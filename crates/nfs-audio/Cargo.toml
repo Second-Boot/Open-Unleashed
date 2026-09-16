@@ -1,0 +1,11 @@
+[package]
+name = "nfs-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nfs-formats.workspace = true
+cpal.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

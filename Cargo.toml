@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nfs-formats",
+    "crates/nfs-assets",
+    "crates/nfs-math",
+    "crates/nfs-physics",
+    "crates/nfs-renderer",
+    "crates/nfs-audio",
+    "crates/nfs-input",
+    "crates/nfs-game",
+    "crates/porsche",
+    "tools/asset-inspector",
+    "tools/asset-extractor",
+    "tools/track-viewer",
+    "tools/car-viewer",
+    "tools/format-dumper",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+nfs-formats = { path = "crates/nfs-formats" }
+nfs-assets = { path = "crates/nfs-assets" }
+nfs-math = { path = "crates/nfs-math" }
+nfs-physics = { path = "crates/nfs-physics" }
+nfs-renderer = { path = "crates/nfs-renderer" }
+nfs-audio = { path = "crates/nfs-audio" }
+nfs-input = { path = "crates/nfs-input" }
+nfs-game = { path = "crates/nfs-game" }
+
+thiserror = "2"
+anyhow = "1"
+glam = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+winit = "0.30"
+wgpu = "27"
+pollster = "0.4"
+gilrs = "0.11"
+cpal = "0.16"
+
+[profile.release]
+debug = 1

@@ -1,0 +1,10 @@
+[package]
+name = "format-dumper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nfs-formats.workspace = true
+nfs-assets.workspace = true
+anyhow.workspace = true

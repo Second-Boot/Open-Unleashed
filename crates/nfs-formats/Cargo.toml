@@ -1,0 +1,9 @@
+[package]
+name = "nfs-formats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Parsers for Need for Speed: Porsche Unleashed data formats (evidence-based, see RE/FORMATS.md)"
+
+[dependencies]
+thiserror.workspace = true

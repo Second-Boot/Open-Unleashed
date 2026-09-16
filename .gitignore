@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+.DS_Store
+.idea/
+*.iml
+
+# Never commit original game data or extracted assets
+/extracted/
+/ref/
+*.viv
+*.crp
+*.fsh
+*.bnk
+*.sim
+*.exe
+*.dll

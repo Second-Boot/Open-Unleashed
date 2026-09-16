@@ -1,0 +1,14 @@
+[package]
+name = "nfs-game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nfs-formats.workspace = true
+nfs-assets.workspace = true
+nfs-physics.workspace = true
+glam.workspace = true
+nfs-renderer.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

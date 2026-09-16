@@ -1,0 +1,26 @@
+[package]
+name = "porsche"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "porsche"
+path = "src/main.rs"
+
+[dependencies]
+nfs-assets.workspace = true
+nfs-formats.workspace = true
+nfs-renderer.workspace = true
+nfs-game.workspace = true
+nfs-input.workspace = true
+nfs-physics.workspace = true
+winit.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+glam.workspace = true
+image.workspace = true
+nfs-audio.workspace = true

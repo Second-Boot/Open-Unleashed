@@ -1,0 +1,9 @@
+[package]
+name = "nfs-physics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+glam.workspace = true
+nfs-formats.workspace = true

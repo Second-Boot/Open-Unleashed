@@ -1,0 +1,14 @@
+[package]
+name = "nfs-renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wgpu.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+winit.workspace = true
+pollster.workspace = true
