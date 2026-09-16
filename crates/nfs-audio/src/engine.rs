@@ -13,6 +13,8 @@ struct Layer {
 
 pub struct EngineSound {
     layers: Vec<Layer>,
+    /// Engine bank slot 2: the gear-shift click (`RE/notes/sfx.md` §4.4, player only).
+    shift_click: Option<Arc<Clip>>,
 }
 
 /// HYPOTHESIS: 512 bins over 0..10240 rpm.
@@ -37,8 +39,23 @@ impl EngineSound {
                 layers.push(Layer { voice, entry: e, load });
             }
         }
-        tracing::info!(set, layers = layers.len(), "engine sound loaded");
-        Ok(Self { layers })
+        let shift_click = bank.decode_slot(bank_bytes, 2).ok().map(|pcm| Arc::new(Clip { rate: pcm.rate, channels: pcm.channels, samples: pcm.samples, loop_range: None }));
+        tracing::info!(set, layers = layers.len(), shift_click = shift_click.is_some(), "engine sound loaded");
+        Ok(Self { layers, shift_click })
+    }
+
+    /// Stop every layer (leaving the race).
+    pub fn stop(&self, out: &AudioOutput) {
+        for l in &self.layers {
+            out.stop(l.voice);
+        }
+    }
+
+    /// Gear-shift click (engine bank slot 2) at full level.
+    pub fn play_shift(&self, out: &AudioOutput, master: f32) {
+        if let Some(c) = &self.shift_click {
+            out.play(c.clone(), master, 1.0, false);
+        }
     }
 
     /// Update per frame: `rpm`, `throttle` 0..1 selects load vs coast tables, `master` volume.

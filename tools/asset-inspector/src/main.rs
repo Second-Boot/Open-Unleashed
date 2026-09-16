@@ -5,7 +5,7 @@
 //! asset-inspector <file> --png <outdir>  also export FSH images as PNG
 //! ```
 use anyhow::{bail, Context, Result};
-use nfs_formats::{bigf::Bigf, crp::{Crp, CrpEntry}, fsh::Fsh, refpack, sim::CarSim};
+use nfs_formats::{bigf::Bigf, crp::Crp, fsh::Fsh, refpack, sim::CarSim};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

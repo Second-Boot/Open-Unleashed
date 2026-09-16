@@ -5,7 +5,6 @@
 use crate::mixer::{AudioOutput, StreamSource, VoiceId};
 use nfs_formats::{bigf::Bigf, schl::SchlStream};
 use std::path::Path;
-use std::sync::Arc;
 
 pub struct Music {
     pub voice: VoiceId,

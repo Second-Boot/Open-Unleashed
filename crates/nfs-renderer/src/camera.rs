@@ -23,7 +23,15 @@ impl Camera {
     pub fn projection(&self, aspect: f32) -> Mat4 {
         Mat4::perspective_rh(self.fov_y_radians, aspect, self.near, self.far)
     }
+    /// The game world is left-handed (D3D: +x right, +y up, +z forward — CRP winding is clockwise
+    /// seen from +y); rendering it through a right-handed look-at would mirror the scene, so the
+    /// clip-space x is flipped here and the pipeline's front face is set accordingly.
     pub fn view_projection(&self, aspect: f32) -> Mat4 {
-        self.projection(aspect) * self.view()
+        self.view_projection_mirrored(aspect, false)
+    }
+
+    /// `mirror` undoes the left-handed clip flip, i.e. draws the world mirrored (race option `MIRROR`).
+    pub fn view_projection_mirrored(&self, aspect: f32, mirror: bool) -> Mat4 {
+        Mat4::from_scale(Vec3::new(if mirror { 1.0 } else { -1.0 }, 1.0, 1.0)) * self.projection(aspect) * self.view()
     }
 }

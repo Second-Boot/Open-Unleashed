@@ -7,3 +7,4 @@ description = "Parsers for Need for Speed: Porsche Unleashed data formats (evide
 
 [dependencies]
 thiserror.workspace = true
+serde.workspace = true

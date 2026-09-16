@@ -5,10 +5,40 @@ use nfs_formats::sim::CarSim;
 
 pub const GRAVITY: f32 = 9.8;
 
+/// Damage zones (0..7 ring around the body, 8 roof, 9 spare) that feed each part-damage getter
+/// (`0x4938A0` family: mean zone damage over the part's mask, `part+0x48[10]`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ZoneMasks {
+    pub engine: [bool; 10],
+    pub brakes: [bool; 10],
+    pub gearbox: [bool; 10],
+    pub suspension: [bool; 10],
+    pub aero: [bool; 10],
+    pub tyres: [bool; 10],
+}
+
+impl Default for ZoneMasks {
+    /// Masks of the standard parts of a rear-engined 911 in `nfs5.prt` (brakes / suspension /
+    /// tyres on the four corners, engine and gearbox at the rear, aero front and rear) — MEDIUM;
+    /// the career replaces them with the car's own family parts.
+    fn default() -> Self {
+        let corners = [true, false, true, false, true, false, true, false, false, false];
+        Self {
+            engine: [false, false, false, false, true, true, true, false, false, false],
+            brakes: corners,
+            gearbox: [false, false, false, false, true, true, true, false, false, false],
+            suspension: corners,
+            aero: [true, true, true, false, true, true, true, false, false, false],
+            tyres: corners,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CarSpecs {
     pub name: String,
     pub mass: f32,
+    pub zone_masks: ZoneMasks,
     /// wheelbase in metres (+0x44 ×0.001)
     pub wheelbase: f32,
     /// 0 NA, 1 turbo, 2 supercharged (+0x4C)
@@ -66,6 +96,18 @@ pub struct CarSpecs {
     pub inv_grip: f32,
     /// grip-table column: 0 for GT1/GT2/GT3/935 race cars, 2 otherwise (+0x1C0)
     pub class: usize,
+    /// pitch / roll rate retention per tick (+0x114/+0x118 ×0.01) — `RE/notes/suspension-collision.md` §8
+    pub pitch_ret: f32,
+    pub roll_ret: f32,
+    /// wheel probe offset m (+0x120), bump travel m (+0x124)
+    pub probe_offset: f32,
+    pub bump_travel: f32,
+    /// dive gain (+0x128 ×0.001), roll gain (+0x12C ×0.001)
+    pub dive_gain: f32,
+    pub roll_gain: f32,
+    /// pitch / roll injection clamps, turns/s (+0x134/+0x138)
+    pub pitch_clamp: f32,
+    pub roll_clamp: f32,
 }
 
 impl CarSpecs {
@@ -102,6 +144,7 @@ impl CarSpecs {
         let yaw_lever = 3.2 * sim.wheelbase_mm * 0.001;
         Self {
             name: sim.name.clone(),
+            zone_masks: ZoneMasks::default(),
             mass,
             wheelbase: sim.wheelbase_mm * 0.001,
             induction: sim.induction,
@@ -133,6 +176,14 @@ impl CarSpecs {
             inv_yaw_lever: 1.0 / yaw_lever,
             inv_grip: 1.0 / t[1],
             class: if race_class { 0 } else { 2 },
+            pitch_ret: t[9] * 0.01,
+            roll_ret: t[10] * 0.01,
+            probe_offset: t[12] * 0.001,
+            bump_travel: t[13] * 0.001,
+            dive_gain: t[14] * 0.001,
+            roll_gain: t[15] * 0.001,
+            pitch_clamp: t[17],
+            roll_clamp: t[18],
         }
     }
 

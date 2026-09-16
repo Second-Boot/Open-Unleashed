@@ -31,11 +31,23 @@ impl BitmapFont {
         let mut x = pos[0];
         let mut out = Vec::new();
         for ch in text.chars() {
+            // the FNTF fonts carry ASCII only: fold Latin-1 accents to their base letters
             let ch = match ch {
-                'é' | 'è' | 'ê' => 'e',
-                'ä' | 'à' | 'á' => 'a',
-                'ö' | 'ó' => 'o',
-                'ü' | 'ú' => 'u',
+                'é' | 'è' | 'ê' | 'ë' => 'e',
+                'É' | 'È' | 'Ê' | 'Ë' => 'E',
+                'ä' | 'à' | 'á' | 'â' | 'ã' | 'å' => 'a',
+                'Ä' | 'À' | 'Á' | 'Â' | 'Ã' | 'Å' => 'A',
+                'ö' | 'ó' | 'ò' | 'ô' | 'õ' => 'o',
+                'Ö' | 'Ó' | 'Ò' | 'Ô' | 'Õ' => 'O',
+                'ü' | 'ú' | 'ù' | 'û' => 'u',
+                'Ü' | 'Ú' | 'Ù' | 'Û' => 'U',
+                'í' | 'ì' | 'î' | 'ï' => 'i',
+                'Í' | 'Ì' | 'Î' | 'Ï' => 'I',
+                'ç' => 'c',
+                'Ç' => 'C',
+                'ñ' => 'n',
+                'Ñ' => 'N',
+                '\u{2019}' | '`' => '\'',
                 c => c,
             };
             let Some(g) = self.font.glyph(ch) else {

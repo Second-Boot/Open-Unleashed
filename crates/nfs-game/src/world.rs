@@ -7,7 +7,13 @@ use std::collections::HashMap;
 
 /// GPU-resident track: static draw items plus the collision grid.
 pub struct TrackWorld {
+    /// Per item: the mission-scene element it belongs to (None for track geometry).
+    pub item_element: Vec<Option<usize>>,
+    /// Mission elements currently hidden (arrow markers not yet reached).
+    pub hidden: std::collections::HashSet<usize>,
     pub items: Vec<DrawItem>,
+    /// environment map for car reflections (`.env` "SKY " entry, else the first)
+    pub env_map: Option<nfs_renderer::TextureId>,
     pub collision: nfs_physics::collision::TriangleGrid,
     pub walls: nfs_physics::walls::WallSet,
     pub start: Vec3,
@@ -29,7 +35,7 @@ impl TrackWorld {
                 let m = materials.get(id as usize);
                 let tex = m.and_then(|m| tex_ids.get(&m.texture_name()));
                 let alpha = tex.map(|t| t.1).unwrap_or(false) && m.map(|m| m.render_method != "Opaque").unwrap_or(true);
-                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back: true, depth_test: true })
+                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0 })
             })
         };
         // Static world: merge every article's meshes per material into one GPU mesh each
@@ -67,16 +73,53 @@ impl TrackWorld {
                 entry.push((r.upload_mesh(&mm.mesh), material));
             }
         }
+        let mut item_element = vec![None; items.len()];
+        let mut missing_tags = std::collections::HashSet::new();
+        // `ENDW` barrier boxes of a skill test (`animdefs.txt` collideType=kBox): their footprint
+        // edges join the wall set so the course is closed for the physics too
+        let mut extra_walls: Vec<([f32; 3], [f32; 3], u32)> = Vec::new();
         for inst in &geometry.instances {
             if let Some(parts) = lib_gpu.get(&inst.tag) {
-                let lib_tr = geometry.library.iter().find(|a| a.tag == inst.tag).map(|a| a.transform).unwrap_or(Mat4::IDENTITY);
+                let art = geometry.library.iter().find(|a| a.tag == inst.tag);
+                let lib_tr = art.map(|a| a.transform).unwrap_or(Mat4::IDENTITY);
+                let world_tr = inst.transform * Mat4::from_scale(inst.scale) * lib_tr;
                 for (mesh, material) in parts {
-                    items.push(DrawItem { mesh: *mesh, material: *material, transform: inst.transform * lib_tr });
+                    items.push(DrawItem { mesh: *mesh, material: *material, transform: world_tr });
+                    item_element.push((inst.source == 1).then_some(inst.element));
                 }
+                if inst.source == 1 && inst.tag == u32::from_le_bytes(*b"ENDW") && let Some(a) = art {
+                    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+                    for mm in &a.meshes {
+                        for v in &mm.mesh.vertices {
+                            let p = Vec3::from(v.position);
+                            lo = lo.min(p);
+                            hi = hi.max(p);
+                        }
+                    }
+                    if lo.x <= hi.x {
+                        let local = Mat4::from_scale(inst.scale) * lib_tr;
+                        let corners = [Vec3::new(lo.x, lo.y, lo.z), Vec3::new(hi.x, lo.y, lo.z), Vec3::new(hi.x, lo.y, hi.z), Vec3::new(lo.x, lo.y, hi.z)]
+                            .map(|c| inst.transform.transform_point3(local.transform_point3(c)));
+                        for k in 0..4 {
+                            extra_walls.push((corners[k].to_array(), corners[(k + 1) % 4].to_array(), 0x60));
+                        }
+                    }
+                }
+            } else if inst.source == 1 {
+                missing_tags.insert(inst.tag);
             }
         }
-        let collision = geometry.collision_grid(20.0);
-        let walls = nfs_physics::walls::WallSet::build(track.edges.iter().flat_map(|e| e.segments.iter().map(|s| (s.p1, s.p2))), 30.0);
+        if !missing_tags.is_empty() {
+            tracing::warn!(tags = ?missing_tags.iter().map(|t| String::from_utf8_lossy(&t.to_le_bytes()).into_owned()).collect::<Vec<_>>(), "mission props without a library article");
+        }
+        let env_map = track.env_textures.iter().find(|t| t.name.trim() == "SKY").or(track.env_textures.first()).map(|t| r.upload_texture(&TextureData { width: t.width, height: t.height, mips: t.mips.clone() }));
+        let flags: Vec<u32> = materials.iter().map(|m| m.flags).collect();
+        let collision = geometry.collision_grid(20.0, &|mat| flags.get(mat as usize).copied().unwrap_or(0));
+        let n_extra = extra_walls.len();
+        let walls = nfs_physics::walls::WallSet::build(track.edges.iter().flat_map(|e| e.segments.iter().map(|s| (s.p1, s.p2, s.tag))).chain(extra_walls), 30.0);
+        if n_extra > 0 {
+            tracing::info!(segments = n_extra, "barrier boxes added to the wall set");
+        }
         let start = track
             .start_forward
             .as_ref()
@@ -91,7 +134,37 @@ impl TrackWorld {
             .map(|a| ((a[1] + a[2] + a[3]) / 3.0).clamp(0.2, 0.9))
             .unwrap_or(0.35);
         tracing::info!(items = items.len(), triangles = collision.triangle_count(), walls = walls.len(), "track uploaded");
-        Ok(Self { items, collision, walls, start, ambient })
+        Ok(Self { items, item_element, hidden: std::collections::HashSet::new(), env_map, collision, walls, start, ambient })
+    }
+
+    /// Draw items with the hidden mission elements filtered out.
+    pub fn visible_items(&self) -> impl Iterator<Item = DrawItem> + '_ {
+        self.items.iter().zip(self.item_element.iter()).filter(|(_, e)| e.map(|e| !self.hidden.contains(&e)).unwrap_or(true)).map(|(i, _)| *i)
+    }
+
+    /// Show exactly the mission elements in `shown` among `all` (arrow markers, 0x482F70).
+    pub fn set_shown(&mut self, all: &[usize], shown: &[usize]) {
+        for e in all {
+            self.hidden.insert(*e);
+        }
+        for e in shown {
+            self.hidden.remove(e);
+        }
+    }
+
+    /// Tip a knocked cone over: rotate its items 80° about the contact edge (visual only).
+    pub fn knock_over(&mut self, element: usize, away: Vec3) {
+        let axis = Vec3::Y.cross(away).normalize_or_zero();
+        if axis.length_squared() < 1e-6 {
+            return;
+        }
+        let rot = Mat4::from_axis_angle(axis, 80f32.to_radians());
+        for (item, e) in self.items.iter_mut().zip(self.item_element.iter()) {
+            if *e == Some(element) {
+                let origin = item.transform.transform_point3(Vec3::ZERO);
+                item.transform = Mat4::from_translation(origin + away * 0.4) * rot * Mat4::from_translation(-origin) * item.transform;
+            }
+        }
     }
 }
 
@@ -124,6 +197,11 @@ pub const MODEL_TO_BODY: Mat4 = Mat4::from_cols(
 
 impl CarModel {
     pub fn upload(r: &mut Renderer, car: &CarAssets, paths: &nfs_assets::GamePaths, lod: u8, paint: [u8; 3]) -> anyhow::Result<Self> {
+        Self::upload_with_env(r, car, paths, lod, paint, None)
+    }
+
+    /// `env`: track environment map (`.env` entry, e.g. "SKY ") for `CarExtEnv` paint reflections.
+    pub fn upload_with_env(r: &mut Renderer, car: &CarAssets, paths: &nfs_assets::GamePaths, lod: u8, paint: [u8; 3], env: Option<nfs_renderer::TextureId>) -> anyhow::Result<Self> {
         let style = nfs_assets::car::CarStyle::from_tpg(&car.tpg, 1);
         tracing::info!(style = style.name, "car style");
         let pages = car.build_pages(paths, paint, &style)?;
@@ -138,7 +216,8 @@ impl CarModel {
                 let m = materials.get(id as usize);
                 let page = m.map(|m| m.page_index() as usize).and_then(|p| page_tex.get(p));
                 let blend = m.map(|m| matches!(m.render_method.as_str(), "CarWindow" | "CarWheel")).unwrap_or(false) || page.map(|p| p.1).unwrap_or(false);
-                r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: !blend, depth_test: true })
+                let reflective = m.map(|m| m.render_method == "CarExtEnv").unwrap_or(false);
+                r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: !blend, depth_test: true, env_texture: if reflective { env } else { None }, env_mix: 0.3 })
             })
         };
         let arts = car.crp.articles(&car.crp_data)?;

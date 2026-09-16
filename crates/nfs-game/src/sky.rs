@@ -60,7 +60,7 @@ impl Sky {
             r.upload_texture(&TextureData { width: t.width, height: t.height, mips: t.mips.clone() })
         }
         let mut parts = Vec::new();
-        let sky_mat = |r: &mut Renderer, id, blend| r.create_material(MaterialDesc { texture: Some(id), alpha_blend: blend, cull_back: false, depth_test: false });
+        let sky_mat = |r: &mut Renderer, id, blend| r.create_material(MaterialDesc { texture: Some(id), alpha_blend: blend, cull_back: false, depth_test: false, env_texture: None, env_mix: 0.0 });
         if let Some(st) = find("st1a") {
             let id = tex(r, st);
             let m = sky_mat(r, id, false);

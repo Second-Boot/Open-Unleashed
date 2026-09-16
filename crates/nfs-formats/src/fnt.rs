@@ -72,7 +72,7 @@ impl Font {
     pub fn texel(&self, x: u32, y: u32) -> u8 {
         let idx = y as usize * self.atlas_width as usize + x as usize;
         let b = self.atlas[idx / 2];
-        if idx % 2 == 0 { b >> 4 } else { b & 15 }
+        if idx.is_multiple_of(2) { b >> 4 } else { b & 15 }
     }
 
     /// Expand the atlas to RGBA8 (white with alpha = intensity × 17).

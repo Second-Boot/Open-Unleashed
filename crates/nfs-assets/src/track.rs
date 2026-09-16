@@ -20,6 +20,11 @@ pub struct ArticleMeshes {
 /// One placement of a library article requested by a `.scn` GEOM element.
 #[derive(Debug, Clone, Copy)]
 pub struct PropInstance {
+    /// 0 = track scene, 1 = extra (mission) scene; `element` = index into that scene's elements.
+    pub source: u8,
+    pub element: usize,
+    /// GEOM scale (v5: three per-cent values at tokens 7..9, v4: one at token 7).
+    pub scale: glam::Vec3,
     pub tag: u32,
     pub transform: glam::Mat4,
 }
@@ -27,15 +32,18 @@ pub struct PropInstance {
 impl TrackGeometry {
     /// Collision triangles from all world articles (placed objects included) and instanced props,
     /// in world space, with the material index as surface id.
-    pub fn collision_grid(&self, cell_size: f32) -> nfs_physics::collision::TriangleGrid {
+    /// `surface_of(material)` = the CRP `mt` flags word (surface type = `& 0xF`, 0 = not drivable —
+    /// CONFIRMED, RE/notes/suspension-collision.md §7); the material index is kept in the upper bits.
+    pub fn collision_grid(&self, cell_size: f32, surface_of: &dyn Fn(u16) -> u32) -> nfs_physics::collision::TriangleGrid {
         use nfs_physics::collision::{Triangle, TriangleGrid};
         let mut tris = Vec::new();
         let mut push = |art: &ArticleMeshes, m: glam::Mat4| {
             for mm in &art.meshes {
                 let v = &mm.mesh.vertices;
+                let surface = (surface_of(mm.material) & 0xFFFF) | ((mm.material as u32) << 16);
                 for idx in mm.mesh.indices.chunks_exact(3) {
                     let p = |i: u32| m.transform_point3(glam::Vec3::from(v[i as usize].position));
-                    tris.push(Triangle { a: p(idx[0]), b: p(idx[1]), c: p(idx[2]), surface: mm.material as u32 });
+                    tris.push(Triangle { a: p(idx[0]), b: p(idx[1]), c: p(idx[2]), surface });
                 }
             }
         };
@@ -79,6 +87,16 @@ pub fn scn_transform(e: &nfs_formats::scn::SceneElement) -> glam::Mat4 {
     )
 }
 
+/// GEOM element scale in per cent (`0 <id> 0 0 -1 1 1 sx sy sz`; v4 files carry one value).
+pub fn geom_scale(e: &nfs_formats::scn::SceneElement) -> glam::Vec3 {
+    let p = e.params.first().map(|v| v.as_slice()).unwrap_or(&[]);
+    let sx = p.get(7).copied().unwrap_or(100.0);
+    let sy = p.get(8).copied().unwrap_or(sx);
+    let sz = p.get(9).copied().unwrap_or(sx);
+    let f = |v: f32| if v > 0.0 { v / 100.0 } else { 1.0 };
+    glam::Vec3::new(f(sx), f(sy), f(sz))
+}
+
 #[derive(Debug)]
 pub struct TrackAssets {
     pub name: String,
@@ -93,7 +111,9 @@ pub struct TrackAssets {
     pub start_backward: Option<Scene>,
     pub cameras: Option<Scene>,
     /// `<track>_st<N>.scn` stage/scenario scenes (which one a race uses is not yet known).
-    pub stages: Vec<Scene>,
+    /// Additional scenes whose GEOM props are instanced: the skill-test `_st<N>.scn` of the
+    /// current mission (`RE/notes/skill-tests.md` §4 — only loaded for `RACE_TYPE 4`).
+    pub extra_scenes: Vec<Scene>,
     /// `Track/<track>.edg` wall/edge segments (may be absent: the game rebuilds it from the mesh).
     pub edges: Option<EdgeFile>,
     /// `Track/Sky/<Track>.fsh` layers (`st1a` sky tile, `sc1a` clouds, `horz` horizon strips, ...).
@@ -130,15 +150,6 @@ impl TrackAssets {
                 Err(_) => Ok(None),
             }
         };
-        let mut stages = Vec::new();
-        let prefix = format!("{}_st", name.to_lowercase());
-        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let p = e.path();
-            let fname = p.file_name().and_then(|n| n.to_str()).map(|n| n.to_lowercase()).unwrap_or_default();
-            if fname.starts_with(&prefix) && fname.ends_with(".scn") {
-                stages.push(Scene::parse(&String::from_utf8_lossy(&read(&p)?)).map_err(fmt_err(&p))?);
-            }
-        }
         let edges = match file(".edg") {
             Ok(p) => Some(EdgeFile::parse(&read(&p)?).map_err(fmt_err(&p))?),
             Err(_) => None,
@@ -166,11 +177,18 @@ impl TrackAssets {
             start_forward: scene("_fstart.scn")?,
             start_backward: scene("_bstart.scn")?,
             cameras: scene("_cameras.scn")?,
-            stages,
+            extra_scenes: Vec::new(),
             edges,
             sky_textures,
             sky_params,
         })
+    }
+
+    /// Load `Track/<track><suffix>` (e.g. `_st1.scn`) as a scene.
+    pub fn load_scene(&self, suffix: &str) -> Result<Option<Scene>, AssetError> {
+        let Some(p) = GamePaths::find_file(&self.dir, &format!("{}{}", self.name, suffix)) else { return Ok(None) };
+        let text = String::from_utf8_lossy(&std::fs::read(&p).map_err(|e| AssetError::Io { path: p.clone(), source: e })?).into_owned();
+        Ok(Some(Scene::parse(&text).map_err(fmt_err(&p))?))
     }
 
     /// Materials of the track CRP in `pr.material` order.
@@ -197,14 +215,30 @@ impl TrackAssets {
             if is_lib { library.push(item) } else { world.push(item) }
         }
         let mut instances = Vec::new();
-        for scene in self.start_forward.iter().chain(self.stages.iter()) {
+        for scene in self.start_forward.iter() {
             for e in scene.of_kind(&nfs_formats::scn::ElementKind::Geom) {
                 // GEOM v5 param line: "0 <id> 0 0 -1 1 1 sx sy sz" — id at index 1 (v4: 8 tokens, same prefix)
                 let Some(id) = Scene::param_u32(e, 0, 1) else { continue };
-                instances.push(PropInstance { tag: id, transform: scn_transform(e) });
+                instances.push(PropInstance { source: 0, element: 0, scale: geom_scale(e), tag: id, transform: scn_transform(e) });
+            }
+        }
+        for scene in &self.extra_scenes {
+            for (i, e) in scene.elements.iter().enumerate() {
+                if e.kind != nfs_formats::scn::ElementKind::Geom {
+                    continue;
+                }
+                let Some(id) = Scene::param_u32(e, 0, 1) else { continue };
+                instances.push(PropInstance { source: 1, element: i, scale: geom_scale(e), tag: id, transform: scn_transform(e) });
             }
         }
         Ok(TrackGeometry { world, library, instances, skipped_primitives: skipped })
+    }
+
+    /// Racing line `Track/racer/work/<track><dir>.lsp` (dir 0 forward, 1 backward).
+    pub fn racing_line(&self, paths: &GamePaths, backwards: bool) -> Option<nfs_formats::ais::RacingLine> {
+        let dir = paths.track_dir().join("racer").join("work");
+        let p = GamePaths::find_file(&dir, &format!("{}{}.lsp", self.name, backwards as u8))?;
+        nfs_formats::ais::RacingLine::parse(&std::fs::read(p).ok()?).ok()
     }
 
     /// Names of all tracks present in the installation (files `<name>.crp` in `GameData/Track`).

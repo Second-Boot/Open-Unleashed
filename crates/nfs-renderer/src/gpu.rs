@@ -17,12 +17,14 @@ struct GlobalsUniform {
     view_proj: [[f32; 4]; 4],
     sun_dir: [f32; 4],
     ambient: [f32; 4],
+    cam_pos: [f32; 4],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ObjectUniform {
     model: [[f32; 4]; 4],
+    env_mix: [f32; 4],
 }
 
 struct GpuMesh {
@@ -50,6 +52,7 @@ struct GpuMaterial {
     alpha_blend: bool,
     cull_back: bool,
     depth_test: bool,
+    env_mix: f32,
 }
 
 pub struct Renderer {
@@ -136,7 +139,7 @@ impl Renderer {
             label: Some("object"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: true,
@@ -158,6 +161,12 @@ impl Renderer {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
                     count: None,
                 },
             ],
@@ -193,7 +202,8 @@ impl Renderer {
                 }),
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
-                    front_face: wgpu::FrontFace::Ccw,
+                    // mirrored clip x (see Camera::view_projection) flips the apparent winding
+                    front_face: wgpu::FrontFace::Cw,
                     cull_mode: if cull { Some(wgpu::Face::Back) } else { None },
                     ..Default::default()
                 },
@@ -387,15 +397,17 @@ impl Renderer {
 
     pub fn create_material(&mut self, desc: MaterialDesc) -> MaterialId {
         let tex = &self.textures[desc.texture.unwrap_or(self.white).0 as usize];
+        let env = &self.textures[desc.env_texture.unwrap_or(self.white).0 as usize];
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("material"),
             layout: &self.material_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&tex.view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&env.view) },
             ],
         });
-        self.materials.push(GpuMaterial { bind_group, alpha_blend: desc.alpha_blend, cull_back: desc.cull_back, depth_test: desc.depth_test });
+        self.materials.push(GpuMaterial { bind_group, alpha_blend: desc.alpha_blend, cull_back: desc.cull_back, depth_test: desc.depth_test, env_mix: if desc.env_texture.is_some() { desc.env_mix } else { 0.0 } });
         MaterialId(self.materials.len() as u32 - 1)
     }
 
@@ -469,7 +481,7 @@ impl Renderer {
 
     fn encode_frame(&mut self, scene: &Scene, camera: &Camera, view: &wgpu::TextureView, depth_view: &wgpu::TextureView, aspect: f32) {
 
-        let vp = camera.view_projection(aspect);
+        let vp = camera.view_projection_mirrored(aspect, scene.mirror);
         self.queue.write_buffer(
             &self.globals_buf,
             0,
@@ -477,12 +489,14 @@ impl Renderer {
                 view_proj: vp.to_cols_array_2d(),
                 sun_dir: scene.sun_direction.extend(0.0).to_array(),
                 ambient: [scene.ambient, 0.0, 0.0, 0.0],
+                cam_pos: camera.position.extend(1.0).to_array(),
             }),
         );
         let n = scene.items.len().min(MAX_OBJECTS as usize);
         let mut staging = vec![0u8; self.object_stride as usize * n];
         for (i, item) in scene.items.iter().take(n).enumerate() {
-            let o = ObjectUniform { model: item.transform.to_cols_array_2d() };
+            let env_mix = self.materials.get(item.material.0 as usize).map(|m| m.env_mix).unwrap_or(0.0);
+            let o = ObjectUniform { model: item.transform.to_cols_array_2d(), env_mix: [env_mix, 0.0, 0.0, 0.0] };
             let off = i * self.object_stride as usize;
             staging[off..off + std::mem::size_of::<ObjectUniform>()].copy_from_slice(bytemuck::bytes_of(&o));
         }
@@ -519,7 +533,9 @@ impl Renderer {
                         continue;
                     }
                     let mesh = &self.meshes[item.mesh.0 as usize];
-                    let pipeline = &self.pipelines[(mat.alpha_blend as usize) * 4 + (!mat.cull_back as usize) * 2 + (!mat.depth_test as usize)];
+                    // mirrored world: the winding flips, so draw both faces instead of culling the wrong one
+                    let cull = mat.cull_back && !scene.mirror;
+                    let pipeline = &self.pipelines[(mat.alpha_blend as usize) * 4 + (!cull as usize) * 2 + (!mat.depth_test as usize)];
                     pass.set_pipeline(pipeline);
                     pass.set_bind_group(1, &self.object_bg, &[(i as u64 * self.object_stride) as u32]);
                     pass.set_bind_group(2, &mat.bind_group, &[]);

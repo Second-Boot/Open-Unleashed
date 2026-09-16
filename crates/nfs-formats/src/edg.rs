@@ -10,6 +10,9 @@ use crate::{f32_le, u32_le, FormatError};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EdgeSegment {
+    /// Wall word: 0x10 metal, 0x20 wood, 0x30 snow, 0x40 ice, 0x50 earth, 0x60 rock; 0 (most
+    /// edges) and stray pointer values (monaco tracks, skidpad) fall back to rock in the game
+    /// (`WallImpulse` 0x494000: `w ∉ [0x10, 0x60] ⇒ 0x60`).
     pub tag: u32,
     pub p1: [f32; 3],
     pub p2: [f32; 3],
@@ -25,7 +28,7 @@ impl EdgeFile {
     pub fn parse(data: &[u8]) -> Result<Self, FormatError> {
         let header = u32_le(data, 0, ".edg header")?;
         let body = &data[4..];
-        if body.len() % 28 != 0 {
+        if !body.len().is_multiple_of(28) {
             return Err(FormatError::SizeMismatch { what: ".edg records", declared: 28, actual: body.len() % 28 });
         }
         let mut segments = Vec::with_capacity(body.len() / 28);

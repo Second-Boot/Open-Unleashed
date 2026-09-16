@@ -10,6 +10,22 @@ pub struct Wall {
     pub b: Vec2,
     pub y_min: f32,
     pub y_max: f32,
+    /// Wall material class 0..5 = metal, wood, snow, ice, earth, rock (`WallImpulse` 0x494000
+    /// byte tables 0x49442C / 0x4943BC over the `.edg` word 0x10..0x60; other words → rock).
+    pub class: u8,
+}
+
+/// `.edg` wall word → material class (tables 0x49442C / 0x4943BC, CONFIRMED from the bytes;
+/// the class order metal/wood/snow/ice/earth/rock is HIGH from the per-track word statistics).
+pub fn wall_class(word: u32) -> u8 {
+    match word {
+        0x10 => 0,
+        0x20 => 1,
+        0x30 => 2,
+        0x40 => 3,
+        0x50 => 4,
+        _ => 5,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -23,9 +39,10 @@ pub struct WallSet {
 }
 
 impl WallSet {
-    pub fn build(segments: impl Iterator<Item = ([f32; 3], [f32; 3])>, cell: f32) -> Self {
+    /// Build from `(p1, p2, wall word)` segments (`.edg` records; barrier boxes use 0x60).
+    pub fn build(segments: impl Iterator<Item = ([f32; 3], [f32; 3], u32)>, cell: f32) -> Self {
         let walls: Vec<Wall> = segments
-            .map(|(p1, p2)| Wall { a: Vec2::new(p1[0], p1[2]), b: Vec2::new(p2[0], p2[2]), y_min: p1[1].min(p2[1]) - 3.0, y_max: p1[1].max(p2[1]) + 3.0 })
+            .map(|(p1, p2, word)| Wall { a: Vec2::new(p1[0], p1[2]), b: Vec2::new(p2[0], p2[2]), y_min: p1[1].min(p2[1]) - 3.0, y_max: p1[1].max(p2[1]) + 3.0, class: wall_class(word) })
             .filter(|w| (w.a - w.b).length_squared() > 1e-6)
             .collect();
         let mut min = Vec2::splat(f32::MAX);
@@ -92,5 +109,46 @@ impl WallSet {
             }
         }
         best
+    }
+}
+
+impl WallSet {
+    /// First wall crossed by the xz segment `p0 → p1` (within the wall's height span at `p1.y`).
+    /// Returns (edge normal `normalize(−d.z, 0, d.x)`, projection of `p1` onto the edge line,
+    /// material class).
+    pub fn segment_hit(&self, p0: Vec3, p1: Vec3) -> Option<(Vec2, Vec2, u8)> {
+        if self.walls.is_empty() {
+            return None;
+        }
+        let (a, b) = (Vec2::new(p0.x, p0.z), Vec2::new(p1.x, p1.z));
+        let idx = |v: Vec2| ((((v.x - self.min.x) / self.cell).floor().max(0.0) as usize).min(self.nx - 1), (((v.y - self.min.y) / self.cell).floor().max(0.0) as usize).min(self.nz - 1));
+        let (x0, z0) = idx(a.min(b));
+        let (x1, z1) = idx(a.max(b));
+        let mut best: Option<(f32, Vec2, Vec2, u8)> = None;
+        for z in z0..=z1 {
+            for x in x0..=x1 {
+                for &wi in &self.cells[z * self.nx + x] {
+                    let w = &self.walls[wi as usize];
+                    if p1.y < w.y_min || p1.y > w.y_max {
+                        continue;
+                    }
+                    let d = w.b - w.a;
+                    let r = b - a;
+                    let denom = r.x * d.y - r.y * d.x;
+                    if denom.abs() < 1e-8 {
+                        continue;
+                    }
+                    let s = a - w.a;
+                    let t = (s.y * d.x - s.x * d.y) / denom; // along the motion segment
+                    let u = (s.y * r.x - s.x * r.y) / denom; // along the wall
+                    if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) && best.map(|b| t < b.0).unwrap_or(true) {
+                        let n = Vec2::new(-d.y, d.x).normalize_or_zero();
+                        let proj = w.a + d * (((b - w.a).dot(d)) / d.length_squared()).clamp(0.0, 1.0);
+                        best = Some((t, n, proj, w.class));
+                    }
+                }
+            }
+        }
+        best.map(|(_, n, q, c)| (n, q, c))
     }
 }

@@ -12,3 +12,6 @@ glam.workspace = true
 nfs-renderer.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+serde.workspace = true
+serde_json = "1"
+thiserror.workspace = true

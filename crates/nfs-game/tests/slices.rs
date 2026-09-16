@@ -37,7 +37,7 @@ fn alps_walls_near_road_edge() {
     let Ok(paths) = GamePaths::locate() else { return };
     let t = TrackAssets::load(&paths, "alps").unwrap();
     let edges = t.edges.as_ref().unwrap();
-    let walls = nfs_physics::walls::WallSet::build(edges.segments.iter().map(|s| (s.p1, s.p2)), 30.0);
+    let walls = nfs_physics::walls::WallSet::build(edges.segments.iter().map(|s| (s.p1, s.p2, s.tag)), 30.0);
     assert_eq!(walls.len(), 7694);
     // point known to be 0.99 m from segment (199.6,68.9,-529.6)-(190.1,70.2,-535.2)
     let hit = walls.nearest(Vec3::new(193.9, 66.6, -531.8), 1.3);
@@ -48,15 +48,51 @@ fn alps_walls_near_road_edge() {
 }
 
 #[test]
-fn vehicle_wall_response_on_alps() {
-    use nfs_physics::{specs::CarSpecs, vehicle::Vehicle};
+fn vehicle_wall_response_synthetic() {
+    use nfs_physics::{specs::CarSpecs, vehicle::Vehicle, walls::WallSet};
     let Ok(paths) = GamePaths::locate() else { return };
-    let t = TrackAssets::load(&paths, "alps").unwrap();
-    let walls = nfs_physics::walls::WallSet::build(t.edges.as_ref().unwrap().segments.iter().map(|s| (s.p1, s.p2)), 30.0);
     let sim = nfs_assets::car::CarAssets::load_sim(&paths, "993coupe36").unwrap();
     let specs = CarSpecs::from_sim(&sim, false);
-    let mut v = Vehicle::new(Vec3::new(193.82, 66.50, -535.45), glam::Mat3::IDENTITY, &specs, 0.75, 0.3);
-    let hit = v.collide_walls(&walls, 0.93, 0.2, 0.15);
-    eprintln!("hit={hit} pos={:?}", v.position);
+    // wall along z at x = 2 (edge direction +z ⇒ normal (−1, 0, 0) points toward −x, the car's side)
+    let walls = WallSet::build(std::iter::once(([2.0, 0.0, -20.0], [2.0, 0.0, 20.0], 0x10)), 30.0);
+    // the sweep runs after integration: the +x corners (x ≈ pos.x + 0.9) have just passed the edge
+    let mut v = Vehicle::new(Vec3::new(1.5, 0.3, 0.0), glam::Mat3::IDENTITY, &specs, 0.75, 0.3);
+    v.velocity = Vec3::new(64.0, 0.0, 0.0); // 2 m per tick
+    let hit = v.collide_walls(&walls, &|_| false, 0.0, 0.0, 0.0);
+    eprintln!("hit={hit} pos={:?} vel={:?}", v.position, v.velocity);
     assert!(hit);
+    assert!(v.velocity.x < 0.0 && v.velocity.x > -10.0, "restitution 0.1 expected, got {:?}", v.velocity);
+    assert!(v.position.x < 1.5, "pushed back off the wall: {:?}", v.position);
+}
+
+#[test]
+fn monaco1_lap_chains_all_sections() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let t = TrackAssets::load(&paths, "monaco1").unwrap();
+    let table = SliceTable::from_crp(&t.crp, &t.crp_data).unwrap();
+    assert_eq!(table.sections.len(), 4);
+    // the street circuit is stored as four sections; the lap runs 0 → 2 → 1 → 3
+    assert_eq!(table.lap_len, 623);
+    assert_eq!(table.route[141], 557);
+    let mut max_gap = 0.0f32;
+    for p in 0..table.lap_len {
+        let a = table.slices[table.route[p]].centre;
+        let b = table.slices[table.route[(p + 1) % table.lap_len]].centre;
+        max_gap = max_gap.max((a - b).length());
+    }
+    assert!(max_gap < 15.0, "max gap along the lap {max_gap}"); // 13.3 m at the section 3 → 0 join
+    assert_eq!(table.add(140, 1), 557);
+    assert_eq!(table.add(557, -1), 140);
+    assert!((table.frac(557) - 141.0 / 623.0).abs() < 1e-4);
+    // find_slice lands on the chained section, not on the file-order neighbour
+    let probe = table.slices[560].centre + Vec3::new(0.5, 0.0, 0.5);
+    assert_eq!(table.find_slice(probe, 138), 560);
+    // point-to-point: section 0 alone is the lap
+    let alps = TrackAssets::load(&paths, "alps").unwrap();
+    let a = SliceTable::from_crp(&alps.crp, &alps.crp_data).unwrap();
+    assert_eq!(a.route.len(), 1795);
+    assert_eq!(a.add(1794, 1), 0);
 }

@@ -31,6 +31,9 @@ pub enum Action {
     FreeUp,
     FreeDown,
     FreeFast,
+    /// Reset the car onto the track (original "reset car" mode 3).
+    Reset,
+    Horn,
 }
 
 /// Default keyboard bindings. Original defaults (arrow keys steer/throttle/brake, A/Z shift,
@@ -46,7 +49,9 @@ pub fn default_binding(key: KeyCode) -> Option<Action> {
         KeyCode::KeyA => Action::ShiftUp,
         KeyCode::KeyZ => Action::ShiftDown,
         KeyCode::KeyC => Action::CameraNext,
-        KeyCode::KeyR => Action::RearView,
+        KeyCode::KeyR => Action::Reset,
+        KeyCode::KeyB => Action::RearView,
+        KeyCode::KeyH => Action::Horn,
         KeyCode::KeyP | KeyCode::Escape => Action::Pause,
         KeyCode::KeyW => Action::FreeForward,
         KeyCode::KeyS => Action::FreeBack,

@@ -145,6 +145,12 @@ impl AudioOutput {
         g.voices.retain(|(i, _)| *i != id);
         g.streams.retain(|(i, _)| *i != id);
     }
+
+    /// Is a one-shot / loop voice still playing?
+    pub fn is_playing(&self, id: VoiceId) -> bool {
+        let g = self.shared.lock().unwrap();
+        g.voices.iter().any(|(i, v)| *i == id && !v.finished) || g.streams.iter().any(|(i, _)| *i == id)
+    }
 }
 
 /// Streamed stereo/mono source fed from another thread (music).

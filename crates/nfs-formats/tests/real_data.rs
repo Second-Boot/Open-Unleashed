@@ -121,6 +121,8 @@ fn car_catalog() {
     assert_eq!(cars[0].sim, "356cabrio11");
     assert_eq!(cars[0].sound_set, "sd1b");
     assert_eq!(cars[0].year, 1950);
+    assert_eq!(cars[0].paint_sets.len(), 19);
+    assert_eq!(cars[0].paint_sets[0].colours[1], [0xFF, 0x00, 0x00]);
     // every model and sim referenced must exist on disk
     for c in &cars {
         assert!(r.join("GameData/CarModel").join(format!("{}.crp", c.model)).exists() || std::fs::read_dir(r.join("GameData/CarModel")).unwrap().flatten().any(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(&format!("{}.crp", c.model))), "model {}", c.model);
@@ -145,4 +147,62 @@ fn fntf_fonts() {
     assert_eq!((0..g.width as u32).map(|dx| f.texel(g.x as u32 + dx, g.y as u32 + 12) as u32).sum::<u32>(), 0);
     let d = nfs_formats::fnt::Font::parse(&std::fs::read(r.join("GameData/DashHud/debug.ffn")).unwrap()).unwrap();
     assert_eq!((d.atlas_width, d.atlas_height, d.glyphs.len()), (256, 60, 224));
+}
+
+#[test]
+fn career_tables() {
+    use nfs_formats::career::*;
+    let r = need_game!();
+    let d = r.join("FEData/Data");
+    let tracks = parse_track_table(&std::fs::read(d.join("nfs5.trk")).unwrap()).unwrap();
+    assert_eq!(tracks.len(), 15);
+    let coastal = tracks.iter().find(|t| t.file == "coastal").unwrap();
+    assert_eq!((coastal.id, coastal.lock_mode, coastal.circuit), (8, 0, false));
+    assert!((300..320).contains(&coastal.name_string_id));
+    assert_eq!(coastal.records.len(), 8);
+    assert_eq!(coastal.records[0].time, 10496);
+    assert!(coastal.records.windows(2).all(|w| w[0].time <= w[1].time));
+    assert!(tracks.iter().filter(|t| t.circuit).count() >= 6);
+
+    let trn = parse_tournaments(&std::fs::read(d.join("nfs5.trn")).unwrap()).unwrap();
+    assert_eq!(trn.len(), 35);
+    let first = trn.iter().find(|t| t.id == 1).unwrap();
+    assert_eq!(first.kind, TournamentKind::Era(Era::Classic));
+    assert_eq!((first.start_year, first.name_string_id, first.title_string_id), (1950, 2000, 2018));
+    assert_eq!(first.opponents.len(), 7);
+    assert!(!first.events.is_empty() && first.events.iter().all(|e| tracks.iter().any(|t| t.id as i16 == e.track_id)));
+    assert!(first.events.iter().all(|e| (0.3..=1.0).contains(&e.difficulty)));
+    assert_eq!(trn.iter().filter(|t| t.is_hidden()).count(), 3);
+    assert!(trn.iter().all(|t| t.opponents.iter().all(|o| o.car_id > 0)));
+
+    let parts = parse_parts(&std::fs::read(d.join("nfs5.prt")).unwrap()).unwrap();
+    assert_eq!(parts.len(), 683);
+    assert!(parts.iter().any(|p| p.name_string_id == 5016 && p.kind == 3));
+    assert!(parts.iter().filter(|p| (0.0..=100.0).contains(&p.condition)).count() >= 682, "one record (#347) stores -65");
+    let mut ids: Vec<i16> = parts.iter().map(|p| p.id).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), parts.len(), "part ids are unique");
+
+    let per = parse_personalities(&std::fs::read(d.join("nfs5.per")).unwrap()).unwrap();
+    assert_eq!(per.len(), 35);
+    assert!(per.iter().all(|p| p.skill.iter().all(|s| (0.0..=1.5).contains(&s[0]))));
+
+    let fac = parse_missions(&std::fs::read(d.join("nfs5.fac")).unwrap()).unwrap();
+    assert_eq!(fac.len(), 34);
+    assert!(fac.iter().all(|m| (1..=3).contains(&m.stage)));
+    let m0 = &fac[0];
+    assert_eq!((m0.code.as_str(), m0.track_id, m0.scene, m0.car_id, m0.time_limit_s, m0.narrator), ("0M01", 32, 1, 161, Some(27), 5));
+    assert_eq!(m0.cone_rule, Some(nfs_formats::career::ConeRule::PenaltySeconds(1)));
+    assert_eq!(m0.scene_file("skidpad").as_deref(), Some("skidpad_st1.scn"));
+    let race = fac.iter().find(|m| m.code == "2m05").unwrap();
+    assert!(race.is_race() && race.min_rank == Some(1) && race.opponents[0].0 == 24);
+    let delivery = fac.iter().find(|m| m.code == "1m06").unwrap();
+    assert!(delivery.backwards && delivery.police && delivery.damage_limit_pct == Some(5) && delivery.traffic_level == 4 / 2);
+
+    let strings = nfs_formats::locale::Strings::parse(&std::fs::read(r.join("FEData/Locale/FEStrings.csv")).unwrap(), 0);
+    assert_eq!(strings.get(521), Some("CLASSIC ERA"));
+    assert_eq!(strings.get(2018), Some("356 Challenge"));
+    assert_eq!(strings.get(0), Some("Hello, World!"));
+    assert!(trn.iter().all(|t| strings.get(t.title_string_id).is_some()));
 }

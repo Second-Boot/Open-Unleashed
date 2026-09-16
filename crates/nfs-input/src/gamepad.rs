@@ -81,6 +81,8 @@ fn map_button(b: Button) -> Option<Action> {
         Button::LeftTrigger => Action::ShiftDown,
         Button::North => Action::CameraNext,
         Button::Start => Action::Pause,
+        Button::Select => Action::RearView,
+        Button::RightThumb => Action::Horn,
         Button::DPadLeft => Action::SteerLeft,
         Button::DPadRight => Action::SteerRight,
         Button::DPadUp => Action::Throttle,

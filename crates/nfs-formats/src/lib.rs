@@ -5,8 +5,10 @@
 //! produces an explicit [`FormatError`] naming the file offset, structure, expected and actual
 //! values; nothing is silently skipped.
 
+pub mod ais;
 pub mod bigf;
 pub mod bnk;
+pub mod career;
 pub mod crdl;
 pub mod crp;
 pub mod edg;
@@ -15,6 +17,7 @@ pub mod fedata;
 pub mod fnt;
 pub mod fsh;
 pub mod ini;
+pub mod locale;
 pub mod refpack;
 pub mod schl;
 pub mod scn;

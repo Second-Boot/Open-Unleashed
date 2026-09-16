@@ -51,16 +51,14 @@ impl CarStyle {
         let count = sec.get_i64("count").unwrap_or(1);
         for k in 1..=count {
             let want = sec.get_i64(&format!("type{k}")).unwrap_or(0) as u32;
-            if let Some(t) = sec.get_i64(&format!("texture{k}")) {
-                if self.texture.get(&(t as u32)).copied().unwrap_or(0) != want {
+            if let Some(t) = sec.get_i64(&format!("texture{k}"))
+                && self.texture.get(&(t as u32)).copied().unwrap_or(0) != want {
                     return false;
                 }
-            }
-            if let Some(g) = sec.get_i64(&format!("geometry{k}")) {
-                if self.geometry.get(&(g as u32)).copied().unwrap_or(0) != want {
+            if let Some(g) = sec.get_i64(&format!("geometry{k}"))
+                && self.geometry.get(&(g as u32)).copied().unwrap_or(0) != want {
                     return false;
                 }
-            }
         }
         true
     }
@@ -139,11 +137,11 @@ impl CarAssets {
             if page_no == 0 || page_no > pages.len() {
                 continue;
             }
-            let offx = det.get_i64("offsetx").unwrap_or(0) as i64;
-            let offy = det.get_i64("offsety").unwrap_or(0) as i64;
+            let offx = det.get_i64("offsetx").unwrap_or(0);
+            let offy = det.get_i64("offsety").unwrap_or(0);
             let mirror = det.get_i64("mirror").unwrap_or(0) == 1;
             let mirror_page = self.tpg.section(&format!("tpage{page_no}.details")).and_then(|d| d.get_i64("mirrortpage")).map(|m| m as usize);
-            let (moffx, moffy) = (det.get_i64("mirroroffsetx").unwrap_or(0) as i64, det.get_i64("mirroroffsety").unwrap_or(0) as i64);
+            let (moffx, moffy) = (det.get_i64("mirroroffsetx").unwrap_or(0), det.get_i64("mirroroffsety").unwrap_or(0));
             // source SHPI bytes
             let data: &[u8] = if let Some(g) = det.get_i64("global") {
                 if g == 1 || g == 2 {
@@ -175,8 +173,8 @@ impl CarAssets {
                 }
                 let Ok(img) = fsh.decode(data, ei) else { continue };
                 let b = &entry.blocks[0];
-                let x = ((b.misc[2] & 0xFFF) as i64) as i64;
-                let y = ((b.misc[3] & 0xFFF) as i64) as i64;
+                let x = (b.misc[2] & 0xFFF) as i64;
+                let y = (b.misc[3] & 0xFFF) as i64;
                 let tint = self.tpg.section(&format!("file{file_no}.{}", ename.to_lowercase())).and_then(|s| s.get_i64("tint")).unwrap_or(1) != 0;
                 blit(&mut pages[page_no - 1], &img.rgba, img.width, img.height, x + offx, y + offy, tint, paint);
                 if mirror && let Some(mp) = mirror_page && mp >= 1 && mp <= pages.len() {
@@ -185,6 +183,20 @@ impl CarAssets {
             }
         }
         Ok(pages)
+    }
+
+    /// Load `GameData/Simulation/AICarData/<family>.ais`; tries the model name (e.g. `993`, `356_1` → `356`)
+    /// then `default.ais` (the exe keys the file by the car-info family string — HYPOTHESIS on the mapping).
+    pub fn load_ais(paths: &GamePaths, model: &str) -> Result<nfs_formats::ais::AiCarData, AssetError> {
+        let dir = paths.game_data().join("Simulation").join("AICarData");
+        let base: String = model.chars().take_while(|c| *c != '_').collect();
+        let candidates = [format!("{model}.ais"), format!("{base}.ais"), format!("{}.ais", base.to_lowercase()), "default.ais".into()];
+        for n in &candidates {
+            if let Some(p) = GamePaths::find_file(&dir, n) {
+                return nfs_formats::ais::AiCarData::parse(&read(&p)?).map_err(fmt_err(&p));
+            }
+        }
+        Err(AssetError::MissingFile { dir, name: format!("{model}.ais") })
     }
 
     /// Load `GameData/Simulation/CarData/<variant>.sim`.
@@ -213,12 +225,12 @@ fn blit(page: &mut TexturePage, src: &[u8], w: u32, h: u32, x: i64, y: i64, tint
             let s = &src[((row as u32 * w + col as u32) * 4) as usize..][..4];
             let d = &mut page.rgba[((py as u32 * page.width + px as u32) * 4) as usize..][..4];
             let a = s[3] as u32;
-            let slot = 20 - ((a + 1) * 20 >> 8);
+            let slot = 20 - (((a + 1) * 20) >> 8);
             if tint && slot != 0 && slot != 10 && slot != 20 {
                 let grey = s[0] as u32;
-                d[0] = (paint[0] as u32 * grey >> 8) as u8;
-                d[1] = (paint[1] as u32 * grey >> 8) as u8;
-                d[2] = (paint[2] as u32 * grey >> 8) as u8;
+                d[0] = ((paint[0] as u32 * grey) >> 8) as u8;
+                d[1] = ((paint[1] as u32 * grey) >> 8) as u8;
+                d[2] = ((paint[2] as u32 * grey) >> 8) as u8;
                 d[3] = 255;
             } else {
                 d.copy_from_slice(s);

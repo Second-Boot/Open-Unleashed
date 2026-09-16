@@ -48,14 +48,18 @@ pub struct MaterialDesc {
     pub cull_back: bool,
     /// When false the item is drawn first without depth test/write (sky, backgrounds).
     pub depth_test: bool,
+    /// Environment (reflection) map blended by `env_mix` using a view-space sphere mapping of the
+    /// normal — the original's `CarExtEnv`/`R3DSpecularTextureLayer` uses the track `.env` maps.
+    pub env_texture: Option<TextureId>,
+    pub env_mix: f32,
 }
 
 impl MaterialDesc {
     pub fn textured(texture: TextureId) -> Self {
-        Self { texture: Some(texture), alpha_blend: false, cull_back: true, depth_test: true }
+        Self { texture: Some(texture), alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0 }
     }
     pub fn flat() -> Self {
-        Self { texture: None, alpha_blend: false, cull_back: true, depth_test: true }
+        Self { texture: None, alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0 }
     }
 }
 
@@ -90,11 +94,13 @@ pub struct Scene {
     pub clear_color: [f64; 4],
     pub sun_direction: Vec3,
     pub ambient: f32,
+    /// `MIRROR` race option: the world is drawn x-flipped (sprites unaffected).
+    pub mirror: bool,
 }
 
 impl Default for Scene {
     fn default() -> Self {
-        Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35 }
+        Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35, mirror: false }
     }
 }
 

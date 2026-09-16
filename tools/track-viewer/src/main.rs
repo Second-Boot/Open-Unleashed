@@ -36,7 +36,7 @@ fn summarise(t: &TrackAssets) -> Result<()> {
     // collision sanity: ground under the start trigger
     let geo = t.build_geometry()?;
     let t0 = Instant::now();
-    let grid = geo.collision_grid(20.0);
+    let grid = geo.collision_grid(20.0, &|_| 1);
     if let Some(p) = t.start_forward.as_ref().and_then(|s| s.of_kind(&ElementKind::Trigger).next()).map(|e| e.position) {
         let hit = grid.ground(p[0], p[1] + 5.0, p[2], 50.0);
         println!(
@@ -103,7 +103,7 @@ impl Viewer {
                 let tex = m.and_then(|m| tex_ids.get(&m.texture_name()));
                 if tex.is_none() { missing += 1; }
                 let alpha = tex.map(|t| t.1).unwrap_or(false) && m.map(|m| m.render_method != "Opaque").unwrap_or(true);
-                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back: true, depth_test: true })
+                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0 })
             })
         };
         for art in &geometry.world {
@@ -149,7 +149,7 @@ impl Viewer {
             "scene built"
         );
         let grid = r.upload_mesh(&MeshData::grid(50.0, 5.0));
-        let mat = r.create_material(MaterialDesc { texture: None, alpha_blend: false, cull_back: false, depth_test: true });
+        let mat = r.create_material(MaterialDesc { texture: None, alpha_blend: false, cull_back: false, depth_test: true, env_texture: None, env_mix: 0.0 });
         self.scene.items.push(DrawItem { mesh: grid, material: mat, transform: Mat4::from_translation(Vec3::new(start.x, start.y - 0.5, start.z)) });
         self.camera.position = start + Vec3::new(0.0, 3.0, 12.0);
         self.camera.target = start;

@@ -10,5 +10,7 @@
 pub mod engine;
 pub mod mixer;
 pub mod music;
+pub mod sfx;
+pub mod speech;
 
 pub use mixer::{AudioOutput, VoiceId};

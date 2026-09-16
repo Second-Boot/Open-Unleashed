@@ -343,3 +343,23 @@ fn fesfx_planar_stereo() {
     check_plausible(&pcm, &format!("fesfx stereo slot {i}"));
     wav(&format!("fesfx_slot{i}_stereo.wav"), &pcm);
 }
+
+#[test]
+fn collision_bank_slots() {
+    use nfs_formats::bnk::Bnk;
+    let Some(root) = game_root() else { eprintln!("skipping"); return };
+    let data = std::fs::read(root.join("GameData/Sounds/SND_coll.bnk")).unwrap();
+    let bank = Bnk::parse(&data).unwrap();
+    assert_eq!(bank.slot_count(), 127);
+    // loops 0x28..=0x2F carry loop points; one-shots 0x30..=0x7E do not (RE/notes/sfx.md §3)
+    for slot in [0x28usize, 0x2A, 0x2D] {
+        let pcm = bank.decode_slot(&data, slot).unwrap();
+        assert!(pcm.loop_range.is_some(), "slot {slot:#x} should loop");
+        assert!(pcm.rate >= 11025);
+    }
+    for slot in [0x20usize, 0x30, 0x3C, 0x40, 0x60, 0x6C, 0x7C] {
+        let pcm = bank.decode_slot(&data, slot).unwrap();
+        assert!(pcm.loop_range.is_none(), "slot {slot:#x} is a one-shot");
+        assert!(pcm.samples.len() > 1000, "slot {slot:#x} has {} samples", pcm.samples.len());
+    }
+}
