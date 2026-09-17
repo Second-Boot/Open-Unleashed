@@ -226,6 +226,41 @@ impl Crp {
     }
 
     /// Bytes referenced by any entry.
+    /// `BndP` — the car's **collision body points** (`RE/notes/car-model.md` §12). Each record is
+    /// `{u32 style slot, u32 required value}` followed by one `vec4` per point (`w = 1`), and the
+    /// loader 0x442080 keeps a record only when `carInfo[0x56C + slot] == value`, so a car's body is
+    /// the union of the records its style selects. The points are in the model frame with `y = 0` at
+    /// the wheel contact plane; the original then shifts them by `−carInfo[0x3AC]`.
+    pub fn bound_points(&self, data: &[u8]) -> Result<Vec<BoundPoints>, FormatError> {
+        self.point_records(data, b"BndP")
+    }
+
+    /// `Wndo` — the windscreen quad, same record shape as `BndP` and the same style filter
+    /// (loader 0x442200). The original draws its first four points with the `INTGLASS` texture in
+    /// the cockpit view (0x43A490).
+    pub fn window_points(&self, data: &[u8]) -> Result<Vec<BoundPoints>, FormatError> {
+        self.point_records(data, b"Wndo")
+    }
+
+    fn point_records(&self, data: &[u8], tag: &[u8; 4]) -> Result<Vec<BoundPoints>, FormatError> {
+        let mut out = Vec::new();
+        for e in self.level.iter().filter(|e| e.is_level(tag)) {
+            let b = self.entry_data(data, e)?;
+            if b.len() < 8 {
+                continue;
+            }
+            let u32_at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+            let f_at = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+            let n = (b.len() - 8) / 16;
+            out.push(BoundPoints {
+                style_slot: u32_at(0),
+                style_value: u32_at(4),
+                points: (0..n).map(|i| [f_at(8 + i * 16), f_at(12 + i * 16), f_at(16 + i * 16)]).collect(),
+            });
+        }
+        Ok(out)
+    }
+
     pub fn entry_data<'a>(&self, data: &'a [u8], e: &CrpEntry) -> Result<&'a [u8], FormatError> {
         let off = e.data_offset();
         data.get(off..off + e.data_len()).ok_or(FormatError::InvalidOffset { what: "CRP entry data", offset: off + e.data_len(), len: data.len() })
@@ -274,6 +309,35 @@ impl Crp {
     /// Embedded SHPI blobs (`sf` entries), cars only.
     pub fn embedded_texture_files<'a>(&self, data: &'a [u8]) -> Result<Vec<&'a [u8]>, FormatError> {
         self.material_entries.iter().filter(|e| e.is_part(b"sf")).map(|e| self.entry_data(data, e)).collect()
+    }
+
+    /// An article's `Anim` / `Anqt` animation track, if it has one (`RE/notes/crp-geometry.md` §7).
+    /// `Anim`'s first dword is the frame count and `Anqt` is exactly 52 bytes a frame: a unit
+    /// quaternion, a position with a trailing 1.0, a scale and two words the sampler does not read.
+    pub fn article_animation(&self, data: &[u8], art: &Article) -> Option<AnimTrack> {
+        let anim = art.level(b"Anim")?;
+        let anqt = art.level(b"Anqt")?;
+        let (ao, al) = (anim.data_offset(), anim.data_len());
+        if al < 4 || ao + al > data.len() {
+            return None;
+        }
+        let count = u32::from_le_bytes([data[ao], data[ao + 1], data[ao + 2], data[ao + 3]]) as usize;
+        let (qo, ql) = (anqt.data_offset(), anqt.data_len());
+        if count == 0 || ql < count * 52 || qo + ql > data.len() {
+            return None;
+        }
+        let f = |o: usize| f32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+        let frames = (0..count)
+            .map(|i| {
+                let b = qo + i * 52;
+                AnimFrame {
+                    rotation: [f(b), f(b + 4), f(b + 8), f(b + 12)],
+                    position: [f(b + 16), f(b + 20), f(b + 24)],
+                    scale: [f(b + 32), f(b + 36), f(b + 40)],
+                }
+            })
+            .collect();
+        Some(AnimTrack { frames })
     }
 
     /// Decode an article's geometry: the `Base` LOD table and every primitive with its streams
@@ -347,27 +411,70 @@ impl Crp {
             let uvs: Vec<[f32; 2]> = read_vec(uv, 8, 2).into_iter().map(|v| [v[0], v[1]]).collect();
             let colors: Vec<u32> = df.map(|b| b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()).unwrap_or_default();
             let n = rec.index_count as usize;
-            let (vertex_indices, uv_indices) = if rec.prim_type == 3 && rec.index_arrays.len() == 2 {
-                let ia = rec.index_area_offset;
-                let vi = bytes.get(ia..ia + n).ok_or(FormatError::Truncated { what: "CRP vertex indices", offset: pr.data_offset() + ia, needed: n })?;
-                let ui = bytes.get(ia + n..ia + 2 * n).ok_or(FormatError::Truncated { what: "CRP uv indices", offset: pr.data_offset() + ia + n, needed: n })?;
-                for (k, &i) in vi.iter().enumerate() {
-                    if i as usize >= positions.len() {
-                        return Err(FormatError::UnexpectedValue {
-                            what: "CRP vertex index",
-                            offset: pr.data_offset() + ia + k,
-                            expected: format!("< {}", positions.len()),
-                            found: i.to_string(),
-                        });
-                    }
+            // Any primitive kind may carry indices: `vI`+`uI` (both indexed), `vI` alone (uv and
+            // colour run per corner) or neither (everything sequential).
+            let ia = rec.index_area_offset;
+            let (vertex_indices, uv_indices) = match rec.index_arrays.len() {
+                2 => {
+                    let vi = bytes.get(ia..ia + n).ok_or(FormatError::Truncated { what: "CRP vertex indices", offset: pr.data_offset() + ia, needed: n })?;
+                    let ui = bytes.get(ia + n..ia + 2 * n).ok_or(FormatError::Truncated { what: "CRP uv indices", offset: pr.data_offset() + ia + n, needed: n })?;
+                    (vi.to_vec(), ui.to_vec())
                 }
-                (vi.to_vec(), ui.to_vec())
-            } else {
-                (Vec::new(), Vec::new())
+                1 => {
+                    let vi = bytes.get(ia..ia + n).ok_or(FormatError::Truncated { what: "CRP vertex indices", offset: pr.data_offset() + ia, needed: n })?;
+                    (vi.to_vec(), Vec::new())
+                }
+                _ => (Vec::new(), Vec::new()),
             };
+            for (k, &i) in vertex_indices.iter().enumerate() {
+                if i as usize >= positions.len() {
+                    return Err(FormatError::UnexpectedValue {
+                        what: "CRP vertex index",
+                        offset: pr.data_offset() + ia + k,
+                        expected: format!("< {}", positions.len()),
+                        found: i.to_string(),
+                    });
+                }
+            }
             primitives.push(Primitive { lod, prim_type: rec.prim_type, flags: rec.flags, material: rec.material, positions, normals, uvs, colors, vertex_indices, uv_indices });
         }
         Ok(ArticleGeometry { name, base, transform, transforms, primitives })
+    }
+}
+
+/// One frame of an article's `Anqt` rotation track (52 bytes; `RE/notes/crp-geometry.md` §7).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnimFrame {
+    /// unit quaternion, x y z w
+    pub rotation: [f32; 4],
+    pub position: [f32; 3],
+    pub scale: [f32; 3],
+}
+
+/// An article's animation: `Anim`'s frame count and `Anqt`'s per-frame track.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnimTrack {
+    pub frames: Vec<AnimFrame>,
+}
+
+impl AnimTrack {
+    /// The frame pair and blend at `seconds`, by `AnimPlayer::sample` 0x470E90: a looping track
+    /// wraps at `frames − 2`, a one-shot holds its last frame.
+    pub fn sample(&self, seconds: f32, seconds_per_frame: f32, looping: bool) -> (usize, usize, f32) {
+        let n = self.frames.len();
+        if n < 2 || seconds_per_frame <= 0.0 {
+            return (0, 0, 0.0);
+        }
+        let f = (seconds.max(0.0) / seconds_per_frame).max(0.0);
+        let mut i = f as usize;
+        let mut frac = f - i as f32;
+        if looping {
+            i %= n - 2;
+        } else if i >= n - 2 {
+            i = n - 1;
+            frac = 0.0;
+        }
+        (i, (i + 1).min(n - 1), frac)
     }
 }
 
@@ -520,8 +627,15 @@ impl PrimitiveRecord {
             index_arrays.push(([t[1], t[0]], u32_le(b, p + 4, "pr index array offset")?));
             p += 8;
         }
-        // index_count: the 'uI' array offset equals the vertex index count; fall back to remaining/2.
-        let index_count = index_arrays.iter().find(|(t, _)| t == b"uI").map(|(_, o)| *o).unwrap_or(((b.len() - p) / 2) as u32);
+        // With the usual `vI`+`uI` pair the `uI` offset is the index count (the two arrays are equally
+        // long). Some primitives carry **only** `vI`, and then the whole remaining index area is that
+        // one array, with the uv and colour streams running per corner instead of being indexed.
+        // the tags are stored reversed in the file, so the uv array reads back as `Iu`
+        let index_count = match index_arrays.iter().find(|(t, _)| t == b"Iu") {
+            Some((_, o)) => *o,
+            None if index_arrays.len() == 1 => (b.len() - p) as u32,
+            None => 0,
+        };
         Ok(Self {
             prim_type: u16_le(b, 0, "pr type")?,
             flags: u16_le(b, 2, "pr flags")?,
@@ -533,6 +647,17 @@ impl PrimitiveRecord {
             index_count,
         })
     }
+}
+
+/// One `BndP` record: the collision body points a style selects.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundPoints {
+    /// Index into the car-info style array at `+0x56C`.
+    pub style_slot: u32,
+    /// The value that slot must hold for these points to be part of the body.
+    pub style_value: u32,
+    /// Model-frame points, `y = 0` at the wheel contact plane.
+    pub points: Vec<[f32; 3]>,
 }
 
 /// A primitive with its stream windows resolved. Indices are relative to `positions`/`uvs`.

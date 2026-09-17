@@ -25,6 +25,7 @@ struct GlobalsUniform {
 struct ObjectUniform {
     model: [[f32; 4]; 4],
     env_mix: [f32; 4],
+    light: [f32; 4],
 }
 
 struct GpuMesh {
@@ -53,6 +54,8 @@ struct GpuMaterial {
     cull_back: bool,
     depth_test: bool,
     env_mix: f32,
+    /// the diffuse texture, kept so the material can be rebound to another environment map
+    texture: TextureId,
 }
 
 pub struct Renderer {
@@ -75,6 +78,8 @@ pub struct Renderer {
     materials: Vec<GpuMaterial>,
     white: TextureId,
     sprite_pipeline: wgpu::RenderPipeline,
+    /// offscreen render targets handed out by [`Renderer::render_offscreen`], by texture index
+    offscreen: std::collections::HashMap<u32, (u32, u32)>,
     sprite_layout: wgpu::BindGroupLayout,
     sprite_buf: wgpu::Buffer,
 }
@@ -310,6 +315,7 @@ impl Renderer {
             materials: Vec::new(),
             white: TextureId(0),
             sprite_pipeline,
+            offscreen: std::collections::HashMap::new(),
             sprite_layout,
             sprite_buf,
         };
@@ -341,6 +347,11 @@ impl Renderer {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.depth_view = Self::make_depth(&self.device, &self.config);
+    }
+
+    /// The surface's pixel size.
+    pub fn size(&self) -> (u32, u32) {
+        (self.config.width.max(1), self.config.height.max(1))
     }
 
     pub fn aspect(&self) -> f32 {
@@ -396,6 +407,25 @@ impl Renderer {
         TextureId(self.textures.len() as u32 - 1)
     }
 
+    /// Overwrite an existing texture's pixels, keeping its id and every bind group that points at
+    /// it. The new data must have the same dimensions and mip count as the original. Used for the
+    /// car's texture pages, which are recomposed when the damage decals change
+    /// (`RE/notes/car-model.md` §11).
+    pub fn update_texture(&mut self, id: TextureId, tex: &TextureData) {
+        let Some(gpu) = self.textures.get(id.0 as usize) else { return };
+        let (mut w, mut h) = (tex.width, tex.height);
+        for (level, data) in tex.mips.iter().enumerate() {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &gpu._texture, mip_level: level as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                data,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            w = (w / 2).max(1);
+            h = (h / 2).max(1);
+        }
+    }
+
     pub fn create_material(&mut self, desc: MaterialDesc) -> MaterialId {
         let tex = &self.textures[desc.texture.unwrap_or(self.white).0 as usize];
         let env = &self.textures[desc.env_texture.unwrap_or(self.white).0 as usize];
@@ -408,8 +438,33 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&env.view) },
             ],
         });
-        self.materials.push(GpuMaterial { bind_group, alpha_blend: desc.alpha_blend, cull_back: desc.cull_back, depth_test: desc.depth_test, env_mix: if desc.env_texture.is_some() { desc.env_mix } else { 0.0 } });
+        self.materials.push(GpuMaterial {
+            bind_group,
+            alpha_blend: desc.alpha_blend,
+            cull_back: desc.cull_back,
+            depth_test: desc.depth_test,
+            env_mix: if desc.env_texture.is_some() { desc.env_mix } else { 0.0 },
+            texture: desc.texture.unwrap_or(self.white),
+        });
         MaterialId(self.materials.len() as u32 - 1)
+    }
+
+    /// Point every reflective material at another environment map — the original re-binds the car's
+    /// environment layers whenever the `.map` section under it changes (`RE/notes/lighting.md` §3).
+    pub fn set_env_texture(&mut self, env: TextureId) {
+        let env_view = &self.textures[env.0 as usize].view;
+        for m in self.materials.iter_mut().filter(|m| m.env_mix > 0.0) {
+            let tex = &self.textures[m.texture.0 as usize];
+            m.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("material"),
+                layout: &self.material_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&tex.view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(env_view) },
+                ],
+            });
+        }
     }
 
     pub fn render(&mut self, scene: &Scene, camera: &Camera) -> Result<()> {
@@ -429,6 +484,49 @@ impl Renderer {
     }
 
     /// Render one frame into an offscreen RGBA8 image (for screenshots and automated checks).
+    /// Render a scene's meshes into an offscreen texture that the sprite pass can then draw, so a
+    /// 3D view can sit **inside** the 2D screen in the right drawing order — what the front end's
+    /// `NFS5.3DCAR` widgets need (`RE/notes/frontend-3d.md` §4). The clear is transparent, so only
+    /// the geometry shows. Passing the id of a texture this returned earlier reuses it.
+    pub fn render_offscreen(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32, reuse: Option<TextureId>) -> TextureId {
+        let (width, height) = (width.max(1), height.max(1));
+        let id = match reuse.filter(|t| self.offscreen.get(&t.0).is_some_and(|(w, h)| *w == width && *h == height)) {
+            Some(t) => t,
+            None => {
+                let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("offscreen 3d"),
+                    size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.config.format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&Default::default());
+                let sprite_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("offscreen tex"),
+                    layout: &self.sprite_layout,
+                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) }],
+                }));
+                self.textures.push(GpuTexture { _texture: texture, view, sprite_bg });
+                let id = TextureId(self.textures.len() as u32 - 1);
+                self.offscreen.insert(id.0, (width, height));
+                id
+            }
+        };
+        let mut cfg = self.config.clone();
+        cfg.width = width;
+        cfg.height = height;
+        let depth = Self::make_depth(&self.device, &cfg);
+        let view = self.textures[id.0 as usize].view.clone();
+        let mut clear = scene.clone();
+        clear.clear_color = [0.0, 0.0, 0.0, 0.0];
+        clear.sprites.clear();
+        self.encode_frame(&clear, camera, &view, &depth, width as f32 / height as f32);
+        id
+    }
+
     pub fn render_to_image(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32) -> Result<Vec<u8>> {
         let target = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen"),
@@ -497,7 +595,12 @@ impl Renderer {
         let mut staging = vec![0u8; self.object_stride as usize * n];
         for (i, item) in scene.items.iter().take(n).enumerate() {
             let env_mix = self.materials.get(item.material.0 as usize).map(|m| m.env_mix).unwrap_or(0.0);
-            let o = ObjectUniform { model: item.transform.to_cols_array_2d(), env_mix: [env_mix, 0.0, 0.0, 0.0] };
+            let o = ObjectUniform {
+                model: item.transform.to_cols_array_2d(),
+                // .x is the environment-map mix, .zw a uv offset (the sky layers scroll with it)
+                env_mix: [env_mix, 0.0, item.uv_offset[0], item.uv_offset[1]],
+                light: [item.light[0], item.light[1], item.light[2], item.alpha],
+            };
             let off = i * self.object_stride as usize;
             staging[off..off + std::mem::size_of::<ObjectUniform>()].copy_from_slice(bytemuck::bytes_of(&o));
         }

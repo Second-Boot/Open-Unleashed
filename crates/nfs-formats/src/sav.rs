@@ -10,10 +10,10 @@
 //! Nine modules contribute bytes; `TrackRecords` contributes none (its save fn writes
 //! `SaveData\nfs5.trk` as a side effect and its load fn is `mov al,1; ret`). The optional trailing
 //! `"accessor\0" u32 len` block holds the front-end accessors — options, selections, the chronicle
-//! year — in `std::map` (byte-wise `strcmp`) order. Which concrete accessor class backs each of the
-//! ~220 names was not enumerated (§9, UNKNOWN), so a payload cannot be sized generically: this
-//! module therefore carries the block as opaque bytes, round-tripping one it read and omitting it
-//! otherwise. §9.6: when the block is absent the original falls back to default options.
+//! year — in `std::map` (byte-wise `strcmp`) order. All 221 registered names and the class that
+//! serialises each one are in [`ACCESSORS`] (`savegame.md` §6.2a), so the block is fully typed
+//! here: [`AccessorBlock`] parses and writes it, and a *subset* is legal because the original looks
+//! every name up in its own registry and anything absent keeps its default (§9.6).
 
 use crate::FormatError;
 
@@ -30,6 +30,65 @@ pub const FE_CAR_IMAGE: usize = 0x758;
 pub const PART_RECORD: usize = 0x168;
 /// `Knockout`'s blob: 33 dwords at `[0x690410]`.
 pub const KNOCKOUT_BLOB: usize = 0x84;
+
+/// The `Knockout` module's 0x84-byte state block (`modes.md` §5.2, CONFIRMED). The module is the raw
+/// image of `[0x690410]`, so this is a typed view of it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KnockoutState {
+    /// +0x00 — the series is running.
+    pub active: bool,
+    /// +0x04 — index of the next race, 0-based.
+    pub race_index: i32,
+    /// +0x08 — opponents, which is also the number of races.
+    pub opponents: i32,
+    /// +0x0C — `alive[car]`, car 0 = the player.
+    pub alive: [u8; 16],
+    /// +0x1C — the personality id of opponents 1..n, drawn once at the start of the series.
+    pub personalities: [i32; 8],
+    /// +0x3C — the grid position for the next race, −1 when the car is out.
+    pub start_pos: [i32; 9],
+    /// +0x60 — where each car finished the last race, −1 before the first.
+    pub last_pos: [i32; 9],
+}
+
+impl KnockoutState {
+    pub fn parse(b: &[u8]) -> Self {
+        let u32at = |o: usize| b.get(o..o + 4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]])).unwrap_or(0);
+        let i32at = |o: usize| u32at(o) as i32;
+        let mut s = Self { active: b.first().copied().unwrap_or(0) != 0, race_index: i32at(4), opponents: i32at(8), ..Default::default() };
+        for (i, a) in s.alive.iter_mut().enumerate() {
+            *a = b.get(0x0C + i).copied().unwrap_or(0);
+        }
+        for (i, p) in s.personalities.iter_mut().enumerate() {
+            *p = i32at(0x1C + i * 4);
+        }
+        for (i, p) in s.start_pos.iter_mut().enumerate() {
+            *p = i32at(0x3C + i * 4);
+        }
+        for (i, p) in s.last_pos.iter_mut().enumerate() {
+            *p = i32at(0x60 + i * 4);
+        }
+        s
+    }
+
+    pub fn write(&self) -> Vec<u8> {
+        let mut b = vec![0u8; KNOCKOUT_BLOB];
+        b[0] = u8::from(self.active);
+        b[4..8].copy_from_slice(&self.race_index.to_le_bytes());
+        b[8..12].copy_from_slice(&self.opponents.to_le_bytes());
+        b[0x0C..0x1C].copy_from_slice(&self.alive);
+        for (i, p) in self.personalities.iter().enumerate() {
+            b[0x1C + i * 4..0x20 + i * 4].copy_from_slice(&p.to_le_bytes());
+        }
+        for (i, p) in self.start_pos.iter().enumerate() {
+            b[0x3C + i * 4..0x40 + i * 4].copy_from_slice(&p.to_le_bytes());
+        }
+        for (i, p) in self.last_pos.iter().enumerate() {
+            b[0x60 + i * 4..0x64 + i * 4].copy_from_slice(&p.to_le_bytes());
+        }
+        b
+    }
+}
 
 fn err(offset: usize, needed: usize) -> FormatError {
     FormatError::Truncated { what: "sav", offset, needed }
@@ -287,9 +346,9 @@ pub struct SaveFile {
     pub knockout: Option<Vec<u8>>,
     /// The selected music-track list.
     pub cd_player: Option<Vec<u32>>,
-    /// The accessor block payload, without its `u32` length prefix — opaque here (see the module
-    /// docs); `None` omits the block entirely.
-    pub accessors: Option<Vec<u8>>,
+    /// The accessor block, `None` when the file has none. Writing a subset is legal: the original
+    /// looks every name up in its own registry and anything absent keeps its default.
+    pub accessors: Option<AccessorBlock>,
     /// Module names seen in the file, in file order (a byte-identical rewrite needs the original
     /// order; [`SaveFile::write`] uses [`MODULE_ORDER`]).
     pub order: Vec<String>,
@@ -331,7 +390,7 @@ impl SaveFile {
                 }
                 "accessor" => {
                     let n = r.u32()? as usize;
-                    out.accessors = Some(r.take(n)?.to_vec());
+                    out.accessors = Some(AccessorBlock::parse(r.take(n)?)?);
                 }
                 // The original's reader fails hard on a name it does not know, because it cannot
                 // size the payload that follows (0x4DEBBC → return false).
@@ -427,9 +486,432 @@ impl SaveFile {
             }
         }
         if let Some(a) = &self.accessors {
+            let payload = a.write();
             put_cstr(&mut out, "accessor");
-            put_u32(&mut out, a.len() as u32);
-            out.extend_from_slice(a);
+            put_u32(&mut out, payload.len() as u32);
+            out.extend_from_slice(&payload);
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The accessor block (§6, §6.1, §6.2a)
+// ---------------------------------------------------------------------------------------------
+
+/// What one accessor writes, by the class that backs it (`RE/notes/savegame.md` §6.1, CONFIRMED).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessorKind {
+    /// The generic `FEAccessor::Save`/`Load` 0x4BC460 / 0x4BC480: the dword at `this+0x18`.
+    Dword,
+    /// `FEStringAccessor` 0x4BCBF0: a NUL-terminated string.
+    Text,
+    /// `FECharVectAccessor` 0x4B8D70: `u32 n`, `n × (char[] NUL)`, `u32 selection` — or just the
+    /// selection when the accessor carries a list it does not own (`this+0x34 != 0`).
+    CharVect,
+    /// `FEColourAccessor` 0x4B9520: selection and RGBA.
+    Colour,
+    /// `FEOwnedCarAccessor` 0x4F5B30: the car count and the selection (the cars live in `PlayerInfo`).
+    OwnedCarSel,
+    /// `FEOpponentCarAccessor` 0x4F56C0: a selection then seven embedded cars.
+    OpponentCars,
+    /// `FEControllerDeadZoneAccessor` 0x51BEC0: a selection then sixteen dwords.
+    DeadZone,
+    /// `FEControllerInputAccessor` 0x51D060: six dwords and no selection.
+    ControllerInput,
+    /// `Factory.Data`, `Comms.Data`, `Showcase.Text` and `Tournament.Data`: their Save and Load are
+    /// both `0x50BBE0`, which is `ret 4` — they write nothing at all.
+    Empty,
+}
+
+/// Every accessor the front end registers, with the class that serialises it — the byte-wise
+/// ascending order the `std::map` at `[0x65B3A8]` keeps them in, which is the order the block must
+/// be written in. Extracted from the image: each name's push site names its constructor, the
+/// constructor's vtable store names the class through its RTTI descriptor (`savegame.md` §6.2a).
+pub const ACCESSORS: [(&str, AccessorKind); 221] = [
+    ("ABOOL", AccessorKind::Dword), // FEBoolAccessor
+    ("ANINTEGER", AccessorKind::Dword), // FEIntAccessor
+    ("ANOTHER", AccessorKind::Text), // FEStringAccessor
+    ("Audio.AmbientLevel", AccessorKind::Dword), // FEIntAccessor
+    ("Audio.EngineLevel", AccessorKind::Dword), // FEIntAccessor
+    ("Audio.Mode", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Audio.MusicLevel", AccessorKind::Dword), // FEIntAccessor
+    ("Audio.Quality", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Audio.SfxLevel", AccessorKind::Dword), // FEIntAccessor
+    ("Audio.SpeechLevel", AccessorKind::Dword), // FEIntAccessor
+    ("BrakeBias", AccessorKind::Dword), // FEFloatAccessor
+    ("CARSETTINGS.CAR", AccessorKind::Dword), // FECarSettingsCarAccessor
+    ("CDPlayer.AvailableList", AccessorKind::Dword), // FEAvailableSongsAccessor
+    ("CDPlayer.Options", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("CDPlayer.SelectedList", AccessorKind::Dword), // FESelectedSongsAccessor
+    ("CDPlayer.View", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("COMMS.ACCOUNTID", AccessorKind::Text), // FEStringAccessor
+    ("COMMS.PASSWORD", AccessorKind::Text), // FEStringAccessor
+    ("Camera.1", AccessorKind::Dword), // FEPositionableAccessor
+    ("Camera.2", AccessorKind::Dword), // FEPositionableAccessor
+    ("Camera.3", AccessorKind::Dword), // FEPositionableAccessor
+    ("Camera.4", AccessorKind::Dword), // FEPositionableAccessor
+    ("Camera.Current", AccessorKind::Dword), // FEPositionableAccessor
+    ("Car.ABS", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Car.Roof", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Car.Traction", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Car.Transmission", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("CarCompare.Data", AccessorKind::Dword), // FECarCompareDataAccessor
+    ("Chronicle.Year", AccessorKind::Dword), // FEIntAccessor
+    ("Comms.ChatInput", AccessorKind::Text), // FEStringAccessor
+    ("Comms.Collision", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Comms.Data", AccessorKind::Empty), // FEMultiplayerDataAccessor
+    ("Comms.GameMode", AccessorKind::Dword), // FEPositionableAccessor
+    ("Comms.GameName", AccessorKind::Text), // FEStringAccessor
+    ("Comms.GamesList", AccessorKind::Dword), // FEGameListAccessor
+    ("Comms.IP", AccessorKind::Text), // FEStringAccessor
+    ("Comms.IPList", AccessorKind::CharVect), // FECharVectAccessor
+    ("Comms.LobbyPlayerList", AccessorKind::Dword), // FELobbyPlayerListAccessor
+    ("Comms.ModemList", AccessorKind::CharVect), // FECharVectAccessor
+    ("Comms.PhoneList", AccessorKind::CharVect), // FECharVectAccessor
+    ("Comms.PhoneNumber", AccessorKind::Text), // FEStringAccessor
+    ("Comms.PlayerList", AccessorKind::Dword), // FEPlayerListAccessor
+    ("Comms.Positional", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Comms.PrimaryServerInput", AccessorKind::Text), // FEStringAccessor
+    ("Comms.ServerList", AccessorKind::Dword), // FECommInfoAccessor
+    ("Controller.Accel", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("Controller.AllControllers", AccessorKind::CharVect), // FECharVectAccessor
+    ("Controller.AllPads", AccessorKind::CharVect), // FECharVectAccessor
+    ("Controller.Brake", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("Controller.CameraView", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("Controller.HandBrake", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("Controller.Hazards", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("Controller.Horn", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("Controller.LeftTurnSignal", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("Controller.Lights", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("Controller.LookBehind", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("Controller.LookForward", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("Controller.LookLeft", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("Controller.LookRight", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("Controller.Pause", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("Controller.ResetCar", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("Controller.RightTurnSignal", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("Controller.ShiftDown", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("Controller.ShiftUp", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("Controller.SteerLeft", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("Controller.SteerRight", AccessorKind::ControllerInput), // FEControllerInputAccessor
+    ("DealerCar.Car", AccessorKind::Dword), // FEGenericCarAccessor
+    ("DealerCar.Colour", AccessorKind::Dword), // FEGenericCarAccessor
+    ("DealerCar.IntColour", AccessorKind::Colour), // FEColourAccessor
+    ("Display.Damage", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Display.DispCols", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Display.Gear", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Display.Map", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Display.MapScale", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Display.OppList", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Display.RearView", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Display.RecordTime", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Display.ScreenLayout", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Display.SpeedUnits", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Display.Speedometer", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Display.SplitTimes", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Display.Tach", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Display.Translucency", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("FDPrizeCars.Car", AccessorKind::Dword), // FEFactoryDriverPrizeCarAccessor
+    ("FDownForce", AccessorKind::Dword), // FEFloatAccessor
+    ("FF.CollisionVolume", AccessorKind::Dword), // FEIntAccessor
+    ("FF.EngineVolume", AccessorKind::Dword), // FEIntAccessor
+    ("FF.RoadGripVolume", AccessorKind::Dword), // FEIntAccessor
+    ("FF.RoadVolume", AccessorKind::Dword), // FEIntAccessor
+    ("FF.TotalVolume", AccessorKind::Dword), // FEIntAccessor
+    ("FTirePressure", AccessorKind::Dword), // FEFloatAccessor
+    ("Factory.Data", AccessorKind::Empty), // FEFactoryDriverDataAccessor
+    ("Factory.MissionCheat", AccessorKind::Dword), // FEIntAccessor
+    ("Factory.ProfileNum", AccessorKind::Dword), // FEPositionableAccessor
+    ("FactoryDriver.Car", AccessorKind::Dword), // FEFactoryDriverCarAccessor
+    ("Game.Damage", AccessorKind::Dword), // FEBoolAccessor
+    ("Game.Difficutly", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Game.GameType", AccessorKind::Dword), // FEIntAccessor
+    ("Game.MaxHumanCars", AccessorKind::Dword), // FEIntAccessor
+    ("Game.NumKOOpponents", AccessorKind::Dword), // FEIntAccessor
+    ("Game.NumOpponents", AccessorKind::Dword), // FEIntAccessor
+    ("Gear0", AccessorKind::Dword), // FEFloatAccessor
+    ("Gear1", AccessorKind::Dword), // FEFloatAccessor
+    ("Gear2", AccessorKind::Dword), // FEFloatAccessor
+    ("Gear3", AccessorKind::Dword), // FEFloatAccessor
+    ("Gear4", AccessorKind::Dword), // FEFloatAccessor
+    ("Gear5", AccessorKind::Dword), // FEFloatAccessor
+    ("Gear6", AccessorKind::Dword), // FEFloatAccessor
+    ("Gear7", AccessorKind::Dword), // FEFloatAccessor
+    ("GenericCar.Car", AccessorKind::Dword), // FEGenericCarAccessor
+    ("GenericCar.Colour", AccessorKind::Dword), // FEGenericCarAccessor
+    ("GenericCar2.Car", AccessorKind::Dword), // FEGenericCarAccessor
+    ("Graphics.CarChrome", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Graphics.CarDetail", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Graphics.DetailedShadows", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Graphics.GammaCorrection", AccessorKind::Dword), // FEIntAccessor
+    ("Graphics.Headlights", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Graphics.LensFlare", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Graphics.Reflections", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Graphics.Resolutions", AccessorKind::CharVect), // FEScreenResolutionAccessor
+    ("Graphics.ShadowMapping", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Graphics.SkyRendering", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Graphics.SpecialFX", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Graphics.TextureDetail", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Graphics.TexturedDamage", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Graphics.TripleBuffer", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Graphics.ViewDistance", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Graphics.WideScreen", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Knockout.Direction", AccessorKind::Dword), // FEAliasedPositionableAccessor
+    ("Knockout.Laps", AccessorKind::Dword), // FEAliasedPositionableAccessor
+    ("Knockout.Track", AccessorKind::Dword), // FEAliasedPositionableAccessor
+    ("Knockout.TrackNumber", AccessorKind::Dword), // FEKnockoutTrackNumberAccessor
+    ("Knockout.Traffic", AccessorKind::Dword), // FEAliasedPositionableAccessor
+    ("LoopedTrack.Track", AccessorKind::Dword), // FETrackAccessor
+    ("OpponentCar.Car", AccessorKind::OpponentCars), // FEOpponentCarAccessor
+    ("OwnedCar.DecalNum", AccessorKind::Dword), // FEIntAccessor
+    ("OwnedCar.ExtColour", AccessorKind::Colour), // FEColourAccessor
+    ("OwnedCar.IntColour", AccessorKind::Colour), // FEColourAccessor
+    ("OwnedCar.PackageNum", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("OwnedCar.S1Colour", AccessorKind::Colour), // FEColourAccessor
+    ("OwnedCar.S2Colour", AccessorKind::Colour), // FEColourAccessor
+    ("OwnedCars.Car", AccessorKind::OwnedCarSel), // FEOwnedCarAccessor
+    ("Parts.AllParts", AccessorKind::Dword), // FEPartsAllPartsAccessor
+    ("Parts.InstallList", AccessorKind::Dword), // FEPartsCarSetupInventoryAccessor
+    ("Parts.OwnedDamageRepairList", AccessorKind::Dword), // FEPartsDamageRepairAccessor
+    ("Parts.UsedDamageList", AccessorKind::Dword), // FEPartsDamageRepairAccessor
+    ("PrizeCars.Car", AccessorKind::Dword), // FEPrizeCarAccessor
+    ("QUICKFIX.BODYWORK", AccessorKind::Dword), // FEBoolAccessor
+    ("QUICKFIX.BRAKES", AccessorKind::Dword), // FEBoolAccessor
+    ("QUICKFIX.COSMETIC", AccessorKind::Dword), // FEBoolAccessor
+    ("QUICKFIX.ENGINE", AccessorKind::Dword), // FEBoolAccessor
+    ("QUICKFIX.OVERALL", AccessorKind::Dword), // FEBoolAccessor
+    ("QUICKFIX.SHOCKS", AccessorKind::Dword), // FEBoolAccessor
+    ("QUICKFIX.SUSPENSION", AccessorKind::Dword), // FEBoolAccessor
+    ("QUICKFIX.SWAYBARS", AccessorKind::Dword), // FEBoolAccessor
+    ("QUICKFIX.TIRES", AccessorKind::Dword), // FEBoolAccessor
+    ("QUICKFIX.TRANSMISSION", AccessorKind::Dword), // FEBoolAccessor
+    ("RDownForce", AccessorKind::Dword), // FEFloatAccessor
+    ("RTirePressure", AccessorKind::Dword), // FEFloatAccessor
+    ("Record.Track", AccessorKind::Dword), // FETrackRecordsDescripAccessor
+    ("Replay.List", AccessorKind::CharVect), // FECharVectAccessor
+    ("RideHeight", AccessorKind::Dword), // FEFloatAccessor
+    ("ShockRate", AccessorKind::Dword), // FEFloatAccessor
+    ("Showcase.Text", AccessorKind::Empty), // FEShowcaseTextAccessor
+    ("SliderA.Max", AccessorKind::DeadZone), // FEControllerDeadZoneAccessor
+    ("SliderA.Min", AccessorKind::DeadZone), // FEControllerDeadZoneAccessor
+    ("SliderB.Max", AccessorKind::DeadZone), // FEControllerDeadZoneAccessor
+    ("SliderB.Min", AccessorKind::DeadZone), // FEControllerDeadZoneAccessor
+    ("SteeringToe", AccessorKind::Dword), // FEFloatAccessor
+    ("Suspension", AccessorKind::Dword), // FEFloatAccessor
+    ("Test.Windowed", AccessorKind::Dword), // FEBoolAccessor
+    ("Tournament.Data", AccessorKind::Empty), // FETournamentDataAccessor
+    ("Tournament.EventType", AccessorKind::Dword), // FETournamentEventTypeAccessor
+    ("Tournament.RemainingTracks", AccessorKind::Dword), // FETrackAccessor
+    ("Tournament.Tournament", AccessorKind::Dword), // FETournyAccessor
+    ("Track.Records", AccessorKind::Dword), // FETrackRecordsAccessor
+    ("Track1.Direction", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track1.Laps", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track1.Track", AccessorKind::Dword), // FETrackAccessor
+    ("Track1.Traffic", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track2.Direction", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track2.Laps", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track2.Track", AccessorKind::Dword), // FETrackAccessor
+    ("Track2.Traffic", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track3.Direction", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track3.Laps", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track3.Track", AccessorKind::Dword), // FETrackAccessor
+    ("Track3.Traffic", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track4.Direction", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track4.Laps", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track4.Track", AccessorKind::Dword), // FETrackAccessor
+    ("Track4.Traffic", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track5.Direction", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track5.Laps", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track5.Track", AccessorKind::Dword), // FETrackAccessor
+    ("Track5.Traffic", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track6.Direction", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track6.Laps", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track6.Track", AccessorKind::Dword), // FETrackAccessor
+    ("Track6.Traffic", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track7.Direction", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track7.Laps", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("Track7.Track", AccessorKind::Dword), // FETrackAccessor
+    ("Track7.Traffic", AccessorKind::Dword), // FELocalizedTextAccessor
+    ("UVWj", AccessorKind::Dword), // FETournyAccessor
+    ("UsedCar.Car", AccessorKind::OwnedCarSel), // FEOwnedCarAccessor
+    ("UserList.NameInput", AccessorKind::Text), // FEStringAccessor
+    ("UserList.UserList", AccessorKind::CharVect), // FESpecialUserListCharVectAccessor
+    ("XAxis.Max", AccessorKind::DeadZone), // FEControllerDeadZoneAccessor
+    ("XAxis.Min", AccessorKind::DeadZone), // FEControllerDeadZoneAccessor
+    ("XRot.Max", AccessorKind::DeadZone), // FEControllerDeadZoneAccessor
+    ("XRot.Min", AccessorKind::DeadZone), // FEControllerDeadZoneAccessor
+    ("YAxis.Max", AccessorKind::DeadZone), // FEControllerDeadZoneAccessor
+    ("YAxis.Min", AccessorKind::DeadZone), // FEControllerDeadZoneAccessor
+    ("YRot.Max", AccessorKind::DeadZone), // FEControllerDeadZoneAccessor
+    ("YRot.Min", AccessorKind::DeadZone), // FEControllerDeadZoneAccessor
+    ("ZAxis.Max", AccessorKind::DeadZone), // FEControllerDeadZoneAccessor
+    ("ZAxis.Min", AccessorKind::DeadZone), // FEControllerDeadZoneAccessor
+    ("ZRot.Max", AccessorKind::DeadZone), // FEControllerDeadZoneAccessor
+    ("ZRot.Min", AccessorKind::DeadZone), // FEControllerDeadZoneAccessor
+    ("zMergedList.Car", AccessorKind::Dword), // FEMergedCarListAccessor
+];
+
+/// The class that backs `name` (the `(MODIFIER)` suffix a layout may add is not part of the key).
+pub fn accessor_kind(name: &str) -> Option<AccessorKind> {
+    let key = name.split_once('(').map(|(b, _)| b.trim()).unwrap_or(name);
+    ACCESSORS.iter().find(|(n, _)| *n == key).map(|(_, k)| *k)
+}
+
+/// One accessor's stored value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AccessorValue {
+    Dword(u32),
+    Text(String),
+    /// `Some(items)` when the accessor owns its list, `None` when it only stores the selection.
+    CharVect { items: Option<Vec<String>>, selection: u32 },
+    Colour { selection: u32, rgba: u32 },
+    OwnedCarSel { cars: u32, selection: u32 },
+    OpponentCars { selection: u32, cars: Vec<SavedCar> },
+    DeadZone { selection: u32, values: [u32; 16] },
+    ControllerInput([u32; 6]),
+    Empty,
+}
+
+impl AccessorValue {
+    pub fn kind(&self) -> AccessorKind {
+        match self {
+            Self::Dword(_) => AccessorKind::Dword,
+            Self::Text(_) => AccessorKind::Text,
+            Self::CharVect { .. } => AccessorKind::CharVect,
+            Self::Colour { .. } => AccessorKind::Colour,
+            Self::OwnedCarSel { .. } => AccessorKind::OwnedCarSel,
+            Self::OpponentCars { .. } => AccessorKind::OpponentCars,
+            Self::DeadZone { .. } => AccessorKind::DeadZone,
+            Self::ControllerInput(_) => AccessorKind::ControllerInput,
+            Self::Empty => AccessorKind::Empty,
+        }
+    }
+}
+
+/// The `"accessor\0"` region: `{ "<Name>\0" + payload }*`, in `std::map` order. A subset is legal —
+/// the reader looks every name up in its own registry and anything absent keeps its default — but a
+/// name the original does not know desyncs the rest, so [`AccessorBlock::write`] skips unknown ones.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AccessorBlock {
+    pub entries: Vec<(String, AccessorValue)>,
+}
+
+impl AccessorBlock {
+    pub fn parse(data: &[u8]) -> Result<Self, FormatError> {
+        let mut r = Reader { data, pos: 0 };
+        let mut entries = Vec::new();
+        while r.pos < data.len() {
+            let name = r.cstr()?;
+            let Some(kind) = accessor_kind(&name) else {
+                return Err(FormatError::UnexpectedValue { what: "sav accessors", offset: r.pos, expected: "a registered accessor name".into(), found: name });
+            };
+            let value = match kind {
+                AccessorKind::Dword => AccessorValue::Dword(r.u32()?),
+                AccessorKind::Text => AccessorValue::Text(r.cstr()?),
+                AccessorKind::CharVect => {
+                    // The writer emits the list only when the accessor owns it; a reader cannot tell
+                    // the two shapes apart from the bytes alone, so the port takes the owning shape
+                    // when the first dword is a plausible count followed by that many strings.
+                    let save = r.pos;
+                    let n = r.u32()? as usize;
+                    let mut items = Vec::new();
+                    let mut ok = n <= 256;
+                    for _ in 0..n {
+                        match r.cstr() {
+                            Ok(s) => items.push(s),
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok && r.pos + 4 <= data.len() {
+                        AccessorValue::CharVect { items: Some(items), selection: r.u32()? }
+                    } else {
+                        r.pos = save;
+                        AccessorValue::CharVect { items: None, selection: r.u32()? }
+                    }
+                }
+                AccessorKind::Colour => AccessorValue::Colour { selection: r.u32()?, rgba: r.u32()? },
+                AccessorKind::OwnedCarSel => AccessorValue::OwnedCarSel { cars: r.u32()?, selection: r.u32()? },
+                AccessorKind::OpponentCars => {
+                    let selection = r.u32()?;
+                    let cars = (0..7).map(|_| SavedCar::read(&mut r)).collect::<Result<_, _>>()?;
+                    AccessorValue::OpponentCars { selection, cars }
+                }
+                AccessorKind::DeadZone => {
+                    let selection = r.u32()?;
+                    let mut values = [0u32; 16];
+                    for v in values.iter_mut() {
+                        *v = r.u32()?;
+                    }
+                    AccessorValue::DeadZone { selection, values }
+                }
+                AccessorKind::ControllerInput => {
+                    let mut values = [0u32; 6];
+                    for v in values.iter_mut() {
+                        *v = r.u32()?;
+                    }
+                    AccessorValue::ControllerInput(values)
+                }
+                AccessorKind::Empty => AccessorValue::Empty,
+            };
+            entries.push((name, value));
+        }
+        Ok(Self { entries })
+    }
+
+    /// The payload region (without the `u32` length the container puts in front of it), in the
+    /// `std::map` order the original writes: byte-wise ascending by name.
+    pub fn write(&self) -> Vec<u8> {
+        let mut entries: Vec<&(String, AccessorValue)> = self.entries.iter().filter(|(n, v)| accessor_kind(n) == Some(v.kind())).collect();
+        entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let mut out = Vec::new();
+        for (name, value) in entries {
+            put_cstr(&mut out, name);
+            match value {
+                AccessorValue::Dword(v) => put_u32(&mut out, *v),
+                AccessorValue::Text(s) => put_cstr(&mut out, s),
+                AccessorValue::CharVect { items, selection } => {
+                    if let Some(items) = items {
+                        put_u32(&mut out, items.len() as u32);
+                        for i in items {
+                            put_cstr(&mut out, i);
+                        }
+                    }
+                    put_u32(&mut out, *selection);
+                }
+                AccessorValue::Colour { selection, rgba } => {
+                    put_u32(&mut out, *selection);
+                    put_u32(&mut out, *rgba);
+                }
+                AccessorValue::OwnedCarSel { cars, selection } => {
+                    put_u32(&mut out, *cars);
+                    put_u32(&mut out, *selection);
+                }
+                AccessorValue::OpponentCars { selection, cars } => {
+                    put_u32(&mut out, *selection);
+                    for c in cars.iter().take(7) {
+                        c.write(&mut out);
+                    }
+                    for _ in cars.len()..7 {
+                        SavedCar::new(vec![0; FE_CAR_IMAGE]).write(&mut out);
+                    }
+                }
+                AccessorValue::DeadZone { selection, values } => {
+                    put_u32(&mut out, *selection);
+                    for v in values {
+                        put_u32(&mut out, *v);
+                    }
+                }
+                AccessorValue::ControllerInput(values) => {
+                    for v in values {
+                        put_u32(&mut out, *v);
+                    }
+                }
+                AccessorValue::Empty => {}
+            }
         }
         out
     }
@@ -465,9 +947,71 @@ mod tests {
             personalities: Some(vec![31, 32, 33]),
             knockout: Some(vec![7; KNOCKOUT_BLOB]),
             cd_player: Some(vec![1, 2, 3]),
-            accessors: Some(b"Chronicle.Year\0\x9e\x07\x00\x00".to_vec()),
+            accessors: Some(AccessorBlock {
+                entries: vec![
+                    ("Chronicle.Year".into(), AccessorValue::Dword(1950)),
+                    ("UserList.NameInput".into(), AccessorValue::Text("Hans".into())),
+                    ("OwnedCars.Car".into(), AccessorValue::OwnedCarSel { cars: 2, selection: 1 }),
+                    ("Game.Damage".into(), AccessorValue::Dword(1)),
+                    ("Factory.Data".into(), AccessorValue::Empty),
+                    ("Controller.Accel".into(), AccessorValue::ControllerInput([1, 2, 3, 4, 5, 6])),
+                    ("OwnedCar.ExtColour".into(), AccessorValue::Colour { selection: 2, rgba: 0x00FF0000 }),
+                ],
+            }),
             order: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_accessor_table_matches_the_registry() {
+        // 221 names, byte-wise ascending — the order the original's std::map keeps and the writer
+        // has to reproduce.
+        assert_eq!(ACCESSORS.len(), 221);
+        for w in ACCESSORS.windows(2) {
+            assert!(w[0].0.as_bytes() < w[1].0.as_bytes(), "{} !< {}", w[0].0, w[1].0);
+        }
+        assert_eq!(accessor_kind("Chronicle.Year"), Some(AccessorKind::Dword));
+        assert_eq!(accessor_kind("Track1.Track(SHORT)"), Some(AccessorKind::Dword), "a layout modifier is not part of the key");
+        assert_eq!(accessor_kind("OwnedCars.Car"), Some(AccessorKind::OwnedCarSel));
+        assert_eq!(accessor_kind("OpponentCar.Car"), Some(AccessorKind::OpponentCars));
+        assert_eq!(accessor_kind("Controller.Accel"), Some(AccessorKind::ControllerInput));
+        assert_eq!(accessor_kind("XAxis.Max"), Some(AccessorKind::DeadZone));
+        assert_eq!(accessor_kind("UserList.UserList"), Some(AccessorKind::CharVect));
+        assert_eq!(accessor_kind("UserList.NameInput"), Some(AccessorKind::Text));
+        // the four whose Save and Load are both `ret 4`
+        for n in ["Factory.Data", "Comms.Data", "Showcase.Text", "Tournament.Data"] {
+            assert_eq!(accessor_kind(n), Some(AccessorKind::Empty), "{n}");
+        }
+        assert_eq!(accessor_kind("Nonsense.Accessor"), None);
+    }
+
+    #[test]
+    fn the_accessor_block_round_trips_every_shape() {
+        let block = AccessorBlock {
+            entries: vec![
+                ("Chronicle.Year".into(), AccessorValue::Dword(1969)),
+                ("Comms.ChatInput".into(), AccessorValue::Text("hello".into())),
+                ("Comms.Data".into(), AccessorValue::Empty),
+                ("Controller.Brake".into(), AccessorValue::ControllerInput([9, 8, 7, 6, 5, 4])),
+                ("Graphics.Resolutions".into(), AccessorValue::CharVect { items: Some(vec!["640x480".into(), "800x600".into()]), selection: 1 }),
+                ("OwnedCar.IntColour".into(), AccessorValue::Colour { selection: 3, rgba: 0x11223344 }),
+                ("OwnedCars.Car".into(), AccessorValue::OwnedCarSel { cars: 4, selection: 2 }),
+                ("XAxis.Min".into(), AccessorValue::DeadZone { selection: 1, values: [7; 16] }),
+            ],
+        };
+        let bytes = block.write();
+        let back = AccessorBlock::parse(&bytes).expect("parse");
+        let mut expect = block.clone();
+        expect.entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        assert_eq!(back, expect);
+        assert_eq!(back.write(), bytes);
+        // an unknown name cannot be sized, exactly as it cannot be in the original
+        let mut bad = b"Nonsense\0".to_vec();
+        bad.extend_from_slice(&[0, 0, 0, 0]);
+        assert!(AccessorBlock::parse(&bad).is_err());
+        // and the writer refuses to emit one, because it would desync everything after it
+        let skipped = AccessorBlock { entries: vec![("Nonsense".into(), AccessorValue::Dword(1)), ("Chronicle.Year".into(), AccessorValue::Dword(2))] };
+        assert_eq!(AccessorBlock::parse(&skipped.write()).unwrap().entries.len(), 1);
     }
 
     #[test]
@@ -478,6 +1022,10 @@ mod tests {
         assert_eq!(back.order, ["Missions", "PartsMarket", "Tournament", "PlayerInfo", "TrackRecords", "UsedCarMarket", "Personalities", "Knockout", "CDPlayer", "accessor"]);
         let mut expect = s.clone();
         expect.order = back.order.clone();
+        // the writer puts the accessors in the std::map order the original keeps them in
+        if let Some(a) = expect.accessors.as_mut() {
+            a.entries.sort_by(|x, y| x.0.as_bytes().cmp(y.0.as_bytes()));
+        }
         assert_eq!(back, expect);
         assert_eq!(back.write(), bytes, "writing a parsed file reproduces it byte for byte");
     }

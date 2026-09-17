@@ -55,7 +55,7 @@ impl AiEngines {
         let road = std::fs::read(sounds_dir.join("SND_coll.bnk"))
             .ok()
             .and_then(|d| Bnk::parse(&d).ok().and_then(|b| b.decode_slot(&d, AI_ROAD_SLOT).ok()))
-            .map(|p| Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range }));
+            .map(|p| Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range, gain: p.gain }));
         Ok(Self { sets: HashMap::new(), road, cars: Vec::new(), viv })
     }
 
@@ -70,7 +70,7 @@ impl AiEngines {
             let bank = Bnk::parse(bytes).ok()?;
             let p = bank.decode_slot(bytes, 0).ok()?;
             let frames = (p.samples.len() / p.channels.max(1) as usize) as u32;
-            Some(Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range.or(Some((0, frames))) }))
+            Some(Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range.or(Some((0, frames))), gain: p.gain }))
         };
         let pair = (load(&format!("{key}lden.bnk")), load(&format!("{key}ldex.bnk")));
         if pair.0.is_none() && pair.1.is_none() {

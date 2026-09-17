@@ -6,13 +6,16 @@
 //! lives in the executable and is not in the file.
 //!
 //! This module draws the widgets the file fully describes: the screen background, the solid, outlined
-//! and gouraud boxes, the glinty lines and rectangles, the pictures, and every text widget that
-//! carries its own `pos` — each in its own `fontPathName` font, its own `foreColor` and its own
-//! `align`. Only `NFS5.HEADER` really has no geometry in the file (it carries `id`, `name`, `state`
-//! and `stringID` and nothing else); it, and the widgets whose *content* comes from the executable
-//! rather than the file (`NFS5.3DCAR`, `NFS5.ListBox`, `NFS5.CarLogo`, and an `NFS5.AccessorWatch`
-//! whose accessor the port cannot resolve), are counted and skipped rather than guessed at.
-//! `unrendered()` reports them.
+//! and gouraud boxes, the glinty lines and rectangles, the pictures, and every text widget — each in
+//! its own `fontPathName` font, its own `foreColor` and its own `align`. `NFS5.HEADER` carries no
+//! `pos`, but the `pos` attribute is registered with a zero default (0x524735), so the class default
+//! *is* the screen origin and the header draws there like any other label. A widget whose `stringID`
+//! is 0 draws nothing: that id is the shipped "Hello, World!" placeholder. The widgets whose
+//! *content* comes from the executable (`NFS5.3DCAR`, `NFS5.ListBox`, `NFS5.CONTROLLERSETUP`, and
+//! an `NFS5.AccessorWatch` whose accessor the port cannot resolve) are counted and skipped rather
+//! than guessed at; `unrendered()` reports them. `NFS5.CarLogo` *is* drawn once the caller binds a
+//! car to it with [`LayoutScreen::set_car_logo`]: the pack and the entry pair both come from the
+//! car's own `nfs5.car` record (+0x147 and +0x1F6).
 //!
 //! **Alignment** is the original's (`FeLabel::draw` 0x5232AD and `FeText_draw` 0x4DA3D7, CONFIRMED):
 //! `align` 0/1/2 anchors the text at the widget box's left edge / midpoint / right edge, and the
@@ -24,12 +27,31 @@
 
 use nfs_assets::GamePaths;
 use nfs_assets::texture::decode_pack;
+use nfs_formats::ctr::ControlLibrary;
 use nfs_formats::lay::Layout;
 use nfs_formats::locale::Strings;
 use nfs_renderer::{Renderer, Sprite, TextureData, TextureId};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::text::BitmapFont;
+
+/// Read `FEData/Controls/*.ctr` — the widget class templates that hold every attribute's default
+/// and the pieces each class is made of (`RE/notes/controls.md`).
+pub fn load_controls(paths: &GamePaths) -> ControlLibrary {
+    let dir = paths.fe_data().join("Controls");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        tracing::debug!(dir = %dir.display(), "no control templates");
+        return ControlLibrary::default();
+    };
+    let files = entries.filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("ctr"))).filter_map(|e| {
+        let bytes = std::fs::read(e.path()).ok()?;
+        Some(bytes.iter().map(|&b| nfs_formats::locale::cp1252(b)).collect::<String>())
+    });
+    let lib = ControlLibrary::from_files(files);
+    tracing::debug!(classes = lib.len(), "control templates loaded");
+    lib
+}
 
 /// A widget the player can operate: a button that leads somewhere or runs a callback, or a combo
 /// slider that edits the accessor it names.
@@ -59,6 +81,198 @@ pub struct LayoutScreen {
     white: TextureId,
     /// widget classes the file does not place, with how many of each were skipped
     unrendered: Vec<(String, usize)>,
+    /// element index of an `NFS5.CarLogo` → the `.fsh` pack and the first of its two entries
+    logos: HashMap<usize, (String, usize)>,
+    /// element index of an `NFS5.ListBox` → its rows and the accessor's current row
+    lists: HashMap<usize, (Vec<ListRow>, Option<usize>)>,
+    /// element index of an `NFS5.3DCAR` → the offscreen texture its car was rendered into, drawn
+    /// full-screen in the widget's own place in the drawing order
+    car_views: HashMap<usize, TextureId>,
+    /// the widget class templates (`FEData/Controls/*.ctr`), shared with the background screen
+    controls: Arc<ControlLibrary>,
+    /// where this screen is in its transition
+    transition: Transition,
+    /// drawn over another screen (the bottom bar, 0x4D39D3) — an overlay must not paint its own fill
+    overlay: bool,
+}
+
+/// The bits a `transon` / `transoff` name maps to (`FE_transitionBits` 0x4C88C0 — the name is
+/// lower-cased first, and anything unrecognised is 0, "no transition").
+pub mod trans {
+    pub const SAME: u32 = 1;
+    pub const LEFT: u32 = 2;
+    pub const RIGHT: u32 = 4;
+    pub const TOP: u32 = 8;
+    pub const BOTTOM: u32 = 0x10;
+    pub const FADE: u32 = 0x20;
+}
+
+/// `transon` / `transoff` → bits. CONFIRMED (0x4C88C0).
+pub fn transition_bits(name: &str) -> u32 {
+    match name.trim().to_lowercase().as_str() {
+        "same" => trans::SAME,
+        "left" => trans::LEFT,
+        "right" => trans::RIGHT,
+        "top" => trans::TOP,
+        "bottom" => trans::BOTTOM,
+        "fade" => trans::FADE,
+        _ => 0,
+    }
+}
+
+/// Progress runs from 0 — the widget in place — to 512, a whole screen away and fully faded
+/// ([0x5B6B2C], 0x4C87CD). CONFIRMED.
+pub const TRANS_FULL: i32 = 512;
+/// The sweep takes half of the timer's ticks-per-second ([0x5DEB48] / 2, 0x4E0A36); the timer is
+/// the 1 kHz `timeSetEvent` set up at 0x564F2D, so half a second. CONFIRMED.
+pub const TRANS_MS: u32 = 500;
+/// …after three frames of nothing (`this+0x124` starts at 3, 0x4E09A0 / 0x4E09E8). CONFIRMED.
+pub const TRANS_DELAY_FRAMES: u32 = 3;
+
+/// Where a screen is in its transition. `In` is the original's state 1 (the progress falls to 0 and
+/// the screen settles), `Out` its state 3 (the progress climbs to 512 and the screen is gone),
+/// `Idle` its state 2 (0x4E0A3F…0x4E0AB4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transition {
+    Idle,
+    In { frames: u32, ms: u32 },
+    Out { frames: u32, ms: u32 },
+}
+
+impl Transition {
+    /// 0 = in place, 512 = a whole screen away.
+    pub fn progress(self) -> i32 {
+        let t = |frames: u32, ms: u32| if frames > 0 { 0 } else { (ms as i64 * TRANS_FULL as i64 / TRANS_MS as i64) as i32 };
+        match self {
+            Transition::Idle => 0,
+            Transition::In { frames, ms } => (TRANS_FULL - t(frames, ms)).max(0),
+            Transition::Out { frames, ms } => t(frames, ms).min(TRANS_FULL),
+        }
+    }
+
+    pub fn done(self) -> bool {
+        match self {
+            Transition::Idle => true,
+            Transition::In { .. } => self.progress() == 0,
+            Transition::Out { .. } => self.progress() == TRANS_FULL,
+        }
+    }
+
+    /// One frame of the transition clock: the first [`TRANS_DELAY_FRAMES`] frames only count down,
+    /// and the timer starts after them (0x4E09E8…0x4E0A16).
+    pub fn advance(self, dt_ms: u32) -> Self {
+        let step = |frames: u32, ms: u32| if frames > 0 { (frames - 1, ms) } else { (0, ms + dt_ms) };
+        match self {
+            Transition::Idle => Transition::Idle,
+            Transition::In { frames, ms } => {
+                let (frames, ms) = step(frames, ms);
+                let next = Transition::In { frames, ms };
+                if next.done() { Transition::Idle } else { next }
+            }
+            Transition::Out { frames, ms } => {
+                let (frames, ms) = step(frames, ms);
+                Transition::Out { frames, ms }
+            }
+        }
+    }
+}
+
+/// The height of one list-box row and the width of its scrollbar, both constants in the original:
+/// the accessor base class answers 14 to "how tall is row n" (0x4BC700) and the scrollbar is 16
+/// wide (0x4DB030).
+pub const LIST_ROW_H: f32 = 14.0;
+pub const LIST_SCROLLBAR_W: f32 = 16.0;
+
+/// An `NFS5.ListBox` widget and the accessor whose rows fill it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListBoxWidget {
+    pub index: usize,
+    pub accessor: Option<String>,
+}
+
+/// One piece of a column-laid-out list row: a string whose x comes from **another widget of the
+/// same screen**, found by name, plus the accessor's own offset from it. `Track.Records` draws its
+/// four columns that way (0x4FB2A0, anchors `ID_RECORDPLAYERPOS` −10 and +4, `ID_RECORDCARPOS` +4,
+/// `ID_RECORDTIMEPOS` +4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListCell {
+    /// the `name` of the widget whose x this column sits at
+    pub anchor: String,
+    pub dx: f32,
+    pub text: String,
+}
+
+/// The height of a parts list's category heading (0x518EA0) and of one of its rows (0x515FD4).
+pub const PART_HEADER_H: f32 = 13.0;
+pub const PART_ROW_H: f32 = 13.0;
+
+/// A list-box row. The base accessor draws the whole row as one string (0x4BC350); the accessors
+/// that override the row draw lay it out in columns instead, and the parts lists put a category
+/// heading above the first row of each group.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ListRow {
+    Text(String),
+    Columns(Vec<ListCell>),
+    /// A parts list's category heading: a black rule above and below and the name centred between
+    /// them (`drawPartsHeading` 0x518DE0), 13 px tall.
+    Header(String),
+}
+
+impl ListRow {
+    /// How tall this row is. The base accessor answers 14 for every row (0x4BC700); a parts list's
+    /// rows are 13 and its headings another 13 (0x516080).
+    pub fn height(&self) -> f32 {
+        match self {
+            ListRow::Text(_) => LIST_ROW_H,
+            ListRow::Columns(_) => LIST_ROW_H,
+            ListRow::Header(_) => PART_HEADER_H,
+        }
+    }
+}
+
+impl From<String> for ListRow {
+    fn from(s: String) -> Self {
+        ListRow::Text(s)
+    }
+}
+
+/// An `NFS5.3DCAR` widget: which car it shows and where it puts it. `positiontype` 0 means the
+/// widget has no car of its own and the screen's 3D room owns it (0x4BFEEC); 1, 2 and 3 place a car
+/// of their own at a fixed spot in front of the camera (`RE/notes/frontend-3d.md` §4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Car3dWidget {
+    pub index: usize,
+    pub accessor: Option<String>,
+    pub othersource: Option<String>,
+    pub position_type: i64,
+    /// the widget's `damage` key: draw the car with its damage state
+    pub damage: bool,
+}
+
+impl Car3dWidget {
+    /// Where `positiontype` puts the car, camera-relative (0x4BFF28…0x4BFF75). `positiontype` 0
+    /// has none of its own.
+    pub fn position(&self) -> Option<[f32; 3]> {
+        match self.position_type {
+            1 => Some([2.4, 0.2, 8.1]),
+            2 => Some([-2.4, 0.2, 8.1]),
+            3 => Some([2.4, -1.2, 6.2]),
+            _ => None,
+        }
+    }
+}
+
+/// An `NFS5.CarLogo` widget and the car source it names. The original resolves the car in this
+/// order (0x4C14E0, CONFIRMED): `othersource` `FactoryDriver` → the `FactoryDriver.Car` accessor,
+/// `EndOfEra` → `PrizeCars.Car`, `FactoryDriverPrize` → the factory-drive prize car (0x4F4360),
+/// then the widget's own `accessor`, then `CarCompare1` → the compare screen's left car (0x50E6B0).
+/// `othersource=Chron` is handled before all of that (0x4C1660) and takes its pack and entry from
+/// the chronicle record instead of from `nfs5.car`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CarLogoWidget {
+    pub index: usize,
+    pub accessor: Option<String>,
+    pub othersource: Option<String>,
 }
 
 /// The front end's default font, loaded at FE start-up (0x4C72B1).
@@ -81,24 +295,32 @@ pub fn background_layout(screen_id: &str) -> Option<&'static str> {
     })
 }
 
+/// An `0xAARRGGBB` string from a `.ctr` template as `[r, g, b, a]`.
+fn parse_color(v: &str) -> Option<[u8; 4]> {
+    let v = v.trim();
+    let n = u64::from_str_radix(v.strip_prefix("0x").or_else(|| v.strip_prefix("0X"))?, 16).ok()?;
+    Some([((n >> 16) & 0xFF) as u8, ((n >> 8) & 0xFF) as u8, (n & 0xFF) as u8, ((n >> 24) & 0xFF) as u8])
+}
+
 fn tint(c: [u8; 4]) -> [f32; 4] {
     [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, c[3] as f32 / 255.0]
 }
 
-/// Classes the file does not describe well enough to draw: `NFS5.HEADER` carries no geometry at
-/// all, and the rest draw content the executable supplies (a 3D car, a list of rows, a car logo, a
-/// controller map).
-fn code_placed(class: &str) -> bool {
-    matches!(class, "NFS5.HEADER" | "NFS5.SUBHEADER" | "NFS5.ListBox" | "NFS5.3DCAR" | "NFS5.CarLogo" | "NFS5.CONTROLLERSETUP")
+/// Classes whose content comes from the executable and which the port does not draw. `NFS5.3DCAR`
+/// is not one of them any more: the car it shows belongs to the screen's 3D room
+/// (`RE/notes/frontend-3d.md`), which the port renders behind the screen.
+fn code_placed(_class: &str) -> bool {
+    false
 }
 
 impl LayoutScreen {
     /// Load `FEData/Layouts/<name>.lay`, the background screen it names, and every `.fsh` entry
     /// they reference.
     pub fn load(r: &mut Renderer, paths: &GamePaths, name: &str) -> anyhow::Result<Self> {
-        let mut screen = Self::load_one(r, paths, name)?;
+        let controls = Arc::new(load_controls(paths));
+        let mut screen = Self::load_one(r, paths, name, controls.clone())?;
         if let Some(bg) = screen.layout.screen().and_then(|s| s.get("screen")).and_then(background_layout) {
-            match Self::load_one(r, paths, bg) {
+            match Self::load_one(r, paths, bg, controls) {
                 Ok(b) => screen.background = Some(Box::new(b)),
                 Err(e) => tracing::debug!(background = bg, error = %e, "background screen unavailable"),
             }
@@ -106,7 +328,7 @@ impl LayoutScreen {
         Ok(screen)
     }
 
-    fn load_one(r: &mut Renderer, paths: &GamePaths, name: &str) -> anyhow::Result<Self> {
+    fn load_one(r: &mut Renderer, paths: &GamePaths, name: &str, controls: Arc<ControlLibrary>) -> anyhow::Result<Self> {
         let dir = paths.fe_data().join("Layouts");
         let path = GamePaths::find_file(&dir, &format!("{name}.lay")).ok_or_else(|| anyhow::anyhow!("no layout {name}.lay in {}", dir.display()))?;
         let bytes = std::fs::read(&path)?;
@@ -138,12 +360,23 @@ impl LayoutScreen {
             shapes.insert(key, (id, img.width as f32, img.height as f32));
         }
 
-        // every `fontPathName` the file names, plus the FE default
+        // every `fontPathName` the file names, every one its widgets' class templates name, plus
+        // the FE default
         let mut fonts: HashMap<String, BitmapFont> = HashMap::new();
         let mut want: Vec<String> = vec![DEFAULT_FONT.to_string()];
         for e in &layout.elements {
             if let Some(f) = e.get("fontPathName").filter(|f| !f.is_empty()) {
                 want.push(f.to_lowercase());
+            }
+            if let Some(c) = controls.get(&e.class) {
+                for part in c.parts.values() {
+                    if let Some(f) = part.value("fontPathName").filter(|f| !f.is_empty()) {
+                        want.push(f.to_lowercase());
+                    }
+                }
+                if let Some(f) = c.default_of("fontpath").filter(|f| !f.is_empty()) {
+                    want.push(f.to_lowercase());
+                }
             }
         }
         want.sort();
@@ -170,11 +403,348 @@ impl LayoutScreen {
         let mut unrendered: Vec<(String, usize)> = counts.into_iter().collect();
         unrendered.sort();
         tracing::info!(name, elements = layout.elements.len(), art = shapes.len(), fonts = fonts.len(), skipped = unrendered.len(), "layout loaded");
-        Ok(Self { layout, background: None, shapes, fonts, white, unrendered })
+        Ok(Self { layout, background: None, shapes, fonts, white, unrendered, logos: HashMap::new(), lists: HashMap::new(), car_views: HashMap::new(), controls, transition: Transition::Idle, overlay: false })
     }
 
-    pub fn unrendered(&self) -> &[(String, usize)] {
-        &self.unrendered
+    /// The widgets the screen does not draw: the classes whose content comes from the executable,
+    /// plus any `NFS5.CarLogo` the caller has not bound a car to yet.
+    pub fn unrendered(&self) -> Vec<(String, usize)> {
+        let mut out = self.unrendered.clone();
+        for (class, bound) in [("NFS5.CarLogo", &self.logos.keys().copied().collect::<Vec<_>>()), ("NFS5.ListBox", &self.lists.keys().copied().collect::<Vec<_>>())] {
+            let n = self.layout.elements.iter().enumerate().filter(|(i, e)| e.class == class && !bound.contains(i)).count();
+            if n > 0 {
+                out.push((class.to_string(), n));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The value of a widget attribute: the `.lay` block's own key when it carries one, otherwise
+    /// the default in the class's `.ctr` template (`RE/notes/controls.md` §2). A key the block
+    /// leaves empty counts as absent, which is how the shipped files spell "use the default"
+    /// (`selectmode=`, `disablesound=`).
+    pub fn attr<'a>(&'a self, e: &'a nfs_formats::lay::Element, key: &str) -> Option<&'a str> {
+        if let Some(v) = e.get(key).filter(|v| !v.is_empty()) {
+            return Some(v);
+        }
+        self.controls.get(&e.class)?.default_of(key).filter(|v| !v.is_empty())
+    }
+
+    fn attr_num(&self, e: &nfs_formats::lay::Element, key: &str) -> Option<f64> {
+        let v = self.attr(e, key)?.trim();
+        match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+            Some(h) => u64::from_str_radix(h, 16).ok().map(|n| n as f64),
+            None => v.parse().ok(),
+        }
+    }
+
+    /// Resolve one `.ctr` expression reference for `e`: `data.<key>` is the widget's own attribute,
+    /// `control.size.width` its box, and `<part>.<key>` another piece of the same template. A
+    /// reference the port cannot answer — a text part's width, which depends on the string — is
+    /// left unresolved so the whole expression falls back rather than silently reading zero.
+    fn reference(&self, e: &nfs_formats::lay::Element, name: &str, depth: u32) -> Option<f64> {
+        let (head, rest) = name.split_once('.')?;
+        if head == "data" {
+            return self.attr_num(e, rest);
+        }
+        let (bw, bh) = self.box_of(e, depth + 1);
+        if head == "control" {
+            return match rest {
+                "size.width" => Some(bw as f64),
+                "size.height" => Some(bh as f64),
+                _ => None,
+            };
+        }
+        if depth > 4 {
+            return None;
+        }
+        let part = self.controls.get(&e.class)?.part(head)?;
+        let (key, field) = rest.split_once('.')?;
+        let v = part.value(key)?;
+        let pair = nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, depth + 1))?;
+        match field {
+            "width" | "x" => Some(pair.0),
+            "height" | "y" => Some(pair.1),
+            _ => None,
+        }
+    }
+
+    /// The widget's box. The `.lay` block's `size` wins; failing that the class template's own
+    /// `size.value`, which for most classes is an expression over the block's keys
+    /// (`data.width,data.height` for a button, `data.width,data.selectionboxmaxheight` for a list).
+    fn box_of(&self, e: &nfs_formats::lay::Element, depth: u32) -> (f32, f32) {
+        if let Some(p) = e.pair("size") {
+            return p;
+        }
+        if depth <= 4
+            && let Some(c) = self.controls.get(&e.class)
+            && let Some(v) = c.value("size")
+            && let Some((w, h)) = nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, depth + 1))
+        {
+            return (w as f32, h as f32);
+        }
+        (e.float("width").unwrap_or(0.0), e.float("height").unwrap_or(0.0))
+    }
+
+    /// The widget's position: the block's own `pos`, or the class template's `[control] pos.value`
+    /// — `NFS5.HEADER` carries no `pos` at all and `Header.ctr` puts it at (6, 4).
+    fn position_of(&self, e: &nfs_formats::lay::Element) -> (f32, f32) {
+        if let Some(p) = e.pair("pos") {
+            return p;
+        }
+        if let Some(c) = self.controls.get(&e.class)
+            && let Some(v) = c.value("pos")
+            && let Some((x, y)) = nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0))
+        {
+            return (x as f32, y as f32);
+        }
+        (0.0, 0.0)
+    }
+
+    /// The `RECT` parts of the widget's class template that its `state` draws, each resolved to a
+    /// rectangle and a colour (`RE/notes/controls.md` §1). This is how a class that is nothing but
+    /// boxes — `NFS5.CONTROLLERSETUP` is a filled box with a one-pixel border — draws without the
+    /// port knowing anything about it.
+    fn rect_parts(&self, e: &nfs_formats::lay::Element) -> Vec<(f32, f32, f32, f32, [u8; 4])> {
+        let Some(c) = self.controls.get(&e.class) else { return Vec::new() };
+        let state = e.get("state").unwrap_or("normal");
+        let mut out = Vec::new();
+        for p in c.state_parts(state).iter().filter_map(|n| c.part(n)) {
+            if p.kind() != nfs_formats::ctr::PartKind::Rect {
+                continue;
+            }
+            let at = |key: &str| p.value(key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)));
+            let Some((x, y)) = at("pos") else { continue };
+            let Some((w, h)) = at("size") else { continue };
+            // a colour may be a literal or a reference to one of the `data` attributes
+            let colour = p
+                .value("color")
+                .and_then(|v| parse_color(v).or_else(|| v.split_once('.').and_then(|(_, key)| self.attr(e, key)).and_then(parse_color)));
+            let Some(colour) = colour else { continue };
+            out.push((x as f32, y as f32, w as f32, h as f32, colour));
+        }
+        out
+    }
+
+    /// The first drawable part of the widget's class template that carries `key`, e.g. the
+    /// `fontPathName` of a header's `label` part.
+    fn part_value<'a>(&'a self, e: &'a nfs_formats::lay::Element, key: &str) -> Option<&'a str> {
+        let c = self.controls.get(&e.class)?;
+        let state = e.get("state").unwrap_or("normal");
+        c.state_parts(state).iter().filter_map(|n| c.part(n)).find_map(|p| p.value(key)).filter(|v| !v.is_empty())
+    }
+
+    /// The black bars that keep the 4:3 design area square in a wider window. The 2D screen is
+    /// letterboxed by [`place`], but a 3D room behind it fills the whole window, so the bars have to
+    /// be drawn over it. APPROXIMATION — the original's front end is always 4:3.
+    pub fn letterbox_bars(&self, aspect: f32) -> Vec<Sprite> {
+        let design = DESIGN.0 / DESIGN.1;
+        if aspect <= design + 1e-3 {
+            return Vec::new();
+        }
+        let w = (1.0 - design / aspect) * 0.5;
+        let bar = |x: f32| Sprite {
+            texture: self.white,
+            pos: [x, 0.0],
+            size: [w * aspect, 1.0],
+            uv_min: [0.0, 0.0],
+            uv_max: [1.0, 1.0],
+            color: [0.0, 0.0, 0.0, 1.0],
+            rotation: 0.0,
+            pivot: [0.5, 0.5],
+        };
+        vec![bar(0.0), bar(1.0 - w)]
+    }
+
+    /// Mark this screen as drawn over something else — the bottom bar the front end lays over
+    /// every screen (0x4D39D3), or any screen with a 3D room behind it
+    /// (`RE/notes/frontend-3d.md`). Such a screen draws its widgets but not the screen fill, which
+    /// would otherwise paint over what is behind. The background screen is marked with it.
+    pub fn set_overlay(&mut self, overlay: bool) {
+        self.overlay = overlay;
+        if let Some(b) = self.background.as_mut() {
+            b.set_overlay(overlay);
+        }
+    }
+
+    /// Start this screen sliding and fading in, the way the original does when a screen is pushed
+    /// (state 1, 0x4E09A0). The background screen transitions with it.
+    pub fn transition_in(&mut self) {
+        self.transition = Transition::In { frames: TRANS_DELAY_FRAMES, ms: 0 };
+        if let Some(b) = self.background.as_mut() {
+            b.transition_in();
+        }
+    }
+
+    /// Start it going out (state 3, 0x4E09C0).
+    pub fn transition_out(&mut self) {
+        self.transition = Transition::Out { frames: TRANS_DELAY_FRAMES, ms: 0 };
+        if let Some(b) = self.background.as_mut() {
+            b.transition_out();
+        }
+    }
+
+    pub fn transition(&self) -> Transition {
+        self.transition
+    }
+
+    /// Advance the transition clock by one frame; `true` once the screen has settled or gone.
+    pub fn advance_transition(&mut self, dt_ms: u32) -> bool {
+        self.transition = self.transition.advance(dt_ms);
+        if let Some(b) = self.background.as_mut() {
+            b.advance_transition(dt_ms);
+        }
+        self.transition.done()
+    }
+
+    /// The offset and the alpha a widget draws with at this point in the transition
+    /// (`FeWidget::transitionOffset` 0x4C8760 and `::transitionAlpha` 0x4C8840): the slide is the
+    /// screen size scaled by the progress, the fade is the progress itself, and the bits come from
+    /// `transon` while the screen comes in and from `transoff` while it goes out.
+    fn transition_of(&self, e: &nfs_formats::lay::Element) -> ((f32, f32), f32) {
+        let p = self.transition.progress();
+        if p == 0 {
+            return ((0.0, 0.0), 1.0);
+        }
+        let out = matches!(self.transition, Transition::Out { .. });
+        let (key, other) = if out { ("transoff", "transon") } else { ("transon", "transoff") };
+        // `SAME` means "use the other one", and both `SAME` means no transition at all
+        // (0x4C75D4…0x4C7601)
+        let (mut bits, ob) = (transition_bits(self.attr(e, key).unwrap_or("")), transition_bits(self.attr(e, other).unwrap_or("")));
+        if bits & trans::SAME != 0 {
+            bits = if ob & trans::SAME != 0 { 0 } else { ob };
+        }
+        let f = p as f32 / TRANS_FULL as f32;
+        let mut d = (0.0f32, 0.0f32);
+        if bits & trans::LEFT != 0 {
+            d.0 -= DESIGN.0 * f;
+        }
+        if bits & trans::RIGHT != 0 {
+            d.0 += DESIGN.0 * f;
+        }
+        if bits & trans::TOP != 0 {
+            d.1 -= DESIGN.1 * f;
+        }
+        if bits & trans::BOTTOM != 0 {
+            d.1 += DESIGN.1 * f;
+        }
+        let alpha = if bits & trans::FADE != 0 { 1.0 - (p * 255 / TRANS_FULL) as f32 / 255.0 } else { 1.0 };
+        (d, alpha)
+    }
+
+    /// The x of the widget named `name` on this screen — the column anchor an accessor's row draw
+    /// looks up (`FE_widgetPos` 0x4D6410 searches the current screen's widget list from the end).
+    fn anchor_x(&self, name: &str) -> Option<f32> {
+        let e = self.layout.elements.iter().rev().find(|e| e.name.eq_ignore_ascii_case(name))?;
+        Some(self.position_of(e).0)
+    }
+
+    /// The `NFS5.ListBox` widgets on this screen, with the accessor each one lists.
+    pub fn list_boxes(&self) -> Vec<ListBoxWidget> {
+        self.layout
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.class == "NFS5.ListBox")
+            .map(|(index, e)| ListBoxWidget { index, accessor: self.attr(e, "accessor").map(str::to_string) })
+            .collect()
+    }
+
+    /// Fill a list box with the rows its accessor would hand out, and say which row the accessor
+    /// has selected (`current` — the row the original paints with `highlightcolorselected`).
+    pub fn set_list_rows(&mut self, index: usize, rows: Vec<ListRow>, current: Option<usize>) {
+        if rows.is_empty() {
+            self.lists.remove(&index);
+        } else {
+            self.lists.insert(index, (rows, current));
+        }
+    }
+
+    /// Hand an `NFS5.3DCAR` the offscreen view its car was rendered into. The view covers the whole
+    /// screen — the car's place in it comes from the camera, not from the widget's rectangle — and
+    /// is drawn in the widget's own place in the layout order, which is what puts it over the art
+    /// behind it and under the art in front.
+    pub fn set_car_view(&mut self, index: usize, view: Option<TextureId>) {
+        match view {
+            Some(t) => self.car_views.insert(index, t),
+            None => self.car_views.remove(&index),
+        };
+    }
+
+    /// The offscreen view already handed to this widget, so the caller can render into it again.
+    pub fn car_view(&self, index: usize) -> Option<TextureId> {
+        self.car_views.get(&index).copied()
+    }
+
+    /// The `NFS5.3DCAR` widgets on this screen.
+    pub fn car_3d(&self) -> Vec<Car3dWidget> {
+        self.layout
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.class == "NFS5.3DCAR")
+            .map(|(index, e)| Car3dWidget {
+                index,
+                accessor: self.attr(e, "accessor").map(str::to_string),
+                othersource: self.attr(e, "othersource").map(str::to_string),
+                position_type: self.attr_num(e, "positiontype").unwrap_or(0.0) as i64,
+                damage: self.attr_num(e, "damage").unwrap_or(0.0) != 0.0,
+            })
+            .collect()
+    }
+
+    /// The `NFS5.CarLogo` widgets on this screen, with the car source each one names.
+    pub fn car_logos(&self) -> Vec<CarLogoWidget> {
+        self.layout
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.class == "NFS5.CarLogo")
+            .map(|(index, e)| CarLogoWidget {
+                index,
+                accessor: e.get("accessor").filter(|a| !a.is_empty()).map(str::to_string),
+                othersource: e.get("othersource").filter(|a| !a.is_empty()).map(str::to_string),
+            })
+            .collect()
+    }
+
+    /// Point a `NFS5.CarLogo` at a car's logo: `pack` is the car record's +0x147 (`finallogos1`)
+    /// and `pair` its +0x1F6. The widget draws entries `2*pair` and `2*pair + 1` of
+    /// `FEData/Art/<pack>.fsh` (`NFS5.CarLogo::update` 0x4C1A63 — the index is the pair doubled,
+    /// and the pair past the end of the pack draws nothing, 0x4C1AF6). CONFIRMED.
+    pub fn set_car_logo(&mut self, r: &mut Renderer, paths: &GamePaths, index: usize, pack: &str, pair: i16) {
+        if pack.is_empty() || pair < 0 {
+            self.logos.remove(&index);
+            return;
+        }
+        let file = format!("{pack}.fsh");
+        let base = pair as usize * 2;
+        if self.logos.get(&index).is_some_and(|(f, b)| f == &file && *b == base) {
+            return;
+        }
+        if !self.shapes.contains_key(&(file.clone(), base)) {
+            let art = paths.fe_data().join("Art");
+            let images = GamePaths::find_file(&art, &file)
+                .and_then(|p| std::fs::read(&p).ok().map(|d| (p, d)))
+                .and_then(|(p, d)| decode_pack(&p, &d).ok())
+                .unwrap_or_default();
+            for entry in [base, base + 1] {
+                let Some(img) = images.get(entry) else {
+                    tracing::debug!(file, entry, "car logo entry missing");
+                    continue;
+                };
+                let Some(level0) = img.mips.first() else { continue };
+                let id = r.upload_texture(&TextureData::single(img.width, img.height, level0.clone()));
+                self.shapes.insert((file.clone(), entry), (id, img.width as f32, img.height as f32));
+            }
+        }
+        // the original draws nothing unless both entries of the pair resolved (0x4C1B76)
+        if self.shapes.contains_key(&(file.clone(), base)) && self.shapes.contains_key(&(file.clone(), base + 1)) {
+            self.logos.insert(index, (file, base));
+        } else {
+            self.logos.remove(&index);
+        }
     }
 
     /// `canplaygame` on the screen block: the bottom bar's PLAYGAME button is live on this screen.
@@ -243,8 +813,14 @@ impl LayoutScreen {
         Sprite { texture: self.white, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5] }
     }
 
+    /// The font a widget draws its text in: its own `fontPathName`, or the one its class template
+    /// gives the part it draws (a header's is `Univers17b.ffn`), or the front end's default.
     fn font_for(&self, e: &nfs_formats::lay::Element) -> Option<&BitmapFont> {
-        let named = e.get("fontPathName").filter(|f| !f.is_empty()).map(|f| f.to_lowercase());
+        let named = e
+            .get("fontPathName")
+            .filter(|f| !f.is_empty())
+            .or_else(|| self.part_value(e, "fontPathName"))
+            .map(|f| f.to_lowercase());
         named.and_then(|n| self.fonts.get(&n)).or_else(|| self.fonts.get(DEFAULT_FONT))
     }
 
@@ -281,16 +857,22 @@ impl LayoutScreen {
             out.extend(bg.sprites(aspect, strings, None, accessor));
         }
         for (i, e) in self.layout.elements.iter().enumerate() {
-            let (x, y) = e.position();
-            let (w, h) = e.size();
+            let ((tdx, tdy), talpha) = self.transition_of(e);
+            let (x, y) = self.position_of(e);
+            let (x, y) = (x + tdx, y + tdy);
+            let (w, h) = self.box_of(e, 0);
+            let first = out.len();
+            'elem: {
             match e.class.as_str() {
                 // the screen itself: a full-screen fill
                 c if c.starts_with("REAL.BLACK") => {
                     // The screen's own `color` is not the fill (the shipped files carry
                     // 0xff000000, 0xff0000ff and 0xff004080 without looking any different), so the
-                    // class name is taken at its word — black. Only the bottom-most screen fills:
-                    // a screen laid over a background must not paint over it. APPROXIMATION.
-                    if self.background.is_none() {
+                    // class name is taken at its word — black. Only the bottom-most screen fills,
+                    // and only when there is nothing behind it: a screen with a 3D room behind it
+                    // (`RE/notes/frontend-3d.md`) would otherwise paint the room out.
+                    // APPROXIMATION.
+                    if self.background.is_none() && !self.overlay {
                         out.push(self.quad(aspect, 0.0, 0.0, DESIGN.0, DESIGN.1, [0.0, 0.0, 0.0, 1.0]));
                     }
                 }
@@ -327,6 +909,122 @@ impl LayoutScreen {
                     let c = e.color("color").map(tint).unwrap_or([1.0, 1.0, 1.0, 0.5]);
                     out.push(self.quad(aspect, x, y, w.max(1.0), h.max(1.0), c));
                 }
+                // `NFS5.3DCAR` is drawn after the screen, below — its car is a 3D view, not a
+                // sprite in the layout's own order
+                "NFS5.3DCAR" => {}
+                // one row of the key-binding screen: a filled box with a one-pixel black border,
+                // all of it in the class template, and the binding itself from its accessor
+                "NFS5.CONTROLLERSETUP" => {
+                    for (px, py, pw, ph, c) in self.rect_parts(e) {
+                        out.push(self.quad(aspect, x + px, y + py, pw.max(1.0), ph.max(1.0), tint(c)));
+                    }
+                    let Some(f) = self.font_for(e) else { break 'elem };
+                    let Some(v) = e.get("accessor").filter(|a| !a.is_empty()).and_then(accessor) else { break 'elem };
+                    let line_h = f.line_px();
+                    let ty = if h > line_h { y + ((h - line_h) * 0.5).round() } else { y };
+                    self.text(&mut out, aspect, f, &v, x, ty, w, e.int("align").unwrap_or(0), [1.0, 1.0, 1.0, 1.0]);
+                }
+                "NFS5.ListBox" => {
+                    // `FeListBox::draw` 0x4C64FE…0x4C691B with `ListBox.ctr`. The panel is the
+                    // template's `selectionbox` part — `pos=0,1`, `size=data.width,
+                    // data.selectionboxmaxheight` — filled with 0x10FFFFFF (0x4C6636), and its
+                    // height is clamped to the content: `min(rows·14, selectionboxmaxheight)`
+                    // (0x4C53A0). When it clamps, a scrollbar appears and takes 16 px off the
+                    // width (0x4C5421 with 0x4DB030). Rows are the accessor's own: 14 px each
+                    // (0x4BC700), the string at (+3, +2) over a bar of the row's colour
+                    // (0x4BC350). The original keeps drawing while the accumulated height is still
+                    // within the panel and scissors the overflow; the port draws only the rows
+                    // that fit whole (APPROXIMATION — the sprite pipeline has no scissor).
+                    let Some((rows, current)) = self.lists.get(&i) else { break 'elem };
+                    let Some(f) = self.font_for(e) else { break 'elem };
+                    let max_h = self.attr_num(e, "selectionboxmaxheight").unwrap_or(0.0) as f32;
+                    let full: f32 = rows.iter().map(|r| r.height()).sum();
+                    let (panel_h, scrolls) = if full < max_h { (full, false) } else { (max_h, true) };
+                    let mut panel_w = self.attr_num(e, "width").unwrap_or(0.0) as f32;
+                    if scrolls {
+                        panel_w -= LIST_SCROLLBAR_W;
+                    }
+                    let (px, py) = match self.controls.get(&e.class).and_then(|c| c.part("selectionbox")).and_then(|p| p.value("pos")) {
+                        Some(v) => nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)).map(|(a, b)| (x + a as f32, y + b as f32)).unwrap_or((x, y)),
+                        None => (x, y),
+                    };
+                    out.push(self.quad(aspect, px, py, panel_w, panel_h, [1.0, 1.0, 1.0, 16.0 / 255.0]));
+                    // `textcolor` is black and the two highlights amber and dark red, all three
+                    // straight out of `ListBox.ctr`; a highlighted row's own text turns white
+                    // (0x4C67A6 → 0x4D87D0).
+                    let text_c = self.attr(e, "textcolor").and_then(parse_color).map(|c| [c[0], c[1], c[2], 255]).unwrap_or([0, 0, 0, 255]);
+                    let sel_c = self.attr(e, "highlightcolorselected").and_then(parse_color).map(|c| [c[0], c[1], c[2], 255]).unwrap_or([0xBC, 0, 0, 255]);
+                    let mut ry = py;
+                    for (n, row) in rows.iter().enumerate() {
+                        if ry + row.height() > py + panel_h {
+                            break;
+                        }
+                        let (bar, fg) = if *current == Some(n) { (Some(sel_c), [1.0, 1.0, 1.0, 1.0]) } else { (None, tint(text_c)) };
+                        match row {
+                            ListRow::Text(t) => {
+                                if let Some(c) = bar {
+                                    out.push(self.quad(aspect, px, ry, panel_w, LIST_ROW_H, tint(c)));
+                                }
+                                self.text(&mut out, aspect, f, t, px + 3.0, ry + 2.0, 0.0, 0, fg);
+                            }
+                            // a columned row draws no bar of its own — `Track.Records` reduces the
+                            // colour it is handed to its alpha alone (0x4FB328) and places each
+                            // column at another widget's x, at the row's own y (no +2)
+                            ListRow::Columns(cells) => {
+                                if let Some(c) = bar {
+                                    out.push(self.quad(aspect, px, ry, panel_w, row.height(), tint(c)));
+                                }
+                                for cell in cells {
+                                    // a cell with no anchor of its own sits at the panel's left edge
+                                    let ax = if cell.anchor.is_empty() { px } else { self.anchor_x(&cell.anchor).unwrap_or(px) };
+                                    let align = if cell.dx < 0.0 { 2 } else { 0 };
+                                    self.text(&mut out, aspect, f, &cell.text, ax + cell.dx, ry, 0.0, align, tint(text_c));
+                                }
+                            }
+                            // `drawPartsHeading` 0x518DE0: a black rule at the top and another 13
+                            // pixels down, with the name centred two pixels below the first
+                            ListRow::Header(t) => {
+                                let black = [0.0, 0.0, 0.0, 1.0];
+                                out.push(self.quad(aspect, px, ry, panel_w, 1.0, black));
+                                out.push(self.quad(aspect, px, ry + PART_HEADER_H, panel_w, 1.0, black));
+                                self.text(&mut out, aspect, f, t, px, ry + 2.0, panel_w, 1, tint(text_c));
+                            }
+                        }
+                        ry += row.height();
+                    }
+                }
+                "NFS5.CarLogo" => {
+                    // `NFS5.CarLogo::draw` 0x4C1B70, CONFIRMED: the pair is drawn side by side —
+                    // the first entry at the anchor, the second immediately to its right — and the
+                    // whole thing is vertically centred in the widget's own box. `align` moves the
+                    // anchor the same way the text rule does: 0 keeps `pos`, 1 pulls back half the
+                    // combined width, 2 the full width (0x4C1BE9…0x4C1C22). A second entry only one
+                    // pixel high is a placeholder: the original zeroes its width and skips it
+                    // (0x4C1BDC). Nothing is drawn until the port has bound a car to the widget.
+                    let Some((file, base)) = self.logos.get(&i) else { break 'elem };
+                    let Some(&(ta, aw, ah)) = self.shapes.get(&(file.clone(), *base)) else { break 'elem };
+                    let b = self.shapes.get(&(file.clone(), base + 1)).copied();
+                    let (bw, bh, tb) = match b {
+                        Some((t, w, h)) if h != 1.0 => (w, h, Some(t)),
+                        _ => (0.0, 0.0, None),
+                    };
+                    let left = match e.int("align").unwrap_or(0) {
+                        1 => x - ((aw + bw) * 0.5).trunc(),
+                        2 => x - (aw + bw),
+                        _ => x,
+                    };
+                    let top = y + ((h - ah) * 0.5).trunc();
+                    let (pos, size) = self.place(aspect, left, top, aw, ah);
+                    out.push(Sprite { texture: ta, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+                    if let Some(tb) = tb {
+                        let (pos, size) = self.place(aspect, left + aw, top, bw, bh);
+                        out.push(Sprite { texture: tb, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+                    }
+                    // Not drawn: the glint that sweeps over the logo (the `GLNT` entry of
+                    // `weeicons.fsh`, 0x4C1D26…0x4C1DB2) — its sweep is driven by the same global
+                    // the front end sets to 640 at 0x4D35B4, but the shape's own travel was not
+                    // traced, so it is left out rather than guessed at.
+                }
                 "NFS5.OutlineRectangle" => {
                     let c = e.color("color").map(tint).unwrap_or([1.0, 1.0, 1.0, 0.5]);
                     let t = 1.0;
@@ -356,9 +1054,9 @@ impl LayoutScreen {
                         out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
                     }
                     if code_placed(&e.class) {
-                        continue;
+                        break 'elem;
                     }
-                    let Some(f) = self.font_for(e) else { continue };
+                    let Some(f) = self.font_for(e) else { break 'elem };
                     // A combo slider carries both: its `stringID` is the label and its `accessor`
                     // holds the value. The original places the value with code; the port fills the
                     // widget's own box — label left, value right — which is the only geometry the
@@ -374,12 +1072,14 @@ impl LayoutScreen {
                     let text = if e.class.contains("AccessorWatch") {
                         match e.get("accessor").filter(|a| !a.is_empty()).and_then(accessor) {
                             Some(v) => v,
-                            None => continue,
+                            None => break 'elem,
                         }
                     } else {
-                        match e.string_id().and_then(|id| strings.get(id)) {
+                        // `stringID=0` is the shipped "Hello, World!" placeholder (marked DO NOT
+                        // TRANSLATE in `FEStrings.csv`): those widgets get their text from code.
+                        match e.string_id().filter(|id| *id != 0).and_then(|id| strings.get(id)) {
                             Some(t) if !t.is_empty() => t.to_string(),
-                            _ => continue,
+                            _ => break 'elem,
                         }
                     };
                     // the highlighted button uses its own `hovercolor`, as the original does
@@ -388,7 +1088,12 @@ impl LayoutScreen {
                         // player can see where the selection is — APPROXIMATION
                         e.color("hovercolor").or_else(|| e.color("maincolor")).map(tint).unwrap_or([1.0, 0.85, 0.2, 1.0])
                     } else {
-                        e.color("foreColor").or_else(|| e.color("maincolor")).or_else(|| e.color("color")).map(tint).unwrap_or([1.0, 1.0, 1.0, 1.0])
+                        e.color("foreColor")
+                            .or_else(|| e.color("maincolor"))
+                            .or_else(|| e.color("color"))
+                            .or_else(|| self.part_value(e, "foreColor").and_then(parse_color))
+                            .map(tint)
+                            .unwrap_or([1.0, 1.0, 1.0, 1.0])
                     };
                     // a widget with no box of its own anchors on its own text (align 0 then works
                     // out to the position in the file, which is what the button classes carry)
@@ -398,7 +1103,68 @@ impl LayoutScreen {
                     self.text(&mut out, aspect, f, &text, x, y, box_w, e.int("align").unwrap_or(0), color);
                 }
             }
+            }
+            // every sprite this widget produced fades with it (0x4C8840)
+            if talpha < 1.0 {
+                for s in &mut out[first..] {
+                    s.color[3] *= talpha;
+                }
+            }
+        }
+        // The cars of the `NFS5.3DCAR` widgets that have a `positiontype` of their own, each
+        // already rendered into an offscreen view the size of the screen — its place in that view
+        // comes from the camera, not from the widget's rectangle. The original draws each one in
+        // its widget's own place in the layout order, but two of the three screens that use them
+        // (`carcompare`) then put `DarkOval.fsh` over the middle, which would hide them, so the
+        // port draws them over the finished screen instead. APPROXIMATION.
+        for (&i, &tex) in &self.car_views {
+            let alpha = self.transition_of(&self.layout.elements[i]).1;
+            let design = DESIGN.0 / DESIGN.1;
+            let (fw, x0) = if aspect > design { (design / aspect, (1.0 - design / aspect) * 0.5) } else { (1.0, 0.0) };
+            out.push(Sprite { texture: tex, pos: [x0, 0.0], size: [fw * aspect, 1.0], uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, alpha], rotation: 0.0, pivot: [0.5, 0.5] });
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `FE_transitionBits` 0x4C88C0 — the six names, lower-cased, and 0 for anything else.
+    #[test]
+    fn transition_names_map_to_their_bits() {
+        assert_eq!(transition_bits("SAME"), trans::SAME);
+        assert_eq!(transition_bits("LEFT"), trans::LEFT);
+        assert_eq!(transition_bits("RIGHT"), trans::RIGHT);
+        assert_eq!(transition_bits("TOP"), trans::TOP);
+        assert_eq!(transition_bits("BOTTOM"), trans::BOTTOM);
+        assert_eq!(transition_bits("FADE"), trans::FADE);
+        assert_eq!(transition_bits("fade"), trans::FADE);
+        assert_eq!(transition_bits(""), 0);
+    }
+
+    /// The clock: three dead frames, then 0..512 over half a second (0x4E09E8…0x4E0AB4).
+    #[test]
+    fn the_transition_clock_runs_for_half_a_second_after_three_frames() {
+        let mut t = Transition::In { frames: TRANS_DELAY_FRAMES, ms: 0 };
+        for _ in 0..TRANS_DELAY_FRAMES {
+            assert_eq!(t.progress(), TRANS_FULL, "the widget is a whole screen away while it waits");
+            t = t.advance(16);
+        }
+        assert_eq!(t.progress(), TRANS_FULL);
+        t = t.advance(250);
+        assert_eq!(t.progress(), TRANS_FULL / 2, "half the time, half the way in");
+        t = t.advance(250);
+        assert_eq!(t, Transition::Idle, "and it settles exactly at the half second");
+        assert!(t.done());
+
+        // going out climbs the other way and stops at 512
+        let mut t = Transition::Out { frames: 0, ms: 0 };
+        assert_eq!(t.progress(), 0);
+        t = t.advance(500);
+        assert_eq!(t.progress(), TRANS_FULL);
+        assert!(t.done());
+        assert_eq!(t.advance(500).progress(), TRANS_FULL, "and stays gone");
     }
 }

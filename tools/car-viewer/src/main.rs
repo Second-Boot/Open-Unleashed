@@ -67,7 +67,7 @@ impl Viewer {
                 }
                 let mat = *mats.entry(mm.material).or_insert_with(|| r.create_material(MaterialDesc::flat()));
                 let id = r.upload_mesh(&mesh);
-                self.scene.items.push(DrawItem { mesh: id, material: mat, transform: Mat4::IDENTITY });
+                self.scene.items.push(DrawItem::new(id, mat, Mat4::IDENTITY));
             }
         }
         tracing::info!(items = self.scene.items.len(), skipped, ?min, ?max, "car scene");

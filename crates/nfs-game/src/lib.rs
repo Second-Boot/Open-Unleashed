@@ -3,14 +3,18 @@
 //! Race logic (checkpoints, laps, positions) follows M5.
 pub mod ai;
 pub mod aidrive;
+pub mod camera;
+pub mod cameras;
 pub mod career;
 pub mod junctions;
 pub mod lanes;
 pub mod layout;
+pub mod particles;
 pub mod police;
 pub mod race;
 pub mod replay;
 pub mod rng;
+pub mod room;
 pub mod racecar;
 pub mod records;
 pub mod save;

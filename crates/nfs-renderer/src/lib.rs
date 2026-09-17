@@ -69,6 +69,20 @@ pub struct DrawItem {
     pub mesh: MeshId,
     pub material: MaterialId,
     pub transform: Mat4,
+    /// Per-object light multiplier, white for anything that takes the scene light as it is. Cars
+    /// use it to carry the colour of the ground they stand on (`RE/notes/lighting.md`).
+    pub light: [f32; 3],
+    /// Per-object opacity, multiplying the material's own alpha — 1 for everything but the
+    /// particles, which fade out with it.
+    pub alpha: f32,
+    /// Added to every vertex's uv before sampling; the sky layers drift with it.
+    pub uv_offset: [f32; 2],
+}
+
+impl DrawItem {
+    pub fn new(mesh: MeshId, material: MaterialId, transform: Mat4) -> Self {
+        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2] }
+    }
 }
 
 /// 2D overlay quad in normalised screen units (0..1, origin top-left), optionally rotated about `pivot`.

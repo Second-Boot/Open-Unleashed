@@ -6,13 +6,20 @@ use nfs_renderer::{Renderer, Sprite, TextureData, TextureId};
 pub struct BitmapFont {
     font: Font,
     texture: TextureId,
+    /// Window aspect the screen-space `sprites` lays a line out for (4:3 until told otherwise).
+    aspect: f32,
 }
 
 impl BitmapFont {
     pub fn upload(r: &mut Renderer, font: Font) -> Self {
         let rgba = font.atlas_rgba();
         let texture = r.upload_texture(&TextureData::single(font.atlas_width as u32, font.atlas_height as u32, rgba));
-        Self { font, texture }
+        Self { font, texture, aspect: 4.0 / 3.0 }
+    }
+
+    /// Tell the font what shape the window is, so a screen-space line keeps the original's spacing.
+    pub fn set_aspect(&mut self, aspect: f32) {
+        self.aspect = aspect.max(0.1);
     }
 
     pub fn texture(&self) -> TextureId {
@@ -57,15 +64,23 @@ impl BitmapFont {
 
     /// Sprites for `text` with its top-left at `pos` (screen units 0..1); `height` = line height in
     /// screen units. Used by the HUD, whose sprites are square in screen units.
+    /// Lay a line out at `pos` in **screen** units with glyphs `height` tall (also in screen units,
+    /// i.e. a fraction of the window's height).
+    ///
+    /// A glyph's advance is in the same units as its height, so turning it into a horizontal screen
+    /// fraction divides by the window's aspect — `set_aspect` is what tells the font which window it
+    /// is drawing into. Without it a wide window spreads a line out (the port used to carry a fixed
+    /// 0.85 here, right only at 4:3). The front end's screens and the HUD do not come through this
+    /// path: they place each glyph in the original's 640×480 space themselves.
     pub fn sprites(&self, text: &str, pos: [f32; 2], height: f32, color: [f32; 4]) -> Vec<Sprite> {
         let scale = height / self.line_px();
+        let advance = scale / self.aspect;
         let (glyphs, _) = self.place(text);
         glyphs
             .iter()
             .map(|g| Sprite {
                 texture: self.texture,
-                // 0.85 = the width/height texel aspect of the atlas as the HUD displays it
-                pos: [pos[0] + g.x * scale * 0.85, pos[1] + g.y * scale],
+                pos: [pos[0] + g.x * advance, pos[1] + g.y * scale],
                 size: [g.w * scale, g.h * scale],
                 uv_min: g.uv_min,
                 uv_max: g.uv_max,

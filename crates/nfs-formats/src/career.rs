@@ -29,7 +29,8 @@ pub const TRACK_RECORD_SIZE: usize = 0x4A8;
 pub struct TrackRecord {
     pub driver: String,
     pub car: String,
-    /// Time as stored; unit HYPOTHESIS (centiseconds or 64 Hz ticks), see `RE/notes/career.md` §1.
+    /// Time in 64 Hz ticks (`RE/notes/career.md` §1, CONFIRMED: 0x492A00 formats the same value as
+    /// `t/3840` min, `(t/64) % 60` s, `(t & 63)·100/64` hundredths).
     pub time: u32,
 }
 
@@ -342,8 +343,10 @@ pub struct Part {
     /// Car family the part fits (`356`, `911 (993)`, `GT1` …).
     pub family: String,
     pub unknown_24: u16,
-    /// 1 engine group, 2 brakes, 3 gearbox, 4 springs, 5 shocks, 6 aero, 7 damage body, 8 sway bars,
-    /// 9 unnamed, 10 visual body/rims/roof.
+    /// The part's category, and the heading the parts lists group it under: 1 ENGINE, 2 BRAKES,
+    /// 3 TRANSMISSION, 4 SUSPENSION, 5 SHOCKS, 6 and 7 both WEIGHT REDUCTION, 8 SWAY BARS,
+    /// 9 TIRES, 10 BODYWORK — `partCategoryString` 0x518D60 maps `+0x26` to string 2554…2562, and
+    /// 6 and 7 share one (CONFIRMED; the earlier reading of 6, 7, 9 and 10 was a guess).
     pub kind: u16,
     pub kind_name: String,
     pub year: u16,
@@ -370,6 +373,19 @@ pub struct Part {
     /// 21 points, 500 rpm spacing (engine parts).
     pub torque_curve: [f32; 21],
     pub state: u32,
+}
+
+/// The `FEStrings` id of the heading a part's category is listed under (`partCategoryString`
+/// 0x518D60). CONFIRMED.
+pub fn part_category_string(kind: u16) -> Option<u32> {
+    Some(match kind {
+        1..=5 => 2553 + kind as u32,
+        6 | 7 => 2559,
+        8 => 2560,
+        9 => 2561,
+        10 => 2562,
+        _ => return None,
+    })
 }
 
 pub fn parse_parts(data: &[u8]) -> Result<Vec<Part>, FormatError> {
@@ -490,7 +506,11 @@ pub struct Mission {
     pub police: bool,
     /// `+0x28 == 2`: track driven backwards.
     pub backwards: bool,
-    pub unknown_2a: i16,
+    /// `+0x2A`: the value the mission puts into the player slot's `.CABRIODOWN` accessor (id 0x24C,
+    /// `0x4EEF48`, the only writer of that accessor in the game). Set on four coupé missions and clear
+    /// on every open-top one, so its effect on the car model is not explained by the data
+    /// (`RE/notes/skill-tests.md` §2).
+    pub cabrio_down: bool,
     /// `0M01` … `3m11`.
     pub code: String,
     /// Traffic level 0..3 → `{0, 2, 4, 8}` cars.
@@ -504,6 +524,8 @@ pub struct Mission {
     pub colours: [[u8; 4]; 8],
     pub colour_index_bc: i16,
     pub colour_index_be: i16,
+    /// `+0xC0`: 1 only on `0M01` and `3m07`, the two missions driven in an open car; no reader exists
+    /// anywhere in the executable, so nothing is done with it here either.
     pub unknown_c0: u8,
     /// Time limit in seconds (`+0xC1` flag, `+0xC2`).
     pub time_limit_s: Option<u16>,
@@ -576,7 +598,7 @@ pub fn parse_missions(data: &[u8]) -> Result<Vec<Mission>, FormatError> {
             scene: i16_le(r, 0x24, what)?,
             police: r[0x26] != 0,
             backwards: i16_le(r, 0x28, what)? == 2,
-            unknown_2a: i16_le(r, 0x2A, what)?,
+            cabrio_down: r[0x2A] != 0,
             code: fixed_str(r, 0x3F, 8, what)?,
             traffic_level: i16_le(r, 0x54, what)?,
             skill: i16_le(r, 0x56, what)?,
@@ -680,6 +702,10 @@ impl TrackRecordFile {
     /// `Records_insert` 0x4FAFC0: find the record for `id`, insert at the first slot whose time is
     /// **strictly** greater than `time`, shift the rest down, drop the eighth. Returns the 0-based
     /// rank, or `None` when the time does not make the table.
+    ///
+    /// The driver name is a plain `strcpy` into the 20-byte field (0x4FB0BF); the car name is
+    /// `strncpy(slot+0x14, car, 0x11)` followed by `slot[0x25] = 0` (0x4FB0AB/0x4FB0E8), so only the
+    /// first **17** characters of a car name are ever stored even though the field is 52 bytes.
     pub fn insert(&mut self, id: u16, driver: &str, car: &str, time: u32) -> Option<usize> {
         let t = self.index_of(id)?;
         let times: Vec<u32> = self.entries(t).iter().map(|e| e.time).collect();
@@ -697,7 +723,7 @@ impl TrackRecordFile {
             }
         };
         put(&mut self.raw, e, 20, driver);
-        put(&mut self.raw, e + 0x14, 52, car);
+        put(&mut self.raw, e + 0x14, 0x12, car);
         self.raw[e + 0x48..e + 0x4C].copy_from_slice(&time.to_le_bytes());
         Some(k)
     }

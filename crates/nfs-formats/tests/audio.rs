@@ -286,7 +286,7 @@ fn music_stream_first_two_seconds() {
         }
     }
     samples.truncate(want * 2);
-    let pcm = PcmSample { rate: s.header.sample_rate, channels: 2, samples, loop_range: None, padded_tail: 0 };
+    let pcm = PcmSample { rate: s.header.sample_rate, channels: 2, samples, loop_range: None, padded_tail: 0, gain: 1.0 };
     assert_eq!(pcm.samples_per_channel(), want);
     check_plausible(&pcm, &format!("music {} ({blocks} blocks)", e.name));
     wav(&format!("music_{}_2s.wav", e.name.split('-').next().unwrap()), &pcm);
@@ -362,4 +362,39 @@ fn collision_bank_slots() {
         assert!(pcm.loop_range.is_none(), "slot {slot:#x} is a one-shot");
         assert!(pcm.samples.len() > 1000, "slot {slot:#x} has {} samples", pcm.samples.len());
     }
+}
+
+/// The PT patch codes of `RE/notes/audio.md` §2: the engine bank gives nearly every sample its own
+/// volume and root key, while the track ambience banks carry neither and take the parser's defaults.
+#[test]
+fn pt_patch_parameters() {
+    let r = need_game!();
+    let v = std::fs::read(r.join("GameData/Sounds/sd6a.viv")).unwrap();
+    let big = Bigf::parse(&v).unwrap();
+    let d = big.get(&v, "sd6a.bnk").expect("sd6a.bnk entry");
+    let b = Bnk::parse(d).unwrap();
+    let mut with_volume = 0;
+    for i in b.used_slots() {
+        let h = b.header(i).unwrap();
+        let vol = h.patch_volume();
+        assert!(vol <= 127, "slot {i} volume {vol}");
+        if h.patch_params.iter().any(|(c, _)| *c == 0x0E) {
+            with_volume += 1;
+            assert!((34..=127).contains(&vol), "slot {i} volume {vol}");
+        }
+        // every engine sample is tuned, and the root keys stay inside the MIDI range
+        assert!((24..=96).contains(&h.root_key()), "slot {i} root {}", h.root_key());
+        assert_eq!(h.patch_pan(), 64, "slot {i} is not centred");
+        assert_eq!(b.decode_slot(d, i).unwrap().gain, vol as f32 / 127.0);
+    }
+    assert_eq!(with_volume, 33, "33 of the 34 sd6a slots carry code 0x0E");
+
+    // an ambience bank has no patch parameters at all, so it plays at full volume, centred
+    let t = std::fs::read(r.join("GameData/Sounds/track.viv")).unwrap();
+    let dir = Bigf::parse(&t).unwrap();
+    let amb = dir.get(&t, "bang1_001.bnk").expect("bang1_001.bnk");
+    let ab = Bnk::parse(amb).unwrap();
+    let h = ab.header(ab.used_slots().next().unwrap()).unwrap();
+    assert!(!h.patch_params.iter().any(|(c, _)| matches!(c, 0x0C..=0x0F)), "ambience banks set no volume or pan");
+    assert_eq!((h.patch_volume(), h.patch_pan(), h.root_key()), (127, 64, 60));
 }

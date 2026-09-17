@@ -13,10 +13,9 @@
 //! engine start/stop one-shots and their duck of the loop bed (§3.6), the smoothed pedal "load" and the
 //! gear-shift dip (§4.3), and the distance gain with its rpm boost (§4.1).
 //!
-//! Not ported: the stereo `pan ± spread` pair for `slotId >= 0x40` layers (each layer plays one voice
-//! at the record's pan; `spread` is computed and used only to move the mono layers dead-behind as the
-//! original does), the tunnel reverb of §4.7, and the road/wind/turbo layers of §4.4–§4.6, which belong
-//! to `sfx.rs`.
+//! The stereo `pan ± spread` pair of §3.4 is played as two voices at half level each, and `spread`
+//! also moves the mono layers dead-behind, as the original does. The tunnel reverb of §4.7 lives in
+//! `reverb.rs`. The road, wind and turbo layers of §4.4–§4.6 live in `sfx.rs`.
 
 use crate::mixer::{AudioOutput, Clip, VoiceId};
 use nfs_formats::{bigf::Bigf, bnk::Bnk, crdl::Crdl, spl::Spl};
@@ -128,6 +127,8 @@ impl Default for EngineInput {
 
 pub struct EngineSound {
     spl: Spl,
+    /// the `engineGain` of the last update, which the aux layers (road, turbo) scale by
+    last_gain: i32,
     /// `game.spl[6]` — the engine trim of the global settings block
     game_trim: u32,
     layers: Vec<Option<LayerDesc>>,
@@ -135,6 +136,8 @@ pub struct EngineSound {
     /// `levelState[32]`, the slew target
     level: Vec<i32>,
     voices: Vec<Option<VoiceId>>,
+    /// the second half of a stereo layer's `pan ± spread` pair (§3.4)
+    voices_b: Vec<Option<VoiceId>>,
     /// `[0x6563C8 + 4·idx]` — the smoothed pedal value
     pedal: i32,
     /// engine start / stop one-shots per view class (bank slots 6..8 / 9..11)
@@ -188,7 +191,7 @@ impl EngineSound {
             }
         }
         let decode = |slot: usize| -> Option<Arc<Clip>> {
-            bank.decode_slot(bank_bytes, slot).ok().map(|p| Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range }))
+            bank.decode_slot(bank_bytes, slot).ok().map(|p| Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range, gain: p.gain }))
         };
         let clips: Vec<Option<Arc<Clip>>> = layers
             .iter()
@@ -207,18 +210,20 @@ impl EngineSound {
 
         let spl = std::fs::read(sounds_dir.join(format!("{sim}.spl"))).ok().and_then(|d| Spl::parse(&d).ok()).unwrap_or_default();
         // `game.spl[6]` = the engine trim of the global settings block (16 shipped)
-        let game_trim = std::fs::read(sounds_dir.join("game.spl")).ok().and_then(|d| d.get(24..28).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))).unwrap_or(16);
+        let game_trim = nfs_formats::spl::GameSpl::load(sounds_dir).engine();
         let start_clips = [decode(6), decode(7), decode(8)];
         let stop_clips = [decode(9), decode(10), decode(11)];
         let n = layers.iter().filter(|l| l.is_some()).count();
         tracing::info!(set, sim, layers = n, spl = ?spl.0, game_trim, "engine sound loaded");
         Ok(Self {
             spl,
+            last_gain: 0,
             game_trim,
             layers,
             clips,
             level: vec![0; 32],
             voices: vec![None; 32],
+            voices_b: vec![None; 32],
             pedal: 0,
             start_clips,
             stop_clips,
@@ -236,7 +241,7 @@ impl EngineSound {
 
     /// Stop every voice (leaving the race).
     pub fn stop(&mut self, out: &AudioOutput) {
-        for v in self.voices.iter_mut().chain([&mut self.start_voice, &mut self.stop_voice, &mut self.horn_voice]) {
+        for v in self.voices.iter_mut().chain(self.voices_b.iter_mut()).chain([&mut self.start_voice, &mut self.stop_voice, &mut self.horn_voice]) {
             if let Some(id) = v.take() {
                 out.stop(id);
             }
@@ -265,6 +270,17 @@ impl EngineSound {
             }
             _ => {}
         }
+    }
+
+    /// `Engine_auxVolume(mode)` 0x4AD640 — the base level the road and turbo layers start from
+    /// (`engine-audio.md` §4.6).
+    pub fn aux_volume(&self, mode: u8) -> i32 {
+        self.spl.aux_volume(mode) as i32
+    }
+
+    /// The `engineGain` the last [`Self::update`] computed.
+    pub fn gain(&self) -> i32 {
+        self.last_gain
     }
 
     /// `engineGain` — the distance attenuation with its rpm boost and the shift dip (§4.1, §4.3).
@@ -319,7 +335,8 @@ impl EngineSound {
         let pan = if inp.mode < 2 { 0.0 } else { inp.pan };
 
         // §4.1 master volume, §3.6 duck while the start sample plays
-        let master_vol = (((inp.engine_level as i32 * self.game_trim as i32 * 85) >> 7) * self.engine_gain(&inp)) >> 14;
+        self.last_gain = self.engine_gain(&inp);
+        let master_vol = (((inp.engine_level as i32 * self.game_trim as i32 * 85) >> 7) * self.last_gain) >> 14;
         let mut rec_volume = ((self.spl.record_volume(inp.mode) as i32 * master_vol) >> 6).min(0x7FF);
         rec_volume = rec_volume * self.start_stop(out, &inp, pan) / 512;
 
@@ -339,8 +356,21 @@ impl EngineSound {
             // ±8 per update
             self.level[i] = level.clamp(self.level[i] - 8, self.level[i] + 8);
             let lvl = self.level[i];
-            // mono layers go dead-behind while the in-car spread is open
-            let voice_pan = if d.slot >= 0x40 { pan } else if spread != 0 { -1.0 } else { pan };
+            // §3.4's voice management: a stereo layer (`slotId >= 0x40`) plays **two** voices at
+            // `pan ± spread` whenever the in-car spread is open; a mono one goes dead-behind
+            // instead. The original's pans are 16-bit angles; this port's are scalars, so the
+            // spread maps onto the pan axis as a fraction of a half turn — APPROXIMATION.
+            let stereo_pair = d.slot >= 0x40 && spread != 0;
+            let sp = spread as f32 / 32768.0;
+            let (pan_a, pan_b) = if stereo_pair {
+                ((pan - sp).clamp(-1.0, 1.0), (pan + sp).clamp(-1.0, 1.0))
+            } else if d.slot >= 0x40 {
+                (pan, pan)
+            } else {
+                (if spread != 0 { -1.0 } else { pan }, pan)
+            };
+            let half = if stereo_pair { 0.5 } else { 1.0 };
+            let vol = lvl as f32 / 127.0 * half;
             match (lvl, self.voices[i]) {
                 (0, Some(v)) => {
                     out.stop(v);
@@ -348,12 +378,29 @@ impl EngineSound {
                 }
                 (0, None) => {}
                 (_, Some(v)) => {
-                    out.set(v, lvl as f32 / 127.0, pitch);
-                    out.set_pan(v, voice_pan);
+                    out.set(v, vol, pitch);
+                    out.set_pan(v, pan_a);
                 }
                 (_, None) => {
                     if let Some(c) = &self.clips[i] {
-                        self.voices[i] = Some(out.play_panned(c.clone(), lvl as f32 / 127.0, pitch, voice_pan, true));
+                        self.voices[i] = Some(out.play_panned(c.clone(), vol, pitch, pan_a, true));
+                    }
+                }
+            }
+            // the second half of a stereo pair
+            match (lvl > 0 && stereo_pair, self.voices_b[i]) {
+                (false, Some(v)) => {
+                    out.stop(v);
+                    self.voices_b[i] = None;
+                }
+                (false, None) => {}
+                (true, Some(v)) => {
+                    out.set(v, vol, pitch);
+                    out.set_pan(v, pan_b);
+                }
+                (true, None) => {
+                    if let Some(c) = &self.clips[i] {
+                        self.voices_b[i] = Some(out.play_panned(c.clone(), vol, pitch, pan_b, true));
                     }
                 }
             }

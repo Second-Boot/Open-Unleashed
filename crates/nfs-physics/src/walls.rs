@@ -21,6 +21,10 @@ pub struct Wall {
 
 /// `.edg` wall word → material class (tables 0x49442C / 0x4943BC, CONFIRMED from the bytes;
 /// the class order metal/wood/snow/ice/earth/rock is HIGH from the per-track word statistics).
+/// The class is the CRP material's `mt.flags & 0xF0` carried into the `.edg` word by the rebuild path
+/// 0x4750B0 (`RE/notes/suspension-collision.md` §7). `WallImpulse` clamps anything outside
+/// `[0x10, 0x60]` to 0x60, and no shipped track has a word inside that range which is not a multiple
+/// of 0x10, so the game's seventh ("unknown") table entry is unreachable and rock is the fallback.
 pub fn wall_class(word: u32) -> u8 {
     match word {
         0x10 => 0,

@@ -110,7 +110,7 @@ impl Viewer {
             for mm in &art.meshes {
                 let mat_id = material_for(r, mm.material);
                 let mesh = r.upload_mesh(&mm.mesh);
-                self.scene.items.push(DrawItem { mesh, material: mat_id, transform: art.transform });
+                self.scene.items.push(DrawItem::new(mesh, mat_id, art.transform));
                 item_count += 1;
             }
         }
@@ -131,7 +131,7 @@ impl Viewer {
                 Some(parts) => {
                     let lib_tr = geometry.library.iter().find(|a| a.tag == inst.tag).map(|a| a.transform).unwrap_or(Mat4::IDENTITY);
                     for (mesh, mat) in parts {
-                        self.scene.items.push(DrawItem { mesh: *mesh, material: *mat, transform: inst.transform * lib_tr });
+                        self.scene.items.push(DrawItem::new(*mesh, *mat, inst.transform * lib_tr));
                     }
                     placed += 1;
                 }
@@ -150,7 +150,7 @@ impl Viewer {
         );
         let grid = r.upload_mesh(&MeshData::grid(50.0, 5.0));
         let mat = r.create_material(MaterialDesc { texture: None, alpha_blend: false, cull_back: false, depth_test: true, env_texture: None, env_mix: 0.0 });
-        self.scene.items.push(DrawItem { mesh: grid, material: mat, transform: Mat4::from_translation(Vec3::new(start.x, start.y - 0.5, start.z)) });
+        self.scene.items.push(DrawItem::new(grid, mat, Mat4::from_translation(Vec3::new(start.x, start.y - 0.5, start.z))));
         self.camera.position = start + Vec3::new(0.0, 3.0, 12.0);
         self.camera.target = start;
         self.yaw = -std::f32::consts::FRAC_PI_2;

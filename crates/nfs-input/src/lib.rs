@@ -67,6 +67,27 @@ pub fn default_binding(key: KeyCode) -> Option<Action> {
     })
 }
 
+/// The key bound to an action, as the key-binding screen would print it. The reverse of
+/// [`default_binding`]; actions with no key of their own return `None`.
+pub fn key_for(action: Action) -> Option<&'static str> {
+    Some(match action {
+        Action::SteerLeft => "LEFT ARROW",
+        Action::SteerRight => "RIGHT ARROW",
+        Action::Throttle => "UP ARROW",
+        Action::Brake => "DOWN ARROW",
+        Action::Handbrake => "SPACE",
+        Action::ShiftUp => "A",
+        Action::ShiftDown => "Z",
+        Action::CameraNext => "C",
+        Action::Reset => "R",
+        Action::RearView => "B",
+        Action::Horn => "H",
+        Action::SplitTimes => "T",
+        Action::Pause => "ESC",
+        _ => return None,
+    })
+}
+
 /// Current logical input state, updated from window events and sampled once per tick.
 #[derive(Debug, Default, Clone)]
 pub struct InputState {

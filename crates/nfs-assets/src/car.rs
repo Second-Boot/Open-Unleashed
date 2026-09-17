@@ -2,7 +2,7 @@
 
 use crate::{fmt_err, read, texture::{decode_pack, TextureImage}, AssetError, GamePaths};
 use nfs_formats::{crp::Crp, fsh::Fsh, ini::Ini, refpack, sim::CarSim};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// One assembled texture page (`.tpg` `[tpageN.details]`), RGBA8.
 #[derive(Debug, Clone)]
@@ -23,6 +23,46 @@ pub struct CarStyle {
     pub name: String,
     pub geometry: std::collections::HashMap<u32, u32>,
     pub texture: std::collections::HashMap<u32, u32>,
+}
+
+/// Where the driver's view sits and how it is aimed, from the car's `.tpg`
+/// (`RE/notes/car-model.md` §3): `drivercampos` / `drivercamrot`, or the body style's own
+/// `drivercamposstyle<N>` / `drivercamrotstyle<N>` when it has them (0x441A10 reads both).
+///
+/// Loading a car copies the pair into the camera globals (0x46427F: `carInfo+0x10E8` →
+/// `0x5CF620`, the driver entry of the view-offset table, and `carInfo+0x10F4` → `0x627ECC`), so
+/// the position is an offset in the same body frame as the rest of that table
+/// (`nfs_game::camera`): +x right, +y up, +z forward, from the car's physics position.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DriverCam {
+    /// the eye point in the car body frame: +x right, +y up, +z forward
+    pub position: glam::Vec3,
+    /// pitch, yaw and roll in **degrees**, applied to the camera matrix in that order
+    /// (0x461B48 multiplies by `angle/360` turns and calls the x/y/z rotations 0x5563D0 /
+    /// 0x5564A0 / 0x556560). A positive pitch tilts the forward row towards −up, i.e. **down**:
+    /// 0x5563D0 leaves the x row alone and does `up' = cos·up + sin·fwd`,
+    /// `fwd' = cos·fwd − sin·up` (`0x532800` fills sin then cos). HIGH.
+    pub rotation: glam::Vec3,
+}
+
+impl DriverCam {
+    /// Read it from a `.tpg`, preferring the body style's own keys.
+    ///
+    /// The file's axes are the body frame's, not the model's: the left-hand-drive cars put the
+    /// driver at `x = −0.38`, the right-hand-drive 935 and GT1 at `x = +0.31`, so +x is the car's
+    /// right (the model has +x on the *left*, `car-model.md` §7); and the front-engined 928 sits
+    /// at `z = −0.53` while the GT1, whose cockpit is far forward, sits at `z = +0.24`, so +z is
+    /// forward. HIGH.
+    pub fn from_tpg(tpg: &Ini, style: usize) -> Option<Self> {
+        let h = tpg.section("header")?;
+        let triple = |key: &str| -> Option<glam::Vec3> {
+            let v = h.get_f32_list(key)?;
+            (v.len() >= 3).then(|| glam::Vec3::new(v[0], v[1], v[2]))
+        };
+        let pos = triple(&format!("drivercamposstyle{style}")).or_else(|| triple("drivercampos"))?;
+        let rot = triple(&format!("drivercamrotstyle{style}")).or_else(|| triple("drivercamrot")).unwrap_or(glam::Vec3::ZERO);
+        Some(Self { position: pos, rotation: rot })
+    }
 }
 
 impl CarStyle {
@@ -81,7 +121,15 @@ pub struct CarAssets {
 
 impl CarAssets {
     pub fn load(paths: &GamePaths, model: &str) -> Result<Self, AssetError> {
-        let dir = paths.car_model_dir();
+        Self::load_in(&paths.car_model_dir(), model)
+    }
+
+    /// The same model files from any directory. The front end's 3D rooms are `Car`-kind `.crp`s in
+    /// `FEData/Models` (`garage`, `dealer2a…c`, `factory`, `victory`, `trackwall`, `track`) that
+    /// carry their textures inside the `.crp` and ship **no** `D.fsh` / `L.fsh` beside them, so the
+    /// two external packs are optional here (`RE/notes/frontend-3d.md` §1).
+    pub fn load_in(dir: &Path, model: &str) -> Result<Self, AssetError> {
+        let dir = dir.to_path_buf();
         let file = |suffix: &str| -> Result<PathBuf, AssetError> {
             let n = format!("{model}{suffix}");
             GamePaths::find_file(&dir, &n).ok_or_else(|| AssetError::MissingFile { dir: dir.clone(), name: n })
@@ -102,7 +150,8 @@ impl CarAssets {
             (Ok(d), Ok(n)) => (d, n),
             (Ok(d), Err(_)) => (d.clone(), d),
             (Err(_), Ok(n)) => (n.clone(), n),
-            (Err(e), Err(_)) => return Err(e),
+            // a model whose textures are all embedded in the `.crp` has neither pack
+            (Err(_), Err(_)) => (Vec::new(), Vec::new()),
         };
         Ok(Self {
             model: model.to_string(),
@@ -246,6 +295,101 @@ fn blit(page: &mut TexturePage, src: &[u8], w: u32, h: u32, x: i64, y: i64, tint
                 if !page.is_window && !page.is_alpha {
                     d[3] = 255;
                 }
+            }
+        }
+    }
+}
+
+/// One entry of a global car texture file (`CarModel/{Shadow,INTGLASS,Suit,Head,Cabrio}.fsh`) by
+/// name — the packs the `.tpg` pulls page pieces from, which also hold standalone textures such as
+/// `INTGLASS`'s `glai` windscreen glass.
+pub fn global_texture(paths: &GamePaths, file: &str, entry: &str) -> Result<Option<TextureImage>, AssetError> {
+    let Some(p) = GamePaths::find_file(&paths.car_model_dir(), file) else { return Ok(None) };
+    let data = refpack::maybe_decompress(&read(&p)?).map_err(fmt_err(&p))?.into_owned();
+    Ok(decode_pack(&p, &data)?.into_iter().find(|t| t.name.trim().eq_ignore_ascii_case(entry)))
+}
+
+/// One patch of a `<model>D.fsh` / `<model>L.fsh` damage pack (`RE/notes/car-model.md` §11).
+#[derive(Debug, Clone)]
+pub struct DamagePatch {
+    /// Last digit of the entry name = the damage zone it belongs to (`car+0x4E4 + 4·zone`).
+    pub zone: u8,
+    /// `misc[0]`: which texture page the patch is drawn onto.
+    pub page: usize,
+    pub x: u32,
+    pub y: u32,
+    /// `misc[1]` as a float. Above zero the original blits the patch opaque once the zone's damage
+    /// passes it; no shipped patch does, so in practice every patch takes the blended path.
+    pub threshold: f32,
+    pub image: TextureImage,
+}
+
+/// Read the damage decals beside a car's `.crp`. `night` picks `<model>L.fsh` over `<model>D.fsh`,
+/// as `car+0xAA <= 0x50` does in the original (0x442011 / 0x44204E).
+pub fn damage_patches(paths: &GamePaths, model: &str, night: bool) -> Result<Vec<DamagePatch>, AssetError> {
+    let suffix = if night { "L" } else { "D" };
+    let Some(p) = GamePaths::find_file(&paths.car_model_dir(), &format!("{model}{suffix}.fsh")) else { return Ok(Vec::new()) };
+    let data = refpack::maybe_decompress(&read(&p)?).map_err(fmt_err(&p))?.into_owned();
+    let fsh = Fsh::parse(&data).map_err(fmt_err(&p))?;
+    let mut out = Vec::new();
+    for (i, e) in fsh.entries.iter().enumerate() {
+        // the four-digit name: the applier keeps the entry when carInfo[0x56C][first two] equals the
+        // third digit (0 == 0 for every shipped pack) and uses the fourth as the damage zone
+        let n = e.name.trim();
+        let digits: Vec<u32> = n.chars().filter_map(|c| c.to_digit(10)).collect();
+        if digits.len() != 4 || n.len() != 4 {
+            continue;
+        }
+        let (group, variant, zone) = (digits[0] * 10 + digits[1], digits[2], digits[3] as u8);
+        if group != 0 || variant != 0 || zone as usize >= 10 {
+            continue;
+        }
+        let Ok(img) = fsh.decode_mip(&data, i, 0) else { continue };
+        let b = &e.blocks[0];
+        out.push(DamagePatch {
+            zone,
+            page: b.misc[0] as usize,
+            x: (b.misc[2] & 0xFFF) as u32,
+            y: (b.misc[3] & 0xFFF) as u32,
+            threshold: b.misc[1] as f32,
+            image: TextureImage { name: e.name.clone(), width: img.width, height: img.height, mips: vec![img.rgba], has_alpha: true, page: b.misc[0] as usize, x: (b.misc[2] & 0xFFF) as u32, y: (b.misc[3] & 0xFFF) as u32 },
+        });
+    }
+    Ok(out)
+}
+
+/// Blend one damage patch onto a page, as 0x448110 does: skipped while the zone is undamaged,
+/// otherwise drawn with a constant `alpha = min(damage · 3.5, 255)` on top of the patch's own
+/// per-pixel alpha.
+pub fn blend_patch(page: &mut TexturePage, patch: &DamagePatch, damage: f32) {
+    if patch.threshold > 0.0 {
+        if damage <= patch.threshold {
+            return;
+        }
+    } else if damage <= 0.0 {
+        return;
+    }
+    let level = if patch.threshold > 0.0 { 255.0 } else { (damage * 3.5).min(255.0) };
+    let src = &patch.image.mips[0];
+    for row in 0..patch.image.height {
+        let dy = patch.y + row;
+        if dy >= page.height {
+            break;
+        }
+        for col in 0..patch.image.width {
+            let dx = patch.x + col;
+            if dx >= page.width {
+                break;
+            }
+            let s = ((row * patch.image.width + col) * 4) as usize;
+            let a = src[s + 3] as f32 / 255.0 * (level / 255.0);
+            if a <= 0.0 {
+                continue;
+            }
+            let d = ((dy * page.width + dx) * 4) as usize;
+            for k in 0..3 {
+                let out = page.rgba[d + k] as f32 * (1.0 - a) + src[s + k] as f32 * a;
+                page.rgba[d + k] = out.round().clamp(0.0, 255.0) as u8;
             }
         }
     }

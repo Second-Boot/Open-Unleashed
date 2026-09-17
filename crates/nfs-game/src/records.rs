@@ -25,12 +25,14 @@ pub struct TrackRecords {
     pub entries: Vec<TrackRecord>,
 }
 
-/// `Time_format` 0x4356E0: `m:ss.hh` with `hh = (ticks & 63) · 100 / 64`.
+/// `Time_format` 0x4356E0: `mm:ss.hh` with `hh = (ticks & 63) · 100 / 64`. Each of the three fields
+/// gets a leading `"0"` of its own when it is below ten (0x4357B4, 0x43582B, 0x4358A0), and more
+/// than sixty minutes clamps to `59:59.99` (0x4358E7). CONFIRMED.
 pub fn format_ticks(ticks: u64) -> String {
     let s = ticks / 64;
     let (m, sec) = (s / 60, s % 60);
     let hh = ((ticks & 63) * 100) / 64;
-    if m > 60 { "59:59.99".to_string() } else { format!("{m}:{sec:02}.{hh:02}") }
+    if m > 60 { "59:59.99".to_string() } else { format!("{m:02}:{sec:02}.{hh:02}") }
 }
 
 /// The `nfs5.trk` array plus the per-track metadata needed to address it by track file name.
@@ -112,10 +114,12 @@ mod tests {
 
     #[test]
     fn format_matches_the_original() {
-        assert_eq!(format_ticks(10496), "2:44.00");
-        assert_eq!(format_ticks(3999), "1:02.48");
-        assert_eq!(format_ticks(11350), "2:57.34");
-        assert_eq!(format_ticks(63), "0:00.98");
+        assert_eq!(format_ticks(10496), "02:44.00");
+        assert_eq!(format_ticks(3999), "01:02.48");
+        assert_eq!(format_ticks(11350), "02:57.34");
+        assert_eq!(format_ticks(63), "00:00.98");
+        // over an hour clamps rather than rolling over
+        assert_eq!(format_ticks(61 * 60 * 64), "59:59.99");
     }
 
     /// The insert/shift rule itself is tested against the shipped table in

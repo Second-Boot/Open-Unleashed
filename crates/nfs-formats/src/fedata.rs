@@ -22,9 +22,12 @@ pub struct CarCatalogEntry {
     pub sim: String,
     /// +0xE3 e.g. `356-14` (chronicle/showcase key?).
     pub unknown_e3: String,
-    /// +0x115 e.g. `356`.
-    pub unknown_115: String,
-    /// +0x147 e.g. `finallogos2` (logo texture pack?).
+    /// +0x115 the car's **family key**, e.g. `356`, `993T`, `boxster`, `GT2` — what the AI's
+    /// per-track steering table is keyed on (0x4A2950, compared case-insensitively) and what the
+    /// car-vs-car tables group by. CONFIRMED.
+    pub sim_family: String,
+    /// +0x147 the logo pack: `FEData/Art/<logo>.fsh` (`NFS5.CarLogo` builds the name with
+    /// `"%s%s.fsh"` at 0x4C19CD). CONFIRMED.
     pub logo: String,
     /// +0x179 engine sound set → `GameData/Sounds/<set>.viv`, e.g. `sd1b`.
     pub sound_set: String,
@@ -38,8 +41,10 @@ pub struct CarCatalogEntry {
     pub year: u16,
     /// +0x202 u16 (1954…) HYPOTHESIS: last model year.
     pub year_end: u16,
-    /// +0x1F6 u16 (4) unknown.
-    pub unknown_1f6: u16,
+    /// +0x1F6 i16: the car's logo **pair** inside the `logo` pack. `NFS5.CarLogo` reads it at
+    /// 0x4C1A63 and uses entries `2*logo_pair` and `2*logo_pair + 1`, drawn side by side
+    /// (`RE/notes/layouts.md` §4). CONFIRMED.
+    pub logo_pair: i16,
     /// +0x1F4 u16: must be 0 for the dealer to list the car (0x4F4240).
     pub dealer_flag_1f4: u16,
     /// +0x204 u16: dealer skips values 2 and 3 (0x4F4240).
@@ -90,10 +95,27 @@ impl DialSpec {
         let v = |i: usize| u16_le(r, off + i * 2, "nfs5.car dial").map(|x| x as i16);
         Ok(Self { style: v(0)?, total_units: v(1)?, needle_style: v(2)?, start_deg: v(3)?, deg_per_unit_x1000: v(4)?, needle_pivot: v(5)? })
     }
-    /// Needle angle in degrees for a value (`φ = start + v·deg`, v clamped to `total − 1`).
+    /// The angle `HDial`'s constructor stored for a value, in degrees (`RE/notes/hud.md` §3.3).
+    ///
+    /// The precompute loop 0x4214A0 walks the table **backwards** — it starts at the last element and
+    /// decrements the write pointer by one vertex triple each turn — while the angle accumulates
+    /// forward from `start_deg` in steps of `deg_per_unit`. Unit `v` therefore holds
+    /// `start + (total − 1 − v)·step`, not `start + v·step`.
     pub fn angle(&self, value: i32) -> f32 {
-        let v = value.clamp(0, (self.total_units as i32 - 1).max(0));
-        self.start_deg as f32 + v as f32 * self.deg_per_unit_x1000 as f32 / 1000.0
+        let last = (self.total_units as i32 - 1).max(0);
+        let v = value.clamp(0, last);
+        self.start_deg as f32 + (last - v) as f32 * self.deg_per_unit_x1000 as f32 / 1000.0
+    }
+
+    /// Where the needle points, in degrees clockwise from twelve o'clock.
+    ///
+    /// The vertices are screen-space (`XYZRHW`, y down) and `setValue` 0x421650 emits
+    /// `(cx + A, cy − B)` with `A = L·cos φ`, `B = L·sin φ`, so the tip sits at `90° − φ` clockwise
+    /// from the top. Together with the reversed table that makes the needle sweep **clockwise** by
+    /// `deg_per_unit` per unit, which is what every shipped face draws — including the Boxster and
+    /// 996 dials, whose positive `start_deg` used to look like an exception.
+    pub fn screen_cw_deg(&self, value: i32) -> f32 {
+        90.0 - self.angle(value)
     }
 }
 
@@ -147,13 +169,13 @@ pub fn parse_car_catalog(data: &[u8]) -> Result<Vec<CarCatalogEntry>, FormatErro
             model: s(0x7F, 50)?,
             sim: s(0xB1, 50)?,
             unknown_e3: s(0xE3, 50)?,
-            unknown_115: s(0x115, 50)?,
+            sim_family: s(0x115, 50)?,
             logo: s(0x147, 50)?,
             sound_set: s(0x179, 57)?,
             body: s(0x1B2, 16)?,
             displacement: s(0x1C2, 16)?,
             id: u16_le(r, 0, "nfs5.car id")?,
-            unknown_1f6: u16_le(r, 0x1F6, "nfs5.car +0x1F6")?,
+            logo_pair: u16_le(r, 0x1F6, "nfs5.car +0x1F6")? as i16,
             dealer_flag_1f4: u16_le(r, 0x1F4, "nfs5.car +0x1F4")?,
             dealer_flag_204: u16_le(r, 0x204, "nfs5.car +0x204")?,
             value_curve: {
@@ -174,4 +196,39 @@ pub fn parse_car_catalog(data: &[u8]) -> Result<Vec<CarCatalogEntry>, FormatErro
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod dial_tests {
+    use super::DialSpec;
+
+    fn spec(total: i16, start: i16, step: i16) -> DialSpec {
+        DialSpec { style: 0, total_units: total, needle_style: 0, start_deg: start, deg_per_unit_x1000: step, needle_pivot: 18 }
+    }
+
+    /// Both dial families read off their own faces once the reversed table is taken into account:
+    /// the '72 911's `300k` face has 0 at about half past seven and 300 at about twenty past four,
+    /// and the Boxster's `boxS` face has 0 at a quarter to eight and 260 just past one.
+    #[test]
+    fn needles_sweep_clockwise_like_the_faces() {
+        let s = spec(300, -40, 910);
+        assert!((s.screen_cw_deg(0).rem_euclid(360.0) - 217.9).abs() < 0.5, "{}", s.screen_cw_deg(0));
+        assert!((s.screen_cw_deg(299) - 130.0).abs() < 0.5);
+        let b = spec(260, 55, 620);
+        assert!((b.screen_cw_deg(0).rem_euclid(360.0) - 234.4).abs() < 0.5, "{}", b.screen_cw_deg(0));
+        assert!((b.screen_cw_deg(259).rem_euclid(360.0) - 35.0).abs() < 0.5);
+        // clockwise everywhere, by exactly one step per unit
+        for d in [s, b] {
+            let step = d.deg_per_unit_x1000 as f32 / 1000.0;
+            assert!((d.screen_cw_deg(10) - d.screen_cw_deg(9) - step).abs() < 1e-3);
+        }
+    }
+
+    /// Values outside the table clamp to its ends rather than running off the face.
+    #[test]
+    fn value_clamps_to_the_table() {
+        let s = spec(300, -40, 910);
+        assert_eq!(s.screen_cw_deg(-5), s.screen_cw_deg(0));
+        assert_eq!(s.screen_cw_deg(999), s.screen_cw_deg(299));
+    }
 }

@@ -132,7 +132,7 @@ pub enum Codec {
 }
 
 /// Decoded, interleaved PCM.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PcmSample {
     pub rate: u32,
     pub channels: u16,
@@ -144,6 +144,9 @@ pub struct PcmSample {
     /// Samples per channel that were filled with silence because the encoded data stopped short
     /// of the declared count by less than one frame (speech banks). 0 for a complete clip.
     pub padded_tail: u32,
+    /// The patch's own volume, `PtHeader::patch_volume() / 127` (`audio.md` §2). The library
+    /// multiplies the caller's level by it, so a clip is never played at more than this.
+    pub gain: f32,
 }
 
 impl PcmSample {
@@ -181,7 +184,8 @@ pub struct PtHeader {
     pub flags_a1: Option<u32>,
     /// Code 0xA0 codec byte; the exe defaults it to 0x0A (EA-XA).
     pub codec_byte: Option<u32>,
-    /// Patch parameters (codes < 0x80: volume/pan/priority?, semantics unknown), in file order.
+    /// Patch parameters, codes < 0x80, in file order; see the table in `RE/notes/audio.md` §2 and
+    /// the accessors below. Codes that are absent take the parser's defaults (0x599188).
     pub patch_params: Vec<(u8, u32)>,
     /// Any other code >= 0x80 with its raw big-endian value bytes, in file order.
     pub unknown: Vec<(u8, Vec<u8>)>,
@@ -190,6 +194,59 @@ pub struct PtHeader {
     pub saw_fe: bool,
     /// Header length in bytes including the terminating 0xFF.
     pub len: usize,
+}
+
+impl PtHeader {
+    fn param(&self, code: u8, default: u32) -> u32 {
+        self.patch_params.iter().rev().find(|(c, _)| *c == code).map(|(_, v)| *v).unwrap_or(default)
+    }
+
+    /// Code 0x0E, default 127: the patch's volume. `0x5905A5` builds the voice's level as
+    /// `(volume + rand(volume_spread)) · callerLevel / 127`.
+    pub fn patch_volume(&self) -> u32 {
+        self.param(0x0E, 127)
+    }
+    /// Code 0x0F, default 0: a random amount added to the volume each time the patch starts.
+    pub fn volume_spread(&self) -> u32 {
+        self.param(0x0F, 0)
+    }
+    /// Code 0x0C, default 64 (centre): the patch's pan, offset against the caller's (0x590447).
+    pub fn patch_pan(&self) -> u32 {
+        self.param(0x0C, 64)
+    }
+    /// Code 0x0D, default 0: a random amount added to the pan.
+    pub fn pan_spread(&self) -> u32 {
+        self.param(0x0D, 0)
+    }
+    /// Code 0x07, default 60: the key the sample was recorded at; the playback pitch is
+    /// `(key − root)·100 + fine_tune() + 100·coarse_tune() + rand(pitch_spread())` cents (0x5904EC).
+    pub fn root_key(&self) -> u32 {
+        self.param(0x07, 60)
+    }
+    /// Code 0x10, default 0 — cents.
+    pub fn fine_tune(&self) -> u32 {
+        self.param(0x10, 0)
+    }
+    /// Code 0x0A, default 0 — semitones.
+    pub fn coarse_tune(&self) -> u32 {
+        self.param(0x0A, 0)
+    }
+    /// Code 0x11, default 0 — cents.
+    pub fn pitch_spread(&self) -> u32 {
+        self.param(0x11, 0)
+    }
+    /// Code 0x06: the priority the voice allocator 0x5898F0 is given.
+    pub fn priority(&self) -> u32 {
+        self.param(0x06, 0)
+    }
+    /// Codes 0x01/0x02 and 0x03/0x04, defaults `0..127`: a patch entry is used only when the
+    /// requested key and velocity fall inside these ranges (0x590884).
+    pub fn key_range(&self) -> (u32, u32) {
+        (self.param(0x01, 0), self.param(0x02, 127))
+    }
+    pub fn velocity_range(&self) -> (u32, u32) {
+        (self.param(0x03, 0), self.param(0x04, 127))
+    }
 }
 
 fn be_value(bytes: &[u8], off: usize, code: u8) -> Result<u32, FormatError> {
@@ -381,6 +438,7 @@ impl PtHeader {
             samples: interleave(&planes),
             loop_range: self.loop_range(),
             padded_tail: padded_tail as u32,
+            gain: self.patch_volume().min(127) as f32 / 127.0,
         })
     }
 }

@@ -9,6 +9,7 @@ struct Globals {
 struct Object {
     model: mat4x4<f32>,
     env_mix: vec4<f32>,
+    light: vec4<f32>,
 };
 @group(1) @binding(0) var<uniform> object: Object;
 
@@ -37,7 +38,8 @@ fn vs_main(in: VsIn) -> VsOut {
     let world = object.model * vec4<f32>(in.position, 1.0);
     out.clip = globals.view_proj * world;
     out.normal = normalize((object.model * vec4<f32>(in.normal, 0.0)).xyz);
-    out.uv = in.uv;
+    // env_mix.zw carries a per-object uv offset (the sky layers scroll with it)
+    out.uv = in.uv + object.env_mix.zw;
     out.color = in.color;
     out.world = world.xyz;
     return out;
@@ -48,7 +50,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let tex = textureSample(t_diffuse, s_diffuse, in.uv);
     let n = normalize(in.normal);
     let diffuse = max(dot(n, normalize(globals.sun_dir.xyz)), 0.0);
-    let light = globals.ambient.x + (1.0 - globals.ambient.x) * diffuse;
+    // the per-object light multiplies the ambient term only: the original keeps one ambient slot
+    // per `.map` header colour and lights the car from the ground patch it stands on
+    let light = globals.ambient.x * object.light.rgb + vec3<f32>(1.0 - globals.ambient.x) * diffuse;
     var base = tex * in.color;
     let mix_amt = object.env_mix.x;
     if mix_amt > 0.0 {
@@ -59,5 +63,5 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let env = textureSample(t_env, s_diffuse, vec2<f32>(r.x / m + 0.5, 0.5 - r.y / m));
         base = vec4<f32>(mix(base.rgb, env.rgb, mix_amt), base.a);
     }
-    return vec4<f32>(base.rgb * light, base.a);
+    return vec4<f32>(base.rgb * light, base.a * object.light.a);
 }

@@ -10,7 +10,7 @@ use nfs_physics::vehicle::{Controls, Vehicle};
 fn flat() -> TriangleGrid {
     let s = 5000.0;
     let (a, b, c, d) = (Vec3::new(-s, 0.0, -s), Vec3::new(s, 0.0, -s), Vec3::new(s, 0.0, s), Vec3::new(-s, 0.0, s));
-    TriangleGrid::build(vec![Triangle { a, b, c, surface: 1 }, Triangle { a, b: c, c: d, surface: 1 }], 200.0)
+    TriangleGrid::build(vec![Triangle::new(a, b, c, 1), Triangle::new(a, c, d, 1)], 200.0)
 }
 
 fn specs_993() -> Option<CarSpecs> {
@@ -82,4 +82,34 @@ fn scenario_gt1_full_throttle() {
         v.step64(&specs);
     }
     assert!(v.speed() * 3.6 > 60.0, "GT1 too slow: {:.1} km/h", v.speed() * 3.6);
+}
+
+/// How tightly the car actually turns for a given steering demand, at a speed and a steer angle the
+/// AI uses on a street circuit (`RE/notes/ai.md` §9.1): the measured radius against what the
+/// steering geometry asks for and what the grip allows.
+#[test]
+fn steady_state_cornering_radius() {
+    let Some(specs) = specs_993() else { return };
+    let grid = flat();
+    for steer in [32i32, 63, 126] {
+        let mut v = Vehicle::new(Vec3::new(0.0, 0.32, 0.0), Mat3::IDENTITY, &specs, 0.75, 0.315);
+        // get up to ~20 m/s, then hold the throttle and the steering
+        run(&mut v, &specs, &grid, Controls { throttle: 254, ..Default::default() }, 6.0);
+        let speed0 = v.speed();
+        run(&mut v, &specs, &grid, Controls { throttle: 90, steer, ..Default::default() }, 3.0);
+        let p0 = v.position;
+        let h0 = v.orientation.row(2);
+        run(&mut v, &specs, &grid, Controls { throttle: 90, steer, ..Default::default() }, 1.0);
+        let h1 = v.orientation.row(2);
+        let yaw = h0.dot(h1).clamp(-1.0, 1.0).acos();
+        let speed = v.speed();
+        let radius = if yaw > 1e-3 { speed / yaw } else { f32::INFINITY };
+        let lateral = if radius.is_finite() { speed * speed / radius } else { 0.0 };
+        let wheel_deg = steer as f32 / 126.0 * (specs.max_steer / 256.0 * 360.0);
+        let geometric = specs.wheelbase / wheel_deg.to_radians().max(1e-4);
+        eprintln!(
+            "steer {steer:3} ({wheel_deg:.1} deg): entry {speed0:.1} m/s, holding {speed:.1} m/s, radius {radius:.1} m (geometry asks {geometric:.1} m), lateral {lateral:.1} m/s^2, drift {:.2} m/s",
+            v.v_local.x
+        );
+    }
 }

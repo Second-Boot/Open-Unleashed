@@ -11,6 +11,9 @@ pub struct Clip {
     pub channels: u16,
     pub samples: Vec<i16>,
     pub loop_range: Option<(u32, u32)>,
+    /// The patch's own volume (`PcmSample::gain`, `RE/notes/audio.md` §2): the sound library
+    /// multiplies the level the game asks for by it, so it belongs to the clip, not the call.
+    pub gain: f32,
 }
 
 struct Voice {
@@ -36,6 +39,54 @@ struct Shared {
     voices: Vec<(VoiceId, Voice)>,
     streams: Vec<(VoiceId, StreamVoice)>,
     next_id: u32,
+    /// wet level 0..1, set from the tunnel reverb state (`engine-audio.md` §4.7)
+    reverb: f32,
+    tail: Option<Reverb>,
+}
+
+/// A small Schroeder reverb — four combs into two all-passes, per channel.
+///
+/// APPROXIMATION: the original hands a level to the sound driver's environment
+/// (`Mixer_setEnvParam(0x80, level/2)` and `(0x20, level)`, `engine-audio.md` §4.7) and the driver
+/// owns the DSP, which is not in the data. What is reproduced from the game is *when* the reverb
+/// runs and how loud (`Reverb` in `lib.rs`); the filter itself is ours.
+struct Reverb {
+    combs: [(Vec<f32>, usize, f32); 4],
+    aps: [(Vec<f32>, usize); 2],
+}
+
+impl Reverb {
+    fn new(rate: u32) -> Self {
+        let d = |ms: f32| ((rate as f32 * ms / 1000.0) as usize).max(1);
+        Self {
+            combs: [
+                (vec![0.0; d(29.7)], 0, 0.805),
+                (vec![0.0; d(37.1)], 0, 0.827),
+                (vec![0.0; d(41.1)], 0, 0.783),
+                (vec![0.0; d(43.7)], 0, 0.764),
+            ],
+            aps: [(vec![0.0; d(5.0)], 0), (vec![0.0; d(1.7)], 0)],
+        }
+    }
+
+    fn tick(&mut self, x: f32) -> f32 {
+        let mut y = 0.0;
+        for (buf, i, g) in self.combs.iter_mut() {
+            let v = buf[*i];
+            buf[*i] = x + v * *g;
+            *i = (*i + 1) % buf.len();
+            y += v;
+        }
+        y *= 0.25;
+        for (buf, i) in self.aps.iter_mut() {
+            let v = buf[*i];
+            let out = v - y * 0.7;
+            buf[*i] = y + v * 0.7;
+            *i = (*i + 1) % buf.len();
+            y = out;
+        }
+        y
+    }
 }
 
 pub struct AudioOutput {
@@ -72,6 +123,8 @@ impl AudioOutput {
                         _ => (0, nframes),
                     };
                     let step = v.pitch as f64 * c.rate as f64 / out_rate;
+                    // the library scales the caller's level by the patch's own volume (0x5905A5)
+                    let vol = v.volume * c.gain;
                     for frame in out.chunks_exact_mut(channels) {
                         if v.pos >= hi as f64 {
                             if v.looping && hi > lo {
@@ -89,7 +142,7 @@ impl AudioOutput {
                             let sc = ch.min(cc - 1);
                             let a = c.samples[i * cc + sc] as f32;
                             let b = c.samples[j * cc + sc] as f32;
-                            *o += (a + (b - a) * f) / 32768.0 * v.volume * g[ch.min(1)];
+                            *o += (a + (b - a) * f) / 32768.0 * vol * g[ch.min(1)];
                         }
                         v.pos += step;
                     }
@@ -118,6 +171,18 @@ impl AudioOutput {
                         }
                         for (ch, o) in frame.iter_mut().enumerate() {
                             *o += sv.last[ch.min(1)] * sv.volume;
+                        }
+                    }
+                }
+                if g.reverb > 0.0 {
+                    let wet = g.reverb;
+                    let rate_hz = out_rate as u32;
+                    let rv = g.tail.get_or_insert_with(|| Reverb::new(rate_hz));
+                    for frame in out.chunks_exact_mut(channels) {
+                        let dry: f32 = frame.iter().take(2).sum::<f32>() / 2.0;
+                        let w = rv.tick(dry);
+                        for o in frame.iter_mut() {
+                            *o += w * wet;
                         }
                     }
                 }
@@ -176,6 +241,15 @@ impl AudioOutput {
         let mut g = self.shared.lock().unwrap();
         g.voices.retain(|(i, _)| *i != id);
         g.streams.retain(|(i, _)| *i != id);
+    }
+
+    /// Wet level of the tunnel reverb, 0..1 (`Reverb::wet` from the game's 0..100 level).
+    pub fn set_reverb(&self, wet: f32) {
+        let mut g = self.shared.lock().unwrap();
+        g.reverb = wet.clamp(0.0, 1.0);
+        if g.reverb == 0.0 {
+            g.tail = None;
+        }
     }
 
     /// Is a one-shot / loop voice still playing?

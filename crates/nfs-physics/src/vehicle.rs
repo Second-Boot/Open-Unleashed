@@ -9,12 +9,19 @@
 //!   shift, steering ramp and angle law, load transfer, friction circle, integration.
 //! * HIGH/MEDIUM: engine rpm heuristics, lateral tyre curve, yaw torque signs.
 //! * Suspension / ground (`Susp_update` 0x499A70, `Car_ground` 0x49BD40, `RE/notes/suspension-collision.md`
-//!   §3–4, CONFIRMED): wheel reference points probe the ground, pitch/roll are rate-driven kinematics,
-//!   landing/rest rules with the surface bounce table. Roughness and damage wobble not modelled.
+//!   §3–4, CONFIRMED): wheel reference points probe the ground, the road roughness of 0x499730 is added
+//!   to each probe, pitch/roll are rate-driven kinematics, landing/rest rules with the surface bounce
+//!   table.
 //! * Walls (`Car_wallCollide` 0x495020 / `WallImpulse` 0x494000, CONFIRMED): 8 body corners swept against
 //!   the `.edg` segments, restitution 0.1, no friction, heuristic yaw (sign table MEDIUM).
-//! * Not modelled yet: damage, drafting, turbo boost, misfire, body–ground impulse when tilted (damped
-//!   instead), car–car impulse (separate approximation).
+//! * Body–ground when tilted (`BodyGroundCollide` 0x496610 + `GroundImpulse` 0x495F30, §6.3, HIGH) and
+//!   car–car (`0x496860`, `traffic.md` §21.6, CONFIRMED) are the original's impulses, not approximations.
+//! * Drafting (`DraftFactor` 0x49D9B0, CONFIRMED): the caller fills `draft` from the other racers
+//!   and it scales the drag.
+//! * Induction boost (`0x49E6C4`) and misfire (§4.3) are modelled; the caller fills `misfire_roll`
+//!   from the shared LCG.
+//! * The per-part condition terms of the damage getters (`physics.md` §10) are `specs.wear`: the
+//!   career fills a scale and an offset per group from the parts on the car.
 
 use crate::collision::TriangleGrid;
 use crate::specs::{CarSpecs, CIRCLE_SOFTNESS, GRAVITY, GRIP_DRY, GRIP_WET, SURFACE_BOUNCE};
@@ -78,6 +85,14 @@ pub struct Vehicle {
     pub frame: Mat3,
     pub ground_normal: Vec3,
     pub cos_tilt: f32,
+    /// `DraftFactor` 0x49D9B0's result, which scales the drag. 1.0 = clean air; the caller sets it
+    /// from the other racers each tick with [`draft_factor`].
+    pub draft: f32,
+    /// `car+0x54C` — the induction boost state 0..1 (0x49E6C4), which the turbo sound reads.
+    pub boost: f32,
+    /// The `[0, 1)` draw the misfire test compares the engine damage against (§4.3). The original
+    /// takes it from the shared LCG every engine step; the caller fills it from the same stream.
+    pub misfire_roll: f32,
     /// 0 on ground, >0.05 airborne (car+0x424)
     pub height_marker: f32,
     pub v_local: Vec3,
@@ -105,8 +120,11 @@ pub struct Vehicle {
     pub traction_control: bool,
     /// Engine wheelspin state (`car+0xDB8 == 2`, clutch slipping / spinning rear axle).
     pub rear_spin: bool,
-    /// Body damage per zone 0..100 (`car+0x4E4..`, `Damage` 0x494500): 0..7 ring (0 front-right,
-    /// 1 front, 2 front-left, 3 left, 4 rear-left, 5 rear, 6 rear-right, 7 right), 8 roof.
+    /// Body damage per zone 0..100 (`car+0x4E4..`, `Damage` 0x494500). The ring runs **0 front-left,
+    /// 1 front, 2 front-right, 3 right, 4 rear-right, 5 rear, 6 rear-left, 7 left**, 8 roof —
+    /// CONFIRMED by the damage decals, whose zone-0/6/7 patches live on the page the car's left-hand
+    /// geometry uses and whose 2/3/4 patches live on the right-hand page, while 1, 5 and 8 appear on
+    /// both (`RE/notes/car-model.md` §11).
     pub damage: [f32; 10],
     pub damage_enabled: bool,
     /// Steering pull from uneven front damage plus suspension-damage noise (`0x49F160`).
@@ -134,6 +152,11 @@ pub struct Vehicle {
     pub min_height: f32,
     /// half extents for wall corners (halfW, halfH, halfL)
     pub half_extents: Vec3,
+    /// The car's collision body points in the body frame, `y = 0` on the wheel contact plane
+    /// (`BndP`, `RE/notes/car-model.md` §12). `0x49ABC0` sorts them ascending by height, so the
+    /// first four are the wheel contact set. Empty falls back to the eight corners of
+    /// [`Self::half_extents`], which is what the port did before the records were decoded.
+    pub body_points: Vec<Vec3>,
     /// last wall impulse magnitude (car+0x430)
     pub impact: f32,
     /// LCG state (the original's `0x5D1028 × 0x5D102C`) for road roughness and the engine's noise.
@@ -151,6 +174,9 @@ impl Vehicle {
             frame: orientation,
             ground_normal: Vec3::Y,
             cos_tilt: 1.0,
+            draft: 1.0,
+            boost: 0.0,
+            misfire_roll: 1.0,
             height_marker: 0.0,
             v_local: Vec3::ZERO,
             w_local: Vec3::ZERO,
@@ -195,6 +221,7 @@ impl Vehicle {
             body_height: 0.0,
             min_height: 0.0,
             half_extents: Vec3::new(half_track + 0.15, 0.6, hb + 0.9),
+            body_points: Vec::new(),
             impact: 0.0,
             rng: 0x1234_5678,
         }
@@ -294,9 +321,44 @@ impl Vehicle {
     }
 
     /// `Engine_update` 0x49E440 → drive − drag (HIGH; clutch-slip branch simplified).
+    /// `0x49E6C4` — the induction boost state `car+0x54C` (CONFIRMED). A turbo (`induction == 1`)
+    /// spools toward `(rpm − redline·0.25)/(redline·0.5)` at ±0.05 a tick; a supercharger
+    /// (`induction == 2`) toward `(rpm − redline/6)/(redline·⅔)`, rising instantly and falling by
+    /// 0.1. Both are capped by `rpm/redline·0.5` — scaled by the throttle for the turbo — and the
+    /// whole update is skipped while the gearbox is shifting. Nothing in the drive path reads it;
+    /// its consumers are the turbo sound (0x4AA72E) and the bleed-off at 0x49F075.
+    fn boost_update(&mut self, specs: &CarSpecs) {
+        let (lo, span) = match specs.induction {
+            1 => (specs.redline * 0.25, specs.redline * 0.5),
+            2 => (specs.redline / 6.0, specs.redline * (2.0 / 3.0)),
+            _ => return,
+        };
+        if specs.redline <= 0.0 {
+            return;
+        }
+        let x = self.rpm - lo;
+        let target = if x <= 0.0 { 0.0 } else { (x / span).min(1.0) };
+        let mut cap = self.rpm / specs.redline * 0.5;
+        if specs.induction == 1 {
+            cap *= self.throttle;
+        }
+        let target = (target * self.throttle).min(cap);
+        if self.shift_timer > 0 {
+            return;
+        }
+        self.boost = if specs.induction == 2 {
+            if target >= self.boost { target } else { target.max(self.boost - 0.1) }
+        } else if target >= self.boost {
+            target.min(self.boost + 0.05)
+        } else {
+            target.max(self.boost - 0.05)
+        };
+    }
+
     fn engine_update(&mut self, specs: &CarSpecs, rear_contact: bool) -> f32 {
+        self.boost_update(specs);
         let vz = self.v_local.z;
-        let a_drag = specs.drag * vz * vz * vz; // draft factor = 1 (single car)
+        let a_drag = specs.drag * vz * vz * vz * self.draft;
         let gear = self.gear;
         let neutral = gear == 1;
         let rpm_target = if neutral || !rear_contact {
@@ -330,6 +392,8 @@ impl Vehicle {
                 self.shift_timer -= 1;
             }
             self.rpm = (self.rpm - 100.0).max(0.0);
+            // 0x49F075: the boost bleeds off on the no-drive path
+            self.boost = (self.boost - 0.1).max(0.0);
             return -a_drag;
         }
         if self.automatic {
@@ -343,7 +407,7 @@ impl Vehicle {
         let rpm_wheel = specs.ratio_rpm_per_mps[gear] * vz;
         let rpm_c = self.rpm.clamp(0.0, specs.redline);
         let t = specs.torque_at(rpm_c);
-        let mut a_drive = t * specs.accel_per_torque[gear] * (1.0 - self.part_damage(&specs.zone_masks.engine) / 300.0) * (1.0 - 0.005 * self.part_damage(&specs.zone_masks.gearbox));
+        let mut a_drive = t * specs.accel_per_torque[gear] * (1.0 - self.part_wear(&specs.zone_masks.engine, &specs.wear.engine) / 300.0) * (1.0 - 0.005 * self.part_wear(&specs.zone_masks.gearbox, &specs.wear.gearbox));
         let mut diff = rpm_target - rpm_wheel.abs();
         if diff.abs() < 125.0 && rpm_target >= specs.redline - 300.0 {
             diff = 0.0;
@@ -351,7 +415,11 @@ impl Vehicle {
         let slip = self.rpm - rpm_wheel.abs();
         let launch = (gear > 1 && vz >= -0.1) || (gear == 0 && vz <= 0.1);
         self.rear_spin = launch && slip > 250.0;
-        if launch && slip > 250.0 && throttle < 0.5 {
+        // `misfire = engineDamage/300 > rand01` (§4.3): a damaged engine stumbles, which stops the
+        // clutch model pulling the revs down and kills the drive when it is over its target. The
+        // draw comes from the shared LCG, so the caller fills `misfire_roll` each tick.
+        let misfire = self.part_wear(&specs.zone_masks.engine, &specs.wear.engine) / 300.0 > self.misfire_roll;
+        if launch && slip > 250.0 && throttle < 0.5 && !misfire {
             // clutch slipping with little throttle: rpm falls toward wheel rpm
             self.rpm -= slip.min(100.0 * (1.0 - throttle) + 100.0);
         } else if launch && slip > 250.0 {
@@ -365,6 +433,10 @@ impl Vehicle {
             }
         } else if diff == 0.0 {
             self.rpm = rpm_wheel.abs();
+        } else if misfire {
+            // over target with a misfire: the revs drop and the engine makes nothing
+            self.rpm -= 100.0;
+            a_drive = 0.0;
         } else {
             // over target: fall toward wheel rpm, drive scaled by throttle
             if self.rpm > rpm_wheel.abs() + 200.0 {
@@ -419,7 +491,7 @@ impl Vehicle {
         self.gravity_scale = 1.16;
         let vz = self.v_local.z;
         if vz > 5.0 {
-            let aero = 1.0 - 0.005 * self.part_damage(&specs.zone_masks.aero);
+            let aero = 1.0 - 0.005 * self.part_wear(&specs.zone_masks.aero, &specs.wear.aero);
             let df = specs.downforce_front * vz * aero;
             let dr = specs.downforce_rear * vz * aero;
             self.wheels[0].limit += df;
@@ -437,6 +509,13 @@ impl Vehicle {
 
     /// Part damage (`0x4938A0` family, HIGH): mean zone damage over the part's zone mask (the
     /// installed-part condition terms are not modelled: stock parts, `1.5 − 0.005·100 = 1`).
+    /// A part group's damage as the original's getters report it: the mean zone damage under the
+    /// group's mask scaled by `wear.scale`, plus the damage the parts carried in from earlier races
+    /// (`wear.offset`) — `Σ (1.5 − 0.005·condition)·mean + state` (`physics.md` §10).
+    pub fn part_wear(&self, mask: &[bool; 10], w: &crate::specs::PartWear) -> f32 {
+        w.scale * self.part_damage(mask) + w.offset
+    }
+
     pub fn part_damage(&self, mask: &[bool; 10]) -> f32 {
         let (mut sum, mut n) = (0.0, 0);
         for (d, m) in self.damage.iter().zip(mask.iter()) {
@@ -517,7 +596,7 @@ impl Vehicle {
         let gear = self.gear;
         let class = specs.class;
         let k_class = CIRCLE_SOFTNESS[class];
-        let tyre_damage = self.part_damage(&specs.zone_masks.tyres);
+        let tyre_damage = self.part_wear(&specs.zone_masks.tyres, &specs.wear.tyres);
         let w = &mut self.wheels[i];
         let ang = specs.max_steer * w.steer / 17.0; // 1/256 turn
         let (mut u, mut v) = (w.slip_vel[0], w.slip_vel[2]);
@@ -583,6 +662,12 @@ impl Vehicle {
             let a = u.atan2(-0.5 * v) / TAU; // turns
             256.0 * if v < 0.0 { a } else if u > 0.0 { 0.5 - a } else if u < 0.0 { -0.5 - a } else { a }
         };
+        // 0x4A24E8 branches on `wheel+0xC0`, which is **not** a sliding flag: 0x410BB2 (car init)
+        // and 0x49E345 (reset) set it to 1 for wheels 0 and 1 and 0 for wheels 2 and 3 and nothing
+        // in the image ever writes it again, so it selects the lateral curve **by axle**. The front
+        // pair follows `min(|lat|, 16)·load/12`, the rear `min(|lat|, 2)·load·0.5` with a floor of
+        // one unit — a deliberate understeer bias of about six to one at small slip
+        // (`physics.md` §5.2).
         if front {
             let f = lat.signum() * lat.abs().min(16.0) * limit / 12.0;
             w.lateral = if u.abs() + v.abs() < 32.0 { u.signum() * u.abs().min(f.abs()) } else { f };
@@ -668,17 +753,26 @@ impl Vehicle {
         let (hw, hh, hl) = (self.half_extents.x, self.half_extents.y, self.half_extents.z);
         let (bx, by, bz) = (m.row(0), m.row(1), m.row(2));
         let (mut count, mut depth, mut centroid) = (0u32, 0.0f32, Vec3::ZERO);
-        for sz in [-1.0, 1.0] {
-            for sx in [-1.0, 1.0] {
-                for sy in [-1.0, 1.0] {
-                    let p = self.position + by * (sy * hh) + bz * (sz * hl) + bx * (sx * hw);
-                    let d = (p - plane_pt).dot(n);
-                    if d < 0.01 {
-                        count += 1;
-                        centroid += p;
-                        depth = depth.min(d);
+        let contact = |p: Vec3, count: &mut u32, depth: &mut f32, centroid: &mut Vec3| {
+            let d = (p - plane_pt).dot(n);
+            if d < 0.01 {
+                *count += 1;
+                *centroid += p;
+                *depth = depth.min(d);
+            }
+        };
+        if self.body_points.is_empty() {
+            for sz in [-1.0, 1.0] {
+                for sx in [-1.0, 1.0] {
+                    for sy in [-1.0, 1.0] {
+                        contact(self.position + by * (sy * hh) + bz * (sz * hl) + bx * (sx * hw), &mut count, &mut depth, &mut centroid);
                     }
                 }
+            }
+        } else {
+            let mt = m.transpose();
+            for p in &self.body_points {
+                contact(self.position + mt * *p, &mut count, &mut depth, &mut centroid);
             }
         }
         if count == 0 {
@@ -902,7 +996,7 @@ impl Vehicle {
         let mut pull = (self.damage[2] - self.damage[0]) * 0.25;
         if self.ticks_alive.is_multiple_of(4) {
             let r = ((self.ticks_alive.wrapping_mul(1103515245).wrapping_add(12345) >> 16) & 0xFFFF) as f32 / 65535.0 - 0.5;
-            pull += r * 0.5 * if speed > 15.0 { speed / 15.0 } else { 1.0 } * self.part_damage(&specs.zone_masks.suspension) * 0.01;
+            pull += r * 0.5 * if speed > 15.0 { speed / 15.0 } else { 1.0 } * self.part_wear(&specs.zone_masks.suspension, &specs.wear.suspension) * 0.01;
         }
         self.damage_pull = pull;
         let steer_int = (self.steer + pull as i32 + g_off).clamp(-127, 127) as f32;
@@ -930,7 +1024,7 @@ impl Vehicle {
                 w.longitudinal = 0.0;
             }
         } else {
-            let mut a_brake = specs.brake_decel * self.brake * (1.0 - 0.005 * self.part_damage(&specs.zone_masks.brakes));
+            let mut a_brake = specs.brake_decel * self.brake * (1.0 - 0.005 * self.part_wear(&specs.zone_masks.brakes, &specs.wear.brakes));
             a_brake = a_brake.min(vl.z.abs() * 32.0);
             let sign = -vl.z.signum();
             let a_brake = a_brake * if vl.z == 0.0 { 0.0 } else { sign };
@@ -1103,7 +1197,7 @@ mod tests {
     fn flat_grid() -> TriangleGrid {
         let s = 2000.0;
         let (a, b, c, d) = (Vec3::new(-s, 0.0, -s), Vec3::new(s, 0.0, -s), Vec3::new(s, 0.0, s), Vec3::new(-s, 0.0, s));
-        TriangleGrid::build(vec![Triangle { a, b, c, surface: 1 }, Triangle { a, b: c, c: d, surface: 1 }], 100.0)
+        TriangleGrid::build(vec![Triangle::new(a, b, c, 1), Triangle::new(a, c, d, 1)], 100.0)
     }
 
     pub(super) fn specs_993() -> CarSpecs {
@@ -1215,6 +1309,31 @@ mod tests {
 /// terms of the original use the rigid-body inertia this model does not carry; the yaw response is
 /// the wall-hit heuristic instead (MEDIUM). The bodies are then pushed apart along the centre line
 /// by the penetration depth. Returns the effect magnitude when a contact was resolved.
+/// `DraftFactor` 0x49D9B0 — CONFIRMED. Above 15 m/s, a racer within `v/3` metres and inside ~7.7°
+/// of this car's heading (`cos > 0.991`) cuts the drag: the deepest of
+/// `(1 − 3·dist/v)·(cos − 0.991)·111.1·0.5` wins and the factor is `1 − that`, so the drag can fall
+/// by at most half. Only the racer array `0x5E8B34` is scanned — traffic and police do not draft.
+pub fn draft_factor(position: Vec3, forward: Vec3, forward_speed: f32, others: &[Vec3]) -> f32 {
+    if forward_speed <= 15.0 {
+        return 1.0;
+    }
+    let mut best = 0.0f32;
+    for o in others {
+        let d = *o - position;
+        let dist = d.length();
+        if forward_speed * (1.0 / 3.0) <= dist || dist <= 0.1 {
+            continue;
+        }
+        let cos = (d / dist).dot(forward);
+        if cos <= 0.991 {
+            continue;
+        }
+        let v = (1.0 - 3.0 * dist / forward_speed) * (cos - 0.991) * 111.1 * 0.5;
+        best = best.max(v);
+    }
+    1.0 - best
+}
+
 pub fn collide_cars(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32) -> Option<f32> {
     // pre-test 0x498FF0: axis-aligned distance against the sum of the bounding radii
     let r_a = a.half_extents.x.max(a.half_extents.z);
@@ -1462,5 +1581,70 @@ mod roughness_tests {
         // a tilted car gets none (cosTilt < 0.86)
         v.cos_tilt = 0.5;
         assert_eq!(v.roughness(1, 30.0), 0.0);
+    }
+
+    #[test]
+    fn drafting_only_behind_a_close_car_at_speed() {
+        // §4.3 / 0x49D9B0: nothing below 15 m/s, nothing outside v/3 metres or 7.7 degrees, and at
+        // most half the drag
+        let fwd = Vec3::Z;
+        let me = Vec3::ZERO;
+        assert_eq!(draft_factor(me, fwd, 10.0, &[Vec3::new(0.0, 0.0, 5.0)]), 1.0, "too slow");
+        assert_eq!(draft_factor(me, fwd, 30.0, &[Vec3::new(0.0, 0.0, 15.0)]), 1.0, "the car is 15 m away, the window is v/3 = 10");
+        assert_eq!(draft_factor(me, fwd, 30.0, &[Vec3::new(5.0, 0.0, 5.0)]), 1.0, "45 degrees off the heading");
+        let close = draft_factor(me, fwd, 30.0, &[Vec3::new(0.0, 0.0, 2.0)]);
+        assert!(close < 1.0 && close >= 0.5, "drag cut to {close}");
+        // directly behind is no help at all
+        assert_eq!(draft_factor(me, fwd, 30.0, &[Vec3::new(0.0, 0.0, -2.0)]), 1.0);
+    }
+
+    #[test]
+    fn the_turbo_spools_and_bleeds() {
+        // 0x49E6C4: a turbo rises 0.05 a tick toward (rpm - redline/4)/(redline/2), capped by
+        // rpm/redline/2 x throttle, and falls the same way
+        let mut specs = tests::specs_993();
+        specs.induction = 1;
+        specs.redline = 6000.0;
+        let mut v = Vehicle::new(Vec3::ZERO, Mat3::IDENTITY, &specs, 0.8, 0.3);
+        v.throttle = 1.0;
+        v.rpm = 5000.0;
+        for _ in 0..40 {
+            v.boost_update(&specs);
+        }
+        let held = v.boost;
+        assert!(held > 0.4 && held <= 1.0, "spooled to {held}");
+        // off the throttle it falls back
+        v.throttle = 0.0;
+        for _ in 0..40 {
+            v.boost_update(&specs);
+        }
+        assert!(v.boost < 0.01, "bled to {}", v.boost);
+        // a supercharger rises at once and falls by 0.1
+        specs.induction = 2;
+        v.throttle = 1.0;
+        v.rpm = 5000.0;
+        v.boost_update(&specs);
+        assert!(v.boost > 0.4, "instant: {}", v.boost);
+        // and a naturally aspirated engine never boosts
+        specs.induction = 0;
+        v.boost = 0.0;
+        v.boost_update(&specs);
+        assert_eq!(v.boost, 0.0);
+    }
+
+    #[test]
+    fn a_damaged_engine_misfires() {
+        // §4.3: `misfire = engineDamage/300 > rand01`, and a misfire over the rev target kills the
+        // drive
+        let specs = tests::specs_993();
+        let mut v = Vehicle::new(Vec3::ZERO, Mat3::IDENTITY, &specs, 0.8, 0.3);
+        // an undamaged engine never misfires, whatever the draw
+        v.misfire_roll = 0.0;
+        assert_eq!(v.part_damage(&specs.zone_masks.engine), 0.0);
+        // a wrecked one misfires on a low draw and not on a high one
+        v.damage = [300.0; 10];
+        assert!(v.part_damage(&specs.zone_masks.engine) / 300.0 > 0.0);
+        let dmg = v.part_damage(&specs.zone_masks.engine) / 300.0;
+        assert!(dmg > 0.5 && dmg <= 1.0, "engine damage {dmg}");
     }
 }

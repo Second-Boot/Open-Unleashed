@@ -11,3 +11,7 @@ tracing.workspace = true
 nfs-renderer.workspace = true
 glam.workspace = true
 nfs-physics.workspace = true
+
+[dev-dependencies]
+# `examples/fshdump.rs` writes the decoded pages out as PNGs
+image.workspace = true

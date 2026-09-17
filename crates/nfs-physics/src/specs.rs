@@ -34,11 +34,39 @@ impl Default for ZoneMasks {
     }
 }
 
+/// What a part-damage getter adds to the live zone damage (`physics.md` §10, 0x4938A0 family):
+/// it returns `Σ (1.5 − 0.005·part.condition)·meanZoneDamage + part.state` over the car's parts of
+/// that type, so each group is a scale and an offset the career fills from the installed parts.
+/// The defaults are one standard part in perfect condition.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PartWear {
+    pub scale: f32,
+    pub offset: f32,
+}
+
+impl Default for PartWear {
+    fn default() -> Self {
+        Self { scale: 1.5, offset: 0.0 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PartWearSet {
+    pub engine: PartWear,
+    pub brakes: PartWear,
+    pub gearbox: PartWear,
+    pub suspension: PartWear,
+    pub aero: PartWear,
+    pub tyres: PartWear,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CarSpecs {
     pub name: String,
     pub mass: f32,
     pub zone_masks: ZoneMasks,
+    /// Per-group wear carried in from the career (`PartWear`).
+    pub wear: PartWearSet,
     /// wheelbase in metres (+0x44 ×0.001)
     pub wheelbase: f32,
     /// 0 NA, 1 turbo, 2 supercharged (+0x4C)
@@ -145,6 +173,7 @@ impl CarSpecs {
         Self {
             name: sim.name.clone(),
             zone_masks: ZoneMasks::default(),
+            wear: PartWearSet::default(),
             mass,
             wheelbase: sim.wheelbase_mm * 0.001,
             induction: sim.induction,

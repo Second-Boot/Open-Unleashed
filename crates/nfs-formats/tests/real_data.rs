@@ -237,3 +237,195 @@ fn track_record_file_fixup_and_insert() {
     assert_eq!(f.insert(8, "Player", "911 GT1", 999_999), None);
     assert_eq!(f.raw.len(), d.len(), "the array keeps its size");
 }
+
+/// `GameData/Track/animdefs.txt` — the shipped object definitions (`RE/notes/crp-geometry.md` §7).
+#[test]
+fn animdefs_parses_the_shipped_file() {
+    let Some(root) = game_root() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let p = root.join("GameData").join("Track").join("animdefs.txt");
+    let Ok(bytes) = std::fs::read(&p) else {
+        eprintln!("skipping: no animdefs.txt");
+        return;
+    };
+    let text: String = bytes.iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+    let defs = nfs_formats::animdefs::AnimDefs::parse(&text);
+    // 64 `SECTION:ANIM` blocks but three tags appear twice (`WELD`, `GATE`, `FTRK`), and the last
+    // of a repeated tag is the one the game keeps
+    assert_eq!(defs.len(), 61);
+
+    // the cone the skill tests count (`skill-tests.md` §5.3)
+    let cone = defs.get("CONE").expect("CONE");
+    assert_eq!(cone.collide_type, "kSmackable");
+    assert_eq!(cone.audio_type, "kAudPylon");
+    assert_eq!(cone.mass, 20.0);
+
+    // the barrier boxes the port already puts in the wall set
+    assert_eq!(defs.get("ENDW").map(|d| d.collide_type.as_str()), Some("kBox"));
+
+    // the animated props: a docker loops at the default rate, the sign has two speed groups
+    let doc = defs.get("DOC2").expect("DOC2");
+    let p = doc.resting_pieces().next().expect("a resting piece");
+    assert!(p.flags.looping);
+    assert_eq!(p.playback_rate, 1.0);
+    assert_eq!(doc.ticks_per_vert_frame, Some(3));
+
+    let rates: Vec<f32> = defs.iter().flat_map(|d| d.pieces.iter().map(|(_, p)| p.playback_rate)).collect();
+    assert!(rates.iter().any(|r| *r == 3.0) && rates.iter().any(|r| *r == 5.0) && rates.iter().any(|r| *r == 8.0));
+    assert!(rates.iter().all(|r| *r > 0.0), "every piece has a usable rate");
+
+    // every piece names the article whose track it plays
+    let pieces: Vec<_> = defs.iter().flat_map(|d| d.pieces.iter().map(|(_, p)| p)).collect();
+    assert!(pieces.len() >= 20);
+    assert!(pieces.iter().all(|p| p.quat_group.is_some() || p.vert_group.is_some()));
+}
+
+/// The animated articles of a track: `Anim` gives the frame count, `Anqt` exactly 52 bytes a frame,
+/// and every rotation is a unit quaternion (`RE/notes/crp-geometry.md` §7).
+#[test]
+fn track_animation_tracks_decode() {
+    let Some(root) = game_root() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let p = root.join("GameData").join("Track").join("alps.crp");
+    let Ok(raw) = std::fs::read(&p) else {
+        eprintln!("skipping: no alps.crp");
+        return;
+    };
+    let data = nfs_formats::refpack::maybe_decompress(&raw).unwrap().into_owned();
+    let crp = nfs_formats::crp::Crp::parse(&data).unwrap();
+    let arts = crp.articles(&data).unwrap();
+
+    let mut animated = 0;
+    let mut heli = None;
+    for a in &arts {
+        let Some(track) = crp.article_animation(&data, a) else { continue };
+        animated += 1;
+        assert!(track.frames.len() >= 2);
+        for f in &track.frames {
+            let q = f.rotation;
+            let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+            assert!((n - 1.0).abs() < 1e-3, "a frame's rotation is a unit quaternion, got {n}");
+        }
+        let g = crp.article_geometry(&data, a).unwrap();
+        if g.name == "RESCUEHELI" {
+            heli = Some(track);
+        }
+    }
+    assert_eq!(animated, 32, "alps has 32 animated articles");
+
+    // the rescue helicopter's own track, and how the sampler walks it at the default ten frames a
+    // second (`animdefs.txt` seeds `playbackrate` with 1.0)
+    let heli = heli.expect("RESCUEHELI");
+    assert_eq!(heli.frames.len(), 101);
+    assert_eq!(heli.sample(0.0, 0.1, true), (0, 1, 0.0));
+    assert_eq!(heli.sample(0.15, 0.1, true), (1, 2, 0.5));
+    // looping wraps at frames − 2, so the last two frames are the seam
+    assert_eq!(heli.sample(99.0 * 0.1, 0.1, true).0, 0);
+    // a one-shot holds the last frame instead
+    assert_eq!(heli.sample(99.0 * 0.1, 0.1, false), (100, 100, 0.0));
+}
+
+/// Every shipped `Track/Sky/*.txt` parses, and the two block shapes both appear.
+#[test]
+fn sky_definitions() {
+    let Some(r) = game_root() else { return };
+    let dir = r.join("GameData/Track/Sky");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x.eq_ignore_ascii_case("txt")).unwrap_or(false))
+        .collect();
+    files.sort();
+    assert!(files.len() >= 15, "{} sky files", files.len());
+    let (mut basic, mut multi) = (0, 0);
+    for p in &files {
+        let text = String::from_utf8_lossy(&std::fs::read(p).unwrap()).into_owned();
+        let f = nfs_formats::sky::SkyFile::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        assert!(!f.blocks.is_empty(), "{}", p.display());
+        for b in &f.blocks {
+            match b.kind {
+                nfs_formats::sky::SkyKind::Basic { .. } => basic += 1,
+                nfs_formats::sky::SkyKind::Multi { .. } => multi += 1,
+                _ => {}
+            }
+            assert_eq!(b.regions[0].layers.len(), b.kind.layers());
+            // a region always names at least the base layer
+            assert!(b.regions[0].layers[0].map.is_some(), "{} has no base sky map", p.display());
+        }
+    }
+    assert!(basic > 0 && multi > 0, "basic {basic}, multi {multi}");
+    // coastal is the sunset track and asks for `sm1b`, not the `st1a` everything else uses
+    let coastal = String::from_utf8_lossy(&std::fs::read(dir.join("Coastal.txt")).unwrap()).into_owned();
+    let f = nfs_formats::sky::SkyFile::parse(&coastal).unwrap();
+    assert_eq!(f.for_capability("HIGH").unwrap().regions[0].layers[0].map.as_deref(), Some("sm1b"));
+}
+
+/// `BndP` gives every car the same body: a wheel-contact quad on the ground, two end boxes and a
+/// roof quad, plus whatever its style adds (`RE/notes/car-model.md` §12).
+#[test]
+fn car_body_points() {
+    let Some(r) = game_root() else { return };
+    let dir = r.join("GameData/CarModel");
+    // expected wheel-quad span from the model itself; the `.sim` agrees for the road cars but not
+    // for the GT1, whose simulation block carries 2400 mm against the model's 2658
+    for (model, sim, quad_mm, sim_agrees) in [("993", "993coupe36", 2304.0, true), ("Boxster", "Boxster25", 2434.0, true), ("GT1", "GT1race", 2658.0, false)] {
+        let Ok(raw) = std::fs::read(dir.join(format!("{model}.crp"))) else { continue };
+        let data = nfs_formats::refpack::maybe_decompress(&raw).unwrap().into_owned();
+        let crp = nfs_formats::crp::Crp::parse(&data).unwrap();
+        let recs = crp.bound_points(&data).unwrap();
+        let default: Vec<[f32; 3]> = recs.iter().filter(|r| r.style_slot == 0).flat_map(|r| r.points.iter().copied()).collect();
+        assert_eq!(default.len(), 24, "{model}: default body point count");
+        // the four lowest points are the wheel contact set, on the ground plane
+        let mut by_y = default.clone();
+        by_y.sort_by(|a, b| a[1].total_cmp(&b[1]));
+        let ground = &by_y[..4];
+        assert!(ground.iter().all(|p| p[1].abs() < 0.01), "{model}: the lowest four are not on y = 0");
+        let (zmin, zmax) = ground.iter().fold((f32::MAX, f32::MIN), |(a, b), p| (a.min(p[2]), b.max(p[2])));
+        let span = (zmax - zmin) * 1000.0;
+        assert!((span - quad_mm).abs() < 20.0, "{model}: wheel quad spans {span} mm, expected {quad_mm}");
+        // and it is a quad, symmetric about the centreline
+        let (xmin, xmax) = ground.iter().fold((f32::MAX, f32::MIN), |(a, b), p| (a.min(p[0]), b.max(p[0])));
+        assert!((xmin + xmax).abs() < 0.05, "{model}: wheel quad is not centred ({xmin}..{xmax})");
+        // the road cars' `.sim` wheelbase matches the model's wheel quad to a few centimetres
+        let sim_path = r.join("GameData/Simulation/CarData").join(format!("{sim}.sim"));
+        if let Ok(d) = std::fs::read(&sim_path) {
+            let s = nfs_formats::sim::CarSim::parse(&d).unwrap();
+            let close = (s.wheelbase_mm - span).abs() < 60.0;
+            assert_eq!(close, sim_agrees, "{sim}: sim {} mm against a {span} mm wheel quad", s.wheelbase_mm);
+        }
+    }
+}
+
+/// The sky colour records of `Track/Sky/<Track>.bin` read as the sky each track actually has.
+#[test]
+fn sky_background_colours() {
+    let Some(r) = game_root() else { return };
+    let dir = r.join("GameData/Track/Sky");
+    let want: [(&str, [u8; 3]); 6] = [
+        ("Monaco1.bin", [0, 0, 0]),          // the night circuits
+        ("Coastal.bin", [254, 210, 196]),    // sunset
+        ("Forest.bin", [119, 187, 254]),     // plain sky blue
+        ("Castle.bin", [254, 194, 125]),     // late afternoon
+        ("Industrial.bin", [93, 63, 21]),    // night, sodium-lit
+        ("alps.bin", [128, 128, 144]),       // overcast, and the one track with a gradient
+    ];
+    for (file, rgb) in want {
+        let Ok(d) = std::fs::read(dir.join(file)) else { continue };
+        let s = nfs_formats::sky::SkyBin::parse(&d).unwrap_or_else(|e| panic!("{file}: {e}"));
+        assert_eq!(s.version, if file.starts_with("Monaco.") { 7 } else { 9 }, "{file}");
+        let bg = s.background().unwrap_or_else(|| panic!("{file}: no colour record"));
+        let got = [(bg[0] * 254.0).round() as u8, (bg[1] * 254.0).round() as u8, (bg[2] * 254.0).round() as u8];
+        assert_eq!(got, rgb, "{file}");
+    }
+    // alps is the only shipped track whose sky colour is a gradient, and its two weather regions differ
+    let d = std::fs::read(dir.join("alps.bin")).unwrap();
+    let s = nfs_formats::sky::SkyBin::parse(&d).unwrap();
+    let c = s.colours[0].unwrap();
+    assert!(c.gradient[0] && c.gradient[1]);
+    assert_ne!(c.rgb[0][0], c.rgb[0][1], "alps sky is a ramp");
+}

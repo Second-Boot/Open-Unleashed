@@ -15,6 +15,8 @@ pub struct ArticleMeshes {
     pub transform: glam::Mat4,
     /// Scene-object tag (`Base+68`), zero when none.
     pub tag: u32,
+    /// `Anim` / `Anqt` rotation track when the article has one (`RE/notes/crp-geometry.md` §7).
+    pub animation: Option<nfs_formats::crp::AnimTrack>,
 }
 
 /// One placement of a library article requested by a `.scn` GEOM element.
@@ -27,6 +29,27 @@ pub struct PropInstance {
     pub scale: glam::Vec3,
     pub tag: u32,
     pub transform: glam::Mat4,
+}
+
+/// The render-layer classes a `.crp`'s `RMth` records instantiate. The engine registers a factory
+/// keyed by these codes (0x449B70, a jump table at 0x449F70), and three of the seventeen classes are
+/// `Headlights::LayerVertexLight`, `…_Opaque` and `…_Ambient` — whose constructors are the only
+/// places that set the game's night flag `word[0x628A28]` (0x449BF8 / 0x449C25 / 0x449C62).
+/// So a track is a **night** track exactly when its render methods use one of them.
+/// CONFIRMED (`RE/notes/lighting.md` §4).
+pub const HEADLIGHT_LAYERS: [u32; 3] = [0x8002, 0x8003, 0x8011];
+
+/// Does this CRP's `RMth` table build a headlight layer?
+pub fn uses_headlight_layers(crp: &Crp, data: &[u8]) -> bool {
+    crp.level
+        .iter()
+        .filter(|e| e.is_level(b"RMth"))
+        .filter_map(|e| data.get(e.data_offset()..e.data_offset() + e.data_len()))
+        .any(|bytes| {
+            bytes
+                .chunks_exact(4)
+                .any(|w| HEADLIGHT_LAYERS.contains(&u32::from_le_bytes([w[0], w[1], w[2], w[3]])))
+        })
 }
 
 impl TrackGeometry {
@@ -43,7 +66,10 @@ impl TrackGeometry {
                 let surface = (surface_of(mm.material) & 0xFFFF) | ((mm.material as u32) << 16);
                 for idx in mm.mesh.indices.chunks_exact(3) {
                     let p = |i: u32| m.transform_point3(glam::Vec3::from(v[i as usize].position));
-                    tris.push(Triangle { a: p(idx[0]), b: p(idx[1]), c: p(idx[2]), surface });
+                    // the vertex colours ride along: the original lights a car from the patch it
+                    // stands on (0x474700, `RE/notes/lighting.md`)
+                    let c = |i: u32| v[i as usize].color.map(|x| (x.clamp(0.0, 1.0) * 255.0) as u8);
+                    tris.push(Triangle { a: p(idx[0]), b: p(idx[1]), c: p(idx[2]), surface, colors: [c(idx[0]), c(idx[1]), c(idx[2])] });
                 }
             }
         };
@@ -117,15 +143,28 @@ pub struct TrackAssets {
     /// Additional scenes whose GEOM props are instanced: the skill-test `_st<N>.scn` of the
     /// current mission (`RE/notes/skill-tests.md` §4 — only loaded for `RACE_TYPE 4`).
     pub extra_scenes: Vec<Scene>,
+    /// `Track/animdefs.txt` — every scene-object tag's physical and animation definition
+    /// (`RE/notes/crp-geometry.md` §7); shared by all tracks.
+    pub animdefs: nfs_formats::animdefs::AnimDefs,
     /// `Track/<track>.edg` wall/edge segments (may be absent: the game rebuilds it from the mesh).
     pub edges: Option<EdgeFile>,
     /// `Track/Sky/<Track>.fsh` layers (`st1a` sky tile, `sc1a` clouds, `horz` horizon strips, ...).
     pub sky_textures: Vec<TextureImage>,
     /// Non-comment lines of `Track/Sky/<Track>.txt` (see RE/FORMATS.md; semantics partially known).
     pub sky_params: Vec<String>,
+    /// `Track/Sky/<Track>.bin` — the dumped sky configuration; only its colour records are decoded
+    /// (`RE/RENDERING.md`).
+    pub sky_bin: Option<nfs_formats::sky::SkyBin>,
 }
 
 impl TrackAssets {
+    /// Whether this is a night track: its render methods build a `Headlights::*` layer, which is
+    /// what sets the game's night flag (`uses_headlight_layers`). The shipped night tracks are
+    /// `industrial` and `monaco1…5`; the other nine have none.
+    pub fn is_night(&self) -> bool {
+        uses_headlight_layers(&self.crp, &self.crp_data)
+    }
+
     pub fn load(paths: &GamePaths, name: &str) -> Result<Self, AssetError> {
         let dir = paths.track_dir();
         let file = |suffix: &str| -> Result<PathBuf, AssetError> {
@@ -146,6 +185,11 @@ impl TrackAssets {
 
         let map_path = file(".map")?;
         let map = Ini::parse(&String::from_utf8_lossy(&read(&map_path)?));
+        // one `animdefs.txt` for every track, beside the track files
+        let animdefs = GamePaths::find_file(&dir, "animdefs.txt")
+            .and_then(|p| std::fs::read(p).ok())
+            .map(|b| nfs_formats::animdefs::AnimDefs::parse(&b.iter().map(|&c| nfs_formats::locale::cp1252(c)).collect::<String>()))
+            .unwrap_or_default();
 
         let scene = |suffix: &str| -> Result<Option<Scene>, AssetError> {
             match file(suffix) {
@@ -176,6 +220,10 @@ impl TrackAssets {
             }
             _ => (Vec::new(), Vec::new()),
         };
+        let sky_bin = GamePaths::find_file(&sky_dir, &format!("{name}.bin"))
+            .or_else(|| GamePaths::find_file(&sky_dir, "default.bin"))
+            .and_then(|p| read(&p).ok())
+            .and_then(|d| nfs_formats::sky::SkyBin::parse(&d).ok());
         Ok(Self {
             name: name.to_string(),
             dir: dir.clone(),
@@ -190,9 +238,11 @@ impl TrackAssets {
             draw_keys_backward: keys("_backwards.key"),
             cameras: scene("_cameras.scn")?,
             extra_scenes: Vec::new(),
+            animdefs,
             edges,
             sky_textures,
             sky_params,
+            sky_bin,
         })
     }
 
@@ -223,7 +273,8 @@ impl TrackAssets {
             let meshes = article_meshes(&g, lod, &mut skipped);
             let transform = g.transform.as_ref().map(tr_to_mat4).unwrap_or(glam::Mat4::IDENTITY);
             let (is_lib, tag) = g.base.as_ref().map(|b| (b.is_library(), b.tag_u32())).unwrap_or((false, 0));
-            let item = ArticleMeshes { name: g.name.clone(), meshes, transform, tag };
+            let animation = self.crp.article_animation(&self.crp_data, a);
+            let item = ArticleMeshes { name: g.name.clone(), meshes, transform, tag, animation };
             if is_lib { library.push(item) } else { world.push(item) }
         }
         let mut instances = Vec::new();

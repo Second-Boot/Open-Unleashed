@@ -53,6 +53,11 @@ impl GamePaths {
     pub fn car_model_dir(&self) -> PathBuf {
         self.game_data().join("CarModel")
     }
+    /// `GameData/Render` — the shared effect textures (`common.fsh`: `SKDP` tyre dust, `SHAD`,
+    /// `GLAR`, `SUNA`, `SPLH`/`SPLG`, `HEAD`, …).
+    pub fn render_dir(&self) -> PathBuf {
+        self.game_data().join("Render")
+    }
     pub fn car_data_dir(&self) -> PathBuf {
         self.game_data().join("Simulation").join("CarData")
     }

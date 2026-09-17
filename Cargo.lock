@@ -1246,6 +1246,7 @@ name = "nfs-assets"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "image",
  "nfs-formats",
  "nfs-physics",
  "nfs-renderer",

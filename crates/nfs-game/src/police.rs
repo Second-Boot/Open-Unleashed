@@ -400,6 +400,26 @@ mod tests {
     }
 
     #[test]
+    fn a_cop_that_spawns_while_the_perp_is_clean_patrols() {
+        // §17.4: a cop deployed with no wanted perp drives the road like traffic (states 2/3) and
+        // only becomes a chaser when the order arrives.
+        let t = ring(400);
+        let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 50, moving: true }] };
+        let mut p = Police::new(file, vec![CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 2)], 0, false);
+        assert!(p.deploy_as(&t, 0, 0, 1000, false));
+        assert!(p.cars[0].active && !p.cars[0].chasing && !p.cars[0].lights, "patrolling, lights off");
+        let tgt = ChaseTarget { position: t.slices[60].centre, slice: 60, lateral: 0.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
+        p.update(&t, 1002, &tgt, &[]);
+        assert_eq!(p.cars[0].mode, None, "a patrol car runs no chase behaviour");
+        assert!(p.cars[0].target_speed.abs() < 30.0, "traffic pace, not the pursuit base: {}", p.cars[0].target_speed);
+        // the order turns it into a chaser
+        p.set_wanted(true);
+        assert!(p.cars[0].chasing && p.cars[0].lights);
+        p.update(&t, 1004, &tgt, &[]);
+        assert!(p.cars[0].mode.is_some(), "now it chases");
+    }
+
+    #[test]
     fn the_duty_budget_caps_how_many_cops_are_out() {
         // §17.2: three at once with a single racer, four with opponents, two in a two-player game
         assert_eq!(duty_budget(1, false), 3);
@@ -413,7 +433,10 @@ mod tests {
         for i in 0..4 {
             p.deploy(&t, i, 0, 100);
         }
-        assert_eq!(p.active_count(), 3, "the fourth deploy is refused");
+        // …but the budget caps nothing: pass 1 puts every cop on duty because `car+0xECC & 4` is
+        // never set in this build, so all four cars may be out.
+        assert_eq!(p.active_count(), 4);
+        assert_eq!(COP_LEVEL[0], 2, "a role-0 cop is always level 2");
     }
 
     #[test]
@@ -452,10 +475,14 @@ pub const BLACKOUT_TICKS: u64 = 0x3C0;
 /// `chase+0x90 > 160` — two and a half seconds unable to reach the target's lane.
 pub const STUCK_LIMIT: i32 = 160;
 
-/// `0x405AD0`'s hard cap on how many cops may be on duty at once (§17.2): **3** when the race has a
-/// single racer, **2** in a two-player game and **4** otherwise. How many of that budget the heat
-/// actually spends (`want[role]` from the heat record) is not ported — see §31's gaps — so the port
-/// treats the cap as the number.
+/// `0x405AD0`'s duty budget (§17.2): **3** when the race has a single racer, **2** in a two-player
+/// game and **4** otherwise.
+///
+/// It is **not** a cap on how many cops are out, because the pass that spends it never runs in this
+/// build: pass 1 hands duty to every cop whose `car+0xECC & 4` is clear, and that bit is never set
+/// anywhere in `.text` (0x406DF2 zeroes the word and the only `or`s into it are bit 1). The budget
+/// and the heat record's `want[role]` only gate pass 2, which is reached solely when pass 1 skipped
+/// a cop. So every cop car in the race is on duty, and this function is kept for the record.
 pub fn duty_budget(racers: usize, two_players: bool) -> usize {
     if racers == 1 {
         3
@@ -465,6 +492,12 @@ pub fn duty_budget(racers: usize, two_players: bool) -> usize {
         4
     }
 }
+
+/// `heatRec+0x18 + 4·role` (0x4053D6) — the chase difficulty of a cop of that role. The heat record
+/// is always chain 0's first record (`perpAI+0x9C` is written only by the init at 0x405C64/0x405CE0,
+/// and `perpAI+0x90` only ever gets `0x5CBD20`), whose `level` pair is `(2, 0)`. Role 0 is the
+/// default (`role = (car+0x52C & 0x40) ? 1 : 0`), so **a cop is level 2** whatever the race skill is.
+pub const COP_LEVEL: [usize; 2] = [2, 0];
 
 /// `0x40D680`'s distance ladder, by skill level. The entries are the speeds for
 /// `d > 150 / 100 / 50 / 25 / 10 / 6 / else`.
@@ -565,6 +598,9 @@ pub struct CopCar {
     pub active: bool,
     /// `car+0xECC & 2` — lights on, which is also what switches the target speed to 100 m/s
     pub lights: bool,
+    /// The cop is chasing (`AIHigh_Cop` state 4). A cop that spawned while the perp was clean
+    /// patrols instead (states 2/3) until an order arrives — §17.4.
+    pub chasing: bool,
     pub slice: usize,
     /// `car+0xEB0`
     pub dir: f32,
@@ -613,6 +649,7 @@ impl CopCar {
             model,
             active: false,
             lights: false,
+            chasing: false,
             slice: 0,
             dir: 1.0,
             requested_dir: 1.0,
@@ -711,7 +748,7 @@ pub struct Police {
     pub route_dir: f32,
     /// `SKILL [0x6573F4]`
     pub skill: u8,
-    /// `0x405AD0`'s duty budget: how many cops may be on duty at once.
+    /// `0x405AD0`'s duty budget — kept for the record; see [`duty_budget`] for why it caps nothing.
     pub budget: usize,
     one_way: bool,
 }
@@ -755,8 +792,11 @@ impl Police {
     /// One AI tick for every active cop (§27.6's dispatch and the three behaviours).
     pub fn update(&mut self, table: &SliceTable, tick: u64, target: &ChaseTarget, others: &[LaneCar]) {
         // `AIHigh+0x60`: the chasers are re-sorted by track distance (0x403C00) and each one's place
-        // in that queue picks its formation slot. Which end of the sort is rank 0 was not traced —
-        // MEDIUM — but slot 0 sits 8 m *ahead* of the target, so the cop that is ahead takes it.
+        // in that queue picks its formation slot. **Rank 0 is the cop furthest ahead**: the insert
+        // loop walks the roster down while the entry it passes is more than twelve metres *behind*
+        // the target (`0x40E740(cop, perp.slice)` is the signed gap from the perp to that cop,
+        // 6 m a slice, wrapped into half a lap, and 0x403C66 compares it with −12). CONFIRMED —
+        // which is also what slot 0 wants, since it sits 8 m ahead of the target.
         let mut order: Vec<usize> = (0..self.cars.len()).filter(|&i| self.cars[i].active).collect();
         order.sort_by(|&a, &b| track_distance(table, self.cars[b].slice, target.slice).partial_cmp(&track_distance(table, self.cars[a].slice, target.slice)).unwrap_or(std::cmp::Ordering::Equal));
         for (rank, &i) in order.iter().enumerate() {
@@ -770,6 +810,17 @@ impl Police {
             let d = crate::traffic::oct_distance(self.cars[i].position, target.position);
             if d > GIVE_UP_DISTANCE || self.cars[i].stuck_ticks > STUCK_LIMIT || target.finished {
                 self.retire(i);
+                continue;
+            }
+            // A cop that spawned while the perp was clean patrols (§17.4 states 2/3): it drives the
+            // road like traffic does and never runs the chase. The original moves it to state 4 on
+            // an *order*, and claims a slot on the perp as it goes (0x403BD0 bumps the perp's
+            // per-role chaser count and inserts the cop into its roster; 0x403BA0 gives the slot
+            // back). That roster is bookkeeping on the target rather than a gate on who may chase,
+            // so the port promotes every patrol car at once and ranks them by the same sort —
+            // MEDIUM only in *when* each cop is told, not in what it then does.
+            if !self.cars[i].chasing {
+                self.patrol(table, i, target, others);
                 continue;
             }
 
@@ -892,35 +943,67 @@ impl Police {
             // §12/§23 lane pass, with §27.10's +15 toward the target's lane
             self.lane_pass(table, i, target, others);
 
-            // §27.2 the drive model, the same one traffic runs
-            let st_road = {
-                let sl = &table.slices[self.cars[i].slice.min(table.slices.len() - 1)];
-                (sl.width_a, sl.width_b)
-            };
-            let mut st = self.cars[i].as_ai_state(self.phys.max_lat_acc, self.phys.max_yaw_acc);
-            let aim = aidrive::aim_direction(table, &self.cfg, &st);
-            let err = aidrive::heading_error(&st, aim);
-            // `0x4081B0`'s speed curve is the traffic column only: a cop's base rate is a flat 1.0,
-            // scaled by the pursuit boost `car+0x1098`
-            let accel = crate::traffic::accel_rate_for(false, st.speed, self.cars[i].boost_engine);
-            let cmd = if aidrive::out_of_control(&st, &self.cfg.out_of_control, err, st_road) {
-                aidrive::out_of_control_command(&st, &self.cfg.out_of_control, err, accel, self.phys.brake_force)
-            } else {
-                let grip = 1.0 + 0.0015 * aidrive::body_forward_speed(&st);
-                aidrive::in_control_command(&st, &self.cfg.in_control, err, aim, grip, self.cars[i].boost_engine, accel, self.phys.brake_force)
-            };
-            aidrive::integrate(&mut st, &cmd, 1.0 / 32.0);
-            let c = &mut self.cars[i];
-            c.velocity = st.velocity;
-            c.angular_velocity = st.angular_velocity;
-            // `0x408360` only grants the requested direction once the car is slow enough to turn round
-            if c.speed_estimate() < 8.889 {
-                c.dir = c.requested_dir;
-            }
+            self.drive(table, i);
         }
     }
 
     /// The lane scorers plus `0x40DA00`'s bias toward the target's lane.
+    /// One tick of a patrolling cop: the traffic speed ladder, the same lane pass and the same drive
+    /// model, with no chase behaviour at all (§17.4 states 2/3).
+    fn patrol(&mut self, table: &SliceTable, i: usize, target: &ChaseTarget, others: &[LaneCar]) {
+        let speed = self.base_target_speed(&self.cars[i], target.speed);
+        {
+            let c = &mut self.cars[i];
+            c.mode = None;
+            c.target_speed = speed;
+            c.requested_dir = c.dir;
+            c.boost_engine = 1.0;
+            c.boost_speed = 1.0;
+            c.aim_point = Vec3::ZERO;
+        }
+        self.lane_pass(table, i, target, others);
+        self.drive(table, i);
+    }
+
+    /// §27.2's drive model, the same one traffic runs.
+    fn drive(&mut self, table: &SliceTable, i: usize) {
+        let st_road = {
+            let sl = &table.slices[self.cars[i].slice.min(table.slices.len() - 1)];
+            (sl.width_a, sl.width_b)
+        };
+        let mut st = self.cars[i].as_ai_state(self.phys.max_lat_acc, self.phys.max_yaw_acc);
+        let aim = aidrive::aim_direction(table, &self.cfg, &st);
+        let err = aidrive::heading_error(&st, aim);
+        // `0x4081B0`'s speed curve is the traffic column only: a cop's base rate is a flat 1.0,
+        // scaled by the pursuit boost `car+0x1098`
+        let accel = crate::traffic::accel_rate_for(false, st.speed, self.cars[i].boost_engine);
+        let cmd = if aidrive::out_of_control(&st, &self.cfg.out_of_control, err, st_road) {
+            aidrive::out_of_control_command(&st, &self.cfg.out_of_control, err, accel, self.phys.brake_force)
+        } else {
+            let grip = 1.0 + 0.0015 * aidrive::body_forward_speed(&st);
+            aidrive::in_control_command(&st, &self.cfg.in_control, err, aim, grip, self.cars[i].boost_engine, accel, self.phys.brake_force)
+        };
+        aidrive::integrate(&mut st, &cmd, 1.0 / 32.0);
+        let c = &mut self.cars[i];
+        c.velocity = st.velocity;
+        c.angular_velocity = st.angular_velocity;
+        // `0x408360` only grants the requested direction once the car is slow enough to turn round
+        if c.speed_estimate() < 8.889 {
+            c.dir = c.requested_dir;
+        }
+    }
+
+    /// Promote every patrol car to a chaser — what an order from the perp's claim system does in the
+    /// original (§17.4 state 3 → 4).
+    pub fn set_wanted(&mut self, wanted: bool) {
+        for c in self.cars.iter_mut().filter(|c| c.active) {
+            if wanted && !c.chasing {
+                c.chasing = true;
+                c.lights = true;
+            }
+        }
+    }
+
     fn lane_pass(&mut self, table: &SliceTable, i: usize, target: &ChaseTarget, others: &[LaneCar]) {
         let sl = table.slices[self.cars[i].slice.min(table.slices.len() - 1)];
         let mut cars: Vec<LaneCar> = others.to_vec();
@@ -971,6 +1054,12 @@ impl Police {
 
     /// The 64 Hz half: move, turn and re-derive the route frame, exactly as traffic does.
     pub fn integrate(&mut self, table: &SliceTable, dt: f32) {
+        self.integrate_on(table, dt, None)
+    }
+
+    /// The same step with the track's collision grid: a cop keeps `car+0xE20 = Car_ground` 0x49BD40
+    /// exactly as traffic does (§14.1), so it follows the surface under it.
+    pub fn integrate_on(&mut self, table: &SliceTable, dt: f32, ground: Option<&nfs_physics::collision::TriangleGrid>) {
         for c in self.cars.iter_mut().filter(|c| c.active) {
             c.position += c.velocity * dt;
             let yaw = c.angular_velocity.y * dt * std::f32::consts::TAU;
@@ -982,16 +1071,31 @@ impl Police {
             let lat_axis = sl.lateral.normalize_or_zero();
             c.lateral = (c.position - sl.centre).dot(lat_axis);
             c.speed = c.velocity.dot(sl.forward.normalize_or_zero());
-            c.position.y = sl.centre.y + 1.0;
+            match ground.and_then(|g| g.ground(c.position.x, c.position.y + 2.0, c.position.z, 6.0)) {
+                Some(h) => {
+                    c.position.y = h.point.y + crate::traffic::RIDE_HEIGHT;
+                    let up = h.normal.normalize_or_zero();
+                    let f0 = c.orientation.row(2);
+                    let fwd = (f0 - up * f0.dot(up)).normalize_or_zero();
+                    let right = up.cross(fwd).normalize_or_zero();
+                    if fwd.length_squared() > 0.5 && right.length_squared() > 0.5 {
+                        c.orientation = Mat3::from_cols(right, fwd.cross(right).normalize_or_zero(), fwd).transpose();
+                    }
+                }
+                None => c.position.y = sl.centre.y + crate::traffic::RIDE_HEIGHT,
+            }
             c.velocity.y = 0.0;
         }
     }
 
     /// Put a cop on the road at a spawn point (§25.10 step 5).
     pub fn deploy(&mut self, table: &SliceTable, i: usize, record: usize, tick: u64) -> bool {
-        if self.active_count() >= self.budget {
-            return false;
-        }
+        self.deploy_as(table, i, record, tick, true)
+    }
+
+    /// `chasing = false` puts the cop on patrol (§17.4 states 2/3): it drives the road at traffic
+    /// pace with its lights off until the perp is wanted.
+    pub fn deploy_as(&mut self, table: &SliceTable, i: usize, record: usize, tick: u64, chasing: bool) -> bool {
         let Some((slice, lateral, moving)) = self.manager.placement(table, record, self.route_dir) else { return false };
         let sl = &table.slices[slice.min(table.slices.len() - 1)];
         let dir = self.route_dir;
@@ -1012,7 +1116,8 @@ impl Police {
         c.velocity = fwd * speed.abs();
         c.angular_velocity = Vec3::ZERO;
         c.active = true;
-        c.lights = true;
+        c.chasing = chasing;
+        c.lights = chasing;
         c.aim_point = Vec3::ZERO;
         c.stuck_ticks = 0;
         // `0x5CBEA0[level]+0x0C` — the boost budget in ticks, 8 / 12 / 18 s

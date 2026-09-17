@@ -34,7 +34,7 @@ impl Speech {
             let bank = Bnk::parse(bytes).ok()?;
             let slot = bank.slots.iter().position(|s| s.is_some())?;
             let pcm = bank.decode_slot(bytes, slot).ok()?;
-            Some(Arc::new(Clip { rate: pcm.rate, channels: pcm.channels, samples: pcm.samples, loop_range: None }))
+            Some(Arc::new(Clip { rate: pcm.rate, channels: pcm.channels, samples: pcm.samples, loop_range: None, gain: pcm.gain }))
         });
         if decoded.is_none() {
             tracing::warn!(name, "speech bank missing");

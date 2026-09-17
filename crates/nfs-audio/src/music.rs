@@ -112,12 +112,15 @@ pub struct MusicPlayer {
     pos: usize,
     shuffle: bool,
     level: u8,
+    /// `game.spl[0]` — the music trim (52 shipped, 80 compiled in).
+    trim: u32,
     current: Option<Music>,
     rng: u32,
 }
 
 impl MusicPlayer {
-    pub fn new(music_dir: &Path, settings: &Settings) -> anyhow::Result<Self> {
+    /// `sounds_dir` is `GameData/Sounds`, for `game.spl`; a missing file leaves the compiled-in trim.
+    pub fn new(music_dir: &Path, sounds_dir: &Path, settings: &Settings) -> anyhow::Result<Self> {
         let names = song_titles(music_dir)?;
         let playlist: Vec<usize> = settings.playlist.iter().copied().filter(|i| *i < names.len()).collect();
         Ok(Self {
@@ -128,6 +131,7 @@ impl MusicPlayer {
             pos: 0,
             shuffle: settings.shuffle,
             level: settings.music_level,
+            trim: nfs_formats::spl::GameSpl::load(sounds_dir).music(),
             current: None,
             rng: 0x2545_F491,
         })
@@ -138,14 +142,20 @@ impl MusicPlayer {
         (self.rng >> 8) as usize
     }
 
+    /// The stream indices in the playlist, in order (`PLAYLIST` in `fe.txt`).
+    pub fn playlist(&self) -> &[usize] {
+        &self.playlist
+    }
+
     pub fn now_playing(&self) -> Option<&str> {
         self.current.as_ref().map(|m| m.title.as_str())
     }
 
-    /// `0x50 · MusicLevel >> 7` (0..80), or the raw level for a `win`/`lose`/`vic` jingle (§8.3).
+    /// `game.spl[0] · MusicLevel >> 7` (0x4A82F0), or the raw level for a `win`/`lose`/`vic` jingle
+    /// (§8.3). The trim is 52 in the shipped `game.spl`, so music sits well below the other categories.
     fn volume_for(&self, name: &str) -> f32 {
         let n = name.to_lowercase();
-        let v = if n.starts_with("win") || n.starts_with("lose") || n.starts_with("vic") { self.level as u32 } else { (0x50 * self.level as u32) >> 7 };
+        let v = if n.starts_with("win") || n.starts_with("lose") || n.starts_with("vic") { self.level as u32 } else { (self.trim * self.level as u32) >> 7 };
         v as f32 / 127.0
     }
 
@@ -315,9 +325,9 @@ mod tests {
 
     #[test]
     fn jingles_are_louder_than_the_race_playlist() {
-        let p = MusicPlayer { dir: PathBuf::new(), names: Vec::new(), playlist: Vec::new(), saved: Vec::new(), pos: 0, shuffle: false, level: 127, current: None, rng: 1 };
-        // 0x50 · 127 >> 7 = 79 of 127 for a race track, the raw 127 for a jingle
-        assert!((p.volume_for("game13-Activator-Morphadron") - 79.0 / 127.0).abs() < 1e-6);
+        let p = MusicPlayer { dir: PathBuf::new(), names: Vec::new(), playlist: Vec::new(), saved: Vec::new(), pos: 0, shuffle: false, level: 127, trim: 52, current: None, rng: 1 };
+        // the shipped game.spl[0] = 52: 52 · 127 >> 7 = 51 of 127 for a race track, the raw 127 for a jingle
+        assert!((p.volume_for("game13-Activator-Morphadron") - 51.0 / 127.0).abs() < 1e-6);
         assert_eq!(p.volume_for("win04-Victory-Cypher"), 1.0);
         assert_eq!(p.volume_for("LOSE01-Aquadelic"), 1.0);
     }

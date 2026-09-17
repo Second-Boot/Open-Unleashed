@@ -47,7 +47,26 @@ fn career_round_trips_through_the_original_format() {
     // The container the original writes: no header, module names NUL-terminated, in its own order.
     assert!(bytes.starts_with(b"Missions\0"));
     let parsed = SaveFile::parse(&bytes).expect("the writer produces a file the reader accepts");
-    assert_eq!(parsed.order, ["Missions", "Tournament", "PlayerInfo", "TrackRecords"]);
+    assert_eq!(parsed.order, ["Missions", "Tournament", "PlayerInfo", "TrackRecords", "Personalities", "Knockout", "CDPlayer", "accessor"]);
+    // the knockout module is the raw 0x84-byte state block, switched off when no series is running
+    let k = nfs_formats::sav::KnockoutState::parse(parsed.knockout.as_ref().unwrap());
+    assert!(!k.active && k.opponents == 0);
+    // the accessor block carries the values the port has, in the original's map order
+    let acc = parsed.accessors.as_ref().expect("accessor block");
+    assert!(acc.entries.iter().any(|(n, v)| n == "Chronicle.Year" && *v == nfs_formats::sav::AccessorValue::Dword(1969)));
+    assert!(acc.entries.iter().any(|(n, _)| n == "OwnedCars.Car"));
+    // …the settings screens' values, each a plain dword (§6.1)
+    assert!(acc.entries.iter().any(|(n, v)| n == "Audio.MusicLevel" && *v == nfs_formats::sav::AccessorValue::Dword(127)));
+    assert!(acc.entries.iter().any(|(n, _)| n == "Graphics.ViewDistance"));
+    // …and the selected car's setup, whose floats ride in the same dword
+    let setup = acc.entries.iter().find(|(n, _)| n == "FTirePressure").expect("a setup accessor");
+    let nfs_formats::sav::AccessorValue::Dword(bits) = setup.1 else { panic!("{setup:?}") };
+    assert_eq!(f32::from_bits(bits), 30.0, "the tyre pressure FECar starts a car with");
+    // the block stays in byte-wise name order, which is what the original's reader walks
+    let names: Vec<&str> = acc.entries.iter().map(|(n, _)| n.as_str()).collect();
+    let mut sorted = names.clone();
+    sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    assert_eq!(names, sorted);
 
     let pi = parsed.player.as_ref().unwrap();
     assert_eq!(pi.money, 123_456);
@@ -102,4 +121,5 @@ fn the_embedded_tables_are_the_shipped_images() {
     assert_eq!(sav.tournament.as_ref().unwrap().year, 1950);
     assert_eq!(sav.tournament.as_ref().unwrap().era_type, 521);
     assert_eq!(sav.tournament.as_ref().unwrap().current_event, -1);
+    assert_eq!(sav.knockout.as_ref().map(|k| k.len()), Some(nfs_formats::sav::KNOCKOUT_BLOB));
 }

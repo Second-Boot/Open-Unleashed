@@ -209,7 +209,8 @@ impl SchlStream {
         if per_channel != total {
             return Err(FormatError::SizeMismatch { what: "SCHl sample count (0x85)", declared: total, actual: per_channel });
         }
-        Ok(PcmSample { rate: self.header.sample_rate, channels: self.header.channels, samples, loop_range: None, padded_tail: 0 })
+        // a music stream carries no patch volume, so it plays at the level the caller asks for
+        Ok(PcmSample { rate: self.header.sample_rate, channels: self.header.channels, samples, loop_range: None, padded_tail: 0, gain: 1.0 })
     }
 }
 

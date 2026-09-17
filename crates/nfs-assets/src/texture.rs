@@ -13,6 +13,11 @@ pub struct TextureImage {
     pub mips: Vec<Vec<u8>>,
     /// True when any decoded texel has alpha < 255.
     pub has_alpha: bool,
+    /// Where the entry says it belongs: `misc[0]` (the page a car's day/night pack blits onto) and
+    /// the blit position `misc[2] & 0xFFF` / `misc[3] & 0xFFF` (`car-model.md` §2.2).
+    pub page: usize,
+    pub x: u32,
+    pub y: u32,
 }
 
 /// Decode every entry of a SHPI pack. `path` is used for diagnostics only.
@@ -34,7 +39,17 @@ pub fn decode_pack(path: &Path, data: &[u8]) -> Result<Vec<TextureImage>, AssetE
             }
             mips.push(img.rgba);
         }
-        out.push(TextureImage { name: e.name.clone(), width, height, mips, has_alpha });
+        let b = &e.blocks[0];
+        out.push(TextureImage {
+            name: e.name.clone(),
+            width,
+            height,
+            mips,
+            has_alpha,
+            page: b.misc[0] as usize,
+            x: (b.misc[2] & 0xFFF) as u32,
+            y: (b.misc[3] & 0xFFF) as u32,
+        });
     }
     Ok(out)
 }

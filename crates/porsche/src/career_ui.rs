@@ -23,6 +23,8 @@ pub struct CareerOpponent {
     pub skill: [[f32; 2]; 4],
     /// Explicit grid slot (knockout series: previous finishing order); None = sequential.
     pub grid: Option<u32>,
+    /// `nfs5.per` id of the driver, when one was drawn for this slot (knockout, §5.2).
+    pub personality: i16,
 }
 
 /// Everything the app needs to start a career event.
@@ -32,7 +34,8 @@ pub struct StartRequest {
     pub car: CarCatalogEntry,
     pub paint: [u8; 3],
     pub laps: u32,
-    /// Event direction flag (backwards driving is not implemented: the track runs forward).
+    /// Event direction flag (`event+0x04`): the race runs the track backwards — reversed slice
+    /// table, `_backwards` start scene and draw keys.
     pub backwards: bool,
     pub opponents: Vec<CareerOpponent>,
     /// Installed parts of the player's car (applied to the `.sim` before the specs are built).
@@ -86,6 +89,10 @@ pub struct CareerUi {
     pub save_path: PathBuf,
     pub t_idx: usize,
     pub car_sel: usize,
+    /// Parts picked in the shop but not paid for yet — the original's `Parts.ShoppingList`, whose
+    /// `(TOTAL)` watch shows their price sum (`parts.lay`). Enter adds a part to it, Backspace on
+    /// the parts row buys everything in it.
+    pub basket: Vec<i16>,
     /// 0 = tournament row, 1 = car row, 2 = parts row.
     pub row: u8,
     pub part_sel: usize,
@@ -98,6 +105,12 @@ pub struct CareerUi {
     /// The profile the career belongs to: `SaveData/<digit><Name>.sav` (`RE/notes/savegame.md` §2).
     pub profile: Profile,
     pub save_dir: PathBuf,
+    /// A knockout series in progress, for the `.sav`'s `Knockout` module (`modes.md` §5.2).
+    pub knockout: Option<nfs_game::save::KnockoutProgress>,
+    /// `CDPlayer`'s selected music tracks (§4.8).
+    pub playlist: Vec<u32>,
+    /// What the settings screens hold, for the save's accessor block (`savegame.md` §6).
+    pub settings: nfs_game::save::SavedSettings,
 }
 
 impl CareerUi {
@@ -131,12 +144,12 @@ impl CareerUi {
                 Career::default()
             }
         };
-        Ok(Self { tables, career, save_path, save_dir: dir, profile, t_idx: 0, car_sel: 0, row: 0, part_sel: 0, club: false, factory: false, message: String::new(), pending: None })
+        Ok(Self { tables, career, save_path, save_dir: dir, profile, knockout: None, playlist: Vec::new(), settings: nfs_game::save::SavedSettings::default(), t_idx: 0, car_sel: 0, row: 0, part_sel: 0, club: false, factory: false, basket: Vec::new(), message: String::new(), pending: None })
     }
 
     pub fn tournaments(&self) -> Vec<&Tournament> {
         if self.club {
-            self.tables.club_tournaments(self.career.era)
+            self.tables.club_tournaments()
         } else {
             self.tables.era_tournaments(self.career.era).into_iter().filter(|t| !t.is_hidden()).collect()
         }
@@ -193,14 +206,11 @@ impl CareerUi {
                 }
                 let skill = self.tables.personalities.iter().find(|p| p.id == *per).map(|p| p.skill).unwrap_or([[1.0, 0.0]; 4]);
                 let paint = car.paint_sets.first().map(|p| p.colours[0]).unwrap_or([0x20, 0x40, 0xC0]);
-                Some(CareerOpponent { car, paint, name: self.tables.driver_name(*per), difficulty: 1.0, skill, grid: None })
+                Some(CareerOpponent { car, paint, name: self.tables.driver_name(*per), difficulty: 1.0, skill, grid: None, personality: *per })
             })
             .collect();
         let scene_suffix = m.scene_file(&track.file).map(|f| f[track.file.len()..].to_string());
         self.pending = Some(PendingEvent { tournament: 0, event: 0, finale: false, garage_idx: None, mission: Some(idx) });
-        if m.backwards {
-            tracing::warn!(track = track.file, "mission is driven backwards in the original; running forward (not implemented)");
-        }
         tracing::info!(mission = m.code, track = track.file, scene = ?scene_suffix, car = car.model, opponents = opponents.len(), "mission start");
         Some(StartRequest {
             track_file: track.file.clone(),
@@ -298,12 +308,81 @@ impl CareerUi {
         v
     }
 
+    /// Repair every category of the selected car (the `QUICKFIX` screen's OVERALL row).
+    pub fn repair_all(&mut self) {
+        let Some(i) = self.selected_garage() else {
+            self.message = "SELECT AN OWNED CAR FIRST".into();
+            return;
+        };
+        let kinds: Vec<u16> = (1..=10).collect();
+        let cost = self.career.repair_cost(&self.tables, i, &kinds);
+        if cost == 0 {
+            self.message = "NOTHING TO REPAIR".into();
+            return;
+        }
+        match self.career.repair(&self.tables, i, &kinds) {
+            Ok(paid) => {
+                self.message = format!("REPAIRED FOR ${paid}");
+                self.save();
+            }
+            Err(e) => self.message = e.to_string().to_uppercase(),
+        }
+    }
+
+    /// The parts in the basket, in the order they were added.
+    pub fn basket_parts(&self) -> Vec<&Part> {
+        self.basket.iter().filter_map(|id| self.tables.parts.iter().find(|p| p.id == *id)).collect()
+    }
+
+    /// `Parts.ShoppingList(TOTAL)`.
+    pub fn basket_total(&self) -> i64 {
+        self.basket_parts().iter().map(|p| p.price as i64).sum()
+    }
+
+    /// Pay for the basket and install everything in it, in order. Stops at the first part that
+    /// cannot be bought (no money, not eligible) and leaves the rest in the basket.
+    pub fn buy_basket(&mut self) {
+        let Some(i) = self.selected_garage() else {
+            self.message = "SELECT AN OWNED CAR FIRST".into();
+            return;
+        };
+        if self.basket.is_empty() {
+            // an empty transaction list on the parts row means the other thing this shop does
+            self.repair_all();
+            return;
+        }
+        let mut bought = 0;
+        let mut spent = 0i64;
+        while let Some(id) = self.basket.first().copied() {
+            let price = self.tables.parts.iter().find(|p| p.id == id).map(|p| p.price as i64).unwrap_or(0);
+            match self.career.buy_part(&self.tables, i, id) {
+                Ok(()) => {
+                    self.basket.remove(0);
+                    bought += 1;
+                    spent += price;
+                }
+                Err(e) => {
+                    self.message = e.to_string().to_uppercase();
+                    break;
+                }
+            }
+        }
+        if bought > 0 {
+            self.message = format!("INSTALLED {bought} PART{}  (${spent})", if bought == 1 { "" } else { "S" });
+            self.save();
+        }
+    }
+
     /// Backspace / East button: decline a pending finale, or sell the selected garage car.
     pub fn back(&mut self) {
         if self.career.finale.is_some() {
             self.career.decline_finale();
             self.message = "FINALE DECLINED".into();
             self.save();
+            return;
+        }
+        if self.row == 2 {
+            self.buy_basket();
             return;
         }
         // used-car market (career.md §10.5): list the car, withdraw it, or accept a standing offer.
@@ -381,7 +460,7 @@ impl CareerUi {
         }
         // …and the same career in the original's format, so `SaveData/` matches what the game
         // itself would leave behind (`RE/notes/savegame.md` §3; the accessor block is omitted).
-        let sav = nfs_game::save::career_to_sav(&self.career, &self.tables, &self.profile);
+        let sav = nfs_game::save::career_to_sav_with(&self.career, &self.tables, &self.profile, self.knockout.as_ref(), &self.playlist, &self.settings);
         if let Err(e) = nfs_game::save::write_profile(&self.save_dir, &self.profile, &sav) {
             tracing::warn!(error = %e, "writing the .sav profile failed");
         }
@@ -393,16 +472,17 @@ impl CareerUi {
             return self.activate_mission();
         }
         if self.row == 2 {
-            let (Some(i), Some(part)) = (self.selected_garage(), self.part_choices().get(self.part_sel).map(|p| (p.id, self.tables.strings.text(p.name_string_id)))) else {
+            let (Some(_), Some(part)) = (self.selected_garage(), self.part_choices().get(self.part_sel).map(|p| (p.id, self.tables.strings.text(p.name_string_id).to_string()))) else {
                 self.message = "SELECT AN OWNED CAR FIRST".into();
                 return None;
             };
-            match self.career.buy_part(&self.tables, i, part.0) {
-                Ok(()) => {
-                    self.message = format!("INSTALLED {}", part.1.to_uppercase());
-                    self.save();
-                }
-                Err(e) => self.message = e.to_string().to_uppercase(),
+            // the shop fills a basket and charges for it on confirmation
+            if let Some(k) = self.basket.iter().position(|id| *id == part.0) {
+                self.basket.remove(k);
+                self.message = format!("REMOVED {}", part.1.to_uppercase());
+            } else {
+                self.basket.push(part.0);
+                self.message = format!("ADDED {}  (TOTAL ${})", part.1.to_uppercase(), self.basket_total());
             }
             return None;
         }
@@ -461,15 +541,12 @@ impl CareerUi {
                         let c = o.colours[0];
                         // opponent colour record is RGBA (bytes r g b a); an all-zero entry means "catalogue default"
                         let paint = if c[..3] == [0, 0, 0] { car.paint_sets.first().map(|p| p.colours[0]).unwrap_or([0x20, 0x40, 0xC0]) } else { [c[0], c[1], c[2]] };
-                        Some(CareerOpponent { car, paint, name: self.tables.driver_name(o.driver), difficulty: ev.difficulty, skill, grid: None })
+                        Some(CareerOpponent { car, paint, name: self.tables.driver_name(o.driver), difficulty: ev.difficulty, skill, grid: None, personality: o.driver })
                     })
                     .collect();
                 self.pending = Some(PendingEvent { tournament: t.id, event, finale: finale.is_some(), garage_idx, mission: None });
                 let parts: Vec<Part> = garage_idx.map(|i| self.career.installed_parts(&self.tables, i).into_iter().cloned().collect()).unwrap_or_default();
-                if ev.backwards {
-                    tracing::warn!(track = track.file, "event is driven backwards in the original; running forward (not implemented)");
-                }
-                tracing::info!(tournament = t.id, event, finale = finale.is_some(), track = track.file, laps = ev.laps, car = car.model, opponents = opponents.len(), parts = parts.len(), "career event start");
+                tracing::info!(tournament = t.id, event, finale = finale.is_some(), track = track.file, laps = ev.laps, backwards = ev.backwards, car = car.model, opponents = opponents.len(), parts = parts.len(), "career event start");
                 Some(StartRequest { track_file: track.file.clone(), car, paint, laps: ev.laps.max(1) as u32, backwards: ev.backwards, opponents, parts, mission: None, traffic: CAREER_TRAFFIC[(t.traffic_level as usize).min(3)], skill: t.difficulty_level.min(2) as u8 })
             }
             None => {
@@ -497,6 +574,13 @@ impl CareerUi {
 
     /// Race over: `order` = finishing order of driver indices (0 = player, 1..=7 = opponents in
     /// tournament order), `times[driver]` = finishing time in ticks (0 = did not finish).
+    /// The car comes back from a race with the damage it took (`Career::record_damage`).
+    pub fn park(&mut self, zones: [f32; 10]) {
+        if let Some(i) = self.pending.as_ref().and_then(|p| p.garage_idx) {
+            self.career.record_damage(&self.tables, i, zones);
+        }
+    }
+
     pub fn finish(&mut self, order: &[usize], times: &[u64; 8]) {
         let Some(p) = self.pending.take() else { return };
         if p.mission.is_some() {
@@ -614,7 +698,23 @@ impl CareerUi {
         let part_line = match (self.selected_garage(), parts.get(self.part_sel.min(parts.len().saturating_sub(1)))) {
             (Some(i), Some(p)) => {
                 let installed = self.career.garage[i].parts.contains(&p.id);
-                format!("PART {}/{}  < {}: {} >  ${}{}", self.part_sel + 1, parts.len(), p.kind_name.to_uppercase(), self.tables.strings.text(p.name_string_id).to_uppercase(), p.price, if installed { "  (INSTALLED)" } else { "" })
+                let mark = if installed {
+                    "  (INSTALLED)".to_string()
+                } else if self.basket.contains(&p.id) {
+                    "  (IN LIST)".to_string()
+                } else {
+                    String::new()
+                };
+                let total = if !self.basket.is_empty() {
+                    format!("   LIST {} = ${}  (BACKSPACE = BUY)", self.basket.len(), self.basket_total())
+                } else {
+                    let kinds: Vec<u16> = (1..=10).collect();
+                    match self.career.repair_cost(&self.tables, i, &kinds) {
+                        0 => String::new(),
+                        c => format!("   REPAIR ${c}  (BACKSPACE)"),
+                    }
+                };
+                format!("PART {}/{}  < {}: {} >  ${}{}{}", self.part_sel + 1, parts.len(), p.kind_name.to_uppercase(), self.tables.strings.text(p.name_string_id).to_uppercase(), p.price, mark, total)
             }
             (Some(_), None) => "PART  -  NONE FOR THIS CAR".to_string(),
             (None, _) => "PART  -  (OWNED CARS ONLY)".to_string(),
@@ -662,8 +762,19 @@ mod tests {
         assert!(n_parts > 10, "{n_parts} parts for the 356");
         ui.career.money = 100_000;
         let pid = ui.part_choices()[0].id;
+        let price = ui.part_choices()[0].price as i64;
+        // Enter fills the transaction list, Backspace pays for it (the original's parts.lay flow)
         assert!(ui.activate().is_none());
+        assert_eq!(ui.basket, vec![pid]);
+        assert_eq!(ui.basket_total(), price);
+        assert!(ui.career.garage[0].parts.is_empty(), "nothing is bought before the list is accepted");
+        assert!(ui.activate().is_none());
+        assert!(ui.basket.is_empty(), "Enter again takes it back out");
+        assert!(ui.activate().is_none());
+        ui.back();
         assert_eq!(ui.career.garage[0].parts, vec![pid]);
+        assert_eq!(ui.career.money, 100_000 - price);
+        assert!(ui.basket.is_empty());
         assert!(ui.message.starts_with("INSTALLED"));
         ui.row = 1;
         let req = ui.activate().expect("event starts");

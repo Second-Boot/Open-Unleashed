@@ -4,7 +4,7 @@
 //!
 //! The junction branch choice of `race-logic.md` §10.4 is in: once per junction the lookahead reaches,
 //! the car draws from the original's single global stream and picks a link, which every road preview
-//! then follows. Not yet reproduced: the per-track steer factor 0x4A2950 beyond its default (0.85),
+//! then follows. Not yet reproduced:
 //! skill randomisation (fe.txt has all skills 1.0), damage/wet factors, and the tracker's
 //! `preferredSection` hop (the port's `find_slice` still hill-climbs). Avoidance (§3.2) follows the
 //! notes for the two cars directly ahead in race order.
@@ -47,6 +47,8 @@ pub struct AiDriver {
     /// Road-width normaliser `[0x5E6E34]`: 12 by default, 10 on castle, 9 on forest (§10.4).
     pub wf_div: f32,
     /// Track name and direction for the per-track speed zones (`crate::zones`, 0x4A2DC0).
+    /// `sim` tail 20 before the per-track steering factor is applied
+    k_steer_base: f32,
     pub track: String,
     pub backwards: bool,
     /// Debug: slices ahead of the last steering target and its lateral offset from the centreline.
@@ -55,13 +57,78 @@ pub struct AiDriver {
     pub dbg_dot: f32,
 }
 
-/// Default steering factor 0x4A2950 (0x5B25E0 = 0.85) and curve factor 0x4A2DC0 (1.0).
-const STEER_FACTOR: f32 = 0.85;
+/// The steering factor `carSpecs[0x140]` is multiplied by (0x49CB16 → 0x4A2950): a table over the
+/// **track** and the car's family key (`nfs5.car` +0x115, compared case-insensitively). Everything
+/// the table does not name keeps 1.0 — which is most of the grid on most of the tracks; the 0.85
+/// the port used to apply everywhere is only one entry of it. CONFIRMED.
+///
+/// | track | family | factor |
+/// |---|---|---|
+/// | `autobahn` | `935` `GT1` `GT2` `GT3` | 0.85 |
+/// | `castle` | `935` `GT1` `GT2` `GT3` | 0.80 |
+/// | `castle` | `993T` `996T` | 0.85 |
+/// | `castle` | `993` `996` `boxster` | 0.90 |
+/// | `monaco1` **backwards only** | as `autobahn` | 0.85 |
+/// | `monaco2` | `935` `GT1` `GT2` `GT3` | 0.85 |
+/// | `monaco2` | `928` | 0.925 |
+/// | `monaco3` **backwards only** | `930T` `965T` | 1.10 |
+pub fn steer_factor(track: &str, family: &str, backwards: bool) -> f32 {
+    let is = |a: &str| family.eq_ignore_ascii_case(a);
+    let race = is("935") || is("GT1") || is("GT2") || is("GT3");
+    let track = track.to_ascii_lowercase();
+    match track.as_str() {
+        "autobahn" => {
+            if race {
+                0.85
+            } else {
+                1.0
+            }
+        }
+        // monaco1 only has a table when it is driven backwards, and then it is the autobahn's
+        "monaco1" if backwards => {
+            if race {
+                0.85
+            } else {
+                1.0
+            }
+        }
+        "castle" => {
+            if race {
+                0.80
+            } else if is("993T") || is("996T") {
+                0.85
+            } else if is("993") || is("996") || is("boxster") {
+                0.90
+            } else {
+                1.0
+            }
+        }
+        "monaco2" => {
+            if race {
+                0.85
+            } else if is("928") {
+                0.925
+            } else {
+                1.0
+            }
+        }
+        "monaco3" if backwards => {
+            if is("930T") || is("965T") {
+                1.10
+            } else {
+                1.0
+            }
+        }
+        _ => 1.0,
+    }
+}
+
+/// Curve factor 0x4A2DC0 (1.0).
 const CURVE_FACTOR: f32 = 1.0;
 
 impl AiDriver {
     pub fn new(data: AiCarData, specs: &CarSpecs, sim_tail: &[f32; 22]) -> Self {
-        Self { data, k_lookahead: sim_tail[19], k_steer: sim_tail[20] * STEER_FACTOR, k_angle: sim_tail[21], stuck_ticks: 0, wrong_way: false, target_speed: 0.0, skill_mean: [1.0; 4], skill_range: [0.0; 4], band: None, skill: 0, catchup: None, last_node: None, link: None, preferred_segment: None, speed_factor: 1.0, rng: 0x1234_5679, wf_div: 12.0, track: String::new(), backwards: false, dbg_n: 0, dbg_offset: 0.0, dbg_dot: 0.0 }
+        Self { data, k_lookahead: sim_tail[19], k_steer: sim_tail[20], k_steer_base: sim_tail[20], k_angle: sim_tail[21], stuck_ticks: 0, wrong_way: false, target_speed: 0.0, skill_mean: [1.0; 4], skill_range: [0.0; 4], band: None, skill: 0, catchup: None, last_node: None, link: None, preferred_segment: None, speed_factor: 1.0, rng: 0x1234_5679, wf_div: 12.0, track: String::new(), backwards: false, dbg_n: 0, dbg_offset: 0.0, dbg_dot: 0.0 }
             .tap(|d| {
                 // curve factor applies to the speed curve (§2.1); default 1.0
                 for v in d.data.bend_speed.iter_mut() {
@@ -72,10 +139,13 @@ impl AiDriver {
     }
 
     /// Per-track road-width normaliser and speed zones (0x4A2DC0).
-    pub fn set_track(&mut self, track: &str, backwards: bool) {
+    pub fn set_track(&mut self, track: &str, backwards: bool, family: &str) {
         self.wf_div = crate::zones::width_divisor(track);
         self.track = track.to_ascii_lowercase();
         self.backwards = backwards;
+        // `carSpecs[0x140] *= 0x4A2950(family)` (0x49CB16) — the steering factor is per track and
+        // per car family, and 1.0 unless the table names the pair
+        self.k_steer = self.k_steer_base * steer_factor(track, family, backwards);
     }
 
     /// Speed estimate `car+0x35C = max(|vx|,|vz|) + 0.25·min(|vx|,|vz|)` used by the AI.
@@ -328,6 +398,43 @@ trait Tap: Sized {
     }
 }
 impl<T> Tap for T {}
+
+#[cfg(test)]
+mod steer_factor_tests {
+    use super::steer_factor;
+
+    /// The table at 0x4A2950. Everything it does not name is 1.0 — including every car on every
+    /// track it has no entry for, which is what the port used to get wrong by applying 0.85
+    /// everywhere.
+    #[test]
+    fn the_table_is_only_a_handful_of_pairs() {
+        // the common case
+        assert_eq!(steer_factor("alps", "993", false), 1.0);
+        assert_eq!(steer_factor("autobahn", "993", false), 1.0);
+        assert_eq!(steer_factor("castle", "356", false), 1.0);
+
+        // the race cars, per track
+        assert_eq!(steer_factor("autobahn", "GT2", false), 0.85);
+        assert_eq!(steer_factor("castle", "GT2", false), 0.80);
+        assert_eq!(steer_factor("monaco2", "935", false), 0.85);
+
+        // castle's three tiers of road car
+        assert_eq!(steer_factor("castle", "996T", false), 0.85);
+        assert_eq!(steer_factor("castle", "996", false), 0.90);
+        // the family key is compared case-insensitively, so the catalogue's `boxster` matches
+        assert_eq!(steer_factor("castle", "boxster", false), 0.90);
+        assert_eq!(steer_factor("CASTLE", "BOXSTER", false), 0.90);
+
+        assert_eq!(steer_factor("monaco2", "928", false), 0.925);
+
+        // two entries only exist when the track is driven backwards
+        assert_eq!(steer_factor("monaco1", "GT1", false), 1.0);
+        assert_eq!(steer_factor("monaco1", "GT1", true), 0.85);
+        assert_eq!(steer_factor("monaco3", "930T", false), 1.0);
+        assert_eq!(steer_factor("monaco3", "930T", true), 1.10);
+        assert_eq!(steer_factor("monaco3", "993", true), 1.0);
+    }
+}
 
 #[cfg(test)]
 mod tests {

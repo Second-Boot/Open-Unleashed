@@ -9,6 +9,17 @@ pub struct Triangle {
     pub c: Vec3,
     /// Caller-defined surface id (e.g. material index) returned by queries.
     pub surface: u32,
+    /// The three vertex colours, 0..255 per channel. The original interpolates the ground patch's
+    /// vertex colours at the car's position to light the car (0x474700, `lighting.md`); a hit
+    /// returns the same value interpolated over the triangle.
+    pub colors: [[u8; 4]; 3],
+}
+
+impl Triangle {
+    /// A triangle with white vertices (for callers that have no colours).
+    pub fn new(a: Vec3, b: Vec3, c: Vec3, surface: u32) -> Self {
+        Self { a, b, c, surface, colors: [[255; 4]; 3] }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -17,6 +28,8 @@ pub struct Hit {
     pub normal: Vec3,
     pub distance: f32,
     pub surface: u32,
+    /// The triangle's vertex colours interpolated at the hit, 0..1 per channel.
+    pub color: [f32; 4],
 }
 
 /// Static triangle grid over the XZ plane.
@@ -69,6 +82,28 @@ impl TriangleGrid {
         self.tris.len()
     }
 
+    /// Mean vertex colour of the triangles a predicate accepts (used to normalise the ground light
+    /// a car picks up against the track's own average).
+    pub fn mean_color(&self, keep: &dyn Fn(u32) -> bool) -> [f32; 3] {
+        let mut sum = [0.0f64; 3];
+        let mut n = 0.0f64;
+        for t in &self.tris {
+            if !keep(t.surface) {
+                continue;
+            }
+            for c in &t.colors {
+                for k in 0..3 {
+                    sum[k] += c[k] as f64 / 255.0;
+                }
+            }
+            n += 3.0;
+        }
+        if n == 0.0 {
+            return [1.0; 3];
+        }
+        [(sum[0] / n) as f32, (sum[1] / n) as f32, (sum[2] / n) as f32]
+    }
+
     /// Nearest intersection along `dir` from `origin` within `max_dist`, searching the cells the
     /// ray's XZ bounding box covers (adequate for short wheel/wall rays).
     pub fn raycast(&self, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<Hit> {
@@ -83,11 +118,19 @@ impl TriangleGrid {
             for x in x0..=x1 {
                 for &ti in &self.cells[z * self.nx + x] {
                     let t = &self.tris[ti as usize];
-                    if let Some((d, n)) = ray_triangle(origin, dir, t)
+                    if let Some((d, n, u, v)) = ray_triangle(origin, dir, t)
                         && d <= max_dist
                         && best.map(|b| d < b.distance).unwrap_or(true)
                     {
-                        best = Some(Hit { point: origin + dir * d, normal: n, distance: d, surface: t.surface });
+                        let w = 1.0 - u - v;
+                        let ch = |k: usize| (t.colors[0][k] as f32 * w + t.colors[1][k] as f32 * u + t.colors[2][k] as f32 * v) / 255.0;
+                        best = Some(Hit {
+                            point: origin + dir * d,
+                            normal: n,
+                            distance: d,
+                            surface: t.surface,
+                            color: [ch(0), ch(1), ch(2), ch(3)],
+                        });
                     }
                 }
             }
@@ -99,10 +142,21 @@ impl TriangleGrid {
     pub fn ground(&self, x: f32, y_from: f32, z: f32, depth: f32) -> Option<Hit> {
         self.raycast(Vec3::new(x, y_from, z), Vec3::NEG_Y, depth)
     }
+
+    /// What is over the point: the **lowest** surface more than `clearance` above `(x, y, z)`,
+    /// within `depth` of it.
+    ///
+    /// This is the shape of the original's enclosure query 0x473330, which walks the patches of the
+    /// quadtree cell the position falls in, keeps those whose height above the position is more
+    /// than 3.5 m, and returns the flags word of the lowest one (`race-logic.md` §12).
+    pub fn ceiling(&self, x: f32, y: f32, z: f32, clearance: f32, depth: f32) -> Option<Hit> {
+        self.raycast(Vec3::new(x, y + clearance, z), Vec3::Y, depth)
+    }
 }
 
-/// Möller–Trumbore, two-sided. Returns (distance, unit normal facing the ray origin).
-fn ray_triangle(o: Vec3, d: Vec3, t: &Triangle) -> Option<(f32, Vec3)> {
+/// Möller–Trumbore, two-sided. Returns (distance, unit normal facing the ray origin, u, v) where
+/// `u`/`v` are the barycentric weights of `b` and `c`.
+fn ray_triangle(o: Vec3, d: Vec3, t: &Triangle) -> Option<(f32, Vec3, f32, f32)> {
     let e1 = t.b - t.a;
     let e2 = t.c - t.a;
     let p = d.cross(e2);
@@ -129,7 +183,7 @@ fn ray_triangle(o: Vec3, d: Vec3, t: &Triangle) -> Option<(f32, Vec3)> {
     if n.dot(d) > 0.0 {
         n = -n;
     }
-    Some((dist, n))
+    Some((dist, n, u, v))
 }
 
 #[cfg(test)]
@@ -138,7 +192,7 @@ mod tests {
 
     fn quad(y: f32) -> Vec<Triangle> {
         let (a, b, c, d) = (Vec3::new(-10.0, y, -10.0), Vec3::new(10.0, y, -10.0), Vec3::new(10.0, y, 10.0), Vec3::new(-10.0, y, 10.0));
-        vec![Triangle { a, b, c, surface: 7 }, Triangle { a, b: c, c: d, surface: 7 }]
+        vec![Triangle::new(a, b, c, 7), Triangle::new(a, c, d, 7)]
     }
 
     #[test]

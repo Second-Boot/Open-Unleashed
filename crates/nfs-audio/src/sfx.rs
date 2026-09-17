@@ -116,7 +116,7 @@ impl CollisionSfx {
             return Some(c.clone());
         }
         let pcm = self.bank.decode_slot(&self.data, slot).ok()?;
-        let clip = Arc::new(Clip { rate: pcm.rate, channels: pcm.channels, samples: pcm.samples, loop_range: pcm.loop_range });
+        let clip = Arc::new(Clip { rate: pcm.rate, channels: pcm.channels, samples: pcm.samples, loop_range: pcm.loop_range, gain: pcm.gain });
         self.clips.insert(slot, clip.clone());
         Some(clip)
     }

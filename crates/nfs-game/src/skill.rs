@@ -7,8 +7,9 @@
 //!   line within ±3.5 m height (or the car centre is inside its sphere); the finish stores the
 //!   race time; a wreck about to auto-reset counts as DNF except on the skidpad.
 //! * Evaluation (§10): min rank ⇒ position; else time + cone penalty < limit; damage cap; cone cap.
-//! * Cone hits: the original simulates cones as bodies and flags one on an impact > 80; here a
-//!   cone is knocked when the car footprint overlaps it (MEDIUM — no cone physics).
+//! * Cone hits: the original simulates cones as extra cars and flags one on an impact > 80; here a
+//!   cone is knocked when the car footprint overlaps it (MEDIUM), and then tumbles as a simple
+//!   body (`TrackWorld::knock`).
 
 use glam::{Mat3, Vec3};
 use nfs_formats::career::{ConeRule, Mission};
@@ -44,7 +45,9 @@ pub struct Cone {
 pub enum SkillEvent {
     Checkpoint { sequence: i32, chime: bool },
     Finish { time_ticks: u64 },
-    ConeHit { element: usize, away: Vec3 },
+    /// `away` = the direction from the car to the cone, `launch` = the velocity the cone is given
+    /// (`TrackWorld::knock`)
+    ConeHit { element: usize, away: Vec3, launch: Vec3 },
     Dnf,
 }
 
@@ -188,7 +191,7 @@ impl SkillTest {
 
     /// Knock every cone inside the car's footprint (half extents `he` in the body frame `m`,
     /// rows = axes). Returns the events for newly knocked cones.
-    pub fn knock_cones(&mut self, pos: Vec3, m: &Mat3, he: Vec3) -> Vec<SkillEvent> {
+    pub fn knock_cones(&mut self, pos: Vec3, m: &Mat3, he: Vec3, car_velocity: Vec3) -> Vec<SkillEvent> {
         let mut ev = Vec::new();
         for c in self.cones.iter_mut().filter(|c| !c.knocked) {
             let d = c.position - pos;
@@ -199,7 +202,13 @@ impl SkillTest {
             if local.x.abs() < he.x + 0.25 && local.z.abs() < he.z + 0.25 {
                 c.knocked = true;
                 let away = Vec3::new(d.x, 0.0, d.z).normalize_or_zero();
-                ev.push(SkillEvent::ConeHit { element: c.element, away: if away.length_squared() > 0.0 { away } else { m.row(2) } });
+                let away = if away.length_squared() > 0.0 { away } else { m.row(2) };
+                // the original gives the smackable to the car physics (§5.3) — a 20 kg body struck
+                // by a car leaves with more than the car's own speed; the port launches it along
+                // the car's velocity, pushed out to the side it was hit on. APPROXIMATION.
+                let v = car_velocity + away * car_velocity.length() * 0.5;
+                let launch = if v.length() > 18.0 { v.normalize() * 18.0 } else { v } + Vec3::Y * 2.0;
+                ev.push(SkillEvent::ConeHit { element: c.element, away, launch });
             }
         }
         ev
@@ -275,8 +284,11 @@ mod tests {
         assert_eq!(e, vec![SkillEvent::Finish { time_ticks: 700 - 448 }]);
         assert!(st.finished);
         // cone at the origin is knocked when driven over
-        let ev = st.knock_cones(Vec3::new(0.5, 0.0, 0.3), &Mat3::IDENTITY, Vec3::new(0.9, 0.6, 2.0));
-        assert!(matches!(ev.first(), Some(SkillEvent::ConeHit { element: 0, .. })));
+        let ev = st.knock_cones(Vec3::new(0.5, 0.0, 0.3), &Mat3::IDENTITY, Vec3::new(0.9, 0.6, 2.0), Vec3::new(0.0, 0.0, 20.0));
+        let Some(SkillEvent::ConeHit { element: 0, launch, .. }) = ev.first() else { panic!("{ev:?}") };
+        // it leaves along the car's velocity, capped, with a little lift
+        assert!(launch.z > 10.0 && launch.z <= 18.0, "{launch:?}");
+        assert!(launch.y > 0.0);
         assert_eq!(st.cones_knocked(), 1);
     }
 

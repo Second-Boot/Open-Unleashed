@@ -6,12 +6,14 @@
 //! values; nothing is silently skipped.
 
 pub mod ais;
+pub mod animdefs;
 pub mod bigf;
 pub mod bnk;
 pub mod career;
 pub mod cop;
 pub mod crdl;
 pub mod crp;
+pub mod ctr;
 pub mod edg;
 pub mod error;
 pub mod fedata;
@@ -29,6 +31,7 @@ pub mod sav;
 pub mod scripts;
 pub mod sim;
 pub mod trafcfg;
+pub mod sky;
 pub mod spl;
 
 pub use error::FormatError;

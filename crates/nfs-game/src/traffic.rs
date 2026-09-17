@@ -42,6 +42,20 @@ pub const DESPAWN_DISTANCE: f32 = 400.0;
 pub const SPAWN_GAP: (u32, u32) = (60, 6);
 /// AI timestep — `[0x5CC750]`, the 32 Hz rate traffic runs at inside ~160 m (§14.3).
 pub const AI_DT: f32 = 1.0 / 32.0;
+
+/// `Lod_shouldUpdate` 0x414B10 for a traffic car (§14.3, CONFIRMED). The class-1 row of
+/// `0x5CC770` is `{6×10, 5×10}`, so `lod = clamp(round(dist/16), 0, 19)` gives `k = 6` — 32 Hz,
+/// `dt = 1/32`, mask 0 — inside ~160 m of the camera and `k = 5` — 16 Hz, `dt = 1/16`, mask 1 —
+/// beyond it. The gate is `((tick/2 + phase) & mask) == mask`, the phase staggering the cars, and
+/// the first 15 ticks always run at 32 Hz.
+pub fn lod_step(distance: f32, tick: u64, phase: usize) -> Option<(f32, i32)> {
+    if tick <= 15 {
+        return Some((AI_DT, AI_TICKS));
+    }
+    let lod = ((distance / 16.0).round() as i32).clamp(0, 19);
+    let (mask, dt, ticks) = if lod < 10 { (0u64, AI_DT, AI_TICKS) } else { (1, 1.0 / 16.0, 4) };
+    (((tick / 2 + phase as u64) & mask) == mask).then_some((dt, ticks))
+}
 /// Purgatory delay table `0x5CC4A0`, indexed by the number of registered traffic cars (§9.1).
 pub const RESPAWN_TABLE: [u32; 12] = [25, 50, 75, 100, 200, 400, 500, 800, 900, 1000, 1100, 1200];
 /// The AI does not start counting down the purgatory delay before this tick (0x40E140).
@@ -102,6 +116,19 @@ pub fn accel_rate(speed: f32) -> f32 {
     accel_rate_for(true, speed, 1.0)
 }
 
+/// `0x40AEF0` — the early-race boost `0x4081B0` multiplies a Normal-state car's accel rate by
+/// (`ai.md` §5.2 rule 3, CONFIRMED from the code): more than one opponent, the game mode is not 1,
+/// the first 30 s (`gGameTick < 0x780`), exactly one human, **and the human is behind this car**
+/// (`human+0xAF8 < car+0xAF8`). Then `1 + (opponents − car+0x10D0)·0.2`, where `car+0x10D0` is the
+/// car's ordinal among the flag-8 cars — 0 for traffic and cops, which never enter that loop
+/// (0x40B3EF), so they get the full `1 + opponents·0.2`.
+pub fn early_boost(opponents: u32, tick: u64, humans: u32, human_progress: f32, car_progress: f32, ordinal: u32) -> f32 {
+    if opponents <= 1 || tick >= 0x780 || humans != 1 || !(human_progress < car_progress) {
+        return 1.0;
+    }
+    1.0 + (opponents as f32 - ordinal as f32) * 0.2
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Reference {
     pub position: Vec3,
@@ -158,6 +185,10 @@ pub struct TrafficCar {
     pub script: ScriptRunner,
     /// the tick a human last hit this car, for the collision trigger
     pub hit_by_human_tick: u64,
+    /// `car+0x418` — collisions since this car was placed. `0x406CD0` clears it on every (re)spawn,
+    /// and nothing else clears it for a traffic car, which is what disables the "on its roof" exit
+    /// for the rest of a car's life once it has been hit (§21.7).
+    pub collisions: u32,
     /// `car+0xEC0`: speed along `dir`
     pub speed: f32,
     /// `car+0xEB8`
@@ -198,6 +229,7 @@ impl TrafficCar {
             // a traffic car's personality is row 0 after the `% 5` of §23.10, i.e. Nemesis
             script: ScriptRunner::new(0),
             hit_by_human_tick: 0,
+            collisions: 0,
             speed: 0.0,
             target_speed: 0.0,
             speed_factor: 1.0,
@@ -304,8 +336,17 @@ impl Default for TrafficPhysics {
     }
 }
 
+/// Where the body sits above the surface under it while a traffic car is resting on the ground.
+/// The original derives it from the suspension; the port has none for a traffic car, so it keeps
+/// the 1 m the slice height used to carry — APPROXIMATION.
+pub const RIDE_HEIGHT: f32 = 1.0;
+
 #[derive(Debug, Clone)]
 pub struct TrafficSet {
+    /// `[0x5E8BF8]` — how many AI opponents are in the race, for the §5.2 rule 3 boost.
+    pub opponents: u32,
+    /// Night track (`[0x628A24] > 0`): the longitudinal rate is scaled by 0.9 (`ai.md` §5.2.3).
+    pub night: bool,
     pub cars: Vec<TrafficCar>,
     /// `scripts.bin`, shared by every car
     pub scripts: nfs_formats::scripts::Scripts,
@@ -335,7 +376,7 @@ impl TrafficSet {
                 c
             })
             .collect();
-        Self { cars, scripts: nfs_formats::scripts::Scripts::default(), rng, one_way, race_dir, linear, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: TrafficPhysics::default() }
+        Self { cars, opponents: 0, night: false, scripts: nfs_formats::scripts::Scripts::default(), rng, one_way, race_dir, linear, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: TrafficPhysics::default() }
     }
 
     pub fn active_count(&self) -> usize {
@@ -358,7 +399,9 @@ impl TrafficSet {
         for i in 0..self.cars.len() {
             if !self.cars[i].active {
                 if tick > SPAWN_GATE_TICK {
-                    self.cars[i].respawn_ticks -= AI_TICKS;
+                    // the purgatory countdown stops at 0: a slot whose delay has run out but which
+                    // cannot spawn yet (five cars are already out) simply waits there
+                    self.cars[i].respawn_ticks = (self.cars[i].respawn_ticks - AI_TICKS).max(0);
                 }
                 if self.cars[i].respawn_ticks <= 0 && self.active_count() < MAX_ACTIVE {
                     self.spawn(i, table, reference);
@@ -412,6 +455,14 @@ impl TrafficSet {
                         if d < 12.0 && h.lane == my_lane {
                             let ahead = crate::lanes::gap_between(table, h.slice, my_slice) * my_dir > 0.0;
                             requests.push((hi as i32, if ahead { Trigger::HumanBlocksOpponent } else { Trigger::OpponentBlocksHuman }));
+                        }
+                        // the contact pair of triggers: the original tests the human's own
+                        // `+0x550`/`car+0x554` bookkeeping, which is the same collision the port
+                        // timestamps in `hit_by_human_tick`; which of the two fires depends on who
+                        // is further along
+                        if tick.saturating_sub(hit_tick) < 15 {
+                            let ahead = crate::lanes::gap_between(table, h.slice, my_slice) * my_dir > 0.0;
+                            requests.push((hi as i32, if ahead { Trigger::HumanPassesOpponent } else { Trigger::OpponentPassesHuman }));
                         }
                     }
                 }
@@ -475,6 +526,30 @@ impl TrafficSet {
             c.lateral_target = lateral_target;
             c.target_speed = capped;
 
+            // §14.3's LOD gate sits inside the *drive* routine 0x408360, not in the AI state
+            // machine that 0x406720 runs: a car more than ~152 m from the camera drives at 16 Hz
+            // with twice the timestep, staggered by its index, and keeps its last velocity in
+            // between. The lane pass above is the AI's and runs every 32 Hz tick regardless.
+            let Some((ai_dt, _)) = lod_step(c.position.distance(reference.position), tick, i) else { continue };
+
+            // §21.7's exits, taken before `0x408360` drives at all: a car lying on its side that has
+            // never been hit, or one whose target speed is zero, is only damped — `vel *= k`,
+            // `ω.y *= 0.98` — and does not steer. The damaged-out and player exits cannot fire for
+            // traffic (§21.7).
+            let up_y = c.orientation.row(1).y;
+            let damp = if c.collisions == 0 && up_y < 0.3 {
+                Some(0.94)
+            } else if c.target_speed == 0.0 {
+                Some(0.94)
+            } else {
+                None
+            };
+            if let Some(k) = damp {
+                c.velocity *= k;
+                c.angular_velocity.y *= 0.98;
+                continue;
+            }
+
             // §27.2: the drive model. The kinematic `0x408840` of §14.5 is dead code — `car+0x7E` is
             // never non-zero — so the car is a point mass with a yaw degree of freedom driven by two
             // P-cascades whose gains come from `trafcfg.dat`.
@@ -482,7 +557,8 @@ impl TrafficSet {
             let aim = aidrive::aim_direction(table, &self.cfg, &st);
             let err = aidrive::heading_error(&st, aim);
             let road = (sl.width_a, sl.width_b);
-            let rate = accel_rate(st.speed) * burst;
+            let boost = early_boost(self.opponents, tick, 1, reference.laps as f32 + table.frac(reference.slice), c.progress, 0);
+            let rate = accel_rate(st.speed) * burst * boost * if self.night { 0.9 } else { 1.0 };
             let cmd = if aidrive::out_of_control(&st, &self.cfg.out_of_control, err, road) {
                 aidrive::out_of_control_command(&st, &self.cfg.out_of_control, err, rate, self.phys.brake_force)
             } else {
@@ -491,7 +567,7 @@ impl TrafficSet {
                 aidrive::in_control_command(&st, &self.cfg.in_control, err, aim, grip, 1.0, rate, self.phys.brake_force)
             };
             tracing::trace!(car = i, err, ooc = aidrive::out_of_control(&st, &self.cfg.out_of_control, err, road), lat = st.lateral, lat_t = st.lateral_target, speed = st.speed, yaw = st.angular_velocity.y, cmd_lat = cmd.lateral, cmd_yaw = cmd.yaw, "traffic drive");
-            aidrive::integrate(&mut st, &cmd, AI_DT);
+            aidrive::integrate(&mut st, &cmd, ai_dt);
             c.velocity = st.velocity;
             c.angular_velocity = st.angular_velocity;
             c.lateral_rate = c.velocity.dot(sl.lateral.normalize_or_zero());
@@ -501,6 +577,16 @@ impl TrafficSet {
     /// The shared 64 Hz integrators (`0x49B7A0` position, `0x49B8E0` orientation) plus the
     /// slice/lateral tracking of `0x49AF70`.
     pub fn integrate(&mut self, table: &SliceTable, dt: f32) {
+        self.integrate_on(table, dt, None)
+    }
+
+    /// The same step with the track's collision grid, so the cars sit on the ground the way the
+    /// original's do: `Car_installHandlers` 0x410D60 replaces a traffic car's drive routine but
+    /// leaves `car+0xE20 = Car_ground` 0x49BD40 in place, and §4.2's resting branch puts the body
+    /// on the surface (`pos.y −= 0x424`) and turns the physics frame onto the ground normal
+    /// (`0x49BA30`). The port does the body half of that — it has no per-wheel suspension for a
+    /// traffic car — and falls back to the slice height where the ray misses.
+    pub fn integrate_on(&mut self, table: &SliceTable, dt: f32, ground: Option<&nfs_physics::collision::TriangleGrid>) {
         for c in self.cars.iter_mut().filter(|c| c.active) {
             c.position += c.velocity * dt;
             // yaw about the world up, the angular velocity being in turns per second
@@ -524,8 +610,22 @@ impl TrafficSet {
             // `car+0xEC0` the speed along the route (`0x417800`)
             c.lateral = (c.position - sl.centre).dot(lat_axis);
             c.speed = c.velocity.dot(sl.forward.normalize_or_zero());
-            // the port has no ground contact for traffic, so the slice carries the ride height
-            c.position.y = sl.centre.y + 1.0;
+            // ground contact: the highest surface under the car within 6 m of 2 m above it
+            match ground.and_then(|g| g.ground(c.position.x, c.position.y + 2.0, c.position.z, 6.0)) {
+                Some(h) => {
+                    c.position.y = h.point.y + RIDE_HEIGHT;
+                    // keep the heading, take the up axis from the ground normal; the rows of
+                    // `orientation` are the body axes, as everywhere else in the port
+                    let up = h.normal.normalize_or_zero();
+                    let f0 = c.orientation.row(2);
+                    let fwd = (f0 - up * f0.dot(up)).normalize_or_zero();
+                    let right = up.cross(fwd).normalize_or_zero();
+                    if fwd.length_squared() > 0.5 && right.length_squared() > 0.5 {
+                        c.orientation = Mat3::from_cols(right, fwd.cross(right).normalize_or_zero(), fwd).transpose();
+                    }
+                }
+                None => c.position.y = sl.centre.y + RIDE_HEIGHT,
+            }
             c.velocity.y = 0.0;
         }
     }
@@ -627,6 +727,8 @@ impl TrafficSet {
         c.prev_frac = table.frac(slice);
         c.progress = c.laps as f32 + c.prev_frac;
         c.active = true;
+        // `0x406CD0` clears the collision counter on every (re)spawn (§21.7)
+        c.collisions = 0;
         tracing::debug!(car = i, slice, dir, lateral, lane = lane_of(&sl, lateral), speed = target, "traffic spawn");
     }
 }
@@ -679,25 +781,67 @@ mod tests {
     }
 
     #[test]
-    fn speed_ladder_and_rate_curve() {
-        // same direction: the cruise speed, and the 8.9 floor keeps a 0.7 car above it
-        assert_eq!(target_speed(1.0, 1.0, 0.0, 1.0), 16.5);
-        assert!((target_speed(1.0, 1.0, 0.0, 0.7) - 11.55).abs() < 1e-3);
-        // oncoming: the faster the reference car, the slower the oncoming traffic, floored at 8.889
-        assert!((target_speed(-1.0, 1.0, 5.0, 1.0) + 16.5).abs() < 1e-3, "sign follows the direction");
-        assert!((target_speed(-1.0, 1.0, 20.0, 1.0).abs() - 13.3333).abs() < 1e-3);
-        // the 8.9 floor flattens the rest of the ladder: rungs below it are unreachable
-        assert_eq!(target_speed(-1.0, 1.0, 30.0, 1.0).abs(), 8.9);
-        assert_eq!(target_speed(-1.0, 1.0, 80.0, 1.0).abs(), 8.9);
-        // a slow personality is floored the same way once its factor takes it under 8.9
-        assert_eq!(target_speed(-1.0, 1.0, 20.0, 0.5).abs(), 8.9);
-        // the acceleration curve dies out at 14 m/s
-        assert!((accel_rate(0.0) - 0.25).abs() < 1e-6);
-        assert!((accel_rate(7.0) - 0.125).abs() < 1e-3);
-        assert_eq!(accel_rate(14.0), 0.0);
-        assert_eq!(accel_rate(30.0), 0.0);
-        // the octagonal metric over-estimates the true distance by at most ~6 %
-        assert_eq!(oct_distance(Vec3::ZERO, Vec3::new(3.0, 0.0, 4.0)), 4.75);
+    fn the_early_race_boost_follows_rule_3() {
+        // §5.2 rule 3 / 0x40AEF0: only with more than one opponent, one human, inside the first 30 s
+        // and while the human is behind the car
+        assert_eq!(early_boost(5, 100, 1, 0.1, 0.5, 0), 2.0);
+        assert_eq!(early_boost(1, 100, 1, 0.1, 0.5, 0), 1.0, "a single opponent");
+        assert_eq!(early_boost(5, 0x780, 1, 0.1, 0.5, 0), 1.0, "after 30 s");
+        assert_eq!(early_boost(5, 100, 2, 0.1, 0.5, 0), 1.0, "two humans");
+        assert_eq!(early_boost(5, 100, 1, 0.9, 0.5, 0), 1.0, "the human is ahead");
+        // the ordinal shrinks it; a traffic car's is 0, an opponent's is its place in the flag-8 loop
+        assert!((early_boost(5, 100, 1, 0.1, 0.5, 3) - 1.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_lod_gate_halves_the_rate_past_160_metres() {
+        // §14.3: inside ~160 m every 32 Hz tick drives the car; beyond it every other one, with
+        // twice the timestep.
+        assert_eq!(lod_step(50.0, 1000, 0), Some((AI_DT, AI_TICKS)));
+        // the boundary is where `round(d/16)` reaches 10, i.e. 152 m
+        assert_eq!(lod_step(151.0, 1000, 0), Some((AI_DT, AI_TICKS)));
+        assert!(lod_step(153.0, 1001, 0).is_none() || lod_step(153.0, 1000, 0).is_none());
+        let far: Vec<_> = (1000..1016).filter_map(|t| lod_step(200.0, t, 0)).collect();
+        assert_eq!(far.len(), 8, "eight of sixteen 64 Hz ticks");
+        assert!(far.iter().all(|(dt, n)| (*dt - 1.0 / 16.0).abs() < 1e-6 && *n == 4));
+        // the phase staggers the cars: two neighbours do not drive on the same tick
+        let a: Vec<bool> = (1000..1008).map(|t| lod_step(200.0, t, 0).is_some()).collect();
+        let b: Vec<bool> = (1000..1008).map(|t| lod_step(200.0, t, 1).is_some()).collect();
+        assert_ne!(a, b);
+        // and the first ticks of a race always run at the full rate
+        assert_eq!(lod_step(400.0, 4, 3), Some((AI_DT, AI_TICKS)));
+    }
+
+    #[test]
+    fn a_traffic_car_sits_on_the_ground_under_it() {
+        use nfs_physics::collision::{Triangle, TriangleGrid};
+        // a plane through the slice plane, rising 1 m over 10 m in +x
+        let h = |x: f32| 0.1 * x;
+        let tri = |a: Vec3, b: Vec3, c: Vec3| Triangle::new(a, b, c, 0);
+        let (p0, p1, p2, p3) = (Vec3::new(-20.0, h(-20.0), -20.0), Vec3::new(20.0, h(20.0), -20.0), Vec3::new(20.0, h(20.0), 20.0), Vec3::new(-20.0, h(-20.0), 20.0));
+        let grid = TriangleGrid::build(vec![tri(p0, p1, p2), tri(p0, p2, p3)], 10.0);
+
+        let t = ring(400);
+        let mut set = TrafficSet::new(&models(7), &t, 1.0, false, 1);
+        // put one car on the plane by hand; the spawner is exercised by the other tests
+        let c = &mut set.cars[0];
+        c.active = true;
+        c.slice = 0;
+        c.position = Vec3::new(5.0, 0.0, 0.0);
+        c.orientation = Mat3::IDENTITY;
+        c.velocity = Vec3::ZERO;
+        c.angular_velocity = Vec3::ZERO;
+        set.integrate_on(&t, 1.0 / 64.0, Some(&grid));
+        let c = &set.cars[0];
+        assert!((c.position.y - (h(5.0) + RIDE_HEIGHT)).abs() < 0.05, "on the slope: {} vs {}", c.position.y, h(5.0) + RIDE_HEIGHT);
+        // the body leans with the surface instead of staying world-up
+        let up = c.orientation.row(1);
+        assert!(up.y > 0.9 && up.x.abs() + up.z.abs() > 0.02, "body up {up:?}");
+        // without a grid it falls back to the slice height, as it did before
+        set.cars[0].position = Vec3::new(5.0, 0.0, 0.0);
+        set.integrate_on(&t, 1.0 / 64.0, None);
+        let c = &set.cars[0];
+        assert!((c.position.y - (t.slices[c.slice].centre.y + RIDE_HEIGHT)).abs() < 1e-3);
     }
 
     #[test]

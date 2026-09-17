@@ -17,17 +17,17 @@
 //! **What the port writes.** [`career_to_sav`] fills `PlayerInfo`, `Tournament` and `Missions` —
 //! the three modules that carry the career (§9.4) — from the port's own career state, embedding
 //! the same record images the original does (`nfs5.trn`, `nfs5.fac`, the FE car object built on
-//! the `nfs5.car` record). It does **not** write the `accessor` block: which concrete accessor
-//! class backs each of the ~220 names is UNKNOWN (§9), and an unknown payload cannot be sized, so
-//! the block is omitted — §9.6 says the original then falls back to its default options. Because
-//! of that, and because a few port-side bookkeeping fields have no home in the original's format
+//! the `nfs5.car` record), plus an `accessor` block holding the values the port actually has
+//! (§6.2a gives the class, and so the payload shape, of all 221 registered names). A subset is
+//! legal: the original looks every name up in its own registry and anything absent keeps its
+//! default (§9.6). Because a few port-side bookkeeping fields still have no home in the format
 //! (see [`career_from_sav`]), the port's own JSON career remains the live save and the `.sav` is
 //! written beside it.
 
 use crate::career::{Career, CareerTables, EventResult, OwnedCar, TournamentState};
 use nfs_formats::career::{Era, MISSION_RECORD_SIZE, PART_RECORD_SIZE, TOURNAMENT_RECORD_SIZE};
 use nfs_formats::fedata::CAR_RECORD_SIZE;
-use nfs_formats::sav::{PlayerInfo, SaveFile, SavedCar, SavedPart, TournamentModule, FE_CAR_IMAGE};
+use nfs_formats::sav::{AccessorBlock, AccessorValue, KnockoutState, PlayerInfo, SaveFile, SavedCar, SavedPart, TournamentModule, FE_CAR_IMAGE};
 use std::path::{Path, PathBuf};
 
 /// `[0x5D8F2C]` / `[0x5DB748]` default driver picture.
@@ -151,6 +151,10 @@ pub mod car {
     /// 1 = the player's car, 0 = a used-car-market car.
     pub const OWNED: usize = 0x6A0;
     pub const PURCHASE_PRICE: usize = 0x6A4;
+    /// The 17 setup floats and the backup the setup screen restores from (`career.md` §12); the two
+    /// blocks end exactly at the 0x758-byte image.
+    pub const SETUP: usize = 0x6D0;
+    pub const SETUP_BACKUP: usize = 0x714;
 }
 
 /// Build the FE car image the save stores for one garage car.
@@ -178,19 +182,27 @@ fn car_image(tables: &CareerTables, c: &OwnedCar, instance: u32) -> SavedCar {
     car.set_field_u32(car::WINS, c.wins);
     car.set_field_u8(car::OWNED, 1);
     car.set_field_u32(car::PURCHASE_PRICE, c.purchase_price);
-    // Only the part id and the float at part+0x164 survive a save/load (§4.7); a freshly installed
-    // part carries the value from its `nfs5.prt` record, so that is what is written.
+    // the setup and the copy the screen's "cancel" restores from (0x4EF4C0/0x4EF4E0)
+    for (i, v) in c.setup.iter().enumerate() {
+        car.set_field_u32(car::SETUP + i * 4, v.to_bits());
+        car.set_field_u32(car::SETUP_BACKUP + i * 4, v.to_bits());
+    }
+    // Only the part id and the float at part+0x164 survive a save/load (§4.7). That float is the
+    // damage the part carries, so the port writes what the car has accumulated and falls back to
+    // the `nfs5.prt` record for a part that has never been raced.
     car.installed = c
         .parts
         .iter()
         .map(|id| {
-            let state = tables
-                .parts
-                .iter()
-                .position(|p| p.id == *id)
-                .and_then(|i| tables.raw.prt.get(i * PART_RECORD_SIZE + 0x164..i * PART_RECORD_SIZE + 0x168))
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .unwrap_or(0.0);
+            let state = c.part_state.iter().find(|(pid, _)| pid == id).map(|(_, s)| *s).unwrap_or_else(|| {
+                tables
+                    .parts
+                    .iter()
+                    .position(|p| p.id == *id)
+                    .and_then(|i| tables.raw.prt.get(i * PART_RECORD_SIZE + 0x164..i * PART_RECORD_SIZE + 0x168))
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .unwrap_or(0.0)
+            });
             SavedPart { id: *id as i32, state }
         })
         .collect();
@@ -211,7 +223,11 @@ fn owned_from_image(tables: &CareerTables, car: &SavedCar) -> OwnedCar {
         parts: car.installed.iter().map(|p| p.id as i16).collect(),
         mileage: car.field_u32(car::MILEAGE),
         wins: car.field_u32(car::WINS),
+        // the container carries the damage a car has taken as the state of each of its parts
         damage_pct: 0.0,
+        damage: [0.0; 10],
+        part_state: car.installed.iter().map(|p| (p.id as i16, p.state)).collect(),
+        setup: std::array::from_fn(|i| f32::from_bits(car.field_u32(car::SETUP + i * 4))),
         purchase_price: car.field_u32(car::PURCHASE_PRICE),
         asking_price: (car.field_u8(car::LISTED) != 0).then(|| car.field_u32(car::ASKING_PRICE)),
         offer: (car.field_u8(car::OFFER_PENDING) != 0).then(|| car.field_u32(car::OFFER)),
@@ -328,8 +344,71 @@ fn mission_table(tables: &CareerTables, c: &Career) -> Vec<u8> {
 /// The money clamp of 0x5012E0.
 pub const MONEY_LIMIT: i64 = 999_999_999;
 
+/// What the port knows about a knockout series in progress, for the `Knockout` module (§4.6 /
+/// `modes.md` §5.2). `None` writes the module with the series switched off.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KnockoutProgress {
+    pub active: bool,
+    pub race_index: u32,
+    pub opponents: u32,
+    /// index 0 is the player
+    pub alive: Vec<bool>,
+    /// 1-based grid places for the next race, index 0 the player
+    pub start_pos: Vec<u32>,
+    /// the personality ids drawn for opponents 1..n
+    pub personalities: Vec<i16>,
+}
+
+impl KnockoutProgress {
+    fn to_state(&self) -> KnockoutState {
+        let mut k = KnockoutState { active: self.active, race_index: self.race_index as i32, opponents: self.opponents as i32, ..Default::default() };
+        for (i, a) in self.alive.iter().take(16).enumerate() {
+            k.alive[i] = u8::from(*a);
+        }
+        for (i, p) in self.personalities.iter().take(8).enumerate() {
+            k.personalities[i] = *p as i32;
+        }
+        k.start_pos = [-1; 9];
+        for (i, p) in self.start_pos.iter().take(9).enumerate() {
+            k.start_pos[i] = *p as i32;
+        }
+        k.last_pos = [-1; 9];
+        k
+    }
+}
+
 /// Build the original's save game from the port's career state.
 pub fn career_to_sav(c: &Career, tables: &CareerTables, profile: &Profile) -> SaveFile {
+    career_to_sav_with(c, tables, profile, None, &[], &SavedSettings::default())
+}
+
+/// The same with a knockout series, the personality ids in play and the CD player's track list.
+/// The front-end settings the port keeps, for the accessor block (`savegame.md` §6).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SavedSettings {
+    /// `Audio.MusicLevel` / `SfxLevel` / `EngineLevel` / `SpeechLevel` / `AmbientLevel`, 0..127
+    pub music: u8,
+    pub sfx: u8,
+    pub engine: u8,
+    pub speech: u8,
+    pub ambient: u8,
+    /// `Audio.Quality`
+    pub audio_quality: u8,
+    /// `Graphics.ViewDistance` as the original's index into {0.5, 0.67, 0.83, 1.0}
+    pub view_distance: u8,
+    /// `Track1.Laps` / `Game.NumOpponents` / `Track1.Traffic`
+    pub laps: u32,
+    pub opponents: u32,
+    pub traffic: u32,
+}
+
+impl Default for SavedSettings {
+    fn default() -> Self {
+        Self { music: 127, sfx: 127, engine: 127, speech: 127, ambient: 127, audio_quality: 1, view_distance: 3, laps: 2, opponents: 7, traffic: 0 }
+    }
+}
+
+pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, knockout: Option<&KnockoutProgress>, playlist: &[u32], settings: &SavedSettings) -> SaveFile {
     let player = PlayerInfo {
         cars: c.garage.iter().enumerate().map(|(i, car)| car_image(tables, car, i as u32)).collect(),
         money: c.money.clamp(-MONEY_LIMIT, MONEY_LIMIT) as i32,
@@ -352,6 +431,35 @@ pub fn career_to_sav(c: &Career, tables: &CareerTables, profile: &Profile) -> Sa
         club_mode: u32::from(c.evolution_complete),
         table: tournament_table(tables, c),
     };
+    // The accessors the port has real values for, each in the shape its class implies (§6.1/§6.2a).
+    let mut entries = vec![
+        ("Chronicle.Year".into(), AccessorValue::Dword(c.year as u32)),
+        ("Game.GameType".into(), AccessorValue::Dword(u32::from(c.evolution_complete))),
+        ("OwnedCars.Car".into(), AccessorValue::OwnedCarSel { cars: c.garage.len() as u32, selection: 0 }),
+        ("UserList.NameInput".into(), AccessorValue::Text(profile.name.clone())),
+        ("Tournament.Data".into(), AccessorValue::Empty),
+        ("Factory.Data".into(), AccessorValue::Empty),
+        // the settings screens: every one of these is an `FEIntAccessor` or an
+        // `FELocalizedTextAccessor`, so the payload is the plain dword of §6.1
+        ("Audio.MusicLevel".into(), AccessorValue::Dword(settings.music as u32)),
+        ("Audio.SfxLevel".into(), AccessorValue::Dword(settings.sfx as u32)),
+        ("Audio.EngineLevel".into(), AccessorValue::Dword(settings.engine as u32)),
+        ("Audio.SpeechLevel".into(), AccessorValue::Dword(settings.speech as u32)),
+        ("Audio.AmbientLevel".into(), AccessorValue::Dword(settings.ambient as u32)),
+        ("Audio.Quality".into(), AccessorValue::Dword(settings.audio_quality as u32)),
+        ("Graphics.ViewDistance".into(), AccessorValue::Dword(settings.view_distance as u32)),
+        ("Track1.Laps".into(), AccessorValue::Dword(settings.laps)),
+        ("Game.NumOpponents".into(), AccessorValue::Dword(settings.opponents)),
+        ("Track1.Traffic".into(), AccessorValue::Dword(settings.traffic)),
+    ];
+    // the selected car's setup, which the screen mirrors into `FEFloatAccessor`s — a float rides in
+    // the same dword (`career.md` §12, `layouts.md`)
+    if let Some(car) = c.garage.first() {
+        for (name, v) in crate::career::CAR_SETUP_NAMES.iter().zip(car.setup.iter()) {
+            entries.push(((*name).into(), AccessorValue::Dword(v.to_bits())));
+        }
+    }
+    let accessors = AccessorBlock { entries };
     SaveFile {
         missions: Some(mission_table(tables, c)),
         parts_market: None,
@@ -359,10 +467,12 @@ pub fn career_to_sav(c: &Career, tables: &CareerTables, profile: &Profile) -> Sa
         player: Some(player),
         track_records: true,
         used_cars: None,
-        personalities: None,
-        knockout: None,
-        cd_player: None,
-        accessors: None,
+        // §4.6: the raw `[0x690410]` block, and §4.5's list of personality ids in play
+        knockout: Some(knockout.map(|k| k.to_state()).unwrap_or_default().write()),
+        personalities: Some(knockout.map(|k| k.personalities.iter().map(|p| *p as u16).collect()).unwrap_or_default()),
+        // §4.8: the selected music tracks
+        cd_player: Some(playlist.to_vec()),
+        accessors: Some(accessors),
         order: Vec::new(),
     }
 }
@@ -386,6 +496,13 @@ pub fn career_from_sav(s: &SaveFile, tables: &CareerTables) -> Career {
         };
         c.evolution_complete = t.club_mode != 0;
         c.tournaments = tournaments_from_table(tables, &t.table);
+    }
+    if let Some(a) = &s.accessors {
+        for (name, value) in &a.entries {
+            if let ("Chronicle.Year", AccessorValue::Dword(y)) = (name.as_str(), value) {
+                c.year = *y as u16;
+            }
+        }
     }
     if let Some(m) = &s.missions {
         c.missions = (0..m.len() / MISSION_RECORD_SIZE).map(|i| get_i16(m, i * MISSION_RECORD_SIZE + 0xE8)).collect();

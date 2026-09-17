@@ -128,7 +128,7 @@ impl Ambience {
                 index.insert(id, (e.offset as usize, e.size as usize));
             }
         }
-        let game_trim = std::fs::read(sounds_dir.join("game.spl")).ok().and_then(|d| d.get(12..16).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))).unwrap_or(100);
+        let game_trim = nfs_formats::spl::GameSpl::load(sounds_dir).ambience();
         let elements: Vec<Element> = scenes.iter().flat_map(|s| Element::from_scene(s)).collect();
         tracing::info!(elements = elements.len(), banks = index.len(), ambient_level, "ambience loaded");
         Ok(Self { elements, index, viv, clips: HashMap::new(), pool: [Slot::default(); VOICES], rng: 0x1234_5678, ambient_level, game_trim })
@@ -147,7 +147,7 @@ impl Ambience {
             let bytes = self.viv.get(o..o + l)?;
             let bank = Bnk::parse(bytes).ok()?;
             let p = (0..bank.slot_count().max(1)).find_map(|s| bank.decode_slot(bytes, s).ok())?;
-            Some(Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range }))
+            Some(Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range, gain: p.gain }))
         });
         if clip.is_none() {
             tracing::debug!(patch, "ambience bank missing or unreadable");

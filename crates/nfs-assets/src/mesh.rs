@@ -20,24 +20,30 @@ pub struct MaterialMesh {
 ///
 /// Primitive types (RE/notes/crp-geometry.md §4): 3 with index arrays = indexed triangle list;
 /// 3 without index arrays = sequential triangle list (CONFIRMED count%3==0, e.g. "Docker2");
-/// 4 = sequential quads of 4 vertices (signs/billboards, HIGH); 1 = unknown (13 in skidpad,
-/// "Econocar" — possibly lines) and is skipped, counted in `skipped`.
+/// **1 = indexed triangle strip** with the usual degenerate stitches (CONFIRMED against the data:
+/// expanded as a strip the 506 shipped type-1 primitives have a mean normal agreement of 0.93
+/// between neighbouring faces, against −0.84 as a fan); 4 = sequential quads of 4 vertices
+/// (signs/billboards, HIGH). Anything else is skipped and counted in `skipped`.
 pub fn article_meshes(art: &ArticleGeometry, lod: u8, skipped: &mut usize) -> Vec<MaterialMesh> {
     let mut by_mat: BTreeMap<u16, MeshData> = BTreeMap::new();
     for p in art.primitives.iter().filter(|p| p.lod == lod) {
-        let (vi, ui): (Vec<u8>, Vec<u8>) = match (p.prim_type, p.vertex_indices.is_empty()) {
-            (3, false) => (p.vertex_indices.clone(), p.uv_indices.clone()),
-            (3, true) if p.positions.len() % 3 == 0 && p.positions.len() <= 256 => {
-                let seq: Vec<u8> = (0..p.positions.len() as u8).collect();
-                (seq.clone(), seq)
-            }
-            (4, _) if p.positions.len() % 4 == 0 && p.positions.len() <= 256 => {
+        // corners of the expanded triangle list, each as a position in the primitive's own index
+        // arrays (which is also what indexes the per-corner colours)
+        // a primitive without index arrays runs one corner per vertex, as many as the colour stream
+        // (the `df` window) says — that window is what tells the engine how long the primitive is
+        let seq = if p.colors.is_empty() { p.positions.len() } else { p.colors.len().min(p.positions.len()) };
+        let corners: Vec<usize> = match (p.prim_type, p.vertex_indices.is_empty()) {
+            (3, false) => (0..p.vertex_indices.len()).collect(),
+            (3, true) if seq % 3 == 0 => (0..seq).collect(),
+            (1, false) => strip_corners(p.vertex_indices.len(), |k| p.vertex_indices[k] as usize),
+            (1, true) => strip_corners(seq, |k| k),
+            (4, true) if seq % 4 == 0 => {
                 let mut v = Vec::new();
-                for q in 0..p.positions.len() / 4 {
-                    let b = (q * 4) as u8;
+                for q in 0..seq / 4 {
+                    let b = q * 4;
                     v.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
                 }
-                (v.clone(), v)
+                v
             }
             _ => {
                 *skipped += 1;
@@ -45,16 +51,34 @@ pub fn article_meshes(art: &ArticleGeometry, lod: u8, skipped: &mut usize) -> Ve
             }
         };
         let mesh = by_mat.entry(p.material).or_default();
-        append_primitive(mesh, p, &vi, &ui);
+        append_primitive(mesh, p, &corners);
     }
     by_mat.into_iter().map(|(material, mesh)| MaterialMesh { material, mesh }).collect()
 }
 
-fn append_primitive(mesh: &mut MeshData, p: &Primitive, vertex_indices: &[u8], uv_indices: &[u8]) {
-    let n = vertex_indices.len();
+/// Expand a triangle strip into triangle-list corner positions, keeping the file's winding and
+/// dropping the degenerate triangles that stitch separate strips together (17.6 % of the shipped
+/// type-1 triangles are such stitches).
+fn strip_corners(n: usize, index_at: impl Fn(usize) -> usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    for k in 0..n.saturating_sub(2) {
+        let t = if k % 2 == 0 { [k, k + 1, k + 2] } else { [k + 1, k, k + 2] };
+        let (a, b, c) = (index_at(t[0]), index_at(t[1]), index_at(t[2]));
+        if a == b || b == c || a == c {
+            continue;
+        }
+        out.extend_from_slice(&t);
+    }
+    out
+}
+
+fn append_primitive(mesh: &mut MeshData, p: &Primitive, corner_at: &[usize]) {
+    let n = corner_at.len();
+    let index_at = |k: usize| -> usize { if p.vertex_indices.is_empty() { corner_at[k] } else { p.vertex_indices[corner_at[k]] as usize } };
+    let uv_at = |k: usize| -> usize { if p.uv_indices.is_empty() { corner_at[k] } else { p.uv_indices[corner_at[k]] as usize } };
     for tri in 0..n / 3 {
         let corners = [tri * 3, tri * 3 + 2, tri * 3 + 1]; // flip winding to CCW
-        let pos = |k: usize| glam::Vec3::from(p.positions[vertex_indices[k] as usize]);
+        let pos = |k: usize| glam::Vec3::from(p.positions[index_at(k)]);
         let face_n = {
             let a = pos(tri * 3);
             let b = pos(tri * 3 + 1);
@@ -64,11 +88,11 @@ fn append_primitive(mesh: &mut MeshData, p: &Primitive, vertex_indices: &[u8], u
             if nrm.length_squared() > 0.0 { nrm.normalize() } else { glam::Vec3::Y }
         };
         for k in corners {
-            let vi = vertex_indices[k] as usize;
-            let ui = uv_indices.get(k).copied().unwrap_or(0) as usize;
+            let vi = index_at(k);
+            let ui = uv_at(k);
             let normal = p.normals.get(vi).copied().unwrap_or(face_n.to_array());
             let uv = p.uvs.get(ui).copied().unwrap_or([0.0, 0.0]);
-            let c = p.colors.get(k).copied().unwrap_or(0xFFFF_FFFF).to_le_bytes();
+            let c = p.colors.get(corner_at[k]).copied().unwrap_or(0xFFFF_FFFF).to_le_bytes();
             let base = mesh.vertices.len() as u32;
             mesh.vertices.push(Vertex {
                 position: p.positions[vi],

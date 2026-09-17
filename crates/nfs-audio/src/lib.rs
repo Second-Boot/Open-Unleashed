@@ -12,6 +12,7 @@ pub mod ambience;
 pub mod engine;
 pub mod mixer;
 pub mod music;
+pub mod reverb;
 pub mod sfx;
 pub mod speech;
 

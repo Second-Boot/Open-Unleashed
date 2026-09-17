@@ -190,6 +190,31 @@ impl SliceTable {
     /// `SliceTable::findSlice` 0x481400: hill-climb in the xz plane from `prev`, with a coarse global
     /// scan over every 8th slice when farther than 128 m. Restricted to the main lap (junction branch
     /// picking not implemented — MEDIUM).
+    /// `0x4816C0` — the nearest slice of one section to `pos` (2-D, as the tracker measures).
+    pub fn nearest_in_section(&self, section: usize, pos: Vec3) -> Option<usize> {
+        let s = self.sections.get(section)?;
+        let mut best: Option<(f32, usize)> = None;
+        for i in s.first..=s.last.min(self.slices.len().saturating_sub(1)) {
+            let d = self.d2(i, pos);
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, i));
+            }
+        }
+        best.map(|(_, i)| i)
+    }
+
+    /// `Tracker::update` 0x474440 with a `preferredSection`: when the car has chosen a branch, its
+    /// slice is resolved against that section as well, and the nearer of the two candidates wins.
+    /// Without a preference (or on a single-section table) this is plain [`Self::find_slice`].
+    pub fn track_slice(&self, pos: Vec3, prev: usize, preferred: Option<usize>) -> usize {
+        let plain = self.find_slice(pos, prev);
+        let Some(sec) = preferred.filter(|_| self.sections.len() > 1) else { return plain };
+        match self.nearest_in_section(sec, pos) {
+            Some(cand) if self.d2(cand, pos) < self.d2(plain, pos) => cand,
+            _ => plain,
+        }
+    }
+
     pub fn find_slice(&self, pos: Vec3, prev: usize) -> usize {
         let n = self.lap_len.max(1);
         let mut p = self.route_pos.get(prev).copied().unwrap_or(0) as usize % n;
@@ -345,7 +370,13 @@ impl RaceProgress {
     /// Update at 32 Hz (even ticks): tracker, `Lap_check` 0x417440, `Race_updateProgress` 0x416310,
     /// wrong-way 0x4A7660. Returns true when a lap was completed this call.
     pub fn update(&mut self, table: &SliceTable, pos: Vec3, forward: Vec3, tick: u64, num_laps: u32) -> bool {
-        self.slice = table.find_slice(pos, self.slice);
+        self.update_tracked(table, pos, forward, tick, num_laps, None)
+    }
+
+    /// The same with the tracker's `preferredSection` (`race-logic.md` §1.4): a car that has taken a
+    /// junction branch resolves its slice against that branch's section too.
+    pub fn update_tracked(&mut self, table: &SliceTable, pos: Vec3, forward: Vec3, tick: u64, num_laps: u32, preferred: Option<usize>) -> bool {
+        self.slice = table.track_slice(pos, self.slice, preferred);
         // finished / eliminated cars leave the progress accounting (0x4169B0: `state >= 2 ⇒ return`),
         // so their lap list and rank freeze at the finish
         if self.finished {
@@ -419,6 +450,45 @@ mod tests {
             })
             .collect();
         SliceTable::build(slices, vec![Section { first: 0, last: n - 1, f0: 0.0, f1: 1.0 }])
+    }
+
+fn two_branch_table() -> SliceTable {
+        // 20 slices of main route along +z, then 10 of a branch 50 m to the side
+        let mut slices = Vec::new();
+        for i in 0..20 {
+            slices.push(slice_at(Vec3::new(0.0, 0.0, i as f32 * SLICE_SPACING)));
+        }
+        for i in 0..10 {
+            slices.push(slice_at(Vec3::new(50.0, 0.0, i as f32 * SLICE_SPACING)));
+        }
+        let sections = vec![Section { first: 0, last: 19, f0: 0.0, f1: 1.0 }, Section { first: 20, last: 29, f0: 0.0, f1: 1.0 }];
+        let route: Vec<usize> = (0..20).collect();
+        let mut route_pos = vec![0usize; slices.len()];
+        for (i, s) in route.iter().enumerate() {
+            route_pos[*s] = i;
+        }
+        SliceTable { slices, sections, lap_len: 20, route, route_pos: route_pos.iter().map(|v| *v as u32).collect(), junctions: crate::junctions::Junctions::default(), backwards: false }
+    }
+
+    fn slice_at(centre: Vec3) -> Slice {
+        Slice { centre, up: Vec3::Y, forward: Vec3::Z, lateral: Vec3::X, lane_mask: 0, lanes_a: 2, lanes_b: 2, width_a: 8.0, width_b: 8.0, lane_width_a: 4.0, lane_width_b: 4.0 }
+    }
+
+#[test]
+    fn the_preferred_section_wins_when_it_is_nearer() {
+        // `race-logic.md` §1.4: with a preferred section the tracker also asks that section for its
+        // nearest slice and keeps whichever candidate is closer.
+        let t = two_branch_table();
+        let on_branch = t.slices[t.sections[1].first + 2].centre;
+        // without a preference the route hill-climb answers with a main-route slice
+        let plain = t.find_slice(on_branch, 0);
+        assert!(plain <= t.sections[0].last, "the route candidate is on the main section");
+        // with it, the branch slice wins
+        let tracked = t.track_slice(on_branch, 0, Some(1));
+        assert_eq!(tracked, t.sections[1].first + 2);
+        // and a preference that is further away changes nothing
+        let on_main = t.slices[3].centre;
+        assert_eq!(t.track_slice(on_main, 0, Some(1)), t.find_slice(on_main, 0));
     }
 
     #[test]

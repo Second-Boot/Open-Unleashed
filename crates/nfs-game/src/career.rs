@@ -131,9 +131,15 @@ impl CareerTables {
         v
     }
 
-    /// Club events (Tournament mode) of every era up to `max_era`, ordered by era then id.
-    pub fn club_tournaments(&self, max_era: Era) -> Vec<&Tournament> {
-        let mut v: Vec<&Tournament> = self.tournaments.iter().filter(|t| matches!(t.kind, TournamentKind::Club(e) if e <= max_era)).collect();
+    /// Club events (Tournament mode), ordered by era then id.
+    ///
+    /// The original's list accessor `Tournament.Tournament` (0x504D00) filters the 35 `nfs5.trn`
+    /// records by `rec+0x04 == 524 + Tournament.EventType` — the club era string ids — and
+    /// `rec+0xE4 != 2` (the hidden era finales). **There is no career-progress condition**: the
+    /// era the player is up to only reaches the accessor in Evolution mode, where it selects
+    /// `[0x691E50]` instead. So every club era is listed from the start. CONFIRMED (H28).
+    pub fn club_tournaments(&self) -> Vec<&Tournament> {
+        let mut v: Vec<&Tournament> = self.tournaments.iter().filter(|t| matches!(t.kind, TournamentKind::Club(_)) && !t.is_hidden()).collect();
         v.sort_by_key(|t| (t.era(), t.id));
         v
     }
@@ -152,9 +158,23 @@ pub struct OwnedCar {
     /// `car+0x69C`: career wins.
     #[serde(default)]
     pub wins: u32,
-    /// Body damage in per cent (no damage model yet — stays 0).
+    /// Body damage in per cent — the mean of `damage`, the figure the value formula and the
+    /// garage screens use.
     #[serde(default)]
     pub damage_pct: f32,
+    /// The ten body zones as the race left them (`car+0x4E4…`), 0..100 each.
+    #[serde(default)]
+    pub damage: [f32; 10],
+    /// Per installed part, the damage it carries from earlier races — the float the original keeps
+    /// at `part+0x164` and writes into the save (`savegame.md` §4.7). A part-damage getter adds it
+    /// to the live zone damage (`physics.md` §10).
+    #[serde(default)]
+    pub part_state: Vec<(i16, f32)>,
+    /// The car's setup (`carsetup.lay`), in `CAR_SETUP_NAMES` order — the 17 floats the original
+    /// keeps at `FECar+0x6D0` with a backup at `+0x714` (`layouts.md`). Nothing in the game reads
+    /// them back, so they change nothing; the port keeps them so the screen and the save match.
+    #[serde(default = "default_setup")]
+    pub setup: [f32; 17],
     /// `car+0x6A4`: what was paid (0 for prize cars).
     #[serde(default)]
     pub purchase_price: u32,
@@ -168,8 +188,27 @@ pub struct OwnedCar {
 
 impl OwnedCar {
     pub fn new(car_id: u16, paint_set: u8, purchase_price: u32) -> Self {
-        Self { car_id, paint_set, parts: Vec::new(), mileage: 0, wins: 0, damage_pct: 0.0, purchase_price, asking_price: None, offer: None }
+        Self { car_id, paint_set, parts: Vec::new(), mileage: 0, wins: 0, damage_pct: 0.0, damage: [0.0; 10], part_state: Vec::new(), setup: CAR_SETUP_DEFAULT, purchase_price, asking_price: None, offer: None }
     }
+}
+
+/// `0x4E3160(count, era)` — the knockout series' driver draw (`modes.md` §5.2 / read 2026-09-17,
+/// CONFIRMED). The pool is every `nfs5.per` record whose `era` matches the selection (or all of them
+/// when it is −1), and each opponent takes one **without replacement**, so no two share a driver.
+/// The original draws with the CRT `rand()` seeded from the clock, not the game's LCG, so any source
+/// reproduces it equally well.
+pub fn pick_personalities(personalities: &[Personality], era: Option<u32>, count: usize, mut rand: impl FnMut(usize) -> usize) -> Vec<i16> {
+    let mut pool: Vec<usize> = personalities.iter().enumerate().filter(|(_, p)| era.is_none_or(|e| p.era == e)).map(|(i, _)| i).collect();
+    let mut out = Vec::new();
+    for _ in 0..count {
+        if pool.is_empty() {
+            break;
+        }
+        let k = rand(pool.len());
+        out.push(personalities[pool[k]].id);
+        pool.remove(k);
+    }
+    out
 }
 
 /// Chronicle years (`0x5B8670`): the year steps to the next entry on each first tournament completion.
@@ -216,6 +255,74 @@ pub fn zone_masks_for(tables: &CareerTables, car: &CarCatalogEntry) -> nfs_physi
     if let Some(z) = pick(&[6]) { m.aero = z; }
     if let Some(z) = pick(&[9]) { m.tyres = z; }
     m
+}
+
+/// The car-setup values in the order the setup screen looks them up (0x4F1097…0x4F1311) and the
+/// order they sit in at `FECar+0x6D0`. CONFIRMED.
+pub const CAR_SETUP_NAMES: [&str; 17] = [
+    "FDownForce",
+    "RDownForce",
+    "BrakeBias",
+    "RideHeight",
+    "Suspension",
+    "SteeringToe",
+    "ShockRate",
+    "FTirePressure",
+    "RTirePressure",
+    "Gear0",
+    "Gear1",
+    "Gear2",
+    "Gear3",
+    "Gear4",
+    "Gear5",
+    "Gear6",
+    "Gear7",
+];
+
+/// What `FECar`'s constructor writes into that block (0x4EED2D…0x4EED80). CONFIRMED.
+pub const CAR_SETUP_DEFAULT: [f32; 17] =
+    [50.0, 50.0, 50.0, 0.0, 0.0, 0.0, 1.0, 30.0, 30.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+fn default_setup() -> [f32; 17] {
+    CAR_SETUP_DEFAULT
+}
+
+/// The part types each damage getter sums over (`physics.md` §10): 1 engine, 2 brakes,
+/// 3 gearbox, 4/5/8 suspension, 6 aero, 9 tyres.
+const WEAR_KINDS: [(&str, &[u16]); 6] =
+    [("engine", &[1]), ("brakes", &[2]), ("gearbox", &[3]), ("suspension", &[4, 5, 8]), ("aero", &[6]), ("tyres", &[9])];
+
+/// The scale and offset each part-damage getter applies (`PartWear`): over the car's installed
+/// parts of the group's types, `scale = Σ (1.5 − 0.005·condition)` and `offset = Σ state` — the
+/// damage those parts carry from earlier races. A group with nothing installed keeps the default
+/// (one standard part, scale 1.5). MEDIUM: the getter's formula is from `physics.md` §10, that the
+/// state accumulates race damage is the port's reading of what the save keeps.
+pub fn part_wear_for(tables: &CareerTables, owned: &OwnedCar) -> nfs_physics::specs::PartWearSet {
+    let mut out = nfs_physics::specs::PartWearSet::default();
+    for (group, kinds) in WEAR_KINDS {
+        let parts: Vec<&Part> = owned
+            .parts
+            .iter()
+            .filter_map(|id| tables.parts.iter().find(|p| p.id == *id))
+            .filter(|p| kinds.contains(&p.kind))
+            .collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let w = nfs_physics::specs::PartWear {
+            scale: parts.iter().map(|p| 1.5 - 0.005 * p.condition).sum(),
+            offset: parts.iter().map(|p| owned.part_state.iter().find(|(id, _)| *id == p.id).map(|(_, s)| *s).unwrap_or(p.state as f32)).sum(),
+        };
+        match group {
+            "engine" => out.engine = w,
+            "brakes" => out.brakes = w,
+            "gearbox" => out.gearbox = w,
+            "suspension" => out.suspension = w,
+            "aero" => out.aero = w,
+            _ => out.tyres = w,
+        }
+    }
+    out
 }
 
 /// Torque added by non-engine type-1 parts is scaled by this constant (`0x5B4A38`, CONFIRMED).
@@ -446,9 +553,97 @@ impl Career {
         };
         let d = owned.damage_pct;
         let pct_d = if d <= 5.0 { -1.0 } else if d <= 10.0 { -6.0 } else if d <= 15.0 { -11.0 } else if d <= 25.0 { -16.0 } else { -26.0 };
-        let parts: f64 = owned.parts.iter().filter_map(|id| tables.parts.iter().find(|p| p.id == *id)).map(|p| part_value(p, self.year)).sum();
+        let parts: f64 = owned
+            .parts
+            .iter()
+            .filter_map(|id| tables.parts.iter().find(|p| p.id == *id))
+            .map(|p| part_value(p, self.year, owned.part_state.iter().find(|(id, _)| *id == p.id).map(|(_, s)| *s).unwrap_or(p.state as f32)))
+            .sum();
         let value = base + base * pct_m / 100.0 + base * pct_d / 100.0 + base * owned.wins as f64 / 100.0 + parts;
         Some(value.max((0.05 * base).round()) as i64)
+    }
+
+    /// Put the damage a race left on the car away with it: the ten zones, their mean as the
+    /// car's damage figure, and the share each installed part takes — `(1.5 − 0.005·condition) ×
+    /// mean zone damage under its mask`, the term its getter contributes (`physics.md` §10). Parts
+    /// keep what they had, so damage accumulates until the car is repaired.
+    pub fn record_damage(&mut self, tables: &CareerTables, idx: usize, zones: [f32; 10]) {
+        let Some(owned) = self.garage.get(idx) else { return };
+        let ids = owned.parts.clone();
+        let mut add: Vec<(i16, f32)> = Vec::new();
+        for id in &ids {
+            let Some(p) = tables.parts.iter().find(|p| p.id == *id) else { continue };
+            let mask = p.zone_mask.map(|b| b != 0);
+            let n = mask.iter().filter(|b| **b).count();
+            if n == 0 {
+                continue;
+            }
+            let mean: f32 = zones.iter().zip(mask.iter()).filter(|(_, m)| **m).map(|(d, _)| *d).sum::<f32>() / n as f32;
+            add.push((*id, (1.5 - 0.005 * p.condition) * mean));
+        }
+        let Some(owned) = self.garage.get_mut(idx) else { return };
+        owned.damage = zones;
+        owned.damage_pct = zones.iter().sum::<f32>() / 10.0;
+        for (id, d) in add {
+            match owned.part_state.iter_mut().find(|(pid, _)| *pid == id) {
+                Some((_, s)) => *s += d,
+                None => owned.part_state.push((id, d)),
+            }
+        }
+    }
+
+    /// What the `QUICKFIX` screen charges to repair one part category (`RepairCost` 0x518880,
+    /// CONFIRMED): per installed part of that category, `aged price × (int)(2 × state) / 100`.
+    pub fn repair_cost(&self, tables: &CareerTables, idx: usize, kinds: &[u16]) -> i64 {
+        let Some(owned) = self.garage.get(idx) else { return 0 };
+        owned
+            .parts
+            .iter()
+            .filter_map(|id| tables.parts.iter().find(|p| p.id == *id))
+            .filter(|p| kinds.contains(&p.kind))
+            .map(|p| {
+                let state = owned.part_state.iter().find(|(id, _)| *id == p.id).map(|(_, s)| *s).unwrap_or(p.state as f32);
+                part_aged_price(p, self.year) * (2.0 * state) as i64 / 100
+            })
+            .sum()
+    }
+
+    /// Pay for and carry out that repair: the parts of those categories go back to no damage, and
+    /// so do the body zones they answer for.
+    pub fn repair(&mut self, tables: &CareerTables, idx: usize, kinds: &[u16]) -> Result<i64, CareerError> {
+        let cost = self.repair_cost(tables, idx, kinds);
+        if cost > self.money {
+            return Err(CareerError::NoMoney { need: cost, have: self.money });
+        }
+        let Some(owned) = self.garage.get(idx) else { return Err(CareerError::UnknownCar { id: 0 }) };
+        let ids: Vec<i16> = owned
+            .parts
+            .iter()
+            .filter(|id| tables.parts.iter().any(|p| p.id == **id && kinds.contains(&p.kind)))
+            .copied()
+            .collect();
+        let masks: Vec<[bool; 10]> = ids
+            .iter()
+            .filter_map(|id| tables.parts.iter().find(|p| p.id == *id))
+            .map(|p| p.zone_mask.map(|b| b != 0))
+            .collect();
+        let Some(owned) = self.garage.get_mut(idx) else { return Err(CareerError::UnknownCar { id: 0 }) };
+        for id in &ids {
+            match owned.part_state.iter_mut().find(|(pid, _)| pid == id) {
+                Some((_, s)) => *s = 0.0,
+                None => owned.part_state.push((*id, 0.0)),
+            }
+        }
+        for m in &masks {
+            for (z, on) in owned.damage.iter_mut().zip(m.iter()) {
+                if *on {
+                    *z = 0.0;
+                }
+            }
+        }
+        owned.damage_pct = owned.damage.iter().sum::<f32>() / 10.0;
+        self.money -= cost;
+        Ok(cost)
     }
 
     /// `SELLCAR` / `0x4F91C0(car, ask)`: list garage car `idx` on the used-car market at `ask`
@@ -565,9 +760,10 @@ impl Career {
     /// Enter `t` and return the event index to race. The fee is paid at the start of the first
     /// event of an attempt (0x4D58FB).
     pub fn enter(&mut self, tables: &CareerTables, t: &Tournament) -> Result<usize, CareerError> {
-        // club events of the reached eras stay open alongside the Evolution tournaments (HYPOTHESIS H28:
-        // the original gates them by game mode 0x657E24, whose writers were not traced)
-        let era_ok = if t.is_club() { t.era() <= self.era } else { t.era() == self.era };
+        // club events are not gated by career progress — the list accessor 0x504D00 filters them by
+        // the selected club era alone (H28, CONFIRMED) — while an Evolution tournament belongs to
+        // the era the player is up to
+        let era_ok = t.is_club() || t.era() == self.era;
         if self.availability(tables, t) != Availability::Open || !era_ok {
             return Err(CareerError::NotAvailable { id: t.id });
         }
@@ -763,9 +959,32 @@ fn mileage_score(age: u16, km: u32) -> i64 {
 
 /// Aged value of an installed part (`0x518220`): price × (1 + Σ yearly increments) × condition.
 /// The yearly increment table `0x5BA4A4` was not transcribed — 0 % per year is used (MEDIUM).
-fn part_value(p: &Part, _year: u16) -> f64 {
-    let condition = ((2.0 * p.state as f64 + 20.0).round()).clamp(0.0, 100.0) / 100.0;
-    p.price as f64 * condition
+/// Per-year appreciation of a part, in per cent — the 62-entry table at **0x5BA4A4** in the
+/// shipped `nfs5.exe`, summed over the part's age (0x518880 / 0x518900). CONFIRMED (data).
+pub const PART_AGE_PCT: [u32; 62] = [
+    1, 2, 2, 2, 2, 3, 4, 5, 4, 5, 6, 7, 8, 12, 4, 5, 4, 2, 3, 2, 3, 4, 3, 5, 6, 7, 2, 4, 5, 8, 9, 2, 5, 4, 6, 3, 7, 4, 7, 6, 6, 4, 7,
+    3, 6, 8, 3, 4, 5, 2, 4, 3, 4, 2, 5, 2, 1, 3, 7, 5, 4, 3,
+];
+
+/// `price + price·Σ PART_AGE_PCT[0..age] / 100` — what a part is worth before its condition is
+/// taken off (0x518900, first half). CONFIRMED.
+pub fn part_aged_price(p: &Part, year: u16) -> i64 {
+    let age = (year as i64 - p.year as i64).max(0) as usize;
+    let sum: u32 = PART_AGE_PCT.iter().take(age).sum();
+    let price = p.price as i64;
+    price + price * sum as i64 / 100
+}
+
+/// `PartValue` 0x518900 (CONFIRMED): `price + price·sum/100 − (100 − c)·aged/100` with
+/// `c = clamp((int)(2·state + 20), 0, 100)`, floored at 0 — so a brand-new part (state 0, age 0) is
+/// worth a fifth of its price, and age lifts that slowly.
+fn part_value(p: &Part, year: u16, state: f32) -> f64 {
+    let aged = part_aged_price(p, year);
+    let c = ((2.0 * state + 20.0) as i64).clamp(0, 100);
+    let price = p.price as i64;
+    let sum: u32 = PART_AGE_PCT.iter().take((year as i64 - p.year as i64).max(0) as usize).sum();
+    let v = price * sum as i64 / 100 - (100 - c) * aged / 100 + price;
+    v.max(0) as f64
 }
 
 /// Standings `0x503660` / sort `0x502880`: points desc, money earned desc, total time asc; time-ranked
@@ -928,12 +1147,80 @@ mod tests {
     #[test]
     fn save_roundtrip() {
         let mut c = Career::default();
-        c.garage.push(OwnedCar { car_id: 76, paint_set: 2, parts: vec![13], mileage: 3000, wins: 1, damage_pct: 0.0, purchase_price: 11_000, asking_price: Some(9_000), offer: None });
+        c.garage.push(OwnedCar { car_id: 76, paint_set: 2, parts: vec![13], mileage: 3000, wins: 1, damage_pct: 0.0, damage: [0.0; 10], part_state: Vec::new(), setup: CAR_SETUP_DEFAULT, purchase_price: 11_000, asking_price: Some(9_000), offer: None });
         c.tournaments.insert(9, TournamentState { entered: true, ..Default::default() });
         let dir = std::env::temp_dir().join(format!("nfs-career-{}", std::process::id()));
         let path = dir.join("career.json");
         c.save(&path).unwrap();
         assert_eq!(Career::load(&path).unwrap(), c);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_knockout_draw_is_without_replacement_and_era_filtered() {
+        let per = |id: i16, era: u32| Personality { id, name_string_id: 0, era, skill: [[1.0, 0.0]; 4] };
+        let table = vec![per(1, 0), per(2, 0), per(3, 1), per(4, 1), per(5, 2)];
+        // era 1 has two drivers; asking for three yields both and stops
+        let ids = pick_personalities(&table, Some(1), 3, |_| 0);
+        assert_eq!(ids, [3, 4]);
+        // no repeats whatever the draw says
+        let mut n = 0;
+        let ids = pick_personalities(&table, None, 5, |len| {
+            n += 1;
+            (n - 1) % len
+        });
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "{ids:?}");
+        assert_eq!(ids.len(), 5);
+        // era = None takes the whole table
+        assert_eq!(pick_personalities(&table, None, 1, |_| 4), [5]);
+    }
+
+
+    /// The damage a race leaves, what it costs to put right, and what the part is worth meanwhile
+    /// (`RE/notes/physics.md` §10, `PartValue` 0x518900 / `RepairCost` 0x518880).
+    #[test]
+    fn damage_wears_the_parts_and_repair_clears_it() {
+        let Ok(paths) = nfs_assets::GamePaths::locate() else {
+            eprintln!("skipping: no game data");
+            return;
+        };
+        let Ok(tables) = CareerTables::load(&paths) else { return };
+        let mut c = Career::default();
+        c.money = 200_000;
+        let car = tables.catalog.iter().find(|c| c.price > 0).unwrap().clone();
+        c.buy_car(&tables, car.id, 0).unwrap();
+        let part = tables.parts.iter().find(|p| p.family == part_family(&car).unwrap_or_default() && p.kind == 1).cloned();
+        let Some(part) = part else { return };
+        c.buy_part(&tables, 0, part.id).unwrap();
+        assert_eq!(c.repair_cost(&tables, 0, &[1]), 0, "a fresh part needs nothing");
+
+        // the car comes back with its rear zones beaten in
+        let mut zones = [0.0f32; 10];
+        for z in zones.iter_mut() {
+            *z = 60.0;
+        }
+        c.record_damage(&tables, 0, zones);
+        assert_eq!(c.garage[0].damage_pct, 60.0);
+        let state = c.garage[0].part_state.iter().find(|(id, _)| *id == part.id).map(|(_, s)| *s).unwrap();
+        assert!((state - (1.5 - 0.005 * part.condition) * 60.0).abs() < 0.01, "{state}");
+
+        // the getter's scale and offset follow the parts on the car
+        let w = part_wear_for(&tables, &c.garage[0]);
+        assert!((w.engine.offset - state).abs() < 0.01);
+        assert!((w.engine.scale - (1.5 - 0.005 * part.condition)).abs() < 0.01);
+
+        // repairing costs the aged price times twice the damage, and clears both
+        let cost = c.repair_cost(&tables, 0, &[1]);
+        let expect = part_aged_price(&part, c.year) * (2.0 * state) as i64 / 100;
+        assert_eq!(cost, expect);
+        assert!(cost > 0);
+        let money = c.money;
+        assert_eq!(c.repair(&tables, 0, &[1]).unwrap(), cost);
+        assert_eq!(c.money, money - cost);
+        assert_eq!(c.repair_cost(&tables, 0, &[1]), 0);
+        assert_eq!(part_wear_for(&tables, &c.garage[0]).engine.offset, 0.0);
     }
 }
