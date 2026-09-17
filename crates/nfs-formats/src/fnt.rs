@@ -7,7 +7,14 @@
 //! +4   u32 file size
 //! +8   u16 101 (unknown, constant), u16 glyph count, u16, u16, u16, u16 flags, u32 0x20 = glyph table offset,
 //! +24  u32 0, u32 atlas offset
-//! +32  glyph records, 11 bytes: { u16 char, u8 width, u8 height, u16 x, u16 y, u8 advance, u8 y_offset, u8 flags }
+//! +32  glyph records, 11 bytes: { u16 char, u8 width, u8 height, u16 x, u16 y, i8 advance, i8 offset_x, i8 offset_y }
+//!
+//! The last three fields are **signed** and are pure geometry: the quad builder 0x53DC53…0x53DCBC
+//! reads `[rec+9]` and multiplies it by the font's X scale, `[rec+0xA]` by the Y scale, and passes
+//! both as the glyph's offset from the pen; `[rec+8]` is then added to the pen's X (0x53DCD4).
+//! CONFIRMED — and it explains the shipped data exactly: in `Univers8b.ffn` `'A'` is 9×9 at
+//! offset (1, 1), `'m'` 10×7 at (1, 3) — the same baseline — `'o'` 8 tall at (1, 3) overshooting it
+//! by one, `'g'` 10 tall at (1, 3) descending three below, and `','` 4 tall at (1, 7).
 //! atlas: 16-byte block header { u8 0x7A, u24 0, u16 width, u16 height, 8×0 } then 4 bpp intensity/alpha,
 //!        high nibble first, row-major (width × height / 2 bytes)
 //! ```
@@ -21,9 +28,12 @@ pub struct Glyph {
     pub height: u8,
     pub x: u16,
     pub y: u16,
-    pub advance: u8,
-    pub y_offset: u8,
-    pub flags: u8,
+    /// Pen advance in texels (signed).
+    pub advance: i8,
+    /// Left bearing: the quad's X offset from the pen.
+    pub offset_x: i8,
+    /// The quad's Y offset from the line's top — this is what puts descenders below the baseline.
+    pub offset_y: i8,
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +59,7 @@ impl Font {
         for i in 0..count {
             let o = table + i * 11;
             let r = data.get(o..o + 11).ok_or(FormatError::Truncated { what: "FNTF glyph", offset: o, needed: 11 })?;
-            glyphs.push(Glyph { ch: u16::from_le_bytes([r[0], r[1]]), width: r[2], height: r[3], x: u16::from_le_bytes([r[4], r[5]]), y: u16::from_le_bytes([r[6], r[7]]), advance: r[8], y_offset: r[9], flags: r[10] });
+            glyphs.push(Glyph { ch: u16::from_le_bytes([r[0], r[1]]), width: r[2], height: r[3], x: u16::from_le_bytes([r[4], r[5]]), y: u16::from_le_bytes([r[6], r[7]]), advance: r[8] as i8, offset_x: r[9] as i8, offset_y: r[10] as i8 });
         }
         let code = *data.get(atlas_off).ok_or(FormatError::Truncated { what: "FNTF atlas", offset: atlas_off, needed: 16 })?;
         if code != 0x7A {

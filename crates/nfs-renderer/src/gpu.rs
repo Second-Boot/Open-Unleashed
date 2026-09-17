@@ -79,7 +79,8 @@ pub struct Renderer {
     sprite_buf: wgpu::Buffer,
 }
 
-const MAX_SPRITES: u64 = 512;
+/// The front-end screens draw a few thousand quads (every gouraud box is a grid of them).
+const MAX_SPRITES: u64 = 8192;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const MAX_OBJECTS: u64 = 8192;
@@ -546,6 +547,9 @@ impl Renderer {
             }
             // HUD sprites
             let n_sprites = scene.sprites.len().min(MAX_SPRITES as usize);
+            if scene.sprites.len() > n_sprites {
+                tracing::warn!(wanted = scene.sprites.len(), drawn = n_sprites, "sprite buffer full");
+            }
             if n_sprites > 0 {
                 let mut verts: Vec<SpriteVertex> = Vec::with_capacity(n_sprites * 6);
                 for sp in scene.sprites.iter().take(n_sprites) {

@@ -19,8 +19,16 @@ struct Voice {
     pos: f64,
     pitch: f32,
     volume: f32,
+    /// −1 = hard left, 0 = centre, +1 = hard right (equal power)
+    pan: f32,
     looping: bool,
     finished: bool,
+}
+
+/// Equal-power stereo gains for a pan in −1..1.
+fn pan_gains(pan: f32) -> [f32; 2] {
+    let a = (pan.clamp(-1.0, 1.0) + 1.0) * (std::f32::consts::FRAC_PI_4);
+    [a.cos(), a.sin()]
 }
 
 #[derive(Default)]
@@ -76,11 +84,12 @@ impl AudioOutput {
                         let i = v.pos as usize;
                         let f = (v.pos - i as f64) as f32;
                         let j = if i + 1 < hi { i + 1 } else if v.looping { lo } else { i };
+                        let g = pan_gains(v.pan);
                         for (ch, o) in frame.iter_mut().enumerate() {
                             let sc = ch.min(cc - 1);
                             let a = c.samples[i * cc + sc] as f32;
                             let b = c.samples[j * cc + sc] as f32;
-                            *o += (a + (b - a) * f) / 32768.0 * v.volume;
+                            *o += (a + (b - a) * f) / 32768.0 * v.volume * g[ch.min(1)];
                         }
                         v.pos += step;
                     }
@@ -128,8 +137,31 @@ impl AudioOutput {
         let mut g = self.shared.lock().unwrap();
         let id = VoiceId(g.next_id);
         g.next_id += 1;
-        g.voices.push((id, Voice { clip, pos: 0.0, pitch, volume, looping, finished: false }));
+        g.voices.push((id, Voice { clip, pos: 0.0, pitch, volume, pan: 0.0, looping, finished: false }));
         id
+    }
+
+    /// `play` with a stereo position (−1..1).
+    pub fn play_panned(&self, clip: Arc<Clip>, volume: f32, pitch: f32, pan: f32, looping: bool) -> VoiceId {
+        let id = self.play(clip, volume, pitch, looping);
+        self.set_pan(id, pan);
+        id
+    }
+
+    pub fn set_pan(&self, id: VoiceId, pan: f32) {
+        let mut g = self.shared.lock().unwrap();
+        if let Some((_, v)) = g.voices.iter_mut().find(|(i, _)| *i == id) {
+            v.pan = pan.clamp(-1.0, 1.0);
+        }
+    }
+
+    /// Fraction of the clip already played (0..1), or None when the voice is gone.
+    pub fn progress(&self, id: VoiceId) -> Option<f32> {
+        let g = self.shared.lock().unwrap();
+        g.voices.iter().find(|(i, _)| *i == id).map(|(_, v)| {
+            let n = (v.clip.samples.len() / v.clip.channels.max(1) as usize).max(1) as f64;
+            (v.pos / n).clamp(0.0, 1.0) as f32
+        })
     }
 
     pub fn set(&self, id: VoiceId, volume: f32, pitch: f32) {

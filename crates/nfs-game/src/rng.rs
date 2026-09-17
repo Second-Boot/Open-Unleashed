@@ -1,0 +1,65 @@
+//! The original's global random number generator (`Rand_seed` 0x4A4780, drawn inline at every call
+//! site, `RE/notes/traffic.md` §14.7).
+//!
+//! A 16-bit multiplicative LCG: `state = (state · 123456789) mod 2^16`, with the draw taken from bits
+//! 8..23 of the full 32-bit product. It is **one shared stream** — the AI's branch choice, the traffic
+//! spawner and everything else pull from the same state, which is why reproducing a race means seeding
+//! it once and then not touching it out of order.
+
+use std::sync::Mutex;
+
+pub const MUL: u32 = 123_456_789;
+
+static STATE: Mutex<u32> = Mutex::new(0x3ADE_68B1);
+
+/// `Rand_seed(seed)` — `seed mod 500` warm-up steps from 0x3ADE68B1.
+pub fn seed(seed: u32) {
+    let mut s = 0x3ADE_68B1u32;
+    for _ in 0..(seed % 500) {
+        s = s.wrapping_mul(MUL) & 0xFFFF;
+    }
+    *STATE.lock().unwrap() = s;
+}
+
+/// One 16-bit draw.
+pub fn rand16() -> u32 {
+    let mut g = STATE.lock().unwrap();
+    let prod = g.wrapping_mul(MUL);
+    *g = prod & 0xFFFF;
+    (prod >> 8) & 0xFFFF
+}
+
+/// `rand16 · 1/65536` — the `[0, 1)` the branch choice compares its thresholds against.
+pub fn rand01() -> f32 {
+    rand16() as f32 * 1.525_878_9e-5
+}
+
+/// `(rand16 · n) >> 16` — the original's "random below n".
+pub fn below(n: u32) -> u32 {
+    (rand16() * n) >> 16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_stream_is_the_originals_and_is_shared() {
+        seed(0);
+        let a: Vec<u32> = (0..4).map(|_| rand16()).collect();
+        // the first draws from the shipped initial state
+        assert_eq!(a[0], 65363);
+        assert_eq!(a[1], 12122);
+        // seeding again rewinds it
+        seed(0);
+        assert_eq!(rand16(), 65363);
+        // and a warm-up moves it on
+        seed(3);
+        assert_ne!(rand16(), 65363);
+        // rand01 stays inside [0, 1)
+        for _ in 0..100 {
+            let r = rand01();
+            assert!((0.0..1.0).contains(&r), "{r}");
+        }
+    }
+}

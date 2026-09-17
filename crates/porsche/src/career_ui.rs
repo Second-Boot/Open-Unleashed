@@ -7,6 +7,7 @@ use nfs_assets::GamePaths;
 use nfs_formats::career::{ConeRule, Mission, Part, Tournament};
 use nfs_formats::fedata::CarCatalogEntry;
 use nfs_game::career::{Availability, Career, CareerError, CareerTables};
+use nfs_game::save::Profile;
 use nfs_game::text::BitmapFont;
 use nfs_renderer::Sprite;
 use std::path::PathBuf;
@@ -38,7 +39,15 @@ pub struct StartRequest {
     pub parts: Vec<Part>,
     /// Factory Driver mission (skill test or plain race).
     pub mission: Option<MissionStart>,
+    /// `Game.Difficulty` 0..2 — the `SKILL` the AI catch-up band is keyed on
+    pub skill: u8,
+    /// Number of traffic cars the race is set up with (`traffic.md` §1: the level indexes
+    /// `{0, 2, 4, 8}` for tournament events and factory-driver missions).
+    pub traffic: u32,
 }
+
+/// `[0x5DB438]` / `[0x5DB448]` — traffic level → number of cars for career events (`traffic.md` §1).
+pub const CAREER_TRAFFIC: [u32; 4] = [0, 2, 4, 8];
 
 #[derive(Debug, Clone)]
 pub struct MissionStart {
@@ -86,24 +95,43 @@ pub struct CareerUi {
     pub factory: bool,
     pub message: String,
     pub pending: Option<PendingEvent>,
+    /// The profile the career belongs to: `SaveData/<digit><Name>.sav` (`RE/notes/savegame.md` §2).
+    pub profile: Profile,
+    pub save_dir: PathBuf,
 }
 
 impl CareerUi {
     pub fn load(paths: &GamePaths) -> Result<Self, CareerError> {
         let tables = CareerTables::load(paths)?;
         let save_path = std::env::var_os("NFS5_CAREER_SAVE").map(PathBuf::from).unwrap_or_else(Career::default_save_path);
+        // The profile is the one `player.lst` last selected, as `RebuildUserList` 0x4DEF60 does.
+        let dir = nfs_game::save::save_dir();
+        let profile = std::env::var("NFS5_PROFILE")
+            .ok()
+            .map(|n| Profile::new(n, nfs_game::save::DEFAULT_PICTURE))
+            .or_else(|| nfs_game::save::read_player_lst(&dir).and_then(|s| Profile::from_stem(&s)))
+            .or_else(|| nfs_game::save::list_profiles(&dir).into_iter().next())
+            .unwrap_or_else(|| Profile::new("DRIVER", nfs_game::save::DEFAULT_PICTURE));
         let career = match Career::load(&save_path) {
             Ok(c) => {
                 tracing::info!(path = %save_path.display(), era = ?c.era, money = c.money, cars = c.garage.len(), "career loaded");
                 c
             }
-            Err(CareerError::Io { .. }) => Career::default(),
+            // No JSON yet: fall back to the original-format save for this profile if one exists.
+            Err(CareerError::Io { .. }) => match std::fs::read(profile.path(&dir)).ok().and_then(|d| nfs_formats::sav::SaveFile::parse(&d).ok()) {
+                Some(s) => {
+                    let c = nfs_game::save::career_from_sav(&s, &tables);
+                    tracing::info!(path = %profile.path(&dir).display(), money = c.money, cars = c.garage.len(), "career imported from the original .sav");
+                    c
+                }
+                None => Career::default(),
+            },
             Err(e) => {
                 tracing::warn!(error = %e, "career save unreadable, starting a new one");
                 Career::default()
             }
         };
-        Ok(Self { tables, career, save_path, t_idx: 0, car_sel: 0, row: 0, part_sel: 0, club: false, factory: false, message: String::new(), pending: None })
+        Ok(Self { tables, career, save_path, save_dir: dir, profile, t_idx: 0, car_sel: 0, row: 0, part_sel: 0, club: false, factory: false, message: String::new(), pending: None })
     }
 
     pub fn tournaments(&self) -> Vec<&Tournament> {
@@ -183,6 +211,8 @@ impl CareerUi {
             opponents,
             parts,
             mission: Some(MissionStart { index: idx, mission: m.clone(), scene_suffix, narrator: self.narrator_name(m.narrator) }),
+            traffic: CAREER_TRAFFIC[(m.traffic_level.max(0) as usize).min(3)],
+            skill: m.skill.clamp(0, 2) as u8,
         })
     }
 
@@ -276,15 +306,34 @@ impl CareerUi {
             self.save();
             return;
         }
+        // used-car market (career.md §10.5): list the car, withdraw it, or accept a standing offer.
+        // The original asks for the asking price in an entry box; this port lists at the car's current
+        // value (UI choice — the offer rules themselves are the original's).
         if self.row == 1 && let Some(i) = self.selected_garage() {
             let name = self.tables.car(self.career.garage[i].car_id).map(|c| c.display_name.to_uppercase()).unwrap_or_default();
-            match self.career.sell_car(&self.tables, i) {
-                Ok(v) => {
-                    self.message = format!("SOLD {name} FOR ${v}");
-                    self.car_sel = 0;
-                    self.save();
+            let car = &self.career.garage[i];
+            if car.offer.is_some() {
+                match self.career.accept_offer(i) {
+                    Ok(v) => {
+                        self.message = format!("SOLD {name} FOR ${v}");
+                        self.car_sel = 0;
+                        self.save();
+                    }
+                    Err(e) => self.message = e.to_string().to_uppercase(),
                 }
-                Err(e) => self.message = e.to_string().to_uppercase(),
+            } else if car.asking_price.is_some() {
+                self.career.withdraw_from_sale(i);
+                self.message = format!("{name} TAKEN OFF THE MARKET");
+                self.save();
+            } else {
+                let ask = self.career.car_value(&self.tables, i).unwrap_or(0).max(0) as u32;
+                match self.career.list_for_sale(i, ask) {
+                    Ok(()) => {
+                        self.message = format!("{name} LISTED AT ${ask}   (OFFERS COME IN AFTER A RACE)");
+                        self.save();
+                    }
+                    Err(e) => self.message = e.to_string().to_uppercase(),
+                }
             }
         }
     }
@@ -329,6 +378,12 @@ impl CareerUi {
         if let Err(e) = self.career.save(&self.save_path) {
             tracing::error!(error = %e, "career save failed");
             self.message = format!("SAVE FAILED: {e}");
+        }
+        // …and the same career in the original's format, so `SaveData/` matches what the game
+        // itself would leave behind (`RE/notes/savegame.md` §3; the accessor block is omitted).
+        let sav = nfs_game::save::career_to_sav(&self.career, &self.tables, &self.profile);
+        if let Err(e) = nfs_game::save::write_profile(&self.save_dir, &self.profile, &sav) {
+            tracing::warn!(error = %e, "writing the .sav profile failed");
         }
     }
 
@@ -415,7 +470,7 @@ impl CareerUi {
                     tracing::warn!(track = track.file, "event is driven backwards in the original; running forward (not implemented)");
                 }
                 tracing::info!(tournament = t.id, event, finale = finale.is_some(), track = track.file, laps = ev.laps, car = car.model, opponents = opponents.len(), parts = parts.len(), "career event start");
-                Some(StartRequest { track_file: track.file.clone(), car, paint, laps: ev.laps.max(1) as u32, backwards: ev.backwards, opponents, parts, mission: None })
+                Some(StartRequest { track_file: track.file.clone(), car, paint, laps: ev.laps.max(1) as u32, backwards: ev.backwards, opponents, parts, mission: None, traffic: CAREER_TRAFFIC[(t.traffic_level as usize).min(3)], skill: t.difficulty_level.min(2) as u8 })
             }
             None => {
                 self.message = "NO CAR AVAILABLE".into();
@@ -462,6 +517,15 @@ impl CareerUi {
         }
         let Some(t) = self.tables.tournament(p.tournament).cloned() else { return };
         let o = self.career.record_event(&self.tables, &t, p.event, order, times, p.garage_idx);
+        // used-car offers are refreshed after every career race (0x4F7DB0)
+        let mut seed = (o.result.position as u32).wrapping_mul(2_654_435_761) ^ (times[0] as u32).wrapping_mul(40_503) ^ 0x9E37_79B9;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed >> 8
+        };
+        self.career.generate_offers(&self.tables, &mut rand);
         let mut msg = format!("RESULT: P{}  PRIZE ${}", o.result.position, o.result.prize);
         if o.result.bonus > 0 {
             msg += &format!("  BONUS ${}", o.result.bonus);
@@ -531,7 +595,16 @@ impl CareerUi {
         }
         let choices = self.car_choices();
         let car_line = match choices.get(self.car_sel.min(choices.len().saturating_sub(1))) {
-            Some(CarChoice::Owned(i, id)) => format!("CAR  < {} >  (GARAGE, VALUE ${}, BACKSPACE = SELL)", self.tables.car(*id).map(|c| c.display_name.to_uppercase()).unwrap_or_default(), self.career.car_value(&self.tables, *i).unwrap_or(0)),
+            Some(CarChoice::Owned(i, id)) => {
+                let name = self.tables.car(*id).map(|c| c.display_name.to_uppercase()).unwrap_or_default();
+                let value = self.career.car_value(&self.tables, *i).unwrap_or(0);
+                let car = &self.career.garage[*i];
+                match (car.offer, car.asking_price) {
+                    (Some(o), _) => format!("CAR  < {name} >  OFFER ${o}  (BACKSPACE = ACCEPT)"),
+                    (None, Some(a)) => format!("CAR  < {name} >  LISTED AT ${a}  (BACKSPACE = WITHDRAW)"),
+                    (None, None) => format!("CAR  < {name} >  (GARAGE, VALUE ${value}, BACKSPACE = SELL)"),
+                }
+            }
             Some(CarChoice::Buy(id, price)) => format!("BUY  < {} >  ${}", self.tables.car(*id).map(|c| c.display_name.to_uppercase()).unwrap_or_default(), price),
             Some(CarChoice::Loaned(id)) => format!("CAR  < {} >  (LOANED FOR THE FINALE)", self.tables.car(*id).map(|c| c.display_name.to_uppercase()).unwrap_or_default()),
             None => "NO ELIGIBLE CAR".to_string(),

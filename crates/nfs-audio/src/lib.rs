@@ -7,6 +7,8 @@
 //! current bin / window centre bin, with bin = rpm / 20 (HYPOTHESIS: 512 bins ≈ 0..10240 rpm,
 //! which places the top window 271..511 at 5.4–10.2 krpm). Not the original DirectSound path.
 
+pub mod ai_engine;
+pub mod ambience;
 pub mod engine;
 pub mod mixer;
 pub mod music;

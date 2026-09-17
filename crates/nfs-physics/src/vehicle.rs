@@ -59,6 +59,11 @@ pub struct Wheel {
     pub height_d: f32,
     pub airborne: bool,
     pub compression: f32,
+    /// `Roughness` 0x499730 state: previous / target offset and the distance phase
+    /// (`wheel+0x74 / +0x78 / +0x7C`).
+    pub rough_prev: f32,
+    pub rough_target: f32,
+    pub rough_phase: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +113,9 @@ pub struct Vehicle {
     pub damage_pull: f32,
     /// Material class of the last wall touched (`[0x628C88]` word → class, see `walls::wall_class`).
     pub last_wall_class: u8,
+    /// `Damage` 0x494500: a corner / roof zone crossed 30 this tick → play the crash one-shot
+    /// (`RE/notes/suspension-collision.md` §6.5, `sfx.md` §4.3). Cleared by the caller.
+    pub crash_sound: bool,
     pub wheels: [Wheel; 4],
     pub accel_local: Vec3,
     pub lateral_filtered: f32,
@@ -128,6 +136,7 @@ pub struct Vehicle {
     pub half_extents: Vec3,
     /// last wall impulse magnitude (car+0x430)
     pub impact: f32,
+    /// LCG state (the original's `0x5D1028 × 0x5D102C`) for road roughness and the engine's noise.
     rng: u32,
 }
 
@@ -166,6 +175,7 @@ impl Vehicle {
             damage_enabled: true,
             damage_pull: 0.0,
             last_wall_class: 5,
+            crash_sound: false,
             wheels: [Wheel::default(); 4],
             accel_local: Vec3::ZERO,
             lateral_filtered: 0.0,
@@ -475,6 +485,10 @@ impl Vehicle {
             return;
         }
         let a = (amount * 0.5).min(100.0);
+        // crash sound for the corner / roof zones when the damage crosses 30
+        if matches!(zone, 0 | 2 | 4 | 6 | 8) && a > 30.0 && self.damage[zone] < 30.0 {
+            self.crash_sound = true;
+        }
         self.damage[zone] = self.damage[zone].max(a);
         if zone <= 7 {
             for j in [(zone + 7) % 8, (zone + 1) % 8] {
@@ -615,6 +629,107 @@ impl Vehicle {
         }
     }
 
+    /// `Roughness` 0x499730 (car, i) — per-wheel random road-height offset, CONFIRMED:
+    /// amplitude and period by surface type, a new target drawn every `period` metres of travel and
+    /// interpolated linearly in between. Returns 0 while the car is tilted (`cosTilt < 0.86`).
+    fn roughness(&mut self, i: usize, speed_est: f32) -> f32 {
+        if self.cos_tilt < 0.86 {
+            return 0.0;
+        }
+        let (amp, period) = match self.wheels[i].surface & 0xF {
+            3 | 5 | 9 => (0.1, 2.5),
+            2 | 7 => (0.03, 0.25),
+            4 | 10 => (0.03, 0.5),
+            _ => (0.0, 0.5),
+        };
+        let w = &mut self.wheels[i];
+        w.rough_phase += speed_est / 32.0;
+        // 0x4997E4..0x49980B: a new target is drawn when the phase has run past the period, and also
+        // on every tick of a smooth surface (amp < 0.01) — which keeps `prev`/`target` at ~0 there, so
+        // a wheel leaving a rough patch does not carry a stale offset.
+        if w.rough_phase >= period || amp < 0.01 {
+            w.rough_phase = 0.0;
+            w.rough_prev = w.rough_target;
+            let r01 = self.rand01();
+            let w = &mut self.wheels[i];
+            w.rough_target = amp * (1.0 / 6.0 - r01);
+        }
+        let w = &self.wheels[i];
+        w.rough_prev + (w.rough_target - w.rough_prev) * (w.rough_phase / period)
+    }
+
+    /// `BodyGroundCollide` 0x496610 + `GroundImpulse` 0x495F30 (`RE/notes/suspension-collision.md`
+    /// §6.3, HIGH): body corners below the contact plane take a normal impulse with surface friction
+    /// `k`. `invM = 1/mass`, `invI = 1/(6·mass)` (`Car_physInit` 0x49B510, CONFIRMED). The stored
+    /// angular velocity is in turns/s and is converted to rad/s the way the original does.
+    /// `car+0x428` (mean of the three lowest body points) is approximated by `body_height` (MEDIUM).
+    fn body_ground_collide(&mut self, specs: &CarSpecs, n: Vec3, plane_pt: Vec3, k: f32) {
+        let m = self.orientation;
+        let (hw, hh, hl) = (self.half_extents.x, self.half_extents.y, self.half_extents.z);
+        let (bx, by, bz) = (m.row(0), m.row(1), m.row(2));
+        let (mut count, mut depth, mut centroid) = (0u32, 0.0f32, Vec3::ZERO);
+        for sz in [-1.0, 1.0] {
+            for sx in [-1.0, 1.0] {
+                for sy in [-1.0, 1.0] {
+                    let p = self.position + by * (sy * hh) + bz * (sz * hl) + bx * (sx * hw);
+                    let d = (p - plane_pt).dot(n);
+                    if d < 0.01 {
+                        count += 1;
+                        centroid += p;
+                        depth = depth.min(d);
+                    }
+                }
+            }
+        }
+        if count == 0 {
+            return;
+        }
+        let c = centroid / count as f32;
+        let inv_m = 1.0 / specs.mass.max(1.0);
+        let inv_i = 1.0 / (6.0 * specs.mass.max(1.0));
+        let mut w = self.angular_velocity * TAU; // rad/s
+        let r = c - self.position;
+        let v_c = self.velocity + w.cross(r);
+        let vrel = v_c.dot(n);
+        // GroundImpulse 0x495F30
+        let denom = 0.25 * inv_m + inv_i * r.cross(n).length();
+        let mut j = if denom > 1e-6 { -vrel / denom } else { 0.0 };
+        let min_extent = hw.min(hh).min(hl);
+        j *= if min_extent > 1.5 { 0.6 / min_extent } else { 0.4 };
+        self.impact = self.impact.max(self.velocity.dot(n).abs());
+        if k > 0.0 {
+            // friction along the contact plane, limited so it cannot reverse the tangential motion
+            let tang = v_c - n * vrel;
+            if tang.length_squared() > 1e-8 {
+                let t = -tang.normalize();
+                let jf = (k * j).min(tang.length() / (0.5 * inv_m).max(1e-6));
+                self.velocity += t * (jf * 0.5 * inv_m);
+                w += r.cross(t) * (jf * 2.0 * inv_i);
+            }
+        }
+        if k < 0.001 {
+            self.velocity *= 0.9;
+            w *= 0.9;
+        } else {
+            self.velocity += n * (j * 0.5 * inv_m);
+            w += r.cross(n * j) * (2.0 * inv_i);
+            // settle a car resting on its body
+            if (self.cos_tilt < 0.2 || min_extent < 0.0) && self.body_height < 0.005 && vrel.abs() < 10.0 && w.abs().max_element() < 1.0 {
+                w *= 0.75;
+                self.velocity *= 0.95;
+            }
+        }
+        let lift = (-depth).max(0.0);
+        self.position += n * lift;
+        for wh in &mut self.wheels {
+            wh.world_pos += n * lift;
+        }
+        // ClampAngVel 0x4964D0: each component to ±0.75 turns/s for a normal car
+        self.angular_velocity = (w / TAU).clamp(Vec3::splat(-0.75), Vec3::splat(0.75));
+        let effect = 4.0 * self.velocity.dot(n).abs();
+        self.damage_by_normal(effect, n);
+    }
+
     /// `Susp_update` 0x499A70 + `Car_ground` 0x49BD40 (CONFIRMED, `RE/notes/suspension-collision.md` §3–4).
     /// Wheel reference points (tyre bottoms) probe the ground; pitch/roll rates are driven by the
     /// front/rear and left/right contact height differences; the body follows the contact plane.
@@ -633,17 +748,20 @@ impl Vehicle {
             let world_pt = self.position + mt * Vec3::new(off.x, off.y - self.ride_height, off.z);
             let probe = world_pt + Vec3::new(0.0, specs.probe_offset * up.y, 0.0);
             let hit = grid.ground(probe.x, probe.y + 4.0, probe.z, 8.0 + 4.0);
-            let w = &mut self.wheels[i];
             let h_i = match hit {
                 Some(h) if h.surface & 0xF != 0 && (h.point.y - self.position.y).abs() < 4.0 => {
-                    w.surface = (h.surface as usize) & 0xF;
+                    self.wheels[i].surface = (h.surface as usize) & 0xF;
                     h.point.y
                 }
-                _ => {
-                    // fallback plane: last known ground height (the original uses the car tracker's plane)
-                    self.ground_h + (probe.y - self.position.y) * 0.0
-                }
+                _ => self.ground_h,
             };
+            // road roughness (0x499730), added to the probed ground height
+            let speed_est = {
+                let (a, b) = (self.v_local.x.abs(), self.v_local.z.abs());
+                a.max(b) + 0.25 * a.min(b)
+            };
+            let h_i = h_i + self.roughness(i, speed_est);
+            let w = &mut self.wheels[i];
             heights[i] = h_i;
             contacts[i] = Vec3::new(probe.x, h_i, probe.z);
             w.world_pos = Vec3::new(probe.x, h_i + self.ride_height, probe.z);
@@ -742,16 +860,10 @@ impl Vehicle {
                 self.height_marker = 0.0;
                 self.velocity.y = if self.velocity.y <= 0.0 || dh <= 0.0 { dh } else { self.velocity.y.max(dh) };
             }
-        } else {
-            if self.body_height < 0.001 {
-                self.position.y -= self.body_height.min(0.0);
-                self.velocity.x *= 0.95;
-                self.velocity.z *= 0.95;
-                self.angular_velocity *= 0.95;
-            }
-            if self.cos_tilt < 0.707 && closing < -2.0 {
-                self.velocity.y -= SURFACE_BOUNCE[surf][1] * closing;
-            }
+        } else if self.body_height < 0.01 {
+            // tilted car with the body on the ground: the impulse of §6.3 instead of plain damping
+            let plane_pt = Vec3::new(self.position.x, h, self.position.z);
+            self.body_ground_collide(specs, self.ground_normal, plane_pt, SURFACE_BOUNCE[surf][0]);
         }
         let n = self.ground_normal;
         let mut z = self.orientation.row(2);
@@ -1129,28 +1241,47 @@ pub fn collide_cars(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32) 
         }
     }
     let (depth, n) = best?;
-    let inv_a = 1.0 / mass_a.max(1.0);
-    let inv_b = 1.0 / mass_b.max(1.0);
-    let vrel = (a.velocity - b.velocity).dot(n);
+    // `CarCarImpulse` 0x496860 (`RE/notes/traffic.md` §21.6), symmetric and with no special case for
+    // traffic. The contact point the original gets from its SAT is not recovered, so the midpoint of
+    // the two centres stands in for it (APPROXIMATION) — which is also what the original uses for the
+    // effect position. The solver works in rad/s, so the stored turns/s angular velocities are scaled
+    // by 2π around it exactly as 0x498FF0 does.
+    let (inv_a, inv_b) = (1.0 / mass_a.max(1.0), 1.0 / mass_b.max(1.0));
+    let (inv6_a, inv6_b) = (inv_a / 6.0, inv_b / 6.0);
+    let pt = (a.position + b.position) * 0.5;
+    let (r_a, r_b) = (pt - a.position, pt - b.position);
+    // the SAT above returns the normal pointing from A to B; the solver's `n` points the other way
+    let ni = -n;
+    let (c_a, c_b) = (r_a.cross(ni), r_b.cross(ni));
+    let (w_a, w_b) = (a.angular_velocity * TAU, b.angular_velocity * TAU);
+    let vrel = b.velocity.dot(ni) - a.velocity.dot(ni) - w_a.dot(c_a) + w_b.dot(c_b);
+    let den = 0.5 * (c_a.length_squared() * inv6_a + c_b.length_squared() * inv6_b + inv_b + inv_a);
     let mut effect = 0.0;
-    if vrel > 0.0 {
-        let mut j = vrel / (0.5 * inv_a + 0.5 * inv_b);
-        j *= 0.5;
-        // effect magnitude 0x430: the notes give `|(mA + mB)·vrel|·4` with an elided clamp; the
-        // closing speed × 4 is used here so that the ≥ 80 "hard hit" branch means ≥ 20 m/s (MEDIUM)
-        effect = (vrel * 4.0).max(9.0);
-        let hard = if effect >= 80.0 { 1.25 } else { 1.0 };
-        a.velocity -= n * (j * inv_a * hard);
-        b.velocity += n * (j * inv_b * hard);
-        // yaw response (heuristic, as for walls): the car hit off-centre spins away from the contact
-        let side_a = n.dot(flat(a.orientation.row(0)));
-        let side_b = n.dot(flat(b.orientation.row(0)));
-        a.angular_velocity.y += -0.15 * vrel.min(10.0) * side_a;
-        b.angular_velocity.y += 0.15 * vrel.min(10.0) * side_b;
-        a.impact = a.impact.max(vrel);
-        b.impact = b.impact.max(vrel);
-        a.damage_by_normal(effect, n);
-        b.damage_by_normal(effect, -n);
+    let j = if den > 1e-9 { vrel / den } else { 0.0 };
+    if j >= 0.0 {
+        let jj = j * 0.5;
+        let imp = ni * jj;
+        // impact magnitude 0x430: `min(4·|Δv|, |vclose·(mA+mB)|/m)`, floored at 9 when the other body
+        // is lighter than 0.65 mass units
+        let vclose = a.velocity.dot(ni) - b.velocity.dot(ni);
+        let p = vclose * (mass_a + mass_b);
+        let sp = 4.0 * (a.velocity - b.velocity).length();
+        let eff_a = if mass_b > 0.65 { sp.min(p.abs() * inv_a) } else { 9.0 };
+        let eff_b = if mass_a > 0.65 { sp.min(p.abs() * inv_b) } else { 9.0 };
+        effect = eff_a.max(eff_b);
+        a.velocity += imp * inv_a * if eff_a >= 80.0 { 1.25 } else { 1.0 };
+        b.velocity -= imp * inv_b * if eff_b >= 80.0 { 1.25 } else { 1.0 };
+        let (t_a, t_b) = (if eff_a >= 80.0 { 3.0 } else { 1.5 }, if eff_b >= 80.0 { 3.0 } else { 1.5 });
+        let w_a = w_a + r_a.cross(imp) * (t_a * inv6_a);
+        let w_b = w_b - r_b.cross(imp) * (t_b * inv6_b);
+        // back to turns/s, then ClampAngVel 0x4964D0 on each component
+        let clamp = |w: Vec3| (w / TAU).clamp(Vec3::splat(-0.75), Vec3::splat(0.75));
+        a.angular_velocity = clamp(w_a);
+        b.angular_velocity = clamp(w_b);
+        a.impact = a.impact.max(eff_a);
+        b.impact = b.impact.max(eff_b);
+        a.damage_by_normal(eff_a, n);
+        b.damage_by_normal(eff_b, -n);
     }
     // push apart along the centre line, split by mass
     let dir = flat(d);
@@ -1203,6 +1334,23 @@ mod car_car_tests {
     }
 
     #[test]
+    fn the_impulse_conserves_momentum_and_clamps_the_spin() {
+        let (ma, mb) = (2000.0f32, 1000.0f32);
+        let mut a = car(Vec3::ZERO, Vec3::new(0.0, 0.0, 12.0), 0.0);
+        let mut b = car(Vec3::new(0.6, 0.0, 3.0), Vec3::new(0.0, 0.0, 2.0), 0.4);
+        a.angular_velocity = Vec3::new(0.0, 0.3, 0.0);
+        let p0 = a.velocity * ma + b.velocity * mb;
+        assert!(collide_cars(&mut a, ma, &mut b, mb).is_some());
+        let p1 = a.velocity * ma + b.velocity * mb;
+        // below the 80 "hard hit" threshold both sides take the same impulse, so momentum is conserved
+        assert!((p1 - p0).length() < 1.0, "{p0:?} -> {p1:?}");
+        // and each angular-velocity component stays inside ClampAngVel's ±0.75 turns/s
+        for w in [a.angular_velocity, b.angular_velocity] {
+            assert!(w.abs().max_element() <= 0.75 + 1e-6, "{w:?}");
+        }
+    }
+
+    #[test]
     fn heavier_car_moves_less() {
         let mut a = car(Vec3::ZERO, Vec3::new(0.0, 0.0, 10.0), 0.0);
         let mut b = car(Vec3::new(0.0, 0.0, 3.0), Vec3::ZERO, 0.0);
@@ -1234,5 +1382,85 @@ mod damage_tests {
         assert!((v.damage_avg() - (30.0 + 15.0 + 15.0 + 100.0) / 10.0).abs() < 1e-4);
         assert!(v.part_damage(&specs.zone_masks.brakes) > 0.0);
         assert_eq!(v.part_damage(&[false; 10]), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod body_ground_tests {
+    use super::*;
+
+    /// A car dropped upside down onto flat ground is pushed out of the surface, loses its downward
+    /// speed and has its angular velocity clamped (`BodyGroundCollide` 0x496610 / `ClampAngVel`).
+    #[test]
+    fn upside_down_car_is_pushed_out_and_settles() {
+        let specs = tests::specs_993();
+        let flipped = Mat3::from_rotation_z(std::f32::consts::PI).transpose();
+        let mut v = Vehicle::new(Vec3::new(0.0, 0.2, 0.0), flipped, &specs, 0.8, 0.3);
+        v.velocity = Vec3::new(0.0, -8.0, 0.0);
+        v.angular_velocity = Vec3::new(3.0, -4.0, 5.0);
+        v.cos_tilt = -1.0;
+        v.body_height = 0.0;
+        let plane = Vec3::ZERO;
+        v.body_ground_collide(&specs, Vec3::Y, plane, 0.5);
+        assert!(v.velocity.y > -8.0, "downward speed reduced: {:?}", v.velocity);
+        assert!(v.position.y >= 0.2, "pushed out of the ground: {}", v.position.y);
+        assert!(v.angular_velocity.abs().max_element() <= 0.75 + 1e-6, "ω clamped: {:?}", v.angular_velocity);
+        assert!(v.impact > 0.0);
+        // a light landing leaves too little residual normal speed to damage the body
+        // (`Damage_byNormal` needs an effect > 10, i.e. `4·|vel·n| > 10`)
+        assert!(v.damage.iter().all(|d| *d == 0.0));
+    }
+
+    /// A hard drop onto the roof does damage the roof zone.
+    #[test]
+    fn hard_roof_impact_damages_the_roof() {
+        let specs = tests::specs_993();
+        let flipped = Mat3::from_rotation_z(std::f32::consts::PI).transpose();
+        let mut v = Vehicle::new(Vec3::new(0.0, 0.2, 0.0), flipped, &specs, 0.8, 0.3);
+        v.velocity = Vec3::new(0.0, -30.0, 0.0);
+        v.cos_tilt = -1.0;
+        v.body_height = 0.0;
+        v.body_ground_collide(&specs, Vec3::Y, Vec3::ZERO, 0.5);
+        assert!(v.damage[8] > 0.0, "roof zone damaged: {:?}", v.damage);
+    }
+
+    /// No body point below the plane: nothing happens.
+    #[test]
+    fn airborne_car_is_untouched() {
+        let specs = tests::specs_993();
+        let mut v = Vehicle::new(Vec3::new(0.0, 10.0, 0.0), Mat3::IDENTITY, &specs, 0.8, 0.3);
+        v.velocity = Vec3::new(1.0, -2.0, 3.0);
+        let before = (v.position, v.velocity, v.angular_velocity);
+        v.body_ground_collide(&specs, Vec3::Y, Vec3::ZERO, 0.5);
+        assert_eq!((v.position, v.velocity, v.angular_velocity), before);
+    }
+}
+
+#[cfg(test)]
+mod roughness_tests {
+    use super::*;
+
+    #[test]
+    fn roughness_by_surface_and_tilt() {
+        let specs = tests::specs_993();
+        let mut v = Vehicle::new(Vec3::ZERO, Mat3::IDENTITY, &specs, 0.8, 0.3);
+        v.cos_tilt = 1.0;
+        // smooth surfaces (asphalt = 1) have no roughness at all
+        v.wheels[0].surface = 1;
+        for _ in 0..200 {
+            assert_eq!(v.roughness(0, 30.0), 0.0);
+        }
+        // a rough surface (3) draws offsets within ±amplitude (0.1 m) and varies over distance
+        v.wheels[1].surface = 3;
+        let mut seen: Vec<f32> = Vec::new();
+        for _ in 0..200 {
+            let r = v.roughness(1, 30.0);
+            assert!(r.abs() <= 0.1 + 1e-6, "amplitude {r}");
+            seen.push(r);
+        }
+        assert!(seen.iter().any(|r| *r != 0.0), "some offset is produced");
+        // a tilted car gets none (cosTilt < 0.86)
+        v.cos_tilt = 0.5;
+        assert_eq!(v.roughness(1, 30.0), 0.0);
     }
 }

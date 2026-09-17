@@ -95,12 +95,21 @@ impl CarAssets {
             decode_pack(&p, &d)
         };
         let tpg_path = file(".tpg")?;
+        // A few traffic cars ship only one texture pack (the Tbus `eas3` has `eas3L.fsh` and no
+        // `eas3D.fsh`), so each set falls back to the other rather than failing the whole car.
+        let (day, night) = (pack("D.fsh"), pack("L.fsh"));
+        let (textures_day, textures_night) = match (day, night) {
+            (Ok(d), Ok(n)) => (d, n),
+            (Ok(d), Err(_)) => (d.clone(), d),
+            (Err(_), Ok(n)) => (n.clone(), n),
+            (Err(e), Err(_)) => return Err(e),
+        };
         Ok(Self {
             model: model.to_string(),
             crp_data,
             crp,
-            textures_day: pack("D.fsh")?,
-            textures_night: pack("L.fsh")?,
+            textures_day,
+            textures_night,
             tpg: Ini::parse(&String::from_utf8_lossy(&read(&tpg_path)?)),
         })
     }

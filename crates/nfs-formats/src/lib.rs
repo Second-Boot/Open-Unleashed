@@ -9,19 +9,27 @@ pub mod ais;
 pub mod bigf;
 pub mod bnk;
 pub mod career;
+pub mod cop;
 pub mod crdl;
 pub mod crp;
 pub mod edg;
 pub mod error;
 pub mod fedata;
+pub mod fetxt;
 pub mod fnt;
 pub mod fsh;
 pub mod ini;
+pub mod key;
+pub mod lay;
 pub mod locale;
 pub mod refpack;
 pub mod schl;
 pub mod scn;
+pub mod sav;
+pub mod scripts;
 pub mod sim;
+pub mod trafcfg;
+pub mod spl;
 
 pub use error::FormatError;
 

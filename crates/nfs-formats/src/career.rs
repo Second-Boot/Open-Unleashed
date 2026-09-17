@@ -598,3 +598,107 @@ pub fn parse_missions(data: &[u8]) -> Result<Vec<Mission>, FormatError> {
     }
     Ok(out)
 }
+
+/// `SaveData\nfs5.trk` — the persisted track-record tables (`RE/notes/savegame.md` §7, CONFIRMED).
+///
+/// The `TrackRecords` save module (0x4FAD80) writes *the whole in-memory `nfs5.trk` array* —
+/// `[0x691C94] × 0x4A8` bytes — to its own file rather than into the `.sav`, which is why records
+/// are global across profiles. On start-up 0x4FAE20 seeds the file from `FEData\data\nfs5.trk` when
+/// it is missing, reads it back, derives the record count as `size / 0x4A8`, and runs the
+/// empty-slot fixup: **unconditionally for all 8 slots of every track, ignoring `trk+0x1AE`**, any
+/// entry whose time is 0 becomes `"n/a"` with time 359 999.
+///
+/// This type holds the array as raw bytes so a port can round-trip a file the original wrote.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackRecordFile {
+    pub raw: Vec<u8>,
+}
+
+/// The empty-slot time written by the 0x4FAE20 fixup.
+pub const NO_RECORD_TIME: u32 = 359_999;
+/// Record holders per track (`trk+0x1B0`, stride 0x4C, fastest first).
+pub const RECORD_SLOTS: usize = 8;
+const SLOT_STRIDE: usize = 0x4C;
+const SLOTS_AT: usize = 0x1B0;
+
+impl TrackRecordFile {
+    /// Wrap a `nfs5.trk` image and apply the 0x4FAE20 empty-slot fixup.
+    pub fn load(data: &[u8]) -> Result<Self, FormatError> {
+        if !data.len().is_multiple_of(TRACK_RECORD_SIZE) {
+            return Err(FormatError::SizeMismatch { what: "nfs5.trk", declared: TRACK_RECORD_SIZE, actual: data.len() % TRACK_RECORD_SIZE });
+        }
+        let mut f = Self { raw: data.to_vec() };
+        f.fixup();
+        Ok(f)
+    }
+
+    pub fn count(&self) -> usize {
+        self.raw.len() / TRACK_RECORD_SIZE
+    }
+
+    /// `nfs5.trk` id of record `i` (`*(u16*)trk`, the key 0x4FAFC0 searches by).
+    pub fn id_at(&self, i: usize) -> u16 {
+        let b = i * TRACK_RECORD_SIZE;
+        u16::from_le_bytes([self.raw[b], self.raw[b + 1]])
+    }
+
+    pub fn index_of(&self, id: u16) -> Option<usize> {
+        (0..self.count()).find(|i| self.id_at(*i) == id)
+    }
+
+    fn slot(&self, track: usize, k: usize) -> usize {
+        track * TRACK_RECORD_SIZE + SLOTS_AT + k * SLOT_STRIDE
+    }
+
+    /// 0x4FAE20's tail: every zero-time slot of every track becomes `"n/a"` / 359 999.
+    fn fixup(&mut self) {
+        for t in 0..self.count() {
+            for k in 0..RECORD_SLOTS {
+                let e = self.slot(t, k);
+                if u32::from_le_bytes([self.raw[e + 0x48], self.raw[e + 0x49], self.raw[e + 0x4A], self.raw[e + 0x4B]]) == 0 {
+                    self.raw[e..e + 20].fill(0);
+                    self.raw[e..e + 3].copy_from_slice(b"n/a");
+                    self.raw[e + 0x48..e + 0x4C].copy_from_slice(&NO_RECORD_TIME.to_le_bytes());
+                }
+            }
+        }
+    }
+
+    pub fn entries(&self, track: usize) -> Vec<TrackRecord> {
+        (0..RECORD_SLOTS)
+            .map(|k| {
+                let e = self.slot(track, k);
+                TrackRecord {
+                    driver: fixed_str(&self.raw, e, 20, "nfs5.trk").unwrap_or_default(),
+                    car: fixed_str(&self.raw, e + 0x14, 52, "nfs5.trk").unwrap_or_default(),
+                    time: u32::from_le_bytes([self.raw[e + 0x48], self.raw[e + 0x49], self.raw[e + 0x4A], self.raw[e + 0x4B]]),
+                }
+            })
+            .collect()
+    }
+
+    /// `Records_insert` 0x4FAFC0: find the record for `id`, insert at the first slot whose time is
+    /// **strictly** greater than `time`, shift the rest down, drop the eighth. Returns the 0-based
+    /// rank, or `None` when the time does not make the table.
+    pub fn insert(&mut self, id: u16, driver: &str, car: &str, time: u32) -> Option<usize> {
+        let t = self.index_of(id)?;
+        let times: Vec<u32> = self.entries(t).iter().map(|e| e.time).collect();
+        let k = times.iter().position(|e| time < *e)?;
+        for j in (k + 1..RECORD_SLOTS).rev() {
+            let (dst, src) = (self.slot(t, j), self.slot(t, j - 1));
+            let row = self.raw[src..src + SLOT_STRIDE].to_vec();
+            self.raw[dst..dst + SLOT_STRIDE].copy_from_slice(&row);
+        }
+        let e = self.slot(t, k);
+        self.raw[e..e + SLOT_STRIDE].fill(0);
+        let put = |raw: &mut [u8], at: usize, len: usize, s: &str| {
+            for (i, b) in s.chars().map(|c| c as u32 as u8).take(len - 1).enumerate() {
+                raw[at + i] = b;
+            }
+        };
+        put(&mut self.raw, e, 20, driver);
+        put(&mut self.raw, e + 0x14, 52, car);
+        self.raw[e + 0x48..e + 0x4C].copy_from_slice(&time.to_le_bytes());
+        Some(k)
+    }
+}

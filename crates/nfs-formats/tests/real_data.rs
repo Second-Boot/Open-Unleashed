@@ -206,3 +206,34 @@ fn career_tables() {
     assert_eq!(strings.get(0), Some("Hello, World!"));
     assert!(trn.iter().all(|t| strings.get(t.title_string_id).is_some()));
 }
+
+/// `RE/notes/savegame.md` §7: the shipped `nfs5.trk` seeds `SaveData\nfs5.trk`, the fixup fills
+/// every zero-time slot with `"n/a"` / 359 999, and insertion is a strict `<` with a shift.
+#[test]
+fn track_record_file_fixup_and_insert() {
+    let r = need_game!();
+    let d = std::fs::read(r.join("FEData/Data/nfs5.trk")).unwrap();
+    assert_eq!(d.len(), 15 * 1192);
+    let mut f = nfs_formats::career::TrackRecordFile::load(&d).unwrap();
+    assert_eq!(f.count(), 15);
+
+    // Coastal (id 8) ships with the fastest time 10496 held by Alberta.
+    let coastal = f.index_of(8).expect("track 8");
+    let e = f.entries(coastal);
+    assert_eq!((e[0].driver.as_str(), e[0].time), ("Alberta", 10_496));
+    assert_eq!(e[7].time, 18_432);
+
+    // skidpad ships with all-zero entries, so every slot becomes the sentinel.
+    let skid = (0..f.count()).find(|i| f.entries(*i)[0].time == nfs_formats::career::NO_RECORD_TIME).expect("an empty track");
+    assert!(f.entries(skid).iter().all(|e| e.driver == "n/a" && e.time == nfs_formats::career::NO_RECORD_TIME));
+
+    assert_eq!(f.insert(8, "Player", "911 GT1", 10_496), Some(1), "an equal time goes behind the holder");
+    assert_eq!(f.insert(8, "Player", "911 GT1", 10_000), Some(0));
+    let e = f.entries(coastal);
+    assert_eq!(e[0].time, 10_000);
+    assert_eq!((e[1].driver.as_str(), e[1].time), ("Alberta", 10_496));
+    assert_eq!(e[2].driver, "Player");
+    assert_eq!(e[7].time, 15_000, "the two slowest holders were pushed off");
+    assert_eq!(f.insert(8, "Player", "911 GT1", 999_999), None);
+    assert_eq!(f.raw.len(), d.len(), "the array keeps its size");
+}

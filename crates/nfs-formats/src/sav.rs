@@ -1,0 +1,522 @@
+//! The original save game: `SaveData\<N><Name>.sav` (`RE/notes/savegame.md`, CONFIRMED).
+//!
+//! The file is a flat, self-delimiting sequence of `"<ModuleName>\0" + blob` written by
+//! `SaveInfo` 0x4DEDA0 and walked by `LoadInfo` 0x4DE9B0 until the file length runs out. There is
+//! **no header, no version stamp, no checksum and no obfuscation** (§1) — every field is stored
+//! little-endian exactly as it sits in memory. Module order is irrelevant on load (the reader is
+//! name-driven), but the writer always emits [`MODULE_ORDER`], and an unknown module name aborts
+//! the whole load.
+//!
+//! Nine modules contribute bytes; `TrackRecords` contributes none (its save fn writes
+//! `SaveData\nfs5.trk` as a side effect and its load fn is `mov al,1; ret`). The optional trailing
+//! `"accessor\0" u32 len` block holds the front-end accessors — options, selections, the chronicle
+//! year — in `std::map` (byte-wise `strcmp`) order. Which concrete accessor class backs each of the
+//! ~220 names was not enumerated (§9, UNKNOWN), so a payload cannot be sized generically: this
+//! module therefore carries the block as opaque bytes, round-tripping one it read and omitting it
+//! otherwise. §9.6: when the block is absent the original falls back to default options.
+
+use crate::FormatError;
+
+const WHAT: &str = "sav";
+
+/// On-disk module order (`SaveInfo`'s traversal of the save list `[0x65B638]`, §3.1).
+pub const MODULE_ORDER: [&str; 9] =
+    ["Missions", "PartsMarket", "Tournament", "PlayerInfo", "TrackRecords", "UsedCarMarket", "Personalities", "Knockout", "CDPlayer"];
+
+/// `sizeof(FECar)` is 0x760; the writer stores the first 0x758 bytes — the two trailing dwords are
+/// the part-vector pointers, saved as the id/state lists instead (§4.7).
+pub const FE_CAR_IMAGE: usize = 0x758;
+/// `nfs5.prt` record size, stored by value in `PartsMarket`.
+pub const PART_RECORD: usize = 0x168;
+/// `Knockout`'s blob: 33 dwords at `[0x690410]`.
+pub const KNOCKOUT_BLOB: usize = 0x84;
+
+fn err(offset: usize, needed: usize) -> FormatError {
+    FormatError::Truncated { what: "sav", offset, needed }
+}
+
+struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], FormatError> {
+        let b = self.data.get(self.pos..self.pos + n).ok_or_else(|| err(self.pos, n))?;
+        self.pos += n;
+        Ok(b)
+    }
+    fn u32(&mut self) -> Result<u32, FormatError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn i32(&mut self) -> Result<i32, FormatError> {
+        Ok(self.u32()? as i32)
+    }
+    fn f32(&mut self) -> Result<f32, FormatError> {
+        Ok(f32::from_bits(self.u32()?))
+    }
+    fn u16(&mut self) -> Result<u16, FormatError> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+    fn u8(&mut self) -> Result<u8, FormatError> {
+        Ok(self.take(1)?[0])
+    }
+    /// A NUL-terminated string, as every name and both player names are stored.
+    fn cstr(&mut self) -> Result<String, FormatError> {
+        let rest = &self.data[self.pos.min(self.data.len())..];
+        let end = rest.iter().position(|&b| b == 0).ok_or_else(|| err(self.pos, 1))?;
+        let s: String = rest[..end].iter().map(|&b| b as char).collect();
+        self.pos += end + 1;
+        Ok(s)
+    }
+}
+
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+fn put_cstr(out: &mut Vec<u8>, s: &str) {
+    out.extend(s.chars().map(|c| c as u32 as u8));
+    out.push(0);
+}
+
+/// One part on a saved car: only the id and the one float at `part+0x164` survive — the loader
+/// rebuilds the rest from `nfs5.prt` (§4.7, CONFIRMED).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SavedPart {
+    /// Sign-extended `i16` from `part+0x00`.
+    pub id: i32,
+    /// `part+0x164`, written as a raw dword and restored with `fld`/`fstp`.
+    pub state: f32,
+}
+
+/// `OwnedCar` — writer 0x4EE8D0, reader 0x4EE6A0. Used by `PlayerInfo`, `UsedCarMarket` and the
+/// `OpponentCar.Car` accessor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedCar {
+    /// The 0x758-byte FE car object verbatim; it begins with the 1648-byte `nfs5.car` record.
+    pub image: Vec<u8>,
+    /// `car+0x75C` — written first (`career.md` §10 calls it the spare/removed list).
+    pub removed: Vec<SavedPart>,
+    /// `car+0x758` — the installed list.
+    pub installed: Vec<SavedPart>,
+}
+
+impl SavedCar {
+    pub fn new(image: Vec<u8>) -> Self {
+        Self { image, removed: Vec::new(), installed: Vec::new() }
+    }
+
+    fn read(r: &mut Reader) -> Result<Self, FormatError> {
+        let image = r.take(FE_CAR_IMAGE)?.to_vec();
+        let n1 = r.u32()? as usize;
+        let n2 = r.u32()? as usize;
+        let part = |r: &mut Reader| -> Result<SavedPart, FormatError> { Ok(SavedPart { id: r.i32()?, state: r.f32()? }) };
+        let removed = (0..n1).map(|_| part(r)).collect::<Result<_, _>>()?;
+        let installed = (0..n2).map(|_| part(r)).collect::<Result<_, _>>()?;
+        Ok(Self { image, removed, installed })
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        let mut image = self.image.clone();
+        image.resize(FE_CAR_IMAGE, 0);
+        out.extend_from_slice(&image);
+        put_u32(out, self.removed.len() as u32);
+        put_u32(out, self.installed.len() as u32);
+        for p in self.removed.iter().chain(self.installed.iter()) {
+            put_u32(out, p.id as u32);
+            put_u32(out, p.state.to_bits());
+        }
+    }
+
+    /// Read a dword of the FE car image (`car+0x68C` … `car+0x6A4`, `career.md` §10).
+    pub fn field_u32(&self, off: usize) -> u32 {
+        self.image.get(off..off + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0)
+    }
+    pub fn set_field_u32(&mut self, off: usize, v: u32) {
+        if self.image.len() < off + 4 {
+            self.image.resize(FE_CAR_IMAGE, 0);
+        }
+        self.image[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pub fn field_u8(&self, off: usize) -> u8 {
+        self.image.get(off).copied().unwrap_or(0)
+    }
+    pub fn set_field_u8(&mut self, off: usize, v: u8) {
+        if self.image.len() < off + 1 {
+            self.image.resize(FE_CAR_IMAGE, 0);
+        }
+        self.image[off] = v;
+    }
+    /// `nfs5.car` record id at `car+0x00`.
+    pub fn car_id(&self) -> u16 {
+        self.image.get(0..2).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(0)
+    }
+}
+
+/// `PlayerInfo` (save 0x5018B0 / load 0x501610) — the core of the career.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlayerInfo {
+    /// The garage, `[0x691DF8]`.
+    pub cars: Vec<SavedCar>,
+    /// `[0x691D90]`, 11 000 in a fresh career, clamped to ±999 999 999 by 0x5012E0.
+    pub money: i32,
+    /// `[0x5DB748]` driver picture 0..9 — the same value as the file name's leading digit, **not**
+    /// a format version (§5.1). Default 8.
+    pub picture: u32,
+    /// `[0x691DC8]` — the displayed profile name (= file stem minus the digit).
+    pub player_name: String,
+    /// `[0x691DE8]` — set once, at profile creation; copied into race-result records.
+    pub driver_name: String,
+    /// `[0x691DD5]` — "already seen the Evolution/tournament intro".
+    pub seen_evolution_intro: u8,
+    /// `[0x691D94]` — "already seen the Factory Driver welcome".
+    pub seen_factory_welcome: u8,
+    /// `[0x691DF5]` — "already seen the first-mission text".
+    pub seen_first_mission: u8,
+    /// `[0x691D98..0x691DB8]` — the eight user-defined paint colours (0 = slot unused).
+    pub colours: [u32; 8],
+}
+
+impl PlayerInfo {
+    fn read(r: &mut Reader) -> Result<Self, FormatError> {
+        let n = r.u32()? as usize;
+        let cars = (0..n).map(|_| SavedCar::read(r)).collect::<Result<_, _>>()?;
+        let money = r.i32()?;
+        let picture = r.u32()?;
+        let player_name = r.cstr()?;
+        let driver_name = r.cstr()?;
+        let seen_evolution_intro = r.u8()?;
+        let seen_factory_welcome = r.u8()?;
+        let seen_first_mission = r.u8()?;
+        let mut colours = [0u32; 8];
+        for c in colours.iter_mut() {
+            *c = r.u32()?;
+        }
+        Ok(Self { cars, money, picture, player_name, driver_name, seen_evolution_intro, seen_factory_welcome, seen_first_mission, colours })
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        put_u32(out, self.cars.len() as u32);
+        for c in &self.cars {
+            c.write(out);
+        }
+        put_u32(out, self.money as u32);
+        put_u32(out, self.picture);
+        put_cstr(out, &self.player_name);
+        put_cstr(out, &self.driver_name);
+        out.push(self.seen_evolution_intro);
+        out.push(self.seen_factory_welcome);
+        out.push(self.seen_first_mission);
+        for c in self.colours {
+            put_u32(out, c);
+        }
+    }
+}
+
+/// `Tournament` (0x502AE0) — the seven runtime dwords plus the whole `nfs5.trn` table with its
+/// standings, `done` flags and completion markers (§4.3).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TournamentModule {
+    /// `[0x5DB764]` chronicle year (0x79E = 1950 in a fresh career).
+    pub year: u32,
+    /// `[0x691E7C]` next event index (`Tournament.RemainingTracks`).
+    pub remaining_tracks: u32,
+    /// `[0x691E6C]` selected tournament index.
+    pub selected: u32,
+    /// `[0x691E50]` era type: 521 Classic / 522 Golden / 523 Modern.
+    pub era_type: u32,
+    /// `[0x5DB768]` current event index (−1 = none).
+    pub current_event: i32,
+    /// `[0x5DB76C]` current tournament index (−1 = none).
+    pub current_tournament: i32,
+    /// `[0x691E54]` club-mode flag.
+    pub club_mode: u32,
+    /// `[0x691E68]` — the whole `nfs5.trn` table image (35 × 0xD40).
+    pub table: Vec<u8>,
+}
+
+impl TournamentModule {
+    fn read(r: &mut Reader) -> Result<Self, FormatError> {
+        let year = r.u32()?;
+        let remaining_tracks = r.u32()?;
+        let selected = r.u32()?;
+        let era_type = r.u32()?;
+        let current_event = r.i32()?;
+        let current_tournament = r.i32()?;
+        let club_mode = r.u32()?;
+        let size = r.u32()? as usize;
+        let table = r.take(size)?.to_vec();
+        Ok(Self { year, remaining_tracks, selected, era_type, current_event, current_tournament, club_mode, table })
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        for v in [self.year, self.remaining_tracks, self.selected, self.era_type, self.current_event as u32, self.current_tournament as u32, self.club_mode] {
+            put_u32(out, v);
+        }
+        put_u32(out, self.table.len() as u32);
+        out.extend_from_slice(&self.table);
+    }
+}
+
+/// `UsedCarMarket` (0x4F7A10): a count, the market's year, then the cars (§4.4).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UsedCarMarket {
+    /// `[0x691B58]`, 0x79E = 1950 on reset.
+    pub year: u32,
+    pub cars: Vec<SavedCar>,
+}
+
+/// A parsed save game. Every module is optional: the reader is bounded by the file size, so a file
+/// that stops after the modules it wants leaves the rest at their defaults (§3).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SaveFile {
+    /// The whole `nfs5.fac` table image including the runtime "current mission" markers at `+0xE8`.
+    pub missions: Option<Vec<u8>>,
+    /// The parts currently on sale, each a 0x168-byte `nfs5.prt` record by value.
+    pub parts_market: Option<Vec<Vec<u8>>>,
+    pub tournament: Option<TournamentModule>,
+    pub player: Option<PlayerInfo>,
+    /// `TrackRecords` writes no bytes; this only records that the module name was present.
+    pub track_records: bool,
+    pub used_cars: Option<UsedCarMarket>,
+    /// The `nfs5.per` personality ids currently in use.
+    pub personalities: Option<Vec<u16>>,
+    /// 33 dwords of Knockout state.
+    pub knockout: Option<Vec<u8>>,
+    /// The selected music-track list.
+    pub cd_player: Option<Vec<u32>>,
+    /// The accessor block payload, without its `u32` length prefix — opaque here (see the module
+    /// docs); `None` omits the block entirely.
+    pub accessors: Option<Vec<u8>>,
+    /// Module names seen in the file, in file order (a byte-identical rewrite needs the original
+    /// order; [`SaveFile::write`] uses [`MODULE_ORDER`]).
+    pub order: Vec<String>,
+}
+
+impl SaveFile {
+    pub fn parse(data: &[u8]) -> Result<Self, FormatError> {
+        let mut r = Reader { data, pos: 0 };
+        let mut out = Self::default();
+        while r.pos < data.len() {
+            let name = r.cstr()?;
+            out.order.push(name.clone());
+            match name.as_str() {
+                "Missions" => {
+                    let n = r.u32()? as usize;
+                    out.missions = Some(r.take(n)?.to_vec());
+                }
+                "PartsMarket" => {
+                    let n = r.u32()? as usize;
+                    out.parts_market = Some((0..n).map(|_| r.take(PART_RECORD).map(<[u8]>::to_vec)).collect::<Result<_, _>>()?);
+                }
+                "Tournament" => out.tournament = Some(TournamentModule::read(&mut r)?),
+                "PlayerInfo" => out.player = Some(PlayerInfo::read(&mut r)?),
+                "TrackRecords" => out.track_records = true,
+                "UsedCarMarket" => {
+                    let n = r.u32()? as usize;
+                    let year = r.u32()?;
+                    let cars = (0..n).map(|_| SavedCar::read(&mut r)).collect::<Result<_, _>>()?;
+                    out.used_cars = Some(UsedCarMarket { year, cars });
+                }
+                "Personalities" => {
+                    let n = r.u32()? as usize;
+                    out.personalities = Some((0..n).map(|_| r.u16()).collect::<Result<_, _>>()?);
+                }
+                "Knockout" => out.knockout = Some(r.take(KNOCKOUT_BLOB)?.to_vec()),
+                "CDPlayer" => {
+                    let n = r.u32()? as usize;
+                    out.cd_player = Some((0..n).map(|_| r.u32()).collect::<Result<_, _>>()?);
+                }
+                "accessor" => {
+                    let n = r.u32()? as usize;
+                    out.accessors = Some(r.take(n)?.to_vec());
+                }
+                // The original's reader fails hard on a name it does not know, because it cannot
+                // size the payload that follows (0x4DEBBC → return false).
+                _ => {
+                    return Err(FormatError::UnexpectedValue {
+                        what: "sav",
+                        offset: r.pos,
+                        expected: format!("one of {MODULE_ORDER:?} or \"accessor\""),
+                        found: name,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn write(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for name in MODULE_ORDER {
+            match name {
+                "Missions" => {
+                    if let Some(m) = &self.missions {
+                        put_cstr(&mut out, name);
+                        put_u32(&mut out, m.len() as u32);
+                        out.extend_from_slice(m);
+                    }
+                }
+                "PartsMarket" => {
+                    if let Some(p) = &self.parts_market {
+                        put_cstr(&mut out, name);
+                        put_u32(&mut out, p.len() as u32);
+                        for rec in p {
+                            let mut rec = rec.clone();
+                            rec.resize(PART_RECORD, 0);
+                            out.extend_from_slice(&rec);
+                        }
+                    }
+                }
+                "Tournament" => {
+                    if let Some(t) = &self.tournament {
+                        put_cstr(&mut out, name);
+                        t.write(&mut out);
+                    }
+                }
+                "PlayerInfo" => {
+                    if let Some(p) = &self.player {
+                        put_cstr(&mut out, name);
+                        p.write(&mut out);
+                    }
+                }
+                "TrackRecords" => {
+                    if self.track_records {
+                        put_cstr(&mut out, name);
+                    }
+                }
+                "UsedCarMarket" => {
+                    if let Some(m) = &self.used_cars {
+                        put_cstr(&mut out, name);
+                        put_u32(&mut out, m.cars.len() as u32);
+                        put_u32(&mut out, m.year);
+                        for c in &m.cars {
+                            c.write(&mut out);
+                        }
+                    }
+                }
+                "Personalities" => {
+                    if let Some(p) = &self.personalities {
+                        put_cstr(&mut out, name);
+                        put_u32(&mut out, p.len() as u32);
+                        for id in p {
+                            out.extend_from_slice(&id.to_le_bytes());
+                        }
+                    }
+                }
+                "Knockout" => {
+                    if let Some(k) = &self.knockout {
+                        put_cstr(&mut out, name);
+                        let mut k = k.clone();
+                        k.resize(KNOCKOUT_BLOB, 0);
+                        out.extend_from_slice(&k);
+                    }
+                }
+                "CDPlayer" => {
+                    if let Some(l) = &self.cd_player {
+                        put_cstr(&mut out, name);
+                        put_u32(&mut out, l.len() as u32);
+                        for v in l {
+                            put_u32(&mut out, *v);
+                        }
+                    }
+                }
+                _ => unreachable!("{WHAT}: {name}"),
+            }
+        }
+        if let Some(a) = &self.accessors {
+            put_cstr(&mut out, "accessor");
+            put_u32(&mut out, a.len() as u32);
+            out.extend_from_slice(a);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> SaveFile {
+        let mut car = SavedCar::new(vec![0u8; FE_CAR_IMAGE]);
+        car.set_field_u32(0x698, 6000);
+        car.set_field_u8(0x6A0, 1);
+        car.installed = vec![SavedPart { id: 42, state: 100.0 }, SavedPart { id: -1, state: 0.5 }];
+        car.removed = vec![SavedPart { id: 7, state: 95.0 }];
+        SaveFile {
+            missions: Some(vec![1, 2, 3, 4, 5]),
+            parts_market: Some(vec![vec![0xAA; PART_RECORD], vec![0xBB; PART_RECORD]]),
+            tournament: Some(TournamentModule { year: 1950, remaining_tracks: 2, selected: 1, era_type: 521, current_event: -1, current_tournament: -1, club_mode: 0, table: vec![9; 100] }),
+            player: Some(PlayerInfo {
+                cars: vec![car],
+                money: 11_000,
+                picture: 8,
+                player_name: "Hans".into(),
+                driver_name: "Hans".into(),
+                seen_evolution_intro: 1,
+                seen_factory_welcome: 0,
+                seen_first_mission: 1,
+                colours: [0x11223344, 0, 0, 0, 0, 0, 0, 0],
+            }),
+            track_records: true,
+            used_cars: Some(UsedCarMarket { year: 1950, cars: vec![SavedCar::new(vec![3u8; FE_CAR_IMAGE])] }),
+            personalities: Some(vec![31, 32, 33]),
+            knockout: Some(vec![7; KNOCKOUT_BLOB]),
+            cd_player: Some(vec![1, 2, 3]),
+            accessors: Some(b"Chronicle.Year\0\x9e\x07\x00\x00".to_vec()),
+            order: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn container_round_trips() {
+        let s = sample();
+        let bytes = s.write();
+        let back = SaveFile::parse(&bytes).expect("parse");
+        assert_eq!(back.order, ["Missions", "PartsMarket", "Tournament", "PlayerInfo", "TrackRecords", "UsedCarMarket", "Personalities", "Knockout", "CDPlayer", "accessor"]);
+        let mut expect = s.clone();
+        expect.order = back.order.clone();
+        assert_eq!(back, expect);
+        assert_eq!(back.write(), bytes, "writing a parsed file reproduces it byte for byte");
+    }
+
+    #[test]
+    fn module_names_are_nul_terminated_and_order_is_the_originals() {
+        let bytes = sample().write();
+        assert!(bytes.starts_with(b"Missions\0"), "the first module is Missions");
+        // TrackRecords contributes its name and nothing else.
+        let at = bytes.windows(13).position(|w| w == b"TrackRecords\0").expect("TrackRecords");
+        assert_eq!(&bytes[at + 13..at + 13 + 14], b"UsedCarMarket\0", "no payload between them");
+    }
+
+    #[test]
+    fn a_truncated_subset_still_loads() {
+        // §3: modules may be omitted, and the loop is bounded by the file length.
+        let s = SaveFile { player: sample().player, ..Default::default() };
+        let back = SaveFile::parse(&s.write()).expect("parse");
+        assert_eq!(back.player, s.player);
+        assert!(back.tournament.is_none() && back.accessors.is_none());
+    }
+
+    #[test]
+    fn an_unknown_module_name_is_a_hard_failure() {
+        let mut bytes = b"Nonsense\0".to_vec();
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        assert!(SaveFile::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn parts_are_written_removed_list_first() {
+        let s = sample();
+        let bytes = s.write();
+        let back = SaveFile::parse(&bytes).unwrap();
+        let car = &back.player.unwrap().cars[0];
+        assert_eq!(car.removed.len(), 1);
+        assert_eq!(car.installed.len(), 2);
+        assert_eq!(car.installed[1].id, -1, "part ids are sign-extended i16");
+        assert_eq!(car.field_u32(0x698), 6000);
+        assert_eq!(car.field_u8(0x6A0), 1);
+    }
+}

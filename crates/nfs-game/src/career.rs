@@ -55,6 +55,8 @@ pub enum CareerError {
     PartMismatch { id: i16 },
     #[error("the last car cannot be sold")]
     LastCar,
+    #[error("no offer has been made for this car")]
+    NoOffer,
 }
 
 /// All static career tables from `FEData`.
@@ -66,6 +68,18 @@ pub struct CareerTables {
     pub missions: Vec<career::Mission>,
     pub strings: Strings,
     pub catalog: Vec<CarCatalogEntry>,
+    /// Raw record images of the tables the original's save game embeds verbatim
+    /// (`RE/notes/savegame.md` §4): `nfs5.car`, `nfs5.trn`, `nfs5.fac`, `nfs5.prt`.
+    pub raw: RawTables,
+}
+
+/// The shipped tables as bytes, kept because the `.sav` stores memory images of them.
+#[derive(Debug, Clone, Default)]
+pub struct RawTables {
+    pub car: Vec<u8>,
+    pub trn: Vec<u8>,
+    pub fac: Vec<u8>,
+    pub prt: Vec<u8>,
 }
 
 impl CareerTables {
@@ -78,14 +92,16 @@ impl CareerTables {
         let tbl = |file: &'static str| move |source| CareerError::Table { file, source };
         let strings_path = paths.fe_data().join("Locale").join("FEStrings.csv");
         let strings = Strings::parse(&std::fs::read(&strings_path).map_err(|source| CareerError::Io { path: strings_path, source })?, 0);
+        let raw = RawTables { car: read("nfs5.car")?, trn: read("nfs5.trn")?, fac: read("nfs5.fac")?, prt: read("nfs5.prt")? };
         Ok(Self {
             tracks: career::parse_track_table(&read("nfs5.trk")?).map_err(tbl("nfs5.trk"))?,
-            tournaments: career::parse_tournaments(&read("nfs5.trn")?).map_err(tbl("nfs5.trn"))?,
-            parts: career::parse_parts(&read("nfs5.prt")?).map_err(tbl("nfs5.prt"))?,
+            tournaments: career::parse_tournaments(&raw.trn).map_err(tbl("nfs5.trn"))?,
+            parts: career::parse_parts(&raw.prt).map_err(tbl("nfs5.prt"))?,
             personalities: career::parse_personalities(&read("nfs5.per")?).map_err(tbl("nfs5.per"))?,
-            missions: career::parse_missions(&read("nfs5.fac")?).map_err(tbl("nfs5.fac"))?,
-            catalog: nfs_formats::fedata::parse_car_catalog(&read("nfs5.car")?).map_err(tbl("nfs5.car"))?,
+            missions: career::parse_missions(&raw.fac).map_err(tbl("nfs5.fac"))?,
+            catalog: nfs_formats::fedata::parse_car_catalog(&raw.car).map_err(tbl("nfs5.car"))?,
             strings,
+            raw,
         })
     }
 
@@ -142,11 +158,17 @@ pub struct OwnedCar {
     /// `car+0x6A4`: what was paid (0 for prize cars).
     #[serde(default)]
     pub purchase_price: u32,
+    /// `car+0x68C` / `+0x691`: asking price while the car is listed on the used-car market.
+    #[serde(default)]
+    pub asking_price: Option<u32>,
+    /// `car+0x694` with `+0x692 = 1`: the standing offer for a listed car.
+    #[serde(default)]
+    pub offer: Option<u32>,
 }
 
 impl OwnedCar {
     pub fn new(car_id: u16, paint_set: u8, purchase_price: u32) -> Self {
-        Self { car_id, paint_set, parts: Vec::new(), mileage: 0, wins: 0, damage_pct: 0.0, purchase_price }
+        Self { car_id, paint_set, parts: Vec::new(), mileage: 0, wins: 0, damage_pct: 0.0, purchase_price, asking_price: None, offer: None }
     }
 }
 
@@ -429,17 +451,74 @@ impl Career {
         Some(value.max((0.05 * base).round()) as i64)
     }
 
-    /// Sell garage car `idx` at its current value (the original lists it on the used-car market
-    /// and pays the accepted offer ≈ value; simplified — MEDIUM). Keeps at least two cars? No: the
-    /// original refuses to *list* the last-but-one car (0x50FCB0); the same rule applies here.
-    pub fn sell_car(&mut self, tables: &CareerTables, idx: usize) -> Result<i64, CareerError> {
+    /// `SELLCAR` / `0x4F91C0(car, ask)`: list garage car `idx` on the used-car market at `ask`
+    /// (`car+0x68C`, `+0x691 = 1`); the car stays owned until an offer is accepted. The original
+    /// refuses to list a car when fewer than two remain (0x50FCB0).
+    pub fn list_for_sale(&mut self, idx: usize, ask: u32) -> Result<(), CareerError> {
         if self.garage.len() < 2 {
             return Err(CareerError::LastCar);
         }
-        let value = self.car_value(tables, idx).ok_or(CareerError::UnknownCar { id: 0 })?;
-        self.money += value;
+        let car = self.garage.get_mut(idx).ok_or(CareerError::UnknownCar { id: 0 })?;
+        car.asking_price = Some(ask);
+        car.offer = None;
+        Ok(())
+    }
+
+    /// `ID_REMOVEFMBUTTON`: take the car off the market.
+    pub fn withdraw_from_sale(&mut self, idx: usize) {
+        if let Some(c) = self.garage.get_mut(idx) {
+            c.asking_price = None;
+            c.offer = None;
+        }
+    }
+
+    /// `0x502190(car)`: accept the standing offer — the money is paid and the car leaves the garage.
+    pub fn accept_offer(&mut self, idx: usize) -> Result<i64, CareerError> {
+        let car = self.garage.get(idx).ok_or(CareerError::UnknownCar { id: 0 })?;
+        let offer = car.offer.ok_or(CareerError::NoOffer)? as i64;
+        self.money = (self.money + offer).clamp(-999_999_999, 999_999_999);
         self.garage.remove(idx);
-        Ok(value)
+        Ok(offer)
+    }
+
+    /// `0x4F7E90` (run after every career race): score each listed car and, depending on the
+    /// bracket, make an offer. `rand` yields the original's 16-bit LCG values.
+    pub fn generate_offers(&mut self, tables: &CareerTables, rand: &mut impl FnMut() -> u32) {
+        for idx in 0..self.garage.len() {
+            let Some(ask) = self.garage[idx].asking_price else { continue };
+            if self.garage[idx].offer.is_some() {
+                continue;
+            }
+            let Some(value) = self.car_value(tables, idx) else { continue };
+            if value <= 0 {
+                continue;
+            }
+            let car = &self.garage[idx];
+            let model_year = tables.car(car.car_id).map(|c| c.year).unwrap_or(self.year);
+            let age = self.year.saturating_sub(model_year);
+            let mileage_pct = mileage_score(age, car.mileage);
+            let score = (((value - ask as i64) as f64 * 100.0 / value as f64).round() as i64) - (car.damage_pct.round() as i64) + 100 + mileage_pct + (car.wins / 5) as i64;
+            // bracket table 0x5B7D88
+            let (pct, immediate) = match score {
+                s if s <= 83 => (20, true),
+                s if s <= 89 => (40, true),
+                s if s <= 95 => (60, true),
+                s if s <= 99 => (80, true),
+                s if s <= 104 => (80, false),
+                s if s <= 109 => (90, false),
+                _ => (100, false),
+            };
+            let offer = if immediate {
+                // asking above the value / damaged: an offer around the value is made at once
+                let jitter = ((rand() % 601) as f64 - 300.0) * 1e-4 * value as f64;
+                (ask as i64).min(value + jitter.round() as i64).max(0) as u32
+            } else if (rand() % 100) < pct {
+                ask
+            } else {
+                continue;
+            };
+            self.garage[idx].offer = Some(offer);
+        }
     }
 
     /// Parts that fit `car`: same family, model year not after the chronicle year, newest year per
@@ -665,6 +744,23 @@ impl Career {
     }
 }
 
+/// Mileage score of a listed car (`0x4F7E90` tables 0x5B7C88.., CONFIRMED brackets by age).
+fn mileage_score(age: u16, km: u32) -> i64 {
+    let (good, mid, ok, limit) = match age {
+        0..=10 => (500, 2000, 5000, 5000),
+        11..=20 => (500, 2000, 5000, 10000),
+        21..=30 => (500, 2000, 5000, 15000),
+        _ => (500, 2000, 5000, 20000),
+    };
+    let (a, b, c) = match age {
+        0..=10 => (3, 2, 1),
+        11..=20 => (4, 3, 2),
+        21..=30 => (8, 6, 4),
+        _ => (15, 10, 5),
+    };
+    if km <= good { a } else if km <= mid { b } else if km <= ok { c } else if km > limit { -1 } else { c }
+}
+
 /// Aged value of an installed part (`0x518220`): price × (1 + Σ yearly increments) × condition.
 /// The yearly increment table `0x5BA4A4` was not transcribed — 0 % per year is used (MEDIUM).
 fn part_value(p: &Part, _year: u16) -> f64 {
@@ -724,7 +820,7 @@ mod tests {
     }
 
     fn tables(ts: Vec<Tournament>) -> CareerTables {
-        CareerTables { tracks: vec![], tournaments: ts, parts: vec![], personalities: vec![], missions: vec![], strings: Strings::default(), catalog: vec![] }
+        CareerTables { raw: Default::default(), tracks: vec![], tournaments: ts, parts: vec![], personalities: vec![], missions: vec![], strings: Strings::default(), catalog: vec![] }
     }
 
     #[test]
@@ -793,9 +889,46 @@ mod tests {
     }
 
     #[test]
+    fn used_car_market_offers() {
+        let tables = tables(vec![]);
+        let mut c = Career::default();
+        c.garage.push(OwnedCar::new(76, 0, 11_000));
+        c.garage.push(OwnedCar::new(76, 0, 11_000));
+        // no catalogue in this fixture → no value, so no offers can be made
+        let mut rng = || 0u32;
+        c.list_for_sale(0, 9_000).unwrap();
+        c.generate_offers(&tables, &mut rng);
+        assert_eq!(c.garage[0].offer, None, "unknown car has no value");
+        // the last car may not be listed
+        let mut one = Career::default();
+        one.garage.push(OwnedCar::new(76, 0, 11_000));
+        assert!(matches!(one.list_for_sale(0, 1), Err(CareerError::LastCar)));
+        // accepting an offer pays and removes the car
+        c.garage[0].offer = Some(12_345);
+        let money = c.money;
+        assert_eq!(c.accept_offer(0).unwrap(), 12_345);
+        assert_eq!(c.money, money + 12_345);
+        assert_eq!(c.garage.len(), 1);
+        assert!(matches!(c.accept_offer(0), Err(CareerError::NoOffer)));
+    }
+
+    #[test]
+    fn mileage_score_brackets() {
+        // age ≤ 10: +3 / +2 / +1, and −1 above 5000 km (0x5B7C88 tables)
+        assert_eq!(mileage_score(5, 400), 3);
+        assert_eq!(mileage_score(5, 1_500), 2);
+        assert_eq!(mileage_score(5, 4_000), 1);
+        assert_eq!(mileage_score(5, 9_000), -1);
+        // older cars tolerate more mileage and score higher when barely used
+        assert_eq!(mileage_score(35, 400), 15);
+        assert_eq!(mileage_score(35, 18_000), 5);
+        assert_eq!(mileage_score(35, 25_000), -1);
+    }
+
+    #[test]
     fn save_roundtrip() {
         let mut c = Career::default();
-        c.garage.push(OwnedCar { car_id: 76, paint_set: 2, parts: vec![13], mileage: 3000, wins: 1, damage_pct: 0.0, purchase_price: 11_000 });
+        c.garage.push(OwnedCar { car_id: 76, paint_set: 2, parts: vec![13], mileage: 3000, wins: 1, damage_pct: 0.0, purchase_price: 11_000, asking_price: Some(9_000), offer: None });
         c.tournaments.insert(9, TournamentState { entered: true, ..Default::default() });
         let dir = std::env::temp_dir().join(format!("nfs-career-{}", std::process::id()));
         let path = dir.join("career.json");

@@ -111,6 +111,9 @@ pub struct TrackAssets {
     pub start_backward: Option<Scene>,
     pub cameras: Option<Scene>,
     /// `<track>_st<N>.scn` stage/scenario scenes (which one a race uses is not yet known).
+    /// `_forward.key` / `_backwards.key`: per-slice render draw distance (`race-logic.md` §6.1).
+    pub draw_keys_forward: nfs_formats::key::DrawKeys,
+    pub draw_keys_backward: nfs_formats::key::DrawKeys,
     /// Additional scenes whose GEOM props are instanced: the skill-test `_st<N>.scn` of the
     /// current mission (`RE/notes/skill-tests.md` §4 — only loaded for `RACE_TYPE 4`).
     pub extra_scenes: Vec<Scene>,
@@ -150,6 +153,13 @@ impl TrackAssets {
                 Err(_) => Ok(None),
             }
         };
+        let keys = |suffix: &str| -> nfs_formats::key::DrawKeys {
+            file(suffix)
+                .ok()
+                .and_then(|p| std::fs::read(p).ok())
+                .and_then(|d| nfs_formats::key::DrawKeys::parse(&d).ok())
+                .unwrap_or_default()
+        };
         let edges = match file(".edg") {
             Ok(p) => Some(EdgeFile::parse(&read(&p)?).map_err(fmt_err(&p))?),
             Err(_) => None,
@@ -176,6 +186,8 @@ impl TrackAssets {
             map,
             start_forward: scene("_fstart.scn")?,
             start_backward: scene("_bstart.scn")?,
+            draw_keys_forward: keys("_forward.key"),
+            draw_keys_backward: keys("_backwards.key"),
             cameras: scene("_cameras.scn")?,
             extra_scenes: Vec::new(),
             edges,

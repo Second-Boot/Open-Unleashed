@@ -66,6 +66,10 @@ pub struct CarCatalogEntry {
 pub struct PaintSet {
     pub package: u32,
     pub colours: [[u8; 3]; 3],
+    /// The same three colours in the dword form the front-end's colour accessors hand out and the
+    /// FE car object stores at `car+0x674` / `+0x67C` / `+0x680`: `b0<<24 | b1<<16 | b2<<8 | b3`
+    /// of the stored bytes (0x4F0C60, CONFIRMED). Kept so a save game can be written byte-exactly.
+    pub packed: [u32; 3],
 }
 
 /// One HUD dial definition (12 bytes of i16, CONFIRMED): face style (`speedK`/`speedM`/`tach.fsh`
@@ -130,7 +134,11 @@ pub fn parse_car_catalog(data: &[u8]) -> Result<Vec<CarCatalogEntry>, FormatErro
             }
             let package = crate::u32_le(r, o, "nfs5.car paint package")?;
             let c = |k: usize| [r[o + 4 + k * 4 + 1], r[o + 4 + k * 4 + 2], r[o + 4 + k * 4 + 3]];
-            paint_sets.push(PaintSet { package, colours: [c(0), c(1), c(2)] });
+            let packed = |k: usize| {
+                let b = &r[o + 4 + k * 4..o + 8 + k * 4];
+                u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+            };
+            paint_sets.push(PaintSet { package, colours: [c(0), c(1), c(2)], packed: [packed(0), packed(1), packed(2)] });
         }
         out.push(CarCatalogEntry {
             display_name: s(0x02, 50)?,

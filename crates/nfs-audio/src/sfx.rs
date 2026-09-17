@@ -72,7 +72,18 @@ pub struct CollisionSfx {
     gate: i32,
     front: Option<(VoiceId, usize)>,
     rear: Option<(VoiceId, usize)>,
-    horn: Option<VoiceId>,
+    /// road / tyre roll loop (voice 0x18, §4.4) and the slot it is playing
+    road: Option<(VoiceId, usize)>,
+    /// wind loop (voice 0x1A, slot 0x1F, §4.5)
+    wind: Option<VoiceId>,
+    /// `[0x5D1838]` / `[0x5D1840]` — the wind level random walk and its step
+    wind_level: i32,
+    wind_level_step: i32,
+    /// `[0x5D183C]` / `[0x5D1844]` — the wind pitch random walk (16.16) and its step
+    wind_pitch: i32,
+    wind_pitch_step: i32,
+    /// turbo / blower loop (voice 0, slot 0x0F, §4.6)
+    turbo: Option<VoiceId>,
 }
 
 impl CollisionSfx {
@@ -81,7 +92,23 @@ impl CollisionSfx {
         let data = std::fs::read(&path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         let bank = Bnk::parse(&data)?;
         tracing::info!(slots = bank.slot_count(), "collision bank loaded");
-        Ok(Self { bank, data, clips: HashMap::new(), last_pick: HashMap::new(), rng: 0x2545_F491, gate: 0, front: None, rear: None, horn: None })
+        Ok(Self {
+            bank,
+            data,
+            clips: HashMap::new(),
+            last_pick: HashMap::new(),
+            rng: 0x2545_F491,
+            gate: 0,
+            front: None,
+            rear: None,
+            road: None,
+            wind: None,
+            wind_level: 0x28,
+            wind_level_step: 1,
+            wind_pitch: 0x1_0000,
+            wind_pitch_step: 10,
+            turbo: None,
+        })
     }
 
     fn clip(&mut self, slot: usize) -> Option<Arc<Clip>> {
@@ -214,20 +241,118 @@ impl CollisionSfx {
         }
     }
 
-    /// Player horn (§4.6): the looped slot 5 while the button is held (slots 3/4 are per-car
-    /// one-shot variants chosen by a car-record flag that is not modelled — MEDIUM).
-    pub fn horn(&mut self, out: &AudioOutput, on: bool, master: f32) {
-        match (on, self.horn) {
-            (true, None) => {
-                if let Some(clip) = self.clip(5) {
-                    self.horn = Some(out.play(clip, master, 1.0, true));
+    /// §4.4 road / tyre roll — voice 0x18, `SND_coll` slots 0x11..0x1C picked by the surface nibble
+    /// (or 0x15 while the handbrake is locked). `gain` is the engine distance gain `A` of §4.1 and
+    /// `doppler` the same factor the engine layers use.
+    pub fn road_roll(&mut self, out: &AudioOutput, speed: f32, nibble: usize, handbrake: bool, gain: i32, doppler: f32, pan: f32, master: f32) {
+        let slot = 0x11 + if handbrake { 4 } else { nibble.min(11) };
+        let v = (speed.abs() as i32) * if nibble == 1 { 1 } else { 3 };
+        let level = (v / 2 + 64).clamp(0, 127);
+        let vol = (gain * (v - 15).max(0) / 128).min(122);
+        if vol == 0 {
+            if let Some((id, _)) = self.road.take() {
+                out.stop(id);
+            }
+            return;
+        }
+        let amp = level as f32 / 127.0 * (vol as f32 / 127.0) * master;
+        match self.road {
+            Some((id, s)) if s == slot => {
+                out.set(id, amp, doppler);
+                out.set_pan(id, pan);
+            }
+            _ => {
+                if let Some((id, _)) = self.road.take() {
+                    out.stop(id);
+                }
+                if let Some(c) = self.clip(slot) {
+                    self.road = Some((out.play_panned(c, amp, doppler, pan, true), slot));
                 }
             }
-            (false, Some(id)) => {
+        }
+    }
+
+    /// §4.5 wind — voice 0x1A, `SND_coll` slot 0x1F. The original plays it only from the attached
+    /// exterior view (mode 1); `active` is that condition. Level and pitch are random walks stepped
+    /// once per update.
+    pub fn wind(&mut self, out: &AudioOutput, active: bool, speed: f32, master: f32) {
+        if !active || speed.abs() < 0.5 {
+            if let Some(id) = self.wind.take() {
                 out.stop(id);
-                self.horn = None;
             }
-            _ => {}
+            return;
+        }
+        // [0x5D1838] 0x28..0x7F, [0x5D183C] 0xFA24..0x105DC
+        self.wind_level += self.wind_level_step;
+        if self.wind_level > 0x7F {
+            self.wind_level = 0x7F;
+            self.wind_level_step = -1 - (self.rand() & 7) as i32;
+        } else if self.wind_level < 0x28 {
+            self.wind_level = 0x28;
+            self.wind_level_step = (self.rand() & 7) as i32 + 1;
+        }
+        self.wind_pitch += self.wind_pitch_step;
+        if self.wind_pitch > 0x1_05DC {
+            self.wind_pitch = 0x1_05DC;
+            self.wind_pitch_step = -20 - (self.rand() % 80) as i32;
+        } else if self.wind_pitch < 0x0_FA24 {
+            self.wind_pitch = 0x0_FA24;
+            self.wind_pitch_step = (self.rand() % 50) as i32 + 10;
+        }
+        let s = (speed.abs() * 5.0) as i32;
+        let vol = (s * self.wind_level / 128).min(127);
+        let level = ((speed.abs() as i32) / 2 + 64).clamp(0, 127);
+        let amp = level as f32 / 127.0 * (vol as f32 / 127.0) * master;
+        let pitch = self.wind_pitch as f32 / 65536.0;
+        match self.wind {
+            Some(id) => out.set(id, amp, pitch),
+            None => {
+                if let Some(c) = self.clip(0x1F) {
+                    self.wind = Some(out.play(c, amp, pitch, true));
+                }
+            }
+        }
+    }
+
+    /// §4.6 turbo / blower — voice 0, `SND_coll` slot 0x0F. `boost` is the turbo state 0..1,
+    /// `throttle` the raw pedal 0..255, `base` the `.spl` aux volume for the view mode and `gain` the
+    /// engine distance gain. The shipped curve is silent below half the redline, jumps there and fades
+    /// to nothing at 0.9 × redline — reproduced as written.
+    #[allow(clippy::too_many_arguments)]
+    pub fn turbo(&mut self, out: &AudioOutput, boost: f32, throttle: u8, rpm: f32, redline: f32, base: i32, gain: i32, doppler: f32, pan: f32, master: f32) {
+        if boost <= 0.1 || redline <= 0.0 {
+            if let Some(id) = self.turbo.take() {
+                out.stop(id);
+            }
+            return;
+        }
+        let lvl = (base * gain / 128).min(127);
+        let f0 = throttle as f32 * boost / 127.5;
+        let g = if rpm > 0.5 * redline {
+            (0.9 * redline - rpm).max(0.0) / (0.9 * redline)
+        } else {
+            // the low branch can never be positive with the shipped constants
+            (0.5 * rpm - 0.25 * redline).max(0.0) / (0.25 * redline)
+        };
+        let vol = ((lvl as f32 * f0 * g) as i32).clamp(0, 127);
+        if vol == 0 {
+            if let Some(id) = self.turbo.take() {
+                out.stop(id);
+            }
+            return;
+        }
+        let pitch = (2.5 * rpm / redline + 0.5) * doppler;
+        let amp = 0x40 as f32 / 127.0 * (vol as f32 / 127.0) * master;
+        match self.turbo {
+            Some(id) => {
+                out.set(id, amp, pitch);
+                out.set_pan(id, pan);
+            }
+            None => {
+                if let Some(c) = self.clip(0x0F) {
+                    self.turbo = Some(out.play_panned(c, amp, pitch, pan, true));
+                }
+            }
         }
     }
 
@@ -235,7 +360,10 @@ impl CollisionSfx {
         for v in [self.front.take(), self.rear.take()].into_iter().flatten() {
             out.stop(v.0);
         }
-        if let Some(id) = self.horn.take() {
+        for id in [self.wind.take(), self.turbo.take()].into_iter().flatten() {
+            out.stop(id);
+        }
+        if let Some((id, _)) = self.road.take() {
             out.stop(id);
         }
     }

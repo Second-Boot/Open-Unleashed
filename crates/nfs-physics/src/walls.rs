@@ -1,6 +1,10 @@
-//! Wall collision against edge segments (APPROXIMATION — the original's collision response
-//! 0x49AEC0 / collision world `[obj+0x38]` have not been read; the segment data itself is the
-//! game's own `.edg` cache). Segments are treated as vertical walls in the xz plane.
+//! Wall geometry: the `.edg` cache's edge segments, treated as vertical walls in the xz plane.
+//!
+//! The *response* is the original's and lives in `vehicle::collide_walls`
+//! (`Car_wallCollide` 0x495020 + `WallImpulse` 0x494000, `RE/notes/suspension-collision.md`
+//! §6.1/§6.2). What is still unread is the original's collision **world** — the broad phase at
+//! 0x49AEC0 over `[obj+0x38]` — so this module does its own segment lookup over the same `.edg`
+//! data the game caches.
 
 use glam::{Vec2, Vec3};
 

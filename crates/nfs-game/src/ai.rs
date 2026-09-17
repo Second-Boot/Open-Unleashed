@@ -2,10 +2,12 @@
 //! target speed from the summed heading deviation over a speed-dependent lookahead (`.ais` tables),
 //! throttle/brake from the rpm error, steering toward the mean of four racing-line points ahead.
 //!
-//! Not yet reproduced: junction branch choice (main lap only), per-track curve/steer factors
-//! 0x4A2DC0/0x4A2950 beyond their defaults (1.0 / 0.85), skill randomisation (fe.txt has all
-//! skills 1.0), catch-up rubber band, damage/wet factors. Avoidance (§3.2) follows the notes for
-//! the two cars directly ahead in race order.
+//! The junction branch choice of `race-logic.md` §10.4 is in: once per junction the lookahead reaches,
+//! the car draws from the original's single global stream and picks a link, which every road preview
+//! then follows. Not yet reproduced: the per-track steer factor 0x4A2950 beyond its default (0.85),
+//! skill randomisation (fe.txt has all skills 1.0), damage/wet factors, and the tracker's
+//! `preferredSection` hop (the port's `find_slice` still hill-climbs). Avoidance (§3.2) follows the
+//! notes for the two cars directly ahead in race order.
 
 use crate::race::{RaceProgress, SliceTable};
 use glam::Vec3;
@@ -20,6 +22,8 @@ pub struct AiDriver {
     pub k_steer: f32,
     pub k_angle: f32,
     pub stuck_ticks: u32,
+    /// `car+0xD8B = 5` from the facing test: the car is pointing back down the route at speed.
+    pub wrong_way: bool,
     pub target_speed: f32,
     /// `.SKILL{SLOW,MEDIUM,FAST,DEFAULT}` means and `.SKILLRANGE*` half-ranges (§3.1); quick race
     /// uses 1.0 / 0 (fe.txt), career events `difficulty × per.mean[k]` / `per.range[k]` (0x4EBDA0).
@@ -27,11 +31,24 @@ pub struct AiDriver {
     pub skill_range: [f32; 4],
     /// Current bend class (0 slow, 1 medium, 2 fast) and the personal speed factor drawn for it.
     pub band: Option<u8>,
+    /// `SKILL [0x6573F4]` 0..2 — the difficulty the catch-up band is keyed on
+    pub skill: u8,
+    /// `car+0xE94` — the junction node a branch was last chosen at, so it is chosen only once
+    last_node: Option<usize>,
+    /// `car+0xE98` — the chosen link inside that node, passed to every road lookahead
+    pub link: Option<usize>,
+    /// `car+0x0C` — the tracker's preferred segment, the branch's segment index
+    pub preferred_segment: Option<usize>,
+    /// the human's progress in laps and average pace, for the catch-up band (§5.2 rule 1)
+    catchup: Option<(f32, f32)>,
     pub speed_factor: f32,
     /// LCG state (`0x5D1028 *= 0x5D102C`, §3.1 random draws).
     pub rng: u32,
     /// Road-width normaliser `[0x5E6E34]`: 12 by default, 10 on castle, 9 on forest (§10.4).
     pub wf_div: f32,
+    /// Track name and direction for the per-track speed zones (`crate::zones`, 0x4A2DC0).
+    pub track: String,
+    pub backwards: bool,
     /// Debug: slices ahead of the last steering target and its lateral offset from the centreline.
     pub dbg_n: i32,
     pub dbg_offset: f32,
@@ -44,7 +61,7 @@ const CURVE_FACTOR: f32 = 1.0;
 
 impl AiDriver {
     pub fn new(data: AiCarData, specs: &CarSpecs, sim_tail: &[f32; 22]) -> Self {
-        Self { data, k_lookahead: sim_tail[19], k_steer: sim_tail[20] * STEER_FACTOR, k_angle: sim_tail[21], stuck_ticks: 0, target_speed: 0.0, skill_mean: [1.0; 4], skill_range: [0.0; 4], band: None, speed_factor: 1.0, rng: 0x1234_5679, wf_div: 12.0, dbg_n: 0, dbg_offset: 0.0, dbg_dot: 0.0 }
+        Self { data, k_lookahead: sim_tail[19], k_steer: sim_tail[20] * STEER_FACTOR, k_angle: sim_tail[21], stuck_ticks: 0, wrong_way: false, target_speed: 0.0, skill_mean: [1.0; 4], skill_range: [0.0; 4], band: None, skill: 0, catchup: None, last_node: None, link: None, preferred_segment: None, speed_factor: 1.0, rng: 0x1234_5679, wf_div: 12.0, track: String::new(), backwards: false, dbg_n: 0, dbg_offset: 0.0, dbg_dot: 0.0 }
             .tap(|d| {
                 // curve factor applies to the speed curve (§2.1); default 1.0
                 for v in d.data.bend_speed.iter_mut() {
@@ -54,10 +71,11 @@ impl AiDriver {
             })
     }
 
-    /// Per-track road-width normaliser (0x4A2DC0: castle 10, forest 9, else 12).
-    pub fn set_track(&mut self, track: &str) {
-        let t = track.to_ascii_lowercase();
-        self.wf_div = if t.starts_with("castle") { 10.0 } else if t.starts_with("forest") { 9.0 } else { 12.0 };
+    /// Per-track road-width normaliser and speed zones (0x4A2DC0).
+    pub fn set_track(&mut self, track: &str, backwards: bool) {
+        self.wf_div = crate::zones::width_divisor(track);
+        self.track = track.to_ascii_lowercase();
+        self.backwards = backwards;
     }
 
     /// Speed estimate `car+0x35C = max(|vx|,|vz|) + 0.25·min(|vx|,|vz|)` used by the AI.
@@ -82,6 +100,19 @@ impl AiDriver {
     }
 
     /// Personal speed factor `car+0xEA0`: redrawn whenever the bend class changes (§3.1).
+    /// Catch-up rubber band (`ai.md` §3.1 tail / §5.2 rule 1, CONFIRMED). `player_progress` is the
+    /// human's progress in laps (`car+0xAF8`), `pace` the `(progress − start)·640000/tick` term.
+    /// At `SKILL` 0 the multiplier is 1.0, so the band does nothing — which is the shipped setting.
+    pub fn set_catchup(&mut self, skill: u8, player_progress: f32, pace: f32) {
+        self.skill = skill.min(2);
+        self.catchup = Some((player_progress, pace));
+    }
+
+    /// `0x5CC384` — how close in laps the opponent must be for the band to apply.
+    const LAP_BAND: [f32; 3] = [1.0, 0.07, 0.03];
+    /// `0x5CC378` — the target-speed multiplier once it does.
+    const BAND_MULT: [f32; 3] = [1.0, 0.98, 0.95];
+
     fn draw_speed_factor(&mut self, band: u8) {
         if self.band == Some(band) {
             return;
@@ -92,6 +123,65 @@ impl AiDriver {
         let b = band as usize;
         self.speed_factor = if r01 <= self.skill_mean[b] { self.skill_mean[b] + self.skill_range[b] * u(self) } else { base };
         self.band = Some(band);
+    }
+
+    /// `0x5CC390..0x5CC3A4` — the fixed fork thresholds for the two easier difficulties.
+    const FORK_T2: [f32; 2] = [0.55, 0.70];
+    const FORK_A: [f32; 2] = [0.40, 0.50];
+    const FORK_B: [f32; 2] = [0.70, 0.80];
+
+    /// The branch choice of `race-logic.md` §10.4, run once per junction the lookahead reaches.
+    ///
+    /// On the hardest difficulty the `.jnc` weights *are* the probabilities; on the two easier ones a
+    /// fork is re-weighted by fixed thresholds against the weight buckets 0.5 / 0.4 / 0.3, which the
+    /// shipped data is authored around (every two-way fork is 0.85/0.15 and every three-way one
+    /// 0.6/0.3/0.1). Choosing sets the link every road lookahead then follows and the segment the
+    /// tracker prefers.
+    fn choose_branch(&mut self, table: &SliceTable, slice: usize, lookahead: i32) {
+        let Some(node) = table.junction_within(slice, lookahead) else { return };
+        if self.last_node == Some(node) {
+            return;
+        }
+        self.last_node = Some(node);
+        // the branch draw comes from the original's single global stream, not the car's own
+        let r = crate::rng::rand01();
+        let want = table.graph_want();
+        let links = &table.junctions.nodes[node].links;
+        let mode = self.skill.min(2) as usize;
+        let matches = links.iter().filter(|l| l.dir() == want).count();
+        let mut cum = 0.0;
+        for (i, l) in links.iter().enumerate() {
+            if l.dir() != want {
+                continue;
+            }
+            let w = table.junctions.segments[l.segment].weight[l.end];
+            let take = if mode >= 2 {
+                cum += w;
+                r < cum
+            } else {
+                match matches {
+                    2 => (r <= Self::FORK_T2[mode]) == (w >= 0.5),
+                    3 => {
+                        if r <= Self::FORK_A[mode] {
+                            w >= 0.4
+                        } else if r <= Self::FORK_B[mode] {
+                            (0.3..0.4).contains(&w)
+                        } else {
+                            w < 0.3
+                        }
+                    }
+                    // one match, or a fork shape the thresholds do not cover: take the first
+                    _ => true,
+                }
+            };
+            if take {
+                tracing::debug!(node, link = i, segment = l.segment, weight = w, r, matches, mode, "AI takes a branch");
+                self.link = Some(i);
+                self.preferred_segment = Some(l.segment);
+                return;
+            }
+        }
+        // nothing matched: the previous branch stands
     }
 
     /// Target speed 0x40B650 (m/s).
@@ -105,8 +195,11 @@ impl AiDriver {
         let idx = ((speed * 0.2 * self.k_lookahead).min(23.0).round() as usize).min(23);
         let lookahead = self.data.lookahead[idx].max(0.0).round() as usize;
         let (mut max_l, mut max_r) = (0f32, 0f32);
+        // §10.4: pick a branch once per junction, then let every road preview follow it
+        self.choose_branch(table, s0, lookahead as i32);
+        let link = self.link;
         for k in 2..=lookahead.max(2) {
-            let s = table.add(s0, k as i32);
+            let s = table.add_graph(s0, k as i32, link);
             let sl = &table.slices[s];
             let a = sl.forward.dot(fwd0).clamp(-1.0, 1.0).acos().to_degrees();
             if sl.lateral.dot(fwd0) < 0.0 {
@@ -115,7 +208,9 @@ impl AiDriver {
                 max_l = max_l.max(a);
             }
         }
-        let ang = ((max_l + max_r) * self.k_angle).min(115.0);
+        // per-track zone multiplier on the bend angle (0x4A2DC0 zones, ai.md §2.3)
+        let zone = crate::zones::zone_mult(&self.track, self.backwards, s0);
+        let ang = ((max_l + max_r) * self.k_angle * zone).min(115.0);
         let c3 = (ang / 3.0) as usize;
         let mut vt = self.data.bend_speed[c3.min(39)];
         // surface factor from the car's surface (`car+0x464`): dry table row × class column, ≤ 1
@@ -125,7 +220,16 @@ impl AiDriver {
         // personal speed factor per bend class (slow > 20, medium 10..20, fast ≤ 10)
         let band = if c3 > 20 { 0 } else if c3 > 10 { 1 } else { 2 };
         self.draw_speed_factor(band);
-        vt * self.speed_factor * wf
+        let mut vt = vt * self.speed_factor * wf;
+        // catch-up: a slow human close by holds the field back a little
+        if let Some((player_progress, pace)) = self.catchup {
+            let own = race.progress;
+            let k = self.skill as usize;
+            if (own - player_progress).abs() < Self::LAP_BAND[k] && pace > 0.0 && pace < 35.0 {
+                vt *= Self::BAND_MULT[k];
+            }
+        }
+        vt
     }
 
     /// Steering / throttle / brake 0x40BFE0. `ahead` = up to two cars directly ahead in race order:
@@ -164,7 +268,7 @@ impl AiDriver {
         };
         let mut target = Vec3::ZERO;
         for i in 0..4 {
-            target += point(table.add(s0, n + i));
+            target += point(table.add_graph(s0, n + i, self.link));
         }
         target *= 0.25;
         // avoidance (§10.2, CONFIRMED): racing cars stand off `t` metres from the centre of a car
@@ -193,18 +297,23 @@ impl AiDriver {
             self.dbg_offset = (target - sl.centre).dot(sl.lateral);
         }
         let steer = if std::env::var_os("NFS_AI_FLIP").is_some() { -steer } else { steer };
-        // stuck detection (5 s below 2 m/s after the start)
+        // `AIState_Racing` 0x40CA20's reset triggers (`ai.md` §3.2): five seconds below 2 m/s after
+        // the start, or facing the wrong way at more than 10 m/s — `dot(slice forward, car
+        // forward) < −0.707`, the sign flipped when the race runs backwards.
         if v.v_long() < 2.0 && v.race_started {
             self.stuck_ticks += 1;
         } else {
             self.stuck_ticks = 0;
         }
+        let facing = table.slices[s0].forward.normalize_or_zero().dot(v.forward());
+        self.wrong_way = v.race_started && v.speed() > 10.0 && if self.backwards { facing > 0.707 } else { facing < -0.707 };
         Controls { throttle, brake, steer, handbrake: false, gear_request: None }
     }
 
     pub fn wants_reset(&mut self) -> bool {
-        if self.stuck_ticks >= 0xA0 {
+        if self.stuck_ticks >= 0xA0 || self.wrong_way {
             self.stuck_ticks = 0;
+            self.wrong_way = false;
             true
         } else {
             false
@@ -219,3 +328,19 @@ trait Tap: Sized {
     }
 }
 impl<T> Tap for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_catchup_band_only_bites_above_skill_0() {
+        // the constants of 0x5CC378 / 0x5CC384: no effect at beginner, 2 % at medium, 5 % at hard
+        assert_eq!(AiDriver::BAND_MULT[0], 1.0);
+        assert_eq!(AiDriver::LAP_BAND[0], 1.0);
+        assert!((AiDriver::BAND_MULT[1] - 0.98).abs() < 1e-6);
+        assert!((AiDriver::BAND_MULT[2] - 0.95).abs() < 1e-6);
+        // and the window tightens as the difficulty rises
+        assert!(AiDriver::LAP_BAND[2] < AiDriver::LAP_BAND[1], "the window tightens as the difficulty rises");
+    }
+}

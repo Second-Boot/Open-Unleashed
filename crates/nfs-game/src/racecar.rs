@@ -32,6 +32,10 @@ pub struct RaceCar {
 
 impl RaceCar {
     pub fn controls_for(&mut self, player: &Controls, table: &SliceTable, line: Option<&nfs_formats::ais::RacingLine>, tick: u64, ahead: &[(Vec3, usize, f32, f32, bool)]) -> Controls {
+        // finish state 2 (`ai.md` §3.2): throttle 0, full brake
+        if self.progress.finished && !matches!(self.controller, Controller::Player) {
+            return Controls { brake: 255, ..Default::default() };
+        }
         match &mut self.controller {
             Controller::Player => *player,
             Controller::Parked => Controls { brake: 254, ..Default::default() },

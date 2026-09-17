@@ -46,6 +46,11 @@ pub struct SliceTable {
     pub route_pos: Vec<u32>,
     /// slices of the main lap (= `route.len()`)
     pub lap_len: usize,
+    /// the derived junction graph (`race-logic.md` §10): segments, nodes and the branch weights
+    pub junctions: crate::junctions::Junctions,
+    /// true when this table is the reversed view of the track, so a step along the lap route is a step
+    /// **backwards** through the junction graph
+    pub backwards: bool,
 }
 
 /// Maximum gap between a section's last slice (advanced one spacing) and the next section's first.
@@ -104,55 +109,30 @@ impl SliceTable {
         Ok(Self::build(slices, sections))
     }
 
-    /// Chain the sections into the main lap and index every slice on it.
+    /// Build the junction graph and lay the main lap out along it (`race-logic.md` §10).
+    ///
+    /// The original derives the graph from the slice geometry at load: a segment is cut wherever another
+    /// segment's end passes within 16 m of it in plan view, the ends that share a 16 m circle become
+    /// junction nodes, and the **main lap is the longest forward-link walk out of node 0** — not
+    /// "section 0". The node count this produces matches every shipped `<track>.jnc` exactly, which is
+    /// the check the original itself applies before it will load that file's branch weights.
     pub fn build(slices: Vec<Slice>, mut sections: Vec<Section>) -> Self {
-        // main-lap chain: from section 0 follow the exit → nearest section start
-        let mut chain = vec![0usize];
-        loop {
-            let cur = &sections[*chain.last().unwrap()];
-            let end = &slices[cur.last];
-            let probe = end.centre + end.forward * SLICE_SPACING;
-            // candidates: section starts within the junction radius; at a fork keep the section
-            // that continues straightest (then the longer one) — the main road, not the exit ramp
-            // (MEDIUM: the original's link order / `.jnc` weights were not reproduced)
-            let mut best: Option<(f32, usize, usize)> = None;
-            for (j, sec) in sections.iter().enumerate() {
-                if chain.contains(&j) && j != 0 {
-                    continue;
-                }
-                let d = (slices[sec.first].centre - probe).length();
-                if d > JUNCTION_RADIUS {
-                    continue;
-                }
-                let align = slices[sec.first].forward.dot(end.forward);
-                let len = sec.last - sec.first + 1;
-                let better = match best {
-                    None => true,
-                    Some((a, l, _)) => align > a + 0.05 || ((align - a).abs() <= 0.05 && len > l),
-                };
-                if better {
-                    best = Some((align, len, j));
-                }
-            }
-            match best {
-                Some((_, _, 0)) | None => break,
-                Some((_, _, j)) => chain.push(j),
-            }
-        }
-        let route: Vec<usize> = chain.iter().flat_map(|&j| sections[j].first..=sections[j].last).collect();
+        let centres: Vec<Vec3> = slices.iter().map(|s| s.centre).collect();
+        let ranges: Vec<(usize, usize)> = sections.iter().map(|s| (s.first, s.last)).collect();
+        let junctions = crate::junctions::Junctions::build(&centres, &ranges);
+        let chain: Vec<(usize, usize)> = junctions.lap_route.iter().map(|&i| (junctions.segments[i].first, junctions.segments[i].last)).collect();
+        let route: Vec<usize> = chain.iter().flat_map(|&(a, b)| a..=b).collect();
         let lap_len = route.len().max(1);
         let mut route_pos = vec![u32::MAX; slices.len()];
         for (p, &s) in route.iter().enumerate() {
             route_pos[s] = p as u32;
         }
-        // lap fractions per section; branch slices map to the nearest lap slice (xz distance)
-        let mut pos_in_chain = 0usize;
-        for (j, sec) in sections.iter_mut().enumerate() {
-            if chain.contains(&j) {
-                let len = sec.last - sec.first + 1;
-                sec.f0 = pos_in_chain as f32 / lap_len as f32;
-                sec.f1 = (pos_in_chain + len) as f32 / lap_len as f32;
-                pos_in_chain += len;
+        // lap fractions per section, from where its slices sit on the lap; branch sections keep 0..1
+        for sec in sections.iter_mut() {
+            let (a, b) = (route_pos[sec.first], route_pos[sec.last]);
+            if a != u32::MAX && b != u32::MAX && a <= b {
+                sec.f0 = a as f32 / lap_len as f32;
+                sec.f1 = (b + 1) as f32 / lap_len as f32;
             }
         }
         for s in 0..slices.len() {
@@ -169,7 +149,7 @@ impl SliceTable {
                 route_pos[s] = best.1;
             }
         }
-        Self { slices, sections, route, route_pos, lap_len }
+        Self { slices, sections, route, route_pos, lap_len, junctions, backwards: false }
     }
 
     /// The same track driven backwards: the lap route runs the other way and every slice's
@@ -193,6 +173,10 @@ impl SliceTable {
         for (p, &s) in t.route.iter().enumerate() {
             t.route_pos[s] = p as u32;
         }
+        // the junction graph is geometric, so it survives the flip unchanged — but walking it now runs
+        // the other way, which `add_graph`'s callers express by asking for a negative delta. The lap
+        // route above is what carries the reversal; `backwards` records it for them.
+        t.backwards = !t.backwards;
         t
     }
 
@@ -251,6 +235,67 @@ impl SliceTable {
         let p = self.route_pos.get(slice).copied().unwrap_or(0) as i32;
         self.route[(p + delta).rem_euclid(n) as usize]
     }
+
+    /// Load `<track>.jnc`'s branch weights. The original rejects the file unless its size is exactly
+    /// `36 × nNodes`; so does this.
+    pub fn apply_jnc(&mut self, data: &[u8]) -> bool {
+        self.junctions.apply_jnc(data)
+    }
+
+    /// `junctionWithin` **0x4816F0** in the table's own frame: a positive `delta` always means "ahead
+    /// along the lap", whichever way this table runs.
+    pub fn junction_within(&self, slice: usize, delta: i32) -> Option<usize> {
+        let d = if self.backwards { -delta } else { delta };
+        self.junctions.junction_within(slice, d)
+    }
+
+    /// The link direction that means "onward along the lap" in this table's frame (`link+0xC`).
+    pub fn graph_want(&self) -> usize {
+        if self.backwards { 1 } else { 0 }
+    }
+
+    /// `addSlices` **0x4817D0** (`race-logic.md` §10, `traffic.md` §23.0) — slice arithmetic along the
+    /// real junction graph rather than along the precomputed lap route.
+    ///
+    /// Walking off the end of a segment crosses that segment's junction node and continues into one of
+    /// its links: the caller's `link` when it has chosen a branch, otherwise the **last** link whose
+    /// direction matches the way we are walking. A dead end clamps, which is what makes a
+    /// point-to-point track stop at its ends instead of wrapping.
+    pub fn add_graph(&self, slice: usize, delta: i32, mut link: Option<usize>) -> usize {
+        // on a reversed table a positive step along the lap is a negative step through the graph
+        let delta = if self.backwards { -delta } else { delta };
+        let j = &self.junctions;
+        let Some(mut seg) = j.segments.iter().position(|s| slice >= s.first && slice <= s.last) else {
+            return slice;
+        };
+        let mut s = slice as i32 + delta;
+        // the original loops until the position lands inside a segment; bound it so a cyclic graph and a
+        // huge delta cannot spin for ever
+        for _ in 0..64 {
+            let (first, last) = (j.segments[seg].first as i32, j.segments[seg].last as i32);
+            if s >= first && s <= last {
+                return (s.max(0) as usize).min(self.slices.len().saturating_sub(1));
+            }
+            let edge = if s > last { last } else { first } as usize;
+            let Some(node) = j.slice_node.get(edge).copied().flatten() else { return edge };
+            let rest = s - edge as i32 - 1;
+            let want = if delta <= 0 { 1 } else { 0 };
+            let k = match link.take() {
+                Some(k) if k < j.nodes[node].links.len() => k,
+                _ => {
+                    // the original's loop does not break, so the LAST matching link wins
+                    match j.nodes[node].links.iter().rposition(|l| l.dir() == want) {
+                        Some(k) => k,
+                        None => return slice,
+                    }
+                }
+            };
+            let l = j.nodes[node].links[k];
+            s = j.segments[l.segment].end_slice(l.end) as i32 + rest;
+            seg = l.segment;
+        }
+        (s.max(0) as usize).min(self.slices.len().saturating_sub(1))
+    }
 }
 
 /// Per-car race bookkeeping (`car+0x530..`).
@@ -265,18 +310,47 @@ pub struct RaceProgress {
     pub lap_times: Vec<u64>,
     pub wrong_way_ticks: u32,
     pub finished: bool,
+    /// Lap fraction the car started from (needed for the projected time of a car that is still
+    /// racing when the race ends, `Race_finalize` 0x416AC0).
+    pub start_progress: f32,
 }
 
 impl RaceProgress {
     pub fn new(start_slice: usize, table: &SliceTable) -> Self {
         let p = table.frac(start_slice);
-        Self { slice: start_slice, progress: p, prev_progress: p, ..Default::default() }
+        Self { slice: start_slice, progress: p, prev_progress: p, start_progress: p, ..Default::default() }
+    }
+
+    /// `Race_finalize` 0x416AC0 (CONFIRMED): the finishing time of a car that is still racing when
+    /// the race ends is extrapolated from how far it got. `elapsed` = ticks since the start
+    /// (`tick − 448`), `circuit` selects the two formulas of the original.
+    pub fn projected_ticks(&self, elapsed: u64, num_laps: u32, circuit: bool) -> u64 {
+        if self.finished {
+            return self.lap_times.iter().sum();
+        }
+        let laps = num_laps.max(1) as f32;
+        if circuit {
+            let frac = (self.progress / laps).max(1e-4);
+            (elapsed as f32 / frac) as u64
+        } else {
+            let span = (1.0 - self.start_progress).max(1e-4);
+            let mut ratio = (self.progress - self.start_progress).max(0.001) / span;
+            if ratio < 0.005 {
+                ratio *= 250_000.0;
+            }
+            (laps * elapsed as f32 / ratio) as u64
+        }
     }
 
     /// Update at 32 Hz (even ticks): tracker, `Lap_check` 0x417440, `Race_updateProgress` 0x416310,
     /// wrong-way 0x4A7660. Returns true when a lap was completed this call.
     pub fn update(&mut self, table: &SliceTable, pos: Vec3, forward: Vec3, tick: u64, num_laps: u32) -> bool {
         self.slice = table.find_slice(pos, self.slice);
+        // finished / eliminated cars leave the progress accounting (0x4169B0: `state >= 2 ⇒ return`),
+        // so their lap list and rank freeze at the finish
+        if self.finished {
+            return false;
+        }
         let frac = table.frac(self.slice);
         let new = self.laps as f32 + frac - self.unlaps as f32;
         let fn_ = frac;
@@ -410,5 +484,63 @@ mod tests {
         assert_eq!(p.wrong_way_ticks, 1);
         p.update(&t, t.slices[10].centre, t.slices[10].forward, 2, 3);
         assert_eq!(p.wrong_way_ticks, 0);
+    }
+}
+
+#[cfg(test)]
+mod finish_tests {
+    use super::*;
+
+    /// A finished car stops accumulating laps and keeps its finishing progress (0x4169B0).
+    #[test]
+    fn progress_freezes_after_the_finish() {
+        let n = 100;
+        let r = n as f32 * SLICE_SPACING / std::f32::consts::TAU;
+        let slices: Vec<Slice> = (0..n)
+            .map(|i| {
+                let a = i as f32 / n as f32 * std::f32::consts::TAU;
+                let centre = Vec3::new(a.cos() * r, 0.0, a.sin() * r);
+                let forward = Vec3::new(-a.sin(), 0.0, a.cos());
+                Slice { centre, up: Vec3::Y, forward, lateral: Vec3::Y.cross(forward), lane_mask: 0, lanes_a: 1, lanes_b: 1, width_a: 5.0, width_b: 5.0, lane_width_a: 5.0, lane_width_b: 5.0 }
+            })
+            .collect();
+        let t = SliceTable::build(slices, vec![Section { first: 0, last: n - 1, f0: 0.0, f1: 1.0 }]);
+        let mut p = RaceProgress::new(0, &t);
+        for step in 1..=250usize {
+            let s = step % n;
+            p.update(&t, t.slices[s].centre, t.slices[s].forward, step as u64, 1);
+        }
+        assert!(p.finished);
+        assert_eq!(p.laps, 1);
+        assert_eq!(p.lap_times.len(), 1, "no laps after the finish");
+        assert!((p.progress - 1.0).abs() < 0.01);
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    fn progress(p: f32, start: f32) -> RaceProgress {
+        RaceProgress { progress: p, start_progress: start, ..Default::default() }
+    }
+
+    #[test]
+    fn projected_time_extrapolates_the_pace() {
+        // circuit: half of a 2-lap race done in 60 s → projected 120 s
+        let p = progress(1.0, 0.0);
+        assert_eq!(p.projected_ticks(60 * 64, 2, true), 120 * 64);
+        // point-to-point: 40 % of the way in 40 s → 100 s
+        let p = progress(0.4, 0.0);
+        assert_eq!(p.projected_ticks(40 * 64, 1, false), 100 * 64);
+        // a car that started mid-track is measured from its own start fraction
+        // 0.2 → 0.6 of the way (half the remaining span) in 40 s → 80 s
+        let p = progress(0.6, 0.2);
+        assert!((p.projected_ticks(40 * 64, 1, false) as i64 - 80 * 64).abs() <= 2);
+        // finished cars report their real total
+        let mut f = progress(1.0, 0.0);
+        f.finished = true;
+        f.lap_times = vec![1000, 1100];
+        assert_eq!(f.projected_ticks(9999, 2, true), 2100);
     }
 }
