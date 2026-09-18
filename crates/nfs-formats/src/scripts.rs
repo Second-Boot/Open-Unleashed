@@ -35,6 +35,7 @@ pub mod mask {
     pub const SWIPE: u32 = 1 << 5;
     pub const SWERVE: u32 = 1 << 9;
     pub const WIPE_OUT: u32 = 1 << 11;
+    /// `0x4013D0`'s second horn test — the pattern `HonkPattern` plays, not the plain loop
     pub const CRAZY_HORN: u32 = 1 << 12;
 }
 

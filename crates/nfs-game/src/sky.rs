@@ -6,10 +6,15 @@
 //! the rest alpha-blended (the shipped tracks are all `MULTINORMAL` or `basic`). The `horz` horizon
 //! strips keep their ring.
 //!
-//! **APPROXIMATION** in what is left: the dome itself (the original's ring geometry lives in
-//! `Sky/<Track>.bin`, unread), the mapping from "wind speed 0..10" and "move ratio 50 fast, 400
-//! slow" to a scroll rate, and the warp, which is ignored. Weather region B is parsed but never
-//! selected, since what picks between A and B has not been traced.
+//! The **horizon ring is the original's own** now (`RE/RENDERING.md`, sky `.bin`): sixteen quads on
+//! a circle of the radius the `.bin`'s weather-region-A record gives, spanning `+0x14` to
+//! `+0x14 + +0x18` in y, each showing the tile of the `horz` grid the `.bin` names for it (mirrored
+//! where it says so) and tinted per corner from the `hzcl` 16 × 2 strip, rotated by `+0x08`.
+//!
+//! **APPROXIMATION** in what is left: the sky layers' dome (the original puts them on rings too),
+//! the mapping from "wind speed 0..10" and "move ratio 50 fast, 400 slow" to a scroll rate, and the
+//! warp, which is ignored. Weather region B is parsed but never selected, since what picks between
+//! A and B has not been traced; the three per-slice tracks in the `.bin` are parsed but unused.
 
 use glam::Vec3;
 use nfs_assets::track::TrackAssets;
@@ -40,6 +45,38 @@ fn dome_uv(radius: f32, rings: u32, segs: u32, uv_scale: [f32; 2], y_min: f32) -
             // inward-facing (viewed from inside): reverse winding
             m.indices.extend_from_slice(&[a, a + 1, b, a + 1, b + 1, b]);
         }
+    }
+    m
+}
+
+/// The horizon ring of `Sky/<Track>.bin`: sixteen quads, each one tile of the `horz` grid, with the
+/// four `hzcl` colours of its two edges. `colour(i)` is the strip's pixel `i` on row 0 (the top) and
+/// row 1 (the bottom); the original reads them as two runs of sixteen dwords 0x40 bytes apart
+/// (0x459D8F / 0x459DE5), which is exactly the two rows of the 16 × 2 image.
+fn horizon_ring(bin: &nfs_formats::sky::SkyBin, y0: f32, y1: f32, colour: impl Fn(usize, usize) -> [f32; 4]) -> MeshData {
+    let mut m = MeshData::default();
+    // the file's radius is in metres (500 … 1500) but the whole sky is rebuilt at `RADIUS` and then
+    // scaled into the camera's far plane, so the ring is normalised here and its heights with it —
+    // the shape the data asks for is the ratio, not the absolute size
+    let k = RADIUS * 0.9 / bin.rings[0].radius.max(1.0);
+    let (r, y0, y1) = (RADIUS * 0.9, y0 * k, y1 * k);
+    for k in 0..16usize {
+        let uv = bin.segment_uv(k);
+        let c = bin.segment_colour(k);
+        let p = |j: usize| {
+            // the original steps 1/16 of a turn per vertex (0x3D800000 = 0.0625, 0x45A03D)
+            let az = (k + j) as f32 / 16.0 * std::f32::consts::TAU;
+            (az.cos() * r, az.sin() * r)
+        };
+        let (x0, z0) = p(0);
+        let (x1, z1) = p(1);
+        let base = m.vertices.len() as u32;
+        let v = |x: f32, z: f32, y: f32, u: f32, vv: f32, col: [f32; 4]| Vertex { position: [x, y, z], normal: [0.0, 1.0, 0.0], uv: [u, vv], color: col };
+        m.vertices.push(v(x0, z0, y1, uv[0], uv[2], colour(c[0], 0)));
+        m.vertices.push(v(x1, z1, y1, uv[1], uv[2], colour(c[1], 0)));
+        m.vertices.push(v(x0, z0, y0, uv[0], uv[3], colour(c[0], 1)));
+        m.vertices.push(v(x1, z1, y0, uv[1], uv[3], colour(c[1], 1)));
+        m.indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
     }
     m
 }
@@ -86,9 +123,29 @@ impl Sky {
         if let Some(hz) = find("horz") {
             let id = tex(r, hz);
             let m = sky_mat(r, id, true);
-            // two 256×128 strips: top half = far layer, bottom half = near layer (HYPOTHESIS)
-            parts.push((r.upload_mesh(&ring(RADIUS * 0.96, -RADIUS * 0.02, RADIUS * 0.12, 64, 4.0, 0.0, 0.5)), m, [0.0, 0.0]));
-            parts.push((r.upload_mesh(&ring(RADIUS * 0.94, -RADIUS * 0.02, RADIUS * 0.10, 64, 5.0, 0.5, 1.0)), m, [0.0, 0.0]));
+            match track.sky_bin.as_ref().filter(|b| b.tile_cols > 0) {
+                // the ring the track's own `.bin` describes
+                Some(bin) => {
+                    let hzcl = find("hzcl");
+                    let colour = |i: usize, row: usize| -> [f32; 4] {
+                        let Some(t) = hzcl else { return [1.0; 4] };
+                        let (w, h) = (t.width as usize, t.height as usize);
+                        let Some(px) = t.mips.first() else { return [1.0; 4] };
+                        if w == 0 || h == 0 || px.len() < w * h * 4 {
+                            return [1.0; 4];
+                        }
+                        let o = ((row.min(h - 1)) * w + i.min(w - 1)) * 4;
+                        [px[o] as f32 / 255.0, px[o + 1] as f32 / 255.0, px[o + 2] as f32 / 255.0, 1.0]
+                    };
+                    let (y0, y1) = (bin.height_pair[0], bin.height_pair[0] + bin.height_pair[1]);
+                    parts.push((r.upload_mesh(&horizon_ring(bin, y0, y1, colour)), m, [0.0, 0.0]));
+                }
+                // no `.bin`: the old two-strip guess
+                None => {
+                    parts.push((r.upload_mesh(&ring(RADIUS * 0.96, -RADIUS * 0.02, RADIUS * 0.12, 64, 4.0, 0.0, 0.5)), m, [0.0, 0.0]));
+                    parts.push((r.upload_mesh(&ring(RADIUS * 0.94, -RADIUS * 0.02, RADIUS * 0.10, 64, 5.0, 0.5, 1.0)), m, [0.0, 0.0]));
+                }
+            }
         }
         if parts.is_empty() { None } else { Some(Self { parts }) }
     }

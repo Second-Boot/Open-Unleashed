@@ -13,6 +13,7 @@ nfs-assets.workspace = true
 nfs-formats.workspace = true
 nfs-renderer.workspace = true
 nfs-game.workspace = true
+nfs-net.workspace = true
 nfs-input.workspace = true
 nfs-physics.workspace = true
 winit.workspace = true

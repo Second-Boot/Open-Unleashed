@@ -19,6 +19,12 @@ use std::sync::Arc;
 /// `SND_coll` slot 0x10 — the AI road-roll loop.
 pub const AI_ROAD_SLOT: usize = 0x10;
 
+/// `SND_coll` slots 0xA / 0xB — the AI horn (`sfx.md` §4.6, §6). `0x4A754B` plays
+/// `0xA + (*(u32*)car[0x558] == 0x30)` on voice `aiIndex + 0x27`, and §6's "slots 6, 10, 11 force
+/// kind 3" routes that to `SND_coll` whatever the voice table says. Which car-info records carry
+/// `0x30` in their first dword was not identified, so the port always takes slot 0xA.
+pub const AI_HORN_SLOT: usize = 0xA;
+
 fn curve(i: i32) -> i32 {
     WEIGHT_CURVE[i.clamp(0, 128) as usize] as i32
 }
@@ -37,6 +43,7 @@ struct CarVoices {
     near: Option<VoiceId>,
     far: Option<VoiceId>,
     road: Option<VoiceId>,
+    horn: Option<VoiceId>,
     set: String,
 }
 
@@ -44,6 +51,7 @@ pub struct AiEngines {
     /// `<set>` → (lden, ldex) samples
     sets: HashMap<String, (Option<Arc<Clip>>, Option<Arc<Clip>>)>,
     road: Option<Arc<Clip>>,
+    horn: Option<Arc<Clip>>,
     cars: Vec<CarVoices>,
     viv: Vec<u8>,
 }
@@ -52,11 +60,14 @@ impl AiEngines {
     pub fn load(sounds_dir: &Path) -> anyhow::Result<Self> {
         let viv = std::fs::read(sounds_dir.join("zzzwzzz.viv"))?;
         Bigf::parse(&viv)?; // fail early when the archive is unreadable
-        let road = std::fs::read(sounds_dir.join("SND_coll.bnk"))
-            .ok()
-            .and_then(|d| Bnk::parse(&d).ok().and_then(|b| b.decode_slot(&d, AI_ROAD_SLOT).ok()))
-            .map(|p| Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range, gain: p.gain }));
-        Ok(Self { sets: HashMap::new(), road, cars: Vec::new(), viv })
+        let coll = std::fs::read(sounds_dir.join("SND_coll.bnk")).ok();
+        let slot = |n: usize| -> Option<Arc<Clip>> {
+            let d = coll.as_ref()?;
+            let p = Bnk::parse(d).ok()?.decode_slot(d, n).ok()?;
+            Some(Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range, gain: p.gain }))
+        };
+        let (road, horn) = (slot(AI_ROAD_SLOT), slot(AI_HORN_SLOT));
+        Ok(Self { sets: HashMap::new(), road, horn, cars: Vec::new(), viv })
     }
 
     fn samples(&mut self, set: &str) -> (Option<Arc<Clip>>, Option<Arc<Clip>>) {
@@ -139,9 +150,34 @@ impl AiEngines {
         }
     }
 
+    /// The AI horn of `sfx.md` §4.6 — the loop an AI car sounds while its `scripts.bin` `HONK_HORN`
+    /// action is running (`traffic.md` §12.3: `0x4013D0` calls `Honk(car, 1)` on mask 8, and
+    /// `0x4A754B` keeps the loop going while the honk timer `audioSlot+0x20` has not run out).
+    ///
+    /// Level and attenuation follow the engine loops: `2048/(d+2)` against a full 0x7F.
+    pub fn honk(&mut self, out: &AudioOutput, index: usize, on: bool, distance: f32, pan: f32, master: f32) {
+        if self.cars.len() <= index {
+            self.cars.resize_with(index + 1, CarVoices::default);
+        }
+        let atten = 2048 / (distance.max(0.0) as i32 + 2);
+        let amp = (atten.min(127) as f32 / 127.0) * master;
+        match (self.cars[index].horn, on && atten > 0, &self.horn) {
+            (Some(id), true, _) => {
+                out.set(id, amp, 1.0);
+                out.set_pan(id, pan);
+            }
+            (Some(id), false, _) => {
+                out.stop(id);
+                self.cars[index].horn = None;
+            }
+            (None, true, Some(c)) => self.cars[index].horn = Some(out.play_panned(c.clone(), amp, 1.0, pan, true)),
+            _ => {}
+        }
+    }
+
     pub fn stop(&mut self, out: &AudioOutput, index: usize) {
         let Some(c) = self.cars.get_mut(index) else { return };
-        for v in [c.near.take(), c.far.take(), c.road.take()].into_iter().flatten() {
+        for v in [c.near.take(), c.far.take(), c.road.take(), c.horn.take()].into_iter().flatten() {
             out.stop(v);
         }
     }

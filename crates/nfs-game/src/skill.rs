@@ -78,6 +78,10 @@ fn is_arrow(tag: u32) -> bool {
     &b[..3] == b"ARW"
 }
 
+/// The prop radius `0x498280`'s caller reads from the prop's own `vtable[+0x14]`. A cone's value
+/// has not been read; this is an **APPROXIMATION** of it.
+const CONE_RADIUS: f32 = 0.25;
+
 impl SkillTest {
     pub fn from_scene(scene: &Scene, track_name: &str) -> Self {
         let mut checkpoints = Vec::new();
@@ -189,17 +193,28 @@ impl SkillTest {
         ev
     }
 
-    /// Knock every cone inside the car's footprint (half extents `he` in the body frame `m`,
-    /// rows = axes). Returns the events for newly knocked cones.
+    /// Knock every cone inside the car's footprint, which is the original's own test.
+    ///
+    /// `0x498280(car, point, radius)` — CONFIRMED: it builds the delta from the prop to the car
+    /// with its **y component zeroed**, dots it against the car's own x axis (`car+0x364`) and
+    /// forward axis (`car+0x37C`), and accepts when both `|dot|` are within `radius + the matching
+    /// half extent` (`car+0x3A8` and `car+0x3B0`). Nothing else: no y test, no sphere test. Its
+    /// caller walks the props the zone query `0x484630(pos, 3.0f, …)` returns — so **3 m**, and the
+    /// radius is the prop's own, from its `vtable[+0x14]`.
+    ///
+    /// **APPROXIMATION** in what is left: that radius. A cone's own value has not been read, so
+    /// 0.25 m stands in for it. The 3 m pre-filter below is the query's radius, and the horizontal
+    /// delta is now the original's.
     pub fn knock_cones(&mut self, pos: Vec3, m: &Mat3, he: Vec3, car_velocity: Vec3) -> Vec<SkillEvent> {
         let mut ev = Vec::new();
         for c in self.cones.iter_mut().filter(|c| !c.knocked) {
             let d = c.position - pos;
-            if d.length_squared() > 16.0 || (d.y).abs() > 2.0 {
+            if d.length_squared() > 9.0 {
                 continue;
             }
-            let local = *m * d;
-            if local.x.abs() < he.x + 0.25 && local.z.abs() < he.z + 0.25 {
+            // 0x498293 / 0x4982AB take only x and z, and 0x49829B leaves the third component 0
+            let local = *m * Vec3::new(d.x, 0.0, d.z);
+            if local.x.abs() < he.x + CONE_RADIUS && local.z.abs() < he.z + CONE_RADIUS {
                 c.knocked = true;
                 let away = Vec3::new(d.x, 0.0, d.z).normalize_or_zero();
                 let away = if away.length_squared() > 0.0 { away } else { m.row(2) };

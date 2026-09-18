@@ -13,8 +13,9 @@
 //! 4. `0x409720` (out of control) or `0x409C70` (in control) writes a body-frame force and a yaw torque;
 //! 5. `0x40A1D0` rotates them to world space and integrates `v += dt·F`, `ω += dt·T`.
 //!
-//! Ported here: the aim point, the heading error, the in-control test and the integrator, plus the
-//! out-of-control controller, all CONFIRMED. The in-control controller `0x409C70` is not ported yet.
+//! All of it is ported here and all of it is CONFIRMED: the aim point, the heading error, the
+//! in-control test, both controllers and the integrator. `traffic.rs` and `police.rs` drive every
+//! AI car through them.
 
 use crate::race::SliceTable;
 use glam::{Mat3, Vec3};
@@ -150,6 +151,86 @@ pub fn out_of_control_command(car: &AiCarState, cfg: &AiPhysics, heading_err: f3
         la *= 0.375;
     }
     DriveCommand { lateral: la, forward: fwd, yaw: aa }
+}
+
+/// The gear / heading sense an AI car carries (`car+0x104C`, `+0x1048`, `+0x1050`, `+0x1080`), and
+/// the "back out of trouble" oscillator that drives it (`traffic.md` §27.2a).
+///
+/// `car+0x104C` is **the gear**: `+1` forward, `−1` reversing. It starts at `+1` (0x4049A8,
+/// 0x406CF9, 0x406DAC) and only the routines here move it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Gear {
+    /// `car+0x104C`
+    pub sense: f32,
+    /// `car+0x1050` — the tick the current gear started at
+    pub since: i64,
+    /// `car+0x1048` — the period the flip is timed against
+    pub period: i64,
+    /// `car+0x1080` — AI ticks spent reversing, reset whenever the gear is forward
+    pub reverse_ticks: i32,
+}
+
+impl Default for Gear {
+    fn default() -> Self {
+        Self { sense: 1.0, since: 0, period: 0, reverse_ticks: 0 }
+    }
+}
+
+/// `0x40A5A0(car)` — "is this car in trouble?", the gate on the oscillator.
+///
+/// True when the car has left the slice's lane extent **and** either it has been reversing for more
+/// than eight AI ticks or its up axis has tipped past 0.85 (`car+0x3C8`, the y of the frame's up
+/// row). An upright car that merely wandered off the lanes is *not* in trouble, so the oscillator
+/// only ever starts on a car that is tipped over.
+pub fn in_trouble(gear: &mut Gear, lane: i32, lanes_a: i32, lanes_b: i32, up_y: f32, ai_ticks: i32) -> bool {
+    if (7 - lanes_a..=lanes_b + 6).contains(&lane) {
+        return false;
+    }
+    if gear.sense < 0.0 {
+        gear.reverse_ticks += ai_ticks;
+    } else {
+        gear.reverse_ticks = 0;
+    }
+    gear.reverse_ticks > 8 || up_y <= 0.85
+}
+
+/// `0x40A850(car, period)` — flip the gear every `period / 2` ticks, the forward → reverse flip only
+/// while the car is below 20 m/s along the road. `AI_drive` 0x4086A0 passes **0x40**, so the flip is
+/// every 32 ticks.
+pub const GEAR_PERIOD: i64 = 0x40;
+
+pub fn toggle_gear(gear: &mut Gear, now: i64, road_speed: f32, period: i64) {
+    let elapsed = now - gear.since;
+    let flip = if gear.sense < 0.0 {
+        elapsed > gear.period / 2
+    } else {
+        elapsed > gear.period / 2 && road_speed.abs() < 20.0
+    };
+    if flip {
+        gear.sense = -gear.sense;
+        gear.since = now;
+        gear.period = period;
+    }
+}
+
+/// `0x408E30(car)` — the trim applied while the gear is reversed, before the drive chain.
+///
+/// Returns the target speed to use (clamped to ±20) and clears the lane target, since a reversing
+/// car is not trying to hold a lane. The timer is pushed back to `now − 24` whenever the lane target
+/// is more than ten metres away on the side the lateral velocity is already going, which keeps the
+/// car in reverse for longer when it is still heading away from where it wants to be.
+pub fn reverse_trim(gear: &mut Gear, now: i64, lateral: f32, lateral_target: f32, lateral_vel: f32, target_speed: f32) -> (f32, f32) {
+    if gear.sense >= 0.0 {
+        return (target_speed, lateral_target);
+    }
+    if (lateral_target - 10.0 > lateral && lateral_vel > 0.0) || (lateral_target + 10.0 < lateral && lateral_vel < 0.0) {
+        gear.since = now - 24;
+    }
+    if now - gear.since > gear.period {
+        gear.sense = 1.0;
+        gear.since = now;
+    }
+    (target_speed.clamp(-20.0, 20.0), 0.0)
 }
 
 /// `0x409C70` — the in-control controller (§27.14).
@@ -301,6 +382,44 @@ mod tests {
     }
 
     #[test]
+    /// §27.2a: an upright car that has merely wandered off the lanes is not in trouble; a tipped one
+    /// is, and then the gear flips every half period while the car is slow.
+    #[test]
+    fn the_gear_only_oscillates_for_a_car_that_is_actually_stuck() {
+        let mut g = Gear::default();
+        // inside the lane extent: never
+        assert!(!in_trouble(&mut g, 7, 2, 2, 1.0, 2));
+        // outside it but upright: still not
+        assert!(!in_trouble(&mut g, 20, 2, 2, 1.0, 2));
+        // outside it and tipped: yes
+        assert!(in_trouble(&mut g, 20, 2, 2, 0.4, 2));
+
+        // the first flip needs half a period to pass
+        g = Gear { sense: 1.0, since: 0, period: GEAR_PERIOD, reverse_ticks: 0 };
+        toggle_gear(&mut g, 30, 5.0, GEAR_PERIOD);
+        assert_eq!(g.sense, 1.0, "32 ticks have not passed");
+        toggle_gear(&mut g, 40, 5.0, GEAR_PERIOD);
+        assert_eq!(g.sense, -1.0);
+        assert_eq!(g.since, 40);
+        // and a fast car never drops into reverse
+        let mut f = Gear { sense: 1.0, since: 0, period: GEAR_PERIOD, reverse_ticks: 0 };
+        toggle_gear(&mut f, 400, 25.0, GEAR_PERIOD);
+        assert_eq!(f.sense, 1.0);
+
+        // while reversing the target speed is clamped and the lane target dropped
+        let mut r = Gear { sense: -1.0, since: 100, period: GEAR_PERIOD, reverse_ticks: 0 };
+        let (v, t) = reverse_trim(&mut r, 110, 0.0, 0.0, 0.0, 30.0);
+        assert_eq!((v, t), (20.0, 0.0));
+        // a target ten metres away on the side the car is already sliding pushes the timer back
+        let mut r2 = Gear { sense: -1.0, since: 100, period: GEAR_PERIOD, reverse_ticks: 0 };
+        reverse_trim(&mut r2, 200, 0.0, 20.0, 1.0, 5.0);
+        assert_eq!(r2.since, 176);
+        // and past the full period it goes back into forward
+        let mut r3 = Gear { sense: -1.0, since: 100, period: GEAR_PERIOD, reverse_ticks: 0 };
+        reverse_trim(&mut r3, 200, 0.0, 0.0, 0.0, 5.0);
+        assert_eq!(r3.sense, 1.0);
+    }
+
     fn the_out_of_control_controller_steers_toward_the_aim() {
         let cfg = TrafficConfig::default().out_of_control;
         let c = car();

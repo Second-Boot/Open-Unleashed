@@ -122,6 +122,13 @@ fn car_catalog() {
     assert_eq!(cars[0].sound_set, "sd1b");
     assert_eq!(cars[0].year, 1950);
     assert_eq!(cars[0].paint_sets.len(), 19);
+    // the car-compare ratings: acceleration, top speed, braking, handling, overall (+0x324 …)
+    assert_eq!(cars[0].compare, [30, 40, 56, 30, 41]);
+    // the widget that draws them has stops `c0`, `c50` and `c100`, so the scale is 0..100 — and
+    // every record in the file keeps to it, traffic and cops included (they are a flat 50)
+    for c in &cars {
+        assert!(c.compare.iter().all(|v| (0..=100).contains(v)), "{} {:?}", c.display_name, c.compare);
+    }
     assert_eq!(cars[0].paint_sets[0].colours[1], [0xFF, 0x00, 0x00]);
     // every model and sim referenced must exist on disk
     for c in &cars {
@@ -428,4 +435,72 @@ fn sky_background_colours() {
     let c = s.colours[0].unwrap();
     assert!(c.gradient[0] && c.gradient[1]);
     assert_ne!(c.rgb[0][0], c.rgb[0][1], "alps sky is a ramp");
+}
+
+/// The rest of `Track/Sky/<Track>.bin`: the ring geometry, the sixteen horizon quads and the three
+/// per-slice keyframe tracks (`RE/RENDERING.md`, sky `.bin`).
+#[test]
+fn sky_bin_rings_and_tracks() {
+    let Some(r) = game_root() else { return };
+    let dir = r.join("GameData/Track/Sky");
+    let Ok(d) = std::fs::read(dir.join("Coastal.bin")) else { return };
+    let s = nfs_formats::sky::SkyBin::parse(&d).unwrap();
+    // region A's ring: 1500 m across, 44.4 m up, turned 0.6224 of a turn (224°)
+    assert!((s.rings[0].radius - 1500.0).abs() < 0.5, "{:?}", s.rings[0]);
+    assert!((s.rings[0].height - 44.4).abs() < 0.5, "{:?}", s.rings[0]);
+    assert!((s.rings[0].angle_turns - 0.6224).abs() < 1e-3, "{:?}", s.rings[0]);
+    // the `horz` texture is a 4 × 2 grid, and Coastal mirrors the second half of the ring
+    assert_eq!((s.tile_cols, s.tile_rows), (4, 2));
+    assert_eq!(s.segments[0].tile, 0);
+    assert_eq!(s.segments[7].tile, 7);
+    assert_eq!((s.segments[8].tile, s.segments[8].mirror), (7, 1));
+    // tile 5 of a 4 × 2 grid is column 1 of row 1
+    let uv = s.segment_uv(5);
+    assert!((uv[0] - 0.25).abs() < 1e-6 && (uv[1] - 0.5).abs() < 1e-6, "{uv:?}");
+    assert!((uv[2] - 0.505).abs() < 1e-3 && (uv[3] - 0.99).abs() < 1e-3, "{uv:?}");
+    // a mirrored quad swaps its two u's
+    let uv8 = s.segment_uv(8);
+    assert!(uv8[0] > uv8[1], "{uv8:?}");
+    // the three tracks stop at the first negative slice
+    assert_eq!(s.track_a.len(), 13);
+    assert_eq!(s.track_b.len(), 17);
+    assert_eq!(s.track_c.len(), 13);
+    assert_eq!(s.track_a[0].0, 0);
+    assert_eq!(s.track_a[1], (100, 1.0));
+    // and the sampler interpolates between them
+    let lap = 1500;
+    assert!((s.sample_track_a(100, lap).unwrap() - 1.0).abs() < 1e-6);
+    let mid = s.sample_track_a(50, lap).unwrap();
+    assert!((0.0..=1.0).contains(&mid) && mid > 0.4 && mid < 0.6, "{mid}");
+
+    // Monaco's horizon is one row of four tiles, hand-placed, and its ring is rotated 0.223
+    let Ok(d) = std::fs::read(dir.join("Monaco1.bin")) else { return };
+    let m = nfs_formats::sky::SkyBin::parse(&d).unwrap();
+    assert_eq!((m.tile_cols, m.tile_rows), (4, 1));
+    assert_eq!(m.colour_rotation, 5);
+    assert_eq!(m.segment_colour(0), [5, 6]);
+    assert_eq!(m.segment_colour(11), [0, 1]);
+    assert!((m.rings[0].angle_turns - 0.223).abs() < 1e-3);
+    // region B is the same default everywhere it was never authored
+    assert!((m.rings[1].radius - 1000.0).abs() < 0.5 && (m.rings[1].height + 75.0).abs() < 0.5);
+}
+
+/// The sky colour record is chosen by the `SKYRENDERING` option, stepping down past the records the
+/// track left disabled (`0x459950`).
+#[test]
+fn the_sky_colour_record_steps_down_to_an_enabled_one() {
+    let Some(r) = game_root() else { return };
+    let dir = r.join("GameData/Track/Sky");
+    // monaco enables record 0 only, so every detail level lands on it
+    let Ok(d) = std::fs::read(dir.join("Monaco1.bin")) else { return };
+    let m = nfs_formats::sky::SkyBin::parse(&d).unwrap();
+    for detail in 0..4 {
+        assert_eq!(m.colour_index(detail), 0, "detail {detail}");
+    }
+    // coastal enables 0, 1 and 2 but not 3, so 3 falls back to 2 and the rest are themselves
+    let Ok(d) = std::fs::read(dir.join("Coastal.bin")) else { return };
+    let c = nfs_formats::sky::SkyBin::parse(&d).unwrap();
+    assert_eq!((c.colour_index(0), c.colour_index(1), c.colour_index(2), c.colour_index(3)), (0, 1, 2, 2));
+    // and the two records really are different skies
+    assert_ne!(c.background_for(0), c.background_for(1));
 }

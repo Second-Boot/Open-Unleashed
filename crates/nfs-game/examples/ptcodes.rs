@@ -24,6 +24,14 @@ fn scan(name: &str, data: &[u8], hist: &mut BTreeMap<u8, BTreeMap<u32, usize>>, 
                 }
             }
         }
+        // `WHICH=0x24` lists the banks that carry one code at all
+        if let Ok(w) = std::env::var("WHICH") {
+            let want = u8::from_str_radix(w.trim_start_matches("0x"), 16).unwrap_or(0);
+            let n = b.slots.iter().flatten().filter(|s| s.header.patch_params.iter().any(|(c, _)| *c == want)).count();
+            if n > 0 {
+                println!("    {name:<24} {n} slot(s) with code {want:#04x}");
+            }
+        }
         if std::env::var_os("PER_BANK").is_some() {
             vols.sort_unstable();
             println!("    {name:<24} {used:>4} slots, code 0x0E on {:>4}: {:?}", vols.len(), vols.iter().step_by(vols.len().max(1) / 4 + 1).collect::<Vec<_>>());

@@ -83,6 +83,9 @@ pub struct LayoutScreen {
     unrendered: Vec<(String, usize)>,
     /// element index of an `NFS5.CarLogo` → the `.fsh` pack and the first of its two entries
     logos: HashMap<usize, (String, usize)>,
+    /// `NFS5.GouraudIndicatorBar` element index → the 0..100 value its `othersource` resolved to.
+    /// A bar with no entry here draws nothing, the way an unresolved `AccessorWatch` shows nothing.
+    bars: HashMap<usize, i32>,
     /// element index of an `NFS5.ListBox` → its rows and the accessor's current row
     lists: HashMap<usize, (Vec<ListRow>, Option<usize>)>,
     /// element index of an `NFS5.3DCAR` → the offscreen texture its car was rendered into, drawn
@@ -306,11 +309,24 @@ fn tint(c: [u8; 4]) -> [f32; 4] {
     [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, c[3] as f32 / 255.0]
 }
 
+/// The tag the chronicle's picture tiles carry, which the control's own name repeats at 0x5DBBFE.
+const CHRONICLE_PICTURE_TAG: &str = "1111";
+
 /// Classes whose content comes from the executable and which the port does not draw. `NFS5.3DCAR`
 /// is not one of them any more: the car it shows belongs to the screen's 3D room
 /// (`RE/notes/frontend-3d.md`), which the port renders behind the screen.
 fn code_placed(_class: &str) -> bool {
     false
+}
+
+/// The source a widget names, for the blank-widget report.
+fn source_of(e: &nfs_formats::lay::Element) -> String {
+    for k in ["accessor", "othersource", "listaccessor"] {
+        if let Some(v) = e.get(k).filter(|v| !v.is_empty()) {
+            return format!("{k}={v}");
+        }
+    }
+    e.string_id().map(|id| format!("stringID={id}")).unwrap_or_else(|| "(none)".to_string())
 }
 
 impl LayoutScreen {
@@ -403,7 +419,7 @@ impl LayoutScreen {
         let mut unrendered: Vec<(String, usize)> = counts.into_iter().collect();
         unrendered.sort();
         tracing::info!(name, elements = layout.elements.len(), art = shapes.len(), fonts = fonts.len(), skipped = unrendered.len(), "layout loaded");
-        Ok(Self { layout, background: None, shapes, fonts, white, unrendered, logos: HashMap::new(), lists: HashMap::new(), car_views: HashMap::new(), controls, transition: Transition::Idle, overlay: false })
+        Ok(Self { layout, background: None, shapes, fonts, white, unrendered, logos: HashMap::new(), bars: HashMap::new(), lists: HashMap::new(), car_views: HashMap::new(), controls, transition: Transition::Idle, overlay: false })
     }
 
     /// The widgets the screen does not draw: the classes whose content comes from the executable,
@@ -414,6 +430,27 @@ impl LayoutScreen {
             let n = self.layout.elements.iter().enumerate().filter(|(i, e)| e.class == class && !bound.contains(i)).count();
             if n > 0 {
                 out.push((class.to_string(), n));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The same, but naming each widget's own `accessor` / `othersource` so a sweep can tell an
+    /// unimplemented source from a list that is simply empty in the current state.
+    pub fn unrendered_sources(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for (class, bound) in [("NFS5.CarLogo", self.logos.keys().copied().collect::<Vec<_>>()), ("NFS5.ListBox", self.lists.keys().copied().collect::<Vec<_>>())] {
+            for (i, e) in self.layout.elements.iter().enumerate() {
+                if e.class == class && !bound.contains(&i) {
+                    let src = self
+                        .attr(e, "accessor")
+                        .filter(|v| !v.is_empty())
+                        .or_else(|| self.attr(e, "othersource").filter(|v| !v.is_empty()))
+                        .unwrap_or("(none)")
+                        .to_string();
+                    out.push((class.to_string(), src));
+                }
             }
         }
         out.sort();
@@ -709,6 +746,88 @@ impl LayoutScreen {
             .collect()
     }
 
+    /// Every `NFS5.GouraudIndicatorBar` and the source it reads. `FEGouraudIndicatorBar`'s
+    /// constructor takes both keys (0x4CA24F `data.othersource`, 0x4CA27E `data.accessor`) and its
+    /// value getter tries the `othersource` names first, falling through to the accessor at
+    /// 0x4CA974. The flag says which of the two the name came from.
+    pub fn indicator_bars(&self) -> Vec<(usize, String, bool)> {
+        self.layout
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.class == "NFS5.GouraudIndicatorBar")
+            .filter_map(|(index, e)| {
+                match e.get("othersource").filter(|a| !a.is_empty()) {
+                    Some(a) => Some((index, a.to_string(), true)),
+                    None => e.get("accessor").filter(|a| !a.is_empty()).map(|a| (index, a.to_string(), false)),
+                }
+            })
+            .collect()
+    }
+
+    /// Give one indicator bar its value, or `None` to leave it blank.
+    pub fn set_bar(&mut self, index: usize, value: Option<i32>) {
+        match value {
+            Some(v) => self.bars.insert(index, v),
+            None => self.bars.remove(&index),
+        };
+    }
+
+    /// Point a `NFS5.CarLogo` at a **chronicle** picture instead of a car logo.
+    ///
+    /// The chronicle's own art is not in `FEData/Art` and is not a logo pair: `0x50757F` builds the
+    /// name with `"%s%c%c%02d%d%c.fsh"` — the directory, `'M'` for a picture (`'p'` is the other
+    /// kind), the model-group letter from the table at **`0x5B8B18` = `"CBADE"`** indexed by the
+    /// group at `[0x5DBA44]`, the year mod 100, a 1-based index within the year, and a variant
+    /// `'a' + n`. `.mad` is the same name for the movie. So one whole image, drawn on its own.
+    pub fn set_chronicle_picture(&mut self, r: &mut Renderer, paths: &GamePaths, index: usize, file: &str) {
+        if file.is_empty() {
+            self.logos.remove(&index);
+            return;
+        }
+        if self.logos.get(&index).is_some_and(|(f, b)| f == file && *b == 0) {
+            return;
+        }
+        if !self.shapes.contains_key(&(file.to_string(), 0)) {
+            let dir = paths.fe_data().join("Chron");
+            let entries = GamePaths::find_file(&dir, file)
+                .and_then(|p| std::fs::read(&p).ok().map(|d| (p, d)))
+                .and_then(|(p, d)| decode_pack(&p, &d).ok())
+                .unwrap_or_default();
+            // the picture is the run of tiles tagged `1111` — the same tag the control's own name
+            // carries at 0x5DBBFE — laid side by side; `bi` and `ci` are its 41×25 icons and the
+            // `Laye` entries a second layer.
+            //
+            // **APPROXIMATION**: the tiles are joined in pack order, left to right. Where each one
+            // actually belongs is in the `.fsh` entry's own attachment record, which has not been
+            // read, so a picture whose tiles are not stored in reading order comes out shuffled.
+            let tiles: Vec<&nfs_assets::texture::TextureImage> = entries.iter().filter(|t| t.name.trim() == CHRONICLE_PICTURE_TAG).collect();
+            let (w, h) = (tiles.iter().map(|t| t.width).sum::<u32>(), tiles.iter().map(|t| t.height).max().unwrap_or(0));
+            if w == 0 || h == 0 {
+                tracing::debug!(file, entries = entries.len(), "chronicle picture has no `1111` tiles");
+                self.logos.remove(&index);
+                return;
+            }
+            let mut rgba = vec![0u8; (w * h * 4) as usize];
+            let mut x0 = 0u32;
+            for t in &tiles {
+                let Some(px) = t.mips.first() else { continue };
+                for y in 0..t.height {
+                    let src = (y * t.width * 4) as usize;
+                    let dst = ((y * w + x0) * 4) as usize;
+                    let n = (t.width * 4) as usize;
+                    if src + n <= px.len() && dst + n <= rgba.len() {
+                        rgba[dst..dst + n].copy_from_slice(&px[src..src + n]);
+                    }
+                }
+                x0 += t.width;
+            }
+            let id = r.upload_texture(&TextureData::single(w, h, rgba));
+            self.shapes.insert((file.to_string(), 0), (id, w as f32, h as f32));
+        }
+        self.logos.insert(index, (file.to_string(), 0));
+    }
+
     /// Point a `NFS5.CarLogo` at a car's logo: `pack` is the car record's +0x147 (`finallogos1`)
     /// and `pair` its +0x1F6. The widget draws entries `2*pair` and `2*pair + 1` of
     /// `FEData/Art/<pack>.fsh` (`NFS5.CarLogo::update` 0x4C1A63 — the index is the pair doubled,
@@ -852,9 +971,23 @@ impl LayoutScreen {
     /// `NFS5.AccessorWatch`'s `accessor` name to the text it shows; a watch it cannot resolve is
     /// counted as unrendered instead of being filled with something invented.
     pub fn sprites(&self, aspect: f32, strings: &Strings, selected: Option<usize>, accessor: &dyn Fn(&str) -> Option<String>) -> Vec<Sprite> {
+        self.sprites_reporting(aspect, strings, selected, accessor, &mut Vec::new())
+    }
+
+    /// Every widget that produced **no sprite at all** — its class and the source it names. This is
+    /// the port's own measure of what it does not draw: a widget whose content the original places
+    /// from code, and for which the file carries neither a shape nor a string, leaves nothing
+    /// behind here. `examples/layout_sweep.rs` runs it over every `.lay` in the game.
+    pub fn blank_widgets(&self, aspect: f32, strings: &Strings, accessor: &dyn Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+        let mut blank = Vec::new();
+        self.sprites_reporting(aspect, strings, None, accessor, &mut blank);
+        blank
+    }
+
+    fn sprites_reporting(&self, aspect: f32, strings: &Strings, selected: Option<usize>, accessor: &dyn Fn(&str) -> Option<String>, blank: &mut Vec<(String, String)>) -> Vec<Sprite> {
         let mut out = Vec::new();
         if let Some(bg) = &self.background {
-            out.extend(bg.sprites(aspect, strings, None, accessor));
+            out.extend(bg.sprites_reporting(aspect, strings, None, accessor, blank));
         }
         for (i, e) in self.layout.elements.iter().enumerate() {
             let ((tdx, tdy), talpha) = self.transition_of(e);
@@ -900,7 +1033,59 @@ impl LayoutScreen {
                         }
                     }
                 }
-                "NFS5.Rectangle" | "NFS5.GlintyRectangle" | "NFS5.ColorBox" | "NFS5.BEVELEDOPTIONBOX" | "NFS5.PANEL" => {
+                // `FEGouraudIndicatorBar::draw` (0x4CA690) asks its source for a number, then at
+                // 0x4CA71A picks the span it paints: with `goingleft` clear it is `0 ..= value`,
+                // and with it set `100 - value ..= 100`, so the mirrored column of the car-compare
+                // screen fills from its right edge. The value is a per cent because the widget's
+                // own colour stops are named `c0`, `c50` and `c100`.
+                "NFS5.GouraudIndicatorBar" => {
+                    let Some(&value) = self.bars.get(&i) else { break 'elem };
+                    let value = value.clamp(0, 100) as f32;
+                    let going_left = e.get("goingleft").is_some_and(|v| v.trim() != "0");
+                    let (lo, hi) = if going_left { (100.0 - value, 100.0) } else { (0.0, value) };
+                    if hi <= lo {
+                        break 'elem;
+                    }
+                    // the three stops are the colour at 0, 50 and 100 per cent of the **box**, not
+                    // of the filled part; the sprite pipeline has one colour per quad, so the span
+                    // is cut into cells of one per cent each — APPROXIMATION, as for `NFS5.GOURAUDBOX`
+                    let stop = |k: &str, d: [f32; 4]| e.color(k).map(tint).unwrap_or(d);
+                    let (c0, c50, c100) = (stop("c0", [1.0; 4]), stop("c50", [1.0; 4]), stop("c100", [1.0; 4]));
+                    let at = |p: f32| -> [f32; 4] {
+                        let (a, b, t) = if p < 50.0 { (c0, c50, p / 50.0) } else { (c50, c100, (p - 50.0) / 50.0) };
+                        std::array::from_fn(|j| a[j] + (b[j] - a[j]) * t)
+                    };
+                    let cell = w / 100.0;
+                    for p in lo as u32..hi as u32 {
+                        out.push(self.quad(aspect, x + p as f32 * cell, y, cell, h.max(1.0), at(p as f32 + 0.5)));
+                    }
+                }
+                // `FEGlintyRectangle`'s constructor (0x522530) reads **`width`, `height`, `col` and
+                // `animate`** — not `size` and `color`, which is why one of these draws nothing when
+                // it is read like a plain rectangle. It hands them to 0x51FDA0 in that order, and
+                // the draw (0x51FDE0) passes the widget's own position and that width and height to
+                // **0x4D9200, which is an outline**: four calls to the one-bar primitive 0x4D9280
+                // with a thickness of `1.0f` — top, bottom, left and right. So this is a one-pixel
+                // frame, which is what makes it a frame around each bar of `repair.lay` (92×8 over
+                // a 90×6 bar) and around the whole list (261×163 over the panel), rather than a
+                // fill that would bury them.
+                //
+                // Not drawn: the glint. With `animate` non-zero the draw arms a timer
+                // (0x51FE39…0x51FE80) that waits `rand() % 32 + 64` and then plays one of the
+                // flourishes — with `animate == 5` a random one of four (0x51FE8E). Its shapes were
+                // not traced, so it is left out rather than guessed at, exactly as the `NFS5.CarLogo`
+                // glint is.
+                "NFS5.GlintyRectangle" => {
+                    let Some(c) = e.color("col").or_else(|| e.color("color")) else { break 'elem };
+                    let gw = e.int("width").map(|v| v as f32).filter(|v| *v > 0.0).unwrap_or(w).max(1.0);
+                    let gh = e.int("height").map(|v| v as f32).filter(|v| *v > 0.0).unwrap_or(h).max(1.0);
+                    let (c, t) = (tint(c), 1.0);
+                    out.push(self.quad(aspect, x, y, gw, t, c));
+                    out.push(self.quad(aspect, x, y + gh - t, gw, t, c));
+                    out.push(self.quad(aspect, x, y, t, gh, c));
+                    out.push(self.quad(aspect, x + gw - t, y, t, gh, c));
+                }
+                "NFS5.Rectangle" | "NFS5.ColorBox" | "NFS5.BEVELEDOPTIONBOX" | "NFS5.PANEL" => {
                     if let Some(c) = e.color("color") {
                         out.push(self.quad(aspect, x, y, w.max(1.0), h.max(1.0), tint(c)));
                     }
@@ -1109,6 +1294,14 @@ impl LayoutScreen {
                 for s in &mut out[first..] {
                     s.color[3] *= talpha;
                 }
+            }
+            // the first block is the screen's own descriptor, not a widget: it is the one that
+            // carries `screen=`, `room=`, `musicfile=` and `callbacklist=`, and its class
+            // (`REAL.BLACK_640x480`) brings a `color` and a `size` with it. Painting that colour
+            // would cover the background layout the same block names, which every screen visibly
+            // has, so it is metadata and not counted as undrawn.
+            if out.len() == first && i > 0 {
+                blank.push((e.class.clone(), source_of(e)));
             }
         }
         // The cars of the `NFS5.3DCAR` widgets that have a `positiontype` of their own, each

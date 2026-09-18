@@ -625,10 +625,16 @@ pub struct CopCar {
     pub boost_speed: f32,
     /// `chase+0x7C` — the boost budget in ticks
     pub boost_budget: i32,
-    /// `chase+0x8C`
+    /// `chase+0x8C`. The original's only writer besides the ctor is the state-4 head 0x404571,
+    /// which blacks the rubber band out for 15 s when *some* human has been faster than 20 m/s
+    /// while un-pursued for over 12.5 s (`perpAI+0xAC > 0x320`). That counter is reset the instant
+    /// a chaser is claimed and the player's AI runs before any cop's, so with one human the rule
+    /// can never fire (`traffic.md` §17.5) — hence no writer here either.
     pub blackout_until: u64,
     /// `chase+0x90`
     pub stuck_ticks: i32,
+    /// `car+0x104C` and its timers — the gear the drive model runs in (`aidrive::Gear`)
+    pub gear: aidrive::Gear,
     /// `chase+0x60`-side bookkeeping for §27.8: this cop's rank in the target's queue, the
     /// formation offset that rank implies and the two desired sectors it maps to.
     pub rank: usize,
@@ -646,6 +652,7 @@ pub struct CopCar {
 impl CopCar {
     pub fn new(model: usize, half_extents: Vec3, mass: f32, level: usize) -> Self {
         Self {
+            gear: aidrive::Gear::default(),
             model,
             active: false,
             lights: false,
@@ -703,7 +710,7 @@ impl CopCar {
             angular_velocity: self.angular_velocity,
             slice: self.slice,
             dir: self.dir,
-            sense: 1.0,
+            sense: self.gear.sense,
             speed: self.speed,
             speed_est: self.speed_estimate(),
             target_speed: self.target_speed,
@@ -820,7 +827,7 @@ impl Police {
             // so the port promotes every patrol car at once and ranks them by the same sort —
             // MEDIUM only in *when* each cop is told, not in what it then does.
             if !self.cars[i].chasing {
-                self.patrol(table, i, target, others);
+                self.patrol(table, tick, i, target, others);
                 continue;
             }
 
@@ -943,14 +950,14 @@ impl Police {
             // §12/§23 lane pass, with §27.10's +15 toward the target's lane
             self.lane_pass(table, i, target, others);
 
-            self.drive(table, i);
+            self.drive(table, tick, i);
         }
     }
 
     /// The lane scorers plus `0x40DA00`'s bias toward the target's lane.
     /// One tick of a patrolling cop: the traffic speed ladder, the same lane pass and the same drive
     /// model, with no chase behaviour at all (§17.4 states 2/3).
-    fn patrol(&mut self, table: &SliceTable, i: usize, target: &ChaseTarget, others: &[LaneCar]) {
+    fn patrol(&mut self, table: &SliceTable, tick: u64, i: usize, target: &ChaseTarget, others: &[LaneCar]) {
         let speed = self.base_target_speed(&self.cars[i], target.speed);
         {
             let c = &mut self.cars[i];
@@ -962,15 +969,28 @@ impl Police {
             c.aim_point = Vec3::ZERO;
         }
         self.lane_pass(table, i, target, others);
-        self.drive(table, i);
+        self.drive(table, tick, i);
     }
 
     /// §27.2's drive model, the same one traffic runs.
-    fn drive(&mut self, table: &SliceTable, i: usize) {
-        let st_road = {
-            let sl = &table.slices[self.cars[i].slice.min(table.slices.len() - 1)];
-            (sl.width_a, sl.width_b)
-        };
+    fn drive(&mut self, table: &SliceTable, tick: u64, i: usize) {
+        let sl = table.slices[self.cars[i].slice.min(table.slices.len() - 1)].clone();
+        let st_road = (sl.width_a, sl.width_b);
+        // §27.2a, exactly as for traffic: trim while reversing, then flip the gear every 32 ticks
+        // for as long as the car is off the lanes and tipped (or already backing up)
+        let tick = tick as i64;
+        {
+            let c = &mut self.cars[i];
+            let lane = lane_of(&sl, c.lateral);
+            let up_y = c.orientation.row(1).y;
+            let lat_vel = c.velocity.dot(sl.lateral.normalize_or_zero());
+            let (speed, target) = aidrive::reverse_trim(&mut c.gear, tick, c.lateral, c.lateral_target, lat_vel, c.target_speed);
+            c.target_speed = speed;
+            c.lateral_target = target;
+            if aidrive::in_trouble(&mut c.gear, lane, sl.lanes_a as i32, sl.lanes_b as i32, up_y, crate::traffic::AI_TICKS) {
+                aidrive::toggle_gear(&mut c.gear, tick, c.speed, aidrive::GEAR_PERIOD);
+            }
+        }
         let mut st = self.cars[i].as_ai_state(self.phys.max_lat_acc, self.phys.max_yaw_acc);
         let aim = aidrive::aim_direction(table, &self.cfg, &st);
         let err = aidrive::heading_error(&st, aim);

@@ -116,7 +116,9 @@ pub struct CareerUi {
 impl CareerUi {
     pub fn load(paths: &GamePaths) -> Result<Self, CareerError> {
         let tables = CareerTables::load(paths)?;
-        let save_path = std::env::var_os("NFS5_CAREER_SAVE").map(PathBuf::from).unwrap_or_else(Career::default_save_path);
+        let save_path = std::env::var_os("NFS5_CAREER_SAVE")
+            .map(PathBuf::from)
+            .unwrap_or_else(Career::default_save_path);
         // The profile is the one `player.lst` last selected, as `RebuildUserList` 0x4DEF60 does.
         let dir = nfs_game::save::save_dir();
         let profile = std::env::var("NFS5_PROFILE")
@@ -131,7 +133,10 @@ impl CareerUi {
                 c
             }
             // No JSON yet: fall back to the original-format save for this profile if one exists.
-            Err(CareerError::Io { .. }) => match std::fs::read(profile.path(&dir)).ok().and_then(|d| nfs_formats::sav::SaveFile::parse(&d).ok()) {
+            Err(CareerError::Io { .. }) => match std::fs::read(profile.path(&dir))
+                .ok()
+                .and_then(|d| nfs_formats::sav::SaveFile::parse(&d).ok())
+            {
                 Some(s) => {
                     let c = nfs_game::save::career_from_sav(&s, &tables);
                     tracing::info!(path = %profile.path(&dir).display(), money = c.money, cars = c.garage.len(), "career imported from the original .sav");
@@ -144,14 +149,36 @@ impl CareerUi {
                 Career::default()
             }
         };
-        Ok(Self { tables, career, save_path, save_dir: dir, profile, knockout: None, playlist: Vec::new(), settings: nfs_game::save::SavedSettings::default(), t_idx: 0, car_sel: 0, row: 0, part_sel: 0, club: false, factory: false, basket: Vec::new(), message: String::new(), pending: None })
+        Ok(Self {
+            tables,
+            career,
+            save_path,
+            save_dir: dir,
+            profile,
+            knockout: None,
+            playlist: Vec::new(),
+            settings: nfs_game::save::SavedSettings::default(),
+            t_idx: 0,
+            car_sel: 0,
+            row: 0,
+            part_sel: 0,
+            club: false,
+            factory: false,
+            basket: Vec::new(),
+            message: String::new(),
+            pending: None,
+        })
     }
 
     pub fn tournaments(&self) -> Vec<&Tournament> {
         if self.club {
             self.tables.club_tournaments()
         } else {
-            self.tables.era_tournaments(self.career.era).into_iter().filter(|t| !t.is_hidden()).collect()
+            self.tables
+                .era_tournaments(self.career.era)
+                .into_iter()
+                .filter(|t| !t.is_hidden())
+                .collect()
         }
     }
 
@@ -176,13 +203,23 @@ impl CareerUi {
     pub fn activate_mission(&mut self) -> Option<StartRequest> {
         if self.career.promotion_due(&self.tables).is_some() {
             if let Some(car) = self.career.accept_promotion(&self.tables) {
-                self.message = format!("PRIZE CAR ACCEPTED: {}", self.tables.car(car).map(|c| c.display_name.to_uppercase()).unwrap_or_default());
+                self.message = format!(
+                    "PRIZE CAR ACCEPTED: {}",
+                    self.tables
+                        .car(car)
+                        .map(|c| c.display_name.to_uppercase())
+                        .unwrap_or_default()
+                );
                 self.save();
             }
             return None;
         }
         // `NFS_MISSION=<idx>` overrides the current mission (smoke runs)
-        let idx = std::env::var("NFS_MISSION").ok().and_then(|v| v.parse::<usize>().ok()).filter(|i| *i < self.tables.missions.len()).or_else(|| self.career.current_mission(&self.tables))?;
+        let idx = std::env::var("NFS_MISSION")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|i| *i < self.tables.missions.len())
+            .or_else(|| self.career.current_mission(&self.tables))?;
         let m = self.tables.missions[idx].clone();
         let car = self.tables.car(m.car_id as u16)?.clone();
         if car.sim.is_empty() {
@@ -194,8 +231,19 @@ impl CareerUi {
             return None;
         };
         let c = m.colours[0];
-        let paint = if c[..3] == [0, 0, 0] { car.paint_sets.first().map(|p| p.colours[0]).unwrap_or([0xD4, 0x10, 0x10]) } else { [c[0], c[1], c[2]] };
-        let parts: Vec<Part> = m.parts.iter().filter_map(|id| self.tables.parts.iter().find(|p| p.id == *id).cloned()).collect();
+        let paint = if c[..3] == [0, 0, 0] {
+            car.paint_sets
+                .first()
+                .map(|p| p.colours[0])
+                .unwrap_or([0xD4, 0x10, 0x10])
+        } else {
+            [c[0], c[1], c[2]]
+        };
+        let parts: Vec<Part> = m
+            .parts
+            .iter()
+            .filter_map(|id| self.tables.parts.iter().find(|p| p.id == *id).cloned())
+            .collect();
         let opponents: Vec<CareerOpponent> = m
             .opponents
             .iter()
@@ -204,13 +252,39 @@ impl CareerUi {
                 if car.sim.is_empty() {
                     return None;
                 }
-                let skill = self.tables.personalities.iter().find(|p| p.id == *per).map(|p| p.skill).unwrap_or([[1.0, 0.0]; 4]);
-                let paint = car.paint_sets.first().map(|p| p.colours[0]).unwrap_or([0x20, 0x40, 0xC0]);
-                Some(CareerOpponent { car, paint, name: self.tables.driver_name(*per), difficulty: 1.0, skill, grid: None, personality: *per })
+                let skill = self
+                    .tables
+                    .personalities
+                    .iter()
+                    .find(|p| p.id == *per)
+                    .map(|p| p.skill)
+                    .unwrap_or([[1.0, 0.0]; 4]);
+                let paint = car
+                    .paint_sets
+                    .first()
+                    .map(|p| p.colours[0])
+                    .unwrap_or([0x20, 0x40, 0xC0]);
+                Some(CareerOpponent {
+                    car,
+                    paint,
+                    name: self.tables.driver_name(*per),
+                    difficulty: 1.0,
+                    skill,
+                    grid: None,
+                    personality: *per,
+                })
             })
             .collect();
-        let scene_suffix = m.scene_file(&track.file).map(|f| f[track.file.len()..].to_string());
-        self.pending = Some(PendingEvent { tournament: 0, event: 0, finale: false, garage_idx: None, mission: Some(idx) });
+        let scene_suffix = m
+            .scene_file(&track.file)
+            .map(|f| f[track.file.len()..].to_string());
+        self.pending = Some(PendingEvent {
+            tournament: 0,
+            event: 0,
+            finale: false,
+            garage_idx: None,
+            mission: Some(idx),
+        });
         tracing::info!(mission = m.code, track = track.file, scene = ?scene_suffix, car = car.model, opponents = opponents.len(), "mission start");
         Some(StartRequest {
             track_file: track.file.clone(),
@@ -220,7 +294,12 @@ impl CareerUi {
             backwards: m.backwards,
             opponents,
             parts,
-            mission: Some(MissionStart { index: idx, mission: m.clone(), scene_suffix, narrator: self.narrator_name(m.narrator) }),
+            mission: Some(MissionStart {
+                index: idx,
+                mission: m.clone(),
+                scene_suffix,
+                narrator: self.narrator_name(m.narrator),
+            }),
             traffic: CAREER_TRAFFIC[(m.traffic_level.max(0) as usize).min(3)],
             skill: m.skill.clamp(0, 2) as u8,
         })
@@ -230,12 +309,25 @@ impl CareerUi {
     pub fn finish_mission(&mut self, idx: usize, passed: bool, time_ticks: u64, cones: usize) {
         self.pending = None;
         let m = self.tables.missions[idx].clone();
-        let texts = if passed { m.success_string_ids } else { m.failure_string_ids };
+        let texts = if passed {
+            m.success_string_ids
+        } else {
+            m.failure_string_ids
+        };
         let ids: Vec<u32> = texts.iter().copied().filter(|t| *t != 0).collect();
-        let pick = ids.get((time_ticks as usize + cones) % ids.len().max(1)).copied();
+        let pick = ids
+            .get((time_ticks as usize + cones) % ids.len().max(1))
+            .copied();
         let promotion = self.career.record_mission(&self.tables, idx, passed);
         let secs = time_ticks as f32 / 64.0;
-        let mut msg = format!("{}: {}  ({}:{:05.2}, {} CONES)  ", if passed { "PASSED" } else { "FAILED" }, m.code.to_uppercase(), (secs / 60.0) as u32, secs % 60.0, cones);
+        let mut msg = format!(
+            "{}: {}  ({}:{:05.2}, {} CONES)  ",
+            if passed { "PASSED" } else { "FAILED" },
+            m.code.to_uppercase(),
+            (secs / 60.0) as u32,
+            secs % 60.0,
+            cones
+        );
         if let Some(id) = pick {
             msg += &self.tables.strings.text(id).replace("%s", "DRIVER");
         }
@@ -249,59 +341,179 @@ impl CareerUi {
     fn factory_sprites(&self, f: &BitmapFont, active: Option<u8>, out: &mut Vec<Sprite>) {
         let grey = [0.85, 0.85, 0.85, 1.0];
         let dim = [0.55, 0.55, 0.55, 1.0];
-        let sel = |r: u8| if active == Some(r) { [1.0, 0.75, 0.1, 1.0] } else { grey };
+        let sel = |r: u8| {
+            if active == Some(r) {
+                [1.0, 0.75, 0.1, 1.0]
+            } else {
+                grey
+            }
+        };
         let done = self.career.missions.iter().filter(|r| **r == 1).count();
-        let titles = ["JUNIOR TEST DRIVER", "TEST DRIVER", "CHIEF TEST DRIVER", "ACE TEST DRIVER"];
+        let titles = [
+            "JUNIOR TEST DRIVER",
+            "TEST DRIVER",
+            "CHIEF TEST DRIVER",
+            "ACE TEST DRIVER",
+        ];
         let rank = self.career.promotions_accepted.len().min(3);
-        out.extend(f.sprites(&format!("FACTORY DRIVER   {}   {}/{} MISSIONS", titles[rank], done, self.tables.missions.len()), [0.08, 0.20], 0.04, [0.9, 0.9, 1.0, 1.0]));
+        out.extend(f.sprites(
+            &format!(
+                "FACTORY DRIVER   {}   {}/{} MISSIONS",
+                titles[rank],
+                done,
+                self.tables.missions.len()
+            ),
+            [0.08, 0.20],
+            0.04,
+            [0.9, 0.9, 1.0, 1.0],
+        ));
         if let Some(p) = self.career.promotion_due(&self.tables) {
-            let car = self.tables.car(p.prize_car as u16).map(|c| c.display_name.to_uppercase()).unwrap_or_default();
-            out.extend(f.sprites(&format!("PROMOTION  < ACCEPT THE {car} >"), [0.08, 0.30], 0.045, sel(0)));
-            for (i, line) in wrap(&self.tables.strings.text(p.promotion_string_id).replace("%s", "DRIVER"), 66).iter().take(7).enumerate() {
-                out.extend(f.sprites(&line.to_uppercase(), [0.08, 0.37 + i as f32 * 0.036], 0.026, dim));
+            let car = self
+                .tables
+                .car(p.prize_car as u16)
+                .map(|c| c.display_name.to_uppercase())
+                .unwrap_or_default();
+            out.extend(f.sprites(
+                &format!("PROMOTION  < ACCEPT THE {car} >"),
+                [0.08, 0.30],
+                0.045,
+                sel(0),
+            ));
+            for (i, line) in wrap(
+                &self
+                    .tables
+                    .strings
+                    .text(p.promotion_string_id)
+                    .replace("%s", "DRIVER"),
+                66,
+            )
+            .iter()
+            .take(7)
+            .enumerate()
+            {
+                out.extend(f.sprites(
+                    &line.to_uppercase(),
+                    [0.08, 0.37 + i as f32 * 0.036],
+                    0.026,
+                    dim,
+                ));
             }
         } else if let Some(idx) = self.career.current_mission(&self.tables) {
             let m = &self.tables.missions[idx];
             let title = self.tables.strings.text(m.title_string_id());
-            out.extend(f.sprites(&format!("MISSION {}  < {} >", m.code.to_uppercase(), title.to_uppercase()), [0.08, 0.30], 0.045, sel(0)));
-            let car = self.tables.car(m.car_id as u16).map(|c| c.display_name.to_uppercase()).unwrap_or_default();
-            let mut rules = vec![format!("{} - {}", self.tables.track_name(m.track_id).to_uppercase(), car)];
-            if let Some(t) = m.time_limit_s { rules.push(format!("GOAL TIME {}:{:02}", t / 60, t % 60)); }
-            if let Some(ConeRule::PenaltySeconds(s)) = m.cone_rule { rules.push(format!("+{s} S PER CONE")); }
-            if let Some(ConeRule::Limit(n)) = m.cone_rule { rules.push(format!("MAX {n} CONES")); }
-            if let Some(d) = m.damage_limit_pct { rules.push(format!("DAMAGE UNDER {d}%")); }
-            if let Some(r) = m.min_rank { rules.push(format!("FINISH {}", if r == 1 { "1ST".to_string() } else { format!("TOP {r}") })); }
-            if m.laps > 1 { rules.push(format!("{} LAPS", m.laps)); }
+            out.extend(f.sprites(
+                &format!(
+                    "MISSION {}  < {} >",
+                    m.code.to_uppercase(),
+                    title.to_uppercase()
+                ),
+                [0.08, 0.30],
+                0.045,
+                sel(0),
+            ));
+            let car = self
+                .tables
+                .car(m.car_id as u16)
+                .map(|c| c.display_name.to_uppercase())
+                .unwrap_or_default();
+            let mut rules = vec![format!(
+                "{} - {}",
+                self.tables.track_name(m.track_id).to_uppercase(),
+                car
+            )];
+            if let Some(t) = m.time_limit_s {
+                rules.push(format!("GOAL TIME {}:{:02}", t / 60, t % 60));
+            }
+            if let Some(ConeRule::PenaltySeconds(s)) = m.cone_rule {
+                rules.push(format!("+{s} S PER CONE"));
+            }
+            if let Some(ConeRule::Limit(n)) = m.cone_rule {
+                rules.push(format!("MAX {n} CONES"));
+            }
+            if let Some(d) = m.damage_limit_pct {
+                rules.push(format!("DAMAGE UNDER {d}%"));
+            }
+            if let Some(r) = m.min_rank {
+                rules.push(format!(
+                    "FINISH {}",
+                    if r == 1 {
+                        "1ST".to_string()
+                    } else {
+                        format!("TOP {r}")
+                    }
+                ));
+            }
+            if m.laps > 1 {
+                rules.push(format!("{} LAPS", m.laps));
+            }
             let rule_lines = wrap(&rules.join("   "), 70);
             for (i, line) in rule_lines.iter().take(2).enumerate() {
                 out.extend(f.sprites(line, [0.12, 0.36 + i as f32 * 0.035], 0.028, dim));
             }
             let y0 = 0.36 + rule_lines.len().min(2) as f32 * 0.035 + 0.02;
-            out.extend(f.sprites(&format!("{}:", self.narrator_name(m.narrator).to_uppercase()), [0.08, y0], 0.028, grey));
-            for (i, line) in wrap(&self.tables.strings.text(m.intro_string_id).replace("%s", "DRIVER"), 66).iter().take(7).enumerate() {
-                out.extend(f.sprites(&line.to_uppercase(), [0.08, y0 + 0.04 + i as f32 * 0.036], 0.026, dim));
+            out.extend(f.sprites(
+                &format!("{}:", self.narrator_name(m.narrator).to_uppercase()),
+                [0.08, y0],
+                0.028,
+                grey,
+            ));
+            for (i, line) in wrap(
+                &self
+                    .tables
+                    .strings
+                    .text(m.intro_string_id)
+                    .replace("%s", "DRIVER"),
+                66,
+            )
+            .iter()
+            .take(7)
+            .enumerate()
+            {
+                out.extend(f.sprites(
+                    &line.to_uppercase(),
+                    [0.08, y0 + 0.04 + i as f32 * 0.036],
+                    0.026,
+                    dim,
+                ));
             }
         } else {
             out.extend(f.sprites("ALL MISSIONS COMPLETE", [0.08, 0.30], 0.045, sel(0)));
         }
         if !self.message.is_empty() {
             for (i, line) in wrap(&self.message, 70).iter().take(4).enumerate() {
-                out.extend(f.sprites(&line.to_uppercase(), [0.08, 0.72 + i as f32 * 0.033], 0.026, [0.4, 1.0, 0.5, 1.0]));
+                out.extend(f.sprites(
+                    &line.to_uppercase(),
+                    [0.08, 0.72 + i as f32 * 0.033],
+                    0.026,
+                    [0.4, 1.0, 0.5, 1.0],
+                ));
             }
         }
     }
 
     pub fn current(&self) -> Option<&Tournament> {
         let list = self.tournaments();
-        list.get(self.t_idx.min(list.len().saturating_sub(1))).copied()
+        list.get(self.t_idx.min(list.len().saturating_sub(1)))
+            .copied()
     }
 
     pub fn car_choices(&self) -> Vec<CarChoice> {
         if let Some(f) = &self.career.finale {
-            return self.tables.tournament(f.tournament).map(|t| vec![CarChoice::Loaned(t.prize_car)]).unwrap_or_default();
+            return self
+                .tables
+                .tournament(f.tournament)
+                .map(|t| vec![CarChoice::Loaned(t.prize_car)])
+                .unwrap_or_default();
         }
-        let Some(t) = self.current() else { return Vec::new() };
-        let mut v: Vec<CarChoice> = self.career.eligible_garage(t).into_iter().map(|i| CarChoice::Owned(i, self.career.garage[i].car_id)).collect();
+        let Some(t) = self.current() else {
+            return Vec::new();
+        };
+        let mut v: Vec<CarChoice> = self
+            .career
+            .eligible_garage(t)
+            .into_iter()
+            .map(|i| CarChoice::Owned(i, self.career.garage[i].car_id))
+            .collect();
         for c in self.career.eligible_catalog(&self.tables, t) {
             v.push(CarChoice::Buy(c.id, self.career.dealer_price(c)));
         }
@@ -331,7 +543,10 @@ impl CareerUi {
 
     /// The parts in the basket, in the order they were added.
     pub fn basket_parts(&self) -> Vec<&Part> {
-        self.basket.iter().filter_map(|id| self.tables.parts.iter().find(|p| p.id == *id)).collect()
+        self.basket
+            .iter()
+            .filter_map(|id| self.tables.parts.iter().find(|p| p.id == *id))
+            .collect()
     }
 
     /// `Parts.ShoppingList(TOTAL)`.
@@ -354,7 +569,13 @@ impl CareerUi {
         let mut bought = 0;
         let mut spent = 0i64;
         while let Some(id) = self.basket.first().copied() {
-            let price = self.tables.parts.iter().find(|p| p.id == id).map(|p| p.price as i64).unwrap_or(0);
+            let price = self
+                .tables
+                .parts
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| p.price as i64)
+                .unwrap_or(0);
             match self.career.buy_part(&self.tables, i, id) {
                 Ok(()) => {
                     self.basket.remove(0);
@@ -368,7 +589,10 @@ impl CareerUi {
             }
         }
         if bought > 0 {
-            self.message = format!("INSTALLED {bought} PART{}  (${spent})", if bought == 1 { "" } else { "S" });
+            self.message = format!(
+                "INSTALLED {bought} PART{}  (${spent})",
+                if bought == 1 { "" } else { "S" }
+            );
             self.save();
         }
     }
@@ -388,8 +612,14 @@ impl CareerUi {
         // used-car market (career.md §10.5): list the car, withdraw it, or accept a standing offer.
         // The original asks for the asking price in an entry box; this port lists at the car's current
         // value (UI choice — the offer rules themselves are the original's).
-        if self.row == 1 && let Some(i) = self.selected_garage() {
-            let name = self.tables.car(self.career.garage[i].car_id).map(|c| c.display_name.to_uppercase()).unwrap_or_default();
+        if self.row == 1
+            && let Some(i) = self.selected_garage()
+        {
+            let name = self
+                .tables
+                .car(self.career.garage[i].car_id)
+                .map(|c| c.display_name.to_uppercase())
+                .unwrap_or_default();
             let car = &self.career.garage[i];
             if car.offer.is_some() {
                 match self.career.accept_offer(i) {
@@ -408,7 +638,8 @@ impl CareerUi {
                 let ask = self.career.car_value(&self.tables, i).unwrap_or(0).max(0) as u32;
                 match self.career.list_for_sale(i, ask) {
                     Ok(()) => {
-                        self.message = format!("{name} LISTED AT ${ask}   (OFFERS COME IN AFTER A RACE)");
+                        self.message =
+                            format!("{name} LISTED AT ${ask}   (OFFERS COME IN AFTER A RACE)");
                         self.save();
                     }
                     Err(e) => self.message = e.to_string().to_uppercase(),
@@ -427,8 +658,12 @@ impl CareerUi {
 
     /// Parts on offer for the selected garage car.
     pub fn part_choices(&self) -> Vec<&Part> {
-        let Some(i) = self.selected_garage() else { return Vec::new() };
-        let Some(car) = self.tables.car(self.career.garage[i].car_id) else { return Vec::new() };
+        let Some(i) = self.selected_garage() else {
+            return Vec::new();
+        };
+        let Some(car) = self.tables.car(self.career.garage[i].car_id) else {
+            return Vec::new();
+        };
         self.career.parts_for(&self.tables, car)
     }
 
@@ -460,7 +695,14 @@ impl CareerUi {
         }
         // …and the same career in the original's format, so `SaveData/` matches what the game
         // itself would leave behind (`RE/notes/savegame.md` §3; the accessor block is omitted).
-        let sav = nfs_game::save::career_to_sav_with(&self.career, &self.tables, &self.profile, self.knockout.as_ref(), &self.playlist, &self.settings);
+        let sav = nfs_game::save::career_to_sav_with(
+            &self.career,
+            &self.tables,
+            &self.profile,
+            self.knockout.as_ref(),
+            &self.playlist,
+            &self.settings,
+        );
         if let Err(e) = nfs_game::save::write_profile(&self.save_dir, &self.profile, &sav) {
             tracing::warn!(error = %e, "writing the .sav profile failed");
         }
@@ -472,7 +714,12 @@ impl CareerUi {
             return self.activate_mission();
         }
         if self.row == 2 {
-            let (Some(_), Some(part)) = (self.selected_garage(), self.part_choices().get(self.part_sel).map(|p| (p.id, self.tables.strings.text(p.name_string_id).to_string()))) else {
+            let (Some(_), Some(part)) = (
+                self.selected_garage(),
+                self.part_choices()
+                    .get(self.part_sel)
+                    .map(|p| (p.id, self.tables.strings.text(p.name_string_id).to_string())),
+            ) else {
                 self.message = "SELECT AN OWNED CAR FIRST".into();
                 return None;
             };
@@ -482,20 +729,34 @@ impl CareerUi {
                 self.message = format!("REMOVED {}", part.1.to_uppercase());
             } else {
                 self.basket.push(part.0);
-                self.message = format!("ADDED {}  (TOTAL ${})", part.1.to_uppercase(), self.basket_total());
+                self.message = format!(
+                    "ADDED {}  (TOTAL ${})",
+                    part.1.to_uppercase(),
+                    self.basket_total()
+                );
             }
             return None;
         }
         let choices = self.car_choices();
-        let choice = choices.get(self.car_sel.min(choices.len().saturating_sub(1))).cloned();
+        let choice = choices
+            .get(self.car_sel.min(choices.len().saturating_sub(1)))
+            .cloned();
         let t = self.current()?.clone();
         match choice {
             Some(CarChoice::Buy(id, _)) => {
                 match self.career.buy_car(&self.tables, id, 0) {
                     Ok(()) => {
-                        let name = self.tables.car(id).map(|c| c.display_name.clone()).unwrap_or_default();
+                        let name = self
+                            .tables
+                            .car(id)
+                            .map(|c| c.display_name.clone())
+                            .unwrap_or_default();
                         self.message = format!("BOUGHT {}", name.to_uppercase());
-                        self.car_sel = self.car_choices().iter().position(|c| matches!(c, CarChoice::Owned(_, cid) if *cid == id)).unwrap_or(0);
+                        self.car_sel = self
+                            .car_choices()
+                            .iter()
+                            .position(|c| matches!(c, CarChoice::Owned(_, cid) if *cid == id))
+                            .unwrap_or(0);
                         self.save();
                     }
                     Err(e) => self.message = e.to_string().to_uppercase(),
@@ -520,7 +781,14 @@ impl CareerUi {
                             }
                         };
                         self.save();
-                        (t, event, match choice { Some(CarChoice::Owned(i, _)) => Some(i), _ => None })
+                        (
+                            t,
+                            event,
+                            match choice {
+                                Some(CarChoice::Owned(i, _)) => Some(i),
+                                _ => None,
+                            },
+                        )
                     }
                 };
                 let ev = &t.events[event];
@@ -528,7 +796,12 @@ impl CareerUi {
                     self.message = format!("UNKNOWN TRACK {}", ev.track_id);
                     return None;
                 };
-                let paint = self.paint_for(&car, garage_idx.map(|i| self.career.garage[i].paint_set as usize).unwrap_or(0));
+                let paint = self.paint_for(
+                    &car,
+                    garage_idx
+                        .map(|i| self.career.garage[i].paint_set as usize)
+                        .unwrap_or(0),
+                );
                 let opponents: Vec<CareerOpponent> = t
                     .opponents
                     .iter()
@@ -537,17 +810,74 @@ impl CareerUi {
                         if car.sim.is_empty() {
                             return None;
                         }
-                        let skill = self.tables.personalities.iter().find(|p| p.id == o.driver).map(|p| p.skill).unwrap_or([[1.0, 0.0]; 4]);
+                        let skill = self
+                            .tables
+                            .personalities
+                            .iter()
+                            .find(|p| p.id == o.driver)
+                            .map(|p| p.skill)
+                            .unwrap_or([[1.0, 0.0]; 4]);
                         let c = o.colours[0];
                         // opponent colour record is RGBA (bytes r g b a); an all-zero entry means "catalogue default"
-                        let paint = if c[..3] == [0, 0, 0] { car.paint_sets.first().map(|p| p.colours[0]).unwrap_or([0x20, 0x40, 0xC0]) } else { [c[0], c[1], c[2]] };
-                        Some(CareerOpponent { car, paint, name: self.tables.driver_name(o.driver), difficulty: ev.difficulty, skill, grid: None, personality: o.driver })
+                        let paint = if c[..3] == [0, 0, 0] {
+                            car.paint_sets
+                                .first()
+                                .map(|p| p.colours[0])
+                                .unwrap_or([0x20, 0x40, 0xC0])
+                        } else {
+                            [c[0], c[1], c[2]]
+                        };
+                        Some(CareerOpponent {
+                            car,
+                            paint,
+                            name: self.tables.driver_name(o.driver),
+                            difficulty: ev.difficulty,
+                            skill,
+                            grid: None,
+                            personality: o.driver,
+                        })
                     })
                     .collect();
-                self.pending = Some(PendingEvent { tournament: t.id, event, finale: finale.is_some(), garage_idx, mission: None });
-                let parts: Vec<Part> = garage_idx.map(|i| self.career.installed_parts(&self.tables, i).into_iter().cloned().collect()).unwrap_or_default();
-                tracing::info!(tournament = t.id, event, finale = finale.is_some(), track = track.file, laps = ev.laps, backwards = ev.backwards, car = car.model, opponents = opponents.len(), parts = parts.len(), "career event start");
-                Some(StartRequest { track_file: track.file.clone(), car, paint, laps: ev.laps.max(1) as u32, backwards: ev.backwards, opponents, parts, mission: None, traffic: CAREER_TRAFFIC[(t.traffic_level as usize).min(3)], skill: t.difficulty_level.min(2) as u8 })
+                self.pending = Some(PendingEvent {
+                    tournament: t.id,
+                    event,
+                    finale: finale.is_some(),
+                    garage_idx,
+                    mission: None,
+                });
+                let parts: Vec<Part> = garage_idx
+                    .map(|i| {
+                        self.career
+                            .installed_parts(&self.tables, i)
+                            .into_iter()
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                tracing::info!(
+                    tournament = t.id,
+                    event,
+                    finale = finale.is_some(),
+                    track = track.file,
+                    laps = ev.laps,
+                    backwards = ev.backwards,
+                    car = car.model,
+                    opponents = opponents.len(),
+                    parts = parts.len(),
+                    "career event start"
+                );
+                Some(StartRequest {
+                    track_file: track.file.clone(),
+                    car,
+                    paint,
+                    laps: ev.laps.max(1) as u32,
+                    backwards: ev.backwards,
+                    opponents,
+                    parts,
+                    mission: None,
+                    traffic: CAREER_TRAFFIC[(t.traffic_level as usize).min(3)],
+                    skill: t.difficulty_level.min(2) as u8,
+                })
             }
             None => {
                 self.message = "NO CAR AVAILABLE".into();
@@ -560,16 +890,36 @@ impl CareerUi {
     /// holds none.
     pub fn ensure_car(&mut self) {
         let choices = self.car_choices();
-        if choices.iter().any(|c| matches!(c, CarChoice::Owned(..) | CarChoice::Loaned(_))) {
+        if choices
+            .iter()
+            .any(|c| matches!(c, CarChoice::Owned(..) | CarChoice::Loaned(_)))
+        {
             return;
         }
-        if let Some(CarChoice::Buy(id, _)) = choices.iter().filter(|c| matches!(c, CarChoice::Buy(..))).min_by_key(|c| if let CarChoice::Buy(_, p) = c { *p } else { u32::MAX }).cloned() {
-            let _ = self.career.buy_car(&self.tables, id, 0).map_err(|e| tracing::warn!(error = %e, "ensure_car"));
+        if let Some(CarChoice::Buy(id, _)) = choices
+            .iter()
+            .filter(|c| matches!(c, CarChoice::Buy(..)))
+            .min_by_key(|c| {
+                if let CarChoice::Buy(_, p) = c {
+                    *p
+                } else {
+                    u32::MAX
+                }
+            })
+            .cloned()
+        {
+            let _ = self
+                .career
+                .buy_car(&self.tables, id, 0)
+                .map_err(|e| tracing::warn!(error = %e, "ensure_car"));
         }
     }
 
     fn paint_for(&self, car: &CarCatalogEntry, set: usize) -> [u8; 3] {
-        car.paint_sets.get(set % car.paint_sets.len().max(1)).map(|p| p.colours[0]).unwrap_or([0xD4, 0x10, 0x10])
+        car.paint_sets
+            .get(set % car.paint_sets.len().max(1))
+            .map(|p| p.colours[0])
+            .unwrap_or([0xD4, 0x10, 0x10])
     }
 
     /// Race over: `order` = finishing order of driver indices (0 = player, 1..=7 = opponents in
@@ -590,7 +940,13 @@ impl CareerUi {
         }
         if p.finale {
             self.message = match self.career.record_finale(&self.tables, order) {
-                Some((true, car)) => format!("FINALE WON: {} IS YOURS", self.tables.car(car).map(|c| c.display_name.to_uppercase()).unwrap_or_default()),
+                Some((true, car)) => format!(
+                    "FINALE WON: {} IS YOURS",
+                    self.tables
+                        .car(car)
+                        .map(|c| c.display_name.to_uppercase())
+                        .unwrap_or_default()
+                ),
                 Some((false, _)) => "FINALE LOST".into(),
                 None => String::new(),
             };
@@ -599,10 +955,16 @@ impl CareerUi {
             self.car_sel = 0;
             return;
         }
-        let Some(t) = self.tables.tournament(p.tournament).cloned() else { return };
-        let o = self.career.record_event(&self.tables, &t, p.event, order, times, p.garage_idx);
+        let Some(t) = self.tables.tournament(p.tournament).cloned() else {
+            return;
+        };
+        let o = self
+            .career
+            .record_event(&self.tables, &t, p.event, order, times, p.garage_idx);
         // used-car offers are refreshed after every career race (0x4F7DB0)
-        let mut seed = (o.result.position as u32).wrapping_mul(2_654_435_761) ^ (times[0] as u32).wrapping_mul(40_503) ^ 0x9E37_79B9;
+        let mut seed = (o.result.position as u32).wrapping_mul(2_654_435_761)
+            ^ (times[0] as u32).wrapping_mul(40_503)
+            ^ 0x9E37_79B9;
         let mut rand = move || {
             seed ^= seed << 13;
             seed ^= seed >> 17;
@@ -627,7 +989,10 @@ impl CareerUi {
         self.save();
         // move the cursor to the next open tournament
         let list = self.tournaments();
-        if let Some(i) = list.iter().position(|x| self.career.availability(&self.tables, x) == Availability::Open) {
+        if let Some(i) = list
+            .iter()
+            .position(|x| self.career.availability(&self.tables, x) == Availability::Open)
+        {
             self.t_idx = i;
         }
         self.car_sel = 0;
@@ -641,13 +1006,57 @@ impl CareerUi {
         }
         let grey = [0.85, 0.85, 0.85, 1.0];
         let dim = [0.55, 0.55, 0.55, 1.0];
-        let sel = |r: u8| if active == Some(r) { [1.0, 0.75, 0.1, 1.0] } else { grey };
-        let mut out = f.sprites(&format!("{}   {}   ${}   GARAGE {}", self.tables.strings.text(self.career.era.string_id()), self.career.year, self.career.money, self.career.garage.len()), [0.08, 0.20], 0.04, [0.9, 0.9, 1.0, 1.0]);
-        if let Some(fin) = &self.career.finale && let Some(t) = self.tables.tournament(fin.tournament) {
-            let car = self.tables.car(t.prize_car).map(|c| c.display_name.to_uppercase()).unwrap_or_default();
-            out.extend(f.sprites(&format!("ERA FINALE  < {} >", self.tables.tournament_title(t).to_uppercase()), [0.08, 0.30], 0.045, sel(0)));
-            out.extend(f.sprites(&format!("WIN IT IN THE LOANED {car} AND KEEP THE CAR   ({} LAPS)", t.events.first().map(|e| e.laps).unwrap_or(5)), [0.12, 0.36], 0.03, dim));
-            out.extend(f.sprites(&format!("CAR  < {car} >  (LOANED)"), [0.08, 0.54], 0.045, sel(1)));
+        let sel = |r: u8| {
+            if active == Some(r) {
+                [1.0, 0.75, 0.1, 1.0]
+            } else {
+                grey
+            }
+        };
+        let mut out = f.sprites(
+            &format!(
+                "{}   {}   ${}   GARAGE {}",
+                self.tables.strings.text(self.career.era.string_id()),
+                self.career.year,
+                self.career.money,
+                self.career.garage.len()
+            ),
+            [0.08, 0.20],
+            0.04,
+            [0.9, 0.9, 1.0, 1.0],
+        );
+        if let Some(fin) = &self.career.finale
+            && let Some(t) = self.tables.tournament(fin.tournament)
+        {
+            let car = self
+                .tables
+                .car(t.prize_car)
+                .map(|c| c.display_name.to_uppercase())
+                .unwrap_or_default();
+            out.extend(f.sprites(
+                &format!(
+                    "ERA FINALE  < {} >",
+                    self.tables.tournament_title(t).to_uppercase()
+                ),
+                [0.08, 0.30],
+                0.045,
+                sel(0),
+            ));
+            out.extend(f.sprites(
+                &format!(
+                    "WIN IT IN THE LOANED {car} AND KEEP THE CAR   ({} LAPS)",
+                    t.events.first().map(|e| e.laps).unwrap_or(5)
+                ),
+                [0.12, 0.36],
+                0.03,
+                dim,
+            ));
+            out.extend(f.sprites(
+                &format!("CAR  < {car} >  (LOANED)"),
+                [0.08, 0.54],
+                0.045,
+                sel(1),
+            ));
             out.extend(f.sprites("ENTER RACE   BACKSPACE DECLINE", [0.08, 0.60], 0.035, dim));
             if !self.message.is_empty() {
                 out.extend(f.sprites(&self.message, [0.08, 0.66], 0.035, [0.4, 1.0, 0.5, 1.0]));
@@ -663,39 +1072,137 @@ impl CareerUi {
         let status = match self.career.availability(&self.tables, t) {
             Availability::Completed => format!("DONE  RANK {}", st.final_rank.unwrap_or(0)),
             Availability::Locked => "LOCKED".to_string(),
-            Availability::Open if st.entered => format!("EVENT {}/{}", st.events.len() + 1, t.events.len()),
+            Availability::Open if st.entered => {
+                format!("EVENT {}/{}", st.events.len() + 1, t.events.len())
+            }
             Availability::Open => format!("FEE ${}  {} EVENTS", t.entry_fee, t.events.len()),
         };
-        let era_tag = if self.club { format!("{} ", self.tables.strings.text(t.era().string_id()).replace(" ERA", "")) } else { String::new() };
-        out.extend(f.sprites(&format!("{} {}/{}  < {}{} >", if self.club { "CLUB EVENT" } else { "TOURNAMENT" }, self.t_idx + 1, list.len(), era_tag, self.tables.tournament_title(t).to_uppercase()), [0.08, 0.30], 0.045, sel(0)));
-        out.extend(f.sprites(&format!("{}   {}", status, self.tables.strings.text(t.restriction_string_id).to_uppercase()), [0.12, 0.36], 0.03, dim));
+        let era_tag = if self.club {
+            format!(
+                "{} ",
+                self.tables
+                    .strings
+                    .text(t.era().string_id())
+                    .replace(" ERA", "")
+            )
+        } else {
+            String::new()
+        };
+        out.extend(f.sprites(
+            &format!(
+                "{} {}/{}  < {}{} >",
+                if self.club {
+                    "CLUB EVENT"
+                } else {
+                    "TOURNAMENT"
+                },
+                self.t_idx + 1,
+                list.len(),
+                era_tag,
+                self.tables.tournament_title(t).to_uppercase()
+            ),
+            [0.08, 0.30],
+            0.045,
+            sel(0),
+        ));
+        out.extend(
+            f.sprites(
+                &format!(
+                    "{}   {}",
+                    status,
+                    self.tables
+                        .strings
+                        .text(t.restriction_string_id)
+                        .to_uppercase()
+                ),
+                [0.12, 0.36],
+                0.03,
+                dim,
+            ),
+        );
         if let Some(e) = self.career.next_event(t).and_then(|i| t.events.get(i)) {
-            out.extend(f.sprites(&format!("NEXT: {}   1ST ${}  BONUS ${}", self.tables.track_name(e.track_id).to_uppercase(), e.prize[0], e.bonus), [0.12, 0.41], 0.03, dim));
+            out.extend(f.sprites(
+                &format!(
+                    "NEXT: {}   1ST ${}  BONUS ${}",
+                    self.tables.track_name(e.track_id).to_uppercase(),
+                    e.prize[0],
+                    e.bonus
+                ),
+                [0.12, 0.41],
+                0.03,
+                dim,
+            ));
         }
         if st.entered && !st.completed {
             let standings = self.career.standings(t);
-            let pts: Vec<String> = standings.iter().take(4).map(|(d, p, ..)| format!("{} {}", if *d == 0 { "YOU".to_string() } else { t.opponents.get(d - 1).map(|o| self.tables.driver_name(o.driver).to_uppercase()).unwrap_or_default() }, p)).collect();
-            out.extend(f.sprites(&format!("POINTS: {}", pts.join("  ")), [0.12, 0.46], 0.03, dim));
+            let pts: Vec<String> = standings
+                .iter()
+                .take(4)
+                .map(|(d, p, ..)| {
+                    format!(
+                        "{} {}",
+                        if *d == 0 {
+                            "YOU".to_string()
+                        } else {
+                            t.opponents
+                                .get(d - 1)
+                                .map(|o| self.tables.driver_name(o.driver).to_uppercase())
+                                .unwrap_or_default()
+                        },
+                        p
+                    )
+                })
+                .collect();
+            out.extend(f.sprites(
+                &format!("POINTS: {}", pts.join("  ")),
+                [0.12, 0.46],
+                0.03,
+                dim,
+            ));
         }
         let choices = self.car_choices();
         let car_line = match choices.get(self.car_sel.min(choices.len().saturating_sub(1))) {
             Some(CarChoice::Owned(i, id)) => {
-                let name = self.tables.car(*id).map(|c| c.display_name.to_uppercase()).unwrap_or_default();
+                let name = self
+                    .tables
+                    .car(*id)
+                    .map(|c| c.display_name.to_uppercase())
+                    .unwrap_or_default();
                 let value = self.career.car_value(&self.tables, *i).unwrap_or(0);
                 let car = &self.career.garage[*i];
                 match (car.offer, car.asking_price) {
                     (Some(o), _) => format!("CAR  < {name} >  OFFER ${o}  (BACKSPACE = ACCEPT)"),
-                    (None, Some(a)) => format!("CAR  < {name} >  LISTED AT ${a}  (BACKSPACE = WITHDRAW)"),
-                    (None, None) => format!("CAR  < {name} >  (GARAGE, VALUE ${value}, BACKSPACE = SELL)"),
+                    (None, Some(a)) => {
+                        format!("CAR  < {name} >  LISTED AT ${a}  (BACKSPACE = WITHDRAW)")
+                    }
+                    (None, None) => {
+                        format!("CAR  < {name} >  (GARAGE, VALUE ${value}, BACKSPACE = SELL)")
+                    }
                 }
             }
-            Some(CarChoice::Buy(id, price)) => format!("BUY  < {} >  ${}", self.tables.car(*id).map(|c| c.display_name.to_uppercase()).unwrap_or_default(), price),
-            Some(CarChoice::Loaned(id)) => format!("CAR  < {} >  (LOANED FOR THE FINALE)", self.tables.car(*id).map(|c| c.display_name.to_uppercase()).unwrap_or_default()),
+            Some(CarChoice::Buy(id, price)) => format!(
+                "BUY  < {} >  ${}",
+                self.tables
+                    .car(*id)
+                    .map(|c| c.display_name.to_uppercase())
+                    .unwrap_or_default(),
+                price
+            ),
+            Some(CarChoice::Loaned(id)) => format!(
+                "CAR  < {} >  (LOANED FOR THE FINALE)",
+                self.tables
+                    .car(*id)
+                    .map(|c| c.display_name.to_uppercase())
+                    .unwrap_or_default()
+            ),
             None => "NO ELIGIBLE CAR".to_string(),
         };
         out.extend(f.sprites(&car_line, [0.08, 0.54], 0.045, sel(1)));
         let parts = self.part_choices();
-        let part_line = match (self.selected_garage(), parts.get(self.part_sel.min(parts.len().saturating_sub(1)))) {
+        let part_line = match (
+            self.selected_garage(),
+            parts.get(self.part_sel.min(parts.len().saturating_sub(1))),
+        ) {
             (Some(i), Some(p)) => {
                 let installed = self.career.garage[i].parts.contains(&p.id);
                 let mark = if installed {
@@ -706,7 +1213,11 @@ impl CareerUi {
                     String::new()
                 };
                 let total = if !self.basket.is_empty() {
-                    format!("   LIST {} = ${}  (BACKSPACE = BUY)", self.basket.len(), self.basket_total())
+                    format!(
+                        "   LIST {} = ${}  (BACKSPACE = BUY)",
+                        self.basket.len(),
+                        self.basket_total()
+                    )
                 } else {
                     let kinds: Vec<u16> = (1..=10).collect();
                     match self.career.repair_cost(&self.tables, i, &kinds) {
@@ -714,7 +1225,16 @@ impl CareerUi {
                         c => format!("   REPAIR ${c}  (BACKSPACE)"),
                     }
                 };
-                format!("PART {}/{}  < {}: {} >  ${}{}{}", self.part_sel + 1, parts.len(), p.kind_name.to_uppercase(), self.tables.strings.text(p.name_string_id).to_uppercase(), p.price, mark, total)
+                format!(
+                    "PART {}/{}  < {}: {} >  ${}{}{}",
+                    self.part_sel + 1,
+                    parts.len(),
+                    p.kind_name.to_uppercase(),
+                    self.tables.strings.text(p.name_string_id).to_uppercase(),
+                    p.price,
+                    mark,
+                    total
+                )
             }
             (Some(_), None) => "PART  -  NONE FOR THIS CAR".to_string(),
             (None, _) => "PART  -  (OWNED CARS ONLY)".to_string(),
@@ -744,18 +1264,34 @@ mod tests {
         assert_eq!(ui.career.money, 11_000);
         let list = ui.tournaments();
         assert_eq!(list[0].id, 1, "356 Challenge first");
-        assert!(list.iter().all(|t| !t.is_hidden()), "finales are not listed");
+        assert!(
+            list.iter().all(|t| !t.is_hidden()),
+            "finales are not listed"
+        );
         // no car yet: the car row offers the eligible 356s at the dealer
         ui.row = 1;
         let choices = ui.car_choices();
         assert!(matches!(choices[0], CarChoice::Buy(_, _)));
-        let CarChoice::Buy(id, price) = choices.iter().find(|c| matches!(c, CarChoice::Buy(_, 11_000))).unwrap().clone() else { unreachable!() };
+        let CarChoice::Buy(id, price) = choices
+            .iter()
+            .find(|c| matches!(c, CarChoice::Buy(_, 11_000)))
+            .unwrap()
+            .clone()
+        else {
+            unreachable!()
+        };
         assert_eq!(ui.career.year, 1950);
-        ui.car_sel = choices.iter().position(|c| *c == CarChoice::Buy(id, price)).unwrap();
+        ui.car_sel = choices
+            .iter()
+            .position(|c| *c == CarChoice::Buy(id, price))
+            .unwrap();
         assert!(ui.activate().is_none(), "buying does not start a race");
         assert_eq!(ui.career.money, 0);
         assert_eq!(ui.career.garage.len(), 1);
-        assert!(matches!(ui.car_choices()[ui.car_sel], CarChoice::Owned(0, _)));
+        assert!(matches!(
+            ui.car_choices()[ui.car_sel],
+            CarChoice::Owned(0, _)
+        ));
         // parts row: the 356 has engine-group parts on offer
         ui.row = 2;
         let n_parts = ui.part_choices().len();
@@ -767,7 +1303,10 @@ mod tests {
         assert!(ui.activate().is_none());
         assert_eq!(ui.basket, vec![pid]);
         assert_eq!(ui.basket_total(), price);
-        assert!(ui.career.garage[0].parts.is_empty(), "nothing is bought before the list is accepted");
+        assert!(
+            ui.career.garage[0].parts.is_empty(),
+            "nothing is bought before the list is accepted"
+        );
         assert!(ui.activate().is_none());
         assert!(ui.basket.is_empty(), "Enter again takes it back out");
         assert!(ui.activate().is_none());
@@ -781,7 +1320,11 @@ mod tests {
         assert_eq!(req.parts.len(), 1);
         assert_eq!(req.opponents.len(), 7);
         assert!(["farmland", "coastal"].contains(&req.track_file.as_str()));
-        assert!(req.opponents.iter().all(|o| (0.3..=1.0).contains(&o.difficulty)));
+        assert!(
+            req.opponents
+                .iter()
+                .all(|o| (0.3..=1.0).contains(&o.difficulty))
+        );
         assert_eq!(req.laps, 1, "point-to-point stage");
         assert!(ui.pending.is_some());
         ui.finish(&[0, 1, 2, 3, 4, 5, 6, 7], &[6400; 8]);

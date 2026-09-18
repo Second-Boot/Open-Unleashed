@@ -520,7 +520,7 @@ impl Career {
 
     /// Dealer availability: model years covering the chronicle year and the record flags.
     pub fn dealer_lists(&self, c: &CarCatalogEntry) -> bool {
-        c.year <= self.year && self.year <= c.year_end.max(c.year) && !matches!(c.dealer_flag_204, 2 | 3) && c.dealer_flag_1f4 == 0
+        c.year <= self.year && self.year <= c.year_end.max(c.year) && !matches!(c.dealer_flag_204, 2 | 3) && c.kind == 0
     }
 
     pub fn dealer_price(&self, c: &CarCatalogEntry) -> u32 {
@@ -590,6 +590,15 @@ impl Career {
                 None => owned.part_state.push((id, d)),
             }
         }
+    }
+
+    /// `part+0x164` — how damaged one installed part is, as the percentage the two damage lists
+    /// print (`"%d %"` at 0x516EF6). A part the car has never raced keeps the table's own `state`.
+    pub fn part_damage(&self, idx: usize, part: &career::Part) -> f32 {
+        self.garage
+            .get(idx)
+            .and_then(|o| o.part_state.iter().find(|(id, _)| *id == part.id).map(|(_, s)| *s))
+            .unwrap_or(part.state as f32)
     }
 
     /// What the `QUICKFIX` screen charges to repair one part category (`RepairCost` 0x518880,
@@ -1206,6 +1215,14 @@ mod tests {
         assert_eq!(c.garage[0].damage_pct, 60.0);
         let state = c.garage[0].part_state.iter().find(|(id, _)| *id == part.id).map(|(_, s)| *s).unwrap();
         assert!((state - (1.5 - 0.005 * part.condition) * 60.0).abs() < 0.01, "{state}");
+
+        // and that is the number the two damage lists print (0x516EF6's `"%d %"`), where a part the
+        // car never raced falls back to the table's own state
+        assert!((c.part_damage(0, &part) - state).abs() < 0.01);
+        let fresh = tables.parts.iter().find(|p| p.id != part.id && p.kind == part.kind);
+        if let Some(f) = fresh {
+            assert_eq!(c.part_damage(0, f), f.state as f32);
+        }
 
         // the getter's scale and offset follow the parts on the car
         let w = part_wear_for(&tables, &c.garage[0]);

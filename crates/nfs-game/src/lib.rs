@@ -9,6 +9,7 @@ pub mod career;
 pub mod junctions;
 pub mod lanes;
 pub mod layout;
+pub mod opponents;
 pub mod particles;
 pub mod police;
 pub mod race;

@@ -1305,6 +1305,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nfs-net"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "nfs-physics"
 version = "0.1.0"
 dependencies = [
@@ -1830,6 +1837,7 @@ dependencies = [
  "nfs-formats",
  "nfs-game",
  "nfs-input",
+ "nfs-net",
  "nfs-physics",
  "nfs-renderer",
  "pollster",

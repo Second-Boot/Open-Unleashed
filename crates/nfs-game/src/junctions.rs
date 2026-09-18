@@ -18,6 +18,11 @@ use glam::Vec3;
 
 /// `[0x5B47B8]` — the squared radius, in metres², that both passes use.
 pub const JOIN_RADIUS_SQ: f32 = 256.0;
+/// `[0x628BB8] = 90 · 90` — how far a junction of **more than two** links reaches when it claims
+/// slices for `near_node` (0x47FCF0, read at 0x4805A6).
+pub const NODE_RADIUS_SQ: f32 = 8100.0;
+/// `[0x628BBC] = 18 · 18` — the same for a node of two links or fewer (0x47FD10).
+pub const SMALL_NODE_RADIUS_SQ: f32 = 324.0;
 /// A cut must leave at least this many slices on each side (0x480A1D / 0x480A27).
 pub const MIN_SEGMENT_SLACK: usize = 6;
 /// `node+0x00..0x1C` is eight pointers.
@@ -79,6 +84,16 @@ pub struct Junctions {
     pub nodes: Vec<Node>,
     /// `this+0x14` — the node index per slice, or `None`
     pub slice_node: Vec<Option<usize>>,
+    /// `this+0x10` — for every slice, the junction node whose catchment covers it, or `None`. A node
+    /// claims every slice of its own links' segments within `NODE_RADIUS_SQ` of it, and where two
+    /// nodes reach the same slice the **nearer** one keeps it (0x480671..0x4806D1). This is what
+    /// `findSlice` 0x481400 consults before it hill-climbs, so that a car near a fork is re-seeded
+    /// onto the branch it is actually on rather than the one it came from.
+    pub near_node: Vec<Option<usize>>,
+    /// `this+0x20` — per node, the slices of its catchment with their squared distance from the
+    /// node, **sorted by that distance** (collected in link order at 0x4805D5 … 0x480643, then
+    /// sorted at 0x480708).
+    pub node_slices: Vec<Vec<(usize, f32)>>,
     /// `this+0x04` — the slice length of the main lap
     pub lap_slices: usize,
     /// `this+0x08` — the last slice of the segment whose exit fraction reaches 1.0
@@ -231,7 +246,37 @@ impl Junctions {
             .next_back()
             .unwrap_or(centres.len().saturating_sub(1));
 
-        Junctions { segments, nodes, slice_node, lap_slices, finish_slice, lap_route }
+        // `this+0x10` / `this+0x20` (0x480526..0x4806D1): every node claims the slices of its own
+        // links' segments that lie inside its radius, keeping the list in link order, and the
+        // per-slice byte goes to whichever claiming node is nearest that slice.
+        let mut near_node: Vec<Option<usize>> = vec![None; centres.len()];
+        let mut node_slices: Vec<Vec<(usize, f32)>> = vec![Vec::new(); nodes.len()];
+        for (ni, n) in nodes.iter().enumerate() {
+            let r = if n.links.len() > 2 { NODE_RADIUS_SQ } else { SMALL_NODE_RADIUS_SQ };
+            for l in &n.links {
+                let seg = &segments[l.segment];
+                // the original walks the linked segment first → last whichever end the link is
+                // (0x4805D5 reads `segment+0` and `segment+0x10` and counts up)
+                for s in seg.first..=seg.last {
+                    let d2 = dist2_xz(centres[s], n.position);
+                    if d2 >= r {
+                        continue;
+                    }
+                    node_slices[ni].push((s, d2));
+                    match near_node[s] {
+                        None => near_node[s] = Some(ni),
+                        Some(other) if dist2_xz(centres[s], nodes[other].position) > d2 => near_node[s] = Some(ni),
+                        Some(_) => {}
+                    }
+                }
+            }
+            // 0x480708 sorts the list before it is ever searched — the MSVC introsort prologue is
+            // right there (depth limit `2·log2(n)`, the sixteen-element cutoff). `findSlice`'s
+            // window scan depends on it: it walks to the first key inside the window and stops at
+            // the first one past it.
+            node_slices[ni].sort_by(|a, b| a.1.total_cmp(&b.1));
+        }
+        Junctions { segments, nodes, slice_node, near_node, node_slices, lap_slices, finish_slice, lap_route }
     }
 
     /// Overwrite the weights from `<track>.jnc`: `nNodes` records of `{u32 index, f32 w[8]}`, `w[k]`

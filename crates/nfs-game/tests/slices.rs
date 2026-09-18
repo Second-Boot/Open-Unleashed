@@ -96,3 +96,41 @@ fn monaco1_lap_chains_all_sections() {
     assert_eq!(a.route.len(), 1795);
     assert_eq!(a.add(1794, 1), 0);
 }
+
+/// A car on one of a track's branch roads is tracked onto that road, not snapped to the main lap
+/// (`0x481400`'s whole-array hill-climb plus the junction step of `0x481190`).
+#[test]
+fn a_car_on_a_shortcut_is_tracked_onto_it() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    // castle drives three of its nineteen sections; the rest are real roads the tracker used to
+    // ignore, 1492 slices of them
+    let t = TrackAssets::load(&paths, "castle").unwrap();
+    let table = SliceTable::from_crp(&t.crp, &t.crp_data).unwrap();
+    assert_eq!(table.slices.len(), 3443);
+    assert_eq!(table.lap_len, 1951);
+    let off_lap = (0..table.slices.len()).filter(|s| !table.route.contains(s)).count();
+    assert_eq!(off_lap, 1492);
+
+    // every off-lap slice the tracker is handed answers with itself, or with a slice of the same
+    // road within a few metres — never with a far-away lap slice
+    let mut worst = 0.0f32;
+    let mut checked = 0;
+    for s in (0..table.slices.len()).step_by(17) {
+        let got = table.find_slice(table.slices[s].centre, s);
+        let d = (table.slices[got].centre - table.slices[s].centre).length();
+        worst = worst.max(d);
+        checked += 1;
+    }
+    assert!(checked > 150);
+    assert!(worst < 4.0, "worst mis-track {worst} m");
+
+    // and the junction catchments exist: castle's nodes claim slices, and a claimed slice names the
+    // nearest node
+    let claimed = table.junctions.near_node.iter().filter(|n| n.is_some()).count();
+    assert!(claimed > 200, "only {claimed} slices are in a junction catchment");
+    let lists: usize = table.junctions.node_slices.iter().map(|v| v.len()).sum();
+    assert!(lists >= claimed);
+}

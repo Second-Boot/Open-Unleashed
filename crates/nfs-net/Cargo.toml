@@ -1,0 +1,9 @@
+[package]
+name = "nfs-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The network protocol of Need for Speed: Porsche Unleashed (see RE/notes/network.md)"
+
+[dependencies]
+thiserror.workspace = true

@@ -20,11 +20,15 @@
 //! * despawn at 400 m (octagonal metric) from the reference car, and near both ends of a linear
 //!   track, then back to purgatory — §10.
 //!
-//! Not ported (documented gaps): the lane **scoring** and lane changes of §12 (a car keeps the lane
-//! it spawned in), the personality lane offset `car+0xEC8` from `prsonal.bin`, the `scripts.bin`
-//! reactions of §12.3/§12.9, police (§17), and the knocked-over hand-back to the rigid body
-//! (`car+0x42C == 1`, 0x4084C3). The AI level-of-detail gate of §14.3 is not modelled either: every
-//! traffic car is updated at the full 32 Hz.
+//! The lane **scoring** and lane changes of §12 are ported too, in `crate::lanes` — the blockers and
+//! caps of §12.4, all six scorers of §23.1–§23.6, the pick of §12.5, the lateral target of §12.6 and
+//! the speed cap of §12.7.
+//!
+//! Not ported: police, which `crate::police` carries instead (§17). Three things that look like gaps
+//! are not: the AI level-of-detail gate of §14.3 **is** modelled (`lod_step`, used by `ai_step`), the
+//! personality lane offset `car+0xEC8` is always zero for traffic (it draws personality row 0), and
+//! the knocked-over hand-back to the rigid body (`car+0x42C == 1`, 0x4084C3) is dead code for traffic
+//! (§21.7) — what replaces it, the two damping exits, is here.
 
 use crate::aidrive::{self, AiCarState};
 use crate::scripts::{ScriptRunner, Trigger};
@@ -189,6 +193,8 @@ pub struct TrafficCar {
     /// and nothing else clears it for a traffic car, which is what disables the "on its roof" exit
     /// for the rest of a car's life once it has been hit (§21.7).
     pub collisions: u32,
+    /// `car+0x104C` and its timers — the gear the drive model runs in (`aidrive::Gear`)
+    pub gear: aidrive::Gear,
     /// `car+0xEC0`: speed along `dir`
     pub speed: f32,
     /// `car+0xEB8`
@@ -214,6 +220,7 @@ pub struct TrafficCar {
 impl TrafficCar {
     pub fn new(spec: TrafficSpec) -> Self {
         Self {
+            gear: aidrive::Gear::default(),
             model: spec.model,
             half_extents: spec.half_extents,
             mass: spec.mass(),
@@ -252,8 +259,8 @@ impl TrafficCar {
             angular_velocity: self.angular_velocity,
             slice: self.slice,
             dir: self.dir,
-            // traffic never reverses out of trouble in the port (`0x40A5A0`/`0x40A850` are not ported)
-            sense: 1.0,
+            // `car+0x104C`, the gear the oscillator of §27.2a leaves it in
+            sense: self.gear.sense,
             speed: self.speed,
             speed_est: self.speed_estimate(),
             target_speed: self.target_speed,
@@ -553,6 +560,16 @@ impl TrafficSet {
             // §27.2: the drive model. The kinematic `0x408840` of §14.5 is dead code — `car+0x7E` is
             // never non-zero — so the car is a point mass with a yaw degree of freedom driven by two
             // P-cascades whose gains come from `trafcfg.dat`.
+            // §27.2a: `AI_drive` runs the reverse trim, then asks whether the car is in trouble
+            // and, if it is, flips the gear every 32 ticks. An upright car that is still inside the
+            // slice's lane extent never enters this at all.
+            let lane = lane_of(&sl, c.lateral);
+            let (trim_speed, trim_target) = aidrive::reverse_trim(&mut c.gear, tick as i64, c.lateral, c.lateral_target, c.lateral_rate, c.target_speed);
+            c.target_speed = trim_speed;
+            c.lateral_target = trim_target;
+            if aidrive::in_trouble(&mut c.gear, lane, sl.lanes_a as i32, sl.lanes_b as i32, up_y, AI_TICKS) {
+                aidrive::toggle_gear(&mut c.gear, tick as i64, c.speed, aidrive::GEAR_PERIOD);
+            }
             let mut st = c.as_ai_state(&self.phys);
             let aim = aidrive::aim_direction(table, &self.cfg, &st);
             let err = aidrive::heading_error(&st, aim);

@@ -45,10 +45,23 @@ pub struct CarCatalogEntry {
     /// 0x4C1A63 and uses entries `2*logo_pair` and `2*logo_pair + 1`, drawn side by side
     /// (`RE/notes/layouts.md` §4). CONFIRMED.
     pub logo_pair: i16,
-    /// +0x1F4 u16: must be 0 for the dealer to list the car (0x4F4240).
-    pub dealer_flag_1f4: u16,
-    /// +0x204 u16: dealer skips values 2 and 3 (0x4F4240).
+    /// +0x1F4 u16 — what the car *is*, and which of the front end's lists it joins (the `switch` at
+    /// 0x4F400E): **0 a racing car** (87 records, the player's, the opponents' and the dealer's),
+    /// **1 traffic** (16: `eden1..5`, `EAS1..11`), **2 a cop** (6). Only kind 0 may be listed or
+    /// raced. CONFIRMED.
+    pub kind: u16,
+    /// +0x204 u16 — availability: `2` is a bonus car (959, 928 GTS, GT2, GT3) and `3` a Factory
+    /// Driver car (`FBoxster`, `F901`, `F996`); the dealer skips both (0x4F4240).
     pub dealer_flag_204: u16,
+    /// +0x1AC u32 — the car's **class**, as an `FEStrings.csv` id: 501 CLASS 3, 502 CLASS 2,
+    /// 503 CLASS 1, 504 RACE CLASS. `FEOpponentCarAccessor` matches on it (`modes.md` §1.1a).
+    pub class_string_id: u32,
+    /// +0x1B0 u32 — the car's **era**, as an `FEStrings.csv` id: 521 CLASSIC, 522 GOLDEN,
+    /// 523 MODERN. Traffic and cop records carry 0 in both.
+    pub era_string_id: u32,
+    /// +0x528 u16 count, +0x530 16-byte entries — the interior colours, in the same
+    /// `{u32 packed, …}` shape as a paint set's colours (`OwnedCar.IntColour`, 0x4F0CE0/0x4F0D20).
+    pub interior_colours: Vec<[u8; 3]>,
     /// +0x214 … +0x2DC: value curve in per cent for the years 1950..=2000 (`0x4F8E50`); the dealer
     /// indexes the same table by age from +0x20C (`age_curve`).
     pub value_curve: [f32; 51],
@@ -58,6 +71,14 @@ pub struct CarCatalogEntry {
     pub dial_kmh: DialSpec,
     pub dial_mph: DialSpec,
     pub dial_tach: DialSpec,
+    /// +0x324 … +0x32C — five i16 ratings on a **0..100** scale, in the order the car-compare
+    /// screen's jump table at 0x4CAA48 dispatches them: **acceleration, top speed, braking,
+    /// handling, overall**. The accessor `CarCompare.Data(<n>CarCompareCar<m>)` (0x4CA790) takes
+    /// the leading digit of its source name as `n` and returns the matching field with `movsx`,
+    /// and `carcompare.lay` labels the five rows with `FEStrings` 10702, 10701, 10700, 10706 and
+    /// 10705 — ACCELERATION, TOP SPEED, BRAKING, HANDLING, OVERALL, top to bottom. The bar widget
+    /// reading them has stops `c0`, `c50` and `c100`, which is what fixes the scale. CONFIRMED.
+    pub compare: [i16; 5],
     /// +0x208 u32 price in dollars (11000 for the '50 356, 750000 for the GT1 — matches the tournament
     /// prize scale; the u16 reading overflowed for cars above $65535). HIGH.
     pub price: u32,
@@ -162,6 +183,15 @@ pub fn parse_car_catalog(data: &[u8]) -> Result<Vec<CarCatalogEntry>, FormatErro
             };
             paint_sets.push(PaintSet { package, colours: [c(0), c(1), c(2)], packed: [packed(0), packed(1), packed(2)] });
         }
+        let n_int = u16_le(r, 0x528, "nfs5.car interior count")? as usize;
+        let mut interior_colours = Vec::new();
+        for i in 0..n_int.min(40) {
+            let o = 0x530 + i * 16;
+            if o + 4 > r.len() {
+                break;
+            }
+            interior_colours.push([r[o + 1], r[o + 2], r[o + 3]]);
+        }
         out.push(CarCatalogEntry {
             display_name: s(0x02, 50)?,
             family: s(0x34, 25)?,
@@ -176,8 +206,11 @@ pub fn parse_car_catalog(data: &[u8]) -> Result<Vec<CarCatalogEntry>, FormatErro
             displacement: s(0x1C2, 16)?,
             id: u16_le(r, 0, "nfs5.car id")?,
             logo_pair: u16_le(r, 0x1F6, "nfs5.car +0x1F6")? as i16,
-            dealer_flag_1f4: u16_le(r, 0x1F4, "nfs5.car +0x1F4")?,
+            kind: u16_le(r, 0x1F4, "nfs5.car +0x1F4")?,
             dealer_flag_204: u16_le(r, 0x204, "nfs5.car +0x204")?,
+            class_string_id: u32_le(r, 0x1AC, "nfs5.car +0x1AC")?,
+            era_string_id: u32_le(r, 0x1B0, "nfs5.car +0x1B0")?,
+            interior_colours,
             value_curve: {
                 let mut c = [0f32; 51];
                 for (i, v) in c.iter_mut().enumerate() {
@@ -189,6 +222,13 @@ pub fn parse_car_catalog(data: &[u8]) -> Result<Vec<CarCatalogEntry>, FormatErro
             dial_kmh: DialSpec::parse(r, 0x300)?,
             dial_mph: DialSpec::parse(r, 0x30C)?,
             dial_tach: DialSpec::parse(r, 0x318)?,
+            compare: {
+                let mut c = [0i16; 5];
+                for (i, v) in c.iter_mut().enumerate() {
+                    *v = u16_le(r, 0x324 + i * 2, "nfs5.car compare rating")? as i16;
+                }
+                c
+            },
             year: u16_le(r, 0x1F8, "nfs5.car year")?,
             year_end: u16_le(r, 0x202, "nfs5.car year_end")?,
             price: u32_le(r, 0x208, "nfs5.car price")?,

@@ -8,6 +8,7 @@ members = [
     "crates/nfs-renderer",
     "crates/nfs-audio",
     "crates/nfs-input",
+    "crates/nfs-net",
     "crates/nfs-game",
     "crates/porsche",
     "tools/asset-inspector",
@@ -31,6 +32,7 @@ nfs-physics = { path = "crates/nfs-physics" }
 nfs-renderer = { path = "crates/nfs-renderer" }
 nfs-audio = { path = "crates/nfs-audio" }
 nfs-input = { path = "crates/nfs-input" }
+nfs-net = { path = "crates/nfs-net" }
 nfs-game = { path = "crates/nfs-game" }
 
 thiserror = "2"

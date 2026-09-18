@@ -56,6 +56,11 @@ pub struct SliceTable {
 /// Maximum gap between a section's last slice (advanced one spacing) and the next section's first.
 pub const JUNCTION_RADIUS: f32 = 20.0;
 
+/// `[0x628BB8] − (90 − 6)²` = 8100 − 7056 (0x4811CF). `0x481190` keeps the catchment slices whose
+/// squared distance from the junction is within this much of the car's own — a ring around the node
+/// at the car's own radius, which is what separates one branch from another.
+pub const BRANCH_WINDOW: f32 = 1044.0;
+
 impl SliceTable {
     pub fn from_crp(crp: &Crp, data: &[u8]) -> Result<Self, String> {
         let simd = crp.level.iter().find(|e| e.is_level(b"SimD")).ok_or("Could not find sim data in data group (no SimD)")?;
@@ -216,9 +221,13 @@ impl SliceTable {
     }
 
     pub fn find_slice(&self, pos: Vec3, prev: usize) -> usize {
-        let n = self.lap_len.max(1);
-        let mut p = self.route_pos.get(prev).copied().unwrap_or(0) as usize % n;
-        let d2 = |p: usize| self.d2(self.route[p], pos);
+        let n = self.slices.len();
+        if n == 0 {
+            return prev;
+        }
+        let d2 = |i: usize| self.d2(i % n, pos);
+        let mut p = prev.min(n - 1);
+        // farther than 128 m from where it was: a coarse sweep of every eighth slice (0x481468)
         if d2(p) > 16384.0 {
             let mut best = (f32::MAX, p);
             let mut i = 0;
@@ -231,6 +240,12 @@ impl SliceTable {
             }
             p = best.1;
         }
+        // 0x4814A5: a slice inside a junction's catchment re-seeds the search onto whichever branch
+        // of that junction the car is actually on, which is what lets the tracker follow a shortcut
+        if let Some(node) = self.junctions.near_node.get(p).copied().flatten() {
+            p = self.resolve_branch(pos, node, p);
+        }
+        // the hill-climb, over the whole slice array and wrapping at its end (0x4814C5)
         for _ in 0..1000 {
             let d = d2(p);
             let next = (p + 1) % n;
@@ -245,7 +260,44 @@ impl SliceTable {
                 break;
             }
         }
-        self.route[p]
+        p
+    }
+
+    /// `0x481190` — which slice of a junction's catchment the car is on.
+    ///
+    /// The node's list is scanned for the entries whose distance from the node is within
+    /// [`BRANCH_WINDOW`] of the car's own, and the nearest of those wins. The scan is the
+    /// original's: it walks forward to the first entry inside the window and stops at the first one
+    /// past it, which matters because the list is a concatenation of per-link runs that each walk
+    /// away from the node. Two quirks are kept: running off the end returns the last entry, and a
+    /// window that admits nothing returns slice 0.
+    fn resolve_branch(&self, pos: Vec3, node: usize, prev: usize) -> usize {
+        let Some(list) = self.junctions.node_slices.get(node) else { return prev };
+        if list.is_empty() {
+            return prev;
+        }
+        let Some(n) = self.junctions.nodes.get(node) else { return prev };
+        let dx = n.position.x - pos.x;
+        let dz = n.position.z - pos.z;
+        let d2c = dx * dx + dz * dz;
+        let lo = (d2c - BRANCH_WINDOW).max(0.0);
+        let hi = d2c + BRANCH_WINDOW;
+        let mut i = 0;
+        while i < list.len() && list[i].1 < lo {
+            i += 1;
+        }
+        if i == list.len() {
+            return list[list.len() - 1].0;
+        }
+        let mut best = (f32::MAX, 0usize);
+        while i < list.len() && list[i].1 < hi {
+            let d = self.d2(list[i].0, pos);
+            if d < best.0 {
+                best = (d, list[i].0);
+            }
+            i += 1;
+        }
+        best.1
     }
 
     /// Lap fraction of a slice (0x416290); branch slices use their nearest lap slice.
@@ -480,15 +532,14 @@ fn two_branch_table() -> SliceTable {
         // nearest slice and keeps whichever candidate is closer.
         let t = two_branch_table();
         let on_branch = t.slices[t.sections[1].first + 2].centre;
-        // without a preference the route hill-climb answers with a main-route slice
-        let plain = t.find_slice(on_branch, 0);
-        assert!(plain <= t.sections[0].last, "the route candidate is on the main section");
-        // with it, the branch slice wins
-        let tracked = t.track_slice(on_branch, 0, Some(1));
-        assert_eq!(tracked, t.sections[1].first + 2);
+        // the plain search covers the whole slice array now (0x481400), so a car parked on the
+        // branch is tracked onto the branch whether or not a section is preferred
+        assert_eq!(t.find_slice(on_branch, 0), t.sections[1].first + 2);
+        assert_eq!(t.track_slice(on_branch, 0, Some(1)), t.sections[1].first + 2);
         // and a preference that is further away changes nothing
         let on_main = t.slices[3].centre;
         assert_eq!(t.track_slice(on_main, 0, Some(1)), t.find_slice(on_main, 0));
+        assert_eq!(t.find_slice(on_main, 0), 3);
     }
 
     #[test]

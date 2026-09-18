@@ -118,6 +118,13 @@ pub struct Vehicle {
     /// TCS (car-info +0x24) or AI car: a traction-limited wheel clamps its demand to the grip limit
     /// instead of spinning/locking (`Tyre` 0x4A20D0, CONFIRMED).
     pub traction_control: bool,
+    /// `car+0x52C & 4` is clear — the car is driven by the AI, not a human. The rev limiter's
+    /// standing-start branch is the one place the original asks (`physics.md` §4.1).
+    pub ai_driven: bool,
+    /// `car+0x52C` bit 7 — the car is **traffic** (`ai.md` §7: the registration at 0x40F160 sets
+    /// 0x80 for traffic, and `AIHigh_Traffic` hangs off it). `Damage_byNormal` 0x494E69 tests it
+    /// and skips the roof zone for a traffic car.
+    pub is_traffic: bool,
     /// Engine wheelspin state (`car+0xDB8 == 2`, clutch slipping / spinning rear axle).
     pub rear_spin: bool,
     /// Body damage per zone 0..100 (`car+0x4E4..`, `Damage` 0x494500). The ring runs **0 front-left,
@@ -196,6 +203,8 @@ impl Vehicle {
             automatic: true,
             race_started: true,
             traction_control: false,
+            ai_driven: false,
+            is_traffic: false,
             rear_spin: false,
             damage: [0.0; 10],
             damage_enabled: true,
@@ -223,14 +232,27 @@ impl Vehicle {
             half_extents: Vec3::new(half_track + 0.15, 0.6, hb + 0.9),
             body_points: Vec::new(),
             impact: 0.0,
-            rng: 0x1234_5678,
+            rng: 0x3ADE_68B1,
         }
     }
 
+    /// The original's 16-bit LCG, drawn inline at every call site: `prod = state · 123456789`,
+    /// `state = prod & 0xFFFF`, `rand16 = (prod >> 8) & 0xFFFF` (`traffic.md` §14.7). The original
+    /// keeps **one** stream for the whole game; this crate sits below `nfs-game`, so it carries its
+    /// own state with the same arithmetic.
+    fn rand16(&mut self) -> u32 {
+        let prod = self.rng.wrapping_mul(123_456_789);
+        self.rng = prod & 0xFFFF;
+        (prod >> 8) & 0xFFFF
+    }
+
+    /// `(rand16 · n) >> 16` — the original's "random below n".
+    fn rand_below(&mut self, n: u32) -> u32 {
+        (self.rand16() * n) >> 16
+    }
+
     fn rand01(&mut self) -> f32 {
-        // The original uses an LCG at 0x5D1028 (multiplier unknown); any uniform source is fine here.
-        self.rng = self.rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        ((self.rng >> 8) & 0xFFFF) as f32 * 1.525_878_9e-5
+        self.rand16() as f32 * 1.525_878_9e-5
     }
 
     pub fn forward(&self) -> Vec3 {
@@ -366,10 +388,18 @@ impl Vehicle {
         } else {
             ((specs.redline + 100.0) * self.throttle).min(specs.redline + 100.0)
         };
-        // rev limiter
+        // The rev limiter of `physics.md` §4.1: crossing the redline pins the rpm just above it and
+        // arms an ignition cut of a few ticks, whose length is a small random draw — longer at a
+        // standing start, where the original gives a human car 10–29 ticks so the launch stutters.
         if self.rpm > specs.redline && self.rpm < specs.redline + 250.0 {
             self.rpm = specs.redline + 50.0;
-            self.ignition_cut = if gear > 1 && rear_contact { 3 * gear as u32 } else { 2 };
+            self.ignition_cut = if gear > 1 && rear_contact {
+                self.rand_below(2) + 3 * gear as u32
+            } else if self.ticks_alive < 0x1A0 && !self.ai_driven {
+                self.rand_below(20) + 10
+            } else {
+                self.rand_below(2) + 2
+            };
         }
         let mut throttle = self.throttle;
         let mut rpm_target = rpm_target;
@@ -534,13 +564,16 @@ impl Vehicle {
 
     /// `Damage_byNormal` 0x494DF0 (CONFIRMED): needs an effect > 10; the zone is chosen from the
     /// contact normal in the body frame (`x = n·right, y = n·up, z = n·forward`).
+    ///
+    /// The roof zone is gated: 0x494E69 takes it only when `car+0x52C & 0x80` is **clear**, and
+    /// that bit marks a traffic car (`ai.md` §7), so traffic never takes roof damage.
     pub fn damage_by_normal(&mut self, effect: f32, n_world: Vec3) {
         if effect <= 10.0 {
             return;
         }
         let m = self.orientation;
         let (x, y, z) = (n_world.dot(m.row(0)), n_world.dot(m.row(1)), n_world.dot(m.row(2)));
-        let zone = if y < -0.5 {
+        let zone = if y < -0.5 && !self.is_traffic {
             8
         } else if x.abs() < 0.1 {
             if z < -0.1 { 1 } else if z > 0.1 { 5 } else { return }
@@ -581,6 +614,36 @@ impl Vehicle {
     /// `Tyre` 0x4A20D0 + `FrictionCircle` 0x4A1DC0 + `Slide` 0x4A1C70 — CONFIRMED
     /// (`RE/notes/tyre-slide.md` §2–4, ported formula by formula).
     ///
+    /// The steering angle law: the front wheels' angle for a given ramped steering value, damage
+    /// pull included, with the high-speed taper and the ×1/(v·0.0125) above 80 m/s.
+    ///
+    /// Pulled out of the step so a car the caller drives itself — a network player's, whose own
+    /// step never runs — can have the same wheels. [`Self::steer_wheels_now`] is the convenience
+    /// form that takes the values off the vehicle.
+    pub fn set_wheel_steer(&mut self, specs: &CarSpecs, steer_int: f32, speed: f32, v_fwd: f32) {
+        let mut y = specs.max_steer;
+        if speed > 30.0 {
+            y *= 1.75 - 0.025 * speed;
+        }
+        y = y.clamp(0.0, 20.0) * 17.0 / specs.max_steer;
+        let mut s0 = steer_int * (1.0 - self.damage[0] / 512.0) * (y + specs.steer_offset) / 127.0;
+        let mut s1 = steer_int * (1.0 - self.damage[2] / 512.0) * (y - specs.steer_offset) / 127.0;
+        if v_fwd > 80.0 {
+            s0 /= v_fwd * 0.0125;
+            s1 /= v_fwd * 0.0125;
+        }
+        self.wheels[0].steer = s0;
+        self.wheels[1].steer = s1;
+        self.wheels[2].steer = 0.0;
+        self.wheels[3].steer = 0.0;
+    }
+
+    /// [`Self::set_wheel_steer`] with this vehicle's own steering, speed and forward velocity.
+    pub fn steer_wheels_now(&mut self, specs: &CarSpecs) {
+        let (s, sp, f) = (self.steer.clamp(-127, 127) as f32, self.speed(), self.v_long());
+        self.set_wheel_steer(specs, s, sp, f);
+    }
+
     /// Slip velocities are ×(−16) in the steered-wheel frame; forces are m/s² of car acceleration.
     /// Not modelled: tyre damage (`LIM = LIM0`), the per-car `.ABS` / `.TRACTION` registry flags
     /// (both off) and the `RALLY` flag. `traction_control` stands for the AI-driven flag `car+0xDA8`.
@@ -999,22 +1062,7 @@ impl Vehicle {
             pull += r * 0.5 * if speed > 15.0 { speed / 15.0 } else { 1.0 } * self.part_wear(&specs.zone_masks.suspension, &specs.wear.suspension) * 0.01;
         }
         self.damage_pull = pull;
-        let steer_int = (self.steer + pull as i32 + g_off).clamp(-127, 127) as f32;
-        let mut y = specs.max_steer;
-        if speed > 30.0 {
-            y *= 1.75 - 0.025 * speed;
-        }
-        y = y.clamp(0.0, 20.0) * 17.0 / specs.max_steer;
-        let mut s0 = steer_int * (1.0 - self.damage[0] / 512.0) * (y + specs.steer_offset) / 127.0;
-        let mut s1 = steer_int * (1.0 - self.damage[2] / 512.0) * (y - specs.steer_offset) / 127.0;
-        if vl.z > 80.0 {
-            s0 /= vl.z * 0.0125;
-            s1 /= vl.z * 0.0125;
-        }
-        self.wheels[0].steer = s0;
-        self.wheels[1].steer = s1;
-        self.wheels[2].steer = 0.0;
-        self.wheels[3].steer = 0.0;
+        self.set_wheel_steer(specs, (self.steer + pull as i32 + g_off).clamp(-127, 127) as f32, speed, vl.z);
         let a_drive = self.engine_update(specs, rear_contact);
         if !front_contact && !rear_contact {
             self.accel_local = Vec3::ZERO;
@@ -1334,7 +1382,19 @@ pub fn draft_factor(position: Vec3, forward: Vec3, forward_speed: f32, others: &
     1.0 - best
 }
 
-pub fn collide_cars(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32) -> Option<f32> {
+fn flat(v: Vec3) -> Vec3 {
+    Vec3::new(v.x, 0.0, v.z).normalize_or_zero()
+}
+
+/// The footprint overlap: the shallowest of the four axes, and the normal pointing from `a` to `b`.
+///
+/// The original tests in three dimensions and by **sampling**, not by a separating axis:
+/// `0x496FD0` runs each box's six face centres and eight corners against the other box —
+/// `0x495600` and `0x495890` for the face centres, `0x495B30` and `0x495D30` for the corners,
+/// twenty-eight point tests in all — against the basis `0x497B10` sets up in `0x628F08 …`. This
+/// port keeps its own two-dimensional test, which is stricter in the plane and blind to the
+/// height the original's would catch; that is the standing **APPROXIMATION**.
+fn footprint_overlap(a: &Vehicle, b: &Vehicle) -> Option<(f32, Vec3)> {
     // pre-test 0x498FF0: axis-aligned distance against the sum of the bounding radii
     let r_a = a.half_extents.x.max(a.half_extents.z);
     let r_b = b.half_extents.x.max(b.half_extents.z);
@@ -1342,7 +1402,6 @@ pub fn collide_cars(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32) 
     if d.x.abs() >= r_a + r_b || d.z.abs() >= r_a + r_b || d.y.abs() >= a.half_extents.y + b.half_extents.y + 0.5 {
         return None;
     }
-    let flat = |v: Vec3| Vec3::new(v.x, 0.0, v.z).normalize_or_zero();
     let axes = [flat(a.orientation.row(0)), flat(a.orientation.row(2)), flat(b.orientation.row(0)), flat(b.orientation.row(2))];
     let ext = |v: &Vehicle, axis: Vec3| -> f32 { (flat(v.orientation.row(0)).dot(axis) * v.half_extents.x).abs() + (flat(v.orientation.row(2)).dot(axis) * v.half_extents.z).abs() };
     let mut best: Option<(f32, Vec3)> = None;
@@ -1359,7 +1418,14 @@ pub fn collide_cars(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32) 
             best = Some((overlap, if dist >= 0.0 { axis } else { -axis }));
         }
     }
-    let (depth, n) = best?;
+    best
+}
+
+/// `0x497B10` runs its separation up to this many times.
+const SEPARATION_PASSES: usize = 0x20;
+
+pub fn collide_cars(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32) -> Option<f32> {
+    let (depth, n) = footprint_overlap(a, b)?;
     // `CarCarImpulse` 0x496860 (`RE/notes/traffic.md` §21.6), symmetric and with no special case for
     // traffic. The contact point the original gets from its SAT is not recovered, so the midpoint of
     // the two centres stands in for it (APPROXIMATION) — which is also what the original uses for the
@@ -1402,18 +1468,39 @@ pub fn collide_cars(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32) 
         a.damage_by_normal(eff_a, n);
         b.damage_by_normal(eff_b, -n);
     }
-    // push apart along the centre line, split by mass
-    let dir = flat(d);
-    let dir = if dir.length_squared() < 1e-6 { n } else { dir };
+    // `0x497B10`: **up to 32 passes**. Each one recomputes the delta (`0x532330`), puts it in both
+    // bodies' frames with six dot products, asks whether the boxes still overlap and, if they do,
+    // moves both positions (`car+0x330`) apart through `0x532300`; it stops the moment they are
+    // clear. A single push, which is what this used to do, leaves a deeply interlocked pair still
+    // touching — the first pass here is that same push, and the rest are what the original adds.
+    //
+    // **What is not resolved:** the size of one pass. The original scales its move by a stack value
+    // and then by `1/32` (0x498059), and the two bodies get vectors built from separate slots whose
+    // magnitudes were not traced. This port moves the measured depth each pass, split by mass, and
+    // re-measures — which separates, and separates by as little as the overlap demands.
     let share_a = inv_a / (inv_a + inv_b);
-    let push = depth * 1.01;
-    a.position -= dir * (push * share_a);
-    b.position += dir * (push * (1.0 - share_a));
-    for w in &mut a.wheels {
-        w.world_pos -= dir * (push * share_a);
-    }
-    for w in &mut b.wheels {
-        w.world_pos += dir * (push * (1.0 - share_a));
+    let (mut depth, mut n) = (depth, n);
+    for _ in 0..SEPARATION_PASSES {
+        let d = b.position - a.position;
+        let dir = flat(d);
+        let dir = if dir.length_squared() < 1e-6 { n } else { dir };
+        let push = depth * 1.01;
+        let (da, db) = (dir * (push * share_a), dir * (push * (1.0 - share_a)));
+        a.position -= da;
+        b.position += db;
+        for w in &mut a.wheels {
+            w.world_pos -= da;
+        }
+        for w in &mut b.wheels {
+            w.world_pos += db;
+        }
+        match footprint_overlap(a, b) {
+            Some((o, axis)) => {
+                depth = o;
+                n = axis;
+            }
+            None => break,
+        }
     }
     Some(effect)
 }
@@ -1428,6 +1515,30 @@ mod car_car_tests {
         let mut v = Vehicle::new(pos, rot, &specs, 0.8, 0.3);
         v.velocity = vel;
         v
+    }
+
+    /// `0x497B10` keeps going until the boxes are clear. A pair dropped deeply inside each other
+    /// must come out separated, which a single push of the measured depth does not guarantee.
+    #[test]
+    fn deeply_interlocked_cars_end_up_clear() {
+        let mut a = car(Vec3::ZERO, Vec3::ZERO, 0.0);
+        let mut b = car(Vec3::new(0.15, 0.0, 0.2), Vec3::ZERO, 0.7);
+        assert!(footprint_overlap(&a, &b).is_some(), "the pair has to start overlapping");
+        collide_cars(&mut a, 1.0, &mut b, 1.0);
+        assert!(footprint_overlap(&a, &b).is_none(), "still overlapping after the separation loop");
+    }
+
+    /// And a pair that only just touches is moved as little as it takes.
+    #[test]
+    fn a_shallow_touch_barely_moves_the_cars() {
+        let mut a = car(Vec3::ZERO, Vec3::ZERO, 0.0);
+        let x = a.half_extents.x * 2.0 - 0.01;
+        let mut b = car(Vec3::new(x, 0.0, 0.0), Vec3::ZERO, 0.0);
+        let before = (a.position, b.position);
+        collide_cars(&mut a, 1.0, &mut b, 1.0);
+        assert!(footprint_overlap(&a, &b).is_none());
+        let moved = (a.position - before.0).length() + (b.position - before.1).length();
+        assert!(moved < 0.2, "moved {moved} m to clear a 1 cm overlap");
     }
 
     #[test]

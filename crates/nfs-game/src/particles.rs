@@ -20,7 +20,10 @@
 //! `GameData/Render/common.fsh`. CONFIRMED.
 //!
 //! What a particle then *looks* like — its velocity, its life, how it grows — is inside the
-//! emitter pool (0x478C10 / 0x47A300), which is not read: the motion below is an APPROXIMATION.
+//! emitter pool: the motion below is an **APPROXIMATION**. The two addresses this note used to
+//! name are not it — `0x478C10` is the emitter **slot allocator** (a 20-entry ring of 20-byte
+//! records, at most two claimed at a time) and `0x47A300` a `lower_bound` over 0x50-byte records
+//! keyed on `+0x34`, the draw-order lookup. What moves a particle has not been located.
 
 use glam::{Mat4, Vec3};
 
@@ -34,7 +37,32 @@ struct Particle {
     size0: f32,
     size1: f32,
     tint: [f32; 3],
+    /// the alpha byte of the surface's `0x5D00A8` entry, before the fade
+    alpha: f32,
 }
+
+/// `0x5D00A8[surface & 15]` — the particle colour per surface kind, read straight out of the image
+/// (0x479200). The alpha byte is the puff's own, and the original scales all four channels by the
+/// emitter's intensity (0x479213). `0x5D0128` is the same table for the no-effects path, opaque and
+/// with dark grey 0x303030 where this one has black.
+pub const SURFACE_ARGB: [[u8; 4]; 16] = [
+    [255, 0, 0, 0],
+    [255, 0, 0, 0],
+    [255, 0, 0, 0],
+    [255, 120, 92, 39],
+    [255, 0, 0, 0],
+    [255, 78, 51, 13],
+    [182, 89, 89, 89],
+    [255, 0, 0, 0],
+    [150, 179, 179, 179],
+    [150, 179, 179, 179],
+    [255, 0, 0, 0],
+    [255, 0, 0, 0],
+    [0, 0, 0, 0],
+    [0, 0, 0, 0],
+    [0, 0, 0, 0],
+    [0, 0, 0, 0],
+];
 
 #[derive(Debug, Default)]
 pub struct Particles {
@@ -84,11 +112,16 @@ impl Particles {
             return;
         }
         self.since[index & 3] = 0;
-        // tarmac marks are smoke — grey and slow; anything else throws the ground's own colour up
-        let (tint, rise, life) = match kind {
-            1 => ([0.75, 0.75, 0.75], 0.9, 0.7),
-            6 => ([0.85, 0.88, 0.95], 1.4, 0.4),
-            _ => ([ground[0].min(1.0), ground[1].min(1.0), ground[2].min(1.0)], 1.2, 0.6),
+        // the colour is the original's own per-surface table (`SURFACE_ARGB`), not the ground under
+        // the wheel; only how fast a puff rises and how long it lives is still an approximation
+        let _ = ground;
+        let c = SURFACE_ARGB[kind & 15];
+        let tint = [c[1] as f32 / 255.0, c[2] as f32 / 255.0, c[3] as f32 / 255.0];
+        let alpha = c[0] as f32 / 255.0;
+        let (rise, life) = match kind {
+            1 => (0.9, 0.7),
+            6 => (1.4, 0.4),
+            _ => (1.2, 0.6),
         };
         let n = ((count as f32) * 0.5 * strength.clamp(0.0, 1.0)).round().max(1.0) as usize;
         let room = Self::MAX - self.live.len();
@@ -104,6 +137,7 @@ impl Particles {
                 size0: 0.2,
                 size1: 0.7 + strength.min(1.0) * 0.5,
                 tint,
+                alpha,
             });
         }
     }
@@ -148,7 +182,7 @@ impl Particles {
                     right.cross(up).extend(0.0),
                     p.pos.extend(1.0),
                 );
-                nfs_renderer::DrawItem { light: p.tint, alpha: fade, ..nfs_renderer::DrawItem::new(mesh, material, m) }
+                nfs_renderer::DrawItem { light: p.tint, alpha: fade * p.alpha, ..nfs_renderer::DrawItem::new(mesh, material, m) }
             })
             .collect()
     }
