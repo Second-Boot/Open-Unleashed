@@ -249,7 +249,7 @@ mod tests {
             locale_key: String::new(),
             model: String::new(),
             sim: String::new(),
-            unknown_e3: String::new(),
+            showcase: String::new(),
             sim_family: String::new(),
             logo: String::new(),
             sound_set: String::new(),

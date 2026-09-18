@@ -23,6 +23,7 @@ pub mod fsh;
 pub mod ini;
 pub mod key;
 pub mod lay;
+pub mod loc;
 pub mod locale;
 pub mod refpack;
 pub mod schl;

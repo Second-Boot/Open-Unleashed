@@ -70,6 +70,7 @@ pub struct Renderer {
     object_layout: wgpu::BindGroupLayout,
     material_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    sprite_sampler: wgpu::Sampler,
     object_buf: wgpu::Buffer,
     object_bg: wgpu::BindGroup,
     object_stride: u64,
@@ -273,6 +274,23 @@ impl Renderer {
             ..Default::default()
         });
 
+        // The 2D pass needs its own sampler. The 3D one asks for `anisotropy_clamp: 8` and
+        // `mipmap_filter: Linear`, which on a single-level texture — every sprite atlas is one —
+        // sampled by a quad a dozen pixels across returns nothing on Metal. That is the fault
+        // recorded as `RE/AUDIT.md` F2: a glyph quad drawn with a 1×1 texture composites fine while
+        // the same quad with the font atlas draws nothing at all, whatever its UV window.
+        let sprite_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("sprite linear clamp"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            lod_max_clamp: 0.0,
+            ..Default::default()
+        });
+
         // 2D sprite pipeline (HUD)
         let sprite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("sprite"), source: wgpu::ShaderSource::Wgsl(include_str!("sprite.wgsl").into()) });
         let sprite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -307,6 +325,7 @@ impl Renderer {
             object_layout,
             material_layout,
             sampler,
+            sprite_sampler,
             object_buf,
             object_bg,
             object_stride,
@@ -401,8 +420,9 @@ impl Renderer {
         let sprite_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sprite tex"),
             layout: &self.sprite_layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) }],
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sprite_sampler) }],
         }));
+        tracing::info!(id = self.textures.len(), w = tex.width, h = tex.height, "texture uploaded");
         self.textures.push(GpuTexture { _texture: texture, view, sprite_bg });
         TextureId(self.textures.len() as u32 - 1)
     }
@@ -507,7 +527,7 @@ impl Renderer {
                 let sprite_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("offscreen tex"),
                     layout: &self.sprite_layout,
-                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) }],
+                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sprite_sampler) }],
                 }));
                 self.textures.push(GpuTexture { _texture: texture, view, sprite_bg });
                 let id = TextureId(self.textures.len() as u32 - 1);
@@ -650,6 +670,9 @@ impl Renderer {
             }
             // HUD sprites
             let n_sprites = scene.sprites.len().min(MAX_SPRITES as usize);
+            if scene.sprites.len() > MAX_SPRITES as usize {
+                tracing::warn!(have = scene.sprites.len(), cap = MAX_SPRITES, "sprite budget exceeded — the rest of the frame is dropped");
+            }
             if scene.sprites.len() > n_sprites {
                 tracing::warn!(wanted = scene.sprites.len(), drawn = n_sprites, "sprite buffer full");
             }
@@ -661,8 +684,15 @@ impl Renderer {
                 self.queue.write_buffer(&self.sprite_buf, 0, bytemuck::cast_slice(&verts));
                 pass.set_pipeline(&self.sprite_pipeline);
                 pass.set_vertex_buffer(0, self.sprite_buf.slice(..));
+                let log = std::env::var("NFS_SPRITE_LOG").is_ok();
                 for (i, sp) in scene.sprites.iter().take(n_sprites).enumerate() {
-                    if let Some(bg) = self.textures[sp.texture.0 as usize].sprite_bg.as_ref() {
+                    let bg = self.textures[sp.texture.0 as usize].sprite_bg.as_ref();
+                    if log {
+                        let v = &verts[i * 6];
+                        let w = &verts[i * 6 + 1];
+                        tracing::info!(i, tex = sp.texture.0, bound = bg.is_some(), x0 = v.pos[0], y0 = v.pos[1], x1 = w.pos[0], uv0 = ?v.uv, color = ?v.color, "sprite");
+                    }
+                    if let Some(bg) = bg {
                         pass.set_bind_group(0, bg, &[]);
                         pass.draw((i * 6) as u32..(i * 6 + 6) as u32, 0..1);
                     }

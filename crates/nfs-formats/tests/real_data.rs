@@ -504,3 +504,46 @@ fn the_sky_colour_record_steps_down_to_an_enabled_one() {
     // and the two records really are different skies
     assert_ne!(c.background_for(0), c.background_for(1));
 }
+
+/// A car's own `.loc`: the strings the showcase screens read (`nfs_formats::loc`).
+#[test]
+fn car_locale_files() {
+    let r = need_game!();
+    let dir = r.join("FEData/Locale");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("loc")))
+        // `festrings.loc` and `hud.loc` are the game's own string tables, not a car's: their
+        // header names seven language offsets but only the first is a `LOCL` block, so they are a
+        // different arrangement and `locale::Strings` reads them instead.
+        .filter(|p| !["festrings.loc", "hud.loc"].iter().any(|n| p.file_name().is_some_and(|f| f.eq_ignore_ascii_case(n))))
+        .collect();
+    files.sort();
+    assert_eq!(files.len(), 97);
+    let d = std::fs::read(dir.join("1948356.loc")).unwrap();
+    let l = nfs_formats::loc::LocFile::parse(&d, 0).unwrap();
+    assert_eq!(l.entries.len(), 44);
+    assert_eq!(l.get(1), Some("American"));
+    assert_eq!(l.get(2), Some("4 cylinder \"Boxer\""));
+    assert_eq!(l.get(3), Some("1131cc"));
+    assert_eq!(l.get(7), Some("84 mph"));
+    assert_eq!(l.get(11), Some("3860 mm"));
+    // an entry the car has nothing for is empty, not missing
+    assert_eq!(l.get(8), None);
+    // every shipped file parses, in every one of the seven languages the header declares. A few
+    // are stubs — `1953356Cabrio13S.loc` is 172 bytes, seven blocks of nothing — so an empty list
+    // is a valid answer; what is checked is that every one of the 99 files decodes.
+    let mut filled = 0;
+    for f in &files {
+        let d = std::fs::read(f).unwrap();
+        for lang in 0..7 {
+            let l = nfs_formats::loc::LocFile::parse(&d, lang).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+            if lang == 0 && !l.entries.is_empty() {
+                filled += 1;
+            }
+        }
+    }
+    assert!(filled >= 90, "only {filled} of {} .loc files carry strings", files.len());
+}

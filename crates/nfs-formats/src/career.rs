@@ -496,7 +496,10 @@ pub struct Mission {
     pub prize_car: i16,
     /// Mission number inside the stage (HIGH).
     pub number: u16,
-    /// Narrator: 0 Billy, 1 Stephanie, 2 Dieter, 3 Frank, 4 Klaus, 5 Rolf (name string 18176 + n).
+    /// Narrator: 0 Billy, 1 Stephanie, 2 Dieter, 3 Frank, 4 Klaus, 5 Rolf. The name is
+    /// `FEStrings[2500 + n]` — `Factory.Data(NARRNAME)` reads this field at 0x519DCA and adds
+    /// `0x9C4` at 0x519DCE. (`FEStrings.csv` carries the same six names again at 18176, which an
+    /// earlier note pointed at; the address-backed constant is 2500.)
     pub narrator: i16,
     /// `nfs5.trk` id.
     pub track_id: i16,

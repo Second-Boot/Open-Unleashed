@@ -661,6 +661,31 @@ const CHOICE_ACCESSORS: &[(&str, &str, &[u32])] = &[
 ];
 
 impl App {
+    /// `Showcase.Text(<n>)` — entry **`n / 2 - 1`** of the selected car's own
+    /// `FEData/Locale/<key>.loc`, the file its catalogue record names at +0x4D
+    /// (`nfs_formats::loc`). The showcase screens (`chassis.lay`, `general.lay`,
+    /// `glancestats.lay`) are nothing but these.
+    ///
+    /// The halving is not a guess. Every car `.loc` holds 45 entries, while `chassis.lay` asks for
+    /// `Showcase.Text` up to 90, and every index any screen uses is even. `general.lay` settles it
+    /// by pairing each watch with a label: `FEStrings` 12702 "weight" sits beside
+    /// `Showcase.Text(24)`, 12700 "length" beside (26), 12708 "width" beside (28), 12707 "height"
+    /// beside (30) and 12706 "wheel base" beside (32) — and the '96 993 Carrera's own entries 11 to
+    /// 15 are "1390Kg", "4260 mm", "1735 mm", "1315 mm", "2272 mm", in that order. Five rows, five
+    /// matches. CONFIRMED.
+    fn showcase_text(&self, index: usize) -> Option<String> {
+        let index = (index / 2).checked_sub(1)?;
+        let key = self.logo_car(Some("zMergedList.Car"), None)?.locale_key.clone();
+        if key.is_empty() {
+            return None;
+        }
+        let dir = self.paths.fe_data().join("Locale");
+        let path = GamePaths::find_file(&dir, &format!("{key}.loc"))?;
+        let d = std::fs::read(path).ok()?;
+        // language 0 is English, the column `FEStrings.csv` also leads with
+        nfs_formats::loc::LocFile::parse(&d, 0).ok()?.get(index).map(str::to_string)
+    }
+
     /// A range accessor's value: what the player has changed this session, else `fe.txt`, else the
     /// default the original registers. Returns the value with its minimum and maximum.
     fn range_value(&self, name: &str) -> Option<(i32, i32, i32)> {
@@ -694,6 +719,32 @@ impl App {
         Some((v.min(options.len() - 1), options))
     }
 }
+
+/// The repair screens' per-category condition accessors and the `nfs5.prt` category (`part+0x26`)
+/// each one measures.
+///
+/// Every one is a getter of the same shape — 0x4EF640 is `ENGINEDAMAGE`'s: walk the car's
+/// installed-parts vector at `car+0x758`, add `part+0x164` (the damage that part carries) for each
+/// part whose `part+0x26` matches, and divide by how many matched when that is more than one. The
+/// accessor then shows **`100 - that`** (`fsubr [0x5B242C]`, which is 100.0, formatted `"%2.0f"`
+/// at 0x4F63B4) — a condition, not a damage. CONFIRMED, each getter read:
+/// 1 → 0x4EF640, 2 → 0x4EF690, 3 → 0x4EF6E0, 4 → 0x4EF730, 5 → 0x4EF780, 6 → 0x4EF7D0,
+/// 8 → 0x4EF870, 9 → 0x4EF8C0, 10 → 0x4EF910.
+///
+/// `OVERALLDAMAGE` is not here: 0x4EF960 combines the per-category means itself (it calls the
+/// parameterised mean 0x4EF580 for 2, 3 and 7 and inlines the others), and the port answers it
+/// from the car's own accumulated figure instead.
+const PART_DAMAGE_CATEGORY: &[(&str, u16)] = &[
+    ("ENGINEDAMAGE", 1),
+    ("BRAKESDAMAGE", 2),
+    ("TRANSMISSIONDAMAGE", 3),
+    ("SUSPENSIONDAMAGE", 4),
+    ("SHOCKSDAMAGE", 5),
+    ("BODYWORKDAMAGE", 6),
+    ("SWAYBARSDAMAGE", 8),
+    ("TIRESDAMAGE", 9),
+    ("COSMETICDAMAGE", 10),
+];
 
 /// The front end's **range** accessors: a name, its `fe.txt` key, and the default, minimum and
 /// maximum the original registers for it.
@@ -1065,6 +1116,11 @@ struct App {
     /// `--layout-sweep`: load every `.lay` in the game, draw it once, and report every widget that
     /// produced no sprite at all. The port's own measure of what the front end does not draw.
     layout_sweep: bool,
+    /// `Factory.ProfileNum` — which of the seven factory-team profiles `teamprofile.lay` shows.
+    /// The original registers the accessor with a default of 6 (0x4BA310); the port starts at 0 and
+    /// the screen has no control of its own to move it, so this only moves if something else sets
+    /// it. MEDIUM.
+    factory_profile: usize,
     /// `fe.txt`, for the multiple-choice accessors' saved indices.
     registry: nfs_formats::fetxt::Registry,
     /// The choices the player has changed on the options screens this session, by `fe.txt` key.
@@ -1191,6 +1247,11 @@ struct App {
     /// player gear on the previous tick (shift click)
     last_gear: usize,
     music: Option<nfs_audio::music::MusicPlayer>,
+    /// The song names in `GameData/Music`, read once at start-up. The CD-player screen needs them
+    /// in the **front end**, where there is no `MusicPlayer` yet — the original plays menu music
+    /// there (every screen block carries `musicfile=menu*`) and that screen edits the playlist, so
+    /// the lists must fill without a race having been started.
+    music_names: Vec<String>,
     /// `fe.txt` audio settings (playlist, shuffle, the five level sliders)
     audio_settings: nfs_audio::music::Settings,
     speech: Option<nfs_audio::speech::Speech>,
@@ -1290,6 +1351,83 @@ impl App {
         let menu = self.menu.as_ref();
         let career = self.career.as_ref();
         Some(match base {
+            "Showcase.Text" => self.showcase_text(modifier.parse::<usize>().ok()?)?,
+            // the tournament screen. Each field is one the `nfs5.trn` record already carries, and
+            // `(LOCATION)` is what 0x506992 makes it: the accessor looks up
+            // `Tournament.RemainingTracks`, calls its vtable +0x70 for an id and hands that to the
+            // `FEStrings` lookup 0x4E06D0 — the name of the event the tournament is on.
+            //
+            // `(DIFFICULTY)` is `FEStrings[450 + n]` (0x506823 adds 0x1C2 to a two-byte field and
+            // looks it up), and 450…452 are the three names `Game.Difficutly` uses. The port takes
+            // `n` from the record's `+0xE6`, which is the difficulty it already parsed; the getter
+            // reads `+0x78` of a run-time object instead, so the two are **MEDIUM**, not confirmed
+            // to be the same field.
+            "Tournament.Tournament" => {
+                let c = self.career.as_ref()?;
+                let t = c.current()?;
+                match modifier {
+                    "SHORT" | "" => self.fe_strings.get(t.name_string_id)?.to_uppercase(),
+                    "DESCRIPTION" => self.fe_strings.get(t.description_string_id)?.to_string(),
+                    "CARRESTRICTION" => self.fe_strings.get(t.restriction_string_id)?.to_string(),
+                    "ENTRYFEE" => format!("${}", t.entry_fee),
+                    "PRIZEMONEY" => format!("${}", t.prize.first()?),
+                    "DIFFICULTY" => self.fe_strings.get(450 + t.difficulty_level.min(2) as u32)?.to_string(),
+                    "LOCATION" => {
+                        // the event the tournament is on: the first one the player has not finished
+                        let done = c.career.tournaments.get(&t.id).map_or(0, |s| s.events.len());
+                        let ev = t.events.get(done.min(t.events.len().saturating_sub(1)))?;
+                        c.tables.track_name(ev.track_id).to_uppercase()
+                    }
+                    _ => return None,
+                }
+            }
+            // the end-of-era lines on `VictoryMessage.lay`. Both read the era's finale tournament
+            // record: `ENDERAHEADER` is `FEStrings[[rec+0x24]]` (0x506389) and `ENDERADESCRIP`
+            // `FEStrings[[rec+0x28]]` (0x5063DE), and +0x24 and +0x28 are the port's
+            // `title_string_id` and `description_string_id`. The record is what
+            // `0x504990(0x504800())` returns; the port takes the era's hidden finale, which its
+            // own `visibility == 2` marks.
+            "Tournament.Data" if matches!(modifier, "ENDERAHEADER" | "ENDERADESCRIP") => {
+                let c = self.career.as_ref()?;
+                let list = c.tables.era_tournaments(c.career.era);
+                let t = list.iter().find(|t| t.visibility == 2).or_else(|| list.last())?;
+                let id = if modifier == "ENDERAHEADER" { t.title_string_id } else { t.description_string_id };
+                self.fe_strings.get(id)?.to_string()
+            }
+            // the factory-drive mission the career is on (`missionbrief.lay`, `missionmap.lay`).
+            // `NARRNAME` is `FEStrings[(i16)[mission+0x1E] + 0x9C4]` — 0x519DCA reads the field and
+            // 0x519DCE adds 2500 — `MISSONDESC` is `FEStrings[[mission+0]]`, the id 0x519D67 loads
+            // straight out of the record, and `ENDOFLEVEL` is `FEStrings[[record+0xC]]` (0x519E31).
+            // All three offsets are ones the port already parses: `narrator` at +0x1E,
+            // `intro_string_id` at +0 and `promotion_string_id` at +0x0C.
+            "Factory.Data" if matches!(modifier, "NARRNAME" | "MISSONDESC" | "TRACKNAME" | "ENDOFLEVEL") => {
+                let c = self.career.as_ref()?;
+                let m = &c.tables.missions[c.career.current_mission(&c.tables)?];
+                match modifier {
+                    "NARRNAME" => self.fe_strings.get(2500 + m.narrator.max(0) as u32)?.to_string(),
+                    "MISSONDESC" => self.fe_strings.get(m.intro_string_id)?.to_string(),
+                    // the promotion line at the end of a stage: 0x519E31 reads `[record+0xC]` and
+                    // looks it up, and +0x0C is the port's `promotion_string_id`
+                    "ENDOFLEVEL" => self.fe_strings.get(m.promotion_string_id)?.to_string(),
+                    _ => c.tables.track_name(m.track_id).to_uppercase(),
+                }
+            }
+            // one of the factory team's profiles (`teamprofile.lay`). Each getter ends in the same
+            // `FEStrings` lookup with the profile index scaled by four: `profilename` is
+            // `0xDAD + 4n` (0x519F1F), `profiletitle` `0xDAE + 4n` (0x519FBD), `profileage`
+            // `0xDAF + 4n` (0x519F6E) and `profiledesc` the next — 3501 "Dieter", 3502 "Porsche
+            // Executive", 3503 "45", 3504 his description, then the same four for Billy.
+            // CONFIRMED, and `FEStrings.csv` carries exactly 28 of them: seven profiles.
+            "Factory.Data" => {
+                let base = match modifier {
+                    "profilename" => 3501,
+                    "profiletitle" => 3502,
+                    "profileage" => 3503,
+                    "profiledesc" => 3504,
+                    _ => return None,
+                };
+                self.fe_strings.get(base + 4 * self.factory_profile as u32)?.to_string()
+            }
             // a range setting the port has no other state for — the force-feedback volumes and
             // the gamma — shows its number
             "FF.TotalVolume" | "FF.RoadVolume" | "FF.EngineVolume" | "FF.CollisionVolume"
@@ -1473,6 +1611,22 @@ impl App {
                     "CURRENTVALUE" => format!("${}", c.career.car_value(&c.tables, idx)?),
                     "PURCHASEPRICE" => format!("${}", owned?.purchase_price),
                     "OVERALLDAMAGE" => format!("{:.0}%", owned?.damage_pct),
+                    // one part category's condition: `100 - mean(part damage)` over the installed
+                    // parts of that category (`PART_DAMAGE_CATEGORY`)
+                    m if PART_DAMAGE_CATEGORY.iter().any(|(n, _)| *n == m) => {
+                        let cat = PART_DAMAGE_CATEGORY.iter().find(|(n, _)| *n == m).map(|(_, c)| *c)?;
+                        let o = owned?;
+                        let mut sum = 0.0f32;
+                        let mut n = 0u32;
+                        for (id, state) in &o.part_state {
+                            if c.tables.parts.iter().any(|p| p.id == *id && p.kind == cat) {
+                                sum += state;
+                                n += 1;
+                            }
+                        }
+                        let mean = if n > 1 { sum / n as f32 } else { sum };
+                        format!("{:.0}", 100.0 - mean)
+                    }
                     _ => owned
                         .and_then(|o| c.tables.car(o.car_id))
                         .map(|e| e.display_name.to_uppercase())
@@ -1581,6 +1735,28 @@ impl App {
             _ => return None,
         };
         Some(car.compare[index] as i32)
+    }
+
+    /// The chronicle's picture files for the current model group, sorted, and where the career's
+    /// year sits in that list. The name is `M<letter><yy><index><variant>.fsh` — see
+    /// [`App::chronicle_picture`] — so sorting by name sorts by year.
+    fn chronicle_list(&self) -> (Vec<String>, usize) {
+        let letter = CHRONICLE_GROUP_LETTERS.as_bytes()[CHRONICLE_GROUP] as char;
+        let dir = self.paths.fe_data().join("Chron");
+        let mut files: Vec<String> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| {
+                let Some(stem) = n.strip_suffix(".fsh") else { return false };
+                let b = stem.as_bytes();
+                b.len() == 6 && b[0] == b'M' && b[1] as char == letter && stem[2..4].parse::<u32>().is_ok()
+            })
+            .collect();
+        files.sort();
+        let cur = self.chronicle_picture().and_then(|f| files.iter().position(|n| *n == f)).unwrap_or(0);
+        (files, cur)
     }
 
     fn chronicle_picture(&self) -> Option<String> {
@@ -1784,16 +1960,23 @@ impl App {
             // the CD player (`cdplayer.lay`): the songs in `zzzymus.viv` that are not in the
             // playlist, and the playlist itself — the two lists the original moves entries between
             "CDPlayer.AvailableList" | "CDPlayer.SelectedList" => {
-                let m = self.music.as_ref()?;
-                let list = m.playlist().to_vec();
+                // in a race the live player owns both lists; in the front end there is no player
+                // yet, so they come from the files and the saved playlist
+                let names: &[String] = match self.music.as_ref() {
+                    Some(m) => &m.names,
+                    None => &self.music_names,
+                };
+                let list: Vec<usize> = match self.music.as_ref() {
+                    Some(m) => m.playlist().to_vec(),
+                    None => self.audio_settings.playlist.iter().map(|i| *i as usize).collect(),
+                };
                 let rows: Vec<ListRow> = match base {
                     "CDPlayer.SelectedList" => list
                         .iter()
-                        .filter_map(|i| m.names.get(*i))
+                        .filter_map(|i| names.get(*i))
                         .map(|n| ListRow::Text(nfs_audio::music::split_title(n).0.to_uppercase()))
                         .collect(),
-                    _ => m
-                        .names
+                    _ => names
                         .iter()
                         .enumerate()
                         .filter(|(i, _)| !list.contains(i))
@@ -2021,6 +2204,18 @@ impl App {
             self.bind_car_logos();
             self.bind_lists();
             self.bind_indicator_bars();
+            self.bind_chronicle_icons();
+            self.bind_showcase_pictures();
+            // `NFS_SWEEP_DUMP=<layout>` prints what every accessor of that one screen resolves to
+            if std::env::var("NFS_SWEEP_DUMP").as_deref() == Ok(name.as_str())
+                && let Some(l) = self.layout_preview.as_ref()
+            {
+                for e in &l.layout.elements {
+                    if let Some(a) = e.get("accessor").filter(|a| !a.is_empty()) {
+                        println!("  {:<26} {a:<28} -> {:?}", e.class, self.accessor_value(a));
+                    }
+                }
+            }
             let Some(l) = self.layout_preview.as_ref() else { continue };
             for (class, src) in l.blank_widgets(nfs_game::layout::DESIGN.0 / nfs_game::layout::DESIGN.1, &self.fe_strings, &|a| self.accessor_value(a)) {
                 *total.entry((class, src)).or_default() += 1;
@@ -2044,6 +2239,55 @@ impl App {
         srcs.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(&b.2)));
         for (n, c, s) in &srcs {
             println!("  {n:4}  {c:<30} {s}");
+        }
+    }
+
+    /// Fill the chronicle's thumbnail column. The four `NFS5.ChroniclePictureIcon`s carry
+    /// `number` 0…3 and sit bottom to top (`number=0` at y 363, `number=3` at y 177), so the
+    /// column runs upwards from the entry the screen is on. Each pack's entry 0 is its `bi` icon
+    /// and entry 1 its `ci`; the port draws `ci` for the entry the screen is showing and `bi` for
+    /// the rest — **APPROXIMATION**, the two names' meaning was not traced, only their size, which
+    /// is the widget's own `size=41,25`.
+    fn bind_chronicle_icons(&mut self) {
+        let Some(l) = self.layout_preview.as_ref() else { return };
+        let icons = l.numbered_widgets("NFS5.ChroniclePictureIcon");
+        if icons.is_empty() {
+            return;
+        }
+        let (files, cur) = self.chronicle_list();
+        let wanted: Vec<(usize, String, usize)> = icons
+            .into_iter()
+            .map(|(i, number)| {
+                let n = cur + number.max(0) as usize;
+                let entry = usize::from(n != cur);
+                (i, files.get(n).cloned().unwrap_or_default(), entry)
+            })
+            .collect();
+        let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) else { return };
+        for (index, file, entry) in wanted {
+            l.set_pack_picture(r, &self.paths, "Chron", index, &file, entry);
+        }
+    }
+
+    /// Fill the showcase screens' picture mosaic. `NFS5.ShowcasePicture` is only a place — its
+    /// template has no drawable part — and the `number` its `.lay` block carries is the entry of
+    /// the selected car's own pack, `FEData/Showcase/<key>.fsh`, where `key` is the catalogue
+    /// record's +0xE3 string (86 of the 87 racing records name a pack that is on disk). The match
+    /// is exact: `general.lay` and `glancestats.lay` give `number` 0…7, and each widget's `size`
+    /// is entry `number`'s own width and height. CONFIRMED.
+    fn bind_showcase_pictures(&mut self) {
+        let Some(l) = self.layout_preview.as_ref() else { return };
+        let want = l.numbered_widgets("NFS5.ShowcasePicture");
+        if want.is_empty() {
+            return;
+        }
+        let pack = self
+            .logo_car(Some("zMergedList.Car"), None)
+            .map(|c| format!("{}.fsh", c.showcase))
+            .unwrap_or_default();
+        let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) else { return };
+        for (index, number) in want {
+            l.set_pack_picture(r, &self.paths, "Showcase", index, &pack, number.max(0) as usize);
         }
     }
 
@@ -5104,9 +5348,9 @@ impl App {
                     // a slider that changed the car changes the logo with it (0x4C1A6A: the widget
                     // reloads when the car's pair differs from the one it cached)
                     self.bind_car_logos();
-            self.bind_indicator_bars();
-                self.bind_indicator_bars();
                     self.bind_indicator_bars();
+                    self.bind_chronicle_icons();
+            self.bind_showcase_pictures();
                     self.bind_lists();
                 }
             }
@@ -5436,6 +5680,9 @@ impl App {
                 };
                 self.bind_car_logos();
                 self.bind_lists();
+                self.bind_indicator_bars();
+                self.bind_chronicle_icons();
+            self.bind_showcase_pictures();
                 if let Some(l) = self.layout_preview.as_mut() {
                     l.transition_in();
                 }
@@ -5595,6 +5842,9 @@ impl App {
             }
             self.bind_car_logos();
             self.bind_lists();
+            self.bind_indicator_bars();
+            self.bind_chronicle_icons();
+            self.bind_showcase_pictures();
             if let Some(l) = self.layout_preview.as_ref() {
                 for (c, n) in l.unrendered() {
                     tracing::info!(
@@ -5607,6 +5857,65 @@ impl App {
                     tracing::info!(class = c, source = src, "unbound widget source");
                 }
             }
+            // `--sprite-selftest`: draw three quads through the real sprite path — a grey ground,
+            // a black square and a white square — and print what came back. The smallest case that
+            // can show the fault in `RE/AUDIT.md` F2, using the pipeline the front end uses.
+            if std::env::var("NFS_SPRITE_SELFTEST").is_ok() {
+                let white = self.layout_preview.as_ref().map(|l| l.white_texture());
+                let atlas = self.layout_preview.as_ref().and_then(|l| l.a_font_texture());
+                if let (Some(tex), Some(r)) = (white, self.renderer.as_mut()) {
+                    let q = |x: f32, c: [f32; 4]| nfs_renderer::Sprite {
+                        texture: tex,
+                        pos: [x, 0.25],
+                        size: [0.2, 0.2],
+                        uv_min: [0.0, 0.0],
+                        uv_max: [1.0, 1.0],
+                        color: c,
+                        rotation: 0.0,
+                        pivot: [0.0, 0.0],
+                    };
+                    let mut scene = nfs_renderer::Scene::default();
+                    let _ = &atlas;
+                    scene.sprites = vec![
+                        nfs_renderer::Sprite { pos: [0.0, 0.0], size: [1.0, 1.0], ..q(0.0, [0.5, 0.5, 0.5, 1.0]) },
+                        q(0.1, [0.0, 0.0, 0.0, 1.0]),
+                        q(0.4, [1.0, 1.0, 1.0, 1.0]),
+                        q(0.7, [1.0, 0.0, 0.0, 1.0]),
+                        // the same three at the size a glyph is actually drawn
+                        nfs_renderer::Sprite { pos: [0.15, 0.6], size: [0.01875, 0.01875], ..q(0.0, [0.0, 0.0, 0.0, 1.0]) },
+                        nfs_renderer::Sprite { pos: [0.45, 0.6], size: [0.01875, 0.01875], ..q(0.0, [1.0, 1.0, 1.0, 1.0]) },
+                        nfs_renderer::Sprite { pos: [0.75, 0.6], size: [0.01875, 0.01875], ..q(0.0, [1.0, 0.0, 0.0, 1.0]) },
+                    ];
+                    // and the same three with the font atlas, sampling one texel that the ASCII
+                    // dump of `Univers8b` shows solid inside 'A' (atlas 240×61, glyph at 26,32)
+                    if let Some(atlas) = atlas {
+                        let uv = [28.5 / 240.0, 37.5 / 61.0];
+                        let a = |x: f32, c: [f32; 4]| nfs_renderer::Sprite {
+                            texture: atlas,
+                            pos: [x, 0.8],
+                            size: [0.01875, 0.01875],
+                            uv_min: [uv[0] - 0.0005, uv[1] - 0.0005],
+                            uv_max: [uv[0] + 0.0005, uv[1] + 0.0005],
+                            color: c,
+                            rotation: 0.0,
+                            pivot: [0.0, 0.0],
+                        };
+                        scene.sprites.push(a(0.15, [0.0, 0.0, 0.0, 1.0]));
+                        scene.sprites.push(a(0.45, [1.0, 1.0, 1.0, 1.0]));
+                        scene.sprites.push(a(0.75, [1.0, 0.0, 0.0, 1.0]));
+                    }
+                    let rgba = r.render_to_image(&scene, &self.camera, 200, 100).expect("render");
+                    let at = |x: usize, y: usize| {
+                        let i = (y * 200 + x) * 4;
+                        (rgba[i], rgba[i + 1], rgba[i + 2])
+                    };
+                    println!("big:   ground {:?}  black {:?}  white {:?}  red {:?}", at(5, 50), at(30, 30), at(90, 30), at(150, 30));
+                    println!("glyph: black {:?}  white {:?}  red {:?}", at(31, 61), at(91, 61), at(151, 61));
+                    println!("atlas: black {:?}  white {:?}  red {:?}", at(31, 81), at(91, 81), at(151, 81));
+                }
+                event_loop.exit();
+                return;
+            }
             if self.layout_sweep {
                 self.layout_sweep = false;
                 self.run_layout_sweep();
@@ -5614,6 +5923,16 @@ impl App {
                 return;
             }
             if let Some(path) = self.screenshot.take() {
+                // a screen fades in over half a second (`RE/notes/controls.md` §6), so a shot taken
+                // on the first frame catches every faded widget at alpha 0 and looks empty. Let the
+                // transition finish first.
+                if let Some(l) = self.layout_preview.as_mut() {
+                    for _ in 0..120 {
+                        if l.advance_transition(16) {
+                            break;
+                        }
+                    }
+                }
                 // a network screen is taken on its first frame, before any `'d'` has had time to
                 // come back, so give the probe half a second — otherwise the shot shows an empty
                 // list that says nothing about the screen
@@ -5629,7 +5948,14 @@ impl App {
                 }
                 // the same scene the front end draws every frame, so a screenshot shows the 3D room too
                 self.rebuild_scene();
-                let scene = self.scene.clone();
+                let mut scene = self.scene.clone();
+                // `NFS_FE_KEEP=<n>` renders only the first n sprites of the front end's own list —
+                // the bisect for `RE/AUDIT.md` F2
+                if let Ok(n) = std::env::var("NFS_FE_KEEP").map(|v| v.parse::<usize>().unwrap_or(usize::MAX)) {
+                    println!("fe sprites: {}, keeping {}", scene.sprites.len(), n.min(scene.sprites.len()));
+                    scene.sprites.truncate(n);
+                }
+                let scene = scene;
                 let rgba = self
                     .renderer
                     .as_mut()
@@ -7139,8 +7465,10 @@ fn main() -> Result<()> {
         .map(|d| nfs_formats::locale::Strings::parse(&d, 0))
         .unwrap_or_default();
     let race_skill = fe.skill;
+    let music_names = nfs_audio::music::song_titles(&paths.game_data().join("Music")).unwrap_or_default();
     let mut app = App {
         layout_sweep,
+        factory_profile: 0,
         registry: nfs_formats::fetxt::Registry::load(&paths.root),
         choices: std::collections::HashMap::new(),
         paths,
@@ -7344,6 +7672,7 @@ fn main() -> Result<()> {
         sfx: None,
         last_gear: 1,
         music: None,
+        music_names,
         audio_settings,
         speech: None,
         countdown_said: 0,

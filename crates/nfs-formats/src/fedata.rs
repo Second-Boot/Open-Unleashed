@@ -20,8 +20,11 @@ pub struct CarCatalogEntry {
     pub model: String,
     /// +0xB1 simulation variant → `GameData/Simulation/CarData/<sim>.sim`, e.g. `356cabrio11`.
     pub sim: String,
-    /// +0xE3 e.g. `356-14` (chronicle/showcase key?).
-    pub unknown_e3: String,
+    /// +0xE3 — the car's **showcase pack**: `FEData/Showcase/<key>.fsh`, e.g. `356-14`. The
+    /// showcase screens' `NFS5.ShowcasePicture` widgets take entry `number` of it, and each
+    /// widget's `size` matches that entry's own dimensions on all eight. CONFIRMED; 86 of the 87
+    /// racing records name a pack that is on disk.
+    pub showcase: String,
     /// +0x115 the car's **family key**, e.g. `356`, `993T`, `boxster`, `GT2` — what the AI's
     /// per-track steering table is keyed on (0x4A2950, compared case-insensitively) and what the
     /// car-vs-car tables group by. CONFIRMED.
@@ -198,7 +201,7 @@ pub fn parse_car_catalog(data: &[u8]) -> Result<Vec<CarCatalogEntry>, FormatErro
             locale_key: s(0x4D, 50)?,
             model: s(0x7F, 50)?,
             sim: s(0xB1, 50)?,
-            unknown_e3: s(0xE3, 50)?,
+            showcase: s(0xE3, 50)?,
             sim_family: s(0x115, 50)?,
             logo: s(0x147, 50)?,
             sound_set: s(0x179, 57)?,
