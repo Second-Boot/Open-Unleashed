@@ -23,6 +23,26 @@ pub fn song_titles(music_dir: &Path) -> anyhow::Result<Vec<String>> {
     Ok(Bigf::parse(&data)?.entries.iter().map(|e| e.name.clone()).collect())
 }
 
+/// Each song's length in milliseconds, which is what the original keeps at `track + 0x20` and what
+/// `CDPlayer.SelectedList(TOTALPLAY)` sums (0x4BED16). It comes from the stream's own `SCHl`
+/// header: the sample count (code 0x85) over the sample rate (code 0x84). A track whose header
+/// does not declare a count contributes 0, as an empty slot would.
+pub fn song_lengths_ms(music_dir: &Path) -> anyhow::Result<Vec<u32>> {
+    let data = std::fs::read(music_dir.join("zzzymus.viv"))?;
+    let viv = Bigf::parse(&data)?;
+    Ok(viv
+        .entries
+        .iter()
+        .map(|e| {
+            let body = data.get(e.offset as usize..e.offset as usize + e.size as usize)?;
+            let h = nfs_formats::schl::SchlStream::parse(body).ok()?.header;
+            let n = h.sample_count?;
+            Some(((n as u64 * 1000) / h.sample_rate.max(1) as u64) as u32)
+        })
+        .map(|v| v.unwrap_or(0))
+        .collect())
+}
+
 /// `game13-Activator-Morphadron` → (`Activator`, `Morphadron`) — `0x4AD950` splits on `-`.
 pub fn split_title(name: &str) -> (String, String) {
     let mut parts = name.splitn(3, '-');

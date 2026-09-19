@@ -26,18 +26,27 @@ impl Element {
     }
 
     /// A `x,y` pair (`pos`, `size`).
+    /// A `x,y` value. Each half is an **expression**, not a literal: 0x527C0C splits the string at
+    /// the comma and hands each half to the evaluator 0x52DC40, writing the two results to
+    /// `[attr+0x38]` and `[attr+0x3C]`. Five shipped blocks rely on it —
+    /// `usedcarparts.lay` §0 and `usedcars.lay` §19 `size=440+8,175+8`, `usedcardamage.lay` §0
+    /// `size=563+6,175+6`, `usedcars.lay` §11 `size=276+6,175+6` and `cdplayer.lay` §18
+    /// `size=155+78,16` — which a plain `parse()` drops, falling back to the class default.
     pub fn pair(&self, key: &str) -> Option<(f32, f32)> {
         let v = self.get(key)?;
         let (a, b) = v.split_once(',')?;
-        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+        let n = |t: &str| t.trim().parse::<f32>().ok().or_else(|| crate::ctr::eval(t, &|_| None).map(|v| v as f32));
+        Some((n(a)?, n(b)?))
     }
 
+    /// An integer value. 0x527D60: an empty string is 0, a `0x` prefix goes to the hex parser
+    /// 0x5242D0, and anything else goes through the same evaluator 0x52DC40.
     pub fn int(&self, key: &str) -> Option<i64> {
         let v = self.get(key)?.trim();
         if let Some(h) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
             i64::from_str_radix(h, 16).ok()
         } else {
-            v.parse().ok()
+            v.parse().ok().or_else(|| crate::ctr::eval(v, &|_| None).map(|v| v as i64))
         }
     }
 

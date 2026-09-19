@@ -352,7 +352,7 @@ pub fn damage_patches(paths: &GamePaths, model: &str, night: bool) -> Result<Vec
             x: (b.misc[2] & 0xFFF) as u32,
             y: (b.misc[3] & 0xFFF) as u32,
             threshold: b.misc[1] as f32,
-            image: TextureImage { name: e.name.clone(), width: img.width, height: img.height, mips: vec![img.rgba], has_alpha: true, page: b.misc[0] as usize, x: (b.misc[2] & 0xFFF) as u32, y: (b.misc[3] & 0xFFF) as u32 },
+            image: TextureImage { name: e.name.clone(), width: img.width, height: img.height, mips: vec![img.rgba], has_alpha: true, page: b.misc[0] as usize, x: (b.misc[2] & 0xFFF) as u32, y: (b.misc[3] & 0xFFF) as u32, place: [b.misc[0] as i16 as i32, b.misc[1] as i16 as i32], text: None },
         });
     }
     Ok(out)

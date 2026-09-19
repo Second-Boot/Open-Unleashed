@@ -272,7 +272,7 @@ fn tournament_table(tables: &CareerTables, c: &Career) -> Vec<u8> {
             break;
         }
         let Some(st) = c.tournaments.get(&tour.id) else { continue };
-        put_i16(&mut t, base + trn::COMPLETED, i16::from(st.completed));
+        put_i16(&mut t, base + trn::COMPLETED, st.completions.min(i16::MAX as u32) as i16);
         for (e, r) in st.events.iter().enumerate() {
             let ev = base + trn::EVENTS + e * trn::EVENT;
             if ev + trn::EVENT > t.len() {
@@ -301,7 +301,8 @@ fn tournaments_from_table(tables: &CareerTables, table: &[u8]) -> std::collectio
         if base + TOURNAMENT_RECORD_SIZE > table.len() {
             break;
         }
-        let completed = get_i16(table, base + trn::COMPLETED) != 0;
+        let completions = get_i16(table, base + trn::COMPLETED).max(0) as u32;
+        let completed = completions != 0;
         let mut events = Vec::new();
         for e in 0..tour.events.len() {
             let ev = base + trn::EVENTS + e * trn::EVENT;
@@ -319,7 +320,7 @@ fn tournaments_from_table(tables: &CareerTables, table: &[u8]) -> std::collectio
             events.push(r);
         }
         if completed || !events.is_empty() {
-            out.insert(tour.id, TournamentState { entered: !events.is_empty(), events, completed, final_rank: None, prize: 0, failed_attempts: 0 });
+            out.insert(tour.id, TournamentState { entered: !events.is_empty(), events, completed, completions, final_rank: None, prize: 0, failed_attempts: 0 });
         }
     }
     out

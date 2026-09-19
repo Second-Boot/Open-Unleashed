@@ -25,6 +25,7 @@ pub mod key;
 pub mod lay;
 pub mod loc;
 pub mod locale;
+pub mod mad;
 pub mod refpack;
 pub mod schl;
 pub mod scn;

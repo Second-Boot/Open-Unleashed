@@ -22,7 +22,7 @@ use anyhow::Result;
 use career_ui::{CareerOpponent, CareerUi};
 use glam::{Mat4, Quat, Vec3};
 use nfs_assets::{GamePaths, car::CarAssets, track::TrackAssets};
-use nfs_game::layout::{ListCell, ListRow};
+use nfs_game::layout::{ListCell, ListRow, TrackMapEvent};
 use nfs_game::{
     lanes::{LaneCar, lane_of, lane_span},
     race::{RaceProgress, SliceTable, grid_pose},
@@ -623,14 +623,22 @@ const CHRONICLE_GROUP: usize = 2;
 /// (0x4B1504 is `{0x5C, 0x657DBC, "SPEEDOMETER"}`). Joining the two on the slot gives this table,
 /// and the twelve `Display.*` rows line up with `fe.txt`'s own key names exactly. CONFIRMED.
 ///
-/// The rows whose slot is not a registry slot are not here: `Track<n>.Laps`, `Track<n>.Traffic`,
-/// `Track<n>.Direction`, `OwnedCar.PackageNum`, `Car.Transmission`, `Game.Difficutly` (the
-/// original's own spelling), `CDPlayer.View`, `Comms.Positional` and `Comms.Collision` keep their
-/// choice in screen state, and the port already answers the ones it has state for.
+/// The rows whose slot is not a registry slot keep their choice in screen state:
+/// `Track<n>.Laps`, `Track<n>.Traffic`, `Track<n>.Direction`, `OwnedCar.PackageNum`,
+/// `Car.Transmission`, `Game.Difficutly` (the original's own spelling), `Comms.Positional` and
+/// `Comms.Collision`. `CDPlayer.View` is one of them and is listed here with an **empty key**,
+/// because a list accessor's index starts at 0 (0x4BC1F0 writes `[this+0x18] = 0`) — so the
+/// original opens on `FEStrings` 1851, "track time remaining", and the slider is not blank.
+///
+/// Read again 2026-09-19 by walking every `0x4BB680` call: the registry record is
+/// `{ int slot, void *storage, const char *key }`, so a key's slot is the dword **three** before
+/// it, not the one after — and joining the two that way puts every row above on its own `fe.txt`
+/// name. The only row that was missing is `Display.RecordTime`, slot 0x68 = `RECORDTIME`.
 const CHOICE_ACCESSORS: &[(&str, &str, &[u32])] = &[
     ("Audio.Mode", "audio3d", &[1500, 1501]),
     ("Audio.Quality", "audioquality", &[1504, 1503, 1502, 1500]),
     ("CDPlayer.Options", "randomplaylist", &[1856, 1855]),
+    ("CDPlayer.View", "", &[1851, 1850]),
     ("Display.Damage", "damagedisplay", &[1500, 1805, 1806, 1807]),
     ("Display.DispCols", "displaycolors", &[1821, 1822, 1823]),
     ("Display.Gear", "gear", &[1500, 1501]),
@@ -638,6 +646,7 @@ const CHOICE_ACCESSORS: &[(&str, &str, &[u32])] = &[
     ("Display.MapScale", "mapscale", &[1810, 1811, 1812, 1813, 1814]),
     ("Display.OppList", "opponentlist", &[1500, 1832, 1833]),
     ("Display.RearView", "rearviewmirrror", &[1500, 1501]),
+    ("Display.RecordTime", "recordtime", &[1500, 1501]),
     ("Display.ScreenLayout", "screenlayout", &[1824, 1825, 1826, 1827]),
     ("Display.SpeedUnits", "speedunits", &[1803, 1804]),
     ("Display.Speedometer", "speedometer", &[1500, 1801, 1802]),
@@ -1252,6 +1261,8 @@ struct App {
     /// there (every screen block carries `musicfile=menu*`) and that screen edits the playlist, so
     /// the lists must fill without a race having been started.
     music_names: Vec<String>,
+    /// each song's length in milliseconds — `track + 0x20` in the original's own music table
+    music_lengths: Vec<u32>,
     /// `fe.txt` audio settings (playlist, shuffle, the five level sliders)
     audio_settings: nfs_audio::music::Settings,
     speech: Option<nfs_audio::speech::Speech>,
@@ -1281,6 +1292,33 @@ const NETWORK_LAYOUTS: [&str; 7] = [
     "creategame",
     "joingame",
 ];
+
+/// A lap or record time in 64 Hz ticks, the way 0x4356E0 prints it: seconds are `ticks/64`, the
+/// minutes `secs/60` and the seconds `secs % 60`, and the hundredths `(ticks & 63)·100/64`
+/// (0x43573C…0x43579D). Minutes below ten get a leading zero (0x4357AF).
+fn format_lap_time(ticks: u32) -> String {
+    let secs = ticks / 64;
+    format!("{:02}:{:02}.{:02}", secs / 60, secs % 60, (ticks & 63) * 100 / 64)
+}
+
+/// A number with thousands separators, the way 0x4DBF80 prints one: it splits off `n % 1000` and
+/// `n / 1000 % 1000` (the 0x3E8 and 0xF4240 divisors at 0x4DBFA3 and 0x4DBFAD) and joins the groups
+/// with commas.
+fn with_thousands(n: i64) -> String {
+    let neg = n < 0;
+    let mut d = n.unsigned_abs().to_string();
+    let mut out = String::new();
+    while d.len() > 3 {
+        let at = d.len() - 3;
+        out.insert_str(0, &format!(",{}", &d[at..]));
+        d.truncate(at);
+    }
+    out.insert_str(0, &d);
+    if neg {
+        out.insert(0, '-');
+    }
+    out
+}
 
 fn is_network_layout(name: &str) -> bool {
     NETWORK_LAYOUTS.iter().any(|n| n.eq_ignore_ascii_case(name))
@@ -1378,6 +1416,18 @@ impl App {
                         let ev = t.events.get(done.min(t.events.len().saturating_sub(1)))?;
                         c.tables.track_name(ev.track_id).to_uppercase()
                     }
+                    // the record on the track the tournament is on. 0x506895 asks
+                    // `Tournament.RemainingTracks` for the current track id, 0x4FB120 finds that
+                    // `nfs5.trk` record and answers `record + 0x1B0` — the **first** record-holder
+                    // entry, the fastest — and 0x5068BB takes its `+0x48`, the time, into the
+                    // formatter 0x4356E0.
+                    "RECORDTIME" => {
+                        let done = c.career.tournaments.get(&t.id).map_or(0, |s| s.events.len());
+                        let ev = t.events.get(done.min(t.events.len().saturating_sub(1)))?;
+                        format_lap_time(c.tables.track(ev.track_id)?.records.first()?.time)
+                    }
+                    // `"%d"` of `trn+0xD3C` (0x506929), the tournament's own completion counter
+                    "TIMESCOMPLETED" => c.career.tournaments.get(&t.id).map_or(0, |s| s.completions).to_string(),
                     _ => return None,
                 }
             }
@@ -1387,6 +1437,14 @@ impl App {
             // `title_string_id` and `description_string_id`. The record is what
             // `0x504990(0x504800())` returns; the port takes the era's hidden finale, which its
             // own `visibility == 2` marks.
+            // the price of the car the dealer screen is on: 0x5062FC takes `DealerCar.Car`, asks it
+            // for the record (vtable +0x90), runs it through the age curve 0x4EE220 — which is the
+            // port's own `dealer_price` — and prints the result with 0x4DBF80's thousands commas.
+            "Tournament.Data" if modifier == "DEALERCARPRICE" => {
+                let c = self.career.as_ref()?;
+                let car = self.logo_car(Some("DealerCar.Car"), None)?;
+                with_thousands(car.dealer_price(c.career.year) as i64)
+            }
             "Tournament.Data" if matches!(modifier, "ENDERAHEADER" | "ENDERADESCRIP") => {
                 let c = self.career.as_ref()?;
                 let list = c.tables.era_tournaments(c.career.era);
@@ -1430,11 +1488,26 @@ impl App {
             }
             // a range setting the port has no other state for — the force-feedback volumes and
             // the gamma — shows its number
-            "FF.TotalVolume" | "FF.RoadVolume" | "FF.EngineVolume" | "FF.CollisionVolume"
-            | "FF.RoadGripVolume" | "Graphics.GammaCorrection" => {
-                let (v, _, hi) = self.range_value(base)?;
-                if modifier == "PERCENT" { format!("{}%", v * 100 / hi.max(1)) } else { v.to_string() }
+            // A range setting asked for as a per cent. `FEAccessor::text("PERCENT")` is
+            // 0x4BC558…0x4BC5F0: with a list of one entry or none it answers a flat **100**
+            // (0x4BC5D8), otherwise `index · 100 / (count − 1)` (0x4BC5A5…0x4BC5C1) **clamped at
+            // 100** (0x4BC5C7), printed with a bare `"%d"` — no per-cent sign. An int range's
+            // index is the value less its minimum and its count is `max − min + 1` (0x4BA329,
+            // 0x4BA34A), so this works out to `(v − min) · 100 / (max − min)`.
+            //
+            // The sign on screen is the layout's, not the accessor's: `audioreal.lay` carries five
+            // `text=%` labels beside its five `(PERCENT)` watches and `advgraphics.lay` one beside
+            // its one, so appending a `%` here printed it twice.
+            _ if modifier == "PERCENT" && RANGE_ACCESSORS.iter().any(|(n, ..)| *n == base) => {
+                let (v, lo, hi) = self.range_value(base)?;
+                if hi <= lo {
+                    "100".to_string()
+                } else {
+                    ((v - lo) * 100 / (hi - lo)).min(100).to_string()
+                }
             }
+            "FF.TotalVolume" | "FF.RoadVolume" | "FF.EngineVolume" | "FF.CollisionVolume"
+            | "FF.RoadGripVolume" | "Graphics.GammaCorrection" => self.range_value(base)?.0.to_string(),
             // a multiple-choice setting: the text is the `FEStrings` entry its chosen index names
             _ if CHOICE_ACCESSORS.iter().any(|(n, _, _)| *n == base) => {
                 let (i, options) = self.choice_index(base)?;
@@ -1510,6 +1583,18 @@ impl App {
                     "RECORDTIME" => {
                         format_ticks(self.records.track(&t)?.entries.first()?.time as u64)
                     }
+                    // the track record's `+0x78`, as `FEStrings[0x1C2 + it]` — 450…452, the same
+                    // three names `Game.Difficutly` uses (0x4FB730) — and the **short** name, which
+                    // is the name id plus 40 (0x4FA845 adds 0x28), not the full one
+                    "DIFFICULTY" | "SHORT" => {
+                        let c = career?;
+                        let rec = c.tables.tracks.iter().find(|r| c.tables.strings.text(r.name_string_id).eq_ignore_ascii_case(&t))?;
+                        if modifier == "SHORT" {
+                            self.fe_strings.get(rec.name_string_id + 40)?.to_uppercase()
+                        } else {
+                            self.fe_strings.get(450 + rec.difficulty.min(2))?.to_string()
+                        }
+                    }
                     _ => t.to_uppercase(),
                 }
             }
@@ -1522,11 +1607,9 @@ impl App {
                     .iter()
                     .position(|n| *n == b)?;
                 let v = c.career.garage.get(idx)?.setup[k];
-                if v.fract() == 0.0 {
-                    format!("{}", v as i64)
-                } else {
-                    format!("{v:.2}")
-                }
+                // shown through the accessor's own index and format, not as the raw float —
+                // `career::car_setup_text` has the chain (0x4B9C10 → 0x4BC240 → 0x4B9AB0)
+                nfs_game::career::car_setup_text(k, v)
             }
             // the repair screen: what each category costs on the selected car (`RepairCost`
             // 0x518880 per installed part, summed by the QUICKFIX screen 0x50F110)
@@ -1577,6 +1660,19 @@ impl App {
                     "TRACKLAPS" => slot.laps.to_string(),
                     "TRACKTRAFFIC" => self.fe_strings.get(TRAFFIC_OPTIONS[(slot.traffic as usize).min(3)])?.to_string(),
                     "TRACKDIRECTION" => self.fe_strings.get(DIRECTION_OPTIONS[usize::from(slot.backwards)])?.to_string(),
+                    // the same two the track accessor answers, for the row's own track: the
+                    // record's `+0x78` as `FEStrings[0x1C2 + it]` (0x4BA8F5) and its best time
+                    // (0x4BA913)
+                    "DIFFICULTY" | "RECORDTIME" => {
+                        let name = m.tracks.get(slot.track_idx)?;
+                        if field == "RECORDTIME" {
+                            format_ticks(self.records.track(name)?.entries.first()?.time as u64)
+                        } else {
+                            let c = career?;
+                            let rec = c.tables.tracks.iter().find(|r| c.tables.strings.text(r.name_string_id).eq_ignore_ascii_case(name))?;
+                            self.fe_strings.get(450 + rec.difficulty.min(2))?.to_string()
+                        }
+                    }
                     _ => return None,
                 }
             }
@@ -1602,40 +1698,58 @@ impl App {
                 };
                 self.fe_strings.get(DIRECTION_OPTIONS[usize::from(b)])?.to_string()
             }
+            // `"%s %s"` of the car's era and its class, as `FEStrings[era − 10]` and
+            // `FEStrings[class + 13]` (0x4F0AAE…0x4F0AD4): 521 − 10 is "Classic" and 501 + 13 is
+            // "3", so a `'50 356` reads "Classic 3".
+            b if modifier == "CLASSLISTING" && matches!(b, "OwnedCars.Car" | "DealerCar.Car" | "GenericCar.Car" | "UsedCar.Car" | "zMergedList.Car") => {
+                let car = self.logo_car(Some(base), None)?;
+                let era = self.fe_strings.get(car.era_string_id.checked_sub(10)?)?;
+                let class = self.fe_strings.get(car.class_string_id + 13)?;
+                format!("{era} {class}")
+            }
+            // a car's short form is its family, the same one `zMergedList.Car(SHORT)` gives: the
+            // accessor's `SHORT` hands the index to a virtual of its own (0x4BC54D) rather than
+            // falling through to the display name.
+            b if modifier == "SHORT" && matches!(b, "OwnedCars.Car" | "DealerCar.Car" | "GenericCar.Car" | "CARSETTINGS.CAR") => {
+                self.logo_car(Some(base), None)?.family.to_uppercase()
+            }
             "OwnedCars.Car" | "DealerCar.Car" | "GenericCar.Car" | "CARSETTINGS.CAR" => {
                 // the garage screens ask the same accessor for the car's money and damage figures
                 let c = career?;
                 let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                let owned = c.career.garage.get(idx);
-                match modifier {
-                    "CURRENTVALUE" => format!("${}", c.career.car_value(&c.tables, idx)?),
-                    "PURCHASEPRICE" => format!("${}", owned?.purchase_price),
-                    "OVERALLDAMAGE" => format!("{:.0}%", owned?.damage_pct),
-                    // one part category's condition: `100 - mean(part damage)` over the installed
-                    // parts of that category (`PART_DAMAGE_CATEGORY`)
-                    m if PART_DAMAGE_CATEGORY.iter().any(|(n, _)| *n == m) => {
-                        let cat = PART_DAMAGE_CATEGORY.iter().find(|(n, _)| *n == m).map(|(_, c)| *c)?;
-                        let o = owned?;
-                        let mut sum = 0.0f32;
-                        let mut n = 0u32;
-                        for (id, state) in &o.part_state {
-                            if c.tables.parts.iter().any(|p| p.id == *id && p.kind == cat) {
-                                sum += state;
-                                n += 1;
-                            }
-                        }
-                        let mean = if n > 1 { sum / n as f32 } else { sum };
-                        format!("{:.0}", 100.0 - mean)
-                    }
-                    _ => owned
+                match self.car_field(c, idx, modifier) {
+                    Some(v) => v,
+                    None => c
+                        .career
+                        .garage
+                        .get(idx)
                         .and_then(|o| c.tables.car(o.car_id))
                         .map(|e| e.display_name.to_uppercase())
                         .unwrap_or_else(|| self.specs.name.to_uppercase()),
                 }
             }
             // the car the front end has selected, and (quick race puts the field in every car) the
-            // opponents' car, which this port takes from the same list
+            // opponents' car, which this port takes from the same list.
+            //
+            // **Only the name.** `usedcardamage.lay` asks this same accessor for a car's condition,
+            // repair costs and mileage — `UsedCar.Car(BODYWORKDAMAGE)`, `(…DAMAGECOST)`,
+            // `(MILEAGE)`, `(ASKINGPRICE)` — and those are fields of a *market* record, an
+            // `OwnedCar`-shaped one with its own wear (`RE/notes/career.md` §10.5). This port has
+            // no used-car market, only the catalogue, so it has nothing to answer them with and
+            // says so. Until that changed it was handing every one of them the car's **name**,
+            // which about thirty widgets on that screen then printed where a percentage belongs.
+            // the used-car screens ask for the market car's condition. The original's market record
+            // is an `OwnedCar`-shaped one (`RE/notes/career.md` §10.5), and the part of that market
+            // this port does have is the player's **own listings** — `list_for_sale` sets
+            // `asking_price`, which is `car+0x68C`. So those come from the listed car; the rest of
+            // the market, the cars the original generates, this port does not have.
+            "UsedCar.Car" if !matches!(modifier, "" | "SHORT") => {
+                let c = career?;
+                let idx = c.career.garage.iter().position(|o| o.asking_price.is_some())?;
+                self.car_field(c, idx, modifier)?
+            }
             "zMergedList.Car" | "OpponentCar.Car" | "UsedCar.Car" | "PrizeCars.Car" => match menu {
+                _ if !matches!(modifier, "" | "SHORT") => return None,
                 // `(SHORT)` asks for the short form, which for a car is its family name
                 Some(m) if modifier == "SHORT" => m.cars[m.car_idx].family.to_uppercase(),
                 Some(m) => m.cars[m.car_idx].display_name.to_uppercase(),
@@ -1668,11 +1782,61 @@ impl App {
             }
             // the options screens: the levels the port actually mixes with (`fe.txt`, 0..127)
             // the CD player's now-playing line, and the sound-quality setting (`AUDIOQUALITY`)
-            "CDPlayer.Title" => self
-                .music
-                .as_ref()
-                .and_then(|m| m.now_playing())
-                .map(|t| nfs_audio::music::split_title(t).0.to_uppercase())?,
+            // `FECDPlayerAccessor`'s `STATUS` is one of two strings: `FEStrings[0x2857]`
+            // "playing..." while something is playing and `[0x2858]` "stopped." otherwise
+            // (0x4BF0BA, 0x4BF0CE). The front end plays nothing, so it is the second.
+            "CDPlayer.Title" if modifier == "STATUS" => {
+                let playing = self.music.as_ref().is_some_and(|m| m.now_playing().is_some());
+                self.fe_strings.get(if playing { 10327 } else { 10328 })?.to_string()
+            }
+            // The three timing lines. All of them end in `FEStrings[0x2859]` — `"%02d:%02d"` — over
+            // a millisecond count divided by 1000, then `/60` and `%60` (0x4BED1F, 0x4BEF6E).
+            //
+            // * `SelectedList(TOTALPLAY)` sums `track + 0x20` over the whole playlist (0x4BED16);
+            // * `Title(TRACKPLAY)` is the current track's own length;
+            // * `Title(SONGTIMEREMAIN)` is the elapsed time, or the length minus it when the
+            //   `CDPlayer.View` toggle is set (0x4BEF66). Nothing is playing in the front end, so
+            //   the elapsed time is zero.
+            "CDPlayer.SelectedList" | "CDPlayer.Title"
+                if matches!(modifier, "TOTALPLAY" | "TRACKPLAY" | "SONGTIMEREMAIN") =>
+            {
+                let list: Vec<usize> = match self.music.as_ref() {
+                    Some(m) => m.playlist().to_vec(),
+                    None => self.audio_settings.playlist.iter().map(|i| *i as usize).collect(),
+                };
+                let len = |i: usize| self.music_lengths.get(i).copied().unwrap_or(0) as u64;
+                let ms = match modifier {
+                    "TOTALPLAY" => list.iter().map(|i| len(*i)).sum::<u64>(),
+                    "TRACKPLAY" => len(list.first().copied().unwrap_or(0)),
+                    // the elapsed time, which is 0 with nothing playing; `CDPlayer.View` would
+                    // make it the remainder instead
+                    _ if self.choice_index("CDPlayer.View").is_some_and(|(i, _)| i != 0) => len(list.first().copied().unwrap_or(0)),
+                    _ => 0,
+                };
+                let secs = ms / 1000;
+                format!("{:02}:{:02}", secs / 60, secs % 60)
+            }
+            // the now-playing line. 0x4BEE70 answers the empty string only when the music table
+            // itself is empty; otherwise it is the entry's own name field. With nothing playing
+            // the port names the first track of the selected playlist, which is the one the
+            // player's own `+0x24` mode would have.
+            "CDPlayer.Title" if modifier.is_empty() => {
+                let title = match self.music.as_ref().and_then(|m| m.now_playing()) {
+                    Some(t) => t.to_string(),
+                    None => {
+                        let names: &[String] = match self.music.as_ref() {
+                            Some(m) => &m.names,
+                            None => &self.music_names,
+                        };
+                        let first = match self.music.as_ref() {
+                            Some(m) => m.playlist().first().copied(),
+                            None => self.audio_settings.playlist.first().map(|i| *i as usize),
+                        };
+                        names.get(first.unwrap_or(0))?.clone()
+                    }
+                };
+                nfs_audio::music::split_title(&title).0.to_uppercase()
+            }
             "Audio.Quality" => self.audio_settings.audio_quality.to_string(),
             // the draw-distance setting, as the original's index into `0x5CE90C` = {0.5, .67, .83, 1}
             "Graphics.ViewDistance" => {
@@ -1802,12 +1966,83 @@ impl App {
         best.or(earliest).map(|(_, n)| n)
     }
 
+    /// The car logo a chronicle pack names, as `(pack, pair)` — the pack without its extension,
+    /// the way [`LayoutScreen::set_car_logo`] wants it.
+    ///
+    /// `FECarLogo::update` with `othersource=Chron` (0x4C1677) loads the chronicle pack, takes
+    /// **entry 1** — the `ci` icon — and reads the string at `+0x24`, which is the entry's `0x6F`
+    /// attachment. It wants at least three characters (0x4C1763); the first two are the logo pair
+    /// as ASCII digits (0x4C17F6 computes `2·(10·s[0] + s[1]) − 0x420`, twice the number they
+    /// spell) and the rest is the logo pack's name (0x4C17F9). CONFIRMED: `MA601a.fsh` carries
+    /// `04finallogos2`, and `FEData/Art/finallogos2.fsh` is on disk.
+    fn chronicle_logo(&self, file: &str) -> Option<(String, i16)> {
+        let dir = self.paths.fe_data().join("Chron");
+        let path = GamePaths::find_file(&dir, file)?;
+        let data = std::fs::read(&path).ok()?;
+        let entries = nfs_assets::texture::decode_pack(&path, &data).ok()?;
+        let text = entries.get(1)?.text.as_deref()?;
+        if text.len() < 3 {
+            return None;
+        }
+        let pair = text[..2].parse::<i16>().ok()?;
+        Some((text[2..].to_string(), pair))
+    }
+
+    /// One field of a car the player owns, for the accessors that ask a car for a number rather
+    /// than its name. `None` means this port has nothing to answer with, and the widget stays blank
+    /// rather than showing something else — which is what it used to do, printing the car's name
+    /// where a percentage belongs.
+    fn car_field(&self, c: &CareerUi, idx: usize, modifier: &str) -> Option<String> {
+        let owned = c.career.garage.get(idx)?;
+        Some(match modifier {
+            "CURRENTVALUE" => format!("${}", c.career.car_value(&c.tables, idx)?),
+            "PURCHASEPRICE" => format!("${}", owned.purchase_price),
+            "OVERALLDAMAGE" => format!("{:.0}%", owned.damage_pct),
+            // what the repair would cost: the aged price of each damaged part times its damage
+            // doubled, over a hundred (`part_repair_cost`, 0x518880), summed over one category —
+            // 0x4EFBC0 for the engine and its neighbours — or over all of them for `OVERALL`
+            // (0x4EFF80), printed with 0x4DBF80's thousands commas
+            m if m.ends_with("DAMAGECOST") => {
+                let cat = PART_DAMAGE_CATEGORY.iter().find(|(n, _)| n.trim_end_matches("DAMAGE") == m.trim_end_matches("DAMAGECOST")).map(|(_, c)| *c);
+                if cat.is_none() && m != "OVERALLDAMAGECOST" {
+                    return None;
+                }
+                let year = c.career.year;
+                let total: i64 = owned
+                    .part_state
+                    .iter()
+                    .filter_map(|(id, state)| {
+                        let part = c.tables.parts.iter().find(|p| p.id == *id)?;
+                        (cat.is_none_or(|k| part.kind == k)).then(|| nfs_game::career::part_repair_cost(part, year, *state))
+                    })
+                    .sum();
+                with_thousands(total)
+            }
+            // one part category's condition: `100 - mean(part damage)` over the installed parts of
+            // that category (`PART_DAMAGE_CATEGORY`)
+            m if PART_DAMAGE_CATEGORY.iter().any(|(n, _)| *n == m) => {
+                let cat = PART_DAMAGE_CATEGORY.iter().find(|(n, _)| *n == m).map(|(_, c)| *c)?;
+                let mut sum = 0.0f32;
+                let mut n = 0u32;
+                for (id, state) in &owned.part_state {
+                    if c.tables.parts.iter().any(|p| p.id == *id && p.kind == cat) {
+                        sum += state;
+                        n += 1;
+                    }
+                }
+                let mean = if n > 1 { sum / n as f32 } else { sum };
+                format!("{:.0}", 100.0 - mean)
+            }
+            _ => return None,
+        })
+    }
+
     /// The catalogue record an `NFS5.CarLogo`'s source names. The original resolves the source in
     /// the order at 0x4C14E0: `othersource` `FactoryDriver` → the `FactoryDriver.Car` accessor,
     /// `EndOfEra` → `PrizeCars.Car`, `FactoryDriverPrize` → the factory-drive prize car, then the
     /// widget's own `accessor`, then `CarCompare1` → the compare screen's left car. `FactoryDriverPrize` and
     /// `CarCompare1` are code-side objects this port does not keep, so those widgets stay
-    /// unrendered; `Chron` is not a car at all and goes to [`App::chronicle_picture`].
+    /// unrendered; `Chron` names a car logo indirectly, through the chronicle pack — see [`App::chronicle_logo`].
     fn logo_car(
         &self,
         accessor: Option<&str>,
@@ -1817,7 +2052,13 @@ impl App {
             Some("FactoryDriver") => "FactoryDriver.Car",
             Some("EndOfEra") => "PrizeCars.Car",
             // `0x51B050` reads the current factory record's `+0x10`, the prize car of the stage the
-            // player has just finished, and 0x4F4360 looks it up in the master list
+            // player has just finished, and 0x4F4360 looks it up in the master list.
+            //
+            // `FactoryVictory.lay`'s `NFS5.3DCAR` asks for the same thing under an accessor name —
+            // `FDPrizeCars.Car`, which 0x4F2053 registers and 0x51A3E0 builds as a car accessor of
+            // the factory-driver module's own. Its list method is a bare `ret` (0x514990), so what
+            // fills it was not traced; pointing it at the prize car of the stage just finished is
+            // an inference from the screen it is on and the name it carries. **MEDIUM.**
             Some("FactoryDriverPrize") => {
                 let c = self.career.as_ref()?;
                 let m = c.career.promotion_due(&c.tables).or_else(|| {
@@ -1838,7 +2079,10 @@ impl App {
             }
             // handled by `bind_car_logos`, which loads a whole picture out of `FEData/Chron`
             Some("Chron") => return None,
-            _ => accessor?,
+            _ => match accessor {
+                Some("FDPrizeCars.Car") => return self.logo_car(None, Some("FactoryDriverPrize")),
+                a => a?,
+            },
         };
         let base = name.split_once('(').map(|(b, _)| b.trim()).unwrap_or(name);
         match base {
@@ -2154,15 +2398,18 @@ impl App {
                 (w.index, car.map(|c| (c.logo.clone(), c.logo_pair)))
             })
             .collect();
-        let chron: Vec<usize> = l
-            .car_logos()
-            .into_iter()
-            .filter(|w| w.othersource.as_deref() == Some("Chron"))
-            .map(|w| w.index)
-            .collect();
-        let picture = (!chron.is_empty())
+        // the `NFS5.ChroniclePicture` widgets of `chroniclepicture.lay` and `chroniclemedia.lay`
+        let chron: Vec<usize> = l.numbered_widgets("NFS5.ChroniclePicture").into_iter().map(|(i, _)| i).collect();
+        // a `NFS5.CarLogo` with `othersource=Chron` is **still a car logo** — 0x4C1747 takes entry
+        // 1 of the chronicle pack (its `ci` icon) and reads the string its `0x6F` attachment
+        // carries, which is a two-digit logo pair followed by the logo pack's name
+        // (`MA601a.fsh` says `04finallogos2`). It draws nothing when that string is shorter than
+        // three characters (0x4C1763).
+        let chron_logo: Vec<usize> = l.car_logos().into_iter().filter(|w| w.othersource.as_deref() == Some("Chron")).map(|w| w.index).collect();
+        let picture = (!chron.is_empty() || !chron_logo.is_empty())
             .then(|| self.chronicle_picture())
             .flatten();
+        let chron_pair = picture.as_deref().filter(|_| !chron_logo.is_empty()).and_then(|f| self.chronicle_logo(f));
         let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) else {
             return;
         };
@@ -2175,6 +2422,12 @@ impl App {
         for index in chron {
             l.set_chronicle_picture(r, &self.paths, index, picture.as_deref().unwrap_or(""));
         }
+        for index in chron_logo {
+            match &chron_pair {
+                Some((pack, pair)) => l.set_car_logo(r, &self.paths, index, pack, *pair),
+                None => l.set_car_logo(r, &self.paths, index, "", -1),
+            }
+        }
     }
 
     /// `--layout-sweep`: load every shipped `.lay`, draw it once with the port's real accessors and
@@ -2182,6 +2435,32 @@ impl App {
     /// lands here when the original places its content from code and the file carries neither a
     /// shape nor a string for it — which is exactly the list of front-end things still to port.
     fn run_layout_sweep(&mut self) {
+        // `NFS_SWEEP_STATE=1` puts the career into the states the blank count is otherwise waiting
+        // on — a car with damage on every part, and one listed on the used-car market — so the
+        // widgets that need them can be measured instead of assumed. It only ever touches the
+        // in-memory career of this one diagnostic run, never the save.
+        if std::env::var("NFS_SWEEP_STATE").is_ok()
+            && let Some(c) = self.career.as_mut()
+        {
+            let parts: Vec<(i16, f32)> = {
+                let car = c.career.garage.first().map(|o| o.car_id);
+                let family = car.and_then(|id| c.tables.car(id)).and_then(nfs_game::career::part_family).map(str::to_string);
+                c.tables
+                    .parts
+                    .iter()
+                    .filter(|p| Some(p.family.as_str()) == family.as_deref())
+                    .map(|p| (p.id, 40.0))
+                    .collect()
+            };
+            if let Some(o) = c.career.garage.first_mut() {
+                o.damage_pct = 37.0;
+                o.damage = [37.0; 10];
+                o.parts = parts.iter().map(|(id, _)| *id).collect();
+                o.part_state = parts;
+                o.mileage = 12_345;
+                o.asking_price = Some(9_500);
+            }
+        }
         let dir = self.paths.fe_data().join("Layouts");
         let mut names: Vec<String> = std::fs::read_dir(&dir)
             .into_iter()
@@ -2201,19 +2480,63 @@ impl App {
                 continue;
             }
             screens += 1;
+            // the same probe fills the browser with one session, so the four `Comms.*` lists and
+            // the watches beside them can be measured too. The record is what a `'d'` answer
+            // carries (`nfs_net::comm::Describe`), filled as a two-player game would fill it.
+            if std::env::var("NFS_SWEEP_STATE").is_ok()
+                && let Some(lobby) = self.lobby.as_mut()
+                && lobby.found.is_empty()
+            {
+                let mut name = [0u8; 32];
+                name[..8].copy_from_slice(b"HANS'S \0");
+                lobby.found.push((
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 1106)),
+                    nfs_net::comm::Describe {
+                        request: 0,
+                        from: nfs_net::wire::Addr::ip([127, 0, 0, 1], 1106),
+                        conn_dword: 0,
+                        conn_words: [0, 0],
+                        conn_raw: [0, 0],
+                        name,
+                        bytes: [0; 4],
+                        words: [0, 0],
+                        dwords: [0, 0],
+                        player_limit: 2,
+                        slot_mask: 1,
+                    },
+                ));
+            }
             self.bind_car_logos();
             self.bind_lists();
             self.bind_indicator_bars();
             self.bind_chronicle_icons();
             self.bind_showcase_pictures();
-            // `NFS_SWEEP_DUMP=<layout>` prints what every accessor of that one screen resolves to
-            if std::env::var("NFS_SWEEP_DUMP").as_deref() == Ok(name.as_str())
+            self.bind_track_maps();
+            self.bind_player_pictures();
+            // `NFS_SWEEP_DUMP=<layout>` prints what every accessor of that one screen resolves to,
+            // and `NFS_SWEEP_DUMP=*` every screen's. The blank count cannot see a widget that draws
+            // the **wrong** thing — `UsedCar.Car` answered every modifier with the car's name for a
+            // long time and counted as drawn — so this is the other half of the measurement.
+            if std::env::var("NFS_SWEEP_DUMP").as_deref().is_ok_and(|v| v == "*" || v == name.as_str())
                 && let Some(l) = self.layout_preview.as_ref()
             {
                 for e in &l.layout.elements {
                     if let Some(a) = e.get("accessor").filter(|a| !a.is_empty()) {
-                        println!("  {:<26} {a:<28} -> {:?}", e.class, self.accessor_value(a));
+                        println!("  {name:<20} {:<26} {a:<30} -> {:?}", e.class, self.accessor_value(a));
                     }
+                }
+                // the lists too: a row that says the wrong thing is as invisible to the blank
+                // count as an accessor that does
+                for w in l.list_boxes() {
+                    let Some(a) = w.accessor.as_deref() else { continue };
+                    let rows = self.list_rows(a).map(|(r, cur)| (r.len(), cur, r.into_iter().take(3).map(|r| format!("{r:?}")).collect::<Vec<_>>()));
+                    println!("  {name:<20} {:<26} {a:<30} => {rows:?}", "list");
+                }
+                // and the 3D cars: the sweep has no 3D pass, so they always count as blank. What
+                // can be measured here is whether the port would have a model to put in each one.
+                for w in l.car_3d() {
+                    let model = self.logo_car(w.accessor.as_deref(), w.othersource.as_deref()).map(|c| c.model.clone());
+                    println!("  {name:<20} {:<26} {:<30} ~> {model:?}", "3dcar", w.accessor.clone().unwrap_or_default());
                 }
             }
             let Some(l) = self.layout_preview.as_ref() else { continue };
@@ -2291,6 +2614,185 @@ impl App {
         }
     }
 
+    /// Fill the three map widgets.
+    ///
+    /// `NFS5.TrackSmall2dSpline` (`tournament.lay`) shows the tournament's events one after the
+    /// other; the art is each track's own `nfs5.trk` `+0x58` name in `FEData/TrackArt`, and the
+    /// marker is entry 1 or entry 2 by the event's `backwards` byte — see [`TrackMapEvent`].
+    ///
+    /// `NFS5.PRIZERACEMAP` (`VictoryMessage.lay`) and `NFS5.FACTORYMAP` (`missionmap.lay`) are one
+    /// picture each. The prize map's pack is the era's (0x506430: `mclass`, `mgold`, `mmod` for the
+    /// `+4` values 0x209, 0x20A, 0x20B; 0x504800 picks the first era that still has an unfinished
+    /// tournament, which is what the port's own `career.era` tracks). The factory map's is the
+    /// current mission's code at `fac+0x3F` — `1m01.fsh` and the rest, in `FEData/Factory` — from
+    /// the first mission whose result is still 0 (0x51AE80).
+    fn bind_track_maps(&mut self) {
+        let Some(l) = self.layout_preview.as_ref() else { return };
+        let splines = l.numbered_widgets("NFS5.TrackSmall2dSpline");
+        let prize = l.numbered_widgets("NFS5.PRIZERACEMAP");
+        let factory = l.numbered_widgets("NFS5.FACTORYMAP");
+        if splines.is_empty() && prize.is_empty() && factory.is_empty() {
+            return;
+        }
+        let events: Vec<TrackMapEvent> = self
+            .career
+            .as_ref()
+            .and_then(|c| {
+                let t = c.current()?;
+                Some(
+                    t.events
+                        .iter()
+                        .filter_map(|ev| {
+                            let trk = c.tables.track(ev.track_id)?;
+                            let name = self
+                                .fe_strings
+                                .get(trk.name_string_id + 20)
+                                .map(str::to_string)
+                                .unwrap_or_else(|| c.tables.track_name(ev.track_id).to_uppercase());
+                            Some(TrackMapEvent { art: trk.art_small.clone(), backwards: ev.backwards, name })
+                        })
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
+        let era_pack = self
+            .career
+            .as_ref()
+            .map(|c| match c.career.era {
+                nfs_formats::career::Era::Classic => "mclass.fsh",
+                nfs_formats::career::Era::Golden => "mgold.fsh",
+                nfs_formats::career::Era::Modern => "mmod.fsh",
+            })
+            .unwrap_or("mclass.fsh")
+            .to_string();
+        let mission_pack = self
+            .career
+            .as_ref()
+            .and_then(|c| Some(format!("{}.fsh", c.tables.missions[c.career.current_mission(&c.tables)?].code)))
+            .unwrap_or_default();
+        let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) else { return };
+        for (index, _) in splines {
+            l.set_track_map(r, &self.paths, index, &events);
+        }
+        for (index, _) in prize {
+            l.set_pack_picture(r, &self.paths, "TrackArt", index, &era_pack, 0);
+        }
+        for (index, _) in factory {
+            l.set_pack_picture(r, &self.paths, "Factory", index, &mission_pack, 0);
+        }
+    }
+
+    /// Fill the player's portrait and the Factory Driver licence card.
+    ///
+    /// **The portrait index is the leading digit of the profile's file name.**
+    /// `FEPlayerPicture::update` (0x4CFB70) asks its `UserList.UserList` accessor (0x4CFAE6) for
+    /// the selected option's text and takes `text[0] - '0'`, clamped to 0..8 (0x4CFBA0…0x4CFBCC) —
+    /// and that text is `sprintf("%d%s", picture, name)`, the same `.sav` stem 0x4DEDA0 builds. The
+    /// picture is entry `n` of `FEData/Art/ALLdrivr.fsh` (0x4DBCEC), whose nine 54×64 entries are
+    /// `M01`…`M04`, `F01`…`F04` and `driv`. This closes the UNKNOWN `RE/notes/layouts.md` left on
+    /// where the chosen index lives.
+    ///
+    /// The licence card is `license`, `license2`, `license3` or `license4` (the table at 0x5D8E50)
+    /// by **the stage of the mission the career is on, minus one** — 0x51AE00 finds the first
+    /// mission whose `+0xE8` result is still 0, answers −1 when that is mission 0 (nothing passed
+    /// yet, so no licence), reads `stage` at `+8` and subtracts 1, and answers 3 when every mission
+    /// is done. The name under it is printed in the colour at 0x5D8E60 for that stage — white,
+    /// 0xD20000, black, black — and the rank line is `FEStrings[3496 + stage]`, or `3485 + stage`
+    /// when the portrait is one of the four female ones (0x4CF56E: `-11` when 0x5024E0 answers
+    /// 4…7). 3496 is `IDS_JUNIORTESTDRIVER` and 3485 `IDS_FEMALEJUNIORTESTDRIVER`. CONFIRMED.
+    fn bind_player_pictures(&mut self) {
+        let Some(l) = self.layout_preview.as_ref() else { return };
+        let pictures: Vec<usize> = ["NFS5.PLAYERPICTURE", "NFS5.MINIPLAYERPICTURE"].iter().flat_map(|c| l.numbered_widgets(c)).map(|(i, _)| i).collect();
+        let badges: Vec<usize> = ["NFS5.BADGE", "NFS5.MINIBADGE"].iter().flat_map(|c| l.numbered_widgets(c)).map(|(i, _)| i).collect();
+        if pictures.is_empty() && badges.is_empty() && l.numbered_widgets("NFS5.FACTORYPIC").is_empty() && l.numbered_widgets("NFS5.MOVIEBOX").is_empty() && l.numbered_widgets("NFS5.HUD").is_empty() {
+            return;
+        }
+        let profile = self.career.as_ref().map(|c| c.profile.clone());
+        let picture = profile.as_ref().map_or(0, |p| p.picture.min(8) as usize);
+        let name = profile.as_ref().map(|p| p.name.clone()).unwrap_or_default();
+        // 0x51AE00
+        let stage = self.career.as_ref().and_then(|c| {
+            let i = c.career.current_mission(&c.tables)?;
+            if i == 0 {
+                return None;
+            }
+            Some((c.tables.missions[i].stage.max(1) - 1).clamp(0, 3) as usize)
+        });
+        let rank = stage
+            .and_then(|st| {
+                let base = if (4..=7).contains(&picture) { 3485 } else { 3496 };
+                self.fe_strings.get(base + st as u32).map(str::to_string)
+            })
+            .unwrap_or_default();
+        let colour = match stage.unwrap_or(0) {
+            0 => [1.0, 1.0, 1.0, 1.0],
+            1 => [0xD2 as f32 / 255.0, 0.0, 0.0, 1.0],
+            _ => [0.0, 0.0, 0.0, 1.0],
+        };
+        let pack = stage.map(|st| if st == 0 { "license.fsh".to_string() } else { format!("license{}.fsh", st + 1) });
+        // `NFS5.FACTORYPIC` (0x51A080): one of the six 54×64 faces of `FactoryPeople.fsh` —
+        // `bill`, `step`, `diet`, `fran`, `klau`, `rolp`, in the narrator order the missions use.
+        // With `source=profile` (`teamprofile.lay`) the entry is `Factory.ProfileNum` through the
+        // jump table at 0x51A1A8, which permutes 0…5 to **2, 0, 3, 1, 4, 5** — profile 0 is Dieter,
+        // which is what `FEStrings[3501]` says too. With anything else (`missionbrief.lay` says
+        // `source=nothingmuch`) it is the current mission's `+0x1E`, the narrator (0x51A184).
+        let faces: Vec<(usize, usize)> = l
+            .numbered_widgets("NFS5.FACTORYPIC")
+            .into_iter()
+            .map(|(i, _)| {
+                const PROFILE_FACE: [usize; 6] = [2, 0, 3, 1, 4, 5];
+                let by_profile = l.layout.elements[i].get("source").is_some_and(|s| s.eq_ignore_ascii_case("profile"));
+                let entry = if by_profile {
+                    PROFILE_FACE[(self.factory_profile as usize).min(5)]
+                } else {
+                    self.career
+                        .as_ref()
+                        .and_then(|c| Some(c.tables.missions[c.career.current_mission(&c.tables)?].narrator))
+                        .unwrap_or(0)
+                        .clamp(0, 5) as usize
+                };
+                (i, entry)
+            })
+            .collect();
+        // `NFS5.MOVIEBOX`. 0x4CD190 reads the widget's `data.othersource`: `chroniclemain` plays
+        // `<Movies>/<0x507390()>.mad`, and 0x507390 maps the chronicle's model group — the same
+        // `[0x5DBA44]` the picture names use — to `ch5`, `Ch3`, `Ch1`, `Ch2`, `Ch4` for groups 0…4
+        // and `Ch0` past them. `chronicle` instead plays the per-entry clip 0x507662 builds with
+        // `"%s%c%c%02d%d%c.mad"`, the picture's own name with the other extension; this
+        // installation ships none of those, so that widget finds no file, as the original would.
+        let movies: Vec<(usize, String)> = l
+            .numbered_widgets("NFS5.MOVIEBOX")
+            .into_iter()
+            .filter_map(|(i, _)| {
+                const CHRONICLE_MOVIE: [&str; 5] = ["ch5", "Ch3", "Ch1", "Ch2", "Ch4"];
+                let src = l.layout.elements[i].get("othersource")?;
+                src.eq_ignore_ascii_case("chroniclemain").then(|| (i, format!("{}.mad", CHRONICLE_MOVIE[CHRONICLE_GROUP.min(4)])))
+            })
+            .collect();
+        let huds = l.numbered_widgets("NFS5.HUD");
+        let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) else { return };
+        for index in pictures {
+            l.set_pack_picture(r, &self.paths, "Art", index, "ALLdrivr.fsh", picture);
+        }
+        for (index, entry) in faces {
+            l.set_pack_picture(r, &self.paths, "Art", index, "FactoryPeople.fsh", entry);
+        }
+        for (index, file) in movies {
+            l.set_movie(r, &self.paths, index, "Movies", &file);
+        }
+        // `NFS5.HUD`'s own art: 0x4CB65D builds `<Art>hud.fsh` and 0x4CB685 keeps all **fifteen**
+        // of its entries at `widget + 0x178 + 4i`. Entry 0 is `disp`, 240×180 — the size
+        // `display.lay` gives the widget — and the draw blits it first (0x4CBB93).
+        for (index, _) in huds {
+            l.set_pack_picture(r, &self.paths, "Art", index, "hud.fsh", 0);
+        }
+        if let Some(pack) = pack {
+            for index in badges {
+                l.set_badge(r, &self.paths, index, &pack, &name, &rank, colour);
+            }
+        }
+    }
+
     /// Fill the `NFS5.GouraudIndicatorBar`s of whatever screen is up. Only the car-compare screen
     /// has any, and its bars read the same `<n>CarCompareCar<m>` sources as its numbers.
     fn bind_indicator_bars(&mut self) {
@@ -2318,9 +2820,46 @@ impl App {
                 (i, v)
             })
             .collect();
+        // `NFS5.KNOCKOUTTRACKLIST` is the strip beside those bars: the opponent count and the row
+        // `Knockout.TrackNumber` is on (`LayoutScreen`'s own arm has the geometry)
+        let strips: Vec<(usize, usize, usize)> = self
+            .layout_preview
+            .as_ref()
+            .map(|l| l.numbered_widgets("NFS5.KNOCKOUTTRACKLIST"))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(i, _)| (i, self.menu.as_ref().map_or(0, |m| m.opponents as usize), self.menu.as_ref().map_or(0, |m| m.ko_sel)))
+            .collect();
+        // the car-setting sliders: the knob's place along its track is the accessor's own index
+        // in its own list (`RE/notes/layouts.md`, the car-setup section)
+        let knobs: Vec<(usize, Option<(i32, i32)>)> = self
+            .layout_preview
+            .as_ref()
+            .map(|l| l.car_setting_sliders())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(i, a)| {
+                let base = a.split_once('(').map_or(a.as_str(), |(b, _)| b.trim());
+                let v = nfs_game::career::CAR_SETUP_NAMES
+                    .iter()
+                    .position(|n| *n == base)
+                    .and_then(|k| {
+                        let c = self.career.as_ref()?;
+                        let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
+                        Some(nfs_game::career::car_setup_index(k, c.career.garage.get(idx)?.setup[k]))
+                    });
+                (i, v)
+            })
+            .collect();
         let Some(l) = self.layout_preview.as_mut() else { return };
         for (index, value) in wanted {
             l.set_bar(index, value);
+        }
+        for (index, value) in knobs {
+            l.set_knob(index, value);
+        }
+        for (index, rows, current) in strips {
+            l.set_ko_strip(index, rows, current);
         }
     }
 
@@ -5351,6 +5890,8 @@ impl App {
                     self.bind_indicator_bars();
                     self.bind_chronicle_icons();
             self.bind_showcase_pictures();
+            self.bind_track_maps();
+            self.bind_player_pictures();
                     self.bind_lists();
                 }
             }
@@ -5467,6 +6008,10 @@ impl App {
         if let Some(l) = self.layout_preview.as_mut() {
             l.advance_transition(dt_ms);
         }
+        // and the movies on it, which need the renderer to put each frame in its texture
+        if let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) {
+            l.advance_movies(r, dt_ms);
+        }
         // a network screen probes once a second and refills its lists from the answers
         if self.lobby.is_some() {
             let before = self.lobby.as_ref().map(|l| l.found.len());
@@ -5556,10 +6101,14 @@ impl App {
         let base = name.split_once('(').map(|(b, _)| b.trim()).unwrap_or(name);
         if let Some((v, lo, hi)) = self.range_value(base).filter(|_| !base.starts_with("Audio.")) {
             let key = RANGE_ACCESSORS.iter().find(|(n, ..)| *n == base).map(|(_, k, ..)| *k).unwrap_or_default();
-            // the step the sliders move by is the port's own; the registration's own step field was
-            // not traced. APPROXIMATION.
-            let step = ((hi - lo) / 20).max(1);
-            self.choices.insert(key.to_string(), (v + delta * step).clamp(lo, hi) as usize);
+            // **one index per press.** An int range is a list of `max − min + 1` entries
+            // (0x4BA329 builds exactly that count) whose index *is* the value less the minimum
+            // (0x4BA34A / 0x4BA362), and the combo slider adds its own `[widget+0x1A8]` to the
+            // accessor's current index (0x4C6CFF…0x4C6D10) — which the `.lay` sets from a
+            // `NFS5.CARSETTINGBUTTON`'s `step`, and every one of the 34 shipped buttons carries
+            // ±1. So the volume sliders move by one of 128 steps, not by a twentieth of the range
+            // as this port used to assume.
+            self.choices.insert(key.to_string(), (v + delta).clamp(lo, hi) as usize);
             return;
         }
         if let Some((cur, options)) = self.choice_index(base) {
@@ -5683,6 +6232,8 @@ impl App {
                 self.bind_indicator_bars();
                 self.bind_chronicle_icons();
             self.bind_showcase_pictures();
+            self.bind_track_maps();
+            self.bind_player_pictures();
                 if let Some(l) = self.layout_preview.as_mut() {
                     l.transition_in();
                 }
@@ -5845,6 +6396,8 @@ impl App {
             self.bind_indicator_bars();
             self.bind_chronicle_icons();
             self.bind_showcase_pictures();
+            self.bind_track_maps();
+            self.bind_player_pictures();
             if let Some(l) = self.layout_preview.as_ref() {
                 for (c, n) in l.unrendered() {
                     tracing::info!(
@@ -5926,9 +6479,15 @@ impl App {
                 // a screen fades in over half a second (`RE/notes/controls.md` §6), so a shot taken
                 // on the first frame catches every faded widget at alpha 0 and looks empty. Let the
                 // transition finish first.
-                if let Some(l) = self.layout_preview.as_mut() {
-                    for _ in 0..120 {
-                        if l.advance_transition(16) {
+                if let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) {
+                    // a movie starts on a black frame and runs at fifteen a second, so a screen
+                    // with one gets the same half second the fade does, whether or not the fade
+                    // has already settled. A screenshot of a playing movie catches whatever frame
+                    // its clock is on; this picks a consistent one.
+                    let least = if l.has_movies() { 32 } else { 0 };
+                    for i in 0..120 {
+                        l.advance_movies(r, 16);
+                        if l.advance_transition(16) && i >= least {
                             break;
                         }
                     }
@@ -7466,6 +8025,7 @@ fn main() -> Result<()> {
         .unwrap_or_default();
     let race_skill = fe.skill;
     let music_names = nfs_audio::music::song_titles(&paths.game_data().join("Music")).unwrap_or_default();
+    let music_lengths = nfs_audio::music::song_lengths_ms(&paths.game_data().join("Music")).unwrap_or_default();
     let mut app = App {
         layout_sweep,
         factory_profile: 0,
@@ -7673,6 +8233,7 @@ fn main() -> Result<()> {
         last_gear: 1,
         music: None,
         music_names,
+        music_lengths,
         audio_settings,
         speech: None,
         countdown_said: 0,

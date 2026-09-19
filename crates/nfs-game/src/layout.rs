@@ -38,6 +38,18 @@ use crate::text::BitmapFont;
 
 /// Read `FEData/Controls/*.ctr` — the widget class templates that hold every attribute's default
 /// and the pieces each class is made of (`RE/notes/controls.md`).
+/// The front end's string table, for the one geometry rule that needs it: a `TEXT` or
+/// `LOCALIZEDTEXT` part's `size` is the **extent of the string it draws**, which several templates
+/// then position other parts from (`BottomBarButton.ctr`'s own `pos.value` is
+/// `(data.align&1)?data.posx-(label.size.width+picture.size.width+data.space):data.posx`).
+pub fn load_strings(paths: &GamePaths) -> Strings {
+    let dir = paths.fe_data().join("Locale");
+    match GamePaths::find_file(&dir, "FEStrings.csv").and_then(|p| std::fs::read(p).ok()) {
+        Some(b) => Strings::parse(&b, 0),
+        None => Strings::default(),
+    }
+}
+
 pub fn load_controls(paths: &GamePaths) -> ControlLibrary {
     let dir = paths.fe_data().join("Controls");
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -70,6 +82,54 @@ pub struct Control {
 /// The design space every `.lay` is authored in.
 pub const DESIGN: (f32, f32) = (640.0, 480.0);
 
+/// One event of the tournament a `NFS5.TrackSmall2dSpline` watches, as the widget needs it.
+///
+/// `FETrackSmall2dSpline::update` (0x4FCB40) asks its `Tournament.Tournament` accessor which
+/// tournament is selected (0x4FC9A6 registers it, 0x4FC9B9 keeps the object), takes the event
+/// count from `trn+0x39C` (0x503370) and, for event `i`, resolves `trn+0x3A0+i*0xA4` — the track
+/// id — into the `nfs5.trk` record (0x5033D0 → 0x4FBF30). From that record it takes **`+0x58`**,
+/// the small art name, and loads `<TrackArt>/<name>.fsh` (0x4FCC7E, `"%s%s.fsh"`), keeping its
+/// entries **0, 1 and 2** (0x4FCCA5, 0x4FCCB4, 0x4FCCC0).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackMapEvent {
+    /// the `nfs5.trk` record's `+0x58` — `alpsSpSm` and the like, without the extension
+    pub art: String,
+    /// the event's `+4`: with it set the widget draws entry **2** (`f`) instead of entry 1 (`s`),
+    /// because a point-to-point track driven backwards starts where it normally finishes
+    /// (0x4FCDFC…0x4FCE0F). The shipped `nfs5.trn` sets it on 39 of its 130 events.
+    pub backwards: bool,
+    /// the track's name in caps — `FEStrings[trk+4 + 20]`, which is what 0x4FCFAD…0x4FCFBE looks
+    /// up for the list beside the map
+    pub name: String,
+}
+
+/// A `.mad` playing inside a `NFS5.MOVIEBOX`.
+///
+/// The frame period is the video header's `+0x0C` as **16.16 fixed point**: 0x4DCB01 masks its low
+/// sixteen bits off as the fraction and 0x4DCB06 shifts the rest down to whole units, which it adds
+/// to the player's own clock. Every shipped movie carries 4369067, so 66.67 ms a frame — fifteen a
+/// second.
+struct MoviePlayer {
+    /// the whole file, and where its video chunks are
+    data: Vec<u8>,
+    chunks: Vec<(usize, usize)>,
+    decoder: nfs_formats::mad::MadDecoder,
+    /// the next chunk to decode
+    next: usize,
+    period_q16: u64,
+    clock_q16: u64,
+    tex: TextureId,
+    size: (f32, f32),
+}
+
+/// A resolved [`TrackMapEvent`]: the art, already uploaded, at the place its own header gives.
+struct TrackMapArt {
+    /// texture, width, height, x, y
+    map: Option<(TextureId, f32, f32, f32, f32)>,
+    marker: Option<(TextureId, f32, f32, f32, f32)>,
+    name: String,
+}
+
 pub struct LayoutScreen {
     pub layout: Layout,
     /// The background screen this one is laid over (`screen=` → [`background_layout`]).
@@ -83,11 +143,25 @@ pub struct LayoutScreen {
     unrendered: Vec<(String, usize)>,
     /// element index of an `NFS5.CarLogo` → the `.fsh` pack and the first of its two entries
     logos: HashMap<usize, (String, usize)>,
-    /// `NFS5.RADIOGROUP` element index → the layout its `filename` names, loaded and drawn inside
-    /// it. Four screens embed a tab strip this way: `Controllers` takes `controllertabs`, `Options`
-    /// `optiontabs`, `graphics` `graphicstabs` and `showcase` `showcasetabs`. `Radio Group.Ctr`
-    /// gives the class one attribute of its own, `filename`, and nothing drawable.
+    /// `NFS5.PANEL` element indices the screen deliberately leaves **closed** — the tabs that are
+    /// not the selected one, and the CD player. A closed panel draws nothing (0x4CEBC0 returns at
+    /// once when `[panel+0x14C]` is null), so it is not a gap; a panel whose file simply would not
+    /// load is not in here and is still counted.
+    closed: std::collections::HashSet<usize>,
+    /// `NFS5.RADIOGROUP` or `NFS5.PANEL` element index → the layout its `filename` names, loaded
+    /// and drawn inside it (`RE/notes/controls.md` §4.1). Four screens embed a tab strip this way:
+    /// `Controllers` takes `controllertabs`, `Options` `optiontabs`, `graphics` `graphicstabs` and
+    /// `showcase` `showcasetabs`. `Radio Group.Ctr` gives the class one attribute of its own,
+    /// `filename`, and nothing drawable; a panel is the container those strips switch between.
     groups: HashMap<usize, Box<LayoutScreen>>,
+    /// element index of a `NFS5.CheckBox` → whether its `boolAccessor` is true. A box with no
+    /// entry is **unticked**, which is what the original's own registration says: a bool accessor
+    /// is a two-entry list (0x4B8720 hands 0x4BC1F0 a count of 2) and every `QUICKFIX.*` is built
+    /// with a default index of 0 (0x4F2584).
+    checks: HashMap<usize, bool>,
+    /// element index of a `NFS5.CarSettingSlider` → the accessor's index and its list's length,
+    /// which is what puts the knob along the track (0x4D0C0C…0x4D0C68)
+    knobs: HashMap<usize, (i32, i32)>,
     /// `NFS5.GouraudIndicatorBar` element index → the 0..100 value its `othersource` resolved to.
     /// A bar with no entry here draws nothing, the way an unresolved `AccessorWatch` shows nothing.
     bars: HashMap<usize, i32>,
@@ -98,6 +172,19 @@ pub struct LayoutScreen {
     car_views: HashMap<usize, TextureId>,
     /// the widget class templates (`FEData/Controls/*.ctr`), shared with the background screen
     controls: Arc<ControlLibrary>,
+    /// the string table, shared the same way — a text part's `size` is its string's extent
+    fe_strings: Arc<Strings>,
+    /// element index of a `NFS5.TrackSmall2dSpline` → the events of the tournament it watches
+    track_maps: HashMap<usize, Vec<TrackMapArt>>,
+    /// element index of a `NFS5.MOVIEBOX` → the `.mad` it is playing
+    movies: HashMap<usize, MoviePlayer>,
+    /// element index of a `NFS5.KNOCKOUTTRACKLIST` → how many rows it has and which one is current
+    ko_strip: HashMap<usize, (usize, usize)>,
+    /// element index of a `NFS5.BADGE` → the player's name, the rank line under it and the colour
+    /// the name is printed in
+    badges: HashMap<usize, (String, String, [f32; 4])>,
+    /// milliseconds this screen has been up, for the map widget's own cycle (0x4FCB50)
+    clock_ms: u32,
     /// where this screen is in its transition
     transition: Transition,
     /// drawn over another screen (the bottom bar, 0x4D39D3) — an overlay must not paint its own fill
@@ -310,12 +397,32 @@ fn parse_color(v: &str) -> Option<[u8; 4]> {
     Some([((n >> 16) & 0xFF) as u8, ((n >> 8) & 0xFF) as u8, (n & 0xFF) as u8, ((n >> 24) & 0xFF) as u8])
 }
 
+/// A front-end colour, as the shader wants it.
+///
+/// The original writes these bytes into an 8-bit frame buffer with no colour management at all:
+/// a `NFS5.GOTOBUTTON`'s `0xFFBC0000` is red **188** on the player's screen. This port's surface
+/// is sRGB, so a value handed to the shader is treated as *linear* and encoded on the way out —
+/// 188 came back as **223**, and every flat colour in the front end was that much too light.
+/// Undoing the encoding here puts the byte back where the file put it. Measured, not assumed:
+/// sampling a pill over black gave 223 before and 188 after.
+///
+/// Only the three colour channels; alpha is not encoded.
 fn tint(c: [u8; 4]) -> [f32; 4] {
-    [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, c[3] as f32 / 255.0]
+    let lin = |v: u8| {
+        let s = v as f32 / 255.0;
+        if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+    };
+    [lin(c[0]), lin(c[1]), lin(c[2]), c[3] as f32 / 255.0]
 }
 
 /// The tag the chronicle's picture tiles carry, which the control's own name repeats at 0x5DBBFE.
 const CHRONICLE_PICTURE_TAG: &str = "1111";
+
+/// The two fonts `NFS5.BADGE` loads for itself (0x4CF25C, 0x4CF2A0).
+const BADGE_NAME_FONT: &str = "univers14b.ffn";
+const BADGE_RANK_FONT: &str = "univers10b.ffn";
+/// The drop shadow `NFS5.BADGE` lays over the licence card (0x4CF208).
+const LICENSE_SHADOW: &str = "LicenseShadow.fsh";
 
 /// Classes whose content comes from the executable and which the port does not draw. `NFS5.3DCAR`
 /// is not one of them any more: the car it shows belongs to the screen's 3D room
@@ -339,7 +446,8 @@ impl LayoutScreen {
     /// they reference.
     pub fn load(r: &mut Renderer, paths: &GamePaths, name: &str) -> anyhow::Result<Self> {
         let controls = Arc::new(load_controls(paths));
-        let mut screen = Self::load_one(r, paths, name, controls.clone())?;
+        let fe_strings = Arc::new(load_strings(paths));
+        let mut screen = Self::load_one(r, paths, name, controls.clone(), fe_strings.clone())?;
         // `NFS_FE_BG=<layout>` puts a background under a **page** — one of the 28 layouts whose
         // `screen=` is empty because in the game it is drawn over whatever opened it. Without it
         // `--fe=<page>` shows the page over black, which is `RE/AUDIT.md` F2.
@@ -351,34 +459,115 @@ impl LayoutScreen {
             .filter(|_| !name.eq_ignore_ascii_case("bottombar"))
             .filter(|_| screen.layout.screen().and_then(|s| s.get("screen")).is_none_or(str::is_empty));
         if let Some(bg) = forced.as_deref().or_else(|| screen.layout.screen().and_then(|s| s.get("screen")).and_then(background_layout)) {
-            match Self::load_one(r, paths, bg, controls) {
+            match Self::load_one(r, paths, bg, controls, fe_strings) {
                 Ok(b) => screen.background = Some(Box::new(b)),
                 Err(e) => tracing::debug!(background = bg, error = %e, "background screen unavailable"),
             }
         }
-        // the tab strips an `NFS5.RADIOGROUP` embeds
-        let want: Vec<(usize, String)> = screen
+        Self::load_children(r, paths, &mut screen, 0);
+        Ok(screen)
+    }
+
+    /// The layouts a screen's widgets embed, loaded into [`groups`](Self::groups).
+    ///
+    /// Two classes carry a `filename`. `NFS5.RADIOGROUP` has nothing else — `Radio Group.Ctr`
+    /// gives it that one attribute and no drawable part — and `NFS5.PANEL` is the container the
+    /// tabbed screens are built from; `Panel.ctr`'s own comment says so ("A lot of the work for
+    /// this is done through code. It will load up and display the lay file given").
+    ///
+    /// The original's panel: **0x4CEA40** reads `data.filename` into `[panel+0x148]`; **0x4CEA90**
+    /// calls the layout loader 0x4E1200 with it, keeps the screen in `[panel+0x14C]`, parents it
+    /// (`[loaded+0xD0] = panel`) and forces its `moveable` attribute to 1; **0x4CEBC0**, the
+    /// per-frame tick, does *nothing at all* when `[panel+0x14C]` is null and otherwise runs the
+    /// loaded screen's own tick and carries the parent's transition into it; **0x4CECE0** keeps it
+    /// at the panel's position — it moves the panel by the delta (0x525310 / 0x4C8760) and then
+    /// hands the panel's new position to the loaded screen (0x525330 and its vtable +0x3C).
+    ///
+    /// That last one is why the sub-layout is drawn **offset by the panel's `pos`**, and the files
+    /// agree: `usedcarparts.lay` is a 448×183 screen whose widgets run 0..444 in x and 0..179 in y,
+    /// and `usedcars.lay` §19 places it at (96, 182) with `size=440+8,175+8` — the same box.
+    ///
+    /// Two levels deep in the shipped data: `Options.lay` embeds `controllers`, which embeds
+    /// `controllertabs` and six more. The depth cap is this port's own guard, not a rule of the
+    /// original.
+    fn load_children(r: &mut Renderer, paths: &GamePaths, screen: &mut Self, depth: usize) {
+        if depth >= 4 {
+            return;
+        }
+        let embedded = |class: &str| class == "NFS5.RADIOGROUP" || class == "NFS5.PANEL";
+        let want: Vec<(usize, String, String)> = screen
             .layout
             .elements
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.class == "NFS5.RADIOGROUP")
-            .filter_map(|(i, e)| e.get("filename").filter(|f| !f.is_empty()).map(|f| (i, f.to_string())))
+            .filter(|(_, e)| embedded(&e.class))
+            .filter_map(|(i, e)| e.get("filename").filter(|f| !f.is_empty()).map(|f| (i, e.class.clone(), f.to_string())))
             .collect();
-        for (i, file) in want {
-            match Self::load_one(r, paths, &file, screen.controls.clone()) {
-                Ok(g) => {
-                    screen.groups.insert(i, Box::new(g));
+
+        // the tab strips first: a strip's buttons are what say which panel of *this* screen is open
+        for (i, class, file) in want.iter().filter(|(_, c, _)| c == "NFS5.RADIOGROUP") {
+            let _ = class;
+            match Self::load_one(r, paths, file, screen.controls.clone(), screen.fe_strings.clone()) {
+                Ok(mut g) => {
+                    g.set_overlay(true);
+                    Self::load_children(r, paths, &mut g, depth + 1);
+                    screen.groups.insert(*i, Box::new(g));
                 }
-                Err(e) => tracing::debug!(file, error = %e, "radio group layout unavailable"),
+                Err(e) => tracing::debug!(file, error = %e, "tab strip unavailable"),
             }
         }
-        Ok(screen)
+
+        // every `panel=` a tab button carries, here or in a strip this screen embeds, and whether
+        // that button is the selected one
+        let mut claimed: HashMap<String, bool> = HashMap::new();
+        let mut note = |es: &[nfs_formats::lay::Element]| {
+            for e in es {
+                if let Some(name) = e.get("panel").filter(|n| !n.is_empty()) {
+                    let sel = e.get("state") == Some("selected");
+                    let slot = claimed.entry(name.to_ascii_uppercase()).or_insert(false);
+                    *slot |= sel;
+                }
+            }
+        };
+        note(&screen.layout.elements);
+        for g in screen.groups.values() {
+            note(&g.layout.elements);
+        }
+
+        for (i, class, file) in want.iter().filter(|(_, c, _)| c == "NFS5.PANEL") {
+            let _ = class;
+            let name = screen.layout.elements[*i].get("name").unwrap_or("").to_ascii_uppercase();
+            // a panel a tab button owns is up only while that button is the selected one
+            // (0x4D02E0: selecting a tab calls its panel's load, vtable +0x6C = 0x4CEA90, and then
+            // shows it, 0x4CEC60). Exactly one button per shipped strip carries `state=selected`.
+            if claimed.get(&name) == Some(&false) {
+                screen.closed.insert(*i);
+                continue;
+            }
+            // and the one panel the *screen* hides on entry: `Audio.lay`'s CD player, hidden at
+            // 0x511A85 (`0x4CEC50` on the `ID_PLAYLISTPANEL` it looks up at 0x511A45). Its own
+            // `audioreal.lay` carries the `SHOWPLAYLISTPANEL` callback that raises it.
+            if name == "ID_PLAYLISTPANEL" {
+                screen.closed.insert(*i);
+                continue;
+            }
+            match Self::load_one(r, paths, file, screen.controls.clone(), screen.fe_strings.clone()) {
+                Ok(mut g) => {
+                    g.set_overlay(true);
+                    Self::load_children(r, paths, &mut g, depth + 1);
+                    screen.groups.insert(*i, Box::new(g));
+                }
+                Err(e) => tracing::debug!(file, error = %e, "panel layout unavailable"),
+            }
+        }
     }
 
-    fn load_one(r: &mut Renderer, paths: &GamePaths, name: &str, controls: Arc<ControlLibrary>) -> anyhow::Result<Self> {
+    fn load_one(r: &mut Renderer, paths: &GamePaths, name: &str, controls: Arc<ControlLibrary>, fe_strings: Arc<Strings>) -> anyhow::Result<Self> {
         let dir = paths.fe_data().join("Layouts");
-        let path = GamePaths::find_file(&dir, &format!("{name}.lay")).ok_or_else(|| anyhow::anyhow!("no layout {name}.lay in {}", dir.display()))?;
+        // 0x4E1281…0x4E12EF: the loader searches the name for `.lay` and appends it only when it
+        // is not already there. Both spellings ship — `filename=audio` and `filename=gearratio.lay`.
+        let file = if name.to_ascii_lowercase().contains(".lay") { name.to_string() } else { format!("{name}.lay") };
+        let path = GamePaths::find_file(&dir, &file).ok_or_else(|| anyhow::anyhow!("no layout {file} in {}", dir.display()))?;
         let bytes = std::fs::read(&path)?;
         let text: String = bytes.iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
         let layout = Layout::parse(&text);
@@ -394,16 +583,39 @@ impl LayoutScreen {
             if let Some((file, index)) = e.shape() {
                 wanted.push((file.to_string(), index));
             }
+            // a `NFS5.CheckBox` keeps both of its entries: the template's part names only the
+            // ticked one (`data.onIndex`) and the code swaps in `data.offIndex` (0x4C3730)
+            if e.class == "NFS5.CheckBox"
+                && let Some(file) = e.get("shapePathName").filter(|v| !v.is_empty())
+            {
+                for key in ["onIndex", "offIndex"] {
+                    if let Some(n) = e.int(key).filter(|n| *n >= 0) {
+                        wanted.push((file.to_string(), n as usize));
+                    }
+                }
+            }
             let Some(c) = controls.get(&e.class) else { continue };
-            for p in c.state_parts(e.get("state").unwrap_or("normal")).iter().filter_map(|n| c.part(n)) {
+            // **every** part of the class, not only the ones its current state draws: a
+            // template's geometry can measure a part that is not on screen —
+            // `Graphic Tab Button.ctr` centres its caption over `selectedbg.size.width`, which
+            // only `[state.selected]` lists, so without the art of every state the four unopened
+            // tabs could not place their own captions
+            for p in c.parts.values() {
                 if p.kind() != nfs_formats::ctr::PartKind::Shape {
                     continue;
                 }
-                if e.get("shapePathName").is_some_and(|v| !v.is_empty()) {
-                    continue;
-                }
-                let Some(file) = p.value("shapePathName").filter(|v| !v.is_empty()) else { continue };
-                let index = match p.value("shapeIndex") {
+                // the same resolution `shape_parts` applies: the part attribute's screen key
+                // against the `.lay` block, else the template's own value
+                let attr = |key: &str| -> Option<&str> {
+                    if let Some(k) = p.screen_key(key)
+                        && let Some(v) = e.get(&k).filter(|v| !v.is_empty())
+                    {
+                        return Some(v);
+                    }
+                    p.value(key)
+                };
+                let Some(file) = attr("shapePathName").filter(|v| !v.is_empty()) else { continue };
+                let index = match attr("shapeIndex") {
                     Some(v) => match v.trim().strip_prefix("data.") {
                         Some(k) => match e.int(k) {
                             Some(n) if n >= 0 => n as usize,
@@ -417,6 +629,19 @@ impl LayoutScreen {
                     None => 0,
                 };
                 wanted.push((file.to_string(), index));
+            }
+        }
+        // A `NFS5.ListBox` that overflows grows a scrollbar of its own — a `NFS5.VerticalSlider`,
+        // which is no widget of any layout, so its art has to be asked for here
+        if layout.elements.iter().any(|e| e.class == "NFS5.ListBox")
+            && let Some(sb) = controls.get("NFS5.VerticalSlider")
+        {
+            for p in sb.state_parts("normal").iter().filter_map(|n| sb.part(n)) {
+                if p.kind() != nfs_formats::ctr::PartKind::Shape {
+                    continue;
+                }
+                let (Some(f), Some(n)) = (p.value("shapePathName"), p.value("shapeIndex").and_then(|v| v.trim().parse::<usize>().ok())) else { continue };
+                wanted.push((f.to_string(), n));
             }
         }
         for (file, index) in wanted {
@@ -444,6 +669,12 @@ impl LayoutScreen {
         // the FE default
         let mut fonts: HashMap<String, BitmapFont> = HashMap::new();
         let mut want: Vec<String> = vec![DEFAULT_FONT.to_string()];
+        // `NFS5.BADGE` builds its own two fonts rather than taking one from the file: 0x4CF25C
+        // loads `Univers14b.ffn` for the player's name and 0x4CF2A0 `Univers10b.ffn` for the rank
+        if layout.elements.iter().any(|e| e.class == "NFS5.BADGE") {
+            want.push(BADGE_NAME_FONT.to_string());
+            want.push(BADGE_RANK_FONT.to_string());
+        }
         for e in &layout.elements {
             if let Some(f) = e.get("fontPathName").filter(|f| !f.is_empty()) {
                 want.push(f.to_lowercase());
@@ -483,7 +714,7 @@ impl LayoutScreen {
         let mut unrendered: Vec<(String, usize)> = counts.into_iter().collect();
         unrendered.sort();
         tracing::info!(name, elements = layout.elements.len(), art = shapes.len(), fonts = fonts.len(), skipped = unrendered.len(), "layout loaded");
-        Ok(Self { layout, background: None, shapes, fonts, white, unrendered, logos: HashMap::new(), groups: HashMap::new(), bars: HashMap::new(), lists: HashMap::new(), car_views: HashMap::new(), controls, transition: Transition::Idle, overlay: false })
+        Ok(Self { layout, background: None, shapes, fonts, white, unrendered, logos: HashMap::new(), checks: HashMap::new(), knobs: HashMap::new(), closed: std::collections::HashSet::new(), groups: HashMap::new(), bars: HashMap::new(), lists: HashMap::new(), car_views: HashMap::new(), track_maps: HashMap::new(), movies: HashMap::new(), ko_strip: HashMap::new(), badges: HashMap::new(), clock_ms: 0, controls, fe_strings, transition: Transition::Idle, overlay: false })
     }
 
     /// The widgets the screen does not draw: the classes whose content comes from the executable,
@@ -544,7 +775,7 @@ impl LayoutScreen {
     /// `control.size.width` its box, and `<part>.<key>` another piece of the same template. A
     /// reference the port cannot answer — a text part's width, which depends on the string — is
     /// left unresolved so the whole expression falls back rather than silently reading zero.
-    fn reference(&self, e: &nfs_formats::lay::Element, name: &str, depth: u32) -> Option<f64> {
+    fn reference(&self, e: &nfs_formats::lay::Element, name: &str, depth: u32, measure: bool) -> Option<f64> {
         let (head, rest) = name.split_once('.')?;
         if head == "data" {
             return self.attr_num(e, rest);
@@ -562,11 +793,60 @@ impl LayoutScreen {
         }
         let part = self.controls.get(&e.class)?.part(head)?;
         let (key, field) = rest.split_once('.')?;
-        let v = part.value(key)?;
-        let pair = nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, depth + 1))?;
+        // A drawable part's `size` is the extent of **what it draws** when the template does not
+        // give it one: `Picture.ctr`'s picture part and `BottomBarButton.ctr`'s label both carry
+        // `size.flags=HIDDEN|READONLY` and no `size.value` at all, and the bar button's own
+        // position is written over `label.size.width + picture.size.width`. HIGH — the rule is
+        // what the expressions require, the point at which the original measures was not traced.
+        let pair = match part.value(key).filter(|v| !v.trim().is_empty()) {
+            Some(v) => nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, depth + 1, measure))?,
+            // a measured extent is only for an explicit `<part>.size.*` reference, never for the
+            // widget's own box: `Label.ctr`'s `size.value` is `label.size.width*2,…`, and letting
+            // that resolve would give every label a box twice its text and move it, because this
+            // port implements the alignment rule as an anchor in the box rather than as the part
+            // offset the template writes (`(0-label.size.width)/2*data.align`, `layouts.md` §2.1)
+            None if key == "size" && measure => self.part_extent(e, part)?,
+            None => return None,
+        };
         match field {
             "width" | "x" => Some(pair.0),
             "height" | "y" => Some(pair.1),
+            _ => None,
+        }
+    }
+
+    /// What one part of a widget actually covers: a `SHAPE`'s `.fsh` entry at its own pixel size,
+    /// or a `TEXT`/`LOCALIZEDTEXT`'s string measured in the font that part draws it in.
+    fn part_extent(&self, e: &nfs_formats::lay::Element, p: &nfs_formats::ctr::Part) -> Option<(f64, f64)> {
+        match p.kind() {
+            nfs_formats::ctr::PartKind::Shape => {
+                // the same resolution `shape_parts` uses — the part attribute's screen key against
+                // the block, else the template's own value. `Graphic Tab Button.ctr`'s
+                // `selectedbg` has an **empty** `shapePathName.value` and only the screen key
+                // `selectedbgSmallPathName` reaches its pack, so without this the four unopened
+                // tabs could not measure the art they centre their captions over.
+                let file = self.part_attr(e, p, "shapePathName").filter(|v| !v.is_empty())?;
+                let index = match self.part_attr(e, p, "shapeIndex") {
+                    Some(v) => nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0, true)).filter(|n| *n >= 0.0)? as usize,
+                    None => 0,
+                };
+                let &(_, w, h) = self.shapes.get(&(file.to_string(), index))?;
+                Some((w as f64, h as f64))
+            }
+            nfs_formats::ctr::PartKind::Text | nfs_formats::ctr::PartKind::LocalizedText => {
+                let text = match e.get("text").filter(|t| !t.is_empty()) {
+                    Some(t) => t.to_string(),
+                    None => self.fe_strings.get(e.string_id()?).filter(|t| !t.is_empty())?.to_string(),
+                };
+                let named = e
+                    .get("fontPathName")
+                    .filter(|f| !f.is_empty())
+                    .or_else(|| p.value("fontPathName").filter(|f| !f.is_empty()))
+                    .map(|f| f.to_lowercase());
+                let f = named.and_then(|n| self.fonts.get(&n)).or_else(|| self.fonts.get(DEFAULT_FONT))?;
+                let (_, w) = f.place(&text);
+                Some((w as f64, f.line_px() as f64))
+            }
             _ => None,
         }
     }
@@ -581,7 +861,7 @@ impl LayoutScreen {
         if depth <= 4
             && let Some(c) = self.controls.get(&e.class)
             && let Some(v) = c.value("size")
-            && let Some((w, h)) = nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, depth + 1))
+            && let Some((w, h)) = nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, depth + 1, false))
         {
             return (w as f32, h as f32);
         }
@@ -596,11 +876,69 @@ impl LayoutScreen {
         }
         if let Some(c) = self.controls.get(&e.class)
             && let Some(v) = c.value("pos")
-            && let Some((x, y)) = nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0))
+            && let Some((x, y)) = nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true))
         {
             return (x as f32, y as f32);
         }
         (0.0, 0.0)
+    }
+
+    /// Whether the widget's `state` selects **no drawable part at all**, in which case it draws
+    /// nothing however much its `.lay` block carries.
+    ///
+    /// A `.lay` block's `state=` is not decoration: it is the name of one of the template's
+    /// `[state.<name>]` sections, and that section's `parts=` *is* the widget's draw list.
+    /// The chain in the original:
+    ///
+    /// * the nine state names live in a 25-byte-stride table at **0x5D81FC**, ending at 0x5D82DD —
+    ///   `normal`, `stringnotused`, `hover`, `selected`, `disabled`, `hidden`, `focused`,
+    ///   `focusedhover`, `selectedhover`, in that order;
+    /// * **0x4C778F…0x4C7818** walks that table and, for each name the template's `states=` list
+    ///   carries, sets bit `1 << i` in `[widget+0x110]` — the states the class supports;
+    /// * **0x4C7820…0x4C78B2** clears `[widget+0x10C]` and matches the widget's own `state`
+    ///   attribute against names 2…8, setting that name's bit on a hit;
+    /// * **0x4C82A0** turns those flags back into a name by priority — 0x20 → `"hidden"`
+    ///   (0x4C82FE), 0x10 → `"disabled"`, 0x40+0x04 → `"focusedhover"`, 0x40 → `"focused"`,
+    ///   0x08+0x04 → `"selectedhover"`, 0x08 → `"selected"`, 0x04 → `"hover"`, else `"normal"`;
+    /// * **0x525285…0x5252F5** matches that name against the loaded `[state.*]` sections and hands
+    ///   the index to 0x525580 → **0x5271F0**, which *copies that state's `parts` vector over the
+    ///   widget's active part list* (`[[widget+0xF4]+0x10]`).
+    ///
+    /// So when the chosen section lists only `DATA` parts — and `DATA` draws nothing, it is the
+    /// attribute block (`RE/notes/controls.md` §1) — the widget is erased. Three shipped widgets
+    /// are in exactly that case, all `NFS5.PANEL` with `state=hidden` against `Panel.ctr`'s
+    /// `[state.hidden] parts=data`: `carsetup.lay` §77, `carsetupdesc.lay` §11 and
+    /// `usedcars.lay` §19. Each carries `color=0x80ffFF00`, so drawing them anyway paints a
+    /// half-transparent yellow slab over the middle of those three screens.
+    fn state_draws_nothing(&self, e: &nfs_formats::lay::Element) -> bool {
+        let Some(c) = self.controls.get(&e.class) else { return false };
+        let Some(state) = e.get("state") else { return false };
+        // an unknown state name leaves the ctor's own list in place, which is every part
+        if !c.has_state(state) {
+            return false;
+        }
+        !c.state_parts(state).iter().filter_map(|n| c.part(n)).any(|p| p.kind() != nfs_formats::ctr::PartKind::Data)
+    }
+
+    /// An embedded layout's sprites, moved into the widget's own place. The offset is applied in
+    /// the same normalised space [`place`](Self::place) maps into, so it carries the letterbox
+    /// factor with it.
+    #[allow(clippy::too_many_arguments)]
+    fn embedded(&self, g: &LayoutScreen, aspect: f32, strings: &Strings, accessor: &dyn Fn(&str) -> Option<String>, blank: &mut Vec<(String, String)>, x: f32, y: f32) -> Vec<Sprite> {
+        // an embedded layout is one of the 98 the sweep already walks on its own, so its gaps are
+        // reported there and not again here — see the note on the background above
+        let _ = &blank;
+        let mut inner = g.sprites_reporting(aspect, strings, None, accessor, &mut Vec::new());
+        if x != 0.0 || y != 0.0 {
+            let design_aspect = DESIGN.0 / DESIGN.1;
+            let fw = if aspect > design_aspect { design_aspect / aspect } else { 1.0 };
+            let (dx, dy) = (x / DESIGN.0 * fw, y / DESIGN.1);
+            for sp in &mut inner {
+                sp.pos[0] += dx;
+                sp.pos[1] += dy;
+            }
+        }
+        inner
     }
 
     /// The `RECT` parts of the widget's class template that its `state` draws, each resolved to a
@@ -615,17 +953,133 @@ impl LayoutScreen {
             if p.kind() != nfs_formats::ctr::PartKind::Rect {
                 continue;
             }
-            let at = |key: &str| p.value(key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)));
+            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)));
             let Some((x, y)) = at("pos") else { continue };
             let Some((w, h)) = at("size") else { continue };
             // a colour may be a literal or a reference to one of the `data` attributes
-            let colour = p
-                .value("color")
+            let colour = self
+                .part_attr(e, p, "color")
                 .and_then(|v| parse_color(v).or_else(|| v.split_once('.').and_then(|(_, key)| self.attr(e, key)).and_then(parse_color)));
             let Some(colour) = colour else { continue };
             out.push((x as f32, y as f32, w as f32, h as f32, colour));
         }
         out
+    }
+
+    /// A part's colour attribute: a literal `0x…`, or an **expression** over the widget's own
+    /// attributes — `GoToButton.ctr` writes its caption's colour as
+    /// `data.medium?0x00000000:0xffffffff`, so which of its three labels is opaque is arithmetic.
+    fn part_colour(&self, e: &nfs_formats::lay::Element, p: &nfs_formats::ctr::Part, key: &str) -> Option<[u8; 4]> {
+        let v = self.part_attr(e, p, key)?;
+        if let Some(c) = parse_color(v) {
+            return Some(c);
+        }
+        let n = nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0, true))?;
+        if !(0.0..=4294967295.0).contains(&n) {
+            return None;
+        }
+        let n = n as u32;
+        Some([((n >> 16) & 0xFF) as u8, ((n >> 8) & 0xFF) as u8, (n & 0xFF) as u8, (n >> 24) as u8])
+    }
+
+    /// The `RECT` parts of one state of the widget's class, each resolved to a rectangle and a
+    /// colour, with the fully transparent ones dropped. Unlike [`rect_parts`](Self::rect_parts)
+    /// this takes the state by name — a button's highlight is `[state.selected]`, which the `.lay`
+    /// block never says — and it evaluates the colour as an expression.
+    fn state_rects(&self, e: &nfs_formats::lay::Element, state: &str) -> Vec<(f32, f32, f32, f32, [u8; 4])> {
+        let Some(c) = self.controls.get(&e.class) else { return Vec::new() };
+        let mut out = Vec::new();
+        for p in c.state_parts(state).iter().filter_map(|n| c.part(n)) {
+            if p.kind() != nfs_formats::ctr::PartKind::Rect {
+                continue;
+            }
+            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)));
+            let (Some((px, py)), Some((pw, ph))) = (at("pos"), at("size")) else { continue };
+            let Some(col) = self.part_colour(e, p, "color").filter(|c| c[3] != 0) else { continue };
+            out.push((px as f32, py as f32, pw as f32, ph as f32, col));
+        }
+        out
+    }
+
+    /// One part attribute with the `%…%` indirection resolved: `%<part>.<key>%` is that part's
+    /// value for that key, which is how `GoToButton.ctr`'s two spare captions say
+    /// `stringID.value=%label.stringID%` — "the same string the first one shows".
+    fn part_ref<'a>(&'a self, e: &'a nfs_formats::lay::Element, p: &'a nfs_formats::ctr::Part, key: &str) -> Option<String> {
+        let v = self.part_attr(e, p, key)?;
+        let Some(inner) = v.strip_prefix('%').and_then(|v| v.strip_suffix('%')) else {
+            return Some(v.to_string());
+        };
+        let (part, k) = inner.split_once('.')?;
+        if part == "data" {
+            return e.get(k).map(str::to_string);
+        }
+        let q = self.controls.get(&e.class)?.part(part)?;
+        self.part_attr(e, q, k).map(str::to_string)
+    }
+
+    /// Draw a widget entirely out of its class template: the `RECT` parts of the state, then its
+    /// `SHAPE` parts, then its `TEXT` / `LOCALIZEDTEXT` parts — each where the template puts it,
+    /// in the font and colour it names, and skipping any whose colour is fully transparent. That
+    /// last rule is how a class carries several captions and shows one (`controls.md` §4.3).
+    #[allow(clippy::too_many_arguments)]
+    fn template_widget(&self, out: &mut Vec<Sprite>, aspect: f32, e: &nfs_formats::lay::Element, state: &str, x: f32, y: f32, strings: &Strings) {
+        for (px, py, pw, ph, col) in self.state_rects(e, state) {
+            out.push(self.quad(aspect, x + px, y + py, pw.max(1.0), ph.max(1.0), tint(col)));
+        }
+        for (px, py, pw, ph, file, index, flip) in self.shape_parts(e) {
+            let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
+            let (dw, dh) = (if pw > 0.0 { pw } else { aw }, if ph > 0.0 { ph } else { ah });
+            let (pos, size) = self.place(aspect, x + px, y + py, dw, dh);
+            let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
+            let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
+            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+        }
+        let Some(c) = self.controls.get(&e.class) else { return };
+        for p in c.state_parts(state).iter().filter_map(|n| c.part(n)) {
+            let text = match p.kind() {
+                nfs_formats::ctr::PartKind::LocalizedText => {
+                    let id = self.part_ref(e, p, "stringID").and_then(|v| v.trim().parse::<u32>().ok());
+                    match id.filter(|n| *n != 0).and_then(|n| strings.get(n)) {
+                        Some(t) if !t.is_empty() => t.to_string(),
+                        _ => continue,
+                    }
+                }
+                nfs_formats::ctr::PartKind::Text => match self.part_ref(e, p, "text").filter(|t| !t.is_empty()) {
+                    Some(t) => t,
+                    None => continue,
+                },
+                _ => continue,
+            };
+            let Some(col) = self.part_colour(e, p, "foreColor").filter(|c| c[3] != 0) else { continue };
+            let (px, py) = self
+                .part_attr(e, p, "pos")
+                .and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)))
+                .unwrap_or((0.0, 0.0));
+            let Some(f) = self
+                .part_attr(e, p, "fontPathName")
+                .map(|f| f.to_lowercase())
+                .and_then(|f| self.fonts.get(&f))
+                .or_else(|| self.fonts.get(DEFAULT_FONT))
+            else {
+                continue;
+            };
+            self.text(out, aspect, f, &text, x + px as f32, y + py as f32, 0.0, 0, tint(col));
+        }
+    }
+
+    /// One attribute of one part, resolved the way the original does: the `.lay` block's value for
+    /// the attribute's **screen key** when it has one, else the template's `<key>.value`
+    /// (`nfs_formats::ctr::Part::screen_key`, 0x52BC90 / 0x52BFB4 / 0x52C000).
+    fn part_attr<'a>(&self, e: &'a nfs_formats::lay::Element, p: &'a nfs_formats::ctr::Part, key: &str) -> Option<&'a str> {
+        if let Some(k) = p.screen_key(key)
+            && let Some(v) = e.get(&k).filter(|v| !v.is_empty())
+        {
+            return Some(v);
+        }
+        // an **empty** `<key>.value` is not a value: `Graphic Tab Button.ctr` writes `size.value=`
+        // on the parts whose size is their art's, and `shapePathName.value=` on the two whose pack
+        // only the screen key names. Reading either as a value can only fail.
+        p.value(key).filter(|v| !v.trim().is_empty())
     }
 
     /// The `SHAPE` parts of the widget's class template that its `state` draws, each resolved to a
@@ -637,26 +1091,26 @@ impl LayoutScreen {
     /// part `shapePathName=weeicons.fsh` and `shapeIndex=data.nonselindex`, so the widget's own
     /// `nonselindex` picks the arrow. The same shape covers `NFS5.POPUPCIRCLE`,
     /// `NFS5.ExtraCircle`, the tab buttons and the rest of the art-from-template classes.
-    fn shape_parts(&self, e: &nfs_formats::lay::Element) -> Vec<(f32, f32, f32, f32, String, usize)> {
-        // `NFS5.POPUPCIRCLE` is the frame of a **modal popup**, not part of the screen behind it:
-        // `PopUp.ctr` pins it at `pos=113,100` (`HIDDEN|READONLY`) and builds a 414×350 frame out of
-        // one 207×175 quarter mirrored four ways (`p1`…`p4`, `flip` 0…3), and its states are
-        // `normal` and `hidden`. Nineteen screens carry one — `repair`, `VictoryMessage`,
-        // `accountlogin`, `createplayer` — and all of them are screens that can raise a dialog.
+    fn shape_parts(&self, e: &nfs_formats::lay::Element) -> Vec<(f32, f32, f32, f32, String, usize, i64)> {
+        // `NFS5.POPUPCIRCLE` is a **modal panel the game raises**, not part of the screen behind
+        // it, and it is skipped until this port has somewhere to raise one from. Three measurements
+        // say so, and drawing it anyway was tried and looks exactly as they predict:
         //
-        // This port never raises one, so drawing the frame leaves it standing over the screen for
-        // ever, which is what it did on `repair.lay`. The widget is skipped until the port has
-        // popup state. **Not** because of `swrenderoff`: that key reaches `[widget+0x13C]` at
-        // 0x4C7733 and 0x4C7750 and a scan of the whole `.text` for the displacement finds those
-        // two writes and **no read at all**, so it is dead in this build (CONFIRMED by exhaustion).
+        // * `PopUp.ctr` pins it at `pos=113,100` (`HIDDEN|READONLY`) and tiles **one** 207×175
+        //   quarter four ways — `p1`…`p4` at (0,0), (207,0), (0,175), (207,175) with `flip` 0…3 —
+        //   so it is a 414×350 oval over the middle of a 640×480 screen, not a border around it;
+        // * the template's states are `normal` and **`hidden`**, and `[state.hidden]` draws only
+        //   `data`, which is nothing;
+        // * in **18 of the 19** layouts that carry one it is the **last** section, so it draws over
+        //   everything else. (The exception is `factdone.lay`, where a `NFS5.HEADER` follows it.)
+        //
+        // Drawn unconditionally on `selectname.lay` it covers the profile list and the buttons with
+        // a translucent oval, which is what a panel meant to be raised over them would do.
+        //
+        // **Not** skipped because of `swrenderoff`: that key reaches `[widget+0x13C]` at 0x4C7733
+        // and 0x4C7750 and a scan of the whole `.text` for the displacement finds those two writes
+        // and **no read at all**, so it is dead in this build (CONFIRMED by exhaustion).
         if e.class == "NFS5.POPUPCIRCLE" {
-            return Vec::new();
-        }
-        // a part's `shapePathName.value` is that part's **default**; a widget that names its own
-        // overrides it, and then the widget's own pair is what gets drawn (the `e.shape()` path
-        // below). Without this, every `NFS5.PICTURE` would also draw `Picture.ctr`'s placeholder —
-        // `pointer.fsh` entry 0, an arrow — on top of its real art.
-        if e.get("shapePathName").is_some_and(|v| !v.is_empty()) {
             return Vec::new();
         }
         let Some(c) = self.controls.get(&e.class) else { return Vec::new() };
@@ -666,19 +1120,41 @@ impl LayoutScreen {
             if p.kind() != nfs_formats::ctr::PartKind::Shape {
                 continue;
             }
-            let Some(file) = p.value("shapePathName").filter(|v| !v.is_empty()) else { continue };
+            // A part's `shapePathName.value` and `shapeIndex.value` are that part's **defaults**,
+            // and the `.lay` block's own keys override them — the ordinary attribute rule of
+            // `RE/notes/controls.md` §1, nothing special about these two. Five classes name their
+            // own pack: `NFS5.PICTURE` (484 of them) also names the entry, so its single part
+            // resolves to exactly the pair the widget carries; `NFS5.BOTTOMBARBUTTON`,
+            // `NFS5.CheckBox`, `NFS5.AnimatingPicture` and `NFS5.CarSettingSlider` name only the
+            // pack and keep the part's index — `data.startframe`, `data.onIndex`,
+            // `data.start_frame` and the literal 8 of `CarSettingSlider.ctr`'s knob.
+            //
+            // The port used to give up on the whole part list as soon as a widget named a pack and
+            // draw the widget's own pair instead, which is the same picture for a `NFS5.PICTURE`
+            // and the **wrong entry** for the other four: every bottom-bar button drew `logoAn`
+            // entry 0 where its `startframe` says 11, and every car-setting slider entry 0 of
+            // `weeicons.fsh` where its knob is entry 8.
+            let Some(file) = self.part_attr(e, p, "shapePathName").filter(|v| !v.is_empty()) else { continue };
             // `shapeIndex` is a literal or a `data.<key>` reference to the widget's own attribute
-            let index = match p.value("shapeIndex") {
-                Some(v) => match nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0)) {
+            let index = match self.part_attr(e, p, "shapeIndex") {
+                Some(v) => match nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0, true)) {
                     Some(n) if n >= 0.0 => n as usize,
                     _ => continue,
                 },
                 None => 0,
             };
-            let at = |key: &str| p.value(key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)));
+            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)));
             let (px, py) = at("pos").unwrap_or((0.0, 0.0));
             let (pw, ph) = at("size").unwrap_or((0.0, 0.0));
-            out.push((px as f32, py as f32, pw as f32, ph as f32, file.to_string(), index));
+            // `flip` is the part's own attribute — `Graphic Tab Button.ctr` writes
+            // `flip.value=data.flipit`, so the widget's `flipit` mirrors the tab's art
+            let flip = self
+                .part_attr(e, p, "flip")
+                .and_then(|v| nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0, true)))
+                .filter(|n| *n >= 0.0)
+                .map(|n| n as i64)
+                .unwrap_or_else(|| e.int("flip").unwrap_or(0).max(0));
+            out.push((px as f32, py as f32, pw as f32, ph as f32, file.to_string(), index, flip));
         }
         out
     }
@@ -747,6 +1223,7 @@ impl LayoutScreen {
 
     /// Advance the transition clock by one frame; `true` once the screen has settled or gone.
     pub fn advance_transition(&mut self, dt_ms: u32) -> bool {
+        self.clock_ms = self.clock_ms.wrapping_add(dt_ms);
         self.transition = self.transition.advance(dt_ms);
         if let Some(b) = self.background.as_mut() {
             b.advance_transition(dt_ms);
@@ -810,6 +1287,12 @@ impl LayoutScreen {
     /// Fill a list box with the rows its accessor would hand out, and say which row the accessor
     /// has selected (`current` — the row the original paints with `highlightcolorselected`).
     pub fn set_list_rows(&mut self, index: usize, rows: Vec<ListRow>, current: Option<usize>) {
+        if let Some((k, j)) = self.route(index) {
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.set_list_rows(j, rows, current);
+            }
+            return;
+        }
         if rows.is_empty() {
             self.lists.remove(&index);
         } else {
@@ -822,6 +1305,12 @@ impl LayoutScreen {
     /// is drawn in the widget's own place in the layout order, which is what puts it over the art
     /// behind it and under the art in front.
     pub fn set_car_view(&mut self, index: usize, view: Option<TextureId>) {
+        if let Some((k, j)) = self.route(index) {
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.set_car_view(j, view);
+            }
+            return;
+        }
         match view {
             Some(t) => self.car_views.insert(index, t),
             None => self.car_views.remove(&index),
@@ -869,6 +1358,48 @@ impl LayoutScreen {
     /// constructor takes both keys (0x4CA24F `data.othersource`, 0x4CA27E `data.accessor`) and its
     /// value getter tries the `othersource` names first, falling through to the accessor at
     /// 0x4CA974. The flag says which of the two the name came from.
+    /// How many index slots this screen occupies: its own widgets, then every layout its panels
+    /// and tab strips embed, in widget order. Binding a screen's content is keyed by widget index
+    /// (`set_bar`, `set_list_rows`, …), and a panel's sub-layout is as much a part of the screen as
+    /// the widgets beside it — the audio sliders of `Options.lay` live in `audioreal.lay`, three
+    /// files down. This flattening is what lets one index reach them.
+    fn span(&self) -> usize {
+        self.layout.elements.len() + self.groups.values().map(|g| g.span()).sum::<usize>()
+    }
+
+    /// Every embedded screen with the index its own slot 0 sits at, in widget order.
+    fn group_spans(&self) -> Vec<(usize, &LayoutScreen)> {
+        let mut keys: Vec<usize> = self.groups.keys().copied().collect();
+        keys.sort_unstable();
+        let mut base = self.layout.elements.len();
+        let mut out = Vec::new();
+        for k in keys {
+            let g = &self.groups[&k];
+            out.push((base, g.as_ref()));
+            base += g.span();
+        }
+        out
+    }
+
+    /// Which embedded screen an index belongs to, and its index there. `None` means this screen's
+    /// own — an index past the end routes nowhere and every setter drops it.
+    fn route(&self, index: usize) -> Option<(usize, usize)> {
+        if index < self.layout.elements.len() {
+            return None;
+        }
+        let mut keys: Vec<usize> = self.groups.keys().copied().collect();
+        keys.sort_unstable();
+        let mut base = self.layout.elements.len();
+        for k in keys {
+            let span = self.groups[&k].span();
+            if index < base + span {
+                return Some((k, index - base));
+            }
+            base += span;
+        }
+        None
+    }
+
     pub fn indicator_bars(&self) -> Vec<(usize, String, bool)> {
         self.layout
             .elements
@@ -881,11 +1412,59 @@ impl LayoutScreen {
                     None => e.get("accessor").filter(|a| !a.is_empty()).map(|a| (index, a.to_string(), false)),
                 }
             })
+            .chain(self.group_spans().into_iter().flat_map(|(base, g)| g.indicator_bars().into_iter().map(move |(i, a, o)| (i + base, a, o))))
             .collect()
+    }
+
+    /// Every `NFS5.CarSettingSlider` and the accessor it watches, in the flattened index space.
+    pub fn car_setting_sliders(&self) -> Vec<(usize, String)> {
+        self.layout
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.class == "NFS5.CarSettingSlider")
+            .filter_map(|(index, e)| e.get("accessor").filter(|a| !a.is_empty()).map(|a| (index, a.to_string())))
+            .chain(self.group_spans().into_iter().flat_map(|(base, g)| g.car_setting_sliders().into_iter().map(move |(i, a)| (i + base, a))))
+            .collect()
+    }
+
+    /// Tick or untick one `NFS5.CheckBox`.
+    pub fn set_check(&mut self, index: usize, value: Option<bool>) {
+        if let Some((k, j)) = self.route(index) {
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.set_check(j, value);
+            }
+            return;
+        }
+        match value {
+            Some(v) => self.checks.insert(index, v),
+            None => self.checks.remove(&index),
+        };
+    }
+
+    /// Put one slider's knob where its accessor is: the index it is on and how many entries its
+    /// list has. Without it the knob sits at the track's left end.
+    pub fn set_knob(&mut self, index: usize, value: Option<(i32, i32)>) {
+        if let Some((k, j)) = self.route(index) {
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.set_knob(j, value);
+            }
+            return;
+        }
+        match value {
+            Some(v) => self.knobs.insert(index, v),
+            None => self.knobs.remove(&index),
+        };
     }
 
     /// Give one indicator bar its value, or `None` to leave it blank.
     pub fn set_bar(&mut self, index: usize, value: Option<i32>) {
+        if let Some((k, j)) = self.route(index) {
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.set_bar(j, value);
+            }
+            return;
+        }
         match value {
             Some(v) => self.bars.insert(index, v),
             None => self.bars.remove(&index),
@@ -910,6 +1489,7 @@ impl LayoutScreen {
             .enumerate()
             .filter(|(_, e)| e.class == class)
             .map(|(index, e)| (index, e.int("number").unwrap_or(0)))
+            .chain(self.group_spans().into_iter().flat_map(|(base, g)| g.numbered_widgets(class).into_iter().map(move |(i, n)| (i + base, n))))
             .collect()
     }
 
@@ -926,6 +1506,12 @@ impl LayoutScreen {
     ///   `number` 0…7 to widgets whose `size` matches entry `number`'s dimensions on all eight
     ///   (128×90, 127×90, 128×91, 127×91, twice). CONFIRMED by that match.
     pub fn set_pack_picture(&mut self, r: &mut Renderer, paths: &GamePaths, dir: &str, index: usize, file: &str, entry: usize) {
+        if let Some((k, j)) = self.route(index) {
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.set_pack_picture(r, paths, dir, j, file, entry);
+            }
+            return;
+        }
         if file.is_empty() {
             self.logos.remove(&index);
             return;
@@ -948,6 +1534,167 @@ impl LayoutScreen {
         self.logos.insert(index, key);
     }
 
+    /// Bind a `NFS5.MOVIEBOX` to a `.mad` and start it playing.
+    ///
+    /// The whole file is kept, its video chunks indexed, and one texture allocated to decode into.
+    /// [`LayoutScreen::advance_movies`] steps it; the period is the header's own (see
+    /// [`MoviePlayer`]).
+    pub fn set_movie(&mut self, r: &mut Renderer, paths: &GamePaths, index: usize, dir: &str, file: &str) {
+        if let Some((k, j)) = self.route(index) {
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.set_movie(r, paths, j, dir, file);
+            }
+            return;
+        }
+        if self.movies.contains_key(&index) {
+            return;
+        }
+        let Some(path) = GamePaths::find_file(&paths.fe_data().join(dir), file) else { return };
+        let (Ok(exe), Ok(data)) = (std::fs::read(paths.root.join("nfs5.exe")), std::fs::read(&path)) else { return };
+        let Ok(tables) = nfs_formats::mad::MadTables::from_exe(&exe) else { return };
+        let chunks: Vec<(usize, usize)> = {
+            let mut at = 0usize;
+            let mut out = Vec::new();
+            for c in nfs_formats::mad::chunks(&data) {
+                if c.is_video() {
+                    out.push((at, c.data.len()));
+                }
+                at += c.data.len();
+            }
+            out
+        };
+        let Some(&(off, len)) = chunks.first() else { return };
+        let Ok(header) = nfs_formats::mad::MadHeader::parse(&data[off..off + len]) else { return };
+        let mut decoder = nfs_formats::mad::MadDecoder::new(tables, &header);
+        let f = decoder.decode_frame(&data[off..off + len]);
+        if f.width == 0 || f.height == 0 {
+            return;
+        }
+        let tex = r.upload_texture(&TextureData::single(f.width as u32, f.height as u32, f.rgba));
+        self.movies.insert(
+            index,
+            MoviePlayer {
+                data,
+                chunks,
+                decoder,
+                next: 1,
+                period_q16: header.period.max(1) as u64,
+                clock_q16: 0,
+                tex,
+                size: (f.width as f32, f.height as f32),
+            },
+        );
+    }
+
+    /// True when this screen — or the one behind it — has a movie playing.
+    pub fn has_movies(&self) -> bool {
+        !self.movies.is_empty() || self.background.as_ref().is_some_and(|b| b.has_movies())
+    }
+
+    /// Step every `NFS5.MOVIEBOX` on this screen by `dt_ms`, decoding and uploading the frames its
+    /// own period calls for. A movie that has run out starts again, which is what a front-end loop
+    /// does.
+    pub fn advance_movies(&mut self, r: &mut Renderer, dt_ms: u32) {
+        for m in self.movies.values_mut() {
+            m.clock_q16 += (dt_ms as u64) << 16;
+            let mut drawn = None;
+            while m.clock_q16 >= m.period_q16 {
+                m.clock_q16 -= m.period_q16;
+                if m.next >= m.chunks.len() {
+                    m.next = 0;
+                }
+                let (off, len) = m.chunks[m.next];
+                m.next += 1;
+                let _ = m.decoder.decode_chunk(&m.data[off..off + len]);
+                drawn = Some(());
+            }
+            if drawn.is_some() {
+                let (w, h) = (m.size.0 as u32, m.size.1 as u32);
+                r.update_texture(m.tex, &TextureData::single(w, h, m.decoder.rgba()));
+            }
+        }
+        if let Some(b) = self.background.as_mut() {
+            b.advance_movies(r, dt_ms);
+        }
+    }
+
+    /// Bind a `NFS5.KNOCKOUTTRACKLIST`: how many rows the knockout has and which one is current.
+    pub fn set_ko_strip(&mut self, index: usize, rows: usize, current: usize) {
+        if let Some((k, j)) = self.route(index) {
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.set_ko_strip(j, rows, current);
+            }
+            return;
+        }
+        self.ko_strip.insert(index, (rows, current));
+    }
+
+    /// Bind the events a `NFS5.TrackSmall2dSpline` shows. Each one's `<art>.fsh` is loaded and its
+    /// entries 0 (the map) and 1/2 (the start and finish markers) are uploaded at the position the
+    /// entry header itself carries — see [`nfs_assets::texture::TextureImage::place`].
+    pub fn set_track_map(&mut self, r: &mut Renderer, paths: &GamePaths, index: usize, events: &[TrackMapEvent]) {
+        if let Some((k, j)) = self.route(index) {
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.set_track_map(r, paths, j, events);
+            }
+            return;
+        }
+        let dir = paths.fe_data().join("TrackArt");
+        let mut out = Vec::with_capacity(events.len());
+        for ev in events {
+            let entries = GamePaths::find_file(&dir, &format!("{}.fsh", ev.art))
+                .and_then(|p| std::fs::read(&p).ok().map(|d| (p, d)))
+                .and_then(|(p, d)| decode_pack(&p, &d).ok())
+                .unwrap_or_default();
+            let mut upload = |k: usize| -> Option<(TextureId, f32, f32, f32, f32)> {
+                let img = entries.get(k)?;
+                let px = img.mips.first()?;
+                let key = (ev.art.clone(), k);
+                let &mut (tex, w, h) = self.shapes.entry(key).or_insert_with(|| {
+                    let id = r.upload_texture(&TextureData::single(img.width, img.height, px.clone()));
+                    (id, img.width as f32, img.height as f32)
+                });
+                Some((tex, w, h, img.place[0] as f32, img.place[1] as f32))
+            };
+            let map = upload(0);
+            let marker = upload(if ev.backwards { 2 } else { 1 });
+            out.push(TrackMapArt { map, marker, name: ev.name.clone() });
+        }
+        self.track_maps.insert(index, out);
+    }
+
+    /// Bind a `NFS5.BADGE` — the Factory Driver licence card.
+    ///
+    /// `pack` is the card (`license`, `license2`, `license3`, `license4` by stage, 0x4CF1C8), `name`
+    /// the player's name (0x501270 returns the global the front end keeps it in), `rank` the line
+    /// under it and `colour` the colour the name is printed in. The drop shadow is loaded here too.
+    pub fn set_badge(&mut self, r: &mut Renderer, paths: &GamePaths, index: usize, pack: &str, name: &str, rank: &str, colour: [f32; 4]) {
+        if let Some((k, j)) = self.route(index) {
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.set_badge(r, paths, j, pack, name, rank, colour);
+            }
+            return;
+        }
+        self.set_pack_picture(r, paths, "Art", index, pack, 0);
+        for entry in [0usize, 1] {
+            if self.shapes.contains_key(&(LICENSE_SHADOW.to_string(), entry)) {
+                continue;
+            }
+            let dir = paths.fe_data().join("Art");
+            let Some(img) = GamePaths::find_file(&dir, LICENSE_SHADOW)
+                .and_then(|p| std::fs::read(&p).ok().map(|d| (p, d)))
+                .and_then(|(p, d)| decode_pack(&p, &d).ok())
+                .and_then(|v| v.into_iter().nth(entry))
+            else {
+                continue;
+            };
+            let Some(px) = img.mips.first() else { continue };
+            let id = r.upload_texture(&TextureData::single(img.width, img.height, px.clone()));
+            self.shapes.insert((LICENSE_SHADOW.to_string(), entry), (id, img.width as f32, img.height as f32));
+        }
+        self.badges.insert(index, (name.to_string(), rank.to_string(), colour));
+    }
+
     /// Point a `NFS5.CarLogo` at a **chronicle** picture instead of a car logo.
     ///
     /// The chronicle's own art is not in `FEData/Art` and is not a logo pair: `0x50757F` builds the
@@ -956,6 +1703,12 @@ impl LayoutScreen {
     /// group at `[0x5DBA44]`, the year mod 100, a 1-based index within the year, and a variant
     /// `'a' + n`. `.mad` is the same name for the movie. So one whole image, drawn on its own.
     pub fn set_chronicle_picture(&mut self, r: &mut Renderer, paths: &GamePaths, index: usize, file: &str) {
+        if let Some((k, j)) = self.route(index) {
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.set_chronicle_picture(r, paths, j, file);
+            }
+            return;
+        }
         if file.is_empty() {
             self.logos.remove(&index);
             return;
@@ -969,33 +1722,48 @@ impl LayoutScreen {
                 .and_then(|p| std::fs::read(&p).ok().map(|d| (p, d)))
                 .and_then(|(p, d)| decode_pack(&p, &d).ok())
                 .unwrap_or_default();
-            // the picture is the run of tiles tagged `1111` — the same tag the control's own name
-            // carries at 0x5DBBFE — laid side by side; `bi` and `ci` are its 41×25 icons and the
-            // `Laye` entries a second layer.
-            //
-            // **APPROXIMATION**: the tiles are joined in pack order, left to right. Where each one
-            // actually belongs is in the `.fsh` entry's own attachment record, which has not been
-            // read, so a picture whose tiles are not stored in reading order comes out shuffled.
-            let tiles: Vec<&nfs_assets::texture::TextureImage> = entries.iter().filter(|t| t.name.trim() == CHRONICLE_PICTURE_TAG).collect();
-            let (w, h) = (tiles.iter().map(|t| t.width).sum::<u32>(), tiles.iter().map(|t| t.height).max().unwrap_or(0));
-            if w == 0 || h == 0 {
+            // The picture is a **grid**, and `FEChroniclePicture::draw` (0x508310) measures it:
+            // it scans the pack from entry **2** — 0 and 1 are the `bi` and `ci` icons — counting
+            // the leading run of entries tagged `1111` as the number of columns (0x5083EF…0x508443),
+            // summing those widths for the picture's width and the height of every row's first
+            // entry for its height, and then blits entry `2 + row*cols + col` at the running
+            // column x and row y (0x50856A…0x50861E). A pack's second row is tagged `Laye`, not
+            // `1111`, which is why only the first row is matched by name. CONFIRMED by the size:
+            // `MA601a.fsh` measures 4 × (128+128+128+74) by (148+138) = 458×286, and both
+            // `chroniclepicture.lay` and `chroniclemedia.lay` give the widget `size=458,286`.
+            let tiles: Vec<&nfs_assets::texture::TextureImage> = entries.iter().skip(2).collect();
+            let cols = tiles.iter().take_while(|t| t.name.trim() == CHRONICLE_PICTURE_TAG).count();
+            if cols == 0 || tiles.is_empty() {
                 tracing::debug!(file, entries = entries.len(), "chronicle picture has no `1111` tiles");
                 self.logos.remove(&index);
                 return;
             }
+            let rows = tiles.len() / cols;
+            let w: u32 = tiles[..cols].iter().map(|t| t.width).sum();
+            let h: u32 = (0..rows).map(|r| tiles[r * cols].height).sum();
+            if w == 0 || h == 0 {
+                self.logos.remove(&index);
+                return;
+            }
             let mut rgba = vec![0u8; (w * h * 4) as usize];
-            let mut x0 = 0u32;
-            for t in &tiles {
-                let Some(px) = t.mips.first() else { continue };
-                for y in 0..t.height {
-                    let src = (y * t.width * 4) as usize;
-                    let dst = ((y * w + x0) * 4) as usize;
-                    let n = (t.width * 4) as usize;
-                    if src + n <= px.len() && dst + n <= rgba.len() {
-                        rgba[dst..dst + n].copy_from_slice(&px[src..src + n]);
+            let mut y0 = 0u32;
+            for r in 0..rows {
+                let mut x0 = 0u32;
+                for c in 0..cols {
+                    let t = tiles[r * cols + c];
+                    if let Some(px) = t.mips.first() {
+                        for y in 0..t.height.min(h.saturating_sub(y0)) {
+                            let src = (y * t.width * 4) as usize;
+                            let dst = (((y + y0) * w + x0) * 4) as usize;
+                            let n = (t.width.min(w.saturating_sub(x0)) * 4) as usize;
+                            if src + n <= px.len() && dst + n <= rgba.len() {
+                                rgba[dst..dst + n].copy_from_slice(&px[src..src + n]);
+                            }
+                        }
                     }
+                    x0 += t.width;
                 }
-                x0 += t.width;
+                y0 += tiles[r * cols].height;
             }
             let id = r.upload_texture(&TextureData::single(w, h, rgba));
             self.shapes.insert((file.to_string(), 0), (id, w as f32, h as f32));
@@ -1008,6 +1776,12 @@ impl LayoutScreen {
     /// `FEData/Art/<pack>.fsh` (`NFS5.CarLogo::update` 0x4C1A63 — the index is the pair doubled,
     /// and the pair past the end of the pack draws nothing, 0x4C1AF6). CONFIRMED.
     pub fn set_car_logo(&mut self, r: &mut Renderer, paths: &GamePaths, index: usize, pack: &str, pair: i16) {
+        if let Some((k, j)) = self.route(index) {
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.set_car_logo(r, paths, j, pack, pair);
+            }
+            return;
+        }
         if pack.is_empty() || pair < 0 {
             self.logos.remove(&index);
             return;
@@ -1220,7 +1994,10 @@ impl LayoutScreen {
     fn sprites_reporting(&self, aspect: f32, strings: &Strings, selected: Option<usize>, accessor: &dyn Fn(&str) -> Option<String>, blank: &mut Vec<(String, String)>) -> Vec<Sprite> {
         let mut out = Vec::new();
         if let Some(bg) = &self.background {
-            out.extend(bg.sprites_reporting(aspect, strings, None, accessor, blank));
+            // the background's own gaps are not this screen's: every background layout is one of
+            // the 98 in `FEData/Layouts` and the sweep measures it in its own right, so reporting
+            // it here would count it once per screen that sits on it
+            out.extend(bg.sprites_reporting(aspect, strings, None, accessor, &mut Vec::new()));
         }
         let bg_end = out.len();
         // `NFS_REVERSE_ORDER=1` draws the widgets back to front instead of file order (probe for
@@ -1237,6 +2014,12 @@ impl LayoutScreen {
             let (x, y) = (x + tdx, y + tdy);
             let (w, h) = self.box_of(e, 0);
             let first = out.len();
+            // the widget's `state` selects a part list that draws nothing at all — it is erased,
+            // not undrawn, so it is not counted as a gap either
+            if self.state_draws_nothing(e) {
+                continue;
+            }
+            let mut closed = false;
             'elem: {
             match e.class.as_str() {
                 // the screen itself: a full-screen fill
@@ -1253,27 +2036,70 @@ impl LayoutScreen {
                 }
                 // `NFS_NO_GOURAUD=1` skips them — the probe for which sprites bury the text
                 "NFS5.GOURAUDBOX" if std::env::var("NFS_NO_GOURAUD").is_ok() => {}
+                // `FEGouraudBox::draw` **0x4C9F60…0x4CA095**. It is one gouraud-shaded quad whose
+                // four corners are placed **independently**, and the port had been drawing an
+                // axis-aligned rectangle — wrong for the 270-odd of the 576 shipped boxes that
+                // carry a corner offset.
+                //
+                // The draw takes the widget's position (0x525360) and box, and its fade
+                // (0x4C8840), then pushes four `(colour, x, y)` triples to the quad primitive
+                // 0x4D98D0 — bottom-right first, then bottom-left, top-right, top-left:
+                //
+                // ```text
+                //   UL = (x + ULoffX,     y + ULoffY)          colour cUL   [this+0x150/0x154]
+                //   UR = (x + URoffX + w, y + URoffY)                 cUR   [this+0x158/0x15C]
+                //   BL = (x + BLoffX,     y + BLoffy + h)             cBL   [this+0x160/0x164]
+                //   BR = (x + BRoffX + w, y + BRoffY + h)             cBR   [this+0x168/0x16C]
+                // ```
+                //
+                // — the eight offsets bound at 0x4C9E8A…0x4C9F1A, and the file really does spell
+                // the third one `BLoffy` with a small `y` (the string at 0x5D865C). Each colour
+                // goes through 0x4D87F0 first, which leaves it alone at a fade of 0xFF and
+                // otherwise scales *its own alpha byte* by the fade — the same thing this port
+                // does to every sprite after the fact.
+                //
+                // The sprite pipeline has one colour per axis-aligned quad, so the box is still a
+                // grid of cells, but now bilinear in **position** as well as colour, which gets
+                // the skew. APPROXIMATION, and the grid is only subdivided along an axis that
+                // actually varies.
                 "NFS5.GOURAUDBOX" => {
-                    // the four corner colours are `cUL cUR cBL cBR`; the sprite pipeline has one colour
-                    // per quad, so the box is drawn as a grid of bilinearly interpolated cells
-                    // (APPROXIMATION — the original draws one gouraud-shaded quad). The grid is only
-                    // subdivided along the axes the colour actually varies on.
                     let c = |k: &str| e.color(k).map(tint).unwrap_or([0.0, 0.0, 0.0, 0.0]);
                     let (ul, ur, bl, br) = (c("cUL"), c("cUR"), c("cBL"), c("cBR"));
+                    let off = |k: &str| e.int(k).unwrap_or(0) as f32;
+                    let corner = [
+                        [x + off("ULoffX"), y + off("ULoffY")],
+                        [x + off("URoffX") + w, y + off("URoffY")],
+                        [x + off("BLoffX"), y + off("BLoffy") + h],
+                        [x + off("BRoffX") + w, y + off("BRoffY") + h],
+                    ];
                     let differs = |a: [f32; 4], b: [f32; 4]| (0..4).any(|j| (a[j] - b[j]).abs() > 1.0 / 255.0);
-                    let nx = if differs(ul, ur) || differs(bl, br) { 16 } else { 1 };
-                    let ny = if differs(ul, bl) || differs(ur, br) { 16 } else { 1 };
+                    let moved = |a: [f32; 2], b: [f32; 2], d: usize| (a[d] - b[d]).abs() > 0.5;
+                    // x varies if the two top corners differ from each other, or the sides slant
+                    let skew_x = moved(corner[0], corner[2], 0) || moved(corner[1], corner[3], 0);
+                    let skew_y = moved(corner[0], corner[1], 1) || moved(corner[2], corner[3], 1);
+                    let nx = if differs(ul, ur) || differs(bl, br) || skew_x || skew_y { 16 } else { 1 };
+                    let ny = if differs(ul, bl) || differs(ur, br) || skew_x || skew_y { 16 } else { 1 };
+                    let at = |u: f32, v: f32, d: usize| {
+                        let top = corner[0][d] + (corner[1][d] - corner[0][d]) * u;
+                        let bot = corner[2][d] + (corner[3][d] - corner[2][d]) * u;
+                        top + (bot - top) * v
+                    };
                     for gy in 0..ny {
                         for gx in 0..nx {
-                            let (u, v) = ((gx as f32 + 0.5) / nx as f32, (gy as f32 + 0.5) / ny as f32);
+                            let (u0, v0) = (gx as f32 / nx as f32, gy as f32 / ny as f32);
+                            let (u1, v1) = ((gx + 1) as f32 / nx as f32, (gy + 1) as f32 / ny as f32);
+                            let (u, v) = ((u0 + u1) * 0.5, (v0 + v1) * 0.5);
                             let mut col = [0.0f32; 4];
                             for j in 0..4 {
                                 let top = ul[j] + (ur[j] - ul[j]) * u;
                                 let bot = bl[j] + (br[j] - bl[j]) * u;
                                 col[j] = top + (bot - top) * v;
                             }
-                            let (cw, ch) = (w / nx as f32, h / ny as f32);
-                            out.push(self.quad(aspect, x + gx as f32 * cw, y + gy as f32 * ch, cw, ch, col));
+                            // the cell's own corners, so a slanted edge is followed a step at a time
+                            let (px, py) = (at(u0, v0, 0).min(at(u0, v1, 0)), at(u0, v0, 1).min(at(u1, v0, 1)));
+                            let cw = (at(u1, v0, 0).max(at(u1, v1, 0)) - px).max(0.5);
+                            let ch = (at(u0, v1, 1).max(at(u1, v1, 1)) - py).max(0.5);
+                            out.push(self.quad(aspect, px, py, cw, ch, col));
                         }
                     }
                 }
@@ -1290,12 +2116,33 @@ impl LayoutScreen {
                     if hi <= lo {
                         break 'elem;
                     }
-                    // the three stops are the colour at 0, 50 and 100 per cent of the **box**, not
-                    // of the filled part; the sprite pipeline has one colour per quad, so the span
-                    // is cut into cells of one per cent each — APPROXIMATION, as for `NFS5.GOURAUDBOX`
-                    let stop = |k: &str, d: [f32; 4]| e.color(k).map(tint).unwrap_or(d);
-                    let (c0, c50, c100) = (stop("c0", [1.0; 4]), stop("c50", [1.0; 4]), stop("c100", [1.0; 4]));
+                    // The three stops are the colour at 0, 50 and 100 per cent of the **box**, not
+                    // of the filled part, and the span really is split at fifty: the shared bar
+                    // painter **0x521CB0** draws it as two gouraud pieces, `c0`→`c50` up to the
+                    // 50.0f at [0x5B251C] and `c50`→`c100` past it, each clamped to the filled
+                    // part (0x521D5A…0x521E3D). CONFIRMED against 0x4CA690, which hands 0x521CB0
+                    // the box, the span and the three colours, and against the bind 0x4CA1C0.
+                    //
+                    // One rule the shipped screens never exercise, kept because it is the class's:
+                    // if the widget gives **no `c50`** the bind promotes the third stop into the
+                    // second and clears the third (0x4CA227…0x4CA23D), and 0x521CB0's `test ebx,
+                    // ebx` at 0x521CE1 then takes the two-stop path, blending its own midpoint
+                    // with `0x4D8850(c0, c100, 0x80)` — half way. All 42 shipped bars carry all
+                    // three, so this is the port being right rather than lucky.
+                    let stop = |k: &str| e.color(k).map(tint);
+                    let c0 = stop("c0").unwrap_or([1.0; 4]);
+                    // the promotion: no `c50` and the third stop becomes the second, leaving two
+                    let (c50, c100) = match (stop("c50"), stop("c100")) {
+                        (Some(a), Some(b)) => (a, Some(b)),
+                        (None, Some(b)) | (Some(b), None) => (b, None),
+                        (None, None) => (c0, None),
+                    };
                     let at = |p: f32| -> [f32; 4] {
+                        // two stops left: one ramp end to end, which is what blending the middle
+                        // one half way (`0x80`) comes to
+                        let Some(c100) = c100 else {
+                            return std::array::from_fn(|j| c0[j] + (c50[j] - c0[j]) * (p / 100.0));
+                        };
                         let (a, b, t) = if p < 50.0 { (c0, c50, p / 50.0) } else { (c50, c100, (p - 50.0) / 50.0) };
                         std::array::from_fn(|j| a[j] + (b[j] - a[j]) * t)
                     };
@@ -1314,29 +2161,55 @@ impl LayoutScreen {
                 // a 90×6 bar) and around the whole list (261×163 over the panel), rather than a
                 // fill that would bury them.
                 //
-                // Not drawn: the glint. With `animate` non-zero the draw arms a timer
-                // (0x51FE39…0x51FE80) that waits `rand() % 32 + 64` and then plays one of the
-                // flourishes — with `animate == 5` a random one of four (0x51FE8E). Its shapes were
-                // not traced, so it is left out rather than guessed at, exactly as the `NFS5.CarLogo`
-                // glint is.
+                // The outline is **verified** against the code: `FEGlintyRectangle::draw` 0x51FDE0
+                // blends `col` with the fade (0x4D87F0) and hands the widget's position and that
+                // width and height to **0x4D9200**, which is four calls to the one-bar primitive
+                // 0x4D9280 — `(x, y, w, 1)`, `(x, y + h − 1, w, 1)`, `(x, y, 1, h)` and
+                // `(x + w − 1, y, 1, h)`, the inset coming from the 1.0f at [0x5B24A8]. That is
+                // this arm, bar for bar.
+                //
+                // Not drawn: the flourish. Its **timing** is settled — 0x51FE65…0x51FEDA: when it
+                // is not running and `now − [this+0x14] > [this+0x18]` it starts, runs for
+                // `rand()%32 + 64` ticks, then waits `rand()%256 + 256` before the next. `animate`
+                // picks which of four to play and **5 means a fresh random one of the four each
+                // time** (0x51FE8E) — which is what 93 of the 181 shipped ones carry. The four
+                // flourishes' own shapes were not traced, so they are left out rather than guessed
+                // at, exactly as the `NFS5.CarLogo` glint is.
+                //
+                // One more thing the draw does that this port does not: 0x51FDE9 returns before
+                // **anything** when 0x4E35E0 answers true — `[0x6197AA] == 0`, a global that also
+                // gates the glinty line (0x51FAA9) and the bar primitives. With it clear the whole
+                // widget disappears, outline and all.
                 "NFS5.GlintyRectangle" => {
-                    let Some(c) = e.color("col").or_else(|| e.color("color")) else { break 'elem };
-                    let gw = e.int("width").map(|v| v as f32).filter(|v| *v > 0.0).unwrap_or(w).max(1.0);
-                    let gh = e.int("height").map(|v| v as f32).filter(|v| *v > 0.0).unwrap_or(h).max(1.0);
+                    // exactly the three keys the ctor reads, and no fallback: `col`, `width` and
+                    // `height`. All 181 shipped ones carry those three and **none** carries
+                    // `color` or `size`, so a fallback could only ever disagree with the class.
+                    let Some(c) = e.color("col") else { break 'elem };
+                    let gw = e.int("width").map(|v| v as f32).unwrap_or(0.0).max(1.0);
+                    let gh = e.int("height").map(|v| v as f32).unwrap_or(0.0).max(1.0);
                     let (c, t) = (tint(c), 1.0);
                     out.push(self.quad(aspect, x, y, gw, t, c));
                     out.push(self.quad(aspect, x, y + gh - t, gw, t, c));
                     out.push(self.quad(aspect, x, y, t, gh, c));
                     out.push(self.quad(aspect, x + gw - t, y, t, gh, c));
                 }
-                "NFS5.Rectangle" | "NFS5.BEVELEDOPTIONBOX" | "NFS5.PANEL" => {
-                    if let Some(c) = e.color("color") {
-                        out.push(self.quad(aspect, x, y, w.max(1.0), h.max(1.0), tint(c)));
-                    }
-                }
-                "NFS5.GLINTYLINE" => {
-                    let c = e.color("color").map(tint).unwrap_or([1.0, 1.0, 1.0, 0.5]);
-                    out.push(self.quad(aspect, x, y, w.max(1.0), h.max(1.0), c));
+                // A panel draws **only** the layout its `filename` names, in the panel's own place.
+                // Its slot-4 0x4CEBC0 — the same slot that is `FeListBox`'s combined tick-and-draw
+                // 0x4C5460…0x4C691B — returns at once when `[panel+0x14C]` is null and otherwise
+                // ticks the loaded screen, runs its draw and unloads it once it is down
+                // (0x4E0E10 → `[panel+0x70]` = 0x4CEB00). It never reaches the base part draw, so
+                // the `area` RECT of `Panel.ctr` is not painted — which the files agree with:
+                // 22 of the 24 shipped panels carry the template's own `color.value=0x8000ff00`
+                // unchanged, a half-transparent green that is nowhere on screen in the game.
+                "NFS5.PANEL" => {
+                    // a closed tab draws nothing and is not a gap
+                    let Some(g) = self.groups.get(&i) else {
+                        if self.closed.contains(&i) {
+                            closed = true;
+                        }
+                        break 'elem;
+                    };
+                    out.extend(self.embedded(g, aspect, strings, accessor, blank, x, y));
                 }
                 // `NFS5.3DCAR` is drawn after the screen, below — its car is a 3D view, not a
                 // sprite in the layout's own order
@@ -1377,10 +2250,48 @@ impl LayoutScreen {
                         panel_w -= LIST_SCROLLBAR_W;
                     }
                     let (px, py) = match self.controls.get(&e.class).and_then(|c| c.part("selectionbox")).and_then(|p| p.value("pos")) {
-                        Some(v) => nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)).map(|(a, b)| (x + a as f32, y + b as f32)).unwrap_or((x, y)),
+                        Some(v) => nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)).map(|(a, b)| (x + a as f32, y + b as f32)).unwrap_or((x, y)),
                         None => (x, y),
                     };
                     out.push(self.quad(aspect, px, py, panel_w, panel_h, [1.0, 1.0, 1.0, 16.0 / 255.0]));
+                    // The scrollbar the list grows when it clamps is a `NFS5.VerticalSlider`, and
+                    // `VerticalSlider.ctr` says what it is: a `track` the full height in
+                    // **0xffffbb00**, `weeicons.fsh` entry **13** at `0,7` for the up arrow, entry
+                    // **14** at the bottom for the down arrow, and a `knob` of
+                    // `decrement_button.size.width × 15` in **0x80ffffff** starting at
+                    // `decrement_button.size.height`. The knob then moves by the scrollbar helper's
+                    // own rule, the vertical branch of 0x4D0BBE:
+                    // `dy = index · (trackHeight − knobHeight) / (count − 1)`.
+                    //
+                    // It lives in the sixteen pixels the panel gave up: 0x4C5421 takes exactly
+                    // 0x4DB030's **16** off the selection box's width and leaves its x alone, so
+                    // the strip freed is the one to its right. That the bar is drawn at the strip's
+                    // left edge is this port's reading of that, not a traced placement —
+                    // APPROXIMATION, as is using the selected row for the knob's index, since the
+                    // port keeps no separate scroll position.
+                    if scrolls {
+                        let sx = px + panel_w;
+                        let art = |n: usize| self.shapes.get(&("weeicons.fsh".to_string(), n)).copied();
+                        let (up, down) = (art(13), art(14));
+                        let track_w = down.map(|(_, w, _)| w).or(up.map(|(_, w, _)| w)).unwrap_or(LIST_SCROLLBAR_W);
+                        out.push(self.quad(aspect, sx, py, track_w, panel_h, tint([0xff, 0xbb, 0x00, 0xff])));
+                        if let Some((tex, aw, ah)) = up {
+                            let (pos, size) = self.place(aspect, sx, py + 7.0, aw, ah);
+                            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+                        }
+                        if let Some((tex, aw, ah)) = down {
+                            let (pos, size) = self.place(aspect, sx, py + panel_h - ah, aw, ah);
+                            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+                        }
+                        let knob_h = 15.0;
+                        let base = py + up.map(|(_, _, h)| h).unwrap_or(0.0);
+                        let span = (panel_h - knob_h - (base - py)).max(0.0);
+                        let count = rows.len().max(1) as f32;
+                        let idx = current.unwrap_or(0) as f32;
+                        let dy = if count > 1.0 { idx * span / (count - 1.0) } else { 0.0 };
+                        let knob_w = up.map(|(_, w, _)| w).unwrap_or(track_w);
+                        out.push(self.quad(aspect, sx, base + dy, knob_w, knob_h, tint([0xff, 0xff, 0xff, 0x80])));
+                    }
                     // `textcolor` is black and the two highlights amber and dark red, all three
                     // straight out of `ListBox.ctr`; a highlighted row's own text turns white
                     // (0x4C67A6 → 0x4D87D0).
@@ -1432,17 +2343,115 @@ impl LayoutScreen {
                 // coordinates.
                 "NFS5.RADIOGROUP" => {
                     let Some(g) = self.groups.get(&i) else { break 'elem };
-                    let mut inner = g.sprites_reporting(aspect, strings, None, accessor, blank);
-                    if x != 0.0 || y != 0.0 {
-                        let (dx, dy) = (x / DESIGN.0, y / DESIGN.1);
-                        for sp in &mut inner {
-                            sp.pos[0] += dx;
-                            sp.pos[1] += dy;
+                    out.extend(self.embedded(g, aspect, strings, accessor, blank, x, y));
+                }
+                // `FETrackSmall2dSpline::draw` (0x4FCD80). The widget cycles through the events of
+                // the tournament its accessor names: `update` (0x4FCB50) divides the milliseconds
+                // since the list was built by 256 for the index and restarts when that reaches the
+                // count, and keeps a second counter for the fade — `m = elapsed % 256`, `m*8` while
+                // `m < 0x20`, `0x7FF - m*8` while `m > 0xE0`, untouched in between, so it holds at
+                // 0xF8 for the middle of each step (0x4FCB5D…0x4FCB91).
+                //
+                // Each step draws three things: the map, in amber (`0x4D87C0` is
+                // `(alpha << 24) | 0xFFBB00`) at the fade's alpha; **one** marker, in white
+                // (`0x4D87D0`, `0xFFFFFF`) at the widget's own alpha; and beside them the whole
+                // event list, `"-"` at x=352 and the track's name at x=356, 15 pixels apart from
+                // y=280, the current one amber and the rest white (0x4FCF20…0x4FCFE9). The map and
+                // the marker take their positions from the `.fsh` entry, not from the `.lay`.
+                "NFS5.TrackSmall2dSpline" => {
+                    let Some(evs) = self.track_maps.get(&i).filter(|e| !e.is_empty()) else { break 'elem };
+                    let cur = (self.clock_ms / 256) as usize % evs.len();
+                    let m = self.clock_ms % 256;
+                    let ramp = if m < 0x20 {
+                        m * 8
+                    } else if m > 0xE0 {
+                        0x7FF - m * 8
+                    } else {
+                        0xF8
+                    };
+                    let ev = &evs[cur];
+                    let picture = |out: &mut Vec<Sprite>, art: Option<(TextureId, f32, f32, f32, f32)>, color: [f32; 4]| {
+                        let Some((tex, aw, ah, ax, ay)) = art else { return };
+                        let (pos, size) = self.place(aspect, ax, ay, aw, ah);
+                        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5] });
+                    };
+                    picture(&mut out, ev.map, [1.0, 0xBB as f32 / 255.0, 0.0, talpha * ramp as f32 / 255.0]);
+                    picture(&mut out, ev.marker, [1.0, 1.0, 1.0, talpha]);
+                    if let Some(f) = self.font_for(e) {
+                        for (row, ev) in evs.iter().enumerate() {
+                            let ry = 280.0 + 15.0 * row as f32;
+                            let c = if row == cur { [1.0, 0xBB as f32 / 255.0, 0.0, talpha] } else { [1.0, 1.0, 1.0, talpha] };
+                            self.text(&mut out, aspect, f, "-", 352.0, ry, 0.0, 0, c);
+                            self.text(&mut out, aspect, f, &ev.name, 356.0, ry, 0.0, 0, c);
                         }
                     }
-                    out.extend(inner);
                 }
-                "NFS5.ChroniclePictureIcon" | "NFS5.ShowcasePicture" => {
+                // `NFS5.PRIZERACEMAP` and `NFS5.FACTORYMAP` share one draw (0x51A360, both vtables
+                // at +0x3C): entry 0 of the pack the widget loaded, at the widget's own place and
+                // the art's own size, in white at the transition alpha. Which pack that is comes
+                // from the setter — the era for the prize map (0x506430: `mclass`, `mgold` or
+                // `mmod` by the current tournament's `+4`, 0x504800) and the mission code at
+                // `fac+0x3F` for the factory map (0x51A310, the first mission whose `+0xE8` is 0).
+                "NFS5.PRIZERACEMAP" | "NFS5.FACTORYMAP" => {
+                    let Some(key) = self.logos.get(&i) else { break 'elem };
+                    let Some(&(tex, aw, ah)) = self.shapes.get(key) else { break 'elem };
+                    let (pos, size) = self.place(aspect, x, y, aw, ah);
+                    out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5] });
+                }
+                // The player's portrait and the Factory Driver licence card. `NFS5.PLAYERPICTURE`
+                // (0x4CFC00) and `NFS5.BADGE` (0x4CF3E0) put their art down at the widget box's
+                // top-left corner at the art's own size; the two `MINI` classes (0x4CFC90,
+                // 0x4CF610) call the blit's eight-argument form (0x4D9B30) with the box's own
+                // width and height instead, so they stretch. All four take the widget's box from
+                // 0x4C8670, which answers `(x1, y1, x2, y2)`.
+                // `NFS5.FACTORYPIC` (0x51A210) joins them: one face from `FactoryPeople.fsh` at the
+                // widget's own place and the art's size.
+                // `NFS5.HUD` (0x4CB970) joins them for its first piece: entry 0 of `hud.fsh`, the
+                // 240×180 `disp` schematic, at the widget box's top-left at its own size.
+                "NFS5.PLAYERPICTURE" | "NFS5.MINIPLAYERPICTURE" | "NFS5.BADGE" | "NFS5.MINIBADGE" | "NFS5.FACTORYPIC" | "NFS5.HUD" => {
+                    let Some(key) = self.logos.get(&i) else { break 'elem };
+                    let Some(&(tex, aw, ah)) = self.shapes.get(key) else { break 'elem };
+                    let stretch = e.class.starts_with("NFS5.MINI");
+                    let (dw, dh) = if stretch && w > 0.0 && h > 0.0 { (w, h) } else { (aw, ah) };
+                    let (pos, size) = self.place(aspect, x, y, dw, dh);
+                    out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5] });
+                    let Some((name, rank, colour)) = self.badges.get(&i) else { break 'elem };
+                    // the shadow: entry 0 at x+244 and entry 1 at y+131 (0x4CF499, 0x4CF4C4). The
+                    // original also gates it on a start-up timer (0x4E35D0 wants the game to have
+                    // been up 0x2100000 ticks) and on `[0x657E60]`; neither is state this port
+                    // keeps, so the shadow is always drawn.
+                    for (entry, dx, dy) in [(0usize, 244.0, 0.0), (1, 0.0, 131.0)] {
+                        let Some(&(t, sw, sh)) = self.shapes.get(&(LICENSE_SHADOW.to_string(), entry)) else { continue };
+                        let (pos, size) = self.place(aspect, x + dx, y + dy, sw, sh);
+                        out.push(Sprite { texture: t, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5] });
+                    }
+                    // the name, centred (the fourth argument of 0x4DA350 is the alignment: 1 pulls
+                    // back half the text's width, 2 the whole of it — 0x4DA3D7…0x4DA405) at
+                    // x+122, y+11 (0x4CF513, 0x4CF522), and the rank at x+98, y+50 in black
+                    // (0x4CF5C1, 0x4CF5C4, 0x4CF5D0)
+                    let mut c = *colour;
+                    c[3] *= talpha;
+                    if let Some(f) = self.fonts.get(BADGE_NAME_FONT).or_else(|| self.font_for(e)) {
+                        self.text(&mut out, aspect, f, name, x + 122.0, y + 11.0, 0.0, 1, c);
+                    }
+                    if let Some(f) = self.fonts.get(BADGE_RANK_FONT).or_else(|| self.font_for(e)) {
+                        self.text(&mut out, aspect, f, rank, x + 98.0, y + 50.0, 0.0, 0, [0.0, 0.0, 0.0, talpha]);
+                    }
+                }
+                // `NFS5.ChroniclePicture` (0x508310) lays the grid out at the widget's box, clipped
+                // to it and panned by the two offsets the drag keeps at `+0x14C` / `+0x150`. The
+                // port composes the grid into one texture and draws it unpanned, which is the same
+                // picture whenever it fits — and it does: the widget is `size=458,286` and so is
+                // the picture.
+                // `NFS5.MOVIEBOX` (0x4CD640) hands the drawing to the player object at `+0x1BC`;
+                // the picture goes at the widget's own box.
+                "NFS5.MOVIEBOX" => {
+                    let Some(m) = self.movies.get(&i) else { break 'elem };
+                    let (dw, dh) = (if w > 0.0 { w } else { m.size.0 }, if h > 0.0 { h } else { m.size.1 });
+                    let (pos, size) = self.place(aspect, x, y, dw, dh);
+                    out.push(Sprite { texture: m.tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5] });
+                }
+                "NFS5.ChroniclePictureIcon" | "NFS5.ShowcasePicture" | "NFS5.ChroniclePicture" => {
                     let Some(key) = self.logos.get(&i) else { break 'elem };
                     let Some(&(tex, aw, ah)) = self.shapes.get(key) else { break 'elem };
                     let (dw, dh) = (if w > 0.0 { w } else { aw }, if h > 0.0 { h } else { ah });
@@ -1481,13 +2490,297 @@ impl LayoutScreen {
                     // the front end sets to 640 at 0x4D35B4, but the shape's own travel was not
                     // traced, so it is left out rather than guessed at.
                 }
-                "NFS5.OutlineRectangle" => {
-                    let c = e.color("color").map(tint).unwrap_or([1.0, 1.0, 1.0, 0.5]);
-                    let t = 1.0;
-                    out.push(self.quad(aspect, x, y, w, t, c));
-                    out.push(self.quad(aspect, x, y + h - t, w, t, c));
-                    out.push(self.quad(aspect, x, y, t, h, c));
-                    out.push(self.quad(aspect, x + w - t, y, t, h, c));
+                // `FEChronicleMainBoxControl::draw` (0x507990) starts with five bars, in this
+                // order, all 454 wide from the widget box's own left edge and all but the outline
+                // at half alpha (0x4D87F0 scales by the 0x80 pushed at 0x5079FB, 0x507A62,
+                // 0x507AA7 and 0x507AEC):
+                //
+                // | y | size | what |
+                // |---|---|---|
+                // | +0x26 | 454×16 | white (0x4D87D0) |
+                // | +0x26 | 455×16 | the outline of that bar, black (0x4D87E0 is `alpha << 24`), 0x4D9200 |
+                // | +0x10 | 454×20 | 0xBC0000 (0x4D87B0) |
+                // | +0x26 | 454×60 | 0xBC0000 |
+                // | +0x64 | 454×60 | 0xBC0000 |
+                //
+                // Not drawn: the timeline over them. 0x507B4F walks the years from the accessor's
+                // own (`(value − 0x76C) % 100`, so `+0x76C` is 1900), prints each as `"%d"` at
+                // `x + col + 0x2D` (0x507BDF), outlines a 90×20 box per year (0x507C1A) and asks
+                // 0x507340 for up to three chronicle entries a year to put icons in it. That loop
+                // is read but not ported — the port has no chronicle year index to walk.
+                // `FEKnockoutTrackList::draw` (0x4FA190) is a **seven-slot** strip: the widget's box
+                // is divided by the `1/7` at 0x5B7E78 (0x4FA241), and the first `n` slots — `n` from
+                // the accessor's vtable `+0x6C`, the opponent count — are filled with the literal
+                // `0x80FEDD81` the draw pushes at 0x4FA1FA, which is also what the `.lay` block's
+                // own `color` says. The row `Knockout.TrackNumber` is on is redrawn in the menu
+                // amber `0x4D87C0` gives (0x4FA296), and half-alpha black rules (`0x4D87E0` at
+                // `0x80`) separate the rows and mark two columns, at `x + 0x0B` and `x + 0x71`
+                // (0x4FA35B, 0x4FA39F).
+                "NFS5.KNOCKOUTTRACKLIST" => {
+                    let Some(&(rows, current)) = self.ko_strip.get(&i) else { break 'elem };
+                    if rows == 0 || w <= 0.0 || h <= 0.0 {
+                        break 'elem;
+                    }
+                    let slot = h / 7.0;
+                    let filled = slot * rows as f32;
+                    let half = talpha * 128.0 / 255.0;
+                    let fill = [0xFE as f32 / 255.0, 0xDD as f32 / 255.0, 0x81 as f32 / 255.0, half];
+                    out.push(self.quad(aspect, x, y, w, filled, fill));
+                    if current < rows {
+                        out.push(self.quad(aspect, x, y + slot * current as f32, w, slot, [1.0, 0xBB as f32 / 255.0, 0.0, talpha]));
+                    }
+                    let rule = [0.0, 0.0, 0.0, half];
+                    for r in 1..rows {
+                        out.push(self.quad(aspect, x, y + slot * r as f32, w, 1.0, rule));
+                    }
+                    for dx in [11.0, 113.0] {
+                        out.push(self.quad(aspect, x + dx, y, 1.0, filled, rule));
+                    }
+                }
+                "NFS5.ChronicleMainBoxControl" => {
+                    let half = |c: [f32; 3]| [c[0], c[1], c[2], talpha * 128.0 / 255.0];
+                    let red = [0xBC as f32 / 255.0, 0.0, 0.0];
+                    out.push(self.quad(aspect, x, y + 38.0, 454.0, 16.0, half([1.0, 1.0, 1.0])));
+                    let black = [0.0, 0.0, 0.0, talpha];
+                    for (bx, by, bw, bh) in [(x, y + 38.0, 455.0, 1.0), (x, y + 38.0 + 15.0, 455.0, 1.0), (x, y + 38.0, 1.0, 16.0), (x + 454.0, y + 38.0, 1.0, 16.0)] {
+                        out.push(self.quad(aspect, bx, by, bw, bh, black));
+                    }
+                    out.push(self.quad(aspect, x, y + 16.0, 454.0, 20.0, half(red)));
+                    out.push(self.quad(aspect, x, y + 38.0, 454.0, 60.0, half(red)));
+                    out.push(self.quad(aspect, x, y + 100.0, 454.0, 60.0, half(red)));
+                }
+                // **None of these four is a registered class.** The only `*Rectangle*` string in
+                // the whole executable is `NFS5.GlintyRectangle` (0x5DD847) — there is no
+                // `NFS5.Rectangle` and no `NFS5.OutlineRectangle`, and no `NFS5.GLINTYLINE`
+                // registration either beyond 0x5222E0's, whose class does nothing but the parts.
+                // CONFIRMED by exhaustion: they are drawn by the template and nothing else.
+                //
+                // Which settles `NFS5.OutlineRectangle`, and the port had it **backwards**:
+                // `OutlineRectangle.ctr`'s `area` is the whole box with `color.value=0x8000ff00`
+                // and **no flags**, so the block's `color` fills the interior, while `top`,
+                // `bottom`, `left` and `right` are one-pixel bars at `0xff000000`
+                // `HIDDEN|READONLY` — always **black**. The port was drawing four hairlines in
+                // the widget's colour and no fill. All 195 shipped ones carry a colour, and they
+                // are fills: 82 a 30 % white wash, 31 fully transparent, 16 half grey, 12 amber,
+                // 11 the dark red. `NFS5.BEVELEDOPTIONBOX` is the same shape.
+                // The same exhaustion settles four more, 811 widgets between them: neither
+                // `REAL.LABEL` (306), `NFS5.PICTURE` (484), `NFS5.NonLocalizedLabel` (11) nor
+                // `NFS5.ExtraCircle` (10) is a registered class, so each is its template and
+                // nothing else.
+                //
+                // `Label.ctr` is one `LOCALIZEDTEXT` part at
+                // **`pos.value=(0-label.size.width)/2*data.align,0`** in `univers8b.ffn` and
+                // `0xffffffff`, all three overridable — and that expression *is* the alignment
+                // rule, written out: `align` 0 keeps the position, 1 pulls back half the string's
+                // width, 2 the whole width. This port used to reproduce it by anchoring in a box,
+                // which only agreed because the box came out zero; now it is the template's own
+                // arithmetic over the measured extent. All 306 carry `stringID`, `align` and
+                // `foreColor`; all 11 non-localised labels carry `text` and `foreColor`.
+                // `NFS5.HEADER` (41) and `NFS5.SUBHEADER` (5) are their template's one
+                // `LOCALIZEDTEXT` part as well: `Header.ctr` puts the class at `pos.value=6,4` and
+                // the label at `0,0` in `Univers17b.ffn` and `0xffffffff`, and the class's own
+                // slot 20 (0x4CAE60) does nothing but bind that part. Its slot 21 (0x4CADC0) loads
+                // a glint — see `RE/notes/controls.md` §4.11 — which is not drawn here.
+                "NFS5.HEADER" | "NFS5.SUBHEADER"
+                | "REAL.LABEL" | "NFS5.PICTURE" | "NFS5.NonLocalizedLabel" | "NFS5.ExtraCircle"
+                | "NFS5.OutlineRectangle" | "NFS5.Rectangle" | "NFS5.BEVELEDOPTIONBOX" | "NFS5.GLINTYLINE" => {
+                    let state = if selected == Some(i) { "selected" } else { e.get("state").unwrap_or("normal") };
+                    self.template_widget(&mut out, aspect, e, state, x, y, strings);
+                    // Erased, not undrawn, in two cases the original agrees with:
+                    //
+                    // * a box whose every rectangle is **fully transparent** — four of the 362
+                    //   `NFS5.Rectangle`s carry an alpha of zero;
+                    // * a label whose `stringID` the shipped table carries **empty** — 12300 and
+                    //   19809, the two `REAL.LABEL`s of `RE/AUDIT.md` F.
+                    if out.len() == first
+                        && let Some(c) = self.controls.get(&e.class)
+                    {
+                        let parts = c.state_parts(state);
+                        let rects = parts.iter().filter_map(|n| c.part(n)).any(|p| p.kind() == nfs_formats::ctr::PartKind::Rect);
+                        let blank_string = e.string_id().is_some_and(|id| strings.get(id) == Some(""));
+                        if rects || blank_string {
+                            closed = true;
+                        }
+                    }
+                }
+                // `NFS5.CarSettingSlider` is the template's transparent track (`color.value` is
+                // `0x00000000`) and a 6×11 knob from `weeicons.fsh` entry 8, whose `pos.value` is
+                // `0,0` and `HIDDEN|READONLY` because the code moves it. The scrollbar helper the
+                // class owns does that at **0x4D0C0C…0x4D0C68**, the horizontal branch of
+                // `[helper+0x130] == 0`:
+                //
+                // ```text
+                // track = width(track part)          // 0x4E2B90
+                // knob  = width(knob part)
+                // dx    = count > 1 ? index * (track - knob) / (count - 1) : 0
+                // knob.x = knobBase.x + dx           // [helper+0x114]
+                // ```
+                //
+                // — and the vertical branch (0x4D0BBE…0x4D0C06) is the same on `y` over
+                // `height(track) - height(knob)` (0x4E2BA0) against `[helper+0x118]`. All five
+                // shipped sliders are `width=90 height=13` against a 6×11 knob, so they are
+                // horizontal. The index and the count come from the accessor's own registration
+                // (`career::car_setup_index`).
+                // `NFS5.CheckBox` keeps **two** entries of its pack, `onIndex` and `offIndex`,
+                // and `CheckBox.ctr`'s one SHAPE part is written `shapeIndex.value=data.onIndex`
+                // — the ticked one, as a default. Which is drawn is the code's:
+                // `FECheckBox::refresh` **0x4C3730** asks the `boolAccessor` (`[this+0x144]`,
+                // vtable +0x6C) and writes `[this+0x14C]` (`data.onIndex`) or `[this+0x150]`
+                // (`data.offIndex`) into `checkBoxPic.shapeIndex` (`[this+0x148]`, through
+                // 0x5271F0); 0x4C36E0 is the per-frame watch that calls it when the bool moves.
+                //
+                // All ten shipped boxes are on `repair.lay` with a `QUICKFIX.<category>` bool, and
+                // each of those is registered with a default index of **0** — false — at
+                // 0x4F2584 and its nine neighbours, so the repair screen opens with every box
+                // clear. The port has no per-category repair basket, so that is where they stay.
+                "NFS5.CheckBox" => {
+                    let on = self.checks.get(&i).copied().unwrap_or(false);
+                    let key = if on { "onIndex" } else { "offIndex" };
+                    let Some(index) = e.int(key).filter(|n| *n >= 0).map(|n| n as usize) else { break 'elem };
+                    let Some(file) = e.get("shapePathName").filter(|v| !v.is_empty()) else { break 'elem };
+                    let Some(&(tex, aw, ah)) = self.shapes.get(&(file.to_string(), index)) else { break 'elem };
+                    let (pos, size) = self.place(aspect, x, y, aw, ah);
+                    out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+                }
+                "NFS5.CarSettingSlider" => {
+                    let (idx, count) = self.knobs.get(&i).copied().unwrap_or((0, 1));
+                    for (px, py, pw, ph, file, index, _) in self.shape_parts(e) {
+                        let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
+                        let (dw, dh) = (if pw > 0.0 { pw } else { aw }, if ph > 0.0 { ph } else { ah });
+                        let dx = if count > 1 { (idx * (w - dw).max(0.0) as i32 / (count - 1)) as f32 } else { 0.0 };
+                        let (pos, size) = self.place(aspect, x + px + dx, y + py, dw, dh);
+                        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+                    }
+                }
+                // `ComboBox.ctr` (the class is `NFS5.ComboBoxSlider`, 86 widgets) and
+                // `ColorBox.ctr` (11) are the same widget, and it is a **dark-red bar**, not a
+                // caption floating on the background:
+                //
+                // * `backrect` fills `0,0`…`data.width,data.height` with `0xFFBC0000`,
+                //   `HIDDEN|READONLY` so no layout changes it — the same dark red as a
+                //   `NFS5.GOTOBUTTON`'s pill (§4.3);
+                // * `labelleft` puts the widget's own `stringID` at `5,2` in `universC11b.ffn`,
+                //   white;
+                // * `arrowbutton` is `weeicons.fsh` entry **14** at
+                //   `data.width-arrowbutton.size.width-4,4`, which `shape_parts` already places;
+                // * `selectionbox` is the drop-down and is not in `[state.normal]`.
+                //
+                // The value is the one piece the template does not settle: its `label` part is
+                // `text.value=%data.accessor%` at `data.width-10-label.size.width-3,2` in
+                // `universC11m.ffn` with `foreColor=0x00000000` — a **transparent** colour, so the
+                // class draws the value from code (`FeComboBox`, the class `NFS5.ListBox` shares)
+                // and the part is the editor's preview. The port keeps its own right-aligned draw
+                // and its own white. APPROXIMATION, as before.
+                "NFS5.ComboBoxSlider" | "NFS5.ColorBox" => {
+                    let state = if selected == Some(i) { "selected" } else { e.get("state").unwrap_or("normal") };
+                    for (px, py, pw, ph, col) in self.state_rects(e, state) {
+                        out.push(self.quad(aspect, x + px, y + py, pw.max(1.0), ph.max(1.0), tint(col)));
+                    }
+                    for (px, py, pw, ph, file, index, flip) in self.shape_parts(e) {
+                        let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
+                        let (dw, dh) = (if pw > 0.0 { pw } else { aw }, if ph > 0.0 { ph } else { ah });
+                        let (pos, size) = self.place(aspect, x + px, y + py, dw, dh);
+                        let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
+                        let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
+                        out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+                    }
+                    // the caption, where the template puts it
+                    if let Some(c) = self.controls.get(&e.class)
+                        && let Some(p) = c.part("labelleft")
+                        && let Some(t) = e.string_id().filter(|n| *n != 0).and_then(|n| strings.get(n)).filter(|t| !t.is_empty())
+                        && let Some(col) = self.part_colour(e, p, "foreColor").filter(|c| c[3] != 0)
+                    {
+                        let (px, py) = self
+                            .part_attr(e, p, "pos")
+                            .and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)))
+                            .unwrap_or((0.0, 0.0));
+                        let f = self
+                            .part_attr(e, p, "fontPathName")
+                            .map(|f| f.to_lowercase())
+                            .and_then(|f| self.fonts.get(&f))
+                            .or_else(|| self.fonts.get(DEFAULT_FONT));
+                        if let Some(f) = f {
+                            self.text(&mut out, aspect, f, t, x + px as f32, y + py as f32, 0.0, 0, tint(col));
+                        }
+                    }
+                    // And the value, which the class draws itself — `FeComboBox`'s own draw has
+                    // two text calls, and they settle both:
+                    //
+                    // * **0x4C6054** puts the caption at `(x + 5, y + 2)` with align **0** in the
+                    //   font at `[this+0x190]` — the template's `labelleft`, same place;
+                    // * **0x4C6237** puts the value with align **2** anchored at
+                    //   `x + width(this) - 12` (0x4C6220, over 0x4E2B90's width) at the widget's
+                    //   own `y`, in the second font `[this+0x194]`.
+                    //
+                    // The template's `label` part says `data.width-10-label.size.width-3,2`, which
+                    // is the same right edge one pixel further in and two rows down; the code is
+                    // what runs, so the port follows the code. That retires the approximation this
+                    // arm used to carry.
+                    if let Some(v) = e.get("accessor").filter(|a| !a.is_empty()).and_then(accessor) {
+                        let f = self
+                            .controls
+                            .get(&e.class)
+                            .and_then(|c| c.part("label"))
+                            .and_then(|p| self.part_attr(e, p, "fontPathName"))
+                            .map(|f| f.to_lowercase())
+                            .and_then(|f| self.fonts.get(&f))
+                            .or_else(|| self.font_for(e));
+                        let Some(f) = f else { break 'elem };
+                        let colour = if selected == Some(i) { [1.0, 0.85, 0.2, 1.0] } else { [1.0, 1.0, 1.0, 1.0] };
+                        self.text(&mut out, aspect, f, &v, x + w - 12.0, y, 0.0, 2, colour);
+                    }
+                }
+                // A `NFS5.GOTOBUTTON` is a **dark-red pill with white text**, not red text on
+                // nothing. `GoToButton.ctr` says so outright and every one of the 153 shipped
+                // buttons carries the colour:
+                //
+                // * `[state.normal] parts=bg,label,mediumlabel,smalllabel,data`, and `bg` is a
+                //   RECT at `1,1` sized `data.width-2,data.height-2` filled with `data.maincolor`
+                //   — whose default is `0xFFBC0000` and whose value in the files is that same dark
+                //   red on 150 of the 153 (two carry `0x00000000`, which is transparent);
+                // * `[state.selected]` and `[state.hover]` swap `bg` for `hoverbg`, the same
+                //   rectangle filled with `data.hovercolor` — default `0xffffBB00`, amber. That is
+                //   what the original highlights with, so this port no longer has to invent one;
+                // * the caption is drawn **three times**, at three places in three fonts, and
+                //   `data.medium` picks which one is opaque: `label` at `5,2` in `Universc11b` is
+                //   `data.medium?0x00000000:0xffffffff`, `mediumlabel` centred in
+                //   `Universc11m` is `(data.medium&1)?0xffffffff:0x00000000`, and `smalllabel` in
+                //   `univers8b` — at `5,2` when `medium&4`, centred otherwise — is
+                //   `(data.medium&4)?0xffffffff:(data.medium&2)?0xffffffff:0x00000000`. The
+                //   shipped `medium` values are 0 (96), 1 (50) and 4 (6).
+                //
+                // An alpha of zero is invisible, which is how two of the three labels stay out of
+                // the way; `BottomBarButton.ctr`'s labels, which really are coloured, all carry a
+                // `0xff` alpha instead.
+                "NFS5.GOTOBUTTON" => {
+                    let state = if selected == Some(i) { "selected" } else { e.get("state").unwrap_or("normal") };
+                    self.template_widget(&mut out, aspect, e, state, x, y, strings);
+                }
+                // The same shape three more times, 19 widgets: a `0xFFBC0000` box inside four
+                // one-pixel black bars, with a white caption. `Tab Button.ctr` puts its
+                // `LOCALIZEDTEXT` at `5,2` in `Universc11b.ffn` and swaps `bg` for `hoverbg`
+                // (`0xffffbb00`) when it is the open tab; `CameraSelect.ctr` centres a `TEXT`
+                // part in `Univers7b.ffn` — the camera number the block carries as `text` — and
+                // `CameraPicture.ctr` adds `optart.fsh` entry `data.picturenum` over the box.
+                // Two more that are only their template, and both had their caption in the wrong
+                // place because the template puts it relative to a **part**, which needs the
+                // measured extents of §2:
+                //
+                // * `BottomBarButton.ctr` (22): `label` sits at `picture.size.width+data.space,8`
+                //   — to the right of the `logoAn.fsh` icon the button carries as `startframe`,
+                //   by the block's own `space`, and eight pixels down. `bg` is `0x00000000`, so
+                //   there is no bar behind it;
+                // * `Graphic Tab Button.ctr` (5): `label` is
+                //   `((selectedbg.size.width-label.size.width)/2)+data.textoffsetx,data.textoffsety`
+                //   — centred over the tab's own highlight art and then nudged by the two offsets
+                //   the block carries (`textoffsetx` is 24, 3, 0, −1 and −22 on the five shipped tabs).
+                "NFS5.BOTTOMBARBUTTON" | "NFS5.GRAPHICTABBUTTON" => {
+                    let state = if selected == Some(i) { "selected" } else { e.get("state").unwrap_or("normal") };
+                    self.template_widget(&mut out, aspect, e, state, x, y, strings);
+                }
+                "NFS5.TABBUTTON" | "NFS5.CAMERASELECT" | "NFS5.CAMERAPICTURE" => {
+                    let state = if selected == Some(i) { "selected" } else { e.get("state").unwrap_or("normal") };
+                    self.template_widget(&mut out, aspect, e, state, x, y, strings);
                 }
                 _ => {
                     // Not drawn here: the template's `RECT` parts. They are the widget's regions,
@@ -1497,14 +2790,20 @@ impl LayoutScreen {
                     // a box draws its rects from its own arm, as `NFS5.CONTROLLERSETUP` does.
                     // the art the widget's class template carries, at the places the template puts
                     // it — `NFS5.CARSETTINGBUTTON`'s arrows, the popup circles, the tab buttons
-                    for (px, py, pw, ph, file, index) in self.shape_parts(e) {
+                    let mut from_template = false;
+                    for (px, py, pw, ph, file, index, flip) in self.shape_parts(e) {
                         let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
                         let (dw, dh) = (if pw > 0.0 { pw } else { aw }, if ph > 0.0 { ph } else { ah });
                         let (pos, size) = self.place(aspect, x + px, y + py, dw, dh);
-                        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+                        let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
+                        let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
+                        out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+                        from_template = true;
                     }
-                    // anything with a picture draws it; anything with a string draws that
-                    if let Some((file, index)) = e.shape()
+                    // anything with a picture draws it; anything with a string draws that.
+                    // Only when the class template placed none — otherwise the same art twice.
+                    if !from_template
+                        && let Some((file, index)) = e.shape()
                         && let Some(&(tex, aw, ah)) = self.shapes.get(&(file.to_string(), index))
                     {
                         // A picture is drawn at its art's own size: every piece of the oval frames
@@ -1557,7 +2856,15 @@ impl LayoutScreen {
                         // TRANSLATE in `FEStrings.csv`): those widgets get their text from code.
                         match e.string_id().filter(|id| *id != 0).and_then(|id| strings.get(id)) {
                             Some(t) if !t.is_empty() => t.to_string(),
-                            _ => break 'elem,
+                            // the table **has** the id and its text is blank: the shipped
+                            // `FEStrings.csv` leaves 11110, 12300 and 19809 empty in every
+                            // language column, so those four widgets draw nothing in the original
+                            // too. Erased, not undrawn.
+                            Some(_) => {
+                                closed = true;
+                                break 'elem;
+                            }
+                            None => break 'elem,
                         }
                     };
                     // the highlighted button uses its own `hovercolor`, as the original does
@@ -1583,7 +2890,41 @@ impl LayoutScreen {
                     // its `size=100,30` box pushed every value a row below its label, while
                     // `PRIZEMONEY`, whose box is `43,11` and so too short to centre in, lined up.
                     let _ = h;
-                    if e.class.to_ascii_lowercase().contains("wordwrap") {
+                    // An accessor watch is its template's one `TEXT` part, and the class's only
+                    // job is to keep that part's string up to date: `FEAccessorWatch::tick`
+                    // **0x4BD230** updates the accessor (vtable +8), asks it for the plain text
+                    // (+0x10) or, when the widget carries a modifier, the modified one (+0x14),
+                    // and writes the answer into the part's `text` attribute with 0x526980 —
+                    // which is why `accessor Watch.ctr` marks that attribute `HIDDEN|READONLY`
+                    // and gives it the placeholder `WATCH`. An accessor that answers **null**
+                    // gets the literal `CANTFINDSTRING` (0x4BD2B0); one that answers an empty
+                    // string gets nothing, which is the knockout rows' case.
+                    //
+                    // So its position is the template's, `(0-label.size.width)/2*data.align,0`,
+                    // over the width of the string it is showing *now* — the same expression
+                    // `Label.ctr` carries (§4.8), and the same integer division. Everything else
+                    // keeps the port's own anchor.
+                    let watch_pos = self
+                        .controls
+                        .get(&e.class)
+                        .filter(|_| {
+                            let c = e.class.to_ascii_lowercase();
+                            // not the wrapping one: `WordWrapAccessorWatch.ctr` pins its label at
+                            // `0,0` and the wrap is the whole point of the class
+                            c.contains("accessorwatch") && !c.contains("wordwrap")
+                        })
+                        .and_then(|c| c.state_parts(e.get("state").unwrap_or("normal")).iter().filter_map(|n| c.part(n)).find(|p| p.kind() == nfs_formats::ctr::PartKind::Text))
+                        .and_then(|p| {
+                            let tw = f.place(&text).1 as f64;
+                            let v = p.value("pos")?;
+                            nfs_formats::ctr::eval_pair(v, &|n| match n {
+                                "label.size.width" => Some(tw),
+                                other => self.reference(e, other, 0, true),
+                            })
+                        });
+                    if let Some((px, py)) = watch_pos {
+                        self.text(&mut out, aspect, f, &text, x + px as f32, y + py as f32, 0.0, 0, color);
+                    } else if e.class.to_ascii_lowercase().contains("wordwrap") {
                         self.wrapped_text(&mut out, aspect, f, &text, x, y, box_w, e.int("align").unwrap_or(0), color);
                     } else {
                         self.text(&mut out, aspect, f, &text, x, y, box_w, e.int("align").unwrap_or(0), color);
@@ -1611,7 +2952,7 @@ impl LayoutScreen {
                 let f0: Vec<(String, [f32; 4])> = { let mut v: Vec<(String, [f32; 4])> = out[first..].iter().map(|s| (format!("{:?}", s.texture), s.color)).collect(); v.dedup(); v };
                 println!("  #{i:3} {:<26} pos=({x:.0},{y:.0}) sprites={n} box=({:.3},{:.3})-({:.3},{:.3}) alpha={talpha:.2} first={f0:?}", e.class, b.0, b.1, b.2, b.3);
             }
-            if out.len() == first && i > 0 {
+            if out.len() == first && i > 0 && !closed {
                 blank.push((e.class.clone(), source_of(e)));
             }
         }

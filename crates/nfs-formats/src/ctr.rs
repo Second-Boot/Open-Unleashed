@@ -73,6 +73,34 @@ impl Part {
     pub fn ty(&self, key: &str) -> Option<&str> {
         self.fields.get(&format!("{}.type", key.to_lowercase())).map(|s| s.as_str())
     }
+
+    /// `<key>.flags` — `HIDDEN`, `READONLY` or both.
+    pub fn flags(&self, key: &str) -> Option<&str> {
+        self.fields.get(&format!("{}.flags", key.to_lowercase())).map(|s| s.as_str())
+    }
+
+    /// The `.lay` key that overrides this attribute, and whether it may be overridden at all.
+    ///
+    /// The `.ctr` parser 0x52BC90 reads four lines per attribute — `<key>.value`,
+    /// `<key>.screenkey`, `<key>.label` and `<key>.flags` — and keeps the **screen key** in
+    /// `[attr+0x1C]`, defaulting to the attribute's own name when the file gives none
+    /// (0x52BF43…0x52BF53). A separate byte `[attr+0x34]` starts at 1 (0x52BFB4) and is cleared
+    /// when the flags contain **`HIDDEN`** (`strstr` at 0x52BFBA…0x52BFEF); 0x52C000 looks the
+    /// screen key up in the `.lay` block (0x5240A0) **only when that byte is set**.
+    ///
+    /// So: a part attribute takes the block's value for its screen key unless it is `HIDDEN`, and
+    /// falls back to its own `<key>.value`. `Graphic Tab Button.ctr` is the one class that uses
+    /// the indirection — its `selectedbg` part takes its pack from the widget's
+    /// `selectedbgSmallPathName` and its position from `highlightsmallpos`.
+    pub fn screen_key(&self, key: &str) -> Option<String> {
+        if self.flags(key).is_some_and(|f| f.to_ascii_uppercase().contains("HIDDEN")) {
+            return None;
+        }
+        Some(match self.fields.get(&format!("{}.screenkey", key.to_lowercase())) {
+            Some(k) if !k.trim().is_empty() => k.trim().to_string(),
+            _ => key.to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -105,6 +133,12 @@ impl Control {
 
     /// The parts drawn in `state`, in the order that state lists them; the parts the `[control]`
     /// section lists when the state is unknown.
+    /// Whether the file carries a `[state.<name>]` section for this state. A name it does not
+    /// carry never reaches 0x525580, so the widget keeps the ctor's own full part list.
+    pub fn has_state(&self, state: &str) -> bool {
+        self.states.contains_key(&state.to_lowercase())
+    }
+
     pub fn state_parts(&self, state: &str) -> &[String] {
         self.states.get(&state.to_lowercase()).map(|v| v.as_slice()).unwrap_or(&self.parts_order)
     }
@@ -211,7 +245,7 @@ pub fn eval(expr: &str, resolve: &dyn Fn(&str) -> Option<f64>) -> Option<f64> {
     let tokens = lex(expr)?;
     let mut p = Parser { t: &tokens, i: 0, resolve };
     let v = p.ternary()?;
-    if p.i == p.t.len() { Some(v) } else { None }
+    if p.i == p.t.len() && !v.is_nan() { Some(v) } else { None }
 }
 
 /// Evaluate a `x,y` pair; a value with no comma resolves both halves from the single expression's
@@ -305,6 +339,16 @@ impl Parser<'_> {
         }
     }
 
+    /// `c ? a : b`. Only the taken branch has to **resolve**: both are still parsed, so the
+    /// expression's shape is checked either way, but a reference the port cannot answer in the
+    /// branch that is not taken does not sink the whole expression.
+    ///
+    /// This matters for `BottomBarButton.ctr`'s position,
+    /// `(data.align&1)?data.posx-(label.size.width+picture.size.width+data.space):data.posx`:
+    /// three of the four shipped bar buttons are `align=0` and want nothing but `data.posx`, and
+    /// requiring the other branch too put all four at the origin. APPROXIMATION in one direction
+    /// only — where the original resolves both branches this gives the same answer, and where the
+    /// port cannot it gives an answer instead of none.
     fn ternary(&mut self) -> Option<f64> {
         let c = self.bitand()?;
         if self.eat('?') {
@@ -313,6 +357,10 @@ impl Parser<'_> {
                 return None;
             }
             let b = self.ternary()?;
+            // an unanswerable condition picks neither
+            if c.is_nan() {
+                return Some(f64::NAN);
+            }
             return Some(if c != 0.0 { a } else { b });
         }
         Some(c)
@@ -322,7 +370,8 @@ impl Parser<'_> {
         let mut v = self.sum()?;
         while self.eat('&') {
             let r = self.sum()?;
-            v = ((v as i64) & (r as i64)) as f64;
+            // `as i64` saturates a NaN to 0, which would quietly turn "unanswerable" into "false"
+            v = if v.is_nan() || r.is_nan() { f64::NAN } else { ((v as i64) & (r as i64)) as f64 };
         }
         Some(v)
     }
@@ -351,7 +400,7 @@ impl Parser<'_> {
                 if d == 0.0 {
                     return None;
                 }
-                v = (v / d).trunc();
+                v = if v.is_nan() || d.is_nan() { f64::NAN } else { (v / d).trunc() };
             } else {
                 return Some(v);
             }
@@ -380,7 +429,11 @@ impl Parser<'_> {
             Tok::Name(n) => {
                 let n = n.clone();
                 self.i += 1;
-                (self.resolve)(&n)
+                // A name the caller cannot answer becomes **NaN** rather than stopping the parse:
+                // the cursor has to reach the end of the expression either way, or a ternary's
+                // `:` is never found and a branch that was never going to be taken sinks the whole
+                // thing. `eval` rejects a NaN result at the end.
+                Some((self.resolve)(&n).unwrap_or(f64::NAN))
             }
             Tok::Op(_) => None,
         }
@@ -393,6 +446,43 @@ mod tests {
 
     fn none(_: &str) -> Option<f64> {
         None
+    }
+
+    /// A name the caller cannot answer must not sink the expression: the parse has to reach the
+    /// end so a ternary's `:` is found, and only the branch that is taken has to resolve. This is
+    /// `BottomBarButton.ctr`'s own position, which is what puts the four bar buttons on the bar.
+    #[test]
+    fn an_unanswerable_name_only_sinks_the_branch_it_is_in() {
+        let pos = "(data.align&1)?data.posx-(label.size.width+picture.size.width+data.space):data.posx,data.posy";
+        let r = |n: &str| -> Option<f64> {
+            match n {
+                "data.align" => Some(0.0),
+                "data.posx" => Some(440.0),
+                "data.posy" => Some(452.0),
+                "data.space" => Some(4.0),
+                _ => None,
+            }
+        };
+        assert_eq!(eval_pair(pos, &r), Some((440.0, 452.0)));
+        // with `align=1` the other branch is taken and the widths really are needed
+        let r1 = |n: &str| -> Option<f64> {
+            match n {
+                "data.align" => Some(1.0),
+                _ => r(n),
+            }
+        };
+        assert_eq!(eval_pair(pos, &r1), None);
+        let r2 = |n: &str| -> Option<f64> {
+            match n {
+                "label.size.width" => Some(30.0),
+                "picture.size.width" => Some(16.0),
+                _ => r1(n),
+            }
+        };
+        assert_eq!(eval_pair(pos, &r2), Some((390.0, 452.0)));
+        // and an unanswerable condition picks neither branch
+        let r3 = |n: &str| -> Option<f64> { if n == "data.align" { None } else { r2(n) } };
+        assert_eq!(eval_pair(pos, &r3), None);
     }
 
     #[test]

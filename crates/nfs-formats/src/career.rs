@@ -50,7 +50,10 @@ pub struct TrackInfo {
     pub lock_mode: u16,
     pub circuit: bool,
     pub unknown_70: f32,
-    pub unknown_78: u32,
+    /// `+0x78`: the track's **difficulty**, 0/1/2. `Track1.Track(DIFFICULTY)` reads it as a word at
+    /// 0x4FB730 and looks up `FEStrings[0x1C2 + it]` — 450…452, the same three names
+    /// `Game.Difficutly` uses. CONFIRMED; this used to be an UNKNOWN with no reader located.
+    pub difficulty: u32,
     pub traffic_cars: [u16; 7],
     pub police_cars: [u16; 5],
     pub unknown_94: u32,
@@ -89,7 +92,7 @@ pub fn parse_track_table(data: &[u8]) -> Result<Vec<TrackInfo>, FormatError> {
             lock_mode: u16_le(r, 0x6C, what)?,
             circuit: u16_le(r, 0x6E, what)? == 1,
             unknown_70: f32_le(r, 0x70, what)?,
-            unknown_78: u32_le(r, 0x78, what)?,
+            difficulty: u32_le(r, 0x78, what)?,
             traffic_cars,
             police_cars,
             unknown_94: u32_le(r, 0x94, what)?,

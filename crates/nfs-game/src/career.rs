@@ -279,6 +279,87 @@ pub const CAR_SETUP_NAMES: [&str; 17] = [
     "Gear7",
 ];
 
+/// How each of those 17 is **registered** as a front-end accessor, and so how it is shown and
+/// stepped: minimum, maximum, step and decimal places, from the seventeen
+/// `FEFloatRangeAccessor(name, min, max, step, decimals)` calls at 0x4F29CC…0x4F2D49. CONFIRMED,
+/// in the order of [`CAR_SETUP_NAMES`].
+///
+/// | accessor | min | max | step | dec | registered at |
+/// |---|---|---|---|---|---|
+/// | `FDownForce` | 0 | 100 | 1 | 0 | 0x4F29CC |
+/// | `RDownForce` | 0 | 100 | 1 | 0 | 0x4F2A01 |
+/// | `BrakeBias` | 30 | 70 | 1 | 2 | 0x4F2A39 |
+/// | `RideHeight` | −20 | 20 | 1 | 2 | 0x4F2A71 |
+/// | `Suspension` | −30 | 30 | 1 | 2 | 0x4F2AA9 |
+/// | `SteeringToe` | −5 | 5 | 0.1 | 2 | 0x4F2AE1 |
+/// | `ShockRate` | 0.7 | 1.5 | 0.01 | 2 | 0x4F2B19 |
+/// | `FTirePressure` | 25 | 45 | 1 | 0 | 0x4F2B51 |
+/// | `RTirePressure` | 25 | 45 | 1 | 0 | 0x4F2B89 |
+/// | `Gear0` | −0.5 | 0.5 | 0.05 | 2 | 0x4F2BC1 |
+/// | `Gear1` | −0.5 | 0.5 | 0.05 | 2 | 0x4F2BF9 |
+/// | `Gear2` | −0.45 | 0.45 | 0.05 | 2 | 0x4F2C31 |
+/// | `Gear3` | −0.4 | 0.405 | 0.05 | 2 | 0x4F2C69 |
+/// | `Gear4` | −0.35 | 0.35 | 0.05 | 2 | 0x4F2CA1 |
+/// | `Gear5` | −0.3 | 0.3 | 0.05 | 2 | 0x4F2CD9 |
+/// | `Gear6` | −0.25 | 0.25 | 0.05 | 2 | 0x4F2D11 |
+/// | `Gear7` | −0.5 | 0.5 | 0.05 | 2 | 0x4F2D49 |
+///
+/// `Gear3`'s maximum really is 0.405 in the image (0x3ECF5C29), where every other gear's pair is
+/// symmetric — left as read.
+pub const CAR_SETUP_RANGE: [(f32, f32, f32, usize); 17] = [
+    (0.0, 100.0, 1.0, 0),
+    (0.0, 100.0, 1.0, 0),
+    (30.0, 70.0, 1.0, 2),
+    (-20.0, 20.0, 1.0, 2),
+    (-30.0, 30.0, 1.0, 2),
+    (-5.0, 5.0, 0.1, 2),
+    (0.7, 1.5, 0.01, 2),
+    (25.0, 45.0, 1.0, 0),
+    (25.0, 45.0, 1.0, 0),
+    (-0.5, 0.5, 0.05, 2),
+    (-0.5, 0.5, 0.05, 2),
+    (-0.45, 0.45, 0.05, 2),
+    (-0.4, 0.405, 0.05, 2),
+    (-0.35, 0.35, 0.05, 2),
+    (-0.3, 0.3, 0.05, 2),
+    (-0.25, 0.25, 0.05, 2),
+    (-0.5, 0.5, 0.05, 2),
+];
+
+/// What the car-setup screen **shows** for one of the 17, from the stored float.
+///
+/// The value is not shown as it is stored: it goes through the accessor's index, which quantises
+/// it to the registered step.
+///
+/// * `FEFloatRangeAccessor::setValue` **0x4B9C10** — `index = (int)((v − min) / step)`, with
+///   `fistp` rounding to nearest;
+/// * the index setter **0x4BC240** clamps it to `0 ..= count − 1`, and the ctor **0x4B9A40** built
+///   `count = (int)((max − min) / step + 0.5)` — so the registered maximum is one step out of
+///   reach, which is the original's own arithmetic and is left as read;
+/// * `FEFloatRangeAccessor::text` **0x4B9AB0** — `v = index · step + min`, then a zero snap
+///   (`−1e−4 < v < 1e−7` becomes `0.0`, 0x4B9AE3…0x4B9AFF against [0x5B4FB0] and [0x5B4FB4]),
+///   then `sprintf` with `"%1.0f"`, `"%1.1f"`, `"%1.2f"` or `"%1.3f"` by the registered decimals
+///   (the jump table at 0x4B9C00).
+///
+/// So a default car reads `50.00` for its brake bias and `0.00` for every gear, not `50` and `0`.
+pub fn car_setup_text(i: usize, v: f32) -> String {
+    let (min, _, step, dec) = CAR_SETUP_RANGE[i];
+    let (index, _) = car_setup_index(i, v);
+    let out = index as f32 * step + min;
+    let out = if out > -1e-4 && out < 1e-7 { 0.0 } else { out };
+    format!("{out:.dec$}")
+}
+
+/// The accessor's index for one of the 17, and how many entries its list has — the pair the
+/// slider's knob is placed from. `count` is the ctor's `(int)((max − min) / step + 0.5)`
+/// (0x4B9A40) and `index` is 0x4B9C10's rounding, clamped to `0 ..= count − 1` by 0x4BC240.
+pub fn car_setup_index(i: usize, v: f32) -> (i32, i32) {
+    let (min, max, step, _) = CAR_SETUP_RANGE[i];
+    let count = ((max - min) / step + 0.5) as i32;
+    let index = ((v - min) / step).round() as i32;
+    (index.clamp(0, (count - 1).max(0)), count)
+}
+
 /// What `FECar`'s constructor writes into that block (0x4EED2D…0x4EED80). CONFIRMED.
 pub const CAR_SETUP_DEFAULT: [f32; 17] =
     [50.0, 50.0, 50.0, 0.0, 0.0, 0.0, 1.0, 30.0, 30.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
@@ -399,6 +480,10 @@ pub struct TournamentState {
     pub events: Vec<EventResult>,
     /// Completed (rank ≤ 3) at least once.
     pub completed: bool,
+    /// How many times, which is what `trn+0xD3C` counts and what
+    /// `Tournament.Tournament(TIMESCOMPLETED)` prints (0x506929).
+    #[serde(default)]
+    pub completions: u32,
     pub final_rank: Option<u8>,
     pub prize: u32,
     /// Attempts that ended with rank > 3 (tournament reset).
@@ -843,6 +928,7 @@ impl Career {
         self.money = (self.money + tprize as i64).clamp(-999_999_999, 999_999_999);
         if t.is_club() {
             st.completed = true;
+            st.completions += 1;
             st.events.clear();
             st.entered = false;
             return outcome;
@@ -856,6 +942,7 @@ impl Career {
         }
         let first = !st.completed;
         st.completed = true;
+        st.completions += 1;
         st.events.clear();
         st.entered = false;
         if first && let Some(next) = YEAR_TABLE.iter().find(|y| **y > self.year) {
@@ -982,6 +1069,18 @@ pub fn part_aged_price(p: &Part, year: u16) -> i64 {
     let sum: u32 = PART_AGE_PCT.iter().take(age).sum();
     let price = p.price as i64;
     price + price * sum as i64 / 100
+}
+
+/// What it costs to repair one installed part (`0x518880`, CONFIRMED): the aged price times the
+/// part's damage doubled, over a hundred. `0x5188BC` multiplies `part+0x164` by the 2.0 at
+/// 0x5BA4A0 and truncates it (`0x5A0F98`), `0x5188E2` multiplies that into the aged price and
+/// 0x5188ED divides by a hundred.
+///
+/// The damage screens sum it over the installed parts of one category — `0x4EFBC0` does category 1
+/// — and `OVERALLDAMAGECOST` over all of them (0x4EFF80). Each is printed through 0x4DBF80's
+/// thousands commas.
+pub fn part_repair_cost(p: &Part, year: u16, state: f32) -> i64 {
+    part_aged_price(p, year) * (2.0 * state) as i64 / 100
 }
 
 /// `PartValue` 0x518900 (CONFIRMED): `price + price·sum/100 − (100 − c)·aged/100` with

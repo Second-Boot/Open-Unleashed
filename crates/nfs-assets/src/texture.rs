@@ -18,6 +18,25 @@ pub struct TextureImage {
     pub page: usize,
     pub x: u32,
     pub y: u32,
+    /// `misc[0]`, `misc[1]` read as signed — where a front-end widget that places its art from the
+    /// pack rather than from the `.lay` puts it. `FETrackSmall2dSpline::draw` takes the map's
+    /// position from the image object alone: 0x4FCE58 and 0x4FCE66 push `-[img+0x1C]` and
+    /// `-[img+0x20]` to the blit (0x4D9AF0), and the two other fields the blit reads, `+0x14` and
+    /// `+0x18`, are the entry's width and height (0x4D9B04/0x4D9B0E `fild` them). Measured against
+    /// the shipped art that pair is `misc[0]`, `misc[1]`: `alpsSpSm.fsh`'s map carries 170,299,
+    /// inside `tournament.lay`'s `pos=140,280 size=342,152` box, and each Monaco pack gives its
+    /// `s` and `f` markers **one** position because a circuit starts and finishes in the same
+    /// place. The sign the pack loader puts between the header and `+0x1C` was not traced —
+    /// `CnstLyr.fsh` stores the same kind of value negated — so this is the position, not an
+    /// offset. HIGH.
+    pub place: [i32; 2],
+    /// The text of the entry's `0x6F` attachment block, if it has one. The chronicle packs use it
+    /// to name the car logo that belongs with the picture: `MA601a.fsh`'s `ci` entry carries
+    /// `"04finallogos2"`, and `FECarLogo::update` with `othersource=Chron` (0x4C1747) takes entry
+    /// **1**, reads the string at `+0x24`, wants at least three characters (0x4C1763) and splits it
+    /// into the two-digit logo pair — 0x4C17F6 computes `2·(10·s[0] + s[1]) − 0x420`, which is
+    /// twice the number the two ASCII digits spell — and the pack name from `+2` (0x4C17F9).
+    pub text: Option<String>,
 }
 
 /// Decode every entry of a SHPI pack. `path` is used for diagnostics only.
@@ -49,6 +68,12 @@ pub fn decode_pack(path: &Path, data: &[u8]) -> Result<Vec<TextureImage>, AssetE
             page: b.misc[0] as usize,
             x: (b.misc[2] & 0xFFF) as u32,
             y: (b.misc[3] & 0xFFF) as u32,
+            place: [b.misc[0] as i16 as i32, b.misc[1] as i16 as i32],
+            text: e.blocks.iter().find(|b| b.code == 0x6F).and_then(|b| {
+                let start = b.offset + 8;
+                let end = data[start..].iter().position(|c| *c == 0).map(|n| start + n)?;
+                std::str::from_utf8(&data[start..end]).ok().map(str::to_string)
+            }),
         });
     }
     Ok(out)

@@ -33,6 +33,7 @@ fn career_round_trips_through_the_original_format() {
         TournamentState {
             entered: true,
             completed: true,
+            completions: 2,
             events: vec![EventResult { position: 1, prize: 5000, bonus: 2500, points: [8, 7, 6, 5, 4, 3, 2, 1], earned: [7500, 3000, 2000, 1500, 1000, 800, 600, 400], times: [10_000, 10_500, 11_000, 0, 0, 0, 0, 0] }],
             final_rank: Some(1),
             prize: 20_000,

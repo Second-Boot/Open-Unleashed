@@ -547,3 +547,49 @@ fn car_locale_files() {
     }
     assert!(filled >= 90, "only {filled} of {} .loc files carry strings", files.len());
 }
+
+/// The `.mad` container walks to the last byte of every shipped movie, and every video chunk's
+/// bitstream is consumed to its payload length (`RE/notes/mad.md` §10).
+#[test]
+fn mad_frames_consume_their_payload() {
+    let root = need_game!();
+    let exe = match std::fs::read(root.join("nfs5.exe")) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("skipping: nfs5.exe not found");
+            return;
+        }
+    };
+    let dir = root.join("FEData").join("Movies");
+    let mut files = 0;
+    for e in std::fs::read_dir(&dir).expect("Movies") {
+        let p = e.expect("entry").path();
+        if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("mad")) {
+            continue;
+        }
+        let d = std::fs::read(&p).expect("mad");
+        // the chunk walk covers the file exactly
+        let covered: usize = nfs_formats::mad::chunks(&d).map(|c| c.data.len()).sum();
+        assert_eq!(covered, d.len(), "{p:?}: chunks cover {covered} of {}", d.len());
+
+        let tables = nfs_formats::mad::MadTables::from_exe(&exe).expect("mad tables");
+        let video: Vec<_> = nfs_formats::mad::chunks(&d).filter(|c| c.is_video()).take(120).map(|c| c.data.to_vec()).collect();
+        let h = nfs_formats::mad::MadHeader::parse(&video[0]).expect("header");
+        let mut dec = nfs_formats::mad::MadDecoder::new(tables, &h);
+        let mut tight = 0usize;
+        for c in &video {
+            let payload = c.len() - nfs_formats::mad::MAD_HEADER_SIZE;
+            let used = dec.decode_chunk(c).expect("decode");
+            // the reader keeps its 32-bit window full, so `8·pos − avail` is the bit count with
+            // `avail` 16…32 — up to four bytes ahead. A frame read at the wrong length lands well
+            // outside that.
+            assert!(used >= payload && used <= payload + 16, "{p:?}: consumed {used} of {payload}");
+            tight += usize::from(used <= payload + 4);
+        }
+        // 3346 of the 3357 frames across the twelve movies land inside that bound; the threshold
+        // guards against a regression rather than claiming perfection (`RE/notes/mad.md` §10)
+        assert!(tight * 20 >= video.len() * 19, "{p:?}: only {tight} of {} frames landed exactly", video.len());
+        files += 1;
+    }
+    assert!(files >= 10, "expected the twelve shipped movies, found {files}");
+}
