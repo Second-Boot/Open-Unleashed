@@ -56,7 +56,11 @@ pub fn load_controls(paths: &GamePaths) -> ControlLibrary {
         tracing::debug!(dir = %dir.display(), "no control templates");
         return ControlLibrary::default();
     };
-    let files = entries.filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("ctr"))).filter_map(|e| {
+    // `.ctr` is a control template and **`.scr` a screen one** — the directory ships exactly one,
+    // `Black Screen 640x480.scr`, which is the template for `REAL.BLACK_640x480`, the id every
+    // layout's `[section.0]` carries. It has the same shape as a `.ctr` and the port used to skip
+    // it, so the one class that every screen is built on had no template at all here.
+    let files = entries.filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("ctr") || x.eq_ignore_ascii_case("scr"))).filter_map(|e| {
         let bytes = std::fs::read(e.path()).ok()?;
         Some(bytes.iter().map(|&b| nfs_formats::locale::cp1252(b)).collect::<String>())
     });
@@ -77,6 +81,11 @@ pub struct Control {
     pub callback: Option<String>,
     pub accessor: Option<String>,
     pub string_id: Option<u32>,
+    /// `data.offset`, which is **what the button does to the screen stack**, not a position:
+    /// `NFS5.GOTOBUTTON`'s bind takes it into `[this+0x144]` (0x4C8F55) and its slot 9 hands the
+    /// attribute's own int, `[+0x38]`, to `0x4D2100(destination, offset, 1)` as the second
+    /// argument (0x4C94BD…0x4C94CF). `RE/notes/layouts.md`.
+    pub offset: i32,
 }
 
 /// The design space every `.lay` is authored in.
@@ -185,10 +194,255 @@ pub struct LayoutScreen {
     badges: HashMap<usize, (String, String, [f32; 4])>,
     /// milliseconds this screen has been up, for the map widget's own cycle (0x4FCB50)
     clock_ms: u32,
+    /// the `weeicons.fsh` entry tagged `GLNT`, when this screen has a `NFS5.HEADER` to sweep it
+    /// across — `RE/notes/controls.md` §4.25
+    glint: Option<usize>,
+    /// the `weeicons.fsh` entry tagged `COLB`, the one sprite `NFS5.ColorBox`'s picker draws
+    colb: Option<usize>,
+    /// where the pointer is, in design coordinates, when it is over the window at all
+    /// (`RE/notes/controls.md` §4.39)
+    cursor: Option<(f32, f32)>,
+    /// whether the left button is held (`RE/notes/controls.md` §4.40 — type 4 down, type 8 up)
+    pressed: bool,
+    /// the widget that holds the mouse, if one does — `[window+0x120]`, which a widget takes when
+    /// it gains focus and gives back when it loses it (`RE/notes/controls.md` §4.57)
+    capture: Option<usize>,
+    /// how long the pointer has rested on one widget, and which — the tooltip of §4.52 needs
+    /// `[widget+0x12C]`, the tick the hover started
+    hover_ms: u32,
+    hover_of: Option<usize>,
+    /// the first row each list draws — `[this+0x1BC]->slot10()` in the original
+    /// (`RE/notes/controls.md` §4.45)
+    scroll: HashMap<usize, usize>,
+    /// the combo slider whose drop-down list is open, by this screen's own element index
+    /// (`RE/notes/controls.md` §4.43 — a combo's list is open exactly while it holds focus)
+    open_combo: Option<usize>,
+    /// `NFS5.ColorBox`'s picker state — `RE/notes/controls.md` §4.66
+    picker: Picker,
+    /// the analogue devices the front end can see, in enumeration order — the port's own stand-in
+    /// for the record table at `[0x69C9EC]` (`RE/notes/controls.md` §4.17)
+    pads: Vec<FePad>,
+    /// which pad the `Controller.AllPads` accessor is on (`[accessor+0x28 + pad*4]` selects the
+    /// stored value inside every one of the sixteen dead-zone accessors)
+    pad_sel: usize,
+    /// the sixteen `FEControllerDeadZoneAccessor` values, `[min, max]` per axis per pad — range
+    /// 0…0x80, and **0 / 0x80 out of the factory** (0x51E546, 0x51E550)
+    deadzone: Vec<[[i32; 2]; 8]>,
+    /// the bar and handle a press grabbed — `[this+0x140]`, which slot 5 sets and slot 9 clears
+    dz_grab: Option<(usize, u32)>,
+    /// `[this+0x144]` — the handle the pointer is **over**, which slot 8 writes whenever nothing
+    /// is held (0x51BD02). The draw paints that one amber and the rest dark red.
+    dz_hover: Option<(usize, u32)>,
+    /// a list's scrollbar knob parked at the pointer by a press on the **track**, until the first
+    /// move puts the model somewhere — `RE/notes/controls.md` §4.46, the tail of 0x4D0995
+    knob_at: Option<(usize, f32)>,
     /// where this screen is in its transition
     transition: Transition,
     /// drawn over another screen (the bottom bar, 0x4D39D3) — an overlay must not paint its own fill
     overlay: bool,
+}
+
+/// One analogue device as the front end sees it — this port's stand-in for a record of the
+/// 0x104-byte table at `[0x69C9EC]`, which 0x51EDEA caches from `0x532E10(i, 6)`.
+///
+/// `analogue` is `[rec+0] == 4` and the info block's `[+4] & 1`; `axes` is that block's `[+8]`,
+/// the **axis bitmask** `0x51F6F0` tests bit by bit; `values` are `[rec+4 + 4n]`, which
+/// `0x51F7A0(device, 0x24 + n, &out)` answers. Axis `n` is bit `n`, in the order the sixteen
+/// accessors are registered at 0x51E4C0 — `XAxis`, `YAxis`, `ZAxis`, `XRot`, `YRot`, `ZRot`,
+/// `SliderA`, `SliderB`, which is `DIJOYSTATE`'s own field order.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FePad {
+    pub analogue: bool,
+    pub axes: u8,
+    pub values: [i32; 8],
+}
+
+/// Where `NFS5.DEADZONE`'s live marker sits, relative to the box's left edge — 0x51B7FF…0x51B84B:
+///
+/// ```text
+/// 0x51B7FF  eax = box.w - 10
+/// 0x51B802  eax *= axis          ; the device's own reading, 0…65535
+/// 0x51B819  fmul [0x5B25C0]      ; 1/65536
+/// 0x51B84B  x = box.l + that
+/// ```
+///
+/// The image sets no `DIPROP_RANGE` — 0x56FD70's only `SetProperty` passes GUID **1**,
+/// `DIPROP_BUFFERSIZE` — so an absolute axis keeps DirectInput's default 0…65535, and the
+/// ten-pixel marker lands exactly inside the box at either end.
+pub fn deadzone_marker(width: i32, axis: i32) -> f32 {
+    ((width - 10) * axis.clamp(0, 0xFFFF)) as f32 / 65536.0
+}
+
+/// The four handles' centres, relative to the box's left edge, **in the order the draw visits
+/// them** — 1, 3, 2, 4 (0x51B883, 0x51B924, 0x51B9C3, 0x51BA64). `half` is `(box.w) / 2`
+/// (0x51B712) and a value's pixel offset is `v * half / 128` (0x51B717, 0x51B732), so the `.Min`
+/// pair rides either side of the centre and the `.Max` pair further out. Each bar is five wide
+/// and starts **two** left of its centre (0x51B8B0).
+pub fn deadzone_handles(width: i32, dz: [i32; 2]) -> [(u32, f32); 4] {
+    let half = (width / 2).max(1);
+    let pix = |v: i32| (v * half / 128) as f32;
+    let c = half as f32;
+    [(1, c - pix(dz[0])), (3, c + pix(dz[0])), (2, c - pix(dz[1])), (4, c + pix(dz[1]))]
+}
+
+/// One handle's new `[min, max]` — the two arms of **0x51BD10**, which keep the pair **five**
+/// units apart and inside the accessors' own 0…0x80:
+///
+/// ```text
+/// 0x51BD84  regions 1 and 3:  min = clamp(v, 0, max - 5)
+/// 0x51BDC9  regions 2 and 4:  max = clamp(v, min + 5, 0x80)
+/// ```
+///
+/// The jump table at 0x51BE14 is what pairs the four handles down to those two arms.
+pub fn deadzone_clamp(region: u32, v: i32, dz: [i32; 2]) -> [i32; 2] {
+    match region {
+        1 | 3 => [v.min(dz[1] - 5).max(0), dz[1]],
+        2 | 4 => [dz[0], v.max(dz[0] + 5).min(0x80)],
+        _ => dz,
+    }
+}
+
+/// The sixteen dead-zone accessors out of the factory: every `.Min` 0 and every `.Max` 0x80
+/// (0x51E546, 0x51E550).
+pub const DEADZONE_DEFAULT: [[i32; 2]; 8] = [[0, 0x80]; 8];
+
+/// `NFS5.ColorBox`'s custom colour editor, as state — `RE/notes/controls.md` §4.47, §4.48, §4.66.
+///
+/// The class keeps three floats and an index in the widget, and the eight colours it edits in a
+/// global array. 0x4D8900, which the mouse slots pack with, reads the three floats as **hue,
+/// saturation and luminance**, not red, green and blue.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Picker {
+    /// `[this+0x288]`, `[this+0x28C]`, `[this+0x290]` — hue, saturation, luminance, each
+    /// **0.5 out of the factory** (0x4C38B9)
+    pub hsl: (f32, f32, f32),
+    /// `[this+0x284]`, the well the editor writes — **0** out of the factory (0x4C38B3)
+    pub well: usize,
+    /// `[0x691D98 + n·4]`, read by `0x5019B0(n)` and written by `0x5019C0(n, v)` — eight
+    /// `0xAARRGGBB` words, **all zero in the image**
+    pub wells: [u32; 8],
+    /// `[this+0x2A0]`…, the copy the draw takes of all eight the first frame the picker is up
+    /// (0x4C3CCE…0x4C3CFA, guarded by `[this+0x2C0]`, which the closed draw clears at 0x4C3D03)
+    /// — what **cancel** puts back (0x4C49E6)
+    saved: [u32; 8],
+}
+
+impl Default for Picker {
+    fn default() -> Self {
+        Self { hsl: (0.5, 0.5, 0.5), well: 0, wells: [0; 8], saved: [0; 8] }
+    }
+}
+
+/// The picker's six rects, `(x0, y0, x1, y1)` each, from the widget's own box — §4.47's table,
+/// built by the bind 0x4C3A10. Indexed by [`rect`].
+pub fn picker_rects(l: f32, t: f32, r: f32, b: f32) -> [(f32, f32, f32, f32); 6] {
+    let _ = t;
+    let half = ((r - l) / 2.0).trunc();
+    [
+        (l + 6.0, b + 6.0, l + 0x79 as f32, b + 0xE as f32),      // A, the luminance ramp
+        (l + 0x7D as f32, b + 5.0, r - 5.0, b + 0xF as f32),      // B, the current colour
+        (l + 6.0, b + 0x15 as f32, r - 6.0, b + 0x74 as f32),     // C, the hue/saturation field
+        (l + 5.0, b + 0x7A as f32, r - 5.0, b + 0x84 as f32),     // D, the eight wells
+        (l + 5.0, b + 0x89 as f32, l + half - 3.0, b + 0x9B as f32), // E left, "ok"
+        (r - half + 3.0, b + 0x89 as f32, r - 5.0, b + 0x9B as f32), // E right, "cancel"
+    ]
+}
+
+/// Names for [`picker_rects`]' six.
+pub mod rect {
+    pub const A: usize = 0;
+    pub const B: usize = 1;
+    pub const C: usize = 2;
+    pub const D: usize = 3;
+    pub const E_LEFT: usize = 4;
+    pub const E_RIGHT: usize = 5;
+}
+
+/// The picker's hit test, `NFS5.ColorBox`'s own **0x4C4AD0**, which every one of its three mouse
+/// slots runs first and leaves in `[this+0x218]`.
+///
+/// It tries the rects in a fixed order and stops at the first that contains the point —
+/// **C → 0**, **A → 1**, E left → **3**, E right → **4**, D → **2** — and answers **5** when none
+/// does. Rect **B**, the swatch, is never tested: it is not clickable. Each test is `jl`/`jg` on
+/// both axes, so a rect is **inclusive on both edges**, like `Control::containsPoint` (§4.56).
+pub fn picker_region(rects: &[(f32, f32, f32, f32); 6], x: f32, y: f32) -> u32 {
+    let inside = |r: (f32, f32, f32, f32)| x >= r.0 && x <= r.2 && y >= r.1 && y <= r.3;
+    for (i, region) in [(rect::C, 0u32), (rect::A, 1), (rect::E_LEFT, 3), (rect::E_RIGHT, 4), (rect::D, 2)] {
+        if inside(rects[i]) {
+            return region;
+        }
+    }
+    5
+}
+
+/// **0x4D8900** — hue, saturation and luminance to a packed `0xAARRGGBB`, alpha forced to 0xFF.
+///
+/// The textbook HLS→RGB: `h` is scaled to degrees by **360.0** (0x5B25CC at 0x4D8904), the
+/// midpoint pair is `m2 = l·(1+s)` when `l <= 0.5` and `l + s - l·s` otherwise (0x4D8926 /
+/// 0x4D8932, the 0.5 at 0x5B23F0), `m1 = 2·l - m2` (0x4D8944), and a saturation of exactly **0**
+/// returns `(l, l, l)` (0x4D8956). The per-channel helper is inlined three times, at `h + 120`,
+/// `h` and `h - 120` (0x5B3D60), each wrapped into `[0, 360)` and then split at **60**, **180**
+/// and **240** (0x5B26F0, 0x5B6938, 0x5B6930) with a slope of **1/60** (0x5B3E48). The three come
+/// out as red, green and blue in that order and are packed `(v·255)` truncated toward zero
+/// (0x5A0F98), red at bit 16 (0x4D8B91…0x4D8BCB).
+pub fn hls_to_rgb(h: f32, s: f32, l: f32) -> u32 {
+    let m2 = if l <= 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let m1 = 2.0 * l - m2;
+    let channel = |mut hue: f32| {
+        if s == 0.0 {
+            return l;
+        }
+        while hue > 360.0 {
+            hue -= 360.0;
+        }
+        while hue < 0.0 {
+            hue += 360.0;
+        }
+        if hue < 60.0 {
+            m1 + (m2 - m1) * hue / 60.0
+        } else if hue < 180.0 {
+            m2
+        } else if hue < 240.0 {
+            m1 + (m2 - m1) * (240.0 - hue) / 60.0
+        } else {
+            m1
+        }
+    };
+    let deg = h * 360.0;
+    let (r, g, b) = (channel(deg + 120.0), channel(deg), channel(deg - 120.0));
+    let byte = |v: f32| ((v * 255.0) as i32 & 0xff) as u32;
+    0xff00_0000 | byte(r) << 16 | byte(g) << 8 | byte(b)
+}
+
+/// **0x4D8BD0** — the inverse, a packed `0xAARRGGBB` back to hue, saturation and luminance.
+///
+/// Each byte is scaled by **1/255** (0x5B3888), `l` is `(max + min)·0.5` (0x4D8CBC), a grey
+/// (`max == min`) gives `h = s = 0` (0x4D8CD3), and otherwise `s` is `delta/(max+min)` below the
+/// 0.5 midpoint and `delta/(2-(max+min))` above it (0x4D8D12 / 0x4D8D18). The hue is the usual
+/// six-sector form — `(g-b)/delta`, `2 + (b-r)/delta`, `4 + (r-g)/delta` (0x4D8D43, 0x4D8D64,
+/// 0x4D8D85) — then **×60** (0x5B6940), `+360` while negative (0x4D8DA4) and **×1/360**
+/// (0x5B3E84), so the float the widget keeps is a fraction of a turn.
+pub fn rgb_to_hls(c: u32) -> (f32, f32, f32) {
+    let (r, g, b) = (((c >> 16) & 0xff) as f32 / 255.0, ((c >> 8) & 0xff) as f32 / 255.0, (c & 0xff) as f32 / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) * 0.5;
+    if max == min {
+        return (0.0, 0.0, l);
+    }
+    let d = max - min;
+    let s = if l <= 0.5 { d / (max + min) } else { d / (2.0 - (max + min)) };
+    let mut h = if r == max {
+        (g - b) / d
+    } else if g == max {
+        2.0 + (b - r) / d
+    } else {
+        4.0 + (r - g) / d
+    } * 60.0;
+    while h < 0.0 {
+        h += 360.0;
+    }
+    (h / 360.0, s, l)
 }
 
 /// The bits a `transon` / `transoff` name maps to (`FE_transitionBits` 0x4C88C0 — the name is
@@ -277,6 +531,27 @@ impl Transition {
 /// wide (0x4DB030).
 pub const LIST_ROW_H: f32 = 14.0;
 pub const LIST_SCROLLBAR_W: f32 = 16.0;
+/// `VerticalSlider.ctr`'s `[part.knob]` is `decrement_button.size.width,15`
+pub const LIST_KNOB_H: f32 = 15.0;
+
+/// A list's scrollbar, as the port hit-tests it — see [`LayoutScreen::list_scrollbar`].
+#[derive(Clone, Copy, Debug)]
+pub struct ListScrollbar {
+    /// the decrement button, region 1 of 0x4D0CC0
+    pub up: (f32, f32, f32, f32),
+    /// the increment button, region 2
+    pub down: (f32, f32, f32, f32),
+    /// the knob, region 3
+    pub knob: (f32, f32, f32, f32),
+    /// where the knob's travel starts
+    pub track_top: f32,
+    /// how far it travels — track height less the knob's
+    pub span: f32,
+    /// how many first rows there are
+    pub positions: usize,
+    /// which one it is on
+    pub at: usize,
+}
 
 /// An `NFS5.ListBox` widget and the accessor whose rows fill it.
 #[derive(Debug, Clone, PartialEq)]
@@ -372,6 +647,14 @@ pub struct CarLogoWidget {
 
 /// The front end's default font, loaded at FE start-up (0x4C72B1).
 pub const DEFAULT_FONT: &str = "univers8b.ffn";
+
+/// The font `FeComboBox` keeps at `[this+0x184]` and hands both its strings when
+/// `data.usesmallfont` is set (0x4C4E8E, 0x4C555E) — the same file as [`DEFAULT_FONT`], named
+/// separately because the two are the same only by coincidence.
+pub const SMALL_FONT: &str = "univers8b.ffn";
+/// `NFS5.ColorBox`'s picker keeps two fonts of its own — `[this+0x294]` and `[this+0x298]`
+pub const PICKER_BUTTON_FONT: &str = "universc11b.ffn";
+pub const PICKER_TITLE_FONT: &str = "univers7b.ffn";
 
 /// The screen block's `screen=` id → the layout drawn underneath it (`FE_loadBackground` 0x4E1470,
 /// CONFIRMED). The original has a second, reduced table — `ID_FULLOVAL` → `screenfulloval` and
@@ -557,9 +840,21 @@ impl LayoutScreen {
                     Self::load_children(r, paths, &mut g, depth + 1);
                     screen.groups.insert(*i, Box::new(g));
                 }
-                Err(e) => tracing::debug!(file, error = %e, "panel layout unavailable"),
+                // A panel whose file will not load draws **nothing, correctly**: 0x4CEA90 hands
+                // the name to the loader 0x4E1200 and keeps what comes back in `[panel+0x14C]`,
+                // and 0x4CEBC0 returns at once when that is null. `Controllers.lay` §6 is the
+                // shipped case — `filename=predefkeys` and no `predefkeys.lay` in the install,
+                // and no tab button names that panel either, so nothing ever selects it.
+                Err(e) => {
+                    tracing::debug!(file, error = %e, "panel layout unavailable");
+                    screen.closed.insert(*i);
+                }
             }
         }
+        // a group is loaded after its parent read `NFS_FE_CURSOR`, and it read the same absolute
+        // pair for itself — push the parent's pointer down again, now that the offsets are known
+        let at = screen.cursor;
+        screen.place_cursor(at);
     }
 
     fn load_one(r: &mut Renderer, paths: &GamePaths, name: &str, controls: Arc<ControlLibrary>, fe_strings: Arc<Strings>) -> anyhow::Result<Self> {
@@ -580,6 +875,29 @@ impl LayoutScreen {
         // draws — the second is where `NFS5.CARSETTINGBUTTON` and its like keep all of their art
         let mut wanted: Vec<(String, usize)> = Vec::new();
         for e in &layout.elements {
+            // `NFS5.AnimatingPicture` cycles a whole run of frames rather than drawing one
+            // (§4.53), so its pack has to give up all of them
+            if e.class == "NFS5.AnimatingPicture"
+                && let Some(file) = e.get("shapePathName").filter(|f| !f.is_empty())
+            {
+                let a = e.int("start_frame").unwrap_or(0).max(0) as usize;
+                let b = e.int("end_frame").unwrap_or(0).max(0) as usize;
+                for n in a.min(b)..=a.max(b) {
+                    wanted.push((file.to_string(), n));
+                }
+            }
+            // and a bottom-bar button has three runs of its own (§4.53)
+            if e.class == "NFS5.BOTTOMBARBUTTON"
+                && let Some(file) = e.get("shapePathName").filter(|f| !f.is_empty())
+            {
+                for (s, t) in [("startframe", "endframe"), ("hoverstartframe", "hoverendframe"), ("hovermousedownstartframe", "hovermousedownendframe")] {
+                    let a = e.int(s).unwrap_or(0).max(0) as usize;
+                    let b = e.int(t).unwrap_or(0).max(0) as usize;
+                    for n in a.min(b)..=a.max(b) {
+                        wanted.push((file.to_string(), n));
+                    }
+                }
+            }
             if let Some((file, index)) = e.shape() {
                 wanted.push((file.to_string(), index));
             }
@@ -614,7 +932,26 @@ impl LayoutScreen {
                     }
                     p.value(key)
                 };
-                let Some(file) = attr("shapePathName").filter(|v| !v.is_empty()) else { continue };
+                // the same `%<part>.<key>%` indirection the draw resolves: without it the
+                // loader asked the art packs for a file literally called
+                // `"%picnonsel.shapePathName%"` and quietly got nothing
+                let file = match attr("shapePathName").filter(|v| !v.is_empty()) {
+                    Some(v) => match v.strip_prefix('%').and_then(|v| v.strip_suffix('%')) {
+                        Some(inner) => match inner.split_once('.') {
+                            Some(("data", k)) => match e.get(k).filter(|v| !v.is_empty()) {
+                                Some(v) => v,
+                                None => continue,
+                            },
+                            Some((part, k)) => match c.part(part).and_then(|q| q.value(k)).filter(|v| !v.is_empty()) {
+                                Some(v) => v,
+                                None => continue,
+                            },
+                            None => continue,
+                        },
+                        None => v,
+                    },
+                    None => continue,
+                };
                 let index = match attr("shapeIndex") {
                     Some(v) => match v.trim().strip_prefix("data.") {
                         Some(k) => match e.int(k) {
@@ -631,6 +968,28 @@ impl LayoutScreen {
                 wanted.push((file.to_string(), index));
             }
         }
+        // A `NFS5.HEADER` sweeps a glint across the screen (§4.25). Its activate builds
+        // `"%sweeicons.fsh"` from the art directory and looks the entry up **by its tag**,
+        // `"GLNT"` (0x4CADC0), so the port does the same rather than carry the index.
+        let glint = layout.elements.iter().any(|e| matches!(e.class.as_str(), "NFS5.HEADER" | "NFS5.CarLogo")).then(|| {
+            let p = GamePaths::find_file(&art, "weeicons.fsh")?;
+            let d = std::fs::read(p).ok()?;
+            let pack = nfs_formats::fsh::Fsh::parse(&d).ok()?;
+            let n = pack.entries.iter().position(|e| e.name.trim_end_matches('\0').eq_ignore_ascii_case("GLNT"))?;
+            wanted.push(("weeicons.fsh".to_string(), n));
+            Some(n)
+        }).flatten();
+        // `NFS5.ColorBox`'s picker draws one sprite, the `weeicons.fsh` entry tagged **`COLB`**
+        // that its factory looks up at 0x4C390C — the same by-tag lookup as the glint's
+        // (`RE/notes/controls.md` §4.47, §4.48)
+        let colb = layout.elements.iter().any(|e| e.class == "NFS5.ColorBox").then(|| {
+            let p = GamePaths::find_file(&art, "weeicons.fsh")?;
+            let d = std::fs::read(p).ok()?;
+            let pack = nfs_formats::fsh::Fsh::parse(&d).ok()?;
+            let n = pack.entries.iter().position(|e| e.name.trim_end_matches('\0').eq_ignore_ascii_case("COLB"))?;
+            wanted.push(("weeicons.fsh".to_string(), n));
+            Some(n)
+        }).flatten();
         // A `NFS5.ListBox` that overflows grows a scrollbar of its own — a `NFS5.VerticalSlider`,
         // which is no widget of any layout, so its art has to be asked for here
         if layout.elements.iter().any(|e| e.class == "NFS5.ListBox")
@@ -675,6 +1034,13 @@ impl LayoutScreen {
             want.push(BADGE_NAME_FONT.to_string());
             want.push(BADGE_RANK_FONT.to_string());
         }
+        // and `NFS5.ColorBox`'s picker builds two of its own: 0x4C3A3A loads `Universc11b.ffn`
+        // into `[this+0x294]` for the buttons and 0x4C3A76 `Univers7b.ffn` into `[+0x298]` for the
+        // title (`RE/notes/controls.md` §4.48)
+        if layout.elements.iter().any(|e| e.class == "NFS5.ColorBox") {
+            want.push(PICKER_BUTTON_FONT.to_string());
+            want.push(PICKER_TITLE_FONT.to_string());
+        }
         for e in &layout.elements {
             if let Some(f) = e.get("fontPathName").filter(|f| !f.is_empty()) {
                 want.push(f.to_lowercase());
@@ -714,7 +1080,32 @@ impl LayoutScreen {
         let mut unrendered: Vec<(String, usize)> = counts.into_iter().collect();
         unrendered.sort();
         tracing::info!(name, elements = layout.elements.len(), art = shapes.len(), fonts = fonts.len(), skipped = unrendered.len(), "layout loaded");
-        Ok(Self { layout, background: None, shapes, fonts, white, unrendered, logos: HashMap::new(), checks: HashMap::new(), knobs: HashMap::new(), closed: std::collections::HashSet::new(), groups: HashMap::new(), bars: HashMap::new(), lists: HashMap::new(), car_views: HashMap::new(), track_maps: HashMap::new(), movies: HashMap::new(), ko_strip: HashMap::new(), badges: HashMap::new(), clock_ms: 0, controls, fe_strings, transition: Transition::Idle, overlay: false })
+        Ok(Self { layout, background: None, shapes, fonts, white, unrendered, logos: HashMap::new(), checks: HashMap::new(), knobs: HashMap::new(), closed: std::collections::HashSet::new(), groups: HashMap::new(), bars: HashMap::new(), lists: HashMap::new(), car_views: HashMap::new(), track_maps: HashMap::new(), movies: HashMap::new(), ko_strip: HashMap::new(), badges: HashMap::new(),
+            // `NFS_FE_CLOCK` preloads the screen clock in milliseconds, so a still can be taken
+            // part way through an animation the front end would otherwise only show in motion
+            clock_ms: std::env::var("NFS_FE_CLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0), glint, colb,
+            // `NFS_FE_CURSOR=x,y` parks the pointer for a still, the way `NFS_FE_CLOCK` parks the
+            // clock — a screenshot has no pointer of its own
+            cursor: std::env::var("NFS_FE_CURSOR").ok().and_then(|v| {
+                let (a, b) = v.split_once(',')?;
+                Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+            }),
+            // `NFS_FE_PRESS=1` holds the button down for a still, the pair of `NFS_FE_CURSOR`
+            pressed: std::env::var("NFS_FE_PRESS").ok().is_some_and(|v| v != "0"),
+            capture: None,
+            // `NFS_FE_OPEN=<index>` drops a combo's list open for a still
+            open_combo: std::env::var("NFS_FE_OPEN").ok().and_then(|v| v.parse().ok()),
+            picker: Picker::default(),
+            pads: Vec::new(),
+            pad_sel: 0,
+            deadzone: Vec::new(),
+            dz_grab: None,
+            dz_hover: None,
+            knob_at: None,
+            scroll: HashMap::new(),
+            hover_ms: 0,
+            hover_of: None,
+            controls, fe_strings, transition: Transition::Idle, overlay: false })
     }
 
     /// The widgets the screen does not draw: the classes whose content comes from the executable,
@@ -815,6 +1206,270 @@ impl LayoutScreen {
         }
     }
 
+    /// Every part expression on this screen that does **not** resolve, as
+    /// `(class, part, key, expression)`.
+    ///
+    /// `reference` answers `None` for a name it cannot resolve and every caller falls back to a
+    /// zero or to the widget's box, so a template the port cannot evaluate is silent. This is the
+    /// measurement of that: `--layout-sweep` with `NFS_EXPR_SWEEP=1` runs it over all 98 layouts.
+    pub fn expr_failures(&self) -> Vec<(String, String, String, String)> {
+        let mut out = Vec::new();
+        for e in self.layout.elements.iter() {
+            let Some(c) = self.controls.get(&e.class) else { continue };
+            let state = e.get("state").unwrap_or("normal");
+            for name in c.state_parts(state) {
+                let Some(p) = c.part(&name) else { continue };
+                for key in ["pos", "size"] {
+                    let Some(v) = self.part_attr(e, p, key).filter(|v| !v.trim().is_empty()) else { continue };
+                    if nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)).is_none() {
+                        out.push((e.class.clone(), name.clone(), key.to_string(), v.to_string()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The shared bar painter **0x521CB0**: the span `lo … hi` of the box, as one cell per per
+    /// cent, coloured by `at`. `NFS5.GouraudIndicatorBar` and `NFS5.DEADZONE` both draw through it.
+    fn gouraud_bar(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32, lo: f32, hi: f32, at: &dyn Fn(f32) -> [f32; 4]) {
+        if hi <= lo {
+            return;
+        }
+        let cell = w / 100.0;
+        for p in lo as u32..hi as u32 {
+            out.push(self.quad(aspect, x + p as f32 * cell, y, cell, h.max(1.0), at(p as f32 + 0.5)));
+        }
+    }
+
+    /// `NFS5.DEADZONE`'s hit test, **0x51BBA0** — which of the bar's four handles the pointer is
+    /// on, or 0 for none.
+    ///
+    /// The handles sit at `x0 + half ∓ minPx` and `x0 + half ∓ maxPx`, each with a **±2**
+    /// tolerance, and they are tested in the order 1, 3, 2, 4 with no early exit, so a later hit
+    /// wins (0x51BC28…0x51BC90). The jump table at 0x51BE14 then sends **1 and 3** to the `.Min`
+    /// arm and **2 and 4** to the `.Max` one.
+    fn deadzone_region(&self, e: &nfs_formats::lay::Element, i: usize, px: f32) -> u32 {
+        let _ = i;
+        let (x0, _) = self.position_of(e);
+        let (w, _) = self.box_of(e, 0);
+        let half = (w as i32 / 2).max(1);
+        let n = self.attr_num(e, "hackindex").unwrap_or(0.0) as usize;
+        let dz = self.deadzone.get(self.pad_sel).copied().unwrap_or(DEADZONE_DEFAULT)[n.min(7)];
+        let px = px as i32;
+        let pix = |v: i32| v * half / 128;
+        let c = x0 as i32 + half;
+        let mut hit = 0;
+        for (centre, region) in [(c - pix(dz[0]), 1), (c + pix(dz[0]), 3), (c - pix(dz[1]), 2), (c + pix(dz[1]), 4)] {
+            if px >= centre - 2 && px <= centre + 2 {
+                hit = region;
+            }
+        }
+        hit
+    }
+
+    /// `NFS5.DEADZONE`'s setter, **0x51BD10** — the value is **centre-relative**, and the two
+    /// handles keep five units apart:
+    ///
+    /// ```text
+    /// 0x51BD4F  half  = (box.r - box.l) / 2
+    /// 0x51BD51  v     = |x - box.l - half| * 128 / half
+    /// 0x51BD84  region 1 or 3: accessorMin = clamp(v, 0, accessorMax - 5)
+    /// 0x51BDC9  region 2 or 4: accessorMax = clamp(v, accessorMin + 5, 0x80)
+    /// ```
+    fn deadzone_set(&mut self, e: &nfs_formats::lay::Element, region: u32, px: f32) {
+        if region == 0 {
+            return;
+        }
+        let (x0, _) = self.position_of(e);
+        let (w, _) = self.box_of(e, 0);
+        let half = (w as i32 / 2).max(1);
+        let v = ((px as i32 - x0 as i32 - half).abs() * 128 / half).clamp(0, 0x80);
+        let n = (self.attr_num(e, "hackindex").unwrap_or(0.0) as usize).min(7);
+        let pad = self.pad_sel;
+        if self.deadzone.len() <= pad {
+            self.deadzone.resize(pad + 1, DEADZONE_DEFAULT);
+        }
+        self.deadzone[pad][n] = deadzone_clamp(region, v, self.deadzone[pad][n]);
+    }
+
+    /// The bar the pointer pressed on, and which handle — `FEDeadZone`'s slot 5, **0x51BB60**: it
+    /// hit-tests (0x51BBA0), keeps the answer in `[this+0x140]`, takes focus (0x4C7D70) and sets
+    /// the value straight away (0x51BD10). Answers whether it took the press.
+    pub fn deadzone_press(&mut self, px: f32, py: f32) -> bool {
+        let Some((i, region)) = self.deadzone_at(px, py) else { return false };
+        self.dz_grab = Some((i, region));
+        let e = self.layout.elements[i].clone();
+        self.deadzone_set(&e, region, px);
+        true
+    }
+
+    /// Slot 8, **0x51BCD0** — two arms. While `[this+0x140]` holds a handle it drags it
+    /// (0x51BCEB → 0x51BD10); with nothing held it hit-tests instead and keeps the answer in
+    /// `[this+0x144]` (0x51BCFD → 0x51BD02), which is the **hover** the draw colours amber.
+    pub fn deadzone_drag(&mut self, px: f32, py: f32) {
+        if let Some((i, region)) = self.dz_grab {
+            let e = self.layout.elements[i].clone();
+            self.deadzone_set(&e, region, px);
+            return;
+        }
+        self.dz_hover = self.deadzone_at(px, py);
+    }
+
+    /// Slot 9, **0x51BCB0** — the release clears the focus and drops the grab.
+    pub fn deadzone_release(&mut self) {
+        self.dz_grab = None;
+    }
+
+    /// Which `NFS5.DEADZONE` the pointer is inside, and on which handle.
+    fn deadzone_at(&self, px: f32, py: f32) -> Option<(usize, u32)> {
+        if !self.any_analogue() {
+            return None;
+        }
+        for (i, e) in self.layout.elements.iter().enumerate() {
+            if e.class != "NFS5.DEADZONE" {
+                continue;
+            }
+            let (x, y) = self.position_of(e);
+            let (w, h) = self.box_of(e, 0);
+            if !(px >= x && px <= x + w && py >= y && py <= y + h) {
+                continue;
+            }
+            let r = self.deadzone_region(e, i, px);
+            if r != 0 {
+                return Some((i, r));
+            }
+        }
+        None
+    }
+
+    /// The sixteen dead-zone values for the selected pad, `[min, max]` per axis.
+    pub fn deadzone_values(&self) -> [[i32; 2]; 8] {
+        self.deadzone.get(self.pad_sel).copied().unwrap_or(DEADZONE_DEFAULT)
+    }
+
+    /// Put them back — what the save block carries (`savegame.md` §472).
+    pub fn set_deadzone_values(&mut self, pad: usize, v: [[i32; 2]; 8]) {
+        if self.deadzone.len() <= pad {
+            self.deadzone.resize(pad + 1, DEADZONE_DEFAULT);
+        }
+        self.deadzone[pad] = v;
+    }
+
+    /// Hand the front end the analogue devices it can see, and which one is selected. Empty —
+    /// which is what this port has with no pad attached — makes `NFS5.DEADZONE` draw nothing, the
+    /// same answer 0x51B60D gives.
+    pub fn set_pads(&mut self, pads: Vec<FePad>, selected: usize) {
+        self.deadzone.resize(pads.len().max(1), DEADZONE_DEFAULT);
+        self.pad_sel = selected.min(pads.len().saturating_sub(1));
+        self.pads = pads.clone();
+        for g in self.groups.values_mut() {
+            g.set_pads(pads.clone(), selected);
+        }
+    }
+
+    /// Is any analogue device enumerated — `0x51F2B0`, which walks the device list and answers true
+    /// at the first record whose class byte is **4** and whose info block's `[+4] & 1` is set.
+    fn any_analogue(&self) -> bool {
+        self.pads.iter().any(|p| p.analogue)
+    }
+
+    /// The **n-th** analogue device — `0x51F1D0`, which counts only those records and answers the
+    /// device index of the one the accessor's pad number names.
+    fn nth_analogue(&self, n: usize) -> Option<&FePad> {
+        self.pads.iter().filter(|p| p.analogue).nth(n)
+    }
+
+    /// `NFS5.DEADZONE`'s eight bars — its own **slot 15**, 0x51B5F0, read end to end
+    /// (`RE/notes/controls.md` §4.17).
+    ///
+    /// ```text
+    /// 0x51B606  no analogue device at all -> draw nothing          ; 0x51F2B0
+    /// 0x51B622  device = 0x51F1D0(accessorMin->pad)
+    /// 0x51B639  hackindex 0…7 -> capability 0x24…0x2B
+    /// 0x51B687  0x51F7A0 gates on the axis bit and answers its value; false -> draw nothing
+    /// 0x51B70B  half = (r - l) / 2
+    /// 0x51B714  minPixels = accessorMin * half / 128
+    /// 0x51B72D  maxPixels = accessorMax * half / 128
+    /// 0x51B748  minPct = minPixels * 100 / half,  maxPct = maxPixels * 100 / half
+    /// 0x51B784  band 1: box (l+1, t, l+1+half, b), span 100-maxPct … 100-minPct,
+    ///                   stops 0xFFFDB306, 0xFFFFD76C, 0xFFE60000
+    /// 0x51B7D0  band 2: box (l+half-1, t, l+2*half-1, b), span minPct … maxPct,
+    ///                   stops 0xFFE60000, 0xFFFFD76C, 0xFFFDB306   — the triple reversed
+    /// ```
+    ///
+    /// so the bar mirrors about its centre, and the factory's 0 / 0x80 lights both halves whole.
+    fn deadzone_bars(&self, out: &mut Vec<Sprite>, aspect: f32, e: &nfs_formats::lay::Element, x: f32, y: f32, w: f32, h: f32, tint: impl Fn([u8; 4]) -> [f32; 4]) {
+        if !self.any_analogue() {
+            return;
+        }
+        let n = self.attr_num(e, "hackindex").unwrap_or(0.0) as usize;
+        if n > 7 {
+            return;
+        }
+        let Some(pad) = self.nth_analogue(self.pad_sel) else { return };
+        if pad.axes >> n & 1 == 0 {
+            return;
+        }
+        let half = (w as i32 / 2).max(1);
+        let dz = self.deadzone.get(self.pad_sel).copied().unwrap_or(DEADZONE_DEFAULT)[n];
+        let pct = |v: i32| {
+            let pixels = v * half / 128;
+            (pixels * 100 / half) as f32
+        };
+        let (lo, hi) = (pct(dz[0]), pct(dz[1]));
+        let ramp = |a: [u8; 4], b: [u8; 4], c: [u8; 4]| {
+            let (a, b, c) = (tint(a), tint(b), tint(c));
+            move |p: f32| -> [f32; 4] {
+                let (s, t, u) = if p < 50.0 { (a, b, p / 50.0) } else { (b, c, (p - 50.0) / 50.0) };
+                std::array::from_fn(|j| s[j] + (t[j] - s[j]) * u)
+            }
+        };
+        const RED: [u8; 4] = [0xE6, 0x00, 0x00, 0xFF];
+        const PALE: [u8; 4] = [0xFF, 0xD7, 0x6C, 0xFF];
+        const ORANGE: [u8; 4] = [0xFD, 0xB3, 0x06, 0xFF];
+        let hw = half as f32;
+        self.gouraud_bar(out, aspect, x + 1.0, y, hw, h, 100.0 - hi, 100.0 - lo, &ramp(ORANGE, PALE, RED));
+        self.gouraud_bar(out, aspect, x + hw - 1.0, y, hw, h, lo, hi, &ramp(RED, PALE, ORANGE));
+
+        // The five bars over the gradient — 0x51B7FA…0x51BAE1. Each is a `0x4D9280` fill with an
+        // outline primitive over it, and all five share the box's own height.
+        //
+        // ```text
+        // 0x51B802  marker : x = box.l + (box.w - 10) * axis / 65536   (1/65536 at 0x5B25C0)
+        // 0x51B852           0x4D9280(x, y, 10.0, h, 0x4D87C0(fade))   — always amber
+        // 0x51B875           0x521810(x, y, 10.0, h, fade)             — its outline
+        // 0x51B8B0  handle : x = box.l + half -+ pixels - 2,  5.0 wide
+        // 0x51B889           0x4D87C0(fade) amber when [this+0x144] names it, else 0x4D87B0 red
+        // 0x51B903           0x521050(x, y, 5.0, h, fade, 3) when [this+0x140] holds it,
+        // 0x51B916           0x521250(...) otherwise
+        // ```
+        //
+        // and the four handles are visited **1, 3, 2, 4** (0x51B883, 0x51B924, 0x51B9C3,
+        // 0x51BA64) — the min pair either side of the centre first, then the max pair — which is
+        // the order the hit test walks them in too.
+        //
+        // The marker's divisor pins the device's range: the image sets **no** `DIPROP_RANGE`
+        // (0x56FD70's only `SetProperty` is `DIPROP_BUFFERSIZE`, GUID 1), so an absolute axis
+        // keeps DirectInput's own 0…65535, and `(w - 10) * v / 65536` puts a ten-pixel marker
+        // exactly inside the box at either end.
+        out.push(self.quad(aspect, x + deadzone_marker(w as i32, pad.values[n]), y, 10.0, h, tint([0xFF, 0xBB, 0x00, 0xFF])));
+        // 0x521810, the marker's own outline, is read but not ported — see §4.17.
+        for (region, centre) in deadzone_handles(w as i32, dz) {
+            let hot = self.dz_hover.is_some_and(|(_, r)| r == region);
+            let col = if hot { [0xFF, 0xBB, 0x00, 0xFF] } else { [0xBC, 0x00, 0x00, 0xFF] };
+            let hx = x + centre - 2.0;
+            out.push(self.quad(aspect, hx, y, 5.0, h, tint(col)));
+            // only the held handle's outline is the traced 0x521050; the other primitive,
+            // 0x521250, is a second four-band bevel whose palette is read (0xE5FFFFFF, 0x80FFFFFF,
+            // 0x80000000, 0x00FFFFFF, 0x00000000, 0xB2FFFFFF, 0xCCFFFFFF, 0xCC000000) but whose
+            // band-to-colour mapping is not pinned, so it is left out rather than guessed at
+            if self.dz_grab.is_some_and(|(_, r)| r == region) {
+                self.bevel(out, aspect, hx, y, 5.0, h, 3.0);
+            }
+        }
+    }
+
     /// What one part of a widget actually covers: a `SHAPE`'s `.fsh` entry at its own pixel size,
     /// or a `TEXT`/`LOCALIZEDTEXT`'s string measured in the font that part draws it in.
     fn part_extent(&self, e: &nfs_formats::lay::Element, p: &nfs_formats::ctr::Part) -> Option<(f64, f64)> {
@@ -855,13 +1510,132 @@ impl LayoutScreen {
     /// `size.value`, which for most classes is an expression over the block's keys
     /// (`data.width,data.height` for a button, `data.width,data.selectionboxmaxheight` for a list).
     fn box_of(&self, e: &nfs_formats::lay::Element, depth: u32) -> (f32, f32) {
+        // an autosizing class is as big as what it draws (§4.62), and `NFS_BOX_SWEEP=1` measured
+        // where that differs from the template's `size.value`: 411 headers and labels whose
+        // expression this port cannot evaluate and so answered (0, 0), 82 car-setting buttons
+        // whose art is 15 wide where the template says 13, and four camera pictures the block
+        // calls 15x13 and whose parts cover 105x78.
+        //
+        // **Only at depth 0**, which is to say only for the widget's own box and never for a
+        // `control.size.*` term inside a part's expression. §4.64: those two are not the same
+        // thing in the original either — 31 of the templates that reference `control.size.width`
+        // autosize, and if that term went through the box the union would re-enter itself before
+        // `computeBox` sets its valid flag (0x525516) and never come back. The term is the `size`
+        // attribute; the box is the union.
+        if depth == 0
+            && e.pair("size").is_none()
+            && self.controls.get(&e.class).and_then(|c| c.value("autosize")).map(|v| v.trim() != "0").unwrap_or(false)
+            && let Some(u) = self.parts_union(e)
+        {
+            return u;
+        }
+        self.box_sized(e, depth, false)
+    }
+
+    /// The box a widget is **hit-tested** against, which is the template's `size.value` with the
+    /// part-relative terms measured — `box_of` leaves those unresolved for the reason it gives, and
+    /// the difference only ever shows on a class whose size is written over its parts.
+    ///
+    /// Two of them have a hover state and so can be hit at all: `BottomBarButton.ctr`'s
+    /// `(label.size.width + picture.size.width + data.space), data.height` and
+    /// `Graphic Tab Button.ctr`'s `hoverbg.size.width, hoverbg.size.height`. Without this the box
+    /// came out (0, 0) and the 27 of them could not be pointed at (§4.53, §4.54).
+    ///
+    /// **Only where `size.value` is live.** §4.62: `Control::getSize` 0x525360 and
+    /// `computeBox` 0x5253C0 both branch on the `autosize` attribute (`[this+0xF0]`, bound at
+    /// 0x52498A), and when it is set the box is the **union of the parts the current state
+    /// draws**, not the `size` expression at all. Seven of the seventy shipped templates set it to
+    /// 0 — `BottomBarButton`, `ComboBox`, `ColorBox`, `GoToButton`, `Graphic Tab Button`,
+    /// `MultiAccessor` and `OvalThing` — and only those seven have a `size.value` the original
+    /// ever evaluates.
+    fn box_hit(&self, e: &nfs_formats::lay::Element) -> (f32, f32) {
+        let live = self.controls.get(&e.class).and_then(|c| c.value("autosize")).map(|v| v.trim() == "0").unwrap_or(false);
+        if !live && let Some(p) = self.parts_union(e) {
+            return p;
+        }
+        self.box_sized(e, 0, live)
+    }
+
+    /// Every widget whose two boxes disagree: what the template's `size.value` says and what the
+    /// union of its parts says. For an autosizing class the original uses the union (§4.62), and
+    /// this port's *drawing* still uses `size.value` — so this is the list of places where that
+    /// choice could show. `NFS_BOX_SWEEP=1` prints it.
+    pub fn box_disagreements(&self) -> Vec<(String, (f32, f32), (f32, f32))> {
+        let mut out = Vec::new();
+        for e in self.layout.elements.iter().skip(1) {
+            let autosizes = self.controls.get(&e.class).and_then(|c| c.value("autosize")).map(|v| v.trim() != "0").unwrap_or(false);
+            if !autosizes || e.pair("size").is_some() {
+                continue;
+            }
+            let Some(u) = self.parts_union(e) else { continue };
+            let b = self.box_of(e, 0);
+            if (b.0 - u.0).abs() > 1.0 || (b.1 - u.1).abs() > 1.0 {
+                out.push((e.class.clone(), b, u));
+            }
+        }
+        for g in self.groups.values() {
+            out.extend(g.box_disagreements());
+        }
+        out
+    }
+
+    /// The box an **autosizing** widget gets: the union of the rects of the parts its state draws,
+    /// started at the origin — `Control::computeBox` 0x5253C0, the branch at 0x525446.
+    ///
+    /// ```text
+    /// left = top = right = bottom = 0                      ; 0x5253E9…0x525403
+    /// for each name in the state's part list:
+    ///     part = lookupPart(this, name)                     ; 0x525620, skipped when < 0
+    ///     r    = part->slot2()                              ; the part's own rect
+    ///     left = min(left, r.left);  top    = min(top,    r.top)
+    ///     right= max(right, r.right); bottom = max(bottom, r.bottom)
+    /// ```
+    ///
+    /// Because it starts at zero the box always contains the widget's own origin, so it can only
+    /// grow from there. The port takes each part's `pos` and `size` the way it draws them, falling
+    /// back to what the part measures when the template gives it no size (§4.54's `part_extent`).
+    fn parts_union(&self, e: &nfs_formats::lay::Element) -> Option<(f32, f32)> {
+        let c = self.controls.get(&e.class)?;
+        let state = e.get("state").unwrap_or("normal");
+        let (mut r, mut b) = (0.0f32, 0.0f32);
+        let (mut l, mut t) = (0.0f32, 0.0f32);
+        let mut any = false;
+        for p in c.state_parts(state).iter().filter_map(|n| c.part(n)) {
+            // only what the state **draws**. A `DATA` part is the widget's attribute block, not a
+            // rect, and its `pos` carries a screen key that resolves to the widget's own `pos=` —
+            // unioning that would drag the box back to the screen's origin.
+            if !matches!(
+                p.kind(),
+                nfs_formats::ctr::PartKind::Rect
+                    | nfs_formats::ctr::PartKind::Shape
+                    | nfs_formats::ctr::PartKind::Text
+                    | nfs_formats::ctr::PartKind::LocalizedText
+            ) {
+                continue;
+            }
+            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)));
+            let (px, py) = at("pos").unwrap_or((0.0, 0.0));
+            let (pw, ph) = match at("size") {
+                Some(v) => v,
+                None => self.part_extent(e, p).unwrap_or((0.0, 0.0)),
+            };
+            l = l.min(px as f32);
+            t = t.min(py as f32);
+            r = r.max(px as f32 + pw as f32);
+            b = b.max(py as f32 + ph as f32);
+            any = true;
+        }
+        (any && r - l >= 1.0 && b - t >= 1.0).then_some((r - l, b - t))
+    }
+
+    fn box_sized(&self, e: &nfs_formats::lay::Element, depth: u32, measure: bool) -> (f32, f32) {
         if let Some(p) = e.pair("size") {
             return p;
         }
         if depth <= 4
             && let Some(c) = self.controls.get(&e.class)
             && let Some(v) = c.value("size")
-            && let Some((w, h)) = nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, depth + 1, false))
+            && let Some((w, h)) = nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, depth + 1, measure))
         {
             return (w as f32, h as f32);
         }
@@ -946,8 +1720,12 @@ impl LayoutScreen {
     /// boxes — `NFS5.CONTROLLERSETUP` is a filled box with a one-pixel border — draws without the
     /// port knowing anything about it.
     fn rect_parts(&self, e: &nfs_formats::lay::Element) -> Vec<(f32, f32, f32, f32, [u8; 4])> {
+        self.rect_parts_in(e, e.get("state").unwrap_or("normal"))
+    }
+
+    /// The same, in a named state — what a widget that can change state needs.
+    fn rect_parts_in(&self, e: &nfs_formats::lay::Element, state: &str) -> Vec<(f32, f32, f32, f32, [u8; 4])> {
         let Some(c) = self.controls.get(&e.class) else { return Vec::new() };
-        let state = e.get("state").unwrap_or("normal");
         let mut out = Vec::new();
         for p in c.state_parts(state).iter().filter_map(|n| c.part(n)) {
             if p.kind() != nfs_formats::ctr::PartKind::Rect {
@@ -1023,10 +1801,16 @@ impl LayoutScreen {
     /// last rule is how a class carries several captions and shows one (`controls.md` §4.3).
     #[allow(clippy::too_many_arguments)]
     fn template_widget(&self, out: &mut Vec<Sprite>, aspect: f32, e: &nfs_formats::lay::Element, state: &str, x: f32, y: f32, strings: &Strings) {
+        self.template_widget_at(out, aspect, e, state, x, y, strings, None)
+    }
+
+    /// The same, with the `picture` part pinned to one entry of its pack — the animation of §4.53.
+    #[allow(clippy::too_many_arguments)]
+    fn template_widget_at(&self, out: &mut Vec<Sprite>, aspect: f32, e: &nfs_formats::lay::Element, state: &str, x: f32, y: f32, strings: &Strings, frame: Option<usize>) {
         for (px, py, pw, ph, col) in self.state_rects(e, state) {
             out.push(self.quad(aspect, x + px, y + py, pw.max(1.0), ph.max(1.0), tint(col)));
         }
-        for (px, py, pw, ph, file, index, flip) in self.shape_parts(e) {
+        for (px, py, pw, ph, file, index, flip) in self.shape_parts_at(e, frame) {
             let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
             let (dw, dh) = (if pw > 0.0 { pw } else { aw }, if ph > 0.0 { ph } else { ah });
             let (pos, size) = self.place(aspect, x + px, y + py, dw, dh);
@@ -1092,31 +1876,38 @@ impl LayoutScreen {
     /// `nonselindex` picks the arrow. The same shape covers `NFS5.POPUPCIRCLE`,
     /// `NFS5.ExtraCircle`, the tab buttons and the rest of the art-from-template classes.
     fn shape_parts(&self, e: &nfs_formats::lay::Element) -> Vec<(f32, f32, f32, f32, String, usize, i64)> {
-        // `NFS5.POPUPCIRCLE` is a **modal panel the game raises**, not part of the screen behind
-        // it, and it is skipped until this port has somewhere to raise one from. Three measurements
-        // say so, and drawing it anyway was tried and looks exactly as they predict:
+        self.shape_parts_at(e, None)
+    }
+
+    /// The same, with the `picture` part's entry replaced — what `NFS5.BOTTOMBARBUTTON`'s tick
+    /// does every frame through `0x5271F0([this+0x17C], frame)` (§4.53).
+    fn shape_parts_at(&self, e: &nfs_formats::lay::Element, frame: Option<usize>) -> Vec<(f32, f32, f32, f32, String, usize, i64)> {
+        // `NFS5.POPUPCIRCLE` **is drawn**, and the reading that said otherwise rested on the
+        // draw order being the wrong way round (§4.67).
         //
-        // * `PopUp.ctr` pins it at `pos=113,100` (`HIDDEN|READONLY`) and tiles **one** 207×175
-        //   quarter four ways — `p1`…`p4` at (0,0), (207,0), (0,175), (207,175) with `flip` 0…3 —
-        //   so it is a 414×350 oval over the middle of a 640×480 screen, not a border around it;
-        // * the template's states are `normal` and **`hidden`**, and `[state.hidden]` draws only
-        //   `data`, which is nothing;
-        // * in **18 of the 19** layouts that carry one it is the **last** section, so it draws over
-        //   everything else. (The exception is `factdone.lay`, where a `NFS5.HEADER` follows it.)
+        // `PopUp.ctr` pins it at `pos=113,100` (`HIDDEN|READONLY`) and tiles **one** 207×175
+        // quarter four ways — `p1`…`p4` at (0,0), (207,0), (0,175), (207,175) with `flip` 0…3 —
+        // a 414×350 oval over the middle of a 640×480 screen. Its states are `normal` and
+        // `hidden`, and `[state.hidden]` draws only `data`, which is nothing.
         //
-        // Drawn unconditionally on `selectname.lay` it covers the profile list and the buttons with
-        // a translucent oval, which is what a panel meant to be raised over them would do.
+        // **Nothing can put it in that state.** Neither the class id `NFS5.POPUPCIRCLE` nor the
+        // widget name `ID_POPUPCIRCLE` appears anywhere in the executable — a byte search of the
+        // whole image finds neither — so there is no class code and no lookup by name that could
+        // reach `setHidden`. And all **19** shipped blocks carry `state=normal`. It is therefore
+        // on, on every one of those screens, always.
         //
-        // **Not** skipped because of `swrenderoff`: that key reaches `[widget+0x13C]` at 0x4C7733
-        // and 0x4C7750 and a scan of the whole `.text` for the displacement finds those two writes
-        // and **no read at all**, so it is dead in this build (CONFIRMED by exhaustion).
-        if e.class == "NFS5.POPUPCIRCLE" {
-            return Vec::new();
-        }
+        // The old note argued from its being the **last** section in 18 of the 19 that it "draws
+        // over everything else". That was true only while this port painted sections forwards; the
+        // original walks the child vector backwards (§4.67), so the last section is painted
+        // **first** — the oval goes *under* the screen, which is what a background vignette does.
+        //
+        // **Not** gated on `swrenderoff` either: that key reaches `[widget+0x13C]` at 0x4C7733 and
+        // 0x4C7750 and a scan of the whole `.text` for the displacement finds those two writes and
+        // **no read at all**, so it is dead in this build (CONFIRMED by exhaustion).
         let Some(c) = self.controls.get(&e.class) else { return Vec::new() };
         let state = e.get("state").unwrap_or("normal");
         let mut out = Vec::new();
-        for p in c.state_parts(state).iter().filter_map(|n| c.part(n)) {
+        for (name, p) in c.state_parts(state).iter().filter_map(|n| c.part(n).map(|p| (n.clone(), p))) {
             if p.kind() != nfs_formats::ctr::PartKind::Shape {
                 continue;
             }
@@ -1134,14 +1925,21 @@ impl LayoutScreen {
             // and the **wrong entry** for the other four: every bottom-bar button drew `logoAn`
             // entry 0 where its `startframe` says 11, and every car-setting slider entry 0 of
             // `weeicons.fsh` where its knob is entry 8.
-            let Some(file) = self.part_attr(e, p, "shapePathName").filter(|v| !v.is_empty()) else { continue };
+            // `%<part>.<key>%` is the indirection of `controls.md` §2 — that other part's value
+            // for that key — and `CarSettingButton.ctr` is the one template that uses it for art:
+            // its `picsel` and `picseldown` both take `%picnonsel.shapePathName%`, so the hover
+            // and pressed arrows come out of the same pack as the plain one.
+            let Some(file) = self.part_ref(e, p, "shapePathName").filter(|v| !v.is_empty()) else { continue };
             // `shapeIndex` is a literal or a `data.<key>` reference to the widget's own attribute
-            let index = match self.part_attr(e, p, "shapeIndex") {
-                Some(v) => match nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0, true)) {
-                    Some(n) if n >= 0.0 => n as usize,
-                    _ => continue,
+            let index = match frame.filter(|_| name == "picture") {
+                Some(n) => n,
+                None => match self.part_attr(e, p, "shapeIndex") {
+                    Some(v) => match nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0, true)) {
+                        Some(n) if n >= 0.0 => n as usize,
+                        _ => continue,
+                    },
+                    None => 0,
                 },
-                None => 0,
             };
             let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)));
             let (px, py) = at("pos").unwrap_or((0.0, 0.0));
@@ -1224,6 +2022,15 @@ impl LayoutScreen {
     /// Advance the transition clock by one frame; `true` once the screen has settled or gone.
     pub fn advance_transition(&mut self, dt_ms: u32) -> bool {
         self.clock_ms = self.clock_ms.wrapping_add(dt_ms);
+        // `[widget+0x12C]` is stamped with the tick whenever the widget is *not* hovered
+        // (0x4C824D), so the count restarts the moment the pointer moves on (§4.52)
+        let on = self.hovered();
+        if on == self.hover_of {
+            self.hover_ms = self.hover_ms.saturating_add(dt_ms);
+        } else {
+            self.hover_of = on;
+            self.hover_ms = 0;
+        }
         self.transition = self.transition.advance(dt_ms);
         if let Some(b) = self.background.as_mut() {
             b.advance_transition(dt_ms);
@@ -1284,6 +2091,51 @@ impl LayoutScreen {
             .collect()
     }
 
+    /// The combo sliders and colour boxes, which take the same row binding as a list box: their
+    /// drop-down is drawn by the very same code (`FeComboBox` slot 27, 0x4C5810), reached from
+    /// slot **17** rather than slot 15 so that it lands over the widgets drawn after it.
+    pub fn combo_sliders(&self) -> Vec<ListBoxWidget> {
+        let mut out: Vec<ListBoxWidget> = self
+            .layout
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.class == "NFS5.ComboBoxSlider" || e.class == "NFS5.ColorBox")
+            .map(|(index, e)| ListBoxWidget { index, accessor: self.attr(e, "accessor").map(str::to_string) })
+            .collect();
+        let mut keys: Vec<usize> = self.groups.keys().copied().collect();
+        keys.sort_unstable();
+        let mut base = self.layout.elements.len();
+        for k in keys {
+            for w in self.groups[&k].combo_sliders() {
+                out.push(ListBoxWidget { index: base + w.index, accessor: w.accessor });
+            }
+            base += self.groups[&k].span();
+        }
+        out
+    }
+
+    /// Open one combo's list, or none. The index is the flattened one `combo_sliders` hands out.
+    ///
+    /// `FeComboBox::refreshRows` **0x4C53A0** is the rule: `[this+0x1C4]`, the height of the rows
+    /// the drop-down draws, is the accessor's own total **only when the widget holds focus or is a
+    /// list box** (0x4C53B1 asks 0x4C7DD0, 0x4C53BA asks the constructor's `[this+0x1DD]`), and
+    /// **0** otherwise — so a combo that is not focused draws no list at all.
+    pub fn set_open_combo(&mut self, index: Option<usize>) {
+        if std::env::var("NFS_FE_OPEN").is_ok() {
+            return;
+        }
+        self.open_combo = index.filter(|i| *i < self.layout.elements.len());
+        let routed = index.and_then(|i| self.route(i));
+        let keys: Vec<usize> = self.groups.keys().copied().collect();
+        for k in keys {
+            let inner = routed.filter(|(g, _)| *g == k).map(|(_, j)| j);
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.set_open_combo(inner);
+            }
+        }
+    }
+
     /// Fill a list box with the rows its accessor would hand out, and say which row the accessor
     /// has selected (`current` — the row the original paints with `highlightcolorselected`).
     pub fn set_list_rows(&mut self, index: usize, rows: Vec<ListRow>, current: Option<usize>) {
@@ -1295,9 +2147,169 @@ impl LayoutScreen {
         }
         if rows.is_empty() {
             self.lists.remove(&index);
+            self.scroll.remove(&index);
         } else {
+            self.scroll.entry(index).and_modify(|f| *f = (*f).min(rows.len().saturating_sub(1))).or_insert(0);
             self.lists.insert(index, (rows, current));
         }
+    }
+
+    /// Move a list's first drawn row. The original keeps that position in a scrollbar object of
+    /// its own — `[this+0x1BC]`, whose slot 10 the row loop asks for at 0x4C66F8 — and the
+    /// scrollbar widget `[this+0x1B8]` (0x4C5175) moves it. This port keeps the position itself
+    /// and moves it by the arrow the player clicks.
+    pub fn scroll_list(&mut self, index: usize, delta: i32) {
+        if let Some((k, j)) = self.route(index) {
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.scroll_list(j, delta);
+            }
+            return;
+        }
+        let Some((rows, _)) = self.lists.get(&index) else { return };
+        let last = self.last_first_row(index, rows);
+        let at = self.scroll.entry(index).or_insert(0);
+        *at = (*at as i32 + delta).clamp(0, last as i32 + 1) as usize;
+    }
+
+    /// The largest first row that still fills the box — walking up from the last row while the
+    /// heights fit, which is the shape of `FeComboBox`'s own loop at 0x4C54EC…0x4C5508.
+    fn last_first_row(&self, index: usize, rows: &[ListRow]) -> usize {
+        let Some(e) = self.layout.elements.get(index) else { return 0 };
+        let max_h = self.attr_num(e, "selectionboxmaxheight").unwrap_or(0.0) as f32;
+        let mut acc = 0.0;
+        let mut n = rows.len();
+        while n > 0 {
+            acc += rows[n - 1].height();
+            if acc > max_h {
+                break;
+            }
+            n -= 1;
+        }
+        n
+    }
+
+    /// A list's scrollbar, in design coordinates, when it has one.
+    ///
+    /// The regions are the ones `0x4D0CC0` hit-tests: **1** the decrement button `[+0xE0]`, **2**
+    /// the increment button `[+0xE4]`, **3** the knob `[+0xDC]`, and 4 / 5 the track either side
+    /// of it. `VerticalSlider.ctr` places them — `decrement_button` at `0,7` with `weeicons.fsh`
+    /// **13**, `increment_button` at the bottom with **14**, the knob
+    /// `decrement_button.size.width × 15`.
+    pub fn list_scrollbar(&self, index: usize) -> Option<ListScrollbar> {
+        if let Some((k, j)) = self.route(index) {
+            let g = self.groups.get(&k)?;
+            let (gx, gy) = self.position_of(self.layout.elements.get(k)?);
+            let mut b = g.list_scrollbar(j)?;
+            for r in [&mut b.up, &mut b.down, &mut b.knob] {
+                r.0 += gx;
+                r.1 += gy;
+            }
+            b.track_top += gy;
+            return Some(b);
+        }
+        let e = self.layout.elements.get(index)?;
+        let (rows, _) = self.lists.get(&index)?;
+        let max_h = self.attr_num(e, "selectionboxmaxheight").unwrap_or(0.0) as f32;
+        let full: f32 = rows.iter().map(|r| r.height()).sum();
+        if full < max_h {
+            return None;
+        }
+        let (x, y) = self.position_of(e);
+        let width = self.attr_num(e, "width").unwrap_or(0.0) as f32;
+        let (px, py) = match self.controls.get(&e.class).and_then(|c| c.part("selectionbox")).and_then(|p| p.value("pos")) {
+            Some(v) => nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)).map(|(a, b)| (x + a as f32, y + b as f32)).unwrap_or((x, y)),
+            None => (x, y),
+        };
+        let sx = px + width - LIST_SCROLLBAR_W;
+        let art = |n: usize| self.shapes.get(&("weeicons.fsh".to_string(), n)).copied();
+        let (uw, uh) = art(13).map(|(_, w, h)| (w, h)).unwrap_or((LIST_SCROLLBAR_W, 8.0));
+        let (dw, dh) = art(14).map(|(_, w, h)| (w, h)).unwrap_or((LIST_SCROLLBAR_W, 8.0));
+        let base = py + uh;
+        let span = (max_h - LIST_KNOB_H - uh).max(0.0);
+        // `+2`, not `+1`: the list's tick hands the scrollbar `rowsWalkedUp + 2` (0x4C550A) and
+        // the model keeps that as its **count** (`[model+0x14]`, slot 24 at 0x4BC310), so there is
+        // one position past the last full page — the list can be scrolled one row further and show
+        // a blank line. §4.59.
+        let positions = self.last_first_row(index, rows) + 2;
+        let at = self.scroll.get(&index).copied().unwrap_or(0);
+        let dy = if positions > 1 { at as f32 * span / (positions - 1) as f32 } else { 0.0 };
+        // A press on the **track** (regions 4 and 5, 0x4D0995) leaves the model alone and moves the
+        // knob's own rect so its top sits at the pointer (0x4D0A0A / 0x4D0A18 → 0x5276E0), then
+        // re-runs the hit test so the region becomes the knob. It lasts until the first move, which
+        // puts the model somewhere and re-places the knob from it (slot 11).
+        let ky = match self.knob_at {
+            Some((i, y)) if i == index => y,
+            _ => base + dy,
+        };
+        Some(ListScrollbar {
+            up: (sx, py + 7.0, uw, uh),
+            down: (sx, py + max_h - dh, dw, dh),
+            knob: (sx, ky, uw, LIST_KNOB_H),
+            track_top: base,
+            span,
+            positions,
+            at,
+        })
+    }
+
+    /// Put a list's first row at an absolute position, clamped — what the knob's drag does.
+    pub fn set_list_scroll(&mut self, index: usize, at: i32) {
+        if let Some((k, j)) = self.route(index) {
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.set_list_scroll(j, at);
+            }
+            return;
+        }
+        let Some((rows, _)) = self.lists.get(&index) else { return };
+        let last = self.last_first_row(index, rows) as i32;
+        self.scroll.insert(index, at.clamp(0, last + 1) as usize);
+        // the model moved, so slot 11 re-places the knob from it and the parked position is gone
+        self.knob_at = None;
+    }
+
+    /// Which row of a list the pointer is on, in the same walk `FeListBox`'s slot 8 uses —
+    /// 0x4C6F60 box-tests the pointer (0x4E2970), then accumulates row heights and takes the
+    /// **first** row whose running bottom is past the pointer's y (0x4C7013).
+    ///
+    /// This is the hovered row the draw highlights, and it is what a click lands on.
+    pub fn list_row_at(&self, index: usize, x: f32, y: f32) -> Option<usize> {
+        if let Some((k, j)) = self.route(index) {
+            let (gx, gy) = self.position_of(self.layout.elements.get(k)?);
+            return self.groups.get(&k)?.list_row_at(j, x - gx, y - gy);
+        }
+        let e = self.layout.elements.get(index)?;
+        let (rows, _) = self.lists.get(&index)?;
+        let max_h = self.attr_num(e, "selectionboxmaxheight").unwrap_or(0.0) as f32;
+        let full: f32 = rows.iter().map(|r| r.height()).sum();
+        let width = self.attr_num(e, "width").unwrap_or(0.0) as f32;
+        let panel_w = if full >= max_h { width - LIST_SCROLLBAR_W } else { width };
+        let (wx, wy) = self.position_of(e);
+        let (px, py) = match self.controls.get(&e.class).and_then(|c| c.part("selectionbox")).and_then(|p| p.value("pos")) {
+            Some(v) => nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)).map(|(a, b)| (wx + a as f32, wy + b as f32)).unwrap_or((wx, wy)),
+            None => (wx, wy),
+        };
+        if !(x >= px && x < px + panel_w && y >= py && y < py + max_h) {
+            return None;
+        }
+        let first = self.scroll.get(&index).copied().unwrap_or(0);
+        let mut acc = py;
+        rows.iter().skip(first).position(|r| {
+            acc += r.height();
+            y < acc
+        }).map(|n| n + first)
+    }
+
+    /// Park a list's knob where a press on the **track** put it, until the model moves
+    /// (`RE/notes/controls.md` §4.46 — the tail of 0x4D0995). `None` gives it back to the model.
+    pub fn park_knob(&mut self, index: usize, y: Option<f32>) {
+        if let Some((k, j)) = self.route(index) {
+            let dy = self.layout.elements.get(k).map(|e| self.position_of(e).1).unwrap_or(0.0);
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.park_knob(j, y.map(|v| v - dy));
+            }
+            return;
+        }
+        self.knob_at = y.map(|v| (index, v));
     }
 
     /// Hand an `NFS5.3DCAR` the offscreen view its car was rendered into. The view covers the whole
@@ -1838,7 +2850,8 @@ impl LayoutScreen {
             if dest.is_none() && callback.is_none() && accessor.is_none() {
                 continue;
             }
-            out.push(Control { index: i, x, y, destination: dest, callback, accessor, string_id: e.string_id() });
+            let offset = self.attr_num(e, "offset").unwrap_or(0.0) as i32;
+            out.push(Control { index: i, x, y, destination: dest, callback, accessor, string_id: e.string_id(), offset });
         }
         out.sort_by(|a, b| (a.y, a.x).partial_cmp(&(b.y, b.x)).unwrap_or(std::cmp::Ordering::Equal));
         out
@@ -1881,6 +2894,1118 @@ impl LayoutScreen {
         Sprite { texture: self.white, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5] }
     }
 
+    /// One gouraud quad of the front end's own primitive **0x4D98D0**, whose four `(x, y, colour)`
+    /// triples arrive in the order upper-left, upper-right, lower-left, lower-right (§4.7).
+    ///
+    /// APPROXIMATION, the one §4.7 already carries: the sprite pipeline has a single colour per
+    /// quad, so the quad is stepped into a grid and each cell is filled with the colour at its
+    /// middle. An axis is stepped only when something varies along it — the colour, or the two
+    /// opposite edges running out of parallel — and then by a step a pixel, to at most eight.
+    fn gouraud(&self, out: &mut Vec<Sprite>, aspect: f32, p: [[f32; 2]; 4], c: [[f32; 4]; 4]) {
+        let differs = |a: [f32; 4], b: [f32; 4]| (0..4).any(|j| (a[j] - b[j]).abs() > 1.0 / 255.0);
+        let steps = |vary: bool, extent: f32| if vary { (extent.abs().ceil() as usize).clamp(2, 8) } else { 1 };
+        // u runs UL→UR and BL→BR; v runs UL→BL and UR→BR
+        let slant_u = (p[0][1] - p[1][1]).abs() > 0.5 || (p[2][1] - p[3][1]).abs() > 0.5;
+        let slant_v = (p[0][0] - p[2][0]).abs() > 0.5 || (p[1][0] - p[3][0]).abs() > 0.5;
+        let nx = steps(differs(c[0], c[1]) || differs(c[2], c[3]) || slant_u || slant_v, p[1][0] - p[0][0]);
+        let ny = steps(differs(c[0], c[2]) || differs(c[1], c[3]) || slant_u || slant_v, p[2][1] - p[0][1]);
+        let at = |u: f32, v: f32, d: usize| {
+            let top = p[0][d] + (p[1][d] - p[0][d]) * u;
+            let bot = p[2][d] + (p[3][d] - p[2][d]) * u;
+            top + (bot - top) * v
+        };
+        for gy in 0..ny {
+            for gx in 0..nx {
+                let (u0, v0) = (gx as f32 / nx as f32, gy as f32 / ny as f32);
+                let (u1, v1) = ((gx + 1) as f32 / nx as f32, (gy + 1) as f32 / ny as f32);
+                let (u, v) = ((u0 + u1) * 0.5, (v0 + v1) * 0.5);
+                let col: [f32; 4] = std::array::from_fn(|j| {
+                    let top = c[0][j] + (c[1][j] - c[0][j]) * u;
+                    let bot = c[2][j] + (c[3][j] - c[2][j]) * u;
+                    top + (bot - top) * v
+                });
+                let xs = [at(u0, v0, 0), at(u0, v1, 0), at(u1, v0, 0), at(u1, v1, 0)];
+                let ys = [at(u0, v0, 1), at(u0, v1, 1), at(u1, v0, 1), at(u1, v1, 1)];
+                let (px, py) = (xs.iter().fold(f32::MAX, |m, v| m.min(*v)), ys.iter().fold(f32::MAX, |m, v| m.min(*v)));
+                let cw = xs.iter().fold(f32::MIN, |m, v| m.max(*v)) - px;
+                let ch = ys.iter().fold(f32::MIN, |m, v| m.max(*v)) - py;
+                out.push(self.quad(aspect, px, py, cw.max(0.5), ch.max(0.5), col));
+            }
+        }
+    }
+
+    /// The state a widget draws in, which `FeWidget::updateState` **0x4C82A0** decides from its
+    /// flag word `[this+0x10C]` and the mask `[this+0x110]` of states its template defines. The
+    /// cascade is first-match-wins, each arm jumping to the end at 0x4C842E:
+    ///
+    /// | | condition | state |
+    /// |---|---|---|
+    /// | 0x4C82E5 | flags & 0x02 | keep whatever it has — no update |
+    /// | 0x4C82FA | flags & 0x20 | `hidden` |
+    /// | 0x4C831E | flags & 0x10, or `[+0x114]` set with `[+0x110] & 0x10` | `disabled` |
+    /// | 0x4C835E | `[+0x110] & 0x80` and flags & 0x40 and flags & 0x04 | `focusedhover` |
+    /// | 0x4C839A | flags & 0x40 | `focused` |
+    /// | 0x4C83C1 | `[+0x110] & 0x100` and flags & 0x08 and flags & 0x04 | `selectedhover` |
+    /// | 0x4C83EE | flags & 0x08 | `selected` |
+    /// | 0x4C840F | flags & 0x04 | `hover` |
+    /// | | otherwise | `normal` |
+    ///
+    /// So **0x04 is hover, 0x08 selected and 0x40 focused**, and hover is the weakest of the
+    /// three — it only combines with the other two when the template names the combination.
+    ///
+    /// The glinty box a widget builds out of `data.glintybox` — `RE/notes/controls.md` §4.60.
+    ///
+    /// `0x51FDA0(0xFF000000, data.width, data.height, data.glintybox)` (0x4C9077 for a button,
+    /// from the three the bind read at 0x4C8FCF…0x4C8FF5) and `0x51FDE0` draws it: a one-pixel
+    /// outline of the box in that colour through the fade, and then §4.27's flourish with the
+    /// style — 1…4 a fixed corner and **5 a fresh `rand() % 4 + 1` each run** (0x51FE86).
+    ///
+    /// It is the same painter, behind the same `THRASH_setstate(0x1C3, 0)` gate (§4.61), that
+    /// `NFS5.GlintyRectangle` uses for its own 181 widgets — and this port draws those. Drawing
+    /// one set and not the other would be the port disagreeing with itself, so it draws both; the
+    /// gate is one uncertainty, not two, and it is `RE/AUDIT.md` §E's.
+    fn glinty_box(&self, out: &mut Vec<Sprite>, aspect: f32, e: &nfs_formats::lay::Element, i: usize, x: f32, y: f32, tint: impl Fn([u8; 4]) -> [f32; 4]) {
+        let style = match self.attr_num(e, "glintybox") {
+            Some(v) if v as i32 != -1 => v as i32,
+            _ => return,
+        };
+        // each class sizes its box its own way, and all three read the same three arguments into
+        // `0x51FDA0(0xFF000000, w, h, style)`:
+        //
+        // * `NFS5.GOTOBUTTON` — `data.width` by `data.height` (0x4C8FEA, 0x4C8FF5);
+        // * the tab buttons — `data.width` by the literal **18**, `0x12` at 0x4D0108;
+        // * the combo family — **`data.width`** (`[this+0x1C8]`, 0x4C593B) by the
+        //   `backrect`'s height, which is `data.height` (0x4C594B on `[this+0x17C]`), and it is
+        //   built lazily in the draw, only once `[+0x20C]` is still null (0x4C5937).
+        let (gw, gh) = match e.class.as_str() {
+            "NFS5.TABBUTTON" | "NFS5.GRAPHICTABBUTTON" => (self.attr_num(e, "width").unwrap_or(0.0) as f32, 18.0),
+            "NFS5.ComboBoxSlider" | "NFS5.ColorBox" | "NFS5.ListBox" => (
+                // `[this+0x1C8]` is `data.width`, not `data.selectionboxwidth`: 0x4C4FCB…0x4C5002
+                // pushes each attribute name *before* storing the previous call's answer, so the
+                // whole run is one slot along from what an earlier reading of it had. With
+                // `selectionboxwidth` here the box came out too narrow for 43 of the 86 combo
+                // sliders and had **no width at all** for the 11 colour boxes, which all carry 0.
+                self.attr_num(e, "width").unwrap_or(0.0) as f32,
+                self.attr_num(e, "height").unwrap_or(0.0) as f32,
+            ),
+            _ => (self.attr_num(e, "width").unwrap_or(0.0) as f32, self.attr_num(e, "height").unwrap_or(0.0) as f32),
+        };
+        if gw < 1.0 || gh < 1.0 {
+            return;
+        }
+        let c = tint([0, 0, 0, 0xff]);
+        for (bx, by, bw, bh) in [(x, y, gw, 1.0), (x, y + gh - 1.0, gw, 1.0), (x, y, 1.0, gh), (x + gw - 1.0, y, 1.0, gh)] {
+            out.push(self.quad(aspect, bx, by, bw, bh, c));
+        }
+        match style {
+            0 => {}
+            5 => self.glinty_flourish(out, aspect, x, y, gw as i32, gh as i32, (i % 4) as i32 + 1),
+            v @ 1..=4 => self.glinty_flourish(out, aspect, x, y, gw as i32, gh as i32, v),
+            _ => {}
+        }
+    }
+
+    /// `FeWidget::hoveredWithButtonDown`, **0x4C7CB0** — the test almost every decoration in the
+    /// front end hangs off, and which these notes read wrong until §4.55.
+    ///
+    /// It is `flags & 0x04` (hover) **and** `0x5299C0`, which is one byte, `[0x69CAE8]`, written in
+    /// exactly one place — `EventPump::poll` at 0x5297E5, with whether the button that just
+    /// changed is now **down** — and read in exactly one place, 0x5299C1. So the test is
+    /// *hovered while a mouse button is held*, not "hovered and the screen settled", and the last
+    /// three conditions are the ordinary ones: not hidden (0x20), not disabled (0x10), and not
+    /// disabled by its accessor (0x4E08E0 on `[+0x114]`).
+    fn pressed_on(&self, i: usize, hovered: Option<usize>) -> bool {
+        (hovered == Some(i) || self.capture == Some(i)) && self.pressed && !self.state_hidden_or_disabled(i)
+    }
+
+    /// The last two arms of 0x4C7CB0 — the flags a `.lay` block can set (0x20 hidden, 0x10
+    /// disabled). The accessor's own byte has no counterpart here: nothing in this port disables a
+    /// widget (§4.55).
+    fn state_hidden_or_disabled(&self, i: usize) -> bool {
+        self.layout
+            .elements
+            .get(i)
+            .and_then(|e| e.get("state"))
+            .is_some_and(|s| s == "hidden" || s == "disabled")
+    }
+
+    /// The entry a `NFS5.BOTTOMBARBUTTON` shows — its tick, **0x4C9980** (§4.53).
+    ///
+    /// It keeps **three** six-field blocks, laid out `start, end, totalticks, delay, mindelay,
+    /// maxdelay` and bound at 0x4C9778 onwards: the plain one at `[this+0x18C]`, the hover one at
+    /// `[+0x1A4]` and the hovermousedown one at `[+0x1BC]`. The tick picks between them at
+    /// 0x4C99C7: when `data.seperatehovermousedown` (`[+0x180]`) is set **and** 0x4C7CB0 says the
+    /// widget is hovered and the screen settled, the **hovermousedown** block; otherwise, when the
+    /// plain hover flag is up (0x4C7C90), the hover block; otherwise the plain one. All four
+    /// shipped buttons carry `seperatehovermousedown=1`, so hovering shows the *hovermousedown*
+    /// run and the `hover…` one is only reached while a screen is still moving.
+    ///
+    /// Within a block the machine is `NFS5.AnimatingPicture`'s, and a `totalticks` of 0 is forced
+    /// to **1** at 0x4C97DF, which with `start == end` is simply a still frame — which is what
+    /// three of the four are at rest.
+    fn bar_button_frame(&self, e: &nfs_formats::lay::Element, hot: bool, down: bool) -> Option<usize> {
+        let sep = self.attr_num(e, "seperatehovermousedown").unwrap_or(0.0) != 0.0;
+        let p = match (hot, down && sep) {
+            (_, true) => "hovermousedown",
+            (true, false) => "hover",
+            _ => "",
+        };
+        let key = |k: &str| e.int(&format!("{p}{k}")).unwrap_or(0).max(0);
+        let (a, b) = (key("startframe"), key("endframe"));
+        let n = e.int(&format!("{p}totalticks")).filter(|v| *v > 0).unwrap_or(1);
+        let lo = key("mindelay");
+        let hi = key("maxdelay").max(lo);
+        let ticks = (self.clock_ms as u64 * 128 / 1000) as i64;
+        let period = n + (lo + hi) / 2;
+        let t = if period > 0 { ticks.rem_euclid(period) } else { 0 };
+        Some((a + (t.min(n) * (b - a) / n)).clamp(a.min(b), a.max(b)) as usize)
+    }
+
+    /// The tooltip a widget with `data.helptext` puts up when the pointer rests on it —
+    /// `FeWidget`'s tick, 0x4C7FE2…0x4C8226 (`RE/notes/controls.md` §4.52).
+    ///
+    /// ```text
+    /// 0x4C7FE2  no `[this+0x128]` (the string id) -> nothing
+    /// 0x4C7FEE  not hovered -> nothing, and 0x4C824D restamps `[this+0x12C]` with the tick
+    /// 0x4C8000  hovered for fewer than 0x80 ticks — **one second** at 128 Hz -> nothing
+    /// 0x4C8057  wrap `FEStrings[[+0x128]]` to **310.0f** in `Univers8b.ffn` (0x4C72B1)
+    /// 0x4C808A  take the pointer from the mouse device (0x5372A0(6), x at +4 and y at +8)
+    /// 0x4C80C7  x = pointer.x, pushed to 636 - width when x + width + 8 would pass 640
+    /// 0x4C80EE  y = pointer.y - height - 4, floored at 0
+    /// 0x4C8112  a = clamp((tick - [+0x12C] - 0x80) * 4, 0, 255) — half a second of fade-in
+    /// 0x4C8193  a **white** panel, `width + 8` by `height + 4`, at `a · 0xC0 / 255`
+    /// 0x4C81E0  the same box outlined black at `a`
+    /// 0x4C8226  the wrapped text at (+4, +2), black at `a`
+    /// ```
+    fn tooltip(&self, out: &mut Vec<Sprite>, aspect: f32, e: &nfs_formats::lay::Element, strings: &Strings) {
+        let Some((mx, my)) = self.cursor else { return };
+        let id = self.attr_num(e, "helptext").unwrap_or(0.0) as u32;
+        if id == 0 {
+            return;
+        }
+        // the port counts milliseconds where the original counts 128 Hz ticks
+        let ticks = self.hover_ms() * 128 / 1000;
+        if ticks < 0x80 {
+            return;
+        }
+        let Some(text) = strings.get(id) else { return };
+        let Some(f) = self.fonts.get(SMALL_FONT) else { return };
+        let lines = wrap_lines(f, &text, 310.0);
+        if lines.is_empty() {
+            return;
+        }
+        let tw = lines.iter().map(|l| f.place(l).1).fold(0.0f32, f32::max).trunc();
+        let th = (lines.len() as f32 * (f.line_px() + 2.0)).trunc();
+        let x = if mx + tw + 8.0 > 640.0 { 636.0 - tw } else { mx };
+        let y = (my - th - 4.0).max(0.0);
+        let a = (((ticks - 0x80) * 4).min(255) as f32) / 255.0;
+        out.push(self.quad(aspect, x, y, tw + 8.0, th + 4.0, [1.0, 1.0, 1.0, a * 192.0 / 255.0]));
+        for (bx, by, bw, bh) in [(x, y, tw + 8.0, 1.0), (x, y + th + 3.0, tw + 8.0, 1.0), (x, y, 1.0, th + 4.0), (x + tw + 7.0, y, 1.0, th + 4.0)] {
+            out.push(self.quad(aspect, bx, by, bw.max(1.0), bh.max(1.0), [0.0, 0.0, 0.0, a]));
+        }
+        let mut ly = y + 2.0;
+        for l in &lines {
+            self.text(out, aspect, f, l, x + 4.0, ly, 0.0, 0, [0.0, 0.0, 0.0, a]);
+            ly += f.line_px() + 2.0;
+        }
+    }
+
+    /// How long the pointer has rested where it is. A still parks the pointer with
+    /// `NFS_FE_CURSOR`, and then the screen clock is the rest — so `NFS_FE_CLOCK=1500` with a
+    /// parked pointer shows the tooltip half way through its fade.
+    fn hover_ms(&self) -> u32 {
+        if std::env::var("NFS_FE_CURSOR").is_ok() { self.clock_ms } else { self.hover_ms }
+    }
+
+    /// An open combo's drop-down list — `FeComboBox` slot 27, 0x4C5810, the stretch a list box
+    /// jumps over (0x4C58D6, 0x4C6555).
+    ///
+    /// The rect is the `selectionbox` part's, `[this+0x178]`: `pos=0,data.height` and
+    /// `size=data.width,data.selectionboxmaxheight` from `ComboBox.ctr`, its **width** reduced by
+    /// 0x4DB030's 16 while the list scrolls (0x4C542D / 0x4C544A through the setter 0x4E2BF0 —
+    /// the only geometry the code touches, so the **height stays the template's**).
+    ///
+    /// * the panel is a gouraud rect, 0x4D96B0 at 0x4C6605, amber `0xffffbb00` across the top and
+    ///   `0x4D8850(amber, 0xb282a8b0, t)` across the bottom, both through the fade (0x4D87F0),
+    ///   with `t = [this+0x1C4] · 255 / [this+0x1C0]` — the rows' height over the box's, so how
+    ///   full the list is (0x4C655C…0x4C658C). Its width takes the 16 back (0x4C65F1);
+    /// * then the same rect outlined in black — `0x4D87E0` of the fade through the four-bar
+    ///   0x4D9200 (0x4C66A6…0x4C66E0), this one at the plain width;
+    /// * then the rows, from the shared loop at 0x4C66E8, the first being the scrollbar's own
+    ///   position `[this+0x1BC]->slot10()`. Their colours are §4.42's three, and `ComboBox.ctr`
+    ///   defines none of them — so the text is black, which is what the amber panel wants.
+    fn drop_down(&self, out: &mut Vec<Sprite>, aspect: f32, e: &nfs_formats::lay::Element, i: usize, x: f32, y: f32, tint: impl Fn([u8; 4]) -> [f32; 4]) {
+        let Some((rows, current)) = self.lists.get(&i) else { return };
+        if rows.is_empty() {
+            return;
+        }
+        let Some(f) = self.font_for(e) else { return };
+        let max_h = self.attr_num(e, "selectionboxmaxheight").unwrap_or(160.0) as f32;
+        let width = self.attr_num(e, "width").unwrap_or(0.0) as f32;
+        let height = self.attr_num(e, "height").unwrap_or(0.0) as f32;
+        let full: f32 = rows.iter().map(|r| r.height()).sum();
+        // `refreshRows` 0x4C53F3: the rows' height, clamped, and the scrollbar that clamping raises
+        let (rows_h, scrolls) = if full >= max_h { (max_h, true) } else { (full, false) };
+        // **The panel is `data.selectionboxwidth` wide when that is wider than the widget**, and
+        // `data.selectionboxslidedirection` says which way it grows. `FeComboBox::refreshRows`
+        // 0x4C5607…0x4C5743 animates both the height and the width off the tick clock:
+        //
+        // ```text
+        // 0x4C5626  h    = min((now - [+0x1D4]) * [+0x1C4] / 16, [+0x1C4])   ; the rows' height
+        // 0x4C5669  grow = clamp((now - [+0x1D4]) * (sbw - w) / 16, 0, sbw - w)
+        // 0x4C56B9  if (sbw < w) grow = 0
+        // 0x4C56C1  if (!focused) both count back down — the panel retracts the same way
+        // 0x4C56F6  [+0x1D0] == -1 -> 0x4E2BB0(selectionbox, x0 - grow)      ; grows leftwards
+        // 0x4C5736  0x4E2BF0(selectionbox, w - <16 while scrolling> + grow)  ; the new width
+        // ```
+        //
+        // so it reaches `max(data.width, data.selectionboxwidth)` after **16 ticks**. This port
+        // draws the settled end of that ramp, which is what a screen at rest shows.
+        //
+        // The three offsets this rests on are **not** what `§4.44` had: 0x4C4FCB…0x4C5002 push
+        // each name *before* storing the previous call's answer, so `[+0x1C8]` is `data.width`,
+        // `[+0x1CC]` is `data.selectionboxwidth` and `[+0x1D0]` is
+        // `data.selectionboxslidedirection`, one slot along from the old table.
+        let sbw = self.attr_num(e, "selectionboxwidth").unwrap_or(0.0) as f32;
+        let grow = (sbw - width).max(0.0);
+        let left = self.attr_num(e, "selectionboxslidedirection").unwrap_or(0.0) as i32 == -1;
+        let (px, py) = (if left { x - grow } else { x }, y + height);
+        let width = width + grow;
+        let rect_w = if scrolls { width - LIST_SCROLLBAR_W } else { width };
+        let t = if max_h > 0.0 { (rows_h * 255.0 / max_h).round().clamp(0.0, 255.0) as u8 } else { 0 };
+        let amber = [0xff, 0xbb, 0x00, 0xff];
+        let low = [0x82, 0xa8, 0xb0, 0xb2];
+        // 0x4D8850, the per-channel lerp the front end uses everywhere: `a + (b - a) * t / 255`
+        let mix = |a: [u8; 4], b: [u8; 4]| -> [u8; 4] {
+            std::array::from_fn(|j| {
+                let (a, b) = (a[j] as i32, b[j] as i32);
+                (a + (b - a) * t as i32 / 255) as u8
+            })
+        };
+        let bottom = mix(amber, low);
+        let (ca, cb) = (tint(amber), tint(bottom));
+        self.gouraud(
+            out,
+            aspect,
+            [[px, py], [px + rect_w + if scrolls { LIST_SCROLLBAR_W } else { 0.0 }, py], [px, py + max_h], [px + rect_w + if scrolls { LIST_SCROLLBAR_W } else { 0.0 }, py + max_h]],
+            [ca, ca, cb, cb],
+        );
+        let black = tint([0, 0, 0, 255]);
+        for (bx, by, bw, bh) in [(px, py, rect_w, 1.0), (px, py + max_h - 1.0, rect_w, 1.0), (px, py, 1.0, max_h), (px + rect_w - 1.0, py, 1.0, max_h)] {
+            out.push(self.quad(aspect, bx, by, bw.max(1.0), bh.max(1.0), black));
+        }
+        let text_c = self.attr(e, "textcolor").and_then(parse_color).map(|c| [c[0], c[1], c[2], 255]).unwrap_or([0, 0, 0, 255]);
+        let sel_c = self.attr(e, "highlightcolorselected").and_then(parse_color).map(|c| [c[0], c[1], c[2], 255]).unwrap_or([0, 0, 0, 255]);
+        // the same foot-of-loop test as the list box's (0x4C6915): the last row overhangs
+        let mut acc = 0.0f32;
+        let mut ry = py;
+        for (n, row) in rows.iter().enumerate() {
+            if acc > max_h {
+                break;
+            }
+            acc += row.height();
+            if *current == Some(n) {
+                out.push(self.quad(aspect, px, ry, rect_w, row.height(), tint(sel_c)));
+            }
+            let fg = if *current == Some(n) { [1.0, 1.0, 1.0, 1.0] } else { tint(text_c) };
+            if let ListRow::Text(t) = row {
+                self.text(out, aspect, f, t, px + 3.0, ry + 2.0, 0.0, 0, fg);
+            }
+            ry += row.height();
+        }
+    }
+
+    /// `NFS5.ColorBox`'s custom colour editor — its own **slot 17**, 0x4C3C30, which draws when
+    /// the widget holds focus and the class's global latch [0x65B710] is set.
+    ///
+    /// Everything hangs off the widget's own box `(l, t, r, b)` and the six rects the bind builds
+    /// from it (§4.47, [`picker_rects`]). In order, and each one traced:
+    ///
+    /// 1. the box itself becomes the **title bar** — filled `0x4D87C0(fade)`, which is
+    ///    `0xFFBB00` amber (0x4C3D79), outlined black (0x4C3D91), with `FEStrings` **610**,
+    ///    "CUSTOM COLOR EDITOR", centred at `y + 2` in black and the `[+0x298]` font,
+    ///    `Univers7b.ffn` (0x4C3DF2);
+    /// 2. a **160-pixel** panel below it, the widget's width, gouraud amber `0xffffbb00` across
+    ///    the top and `0xb282a8b0` across the bottom (0x4C3E33), outlined black (0x4C3E4E);
+    /// 3. rect **A** is the **luminance ramp**: one 1-pixel column per x with the hue and the
+    ///    saturation held and the third float sweeping 0…1 through 0x4D8900
+    ///    (0x4C3E64…0x4C3F06), a black frame one pixel around it (0x4C3F73) and a **3-pixel**
+    ///    black marker at `(A.x1 - A.x0 - 2)·l + A.x0 + 1` (0x4C3FEC);
+    /// 4. rect **B** is the current colour, filled (0x4C4062) and outlined (0x4C40BD);
+    /// 5. rect **C** is the sprite the factory looked up by the tag `COLB` (0x4C40EE), drawn white
+    ///    at its top-left, with a black frame one pixel around it (0x4C4151) — the hue across it
+    ///    and the saturation up it, which is what its mouse slots read back out of it (§4.66);
+    /// 6. rect **D** is the **eight wells**, `[0x691D98 + n·4]` through 0x5019B0 — all
+    ///    **zero in the image**, so they start empty — each filled and outlined black, and the
+    ///    selected slot `[+0x284]` (**0** out of the factory, 0x4C38B3) outlined white (0x4C42A1);
+    /// 7. rect **E** is two buttons, `FEStrings` **702** "ok" and **703** "cancel": dark red
+    ///    `0x4D87B0(fade)` — amber `0x4D87C0` while `[this+0x218]`, the region the hit test left,
+    ///    is **3** for the left one or **4** for the right (0x4C42D0, 0x4C42D7) — the label
+    ///    centred at `y + 2` in white and the `[+0x294]` font, the §4.21 bevel at a thickness of
+    ///    **3** over the hovered one (0x4C4414) and a black outline (0x4C44C9).
+    ///
+    /// The three colour floats are `[+0x288]`, `[+0x28C]` and `[+0x290]` — **hue, saturation and
+    /// luminance**, because 0x4D8900 is an HLS→RGB (§4.66) — 0.5 each out of the factory
+    /// (0x4C38B9). The port moves them from the pointer exactly as the class's three mouse slots
+    /// do, so the editor is live.
+    fn color_picker(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32, tint: impl Fn([u8; 4]) -> [f32; 4]) {
+        let (l, t, r, b) = (x, y, x + w, y + h);
+        let rects = picker_rects(l, t, r, b);
+        let region = self.cursor.map(|(cx, cy)| picker_region(&rects, cx, cy)).unwrap_or(5);
+        let black = tint([0, 0, 0, 255]);
+        let white = tint([255, 255, 255, 255]);
+        let outline = |out: &mut Vec<Sprite>, x: f32, y: f32, w: f32, h: f32, c: [f32; 4]| {
+            for (bx, by, bw, bh) in [(x, y, w, 1.0), (x, y + h - 1.0, w, 1.0), (x, y, 1.0, h), (x + w - 1.0, y, 1.0, h)] {
+                out.push(self.quad(aspect, bx, by, bw.max(1.0), bh.max(1.0), c));
+            }
+        };
+        let word = |c: u32| tint([(c >> 16) as u8, (c >> 8) as u8, c as u8, (c >> 24) as u8]);
+        // 1 — the title bar
+        out.push(self.quad(aspect, l, t, w, h, tint([0xff, 0xbb, 0x00, 0xff])));
+        outline(out, l, t, w, h, black);
+        if let Some(f) = self.fonts.get(PICKER_TITLE_FONT) {
+            let s = self.fe_strings.get(610).unwrap_or_default();
+            self.text(out, aspect, f, &s, l, t + 2.0, w, 1, black);
+        }
+        // 2 — the panel
+        const PANEL_H: f32 = 160.0;
+        let amber = tint([0xff, 0xbb, 0x00, 0xff]);
+        let muted = tint([0x82, 0xa8, 0xb0, 0xb2]);
+        self.gouraud(out, aspect, [[l, b], [l + w, b], [l, b + PANEL_H], [l + w, b + PANEL_H]], [amber, amber, muted, muted]);
+        outline(out, l, b, w, PANEL_H, black);
+        let (ph, ps, pl) = self.picker.hsl;
+        // 3 — the luminance ramp
+        let (ax0, ay0, ax1, ay1) = rects[rect::A];
+        let mut px = ax0;
+        while px <= ax1 {
+            let tt = (px - ax0) / (ax1 - ax0);
+            out.push(self.quad(aspect, px, ay0, 1.0, ay1 - ay0, word(hls_to_rgb(ph, ps, tt))));
+            px += 1.0;
+        }
+        outline(out, ax0 - 1.0, ay0 - 1.0, (ax1 - ax0) + 2.0, (ay1 - ay0) + 2.0, black);
+        outline(out, ((ax1 - ax0 - 2.0) * pl).round() + ax0 + 1.0, ay0 - 2.0, 3.0, (ay1 - ay0) + 4.0, black);
+        // 4 — the swatch
+        let (bx0, by0, bx1, by1) = rects[rect::B];
+        out.push(self.quad(aspect, bx0, by0, bx1 - bx0, by1 - by0, word(hls_to_rgb(ph, ps, pl))));
+        outline(out, bx0, by0, bx1 - bx0, by1 - by0, black);
+        // 5 — the `COLB` sprite
+        let (cx0, cy0, cx1, cy1) = rects[rect::C];
+        if let Some(n) = self.colb
+            && let Some(&(tex, sw, sh)) = self.shapes.get(&("weeicons.fsh".to_string(), n))
+        {
+            let (pos, size) = self.place(aspect, cx0, cy0, sw, sh);
+            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: white, rotation: 0.0, pivot: [0.5, 0.5] });
+        }
+        outline(out, cx0 - 1.0, cy0 - 1.0, (cx1 - cx0) + 2.0, (cy1 - cy0) + 2.0, black);
+        // 6 — the eight wells, and the selected one in white
+        let (dx0, dy0, dx1, dy1) = rects[rect::D];
+        let w8 = ((dx1 - dx0) / 8.0).trunc();
+        for n in 0..8 {
+            let sx = dx0 + n as f32 * w8;
+            out.push(self.quad(aspect, sx, dy0, w8.max(1.0), dy1 - dy0, word(self.picker.wells[n])));
+            outline(out, sx, dy0, w8.max(1.0), dy1 - dy0, black);
+        }
+        let sel = dx0 + self.picker.well.min(7) as f32 * w8;
+        outline(out, sel, dy0, w8.max(1.0), dy1 - dy0, white);
+        // 7 — the two buttons
+        for (i, id, hot) in [(rect::E_LEFT, 702, 3), (rect::E_RIGHT, 703, 4)] {
+            let (ex0, ey0, ex1, ey1) = rects[i];
+            let on = region == hot;
+            let fill = if on { [0xff, 0xbb, 0x00, 0xff] } else { [0xbc, 0x00, 0x00, 0xff] };
+            out.push(self.quad(aspect, ex0, ey0, ex1 - ex0, ey1 - ey0, tint(fill)));
+            if let Some(f) = self.fonts.get(PICKER_BUTTON_FONT) {
+                let s = self.fe_strings.get(id).unwrap_or_default();
+                self.text(out, aspect, f, &s, ex0, ey0 + 2.0, ex1 - ex0, 1, white);
+            }
+            if on {
+                self.bevel(out, aspect, ex0, ey0, ex1 - ex0, ey1 - ey0, 3.0);
+            }
+            outline(out, ex0, ey0, ex1 - ex0, ey1 - ey0, black);
+        }
+    }
+
+    /// The colour editor, as the port's own state (§4.66) — the three floats, the selected well
+    /// and the eight wells.
+    pub fn picker(&self) -> Picker {
+        self.picker
+    }
+
+    /// The `NFS5.ColorBox` whose picker is up, if one is.
+    ///
+    /// The original's gate is two things at 0x4C3D0C: the widget holds **focus** and the class's
+    /// global latch `[0x65B710]` is set. The latch is raised by `0x4C39F0`, called from one place
+    /// — 0x4C6D6C, in the shared combo commit, and only for a widget whose constructor byte
+    /// `[this+0x1DE]` is set, which is `NFS5.ColorBox` alone (§4.44): the widget asks its accessor
+    /// for the index it calls custom (`0x4B94B0`, `accessor->slot 0x24`) and opens the editor when
+    /// the row just chosen **is** that one. The port has no colour accessor for `OwnedCar.*Colour`
+    /// to ask, so it opens the editor on the click that would open a combo's list.
+    /// APPROXIMATION, and the only one here.
+    pub fn open_picker(&self) -> Option<usize> {
+        self.open_combo.filter(|i| self.layout.elements.get(*i).is_some_and(|e| e.class == "NFS5.ColorBox"))
+    }
+
+    /// The picker's box and its six rects, for the widget that has it up.
+    fn picker_geometry(&self) -> Option<[(f32, f32, f32, f32); 6]> {
+        let i = self.open_picker()?;
+        let e = self.layout.elements.get(i)?;
+        let (x, y) = self.position_of(e);
+        // the same box the draw hangs the picker off — `NFS5.ColorBox` is one of the eight
+        // templates with `autosize=0` (§4.62), so this is its `size` attribute
+        let (w, h) = self.box_of(e, 0);
+        Some(picker_rects(x, y, x + w, y + h))
+    }
+
+    /// Where the pointer is in the open picker, `[this+0x218]` — 5 when it is nowhere in it.
+    pub fn picker_region(&self) -> u32 {
+        match (self.picker_geometry(), self.cursor) {
+            (Some(rects), Some((x, y))) => picker_region(&rects, x, y),
+            _ => 5,
+        }
+    }
+
+    /// The picker's **slot 5**, the button going down — 0x4C4710.
+    ///
+    /// It hit-tests, then, only while the widget is focused and the latch is up, moves whichever
+    /// of the two float pairs the pointer is on: region **0** takes the hue from x across rect C
+    /// and the saturation from `(C.y1 - y)` **up** it (0x4C474D…0x4C479D — the y term is inverted,
+    /// the x term is not), region **1** takes the luminance from x across rect A
+    /// (0x4C47A8…0x4C47CB). Whatever the region, it then packs the three with 0x4D8900 and writes
+    /// the result into the selected well (0x4C47E6, 0x4C47F3) and tells the accessor
+    /// (`slot 0x6C`).
+    pub fn picker_press(&mut self, x: f32, y: f32) {
+        let Some(rects) = self.picker_geometry() else { return };
+        match picker_region(&rects, x, y) {
+            0 => {
+                let (x0, y0, x1, y1) = rects[rect::C];
+                self.picker.hsl.0 = (x - x0) / (x1 - x0);
+                self.picker.hsl.1 = (y1 - y) / (y1 - y0);
+            }
+            1 => {
+                let (x0, _, x1, _) = rects[rect::A];
+                self.picker.hsl.2 = (x - x0) / (x1 - x0);
+            }
+            _ => {}
+        }
+        self.commit_well();
+    }
+
+    /// The picker's **slot 8**, the pointer moving — 0x4C4830.
+    ///
+    /// The same two arms as the press, behind one more gate: **0x5299C0**, a mouse button is held
+    /// (0x4C4863). The widget holds the capture while it is focused (§4.57), so the move reaches
+    /// it wherever the pointer goes — but each arm still needs its own rect, so a drag that leaves
+    /// rect C stops moving the hue and the saturation instead of running away with them.
+    pub fn picker_move(&mut self, x: f32, y: f32) {
+        if !self.pressed {
+            return;
+        }
+        self.picker_press(x, y);
+    }
+
+    /// The picker's **slot 9**, the button coming up — 0x4C4960. Answers whether it closed.
+    ///
+    /// Region **3** is "ok": drop the latch, drop focus (0x4C7DA0) and hand the accessor back what
+    /// it already has, `slot 0x28` into `slot 0x2C` (0x4C49AD…0x4C49BF). Region **4** is "cancel":
+    /// drop both, then put all **eight** wells back from the copy the first drawn frame took
+    /// (0x4C49E6…0x4C4A00) and hand the accessor the value it had then, `[this+0x29C]`
+    /// (0x4C4A08). Both play sound **5** (0x4AADB0). Region **2** picks a well —
+    /// `(x - D.x0)·8 / (D.x1 - D.x0)`, an integer divide clamped to `0…7` (0x4C4A2C…0x4C4A6E) —
+    /// and, **only when that well is not zero** (0x4C4A7D), reads its colour back into the three
+    /// floats with 0x4D8BD0.
+    pub fn picker_release(&mut self, x: f32, y: f32) -> bool {
+        let Some(rects) = self.picker_geometry() else { return false };
+        match picker_region(&rects, x, y) {
+            3 => return true,
+            4 => {
+                self.picker.wells = self.picker.saved;
+                return true;
+            }
+            2 => {
+                let (x0, _, x1, _) = rects[rect::D];
+                let n = ((x - x0) as i32 * 8) / (x1 - x0) as i32;
+                self.picker.well = n.clamp(0, 7) as usize;
+                let c = self.picker.wells[self.picker.well];
+                if c != 0 {
+                    self.picker.hsl = rgb_to_hls(c);
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// The tail every press and move runs: pack the three floats and write the selected well
+    /// (0x4C47E3…0x4C47F8).
+    fn commit_well(&mut self) {
+        let (h, s, l) = self.picker.hsl;
+        let w = self.picker.well.min(7);
+        self.picker.wells[w] = hls_to_rgb(h, s, l);
+    }
+
+    /// Take the copy of the eight wells that **cancel** puts back. The original takes it in the
+    /// first frame the picker draws and clears the guard whenever it is down (0x4C3CB3, 0x4C3CFA,
+    /// 0x4C3D03), so it is one copy per opening — which is what this is.
+    pub fn picker_opened(&mut self) {
+        self.picker.saved = self.picker.wells;
+    }
+
+    /// `focused` is reached here by holding the button down over a widget whose class takes focus
+    /// on the press (§4.40, `can_press`) — for `NFS5.CARSETTINGBUTTON` that is `picseldown` at
+    /// `data.seldownindex`, the pressed art. `focusedhover` needs `[+0x110] & 0x80`, which no
+    /// shipped template of those three sets, so the cascade falls to `focused`.
+    fn state_for<'a>(&self, e: &'a nfs_formats::lay::Element, i: usize, selected: Option<usize>, hovered: Option<usize>) -> &'a str {
+        // a widget that has the mouse keeps its pressed look wherever the pointer goes (§4.57)
+        let hot = hovered == Some(i) || self.capture == Some(i);
+        // `data.alwaysfocused` (read at 0x4CC537 into `[this+0x156]`): the input box's bind calls
+        // `setFocused` outright when it is set (0x4CC56E…0x4CC570), so the box is focused with no
+        // pointer involved at all. Two shipped screens use it, `accountlogin` and `createplayer`.
+        if self.attr_num(e, "alwaysfocused").unwrap_or(0.0) != 0.0 || self.open_combo == Some(i) {
+            return "focused";
+        }
+        if hot && self.pressed && self.can_press(&e.class) {
+            if self.controls.get(&e.class).is_some_and(|c| c.has_state("focusedhover")) {
+                return "focusedhover";
+            }
+            return "focused";
+        }
+        if selected == Some(i) {
+            if hot && self.controls.get(&e.class).is_some_and(|c| c.has_state("selectedhover")) {
+                return "selectedhover";
+            }
+            return "selected";
+        }
+        if hot && self.can_hover(&e.class) {
+            return "hover";
+        }
+        e.get("state").unwrap_or("normal")
+    }
+
+    /// Put the pointer somewhere, in design coordinates, or take it away.
+    ///
+    /// `RE/notes/controls.md` §4.39: the front end is mouse-driven, and hover is a **flag** —
+    /// bit **0x04** of `[widget+0x10C]`, set by the base vtable's slot 6 (0x4C7B90) and cleared by
+    /// slot 7 (0x4C7C50), each of which then re-runs `updateState` (0x4C82A0) to turn the flags
+    /// into the state name the widget draws.
+    pub fn set_cursor(&mut self, at: Option<(f32, f32)>) {
+        // a still parked its own pointer with `NFS_FE_CURSOR`; the live one must not clobber it
+        if std::env::var("NFS_FE_CURSOR").is_ok() {
+            return;
+        }
+        self.place_cursor(at);
+    }
+
+    /// Hand every group the pointer in **its own** coordinates. `embedded` draws a panel's
+    /// sub-layout offset by the panel's position, because 0x4CEBC0 hands the loaded screen the
+    /// panel's place (§4.12) — so the hit test inside it has to move the same way.
+    fn place_cursor(&mut self, at: Option<(f32, f32)>) {
+        self.cursor = at;
+        let offsets: Vec<(usize, (f32, f32))> = self
+            .groups
+            .keys()
+            .copied()
+            .filter_map(|k| self.layout.elements.get(k).map(|e| (k, self.position_of(e))))
+            .collect();
+        for (k, (gx, gy)) in offsets {
+            let inner = at.map(|(x, y)| (x - gx, y - gy));
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.place_cursor(inner);
+            }
+        }
+    }
+
+    /// Whether this class can hover at all: 0x4C7B90 sets the bit only when `[this+0x110] & 4`,
+    /// and that mask is built from the template's own state list (0x4C7784, 0x4C7800) — so it is
+    /// exactly "the `.ctr` has a `[state.hover]`". Checked against the classes whose draws gate
+    /// something on hover: all seven have one, and `BevelOptionBox.ctr`, whose bevel is *not*
+    /// gated, has none.
+    fn can_hover(&self, class: &str) -> bool {
+        self.controls.get(class).is_some_and(|c| c.has_state("hover"))
+    }
+
+    /// Hold the left button down, or let it up.
+    ///
+    /// `RE/notes/controls.md` §4.40: `EventPump::poll` 0x529700 stamps a `MouseButtonEvent` with
+    /// type **4** when the button goes down and **8** when it comes up (0x529806), and
+    /// `Control::handleEvent` 0x525F80 sends them to **slot 5** and **slot 9**.
+    pub fn set_pressed(&mut self, down: bool) {
+        if std::env::var("NFS_FE_PRESS").is_ok() {
+            return;
+        }
+        self.pressed = down;
+        // §4.57: a widget that takes focus takes the mouse with it (0x4C8486 → 0x528CB0), and
+        // `Window::handleEvent`'s button arm then hands it every button event wherever the pointer
+        // is (0x528AD5). The classes that take focus on the press are §4.40's three.
+        self.capture = if down {
+            self.hovered().filter(|i| self.layout.elements.get(*i).is_some_and(|e| self.can_press(&e.class)))
+        } else {
+            None
+        };
+        for g in self.groups.values_mut() {
+            g.set_pressed(down);
+        }
+    }
+
+    /// The classes that take **focus on the press** — the ones whose slot 5 calls
+    /// `FeWidget::setFocused` 0x4C7D70, which is what makes the held-down art appear:
+    /// `NFS5.CARSETTINGBUTTON` at 0x4C1F6C, `NFS5.DEADZONE` at 0x51BB83 and
+    /// `NFS5.GouraudIndicatorBar` at 0x4CA556. The other three callers
+    /// (`NFS5.CAMERAPICTURE` 0x4BF9BF, `NFS5.3DCAR` 0x4C1002, `NFS5.CONTROLLERSETUP` 0x51C5F0)
+    /// take it in **slot 9**, on the release, and keep it — that is a selection, not a press, and
+    /// the port does not raise it.
+    const PRESS_FOCUS: [&'static str; 3] = ["NFS5.CARSETTINGBUTTON", "NFS5.DEADZONE", "NFS5.GouraudIndicatorBar"];
+
+    /// Whether this widget shows a held-down state: its class must set focus on the press, and
+    /// `setFocused` only sets the bit when `[this+0x110] & 0x40`, the mask bit the template's own
+    /// `[state.focused]` puts there.
+    fn can_press(&self, class: &str) -> bool {
+        Self::PRESS_FOCUS.contains(&class) && self.controls.get(class).is_some_and(|c| c.has_state("focused"))
+    }
+
+    /// The widget the pointer is over — the **first** section whose box contains it and whose
+    /// class can hover.
+    ///
+    /// `Window::hitTest` **0x528C00** walks the child vector forwards and returns the **first**
+    /// child that contains the point, and that vector is in section order (§4.67) with the draw
+    /// walking it backwards — so the first section is both the topmost and the first tested.
+    ///
+    /// The box is the widget's own, the same `0x4C8670` gives the original. A widget with no size
+    /// of its own has a box of (0, 0) here (§4.37) and so can never be hit; those are the 27
+    /// bottom-bar buttons and graphic tabs, whose classes carry no hover state anyway.
+    pub fn hovered(&self) -> Option<usize> {
+        let (cx, cy) = self.cursor?;
+        // the bases the flattened index space gives each embedded screen, by the element the
+        // panel sits at, so a sub-layout is tested exactly where the draw reaches it
+        let bases: std::collections::HashMap<usize, usize> = {
+            let mut keys: Vec<usize> = self.groups.keys().copied().collect();
+            keys.sort_unstable();
+            let mut base = self.layout.elements.len();
+            let mut m = std::collections::HashMap::new();
+            for k in keys {
+                m.insert(k, base);
+                base += self.groups[&k].span();
+            }
+            m
+        };
+        for (i, e) in self.layout.elements.iter().enumerate().skip(1) {
+            // a panel draws a whole screen of its own here, at the panel's own depth
+            if let Some(base) = bases.get(&i) {
+                if let Some(j) = self.groups[&i].hovered() {
+                    return Some(base + j);
+                }
+                continue;
+            }
+            if !self.can_hover(&e.class) || self.state_draws_nothing(e) {
+                continue;
+            }
+            let (x, y) = self.position_of(e);
+            let (w, h) = self.box_hit(e);
+            // `Control::containsPoint` 0x525A90 takes the widget's box (slot 13 → 0x4C8670) and
+            // fails only on `x < left`, `x > right`, `y < top` or `y > bottom` — so both edges are
+            // **inclusive** (§4.56), where this port used to be half-open.
+            if w >= 1.0 && h >= 1.0 && cx >= x && cx <= x + w && cy >= y && cy <= y + h {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// The glint that sweeps the screen, shared by `NFS5.HEADER` (0x4CB024…0x4CB0F6) and
+    /// `NFS5.CarLogo` (0x4C1CE0…0x4C1DAF) — `RE/notes/controls.md` §4.25. Both keep the same three
+    /// fields (running, started, wait), both take the travel from 0x4E3550 — which is `[0x6907E0]`,
+    /// set to **640.0f** by 0x4D35B4 — and both wait `rand() % 128 + 128` ticks between sweeps.
+    /// The sprite's **x is the elapsed tick count itself**, at 128 Hz, so it crosses the whole
+    /// screen at a pixel a tick, and its y is the widget's own.
+    ///
+    /// APPROXIMATION: the port takes the middle of the random wait, and every widget on a screen
+    /// sweeps together — which is what the original does on its first cycle anyway, since they all
+    /// start their timers at the same activate.
+    fn sweep_glint(&self, out: &mut Vec<Sprite>, aspect: f32, y: f32, alpha: f32) {
+        const TRAVEL: u32 = 640;
+        const WAIT: u32 = 128 + 64;
+        let Some(n) = self.glint else { return };
+        let Some(&(tex, aw, ah)) = self.shapes.get(&("weeicons.fsh".to_string(), n)) else { return };
+        let phase = (self.clock_ms * 128 / 1000) % (TRAVEL + WAIT);
+        if phase >= TRAVEL {
+            return;
+        }
+        let (pos, size) = self.place(aspect, phase as f32, y, aw, ah);
+        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, alpha], rotation: 0.0, pivot: [0.5, 0.5] });
+    }
+
+}
+
+/// Break `s` into lines that fit `w`, the way `FeWordWrap` does it — **0x523600**.
+///
+/// The original does not fit words forward; it **guesses** a break and walks back to a space:
+///
+/// ```text
+/// 0x523679  strip the trailing spaces
+/// 0x5236C1  first line:  guess = start + trunc(width * 0.125) + 10     ; [0x5BAF60] is -0.125
+/// 0x5236B7  after that:  guess = start + (the previous line's length) + 10
+/// 0x5236E7  if the guess is past the end, the line is the whole remainder
+/// 0x5236F5  else walk back to the last space, then back over the run of spaces
+/// 0x52374F  measure the line, and while its width is **not strictly less** than the box
+/// 0x523765  walk back another word and measure again
+/// 0x52371D  a line with no space left in it is taken as it stands
+/// ```
+///
+/// Two of those matter and the port used neither: a line can never reach **past** the guess, so a
+/// narrow font breaks earlier than a greedy fit would; and the test is `<`, not `<=`, so a line
+/// that comes out exactly the width of the box is one word too long.
+pub fn wrap_lines(f: &BitmapFont, s: &str, w: f32) -> Vec<String> {
+    wrap_lines_by(&|t: &str| f.place(t).1, s, w)
+}
+
+/// The same, against any metric — which is how it is tested without a renderer to upload a font.
+pub fn wrap_lines_by(measure: &dyn Fn(&str) -> f32, s: &str, w: f32) -> Vec<String> {
+    let text: Vec<char> = s.trim_end_matches(' ').chars().collect();
+    let width = |c: &[char]| measure(&c.iter().collect::<String>());
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    // the first guess is the box's width over 8 — one character per 8 pixels — and 10 more
+    let mut reach = (w * 0.125).trunc().max(0.0) as usize + 10;
+    while start < text.len() {
+        let guess = start + reach;
+        let mut cut = if guess >= text.len() {
+            text.len()
+        } else {
+            // back to the last space, then over the run of spaces before it
+            let mut i = guess;
+            while i > start && text[i] != ' ' {
+                i -= 1;
+            }
+            while i > start && text[i] == ' ' {
+                i -= 1;
+            }
+            if i == start { text.len() } else { i + 1 }
+        };
+        // and back another word while the line is not strictly narrower than the box
+        while cut > start && width(&text[start..cut]) >= w {
+            let mut i = cut - 1;
+            while i > start && text[i] != ' ' {
+                i -= 1;
+            }
+            while i > start && text[i] == ' ' {
+                i -= 1;
+            }
+            if i == start {
+                break;
+            }
+            cut = i + 1;
+        }
+        let line: String = text[start..cut].iter().collect();
+        let line = line.trim_end_matches(' ').to_string();
+        reach = cut - start + 10;
+        out.push(line);
+        start = cut;
+        while start < text.len() && text[start] == ' ' {
+            start += 1;
+        }
+    }
+    out
+}
+
+/// One piece of `NFS5.GlintyRectangle`'s flourish: a rectangle relative to the widget's origin
+/// and the two colours it ramps between, the first at its left or top edge.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GlintPiece {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub c0: [u8; 4],
+    pub c1: [u8; 4],
+    /// the ramp runs along x; otherwise along y
+    pub along_x: bool,
+}
+
+/// The flourish of **0x51FEE8…0x52061C** — the bright segment that runs round a glinty
+/// rectangle's outline, as at most four pieces. `RE/notes/controls.md` §4.27.
+///
+/// Two segments travel the border in mirror image, each drawn as one piece on a vertical edge and
+/// one on a horizontal edge as it turns the corner, all of them **one pixel** thick, through the
+/// gouraud rect 0x4D96B0. `p` is the leading edge and `band` the segment's length; `variant`,
+/// 1…4, is `animate` — which corner the pair starts from.
+///
+/// Every rule here is one of the sixteen arms behind the four jump tables at 0x520628, 0x520638,
+/// 0x520648 and 0x520658, with the three-way split before each table at 0x51FF5E / 0x520036 /
+/// 0x520063 and 0x5202AC / 0x520399 / 0x5203D4, and the gates at 0x51FFF2, 0x5201AB, 0x520338 and
+/// 0x520525.
+pub fn glint_pieces(w: i32, h: i32, p: i32, band: i32, variant: i32) -> Vec<GlintPiece> {
+    let mut out = Vec::new();
+    if band <= 0 || w < 2 || h < 2 {
+        return out;
+    }
+    // 0x4D8850: `(c0·(255−t) + c1·t) / 255`, channel by channel
+    let lerp = |c0: [u8; 4], c1: [u8; 4], t: i32| -> [u8; 4] {
+        let t = t.clamp(0, 255) as u32;
+        std::array::from_fn(|k| ((c0[k] as u32 * (255 - t) + c1[k] as u32 * t) / 255) as u8)
+    };
+    // 0xDDFFFFFF and 0x00FFFFFF as this port spells colours. `count` is the loop index handed to
+    // 0x4D8850 as a colour at 0x51FFA9 — a near-transparent black, which is why a segment's far
+    // end disappears; it is kept rather than tidied because it is what the original mixes.
+    let glint: [u8; 4] = [0xff, 0xff, 0xff, 0xdd];
+    let clear: [u8; 4] = [0xff, 0xff, 0xff, 0x00];
+    let count = |i: i32| -> [u8; 4] { [0, 0, i.clamp(0, 255) as u8, 0] };
+    let (wf, hf) = (w as f32, h as f32);
+    let mut push = |x: f32, y: f32, pw: f32, ph: f32, c0, c1, along_x| {
+        // the original passes a signed extent, so a negative one runs back from `x`/`y`
+        let (x, pw) = if pw < 0.0 { (x + pw, -pw) } else { (x, pw) };
+        let (y, ph) = if ph < 0.0 { (y + ph, -ph) } else { (y, ph) };
+        if pw >= 0.5 && ph >= 0.5 {
+            out.push(GlintPiece { x, y, w: pw, h: ph, c0, c1, along_x });
+        }
+    };
+    // ---- the segment that rides a vertical edge first, then a horizontal one (0x51FF5E…)
+    let (i0, i1, a, ca0, ca1, cb0, cb1);
+    if p > h || band + p < h {
+        if p > h {
+            i0 = 0;
+            i1 = (w + h - p).min(band);
+            a = p;
+        } else if p < 0 {
+            i0 = band + p;
+            i1 = 0;
+            a = 0;
+        } else {
+            i0 = band;
+            i1 = 0;
+            a = p;
+        }
+        ca0 = lerp(count(i0), glint, 255 - i0 * 255 / band);
+        ca1 = glint;
+        cb0 = clear;
+        cb1 = lerp(clear, glint, i1 * 255 / band);
+    } else {
+        // 0x520063: the segment straddles the corner, and both pieces take the one blend
+        i0 = h - p;
+        i1 = band - i0;
+        a = p;
+        let t = lerp(clear, glint, i0 * 255 / band);
+        ca0 = clear;
+        ca1 = t;
+        cb0 = t;
+        cb1 = glint;
+    }
+    if a < h {
+        // table 0x520628: left edge for 1 and 3, right for 2 and 4; down for 1 and 2, up for 3, 4
+        let x = if variant == 1 || variant == 3 { 0.0 } else { wf - 1.0 };
+        let (y, hh) = if variant <= 2 { (a as f32, i0 as f32) } else { (hf - a as f32, -i0 as f32) };
+        push(x, y, 1.0, hh, ca0, ca1, false);
+    }
+    if band + a >= h {
+        // table 0x520638: the bottom edge for 1 and 2, the top for 3 and 4
+        let b = (a - h).max(0) as f32;
+        let (x, ww) = if variant == 1 || variant == 3 { (b, i1 as f32) } else { (wf - b, -(i1 as f32)) };
+        let y = if variant <= 2 { hf - 1.0 } else { 0.0 };
+        push(x, y, ww, 1.0, cb0, cb1, true);
+    }
+    // ---- and its mirror, riding a horizontal edge first (0x5202AC…)
+    let (j0, j1, c, cc0, cc1, cd0, cd1);
+    if p > w || band + p < w {
+        if p > w {
+            j0 = 0;
+            j1 = (w + h - p).min(band);
+            c = p;
+        } else if p < 0 {
+            j0 = band + p;
+            j1 = 0;
+            c = 0;
+        } else {
+            j0 = band;
+            j1 = 0;
+            c = p;
+        }
+        cc0 = lerp(count(j0), glint, 255 - j0 * 255 / band);
+        cc1 = glint;
+        cd0 = clear;
+        cd1 = lerp(clear, glint, j1 * 255 / band);
+    } else {
+        // 0x5203D4
+        j0 = w - p;
+        j1 = band - j0;
+        c = p;
+        let t = lerp(clear, glint, j0 * 255 / band);
+        cc0 = clear;
+        cc1 = t;
+        cd0 = t;
+        cd1 = glint;
+    }
+    if c < w {
+        // table 0x520648: the top edge for 1 and 2, the bottom for 3 and 4
+        let (x, ww) = if variant == 1 || variant == 3 { (c as f32, j0 as f32) } else { (wf - c as f32, -(j0 as f32)) };
+        let y = if variant <= 2 { 0.0 } else { hf - 1.0 };
+        push(x, y, ww, 1.0, cc0, cc1, true);
+    }
+    if band + c >= w {
+        // table 0x520658: the right edge for 1 and 3, the left for 2 and 4
+        let d = (c - w).max(0) as f32;
+        let x = if variant == 1 || variant == 3 { wf - 1.0 } else { 0.0 };
+        let (y, hh) = if variant <= 2 { (d, j1 as f32) } else { (hf - d, -(j1 as f32)) };
+        push(x, y, 1.0, hh, cd0, cd1, false);
+    }
+    out
+}
+
+/// `NFS5.GLINTYLINE`'s sweep — the bright segment that slides along the line, on top of the bar
+/// the class draws for its body (§4.28). `RE/notes/controls.md` §4.29.
+///
+/// The object's setup (0x51F9A0) puts the sweep's range in `[+0x40]`/`[+0x44]`: **the long axis**,
+/// left…right when `data.horizontal` is set and top…bottom when it is not. Its width is a fifth of
+/// that range (0x51FB38, the same 0x66666667 as the rectangle's band), it starts one width outside
+/// one end and runs to one width past the other at `rand() % 3 + 3` pixels a tick (0x51FB4D,
+/// 0x51FBC5), and between runs it waits `rand() % 128` (0x51FC10).
+///
+/// The rectangle it draws is one pixel thick across the line and `width` long along it (0x51FCCA
+/// for the horizontal case, 0x51FD71 for the vertical), in a ramp between **0xDDFFFFFF** through
+/// the fade and **0x00FFFFFF** (0x51FBA1), and it goes through **0x4D94A0** rather than 0x4D96B0 —
+/// the same gouraud rect but **clipped to a box**, the widget's own, with the colours interpolated
+/// at the cut (0x4D94C8…0x4D9577). Returns the clipped rectangle and the two colours, or `None`
+/// when it is entirely outside.
+///
+/// `along` is the position of the leading edge on the long axis, relative to the widget's origin.
+pub fn glint_sweep(len: f32, along: f32, width: f32, forward: bool) -> Option<(f32, f32, [u8; 4], [u8; 4])> {
+    let glint: [u8; 4] = [0xff, 0xff, 0xff, 0xdd];
+    let clear: [u8; 4] = [0xff, 0xff, 0xff, 0x00];
+    let (c0, c1) = if forward { (clear, glint) } else { (glint, clear) };
+    let lerp = |a: [u8; 4], b: [u8; 4], t: f32| -> [u8; 4] {
+        let t = t.clamp(0.0, 1.0);
+        std::array::from_fn(|k| (a[k] as f32 + (b[k] as f32 - a[k] as f32) * t).round() as u8)
+    };
+    let (mut s, mut e) = (along, along + width);
+    if e <= 0.0 || s >= len || width <= 0.0 {
+        return None;
+    }
+    let (mut ca, mut cb) = (c0, c1);
+    if s < 0.0 {
+        ca = lerp(c0, c1, -s / width);
+        s = 0.0;
+    }
+    if e > len {
+        cb = lerp(c0, c1, (len - along) / width);
+        e = len;
+    }
+    (e - s >= 0.5).then_some((s, e - s, ca, cb))
+}
+
+/// `band = min((w+h)/5, w−1, h−1)` (0x51FEE8…0x51FF2E) and the leading edge
+/// `p = (band + w + h)·elapsed/duration − band` (0x51FF32…0x51FF4D).
+pub fn glint_band(w: i32, h: i32) -> i32 {
+    ((w + h) / 5).min(w - 1).min(h - 1)
+}
+
+impl LayoutScreen {
+    /// Draw the flourish of `glint_pieces` at the widget's origin.
+    ///
+    /// APPROXIMATION, the same one the glints of §4.25 carry: the original draws
+    /// `rand() % 32 + 64` ticks for each run and `rand() % 256 + 256` for each wait (0x51FE6C,
+    /// 0x51FEC2), so the port takes the middle of both and every rectangle on a screen runs
+    /// together.
+    fn glinty_flourish(&self, out: &mut Vec<Sprite>, aspect: f32, px: f32, py: f32, w: i32, h: i32, variant: i32) {
+        const RUN: u32 = 64 + 16;
+        const WAIT: u32 = 256 + 128;
+        if w < 2 || h < 2 {
+            return;
+        }
+        let band = glint_band(w, h);
+        if band <= 0 {
+            return;
+        }
+        let phase = (self.clock_ms * 128 / 1000) % (RUN + WAIT);
+        if phase >= RUN {
+            return;
+        }
+        let p = (band + w + h) * phase as i32 / RUN as i32 - band;
+        for g in glint_pieces(w, h, p, band, variant) {
+            let (a, b) = (tint(g.c0), tint(g.c1));
+            let (x, y) = (px + g.x, py + g.y);
+            let pts = [[x, y], [x + g.w, y], [x, y + g.h], [x + g.w, y + g.h]];
+            let cols = if g.along_x { [a, b, a, b] } else { [a, a, b, b] };
+            self.gouraud(out, aspect, pts, cols);
+        }
+    }
+}
+
+impl LayoutScreen {
+    /// The front end's drop shadow, **0x520F00** — the widget's box offset by `(a, b)` and painted
+    /// black, as the L of what the offset uncovers. `NFS5.GOTOBUTTON`'s draw calls it with
+    /// **(4, 4)** (0x4C91FE, 0x4C9202) for every button whose `dropshadow` is **1**, which is the
+    /// template's default and what 132 of the 153 shipped ones carry.
+    ///
+    /// Three colours, each through the fade (0x4D87F0): **0xCC000000** at the box's own edge,
+    /// **0x19000000** at the far edge of the offset, and **0x0C000000** in the two corner wedges
+    /// (0x520F19…0x520F40; the fourth mix, a fully transparent 0, is dropped unused). The four
+    /// quads, in the order the function draws them:
+    ///
+    /// | | upper-left | upper-right | lower-left | lower-right |
+    /// |---|---|---|---|---|
+    /// | right strip (0x520FAF) | `(x+w, y+b)` CC | `(x+w+a, y+b)` 19 | `(x+w, y+h)` CC | `(x+w+a, y+h+b)` 19 |
+    /// | bottom strip (0x520FEB) | `(x+2a, y+h)` CC | `(x+w, y+h)` CC | `(x+a, y+h+b)` 19 | `(x+w+a, y+h+b)` 19 |
+    /// | lower-left wedge (0x521008) | `(x+a, y+h)` 0C | `(x+2a, y+h)` CC | `(x+a, y+h+b)` 0C | `(x+a, y+h+b)` 0C |
+    /// | upper-right wedge (0x521036) | `(x+w, y+b)` 0C | `(x+w+a, y+b)` 0C | `(x+w, y+2b)` CC | `(x+w, y+2b)` CC |
+    ///
+    /// Behind the same global gate 0x4E35E0 as the bevel (0x520F03).
+    fn drop_shadow(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32, a: f32, b: f32) {
+        let (near, far, edge) = (tint([0, 0, 0, 0xcc]), tint([0, 0, 0, 0x19]), tint([0, 0, 0, 0x0c]));
+        let (r, bot) = (x + w, y + h);
+        self.gouraud(out, aspect, [[r, y + b], [r + a, y + b], [r, bot], [r + a, bot + b]], [near, far, near, far]);
+        self.gouraud(out, aspect, [[x + 2.0 * a, bot], [r, bot], [x + a, bot + b], [r + a, bot + b]], [near, near, far, far]);
+        self.gouraud(out, aspect, [[x + a, bot], [x + 2.0 * a, bot], [x + a, bot + b], [x + a, bot + b]], [edge, near, edge, edge]);
+        self.gouraud(out, aspect, [[r, y + b], [r + a, y + b], [r, y + 2.0 * b], [r, y + 2.0 * b]], [edge, edge, near, near]);
+    }
+
+    /// The front end's beveled frame, **0x521050** — a shared painter with twenty call sites, of
+    /// which `NFS5.BEVELEDOPTIONBOX`'s (0x520EEC, thickness **3**) is the one this port draws so
+    /// far. It takes `(x, y, w, h, fade, thickness)` as four floats and two ints, and paints four
+    /// trapezoidal bands with the gouraud quad primitive 0x4D98D0 (§4.7's four `(x, y, colour)`
+    /// triples, in the order upper-left, upper-right, lower-left, lower-right):
+    ///
+    /// | band | outer edge, opaque | inner edge, nearly clear |
+    /// |---|---|---|
+    /// | top | `(x+1, y+1)`…`(x+w−1, y+1)` **0xCC000000** | `(x+t+1, y+t+1)`…`(x+w−t−1, y+t+1)` **0x19000000** |
+    /// | left | `(x+1, y+1)`…`(x+1, y+h−1)` 0xCC000000 | `(x+t, y+t+1)`…`(x+t, y+h−t−1)` 0x19000000 |
+    /// | right | `(x+w−1, y+1)`…`(x+w−1, y+h−1)` **0xCCFFFFFF** | `(x+w−t−1, y+t+1)`…`(x+w−t−1, y+h−t−1)` **0x33FFFFFF** |
+    /// | bottom | `(x−2, y+h−1)`…`(x+w−2, y+h−1)` 0xCCFFFFFF | `(x+t+1, y+h−t−1)`…`(x+w−t+1, y+h−t−1)` 0x33FFFFFF |
+    ///
+    /// Dark above and to the left, light below and to the right: a **sunken** bevel. The two the
+    /// bottom band is shifted by — the −2 on its outer edge (the 2.0f at 0x5B2580, 0x521206 and
+    /// 0x52121D) and the +1 where the right band has −1 — are the original's own asymmetry, kept.
+    ///
+    /// Three of the seven colours 0x521050 mixes are computed and dropped without being used
+    /// (0xCC808080, 0x19FFFFFF and 0xB2FFFFFF — the results of the second, third and fifth
+    /// 0x4D87F0 calls are overwritten before anything reads them), so only these four reach the
+    /// screen. The whole thing is behind the global gate 0x4E35E0 that §4.9 records, the one the
+    /// glinty classes share; this port draws those, so it draws this.
+    ///
+    /// APPROXIMATION in one respect only, the same one §4.7 carries: each band is a gouraud
+    /// trapezoid and the sprite pipeline has one colour per quad, so a band is stepped across its
+    /// depth — `t` strips, each between two interpolated edges, in the colour at its middle.
+    fn bevel(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32, t: f32) {
+        let (dark_out, dark_in) = (tint([0, 0, 0, 0xcc]), tint([0, 0, 0, 0x19]));
+        let (lit_out, lit_in) = (tint([0xff, 0xff, 0xff, 0xcc]), tint([0xff, 0xff, 0xff, 0x33]));
+        let (r, b) = (x + w, y + h);
+        let bands = [
+            ([x + 1.0, y + 1.0], [r - 1.0, y + 1.0], dark_out, [x + t + 1.0, y + t + 1.0], [r - t - 1.0, y + t + 1.0], dark_in),
+            ([x + 1.0, y + 1.0], [x + 1.0, b - 1.0], dark_out, [x + t, y + t + 1.0], [x + t, b - t - 1.0], dark_in),
+            ([r - 1.0, y + 1.0], [r - 1.0, b - 1.0], lit_out, [r - t - 1.0, y + t + 1.0], [r - t - 1.0, b - t - 1.0], lit_in),
+            ([x - 2.0, b - 1.0], [r - 2.0, b - 1.0], lit_out, [x + t + 1.0, b - t - 1.0], [r - t + 1.0, b - t - 1.0], lit_in),
+        ];
+        let n = (t.round() as usize).max(1);
+        for (a0, a1, ca, b0, b1, cb) in bands {
+            for d in 0..n {
+                let (s0, s1) = (d as f32 / n as f32, (d + 1) as f32 / n as f32);
+                let at = |s: f32, p: [f32; 2], q: [f32; 2]| [p[0] + (q[0] - p[0]) * s, p[1] + (q[1] - p[1]) * s];
+                let corners = [at(s0, a0, b0), at(s0, a1, b1), at(s1, a0, b0), at(s1, a1, b1)];
+                let (px, py) = (corners.iter().fold(f32::MAX, |m, c| m.min(c[0])), corners.iter().fold(f32::MAX, |m, c| m.min(c[1])));
+                let cw = corners.iter().fold(f32::MIN, |m, c| m.max(c[0])) - px;
+                let ch = corners.iter().fold(f32::MIN, |m, c| m.max(c[1])) - py;
+                let s = (s0 + s1) * 0.5;
+                let col = std::array::from_fn(|j| ca[j] + (cb[j] - ca[j]) * s);
+                out.push(self.quad(aspect, px, py, cw.max(0.5), ch.max(0.5), col));
+            }
+        }
+    }
+
     /// The font a widget draws its text in: its own `fontPathName`, or the one its class template
     /// gives the part it draws (a header's is `Univers17b.ffn`), or the front end's default.
     fn font_for(&self, e: &nfs_formats::lay::Element) -> Option<&BitmapFont> {
@@ -1900,28 +4025,18 @@ impl LayoutScreen {
     /// `NFS5.WORDWRAPACCESSORWATCH` — the class the front end uses where a value is a sentence
     /// rather than a figure: a tournament's description, a part's, a mission briefing.
     ///
-    /// **APPROXIMATION**: breaking on spaces, keeping a word that does not fit on its own line, is
-    /// the obvious rule but is not one that was read out of the original.
+    /// The break is the original's, **0x523600** (`RE/notes/controls.md` §4.51), and the lines sit
+    /// `lineHeight + 2` apart (0x523916 adds the 2.0f at [0x5B2580]).
     #[allow(clippy::too_many_arguments)]
     fn wrapped_text(&self, out: &mut Vec<Sprite>, aspect: f32, f: &BitmapFont, s: &str, x: f32, y: f32, w: f32, align: i64, color: [f32; 4]) {
         if w <= 0.0 {
             self.text(out, aspect, f, s, x, y, w, align, color);
             return;
         }
-        let mut line = String::new();
         let mut ly = y;
-        for word in s.split_whitespace() {
-            let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
-            if f.place(&candidate).1 > w && !line.is_empty() {
-                self.text(out, aspect, f, &line, x, ly, w, align, color);
-                ly += f.line_px();
-                line = word.to_string();
-            } else {
-                line = candidate;
-            }
-        }
-        if !line.is_empty() {
+        for line in wrap_lines(f, s, w) {
             self.text(out, aspect, f, &line, x, ly, w, align, color);
+            ly += f.line_px() + 2.0;
         }
     }
 
@@ -2000,13 +4115,20 @@ impl LayoutScreen {
             out.extend(bg.sprites_reporting(aspect, strings, None, accessor, &mut Vec::new()));
         }
         let bg_end = out.len();
-        // `NFS_REVERSE_ORDER=1` draws the widgets back to front instead of file order (probe for
-        // `RE/AUDIT.md` F2). The screen block, element 0, is metadata and is never drawn.
-        let order: Vec<usize> = if std::env::var("NFS_REVERSE_ORDER").is_ok() {
-            (1..self.layout.elements.len()).rev().collect()
-        } else {
-            (0..self.layout.elements.len()).collect()
-        };
+        // which widget the pointer is over, once for the whole screen (§4.39)
+        let hovered = self.hovered();
+        // `FeComboBox` paints an open drop-down from **slot 17** (0x4C6A88), the pass after the
+        // ordinary draw, and steps the sprite depth for it (0x4DAA10 / 0x4DAAC0) — so it lands over
+        // every widget on the screen. The port collects it here and appends it at the end.
+        let mut overlay: Vec<Sprite> = Vec::new();
+        // **The draw order is the section order, backwards** — `RE/notes/controls.md` §4.67.
+        // `Window::load` (slot 20, 0x5282E0) walks the layout's sections **1 … count-1 forwards**
+        // and `Window::addChild` (slot 22, 0x528120) is a `push_back`, so the child vector is in
+        // section order; `Window::draw` (slot 15, 0x528760) then walks it from `_Last` down to
+        // `_First` (0x528785…0x528799). So the **last** section is painted first and **section 1
+        // is on top**. Section **0** is not a child at all: 0x5285D3 reads it once for the screen
+        // descriptor, and it is the screen's own fill, painted before everything.
+        let order: Vec<usize> = std::iter::once(0).chain((1..self.layout.elements.len()).rev()).collect();
         for i in order {
             let e = &self.layout.elements[i];
             let ((tdx, tdy), talpha) = self.transition_of(e);
@@ -2024,14 +4146,34 @@ impl LayoutScreen {
             match e.class.as_str() {
                 // the screen itself: a full-screen fill
                 c if c.starts_with("REAL.BLACK") => {
-                    // The screen's own `color` is not the fill (the shipped files carry
-                    // 0xff000000, 0xff0000ff and 0xff004080 without looking any different), so the
-                    // class name is taken at its word — black. Only the bottom-most screen fills,
-                    // and only when there is nothing behind it: a screen with a 3D room behind it
-                    // (`RE/notes/frontend-3d.md`) would otherwise paint the room out.
-                    // APPROXIMATION.
+                    // **The screen's own `color` is dead**, and the template says so rather than
+                    // the port guessing it: `Black Screen 640x480.scr` gives the class one drawn
+                    // part, `[part.canvas]`, a `RECT` at `0,0` sized
+                    // `control.size.width,control.size.height` — `size.value=640,480` — whose
+                    // `color.value` is the literal **`0xff000000`**, and its `data` part's
+                    // `attributes.value` is exactly `screen,room,callbacklist,musicfile,
+                    // canplaygame`. `color` is not among them, so the `0xff0000ff` and
+                    // `0xff004080` three of the 98 shipped `[section.0]` blocks carry are editor
+                    // leftovers that nothing reads. CONFIRMED, where this used to be an
+                    // APPROXIMATION argued from the files looking the same.
+                    //
+                    // Only the bottom-most screen fills, and only when there is nothing behind it:
+                    // a screen with a 3D room behind it (`RE/notes/frontend-3d.md`) would
+                    // otherwise paint the room out. That part is still the port's own rule —
+                    // `Window::load` builds the descriptor at `[window+0x11C]` (0x52862F) and
+                    // binds it (0x528651), but the widget loop starts at **section 1** and
+                    // `Window::draw` walks `[window+0x10C]` alone, so nothing in the window paints
+                    // this canvas.
                     if self.background.is_none() && !self.overlay {
-                        out.push(self.quad(aspect, 0.0, 0.0, DESIGN.0, DESIGN.1, [0.0, 0.0, 0.0, 1.0]));
+                        let c = self
+                            .controls
+                            .get(&e.class)
+                            .and_then(|c| c.part("canvas"))
+                            .and_then(|p| p.value("color"))
+                            .and_then(parse_color)
+                            .map(tint)
+                            .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+                        out.push(self.quad(aspect, 0.0, 0.0, DESIGN.0, DESIGN.1, c));
                     }
                 }
                 // `NFS_NO_GOURAUD=1` skips them — the probe for which sprites bury the text
@@ -2146,10 +4288,7 @@ impl LayoutScreen {
                         let (a, b, t) = if p < 50.0 { (c0, c50, p / 50.0) } else { (c50, c100, (p - 50.0) / 50.0) };
                         std::array::from_fn(|j| a[j] + (b[j] - a[j]) * t)
                     };
-                    let cell = w / 100.0;
-                    for p in lo as u32..hi as u32 {
-                        out.push(self.quad(aspect, x + p as f32 * cell, y, cell, h.max(1.0), at(p as f32 + 0.5)));
-                    }
+                    self.gouraud_bar(&mut out, aspect, x, y, w, h, lo, hi, &at);
                 }
                 // `FEGlintyRectangle`'s constructor (0x522530) reads **`width`, `height`, `col` and
                 // `animate`** — not `size` and `color`, which is why one of these draws nothing when
@@ -2192,6 +4331,17 @@ impl LayoutScreen {
                     out.push(self.quad(aspect, x, y + gh - t, gw, t, c));
                     out.push(self.quad(aspect, x, y, t, gh, c));
                     out.push(self.quad(aspect, x + gw - t, y, t, gh, c));
+                    // and the flourish that runs round that outline (§4.27). `animate` is 0 for
+                    // "none" (0x51FE31), 1…4 for which corner, and **5 for a fresh `rand() % 4 + 1`
+                    // every run** (0x51FE8E) — 93 of the 181 ask for 5. The port has no per-widget
+                    // generator, so it spreads those over the four by the widget's own index:
+                    // APPROXIMATION, and the only invention-shaped choice here.
+                    match self.attr_num(e, "animate").unwrap_or(0.0) as i32 {
+                        0 => {}
+                        5 => self.glinty_flourish(&mut out, aspect, x, y, gw as i32, gh as i32, (i % 4) as i32 + 1),
+                        v @ 1..=4 => self.glinty_flourish(&mut out, aspect, x, y, gw as i32, gh as i32, v),
+                        _ => {}
+                    }
                 }
                 // A panel draws **only** the layout its `filename` names, in the panel's own place.
                 // Its slot-4 0x4CEBC0 — the same slot that is `FeListBox`'s combined tick-and-draw
@@ -2211,9 +4361,46 @@ impl LayoutScreen {
                     };
                     out.extend(self.embedded(g, aspect, strings, accessor, blank, x, y));
                 }
-                // `NFS5.3DCAR` is drawn after the screen, below — its car is a 3D view, not a
-                // sprite in the layout's own order
-                "NFS5.3DCAR" => {}
+                // `NFS5.3DCAR`'s car is an offscreen view the size of the screen, not a sprite:
+                // where the car sits in that view comes from the camera, not from the widget's
+                // rectangle. It is drawn **here**, in the widget's own place in the section order,
+                // which is where the original draws it — the class has no special pass.
+                //
+                // It used to be appended after the whole screen instead, because on
+                // `carcompare.lay` the two `DarkOval.fsh` pictures (sections 89 and 90) would
+                // otherwise cover the two cars (sections 64 and 65). They do not: the later
+                // section is painted **first** (§4.67), so the ovals go under the cars. That
+                // reading was an artefact of the inverted draw order.
+                "NFS5.3DCAR" => {
+                    if let Some(&tex) = self.car_views.get(&i) {
+                        let design = DESIGN.0 / DESIGN.1;
+                        let (fw, x0) = if aspect > design { (design / aspect, (1.0 - design / aspect) * 0.5) } else { (1.0, 0.0) };
+                        out.push(Sprite { texture: tex, pos: [x0, 0.0], size: [fw * aspect, 1.0], uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5] });
+                    }
+                }
+                // `deadzone.lay`'s eight axis bars. The class draws through its own slot 15
+                // (0x51B5F0) and **that draw returns before it paints anything when no analogue
+                // controller is enumerated**: 0x51B606 calls 0x51F2B0, which walks the device list
+                // (0x532E10), and `je 0x51BB08` leaves. This port has no pad enumeration behind
+                // the front end, so drawing nothing here is the original's own behaviour rather
+                // than a gap — `RE/notes/controls.md` §4.17, which also records what it draws when
+                // there *is* a pad (the art at 0x24 + `hackindex`, and two gradient bands through
+                // 0x521CB0) and why that is read and not ported.
+                //
+                // Its own `area` RECT is the `0x8000ff00` placeholder, and it paints none of its
+                // template anyway (slot 15 never chains to the base part walk at 0x520E50). The
+                // dark track that is visible on the screen is a separate `NFS5.Rectangle` of
+                // `0x66000000` that the layout puts over the same 300x9 box in the next section.
+                "NFS5.DEADZONE" => {
+                    // Its own `area` RECT is the `0x8000ff00` placeholder and it paints none of
+                    // its template — slot 15 never chains to the base part walk at 0x520E50. The
+                    // dark track the screen shows is a separate `NFS5.Rectangle` of `0x66000000`
+                    // the layout puts over the same 300x9 box in the next section.
+                    self.deadzone_bars(&mut out, aspect, e, x, y, w, h, tint);
+                    // with no analogue device the draw returns before painting anything
+                    // (0x51B60D), which is not a gap
+                    closed = !self.any_analogue();
+                }
                 // The text boxes: `InputBox.ctr`'s `state.normal` is `unselbkgd` — a
                 // `data.width`×14 rect filled `0xFFBC0000`, the same dark red `ControllerSetup.ctr`
                 // gives its rows as `regcolor` — four one-pixel black `bgoutline` rects, and
@@ -2222,30 +4409,86 @@ impl LayoutScreen {
                 // port has no focus or caret for.
                 "NFS5.INPUTBOX" | "NFS5.CHATINPUTBOX" | "NFS5.CHATDISPLAYBOX"
                 | "NFS5.CHARVECTACCESSORINPUTBOX" | "NFS5.CONTROLLERSETUP" => {
-                    for (px, py, pw, ph, c) in self.rect_parts(e) {
+                    let state = self.state_for(e, i, selected, hovered);
+                    for (px, py, pw, ph, c) in self.rect_parts_in(e, state) {
                         out.push(self.quad(aspect, x + px, y + py, pw.max(1.0), ph.max(1.0), tint(c)));
                     }
+                    // The three input boxes share one class — `NFS5.INPUTBOX`,
+                    // `NFS5.CHATINPUTBOX` and `NFS5.CHARVECTACCESSORINPUTBOX` all write vtable
+                    // 0x5B60AC — and its draw **0x4CC950** puts a drop shadow at (4, 4) over the
+                    // box (0x4CCA6F…0x4CCAA2) unless `data.noshadow` is set, which the bind reads
+                    // into `[this+0x155]` (0x4CC4DD) and leaves **0** by default. Of the eight
+                    // shipped ones three carry `noshadow=0`, three leave it absent and two — the
+                    // `NFS5.CHARVECTACCESSORINPUTBOX`es — carry 1, so six get it.
+                    //
+                    // Not drawn: the caret of 0x4CC9D7, which blinks on `TIMER_getTicks() & 0x3F`
+                    // and only while the box has focus (0x4C7DD0, flag 0x40) — this port has
+                    // neither. `NFS5.CHATDISPLAYBOX` is a different class (vtable 0x5B5A58, draw
+                    // 0x4C2F50) and has no shadow.
+                    if matches!(e.class.as_str(), "NFS5.INPUTBOX" | "NFS5.CHATINPUTBOX" | "NFS5.CHARVECTACCESSORINPUTBOX")
+                        && self.attr_num(e, "noshadow").unwrap_or(0.0) == 0.0
+                    {
+                        self.drop_shadow(&mut out, aspect, x, y, w, h, 4.0, 4.0);
+                    }
+                    // `NFS5.CONTROLLERSETUP`'s own draw, **0x51C670**, ends like the buttons':
+                    // the bevel 0x521050 over the widget's box with a thickness of 3 (0x51CB16),
+                    // ungated but for the two visibility tests at 0x51CACE and 0x51CAD9. Its box
+                    // comes from 0x4C8670 at 0x51C9B0 and its position from the `pos + offset`
+                    // pair of 0x51C6B3. Eighteen widgets, and the only class in this arm that is
+                    // registered at all — the text boxes are their template and nothing more.
+                    if e.class == "NFS5.CONTROLLERSETUP" && self.pressed_on(i, hovered) {
+                        self.bevel(&mut out, aspect, x, y, w, h, 3.0);
+                    }
                     let Some(f) = self.font_for(e) else { break 'elem };
-                    let Some(v) = e.get("accessor").filter(|a| !a.is_empty()).and_then(accessor) else { break 'elem };
-                    self.text(&mut out, aspect, f, &v, x, y, w, e.int("align").unwrap_or(0), [1.0, 1.0, 1.0, 1.0]);
+                    // an unanswered accessor is an empty box, not a missing one — the caret still
+                    // blinks in it, which is what a name field waiting to be typed into looks like
+                    let v = e.get("accessor").filter(|a| !a.is_empty()).and_then(accessor).unwrap_or_default();
+                    // `[state.normal]` draws `untext`, white; `[state.focused]` draws `hitext`,
+                    // `0xFF000000` — black over the amber `selbkgd`
+                    let ink = match self.controls.get(&e.class).and_then(|c| c.part(if state == "focused" { "hitext" } else { "untext" })).and_then(|p| p.value("foreColor")).and_then(parse_color) {
+                        Some(c) => tint(c),
+                        None => [1.0, 1.0, 1.0, 1.0],
+                    };
+                    self.text(&mut out, aspect, f, &v, x, y, w, e.int("align").unwrap_or(0), ink);
+                    // The caret, 0x4CC9D7: while the box has focus (0x4C7DD0) and
+                    // `TIMER_getTicks() & 0x3F < 0x20` — half of a 64-tick period at the front
+                    // end's 128 Hz, so 1 Hz on, 1 Hz off — the draw calls the part the bind
+                    // resolved into `[this+0x14C]` (0x4CC50B, the part named **`cursor`**) at the
+                    // widget's own place. `InputBox.ctr` puts that part at
+                    // `((data.width - hitext.size.width)/2)+hitext.size.width+1, 3`, one pixel
+                    // wide and `data.height-6` tall, in `0xff000000`.
+                    if state == "focused" && (self.clock_ms * 128 / 1000) & 0x3F < 0x20 {
+                        let Some(c) = self.controls.get(&e.class) else { break 'elem };
+                        let Some(p) = c.part("cursor") else { break 'elem };
+                        let tw = f.place(&v).1;
+                        let colour = p.value("color").and_then(parse_color).unwrap_or([0, 0, 0, 255]);
+                        let ch = self.attr_num(e, "height").unwrap_or(14.0) as f32 - 6.0;
+                        out.push(self.quad(aspect, x + ((w - tw) / 2.0).round() + tw + 1.0, y + 3.0, 1.0, ch.max(1.0), tint(colour)));
+                    }
                 }
                 "NFS5.ListBox" => {
                     // `FeListBox::draw` 0x4C64FE…0x4C691B with `ListBox.ctr`. The panel is the
                     // template's `selectionbox` part — `pos=0,1`, `size=data.width,
-                    // data.selectionboxmaxheight` — filled with 0x10FFFFFF (0x4C6636), and its
-                    // height is clamped to the content: `min(rows·14, selectionboxmaxheight)`
-                    // (0x4C53A0). When it clamps, a scrollbar appears and takes 16 px off the
-                    // width (0x4C5421 with 0x4DB030). Rows are the accessor's own: 14 px each
+                    // data.selectionboxmaxheight` — filled with 0x10FFFFFF (0x4C6636). When the
+                    // rows are taller than it (0x4C53F3) a scrollbar appears and takes 16 px off
+                    // the rect's width (0x4C5421 with 0x4DB030). Rows are the accessor's own: 14 px each
                     // (0x4BC700), the string at (+3, +2) over a bar of the row's colour
-                    // (0x4BC350). The original keeps drawing while the accumulated height is still
-                    // within the panel and scissors the overflow; the port draws only the rows
-                    // that fit whole (APPROXIMATION — the sprite pipeline has no scissor).
+                    // (0x4BC350). The row loop's own test is at its foot (§4.49), so the row that
+                    // crosses the bottom edge is drawn whole and overhangs — there is no scissor.
                     let Some((rows, current)) = self.lists.get(&i) else { break 'elem };
                     let Some(f) = self.font_for(e) else { break 'elem };
                     let max_h = self.attr_num(e, "selectionboxmaxheight").unwrap_or(0.0) as f32;
                     let full: f32 = rows.iter().map(|r| r.height()).sum();
-                    let (panel_h, scrolls) = if full < max_h { (full, false) } else { (max_h, true) };
-                    let mut panel_w = self.attr_num(e, "width").unwrap_or(0.0) as f32;
+                    // **The panel is the `selectionbox` part's own rect and keeps its full
+                    // height.** `refreshRows` 0x4C53A0 clamps `[this+0x1C4]`, which is the height
+                    // of the *rows*, and the only geometry it ever changes is the rect's **width**
+                    // — 0x4C542D / 0x4C544A call 0x4E2BF0, which reads the old size pair and
+                    // replaces the width alone. So a short list still paints the whole box. (An
+                    // earlier reading of §4.16 clamped the panel too; that was wrong.)
+                    let scrolls = full >= max_h;
+                    let width = self.attr_num(e, "width").unwrap_or(0.0) as f32;
+                    let panel_h = max_h;
+                    let mut panel_w = width;
                     if scrolls {
                         panel_w -= LIST_SCROLLBAR_W;
                     }
@@ -2253,7 +4496,10 @@ impl LayoutScreen {
                         Some(v) => nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)).map(|(a, b)| (x + a as f32, y + b as f32)).unwrap_or((x, y)),
                         None => (x, y),
                     };
-                    out.push(self.quad(aspect, px, py, panel_w, panel_h, [1.0, 1.0, 1.0, 16.0 / 255.0]));
+                    // 0x4C6617…0x4C667B: `0x4D9280(x, y, width + 16 when it scrolls, height,
+                    // 0x10FFFFFF)` — the 16 the rect gave up is taken back for the fill, so the
+                    // bar spans the whole widget and the scrollbar is drawn over its right edge.
+                    out.push(self.quad(aspect, px, py, width, panel_h, [1.0, 1.0, 1.0, 16.0 / 255.0]));
                     // The scrollbar the list grows when it clamps is a `NFS5.VerticalSlider`, and
                     // `VerticalSlider.ctr` says what it is: a `track` the full height in
                     // **0xffffbb00**, `weeicons.fsh` entry **13** at `0,7` for the up arrow, entry
@@ -2267,8 +4513,8 @@ impl LayoutScreen {
                     // 0x4DB030's **16** off the selection box's width and leaves its x alone, so
                     // the strip freed is the one to its right. That the bar is drawn at the strip's
                     // left edge is this port's reading of that, not a traced placement —
-                    // APPROXIMATION, as is using the selected row for the knob's index, since the
-                    // port keeps no separate scroll position.
+                    // APPROXIMATION. The knob's index is the port's own scroll position now
+                    // (§4.45), which is what `[this+0x1BC]->slot10()` is in the original.
                     if scrolls {
                         let sx = px + panel_w;
                         let art = |n: usize| self.shapes.get(&("weeicons.fsh".to_string(), n)).copied();
@@ -2283,26 +4529,60 @@ impl LayoutScreen {
                             let (pos, size) = self.place(aspect, sx, py + panel_h - ah, aw, ah);
                             out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
                         }
-                        let knob_h = 15.0;
-                        let base = py + up.map(|(_, _, h)| h).unwrap_or(0.0);
-                        let span = (panel_h - knob_h - (base - py)).max(0.0);
-                        let count = rows.len().max(1) as f32;
-                        let idx = current.unwrap_or(0) as f32;
-                        let dy = if count > 1.0 { idx * span / (count - 1.0) } else { 0.0 };
+                        // the knob's own travel, straight out of `list_scrollbar` so that where
+                        // it is drawn and where a drag puts it are the same arithmetic
                         let knob_w = up.map(|(_, w, _)| w).unwrap_or(track_w);
-                        out.push(self.quad(aspect, sx, base + dy, knob_w, knob_h, tint([0xff, 0xff, 0xff, 0x80])));
+                        let ky = self.list_scrollbar(i).map(|b| b.knob.1).unwrap_or(py);
+                        out.push(self.quad(aspect, sx, ky, knob_w, LIST_KNOB_H, tint([0xff, 0xff, 0xff, 0x80])));
                     }
                     // `textcolor` is black and the two highlights amber and dark red, all three
                     // straight out of `ListBox.ctr`; a highlighted row's own text turns white
                     // (0x4C67A6 → 0x4D87D0).
                     let text_c = self.attr(e, "textcolor").and_then(parse_color).map(|c| [c[0], c[1], c[2], 255]).unwrap_or([0, 0, 0, 255]);
                     let sel_c = self.attr(e, "highlightcolorselected").and_then(parse_color).map(|c| [c[0], c[1], c[2], 255]).unwrap_or([0xBC, 0, 0, 255]);
+                    let hov_c = self.attr(e, "highlightcolorhover").and_then(parse_color).map(|c| [c[0], c[1], c[2], 255]);
+                    // The hovered row. `FeListBox`'s slot 8 — its mouse-move handler, 0x4C6F60 —
+                    // box-tests the pointer (0x4E2970), then walks the rows accumulating each
+                    // one's height (`accessor->slot26`, 0x4C6FF6) and takes the **first** row whose
+                    // running bottom is past the pointer's y (0x4C7013), leaving it in
+                    // `[this+0x1A8]` with `[this+0x1A4]` as "there is one". The draw asks those two
+                    // *before* it asks about the selected row (0x4C674C jumps past 0x4C677C), so
+                    // **hover wins over selection**, and its bar is `data.highlightcolorhover`
+                    // with the row's text turned white (0x4C676A, 0x4C6772).
+                    //
+                    // The original measures from the widget's own box (0x4C8670); the port
+                    // measures from the selection box, one pixel below it.
+                    let hover_row = self.cursor.and_then(|(cx, cy)| {
+                        if !(cx >= px && cx < px + panel_w && cy >= py && cy < py + panel_h) {
+                            return None;
+                        }
+                        let mut acc = py;
+                        let first = self.scroll.get(&i).copied().unwrap_or(0);
+                        rows.iter().skip(first).position(|r| {
+                            acc += r.height();
+                            cy < acc
+                        }).map(|n| n + first)
+                    });
+                    // The row loop starts at the scrollbar's own position — 0x4C66E8 takes
+                    // `[this+0x1BC]->slot10()` for its first row (§4.45)
+                    let first = self.scroll.get(&i).copied().unwrap_or(0).min(rows.len().saturating_sub(1));
+                    // **The last row is not clipped.** The loop's test is at its *foot*, 0x4C6915:
+                    // a row is drawn, its height added, and only then is the running total compared
+                    // with `[this+0x1C4]` — so the row that crosses the bottom edge is drawn whole
+                    // and overhangs. (0x4DAA10 / 0x4DAAC0, which bracket the draw, are a z step,
+                    // not a scissor — §4.44.) The port used to stop one row early.
+                    let mut acc = 0.0f32;
                     let mut ry = py;
-                    for (n, row) in rows.iter().enumerate() {
-                        if ry + row.height() > py + panel_h {
+                    for (n, row) in rows.iter().enumerate().skip(first) {
+                        if acc > panel_h {
                             break;
                         }
-                        let (bar, fg) = if *current == Some(n) { (Some(sel_c), [1.0, 1.0, 1.0, 1.0]) } else { (None, tint(text_c)) };
+                        acc += row.height();
+                        let (bar, fg) = match (hover_row == Some(n), *current == Some(n)) {
+                            (true, _) if hov_c.is_some() => (hov_c, [1.0, 1.0, 1.0, 1.0]),
+                            (_, true) => (Some(sel_c), [1.0, 1.0, 1.0, 1.0]),
+                            _ => (None, tint(text_c)),
+                        };
                         match row {
                             ListRow::Text(t) => {
                                 if let Some(c) = bar {
@@ -2445,11 +4725,32 @@ impl LayoutScreen {
                 // the picture.
                 // `NFS5.MOVIEBOX` (0x4CD640) hands the drawing to the player object at `+0x1BC`;
                 // the picture goes at the widget's own box.
-                "NFS5.MOVIEBOX" => {
-                    let Some(m) = self.movies.get(&i) else { break 'elem };
-                    let (dw, dh) = (if w > 0.0 { w } else { m.size.0 }, if h > 0.0 { h } else { m.size.1 });
-                    let (pos, size) = self.place(aspect, x, y, dw, dh);
-                    out.push(Sprite { texture: m.tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5] });
+                // `NFS5.MOVIECIRCLE` plays one too, and its draw **0x4CDAE0** puts it in the same
+                // place: it adds `[this+0x22C]` and `[this+0x230]` — the widget's own `pos`,
+                // which its bind reads at 0x4CDA61 — to the screen offset, and hands the box to
+                // the player at `[this+0x1C4]`. `RE/notes/controls.md` §4.33.
+                "NFS5.MOVIEBOX" | "NFS5.MOVIECIRCLE" => {
+                    if let Some(m) = self.movies.get(&i) {
+                        let (dw, dh) = (if w > 0.0 { w } else { m.size.0 }, if h > 0.0 { h } else { m.size.1 });
+                        let (pos, size) = self.place(aspect, x, y, dw, dh);
+                        out.push(Sprite { texture: m.tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5] });
+                    }
+                    // `NFS5.MOVIECIRCLE`'s template carries nine `stencilshape` parts out of
+                    // `movieoval.fsh` — the oval that frames the clip — and only its
+                    // **`[state.test1]`** lists them, which is the state all three shipped widgets
+                    // ask for. Its draw plays the movie first, through `NFS5.MOVIEBOX`'s own draw
+                    // at 0x4CDB61, and reaches the parts after (0x4CDB72), so the oval goes over
+                    // the picture. `NFS5.MOVIEBOX` has no such parts.
+                    if e.class == "NFS5.MOVIECIRCLE" {
+                        for (px, py, pw, ph, file, index, flip) in self.shape_parts(e) {
+                            let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
+                            let (dw, dh) = (if pw > 0.0 { pw } else { aw }, if ph > 0.0 { ph } else { ah });
+                            let (pos, size) = self.place(aspect, x + px, y + py, dw, dh);
+                            let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
+                            let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
+                            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+                        }
+                    }
                 }
                 "NFS5.ChroniclePictureIcon" | "NFS5.ShowcasePicture" | "NFS5.ChroniclePicture" => {
                     let Some(key) = self.logos.get(&i) else { break 'elem };
@@ -2457,6 +4758,14 @@ impl LayoutScreen {
                     let (dw, dh) = (if w > 0.0 { w } else { aw }, if h > 0.0 { h } else { ah });
                     let (pos, size) = self.place(aspect, x, y, dw, dh);
                     out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+                    // `NFS5.ChroniclePictureIcon`'s draw ends with the bevel over **the art's own
+                    // size** — 0x508906 and 0x508910 read `[entry+0x18]` and `[entry+0x14]`, the
+                    // height and width of the `.fsh` entry it just drew, not the widget's box —
+                    // at the widget's position, thickness 3, ungated (0x508927). Its two
+                    // neighbours here have draws of their own that never call the painter.
+                    if e.class == "NFS5.ChroniclePictureIcon" && self.pressed_on(i, hovered) {
+                        self.bevel(&mut out, aspect, x, y, aw, ah, 3.0);
+                    }
                 }
                 "NFS5.CarLogo" => {
                     // `NFS5.CarLogo::draw` 0x4C1B70, CONFIRMED: the pair is drawn side by side —
@@ -2485,10 +4794,14 @@ impl LayoutScreen {
                         let (pos, size) = self.place(aspect, left + aw, top, bw, bh);
                         out.push(Sprite { texture: tb, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
                     }
-                    // Not drawn: the glint that sweeps over the logo (the `GLNT` entry of
-                    // `weeicons.fsh`, 0x4C1D26…0x4C1DB2) — its sweep is driven by the same global
-                    // the front end sets to 640 at 0x4D35B4, but the shape's own travel was not
-                    // traced, so it is left out rather than guessed at.
+                    // The glint, 0x4C1CE0…0x4C1DAF, and it is the **same sweep the header has**
+                    // (§4.25): the `GLNT` entry of `weeicons.fsh` that the activate looks up by
+                    // tag at 0x4C13E3, at x = the elapsed tick count (0x4C1D35 stores it in the
+                    // local the sprite's first argument reads at 0x4C1DA1) and y = the widget's
+                    // own (0x4C1BBB). One difference: the colour goes through 0x4D87F0 a second
+                    // time with **0x40** (0x4C1D7E), so the logo's sweep is a quarter as strong as
+                    // the header's.
+                    self.sweep_glint(&mut out, aspect, y, 0x40 as f32 / 255.0);
                 }
                 // `FEChronicleMainBoxControl::draw` (0x507990) starts with five bars, in this
                 // order, all 454 wide from the widget box's own left edge and all but the outline
@@ -2581,11 +4894,91 @@ impl LayoutScreen {
                 // the label at `0,0` in `Univers17b.ffn` and `0xffffffff`, and the class's own
                 // slot 20 (0x4CAE60) does nothing but bind that part. Its slot 21 (0x4CADC0) loads
                 // a glint — see `RE/notes/controls.md` §4.11 — which is not drawn here.
+                // `NFS5.AnimatingPicture`'s own tick, **0x4BD8F0** (§4.53): a frame out of the run
+                // its bind read — `data.start_frame` into `[+0x144]`, `data.end_frame` into
+                // `[+0x148]`, `data.numticks` into `[+0x154]` (forced to 1 when it is 0) and
+                // `data.mindelay` / `data.maxdelay` into `[+0x15C]` / `[+0x160]`.
+                //
+                // The class alternates between waiting and playing. Idle, it starts once the tick
+                // passes `[+0x150] + [+0x158]`, the delay it is sitting out; playing, it runs until
+                // the tick passes `[+0x150] + [+0x154]` and then draws a new delay,
+                // `mindelay + rand() % (maxdelay - mindelay)` (0x4BD981), and goes back to idle.
+                // While it plays the frame is
+                // `start + (tick - started) · (end - start) / numticks` clamped to the pair
+                // (0x4BD9DD…0x4BDA1E).
+                //
+                // **All five shipped ones are the same**: `logoAn.fsh`, frames 0…29 over 256 ticks
+                // — two seconds at 128 Hz — with `mindelay` and `maxdelay` both 0, so there is no
+                // wait at all and the run simply repeats. That is what the port draws, and it is
+                // the whole of the class's shipped use.
+                "NFS5.AnimatingPicture" => {
+                    let Some(file) = e.get("shapePathName").filter(|f| !f.is_empty()) else { break 'elem };
+                    let a = e.int("start_frame").unwrap_or(0).max(0) as usize;
+                    let b = e.int("end_frame").unwrap_or(0).max(0) as usize;
+                    let ticks = (self.clock_ms as u64 * 128 / 1000) as i64;
+                    let n = e.int("numticks").filter(|v| *v > 0).unwrap_or(1);
+                    let lo = e.int("mindelay").unwrap_or(0).max(0);
+                    let hi = e.int("maxdelay").unwrap_or(0).max(lo);
+                    // the cycle is the run plus the delay it waits out; with the shipped zeros the
+                    // delay is zero and the period is `numticks`. APPROXIMATION where it is not:
+                    // the port takes the middle of the random wait, as it does for the glint
+                    let period = n + (lo + hi) / 2;
+                    let t = if period > 0 { ticks.rem_euclid(period) } else { 0 };
+                    let span = b as i64 - a as i64;
+                    let frame = (a as i64 + (t.min(n) * span / n)).clamp(a.min(b) as i64, a.max(b) as i64) as usize;
+                    if let Some(&(tex, aw, ah)) = self.shapes.get(&(file.to_string(), frame)) {
+                        let (dw, dh) = (if w > 0.0 { w } else { aw }, if h > 0.0 { h } else { ah });
+                        let (pos, size) = self.place(aspect, x, y, dw, dh);
+                        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: tint([255, 255, 255, 255]), rotation: 0.0, pivot: [0.5, 0.5] });
+                    }
+                }
                 "NFS5.HEADER" | "NFS5.SUBHEADER"
                 | "REAL.LABEL" | "NFS5.PICTURE" | "NFS5.NonLocalizedLabel" | "NFS5.ExtraCircle"
                 | "NFS5.OutlineRectangle" | "NFS5.Rectangle" | "NFS5.BEVELEDOPTIONBOX" | "NFS5.GLINTYLINE" => {
-                    let state = if selected == Some(i) { "selected" } else { e.get("state").unwrap_or("normal") };
+                    let state = self.state_for(e, i, selected, hovered);
                     self.template_widget(&mut out, aspect, e, state, x, y, strings);
+                    // The header's glint, **0x4CB024…0x4CB0F6** — its colour is 0x4D87D0 of
+                    // the fade, so white at full (§4.25).
+                    if e.class == "NFS5.HEADER" {
+                        self.sweep_glint(&mut out, aspect, y, 1.0);
+                    }
+                    // `NFS5.GLINTYLINE`'s sweep, on top of the bar its template just drew
+                    // (§4.28, §4.29). The long axis is the one the sweep runs along: `x` when
+                    // `data.horizontal` is set — the class's own test is `!= 0`, so its 2 counts
+                    // as set — and `y` when it is not.
+                    if e.class == "NFS5.GLINTYLINE" {
+                        // APPROXIMATION, as with every other flourish here: the original redraws
+                        // the speed (`rand() % 3 + 3`), the direction (a coin) and the wait
+                        // (`rand() % 128`) for each run, so the port takes the middle of the
+                        // speed, runs forward, and takes half the wait.
+                        const SPEED: u32 = 4;
+                        const WAIT: u32 = 64;
+                        let horizontal = self.attr_num(e, "horizontal").unwrap_or(1.0) != 0.0;
+                        let len = if horizontal { w } else { h };
+                        let width = (len / 5.0).floor();
+                        if width >= 1.0 {
+                            let travel = (len + 2.0 * width) as u32;
+                            let ticks = travel.div_ceil(SPEED);
+                            let phase = (self.clock_ms * 128 / 1000) % (ticks + WAIT);
+                            if phase < ticks
+                                && let Some((s, l, c0, c1)) = glint_sweep(len, (phase * SPEED) as f32 - width, width, true)
+                            {
+                                let (a, b) = (tint(c0), tint(c1));
+                                let (px, py, pw, ph) = if horizontal { (x + s, y, l, 1.0) } else { (x, y + s, 1.0, l) };
+                                let pts = [[px, py], [px + pw, py], [px, py + ph], [px + pw, py + ph]];
+                                let cols = if horizontal { [a, b, a, b] } else { [a, a, b, b] };
+                                self.gouraud(&mut out, aspect, pts, cols);
+                            }
+                        }
+                    }
+                    // `NFS5.BEVELEDOPTIONBOX` is the one class whose draw is the vtable's own
+                    // 0x520E50: the template's parts (0x4C8260 at 0x520E5E) and then the shared
+                    // bevel 0x521050 with a thickness of **3** (0x520EBD), over the widget's box
+                    // (0x4C8670) in its fade colour. So it is its amber fill and black frame with
+                    // a sunken bevel inside them, not the fill alone.
+                    if e.class == "NFS5.BEVELEDOPTIONBOX" {
+                        self.bevel(&mut out, aspect, x, y, w, h, 3.0);
+                    }
                     // Erased, not undrawn, in two cases the original agrees with:
                     //
                     // * a box whose every rectangle is **fully transparent** — four of the 362
@@ -2672,9 +5065,50 @@ impl LayoutScreen {
                 // and the part is the editor's preview. The port keeps its own right-aligned draw
                 // and its own white. APPROXIMATION, as before.
                 "NFS5.ComboBoxSlider" | "NFS5.ColorBox" => {
-                    let state = if selected == Some(i) { "selected" } else { e.get("state").unwrap_or("normal") };
+                    self.glinty_box(&mut out, aspect, e, i, x, y, tint);
+                    // The combo's own bevel, 0x4C69DF — the last call site of 0x521050 whose
+                    // arguments were not all read (§4.58, §4.68). Its gate is four tests at
+                    // 0x4C6947…0x4C698D: not a list box (`[+0x1DD]`), hovered (0x4C7C90), a
+                    // **button held** (0x5299C0) and not disabled (0x4C7E40) — a pressed
+                    // decoration. Its rect is `x` from the `selectionbox`'s left (0x4C6961), `y`
+                    // from the widget's box's **bottom** — `[0x4C8670()+0xC]`, copied at
+                    // 0x4C58D2 and the only write to that slot — `w` the `backrect`'s width
+                    // (0x4C69BE) and `h` the two rects' heights together (0x4C6998, 0x4C69A5),
+                    // which is `data.height + data.selectionboxmaxheight`. Thickness **3**.
+                    if self.pressed_on(i, hovered) {
+                        let max_h = self.attr_num(e, "selectionboxmaxheight").unwrap_or(160.0) as f32;
+                        self.bevel(&mut out, aspect, x, y + h, w, h + max_h, 3.0);
+                    }
+                    let state = self.state_for(e, i, selected, hovered);
+                    if self.open_combo == Some(i) {
+                        if e.class == "NFS5.ColorBox" {
+                            self.color_picker(&mut overlay, aspect, x, y, w, h, tint);
+                        } else {
+                            self.drop_down(&mut overlay, aspect, e, i, x, y, tint);
+                        }
+                    }
                     for (px, py, pw, ph, col) in self.state_rects(e, state) {
                         out.push(self.quad(aspect, x + px, y + py, pw.max(1.0), ph.max(1.0), tint(col)));
+                    }
+                    // The same stems the buttons have (§4.24), from the same draw — a combo slider
+                    // and a colour box share `FeComboBox`'s slot 1, and 0x4C5F18…0x4C5FB2 is its
+                    // copy of the pair: 0x4D9280 twice, one pixel wide, in 0x4D87E0 of the fade
+                    // (black), each `backrect.height + stem` tall. The left one at the widget's
+                    // own x (0x4C5F4F), the right at `x + backrect.width` plus **one more pixel
+                    // when the list is scrolling** (0x4C5F93 reads the `[this+0x1DC]` flag and
+                    // adds its truth to the x) — a closed combo never scrolls, so the port adds
+                    // nothing. `backrect` is `data.width` x `data.height` in `ComboBox.ctr`.
+                    //
+                    // Unlike the buttons' pair this one is not behind `glintybox`: the draw
+                    // reaches it whichever way the background above it went (0x4C5E8C's two arms
+                    // on `dropshadow == 2` both fall into it).
+                    {
+                        let stem = tint([0, 0, 0, 0xff]);
+                        let bh = self.attr_num(e, "height").unwrap_or(0.0) as f32;
+                        let bw = self.attr_num(e, "width").unwrap_or(0.0) as f32;
+                        let at = |k: &str| self.attr_num(e, k).unwrap_or(0.0) as f32 + bh;
+                        out.push(self.quad(aspect, x, y, 1.0, at("stemleftheight"), stem));
+                        out.push(self.quad(aspect, x + bw, y, 1.0, at("stemrightheight"), stem));
                     }
                     for (px, py, pw, ph, file, index, flip) in self.shape_parts(e) {
                         let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
@@ -2694,9 +5128,19 @@ impl LayoutScreen {
                             .part_attr(e, p, "pos")
                             .and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)))
                             .unwrap_or((0.0, 0.0));
-                        let f = self
-                            .part_attr(e, p, "fontPathName")
-                            .map(|f| f.to_lowercase())
+                        // **`data.usesmallfont`** puts both strings in `univers8b.ffn`. The class
+                        // keeps two hard-coded fonts — `[this+0x184]` is `univers8b.ffn`
+                        // (0x4C4E8E) and `[this+0x188]` `universC11b.ffn` (0x4C4EC6) — and
+                        // 0x4C555E picks between them into the caption's slot `[this+0x190]`,
+                        // which is the font the caption draw reads at 0x4C604A. The value's slot
+                        // `[this+0x194]` takes the same `univers8b.ffn` when the flag is set and
+                        // the template's `label` font (0x4C532E) when it is not. Twenty-nine of
+                        // the 46 shipped sliders that carry the key set it.
+                        let small = self.attr_num(e, "usesmallfont").is_some_and(|v| v != 0.0);
+                        let f = (!small)
+                            .then(|| self.part_attr(e, p, "fontPathName").map(|f| f.to_lowercase()))
+                            .flatten()
+                            .or_else(|| small.then(|| SMALL_FONT.to_string()))
                             .and_then(|f| self.fonts.get(&f))
                             .or_else(|| self.fonts.get(DEFAULT_FONT));
                         if let Some(f) = f {
@@ -2720,13 +5164,66 @@ impl LayoutScreen {
                         let f = self
                             .controls
                             .get(&e.class)
+                            .filter(|_| !self.attr_num(e, "usesmallfont").is_some_and(|v| v != 0.0))
                             .and_then(|c| c.part("label"))
                             .and_then(|p| self.part_attr(e, p, "fontPathName"))
                             .map(|f| f.to_lowercase())
+                            .or_else(|| self.attr_num(e, "usesmallfont").is_some_and(|v| v != 0.0).then(|| SMALL_FONT.to_string()))
                             .and_then(|f| self.fonts.get(&f))
                             .or_else(|| self.font_for(e));
                         let Some(f) = f else { break 'elem };
+                        // **`nolabel == 4`** is a second box, and eleven of the shipped sliders
+                        // ask for it — all on `advgraphics.lay`, `graphicsettings.lay` and
+                        // `audioreal.lay`, the same eleven that carry a non-zero
+                        // `GraphicsSpecialCaseWidth`. `FeComboBox` takes that branch at 0x4C5A26
+                        // and draws, immediately to the **right** of the slider at
+                        // `x + data.width` (`[this+0x1C8]`, bound at 0x4C4FDE):
+                        //
+                        // * a fill that wide and the slider's own height, **0xA0444444**
+                        //   (0x4C5A34, through 0x4D9280 at 0x4C5A80);
+                        // * the same box outlined in **black** — 0x4D87E0 of the fade at
+                        //   0x4C5A86, through the four-bar 0x4D9200 at 0x4C5AC9;
+                        // * and the value **centred** in it, at
+                        //   `x + data.width + GraphicsSpecialCaseWidth/2` and `y + 2`, in
+                        //   **0xAAFFFFFF** and the same `[this+0x194]` font the ordinary draw uses
+                        //   (0x4C5B30…0x4C5BD0).
+                        //
+                        // Not ported: the `"N/A"` of `FEStrings` 299 that 0x4C5B64 puts there
+                        // instead — 0x4C5AD3 chooses it on 0x4C7E40, the *transitioning* test, so
+                        // at rest it is always the value.
+                        let gscw = self.attr_num(e, "GraphicsSpecialCaseWidth").unwrap_or(0.0) as f32;
                         let colour = if selected == Some(i) { [1.0, 0.85, 0.2, 1.0] } else { [1.0, 1.0, 1.0, 1.0] };
+                        // **`nolabel == 1`** — all fourteen of them on `display.lay`, and all
+                        // fourteen with `stringID=0`, so they have no caption of their own — puts
+                        // the **value** where the caption would go instead: 0x4C6080 takes the
+                        // `label` part's string, 0x4C609F its x as `x + 5` and `y + 2`, 0x4C6098
+                        // align **0**, and 0x4C60AE the **caption's** font `[this+0x190]` rather
+                        // than the value's `[this+0x194]`, before jumping into the ordinary
+                        // draw's last two pushes at 0x4C6236. So it is left-aligned in the
+                        // caption's place, not right-aligned against the arrow.
+                        if self.attr_num(e, "nolabel") == Some(1.0) {
+                            let small = self.attr_num(e, "usesmallfont").is_some_and(|q| q != 0.0);
+                            let cf = (!small)
+                                .then(|| self.controls.get(&e.class).and_then(|c| c.part("labelleft")).and_then(|p| self.part_attr(e, p, "fontPathName")).map(|f| f.to_lowercase()))
+                                .flatten()
+                                .or_else(|| small.then(|| SMALL_FONT.to_string()))
+                                .and_then(|f| self.fonts.get(&f))
+                                .unwrap_or(f);
+                            self.text(&mut out, aspect, cf, &v, x + 5.0, y + 2.0, 0.0, 0, colour);
+                            break 'elem;
+                        }
+                        if self.attr_num(e, "nolabel") == Some(4.0) && gscw >= 1.0 {
+                            let bw = self.attr_num(e, "width").unwrap_or(0.0) as f32;
+                            let bh = self.attr_num(e, "height").unwrap_or(0.0) as f32;
+                            let (bx, black) = (x + bw, tint([0, 0, 0, 0xff]));
+                            out.push(self.quad(aspect, bx, y, gscw, bh, tint([0x44, 0x44, 0x44, 0xa0])));
+                            out.push(self.quad(aspect, bx, y, gscw, 1.0, black));
+                            out.push(self.quad(aspect, bx, y + bh - 1.0, gscw, 1.0, black));
+                            out.push(self.quad(aspect, bx, y, 1.0, bh, black));
+                            out.push(self.quad(aspect, bx + gscw - 1.0, y, 1.0, bh, black));
+                            self.text(&mut out, aspect, f, &v, bx + (gscw / 2.0).trunc(), y + 2.0, 0.0, 1, tint([0xff, 0xff, 0xff, 0xaa]));
+                            break 'elem;
+                        }
                         self.text(&mut out, aspect, f, &v, x + w - 12.0, y, 0.0, 2, colour);
                     }
                 }
@@ -2752,9 +5249,71 @@ impl LayoutScreen {
                 // An alpha of zero is invisible, which is how two of the three labels stay out of
                 // the way; `BottomBarButton.ctr`'s labels, which really are coloured, all carry a
                 // `0xff` alpha instead.
+                //
+                // Its draw, **0x4C90C0**, puts three more things round that pill, and this port
+                // now draws two of them (`RE/notes/controls.md` §4.22). In order:
+                //
+                // * `dropshadow == 2` — six of the 153 — gets **0x521900** *under* the parts
+                //   (0x4C914A). Not reversed, so not drawn;
+                // * the template's parts, through 0x4C8260 (0x4C918E);
+                // * the **bevel** 0x521050 with a thickness of 3 (0x4C91E4) — ungated: every
+                //   button that is fully shown and not mid-transition gets it;
+                // * `dropshadow == 1` — the template's own default, and what 132 of the 153 carry
+                //   — gets the **drop shadow** 0x520F00 at an offset of (4, 4) (0x4C91FE).
+                //
+                // `dropshadow` reaches two separate bytes: 1 sets `[this+0x14C]` and 2 sets
+                // `[this+0x14D]` (0x4C8F8C…0x4C8FBA), which is why the two are different draws.
                 "NFS5.GOTOBUTTON" => {
-                    let state = if selected == Some(i) { "selected" } else { e.get("state").unwrap_or("normal") };
+                    let state = self.state_for(e, i, selected, hovered);
+                    // `dropshadow == 2` — six of the 153 — gets **0x521900** *under* the parts
+                    // (0x4C914A), and that is `0x4D96B0(x+1, y+1, w−2, h−2, …)` with the four
+                    // corners **bright, dark, bright, dark** — 0xFFE00C0C at the left edge and
+                    // 0xFF820000 at the right (0x52192B…0x52195D), a horizontal red ramp inset by
+                    // a pixel. Which corner each colour belongs to is settled by 0x4D96B0 itself:
+                    // it lays the four vertices out (x, y), (x+w, y), (x+w, y+h), (x, y+h) and
+                    // copies the colours in the order c0, c1, c3, c2 (0x4D973C…0x4D97AF), so the
+                    // argument order is upper-left, upper-right, **bottom-left**, bottom-right.
+                    if self.attr_num(e, "dropshadow") == Some(2.0) {
+                        let (l, r) = (tint([0xe0, 0x0c, 0x0c, 0xff]), tint([0x82, 0, 0, 0xff]));
+                        let (x0, y0, x1, y1) = (x + 1.0, y + 1.0, x + w - 1.0, y + h - 1.0);
+                        self.gouraud(&mut out, aspect, [[x0, y0], [x1, y0], [x0, y1], [x1, y1]], [l, r, l, r]);
+                    }
                     self.template_widget(&mut out, aspect, e, state, x, y, strings);
+                    if self.pressed_on(i, hovered) {
+                        self.bevel(&mut out, aspect, x, y, w, h, 3.0);
+                    }
+                    if self.attr_num(e, "dropshadow") == Some(1.0) {
+                        self.drop_shadow(&mut out, aspect, x, y, w, h, 4.0, 4.0);
+                    }
+                    // **The stems** (0x4C9341…0x4C93D9), the thin verticals that hang off the ends
+                    // of a menu button and join it to the next: two calls to the one-bar primitive
+                    // 0x4D9280, each **one pixel wide**, at the button's left edge and at
+                    // `left + width` (0x4C93B4 differences the box and adds the widget's own x
+                    // back), starting at the widget's `y` and running
+                    // `stemleftheight + height` / `stemrightheight + height` down — the draw
+                    // spells that `stem − box.top + box.bottom` (0x4C9362, 0x4C939B). The colour
+                    // is 0x4D87E0 of the fade, which is `fade << 24`: **black**.
+                    //
+                    // They are drawn when `[this+0x150]` is set, and the activate (0x4C9030) sets
+                    // it exactly when `data.glintybox` is not −1 (0x4C9048). None of the 153
+                    // shipped buttons carries −1 — 66 carry 1, 40 carry 2, 35 carry 5 and 12
+                    // leave it empty, which is the template's own 1 — so all of them have stems.
+                    //
+                    // `[this+0x150]` is not a flag, though: it is a **glinty rectangle of the
+                    // button's own box** (§4.60), and the button's draw paints it at 0x4C9461 — a
+                    // black one-pixel outline and §4.27's corner flourish. It is not drawn here
+                    // because 0x51FDE0 returns at once unless a device byte is set, and which way
+                    // that falls needs the original running (`RE/AUDIT.md` §E).
+                    // `stemleftheight` and `stemrightheight` default to 0, and 0 still draws: the
+                    // bar is then the button's own height.
+                    if self.attr_num(e, "glintybox").unwrap_or(1.0) != -1.0 {
+                        let stem = tint([0, 0, 0, 0xff]);
+                        let at = |k: &str| self.attr_num(e, k).unwrap_or(0.0) as f32 + h;
+                        out.push(self.quad(aspect, x, y, 1.0, at("stemleftheight"), stem));
+                        out.push(self.quad(aspect, x + w, y, 1.0, at("stemrightheight"), stem));
+                    }
+                    // and the glinty box itself, which is the last thing the draw does (0x4C9461)
+                    self.glinty_box(&mut out, aspect, e, i, x, y, tint);
                 }
                 // The same shape three more times, 19 widgets: a `0xFFBC0000` box inside four
                 // one-pixel black bars, with a white caption. `Tab Button.ctr` puts its
@@ -2775,12 +5334,53 @@ impl LayoutScreen {
                 //   — centred over the tab's own highlight art and then nudged by the two offsets
                 //   the block carries (`textoffsetx` is 24, 3, 0, −1 and −22 on the five shipped tabs).
                 "NFS5.BOTTOMBARBUTTON" | "NFS5.GRAPHICTABBUTTON" => {
-                    let state = if selected == Some(i) { "selected" } else { e.get("state").unwrap_or("normal") };
-                    self.template_widget(&mut out, aspect, e, state, x, y, strings);
+                    let state = self.state_for(e, i, selected, hovered);
+                    let frame = (e.class == "NFS5.BOTTOMBARBUTTON").then(|| self.bar_button_frame(e, hovered == Some(i), self.pressed_on(i, hovered))).flatten();
+                    self.template_widget_at(&mut out, aspect, e, state, x, y, strings, frame);
                 }
                 "NFS5.TABBUTTON" | "NFS5.CAMERASELECT" | "NFS5.CAMERAPICTURE" => {
-                    let state = if selected == Some(i) { "selected" } else { e.get("state").unwrap_or("normal") };
+                    let state = self.state_for(e, i, selected, hovered);
                     self.template_widget(&mut out, aspect, e, state, x, y, strings);
+                    if e.class == "NFS5.TABBUTTON" {
+                        self.glinty_box(&mut out, aspect, e, i, x, y, tint);
+                    }
+                    // The tab buttons' draw 0x4D0350 draws the parts first (0x4D036D) and then,
+                    // **when `data.dropshadow` is set** (`[this+0x144]`, bound at 0x4D00E0), the
+                    // bevel 0x521050 over its own box with a thickness of 3 — that in the steady
+                    // state, 0x4D0440; a tab that is still fading gets 0x520F00 with (4, 4)
+                    // instead, at 0x4D048D, which this port has no transition state to reach.
+                    // `Tab Button.ctr` carries `dropshadow.value=1` `HIDDEN|READONLY`, so all 11
+                    // get it; `Graphic Tab Button.ctr` carries 0, so none of its 5 do.
+                    //
+                    // The two camera classes have draws of their own and both end the same way,
+                    // with the bevel and **no** `dropshadow` to gate it — only the two visibility
+                    // tests every caller makes. `NFS5.CAMERASELECT` (0x4BF610) gives it the
+                    // widget's own box (0x4BF69D…0x4BF6CA); `NFS5.CAMERAPICTURE` (0x4BFA20) gives
+                    // it a fixed **15 x 13**, the two float constants 0x41700000 and 0x41500000
+                    // pushed at 0x4BFAC8 and 0x4BFACD.
+                    // **A tab button at rest gets the drop shadow, not nothing.** 0x4D03D6 gates
+                    // the whole tail on `data.dropshadow`; then 0x4D03E6 asks 0x4C7CB0 — hovered
+                    // with the button held (§4.55) — and 0x4D03F1 asks 0x4C7E40, which is
+                    // `isDisabled` and **not** "transitioning" as this comment used to say. The
+                    // pressed, enabled tab gets the bevel at 0x4D0440; every other tab gets
+                    // 0x520F00 with (4, 4) at 0x4D044A. `Tab Button.ctr` carries
+                    // `dropshadow.value=1 HIDDEN|READONLY`, so all 11 have one.
+                    if e.class == "NFS5.TABBUTTON"
+                        && self.attr_num(e, "dropshadow").is_some_and(|v| v != 0.0)
+                        && !self.pressed_on(i, hovered)
+                    {
+                        self.drop_shadow(&mut out, aspect, x, y, w, h, 4.0, 4.0);
+                    }
+                    if self.pressed_on(i, hovered) {
+                        match e.class.as_str() {
+                            "NFS5.TABBUTTON" if self.attr_num(e, "dropshadow").is_some_and(|v| v != 0.0) => {
+                                self.bevel(&mut out, aspect, x, y, w, h, 3.0);
+                            }
+                            "NFS5.CAMERASELECT" => self.bevel(&mut out, aspect, x, y, w, h, 3.0),
+                            "NFS5.CAMERAPICTURE" => self.bevel(&mut out, aspect, x, y, 15.0, 13.0, 3.0),
+                            _ => {}
+                        }
+                    }
                 }
                 _ => {
                     // Not drawn here: the template's `RECT` parts. They are the widget's regions,
@@ -2821,21 +5421,19 @@ impl LayoutScreen {
                         let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
                         out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
                     }
+                    // `NFS5.PLAYERDRIVERPICTURE`'s draw 0x4CF7C0 ends the way the buttons' do:
+                    // the bevel 0x521050 over the widget's own box (0x4C8670's corners differenced
+                    // at 0x4CF89E and 0x4CF8AE) with a thickness of 3, ungated but for the two
+                    // visibility tests (0x4CF88D, 0x4CF896). Eight widgets.
+                    if e.class == "NFS5.PLAYERDRIVERPICTURE" && self.pressed_on(i, hovered) {
+                        self.bevel(&mut out, aspect, x, y, w, h, 3.0);
+                    }
                     if code_placed(&e.class) {
                         break 'elem;
                     }
                     let Some(f) = self.font_for(e) else { break 'elem };
-                    // A combo slider carries both: its `stringID` is the label and its `accessor`
-                    // holds the value. The original places the value with code; the port fills the
-                    // widget's own box — label left, value right — which is the only geometry the
-                    // file gives. APPROXIMATION.
-                    if e.class == "NFS5.ComboBoxSlider"
-                        && let Some(v) = e.get("accessor").filter(|a| !a.is_empty()).and_then(accessor)
-                    {
-                        let colour = if selected == Some(i) { [1.0, 0.85, 0.2, 1.0] } else { [1.0, 1.0, 1.0, 1.0] };
-                        let box_w = if w > 0.0 { w } else { 120.0 };
-                        self.text(&mut out, aspect, f, &v, x, y, box_w, 2, colour);
-                    }
+                    // (A `NFS5.ComboBoxSlider` never reaches here — §4.14 gave it its own arm,
+                    // which places its value the way the code does, at `x + width - 12`.)
                     // an accessor watch shows a value, everything else its own `stringID`
                     // case-insensitively: the class is `NFS5.AccessorWatch` on most screens but
                     // `NFS5.WORDWRAPACCESSORWATCH` where the text has to wrap, and a `contains`
@@ -2949,27 +5547,27 @@ impl LayoutScreen {
             if std::env::var("NFS_WIDGET_DUMP").is_ok() {
                 let n = out.len() - first;
                 let b = out[first..].iter().fold((9.0f32, 9.0f32, -9.0f32, -9.0f32), |a, s| (a.0.min(s.pos[0]), a.1.min(s.pos[1]), a.2.max(s.pos[0]), a.3.max(s.pos[1])));
-                let f0: Vec<(String, [f32; 4])> = { let mut v: Vec<(String, [f32; 4])> = out[first..].iter().map(|s| (format!("{:?}", s.texture), s.color)).collect(); v.dedup(); v };
-                println!("  #{i:3} {:<26} pos=({x:.0},{y:.0}) sprites={n} box=({:.3},{:.3})-({:.3},{:.3}) alpha={talpha:.2} first={f0:?}", e.class, b.0, b.1, b.2, b.3);
+                let f0: Vec<(String, [f32; 4])> = { let mut v: Vec<(String, [f32; 4])> = out[first..].iter().map(|s| (format!("{:?}", s.texture), s.color)).collect(); v.dedup(); v.truncate(3); v };
+                let hot = match self.state_for(e, i, selected, hovered) {
+                    "normal" => String::new(),
+                    st => format!(" [{st}]"),
+                };
+                println!("  #{i:3} {:<26} pos=({x:.0},{y:.0}) size=({w:.0}x{h:.0}) sprites={n}{hot} box=({:.3},{:.3})-({:.3},{:.3}) alpha={talpha:.2} first={f0:?}", e.class, b.0, b.1, b.2, b.3);
             }
             if out.len() == first && i > 0 && !closed {
                 blank.push((e.class.clone(), source_of(e)));
             }
         }
+        // the tooltip last of all: the original builds it in the widget's own tick, and it has to
+        // be over the screen it describes
+        if let Some(h) = hovered
+            && let Some(e) = self.layout.elements.get(h)
+        {
+            self.tooltip(&mut overlay, aspect, e, strings);
+        }
+        out.append(&mut overlay);
         if std::env::var("NFS_LAYER_DUMP").is_ok() {
             println!("layer: background {} sprites, own {} sprites", bg_end, out.len() - bg_end);
-        }
-        // The cars of the `NFS5.3DCAR` widgets that have a `positiontype` of their own, each
-        // already rendered into an offscreen view the size of the screen — its place in that view
-        // comes from the camera, not from the widget's rectangle. The original draws each one in
-        // its widget's own place in the layout order, but two of the three screens that use them
-        // (`carcompare`) then put `DarkOval.fsh` over the middle, which would hide them, so the
-        // port draws them over the finished screen instead. APPROXIMATION.
-        for (&i, &tex) in &self.car_views {
-            let alpha = self.transition_of(&self.layout.elements[i]).1;
-            let design = DESIGN.0 / DESIGN.1;
-            let (fw, x0) = if aspect > design { (design / aspect, (1.0 - design / aspect) * 0.5) } else { (1.0, 0.0) };
-            out.push(Sprite { texture: tex, pos: [x0, 0.0], size: [fw * aspect, 1.0], uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, alpha], rotation: 0.0, pivot: [0.5, 0.5] });
         }
         out
     }

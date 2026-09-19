@@ -626,8 +626,26 @@ impl CarModel {
             let g = nfs_assets::car::global_texture(paths, "INTGLASS.FSH", "glai").ok()??;
             let tex = r.upload_texture(&TextureData { width: g.width, height: g.height, mips: g.mips.clone() });
             let mat = r.create_material(MaterialDesc { texture: Some(tex), alpha_blend: true, cull_back: false, depth_test: true, env_texture: None, env_mix: 0.0 });
-            // APPROXIMATION: the corners are mapped to the whole texture in the order the record
-            // stores them (bottom pair first); the original's uv set-up (0x457E60) was not read.
+            // **The quad is mapped to the whole texture**, and that is traced now. The batcher's
+            // three parallel buffers are positions at `acc+0x0C` (stride 0x10), **texture
+            // coordinates at `acc+0x25BC` (stride 8)** and colours at `acc+0x3894` (stride 4), 201
+            // triangles of three vertices each. The whole image holds **three** references to
+            // `+0x25BC`: two are the flush in 0x457E60, and the third, 0x4578EB, registers the
+            // buffer as a stream. Nothing ever writes it per quad — it is filled **once**, at
+            // 0x458150 from the accumulator's setup (0x457864), with a fixed pattern that
+            // alternates on the triangle index:
+            //
+            // ```text
+            // even: (1,0) (1,1) (0,0)      odd: (0,1) (0,0) (1,1)
+            // ```
+            //
+            // so each **pair** of triangles covers the unit square. There is no generated mapping
+            // to find, which is what an earlier note had guessed at.
+            //
+            // What is left is which corner takes which of the four: the original's vertices reach
+            // the buffer through 0x4583F0 (`origin + (a·len)·u + b·v` on the plane 0x457920 sorts
+            // by y and then x), and this port uses the record's own order. That ordering is the
+            // one residual here.
             let uv = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
             let mut mesh = MeshData::default();
             for (i, q) in p.iter().enumerate() {

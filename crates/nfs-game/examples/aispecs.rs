@@ -21,7 +21,8 @@ fn main() {
         if (b - 1.0).abs() > 1e-3 || (c - 1.0).abs() > 1e-3 {
             println!("{:<16} 0x140 {b:>6.3}  0x144 {c:>6.3}", p.file_stem().unwrap().to_string_lossy());
         }
-        if false && shown < 6 {
+        // `AISPECS_ALL=1` prints the first six rows in full, not just the ones that differ
+        if shown < 6 && std::env::var("AISPECS_ALL").is_ok() {
             println!("{:<16} 0x13C {a:>7.3}  0x140 {b:>7.3}  0x144 {c:>7.3}", p.file_stem().unwrap().to_string_lossy());
             shown += 1;
         }

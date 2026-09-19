@@ -124,3 +124,49 @@ fn the_embedded_tables_are_the_shipped_images() {
     assert_eq!(sav.tournament.as_ref().unwrap().current_event, -1);
     assert_eq!(sav.knockout.as_ref().map(|k| k.len()), Some(nfs_formats::sav::KNOCKOUT_BLOB));
 }
+
+/// The sixteen `FEControllerDeadZoneAccessor`s ride in the accessor block as `u32 selection` plus
+/// `u32[16]` — one value per pad — and the port writes the pad it edits into slot 0, leaving the
+/// rest at the factory's own 0 / 0x80. `RE/notes/savegame.md` §6.1, `controls.md` §4.17.
+#[test]
+fn the_dead_zone_accessors_ride_in_the_save() {
+    let Some(tables) = tables() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let career = Career::default();
+    let profile = Profile { name: "DRIVER".into(), picture: 0 };
+    let mut settings = nfs_game::save::SavedSettings::default();
+    // both opponent counts start at 4 (0x4E5539, 0x4E556C), not at 7
+    assert_eq!((settings.opponents, settings.ko_opponents), (4, 4));
+    assert_eq!(settings.deadzone, [[0, 0x80]; 8]);
+    settings.deadzone[2] = [40, 100];
+
+    let sav = nfs_game::save::career_to_sav_with(&career, &tables, &profile, None, &[], &settings);
+    let a = sav.accessors.as_ref().expect("an accessor block");
+    let find = |n: &str| a.entries.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+
+    // every one of the sixteen is there, in the registration order
+    for axis in nfs_game::save::DEADZONE_AXES {
+        for (k, suffix) in ["Min", "Max"].iter().enumerate() {
+            let v = find(&format!("{axis}.{suffix}")).unwrap_or_else(|| panic!("{axis}.{suffix}"));
+            let nfs_formats::sav::AccessorValue::DeadZone { selection, values } = v else {
+                panic!("{axis}.{suffix} is not a dead-zone value");
+            };
+            assert_eq!(selection, 0);
+            // pads 1..15 keep the factory's own default for that end
+            assert!(values[1..].iter().all(|x| *x == if k == 0 { 0 } else { 0x80 }), "{axis}.{suffix}");
+        }
+    }
+    // and the one the test moved came through on pad 0
+    let nfs_formats::sav::AccessorValue::DeadZone { values, .. } = find("ZAxis.Min").unwrap() else { panic!() };
+    assert_eq!(values[0], 40);
+    let nfs_formats::sav::AccessorValue::DeadZone { values, .. } = find("ZAxis.Max").unwrap() else { panic!() };
+    assert_eq!(values[0], 100);
+
+    // the block survives a round trip through the original's own bytes
+    let bytes = sav.write();
+    let back = SaveFile::parse(&bytes).expect("re-parse");
+    let b = back.accessors.as_ref().expect("an accessor block");
+    assert_eq!(b.entries.len(), a.entries.len());
+}

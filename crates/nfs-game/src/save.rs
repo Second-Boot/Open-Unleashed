@@ -401,11 +401,38 @@ pub struct SavedSettings {
     pub laps: u32,
     pub opponents: u32,
     pub traffic: u32,
+    /// `Game.NumKOOpponents` — a **separate** accessor from `Game.NumOpponents`, registered at
+    /// 0x4E556C with the same default of 4 but a minimum of 1 (`RE/notes/layouts.md`)
+    pub ko_opponents: u32,
+    /// the sixteen `FEControllerDeadZoneAccessor`s for **pad 0**, `[min, max]` per axis in the
+    /// order they are registered at 0x51E4C0 — `XAxis`, `YAxis`, `ZAxis`, `XRot`, `YRot`, `ZRot`,
+    /// `SliderA`, `SliderB` (`RE/notes/controls.md` §4.17)
+    pub deadzone: [[u32; 2]; 8],
 }
+
+/// The eight axes in the order 0x51E4C0 registers their two accessors, which is `DIJOYSTATE`'s own
+/// field order and therefore the order of the axis bitmask's bits.
+pub const DEADZONE_AXES: [&str; 8] = ["XAxis", "YAxis", "ZAxis", "XRot", "YRot", "ZRot", "SliderA", "SliderB"];
 
 impl Default for SavedSettings {
     fn default() -> Self {
-        Self { music: 127, sfx: 127, engine: 127, speech: 127, ambient: 127, audio_quality: 1, view_distance: 3, laps: 2, opponents: 7, traffic: 0 }
+        // `Game.NumOpponents` and `Game.NumKOOpponents` are both registered with a default of
+        // **4** (0x4E5539, 0x4E556C), and every dead-zone accessor with 0 for a `.Min` and 0x80
+        // for a `.Max` (0x51E546, 0x51E550)
+        Self {
+            music: 127,
+            sfx: 127,
+            engine: 127,
+            speech: 127,
+            ambient: 127,
+            audio_quality: 1,
+            view_distance: 3,
+            laps: 2,
+            opponents: 4,
+            traffic: 0,
+            ko_opponents: 4,
+            deadzone: [[0, 0x80]; 8],
+        }
     }
 }
 
@@ -452,7 +479,19 @@ pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, 
         ("Track1.Laps".into(), AccessorValue::Dword(settings.laps)),
         ("Game.NumOpponents".into(), AccessorValue::Dword(settings.opponents)),
         ("Track1.Traffic".into(), AccessorValue::Dword(settings.traffic)),
+        ("Game.NumKOOpponents".into(), AccessorValue::Dword(settings.ko_opponents)),
     ];
+    // The sixteen dead-zone accessors. Each holds **one value per pad** — `u32[16]` at
+    // `this+0x28`, written with the selection in front (0x51BEC0 / 0x51BEF0, `savegame.md` §6.1) —
+    // so this port's edited pad goes in slot 0 and the rest keep the factory's own default, which
+    // is what an untouched pad has.
+    for (n, axis) in DEADZONE_AXES.iter().enumerate() {
+        for (k, suffix) in ["Min", "Max"].iter().enumerate() {
+            let mut values = [if k == 0 { 0 } else { 0x80 }; 16];
+            values[0] = settings.deadzone[n][k];
+            entries.push((format!("{axis}.{suffix}"), AccessorValue::DeadZone { selection: 0, values }));
+        }
+    }
     // the selected car's setup, which the screen mirrors into `FEFloatAccessor`s — a float rides in
     // the same dword (`career.md` §12, `layouts.md`)
     if let Some(car) = c.garage.first() {
