@@ -612,6 +612,14 @@ const CHRONICLE_GROUP_LETTERS: &str = "CBADE";
 /// `[0x5DBA44]` starts at 2, so the chronicle opens on `'A'` — the 356.
 const CHRONICLE_GROUP: usize = 2;
 
+/// `chronicle.lay`'s five model-group buttons, in the order the jump table at **0x507894** puts
+/// them: 0x507839 `ID_RACEMODEL`, 0x50784B `ID_911BUTTON`, 0x50785D `ID_356BUTTON`, 0x50786F
+/// `ID_924BUTTON`, 0x507881 `ID_914BUTTON`. The index is `[0x5DBA44]`, which is also what
+/// [`CHRONICLE_GROUP_LETTERS`] is indexed by — so group 2 is `ID_356BUTTON` and letter `'A'`,
+/// which is what the port already had. Each arm sets the flag on its own button and 0x5077D0
+/// clears it on all five first. §4.111.
+const CHRONICLE_GROUP_BUTTONS: [&str; 5] = ["ID_RACEMODEL", "ID_911BUTTON", "ID_356BUTTON", "ID_924BUTTON", "ID_914BUTTON"];
+
 /// The front end's **multiple-choice** accessors: the name a layout writes, the `fe.txt` key that
 /// holds the chosen index, and the `FEStrings` ids of the choices in order.
 ///
@@ -636,6 +644,14 @@ const CHRONICLE_GROUP: usize = 2;
 /// name. The only row that was missing is `Display.RecordTime`, slot 0x68 = `RECORDTIME`.
 /// How often a held scrollbar arrow steps — `0x529220(this, 0x96, 1)` at 0x4D0A97, 150 ms.
 const SCROLL_REPEAT_MS: u32 = 0x96;
+
+/// The two rows of the front end's boolean accessor, in index order — 0x4B8770 answers `FEStrings`
+/// **705** "off" for every index but 1, and **704** "on" for 1.
+const BOOL_OPTIONS: [u32; 2] = [705, 704];
+
+/// `Comms.Positional`'s two rows, in index order — the option list 0x5B9674 that 0x50BB03 hands
+/// 0x4BB680: `FEStrings` 281 "input exchange" and 282 "positional". 0x50BB1C starts it on **1**.
+const POSITIONAL_OPTIONS: [u32; 2] = [281, 282];
 
 const CHOICE_ACCESSORS: &[(&str, &str, &[u32])] = &[
     ("Audio.Mode", "audio3d", &[1500, 1501]),
@@ -666,6 +682,13 @@ const CHOICE_ACCESSORS: &[(&str, &str, &[u32])] = &[
     ("Car.Transmission", "car[0].transmission", &[560, 561]),
     ("Comms.Collision", "", &[1500, 1501]),
     ("OwnedCar.PackageNum", "", &[620, 621, 622, 623, 624, 625, 626, 627]),
+    // `Tournament.EventType` is the **two-list** choice accessor 0x4BB6F0: 0x4FD13E builds it
+    // through 0x506A70 with `[this+0x24] = 0x5B81A4` — `FEStrings` 470, 471, 472, 473 — and
+    // `[this+0x28] = 0x5B81B8` — 470, 476, 477, 478, the short forms. The drop-down's rows and
+    // the combo's caption both come from slot 12 (0x4BB750, `[this+0x24]`), reached through
+    // 0x4BC350 at 0x4BC38B and through 0x4BC4E0, so the long list is the one listed here; the
+    // short one answers `(SHORT)`. It has no `fe.txt` key. §4.105.
+    ("Tournament.EventType", "", &[470, 471, 472, 473]),
     ("CDPlayer.Options", "randomplaylist", &[1856, 1855]),
     ("CDPlayer.View", "", &[1851, 1850]),
     ("Display.Damage", "damagedisplay", &[1500, 1805, 1806, 1807]),
@@ -751,6 +774,145 @@ impl App {
     /// The rows a combo slider's drop-down would list: every option of the choice accessor it
     /// edits, and the one it is on. An accessor that is not one of [`CHOICE_ACCESSORS`] — a
     /// numeric range, say — has no enumerable options here, and that combo simply does not open.
+    /// The rows a combo drops down when its accessor is **not** one of the multiple-choice ones.
+    ///
+    /// `FeComboBox` does not keep a list of its own: 0x4C66E8's loop walks the accessor, asking it
+    /// for each entry in turn, so the drop-down is exactly the accessor's own enumeration with the
+    /// current index marked. For an **int range** that enumeration is `max - min + 1` entries
+    /// whose index is the value less the minimum — 0x4BA329 builds precisely that many and
+    /// 0x4BA34A / 0x4BA362 index them that way (§4.81) — and for a list accessor it is the list.
+    ///
+    /// So each family here is enumerated from the very source this port already answers the
+    /// combo's **caption** from, which is what makes it a reading rather than a guess: the car
+    /// combos from the car table the caption's `m.cars[m.car_idx]` indexes, the track combos from
+    /// `m.tracks`, the paint combos from the selected car's paint sets, and the four counted
+    /// settings from the clamps their own steppers carry. §4.91.
+    fn combo_rows(&self, name: &str) -> Option<(Vec<ListRow>, Option<usize>)> {
+        let (base, modifier) = match name.split_once('(') {
+            Some((b, m)) => (b.trim(), m.trim_end_matches(')').trim()),
+            None => (name, ""),
+        };
+        let m = self.menu.as_ref()?;
+        let num = |lo: i64, hi: i64, cur: i64| {
+            let rows = (lo..=hi).map(|v| ListRow::Text(v.to_string())).collect();
+            Some((rows, Some((cur - lo).max(0) as usize)))
+        };
+        match base {
+            // the car tables — `(SHORT)` is the family name, the plain form the display name,
+            // exactly as the caption resolves them
+            "zMergedList.Car" | "OpponentCar.Car" | "UsedCar.Car" | "PrizeCars.Car" | "OwnedCars.Car"
+            | "DealerCar.Car" | "GenericCar.Car" | "CARSETTINGS.CAR" | "GenericCar2.Car" => {
+                let rows = m
+                    .cars
+                    .iter()
+                    .map(|c| {
+                        ListRow::Text(if modifier == "SHORT" { c.family.to_uppercase() } else { c.display_name.to_uppercase() })
+                    })
+                    .collect();
+                let cur = if base == "GenericCar2.Car" { m.car2_idx } else { m.car_idx };
+                Some((rows, Some(cur)))
+            }
+            "Track1.Track" | "LoopedTrack.Track" | "Knockout.Track" | "Track.Track" | "Record.Track" => {
+                Some((m.tracks.iter().map(|t| ListRow::Text(t.to_uppercase())).collect(), Some(m.track_idx)))
+            }
+            // a paint combo counts the selected car's own sets from 1, which is what its caption
+            // shows (`m.paint_idx + 1`)
+            "OwnedCar.ExtColour" | "OwnedCar.IntColour" | "OwnedCar.S1Colour" | "OwnedCar.S2Colour"
+            | "GenericCar.Colour" | "DealerCar.Colour" | "DealerCar.IntColour" => {
+                let n = m.cars.get(m.car_idx).map(|c| c.paint_sets.len()).unwrap_or(0).max(1) as i64;
+                num(1, n, m.paint_idx as i64 + 1)
+            }
+            // the two two-way ones: the direction's rows are `DIRECTION_OPTIONS`, the same pair
+            // its caption reads, and the traffic's `TRAFFIC_OPTIONS`' four
+            "Track1.Direction" | "Knockout.Direction" => {
+                let b = if base == "Knockout.Direction" { m.ko.get(m.ko_sel).map_or(m.backwards, |k| k.backwards) } else { m.backwards };
+                let rows = DIRECTION_OPTIONS.iter().map(|id| ListRow::Text(self.fe_strings.get(*id).unwrap_or_default().to_string())).collect();
+                Some((rows, Some(usize::from(b))))
+            }
+            "Knockout.Traffic" => {
+                let t = m.ko.get(m.ko_sel).map_or(m.traffic, |k| k.traffic);
+                let rows = TRAFFIC_OPTIONS.iter().map(|id| ListRow::Text(self.fe_strings.get(*id).unwrap_or_default().to_string())).collect();
+                Some((rows, Some((t as usize).min(3))))
+            }
+            "Knockout.Laps" => num(1, 10, m.ko.get(m.ko_sel).map_or(m.laps, |k| k.laps) as i64),
+            // `Game.Difficutly` — the file's own spelling — is the three skills its caption reads
+            "Game.Difficutly" => {
+                let rows = ["EASY", "MEDIUM", "HARD"].iter().map(|t| ListRow::Text((*t).to_string())).collect();
+                Some((rows, Some((self.race_skill as usize).min(2))))
+            }
+            // `Tournament.Tournament` — class 0x5B88F0, whose `[this+0x24]` is **0x5053C0**, the
+            // function that picks the tournament vector, and whose row text (slot 12, 0x506560) is
+            // `FEStrings[rec+0x24]`, the port's `title_string_id`. 0x5053C0's own choice is the
+            // jump table at 0x505450 over `Tournament.EventType`'s index: **0** falls to 0x505404,
+            // which switches on the era id `[0x691E50]` — 0x209, 0x20A, 0x20B are 521, 522, 523,
+            // the three eras — and **1**, **2**, **3** take the classic, golden and modern club
+            // lists at 0x505447, 0x505441 and 0x50543B. §4.105.
+            "Tournament.Tournament" => {
+                let c = self.career.as_ref()?;
+                let list = match self.choice_index("Tournament.EventType").map(|(i, _)| i) {
+                    Some(1) => c.tables.club_tournaments_of(nfs_formats::career::Era::Classic),
+                    Some(2) => c.tables.club_tournaments_of(nfs_formats::career::Era::Golden),
+                    Some(3) => c.tables.club_tournaments_of(nfs_formats::career::Era::Modern),
+                    _ => c.tables.era_tournaments(c.career.era),
+                };
+                let cur = c.current().and_then(|t| list.iter().position(|x| x.id == t.id));
+                let rows = list
+                    .iter()
+                    .map(|t| ListRow::Text(self.fe_strings.get(if modifier == "SHORT" { t.name_string_id } else { t.title_string_id }).unwrap_or_default().to_uppercase()))
+                    .collect::<Vec<_>>();
+                (!rows.is_empty()).then(|| (rows, cur.or(Some(0))))
+            }
+            // `Tournament.RemainingTracks` — class 0x5B7E80, `[this+0x24] = 0x505170`, and its row
+            // text (slot 12, 0x4FA560) is `FEStrings[rec+4]` of the i-th record in that vector.
+            // `+4` is a `.trk` record's own name id (the port's `Track::name_string_id`), which is
+            // what makes these rows the remaining events' **track names**. 0x4FA575 wraps an index
+            // at or past the count back to 0.
+            "Tournament.RemainingTracks" => {
+                let c = self.career.as_ref()?;
+                let t = c.current()?;
+                let done = c.career.tournaments.get(&t.id).map_or(0, |s| s.events.len());
+                let rows: Vec<ListRow> =
+                    t.events.iter().skip(done).map(|e| ListRow::Text(c.tables.track_name(e.track_id).to_uppercase())).collect();
+                (!rows.is_empty()).then(|| (rows, Some(0)))
+            }
+            // `Controller.AllControllers` and `Controller.AllPads` — two empty string lists
+            // (0x4B8990 at 0x51E4AE and 0x51E4E1) that 0x511809 fills from the input layer's own
+            // enumeration: the count `0x51F050()`, each device's name `0x51F060(i)` appended to
+            // the controllers' list, and the same name appended to the pads' list only when
+            // `0x51F080(i)` says so. §4.103.
+            "Controller.AllControllers" | "Controller.AllPads" => {
+                let pads_only = base == "Controller.AllPads";
+                let rows: Vec<ListRow> = self
+                    .gamepads
+                    .devices()
+                    .into_iter()
+                    .filter(|(_, is_pad)| !pads_only || *is_pad)
+                    .map(|(n, _)| ListRow::Text(n.to_uppercase()))
+                    .collect();
+                (!rows.is_empty()).then(|| (rows, Some(0)))
+            }
+            // `Graphics.Resolutions` — 0x4BC710 formats one row per display mode as
+            // `"%d x %d x %d"` (0x5D7574) from the width, height and depth `0x44E720(i, &out)`
+            // writes, over the modes `0x44E780(i)` passes. This port has no Direct3D mode list, so
+            // it takes the arm 0x44E72A takes when there is no hardware device: **one** mode,
+            // 0x280 x 0x1E0 x 0x10. §4.104.
+            "Graphics.Resolutions" => Some((vec![ListRow::Text("640 x 480 x 16".to_string())], Some(0))),
+            // `Game.Damage` is the front end's one **boolean** accessor a layout names: class
+            // 0x5B4C64, two rows, the row text from 0x4B8770 — index 1 is `FEStrings` 0x2C0 = 704
+            // "on" and anything else 0x2C1 = 705 "off". §4.102.
+            "Game.Damage" => {
+                let rows = BOOL_OPTIONS.iter().map(|id| ListRow::Text(self.fe_strings.get(*id).unwrap_or_default().to_string())).collect();
+                Some((rows, Some(usize::from(m.damage))))
+            }
+            // and the four counted settings, at the ranges their own steppers clamp to
+            "Game.NumOpponents" => num(0, 7, m.opponents as i64),
+            "Game.NumKOOpponents" => num(1, 7, m.ko_opponents as i64),
+            "Track1.Laps" => num(1, 10, m.laps as i64),
+            "Track1.Traffic" => num(0, 3, m.traffic as i64),
+            _ => None,
+        }
+    }
+
     fn choice_rows(&self, name: &str) -> Option<(Vec<ListRow>, Option<usize>)> {
         let base = name.split_once('(').map(|(b, _)| b).unwrap_or(name);
         let (index, options) = self.choice_index(base)?;
@@ -763,11 +925,20 @@ impl App {
 
     fn choice_index(&self, name: &str) -> Option<(usize, &'static [u32])> {
         let (_, key, options) = CHOICE_ACCESSORS.iter().find(|(n, _, _)| *n == name)?;
-        let v = match self.choices.get(*key) {
+        let v = match self.choices.get(Self::choice_slot(name, key)) {
             Some(v) => *v,
             None => self.registry.u32(key, 0) as usize,
         };
         Some((v.min(options.len() - 1), options))
+    }
+
+    /// Where this port keeps a choice accessor's index. The original keeps it in the accessor
+    /// object itself, `[this+0x18]` (0x4BC460 / 0x4BC480); the `fe.txt` key is only where the
+    /// *saved* ones are written back. Several accessors have **no** `fe.txt` key — `Car.Roof`,
+    /// `Comms.Collision`, `OwnedCar.PackageNum`, `CDPlayer.View`, `Tournament.EventType` — so
+    /// those are kept under their own name instead of all sharing the empty one.
+    fn choice_slot<'a>(name: &'a str, key: &'a str) -> &'a str {
+        if key.is_empty() { name } else { key }
     }
 }
 
@@ -879,6 +1050,11 @@ struct Menu {
     /// `locationsetup.lay` and `quickknockout.lay` are the three layouts that name it, and it is
     /// what `Knockout.TrackNumber` measures its table by (0x4BA786).
     ko_opponents: u32,
+    /// `Game.Damage` — the **boolean** accessor 0x4B8720 builds at 0x4E55DD from
+    /// `("Game.Damage", 0, 1, 0)`. Its third argument is the initial value, fed to the setter
+    /// 0x4BC240 as `!= 0`, so the setting starts **on**. Two rows, `FEStrings` 705 "off" at index
+    /// 0 and 704 "on" at index 1 — 0x4B8770, the class's row-text slot (§4.102).
+    damage: bool,
     /// `OpponentCar.Car` — which cars the opponents drive (`nfs-game/src/opponents.rs`,
     /// `modes.md` §1.1a). The original's accessor is built with this at 0, "same car".
     opp_car: u8,
@@ -1330,6 +1506,29 @@ struct App {
     music_lengths: Vec<u32>,
     /// `fe.txt` audio settings (playlist, shuffle, the five level sliders)
     audio_settings: nfs_audio::music::Settings,
+    /// the `NFS5.GouraudIndicatorBar` the pointer took — `FeGouraudIndicatorBar`'s slot 8 asks
+    /// 0x4C7DD0 for focus before it drags, and the press is what grants it (§4.81)
+    bar_grab: Option<String>,
+    /// `[0x5DBA44]` — which model group the chronicle is on, 0…4, switched by the five buttons of
+    /// [`CHRONICLE_GROUP_BUTTONS`] (§4.111).
+    chronicle_group: usize,
+    /// `[FEUsedCarsScreen + 0x290]` — whether `usedcars.lay` is on the parts panel rather than
+    /// the damage one. The constructor leaves it clear (§4.113).
+    usedcars_showparts: bool,
+    /// Which row of `Parts.AllParts` the player has clicked — the accessor's own current index in
+    /// the original, which its refresh reads back through `slot27` (§4.114).
+    parts_sel: Option<usize>,
+    /// A held `NFS5.CARSETTINGBUTTON`: the accessor it steps, its `data.step`, and how long since
+    /// the last tick. Its press 0x4C1F40 starts `0x529220(this, 0x96, 1)` — the same 150 ms
+    /// repeating timer the scrollbar arrows use — keeps the handle in `[this+0x14C]` and steps
+    /// once immediately (0x4C1F67); 0x4C1F80 steps again on every firing whose `[ev+8]` matches
+    /// that handle, and the release 0x4C1FB0 kills it with 0x5292D0 and clears the slot. §4.108.
+    setting_repeat: Option<(String, i32, u32)>,
+    /// whether the left button is held, for the scrollbar arrows' pressed frame (§4.101)
+    mouse_down: bool,
+    /// which of `repair.lay`'s ten `QUICKFIX.*` boxes are ticked — the ten bool accessors
+    /// registered at 0x4F252A…0x4F258B, all of which start **false** (§4.84, §4.95)
+    repair_ticks: std::collections::BTreeSet<&'static str>,
     speech: Option<nfs_audio::speech::Speech>,
     countdown_said: u8,
     sound_set: String,
@@ -1472,6 +1671,14 @@ impl App {
             // `n` from the record's `+0xE6`, which is the difficulty it already parsed; the getter
             // reads `+0x78` of a run-time object instead, so the two are **MEDIUM**, not confirmed
             // to be the same field.
+            // the bare accessor's caption is its own row 0 — slot 4 (0x4BC4E0) hands `[this+0x18]`,
+            // which starts at 0 (0x4BC224), to the row-text slot. §4.105.
+            "Tournament.RemainingTracks" if modifier.is_empty() => {
+                let c = self.career.as_ref()?;
+                let t = c.current()?;
+                let done = c.career.tournaments.get(&t.id).map_or(0, |s| s.events.len());
+                c.tables.track_name(t.events.get(done)?.track_id).to_uppercase()
+            }
             "Tournament.Tournament" => {
                 let c = self.career.as_ref()?;
                 let t = c.current()?;
@@ -1633,19 +1840,38 @@ impl App {
                     _ => return None,
                 }
             }
-            "Comms.Positional" => match self.net.as_ref() {
-                Some(n) => if n.positional { "ON" } else { "OFF" }.to_string(),
-                None => {
-                    let l = self.lobby.as_ref()?;
-                    if l.positional { "ON" } else { "OFF" }.to_string()
-                }
-            },
+            // **not** off/on. 0x50BB03 registers it with 0x4BB680 and the option list 0x5B9674,
+            // which is `0x119, 0x11A, 0` — `FEStrings` **281 "input exchange"** and **282
+            // "positional"** — and 0x50BB1C then calls the setter (slot 11) with **1**, so the
+            // screen opens on "positional". §4.106.
+            "Comms.Positional" => {
+                // with no session yet the answer is the accessor's own starting index, 1
+                let on = match self.net.as_ref() {
+                    Some(n) => n.positional,
+                    None => self.lobby.as_ref().map_or(true, |l| l.positional),
+                };
+                self.fe_strings.get(POSITIONAL_OPTIONS[usize::from(on)]).unwrap_or_default().to_uppercase()
+            }
             // this port has no modem, so the modem screen's fields are blank, which is what a
             // machine without one shows
             "Comms.PhoneNumber" => String::new(),
             // chat is carried by a message the port has not traced, so the box stays empty
             "Comms.ChatInput" => String::new(),
             "Chronicle.Year" => career?.career.year.to_string(),
+            "Graphics.Resolutions" => "640 x 480 x 16".to_string(),
+            "Controller.AllControllers" | "Controller.AllPads" => {
+                let pads_only = name == "Controller.AllPads";
+                self.gamepads
+                    .devices()
+                    .into_iter()
+                    .find(|(_, is_pad)| !pads_only || *is_pad)
+                    .map(|(n, _)| n.to_uppercase())
+                    .unwrap_or_default()
+            }
+            "Game.Damage" => {
+                let id = BOOL_OPTIONS[usize::from(menu?.damage)];
+                self.fe_strings.get(id).unwrap_or_default().to_string()
+            }
             "Game.NumOpponents" => menu?.opponents.to_string(),
             "Game.NumKOOpponents" => menu?.ko_opponents.to_string(),
             "Game.Difficutly" => {
@@ -1694,19 +1920,7 @@ impl App {
             b if b.starts_with("QUICKFIX.") => {
                 let c = career?;
                 let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                let kinds: &[u16] = match &b["QUICKFIX.".len()..] {
-                    "ENGINE" => &[1],
-                    "BRAKES" => &[2],
-                    "TRANSMISSION" => &[3],
-                    "SUSPENSION" => &[4],
-                    "SHOCKS" => &[5],
-                    "BODYWORK" => &[10],
-                    "SWAYBARS" => &[8],
-                    "TIRES" => &[9],
-                    "COSMETIC" => &[6, 7],
-                    "OVERALL" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-                    _ => return None,
-                };
+                let kinds = quickfix_kinds(&b["QUICKFIX.".len()..])?;
                 with_thousands(c.career.repair_cost(&c.tables, idx, kinds))
             }
             // The two baskets' totals. `parts.lay` §19 watches `Parts.ShoppingList(TOTAL)` and
@@ -1721,10 +1935,23 @@ impl App {
             //
             // The `$` this port used to print was its own.
             "Parts.ShoppingList" if modifier == "TOTAL" => format!("{}", career?.basket_total()),
+            // **and it counts only the categories that are ticked.** The screen's own sum,
+            // 0x50F110, takes the car from `OwnedCars.Car` (0x4F5A20) and then adds one
+            // category's cost per `if (accessor->slot27())` — ten of them, 0x50F14A onwards, each
+            // guarded by its own `QUICKFIX.*` bool and each cost from its own getter (0x4EFBC0,
+            // 0x4EFC20, 0x4EFC80, …). All ten bools start false (§4.84) and 0x50F0D1 resets them
+            // to false as a group, so the total starts at **0** and grows as boxes are ticked —
+            // where this port used to sum every damaged part unconditionally. §4.96.
             "Parts.RepairShoppingList" if modifier == "TOTAL" => {
                 let c = career?;
                 let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                format!("{}", c.career.repair_cost(&c.tables, idx, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]))
+                let mut kinds: Vec<u16> = Vec::new();
+                for name in &self.repair_ticks {
+                    kinds.extend(quickfix_kinds(name).unwrap_or(&[]));
+                }
+                kinds.sort_unstable();
+                kinds.dedup();
+                format!("{}", c.career.repair_cost(&c.tables, idx, &kinds))
             }
             // A `Parts.*` accessor with **no** modifier: `FEAccessorWatch::tick` asks vtable +0x10
             // (§4.10), which is the base's 0x4BC4E0 — `this->slot12([this+0x18])`, the text of the
@@ -1806,8 +2033,12 @@ impl App {
                 Some(m) => m.laps.to_string(),
                 None => self.num_laps.to_string(),
             },
-            // the screen's own option list, not a bare number: `FEStrings` 403, 402, 401, 400
-            "Track1.Traffic" => {
+            // the screen's own option list, not a bare number: `FEStrings` 403, 402, 401, 400.
+            // (`Knockout.Traffic` belongs on this arm too — its body has always tested for it and
+            // the pattern has always left it out, so `locationsetup.lay`'s combo read blank. The
+            // sweep's caption axis is what showed it; the blank count never could, because the
+            // combo draws its own box. §4.93.)
+            "Track1.Traffic" | "Knockout.Traffic" => {
                 let t = match menu {
                     Some(m) if base == "Knockout.Traffic" => m.ko.get(m.ko_sel).map_or(m.traffic, |k| k.traffic),
                     Some(m) => m.traffic,
@@ -1880,9 +2111,21 @@ impl App {
                 Some(m) => m.cars[m.car_idx].display_name.to_uppercase(),
                 None => self.specs.name.to_uppercase(),
             },
-            "OwnedCar.ExtColour" | "GenericCar.Colour" | "DealerCar.Colour" => {
+            // All seven colour combos count the same way — the paint set's number from 1, which
+            // is what `combo_rows` enumerates (§4.91). The original keeps four separate values
+            // per car (exterior, interior, and the two stripes) and this port keeps one, so the
+            // other three read the exterior's: an APPROXIMATION, and the one this arm carries.
+            "OwnedCar.ExtColour" | "OwnedCar.IntColour" | "OwnedCar.S1Colour" | "OwnedCar.S2Colour"
+            | "GenericCar.Colour" | "DealerCar.Colour" | "DealerCar.IntColour" => {
                 format!("{}", menu.map(|m| m.paint_idx + 1).unwrap_or(1))
             }
+            // the compare screen's right-hand car, the one `GenericCar2.Car` steps with `car2_idx`
+            "GenericCar2.Car" => match menu {
+                _ if !matches!(modifier, "" | "SHORT") => return None,
+                Some(m) if modifier == "SHORT" => m.cars.get(m.car2_idx)?.family.to_uppercase(),
+                Some(m) => m.cars.get(m.car2_idx)?.display_name.to_uppercase(),
+                None => return None,
+            },
             "Game.GameType" => "QUICK RACE".to_string(),
             // the key-binding rows of `GameCtrl.lay` / `fluffctrl.lay`. The names are this port's
             // own keyboard map (`nfs-input`), not the original's — the original keeps its bindings
@@ -1976,7 +2219,17 @@ impl App {
             "Audio.EngineLevel" => self.audio_settings.engine_level.to_string(),
             "Audio.SpeechLevel" => self.audio_settings.speech_level.to_string(),
             "Audio.AmbientLevel" => self.audio_settings.ambient_level.to_string(),
-            _ => return None,
+            // A list accessor with no arm of its own still answers: 0x4BC4E0, the caption getter,
+            // is nothing but `rowText([this+0x18])`, so the caption is the row the list is on, and
+            // the empty string when the list is empty — which is what a `Comms.*` list shows
+            // before a session has filled it. §4.106.
+            _ => {
+                let (rows, cur) = self.list_rows(base)?;
+                match rows.get(cur.unwrap_or(0)) {
+                    Some(ListRow::Text(t)) => t.clone(),
+                    _ => String::new(),
+                }
+            }
         })
     }
 
@@ -2030,7 +2283,7 @@ impl App {
     /// year sits in that list. The name is `M<letter><yy><index><variant>.fsh` — see
     /// [`App::chronicle_picture`] — so sorting by name sorts by year.
     fn chronicle_list(&self) -> (Vec<String>, usize) {
-        let letter = CHRONICLE_GROUP_LETTERS.as_bytes()[CHRONICLE_GROUP] as char;
+        let letter = CHRONICLE_GROUP_LETTERS.as_bytes()[self.chronicle_group.min(4)] as char;
         let dir = self.paths.fe_data().join("Chron");
         let mut files: Vec<String> = std::fs::read_dir(&dir)
             .into_iter()
@@ -2050,7 +2303,7 @@ impl App {
 
     fn chronicle_picture(&self) -> Option<String> {
         let year = self.career.as_ref()?.career.year;
-        let letter = CHRONICLE_GROUP_LETTERS.as_bytes()[CHRONICLE_GROUP] as char;
+        let letter = CHRONICLE_GROUP_LETTERS.as_bytes()[self.chronicle_group.min(4)] as char;
         let dir = self.paths.fe_data().join("Chron");
         let mut best: Option<(u32, String)> = None;
         let mut earliest: Option<(u32, String)> = None;
@@ -2278,6 +2531,18 @@ impl App {
                     None => self.lobby.as_ref()?.players(),
                 };
                 Some((rows.into_iter().map(ListRow::Text).collect(), None))
+            }
+            "Comms.Positional" => {
+                // with no session yet the answer is the accessor's own starting index, 1
+                let on = match self.net.as_ref() {
+                    Some(n) => n.positional,
+                    None => self.lobby.as_ref().map_or(true, |l| l.positional),
+                };
+                let rows = POSITIONAL_OPTIONS
+                    .iter()
+                    .map(|id| ListRow::Text(self.fe_strings.get(*id).unwrap_or_default().to_uppercase()))
+                    .collect();
+                Some((rows, Some(usize::from(on))))
             }
             // no modem in this port
             "Comms.ModemList" | "Comms.PhoneList" => Some((Vec::new(), None)),
@@ -2526,6 +2791,26 @@ impl App {
     }
 
     /// Fill every `NFS5.ListBox` on the previewed screen from its accessor.
+    /// Put the ten `QUICKFIX.*` ticks on the screen's check boxes. `FECheckBox::refresh`
+    /// 0x4C3730 asks the `boolAccessor` and picks `onIndex` or `offIndex` by the answer; this is
+    /// that, with the answer coming from `repair_ticks`. §4.96.
+    fn bind_checks(&mut self) {
+        let Some(l) = self.layout_preview.as_ref() else { return };
+        let wanted: Vec<(usize, Option<bool>)> = l
+            .check_boxes()
+            .into_iter()
+            .map(|(i, a)| {
+                let on = a.strip_prefix("QUICKFIX.").map(|n| self.repair_ticks.contains(n));
+                (i, on)
+            })
+            .collect();
+        if let Some(l) = self.layout_preview.as_mut() {
+            for (i, on) in wanted {
+                l.set_check(i, on);
+            }
+        }
+    }
+
     fn bind_lists(&mut self) {
         let Some(l) = self.layout_preview.as_ref() else {
             return;
@@ -2544,7 +2829,12 @@ impl App {
             .chain(l.combo_sliders().into_iter().map(|w| {
                 (
                     w.index,
-                    w.accessor.as_deref().and_then(|a| self.choice_rows(a)),
+                    // …and when it is neither a choice nor one of the families `combo_rows`
+                    // enumerates, the accessor is still an accessor: 0x4C66E8's loop asks it for
+                    // its count and its rows exactly as a list box's does (§4.91), so the combo
+                    // falls through to the same `list_rows` a list box would get. That is what
+                    // puts the `Comms.*` lists into the combo on `netgamesetup.lay`.
+                    w.accessor.as_deref().and_then(|a| self.choice_rows(a).or_else(|| self.combo_rows(a)).or_else(|| self.list_rows(a))),
                 )
             }))
             .collect();
@@ -2654,6 +2944,9 @@ impl App {
         let mut total: std::collections::BTreeMap<(String, String), usize> = Default::default();
         let mut where_of: std::collections::BTreeMap<String, Vec<String>> = Default::default();
         let mut expr_fail: std::collections::BTreeMap<(String, String, String, String), usize> = Default::default();
+        let mut empty_combos: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut mute_combos: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut mute_bars: std::collections::BTreeMap<String, usize> = Default::default();
         let mut screens = 0usize;
         for name in &names {
             self.open_layout(name);
@@ -2689,8 +2982,14 @@ impl App {
             }
             self.bind_car_logos();
             self.bind_lists();
+            self.bind_checks();
             self.bind_indicator_bars();
             self.bind_chronicle_icons();
+            self.bind_chronicle_group();
+            self.bind_repair_bars();
+            self.bind_usedcars_panels();
+            self.bind_parts_buttons();
+            self.bind_mergedlist_panel();
             self.bind_showcase_pictures();
             self.bind_track_maps();
             self.bind_player_pictures();
@@ -2737,6 +3036,48 @@ impl App {
                     println!("  box {name:<20} {class:<28} size.value=({:.0}x{:.0}) parts=({:.0}x{:.0})", b.0, b.1, u.0, u.1);
                 }
             }
+            // **The blank count cannot see an empty drop-down.** A combo always draws its own
+            // box, so however empty its list is it never counts as a widget that drew nothing —
+            // which is how 61 of the 97 went unnoticed until §4.91. Counted here as its own axis.
+            if let Some(l) = self.layout_preview.as_ref() {
+                for w in l.combo_sliders() {
+                    let a = w.accessor.clone().unwrap_or_default();
+                    let n = self
+                        .choice_rows(&a)
+                        .or_else(|| self.combo_rows(&a))
+                        .or_else(|| self.list_rows(&a))
+                        .map(|(r, _)| r.len())
+                        .unwrap_or(0);
+                    if n == 0 {
+                        *empty_combos.entry(a.split('(').next().unwrap_or("").trim().to_string()).or_insert(0usize) += 1;
+                    }
+                    // and the caption is blind in the same way: a combo whose accessor answers
+                    // nothing still draws its box, so the blank count never sees it either
+                    if self.accessor_value(&a).is_none() {
+                        *mute_combos.entry(a.split('(').next().unwrap_or("").trim().to_string()).or_insert(0usize) += 1;
+                    }
+                }
+                // the same blindness, one class along: a `NFS5.GouraudIndicatorBar` paints its two
+                // bands whatever its accessor says, so a bar the port cannot answer sits at zero
+                // and the blank count never sees it (§4.94)
+                for (_, src, is_other) in l.indicator_bars() {
+                    let v = if is_other {
+                        self.compare_rating(&src)
+                    } else {
+                        let name = src.split_once('(').map_or(src.as_str(), |(b, _)| b.trim());
+                        match self.range_value(name) {
+                            Some((_, lo, hi)) if hi > lo => Some(0),
+                            _ => self
+                                .accessor_value(&src)
+                                .and_then(|t| t.trim().trim_end_matches('%').trim().parse::<f32>().ok())
+                                .map(|v| v as i32),
+                        }
+                    };
+                    if v.is_none() {
+                        *mute_bars.entry(src.split('(').next().unwrap_or("").trim().to_string()).or_insert(0usize) += 1;
+                    }
+                }
+            }
             let Some(l) = self.layout_preview.as_ref() else { continue };
             for (class, src) in l.blank_widgets(nfs_game::layout::DESIGN.0 / nfs_game::layout::DESIGN.1, &self.fe_strings, &|a| self.accessor_value(a)) {
                 where_of.entry(class.clone()).or_default().push(name.clone());
@@ -2754,6 +3095,31 @@ impl App {
         // which screen each blank is on — `NFS_SWEEP_WHERE=1` prints it. A count by class says
         // what is missing, not where to look for it, and every blank that turned out to be a real
         // gap was found by opening the screen it is on.
+        // **A state a template declares and this port never returns is a look the original has
+        // and the port does not** — and no blank count can see it, because the widget draws its
+        // other states perfectly well. `NFS_SWEEP_STATES=1` lists them. The set the port can
+        // return is `state_for`'s own: the `.lay`'s `state=`, `normal`, `hover`, `focused`,
+        // `focusedhover`, `selected`, `selectedhover` and `NFS5.CAMERASELECT`'s `highlighty`.
+        // §4.112.
+        if std::env::var("NFS_SWEEP_STATES").is_ok() {
+            const KNOWN: [&str; 7] = ["normal", "hover", "focused", "focusedhover", "selected", "selectedhover", "highlighty"];
+            let mut miss: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = Default::default();
+            for name in &names {
+                self.open_layout(name);
+                let Some(l) = self.layout_preview.as_ref() else { continue };
+                for (class, states) in l.declared_states() {
+                    for st in states {
+                        if !KNOWN.contains(&st.as_str()) {
+                            miss.entry(class.clone()).or_default().insert(st);
+                        }
+                    }
+                }
+            }
+            println!("template states this port never returns:");
+            for (class, states) in &miss {
+                println!("  {class:<32} {}", states.iter().cloned().collect::<Vec<_>>().join(", "));
+            }
+        }
         if std::env::var("NFS_SWEEP_WHERE").is_ok() {
             println!("blank widgets by screen:");
             let mut ks: Vec<&String> = where_of.keys().collect();
@@ -2780,6 +3146,28 @@ impl App {
             println!("  {n:5}  {c:<32} {}", srcs.join(", "));
         }
         println!("total: {}", rows.iter().map(|(n, _)| n).sum::<usize>());
+        // the second axis: containers the blank count is blind to (§4.92)
+        let ec: usize = empty_combos.values().sum();
+        println!("\ncombos with an empty drop-down: {ec}");
+        let mut ecs: Vec<(usize, String)> = empty_combos.into_iter().map(|(a, n)| (n, a)).collect();
+        ecs.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (n, a) in &ecs {
+            println!("  {n:4}  {a}");
+        }
+        let mc: usize = mute_combos.values().sum();
+        println!("\ncombos whose caption answers nothing: {mc}");
+        let mut mcs: Vec<(usize, String)> = mute_combos.into_iter().map(|(a, n)| (n, a)).collect();
+        mcs.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (n, a) in &mcs {
+            println!("  {n:4}  {a}");
+        }
+        let mb: usize = mute_bars.values().sum();
+        println!("\nindicator bars whose accessor answers nothing: {mb}");
+        let mut mbs: Vec<(usize, String)> = mute_bars.into_iter().map(|(a, n)| (n, a)).collect();
+        mbs.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (n, a) in &mbs {
+            println!("  {n:4}  {a}");
+        }
         println!("\nby source:");
         let mut srcs: Vec<(usize, String, String)> = total.iter().map(|((c, s), n)| (*n, c.clone(), s.clone())).collect();
         srcs.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(&b.2)));
@@ -2788,31 +3176,325 @@ impl App {
         }
     }
 
-    /// Fill the chronicle's thumbnail column. The four `NFS5.ChroniclePictureIcon`s carry
-    /// `number` 0…3 and sit bottom to top (`number=0` at y 363, `number=3` at y 177), so the
-    /// column runs upwards from the entry the screen is on. Each pack's entry 0 is its `bi` icon
-    /// and entry 1 its `ci`; the port draws `ci` for the entry the screen is showing and `bi` for
-    /// the rest — **APPROXIMATION**, the two names' meaning was not traced, only their size, which
-    /// is the widget's own `size=41,25`.
+    /// Fill the chronicle's thumbnail column.
+    ///
+    /// `FEChroniclePictureIconControl`'s activate, **0x5087A0**, is the whole binding:
+    ///
+    /// ```text
+    /// 0x5087BD  n = data.number                       ; [this+0x140]
+    /// 0x5087CF  if (n >= [0x699D00]) nothing is drawn ; past the media count
+    /// 0x5087DA  rec = 0x507480(n)                     ; [0x699C84][n], a file name
+    /// 0x5087EB  [this+0x148] = 0x4D7A10(rec, 0)       ; entry 0 of that pack
+    /// 0x5087F9  [this+0x144] = 0x4D7A10(rec, 1)       ; entry 1
+    /// ```
+    ///
+    /// and the draw 0x508810 picks `[this+0x144]` when 0x4C7C90 says the widget is **hovered**
+    /// (§4.109) and `[this+0x148]` otherwise, returning at 0x508832 when that pointer is null. 0x4D7A10's
+    /// second argument really is an entry index — its tail, 0x4D7B09…0x4D7B16, is
+    /// `pack[+0x1C][+8][k]`.
+    ///
+    /// The list itself is built by **0x5074A0(kind, year, variant)**, which formats
+    /// `"%s%c%c%02d%d%c.fsh"` (0x50757F) and keeps every name that exists:
+    ///
+    /// ```text
+    /// 0x507508  kind 0 -> 'p', kind 2 -> 'v', anything else -> 'm'
+    /// 0x50756A  the model-group letter, "CBADE"[[0x5DBA44]]
+    /// 0x50754D  the year, mod 100
+    /// 0x507567  a 1-based index, and the variant 'a' + `variant`
+    /// 0x507627  stop at the first name that is not on disk, or at four (0x507639)
+    /// ```
+    ///
+    /// so a screen shows **at most four** pictures of one year and variant, and 0x507649 adds the
+    /// matching `"%s%c%c%02d%d%c.mad"` for kind 2 — the movie box's file. 0x5080F8 passes kind 0
+    /// for `chroniclepicture` and 0x508137 kind 1 for `chroniclemedia`.
+    ///
+    /// **What the port does not have is the screen's own state**: 0x5080E0 takes the year and the
+    /// variant from `[this + row*4 + 0x160]` and `[this + row*4 + 0x174]` of the timeline screen,
+    /// whose row table is the untraced 0x507B4F. So the port takes them from the entry
+    /// [`App::chronicle_picture`] already picks — the newest at or before the career's year.
+    /// APPROXIMATION of the browsing position only; the naming, the count and the two frames are
+    /// read. Which of the two frames shows is **not** approximate: 0x508819's test is 0x4C7C90,
+    /// `[this+0x10C] & 4`, bit 2 of the state mask — **hover** (§4.109) — so entry 1 is the
+    /// hovered frame and the draw picks it.
+    ///
+    /// The draw also puts `[[this+0x148]+0x24]`, the entry's own name, under the icon in the
+    /// class's `Univers7b.ffn` (0x5089AD), but only when that name is non-empty (0x508965) — and
+    /// the `Chron` packs' entries carry none, so nothing is drawn there. Read, not invented.
     fn bind_chronicle_icons(&mut self) {
         let Some(l) = self.layout_preview.as_ref() else { return };
         let icons = l.numbered_widgets("NFS5.ChroniclePictureIcon");
         if icons.is_empty() {
             return;
         }
-        let (files, cur) = self.chronicle_list();
-        let wanted: Vec<(usize, String, usize)> = icons
+        let files = self.chronicle_media();
+        let wanted: Vec<(usize, String)> = icons
             .into_iter()
-            .map(|(i, number)| {
-                let n = cur + number.max(0) as usize;
-                let entry = usize::from(n != cur);
-                (i, files.get(n).cloned().unwrap_or_default(), entry)
-            })
+            .map(|(i, number)| (i, files.get(number.max(0) as usize).cloned().unwrap_or_default()))
             .collect();
         let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) else { return };
-        for (index, file, entry) in wanted {
-            l.set_pack_picture(r, &self.paths, "Chron", index, &file, entry);
+        for (index, file) in wanted {
+            // entry 0 is the resting frame; the draw takes the next one when the pointer is on
+            // the icon, which is what 0x508819's 0x4C7C90 tests (§4.109)
+            l.set_pack_picture(r, &self.paths, "Chron", index, &file, 1);
+            l.set_pack_picture(r, &self.paths, "Chron", index, &file, 0);
         }
+    }
+
+    /// The car-picking screens show **one of two** widgets at one place: the garage button or the
+    /// colour box. 0x50CC85:
+    ///
+    /// ```text
+    /// 0x50CC8C  owned = 0x4F4DF0([this+0x280])                       ; the merged list accessor
+    /// 0x50CCA5  0x50D910("ID_MERGEDLISTCOLOR",    owned,  0)         ; hide the paint box
+    /// 0x50CCB9  0x50D910("ID_MERGEDLISTCARSETUP", !owned, 0)         ; hide the garage button
+    /// ```
+    ///
+    /// and 0x4F4DF0 is three instructions of meaning:
+    ///
+    /// ```text
+    /// 0x4F4DF9  n   = [acc+0x28]->slot9()   ; the sub-accessor's row count
+    /// 0x4F4E02  cur = acc->slot10()         ; the merged list's own index
+    /// 0x4F4E08  setl                        ; cur < n
+    /// ```
+    ///
+    /// `FEMergedCarListAccessor` puts the player's **owned** cars first, and 0x4EB88F proves what
+    /// the test means: when it is true 0x4EB89C takes an existing record through `[vtable+0x8C]`,
+    /// and when it is false 0x4EB8B4 **allocates a fresh 0x760-byte car**. So the two widgets are
+    /// "this is a car you own — take it to the garage" against "this is one you do not — here is
+    /// its paint". Five screens carry the pair, at the same `pos` in each: `QuickRace`,
+    /// `creategame`, `joingame`, `knockout` and `quickknockout`. §4.115.
+    ///
+    /// This port's merged list is the catalogue, one row per record, so it cannot compare indices
+    /// the way 0x4F4DF0 does; it asks the same question of the selection instead — is a car with
+    /// this record's id in the garage. Recorded as the one difference.
+    fn bind_mergedlist_panel(&mut self) {
+        let Some(l) = self.layout_preview.as_ref() else { return };
+        let names = ["ID_MERGEDLISTCARSETUP", "ID_MERGEDLISTCOLOR"];
+        let want = l.widgets_named(&names);
+        if want.is_empty() {
+            return;
+        }
+        let owned = self
+            .menu
+            .as_ref()
+            .and_then(|m| m.cars.get(m.car_idx))
+            .zip(self.career.as_ref())
+            .is_some_and(|(car, c)| c.career.garage.iter().any(|g| g.car_id == car.id));
+        if let Some(l) = self.layout_preview.as_mut() {
+            for (index, which) in want {
+                l.set_hidden_flag(index, if which == 0 { !owned } else { owned });
+            }
+        }
+    }
+
+    /// `parts.lay`'s install and uninstall buttons are **one of two**, and both go away when no
+    /// part is picked. The screen's refresh 0x4F1AC0:
+    ///
+    /// ```text
+    /// 0x4F1ADE  [this+0x288]->slot27(&picked, &installed)     ; two out-parameters
+    /// 0x4F1AED  0x50D880("ID_PARTSDESC", picked != 0, 0)      ; enable the description
+    /// 0x4F1AFD  picked == 0 -> 0x4F1B47
+    ///           set: 0x50D880("ID_UNINSTALLBUTTON", 1)        ; enable it
+    /// 0x4F1B29       0x50D910("ID_INSTALLBUTTON",   installed)  ; hide when it is fitted
+    /// 0x4F1B40       0x50D910("ID_UNINSTALLBUTTON", !installed) ; hide when it is not
+    /// 0x4F1B47  clear: 0x50D910("ID_INSTALLBUTTON", 1)        ; hide install
+    /// 0x4F1B6C         0x50D910("ID_UNINSTALLBUTTON", 0)      ; show uninstall
+    /// 0x4F1B7B         0x50D880("ID_UNINSTALLBUTTON", 0)      ; and disable it
+    /// ```
+    ///
+    /// so the three states are: **nothing picked** — description disabled, install hidden,
+    /// uninstall shown but dead; **a part that is not fitted** — install shown, uninstall hidden;
+    /// **a part that is fitted** — install hidden, uninstall shown and live. §4.114.
+    ///
+    /// Which section of `Parts.AllParts` the picked row is in *is* whether it is fitted: 0x5152E0
+    /// decodes a row as a header, as the car's own parts or as the shop's (§4.x), and this port
+    /// builds the same two sections.
+    fn bind_parts_buttons(&mut self) {
+        let Some(l) = self.layout_preview.as_ref() else { return };
+        let names = ["ID_PARTSDESC", "ID_INSTALLBUTTON", "ID_UNINSTALLBUTTON"];
+        let want = l.widgets_named(&names);
+        if want.is_empty() {
+            return;
+        }
+        let picked = self.parts_picked();
+        // (hidden, enabled) for the three, in the order of `names`
+        let state: [(bool, Option<bool>); 3] = match picked {
+            None => [(false, Some(false)), (true, None), (false, Some(false))],
+            Some(false) => [(false, Some(true)), (false, None), (true, Some(true))],
+            Some(true) => [(false, Some(true)), (true, None), (false, Some(true))],
+        };
+        if let Some(l) = self.layout_preview.as_mut() {
+            for (index, which) in want {
+                let (hide, enable) = state[which];
+                l.set_hidden_flag(index, hide);
+                if let Some(en) = enable {
+                    l.set_disabled_flag(index, !en);
+                }
+            }
+        }
+    }
+
+    /// The part `Parts.AllParts` is on, and whether it is **fitted** — `None` when the row is one
+    /// of the two section headers or nothing has been picked (§4.114).
+    fn parts_picked(&self) -> Option<bool> {
+        let row = self.parts_sel?;
+        let b = self.parts_header_b();
+        if row == 0 || row == b {
+            return None;
+        }
+        // section 0 is the shop's list, section 1 the car's own — `combo_rows` builds them in
+        // that order, which is the order 0x5152E0 walks
+        Some(row > b)
+    }
+
+    /// `usedcars.lay` shows **one of two panels**, and disables its three buttons when the market
+    /// is empty. `FEUsedCarsScreen`'s refresh, 0x4F7384 onwards:
+    ///
+    /// ```text
+    /// 0x4F7394  n = the used-car list accessor's count (slot 9)
+    /// 0x4F7399  n != 0 -> 0x4F73E3
+    ///           n == 0: hide ID_SHOWDAMAGEBUTTON, hide ID_SHOWPARTSBUTTON,
+    ///                   0x50D880 on ID_SHOWPARTSBUTTON and ID_TESTDRIVEUSEDBUTTON,
+    ///                   then `jmp 0x4F74BA` — disable ID_BUYUSEDBUTTON
+    /// 0x4F73E3  showparts = [this+0x290]
+    ///           set: hide ID_SHOWPARTSBUTTON, hide ID_USEDCARDAMAGEPANEL,
+    ///                show ID_PARTSPANEL, show ID_PARTSBOX, show ID_SHOWDAMAGEBUTTON,
+    ///                then `jmp 0x4F749F` — enable ID_SHOWDAMAGEBUTTON
+    /// 0x4F7448  clear: show ID_SHOWPARTSBUTTON, show ID_USEDCARDAMAGEPANEL,
+    ///                hide ID_PARTSPANEL, hide ID_PARTSBOX, hide ID_SHOWDAMAGEBUTTON,
+    ///                enable ID_SHOWPARTSBUTTON
+    /// 0x4F74A6  and both arms end: enable ID_TESTDRIVEUSEDBUTTON, enable ID_BUYUSEDBUTTON
+    /// ```
+    ///
+    /// `[this+0x290]` is flipped by the two callbacks the constructor registers at 0x4F71C0 and
+    /// 0x4F71D1 — `SHOWPARTS` (0x4F76A0) and `SHOWDAMAGE` (0x4F76B0) — which are the `callback`
+    /// lines on `ID_SHOWPARTSBUTTON` and `ID_SHOWDAMAGEBUTTON`. The constructor itself
+    /// (0x4F71E2…0x4F726D) leaves the screen on the **damage** panel with `ID_Used3DCar` and
+    /// `ID_GREYRECT` hidden. §4.113.
+    fn bind_usedcars_panels(&mut self) {
+        const SHOW: &str = "ID_SHOWPARTSBUTTON";
+        const DAMAGE: &str = "ID_SHOWDAMAGEBUTTON";
+        let Some(l) = self.layout_preview.as_ref() else { return };
+        let names = [SHOW, DAMAGE, "ID_USEDCARDAMAGEPANEL", "ID_PARTSPANEL", "ID_PARTSBOX", "ID_Used3DCar", "ID_GREYRECT", "ID_TESTDRIVEUSEDBUTTON", "ID_BUYUSEDBUTTON"];
+        let want = l.widgets_named(&names);
+        if want.is_empty() {
+            return;
+        }
+        // the market this port has is the player's own listings (`list_for_sale`)
+        let n = self.career.as_ref().map_or(0, |c| c.career.garage.iter().filter(|o| o.asking_price.is_some()).count());
+        let parts = self.usedcars_showparts;
+        // (hidden, enabled) per name, in the order of `names`
+        let state: [(bool, Option<bool>); 9] = if n == 0 {
+            [(true, Some(false)), (true, None), (false, None), (true, None), (true, None), (true, None), (true, None), (false, Some(false)), (false, Some(false))]
+        } else if parts {
+            [(true, None), (false, Some(true)), (true, None), (false, None), (false, None), (true, None), (true, None), (false, Some(true)), (false, Some(true))]
+        } else {
+            [(false, Some(true)), (true, None), (false, None), (true, None), (true, None), (true, None), (true, None), (false, Some(true)), (false, Some(true))]
+        };
+        if let Some(l) = self.layout_preview.as_mut() {
+            for (index, which) in want {
+                let (hide, enable) = state[which];
+                l.set_hidden_flag(index, hide);
+                if let Some(en) = enable {
+                    l.set_disabled_flag(index, !en);
+                }
+            }
+        }
+    }
+
+    /// `repair.lay`'s ten damage bars are **hidden** when their category has nothing in it.
+    ///
+    /// 0x50F4AD…0x50F609 is ten copies of one block:
+    ///
+    /// ```text
+    /// 0x50F4BC  ok = [this + 0x284 + 4k]->slot27(&[this + 0x2AC + 4k])   ; the category accessor
+    /// 0x50F4C1  sete al                                                  ; hide = !ok
+    /// 0x50F4CC  0x50D910(screen, "ID_BAR<K>", hide)
+    /// ```
+    ///
+    /// in the order ENGINE, BRAKES, TRANSMISSION, SUSPENSION, SHOCKS, BODYWORK, SWAYBARS, TIRES,
+    /// COSMETIC, OVERALL — the same order as [`QUICKFIX_NAMES`]. So a category the car has no
+    /// part of does not draw an empty bar in the original: **the bar is not there at all**. This
+    /// port had been drawing a full-length one for `BODYWORK` on a 356, which has no part of
+    /// category 6 — the one row `RE/AUDIT.md` §10 recorded as "blank with state". §4.112.
+    ///
+    /// `OVERALL` is the tenth and is never hidden here: 0x4EF960 combines the other categories
+    /// itself and always answers.
+    fn bind_repair_bars(&mut self) {
+        let Some(l) = self.layout_preview.as_ref() else { return };
+        let names: Vec<String> = QUICKFIX_NAMES.iter().map(|k| format!("ID_BAR{k}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let want = l.widgets_named(&refs);
+        if want.is_empty() {
+            return;
+        }
+        let has: Vec<bool> = QUICKFIX_NAMES
+            .iter()
+            .map(|k| *k == "OVERALL" || self.category_has_parts(*k))
+            .collect();
+        tracing::debug!(hidden = ?QUICKFIX_NAMES.iter().zip(&has).filter(|(_, h)| !**h).map(|(k, _)| *k).collect::<Vec<_>>(), "repair bars");
+        if let Some(l) = self.layout_preview.as_mut() {
+            for (index, which) in want {
+                l.set_hidden_flag(index, !has[which]);
+            }
+        }
+    }
+
+    /// Whether the garage car has any installed part of the category `<K>DAMAGE` names — what
+    /// decides whether 0x50F4BC's accessor answers at all (§4.112).
+    fn category_has_parts(&self, key: &str) -> bool {
+        let Some(c) = self.career.as_ref() else { return true };
+        let name = format!("{key}DAMAGE");
+        let Some(cat) = PART_DAMAGE_CATEGORY.iter().find(|(n, _)| *n == name).map(|(_, c)| *c) else { return true };
+        let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
+        let Some(owned) = c.career.garage.get(idx) else { return true };
+        owned.part_state.iter().any(|(id, _)| c.tables.parts.iter().any(|p| p.id == *id && p.kind == cat))
+    }
+
+    /// `chronicle.lay`'s five model-group buttons carry the **`selected`** flag, one at a time.
+    /// 0x5077D0 clears it on all five through the by-name helper 0x50D9A0 and then, on
+    /// `[0x5DBA44]` through the jump table at 0x507894, sets it on exactly one (§4.111).
+    fn bind_chronicle_group(&mut self) {
+        let Some(l) = self.layout_preview.as_ref() else { return };
+        let want = l.widgets_named(&CHRONICLE_GROUP_BUTTONS);
+        if want.is_empty() {
+            return;
+        }
+        let group = self.chronicle_group;
+        if let Some(l) = self.layout_preview.as_mut() {
+            for (index, which) in want {
+                l.set_selected_flag(index, which == group);
+            }
+        }
+    }
+
+    /// 0x5074A0's list for the screen the port is on: `<kind><group><yy><i><variant>.fsh` for
+    /// `i` = 1…4, stopping at the first one that is not on disk.
+    fn chronicle_media(&self) -> Vec<String> {
+        // 0x507508's three letters, by the kind each screen passes (0x5080F8, 0x508137)
+        let kind = match self.layout_name.as_deref().unwrap_or("").to_ascii_lowercase().as_str() {
+            "chroniclemovie" => 'v',
+            "chroniclemedia" => 'm',
+            _ => 'p',
+        };
+        let letter = CHRONICLE_GROUP_LETTERS.as_bytes()[self.chronicle_group.min(4)] as char;
+        // the year and the variant of the entry the chronicle is showing
+        let cur = self.chronicle_picture().unwrap_or_default();
+        let stem = cur.strip_suffix(".fsh").unwrap_or("");
+        let (yy, variant) = match stem.as_bytes() {
+            b if b.len() == 6 => (stem[2..4].to_string(), b[5] as char),
+            _ => return Vec::new(),
+        };
+        let dir = self.paths.fe_data().join("Chron");
+        let mut out = Vec::new();
+        for i in 1..=4 {
+            let name = format!("{kind}{letter}{yy}{i}{variant}.fsh");
+            if GamePaths::find_file(&dir, &name).is_none() {
+                break;
+            }
+            out.push(name);
+        }
+        out
     }
 
     /// Fill the showcase screens' picture mosaic. `NFS5.ShowcasePicture` is only a place — its
@@ -3003,7 +3685,7 @@ impl App {
             .filter_map(|(i, _)| {
                 const CHRONICLE_MOVIE: [&str; 5] = ["ch5", "Ch3", "Ch1", "Ch2", "Ch4"];
                 let src = l.layout.elements[i].get("othersource")?;
-                src.eq_ignore_ascii_case("chroniclemain").then(|| (i, format!("{}.mad", CHRONICLE_MOVIE[CHRONICLE_GROUP.min(4)])))
+                src.eq_ignore_ascii_case("chroniclemain").then(|| (i, format!("{}.mad", CHRONICLE_MOVIE[self.chronicle_group.min(4)])))
             })
             .chain(l.numbered_widgets("NFS5.MOVIECIRCLE").into_iter().filter_map(|(i, _)| {
                 let file = match l.layout.elements[i].get("othersource")? {
@@ -5756,6 +6438,7 @@ impl App {
                     ko_sel: m.ko_sel,
                     opponents: m.opponents,
                     ko_opponents: m.ko_opponents,
+                    damage: m.damage,
                     opp_car: m.opp_car,
                     paint_idx: m.paint_idx,
                     laps: m.laps,
@@ -5974,6 +6657,7 @@ impl App {
                     ko_sel: m.ko_sel,
                     opponents: m.opponents,
                     ko_opponents: m.ko_opponents,
+                    damage: m.damage,
                     opp_car: m.opp_car,
                     paint_idx: m.paint_idx,
                     laps: m.laps,
@@ -6044,6 +6728,7 @@ impl App {
                     ko_sel: m.ko_sel,
                     opponents: m.opponents,
                     ko_opponents: m.ko_opponents,
+                    damage: m.damage,
                     opp_car: m.opp_car,
                     paint_idx: m.paint_idx,
                     laps: m.laps,
@@ -6146,10 +6831,16 @@ impl App {
                     self.bind_car_logos();
                     self.bind_indicator_bars();
                     self.bind_chronicle_icons();
+            self.bind_chronicle_group();
+            self.bind_repair_bars();
+            self.bind_usedcars_panels();
+            self.bind_parts_buttons();
+            self.bind_mergedlist_panel();
             self.bind_showcase_pictures();
             self.bind_track_maps();
             self.bind_player_pictures();
                     self.bind_lists();
+                    self.bind_checks();
                 }
             }
             MenuKey::Enter => {
@@ -6167,10 +6858,21 @@ impl App {
                     self.network_callback(cb, event_loop);
                     return;
                 }
-                // the bottom bar's PLAYGAME, or any screen that says it can start a game
-                if c.callback.as_deref() == Some("PLAYGAME")
-                    || (c.destination.is_none() && l.can_play())
-                {
+                // The bottom bar's PLAYGAME button, or any screen that says it can start a game.
+                //
+                // **The button asks the screen first.** Its `callback=PLAYGAME` resolves through
+                // the callback table the screen controller builds at 0x50C1D0 to the controller's
+                // own slot **+0xBC** (0x50E540 is `jmp [vtbl+0xBC]`), and thirty of the
+                // forty-one screen vtables carry the same default there, **0x50CC10**, which is
+                // `if ([this+0x270]->slot16()) [this+0x270]->slot13()` — it asks before it acts.
+                // This port was acting unconditionally, so the RACE button started a race from
+                // `credits.lay` and `createplayer.lay` alike. The only per-screen "may I" in the
+                // layouts is `data.canplaygame`, whose getter is 0x4E0BF0 and which `can_play`
+                // already reads for the other arm of this very test; its thirteen non-zero
+                // screens are exactly the race-launching ones. Tying slot16 to that attribute is
+                // **HIGH**, not confirmed — what is confirmed is the routing and the ask.
+                // §4.85.
+                if (c.callback.as_deref() == Some("PLAYGAME") || c.destination.is_none()) && l.can_play() {
                     self.start_from_layout(event_loop);
                     return;
                 }
@@ -6256,6 +6958,7 @@ impl App {
                     l.ip = l.target().map(|a| a.to_string()).unwrap_or_default();
                 }
                 self.bind_lists();
+            self.bind_checks();
                 return;
             }
         };
@@ -6319,11 +7022,15 @@ impl App {
             self.gamepads.set_dead_zone(l.deadzone_values()[0][0]);
         }
         let pads = self.fe_pads();
+        // `Camera.Current` — the slot `NFS5.CAMERASELECT` highlights (§4.89). This port keeps the
+        // chosen view as an index into the registry's own cycle, which is the same thing.
+        let cam_cur = self.camera_mode as usize;
         if let Some(l) = self.layout_preview.as_mut() {
             l.advance_transition(dt_ms);
             // hand the screen the pointer, so its widgets can pick their `hover` state (§4.39)
             l.set_cursor(self.cursor);
             l.set_pads(pads, 0);
+            l.set_camera_current(cam_cur);
         }
         // the bottom bar is a screen of its own (0x4D39D3) and its four buttons hover and animate
         // like any other (§4.53), so it needs the clock and the pointer too
@@ -6342,6 +7049,21 @@ impl App {
                 l.scroll_list(index, delta * steps as i32);
             }
         }
+        // and so does a held car-setting arrow, off the very same timer (0x4C1F55, 0x4C1F80)
+        if let Some((name, step, acc)) = self.setting_repeat.take() {
+            let acc = acc + dt_ms;
+            let steps = acc / SCROLL_REPEAT_MS;
+            self.setting_repeat = Some((name.clone(), step, acc % SCROLL_REPEAT_MS));
+            for _ in 0..steps {
+                self.set_accessor(&name, step);
+            }
+            if steps > 0 {
+                self.bind_car_logos();
+                self.bind_indicator_bars();
+                self.bind_lists();
+                self.bind_checks();
+            }
+        }
         // and the movies on it, which need the renderer to put each frame in its texture
         if let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) {
             l.advance_movies(r, dt_ms);
@@ -6354,6 +7076,7 @@ impl App {
             }
             if before != self.lobby.as_ref().map(|l| l.found.len()) {
                 self.bind_lists();
+            self.bind_checks();
             }
         }
         if let Some(b) = self.layout_bottom.as_mut() {
@@ -6431,6 +7154,36 @@ impl App {
 
     /// The write half of `accessor_value`: a combo slider moves the port's own setting the accessor
     /// stands for. Only the names the port has state for do anything.
+    /// Set a range accessor to an absolute value — what `NFS5.GouraudIndicatorBar`'s pointer
+    /// slots do (0x4CA548 and its twin in 0x4CA590) once they have turned the pointer's x into an
+    /// index. `bar_at` answers the fraction; the count is the accessor's own `max - min + 1`,
+    /// which is the list 0x4BA329 builds, and the index is the value less the minimum (0x4BA34A).
+    /// `RE/notes/controls.md` §4.81.
+    fn set_accessor_fraction(&mut self, name: &str, f: f32) {
+        let base = name.split_once('(').map(|(b, _)| b.trim()).unwrap_or(name);
+        let Some((_, lo, hi)) = self.range_value(base) else { return };
+        let n = (hi - lo + 1).max(1);
+        // 0x5A0F98 truncates toward zero and 0x4CA535 pins the top index, so the bar can never
+        // answer `n` itself
+        let v = ((n as f32 * f) as i32).min(n - 1).max(0) + lo;
+        if base.starts_with("Audio.") {
+            let a = &mut self.audio_settings;
+            let v = v.clamp(0, 127) as u8;
+            match base {
+                "Audio.MusicLevel" => a.music_level = v,
+                "Audio.SfxLevel" => a.sfx_level = v,
+                "Audio.EngineLevel" => a.engine_level = v,
+                "Audio.SpeechLevel" => a.speech_level = v,
+                "Audio.AmbientLevel" => a.ambient_level = v,
+                _ => {}
+            }
+            return;
+        }
+        if let Some(key) = RANGE_ACCESSORS.iter().find(|(n, ..)| *n == base).map(|(_, k, ..)| *k) {
+            self.choices.insert(key.to_string(), v.clamp(lo, hi) as usize);
+        }
+    }
+
     fn set_accessor(&mut self, name: &str, delta: i32) {
         let base = name.split_once('(').map(|(b, _)| b.trim()).unwrap_or(name);
         if let Some((v, lo, hi)) = self.range_value(base).filter(|_| !base.starts_with("Audio.")) {
@@ -6448,7 +7201,7 @@ impl App {
         if let Some((cur, options)) = self.choice_index(base) {
             let key = CHOICE_ACCESSORS.iter().find(|(n, _, _)| *n == base).map(|(_, k, _)| *k).unwrap_or_default();
             let next = (cur as i32 + delta).rem_euclid(options.len() as i32) as usize;
-            self.choices.insert(key.to_string(), next);
+            self.choices.insert(Self::choice_slot(base, key).to_string(), next);
             return;
         }
         // the network screens' own sliders and lists
@@ -6504,6 +7257,9 @@ impl App {
             "GenericCar2.Car" => m.car2_idx = step(m.car2_idx, m.cars.len()),
             // two accessors, two ranges (0x4E5539 and 0x4E556C): 0…7 for the race, **1**…7 for
             // the knockout table, both starting at 4
+            // 0x4BC240 clamps the new index to `count - 1` and then to 0, so the two rows wrap
+            // into nothing — the stepper simply runs off each end
+            "Game.Damage" => m.damage = (usize::from(m.damage) as i32 + delta).clamp(0, 1) != 0,
             "Game.NumOpponents" => m.opponents = (m.opponents as i32 + delta).clamp(0, 7) as u32,
             "Game.NumKOOpponents" => {
                 m.ko_opponents = (m.ko_opponents as i32 + delta).clamp(1, 7) as u32;
@@ -6575,8 +7331,14 @@ impl App {
                 };
                 self.bind_car_logos();
                 self.bind_lists();
+            self.bind_checks();
                 self.bind_indicator_bars();
                 self.bind_chronicle_icons();
+            self.bind_chronicle_group();
+            self.bind_repair_bars();
+            self.bind_usedcars_panels();
+            self.bind_parts_buttons();
+            self.bind_mergedlist_panel();
             self.bind_showcase_pictures();
             self.bind_track_maps();
             self.bind_player_pictures();
@@ -6747,8 +7509,14 @@ impl App {
             }
             self.bind_car_logos();
             self.bind_lists();
+            self.bind_checks();
             self.bind_indicator_bars();
             self.bind_chronicle_icons();
+            self.bind_chronicle_group();
+            self.bind_repair_bars();
+            self.bind_usedcars_panels();
+            self.bind_parts_buttons();
+            self.bind_mergedlist_panel();
             self.bind_showcase_pictures();
             self.bind_track_maps();
             self.bind_player_pictures();
@@ -6858,6 +7626,7 @@ impl App {
                         std::thread::sleep(Duration::from_millis(20));
                     }
                     self.bind_lists();
+                    self.bind_checks();
                 }
                 // the same scene the front end draws every frame, so a screenshot shows the 3D room too
                 self.rebuild_scene();
@@ -7941,6 +8710,21 @@ impl ApplicationHandler for App {
                     l.picker_move(cx, cy);
                     l.deadzone_drag(cx, cy);
                 }
+                // the open drop-down's scrollbar tracks the pointer so its arrows can show their
+                // hovered frame — `[this+0xEC]`, which 0x4DB2F0 writes on every move (§4.101)
+                if let Some((cx, cy)) = self.cursor {
+                    let at = self.layout_preview.as_ref().and_then(|l| l.combo_scroll_at(cx, cy));
+                    let held = self.mouse_down;
+                    if let Some(l) = self.layout_preview.as_mut() {
+                        l.set_combo_scroll(at.map(|(i, r)| (i, r, held)));
+                    }
+                }
+                if self.bar_grab.is_some()
+                    && let Some((cx, cy)) = self.cursor
+                    && let Some((_, name, f)) = self.layout_preview.as_ref().and_then(|l| l.bar_at(cx, cy))
+                {
+                    self.set_accessor_fraction(&name, f);
+                }
             }
             WindowEvent::CursorLeft { .. } => self.cursor = None,
             // `RE/notes/controls.md` §4.40: the pump stamps a `MouseButtonEvent` type **4** on the
@@ -7952,6 +8736,28 @@ impl ApplicationHandler for App {
                 let down = state == ElementState::Pressed;
                 if let Some(l) = self.layout_preview.as_mut() {
                     l.set_pressed(down);
+                }
+                self.mouse_down = down;
+                if !down {
+                    // 0x4C1FB0: the release hands `[this+0x14C]` to 0x5292D0 and zeroes it
+                    self.setting_repeat = None;
+                }
+                // `FeListScrollBar::onPress` 0x4DB040: the hit test first, then the jump table at
+                // 0x4DB164. Arms 1 and 2 step the list and swallow the press — the drop-down must
+                // not close under the pointer (§4.101).
+                if let Some((cx, cy)) = self.cursor
+                    && let Some((_, region)) = self.layout_preview.as_ref().and_then(|l| l.combo_scroll_at(cx, cy))
+                {
+                    // 0x4DB08B and 0x4DB0A1 also play click 8 through 0x4AADB0; this port's front
+                    // end has no sound path, so the step is all that is ported.
+                    if let Some(l) = self.layout_preview.as_mut() {
+                        let i = l.open_combo();
+                        l.set_combo_scroll(i.map(|i| (i, region, down)));
+                        if down {
+                            l.combo_scroll_press(region);
+                        }
+                    }
+                    return;
                 }
                 // `NFS5.DEADZONE` takes the button before anything else on its screen: its slot 5
                 // (0x51BB60) hit-tests its four handles, takes focus and sets the value, its slot
@@ -7967,6 +8773,21 @@ impl ApplicationHandler for App {
                     && let Some(l) = self.layout_preview.as_mut()
                     && l.deadzone_press(cx, cy)
                 {
+                    return;
+                }
+                // `NFS5.GouraudIndicatorBar`'s slot 5 (0x4CA470) takes the button when the bar is
+                // `data.changeable` and the pointer is on it, and sets the accessor straight from
+                // where the pointer landed. Its slot 8 (0x4CA590) then drags, gated on the focus
+                // the press granted (0x4C7DD0) and on the pointer still being over the part.
+                // §4.81.
+                if !down {
+                    self.bar_grab = None;
+                }
+                if let (Some((cx, cy)), true) = (self.cursor, down)
+                    && let Some((_, name, f)) = self.layout_preview.as_ref().and_then(|l| l.bar_at(cx, cy))
+                {
+                    self.bar_grab = Some(name.clone());
+                    self.set_accessor_fraction(&name, f);
                     return;
                 }
                 // The colour editor eats the button while it is up: its slots 5 and 9 return
@@ -8012,6 +8833,7 @@ impl ApplicationHandler for App {
                     // for a **header** flips `[this+0x2C]` or `[this+0x2D]` with a `sete`
                     // (0x51548B, 0x5154B2) before refreshing. The second header's row is 1 while
                     // the first section is closed and `1 + <its rows>` while it is open.
+                    let mut picked_part = None;
                     let section = l
                         .list_boxes()
                         .into_iter()
@@ -8020,7 +8842,12 @@ impl ApplicationHandler for App {
                         .and_then(|row| match row {
                             0 => Some(0usize),
                             r if r == self.parts_header_b() => Some(1),
-                            _ => None,
+                            // any other row is a part, and clicking it moves the accessor's own
+                            // index — which is what 0x4F1ADE reads back (§4.114)
+                            r => {
+                                picked_part = Some(r);
+                                None
+                            }
                         });
                     for w in l.list_boxes() {
                         let Some(b) = l.list_scrollbar(w.index) else { continue };
@@ -8061,12 +8888,64 @@ impl ApplicationHandler for App {
                     }
                     if let Some(sec) = section {
                         self.parts_open[sec] = !self.parts_open[sec];
+                        // the two headers move the second one's row, so the picked part goes with
+                        // the list rather than staying on a row that is no longer a part
+                        self.parts_sel = None;
                         self.bind_lists();
+                        self.bind_checks();
+                        self.bind_parts_buttons();
+                        return;
+                    }
+                    if let Some(r) = picked_part {
+                        self.parts_sel = Some(r);
+                        self.bind_parts_buttons();
                         return;
                     }
 
                 }
                 if let Some(hit) = self.layout_preview.as_ref().and_then(|l| l.hovered()) {
+                    // An input box takes focus when it is activated — `FeInputBox`'s slot 9,
+                    // 0x4CCB70, which the base's release path reaches through the `"CLICKED"`
+                    // message (§4.40). Three classes share that slot. §4.109.
+                    if !down
+                        && let Some(l) = self.layout_preview.as_mut()
+                    {
+                        let class = l.class_of(hit).unwrap_or_default();
+                        // `NFS5.CONTROLLERSETUP`'s slot 9 is **0x51C5F0**, three calls: take
+                        // focus (0x4C7D70), then 0x51F000 and 0x51F310 — the input layer's
+                        // "start listening for the next control". §4.117.
+                        if matches!(class.as_str(), "NFS5.INPUTBOX" | "NFS5.CHATINPUTBOX" | "NFS5.CHARVECTACCESSORINPUTBOX" | "NFS5.CONTROLLERSETUP") {
+                            l.focus_input(hit);
+                        }
+                    }
+                    // `usedcars.lay`'s two panel buttons flip `[FEUsedCarsScreen + 0x290]`
+                    // through the `SHOWPARTS` and `SHOWDAMAGE` callbacks the constructor
+                    // registers at 0x4F71C0 and 0x4F71D1 (§4.113)
+                    if !down
+                        && let Some(which) = self
+                            .layout_preview
+                            .as_ref()
+                            .and_then(|l| l.widgets_named(&["ID_SHOWPARTSBUTTON", "ID_SHOWDAMAGEBUTTON"]).into_iter().find(|(i, _)| *i == hit).map(|(_, k)| k))
+                    {
+                        self.usedcars_showparts = which == 0;
+                        self.bind_usedcars_panels();
+                        return;
+                    }
+                    // and a click on one of `chronicle.lay`'s five model-group buttons moves
+                    // `[0x5DBA44]` — 0x506E68, 0x506EA6 and the three arms after them each write
+                    // the group their button stands for and then reload the screen (§4.111)
+                    if !down
+                        && let Some(which) = self
+                            .layout_preview
+                            .as_ref()
+                            .and_then(|l| l.widgets_named(&CHRONICLE_GROUP_BUTTONS).into_iter().find(|(i, _)| *i == hit).map(|(_, k)| k))
+                    {
+                        self.chronicle_group = which;
+                        self.bind_chronicle_group();
+                        self.bind_chronicle_icons();
+                        self.bind_lists();
+                        return;
+                    }
                     let controls = self.layout_preview.as_ref().map(|l| l.controls()).unwrap_or_default();
                     // a combo takes focus on the **release** (0x4C6CC1, after sound 2 at
                     // 0x4C6C97), and focus is what opens its list (0x4C53A0) — clicking the open
@@ -8089,8 +8968,46 @@ impl ApplicationHandler for App {
                             l.set_open_combo(None);
                         }
                     }
+                    // `NFS5.CheckBox` is no button and carries no `accessor`, so it is not in
+                    // `controls()` at all — its tick comes off the hit itself. `repair.lay`'s ten
+                    // are the only ones in the front end, each naming a `QUICKFIX.*` bool (§4.95).
+                    if down
+                        && let Some(name) = self
+                            .layout_preview
+                            .as_ref()
+                            .and_then(|l| l.check_boxes().into_iter().find(|(i, _)| *i == hit).map(|(_, a)| a))
+                        && let Some(n) = name.strip_prefix("QUICKFIX.")
+                        && let Some(k) = QUICKFIX_NAMES.iter().find(|k| **k == n)
+                    {
+                        if !self.repair_ticks.remove(*k) {
+                            self.repair_ticks.insert(k);
+                        }
+                        self.bind_checks();
+                        return;
+                    }
                     if let Some(n) = controls.iter().position(|c| c.index == hit) {
                         self.layout_sel = n;
+                        // `NFS5.CARSETTINGBUTTON` steps its accessor on the **press**, not the
+                        // release: slot 5 (0x4C1F6C) takes focus and slot 27 (0x4C1F20) hands
+                        // `data.step` — `[this+0x144]`, bound at 0x4C1ED7 — to the accessor.
+                        // Seventeen of the 34 carry 1 and seventeen −1, so the arrow that points
+                        // left really does subtract. §4.84.
+                        if down
+                            && controls[n].step != 0
+                            && let Some(a) = controls[n].accessor.clone()
+                        {
+                            let step = controls[n].step;
+                            self.setting_repeat = Some((a.clone(), step, 0));
+                            self.set_accessor(&a, step);
+                            self.bind_car_logos();
+                            self.bind_indicator_bars();
+                            self.bind_chronicle_icons();
+                            self.bind_showcase_pictures();
+                            self.bind_lists();
+                            self.bind_checks();
+                            self.bind_mergedlist_panel();
+                            return;
+                        }
                         if !down && !combos.iter().any(|c| c.index == hit) {
                             self.layout_key(MenuKey::Enter, event_loop);
                         }
@@ -8390,6 +9307,15 @@ fn main() -> Result<()> {
         .position(|a| a == "--screenshot")
         .and_then(|i| args.get(i + 1).cloned());
     let layout_sweep = args.iter().any(|a| a == "--layout-sweep");
+    // The sweep measures **gaps**, and a widget that is correctly blank because an animation has
+    // not started yet is not one. `data.animating` keeps a wordwrap widget empty for its first
+    // 0x97 = 151 ticks (§4.87), so a sweep taken at clock 0 counts five of them; preloading the
+    // screen clock past that wait keeps the measurement comparable with every earlier round.
+    // An explicit `NFS_FE_CLOCK` still wins, so a sweep can be taken at any moment on purpose.
+    if layout_sweep && std::env::var("NFS_FE_CLOCK").is_err() {
+        // SAFETY: single-threaded start-up, before any screen is loaded
+        unsafe { std::env::set_var("NFS_FE_CLOCK", "5000") };
+    }
     let fe_start = if layout_sweep { fe_start.or_else(|| Some("QuickRace".to_string())) } else { fe_start };
     // the views the player cycles through come from the registry, like everything else in `fe.txt`
     let camera_cycle =
@@ -8491,6 +9417,7 @@ fn main() -> Result<()> {
             ko_sel: 0,
             opponents: 4,
             ko_opponents: 4,
+            damage: true,
             opp_car: std::env::var("NFS_OPPCAR")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -8573,6 +9500,13 @@ fn main() -> Result<()> {
     let music_names = nfs_audio::music::song_titles(&paths.game_data().join("Music")).unwrap_or_default();
     let music_lengths = nfs_audio::music::song_lengths_ms(&paths.game_data().join("Music")).unwrap_or_default();
     let mut app = App {
+        bar_grab: None,
+        chronicle_group: CHRONICLE_GROUP,
+        usedcars_showparts: false,
+        parts_sel: None,
+        setting_repeat: None,
+        mouse_down: false,
+        repair_ticks: Default::default(),
         cursor: None,
         // both of `Parts.AllParts`'s sections start closed (0x515190, 0x515193)
         parts_open: [false, false],
@@ -8801,3 +9735,28 @@ fn main() -> Result<()> {
     event_loop.run_app(&mut app)?;
     Ok(())
 }
+
+/// The `nfs5.prt` categories one `QUICKFIX.<name>` box covers — the same mapping the per-category
+/// cost getters use (0x4EFBC0 and its nine neighbours), and what `repair.lay`'s ten boxes tick.
+/// `RE/notes/controls.md` §4.96.
+fn quickfix_kinds(name: &str) -> Option<&'static [u16]> {
+    Some(match name {
+        "ENGINE" => &[1],
+        "BRAKES" => &[2],
+        "TRANSMISSION" => &[3],
+        "SUSPENSION" => &[4],
+        "SHOCKS" => &[5],
+        "BODYWORK" => &[10],
+        "SWAYBARS" => &[8],
+        "TIRES" => &[9],
+        "COSMETIC" => &[6, 7],
+        "OVERALL" => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        _ => return None,
+    })
+}
+
+/// The ten `QUICKFIX.*` names `repair.lay`'s check boxes carry, in the order the accessors are
+/// registered at 0x4F252A…0x4F258B. `RE/notes/controls.md` §4.96.
+const QUICKFIX_NAMES: [&str; 10] = [
+    "ENGINE", "BRAKES", "TRANSMISSION", "SUSPENSION", "SHOCKS", "BODYWORK", "SWAYBARS", "TIRES", "COSMETIC", "OVERALL",
+];

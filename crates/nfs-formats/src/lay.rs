@@ -41,6 +41,21 @@ impl Element {
 
     /// An integer value. 0x527D60: an empty string is 0, a `0x` prefix goes to the hex parser
     /// 0x5242D0, and anything else goes through the same evaluator 0x52DC40.
+    /// The components a comma-separated value actually yields, following the front end's own
+    /// tokeniser at **0x4B58E9**: it collects characters up to the next comma or NUL, dropping
+    /// spaces, tabs and carriage returns, and at 0x4B5936 it **skips an empty token outright** —
+    /// no parse, no store, and the running count is not advanced. So `"150,"` yields **one**
+    /// value, not two, and a consumer that writes one component per parsed value leaves the rest
+    /// of its destination alone. `RE/notes/controls.md` §4.116.
+    pub fn parts_of(&self, key: &str) -> Vec<f32> {
+        let Some(v) = self.get(key) else { return Vec::new() };
+        v.split(',')
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .filter_map(|t| t.parse::<f32>().ok().or_else(|| crate::ctr::eval(t, &|_| None).map(|v| v as f32)))
+            .collect()
+    }
+
     pub fn int(&self, key: &str) -> Option<i64> {
         let v = self.get(key)?.trim();
         if let Some(h) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {

@@ -138,6 +138,12 @@ impl CareerTables {
     /// `rec+0xE4 != 2` (the hidden era finales). **There is no career-progress condition**: the
     /// era the player is up to only reaches the accessor in Evolution mode, where it selects
     /// `[0x691E50]` instead. So every club era is listed from the start. CONFIRMED (H28).
+    /// The club tournaments of **one** era — the three lists the jump table at 0x505450 picks
+    /// between for `Tournament.EventType` 1, 2 and 3 (`controls.md` §4.105).
+    pub fn club_tournaments_of(&self, era: Era) -> Vec<&Tournament> {
+        self.club_tournaments().into_iter().filter(|t| t.era() == era).collect()
+    }
+
     pub fn club_tournaments(&self) -> Vec<&Tournament> {
         let mut v: Vec<&Tournament> = self.tournaments.iter().filter(|t| matches!(t.kind, TournamentKind::Club(_)) && !t.is_hidden()).collect();
         v.sort_by_key(|t| (t.era(), t.id));

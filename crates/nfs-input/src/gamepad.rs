@@ -129,6 +129,21 @@ pub struct PadAxisSet {
 }
 
 impl Gamepads {
+    /// Every input device the layer enumerates, with the flag that says whether it is a **pad**.
+    ///
+    /// The original builds `Controller.AllControllers` and `Controller.AllPads` at 0x511809 from
+    /// exactly this: `0x51F050()` — `0x532E10(0, 1)`, the count at `[0x69CB0C]` — then for each
+    /// index `0x51F0C0(i)` to skip a device, `0x51F060(i)` for its name (the descriptor
+    /// `0x532E10(i, 2)` returns, name at **+0x14**) and `0x51F080(i)` to decide whether the name
+    /// also goes on the pads' list. `RE/notes/controls.md` §4.103.
+    ///
+    /// That enumeration is DirectInput's, and it carries the keyboard too; `gilrs` enumerates
+    /// only game controllers, so here every device is a pad and the two lists come out the same.
+    pub fn devices(&self) -> Vec<(String, bool)> {
+        let Some(g) = self.gilrs.as_ref() else { return Vec::new() };
+        g.gamepads().map(|(_, gp)| (gp.name().to_string(), true)).collect()
+    }
+
     /// The connected pads' axis sets, in connection order — what `NFS5.DEADZONE` draws from.
     pub fn axis_sets(&self) -> Vec<PadAxisSet> {
         let Some(g) = self.gilrs.as_ref() else { return Vec::new() };

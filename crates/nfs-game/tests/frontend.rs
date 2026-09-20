@@ -2375,3 +2375,480 @@ fn the_deadzone_bar_carries_a_marker_and_four_handles() {
     // makes a later hit win when two handles coincide
     assert_eq!(deadzone_handles(300, [0, 0x80]).map(|(r, _)| r), [1, 3, 2, 4]);
 }
+
+/// `data.picoffy` shifts a `NFS5.BOTTOMBARBUTTON`'s picture down — 0x4C9BDE, and only the three
+/// bottom-bar buttons that have an icon carry a non-zero one. `RE/notes/controls.md` §4.80.
+#[test]
+fn the_bottom_bar_icons_carry_a_y_offset() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let dir = paths.fe_data().join("Layouts");
+    let p = GamePaths::find_file(&dir, "bottombar.lay").expect("bottombar.lay");
+    let text: String = std::fs::read(p).unwrap().iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+    let lay = nfs_formats::lay::Layout::parse(&text);
+
+    let mut seen: Vec<(String, i64)> = lay
+        .elements
+        .iter()
+        .filter(|e| e.class == "NFS5.BOTTOMBARBUTTON")
+        .map(|e| (e.get("name").unwrap_or("").to_string(), e.int("picoffy").unwrap_or(0)))
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        [
+            ("ID_BACKBUTTON".to_string(), 6),
+            ("ID_EXITBUTTON".to_string(), 6),
+            ("ID_OPTIONSBUTTON".to_string(), 6),
+            ("ID_PLAYGAMEBUTTON".to_string(), 0),
+        ]
+    );
+
+    // and across the whole front end: 22 bar buttons, three of them offset
+    let mut off = 0;
+    let mut total = 0;
+    for f in std::fs::read_dir(&dir).expect("Layouts") {
+        let p = f.unwrap().path();
+        if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lay")) {
+            continue;
+        }
+        let t: String = std::fs::read(&p).unwrap().iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+        for e in nfs_formats::lay::Layout::parse(&t).elements.iter().filter(|e| e.class == "NFS5.BOTTOMBARBUTTON") {
+            total += 1;
+            if e.int("picoffy").unwrap_or(0) != 0 {
+                off += 1;
+            }
+        }
+    }
+    assert_eq!((total, off), (22, 3));
+}
+
+/// `data.changeable` makes a `NFS5.GouraudIndicatorBar` take the pointer — 0x4CA470's first test.
+/// Eleven of the 42 shipped bars carry it. `RE/notes/controls.md` §4.81.
+#[test]
+fn the_changeable_bars_are_the_eleven_settings_sliders() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let dir = paths.fe_data().join("Layouts");
+    let mut on: Vec<String> = Vec::new();
+    let mut total = 0;
+    for f in std::fs::read_dir(&dir).expect("Layouts") {
+        let p = f.unwrap().path();
+        if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lay")) {
+            continue;
+        }
+        let t: String = std::fs::read(&p).unwrap().iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+        for e in nfs_formats::lay::Layout::parse(&t).elements.iter().filter(|e| e.class == "NFS5.GouraudIndicatorBar") {
+            total += 1;
+            if e.int("changeable").unwrap_or(0) != 0 {
+                on.push(e.get("accessor").unwrap_or("").to_string());
+            }
+        }
+    }
+    on.sort();
+    assert_eq!(total, 42);
+    assert_eq!(
+        on,
+        [
+            "Audio.AmbientLevel",
+            "Audio.EngineLevel",
+            "Audio.MusicLevel",
+            "Audio.SfxLevel",
+            "Audio.SpeechLevel",
+            "FF.CollisionVolume",
+            "FF.EngineVolume",
+            "FF.RoadGripVolume",
+            "FF.RoadVolume",
+            "FF.TotalVolume",
+            "Graphics.GammaCorrection",
+        ]
+    );
+}
+
+/// `NFS5.GRAPHICTABBUTTON`'s clickable area is a parallelogram, not its box — 0x4CABA0. All five
+/// are on `optiontabs.lay` and their rectangles overlap. `RE/notes/controls.md` §4.82.
+#[test]
+fn the_graphic_tabs_are_slanted_and_their_boxes_overlap() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let p = GamePaths::find_file(&paths.fe_data().join("Layouts"), "optiontabs.lay").expect("optiontabs.lay");
+    let text: String = std::fs::read(p).unwrap().iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+    let lay = nfs_formats::lay::Layout::parse(&text);
+
+    let tabs: Vec<&nfs_formats::lay::Element> =
+        lay.elements.iter().filter(|e| e.class == "NFS5.GRAPHICTABBUTTON").collect();
+    assert_eq!(tabs.len(), 5);
+    let quad = |e: &nfs_formats::lay::Element| {
+        (
+            e.int("TLoffsetx").unwrap_or(0),
+            e.int("TRoffsetx").unwrap_or(0),
+            e.int("BLoffsetx").unwrap_or(0),
+            e.int("BRoffsetx").unwrap_or(0),
+        )
+    };
+    let mut got: Vec<(i64, (i64, i64, i64, i64))> = tabs
+        .iter()
+        .map(|e| (e.get("pos").and_then(|p| p.split(',').next()?.trim().parse().ok()).unwrap_or(0), quad(e)))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            (59, (0, -60, 94, 0)),
+            (154, (0, -20, 60, 0)),
+            (263, (0, 0, 20, -20)),
+            (354, (20, 0, 0, -60)),
+            (414, (60, 0, 0, -94)),
+        ]
+    );
+    // every one of them slants: no tab carries four zeroes, which is what would make the box right
+    assert!(got.iter().all(|(_, q)| *q != (0, 0, 0, 0)));
+}
+
+/// `data.tint` is the widget base's colour, `[this+0x120]` — six widgets carry it and only one
+/// differs from the opaque-white default. `RE/notes/controls.md` §4.83.
+#[test]
+fn only_one_widget_in_the_front_end_carries_a_real_tint() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let dir = paths.fe_data().join("Layouts");
+    let mut carried: Vec<(String, String, String)> = Vec::new();
+    for f in std::fs::read_dir(&dir).expect("Layouts") {
+        let p = f.unwrap().path();
+        if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lay")) {
+            continue;
+        }
+        let name = p.file_name().unwrap().to_string_lossy().to_lowercase();
+        let t: String = std::fs::read(&p).unwrap().iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+        for e in nfs_formats::lay::Layout::parse(&t).elements.iter() {
+            if let Some(v) = e.get("tint").filter(|v| !v.is_empty()) {
+                carried.push((name.clone(), e.class.clone(), v.to_lowercase()));
+            }
+        }
+    }
+    carried.sort();
+    assert_eq!(carried.len(), 6, "{carried:?}");
+    // every one of them is a movie widget, and five carry the default written out
+    assert!(carried.iter().all(|(_, c, _)| c == "NFS5.MOVIEBOX" || c == "NFS5.MOVIECIRCLE"));
+    let odd: Vec<&(String, String, String)> = carried.iter().filter(|(_, _, v)| v != "0xffffffff").collect();
+    assert_eq!(odd.len(), 1, "{odd:?}");
+    assert_eq!((odd[0].0.as_str(), odd[0].2.as_str()), ("credits.lay", "0xff55afbe"));
+}
+
+/// `data.step` on `NFS5.CARSETTINGBUTTON` — the arrows come in pairs and the sign is the point.
+/// `RE/notes/controls.md` §4.84.
+#[test]
+fn the_car_setting_arrows_come_in_plus_and_minus_pairs() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let dir = paths.fe_data().join("Layouts");
+    let mut steps: Vec<i64> = Vec::new();
+    for f in std::fs::read_dir(&dir).expect("Layouts") {
+        let p = f.unwrap().path();
+        if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lay")) {
+            continue;
+        }
+        let t: String = std::fs::read(&p).unwrap().iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+        for e in nfs_formats::lay::Layout::parse(&t).elements.iter().filter(|e| e.class == "NFS5.CARSETTINGBUTTON") {
+            steps.push(e.int("step").unwrap_or(0));
+        }
+    }
+    assert_eq!(steps.len(), 34);
+    assert_eq!(steps.iter().filter(|s| **s == 1).count(), 17);
+    assert_eq!(steps.iter().filter(|s| **s == -1).count(), 17);
+    // and `controls()` carries the sign through, so a click can use it
+    let p = GamePaths::find_file(&dir, "carsetup.lay").or_else(|| GamePaths::find_file(&dir, "CarSetup.lay"));
+    if let Some(p) = p {
+        let t: String = std::fs::read(&p).unwrap().iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+        let lay = nfs_formats::lay::Layout::parse(&t);
+        let n = lay.elements.iter().filter(|e| e.class == "NFS5.CARSETTINGBUTTON").count();
+        assert!(n > 0, "carsetup.lay should carry the arrows");
+    }
+}
+
+/// `canplaygame` on the screen block is what the bottom bar's RACE button asks before it acts —
+/// and only thirteen of the 98 screens say yes. `RE/notes/controls.md` §4.85.
+#[test]
+fn only_the_race_launching_screens_can_play() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let dir = paths.fe_data().join("Layouts");
+    let mut yes: Vec<String> = Vec::new();
+    let mut total = 0;
+    for f in std::fs::read_dir(&dir).expect("Layouts") {
+        let p = f.unwrap().path();
+        if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lay")) {
+            continue;
+        }
+        total += 1;
+        let t: String = std::fs::read(&p).unwrap().iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+        let lay = nfs_formats::lay::Layout::parse(&t);
+        if lay.screen().and_then(|s| s.int("canplaygame")).unwrap_or(0) != 0 {
+            yes.push(p.file_name().unwrap().to_string_lossy().to_lowercase());
+        }
+    }
+    yes.sort();
+    assert_eq!(total, 98);
+    assert_eq!(
+        yes,
+        [
+            "creategame.lay",
+            "factdone.lay",
+            "factorydriver.lay",
+            "knockout.lay",
+            "knockoutraceinfo.lay",
+            "location.lay",
+            "locationqk.lay",
+            "locationsetup.lay",
+            "prerace.lay",
+            "quickknockout.lay",
+            "quickrace.lay",
+            "tournament.lay",
+            "victoryroom.lay",
+        ]
+    );
+}
+
+/// `data.allowcustom` — only a colour box that has a custom colour to offer opens the editor, and
+/// the two that do not are the dealership's. `RE/notes/controls.md` §4.86.
+#[test]
+fn the_dealership_colour_boxes_offer_no_custom_colour() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let dir = paths.fe_data().join("Layouts");
+    let mut boxes: Vec<(String, String, i64)> = Vec::new();
+    for f in std::fs::read_dir(&dir).expect("Layouts") {
+        let p = f.unwrap().path();
+        if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lay")) {
+            continue;
+        }
+        let name = p.file_name().unwrap().to_string_lossy().to_lowercase();
+        let t: String = std::fs::read(&p).unwrap().iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+        for e in nfs_formats::lay::Layout::parse(&t).elements.iter().filter(|e| e.class == "NFS5.ColorBox") {
+            boxes.push((name.clone(), e.get("accessor").unwrap_or("").to_string(), e.int("allowcustom").unwrap_or(0)));
+        }
+    }
+    boxes.sort();
+    assert_eq!(boxes.len(), 11);
+    let off: Vec<&(String, String, i64)> = boxes.iter().filter(|(_, _, v)| *v == 0).collect();
+    assert_eq!(off.len(), 2, "{off:?}");
+    assert!(off.iter().all(|(f, a, _)| f == "dealership.lay" && a.starts_with("DealerCar.")));
+    // and the paint shop's four all allow it
+    assert_eq!(boxes.iter().filter(|(f, _, v)| f == "paintshop.lay" && *v == 1).count(), 4);
+}
+
+/// `data.animating` — the five narrative wordwrap widgets that type themselves out.
+/// `RE/notes/controls.md` §4.87.
+#[test]
+fn the_five_narrative_panels_animate() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let dir = paths.fe_data().join("Layouts");
+    let mut on: Vec<String> = Vec::new();
+    let mut total = 0;
+    for f in std::fs::read_dir(&dir).expect("Layouts") {
+        let p = f.unwrap().path();
+        if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lay")) {
+            continue;
+        }
+        let name = p.file_name().unwrap().to_string_lossy().to_lowercase();
+        let t: String = std::fs::read(&p).unwrap().iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+        for e in nfs_formats::lay::Layout::parse(&t).elements.iter() {
+            if !e.class.to_ascii_lowercase().contains("wordwrap") {
+                continue;
+            }
+            total += 1;
+            if e.int("animating").unwrap_or(0) != 0 {
+                on.push(name.clone());
+            }
+        }
+    }
+    on.sort();
+    assert_eq!(total, 11);
+    assert_eq!(on, ["factdone.lay", "levelvictory.lay", "missionbrief.lay", "tournament.lay", "victorymessage.lay"]);
+}
+
+/// `NFS5.CAMERASELECT`'s `data.accessornum` picks which of `Camera.1`…`Camera.4` it watches, and
+/// the one matching `Camera.Current` draws in the `highlighty` state.
+/// `RE/notes/controls.md` §4.89.
+#[test]
+fn the_four_camera_buttons_are_numbered_and_have_a_highlight_state() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let p = GamePaths::find_file(&paths.fe_data().join("Layouts"), "cameras.lay").expect("cameras.lay");
+    let text: String = std::fs::read(p).unwrap().iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+    let lay = nfs_formats::lay::Layout::parse(&text);
+
+    let mut got: Vec<(i64, String)> = lay
+        .elements
+        .iter()
+        .filter(|e| e.class == "NFS5.CAMERASELECT")
+        .map(|e| (e.int("accessornum").unwrap_or(-1), e.get("text").unwrap_or("").to_string()))
+        .collect();
+    got.sort();
+    assert_eq!(got, [(0, "1".into()), (1, "2".into()), (2, "3".into()), (3, "4".into())]);
+
+    // and the template really has that state, with its own background part
+    let c = {
+        let p = GamePaths::find_file(&paths.fe_data().join("Controls"), "CameraSelect.ctr").expect("CameraSelect.ctr");
+        let t: String = std::fs::read(p).unwrap().iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+        nfs_formats::ctr::Control::parse(&t)
+    };
+    assert!(c.has_state("highlighty"));
+    assert!(c.state_parts("highlighty").iter().any(|n| n == "hbg"));
+    assert!(c.state_parts("normal").iter().any(|n| n == "bg"));
+}
+
+/// The sweep counts widgets that draw **nothing**, so a combo — which always draws its own box —
+/// can never appear in it however empty its drop-down is. That is how 61 of the 97 went unnoticed
+/// until §4.91. This pins the accessor families down so the blind spot cannot re-open quietly:
+/// every combo's accessor is either one this port enumerates or one on the recorded list.
+/// `RE/notes/controls.md` §4.92.
+#[test]
+fn every_combo_accessor_is_enumerated_or_recorded() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    // the families `combo_rows` and `choice_rows` answer, by prefix
+    const ENUMERATED: &[&str] = &[
+        "Car.", "CDPlayer.Options", "CDPlayer.View", "Audio.Quality", "Audio.Mode", "Display.",
+        "Graphics.SkyRendering", "Graphics.LensFlare", "Graphics.Headlights", "Graphics.CarChrome",
+        "Graphics.TextureDetail", "Graphics.CarDetail", "Graphics.SpecialFX", "Graphics.ViewDistance",
+        "Comms.Collision", "OwnedCar.PackageNum",
+        // §4.91's four families
+        "zMergedList.Car", "OpponentCar.Car", "UsedCar.Car", "PrizeCars.Car", "OwnedCars.Car",
+        "DealerCar.Car", "GenericCar.Car", "GenericCar2.Car", "CARSETTINGS.CAR",
+        "Track1.Track", "LoopedTrack.Track", "Knockout.Track", "Track.Track", "Record.Track",
+        "OwnedCar.ExtColour", "OwnedCar.IntColour", "OwnedCar.S1Colour", "OwnedCar.S2Colour",
+        "GenericCar.Colour", "DealerCar.Colour", "DealerCar.IntColour",
+        "Game.NumOpponents", "Game.NumKOOpponents", "Track1.Laps", "Track1.Traffic",
+    ];
+    // and the ones the port does not model at all, recorded in §4.91
+    const RECORDED: &[&str] = &[
+        "Comms.", "Controller.", "Tournament.", "CDPlayer.Title", "Graphics.Resolutions",
+        "Knockout.Direction", "Knockout.Laps", "Knockout.Traffic", "Track1.Direction",
+        "Game.Damage", "Game.Difficutly",
+    ];
+    let dir = paths.fe_data().join("Layouts");
+    let mut unknown: Vec<String> = Vec::new();
+    let mut total = 0;
+    for f in std::fs::read_dir(&dir).expect("Layouts") {
+        let p = f.unwrap().path();
+        if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lay")) {
+            continue;
+        }
+        let t: String = std::fs::read(&p).unwrap().iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+        for e in nfs_formats::lay::Layout::parse(&t).elements.iter() {
+            if !matches!(e.class.as_str(), "NFS5.ComboBoxSlider" | "NFS5.ColorBox") {
+                continue;
+            }
+            total += 1;
+            let a = e.get("accessor").unwrap_or("").split('(').next().unwrap_or("").trim().to_string();
+            if a.is_empty() || ENUMERATED.iter().chain(RECORDED).any(|p| a.starts_with(p)) {
+                continue;
+            }
+            unknown.push(a);
+        }
+    }
+    unknown.sort();
+    unknown.dedup();
+    assert_eq!(total, 97);
+    assert!(unknown.is_empty(), "combo accessors neither enumerated nor recorded: {unknown:?}");
+}
+
+/// `repair.lay`'s ten check boxes and the `QUICKFIX.*` bool each one watches — the categories the
+/// screen's own total, 0x50F110, adds one `if (accessor->slot27())` at a time.
+/// `RE/notes/controls.md` §4.96.
+#[test]
+fn the_repair_screen_has_ten_category_ticks() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let p = GamePaths::find_file(&paths.fe_data().join("Layouts"), "repair.lay").expect("repair.lay");
+    let text: String = std::fs::read(p).unwrap().iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+    let lay = nfs_formats::lay::Layout::parse(&text);
+
+    let mut names: Vec<String> = lay
+        .elements
+        .iter()
+        .filter(|e| e.class == "NFS5.CheckBox")
+        .map(|e| e.get("boolaccessor").unwrap_or("").to_string())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "QUICKFIX.BODYWORK",
+            "QUICKFIX.BRAKES",
+            "QUICKFIX.COSMETIC",
+            "QUICKFIX.ENGINE",
+            "QUICKFIX.OVERALL",
+            "QUICKFIX.SHOCKS",
+            "QUICKFIX.SUSPENSION",
+            "QUICKFIX.SWAYBARS",
+            "QUICKFIX.TIRES",
+            "QUICKFIX.TRANSMISSION",
+        ]
+    );
+    // and every one of them keeps the same pair of entries, on 9 and off 10
+    for e in lay.elements.iter().filter(|e| e.class == "NFS5.CheckBox") {
+        assert_eq!((e.int("onIndex"), e.int("offIndex")), (Some(9), Some(10)));
+    }
+}
+
+/// `FeListScrollBar::hitTest` 0x4DB2F0 — four rectangles in a fixed order, the knob before the
+/// trough, and 0 when the pointer is off the bar (0x4DB512). `RE/notes/controls.md` §4.101.
+#[test]
+fn the_combo_scrollbars_four_regions() {
+    use nfs_game::layout::scrollbar_region;
+    // a 160-px bar at (400, 100) with 20 rows, parked at the top
+    let r = |px, py| scrollbar_region(400.0, 100.0, 160.0, 20, 0, px, py);
+    assert_eq!(r(408.0, 106.0), 1, "the up arrow, [ecx+0x12C] -> 0x4DB371");
+    assert_eq!(r(408.0, 252.0), 2, "the down arrow, [ecx+0x11C] -> 0x4DB3F5");
+    assert_eq!(r(408.0, 120.0), 3, "the knob, [ecx+0xFC] -> 0x4DB479");
+    assert_eq!(r(408.0, 240.0), 4, "the trough below it, [ecx+0x10C] -> 0x4DB4FD");
+    assert_eq!(r(380.0, 240.0), 0, "left of the bar — 0x4DB512 writes 0");
+    assert_eq!(r(408.0, 300.0), 0, "below the bar");
+    // the knob is tested before the trough, so it never reads as the track
+    let knob_h = (160.0f32 - 26.0 - 20.0).max(16.0);
+    assert_eq!(r(408.0, 113.0 + knob_h - 1.0), 3);
+    // and it slides down as the list scrolls: the same point is trough once the knob has moved
+    assert_eq!(scrollbar_region(400.0, 100.0, 160.0, 20, 19, 408.0, 120.0), 4);
+}
+
+/// The front end's comma tokeniser, 0x4B58E9: an empty token is skipped outright (0x4B5936), so
+/// `"150,"` yields one value and not two. `RE/notes/controls.md` §4.116.
+#[test]
+fn a_trailing_comma_yields_one_component() {
+    let mut e = nfs_formats::lay::Element::default();
+    let put = |e: &mut nfs_formats::lay::Element, v: &str| {
+        e.fields.insert("size".into(), v.into());
+    };
+    put(&mut e, "150,");
+    assert_eq!(e.parts_of("size"), vec![150.0], "the empty token after the comma is skipped");
+    assert_eq!(e.pair("size"), None, "and it is not a pair at all");
+    put(&mut e, "1, 50");
+    assert_eq!(e.parts_of("size"), vec![1.0, 50.0], "spaces are dropped inside a token (0x4B591B)");
+    put(&mut e, " , 50");
+    assert_eq!(e.parts_of("size"), vec![50.0], "a leading empty token is skipped the same way");
+}
