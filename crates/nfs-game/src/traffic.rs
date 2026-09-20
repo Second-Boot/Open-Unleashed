@@ -107,8 +107,11 @@ pub fn target_speed(dir: f32, race_dir: f32, reference_speed: f32, speed_factor:
 
 /// Longitudinal rate `0x4081B0(car, v)`. The speed-dependent curve `0.25 − |v|/56`, clamped to
 /// `0..0.25`, is applied **only to traffic** (`car+0x52C & 0x10`, tested at 0x4081FC); every other AI
-/// car — a cop above all — starts from a flat 1.0. The result is then scaled by `car+0x1098` (the
-/// pursuit boost), by `car+0x10DC`, by 0.9 at night and, for a cop, by the dead `car+0x1028`.
+/// car — a cop above all — starts from a flat 1.0. **This function is only the base and the
+/// `car+0x1098` pursuit boost**; the rest of 0x4081B0's chain — `× car+0x10DC` (a compile-time 1.0),
+/// `× 0.9` under `WEATHER`, `× car+0x1028` for a cop (also a compile-time 1.0), `× 1.5` while the
+/// HARD_BRAKE script action is up, and `× 0x40AEF0`'s early-race boost — is applied by each caller,
+/// because what each of them has to hand differs.
 /// (Read 2026-09-17 while porting the chase; `ai.md` §5.2.3 quotes only the traffic column.)
 pub fn accel_rate_for(is_traffic: bool, speed: f32, boost: f32) -> f32 {
     let base = if is_traffic { (0.25 - speed.abs() / 56.0).clamp(0.0, 0.25) } else { 1.0 };
@@ -292,6 +295,7 @@ impl TrafficCar {
             // (`car+0x538`, 0x417680) is just its body half width
             half_span: self.half_extents.x,
             is_human: false,
+            is_racer: false,
         }
     }
 }
@@ -352,8 +356,13 @@ pub const RIDE_HEIGHT: f32 = 1.0;
 pub struct TrafficSet {
     /// `[0x5E8BF8]` — how many AI opponents are in the race, for the §5.2 rule 3 boost.
     pub opponents: u32,
-    /// Night track (`[0x628A24] > 0`): the longitudinal rate is scaled by 0.9 (`ai.md` §5.2.3).
-    pub night: bool,
+    /// `WEATHER` (`[0x657A24] > 0`): the longitudinal rate is scaled by 0.9 (`ai.md` §5.2.3). It is
+    /// 0 in the shipped options, so this is off in every normal race.
+    /// `[0x657A24]`, which the option registry names **`WEATHER`** (id 0x1E, record 0x5D1F90) —
+    /// *not* the per-track night flag `word[0x628A28]`. The shipped `fe.txt` and `fe_out.txt` both
+    /// carry `weather = 0`, so in a normal race this is **false and the ×0.9 never applies**; the
+    /// port used to drive it from the track's night flag and slowed traffic on every night track.
+    pub weather: bool,
     pub cars: Vec<TrafficCar>,
     /// `scripts.bin`, shared by every car
     pub scripts: nfs_formats::scripts::Scripts,
@@ -383,7 +392,7 @@ impl TrafficSet {
                 c
             })
             .collect();
-        Self { cars, opponents: 0, night: false, scripts: nfs_formats::scripts::Scripts::default(), rng, one_way, race_dir, linear, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: TrafficPhysics::default() }
+        Self { cars, opponents: 0, weather: false, scripts: nfs_formats::scripts::Scripts::default(), rng, one_way, race_dir, linear, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: TrafficPhysics::default() }
     }
 
     pub fn active_count(&self) -> usize {
@@ -575,15 +584,16 @@ impl TrafficSet {
             let err = aidrive::heading_error(&st, aim);
             let road = (sl.width_a, sl.width_b);
             let boost = early_boost(self.opponents, tick, 1, reference.laps as f32 + table.frac(reference.slice), c.progress, 0);
-            let rate = accel_rate(st.speed) * burst * boost * if self.night { 0.9 } else { 1.0 };
-            let cmd = if aidrive::out_of_control(&st, &self.cfg.out_of_control, err, road) {
+            let rate = accel_rate(st.speed) * burst * boost * if self.weather { 0.9 } else { 1.0 };
+            let bend = aidrive::road_bend(table, c.slice, c.dir);
+            let cmd = if aidrive::out_of_control(&st, &self.cfg.out_of_control, err, road, bend) {
                 aidrive::out_of_control_command(&st, &self.cfg.out_of_control, err, rate, self.phys.brake_force)
             } else {
                 // `grip` is the post-collision ramp, 1.0 for an undamaged car
                 let grip = 1.0 + 0.0015 * aidrive::body_forward_speed(&st);
                 aidrive::in_control_command(&st, &self.cfg.in_control, err, aim, grip, 1.0, rate, self.phys.brake_force)
             };
-            tracing::trace!(car = i, err, ooc = aidrive::out_of_control(&st, &self.cfg.out_of_control, err, road), lat = st.lateral, lat_t = st.lateral_target, speed = st.speed, yaw = st.angular_velocity.y, cmd_lat = cmd.lateral, cmd_yaw = cmd.yaw, "traffic drive");
+            tracing::trace!(car = i, err, ooc = aidrive::out_of_control(&st, &self.cfg.out_of_control, err, road, bend), lat = st.lateral, lat_t = st.lateral_target, speed = st.speed, yaw = st.angular_velocity.y, cmd_lat = cmd.lateral, cmd_yaw = cmd.yaw, "traffic drive");
             aidrive::integrate(&mut st, &cmd, ai_dt);
             c.velocity = st.velocity;
             c.angular_velocity = st.angular_velocity;

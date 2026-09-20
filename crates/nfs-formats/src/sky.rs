@@ -14,8 +14,19 @@
 
 use crate::FormatError;
 
+/// The `type` keyword. 0x45FD57 onwards compares it against thirteen strings and turns it into a
+/// **bitmask** — `config` 0x01, `basic` 0x02, `multinormal` 0x04, `multiadditive` 0x08,
+/// `multiattenuate` 0x10, `multimodulate` 0x20, `freecloud` 0x40, `additive` 0x100, the `…water`
+/// spellings the same with **0x200** added, and anything unrecognised **0x800**.
+///
+/// The factory at 0x45D920 then tests the mask in order — `& 2` → `SkyLevel_BasicSky` (0x45ADF0,
+/// 0x5C bytes), `& 4`/`& 8`/`& 0x10`/`& 0x20` → `SkyLevel_MultiSky` (0x45B5A0, 0x88 bytes) with
+/// blend 0, 1, 2 and 3, `& 0x40` → `SkyLevel_FreeClouds` (0x45BF80, 0xFC bytes) — and **stops**.
+/// Nothing tests 0x100, 0x01 or 0x800, so an `additive` block, a `config` block and a misspelt
+/// one all build **no level at all**: `[`SkyKind::builds_a_level`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkyKind {
+    Config,
     Basic { water: bool },
     FreeCloud,
     Additive,
@@ -33,6 +44,7 @@ pub enum SkyBlend {
 impl SkyKind {
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s.to_ascii_lowercase().as_str() {
+            "config" => Self::Config,
             "basic" => Self::Basic { water: false },
             "basicwater" => Self::Basic { water: true },
             "freecloud" => Self::FreeCloud,
@@ -54,6 +66,31 @@ impl SkyKind {
         match self {
             Self::Multi { .. } => 3,
             _ => 1,
+        }
+    }
+
+    /// Whether 0x45D920's chain builds a level for this keyword at all. `additive` and `config`
+    /// are parsed and then dropped on the floor — `default.txt`'s `HIGH` block is `ADDITIVE`, so
+    /// at high sky detail that file contributes nothing.
+    pub fn builds_a_level(&self) -> bool {
+        !matches!(self, Self::Config | Self::Additive)
+    }
+
+    /// The mask 0x45FD57's chain assigns, for comparing against a disassembly.
+    pub fn mask(&self) -> u32 {
+        match self {
+            Self::Config => 0x001,
+            Self::Basic { water } => 0x002 | if *water { 0x200 } else { 0 },
+            Self::Additive => 0x100,
+            Self::FreeCloud => 0x040,
+            Self::Multi { blend, water } => {
+                (match blend {
+                    SkyBlend::Normal => 0x004,
+                    SkyBlend::Additive => 0x008,
+                    SkyBlend::Attenuate => 0x010,
+                    SkyBlend::Modulate => 0x020,
+                }) | if *water { 0x200 } else { 0 }
+            }
         }
     }
 }
@@ -85,6 +122,11 @@ pub struct SkyRegion {
     pub warp_amount: f32,
     /// `basic` only: the cloud texture of this region.
     pub cloud: Option<String>,
+    /// `freecloud` only: the three cloud amounts, relative weights rather than counts —
+    /// 0x45C4BA divides each by their sum and multiplies by `[0x5B243C]` = 15.0, so `{1,1,1}`
+    /// and `{10,10,10}` both give five instances each. **Region B's three are read and then
+    /// never used**: 0x45C376 copies only region A's into `this+0xBC…+0xC4`.
+    pub cloud_weights: [f32; 3],
 }
 
 /// One `BEGIN … END` block.
@@ -96,8 +138,12 @@ pub struct SkyBlock {
     /// "Does this layer block the sun".
     pub blocks_sun: bool,
     pub regions: [SkyRegion; 2],
-    /// `multi*` only: the cloud texture of each layer, after both regions.
+    /// `multi*` and `freecloud`: the cloud texture of each layer, after both regions.
     pub clouds: Vec<Option<String>>,
+    /// `freecloud` only: the two integers that follow each cloud name (`this+0xC8+4k` and
+    /// `this+0xD4+4k`, atoi'd at 0x45C384 / 0x45C3CD, and passed on to 0x45F470 as its fifth
+    /// and sixth arguments). What they mean is not read.
+    pub cloud_params: Vec<[i32; 2]>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -105,8 +151,10 @@ pub struct SkyFile {
     pub blocks: Vec<SkyBlock>,
 }
 
+/// A map name, or `None` for `none`. The original's test is `strncmp(tok, "none", 4)` (0x45B746),
+/// a **prefix** compare, so anything beginning `none` counts.
 fn name(s: &str) -> Option<String> {
-    (!s.eq_ignore_ascii_case("none")).then(|| s.to_string())
+    (s.len() < 4 || !s[..4].eq_ignore_ascii_case("none")).then(|| s.to_string())
 }
 
 impl SkyFile {
@@ -140,7 +188,48 @@ impl SkyFile {
                 expected: "basic | freecloud | additive | multi*".into(),
                 found: type_word.to_string(),
             })?;
-            let blocks_sun = next!().eq_ignore_ascii_case("yes");
+            // 0x45B6FE is `strncmp(tok, "no", 2)`: the flag goes **on** unless the word starts
+            // with `no`, so it is "not no" rather than "yes"
+            // **`freecloud` has no sun token.** 0x45AEBC (`basic`) and 0x45B6FE (`multi*`) do
+            // the `strncmp(tok, "no", 2)` test; the freecloud constructor 0x45BF80 contains no
+            // such test at all and consumes its opening token as the first sky-map name
+            // (0x45BFC2). Reading a sun token here puts the whole block one out.
+            let blocks_sun = if kind == SkyKind::FreeCloud {
+                true
+            } else {
+                let sun_word = next!();
+                sun_word.len() < 2 || !sun_word[..2].eq_ignore_ascii_case("no")
+            };
+            if kind == SkyKind::FreeCloud {
+                // 0x45BFCC…0x45C02A: eight tokens per weather region, twice, then
+                // 0x45C02E…0x45C05A: three per cloud, three times. Twenty-five in all.
+                let mut regions: [SkyRegion; 2] = Default::default();
+                for region in regions.iter_mut() {
+                    let mut l = SkyLayer::default();
+                    l.map = name(next!());
+                    l.alpha_map = name(next!());
+                    let c: f32 = next!().parse().unwrap_or(1.0);
+                    l.scale = [c, c]; // one token, kept as 1/c for both axes at 0x45F8C9
+                    l.wind_speed = next!().parse().unwrap_or(0.0);
+                    l.wind_direction = next!().parse().unwrap_or(0.0);
+                    region.layers = vec![l];
+                    for w in region.cloud_weights.iter_mut() {
+                        *w = next!().parse().unwrap_or(0.0);
+                    }
+                }
+                let mut clouds = Vec::new();
+                let mut cloud_params = Vec::new();
+                for _ in 0..3 {
+                    clouds.push(name(next!()));
+                    cloud_params.push([next!().parse().unwrap_or(0), next!().parse().unwrap_or(0)]);
+                }
+                while i < toks.len() && !toks[i].eq_ignore_ascii_case("end") {
+                    i += 1;
+                }
+                i += 1;
+                blocks.push(SkyBlock { capability, kind, blocks_sun, regions, clouds, cloud_params });
+                continue;
+            }
             let n = kind.layers();
             let mut regions: [SkyRegion; 2] = Default::default();
             for region in regions.iter_mut() {
@@ -186,14 +275,25 @@ impl SkyFile {
                 i += 1;
             }
             i += 1;
-            blocks.push(SkyBlock { capability, kind, blocks_sun, regions, clouds });
+            blocks.push(SkyBlock { capability, kind, blocks_sun, regions, clouds, cloud_params: Vec::new() });
         }
         Ok(Self { blocks })
     }
 
-    /// The block the game would use for a capability, falling back to the first one.
+    /// The block the game would use for a capability, falling back to the first usable one.
+    ///
+    /// "Usable" is [`SkyKind::builds_a_level`]: 0x45D920's chain has no branch for `additive`,
+    /// `config` or an unrecognised keyword, so such a block builds nothing and the game draws no
+    /// layer for it. `Sky/default.txt`'s only `HIGH` block is `ADDITIVE`, which is exactly that
+    /// case — so this skips it rather than drawing a sky the original does not. (The fallback to
+    /// *some* block is this port's own: the original would simply have no level.)
     pub fn for_capability(&self, capability: &str) -> Option<&SkyBlock> {
-        self.blocks.iter().find(|b| b.capability.eq_ignore_ascii_case(capability)).or_else(|| self.blocks.first())
+        let usable = |b: &&SkyBlock| b.kind.builds_a_level();
+        self.blocks
+            .iter()
+            .filter(usable)
+            .find(|b| b.capability.eq_ignore_ascii_case(capability))
+            .or_else(|| self.blocks.iter().find(usable))
     }
 }
 
@@ -201,7 +301,31 @@ impl SkyFile {
 mod tests {
     use super::*;
 
+    #[test]
+    fn freecloud_has_no_sun_token_and_twenty_five_fields() {
+        let f = SkyFile::parse(FREE).unwrap();
+        let b = &f.blocks[0];
+        assert_eq!(b.kind, SkyKind::FreeCloud);
+        // no `NO` line to read, so the flag is left on
+        assert!(b.blocks_sun);
+        assert_eq!(b.regions[0].layers[0].map.as_deref(), Some("st1a"));
+        assert_eq!(b.regions[0].layers[0].alpha_map.as_deref(), Some("noise"));
+        assert_eq!(b.regions[0].layers[0].scale, [2.0, 2.0]);
+        assert_eq!(b.regions[0].layers[0].wind_speed, 3.0);
+        assert_eq!(b.regions[0].layers[0].wind_direction, 90.0);
+        assert_eq!(b.regions[0].cloud_weights, [1.0, 2.0, 3.0]);
+        assert_eq!(b.regions[1].layers[0].map.as_deref(), Some("st1b"));
+        assert_eq!(b.regions[1].layers[0].alpha_map, None);
+        assert_eq!(b.regions[1].cloud_weights, [4.0, 5.0, 6.0]);
+        assert_eq!(b.clouds, vec![Some("cc1a".into()), Some("cc1b".into()), None]);
+        assert_eq!(b.cloud_params, vec![[7, 8], [9, 10], [11, 12]]);
+    }
+
     const BASIC: &str = "BEGIN\n#cap\n\tHIGH\n#type\n\tbasic\n#sun\nNO\n\tst1a\n\tnone\n\tflat\n\t.5\n\t.5\n\t0\n\t0\n\t90\n\t0\n\t0\n\tst1a\n\tnone\n\tflat\n\t.5\n\t.5\n\t0\n\t0\n\t90\n\t0\n\t0\nEND\n";
+    // 25 tokens and no sun line: 2 x (map, alphamap, scale, windspeed, winddir, w0, w1, w2)
+    // then 3 x (cloudmap, int, int). Synthetic — no shipped .txt declares `freecloud`.
+    const FREE: &str = "BEGIN\n\tHIGH\n\tfreecloud\n\tst1a\n\tnoise\n\t2\n\t3\n\t90\n\t1\n\t2\n\t3\n\tst1b\n\tnone\n\t4\n\t5\n\t270\n\t4\n\t5\n\t6\n\tcc1a\n\t7\n\t8\n\tcc1b\n\t9\n\t10\n\tnone\n\t11\n\t12\nEND\n";
+
     const MULTI: &str = "BEGIN\n\tHIGH\n\tMULTINORMAL\nNO\n\tst1a\n\tsc1a\n\tnone\n\t1\n\t2\n\t0\n\t1\n\t2\n\t0\n\t400\n\t0\n\t2\n\t0\n\t90\n\t40\n\t0\n\t0\n\t0\n\tst1a\n\tnone\n\tnone\n\t4\n\t0\n\t0\n\t4\n\t0\n\t0\n\t400\n\t0\n\t0\n\t0\n\t90\n\t0\n\t0\n\t0\n\t0\n\tflat\n\tcc1a\n\tnone\nEND\n";
 
     #[test]
@@ -252,6 +376,45 @@ mod tests {
             assert_eq!(SkyKind::parse(s), Some(k), "{s}");
         }
         assert_eq!(SkyKind::parse("nonsense"), None);
+    }
+
+    /// The masks 0x45FD57's chain assigns, and the three keywords 0x45D920 then has no branch for.
+    #[test]
+    fn the_type_masks_and_what_builds_a_level() {
+        for (s, m) in [
+            ("config", 0x001),
+            ("basic", 0x002),
+            ("multinormal", 0x004),
+            ("multiadditive", 0x008),
+            ("multiattenuate", 0x010),
+            ("multimodulate", 0x020),
+            ("freecloud", 0x040),
+            ("additive", 0x100),
+            ("basicwater", 0x202),
+            ("multinormalwater", 0x204),
+            ("multiadditivewater", 0x208),
+            ("multiattenuatewater", 0x210),
+            ("multimodulatewater", 0x220),
+        ] {
+            assert_eq!(SkyKind::parse(s).unwrap().mask(), m, "{s}");
+        }
+        // 0x45D920 tests 2, 4, 8, 0x10, 0x20 and 0x40 and nothing else
+        assert!(SkyKind::parse("basic").unwrap().builds_a_level());
+        assert!(SkyKind::parse("multinormal").unwrap().builds_a_level());
+        assert!(SkyKind::parse("freecloud").unwrap().builds_a_level());
+        assert!(!SkyKind::parse("additive").unwrap().builds_a_level());
+        assert!(!SkyKind::parse("config").unwrap().builds_a_level());
+    }
+
+    /// `blocks_sun` is "not `no`", not "`yes`" (0x45B6FE), and `none` is a four-character prefix
+    /// test (0x45B746).
+    #[test]
+    fn the_sun_flag_and_the_none_test() {
+        let f = SkyFile::parse(&BASIC.replace("NO\n", "MAYBE\n")).unwrap();
+        assert!(f.blocks[0].blocks_sun, "anything not starting `no` sets the flag");
+        assert!(!SkyFile::parse(BASIC).unwrap().blocks[0].blocks_sun);
+        assert_eq!(name("NONEXISTENT"), None, "the compare is four characters, not the whole word");
+        assert_eq!(name("non"), Some("non".to_string()));
     }
 }
 

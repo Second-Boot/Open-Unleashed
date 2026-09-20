@@ -170,3 +170,57 @@ fn the_dead_zone_accessors_ride_in_the_save() {
     let b = back.accessors.as_ref().expect("an accessor block");
     assert_eq!(b.entries.len(), a.entries.len());
 }
+
+/// The used-car market (`RE/notes/career.md` §10.5, generator 0x4F80C0 / 0x4F82C0 / 0x4F8590).
+#[test]
+fn the_used_car_market_fills_and_caps() {
+    let Some(t) = tables() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let mut c = Career::default();
+    c.year = 1975;
+    // the original's 16-bit LCG stands in for `0x538040`; any uniform source exercises the rules
+    let mut seed = 12345u32;
+    let mut rand = || {
+        seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        (seed >> 16) & 0x7FFF
+    };
+    c.refresh_market(&t, &mut rand);
+    assert!(!c.market.is_empty(), "a 1975 market should hold something");
+    assert!(c.market.len() <= nfs_game::career::USED_CAR_MARKET_MAX);
+    for car in &c.market {
+        let rec = t.car(car.car_id).expect("a catalogue car");
+        // nothing under two years old, and never a flag-2 or flag-3 record (0x4F80FE, 0x4F8114)
+        assert!(rec.year as i64 <= c.year as i64 - 2, "{} is too new", rec.display_name);
+        assert!(!matches!(rec.dealer_flag_204, 2 | 3));
+        // mileage and wins come from their bands, and the price is the car's own value
+        assert!(car.mileage <= 100_000);
+        assert!(car.wins <= 50);
+        assert_eq!(car.asking_price, Some(c.value_of(&t, car).unwrap().max(0) as u32));
+        // a market car is mechanically fresh — the generator never damages it
+        assert_eq!(car.damage_pct, 0.0);
+        assert!(car.part_state.iter().all(|(_, s)| *s == 0.0));
+        // and it never carries two engines (0x4F877E's four compares)
+        let engines = car
+            .parts
+            .iter()
+            .filter_map(|id| t.parts.iter().find(|p| p.id == *id))
+            .filter(|p| p.kind_name == "Engine" || p.kind_name == "Engine (Standard)")
+            .count();
+        assert!(engines <= 1, "{} has {engines} engines", rec.display_name);
+    }
+    // refreshing again keeps the cap
+    for _ in 0..4 {
+        c.refresh_market(&t, &mut rand);
+    }
+    assert_eq!(c.market.len(), nfs_game::career::USED_CAR_MARKET_MAX);
+    // buying takes the money and moves the car across untouched
+    c.money = 10_000_000;
+    let want = c.market[0].clone();
+    c.buy_used_car(0).unwrap();
+    assert_eq!(c.money, 10_000_000 - want.asking_price.unwrap() as i64);
+    assert_eq!(c.garage.last().unwrap().car_id, want.car_id);
+    assert_eq!(c.garage.last().unwrap().mileage, want.mileage);
+    assert_eq!(c.garage.last().unwrap().asking_price, None);
+}

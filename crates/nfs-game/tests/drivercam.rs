@@ -42,3 +42,18 @@ fn driver_camera_keys_read_from_the_tpg() {
     assert!((s0.position.x - 0.2884).abs() < 1e-3);
     assert!((s0.rotation.x - 13.3).abs() < 1e-2);
 }
+
+/// A mirrored race negates the **x** of both triples — `RCar::load` 0x441E16…0x441E41
+/// (`RE/notes/car-model.md`). The driver moves to the other side of the car.
+#[test]
+fn a_mirrored_race_puts_the_driver_on_the_other_side() {
+    let dc = nfs_assets::car::DriverCam { position: glam::Vec3::new(-0.38, 0.4, -0.15), rotation: glam::Vec3::new(2.0, 1.0, 0.0) };
+    let m = dc.mirrored();
+    assert_eq!(m.position.x, 0.38);
+    assert_eq!(m.rotation.x, -2.0);
+    // and nothing else moves
+    assert_eq!((m.position.y, m.position.z), (dc.position.y, dc.position.z));
+    assert_eq!((m.rotation.y, m.rotation.z), (dc.rotation.y, dc.rotation.z));
+    // twice is the identity
+    assert_eq!(m.mirrored().position, dc.position);
+}

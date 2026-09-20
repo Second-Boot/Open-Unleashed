@@ -466,6 +466,23 @@ struct AnimatedProp {
 /// +Y up, −Z front, +X left; `MODEL_TO_BODY` rotates it into the physics body frame (+Z forward).
 pub struct CarModel {
     pub body: Vec<(MeshId, MaterialId, Mat4)>,
+    /// The **rotation channel** of each `body` entry — the article's `Base+75`, 0 for a part that
+    /// never moves (`car-model.md`). `R3DCarLOD::draw` picks it at 0x43C98A and turns
+    /// `channel_turns[n]` into `Rx·Ry·Rz` about the part's own origin.
+    body_channel: Vec<u8>,
+    /// `.tpg` `movespoilerextent` → `R3DCar+0x74` (0x441D08), in **turns**: −0.04 on the 996 and
+    /// the GT3, −0.08 on the two Boxsters, and absent everywhere else.
+    move_spoiler_extent: f32,
+    /// `.tpg` `headlightextent` → `R3DCar+0x70` (0x441CF7), in **turns**: 0.19 on the 914, −0.18
+    /// on the 928, 0.14 on the 944 — the three Porsches with pop-up headlights, and no others.
+    headlight_extent: f32,
+    spoiler: ChannelEase,
+    headlight: ChannelEase,
+    /// `object + 0x2DC + 12n` — three floats a channel, **rotations in turns** about x, y and z
+    /// (0x43C9C0 / 0x43C9D7 / 0x43C9F8 each multiply by `[0x5B25CC]` = 360.0 before the
+    /// axis-angle build 0x539BD0). Only the x column is used so far: channel **16** is
+    /// `MoveSpoiler` and **17** the pop-up `HeadLight`.
+    pub channel_turns: [f32; 32],
     /// (pivot in body space, is_front, is_left, parts)
     pub wheels: Vec<CarWheelModel>,
     pub bbox_min: Vec3,
@@ -497,6 +514,21 @@ pub struct CarLight {
     pub facing: f32,
 }
 
+/// One `{start, duration, from, to}` easer — the 16-byte record the original keeps per channel at
+/// `object+0x64 + 16n` (`car-model.md`), with the clock kept as elapsed rather than a start tick.
+#[derive(Debug, Clone, Copy, Default)]
+struct ChannelEase {
+    from: f32,
+    to: f32,
+    elapsed: u32,
+    duration: u32,
+}
+
+/// One float key out of a `.tpg` `[header]`, 0.0 when absent.
+fn tpg_f32(tpg: &nfs_formats::ini::Ini, key: &str) -> f32 {
+    tpg.section("header").and_then(|h| h.get_f32_list(key)).and_then(|v| v.first().copied()).unwrap_or(0.0)
+}
+
 pub struct CarWheelModel {
     pub pivot: Vec3,
     pub is_front: bool,
@@ -511,9 +543,13 @@ pub struct CarWheelModel {
 /// not track the style array yet, so spoilers and wings are left out.
 pub fn car_body_points(car: &CarAssets) -> Vec<Vec3> {
     let Ok(recs) = car.crp.bound_points(&car.crp_data) else { return Vec::new() };
+    // The loader's filter is `carinfo[0x56C + 4·slot] == value` (0x4420B9), i.e. the body style's
+    // own array — not "slot 0 only", which is what this used to be and which left every
+    // style-selected record out (the spoilers, the GT1 wing).
+    let style = nfs_assets::car::CarStyle::from_tpg(&car.tpg, car.style_index + 1);
     let mut pts: Vec<Vec3> = recs
         .iter()
-        .filter(|r| r.style_slot == 0 && r.style_value == 0)
+        .filter(|r| style.article_enabled(r.style_slot as u8, r.style_value as u8))
         .flat_map(|r| r.points.iter().map(|p| MODEL_TO_BODY.transform_point3(Vec3::from(*p))))
         .collect();
     pts.sort_by(|a, b| a.y.total_cmp(&b.y));
@@ -534,7 +570,20 @@ impl CarModel {
 
     /// `env`: track environment map (`.env` entry, e.g. "SKY ") for `CarExtEnv` paint reflections.
     pub fn upload_with_env(r: &mut Renderer, car: &CarAssets, paths: &nfs_assets::GamePaths, lod: u8, paint: [u8; 3], env: Option<nfs_renderer::TextureId>, night: bool) -> anyhow::Result<Self> {
-        let style = nfs_assets::car::CarStyle::from_tpg(&car.tpg, 1);
+        // `[styleN]` is **1-based** and `CarAssets::style_index` is the raw 0-based `nfs5.car
+        // +0x1C0`, which is what 0x437B33's `inc esi` turns into the section name.
+        let mut style = nfs_assets::car::CarStyle::from_tpg(&car.tpg, car.style_index + 1);
+        // Slot 19 overlays the driver's variants onto the same array at model load — the port
+        // draws at the best detail the table carries, so `slot9 = 1, slot43 = 1`.
+        //
+        // The other two things that block writes (`car-model.md`) are **left to the style**, and
+        // deliberately: slot 42 (`SpoilerDown` / `SpoilerUp`) is zeroed by 0x43AEB2, which hides
+        // both halves of the pop-up spoiler until the animation channel picks one, and the port
+        // does not run that channel — so zeroing it would leave a hole in the engine lid where
+        // the style's own `42 = 1`, the retracted spoiler, belongs. Slot 41's
+        // `2 × slot37 (− 1 when the roof is down)` needs `[carinfo+0x50C]`, which the port has no
+        // equivalent of.
+        style.apply_driver_detail(8, false, false);
         tracing::info!(style = style.name, "car style");
         let pages = car.build_pages(paths, paint, &style)?;
         let page_tex: Vec<(nfs_renderer::TextureId, bool)> = pages
@@ -557,6 +606,7 @@ impl CarModel {
         };
         let arts = car.crp.articles(&car.crp_data)?;
         let mut body = Vec::new();
+        let mut body_channel: Vec<u8> = Vec::new();
         let mut wheels = Vec::new();
         let mut skipped = 0;
         let mut min = Vec3::splat(f32::MAX);
@@ -577,6 +627,7 @@ impl CarModel {
             let is_light = matches!(ty, 0x13 | 0x14 | 0x15);
             let local = g.transform_for_lod(lod).map(|m| Mat4::from_cols_array(&m)).unwrap_or(Mat4::IDENTITY);
             let mut parts = Vec::new();
+            let mut part_channels: Vec<u8> = Vec::new();
             let (mut lamp_sum, mut lamp_n) = (Vec3::ZERO, 0.0f32);
             for mm in article_meshes(&g, lod, &mut skipped) {
                 let mut mesh = mm.mesh;
@@ -600,6 +651,7 @@ impl CarModel {
                 }
                 let material = material_for(r, mm.material);
                 parts.push((r.upload_mesh(&mesh), material, local));
+                part_channels.push(g.base.as_ref().map(|b| b.rot_channel).unwrap_or(0));
             }
             if is_light && lamp_n > 0.0 {
                 // 0x13 headlights and 0x15 front indicators face the front, 0x14 tail lights the back
@@ -611,6 +663,7 @@ impl CarModel {
                 wheels.push(CarWheelModel { pivot, is_front: ty == 0x0D, is_left: local.w_axis.x > 0.0, parts });
             } else {
                 body.extend(parts);
+                body_channel.extend(part_channels);
             }
         }
         tracing::info!(body_parts = body.len(), wheels = wheels.len(), lights = lights.len(), skipped, pages = pages.len(), wheel_radius, half_track, "car uploaded");
@@ -657,6 +710,12 @@ impl CarModel {
         tracing::info!(patches = damage_patches.len(), night, glass = window.is_some(), "damage decals");
         Ok(Self {
             body,
+            body_channel,
+            channel_turns: [0.0; 32],
+            move_spoiler_extent: tpg_f32(&car.tpg, "movespoilerextent"),
+            headlight_extent: tpg_f32(&car.tpg, "headlightextent"),
+            spoiler: ChannelEase::default(),
+            headlight: ChannelEase::default(),
             wheels,
             bbox_min: min,
             bbox_max: max,
@@ -699,6 +758,74 @@ impl CarModel {
         }
     }
 
+    /// Step the two animated channels this port drives — `car-model.md`.
+    ///
+    /// **The spoiler**, channel 16, is slot 9's block at 0x438931…0x438A57: deploy above
+    /// `[0x5B3698]` = 22.222 m/s (**80 km/h**), retract below `[0x5B3694]` = 13.889 (**50**),
+    /// over `0x7D0` = **2000 ms**, and a travel already running is never interrupted — 0x438950
+    /// compares `now − start` against the duration before it re-arms. The angle is
+    /// `t × movespoilerextent` turns (0x43878D clamps it to `[0, extent]` against 1.0).
+    ///
+    /// **The headlights**, channel 17, are slot 6's easer at 0x43950E…0x439620: the same shape
+    /// with a **1000 ms** duration, from the car's headlight bit — which `Car_init` freezes at
+    /// 0x410C74 as `word[0x628A28] ? 3 : 0`, so it is the track's night flag and never changes
+    /// during a race.
+    pub fn update_animation(&mut self, dt_ms: u32, speed_mps: f32, headlights_on: bool) {
+        let step = |e: &mut ChannelEase, dt: u32, want: f32, duration: u32| {
+            if e.elapsed < e.duration {
+                e.elapsed = e.elapsed.saturating_add(dt);
+            } else if e.to != want {
+                e.from = e.to;
+                e.to = want;
+                e.elapsed = 0;
+                e.duration = duration;
+            }
+            let t = if e.duration == 0 { 1.0 } else { (e.elapsed as f32 / e.duration as f32).min(1.0) };
+            e.from + (e.to - e.from) * t
+        };
+        if self.move_spoiler_extent != 0.0 {
+            // the gate has a dead band between 50 and 80 km/h: neither test fires, so the
+            // spoiler stays where it is
+            let want = if speed_mps > 22.222 {
+                1.0
+            } else if speed_mps < 13.889 {
+                0.0
+            } else {
+                self.spoiler.to
+            };
+            let t = step(&mut self.spoiler, dt_ms, want, 2000);
+            let e = self.move_spoiler_extent;
+            self.set_channel(16, t * e);
+        }
+        if self.headlight_extent != 0.0 {
+            let t = step(&mut self.headlight, dt_ms, if headlights_on { 1.0 } else { 0.0 }, 1000);
+            let e = self.headlight_extent;
+            self.set_channel(17, t * e);
+        }
+    }
+
+    /// The rotation a channel's three floats compose to: `Rx·Ry·Rz`, each angle in **turns**
+    /// (0x43C9C0 / 0x43C9D7 / 0x43C9F8, all `× 360` into the axis-angle build 0x539BD0, and
+    /// accumulated in that order by the two 0x539AD0 multiplies at 0x43CA26 / 0x43CA38).
+    ///
+    /// The port only ever fills the x term, so the y and z rotations are identity here; they are
+    /// written this way round so a later channel that uses them lands in the right order.
+    fn channel_matrix(&self, n: u8) -> Mat4 {
+        let t = self.channel_turns.get(n as usize).copied().unwrap_or(0.0);
+        if t == 0.0 {
+            return Mat4::IDENTITY;
+        }
+        Mat4::from_rotation_x(t * std::f32::consts::TAU)
+    }
+
+    /// Set one animation channel, in turns. Channel **16** is `MoveSpoiler`, **17** the pop-up
+    /// `HeadLight`; both are `Base+75` bindings confirmed against every shipped model.
+    pub fn set_channel(&mut self, n: u8, turns: f32) {
+        if let Some(slot) = self.channel_turns.get_mut(n as usize) {
+            *slot = turns;
+        }
+    }
+
     /// Draw items for a car at `car_to_world` (body frame → world). `wheel_spin` in turns,
     /// `steer` in turns for the front wheels.
     pub fn draw_items(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: f32) -> Vec<DrawItem> {
@@ -708,8 +835,15 @@ impl CarModel {
     /// `draw_items` with the light the car picks up from the ground (`TrackWorld::light_at`).
     pub fn draw_items_lit(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: f32, light: [f32; 3]) -> Vec<DrawItem> {
         let mut out = Vec::with_capacity(self.body.len() + 4 * 8);
-        for (mesh, material, local) in &self.body {
-            out.push(DrawItem { light, ..DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * *local) });
+        for (i, (mesh, material, local)) in self.body.iter().enumerate() {
+            // A part bound to a rotation channel turns about **its own origin**: 0x43CA19…
+            // 0x43CA38 compose Rx·Ry·Rz and 0x43CA43 multiplies that into the part's transform,
+            // so the rotation is on the right of the part's own matrix.
+            let m = match self.body_channel.get(i).copied().unwrap_or(0) {
+                0 => *local,
+                n => *local * self.channel_matrix(n),
+            };
+            out.push(DrawItem { light, ..DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * m) });
         }
         for w in &self.wheels {
             let idx = match (w.is_front, w.is_left) {

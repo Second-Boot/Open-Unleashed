@@ -63,6 +63,20 @@ impl DriverCam {
         let rot = triple(&format!("drivercamrotstyle{style}")).or_else(|| triple("drivercamrot")).unwrap_or(glam::Vec3::ZERO);
         Some(Self { position: pos, rotation: rot })
     }
+
+    /// A **mirrored** race moves the driver to the other side of the car: `RCar::load` tests
+    /// `[0x65742C] > 0` at 0x441E16 and negates the **x** of both triples in place —
+    /// `car+0x10E8` at 0x441E2D and `car+0x10F4` at 0x441E41. It happens once, at load, so the
+    /// eye point and its aim are mirrored for the whole race.
+    ///
+    /// The position's x is plainly the driver's side. The *rotation's* x is what `car-model.md`
+    /// reads as the pitch, and negating a pitch in a mirror is odd — but that is what the two
+    /// `fchs` do, and both fields are treated the same way, so it is carried as read.
+    pub fn mirrored(mut self) -> Self {
+        self.position.x = -self.position.x;
+        self.rotation.x = -self.rotation.x;
+        self
+    }
 }
 
 impl CarStyle {
@@ -72,12 +86,20 @@ impl CarStyle {
             st.name = sec.get("name").unwrap_or("").to_string();
             let count = sec.get_i64("count").unwrap_or(0);
             for k in 1..=count {
+                // **`geometry` wins, and the two are exclusive.** `applyStyle` 0x437B00 reads
+                // `geometry%d` with a default of **−1** (0x437B97 `push -1`) and only when that
+                // comes back negative (0x437BA3 `jge`) does it read `texture%d` and offset the
+                // slot by **60** (0x437BC8 `add esi, 0x3C`) — so one entry fills one slot of the
+                // 120-dword array at `car+0x56C`, never both. No shipped `[styleN]` entry carries
+                // both keys, so this is the rule rather than a change in behaviour.
                 let variant = sec.get_i64(&format!("type{k}")).unwrap_or(0) as u32;
-                if let Some(g) = sec.get_i64(&format!("geometry{k}")) {
-                    st.geometry.insert(g as u32, variant);
-                }
-                if let Some(t) = sec.get_i64(&format!("texture{k}")) {
-                    st.texture.insert(t as u32, variant);
+                match sec.get_i64(&format!("geometry{k}")) {
+                    Some(g) if g >= 0 => {
+                        st.geometry.insert(g as u32, variant);
+                    }
+                    _ => {
+                        st.texture.insert(sec.get_i64(&format!("texture{k}")).unwrap_or(0) as u32, variant);
+                    }
                 }
             }
         }
@@ -102,9 +124,61 @@ impl CarStyle {
         }
         true
     }
+    /// The render overlay `R3DCar` slot 19 lays over the `.tpg` style at model load
+    /// (0x43AEA5…0x43AF6B). It is not a separate mechanism — it writes the **same** array, so
+    /// these are style slots:
+    ///
+    /// | slot | `Base+68` | what it selects |
+    /// |---|---|---|
+    /// | 9 | 0x09 | `DriverBody1…10` |
+    /// | 43 | 0x2B | `LeftArm`, `RightArm`, `Legs` — four variants |
+    /// | 56 | 0x38 | `LeftHand`, `RightHand` — two |
+    ///
+    /// ```text
+    /// 0x43AEAB  slot9  = 0x5CD5C4[detail]                ; {2,3,4,5,10,8,9,7,1}
+    /// 0x43AED4  car+0x52C & 0x10   -> slot9 = 0, done    ; no driver at all
+    /// 0x43AEEA  detail >= 8        -> slot9 = 1, slot43 = 1, and slot56 is left alone
+    /// 0x43AF0B  GameType 9, detail >= 4 -> 6, 3, 1       ; a factory-driver mission
+    /// 0x43AF2B  GameType 9, else        -> 1, 1, 2
+    /// 0x43AF51  otherwise -> slot43 = 2·(detail/4) + 2, slot56 = detail/4 + 1
+    /// ```
+    ///
+    /// The port renders at the best detail the table has, so it takes the `detail >= 8` arm.
+    pub fn apply_driver_detail(&mut self, detail: u32, no_driver: bool, factory_driver: bool) {
+        if no_driver {
+            self.geometry.insert(9, 0);
+            return;
+        }
+        if detail >= 8 {
+            self.geometry.insert(9, 1);
+            self.geometry.insert(43, 1);
+            return;
+        }
+        if factory_driver {
+            let (b, l, h) = if detail >= 4 { (6, 3, 1) } else { (1, 1, 2) };
+            self.geometry.insert(9, b);
+            self.geometry.insert(43, l);
+            self.geometry.insert(56, h);
+            return;
+        }
+        const DRIVER_BY_DETAIL: [u32; 9] = [2, 3, 4, 5, 10, 8, 9, 7, 1];
+        self.geometry.insert(9, DRIVER_BY_DETAIL[detail.min(8) as usize]);
+        self.geometry.insert(43, 2 * (detail / 4) + 2);
+        self.geometry.insert(56, detail / 4 + 1);
+    }
+
     /// Whether an article of `Base+68` type id and `+69` variant is shown.
+    ///
+    /// **Type 0 is not a wildcard.** `applyStyle` 0x437B00 `memset`s the whole 120-dword array at
+    /// `car+0x56C` to zero (0x437B1B, `push 0x1E0`) before it reads the `[styleN]` section, so an
+    /// unnamed slot — slot 0 included — holds 0, and the loader's test `carinfo[0x56C + 4·type]
+    /// == variant` (0x4420B9) fails for a type-0 article whose variant is not 0. This used to
+    /// short-circuit `type_id == 0` to *true*, which drew `DecalHood1` — type 0, variant **1** —
+    /// on top of `DecalHood`, type 0 variant 0, at the same pivot. Both exist on the 993, the GT2
+    /// and the two 993 police cars, no `[styleN]` on any of them sets slot 0, and across all 44
+    /// shipped models and every style this correction drops that one article and nothing else.
     pub fn article_enabled(&self, type_id: u8, variant: u8) -> bool {
-        type_id == 0 || self.geometry.get(&(type_id as u32)).copied().unwrap_or(0) == variant as u32
+        self.geometry.get(&(type_id as u32)).copied().unwrap_or(0) == variant as u32
     }
 }
 
@@ -117,6 +191,15 @@ pub struct CarAssets {
     pub textures_day: Vec<TextureImage>,
     pub textures_night: Vec<TextureImage>,
     pub tpg: Ini,
+    /// Which **body style** of this model the car is, **0-based** — `nfs5.car +0x1C0`
+    /// (`fedata::CarCatalogEntry::variant`). `Car_init` copies it out of the car-info record at
+    /// `+0x328` into `car+0x568` (0x410F5C…0x410F62) and `applyStyle` 0x437B00 looks up
+    /// `"style%d"` with it **plus one** (0x437B33 `inc esi`). The `drivercamposstyle<N>` keys use
+    /// the raw 0-based number instead — `550.tpg` has a `drivercamposstyle0`.
+    ///
+    /// Zero until somebody sets it, which is the right default: `style1` is what a model with one
+    /// style has.
+    pub style_index: usize,
 }
 
 impl CarAssets {
@@ -160,7 +243,15 @@ impl CarAssets {
             textures_day,
             textures_night,
             tpg: Ini::parse(&String::from_utf8_lossy(&read(&tpg_path)?)),
+            style_index: 0,
         })
+    }
+
+    /// Set the body style from a catalogue entry's `nfs5.car +0x1C0`, clamping a negative one to
+    /// style 1 the way an unset `car+0x568` would.
+    pub fn with_style(mut self, variant: i16) -> Self {
+        self.style_index = variant.max(0) as usize;
+        self
     }
 
     /// Build the texture pages the car materials index (`RE/notes/car-model.md` §2.2, CONFIRMED):
@@ -258,10 +349,26 @@ impl CarAssets {
     }
 
     /// Load `GameData/Simulation/CarData/<variant>.sim`.
+    /// A car's `.sim`, falling back to **`default.sim`** when the named one is not there.
+    ///
+    /// That fallback is the original's, not a convenience: 0x49C7B6 formats `"%s%s.sim"` and
+    /// opens it, and when the handle comes back null (`test edi, edi; jne` at 0x49C7D4) it
+    /// formats `"%sdefault.sim"` (0x49C7E0) and opens that instead. It matters for exactly one
+    /// shipped car — the **'96 911 Carrera 4S Coupé (993)**, whose catalogue record names
+    /// `993coupeS436` while the file on disk is `993coupe4S36.sim`. A typo in the data, and the
+    /// only one of the 87 catalogue cars with a missing `.sim`; without the fallback, picking
+    /// that car fails to start a race.
     pub fn load_sim(paths: &GamePaths, variant: &str) -> Result<CarSim, AssetError> {
         let dir = paths.car_data_dir();
-        let n = format!("{variant}.sim");
-        let p = GamePaths::find_file(&dir, &n).ok_or_else(|| AssetError::MissingFile { dir: dir.clone(), name: n })?;
+        let named = GamePaths::find_file(&dir, &format!("{variant}.sim"));
+        let p = match named {
+            Some(p) => p,
+            None => {
+                tracing::warn!(variant, "no such .sim; falling back to default.sim (0x49C7D4)");
+                let n = "default.sim".to_string();
+                GamePaths::find_file(&dir, &n).ok_or_else(|| AssetError::MissingFile { dir: dir.clone(), name: n })?
+            }
+        };
         CarSim::parse(&read(&p)?).map_err(fmt_err(&p))
     }
 }

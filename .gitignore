@@ -15,3 +15,7 @@
 *.exe
 *.dll
 /porsche
+
+# Python bytecode
+__pycache__/
+*.pyc

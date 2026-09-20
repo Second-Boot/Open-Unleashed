@@ -47,6 +47,11 @@ pub struct CarCatalogEntry {
     /// +0x1F6 i16: the car's logo **pair** inside the `logo` pack. `NFS5.CarLogo` reads it at
     /// 0x4C1A63 and uses entries `2*logo_pair` and `2*logo_pair + 1`, drawn side by side
     /// (`RE/notes/layouts.md` §4). CONFIRMED.
+    /// `+0x1C0` — the car's place among the variants of one model generation, 0…12, handed out by
+    /// `FEGenericCarAccessor`'s slot 38 (0x4F31F6) and three more accessors. The generation is
+    /// wider than [`Self::family`]: the 356 A, its Convertible and its Speedster share one run.
+    /// `RE/notes/controls.md` §4.145. Nothing in this port reads it yet.
+    pub variant: i16,
     pub logo_pair: i16,
     /// +0x1F4 u16 — what the car *is*, and which of the front end's lists it joins (the `switch` at
     /// 0x4F400E): **0 a racing car** (87 records, the player's, the opponents' and the dealer's),
@@ -208,6 +213,7 @@ pub fn parse_car_catalog(data: &[u8]) -> Result<Vec<CarCatalogEntry>, FormatErro
             body: s(0x1B2, 16)?,
             displacement: s(0x1C2, 16)?,
             id: u16_le(r, 0, "nfs5.car id")?,
+            variant: u16_le(r, 0x1C0, "nfs5.car +0x1C0")? as i16,
             logo_pair: u16_le(r, 0x1F6, "nfs5.car +0x1F6")? as i16,
             kind: u16_le(r, 0x1F4, "nfs5.car +0x1F4")?,
             dealer_flag_204: u16_le(r, 0x204, "nfs5.car +0x204")?,

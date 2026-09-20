@@ -79,6 +79,12 @@ pub struct CarSpecs {
     pub efficiency: f32,
     /// front drive fraction (+0x5C ×0.01): 0 RWD, 1 FWD, 0.5 AWD
     pub front_drive: f32,
+    /// final drive (+0x80), and the raw per-slot gear ratios (+0x60..+0x7C) **before** 0x49D634
+    /// overwrites them in place with `ratio'`. The original keeps only the overwritten form, but
+    /// the car-setup sliders add to the raw ratios and to the final drive (`apply_setup`), so the
+    /// port keeps both and derives `ratio_rpm_per_mps` from them.
+    pub final_drive: f32,
+    pub gear_ratio: [f32; 8],
     /// `ratio'[slot] = final * ratio * 60 / circumference` = rpm per m/s; slot 0 = reverse (negative), 1 = neutral (0)
     pub ratio_rpm_per_mps: [f32; 8],
     /// top speed m/s (+0x90 ×0.44643)
@@ -122,7 +128,7 @@ pub struct CarSpecs {
     pub inv_yaw_lever: f32,
     /// 1 / grip (+0x1BC)
     pub inv_grip: f32,
-    /// grip-table column: 0 for GT1/GT2/GT3/935 race cars, 2 otherwise (+0x1C0)
+    /// grip-table column: **2** for the GT1/GT2/GT3/935 race cars, **0** otherwise (+0x1C0)
     pub class: usize,
     /// pitch / roll rate retention per tick (+0x114/+0x118 ×0.01) — `RE/notes/suspension-collision.md` §8
     pub pitch_ret: f32,
@@ -153,24 +159,8 @@ impl CarSpecs {
         for (i, g) in sim.gear_ratios.iter().enumerate() {
             ratio[2 + i] = *g;
         }
-        let mut ratio_rpm_per_mps = [0f32; 8];
-        let mut mps_per_rpm = [0.1f32; 8];
-        let mut accel_per_torque = [0f32; 8];
-        for i in 0..8 {
-            let r = sim.final_drive * ratio[i] * 60.0 / circumference;
-            ratio_rpm_per_mps[i] = r;
-            if r != 0.0 {
-                mps_per_rpm[i] = 1.0 / r;
-            }
-            // class multiplier {1.2 SILSPD | 1.05 manual | 1}: manual/AI variants not modelled → 1
-            accel_per_torque[i] = r * 0.1 * efficiency / mass;
-        }
         let torque = sim.torque_curve;
-        let top = gear_slots - 1;
-        let rpm_top = (ratio_rpm_per_mps[top] * top_speed).clamp(0.0, sim.redline_rpm);
-        let drag = torque_at(&torque, rpm_top) * accel_per_torque[top] / (top_speed * top_speed * top_speed);
-        let yaw_lever = 3.2 * sim.wheelbase_mm * 0.001;
-        Self {
+        let mut out = Self {
             name: sim.name.clone(),
             zone_masks: ZoneMasks::default(),
             wear: PartWearSet::default(),
@@ -181,7 +171,9 @@ impl CarSpecs {
             shift_ticks: sim.unknown_54,
             efficiency,
             front_drive: sim.unknown_5c_pct * 0.01,
-            ratio_rpm_per_mps,
+            final_drive: sim.final_drive,
+            gear_ratio: ratio,
+            ratio_rpm_per_mps: [0.0; 8],
             top_speed,
             redline: sim.redline_rpm,
             rev_rate: sim.unknown_98_pct * 0.01,
@@ -198,13 +190,20 @@ impl CarSpecs {
             transfer_div: t[11],
             lateral_div: t[16],
             circumference,
-            mps_per_rpm,
-            accel_per_torque,
-            drag,
-            yaw_lever,
-            inv_yaw_lever: 1.0 / yaw_lever,
-            inv_grip: 1.0 / t[1],
-            class: if race_class { 0 } else { 2 },
+            mps_per_rpm: [0.1; 8],
+            accel_per_torque: [0.0; 8],
+            drag: 0.0,
+            yaw_lever: 0.0,
+            inv_yaw_lever: 0.0,
+            inv_grip: 0.0,
+            // **2 for a race car, 0 for everything else** — this was the wrong way round here
+            // and in three notes. `CarSim_applyParts` 0x49CB50 compares `carInfo+0x2A8` with
+            // "GT1", "GT2", "GT3" and "935" through 0x5AE3C0, which returns **0 on a match**, so
+            // each `je 0x49CBE3` is the *match* arm and 0x49CBE9 stores **2**; the fall-through
+            // at 0x49CBD1, reached only when none matched, stores **0**. A race car therefore
+            // takes grip column 2 and friction-circle softness `{8, 8, 6}[2]` = 6, and a road car
+            // column 0 and 8 — the port had them swapped.
+            class: if race_class { 2 } else { 0 },
             pitch_ret: t[9] * 0.01,
             roll_ret: t[10] * 0.01,
             probe_offset: t[12] * 0.001,
@@ -213,12 +212,269 @@ impl CarSpecs {
             roll_gain: t[15] * 0.001,
             pitch_clamp: t[17],
             roll_clamp: t[18],
-        }
+        };
+        // 0x49CB50's tail, which the loader always runs: the three gear tables, the drag term, the
+        // yaw lever and 1/grip. `automatic` = `carinfo+0xC != 0`, which the `.sim` does not carry —
+        // the gearbox is the player's, so the loader's own pass is the automatic one and a manual
+        // box re-derives the tables through [`CarSpecs::rebuild_tables`].
+        out.rebuild_tables(true);
+        out
     }
 
     pub fn torque_at(&self, rpm: f32) -> f32 {
         torque_at(&self.torque, rpm)
     }
+
+    /// **The purchased parts, folded into the block** — `0x49CB50 … 0x49D28A`, the first half of
+    /// `CarSim_applyParts`. CONFIRMED, read instruction by instruction 2026-09-21.
+    ///
+    /// Runs on the block the `.sim` loader has just filled, **before** [`CarSpecs::apply_setup`].
+    /// Returns the ratio grip ended at over the grip it started with — `car+0x10D8`, which the
+    /// `.ais` loader rescales the AI's cornering table by (`loaders.md` §1.4).
+    ///
+    /// Two arms come before the loop. `family == "959"` sets `front_weight = 0.4675` outright
+    /// (0x49CCAB), and **families `959`, `928`, `GT2` and `GT3` skip the parts entirely**
+    /// (0x49CCC5…0x49CD07) — for those four the purchased list is ignored, whatever is in it.
+    ///
+    /// Then, for each of the twenty slots whose `kind` is not 0: `mass += +0x54`,
+    /// `top_speed /= 1 + 0.01·(+0x58)`, and one arm by `kind`. `+0xC0` and `+0xC4` are the two
+    /// tuning values, and in every arm **the value that leaves the block unchanged is 1** — which
+    /// is a good check on the record layout, and is what the standard brake, spring and shock
+    /// carry (`nfs5.prt`: kind 2 and 4 are 1…2.5, kind 5 is 0.8…2, kind 8 is 1.2…3).
+    ///
+    /// | kind | name | effect |
+    /// |---|---|---|
+    /// | 1 engine | `"Engine"` | replaces the whole 21-point torque curve with the part's own (`+0x110`), and **stops there** |
+    /// | 1 engine | `"Turbo"` / `"Supercharged"` | `induction = 1` / `2`, then falls through |
+    /// | 1 engine | anything else | `torque[i] += part_curve[i] · 0.67` |
+    /// | 2 brakes | | `brake_decel *= (c0 + 3)·0.25` |
+    /// | 3 gearbox | `"Gear Box"` | `shift_ticks = (i16)+0xEC`; `gear_slots = (i16)+0xEA + 2`; `final_drive = c0`; the eight raw ratios from `+0xF0` |
+    /// | 3 gearbox | anything else (`"Shifter"`) | `shift_ticks += (i16)+0xEC` |
+    /// | 4 springs | | `transfer_div = (c0 + 4)·transfer_div·0.2`; `lateral_div` likewise; `grip = (c0 + 15)·grip·0.0625`; `roll_gain /= (c0 + 3)·0.25`; **`probe_offset = c4·0.001`**, an overwrite — the spring's ride height in millimetres, 0/5/15/20 in the file |
+    /// | 5 shocks | | `pitch_ret /= (c0 + 4)·0.2`; `roll_ret` likewise; `grip = (c0 + 11)·grip/12` |
+    /// | 8 sway bars | | `transfer_div = (c0 + 4)·transfer_div·0.2`; `grip = (c0 + 11)·grip/12`; `roll_gain /= (c0 + 3)·0.25` |
+    /// | 6 aero | | `downforce_front *= 1 + c0·0.005`; `downforce_rear *= 1 + c4·0.005` |
+    /// | 9 tyres | | `G = 3·grip`, `u = (G + c0)/(G + 1)`, `v = (G + c4)/(G + 1)`; `grip = (u + v + 1)·grip/3`; `front_weight *= (2u/(u+v) + 1)·0.5`; and **`class = +0xC8`**, the grip-table column, which is 0, 1 or 2 in the file |
+    /// | 7, 10 | weight reduction, bodywork | nothing beyond the mass and the top-speed per cent — every one of those 108 records has `+0xC0 = +0xC4 = 0` |
+    ///
+    /// So `+0xC8` is the **tyre grip class** and not an induction type: the induction comes from the
+    /// engine part's *name*, and the four values `+0xC8` takes on kind-9 records are 0, 1 and 2.
+    ///
+    /// After the loop (0x49D212…0x49D28A) the top speed is rescaled by how much the torque peak
+    /// moved — `top_speed *= (peak_after/peak_before + 3)·0.25`, both peaks being `max(0, curve)`
+    /// over the 21 points — and the AI's steering lookahead by the grip ratio,
+    /// `bend_lookahead /= (ratio + 2)/3`. The port has no `+0x140` field, so that last division is
+    /// returned to the caller with the ratio rather than applied here.
+    ///
+    /// Not modelled: `specs[0x14C] = 1/redline` (0x49CC1A), which nothing reads back; and an engine
+    /// part's `+0xC0`, which holds a redline (5500…7300 in the file) that this arm never consumes.
+    pub fn apply_parts(&mut self, parts: &[&nfs_formats::career::Part], family: &str) -> f32 {
+        let peak_before = self.torque.iter().copied().fold(0.0, f32::max);
+        let grip_before = self.grip;
+        if family == "959" {
+            self.front_weight = 0.4675;
+        }
+        if !NO_PARTS_FAMILIES.contains(&family) {
+            for p in parts {
+                if p.kind == 0 {
+                    continue;
+                }
+                self.mass += p.mass_delta;
+                self.top_speed /= p.top_speed_pct * 0.01 + 1.0;
+                let (c0, c4) = (p.value_c0, p.boost);
+                match p.kind {
+                    1 => {
+                        if p.kind_name == "Engine" {
+                            self.torque = p.torque_curve;
+                        } else {
+                            match p.kind_name.as_str() {
+                                "Turbo" => self.induction = 1,
+                                "Supercharged" => self.induction = 2,
+                                _ => {}
+                            }
+                            for (t, a) in self.torque.iter_mut().zip(p.torque_curve) {
+                                *t += a * 0.67;
+                            }
+                        }
+                    }
+                    2 => self.brake_decel = (c0 + 3.0) * 0.25 * self.brake_decel,
+                    3 => {
+                        if p.kind_name == "Gear Box" {
+                            self.shift_ticks = p.gearbox_param as u32;
+                            self.gear_slots = (p.forward_gears + 2) as usize;
+                            self.final_drive = c0;
+                            self.gear_ratio = p.gear_ratios;
+                        } else {
+                            self.shift_ticks = self.shift_ticks.wrapping_add(p.gearbox_param as u32);
+                        }
+                    }
+                    4 => {
+                        self.transfer_div = (c0 + 4.0) * self.transfer_div * 0.2;
+                        self.lateral_div = (c0 + 4.0) * self.lateral_div * 0.2;
+                        self.grip = (c0 + 15.0) * self.grip * 0.0625;
+                        self.roll_gain /= (c0 + 3.0) * 0.25;
+                        self.probe_offset = c4 * 0.001;
+                    }
+                    5 => {
+                        self.pitch_ret /= (c0 + 4.0) * 0.2;
+                        self.roll_ret /= (c0 + 4.0) * 0.2;
+                        self.grip = (c0 + 11.0) * self.grip * (1.0 / 12.0);
+                    }
+                    8 => {
+                        self.transfer_div = (c0 + 4.0) * self.transfer_div * 0.2;
+                        self.grip = (c0 + 11.0) * self.grip * (1.0 / 12.0);
+                        self.roll_gain /= (c0 + 3.0) * 0.25;
+                    }
+                    6 => {
+                        self.downforce_front *= c0 * 0.005 + 1.0;
+                        self.downforce_rear *= c4 * 0.005 + 1.0;
+                    }
+                    9 => {
+                        let g = self.grip * 3.0;
+                        let u = (g + c0) / (g + 1.0);
+                        let v = (g + c4) / (g + 1.0);
+                        self.grip = (u + v + 1.0) * self.grip * (1.0 / 3.0);
+                        self.front_weight *= (2.0 * u / (u + v) + 1.0) * 0.5;
+                        self.class = p.grip_class as usize;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let peak_after = self.torque.iter().copied().fold(0.0, f32::max);
+        self.top_speed = (peak_after / peak_before + 3.0) * 0.25 * self.top_speed;
+        self.rebuild_tables(true);
+        self.grip / grip_before
+    }
+
+    /// **The seventeen car-setup sliders, folded into the block** — `0x49D290 … 0x49D62C`,
+    /// the second half of `CarSim_applyParts` 0x49CB50. CONFIRMED, read instruction by
+    /// instruction 2026-09-21.
+    ///
+    /// The sliders do not reach the physics as floats. The car-setup screen stores them in the
+    /// `FECar` at `+0x6D0 … +0x710`, seventeen consecutive floats in [`CAR_SETUP_NAMES`] order
+    /// (the constructor 0x4EED2D writes 50/50/50, three zeroes, 1.0, 30/30 and eight zeroes
+    /// there, and copies them again to `+0x714` as the reset copy); race setup 0x4EF188…0x4EF32F
+    /// pushes each through **0x4A5400** = `(int)(f × 65536)` — `_ftol`, so a **truncation** — into
+    /// the named registry parameter, and this block reads them back out of the per-player
+    /// `carinfo` record with `fild` and `× 2⁻¹⁶` ([0x5B253C]). [`fixed16`] is that round trip.
+    ///
+    /// | carinfo | slider | effect on the block |
+    /// |---|---|---|
+    /// | +0x114 / +0x118 `.FRONT/REARDOWNFORCE` | `FDownForce`, `RDownForce` | `pf = (v·0.02 + 1)·0.5` and `pr` likewise; `top_speed /= (pf + pr + 3)·0.2`; `downforce_front *= pf`; `downforce_rear *= pr` |
+    /// | +0xF0 `.FINALRATIO` | `Gear7` | `final_drive += v` |
+    /// | +0xF4, +0xFC…+0x110 `.REVERSERATIO`, `.FIRST…SIXTHRATIO` | `Gear0`, `Gear1…Gear6` | `gear_ratio[slot] += v`; the loop steps the block's own slots and **skips slot 1**, so carinfo `+0xF8` — the neutral — is the one dword of the eight nothing ever reads |
+    /// | +0x11C `.BRAKEBIAS` | `BrakeBias` | `front_brake += (trunc(fixed/100)·2⁻¹⁶ − 0.5)·0.5`, an **integer** divide of the fixed-point word (0x49D38C `imul 0x51EB851F`), not a float one |
+    /// | +0x128 `.STEERINGTOE` | `SteeringToe` | `steer_offset += v` |
+    /// | +0x134 `.SHOCKRATE` | `ShockRate` | read three times: `transfer_div = (v + 2)·transfer_div/3`; `grip = (transfer_div + 9)·0.1·grip`; `pitch_ret += (1 − v)·0.2` and `roll_ret` likewise; `roll_gain /= (transfer_div + 1)·0.5` |
+    /// | +0x124 `.SUSPENSIONTRAVEL` | `Suspension` | `r = v·0.001`; `bump_travel += r`; `grip *= 1 + r`; `roll_gain /= 1 + r` |
+    /// | +0x120 `.RIDEHEIGHT` | `RideHeight` | `probe_offset = v·0.001` — an **overwrite**, mm to metres, which is why every shipped `.sim` carries 0 there and the wheel probe still has an offset; then `roll_gain /= 6·probe_offset + 1` |
+    /// | +0x13C / +0x140 `.FRONT/REARTIREPRESSURE` | `FTirePressure`, `RTirePressure` | `a = v/30`, `b` likewise, and **each below 1.0 is multiplied by 10/11** (0x5B3354); `grip = (a + b + 8)·grip·0.1`; `front_weight *= (2a/(a+b) + 1)·0.5` |
+    ///
+    /// Every default is neutral: 50/50 gives `pf = pr = 1` and a divisor of 1, bias 50 gives
+    /// exactly 0, shock rate 1 leaves `transfer_div` alone and `grip ×(1+9)·0.1`, and 30 psi gives
+    /// `a = b = 1` and `grip ×(1+1+8)·0.1`.
+    ///
+    /// Not modelled, and deliberately: the two driver-name cheats that follow at 0x49D6F3 /
+    /// 0x49D84B (`"SILSPD"` multiplies every gear's acceleration by 1.2 and then grip by 1.2,
+    /// `roll_gain` by 0.8 and `roll_ret` by 10/11; `"ROLLEY"` grip by 1.5 and `roll_gain` by 1.33),
+    /// because this port has no typed driver name to trigger them. They are **not** exclusive with
+    /// the manual-gearbox 1.05 — the SILSPD arm falls through into it.
+    pub fn apply_setup(&mut self, setup: &[f32; 17], automatic: bool) {
+        // 0x49D290
+        let pf = (fixed16(setup[0]) * 0.02 + 1.0) * 0.5;
+        let pr = (fixed16(setup[1]) * 0.02 + 1.0) * 0.5;
+        self.top_speed /= (pf + pr + 3.0) * 0.2;
+        self.downforce_front *= pf;
+        self.downforce_rear *= pr;
+        // 0x49D32E, then the slot loop 0x49D346 — slot 1 (neutral) is skipped
+        self.final_drive += fixed16(setup[16]);
+        // `Gear0` is the reverse ratio and `Gear1 … Gear6` are first to sixth, so slider 9 + n
+        // lands on block slot n + 1 from first gear on, and the neutral slot has no slider at all.
+        for (slot, slider) in [(0usize, 9usize), (2, 10), (3, 11), (4, 12), (5, 13), (6, 14), (7, 15)] {
+            self.gear_ratio[slot] += fixed16(setup[slider]);
+        }
+        // 0x49D386 — the fixed-point word divided by 100 as an integer
+        let bias = (setup[2] * 65536.0).trunc() as i32 / 100;
+        self.front_brake += (bias as f32 / 65536.0 - 0.5) * 0.5;
+        // 0x49D3CF
+        self.steer_offset += fixed16(setup[5]);
+        // 0x49D3F3 — shock rate, read three times
+        let shock = fixed16(setup[6]);
+        self.transfer_div = (shock + 2.0) * self.transfer_div * (1.0 / 3.0);
+        self.grip = (self.transfer_div + 9.0) * 0.1 * self.grip;
+        self.pitch_ret += (1.0 - shock) * 0.2;
+        self.roll_ret += (1.0 - shock) * 0.2;
+        self.roll_gain /= (self.transfer_div + 1.0) * 0.5;
+        // 0x49D4CB — suspension travel, also read three times
+        let travel = fixed16(setup[4]) * 0.001;
+        self.bump_travel += travel;
+        self.grip = (travel + 1.0) * self.grip;
+        self.roll_gain /= travel + 1.0;
+        // 0x49D555 — ride height, an overwrite
+        self.probe_offset = fixed16(setup[3]) * 0.001;
+        self.roll_gain /= self.probe_offset * 6.0 + 1.0;
+        // 0x49D597 — the tyre pressures
+        let mut a = fixed16(setup[7]) * (1.0 / 30.0);
+        let mut b = fixed16(setup[8]) * (1.0 / 30.0);
+        if a < 1.0 {
+            a *= 0.909_091;
+        }
+        if b < 1.0 {
+            b *= 0.909_091;
+        }
+        self.grip = (a + b + 8.0) * self.grip * 0.1;
+        self.front_weight *= (2.0 * a / (a + b) + 1.0) * 0.5;
+        self.rebuild_tables(automatic);
+    }
+
+    /// **The derived tables, rebuilt** — `0x49D634 … 0x49D99D`, the tail every path through
+    /// `CarSim_applyParts` runs once the parts and the sliders have moved the block. CONFIRMED.
+    ///
+    /// * 0x49D634: `ratio'[slot] = final_drive · ratio · 60 / circumference` for all eight slots;
+    /// * 0x49D67D, for the `gear_slots` live slots only: `mps_per_rpm = 1/ratio'`, or **0.1** when
+    ///   the ratio is exactly 0 (0x49D6A4 stores `0x3DCCCCCD`), and
+    ///   `accel_per_torque = efficiency · (ratio'/mass · 0.1)`, times **1.05 when the gearbox is
+    ///   manual** — `carinfo+0xC == 0`, 0x49D733;
+    /// * 0x49D757 writes a fourth table, `ratio'[i]/redline` at `+0x150`, which **nothing in the
+    ///   image ever reads back**; it is not modelled;
+    /// * 0x49D87B: `drag = T(rpm_top) · accel_per_torque[top] / v_top³`, with
+    ///   `rpm_top = clamp(trunc(ratio'[top] · v_top), 0, redline)` — the truncation is `_ftol`
+    ///   at 0x49D88E and happens **before** the clamp;
+    /// * 0x49D934: `yaw_lever = wheelbase · 0.5 · 0.025 · 256` (= 3.2·wheelbase) and its inverse;
+    /// * 0x49D991: `inv_grip = 1 / grip`, which is why grip has to be settled first.
+    pub fn rebuild_tables(&mut self, automatic: bool) {
+        for i in 0..8 {
+            self.ratio_rpm_per_mps[i] = self.final_drive * self.gear_ratio[i] * 60.0 / self.circumference;
+        }
+        for i in 0..self.gear_slots.min(8) {
+            let r = self.ratio_rpm_per_mps[i];
+            self.mps_per_rpm[i] = if r == 0.0 { 0.1 } else { 1.0 / r };
+            let mut a = self.efficiency * (r / self.mass * 0.1);
+            if !automatic {
+                a *= 1.05;
+            }
+            self.accel_per_torque[i] = a;
+        }
+        let top = self.gear_slots - 1;
+        let rpm_top = (self.ratio_rpm_per_mps[top] * self.top_speed).trunc().min(self.redline).max(0.0);
+        self.drag = torque_at(&self.torque, rpm_top) * self.accel_per_torque[top] / (self.top_speed * self.top_speed * self.top_speed);
+        self.yaw_lever = self.wheelbase * 0.5 * 0.025 * 256.0;
+        self.inv_yaw_lever = 1.0 / self.yaw_lever;
+        self.inv_grip = 1.0 / self.grip;
+    }
+}
+
+/// The round trip every car-setup slider makes on its way into the physics: `0x4A5400` turns the
+/// float into 16.16 fixed point by truncating `f × 65536`, and 0x49D29C and its thirteen siblings
+/// read it back with `fild` and `× [0x5B253C] = 2⁻¹⁶`. Integer sliders come back exactly; a shock
+/// rate of 0.7 comes back as 0.699996948.
+/// The four AI families whose purchased parts `CarSim_applyParts` ignores outright — 0x49CCC5,
+/// 0x49CCDB, 0x49CCF1 and 0x49CD07, each an `je` straight past the loop to the tail.
+pub const NO_PARTS_FAMILIES: [&str; 4] = ["959", "928", "GT2", "GT3"];
+
+pub fn fixed16(v: f32) -> f32 {
+    (v * 65536.0).trunc() / 65536.0
 }
 
 /// Torque lookup: `idx = int(rpm*0.002)`, linear interpolation (CONFIRMED, 0x49E90C).

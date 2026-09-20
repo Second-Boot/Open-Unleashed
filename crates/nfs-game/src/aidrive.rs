@@ -85,14 +85,41 @@ pub fn heading_error(car: &AiCarState, aim: Vec3) -> f32 {
 
 /// `0x409570` — is the car out of control? `road` is the slice's A/B road extents. The speed floor
 /// comes from the **out-of-control** chain's `vel_limit_range` (0x409637 reads `[0x5E6D68]`, which is
-/// `0x5E6D48 + 0x20`), so with the shipped file it is 10 − 3 = 7 m/s.
-pub fn out_of_control(car: &AiCarState, ooc: &AiPhysics, heading_err: f32, road: (f32, f32)) -> bool {
+/// `0x5E6D48 + 0x20`), so with the shipped file it is 10 − 3 = 7 m/s. `bend` is [`road_bend`].
+///
+/// The clauses are in the binary's own order, which is also the order they short-circuit in:
+/// heading error (0x4095FE), the reverse sense (0x40960F), the speed floor (0x409645), the two road
+/// edges (0x409675 / 0x409699), **the bend ahead (0x4096A6)** and the lateral-speed pair
+/// (0x4096DC / 0x409700).
+///
+/// **Not modelled, and it is shut in the original too:** 0x4095A3 puts a branch *in front* of all of
+/// them — while `gGameTick < car+0x10A4` the only test is `|car+0xEC0| < 3.0` and the car is
+/// otherwise in control. Both controllers pin `car+0x10A4` to the current tick every tick
+/// (0x409788 unconditionally, 0x409DCC within 0x40 ticks of `car+0x45C`), so the window only opens
+/// for the ten ticks-times-sixty-four a cop's bust state grants at 0x4051F7, which this port has no
+/// equivalent of. `traffic.md` §17.8a.
+pub fn out_of_control(car: &AiCarState, ooc: &AiPhysics, heading_err: f32, road: (f32, f32), bend: f32) -> bool {
     heading_err.abs() > 0.25
         || car.sense < 0.0
         || car.speed.abs() < ooc.vel_limit_range - 3.0
         || car.lateral < -road.0
         || car.lateral > road.1
+        || bend.abs() > 0.8
         || (body_lateral_speed(car).abs() > 0.4 * car.speed_est && car.speed.abs() >= 15.0)
+}
+
+/// **How sharply the road turns in the next eight slices** — `0x40EDD0(car, car+0xEB0 · 8)`, the
+/// measure [`out_of_control`]'s sixth clause tests against `[0x5B24E8]` = 0.8.
+///
+/// It is `dot` of the **lateral** of the car's own slice with the **forward** of the slice eight
+/// along its direction of travel, in **x and z only** — 0x40EDFE multiplies `+0x30` by `+0x24` and
+/// `+0x28` by `+0x1C`, which are `lateral.z · forward.z + lateral.x · forward.x`. Zero on a straight
+/// road and ±1 at a right-angle turn, so `> 0.8` is a bend of about 53° over the 48 m the eight
+/// slices span. The slice arithmetic is `addSlices` with `link = −1` (0x40EDEA).
+pub fn road_bend(table: &SliceTable, slice: usize, dir: f32) -> f32 {
+    let ahead = table.add_graph(slice, if dir < 0.0 { -8 } else { 8 }, None);
+    let (a, b) = (&table.slices[slice.min(table.slices.len() - 1)], &table.slices[ahead.min(table.slices.len() - 1)]);
+    a.lateral.x * b.forward.x + a.lateral.z * b.forward.z
 }
 
 /// `car+0xD58` — the body-frame lateral speed.
@@ -366,19 +393,24 @@ mod tests {
         // the test reads the out-of-control chain's vel_limit_range, so the floor is 10 − 3 = 7 m/s
         let cfg = TrafficConfig::default().out_of_control;
         let c = car();
-        assert!(!out_of_control(&c, &cfg, 0.1, (11.0, 11.0)));
-        assert!(out_of_control(&c, &cfg, 0.3, (11.0, 11.0)), "a quarter turn off is out of control");
+        assert!(!out_of_control(&c, &cfg, 0.1, (11.0, 11.0), 0.0));
+        assert!(out_of_control(&c, &cfg, 0.3, (11.0, 11.0), 0.0), "a quarter turn off is out of control");
         let mut slow = c;
         slow.speed = 7.5;
-        assert!(!out_of_control(&slow, &cfg, 0.0, (11.0, 11.0)));
+        assert!(!out_of_control(&slow, &cfg, 0.0, (11.0, 11.0), 0.0));
         slow.speed = 6.5;
-        assert!(out_of_control(&slow, &cfg, 0.0, (11.0, 11.0)), "below vel_limit_range − 3");
+        assert!(out_of_control(&slow, &cfg, 0.0, (11.0, 11.0), 0.0), "below vel_limit_range − 3");
         let mut off = c;
         off.lateral = 12.0;
-        assert!(out_of_control(&off, &cfg, 0.0, (11.0, 11.0)), "off the road");
+        assert!(out_of_control(&off, &cfg, 0.0, (11.0, 11.0), 0.0), "off the road");
         let mut sliding = c;
         sliding.velocity = Vec3::new(8.0, 0.0, 16.0);
-        assert!(out_of_control(&sliding, &cfg, 0.0, (11.0, 11.0)), "sliding sideways at speed");
+        assert!(out_of_control(&sliding, &cfg, 0.0, (11.0, 11.0), 0.0), "sliding sideways at speed");
+        // the sixth clause, 0x4096A6 against `[0x5B24E8]` = 0.8: a bend of more than about 53° in the
+        // next eight slices, and the sign does not matter
+        assert!(!out_of_control(&c, &cfg, 0.0, (11.0, 11.0), 0.79));
+        assert!(out_of_control(&c, &cfg, 0.0, (11.0, 11.0), 0.81), "a sharp bend ahead");
+        assert!(out_of_control(&c, &cfg, 0.0, (11.0, 11.0), -0.81), "either way round");
     }
 
     #[test]
@@ -420,6 +452,7 @@ mod tests {
         assert_eq!(r3.sense, 1.0);
     }
 
+    #[test]
     fn the_out_of_control_controller_steers_toward_the_aim() {
         let cfg = TrafficConfig::default().out_of_control;
         let c = car();

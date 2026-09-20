@@ -17,6 +17,10 @@ use nfs_physics::vehicle::{Controls, Vehicle};
 
 pub struct AiDriver {
     pub data: AiCarData,
+    /// The `.ais` bend-speed curve as it was parsed, before `0x4A2DC0`'s per-track × per-tier
+    /// factor is applied to it — kept so `set_track` can re-scale from the original rather than
+    /// compound onto an already-scaled curve.
+    bend_speed_base: [f32; 40],
     /// carSpecs[0x13C]/[0x140]/[0x144] (raw `.sim` +0x13C..+0x144, i.e. `unknown_tail[19..22]`)
     pub k_lookahead: f32,
     pub k_steer: f32,
@@ -123,17 +127,79 @@ pub fn steer_factor(track: &str, family: &str, backwards: bool) -> f32 {
     }
 }
 
-/// Curve factor 0x4A2DC0 (1.0).
-const CURVE_FACTOR: f32 = 1.0;
+/// The car's **class tier**, 1…5 — `0x4A2BC0(family)`, compared against `carInfo+0x2A8`, the
+/// `nfs5.car +0x115` family key. Anything the chain does not name falls through to the `edi = 5`
+/// the function seeds at 0x4A2BCC.
+///
+/// The two `alps` rows are the original's: 935 and GT2 drop to tier 1 **on that track only**
+/// (0x4A2C1F and 0x4A2C4B each guard their family's tier-1 exit with a second `strcmp`).
+fn class_tier(family: &str, track: &str) -> u32 {
+    let f = family.to_ascii_uppercase();
+    let alps = track.eq_ignore_ascii_case("alps");
+    match f.as_str() {
+        "356" | "356A" | "356B" => 1,
+        "935" if alps => 1,
+        "GT2" if alps => 1,
+        "550A" | "928" | "930T" | "964" => 2,
+        "914" | "944" | "959" | "965T" => 3,
+        "993" | "993T" | "996" | "996T" | "GT2" | "GT3" | "BOXSTER" => 4,
+        _ => 5,
+    }
+}
+
+/// `0x4A2DC0`'s return value: the factor the **whole `.ais` bend-speed curve** is multiplied by,
+/// per track and per class tier (applied at 0x49CAF5, inside the 40-entry loop).
+///
+/// Rows verified instruction by instruction against the binary: **monaco1** (0x4A2F7C…0x4A2FB8),
+/// **alps** (0x4A37F5…0x4A384E), **autobahn** (0x4A3A9F…0x4A3AC6) and **industrial**
+/// (0x4A45AC…0x4A45BB). The rest come from a single reading pass over the same ladders and are
+/// marked HIGH rather than CONFIRMED in `ai.md`. The ladders mix `jne` and `jl`, which is how a
+/// tier can share its neighbour's value — alps gives tiers 3 and 4 both 1.2 through the `jl` at
+/// 0x4A3839.
+///
+/// An unknown track returns **1.0** (0x4A45C5 hands back the argument slot 0x4A2E0E seeded with
+/// 1.0), which is also what the port did for every track before this was read.
+fn curve_factor(track: &str, family: &str) -> f32 {
+    let tier = class_tier(family, track) as usize;
+    // tiers 1…5
+    let row: [f32; 5] = match track.to_ascii_lowercase().as_str() {
+        "monaco1" => [1.175, 1.22, 1.275, 1.325, 1.5],
+        "monaco2" => [1.175, 1.2, 1.275, 1.325, 1.6],
+        "monaco3" => [1.2, 1.225, 1.275, 1.325, 1.6],
+        "monaco4" => [1.2, 1.2, 1.275, 1.325, 1.375],
+        "monaco5" => [1.2, 1.2, 1.275, 1.325, 1.5],
+        "alps" => [1.0, 1.15, 1.2, 1.2, 1.3],
+        "autobahn" => [1.0, 1.1, 1.1, 1.2, 1.3],
+        "canyon" => [1.1, 1.1, 1.15, 1.15, 1.2],
+        "castle" => [1.0, 1.0, 1.05, 1.1, 1.1],
+        "coastal" => [1.1, 1.1, 1.2, 1.2, 1.3],
+        "farmland" => [1.0, 1.0, 1.05, 1.1, 1.2],
+        "foothills" => [1.2, 1.2, 1.25, 1.3, 1.4],
+        "forest" => [1.0, 1.0, 1.05, 1.15, 1.25],
+        "industrial" => [1.0, 1.0, 1.0, 1.0, 1.1],
+        _ => [1.0; 5],
+    };
+    row[tier - 1]
+}
+
+/// `monaco3` is the one track whose factor depends on the direction — its two ladders are at
+/// 0x4A311A (backwards) and 0x4A3258 (forwards).
+fn curve_factor_dir(track: &str, family: &str, backwards: bool) -> f32 {
+    if backwards && track.eq_ignore_ascii_case("monaco3") {
+        let tier = class_tier(family, track) as usize;
+        return [1.15, 1.15, 1.2, 1.325, 1.6][tier - 1];
+    }
+    curve_factor(track, family)
+}
 
 impl AiDriver {
     pub fn new(data: AiCarData, specs: &CarSpecs, sim_tail: &[f32; 22]) -> Self {
-        Self { data, k_lookahead: sim_tail[19], k_steer: sim_tail[20], k_steer_base: sim_tail[20], k_angle: sim_tail[21], stuck_ticks: 0, wrong_way: false, target_speed: 0.0, skill_mean: [1.0; 4], skill_range: [0.0; 4], band: None, skill: 0, catchup: None, last_node: None, link: None, preferred_segment: None, speed_factor: 1.0, rng: 0x1234_5679, wf_div: 12.0, track: String::new(), backwards: false, dbg_n: 0, dbg_offset: 0.0, dbg_dot: 0.0 }
+        Self { data, bend_speed_base: [0.0; 40], k_lookahead: sim_tail[19], k_steer: sim_tail[20], k_steer_base: sim_tail[20], k_angle: sim_tail[21], stuck_ticks: 0, wrong_way: false, target_speed: 0.0, skill_mean: [1.0; 4], skill_range: [0.0; 4], band: None, skill: 0, catchup: None, last_node: None, link: None, preferred_segment: None, speed_factor: 1.0, rng: 0x1234_5679, wf_div: 12.0, track: String::new(), backwards: false, dbg_n: 0, dbg_offset: 0.0, dbg_dot: 0.0 }
             .tap(|d| {
-                // curve factor applies to the speed curve (§2.1); default 1.0
-                for v in d.data.bend_speed.iter_mut() {
-                    *v *= CURVE_FACTOR;
-                }
+                // The curve factor is per track *and* per car class, so it cannot be applied here
+                // — `set_track` does it, over a pristine copy of the curve so that re-entering a
+                // track does not compound it.
+                d.bend_speed_base = d.data.bend_speed;
                 let _ = specs;
             })
     }
@@ -146,6 +212,11 @@ impl AiDriver {
         // `carSpecs[0x140] *= 0x4A2950(family)` (0x49CB16) — the steering factor is per track and
         // per car family, and 1.0 unless the table names the pair
         self.k_steer = self.k_steer_base * steer_factor(track, family, backwards);
+        // …and `0x4A2DC0`'s return value scales the whole bend-speed curve (0x49CAF5)
+        let f = curve_factor_dir(track, family, backwards);
+        for (v, base) in self.data.bend_speed.iter_mut().zip(self.bend_speed_base.iter()) {
+            *v = base * f;
+        }
     }
 
     /// Speed estimate `car+0x35C = max(|vx|,|vz|) + 0.25·min(|vx|,|vz|)` used by the AI.
@@ -449,5 +520,75 @@ mod tests {
         assert!((AiDriver::BAND_MULT[2] - 0.95).abs() < 1e-6);
         // and the window tightens as the difficulty rises
         assert!(AiDriver::LAP_BAND[2] < AiDriver::LAP_BAND[1], "the window tightens as the difficulty rises");
+    }
+}
+
+#[cfg(test)]
+mod curve_factor_tests {
+    use super::{class_tier, curve_factor, curve_factor_dir};
+
+    /// `0x4A2BC0`'s five tiers, including the two families that drop a tier on alps only.
+    #[test]
+    fn the_class_tiers_are_the_five_the_chain_assigns() {
+        for f in ["356", "356A", "356B"] {
+            assert_eq!(class_tier(f, "canyon"), 1, "{f}");
+        }
+        for f in ["550A", "928", "930T", "964"] {
+            assert_eq!(class_tier(f, "canyon"), 2, "{f}");
+        }
+        for f in ["914", "944", "959", "965T"] {
+            assert_eq!(class_tier(f, "canyon"), 3, "{f}");
+        }
+        for f in ["993", "993T", "996", "996T", "GT2", "GT3", "BOXSTER"] {
+            assert_eq!(class_tier(f, "canyon"), 4, "{f}");
+        }
+        // unnamed families take the seeded 5 — the GT1 and the 935 among them
+        assert_eq!(class_tier("GT1", "canyon"), 5);
+        assert_eq!(class_tier("935", "canyon"), 5);
+        // …but 935 and GT2 are tier 1 on alps, and nowhere else (0x4A2C1F / 0x4A2C4B)
+        assert_eq!(class_tier("935", "alps"), 1);
+        assert_eq!(class_tier("GT2", "alps"), 1);
+        assert_eq!(class_tier("GT2", "monaco1"), 4);
+    }
+
+    /// The four rows read instruction by instruction, and the unknown-track default.
+    #[test]
+    fn the_verified_rows_match_the_ladders() {
+        // monaco1, 0x4A2F7C…0x4A2FB8
+        assert_eq!(curve_factor("monaco1", "356"), 1.175);
+        assert_eq!(curve_factor("monaco1", "964"), 1.22);
+        assert_eq!(curve_factor("monaco1", "944"), 1.275);
+        assert_eq!(curve_factor("monaco1", "993"), 1.325);
+        assert_eq!(curve_factor("monaco1", "GT1"), 1.5);
+        // alps, 0x4A37F5…0x4A384E — the `jl` at 0x4A3839 gives tiers 3 and 4 the same value
+        assert_eq!(curve_factor("alps", "356"), 1.0);
+        assert_eq!(curve_factor("alps", "964"), 1.15);
+        assert_eq!(curve_factor("alps", "944"), 1.2);
+        assert_eq!(curve_factor("alps", "993"), 1.2);
+        assert_eq!(curve_factor("alps", "GT1"), 1.3);
+        // and on alps a 935 is tier 1, so it gets the slowest row
+        assert_eq!(curve_factor("alps", "935"), 1.0);
+        // autobahn, 0x4A3A9F…0x4A3AC6 — the `jl` puts tiers 2 and 3 together
+        assert_eq!(curve_factor("autobahn", "964"), 1.1);
+        assert_eq!(curve_factor("autobahn", "944"), 1.1);
+        assert_eq!(curve_factor("autobahn", "993"), 1.2);
+        // industrial, 0x4A45AC — only tier 5 is not 1.0
+        assert_eq!(curve_factor("industrial", "993"), 1.0);
+        assert_eq!(curve_factor("industrial", "GT1"), 1.1);
+        // an unknown track is 1.0 for everyone (0x4A45C5)
+        assert_eq!(curve_factor("skidpad", "GT1"), 1.0);
+    }
+
+    /// Only monaco3 changes with the direction (0x4A311A backwards, 0x4A3258 forwards).
+    #[test]
+    fn only_monaco3_is_direction_dependent() {
+        for t in ["monaco1", "alps", "canyon", "industrial"] {
+            for f in ["356", "993", "GT1"] {
+                assert_eq!(curve_factor_dir(t, f, false), curve_factor_dir(t, f, true), "{t}/{f}");
+            }
+        }
+        assert_eq!(curve_factor_dir("monaco3", "356", false), 1.2);
+        assert_eq!(curve_factor_dir("monaco3", "356", true), 1.15);
+        assert_eq!(curve_factor_dir("monaco3", "944", true), 1.2);
     }
 }

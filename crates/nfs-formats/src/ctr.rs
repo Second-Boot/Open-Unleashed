@@ -215,7 +215,17 @@ impl ControlLibrary {
         let mut lib = ControlLibrary::default();
         for text in files {
             let c = Control::parse(&text);
-            if !c.id.is_empty() {
+            // **Both keys are mandatory.** The registry builder 0x52C430 pulls `id` and
+            // `description` out of section 0 (0x52C635 / 0x52C644) and skips the file unless
+            // both came back non-null — `test ebp,ebp; je 0x52C718` at 0x52C656 and
+            // `test ebx,ebx; je 0x52C718` at 0x52C65E. Of the 77 shipped `*.ctr` / `*.scr`
+            // files six register nothing: five are zero bytes (`3DTrack.Ctr`,
+            // `ComboBoxSlider.ctr`, `GotoRect.ctr`, `GraphicsComboBoxSlider.ctr`,
+            // `TrackLarge2dSpline.ctr`) and `UserNameInputBox.ctr` is a comment that says so.
+            // 71 register. The key is the `id=` line, never the file name — `ComboBox.ctr`
+            // carries `NFS5.ComboBoxSlider`, which is 97 of the shipped widgets, while the
+            // file actually called `ComboBoxSlider.ctr` is empty.
+            if !c.id.is_empty() && !c.description.is_empty() {
                 lib.controls.insert(c.id.to_lowercase(), c);
             }
         }

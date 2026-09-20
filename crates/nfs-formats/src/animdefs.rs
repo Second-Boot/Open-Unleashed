@@ -43,19 +43,59 @@ impl Piece {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+/// One `SECTION:ANIM`. The parser is **0x47DCF0**, and the record it fills is
+/// `+0x00 mass, +0x08 radius, +0x0C audioType, +0x10 collideType, +0x14 drivethru,
+/// +0x15 triggerable, +0x16 dynamicLight, +0x18 piece count, +0x80 velocityFactor,
+/// +0x84 frameTickOffset, +0x88 ticksPerVertFrame`, zeroed at 0x47DD5D except **radius = 0.5**
+/// (0x47DD62) and **ticksPerVertFrame = 8** (0x47DD8D).
+#[derive(Debug, Clone, PartialEq)]
 pub struct AnimDef {
     /// the scene-object tag, e.g. `DOC2`, `CONE`, `RHEL`
     pub tag: String,
+    /// `collideType` — 0x47E0A2/0x47E0EF/0x47E13E store `kSmackable` 3, `kCylinder` 1 and
+    /// `kBox` 2 at `+0x10`; anything else leaves the 0 the record was zeroed with.
     pub collide_type: String,
+    /// `audioType` — `+0x0C`, the thirteen `kAud…` names in order: `kAudSign` 0, `kAudMetalSign`
+    /// 1, `kAudGlass` 2, `kAudWoodbox` 3, `kAudPylon` 4, `kAudTree` 5, `kAudBush` 6,
+    /// `kAudCarBody` 7, `kAudWood` 8, `kAudSnow` 9, `kAudIce` 10, `kAudEarth` 11, `kAudRock` 12.
     pub audio_type: String,
     pub mass: f32,
+    /// `radius` — **0.5** when the file does not say (0x47DD62).
     pub radius: f32,
+    /// `ticksPerVertFrame` — **8** when the file does not say (0x47DD8D).
     pub ticks_per_vert_frame: Option<u32>,
     pub triggerable: bool,
     pub dynamic_light: bool,
+    /// `drivethru` / `drivethrough` — both spellings write the same byte `+0x14` (0x47E6CE and
+    /// 0x47E6F3). Only `BUSH` carries it in the shipped file, and no scene places a `BUSH`.
+    pub drive_through: bool,
+    /// `velocityFactor` — `+0x80`, **scaled by a thousandth on the way in** (0x47E618 multiplies
+    /// the stored float by `[0x5B3060]` = 0.001), so `BBOX`'s `velocityFactor=18` is **0.018**.
+    /// Only `BBOX` carries it, and no scene places a `BBOX`.
+    pub velocity_factor: f32,
+    /// `frameTickOffset` — `+0x84`. No shipped definition sets it.
+    pub frame_tick_offset: i32,
     /// pieces with the `speed=` they were listed under
     pub pieces: Vec<(f32, Piece)>,
+}
+
+impl Default for AnimDef {
+    fn default() -> Self {
+        Self {
+            tag: String::new(),
+            collide_type: String::new(),
+            audio_type: String::new(),
+            mass: 0.0,
+            radius: 0.5,
+            ticks_per_vert_frame: Some(8),
+            triggerable: false,
+            dynamic_light: false,
+            drive_through: false,
+            velocity_factor: 0.0,
+            frame_tick_offset: 0,
+            pieces: Vec::new(),
+        }
+    }
 }
 
 impl AnimDef {
@@ -167,6 +207,9 @@ impl AnimDefs {
                 "tickspervertframe" => d.ticks_per_vert_frame = v.parse().ok(),
                 "triggerable" => d.triggerable = v != "0",
                 "dynamiclight" => d.dynamic_light = v != "0",
+                "drivethru" | "drivethrough" => d.drive_through = v != "0",
+                "velocityfactor" => d.velocity_factor = v.parse().unwrap_or(0.0) * 0.001,
+                "frametickoffset" => d.frame_tick_offset = v.parse().unwrap_or(0),
                 "speed" => speed = v.parse().unwrap_or(0.0),
                 _ => {}
             }
@@ -180,6 +223,26 @@ impl AnimDefs {
 mod tests {
     use super::*;
 
+    /// The defaults the record is zeroed with (0x47DD5D) — radius 0.5, eight ticks a vertex
+    /// frame — and the three keys the parser gained with §7.2: `drivethrough`, `velocityFactor`
+    /// and `frameTickOffset`.
+    #[test]
+    fn the_defaults_and_the_three_late_keys() {
+        let d = AnimDefs::parse(SAMPLE);
+        let cone = d.get("CONE").unwrap();
+        assert_eq!(cone.radius, 0.5, "unset radius is 0.5, not 0");
+        assert_eq!(cone.ticks_per_vert_frame, Some(8));
+        assert!(!cone.drive_through);
+        assert_eq!(cone.velocity_factor, 0.0);
+        let bush = d.get("BUSH").unwrap();
+        assert_eq!(bush.radius, 1.0);
+        assert!(bush.drive_through, "drivethrough= writes the same byte as drivethru=");
+        // 0x47E618 scales it by 0.001 on the way in
+        assert!((bush.velocity_factor - 0.018).abs() < 1e-6, "{}", bush.velocity_factor);
+        assert_eq!(bush.frame_tick_offset, 0);
+        assert_eq!(d.get("DOC2").unwrap().ticks_per_vert_frame, Some(3));
+    }
+
     const SAMPLE: &str = r#"
 // a comment
 SECTION:ANIM
@@ -189,6 +252,16 @@ SECTION:ANIM
 	audioType=kAudPylon;
 	dynamicLight=1;
 	mass=20;
+}
+
+SECTION:ANIM
+{
+	tag=BUSH;
+	CollideType=kCylinder;
+	Radius=1;
+	AudioType=kAudBush;
+	drivethrough=1;
+	velocityFactor=18;
 }
 
 SECTION:ANIM	//	Docker just walking
@@ -235,7 +308,7 @@ SECTION:ANIM
     #[test]
     fn sections_and_their_pieces() {
         let d = AnimDefs::parse(SAMPLE);
-        assert_eq!(d.len(), 3);
+        assert_eq!(d.len(), 4);
 
         let cone = d.get("CONE").unwrap();
         assert_eq!((cone.collide_type.as_str(), cone.audio_type.as_str(), cone.mass), ("kSmackable", "kAudPylon", 20.0));

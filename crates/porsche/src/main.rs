@@ -235,12 +235,21 @@ impl Hud {
 
     /// Results table (HBillBoard, hud.md §5/§9): rank, NAME, CAR, BEST LAP, TIME; dashes for no time.
     /// `rows` = (name, car, best lap ticks, total ticks) in finishing order; `player` = the player's row.
+    /// `HRaceSummary` 0x42BCD0 / 0x42C080: the billboard's four columns and eight ordinal rows.
+    /// The column headers are `FEStrings` **18111…18114** (`NAME`, `CAR`, `BEST LAP`, `TIME`), the
+    /// row labels **18116…18123** (`1st`…`8th`), and a car with no time prints
+    /// `"--------------"` rather than a dash. `title` is the billboard's, by game type: 18130
+    /// `Race Summary`, 18129 `Single Race`, 18169 `Knockout`, 18175 `Quick Knockout`
+    /// (`RE/notes/hud.md` §5). The box's own geometry is still this port's — see the same section.
     pub fn results_sprites(
         &self,
         out: &mut Vec<Sprite>,
         aspect: f32,
         rows: &[(String, String, Option<u64>, Option<u64>)],
         player: usize,
+        title: &str,
+        head: &[String; 4],
+        ord: &[String],
     ) {
         if self.font.is_none() {
             return;
@@ -249,11 +258,10 @@ impl Hud {
         let (x, y, w, h) = (60.0, 120.0, 520.0, 26.0 + 20.0 * n + 24.0);
         self.tray(out, aspect, x, y, w, h);
         let cols = [x + 8.0, x + 46.0, x + 190.0, x + 380.0, x + 450.0];
-        let head = ["", "NAME", "CAR", "BEST LAP", "TIME"];
+        self.text(out, aspect, title, x + 8.0, y - 16.0, 13.0, HUD_ORANGE);
         for (i, t) in head.iter().enumerate() {
-            self.text(out, aspect, t, cols[i], y + 6.0, 11.0, HUD_GREY);
+            self.text(out, aspect, t, cols[i + 1], y + 6.0, 11.0, HUD_GREY);
         }
-        let ord = ["1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th"];
         for (k, (name, car, best, total)) in rows.iter().enumerate() {
             let yy = y + 26.0 + 20.0 * k as f32;
             let color = if k == player {
@@ -261,12 +269,13 @@ impl Hud {
             } else {
                 [1.0, 1.0, 1.0, 0.95]
             };
+            let none = || "--------------".to_string();
             let cells = [
-                ord[k.min(7)].to_string(),
+                ord.get(k).cloned().unwrap_or_default(),
                 name.chars().take(18).collect::<String>(),
                 car.chars().take(24).collect::<String>(),
-                best.map(format_ticks).unwrap_or_else(|| "-".into()),
-                total.map(format_ticks).unwrap_or_else(|| "-".into()),
+                best.map(format_ticks).unwrap_or_else(none),
+                total.map(format_ticks).unwrap_or_else(none),
             ];
             for (i, t) in cells.iter().enumerate() {
                 self.text(out, aspect, t, cols[i], yy, 12.0, color);
@@ -787,6 +796,61 @@ impl App {
     /// combos from the car table the caption's `m.cars[m.car_idx]` indexes, the track combos from
     /// `m.tracks`, the paint combos from the selected car's paint sets, and the four counted
     /// settings from the clamps their own steppers carry. §4.91.
+    /// Every car on the used-car lot — the vector at `[0x691B88]`. It holds **both** the cars the
+    /// game generates (0x4F80C0) and the player's own listings, which `0x4F91C0` appends to the
+    /// same vector with `car+0x6A0 = 1`. This port keeps the two apart — generated cars in
+    /// `Career::market`, listings in the garage under an `asking_price` — so it chains them, which
+    /// matches the original's contents but not the order it happens to have appended them in.
+    fn used_cars(&self) -> Vec<&nfs_game::career::OwnedCar> {
+        let Some(c) = self.career.as_ref() else { return Vec::new() };
+        c.career.market.iter().chain(c.career.garage.iter().filter(|o| o.asking_price.is_some())).collect()
+    }
+
+    /// The car the used-car screens are on — `UsedCar.Car`'s current row.
+    fn used_car(&self) -> Option<&nfs_game::career::OwnedCar> {
+        let all = self.used_cars();
+        all.get(self.usedcar_sel.min(all.len().saturating_sub(1))).copied()
+    }
+
+    /// The catalogue records behind the player's garage, in save order — `OwnedCars.Car`'s own
+    /// list. Its accessor (`FEOwnedCarAccessor`, vtable 0x5B7868) counts
+    /// `(end − begin) / 4` of the vector its `[this+0x2C]` thunk hands back (0x4F5CBD) and reads
+    /// row `i` as `begin[i] + 6` (0x4F5C5F) — the FE car object's `+4` record plus its `+2` name.
+    fn garage_cars(&self) -> Vec<&nfs_formats::fedata::CarCatalogEntry> {
+        let Some(c) = self.career.as_ref() else { return Vec::new() };
+        c.career.garage.iter().filter_map(|o| c.tables.car(o.car_id)).collect()
+    }
+
+    /// The garage half of a car list, with `FEOwnedCarAccessor`'s headings — §4.144. Pushes a
+    /// `GroupHeading` for the era **and** the class when the era changes, one for the class when
+    /// only the class does, then the car's own row; returns the row index of `select`.
+    fn garage_rows(&self, rows: &mut Vec<ListRow>, short: bool, select: usize) -> Option<usize> {
+        let mut at = None;
+        let mut prev: Option<(u32, u32)> = None;
+        for (i, e) in self.garage_cars().into_iter().enumerate() {
+            let key = (e.era_string_id, e.class_string_id);
+            let heading = |id: u32| ListRow::GroupHeading(self.fe_strings.get(id).unwrap_or_default().to_uppercase());
+            match prev {
+                None => {
+                    rows.push(heading(key.0));
+                    rows.push(heading(key.1));
+                }
+                Some(p) if p.0 != key.0 => {
+                    rows.push(heading(key.0));
+                    rows.push(heading(key.1));
+                }
+                Some(p) if p.1 != key.1 => rows.push(heading(key.1)),
+                _ => {}
+            }
+            prev = Some(key);
+            if i == select {
+                at = Some(rows.len());
+            }
+            rows.push(ListRow::Text(if short { e.family.to_uppercase() } else { e.display_name.to_uppercase() }));
+        }
+        at
+    }
+
     fn combo_rows(&self, name: &str) -> Option<(Vec<ListRow>, Option<usize>)> {
         let (base, modifier) = match name.split_once('(') {
             Some((b, m)) => (b.trim(), m.trim_end_matches(')').trim()),
@@ -798,9 +862,79 @@ impl App {
             Some((rows, Some((cur - lo).max(0) as usize)))
         };
         match base {
+            // **`zMergedList.Car` is two lists, not one.** `FEMergedCarListAccessor` (vtable
+            // 0x5B773C) holds list A at `[this+0x28]` and list B at `[this+0x2C]`. Its rebuild
+            // 0x4F4DB0 rebuilds both and then sets its own count to `A.count + B.count`
+            // (0x4F4DD6 `add edi, eax` into 0x4BC310), and its row text 0x4F4A90 answers
+            // `i < A.count ? A.row(i) : B.row(i − A.count)`. Its one construction, 0x4F2278,
+            // passes the owning object's `[esi+0x14]` and `[esi+4]`, which the same registration
+            // built as **`OwnedCars.Car`** (0x4F1ED2) and **`GenericCar.Car`** (0x4F20C5). Both
+            // sub-lists' row text is the car record's name field — `owned+6` at 0x4F5C5F and
+            // `record+2` at 0x4F300F, which is the same `display_name`. So the drop-down is the
+            // player's garage first, then the whole catalogue. `RE/notes/controls.md` §4.133.
+            //
+            // **And its garage half is grouped.** Slot 26 (0x4F4D40) routes the row height to
+            // `A->slot26(i)` below `A.count` and `B->slot26(i − A.count)` above it, and slot 25
+            // (0x4F4D20) is `A->slot25() + B->slot25()` — the two lists' heights added. List A is
+            // `OwnedCars.Car`, whose rows are 42 / 28 / 14 with era and class headings (§4.144),
+            // so the merged drop-down carries those headings over its first half and stays flat
+            // over the catalogue. §4.148.
+            "zMergedList.Car" => {
+                let short = modifier == "SHORT";
+                let mut rows: Vec<ListRow> = Vec::new();
+                self.garage_rows(&mut rows, short, usize::MAX);
+                let a = rows.len();
+                rows.extend(m.cars.iter().map(|c| {
+                    ListRow::Text(if short { c.family.to_uppercase() } else { c.display_name.to_uppercase() })
+                }));
+                // the port's selection is an index into the catalogue (list B), so it sits at
+                // `A.count + car_idx` in the merged numbering
+                Some((rows, Some(a + m.car_idx)))
+            }
             // the car tables — `(SHORT)` is the family name, the plain form the display name,
             // exactly as the caption resolves them
-            "zMergedList.Car" | "OpponentCar.Car" | "UsedCar.Car" | "PrizeCars.Car" | "OwnedCars.Car"
+            // `usedcars.lay`'s `ID_CHOOSEUSEDBOX` is a combo on `UsedCar.Car(SHORT)` — the market,
+            // one row per generated car, not the catalogue
+            "UsedCar.Car" => {
+                let c = self.career.as_ref()?;
+                let rows = self
+                    .used_cars()
+                    .into_iter()
+                    .filter_map(|o| c.tables.car(o.car_id))
+                    .map(|e| ListRow::Text(if modifier == "SHORT" { e.family.to_uppercase() } else { e.display_name.to_uppercase() }))
+                    .collect::<Vec<_>>();
+                let cur = self.usedcar_sel.min(rows.len().saturating_sub(1));
+                Some((rows, Some(cur)))
+            }
+            // **`OpponentCar.Car` is not a car list.** `FEOpponentCarAccessor`'s row text
+            // (0x4F5720) is a jump table over five `FEStrings` ids — 640 `same car`, 642
+            // `same era`, 643 `same class`, 644 `same era/class`, 641 `random car`, in that row
+            // order — and its own `slot25` answers **70**, five rows of fourteen. The value the
+            // widget carries is the row index, which is what `[accessor+0x33C4]` holds and what
+            // `nfs_game::opponents::OpponentChoice::from_index` reads (`modes.md` §1.1a).
+            "OpponentCar.Car" => {
+                let rows = nfs_game::opponents::OpponentChoice::ROWS
+                    .iter()
+                    .map(|c| ListRow::Text(self.fe_strings.get(c.string_id()).unwrap_or_default().to_uppercase()))
+                    .collect();
+                Some((rows, Some((m.opp_car as usize).min(4))))
+            }
+            // **The garage picker is the garage, and it is grouped.** `garage.lay`'s
+            // `ID_CHOOSECARBOX` and `paintshop.lay`'s `ID_COMBOBOX` are `OwnedCars.Car(SHORT)`,
+            // and `FEOwnedCarAccessor`'s row heights (slot 26, **0x4F60F0**) are **42** for the
+            // first row and for any row whose **era** differs from the one above it, **28** when
+            // only its **class** differs, and **14** otherwise. The painter 0x4F5D48 draws the
+            // heading block for exactly those changes — two rules 13 apart with
+            // `FEStrings[the id]` between them — and the ids are the FE car object's `+0x1B4` and
+            // `+0x1B0`, which are the record's `+0x1B0` **era** and `+0x1AC` **class** (the
+            // object holds the record at +4, `savegame.md` §4.7a). §4.144.
+            "OwnedCars.Car" => {
+                let c = self.career.as_ref()?;
+                let mut rows: Vec<ListRow> = Vec::new();
+                let at = self.garage_rows(&mut rows, modifier == "SHORT", c.car_sel.min(c.career.garage.len().saturating_sub(1)));
+                Some((rows, at))
+            }
+            "PrizeCars.Car"
             | "DealerCar.Car" | "GenericCar.Car" | "CARSETTINGS.CAR" | "GenericCar2.Car" => {
                 let rows = m
                     .cars
@@ -1403,6 +1537,8 @@ struct App {
     particle_draw: Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
     /// the `SHAD` blob every car casts on the ground (0x43B820)
     shadow_draw: Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
+    /// One dynamic four-vertex mesh per shadow on screen — the quad 0x43B5B0 rebuilds every frame.
+    shadow_meshes: Vec<nfs_renderer::MeshId>,
     /// `CARG`, the glare slot 0 of every light kind in the table at 0x5CD73C
     glare_draw: Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
     /// trackside cameras and the triggers that switch them (`RE/notes/race-logic.md` §3.3)
@@ -1512,9 +1648,14 @@ struct App {
     /// `[0x5DBA44]` — which model group the chronicle is on, 0…4, switched by the five buttons of
     /// [`CHRONICLE_GROUP_BUTTONS`] (§4.111).
     chronicle_group: usize,
+    /// `[FEChronicleMainBoxControl + 0x154]` — the timeline column a click has put the chronicle
+    /// on, `None` while nothing has been clicked (§4.120).
+    chronicle_col: Option<usize>,
     /// `[FEUsedCarsScreen + 0x290]` — whether `usedcars.lay` is on the parts panel rather than
     /// the damage one. The constructor leaves it clear (§4.113).
     usedcars_showparts: bool,
+    /// Which market car `UsedCar.Car` is on — the used-car list's current row.
+    usedcar_sel: usize,
     /// Which row of `Parts.AllParts` the player has clicked — the accessor's own current index in
     /// the original, which its refresh reads back through `slot27` (§4.114).
     parts_sel: Option<usize>,
@@ -1582,6 +1723,17 @@ fn with_thousands(n: i64) -> String {
         out.insert(0, '-');
     }
     out
+}
+
+/// The row index of a `Knockout.TrackNumber(<n><FIELD>)` reference, if that is what this is.
+///
+/// `locationsetup.lay` names the one accessor seven times with the row written into the argument
+/// (`controls.md` §4.x), and `FEKnockoutTrackNumberAccessor`'s getter compares that row against
+/// `Game.NumKOOpponents` at 0x4BA7CF before it looks anything up.
+fn ko_row_of(src: &str) -> Option<u32> {
+    let arg = src.split_once("Knockout.TrackNumber(")?.1;
+    let digits: String = arg.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 fn is_network_layout(name: &str) -> bool {
@@ -1724,6 +1876,9 @@ impl App {
             // the price of the car the dealer screen is on: 0x5062FC takes `DealerCar.Car`, asks it
             // for the record (vtable +0x90), runs it through the age curve 0x4EE220 — which is the
             // port's own `dealer_price` — and prints the result with 0x4DBF80's thousands commas.
+            // `0x506250`'s first arm: `"CASH"` is `0x4DBF80(0x5012D0())` — the player's money
+            // through the thousands formatter. `NFS5.ACCOUNTTHING` is its only consumer (§4.128).
+            "Tournament.Data" if modifier == "CASH" => with_thousands(career?.career.money as i64),
             "Tournament.Data" if modifier == "DEALERCARPRICE" => {
                 let c = self.career.as_ref()?;
                 let car = self.logo_car(Some("DealerCar.Car"), None)?;
@@ -1799,7 +1954,8 @@ impl App {
             }
             // the car-compare screen's five numbers — `CarCompare.Data(<n>CarCompareCar<m>)`, the
             // same source name its bars read (`fn compare_rating`)
-            "CarCompare.Data" => self.compare_rating(modifier)?.to_string(),
+            // 0x50E94C prints it with **`"%02d"`** — a rating under ten reads `05`, not `5`
+            "CarCompare.Data" => format!("{:02}", self.compare_rating(modifier)?),
             // the network screens (`netplay::Lobby`): the names come out of the layouts themselves
             "Comms.IP" => self.lobby.as_ref()?.ip.clone(),
             "Comms.Data" => {
@@ -2010,8 +2166,13 @@ impl App {
                     "TRACKNUMBER" => (row + 1).to_string(),
                     "TRACKNAME" => m.tracks.get(slot.track_idx)?.to_uppercase(),
                     "TRACKLAPS" => slot.laps.to_string(),
-                    "TRACKTRAFFIC" => self.fe_strings.get(TRAFFIC_OPTIONS[(slot.traffic as usize).min(3)])?.to_string(),
-                    "TRACKDIRECTION" => self.fe_strings.get(DIRECTION_OPTIONS[usize::from(slot.backwards)])?.to_string(),
+                    // **the short, capitalised forms.** 0x4BAA3B adds **0x23** to the traffic
+                    // accessor's own string id and 0x4BAA03 adds **0x14** to the direction's —
+                    // `FEStrings` 435…438 (`HEAVY`, `MED`, `LIGHT`, `NONE`) and 430…433 (`FWD`,
+                    // `BKW`, …), the `…SHORT` rows of the sheet, not the sentence forms the
+                    // combo boxes show. §4.136.
+                    "TRACKTRAFFIC" => self.fe_strings.get(TRAFFIC_OPTIONS[(slot.traffic as usize).min(3)] + 0x23)?.to_string(),
+                    "TRACKDIRECTION" => self.fe_strings.get(DIRECTION_OPTIONS[usize::from(slot.backwards)] + 0x14)?.to_string(),
                     // the same two the track accessor answers, for the row's own track: the
                     // record's `+0x78` as `FEStrings[0x1C2 + it]` (0x4BA8F5) and its best time
                     // (0x4BA913)
@@ -2073,7 +2234,7 @@ impl App {
                 // the garage screens ask the same accessor for the car's money and damage figures
                 let c = career?;
                 let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                match self.car_field(c, idx, modifier) {
+                match c.career.garage.get(idx).and_then(|o| self.car_field(c, o, modifier)) {
                     Some(v) => v,
                     None => c
                         .career
@@ -2087,24 +2248,29 @@ impl App {
             // the car the front end has selected, and (quick race puts the field in every car) the
             // opponents' car, which this port takes from the same list.
             //
-            // **Only the name.** `usedcardamage.lay` asks this same accessor for a car's condition,
-            // repair costs and mileage — `UsedCar.Car(BODYWORKDAMAGE)`, `(…DAMAGECOST)`,
-            // `(MILEAGE)`, `(ASKINGPRICE)` — and those are fields of a *market* record, an
-            // `OwnedCar`-shaped one with its own wear (`RE/notes/career.md` §10.5). This port has
-            // no used-car market, only the catalogue, so it has nothing to answer them with and
-            // says so. Until that changed it was handing every one of them the car's **name**,
-            // which about thirty widgets on that screen then printed where a percentage belongs.
-            // the used-car screens ask for the market car's condition. The original's market record
-            // is an `OwnedCar`-shaped one (`RE/notes/career.md` §10.5), and the part of that market
-            // this port does have is the player's **own listings** — `list_for_sale` sets
-            // `asking_price`, which is `car+0x68C`. So those come from the listed car; the rest of
-            // the market, the cars the original generates, this port does not have.
+            // **Only the name** for the plain and `SHORT` forms; everything else is a field of the
+            // *market* record, which is an `OwnedCar` with its own mileage, parts and asking price
+            // (`RE/notes/career.md` §10.5). The port generates that market now — `Career::market`,
+            // filled by `refresh_market` from 0x4F80C0 — so `UsedCar.Car(MILEAGE)`,
+            // `(ASKINGPRICE)`, `(…DAMAGE)` and `(…DAMAGECOST)` all come from the selected market
+            // car, the one `usedcar_sel` names.
             "UsedCar.Car" if !matches!(modifier, "" | "SHORT") => {
                 let c = career?;
-                let idx = c.career.garage.iter().position(|o| o.asking_price.is_some())?;
-                self.car_field(c, idx, modifier)?
+                self.car_field(c, self.used_car()?, modifier)?
             }
-            "zMergedList.Car" | "OpponentCar.Car" | "UsedCar.Car" | "PrizeCars.Car" => match menu {
+            "UsedCar.Car" => {
+                let c = career?;
+                let e = c.tables.car(self.used_car()?.car_id)?;
+                if modifier == "SHORT" { e.family.to_uppercase() } else { e.display_name.to_uppercase() }
+            }
+            // the same five strings the drop-down lists — `SHORT` is the same jump table
+            // (0x4F57A0), so both forms answer alike
+            "OpponentCar.Car" => {
+                let m = menu?;
+                let c = nfs_game::opponents::OpponentChoice::from_index(m.opp_car as u32);
+                self.fe_strings.get(c.string_id())?.to_uppercase()
+            }
+            "zMergedList.Car" | "PrizeCars.Car" => match menu {
                 _ if !matches!(modifier, "" | "SHORT") => return None,
                 // `(SHORT)` asks for the short form, which for a car is its family name
                 Some(m) if modifier == "SHORT" => m.cars[m.car_idx].family.to_uppercase(),
@@ -2271,34 +2437,10 @@ impl App {
         let (d, rest) = source.split_at_checked(1)?;
         let index = d.parse::<usize>().ok().filter(|i| *i < 5)?;
         let (car1, car2) = self.compare_cars()?;
-        let car = match rest {
-            "CarCompareCar1" => car1,
-            "CarCompareCar2" => car2,
-            _ => return None,
-        };
+        // 0x50E8BA tests only for `CarCompareCar1`; **anything else** falls through to
+        // `GenericCar2.Car` (0x50E8F1), so the second column is the default, not a second name
+        let car = if rest == "CarCompareCar1" { car1 } else { car2 };
         Some(car.compare[index] as i32)
-    }
-
-    /// The chronicle's picture files for the current model group, sorted, and where the career's
-    /// year sits in that list. The name is `M<letter><yy><index><variant>.fsh` — see
-    /// [`App::chronicle_picture`] — so sorting by name sorts by year.
-    fn chronicle_list(&self) -> (Vec<String>, usize) {
-        let letter = CHRONICLE_GROUP_LETTERS.as_bytes()[self.chronicle_group.min(4)] as char;
-        let dir = self.paths.fe_data().join("Chron");
-        let mut files: Vec<String> = std::fs::read_dir(&dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| {
-                let Some(stem) = n.strip_suffix(".fsh") else { return false };
-                let b = stem.as_bytes();
-                b.len() == 6 && b[0] == b'M' && b[1] as char == letter && stem[2..4].parse::<u32>().is_ok()
-            })
-            .collect();
-        files.sort();
-        let cur = self.chronicle_picture().and_then(|f| files.iter().position(|n| *n == f)).unwrap_or(0);
-        (files, cur)
     }
 
     fn chronicle_picture(&self) -> Option<String> {
@@ -2370,11 +2512,10 @@ impl App {
     /// than its name. `None` means this port has nothing to answer with, and the widget stays blank
     /// rather than showing something else — which is what it used to do, printing the car's name
     /// where a percentage belongs.
-    fn car_field(&self, c: &CareerUi, idx: usize, modifier: &str) -> Option<String> {
-        let owned = c.career.garage.get(idx)?;
+    fn car_field(&self, c: &CareerUi, owned: &nfs_game::career::OwnedCar, modifier: &str) -> Option<String> {
         Some(match modifier {
             // 0x4F633E and 0x4F62E1, the same shape again: `"%s"` of 0x4DBF80's commas, no sign
-            "CURRENTVALUE" => with_thousands(c.career.car_value(&c.tables, idx)?),
+            "CURRENTVALUE" => with_thousands(c.career.value_of(&c.tables, owned)?),
             "PURCHASEPRICE" => with_thousands(owned.purchase_price as i64),
             // and two more of the same shape, on the used-car screens: 0x4F61D0 reads
             // **`car+0x68C`**, the asking price while the car is listed, and 0x4F6281
@@ -2383,7 +2524,6 @@ impl App {
             // (§4.10) — but with a car and no listing the field is simply 0, so it prints `0`.
             "ASKINGPRICE" => with_thousands(owned.asking_price.unwrap_or(0) as i64),
             "MILEAGE" => with_thousands(owned.mileage as i64),
-            "OVERALLDAMAGE" => format!("{:.0}%", owned.damage_pct),
             // what the repair would cost: the aged price of each damaged part times its damage
             // doubled, over a hundred (`part_repair_cost`, 0x518880), summed over one category —
             // 0x4EFBC0 for the engine and its neighbours — or over all of them for `OVERALL`
@@ -2404,23 +2544,76 @@ impl App {
                     .sum();
                 with_thousands(total)
             }
-            // one part category's condition: `100 - mean(part damage)` over the installed parts of
-            // that category (`PART_DAMAGE_CATEGORY`)
-            m if PART_DAMAGE_CATEGORY.iter().any(|(n, _)| *n == m) => {
-                let cat = PART_DAMAGE_CATEGORY.iter().find(|(n, _)| *n == m).map(|(_, c)| *c)?;
-                let mut sum = 0.0f32;
-                let mut n = 0u32;
-                for (id, state) in &owned.part_state {
-                    if c.tables.parts.iter().any(|p| p.id == *id && p.kind == cat) {
-                        sum += state;
-                        n += 1;
-                    }
-                }
-                let mean = if n > 1 { sum / n as f32 } else { sum };
-                format!("{:.0}", 100.0 - mean)
+            // the ten damage modifiers. Slot 5's arms all read the same way — 0x4F63A3 calls the
+            // category's mean, 0x4F63A8 `fsubr [0x5B242C]` turns it into `100 − mean`, and
+            // 0x4F63B4 prints it with **`"%2.0f"`**: no per-cent sign, and a leading space under
+            // ten. `RE/notes/controls.md` §4.134.
+            m if m == "OVERALLDAMAGE" || PART_DAMAGE_CATEGORY.iter().any(|(n, _)| *n == m) => {
+                format!("{:>2.0}", self.car_damage(c, owned, m)?)
             }
             _ => return None,
         })
+    }
+
+    /// The **integer** an accessor's slot 6 hands back, where this port has one. The front end's
+    /// only bars that ask for one are the damage family's (`FEOwnedCarAccessor`'s slot 6 is
+    /// 0x4F6B50); everything else has no slot-6 override and falls back to the text.
+    fn accessor_number(&self, src: &str) -> Option<i32> {
+        let (base, modifier) = match src.split_once('(') {
+            Some((b, m)) => (b.trim(), m.trim_end_matches(')').trim()),
+            None => (src, ""),
+        };
+        if modifier != "OVERALLDAMAGE" && !PART_DAMAGE_CATEGORY.iter().any(|(n, _)| *n == modifier) {
+            return None;
+        }
+        let c = self.career.as_ref()?;
+        let car = match base {
+            "UsedCar.Car" => self.used_car()?,
+            "OwnedCars.Car" | "DealerCar.Car" | "GenericCar.Car" | "CARSETTINGS.CAR" => {
+                c.career.garage.get(c.car_sel.min(c.career.garage.len().saturating_sub(1)))?
+            }
+            _ => return None,
+        };
+        Some(self.car_damage(c, car, modifier)? as i32)
+    }
+
+    /// `100 − damage` for one of `FEOwnedCarAccessor`'s ten damage modifiers — the condition the
+    /// screens draw, despite the names. It is the number both
+    /// slot 5 (the text, `"%2.0f"`) and slot 6 (the integer a bar draws, `_ftol` at 0x4F6BDD, so
+    /// **truncated**) are built from.
+    ///
+    /// One category's damage is 0x4EF580: the sum of `part+0x164` over the installed parts
+    /// whose `part+0x26` is that category, divided by the count **only when the count is above
+    /// one** (0x4EF5C2 `cmp esi, 1; jle`), and 0.0 when the category holds none. The categories
+    /// are 1 engine, 2 brakes, 3 transmission, 4 suspension, 5 shocks, 6 and 7 bodywork,
+    /// 8 sway bars, 9 tyres, 10 cosmetic. `RE/notes/controls.md` §4.134.
+    fn car_damage(&self, c: &CareerUi, owned: &nfs_game::career::OwnedCar, modifier: &str) -> Option<f32> {
+        let mean = |cat: u16| {
+            let mut sum = 0.0f32;
+            let mut n = 0u32;
+            for (id, state) in &owned.part_state {
+                if c.tables.parts.iter().any(|p| p.id == *id && p.kind == cat) {
+                    sum += state;
+                    n += 1;
+                }
+            }
+            if n > 1 { sum / n as f32 } else { sum }
+        };
+        // 0x4EF7D0 sums category **6 and category 7** and halves them (0x4EF857 `faddp`,
+        // 0x4EF85B `fmul [0x5B23F0]` = 0.5) — bodywork is two categories, not one
+        let bodywork = (mean(6) + mean(7)) * 0.5;
+        let v = match modifier {
+            "BODYWORKDAMAGE" => bodywork,
+            // 0x4EF960: nine terms — bodywork and the eight single categories — scaled by
+            // `[0x5B74B8]` = 1/9 at 0x4EFBB1. The adds run 0x4EFB93…0x4EFBAD in the order
+            // engine, bodywork, cosmetic, tyres, sway bars, shocks, suspension, transmission,
+            // brakes.
+            "OVERALLDAMAGE" => {
+                (mean(1) + bodywork + mean(10) + mean(9) + mean(8) + mean(5) + mean(4) + mean(3) + mean(2)) / 9.0
+            }
+            m => mean(PART_DAMAGE_CATEGORY.iter().find(|(n, _)| *n == m)?.1),
+        };
+        Some(100.0 - v)
     }
 
     /// The catalogue record an `NFS5.CarLogo`'s source names. The original resolves the source in
@@ -2484,8 +2677,13 @@ impl App {
                 let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
                 c.tables.car(c.career.garage.get(idx)?.car_id)
             }
+            // the used-car lot's own selection — the car its logo, its 3D view and its bars are on
+            "UsedCar.Car" => {
+                let c = self.career.as_ref()?;
+                c.tables.car(self.used_car()?.car_id)
+            }
             // the same list the port's other car accessors answer from
-            "zMergedList.Car" | "OpponentCar.Car" | "UsedCar.Car" | "PrizeCars.Car"
+            "zMergedList.Car" | "OpponentCar.Car" | "PrizeCars.Car"
             | "DealerCar.Car" | "GenericCar.Car" | "CARSETTINGS.CAR" => {
                 let m = self.menu.as_ref()?;
                 m.cars.get(m.car_idx)
@@ -2929,6 +3127,19 @@ impl App {
                 o.mileage = 12_345;
                 o.asking_price = Some(9_500);
             }
+            // …and a used-car market, which the original only has after the first career race
+            // (0x4F7DB0 → 0x4F80C0). Without it the used-car screens have nothing to read.
+            if c.career.market.is_empty() {
+                let mut seed = 0x1234_5678u32;
+                let mut rand = move || {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    seed >> 8
+                };
+                let CareerUi { career, tables, .. } = c;
+                career.refresh_market(tables, &mut rand);
+            }
         }
         let dir = self.paths.fe_data().join("Layouts");
         let mut names: Vec<String> = std::fs::read_dir(&dir)
@@ -2947,6 +3158,9 @@ impl App {
         let mut empty_combos: std::collections::BTreeMap<String, usize> = Default::default();
         let mut mute_combos: std::collections::BTreeMap<String, usize> = Default::default();
         let mut mute_bars: std::collections::BTreeMap<String, usize> = Default::default();
+        // `NFS5.3DCAR`s, counted out of the blank total and reported on their own
+        let mut cars3d = 0usize;
+        let mut ko_past = 0usize;
         let mut screens = 0usize;
         for name in &names {
             self.open_layout(name);
@@ -3036,6 +3250,9 @@ impl App {
                     println!("  box {name:<20} {class:<28} size.value=({:.0}x{:.0}) parts=({:.0}x{:.0})", b.0, b.1, u.0, u.1);
                 }
             }
+            if let Some(l) = self.layout_preview.as_ref() {
+                cars3d += l.car_3d().len();
+            }
             // **The blank count cannot see an empty drop-down.** A combo always draws its own
             // box, so however empty its list is it never counts as a widget that drew nothing —
             // which is how 61 of the 97 went unnoticed until §4.91. Counted here as its own axis.
@@ -3080,6 +3297,20 @@ impl App {
             }
             let Some(l) = self.layout_preview.as_ref() else { continue };
             for (class, src) in l.blank_widgets(nfs_game::layout::DESIGN.0 / nfs_game::layout::DESIGN.1, &self.fe_strings, &|a| self.accessor_value(a)) {
+                // **A knockout row past the opponent count draws nothing in the original too.**
+                // `locationsetup.lay` carries seven fixed rows of watches, rows 0…6, but
+                // `FEKnockoutTrackNumberAccessor`'s getter reads `Game.NumKOOpponents`
+                // (0x4BA786) and, at 0x4BA7CF, `cmp ebp, [esp+0x44]; jl …` — a row at or past
+                // that count falls straight through to `mov eax, 0x5E8E50`, the shared empty
+                // string. With the default count of 4 that is rows 4, 5 and 6, five fields
+                // each. They are not blanks the port owes anyone; counting them made the sweep
+                // chase its own harness, the same way `NFS5.3DCAR` did.
+                if let Some(row) = ko_row_of(&src)
+                    && row >= self.menu.as_ref().map(|m| m.ko_opponents).unwrap_or(4)
+                {
+                    ko_past += 1;
+                    continue;
+                }
                 where_of.entry(class.clone()).or_default().push(name.clone());
                 *total.entry((class, src)).or_default() += 1;
             }
@@ -3115,6 +3346,19 @@ impl App {
                     }
                 }
             }
+            // and the parts no state lists — only a class's own draw can reach one (§4.130)
+            let mut unlisted: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+            for name in &names {
+                self.open_layout(name);
+                if let Some(l) = self.layout_preview.as_ref() {
+                    unlisted.extend(l.unlisted_parts());
+                }
+            }
+            println!("template parts no state lists:");
+            for (class, parts) in &unlisted {
+                println!("  {class:<32} {}", parts.join(", "));
+            }
+            println!("the chronicle index for group {} (§4.118): {:?}", self.chronicle_group, self.chronicle_index());
             println!("template states this port never returns:");
             for (class, states) in &miss {
                 println!("  {class:<32} {}", states.iter().cloned().collect::<Vec<_>>().join(", "));
@@ -3161,6 +3405,11 @@ impl App {
         for (n, a) in &mcs {
             println!("  {n:4}  {a}");
         }
+        // `NFS5.3DCAR` is not in the blank count — it is never a 2D sprite in either build
+        // (`FECar3DControl`'s draw 0x4C0990 calls no painter at all) — so it is reported here
+        // instead of going missing.
+        println!("\n3D car widgets (never a sprite, drawn by the 3D pass — 0x4C0990): {cars3d}");
+        println!("knockout rows past Game.NumKOOpponents (empty in the original — 0x4BA7CF): {ko_past}");
         let mb: usize = mute_bars.values().sum();
         println!("\nindicator bars whose accessor answers nothing: {mb}");
         let mut mbs: Vec<(usize, String)> = mute_bars.into_iter().map(|(a, n)| (n, a)).collect();
@@ -3380,8 +3629,7 @@ impl App {
         if want.is_empty() {
             return;
         }
-        // the market this port has is the player's own listings (`list_for_sale`)
-        let n = self.career.as_ref().map_or(0, |c| c.career.garage.iter().filter(|o| o.asking_price.is_some()).count());
+        let n = self.used_cars().len();
         let parts = self.usedcars_showparts;
         // (hidden, enabled) per name, in the order of `names`
         let state: [(bool, Option<bool>); 9] = if n == 0 {
@@ -3460,6 +3708,34 @@ impl App {
         if want.is_empty() {
             return;
         }
+        // and the timeline's own five columns, which the same screen carries (§4.122)
+        let cols: Vec<(u32, usize)> = match self.chronicle_column() {
+            Some(c) => self.chronicle_columns().into_iter().skip_while(|x| *x != c).take(5).collect(),
+            None => Vec::new(),
+        };
+        // the icons of the ten cells: `0x507340(year, row, variant, hot)` for rows 0 and 1
+        // (0x507DDB loops `ebx < 2`), each answering the resting frame and the hovered one
+        const PACKS: [&str; 5] = ["iconsrace", "icons911", "icons356", "icons924", "icons914"];
+        let pack = format!("{}.fsh", PACKS[self.chronicle_group.min(4)]);
+        let entries = self.chronicle_entries();
+        let mut cells: std::collections::BTreeMap<(usize, usize), (usize, usize)> = Default::default();
+        for (col, (year, var)) in cols.iter().enumerate() {
+            for row in 0..2 {
+                if let Some((_, _, _, f)) = entries.iter().find(|(y, k, v, _)| y == year && *k == row && v == var) {
+                    cells.insert((col, row), (f[0], if f[1] == usize::MAX { f[0] } else { f[1] }));
+                }
+            }
+        }
+        let frames: Vec<usize> = cells.values().flat_map(|(a, b)| [*a, *b]).collect();
+        if let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) {
+            for n in frames {
+                l.load_pack_entry(r, &self.paths, "Chron", &pack, n);
+            }
+        }
+        if let Some(l) = self.layout_preview.as_mut() {
+            l.set_chronicle_icons(pack, cells);
+            l.set_chronicle_columns(cols);
+        }
         let group = self.chronicle_group;
         if let Some(l) = self.layout_preview.as_mut() {
             for (index, which) in want {
@@ -3468,23 +3744,139 @@ impl App {
         }
     }
 
+    /// **The chronicle's entry index**, as 0x506FE0 builds it.
+    ///
+    /// The index is a flat table of 5 × 53 × 3 × 5 × 2 dwords at **0x692038** — group, year − 48,
+    /// kind, variant, and a flag — and 0x507340 reads it with
+    /// `[0x692038 + (2*(5*(3*(53*group + year − 48) + kind) + variant) + (flag != 0)) * 4]`.
+    /// 0x507065's `rep stosd` of **0x1F0E** dwords is 7950, which is that product exactly.
+    ///
+    /// It is built from the **five icon packs**, not from the picture files: 0x50701E formats
+    /// `"%s%s.fsh"` over the names at 0x5B8AB4, stepping 0x14 up to 0x5B8B18 — `iconsrace`,
+    /// `icons911`, `icons356`, `icons924`, `icons914`, which is group order and agrees with both
+    /// `"CBADE"` (§4.107) and the five buttons (§4.111). For each entry 0x537F60 hands back the
+    /// four-character directory tag and 0x5070CF…0x5070FB parses it:
+    ///
+    /// ```text
+    /// 0x5070FB  year = 10*tag[0] + tag[1] - 0x210     ; two ASCII digits; "00" becomes 100
+    /// 0x5070CA  kind = table[tag[2] - 0x4D]           ; 0x507234 -> the jump table 0x507224
+    ///                'p' -> 0, 'm' -> 1, 'v' -> 2, anything else -> 0
+    /// 0x507132  the slot is found by **linear probing along the flat table** from
+    ///           (group, year, kind, 0, 0): 0x50714C walks `eax += 4` while the dword is
+    ///           taken, counting in `ebx`, and gives up at ten — which is the product of the
+    ///           two fastest dimensions, 5 variants x 2 flags. So the k-th entry with the same
+    ///           (group, year, kind) lands at `variant = k / 2`, `flag = k % 2`, and the pairs
+    ///           are exactly §4.107's two frames, the resting one and the hovered one.
+    /// ```
+    ///
+    /// so `icons356.fsh`'s `"48p "` is the 1948 picture of the 356 line. §4.118.
+    fn chronicle_index(&self) -> Vec<(u32, usize, usize)> {
+        self.chronicle_entries().into_iter().map(|(y, k, v, _)| (y, k, v)).collect()
+    }
+
+    /// The same walk, keeping the **pack entry number** each slot holds — which is what
+    /// 0x507340 returns and what the timeline's icons are (§4.123). The two slots of a
+    /// (year, kind, variant) are the resting frame and the hovered one (§4.121).
+    fn chronicle_entries(&self) -> Vec<(u32, usize, usize, [usize; 2])> {
+        const PACKS: [&str; 5] = ["iconsrace", "icons911", "icons356", "icons924", "icons914"];
+        let dir = self.paths.fe_data().join("Chron");
+        let Some(path) = GamePaths::find_file(&dir, &format!("{}.fsh", PACKS[self.chronicle_group.min(4)])) else {
+            return Vec::new();
+        };
+        let Some(pack) = std::fs::read(&path).ok().and_then(|d| nfs_formats::fsh::Fsh::parse(&d).ok()) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(u32, usize, usize, [usize; 2])> = Vec::new();
+        for (n, e) in pack.entries.iter().enumerate() {
+            let t = e.name.as_bytes();
+            if t.len() < 3 || !t[0].is_ascii_digit() || !t[1].is_ascii_digit() {
+                continue;
+            }
+            let year = match 10 * u32::from(t[0]) + u32::from(t[1]) - 0x210 {
+                0 => 100,
+                y => y,
+            };
+            let kind = match t[2] {
+                b'p' | b'P' => 0,
+                b'm' | b'M' => 1,
+                b'v' => 2,
+                _ => 0,
+            };
+            // 0x50714C's probe: the k-th entry of a (year, kind) lands at variant k/2 and
+            // frame k%2, so a group with a free second frame takes this one, and otherwise a
+            // fresh variant opens
+            match out.iter_mut().find(|(y, kk, _, f)| *y == year && *kk == kind && f[1] == usize::MAX) {
+                Some(slot) => slot.3[1] = n,
+                None => {
+                    let v = out.iter().filter(|(y, kk, _, _)| *y == year && *kk == kind).count();
+                    out.push((year, kind, v, [n, usize::MAX]));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
     /// 0x5074A0's list for the screen the port is on: `<kind><group><yy><i><variant>.fsh` for
     /// `i` = 1…4, stopping at the first one that is not on disk.
+    /// The timeline's columns: the index's distinct **(year, variant)** pairs, which is what
+    /// 0x507B4F's walk settles on — it asks 0x507340 for all three kinds and moves to the next
+    /// year only when the variant it is on has none of them (0x507B93). §4.120.
+    fn chronicle_columns(&self) -> Vec<(u32, usize)> {
+        let mut v: Vec<(u32, usize)> = self.chronicle_index().into_iter().map(|(y, _, var)| (y, var)).collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// The (year, variant) the chronicle is on: the column a click has picked, else the one the
+    /// timeline opens at — **0x507999** asks the `Chronicle.Year` accessor the bind 0x507E65 put
+    /// in `[this+0x148]`, takes 0x76C (1900) off it and keeps the remainder mod 100 (0x5079AF),
+    /// and 0x507B4F's walk starts there at variant 0 and only ever moves forward. §4.121.
+    fn chronicle_column(&self) -> Option<(u32, usize)> {
+        let cols = self.chronicle_columns();
+        if let Some(c) = self.chronicle_col.and_then(|c| cols.get(c).copied()) {
+            return Some(c);
+        }
+        let start = self.career.as_ref().map(|c| c.career.year as u32).map(|y| if y >= 1900 { (y - 1900) % 100 } else { y % 100 }).unwrap_or(0);
+        cols.iter().copied().find(|(y, _)| *y >= start).or_else(|| cols.first().copied())
+    }
+
     fn chronicle_media(&self) -> Vec<String> {
-        // 0x507508's three letters, by the kind each screen passes (0x5080F8, 0x508137)
-        let kind = match self.layout_name.as_deref().unwrap_or("").to_ascii_lowercase().as_str() {
-            "chroniclemovie" => 'v',
-            "chroniclemedia" => 'm',
-            _ => 'p',
-        };
+        // 0x507508's three letters, by the kind each screen passes (0x5080F8, 0x508137) — and
+        // the same three the index's tags carry (§4.118)
+        self.chronicle_media_for(match self.layout_name.as_deref().unwrap_or("").to_ascii_lowercase().as_str() {
+            "chroniclemovie" => 2usize,
+            "chroniclemedia" => 1,
+            _ => 0,
+        })
+    }
+
+    /// 0x5074A0 for one kind — what a timeline cell's row asks for before it opens a screen
+    /// (0x5080F8, 0x508137).
+    fn chronicle_media_for(&self, k: usize) -> Vec<String> {
+        let kind = [b'p', b'm', b'v'][k.min(2)] as char;
         let letter = CHRONICLE_GROUP_LETTERS.as_bytes()[self.chronicle_group.min(4)] as char;
-        // the year and the variant of the entry the chronicle is showing
-        let cur = self.chronicle_picture().unwrap_or_default();
-        let stem = cur.strip_suffix(".fsh").unwrap_or("");
-        let (yy, variant) = match stem.as_bytes() {
-            b if b.len() == 6 => (stem[2..4].to_string(), b[5] as char),
-            _ => return Vec::new(),
-        };
+        // **the year and the variant come from the index**, which is what 0x5080E0 reads them
+        // from — its row table `[this + row*4 + 0x160]` and `[+0x174]` is filled by the timeline
+        // draw out of the very entries 0x506FE0 put in the table (§4.118). This port has no
+        // timeline row, so it takes the newest entry of this kind at or before the career's year,
+        // which is the browsing approximation §4.107 already records.
+        let want = self.career.as_ref().map(|c| c.career.year as u32).unwrap_or(0);
+        let want = if want >= 1900 { want - 1900 } else { want };
+        // **Which** column the screen is on is 0x5080E0's `[this+0x154]`, a timeline row this port
+        // has not got — so the year and the variant still come from the entry
+        // [`App::chronicle_picture`] picks, the browsing approximation §4.107 records. The index
+        // §4.118 reads is the source the original uses for the same two numbers, and the port's
+        // own reading of it is checkable with `NFS_SWEEP_STATES=1`; rewiring the browsing
+        // position onto it wants the timeline row, which is still unported.
+        let _ = want;
+        // the column the timeline is on — 0x5080E0 reads the year and the variant out of
+        // `[this+0x160 + 4*col]` and `[this+0x174 + 4*col]`, and a click on a cell moves the
+        // column (§4.120)
+        let Some((year, var)) = self.chronicle_column() else { return Vec::new() };
+        let yy = format!("{:02}", year % 100);
+        let variant = (b'a' + var.min(4) as u8) as char;
         let dir = self.paths.fe_data().join("Chron");
         let mut out = Vec::new();
         for i in 1..=4 {
@@ -3504,6 +3896,28 @@ impl App {
     /// is exact: `general.lay` and `glancestats.lay` give `number` 0…7, and each widget's `size`
     /// is entry `number`'s own width and height. CONFIRMED.
     fn bind_showcase_pictures(&mut self) {
+        // `NFS5.CAMERAPICTURE`'s `shp` part is in no state list, so nothing preloads it (§4.129)
+        let cams: Vec<i64> = self
+            .layout_preview
+            .as_ref()
+            .map(|l| l.numbered_widgets("NFS5.CAMERAPICTURE").into_iter().filter_map(|(i, _)| l.layout.elements.get(i).and_then(|e| e.int("picturenum"))).collect())
+            .unwrap_or_default();
+        if !cams.is_empty()
+            && let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut())
+        {
+            for n in cams {
+                l.load_pack_entry(r, &self.paths, "Art", nfs_game::layout::CAMERA_PICTURES, n.max(0) as usize);
+            }
+        }
+        // `NFS5.ANIMSHOWCASEPICTURE` needs all eight entries of `show.fsh` — four pictures and
+        // four labels — which its own bind 0x4BDB90 loads up front (§4.127)
+        if self.layout_preview.as_ref().is_some_and(|l| !l.numbered_widgets("NFS5.ANIMSHOWCASEPICTURE").is_empty())
+            && let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut())
+        {
+            for n in 0..8 {
+                l.load_pack_entry(r, &self.paths, "Art", nfs_game::layout::SHOWCASE_ANIM, n);
+            }
+        }
         let Some(l) = self.layout_preview.as_ref() else { return };
         let want = l.numbered_widgets("NFS5.ShowcasePicture");
         if want.is_empty() {
@@ -3736,12 +4150,17 @@ impl App {
                     // the literal 0x64 at 0x4CA724), otherwise whatever number the accessor's text
                     // carries — the damage accessors already answer in per cent
                     let name = src.split_once('(').map_or(src.as_str(), |(b, _)| b.trim());
-                    match self.range_value(name) {
-                        Some((v, lo, hi)) if hi > lo => Some((v - lo) * 100 / (hi - lo)),
-                        _ => self
-                            .accessor_value(&src)
-                            .and_then(|t| t.trim().trim_end_matches('%').trim().parse::<f32>().ok())
-                            .map(|v| v.round() as i32),
+                    // a bar asks slot **6**, the integer, not slot 5's text — for the damage
+                    // family that is `_ftol(100 − condition)`, truncated (§4.134)
+                    match self.accessor_number(&src) {
+                        Some(v) => Some(v),
+                        None => match self.range_value(name) {
+                            Some((v, lo, hi)) if hi > lo => Some((v - lo) * 100 / (hi - lo)),
+                            _ => self
+                                .accessor_value(&src)
+                                .and_then(|t| t.trim().trim_end_matches('%').trim().parse::<f32>().ok())
+                                .map(|v| v.round() as i32),
+                        },
                     }
                 };
                 (i, v)
@@ -4216,6 +4635,10 @@ impl App {
                         lateral: lateral_of,
                         half_span: hw,
                         is_human: human,
+                        // every car this closure builds is in the race — the player or an
+                        // opponent — and 0x401C8D's shoulder bonus asks for `52C & 1`, which is
+                        // exactly that (`traffic.md`)
+                        is_racer: true,
                     }
                 };
                 let lateral_on = |pos: Vec3, s: usize| {
@@ -4242,7 +4665,14 @@ impl App {
                         false,
                     )
                 }));
-                tr.update(t, self.tick, reference, &others);
+                // **Once**, not twice. `traffic.md` §21.5 used to say 0x408360 was inserted into
+                // two scheduler slots for a traffic car and therefore ran twice per due tick; it
+                // is not. `Car_installHandlers` seeds `car+0xE0C = 0x49AF70` at 0x410DDD and only
+                // overwrites it with 0x408360 at 0x410E6D **when `car+0x52C & 1`** — the racer
+                // bit, which traffic does not have (`test bl, al; je` at 0x410E64/0x410E6B skips
+                // the store). `+0xE1C` gets 0x408360 unconditionally at 0x410E83, so traffic has
+                // it in one slot. A racer has it in both and 0x408366 makes it return at once for
+                // exactly that case, so it never does work twice for anybody.
                 tr.update(t, self.tick, reference, &others);
             }
             // police (`traffic.md` §17.3 violation, §25 spawn, §27 chase)
@@ -4304,6 +4734,7 @@ impl App {
                         lateral: lat,
                         half_span: self.car_half_width,
                         is_human: true,
+                        is_racer: true,
                     }];
                     pol.update(t, self.tick, &target, &others);
                 }
@@ -5283,19 +5714,21 @@ impl App {
         // room; 1, 2 and 3 put one of their own at a fixed spot (`RE/notes/frontend-3d.md` §4). A
         // source the port cannot resolve falls back to the car the front end has selected, as the
         // accessor answers elsewhere.
-        let fallback = self.menu.as_ref().map(|m| m.cars[m.car_idx].model.clone());
+        // the model **and its body style** — `nfs5.car +0x1C0`, which is what picks the `[styleN]`
+        // section (`car-model.md`, `applyStyle` 0x437B00)
+        let fallback = self.menu.as_ref().map(|m| (m.cars[m.car_idx].model.clone(), m.cars[m.car_idx].variant));
         let widgets = self
             .layout_preview
             .as_ref()
             .map(|l| l.car_3d())
             .unwrap_or_default();
-        let mut wanted: Vec<(usize, String)> = Vec::new();
+        let mut wanted: Vec<(usize, String, i16)> = Vec::new();
         for w in &widgets {
             let model = self
                 .logo_car(w.accessor.as_deref(), w.othersource.as_deref())
-                .map(|c| c.model.clone())
+                .map(|c| (c.model.clone(), c.variant))
                 .or_else(|| fallback.clone());
-            if let Some(model) = model {
+            if let Some((model, variant)) = model {
                 wanted.push((
                     if w.position_type == 0 {
                         usize::MAX
@@ -5303,6 +5736,7 @@ impl App {
                         w.index
                     },
                     model,
+                    variant,
                 ));
             }
         }
@@ -5310,9 +5744,9 @@ impl App {
         // empty room (`ID_NONE`) without one shows nothing
         if wanted.is_empty()
             && !room.models.is_empty()
-            && let Some(model) = fallback
+            && let Some((model, variant)) = fallback
         {
-            wanted.push((usize::MAX, model));
+            wanted.push((usize::MAX, model, variant));
         }
         if self
             .fe_room
@@ -5346,15 +5780,16 @@ impl App {
             .fe_cars
             .iter()
             .map(|(i, n, _)| (*i, n.as_str()))
-            .ne(wanted.iter().map(|(i, n)| (*i, n.as_str())))
+            .ne(wanted.iter().map(|(i, n, _)| (*i, n.as_str())))
         {
             self.fe_cars.clear();
             let paint = self.paint;
-            for (slot, model) in wanted {
+            for (slot, model, variant) in wanted {
                 let Some(r) = self.renderer.as_mut() else {
                     return;
                 };
                 let loaded = nfs_assets::car::CarAssets::load(&self.paths, &model)
+                    .map(|c| c.with_style(variant))
                     .map_err(anyhow::Error::from)
                     .and_then(|a| CarModel::upload(r, &a, &self.paths, 1, paint));
                 match loaded {
@@ -5532,6 +5967,13 @@ impl App {
         if let (Some(c), Some(r)) = (self.car_model.as_mut(), self.renderer.as_mut()) {
             c.update_damage(r, &damage);
         }
+        // the two animated body parts the notes have settled: the pop-up spoiler off the speed
+        // gate and the pop-up headlights off the track's night flag (`car-model.md`)
+        let speed = self.vehicle.as_ref().map(|v| v.speed()).unwrap_or(0.0);
+        let night = self.track.is_night();
+        if let Some(c) = self.car_model.as_mut() {
+            c.update_animation(16, speed, night);
+        }
     }
 
     fn update_env_map(&mut self) {
@@ -5548,26 +5990,39 @@ impl App {
         }
     }
 
-    /// The blob a car drops on the ground (`SHAD`, 0x43B820): a quad the size of the car's
-    /// footprint, laid on the surface under it and turned with it. APPROXIMATION of the original's
-    /// distance-stepped 1…6 patch grid — the port always draws the single far-away quad.
-    fn shadow_item(&self, pos: Vec3, rot: Quat, half: Vec3) -> Option<nfs_renderer::DrawItem> {
-        let (mesh, material) = self.shadow_draw?;
+    /// The four corners of a car's shadow, world-space and draped on the ground — `R3DCar`'s
+    /// slot 22, **0x43B220**, with the patch slot 23 (0x43B5B0) lays over them.
+    ///
+    /// 0x43B231…0x43B2F3 build the corners in body space out of nothing but the half extents at
+    /// `car+0x3A8` and `car+0x3B0` — `(−ex, 0, −ez)`, `(+ex, 0, −ez)`, `(+ex, 0, +ez)`,
+    /// `(−ex, 0, +ez)`, with no scale factor of any kind — and 0x532A80 turns them by the car's
+    /// full basis `car+0x364` and moves them to `car+0x330`. The byte table at **0x5CD5E8** takes
+    /// them in the order **3, 2, 0, 1** with the UVs at 0x5CD5F0, `(0,0) (1,0) (1,1) (0,1)`, and
+    /// each corner's **y** is the ground under it: 0x43B6CF starts that query from the car's own
+    /// `y` plus **`[0x5B36E8]` = 1.75**.
+    ///
+    /// APPROXIMATION, still: the original subdivides the quad into an n×n patch with
+    /// `n = 6 − (int)(dist² × 0.01)`, floored at 1 and forced to 6 in a replay
+    /// (0x43B8EE…0x43B91A), sampling every vertex of it; this draws the n = 1 case, four corners.
+    /// The `0.04` lift is this port's own, against z-fighting.
+    fn shadow_quad(&self, pos: Vec3, rot: Quat, half: Vec3) -> Option<[nfs_renderer::Vertex; 4]> {
         let w = self.world.as_ref()?;
-        let h = w.collision.ground(pos.x, pos.y + 2.0, pos.z, 12.0)?;
-        let yaw = {
-            let f = rot * Vec3::Z;
-            f.x.atan2(f.z)
-        };
-        let m = Mat4::from_translation(Vec3::new(pos.x, h.point.y + 0.04, pos.z))
-            * Mat4::from_rotation_y(yaw)
-            * Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2)
-            * Mat4::from_scale(Vec3::new(half.x * 2.6, half.z * 2.3, 1.0));
-        Some(nfs_renderer::DrawItem {
-            light: [0.0; 3],
-            alpha: 0.9,
-            ..nfs_renderer::DrawItem::new(mesh, material, m)
-        })
+        let body = [
+            Vec3::new(-half.x, 0.0, -half.z),
+            Vec3::new(half.x, 0.0, -half.z),
+            Vec3::new(half.x, 0.0, half.z),
+            Vec3::new(-half.x, 0.0, half.z),
+        ];
+        const ORDER: [usize; 4] = [3, 2, 0, 1];
+        const UV: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let mut out = [nfs_renderer::Vertex { position: [0.0; 3], normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: [1.0; 4] }; 4];
+        for (k, &i) in ORDER.iter().enumerate() {
+            let p = pos + rot * body[i];
+            let h = w.collision.ground(p.x, pos.y + 1.75, p.z, 12.0)?;
+            out[k].position = [p.x, h.point.y + 0.04, p.z];
+            out[k].uv = UV[k];
+        }
+        Some(out)
     }
 
     /// The glare a car's lamps throw towards the camera (`RE/notes/particles.md` §4): each light
@@ -5797,7 +6252,16 @@ impl App {
                 let rows: Vec<_> = order.iter().map(|&d| row(d)).collect();
                 let player = order.iter().position(|d| *d == 0).unwrap_or(0);
                 let mut table = Vec::new();
-                h.results_sprites(&mut table, hud_aspect, &rows, player);
+                // the headers, the ordinals and the billboard's title come from `FEStrings`
+                let fe = |id: u32| self.fe_strings.get(id).unwrap_or_default().to_string();
+                let head = [fe(18111), fe(18112), fe(18113), fe(18114)];
+                let ordinals: Vec<String> = (18116..18124).map(fe).collect();
+                let title = fe(match self.menu.as_ref().map(|m| m.mode) {
+                    Some(1) => 18175,
+                    Some(2) => 18169,
+                    _ => 18129,
+                });
+                h.results_sprites(&mut table, hud_aspect, &rows, player, &title, &head, &ordinals);
                 self.scene.sprites.extend(table);
             }
             if let Some(f) = &h.font {
@@ -6127,19 +6591,19 @@ impl App {
                 ));
         }
         // every car drops a blob shadow on the ground under it (0x43B820)
-        if self.shadow_draw.is_some() {
+        if let Some((_, material)) = self.shadow_draw {
             let half = self
                 .vehicle
                 .as_ref()
                 .map(|v| v.half_extents)
                 .unwrap_or(Vec3::new(0.9, 0.6, 2.1));
-            let mut shadows: Vec<nfs_renderer::DrawItem> = Vec::new();
+            let mut quads: Vec<[nfs_renderer::Vertex; 4]> = Vec::new();
             if self.vehicle.is_some() {
-                shadows.extend(self.shadow_item(car_pos, car_rot, half));
+                quads.extend(self.shadow_quad(car_pos, car_rot, half));
             }
             for o in &self.opponents {
                 let r = Quat::from_mat3(&o.vehicle.orientation.transpose()).normalize();
-                shadows.extend(self.shadow_item(o.vehicle.position, r, o.vehicle.half_extents));
+                quads.extend(self.shadow_quad(o.vehicle.position, r, o.vehicle.half_extents));
             }
             for c in self
                 .traffic
@@ -6148,7 +6612,7 @@ impl App {
                 .filter(|c| c.active)
             {
                 let r = Quat::from_mat3(&c.orientation.transpose()).normalize();
-                shadows.extend(self.shadow_item(c.position, r, Vec3::new(0.9, 0.6, 2.1)));
+                quads.extend(self.shadow_quad(c.position, r, Vec3::new(0.9, 0.6, 2.1)));
             }
             for c in self
                 .police
@@ -6157,9 +6621,28 @@ impl App {
                 .filter(|c| c.active)
             {
                 let r = Quat::from_mat3(&c.orientation.transpose()).normalize();
-                shadows.extend(self.shadow_item(c.position, r, Vec3::new(0.9, 0.6, 2.1)));
+                quads.extend(self.shadow_quad(c.position, r, Vec3::new(0.9, 0.6, 2.1)));
             }
-            self.scene.items.extend(shadows);
+            // each quad gets its own dynamic mesh, rewritten in place every frame — the corners
+            // move with the car and with the ground under it, so a transform cannot carry them
+            if let Some(r) = self.renderer.as_mut() {
+                while self.shadow_meshes.len() < quads.len() {
+                    let mut m = nfs_renderer::MeshData::default();
+                    m.vertices = vec![nfs_renderer::Vertex { position: [0.0; 3], normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: [1.0; 4] }; 4];
+                    m.indices = vec![0, 1, 2, 2, 1, 3];
+                    self.shadow_meshes.push(r.upload_dynamic_mesh(&m));
+                }
+                for (mesh, q) in self.shadow_meshes.iter().zip(&quads) {
+                    r.write_mesh_vertices(*mesh, q);
+                }
+            }
+            for mesh in self.shadow_meshes.iter().take(quads.len()) {
+                self.scene.items.push(nfs_renderer::DrawItem {
+                    light: [0.0; 3],
+                    alpha: 0.9,
+                    ..nfs_renderer::DrawItem::new(*mesh, material, Mat4::IDENTITY)
+                });
+            }
         }
         // from inside the car the windscreen is drawn instead of the body: 0x43A490 puts the `Wndo`
         // quad up with the `INTGLASS` glass whenever the view id is 0 or 1 (`car-model.md` §12)
@@ -6466,14 +6949,10 @@ impl App {
                 self.skill = None;
                 match (
                     TrackAssets::load(&self.paths, &req.track_file),
-                    CarAssets::load(&self.paths, &car.model),
+                    CarAssets::load(&self.paths, &car.model).map(|c| c.with_style(car.variant)),
                     CarAssets::load_sim(&self.paths, &car.sim),
                 ) {
-                    (Ok(mut t), Ok(c), Ok(mut sim)) => {
-                        nfs_game::career::apply_parts(
-                            &mut sim,
-                            &req.parts.iter().collect::<Vec<_>>(),
-                        );
+                    (Ok(mut t), Ok(c), Ok(sim)) => {
                         if let Some(ms) = &req.mission
                             && let Some(suffix) = &ms.scene_suffix
                         {
@@ -6492,6 +6971,12 @@ impl App {
                         let race_class =
                             car.sim.to_lowercase().starts_with("gt") || car.sim.starts_with("935");
                         self.specs = CarSpecs::from_sim(&sim, race_class);
+                        // the purchased parts, then the setup sliders — the order 0x49CB50 runs
+                        // them in, and both of them before anything reads the block
+                        let grip_ratio = self
+                            .specs
+                            .apply_parts(&req.parts.iter().collect::<Vec<_>>(), &car.sim_family);
+                        tracing::debug!(parts = req.parts.len(), grip_ratio, "parts applied");
                         if let Some(cu) = &self.career {
                             self.specs.zone_masks =
                                 nfs_game::career::zone_masks_for(&cu.tables, &car);
@@ -6504,6 +6989,12 @@ impl App {
                             {
                                 self.specs.wear =
                                     nfs_game::career::part_wear_for(&cu.tables, owned);
+                                // …and the car-setup screen's seventeen sliders reach the block
+                                // here, as 0x49D290 folds them in out of the per-player record.
+                                // `automatic`: the port's `Vehicle` is always an automatic
+                                // (`vehicle.automatic = true`), so the manual 1.05 of 0x49D733
+                                // is not in play until a gearbox option exists.
+                                self.specs.apply_setup(&owned.setup, true);
                             }
                         }
                         self.sound_set = car.sound_set.clone();
@@ -6684,7 +7175,7 @@ impl App {
                 );
                 match (
                     TrackAssets::load(&self.paths, &track_name),
-                    CarAssets::load(&self.paths, &car.model),
+                    CarAssets::load(&self.paths, &car.model).map(|c| c.with_style(car.variant)),
                     CarAssets::load_sim(
                         &self.paths,
                         if car.sim.is_empty() {
@@ -6769,7 +7260,7 @@ impl App {
                 );
                 match (
                     TrackAssets::load(&self.paths, &track_name),
-                    CarAssets::load(&self.paths, &car.model),
+                    CarAssets::load(&self.paths, &car.model).map(|c| c.with_style(car.variant)),
                     CarAssets::load_sim(
                         &self.paths,
                         if car.sim.is_empty() {
@@ -6858,20 +7349,47 @@ impl App {
                     self.network_callback(cb, event_loop);
                     return;
                 }
+                // `usedcars.lay`'s `ID_BUYCARBUTTON` — `callback=BUYCAR`, which for the used-car
+                // lot is 0x501F40: the money goes and the car moves across as it stands, mileage,
+                // parts and all. The player's own listings are on the same lot and cannot be
+                // bought back, so only a generated one is taken.
+                if c.callback.as_deref() == Some("BUYCAR")
+                    && self.layout_name.as_deref().map(|n| n.eq_ignore_ascii_case("usedcars")).unwrap_or(false)
+                {
+                    let n = self.career.as_ref().map_or(0, |c| c.career.market.len());
+                    let idx = self.usedcar_sel;
+                    if idx < n
+                        && let Some(cu) = self.career.as_mut()
+                    {
+                        match cu.career.buy_used_car(idx) {
+                            Ok(()) => {
+                                self.usedcar_sel = 0;
+                                self.bind_lists();
+                                self.bind_indicator_bars();
+                                self.bind_usedcars_panels();
+                            }
+                            Err(e) => tracing::info!("used car: {e}"),
+                        }
+                    }
+                    return;
+                }
                 // The bottom bar's PLAYGAME button, or any screen that says it can start a game.
                 //
-                // **The button asks the screen first.** Its `callback=PLAYGAME` resolves through
-                // the callback table the screen controller builds at 0x50C1D0 to the controller's
-                // own slot **+0xBC** (0x50E540 is `jmp [vtbl+0xBC]`), and thirty of the
-                // forty-one screen vtables carry the same default there, **0x50CC10**, which is
-                // `if ([this+0x270]->slot16()) [this+0x270]->slot13()` — it asks before it acts.
-                // This port was acting unconditionally, so the RACE button started a race from
-                // `credits.lay` and `createplayer.lay` alike. The only per-screen "may I" in the
-                // layouts is `data.canplaygame`, whose getter is 0x4E0BF0 and which `can_play`
-                // already reads for the other arm of this very test; its thirteen non-zero
-                // screens are exactly the race-launching ones. Tying slot16 to that attribute is
-                // **HIGH**, not confirmed — what is confirmed is the routing and the ask.
-                // §4.85.
+                // **The gate is this port's, and it is an approximation — §4.85.** `PLAYGAME`
+                // resolves through the controller's callback table to **slot 53**, 0x50CE90
+                // (0x50C1F2 stores 0x50E5B0, which is `jmp [vtbl+0xD4]`), and that handler asks
+                // nothing: it opens with its own re-entry latch `[this+0x278]` and goes straight
+                // into the network-session checks. `canplaygame`'s getter, slot 36 at 0x4E0BF0,
+                // has no direct callers at all — in the original the **bottom bar** shows and
+                // hides the button per screen, so on a screen that cannot race there is no
+                // button to press. This port keeps the button and declines instead, which is the
+                // same outcome by a different route, and it is what stops the RACE button
+                // starting a race from `credits.lay` and `createplayer.lay`. The thirteen screens
+                // with a non-zero `canplaygame` are exactly the race-launching ones.
+                //
+                // (An earlier reading paired `PLAYGAME` with 0x50E540 and hung this on slot 47's
+                // "ask then act". That registration is **`QUIT`**, and its `[this+0x270]` is the
+                // exit-confirm dialog, `FEStrings` 811.)
                 if (c.callback.as_deref() == Some("PLAYGAME") || c.destination.is_none()) && l.can_play() {
                     self.start_from_layout(event_loop);
                     return;
@@ -7068,6 +7586,13 @@ impl App {
         if let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) {
             l.advance_movies(r, dt_ms);
         }
+        // the front end's own pointer (`controls.md` §4.152), and where the turntable stands,
+        // which is what a hovered `NFS5.3DCAR` picks its cursor by (§4.153)
+        let spin = self.fe_room_of().map(|r| r.spin_turns(self.fe_ms)).unwrap_or(0.0);
+        if let Some(l) = self.layout_preview.as_mut() {
+            l.advance_cursor(dt_ms);
+            l.set_car_spin(spin);
+        }
         // a network screen probes once a second and refills its lists from the answers
         if self.lobby.is_some() {
             let before = self.lobby.as_ref().map(|l| l.found.len());
@@ -7119,7 +7644,7 @@ impl App {
         tracing::info!(track = track_name, car = car.model, "front end: start race");
         match (
             TrackAssets::load(&self.paths, &track_name),
-            CarAssets::load(&self.paths, &car.model),
+            CarAssets::load(&self.paths, &car.model).map(|c| c.with_style(car.variant)),
             CarAssets::load_sim(
                 &self.paths,
                 if car.sim.is_empty() {
@@ -7247,6 +7772,14 @@ impl App {
             }
             "Track1.Track" | "LoopedTrack.Track" | "Record.Track" => {
                 m.track_idx = step(m.track_idx, m.tracks.len())
+            }
+            // the opponent combo steps the five choices, not a car list
+            "OpponentCar.Car" => m.opp_car = ((m.opp_car as i32 + delta).rem_euclid(5)) as u8,
+            // the used-car lot steps its own selection, not the catalogue's
+            "UsedCar.Car" => {
+                let n = self.used_cars().len();
+                self.usedcar_sel = step(self.usedcar_sel, n);
+                self.bind_indicator_bars();
             }
             "zMergedList.Car" | "OwnedCars.Car" | "DealerCar.Car" | "GenericCar.Car"
             | "CARSETTINGS.CAR" => {
@@ -7944,7 +8477,7 @@ impl App {
                 for (g, (entry, paint, name, skill, grid)) in plan.iter().enumerate() {
                     let g = grid.unwrap_or(g as u32);
                     let (Ok(assets), Ok(sim)) = (
-                        CarAssets::load(&self.paths, &entry.model),
+                        CarAssets::load(&self.paths, &entry.model).map(|c| c.with_style(entry.variant)),
                         CarAssets::load_sim(&self.paths, &entry.sim),
                     ) else {
                         continue;
@@ -7981,6 +8514,7 @@ impl App {
                     vehicle.traction_control = true; // AI cars never spin their wheels (Tyre 0x4A20D0)
                     vehicle.ai_driven = true;
                     vehicle.body_points = nfs_game::world::car_body_points(&assets);
+                    vehicle.fit_half_extents();
                     self.opponent_models.push(model);
                     let controller = match CarAssets::load_ais(&self.paths, &entry.model) {
                         Ok(ais) => {
@@ -8149,8 +8683,12 @@ impl App {
                         let mut set = TrafficSet::new(&plan, t, 1.0, linear, seed);
                         // `[0x5E8BF8]` for the §5.2 rule 3 early-race boost
                         set.opponents = self.num_opponents;
-                        // traffic drives a tenth slower at night (`ai.md` §5.2.3)
-                        set.night = night;
+                        // The ×0.9 is gated on `[0x657A24]`, which the option registry names
+                        // **`WEATHER`** (id 0x1E at 0x5D1F90) — not the track's night flag. Both
+                        // the shipped `fe.txt` and `fe_out.txt` say `weather = 0`, so it is off in
+                        // every normal race; the port used to pass the night flag here and slowed
+                        // traffic on every night track. Corrected 2026-09-21.
+                        set.weather = false;
                         // `scripts.bin` drives the reactions of `traffic.md` §12.3 / §12.9 / §30
                         if let Some(p) = GamePaths::find_file(
                             &self.paths.game_data().join("Simulation").join("AI"),
@@ -8283,6 +8821,9 @@ impl App {
                             );
                             let mut pol =
                                 nfs_game::police::Police::new(file, cars, self.race_skill, one_way);
+                            // the same `WEATHER` the traffic set gets — `[0x657A24]`, off in a
+                            // normal race, and 0x4081B0 scales every AI car's rate by it
+                            pol.weather = false;
                             pol.budget = nfs_game::police::duty_budget(
                                 1 + self.num_opponents as usize,
                                 false,
@@ -8352,8 +8893,21 @@ impl App {
             car.wheel_radius,
         );
         vehicle.automatic = true;
+        // **The damage the car brings with it.** `Car_raceInit` 0x41083A copies ten dwords from
+        // `carInfo+0xC8 … +0xEC` into `car+0x4E4`, the per-zone body damage, and 0x41085F copies
+        // twenty more from `carInfo+0x78 … +0xC4` into each installed part's `+0x164`. The port had
+        // the second half — `part_wear_for` sums those states into `CarSpecs::wear` — and started
+        // every race with an undented body whatever the garage said.
+        if let Some(cu) = &self.career
+            && let Some(owned) =
+                cu.pending.as_ref().and_then(|p| p.garage_idx).and_then(|i| cu.career.garage.get(i))
+        {
+            vehicle.damage = owned.damage;
+            tracing::info!(damage = ?owned.damage, "body damage carried into the race");
+        }
         // the body the car actually collides with (`BndP`, `RE/notes/car-model.md` §12)
         vehicle.body_points = nfs_game::world::car_body_points(&self.car);
+        vehicle.fit_half_extents();
         self.vehicle = Some(vehicle);
         tracing::info!(pos = ?self.car_pos, "car placed");
         // `GameData/Render/common.fsh`: `SKDP` is the tyre dust (the one texture the original's
@@ -8418,7 +8972,10 @@ impl App {
         self.world = Some(world);
         self.car_model = Some(car);
         // the cockpit view's eye point, for the car's own body style
-        self.driver_cam = nfs_assets::car::DriverCam::from_tpg(&self.car.tpg, 1);
+        // `drivercamposstyle<N>` is keyed on the **raw 0-based** style number — `550.tpg` has a
+        // `drivercamposstyle0` — where `[styleN]` is 1-based. This passed a flat 1.
+        self.driver_cam = nfs_assets::car::DriverCam::from_tpg(&self.car.tpg, self.car.style_index)
+            .map(|dc| if self.mirror { dc.mirrored() } else { dc });
         self.renderer = Some(renderer);
         self.window = Some(window);
         self.rebuild_scene();
@@ -8719,6 +9276,11 @@ impl ApplicationHandler for App {
                         l.set_combo_scroll(at.map(|(i, r)| (i, r, held)));
                     }
                 }
+                if let Some((cx, cy)) = self.cursor
+                    && let Some(l) = self.layout_preview.as_mut()
+                {
+                    l.picture_drag_to(cx, cy);
+                }
                 if self.bar_grab.is_some()
                     && let Some((cx, cy)) = self.cursor
                     && let Some((_, name, f)) = self.layout_preview.as_ref().and_then(|l| l.bar_at(cx, cy))
@@ -8738,6 +9300,22 @@ impl ApplicationHandler for App {
                     l.set_pressed(down);
                 }
                 self.mouse_down = down;
+                // `NFS5.ChroniclePicture` drags its picture about: slot 5 takes hold, slot 8
+                // pans, slot 9 lets go (§4.119)
+                if let Some((cx, cy)) = self.cursor {
+                    let hit = self
+                        .layout_preview
+                        .as_ref()
+                        .and_then(|l| l.hovered())
+                        .filter(|i| self.layout_preview.as_ref().and_then(|l| l.class_of(*i)).as_deref() == Some("NFS5.ChroniclePicture"));
+                    if let Some(l) = self.layout_preview.as_mut() {
+                        match (down, hit) {
+                            (true, Some(i)) => l.picture_press(i, cx, cy),
+                            (false, _) => l.picture_release(),
+                            _ => {}
+                        }
+                    }
+                }
                 if !down {
                     // 0x4C1FB0: the release hands `[this+0x14C]` to 0x5292D0 and zeroes it
                     self.setting_repeat = None;
@@ -8929,6 +9507,22 @@ impl ApplicationHandler for App {
                     {
                         self.usedcars_showparts = which == 0;
                         self.bind_usedcars_panels();
+                        return;
+                    }
+                    // a click on a timeline cell — `FEChronicleMainBoxControl`'s slot 9,
+                    // 0x5080C0: row 0 opens `chroniclepicture` and row 1 `chroniclemedia`, each
+                    // for the column's own year and variant, and only when 0x5074A0 finds files
+                    // there (§4.120)
+                    if !down
+                        && let Some((cx, cy)) = self.cursor
+                        && let Some((col, row)) = self.layout_preview.as_ref().and_then(|l| l.chronicle_cell_at(cx, cy))
+                    {
+                        self.chronicle_col = Some(col);
+                        self.bind_chronicle_icons();
+                        self.bind_lists();
+                        if row < 2 && !self.chronicle_media_for(row).is_empty() {
+                            self.open_layout(if row == 0 { "chroniclepicture" } else { "chroniclemedia" });
+                        }
                         return;
                     }
                     // and a click on one of `chronicle.lay`'s five model-group buttons moves
@@ -9259,10 +9853,7 @@ fn main() -> Result<()> {
                 .map(|c| c.sim.clone())
         })
         .unwrap_or_else(|| "default".into());
-    let mut sim = CarAssets::load_sim(&paths, &sim_name)?;
-    if let Some(r) = &career_request {
-        nfs_game::career::apply_parts(&mut sim, &r.parts.iter().collect::<Vec<_>>());
-    }
+    let sim = CarAssets::load_sim(&paths, &sim_name)?;
     let sound_set = catalog
         .iter()
         .find(|c| c.sim.eq_ignore_ascii_case(&sim_name))
@@ -9281,7 +9872,16 @@ fn main() -> Result<()> {
         })
         .unwrap_or([0xD4, 0x10, 0x10]);
     let race_class = sim_name.to_lowercase().starts_with("gt") || sim_name.starts_with("935");
-    let specs = CarSpecs::from_sim(&sim, race_class);
+    let mut specs = CarSpecs::from_sim(&sim, race_class);
+    if let Some(r) = &career_request {
+        let family = catalog
+            .iter()
+            .find(|c| c.sim.eq_ignore_ascii_case(&sim_name))
+            .map(|c| c.sim_family.clone())
+            .unwrap_or_default();
+        specs.apply_parts(&r.parts.iter().collect::<Vec<_>>(), &family);
+    }
+    let specs = specs;
     tracing::info!(
         sim = sim_name,
         name = specs.name,
@@ -9502,7 +10102,9 @@ fn main() -> Result<()> {
     let mut app = App {
         bar_grab: None,
         chronicle_group: CHRONICLE_GROUP,
+        chronicle_col: None,
         usedcars_showparts: false,
+        usedcar_sel: 0,
         parts_sel: None,
         setting_repeat: None,
         mouse_down: false,
@@ -9643,6 +10245,7 @@ fn main() -> Result<()> {
         particles: nfs_game::particles::Particles::default(),
         particle_draw: None,
         shadow_draw: None,
+        shadow_meshes: Vec::new(),
         glare_draw: None,
         track_cameras: None,
         reverb: nfs_audio::reverb::Reverb::default(),

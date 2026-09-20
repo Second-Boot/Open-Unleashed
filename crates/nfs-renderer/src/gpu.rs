@@ -377,6 +377,34 @@ impl Renderer {
         self.config.width as f32 / self.config.height.max(1) as f32
     }
 
+    /// A mesh whose vertices are rewritten every frame — [`Self::write_mesh_vertices`]. The index
+    /// buffer and the index count are fixed at upload; only the vertex data moves.
+    pub fn upload_dynamic_mesh(&mut self, mesh: &MeshData) -> MeshId {
+        let vertex_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dynamic mesh vb"),
+            contents: bytemuck::cast_slice(&mesh.vertices),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        });
+        let index_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dynamic mesh ib"),
+            contents: bytemuck::cast_slice(&mesh.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        self.meshes.push(GpuMesh { vertex_buf, index_buf, index_count: mesh.indices.len() as u32 });
+        MeshId(self.meshes.len() as u32 - 1)
+    }
+
+    /// Rewrite a dynamic mesh's vertices. The slice must be no longer than the one it was uploaded
+    /// with; anything else is ignored.
+    pub fn write_mesh_vertices(&mut self, id: MeshId, vertices: &[Vertex]) {
+        let Some(m) = self.meshes.get(id.0 as usize) else { return };
+        let bytes: &[u8] = bytemuck::cast_slice(vertices);
+        if bytes.len() as u64 > m.vertex_buf.size() {
+            return;
+        }
+        self.queue.write_buffer(&m.vertex_buf, 0, bytes);
+    }
+
     pub fn upload_mesh(&mut self, mesh: &MeshData) -> MeshId {
         let vertex_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh vb"),

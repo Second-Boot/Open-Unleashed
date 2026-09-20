@@ -155,6 +155,18 @@ pub struct LayoutScreen {
     /// `fontPathName` (lower-cased) → font, plus the front end's default
     fonts: HashMap<String, BitmapFont>,
     white: TextureId,
+    /// how long the cursor has been animating, for the frame of a multi-frame shape (§4.152)
+    cursor_ms: u32,
+    /// where the 3D room's turntable stands, in turns — what `FECar3DControl`'s zone test reads
+    /// out of the room through `[[0x65B928]+0xE8]`'s slot 0xB4 (§4.153)
+    car_spin: f32,
+    /// `(combo element, row)` — the open drop-down's hovered row, kept from the last frame the
+    /// pointer was actually on the list. The original keeps it in `[this+0x1A8]` with
+    /// `[this+0x1A4]` as "there is one", and **`FEComboBox`'s leave handler 0x4C6F00 does not
+    /// clear either when the pointer has gone onto the list's own scrollbar** — 0x4C6F21 asks the
+    /// scrollbar at `[this+0x1B8]` whether it has the pointer now and returns before the
+    /// `mov byte [esi+0x1A4], 0` at 0x4C6F31. So the row stays lit while you reach for the bar.
+    combo_hover: std::cell::Cell<Option<(usize, usize)>>,
     /// widget classes the file does not place, with how many of each were skipped
     unrendered: Vec<(String, usize)>,
     /// element index of an `NFS5.CarLogo` → the `.fsh` pack and the first of its two entries
@@ -260,6 +272,18 @@ pub struct LayoutScreen {
     /// The widgets the screen has **disabled** — `[widget+0x10C] & 0x10` (§4.113), which
     /// 0x4C831E turns into `[state.disabled]`.
     disabled_flags: std::collections::BTreeSet<usize>,
+    /// `NFS5.ChroniclePicture`'s pan: where each widget's picture has been dragged to
+    /// (`[widget+0x14C]`, `[+0x150]`), and, while a drag is on, which widget it is, where the
+    /// pointer took hold (`[+0x144]`, `[+0x148]`) and the offset it had then (`[+0x154]`,
+    /// `[+0x158]`). §4.119.
+    picture_pan: std::collections::BTreeMap<usize, (f32, f32)>,
+    picture_drag: Option<(usize, f32, f32, f32, f32)>,
+    /// The five year-and-variant columns the chronicle's timeline is showing — what 0x507B4F's
+    /// walk settles on and writes into `[this+0x160]` and `[this+0x174]` (§4.118, §4.122).
+    chronicle_columns: Vec<(u32, usize)>,
+    /// The timeline's icon pack, and the entry each (column, row) cell shows in its two states —
+    /// `0x507340(year, row, variant, hot)`'s two slots (§4.118, §4.123).
+    chronicle_icons: (String, std::collections::BTreeMap<(usize, usize), (usize, usize)>),
     /// the six `WeeIcons.fsh` entries the combo scrollbar's two arrows cycle (§4.90, §4.101)
     combo_arrows: Option<[usize; 6]>,
     /// a list's scrollbar knob parked at the pointer by a press on the **track**, until the first
@@ -589,6 +613,13 @@ impl Transition {
 /// wide (0x4DB030).
 pub const LIST_ROW_H: f32 = 14.0;
 pub const LIST_SCROLLBAR_W: f32 = 16.0;
+
+/// `"%sshow.fsh"` — the pack `NFS5.ANIMSHOWCASEPICTURE` cycles, four pictures and four labels
+/// (0x4BDBC5, §4.127).
+pub const SHOWCASE_ANIM: &str = "show.fsh";
+
+/// `CameraPicture.ctr`'s `shp` part — `optart.fsh`, indexed by `data.picturenum` (§4.129).
+pub const CAMERA_PICTURES: &str = "optart.fsh";
 /// `VerticalSlider.ctr`'s `[part.knob]` is `decrement_button.size.width,15`
 pub const LIST_KNOB_H: f32 = 15.0;
 
@@ -644,6 +675,12 @@ pub enum ListRow {
     /// A parts list's category heading: a black rule above and below and the name centred between
     /// them (`drawPartsHeading` 0x518DE0), 13 px tall.
     Header(String),
+    /// The garage list's own grouping heading — two rules **13 px** apart with the name between
+    /// them, drawn by `FEOwnedCarAccessor`'s row painter 0x4F5D54…0x4F5DB3 and costing **14** px
+    /// of row height. Its height comes out of slot 26 (0x4F60F0): a row whose era differs from
+    /// the one above it is **42** — two headings and the row — one whose class differs is **28**,
+    /// and any other row is **14**. `RE/notes/controls.md` §4.144.
+    GroupHeading(String),
 }
 
 impl ListRow {
@@ -654,6 +691,7 @@ impl ListRow {
             ListRow::Text(_) => LIST_ROW_H,
             ListRow::Columns(_) => LIST_ROW_H,
             ListRow::Header(_) => PART_HEADER_H,
+            ListRow::GroupHeading(_) => LIST_ROW_H,
         }
     }
 }
@@ -765,6 +803,19 @@ const BADGE_RANK_FONT: &str = "univers10b.ffn";
 /// The drop shadow `NFS5.BADGE` lays over the licence card (0x4CF208).
 const LICENSE_SHADOW: &str = "LicenseShadow.fsh";
 
+/// The front end draws its own pointer, out of `FEData/Art/Pointer.fsh` — `controls.md` §4.152.
+const POINTER: &str = "Pointer.fsh";
+
+/// The ten shapes, as `{firstFrame, lastFrame}` over `Pointer.fsh`'s 34 entries. This is the table
+/// at **0x5D9C8C**, read out pair by pair; every pair lands exactly on a tag boundary in the file
+/// (`00`…`05`, `watc`, `mags`, `magP`, `pick`, `Lift`×6, `Pan.`×6, `Poin`×6, `grab`×6).
+pub const CURSOR_SHAPES: [(usize, usize); 10] =
+    [(0, 0), (1, 5), (9, 9), (10, 15), (16, 21), (28, 33), (22, 27), (7, 7), (8, 8), (6, 6)];
+
+/// How long one frame of an animated shape is held. **APPROXIMATION** — the rate is the one thing
+/// about the cursor §4.152 could not read.
+const CURSOR_FRAME_MS: u32 = 80;
+
 /// Classes whose content comes from the executable and which the port does not draw. `NFS5.3DCAR`
 /// is not one of them any more: the car it shows belongs to the screen's 3D room
 /// (`RE/notes/frontend-3d.md`), which the port renders behind the screen.
@@ -801,7 +852,11 @@ impl LayoutScreen {
             .filter(|_| screen.layout.screen().and_then(|s| s.get("screen")).is_none_or(str::is_empty));
         if let Some(bg) = forced.as_deref().or_else(|| screen.layout.screen().and_then(|s| s.get("screen")).and_then(background_layout)) {
             match Self::load_one(r, paths, bg, controls, fe_strings) {
-                Ok(b) => screen.background = Some(Box::new(b)),
+                Ok(mut b) => {
+                    // a background screen never draws the pointer — the screen in front of it does
+                    b.cursor_ms = u32::MAX;
+                    screen.background = Some(Box::new(b));
+                }
                 Err(e) => tracing::debug!(background = bg, error = %e, "background screen unavailable"),
             }
         }
@@ -1082,6 +1137,12 @@ impl LayoutScreen {
                 wanted.push((f.to_string(), n));
             }
         }
+        // The pointer belongs to no widget — the front end draws it itself out of
+        // `FEData/Art/Pointer.fsh` every frame (§4.152), so its 34 entries have to be asked for
+        // here or nothing would ever load them.
+        for i in 0..34 {
+            wanted.push((POINTER.to_string(), i));
+        }
         for (file, index) in wanted {
             let file = file.as_str();
             let key = (file.to_string(), index);
@@ -1159,7 +1220,7 @@ impl LayoutScreen {
         let mut unrendered: Vec<(String, usize)> = counts.into_iter().collect();
         unrendered.sort();
         tracing::info!(name, elements = layout.elements.len(), art = shapes.len(), fonts = fonts.len(), skipped = unrendered.len(), "layout loaded");
-        Ok(Self { layout, background: None, shapes, fonts, white, unrendered, logos: HashMap::new(), checks: HashMap::new(), knobs: HashMap::new(), closed: std::collections::HashSet::new(), groups: HashMap::new(), bars: HashMap::new(), lists: HashMap::new(), car_views: HashMap::new(), track_maps: HashMap::new(), movies: HashMap::new(), ko_strip: HashMap::new(), badges: HashMap::new(),
+        Ok(Self { layout, background: None, shapes, fonts, white, cursor_ms: 0, car_spin: 0.0, combo_hover: std::cell::Cell::new(None), unrendered, logos: HashMap::new(), checks: HashMap::new(), knobs: HashMap::new(), closed: std::collections::HashSet::new(), groups: HashMap::new(), bars: HashMap::new(), lists: HashMap::new(), car_views: HashMap::new(), track_maps: HashMap::new(), movies: HashMap::new(), ko_strip: HashMap::new(), badges: HashMap::new(),
             // `NFS_FE_CLOCK` preloads the screen clock in milliseconds, so a still can be taken
             // part way through an animation the front end would otherwise only show in motion
             clock_ms: std::env::var("NFS_FE_CLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0), glint, colb,
@@ -1186,6 +1247,10 @@ impl LayoutScreen {
             selected_flags: Default::default(),
             hidden_flags: Default::default(),
             disabled_flags: Default::default(),
+            picture_pan: Default::default(),
+            picture_drag: None,
+            chronicle_columns: Vec::new(),
+            chronicle_icons: (String::new(), Default::default()),
             combo_arrows,
             knob_at: None,
             scroll: HashMap::new(),
@@ -2272,7 +2337,9 @@ impl LayoutScreen {
             .elements
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.class == "NFS5.ListBox")
+            // `NFS5.CHATDISPLAYBOX` takes the same binding: its draw is a row walk over its own
+            // accessor too, only with a fixed spacing rather than the list box's 14 (§4.131)
+            .filter(|(_, e)| e.class == "NFS5.ListBox" || e.class == "NFS5.CHATDISPLAYBOX")
             .map(|(index, e)| ListBoxWidget { index, accessor: self.attr(e, "accessor").map(str::to_string) })
             .collect()
     }
@@ -2756,6 +2823,24 @@ impl LayoutScreen {
         self.logos.insert(index, key);
     }
 
+    /// Load one entry of a pack into the shape cache, without binding it to a widget — the
+    /// timeline's icons are ten cells inside a single widget, not ten widgets (§4.123).
+    pub fn load_pack_entry(&mut self, r: &mut Renderer, paths: &GamePaths, dir: &str, file: &str, entry: usize) {
+        let key = (file.to_string(), entry);
+        if self.shapes.contains_key(&key) {
+            return;
+        }
+        let dir = paths.fe_data().join(dir);
+        let entries = GamePaths::find_file(&dir, file)
+            .and_then(|p| std::fs::read(&p).ok().map(|d| (p, d)))
+            .and_then(|(p, d)| decode_pack(&p, &d).ok())
+            .unwrap_or_default();
+        let Some(img) = entries.get(entry) else { return };
+        let Some(px) = img.mips.first() else { return };
+        let id = r.upload_texture(&TextureData::single(img.width, img.height, px.clone()));
+        self.shapes.insert(key, (id, img.width as f32, img.height as f32));
+    }
+
     /// Bind a `NFS5.MOVIEBOX` to a `.mad` and start it playing.
     ///
     /// The whole file is kept, its video chunks indexed, and one texture allocated to decode into.
@@ -2816,6 +2901,134 @@ impl LayoutScreen {
     /// Step every `NFS5.MOVIEBOX` on this screen by `dt_ms`, decoding and uploading the frames its
     /// own period calls for. A movie that has run out starts again, which is what a front-end loop
     /// does.
+    /// Step the cursor's animation clock. The original has no such clock — it walks a shape's
+    /// frames off the front end's own tick — so the **rate is this port's** (`CURSOR_FRAME_MS`),
+    /// and it is the one number §4.152 could not read.
+    pub fn advance_cursor(&mut self, dt_ms: u32) {
+        if self.cursor_ms != u32::MAX {
+            self.cursor_ms = self.cursor_ms.wrapping_add(dt_ms) % (CURSOR_FRAME_MS * 64);
+        }
+    }
+
+    /// Which cursor shape this screen asks for, and the frame of it to draw.
+    ///
+    /// **A shape is requested, not set**: 0x4E1E50 is `[0x690720] = max([0x690720], n)` and
+    /// 0x4D2F3D clears the slot at the top of the next frame, so the highest number anyone asked
+    /// for during a frame is the one drawn (§4.152). The two requesters the notes have read are
+    /// `FEControl`'s slot 24 — 0x4C7F40, `push 1`, dispatched from the per-tick slot 16 at
+    /// 0x4C7FDF while a widget is hovered — and `FECar3DControl`'s slot 15, `push 7`, the
+    /// magnifier over a hovered 3D car (`frontend-3d.md` §5).
+    fn cursor_shape(&self, hovered: Option<usize>) -> usize {
+        let mut want = 0usize;
+        if let Some(h) = hovered {
+            want = want.max(1);
+            if let Some(e) = self.layout.elements.get(h)
+                && e.class.eq_ignore_ascii_case("NFS5.3DCAR")
+            {
+                // A **focused** 3D car is the magnifier, shape 7 — 0x4C09F7 tests 0x4C7DD0,
+                // bit 0x40 of `[widget+0x10C]` (§4.109), and only then pushes 7. **The port
+                // never focuses a 3D car**, so that branch is not reachable here and is left
+                // out rather than guessed at. A merely *hovered* one — 0x4C7C90, bit 0x04 —
+                // asks per zone, and that is what this does.
+                want = want.max(match self.car_zone(e) {
+                    Some(0) => 6,
+                    // zones 1 and 2 read `byte[this+0x1AE + (zone != 1)]` at 0x4C0A41: an open
+                    // part is `magP`, a closed one `grab`. The port opens no parts (§4.153), so
+                    // both bytes are always clear and the answer is always 5.
+                    Some(1 | 2) => 5,
+                    Some(_) => 3,
+                    // hovered but off the box — the plain hovered arrow slot 24 already asked for
+                    None => 1,
+                });
+            }
+        }
+        want
+    }
+
+    /// Which of the five zones of a `NFS5.3DCAR` the pointer is in — `FECar3DControl`'s
+    /// **0x4C0D10**, `RE/notes/controls.md` §4.153. `None` when the pointer is not on it.
+    ///
+    /// The zone is the turntable angle's fraction crossed with the horizontal third of the
+    /// widget's box, and the answers are the ones 0x4C0DCD…0x4C0E89 write into `edi`.
+    fn car_zone(&self, e: &nfs_formats::lay::Element) -> Option<u32> {
+        let (x, y) = self.cursor?;
+        let (bx, by) = self.position_of(e);
+        let (w, h) = self.box_of(e, 0);
+        car_zone_of(self.car_spin, x, y, bx, by, w, h)
+    }
+
+    /// Where the 3D room's turntable stands, in turns, for [`Self::car_zone`].
+    pub fn set_car_spin(&mut self, turns: f32) {
+        self.car_spin = turns;
+    }
+}
+
+/// The body of [`LayoutScreen::car_zone`], free of the screen so it can be tested on its own.
+pub fn car_zone_of(spin: f32, x: f32, y: f32, bx: f32, by: f32, w: f32, h: f32) -> Option<u32> {
+    {
+        if x < bx || y < by || x >= bx + w || y >= by + h {
+            return None;
+        }
+        // 0x4C0D5D: the top **5/16** of the box is zone 0 whatever the angle. (The original
+        // reaches this only when 0x438190(model, 1) is non-zero — a model property the port does
+        // not carry — so the port always applies it. APPROXIMATION, and the only one here.)
+        if y <= by + 5.0 * h / 16.0 {
+            return Some(0);
+        }
+        let t = spin.rem_euclid(1.0);
+        let third = w / 3.0;
+        let left = x < bx + third;
+        let right = x > bx + w - third;
+        // 0x4C0DD2…0x4C0E89, in the order the compares run
+        Some(match t {
+            t if t <= 0.1 || t > 0.9 => 4,
+            t if t <= 0.4 =>
+            // 0x4C0E57: left third 4, middle 2, right 3
+            {
+                if left {
+                    4
+                } else if right {
+                    3
+                } else {
+                    2
+                }
+            }
+            t if t <= 0.6 => 3,
+            // 0x4C0E0F: left third 3, middle 1, right 4
+            _ => {
+                if left {
+                    3
+                } else if right {
+                    4
+                } else {
+                    1
+                }
+            }
+        })
+    }
+}
+
+impl LayoutScreen {
+
+    /// The cursor itself, drawn over everything. Nothing else in the screen may come after it.
+    fn cursor_sprite(&self, out: &mut Vec<Sprite>, aspect: f32, hovered: Option<usize>) {
+        // `u32::MAX` marks a screen that is somebody's background; only the screen in front draws
+        if self.cursor_ms == u32::MAX {
+            return;
+        }
+        let Some((cx, cy)) = self.cursor else { return };
+        let shape = self.cursor_shape(hovered);
+        let Some(&(first, last)) = CURSOR_SHAPES.get(shape) else { return };
+        let n = last - first + 1;
+        let frame = first + if n > 1 { (self.cursor_ms / CURSOR_FRAME_MS) as usize % n } else { 0 };
+        let Some(&(tex, w, h)) = self.shapes.get(&(POINTER.to_string(), frame)) else { return };
+        // the one hot spot the notes have: −6.0 for shape 2 (0x4D32EF). Every other shape is
+        // drawn with its top-left corner on the pointer.
+        let ox = if shape == 2 { -6.0 } else { 0.0 };
+        let (pos, size) = self.place(aspect, cx + ox, cy, w, h);
+        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+    }
+
     pub fn advance_movies(&mut self, r: &mut Renderer, dt_ms: u32) {
         for m in self.movies.values_mut() {
             m.clock_q16 += (dt_ms as u64) << 16;
@@ -3515,6 +3728,28 @@ impl LayoutScreen {
     /// the `else` arm cannot fire. `NFS5.CHATINPUTBOX` shares that slot, and its own bind
     /// 0x4C32D3 starts by calling the input box's 0x4CC430, so `data.alwaysfocused` reaches it
     /// too (§4.109).
+    /// Every class on this screen with the parts its template declares that **no state lists**.
+    ///
+    /// The part walk can never reach one, so only the class's own draw can put it down — and
+    /// `NFS5.CAMERAPICTURE`'s `shp` (§4.129) is exactly that: a part the bind looks up by name.
+    /// A measurement axis for the same kind of gap: a part here that the port draws nowhere is a
+    /// thing the original puts on the screen and this port does not.
+    pub fn unlisted_parts(&self) -> Vec<(String, Vec<String>)> {
+        let mut out: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for e in &self.layout.elements {
+            let Some(c) = self.controls.get(&e.class) else { continue };
+            let used: std::collections::BTreeSet<&str> = c.states.values().flatten().map(String::as_str).collect();
+            let dead: Vec<String> = c.parts_order.iter().filter(|p| p.as_str() != "data" && !used.contains(p.as_str())).cloned().collect();
+            if !dead.is_empty() {
+                out.insert(e.class.clone(), dead);
+            }
+        }
+        for (_, g) in self.group_spans() {
+            out.extend(g.unlisted_parts());
+        }
+        out.into_iter().collect()
+    }
+
     /// Every class on this screen with the states its `.ctr` template declares — the very set
     /// `FeWidget`'s slot 12 (0x4C7760) turns into `[widget+0x110]`, and therefore the complete
     /// list of looks the original can ever put a widget of that class into (§4.109, §4.110).
@@ -3552,6 +3787,98 @@ impl LayoutScreen {
             out.extend(g.widgets_named(names).into_iter().map(|(i, k)| (i + base, k)));
         }
         out
+    }
+
+}
+
+/// `FEChronicleMainBoxControl`'s grid, from its slot 8 — **0x508020**:
+///
+/// ```text
+/// 0x50802D  p = the widget's position (0x525310)
+/// 0x508042  [this+0x154] = (ev.x - p.x) / 91          ; 0xB40B40B5, add, sar 6
+/// 0x508055  [this+0x150] = (ev.y - p.y - 0x26) / 61   ; 0x4325C53F, sar 4
+/// 0x50807A  [this+0x14C] = 0 <= col < 5 && 0 <= row < 3
+/// ```
+///
+/// The two magic constants are emulated rather than guessed: 91 and 61 are the only divisors that
+/// reproduce them over the whole range. Slot 7 (0x508010) clears the flag when the pointer leaves,
+/// and slot 9 (0x5080C0) is the click — **row 0 goes to `chroniclepicture` and row 1 to
+/// `chroniclemedia`**, each through `0x5074A0(row, [this+0x160 + 4*col], [this+0x174 + 4*col])`.
+/// So the row is the kind and the column the year-and-variant. `RE/notes/controls.md` §4.120.
+pub fn chronicle_cell(px: f32, py: f32, x: f32, y: f32) -> Option<(usize, usize)> {
+    let (dx, dy) = (px - x, py - y - 0x26 as f32);
+    if dx < 0.0 || dy < 0.0 {
+        return None;
+    }
+    let (col, row) = ((dx as i32 / 91) as usize, (dy as i32 / 61) as usize);
+    (col < 5 && row < 3).then_some((col, row))
+}
+
+impl LayoutScreen {
+    /// Which timeline cell the pointer is on, against this screen's own
+    /// `NFS5.ChronicleMainBoxControl` (§4.120).
+    pub fn chronicle_cell_at(&self, px: f32, py: f32) -> Option<(usize, usize)> {
+        let i = self.layout.elements.iter().position(|e| e.class == "NFS5.ChronicleMainBoxControl")?;
+        let (x, y) = self.position_of(&self.layout.elements[i]);
+        chronicle_cell(px, py, x, y)
+    }
+}
+
+impl LayoutScreen {
+    /// The timeline's five columns, in the order 0x507B4F walks them (§4.122).
+    pub fn set_chronicle_columns(&mut self, cols: Vec<(u32, usize)>) {
+        self.chronicle_columns = cols;
+        for g in self.groups.values_mut() {
+            g.set_chronicle_columns(self.chronicle_columns.clone());
+        }
+    }
+
+    /// The pack and the per-cell entries the timeline's icons come from (§4.123).
+    pub fn set_chronicle_icons(&mut self, pack: String, cells: std::collections::BTreeMap<(usize, usize), (usize, usize)>) {
+        self.chronicle_icons = (pack, cells);
+    }
+
+    /// `FEChroniclePictureControl`'s three mouse slots — the class `NFS5.ChroniclePicture`
+    /// instantiates, vtable **0x5B8C74**:
+    ///
+    /// ```text
+    /// 0x508250  slot 5  [+0x154] = [+0x14C]; [+0x158] = [+0x150]     ; remember the offset
+    ///                   [+0x140] = 1; [+0x144] = ev.x; [+0x148] = ev.y
+    /// 0x5082A0  slot 8  while [+0x140]:
+    ///                     [+0x14C] = [+0x154] - ev.x + [+0x144]
+    ///                     [+0x150] = [+0x158] - ev.y + [+0x148]
+    /// 0x508290  slot 9  [+0x140] = 0
+    /// ```
+    ///
+    /// so the offset moves **against** the pointer, the way a document scrolls under a hand, and
+    /// the bind 0x508220 starts all five at zero. §4.119.
+    pub fn picture_press(&mut self, index: usize, x: f32, y: f32) {
+        if let Some((k, j)) = self.route(index) {
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.picture_press(j, x, y);
+            }
+            return;
+        }
+        let (ox, oy) = self.picture_pan.get(&index).copied().unwrap_or((0.0, 0.0));
+        self.picture_drag = Some((index, x, y, ox, oy));
+    }
+
+    /// Slot 8, 0x5082A0 — the pan follows the pointer while the button is held.
+    pub fn picture_drag_to(&mut self, x: f32, y: f32) {
+        if let Some((i, gx, gy, ox, oy)) = self.picture_drag {
+            self.picture_pan.insert(i, (ox - x + gx, oy - y + gy));
+        }
+        for g in self.groups.values_mut() {
+            g.picture_drag_to(x, y);
+        }
+    }
+
+    /// Slot 9, 0x508290.
+    pub fn picture_release(&mut self) {
+        self.picture_drag = None;
+        for g in self.groups.values_mut() {
+            g.picture_release();
+        }
     }
 
     /// Enable or disable a widget, as the by-name helper **0x50D880** does: 0x50D8DB reads the
@@ -5252,6 +5579,34 @@ impl LayoutScreen {
                     for (px, py, pw, ph, c) in self.rect_parts_in(e, state) {
                         out.push(self.quad(aspect, x + px, y + py, pw.max(1.0), ph.max(1.0), tint(c)));
                     }
+                    // **`NFS5.CHATDISPLAYBOX` is a list.** Its bind 0x4C2B60 takes the font
+                    // `Univers8b` into `[this+0x140]`, `data.spacing` into `[+0x144]` and
+                    // **`data.height / data.spacing`** into `[+0x148]` (0x4C2BD7's `idiv`) — the
+                    // number of rows that fit — and the draw 0x4C2F50 walks them:
+                    //
+                    // ```text
+                    // 0x4C2FCC  first = [this+0x150]->slot10()        ; the accessor's index
+                    // 0x4C2FEC  for i = first .. first + [+0x148]:
+                    // 0x4C3000    y = (i - first) * [+0x144] + box.top + 2
+                    // 0x4C303A    x = box.left + 1 + 3.0               ; [0x5B2600]
+                    // 0x4C304F    0x4DA350(font, x, y, 0, 0x4D87E0(fade), row, 1.0, 1.0)
+                    // ```
+                    //
+                    // so the rows are **black** at the widget's fade, `spacing` apart, and the
+                    // list is `Comms.PlayerList` on all three shipped widgets. §4.131.
+                    if e.class == "NFS5.CHATDISPLAYBOX"
+                        && let Some(cf) = self.fonts.get("univers8b.ffn").or_else(|| self.font_for(e))
+                        && let Some((rows, cur)) = self.lists.get(&i)
+                    {
+                        let spacing = self.attr_num(e, "spacing").unwrap_or(14.0) as f32;
+                        let fit = if spacing > 0.0 { (self.attr_num(e, "height").unwrap_or(0.0) as f32 / spacing) as usize } else { 0 };
+                        let first = cur.unwrap_or(0);
+                        for (k, row) in rows.iter().skip(first).take(fit).enumerate() {
+                            if let ListRow::Text(t) = row {
+                                self.text(&mut out, aspect, cf, t, x + 4.0, y + 2.0 + k as f32 * spacing, 0.0, 0, [0.0, 0.0, 0.0, talpha]);
+                            }
+                        }
+                    }
                     // The three input boxes share one class — `NFS5.INPUTBOX`,
                     // `NFS5.CHATINPUTBOX` and `NFS5.CHARVECTACCESSORINPUTBOX` all write vtable
                     // 0x5B60AC — and its draw **0x4CC950** puts a drop shadow at (4, 4) over the
@@ -5447,14 +5802,24 @@ impl LayoutScreen {
                     // measures from the selection box, one pixel below it.
                     let hover_row = self.cursor.and_then(|(cx, cy)| {
                         if !(cx >= px && cx < px + panel_w && cy >= py && cy < py + panel_h) {
-                            return None;
+                            // off the list. 0x4C6F00 clears the row *unless* the pointer has
+                            // landed on this list's own scrollbar, so keep the last one then.
+                            return match (self.combo_scroll, self.combo_hover.get()) {
+                                (Some((c, _, _)), Some((h, n))) if c == i && h == i => Some(n),
+                                _ => {
+                                    self.combo_hover.set(None);
+                                    None
+                                }
+                            };
                         }
                         let mut acc = py;
                         let first = self.scroll.get(&i).copied().unwrap_or(0);
-                        rows.iter().skip(first).position(|r| {
+                        let n = rows.iter().skip(first).position(|r| {
                             acc += r.height();
                             cy < acc
-                        }).map(|n| n + first)
+                        }).map(|n| n + first);
+                        self.combo_hover.set(n.map(|n| (i, n)));
+                        n
                     });
                     // The row loop starts at the scrollbar's own position — 0x4C66E8 takes
                     // `[this+0x1BC]->slot10()` for its first row (§4.45)
@@ -5473,6 +5838,18 @@ impl LayoutScreen {
                     // inset highlight 0x521810 (0x515746), over the row's own 13-pixel bar. This
                     // port has no pressed row in a list, so only the second arm is here. §4.75.
                     let parts_glass = e.get("accessor").is_some_and(|a| a.starts_with("Parts.AllParts"));
+                    // `FEAllPartsAccessor::drawRow` 0x515620 puts a **one-pixel, 14-tall black
+                    // rule** at the `ID_PRICEPOS` anchor on every row, before it looks at the
+                    // section at all: 0x515641 finds the widget by name through 0x4D63E0,
+                    // 0x51569B takes `0x4D87E0(fade)` — black — and 0x5156AC pushes 14.0 and
+                    // 1.0 into 0x4D9280. It is the column the price is written against. §4.124.
+                    let price_x = parts_glass.then(|| self.anchor_x("ID_PRICEPOS")).flatten();
+                    // and the row's own bar: `section < 2` — the headings and the car's own parts,
+                    // which is the **second** of the two lists this port builds (§4.114) — takes a
+                    // 13-tall bar in `0x4D87B0`, the dark red 0xBC0000, when the caller hands it
+                    // no colour (0x5156DE, 0x5156FE). The shop's rows take a one-pixel rule
+                    // instead (0x51574E).
+                    let mut headers = 0usize;
                     for (n, row) in rows.iter().enumerate().skip(first) {
                         if acc > panel_h {
                             break;
@@ -5489,6 +5866,9 @@ impl LayoutScreen {
                                     out.push(self.quad(aspect, px, ry, panel_w, LIST_ROW_H, tint(c)));
                                 }
                                 if parts_glass {
+                                    if bar.is_none() {
+                                        out.push(self.quad(aspect, px, ry, panel_w, 13.0, tint([0xBC, 0, 0, 0xFF])));
+                                    }
                                     self.glass(&mut out, aspect, px, ry, panel_w, 13.0, &tint);
                                 }
                                 self.text(&mut out, aspect, f, t, px + 3.0, ry + 2.0, 0.0, 0, fg);
@@ -5499,6 +5879,9 @@ impl LayoutScreen {
                             ListRow::Columns(cells) => {
                                 if let Some(c) = bar {
                                     out.push(self.quad(aspect, px, ry, panel_w, row.height(), tint(c)));
+                                } else if parts_glass && headers >= 2 {
+                                    out.push(self.quad(aspect, px, ry, panel_w, 13.0, tint([0xBC, 0, 0, 0xFF])));
+                                    self.glass(&mut out, aspect, px, ry, panel_w, 13.0, &tint);
                                 }
                                 for cell in cells {
                                     // a cell with no anchor of its own sits at the panel's left edge
@@ -5510,11 +5893,25 @@ impl LayoutScreen {
                             // `drawPartsHeading` 0x518DE0: a black rule at the top and another 13
                             // pixels down, with the name centred two pixels below the first
                             ListRow::Header(t) => {
+                                headers += 1;
                                 let black = [0.0, 0.0, 0.0, 1.0];
                                 out.push(self.quad(aspect, px, ry, panel_w, 1.0, black));
                                 out.push(self.quad(aspect, px, ry + PART_HEADER_H, panel_w, 1.0, black));
                                 self.text(&mut out, aspect, f, t, px, ry + 2.0, panel_w, 1, tint(text_c));
                             }
+                            // the garage list's grouping heading (§4.144): the same two rules 13
+                            // apart, but drawn by the row painter itself — 0x4F5D67 puts a bar at
+                            // the row's y and 0x4F5D8D another at `y + [0x5B7734]` (13.0), with
+                            // `FEStrings[era or class]` between them at 0x4F5DB3
+                            ListRow::GroupHeading(t) => {
+                                let black = [0.0, 0.0, 0.0, 1.0];
+                                out.push(self.quad(aspect, px, ry, panel_w, 1.0, black));
+                                out.push(self.quad(aspect, px, ry + PART_HEADER_H, panel_w, 1.0, black));
+                                self.text(&mut out, aspect, f, t, px, ry + 2.0, panel_w, 1, tint(text_c));
+                            }
+                        }
+                        if let Some(cx) = price_x {
+                            out.push(self.quad(aspect, cx, ry, 1.0, 14.0, tint([0, 0, 0, 0xFF])));
                         }
                         ry += row.height();
                     }
@@ -5664,6 +6061,76 @@ impl LayoutScreen {
                         }
                     }
                 }
+                // **`NFS5.ACCOUNTTHING`** is the bottom bar's money readout, and it is its own
+                // class because it sets the characters by hand. `FEAccountThing`'s bind 0x4BD550
+                // takes the font **`Univers7b`** (0x4DBEB0) into `[this+0x148]` and the
+                // `Tournament.Data` accessor into `[this+0x140]`; the draw 0x4BD5A0 runs the
+                // template's parts first (0x4C8260), asks the accessor for `"CASH"` — which
+                // 0x506250 answers with `0x4DBF80(0x5012D0())`, the money with its commas — and
+                // then walks the string **backwards** from `box.right − 1`:
+                //
+                // ```text
+                // 0x4BD652  x = box.right - 1                     ; [eax+8], less one
+                // 0x4BD66C  for i = strlen - 1 down to 0:
+                // 0x4BD675    the single character into a two-byte buffer
+                // 0x4BD6BA    y = box.top + 3
+                // 0x4BD6DB    0x4DA530(font, x, y, 2, 0x4D87D0(tint), &ch)   ; right-aligned
+                // 0x4BD6EF    x -= (ch == ',') ? 3 : 9
+                // ```
+                //
+                // so it is a fixed pitch of **9** a glyph and **3** a comma, in white at the
+                // widget's own fade. §4.128.
+                "NFS5.ACCOUNTTHING" => {
+                    self.template_widget(&mut out, aspect, e, self.state_for(e, i, selected, hovered), x, y, strings);
+                    let Some(f) = self.fonts.get("univers7b.ffn").or_else(|| self.font_for(e)) else { break 'elem };
+                    let Some(v) = accessor("Tournament.Data(CASH)") else { break 'elem };
+                    let mut cx = x + w - 1.0;
+                    for ch in v.chars().rev() {
+                        self.text(&mut out, aspect, f, &ch.to_string(), cx, y + 3.0, 0.0, 2, [1.0, 1.0, 1.0, talpha]);
+                        cx -= if ch == ',' { 3.0 } else { 9.0 };
+                    }
+                }
+                // **`NFS5.ANIMSHOWCASEPICTURE`** cycles the four pictures of `show.fsh`, each
+                // beside its own label. `FEAnimShowcasePicture`'s bind 0x4BDB90 allocates two
+                // four-entry arrays — `[this+0x140]` from entries **0…3** and `[this+0x144]` from
+                // **4…7** of `"%sshow.fsh"` (0x4BDBC5) — and the draw 0x4BDDC0 runs a two-state
+                // machine off `TIMER_getTicks` (0x53C2E0):
+                //
+                // ```text
+                // 0x4BDFDC  resting ([+0x150] == 0): when now - [+0x154] passes [+0x158],
+                //           [+0x14C] = ([+0x148] + 1) % 4, [+0x150] = 1, [+0x158] = 0x40
+                // 0x4BE059  and it draws [+0x140][[+0x148]] at full alpha
+                // 0x4BDE17  fading: t = (now - [+0x154]) * 255 / [+0x158]
+                // 0x4BDE97  [+0x140][[+0x14C]] at alpha t, [+0x140][[+0x148]] at 255 - t
+                // 0x4BDF94  when it passes, [+0x148] = [+0x14C], [+0x150] = 0, [+0x158] = 0x80
+                // ```
+                //
+                // so a frame rests for **0x80 = 128 ticks** and cross-fades for **0x40 = 64** —
+                // one second and a half at the front end's 128 Hz. The label goes at
+                // `x + picture.width` (0x4BDF72 adds the entry's `+0x14`), the same side-by-side
+                // pair `NFS5.CarLogo` draws. §4.127.
+                "NFS5.ANIMSHOWCASEPICTURE" => {
+                    const REST: i64 = 0x80;
+                    const FADE: i64 = 0x40;
+                    let ticks = (self.clock_ms as u64 * 128 / 1000) as i64;
+                    let phase = ticks.rem_euclid(REST + FADE);
+                    let frame = (ticks.div_euclid(REST + FADE)).rem_euclid(4) as usize;
+                    let mut draw = |out: &mut Vec<Sprite>, n: usize, a: f32| {
+                        let Some(&(tex, aw, ah)) = self.shapes.get(&(SHOWCASE_ANIM.to_string(), n)) else { return };
+                        let Some(&(lt, lw, lh)) = self.shapes.get(&(SHOWCASE_ANIM.to_string(), n + 4)) else { return };
+                        for (t, dx, w2, h2) in [(tex, 0.0, aw, ah), (lt, aw, lw, lh)] {
+                            let (pos, size) = self.place(aspect, x + dx, y, w2, h2);
+                            out.push(Sprite { texture: t, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, a * talpha], rotation: 0.0, pivot: [0.5, 0.5] });
+                        }
+                    };
+                    if phase < REST {
+                        draw(&mut out, frame, 1.0);
+                    } else {
+                        let t = (phase - REST) as f32 * 255.0 / FADE as f32 / 255.0;
+                        draw(&mut out, frame, 1.0 - t);
+                        draw(&mut out, (frame + 1) % 4, t);
+                    }
+                }
                 "NFS5.ChroniclePictureIcon" | "NFS5.ShowcasePicture" | "NFS5.ChroniclePicture" => {
                     let Some(key) = self.logos.get(&i) else { break 'elem };
                     // `NFS5.ChroniclePictureIcon` keeps **two** entries, 0 and 1, and 0x508819
@@ -5678,7 +6145,13 @@ impl LayoutScreen {
                     };
                     let Some(&(tex, aw, ah)) = self.shapes.get(key) else { break 'elem };
                     let (dw, dh) = (if w > 0.0 { w } else { aw }, if h > 0.0 { h } else { ah });
-                    let (pos, size) = self.place(aspect, x, y, dw, dh);
+                    // `NFS5.ChroniclePicture` is draggable: `[this+0x14C]` and `[+0x150]` are a
+                    // pan the mouse slots move against the pointer (§4.119)
+                    let (px, py) = match e.class == "NFS5.ChroniclePicture" {
+                        true => self.picture_pan.get(&i).copied().unwrap_or((0.0, 0.0)),
+                        false => (0.0, 0.0),
+                    };
+                    let (pos, size) = self.place(aspect, x - px, y - py, dw, dh);
                     out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
                     // `NFS5.ChroniclePictureIcon`'s draw ends with the bevel over **the art's own
                     // size** — 0x508906 and 0x508910 read `[entry+0x18]` and `[entry+0x14]`, the
@@ -5790,6 +6263,39 @@ impl LayoutScreen {
                     out.push(self.quad(aspect, x, y + 16.0, 454.0, 20.0, half(red)));
                     out.push(self.quad(aspect, x, y + 38.0, 454.0, 60.0, half(red)));
                     out.push(self.quad(aspect, x, y + 100.0, 454.0, 60.0, half(red)));
+                    // **and the timeline over them**, 0x507B4F. One cell per column, 90 wide at a
+                    // pitch of 91 and 61 apart down from `+0x26` — the two numbers §4.120's hit
+                    // test divides by. The year goes in centred (`push 1`, the align, at
+                    // 0x507BCA) at `x + col + 0x2D` over 0x4DA530 (0x507BF3), and the 90x20
+                    // outline goes 0x10 below it through 0x4D9200 (0x507C09, 0x507C15 pushes
+                    // 20.0 and 0x507C1A 90.0). §4.122.
+                    if let Some(f) = self.font_for(e) {
+                        let hot = self.cursor.and_then(|(px, py)| chronicle_cell(px, py, x, y));
+                        for (col, (year, _)) in self.chronicle_columns.iter().take(5).enumerate() {
+                            let cx = x + col as f32 * 91.0;
+                            // the year, centred in its column, and the 90x20 cell 0x10 under it
+                            // — which lands on the 454x20 bar the draw put at `+0x10` (§4.123)
+                            self.text(&mut out, aspect, f, &format!("{}", 1900 + year), cx + 45.0, y + 2.0, 0.0, 1, black);
+                            for (bx, by, bw, bh) in [(cx, y + 16.0, 90.0, 1.0), (cx, y + 35.0, 90.0, 1.0), (cx, y + 16.0, 1.0, 20.0), (cx + 89.0, y + 16.0, 1.0, 20.0)] {
+                                out.push(self.quad(aspect, bx, by, bw, bh, black));
+                            }
+                            // and **two** icon cells of 90 x 60, 0x3E apart (0x507DD8), which is
+                            // where the two 454x60 bars are; the icon goes in at (+1, +1)
+                            for r in 0..2 {
+                                let by = y + 38.0 + r as f32 * 62.0;
+                                let on = hot == Some((col, r));
+                                if let Some((rest, over)) = self.chronicle_icons.1.get(&(col, r))
+                                    && let Some(&(tex, aw, ah)) = self.shapes.get(&(self.chronicle_icons.0.clone(), if on { *over } else { *rest }))
+                                {
+                                    let (pos, size) = self.place(aspect, cx + 1.0, by + 1.0, aw, ah);
+                                    out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5] });
+                                }
+                                for (bx, by, bw, bh) in [(cx, by, 90.0, 1.0), (cx, by + 59.0, 90.0, 1.0), (cx, by, 1.0, 60.0), (cx + 89.0, by, 1.0, 60.0)] {
+                                    out.push(self.quad(aspect, bx, by, bw, bh, black));
+                                }
+                            }
+                        }
+                    }
                 }
                 // **None of these four is a registered class.** The only `*Rectangle*` string in
                 // the whole executable is `NFS5.GlintyRectangle` (0x5DD847) — there is no
@@ -6119,9 +6625,11 @@ impl LayoutScreen {
                         //   **0xAAFFFFFF** and the same `[this+0x194]` font the ordinary draw uses
                         //   (0x4C5B30…0x4C5BD0).
                         //
-                        // Not ported: the `"N/A"` of `FEStrings` 299 that 0x4C5B64 puts there
-                        // instead — 0x4C5AD3 chooses it on 0x4C7E40, the *transitioning* test, so
-                        // at rest it is always the value.
+                        // and the **`"N/A"`** of `FEStrings` 299 that 0x4C5B64 puts there
+                        // instead when the widget is **disabled** — 0x4C5AD3 chooses between the
+                        // two on 0x4C7E40, `[this+0x10C] & 0x10` or the accessor's own byte
+                        // (§4.65, §4.112). That arm was unreachable until §4.113 gave this port a
+                        // disabled flag; it is drawn now. §4.125.
                         let gscw = self.attr_num(e, "GraphicsSpecialCaseWidth").unwrap_or(0.0) as f32;
                         let colour = if selected == Some(i) { [1.0, 0.85, 0.2, 1.0] } else { [1.0, 1.0, 1.0, 1.0] };
                         // **`nolabel == 1`** — all fourteen of them on `display.lay`, and all
@@ -6152,7 +6660,11 @@ impl LayoutScreen {
                             out.push(self.quad(aspect, bx, y + bh - 1.0, gscw, 1.0, black));
                             out.push(self.quad(aspect, bx, y, 1.0, bh, black));
                             out.push(self.quad(aspect, bx + gscw - 1.0, y, 1.0, bh, black));
-                            self.text(&mut out, aspect, f, &v, bx + (gscw / 2.0).trunc(), y + 2.0, 0.0, 1, tint([0xff, 0xff, 0xff, 0xaa]));
+                            let shown = match state == "disabled" {
+                                true => strings.get(299).unwrap_or_default().to_string(),
+                                false => v.clone(),
+                            };
+                            self.text(&mut out, aspect, f, &shown, bx + (gscw / 2.0).trunc(), y + 2.0, 0.0, 1, tint([0xff, 0xff, 0xff, 0xaa]));
                             break 'elem;
                         }
                         self.text(&mut out, aspect, f, &v, x + w - 12.0, y, 0.0, 2, colour);
@@ -6326,6 +6838,21 @@ impl LayoutScreen {
                 }
                 "NFS5.TABBUTTON" | "NFS5.CAMERASELECT" | "NFS5.CAMERAPICTURE" => {
                     let state = self.state_for(e, i, selected, hovered);
+                    // **`NFS5.CAMERAPICTURE` draws a part no state lists.** Its bind 0x4BF81E
+                    // looks `"shp"` up by name (0x525620, 0x525600) and keeps its art in
+                    // `[this+0x14C]` (0x4BF849), and the draw puts it at the widget's own place
+                    // through 0x4D9B30 (0x4BFA9B) **before** it runs the template's parts
+                    // (0x4BFAA6). `CameraPicture.ctr` gives `shp` `shapePathName=optart.fsh` and
+                    // `shapeIndex=data.picturenum`, and it is in none of the six state lists — so
+                    // the part walk never reaches it and only this arm can. `cameras.lay`'s four
+                    // widgets carry `picturenum` 1…4. §4.129.
+                    if e.class == "NFS5.CAMERAPICTURE"
+                        && let Some(n) = self.attr_num(e, "picturenum")
+                        && let Some(&(tex, aw, ah)) = self.shapes.get(&(CAMERA_PICTURES.to_string(), n.max(0.0) as usize))
+                    {
+                        let (pos, size) = self.place(aspect, x, y, aw, ah);
+                        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5] });
+                    }
                     self.template_widget(&mut out, aspect, e, state, x, y, strings);
                     if e.class == "NFS5.TABBUTTON" {
                         self.glinty_box(&mut out, aspect, e, i, x, y, tint);
@@ -6431,8 +6958,18 @@ impl LayoutScreen {
                     // the bevel 0x521050 over the widget's own box (0x4C8670's corners differenced
                     // at 0x4CF89E and 0x4CF8AE) with a thickness of 3, ungated but for the two
                     // visibility tests (0x4CF88D, 0x4CF896). Eight widgets.
-                    if e.class == "NFS5.PLAYERDRIVERPICTURE" && self.pressed_on(i, hovered) {
-                        self.bevel(&mut out, aspect, x, y, w, h, 3.0);
+                    // — and, when it is **not** pressed, the drop shadow 0x520F00 with (4, 4)
+                    // at 0x4CF92A, behind one gate: 0x4CF8E1 skips it when `data.ournumber`
+                    // (`[this+0x140]`, bound at 0x4CF7A8) equals the **8** at 0x5D8F2C. The eight
+                    // shipped widgets are `createplayer.lay`'s and carry `ournumber` 0…7, so all
+                    // eight have one; the ninth portrait `ALLdrivr.fsh` holds is what the gate is
+                    // for. §4.126.
+                    if e.class == "NFS5.PLAYERDRIVERPICTURE" {
+                        if self.pressed_on(i, hovered) {
+                            self.bevel(&mut out, aspect, x, y, w, h, 3.0);
+                        } else if self.attr_num(e, "ournumber").unwrap_or(0.0) != 8.0 {
+                            self.drop_shadow(&mut out, aspect, x, y, w, h, 4.0, 4.0);
+                        }
                     }
                     if code_placed(&e.class) {
                         break 'elem;
@@ -6563,7 +7100,18 @@ impl LayoutScreen {
                 };
                 println!("  #{i:3} {:<26} pos=({x:.0},{y:.0}) size=({w:.0}x{h:.0}) sprites={n}{hot} box=({:.3},{:.3})-({:.3},{:.3}) alpha={talpha:.2} first={f0:?}", e.class, b.0, b.1, b.2, b.3);
             }
-            if out.len() == first && i > 0 && !closed {
+            // **`NFS5.3DCAR` is never a sprite, in either build.** Its draw, `FECar3DControl`'s
+            // slot 15 = **0x4C0990**, calls none of the painter family: 0x4C09A3 places the car
+            // through 0x4C0D10 and the only other thing it can do is 0x4E1E50(7), a sound, when
+            // the widget is hovered (0x4C7DD0) and its accessor answers (0x4F09C0). The car
+            // itself belongs to the 3D pass — `positiontype` 0 hands it to the screen's room
+            // (0x4BFEEC) and 1…3 place one of the widget's own at a fixed camera-relative spot
+            // (`RE/notes/frontend-3d.md` §4). This port puts that car into an offscreen view so
+            // it lands in the right place in the 2D layering, which is a porting device and not
+            // something the original does; a sweep that counts 2D sprites therefore has nothing
+            // to see here, the same way `deadzone.lay`'s axis bars have nothing to show without
+            // a pad. Reported on its own line rather than as a blank.
+            if out.len() == first && i > 0 && !closed && e.class != "NFS5.3DCAR" {
                 blank.push((e.class.clone(), source_of(e)));
             }
         }
@@ -6575,6 +7123,8 @@ impl LayoutScreen {
             self.tooltip(&mut overlay, aspect, e, strings);
         }
         out.append(&mut overlay);
+        // last of all, over the tooltip and the drop-down alike
+        self.cursor_sprite(&mut out, aspect, hovered);
         if std::env::var("NFS_LAYER_DUMP").is_ok() {
             println!("layer: background {} sprites, own {} sprites", bg_end, out.len() - bg_end);
         }

@@ -61,6 +61,23 @@ impl OpponentChoice {
     }
 
     /// `FEStrings.csv` 640 / 642 / 643 / 644 / 641.
+    /// The `FEStrings` id of this choice's row, in the order `FEOpponentCarAccessor`'s row-text
+    /// jump table at **0x4F5788** lists them: index 0 → 640, 1 → **642**, 2 → 643, 3 → 644,
+    /// 4 → **641**. Anything outside 0…4 is the literal `"bug in car list"` at 0x5DACAC
+    /// (0x4F5780) — the original's own words.
+    pub fn string_id(self) -> u32 {
+        match self {
+            Self::SameCar => 640,
+            Self::SameEra => 642,
+            Self::SameClass => 643,
+            Self::SameEraClass => 644,
+            Self::RandomCar => 641,
+        }
+    }
+
+    /// The five choices in row order.
+    pub const ROWS: [Self; 5] = [Self::SameCar, Self::SameEra, Self::SameClass, Self::SameEraClass, Self::RandomCar];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::SameCar => "SAME CAR",
@@ -244,6 +261,7 @@ mod tests {
     fn entry(era: u32, class: u32) -> CarCatalogEntry {
         let mut e = CarCatalogEntry {
             compare: [0; 5],
+            variant: 0,
             display_name: String::new(),
             family: String::new(),
             locale_key: String::new(),

@@ -113,3 +113,270 @@ fn steady_state_cornering_radius() {
         );
     }
 }
+
+/// What `FECar`'s constructor writes into the setup block (0x4EED2D…0x4EED80), in the order the
+/// seventeen sliders sit in the record: three 50s, three zeroes, a 1.0, two 30s and eight zeroes.
+const SETUP_DEFAULT: [f32; 17] = [50.0, 50.0, 50.0, 0.0, 0.0, 0.0, 1.0, 30.0, 30.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+/// **A car at its default setup is the car the `.sim` describes.** Every one of the eleven effects
+/// in 0x49D290…0x49D62C is neutral at the constructor's values — `pf = pr = 1` so the top-speed
+/// divisor is `(1 + 1 + 3)·0.2 = 1`, brake bias 50 gives `(0.5 − 0.5)·0.5`, shock rate 1 leaves
+/// `transfer_div` at `(1 + 2)/3` of itself and then grip at `(1 + 9)·0.1` of itself, and 30 psi on
+/// both axles gives `a = b = 1`, grip `×(1 + 1 + 8)·0.1` and front weight `×(2/2 + 1)·0.5`.
+///
+/// It holds only because the 993's `.sim` carries `transfer_div = 1` and `probe_offset = 0`; the
+/// ride-height arm is an **overwrite**, so a car whose file said otherwise would move.
+#[test]
+fn the_default_car_setup_changes_nothing() {
+    let Some(base) = specs_993() else { return };
+    let mut tuned = base.clone();
+    tuned.apply_setup(&SETUP_DEFAULT, true);
+    assert_eq!(base, tuned);
+}
+
+/// The sliders that have a sign, in the direction the block gives them. Downforce trades top speed
+/// for grip on the axle, a softer shock rate (0.7) raises the pitch and roll retention because the
+/// term is `(1 − v)·0.2`, and ride height is written in metres from millimetres.
+#[test]
+fn the_sliders_move_what_their_names_say() {
+    let Some(base) = specs_993() else { return };
+
+    let mut s = SETUP_DEFAULT;
+    s[0] = 100.0;
+    s[1] = 100.0;
+    let mut max_wing = base.clone();
+    max_wing.apply_setup(&s, true);
+    assert!(max_wing.top_speed < base.top_speed, "full downforce must cost top speed");
+    assert!(max_wing.downforce_front > base.downforce_front);
+    assert!(max_wing.downforce_rear > base.downforce_rear);
+    // pf = pr = (100·0.02 + 1)·0.5 = 1.5, so the divisor is (1.5 + 1.5 + 3)·0.2 = 1.2
+    assert!((max_wing.top_speed - base.top_speed / 1.2).abs() < 1e-4);
+    assert!((max_wing.downforce_front - base.downforce_front * 1.5).abs() < 1e-6);
+
+    let mut s = SETUP_DEFAULT;
+    s[6] = 0.7;
+    let mut soft = base.clone();
+    soft.apply_setup(&s, true);
+    assert!(soft.pitch_ret > base.pitch_ret && soft.roll_ret > base.roll_ret);
+    assert!((soft.pitch_ret - (base.pitch_ret + 0.3 * 0.2)).abs() < 1e-5);
+    assert!(soft.transfer_div < base.transfer_div, "a softer shock rate lowers the transfer divisor");
+
+    let mut s = SETUP_DEFAULT;
+    s[3] = 20.0;
+    let mut high = base.clone();
+    high.apply_setup(&s, true);
+    assert!((high.probe_offset - 0.02).abs() < 1e-6, "twenty millimetres is 0.02 m, and it overwrites");
+
+    let mut s = SETUP_DEFAULT;
+    s[2] = 70.0;
+    let mut rear_bias = base.clone();
+    rear_bias.apply_setup(&s, true);
+    // trunc(70·65536/100) = 45875, /65536 = 0.6999969, −0.5, ×0.5
+    assert!((rear_bias.front_brake - (base.front_brake + 0.099_998_5)).abs() < 1e-5);
+}
+
+/// The gear sliders add to the **raw** ratios, so what moves is the whole derived chain:
+/// `ratio_rpm_per_mps`, `mps_per_rpm`, `accel_per_torque` and the drag term. `Gear7` is the final
+/// drive, not an eighth gear, and the neutral slot stays at zero whatever the sliders say.
+#[test]
+fn a_gear_slider_moves_the_derived_tables() {
+    let Some(base) = specs_993() else { return };
+
+    let mut s = SETUP_DEFAULT;
+    s[10] = 0.5; // Gear1 = first gear
+    let mut tall = base.clone();
+    tall.apply_setup(&s, true);
+    assert!((tall.gear_ratio[2] - (base.gear_ratio[2] + 0.5)).abs() < 1e-6);
+    assert!(tall.ratio_rpm_per_mps[2] > base.ratio_rpm_per_mps[2]);
+    assert!(tall.mps_per_rpm[2] < base.mps_per_rpm[2]);
+    assert_eq!(tall.gear_ratio[1], 0.0, "the neutral slot has no slider");
+    assert_eq!(tall.ratio_rpm_per_mps[1], 0.0);
+    assert_eq!(tall.mps_per_rpm[1], 0.1, "and a zero ratio gives the 0.1 that 0x49D6A4 stores");
+
+    let mut s = SETUP_DEFAULT;
+    s[16] = 0.5; // Gear7 = the final drive
+    let mut short = base.clone();
+    short.apply_setup(&s, true);
+    assert!((short.final_drive - (base.final_drive + 0.5)).abs() < 1e-6);
+    for i in [0usize, 2, 3, 4, 5, 6] {
+        assert!(short.gear_ratio[i] == base.gear_ratio[i], "the final drive is not a gear");
+        // reverse is a negative ratio, so what grows is the magnitude
+        assert!(short.ratio_rpm_per_mps[i].abs() > base.ratio_rpm_per_mps[i].abs(), "but it rescales every one");
+    }
+    assert!(short.drag != base.drag);
+}
+
+/// A manual gearbox is worth five per cent of acceleration in every gear — `carinfo+0xC == 0`
+/// at 0x49D733. Nothing else in the block moves.
+#[test]
+fn a_manual_gearbox_is_worth_five_per_cent() {
+    let Some(base) = specs_993() else { return };
+    let mut manual = base.clone();
+    manual.apply_setup(&SETUP_DEFAULT, false);
+    for i in 0..base.gear_slots {
+        assert!((manual.accel_per_torque[i] - base.accel_per_torque[i] * 1.05).abs() < 1e-9);
+    }
+    assert_eq!(manual.grip, base.grip);
+}
+
+fn parts() -> Option<Vec<nfs_formats::career::Part>> {
+    let home = std::env::var_os("HOME")?;
+    let p = std::path::PathBuf::from(home).join("Games/NFS-Porsche-Unleashed/game_info/data/FEData/Data/nfs5.prt");
+    nfs_formats::career::parse_parts(&std::fs::read(p).ok()?).ok()
+}
+
+/// `+0xC0 = 1` is the identity in the brake, spring, shock and sway-bar arms, and that is a check on
+/// the record layout rather than on the port: if `value_c0` were being read from the wrong offset,
+/// the standard part would not leave the block alone.
+#[test]
+fn the_standard_part_is_the_identity() {
+    let (Some(base), Some(all)) = (specs_993(), parts()) else { return };
+    for kind in [2u16, 4, 5, 8] {
+        let Some(p) = all.iter().find(|p| p.kind == kind && p.value_c0 == 1.0) else { continue };
+        let mut one = base.clone();
+        one.apply_parts(&[p], "993");
+        // the mass and top-speed deltas are separate and may be non-zero; the tuning arms are not
+        assert_eq!(one.transfer_div, base.transfer_div, "kind {kind} transfer_div");
+        assert_eq!(one.lateral_div, base.lateral_div, "kind {kind} lateral_div");
+        assert!((one.grip - base.grip).abs() < 1e-6, "kind {kind} grip");
+        assert!((one.roll_gain - base.roll_gain).abs() < 1e-6, "kind {kind} roll_gain");
+        assert!((one.pitch_ret - base.pitch_ret).abs() < 1e-6, "kind {kind} pitch_ret");
+    }
+}
+
+/// The three arms whose value is not a multiplier: a spring's `+0xC4` is a ride height in
+/// millimetres and **overwrites** the probe offset, a tyre's `+0xC8` **overwrites** the grip class,
+/// and a brake's `+0xC0` scales the deceleration by `(c0 + 3)/4`.
+#[test]
+fn the_parts_that_overwrite_rather_than_scale() {
+    let (Some(base), Some(all)) = (specs_993(), parts()) else { return };
+
+    if let Some(p) = all.iter().find(|p| p.kind == 4 && p.boost == 20.0) {
+        let mut lifted = base.clone();
+        lifted.apply_parts(&[p], "993");
+        assert!((lifted.probe_offset - 0.02).abs() < 1e-6);
+    }
+    if let Some(p) = all.iter().find(|p| p.kind == 9 && p.grip_class == 2) {
+        let mut shod = base.clone();
+        shod.apply_parts(&[p], "993");
+        assert_eq!(shod.class, 2, "a tyre's +0xC8 is the grip-table column");
+    }
+    if let Some(p) = all.iter().find(|p| p.kind == 2 && p.value_c0 == 2.5) {
+        let mut stoppers = base.clone();
+        stoppers.apply_parts(&[p], "993");
+        assert!((stoppers.brake_decel - base.brake_decel * 1.375).abs() < 1e-5);
+    }
+}
+
+/// Four families ignore the purchased list outright (0x49CCC5…0x49CD07), and the 959 gets its front
+/// weight written flat before that test — so for the 959 the parts do nothing *and* the weight
+/// moves.
+#[test]
+fn four_families_ignore_their_parts() {
+    let (Some(base), Some(all)) = (specs_993(), parts()) else { return };
+    let Some(p) = all.iter().find(|p| p.kind == 2 && p.value_c0 == 2.5) else { return };
+    for family in ["959", "928", "GT2", "GT3"] {
+        let mut skipped = base.clone();
+        skipped.apply_parts(&[p], family);
+        assert_eq!(skipped.brake_decel, base.brake_decel, "{family} must ignore the part");
+        assert_eq!(skipped.mass, base.mass, "{family} must ignore its mass too");
+        if family == "959" {
+            assert_eq!(skipped.front_weight, 0.4675);
+        } else {
+            assert_eq!(skipped.front_weight, base.front_weight);
+        }
+    }
+}
+
+/// **`specs[0x4C] = 2` is unreachable from a part.** 0x49CE09 compares the part's name with
+/// `"Supercharged"` (0x5D0D04, the only occurrence of that string in the image), and the fifteen
+/// records that do the job are named **`"Supercharger"`**. So in the original a supercharger part
+/// adds its torque and nothing else, and a car is supercharged only if its own `.sim` says so. The
+/// port compares the same literal, so it inherits the same dead branch — this test is what stops it
+/// being "fixed" by accident.
+#[test]
+fn no_part_is_named_supercharged() {
+    let Some(all) = parts() else { return };
+    assert!(all.iter().any(|p| p.kind_name == "Supercharger"), "the data does have superchargers");
+    assert!(!all.iter().any(|p| p.kind_name == "Supercharged"), "but not one is spelled the way 0x49CE09 compares");
+
+    let Some(base) = specs_993() else { return };
+    let Some(sc) = all.iter().find(|p| p.kind_name == "Supercharger") else { return };
+    let mut boosted = base.clone();
+    boosted.apply_parts(&[sc], "993");
+    assert_eq!(boosted.induction, base.induction, "a supercharger part cannot change the induction");
+}
+
+/// `"Engine (Standard)"` is not `"Engine"`, so it takes the `+= 0.67 ×` arm — and every one of the
+/// 38 records carries an all-zero curve, which is what makes it the revert part rather than a
+/// 1.67× engine.
+#[test]
+fn the_standard_engine_is_a_no_op() {
+    let Some(all) = parts() else { return };
+    for p in all.iter().filter(|p| p.kind_name == "Engine (Standard)") {
+        assert!(p.torque_curve.iter().all(|t| *t == 0.0), "part {} has a curve", p.id);
+        assert_eq!(p.mass_delta, 0.0);
+        assert_eq!(p.top_speed_pct, 0.0);
+    }
+    let (Some(base), Some(std)) = (specs_993(), all.iter().find(|p| p.kind_name == "Engine (Standard)").cloned()) else { return };
+    let mut reverted = base.clone();
+    reverted.apply_parts(&[&std], "993");
+    assert_eq!(reverted.torque, base.torque);
+}
+
+/// **`0x49B8E0`'s rotation, transcribed instruction for instruction** and compared with what
+/// `step64` does to the orientation. The reference below is the original's arithmetic in the
+/// original's own terms: row-major 3×3 matrices, `dest = a1 · a2` (0x532470, whose first output
+/// element is `Σ_k a1[0][k]·a2[k][0]` — 0x5324B3…0x5324C7), the three axis matrices exactly as
+/// 0x5325A0 / 0x532600 / 0x532660 fill them, composed **X then Y then Z**, and applied on the
+/// right: `M ← M · Δ`.
+///
+/// The angular velocities here are deliberately large and unequal, because the wrong composition
+/// order agrees to first order and only shows in the second.
+#[test]
+fn the_orientation_update_is_the_originals_composition() {
+    type M3 = [[f32; 3]; 3];
+    fn mul(a: &M3, b: &M3) -> M3 {
+        let mut o = [[0f32; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                o[i][j] = (0..3).map(|k| a[i][k] * b[k][j]).sum();
+            }
+        }
+        o
+    }
+    // 0x5325A0, 0x532600, 0x532660 — the angle is in turns, 0x5327E0/0x5327F0 take `angle × 2π`
+    let sc = |t: f32| ((t * std::f32::consts::TAU).sin(), (t * std::f32::consts::TAU).cos());
+    let mx = |t: f32| { let (s, c) = sc(t); [[1.0, 0.0, 0.0], [0.0, c, s], [0.0, -s, c]] };
+    let my = |t: f32| { let (s, c) = sc(t); [[c, 0.0, -s], [0.0, 1.0, 0.0], [s, 0.0, c]] };
+    let mz = |t: f32| { let (s, c) = sc(t); [[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]] };
+
+    let Some(specs) = specs_993() else { return };
+    let mut v = Vehicle::new(Vec3::new(0.0, 0.3, 0.0), Mat3::IDENTITY, &specs, 0.75, 0.3);
+    // a tilted start, so that `M · Δ` and `Δ · M` cannot coincide either
+    v.orientation = Mat3::from_rotation_z(0.2).transpose() * v.orientation;
+    v.angular_velocity = Vec3::new(0.9, 2.3, -1.4); // turns/s
+    let m0 = v.orientation;
+
+    let mut want: M3 = [[0.0; 3]; 3];
+    for i in 0..3 {
+        let r = m0.row(i);
+        want[i] = [r.x, r.y, r.z];
+    }
+    let w = v.angular_velocity * (1.0 / 64.0); // [0x5B2828]
+    let delta = mul(&mul(&mx(w.x), &my(w.y)), &mz(w.z));
+    let want = mul(&want, &delta);
+
+    v.step64(&specs);
+    for i in 0..3 {
+        let got = v.orientation.row(i);
+        for j in 0..3 {
+            assert!(
+                (got[j] - want[i][j]).abs() < 1e-5,
+                "row {i} col {j}: port {} vs 0x49B8E0 {}",
+                got[j],
+                want[i][j]
+            );
+        }
+    }
+}

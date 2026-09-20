@@ -699,6 +699,7 @@ impl CopCar {
             lateral: self.lateral,
             half_span: self.half_extents.x,
             is_human: false,
+            is_racer: false,
         }
     }
 
@@ -757,12 +758,17 @@ pub struct Police {
     pub skill: u8,
     /// `0x405AD0`'s duty budget — kept for the record; see [`duty_budget`] for why it caps nothing.
     pub budget: usize,
+    /// `WEATHER` (`[0x657A24] > 0`). `0x4081B0` scales the longitudinal rate by **0.9** and it does
+    /// so *after* the traffic/1.0 split at 0x4081FC, so it applies to a cop as much as to a traffic
+    /// car (0x40825C…0x40826E, `[0x5B25E8]` = 0.9). The shipped `fe.txt` says `weather = 0`, so it
+    /// is off in a normal race — and it is the option, not the track's night flag.
+    pub weather: bool,
     one_way: bool,
 }
 
 impl Police {
     pub fn new(file: CopFile, cars: Vec<CopCar>, skill: u8, one_way: bool) -> Self {
-        Self { manager: CopManager::new(file), cars, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: CopPhysics::default(), violation: Violation::None, route_dir: 1.0, skill, one_way, budget: duty_budget(1, false) }
+        Self { manager: CopManager::new(file), cars, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: CopPhysics::default(), violation: Violation::None, route_dir: 1.0, skill, one_way, weather: false, budget: duty_budget(1, false) }
     }
 
     pub fn active_count(&self) -> usize {
@@ -995,9 +1001,21 @@ impl Police {
         let aim = aidrive::aim_direction(table, &self.cfg, &st);
         let err = aidrive::heading_error(&st, aim);
         // `0x4081B0`'s speed curve is the traffic column only: a cop's base rate is a flat 1.0,
-        // scaled by the pursuit boost `car+0x1098`
-        let accel = crate::traffic::accel_rate_for(false, st.speed, self.cars[i].boost_engine);
-        let cmd = if aidrive::out_of_control(&st, &self.cfg.out_of_control, err, st_road) {
+        // scaled by the pursuit boost `car+0x1098` and then, whatever the car's class, by 0.9 under
+        // `WEATHER` (0x40825C). Two further factors of that function are **not** applied here and
+        // are left out deliberately rather than approximated:
+        //   * the HARD_BRAKE script action (`0x40AC60(car+0xE3C, 4)` → ×1.5 at 0x40829B) — the port
+        //     runs `scripts.bin` for traffic, not for cops;
+        //   * the early-race boost `0x40AEF0` (×`1 + opponents·0.2` in the first 30 s, and a cop
+        //     takes the *full* factor because its `car+0x10D0` ordinal is 0). It compares
+        //     `human+0xAF8` with `car+0xAF8`, the **lap fraction**, and neither `ChaseTarget` nor
+        //     `CopCar` carries one — only a slice index, which is not the same thing across a lap
+        //     boundary. It also needs more than one opponent, so it cannot fire in a pursuit race
+        //     with none.
+        let accel = crate::traffic::accel_rate_for(false, st.speed, self.cars[i].boost_engine)
+            * if self.weather { 0.9 } else { 1.0 };
+        let bend = aidrive::road_bend(table, self.cars[i].slice, self.cars[i].dir);
+        let cmd = if aidrive::out_of_control(&st, &self.cfg.out_of_control, err, st_road, bend) {
             aidrive::out_of_control_command(&st, &self.cfg.out_of_control, err, accel, self.phys.brake_force)
         } else {
             let grip = 1.0 + 0.0015 * aidrive::body_forward_speed(&st);

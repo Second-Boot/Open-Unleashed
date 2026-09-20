@@ -87,6 +87,17 @@ impl TrackCameras {
 
     fn trigger(e: &SceneElement) -> Option<CameraTrigger> {
         let p = e.params.first()?;
+        // Only **type 6**. The scene manager keeps five separate element vectors and
+        // 0x46CB00 fills `[0x628174]` with the triggers whose type accessor 0x46AF50
+        // (`return [this+0x7C]`) answers 6 (0x46CC56 `cmp eax, 6`); 0x413B80, the
+        // per-frame trackside-camera sweep, reads exactly that vector through 0x46D880.
+        // Checkpoints, the start and finish lines (types 0/1/2) go into `[0x628170]`
+        // instead and can never reach the camera switch. All 1297 shipped type-6
+        // triggers live in `<track>_cameras.scn` and they are the only ones carrying a
+        // camera link. — race-logic.md §3.3.
+        if p.first().copied().map(|t| t as i32) != Some(6) {
+            return None;
+        }
         let link = p.get(11).copied().filter(|l| *l >= 0.0)? as usize;
         let ends = e.params.get(1);
         Some(CameraTrigger {

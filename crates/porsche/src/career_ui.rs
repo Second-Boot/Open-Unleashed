@@ -972,6 +972,11 @@ impl CareerUi {
             seed >> 8
         };
         self.career.generate_offers(&self.tables, &mut rand);
+        // 0x4F7DB0 then re-prices every market car at its current value (0x4F7E63) and calls
+        // 0x4F80C0 to top the market up — so the used-car lot fills after the first career race,
+        // not when the career is created
+        self.career.reprice_market(&self.tables);
+        self.career.refresh_market(&self.tables, &mut rand);
         let mut msg = format!("RESULT: P{}  PRIZE ${}", o.result.position, o.result.prize);
         if o.result.bonus > 0 {
             msg += &format!("  BONUS ${}", o.result.bonus);

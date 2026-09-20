@@ -112,6 +112,14 @@ impl SkillTest {
     fn checkpoint(index: usize, e: &SceneElement) -> Option<Checkpoint> {
         let p = e.params.first()?;
         let kind = *p.first()? as u8;
+        // Types 0, 1 and 2 only — checkpoint, finish line, start line. 0x46C8D0 builds
+        // `[0x628170]` with just those three (the compares at 0x46C9AD…0x46C9D0), and
+        // the two lookups the skill tests use, 0x46D290 (by type) and 0x46D2E0 (by
+        // sequence id), read that vector. Type 6 is a trackside camera and type 4 an
+        // audio trigger; neither is ever a checkpoint. — race-logic.md §3.2.
+        if !matches!(kind, 0 | 1 | 2) {
+            return None;
+        }
         let shape = *p.get(1)? as u8;
         let radius = *p.get(2)?;
         let sequence = *p.get(7)? as i32;
@@ -209,7 +217,15 @@ impl SkillTest {
         let mut ev = Vec::new();
         for c in self.cones.iter_mut().filter(|c| !c.knocked) {
             let d = c.position - pos;
-            if d.length_squared() > 9.0 {
+            // The broad phase is **two** gates and neither is a 3 m sphere. 0x498DFD pushes
+            // `0x40A00000` = **5.0** with the car's position into the prop query 0x473870;
+            // that function hard-codes `0x40400000` = 3.0 for 0x484630, which picks the
+            // *quadtree cells* to visit, and then passes its own 5.0 to **0x486510** for each
+            // element — an **XZ AABB inflation, per axis** (`[elem+8]`/`+0x14` against x and
+            // `+0x10`/`+0x1C` against z), not a distance. Only then does 0x498280, the
+            // footprint test below, decide. AUDIT §B read the 3.0 as the search radius and
+            // this filter was tightened to match it; corrected 2026-09-20.
+            if d.x.abs() > 5.0 || d.z.abs() > 5.0 {
                 continue;
             }
             // 0x498293 / 0x4982AB take only x and z, and 0x49829B leaves the third component 0

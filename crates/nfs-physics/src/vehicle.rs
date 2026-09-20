@@ -157,7 +157,13 @@ pub struct Vehicle {
     pub ground_h: f32,
     pub body_height: f32,
     pub min_height: f32,
-    /// half extents for wall corners (halfW, halfH, halfL)
+    /// `car+0x3A8`, `+0x3AC`, `+0x3B0` — **half the span of the body points**, which is what
+    /// 0x4A1472…0x4A14A6 computes: the loop walks `car+0x8C + 12i` for `car+0x32C` points,
+    /// keeping a min and a max per axis, and stores `(max − min) × 0.5` for each
+    /// (`[0x5B23F0]` is the 0.5). `Car_physInit` 0x49B510 then only writes them back where they
+    /// already were (0x4107C1). They are the half extents the prop-footprint test reads
+    /// (`RE/AUDIT.md` §B) and the ones the car's drop shadow is cut to (`R3DCar` slot 22,
+    /// 0x43B220). [`Vehicle::fit_half_extents`] is the same computation.
     pub half_extents: Vec3,
     /// The car's collision body points in the body frame, `y = 0` on the wheel contact plane
     /// (`BndP`, `RE/notes/car-model.md` §12). `0x49ABC0` sorts them ascending by height, so the
@@ -234,6 +240,18 @@ impl Vehicle {
             impact: 0.0,
             rng: 0x3ADE_68B1,
         }
+    }
+
+    /// Re-cut [`Self::half_extents`] to the body points, as **0x4A1472** does: half the span of
+    /// `body_points` on each axis. A car with no points keeps whatever it was built with.
+    pub fn fit_half_extents(&mut self) {
+        let Some(first) = self.body_points.first().copied() else { return };
+        let (mut lo, mut hi) = (first, first);
+        for p in &self.body_points {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        self.half_extents = (hi - lo) * 0.5;
     }
 
     /// The original's 16-bit LCG, drawn inline at every call site: `prod = state · 123456789`,
@@ -325,7 +343,13 @@ impl Vehicle {
         }
         let vz = self.v_local.z.abs();
         let g = self.gear;
-        let rpm_now = (vz * specs.ratio_rpm_per_mps[g] * 1.2).min(self.rpm);
+        // **Not `min(1.2·x, rpm)`.** 0x49DBFD forms `x = |vL.z| · ratio[gear]` and stores it,
+        // 0x49DC05 multiplies a *copy* by `[0x5B2480]` = 1.2 and compares that with the rpm, and
+        // 0x49DC16's `jne` keeps the stored **`x`** when `1.2·x <= rpm` — only the other way round
+        // does 0x49DC18 replace it with the rpm. So when the headroom test passes the answer is
+        // `x`, not `1.2·x`. Corrected 2026-09-21.
+        let x = vz * specs.ratio_rpm_per_mps[g];
+        let rpm_now = if x * 1.2 > self.rpm { self.rpm } else { x };
         let ratio_prev = if g >= 1 { specs.ratio_rpm_per_mps[g - 1] } else { 0.0 };
         let mut new_gear = g;
         if g >= 2 && self.throttle >= 0.5 && rpm_now.abs() < specs.redline && vz * ratio_prev < down && g - 1 > 1 && self.slip_tangent.abs() < 0.1 {
@@ -622,7 +646,13 @@ impl Vehicle {
     /// form that takes the values off the vehicle.
     pub fn set_wheel_steer(&mut self, specs: &CarSpecs, steer_int: f32, speed: f32, v_fwd: f32) {
         let mut y = specs.max_steer;
-        if speed > 30.0 {
+        // **Below** 30 m/s, not above — `physics.md` had the condition inverted and the port
+        // followed it. 0x49F5EA loads the speed, 0x49F5F0 compares it with `[0x5B2408]` = 30.0,
+        // and 0x49F5FB's `test ah,1; je` **skips** the factor when C0 is clear, i.e. when
+        // `speed >= 30`. So `1.75 − 0.025·speed` runs from 1.75 at rest down to 1.0 at 30 m/s
+        // and the lock is flat above that — a speed-sensitive rack. The old reading drove the
+        // factor negative and took all the steering away at 250 km/h.
+        if speed < 30.0 {
             y *= 1.75 - 0.025 * speed;
         }
         y = y.clamp(0.0, 20.0) * 17.0 / specs.max_steer;
@@ -1043,18 +1073,31 @@ impl Vehicle {
         self.v_local = m * self.velocity;
         self.w_local = m * self.angular_velocity;
         let vl = self.v_local;
-        self.slip_tangent = if vl.z.abs() > 5.0 { vl.x / vl.z } else { 0.0 };
+        // **Signed, not `|vz|`.** 0x49F25C loads `car+0xD60` with no `fabs` and 0x49F262 compares
+        // it with `[0x5B2400]` = 5.0; 0x49F270's `test ah,0x41; jne` zeroes the ratio when
+        // `vz <= 5`. So driving **backwards** the slip tangent is always 0 in the original, where
+        // the port's `abs()` kept computing a ratio. It gates the kick-down and scales the
+        // longitudinal demand, so the difference shows up in reverse. Corrected 2026-09-21.
+        self.slip_tangent = if vl.z > 5.0 { vl.x / vl.z } else { 0.0 };
         // contact-patch slip velocities (×−16) with the yaw/roll term
         let yaw = specs.yaw_lever * self.angular_velocity.y * 32.0 * -0.5;
         let speed = vl.x.abs().max(vl.z.abs()) + 0.25 * vl.x.abs().min(vl.z.abs());
-        let roll = if speed > 10.0 { (speed + 30.0) * yaw * 0.025 } else { (speed + 70.0) * yaw * 0.0125 };
+        // The two arms are the other way round: 0x49F2F0 compares the speed with `[0x5B241C]` =
+        // 10.0 and 0x49F301's `je` goes to the **`+70 … ×0.0125`** arm when `speed >= 10`, while
+        // the fall-through at 0x49F303 is `+30 … ×0.025` for `speed < 10`. (Both give `1.0·yaw`
+        // at exactly 10, so the curve is continuous either way and only the branch order tells
+        // them apart.) `physics.md` §4 had it inverted and the port followed.
+        let roll = if speed < 10.0 { (speed + 30.0) * yaw * 0.025 } else { (speed + 70.0) * yaw * 0.0125 };
         for (i, w) in self.wheels.iter_mut().enumerate() {
             let lat = -16.0 * vl.x + if i < 2 { roll } else { -roll };
             w.slip_vel = [lat, -16.0 * vl.y, -16.0 * vl.z];
         }
         let gravity_l = m * Vec3::new(0.0, -GRAVITY, 0.0);
-        // steering angle law
-        let g_off = ((gravity_l.x * 8.0) as i32).clamp(-64, 64);
+        // steering angle law. Both float→int steps here are **bare `fistp`** — 0x49F3EE for the
+        // gravity offset and 0x49F4C9 for the damage pull — so they round to nearest (ties to
+        // even), not truncate. `physics.md` writes them as `int()` and the port used `as i32`.
+        // Corrected 2026-09-21; see `RE/CONVENTIONS.md`.
+        let g_off = fistp(gravity_l.x * 8.0).clamp(-64, 64);
         // damage pull (0x49F160): uneven front-corner damage plus suspension-damage noise every 4th tick
         let mut pull = (self.damage[2] - self.damage[0]) * 0.25;
         if self.ticks_alive.is_multiple_of(4) {
@@ -1062,7 +1105,7 @@ impl Vehicle {
             pull += r * 0.5 * if speed > 15.0 { speed / 15.0 } else { 1.0 } * self.part_wear(&specs.zone_masks.suspension, &specs.wear.suspension) * 0.01;
         }
         self.damage_pull = pull;
-        self.set_wheel_steer(specs, (self.steer + pull as i32 + g_off).clamp(-127, 127) as f32, speed, vl.z);
+        self.set_wheel_steer(specs, (self.steer + fistp(pull) + g_off).clamp(-127, 127) as f32, speed, vl.z);
         let a_drive = self.engine_update(specs, rear_contact);
         if !front_contact && !rear_contact {
             self.accel_local = Vec3::ZERO;
@@ -1105,12 +1148,25 @@ impl Vehicle {
             // yaw torque (signs per 0x49F994..0x49F9E3; MEDIUM)
             let torque_y = ((w[1].lateral + w[0].lateral) - (w[2].lateral + w[3].lateral)) * specs.inv_yaw_lever
                 - ((w[2].longitudinal + w[0].longitudinal) - w[1].longitudinal - w[3].longitudinal) * specs.inv_yaw_lever;
-            // stability assist (0x49F0C0): gravity along slopes
+            // **Stability assist 0x49F0C0, corrected 2026-09-21.** Two gates, both of which the
+            // port had wrong.
+            //
+            // The lateral term: 0x49F11F compares `|car+0xD58|` with 1.0 and 0x49F12A's
+            // `test ah,0x41; je` jumps **straight to the add** when `|x| > 1`; only the
+            // `|x| <= 1` path falls through to the second test, `[car+0x374] < 0.833`
+            // (0x49F132 / 0x49F13D). So the condition is `|vL.x| > 1 || M[1].y < 0.833`, and the
+            // port asked for `< 1`.
+            //
+            // The longitudinal term is not unconditional either: 0x49F0E3 is
+            // `cmp byte [ecx+0xD80], 0x40; jae 0x49F104`, so `−4.9 · M[2].y` is added only while
+            // the **brake byte is under 64** of 255.
             let mut local = self.accel_local;
-            if vl.x.abs() < 1.0 || self.orientation.row(1).y < 0.833 {
+            if vl.x.abs() > 1.0 || self.orientation.row(1).y < 0.833 {
                 local.x += -19.6 * m.row(0).y;
             }
-            local.z += -4.9 * m.row(2).y;
+            if self.brake_raw < 0x40 {
+                local.z += -4.9 * m.row(2).y;
+            }
             let acc = m.transpose() * local;
             let angacc = m.transpose() * Vec3::new(0.0, torque_y, 0.0);
             self.velocity += acc * DT32;
@@ -1119,12 +1175,22 @@ impl Vehicle {
             self.angular_velocity.y += angacc.y * (1.0 / 48.0);
             self.lateral_filtered = 0.25 * fx + 0.75 * self.lateral_filtered;
             self.long_filtered = 0.9 * self.long_filtered + 0.1 * self.accel_local.z;
-            // coast yaw damping / handbrake
-            if self.gear > 1 && self.throttle < 0.25 && speed > 30.0 && specs.grip <= 2.5 {
+            // **Coast yaw damping / handbrake — both conditions were inverted, 2026-09-21.**
+            // 0x49FBE5 loads the speed and compares it with `[0x5B2408]` = 30.0; 0x49FBF3's
+            // `test ah,1; je` **bails** when `speed >= 30`, so the damping is a *low*-speed
+            // effect. 0x49FBFE then loads `specs[0xF4]` against `[0x5B2464]` = 2.5 and
+            // 0x49FC0C's `test ah,0x41; jne` bails when it is `<= 2.5`, so it needs a grip
+            // multiplier **above** 2.5. The port asked for `> 30` and `<= 2.5`, which is the
+            // opposite pair on both counts.
+            //
+            // The handbrake arm is the same shape: 0x49FCFD compares the speed with 1.0 and
+            // 0x49FD05's `je` bails when `speed >= 1`, so `vel *= 0.5` is the stop-it-dead
+            // behaviour at a standstill, not a braking force at speed.
+            if self.gear > 1 && self.throttle < 0.25 && speed < 30.0 && specs.grip > 2.5 {
                 let k = 1.0 - 0.05 * self.angular_velocity.y.abs();
                 self.velocity.x *= k;
                 self.velocity.z *= k;
-            } else if self.handbrake && speed > 1.0 {
+            } else if self.handbrake && speed < 1.0 {
                 self.velocity *= 0.5;
             }
         }
@@ -1142,7 +1208,20 @@ impl Vehicle {
     pub fn step64(&mut self, specs: &CarSpecs) {
         self.position += self.velocity * DT64;
         let w = self.angular_velocity * DT64; // turns
-        let rot = Mat3::from_rotation_y(w.y * TAU) * Mat3::from_rotation_x(w.x * TAU) * Mat3::from_rotation_z(w.z * TAU);
+        // 0x49B8E0 builds three axis rotations and multiplies them **X, then Y, then Z**:
+        // 0x532600(M_y, ω_y/64), 0x5325A0(M_x, ω_x/64), 0x532660(M_z, ω_z/64) — each angle in turns
+        // ([0x5B2828] = 1/64, and 0x5327E0/0x5327F0 are `sin`/`cos` of `angle × 2π`) — then
+        // 0x49B968 `0x532470(M_x, M_y, T)` = `T = M_x · M_y`, 0x49B991 `Δ = T · M_z` and 0x49B9A6
+        // `car+0x364 = car+0x364 · Δ`, in place through the aliasing guard at 0x532482.
+        //
+        // The three matrices are stored row-major and act on **row** vectors, so each is the
+        // transpose of glam's same-named rotation: `M_x = [[1,0,0],[0,c,s],[0,-s,c]]`,
+        // `M_y = [[c,0,-s],[0,1,0],[s,0,c]]`, `M_z = [[c,s,0],[-s,c,0],[0,0,1]]`. A row of
+        // `car+0x364` therefore maps to `Δᵀ · row`, and
+        // `Δᵀ = (M_x M_y M_z)ᵀ = M_zᵀ M_yᵀ M_xᵀ` = **`Rz · Ry · Rx`** in glam's convention.
+        // This was `Ry · Rx · Rz` until 2026-09-21 — the right three matrices in the wrong order,
+        // which agrees to first order in ω/64 and drifts in the second.
+        let rot = Mat3::from_rotation_z(w.z * TAU) * Mat3::from_rotation_y(w.y * TAU) * Mat3::from_rotation_x(w.x * TAU);
         // rows are body axes in world space: rotate each row
         let m = self.orientation;
         self.orientation = Mat3::from_cols(rot * m.row(0), rot * m.row(1), rot * m.row(2)).transpose();
@@ -1241,6 +1320,26 @@ impl Vehicle {
 mod tests {
     use super::*;
     use crate::collision::{Triangle, TriangleGrid};
+
+    /// `0x4A1472…0x4A14A6`: the half extents are half the span of the body points, per axis.
+    #[test]
+    fn the_half_extents_are_half_the_body_points_span() {
+        let specs = specs_993();
+        let mut v = Vehicle::new(Vec3::ZERO, Mat3::IDENTITY, &specs, 0.7, 0.3);
+        v.body_points = vec![
+            Vec3::new(-0.8, 0.0, -2.0),
+            Vec3::new(0.9, 0.0, -2.0),
+            Vec3::new(0.9, 1.2, 2.2),
+            Vec3::new(-0.8, 1.2, 2.2),
+        ];
+        v.fit_half_extents();
+        assert_eq!(v.half_extents, Vec3::new(0.85, 0.6, 2.1));
+        // no points, no change — 0x4A13CD's loop runs `car+0x32C` times and that is zero
+        let before = v.half_extents;
+        v.body_points.clear();
+        v.fit_half_extents();
+        assert_eq!(v.half_extents, before);
+    }
 
     fn flat_grid() -> TriangleGrid {
         let s = 2000.0;
@@ -1757,5 +1856,62 @@ mod roughness_tests {
         assert!(v.part_damage(&specs.zone_masks.engine) / 300.0 > 0.0);
         let dmg = v.part_damage(&specs.zone_masks.engine) / 300.0;
         assert!(dmg > 0.5 && dmg <= 1.0, "engine damage {dmg}");
+    }
+}
+
+/// A bare x87 `fistp`: round to nearest, **ties to even** — which is neither Rust's `f32::round`
+/// (ties away from zero) nor `as i32` (truncate). `RE/CONVENTIONS.md` has the rule and the list of
+/// the 141 sites in the executable that use it instead of `_ftol`.
+fn fistp(v: f32) -> i32 {
+    let r = v.round();
+    if (v - v.trunc()).abs() == 0.5 && (r as i32) % 2 != 0 { r as i32 - v.signum() as i32 } else { r as i32 }
+}
+
+#[cfg(test)]
+mod steer_taper_tests {
+    use super::*;
+
+    /// `physics.md` §4 item 4, corrected 2026-09-21: the `1.75 − 0.025·speed` factor applies
+    /// **below** 30 m/s (0x49F5F0 compares, 0x49F5FB's `test ah,1; je` skips when `speed >= 30`).
+    #[test]
+    fn the_steering_taper_is_a_low_speed_boost_not_a_high_speed_cut() {
+        let f = |speed: f32| if speed < 30.0 { 1.75 - 0.025 * speed } else { 1.0 };
+        // 1.75 at rest, 1.0 where the two meet, flat above
+        assert!((f(0.0) - 1.75).abs() < 1e-6);
+        assert!((f(29.9) - 1.0).abs() < 0.01);
+        assert_eq!(f(30.0), 1.0);
+        assert_eq!(f(70.0), 1.0);
+        // the old reading went negative, which is what took the steering away at speed
+        assert!(f(70.0) > 0.0);
+    }
+
+    /// A bare `fistp` rounds to nearest with ties to even — 0x49F3EE and 0x49F4C9 both use it
+    /// where `physics.md` §4 writes `int()`.
+    #[test]
+    fn the_fistp_helper_rounds_to_nearest_with_ties_to_even() {
+        assert_eq!(super::fistp(0.4), 0);
+        assert_eq!(super::fistp(0.6), 1);
+        assert_eq!(super::fistp(-0.6), -1);
+        // ties go to the even neighbour, both signs
+        assert_eq!(super::fistp(0.5), 0);
+        assert_eq!(super::fistp(1.5), 2);
+        assert_eq!(super::fistp(2.5), 2);
+        assert_eq!(super::fistp(-0.5), 0);
+        assert_eq!(super::fistp(-1.5), -2);
+        assert_eq!(super::fistp(-2.5), -2);
+        // and it is not truncation: this is the case `as i32` gets wrong
+        assert_ne!(super::fistp(0.9), 0.9_f32 as i32);
+    }
+
+    /// And the roll split: `speed < 10 → (speed+30)·0.025`, otherwise `(speed+70)·0.0125`
+    /// (0x49F2F0 / 0x49F301). Continuous at 10, which is why only the branch order settles it.
+    #[test]
+    fn the_roll_factor_arms_meet_at_ten_metres_a_second() {
+        let r = |speed: f32| if speed < 10.0 { (speed + 30.0) * 0.025 } else { (speed + 70.0) * 0.0125 };
+        assert!((r(9.99) - 1.0).abs() < 0.001);
+        assert!((r(10.0) - 1.0).abs() < 1e-6);
+        // below 10 the slope is twice as steep as above it
+        assert!((r(0.0) - 0.75).abs() < 1e-6);
+        assert!((r(50.0) - 1.5).abs() < 1e-6);
     }
 }

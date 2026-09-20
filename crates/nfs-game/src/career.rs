@@ -20,7 +20,6 @@
 use nfs_assets::GamePaths;
 use nfs_formats::career::{self, Era, Mission, Part, Personality, Tournament, TournamentKind, TrackInfo};
 use nfs_formats::fedata::CarCatalogEntry;
-use nfs_formats::sim::CarSim;
 use nfs_formats::locale::Strings;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -265,6 +264,12 @@ pub fn zone_masks_for(tables: &CareerTables, car: &CarCatalogEntry) -> nfs_physi
 
 /// The car-setup values in the order the setup screen looks them up (0x4F1097…0x4F1311) and the
 /// order they sit in at `FECar+0x6D0`. CONFIRMED.
+///
+/// The eight `GearN` are **not** eight gears. Race setup 0x4EF272…0x4EF32F pushes them into the
+/// named registry parameters, and the names say what they are: `Gear0` is `.REVERSERATIO`,
+/// `Gear1 … Gear6` are `.FIRST … .SIXTHRATIO`, and **`Gear7` is `.FINALRATIO`** — the final drive,
+/// which is why its range is the full ±0.5 again. The neutral slot has no slider.
+/// `RE/notes/physics.md` §3a has the whole path and what each one does to the block.
 pub const CAR_SETUP_NAMES: [&str; 17] = [
     "FDownForce",
     "RDownForce",
@@ -382,8 +387,9 @@ const WEAR_KINDS: [(&str, &[u16]); 6] =
 /// The scale and offset each part-damage getter applies (`PartWear`): over the car's installed
 /// parts of the group's types, `scale = Σ (1.5 − 0.005·condition)` and `offset = Σ state` — the
 /// damage those parts carry from earlier races. A group with nothing installed keeps the default
-/// (one standard part, scale 1.5). MEDIUM: the getter's formula is from `physics.md` §10, that the
-/// state accumulates race damage is the port's reading of what the save keeps.
+/// (one standard part, scale 1.5). The getter's formula is from `physics.md` §10; that `+0x164`
+/// is the carried state is CONFIRMED by `Car_raceInit` 0x41085F, a twenty-iteration loop that
+/// copies `carInfo+0x78 … +0xC4` into `[car+0x768 + 4i]->+0x164` — the save keeps the same field.
 pub fn part_wear_for(tables: &CareerTables, owned: &OwnedCar) -> nfs_physics::specs::PartWearSet {
     let mut out = nfs_physics::specs::PartWearSet::default();
     for (group, kinds) in WEAR_KINDS {
@@ -412,57 +418,11 @@ pub fn part_wear_for(tables: &CareerTables, owned: &OwnedCar) -> nfs_physics::sp
     out
 }
 
-/// Torque added by non-engine type-1 parts is scaled by this constant (`0x5B4A38`, CONFIRMED).
-pub const PART_TORQUE_SCALE: f32 = 0.67;
-
-/// `CarSim_applyParts` 0x49CB50 (`RE/notes/loaders.md` §1.3, offsets corrected against the data):
-/// mass and top-speed deltas for every part; engine parts replace the torque curve (a zero curve
-/// keeps the stock one); other engine-group parts add `0.67 ×` their curve; gearbox parts replace
-/// the ratios and final drive. Brake / spring / shock / sway-bar factors (`+0xC0`) are not applied
-/// (their consumers in the physics were not traced — UNKNOWN).
-pub fn apply_parts(sim: &mut CarSim, parts: &[&Part]) {
-    for p in parts {
-        sim.mass_kg += p.mass_delta;
-        sim.top_speed_mph /= 1.0 + 0.01 * p.top_speed_pct;
-        match p.kind {
-            1 if p.kind_name.starts_with("Engine") => {
-                if p.torque_curve.iter().any(|t| *t != 0.0) {
-                    sim.torque_curve = p.torque_curve;
-                }
-                if p.value_c0 > 0.0 {
-                    sim.redline_rpm = p.value_c0;
-                }
-                match p.induction {
-                    1 | 2 => sim.induction = p.induction,
-                    _ => {}
-                }
-            }
-            1 => {
-                for (t, add) in sim.torque_curve.iter_mut().zip(p.torque_curve.iter()) {
-                    *t += add * PART_TORQUE_SCALE;
-                }
-                if p.kind_name == "Turbo" {
-                    sim.induction = 1;
-                } else if p.kind_name == "Supercharger" {
-                    sim.induction = 2;
-                }
-            }
-            3 if p.kind_name == "Gear Box" => {
-                if p.gear_ratios[2..].iter().any(|g| *g != 0.0) {
-                    sim.reverse_ratio = p.gear_ratios[0];
-                    sim.neutral = p.gear_ratios[1];
-                    sim.gear_ratios.copy_from_slice(&p.gear_ratios[2..8]);
-                    sim.gear_count = p.forward_gears.max(1) as u32;
-                }
-                if p.value_c0 > 0.0 {
-                    sim.final_drive = p.value_c0;
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
+/// Where the purchased parts used to be applied. They are applied to the **`carSpecs` block**
+/// now, by `CarSpecs::apply_parts` (`RE/notes/loaders.md` §1.3) — which is where 0x49CB50 does it,
+/// and which is the only place the `+0xC0` / `+0xC4` factors of the brake, spring, shock, sway-bar,
+/// aero and tyre arms can be applied at all: their targets are block fields with no `.sim`
+/// counterpart.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EventResult {
     /// Player's finishing position, 1-based.
@@ -529,6 +489,11 @@ pub struct Career {
     /// Stages whose promotion prize car was accepted (`fac+0xC = −1`).
     #[serde(default)]
     pub promotions_accepted: Vec<i16>,
+    /// The used-car market — the vector at `[0x691B88]`, which the original saves as its
+    /// `UsedCarMarket` module (`savegame.md` §4.4). The player's own listings stay in the garage
+    /// with an `asking_price`; these are the cars the game generates.
+    #[serde(default)]
+    pub market: Vec<OwnedCar>,
 }
 
 fn default_year() -> u16 {
@@ -537,7 +502,7 @@ fn default_year() -> u16 {
 
 impl Default for Career {
     fn default() -> Self {
-        Self { version: SAVE_VERSION, era: Era::Classic, year: 1950, money: STARTING_MONEY, garage: Vec::new(), tournaments: BTreeMap::new(), eras_completed: Vec::new(), finale: None, evolution_complete: false, missions: Vec::new(), promotions_accepted: Vec::new() }
+        Self { version: SAVE_VERSION, era: Era::Classic, year: 1950, money: STARTING_MONEY, garage: Vec::new(), tournaments: BTreeMap::new(), eras_completed: Vec::new(), finale: None, evolution_complete: false, missions: Vec::new(), promotions_accepted: Vec::new(), market: Vec::new() }
     }
 }
 
@@ -632,7 +597,11 @@ impl Career {
     /// Current value of garage car `idx` (`0x4F8E50`, HIGH): catalogue price × year curve, mileage
     /// and damage deductions, +1 % per win, installed parts at their aged value, floor 5 %.
     pub fn car_value(&self, tables: &CareerTables, idx: usize) -> Option<i64> {
-        let owned = self.garage.get(idx)?;
+        self.value_of(tables, self.garage.get(idx)?)
+    }
+
+    /// The same figure for any car, garage or market.
+    pub fn value_of(&self, tables: &CareerTables, owned: &OwnedCar) -> Option<i64> {
         let car = tables.car(owned.car_id)?;
         let base = (car.price as f64 * car.value_pct(self.year) as f64 / 100.0).round();
         let pct_m = match owned.mileage {
@@ -652,6 +621,139 @@ impl Career {
             .sum();
         let value = base + base * pct_m / 100.0 + base * pct_d / 100.0 + base * owned.wins as f64 / 100.0 + parts;
         Some(value.max((0.05 * base).round()) as i64)
+    }
+
+    /// **The used-car market.** `0x4F80C0`, run by `0x4F7DB0(year)` after every career race and by
+    /// the refresh cheat, walks the whole catalogue `[0x6919F0]` and offers each model with a
+    /// probability that depends on its age:
+    ///
+    /// ```text
+    /// 0x4F80FE  skip when record+0x1F8 (model year) >= year - 1     ; nothing under two years old
+    /// 0x4F8114  skip when record+0x204 is 2 or 3
+    /// 0x4F812C  roll = rand() % 60
+    /// 0x4F813A  skip when roll < USED_CAR_RARITY[year - model year]  ; `jb`
+    /// 0x4F8153  otherwise generate a car and append it to the market [0x691B88]
+    /// 0x4F8171  but first, once the market holds 25, drop the first entry that is not the
+    ///           player's own listing (car+0x6A0 == 0)
+    /// ```
+    ///
+    /// The comparison is `jb`, so the table entry is the chance of **not** being offered, in
+    /// sixtieths: a seven-to-ten-year-old Porsche (70, 80, 80, 70) never reaches the market and
+    /// anything sixteen years old or more (5) nearly always does.
+    pub fn refresh_market(&mut self, tables: &CareerTables, rand: &mut impl FnMut() -> u32) {
+        for record in &tables.catalog {
+            // `[0x6919F0]` is not the raw table: 0x4F3E40 builds it from the records whose
+            // `+0x1F4` is **0** — the playable cars, as against the 1 and 2 that go to
+            // `[0x6919FC]` and `[0x6919F8]` — and only those whose model file is on disk
+            // (0x4F40E6's `sprintf` and 0x4F40F0's open). Without that filter the market fills
+            // with `Eden2` and `EAS7`, the scenery records.
+            if record.kind != 0 || record.sim.is_empty() {
+                continue;
+            }
+            if record.year as i64 >= self.year as i64 - 1 || matches!(record.dealer_flag_204, 2 | 3) {
+                continue;
+            }
+            let age = (self.year as i64 - record.year as i64).clamp(0, USED_CAR_RARITY.len() as i64 - 1) as usize;
+            if rand() % 60 < USED_CAR_RARITY[age] {
+                continue;
+            }
+            let car = self.generate_used_car(tables, record, rand);
+            // 0x4F817A walks for the first entry whose `car+0x6A0` is 0 — a car the game put
+            // there rather than one the player listed. This port keeps the player's listings in
+            // the garage, so every entry here qualifies and the oldest goes.
+            if self.market.len() >= USED_CAR_MARKET_MAX {
+                self.market.remove(0);
+            }
+            self.market.push(car);
+        }
+    }
+
+    /// `0x4F7E41`: every market car is re-valued before the market is topped up, so a car that
+    /// has sat there through a year change is offered at its new price.
+    pub fn reprice_market(&mut self, tables: &CareerTables) {
+        for i in 0..self.market.len() {
+            if let Some(v) = self.value_of(tables, &self.market[i]) {
+                self.market[i].asking_price = Some(v.max(0) as u32);
+            }
+        }
+    }
+
+    /// One market car — `0x4F82C0(record)`. A random paint set, a random mileage and win count from
+    /// their weighted tables, a share of the parts that fit it, and the asking price its own value
+    /// comes to. The original also rolls a decal (a one-in-two chance of `rand() % decalCount`) and
+    /// a paint package (`rand() % 100 - 1` about one time in five) and picks an interior colour
+    /// separately from the exterior; this port keeps one paint index per car, so those three are
+    /// read and not carried.
+    ///
+    /// Nothing here damages the car: the generator never touches the body zones, and every
+    /// `nfs5.prt` record ships `+0x164 = 0`, so a market car's parts are undamaged and its
+    /// condition bars read 100. Its price is discounted by mileage alone.
+    pub fn generate_used_car(&self, tables: &CareerTables, record: &CarCatalogEntry, rand: &mut impl FnMut() -> u32) -> OwnedCar {
+        let mut car = OwnedCar::new(record.id, 0, 0);
+        if !record.paint_sets.is_empty() {
+            car.paint_set = (rand() as usize % record.paint_sets.len()) as u8;
+        }
+        car.mileage = weighted_band(&USED_MILEAGE, rand).max(0) as u32;
+        car.wins = weighted_band(&USED_WINS, rand).max(0) as u32;
+        car.parts = self.generate_used_parts(tables, record, rand);
+        car.part_state = car.parts.iter().map(|id| (*id, 0.0)).collect();
+        car.asking_price = Some(self.value_of(tables, &car).unwrap_or(0).max(0) as u32);
+        car
+    }
+
+    /// `0x4F8590(car)` — which parts a market car comes with. It clears the installed list, takes
+    /// the parts that fit the car (`0x517D10`, this port's [`Career::parts_for`]), rolls a
+    /// **percentage** from `USED_PART_PCT` and installs `pct × available / 100` of them, truncated
+    /// (0x4F869E), drawn without replacement: `pick = rand() % remaining`, then
+    /// `index[pick] = index[--remaining]` (0x4F89AC), whether the pick was kept or dropped.
+    ///
+    /// A pick is dropped when it duplicates one already installed — the same type name
+    /// (`part+0x28`) **and** the same category (`part+0x26`) — or when both are engines: the four
+    /// string compares at 0x4F877E, 0x4F87EA, 0x4F8856 and 0x4F88C2 reject every pairing of
+    /// `"Engine"` and `"Engine (Standard)"`, so a car never leaves the market with two.
+    fn generate_used_parts(&self, tables: &CareerTables, record: &CarCatalogEntry, rand: &mut impl FnMut() -> u32) -> Vec<i16> {
+        let avail = self.parts_for(tables, record);
+        if avail.is_empty() {
+            return Vec::new();
+        }
+        let pct = weighted_band(&USED_PART_PCT, rand).max(0);
+        let want = (pct as f64 * avail.len() as f64 * 0.01) as usize;
+        let mut index: Vec<usize> = (0..avail.len()).collect();
+        let mut remaining = avail.len();
+        let mut out: Vec<i16> = Vec::new();
+        let engine = |n: &str| n == "Engine" || n == "Engine (Standard)";
+        for _ in 0..want {
+            let pick = if remaining == 0 { 0 } else { rand() as usize % remaining };
+            let cand = avail[index[pick]];
+            let clash = out.iter().filter_map(|id| avail.iter().find(|p| p.id == *id)).any(|p| {
+                (p.kind_name == cand.kind_name && p.kind == cand.kind) || (engine(&p.kind_name) && engine(&cand.kind_name))
+            });
+            if !clash {
+                out.push(cand.id);
+            }
+            if remaining > 0 {
+                remaining -= 1;
+                index[pick] = index[remaining];
+            }
+        }
+        out
+    }
+
+    /// `0x501F40`: buy market car `idx` at its asking price. The car joins the garage exactly as it
+    /// stands, mileage, wins, parts and all.
+    pub fn buy_used_car(&mut self, idx: usize) -> Result<(), CareerError> {
+        let car = self.market.get(idx).ok_or(CareerError::UnknownCar { id: 0 })?;
+        let price = car.asking_price.unwrap_or(0) as i64;
+        if self.money < price {
+            return Err(CareerError::NoMoney { need: price, have: self.money });
+        }
+        let mut car = self.market.remove(idx);
+        self.money -= price;
+        car.purchase_price = price as u32;
+        car.asking_price = None;
+        car.offer = None;
+        self.garage.push(car);
+        Ok(())
     }
 
     /// Put the damage a race left on the car away with it: the ten zones, their mean as the
@@ -1070,6 +1172,41 @@ pub const PART_AGE_PCT: [u32; 62] = [
 
 /// `price + price·Σ PART_AGE_PCT[0..age] / 100` — what a part is worth before its condition is
 /// taken off (0x518900, first half). CONFIRMED.
+/// How many cars the used-car market holds before the oldest generated one is dropped —
+/// `0x4F8171` compares the list length against **0x19**.
+pub const USED_CAR_MARKET_MAX: usize = 25;
+
+/// `0x5B7A10`, indexed by a model's age in years (0…60). See [`Career::refresh_market`]: the entry
+/// is the chance in sixtieths of the model **not** being offered.
+pub const USED_CAR_RARITY: [u32; 61] = [
+    5, 10, 15, 20, 25, 35, 50, 70, 80, 80, 70, 50, 40, 30, 20, 10, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 4, 4, 4, 3, 3, 3, 2, 2,
+];
+
+/// One of the used-car generator's weighted draws: `(roll_lo, roll_hi, min, max)`. `rand() % 100`
+/// picks the band and the value is `min + rand() % (max - min)` — **`max` exclusive** — or exactly
+/// `min` when the two are equal (0x4F866C's `sub`/`jne`). The original's loop does not stop at the
+/// first match; the bands do not overlap, so the last one to match is the only one.
+pub type Band = (i32, i32, i32, i32);
+
+/// `0x5B7B08`: what share of the parts that fit go on a market car.
+pub const USED_PART_PCT: [Band; 4] = [(0, 5, 0, 0), (6, 45, 1, 10), (46, 75, 11, 20), (76, 100, 21, 50)];
+/// `0x5B7B48`: the odometer.
+pub const USED_MILEAGE: [Band; 4] = [(0, 5, 0, 0), (6, 20, 2000, 15000), (21, 80, 15000, 25000), (81, 100, 25000, 100000)];
+/// `0x5B7BC8`: the win count.
+pub const USED_WINS: [Band; 4] = [(0, 5, 0, 0), (6, 20, 1, 2), (21, 80, 3, 10), (81, 100, 11, 50)];
+
+pub fn weighted_band(bands: &[Band], rand: &mut impl FnMut() -> u32) -> i32 {
+    let roll = (rand() % 100) as i32;
+    let mut out = 0;
+    for &(lo, hi, min, max) in bands {
+        if roll >= lo && roll <= hi {
+            out = if max == min { min } else { min + (rand() % (max - min) as u32) as i32 };
+        }
+    }
+    out
+}
+
 pub fn part_aged_price(p: &Part, year: u16) -> i64 {
     let age = (year as i64 - p.year as i64).max(0) as usize;
     let sum: u32 = PART_AGE_PCT.iter().take(age).sum();

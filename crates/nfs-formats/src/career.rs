@@ -364,11 +364,19 @@ pub struct Part {
     pub condition: f32,
     /// `{group, slot, geometry id}` visual swaps.
     pub geometry_swaps: Vec<[i16; 3]>,
-    /// Engine parts: redline rpm; gearbox parts: final-drive ratio.
+    /// `+0xC0`, the arm's first tuning value, and what it means is the `kind`'s business
+    /// (`nfs-physics`'s `CarSpecs::apply_parts`): a gearbox part's final drive, a brake / spring /
+    /// shock / sway-bar factor whose identity is **1**, an aero part's front percentage — and on an
+    /// engine part a redline in rpm that **nothing reads**.
     pub value_c0: f32,
+    /// `+0xC4`, the second: a spring's ride height in millimetres, an aero part's rear percentage,
+    /// a tyre's rear grip figure. 0 on every other kind.
     pub boost: f32,
-    /// 1 turbo, 2 supercharged.
-    pub induction: u32,
+    /// `+0xC8`. **Not an induction type** — the induction comes from an engine part's *name*
+    /// (0x49CDC5 / 0x49CE09). On a tyre part (`kind == 9`) this is the **grip-table column**, 0, 1
+    /// or 2, which 0x49D1FA writes straight into `carSpecs+0x1C0`. It is 0 or 1 on engine parts and
+    /// 0 everywhere else, and nothing reads it there.
+    pub grip_class: u32,
     pub forward_gears: i16,
     pub gearbox_param: i16,
     /// Reverse, neutral, 1st … (gearbox parts).
@@ -428,7 +436,7 @@ pub fn parse_parts(data: &[u8]) -> Result<Vec<Part>, FormatError> {
             geometry_swaps,
             value_c0: f32_le(r, 0xC0, what)?,
             boost: f32_le(r, 0xC4, what)?,
-            induction: u32_le(r, 0xC8, what)?,
+            grip_class: u32_le(r, 0xC8, what)?,
             forward_gears: i16_le(r, 0xEA, what)?,
             gearbox_param: i16_le(r, 0xEC, what)?,
             gear_ratios,

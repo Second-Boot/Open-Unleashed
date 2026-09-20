@@ -2852,3 +2852,153 @@ fn a_trailing_comma_yields_one_component() {
     put(&mut e, " , 50");
     assert_eq!(e.parts_of("size"), vec![50.0], "a leading empty token is skipped the same way");
 }
+
+/// `FEChronicleMainBoxControl`'s grid, 0x508020: five columns of 91 across and three rows of 61
+/// down from 0x26 below the widget's top. `RE/notes/controls.md` §4.120.
+#[test]
+fn the_chronicle_timelines_grid() {
+    use nfs_game::layout::chronicle_cell;
+    let at = |px, py| chronicle_cell(px, py, 100.0, 200.0);
+    assert_eq!(at(100.0, 238.0), Some((0, 0)), "the first cell starts 0x26 = 38 below the top");
+    assert_eq!(at(190.0, 238.0), Some((0, 0)), "91 wide, so 90 is still column 0");
+    assert_eq!(at(191.0, 238.0), Some((1, 0)));
+    assert_eq!(at(100.0, 298.0), Some((0, 0)), "61 tall, so 60 is still row 0");
+    assert_eq!(at(100.0, 299.0), Some((0, 1)));
+    assert_eq!(at(100.0, 237.0), None, "above the grid");
+    assert_eq!(at(99.0, 238.0), None, "left of it");
+    assert_eq!(at(100.0 + 5.0 * 91.0, 238.0), None, "past the fifth column");
+    assert_eq!(at(100.0, 238.0 + 3.0 * 61.0), None, "past the third row");
+}
+
+/// `OpponentCar.Car`'s five rows are menu strings, not cars — `controls.md` §4.140.
+#[test]
+fn the_opponent_combo_lists_five_menu_strings() {
+    use nfs_game::opponents::OpponentChoice;
+    // the jump table at 0x4F5788, in row order
+    let ids: Vec<u32> = OpponentChoice::ROWS.iter().map(|c| c.string_id()).collect();
+    assert_eq!(ids, [640, 642, 643, 644, 641]);
+    // and the stored value is the row index, which is what `from_index` reads
+    for (i, c) in OpponentChoice::ROWS.iter().enumerate() {
+        assert_eq!(OpponentChoice::from_index(i as u32), *c);
+    }
+    // anything past the table is "random car" (0x4F54B2's fall-through)
+    assert_eq!(OpponentChoice::from_index(9), OpponentChoice::RandomCar);
+}
+
+/// The garage picker's row heights — `controls.md` §4.144, `FEOwnedCarAccessor` slot 26 0x4F60F0.
+#[test]
+fn the_garage_lists_grouping_heights() {
+    use nfs_game::layout::{ListRow, LIST_ROW_H};
+    // a heading block costs a whole row, so an era change is 42, a class change 28, a plain row 14
+    let era = ListRow::GroupHeading("CLASSIC ERA".into());
+    let class = ListRow::GroupHeading("CLASS 3".into());
+    let car = ListRow::Text("356".into());
+    assert_eq!(era.height(), LIST_ROW_H);
+    assert_eq!(era.height() + class.height() + car.height(), 42.0, "an era change");
+    assert_eq!(class.height() + car.height(), 28.0, "a class change");
+    assert_eq!(car.height(), 14.0, "any other row");
+}
+
+/// `nfs5.car + 0x1C0` — the variant index, `controls.md` §4.145.
+#[test]
+fn the_variant_index_orders_one_generation() {
+    let Ok(paths) = nfs_assets::GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let Ok(t) = nfs_game::career::CareerTables::load(&paths) else { return };
+    let mut a: Vec<(i16, &str)> = t
+        .catalog
+        .iter()
+        .filter(|c| c.kind == 0 && c.family.starts_with("356 A"))
+        .map(|c| (c.variant, c.display_name.as_str()))
+        .collect();
+    a.sort();
+    // one 0…11 run across `356 A`, `356 A Convertible` and `356 A Speedster`
+    assert_eq!(a.iter().map(|(v, _)| *v).collect::<Vec<_>>(), (0..12).collect::<Vec<i16>>());
+    assert!(a[0].1.contains("Cabriolet"), "{}", a[0].1);
+    assert!(a[11].1.contains("Speedster"), "{}", a[11].1);
+}
+
+/// The cursor table at 0x5D9C8C against the shipped `Pointer.fsh` — `RE/notes/controls.md`
+/// §4.152. Ten shapes, and every `{first, last}` pair lands exactly on a tag boundary in the
+/// file, which is what says the pairs were read off correctly.
+#[test]
+fn the_cursor_shapes_land_on_the_pointer_packs_tag_boundaries() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let p = GamePaths::find_file(&paths.fe_data().join("Art"), "Pointer.fsh").expect("Pointer.fsh");
+    let d = std::fs::read(&p).unwrap();
+    let n = u32::from_le_bytes(d[8..12].try_into().unwrap()) as usize;
+    assert_eq!(n, 34, "Pointer.fsh entry count");
+    let tag = |i: usize| String::from_utf8_lossy(&d[16 + i * 8..20 + i * 8]).to_string();
+    // Entries 0…5 are tagged "00 "…"05 ", one per frame; everything from 6 on is a named run
+    // whose frames share a tag. Both kinds have to line up with the table.
+    let expect = ["00", "01", "pick", "Lift", "Pan.", "grab", "Poin", "mags", "magP", "watc"];
+    for (shape, &(first, last)) in nfs_game::layout::CURSOR_SHAPES.iter().enumerate() {
+        assert!(last < n && first <= last, "shape {shape} is not a range inside the file");
+        assert_eq!(tag(first).trim(), expect[shape], "shape {shape} starts on the wrong entry");
+        if first >= 6 {
+            // a named run: every frame carries the tag, and the neighbours do not
+            for i in first..=last {
+                assert_eq!(tag(i), tag(first), "frames {first}..={last} are not one run");
+            }
+            if first > 6 {
+                assert_ne!(tag(first - 1), tag(first), "shape {shape} does not start its run");
+            }
+            if last + 1 < n {
+                assert_ne!(tag(last + 1), tag(last), "shape {shape} does not end its run");
+            }
+        } else {
+            // the numbered frames: "00", "01", "02", … in order
+            for (k, i) in (first..=last).enumerate() {
+                assert_eq!(tag(i).trim(), format!("{:02}", first + k), "frame {i} is out of order");
+            }
+        }
+    }
+    // the three the notes name by hand
+    assert_eq!(tag(nfs_game::layout::CURSOR_SHAPES[7].0).trim(), "mags"); // the magnifier a 3D car asks for
+    assert_eq!(tag(nfs_game::layout::CURSOR_SHAPES[9].0).trim(), "watc"); // the hourglass
+    assert_eq!(nfs_game::layout::CURSOR_SHAPES[1], (1, 5)); // the animated arrow, five frames
+}
+
+/// `FECar3DControl`'s zone test, 0x4C0D10 — `RE/notes/controls.md` §4.153. Five zones from the
+/// turntable's fraction of a turn crossed with the horizontal third of the widget's box, and the
+/// top 5/16 of the box before either of them.
+#[test]
+fn the_3d_cars_zones_follow_the_turntable_and_the_thirds() {
+    use nfs_game::layout::car_zone_of;
+    // the box the test works in: 300 wide, 160 tall, at the origin
+    let (w, h) = (300.0, 160.0);
+    let z = |t: f32, x: f32, y: f32| car_zone_of(t, x, y, 0.0, 0.0, w, h);
+    // 0x4C0D5D: the top five sixteenths are zone 0 whatever the angle
+    for t in [0.0, 0.25, 0.5, 0.75] {
+        assert_eq!(z(t, 150.0, 0.0), Some(0));
+        assert_eq!(z(t, 150.0, 5.0 * h / 16.0), Some(0));
+    }
+    let y = h * 0.9; // below the 5/16 line for everything that follows
+    // 0x4C0DCD: t <= 0.1 or t > 0.9 is zone 4 across the whole width
+    for x in [10.0, 150.0, 290.0] {
+        assert_eq!(z(0.05, x, y), Some(4));
+        assert_eq!(z(0.95, x, y), Some(4));
+    }
+    // 0x4C0E57: 0.1 < t <= 0.4 — left 4, middle 2, right 3
+    assert_eq!(z(0.25, 10.0, y), Some(4));
+    assert_eq!(z(0.25, 150.0, y), Some(2));
+    assert_eq!(z(0.25, 290.0, y), Some(3));
+    // 0x4C0DF0: 0.4 < t <= 0.6 is zone 3 across the whole width
+    for x in [10.0, 150.0, 290.0] {
+        assert_eq!(z(0.5, x, y), Some(3));
+    }
+    // 0x4C0E0F: 0.6 < t <= 0.9 — left 3, middle 1, right 4
+    assert_eq!(z(0.75, 10.0, y), Some(3));
+    assert_eq!(z(0.75, 150.0, y), Some(1));
+    assert_eq!(z(0.75, 290.0, y), Some(4));
+    // the turntable runs backwards, so the fraction has to wrap the same way
+    assert_eq!(z(-0.25, 150.0, y), z(0.75, 150.0, y));
+    // off the box at all
+    assert_eq!(z(0.5, -1.0, y), None);
+    assert_eq!(z(0.5, 150.0, h + 1.0), None);
+}

@@ -29,12 +29,42 @@ pub fn lane_exists(sl: &Slice, lane: i32) -> bool {
 }
 
 /// `0x40EB20(slice, offset)` — the lane a lateral offset falls in, clamped to 2..11.
+///
+/// **It does not divide by the lane width.** It rounds the width to a whole number and looks the
+/// reciprocal up in a 20-entry table:
+///
+/// ```text
+/// 0x40EB6F  fld  width ; fistp n            ; round to nearest, not truncate
+/// 0x40EB78  fld  [n*4 + 0x5E7550]           ; = 1/n
+/// 0x40EB7F  fmul offset
+/// 0x40EB85  fistp                           ; round to nearest again
+/// 0x40EB8E  clamp 2 … 11
+/// ```
+///
+/// The table is built by 0x4068A0: `[0x5E7550] = 0.0` and `[0x5E7550 + 4i] = 1/i` for
+/// **i = 1…19** (the loop stores while `eax < 0x5E75A0`). So a 3.7 m lane is treated as 4 m, a
+/// width under 0.5 rounds to 0 and reads the table's leading **0.0**, which puts everything in
+/// the base lane — which is what the old `w <= 0.0` guard was approximating.
+///
+/// Both conversions are bare `fistp`, i.e. **round to nearest**; the port truncated with `as i32`
+/// and divided by the raw width. Corrected 2026-09-20.
 pub fn lane_of(sl: &Slice, offset: f32) -> i32 {
     let (base, w) = if offset < 0.0 { (6, sl.lane_width_a) } else { (7, sl.lane_width_b) };
-    if w <= 0.0 {
+    let n = round_half_even(w);
+    if !(1..=19).contains(&n) {
+        // n = 0 reads the table's 0.0; anything past 19 is off the end of it and never happens
+        // on shipped data, where a lane is 2…6 m
         return base;
     }
-    (base + (offset / w) as i32).clamp(2, 11)
+    (base + round_half_even(offset * (1.0 / n as f32))).clamp(2, 11)
+}
+
+/// `fistp` with the x87's default rounding mode: **to nearest, ties to even**. Rust's `f32::round`
+/// is ties-away-from-zero, and `as i32` truncates, so neither is it.
+fn round_half_even(v: f32) -> i32 {
+    let r = v.round();
+    // `round` only differs from the x87 on an exact .5, where it goes away from zero
+    if (v - v.trunc()).abs() == 0.5 && (r as i32) % 2 != 0 { r as i32 - v.signum() as i32 } else { r as i32 }
 }
 
 /// `0x40EBB0(car)` — the mask of every lane the car's body spans, from `lateral ± (halfWidth − 0.5)`.
@@ -104,8 +134,14 @@ pub struct LaneCar {
     pub lateral: f32,
     /// `car+0x538` — half the body's extent projected on the slice's lateral axis
     pub half_span: f32,
-    /// `car+0x52C & 1`
+    /// `car+0x52C & 4` — the **human**. `Car_register` sets this bit only on the human path
+    /// (0x40F270).
     pub is_human: bool,
+    /// `car+0x52C & 1` — **any racer**, the human or an opponent. `Car_register` loads `ecx = 1`
+    /// once at 0x40F23F and ORs it in on both paths, 0x40F291 for the human and 0x40F32E for an
+    /// opponent, so bit 0 is membership of the racer list `[0x5E8E2C]` and bit 2 / bit 3 say
+    /// which kind. Several notes called bit 0 "human"; corrected 2026-09-20.
+    pub is_racer: bool,
 }
 
 /// The per-car scratch block `0x5E6658 … 0x5E66AC`: slot 0 = lane−1, 1 = current, 2 = lane+1.
@@ -322,8 +358,10 @@ impl LaneScratch {
         let mut bonus = -4.9;
         if me.is_traffic {
             bonus = -38.0;
+            // **0x401C8D tests `& 1`**, so an opponent bearing down on a traffic car makes it
+            // pull over exactly as the player does. This used to ask for the human.
             if let Some(i) = self.blocker[1]
-                && cars[i].is_human
+                && cars[i].is_racer
                 && cars[i].speed_est > 8.889
             {
                 bonus = 5.0;
@@ -493,6 +531,40 @@ mod tests {
         LaneSelf { slice: 10, lane, lateral, dir: 1.0, speed: 16.5, target_speed: 16.5, half_width: 0.9, half_len: 2.1, is_traffic: true, travelled: 1000.0 }
     }
 
+    /// The lane index is `base + round(offset × table[round(width)])` where the table is `1/i`
+    /// (0x40EB6F…0x40EB88). Both roundings are bare `fistp`, i.e. to nearest — and the width one
+    /// matters, because a third of the shipped slice sides are not whole metres.
+    #[test]
+    fn a_lane_width_is_rounded_before_its_reciprocal_is_taken() {
+        let at = |w: f32, off: f32| {
+            let mut t = ring(200, 2, 2);
+            for sl in &mut t.slices {
+                sl.lane_width_a = w;
+                sl.lane_width_b = w;
+            }
+            lane_of(&t.slices[0], off)
+        };
+        // 7.5 rounds to 8 (ties to even), so the 7→8 step is at 4 m, not 3.75
+        assert_eq!(at(7.5, 3.9), 7);
+        assert_eq!(at(7.5, 4.1), 8);
+        // 4.5 rounds **down** to 4, again ties-to-even — the step is at 2 m
+        assert_eq!(at(4.5, 1.9), 7);
+        assert_eq!(at(4.5, 2.1), 8);
+        // 3.75 rounds to 4, so it behaves exactly as 4.5 does
+        assert_eq!(at(3.75, 1.9), 7);
+        assert_eq!(at(3.75, 2.1), 8);
+        // 5.5 rounds up to 6 — the step is at 3 m
+        assert_eq!(at(5.5, 2.9), 7);
+        assert_eq!(at(5.5, 3.1), 8);
+        // a width under half a metre rounds to 0 and reads the table's leading 0.0: everything
+        // lands in the base lane
+        assert_eq!(at(0.4, 50.0), 7);
+        assert_eq!(at(0.4, -50.0), 6);
+        // and the clamp still holds at both ends
+        assert_eq!(at(1.0, 100.0), 11);
+        assert_eq!(at(1.0, -100.0), 2);
+    }
+
     #[test]
     fn lanes_and_masks_agree_with_each_other() {
         let t = ring(200, 2, 2);
@@ -505,10 +577,14 @@ mod tests {
         // the shipped mask covers the whole road and nothing outside it
         assert!(lane_exists(sl, 4) && lane_exists(sl, 9));
         assert!(!lane_exists(sl, 3) && !lane_exists(sl, 10));
-        // a car spans the lanes its body covers
-        let m = lane_span(sl, 2.0, 0.9);
-        assert_eq!(m, lane_bit(7), "a car inside one lane spans only that lane");
-        assert_eq!(lane_span(sl, 4.0, 0.9), lane_bit(7) | lane_bit(8), "straddling the line spans both");
+        // A car spans the lanes its body covers — and the boundaries are where **rounding** puts
+        // them, not truncation: `lane = base + round(offset/w)`, so with a 4 m lane the step from
+        // 7 to 8 is at 2 m, not 4 m. Lanes 6 and 7 are the two halves of the centre lane and
+        // everything outside them is a full width. A car at 2.0 with 0.9 of half-width has edges
+        // at 1.6 and 2.4, which round to 0 and 1 — it straddles.
+        assert_eq!(lane_span(sl, 1.0, 0.9), lane_bit(7), "a car well inside one lane spans only that lane");
+        assert_eq!(lane_span(sl, 2.0, 0.9), lane_bit(7) | lane_bit(8), "straddling the 7/8 line spans both");
+        assert_eq!(lane_span(sl, 4.0, 0.9), lane_bit(8), "a car well inside lane 8");
     }
 
     #[test]
@@ -517,7 +593,7 @@ mod tests {
         let m = me(8, 6.0);
         // a slow car two slices (12 m) ahead in lane 8, nothing in the lanes either side. Farther out
         // the cap is not restrictive at all: the permitted speed grows by 1.25 m/s per metre of gap.
-        let cars = [LaneCar { slice: 12, lane: 8, lane_mask: lane_bit(8), speed: 4.0, speed_est: 4.0, half_len: 2.1, lateral: 6.0, half_span: 0.9, is_human: false }];
+        let cars = [LaneCar { slice: 12, lane: 8, lane_mask: lane_bit(8), speed: 4.0, speed_est: 4.0, half_len: 2.1, lateral: 6.0, half_span: 0.9, is_human: false, is_racer: false }];
         let mut s = LaneScratch::default();
         s.find_blockers(&t, &m, &cars, &PERSONALITIES[0]);
         // lane 8 is the car's own lane, so the blocker lands in slot 1 and caps that lane's speed
@@ -554,7 +630,7 @@ mod tests {
     fn traffic_pulls_over_for_a_fast_human() {
         let t = ring(200, 2, 2);
         let m = me(8, 6.0);
-        let cars = [LaneCar { slice: 12, lane: 8, lane_mask: lane_bit(8), speed: 40.0, speed_est: 40.0, half_len: 2.1, lateral: 6.0, half_span: 0.9, is_human: true }];
+        let cars = [LaneCar { slice: 12, lane: 8, lane_mask: lane_bit(8), speed: 40.0, speed_est: 40.0, half_len: 2.1, lateral: 6.0, half_span: 0.9, is_human: true, is_racer: true }];
         let mut s = LaneScratch::default();
         s.blocker[1] = Some(0);
         s.score_shoulders(&t, &m, &cars);
@@ -568,7 +644,7 @@ mod tests {
         let m = me(8, 6.0);
         // lane 8 spans 4.0..8.0; a car sitting at 5.0 with a 0.9 half-span leaves 2.1 m above it and
         // 0.1 m below, and the margin is 1.5 x the car's own 0.9 half width
-        let o = LaneCar { slice: 10, lane: 8, lane_mask: lane_bit(8), speed: 4.0, speed_est: 4.0, half_len: 2.1, lateral: 5.0, half_span: 0.9, is_human: false };
+        let o = LaneCar { slice: 10, lane: 8, lane_mask: lane_bit(8), speed: 4.0, speed_est: 4.0, half_len: 2.1, lateral: 5.0, half_span: 0.9, is_human: false, is_racer: false };
         let target = LaneScratch::squeeze_past(&t, &m, &o, 8).expect("the upper strip is wide enough");
         assert!((target - (5.9 + 0.5 * 2.1)).abs() < 1e-5, "aim at the middle of the free strip: {target}");
         // a car parked in the middle of the lane leaves nothing on either side

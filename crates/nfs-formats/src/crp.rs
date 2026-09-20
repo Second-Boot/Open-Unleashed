@@ -487,6 +487,16 @@ pub struct Base {
     /// Scene-object tag at +68 (e.g. "CONE", "ARW1", "SIGN", "FNSH"); `.scn` GEOM_ELEMENT ids are
     /// this FourCC read as a little-endian u32. Zero when absent. CONFIRMED.
     pub tag: [u8; 4],
+    /// `Base+72` — the article's **translation** channel index, signed; `-1` (0xFF) for none.
+    /// `R3DCarLOD::draw` reads it at 0x43C945 and offsets `object + 0x6D0 + 12n`.
+    pub move_channel: i8,
+    /// `Base+75` — the article's **rotation** channel index, `0` for none. 0x43C98A
+    /// (`mov al, byte ptr [edx+7]` over `[part+0x44]`, the `Base` record) picks it, and
+    /// 0x43C9B0 fetches `0x443F10(n)` = `object + 0x2DC + 12n`: three floats that are rotations
+    /// **in turns** about X, Y and Z (0x43C9C0 / 0x43C9D7 / 0x43C9F8 each multiply by
+    /// `[0x5B25CC]` = 360.0 before 0x539BD0's axis-angle build). Channels 6 and 7 are special:
+    /// 0x43CA5A rotates about the `.tpg` `dooraxis` by `chan[1]` instead, x negated for 7.
+    pub rot_channel: u8,
     pub lod_count: u32,
     pub bbox_min: [f32; 3],
     pub bbox_max: [f32; 3],
@@ -531,6 +541,8 @@ impl Base {
         Ok(Self {
             flags: u32_le(b, 0, "CRP Base flags")?,
             tag: [b[68], b[69], b[70], b[71]],
+            move_channel: if b.len() > 72 { b[72] as i8 } else { -1 },
+            rot_channel: if b.len() > 75 { b[75] } else { 0 },
             lod_count,
             bbox_min: [f(20)?, f(24)?, f(28)?],
             bbox_max: [f(32)?, f(36)?, f(40)?],
