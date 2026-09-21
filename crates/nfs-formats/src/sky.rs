@@ -465,8 +465,11 @@ pub struct SkyBin {
     pub segments: [SkySegment; 16],
     /// `+0x3C` (region A) and `+0xB3C` (region B) — the ring each region draws.
     pub rings: [SkyRing; 2],
-    /// `+0xCE4` — a scalar handed to the region-A ring's constructor, 0.1 … 1.5.
+    /// `+0xCE4` — a scalar handed to the region-A ring's constructor, 0.1 … 1.5; the sun's scale.
     pub scalar_ce4: f32,
+    /// `+0xCDC`, `+0xCE0` — where the sun sits on region A's dome before its turn (0x461090's
+    /// first two arguments, pushed at 0x46092A / 0x46092B); 0, 0 on the tracks whose sun is overhead.
+    pub sun_offset: [f32; 2],
     /// `+0xDD8` — non-zero enables the sun's screen read-back (the lens flare, 0x4604B8).
     pub sun_readback: bool,
     /// `+0xDDC` — a per-slice scalar track, handed to every layer's update (0x45D077).
@@ -502,6 +505,26 @@ pub struct SkyRing {
 }
 
 impl SkyBin {
+    /// The sun, as the lens-flare object 0x460780 places it at `+0x11C` through **0x461090**:
+    /// the offset `(a, b)` turned by region A's `angle_turns` (`c`, times 2π, `fcos` / `fsin`),
+    /// raised on the ring's dome `height − small·(a² + b²)`, all scaled by `+0xCE4`:
+    ///
+    /// ```text
+    /// x = (cos c · a + sin c · b) · g
+    /// y = (height − small · (a² + b²)) · g
+    /// z = (cos c · b − sin c · a) · g
+    /// ```
+    ///
+    /// The race car's light travels along its **negation**, normalised (0x43AC8D…0x43AD36).
+    pub fn sun_position(&self) -> [f32; 3] {
+        let [a, b] = self.sun_offset;
+        let r = &self.rings[0];
+        let t = (r.angle_turns as f64 * 6.28318452835083) as f32;
+        let (c, s) = (t.cos(), t.sin());
+        let g = self.scalar_ce4;
+        [(c * a + s * b) * g, (r.height - r.small * (a * a + b * b)) * g, (c * b - s * a) * g]
+    }
+
     pub const COLOURS_AT: usize = 0xCE8;
     pub const RECORD: usize = 60;
     /// `+0xDDC`, `+0x1A5C`, `+0x655C` — three per-slice keyframe tracks, each at most 400 entries and
@@ -578,6 +601,7 @@ impl SkyBin {
             segments,
             rings: [ring(0x3C), ring(0xB3C)],
             scalar_ce4: f_raw(0xCE4),
+            sun_offset: [f_raw(0xCDC), f_raw(0xCE0)],
             sun_readback: i_at(0xDD8) != 0,
             track_a,
             track_b,

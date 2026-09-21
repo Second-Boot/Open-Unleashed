@@ -490,3 +490,27 @@ fn the_rear_axle_does_not_spin_at_speed() {
     assert!(v.speed() * 3.6 > 150.0, "the car should be well into its top gears");
     assert!(share < 0.10, "the rear axle is marked spinning on {:.0} % of ticks at speed", 100.0 * share);
 }
+
+/// The driver-name cheats (0x49D6E7…0x49D875): `SILSPD` 1.2× the gear pull (in place of the
+/// manual 1.05), grip ×1.2, roll gain ×0.8, roll retention ×10/11; `ROLLEY` grip ×1.5 and roll gain
+/// ×1.33; anyone else nothing — and a second call folds nothing more in.
+#[test]
+fn the_driver_name_cheats() {
+    let Some(base) = specs_993() else { return };
+    let mut s = base.clone();
+    s.apply_driver_name("SILSPD", true);
+    assert!((s.grip / base.grip - 1.2).abs() < 1e-5);
+    assert!((s.accel_per_torque[2] / base.accel_per_torque[2] - 1.2).abs() < 1e-5);
+    assert!((s.roll_gain / base.roll_gain - 0.8).abs() < 1e-5);
+    assert!((s.roll_ret / base.roll_ret - 10.0 / 11.0).abs() < 1e-5);
+    assert!((s.inv_grip * s.grip - 1.0).abs() < 1e-6);
+    let once = s.clone();
+    s.apply_driver_name("SILSPD", true);
+    assert_eq!(s, once);
+    let mut r = base.clone();
+    r.apply_driver_name("ROLLEY", true);
+    assert!((r.grip / base.grip - 1.5).abs() < 1e-5 && (r.roll_gain / base.roll_gain - 1.33).abs() < 1e-5);
+    let mut n = base.clone();
+    n.apply_driver_name("Hans", true);
+    assert_eq!(n, base);
+}

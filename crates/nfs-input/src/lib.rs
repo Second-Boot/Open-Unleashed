@@ -39,7 +39,9 @@ pub enum Action {
     SplitTimes,
 }
 
-const ALL_ACTIONS: [Action; 9] = [
+const ALL_ACTIONS: [Action; 11] = [
+    Action::CameraNext,
+    Action::RearView,
     Action::SteerLeft,
     Action::SteerRight,
     Action::Throttle,
@@ -140,6 +142,8 @@ pub fn binding_id(a: Action) -> Option<u16> {
         Action::ShiftUp => C1_SHIFTUP,
         Action::ShiftDown => C1_SHIFTDOWN,
         Action::Reset => C1_RESET,
+        Action::CameraNext => I_CYCLECAMERA,
+        Action::RearView => I_LOOKBEHIND,
         _ => return None,
     })
 }

@@ -156,11 +156,12 @@ impl Room {
         -(ms as f32) / (1000.0 * self.spin)
     }
 
-    /// Where the room sits while the screen is `fade` of the way out (0 in place, 1 gone):
-    /// `(X·f, Y·f − fade·0.8, Z·f + fade·0.3)` with `f = 1 − fade` (0x4E9FFF…0x4EA051).
-    pub fn faded_pos(&self, fade: f32) -> [f32; 3] {
-        let f = 1.0 - fade;
-        [self.pos[0] * f, self.pos[1] * f - fade * 0.8, self.pos[2] * f + fade * 0.3]
+    /// Where the room (and its car) sits `zoom` of the way into a door: `(X·f, Y·f − zoom·0.8,
+    /// Z·f + zoom·0.3)` with `f = 1 − zoom` (0x4E9FFF…0x4EA051) — `zoom` is `[room+0x2E8]`, the
+    /// 3D car widget's door zoom (0x4C05E1 → 0x4E7800), 0 at rest.
+    pub fn zoomed_pos(&self, zoom: f32) -> [f32; 3] {
+        let f = 1.0 - zoom;
+        [self.pos[0] * f, self.pos[1] * f - zoom * 0.8, self.pos[2] * f + zoom * 0.3]
     }
 }
 
@@ -188,10 +189,10 @@ mod tests {
     }
 
     #[test]
-    fn the_room_pulls_toward_the_camera_as_the_screen_fades() {
+    fn the_room_pulls_toward_the_camera_as_a_door_is_zoomed_into() {
         let g = room("ID_GARAGE").unwrap();
-        assert_eq!(g.faded_pos(0.0), g.pos);
-        let out = g.faded_pos(1.0);
+        assert_eq!(g.zoomed_pos(0.0), g.pos);
+        let out = g.zoomed_pos(1.0);
         assert_eq!(out, [0.0, -0.8, 0.3]);
     }
 }

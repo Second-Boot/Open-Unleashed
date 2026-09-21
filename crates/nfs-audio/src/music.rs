@@ -167,6 +167,11 @@ impl MusicPlayer {
         &self.playlist
     }
 
+    /// The saved playlist the race starts from, as the CD player edited it.
+    pub fn set_saved(&mut self, list: Vec<usize>) {
+        self.saved = list;
+    }
+
     pub fn now_playing(&self) -> Option<&str> {
         self.current.as_ref().map(|m| m.title.as_str())
     }

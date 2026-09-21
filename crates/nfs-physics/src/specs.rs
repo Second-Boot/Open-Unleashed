@@ -142,6 +142,8 @@ pub struct CarSpecs {
     /// pitch / roll injection clamps, turns/s (+0x134/+0x138)
     pub pitch_clamp: f32,
     pub roll_clamp: f32,
+    /// a driver-name cheat already folded in (`apply_driver_name`)
+    pub driver_cheat: bool,
 }
 
 impl CarSpecs {
@@ -212,6 +214,7 @@ impl CarSpecs {
             roll_gain: t[15] * 0.001,
             pitch_clamp: t[17],
             roll_clamp: t[18],
+            driver_cheat: false,
         };
         // 0x49CB50's tail, which the loader always runs: the three gear tables, the drag term, the
         // yaw lever and 1/grip. `automatic` = `carinfo+0xC != 0`, which the `.sim` does not carry —
@@ -443,6 +446,43 @@ impl CarSpecs {
     ///   at 0x49D88E and happens **before** the clamp;
     /// * 0x49D934: `yaw_lever = wheelbase · 0.5 · 0.025 · 256` (= 3.2·wheelbase) and its inverse;
     /// * 0x49D991: `inv_grip = 1 / grip`, which is why grip has to be settled first.
+    /// **The driver-name cheats** of the same tail (0x49D6E7…0x49D875), which compare the car's
+    /// typed driver name `carinfo+0x17C` with `"SILSPD"` (0x5D0CF0) and `"ROLLEY"` (0x5D0CE8):
+    ///
+    /// * `SILSPD`: in the gear loop each live slot's `accel_per_torque` takes **×1.2 in place of**
+    ///   the manual ×1.05 (0x49D71F — the match skips the `carinfo+0xC` test); after it `grip`
+    ///   ×1.2, `roll_gain` (+0x12C) ×0.8 and `roll_ret` (+0x118) ×10/11 (0x49D7C9…0x49D80B);
+    /// * `ROLLEY`: `grip` ×1.5 and `roll_gain` ×1.33 (0x49D84B…0x49D875).
+    ///
+    /// The drag term and `1/grip` that follow are taken again. Applied once per car build; the
+    /// flag keeps a restarted race from compounding it.
+    pub fn apply_driver_name(&mut self, name: &str, automatic: bool) {
+        if self.driver_cheat {
+            return;
+        }
+        match name {
+            "SILSPD" => {
+                let f = if automatic { 1.2 } else { 1.2 / 1.05 };
+                for a in self.accel_per_torque.iter_mut().take(self.gear_slots.min(8)) {
+                    *a *= f;
+                }
+                self.grip *= 1.2;
+                self.roll_gain *= 0.8;
+                self.roll_ret *= f32::from_bits(0x3f68ba2e);
+            }
+            "ROLLEY" => {
+                self.grip *= 1.5;
+                self.roll_gain *= 1.33;
+            }
+            _ => return,
+        }
+        self.driver_cheat = true;
+        let top = self.gear_slots - 1;
+        let rpm_top = (self.ratio_rpm_per_mps[top] * self.top_speed).trunc().min(self.redline).max(0.0);
+        self.drag = torque_at(&self.torque, rpm_top) * self.accel_per_torque[top] / (self.top_speed * self.top_speed * self.top_speed);
+        self.inv_grip = 1.0 / self.grip;
+    }
+
     pub fn rebuild_tables(&mut self, automatic: bool) {
         for i in 0..8 {
             self.ratio_rpm_per_mps[i] = self.final_drive * self.gear_ratio[i] * 60.0 / self.circumference;

@@ -10,6 +10,7 @@
 pub mod ai_engine;
 pub mod ambience;
 pub mod engine;
+pub mod fesfx;
 pub mod mixer;
 pub mod music;
 pub mod reverb;

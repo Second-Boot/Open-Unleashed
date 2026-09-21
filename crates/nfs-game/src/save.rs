@@ -408,6 +408,10 @@ pub struct SavedSettings {
     /// order they are registered at 0x51E4C0 — `XAxis`, `YAxis`, `ZAxis`, `XRot`, `YRot`, `ZRot`,
     /// `SliderA`, `SliderB` (`RE/notes/controls.md` §4.17)
     pub deadzone: [[u32; 2]; 8],
+    /// The `Controller.*` bindings the port has, `(accessor, six fields)` — each an
+    /// `FEControllerInputAccessor` (0x51D060: `u32[6]` from `this+0x14`, no selection). The
+    /// original keeps the player's rebound controls here, in the profile (`savegame.md` §6.2).
+    pub controls: [Option<(&'static str, [u32; 6])>; 12],
 }
 
 /// The eight axes in the order 0x51E4C0 registers their two accessors, which is `DIJOYSTATE`'s own
@@ -432,8 +436,25 @@ impl Default for SavedSettings {
             traffic: 0,
             ko_opponents: 4,
             deadzone: [[0, 0x80]; 8],
+            controls: [None; 12],
         }
     }
+}
+
+/// The `Controller.*` bindings a save carries, by accessor name.
+pub fn saved_controls(s: &SaveFile) -> Vec<(String, [u32; 6])> {
+    s.accessors
+        .as_ref()
+        .map(|a| {
+            a.entries
+                .iter()
+                .filter_map(|(n, v)| match v {
+                    AccessorValue::ControllerInput(f) if n.starts_with("Controller.") => Some((n.clone(), *f)),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, knockout: Option<&KnockoutProgress>, playlist: &[u32], settings: &SavedSettings) -> SaveFile {
@@ -491,6 +512,9 @@ pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, 
             values[0] = settings.deadzone[n][k];
             entries.push((format!("{axis}.{suffix}"), AccessorValue::DeadZone { selection: 0, values }));
         }
+    }
+    for (name, fields) in settings.controls.iter().flatten() {
+        entries.push(((*name).into(), AccessorValue::ControllerInput(*fields)));
     }
     // the selected car's setup, which the screen mirrors into `FEFloatAccessor`s — a float rides in
     // the same dword (`career.md` §12, `layouts.md`)
@@ -560,6 +584,19 @@ pub fn write_profile(dir: &Path, profile: &Profile, save: &SaveFile) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rebound control survives the `.sav`: six dwords under its `Controller.*` name, read back
+    /// by name (0x51D060 / 0x51D080).
+    #[test]
+    fn controls_round_trip_through_the_accessor_block() {
+        let fields = [3, 0, 0x1E, 0, 0, b'A' as u32];
+        let s = SaveFile {
+            accessors: Some(AccessorBlock { entries: vec![("Controller.SteerLeft".into(), AccessorValue::ControllerInput(fields)), ("Chronicle.Year".into(), AccessorValue::Dword(1950))] }),
+            ..SaveFile::default()
+        };
+        let back = SaveFile::parse(&s.write()).unwrap();
+        assert_eq!(saved_controls(&back), vec![("Controller.SteerLeft".to_string(), fields)]);
+    }
 
     #[test]
     fn profile_stems_follow_the_original_naming() {

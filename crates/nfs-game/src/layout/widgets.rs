@@ -1328,16 +1328,14 @@ impl LayoutScreen {
     // unchanged, a half-transparent green that is nowhere on screen in the game.
     pub(super) fn draw_panel(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>, blank: &mut Vec<(String, String)>) -> bool {
         let WidgetDraw { i, x, y, aspect, strings, accessor, .. } = d;
-        let mut closed = false;
-        // a closed tab draws nothing and is not a gap
-        let Some(g) = self.groups.get(&i) else {
-            if self.closed.contains(&i) {
-                closed = true;
-            }
-            return closed;
-        };
+        // a closed panel — a tab not selected, or one the screen hid (0x4CEC50) after it was
+        // loaded — draws nothing and is not a gap
+        if self.closed.contains(&i) {
+            return true;
+        }
+        let Some(g) = self.groups.get(&i) else { return false };
         out.extend(self.embedded(g, aspect, strings, accessor, blank, x, y));
-        closed
+        false
     }
 
     // `NFS5.3DCAR`'s car is an offscreen view the size of the screen, not a sprite:

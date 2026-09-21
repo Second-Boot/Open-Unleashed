@@ -36,6 +36,7 @@ use std::sync::Arc;
 
 use crate::text::BitmapFont;
 
+mod dialog_draw;
 mod widgets;
 use widgets::WidgetDraw;
 
@@ -117,6 +118,10 @@ pub struct TrackMapEvent {
     /// because a point-to-point track driven backwards starts where it normally finishes
     /// (0x4FCDFC…0x4FCE0F). The shipped `nfs5.trn` sets it on 39 of its 130 events.
     pub backwards: bool,
+    /// the event's `+5`, handed to the blit as its fifth argument: when set the marker's x is
+    /// mirrored across the map, `map.x + map.w − marker.x − marker.w` (0x4FCE9F…0x4FCEC8). No
+    /// shipped event sets it.
+    pub mirror: bool,
     /// the track's name in caps — `FEStrings[trk+4 + 20]`, which is what 0x4FCFAD…0x4FCFBE looks
     /// up for the list beside the map
     pub name: String,
@@ -175,6 +180,12 @@ pub struct LayoutScreen {
     /// each `NFS5.3DCAR`'s opening parts — `FECar3DControl`'s slot 9 and its step
     /// (`crate::carparts`, §4.153), by widget index
     car_parts: HashMap<usize, crate::carparts::CarParts>,
+    /// the `NFS5.3DCAR` widgets whose car has a roof animation (`set_car_roof`)
+    car_roof: std::collections::HashSet<usize>,
+    /// `[screen+0x261]`, "covered" — set by the manager's 0x4D2000 while a dialog is up, and by
+    /// 0x4D1E70 on every layer but the top; a covered screen's widgets answer `isDisabled` and draw
+    /// `[state.disabled]` where their template has it (§4.147)
+    covered: bool,
     /// `(combo element, row)` — the open drop-down's hovered row, kept from the last frame the
     /// pointer was actually on the list. The original keeps it in `[this+0x1A8]` with
     /// `[this+0x1A4]` as "there is one", and **`FEComboBox`'s leave handler 0x4C6F00 does not
@@ -783,6 +794,10 @@ pub const DEFAULT_FONT: &str = "univers8b.ffn";
 pub const SMALL_FONT: &str = "univers8b.ffn";
 /// `NFS5.ColorBox`'s picker keeps two fonts of its own — `[this+0x294]` and `[this+0x298]`
 pub const PICKER_BUTTON_FONT: &str = "universc11b.ffn";
+/// The dialogs' two fonts, loaded once for all of them at 0x5121EB / 0x512227 into `[0x69A060]`
+/// (the text) and `[0x69A064]` (the buttons) — §4.147.
+pub const DIALOG_TEXT_FONT: &str = "univers10b.ffn";
+pub const DIALOG_BUTTON_FONT: &str = "universc11m.ffn";
 pub const PICKER_TITLE_FONT: &str = "univers7b.ffn";
 
 /// The screen block's `screen=` id → the layout drawn underneath it (`FE_loadBackground` 0x4E1470,
@@ -969,6 +984,39 @@ impl LayoutScreen {
     /// Two levels deep in the shipped data: `Options.lay` embeds `controllers`, which embeds
     /// `controllertabs` and six more. The depth cap is this port's own guard, not a rule of the
     /// original.
+    /// Open or close the `NFS5.PANEL` named `name`, here or in any panel this screen holds —
+    /// a panel's slot 27 load (0x4CEA90, `[panel+0x14C]` from the layout loader) the first time it
+    /// opens, then 0x4CEC60 (show) or 0x4CEC50 (hide). Answers whether the panel was found.
+    pub fn set_panel(&mut self, r: &mut Renderer, paths: &GamePaths, name: &str, open: bool) -> bool {
+        let found = self.layout.elements.iter().position(|e| e.class == "NFS5.PANEL" && e.get("name").is_some_and(|n| n.eq_ignore_ascii_case(name)));
+        if let Some(i) = found {
+            if !open {
+                self.closed.insert(i);
+                return true;
+            }
+            self.closed.remove(&i);
+            if !self.groups.contains_key(&i)
+                && let Some(file) = self.layout.elements[i].get("filename").map(str::to_string)
+            {
+                match Self::load_one(r, paths, &file, self.controls.clone(), self.fe_strings.clone()) {
+                    Ok(mut g) => {
+                        g.set_overlay(true);
+                        Self::load_children(r, paths, &mut g, 1);
+                        self.groups.insert(i, Box::new(g));
+                    }
+                    Err(e) => {
+                        tracing::debug!(file, error = %e, "panel layout unavailable");
+                        self.closed.insert(i);
+                    }
+                }
+            }
+            return true;
+        }
+        let mut keys: Vec<usize> = self.groups.keys().copied().collect();
+        keys.sort_unstable();
+        keys.into_iter().any(|k| self.groups.get_mut(&k).is_some_and(|g| g.set_panel(r, paths, name, open)))
+    }
+
     fn load_children(r: &mut Renderer, paths: &GamePaths, screen: &mut Self, depth: usize) {
         if depth >= 4 {
             return;
@@ -1262,7 +1310,8 @@ impl LayoutScreen {
         // every `fontPathName` the file names, every one its widgets' class templates name, plus
         // the FE default
         let mut fonts: HashMap<String, BitmapFont> = HashMap::new();
-        let mut want: Vec<String> = vec![DEFAULT_FONT.to_string()];
+        // the FE default, and the dialogs' two fonts: a dialog can come up over any screen
+        let mut want: Vec<String> = vec![DEFAULT_FONT.to_string(), DIALOG_TEXT_FONT.to_string(), DIALOG_BUTTON_FONT.to_string()];
         // `NFS5.BADGE` builds its own two fonts rather than taking one from the file: 0x4CF25C
         // loads `Univers14b.ffn` for the player's name and 0x4CF2A0 `Univers10b.ffn` for the rank
         if layout.elements.iter().any(|e| e.class == "NFS5.BADGE") {
@@ -1315,7 +1364,7 @@ impl LayoutScreen {
         let mut unrendered: Vec<(String, usize)> = counts.into_iter().collect();
         unrendered.sort();
         tracing::info!(name, elements = layout.elements.len(), art = shapes.len(), fonts = fonts.len(), skipped = unrendered.len(), "layout loaded");
-        Ok(Self { layout, background: None, shapes, fonts, white, cursor_ms: 0, cursor_shape_at: std::cell::Cell::new((usize::MAX, 0)), cursor_btn_at: std::cell::Cell::new((false, 0)), cursor_btn: false, car_spin: 0.0, car_parts: HashMap::new(), combo_hover: std::cell::Cell::new(None), unrendered, logos: HashMap::new(), checks: HashMap::new(), knobs: HashMap::new(), closed: std::collections::HashSet::new(), groups: HashMap::new(), bars: HashMap::new(), lists: HashMap::new(), car_views: HashMap::new(), track_maps: HashMap::new(), movies: HashMap::new(), ko_strip: HashMap::new(), badges: HashMap::new(),
+        Ok(Self { layout, background: None, shapes, fonts, white, cursor_ms: 0, cursor_shape_at: std::cell::Cell::new((usize::MAX, 0)), cursor_btn_at: std::cell::Cell::new((false, 0)), cursor_btn: false, car_spin: 0.0, car_parts: HashMap::new(), car_roof: Default::default(), covered: false, combo_hover: std::cell::Cell::new(None), unrendered, logos: HashMap::new(), checks: HashMap::new(), knobs: HashMap::new(), closed: std::collections::HashSet::new(), groups: HashMap::new(), bars: HashMap::new(), lists: HashMap::new(), car_views: HashMap::new(), track_maps: HashMap::new(), movies: HashMap::new(), ko_strip: HashMap::new(), badges: HashMap::new(),
             // `NFS_FE_CLOCK` preloads the screen clock in milliseconds, so a still can be taken
             // part way through an animation the front end would otherwise only show in motion
             clock_ms: std::env::var("NFS_FE_CLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0), glint, colb, arcs,
@@ -2433,7 +2482,8 @@ impl LayoutScreen {
 
     /// The `NFS5.ListBox` widgets on this screen, with the accessor each one lists.
     pub fn list_boxes(&self) -> Vec<ListBoxWidget> {
-        self.layout
+        let mut out: Vec<ListBoxWidget> = self
+            .layout
             .elements
             .iter()
             .enumerate()
@@ -2441,7 +2491,19 @@ impl LayoutScreen {
             // accessor too, only with a fixed spacing rather than the list box's 14 (§4.131)
             .filter(|(_, e)| e.class == "NFS5.ListBox" || e.class == "NFS5.CHATDISPLAYBOX")
             .map(|(index, e)| ListBoxWidget { index, accessor: self.attr(e, "accessor").map(str::to_string) })
-            .collect()
+            .collect();
+        // …and the ones inside the panels this screen holds, in the flattened index space, as
+        // `combo_sliders` does — `Audio.lay`'s CD player lists live in its playlist panel
+        let mut keys: Vec<usize> = self.groups.keys().copied().collect();
+        keys.sort_unstable();
+        let mut base = self.layout.elements.len();
+        for k in keys {
+            for w in self.groups[&k].list_boxes() {
+                out.push(ListBoxWidget { index: base + w.index, accessor: w.accessor });
+            }
+            base += self.groups[&k].span();
+        }
+        out
     }
 
     /// The combo sliders and colour boxes, which take the same row binding as a list box: their
@@ -3038,7 +3100,7 @@ impl LayoutScreen {
                 if parts.is_some_and(|p| p.zoomed) {
                     return 7;
                 }
-                want = want.max(match self.car_zone(e) {
+                want = want.max(match self.car_zone(h, e) {
                     Some(0) => 6,
                     // zones 1 and 2 read `byte[this+0x1AE + (zone != 1)]` at 0x4C0A41: a door
                     // clicked open is `magP`, a closed one `grab`
@@ -3059,11 +3121,22 @@ impl LayoutScreen {
     ///
     /// The zone is the turntable angle's fraction crossed with the horizontal third of the
     /// widget's box, and the answers are the ones 0x4C0DCD…0x4C0E89 write into `edi`.
-    fn car_zone(&self, e: &nfs_formats::lay::Element) -> Option<u32> {
+    fn car_zone(&self, index: usize, e: &nfs_formats::lay::Element) -> Option<u32> {
         let (x, y) = self.cursor?;
         let (bx, by) = self.position_of(e);
         let (w, h) = self.box_of(e, 0);
-        car_zone_of(self.car_spin, x, y, bx, by, w, h)
+        let roof = self.car_roof.contains(&index);
+        car_zone_of(self.car_spin, roof, x, y, bx, by, w, h)
+    }
+
+    /// Whether the car a `NFS5.3DCAR` shows has a roof animation — `0x438190(model, 1)` non-zero,
+    /// the test 0x4C0D10 makes before its roof zone.
+    pub fn set_car_roof(&mut self, index: usize, roof: bool) {
+        if roof {
+            self.car_roof.insert(index);
+        } else {
+            self.car_roof.remove(&index);
+        }
     }
 
     /// A click released on a `NFS5.3DCAR` — slot 9, 0x4C0EB0: the zone under the pointer
@@ -3075,7 +3148,7 @@ impl LayoutScreen {
         if !e.class.eq_ignore_ascii_case("NFS5.3DCAR") {
             return out;
         }
-        let zone = self.car_zone(e);
+        let zone = self.car_zone(index, e);
         let now = self.ticks();
         let parts = self.car_parts.entry(index).or_default();
         let focused = parts.zoomed;
@@ -3105,13 +3178,33 @@ impl LayoutScreen {
         out
     }
 
+    /// The widget's `Car.Roof` check each tick (0x4C05E7…0x4C063F; the bind 0x4BFE71 on the first).
+    pub fn sync_car_roof(&mut self, index: usize, down: bool) -> Vec<crate::carparts::PartEvent> {
+        let now = self.ticks();
+        let mut out = Vec::new();
+        self.car_parts.entry(index).or_default().sync_roof(down, now, &mut out);
+        out
+    }
+
+    /// The room zoom a 3D car's tick hands on (`CarParts::zoom`), and whether it is zoomed in —
+    /// while it is, the tick covers the screens every frame (0x4C052F → 0x4D2000).
+    pub fn car_zoom(&self, index: usize) -> (f32, bool) {
+        let now = self.ticks();
+        self.car_parts.get(&index).map(|p| (p.zoom(now), p.zoomed)).unwrap_or((0.0, false))
+    }
+
+    /// Zone 0's state, 0…255 — what 0x4C07E8 hands 0x4D1990(1, ·) after every step.
+    pub fn car_roof_state(&self, index: usize) -> i32 {
+        self.car_parts.get(&index).map(|p| p.state[0]).unwrap_or(0)
+    }
+
     /// Channels 6 and 7 of the car a `NFS5.3DCAR` widget shows — its two doors, in turns.
     pub fn car_doors(&self, index: usize) -> (f32, f32) {
         self.car_parts.get(&index).map(|p| p.doors()).unwrap_or((0.0, 0.0))
     }
 
     /// `TIMER_getTicks()` (0x53C2E0) — the 128 Hz count — from the screen's clock.
-    fn ticks(&self) -> u32 {
+    pub fn ticks(&self) -> u32 {
         (self.clock_ms as u64 * 128 / 1000) as u32
     }
 
@@ -3122,15 +3215,14 @@ impl LayoutScreen {
 }
 
 /// The body of [`LayoutScreen::car_zone`], free of the screen so it can be tested on its own.
-pub fn car_zone_of(spin: f32, x: f32, y: f32, bx: f32, by: f32, w: f32, h: f32) -> Option<u32> {
+pub fn car_zone_of(spin: f32, roof: bool, x: f32, y: f32, bx: f32, by: f32, w: f32, h: f32) -> Option<u32> {
     {
         if x < bx || y < by || x >= bx + w || y >= by + h {
             return None;
         }
-        // 0x4C0D5D: the top **5/16** of the box is zone 0 whatever the angle. (The original
-        // reaches this only when 0x438190(model, 1) is non-zero — a model property the port does
-        // not carry — so the port always applies it. APPROXIMATION, and the only one here.)
-        if y <= by + 5.0 * h / 16.0 {
+        // 0x4C0D5D: the top **5/16** of the box is zone 0 whatever the angle — reached only when
+        // the car's roof animation has a length, `0x438190(model, 1)` non-zero
+        if roof && y <= by + 5.0 * h / 16.0 {
             return Some(0);
         }
         let t = spin.rem_euclid(1.0);
@@ -3268,7 +3360,12 @@ impl LayoutScreen {
                 Some((tex, w, h, img.place[0] as f32, img.place[1] as f32))
             };
             let map = upload(0);
-            let marker = upload(if ev.backwards { 2 } else { 1 });
+            let mut marker = upload(if ev.backwards { 2 } else { 1 });
+            if ev.mirror
+                && let (Some(m), Some(k)) = (map, marker.as_mut())
+            {
+                k.3 = m.3 + m.1 - k.3 - k.1;
+            }
             out.push(TrackMapArt { map, marker, name: ev.name.clone() });
         }
         self.track_maps.insert(index, out);
@@ -3632,6 +3729,33 @@ impl LayoutScreen {
     /// Not covered: 0x4C7CD3's third way out — `[this+0x114]` set, the template carrying a
     /// `disabled` state (`[this+0x110] & 0x10`) and 0x4E08E0 agreeing — the accessor-driven
     /// disable, which is the same condition §4.110 reads at 0x4C831E.
+    /// The state a widget is drawn in right now, by name — what `FEControl::onMouseEnter`
+    /// 0x4C7BC3…0x4C7BFC compares with `"hover"`. `None` off this screen's own widgets.
+    pub fn state_name(&self, i: usize, selected: Option<usize>) -> Option<String> {
+        let e = self.layout.elements.get(i)?;
+        Some(self.state_for(e, i, selected, self.hovered()).to_string())
+    }
+
+    /// 0x4C7E40 — the disabled bit (0x10) of the live flag word, or a `.lay` block that starts
+    /// `state=disabled`.
+    pub fn widget_disabled(&self, i: usize) -> bool {
+        self.disabled_flags.contains(&i)
+            || self.layout.elements.get(i).and_then(|e| e.get("state")).is_some_and(|s| s == "disabled")
+            || self.covered_disables(i)
+    }
+
+    /// 0x4C7E4C…0x4C7E62, `isDisabled`'s third arm: the owning screen is covered and the
+    /// widget's template has a `disabled` state.
+    fn covered_disables(&self, i: usize) -> bool {
+        self.covered
+            && self.layout.elements.get(i).is_some_and(|e| self.controls.get(&e.class).is_some_and(|c| c.has_state("disabled")))
+    }
+
+    /// Cover or uncover this screen (`[+0x261]`, 0x4E08C0 / 0x4E08A0).
+    pub fn set_covered(&mut self, on: bool) {
+        self.covered = on;
+    }
+
     fn state_hidden_or_disabled(&self, i: usize) -> bool {
         if self.is_hidden(i) || self.disabled_flags.contains(&i) {
             return true;
@@ -4232,12 +4356,31 @@ impl LayoutScreen {
 
     /// Return, `c == 0x0D`: 0x4CCDB5 drops the focus flag through `0x4C7DA0` and then calls
     /// `accessor->vt[0x0C]()` to commit. Hands back the accessor's name and what was typed so the
-    /// caller can store it; the buffer and the focus both go.
+    /// caller can store it; the focus goes, the text stays — it is the accessor's own buffer,
+    /// which `CREATEPLAYERDONE` (0x5107A8) reads through `vt[0x10]` after the box has let go.
     pub fn commit_input(&mut self, index: usize) -> Option<(String, String)> {
         let name = self.layout.elements.get(index)?.get("accessor")?.to_string();
-        let text = self.edits.remove(&index)?;
+        let text = self.edits.get(&index)?.clone();
         self.focused.remove(&index);
         Some((name, text))
+    }
+
+    /// Empty the input box bound to `accessor` — the string accessor's clear, its slot 0x44.
+    pub fn clear_input(&mut self, accessor: &str) {
+        if let Some(i) = self.layout.elements.iter().position(|e| e.get("accessor") == Some(accessor)) {
+            self.edits.remove(&i);
+        }
+    }
+
+    /// What the input box bound to `accessor` holds — `accessor->vt[0x10]()`, the string
+    /// accessor's buffer (empty until something is typed; the buffers go with the screen).
+    pub fn input_text(&self, accessor: &str) -> String {
+        self.layout
+            .elements
+            .iter()
+            .position(|e| e.get("accessor") == Some(accessor))
+            .and_then(|i| self.edits.get(&i).cloned())
+            .unwrap_or_default()
     }
 
     /// The `NFS5.CONTROLLERSETUP` row waiting for a control, if one has focus — its flattened
@@ -4646,7 +4789,11 @@ impl LayoutScreen {
         let hot = hovered == Some(i) || self.capture == Some(i);
         // 0x4C831E comes second, after `hidden` and before everything else (§4.110), and a
         // disabled widget shows `[state.disabled]` whatever the pointer is doing
-        if self.disabled_flags.contains(&i) && self.controls.get(&e.class).is_some_and(|c| c.has_state("disabled")) {
+        // a covered screen (§4.147) disables it the same way — but `hidden` is tested first, so a
+        // widget the screen has hidden stays hidden under a dialog
+        if (self.disabled_flags.contains(&i) || (self.covered && !self.is_hidden(i)))
+            && self.controls.get(&e.class).is_some_and(|c| c.has_state("disabled"))
+        {
             return "disabled";
         }
         // `data.alwaysfocused` (read at 0x4CC537 into `[this+0x156]`): the input box's bind calls
@@ -4809,7 +4956,10 @@ impl LayoutScreen {
         for (i, e) in self.layout.elements.iter().enumerate().skip(1) {
             // a panel draws a whole screen of its own here, at the panel's own depth
             if let Some(base) = bases.get(&i) {
-                if let Some(j) = self.groups[&i].hovered() {
+                // a hidden panel takes no pointer either
+                if !self.closed.contains(&i)
+                    && let Some(j) = self.groups[&i].hovered()
+                {
                     return Some(base + j);
                 }
                 continue;

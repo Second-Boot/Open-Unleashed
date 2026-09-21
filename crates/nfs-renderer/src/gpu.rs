@@ -18,6 +18,9 @@ struct GlobalsUniform {
     sun_dir: [f32; 4],
     ambient: [f32; 4],
     cam_pos: [f32; 4],
+    /// world → headlight frame; `headlight_on.x` 1 while it lights
+    headlight: [[f32; 4]; 4],
+    headlight_on: [f32; 4],
 }
 
 #[repr(C)]
@@ -26,6 +29,12 @@ struct ObjectUniform {
     model: [[f32; 4]; 4],
     env_mix: [f32; 4],
     light: [f32; 4],
+    /// `R3DLightLayer` (`RE/notes/lighting.md` §6): `lit_a.xyz` the slot's colour × p0 and
+    /// `lit_a.w` 1 when the layer lights this item; `lit_d.xyz` the `slot + 4` partner × p1;
+    /// `lit_dir.xyz` the direction the light travels, in world space
+    lit_a: [f32; 4],
+    lit_d: [f32; 4],
+    lit_dir: [f32; 4],
 }
 
 struct GpuMesh {
@@ -67,6 +76,7 @@ pub struct Renderer {
     pipelines: Vec<wgpu::RenderPipeline>, // index = blend*4 + nocull*2 + nodepth
     globals_buf: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
+    headlight_map_buf: wgpu::Buffer,
     object_layout: wgpu::BindGroupLayout,
     material_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -135,12 +145,21 @@ impl Renderer {
         });
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("globals"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                count: None,
-            }],
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                // the 128 × 128 `nght` bytes, four to a u32
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+            ],
         });
         let object_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("object"),
@@ -237,10 +256,19 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let headlight_map_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("headlight map"),
+            size: 128 * 128,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let globals_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globals"),
             layout: &globals_layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals_buf.as_entire_binding() }],
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: globals_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: headlight_map_buf.as_entire_binding() },
+            ],
         });
         let align = device.limits().min_uniform_buffer_offset_alignment as u64;
         let object_stride = (std::mem::size_of::<ObjectUniform>() as u64).div_ceil(align) * align;
@@ -322,6 +350,7 @@ impl Renderer {
             pipelines,
             globals_buf,
             globals_bg,
+            headlight_map_buf,
             object_layout,
             material_layout,
             sampler,
@@ -409,7 +438,7 @@ impl Renderer {
         let vertex_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh vb"),
             contents: bytemuck::cast_slice(&mesh.vertices),
-            usage: wgpu::BufferUsages::VERTEX,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
         let index_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh ib"),
@@ -418,6 +447,16 @@ impl Renderer {
         });
         self.meshes.push(GpuMesh { vertex_buf, index_buf, index_count: mesh.indices.len() as u32 });
         MeshId(self.meshes.len() as u32 - 1)
+    }
+
+    /// New vertices for a mesh already uploaded, the same count — the morphing parts of a car
+    /// (its roof) rewrite theirs when the animation moves.
+    pub fn update_mesh_vertices(&mut self, id: MeshId, vertices: &[crate::Vertex]) {
+        if let Some(m) = self.meshes.get(id.0 as usize)
+            && (vertices.len() * std::mem::size_of::<crate::Vertex>()) as u64 == m.vertex_buf.size()
+        {
+            self.queue.write_buffer(&m.vertex_buf, 0, bytemuck::cast_slice(vertices));
+        }
     }
 
     pub fn upload_texture(&mut self, tex: &TextureData) -> TextureId {
@@ -499,6 +538,13 @@ impl Renderer {
 
     /// Point every reflective material at another environment map — the original re-binds the car's
     /// environment layers whenever the `.map` section under it changes (`RE/notes/lighting.md` §3).
+    /// `night.psh`'s `nght` bitmap, 128 × 128 bytes, for the headlight projector.
+    pub fn set_headlight_map(&mut self, map: &[u8]) {
+        if map.len() == 128 * 128 {
+            self.queue.write_buffer(&self.headlight_map_buf, 0, map);
+        }
+    }
+
     pub fn set_env_texture(&mut self, env: TextureId) {
         let env_view = &self.textures[env.0 as usize].view;
         for m in self.materials.iter_mut().filter(|m| m.env_mix > 0.0) {
@@ -637,6 +683,8 @@ impl Renderer {
                 sun_dir: scene.sun_direction.extend(0.0).to_array(),
                 ambient: [scene.ambient, 0.0, 0.0, 0.0],
                 cam_pos: camera.position.extend(1.0).to_array(),
+                headlight: scene.headlight.unwrap_or(glam::Mat4::IDENTITY).to_cols_array_2d(),
+                headlight_on: [scene.headlight.is_some() as u32 as f32, 0.0, 0.0, 0.0],
             }),
         );
         let n = scene.items.len().min(MAX_OBJECTS as usize);
@@ -646,8 +694,12 @@ impl Renderer {
             let o = ObjectUniform {
                 model: item.transform.to_cols_array_2d(),
                 // .x is the environment-map mix, .zw a uv offset (the sky layers scroll with it)
-                env_mix: [env_mix, 0.0, item.uv_offset[0], item.uv_offset[1]],
+                // .y flags an item the headlight projector lights
+                env_mix: [env_mix, item.headlit as u32 as f32, item.uv_offset[0], item.uv_offset[1]],
                 light: [item.light[0], item.light[1], item.light[2], item.alpha],
+                lit_a: item.layer_light.map_or([0.0; 4], |l| [l.ambient[0], l.ambient[1], l.ambient[2], 1.0]),
+                lit_d: item.layer_light.map_or([0.0; 4], |l| [l.diffuse[0], l.diffuse[1], l.diffuse[2], 0.0]),
+                lit_dir: item.layer_light.map_or([0.0; 4], |l| [l.direction[0], l.direction[1], l.direction[2], 0.0]),
             };
             let off = i * self.object_stride as usize;
             staging[off..off + std::mem::size_of::<ObjectUniform>()].copy_from_slice(bytemuck::bytes_of(&o));

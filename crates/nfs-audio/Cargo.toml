@@ -9,3 +9,6 @@ nfs-formats.workspace = true
 cpal.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+nfs-assets.workspace = true

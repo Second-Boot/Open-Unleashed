@@ -2972,12 +2972,14 @@ fn the_3d_cars_zones_follow_the_turntable_and_the_thirds() {
     use nfs_game::layout::car_zone_of;
     // the box the test works in: 300 wide, 160 tall, at the origin
     let (w, h) = (300.0, 160.0);
-    let z = |t: f32, x: f32, y: f32| car_zone_of(t, x, y, 0.0, 0.0, w, h);
+    let z = |t: f32, x: f32, y: f32| car_zone_of(t, true, x, y, 0.0, 0.0, w, h);
     // 0x4C0D5D: the top five sixteenths are zone 0 whatever the angle
     for t in [0.0, 0.25, 0.5, 0.75] {
         assert_eq!(z(t, 150.0, 0.0), Some(0));
         assert_eq!(z(t, 150.0, 5.0 * h / 16.0), Some(0));
     }
+    // …but only for a car with a roof animation: without one the top falls to the angle's zones
+    assert_eq!(car_zone_of(0.0, false, 150.0, 0.0, 0.0, 0.0, w, h), Some(4));
     let y = h * 0.9; // below the 5/16 line for everything that follows
     // 0x4C0DCD: t <= 0.1 or t > 0.9 is zone 4 across the whole width
     for x in [10.0, 150.0, 290.0] {

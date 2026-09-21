@@ -44,6 +44,11 @@ pub mod id {
     pub const C1_ABORT: u16 = 0x16B;
     pub const C1_RESET: u16 = 0x16C;
     pub const C1_AIDRIVE: u16 = 0x16D;
+    /// `I_LOOKBEHIND` and `I_CYCLECAMERA` (the option table's entries at 0x4B41F7 / 0x4B425B) —
+    /// the ids `Controller.LookBehind` and `Controller.CameraView` are built with (0x51E1A9,
+    /// 0x51E22D)
+    pub const I_LOOKBEHIND: u16 = 0x201;
+    pub const I_CYCLECAMERA: u16 = 0x205;
 }
 
 /// One binding's six fields, `[binding+0x14…+0x28]`.
@@ -60,6 +65,18 @@ pub struct Binding {
     pub pov: u32,
     /// a key binding's display code, the one 0x51C050 names
     pub key: u32,
+}
+
+impl Binding {
+    /// The six dwords `FEControllerInputAccessor` saves from `this+0x14` (0x51D060) and loads
+    /// back (0x51D080), in their order.
+    pub fn to_fields(&self) -> [u32; 6] {
+        [self.kind, self.device, self.index, self.dir as u32, self.pov, self.key]
+    }
+
+    pub fn from_fields(f: [u32; 6]) -> Self {
+        Self { kind: f[0], device: f[1], index: f[2], dir: f[3] as i32, pov: f[4], key: f[5] }
+    }
 }
 
 pub fn scancode_by_name(name: &str) -> Option<u8> {
@@ -231,6 +248,8 @@ impl Bindings {
             ("C1_ABORT", id::C1_ABORT),
             ("C1_RESET", id::C1_RESET),
             ("C1_AIDRIVE", id::C1_AIDRIVE),
+            ("I_LOOKBEHIND", id::I_LOOKBEHIND),
+            ("I_CYCLECAMERA", id::I_CYCLECAMERA),
         ];
         let by_id = names.iter().filter_map(|&(n, i)| Some((i, parse(get(n)?)?))).collect();
         Self { by_id }

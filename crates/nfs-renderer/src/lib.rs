@@ -77,12 +77,31 @@ pub struct DrawItem {
     pub alpha: f32,
     /// Added to every vertex's uv before sampling; the sky layers drift with it.
     pub uv_offset: [f32; 2],
+    /// The car materials' `R3DLightLayer` (0x8104, `RE/notes/lighting.md` §6), when the item is
+    /// lit by one; it then takes the place of the scene's ambient and sun.
+    pub layer_light: Option<LayerLight>,
+    /// The item's render method builds `Headlights::LayerVertexLight` (0x8002 / 0x8003), so the
+    /// scene's headlight projector adds to its vertex colours (`RE/notes/lighting.md` §5).
+    pub headlit: bool,
 }
 
 impl DrawItem {
     pub fn new(mesh: MeshId, material: MaterialId, transform: Mat4) -> Self {
-        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2] }
+        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false }
     }
+}
+
+/// What `R3DLightLayer` 0x446530 computes a vertex's colour from: `ambient + diffuse · d`, with `d`
+/// the normal against the reversed light direction and the ambient alone where that is negative,
+/// each channel clamped to 1 (0x446944…0x446A17).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerLight {
+    /// the light block's `slot` × `p0`
+    pub ambient: [f32; 3],
+    /// its `slot + 4` × the block's `+0x74` × `p1`
+    pub diffuse: [f32; 3],
+    /// the block's `+0x30`, the way the light travels, in world space
+    pub direction: [f32; 3],
 }
 
 /// 2D overlay quad in normalised screen units (0..1, origin top-left), optionally rotated about `pivot`.
@@ -110,11 +129,14 @@ pub struct Scene {
     pub ambient: f32,
     /// `MIRROR` race option: the world is drawn x-flipped (sprites unaffected).
     pub mirror: bool,
+    /// The headlight projector, world → the player car's light frame (0x4526C0), when the car's
+    /// lamps are lit; `headlit` items then take 0x452910's weight from `Renderer::set_headlight_map`.
+    pub headlight: Option<Mat4>,
 }
 
 impl Default for Scene {
     fn default() -> Self {
-        Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35, mirror: false }
+        Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35, mirror: false, headlight: None }
     }
 }
 

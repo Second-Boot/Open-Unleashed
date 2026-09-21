@@ -71,6 +71,33 @@ fn crp_articles() {
     assert_eq!(arts[0].parts.len(), 45);
 }
 
+/// Every shipped car material carries `R3DLightLayer`'s block (`lighting.md` §6): the exterior on
+/// slot 0, the interior on slot 1, and slot 2 only on env-mapped or window materials.
+#[test]
+fn car_materials_carry_their_light_layer() {
+    let r = need_game!();
+    let mut n = 0;
+    for e in std::fs::read_dir(r.join("GameData/CarModel")).unwrap().flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case("crp")) != Some(true) {
+            continue;
+        }
+        let raw = std::fs::read(&p).unwrap();
+        let d = refpack::maybe_decompress(&raw).unwrap();
+        let c = Crp::parse(&d).unwrap();
+        for m in c.materials(&d).unwrap() {
+            let l = m.light.unwrap_or_else(|| panic!("{}: {} has no light block", p.display(), m.render_method));
+            match m.render_method.as_str() {
+                "CarExt" => assert_eq!(l.slot, 0),
+                "CarInt" | "CarIntShd" => assert_eq!(l.slot, 1),
+                _ => assert!(l.slot <= 2, "{} slot {}", m.render_method, l.slot),
+            }
+            n += 1;
+        }
+    }
+    assert!(n > 1000, "{n} materials");
+}
+
 #[test]
 fn sim_993() {
     let r = need_game!();
@@ -435,6 +462,25 @@ fn sky_background_colours() {
     let c = s.colours[0].unwrap();
     assert!(c.gradient[0] && c.gradient[1]);
     assert_ne!(c.rgb[0][0], c.rgb[0][1], "alps sky is a ramp");
+}
+
+/// The sun 0x461090 places from the sky configuration (`RE/notes/lighting.md` §6): overhead where
+/// the offset is zero (autobahn), off to one side on coastal.
+#[test]
+fn sky_bin_sun() {
+    let Some(r) = game_root() else { return };
+    let dir = r.join("GameData/Track/Sky");
+    let sun = |f: &str| nfs_formats::sky::SkyBin::parse(&std::fs::read(dir.join(f)).unwrap()).unwrap().sun_position();
+    let a = sun("Autobahn.bin");
+    // (0, 76.724·0.576, 0): only the dome's height, scaled
+    assert!(a[0].abs() < 1e-4 && a[2].abs() < 1e-4 && (a[1] - 76.724 * 0.5760).abs() < 0.05, "{a:?}");
+    let c = sun("Coastal.bin");
+    // a = −289.1, b = −204.1, turned by 0.6224 turn, raised 44.39 − 0.0002·(a² + b²), × 0.236
+    let (a0, b0, t, g) = (-289.116f32, -204.082f32, 0.6224f32 * std::f32::consts::TAU, 0.2360f32);
+    let want = [(t.cos() * a0 + t.sin() * b0) * g, (44.388 - 0.0002 * (a0 * a0 + b0 * b0)) * g, (t.cos() * b0 - t.sin() * a0) * g];
+    for k in 0..3 {
+        assert!((c[k] - want[k]).abs() < 0.2, "{c:?} vs {want:?}"); // the constants above are rounded
+    }
 }
 
 /// The rest of `Track/Sky/<Track>.bin`: the ring geometry, the sixteen horizon quads and the three

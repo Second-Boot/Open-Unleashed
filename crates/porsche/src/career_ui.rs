@@ -101,6 +101,12 @@ pub struct CareerUi {
     /// Factory Driver screen.
     pub factory: bool,
     pub message: String,
+    /// A dialog the start check wants up — `(FEStrings id, two buttons)` (§4.147's raise sites in
+    /// 0x4D5730): 813 the car does not meet the restrictions, 858 another tournament is
+    /// part-way through, 857 not enough credits for the fee. The app raises it and takes it.
+    pub dialog: Option<(u32, bool)>,
+    /// `[screen+0x174]` — the player said "yes" to 858 (0x4D2C94), so the check does not ask again
+    pub reset_confirmed: bool,
     pub pending: Option<PendingEvent>,
     /// The profile the career belongs to: `SaveData/<digit><Name>.sav` (`RE/notes/savegame.md` §2).
     pub profile: Profile,
@@ -166,6 +172,8 @@ impl CareerUi {
             factory: false,
             basket: Vec::new(),
             message: String::new(),
+            dialog: None,
+            reset_confirmed: false,
             pending: None,
         })
     }
@@ -537,6 +545,8 @@ impl CareerUi {
                 self.message = format!("REPAIRED FOR ${paid}");
                 self.save();
             }
+            // 0x50F232: the repair total above the money -> one-button 809
+            Err(nfs_game::career::CareerError::NoMoney { .. }) => self.dialog = Some((809, false)),
             Err(e) => self.message = e.to_string().to_uppercase(),
         }
     }
@@ -564,6 +574,12 @@ impl CareerUi {
         if self.basket.is_empty() {
             // an empty transaction list on the parts row means the other thing this shop does
             self.repair_all();
+            return;
+        }
+        // 0x517630: the whole list's `TOTAL` against the money first — above it, one-button 810
+        // and nothing is bought (the port used to buy part by part until the money ran out)
+        if self.basket_total() > self.career.money {
+            self.dialog = Some((810, false));
             return;
         }
         let mut bought = 0;
@@ -688,7 +704,7 @@ impl CareerUi {
         self.message.clear();
     }
 
-    fn save(&mut self) {
+    pub fn save(&mut self) {
         if let Err(e) = self.career.save(&self.save_path) {
             tracing::error!(error = %e, "career save failed");
             self.message = format!("SAVE FAILED: {e}");
@@ -708,7 +724,61 @@ impl CareerUi {
         }
     }
 
+    /// `LoadInfo` 0x4DE9B0 with `autosave = 0` (`RE/notes/savegame.md` §2.4, §3): read
+    /// `SaveData\<stem>.sav` and make it the career; `player.lst` takes the stem (0x4DEC7B).
+    /// False when the file is missing or does not parse — the callers' 806.
+    ///
+    /// The autosave arm never fires from the player screens: it tests `<i><stem>.sav` for a stem
+    /// that already carries its digit, which no file matches. The port's JSON career is rewritten
+    /// with the loaded one so the next start agrees with `player.lst`.
+    pub fn switch_profile(&mut self, p: &Profile) -> bool {
+        let Some(s) = std::fs::read(p.path(&self.save_dir))
+            .ok()
+            .and_then(|d| nfs_formats::sav::SaveFile::parse(&d).ok())
+        else {
+            return false;
+        };
+        self.career = nfs_game::save::career_from_sav(&s, &self.tables);
+        self.profile = p.clone();
+        self.knockout = None;
+        if nfs_game::save::write_player_lst(&self.save_dir, &p.stem()).is_err() {
+            return false;
+        }
+        if let Err(e) = self.career.save(&self.save_path) {
+            tracing::warn!(error = %e, "career save failed");
+        }
+        true
+    }
+
+    /// `0x4DE5B0(name, picture)` (`savegame.md` §2.2): refused when any `<i><name>.sav` exists;
+    /// otherwise the pristine career (`XXDefXX`, the defaults 0x4DE880 saved at start-up), the
+    /// name, the picture, and `SaveInfo` under `<picture><name>`. The per-profile HUD copies it
+    /// also makes are not ported.
+    pub fn create_profile(&mut self, name: &str, picture: u8) -> bool {
+        if (0..=9).any(|d| self.save_dir.join(format!("{d}{name}.sav")).exists()) {
+            return false;
+        }
+        let old = (std::mem::take(&mut self.career), self.profile.clone());
+        self.profile = Profile::new(name, picture);
+        let sav = nfs_game::save::career_to_sav(&self.career, &self.tables, &self.profile);
+        if nfs_game::save::write_profile(&self.save_dir, &self.profile, &sav).is_err() {
+            (self.career, self.profile) = old;
+            return false;
+        }
+        true
+    }
+
     /// Enter pressed: buy the selected car or part, or start the next event of the selected tournament.
+    /// The "yes" to 858 (0x4D2C94…0x4D2CA3): clear the other part-way tournaments (0x504BD0)
+    /// and remember the answer, so the start check that runs again does not ask.
+    pub fn confirm_reset(&mut self) {
+        if let Some(t) = self.current().cloned() {
+            self.career.reset_partial_except(&self.tables, t.id);
+            self.reset_confirmed = true;
+            self.save();
+        }
+    }
+
     pub fn activate(&mut self) -> Option<StartRequest> {
         if self.factory {
             return self.activate_mission();
@@ -759,6 +829,8 @@ impl CareerUi {
                             .unwrap_or(0);
                         self.save();
                     }
+                    // 0x501D41 / 0x501F86: not enough credits for the car -> one-button 802
+                    Err(nfs_game::career::CareerError::NoMoney { .. }) => self.dialog = Some((802, false)),
                     Err(e) => self.message = e.to_string().to_uppercase(),
                 }
                 None
@@ -773,13 +845,36 @@ impl CareerUi {
                 let (t, event, garage_idx) = match &finale {
                     Some(f) => (self.tables.tournament(f.tournament)?.clone(), 0usize, None),
                     None => {
+                        // the start check 0x4D5730 in the original's order: the car against the
+                        // tournament's restrictions (0x504A70 → 813), another tournament part-way
+                        // through (0x504B60 → 858, unless already confirmed), then the fee on the
+                        // first event of an attempt (0x503430 against 0x5012D0 → 857)
+                        if let Some(CarChoice::Owned(i, _)) = choice
+                            && !self.career.eligible_garage(&t).contains(&i)
+                        {
+                            self.dialog = Some((813, false));
+                            return None;
+                        }
+                        if !self.reset_confirmed && self.career.partial_elsewhere(&self.tables, t.id) {
+                            self.dialog = Some((858, true));
+                            return None;
+                        }
                         let event = match self.career.enter(&self.tables, &t) {
                             Ok(e) => e,
+                            Err(nfs_game::career::CareerError::NoMoney { .. }) => {
+                                self.dialog = Some((857, false));
+                                return None;
+                            }
+                            Err(nfs_game::career::CareerError::NoEligibleCar { .. }) => {
+                                self.dialog = Some((813, false));
+                                return None;
+                            }
                             Err(e) => {
                                 self.message = e.to_string().to_uppercase();
                                 return None;
                             }
                         };
+                        self.reset_confirmed = false;
                         self.save();
                         (
                             t,
@@ -1255,6 +1350,34 @@ impl CareerUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `CREATEPLAYERDONE` / `SETNAMETHENBACK` / `REMOVEPLAYER` over their three helpers:
+    /// 0x4DE5B0 refuses a taken name, `LoadInfo` reads the file back, 0x4DE8A0 deletes it.
+    #[test]
+    fn profiles_are_made_loaded_and_removed() {
+        let Ok(paths) = GamePaths::locate() else {
+            eprintln!("skipping: original game data not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("nfs-profiles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ui = CareerUi::load(&paths).unwrap();
+        ui.save_dir = dir.clone();
+        ui.save_path = dir.join("career.json");
+        ui.career.money = 1;
+        assert!(ui.create_profile("Hans", 8));
+        assert!(dir.join("8Hans.sav").exists());
+        assert_eq!(ui.career.money, 11_000, "the pristine career");
+        assert!(!ui.create_profile("Hans", 3), "a taken name, whatever the picture");
+        ui.career.money = 5;
+        let p = Profile::new("Hans", 8);
+        assert!(ui.switch_profile(&p));
+        assert_eq!(ui.career.money, 11_000);
+        assert_eq!(nfs_game::save::read_player_lst(&dir).as_deref(), Some("8Hans"));
+        nfs_game::save::delete_profile(&dir, &p).unwrap();
+        assert!(!ui.switch_profile(&p), "806: nothing to load");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn first_classic_tournament_flow() {

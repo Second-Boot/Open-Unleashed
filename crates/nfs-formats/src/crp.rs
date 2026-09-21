@@ -343,6 +343,13 @@ impl Crp {
     /// Decode an article's geometry: the `Base` LOD table and every primitive with its streams
     /// resolved into plain arrays.
     pub fn article_geometry(&self, data: &[u8], art: &Article) -> Result<ArticleGeometry, FormatError> {
+        self.article_geometry_frame(data, art, 0)
+    }
+
+    /// The geometry at animation frame `frame`: each primitive's `vt` stream taken from the part
+    /// `frame·0x10 + ` the stream's own index (0x43E242…0x43E254, 0x43E2A4…0x43E2B4), everything
+    /// else as frame 0. `None`-like failure when that frame's `vt` is missing.
+    pub fn article_geometry_frame(&self, data: &[u8], art: &Article, frame: u16) -> Result<ArticleGeometry, FormatError> {
         self.check(data)?;
         let name = match art.level(b"Name") {
             Some(e) => self.entry_string(data, e)?,
@@ -379,7 +386,8 @@ impl Crp {
                     _ => return Ok(None),
                 };
                 let idx = if tag == b"pr" { 0 } else { sd.lod };
-                let part = art.find(tag, idx).or_else(|| art.parts.iter().find(|p| p.is_part(tag) && p.lod() == lod)).ok_or(FormatError::UnexpectedValue {
+                let idx = if kind == 0 && frame > 0 { frame * 0x10 + idx } else { idx };
+                let part = art.find(tag, idx).or_else(|| if frame > 0 && kind == 0 { None } else { art.parts.iter().find(|p| p.is_part(tag) && p.lod() == lod) }).ok_or(FormatError::UnexpectedValue {
                     what: "CRP primitive stream",
                     offset: pr.data_offset(),
                     expected: format!("a '{}' part for lod {lod}", String::from_utf8_lossy(tag)),
@@ -497,6 +505,12 @@ pub struct Base {
     /// `[0x5B25CC]` = 360.0 before 0x539BD0's axis-angle build). Channels 6 and 7 are special:
     /// 0x43CA5A rotates about the `.tpg` `dooraxis` by `chan[1]` instead, x negated for 7.
     pub rot_channel: u8,
+    /// `Base+77` — the **model animation** the article's vertices follow, 0 for none
+    /// (`[[part+0x44] + 9]`, 0x43E195 / 0x43C541). Animation 1 is the convertible's roof, the one
+    /// the front end's 0x4D1990 drives; its frames are `vt` parts at `frame·0x10 + stream index`.
+    pub anim: u8,
+    /// `Base+76` — the frame count those `vt` parts run to.
+    pub anim_frames: u8,
     pub lod_count: u32,
     pub bbox_min: [f32; 3],
     pub bbox_max: [f32; 3],
@@ -543,6 +557,8 @@ impl Base {
             tag: [b[68], b[69], b[70], b[71]],
             move_channel: if b.len() > 72 { b[72] as i8 } else { -1 },
             rot_channel: if b.len() > 75 { b[75] } else { 0 },
+            anim: if b.len() > 77 { b[77] } else { 0 },
+            anim_frames: if b.len() > 76 { b[76] } else { 0 },
             lod_count,
             bbox_min: [f(20)?, f(24)?, f(28)?],
             bbox_max: [f(32)?, f(36)?, f(40)?],
@@ -563,6 +579,19 @@ pub struct Material {
     /// SHPI entry FourCC in the file named by `sn` (tracks); garbage/empty when untextured.
     pub texture: [u8; 4],
     pub unknown_20: u32,
+    /// The `R3DLightLayer` (0x8104) parameters a car material carries — `RE/notes/lighting.md` §6.
+    pub light: Option<LayerLight>,
+}
+
+/// `R3DLightLayer`'s parameter block `{f32 p0, f32 p1, u32 slot}` (read at 0x446600, 0x446886 and
+/// 0x4465D8): the light block's `slot` scaled by `p0`, plus its `slot + 4` partner by `p1` along
+/// the light direction. A car `mt` keeps it as its last three dwords, `+300…+311`, the entry of
+/// size 0xC at data offset 0x28 that the record's extension table names at `+248` / `+252`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerLight {
+    pub p0: f32,
+    pub p1: f32,
+    pub slot: u32,
 }
 
 impl Material {
@@ -577,6 +606,11 @@ impl Material {
             render_method: b[16..16 + name_end].iter().map(|&c| c as char).collect(),
             texture: [b[40], b[41], b[42], b[43]],
             unknown_20: u32_le(b, 32, "mt +32")?,
+            light: (b.len() >= 312 && u32_le(b, 248, "mt +248")? == 0x28 && u32_le(b, 252, "mt +252")? == 0xC).then(|| LayerLight {
+                p0: f32::from_bits(u32::from_le_bytes([b[300], b[301], b[302], b[303]])),
+                p1: f32::from_bits(u32::from_le_bytes([b[304], b[305], b[306], b[307]])),
+                slot: u32::from_le_bytes([b[308], b[309], b[310], b[311]]),
+            }),
         })
     }
     pub fn texture_name(&self) -> String {

@@ -2,7 +2,7 @@
 
 use glam::{Mat4, Vec3};
 use nfs_assets::{car::CarAssets, mesh::article_meshes, track::TrackAssets};
-use nfs_renderer::{DrawItem, MaterialDesc, MaterialId, MeshData, MeshId, Renderer, TextureData, Vertex};
+use nfs_renderer::{DrawItem, LayerLight, MaterialDesc, MaterialId, MeshData, MeshId, Renderer, TextureData, Vertex};
 use std::collections::HashMap;
 
 /// GPU-resident track: static draw items plus the collision grid.
@@ -22,6 +22,9 @@ pub struct TrackWorld {
     pub map_light: MapLight,
     /// Mean vertex colour of the drivable patches, the reference `light_at` normalises against.
     mean_ground: [f32; 3],
+    /// The way the sun's light travels, `−normalize(SkyBin::sun_position)` (0x43AC8D…0x43AD36);
+    /// straight down when the track has no sky configuration.
+    pub sun_direction: Vec3,
     /// Smackable props knocked loose and still moving.
     knocked: Vec<KnockedProp>,
     /// `.map` sections, and every `.env` entry by its SHPI name (`RE/notes/lighting.md` §3).
@@ -131,12 +134,9 @@ impl MapLight {
 }
 
 impl TrackWorld {
-    /// The light a car standing at `pos` picks up: the vertex colour of the ground patch under it
-    /// (`RE/notes/lighting.md`, 0x4746A0). White when there is no ground under it.
-    ///
-    /// The `.map` header's `ambient`, which the original multiplies this by for the car's ambient
-    /// slot, is already the scene's ambient level (`TrackWorld::ambient`), so the renderer applies
-    /// it once, to the ambient term only.
+    /// The ground patch's colour under `pos` relative to the track's mean — what this port tints
+    /// the tyre spray with. White when there is no ground under it. (The cars themselves are lit
+    /// through `car_light`.)
     pub fn light_at(&self, pos: Vec3) -> [f32; 3] {
         let Some(h) = self.collision.ground(pos.x, pos.y + 2.0, pos.z, 20.0) else { return [1.0; 3] };
         // APPROXIMATION: the original's ambient slot is `patch colour × map.ambient` feeding a D3D
@@ -162,6 +162,31 @@ impl TrackWorld {
     /// same word the port keeps in the low 16 bits of a collision triangle's surface id.
     pub fn overhead_flags(&self, pos: Vec3) -> u16 {
         self.collision.ceiling(pos.x, pos.y, pos.z, 3.5, 200.0).map(|h| (h.surface & 0xFFFF) as u16).unwrap_or(0)
+    }
+
+    /// The race car's light block, 0x43A8A6…0x43AD36 (`RE/notes/lighting.md` §6): the ground
+    /// patch's colour `g` under `pos` (0x4746A0) times the `.map` header colours, slot by slot —
+    /// 0 `g·ambient`, 1 `g·ambient·interior`, 2 `g·ambient·lightdecal`, 4 `g·tint`, 5
+    /// `g·interiordiffuse`, 6 `g·tint·lightdecal` — `+0x74` white (0x43A5AC), and the direction
+    /// straight down under cover (0x473330's flags `& 0xC000`, 0x43A6E8 / 0x43AB19) or else along
+    /// the negated sun of the track's sky configuration (0x43AC8D, `SkyBin::sun_position`).
+    pub fn car_light(&self, pos: Vec3) -> LightBlock {
+        let g = self.collision.ground(pos.x, pos.y + 2.0, pos.z, 20.0).map(|h| [h.color[0], h.color[1], h.color[2]]).unwrap_or([1.0; 3]);
+        let m = &self.map_light;
+        let mul = |a: [f32; 3], b: [f32; 3]| [a[0] * b[0], a[1] * b[1], a[2] * b[2]];
+        let amb = mul(g, m.ambient);
+        let tint = mul(g, m.tint);
+        let covered = self.overhead_flags(pos) & 0xC000 != 0;
+        Self::car_light_block(amb, tint, g, m, covered, self.sun_direction)
+    }
+
+    fn car_light_block(amb: [f32; 3], tint: [f32; 3], g: [f32; 3], m: &MapLight, covered: bool, sun: Vec3) -> LightBlock {
+        let mul = |a: [f32; 3], b: [f32; 3]| [a[0] * b[0], a[1] * b[1], a[2] * b[2]];
+        LightBlock {
+            colours: [amb, mul(amb, m.interior), mul(amb, m.light_decal), [0.0; 3], tint, mul(g, m.interior_diffuse), mul(tint, m.light_decal)],
+            direction: if covered { Vec3::NEG_Y } else { sun },
+            material: [1.0; 3],
+        }
     }
 
     /// Whether the car is under a tunnel or bridge deck — bit 15 of the patch overhead
@@ -327,8 +352,19 @@ impl TrackWorld {
         let map_light = MapLight::from_map(&track.map);
         // the drivable patches only (surface nibble != 0), as `Tracker::findPatch` does
         let mean_ground = collision.mean_color(&|s| s & 0xF != 0);
+        let sun_direction = track.sky_bin.as_ref().map(|b| -Vec3::from(b.sun_position()).normalize_or_zero()).filter(|d| *d != Vec3::ZERO).unwrap_or(Vec3::NEG_Y);
         let map_sections = MapSection::all(&track.map);
-        Ok(Self { items, item_element, hidden: std::collections::HashSet::new(), env_map, collision, walls, start, ambient, map_light, mean_ground, map_sections, env_by_id, knocked: Vec::new(), animated })
+        // the items whose render method builds `Headlights::LayerVertexLight` (0x8002 / 0x8003)
+        let lit_methods = nfs_assets::track::vertex_light_methods(&track.crp, &track.crp_data);
+        let lit: std::collections::HashSet<MaterialId> = mat_ids
+            .iter()
+            .filter(|(id, _)| materials.get(**id as usize).is_some_and(|m| lit_methods.contains(&m.render_method)))
+            .map(|(_, mid)| *mid)
+            .collect();
+        for it in &mut items {
+            it.headlit = lit.contains(&it.material);
+        }
+        Ok(Self { items, item_element, hidden: std::collections::HashSet::new(), env_map, collision, walls, start, ambient, map_light, mean_ground, sun_direction, map_sections, env_by_id, knocked: Vec::new(), animated })
     }
 
     /// Advance every looping prop animation to `seconds` since the race started
@@ -466,6 +502,14 @@ struct AnimatedProp {
 /// +Y up, −Z front, +X left; `MODEL_TO_BODY` rotates it into the physics body frame (+Z forward).
 pub struct CarModel {
     pub body: Vec<(MeshId, MaterialId, Mat4)>,
+    /// Each material's `R3DLightLayer` parameters (`RE/notes/lighting.md` §6) — every shipped car
+    /// material has them.
+    material_light: HashMap<MaterialId, nfs_formats::crp::LayerLight>,
+    /// The meshes animation 1 — the convertible's roof — morphs, with each frame's positions.
+    roof: Vec<MorphPart>,
+    /// `0x438190(1)`: the roof animation's length in frames, 0 for a car without one
+    pub roof_length: u32,
+    roof_state: i32,
     /// The **rotation channel** of each `body` entry — the article's `Base+75`, 0 for a part that
     /// never moves (`car-model.md`). `R3DCarLOD::draw` picks it at 0x43C98A and turns
     /// `channel_turns[n]` into `Rx·Ry·Rz` about the part's own origin.
@@ -611,14 +655,21 @@ impl CarModel {
         let page_textures: Vec<nfs_renderer::TextureId> = page_tex.iter().map(|p| p.0).collect();
         let materials = car.crp.materials(&car.crp_data)?;
         let mut mat_ids: HashMap<u16, MaterialId> = HashMap::new();
+        let mut material_light: HashMap<MaterialId, nfs_formats::crp::LayerLight> = HashMap::new();
         let mut material_for = |r: &mut Renderer, id: u16| {
-            *mat_ids.entry(id).or_insert_with(|| {
-                let m = materials.get(id as usize);
-                let page = m.map(|m| m.page_index() as usize).and_then(|p| page_tex.get(p));
-                let blend = m.map(|m| matches!(m.render_method.as_str(), "CarWindow" | "CarWheel")).unwrap_or(false) || page.map(|p| p.1).unwrap_or(false);
-                let reflective = m.map(|m| m.render_method == "CarExtEnv").unwrap_or(false);
-                r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: !blend, depth_test: true, env_texture: if reflective { env } else { None }, env_mix: 0.3 })
-            })
+            if let Some(m) = mat_ids.get(&id) {
+                return *m;
+            }
+            let m = materials.get(id as usize);
+            let page = m.map(|m| m.page_index() as usize).and_then(|p| page_tex.get(p));
+            let blend = m.map(|m| matches!(m.render_method.as_str(), "CarWindow" | "CarWheel")).unwrap_or(false) || page.map(|p| p.1).unwrap_or(false);
+            let reflective = m.map(|m| m.render_method == "CarExtEnv").unwrap_or(false);
+            let mid = r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: !blend, depth_test: true, env_texture: if reflective { env } else { None }, env_mix: 0.3 });
+            if let Some(l) = m.and_then(|m| m.light) {
+                material_light.insert(mid, l);
+            }
+            mat_ids.insert(id, mid);
+            mid
         };
         let arts = car.crp.articles(&car.crp_data)?;
         let mut body = Vec::new();
@@ -628,6 +679,8 @@ impl CarModel {
         let mut min = Vec3::splat(f32::MAX);
         let mut max = Vec3::splat(f32::MIN);
         let mut lights: Vec<CarLight> = Vec::new();
+        let mut roof: Vec<MorphPart> = Vec::new();
+        let mut roof_length = 0u32;
         let mut wheel_radius: f32 = 0.3;
         let mut half_track: f32 = 0.7;
         for a in &arts {
@@ -645,7 +698,24 @@ impl CarModel {
             let mut parts = Vec::new();
             let mut part_channels: Vec<u8> = Vec::new();
             let (mut lamp_sum, mut lamp_n) = (Vec3::ZERO, 0.0f32);
-            for mm in article_meshes(&g, lod, &mut skipped) {
+            // the roof's morph frames (animation 1): each frame's meshes, in frame 0's order —
+            // 0x43C4FB probes `vt` part `frame·0x10 + index` until one is missing, and the count
+            // is the animation's length when it is the largest (0x43C54B…0x43C56F)
+            let roof_frames: Vec<Vec<MeshData>> = if !is_wheel && g.base.as_ref().is_some_and(|b| b.anim == 1) {
+                let mut frames = Vec::new();
+                for f in 1u16.. {
+                    let Ok(gf) = car.crp.article_geometry_frame(&car.crp_data, a, f) else { break };
+                    let mut sk = 0;
+                    frames.push(article_meshes(&gf, lod, &mut sk).into_iter().map(|m| m.mesh).collect());
+                }
+                frames
+            } else {
+                Vec::new()
+            };
+            if !roof_frames.is_empty() {
+                roof_length = roof_length.max(roof_frames.len() as u32 + 1);
+            }
+            for (k, mm) in article_meshes(&g, lod, &mut skipped).into_iter().enumerate() {
                 let mut mesh = mm.mesh;
                 for v in &mut mesh.vertices {
                     let p = (MODEL_TO_BODY * local).transform_point3(Vec3::from(v.position));
@@ -666,7 +736,18 @@ impl CarModel {
                     }
                 }
                 let material = material_for(r, mm.material);
-                parts.push((r.upload_mesh(&mesh), material, local));
+                let id = r.upload_mesh(&mesh);
+                if !roof_frames.is_empty() {
+                    let mut positions = vec![mm_positions(&mesh)];
+                    for f in &roof_frames {
+                        match f.get(k) {
+                            Some(m) if m.vertices.len() == mesh.vertices.len() => positions.push(mm_positions(m)),
+                            _ => break,
+                        }
+                    }
+                    roof.push(MorphPart { mesh: id, base: mesh.vertices.clone(), frames: positions });
+                }
+                parts.push((id, material, local));
                 part_channels.push(g.base.as_ref().map(|b| b.rot_channel).unwrap_or(0));
             }
             if is_light && lamp_n > 0.0 {
@@ -682,7 +763,7 @@ impl CarModel {
                 body_channel.extend(part_channels);
             }
         }
-        tracing::info!(body_parts = body.len(), wheels = wheels.len(), lights = lights.len(), skipped, pages = pages.len(), wheel_radius, half_track, "car uploaded");
+        tracing::info!(body_parts = body.len(), wheels = wheels.len(), lights = lights.len(), roof_parts = roof.len(), roof_length, skipped, pages = pages.len(), wheel_radius, half_track, "car uploaded");
         // the windscreen seen from the driver's seat: the `Wndo` quad with `INTGLASS`'s `glai`
         // entry. 0x43A490 draws it whenever the camera's view id is 0 or 1 — the two views that do
         // not draw the car itself — and skips it in a replay.
@@ -727,6 +808,10 @@ impl CarModel {
         Ok(Self {
             body,
             body_channel,
+            material_light,
+            roof,
+            roof_length,
+            roof_state: 0,
             channel_turns: [0.0; 32],
             move_spoiler_extent: tpg_f32(&car.tpg, "movespoilerextent"),
             headlight_extent: tpg_f32(&car.tpg, "headlightextent"),
@@ -905,11 +990,6 @@ impl CarModel {
     /// `steer` in turns for the front wheels, positive to the right — take it from
     /// `Vehicle::wheel_steer_turns`, not from the raw `Wheel::steer`.
     pub fn draw_items(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: f32) -> Vec<DrawItem> {
-        self.draw_items_lit(car_to_world, wheel_spin, steer, [1.0; 3])
-    }
-
-    /// `draw_items` with the light the car picks up from the ground (`TrackWorld::light_at`).
-    pub fn draw_items_lit(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: f32, light: [f32; 3]) -> Vec<DrawItem> {
         let mut out = Vec::with_capacity(self.body.len() + 4 * 8);
         for (i, (mesh, material, local)) in self.body.iter().enumerate() {
             // A part bound to a rotation channel turns about **its own origin**: 0x43CA19…
@@ -919,7 +999,7 @@ impl CarModel {
                 0 => *local,
                 n => *local * self.channel_matrix(n),
             };
-            out.push(DrawItem { light, ..DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * m) });
+            out.push(DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * m));
         }
         for w in &self.wheels {
             let idx = match (w.is_front, w.is_left) {
@@ -939,8 +1019,101 @@ impl CarModel {
                 // local has translation = pivot; rotate about the pivot in model space
                 let pivot = local.w_axis.truncate();
                 let m = Mat4::from_translation(pivot) * MODEL_TO_BODY * st * spin * MODEL_TO_BODY.inverse() * Mat4::from_translation(-pivot) * *local;
-                out.push(DrawItem { light, ..DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * m) });
+                out.push(DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * m));
             }
+        }
+        out
+    }
+}
+
+/// One mesh of a morphing article: its frame-0 vertices and every frame's positions.
+struct MorphPart {
+    mesh: MeshId,
+    base: Vec<Vertex>,
+    frames: Vec<Vec<[f32; 3]>>,
+}
+
+fn mm_positions(m: &MeshData) -> Vec<[f32; 3]> {
+    m.vertices.iter().map(|v| v.position).collect()
+}
+
+impl CarModel {
+    /// **0x4D1990(1, state)**: the roof animation to `length · state / 255` frames (0x4D199F…
+    /// 0x4D19BA), which 0x4380D0 splits as `frame = fistp(t − 0.5)`, the fraction the rest, and
+    /// the draw (0x43E2FD…0x43E35B) blends each vertex `A + (B − A)·frac` between that frame and
+    /// the next — the frame alone where there is no next. Past the last frame the part keeps it.
+    pub fn set_roof(&mut self, r: &mut Renderer, state: i32) {
+        if self.roof_length == 0 || state == self.roof_state {
+            return;
+        }
+        self.roof_state = state;
+        let t = (self.roof_length as f32 * state as f32 * (1.0 / 255.0)).clamp(0.0, self.roof_length as f32);
+        let frame = (t - 0.5).round_ties_even().max(0.0) as usize;
+        let frac = t - frame as f32;
+        for p in &self.roof {
+            let Some(a) = p.frames.get(frame.min(p.frames.len() - 1)) else { continue };
+            let b = p.frames.get(frame + 1);
+            let frac = if frame >= p.frames.len() { 0.0 } else { frac };
+            let mut v = p.base.clone();
+            for (i, out) in v.iter_mut().enumerate() {
+                let pa = Vec3::from(a[i]);
+                out.position = match b {
+                    Some(b) => (pa + (Vec3::from(b[i]) - pa) * frac).to_array(),
+                    None => a[i],
+                };
+            }
+            r.update_mesh_vertices(p.mesh, &v);
+        }
+    }
+}
+
+/// A render object's light block, `obj+0x2F4` (`RE/notes/lighting.md` §6): seven colour slots —
+/// slot 3 is the direction — and the material colour at `+0x74` that scales the directional half.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LightBlock {
+    /// slots 0, 1, 2, (3 unused here), 4, 5, 6 — rgb, the alpha the original carries is 1
+    pub colours: [[f32; 3]; 7],
+    /// slot 3, the way the light travels, in world space
+    pub direction: Vec3,
+    /// `+0x74`, rgb
+    pub material: [f32; 3],
+}
+
+impl LightBlock {
+    /// The 3D room's block, 0x4E84C0: with `flag` clear (the room's own models) slots 0–2 are the
+    /// rig's ambient and 4–6 its sun colour, `/ 255` and faded, and the direction the rig's sun
+    /// direction normalised (0x4E876D…0x4E87D7); with `flag` set (the car, 0x4EA08A / 0x4E8CB2)
+    /// they are 0.3 and 0.7 grey, faded, and the direction (0, −0.707, 0.707) (0x4E85FE…). `+0x74`
+    /// is white either way (0x4E8513). `fade` is `1 − progress / 512` (0x4E84DE).
+    pub fn room(ambient: [f32; 3], sun: [f32; 3], sun_dir: Vec3, fade: f32, flag: bool) -> Self {
+        let (a, s, dir) = if flag {
+            ([0.3 * fade; 3], [0.7 * fade; 3], Vec3::new(0.0, f32::from_bits(0xbf34fdf4), f32::from_bits(0x3f34fdf4)))
+        } else {
+            (ambient.map(|c| c * fade / 255.0), sun.map(|c| c * fade / 255.0), sun_dir.normalize_or_zero())
+        };
+        Self { colours: [a, a, a, [0.0; 3], s, s, s], direction: dir, material: [1.0; 3] }
+    }
+
+    /// What `R3DLightLayer` 0x446530 makes of a material's `{p0, p1, slot}`: the slot's colour
+    /// × p0, and its `slot + 4` partner × `+0x74` × p1 — nothing directional when `p1 <= 0`
+    /// (0x446724). A slot past 2 would read the direction as a colour; none ships.
+    pub fn layer_light(&self, l: nfs_formats::crp::LayerLight) -> Option<LayerLight> {
+        let s = l.slot as usize;
+        if s > 2 {
+            return None;
+        }
+        let a = self.colours[s].map(|c| c * l.p0);
+        let d = if l.p1 > 0.0 { [0, 1, 2].map(|k| self.colours[s + 4][k] * self.material[k] * l.p1) } else { [0.0; 3] };
+        Some(LayerLight { ambient: a, diffuse: d, direction: self.direction.to_array() })
+    }
+}
+
+impl CarModel {
+    /// `draw_items` lit through each material's `R3DLightLayer` from `block`.
+    pub fn draw_items_block(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: f32, block: &LightBlock) -> Vec<DrawItem> {
+        let mut out = self.draw_items(car_to_world, wheel_spin, steer);
+        for it in &mut out {
+            it.layer_light = self.material_light.get(&it.material).and_then(|l| block.layer_light(*l));
         }
         out
     }

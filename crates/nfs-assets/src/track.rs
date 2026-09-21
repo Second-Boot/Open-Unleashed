@@ -39,6 +39,35 @@ pub struct PropInstance {
 /// CONFIRMED (`RE/notes/lighting.md` §4).
 pub const HEADLIGHT_LAYERS: [u32; 3] = [0x8002, 0x8003, 0x8011];
 
+/// The render methods that build `Headlights::LayerVertexLight` (0x8002) or `…_Opaque` (0x8003) —
+/// both slot 0 **0x453110**, which adds the headlight projection to each vertex's colour
+/// (`RE/notes/lighting.md` §5). By the method's name, the key an `mt` names it by.
+pub fn vertex_light_methods(crp: &Crp, data: &[u8]) -> std::collections::HashSet<String> {
+    crp.level
+        .iter()
+        .filter(|e| e.is_level(b"RMth"))
+        .filter_map(|e| data.get(e.data_offset()..e.data_offset() + e.data_len()))
+        .filter(|bytes| bytes.len() > 16 && bytes[16..].chunks_exact(4).any(|w| matches!(u32::from_le_bytes([w[0], w[1], w[2], w[3]]), 0x8002 | 0x8003)))
+        .map(|bytes| bytes[..16].iter().take_while(|b| **b != 0).map(|b| *b as char).collect())
+        .collect()
+}
+
+/// `GameData/Render/night.psh`'s one entry, `nght` — 128 × 128 bytes the headlight projector
+/// 0x452910 indexes directly, read at `entry + 0x10` (0x45261B).
+pub fn night_map(paths: &crate::GamePaths) -> Option<Vec<u8>> {
+    let d = std::fs::read(crate::GamePaths::find_file(&paths.render_dir(), "night.psh")?).ok()?;
+    if d.get(0..4)? != b"SHPP" {
+        return None;
+    }
+    let count = u32::from_le_bytes(d.get(8..12)?.try_into().ok()?) as usize;
+    (0..count).find_map(|i| {
+        let e = 16 + 8 * i;
+        (d.get(e..e + 4)? == b"nght").then_some(())?;
+        let off = u32::from_le_bytes(d.get(e + 4..e + 8)?.try_into().ok()?) as usize;
+        d.get(off + 0x10..off + 0x10 + 128 * 128).map(<[u8]>::to_vec)
+    })
+}
+
 /// Does this CRP's `RMth` table build a headlight layer?
 pub fn uses_headlight_layers(crp: &Crp, data: &[u8]) -> bool {
     crp.level
@@ -317,5 +346,26 @@ impl TrackAssets {
             .collect();
         v.sort();
         v
+    }
+}
+
+#[cfg(test)]
+mod headlight_tests {
+    use super::*;
+
+    /// `night.psh`'s bitmap is the one 0x452910 indexes, and only a night track's methods build
+    /// the vertex-light layers (`RE/notes/lighting.md` §5).
+    #[test]
+    fn night_map_and_vertex_light_methods() {
+        let Ok(paths) = crate::GamePaths::locate() else { return };
+        let m = night_map(&paths).expect("night.psh");
+        assert_eq!(m.len(), 128 * 128);
+        assert_eq!(m[64 * 128 + 64], 255, "the beam's centre");
+        assert_eq!(m[0], 0);
+        let night = TrackAssets::load(&paths, "monaco1").unwrap();
+        let lit = vertex_light_methods(&night.crp, &night.crp_data);
+        assert!(lit.contains("Normal") && lit.contains("Opaque"), "{lit:?}");
+        let day = TrackAssets::load(&paths, "alps").unwrap();
+        assert!(vertex_light_methods(&day.crp, &day.crp_data).is_empty());
     }
 }

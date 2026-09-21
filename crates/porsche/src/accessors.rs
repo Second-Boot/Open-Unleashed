@@ -569,26 +569,14 @@ impl App {
                 let secs = ms / 1000;
                 format!("{:02}:{:02}", secs / 60, secs % 60)
             }
-            // the now-playing line. 0x4BEE70 answers the empty string only when the music table
-            // itself is empty; otherwise it is the entry's own name field. With nothing playing
-            // the port names the first track of the selected playlist, which is the one the
-            // player's own `+0x24` mode would have.
+            // the title line. 0x4BEE70 reads the song table at the accessor's own index — the song
+            // `SKIPFWD` / `SKIPBK` step to (0x4BEDC0) — and answers the empty string only when the
+            // table itself is empty
             "CDPlayer.Title" if modifier.is_empty() => {
-                let title = match self.snd.music.as_ref().and_then(|m| m.now_playing()) {
-                    Some(t) => t.to_string(),
-                    None => {
-                        let names: &[String] = match self.snd.music.as_ref() {
-                            Some(m) => &m.names,
-                            None => &self.snd.music_names,
-                        };
-                        let first = match self.snd.music.as_ref() {
-                            Some(m) => m.playlist().first().copied(),
-                            None => self.snd.audio_settings.playlist.first().map(|i| *i as usize),
-                        };
-                        names.get(first.unwrap_or(0))?.clone()
-                    }
-                };
-                nfs_audio::music::split_title(&title).0.to_uppercase()
+                let names = self.cd_names();
+                let table = Self::cd_table(&names);
+                let (_, n) = table.get(self.fe.cd_title.min(table.len().checked_sub(1)?))?;
+                nfs_audio::music::split_title(n).0.to_uppercase()
             }
             "Audio.Quality" => self.snd.audio_settings.audio_quality.to_string(),
             // the draw-distance setting, as the original's index into `0x5CE90C` = {0.5, .67, .83, 1}

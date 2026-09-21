@@ -1521,6 +1521,8 @@ struct App {
     /// Seed of the shared RNG for this race; travels with a replay so playback re-simulates the
     /// same traffic, police and AI.
     traffic_seed: u32,
+    /// `[0x65B940]`, the name-box cheat bits (`nfs_game::cheats`); read through 0x4D8790
+    cheat_bits: u32,
     /// The profile name the original stores in a track record (`player.lst` → `LoadInfo`).
     player_name: String,
     /// `nfs5.car` id of the car being driven, for the replay snapshot's car slot.
@@ -1653,6 +1655,8 @@ struct AudioState {
     last_gear: usize,
     /// the roll-over crash sound fires once per roll-over
     crash_played: bool,
+    /// the front end's one-shots, `fesfx.bnk` (0x4AADB0) — loaded on the first one played
+    fe_sfx: Option<nfs_audio::fesfx::FeSfx>,
 }
 
 /// Everyone else on the road, split out of [`App`] on 2026-09-21: the opponents, the traffic and
@@ -1803,6 +1807,49 @@ struct FrontEnd {
     binding_base: Option<Vec<nfs_input::bindings::PadRecord>>,
     /// `NFS_FE_PARTS` has been applied (see `fe_car_parts_step`)
     parts_forced: bool,
+    /// the widget the pointer was over, for `FEControl::onMouseEnter`'s sound (0x4C7B90)
+    last_hover: Option<usize>,
+    /// the pop-up that is up or fading, and what its answer is for (§4.147)
+    dialog: Option<(nfs_game::dialog::Dialog, DialogFor)>,
+    /// `NFS_FE_DIALOG` has been applied
+    dialog_forced: bool,
+    /// an answer the tick took, waiting for `fe_dialog_answer`
+    dialog_answer: Option<(bool, DialogFor)>,
+    /// `Replay.List`'s row — the file `KILLREPLAY` and `STARTREPLAY` act on
+    replay_sel: usize,
+    /// `UserList.UserList`'s selected row when a click has moved it; otherwise the row
+    /// `RebuildUserList` 0x4DEF60 selects — the profile `player.lst` names
+    user_sel: Option<usize>,
+    /// the CD player's two list selections, `CDPlayer.AvailableList` / `SelectedList` rows
+    cd_available: Option<usize>,
+    cd_selected: Option<usize>,
+    /// `CDPlayer.Title`'s index `[this+0x18]` and the current song `[0x5D7938]` (−1 at start)
+    cd_title: usize,
+    cd_current: i32,
+}
+
+/// What a front-end dialog's answer is for — each is one of the raise sites §4.147 tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialogFor {
+    /// `QUIT` (0x50CC10) → `FEStrings` 811; "yes" is 0x4D56E0(0), out to the system (0x50CC53)
+    Quit,
+    /// the start check's 858 (0x4D5AE8): "yes" clears the other part-way tournaments and runs the
+    /// check again (0x4D2C94…0x4D2CA3)
+    TournamentReset,
+    /// a one-button notice whose answer nothing polls (813, 857)
+    Notice,
+    /// the pre-race screen's offer, 807 (0x505E79): "yes" sells (0x502190), "no" declines
+    /// (0x4F9720); the garage index of the car
+    Offer(usize),
+    /// `FORFEITTOURNY` → 824 (0x506130): "yes" forfeits the tournament (0x503E40) and goes back
+    /// one screen (0x4D23F0(0) → 0x4D5FB0)
+    Forfeit,
+    /// `KILLREPLAY` → 808 (0x50D3A0): "yes" deletes the selected `.rpl` and rebuilds the list
+    /// (0x50CC7E → 0x50D3C0)
+    KillReplay,
+    /// `REMOVEPLAYER` → 803 (0x510770 raises the dialog the screen built at 0x51015A): "yes"
+    /// deletes the selected profile (0x5103F0 → 0x4DE8A0), 804 when that fails
+    RemovePlayer,
 }
 
 /// The layouts that speak to the network. Their `callbacklist=` ids are `ID_COMMSSERVERSCREEN`,
@@ -1912,11 +1959,52 @@ impl App {
                 .as_ref()
                 .map(|l| l.deadzone_values().map(|p| [p[0] as u32, p[1] as u32]))
                 .unwrap_or([[0, 0x80]; 8]),
+            controls: self.saved_control_fields(),
         };
         if let Some(c) = self.career.as_mut() {
             c.knockout = ko;
             c.playlist = playlist;
             c.settings = settings;
+        }
+    }
+
+    /// The `Controller.*` accessors this port has a binding behind, in the order they are saved.
+    const CONTROL_ACCESSORS: [&'static str; 11] = [
+        "Controller.Accel",
+        "Controller.Brake",
+        "Controller.SteerLeft",
+        "Controller.SteerRight",
+        "Controller.HandBrake",
+        "Controller.ShiftUp",
+        "Controller.ShiftDown",
+        "Controller.ResetCar",
+        "Controller.Horn",
+        "Controller.CameraView",
+        "Controller.LookBehind",
+    ];
+
+    /// The player's bindings as the profile's `FEControllerInputAccessor`s save them (0x51D060).
+    fn saved_control_fields(&self) -> [Option<(&'static str, [u32; 6])>; 12] {
+        let mut out = [None; 12];
+        for (k, name) in Self::CONTROL_ACCESSORS.iter().enumerate() {
+            out[k] = accessors::controller_action(name)
+                .and_then(nfs_input::binding_id)
+                .and_then(|id| self.input.bindings.get(id))
+                .map(|b| (*name, b.to_fields()));
+        }
+        out
+    }
+
+    /// Load the profile's saved `Controller.*` bindings over `fe.txt`'s defaults — the accessors'
+    /// Load 0x51D080 restores the six fields, which the race's option stream then carries into
+    /// `[0x5E9130 + id·4]` (`RE/notes/controls.md` §4.117). A profile with none keeps the defaults.
+    fn apply_saved_controls(&mut self) {
+        let Some(c) = self.career.as_ref() else { return };
+        let Some(s) = std::fs::read(c.profile.path(&c.save_dir)).ok().and_then(|d| nfs_formats::sav::SaveFile::parse(&d).ok()) else { return };
+        for (name, fields) in nfs_game::save::saved_controls(&s) {
+            if let Some(id) = accessors::controller_action(&name).and_then(nfs_input::binding_id) {
+                self.input.bindings.by_id.insert(id, nfs_input::bindings::Binding::from_fields(fields));
+            }
         }
     }
 
@@ -2332,43 +2420,25 @@ impl App {
                     .collect();
                 Some((rows, None))
             }
-            // the CD player (`cdplayer.lay`): the songs in `zzzymus.viv` that are not in the
-            // playlist, and the playlist itself — the two lists the original moves entries between
+            // the CD player (`cdplayer.lay`). `CDPlayer.AvailableList` is the whole song table
+            // `[0x65B628]` — 0x4ADE20 builds it from the streams matching `game*`, each record's
+            // `+0x24` its stream index — row `i` its title `rec+0xC` (0x4BEBB0), all of them, the
+            // ones already in the playlist too. `CDPlayer.SelectedList` is the playlist
+            // `[0x65B62C]`, row `i` the title of table record `playlist[i]` (0x4BEC30).
             "CDPlayer.AvailableList" | "CDPlayer.SelectedList" => {
-                // in a race the live player owns both lists; in the front end there is no player
-                // yet, so they come from the files and the saved playlist
-                let names: &[String] = match self.snd.music.as_ref() {
-                    Some(m) => &m.names,
-                    None => &self.snd.music_names,
+                let names = self.cd_names();
+                let table = Self::cd_table(&names);
+                let list = self.cd_playlist();
+                let title = |n: &String| ListRow::Text(nfs_audio::music::split_title(n).0.to_uppercase());
+                let (rows, sel): (Vec<ListRow>, Option<usize>) = match base {
+                    "CDPlayer.SelectedList" => (list.iter().filter_map(|i| table.get(*i)).map(|(_, n)| title(n)).collect(), self.fe.cd_selected.filter(|r| *r < list.len())),
+                    _ => (table.iter().map(|(_, n)| title(n)).collect(), self.fe.cd_available.filter(|r| *r < table.len())),
                 };
-                let list: Vec<usize> = match self.snd.music.as_ref() {
-                    Some(m) => m.playlist().to_vec(),
-                    None => self.snd.audio_settings.playlist.iter().map(|i| *i as usize).collect(),
-                };
-                let rows: Vec<ListRow> = match base {
-                    "CDPlayer.SelectedList" => list
-                        .iter()
-                        .filter_map(|i| names.get(*i))
-                        .map(|n| ListRow::Text(nfs_audio::music::split_title(n).0.to_uppercase()))
-                        .collect(),
-                    _ => names
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| !list.contains(i))
-                        .map(|(_, n)| {
-                            ListRow::Text(nfs_audio::music::split_title(n).0.to_uppercase())
-                        })
-                        .collect(),
-                };
-                Some((rows, None))
+                Some((rows, sel))
             }
             "UserList.UserList" => {
-                let dir = nfs_game::save::save_dir();
-                let profiles = nfs_game::save::list_profiles(&dir);
-                let current = self
-                    .career
-                    .as_ref()
-                    .and_then(|c| profiles.iter().position(|p| *p == c.profile));
+                let profiles = nfs_game::save::list_profiles(&nfs_game::save::save_dir());
+                let current = self.user_row(&profiles);
                 Some((
                     profiles
                         .into_iter()
@@ -2378,24 +2448,9 @@ impl App {
                 ))
             }
             "Replay.List" => {
-                // `RebuildReplayList` reads `%s*.rpl` from the replay directory (0x4E5E1B)
-                let dir = self.replay.path.parent()?.to_path_buf();
-                let mut names: Vec<String> = std::fs::read_dir(&dir)
-                    .ok()?
-                    .flatten()
-                    .filter(|e| {
-                        e.path()
-                            .extension()
-                            .is_some_and(|x| x.eq_ignore_ascii_case("rpl"))
-                    })
-                    .filter_map(|e| {
-                        e.path()
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().to_string())
-                    })
-                    .collect();
-                names.sort();
-                Some((names.into_iter().map(ListRow::Text).collect(), None))
+                let names = self.replay_names();
+                let sel = (!names.is_empty()).then(|| self.fe.replay_sel.min(names.len() - 1));
+                Some((names.into_iter().map(ListRow::Text).collect(), sel))
             }
             // the parts screens. Each row is the part's name and its price right-aligned four
             // pixels left of the widget named `ID_PRICEPOS`, and the first row of each category
@@ -2745,6 +2800,8 @@ impl App {
             self.bind_chronicle_group();
             self.bind_repair_bars();
             self.bind_usedcars_panels();
+            self.bind_garage();
+            self.bind_player_buttons();
             self.bind_parts_buttons();
             self.bind_mergedlist_panel();
             self.bind_showcase_pictures();
@@ -3243,6 +3300,66 @@ impl App {
         }
     }
 
+    /// **`garage.lay`'s buttons, from the garage screen's tick 0x50F970** (§4.112): which are
+    /// enabled (0x50D880) and which of the two that share a place is shown (0x50D910).
+    ///
+    /// ```text
+    /// 0x50F98B  car = [this+0x2D4]->slot35()       ; the garage car on show, or null
+    /// 0x50F997  listed = car[+0x691]               ; on the used-car market
+    /// 0x50F9A7  ID_CHOOSECARBOX, ID_CARSETUP, ID_PAINTBUTTON, ID_SETTINGSBUTTON  enabled = car
+    /// 0x50FA1A  career = Game.GameType == 4
+    /// 0x50FA2B  ID_USEDCARSBUTTON, ID_NEWCARSBUTTON                              enabled = career
+    /// 0x50FA65  ID_PARTSBUTTON, ID_REPAIRBUTTONGARAGE                            enabled = car && career
+    /// 0x50FA9A  career:  ID_REMOVEFMBUTTON hidden = !(car && listed)
+    ///                    ID_SELLCARBUTTON  enabled = car, hidden = car && listed
+    /// 0x50FAF9  else:    ID_REMOVEFMBUTTON hidden; ID_SELLCARBUTTON disabled, shown
+    /// ```
+    ///
+    /// "Game type 4" is the port's career (`car_settings_delegate` reads it the same way), and the
+    /// car on show is the career's selected garage car.
+    fn bind_garage(&mut self) {
+        const NAMES: [&str; 10] = [
+            "ID_CHOOSECARBOX",
+            "ID_CARSETUP",
+            "ID_PAINTBUTTON",
+            "ID_SETTINGSBUTTON",
+            "ID_USEDCARSBUTTON",
+            "ID_NEWCARSBUTTON",
+            "ID_PARTSBUTTON",
+            "ID_REPAIRBUTTONGARAGE",
+            "ID_REMOVEFMBUTTON",
+            "ID_SELLCARBUTTON",
+        ];
+        if self.fe.layout_name.as_deref() != Some("garage") {
+            return;
+        }
+        let career = self.career.is_some() && self.mission.is_none();
+        let owned = self.career.as_ref().and_then(|c| c.career.garage.get(c.car_sel));
+        let car = owned.is_some();
+        let listed = owned.is_some_and(|c| c.asking_price.is_some());
+        // (hidden, enabled) per name, in the order of `NAMES`
+        let state: [(Option<bool>, bool); 10] = [
+            (None, car),
+            (None, car),
+            (None, car),
+            (None, car),
+            (None, career),
+            (None, career),
+            (None, car && career),
+            (None, car && career),
+            (Some(!(career && car && listed)), true),
+            (Some(career && car && listed), career && car),
+        ];
+        let Some(l) = self.fe.layout_preview.as_mut() else { return };
+        for (index, which) in l.widgets_named(&NAMES) {
+            let (hide, enable) = state[which];
+            if let Some(h) = hide {
+                l.set_hidden_flag(index, h);
+            }
+            l.set_disabled_flag(index, !enable);
+        }
+    }
+
     /// `repair.lay`'s ten damage bars are **hidden** when their category has nothing in it.
     ///
     /// 0x50F4AD…0x50F609 is ten copies of one block:
@@ -3561,7 +3678,7 @@ impl App {
                                 .get(trk.name_string_id + 20)
                                 .map(str::to_string)
                                 .unwrap_or_else(|| c.tables.track_name(ev.track_id).to_uppercase());
-                            Some(TrackMapEvent { art: trk.art_small.clone(), backwards: ev.backwards, name })
+                            Some(TrackMapEvent { art: trk.art_small.clone(), backwards: ev.backwards, mirror: ev.direction_flag != 0, name })
                         })
                         .collect(),
                 )
@@ -3809,6 +3926,11 @@ impl App {
             return false;
         };
         self.save_replay();
+        // back in the front end the playback flag `[0x699FC9]` is clear again — the controller's
+        // constructor zeroes it (0x50C16F) — so the next race records
+        if self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted)) {
+            self.replay.stream = Some(nfs_game::replay::Replay::new());
+        }
         if let Some(c) = self.career.as_mut() {
             c.pending = None;
         }
@@ -5411,17 +5533,314 @@ impl App {
         self.fe.cars.iter().position(|c| c.0 == slot)
     }
 
-    /// A click's part events: the lids go to the car's own easers (0x439A00…0x439BD0). The sound
-    /// effects are not played — this port's front end has no sound path.
+    /// `RebuildReplayList` — `%s*.rpl` from the replay directory (0x4E5E1B, and again at
+    /// 0x50D45A after a delete), by name.
+    fn replay_names(&self) -> Vec<String> {
+        let Some(dir) = self.replay.path.parent() else { return Vec::new() };
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("rpl")))
+            .filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().to_string()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// **`STARTREPLAY`** (slot 51, 0x50D390): `[0x699FC9] = 1` — "this is a replay playback" —
+    /// then `PLAYGAME`. The launch (0x4D5372…0x4D5425) sends option 0x97 = 2 and 0x110 =
+    /// `"%s.rpl"` over `Replay.List`'s current name, and the start check 0x4D5730 skips the
+    /// game-type switch and the car checks for it (0x4D5786). Here: that file read, the stream set
+    /// playing, the race set up from its snapshot, and the race started.
+    fn start_replay(&mut self, event_loop: &ActiveEventLoop) {
+        let names = self.replay_names();
+        let Some(name) = names.get(self.fe.replay_sel.min(names.len().saturating_sub(1))).cloned() else { return };
+        let Some(dir) = self.replay.path.parent().map(|d| d.to_path_buf()) else { return };
+        let path = dir.join(format!("{name}.rpl"));
+        let Some(f) = std::fs::read(&path).ok().and_then(|d| read_replay_file(&d)) else {
+            tracing::warn!(path = %path.display(), "not a replay file");
+            return;
+        };
+        let mut setup = f.setup.clone();
+        resolve_replay_car(&self.paths, &mut setup);
+        let (track, car) = match (TrackAssets::load(&self.paths, &setup.track), CarAssets::load(&self.paths, &setup.car), CarAssets::load_sim(&self.paths, if setup.sim.is_empty() { "default" } else { &setup.sim })) {
+            (Ok(t), Ok(c), Ok(sim)) => (t, (c, sim)),
+            (t, c, s) => {
+                tracing::error!(track = ?t.err(), car = ?c.err(), sim = ?s.err(), "replay load failed");
+                return;
+            }
+        };
+        tracing::info!(path = %path.display(), track = setup.track, car = setup.car, "front end: start replay");
+        let race_class = setup.sim.to_lowercase().starts_with("gt") || setup.sim.starts_with("935");
+        self.specs = CarSpecs::from_sim(&car.1, race_class);
+        self.track = track;
+        self.car = car.0;
+        self.sim_name = setup.sim.clone();
+        self.num_opponents = setup.opponents;
+        self.num_laps = setup.laps.max(1);
+        self.backwards = setup.backwards;
+        self.mirror = setup.mirror;
+        self.paint = setup.paint;
+        self.road.traffic_count = TRAFFIC_COUNT[(setup.traffic as usize).min(3)];
+        self.road.cops_enabled = setup.cops;
+        self.traffic_seed = setup.seed;
+        self.career_opponents = None;
+        self.replay.stream = Some(nfs_game::replay::Replay::playing(f.stream, f.final_tick));
+        self.replay.setup = setup;
+        // the menu comes back when the playback ends (`leave_race`)
+        self.fe.menu_template = self.fe.menu.take();
+        self.fe.layout_preview = None;
+        self.fe.layout_name = None;
+        let (Some(renderer), Some(window)) = (self.renderer.take(), self.window.take()) else { return };
+        self.tick = 0;
+        self.start_race(renderer, window, event_loop);
+    }
+
+    /// **0x50D3C0**, the "yes" to 808: `"%s%s.rpl"` over the replay directory and `Replay.List`'s
+    /// current name (0x50D402), removed when it exists (0x50D412…0x50D425), then the list rebuilt.
+    /// The directory is this port's own save directory, never the game's.
+    fn kill_selected_replay(&mut self) {
+        let names = self.replay_names();
+        let Some(name) = names.get(self.fe.replay_sel.min(names.len().saturating_sub(1))) else { return };
+        if let Some(dir) = self.replay.path.parent() {
+            let path = dir.join(format!("{name}.rpl"));
+            match std::fs::remove_file(&path) {
+                Ok(()) => tracing::info!(path = %path.display(), "replay deleted"),
+                Err(e) => tracing::warn!(path = %path.display(), error = %e, "replay delete failed"),
+            }
+        }
+        let n = self.replay_names().len();
+        self.fe.replay_sel = self.fe.replay_sel.min(n.saturating_sub(1));
+        self.bind_lists();
+    }
+
+    /// Raise a dialog (slot 13, 0x5128A0) with its text from `FEStrings` — unless the one for the
+    /// same purpose is still up, which is 0x50CC1B's "gone" test.
+    fn fe_raise_dialog(&mut self, kind: nfs_game::dialog::DialogKind, text_id: u32, labels: [u32; 2], purpose: DialogFor) {
+        if self.fe.dialog.as_ref().is_some_and(|(d, p)| *p == purpose && !d.gone()) {
+            return;
+        }
+        let now = self.fe.layout_preview.as_ref().or(self.fe.layout_bottom.as_ref()).map(|l| l.ticks()).unwrap_or(0);
+        let text = self.fe.strings.get(text_id).unwrap_or_default().to_string();
+        let mut d = nfs_game::dialog::Dialog::new(kind, text, labels);
+        d.raise(now);
+        self.fe.dialog = Some((d, purpose));
+    }
+
+    /// Act on a dialog's answer (the callers' polls of slots 18/19). Returns whether the front
+    /// end is leaving.
+    fn fe_dialog_answer(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        match self.fe.dialog_answer.take() {
+            // 0x50CC4F: "yes" to 811 is 0x4D56E0(0) — the front end is over
+            Some((true, DialogFor::Quit)) => {
+                event_loop.exit();
+                true
+            }
+            Some((yes, DialogFor::Offer(i))) => {
+                if let Some(c) = self.career.as_mut() {
+                    if yes {
+                        let _ = c.career.accept_offer(i);
+                        c.car_sel = 0;
+                    } else {
+                        c.career.decline_offer(i);
+                    }
+                    c.save();
+                }
+                false
+            }
+            Some((true, DialogFor::Forfeit)) => {
+                if let Some(c) = self.career.as_mut()
+                    && let Some(t) = c.current().cloned()
+                {
+                    c.career.forfeit(t.id);
+                    c.save();
+                }
+                self.menu_key(MenuKey::Back, event_loop);
+                false
+            }
+            Some((true, DialogFor::KillReplay)) => {
+                self.kill_selected_replay();
+                false
+            }
+            // 0x5103DA…0x51042F: delete the selected stem; the list is rebuilt (0x4DEF60) when it
+            // went, 804 says it did not
+            Some((true, DialogFor::RemovePlayer)) => {
+                let profiles = nfs_game::save::list_profiles(&nfs_game::save::save_dir());
+                if let Some(p) = self.user_row(&profiles).and_then(|i| profiles.get(i)) {
+                    match nfs_game::save::delete_profile(&nfs_game::save::save_dir(), p) {
+                        Ok(()) => {
+                            self.fe.user_sel = None;
+                            self.bind_lists();
+                        }
+                        Err(e) => {
+                            tracing::info!(error = %e, "profile not deleted");
+                            self.fe_raise_dialog(nfs_game::dialog::DialogKind::One, 804, [0, 0], DialogFor::Notice);
+                        }
+                    }
+                }
+                self.bind_player_buttons();
+                false
+            }
+            Some((true, DialogFor::TournamentReset)) => {
+                if let Some(c) = self.career.as_mut() {
+                    c.confirm_reset();
+                }
+                self.menu_key(MenuKey::Enter, event_loop);
+                self.fe.menu.is_none()
+            }
+            _ => false,
+        }
+    }
+
+    /// A dialog the career screen asked for (`CareerUi::dialog`, §4.147): 858 two-button with
+    /// its reset answer, the rest one-button notices — 802, 809, 810, 813, 857.
+    fn fe_career_dialog(&mut self) {
+        if self.fe.dialog.is_some() {
+            return;
+        }
+        if let Some((id, two)) = self.career.as_mut().and_then(|c| c.dialog.take()) {
+            use nfs_game::dialog::DialogKind;
+            let (kind, purpose) = if two { (DialogKind::Two, DialogFor::TournamentReset) } else { (DialogKind::One, DialogFor::Notice) };
+            self.fe_raise_dialog(kind, id, [0, 0], purpose);
+        }
+    }
+
+    /// The pre-race screen's tick (0x505E58…0x505ED3): with no offer dialog up and a garage car
+    /// holding an offer, ask about it — `FEStrings` 807 over the offer, the car's name and its
+    /// asking price — with yes / no.
+    fn fe_offer_check(&mut self) {
+        let on_career = self.fe.layout_name.as_deref() == Some("prerace")
+            || self.fe.menu.as_ref().is_some_and(|m| (1..=3).contains(&m.mode));
+        if !on_career || self.fe.dialog.is_some() {
+            return;
+        }
+        let Some(ui) = self.career.as_ref() else { return };
+        let Some(i) = ui.career.pending_offer() else { return };
+        let car = &ui.career.garage[i];
+        let name = ui.tables.car(car.car_id).map(|c| c.display_name.clone()).unwrap_or_default();
+        let fmt = self.fe.strings.get(807).unwrap_or_default();
+        // "%d … %s … %d": the offer, the name, the asking price (0x505E95…0x505EB1)
+        let text = fmt
+            .replacen("%d", &car.offer.unwrap_or(0).to_string(), 1)
+            .replacen("%s", &name, 1)
+            .replacen("%d", &car.asking_price.unwrap_or(0).to_string(), 1);
+        let now = self.fe.layout_preview.as_ref().or(self.fe.layout_bottom.as_ref()).map(|l| l.ticks()).unwrap_or(0);
+        let mut d = nfs_game::dialog::Dialog::new(nfs_game::dialog::DialogKind::Two, text, [700, 701]);
+        d.raise(now);
+        self.fe.dialog = Some((d, DialogFor::Offer(i)));
+    }
+
+    /// One frame of the dialog: the tick, the answer kept for `fe_dialog_answer`, the screens
+    /// covered while it is up.
+    fn fe_dialog_step(&mut self) {
+        // `NFS_FE_DIALOG=<FEStrings id>` raises a two-button dialog with that text at tick 0, for
+        // a still — the way `NFS_FE_PARTS` opens the car's parts
+        if self.fe.dialog.is_none()
+            && !self.fe.dialog_forced
+            && let Some(id) = std::env::var("NFS_FE_DIALOG").ok().and_then(|v| v.parse::<u32>().ok())
+        {
+            self.fe.dialog_forced = true;
+            let text = self.fe.strings.get(id).unwrap_or_default().to_string();
+            let mut d = nfs_game::dialog::Dialog::new(nfs_game::dialog::DialogKind::Two, text, [700, 701]);
+            d.raise(0);
+            self.fe.dialog = Some((d, DialogFor::Quit));
+        }
+        let now = self.fe.layout_preview.as_ref().or(self.fe.layout_bottom.as_ref()).map(|l| l.ticks()).unwrap_or(0);
+        let mut answer = None;
+        let mut up = false;
+        if let Some((d, purpose)) = self.fe.dialog.as_mut() {
+            d.tick(now);
+            if let Some(a) = d.take_answer() {
+                answer = Some((a, *purpose));
+            }
+            up = d.up;
+            if d.gone() {
+                self.fe.dialog = None;
+            }
+        }
+        // a 3D car zoomed into a door covers every screen each tick too (0x4C052F → 0x4D2000),
+        // and lets them go through 0x4D20F0 (= 0x4D1E70) when it zooms back out
+        let zoomed = self.fe.layout_preview.as_ref().is_some_and(|l| l.car_3d().iter().any(|w| l.car_zoom(w.index).1));
+        let up = up || zoomed;
+        if let Some(l) = self.fe.layout_preview.as_mut() {
+            l.set_covered(up);
+        }
+        if let Some(b) = self.fe.layout_bottom.as_mut() {
+            b.set_covered(up);
+        }
+        if answer.is_some() {
+            self.fe.dialog_answer = answer;
+        }
+    }
+
+    /// A release on the bottom bar — `NFS5.BOTTOMBARBUTTON`'s slot 9 is `NFS5.GOTOBUTTON`'s
+    /// **0x4C9470**: unless disabled, sound 5, then the callback (0x50D6D0) and the destination.
+    /// `QUIT` raises the exit dialog; `GOBACK` and `PLAYGAME` are the port's own back and race
+    /// paths; `OPTIONS`' handler is not read and is logged.
+    fn fe_bottom_click(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        let Some(b) = self.fe.layout_bottom.as_ref() else { return false };
+        let Some(hit) = b.hovered() else { return false };
+        if b.widget_disabled(hit) {
+            return true;
+        }
+        let Some(c) = b.controls().into_iter().find(|c| c.index == hit) else { return false };
+        self.fe_sound(5);
+        match c.callback.as_deref() {
+            Some("QUIT") => self.fe_raise_dialog(nfs_game::dialog::DialogKind::Two, 811, [0, 0], DialogFor::Quit),
+            Some("GOBACK") => self.menu_key(MenuKey::Back, event_loop),
+            Some("PLAYGAME") => {
+                if self.fe.layout_preview.as_ref().is_some_and(|l| l.can_play()) {
+                    self.start_from_layout(event_loop);
+                }
+            }
+            other => tracing::info!(callback = ?other, "bottom bar callback not ported"),
+        }
+        true
+    }
+
+    /// **0x4AADB0(`slot`)**, the front end's one-shot: `fesfx.bnk`'s slot at the level
+    /// `nfs_audio::fesfx::level` gives, silent at sound detail 3. The output opens and the bank
+    /// loads on the first call; a screenshot run plays nothing.
+    fn fe_sound(&mut self, slot: usize) {
+        if self.screenshot.is_some() {
+            return;
+        }
+        if self.snd.audio.is_none() {
+            self.snd.audio = nfs_audio::AudioOutput::new().map_err(|e| tracing::warn!(error = %e, "audio disabled")).ok();
+        }
+        let q = self.snd.audio_settings.audio_quality;
+        if self.snd.fe_sfx.is_none() {
+            self.snd.fe_sfx = nfs_audio::fesfx::FeSfx::load(&self.paths.game_data().join("Sounds"), q)
+                .map_err(|e| tracing::warn!(error = %e, "front-end sounds unavailable"))
+                .ok();
+        }
+        if let (Some(out), Some(fx)) = (self.snd.audio.as_ref(), self.snd.fe_sfx.as_mut()) {
+            fx.play(out, slot, self.snd.audio_settings.sfx_level, q);
+        }
+    }
+
+    /// A click's part events: the lids go to the car's own easers (0x439A00…0x439BD0), the sounds
+    /// through 0x4AADB0.
     fn fe_car_part_events(&mut self, widget: usize, events: &[nfs_game::carparts::PartEvent]) {
         use nfs_game::carparts::PartEvent;
-        let Some(k) = self.fe_car_slot_of(widget) else { return };
-        let car = &mut self.fe.cars[k].4;
         for e in events {
             match *e {
-                PartEvent::Hood(open) => car.set_lid(true, open),
-                PartEvent::Trunk(open) => car.set_lid(false, open),
-                PartEvent::Sfx(_) => {}
+                PartEvent::Hood(open) => {
+                    if let Some(k) = self.fe_car_slot_of(widget) {
+                        self.fe.cars[k].4.set_lid(true, open);
+                    }
+                }
+                PartEvent::Trunk(open) => {
+                    if let Some(k) = self.fe_car_slot_of(widget) {
+                        self.fe.cars[k].4.set_lid(false, open);
+                    }
+                }
+                PartEvent::Sfx(n) => self.fe_sound(n as usize),
+                // the roof click's `Car.Roof` write, index 1 "down" / 0 "up" (0x4C0F9E / 0x4C0FA7)
+                PartEvent::Roof(down) => {
+                    self.choices.insert("Car.Roof".to_string(), usize::from(down));
+                }
             }
         }
     }
@@ -5446,16 +5865,54 @@ impl App {
                 }
             }
         }
+        // the widget's tick first looks at `Car.Roof` (0x4C05E7…0x4C063F) — and the roof zone is
+        // there only when the car's roof animation has a length (0x438190 at 0x4C0D10)
+        let roof_down = self.choice_index("Car.Roof").is_some_and(|(i, _)| i == 1);
+        let widgets: Vec<usize> = self.fe.layout_preview.as_ref().map(|l| l.car_3d().iter().map(|w| w.index).collect()).unwrap_or_default();
+        for w in widgets {
+            let has_roof = self.fe_car_slot_of(w).is_some_and(|k| self.fe.cars[k].4.roof_length > 0);
+            let ev = match self.fe.layout_preview.as_mut() {
+                Some(l) => {
+                    l.set_car_roof(w, has_roof);
+                    l.sync_car_roof(w, roof_down)
+                }
+                None => Vec::new(),
+            };
+            self.fe_car_part_events(w, &ev);
+        }
         let Some(l) = self.fe.layout_preview.as_mut() else { return };
-        l.step_car_parts();
+        // the step's closing sounds, 0x31 / 0x33 / 0x35 (0x4C0778…0x4C07A6)
+        let closing = l.step_car_parts();
+        for e in closing {
+            if let nfs_game::carparts::PartEvent::Sfx(n) = e {
+                self.fe_sound(n as usize);
+            }
+        }
+        let Some(l) = self.fe.layout_preview.as_mut() else { return };
         let widgets: Vec<usize> = l.car_3d().iter().map(|w| w.index).collect();
+        // `data.damage` (0x4BFCEE → `[+0x1AD]`): every tick the widget hands the car its ten zone
+        // damages — the owned car's `FECar+0x6A8` floats when the key is set and the accessor has
+        // a car, 0 otherwise (0x4C0662…0x4C068B, through 0x4D1A00 into `car+0x4E4 + 4z`)
+        let damages: Vec<(usize, [f32; 10])> = l.car_3d().iter().map(|w| (w.index, if w.damage { self.fe_car_damage(w.accessor.as_deref()) } else { [0.0; 10] })).collect();
+        for (w, d) in damages {
+            if let Some(k) = self.fe_car_slot_of(w)
+                && let Some(r) = self.renderer.as_mut()
+            {
+                self.fe.cars[k].4.update_damage(r, &d);
+            }
+        }
         let dt = (self.frame_dt * 1000.0).round().clamp(0.0, 250.0) as u32;
         for w in widgets {
             let doors = self.fe.layout_preview.as_ref().map(|l| l.car_doors(w)).unwrap_or((0.0, 0.0));
+            let roof = self.fe.layout_preview.as_ref().map(|l| l.car_roof_state(w)).unwrap_or(0);
             if let Some(k) = self.fe_car_slot_of(w) {
                 let car = &mut self.fe.cars[k].4;
                 car.set_channel(6, doors.0);
                 car.set_channel(7, doors.1);
+                // 0x4C07E8: after the step, the roof animation follows zone 0's state
+                if let Some(r) = self.renderer.as_mut() {
+                    car.set_roof(r, roof);
+                }
             }
         }
         for c in self.fe.cars.iter_mut() {
@@ -5469,13 +5926,21 @@ impl App {
         let Some(room) = self.fe_room_of() else {
             return;
         };
-        // the room slides toward the camera as the screen fades out
+        // the screen's transition progress, 0…1 — the light block's fade (0x4E84DE)
         let fade = self
             .fe.layout_preview
             .as_ref()
             .map(|l| l.transition().progress() as f32 / nfs_game::layout::TRANS_FULL as f32)
             .unwrap_or(0.0);
-        let p = room.faded_pos(fade);
+        // **The room moves toward the camera when a door is zoomed into**, not with the screen:
+        // `[room+0x2E8]` is written only by its slot 0xB8 (0x4E7800), which only the room car's
+        // widget calls, each tick, with its zoom (0x4C05E1)
+        let zoom = self
+            .fe.layout_preview
+            .as_ref()
+            .map(|l| l.car_3d().iter().filter(|w| w.position().is_none()).map(|w| l.car_zoom(w.index).0).fold(0.0f32, f32::max))
+            .unwrap_or(0.0);
+        let p = room.zoomed_pos(zoom);
         let pos = Vec3::new(p[0], p[1], p[2]);
         let turn = |t: f32| {
             let rot = Quat::from_rotation_y((t + room.rot[1]) * std::f32::consts::TAU)
@@ -5489,8 +5954,18 @@ impl App {
         let spin = room.spin_turns(self.fe.ms);
         let mut items = Vec::new();
         let room_m = turn(room.models_turn.unwrap_or(spin));
+        // **The light block** 0x4E84C0 fills for each model (`RE/notes/lighting.md` §6): the
+        // room's own models (0x4EA07A, flag 0) take the rig's ambient and sun, the car
+        // (0x4EA08A, flag 1) a fixed 0.3 / 0.7 grey from (0, −0.707, 0.707); both faded by
+        // `1 − progress / 512`. The direction is carried into this port's frame the way the models
+        // are, through `MODEL_TO_BODY`, so a surface meets the light at the angle it does there.
+        let light_fade = 1.0 - fade;
+        let sun_dir = nfs_game::world::MODEL_TO_BODY.transform_vector3(Vec3::from(room.sun_dir));
+        let room_light = nfs_game::world::LightBlock::room(room.ambient, room.sun, sun_dir, light_fade, false);
+        let mut car_light = nfs_game::world::LightBlock::room(room.ambient, room.sun, sun_dir, light_fade, true);
+        car_light.direction = nfs_game::world::MODEL_TO_BODY.transform_vector3(car_light.direction);
         for (_, model) in &self.fe.room {
-            items.extend(model.draw_items(room_m, [0.0; 4], 0.0));
+            items.extend(model.draw_items_block(room_m, [0.0; 4], 0.0, &room_light));
         }
         let widgets = self
             .fe.layout_preview
@@ -5518,12 +5993,13 @@ impl App {
                         Quat::from_rotation_y(spin * std::f32::consts::TAU),
                         Vec3::new(-p[0], p[1], p[2]),
                     );
-                    views.push((*slot, car.draw_items(m, [0.0; 4], 0.0)));
+                    views.push((*slot, car.draw_items_block(m, [0.0; 4], 0.0, &car_light)));
                 }
-                None => items.extend(car.draw_items(turn(spin), [0.0; 4], 0.0)),
+                None => items.extend(car.draw_items_block(turn(spin), [0.0; 4], 0.0, &car_light)),
             }
         }
         self.scene.items = items;
+        self.scene.headlight = None;
         self.scene.ambient = room.ambient.iter().sum::<f32>() / (3.0 * 255.0);
         self.scene.sun_direction =
             -Vec3::new(room.sun_dir[0], room.sun_dir[1], room.sun_dir[2]).normalize();
@@ -5586,6 +6062,10 @@ impl App {
                         b.sprites(aspect, &self.fe.strings, None, &|a| self.accessor_value(a)),
                     );
                 }
+                // a dialog over everything (§4.147)
+                if let Some((d, _)) = &self.fe.dialog {
+                    v.extend(l.dialog_sprites(d, aspect, &self.fe.strings, self.fe.mouse_down));
+                }
                 if let Some(f) = self.fe.menu.as_ref().and_then(|m| m.font.as_ref()) {
                     let name = self.fe.layout_name.clone().unwrap_or_default();
                     let hint = if l.can_play() {
@@ -5606,11 +6086,16 @@ impl App {
                 }
                 v
             }
-            None => self
-                .fe.menu
-                .as_ref()
-                .map(|m| m.sprites(self.career.as_ref()))
-                .unwrap_or_default(),
+            None => {
+                let mut v = self.fe.menu.as_ref().map(|m| m.sprites(self.career.as_ref())).unwrap_or_default();
+                // a dialog over the port's own text menu, painted by the bottom bar's screen —
+                // the dialog belongs to no screen of its own (§4.147)
+                if let (Some((d, _)), Some(b)) = (&self.fe.dialog, &self.fe.layout_bottom) {
+                    let aspect = self.renderer.as_ref().map(|r| r.aspect()).unwrap_or(1.6);
+                    v.extend(b.dialog_sprites(d, aspect, &self.fe.strings, self.fe.mouse_down));
+                }
+                v
+            }
         }
     }
 
@@ -6025,6 +6510,16 @@ impl App {
             ),
             _ => (self.car_pos, self.car_rot),
         };
+        // **The headlight projector** 0x4526C0, rebuilt each frame from the player car: world into
+        // the car's frame (0x466280 / 0x466220 from `car+0x364` / `+0x330`), its y shifted by
+        // `[0x5CEC54]` = −4.8 (0x452749), then turned −17° about x (`[0x5CEC5C]` through 0x539BD0
+        // at 0x452769, the row-vector product 0x539AD0). The car's lamp bit `car+0xD87 & 1` is the
+        // night flag (`Car_init` 0x410C74), so it lights exactly on a night track.
+        self.scene.headlight = (self.vehicle.is_some() && self.track.is_night()).then(|| {
+            Mat4::from_rotation_x((-17.0f32).to_radians())
+                * Mat4::from_translation(Vec3::new(0.0, -4.8, 0.0))
+                * Mat4::from_rotation_translation(car_rot, car_pos).inverse()
+        });
         let dt = self.frame_dt.clamp(0.001, 0.1);
         let fwd = car_rot * Vec3::Z;
         let rear_view = self.input.held(Action::RearView) && self.vehicle.is_some();
@@ -6202,14 +6697,10 @@ impl App {
                 };
                 let m = Mat4::from_rotation_translation(r, p);
                 let spin = c.speed.abs() * self.tick as f32 / 64.0 / 0.32;
-                let light = self
-                    .world
-                    .as_ref()
-                    .map(|w| w.light_at(p))
-                    .unwrap_or([1.0; 3]);
+                let block = self.world.as_ref().map(|w| w.car_light(p));
                 self.scene
                     .items
-                    .extend(self.road.police_models[c.model].draw_items_lit(m, [spin; 4], 0.0, light));
+                    .extend(match &block { Some(b) => self.road.police_models[c.model].draw_items_block(m, [spin; 4], 0.0, b), None => self.road.police_models[c.model].draw_items(m, [spin; 4], 0.0) });
             }
         }
         if let Some(tr) = &self.road.traffic {
@@ -6227,14 +6718,10 @@ impl App {
                 let m = Mat4::from_rotation_translation(r, p);
                 // a kinematic car has no wheel state: the wheels are rolled from the distance driven
                 let spin = self.road.traffic_spin.get(i).copied().unwrap_or(0.0);
-                let light = self
-                    .world
-                    .as_ref()
-                    .map(|w| w.light_at(p))
-                    .unwrap_or([1.0; 3]);
+                let block = self.world.as_ref().map(|w| w.car_light(p));
                 self.scene
                     .items
-                    .extend(self.road.traffic_models[c.model].draw_items_lit(m, [spin; 4], 0.0, light));
+                    .extend(match &block { Some(b) => self.road.traffic_models[c.model].draw_items_block(m, [spin; 4], 0.0, b), None => self.road.traffic_models[c.model].draw_items(m, [spin; 4], 0.0) });
             }
         }
         for (i, o) in self.road.opponents.iter().enumerate() {
@@ -6250,19 +6737,13 @@ impl App {
             };
             let m = Mat4::from_rotation_translation(r, p);
             let w = &o.vehicle.wheels;
-            let light = self
-                .world
-                .as_ref()
-                .map(|wl| wl.light_at(p))
-                .unwrap_or([1.0; 3]);
-            self.scene
-                .items
-                .extend(self.road.opponent_models[o.model].draw_items_lit(
-                    m,
-                    [w[0].rotation, w[1].rotation, w[2].rotation, w[3].rotation],
-                    o.vehicle.wheel_steer_turns(0, &o.specs),
-                    light,
-                ));
+            let block = self.world.as_ref().map(|w| w.car_light(p));
+            let (spin, steer) = ([w[0].rotation, w[1].rotation, w[2].rotation, w[3].rotation], o.vehicle.wheel_steer_turns(0, &o.specs));
+            let model = &self.road.opponent_models[o.model];
+            self.scene.items.extend(match &block {
+                Some(b) => model.draw_items_block(m, spin, steer, b),
+                None => model.draw_items(m, spin, steer),
+            });
         }
         // every car drops a blob shadow on the ground under it (0x43B820)
         if let Some((_, material)) = self.shadow_draw {
@@ -6347,15 +6828,12 @@ impl App {
                 ),
                 None => ([0.0; 4], 0.0),
             };
-            // the car picks up the light of the ground it stands on (`RE/notes/lighting.md`)
-            let light = self
-                .world
-                .as_ref()
-                .map(|w| w.light_at(car_pos))
-                .unwrap_or([1.0; 3]);
+            // the car's light block — the ground under it times the `.map` colours, and the sun of
+            // the track's sky (`RE/notes/lighting.md` §6)
+            let block = self.world.as_ref().map(|w| w.car_light(car_pos));
             self.scene
                 .items
-                .extend(c.draw_items_lit(m, spin, steer, light));
+                .extend(match &block { Some(b) => c.draw_items_block(m, spin, steer, b), None => c.draw_items(m, spin, steer) });
         }
         {
             let fwd = (self.camera.target - self.camera.position).normalize_or_zero();
@@ -6582,6 +7060,8 @@ impl App {
             }
             MenuKey::Enter if (1..=3).contains(&m.mode) => {
                 let Some(req) = self.career.as_mut().and_then(|c| c.activate()) else {
+                    // a dialog the career screen asked for is raised on the next frame
+                    // (`fe_career_dialog`)
                     return;
                 };
                 let template = Menu {
@@ -7000,6 +7480,8 @@ impl App {
             self.bind_chronicle_group();
             self.bind_repair_bars();
             self.bind_usedcars_panels();
+            self.bind_garage();
+            self.bind_player_buttons();
             self.bind_parts_buttons();
             self.bind_mergedlist_panel();
             self.bind_showcase_pictures();
@@ -7065,7 +7547,32 @@ impl App {
                 // (An earlier reading paired `PLAYGAME` with 0x50E540 and hung this on slot 47's
                 // "ask then act". That registration is **`QUIT`**, and its `[this+0x270]` is the
                 // exit-confirm dialog, `FEStrings` 811.)
-                if (c.callback.as_deref() == Some("PLAYGAME") || c.destination.is_none()) && l.can_play() {
+                // `FORFEITTOURNY` (0x506130) raises 824; it has no destination, so without this
+                // it fell into the start below and raced instead of forfeiting
+                if c.callback.as_deref() == Some("FORFEITTOURNY") {
+                    self.fe_raise_dialog(nfs_game::dialog::DialogKind::Two, 824, [700, 701], DialogFor::Forfeit);
+                    return;
+                }
+                // `KILLREPLAY` (0x50D3A0) raises the prebuilt 808 with the default ok / cancel
+                // (0x50C690 passes 0, 0); `STARTREPLAY` is not ported — both used to fall into the
+                // race start below
+                if c.callback.as_deref() == Some("KILLREPLAY") {
+                    if !self.replay_names().is_empty() {
+                        self.fe_raise_dialog(nfs_game::dialog::DialogKind::Two, 808, [0, 0], DialogFor::KillReplay);
+                    }
+                    return;
+                }
+                let can_play = l.can_play();
+                if let Some(cb) = c.callback.clone()
+                    && (self.player_callback(&cb, event_loop) || self.cd_callback(&cb))
+                {
+                    return;
+                }
+                if c.callback.as_deref() == Some("STARTREPLAY") {
+                    self.start_replay(event_loop);
+                    return;
+                }
+                if (c.callback.as_deref() == Some("PLAYGAME") || c.destination.is_none()) && can_play {
                     self.start_from_layout(event_loop);
                     return;
                 }
@@ -7104,6 +7611,283 @@ impl App {
                 Some(prev) => self.open_layout(&prev),
                 None => event_loop.exit(),
             },
+        }
+    }
+
+    /// The song names, from the live player in a race and from the files in the front end.
+    fn cd_names(&self) -> Vec<String> {
+        match self.snd.music.as_ref() {
+            Some(m) => m.names.clone(),
+            None => self.snd.music_names.clone(),
+        }
+    }
+
+    /// The song table `[0x65B628]` (0x4ADE20 with `game*`): each matching stream's index and name,
+    /// in stream order.
+    fn cd_table(names: &[String]) -> Vec<(usize, String)> {
+        names.iter().enumerate().filter(|(_, n)| nfs_audio::music::pattern_match(n, "game*")).map(|(i, n)| (i, n.clone())).collect()
+    }
+
+    /// The playlist `[0x65B62C]` as stream indices.
+    fn cd_playlist(&self) -> Vec<usize> {
+        match self.snd.music.as_ref() {
+            Some(m) => m.playlist().to_vec(),
+            None => self.snd.audio_settings.playlist.iter().map(|i| *i as usize).collect(),
+        }
+    }
+
+    fn set_cd_playlist(&mut self, list: Vec<usize>) {
+        self.snd.audio_settings.playlist = list.clone();
+        if let Some(m) = self.snd.music.as_mut() {
+            m.set_saved(list);
+        }
+    }
+
+    /// The CD player's editing callbacks (`cdplayer.lay`, the screen at vtable 0x5B9F58):
+    ///
+    /// * `ADDSONG` 0x511FF0: with an `AvailableList` row selected, **815** when the playlist
+    ///   already holds 40 (`cmp eax, 0x28`, raised at 0x51202C), else that record's stream index
+    ///   appended (0x4BEBE0 → 0x4BE670);
+    /// * `REMOVESONG` 0x512070: with a `SelectedList` row selected, that entry erased (0x4BE790);
+    /// * `CLEARALL` (slot 0xEC → 0x4BE9E0): the playlist emptied;
+    /// * `RESETLIST` (slot 0xF0 → 0x4BE7E0): emptied, then every table record whose name's first
+    ///   four characters, lower-cased, are `game` appended in table order.
+    fn cd_callback(&mut self, cb: &str) -> bool {
+        let names = self.cd_names();
+        let table = Self::cd_table(&names);
+        let mut list = self.cd_playlist();
+        match cb {
+            "ADDSONG" => {
+                let Some(r) = self.fe.cd_available.filter(|r| *r < table.len()) else { return true };
+                if list.len() >= 0x28 {
+                    self.fe_raise_dialog(nfs_game::dialog::DialogKind::One, 815, [0, 0], DialogFor::Notice);
+                    return true;
+                }
+                list.push(table[r].0);
+            }
+            "REMOVESONG" => {
+                let Some(r) = self.fe.cd_selected.filter(|r| *r < list.len()) else { return true };
+                list.remove(r);
+            }
+            // slots 55 / 56, 0x511F90 / 0x511FC0: one of `Audio.lay`'s two panels at a time — the
+            // one going away hidden (0x4CEC50), the other loaded (its slot 0x6C) and shown
+            // (0x4CEC60); `[+0x290]` remembers which
+            "SHOWPLAYLISTPANEL" | "HIDEPLAYLISTPANEL" => {
+                let show = cb == "SHOWPLAYLISTPANEL";
+                let (off, on) = if show { ("ID_MAINSCREENPANEL", "ID_PLAYLISTPANEL") } else { ("ID_PLAYLISTPANEL", "ID_MAINSCREENPANEL") };
+                if let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) {
+                    l.set_panel(r, &self.paths, off, false);
+                    l.set_panel(r, &self.paths, on, true);
+                }
+                self.bind_lists();
+                return true;
+            }
+            // the transport (`audioreal.lay`)
+            "PLAYSONG" => {
+                // 0x5120D0: `MusicStop(0)`, then `MusicPlay(0x4BEB40(), 0)` — the current song's
+                // name, or none (`MusicPlay(NULL, 0)`, a pick from the playlist) when `[0x5D7938]`
+                // names no table record
+                let name = table.iter().find(|(i, _)| *i as i32 == self.fe.cd_current).map(|(_, n)| n.clone());
+                self.fe_music(|m, a| {
+                    m.stop(a);
+                    match &name {
+                        Some(n) => m.play_pattern(a, n, 0),
+                        None => m.start_race(a),
+                    }
+                });
+                return true;
+            }
+            "STOPSONG" => {
+                // 0x5120F0: `MusicStop(0)`
+                self.fe_music(|m, a| m.stop(a));
+                return true;
+            }
+            "SKIPFWD" | "SKIPBK" => {
+                // 0x512100 / 0x512110: `CDPlayer.Title` stepped forward / back, wrapping
+                // (0x4BC690 / 0x4BC660), through its setter 0x4BEDC0
+                let n = table.len();
+                if n > 0 {
+                    let i = self.fe.cd_title.min(n - 1);
+                    let next = if cb == "SKIPFWD" { (i + 1) % n } else { (i + n - 1) % n };
+                    self.cd_set_title(next);
+                }
+                return true;
+            }
+            "CLEARALL" => list.clear(),
+            "RESETLIST" => {
+                list = table.iter().filter(|(_, n)| n.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("game"))).map(|(i, _)| *i).collect();
+            }
+            _ => return false,
+        }
+        self.set_cd_playlist(list);
+        self.bind_lists();
+        true
+    }
+
+    /// `CDPlayer.Title`'s setter **0x4BEDC0**: the index clamped (0x4BC240), then the record's
+    /// stream index made the current song `[0x5D7938]` when it differs (and is not −1), and played
+    /// at once — `MusicStop(0)`, `MusicPlay(name, 0)` — when the current screen answers its slot
+    /// 0xA8 true, which only the CD player's does (0x510E90; every other screen's is 0x50DD60,
+    /// false). APPROXIMATION: which layouts get that screen class is not read; the port takes the
+    /// two that carry its callbacks, `audioreal` and `cdplayer`.
+    fn cd_set_title(&mut self, index: usize) {
+        let table = Self::cd_table(&self.cd_names());
+        let Some((id, name)) = table.get(index.min(table.len().saturating_sub(1))).cloned() else { return };
+        self.fe.cd_title = index.min(table.len() - 1);
+        if id as i32 == self.fe.cd_current {
+            return;
+        }
+        self.fe.cd_current = id as i32;
+        let cd_screen = self.fe.layout_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("audioreal") || n.eq_ignore_ascii_case("cdplayer"));
+        if cd_screen {
+            self.fe_music(|m, a| {
+                m.stop(a);
+                m.play_pattern(a, &name, 0);
+            });
+        }
+        self.bind_lists();
+    }
+
+    /// The front end's music player, made on first use (the port has no menu music of its own yet)
+    /// — nothing in a screenshot run.
+    fn fe_music(&mut self, f: impl FnOnce(&mut nfs_audio::music::MusicPlayer, &nfs_audio::AudioOutput)) {
+        if self.screenshot.is_some() {
+            return;
+        }
+        if self.snd.audio.is_none() {
+            self.snd.audio = nfs_audio::AudioOutput::new().map_err(|e| tracing::warn!(error = %e, "audio disabled")).ok();
+        }
+        if self.snd.music.is_none() {
+            self.snd.music = nfs_audio::music::MusicPlayer::new(&self.paths.game_data().join("Music"), &self.paths.game_data().join("Sounds"), &self.snd.audio_settings)
+                .map_err(|e| tracing::warn!(error = %e, "music unavailable"))
+                .ok();
+        }
+        if let (Some(a), Some(m)) = (self.snd.audio.as_ref(), self.snd.music.as_mut()) {
+            f(m, a);
+        }
+    }
+
+    /// The zone damages of the car a 3D widget's accessor holds (`FECar+0x6A8`, ten floats, the
+    /// owned car's own) — the garage's selected car for `OwnedCars.Car`, the lot's for
+    /// `UsedCar.Car`; nothing for a source without one.
+    fn fe_car_damage(&self, accessor: Option<&str>) -> [f32; 10] {
+        let Some(c) = self.career.as_ref() else { return [0.0; 10] };
+        match accessor.map(|a| a.split('(').next().unwrap_or(a).trim()) {
+            Some("OwnedCars.Car") => c.career.garage.get(c.car_sel).map(|o| o.damage).unwrap_or([0.0; 10]),
+            Some("UsedCar.Car") => c.career.market.get(self.fe.usedcar_sel).map(|o| o.damage).unwrap_or([0.0; 10]),
+            _ => [0.0; 10],
+        }
+    }
+
+    /// The row of `UserList.UserList` that is selected: the clicked one, else the profile
+    /// `player.lst` names — `RebuildUserList` 0x4DEF60 selects it — which is the loaded one.
+    fn user_row(&self, profiles: &[nfs_game::save::Profile]) -> Option<usize> {
+        match self.fe.user_sel {
+            Some(i) if i < profiles.len() => Some(i),
+            _ => self.career.as_ref().and_then(|c| profiles.iter().position(|p| *p == c.profile)),
+        }
+    }
+
+    /// The player screens' callbacks — the front-end controller's slots 0xDC…0xE8 and 0x108
+    /// (vtable 0x5B9D64), registered by name at 0x50FF40 (§4.147). Returns whether `cb` was one.
+    ///
+    /// * `REMOVEPLAYER` (0x510770) raises 803; its answer is `DialogFor::RemovePlayer`.
+    /// * `SETNAMETHENBACK` (0x5106C0): with a row selected, `LoadInfo(stem, 0)`; loaded, the
+    ///   knockout is cancelled (0x4DE040) and the screen goes back (slot 0xB4 = 0x4D23F0(0)),
+    ///   otherwise 806.
+    /// * `CREATEPLAYERDONE` (0x5107A0): the name box's text; nothing when empty (0x5107F9); 801
+    ///   when the name is taken (0x4DE510); 805 when the profile cannot be made (0x4DE5B0 with
+    ///   the picture `[0x5D8F2C]`); then `LoadInfo` of the new stem — 806 on failure — and the
+    ///   whole layer closes, 0x4D23F0(−1), with sound 4 (0x4D252B).
+    /// * `CANCELCREATEPLAYER` (0x510AE0): slot 0xB4, back one history entry (0x4D5FB0).
+    ///
+    /// Not ported: 0x4D8680, which first tries the name as one of the seven cheat codes of the
+    /// table at 0x5D9618 (sound 0xC and a bit of `[0x65B940]` when it matches); 0x4F3E40, the
+    /// `DealerCar` accessors' reset `SETNAMETHENBACK` makes before loading; 0x505570 each path
+    /// ends in; and the driver-picture choice, so `[0x5D8F2C]` is its image value 8 — which
+    /// `CREATEPLAYERENTER` (0x510780) also sets.
+    fn player_callback(&mut self, cb: &str, event_loop: &ActiveEventLoop) -> bool {
+        use nfs_game::dialog::DialogKind;
+        let dir = nfs_game::save::save_dir();
+        match cb {
+            "REMOVEPLAYER" => {
+                self.fe_raise_dialog(DialogKind::Two, 803, [0, 0], DialogFor::RemovePlayer);
+            }
+            "SETNAMETHENBACK" => {
+                let profiles = nfs_game::save::list_profiles(&dir);
+                let Some(p) = self.user_row(&profiles).and_then(|i| profiles.get(i)).cloned() else { return true };
+                if self.career.as_mut().is_some_and(|c| c.switch_profile(&p)) {
+                    self.fe.user_sel = None;
+                    self.apply_saved_controls();
+                    self.menu_key(MenuKey::Back, event_loop);
+                } else {
+                    self.fe_raise_dialog(DialogKind::One, 806, [0, 0], DialogFor::Notice);
+                }
+            }
+            "CREATEPLAYERDONE" => {
+                let name = self.fe.layout_preview.as_ref().map(|l| l.input_text("UserList.NameInput")).unwrap_or_default();
+                if name.is_empty() {
+                    return true;
+                }
+                // 0x510804: a cheat code first — sound 0xC, its bit of `[0x65B940]` set, and the
+                // name box emptied (0x510818) instead of a profile made
+                if let Some(id) = nfs_game::cheats::code_of(&name) {
+                    self.fe_sound(0xC);
+                    // id 4 would call 0x5012E0(−1) instead; no shipped code carries it
+                    if id != 4 {
+                        self.cheat_bits |= 1 << id;
+                    }
+                    tracing::info!(id, "cheat code");
+                    if let Some(l) = self.fe.layout_preview.as_mut() {
+                        l.clear_input("UserList.NameInput");
+                    }
+                    return true;
+                }
+                if nfs_game::save::name_taken(&dir, &name) {
+                    self.fe_raise_dialog(DialogKind::One, 801, [0, 0], DialogFor::Notice);
+                    return true;
+                }
+                let made = self.career.as_mut().is_some_and(|c| c.create_profile(&name, nfs_game::save::DEFAULT_PICTURE));
+                if !made {
+                    self.fe_raise_dialog(DialogKind::One, 805, [0, 0], DialogFor::Notice);
+                    return true;
+                }
+                self.fe.user_sel = None;
+                let p = nfs_game::save::Profile::new(name, nfs_game::save::DEFAULT_PICTURE);
+                if self.career.as_mut().is_some_and(|c| c.switch_profile(&p)) {
+                    self.fe_sound(4);
+                    if let Some(prev) = self.fe.layout_stack.pop() {
+                        self.open_layout(&prev);
+                    }
+                } else {
+                    self.fe_raise_dialog(DialogKind::One, 806, [0, 0], DialogFor::Notice);
+                }
+            }
+            // 0x4D5FB0 opens the screen before this one in the layer's history. This port keeps
+            // no per-layer history, and the one screen that replaces itself with `createplayer`
+            // is `selectname` (the only `destination=createplayer`, offset 0) — so that is it.
+            "CANCELCREATEPLAYER" => self.open_layout("selectname"),
+            _ => return false,
+        }
+        true
+    }
+
+    /// The player screens' enables from the tick 0x510210, through the by-name 0x50D880:
+    /// `ID_CREATEPLAYEROKBUTTON` while the name box holds something (0x51034D) and
+    /// `ID_REMOVEBUTTON` while the list is not empty (0x51036E: the accessor's slot 0x6C,
+    /// 0x4B8B50, is `begin == end`). `ID_CONTINUEBUTTON`'s is gated on a local the slot-0x6C call
+    /// never writes — it returns with a plain `ret` over the argument pushed for it — so what it
+    /// sees is left to a running original (AUDIT.md §E) and the button is left as it stands.
+    fn bind_player_buttons(&mut self) {
+        let Some(l) = self.fe.layout_preview.as_mut() else { return };
+        let named = l.widgets_named(&["ID_CREATEPLAYEROKBUTTON", "ID_REMOVEBUTTON"]);
+        if named.is_empty() {
+            return;
+        }
+        let empty = nfs_game::save::list_profiles(&nfs_game::save::save_dir()).is_empty();
+        let typed = !l.input_text("UserList.NameInput").is_empty();
+        for (index, which) in named {
+            l.set_disabled_flag(index, if which == 0 { !typed } else { empty });
         }
     }
 
@@ -7209,6 +7993,22 @@ impl App {
         // the front end's screens slide and fade in over half a second (`RE/notes/controls.md` §6)
         let dt_ms = (self.frame_dt * 1000.0).round().clamp(0.0, 250.0) as u32;
         self.fe.ms += dt_ms as u64;
+        // the garage screen's tick re-decides its buttons every frame (0x50F970), and the player
+        // screens' tick theirs (0x510210)
+        self.bind_garage();
+        self.bind_player_buttons();
+        // the dialog's tick (0x512980 and the kind's own), and the covering the manager keeps
+        // while it is up (0x4D2000 on the raise, 0x4D1E70 on the dismiss)
+        self.fe_dialog_step();
+        // the front end's music, when the CD player started some: the end-of-stream advance
+        // (0x4ADD6D) the race's audio update runs
+        if self.vehicle.is_none()
+            && let (Some(a), Some(m)) = (&self.snd.audio, self.snd.music.as_mut())
+        {
+            m.update(a);
+        }
+        self.fe_career_dialog();
+        self.fe_offer_check();
         // the steering band is the front end's own `XAxis.Min` / `XAxis.Max`, not a constant of
         // this port's (`nfs-input/src/gamepad.rs`)
         if let Some(l) = self.fe.layout_preview.as_ref() {
@@ -7569,6 +8369,8 @@ impl App {
             self.bind_chronicle_group();
             self.bind_repair_bars();
             self.bind_usedcars_panels();
+            self.bind_garage();
+            self.bind_player_buttons();
             self.bind_parts_buttons();
             self.bind_mergedlist_panel();
             self.bind_showcase_pictures();
@@ -7747,6 +8549,8 @@ impl App {
             self.bind_chronicle_group();
             self.bind_repair_bars();
             self.bind_usedcars_panels();
+            self.bind_garage();
+            self.bind_player_buttons();
             self.bind_parts_buttons();
             self.bind_mergedlist_panel();
             self.bind_showcase_pictures();
@@ -7890,6 +8694,11 @@ impl App {
         window: Arc<Window>,
         event_loop: &ActiveEventLoop,
     ) {
+        // the player's typed name is the car's `carinfo+0x17C`, which the specs' tail compares
+        // with the two cheat names (0x49D6E7…0x49D875); the port's gearbox is automatic
+        if let Some(name) = self.career.as_ref().map(|c| c.profile.name.clone()) {
+            self.specs.apply_driver_name(&name, true);
+        }
         // `Replay_startRace` 0x413EA0 + `0x414EB0`: rewind the stream and seed the shared RNG from
         // the race's seed, which is what makes a replay re-simulate the same race (replay.md §11).
         let playing = self
@@ -8668,6 +9477,13 @@ impl App {
                 "trackside cameras"
             );
         }
+        // the headlight projector's bitmap, loaded on a night track as `Headlights_init` 0x452590
+        // does (`RE/notes/lighting.md` §5)
+        if self.track.is_night()
+            && let Some(m) = nfs_assets::track::night_map(&self.paths)
+        {
+            renderer.set_headlight_map(&m);
+        }
         self.world = Some(world);
         self.car_model = Some(car);
         // the cockpit view's eye point, for the car's own body style
@@ -8843,10 +9659,9 @@ impl ApplicationHandler for App {
                         }
                         _ => {}
                     }
-                    // Every accepted path in 0x4CCC20 ends at `0x4AADB0(9)`. This port's front end
-                    // has no sound path — the same reason the scrollbar's click 8 is not played —
-                    // so the keystroke is taken and the sound is not.
+                    // Every accepted path in 0x4CCC20 ends at `0x4AADB0(9)`.
                     if took {
+                        self.fe_sound(9);
                         return;
                     }
                 }
@@ -9014,6 +9829,33 @@ impl ApplicationHandler for App {
                     let (fw, x0) = if aspect > design_aspect { (design_aspect / aspect, (1.0 - design_aspect / aspect) * 0.5) } else { (1.0, 0.0) };
                     ((u - x0) / fw * 640.0, v * 480.0)
                 });
+                // **`FEControl::onMouseEnter` 0x4C7B90 plays sound 6** through slot 23 (0x4C7A30):
+                // on entering a widget whose state is now `"hover"` (the string compare at
+                // 0x4C7BD9), that was not hovered already (0x4C7BA5) and is not disabled (bit 0x10,
+                // 0x4C7C18). Not carried: 0x4C7C1C's accessor-driven disable (0x4E08E0), which
+                // this port does not model (§4.110).
+                if let (Some(l), Some((cx, cy))) = (self.fe.layout_preview.as_mut(), self.fe.cursor) {
+                    l.set_cursor(Some((cx, cy)));
+                }
+                // a dialog's buttons take the pointer too (slot 8, 0x515060)
+                if let (Some((d, _)), Some((cx, cy)), Some(l)) = (self.fe.dialog.as_mut(), self.fe.cursor, self.fe.layout_preview.as_ref().or(self.fe.layout_bottom.as_ref())) {
+                    let th = l.dialog_text_height(&d.text);
+                    let sounds = d.pointer(cx, cy, th);
+                    for s in sounds {
+                        self.fe_sound(s as usize);
+                    }
+                }
+                let now = self.fe.layout_preview.as_ref().and_then(|l| l.hovered());
+                if now != self.fe.last_hover {
+                    self.fe.last_hover = now;
+                    if let (Some(i), Some(l)) = (now, self.fe.layout_preview.as_ref()) {
+                        let controls = l.controls();
+                        let sel = controls.get(self.fe.layout_sel.min(controls.len().saturating_sub(1))).map(|c| c.index);
+                        if l.state_name(i, sel).as_deref() == Some("hover") && !l.widget_disabled(i) {
+                            self.fe_sound(6);
+                        }
+                    }
+                }
                 // Dragging the scrollbar's knob. `FeScrollBar`'s slot 8, 0x4D0F20: with the knob
                 // grabbed (`[this+0x10C] == 3`) and the pointer still on the bar, it sets the
                 // model's position to
@@ -9070,6 +9912,16 @@ impl ApplicationHandler for App {
                     l.set_pressed(down);
                 }
                 self.fe.mouse_down = down;
+                // a dialog's input slot 3 (0x512F10) hands the event to its buttons first, and
+                // stops at the one that takes it (slot 9, 0x515130)
+                if !down && let Some((d, _)) = self.fe.dialog.as_mut() && let Some(s) = d.release() {
+                    self.fe_sound(s as usize);
+                    return;
+                }
+                // the bottom bar is a screen of its own, and its buttons navigate on the release
+                if !down && self.fe_bottom_click(event_loop) {
+                    return;
+                }
                 // `NFS5.ChroniclePicture` drags its picture about: slot 5 takes hold, slot 8
                 // pans, slot 9 lets go (§4.119)
                 if let Some((cx, cy)) = self.fe.cursor {
@@ -9096,8 +9948,11 @@ impl ApplicationHandler for App {
                 if let Some((cx, cy)) = self.fe.cursor
                     && let Some((_, region)) = self.fe.layout_preview.as_ref().and_then(|l| l.combo_scroll_at(cx, cy))
                 {
-                    // 0x4DB08B and 0x4DB0A1 also play click 8 through 0x4AADB0; this port's front
-                    // end has no sound path, so the step is all that is ported.
+                    // arms 1 and 2 play click 8 through 0x4AADB0 whether or not the list moves
+                    // (0x4DB08B, 0x4DB0A1)
+                    if down && matches!(region, 1 | 2) {
+                        self.fe_sound(8);
+                    }
                     if let Some(l) = self.fe.layout_preview.as_mut() {
                         let i = l.open_combo();
                         l.set_combo_scroll(i.map(|i| (i, region, down)));
@@ -9153,6 +10008,8 @@ impl ApplicationHandler for App {
                         false
                     };
                     if closed {
+                        // "ok" and "cancel" both play sound 5 (0x4C49C4, 0x4C4A16)
+                        self.fe_sound(5);
                         self.fe.layout_open_combo = None;
                         if let Some(l) = self.fe.layout_preview.as_mut() {
                             l.set_open_combo(None);
@@ -9249,6 +10106,37 @@ impl ApplicationHandler for App {
                         self.bind_parts_buttons();
                         return;
                     }
+                    // a click on `Replay.List` puts its accessor on that row (FeListBox slot 9 →
+                    // the accessor's slot 11)
+                    if let Some(row) = self.fe.layout_preview.as_ref().and_then(|l| {
+                        l.list_boxes().into_iter().find(|w| w.accessor.as_deref() == Some("Replay.List")).and_then(|w| l.list_row_at(w.index, cx, cy))
+                    }) {
+                        self.fe.replay_sel = row;
+                        self.bind_lists();
+                        return;
+                    }
+                    // the CD player's two lists keep their own selected rows
+                    for (acc, avail) in [("CDPlayer.AvailableList", true), ("CDPlayer.SelectedList", false)] {
+                        if let Some(row) = self.fe.layout_preview.as_ref().and_then(|l| {
+                            l.list_boxes().into_iter().find(|w| w.accessor.as_deref() == Some(acc)).and_then(|w| l.list_row_at(w.index, cx, cy))
+                        }) {
+                            if avail {
+                                self.fe.cd_available = Some(row);
+                            } else {
+                                self.fe.cd_selected = Some(row);
+                            }
+                            self.bind_lists();
+                            return;
+                        }
+                    }
+                    // and one on `UserList.UserList` selects that profile's row
+                    if let Some(row) = self.fe.layout_preview.as_ref().and_then(|l| {
+                        l.list_boxes().into_iter().find(|w| w.accessor.as_deref() == Some("UserList.UserList")).and_then(|w| l.list_row_at(w.index, cx, cy))
+                    }) {
+                        self.fe.user_sel = Some(row);
+                        self.bind_lists();
+                        return;
+                    }
 
                 }
                 if let Some(hit) = self.fe.layout_preview.as_ref().and_then(|l| l.hovered()) {
@@ -9268,8 +10156,17 @@ impl ApplicationHandler for App {
                         if class == "NFS5.CONTROLLERSETUP" {
                             self.fe.binding_base = Some(self.input.pads.clone());
                         }
+                        // `NFS5.GOTOBUTTON`'s slot 9, 0x4C9470: unless disabled (0x4C7E40), sound 5
+                        // before the transition
+                        if class == "NFS5.GOTOBUTTON" && !l.widget_disabled(hit) {
+                            self.fe_sound(5);
+                        }
                         // `NFS5.3DCAR`'s slot 9, 0x4C0EB0: a click opens or closes the part under
                         // the pointer (§4.153)
+                        let l = match self.fe.layout_preview.as_mut() {
+                            Some(l) => l,
+                            None => return,
+                        };
                         if class == "NFS5.3DCAR" {
                             let events = l.car_click(hit);
                             self.fe_car_part_events(hit, &events);
@@ -9425,6 +10322,11 @@ impl ApplicationHandler for App {
                         return;
                     }
                 }
+                // the dialog's tick (0x512980 and the kind's own), its answer, and the covering
+                // the manager keeps while it is up (0x4D2000 on the raise, 0x4D1E70 on the dismiss)
+                if self.fe_dialog_answer(event_loop) {
+                    return;
+                }
                 // the front end draws from `rebuild_scene` like everything else, so it keeps
                 // animating between key presses
                 let now = Instant::now();
@@ -9463,6 +10365,32 @@ impl ApplicationHandler for App {
             }
             _ => {}
         }
+    }
+}
+
+/// A replay file in either format: the port's own, or an original `.rpl` (§6.1 + §16) — the setup
+/// snapshot, the final tick and the same stream, played back as far as the port's simulation
+/// matches.
+fn read_replay_file(d: &[u8]) -> Option<nfs_game::replay::ReplayFile> {
+    nfs_game::replay::ReplayFile::parse(d).or_else(|| {
+        let (setup, final_tick, stream) = nfs_game::replay::parse_original_rpl(d)?;
+        tracing::info!(track = setup.track, "original-format .rpl");
+        Some(nfs_game::replay::ReplayFile { setup, final_tick, stream })
+    })
+}
+
+/// An original `.rpl` names the car by its `nfs5.car` id only (§16.2): the model, the simulation
+/// and the first paint from the catalogue.
+fn resolve_replay_car(paths: &GamePaths, rs: &mut nfs_game::replay::ReplaySetup) {
+    if rs.car.is_empty()
+        && rs.car_id != 0
+        && let Ok(cat) = std::fs::read(paths.fe_data().join("Data").join("nfs5.car")).map_err(|e| tracing::warn!(error = %e, "nfs5.car"))
+        && let Ok(entries) = nfs_formats::fedata::parse_car_catalog(&cat)
+        && let Some(e) = entries.iter().find(|c| c.id == rs.car_id)
+    {
+        rs.car = e.model.clone();
+        rs.sim = e.sim.clone();
+        rs.paint = e.paint_sets.first().map(|p| p.colours[0]).unwrap_or([0xD4, 0x10, 0x10]);
     }
 }
 
@@ -9513,18 +10441,7 @@ fn main() -> Result<()> {
             let d = std::fs::read(p)
                 .map_err(|e| tracing::error!(error = %e, path = p, "replay unreadable"))
                 .ok()?;
-            nfs_game::replay::ReplayFile::parse(&d)
-                .or_else(|| {
-                    // an original-format `.rpl` (§6.1 + §16): the setup snapshot, the final tick and the
-                    // same stream, so the port can play one back as far as its own simulation matches
-                    let (setup, final_tick, stream) = nfs_game::replay::parse_original_rpl(&d)?;
-                    tracing::info!(path = p, track = setup.track, "original-format .rpl");
-                    Some(nfs_game::replay::ReplayFile {
-                        setup,
-                        final_tick,
-                        stream,
-                    })
-                })
+            read_replay_file(&d)
                 .or_else(|| {
                     tracing::error!(path = p, "not a replay file");
                     None
@@ -9573,23 +10490,8 @@ fn main() -> Result<()> {
         );
     }
     let mut replay_setup = replay_file.as_ref().map(|r| r.setup.clone());
-    // an original `.rpl` names the car by its `nfs5.car` id only (§16.2), so resolve the model and
-    // the simulation from the catalogue
-    if let Some(rs) = replay_setup.as_mut()
-        && rs.car.is_empty()
-        && rs.car_id != 0
-        && let Ok(cat) = std::fs::read(paths.fe_data().join("Data").join("nfs5.car"))
-            .map_err(|e| tracing::warn!(error = %e, "nfs5.car"))
-        && let Ok(entries) = nfs_formats::fedata::parse_car_catalog(&cat)
-        && let Some(e) = entries.iter().find(|c| c.id == rs.car_id)
-    {
-        rs.car = e.model.clone();
-        rs.sim = e.sim.clone();
-        rs.paint = e
-            .paint_sets
-            .first()
-            .map(|p| p.colours[0])
-            .unwrap_or([0xD4, 0x10, 0x10]);
+    if let Some(rs) = replay_setup.as_mut() {
+        resolve_replay_car(&paths, rs);
     }
     let track_name = replay_setup
         .as_ref()
@@ -9894,6 +10796,16 @@ fn main() -> Result<()> {
             repair_ticks: Default::default(),
             binding_base: None,
             parts_forced: false,
+            last_hover: None,
+            dialog: None,
+            dialog_forced: false,
+            dialog_answer: None,
+            replay_sel: 0,
+            user_sel: None,
+            cd_available: None,
+            cd_selected: None,
+            cd_title: 0,
+            cd_current: -1,
             cursor: None,
             // both of `Parts.AllParts`'s sections start closed (0x515190, 0x515193)
             parts_open: [false, false],
@@ -9987,6 +10899,7 @@ fn main() -> Result<()> {
         },
         // the original seeds the race RNG from the registry's RAND_SEED (replay.md §11); a replay
         // carries the seed so playback re-simulates the same traffic, police and AI
+        cheat_bits: 0,
         traffic_seed: match (
             &replay_setup,
             std::env::var("NFS_TRAFFIC_SEED")
@@ -10117,6 +11030,7 @@ fn main() -> Result<()> {
             sound_set,
             last_gear: 1,
             crash_played: false,
+            fe_sfx: None,
         },
         sim_name: sim_name.clone(),
         race_skill,
@@ -10128,6 +11042,8 @@ fn main() -> Result<()> {
     };
     // the player's key bindings are `fe.txt`'s `C1_*` lines (`nfs_input::bindings`)
     app.input.bindings = nfs_input::bindings::Bindings::from_registry(|k| app.registry.get(k));
+    // …and the profile's own, when it has saved any
+    app.apply_saved_controls();
     // every `<Axis>.Min` / `.Max` starts at 0 / 0x80 (0x51E546, 0x51E550)
     app.input.axis_bands = [[0, 0x80]; 8];
     event_loop.run_app(&mut app)?;

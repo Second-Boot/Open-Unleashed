@@ -7,6 +7,8 @@ pub mod camera;
 pub mod cameras;
 pub mod career;
 pub mod carparts;
+pub mod cheats;
+pub mod dialog;
 pub mod junctions;
 pub mod keyname;
 pub mod lanes;

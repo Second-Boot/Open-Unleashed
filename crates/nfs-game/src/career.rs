@@ -878,6 +878,30 @@ impl Career {
         Ok(offer)
     }
 
+    /// **0x4F9720(car)** — the "no" to an offer (807): the offer flag `+0x692` and amount `+0x694`
+    /// are cleared; the car stays listed.
+    pub fn decline_offer(&mut self, idx: usize) {
+        if let Some(c) = self.garage.get_mut(idx) {
+            c.offer = None;
+        }
+    }
+
+    /// The first garage car with a standing offer — what 0x4F9570's list gives the pre-race
+    /// screen's tick (0x505FCE), which asks about one at a time.
+    pub fn pending_offer(&self) -> Option<usize> {
+        self.garage.iter().position(|c| c.offer.is_some())
+    }
+
+    /// **0x503E40(id)** — forfeit: the tournament's event records are cleared
+    /// (0x503E83…0x503E9B), the same as 0x504BD0 does to a part-way one, so it starts over and
+    /// pays its fee again.
+    pub fn forfeit(&mut self, id: i16) {
+        if let Some(st) = self.tournaments.get_mut(&id) {
+            st.events.clear();
+            st.entered = false;
+        }
+    }
+
     /// `0x4F7E90` (run after every career race): score each listed car and, depending on the
     /// bracket, make an offer. `rand` yields the original's 16-bit LCG values.
     pub fn generate_offers(&mut self, tables: &CareerTables, rand: &mut impl FnMut() -> u32) {
@@ -951,6 +975,28 @@ impl Career {
         owned.parts.retain(|id| tables.parts.iter().find(|p| p.id == *id).map(|p| !(p.kind == part.kind && p.kind_name == part.kind_name)).unwrap_or(false));
         owned.parts.push(part_id);
         Ok(())
+    }
+
+    /// **0x504B60** — is a tournament other than `except` part-way through: some of its events
+    /// raced and not all (the count of event records with their done byte clear is `> 0` and
+    /// `< events`, 0x504B8B…0x504BA8). The start check 0x4D5AB1 asks it before letting the player
+    /// into another one (`FEStrings` 858).
+    pub fn partial_elsewhere(&self, tables: &CareerTables, except: i16) -> bool {
+        self.tournaments.iter().any(|(&id, st)| {
+            id != except
+                && tables.tournament(id).is_some_and(|t| !st.events.is_empty() && st.events.len() < t.events.len())
+        })
+    }
+
+    /// **0x504BD0** — the "yes" to 858: every part-way tournament but `except` has its event
+    /// records cleared (0x504C77…0x504C96), so it starts again from the first event and its fee.
+    pub fn reset_partial_except(&mut self, tables: &CareerTables, except: i16) {
+        for (&id, st) in self.tournaments.iter_mut() {
+            if id != except && tables.tournament(id).is_some_and(|t| !st.events.is_empty() && st.events.len() < t.events.len()) {
+                st.events.clear();
+                st.entered = false;
+            }
+        }
     }
 
     /// Index of the next event to race in `t`, or `None` when all are done.
@@ -1291,6 +1337,39 @@ mod tests {
 
     fn tables(ts: Vec<Tournament>) -> CareerTables {
         CareerTables { raw: Default::default(), tracks: vec![], tournaments: ts, parts: vec![], personalities: vec![], missions: vec![], strings: Strings::default(), catalog: vec![] }
+    }
+
+    /// 0x503E40 clears a forfeited tournament's records; 0x4F9720 drops an offer and keeps the
+    /// listing; the pre-race screen asks about the first car holding one.
+    #[test]
+    fn forfeit_and_offers() {
+        let r = EventResult { position: 1, prize: 0, bonus: 0, points: [0; 8], earned: [0; 8], times: [0; 8] };
+        let mut c = Career::default();
+        c.tournaments.entry(4).or_default().events.push(r);
+        c.forfeit(4);
+        assert!(c.state(4).events.is_empty());
+        c.garage.push(OwnedCar { car_id: 76, paint_set: 0, parts: vec![], mileage: 0, wins: 0, damage_pct: 0.0, damage: [0.0; 10], part_state: Vec::new(), setup: CAR_SETUP_DEFAULT, purchase_price: 0, asking_price: Some(9_000), offer: Some(8_000) });
+        assert_eq!(c.pending_offer(), Some(0));
+        c.decline_offer(0);
+        assert_eq!(c.pending_offer(), None);
+        assert_eq!(c.garage[0].asking_price, Some(9_000));
+    }
+
+    /// 0x504B60 / 0x504BD0: a tournament with some but not all events raced is "part-way"; the
+    /// selected one never counts, and the reset clears only the others.
+    #[test]
+    fn part_way_tournaments_and_their_reset() {
+        let t = tables(vec![tournament(1, 3, false), tournament(2, 3, false), tournament(3, 2, false)]);
+        let r = EventResult { position: 1, prize: 0, bonus: 0, points: [0; 8], earned: [0; 8], times: [0; 8] };
+        let mut c = Career::default();
+        c.tournaments.entry(1).or_default().events.push(r.clone());
+        c.tournaments.entry(3).or_default().events = vec![r.clone(), r.clone()]; // finished
+        assert!(c.partial_elsewhere(&t, 2));
+        assert!(!c.partial_elsewhere(&t, 1));
+        c.reset_partial_except(&t, 2);
+        assert!(c.state(1).events.is_empty());
+        assert_eq!(c.state(3).events.len(), 2);
+        assert!(!c.partial_elsewhere(&t, 2));
     }
 
     #[test]
