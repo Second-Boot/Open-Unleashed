@@ -4,7 +4,7 @@
 
 use glam::{Mat3, Vec3};
 use nfs_physics::collision::{Triangle, TriangleGrid};
-use nfs_physics::specs::CarSpecs;
+use nfs_physics::specs::{CarSpecs, CIRCLE_SOFTNESS, GRIP_DRY, GRIP_WET, SURFACE_BOUNCE};
 use nfs_physics::vehicle::{Controls, Vehicle};
 
 fn flat() -> TriangleGrid {
@@ -97,7 +97,6 @@ fn steady_state_cornering_radius() {
         run(&mut v, &specs, &grid, Controls { throttle: 254, ..Default::default() }, 6.0);
         let speed0 = v.speed();
         run(&mut v, &specs, &grid, Controls { throttle: 90, steer, ..Default::default() }, 3.0);
-        let p0 = v.position;
         let h0 = v.orientation.row(2);
         run(&mut v, &specs, &grid, Controls { throttle: 90, steer, ..Default::default() }, 1.0);
         let h1 = v.orientation.row(2);
@@ -379,4 +378,115 @@ fn the_orientation_update_is_the_originals_composition() {
             );
         }
     }
+}
+
+/// Read `nfs5.exe` and map a virtual address to a file offset, so a table the port transcribed can
+/// be compared with the bytes it was transcribed from. Minimal PE walking: `e_lfanew` at 0x3C, the
+/// COFF header, then the section whose virtual range holds the RVA.
+struct Image {
+    bytes: Vec<u8>,
+    sections: Vec<(u32, u32, u32)>, // rva, size, file offset
+}
+
+impl Image {
+    fn open() -> Option<Self> {
+        let home = std::env::var_os("HOME")?;
+        let p = std::path::PathBuf::from(home).join("Games/NFS-Porsche-Unleashed/game_info/data/nfs5.exe");
+        let bytes = std::fs::read(p).ok()?;
+        let u16at = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]) as usize;
+        let u32at = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+        let pe = u32at(0x3C) as usize;
+        let n = u16at(pe + 6);
+        let opt = u16at(pe + 20);
+        let table = pe + 24 + opt;
+        let sections = (0..n)
+            .map(|i| {
+                let s = table + i * 40;
+                (u32at(s + 12), u32at(s + 8), u32at(s + 20))
+            })
+            .collect();
+        Some(Self { bytes, sections })
+    }
+
+    fn at(&self, va: u32) -> usize {
+        let rva = va - 0x400000;
+        let (r, _, off) = *self
+            .sections
+            .iter()
+            .find(|(r, sz, _)| rva >= *r && rva < r + sz.max(&1))
+            .expect("the address is inside a section");
+        (off + (rva - r)) as usize
+    }
+
+    fn f32s(&self, va: u32, n: usize) -> Vec<f32> {
+        let o = self.at(va);
+        (0..n).map(|i| f32::from_le_bytes(self.bytes[o + i * 4..o + i * 4 + 4].try_into().unwrap())).collect()
+    }
+}
+
+/// **The four surface tables, against the bytes they were transcribed from.** These are the numbers
+/// every wheel's grip and every landing bounce comes out of, they are pure data at fixed addresses,
+/// and a slip in one of the 131 floats would be invisible in play and in every other test.
+///
+/// `GRIP_DRY` 0x5D0D50 and `GRIP_WET` 0x5D0E4C are `f32[16][3]` — surface type by car class, and the
+/// wet table is the dry one with its first two columns swapped for rows 1…11, which is worth knowing
+/// before trusting a hand copy of either. `SURFACE_BOUNCE` 0x5D0B94 is `f32[16][2]` and
+/// `CIRCLE_SOFTNESS` 0x5D0F58 the three friction-circle exponents (`physics.md` §3, `+0x1C0`).
+#[test]
+fn the_surface_tables_match_the_image() {
+    let Some(img) = Image::open() else { return };
+    let dry = img.f32s(0x5D0D50, 48);
+    let wet = img.f32s(0x5D0E4C, 48);
+    for row in 0..16 {
+        for col in 0..3 {
+            assert_eq!(GRIP_DRY[row][col], dry[row * 3 + col], "GRIP_DRY[{row}][{col}]");
+            assert_eq!(GRIP_WET[row][col], wet[row * 3 + col], "GRIP_WET[{row}][{col}]");
+        }
+    }
+    let bounce = img.f32s(0x5D0B94, 32);
+    for row in 0..16 {
+        for col in 0..2 {
+            assert_eq!(SURFACE_BOUNCE[row][col], bounce[row * 2 + col], "SURFACE_BOUNCE[{row}][{col}]");
+        }
+    }
+    assert_eq!(CIRCLE_SOFTNESS.to_vec(), img.f32s(0x5D0F58, 3));
+    // and the swap, because it is the thing a copy gets wrong
+    for row in 1..12 {
+        assert_eq!(wet[row * 3], dry[row * 3 + 1], "wet col 0 is dry col 1 on row {row}");
+        assert_eq!(wet[row * 3 + 1], dry[row * 3], "wet col 1 is dry col 0 on row {row}");
+        assert_eq!(wet[row * 3 + 2], dry[row * 3 + 2], "col 2 is shared on row {row}");
+    }
+}
+
+/// The clutch-slip state `car+0xDB8` must not stay set at speed. `Engine_update` 0x49E440 only
+/// enters its clutch block on `slip > 250` or on a car rolling **against** its gear, marks the axle
+/// spinning only when the slip passes an eighth of the redline, and on the throttle pulls the revs
+/// down by `min(slip, allow)` (`physics.md` §4.1a). Following a note that had those comparisons the
+/// wrong way round, the port kept the rear "spinning" on about 80 % of full-throttle ticks at every
+/// speed — heard in play as a constant wheelspin squeal. After the first twelve seconds of a
+/// full-throttle run a 993 is past 130 km/h in fifth and sixth, and the flag must be all but gone.
+#[test]
+fn the_rear_axle_does_not_spin_at_speed() {
+    let Some(specs) = specs_993() else { return };
+    let grid = flat();
+    let mut v = Vehicle::new(Vec3::new(0.0, 0.3, 0.0), Mat3::IDENTITY, &specs, 0.75, 0.3);
+    run(&mut v, &specs, &grid, Controls { brake: 254, ..Default::default() }, 1.5);
+    let full = Controls { throttle: 254, ..Default::default() };
+    run(&mut v, &specs, &grid, full, 12.0);
+    let (mut spin, mut n) = (0u32, 0u32);
+    for t in 0..(12.0 * 64.0) as u32 {
+        if t % 2 == 0 {
+            v.step32(&full, &specs, &grid);
+        }
+        v.step64(&specs);
+        if t % 32 == 0 {
+            v.renormalise();
+        }
+        spin += v.rear_spin as u32;
+        n += 1;
+    }
+    let share = spin as f32 / n as f32;
+    eprintln!("rear axle spinning on {:.1} % of ticks from 12 s to 24 s, ending at {:.0} km/h", 100.0 * share, v.speed() * 3.6);
+    assert!(v.speed() * 3.6 > 150.0, "the car should be well into its top gears");
+    assert!(share < 0.10, "the rear axle is marked spinning on {:.0} % of ticks at speed", 100.0 * share);
 }

@@ -262,6 +262,11 @@ impl TrafficCar {
             angular_velocity: self.angular_velocity,
             slice: self.slice,
             dir: self.dir,
+            // `car+0xEAC`, which `AI_resetState` 0x406D50 sets equal to `car+0xEB0` and only a
+            // behaviour asking for a U-turn moves. No traffic behaviour in this port does, so it
+            // stays equal and 0x409AAF's gate is always open — as it is in the original for a
+            // traffic car that has not been told to turn round.
+            requested_dir: self.dir,
             // `car+0x104C`, the gear the oscillator of §27.2a leaves it in
             sense: self.gear.sense,
             speed: self.speed,

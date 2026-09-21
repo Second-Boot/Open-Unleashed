@@ -711,6 +711,7 @@ impl CopCar {
             angular_velocity: self.angular_velocity,
             slice: self.slice,
             dir: self.dir,
+            requested_dir: self.requested_dir,
             sense: self.gear.sense,
             speed: self.speed,
             speed_est: self.speed_estimate(),

@@ -15,6 +15,7 @@
 //! keys: arrows = steer/throttle/brake, space = handbrake, C = camera, R = reset to track, Esc = quit
 //! ```
 
+mod accessors;
 mod career_ui;
 mod netplay;
 
@@ -69,6 +70,10 @@ struct Hud {
     /// track map (120×120 @ (0,358) in the original, an HRenderVisual top-down render; here the
     /// lap route rasterised once — MEDIUM) and its world→map projection (x0, z0, scale)
     map: Option<(TextureId, [f32; 3])>,
+    /// `HReplay`'s twelve glyphs from `DashHud/replay.fsh`, by the file's own index
+    /// (`RE/notes/hud.md` §5.2): 0 cam, 1 paus, 2 quit, 3 rest, 4 Irac, 5…8 the speed steps,
+    /// 9 save, 10 next, 11 play.
+    replay_glyphs: [Option<(TextureId, f32, f32)>; 12],
 }
 
 const MAP_PX: u32 = 120;
@@ -81,6 +86,15 @@ const COUNTDOWN_TICKS: [u64; 3] = [256, 320, 384];
 const HUD_REF_H: f32 = 480.0;
 const HUD_REF_W: f32 = 640.0;
 const HUD_ORANGE: [f32; 4] = [0.98, 0.706, 0.0, 1.0];
+/// **`HButtonVisual`'s two colour pairs** — 0x41B340, its vtable slot 6 (`RE/notes/hud.md` §5.3).
+/// The slot sets two colours per button: the plate through `0x419F50(&this+0x14, …)` and the glyph
+/// through `[this+0xF8]+0x24`. Idle (`this+0xFC == 0` and the pointer outside the box) is
+/// **0xFFBC0000** on the plate — the same dark red the `.lay` files give a button's `maincolor` —
+/// with a **white** glyph (0x41B4E0); hovered is **0xFFFAB400**, the HUD orange, with a **black**
+/// glyph (0x41B3F8), and crossing into the box once plays sound **9** (`0x4AADB0`, 0x41B3C4).
+/// This port has no in-race pointer, so only the idle pair is reachable.
+const HBUTTON_IDLE: [f32; 4] = [0.737, 0.0, 0.0, 1.0];
+const HBUTTON_IDLE_GLYPH: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 const HUD_GREY: [f32; 4] = [0.706, 0.706, 0.706, 1.0];
 
 impl Hud {
@@ -177,6 +191,7 @@ impl Hud {
             tach,
             white,
             map: None,
+            replay_glyphs: std::array::from_fn(|i| load_idx(r, "replay.fsh", Some(i), None)),
         })
     }
 
@@ -318,6 +333,36 @@ impl Hud {
             floored[2] as f32 / 255.0,
             1.0,
         ]
+    }
+
+    /// **`HReplay`'s control bar** — `RE/notes/hud.md` §5.2. Seven 21×18 cells of pitch 51, centred
+    /// and thirty pixels up from the bottom (`nfs_game::replay::control_bar`, which is 0x42DEF0's
+    /// arithmetic), each holding a `replay.fsh` glyph centred in its own box.
+    ///
+    /// `paused` picks `play` over `paus` in cell 2 (the original keeps both widgets, `this+0xC8` and
+    /// `this+0xCC`, and draws one — 0x42D31E switches on `this+0x199`), and `speed` picks one of the
+    /// four speed glyphs in cell 4. The frame the bar sits on is `this+0x164/+0x168`, three pixels up
+    /// and left of the first cell; the original draws it through the widget's own vtable, which this
+    /// port has not read, so it is the HUD's ordinary tray — **APPROXIMATION**, and the only part of
+    /// the bar that is.
+    fn replay_bar(&self, out: &mut Vec<Sprite>, aspect: f32, paused: bool, speed: nfs_game::replay::Speed) {
+        use nfs_game::replay::{cell_glyph_origin, control_bar, BAR, BAR_CELL, BAR_PITCH, BAR_PLAY};
+        let (cells, frame) = control_bar(HUD_REF_W, HUD_REF_H);
+        self.tray(out, aspect, frame.0, frame.1, 6.0 * BAR_PITCH + BAR_CELL.0 + 6.0, BAR_CELL.1 + 6.0);
+        for (i, cell) in cells.iter().enumerate() {
+            let c = BAR[i];
+            let glyph = match i {
+                2 if paused => BAR_PLAY,
+                4 => speed.bar_glyph(),
+                _ => c.glyph,
+            };
+            // the plate, in the idle colour
+            out.push(self.quad(aspect, cell.0, cell.1, BAR_CELL.0, BAR_CELL.1, HBUTTON_IDLE));
+            let Some((tex, _, _)) = self.replay_glyphs[glyph] else { continue };
+            let (x, y) = cell_glyph_origin(*cell, c.box_w, c.box_h);
+            let (pos, size) = Self::place(aspect, x, y, c.box_w, c.box_h);
+            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: HBUTTON_IDLE_GLYPH, rotation: 0.0, pivot: [0.5, 0.5] });
+        }
     }
 
     fn map_sprites(
@@ -761,7 +806,7 @@ impl App {
     fn range_value(&self, name: &str) -> Option<(i32, i32, i32)> {
         let (_, key, default, lo, hi) = RANGE_ACCESSORS.iter().find(|(n, ..)| *n == name)?;
         // the five audio levels are live state the mixers read every tick, so they come from there
-        let a = &self.audio_settings;
+        let a = &self.snd.audio_settings;
         let v = match name {
             "Audio.MusicLevel" => a.music_level as i32,
             "Audio.SfxLevel" => a.sfx_level as i32,
@@ -793,7 +838,7 @@ impl App {
     ///
     /// So each family here is enumerated from the very source this port already answers the
     /// combo's **caption** from, which is what makes it a reading rather than a guess: the car
-    /// combos from the car table the caption's `m.cars[m.car_idx]` indexes, the track combos from
+    /// combos from the car table the caption's `(*m.car()?)` indexes, the track combos from
     /// `m.tracks`, the paint combos from the selected car's paint sets, and the four counted
     /// settings from the clamps their own steppers carry. §4.91.
     /// Every car on the used-car lot — the vector at `[0x691B88]`. It holds **both** the cars the
@@ -809,7 +854,7 @@ impl App {
     /// The car the used-car screens are on — `UsedCar.Car`'s current row.
     fn used_car(&self) -> Option<&nfs_game::career::OwnedCar> {
         let all = self.used_cars();
-        all.get(self.usedcar_sel.min(all.len().saturating_sub(1))).copied()
+        all.get(self.fe.usedcar_sel.min(all.len().saturating_sub(1))).copied()
     }
 
     /// The catalogue records behind the player's garage, in save order — `OwnedCars.Car`'s own
@@ -829,7 +874,7 @@ impl App {
         let mut prev: Option<(u32, u32)> = None;
         for (i, e) in self.garage_cars().into_iter().enumerate() {
             let key = (e.era_string_id, e.class_string_id);
-            let heading = |id: u32| ListRow::GroupHeading(self.fe_strings.get(id).unwrap_or_default().to_uppercase());
+            let heading = |id: u32| ListRow::GroupHeading(self.fe.strings.get(id).unwrap_or_default().to_uppercase());
             match prev {
                 None => {
                     rows.push(heading(key.0));
@@ -856,7 +901,7 @@ impl App {
             Some((b, m)) => (b.trim(), m.trim_end_matches(')').trim()),
             None => (name, ""),
         };
-        let m = self.menu.as_ref()?;
+        let m = self.fe.menu.as_ref()?;
         let num = |lo: i64, hi: i64, cur: i64| {
             let rows = (lo..=hi).map(|v| ListRow::Text(v.to_string())).collect();
             Some((rows, Some((cur - lo).max(0) as usize)))
@@ -903,7 +948,7 @@ impl App {
                     .filter_map(|o| c.tables.car(o.car_id))
                     .map(|e| ListRow::Text(if modifier == "SHORT" { e.family.to_uppercase() } else { e.display_name.to_uppercase() }))
                     .collect::<Vec<_>>();
-                let cur = self.usedcar_sel.min(rows.len().saturating_sub(1));
+                let cur = self.fe.usedcar_sel.min(rows.len().saturating_sub(1));
                 Some((rows, Some(cur)))
             }
             // **`OpponentCar.Car` is not a car list.** `FEOpponentCarAccessor`'s row text
@@ -915,7 +960,7 @@ impl App {
             "OpponentCar.Car" => {
                 let rows = nfs_game::opponents::OpponentChoice::ROWS
                     .iter()
-                    .map(|c| ListRow::Text(self.fe_strings.get(c.string_id()).unwrap_or_default().to_uppercase()))
+                    .map(|c| ListRow::Text(self.fe.strings.get(c.string_id()).unwrap_or_default().to_uppercase()))
                     .collect();
                 Some((rows, Some((m.opp_car as usize).min(4))))
             }
@@ -960,12 +1005,12 @@ impl App {
             // its caption reads, and the traffic's `TRAFFIC_OPTIONS`' four
             "Track1.Direction" | "Knockout.Direction" => {
                 let b = if base == "Knockout.Direction" { m.ko.get(m.ko_sel).map_or(m.backwards, |k| k.backwards) } else { m.backwards };
-                let rows = DIRECTION_OPTIONS.iter().map(|id| ListRow::Text(self.fe_strings.get(*id).unwrap_or_default().to_string())).collect();
+                let rows = DIRECTION_OPTIONS.iter().map(|id| ListRow::Text(self.fe.strings.get(*id).unwrap_or_default().to_string())).collect();
                 Some((rows, Some(usize::from(b))))
             }
             "Knockout.Traffic" => {
                 let t = m.ko.get(m.ko_sel).map_or(m.traffic, |k| k.traffic);
-                let rows = TRAFFIC_OPTIONS.iter().map(|id| ListRow::Text(self.fe_strings.get(*id).unwrap_or_default().to_string())).collect();
+                let rows = TRAFFIC_OPTIONS.iter().map(|id| ListRow::Text(self.fe.strings.get(*id).unwrap_or_default().to_string())).collect();
                 Some((rows, Some((t as usize).min(3))))
             }
             "Knockout.Laps" => num(1, 10, m.ko.get(m.ko_sel).map_or(m.laps, |k| k.laps) as i64),
@@ -992,7 +1037,7 @@ impl App {
                 let cur = c.current().and_then(|t| list.iter().position(|x| x.id == t.id));
                 let rows = list
                     .iter()
-                    .map(|t| ListRow::Text(self.fe_strings.get(if modifier == "SHORT" { t.name_string_id } else { t.title_string_id }).unwrap_or_default().to_uppercase()))
+                    .map(|t| ListRow::Text(self.fe.strings.get(if modifier == "SHORT" { t.name_string_id } else { t.title_string_id }).unwrap_or_default().to_uppercase()))
                     .collect::<Vec<_>>();
                 (!rows.is_empty()).then(|| (rows, cur.or(Some(0))))
             }
@@ -1035,7 +1080,7 @@ impl App {
             // 0x5B4C64, two rows, the row text from 0x4B8770 — index 1 is `FEStrings` 0x2C0 = 704
             // "on" and anything else 0x2C1 = 705 "off". §4.102.
             "Game.Damage" => {
-                let rows = BOOL_OPTIONS.iter().map(|id| ListRow::Text(self.fe_strings.get(*id).unwrap_or_default().to_string())).collect();
+                let rows = BOOL_OPTIONS.iter().map(|id| ListRow::Text(self.fe.strings.get(*id).unwrap_or_default().to_string())).collect();
                 Some((rows, Some(usize::from(m.damage))))
             }
             // and the four counted settings, at the ranges their own steppers clamp to
@@ -1052,7 +1097,7 @@ impl App {
         let (index, options) = self.choice_index(base)?;
         let rows = options
             .iter()
-            .map(|id| ListRow::Text(self.fe_strings.get(*id).unwrap_or_default().to_string()))
+            .map(|id| ListRow::Text(self.fe.strings.get(*id).unwrap_or_default().to_string()))
             .collect();
         Some((rows, Some(index)))
     }
@@ -1210,6 +1255,30 @@ struct Menu {
 }
 
 impl Menu {
+    /// **The selected track, with the original's own out-of-range rule.** `FETrackAccessor`'s row
+    /// getters all guard the index the same way — 0x4FA5A0, 0x4FA5E0 and 0x4FA620 each take the
+    /// list's length as `(end − begin)/4` and, when the index is **not below** it, use **0**
+    /// instead (`cmp ; jb ; xor edi, edi`). Slot 28 does it to the accessor's own current index,
+    /// which is this. So a stale selection shows the first track rather than nothing — and rather
+    /// than the panic a bare `self.tracks[self.track_idx]` would be.
+    fn track(&self) -> &str {
+        let i = if self.track_idx < self.tracks.len() { self.track_idx } else { 0 };
+        self.tracks.get(i).map(String::as_str).unwrap_or("")
+    }
+
+    /// **The selected car, with the original's rule.** The car lists clamp in the *setter*, not the
+    /// getter: `FEGenericCarAccessor`'s slot 11, 0x4F3060, takes the count from its own slot 9,
+    /// compares the new index with `n − 1` and zeroes it when it is greater (0x4F3070/0x4F3072),
+    /// zeroes it again when it is negative (0x4F3078 → 0x4F308B), and then **re-measures the vector
+    /// and clamps a third time** (0x4F3087). Because the index can never be out of range, every
+    /// getter indexes freely. This port keeps its index in a field nothing clamps, so the clamp has
+    /// to live here — same effect for a read, and it is the eight `cars[car_idx]` panics that were
+    /// the alternative.
+    fn car(&self) -> Option<&nfs_formats::fedata::CarCatalogEntry> {
+        let i = if self.car_idx < self.cars.len() { self.car_idx } else { 0 };
+        self.cars.get(i)
+    }
+
     /// Keep the knockout location table as long as the opponent count, which is what
     /// `Knockout.TrackNumber`'s accessor measures it by (0x4BA786 reads `Game.NumKOOpponents`, and
     /// 0x4BA7CF answers the empty string for any row at or past it). A row that appears takes the
@@ -1288,13 +1357,13 @@ impl Menu {
             out.extend(f.sprites(&self.knockout_line, [0.08, 0.30], 0.045, sel(1)));
         } else {
             out.extend(f.sprites(
-                &format!("TRACK   < {} >", self.tracks[self.track_idx].to_uppercase()),
+                &format!("TRACK   < {} >", self.track().to_uppercase()),
                 [0.08, 0.30],
                 0.045,
                 sel(1),
             ));
         }
-        let c = &self.cars[self.car_idx];
+        let Some(c) = self.car() else { return Vec::new() };
         out.extend(f.sprites(
             &format!("CAR     < {} >", c.display_name.to_uppercase()),
             [0.08, 0.40],
@@ -1414,9 +1483,8 @@ impl Menu {
 
 struct App {
     paths: GamePaths,
-    menu: Option<Menu>,
-    /// menu kept for returning after a race
-    menu_template: Option<Menu>,
+    /// the front end's screens and per-screen state — see [`FrontEnd`]
+    fe: FrontEnd,
     career: Option<CareerUi>,
     /// opponents of the current career event (None = quick-race opponents)
     career_opponents: Option<Vec<CareerOpponent>>,
@@ -1435,7 +1503,6 @@ struct App {
     /// frames arrive at up to 120 Hz while the state advances at 64 Hz, so drawing the latest
     /// state directly makes the car (and the chase camera bolted to it) stutter.
     render_prev: Option<(Vec3, Quat)>,
-    opp_prev: Vec<(Vec3, Quat)>,
     /// Seconds since the previous frame (camera low-pass time constants).
     frame_dt: f32,
     paused: bool,
@@ -1449,17 +1516,8 @@ struct App {
     quick_knockout: bool,
     player_eliminated: bool,
     records: Records,
-    /// Input recording / playback (`RE/notes/replay.md`): the original records the four-byte
-    /// controller packet per 32 Hz frame and re-simulates everything else.
-    replay: Option<nfs_game::replay::Replay>,
-    replay_speed: nfs_game::replay::Speed,
-    replay_setup: nfs_game::replay::ReplaySetup,
-    replay_path: std::path::PathBuf,
-    replay_saved: bool,
-    /// Loop-iteration counter the playback-speed decimation of `replay.md` §5.1 indexes.
-    replay_loop: u64,
-    /// Ticks since a played-back stream ran out.
-    replay_end_ticks: u64,
+    /// recording and playback of the controller stream — see [`Playback`]
+    replay: Playback,
     /// Seed of the shared RNG for this race; travels with a replay so playback re-simulates the
     /// same traffic, police and AI.
     traffic_seed: u32,
@@ -1467,8 +1525,6 @@ struct App {
     player_name: String,
     /// `nfs5.car` id of the car being driven, for the replay snapshot's car slot.
     car_id: u16,
-    /// the roll-over crash sound fires once per roll-over
-    crash_played: bool,
     /// headless run (`--autotest`): the bot may reset itself when stuck
     scripted: bool,
     stuck_ticks: u32,
@@ -1485,11 +1541,6 @@ struct App {
     /// `--layout-sweep`: load every `.lay` in the game, draw it once, and report every widget that
     /// produced no sprite at all. The port's own measure of what the front end does not draw.
     layout_sweep: bool,
-    /// `Factory.ProfileNum` — which of the seven factory-team profiles `teamprofile.lay` shows.
-    /// The original registers the accessor with a default of 6 (0x4BA310); the port starts at 0 and
-    /// the screen has no control of its own to move it, so this only moves if something else sets
-    /// it. MEDIUM.
-    factory_profile: usize,
     /// `fe.txt`, for the multiple-choice accessors' saved indices.
     registry: nfs_formats::fetxt::Registry,
     /// The choices the player has changed on the options screens this session, by `fe.txt` key.
@@ -1499,23 +1550,11 @@ struct App {
     /// scripted drive before the screenshot: seconds of full throttle (steer right for the last third)
     autotest: Option<f32>,
     window: Option<Arc<Window>>,
-    /// where the pointer is, in **design** coordinates (640x480), or `None` when it is outside
-    /// the window. The front end is mouse-driven (`RE/notes/controls.md` §4.39); this is what
-    /// feeds `LayoutScreen::set_cursor`.
-    cursor: Option<(f32, f32)>,
     renderer: Option<Renderer>,
     world: Option<TrackWorld>,
     car_model: Option<CarModel>,
     /// the cockpit view's eye point from the player car's `.tpg`, when it has one
     driver_cam: Option<nfs_assets::car::DriverCam>,
-    /// the front end's 3D room and the car standing in it (`RE/notes/frontend-3d.md`), each keyed
-    /// by the model name so a screen change only reloads what actually changed
-    fe_room: Vec<(String, CarModel)>,
-    /// the cars standing in the front end: the room's own (`usize::MAX`) and one per
-    /// `NFS5.3DCAR` widget with a `positiontype` of its own
-    fe_cars: Vec<(usize, String, CarModel)>,
-    /// milliseconds the front end has been up, for the turntable
-    fe_ms: u64,
     sky: Option<Sky>,
     scene: Scene,
     camera: Camera,
@@ -1543,71 +1582,15 @@ struct App {
     glare_draw: Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
     /// trackside cameras and the triggers that switch them (`RE/notes/race-logic.md` §3.3)
     track_cameras: Option<nfs_game::cameras::TrackCameras>,
-    /// tunnel reverb level (`engine-audio.md` §4.7)
-    reverb: nfs_audio::reverb::Reverb,
     /// environment map currently bound on the car materials
     env_bound: Option<nfs_renderer::TextureId>,
     slices: Option<SliceTable>,
     race: Option<RaceProgress>,
-    /// opponents (parked until the AI rules are implemented) with their own models
-    opponents: Vec<RaceCar>,
-    opponent_models: Vec<CarModel>,
-    /// `--layout <name>`: draw a `FEData/Layouts/<name>.lay` screen instead of the menu
-    layout_preview: Option<nfs_game::layout::LayoutScreen>,
-    /// `bottombar.lay`, which the front end loads once and draws over every screen (0x4D39D3).
-    layout_bottom: Option<nfs_game::layout::LayoutScreen>,
-    /// `FEData/Locale/FEStrings.csv`, for the layout string ids
-    fe_strings: nfs_formats::locale::Strings,
-    /// `Parts.AllParts`'s two collapsible sections, `[this+0x2C]` and `[this+0x2D]` — both
-    /// **false** out of the constructor (0x515190, 0x515193), so the list opens as two header
-    /// rows and a click on one flips it (0x51548B / 0x5154B2)
-    parts_open: [bool; 2],
-    layout_name: Option<String>,
-    /// selected button on the previewed screen, and the screens we came from
-    layout_sel: usize,
-    /// the combo whose list is open, by the flattened index `combo_sliders` uses
-    layout_open_combo: Option<usize>,
-    /// a list whose scrollbar knob is being dragged: which list, where the grab was, and the
-    /// position it was on — `[this+0x104]` and `[this+0x108]` in the original (0x4D0973)
-    list_drag: Option<(usize, f32, usize)>,
-    /// a held scrollbar arrow: which list, which way, and how long since the last step
-    list_repeat: Option<(usize, i32, u32)>,
-    layout_stack: Vec<String>,
-    /// kinematic traffic (`nfs_game::traffic`), rebuilt with the scene
-    traffic: Option<TrafficSet>,
-    traffic_models: Vec<CarModel>,
-    /// engine sound set per opponent (`nfs5.car +0x179`), for the AI engine loops
-    opponent_sets: Vec<String>,
-    /// engine sound set per traffic car, same source
-    traffic_sets: Vec<String>,
-    /// paint colour per opponent, for the HUD map blips
-    opponent_paints: Vec<[u8; 3]>,
-    /// paint colour per traffic car, same use
-    traffic_paints: Vec<[u8; 3]>,
-    /// police: the spawn manager, the cop cars and their models (`traffic.md` §17, §25, §27)
-    police: Option<nfs_game::police::Police>,
-    police_models: Vec<CarModel>,
-    police_prev: Vec<(Vec3, Quat)>,
-    police_bodies: Vec<Vehicle>,
-    /// whether the race was set up with police at all (`COPS`)
-    cops_enabled: bool,
-    ai_engines: Option<nfs_audio::ai_engine::AiEngines>,
-    ambience: Option<nfs_audio::ambience::Ambience>,
-    traffic_prev: Vec<(Vec3, Quat)>,
-    /// one rigid body per traffic car, re-synced from the kinematic state every AI tick so the shared
-    /// car-vs-car solver can be used unchanged (`traffic.md` §21.5)
-    traffic_bodies: Vec<Vehicle>,
-    /// `default.sim` — what `Car_loadSim` 0x49C6C0 falls back to for a car with no sim name (§21.1)
-    traffic_specs: Option<CarSpecs>,
-    /// wheel roll angle per traffic car (radians), integrated from the distance driven
-    traffic_spin: Vec<f32>,
-    /// number of traffic cars this race was set up with
-    traffic_count: u32,
+    /// the other cars on the road — opponents, traffic, police — see [`RoadCars`]
+    road: RoadCars,
     racing_line: Option<nfs_formats::ais::RacingLine>,
-    /// `--net host[:PORT]` / `--net join:HOST[:PORT]` — network play (`netplay`, `network.md` §7).
-    net: Option<netplay::NetPlay>,
-    /// The front end's side of it, alive while one of the four network layouts is open.
-    lobby: Option<netplay::Lobby>,
+    /// network play — see [`Network`]
+    net: Network,
     num_opponents: u32,
     player_grid: u32,
     player_progress_tick: u64,
@@ -1627,11 +1610,31 @@ struct App {
     dials: Option<(nfs_formats::fedata::DialSpec, nfs_formats::fedata::DialSpec)>,
     /// player body paint (catalogue set 0 by default)
     paint: [u8; 3],
+    /// everything that makes a sound — see [`AudioState`]
+    snd: AudioState,
+    /// `.sim` name — also the name of the car's `.spl` engine-audio parameters
+    sim_name: String,
+    /// `SKILL [0x6573F4]` 0..2: `fe.txt skill` for a quick race, the event's `Game.Difficulty` in career
+    race_skill: u8,
+    last_frame: Instant,
+    accumulator: Duration,
+    tick: u64,
+    frames: u32,
+    fps_timer: Instant,
+}
+
+/// The sound half of [`App`]: the output device and every voice that plays through it — the
+/// player's engine, the AI and traffic engine loops, the collision and squeal sounds, the
+/// ambience, the reverb, music and speech — with the settings they are mixed by. Split out of
+/// `App` on 2026-09-21; every field kept its name, so `self.x` became `self.snd.x`.
+struct AudioState {
     audio: Option<nfs_audio::AudioOutput>,
     engine_sound: Option<nfs_audio::engine::EngineSound>,
     sfx: Option<nfs_audio::sfx::CollisionSfx>,
-    /// player gear on the previous tick (shift click)
-    last_gear: usize,
+    ai_engines: Option<nfs_audio::ai_engine::AiEngines>,
+    ambience: Option<nfs_audio::ambience::Ambience>,
+    /// tunnel reverb level (`engine-audio.md` §4.7)
+    reverb: nfs_audio::reverb::Reverb,
     music: Option<nfs_audio::music::MusicPlayer>,
     /// The song names in `GameData/Music`, read once at start-up. The CD-player screen needs them
     /// in the **front end**, where there is no `MusicPlayer` yet — the original plays menu music
@@ -1642,6 +1645,131 @@ struct App {
     music_lengths: Vec<u32>,
     /// `fe.txt` audio settings (playlist, shuffle, the five level sliders)
     audio_settings: nfs_audio::music::Settings,
+    speech: Option<nfs_audio::speech::Speech>,
+    countdown_said: u8,
+    /// the catalogue sound set of the car being driven (`nfs5.car +0x179`)
+    sound_set: String,
+    /// player gear on the previous tick (shift click)
+    last_gear: usize,
+    /// the roll-over crash sound fires once per roll-over
+    crash_played: bool,
+}
+
+/// Everyone else on the road, split out of [`App`] on 2026-09-21: the opponents, the traffic and
+/// the police, each with its models, bodies, previous poses and per-car sound set and paint.
+/// The fields kept their names, so `self.x` became `self.road.x`.
+struct RoadCars {
+    /// opponents (parked until the AI rules are implemented) with their own models
+    opponents: Vec<RaceCar>,
+    opponent_models: Vec<CarModel>,
+    /// opponent poses before the last physics tick, as `App::render_prev` is for the player
+    opp_prev: Vec<(Vec3, Quat)>,
+    /// kinematic traffic (`nfs_game::traffic`), rebuilt with the scene
+    traffic: Option<TrafficSet>,
+    traffic_models: Vec<CarModel>,
+    /// engine sound set per opponent (`nfs5.car +0x179`), for the AI engine loops
+    opponent_sets: Vec<String>,
+    /// engine sound set per traffic car, same source
+    traffic_sets: Vec<String>,
+    /// paint colour per opponent, for the HUD map blips
+    opponent_paints: Vec<[u8; 3]>,
+    /// paint colour per traffic car, same use
+    traffic_paints: Vec<[u8; 3]>,
+    /// police: the spawn manager, the cop cars and their models (`traffic.md` §17, §25, §27)
+    police: Option<nfs_game::police::Police>,
+    police_models: Vec<CarModel>,
+    police_prev: Vec<(Vec3, Quat)>,
+    police_bodies: Vec<Vehicle>,
+    /// whether the race was set up with police at all (`COPS`)
+    cops_enabled: bool,
+    traffic_prev: Vec<(Vec3, Quat)>,
+    /// one rigid body per traffic car, re-synced from the kinematic state every AI tick so the shared
+    /// car-vs-car solver can be used unchanged (`traffic.md` §21.5)
+    traffic_bodies: Vec<Vehicle>,
+    /// `default.sim` — what `Car_loadSim` 0x49C6C0 falls back to for a car with no sim name (§21.1)
+    traffic_specs: Option<CarSpecs>,
+    /// wheel roll angle per traffic car (radians), integrated from the distance driven
+    traffic_spin: Vec<f32>,
+    /// number of traffic cars this race was set up with
+    traffic_count: u32,
+}
+
+/// Replay, split out of [`App`] on 2026-09-21. The fields dropped their redundant `replay_`
+/// prefix: `self.replay` is `self.replay.stream`, `self.replay_speed` is `self.replay.speed`,
+/// and `replay_loop` became `loop_count`.
+struct Playback {
+    /// Input recording / playback (`RE/notes/replay.md`): the original records the four-byte
+    /// controller packet per 32 Hz frame and re-simulates everything else.
+    stream: Option<nfs_game::replay::Replay>,
+    speed: nfs_game::replay::Speed,
+    setup: nfs_game::replay::ReplaySetup,
+    path: std::path::PathBuf,
+    saved: bool,
+    /// Loop-iteration counter the playback-speed decimation of `replay.md` §5.1 indexes.
+    loop_count: u64,
+    /// Ticks since a played-back stream ran out.
+    end_ticks: u64,
+}
+
+/// Network play, split out of [`App`] on 2026-09-21: the running session and the front end's
+/// lobby. `self.net` became `self.net.session`; `self.lobby` became `self.net.lobby`.
+struct Network {
+    /// `--net host[:PORT]` / `--net join:HOST[:PORT]` — network play (`netplay`, `network.md` §7).
+    session: Option<netplay::NetPlay>,
+    /// The front end's side of it, alive while one of the four network layouts is open.
+    lobby: Option<netplay::Lobby>,
+}
+
+/// The front end's half of [`App`]: the menu and the layout screens it shows, the 3D room and
+/// the cars standing in it, the pointer, and every piece of per-screen state the original keeps
+/// in its screen and widget objects — the open combo, a dragged or held scrollbar, the chronicle
+/// column, the used-car and parts rows, the repair basket. Split out of `App` on 2026-09-21;
+/// the fields kept their names apart from dropping a redundant `fe_` (`fe_room` is `room`),
+/// so `self.x` became `self.fe.x`.
+struct FrontEnd {
+    menu: Option<Menu>,
+    /// menu kept for returning after a race
+    menu_template: Option<Menu>,
+    /// `Factory.ProfileNum` — which of the seven factory-team profiles `teamprofile.lay` shows.
+    /// The original registers the accessor with a default of 6 (0x4BA310); the port starts at 0 and
+    /// the screen has no control of its own to move it, so this only moves if something else sets
+    /// it. MEDIUM.
+    factory_profile: usize,
+    /// where the pointer is, in **design** coordinates (640x480), or `None` when it is outside
+    /// the window. The front end is mouse-driven (`RE/notes/controls.md` §4.39); this is what
+    /// feeds `LayoutScreen::set_cursor`.
+    cursor: Option<(f32, f32)>,
+    /// the front end's 3D room and the car standing in it (`RE/notes/frontend-3d.md`), each keyed
+    /// by the model name so a screen change only reloads what actually changed
+    room: Vec<(String, CarModel)>,
+    /// the cars standing in the front end — the room's own (`usize::MAX`) and one per
+    /// `NFS5.3DCAR` widget with a `positiontype` of its own — each with the model file, **body
+    /// style** and paint it was built with, and the uploaded model. The last three are all part of
+    /// the reload key — see `fe_room_models`.
+    cars: Vec<(usize, String, i16, [u8; 3], CarModel)>,
+    /// milliseconds the front end has been up, for the turntable
+    ms: u64,
+    /// `--layout <name>`: draw a `FEData/Layouts/<name>.lay` screen instead of the menu
+    layout_preview: Option<nfs_game::layout::LayoutScreen>,
+    /// `bottombar.lay`, which the front end loads once and draws over every screen (0x4D39D3).
+    layout_bottom: Option<nfs_game::layout::LayoutScreen>,
+    /// `FEData/Locale/FEStrings.csv`, for the layout string ids
+    strings: nfs_formats::locale::Strings,
+    /// `Parts.AllParts`'s two collapsible sections, `[this+0x2C]` and `[this+0x2D]` — both
+    /// **false** out of the constructor (0x515190, 0x515193), so the list opens as two header
+    /// rows and a click on one flips it (0x51548B / 0x5154B2)
+    parts_open: [bool; 2],
+    layout_name: Option<String>,
+    /// selected button on the previewed screen, and the screens we came from
+    layout_sel: usize,
+    /// the combo whose list is open, by the flattened index `combo_sliders` uses
+    layout_open_combo: Option<usize>,
+    /// a list whose scrollbar knob is being dragged: which list, where the grab was, and the
+    /// position it was on — `[this+0x104]` and `[this+0x108]` in the original (0x4D0973)
+    list_drag: Option<(usize, f32, usize)>,
+    /// a held scrollbar arrow: which list, which way, and how long since the last step
+    list_repeat: Option<(usize, i32, u32)>,
+    layout_stack: Vec<String>,
     /// the `NFS5.GouraudIndicatorBar` the pointer took — `FeGouraudIndicatorBar`'s slot 8 asks
     /// 0x4C7DD0 for focus before it drags, and the press is what grants it (§4.81)
     bar_grab: Option<String>,
@@ -1670,18 +1798,11 @@ struct App {
     /// which of `repair.lay`'s ten `QUICKFIX.*` boxes are ticked — the ten bool accessors
     /// registered at 0x4F252A…0x4F258B, all of which start **false** (§4.84, §4.95)
     repair_ticks: std::collections::BTreeSet<&'static str>,
-    speech: Option<nfs_audio::speech::Speech>,
-    countdown_said: u8,
-    sound_set: String,
-    /// `.sim` name — also the name of the car's `.spl` engine-audio parameters
-    sim_name: String,
-    /// `SKILL [0x6573F4]` 0..2: `fe.txt skill` for a quick race, the event's `Game.Difficulty` in career
-    race_skill: u8,
-    last_frame: Instant,
-    accumulator: Duration,
-    tick: u64,
-    frames: u32,
-    fps_timer: Instant,
+    /// the pads as they were when a binding row took focus — the baseline 0x51F310 copies into
+    /// `[[0x69C9E8]]`, which the capture 0x51F3B0 compares against every frame (§4.117)
+    binding_base: Option<Vec<nfs_input::bindings::PadRecord>>,
+    /// `NFS_FE_PARTS` has been applied (see `fe_car_parts_step`)
+    parts_forced: bool,
 }
 
 /// The layouts that speak to the network. Their `callbacklist=` ids are `ID_COMMSSERVERSCREEN`,
@@ -1758,13 +1879,14 @@ impl App {
                 personalities: k.opponents.iter().map(|o| o.personality).collect(),
             });
         let playlist: Vec<u32> = self
+            .snd
             .audio_settings
             .playlist
             .iter()
             .map(|i| *i as u32)
             .collect();
         // what the settings screens hold, for the save's accessor block
-        let a = &self.audio_settings;
+        let a = &self.snd.audio_settings;
         let settings = nfs_game::save::SavedSettings {
             music: a.music_level,
             sfx: a.sfx_level,
@@ -1776,17 +1898,17 @@ impl App {
                 .iter()
                 .position(|v| (v - self.detail).abs() < 0.01)
                 .unwrap_or(3) as u8,
-            laps: self.menu.as_ref().map(|m| m.laps).unwrap_or(self.num_laps),
+            laps: self.fe.menu.as_ref().map(|m| m.laps).unwrap_or(self.num_laps),
             opponents: self
-                .menu
+                .fe.menu
                 .as_ref()
                 .map(|m| m.opponents)
                 .unwrap_or(self.num_opponents),
-            traffic: self.menu.as_ref().map(|m| m.traffic).unwrap_or(0),
-            ko_opponents: self.menu.as_ref().map(|m| m.ko_opponents).unwrap_or(4),
+            traffic: self.fe.menu.as_ref().map(|m| m.traffic).unwrap_or(0),
+            ko_opponents: self.fe.menu.as_ref().map(|m| m.ko_opponents).unwrap_or(4),
             // the sixteen dead-zone values as the screen has them, for pad 0
             deadzone: self
-                .layout_preview
+                .fe.layout_preview
                 .as_ref()
                 .map(|l| l.deadzone_values().map(|p| [p[0] as u32, p[1] as u32]))
                 .unwrap_or([[0, 0x80]; 8]),
@@ -1798,605 +1920,18 @@ impl App {
         }
     }
 
-    /// Abandon the running race and go back to the menu; `false` when there is no menu to go back
-    /// to (the app was started straight into a race).
-    /// Values for the front-end accessors an `NFS5.AccessorWatch` can name. Only the ones the port
-    /// actually has state for are answered; anything else returns `None` and the watch is left
-    /// blank rather than filled with something invented. The `(MODIFIER)` suffix the layouts use
-    /// (`OwnedCars.Car(SHORT)`) selects a shorter form of the same value.
-    fn accessor_value(&self, name: &str) -> Option<String> {
-        let (base, modifier) = match name.split_once('(') {
-            Some((b, m)) => (b.trim(), m.trim_end_matches(')')),
-            None => (name, ""),
-        };
-        let menu = self.menu.as_ref();
-        let career = self.career.as_ref();
-        Some(match base {
-            "Showcase.Text" => self.showcase_text(modifier.parse::<usize>().ok()?)?,
-            // the tournament screen. Each field is one the `nfs5.trn` record already carries, and
-            // `(LOCATION)` is what 0x506992 makes it: the accessor looks up
-            // `Tournament.RemainingTracks`, calls its vtable +0x70 for an id and hands that to the
-            // `FEStrings` lookup 0x4E06D0 — the name of the event the tournament is on.
-            //
-            // `(DIFFICULTY)` is `FEStrings[450 + n]` (0x506823 adds 0x1C2 to a two-byte field and
-            // looks it up), and 450…452 are the three names `Game.Difficutly` uses. The port takes
-            // `n` from the record's `+0xE6`, which is the difficulty it already parsed; the getter
-            // reads `+0x78` of a run-time object instead, so the two are **MEDIUM**, not confirmed
-            // to be the same field.
-            // the bare accessor's caption is its own row 0 — slot 4 (0x4BC4E0) hands `[this+0x18]`,
-            // which starts at 0 (0x4BC224), to the row-text slot. §4.105.
-            "Tournament.RemainingTracks" if modifier.is_empty() => {
-                let c = self.career.as_ref()?;
-                let t = c.current()?;
-                let done = c.career.tournaments.get(&t.id).map_or(0, |s| s.events.len());
-                c.tables.track_name(t.events.get(done)?.track_id).to_uppercase()
-            }
-            "Tournament.Tournament" => {
-                let c = self.career.as_ref()?;
-                let t = c.current()?;
-                match modifier {
-                    "SHORT" | "" => self.fe_strings.get(t.name_string_id)?.to_uppercase(),
-                    "DESCRIPTION" => self.fe_strings.get(t.description_string_id)?.to_string(),
-                    "CARRESTRICTION" => self.fe_strings.get(t.restriction_string_id)?.to_string(),
-                    // 0x50666D and 0x506749: both are `sprintf("%s", 0x4DBF80(value))` — the
-                    // money formatter's thousands commas and **no currency sign**. Nothing in the
-                    // image formats one: there is no `$%d` or `$%s` anywhere in it, and 0x4DBF80's
-                    // own format strings are `FEStrings` 1700…1703, `"%d,%03d,%03d"` and their
-                    // signed and quoted variants. The `$` this port printed was its own.
-                    "ENTRYFEE" => with_thousands(t.entry_fee as i64),
-                    "PRIZEMONEY" => with_thousands(*t.prize.first()? as i64),
-                    "DIFFICULTY" => self.fe_strings.get(450 + t.difficulty_level.min(2) as u32)?.to_string(),
-                    "LOCATION" => {
-                        // the event the tournament is on: the first one the player has not finished
-                        let done = c.career.tournaments.get(&t.id).map_or(0, |s| s.events.len());
-                        let ev = t.events.get(done.min(t.events.len().saturating_sub(1)))?;
-                        c.tables.track_name(ev.track_id).to_uppercase()
-                    }
-                    // the record on the track the tournament is on. 0x506895 asks
-                    // `Tournament.RemainingTracks` for the current track id, 0x4FB120 finds that
-                    // `nfs5.trk` record and answers `record + 0x1B0` — the **first** record-holder
-                    // entry, the fastest — and 0x5068BB takes its `+0x48`, the time, into the
-                    // formatter 0x4356E0.
-                    "RECORDTIME" => {
-                        let done = c.career.tournaments.get(&t.id).map_or(0, |s| s.events.len());
-                        let ev = t.events.get(done.min(t.events.len().saturating_sub(1)))?;
-                        format_lap_time(c.tables.track(ev.track_id)?.records.first()?.time)
-                    }
-                    // `"%d"` of `trn+0xD3C` (0x506929), the tournament's own completion counter
-                    "TIMESCOMPLETED" => c.career.tournaments.get(&t.id).map_or(0, |s| s.completions).to_string(),
-                    _ => return None,
-                }
-            }
-            // the end-of-era lines on `VictoryMessage.lay`. Both read the era's finale tournament
-            // record: `ENDERAHEADER` is `FEStrings[[rec+0x24]]` (0x506389) and `ENDERADESCRIP`
-            // `FEStrings[[rec+0x28]]` (0x5063DE), and +0x24 and +0x28 are the port's
-            // `title_string_id` and `description_string_id`. The record is what
-            // `0x504990(0x504800())` returns; the port takes the era's hidden finale, which its
-            // own `visibility == 2` marks.
-            // the price of the car the dealer screen is on: 0x5062FC takes `DealerCar.Car`, asks it
-            // for the record (vtable +0x90), runs it through the age curve 0x4EE220 — which is the
-            // port's own `dealer_price` — and prints the result with 0x4DBF80's thousands commas.
-            // `0x506250`'s first arm: `"CASH"` is `0x4DBF80(0x5012D0())` — the player's money
-            // through the thousands formatter. `NFS5.ACCOUNTTHING` is its only consumer (§4.128).
-            "Tournament.Data" if modifier == "CASH" => with_thousands(career?.career.money as i64),
-            "Tournament.Data" if modifier == "DEALERCARPRICE" => {
-                let c = self.career.as_ref()?;
-                let car = self.logo_car(Some("DealerCar.Car"), None)?;
-                with_thousands(car.dealer_price(c.career.year) as i64)
-            }
-            "Tournament.Data" if matches!(modifier, "ENDERAHEADER" | "ENDERADESCRIP") => {
-                let c = self.career.as_ref()?;
-                let list = c.tables.era_tournaments(c.career.era);
-                let t = list.iter().find(|t| t.visibility == 2).or_else(|| list.last())?;
-                let id = if modifier == "ENDERAHEADER" { t.title_string_id } else { t.description_string_id };
-                self.fe_strings.get(id)?.to_string()
-            }
-            // the factory-drive mission the career is on (`missionbrief.lay`, `missionmap.lay`).
-            // `NARRNAME` is `FEStrings[(i16)[mission+0x1E] + 0x9C4]` — 0x519DCA reads the field and
-            // 0x519DCE adds 2500 — `MISSONDESC` is `FEStrings[[mission+0]]`, the id 0x519D67 loads
-            // straight out of the record, and `ENDOFLEVEL` is `FEStrings[[record+0xC]]` (0x519E31).
-            // All three offsets are ones the port already parses: `narrator` at +0x1E,
-            // `intro_string_id` at +0 and `promotion_string_id` at +0x0C.
-            "Factory.Data" if matches!(modifier, "NARRNAME" | "MISSONDESC" | "TRACKNAME" | "ENDOFLEVEL") => {
-                let c = self.career.as_ref()?;
-                let m = &c.tables.missions[c.career.current_mission(&c.tables)?];
-                match modifier {
-                    "NARRNAME" => self.fe_strings.get(2500 + m.narrator.max(0) as u32)?.to_string(),
-                    "MISSONDESC" => self.fe_strings.get(m.intro_string_id)?.to_string(),
-                    // the promotion line at the end of a stage: 0x519E31 reads `[record+0xC]` and
-                    // looks it up, and +0x0C is the port's `promotion_string_id`
-                    "ENDOFLEVEL" => self.fe_strings.get(m.promotion_string_id)?.to_string(),
-                    _ => c.tables.track_name(m.track_id).to_uppercase(),
-                }
-            }
-            // one of the factory team's profiles (`teamprofile.lay`). Each getter ends in the same
-            // `FEStrings` lookup with the profile index scaled by four: `profilename` is
-            // `0xDAD + 4n` (0x519F1F), `profiletitle` `0xDAE + 4n` (0x519FBD), `profileage`
-            // `0xDAF + 4n` (0x519F6E) and `profiledesc` the next — 3501 "Dieter", 3502 "Porsche
-            // Executive", 3503 "45", 3504 his description, then the same four for Billy.
-            // CONFIRMED, and `FEStrings.csv` carries exactly 28 of them: seven profiles.
-            "Factory.Data" => {
-                let base = match modifier {
-                    "profilename" => 3501,
-                    "profiletitle" => 3502,
-                    "profileage" => 3503,
-                    "profiledesc" => 3504,
-                    _ => return None,
-                };
-                self.fe_strings.get(base + 4 * self.factory_profile as u32)?.to_string()
-            }
-            // a range setting the port has no other state for — the force-feedback volumes and
-            // the gamma — shows its number
-            // A range setting asked for as a per cent. `FEAccessor::text("PERCENT")` is
-            // 0x4BC558…0x4BC5F0: with a list of one entry or none it answers a flat **100**
-            // (0x4BC5D8), otherwise `index · 100 / (count − 1)` (0x4BC5A5…0x4BC5C1) **clamped at
-            // 100** (0x4BC5C7), printed with a bare `"%d"` — no per-cent sign. An int range's
-            // index is the value less its minimum and its count is `max − min + 1` (0x4BA329,
-            // 0x4BA34A), so this works out to `(v − min) · 100 / (max − min)`.
-            //
-            // The sign on screen is the layout's, not the accessor's: `audioreal.lay` carries five
-            // `text=%` labels beside its five `(PERCENT)` watches and `advgraphics.lay` one beside
-            // its one, so appending a `%` here printed it twice.
-            _ if modifier == "PERCENT" && RANGE_ACCESSORS.iter().any(|(n, ..)| *n == base) => {
-                let (v, lo, hi) = self.range_value(base)?;
-                if hi <= lo {
-                    "100".to_string()
-                } else {
-                    ((v - lo) * 100 / (hi - lo)).min(100).to_string()
-                }
-            }
-            "FF.TotalVolume" | "FF.RoadVolume" | "FF.EngineVolume" | "FF.CollisionVolume"
-            | "FF.RoadGripVolume" | "Graphics.GammaCorrection" => self.range_value(base)?.0.to_string(),
-            // a multiple-choice setting: the text is the `FEStrings` entry its chosen index names
-            _ if CHOICE_ACCESSORS.iter().any(|(n, _, _)| *n == base) => {
-                let (i, options) = self.choice_index(base)?;
-                self.fe_strings.get(options[i])?.to_string()
-            }
-            // the car-compare screen's five numbers — `CarCompare.Data(<n>CarCompareCar<m>)`, the
-            // same source name its bars read (`fn compare_rating`)
-            // 0x50E94C prints it with **`"%02d"`** — a rating under ten reads `05`, not `5`
-            "CarCompare.Data" => format!("{:02}", self.compare_rating(modifier)?),
-            // the network screens (`netplay::Lobby`): the names come out of the layouts themselves
-            "Comms.IP" => self.lobby.as_ref()?.ip.clone(),
-            "Comms.Data" => {
-                // once a session is open the lobby screens read from it, not from the browser
-                if let Some(n) = self.net.as_ref() {
-                    return Some(match modifier {
-                        "GAMENAME" => n.game_name(),
-                        "MYIPADDRESS" => n.my_address(),
-                        "POSITIONALUPDATES" => if n.positional { "ON" } else { "OFF" }.to_string(),
-                        "TRACKNAME" => menu.map(|m| m.tracks[m.track_idx].to_uppercase())?,
-                        "TRACKLAPS" => menu?.laps.to_string(),
-                        "TRACKDIRECTION" => if menu?.backwards {
-                            "REVERSE"
-                        } else {
-                            "FORWARD"
-                        }
-                        .to_string(),
-                        _ => return None,
-                    });
-                }
-                let l = self.lobby.as_ref()?;
-                match modifier {
-                    "GAMENAME" => l.game_name(),
-                    // `[desc+0x44]` copies the socket's own record out of `sock+0x08` (0x5878F0)
-                    "MYIPADDRESS" => l.my_address(),
-                    // the `0xBE` broadcast of §5.2, which `Comms.Positional` switches
-                    "POSITIONALUPDATES" => if l.positional { "ON" } else { "OFF" }.to_string(),
-                    // the race the host chose. Which message carries it to a joiner has not been
-                    // traced, so these show this machine's own settings and no more.
-                    "TRACKNAME" => menu.map(|m| m.tracks[m.track_idx].to_uppercase())?,
-                    "TRACKLAPS" => menu?.laps.to_string(),
-                    "TRACKDIRECTION" => if menu?.backwards {
-                        "REVERSE"
-                    } else {
-                        "FORWARD"
-                    }
-                    .to_string(),
-                    _ => return None,
-                }
-            }
-            // **not** off/on. 0x50BB03 registers it with 0x4BB680 and the option list 0x5B9674,
-            // which is `0x119, 0x11A, 0` — `FEStrings` **281 "input exchange"** and **282
-            // "positional"** — and 0x50BB1C then calls the setter (slot 11) with **1**, so the
-            // screen opens on "positional". §4.106.
-            "Comms.Positional" => {
-                // with no session yet the answer is the accessor's own starting index, 1
-                let on = match self.net.as_ref() {
-                    Some(n) => n.positional,
-                    None => self.lobby.as_ref().map_or(true, |l| l.positional),
-                };
-                self.fe_strings.get(POSITIONAL_OPTIONS[usize::from(on)]).unwrap_or_default().to_uppercase()
-            }
-            // this port has no modem, so the modem screen's fields are blank, which is what a
-            // machine without one shows
-            "Comms.PhoneNumber" => String::new(),
-            // chat is carried by a message the port has not traced, so the box stays empty
-            "Comms.ChatInput" => String::new(),
-            "Chronicle.Year" => career?.career.year.to_string(),
-            "Graphics.Resolutions" => "640 x 480 x 16".to_string(),
-            "Controller.AllControllers" | "Controller.AllPads" => {
-                let pads_only = name == "Controller.AllPads";
-                self.gamepads
-                    .devices()
-                    .into_iter()
-                    .find(|(_, is_pad)| !pads_only || *is_pad)
-                    .map(|(n, _)| n.to_uppercase())
-                    .unwrap_or_default()
-            }
-            "Game.Damage" => {
-                let id = BOOL_OPTIONS[usize::from(menu?.damage)];
-                self.fe_strings.get(id).unwrap_or_default().to_string()
-            }
-            "Game.NumOpponents" => menu?.opponents.to_string(),
-            "Game.NumKOOpponents" => menu?.ko_opponents.to_string(),
-            "Game.Difficutly" => {
-                ["EASY", "MEDIUM", "HARD"][(self.race_skill as usize).min(2)].to_string()
-            }
-            "Track1.Track" | "LoopedTrack.Track" | "Knockout.Track" | "Record.Track"
-            | "Track.Track" => {
-                let t = menu
-                    .map(|m| m.tracks[m.track_idx].clone())
-                    .unwrap_or_else(|| self.track.name.clone());
-                match modifier {
-                    // the track's own best time, which is what the port's records table holds
-                    "RECORDTIME" => {
-                        format_ticks(self.records.track(&t)?.entries.first()?.time as u64)
-                    }
-                    // the track record's `+0x78`, as `FEStrings[0x1C2 + it]` — 450…452, the same
-                    // three names `Game.Difficutly` uses (0x4FB730) — and the **short** name, which
-                    // is the name id plus 40 (0x4FA845 adds 0x28), not the full one
-                    "DIFFICULTY" | "SHORT" => {
-                        let c = career?;
-                        let rec = c.tables.tracks.iter().find(|r| c.tables.strings.text(r.name_string_id).eq_ignore_ascii_case(&t))?;
-                        if modifier == "SHORT" {
-                            self.fe_strings.get(rec.name_string_id + 40)?.to_uppercase()
-                        } else {
-                            self.fe_strings.get(450 + rec.difficulty.min(2))?.to_string()
-                        }
-                    }
-                    _ => t.to_uppercase(),
-                }
-            }
-            // the car-setup screen: the 17 floats the original keeps on the car and reads back
-            // nowhere (`RE/notes/layouts.md`), so the port shows them and changes nothing
-            b if nfs_game::career::CAR_SETUP_NAMES.contains(&b) => {
-                let c = career?;
-                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                let k = nfs_game::career::CAR_SETUP_NAMES
-                    .iter()
-                    .position(|n| *n == b)?;
-                let v = c.career.garage.get(idx)?.setup[k];
-                // shown through the accessor's own index and format, not as the raw float —
-                // `career::car_setup_text` has the chain (0x4B9C10 → 0x4BC240 → 0x4B9AB0)
-                nfs_game::career::car_setup_text(k, v)
-            }
-            // the repair screen: what each category costs on the selected car (`RepairCost`
-            // 0x518880 per installed part, summed by the QUICKFIX screen 0x50F110)
-            b if b.starts_with("QUICKFIX.") => {
-                let c = career?;
-                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                let kinds = quickfix_kinds(&b["QUICKFIX.".len()..])?;
-                with_thousands(c.career.repair_cost(&c.tables, idx, kinds))
-            }
-            // The two baskets' totals. `parts.lay` §19 watches `Parts.ShoppingList(TOTAL)` and
-            // `advancedrepair.lay` §24 `Parts.RepairShoppingList(TOTAL)`, and both accessors
-            // answer the same way: 0x516480 and 0x517500 compare the modifier against the literal
-            // **`TOTAL`** (0x5DCE04) and, on a match, print `this->slot6(modifier)` with
-            // **`"%d"`** (0x5CD1B0) — a bare number, no currency sign and no thousands commas.
-            // The sum itself (0x517580 for the repair one) walks the basket and takes each
-            // entry's repair cost (0x518900) or its price (0x518880) by the entry's own
-            // `[+4]` byte, so an **empty** basket prints **`0`**, not nothing. Any other modifier
-            // answers null, which is `CANTFINDSTRING` in the original (§4.10) and nothing here.
-            //
-            // The `$` this port used to print was its own.
-            "Parts.ShoppingList" if modifier == "TOTAL" => format!("{}", career?.basket_total()),
-            // **and it counts only the categories that are ticked.** The screen's own sum,
-            // 0x50F110, takes the car from `OwnedCars.Car` (0x4F5A20) and then adds one
-            // category's cost per `if (accessor->slot27())` — ten of them, 0x50F14A onwards, each
-            // guarded by its own `QUICKFIX.*` bool and each cost from its own getter (0x4EFBC0,
-            // 0x4EFC20, 0x4EFC80, …). All ten bools start false (§4.84) and 0x50F0D1 resets them
-            // to false as a group, so the total starts at **0** and grows as boxes are ticked —
-            // where this port used to sum every damaged part unconditionally. §4.96.
-            "Parts.RepairShoppingList" if modifier == "TOTAL" => {
-                let c = career?;
-                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                let mut kinds: Vec<u16> = Vec::new();
-                for name in &self.repair_ticks {
-                    kinds.extend(quickfix_kinds(name).unwrap_or(&[]));
-                }
-                kinds.sort_unstable();
-                kinds.dedup();
-                format!("{}", c.career.repair_cost(&c.tables, idx, &kinds))
-            }
-            // A `Parts.*` accessor with **no** modifier: `FEAccessorWatch::tick` asks vtable +0x10
-            // (§4.10), which is the base's 0x4BC4E0 — `this->slot12([this+0x18])`, the text of the
-            // accessor's **current row**, and that index is 0 out of the constructor and nothing
-            // in this port moves it.
-            //
-            // For `Parts.AllParts` row 0 is the first section header (0x5152E0's `row == 0` arm),
-            // whose text is `FEStrings` 2550, "PARTS AVAILABLE FOR %s", with the car (0x5157A1).
-            // For `Parts.InstallList` slot 12 is 0x516B50: `"%s %s"` of the row's part name and
-            // its type name, so row 0 is the first installed part.
-            "Parts.AllParts" if modifier.is_empty() => {
-                let c = self.career.as_ref()?;
-                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                let car = c.tables.car(c.career.garage.get(idx)?.car_id)?;
-                self.fe_strings.get(2550)?.replacen("%s", &car.display_name.to_uppercase(), 1)
-            }
-            "Parts.InstallList" if modifier.is_empty() => {
-                let c = self.career.as_ref()?;
-                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                let p = c.career.installed_parts(&c.tables, idx).into_iter().next()?;
-                format!("{} {}", self.fe_strings.get(p.name_string_id).unwrap_or(""), p.kind_name)
-            }
-            // A `Parts.*` accessor **with** a modifier goes to vtable +0x14, and these two classes
-            // override it with a function that never looks at the modifier at all: 0x515D60 and
-            // 0x516BA0 both take the accessor's current row and answer
-            // `FEStrings[part->nameStringId + 0x1F4]` — the part's **description**, 500 ids above
-            // its name. So `Parts.InstallList(DESC)` is the description of the first installed
-            // part, and `DESC` could have been any word.
-            //
-            // `Parts.AllParts(DESC)` is not portable: its current row is **0**, a section header
-            // (§4.x), and 0x5152E0's header arms leave the fourth and fifth out-parameters
-            // untouched (0x5152EE, 0x515346), so 0x515DCA reads an uninitialised stack slot. The
-            // original's answer there is undefined; this port draws nothing.
-            "Parts.InstallList" => {
-                let c = self.career.as_ref()?;
-                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                let p = c.career.installed_parts(&c.tables, idx).into_iter().next()?;
-                self.fe_strings.get(p.name_string_id + 500)?.to_string()
-            }
-            // one cell of `locationsetup.lay`'s table. The modifier is `<row>TRACK<FIELD>`:
-            // 0x4BA838 takes the leading digit as the row (the same shape the car-compare bars
-            // use), 0x4BA786 reads `Game.NumKOOpponents` for how many rows there are, and
-            // 0x4BA7CF answers the empty string for a row at or past that count. `TRACKNUMBER` is
-            // the row plus one (0x4BA800 formats `ebp + 1` with `"%d"`).
-            "Knockout.TrackNumber" => {
-                let m = menu?;
-                let (row, field) = match modifier.as_bytes().first() {
-                    Some(c) if c.is_ascii_digit() => (usize::from(c - b'0'), &modifier[1..]),
-                    _ => (m.ko_sel, modifier),
-                };
-                if row >= m.ko_opponents as usize {
-                    return None;
-                }
-                let slot = m.ko.get(row)?;
-                match field {
-                    "TRACKNUMBER" => (row + 1).to_string(),
-                    "TRACKNAME" => m.tracks.get(slot.track_idx)?.to_uppercase(),
-                    "TRACKLAPS" => slot.laps.to_string(),
-                    // **the short, capitalised forms.** 0x4BAA3B adds **0x23** to the traffic
-                    // accessor's own string id and 0x4BAA03 adds **0x14** to the direction's —
-                    // `FEStrings` 435…438 (`HEAVY`, `MED`, `LIGHT`, `NONE`) and 430…433 (`FWD`,
-                    // `BKW`, …), the `…SHORT` rows of the sheet, not the sentence forms the
-                    // combo boxes show. §4.136.
-                    "TRACKTRAFFIC" => self.fe_strings.get(TRAFFIC_OPTIONS[(slot.traffic as usize).min(3)] + 0x23)?.to_string(),
-                    "TRACKDIRECTION" => self.fe_strings.get(DIRECTION_OPTIONS[usize::from(slot.backwards)] + 0x14)?.to_string(),
-                    // the same two the track accessor answers, for the row's own track: the
-                    // record's `+0x78` as `FEStrings[0x1C2 + it]` (0x4BA8F5) and its best time
-                    // (0x4BA913)
-                    "DIFFICULTY" | "RECORDTIME" => {
-                        let name = m.tracks.get(slot.track_idx)?;
-                        if field == "RECORDTIME" {
-                            format_ticks(self.records.track(name)?.entries.first()?.time as u64)
-                        } else {
-                            let c = career?;
-                            let rec = c.tables.tracks.iter().find(|r| c.tables.strings.text(r.name_string_id).eq_ignore_ascii_case(name))?;
-                            self.fe_strings.get(450 + rec.difficulty.min(2))?.to_string()
-                        }
-                    }
-                    _ => return None,
-                }
-            }
-            "Track1.Laps" | "Knockout.Laps" => match menu {
-                Some(m) if base == "Knockout.Laps" => m.ko.get(m.ko_sel).map_or(m.laps, |k| k.laps).to_string(),
-                Some(m) => m.laps.to_string(),
-                None => self.num_laps.to_string(),
-            },
-            // the screen's own option list, not a bare number: `FEStrings` 403, 402, 401, 400.
-            // (`Knockout.Traffic` belongs on this arm too — its body has always tested for it and
-            // the pattern has always left it out, so `locationsetup.lay`'s combo read blank. The
-            // sweep's caption axis is what showed it; the blank count never could, because the
-            // combo draws its own box. §4.93.)
-            "Track1.Traffic" | "Knockout.Traffic" => {
-                let t = match menu {
-                    Some(m) if base == "Knockout.Traffic" => m.ko.get(m.ko_sel).map_or(m.traffic, |k| k.traffic),
-                    Some(m) => m.traffic,
-                    None => 0,
-                };
-                self.fe_strings.get(TRAFFIC_OPTIONS[(t as usize).min(3)])?.to_string()
-            }
-            "Track1.Direction" | "Knockout.Direction" => {
-                let b = match menu {
-                    Some(m) if base == "Knockout.Direction" => m.ko.get(m.ko_sel).map_or(m.backwards, |k| k.backwards),
-                    Some(m) => m.backwards,
-                    None => self.backwards,
-                };
-                self.fe_strings.get(DIRECTION_OPTIONS[usize::from(b)])?.to_string()
-            }
-            // `"%s %s"` of the car's era and its class, as `FEStrings[era − 10]` and
-            // `FEStrings[class + 13]` (0x4F0AAE…0x4F0AD4): 521 − 10 is "Classic" and 501 + 13 is
-            // "3", so a `'50 356` reads "Classic 3".
-            b if modifier == "CLASSLISTING" && matches!(b, "OwnedCars.Car" | "DealerCar.Car" | "GenericCar.Car" | "UsedCar.Car" | "zMergedList.Car") => {
-                let car = self.logo_car(Some(base), None)?;
-                let era = self.fe_strings.get(car.era_string_id.checked_sub(10)?)?;
-                let class = self.fe_strings.get(car.class_string_id + 13)?;
-                format!("{era} {class}")
-            }
-            // a car's short form is its family, the same one `zMergedList.Car(SHORT)` gives: the
-            // accessor's `SHORT` hands the index to a virtual of its own (0x4BC54D) rather than
-            // falling through to the display name.
-            b if modifier == "SHORT" && matches!(b, "OwnedCars.Car" | "DealerCar.Car" | "GenericCar.Car" | "CARSETTINGS.CAR") => {
-                self.logo_car(Some(base), None)?.family.to_uppercase()
-            }
-            "OwnedCars.Car" | "DealerCar.Car" | "GenericCar.Car" | "CARSETTINGS.CAR" => {
-                // the garage screens ask the same accessor for the car's money and damage figures
-                let c = career?;
-                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                match c.career.garage.get(idx).and_then(|o| self.car_field(c, o, modifier)) {
-                    Some(v) => v,
-                    None => c
-                        .career
-                        .garage
-                        .get(idx)
-                        .and_then(|o| c.tables.car(o.car_id))
-                        .map(|e| e.display_name.to_uppercase())
-                        .unwrap_or_else(|| self.specs.name.to_uppercase()),
-                }
-            }
-            // the car the front end has selected, and (quick race puts the field in every car) the
-            // opponents' car, which this port takes from the same list.
-            //
-            // **Only the name** for the plain and `SHORT` forms; everything else is a field of the
-            // *market* record, which is an `OwnedCar` with its own mileage, parts and asking price
-            // (`RE/notes/career.md` §10.5). The port generates that market now — `Career::market`,
-            // filled by `refresh_market` from 0x4F80C0 — so `UsedCar.Car(MILEAGE)`,
-            // `(ASKINGPRICE)`, `(…DAMAGE)` and `(…DAMAGECOST)` all come from the selected market
-            // car, the one `usedcar_sel` names.
-            "UsedCar.Car" if !matches!(modifier, "" | "SHORT") => {
-                let c = career?;
-                self.car_field(c, self.used_car()?, modifier)?
-            }
-            "UsedCar.Car" => {
-                let c = career?;
-                let e = c.tables.car(self.used_car()?.car_id)?;
-                if modifier == "SHORT" { e.family.to_uppercase() } else { e.display_name.to_uppercase() }
-            }
-            // the same five strings the drop-down lists — `SHORT` is the same jump table
-            // (0x4F57A0), so both forms answer alike
-            "OpponentCar.Car" => {
-                let m = menu?;
-                let c = nfs_game::opponents::OpponentChoice::from_index(m.opp_car as u32);
-                self.fe_strings.get(c.string_id())?.to_uppercase()
-            }
-            "zMergedList.Car" | "PrizeCars.Car" => match menu {
-                _ if !matches!(modifier, "" | "SHORT") => return None,
-                // `(SHORT)` asks for the short form, which for a car is its family name
-                Some(m) if modifier == "SHORT" => m.cars[m.car_idx].family.to_uppercase(),
-                Some(m) => m.cars[m.car_idx].display_name.to_uppercase(),
-                None => self.specs.name.to_uppercase(),
-            },
-            // All seven colour combos count the same way — the paint set's number from 1, which
-            // is what `combo_rows` enumerates (§4.91). The original keeps four separate values
-            // per car (exterior, interior, and the two stripes) and this port keeps one, so the
-            // other three read the exterior's: an APPROXIMATION, and the one this arm carries.
-            "OwnedCar.ExtColour" | "OwnedCar.IntColour" | "OwnedCar.S1Colour" | "OwnedCar.S2Colour"
-            | "GenericCar.Colour" | "DealerCar.Colour" | "DealerCar.IntColour" => {
-                format!("{}", menu.map(|m| m.paint_idx + 1).unwrap_or(1))
-            }
-            // the compare screen's right-hand car, the one `GenericCar2.Car` steps with `car2_idx`
-            "GenericCar2.Car" => match menu {
-                _ if !matches!(modifier, "" | "SHORT") => return None,
-                Some(m) if modifier == "SHORT" => m.cars.get(m.car2_idx)?.family.to_uppercase(),
-                Some(m) => m.cars.get(m.car2_idx)?.display_name.to_uppercase(),
-                None => return None,
-            },
-            "Game.GameType" => "QUICK RACE".to_string(),
-            // the key-binding rows of `GameCtrl.lay` / `fluffctrl.lay`. The names are this port's
-            // own keyboard map (`nfs-input`), not the original's — the original keeps its bindings
-            // in its own configuration, which the port does not read.
-            b if b.starts_with("Controller.") => {
-                use nfs_input::Action;
-                let action = match &b["Controller.".len()..] {
-                    "Accel" => Action::Throttle,
-                    "Brake" => Action::Brake,
-                    "SteerLeft" => Action::SteerLeft,
-                    "SteerRight" => Action::SteerRight,
-                    "HandBrake" => Action::Handbrake,
-                    "ShiftUp" => Action::ShiftUp,
-                    "ShiftDown" => Action::ShiftDown,
-                    "ResetCar" => Action::Reset,
-                    "CameraView" => Action::CameraNext,
-                    "LookBehind" => Action::RearView,
-                    "Horn" => Action::Horn,
-                    _ => return None,
-                };
-                nfs_input::key_for(action)?.to_string()
-            }
-            // the options screens: the levels the port actually mixes with (`fe.txt`, 0..127)
-            // the CD player's now-playing line, and the sound-quality setting (`AUDIOQUALITY`)
-            // `FECDPlayerAccessor`'s `STATUS` is one of two strings: `FEStrings[0x2857]`
-            // "playing..." while something is playing and `[0x2858]` "stopped." otherwise
-            // (0x4BF0BA, 0x4BF0CE). The front end plays nothing, so it is the second.
-            "CDPlayer.Title" if modifier == "STATUS" => {
-                let playing = self.music.as_ref().is_some_and(|m| m.now_playing().is_some());
-                self.fe_strings.get(if playing { 10327 } else { 10328 })?.to_string()
-            }
-            // The three timing lines. All of them end in `FEStrings[0x2859]` — `"%02d:%02d"` — over
-            // a millisecond count divided by 1000, then `/60` and `%60` (0x4BED1F, 0x4BEF6E).
-            //
-            // * `SelectedList(TOTALPLAY)` sums `track + 0x20` over the whole playlist (0x4BED16);
-            // * `Title(TRACKPLAY)` is the current track's own length;
-            // * `Title(SONGTIMEREMAIN)` is the elapsed time, or the length minus it when the
-            //   `CDPlayer.View` toggle is set (0x4BEF66). Nothing is playing in the front end, so
-            //   the elapsed time is zero.
-            "CDPlayer.SelectedList" | "CDPlayer.Title"
-                if matches!(modifier, "TOTALPLAY" | "TRACKPLAY" | "SONGTIMEREMAIN") =>
-            {
-                let list: Vec<usize> = match self.music.as_ref() {
-                    Some(m) => m.playlist().to_vec(),
-                    None => self.audio_settings.playlist.iter().map(|i| *i as usize).collect(),
-                };
-                let len = |i: usize| self.music_lengths.get(i).copied().unwrap_or(0) as u64;
-                let ms = match modifier {
-                    "TOTALPLAY" => list.iter().map(|i| len(*i)).sum::<u64>(),
-                    "TRACKPLAY" => len(list.first().copied().unwrap_or(0)),
-                    // the elapsed time, which is 0 with nothing playing; `CDPlayer.View` would
-                    // make it the remainder instead
-                    _ if self.choice_index("CDPlayer.View").is_some_and(|(i, _)| i != 0) => len(list.first().copied().unwrap_or(0)),
-                    _ => 0,
-                };
-                let secs = ms / 1000;
-                format!("{:02}:{:02}", secs / 60, secs % 60)
-            }
-            // the now-playing line. 0x4BEE70 answers the empty string only when the music table
-            // itself is empty; otherwise it is the entry's own name field. With nothing playing
-            // the port names the first track of the selected playlist, which is the one the
-            // player's own `+0x24` mode would have.
-            "CDPlayer.Title" if modifier.is_empty() => {
-                let title = match self.music.as_ref().and_then(|m| m.now_playing()) {
-                    Some(t) => t.to_string(),
-                    None => {
-                        let names: &[String] = match self.music.as_ref() {
-                            Some(m) => &m.names,
-                            None => &self.music_names,
-                        };
-                        let first = match self.music.as_ref() {
-                            Some(m) => m.playlist().first().copied(),
-                            None => self.audio_settings.playlist.first().map(|i| *i as usize),
-                        };
-                        names.get(first.unwrap_or(0))?.clone()
-                    }
-                };
-                nfs_audio::music::split_title(&title).0.to_uppercase()
-            }
-            "Audio.Quality" => self.audio_settings.audio_quality.to_string(),
-            // the draw-distance setting, as the original's index into `0x5CE90C` = {0.5, .67, .83, 1}
-            "Graphics.ViewDistance" => {
-                let idx = [0.5f32, 0.67, 0.83, 1.0]
-                    .iter()
-                    .position(|v| (v - self.detail).abs() < 0.01)
-                    .unwrap_or(3);
-                idx.to_string()
-            }
-            "Audio.MusicLevel" => self.audio_settings.music_level.to_string(),
-            "Audio.SfxLevel" => self.audio_settings.sfx_level.to_string(),
-            "Audio.EngineLevel" => self.audio_settings.engine_level.to_string(),
-            "Audio.SpeechLevel" => self.audio_settings.speech_level.to_string(),
-            "Audio.AmbientLevel" => self.audio_settings.ambient_level.to_string(),
-            // A list accessor with no arm of its own still answers: 0x4BC4E0, the caption getter,
-            // is nothing but `rowText([this+0x18])`, so the caption is the row the list is on, and
-            // the empty string when the list is empty — which is what a `Comms.*` list shows
-            // before a session has filled it. §4.106.
-            _ => {
-                let (rows, cur) = self.list_rows(base)?;
-                match rows.get(cur.unwrap_or(0)) {
-                    Some(ListRow::Text(t)) => t.clone(),
-                    _ => String::new(),
-                }
-            }
-        })
+    /// Which accessor `CARSETTINGS.CAR` forwards to — 0x4B88F0's switch on `Game.GameType`. The
+    /// port has no numeric game type of its own, so it derives the three cases 0x4B88F0
+    /// distinguishes and nothing finer: a factory-driver mission is **9**, a career event pending or
+    /// a career loaded at all is the Evolution **4**, and everything else is **0**.
+    fn car_settings_delegate(&self) -> &'static str {
+        if self.mission.is_some() {
+            "FactoryDriver.Car"
+        } else if self.career.is_some() {
+            "OwnedCars.Car"
+        } else {
+            "zMergedList.Car"
+        }
     }
 
     /// The chronicle picture for the year the career is in.
@@ -2423,7 +1958,7 @@ impl App {
     /// from the binary; which car the opening screen hands over is inferred from where the button
     /// is.
     fn compare_cars(&self) -> Option<(&nfs_formats::fedata::CarCatalogEntry, &nfs_formats::fedata::CarCatalogEntry)> {
-        let m = self.menu.as_ref()?;
+        let m = self.fe.menu.as_ref()?;
         Some((m.cars.get(m.car_idx)?, m.cars.get(m.car2_idx)?))
     }
 
@@ -2445,7 +1980,7 @@ impl App {
 
     fn chronicle_picture(&self) -> Option<String> {
         let year = self.career.as_ref()?.career.year;
-        let letter = CHRONICLE_GROUP_LETTERS.as_bytes()[self.chronicle_group.min(4)] as char;
+        let letter = CHRONICLE_GROUP_LETTERS.as_bytes()[self.fe.chronicle_group.min(4)] as char;
         let dir = self.paths.fe_data().join("Chron");
         let mut best: Option<(u32, String)> = None;
         let mut earliest: Option<(u32, String)> = None;
@@ -2685,7 +2220,7 @@ impl App {
             // the same list the port's other car accessors answer from
             "zMergedList.Car" | "OpponentCar.Car" | "PrizeCars.Car"
             | "DealerCar.Car" | "GenericCar.Car" | "CARSETTINGS.CAR" => {
-                let m = self.menu.as_ref()?;
+                let m = self.fe.menu.as_ref()?;
                 m.cars.get(m.car_idx)
             }
             // the compare screen's two columns: `CarCompare1` is the car it was entered with and
@@ -2710,42 +2245,42 @@ impl App {
         match base {
             // the four network layouts, filled from the `'d'` answers a `'w'` probe collects
             "Comms.ServerList" | "Comms.GamesList" => {
-                let l = self.lobby.as_ref()?;
+                let l = self.net.lobby.as_ref()?;
                 Some((
                     l.games().into_iter().map(ListRow::Text).collect(),
                     Some(l.sel),
                 ))
             }
             "Comms.IPList" => {
-                let l = self.lobby.as_ref()?;
+                let l = self.net.lobby.as_ref()?;
                 Some((
                     l.addresses().into_iter().map(ListRow::Text).collect(),
                     Some(l.sel),
                 ))
             }
             "Comms.LobbyPlayerList" | "Comms.PlayerList" => {
-                let rows = match self.net.as_ref() {
+                let rows = match self.net.session.as_ref() {
                     Some(n) => n.players(),
-                    None => self.lobby.as_ref()?.players(),
+                    None => self.net.lobby.as_ref()?.players(),
                 };
                 Some((rows.into_iter().map(ListRow::Text).collect(), None))
             }
             "Comms.Positional" => {
                 // with no session yet the answer is the accessor's own starting index, 1
-                let on = match self.net.as_ref() {
+                let on = match self.net.session.as_ref() {
                     Some(n) => n.positional,
-                    None => self.lobby.as_ref().map_or(true, |l| l.positional),
+                    None => self.net.lobby.as_ref().map_or(true, |l| l.positional),
                 };
                 let rows = POSITIONAL_OPTIONS
                     .iter()
-                    .map(|id| ListRow::Text(self.fe_strings.get(*id).unwrap_or_default().to_uppercase()))
+                    .map(|id| ListRow::Text(self.fe.strings.get(*id).unwrap_or_default().to_uppercase()))
                     .collect();
                 Some((rows, Some(usize::from(on))))
             }
             // no modem in this port
             "Comms.ModemList" | "Comms.PhoneList" => Some((Vec::new(), None)),
             "Track1.Track" | "LoopedTrack.Track" | "Knockout.Track" | "Track.Track" => {
-                let m = self.menu.as_ref()?;
+                let m = self.fe.menu.as_ref()?;
                 Some((
                     m.tracks
                         .iter()
@@ -2760,9 +2295,9 @@ impl App {
             // right of `ID_RECORDTIMEPOS`. The rows are the `nfs5.trk` slots of the selected track.
             "Track.Records" | "Record.Track" => {
                 let t = self
-                    .menu
+                    .fe.menu
                     .as_ref()
-                    .map(|m| m.tracks[m.track_idx].clone())
+                    .map(|m| m.track().to_string())
                     .unwrap_or_else(|| self.track.name.clone());
                 let rows = self
                     .records
@@ -2802,13 +2337,13 @@ impl App {
             "CDPlayer.AvailableList" | "CDPlayer.SelectedList" => {
                 // in a race the live player owns both lists; in the front end there is no player
                 // yet, so they come from the files and the saved playlist
-                let names: &[String] = match self.music.as_ref() {
+                let names: &[String] = match self.snd.music.as_ref() {
                     Some(m) => &m.names,
-                    None => &self.music_names,
+                    None => &self.snd.music_names,
                 };
-                let list: Vec<usize> = match self.music.as_ref() {
+                let list: Vec<usize> = match self.snd.music.as_ref() {
                     Some(m) => m.playlist().to_vec(),
-                    None => self.audio_settings.playlist.iter().map(|i| *i as usize).collect(),
+                    None => self.snd.audio_settings.playlist.iter().map(|i| *i as usize).collect(),
                 };
                 let rows: Vec<ListRow> = match base {
                     "CDPlayer.SelectedList" => list
@@ -2844,7 +2379,7 @@ impl App {
             }
             "Replay.List" => {
                 // `RebuildReplayList` reads `%s*.rpl` from the replay directory (0x4E5E1B)
-                let dir = self.replay_path.parent()?.to_path_buf();
+                let dir = self.replay.path.parent()?.to_path_buf();
                 let mut names: Vec<String> = std::fs::read_dir(&dir)
                     .ok()?
                     .flatten()
@@ -2901,14 +2436,14 @@ impl App {
                 // nothing. The second section is the player's own inventory (0x518B80), which this
                 // port has no model for, so it opens empty.
                 if base == "Parts.AllParts" {
-                    let name = self.fe_strings.get(2550).unwrap_or_default();
+                    let name = self.fe.strings.get(2550).unwrap_or_default();
                     let title = car.display_name.to_uppercase();
                     let mut rows = vec![ListRow::Header(name.replacen("%s", &title, 1))];
-                    if self.parts_open[0] {
-                        rows.extend(Self::parts_rows(c, idx, c.career.parts_for(&c.tables, car), &self.fe_strings, false));
+                    if self.fe.parts_open[0] {
+                        rows.extend(Self::parts_rows(c, idx, c.career.parts_for(&c.tables, car), &self.fe.strings, false));
                     }
-                    rows.push(ListRow::Header(self.fe_strings.get(2551).unwrap_or_default().to_string()));
-                    if self.parts_open[1] {
+                    rows.push(ListRow::Header(self.fe.strings.get(2551).unwrap_or_default().to_string()));
+                    if self.fe.parts_open[1] {
                         // the player's own inventory — no model here, so nothing under it
                     }
                     return Some((rows, None));
@@ -2929,7 +2464,7 @@ impl App {
                         .collect(),
                     _ => c.career.parts_for(&c.tables, car),
                 };
-                Some((Self::parts_rows(c, idx, parts, &self.fe_strings, damage_list), None))
+                Some((Self::parts_rows(c, idx, parts, &self.fe.strings, damage_list), None))
             }
             _ => None,
         }
@@ -2938,13 +2473,13 @@ impl App {
     /// Which row `Parts.AllParts`'s **second** section header sits on: 1 while the first section
     /// is closed, and `1 + <the first section's rows>` while it is open (0x5152E0's walk).
     fn parts_header_b(&self) -> usize {
-        if !self.parts_open[0] {
+        if !self.fe.parts_open[0] {
             return 1;
         }
         let Some(c) = self.career.as_ref() else { return 1 };
         let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
         let Some(car) = c.career.garage.get(idx).and_then(|g| c.tables.car(g.car_id)) else { return 1 };
-        1 + Self::parts_rows(c, idx, c.career.parts_for(&c.tables, car), &self.fe_strings, false).len()
+        1 + Self::parts_rows(c, idx, c.career.parts_for(&c.tables, car), &self.fe.strings, false).len()
     }
 
     /// One `Parts.*` row per part, grouped under the category headings every one of the five
@@ -2993,16 +2528,16 @@ impl App {
     /// 0x4C3730 asks the `boolAccessor` and picks `onIndex` or `offIndex` by the answer; this is
     /// that, with the answer coming from `repair_ticks`. §4.96.
     fn bind_checks(&mut self) {
-        let Some(l) = self.layout_preview.as_ref() else { return };
+        let Some(l) = self.fe.layout_preview.as_ref() else { return };
         let wanted: Vec<(usize, Option<bool>)> = l
             .check_boxes()
             .into_iter()
             .map(|(i, a)| {
-                let on = a.strip_prefix("QUICKFIX.").map(|n| self.repair_ticks.contains(n));
+                let on = a.strip_prefix("QUICKFIX.").map(|n| self.fe.repair_ticks.contains(n));
                 (i, on)
             })
             .collect();
-        if let Some(l) = self.layout_preview.as_mut() {
+        if let Some(l) = self.fe.layout_preview.as_mut() {
             for (i, on) in wanted {
                 l.set_check(i, on);
             }
@@ -3010,7 +2545,7 @@ impl App {
     }
 
     fn bind_lists(&mut self) {
-        let Some(l) = self.layout_preview.as_ref() else {
+        let Some(l) = self.fe.layout_preview.as_ref() else {
             return;
         };
         let wanted: Vec<(usize, Option<(Vec<ListRow>, Option<usize>)>)> = l
@@ -3036,7 +2571,7 @@ impl App {
                 )
             }))
             .collect();
-        let Some(l) = self.layout_preview.as_mut() else {
+        let Some(l) = self.fe.layout_preview.as_mut() else {
             return;
         };
         for (index, rows) in wanted {
@@ -3050,7 +2585,7 @@ impl App {
     /// Point every `NFS5.CarLogo` on the previewed screen at the car its source names. The pack and
     /// the entry pair are the car record's own +0x147 and +0x1F6 (`RE/notes/layouts.md` §4).
     fn bind_car_logos(&mut self) {
-        let Some(l) = self.layout_preview.as_ref() else {
+        let Some(l) = self.fe.layout_preview.as_ref() else {
             return;
         };
         let wanted: Vec<(usize, Option<(String, i16)>)> = l
@@ -3077,7 +2612,7 @@ impl App {
             .then(|| self.chronicle_picture())
             .flatten();
         let chron_pair = picture.as_deref().filter(|_| !chron_logo.is_empty()).and_then(|f| self.chronicle_logo(f));
-        let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) else {
+        let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) else {
             return;
         };
         for (index, car) in wanted {
@@ -3102,11 +2637,19 @@ impl App {
     /// lands here when the original places its content from code and the file carries neither a
     /// shape nor a string for it — which is exactly the list of front-end things still to port.
     fn run_layout_sweep(&mut self) {
-        // `NFS_SWEEP_STATE=1` puts the career into the states the blank count is otherwise waiting
-        // on — a car with damage on every part, and one listed on the used-car market — so the
-        // widgets that need them can be measured instead of assumed. It only ever touches the
-        // in-memory career of this one diagnostic run, never the save.
-        if std::env::var("NFS_SWEEP_STATE").is_ok()
+        // The career is put into the states the blank count is otherwise waiting on — a car with
+        // damage on every part, and a used-car market — so the widgets that need them are
+        // measured instead of assumed. It only ever touches the in-memory career of this one
+        // diagnostic run, never the save.
+        //
+        // This is **on by default** since 2026-09-21, and the reason is the same one that made
+        // `coverage.py`'s phantom functions worth recording: a diagnostic that answers with the
+        // starting state of a synthetic career is measuring the harness, not the port. With it
+        // off the headline was 61, of which 42 were `UsedCar.Car` and damage widgets that are
+        // blank only because nothing had been bought, damaged or listed — a parity loop reading
+        // that number chases widgets that are already ported. `NFS_SWEEP_STATE=0` restores the
+        // bare-career count for anyone who wants to see it.
+        if std::env::var("NFS_SWEEP_STATE").as_deref() != Ok("0")
             && let Some(c) = self.career.as_mut()
         {
             let parts: Vec<(i16, f32)> = {
@@ -3164,15 +2707,15 @@ impl App {
         let mut screens = 0usize;
         for name in &names {
             self.open_layout(name);
-            if self.layout_preview.is_none() {
+            if self.fe.layout_preview.is_none() {
                 continue;
             }
             screens += 1;
             // the same probe fills the browser with one session, so the four `Comms.*` lists and
             // the watches beside them can be measured too. The record is what a `'d'` answer
             // carries (`nfs_net::comm::Describe`), filled as a two-player game would fill it.
-            if std::env::var("NFS_SWEEP_STATE").is_ok()
-                && let Some(lobby) = self.lobby.as_mut()
+            if std::env::var("NFS_SWEEP_STATE").as_deref() != Ok("0")
+                && let Some(lobby) = self.net.lobby.as_mut()
                 && lobby.found.is_empty()
             {
                 let mut name = [0u8; 32];
@@ -3212,7 +2755,7 @@ impl App {
             // the **wrong** thing — `UsedCar.Car` answered every modifier with the car's name for a
             // long time and counted as drawn — so this is the other half of the measurement.
             if std::env::var("NFS_SWEEP_DUMP").as_deref().is_ok_and(|v| v == "*" || v == name.as_str())
-                && let Some(l) = self.layout_preview.as_ref()
+                && let Some(l) = self.fe.layout_preview.as_ref()
             {
                 for e in &l.layout.elements {
                     if let Some(a) = e.get("accessor").filter(|a| !a.is_empty()) {
@@ -3237,26 +2780,26 @@ impl App {
             // name it does not know and every caller falls back silently, so a template rule the
             // port misses leaves no trace in the blank count.
             if std::env::var("NFS_EXPR_SWEEP").is_ok()
-                && let Some(l) = self.layout_preview.as_ref()
+                && let Some(l) = self.fe.layout_preview.as_ref()
             {
                 for (class, part, key, expr) in l.expr_failures() {
                     *expr_fail.entry((class, part, key, expr)).or_insert(0usize) += 1;
                 }
             }
             if std::env::var("NFS_BOX_SWEEP").is_ok()
-                && let Some(l) = self.layout_preview.as_ref()
+                && let Some(l) = self.fe.layout_preview.as_ref()
             {
                 for (class, b, u) in l.box_disagreements() {
                     println!("  box {name:<20} {class:<28} size.value=({:.0}x{:.0}) parts=({:.0}x{:.0})", b.0, b.1, u.0, u.1);
                 }
             }
-            if let Some(l) = self.layout_preview.as_ref() {
+            if let Some(l) = self.fe.layout_preview.as_ref() {
                 cars3d += l.car_3d().len();
             }
             // **The blank count cannot see an empty drop-down.** A combo always draws its own
             // box, so however empty its list is it never counts as a widget that drew nothing —
             // which is how 61 of the 97 went unnoticed until §4.91. Counted here as its own axis.
-            if let Some(l) = self.layout_preview.as_ref() {
+            if let Some(l) = self.fe.layout_preview.as_ref() {
                 for w in l.combo_sliders() {
                     let a = w.accessor.clone().unwrap_or_default();
                     let n = self
@@ -3295,8 +2838,8 @@ impl App {
                     }
                 }
             }
-            let Some(l) = self.layout_preview.as_ref() else { continue };
-            for (class, src) in l.blank_widgets(nfs_game::layout::DESIGN.0 / nfs_game::layout::DESIGN.1, &self.fe_strings, &|a| self.accessor_value(a)) {
+            let Some(l) = self.fe.layout_preview.as_ref() else { continue };
+            for (class, src) in l.blank_widgets(nfs_game::layout::DESIGN.0 / nfs_game::layout::DESIGN.1, &self.fe.strings, &|a| self.accessor_value(a)) {
                 // **A knockout row past the opponent count draws nothing in the original too.**
                 // `locationsetup.lay` carries seven fixed rows of watches, rows 0…6, but
                 // `FEKnockoutTrackNumberAccessor`'s getter reads `Game.NumKOOpponents`
@@ -3306,7 +2849,7 @@ impl App {
                 // each. They are not blanks the port owes anyone; counting them made the sweep
                 // chase its own harness, the same way `NFS5.3DCAR` did.
                 if let Some(row) = ko_row_of(&src)
-                    && row >= self.menu.as_ref().map(|m| m.ko_opponents).unwrap_or(4)
+                    && row >= self.fe.menu.as_ref().map(|m| m.ko_opponents).unwrap_or(4)
                 {
                     ko_past += 1;
                     continue;
@@ -3316,12 +2859,52 @@ impl App {
             }
         }
         if !expr_fail.is_empty() {
-            println!("part expressions that do not resolve:");
+            // Each of these was decomposed on 2026-09-21 (`RE/AUDIT.md` §J) and every one is
+            // either a fault in the shipped data — a name no template declares — or a place the
+            // port follows the **code** rather than the template expression, with the addresses
+            // in the note. They are separated from anything new so this axis reports a small
+            // number the way the others do; a row that is not on this list is the interesting
+            // one. The key is `(class, part.key)`, not the expression, so a template edit cannot
+            // slip past it unnoticed.
+            const EXPLAINED: [(&str, &str); 12] = [
+                // the port sets alignment as an anchor in the box, not as this part offset
+                ("NFS5.AccessorWatch", "label.pos"),
+                ("REAL.LABEL", "label.pos"),
+                // `data.area` is not among `BottomBarButton.ctr`'s declared attributes, so the
+                // original cannot resolve it either — and `bg` is `0x00000000`
+                ("NFS5.BOTTOMBARBUTTON", "bg.size"),
+                // `ChatDisplayBox.ctr` has no `backrect` part at all
+                ("NFS5.CHATDISPLAYBOX", "sblinebottom.pos"),
+                ("NFS5.CHATDISPLAYBOX", "sblineleft.pos"),
+                ("NFS5.CHATDISPLAYBOX", "sblineright.pos"),
+                // the caption runs from 0x4C6054 / 0x4C6237, not from the template (§4.14)
+                ("NFS5.ComboBoxSlider", "label.pos"),
+                // the text comes from an accessor and is drawn from the code path
+                ("NFS5.INPUTBOX", "untext.pos"),
+                ("NFS5.CHARVECTACCESSORINPUTBOX", "untext.pos"),
+                // a button whose own string is empty — AUDIT §F's five
+                ("NFS5.GOTOBUTTON", "mediumlabel.pos"),
+                ("NFS5.GOTOBUTTON", "smalllabel.pos"),
+                // the `.lay` block carries a malformed `size=150,`
+                ("NFS5.Rectangle", "data.size"),
+            ];
             let mut ks: Vec<_> = expr_fail.iter().collect();
             ks.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
-            for ((class, part, key, expr), n) in ks {
-                println!("  {n:5}  {class:<28} {part}.{key} = {expr}");
+            let mut news = 0usize;
+            let mut known = 0usize;
+            for ((class, part, key, expr), n) in &ks {
+                let site = format!("{part}.{key}");
+                if EXPLAINED.iter().any(|(c, s)| c == class && *s == site) {
+                    known += **n;
+                    continue;
+                }
+                if news == 0 {
+                    println!("part expressions that do not resolve and are NOT accounted for:");
+                }
+                news += **n;
+                println!("  {n:5}  {class:<28} {site} = {expr}");
             }
+            println!("part expressions that do not resolve: {news} unaccounted, {known} decomposed in AUDIT.md §J");
         }
         // which screen each blank is on — `NFS_SWEEP_WHERE=1` prints it. A count by class says
         // what is missing, not where to look for it, and every blank that turned out to be a real
@@ -3332,12 +2915,22 @@ impl App {
         // return is `state_for`'s own: the `.lay`'s `state=`, `normal`, `hover`, `focused`,
         // `focusedhover`, `selected`, `selectedhover` and `NFS5.CAMERASELECT`'s `highlighty`.
         // §4.112.
+        //
+        // **`hidden` and `disabled` belong in that set and were missing from it until
+        // 2026-09-21**, which made this axis report 58 classes "never hidden" and 11 "never
+        // disabled" — 69 phantom gaps. The port does both: a hidden widget is skipped at the
+        // draw (`layout.rs`'s `hidden_flags`, set by name the way 0x50D910 does at its fifty-one
+        // call sites) and `state_for`'s **first** arm returns `disabled` off `disabled_flags`.
+        // A list of gaps that names things already done is the same failure as the blank count
+        // reading an empty career, and it hid a real one underneath: `state_hidden_or_disabled`
+        // was reading only the `.lay` attribute, so a widget hidden at run time stayed pressable.
         if std::env::var("NFS_SWEEP_STATES").is_ok() {
-            const KNOWN: [&str; 7] = ["normal", "hover", "focused", "focusedhover", "selected", "selectedhover", "highlighty"];
+            const KNOWN: [&str; 9] =
+                ["normal", "hover", "focused", "focusedhover", "selected", "selectedhover", "highlighty", "hidden", "disabled"];
             let mut miss: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = Default::default();
             for name in &names {
                 self.open_layout(name);
-                let Some(l) = self.layout_preview.as_ref() else { continue };
+                let Some(l) = self.fe.layout_preview.as_ref() else { continue };
                 for (class, states) in l.declared_states() {
                     for st in states {
                         if !KNOWN.contains(&st.as_str()) {
@@ -3350,7 +2943,7 @@ impl App {
             let mut unlisted: std::collections::BTreeMap<String, Vec<String>> = Default::default();
             for name in &names {
                 self.open_layout(name);
-                if let Some(l) = self.layout_preview.as_ref() {
+                if let Some(l) = self.fe.layout_preview.as_ref() {
                     unlisted.extend(l.unlisted_parts());
                 }
             }
@@ -3358,7 +2951,7 @@ impl App {
             for (class, parts) in &unlisted {
                 println!("  {class:<32} {}", parts.join(", "));
             }
-            println!("the chronicle index for group {} (§4.118): {:?}", self.chronicle_group, self.chronicle_index());
+            println!("the chronicle index for group {} (§4.118): {:?}", self.fe.chronicle_group, self.chronicle_index());
             println!("template states this port never returns:");
             for (class, states) in &miss {
                 println!("  {class:<32} {}", states.iter().cloned().collect::<Vec<_>>().join(", "));
@@ -3470,7 +3063,7 @@ impl App {
     /// class's `Univers7b.ffn` (0x5089AD), but only when that name is non-empty (0x508965) — and
     /// the `Chron` packs' entries carry none, so nothing is drawn there. Read, not invented.
     fn bind_chronicle_icons(&mut self) {
-        let Some(l) = self.layout_preview.as_ref() else { return };
+        let Some(l) = self.fe.layout_preview.as_ref() else { return };
         let icons = l.numbered_widgets("NFS5.ChroniclePictureIcon");
         if icons.is_empty() {
             return;
@@ -3480,7 +3073,7 @@ impl App {
             .into_iter()
             .map(|(i, number)| (i, files.get(number.max(0) as usize).cloned().unwrap_or_default()))
             .collect();
-        let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) else { return };
+        let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) else { return };
         for (index, file) in wanted {
             // entry 0 is the resting frame; the draw takes the next one when the pointer is on
             // the icon, which is what 0x508819's 0x4C7C90 tests (§4.109)
@@ -3517,19 +3110,19 @@ impl App {
     /// the way 0x4F4DF0 does; it asks the same question of the selection instead — is a car with
     /// this record's id in the garage. Recorded as the one difference.
     fn bind_mergedlist_panel(&mut self) {
-        let Some(l) = self.layout_preview.as_ref() else { return };
+        let Some(l) = self.fe.layout_preview.as_ref() else { return };
         let names = ["ID_MERGEDLISTCARSETUP", "ID_MERGEDLISTCOLOR"];
         let want = l.widgets_named(&names);
         if want.is_empty() {
             return;
         }
         let owned = self
-            .menu
+            .fe.menu
             .as_ref()
             .and_then(|m| m.cars.get(m.car_idx))
             .zip(self.career.as_ref())
             .is_some_and(|(car, c)| c.career.garage.iter().any(|g| g.car_id == car.id));
-        if let Some(l) = self.layout_preview.as_mut() {
+        if let Some(l) = self.fe.layout_preview.as_mut() {
             for (index, which) in want {
                 l.set_hidden_flag(index, if which == 0 { !owned } else { owned });
             }
@@ -3559,7 +3152,7 @@ impl App {
     /// decodes a row as a header, as the car's own parts or as the shop's (§4.x), and this port
     /// builds the same two sections.
     fn bind_parts_buttons(&mut self) {
-        let Some(l) = self.layout_preview.as_ref() else { return };
+        let Some(l) = self.fe.layout_preview.as_ref() else { return };
         let names = ["ID_PARTSDESC", "ID_INSTALLBUTTON", "ID_UNINSTALLBUTTON"];
         let want = l.widgets_named(&names);
         if want.is_empty() {
@@ -3572,7 +3165,7 @@ impl App {
             Some(false) => [(false, Some(true)), (false, None), (true, Some(true))],
             Some(true) => [(false, Some(true)), (true, None), (false, Some(true))],
         };
-        if let Some(l) = self.layout_preview.as_mut() {
+        if let Some(l) = self.fe.layout_preview.as_mut() {
             for (index, which) in want {
                 let (hide, enable) = state[which];
                 l.set_hidden_flag(index, hide);
@@ -3586,7 +3179,7 @@ impl App {
     /// The part `Parts.AllParts` is on, and whether it is **fitted** — `None` when the row is one
     /// of the two section headers or nothing has been picked (§4.114).
     fn parts_picked(&self) -> Option<bool> {
-        let row = self.parts_sel?;
+        let row = self.fe.parts_sel?;
         let b = self.parts_header_b();
         if row == 0 || row == b {
             return None;
@@ -3623,14 +3216,14 @@ impl App {
     fn bind_usedcars_panels(&mut self) {
         const SHOW: &str = "ID_SHOWPARTSBUTTON";
         const DAMAGE: &str = "ID_SHOWDAMAGEBUTTON";
-        let Some(l) = self.layout_preview.as_ref() else { return };
+        let Some(l) = self.fe.layout_preview.as_ref() else { return };
         let names = [SHOW, DAMAGE, "ID_USEDCARDAMAGEPANEL", "ID_PARTSPANEL", "ID_PARTSBOX", "ID_Used3DCar", "ID_GREYRECT", "ID_TESTDRIVEUSEDBUTTON", "ID_BUYUSEDBUTTON"];
         let want = l.widgets_named(&names);
         if want.is_empty() {
             return;
         }
         let n = self.used_cars().len();
-        let parts = self.usedcars_showparts;
+        let parts = self.fe.usedcars_showparts;
         // (hidden, enabled) per name, in the order of `names`
         let state: [(bool, Option<bool>); 9] = if n == 0 {
             [(true, Some(false)), (true, None), (false, None), (true, None), (true, None), (true, None), (true, None), (false, Some(false)), (false, Some(false))]
@@ -3639,7 +3232,7 @@ impl App {
         } else {
             [(false, Some(true)), (true, None), (false, None), (true, None), (true, None), (true, None), (true, None), (false, Some(true)), (false, Some(true))]
         };
-        if let Some(l) = self.layout_preview.as_mut() {
+        if let Some(l) = self.fe.layout_preview.as_mut() {
             for (index, which) in want {
                 let (hide, enable) = state[which];
                 l.set_hidden_flag(index, hide);
@@ -3669,7 +3262,7 @@ impl App {
     /// `OVERALL` is the tenth and is never hidden here: 0x4EF960 combines the other categories
     /// itself and always answers.
     fn bind_repair_bars(&mut self) {
-        let Some(l) = self.layout_preview.as_ref() else { return };
+        let Some(l) = self.fe.layout_preview.as_ref() else { return };
         let names: Vec<String> = QUICKFIX_NAMES.iter().map(|k| format!("ID_BAR{k}")).collect();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let want = l.widgets_named(&refs);
@@ -3681,7 +3274,7 @@ impl App {
             .map(|k| *k == "OVERALL" || self.category_has_parts(*k))
             .collect();
         tracing::debug!(hidden = ?QUICKFIX_NAMES.iter().zip(&has).filter(|(_, h)| !**h).map(|(k, _)| *k).collect::<Vec<_>>(), "repair bars");
-        if let Some(l) = self.layout_preview.as_mut() {
+        if let Some(l) = self.fe.layout_preview.as_mut() {
             for (index, which) in want {
                 l.set_hidden_flag(index, !has[which]);
             }
@@ -3703,7 +3296,7 @@ impl App {
     /// 0x5077D0 clears it on all five through the by-name helper 0x50D9A0 and then, on
     /// `[0x5DBA44]` through the jump table at 0x507894, sets it on exactly one (§4.111).
     fn bind_chronicle_group(&mut self) {
-        let Some(l) = self.layout_preview.as_ref() else { return };
+        let Some(l) = self.fe.layout_preview.as_ref() else { return };
         let want = l.widgets_named(&CHRONICLE_GROUP_BUTTONS);
         if want.is_empty() {
             return;
@@ -3716,7 +3309,7 @@ impl App {
         // the icons of the ten cells: `0x507340(year, row, variant, hot)` for rows 0 and 1
         // (0x507DDB loops `ebx < 2`), each answering the resting frame and the hovered one
         const PACKS: [&str; 5] = ["iconsrace", "icons911", "icons356", "icons924", "icons914"];
-        let pack = format!("{}.fsh", PACKS[self.chronicle_group.min(4)]);
+        let pack = format!("{}.fsh", PACKS[self.fe.chronicle_group.min(4)]);
         let entries = self.chronicle_entries();
         let mut cells: std::collections::BTreeMap<(usize, usize), (usize, usize)> = Default::default();
         for (col, (year, var)) in cols.iter().enumerate() {
@@ -3727,17 +3320,17 @@ impl App {
             }
         }
         let frames: Vec<usize> = cells.values().flat_map(|(a, b)| [*a, *b]).collect();
-        if let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) {
+        if let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) {
             for n in frames {
                 l.load_pack_entry(r, &self.paths, "Chron", &pack, n);
             }
         }
-        if let Some(l) = self.layout_preview.as_mut() {
+        if let Some(l) = self.fe.layout_preview.as_mut() {
             l.set_chronicle_icons(pack, cells);
             l.set_chronicle_columns(cols);
         }
-        let group = self.chronicle_group;
-        if let Some(l) = self.layout_preview.as_mut() {
+        let group = self.fe.chronicle_group;
+        if let Some(l) = self.fe.layout_preview.as_mut() {
             for (index, which) in want {
                 l.set_selected_flag(index, which == group);
             }
@@ -3780,7 +3373,7 @@ impl App {
     fn chronicle_entries(&self) -> Vec<(u32, usize, usize, [usize; 2])> {
         const PACKS: [&str; 5] = ["iconsrace", "icons911", "icons356", "icons924", "icons914"];
         let dir = self.paths.fe_data().join("Chron");
-        let Some(path) = GamePaths::find_file(&dir, &format!("{}.fsh", PACKS[self.chronicle_group.min(4)])) else {
+        let Some(path) = GamePaths::find_file(&dir, &format!("{}.fsh", PACKS[self.fe.chronicle_group.min(4)])) else {
             return Vec::new();
         };
         let Some(pack) = std::fs::read(&path).ok().and_then(|d| nfs_formats::fsh::Fsh::parse(&d).ok()) else {
@@ -3835,7 +3428,7 @@ impl App {
     /// and 0x507B4F's walk starts there at variant 0 and only ever moves forward. §4.121.
     fn chronicle_column(&self) -> Option<(u32, usize)> {
         let cols = self.chronicle_columns();
-        if let Some(c) = self.chronicle_col.and_then(|c| cols.get(c).copied()) {
+        if let Some(c) = self.fe.chronicle_col.and_then(|c| cols.get(c).copied()) {
             return Some(c);
         }
         let start = self.career.as_ref().map(|c| c.career.year as u32).map(|y| if y >= 1900 { (y - 1900) % 100 } else { y % 100 }).unwrap_or(0);
@@ -3845,7 +3438,7 @@ impl App {
     fn chronicle_media(&self) -> Vec<String> {
         // 0x507508's three letters, by the kind each screen passes (0x5080F8, 0x508137) — and
         // the same three the index's tags carry (§4.118)
-        self.chronicle_media_for(match self.layout_name.as_deref().unwrap_or("").to_ascii_lowercase().as_str() {
+        self.chronicle_media_for(match self.fe.layout_name.as_deref().unwrap_or("").to_ascii_lowercase().as_str() {
             "chroniclemovie" => 2usize,
             "chroniclemedia" => 1,
             _ => 0,
@@ -3856,7 +3449,7 @@ impl App {
     /// (0x5080F8, 0x508137).
     fn chronicle_media_for(&self, k: usize) -> Vec<String> {
         let kind = [b'p', b'm', b'v'][k.min(2)] as char;
-        let letter = CHRONICLE_GROUP_LETTERS.as_bytes()[self.chronicle_group.min(4)] as char;
+        let letter = CHRONICLE_GROUP_LETTERS.as_bytes()[self.fe.chronicle_group.min(4)] as char;
         // **the year and the variant come from the index**, which is what 0x5080E0 reads them
         // from — its row table `[this + row*4 + 0x160]` and `[+0x174]` is filled by the timeline
         // draw out of the very entries 0x506FE0 put in the table (§4.118). This port has no
@@ -3898,12 +3491,12 @@ impl App {
     fn bind_showcase_pictures(&mut self) {
         // `NFS5.CAMERAPICTURE`'s `shp` part is in no state list, so nothing preloads it (§4.129)
         let cams: Vec<i64> = self
-            .layout_preview
+            .fe.layout_preview
             .as_ref()
             .map(|l| l.numbered_widgets("NFS5.CAMERAPICTURE").into_iter().filter_map(|(i, _)| l.layout.elements.get(i).and_then(|e| e.int("picturenum"))).collect())
             .unwrap_or_default();
         if !cams.is_empty()
-            && let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut())
+            && let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut())
         {
             for n in cams {
                 l.load_pack_entry(r, &self.paths, "Art", nfs_game::layout::CAMERA_PICTURES, n.max(0) as usize);
@@ -3911,14 +3504,14 @@ impl App {
         }
         // `NFS5.ANIMSHOWCASEPICTURE` needs all eight entries of `show.fsh` — four pictures and
         // four labels — which its own bind 0x4BDB90 loads up front (§4.127)
-        if self.layout_preview.as_ref().is_some_and(|l| !l.numbered_widgets("NFS5.ANIMSHOWCASEPICTURE").is_empty())
-            && let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut())
+        if self.fe.layout_preview.as_ref().is_some_and(|l| !l.numbered_widgets("NFS5.ANIMSHOWCASEPICTURE").is_empty())
+            && let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut())
         {
             for n in 0..8 {
                 l.load_pack_entry(r, &self.paths, "Art", nfs_game::layout::SHOWCASE_ANIM, n);
             }
         }
-        let Some(l) = self.layout_preview.as_ref() else { return };
+        let Some(l) = self.fe.layout_preview.as_ref() else { return };
         let want = l.numbered_widgets("NFS5.ShowcasePicture");
         if want.is_empty() {
             return;
@@ -3927,7 +3520,7 @@ impl App {
             .logo_car(Some("zMergedList.Car"), None)
             .map(|c| format!("{}.fsh", c.showcase))
             .unwrap_or_default();
-        let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) else { return };
+        let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) else { return };
         for (index, number) in want {
             l.set_pack_picture(r, &self.paths, "Showcase", index, &pack, number.max(0) as usize);
         }
@@ -3946,7 +3539,7 @@ impl App {
     /// current mission's code at `fac+0x3F` — `1m01.fsh` and the rest, in `FEData/Factory` — from
     /// the first mission whose result is still 0 (0x51AE80).
     fn bind_track_maps(&mut self) {
-        let Some(l) = self.layout_preview.as_ref() else { return };
+        let Some(l) = self.fe.layout_preview.as_ref() else { return };
         let splines = l.numbered_widgets("NFS5.TrackSmall2dSpline");
         let prize = l.numbered_widgets("NFS5.PRIZERACEMAP");
         let factory = l.numbered_widgets("NFS5.FACTORYMAP");
@@ -3964,7 +3557,7 @@ impl App {
                         .filter_map(|ev| {
                             let trk = c.tables.track(ev.track_id)?;
                             let name = self
-                                .fe_strings
+                                .fe.strings
                                 .get(trk.name_string_id + 20)
                                 .map(str::to_string)
                                 .unwrap_or_else(|| c.tables.track_name(ev.track_id).to_uppercase());
@@ -3989,7 +3582,7 @@ impl App {
             .as_ref()
             .and_then(|c| Some(format!("{}.fsh", c.tables.missions[c.career.current_mission(&c.tables)?].code)))
             .unwrap_or_default();
-        let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) else { return };
+        let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) else { return };
         for (index, _) in splines {
             l.set_track_map(r, &self.paths, index, &events);
         }
@@ -4020,7 +3613,7 @@ impl App {
     /// when the portrait is one of the four female ones (0x4CF56E: `-11` when 0x5024E0 answers
     /// 4…7). 3496 is `IDS_JUNIORTESTDRIVER` and 3485 `IDS_FEMALEJUNIORTESTDRIVER`. CONFIRMED.
     fn bind_player_pictures(&mut self) {
-        let Some(l) = self.layout_preview.as_ref() else { return };
+        let Some(l) = self.fe.layout_preview.as_ref() else { return };
         let pictures: Vec<usize> = ["NFS5.PLAYERPICTURE", "NFS5.MINIPLAYERPICTURE"].iter().flat_map(|c| l.numbered_widgets(c)).map(|(i, _)| i).collect();
         let badges: Vec<usize> = ["NFS5.BADGE", "NFS5.MINIBADGE"].iter().flat_map(|c| l.numbered_widgets(c)).map(|(i, _)| i).collect();
         if pictures.is_empty()
@@ -4043,7 +3636,7 @@ impl App {
         let rank = stage
             .and_then(|st| {
                 let base = if (4..=7).contains(&picture) { 3485 } else { 3496 };
-                self.fe_strings.get(base + st as u32).map(str::to_string)
+                self.fe.strings.get(base + st as u32).map(str::to_string)
             })
             .unwrap_or_default();
         let colour = match stage.unwrap_or(0) {
@@ -4065,7 +3658,7 @@ impl App {
                 const PROFILE_FACE: [usize; 6] = [2, 0, 3, 1, 4, 5];
                 let by_profile = l.layout.elements[i].get("source").is_some_and(|s| s.eq_ignore_ascii_case("profile"));
                 let entry = if by_profile {
-                    PROFILE_FACE[(self.factory_profile as usize).min(5)]
+                    PROFILE_FACE[(self.fe.factory_profile as usize).min(5)]
                 } else {
                     self.career
                         .as_ref()
@@ -4099,7 +3692,7 @@ impl App {
             .filter_map(|(i, _)| {
                 const CHRONICLE_MOVIE: [&str; 5] = ["ch5", "Ch3", "Ch1", "Ch2", "Ch4"];
                 let src = l.layout.elements[i].get("othersource")?;
-                src.eq_ignore_ascii_case("chroniclemain").then(|| (i, format!("{}.mad", CHRONICLE_MOVIE[self.chronicle_group.min(4)])))
+                src.eq_ignore_ascii_case("chroniclemain").then(|| (i, format!("{}.mad", CHRONICLE_MOVIE[self.fe.chronicle_group.min(4)])))
             })
             .chain(l.numbered_widgets("NFS5.MOVIECIRCLE").into_iter().filter_map(|(i, _)| {
                 let file = match l.layout.elements[i].get("othersource")? {
@@ -4111,7 +3704,7 @@ impl App {
             }))
             .collect();
         let huds = l.numbered_widgets("NFS5.HUD");
-        let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) else { return };
+        let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) else { return };
         for index in pictures {
             l.set_pack_picture(r, &self.paths, "Art", index, "ALLdrivr.fsh", picture);
         }
@@ -4137,7 +3730,7 @@ impl App {
     /// Fill the `NFS5.GouraudIndicatorBar`s of whatever screen is up. Only the car-compare screen
     /// has any, and its bars read the same `<n>CarCompareCar<m>` sources as its numbers.
     fn bind_indicator_bars(&mut self) {
-        let Some(l) = self.layout_preview.as_ref() else { return };
+        let Some(l) = self.fe.layout_preview.as_ref() else { return };
         let wanted: Vec<(usize, Option<i32>)> = l
             .indicator_bars()
             .into_iter()
@@ -4169,17 +3762,17 @@ impl App {
         // `NFS5.KNOCKOUTTRACKLIST` is the strip beside those bars: the opponent count and the row
         // `Knockout.TrackNumber` is on (`LayoutScreen`'s own arm has the geometry)
         let strips: Vec<(usize, usize, usize)> = self
-            .layout_preview
+            .fe.layout_preview
             .as_ref()
             .map(|l| l.numbered_widgets("NFS5.KNOCKOUTTRACKLIST"))
             .unwrap_or_default()
             .into_iter()
-            .map(|(i, _)| (i, self.menu.as_ref().map_or(0, |m| m.ko_opponents as usize), self.menu.as_ref().map_or(0, |m| m.ko_sel)))
+            .map(|(i, _)| (i, self.fe.menu.as_ref().map_or(0, |m| m.ko_opponents as usize), self.fe.menu.as_ref().map_or(0, |m| m.ko_sel)))
             .collect();
         // the car-setting sliders: the knob's place along its track is the accessor's own index
         // in its own list (`RE/notes/layouts.md`, the car-setup section)
         let knobs: Vec<(usize, Option<(i32, i32)>)> = self
-            .layout_preview
+            .fe.layout_preview
             .as_ref()
             .map(|l| l.car_setting_sliders())
             .unwrap_or_default()
@@ -4197,7 +3790,7 @@ impl App {
                 (i, v)
             })
             .collect();
-        let Some(l) = self.layout_preview.as_mut() else { return };
+        let Some(l) = self.fe.layout_preview.as_mut() else { return };
         for (index, value) in wanted {
             l.set_bar(index, value);
         }
@@ -4209,8 +3802,10 @@ impl App {
         }
     }
 
+    /// Abandon the running race and go back to the menu; `false` when there is no menu to go back
+    /// to (the app was started straight into a race).
     fn leave_race(&mut self) -> bool {
-        let Some(menu) = self.menu_template.take() else {
+        let Some(menu) = self.fe.menu_template.take() else {
             return false;
         };
         self.save_replay();
@@ -4227,7 +3822,7 @@ impl App {
         self.skill = None;
         self.mission = None;
         self.stop_race_audio();
-        self.menu = Some(menu);
+        self.fe.menu = Some(menu);
         self.vehicle = None;
         self.race = None;
         self.world = None;
@@ -4240,11 +3835,11 @@ impl App {
     /// owns this tick, so the AI/physics below leaves them alone — a remote car is driven by what
     /// arrived, exactly as the original's receiver drives it (`network.md` §5.2).
     fn net_step(&mut self) -> Vec<usize> {
-        if self.net.is_none() {
+        if self.net.session.is_none() {
             return Vec::new();
         }
         let poses: Vec<(Vec3, Quat)> = self
-            .opponents
+            .road.opponents
             .iter()
             .map(|o| {
                 (
@@ -4255,7 +3850,7 @@ impl App {
             .collect();
         let tick = self.tick;
         // taken out for the duration so the seats and the player's car can be borrowed too
-        let mut net = self.net.take();
+        let mut net = self.net.session.take();
         let seats = {
             let n = net.as_mut().expect("checked");
             for line in n.poll(tick, |s| {
@@ -4270,7 +3865,7 @@ impl App {
         };
         if let Some(n) = net.as_ref() {
             for &s in &seats {
-                if let Some(o) = self.opponents.get_mut(s) {
+                if let Some(o) = self.road.opponents.get_mut(s) {
                     let specs = o.specs.clone();
                     n.drive(s, &mut o.vehicle, &specs, tick);
                 }
@@ -4282,15 +3877,15 @@ impl App {
         if let (Some(n), Some(v)) = (net.as_mut(), self.vehicle.as_ref()) {
             n.send(tick, v);
         }
-        self.net = net;
+        self.net.session = net;
         seats
     }
 
     fn simulate(&mut self) {
         self.tick += 1;
         self.render_prev = Some((self.car_pos, self.car_rot));
-        self.opp_prev = self
-            .opponents
+        self.road.opp_prev = self
+            .road.opponents
             .iter()
             .map(|o| {
                 (
@@ -4307,7 +3902,9 @@ impl App {
         let Some(w) = self.world.as_ref() else { return };
         if self.tick % 2 == 0 {
             // 32 Hz: latch controller, run the force step (Sc32)
-            let mut steer = (self.input.steer() * 126.0) as i32; // right = +x in the body frame
+            // right = +x in the body frame; rounded, so a pad's packet byte (a multiple of 2/126)
+            // comes back whole
+            let mut steer = (self.input.steer() * 126.0).round() as i32;
             if self.mirror {
                 steer = -steer;
             }
@@ -4344,10 +3941,10 @@ impl App {
                 .chain(std::iter::once(&RACE_START_TICK))
                 .filter(|&&t| self.tick >= t)
                 .count() as u8;
-            if phase > self.countdown_said
-                && let (Some(a), Some(sp)) = (&self.audio, &self.speech)
+            if phase > self.snd.countdown_said
+                && let (Some(a), Some(sp)) = (&self.snd.audio, &self.snd.speech)
             {
-                self.countdown_said = phase;
+                self.snd.countdown_said = phase;
                 sp.say(
                     a,
                     ["SOR-a-3.bnk", "SOR-a-2.bnk", "SOR-a-1.bnk", "SOR-a-Go.bnk"]
@@ -4367,22 +3964,21 @@ impl App {
             };
             // replay.md §4: the hook sits inside the 32 Hz input step, before the car reads the
             // packet, so recording and playback are in phase with the simulation by construction
-            let controls = match self.replay.as_mut() {
-                // `.RAMPS` is set because this port always ramps the steering (0x49DFAD's digital
-                // path); the gas and brake axes are not ramped.
+            let controls = match self.replay.stream.as_mut() {
+                // `.RAMPS` / `.RAMPG` / `.RAMPB` are `kind != 1` of the `C1_RIGHT`, `C1_GAS` and
+                // `C1_BRAKE` bindings (0x51CF54…0x51CFFC) — set for keys, clear for an axis
                 Some(r) => r.step(
                     controls,
-                    nfs_game::replay::Ramp {
-                        steer: true,
-                        gas: false,
-                        brake: false,
+                    {
+                        let (steer, gas, brake) = self.input.ramps();
+                        nfs_game::replay::Ramp { steer, gas, brake }
                     },
                     self.tick,
                 ),
                 None => controls,
             };
             // `DraftFactor` 0x49D9B0: the racer array only — traffic and police do not draft
-            let racers: Vec<Vec3> = self.opponents.iter().map(|o| o.vehicle.position).collect();
+            let racers: Vec<Vec3> = self.road.opponents.iter().map(|o| o.vehicle.position).collect();
             v.draft =
                 nfs_physics::vehicle::draft_factor(v.position, v.forward(), v.v_long(), &racers);
             // the misfire draw comes from the shared LCG, like every other draw in the game
@@ -4419,7 +4015,7 @@ impl App {
             v.impact = 0.0;
             if v.collide_walls(&w.walls, &drivable, 0.0, 0.0, 0.0) {
                 self.wall_hits += 1;
-                if let (Some(a), Some(s)) = (&self.audio, self.sfx.as_mut()) {
+                if let (Some(a), Some(s)) = (&self.snd.audio, self.snd.sfx.as_mut()) {
                     let j = v.impact;
                     if j >= v.speed() / 8.0 {
                         s.wall_hit(a, j, v.last_wall_class, 0.8)
@@ -4429,7 +4025,7 @@ impl App {
                 }
                 v.impact = 0.0;
             } else if landing > 6.0
-                && let (Some(a), Some(s)) = (&self.audio, self.sfx.as_mut())
+                && let (Some(a), Some(s)) = (&self.snd.audio, self.snd.sfx.as_mut())
             {
                 s.landing(a, landing, 0.8);
             }
@@ -4490,14 +4086,14 @@ impl App {
             // crash / roll-over one-shot (Damage 0x494500 zone rule; roll-over 0x49BC80 at level 127)
             let rolled = v.orientation.row(1).y < -0.86;
             if (v.crash_sound || rolled)
-                && let (Some(a), Some(s)) = (&self.audio, self.sfx.as_mut())
+                && let (Some(a), Some(s)) = (&self.snd.audio, self.snd.sfx.as_mut())
             {
-                if !self.crash_played {
+                if !self.snd.crash_played {
                     s.crash(a, 0.9);
                 }
-                self.crash_played = rolled;
+                self.snd.crash_played = rolled;
             } else {
-                self.crash_played = false;
+                self.snd.crash_played = false;
             }
             v.crash_sound = false;
             // tyre dust and smoke, per wheel (0x4A2880); they live on the simulation clock so a
@@ -4577,7 +4173,7 @@ impl App {
                         } => {
                             self.world_actions
                                 .push(WorldAction::Knock(element, away, launch));
-                            if let (Some(a), Some(s)) = (&self.audio, self.sfx.as_mut()) {
+                            if let (Some(a), Some(s)) = (&self.snd.audio, self.snd.sfx.as_mut()) {
                                 s.pylon_hit(a, 0.8);
                             }
                         }
@@ -4593,7 +4189,7 @@ impl App {
             // both trigger sweeps above compare the position with the previous tick's
             self.prev_car_pos = v.position;
             // traffic AI (priority 6 on the 32 Hz list, before ground contact and the collision pass)
-            if let (Some(tr), Some(t)) = (self.traffic.as_mut(), self.slices.as_ref()) {
+            if let (Some(tr), Some(t)) = (self.road.traffic.as_mut(), self.slices.as_ref()) {
                 let slice = self.race.as_ref().map(|r| r.slice).unwrap_or(0);
                 // the player's own `car+0xEB0` (0x417800): −1 below −3 m/s, +1 from 0 up, otherwise
                 // the sign of the heading against the slice
@@ -4653,7 +4249,7 @@ impl App {
                     v.speed(),
                     true,
                 )];
-                others.extend(self.opponents.iter().map(|o| {
+                others.extend(self.road.opponents.iter().map(|o| {
                     let s = o.progress.slice;
                     lane_car(
                         s,
@@ -4676,7 +4272,7 @@ impl App {
                 tr.update(t, self.tick, reference, &others);
             }
             // police (`traffic.md` §17.3 violation, §25 spawn, §27 chase)
-            if let (Some(pol), Some(t)) = (self.police.as_mut(), self.slices.as_ref()) {
+            if let (Some(pol), Some(t)) = (self.road.police.as_mut(), self.slices.as_ref()) {
                 let slice = self.race.as_ref().map(|r| r.slice).unwrap_or(0);
                 let vl = v.v_long();
                 let one_way = t.slices.get(1).map(|s| s.lanes_a == 0).unwrap_or(false);
@@ -4741,7 +4337,7 @@ impl App {
             }
             // car–car contact (approximation, see nfs_physics::vehicle::collide_cars)
             let no_carcol = std::env::var_os("NFS_NO_CARCOL").is_some();
-            for o in self.opponents.iter_mut() {
+            for o in self.road.opponents.iter_mut() {
                 if !no_carcol
                     && let Some(effect) = nfs_physics::vehicle::collide_cars(
                         v,
@@ -4749,7 +4345,7 @@ impl App {
                         &mut o.vehicle,
                         o.specs.mass,
                     )
-                    && let (Some(a), Some(s)) = (&self.audio, self.sfx.as_mut())
+                    && let (Some(a), Some(s)) = (&self.snd.audio, self.snd.sfx.as_mut())
                 {
                     s.car_car(a, effect, 0.8);
                 }
@@ -4757,9 +4353,9 @@ impl App {
             // traffic vs everyone (`traffic.md` §21.5): the broad phase walks every car pair, so a
             // traffic car is a full rigid body for the solver. The impulse it takes lives until the
             // next AI tick overwrites its velocity, exactly as in the original.
-            if !no_carcol && let Some(tr) = self.traffic.as_mut() {
+            if !no_carcol && let Some(tr) = self.road.traffic.as_mut() {
                 for (i, c) in tr.cars.iter_mut().enumerate().filter(|(_, c)| c.active) {
-                    let Some(b) = self.traffic_bodies.get_mut(i) else {
+                    let Some(b) = self.road.traffic_bodies.get_mut(i) else {
                         continue;
                     };
                     b.position = c.position;
@@ -4781,11 +4377,11 @@ impl App {
                             speed = v.speed(),
                             "player hit traffic"
                         );
-                        if let (Some(a), Some(s)) = (&self.audio, self.sfx.as_mut()) {
+                        if let (Some(a), Some(s)) = (&self.snd.audio, self.snd.sfx.as_mut()) {
                             s.car_car(a, effect, 0.8);
                         }
                     }
-                    for o in self.opponents.iter_mut() {
+                    for o in self.road.opponents.iter_mut() {
                         if let Some(effect) = nfs_physics::vehicle::collide_cars(
                             &mut o.vehicle,
                             o.specs.mass,
@@ -4806,9 +4402,9 @@ impl App {
                 }
             }
             // the player and the opponents against the police
-            if !no_carcol && let Some(pol) = self.police.as_mut() {
+            if !no_carcol && let Some(pol) = self.road.police.as_mut() {
                 for (i, c) in pol.cars.iter_mut().enumerate().filter(|(_, c)| c.active) {
-                    let Some(b) = self.police_bodies.get_mut(i) else {
+                    let Some(b) = self.road.police_bodies.get_mut(i) else {
                         continue;
                     };
                     b.position = c.position;
@@ -4820,11 +4416,11 @@ impl App {
                         nfs_physics::vehicle::collide_cars(v, self.specs.mass, b, c.mass)
                     {
                         tracing::debug!(cop = i, effect, "player hit a cop");
-                        if let (Some(a), Some(s)) = (&self.audio, self.sfx.as_mut()) {
+                        if let (Some(a), Some(s)) = (&self.snd.audio, self.snd.sfx.as_mut()) {
                             s.car_car(a, effect, 0.8);
                         }
                     }
-                    for o in self.opponents.iter_mut() {
+                    for o in self.road.opponents.iter_mut() {
                         nfs_physics::vehicle::collide_cars(&mut o.vehicle, o.specs.mass, b, c.mass);
                     }
                     c.position = b.position;
@@ -4832,11 +4428,11 @@ impl App {
                     c.angular_velocity = b.angular_velocity;
                 }
             }
-            for i in 0..self.opponents.len() {
+            for i in 0..self.road.opponents.len() {
                 if no_carcol {
                     break;
                 }
-                let (l, r) = self.opponents.split_at_mut(i + 1);
+                let (l, r) = self.road.opponents.split_at_mut(i + 1);
                 for o in r.iter_mut() {
                     let (ma, mb) = (l[i].specs.mass, o.specs.mass);
                     nfs_physics::vehicle::collide_cars(&mut l[i].vehicle, ma, &mut o.vehicle, mb);
@@ -4847,7 +4443,7 @@ impl App {
             if let Some(t) = &self.slices {
                 // race order (ascending progress) for the avoidance rule: cars directly ahead of each opponent
                 let mut order: Vec<(f32, Vec3, usize, f32, f32, bool)> = self
-                    .opponents
+                    .road.opponents
                     .iter()
                     .map(|o| {
                         (
@@ -4872,7 +4468,7 @@ impl App {
                 }
                 // traffic is in the race-order array too (`traffic.md` §8), so the opponents' "two cars
                 // directly ahead" rule sees it and steers around it
-                if let Some(tr) = &self.traffic {
+                if let Some(tr) = &self.road.traffic {
                     order.extend(tr.cars.iter().filter(|c| c.active).map(|c| {
                         (
                             c.progress,
@@ -4899,9 +4495,9 @@ impl App {
                 };
                 // every racer's position: index 0 is the human, then the opponents in order
                 let racer_positions: Vec<Vec3> = std::iter::once(self.car_pos)
-                    .chain(self.opponents.iter().map(|o| o.vehicle.position))
+                    .chain(self.road.opponents.iter().map(|o| o.vehicle.position))
                     .collect();
-                for (oi, o) in self.opponents.iter_mut().enumerate() {
+                for (oi, o) in self.road.opponents.iter_mut().enumerate() {
                     o.vehicle.race_started = self.tick >= RACE_START_TICK;
                     if net_seats.contains(&oi) {
                         // a remote player: the pose is already set, so only the lap tracker runs
@@ -4985,7 +4581,7 @@ impl App {
             // Quick Knockout cut for opponents that completed a lap this tick (modes.md §4)
             if self.quick_knockout && !ko_laps.is_empty() {
                 let mut all: Vec<(usize, f32)> = self
-                    .opponents
+                    .road.opponents
                     .iter()
                     .enumerate()
                     .map(|(i, o)| (i + 1, o.progress.progress))
@@ -5011,11 +4607,11 @@ impl App {
                                     self.player_eliminated = true;
                                     r.finished = true;
                                     r.progress -= 0.01;
-                                    if let (Some(a), Some(sp)) = (&self.audio, &self.speech) {
+                                    if let (Some(a), Some(sp)) = (&self.snd.audio, &self.snd.speech) {
                                         sp.say(a, "KO-eliminated.bnk", 0.9);
                                     }
                                 }
-                            } else if let Some(o) = self.opponents.get_mut(d - 1)
+                            } else if let Some(o) = self.road.opponents.get_mut(d - 1)
                                 && !o.eliminated
                             {
                                 o.eliminated = true;
@@ -5035,9 +4631,9 @@ impl App {
                 if r.progress > before {
                     self.player_progress_tick = self.tick;
                 }
-                let n_cars = self.opponents.len() + 1;
+                let n_cars = self.road.opponents.len() + 1;
                 let place = 1 + self
-                    .opponents
+                    .road.opponents
                     .iter()
                     .filter(|o| o.progress.progress > r.progress)
                     .count();
@@ -5047,7 +4643,7 @@ impl App {
                         time_s = r.lap_times.last().map(|t| *t as f32 / 64.0),
                         "lap completed"
                     );
-                    if let (Some(a), Some(sp)) = (&self.audio, &self.speech) {
+                    if let (Some(a), Some(sp)) = (&self.snd.audio, &self.snd.speech) {
                         let rnd = (self.tick as usize) ^ (r.laps as usize * 7919);
                         let ord = ["1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th"];
                         if r.finished && !was_finished {
@@ -5095,14 +4691,14 @@ impl App {
                             );
                             let lap_m = t.lap_len as f32 * nfs_game::race::SLICE_SPACING;
                             let leader = self
-                                .opponents
+                                .road.opponents
                                 .iter()
                                 .map(|o| o.progress.progress)
                                 .fold(r.progress, f32::max);
                             let speed = v.speed();
                             if n_cars == 2 {
                                 // kPositionRel: seconds ahead (+) / behind (−) of the rival
-                                if let Some(o) = self.opponents.first()
+                                if let Some(o) = self.road.opponents.first()
                                     && speed > 1.0
                                 {
                                     let g =
@@ -5214,7 +4810,7 @@ impl App {
                     // `MusicPlay("win*"|"lose*", 1)` — only in a race with opponents, `win*` iff first
                     // (`engine-audio.md` §8.3); the jingle is appended to the playlist and plays loud
                     if n_cars > 1
-                        && let (Some(a), Some(m)) = (&self.audio, self.music.as_mut())
+                        && let (Some(a), Some(m)) = (&self.snd.audio, self.snd.music.as_mut())
                     {
                         m.play_pattern(a, if place == 1 { "win*" } else { "lose*" }, 1);
                     }
@@ -5252,7 +4848,7 @@ impl App {
                             tracing::warn!(error = %e, "records save failed");
                         }
                         if rank == 0
-                            && let (Some(a), Some(sp)) = (&self.audio, &self.speech)
+                            && let (Some(a), Some(sp)) = (&self.snd.audio, &self.snd.speech)
                         {
                             let rnd = self.tick as usize;
                             sp.say(
@@ -5285,7 +4881,7 @@ impl App {
                         r.finished = true;
                         r.progress -= 0.01;
                         for o in self
-                            .opponents
+                            .road.opponents
                             .iter_mut()
                             .filter(|o| o.progress.progress < r.progress + 0.01)
                         {
@@ -5296,7 +4892,7 @@ impl App {
                                 o.controller = Controller::Parked;
                             }
                         }
-                        if let (Some(a), Some(sp)) = (&self.audio, &self.speech) {
+                        if let (Some(a), Some(sp)) = (&self.snd.audio, &self.snd.speech) {
                             sp.say(a, "KO-eliminated.bnk", 0.9);
                         }
                         tracing::info!(lap, place, "player knocked out");
@@ -5320,8 +4916,8 @@ impl App {
             self.input.end_tick();
         }
         // police move on the same 64 Hz integrator as traffic
-        if let (Some(pol), Some(t)) = (self.police.as_mut(), self.slices.as_ref()) {
-            self.police_prev = pol
+        if let (Some(pol), Some(t)) = (self.road.police.as_mut(), self.slices.as_ref()) {
+            self.road.police_prev = pol
                 .cars
                 .iter()
                 .map(|c| {
@@ -5335,8 +4931,8 @@ impl App {
             pol.integrate_on(t, 1.0 / 64.0, grid);
         }
         // traffic is integrated at 64 Hz from the velocity the AI wrote on the last 32 Hz tick
-        if let (Some(tr), Some(t)) = (self.traffic.as_mut(), self.slices.as_ref()) {
-            self.traffic_prev = tr
+        if let (Some(tr), Some(t)) = (self.road.traffic.as_mut(), self.slices.as_ref()) {
+            self.road.traffic_prev = tr
                 .cars
                 .iter()
                 .map(|c| {
@@ -5350,8 +4946,8 @@ impl App {
             // contact `Car_installHandlers` leaves them with (`car+0xE20`, §14.1)
             let grid = self.world.as_ref().map(|w| &w.collision);
             tr.integrate_on(t, 1.0 / 64.0, grid);
-            self.traffic_spin.resize(tr.cars.len(), 0.0);
-            for (sp, c) in self.traffic_spin.iter_mut().zip(tr.cars.iter()) {
+            self.road.traffic_spin.resize(tr.cars.len(), 0.0);
+            for (sp, c) in self.road.traffic_spin.iter_mut().zip(tr.cars.iter()) {
                 *sp = if c.active {
                     *sp + c.speed / 64.0 / 0.32
                 } else {
@@ -5360,7 +4956,7 @@ impl App {
             }
         }
         v.step64(&self.specs);
-        for o in self.opponents.iter_mut() {
+        for o in self.road.opponents.iter_mut() {
             o.vehicle.step64(&o.specs);
             if self.tick % 32 == 0 {
                 o.vehicle.renormalise();
@@ -5371,14 +4967,14 @@ impl App {
         }
         self.car_pos = v.position;
         self.car_rot = Quat::from_mat3(&v.orientation.transpose()).normalize();
-        if let (Some(a), Some(sp)) = (&self.audio, &self.speech) {
+        if let (Some(a), Some(sp)) = (&self.snd.audio, &self.snd.speech) {
             sp.update(a);
         }
         let mirror = self.mirror;
         // AI engine loops (`engine-audio.md` §5): two crossfaded samples plus a road loop per opponent.
         // Traffic cars are left silent: the original drives their loops from `car+0xDB4`, and the port's
         // kinematic traffic has no engine speed to drive them with.
-        if let (Some(a), Some(ai)) = (&self.audio, self.ai_engines.as_mut()) {
+        if let (Some(a), Some(ai)) = (&self.snd.audio, self.snd.ai_engines.as_mut()) {
             let cam = self.camera.position;
             // `MIRROR` negates the pan angle before the atan2 that produces it (0x4A704D, 0x4A78C1
             // and the other four sites of `modes.md` §2.1), so flip the right vector with the world
@@ -5387,9 +4983,9 @@ impl App {
                 .cross(Vec3::Y)
                 .normalize_or_zero()
                 * if mirror { -1.0 } else { 1.0 };
-            let level = self.audio_settings.engine_level as f32 / 255.0;
-            for (i, o) in self.opponents.iter().enumerate() {
-                let set = self.opponent_sets.get(i).cloned().unwrap_or_default();
+            let level = self.snd.audio_settings.engine_level as f32 / 255.0;
+            for (i, o) in self.road.opponents.iter().enumerate() {
+                let set = self.road.opponent_sets.get(i).cloned().unwrap_or_default();
                 if set.is_empty() {
                     continue;
                 }
@@ -5415,7 +5011,7 @@ impl App {
                     pan,
                     o.vehicle.v_long(),
                     1.0,
-                    self.audio_settings.audio_quality,
+                    self.snd.audio_settings.audio_quality,
                     64,
                     level,
                 );
@@ -5425,10 +5021,10 @@ impl App {
             // `Traffic_pickGear` 0x408130 — 1 below 2 m/s, otherwise 0 while the car has not been hit
             // (`car+0x104C == −1`), and the highest gear whose top speed is under the current speed
             // while it is recovering from one.
-            if let (Some(tr), Some(specs)) = (&self.traffic, &self.traffic_specs) {
-                let base = self.opponents.len();
+            if let (Some(tr), Some(specs)) = (&self.road.traffic, &self.road.traffic_specs) {
+                let base = self.road.opponents.len();
                 for (i, c) in tr.cars.iter().enumerate() {
-                    let set = self.traffic_sets.get(i).cloned().unwrap_or_default();
+                    let set = self.road.traffic_sets.get(i).cloned().unwrap_or_default();
                     if !c.active || set.is_empty() {
                         ai.stop(a, base + i);
                         continue;
@@ -5460,7 +5056,7 @@ impl App {
                         pan,
                         c.speed,
                         1.0,
-                        self.audio_settings.audio_quality,
+                        self.snd.audio_settings.audio_quality,
                         64,
                         level,
                     );
@@ -5480,25 +5076,25 @@ impl App {
             }
         }
         // track ambience: a quarter of the elements per update (0x4AEF30)
-        if let (Some(a), Some(amb)) = (&self.audio, self.ambience.as_mut()) {
+        if let (Some(a), Some(amb)) = (&self.snd.audio, self.snd.ambience.as_mut()) {
             let cam = self.camera.position;
             let fwd = (self.camera.target - cam).normalize_or_zero();
             let right = fwd.cross(Vec3::Y).normalize_or_zero();
             amb.update(a, self.tick, cam.into(), right.into(), fwd.into());
         }
         // end-of-stream advance through the playlist (0x4ADD6D)
-        if let (Some(a), Some(m)) = (&self.audio, self.music.as_mut()) {
+        if let (Some(a), Some(m)) = (&self.snd.audio, self.snd.music.as_mut()) {
             m.update(a);
         }
         // tunnel reverb (`engine-audio.md` §4.7): the enclosure test every audio update, then the
         // level that snaps to 100 under a road deck and decays 100 → 68 → 36 → 8 on the way out
-        if let Some(a) = &self.audio {
+        if let Some(a) = &self.snd.audio {
             let in_tunnel = w.in_tunnel(v.position);
-            if self.reverb.update(in_tunnel, false, false).is_some() {
-                a.set_reverb(self.reverb.wet());
+            if self.snd.reverb.update(in_tunnel, false, false).is_some() {
+                a.set_reverb(self.snd.reverb.wet());
             }
         }
-        if let (Some(a), Some(e)) = (&self.audio, self.engine_sound.as_mut()) {
+        if let (Some(a), Some(e)) = (&self.snd.audio, self.snd.engine_sound.as_mut()) {
             // view mode: the audio mode follows the view id the camera stands for
             // (`nfs_game::camera::audio_mode`, `engine-audio.md` §4.2) — 1 for the bumper view,
             // 2 for the chase views, 0 (the `.cct`/`.clt` cockpit layers) for the driver view and
@@ -5544,20 +5140,20 @@ impl App {
                     pan,
                     distance: dist,
                     doppler: 1.0,
-                    detail: self.audio_settings.audio_quality,
+                    detail: self.snd.audio_settings.audio_quality,
                     crowding: 0,
-                    engine_level: self.audio_settings.engine_level,
-                    shift: (v.shift_timer > 0 && v.gear > self.last_gear)
+                    engine_level: self.snd.audio_settings.engine_level,
+                    shift: (v.shift_timer > 0 && v.gear > self.snd.last_gear)
                         .then_some((v.shift_timer, self.specs.shift_ticks)),
                 },
             );
             // the click fires on the last tick of the shift, not at the gear change (§4.3)
-            if v.shift_timer == 1 && v.gear > self.last_gear {
+            if v.shift_timer == 1 && v.gear > self.snd.last_gear {
                 e.play_shift(a, 0.6);
             }
         }
-        self.last_gear = v.gear;
-        if let (Some(a), Some(s)) = (&self.audio, self.sfx.as_mut()) {
+        self.snd.last_gear = v.gear;
+        if let (Some(a), Some(s)) = (&self.snd.audio, self.snd.sfx.as_mut()) {
             s.update();
             // tyre squeal producer 0x40FBC0: per-axle slip sums, upright and near the ground
             let upright = v.orientation.row(1).y > 0.5;
@@ -5571,7 +5167,7 @@ impl App {
             } else {
                 0.0
             };
-            let sfx_level = self.audio_settings.sfx_level as f32 / 255.0;
+            let sfx_level = self.snd.audio_settings.sfx_level as f32 / 255.0;
             s.squeal(
                 a,
                 self.specs.class.min(2),
@@ -5608,7 +5204,7 @@ impl App {
             s.wind(a, view == 0x00, v.v_long(), sfx_level);
             // §4.6: the boost state the physics now keeps (`car+0x54C`), at the aux base level of
             // `Engine_auxVolume(mode)` scaled by the engine gain
-            if let Some(e) = &self.engine_sound {
+            if let Some(e) = &self.snd.engine_sound {
                 let mode = nfs_game::camera::audio_mode(
                     view,
                     !matches!(view, 0x0C | 0x14),
@@ -5636,24 +5232,24 @@ impl App {
     /// after a played-back stream runs out (0x415CB3, `replay.md` §5.2).
     fn replay_tick(&mut self) {
         use nfs_game::replay::Mode;
-        let Some(r) = self.replay.as_ref() else {
+        let Some(r) = self.replay.stream.as_ref() else {
             return;
         };
         match r.mode {
             Mode::Recording | Mode::Full => {
                 let done = self.race.as_ref().map(|r| r.finished).unwrap_or(false)
                     || self.player_eliminated;
-                if done && !self.replay_saved {
+                if done && !self.replay.saved {
                     self.save_replay();
                 }
             }
             Mode::Exhausted => {
-                self.replay_end_ticks += 1;
-                if self.replay_end_ticks >= nfs_game::replay::END_GRACE_TICKS {
-                    self.replay_end_ticks = 0;
+                self.replay.end_ticks += 1;
+                if self.replay.end_ticks >= nfs_game::replay::END_GRACE_TICKS {
+                    self.replay.end_ticks = 0;
                     tracing::info!("replay finished");
                     if !self.leave_race() {
-                        self.replay = None;
+                        self.replay.stream = None;
                     }
                 }
             }
@@ -5664,8 +5260,8 @@ impl App {
     /// Write the port's replay file (`replay.md` §6.2 saves `replay.rpl` after every race; §14.5
     /// explains why this is the port's own format and not the original's 118 312-byte dump).
     fn save_replay(&mut self) {
-        self.replay_saved = true;
-        let Some(r) = self.replay.as_mut() else {
+        self.replay.saved = true;
+        let Some(r) = self.replay.stream.as_mut() else {
             return;
         };
         if r.written() == 0 {
@@ -5675,11 +5271,11 @@ impl App {
             r.final_tick = self.tick;
         }
         let file = nfs_game::replay::ReplayFile {
-            setup: self.replay_setup.clone(),
+            setup: self.replay.setup.clone(),
             final_tick: r.final_tick,
             stream: r.stream().to_vec(),
         };
-        let path = self.replay_path.clone();
+        let path = self.replay.path.clone();
         let bytes = file.write();
         let res = std::fs::create_dir_all(path.parent().unwrap_or(&path))
             .and_then(|_| std::fs::write(&path, bytes));
@@ -5699,14 +5295,14 @@ impl App {
 
     /// The room the previewed screen names in its `room=` (`RE/notes/frontend-3d.md` §1).
     fn fe_room_of(&self) -> Option<&'static nfs_game::room::Room> {
-        let l = self.layout_preview.as_ref()?;
+        let l = self.fe.layout_preview.as_ref()?;
         nfs_game::room::room(l.layout.screen().and_then(|s| s.get("room")).unwrap_or(""))
     }
 
     /// Load the room's models and the car that stands in it, keeping whatever is already loaded.
     fn load_fe_room(&mut self) {
         let Some(room) = self.fe_room_of() else {
-            self.fe_room.clear();
+            self.fe.room.clear();
             return;
         };
         // the car the screen's own `NFS5.3DCAR` names — with `positiontype` 0 the room owns it
@@ -5716,9 +5312,9 @@ impl App {
         // accessor answers elsewhere.
         // the model **and its body style** — `nfs5.car +0x1C0`, which is what picks the `[styleN]`
         // section (`car-model.md`, `applyStyle` 0x437B00)
-        let fallback = self.menu.as_ref().map(|m| (m.cars[m.car_idx].model.clone(), m.cars[m.car_idx].variant));
+        let fallback = self.fe.menu.as_ref().and_then(|m| m.car()).map(|c| (c.model.clone(), c.variant));
         let widgets = self
-            .layout_preview
+            .fe.layout_preview
             .as_ref()
             .map(|l| l.car_3d())
             .unwrap_or_default();
@@ -5749,12 +5345,12 @@ impl App {
             wanted.push((usize::MAX, model, variant));
         }
         if self
-            .fe_room
+            .fe.room
             .iter()
             .map(|(n, _)| n.as_str())
             .ne(room.models.iter().copied())
         {
-            self.fe_room.clear();
+            self.fe.room.clear();
             let dir = self.paths.fe_data().join("Models");
             for name in room.models {
                 let Some(r) = self.renderer.as_mut() else {
@@ -5764,7 +5360,7 @@ impl App {
                     .map_err(anyhow::Error::from)
                     .and_then(|a| CarModel::upload(r, &a, &self.paths, 1, [0xC0, 0xC0, 0xC0]));
                 match loaded {
-                    Ok(m) => self.fe_room.push((name.to_string(), m)),
+                    Ok(m) => self.fe.room.push((name.to_string(), m)),
                     Err(e) => {
                         tracing::warn!(room = room.id, model = name, error = %e, "front-end room model unavailable")
                     }
@@ -5772,18 +5368,24 @@ impl App {
             }
             tracing::info!(
                 room = room.id,
-                models = self.fe_room.len(),
+                models = self.fe.room.len(),
                 "front-end room loaded"
             );
         }
+        // **The key is the model file, the body style and the paint — not the file alone.** 87
+        // playable cars share **21** model files: a family is one `.crp` and its cars differ by
+        // the `[styleN]` section `nfs5.car +0x1C0` picks (`applyStyle` 0x437B00) — `356A` is one
+        // file for twelve cars and twelve styles, `964` one for eight. Keyed on the file alone,
+        // stepping through a family never reloaded, so the showroom kept the first car's body
+        // and paint while the name under it changed. Found in play, 2026-09-21.
+        let paint = self.paint;
         if self
-            .fe_cars
+            .fe.cars
             .iter()
-            .map(|(i, n, _)| (*i, n.as_str()))
-            .ne(wanted.iter().map(|(i, n, _)| (*i, n.as_str())))
+            .map(|(i, n, v, p, _)| (*i, n.as_str(), *v, *p))
+            .ne(wanted.iter().map(|(i, n, v)| (*i, n.as_str(), *v, paint)))
         {
-            self.fe_cars.clear();
-            let paint = self.paint;
+            self.fe.cars.clear();
             for (slot, model, variant) in wanted {
                 let Some(r) = self.renderer.as_mut() else {
                     return;
@@ -5793,10 +5395,71 @@ impl App {
                     .map_err(anyhow::Error::from)
                     .and_then(|a| CarModel::upload(r, &a, &self.paths, 1, paint));
                 match loaded {
-                    Ok(m) => self.fe_cars.push((slot, model, m)),
+                    Ok(m) => self.fe.cars.push((slot, model, variant, paint, m)),
                     Err(e) => tracing::warn!(model, error = %e, "front-end car model unavailable"),
                 }
             }
+        }
+    }
+
+    /// The car a `NFS5.3DCAR` widget shows: the one loaded for its own slot, or — for the widget
+    /// with no `positiontype` of its own — the room's car (`usize::MAX`).
+    fn fe_car_slot_of(&self, widget: usize) -> Option<usize> {
+        let l = self.fe.layout_preview.as_ref()?;
+        let w = l.car_3d().into_iter().find(|w| w.index == widget)?;
+        let slot = if w.position().is_some() { widget } else { usize::MAX };
+        self.fe.cars.iter().position(|c| c.0 == slot)
+    }
+
+    /// A click's part events: the lids go to the car's own easers (0x439A00…0x439BD0). The sound
+    /// effects are not played — this port's front end has no sound path.
+    fn fe_car_part_events(&mut self, widget: usize, events: &[nfs_game::carparts::PartEvent]) {
+        use nfs_game::carparts::PartEvent;
+        let Some(k) = self.fe_car_slot_of(widget) else { return };
+        let car = &mut self.fe.cars[k].4;
+        for e in events {
+            match *e {
+                PartEvent::Hood(open) => car.set_lid(true, open),
+                PartEvent::Trunk(open) => car.set_lid(false, open),
+                PartEvent::Sfx(_) => {}
+            }
+        }
+    }
+
+    /// One frame of the parts: the step (0x4C0696…0x4C07CF), then each widget's doors onto its
+    /// car's channels 6 and 7 and the lids' easers onto 8 and 9.
+    fn fe_car_parts_step(&mut self) {
+        // `NFS_FE_PARTS=1,3` clicks those zones of every 3D car at tick 0, once, so a still taken
+        // with `NFS_FE_CLOCK` shows them open — the way `NFS_FE_DZ` stands in for a dragged bar
+        if !self.fe.parts_forced
+            && let Ok(v) = std::env::var("NFS_FE_PARTS")
+        {
+            self.fe.parts_forced = true;
+            let widgets: Vec<usize> = self.fe.layout_preview.as_ref().map(|l| l.car_3d().iter().map(|w| w.index).collect()).unwrap_or_default();
+            for w in widgets {
+                for z in v.split(',').filter_map(|z| z.trim().parse::<u32>().ok()) {
+                    let ev = self.fe.layout_preview.as_mut().map(|l| l.car_click_zone(w, z, 0)).unwrap_or_default();
+                    self.fe_car_part_events(w, &ev);
+                    if let Some(k) = self.fe_car_slot_of(w) {
+                        self.fe.cars[k].4.update_lids(1000);
+                    }
+                }
+            }
+        }
+        let Some(l) = self.fe.layout_preview.as_mut() else { return };
+        l.step_car_parts();
+        let widgets: Vec<usize> = l.car_3d().iter().map(|w| w.index).collect();
+        let dt = (self.frame_dt * 1000.0).round().clamp(0.0, 250.0) as u32;
+        for w in widgets {
+            let doors = self.fe.layout_preview.as_ref().map(|l| l.car_doors(w)).unwrap_or((0.0, 0.0));
+            if let Some(k) = self.fe_car_slot_of(w) {
+                let car = &mut self.fe.cars[k].4;
+                car.set_channel(6, doors.0);
+                car.set_channel(7, doors.1);
+            }
+        }
+        for c in self.fe.cars.iter_mut() {
+            c.4.update_lids(dt);
         }
     }
 
@@ -5808,7 +5471,7 @@ impl App {
         };
         // the room slides toward the camera as the screen fades out
         let fade = self
-            .layout_preview
+            .fe.layout_preview
             .as_ref()
             .map(|l| l.transition().progress() as f32 / nfs_game::layout::TRANS_FULL as f32)
             .unwrap_or(0.0);
@@ -5820,14 +5483,17 @@ impl App {
                 * Quat::from_rotation_z(room.rot[2] * std::f32::consts::TAU);
             Mat4::from_rotation_translation(rot, pos)
         };
-        let spin = room.spin_turns(self.fe_ms);
+        // the parts a click opened (`nfs_game::carparts`): the step, then the doors onto channels
+        // 6/7 and the lids' easers onto 8/9 of the car each `NFS5.3DCAR` shows
+        self.fe_car_parts_step();
+        let spin = room.spin_turns(self.fe.ms);
         let mut items = Vec::new();
         let room_m = turn(room.models_turn.unwrap_or(spin));
-        for (_, model) in &self.fe_room {
+        for (_, model) in &self.fe.room {
             items.extend(model.draw_items(room_m, [0.0; 4], 0.0));
         }
         let widgets = self
-            .layout_preview
+            .fe.layout_preview
             .as_ref()
             .map(|l| l.car_3d())
             .unwrap_or_default();
@@ -5835,7 +5501,7 @@ impl App {
         // drawn into an offscreen view instead, so it lands in that widget's place in the screen's
         // drawing order rather than behind all of it
         let mut views: Vec<(usize, Vec<nfs_renderer::DrawItem>)> = Vec::new();
-        for (slot, _, car) in &self.fe_cars {
+        for (slot, _, _, _, car) in &self.fe.cars {
             match widgets
                 .iter()
                 .find(|w| w.index == *slot)
@@ -5883,7 +5549,7 @@ impl App {
         let (camera, ambient, sun) = (self.camera, self.scene.ambient, self.scene.sun_direction);
         let mut rendered: Vec<(usize, nfs_renderer::TextureId)> = Vec::new();
         for (slot, items) in views {
-            let reuse = self.layout_preview.as_ref().and_then(|l| l.car_view(slot));
+            let reuse = self.fe.layout_preview.as_ref().and_then(|l| l.car_view(slot));
             let scene = Scene {
                 items,
                 ambient,
@@ -5895,7 +5561,7 @@ impl App {
             };
             rendered.push((slot, r.render_offscreen(&scene, &camera, w, h, reuse)));
         }
-        if let Some(l) = self.layout_preview.as_mut() {
+        if let Some(l) = self.fe.layout_preview.as_mut() {
             for (slot, tex) in rendered {
                 l.set_car_view(slot, Some(tex));
             }
@@ -5905,23 +5571,23 @@ impl App {
     /// The front end's own sprites: the previewed `.lay` screen over its background, the bottom bar
     /// and the port's key hint, or the text menu when no layout is loaded.
     fn fe_sprites(&self) -> Vec<Sprite> {
-        match &self.layout_preview {
+        match &self.fe.layout_preview {
             Some(l) => {
                 let aspect = self.renderer.as_ref().map(|r| r.aspect()).unwrap_or(1.6);
                 let controls = l.controls();
                 let sel = controls
-                    .get(self.layout_sel.min(controls.len().saturating_sub(1)))
+                    .get(self.fe.layout_sel.min(controls.len().saturating_sub(1)))
                     .map(|c| c.index);
                 let mut v = l.letterbox_bars(aspect);
-                v.extend(l.sprites(aspect, &self.fe_strings, sel, &|a| self.accessor_value(a)));
+                v.extend(l.sprites(aspect, &self.fe.strings, sel, &|a| self.accessor_value(a)));
                 // the bottom bar the front end draws on every screen (0x4D39D3)
-                if let Some(b) = &self.layout_bottom {
+                if let Some(b) = &self.fe.layout_bottom {
                     v.extend(
-                        b.sprites(aspect, &self.fe_strings, None, &|a| self.accessor_value(a)),
+                        b.sprites(aspect, &self.fe.strings, None, &|a| self.accessor_value(a)),
                     );
                 }
-                if let Some(f) = self.menu.as_ref().and_then(|m| m.font.as_ref()) {
-                    let name = self.layout_name.clone().unwrap_or_default();
+                if let Some(f) = self.fe.menu.as_ref().and_then(|m| m.font.as_ref()) {
+                    let name = self.fe.layout_name.clone().unwrap_or_default();
                     let hint = if l.can_play() {
                         "UP/DOWN SELECT   LEFT/RIGHT CHANGE   ENTER RACE   ESC BACK"
                     } else {
@@ -5941,7 +5607,7 @@ impl App {
                 v
             }
             None => self
-                .menu
+                .fe.menu
                 .as_ref()
                 .map(|m| m.sprites(self.career.as_ref()))
                 .unwrap_or_default(),
@@ -6095,7 +5761,7 @@ impl App {
         if let Some(f) = self.hud.as_mut().and_then(|h| h.font.as_mut()) {
             f.set_aspect(a);
         }
-        if let Some(f) = self.menu.as_mut().and_then(|m| m.font.as_mut()) {
+        if let Some(f) = self.fe.menu.as_mut().and_then(|m| m.font.as_mut()) {
             f.set_aspect(a);
         }
         if let Some(w) = self.world.as_mut() {
@@ -6117,13 +5783,13 @@ impl App {
         {
             self.scene.clear_color = [c[0] as f64, c[1] as f64, c[2] as f64, 1.0];
         }
-        if self.vehicle.is_none() && self.menu.is_some() {
+        if self.vehicle.is_none() && self.fe.menu.is_some() {
             self.scene.clear_color = [0.0, 0.0, 0.0, 1.0];
             self.load_fe_room();
             self.fe_room_items();
             // a screen with a room behind it must not paint its own black fill over it
-            let room = !self.fe_room.is_empty() || !self.fe_cars.is_empty();
-            if let Some(l) = self.layout_preview.as_mut() {
+            let room = !self.fe.room.is_empty() || !self.fe.cars.is_empty();
+            if let Some(l) = self.fe.layout_preview.as_mut() {
                 l.set_overlay(room);
             }
             self.scene.sprites = self.fe_sprites();
@@ -6136,13 +5802,13 @@ impl App {
             .map(|r| r.aspect())
             .unwrap_or(HUD_REF_W / HUD_REF_H);
         if let (Some(h), Some(v)) = (&self.hud, &self.vehicle) {
-            let position = if self.opponents.is_empty() {
+            let position = if self.road.opponents.is_empty() {
                 None
             } else {
                 // rank the player among the opponents by progress (ties: earlier progress tick)
                 let mut better = 0;
                 if let Some(r) = &self.race {
-                    for o in &self.opponents {
+                    for o in &self.road.opponents {
                         if o.progress.progress > r.progress
                             || (o.progress.progress == r.progress
                                 && o.last_progress_tick < self.player_progress_tick)
@@ -6151,7 +5817,7 @@ impl App {
                         }
                     }
                 }
-                Some((better, self.opponents.len() + 1))
+                Some((better, self.road.opponents.len() + 1))
             };
             self.scene.sprites.extend(h.sprites(
                 hud_aspect,
@@ -6163,17 +5829,25 @@ impl App {
                 self.num_laps,
                 position,
             ));
+            // `HReplay` is up for as long as the stream is playing (`hud.md` §5.2)
+            if let Some(r) = &self.replay.stream
+                && r.mode == nfs_game::replay::Mode::Playing
+            {
+                let mut bar = Vec::new();
+                h.replay_bar(&mut bar, hud_aspect, self.paused, self.replay.speed);
+                self.scene.sprites.extend(bar);
+            }
             // the original's blip loop walks the whole racer list (0x433328), so traffic is on the map too
             let tick = self.tick;
             let mut others: Vec<(Vec3, [f32; 4])> = self
-                .opponents
+                .road.opponents
                 .iter()
                 .enumerate()
                 .map(|(i, o)| {
                     (
                         o.vehicle.position,
                         Hud::blip_color(
-                            self.opponent_paints
+                            self.road.opponent_paints
                                 .get(i)
                                 .copied()
                                 .unwrap_or([0x20, 0x40, 0xC0]),
@@ -6183,7 +5857,7 @@ impl App {
                     )
                 })
                 .collect();
-            others.extend(self.police.iter().flat_map(|p| {
+            others.extend(self.road.police.iter().flat_map(|p| {
                 p.cars.iter().filter(|c| c.active).map(|c| {
                     (
                         c.position,
@@ -6191,7 +5865,7 @@ impl App {
                     )
                 })
             }));
-            others.extend(self.traffic.iter().flat_map(|tr| {
+            others.extend(self.road.traffic.iter().flat_map(|tr| {
                 tr.cars
                     .iter()
                     .enumerate()
@@ -6200,7 +5874,7 @@ impl App {
                         (
                             c.position,
                             Hud::blip_color(
-                                self.traffic_paints
+                                self.road.traffic_paints
                                     .get(i)
                                     .copied()
                                     .unwrap_or([0x8C, 0x8C, 0x90]),
@@ -6232,7 +5906,7 @@ impl App {
                             self.player_eliminated,
                         )
                     } else {
-                        let o = &self.opponents[d - 1];
+                        let o = &self.road.opponents[d - 1];
                         (
                             o.name.clone(),
                             o.specs.name.clone(),
@@ -6253,10 +5927,10 @@ impl App {
                 let player = order.iter().position(|d| *d == 0).unwrap_or(0);
                 let mut table = Vec::new();
                 // the headers, the ordinals and the billboard's title come from `FEStrings`
-                let fe = |id: u32| self.fe_strings.get(id).unwrap_or_default().to_string();
+                let fe = |id: u32| self.fe.strings.get(id).unwrap_or_default().to_string();
                 let head = [fe(18111), fe(18112), fe(18113), fe(18114)];
                 let ordinals: Vec<String> = (18116..18124).map(fe).collect();
-                let title = fe(match self.menu.as_ref().map(|m| m.mode) {
+                let title = fe(match self.fe.menu.as_ref().map(|m| m.mode) {
                     Some(1) => 18175,
                     Some(2) => 18169,
                     _ => 18129,
@@ -6355,7 +6029,7 @@ impl App {
         let fwd = car_rot * Vec3::Z;
         let rear_view = self.input.held(Action::RearView) && self.vehicle.is_some();
         // the horn is a loop on the car's own engine bank (`engine-audio.md` §6)
-        if let (Some(a), Some(e)) = (&self.audio, self.engine_sound.as_mut()) {
+        if let (Some(a), Some(e)) = (&self.snd.audio, self.snd.engine_sound.as_mut()) {
             e.horn(
                 a,
                 self.input.held(Action::Horn) && !self.paused && self.vehicle.is_some(),
@@ -6514,13 +6188,13 @@ impl App {
             self.scene.items.extend(w.visible_items());
             self.scene.ambient = w.ambient;
         }
-        if let Some(pol) = &self.police {
+        if let Some(pol) = &self.road.police {
             for (i, c) in pol.cars.iter().enumerate().filter(|(_, c)| c.active) {
                 let (p1, r1) = (
                     c.position,
                     Quat::from_mat3(&c.orientation.transpose()).normalize(),
                 );
-                let (p, r) = match self.police_prev.get(i) {
+                let (p, r) = match self.road.police_prev.get(i) {
                     Some((p0, r0)) if p0.distance(p1) < 5.0 => {
                         (p0.lerp(p1, alpha), r0.slerp(r1, alpha).normalize())
                     }
@@ -6535,16 +6209,16 @@ impl App {
                     .unwrap_or([1.0; 3]);
                 self.scene
                     .items
-                    .extend(self.police_models[c.model].draw_items_lit(m, [spin; 4], 0.0, light));
+                    .extend(self.road.police_models[c.model].draw_items_lit(m, [spin; 4], 0.0, light));
             }
         }
-        if let Some(tr) = &self.traffic {
+        if let Some(tr) = &self.road.traffic {
             for (i, c) in tr.cars.iter().enumerate().filter(|(_, c)| c.active) {
                 let (p1, r1) = (
                     c.position,
                     Quat::from_mat3(&c.orientation.transpose()).normalize(),
                 );
-                let (p, r) = match self.traffic_prev.get(i) {
+                let (p, r) = match self.road.traffic_prev.get(i) {
                     Some((p0, r0)) if p0.distance(p1) < 5.0 => {
                         (p0.lerp(p1, alpha), r0.slerp(r1, alpha).normalize())
                     }
@@ -6552,7 +6226,7 @@ impl App {
                 };
                 let m = Mat4::from_rotation_translation(r, p);
                 // a kinematic car has no wheel state: the wheels are rolled from the distance driven
-                let spin = self.traffic_spin.get(i).copied().unwrap_or(0.0);
+                let spin = self.road.traffic_spin.get(i).copied().unwrap_or(0.0);
                 let light = self
                     .world
                     .as_ref()
@@ -6560,15 +6234,15 @@ impl App {
                     .unwrap_or([1.0; 3]);
                 self.scene
                     .items
-                    .extend(self.traffic_models[c.model].draw_items_lit(m, [spin; 4], 0.0, light));
+                    .extend(self.road.traffic_models[c.model].draw_items_lit(m, [spin; 4], 0.0, light));
             }
         }
-        for (i, o) in self.opponents.iter().enumerate() {
+        for (i, o) in self.road.opponents.iter().enumerate() {
             let (p1, r1) = (
                 o.vehicle.position,
                 Quat::from_mat3(&o.vehicle.orientation.transpose()).normalize(),
             );
-            let (p, r) = match self.opp_prev.get(i) {
+            let (p, r) = match self.road.opp_prev.get(i) {
                 Some((p0, r0)) if p0.distance(p1) < 5.0 => {
                     (p0.lerp(p1, alpha), r0.slerp(r1, alpha).normalize())
                 }
@@ -6583,10 +6257,10 @@ impl App {
                 .unwrap_or([1.0; 3]);
             self.scene
                 .items
-                .extend(self.opponent_models[o.model].draw_items_lit(
+                .extend(self.road.opponent_models[o.model].draw_items_lit(
                     m,
                     [w[0].rotation, w[1].rotation, w[2].rotation, w[3].rotation],
-                    w[0].steer / 256.0,
+                    o.vehicle.wheel_steer_turns(0, &o.specs),
                     light,
                 ));
         }
@@ -6601,12 +6275,12 @@ impl App {
             if self.vehicle.is_some() {
                 quads.extend(self.shadow_quad(car_pos, car_rot, half));
             }
-            for o in &self.opponents {
+            for o in &self.road.opponents {
                 let r = Quat::from_mat3(&o.vehicle.orientation.transpose()).normalize();
                 quads.extend(self.shadow_quad(o.vehicle.position, r, o.vehicle.half_extents));
             }
             for c in self
-                .traffic
+                .road.traffic
                 .iter()
                 .flat_map(|t| t.cars.iter())
                 .filter(|c| c.active)
@@ -6615,7 +6289,7 @@ impl App {
                 quads.extend(self.shadow_quad(c.position, r, Vec3::new(0.9, 0.6, 2.1)));
             }
             for c in self
-                .police
+                .road.police
                 .iter()
                 .flat_map(|p| p.cars.iter())
                 .filter(|c| c.active)
@@ -6669,7 +6343,7 @@ impl App {
                         v.wheels[2].rotation,
                         v.wheels[3].rotation,
                     ],
-                    v.wheels[0].steer / 256.0,
+                    v.wheel_steer_turns(0, &self.specs),
                 ),
                 None => ([0.0; 4], 0.0),
             };
@@ -6700,11 +6374,11 @@ impl App {
                 {
                     self.glare_items(&mut glares, c, car_pos, car_rot, right, up);
                 }
-                for o in &self.opponents {
+                for o in &self.road.opponents {
                     let r = Quat::from_mat3(&o.vehicle.orientation.transpose()).normalize();
                     self.glare_items(
                         &mut glares,
-                        &self.opponent_models[o.model],
+                        &self.road.opponent_models[o.model],
                         o.vehicle.position,
                         r,
                         right,
@@ -6712,7 +6386,7 @@ impl App {
                     );
                 }
                 for c in self
-                    .traffic
+                    .road.traffic
                     .iter()
                     .flat_map(|t| t.cars.iter())
                     .filter(|c| c.active)
@@ -6720,7 +6394,7 @@ impl App {
                     let r = Quat::from_mat3(&c.orientation.transpose()).normalize();
                     self.glare_items(
                         &mut glares,
-                        &self.traffic_models[c.model],
+                        &self.road.traffic_models[c.model],
                         c.position,
                         r,
                         right,
@@ -6728,7 +6402,7 @@ impl App {
                     );
                 }
                 for c in self
-                    .police
+                    .road.police
                     .iter()
                     .flat_map(|p| p.cars.iter())
                     .filter(|c| c.active)
@@ -6736,7 +6410,7 @@ impl App {
                     let r = Quat::from_mat3(&c.orientation.transpose()).normalize();
                     self.glare_items(
                         &mut glares,
-                        &self.police_models[c.model],
+                        &self.road.police_models[c.model],
                         c.position,
                         r,
                         right,
@@ -6786,11 +6460,11 @@ impl App {
     /// Menu navigation shared by the keyboard and the gamepad.
     fn menu_key(&mut self, key: MenuKey, event_loop: &ActiveEventLoop) {
         // `--layout` browse mode: the screens navigate each other through their own `destination` fields
-        if self.layout_preview.is_some() {
+        if self.fe.layout_preview.is_some() {
             self.layout_key(key, event_loop);
             return;
         }
-        let Some(m) = self.menu.as_mut() else { return };
+        let Some(m) = self.fe.menu.as_mut() else { return };
         let rows = m.rows();
         match key {
             MenuKey::Up => {
@@ -6829,7 +6503,7 @@ impl App {
                         && !m
                             .circuits
                             .iter()
-                            .any(|c| c.eq_ignore_ascii_case(&m.tracks[m.track_idx]))
+                            .any(|c| c.eq_ignore_ascii_case(m.track()))
                         && let Some(i) = m
                             .tracks
                             .iter()
@@ -6857,7 +6531,7 @@ impl App {
                                 for _ in 0..m.tracks.len() {
                                     if m.circuits
                                         .iter()
-                                        .any(|c| c.eq_ignore_ascii_case(&m.tracks[m.track_idx]))
+                                        .any(|c| c.eq_ignore_ascii_case(m.track()))
                                     {
                                         break;
                                     }
@@ -6934,12 +6608,12 @@ impl App {
                     row: m.row,
                     font: m.font.take(),
                 };
-                self.menu_template = Some(template);
+                self.fe.menu_template = Some(template);
                 self.num_opponents = req.opponents.len() as u32;
                 self.num_laps = req.laps;
                 self.paint = req.paint;
                 self.career_opponents = Some(req.opponents.clone());
-                self.traffic_count = req.traffic;
+                self.road.traffic_count = req.traffic;
                 self.race_skill = req.skill;
                 self.backwards = req.backwards;
                 self.mirror = false;
@@ -6997,10 +6671,10 @@ impl App {
                                 self.specs.apply_setup(&owned.setup, true);
                             }
                         }
-                        self.sound_set = car.sound_set.clone();
+                        self.snd.sound_set = car.sound_set.clone();
                         self.sim_name = car.sim.clone();
                         self.dials = Some((car.dial_kmh, car.dial_tach));
-                        self.menu = None;
+                        self.fe.menu = None;
                         let (renderer, window) =
                             (self.renderer.take().unwrap(), self.window.take().unwrap());
                         self.tick = 0;
@@ -7013,15 +6687,15 @@ impl App {
                             cu.message = "EVENT LOAD FAILED".into();
                         }
                         self.career_opponents = None;
-                        if let Some(mut mt) = self.menu_template.take() {
+                        if let Some(mut mt) = self.fe.menu_template.take() {
                             mt.font = mt.font.take();
-                            self.menu = Some(mt);
+                            self.fe.menu = Some(mt);
                         }
                     }
                 }
             }
             MenuKey::Enter if m.mode == 5 => {
-                let car = m.cars[m.car_idx].clone();
+                let Some(car) = m.car().cloned() else { return };
                 // new series unless one is active
                 if !self.knockout.as_ref().map(|k| k.active).unwrap_or(false) {
                     let n = m.ko_opponents.clamp(1, 7);
@@ -7044,7 +6718,7 @@ impl App {
                     let tracks: Vec<String> = (0..n as usize)
                         .map(|i| {
                             let idx = m.ko.get(i).map_or(m.track_idx, |k| k.track_idx);
-                            m.tracks.get(idx).cloned().unwrap_or_else(|| m.tracks[m.track_idx].clone())
+                            m.tracks.get(idx).cloned().unwrap_or_else(|| m.track().to_string())
                         })
                         .collect();
                     let mut used: Vec<String> = vec![car.model.to_lowercase()];
@@ -7131,8 +6805,8 @@ impl App {
                 self.player_grid_override = Some(k.start_pos[0] - 1);
                 self.num_opponents = opponents.len() as u32;
                 self.career_opponents = Some(opponents);
-                self.traffic_count = TRAFFIC_COUNT[m.traffic.min(3) as usize];
-                self.cops_enabled = m.cops;
+                self.road.traffic_count = TRAFFIC_COUNT[m.traffic.min(3) as usize];
+                self.road.cops_enabled = m.cops;
                 self.quick_knockout = false;
                 self.num_laps = m.laps;
                 self.backwards = m.backwards;
@@ -7166,7 +6840,7 @@ impl App {
                     .get(m.paint_idx % car.paint_sets.len().max(1))
                     .map(|p| p.colours[0])
                     .unwrap_or([0xD4, 0x10, 0x10]);
-                self.menu_template = Some(template);
+                self.fe.menu_template = Some(template);
                 tracing::info!(
                     track = track_name,
                     race = k.race_idx + 1,
@@ -7191,10 +6865,10 @@ impl App {
                         let race_class =
                             car.sim.to_lowercase().starts_with("gt") || car.sim.starts_with("935");
                         self.specs = CarSpecs::from_sim(&sim, race_class);
-                        self.sound_set = car.sound_set.clone();
+                        self.snd.sound_set = car.sound_set.clone();
                         self.sim_name = car.sim.clone();
                         self.dials = Some((car.dial_kmh, car.dial_tach));
-                        self.menu = None;
+                        self.fe.menu = None;
                         let (renderer, window) =
                             (self.renderer.take().unwrap(), self.window.take().unwrap());
                         self.tick = 0;
@@ -7206,7 +6880,8 @@ impl App {
                 }
             }
             MenuKey::Enter => {
-                let (track_name, car) = (m.tracks[m.track_idx].clone(), m.cars[m.car_idx].clone());
+                let Some(car) = m.car().cloned() else { return };
+                let track_name = m.track().to_string();
                 self.player_grid_override = None;
                 let template = Menu {
                     mode: m.mode,
@@ -7244,14 +6919,14 @@ impl App {
                 self.backwards = m.backwards;
                 self.mirror = m.mirror;
                 self.career_opponents = None;
-                self.traffic_count = TRAFFIC_COUNT[m.traffic.min(3) as usize];
-                self.cops_enabled = m.cops;
+                self.road.traffic_count = TRAFFIC_COUNT[m.traffic.min(3) as usize];
+                self.road.cops_enabled = m.cops;
                 self.paint = car
                     .paint_sets
                     .get(m.paint_idx % car.paint_sets.len().max(1))
                     .map(|p| p.colours[0])
                     .unwrap_or([0xD4, 0x10, 0x10]);
-                self.menu_template = Some(template);
+                self.fe.menu_template = Some(template);
                 tracing::info!(
                     track = track_name,
                     car = car.model,
@@ -7276,10 +6951,10 @@ impl App {
                         let race_class =
                             car.sim.to_lowercase().starts_with("gt") || car.sim.starts_with("935");
                         self.specs = CarSpecs::from_sim(&sim, race_class);
-                        self.sound_set = car.sound_set.clone();
+                        self.snd.sound_set = car.sound_set.clone();
                         self.sim_name = car.sim.clone();
                         self.dials = Some((car.dial_kmh, car.dial_tach));
-                        self.menu = None;
+                        self.fe.menu = None;
                         let (renderer, window) =
                             (self.renderer.take().unwrap(), self.window.take().unwrap());
                         self.tick = 0;
@@ -7295,23 +6970,23 @@ impl App {
 
     /// Navigate the previewed front-end screen: the buttons carry the name of the screen they lead to.
     fn layout_key(&mut self, key: MenuKey, event_loop: &ActiveEventLoop) {
-        let Some(l) = self.layout_preview.as_ref() else {
+        let Some(l) = self.fe.layout_preview.as_ref() else {
             return;
         };
         let controls = l.controls();
         if controls.is_empty() {
             if key == MenuKey::Back {
-                match self.layout_stack.pop() {
+                match self.fe.layout_stack.pop() {
                     Some(prev) => self.open_layout(&prev),
                     None => event_loop.exit(),
                 }
             }
             return;
         }
-        let sel = self.layout_sel.min(controls.len() - 1);
+        let sel = self.fe.layout_sel.min(controls.len() - 1);
         match key {
-            MenuKey::Up => self.layout_sel = (sel + controls.len() - 1) % controls.len(),
-            MenuKey::Down => self.layout_sel = (sel + 1) % controls.len(),
+            MenuKey::Up => self.fe.layout_sel = (sel + controls.len() - 1) % controls.len(),
+            MenuKey::Down => self.fe.layout_sel = (sel + 1) % controls.len(),
             // a combo slider edits the accessor it names
             MenuKey::Left | MenuKey::Right => {
                 let delta = if key == MenuKey::Left { -1 } else { 1 };
@@ -7339,7 +7014,7 @@ impl App {
                 // the network screens' own callbacks. What the original's handlers behind
                 // `ID_COMMSSERVERSCREEN` and friends do has not been read; these do what the
                 // protocol of `network.md` §7 allows and nothing more.
-                if self.lobby.is_some()
+                if self.net.lobby.is_some()
                     && let Some(cb) = c.callback.as_deref()
                     && matches!(
                         cb,
@@ -7354,16 +7029,16 @@ impl App {
                 // parts and all. The player's own listings are on the same lot and cannot be
                 // bought back, so only a generated one is taken.
                 if c.callback.as_deref() == Some("BUYCAR")
-                    && self.layout_name.as_deref().map(|n| n.eq_ignore_ascii_case("usedcars")).unwrap_or(false)
+                    && self.fe.layout_name.as_deref().map(|n| n.eq_ignore_ascii_case("usedcars")).unwrap_or(false)
                 {
                     let n = self.career.as_ref().map_or(0, |c| c.career.market.len());
-                    let idx = self.usedcar_sel;
+                    let idx = self.fe.usedcar_sel;
                     if idx < n
                         && let Some(cu) = self.career.as_mut()
                     {
                         match cu.career.buy_used_car(idx) {
                             Ok(()) => {
-                                self.usedcar_sel = 0;
+                                self.fe.usedcar_sel = 0;
                                 self.bind_lists();
                                 self.bind_indicator_bars();
                                 self.bind_usedcars_panels();
@@ -7414,18 +7089,18 @@ impl App {
                 // `ESC` walked back through screens the game does not keep.
                 match c.offset {
                     n if n > 0 => {
-                        if let Some(cur) = self.layout_name.clone() {
-                            self.layout_stack.push(cur);
+                        if let Some(cur) = self.fe.layout_name.clone() {
+                            self.fe.layout_stack.push(cur);
                         }
                     }
                     n if n < 0 => {
-                        self.layout_stack.pop();
+                        self.fe.layout_stack.pop();
                     }
                     _ => {}
                 }
                 self.open_layout(&dest);
             }
-            MenuKey::Back => match self.layout_stack.pop() {
+            MenuKey::Back => match self.fe.layout_stack.pop() {
                 Some(prev) => self.open_layout(&prev),
                 None => event_loop.exit(),
             },
@@ -7446,8 +7121,8 @@ impl App {
     /// since what the original's server list connects *to* is the lobby service of §1.
     fn network_callback(&mut self, cb: &str, _event_loop: &ActiveEventLoop) {
         let opened = match cb {
-            "CREATE" => self.lobby.as_ref().map(|l| l.create()),
-            "JOIN" | "CONNECT" => self.lobby.as_ref().map(|l| l.connect()),
+            "CREATE" => self.net.lobby.as_ref().map(|l| l.create()),
+            "JOIN" | "CONNECT" => self.net.lobby.as_ref().map(|l| l.connect()),
             "DIAL" => {
                 tracing::info!("the modem screen has nothing behind it in this port");
                 return;
@@ -7455,8 +7130,8 @@ impl App {
             // `EJECTPLAYER` is message 0xC6, which only a host can mean — and only once a session
             // is actually running, since the lobby's socket has no peers of its own
             "EJECTPLAYER" => {
-                let slot = self.lobby.as_ref().map(|l| l.sel).unwrap_or(0) as u8;
-                match self.net.as_mut() {
+                let slot = self.net.lobby.as_ref().map(|l| l.sel).unwrap_or(0) as u8;
+                match self.net.session.as_mut() {
                     Some(n) if n.is_host() => {
                         n.eject(slot + 1);
                         tracing::info!(slot, "eject sent");
@@ -7472,7 +7147,7 @@ impl App {
             }
             _ => {
                 // ENTER on the server list: take the row under the cursor as the address to use
-                if let Some(l) = self.lobby.as_mut() {
+                if let Some(l) = self.net.lobby.as_mut() {
                     l.ip = l.target().map(|a| a.to_string()).unwrap_or_default();
                 }
                 self.bind_lists();
@@ -7484,15 +7159,15 @@ impl App {
             Some(Ok(mut n)) => {
                 let host = n.is_host();
                 tracing::info!(cb, host, "network session open");
-                n.positional = self.lobby.as_ref().is_none_or(|l| l.positional);
-                self.net = Some(n);
+                n.positional = self.net.lobby.as_ref().is_none_or(|l| l.positional);
+                self.net.session = Some(n);
                 // one seat per player the session can hold, minus ourselves
                 if self.num_opponents == 0 {
                     self.num_opponents = 1;
                 }
                 // 0x50A0DB / 0x50AB31: the lobby screen, not the race
-                if let Some(cur) = self.layout_name.clone() {
-                    self.layout_stack.push(cur);
+                if let Some(cur) = self.fe.layout_name.clone() {
+                    self.fe.layout_stack.push(cur);
                 }
                 self.open_layout(if host { "creategame" } else { "joingame" });
             }
@@ -7533,45 +7208,67 @@ impl App {
     fn draw_frame(&mut self) {
         // the front end's screens slide and fade in over half a second (`RE/notes/controls.md` §6)
         let dt_ms = (self.frame_dt * 1000.0).round().clamp(0.0, 250.0) as u32;
-        self.fe_ms += dt_ms as u64;
-        // the steering dead zone is the front end's own `XAxis.Min`, not a constant of this
-        // port's (`nfs-input/src/gamepad.rs`)
-        if let Some(l) = self.layout_preview.as_ref() {
-            self.gamepads.set_dead_zone(l.deadzone_values()[0][0]);
+        self.fe.ms += dt_ms as u64;
+        // the steering band is the front end's own `XAxis.Min` / `XAxis.Max`, not a constant of
+        // this port's (`nfs-input/src/gamepad.rs`)
+        if let Some(l) = self.fe.layout_preview.as_ref() {
+            let bands = l.deadzone_values();
+            self.gamepads.set_axis_band(bands[0][0], bands[0][1]);
+            self.input.axis_bands = bands;
+        }
+        // **A binding row waiting for a control polls the pads** — slot 1, 0x51C4E0, every frame
+        // while it has focus: 0x51F3B0 against the baseline taken when it got it, and on a find
+        // the same commit as a key's (`Bindings::assign`) and focus goes (0x51C5DE).
+        match self.fe.layout_preview.as_ref().and_then(|l| l.focused_binding_row()) {
+            Some((i, acc)) => {
+                if let Some(base) = self.fe.binding_base.as_ref()
+                    && let Some(b) = nfs_input::bindings::capture(base, &self.input.pads)
+                {
+                    if let Some(id) = accessors::controller_action(&acc).and_then(nfs_input::binding_id) {
+                        self.input.bindings.assign(id, b);
+                        tracing::info!(row = %acc, kind = b.kind, index = b.index, "control rebound");
+                    }
+                    if let Some(l) = self.fe.layout_preview.as_mut() {
+                        l.release_focus(i);
+                    }
+                    self.fe.binding_base = None;
+                }
+            }
+            None => self.fe.binding_base = None,
         }
         let pads = self.fe_pads();
         // `Camera.Current` — the slot `NFS5.CAMERASELECT` highlights (§4.89). This port keeps the
         // chosen view as an index into the registry's own cycle, which is the same thing.
         let cam_cur = self.camera_mode as usize;
-        if let Some(l) = self.layout_preview.as_mut() {
+        if let Some(l) = self.fe.layout_preview.as_mut() {
             l.advance_transition(dt_ms);
             // hand the screen the pointer, so its widgets can pick their `hover` state (§4.39)
-            l.set_cursor(self.cursor);
+            l.set_cursor(self.fe.cursor);
             l.set_pads(pads, 0);
             l.set_camera_current(cam_cur);
         }
         // the bottom bar is a screen of its own (0x4D39D3) and its four buttons hover and animate
         // like any other (§4.53), so it needs the clock and the pointer too
-        if let Some(b) = self.layout_bottom.as_mut() {
+        if let Some(b) = self.fe.layout_bottom.as_mut() {
             b.advance_transition(dt_ms);
-            b.set_cursor(self.cursor);
+            b.set_cursor(self.fe.cursor);
         }
         // A held scrollbar arrow repeats. 0x4D0A97: the press starts `0x529220(this, 0x96, 1)` —
         // a **150 ms** repeating timer, the same one `NFS5.CARSETTINGBUTTON` uses (§4.40) — and
         // slot 10 (0x4D0B40) steps the position each time it fires.
-        if let Some((index, delta, ref mut acc)) = self.list_repeat {
+        if let Some((index, delta, ref mut acc)) = self.fe.list_repeat {
             *acc += dt_ms;
             let steps = *acc / SCROLL_REPEAT_MS;
             *acc %= SCROLL_REPEAT_MS;
-            if steps > 0 && let Some(l) = self.layout_preview.as_mut() {
+            if steps > 0 && let Some(l) = self.fe.layout_preview.as_mut() {
                 l.scroll_list(index, delta * steps as i32);
             }
         }
         // and so does a held car-setting arrow, off the very same timer (0x4C1F55, 0x4C1F80)
-        if let Some((name, step, acc)) = self.setting_repeat.take() {
+        if let Some((name, step, acc)) = self.fe.setting_repeat.take() {
             let acc = acc + dt_ms;
             let steps = acc / SCROLL_REPEAT_MS;
-            self.setting_repeat = Some((name.clone(), step, acc % SCROLL_REPEAT_MS));
+            self.fe.setting_repeat = Some((name.clone(), step, acc % SCROLL_REPEAT_MS));
             for _ in 0..steps {
                 self.set_accessor(&name, step);
             }
@@ -7583,28 +7280,28 @@ impl App {
             }
         }
         // and the movies on it, which need the renderer to put each frame in its texture
-        if let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) {
+        if let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) {
             l.advance_movies(r, dt_ms);
         }
         // the front end's own pointer (`controls.md` §4.152), and where the turntable stands,
         // which is what a hovered `NFS5.3DCAR` picks its cursor by (§4.153)
-        let spin = self.fe_room_of().map(|r| r.spin_turns(self.fe_ms)).unwrap_or(0.0);
-        if let Some(l) = self.layout_preview.as_mut() {
-            l.advance_cursor(dt_ms);
+        let spin = self.fe_room_of().map(|r| r.spin_turns(self.fe.ms)).unwrap_or(0.0);
+        if let Some(l) = self.fe.layout_preview.as_mut() {
+            l.advance_cursor(dt_ms, self.fe.mouse_down);
             l.set_car_spin(spin);
         }
         // a network screen probes once a second and refills its lists from the answers
-        if self.lobby.is_some() {
-            let before = self.lobby.as_ref().map(|l| l.found.len());
-            if let Some(l) = self.lobby.as_mut() {
+        if self.net.lobby.is_some() {
+            let before = self.net.lobby.as_ref().map(|l| l.found.len());
+            if let Some(l) = self.net.lobby.as_mut() {
                 l.poll();
             }
-            if before != self.lobby.as_ref().map(|l| l.found.len()) {
+            if before != self.net.lobby.as_ref().map(|l| l.found.len()) {
                 self.bind_lists();
             self.bind_checks();
             }
         }
-        if let Some(b) = self.layout_bottom.as_mut() {
+        if let Some(b) = self.fe.layout_bottom.as_mut() {
             b.advance_transition(dt_ms);
         }
         self.rebuild_scene();
@@ -7628,14 +7325,15 @@ impl App {
 
     /// Start the race the front end's own settings describe (the same path the text menu takes).
     fn start_from_layout(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(m) = self.menu.as_ref() else { return };
-        let (track_name, car) = (m.tracks[m.track_idx].clone(), m.cars[m.car_idx].clone());
+        let Some(m) = self.fe.menu.as_ref() else { return };
+        let Some(car) = m.car().cloned() else { return };
+        let track_name = m.track().to_string();
         self.num_opponents = m.opponents;
         self.num_laps = m.laps;
         self.backwards = m.backwards;
         self.mirror = m.mirror;
-        self.traffic_count = TRAFFIC_COUNT[m.traffic.min(3) as usize];
-        self.cops_enabled = m.cops;
+        self.road.traffic_count = TRAFFIC_COUNT[m.traffic.min(3) as usize];
+        self.road.cops_enabled = m.cops;
         self.paint = car
             .paint_sets
             .get(m.paint_idx % car.paint_sets.len().max(1))
@@ -7660,12 +7358,12 @@ impl App {
                 let race_class =
                     car.sim.to_lowercase().starts_with("gt") || car.sim.starts_with("935");
                 self.specs = CarSpecs::from_sim(&sim, race_class);
-                self.sound_set = car.sound_set.clone();
+                self.snd.sound_set = car.sound_set.clone();
                 self.sim_name = car.sim.clone();
                 self.dials = Some((car.dial_kmh, car.dial_tach));
-                self.layout_preview = None;
-                self.layout_name = None;
-                self.menu = None;
+                self.fe.layout_preview = None;
+                self.fe.layout_name = None;
+                self.fe.menu = None;
                 let (renderer, window) =
                     (self.renderer.take().unwrap(), self.window.take().unwrap());
                 self.tick = 0;
@@ -7692,7 +7390,7 @@ impl App {
         // answer `n` itself
         let v = ((n as f32 * f) as i32).min(n - 1).max(0) + lo;
         if base.starts_with("Audio.") {
-            let a = &mut self.audio_settings;
+            let a = &mut self.snd.audio_settings;
             let v = v.clamp(0, 127) as u8;
             match base {
                 "Audio.MusicLevel" => a.music_level = v,
@@ -7731,12 +7429,12 @@ impl App {
         }
         // the network screens' own sliders and lists
         if base == "Comms.Positional"
-            && let Some(n) = self.net.as_mut()
+            && let Some(n) = self.net.session.as_mut()
         {
             n.positional = !n.positional;
             return;
         }
-        if let Some(l) = self.lobby.as_mut() {
+        if let Some(l) = self.net.lobby.as_mut() {
             match base {
                 "Comms.Positional" => {
                     l.positional = !l.positional;
@@ -7754,7 +7452,7 @@ impl App {
                 _ => {}
             }
         }
-        let Some(m) = self.menu.as_mut() else { return };
+        let Some(m) = self.fe.menu.as_mut() else { return };
         let step = |i: usize, n: usize| ((i as i32 + delta).rem_euclid(n.max(1) as i32)) as usize;
         match base {
             // the knockout screen's four combo boxes edit the selected row of its table
@@ -7778,7 +7476,7 @@ impl App {
             // the used-car lot steps its own selection, not the catalogue's
             "UsedCar.Car" => {
                 let n = self.used_cars().len();
-                self.usedcar_sel = step(self.usedcar_sel, n);
+                self.fe.usedcar_sel = step(self.fe.usedcar_sel, n);
                 self.bind_indicator_bars();
             }
             "zMergedList.Car" | "OwnedCars.Car" | "DealerCar.Car" | "GenericCar.Car"
@@ -7804,13 +7502,14 @@ impl App {
             }
             "Track1.Direction" => m.backwards = !m.backwards,
             "OwnedCar.ExtColour" | "GenericCar.Colour" | "DealerCar.Colour" => {
-                let n = m.cars[m.car_idx].paint_sets.len().max(1);
+                let Some(c) = m.car() else { return };
+                let n = c.paint_sets.len().max(1);
                 m.paint_idx = step(m.paint_idx, n);
             }
             _ => {
                 // the audio levels are 0..127 and the mixers read them every tick, so a slider
                 // changes the mix straight away
-                let a = &mut self.audio_settings;
+                let a = &mut self.snd.audio_settings;
                 let lvl = |v: u8| (v as i32 + delta * 8).clamp(0, 127) as u8;
                 match base {
                     "Audio.MusicLevel" => a.music_level = lvl(a.music_level),
@@ -7830,24 +7529,24 @@ impl App {
         };
         match nfs_game::layout::LayoutScreen::load(r, &self.paths, name) {
             Ok(l) => {
-                if self.layout_bottom.is_none()
+                if self.fe.layout_bottom.is_none()
                     && let Some(r) = self.renderer.as_mut()
                 {
-                    self.layout_bottom =
+                    self.fe.layout_bottom =
                         nfs_game::layout::LayoutScreen::load(r, &self.paths, "bottombar")
                             .map_err(|e| tracing::debug!(error = %e, "no bottom bar"))
                             .ok();
-                    if let Some(b) = self.layout_bottom.as_mut() {
+                    if let Some(b) = self.fe.layout_bottom.as_mut() {
                         b.set_overlay(true);
                     }
                 }
-                self.layout_preview = Some(l);
-                self.layout_name = Some(name.to_string());
-                self.layout_sel = 0;
-                self.layout_open_combo = None;
+                self.fe.layout_preview = Some(l);
+                self.fe.layout_name = Some(name.to_string());
+                self.fe.layout_sel = 0;
+                self.fe.layout_open_combo = None;
                 // a freshly opened screen needs the device list before its first draw, not after
                 let (pads, dz) = (self.fe_pads(), Self::fe_deadzone());
-                if let Some(l) = self.layout_preview.as_mut() {
+                if let Some(l) = self.fe.layout_preview.as_mut() {
                     l.set_pads(pads, 0);
                     if let Some(dz) = dz {
                         l.set_deadzone_values(0, dz);
@@ -7856,7 +7555,7 @@ impl App {
                 // the four screens whose `callbacklist=` is a comms one need a browsing socket
                 // a browsing socket is only wanted while looking for a game; once a session is
                 // open the lobby screens read from it instead
-                self.lobby = match is_network_layout(name) && self.net.is_none() {
+                self.net.lobby = match is_network_layout(name) && self.net.session.is_none() {
                     true => netplay::Lobby::open(&self.player_name)
                         .map_err(|e| tracing::warn!(error = %e, "cannot open a browsing socket"))
                         .ok(),
@@ -7875,7 +7574,7 @@ impl App {
             self.bind_showcase_pictures();
             self.bind_track_maps();
             self.bind_player_pictures();
-                if let Some(l) = self.layout_preview.as_mut() {
+                if let Some(l) = self.fe.layout_preview.as_mut() {
                     l.transition_in();
                 }
             }
@@ -7885,17 +7584,17 @@ impl App {
 
     /// Silence the race audio (engine layers, squeal / horn loops) when leaving to the menu.
     fn stop_race_audio(&mut self) {
-        if let Some(a) = &self.audio {
-            if let Some(mut e) = self.engine_sound.take() {
+        if let Some(a) = &self.snd.audio {
+            if let Some(mut e) = self.snd.engine_sound.take() {
                 e.stop(a);
             }
-            if let Some(s) = self.sfx.as_mut() {
+            if let Some(s) = self.snd.sfx.as_mut() {
                 s.stop_loops(a);
             }
-            if let Some(ai) = self.ai_engines.as_mut() {
+            if let Some(ai) = self.snd.ai_engines.as_mut() {
                 ai.stop_all(a);
             }
-            if let Some(amb) = self.ambience.as_mut() {
+            if let Some(amb) = self.snd.ambience.as_mut() {
                 amb.stop(a);
             }
         }
@@ -7977,7 +7676,7 @@ impl App {
                 times[0] = r.lap_times.iter().sum();
             }
         }
-        for (i, o) in self.opponents.iter().enumerate() {
+        for (i, o) in self.road.opponents.iter().enumerate() {
             all.push((i + 1, key(&o.progress, o.last_progress_tick)));
             if o.progress.finished && i + 1 < 8 {
                 times[i + 1] = o.progress.lap_times.iter().sum();
@@ -7993,31 +7692,31 @@ impl App {
             .with_inner_size(winit::dpi::LogicalSize::new(1280, 800));
         let window = Arc::new(event_loop.create_window(attrs).expect("window"));
         let mut renderer = Renderer::new(window.clone()).expect("renderer");
-        if let Some(m) = self.menu.as_mut() {
+        if let Some(m) = self.fe.menu.as_mut() {
             let dir = self.paths.fe_data().join("Art");
             m.font = GamePaths::find_file(&dir, "Univers14b.ffn")
                 .and_then(|p| std::fs::read(p).ok())
                 .and_then(|d| nfs_formats::fnt::Font::parse(&d).ok())
                 .map(|f| BitmapFont::upload(&mut renderer, f));
         }
-        if self.menu.is_some() {
+        if self.fe.menu.is_some() {
             // `--layout <name>`: draw the original front-end screen instead of the text menu
-            if let Some(name) = self.layout_name.clone() {
+            if let Some(name) = self.fe.layout_name.clone() {
                 match nfs_game::layout::LayoutScreen::load(&mut renderer, &self.paths, &name) {
                     Ok(l) => {
-                        self.layout_bottom = nfs_game::layout::LayoutScreen::load(
+                        self.fe.layout_bottom = nfs_game::layout::LayoutScreen::load(
                             &mut renderer,
                             &self.paths,
                             "bottombar",
                         )
                         .ok();
-                        if let Some(b) = self.layout_bottom.as_mut() {
+                        if let Some(b) = self.fe.layout_bottom.as_mut() {
                             b.set_overlay(true);
                         }
-                        self.layout_preview = Some(l);
+                        self.fe.layout_preview = Some(l);
                         // the same as `open_layout`: the device list before the first draw
                         let (pads, dz) = (self.fe_pads(), Self::fe_deadzone());
-                        if let Some(l) = self.layout_preview.as_mut() {
+                        if let Some(l) = self.fe.layout_preview.as_mut() {
                             l.set_pads(pads, 0);
                             if let Some(dz) = dz {
                                 l.set_deadzone_values(0, dz);
@@ -8033,10 +7732,10 @@ impl App {
             self.fps_timer = Instant::now();
             // `--layout serverlist` and friends start straight on a network screen, which needs a
             // browsing socket just as `open_layout` gives one
-            if let Some(name) = self.layout_name.as_deref()
+            if let Some(name) = self.fe.layout_name.as_deref()
                 && is_network_layout(name)
             {
-                self.lobby = netplay::Lobby::open(&self.player_name)
+                self.net.lobby = netplay::Lobby::open(&self.player_name)
                     .map_err(|e| tracing::warn!(error = %e, "cannot open a browsing socket"))
                     .ok();
             }
@@ -8053,7 +7752,7 @@ impl App {
             self.bind_showcase_pictures();
             self.bind_track_maps();
             self.bind_player_pictures();
-            if let Some(l) = self.layout_preview.as_ref() {
+            if let Some(l) = self.fe.layout_preview.as_ref() {
                 for (c, n) in l.unrendered() {
                     tracing::info!(
                         class = c,
@@ -8069,8 +7768,8 @@ impl App {
             // a black square and a white square — and print what came back. The smallest case that
             // can show the fault in `RE/AUDIT.md` F2, using the pipeline the front end uses.
             if std::env::var("NFS_SPRITE_SELFTEST").is_ok() {
-                let white = self.layout_preview.as_ref().map(|l| l.white_texture());
-                let atlas = self.layout_preview.as_ref().and_then(|l| l.a_font_texture());
+                let white = self.fe.layout_preview.as_ref().map(|l| l.white_texture());
+                let atlas = self.fe.layout_preview.as_ref().and_then(|l| l.a_font_texture());
                 if let (Some(tex), Some(r)) = (white, self.renderer.as_mut()) {
                     let q = |x: f32, c: [f32; 4]| nfs_renderer::Sprite {
                         texture: tex,
@@ -8134,7 +7833,7 @@ impl App {
                 // a screen fades in over half a second (`RE/notes/controls.md` §6), so a shot taken
                 // on the first frame catches every faded widget at alpha 0 and looks empty. Let the
                 // transition finish first.
-                if let (Some(l), Some(r)) = (self.layout_preview.as_mut(), self.renderer.as_mut()) {
+                if let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) {
                     // a movie starts on a black frame and runs at fifteen a second, so a screen
                     // with one gets the same half second the fade does, whether or not the fade
                     // has already settled. A screenshot of a playing movie catches whatever frame
@@ -8150,10 +7849,10 @@ impl App {
                 // a network screen is taken on its first frame, before any `'d'` has had time to
                 // come back, so give the probe half a second — otherwise the shot shows an empty
                 // list that says nothing about the screen
-                if self.lobby.is_some() {
+                if self.net.lobby.is_some() {
                     let until = Instant::now() + Duration::from_millis(500);
                     while Instant::now() < until {
-                        if let Some(l) = self.lobby.as_mut() {
+                        if let Some(l) = self.net.lobby.as_mut() {
                             l.poll();
                         }
                         std::thread::sleep(Duration::from_millis(20));
@@ -8194,10 +7893,10 @@ impl App {
         // `Replay_startRace` 0x413EA0 + `0x414EB0`: rewind the stream and seed the shared RNG from
         // the race's seed, which is what makes a replay re-simulate the same race (replay.md §11).
         let playing = self
-            .replay
+            .replay.stream
             .as_ref()
             .is_some_and(|r| r.mode == nfs_game::replay::Mode::Playing);
-        if let Some(r) = self.replay.as_mut() {
+        if let Some(r) = self.replay.stream.as_mut() {
             r.start_race();
         }
         if playing {
@@ -8223,7 +7922,7 @@ impl App {
                         .map(|d| d.as_nanos() as u32)
                         .unwrap_or(1)
                 });
-            self.replay_setup = nfs_game::replay::ReplaySetup {
+            self.replay.setup = nfs_game::replay::ReplaySetup {
                 track: self.track.name.clone(),
                 car: self.car.model.clone(),
                 sim: self.sim_name.clone(),
@@ -8233,18 +7932,18 @@ impl App {
                 opponents: self.num_opponents,
                 traffic: TRAFFIC_COUNT
                     .iter()
-                    .position(|c| *c == self.traffic_count)
+                    .position(|c| *c == self.road.traffic_count)
                     .unwrap_or(0) as u32,
-                cops: self.cops_enabled,
+                cops: self.road.cops_enabled,
                 backwards: self.backwards,
                 mirror: self.mirror,
                 seed: self.traffic_seed,
                 skill: self.race_skill,
             };
         }
-        self.replay_setup.seed = self.traffic_seed;
-        self.replay_saved = false;
-        self.replay_loop = 0;
+        self.replay.setup.seed = self.traffic_seed;
+        self.replay.saved = false;
+        self.replay.loop_count = 0;
         nfs_game::rng::seed(self.traffic_seed);
         let mut world = TrackWorld::upload(&mut renderer, &self.track).expect("track");
         let car = CarModel::upload_with_env(
@@ -8273,26 +7972,26 @@ impl App {
                 &if self.backwards { t.reversed() } else { t },
             );
         }
-        if self.audio.is_none() {
-            self.audio = nfs_audio::AudioOutput::new()
+        if self.snd.audio.is_none() {
+            self.snd.audio = nfs_audio::AudioOutput::new()
                 .map_err(|e| tracing::warn!(error = %e, "audio disabled"))
                 .ok();
         }
-        if let Some(a) = &self.audio {
-            self.engine_sound = nfs_audio::engine::EngineSound::load(
+        if let Some(a) = &self.snd.audio {
+            self.snd.engine_sound = nfs_audio::engine::EngineSound::load(
                 a,
                 &self.paths.game_data().join("Sounds"),
-                &self.sound_set,
+                &self.snd.sound_set,
                 &self.sim_name,
             )
             .map_err(|e| tracing::warn!(error = %e, "engine sound unavailable"))
             .ok();
             // track ambience (`engine-audio.md` §7): the `<track>_audio.scn` emitters over `track.viv`
-            self.ambience = match self.track.load_scene("_audio.scn") {
+            self.snd.ambience = match self.track.load_scene("_audio.scn") {
                 Ok(Some(scene)) => nfs_audio::ambience::Ambience::load(
                     &self.paths.game_data().join("Sounds"),
                     &[&scene],
-                    self.audio_settings.ambient_level,
+                    self.snd.audio_settings.ambient_level,
                 )
                 .map_err(|e| tracing::warn!(error = %e, "ambience unavailable"))
                 .ok(),
@@ -8303,35 +8002,35 @@ impl App {
                     None
                 }
             };
-            if self.ai_engines.is_none() {
-                self.ai_engines =
+            if self.snd.ai_engines.is_none() {
+                self.snd.ai_engines =
                     nfs_audio::ai_engine::AiEngines::load(&self.paths.game_data().join("Sounds"))
                         .map_err(|e| tracing::warn!(error = %e, "AI engine banks unavailable"))
                         .ok();
             }
-            if self.sfx.is_none() {
-                self.sfx =
+            if self.snd.sfx.is_none() {
+                self.snd.sfx =
                     nfs_audio::sfx::CollisionSfx::load(&self.paths.game_data().join("Sounds"))
                         .map_err(|e| tracing::warn!(error = %e, "collision sfx unavailable"))
                         .ok();
             }
-            if self.speech.is_none() {
-                self.speech =
+            if self.snd.speech.is_none() {
+                self.snd.speech =
                     nfs_audio::speech::Speech::load(&self.paths.game_data().join("Speech"))
                         .map_err(|e| tracing::warn!(error = %e, "speech unavailable"))
                         .ok();
             }
-            self.countdown_said = 0;
-            if self.music.is_none() && self.autotest.is_none() && self.screenshot.is_none() {
+            self.snd.countdown_said = 0;
+            if self.snd.music.is_none() && self.autotest.is_none() && self.screenshot.is_none() {
                 // `MusicPlay(NULL, 0)` at race start: any entry of the saved playlist but the current one
-                self.music = nfs_audio::music::MusicPlayer::new(
+                self.snd.music = nfs_audio::music::MusicPlayer::new(
                     &self.paths.game_data().join("Music"),
                     &self.paths.game_data().join("Sounds"),
-                    &self.audio_settings,
+                    &self.snd.audio_settings,
                 )
                 .map_err(|e| tracing::warn!(error = %e, "music unavailable"))
                 .ok();
-                if let Some(m) = self.music.as_mut() {
+                if let Some(m) = self.snd.music.as_mut() {
                     m.start_race(a);
                 }
             }
@@ -8374,10 +8073,10 @@ impl App {
                     "grid pose"
                 );
                 // opponents: distinct catalogue models, parked on their grid slots
-                self.opponents.clear();
-                self.opponent_models.clear();
-                self.opponent_sets.clear();
-                self.opponent_paints.clear();
+                self.road.opponents.clear();
+                self.road.opponent_models.clear();
+                self.road.opponent_sets.clear();
+                self.road.opponent_paints.clear();
                 let catalog = nfs_formats::fedata::parse_car_catalog(
                     &std::fs::read(self.paths.fe_data().join("Data").join("nfs5.car"))
                         .unwrap_or_default(),
@@ -8515,7 +8214,7 @@ impl App {
                     vehicle.ai_driven = true;
                     vehicle.body_points = nfs_game::world::car_body_points(&assets);
                     vehicle.fit_half_extents();
-                    self.opponent_models.push(model);
+                    self.road.opponent_models.push(model);
                     let controller = match CarAssets::load_ais(&self.paths, &entry.model) {
                         Ok(ais) => {
                             let mut d = nfs_game::ai::AiDriver::new(ais, &specs, &sim.unknown_tail);
@@ -8532,16 +8231,16 @@ impl App {
                             Controller::Parked
                         }
                     };
-                    self.opponent_sets.push(entry.sound_set.clone());
-                    self.opponent_paints.push(paint);
-                    self.opponents.push(RaceCar {
+                    self.road.opponent_sets.push(entry.sound_set.clone());
+                    self.road.opponent_paints.push(paint);
+                    self.road.opponents.push(RaceCar {
                         name: name.clone(),
                         vehicle,
                         specs,
                         progress: RaceProgress::new(sl, t),
                         controller,
                         grid_pos: g,
-                        model: self.opponent_models.len() - 1,
+                        model: self.road.opponent_models.len() - 1,
                         last_progress_tick: 0,
                         wall_hits: 0,
                         resets: 0,
@@ -8551,13 +8250,13 @@ impl App {
                 // network play: every opponent seat belongs to a remote player. Their cars sit on
                 // the grid until the first 0xBE arrives and are driven by it afterwards, so their
                 // controllers never run.
-                if let Some(n) = self.net.as_mut() {
-                    n.reserve((0..self.opponents.len()).collect());
-                    for o in self.opponents.iter_mut() {
+                if let Some(n) = self.net.session.as_mut() {
+                    n.reserve((0..self.road.opponents.len()).collect());
+                    for o in self.road.opponents.iter_mut() {
                         o.controller = Controller::Parked;
                     }
                     tracing::info!(
-                        seats = self.opponents.len(),
+                        seats = self.road.opponents.len(),
                         host = n.is_host(),
                         "network seats reserved"
                     );
@@ -8568,12 +8267,12 @@ impl App {
                 // Which of the race's car slots take which id is not in the notes (§8, UNKNOWN), so
                 // the ids are handed out in table order and cycled when more cars than ids are asked
                 // for (the heavy career setting wants eight).
-                self.traffic = None;
-                self.traffic_models.clear();
-                self.traffic_sets.clear();
-                self.traffic_paints.clear();
-                self.traffic_prev.clear();
-                if self.traffic_count > 0 {
+                self.road.traffic = None;
+                self.road.traffic_models.clear();
+                self.road.traffic_sets.clear();
+                self.road.traffic_paints.clear();
+                self.road.traffic_prev.clear();
+                if self.road.traffic_count > 0 {
                     let trk = std::fs::read(self.paths.fe_data().join("Data").join("nfs5.trk"))
                         .ok()
                         .and_then(|d| nfs_formats::career::parse_track_table(&d).ok())
@@ -8585,7 +8284,7 @@ impl App {
                         .unwrap_or_default();
                     let mut plan: Vec<TrafficSpec> = Vec::new();
                     let mut by_id: Vec<u16> = Vec::new();
-                    for k in 0..self.traffic_count as usize {
+                    for k in 0..self.road.traffic_count as usize {
                         let Some(id) = ids.get(k % ids.len().max(1)).copied() else {
                             break;
                         };
@@ -8624,15 +8323,15 @@ impl App {
                                         continue;
                                     }
                                 };
-                                self.traffic_models.push(model);
+                                self.road.traffic_models.push(model);
                                 by_id.push(id);
-                                self.traffic_models.len() - 1
+                                self.road.traffic_models.len() - 1
                             }
                         };
                         // the collision box is half the model's bounding box (`traffic.md` §21.4)
-                        let m = &self.traffic_models[slot];
-                        self.traffic_sets.push(entry.sound_set.clone());
-                        self.traffic_paints.push(
+                        let m = &self.road.traffic_models[slot];
+                        self.road.traffic_sets.push(entry.sound_set.clone());
+                        self.road.traffic_paints.push(
                             entry
                                 .paint_sets
                                 .first()
@@ -8645,16 +8344,16 @@ impl App {
                             half_extents: (m.bbox_max - m.bbox_min) * 0.5,
                         });
                     }
-                    if self.traffic_specs.is_none() {
-                        self.traffic_specs = CarAssets::load_sim(&self.paths, "default")
+                    if self.road.traffic_specs.is_none() {
+                        self.road.traffic_specs = CarAssets::load_sim(&self.paths, "default")
                             .ok()
                             .map(|sim| CarSpecs::from_sim(&sim, false));
                     }
-                    self.traffic_bodies = plan
+                    self.road.traffic_bodies = plan
                         .iter()
                         .map(|sp| {
                             let specs = self
-                                .traffic_specs
+                                .road.traffic_specs
                                 .clone()
                                 .unwrap_or_else(|| self.specs.clone());
                             let mut v = Vehicle::new(
@@ -8700,14 +8399,14 @@ impl App {
                                 Err(e) => tracing::warn!(error = %e, "scripts.bin unreadable"),
                             }
                         }
-                        self.traffic = Some(set);
+                        self.road.traffic = Some(set);
                         for sp in &plan {
                             tracing::debug!(model = sp.model, bus = sp.bus, half = ?sp.half_extents, mass = sp.mass(), "traffic body");
                         }
                         tracing::info!(
                             cars = plan.len(),
-                            models = self.traffic_models.len(),
-                            bodies = self.traffic_bodies.len(),
+                            models = self.road.traffic_models.len(),
+                            bodies = self.road.traffic_bodies.len(),
                             linear,
                             "traffic placed"
                         );
@@ -8715,11 +8414,11 @@ impl App {
                 }
                 // police (`traffic.md` §17.1, §25): the track's five cop car ids are `nfs5.trk +0x8A`
                 // and the spawn points `GameData/Track/Cops/<track>.cop`; a single race gets four cars.
-                self.police = None;
-                self.police_models.clear();
-                self.police_prev.clear();
-                self.police_bodies.clear();
-                if self.cops_enabled {
+                self.road.police = None;
+                self.road.police_models.clear();
+                self.road.police_prev.clear();
+                self.road.police_bodies.clear();
+                if self.road.cops_enabled {
                     let trk = std::fs::read(self.paths.fe_data().join("Data").join("nfs5.trk"))
                         .ok()
                         .and_then(|d| nfs_formats::career::parse_track_table(&d).ok())
@@ -8772,12 +8471,12 @@ impl App {
                                     ) else {
                                         continue;
                                     };
-                                    self.police_models.push(model);
+                                    self.road.police_models.push(model);
                                     by_id.push(id);
-                                    self.police_models.len() - 1
+                                    self.road.police_models.len() - 1
                                 }
                             };
-                            let m = &self.police_models[slot];
+                            let m = &self.road.police_models[slot];
                             let half = (m.bbox_max - m.bbox_min) * 0.5;
                             // a cop car has a real `.sim` (§17.1), so its mass is the sim's
                             let mass = CarAssets::load_sim(&self.paths, &entry.sim)
@@ -8795,11 +8494,11 @@ impl App {
                         }
                         if !cars.is_empty() {
                             let one_way = t.slices.get(1).map(|s| s.lanes_a == 0).unwrap_or(false);
-                            self.police_bodies = cars
+                            self.road.police_bodies = cars
                                 .iter()
                                 .map(|c| {
                                     let specs = self
-                                        .traffic_specs
+                                        .road.traffic_specs
                                         .clone()
                                         .unwrap_or_else(|| self.specs.clone());
                                     let mut v = Vehicle::new(
@@ -8815,7 +8514,7 @@ impl App {
                                 .collect();
                             tracing::info!(
                                 cars = cars.len(),
-                                models = self.police_models.len(),
+                                models = self.road.police_models.len(),
                                 points = file.records.len(),
                                 "police on duty"
                             );
@@ -8828,13 +8527,13 @@ impl App {
                                 1 + self.num_opponents as usize,
                                 false,
                             );
-                            self.police = Some(pol);
+                            self.road.police = Some(pol);
                         }
                     }
                 }
                 self.racing_line = self.track.racing_line(&self.paths, self.backwards);
                 tracing::info!(
-                    opponents = self.opponents.len(),
+                    opponents = self.road.opponents.len(),
                     racing_line = self.racing_line.as_ref().map(|l| l.points.len()),
                     "opponents placed"
                 );
@@ -8997,7 +8696,7 @@ impl App {
                     && let Some(idx) = std::env::var("NFS_AI_TRACE")
                         .ok()
                         .and_then(|v| v.parse::<usize>().ok())
-                    && let Some(o) = self.opponents.get(idx)
+                    && let Some(o) = self.road.opponents.get(idx)
                 {
                     let target = match &o.controller {
                         Controller::Ai(a) => a.target_speed * 3.6,
@@ -9021,7 +8720,7 @@ impl App {
                 if t % 64 == 0
                     && let Some(v) = &self.vehicle
                 {
-                    tracing::info!(t = t / 64, speed_kmh = v.speed() * 3.6, gear = v.gear, rpm = v.rpm, slice = self.race.as_ref().map(|r| r.slice), walls = self.wall_hits, resets = self.resets, opp = ?self.opponents.iter().map(|o| (o.progress.slice, (o.vehicle.speed() * 3.6) as i32, match &o.controller { Controller::Ai(a) => (a.target_speed * 3.6) as i32, _ => -1 }, o.vehicle.gear, o.wall_hits, o.resets, o.vehicle.wheels[0].steer as i32, (o.vehicle.throttle * 100.0) as i32, (o.vehicle.brake * 100.0) as i32, o.vehicle.position.x as i32, o.vehicle.position.z as i32)).collect::<Vec<_>>(), wrong_way = self.race.as_ref().map(|r| r.wrong_way_ticks > 0), police = ?self.police.as_ref().map(|p| p.cars.iter().filter(|c| c.active).map(|c| (c.slice, (c.speed * 3.6) as i32, (c.position - v.position).length() as i32, c.mode)).collect::<Vec<_>>()), violation = ?self.police.as_ref().map(|p| p.violation), traffic = ?self.traffic.as_ref().map(|tr| tr.cars.iter().filter(|c| c.active).map(|c| (c.slice, c.dir as i32, (c.speed * 3.6) as i32, (c.lateral * 10.0) as i32, (c.position - v.position).length() as i32, (c.position.y - v.position.y) as i32)).collect::<Vec<_>>()), pos = ?v.position, "autotest");
+                    tracing::info!(t = t / 64, speed_kmh = v.speed() * 3.6, gear = v.gear, rpm = v.rpm, slice = self.race.as_ref().map(|r| r.slice), walls = self.wall_hits, resets = self.resets, opp = ?self.road.opponents.iter().map(|o| (o.progress.slice, (o.vehicle.speed() * 3.6) as i32, match &o.controller { Controller::Ai(a) => (a.target_speed * 3.6) as i32, _ => -1 }, o.vehicle.gear, o.wall_hits, o.resets, o.vehicle.wheels[0].steer as i32, (o.vehicle.throttle * 100.0) as i32, (o.vehicle.brake * 100.0) as i32, o.vehicle.position.x as i32, o.vehicle.position.z as i32)).collect::<Vec<_>>(), wrong_way = self.race.as_ref().map(|r| r.wrong_way_ticks > 0), police = ?self.road.police.as_ref().map(|p| p.cars.iter().filter(|c| c.active).map(|c| (c.slice, (c.speed * 3.6) as i32, (c.position - v.position).length() as i32, c.mode)).collect::<Vec<_>>()), violation = ?self.road.police.as_ref().map(|p| p.violation), traffic = ?self.road.traffic.as_ref().map(|tr| tr.cars.iter().filter(|c| c.active).map(|c| (c.slice, c.dir as i32, (c.speed * 3.6) as i32, (c.lateral * 10.0) as i32, (c.position - v.position).length() as i32, (c.position.y - v.position.y) as i32)).collect::<Vec<_>>()), pos = ?v.position, "autotest");
                 }
             }
             self.rebuild_scene();
@@ -9080,7 +8779,78 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. } => {
                 self.input.key_event(&event);
-                if self.menu.is_some() && event.state == winit::event::ElementState::Pressed {
+                // **A binding row waiting for a control takes every key** — its slot 4, 0x51C610,
+                // answers true whatever it does, so nothing else on the screen sees the key (not
+                // even Esc). It takes one only when exactly **one** key is down (the walk of the
+                // key-down table 0x5DE028 at 0x51C623), and 0x51D0A0 then drops any key 0x51C050
+                // cannot name — the row keeps waiting. A named key becomes `{3, 0, scancode, 0, 0,
+                // code}`, is committed as `Bindings::assign` describes, and focus goes (0x51C65C).
+                // `CameraView` and `LookBehind` are `I_*` bindings this port does not read, so
+                // their rows only let focus go.
+                if event.state == winit::event::ElementState::Pressed
+                    && let Some((i, acc)) = self.fe.layout_preview.as_ref().and_then(|l| l.focused_binding_row())
+                {
+                    if let winit::keyboard::PhysicalKey::Code(k) = event.physical_key
+                        && let Some(sc) = nfs_input::scancode(k)
+                        && self.input.keys_down_count() == 1
+                    {
+                        let code = nfs_input::bindings::display_code(sc);
+                        let (name, arc) = nfs_game::keyname::key_name(code, &self.fe.strings);
+                        if !name.is_empty() || arc.is_some() {
+                            if let Some(id) = accessors::controller_action(&acc).and_then(nfs_input::binding_id) {
+                                let b = nfs_input::bindings::Binding { kind: 3, device: 0, index: sc as u32, dir: 0, pov: 0, key: code };
+                                self.input.bindings.assign(id, b);
+                                tracing::info!(row = %acc, scancode = sc, "control rebound");
+                            }
+                            if let Some(l) = self.fe.layout_preview.as_mut() {
+                                l.release_focus(i);
+                            }
+                        }
+                    }
+                    return;
+                }
+                // **A focused input box swallows the keyboard.** 0x4CCC20 is slot 4 of the three
+                // input classes, and it returns *true* for every key it takes, which is what stops
+                // the screen's own arrows and Enter from seeing it. Return commits, backspace
+                // erases, and everything printable but `'%'` goes in — the filter itself lives in
+                // `LayoutScreen::type_char`, beside the addresses it came from.
+                if event.state == winit::event::ElementState::Pressed
+                    && let Some(i) = self.fe.layout_preview.as_ref().and_then(|l| l.focused_input())
+                {
+                    use winit::keyboard::{Key, NamedKey};
+                    let mut took = false;
+                    match event.logical_key.as_ref() {
+                        Key::Named(NamedKey::Enter) => {
+                            if let Some(l) = self.fe.layout_preview.as_mut()
+                                && let Some((name, text)) = l.commit_input(i)
+                            {
+                                tracing::info!(accessor = %name, value = %text, "input box committed");
+                                took = true;
+                            }
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            took = self.fe.layout_preview.as_mut().is_some_and(|l| l.backspace(i));
+                        }
+                        Key::Character(t) => {
+                            if let Some(c) = t.chars().next()
+                                && let Some(l) = self.fe.layout_preview.as_mut()
+                            {
+                                took = l.type_char(i, c);
+                            }
+                        }
+                        Key::Named(NamedKey::Space) => {
+                            took = self.fe.layout_preview.as_mut().is_some_and(|l| l.type_char(i, ' '));
+                        }
+                        _ => {}
+                    }
+                    // Every accepted path in 0x4CCC20 ends at `0x4AADB0(9)`. This port's front end
+                    // has no sound path — the same reason the scrollbar's click 8 is not played —
+                    // so the keystroke is taken and the sound is not.
+                    if took {
+                        return;
+                    }
+                }
+                if self.fe.menu.is_some() && event.state == winit::event::ElementState::Pressed {
                     use winit::keyboard::{KeyCode, PhysicalKey};
                     let key = match event.physical_key {
                         PhysicalKey::Code(KeyCode::ArrowUp) => Some(MenuKey::Up),
@@ -9108,7 +8878,7 @@ impl ApplicationHandler for App {
                         event_loop.exit();
                     } else if self.vehicle.is_some() {
                         self.paused = true;
-                        if let (Some(a), Some(s)) = (&self.audio, self.sfx.as_mut()) {
+                        if let (Some(a), Some(s)) = (&self.snd.audio, self.snd.sfx.as_mut()) {
                             s.stop_loops(a);
                         }
                     } else {
@@ -9120,7 +8890,7 @@ impl ApplicationHandler for App {
                 // APPROXIMATION.
                 if event.state == winit::event::ElementState::Pressed
                     && self
-                        .replay
+                        .replay.stream
                         .as_ref()
                         .is_some_and(|r| r.mode == nfs_game::replay::Mode::Playing)
                 {
@@ -9134,7 +8904,7 @@ impl ApplicationHandler for App {
                         _ => None,
                     };
                     if let Some(sp) = speed {
-                        self.replay_speed = sp;
+                        self.replay.speed = sp;
                         tracing::info!(speed = ?sp, "replay speed");
                     }
                 }
@@ -9152,7 +8922,7 @@ impl ApplicationHandler for App {
                     && event.physical_key
                         == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Enter)
                     && self.race.as_ref().map(|r| r.finished).unwrap_or(false)
-                    && let Some(menu) = self.menu_template.take()
+                    && let Some(menu) = self.fe.menu_template.take()
                 {
                     self.settle_mission();
                     if self.career.as_ref().is_some_and(|c| c.pending.is_some()) {
@@ -9218,7 +8988,7 @@ impl ApplicationHandler for App {
                         }
                     }
                     self.player_grid_override = None;
-                    self.menu = Some(menu);
+                    self.fe.menu = Some(menu);
                     self.vehicle = None;
                     self.race = None;
                     self.world = None;
@@ -9235,7 +9005,7 @@ impl ApplicationHandler for App {
             // The pointer, mapped back through `place`: the design area keeps 4:3 and is centred
             // in a wider window, so the inverse is `(u - x0) / fw * 640` across and `v * 480` down.
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = self.window.as_ref().map(|w| {
+                self.fe.cursor = self.window.as_ref().map(|w| {
                     let size = w.inner_size();
                     let (sw, sh) = (size.width.max(1) as f32, size.height.max(1) as f32);
                     let (u, v) = (position.x as f32 / sw, position.y as f32 / sh);
@@ -9249,12 +9019,12 @@ impl ApplicationHandler for App {
                 // model's position to
                 // `grabPosition + (y - grabY) · (positions - 1) / (trackHeight - knobHeight)`
                 // — the exact inverse of the placement at 0x4D0BBE — and re-places the knob.
-                if let (Some((index, gy, at)), Some((_, cy))) = (self.list_drag, self.cursor) {
-                    let span = self.layout_preview.as_ref().and_then(|l| l.list_scrollbar(index)).map(|b| (b.span, b.positions));
+                if let (Some((index, gy, at)), Some((_, cy))) = (self.fe.list_drag, self.fe.cursor) {
+                    let span = self.fe.layout_preview.as_ref().and_then(|l| l.list_scrollbar(index)).map(|b| (b.span, b.positions));
                     if let Some((span, positions)) = span
                         && span > 0.0
                         && positions > 1
-                        && let Some(l) = self.layout_preview.as_mut()
+                        && let Some(l) = self.fe.layout_preview.as_mut()
                     {
                         let moved = ((cy - gy) * (positions - 1) as f32 / span).round() as i32;
                         l.set_list_scroll(index, at as i32 + moved);
@@ -9263,32 +9033,32 @@ impl ApplicationHandler for App {
                 // `NFS5.ColorBox`'s slot 8, 0x4C4830: while the editor is up the widget holds the
                 // capture, so every move reaches it, and it drags the hue, the saturation or the
                 // luminance whenever a button is held (§4.66)
-                if let (Some(l), Some((cx, cy))) = (self.layout_preview.as_mut(), self.cursor) {
+                if let (Some(l), Some((cx, cy))) = (self.fe.layout_preview.as_mut(), self.fe.cursor) {
                     l.picker_move(cx, cy);
                     l.deadzone_drag(cx, cy);
                 }
                 // the open drop-down's scrollbar tracks the pointer so its arrows can show their
                 // hovered frame — `[this+0xEC]`, which 0x4DB2F0 writes on every move (§4.101)
-                if let Some((cx, cy)) = self.cursor {
-                    let at = self.layout_preview.as_ref().and_then(|l| l.combo_scroll_at(cx, cy));
-                    let held = self.mouse_down;
-                    if let Some(l) = self.layout_preview.as_mut() {
+                if let Some((cx, cy)) = self.fe.cursor {
+                    let at = self.fe.layout_preview.as_ref().and_then(|l| l.combo_scroll_at(cx, cy));
+                    let held = self.fe.mouse_down;
+                    if let Some(l) = self.fe.layout_preview.as_mut() {
                         l.set_combo_scroll(at.map(|(i, r)| (i, r, held)));
                     }
                 }
-                if let Some((cx, cy)) = self.cursor
-                    && let Some(l) = self.layout_preview.as_mut()
+                if let Some((cx, cy)) = self.fe.cursor
+                    && let Some(l) = self.fe.layout_preview.as_mut()
                 {
                     l.picture_drag_to(cx, cy);
                 }
-                if self.bar_grab.is_some()
-                    && let Some((cx, cy)) = self.cursor
-                    && let Some((_, name, f)) = self.layout_preview.as_ref().and_then(|l| l.bar_at(cx, cy))
+                if self.fe.bar_grab.is_some()
+                    && let Some((cx, cy)) = self.fe.cursor
+                    && let Some((_, name, f)) = self.fe.layout_preview.as_ref().and_then(|l| l.bar_at(cx, cy))
                 {
                     self.set_accessor_fraction(&name, f);
                 }
             }
-            WindowEvent::CursorLeft { .. } => self.cursor = None,
+            WindowEvent::CursorLeft { .. } => self.fe.cursor = None,
             // `RE/notes/controls.md` §4.40: the pump stamps a `MouseButtonEvent` type **4** on the
             // press and **8** on the release (0x529806). The base's slot 5, 0x5258B0, fires the
             // widget's `"CLICKED"` message — the one reference to that string in the whole image —
@@ -9296,19 +9066,19 @@ impl ApplicationHandler for App {
             // runs the screen transition: **a button navigates on the release, not the press**.
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
                 let down = state == ElementState::Pressed;
-                if let Some(l) = self.layout_preview.as_mut() {
+                if let Some(l) = self.fe.layout_preview.as_mut() {
                     l.set_pressed(down);
                 }
-                self.mouse_down = down;
+                self.fe.mouse_down = down;
                 // `NFS5.ChroniclePicture` drags its picture about: slot 5 takes hold, slot 8
                 // pans, slot 9 lets go (§4.119)
-                if let Some((cx, cy)) = self.cursor {
+                if let Some((cx, cy)) = self.fe.cursor {
                     let hit = self
-                        .layout_preview
+                        .fe.layout_preview
                         .as_ref()
                         .and_then(|l| l.hovered())
-                        .filter(|i| self.layout_preview.as_ref().and_then(|l| l.class_of(*i)).as_deref() == Some("NFS5.ChroniclePicture"));
-                    if let Some(l) = self.layout_preview.as_mut() {
+                        .filter(|i| self.fe.layout_preview.as_ref().and_then(|l| l.class_of(*i)).as_deref() == Some("NFS5.ChroniclePicture"));
+                    if let Some(l) = self.fe.layout_preview.as_mut() {
                         match (down, hit) {
                             (true, Some(i)) => l.picture_press(i, cx, cy),
                             (false, _) => l.picture_release(),
@@ -9318,17 +9088,17 @@ impl ApplicationHandler for App {
                 }
                 if !down {
                     // 0x4C1FB0: the release hands `[this+0x14C]` to 0x5292D0 and zeroes it
-                    self.setting_repeat = None;
+                    self.fe.setting_repeat = None;
                 }
                 // `FeListScrollBar::onPress` 0x4DB040: the hit test first, then the jump table at
                 // 0x4DB164. Arms 1 and 2 step the list and swallow the press — the drop-down must
                 // not close under the pointer (§4.101).
-                if let Some((cx, cy)) = self.cursor
-                    && let Some((_, region)) = self.layout_preview.as_ref().and_then(|l| l.combo_scroll_at(cx, cy))
+                if let Some((cx, cy)) = self.fe.cursor
+                    && let Some((_, region)) = self.fe.layout_preview.as_ref().and_then(|l| l.combo_scroll_at(cx, cy))
                 {
                     // 0x4DB08B and 0x4DB0A1 also play click 8 through 0x4AADB0; this port's front
                     // end has no sound path, so the step is all that is ported.
-                    if let Some(l) = self.layout_preview.as_mut() {
+                    if let Some(l) = self.fe.layout_preview.as_mut() {
                         let i = l.open_combo();
                         l.set_combo_scroll(i.map(|i| (i, region, down)));
                         if down {
@@ -9340,15 +9110,15 @@ impl ApplicationHandler for App {
                 // `NFS5.DEADZONE` takes the button before anything else on its screen: its slot 5
                 // (0x51BB60) hit-tests its four handles, takes focus and sets the value, its slot
                 // 8 (0x51BCD0) drags while one is held and its slot 9 (0x51BCB0) lets go.
-                if let Some((cx, _)) = self.cursor
+                if let Some((cx, _)) = self.fe.cursor
                     && !down
-                    && let Some(l) = self.layout_preview.as_mut()
+                    && let Some(l) = self.fe.layout_preview.as_mut()
                 {
                     let _ = cx;
                     l.deadzone_release();
                 }
-                if let (Some((cx, cy)), true) = (self.cursor, down)
-                    && let Some(l) = self.layout_preview.as_mut()
+                if let (Some((cx, cy)), true) = (self.fe.cursor, down)
+                    && let Some(l) = self.fe.layout_preview.as_mut()
                     && l.deadzone_press(cx, cy)
                 {
                     return;
@@ -9359,20 +9129,20 @@ impl ApplicationHandler for App {
                 // the press granted (0x4C7DD0) and on the pointer still being over the part.
                 // §4.81.
                 if !down {
-                    self.bar_grab = None;
+                    self.fe.bar_grab = None;
                 }
-                if let (Some((cx, cy)), true) = (self.cursor, down)
-                    && let Some((_, name, f)) = self.layout_preview.as_ref().and_then(|l| l.bar_at(cx, cy))
+                if let (Some((cx, cy)), true) = (self.fe.cursor, down)
+                    && let Some((_, name, f)) = self.fe.layout_preview.as_ref().and_then(|l| l.bar_at(cx, cy))
                 {
-                    self.bar_grab = Some(name.clone());
+                    self.fe.bar_grab = Some(name.clone());
                     self.set_accessor_fraction(&name, f);
                     return;
                 }
                 // The colour editor eats the button while it is up: its slots 5 and 9 return
                 // without ever reaching the combo's own (0x4C4730, 0x4C4980 fall through to the
                 // base only when the widget has **lost** focus or the latch is down) — §4.66.
-                if let (Some(open), Some((cx, cy))) = (self.layout_preview.as_ref().and_then(|l| l.open_picker()), self.cursor) {
-                    let closed = if let Some(l) = self.layout_preview.as_mut() {
+                if let (Some(open), Some((cx, cy))) = (self.fe.layout_preview.as_ref().and_then(|l| l.open_picker()), self.fe.cursor) {
+                    let closed = if let Some(l) = self.fe.layout_preview.as_mut() {
                         if down {
                             l.picker_press(cx, cy);
                             false
@@ -9383,8 +9153,8 @@ impl ApplicationHandler for App {
                         false
                     };
                     if closed {
-                        self.layout_open_combo = None;
-                        if let Some(l) = self.layout_preview.as_mut() {
+                        self.fe.layout_open_combo = None;
+                        if let Some(l) = self.fe.layout_preview.as_mut() {
                             l.set_open_combo(None);
                         }
                     }
@@ -9396,13 +9166,13 @@ impl ApplicationHandler for App {
                 // a list's scrollbar arrows, hit-tested in design coordinates: the original moves
                 // the position in the scrollbar object the row loop reads (§4.45)
                 if !down {
-                    if let (Some((i, _, _)), Some(l)) = (self.list_drag, self.layout_preview.as_mut()) {
+                    if let (Some((i, _, _)), Some(l)) = (self.fe.list_drag, self.fe.layout_preview.as_mut()) {
                         l.park_knob(i, None);
                     }
-                    self.list_drag = None;
-                    self.list_repeat = None;
+                    self.fe.list_drag = None;
+                    self.fe.list_repeat = None;
                 }
-                if down && let (Some(l), Some((cx, cy))) = (self.layout_preview.as_ref(), self.cursor) {
+                if down && let (Some(l), Some((cx, cy))) = (self.fe.layout_preview.as_ref(), self.fe.cursor) {
                     let mut moved = None;
                     let mut grabbed = None;
                     let mut parked = None;
@@ -9451,42 +9221,42 @@ impl ApplicationHandler for App {
                         }
                     }
                     if let Some(g) = grabbed {
-                        self.list_drag = Some(g);
-                        if let (Some((i, ky)), Some(l)) = (parked, self.layout_preview.as_mut()) {
+                        self.fe.list_drag = Some(g);
+                        if let (Some((i, ky)), Some(l)) = (parked, self.fe.layout_preview.as_mut()) {
                             l.park_knob(i, Some(ky));
                         }
                         return;
                     }
                     if let Some((index, delta)) = moved
-                        && let Some(l) = self.layout_preview.as_mut()
+                        && let Some(l) = self.fe.layout_preview.as_mut()
                     {
                         l.scroll_list(index, delta);
-                        self.list_repeat = Some((index, delta, 0));
+                        self.fe.list_repeat = Some((index, delta, 0));
                         return;
                     }
                     if let Some(sec) = section {
-                        self.parts_open[sec] = !self.parts_open[sec];
+                        self.fe.parts_open[sec] = !self.fe.parts_open[sec];
                         // the two headers move the second one's row, so the picked part goes with
                         // the list rather than staying on a row that is no longer a part
-                        self.parts_sel = None;
+                        self.fe.parts_sel = None;
                         self.bind_lists();
                         self.bind_checks();
                         self.bind_parts_buttons();
                         return;
                     }
                     if let Some(r) = picked_part {
-                        self.parts_sel = Some(r);
+                        self.fe.parts_sel = Some(r);
                         self.bind_parts_buttons();
                         return;
                     }
 
                 }
-                if let Some(hit) = self.layout_preview.as_ref().and_then(|l| l.hovered()) {
+                if let Some(hit) = self.fe.layout_preview.as_ref().and_then(|l| l.hovered()) {
                     // An input box takes focus when it is activated — `FeInputBox`'s slot 9,
                     // 0x4CCB70, which the base's release path reaches through the `"CLICKED"`
                     // message (§4.40). Three classes share that slot. §4.109.
                     if !down
-                        && let Some(l) = self.layout_preview.as_mut()
+                        && let Some(l) = self.fe.layout_preview.as_mut()
                     {
                         let class = l.class_of(hit).unwrap_or_default();
                         // `NFS5.CONTROLLERSETUP`'s slot 9 is **0x51C5F0**, three calls: take
@@ -9495,17 +9265,26 @@ impl ApplicationHandler for App {
                         if matches!(class.as_str(), "NFS5.INPUTBOX" | "NFS5.CHATINPUTBOX" | "NFS5.CHARVECTACCESSORINPUTBOX" | "NFS5.CONTROLLERSETUP") {
                             l.focus_input(hit);
                         }
+                        if class == "NFS5.CONTROLLERSETUP" {
+                            self.fe.binding_base = Some(self.input.pads.clone());
+                        }
+                        // `NFS5.3DCAR`'s slot 9, 0x4C0EB0: a click opens or closes the part under
+                        // the pointer (§4.153)
+                        if class == "NFS5.3DCAR" {
+                            let events = l.car_click(hit);
+                            self.fe_car_part_events(hit, &events);
+                        }
                     }
                     // `usedcars.lay`'s two panel buttons flip `[FEUsedCarsScreen + 0x290]`
                     // through the `SHOWPARTS` and `SHOWDAMAGE` callbacks the constructor
                     // registers at 0x4F71C0 and 0x4F71D1 (§4.113)
                     if !down
                         && let Some(which) = self
-                            .layout_preview
+                            .fe.layout_preview
                             .as_ref()
                             .and_then(|l| l.widgets_named(&["ID_SHOWPARTSBUTTON", "ID_SHOWDAMAGEBUTTON"]).into_iter().find(|(i, _)| *i == hit).map(|(_, k)| k))
                     {
-                        self.usedcars_showparts = which == 0;
+                        self.fe.usedcars_showparts = which == 0;
                         self.bind_usedcars_panels();
                         return;
                     }
@@ -9514,10 +9293,10 @@ impl ApplicationHandler for App {
                     // for the column's own year and variant, and only when 0x5074A0 finds files
                     // there (§4.120)
                     if !down
-                        && let Some((cx, cy)) = self.cursor
-                        && let Some((col, row)) = self.layout_preview.as_ref().and_then(|l| l.chronicle_cell_at(cx, cy))
+                        && let Some((cx, cy)) = self.fe.cursor
+                        && let Some((col, row)) = self.fe.layout_preview.as_ref().and_then(|l| l.chronicle_cell_at(cx, cy))
                     {
-                        self.chronicle_col = Some(col);
+                        self.fe.chronicle_col = Some(col);
                         self.bind_chronicle_icons();
                         self.bind_lists();
                         if row < 2 && !self.chronicle_media_for(row).is_empty() {
@@ -9530,26 +9309,26 @@ impl ApplicationHandler for App {
                     // the group their button stands for and then reload the screen (§4.111)
                     if !down
                         && let Some(which) = self
-                            .layout_preview
+                            .fe.layout_preview
                             .as_ref()
                             .and_then(|l| l.widgets_named(&CHRONICLE_GROUP_BUTTONS).into_iter().find(|(i, _)| *i == hit).map(|(_, k)| k))
                     {
-                        self.chronicle_group = which;
+                        self.fe.chronicle_group = which;
                         self.bind_chronicle_group();
                         self.bind_chronicle_icons();
                         self.bind_lists();
                         return;
                     }
-                    let controls = self.layout_preview.as_ref().map(|l| l.controls()).unwrap_or_default();
+                    let controls = self.fe.layout_preview.as_ref().map(|l| l.controls()).unwrap_or_default();
                     // a combo takes focus on the **release** (0x4C6CC1, after sound 2 at
                     // 0x4C6C97), and focus is what opens its list (0x4C53A0) — clicking the open
                     // one again gives the focus back
-                    let combos = self.layout_preview.as_ref().map(|l| l.combo_sliders()).unwrap_or_default();
+                    let combos = self.fe.layout_preview.as_ref().map(|l| l.combo_sliders()).unwrap_or_default();
                     if !down && combos.iter().any(|c| c.index == hit) {
-                        let open = self.layout_open_combo == Some(hit);
-                        self.layout_open_combo = (!open).then_some(hit);
-                        if let Some(l) = self.layout_preview.as_mut() {
-                            l.set_open_combo(self.layout_open_combo);
+                        let open = self.fe.layout_open_combo == Some(hit);
+                        self.fe.layout_open_combo = (!open).then_some(hit);
+                        if let Some(l) = self.fe.layout_preview.as_mut() {
+                            l.set_open_combo(self.fe.layout_open_combo);
                             // the editor's draw copies all eight wells the first frame it is up,
                             // and cancel puts that copy back (§4.66)
                             if l.open_picker().is_some() {
@@ -9557,8 +9336,8 @@ impl ApplicationHandler for App {
                             }
                         }
                     } else if !down {
-                        self.layout_open_combo = None;
-                        if let Some(l) = self.layout_preview.as_mut() {
+                        self.fe.layout_open_combo = None;
+                        if let Some(l) = self.fe.layout_preview.as_mut() {
                             l.set_open_combo(None);
                         }
                     }
@@ -9567,20 +9346,20 @@ impl ApplicationHandler for App {
                     // are the only ones in the front end, each naming a `QUICKFIX.*` bool (§4.95).
                     if down
                         && let Some(name) = self
-                            .layout_preview
+                            .fe.layout_preview
                             .as_ref()
                             .and_then(|l| l.check_boxes().into_iter().find(|(i, _)| *i == hit).map(|(_, a)| a))
                         && let Some(n) = name.strip_prefix("QUICKFIX.")
                         && let Some(k) = QUICKFIX_NAMES.iter().find(|k| **k == n)
                     {
-                        if !self.repair_ticks.remove(*k) {
-                            self.repair_ticks.insert(k);
+                        if !self.fe.repair_ticks.remove(*k) {
+                            self.fe.repair_ticks.insert(k);
                         }
                         self.bind_checks();
                         return;
                     }
                     if let Some(n) = controls.iter().position(|c| c.index == hit) {
-                        self.layout_sel = n;
+                        self.fe.layout_sel = n;
                         // `NFS5.CARSETTINGBUTTON` steps its accessor on the **press**, not the
                         // release: slot 5 (0x4C1F6C) takes focus and slot 27 (0x4C1F20) hands
                         // `data.step` — `[this+0x144]`, bound at 0x4C1ED7 — to the accessor.
@@ -9591,7 +9370,7 @@ impl ApplicationHandler for App {
                             && let Some(a) = controls[n].accessor.clone()
                         {
                             let step = controls[n].step;
-                            self.setting_repeat = Some((a.clone(), step, 0));
+                            self.fe.setting_repeat = Some((a.clone(), step, 0));
                             self.set_accessor(&a, step);
                             self.bind_car_logos();
                             self.bind_indicator_bars();
@@ -9608,7 +9387,7 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::RedrawRequested if self.menu.is_some() => {
+            WindowEvent::RedrawRequested if self.fe.menu.is_some() => {
                 // gamepad: d-pad / left stick moves, South (A / cross) selects
                 self.gamepads.poll(&mut self.input);
                 let stick = self.input.pad.map(|p| p.steer).unwrap_or(0.0);
@@ -9642,7 +9421,7 @@ impl ApplicationHandler for App {
                 self.input.end_tick();
                 for k in keys {
                     self.menu_key(k, event_loop);
-                    if self.menu.is_none() {
+                    if self.fe.menu.is_none() {
                         return;
                     }
                 }
@@ -9669,13 +9448,13 @@ impl ApplicationHandler for App {
                     self.accumulator -= GAME_TICK;
                     // replay.md §5.1: playback speed is tick *decimation* inside the catch-up
                     // loop — never a `dt` scale. Every iteration still renders.
-                    let n = match &self.replay {
+                    let n = match &self.replay.stream {
                         Some(r) if r.mode == nfs_game::replay::Mode::Playing => {
-                            self.replay_speed.ticks_at(self.replay_loop)
+                            self.replay.speed.ticks_at(self.replay.loop_count)
                         }
                         _ => 1,
                     };
-                    self.replay_loop += 1;
+                    self.replay.loop_count += 1;
                     for _ in 0..n {
                         self.simulate();
                     }
@@ -9999,9 +9778,12 @@ fn main() -> Result<()> {
             .cloned()
             .collect::<Vec<_>>();
         cars.sort_by_key(|c| c.year);
-        let car_idx = cars
-            .iter()
-            .position(|c| c.model.eq_ignore_ascii_case("993") && c.sim.contains("coupe"))
+        // `NFS_FE_CAR=<display name substring>` preselects a car, for stills of the showroom — the
+        // same kind of diagnostic as `NFS_MENU_MODE`
+        let car_idx = std::env::var("NFS_FE_CAR")
+            .ok()
+            .and_then(|want| cars.iter().position(|c| c.display_name.contains(want.as_str())))
+            .or_else(|| cars.iter().position(|c| c.model.eq_ignore_ascii_case("993") && c.sim.contains("coupe")))
             .unwrap_or(0);
         let mut menu0 = Menu {
             mode: std::env::var("NFS_MENU_MODE")
@@ -10100,27 +9882,46 @@ fn main() -> Result<()> {
     let music_names = nfs_audio::music::song_titles(&paths.game_data().join("Music")).unwrap_or_default();
     let music_lengths = nfs_audio::music::song_lengths_ms(&paths.game_data().join("Music")).unwrap_or_default();
     let mut app = App {
-        bar_grab: None,
-        chronicle_group: CHRONICLE_GROUP,
-        chronicle_col: None,
-        usedcars_showparts: false,
-        usedcar_sel: 0,
-        parts_sel: None,
-        setting_repeat: None,
-        mouse_down: false,
-        repair_ticks: Default::default(),
-        cursor: None,
-        // both of `Parts.AllParts`'s sections start closed (0x515190, 0x515193)
-        parts_open: [false, false],
+        fe: FrontEnd {
+            bar_grab: None,
+            chronicle_group: CHRONICLE_GROUP,
+            chronicle_col: None,
+            usedcars_showparts: false,
+            usedcar_sel: 0,
+            parts_sel: None,
+            setting_repeat: None,
+            mouse_down: false,
+            repair_ticks: Default::default(),
+            binding_base: None,
+            parts_forced: false,
+            cursor: None,
+            // both of `Parts.AllParts`'s sections start closed (0x515190, 0x515193)
+            parts_open: [false, false],
+            factory_profile: 0,
+            menu,
+            menu_template: None,
+            room: Vec::new(),
+            cars: Vec::new(),
+            ms: 0,
+            layout_preview: None,
+            layout_bottom: None,
+            strings: fe_strings,
+            layout_name: args
+                .iter()
+                .position(|a| a == "--layout")
+                .and_then(|i| args.get(i + 1).cloned())
+                .or(fe_start),
+            layout_sel: 0,
+            layout_open_combo: None,
+            list_drag: None,
+            list_repeat: None,
+            layout_stack: Vec::new(),
+        },
         layout_sweep,
-        factory_profile: 0,
         registry: nfs_formats::fetxt::Registry::load(&paths.root),
         choices: std::collections::HashMap::new(),
         paths,
-        net,
-        lobby: None,
-        menu,
-        menu_template: None,
+        net: Network { session: net, lobby: None },
         career,
         career_opponents: career_request.map(|r| r.opponents),
         // diagnostic: `NFS_OPPCAR=0..4` picks `OpponentCar.Car` without going through the menu
@@ -10135,7 +9936,6 @@ fn main() -> Result<()> {
         prev_car_pos: Vec3::ZERO,
         world_actions: Vec::new(),
         render_prev: None,
-        opp_prev: Vec::new(),
         frame_dt: 1.0 / 60.0,
         paused: false,
         knockout: None,
@@ -10148,41 +9948,43 @@ fn main() -> Result<()> {
         quick_knockout: args.iter().any(|a| a == "--quick-knockout"),
         player_eliminated: false,
         records,
-        replay: Some(match &replay_file {
-            Some(f) => nfs_game::replay::Replay::playing(f.stream.clone(), f.final_tick),
-            None => nfs_game::replay::Replay::new(),
-        }),
-        replay_speed: nfs_game::replay::Speed::Normal,
-        replay_setup: replay_setup
-            .clone()
-            .unwrap_or(nfs_game::replay::ReplaySetup {
-                track: track_name.to_string(),
-                car: car_name.to_string(),
-                sim: sim_name.clone(),
-                car_id: catalog
-                    .iter()
-                    .find(|c| c.sim.eq_ignore_ascii_case(&sim_name))
-                    .map(|c| c.id)
-                    .unwrap_or(0),
-                paint,
-                laps: num_laps,
-                opponents: num_opponents,
-                traffic: std::env::var("NFS_TRAFFIC")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(fe.traffic_density as u32),
-                cops: std::env::var("NFS_COPS")
-                    .map(|v| v != "0")
-                    .unwrap_or(fe.cops),
-                backwards,
-                mirror: args.iter().any(|a| a == "--mirror"),
-                seed: 0,
-                skill: fe.skill,
+        replay: Playback {
+            stream: Some(match &replay_file {
+                Some(f) => nfs_game::replay::Replay::playing(f.stream.clone(), f.final_tick),
+                None => nfs_game::replay::Replay::new(),
             }),
-        replay_path: nfs_game::save::save_dir().join("replay.prpl"),
-        replay_saved: false,
-        replay_loop: 0,
-        replay_end_ticks: 0,
+            speed: nfs_game::replay::Speed::Normal,
+            setup: replay_setup
+                .clone()
+                .unwrap_or(nfs_game::replay::ReplaySetup {
+                    track: track_name.to_string(),
+                    car: car_name.to_string(),
+                    sim: sim_name.clone(),
+                    car_id: catalog
+                        .iter()
+                        .find(|c| c.sim.eq_ignore_ascii_case(&sim_name))
+                        .map(|c| c.id)
+                        .unwrap_or(0),
+                    paint,
+                    laps: num_laps,
+                    opponents: num_opponents,
+                    traffic: std::env::var("NFS_TRAFFIC")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(fe.traffic_density as u32),
+                    cops: std::env::var("NFS_COPS")
+                        .map(|v| v != "0")
+                        .unwrap_or(fe.cops),
+                    backwards,
+                    mirror: args.iter().any(|a| a == "--mirror"),
+                    seed: 0,
+                    skill: fe.skill,
+                }),
+            path: nfs_game::save::save_dir().join("replay.prpl"),
+            saved: false,
+            loop_count: 0,
+            end_ticks: 0,
+        },
         // the original seeds the race RNG from the registry's RAND_SEED (replay.md §11); a replay
         // carries the seed so playback re-simulates the same traffic, police and AI
         traffic_seed: match (
@@ -10198,7 +10000,6 @@ fn main() -> Result<()> {
                 .map(|d| d.as_nanos() as u32)
                 .unwrap_or(1),
         },
-        crash_played: false,
         scripted: autotest.is_some(),
         stuck_ticks: 0,
         detail: std::env::var("NFS_DETAIL")
@@ -10228,9 +10029,6 @@ fn main() -> Result<()> {
         driver_cam: None,
         // `NFS_CAMERA=0..3` picks the starting view (chase / bonnet / trackside / cockpit) —
         // the port's own switch, for screenshots and tests
-        fe_room: Vec::new(),
-        fe_cars: Vec::new(),
-        fe_ms: 0,
         sky: None,
         scene: Scene::default(),
         camera: Camera::default(),
@@ -10248,55 +10046,42 @@ fn main() -> Result<()> {
         shadow_meshes: Vec::new(),
         glare_draw: None,
         track_cameras: None,
-        reverb: nfs_audio::reverb::Reverb::default(),
         env_bound: None,
         slices: None,
         race: None,
-        opponents: Vec::new(),
-        opponent_models: Vec::new(),
-        layout_preview: None,
-        layout_bottom: None,
-        fe_strings,
-        layout_name: args
-            .iter()
-            .position(|a| a == "--layout")
-            .and_then(|i| args.get(i + 1).cloned())
-            .or(fe_start),
-        layout_sel: 0,
-        layout_open_combo: None,
-        list_drag: None,
-        list_repeat: None,
-        layout_stack: Vec::new(),
-        traffic: None,
-        traffic_models: Vec::new(),
-        opponent_sets: Vec::new(),
-        traffic_sets: Vec::new(),
-        opponent_paints: Vec::new(),
-        traffic_paints: Vec::new(),
-        police: None,
-        police_models: Vec::new(),
-        police_prev: Vec::new(),
-        police_bodies: Vec::new(),
-        cops_enabled: std::env::var("NFS_COPS")
-            .map(|v| v != "0")
-            .unwrap_or(fe.cops),
-        ai_engines: None,
-        ambience: None,
-        traffic_prev: Vec::new(),
-        traffic_bodies: Vec::new(),
-        traffic_specs: None,
-        traffic_spin: Vec::new(),
-        // the registry's `traffic_density`, or `NFS_TRAFFIC=0..3` for the menu-less --autotest start
-        traffic_count: TRAFFIC_COUNT[replay_setup
-            .as_ref()
-            .map(|r| r.traffic as usize)
-            .unwrap_or_else(|| {
-                std::env::var("NFS_TRAFFIC")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(fe.traffic_density as usize)
-            })
-            .min(3)],
+        road: RoadCars {
+            opponents: Vec::new(),
+            opponent_models: Vec::new(),
+            opp_prev: Vec::new(),
+            traffic: None,
+            traffic_models: Vec::new(),
+            opponent_sets: Vec::new(),
+            traffic_sets: Vec::new(),
+            opponent_paints: Vec::new(),
+            traffic_paints: Vec::new(),
+            police: None,
+            police_models: Vec::new(),
+            police_prev: Vec::new(),
+            police_bodies: Vec::new(),
+            cops_enabled: std::env::var("NFS_COPS")
+                .map(|v| v != "0")
+                .unwrap_or(fe.cops),
+            traffic_prev: Vec::new(),
+            traffic_bodies: Vec::new(),
+            traffic_specs: None,
+            traffic_spin: Vec::new(),
+            // the registry's `traffic_density`, or `NFS_TRAFFIC=0..3` for the menu-less --autotest start
+            traffic_count: TRAFFIC_COUNT[replay_setup
+                .as_ref()
+                .map(|r| r.traffic as usize)
+                .unwrap_or_else(|| {
+                    std::env::var("NFS_TRAFFIC")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(fe.traffic_density as usize)
+                })
+                .min(3)],
+        },
         racing_line: None,
         num_opponents,
         player_grid: 0,
@@ -10316,17 +10101,23 @@ fn main() -> Result<()> {
             .find(|c| c.sim.eq_ignore_ascii_case(&sim_name))
             .map(|c| (c.dial_kmh, c.dial_tach)),
         paint,
-        audio: None,
-        engine_sound: None,
-        sfx: None,
-        last_gear: 1,
-        music: None,
-        music_names,
-        music_lengths,
-        audio_settings,
-        speech: None,
-        countdown_said: 0,
-        sound_set,
+        snd: AudioState {
+            audio: None,
+            engine_sound: None,
+            sfx: None,
+            ai_engines: None,
+            ambience: None,
+            reverb: nfs_audio::reverb::Reverb::default(),
+            music: None,
+            music_names,
+            music_lengths,
+            audio_settings,
+            speech: None,
+            countdown_said: 0,
+            sound_set,
+            last_gear: 1,
+            crash_played: false,
+        },
         sim_name: sim_name.clone(),
         race_skill,
         last_frame: Instant::now(),
@@ -10335,6 +10126,10 @@ fn main() -> Result<()> {
         frames: 0,
         fps_timer: Instant::now(),
     };
+    // the player's key bindings are `fe.txt`'s `C1_*` lines (`nfs_input::bindings`)
+    app.input.bindings = nfs_input::bindings::Bindings::from_registry(|k| app.registry.get(k));
+    // every `<Axis>.Min` / `.Max` starts at 0 / 0x80 (0x51E546, 0x51E550)
+    app.input.axis_bands = [[0, 0x80]; 8];
     event_loop.run_app(&mut app)?;
     Ok(())
 }

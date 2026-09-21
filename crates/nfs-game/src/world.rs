@@ -478,6 +478,17 @@ pub struct CarModel {
     headlight_extent: f32,
     spoiler: ChannelEase,
     headlight: ChannelEase,
+    /// `.tpg` `dooraxis` → `R3DCar+0x2B0` (0x441C92), default (0, 1, 0): the axis channels 6 and 7
+    /// turn about, x negated for 7 (0x43CA5A…0x43CA7D)
+    door_axis: Vec3,
+    /// `.tpg` `hoodextent` → `+0x68` (0x441CCC), default **0.15** turn; `trunkextent` → `+0x6C`
+    /// (0x441CE6), default **−0.15** — the targets of the two lid easers
+    hood_extent: f32,
+    trunk_extent: f32,
+    /// the lid easers at `car+0x64 + 0x80` (hood) and `+ 0x90` (engine lid) that slot 9 writes
+    /// into channels 8 and 9 (0x4387CE…0x43891C)
+    hood: ChannelEase,
+    trunk: ChannelEase,
     /// `object + 0x2DC + 12n` — three floats a channel, **rotations in turns** about x, y and z
     /// (0x43C9C0 / 0x43C9D7 / 0x43C9F8 each multiply by `[0x5B25CC]` = 360.0 before the
     /// axis-angle build 0x539BD0). Only the x column is used so far: channel **16** is
@@ -522,6 +533,11 @@ struct ChannelEase {
     to: f32,
     elapsed: u32,
     duration: u32,
+}
+
+/// One float key out of a `.tpg` `[header]`, `default` when absent.
+fn tpg_f32_or(tpg: &nfs_formats::ini::Ini, key: &str, default: f32) -> f32 {
+    tpg.section("header").and_then(|h| h.get_f32_list(key)).and_then(|v| v.first().copied()).unwrap_or(default)
 }
 
 /// One float key out of a `.tpg` `[header]`, 0.0 when absent.
@@ -716,6 +732,17 @@ impl CarModel {
             headlight_extent: tpg_f32(&car.tpg, "headlightextent"),
             spoiler: ChannelEase::default(),
             headlight: ChannelEase::default(),
+            door_axis: car
+                .tpg
+                .section("header")
+                .and_then(|h| h.get_f32_list("dooraxis"))
+                .filter(|v| v.len() >= 3)
+                .map(|v| Vec3::new(v[0], v[1], v[2]))
+                .unwrap_or(Vec3::Y),
+            hood_extent: tpg_f32_or(&car.tpg, "hoodextent", 0.15),
+            trunk_extent: tpg_f32_or(&car.tpg, "trunkextent", -0.15),
+            hood: ChannelEase::default(),
+            trunk: ChannelEase::default(),
             wheels,
             bbox_min: min,
             bbox_max: max,
@@ -815,7 +842,55 @@ impl CarModel {
         if t == 0.0 {
             return Mat4::IDENTITY;
         }
+        // **Channels 6 and 7 are the doors** (0x43CA5A): they turn about the `.tpg` `dooraxis`,
+        // normalised (0x5328D0), with its x negated for 7, by the channel's *y* in turns — through
+        // 0x5326C0, the same axis-angle build 0x539BD0 uses for the others, so the same
+        // convention. The door value is kept in `channel_turns` like the rest.
+        if n == 6 || n == 7 {
+            let mut a = self.door_axis;
+            if n == 7 {
+                a.x = -a.x;
+            }
+            return Mat4::from_axis_angle(a.normalize_or(Vec3::Y), t * std::f32::consts::TAU);
+        }
         Mat4::from_rotation_x(t * std::f32::consts::TAU)
+    }
+
+    /// The lids' two easers, 0x439A00 / 0x439AA0 (hood) and 0x439B30 / 0x439BD0 (engine lid):
+    /// a travel already running is left alone (0x439A1E); otherwise it restarts from where it
+    /// ended toward the extent (`open`) or 0, over **1000 ms** (0x439A81).
+    pub fn set_lid(&mut self, hood: bool, open: bool) {
+        let (e, target) = if hood {
+            (&mut self.hood, if open { self.hood_extent } else { 0.0 })
+        } else {
+            (&mut self.trunk, if open { self.trunk_extent } else { 0.0 })
+        };
+        if e.elapsed < e.duration {
+            return;
+        }
+        e.from = e.to;
+        e.to = target;
+        e.elapsed = 0;
+        e.duration = 1000;
+    }
+
+    /// Advance the lid easers and write channels 8 and 9 (slot 9, 0x4387CE…0x43891C): the easer's
+    /// `from + (to − from)·t`, and `to` once it has run its course. Front-end cars only; the race
+    /// never opens a lid.
+    pub fn update_lids(&mut self, dt_ms: u32) {
+        for (n, e) in [(8u8, self.hood), (9u8, self.trunk)] {
+            let v = if e.duration == 0 || e.elapsed >= e.duration {
+                e.to
+            } else {
+                e.from + (e.to - e.from) * (e.elapsed as f32 / e.duration as f32)
+            };
+            self.set_channel(n, v);
+        }
+        for e in [&mut self.hood, &mut self.trunk] {
+            if e.elapsed < e.duration {
+                e.elapsed = e.elapsed.saturating_add(dt_ms);
+            }
+        }
     }
 
     /// Set one animation channel, in turns. Channel **16** is `MoveSpoiler`, **17** the pop-up
@@ -827,7 +902,8 @@ impl CarModel {
     }
 
     /// Draw items for a car at `car_to_world` (body frame → world). `wheel_spin` in turns,
-    /// `steer` in turns for the front wheels.
+    /// `steer` in turns for the front wheels, positive to the right — take it from
+    /// `Vehicle::wheel_steer_turns`, not from the raw `Wheel::steer`.
     pub fn draw_items(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: f32) -> Vec<DrawItem> {
         self.draw_items_lit(car_to_world, wheel_spin, steer, [1.0; 3])
     }
@@ -853,7 +929,12 @@ impl CarModel {
                 (false, false) => 3,
             };
             let spin = Mat4::from_rotation_x(-wheel_spin[idx] * std::f32::consts::TAU);
-            let st = if w.is_front { Mat4::from_rotation_y(-steer * std::f32::consts::TAU) } else { Mat4::IDENTITY };
+            // **Positive steer is a right turn** (the right arrow gives +1, and the car yaws right
+            // on it), and in the body frame +X is right and +Z forward — so the wheel turns by
+            // `+steer`: `from_rotation_y(θ)` carries forward (0,0,1) to (sin θ, 0, cos θ), toward
+            // +X. This said `-steer` until 2026-09-21 and drew the front wheels turned the wrong
+            // way while the car steered correctly — found in play.
+            let st = if w.is_front { Mat4::from_rotation_y(steer * std::f32::consts::TAU) } else { Mat4::IDENTITY };
             for (mesh, material, local) in &w.parts {
                 // local has translation = pivot; rotate about the pivot in model space
                 let pivot = local.w_axis.truncate();

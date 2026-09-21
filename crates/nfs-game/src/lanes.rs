@@ -12,7 +12,8 @@
 //!
 //! Ported: §23.0 helpers, §12.4 blockers and speed caps, §23.1–§23.6 scorers, §12.5 the pick, §12.6 the
 //! lateral target and §12.7 the speed cap, plus §12.3's script reactions (`traffic.rs` pushes them into
-//! the same scores). Not ported: `0x402F00`'s post-finish pull-over (humans only), and the two abort tests of
+//! the same scores). Not ported: `0x402F00`'s post-finish pull-over (it asks for a racer, and only cops and
+//! traffic reach it, so it never fires — `traffic.md` §12.10a), and the two abort tests of
 //! §12.6's `0x402790`, which §28.5 shows is dead for traffic (every writer of its `car+0x107C` bias is
 //! an opponent path). `0x402920`, the other early return, **is** ported — see `squeeze_past`.
 

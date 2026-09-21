@@ -224,3 +224,64 @@ fn the_used_car_market_fills_and_caps() {
     assert_eq!(c.garage.last().unwrap().mileage, want.mileage);
     assert_eq!(c.garage.last().unwrap().asking_price, None);
 }
+
+/// `nfs5.exe`'s virtual addresses mapped to file offsets, so a table the port transcribed can be
+/// compared with the bytes it came from (the same helper `nfs-physics`'s `scenarios.rs` uses for the
+/// surface tables). Minimal PE walking: `e_lfanew` at 0x3C, the COFF header, then the section whose
+/// virtual range holds the RVA.
+struct Image {
+    bytes: Vec<u8>,
+    sections: Vec<(u32, u32, u32)>,
+}
+
+impl Image {
+    fn open() -> Option<Self> {
+        let home = std::env::var_os("HOME")?;
+        let p = std::path::PathBuf::from(home).join("Games/NFS-Porsche-Unleashed/game_info/data/nfs5.exe");
+        let bytes = std::fs::read(p).ok()?;
+        let u16at = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]) as usize;
+        let u32at = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+        let pe = u32at(0x3C) as usize;
+        let (n, opt) = (u16at(pe + 6), u16at(pe + 20));
+        let table = pe + 24 + opt;
+        let sections = (0..n).map(|i| { let s = table + i * 40; (u32at(s + 12), u32at(s + 8), u32at(s + 20)) }).collect();
+        Some(Self { bytes, sections })
+    }
+
+    fn i32s(&self, va: u32, n: usize) -> Vec<i32> {
+        let rva = va - 0x400000;
+        let (r, _, off) = *self.sections.iter().find(|(r, sz, _)| rva >= *r && rva < r + sz.max(&1)).expect("inside a section");
+        let o = (off + (rva - r)) as usize;
+        (0..n).map(|i| i32::from_le_bytes(self.bytes[o + i * 4..o + i * 4 + 4].try_into().unwrap())).collect()
+    }
+}
+
+/// **The used-car generator's four tables, against the bytes they were transcribed from.** 61 + 48
+/// integers that decide which cars reach the lot and with what mileage, wins and parts
+/// (`career.md` §10.5a). None of them shows up in any other test: a slip would just make the lot
+/// subtly wrong for ever.
+#[test]
+fn the_used_car_tables_match_the_image() {
+    use nfs_game::career::{USED_CAR_RARITY, USED_MILEAGE, USED_PART_PCT, USED_WINS};
+    let Some(img) = Image::open() else { return };
+    // 0x5B7A10: the chance of **not** being offered, in sixtieths, by age 0…60
+    let rarity = img.i32s(0x5B7A10, 61);
+    for (i, v) in USED_CAR_RARITY.iter().enumerate() {
+        assert_eq!(*v as i32, rarity[i], "USED_CAR_RARITY[{i}]");
+    }
+    // the three `{roll_lo, roll_hi, min, max}` band tables, 16 bytes an entry
+    for (va, name, bands) in [
+        (0x5B7B08u32, "USED_PART_PCT", &USED_PART_PCT[..]),
+        (0x5B7B48, "USED_MILEAGE", &USED_MILEAGE[..]),
+        (0x5B7BC8, "USED_WINS", &USED_WINS[..]),
+    ] {
+        let raw = img.i32s(va, 16);
+        for (i, b) in bands.iter().enumerate() {
+            assert_eq!([b.0, b.1, b.2, b.3], raw[i * 4..i * 4 + 4], "{name}[{i}]");
+        }
+    }
+    // 0x5B7B88 is a fourth table of the same shape that neither generator reads, and the port is
+    // right not to carry it — this pins that it is the one with the 1…20 / 20…40 / 40…100 bands, so
+    // a future reader does not mistake it for one of the three above.
+    assert_eq!(img.i32s(0x5B7B88, 16), vec![0, 5, 0, 0, 6, 20, 1, 20, 21, 80, 20, 40, 81, 100, 40, 100]);
+}

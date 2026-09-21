@@ -34,6 +34,9 @@ pub struct AiCarState {
     pub slice: usize,
     /// `car+0xEB0`: +1 along the route, −1 against it
     pub dir: f32,
+    /// `car+0xEAC`: the direction the behaviour has *asked* for. 0x409AAF gates the throttle on it
+    /// matching `dir`, so a car that has been told to turn round coasts until it has.
+    pub requested_dir: f32,
     /// `car+0x104C`: the gear / heading sense, +1 forward and −1 reversing out of trouble
     pub sense: f32,
     /// `car+0xEC0` signed speed along the route
@@ -145,13 +148,20 @@ pub fn out_of_control_command(car: &AiCarState, cfg: &AiPhysics, heading_err: f3
     let wrong_way = car.dir * car.speed < 0.0 && car.sense >= 0.0;
     // desired angular velocity from the heading error, then the lateral velocity that goes with it
     let mut dav = (-2.0 * cfg.dangle_to_dav * heading_err).clamp(-cfg.max_dav, cfg.max_dav);
-    let mut dlv = (10.0 * dav).clamp(-cfg.max_dlvel, cfg.max_dlvel).min(car.speed_est);
+    // …and then to ±`car+0xEC4`, the speed estimate. Both halves are real: 0x409811 is
+    // `min(dlv, speed_est)` and **0x40982C is `max(dlv, −speed_est)`** — `traffic.md` §27.14 called
+    // that second one "a compiler no-op" and it is not, because `max_dlvel` can exceed the estimate
+    // and leave `dlv` below `−speed_est` for the first clamp to pass through. Corrected 2026-09-21.
+    let mut dlv = (10.0 * dav).clamp(-cfg.max_dlvel, cfg.max_dlvel).clamp(-car.speed_est, car.speed_est);
     if car.speed.abs() < cfg.vel_limit_range {
         let l = (cfg.lat_vel_limit_factor * car.speed_est).abs();
         dlv = dlv.clamp(-l, l);
         let a = (cfg.ang_vel_limit_factor * car.speed_est).abs();
         dav = dav.clamp(-a, a);
     }
+    // `car+0x10AC == 2 → dav *= 5` (0x40990F) is **not** modelled, because it cannot fire: that
+    // `cmp` is the only reference to `car+0x10AC` anywhere in the image and nothing writes it, so it
+    // holds the zero `Car_tObj`'s allocation left there.
     let yaw_rate = car.angular_velocity.dot(car.orientation.row(1));
     let mut aa = -(yaw_rate - dav) * cfg.dav_to_aa;
     if car.speed.abs() > 18.0 {
@@ -159,10 +169,25 @@ pub fn out_of_control_command(car: &AiCarState, cfg: &AiPhysics, heading_err: f3
     }
     aa = aa.clamp(-car.max_yaw_acc, car.max_yaw_acc);
     let la = (-(body_lateral_speed(car) - dlv) * cfg.dlvel_to_clacc).clamp(-car.max_lat_acc, car.max_lat_acc);
-    // longitudinal: accelerate while the forward speed is between the dead band and the target
-    let want = car.sense * car.target_speed * car.dir;
+    // **Longitudinal, read out in full 2026-09-21** (0x4099F0…0x409B0E). The target:
+    //
+    // * reversing (`car+0x104C == −1`) with **no aim point at all** — all three of `car+0x1064…+0x106C`
+    //   exactly zero, 0x409A09/0x409A1C/0x409A2F — asks for `−vel_limit_range` (0x409A42,
+    //   `[0x5B2624]` = −1); the port had no such arm;
+    // * otherwise `sense · target_speed · dir` (0x409A50).
+    //
+    // And the window is a **±2 m/s dead band stretched to the target**, not a fixed one:
+    // `want >= 0` accelerates while `−2 <= v <= want` (0x409A7D / 0x409A8C) and `want < 0` while
+    // `want <= v <= 2` (0x409A99 / 0x409AA2), both bounds inclusive. The port had
+    // `v > −2 && v < max(want, 2)`, which for a small positive target keeps the throttle on past it
+    // and for a negative one cuts it at −2 instead of following the target down. `want == 0` takes
+    // the first arm in the original, so the port's extra `want != 0` test was its own.
+    let want = if car.sense < 0.0 && car.aim_point == Vec3::ZERO { -cfg.vel_limit_range } else { car.sense * car.target_speed * car.dir };
     let v = body_forward_speed(car);
-    let mut fwd = if v > -2.0 && v < want.max(2.0) && want != 0.0 {
+    let in_band = if want >= 0.0 { (-2.0..=want).contains(&v) } else { (want..=2.0).contains(&v) };
+    // `car+0x544 == 0` (0x409A5E) is the post-finish forced-brake state, which no AI car this port
+    // drives ever has; `car+0xEAC == car+0xEB0` (0x409AAF) is the gate below.
+    let mut fwd = if in_band && car.requested_dir == car.dir {
         accel_rate * car.sense
     } else if v.abs() > 0.0 {
         -v.signum() * brake_force
@@ -277,6 +302,11 @@ pub fn in_control_command(car: &AiCarState, cfg: &AiPhysics, heading_err: f32, a
     // the desired direction rotated a quarter turn in the ground plane
     let perp = Vec3::new(d.z, d.y, -d.x);
     let k = if boost > 1.0 { boost } else { 1.0 };
+    // `grip` is §27.14's `gripK` **less its second factor**: the original is
+    // `(1 + 0.0015·car+0xD60) · car+0x10BC`, and `car+0x10BC` is the post-collision recovery ramp
+    // 0x40A900 winds down, which this port does not model — it is 1.0 for an undamaged car, and the
+    // cases that move it ((ii) the scripted spin, (iii) the cop-collision window) are not ported
+    // either.
     let (a, b) = (grip * car.max_lat_acc * k, grip * cfg.dlvel_to_clacc * k);
     let lateral = (-car.velocity.dot(perp) * b).clamp(-a, a);
 
@@ -289,9 +319,16 @@ pub fn in_control_command(car: &AiCarState, cfg: &AiPhysics, heading_err: f32, a
     let yaw = (-(yaw_rate - dav) * cfg.dav_to_aa).clamp(-car.max_yaw_acc, car.max_yaw_acc);
 
     // the throttle window is a plain comparison of the route-signed speeds, with no dead band and no
-    // gear factor; the brake, like the drive force, acts along the car's own forward axis, so its sign
-    // comes from the body-frame speed and not from the route-signed one
-    let forward = if car.dir * car.speed < car.dir * car.target_speed { accel_rate } else { -body_forward_speed(car).signum() * brake_force };
+    // gear factor (`traffic.md` §27.14 (x)) — but it carries the same two gates the out-of-control
+    // one does, and the port had neither: `car+0x544 == 0` (0x40A093), the post-finish forced brake
+    // no AI car this port drives ever has, and `car+0xEAC == car+0xEB0` (0x40A09B), so a car asked to
+    // turn round coasts until it has. The brake, like the drive force, acts along the car's own
+    // forward axis, so its sign comes from the body-frame speed and not from the route-signed one.
+    let forward = if car.dir * car.speed < car.dir * car.target_speed && car.requested_dir == car.dir {
+        accel_rate
+    } else {
+        -body_forward_speed(car).signum() * brake_force
+    };
     DriveCommand { lateral, forward, yaw }
 }
 
@@ -345,6 +382,7 @@ mod tests {
             angular_velocity: Vec3::ZERO,
             slice: 10,
             dir: 1.0,
+            requested_dir: 1.0,
             sense: 1.0,
             speed: 16.0,
             speed_est: 16.0,
@@ -413,7 +451,36 @@ mod tests {
         assert!(out_of_control(&c, &cfg, 0.0, (11.0, 11.0), -0.81), "either way round");
     }
 
+    /// The out-of-control throttle window, 0x409A6A…0x409AA2: a ±2 m/s dead band **stretched to the
+    /// target**, both bounds inclusive, and a target of 0 still accelerates a car that is rolling
+    /// backwards.
     #[test]
+    fn the_throttle_window_follows_the_target_past_the_dead_band() {
+        let cfg = TrafficConfig::default().out_of_control;
+        let mut c = car();
+        c.target_speed = 1.0; // want = +1, so the window is −2 ..= 1
+        let fwd = |v: f32, c: &AiCarState| {
+            let mut c = *c;
+            c.velocity = Vec3::new(0.0, 0.0, v);
+            out_of_control_command(&c, &cfg, 0.0, 3.0, 9.0).forward
+        };
+        assert_eq!(fwd(0.5, &c), 3.0, "inside the window");
+        assert!(fwd(1.5, &c) < 0.0, "past a small target it brakes, where the old bound was 2.0");
+        assert_eq!(fwd(-1.5, &c), 3.0, "and the dead band still reaches −2");
+        c.target_speed = 0.0;
+        assert_eq!(fwd(-1.0, &c), 3.0, "a zero target is the `want >= 0` arm, not a special case");
+        // reversing with no aim point asks for −vel_limit_range, so the window is that ..= 2
+        let mut back = car();
+        back.sense = -1.0;
+        back.aim_point = Vec3::ZERO;
+        assert_eq!(fwd(-8.0, &back), -3.0, "well inside the reverse window, and the sense flips the sign");
+        assert!(fwd(-12.0, &back).abs() > 3.0, "past −vel_limit_range it brakes");
+        // the gate of 0x409AAF: a car that has been asked to turn round coasts until it has
+        let mut turning = c;
+        turning.requested_dir = -1.0;
+        assert!(fwd(0.5, &turning) < 0.0, "no throttle while the requested direction differs");
+    }
+
     /// §27.2a: an upright car that has merely wandered off the lanes is not in trouble; a tipped one
     /// is, and then the gear flips every half period while the car is slow.
     #[test]

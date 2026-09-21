@@ -31,13 +31,6 @@
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Zone(pub u32, pub u32, pub f32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Dir {
-    Fwd,
-    Back,
-    Both,
-}
-
 const ZONES: &[(&str, &str, &[Zone])] = &[
     ("monaco1", "fwd", &[Zone(30, 70, 1.15), Zone(90, 110, 1.2), Zone(425, 525, 1.15), Zone(525, 557, 1.13), Zone(200, 300, 0.7)]),
     ("monaco1", "back", &[Zone(20, 50, 1.1), Zone(90, 130, 1.1), Zone(390, 557, 1.15), Zone(139, 150, 25.0), Zone(580, 592, 30.0), Zone(200, 300, 0.7)]),
@@ -108,6 +101,15 @@ pub fn zone_mult(track: &str, backwards: bool, slice: usize) -> f32 {
 }
 
 /// Road-width normaliser `[0x5E6E34]`: 12 by default, 10 on castle, 9 on forest (0x4A2DC0).
+/// **Why a slot can read `Zone(0, …)`.** 0x4A2DC0 opens with a reset (0x4A2DE1…0x4A2E02): the ten
+/// multipliers at `0x5E74FC` are `rep stosd`-filled with **1.0** and the twenty range dwords at
+/// `0x5E74AC` are zeroed. A track arm then stores only the slots it uses, so a slot whose `from` is
+/// never stored is **0**, and a slot with no multiplier is **1.0** — which is what
+/// `monaco5 back`'s first zone is: only its `to` (0x14 = 20) is written, at 0x4A35D9.
+/// Re-verified against the immediates 2026-09-21, all 28 arms; the four `from`s a scan could not
+/// resolve are `monaco2 back` 0 (`ebx`, xor-zeroed at 0x4A2DF0, with `to` = `eax` = 0x46 set at
+/// 0x4A301E **after** the direction branch), `monaco3 back` **7** (0x4A31A9), `monaco4 back` **5**
+/// (0x4A3446) and `monaco5 back` 0 (never stored).
 pub fn width_divisor(track: &str) -> f32 {
     let t = track.to_ascii_lowercase();
     if t.starts_with("castle") {

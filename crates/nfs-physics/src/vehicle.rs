@@ -28,6 +28,13 @@ use crate::specs::{CarSpecs, CIRCLE_SOFTNESS, GRAVITY, GRIP_DRY, GRIP_WET, SURFA
 use glam::{Mat3, Vec3};
 use std::f32::consts::TAU;
 
+/// A front wheel's angle in 1/256 turn from its steering value: `max_steer · steer / 17`.
+/// `set_wheel_steer` scales the lock to 17 (`y · 17 / max_steer`), so this undoes it. One function
+/// for the tyre and the renderer.
+pub fn steer_angle_256(max_steer: f32, steer: f32) -> f32 {
+    max_steer * steer / 17.0
+}
+
 pub const DT32: f32 = 0.03125;
 pub const DT64: f32 = 0.015625;
 
@@ -55,7 +62,10 @@ pub struct Wheel {
     pub slip_vel: [f32; 3],
     pub demand: f32,
     pub limit: f32,
-    /// steer angle in 1/256 turn
+    /// The front wheel's steering value as `set_wheel_steer` leaves it — **not** an angle: full lock
+    /// is about ±17 (the `y · 17 / max_steer` scaling), and the angle the tyre is actually turned
+    /// through is [`steer_angle_256`]`(max_steer, steer)`, in 1/256 turn. This comment used to say
+    /// "steer angle in 1/256 turn", and the renderer took it at its word (2026-09-21).
     pub steer: f32,
     pub slip: f32,
     pub locked: bool,
@@ -432,6 +442,11 @@ impl Vehicle {
             rpm_target = 0.0;
             self.ignition_cut -= 1;
         }
+        // 0x49E843 / 0x49E849: both axles' clutch-slip states are cleared at the top of every call,
+        // **before** the neutral and shift early-outs — so the flag is per-tick, and a car sitting
+        // in neutral or mid-shift is never "spinning". This port used to set it only inside the
+        // block below, so on those paths it kept the previous tick's value.
+        self.rear_spin = false;
         if neutral {
             if self.rpm < rpm_target {
                 self.rpm += 250.0;
@@ -467,17 +482,60 @@ impl Vehicle {
             diff = 0.0;
         }
         let slip = self.rpm - rpm_wheel.abs();
-        let launch = (gear > 1 && vz >= -0.1) || (gear == 0 && vz <= 0.1);
-        self.rear_spin = launch && slip > 250.0;
         // `misfire = engineDamage/300 > rand01` (§4.3): a damaged engine stumbles, which stops the
         // clutch model pulling the revs down and kills the drive when it is over its target. The
         // draw comes from the shared LCG, so the caller fills `misfire_roll` each tick.
         let misfire = self.part_wear(&specs.zone_masks.engine, &specs.wear.engine) / 300.0 > self.misfire_roll;
-        if launch && slip > 250.0 && throttle < 0.5 && !misfire {
-            // clutch slipping with little throttle: rpm falls toward wheel rpm
-            self.rpm -= slip.min(100.0 * (1.0 - throttle) + 100.0);
-        } else if launch && slip > 250.0 {
-            self.rpm -= slip / 6.0;
+        // **The clutch-slip block of `Engine_update` 0x49E440, read to the instruction on
+        // 2026-09-21** (`physics.md` §4.1a). The note this used to follow had three comparisons the
+        // wrong way round, and the port had simplified the rest; together they left the rear axle
+        // "spinning" on about 80 % of full-throttle ticks at every speed up to 197 km/h in seventh,
+        // which is the constant wheelspin squeal that was reported in play.
+        //
+        // Entered on any of (0x49EA1B…0x49EA8B):
+        //
+        // * `slip > 250` (`[0x5B4A60]`), not shifting and not in neutral — the neutral and shift
+        //   early-outs above have already returned, so only the slip test remains here;
+        // * a forward gear while rolling **backwards**, `v < −0.1` (0x49EA52 against `[0x5B2444]`,
+        //   `test ah,1 ; jne` — taken when st0 < arg);
+        // * reverse while rolling **forwards**, `v > 0.1` (0x49EA69, `test ah,0x41 ; je`).
+        //
+        // The note had the last two as `v ≥ −0.1` / `v ≤ 0.1` — "moving with the gear", which is
+        // nearly always. A fourth disjunct, `DB8 == 1 && ignitionCut == 0` (0x49EA76), is dead:
+        // 0x49E849 cleared `DB8` at the top of this very call and nothing in the image writes 1.
+        let clutch = slip > 250.0 || (gear > 1 && vz < -0.1) || (gear == 0 && vz > 0.1);
+        if clutch {
+            // `allow`, 0x49EA91…0x49EB44: the most the revs may fall this tick. The loads are the
+            // wheels' grip limits `+0xAC` (the wheel block is at `car+0x7B8`, so wheel 0's is
+            // `+0x864`) — all four for a car with any front drive (`specs[0x5C] > 0`, against 120),
+            // the rear two otherwise (against 100) — and the raw throttle byte `[0xD7C]` divides,
+            // floored at 0.3. The port had `100·(1 − throttle) + 100`.
+            let drive = (15.0 * a_drive).abs();
+            let base = if specs.front_drive > 0.0 {
+                120.0 - (drive - (self.wheels[0].limit + self.wheels[1].limit + self.wheels[2].limit + self.wheels[3].limit))
+            } else {
+                100.0 - (drive - (self.wheels[2].limit + self.wheels[3].limit))
+            };
+            let allow = base / (self.throttle_raw as f32 / 254.0).max(0.3) + 100.0 * (1.0 - throttle);
+            // 0x49EB2C…0x49EB61: a quick gearbox (`specs[0x54] ≤ 4` ticks) above first gear bleeds
+            // a sixth of the slip off first, whichever branch follows
+            if specs.shift_ticks <= 4 && gear > 2 {
+                self.rpm -= slip / 6.0;
+            }
+            // 0x49EB67: **on the throttle** (≥ 0.5) and not misfiring, the clutch pulls the revs
+            // down hard — by `min(slip, allow)` — and the axle is marked spinning only when the
+            // slip is past an eighth of the redline (`specs[0x94] · [0x5B272C]`, 0x49E473),
+            // not past 250. **Off** the throttle the revs only drift down by a sixth (0x49EBE3).
+            // The port had these two branches swapped, so at full throttle the revs never came
+            // down to the wheels.
+            if throttle >= 0.5 && !misfire {
+                if slip > specs.redline * 0.125 {
+                    self.rear_spin = true;
+                }
+                self.rpm -= slip.min(allow);
+            } else {
+                self.rpm -= slip / 6.0;
+            }
         } else if diff > 0.0 {
             // engine wants to rev: rate limited
             let step = (81920.0 * specs.mps_per_rpm[gear]).min(-slip.min(0.0) + specs.rev_rate * diff);
@@ -674,6 +732,12 @@ impl Vehicle {
         self.set_wheel_steer(specs, s, sp, f);
     }
 
+    /// Front wheel `i`'s angle in **turns**, positive to the right — the same angle [`Self::tyre`]
+    /// turns the contact patch by, so the drawn wheel and the simulated one cannot disagree.
+    pub fn wheel_steer_turns(&self, i: usize, specs: &CarSpecs) -> f32 {
+        steer_angle_256(specs.max_steer, self.wheels[i].steer) / 256.0
+    }
+
     /// Slip velocities are ×(−16) in the steered-wheel frame; forces are m/s² of car acceleration.
     /// Not modelled: tyre damage (`LIM = LIM0`), the per-car `.ABS` / `.TRACTION` registry flags
     /// (both off) and the `RALLY` flag. `traction_control` stands for the AI-driven flag `car+0xDA8`.
@@ -691,7 +755,7 @@ impl Vehicle {
         let k_class = CIRCLE_SOFTNESS[class];
         let tyre_damage = self.part_wear(&specs.zone_masks.tyres, &specs.wear.tyres);
         let w = &mut self.wheels[i];
-        let ang = specs.max_steer * w.steer / 17.0; // 1/256 turn
+        let ang = steer_angle_256(specs.max_steer, w.steer);
         let (mut u, mut v) = (w.slip_vel[0], w.slip_vel[2]);
         if ang != 0.0 {
             let a = ang / 256.0 * TAU;
@@ -1873,16 +1937,29 @@ mod steer_taper_tests {
 
     /// `physics.md` §4 item 4, corrected 2026-09-21: the `1.75 − 0.025·speed` factor applies
     /// **below** 30 m/s (0x49F5F0 compares, 0x49F5FB's `test ah,1; je` skips when `speed >= 30`).
+    ///
+    /// This used to assert a closure it defined itself — a copy of the formula, not the port — so
+    /// it could never catch the port drifting. It now drives [`Vehicle::set_wheel_steer`] at full
+    /// lock and reads the wheel back (2026-09-21, found by the unused `use super::*`).
     #[test]
     fn the_steering_taper_is_a_low_speed_boost_not_a_high_speed_cut() {
-        let f = |speed: f32| if speed < 30.0 { 1.75 - 0.025 * speed } else { 1.0 };
-        // 1.75 at rest, 1.0 where the two meet, flat above
-        assert!((f(0.0) - 1.75).abs() < 1e-6);
-        assert!((f(29.9) - 1.0).abs() < 0.01);
-        assert_eq!(f(30.0), 1.0);
-        assert_eq!(f(70.0), 1.0);
+        let specs = super::tests::specs_993();
+        let mut v = Vehicle::new(Vec3::ZERO, Mat3::IDENTITY, &specs, 0.8, 0.3);
+        // the wheel at full lock, less the fixed offset, at one speed (below 80 m/s, so the
+        // `1/(v·0.0125)` arm stays out of it)
+        let mut lock = |speed: f32| {
+            v.set_wheel_steer(&specs, 127.0, speed, speed);
+            v.wheels[0].steer - specs.steer_offset
+        };
+        let (rest, at30, at70) = (lock(0.0), lock(30.0), lock(70.0));
+        assert!(rest > at70, "the factor is a boost below 30 m/s: {rest} at rest vs {at70} at 70 m/s");
+        assert!((at30 - at70).abs() < 1e-4, "and flat from 30 m/s up: {at30} vs {at70}");
         // the old reading went negative, which is what took the steering away at speed
-        assert!(f(70.0) > 0.0);
+        assert!(at70 > 0.0);
+        // where the 20-unit clamp does not bite, the boost at rest is exactly 1.75
+        if specs.max_steer * 1.75 <= 20.0 {
+            assert!((rest / at70 - 1.75).abs() < 1e-3, "rest/fast = {}", rest / at70);
+        }
     }
 
     /// A bare `fistp` rounds to nearest with ties to even — 0x49F3EE and 0x49F4C9 both use it

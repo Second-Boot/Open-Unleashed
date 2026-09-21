@@ -3002,3 +3002,309 @@ fn the_3d_cars_zones_follow_the_turntable_and_the_thirds() {
     assert_eq!(z(0.5, -1.0, y), None);
     assert_eq!(z(0.5, 150.0, h + 1.0), None);
 }
+
+/// 0x4E1C90's two frame rules, read 2026-09-21. The hovered arrow counts **backwards** from its
+/// last frame over a span of `last − first`, so its first frame never appears; every other shape
+/// ramps with the mouse button and stops at whichever end it reaches.
+#[test]
+fn the_cursor_steps_the_way_the_original_steps_it() {
+    use nfs_game::layout::{cursor_frame, CURSOR_SHAPES};
+    let arrow = CURSOR_SHAPES[1];
+    assert_eq!(arrow, (1, 5));
+    // 125 ms a frame, down from 5, and 1 is never drawn (the span is 4, not 5)
+    let seen: Vec<usize> = (0..8).map(|k| cursor_frame(1, arrow, k * 125, 0, false)).collect();
+    assert_eq!(seen, vec![5, 4, 3, 2, 5, 4, 3, 2]);
+    assert!(!seen.contains(&1), "0x4E1D31's clamp to `first` is unreachable, so 1 never shows");
+    // one frame short of the step is still the frame before it
+    assert_eq!(cursor_frame(1, arrow, 124, 0, false), 5);
+    assert_eq!(cursor_frame(1, arrow, 125, 0, false), 4);
+
+    // `grab` (shape 5) closes as the button is held, at 31.25 ms a frame, and stops at `last`
+    let grab = CURSOR_SHAPES[5];
+    assert_eq!(grab, (28, 33));
+    assert_eq!(cursor_frame(5, grab, 0, 0, true), 28);
+    assert_eq!(cursor_frame(5, grab, 0, 31, true), 28);
+    assert_eq!(cursor_frame(5, grab, 0, 32, true), 29);
+    assert_eq!(cursor_frame(5, grab, 0, 5 * 32, true), 33);
+    assert_eq!(cursor_frame(5, grab, 0, 100 * 32, true), 33, "clamped at `last`");
+    // and opens again when it is let go, from `last` back down to `first`
+    assert_eq!(cursor_frame(5, grab, 0, 0, false), 33);
+    assert_eq!(cursor_frame(5, grab, 0, 32, false), 32);
+    assert_eq!(cursor_frame(5, grab, 0, 100 * 32, false), 28, "clamped at `first`");
+
+    // a one-frame shape is its one frame whatever the clocks say
+    for (i, pair) in CURSOR_SHAPES.iter().enumerate().filter(|(_, (f, l))| f == l) {
+        assert_eq!(cursor_frame(i, *pair, 9999, 9999, true), pair.0);
+        assert_eq!(cursor_frame(i, *pair, 9999, 9999, false), pair.0);
+    }
+}
+
+/// The cursor's hot spot, 0x4E1DF1…0x4E1E42: **only** shape 2 is offset, and it is offset on both
+/// axes by 6.0, not one. There is no per-shape table in the original to read.
+#[test]
+fn only_the_magnifier_has_a_hot_spot_and_it_is_on_both_axes() {
+    use nfs_game::layout::{cursor_hot_spot, CURSOR_SHAPES};
+    assert_eq!(cursor_hot_spot(2), -6.0, "0x4E1E07 and 0x4E1E15 both subtract [0x5B2460] = 6.0");
+    for shape in (0..CURSOR_SHAPES.len()).filter(|s| *s != 2) {
+        assert_eq!(cursor_hot_spot(shape), 0.0, "0x4E1E2C passes the coordinates through");
+    }
+}
+
+/// 0x4D94A0's clip box for the combo scrollbar's two slivers, pinned 2026-09-21: the trough's
+/// **interior**, `upArrow.y + upArrow.h … downArrow.y`, not the widget's whole box (§4.100).
+#[test]
+fn a_scrollbar_sliver_is_clipped_to_the_trough_between_the_arrows() {
+    use nfs_game::layout::{combo_sliver_visible, COMBO_ARROW_H};
+    let (y, h) = (40.0f32, 120.0f32);
+    // the arrows' own rows are outside the box at both ends
+    assert!(!combo_sliver_visible(y, y, h), "the up arrow's first row");
+    assert!(!combo_sliver_visible(y + COMBO_ARROW_H - 1.0, y, h), "still the up arrow");
+    assert!(combo_sliver_visible(y + COMBO_ARROW_H, y, h), "the trough starts at the arrow's bottom");
+    assert!(combo_sliver_visible(y + h - COMBO_ARROW_H - 1.0, y, h), "the last trough row");
+    assert!(!combo_sliver_visible(y + h - COMBO_ARROW_H, y, h), "the down arrow's first row");
+    assert!(!combo_sliver_visible(y + h - 1.0, y, h), "still the down arrow");
+    // and the widget's own box is wider than the clip at both ends, which is the divergence fixed
+    assert!(y < y + COMBO_ARROW_H && y + h > y + h - COMBO_ARROW_H);
+}
+
+/// 0x4CCC20, the key handler the three input classes share: everything printable goes in except
+/// `'%'`, and the accessor's own `maxLen` (the third argument of its ctor 0x4BC8B0) stops it.
+#[test]
+fn an_input_box_takes_everything_printable_except_a_percent() {
+    use nfs_game::layout::LayoutScreen;
+
+    // the three limits read out of the registrations that name an accessor this port can see
+    assert_eq!(LayoutScreen::input_max_len("UserList.NameInput"), Some(8), "0x4E5D9E pushes 8");
+    assert_eq!(LayoutScreen::input_max_len("ANOTHER"), Some(15), "0x4E6016 pushes 0xF");
+    assert_eq!(LayoutScreen::input_max_len("COMMS.PASSWORD"), Some(7), "0x50B9C1 pushes 7");
+    // an accessor whose registration this port has not read is left unlimited rather than guessed
+    assert_eq!(LayoutScreen::input_max_len("Comms.GameName"), None);
+
+    // the filter itself, stated where it can be checked against 0x4CCD95…0x4CCDA2
+    let takes = |c: char| {
+        let n = c as u32;
+        (0x20..0xFF).contains(&n) && n != 0x25
+    };
+    assert!(takes('A') && takes('z') && takes('0') && takes(' ') && takes('-'));
+    assert!(!takes('%'), "0x4CCDA2: '%' is the one printable character refused");
+    assert!(!takes('\n') && !takes('\t'), "0x4CCD9D: below 0x20");
+    assert!(!takes('\u{100}'), "0x4CCD95: 0xFF and above");
+    // and nothing else in the printable range is singled out
+    for n in 0x20u32..0xFF {
+        let c = char::from_u32(n).unwrap();
+        assert_eq!(takes(c), n != 0x25, "only 0x25 is refused, not {n:#04x}");
+    }
+}
+
+/// The caret of an input box — `0x4CC9D7` in `FeInputBox::draw` and the identical block at
+/// `0x4C343D` in `NFS5.CHATINPUTBOX`'s own draw `0x4C33C0`. Both ask `isFocused` (0x4C7DD0,
+/// `[this+0x10C] & 0x40`), both take `TIMER_getTicks() & 0x3F` and draw only while it is under
+/// `0x20`, and both draw the part the shared bind `0x4CC430` resolved by **name** at 0x4CC50B —
+/// `"cursor"` — into `[this+0x14C]`.
+///
+/// What that part *is* differs by template, and this pins all three against the shipped files so
+/// the port cannot quietly draw one shape for all of them:
+///
+/// * `InputBox.ctr` — a `RECT`, one pixel wide and `data.height-6` tall, opaque black;
+/// * `CharVectInputBox.ctr` and `ChatInputBox.ctr` — a `TEXT` underscore in `univers8b.ffn`.
+///
+/// And the position rule the port implements: every one of the three puts `cursor` exactly one
+/// pixel past the right edge of `hitext`, whatever that template's alignment is.
+#[test]
+fn an_input_box_puts_its_caret_one_pixel_past_the_text() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let dir = paths.fe_data().join("Controls");
+    let load = |name: &str| {
+        let p = GamePaths::find_file(&dir, name).expect(name);
+        let text: String = std::fs::read(p).unwrap().iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+        nfs_formats::ctr::Control::parse(&text)
+    };
+    // a stand-in box 100 wide and 14 tall with 40 pixels of text in it
+    const W: f64 = 100.0;
+    const TW: f64 = 40.0;
+    let refs = |n: &str| match n {
+        "data.width" => Some(W),
+        "data.height" => Some(14.0),
+        "hitext.size.width" => Some(TW),
+        _ => None,
+    };
+    for name in ["InputBox.ctr", "CharVectInputBox.ctr", "ChatInputBox.ctr"] {
+        let c = load(name);
+        let cursor = c.part("cursor").unwrap_or_else(|| panic!("{name} should have a cursor part"));
+        let hitext = c.part("hitext").unwrap_or_else(|| panic!("{name} should have a hitext part"));
+        let (cx, _) = nfs_formats::ctr::eval_pair(cursor.value("pos").unwrap(), &refs).unwrap();
+        let (hx, _) = nfs_formats::ctr::eval_pair(hitext.value("pos").unwrap(), &refs).unwrap();
+        assert_eq!(cx, hx + TW + 1.0, "{name}: the caret is one pixel past the text");
+    }
+    // the bar
+    let c = load("InputBox.ctr");
+    let p = c.part("cursor").unwrap();
+    assert_eq!(p.kind(), nfs_formats::ctr::PartKind::Rect);
+    assert_eq!(p.value("color"), Some("0xff000000"));
+    assert_eq!(nfs_formats::ctr::eval_pair(p.value("size").unwrap(), &refs), Some((1.0, 8.0)));
+    assert_eq!(nfs_formats::ctr::eval_pair(p.value("pos").unwrap(), &refs).map(|(_, y)| y), Some(3.0));
+    // and the two underscores
+    for name in ["CharVectInputBox.ctr", "ChatInputBox.ctr"] {
+        let c = load(name);
+        let p = c.part("cursor").unwrap();
+        assert_eq!(p.kind(), nfs_formats::ctr::PartKind::Text, "{name}");
+        assert_eq!(p.value("text"), Some("_"), "{name}");
+        assert_eq!(p.value("fontPathName"), Some("univers8b.ffn"), "{name}");
+        assert_eq!(p.value("foreColor"), Some("0xFF000000"), "{name}");
+        assert_eq!(nfs_formats::ctr::eval_pair(p.value("pos").unwrap(), &refs).map(|(_, y)| y), Some(2.0), "{name}");
+    }
+}
+
+/// Every shipped `.ctr` against the two things the executable can actually reach, so neither
+/// blind spot can re-open quietly (`RE/notes/controls.md` §4.156).
+///
+/// **A state** is selectable only through `FeWidget::updateState` 0x4C82A0 — whose eight arms are
+/// `hidden`, `disabled`, `focusedhover`, `focused`, `selectedhover`, `selected`, `hover`,
+/// `normal` (§4.110) — or through `setState(name)` 0x4C7970, which has exactly two call sites in
+/// the whole image, 0x4BF43A and 0x4BF8B5, both pushing `"highlighty"`. Three shipped templates
+/// declare something outside those nine, and nothing in the game can ask for any of them:
+/// `CarSettingButton.ctr`'s `hovermousedown` (the executable's only occurrence of that text is
+/// the tail of `"data.seperatehovermousedown"`, an attribute of the bottom bar button) and
+/// `MovieCircle.ctr`'s `test1` and `test2`, which appear nowhere in the image at all.
+///
+/// **A part no state lists** can only be reached by a class's own draw, which means by a by-name
+/// lookup — so each one is either a push this project has located or a part nothing can draw.
+#[test]
+fn no_template_offers_a_look_the_game_cannot_ask_for() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    const REACHABLE: [&str; 9] =
+        ["normal", "hover", "focused", "focusedhover", "selected", "selectedhover", "highlighty", "hidden", "disabled"];
+    // state -> the template that declares it, and why nothing can select it
+    const DEAD_STATES: [(&str, &str); 3] =
+        [("hovermousedown", "CarSettingButton.ctr"), ("test1", "MovieCircle.ctr"), ("test2", "MovieCircle.ctr")];
+    // a part no state lists -> where the executable looks it up by name, or "" when it cannot
+    const UNLISTED_PARTS: [(&str, &str); 8] = [
+        ("cursor", "0x4CC50B"),
+        ("shp", "0x4BF81E"),
+        ("selectionbox", "0x4C4F03"),
+        ("track", "the scrollbar's own"),
+        ("trackgraphic", "0x4D0753"),
+        ("knob", "0x4D0795"),
+        ("decrement_button", "0x4D0769"),
+        ("increment_button", "0x4D077F"),
+    ];
+    let dir = paths.fe_data().join("Controls");
+    let mut dead_seen: Vec<String> = Vec::new();
+    let mut unlisted_seen: Vec<String> = Vec::new();
+    let mut files = 0;
+    for entry in std::fs::read_dir(&dir).expect("Controls").flatten() {
+        let path = entry.path();
+        if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("ctr")) {
+            continue;
+        }
+        files += 1;
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let text: String = std::fs::read(&path).unwrap().iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+        let c = nfs_formats::ctr::Control::parse(&text);
+        for st in c.states.keys() {
+            if !REACHABLE.contains(&st.as_str()) {
+                assert!(
+                    DEAD_STATES.contains(&(st.as_str(), name.as_str())),
+                    "{name} declares [state.{st}], which is neither one of the nine the executable can select nor a recorded dead state"
+                );
+                dead_seen.push(format!("{name}:{st}"));
+            }
+        }
+        let used: std::collections::BTreeSet<&str> = c.states.values().flatten().map(String::as_str).collect();
+        for p in c.parts_order.iter().filter(|p| p.as_str() != "data" && !used.contains(p.as_str())) {
+            // `mousedownbg` is the part case of the same thing: no such string in the image
+            if p == "mousedownbg" {
+                continue;
+            }
+            assert!(
+                UNLISTED_PARTS.iter().any(|(n, _)| n == p),
+                "{name} declares a part `{p}` that no state lists and nothing here has located a lookup for"
+            );
+            unlisted_seen.push(format!("{name}:{p}"));
+        }
+    }
+    assert!(files > 30, "only {files} templates found");
+    // and the dead states really are all three, not a subset that happened to be skipped
+    assert_eq!(dead_seen.len(), 3, "dead states seen: {dead_seen:?}");
+    assert!(!unlisted_seen.is_empty());
+}
+
+/// The fifth axis, and it comes out empty — but by measurement, not by assumption.
+///
+/// A widget whose font does not load still draws its text, in whatever face the fallback is, so
+/// no blank count can see it: `LayoutScreen::new` logs `layout font missing` / `layout font
+/// unreadable` at `debug!` and carries on with `univers8b.ffn`. This walks every font name the
+/// shipped screens and templates ask for and parses each one, so a silently wrong face cannot
+/// creep in.
+///
+/// It also pins the one template that asks for a font by **attribute** — `MultiAccessor.ctr`'s
+/// three `LOCALIZEDTEXT` parts carry `fontPathName.value=%data.font%`, a form this port does not
+/// resolve. That is safe only while nothing uses it: `NFS5.MULTIACCESSOR` appears in **no**
+/// shipped layout, and **no** `.lay` block carries a `font=` attribute at all. The assertion
+/// fails the day either changes.
+#[test]
+fn every_font_the_front_end_asks_for_loads() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let fe = paths.fe_data();
+    let read_text = |p: &std::path::Path| -> String {
+        std::fs::read(p).unwrap().iter().map(|&b| nfs_formats::locale::cp1252(b)).collect()
+    };
+    let mut wanted: std::collections::BTreeSet<String> = Default::default();
+    let mut uses_multi = 0;
+    let mut font_attrs = 0;
+    for entry in std::fs::read_dir(fe.join("Layouts")).expect("Layouts").flatten() {
+        let path = entry.path();
+        if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lay")) {
+            continue;
+        }
+        let layout = nfs_formats::lay::Layout::parse(&read_text(&path));
+        for e in &layout.elements {
+            if let Some(f) = e.get("fontPathName").filter(|f| !f.is_empty()) {
+                wanted.insert(f.to_lowercase());
+            }
+            if e.get("font").is_some() {
+                font_attrs += 1;
+            }
+            if e.class.eq_ignore_ascii_case("NFS5.MULTIACCESSOR") {
+                uses_multi += 1;
+            }
+        }
+    }
+    let mut by_attribute: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(fe.join("Controls")).expect("Controls").flatten() {
+        let path = entry.path();
+        if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("ctr")) {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let c = nfs_formats::ctr::Control::parse(&read_text(&path));
+        for p in c.parts.values() {
+            let Some(f) = p.value("fontPathName").filter(|f| !f.is_empty()) else { continue };
+            if f.contains('%') {
+                by_attribute.push(format!("{name}:{f}"));
+            } else {
+                wanted.insert(f.to_lowercase());
+            }
+        }
+    }
+    assert!(wanted.len() >= 6, "only {} fonts named: {wanted:?}", wanted.len());
+    let art = fe.join("Art");
+    for name in &wanted {
+        let path = GamePaths::find_file(&art, name).unwrap_or_else(|| panic!("{name} is named by the front end and is not in FEData/Art"));
+        let data = std::fs::read(&path).unwrap();
+        assert!(nfs_formats::fnt::Font::parse(&data).is_ok(), "{name} does not parse");
+    }
+    // the `%attr%` form, and why leaving it unresolved is safe
+    assert!(by_attribute.iter().all(|s| s.starts_with("MultiAccessor.ctr:")), "a new template asks for a font by attribute: {by_attribute:?}");
+    assert_eq!(uses_multi, 0, "a layout now uses NFS5.MULTIACCESSOR, whose font comes from %data.font%");
+    assert_eq!(font_attrs, 0, "a .lay block now carries a font= attribute");
+}

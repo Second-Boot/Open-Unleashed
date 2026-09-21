@@ -573,6 +573,92 @@ pub fn parse_original_rpl(data: &[u8]) -> Option<(ReplaySetup, u64, Vec<u8>)> {
     Some((setup, final_tick, stream))
 }
 
+// -------------------------------------------------------------------------------------------------
+// `HReplay`, the control bar (`RE/notes/hud.md` §5.2)
+// -------------------------------------------------------------------------------------------------
+
+/// One cell of the bar: which `DashHud/replay.fsh` glyph it shows and the **box** the original
+/// centres that glyph in. The box is not the glyph's own size — three of the seven disagree with the
+/// file, and these are the numbers 0x42C910 passes to `0x422DF0` (`hud.md` §5.2).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BarCell {
+    /// index into `replay.fsh`; the name is the file's own four-character tag
+    pub glyph: usize,
+    pub name: &'static str,
+    pub box_w: f32,
+    pub box_h: f32,
+}
+
+/// The seven cells, left to right, in the order 0x42DEF0 lays their positions out. Two of them have
+/// alternatives the state picks between: cell 2 is `paus` or `next` by the ctor's byte argument and
+/// `play` when playback is stopped (`this+0xC8` / `this+0xCC` share `+0x13C`), and cell 4 is one of
+/// the four speed glyphs (`this+0xD8 … +0xE4` all share `+0x14C`).
+pub const BAR: [BarCell; 7] = [
+    BarCell { glyph: 0, name: "cam", box_w: 14.0, box_h: 12.0 },
+    BarCell { glyph: 3, name: "rest", box_w: 11.0, box_h: 9.0 },
+    BarCell { glyph: 1, name: "paus", box_w: 8.0, box_h: 9.0 },
+    BarCell { glyph: 2, name: "quit", box_w: 9.0, box_h: 10.0 },
+    BarCell { glyph: 5, name: "I.1X", box_w: 16.0, box_h: 13.0 },
+    BarCell { glyph: 4, name: "Irac", box_w: 14.0, box_h: 13.0 },
+    BarCell { glyph: 9, name: "save", box_w: 14.0, box_h: 13.0 },
+];
+
+/// The alternative glyphs cells 2 and 4 swap in: `play` 0xB and `next` 0xA for the pause cell, and
+/// the four speed steps for cell 4 in the file's own order — `I.1X`, `I.2X`, `I.25`, `I.5`.
+pub const BAR_PLAY: usize = 0xB;
+pub const BAR_NEXT: usize = 0xA;
+pub const BAR_SPEEDS: [usize; 4] = [5, 6, 7, 8];
+
+impl Speed {
+    /// Which of the four speed glyphs cell 4 shows. The `.fsh` names them `I.1X`, `I.2X`, `I.25`
+    /// and `I.5`, which is one-for-one with [`Speed`]'s four values — normal, double, a quarter and
+    /// a half — so the mapping is the file's, not a guess.
+    pub fn bar_glyph(self) -> usize {
+        match self {
+            Speed::Normal => BAR_SPEEDS[0],
+            Speed::Double => BAR_SPEEDS[1],
+            Speed::Quarter => BAR_SPEEDS[2],
+            Speed::Half => BAR_SPEEDS[3],
+        }
+    }
+}
+
+/// The cell, `[0x5B2EF0]` × `[0x5B2EF4]`.
+pub const BAR_CELL: (f32, f32) = (21.0, 18.0);
+/// Cell pitch: `+0x15 + 0x1E` at 0x42DF4C and its five twins.
+pub const BAR_PITCH: f32 = 21.0 + 30.0;
+
+/// **Where the bar goes** — `0x42DEF0`, which is the only thing that sets `this+0x12C … +0x160`.
+///
+/// ```text
+/// 0x42DEFA  total = 8·cell − cell + 0xB4 = 7·21 + 180 = 327      ; and 6·pitch + cell is 327 too
+/// 0x42DF0D  x0    = [0x619784]/2 − total/2                       ; screen width, halved signed
+/// 0x42DF21  y     = [0x619788] − 0x1E                            ; thirty up from the bottom
+/// 0x42DF34  cell i at (x0 + i·(cell + 30), y)
+/// 0x42DFC4  the bar's own frame at (x0 − 3, y − 3)
+/// ```
+///
+/// Every halving is `cdq ; sub ; sar 1` — signed, so an odd screen width biases the bar left by one
+/// rather than wrapping. Returns the seven cell origins and the frame origin.
+pub fn control_bar(screen_w: f32, screen_h: f32) -> ([(f32, f32); 7], (f32, f32)) {
+    let half = |v: f32| ((v as i32) - if (v as i32) < 0 { 1 } else { 0 }) >> 1;
+    let total = 7.0 * BAR_CELL.0 + 180.0;
+    let x0 = (half(screen_w) - half(total)) as f32;
+    let y = screen_h - 30.0;
+    let mut out = [(0.0, 0.0); 7];
+    for (i, c) in out.iter_mut().enumerate() {
+        *c = (x0 + i as f32 * BAR_PITCH, y);
+    }
+    (out, (x0 - 3.0, y - 3.0))
+}
+
+/// Where one glyph lands inside its cell: `x = (21 − w)/2 + cellX + 1`, `y = (18 − h)/2 + cellY + 1`
+/// (0x42C993 and its eleven twins), the halving signed again.
+pub fn cell_glyph_origin(cell: (f32, f32), box_w: f32, box_h: f32) -> (f32, f32) {
+    let half = |v: f32| ((v as i32) - if (v as i32) < 0 { 1 } else { 0 }) >> 1;
+    (half(BAR_CELL.0 - box_w) as f32 + cell.0 + 1.0, half(BAR_CELL.1 - box_h) as f32 + cell.1 + 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,6 +806,41 @@ mod tests {
         assert_eq!((back.laps, back.opponents, back.traffic, back.cops, back.backwards, back.seed, back.skill), (3, 5, 2, true, true, 4321, 2));
         assert_eq!(&s2[..1000], &stream[..]);
         assert_eq!(parse_original_rpl(&f[..100]), None);
+    }
+
+    /// The bar's geometry, against 0x42DEF0's own arithmetic: seven cells of pitch 51 spanning
+    /// exactly the 327 the width formula computes, centred, thirty up from the bottom.
+    #[test]
+    fn the_replay_bar_is_seven_cells_of_pitch_fifty_one() {
+        let (cells, frame) = control_bar(640.0, 480.0);
+        // 8·21 − 21 + 0xB4 = 327, and 6·51 + 21 = 327: the width and the pitch agree
+        let total = 6.0 * BAR_PITCH + BAR_CELL.0;
+        assert_eq!(total, 327.0);
+        assert_eq!(cells[0].0, 320.0 - 163.0, "centred with the signed halving: 327/2 is 163");
+        assert_eq!(cells[0].1, 450.0);
+        for i in 1..7 {
+            assert_eq!(cells[i].0 - cells[i - 1].0, BAR_PITCH);
+            assert_eq!(cells[i].1, cells[0].1);
+        }
+        assert_eq!(cells[6].0 + BAR_CELL.0 - cells[0].0, total, "the seven cells span the width");
+        assert_eq!(frame, (cells[0].0 - 3.0, cells[0].1 - 3.0));
+        // an odd width biases left rather than wrapping (both halvings truncate toward −∞ here
+        // because both values are positive, which is what `cdq ; sub ; sar 1` does)
+        let (odd, _) = control_bar(641.0, 480.0);
+        assert_eq!(odd[0].0, 320.0 - 163.0);
+    }
+
+    /// And where a glyph sits inside its cell — `(21 − w)/2 + 1`, so the 16-wide speed glyphs sit
+    /// one in from the left edge and the 8-wide pause glyph six in.
+    #[test]
+    fn a_bar_glyph_is_centred_in_its_cell() {
+        let cell = (100.0, 200.0);
+        assert_eq!(cell_glyph_origin(cell, 21.0, 18.0), (101.0, 201.0), "a full-cell glyph just insets by one");
+        assert_eq!(cell_glyph_origin(cell, 8.0, 9.0), (107.0, 205.0), "`paus`: (21−8)/2 = 6");
+        assert_eq!(cell_glyph_origin(cell, 16.0, 13.0), (103.0, 203.0), "a speed step: (21−16)/2 = 2");
+        // the seven cells' boxes are the ctor's, not the file's — `rest` is 11×9 here and 12×9 there
+        assert_eq!(BAR[1].name, "rest");
+        assert_eq!((BAR[1].box_w, BAR[1].box_h), (11.0, 9.0));
     }
 
 }
