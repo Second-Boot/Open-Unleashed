@@ -37,6 +37,7 @@ use std::sync::Arc;
 use crate::text::BitmapFont;
 
 mod dialog_draw;
+mod end_of_era_draw;
 mod widgets;
 use widgets::WidgetDraw;
 
@@ -146,6 +147,56 @@ struct MoviePlayer {
     size: (f32, f32),
 }
 
+impl MoviePlayer {
+    /// The whole file kept, its video chunks indexed, the first frame decoded into a texture.
+    fn open(r: &mut Renderer, paths: &GamePaths, dir: &str, file: &str) -> Option<Self> {
+        let path = GamePaths::find_file(&paths.fe_data().join(dir), file)?;
+        let (Ok(exe), Ok(data)) = (std::fs::read(paths.root.join("nfs5.exe")), std::fs::read(&path)) else { return None };
+        let tables = nfs_formats::mad::MadTables::from_exe(&exe).ok()?;
+        let chunks: Vec<(usize, usize)> = {
+            let mut at = 0usize;
+            let mut out = Vec::new();
+            for c in nfs_formats::mad::chunks(&data) {
+                if c.is_video() {
+                    out.push((at, c.data.len()));
+                }
+                at += c.data.len();
+            }
+            out
+        };
+        let &(off, len) = chunks.first()?;
+        let header = nfs_formats::mad::MadHeader::parse(&data[off..off + len]).ok()?;
+        let mut decoder = nfs_formats::mad::MadDecoder::new(tables, &header);
+        let f = decoder.decode_frame(&data[off..off + len]);
+        if f.width == 0 || f.height == 0 {
+            return None;
+        }
+        let tex = r.upload_texture(&TextureData::single(f.width as u32, f.height as u32, f.rgba));
+        Some(MoviePlayer { data, chunks, decoder, next: 1, period_q16: header.period.max(1) as u64, clock_q16: 0, tex, size: (f.width as f32, f.height as f32) })
+    }
+
+    /// Step by `dt_ms`, decoding and uploading the frames the period calls for; a movie that has
+    /// run out starts again.
+    fn advance(&mut self, r: &mut Renderer, dt_ms: u32) {
+        self.clock_q16 += (dt_ms as u64) << 16;
+        let mut drawn = false;
+        while self.clock_q16 >= self.period_q16 {
+            self.clock_q16 -= self.period_q16;
+            if self.next >= self.chunks.len() {
+                self.next = 0;
+            }
+            let (off, len) = self.chunks[self.next];
+            self.next += 1;
+            let _ = self.decoder.decode_chunk(&self.data[off..off + len]);
+            drawn = true;
+        }
+        if drawn {
+            let (w, h) = (self.size.0 as u32, self.size.1 as u32);
+            r.update_texture(self.tex, &TextureData::single(w, h, self.decoder.rgba()));
+        }
+    }
+}
+
 /// A resolved [`TrackMapEvent`]: the art, already uploaded, at the place its own header gives.
 struct TrackMapArt {
     /// texture, width, height, x, y
@@ -243,6 +294,8 @@ pub struct LayoutScreen {
     movie_overlays: std::cell::RefCell<HashMap<usize, crate::movie_overlay::MovieOverlay>>,
     /// the credits roll the movie circle draws on the credits screen (0x4CE0F0)
     credits_roll: std::cell::RefCell<Option<crate::movie_overlay::CreditsRoll>>,
+    /// `FEEndOfEraCallBackList`'s show, when this is the end-of-era screen (`set_end_of_era`)
+    end_of_era: Option<end_of_era_draw::EndOfEraScreen>,
     /// `[0x65B940]`, the name-box codes the player has typed (`nfs_game::cheats`) — bit 6 is read
     /// by the credits roll
     pub cheat_bits: u32,
@@ -1399,6 +1452,7 @@ impl LayoutScreen {
             clock_ms: std::env::var("NFS_FE_CLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0), glint, colb, arcs,
             movie_overlays: Default::default(),
             credits_roll: Default::default(),
+            end_of_era: None,
             cheat_bits: 0,
             // `NFS_FE_CURSOR=x,y` parks the pointer for a still, the way `NFS_FE_CLOCK` parks the
             // clock — a screenshot has no pointer of its own
@@ -3050,41 +3104,9 @@ impl LayoutScreen {
         if self.movies.contains_key(&index) {
             return;
         }
-        let Some(path) = GamePaths::find_file(&paths.fe_data().join(dir), file) else { return };
-        let (Ok(exe), Ok(data)) = (std::fs::read(paths.root.join("nfs5.exe")), std::fs::read(&path)) else { return };
-        let Ok(tables) = nfs_formats::mad::MadTables::from_exe(&exe) else { return };
-        let chunks: Vec<(usize, usize)> = {
-            let mut at = 0usize;
-            let mut out = Vec::new();
-            for c in nfs_formats::mad::chunks(&data) {
-                if c.is_video() {
-                    out.push((at, c.data.len()));
-                }
-                at += c.data.len();
-            }
-            out
-        };
-        let Some(&(off, len)) = chunks.first() else { return };
-        let Ok(header) = nfs_formats::mad::MadHeader::parse(&data[off..off + len]) else { return };
-        let mut decoder = nfs_formats::mad::MadDecoder::new(tables, &header);
-        let f = decoder.decode_frame(&data[off..off + len]);
-        if f.width == 0 || f.height == 0 {
-            return;
+        if let Some(m) = MoviePlayer::open(r, paths, dir, file) {
+            self.movies.insert(index, m);
         }
-        let tex = r.upload_texture(&TextureData::single(f.width as u32, f.height as u32, f.rgba));
-        self.movies.insert(
-            index,
-            MoviePlayer {
-                data,
-                chunks,
-                decoder,
-                next: 1,
-                period_q16: header.period.max(1) as u64,
-                clock_q16: 0,
-                tex,
-                size: (f.width as f32, f.height as f32),
-            },
-        );
     }
 
     /// True when this screen — or the one behind it — has a movie playing.
@@ -3331,22 +3353,14 @@ impl LayoutScreen {
 
     pub fn advance_movies(&mut self, r: &mut Renderer, dt_ms: u32) {
         for m in self.movies.values_mut() {
-            m.clock_q16 += (dt_ms as u64) << 16;
-            let mut drawn = None;
-            while m.clock_q16 >= m.period_q16 {
-                m.clock_q16 -= m.period_q16;
-                if m.next >= m.chunks.len() {
-                    m.next = 0;
-                }
-                let (off, len) = m.chunks[m.next];
-                m.next += 1;
-                let _ = m.decoder.decode_chunk(&m.data[off..off + len]);
-                drawn = Some(());
-            }
-            if drawn.is_some() {
-                let (w, h) = (m.size.0 as u32, m.size.1 as u32);
-                r.update_texture(m.tex, &TextureData::single(w, h, m.decoder.rgba()));
-            }
+            m.advance(r, dt_ms);
+        }
+        // the end-of-era movie runs from the moment the show starts it (0x4FF76F)
+        if let Some(e) = self.end_of_era.as_mut()
+            && e.show.borrow().movie_started().is_some()
+            && let Some(m) = e.movie.as_mut()
+        {
+            m.advance(r, dt_ms);
         }
         if let Some(b) = self.background.as_mut() {
             b.advance_movies(r, dt_ms);
@@ -5784,6 +5798,14 @@ impl LayoutScreen {
             out.extend(bg.sprites_reporting(aspect, strings, None, accessor, &mut Vec::new()));
         }
         let bg_end = out.len();
+        // `FEEndOfEraCallBackList`'s slot 15 (0x4FF1F0) is the screen's whole draw: it does not
+        // call `Window::draw` (0x528760), so neither the fill of section 0 nor any child is painted
+        if let Some(e) = &self.end_of_era {
+            self.end_of_era_sprites(e, aspect, &mut out);
+            // the pointer is the front end's own, drawn over every screen (§4.152)
+            self.cursor_sprite(&mut out, aspect, None);
+            return out;
+        }
         // which widget the pointer is over, once for the whole screen (§4.39)
         let hovered = self.hovered();
         // `FeComboBox` paints an open drop-down from **slot 17** (0x4C6A88), the pass after the

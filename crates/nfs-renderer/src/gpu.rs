@@ -15,12 +15,17 @@ pub struct MaterialId(u32);
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GlobalsUniform {
     view_proj: [[f32; 4]; 4],
+    /// the camera's view matrix alone — `R3DSpecularTextureLayer` needs the normal in eye space
+    view: [[f32; 4]; 4],
     sun_dir: [f32; 4],
     ambient: [f32; 4],
     cam_pos: [f32; 4],
     /// world → headlight frame; `headlight_on.x` 1 while it lights
     headlight: [[f32; 4]; 4],
     headlight_on: [f32; 4],
+    /// world → the police beacon's frame, and `beacon_on.x` 1 while one spins
+    beacon: [[f32; 4]; 4],
+    beacon_on: [f32; 4],
 }
 
 #[repr(C)]
@@ -35,6 +40,11 @@ struct ObjectUniform {
     lit_a: [f32; 4],
     lit_d: [f32; 4],
     lit_dir: [f32; 4],
+    /// `R3DShadowMapTextureLayer` (0x446130): `u = shadow_u.xyz · world + shadow_u.w`, likewise
+    /// `v`; `shadow_on.x` 1 when the item takes the projector's texture
+    shadow_u: [f32; 4],
+    shadow_v: [f32; 4],
+    shadow_on: [f32; 4],
 }
 
 struct GpuMesh {
@@ -63,6 +73,7 @@ struct GpuMaterial {
     cull_back: bool,
     depth_test: bool,
     env_mix: f32,
+    env_variant: usize,
     /// the diffuse texture, kept so the material can be rebound to another environment map
     texture: TextureId,
 }
@@ -76,7 +87,13 @@ pub struct Renderer {
     pipelines: Vec<wgpu::RenderPipeline>, // index = blend*4 + nocull*2 + nodepth
     globals_buf: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
+    globals_layout: wgpu::BindGroupLayout,
+    proj_sampler: wgpu::Sampler,
+    _proj_default: wgpu::Texture,
+    proj_default_view: wgpu::TextureView,
     headlight_map_buf: wgpu::Buffer,
+    proj_tex: Option<TextureId>,
+    head_tex: Option<TextureId>,
     object_layout: wgpu::BindGroupLayout,
     material_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -157,6 +174,26 @@ impl Renderer {
                     binding: 1,
                     visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                // the car shadow projector's texture (`[0x6115CC]+0x18C`) and its sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // `HEAD` of `Render/common.fsh`, the headlight decal `LayerUVLight` projects
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
                     count: None,
                 },
             ],
@@ -262,12 +299,45 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // APPROXIMATION: the projector's address mode is not read; clamping keeps the one shadow
+        // from repeating across the track
+        let proj_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("projector clamp"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            lod_max_clamp: 0.0,
+            ..Default::default()
+        });
+        let proj_default = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("projector default"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &proj_default, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &[255, 255, 255, 0],
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let proj_default_view = proj_default.create_view(&wgpu::TextureViewDescriptor::default());
         let globals_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globals"),
             layout: &globals_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: globals_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: headlight_map_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&proj_default_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&proj_sampler) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&proj_default_view) },
             ],
         });
         let align = device.limits().min_uniform_buffer_offset_alignment as u64;
@@ -350,7 +420,13 @@ impl Renderer {
             pipelines,
             globals_buf,
             globals_bg,
+            globals_layout,
+            proj_sampler,
+            _proj_default: proj_default,
+            proj_default_view,
             headlight_map_buf,
+            proj_tex: None,
+            head_tex: None,
             object_layout,
             material_layout,
             sampler,
@@ -531,6 +607,7 @@ impl Renderer {
             cull_back: desc.cull_back,
             depth_test: desc.depth_test,
             env_mix: if desc.env_texture.is_some() { desc.env_mix } else { 0.0 },
+            env_variant: desc.env_variant.min(2),
             texture: desc.texture.unwrap_or(self.white),
         });
         MaterialId(self.materials.len() as u32 - 1)
@@ -542,6 +619,65 @@ impl Renderer {
     pub fn set_headlight_map(&mut self, map: &[u8]) {
         if map.len() == 128 * 128 {
             self.queue.write_buffer(&self.headlight_map_buf, 0, map);
+        }
+    }
+
+    /// The car shadow projector's texture, `[0x6115CC]+0x18C` (`RE/notes/crp-geometry.md` §8);
+    /// `None` for none.
+    pub fn set_projector_texture(&mut self, tex: Option<TextureId>) {
+        self.proj_tex = tex;
+        self.rebuild_globals_bg();
+    }
+
+    /// `HEAD` of `Render/common.fsh`, what `Headlights::LayerUVLight` projects (0x452645 fetches it
+    /// by that four-character code); `None` for none.
+    pub fn set_headlight_texture(&mut self, tex: Option<TextureId>) {
+        self.head_tex = tex;
+        self.rebuild_globals_bg();
+    }
+
+    fn rebuild_globals_bg(&mut self) {
+        let pick = |t: Option<TextureId>| match t.and_then(|t| self.textures.get(t.0 as usize)) {
+            Some(t) => &t.view,
+            None => &self.proj_default_view,
+        };
+        let (proj, head) = (pick(self.proj_tex), pick(self.head_tex));
+        self.globals_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("globals"),
+            layout: &self.globals_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.globals_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.headlight_map_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(proj) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.proj_sampler) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(head) },
+            ],
+        });
+    }
+
+    /// The three environment textures the frame binds — `EnvSet::texture` 0x441180 with the layers
+    /// 0, 1 and 2 (0x43A73D…0x43A778) — each material taking the one its reflection strength
+    /// buckets to (`RE/notes/lighting.md` §3.1). A `None` leaves that variant on the one before it.
+    pub fn set_env_textures(&mut self, env: [Option<TextureId>; 3]) {
+        let pick = |v: usize| -> Option<TextureId> { (0..=v).rev().find_map(|i| env[i]) };
+        let views: Vec<Option<TextureId>> = (0..3).map(pick).collect();
+        for i in 0..self.materials.len() {
+            if self.materials[i].env_mix <= 0.0 {
+                continue;
+            }
+            let Some(e) = views[self.materials[i].env_variant] else { continue };
+            let env_view = &self.textures[e.0 as usize].view;
+            let tex = &self.textures[self.materials[i].texture.0 as usize];
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("material"),
+                layout: &self.material_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&tex.view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(env_view) },
+                ],
+            });
+            self.materials[i].bind_group = bg;
         }
     }
 
@@ -680,11 +816,14 @@ impl Renderer {
             0,
             bytemuck::bytes_of(&GlobalsUniform {
                 view_proj: vp.to_cols_array_2d(),
+                view: camera.view().to_cols_array_2d(),
                 sun_dir: scene.sun_direction.extend(0.0).to_array(),
                 ambient: [scene.ambient, 0.0, 0.0, 0.0],
                 cam_pos: camera.position.extend(1.0).to_array(),
                 headlight: scene.headlight.unwrap_or(glam::Mat4::IDENTITY).to_cols_array_2d(),
                 headlight_on: [scene.headlight.is_some() as u32 as f32, 0.0, 0.0, 0.0],
+                beacon: scene.beacon.unwrap_or(glam::Mat4::IDENTITY).to_cols_array_2d(),
+                beacon_on: [scene.beacon.is_some() as u32 as f32, 0.0, 0.0, 0.0],
             }),
         );
         let n = scene.items.len().min(MAX_OBJECTS as usize);
@@ -700,6 +839,10 @@ impl Renderer {
                 lit_a: item.layer_light.map_or([0.0; 4], |l| [l.ambient[0], l.ambient[1], l.ambient[2], 1.0]),
                 lit_d: item.layer_light.map_or([0.0; 4], |l| [l.diffuse[0], l.diffuse[1], l.diffuse[2], 0.0]),
                 lit_dir: item.layer_light.map_or([0.0; 4], |l| [l.direction[0], l.direction[1], l.direction[2], 0.0]),
+                shadow_u: item.shadow.map_or([0.0; 4], |s| s.0),
+                shadow_v: item.shadow.map_or([0.0; 4], |s| s.1),
+                // .y flags the item `Headlights::LayerUVLight` lays the `HEAD` decal over
+                shadow_on: [item.shadow.is_some() as u32 as f32, item.uv_lit as u32 as f32, 0.0, 0.0],
             };
             let off = i * self.object_stride as usize;
             staging[off..off + std::mem::size_of::<ObjectUniform>()].copy_from_slice(bytemuck::bytes_of(&o));

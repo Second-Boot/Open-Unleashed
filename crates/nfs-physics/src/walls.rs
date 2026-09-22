@@ -12,8 +12,12 @@ use glam::{Vec2, Vec3};
 pub struct Wall {
     pub a: Vec2,
     pub b: Vec2,
-    pub y_min: f32,
-    pub y_max: f32,
+    /// The segment's own mid height. `Tracker::edgeHit` 0x4740D0 keeps, among the edges a segment
+    /// **crosses in xz**, the one whose endpoint-midpoint height is nearest the moving segment's —
+    /// a tie-break, *not* a filter. This port used to reject any edge whose height was more than
+    /// 3 m from the car, which is why a car that had dropped into a dip drove straight through the
+    /// wall line and out of the world (`RE/notes/physics.md` §4.1c-bis, found 2026-09-23).
+    pub y_mid: f32,
     /// Wall material class 0..5 = metal, wood, snow, ice, earth, rock (`WallImpulse` 0x494000
     /// byte tables 0x49442C / 0x4943BC over the `.edg` word 0x10..0x60; other words → rock).
     pub class: u8,
@@ -50,7 +54,7 @@ impl WallSet {
     /// Build from `(p1, p2, wall word)` segments (`.edg` records; barrier boxes use 0x60).
     pub fn build(segments: impl Iterator<Item = ([f32; 3], [f32; 3], u32)>, cell: f32) -> Self {
         let walls: Vec<Wall> = segments
-            .map(|(p1, p2, word)| Wall { a: Vec2::new(p1[0], p1[2]), b: Vec2::new(p2[0], p2[2]), y_min: p1[1].min(p2[1]) - 3.0, y_max: p1[1].max(p2[1]) + 3.0, class: wall_class(word) })
+            .map(|(p1, p2, word)| Wall { a: Vec2::new(p1[0], p1[2]), b: Vec2::new(p2[0], p2[2]), y_mid: (p1[1] + p2[1]) * 0.5, class: wall_class(word) })
             .filter(|w| (w.a - w.b).length_squared() > 1e-6)
             .collect();
         let mut min = Vec2::splat(f32::MAX);
@@ -97,21 +101,25 @@ impl WallSet {
         let (x0, z0) = idx(q - Vec2::splat(radius));
         let (x1, z1) = idx(q + Vec2::splat(radius));
         let mut best: Option<(Vec2, f32)> = None;
+        let mut best_key: Option<(f32, f32)> = None;
         for z in z0..=z1 {
             for x in x0..=x1 {
                 for &wi in &self.cells[z * self.nx + x] {
                     let w = &self.walls[wi as usize];
-                    if p.y < w.y_min || p.y > w.y_max {
-                        continue;
-                    }
                     let ab = w.b - w.a;
                     let t = ((q - w.a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0);
                     let c = w.a + ab * t;
                     let d = q - c;
                     let dist = d.length();
-                    if dist < radius && best.map(|b| radius - dist > b.1).unwrap_or(true) {
-                        let n = if dist > 1e-5 { d / dist } else { Vec2::new(-ab.y, ab.x).normalize_or_zero() };
-                        best = Some((n, radius - dist));
+                    if dist < radius {
+                        // among those in range, the one nearest in height (0x4740D0's tie-break),
+                        // and then the deepest
+                        let key = ((w.y_mid - p.y).abs(), -(radius - dist));
+                        if best_key.map(|b| key < b).unwrap_or(true) {
+                            let n = if dist > 1e-5 { d / dist } else { Vec2::new(-ab.y, ab.x).normalize_or_zero() };
+                            best_key = Some(key);
+                            best = Some((n, radius - dist));
+                        }
                     }
                 }
             }
@@ -132,14 +140,11 @@ impl WallSet {
         let idx = |v: Vec2| ((((v.x - self.min.x) / self.cell).floor().max(0.0) as usize).min(self.nx - 1), (((v.y - self.min.y) / self.cell).floor().max(0.0) as usize).min(self.nz - 1));
         let (x0, z0) = idx(a.min(b));
         let (x1, z1) = idx(a.max(b));
-        let mut best: Option<(f32, Vec2, Vec2, u8)> = None;
+        let mut best: Option<(f32, f32, Vec2, Vec2, u8)> = None;
         for z in z0..=z1 {
             for x in x0..=x1 {
                 for &wi in &self.cells[z * self.nx + x] {
                     let w = &self.walls[wi as usize];
-                    if p1.y < w.y_min || p1.y > w.y_max {
-                        continue;
-                    }
                     let d = w.b - w.a;
                     let r = b - a;
                     let denom = r.x * d.y - r.y * d.x;
@@ -149,14 +154,19 @@ impl WallSet {
                     let s = a - w.a;
                     let t = (s.y * d.x - s.x * d.y) / denom; // along the motion segment
                     let u = (s.y * r.x - s.x * r.y) / denom; // along the wall
-                    if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) && best.map(|b| t < b.0).unwrap_or(true) {
-                        let n = Vec2::new(-d.y, d.x).normalize_or_zero();
-                        let proj = w.a + d * (((b - w.a).dot(d)) / d.length_squared()).clamp(0.0, 1.0);
-                        best = Some((t, n, proj, w.class));
+                    if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
+                        // 0x4740D0 keeps the crossed edge nearest **in height** to the segment;
+                        // ties go to the one crossed first
+                        let key = ((w.y_mid - p1.y).abs(), t);
+                        if best.map(|b| key < (b.0, b.1)).unwrap_or(true) {
+                            let n = Vec2::new(-d.y, d.x).normalize_or_zero();
+                            let proj = w.a + d * (((b - w.a).dot(d)) / d.length_squared()).clamp(0.0, 1.0);
+                            best = Some((key.0, t, n, proj, w.class));
+                        }
                     }
                 }
             }
         }
-        best.map(|(_, n, q, c)| (n, q, c))
+        best.map(|(_, _, n, q, c)| (n, q, c))
     }
 }

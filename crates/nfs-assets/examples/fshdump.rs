@@ -26,7 +26,7 @@ fn main() {
             rmin = rmin.min(c[0]);
             rmax = rmax.max(c[0]);
         }
-        println!("{} {}x{} alpha {amin}..{amax} red {rmin}..{rmax}", t.name.trim(), t.width, t.height);
+        println!("{} {}x{} alpha {amin}..{amax} red {rmin}..{rmax} place {:?}", t.name.trim(), t.width, t.height, t.place);
         if let Ok(dir) = std::env::var("FSH_OUT") {
             let n = format!("{dir}/{}_{}.png", a[0].replace('/', "_"), t.name.trim());
             let _ = image::save_buffer(&n, px, t.width, t.height, image::ColorType::Rgba8);

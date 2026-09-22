@@ -63,6 +63,8 @@ pub struct AiDriver {
     pub dbg_n: i32,
     pub dbg_offset: f32,
     pub dbg_dot: f32,
+    /// Diagnostic: `dot(slice forward, car forward)` as the wrong-way test reads it.
+    pub dbg_facing: f32,
 }
 
 /// The steering factor `carSpecs[0x140]` is multiplied by (0x49CB16 → 0x4A2950): a table over the
@@ -198,7 +200,7 @@ fn curve_factor_dir(track: &str, family: &str, backwards: bool) -> f32 {
 
 impl AiDriver {
     pub fn new(data: AiCarData, specs: &CarSpecs, sim_tail: &[f32; 22]) -> Self {
-        Self { data, bend_speed_base: [0.0; 40], grip_ratio: 1.0, k_lookahead: sim_tail[19], k_steer: sim_tail[20], k_steer_base: sim_tail[20], k_angle: sim_tail[21], stuck_ticks: 0, wrong_way: false, target_speed: 0.0, skill_mean: [1.0; 4], skill_range: [0.0; 4], band: None, skill: 0, catchup: None, last_node: None, link: None, preferred_segment: None, speed_factor: 1.0, rng: 0x1234_5679, wf_div: 12.0, track: String::new(), backwards: false, dbg_n: 0, dbg_offset: 0.0, dbg_dot: 0.0 }
+        Self { data, bend_speed_base: [0.0; 40], grip_ratio: 1.0, k_lookahead: sim_tail[19], k_steer: sim_tail[20], k_steer_base: sim_tail[20], k_angle: sim_tail[21], stuck_ticks: 0, wrong_way: false, target_speed: 0.0, skill_mean: [1.0; 4], skill_range: [0.0; 4], band: None, skill: 0, catchup: None, last_node: None, link: None, preferred_segment: None, speed_factor: 1.0, rng: 0x1234_5679, wf_div: 12.0, track: String::new(), backwards: false, dbg_n: 0, dbg_offset: 0.0, dbg_dot: 0.0, dbg_facing: 0.0 }
             .tap(|d| {
                 // The curve factor is per track *and* per car class, so it cannot be applied here
                 // — `set_track` does it, over a pristine copy of the curve so that re-entering a
@@ -447,14 +449,39 @@ impl AiDriver {
         let steer = if std::env::var_os("NFS_AI_FLIP").is_some() { -steer } else { steer };
         // `AIState_Racing` 0x40CA20's reset triggers (`ai.md` §3.2): five seconds below 2 m/s after
         // the start, or facing the wrong way at more than 10 m/s — `dot(slice forward, car
-        // forward) < −0.707`, the sign flipped when the race runs backwards.
+        // forward) < −0.707` against the table the race is actually run on.
         if v.v_long() < 2.0 && v.race_started {
             self.stuck_ticks += 1;
         } else {
             self.stuck_ticks = 0;
         }
-        let facing = table.slices[s0].forward.normalize_or_zero().dot(v.forward());
-        self.wrong_way = v.race_started && v.speed() > 10.0 && if self.backwards { facing > 0.707 } else { facing < -0.707 };
+        // **The original's wrong way is a sign, not an angle** (`AIHigh::check` 0x403990, read
+        // 2026-09-23, `ai.md` §2.9a): 0x403AC7 multiplies the route-signed speed `car+0xEC0` by
+        // the direction multiplier `[0x5E753C]` and takes the arm where the product is **below
+        // zero** — the car is making progress *against* the race direction — and 0x403B00 then
+        // requires `|car+0xEC0| <= [0x5B2404]` = **4.0 m/s** before it sets the type. So the
+        // original marks a car that is **crawling backwards along the route**, not one sliding at
+        // speed. This port used to reset a car whose *heading* was past 135° from its slice at
+        // over 10 m/s, which is neither test: on farmland it fired 13 times in 120 s across five
+        // cars, every one of them at 43–62 km/h in an open corner.
+        //
+        // The direction multiplier needs no counterpart here: `SliceTable::reversed` negates every
+        // slice's `forward`, so the projection below is already signed by the race's own direction.
+        //
+        // Gaps, recorded not filled: `car+0x1020` gates the arm (`< 7` here, and a second arm at
+        // 0x403B13 for `>= 7`) and is **not read**; and what the original does with the type it
+        // stores in `AIHigh+0x78` is a separate path this port does not have — here the mark goes
+        // straight to a reset request, as the port's own rule did.
+        let fwd = table.slices[s0].forward.normalize_or_zero();
+        self.dbg_facing = fwd.dot(v.forward());
+        let v_route = v.velocity.dot(fwd);
+        // and the check's own gates: 0x4039BD returns unless **0x280** ticks have passed since the
+        // state started (`gGameTick − AIHigh+0x68`), 0x4039CB returns for a car that has finished,
+        // and 0x403B49 stores the type only past tick **0x200**. This port has no per-state start
+        // tick, so the race's own clock stands in for `AIHigh+0x68` — the state is created with
+        // the racing car, so the two agree for an opponent that has not been through another state.
+        self.wrong_way =
+            v.race_started && v.game_tick >= 0x280 && v_route < 0.0 && -v_route <= 4.0;
         Controls { throttle, brake, steer, handbrake: false, command: 0 }
     }
 

@@ -40,6 +40,150 @@ pub struct TrackWorld {
     animated: Vec<AnimatedProp>,
     /// The breakable props drawn in the world, with their pieces once a car has started them.
     broken: Vec<BrokenProp>,
+    /// The kind-2 `ef` parts of the track's own articles — the flares 0x451940 draws
+    /// (`RE/notes/crp-geometry.md` §8).
+    pub flares: Vec<TrackFlare>,
+    /// The kind-3 `ef` parts — the particle emitters 0x455150 starts (`particles.md` §6).
+    pub emitters: Vec<crate::track_particles::Emitter>,
+    /// The kind-4 `ef` parts — the car shadow projectors 0x456090 registers (`crp-geometry.md` §8)
+    /// — and the one texture every shipped one names (`sh80`), uploaded.
+    pub projectors: Vec<Projector>,
+    pub projector_texture: Option<nfs_renderer::TextureId>,
+}
+
+/// One kind-4 `ef` part: its sixteen floats from `+8`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Projector {
+    /// `[0…2]`, `[3]`
+    pub point: Vec3,
+    pub radius: f32,
+    /// `[6…8]`, `[10]` and `[11…13]`, `[15]`: `u = u.xyz · world + u.w`, likewise `v` (0x446130)
+    pub u: [f32; 4],
+    pub v: [f32; 4],
+    /// `+0x1C` of the part, the texture's name (0x44B000)
+    pub texture: String,
+}
+
+impl TrackWorld {
+    /// 0x456160: the projector nearest to `pos` by `max(|dx|, |dz|) + 0.25 · min(|dx|, |dz|)`,
+    /// below the running best from **400** and below its radius + 2.5.
+    pub fn projector_for(&self, pos: Vec3) -> Option<&Projector> {
+        let mut best = 400.0f32;
+        let mut found = None;
+        for p in &self.projectors {
+            let (dx, dz) = ((pos.x - p.point.x).abs(), (pos.z - p.point.z).abs());
+            let d = dx.max(dz) + 0.25 * dx.min(dz);
+            if d < best && d < p.radius + 2.5 {
+                best = d;
+                found = Some(p);
+            }
+        }
+        found
+    }
+}
+
+/// The kind-4 `ef` parts of every placed article. The planes are taken as the file has them: the
+/// `Shadow` articles that carry them have no `tr` on any shipped track (canyon 59, farmland 18,
+/// castle 13), so they are in world space already; the point still goes through the transform.
+pub fn track_projectors(track: &TrackAssets) -> Vec<Projector> {
+    let mut out = Vec::new();
+    let Ok(arts) = track.crp.articles(&track.crp_data) else { return out };
+    for a in &arts {
+        let Ok(g) = track.crp.article_geometry(&track.crp_data, a) else { continue };
+        if g.base.as_ref().is_some_and(|b| b.is_library()) {
+            continue;
+        }
+        let tr = g.transform.as_ref().map(Mat4::from_cols_array).unwrap_or(Mat4::IDENTITY);
+        for p in a.parts.iter().filter(|p| p.is_part(b"ef")) {
+            let Ok(d) = track.crp.entry_data(&track.crp_data, p) else { continue };
+            if d.len() < 0x48 || u32::from_le_bytes([d[0], d[1], d[2], d[3]]) != 4 {
+                continue;
+            }
+            let f = |i: usize| {
+                let o = 8 + 4 * i;
+                f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+            };
+            out.push(Projector {
+                point: tr.transform_point3(Vec3::new(f(0), f(1), f(2))),
+                radius: f(3),
+                u: [f(6), f(7), f(8), f(10)],
+                v: [f(11), f(12), f(13), f(15)],
+                texture: d[0x1C..0x20].iter().map(|&c| c as char).collect(),
+            });
+        }
+    }
+    out
+}
+
+/// One flare a track article carries: its `ef` part's data from `+8`, taken through the article's
+/// transform.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackFlare {
+    /// `+0…+8`
+    pub position: Vec3,
+    /// `+0x10…+0x18` — what the draw turns towards the camera for its angle (0x451A0C…0x451A90)
+    pub direction: Vec3,
+    /// `+0x1C` — the `flare.dat` id
+    pub id: u32,
+    /// `+0x20` — the part's own blink phase (flag 0x10)
+    pub phase: u32,
+}
+
+/// The kind-3 `ef` parts of every placed article, their data from `+8` through the article's
+/// transform.
+pub fn track_emitters(track: &TrackAssets) -> Vec<crate::track_particles::Emitter> {
+    let mut out = Vec::new();
+    let Ok(arts) = track.crp.articles(&track.crp_data) else { return out };
+    for a in &arts {
+        let Ok(g) = track.crp.article_geometry(&track.crp_data, a) else { continue };
+        if g.base.as_ref().is_some_and(|b| b.is_library()) {
+            continue;
+        }
+        let tr = g.transform.as_ref().map(Mat4::from_cols_array).unwrap_or(Mat4::IDENTITY);
+        for p in a.parts.iter().filter(|p| p.is_part(b"ef")) {
+            let Ok(d) = track.crp.entry_data(&track.crp_data, p) else { continue };
+            if d.len() < 0x34 || u32::from_le_bytes([d[0], d[1], d[2], d[3]]) != 3 {
+                continue;
+            }
+            let f = |o: usize| f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+            out.push(crate::track_particles::Emitter {
+                position: tr.transform_point3(Vec3::new(f(8), f(0xC), f(0x10))),
+                dir_a: tr.transform_vector3(Vec3::new(f(0x18), f(0x1C), f(0x20))),
+                dir_b: tr.transform_vector3(Vec3::new(f(0x24), f(0x28), f(0x2C))),
+                tag: u32::from_le_bytes([d[0x30], d[0x31], d[0x32], d[0x33]]),
+            });
+        }
+    }
+    out
+}
+
+/// The kind-2 `ef` parts of every placed article (library articles are drawn only through
+/// scenes; 0x450D10 runs for `RDrawArticleBundle`, the placed ones).
+pub fn track_flares(track: &TrackAssets) -> Vec<TrackFlare> {
+    let mut out = Vec::new();
+    let Ok(arts) = track.crp.articles(&track.crp_data) else { return out };
+    for a in &arts {
+        let Ok(g) = track.crp.article_geometry(&track.crp_data, a) else { continue };
+        if g.base.as_ref().is_some_and(|b| b.is_library()) {
+            continue;
+        }
+        let tr = g.transform.as_ref().map(Mat4::from_cols_array).unwrap_or(Mat4::IDENTITY);
+        for p in a.parts.iter().filter(|p| p.is_part(b"ef")) {
+            let Ok(d) = track.crp.entry_data(&track.crp_data, p) else { continue };
+            if d.len() < 0x2C || u32::from_le_bytes([d[0], d[1], d[2], d[3]]) != 2 {
+                continue;
+            }
+            let f = |o: usize| f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+            let w = |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+            out.push(TrackFlare {
+                position: tr.transform_point3(Vec3::new(f(8), f(0xC), f(0x10))),
+                direction: tr.transform_vector3(Vec3::new(f(0x18), f(0x1C), f(0x20))),
+                id: w(0x24),
+                phase: w(0x28),
+            });
+        }
+    }
+    out
 }
 
 /// One `[sectionN]` of a track's `.map`: the slice range it covers and the six environment-map ids
@@ -157,8 +301,17 @@ impl TrackWorld {
     /// its covered or open variant (`RE/notes/lighting.md` §3). `None` outside every section, where
     /// the original leaves the car on the default maps.
     pub fn env_for(&self, slice: u32, covered: bool) -> Option<nfs_renderer::TextureId> {
-        let sec = self.map_sections.iter().find(|s| slice >= s.start && slice <= s.end)?;
-        self.env_by_id.get(&sec.ids[3 * covered as usize]).copied()
+        self.env_layers_for(slice, covered)[0]
+    }
+
+    /// All three of the section's environment textures — `EnvSet::texture` 0x441180 answers
+    /// `ids[layer + 3·covered]` for the layers 0, 1 and 2, and the frame binds all three
+    /// (0x43A73D…0x43A778, `RE/notes/lighting.md` §3.1).
+    pub fn env_layers_for(&self, slice: u32, covered: bool) -> [Option<nfs_renderer::TextureId>; 3] {
+        let Some(sec) = self.map_sections.iter().find(|s| slice >= s.start && slice <= s.end) else {
+            return [None; 3];
+        };
+        std::array::from_fn(|l| self.env_by_id.get(&sec.ids[l + 3 * covered as usize]).copied())
     }
 
     /// The original's enclosure test (0x473330, `race-logic.md` §12): the flags word of the lowest
@@ -216,7 +369,7 @@ impl TrackWorld {
                 let m = materials.get(id as usize);
                 let tex = m.and_then(|m| tex_ids.get(&m.texture_name()));
                 let alpha = tex.map(|t| t.1).unwrap_or(false) && m.map(|m| m.render_method != "Opaque").unwrap_or(true);
-                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0 })
+                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0 })
             })
         };
         // Static world: merge every article's meshes per material into one GPU mesh each
@@ -373,11 +526,22 @@ impl TrackWorld {
             .filter(|(id, _)| materials.get(**id as usize).is_some_and(|m| lit_methods.contains(&m.render_method)))
             .map(|(_, mid)| *mid)
             .collect();
+        // the items whose render method builds `Headlights::LayerUVLight` (0x8004) — the `HEAD`
+        // decal of `lighting.md` §5.2, two layers in every night track's `Opaque` method
+        let uv_methods = nfs_assets::track::uv_light_methods(&track.crp, &track.crp_data);
+        let uv: std::collections::HashSet<MaterialId> = mat_ids
+            .iter()
+            .filter(|(id, _)| materials.get(**id as usize).is_some_and(|m| uv_methods.contains(&m.render_method)))
+            .map(|(_, mid)| *mid)
+            .collect();
         for it in &mut items {
             it.headlit = lit.contains(&it.material);
+            it.uv_lit = uv.contains(&it.material);
         }
         tracing::info!(props = props.len(), breakable = props.iter().filter(|p| p.breakable.is_some()).count(), "track props");
-        Ok(Self { items, item_element, hidden: std::collections::HashSet::new(), env_map, collision, props, walls, start, ambient, map_light, mean_ground, sun_direction, map_sections, env_by_id, knocked: Vec::new(), animated, broken })
+        let projectors = track_projectors(track);
+        let projector_texture = projectors.first().and_then(|p| tex_ids.get(&p.texture)).map(|t| t.0);
+        Ok(Self { items, item_element, hidden: std::collections::HashSet::new(), env_map, collision, props, walls, start, ambient, map_light, mean_ground, sun_direction, map_sections, env_by_id, knocked: Vec::new(), animated, broken, flares: track_flares(track), emitters: track_emitters(track), projectors, projector_texture })
     }
 
     /// Advance every looping prop animation to `seconds` since the race started
@@ -734,6 +898,8 @@ pub struct CarModel {
     /// Each material's `R3DLightLayer` parameters (`RE/notes/lighting.md` §6) — every shipped car
     /// material has them.
     material_light: HashMap<MaterialId, nfs_formats::crp::LayerLight>,
+    /// The materials whose render method takes the shadow projector (layer 0x8101).
+    shadowed: std::collections::HashSet<MaterialId>,
     /// The meshes each **model animation** morphs (`Base+77`, index 1…7), with every frame's
     /// positions: 1 the convertible's roof, 2 the `SpoilerW` wing, 3 the wipers, 4 / 5 / 6 the
     /// driver's right arm, left arm and body, 7 the aerial (`anims` example over every car).
@@ -951,6 +1117,11 @@ pub struct CarWheelModel {
     pub pivot: Vec3,
     pub is_front: bool,
     pub is_left: bool,
+    /// The article's `Base+75` rotation channel. Every wheel-typed article of every shipped car is
+    /// bound to **1…4** — the wheels that spin — or to **18…21**, the tread that takes the steer
+    /// but not the spin, because 0x438669…0x438726 copy channels 1…4 into 18…21 with `.x` cleared
+    /// (`cargo run -p nfs-formats --example rotchan`).
+    pub channel: u8,
     pub parts: Vec<(MeshId, MaterialId, Mat4)>,
 }
 
@@ -1030,6 +1201,7 @@ impl CarModel {
         let materials = car.crp.materials(&car.crp_data)?;
         let mut mat_ids: HashMap<u16, MaterialId> = HashMap::new();
         let mut material_light: HashMap<MaterialId, nfs_formats::crp::LayerLight> = HashMap::new();
+        let mut shadowed: std::collections::HashSet<MaterialId> = std::collections::HashSet::new();
         let mut material_for = |r: &mut Renderer, id: u16| {
             if let Some(m) = mat_ids.get(&id) {
                 return *m;
@@ -1038,9 +1210,18 @@ impl CarModel {
             let page = m.map(|m| m.page_index() as usize).and_then(|p| page_tex.get(p));
             let blend = m.map(|m| matches!(m.render_method.as_str(), "CarWindow" | "CarWheel")).unwrap_or(false) || page.map(|p| p.1).unwrap_or(false);
             let reflective = m.map(|m| m.render_method == "CarExtEnv").unwrap_or(false);
-            let mid = r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: !blend, depth_test: true, env_texture: if reflective { env } else { None }, env_mix: 0.3 });
+            // `R3DSpecularTextureLayer` buckets the material's own reflection strength to pick
+            // which of the three environment textures it reflects (`lighting.md` §3.1); the 0.3
+            // blend stays the APPROXIMATION it was, since the pass's combine is AUDIT.md §E
+            let variant = nfs_formats::crp::env_variant(m.map(|m| m.reflection).unwrap_or(0.0));
+            let mid = r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: !blend, depth_test: true, env_texture: if reflective { env } else { None }, env_mix: 0.3, env_variant: variant });
             if let Some(l) = m.and_then(|m| m.light) {
                 material_light.insert(mid, l);
+            }
+            // the methods whose second pass lists layer 0x8101, `R3DShadowMapTextureLayer`
+            // (`RE/notes/lighting.md` §3)
+            if m.is_some_and(|m| matches!(m.render_method.as_str(), "CarExtEnv" | "CarExtEnvNS" | "CarWindow")) {
+                shadowed.insert(mid);
             }
             mat_ids.insert(id, mid);
             mid
@@ -1132,7 +1313,8 @@ impl CarModel {
             if is_wheel {
                 let pivot = MODEL_TO_BODY.transform_point3(local.w_axis.truncate());
                 half_track = half_track.max(pivot.x.abs());
-                wheels.push(CarWheelModel { pivot, is_front: ty == 0x0D, is_left: local.w_axis.x > 0.0, parts });
+                let channel = g.base.as_ref().map(|b| b.rot_channel).unwrap_or(0);
+                wheels.push(CarWheelModel { pivot, is_front: ty == 0x0D, is_left: local.w_axis.x > 0.0, channel, parts });
             } else {
                 body.extend(parts);
                 body_channel.extend(part_channels);
@@ -1150,7 +1332,7 @@ impl CarModel {
             let p: Vec<Vec3> = quad.points.iter().take(4).map(|q| MODEL_TO_BODY.transform_point3(Vec3::from(*q))).collect();
             let g = nfs_assets::car::global_texture(paths, "INTGLASS.FSH", "glai").ok()??;
             let tex = r.upload_texture(&TextureData { width: g.width, height: g.height, mips: g.mips.clone() });
-            let mat = r.create_material(MaterialDesc { texture: Some(tex), alpha_blend: true, cull_back: false, depth_test: true, env_texture: None, env_mix: 0.0 });
+            let mat = r.create_material(MaterialDesc { texture: Some(tex), alpha_blend: true, cull_back: false, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0 });
             // **The quad is mapped to the whole texture**, and that is traced now. The batcher's
             // three parallel buffers are positions at `acc+0x0C` (stride 0x10), **texture
             // coordinates at `acc+0x25BC` (stride 8)** and colours at `acc+0x3894` (stride 4), 201
@@ -1185,6 +1367,7 @@ impl CarModel {
             body,
             body_channel,
             material_light,
+            shadowed,
             morph,
             anim_length,
             anim_time: [-1.0; ANIMS],
@@ -1564,6 +1747,16 @@ impl CarModel {
             // so the rotation is on the right of the part's own matrix.
             let m = match self.body_channel.get(i).copied().unwrap_or(0) {
                 0 => *local,
+                // 18…21 are channels 1…4 with `.x` cleared (0x438669…0x438726) — the wheel shadow
+                // and the parts that turn with the steer but do not spin. Taking them from the
+                // caller's `steer` instead of this model's own channels is what lets the traffic
+                // and the cops have them: those share one upload per car type.
+                n @ 18..=21 if n <= 19 => *local * Mat4::from_rotation_y(steer[(n - 18) as usize] * std::f32::consts::TAU),
+                20..=21 => *local,
+                // 5, the steering wheel: `.z = ch1.y + ch2.y` within ±4.5/23 (0x43858F…0x4385FB).
+                // Off the caller's `steer` for the same reason as 18…21 — the traffic and the cops
+                // share one model per car type and would otherwise hold the wheel straight.
+                5 => *local * Mat4::from_rotation_z((steer[0] + steer[1]).clamp(-4.5 / 23.0, 4.5 / 23.0) * std::f32::consts::TAU),
                 n => *local * self.channel_matrix(n),
             };
             out.push(DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * m));
@@ -1579,7 +1772,13 @@ impl CarModel {
             // `.x = −(wheel+0x88)` (0x438600…0x438660), in **model** space, which is the body
             // frame turned half a turn about y — so `+turn` about the body's x. This read
             // `−turn` until 2026-09-22 and rolled the wheels backwards.
-            let spin = Mat4::from_rotation_x(wheel_spin[idx] * std::f32::consts::TAU);
+            // a wheel article on channels 18…21 takes the steer but **not** the spin: `.x` of those
+            // channels is cleared at 0x438669…0x438726
+            let spin = if (18..=21).contains(&w.channel) {
+                Mat4::IDENTITY
+            } else {
+                Mat4::from_rotation_x(wheel_spin[idx] * std::f32::consts::TAU)
+            };
             // **Positive steer is a right turn** (the right arrow gives +1, and the car yaws right
             // on it), and in the body frame +X is right and +Z forward — so the wheel turns by
             // `+steer`: `from_rotation_y(θ)` carries forward (0,0,1) to (sin θ, 0, cos θ), toward
@@ -1722,6 +1921,14 @@ impl LightBlock {
 
 impl CarModel {
     /// `draw_items` lit through each material's `R3DLightLayer` from `block`.
+    /// `R3DShadowMapTextureLayer` for this car's items: the projector's planes on every item whose
+    /// material carries the layer (0x440920 / 0x440910 set it per car at 0x43A70E).
+    pub fn apply_projector(&self, items: &mut [DrawItem], planes: Option<([f32; 4], [f32; 4])>) {
+        for it in items {
+            it.shadow = if self.shadowed.contains(&it.material) { planes } else { None };
+        }
+    }
+
     pub fn draw_items_block(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2], block: &LightBlock) -> Vec<DrawItem> {
         let mut out = self.draw_items(car_to_world, wheel_spin, steer);
         for it in &mut out {

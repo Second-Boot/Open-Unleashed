@@ -557,3 +557,42 @@ pub fn blend_patch(page: &mut TexturePage, patch: &DamagePatch, damage: f32) {
         }
     }
 }
+
+#[cfg(test)]
+mod wheel_channel_tests {
+    use super::*;
+
+    /// Slot 9 copies channels 1…4 into 18…21 with `.x` cleared (0x438669…0x438726), so a
+    /// wheel-typed article on 18…21 takes the steer but never the spin. `CarModel::draw_items`
+    /// relies on every wheel article of every shipped car being on one of those two runs.
+    #[test]
+    fn wheel_articles_are_on_the_spinning_or_the_still_channels() {
+        let Ok(paths) = GamePaths::locate() else { return };
+        let dir = paths.car_model_dir();
+        let Ok(entries) = std::fs::read_dir(&dir) else { return };
+        let mut seen = 0usize;
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("crp") {
+                continue;
+            }
+            let Some(model) = p.file_stem().and_then(|x| x.to_str()) else { continue };
+            let Ok(car) = CarAssets::load(&paths, model) else { continue };
+            let Ok(arts) = car.crp.articles(&car.crp_data) else { continue };
+            for a in &arts {
+                let Ok(g) = car.crp.article_geometry(&car.crp_data, a) else { continue };
+                let Some(b) = g.base.as_ref() else { continue };
+                if !matches!(b.tag[0], 0x0D | 0x0E) {
+                    continue;
+                }
+                seen += 1;
+                let c = b.rot_channel;
+                assert!(
+                    (1..=4).contains(&c) || (18..=21).contains(&c),
+                    "{model}: a wheel article on channel {c}"
+                );
+            }
+        }
+        assert!(seen > 100, "only {seen} wheel articles seen");
+    }
+}

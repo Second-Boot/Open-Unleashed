@@ -52,14 +52,17 @@ pub struct MaterialDesc {
     /// normal — the original's `CarExtEnv`/`R3DSpecularTextureLayer` uses the track `.env` maps.
     pub env_texture: Option<TextureId>,
     pub env_mix: f32,
+    /// Which of the three environment textures this material reflects — `R3DSpecularTextureLayer`
+    /// buckets its own reflection strength at 0.05 and 0.95 (`RE/notes/lighting.md` §3.1).
+    pub env_variant: usize,
 }
 
 impl MaterialDesc {
     pub fn textured(texture: TextureId) -> Self {
-        Self { texture: Some(texture), alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0 }
+        Self { texture: Some(texture), alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0 }
     }
     pub fn flat() -> Self {
-        Self { texture: None, alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0 }
+        Self { texture: None, alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0 }
     }
 }
 
@@ -83,11 +86,18 @@ pub struct DrawItem {
     /// The item's render method builds `Headlights::LayerVertexLight` (0x8002 / 0x8003), so the
     /// scene's headlight projector adds to its vertex colours (`RE/notes/lighting.md` §5).
     pub headlit: bool,
+    /// `Headlights::LayerUVLight` (0x453CA0, class code 0x8004): the `HEAD` decal of
+    /// `Render/common.fsh` projected from the same headlight frame (`RE/notes/lighting.md` §5.2).
+    pub uv_lit: bool,
+    /// The car shadow projector's `(u, v)` planes over world positions — `R3DShadowMapTextureLayer`
+    /// (0x446130), for an item whose material carries layer 0x8101 while its car stands near a
+    /// kind-4 `ef` part (`RE/notes/crp-geometry.md` §8).
+    pub shadow: Option<([f32; 4], [f32; 4])>,
 }
 
 impl DrawItem {
     pub fn new(mesh: MeshId, material: MaterialId, transform: Mat4) -> Self {
-        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false }
+        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None }
     }
 }
 
@@ -132,11 +142,14 @@ pub struct Scene {
     /// The headlight projector, world → the player car's light frame (0x4526C0), when the car's
     /// lamps are lit; `headlit` items then take 0x452910's weight from `Renderer::set_headlight_map`.
     pub headlight: Option<Mat4>,
+    /// World into the nearest lit police car's spinning beacon frame — the second projector on the
+    /// same path (0x452A50, `RE/notes/lighting.md` §5).
+    pub beacon: Option<Mat4>,
 }
 
 impl Default for Scene {
     fn default() -> Self {
-        Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35, mirror: false, headlight: None }
+        Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35, mirror: false, headlight: None, beacon: None }
     }
 }
 

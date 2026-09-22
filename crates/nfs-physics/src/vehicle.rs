@@ -97,6 +97,13 @@ pub struct Vehicle {
     pub frame: Mat3,
     pub ground_normal: Vec3,
     pub cos_tilt: f32,
+    /// Diagnostic only: **why** the engine last died — 1 an impact past 120 (0x4948C1), 2 a
+    /// body-ground contact that left the car upside down (0x49C005). Nothing reads it but the
+    /// logs that chase cars which will not drive away.
+    pub engine_kill: u8,
+    /// Diagnostic only: which arm of `engine_update`'s rev/clutch selection ran last — 1 the
+    /// clutch arm, 2 the rev arm, 3 `diff == 0`, 4 the misfire arm, 5 over target.
+    pub engine_arm: u8,
     /// `DraftFactor` 0x49D9B0's result, which scales the drag. 1.0 = clean air; the caller sets it
     /// from the other racers each tick with [`draft_factor`].
     pub draft: f32,
@@ -194,6 +201,10 @@ pub struct Vehicle {
     /// upside down (`car+0x3A0 < 0`, 0x49C01B). A reset re-arms it (0x49E220, 0x49E31E…0x49E3E5):
     /// 60 when it was alive, 1 when it was dead.
     pub engine_alive: u32,
+    /// `car+0xAC8` / `+0xACC`: the front wheels' angle smoothed, `s = s/2 + angle/2` each step
+    /// right after the angle is worked out (0x49F6CC…0x49F6F6); zero after a reset (0x49E361) and
+    /// at race init (0x410BD0). The model's steer channels take it in a replay (`car-model.md`).
+    pub steer_smoothed: [f32; 2],
     /// `car+0x1100`, the crash reset countdown (32 Hz ticks) that 0x40F740 runs — see
     /// [`Self::reset_countdown_tick`]. `Damage` loads it with 0xC0 on a heavy impact (0x4948E6).
     pub reset_countdown: i32,
@@ -243,6 +254,8 @@ impl Vehicle {
             frame: orientation,
             ground_normal: Vec3::Y,
             cos_tilt: 1.0,
+            engine_kill: 0,
+            engine_arm: 0,
             draft: 1.0,
             boost: 0.0,
             misfire_roll: 1.0,
@@ -289,6 +302,7 @@ impl Vehicle {
             gravity_scale: 1.16,
             ticks_alive: 0,
             engine_alive: 1,
+            steer_smoothed: [0.0; 2],
             reset_countdown: 0,
             reset_hold: 0,
             wheel_offsets: [
@@ -697,6 +711,7 @@ impl Vehicle {
         // nearly always. A fourth disjunct, `DB8 == 1 && ignitionCut == 0` (0x49EA76), is dead:
         // 0x49E849 cleared `DB8` at the top of this very call and nothing in the image writes 1.
         let clutch = slip > 250.0 || (gear > 1 && vz < -0.1) || (gear == 0 && vz > 0.1);
+        self.engine_arm = if clutch { 1 } else if diff > 0.0 { 2 } else if diff == 0.0 { 3 } else if misfire { 4 } else { 5 };
         if clutch {
             // `allow`, 0x49EA91…0x49EB44: the most the revs may fall this tick. The loads are the
             // wheels' grip limits `+0xAC` (the wheel block is at `car+0x7B8`, so wheel 0's is
@@ -743,9 +758,16 @@ impl Vehicle {
             self.rpm -= 100.0;
             a_drive = 0.0;
         } else {
-            // over target: fall toward wheel rpm, drive scaled by throttle
-            if self.rpm > rpm_wheel.abs() + 200.0 {
+            // **Over target, 0x49ED94…0x49EDE2 — a ladder of three, not a fall and a snap.**
+            // `slip > [0x5B2484]` (200) takes 200 off; `slip < [0x5B4A4C]` (−200) **adds** 200,
+            // stepping the revs *up* toward wheels that are turning faster than the engine; only
+            // between the two does the engine take the wheel rpm outright (0x49EDDE). This port
+            // had the first rung and the snap but not the middle one, so lifting off at speed
+            // pulled the revs to the wheels in one jump where the original walks them up.
+            if slip > 200.0 {
                 self.rpm -= 200.0;
+            } else if slip < -200.0 {
+                self.rpm += 200.0;
             } else {
                 self.rpm = rpm_wheel.abs();
             }
@@ -910,6 +932,9 @@ impl Vehicle {
         }
         let (k, m) = if a > 80.0 {
             if !self.tiny && a > 120.0 {
+                if self.engine_alive != 0 {
+                    self.engine_kill = 1;
+                }
                 self.engine_alive = 0;
             }
             a *= 0.125;
@@ -1015,6 +1040,7 @@ impl Vehicle {
         self.wheels[1].steer = s1;
         self.wheels[2].steer = 0.0;
         self.wheels[3].steer = 0.0;
+        self.steer_smoothed = [self.steer_smoothed[0] * 0.5 + s0 * 0.5, self.steer_smoothed[1] * 0.5 + s1 * 0.5];
     }
 
     /// [`Self::set_wheel_steer`] with this vehicle's own steering, speed and forward velocity.
@@ -1429,6 +1455,9 @@ impl Vehicle {
             self.body_ground_collide(specs, self.ground_normal, plane_pt, SURFACE_BOUNCE[surf][0]);
             // 0x49C005…0x49C01B: left upside down by the contact, the car is dead
             if self.cos_tilt < 0.0 {
+                if self.engine_alive != 0 {
+                    self.engine_kill = 2;
+                }
                 self.engine_alive = 0;
             }
         }
@@ -1630,8 +1659,15 @@ impl Vehicle {
     /// `Car_wallCollide` 0x495020 + `WallImpulse` 0x494000 (CONFIRMED): the 8 body corners are swept
     /// over the last tick against the `.edg` edges; a crossing reflects the normal velocity with
     /// restitution 0.1 (no friction), pushes the body 1.05× back onto the edge line and sets a
-    /// heuristic yaw rate. `drivable` tells whether a corner is over drivable road (skipped).
-    pub fn collide_walls(&mut self, walls: &crate::walls::WallSet, drivable: &dyn Fn(Vec3) -> bool, _unused: f32, _b: f32, _f: f32) -> bool {
+    /// heuristic yaw rate.
+    ///
+    /// `patch_height` answers the height of the drivable patch that contains a corner in plan, or
+    /// `None` when there is none — `CollisionGrid::find_patch_height`. 0x495020 skips a corner only
+    /// when **both** halves of its conjunction hold: the patch under it is drivable
+    /// (`(T.word & 0xF) != 0`, 0x49527A) **and** that patch's height is within 4 m of the car's own
+    /// y (`|h − car+0x334| <= [0x5B2404]`, 0x4952B9…0x4952D9). So a car sailing over drivable road
+    /// is still tested against the walls, and a car that has dropped away from it is too.
+    pub fn collide_walls(&mut self, walls: &crate::walls::WallSet, patch_height: &dyn Fn(Vec3) -> Option<f32>, _unused: f32, _b: f32, _f: f32) -> bool {
         let m = self.orientation;
         let (hw, hh, hl) = (self.half_extents.x, self.half_extents.y, self.half_extents.z);
         let (bx, by, bz) = (m.row(0), m.row(1), m.row(2));
@@ -1646,7 +1682,7 @@ impl Vehicle {
         let mut max_j: f32 = 0.0;
         let mut hit = false;
         for p in corners {
-            if drivable(p) {
+            if patch_height(p).is_some_and(|h| (h - self.position.y).abs() <= 4.0) {
                 continue;
             }
             let p0 = p - v_tick;
@@ -1901,9 +1937,11 @@ impl Vehicle {
     }
 
     /// The alive count's part of 0x49E220, which every reset through 0x40F540 runs (0x40F694):
-    /// 60 when the car was alive, 1 when it was dead (0x49E31E…0x49E3E5).
+    /// 60 when the car was alive, 1 when it was dead (0x49E31E…0x49E3E5); and the smoothed
+    /// steering it clears (0x49E361 / 0x49E367).
     pub fn rearm_after_reset(&mut self) {
         self.engine_alive = if self.engine_alive != 0 { 0x3C } else { 1 };
+        self.steer_smoothed = [0.0; 2];
     }
 
     /// Re-orthonormalise the orientation (every 32 ticks in the original, 0x4A4810).
@@ -1938,6 +1976,70 @@ mod tests {
         v.body_points.clear();
         v.fit_half_extents();
         assert_eq!(v.half_extents, before);
+    }
+
+    /// A plane tilted by `grade` (rise per run) about x, so +z is uphill.
+    fn slope_grid(grade: f32) -> TriangleGrid {
+        let s = 2000.0;
+        let y = |z: f32| z * grade;
+        let (a, b, c, d) = (
+            Vec3::new(-s, y(-s), -s),
+            Vec3::new(s, y(-s), -s),
+            Vec3::new(s, y(s), s),
+            Vec3::new(-s, y(s), s),
+        );
+        TriangleGrid::build(vec![Triangle::new(a, b, c, 1), Triangle::new(a, c, d, 1)], 100.0)
+    }
+
+    /// 0x49ED94…0x49EDE2's middle rung: over its target with the **wheels** turning far faster
+    /// than the engine (`slip < [0x5B4A4C]` = −200), the revs step **up** by 200 — they do not
+    /// snap to the wheel rpm, which is what this port did until 2026-09-23.
+    #[test]
+    fn over_target_steps_up_toward_the_wheels() {
+        let specs = specs_993();
+        let grid = flat_grid();
+        let idle = Controls { throttle: 0, brake: 0, steer: 0, handbrake: false, command: 0 };
+        let mut v = Vehicle::new(Vec3::new(0.0, 0.5, 0.0), Mat3::IDENTITY, &specs, 0.7, 0.3);
+        v.race_started = true;
+        v.ticks_alive = 0x100;
+        // settle onto the plane: the arm only runs with the rear axle in contact
+        for t in 0..64 {
+            if t % 2 == 0 {
+                v.step32(&idle, &specs, &grid);
+            }
+            v.step64(&specs);
+        }
+        // rolling fast in third with the throttle shut and the engine at a standstill
+        v.gear = 3;
+        v.velocity = Vec3::new(0.0, 0.0, 40.0);
+        v.rpm = 0.0;
+        v.step32(&idle, &specs, &grid);
+        assert_eq!(v.engine_arm, 5, "over its (zero) target");
+        assert!(v.rpm >= 199.0 && v.rpm <= 201.0, "one rung up, not a snap to the wheels: {}", v.rpm);
+    }
+
+    /// Diagnostic: how fast a 993 gets going from rest, on the flat and up a 14% climb.
+    #[test]
+    #[ignore]
+    fn launch_profile() {
+        for grade in [0.0f32, 0.14] {
+            let specs = specs_993();
+            let grid = slope_grid(grade);
+            let mut v = Vehicle::new(Vec3::new(0.0, 0.5, 0.0), Mat3::IDENTITY, &specs, 0.7, 0.3);
+            v.ai_driven = true;
+            v.game_tick = 0x400;
+            v.race_started = true;
+            let c = Controls { throttle: 255, brake: 0, steer: 0, handbrake: false, command: 0 };
+            for t in 0..(5 * 64) {
+                if t % 2 == 0 {
+                    v.step32(&c, &specs, &grid);
+                }
+                v.step64(&specs);
+                if t % 32 == 0 {
+                    println!("grade {grade:.2} t={:.1}s  {:5.1} km/h  rpm {:6.0} gear {} contact {} arm {}", t as f32 / 64.0, v.speed() * 3.6, v.rpm, v.gear, v.wheels.iter().filter(|w| w.contact).count(), v.engine_arm);
+                }
+            }
+        }
     }
 
     fn flat_grid() -> TriangleGrid {
@@ -2688,6 +2790,20 @@ mod steer_taper_tests {
     /// This used to assert a closure it defined itself — a copy of the formula, not the port — so
     /// it could never catch the port drifting. It now drives [`Vehicle::set_wheel_steer`] at full
     /// lock and reads the wheel back (2026-09-21, found by the unused `use super::*`).
+    /// 0x49F6CC: `car+0xAC8` follows the wheel angle half way each step; a reset clears it.
+    #[test]
+    fn smoothed_steering() {
+        let specs = super::tests::specs_993();
+        let mut v = Vehicle::new(Vec3::ZERO, Mat3::IDENTITY, &specs, 0.8, 0.3);
+        v.set_wheel_steer(&specs, 127.0, 10.0, 10.0);
+        let a = v.wheels[0].steer;
+        assert!((v.steer_smoothed[0] - a * 0.5).abs() < 1e-5);
+        v.set_wheel_steer(&specs, 127.0, 10.0, 10.0);
+        assert!((v.steer_smoothed[0] - a * 0.75).abs() < 1e-5);
+        v.rearm_after_reset();
+        assert_eq!(v.steer_smoothed, [0.0; 2]);
+    }
+
     #[test]
     fn the_steering_taper_is_a_low_speed_boost_not_a_high_speed_cut() {
         let specs = super::tests::specs_993();

@@ -1583,10 +1583,18 @@ struct App {
     shadow_meshes: Vec<nfs_renderer::MeshId>,
     /// `CARG`, the glare slot 0 of every light kind in the table at 0x5CD73C
     glare_draw: Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
+    /// `GameData/Render/flare.dat` (0x4522B0) and a sprite for every texture its records name
+    flare_defs: Vec<nfs_formats::flare::FlareDef>,
+    flare_sprites: std::collections::HashMap<String, (nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
+    /// the track's particle systems (`nfs_game::track_particles`) and their textures out of
+    /// `Render/particle.fsh`
+    track_particles: Option<nfs_game::track_particles::TrackParticles>,
+    track_particle_defs: Vec<nfs_formats::particle_dat::ParticleDef>,
+    track_particle_sprites: std::collections::HashMap<String, (nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
     /// trackside cameras and the triggers that switch them (`RE/notes/race-logic.md` §3.3)
     track_cameras: Option<nfs_game::cameras::TrackCameras>,
     /// environment map currently bound on the car materials
-    env_bound: Option<nfs_renderer::TextureId>,
+    env_bound: [Option<nfs_renderer::TextureId>; 3],
     slices: Option<SliceTable>,
     race: Option<RaceProgress>,
     /// the other cars on the road — opponents, traffic, police — see [`RoadCars`]
@@ -1715,6 +1723,8 @@ struct Playback {
     loop_count: u64,
     /// Ticks since a played-back stream ran out.
     end_ticks: u64,
+    /// `[0x60686C]` — the index into `replay::CAMERA_IDS` playback cycles through (`replay.md` §8).
+    camera: u8,
 }
 
 /// Network play, split out of [`App`] on 2026-09-21: the running session and the front end's
@@ -1824,6 +1834,9 @@ struct FrontEnd {
     /// `UserList.UserList`'s selected row when a click has moved it; otherwise the row
     /// `RebuildUserList` 0x4DEF60 selects — the profile `player.lst` names
     user_sel: Option<usize>,
+    /// whether the end-of-era show's `MusicPlay("vic*", 2)` (0x4FD538) has been started for this
+    /// opening of the screen
+    era_music: bool,
     /// the CD player's two list selections, `CDPlayer.AvailableList` / `SelectedList` rows
     cd_available: Option<usize>,
     cd_selected: Option<usize>,
@@ -3729,6 +3742,74 @@ impl App {
     /// tournament, which is what the port's own `career.era` tracks). The factory map's is the
     /// current mission's code at `fac+0x3F` — `1m01.fsh` and the rest, in `FEData/Factory` — from
     /// the first mission whose result is still 0 (0x51AE80).
+    /// `ID_ENDOFERASCREEN` (`endofera.lay`): build `FEEndOfEraCallBackList`'s show from the career
+    /// the way its constructor 0x4FD4F0 reads it (`RE/notes/controls.md` §4.150a). The tables are
+    /// the original's globals, so without a career the screen still has them and a fresh career's
+    /// state.
+    fn bind_end_of_era(&mut self) {
+        use nfs_formats::career::{Era, TournamentKind};
+        use nfs_game::end_of_era::{EndOfEra, EraInput, TITLE_TEXT};
+        let Some(l) = self.fe.layout_preview.as_ref() else { return };
+        let is_show = l.layout.elements.first().and_then(|e| e.get("callbacklist")).is_some_and(|c| c.eq_ignore_ascii_case("ID_ENDOFERASCREEN"));
+        if !is_show {
+            self.fe.era_music = false;
+            return;
+        }
+        // The show's constructor 0x4FD4F0 starts the victory music before anything else:
+        // 0x4FD531 / 0x4FD538 push **2** and `"vic*"` into `MusicPlay` 0x4AE4D0, which is mode 2 —
+        // the playlist becomes that one pick (`engine-audio.md` §8.3). Once per opening.
+        if !self.fe.era_music {
+            self.fe.era_music = true;
+            self.fe_music(|m, a| m.play_pattern(a, "vic*", 2));
+        }
+        let loaded;
+        let fresh;
+        let (tables, state) = match self.career.as_ref() {
+            Some(c) => (&c.tables, &c.career),
+            None => {
+                let Ok(t) = nfs_game::career::CareerTables::load(&self.paths) else { return };
+                loaded = t;
+                fresh = nfs_game::career::Career::default();
+                (&loaded, &fresh)
+            }
+        };
+        let idx = |e: Era| match e {
+            Era::Classic => 0usize,
+            Era::Golden => 1,
+            Era::Modern => 2,
+        };
+        // 0x503ED0: every era record not hidden (`+0xE4 != 2`) completed
+        let done = |e: Era| tables.tournaments.iter().filter(|t| t.kind == TournamentKind::Era(e) && !t.is_hidden()).all(|t| state.state(t.id).completed);
+        let current = state.era;
+        // 0x5032E0: Classic and Golden answer Classic, Modern answers Golden
+        let previous = if current == Era::Modern { Era::Golden } else { Era::Classic };
+        // 0x504800: the highest era found done; with none, a stack word the movie table maps to 0
+        // (MEDIUM — `+0x30C` stays 0 unless that word happens to be an era id)
+        let completed = [Era::Modern, Era::Golden, Era::Classic].into_iter().find(|e| done(*e)).map(idx).unwrap_or(0);
+        // 0x4E06D0 walks the loaded tables in order and the front end's own is first, so an id the
+        // file also gives the HUD reads the front end's row
+        let text = |id: u32| self.fe.strings.get(id).unwrap_or_default().to_string();
+        let tournaments = [Era::Classic, Era::Golden, Era::Modern].map(|e| {
+            tables.tournaments.iter().filter(|t| t.kind == TournamentKind::Era(e) && t.visibility == 0).map(|t| text(t.title_string_id)).collect::<Vec<_>>()
+        });
+        let input = EraInput {
+            previous: idx(previous),
+            current: idx(current),
+            completed,
+            current_done: done(current),
+            era_names: [text(0x209), text(0x20A), text(0x20B)],
+            cars: tables.catalog.iter().map(|c| (c.year as i32, c.display_name.clone())).collect(),
+            tournaments,
+            title: text(TITLE_TEXT),
+            centre: (320, 240),
+        };
+        // APPROXIMATION: the front end's generator is seeded from the clock (0x4E3182); a fixed
+        // seed keeps a still reproducible, as the movie circle's overlay does
+        let show = EndOfEra::build(&input, &mut nfs_game::opponents::FeRng::new(0));
+        let (Some(r), Some(l)) = (self.renderer.as_mut(), self.fe.layout_preview.as_mut()) else { return };
+        l.set_end_of_era(r, &self.paths, show);
+    }
+
     fn bind_track_maps(&mut self) {
         let Some(l) = self.fe.layout_preview.as_ref() else { return };
         let splines = l.numbered_widgets("NFS5.TrackSmall2dSpline");
@@ -4099,6 +4180,29 @@ impl App {
 
     fn simulate(&mut self) {
         self.tick += 1;
+        // the track's particle systems run on the 64 Hz clock (0x4689C0 → 0x4551E0)
+        if self.track_particles.is_none()
+            && !self.track_particle_defs.is_empty()
+            && let Some(w) = self.world.as_ref()
+        {
+            let p = nfs_game::track_particles::TrackParticles::new(std::mem::take(&mut self.track_particle_defs), &w.emitters, self.traffic_seed, 256);
+            tracing::info!(emitters = w.emitters.len(), systems = p.systems(), flares = w.flares.len(), "track effects");
+            self.track_particles = Some(p);
+            // diagnostic: `NFS_EMITTER_VIEW=k` runs the systems 300 updates ahead so a still of
+            // emitter k (see `rebuild_scene`) shows them going
+            if std::env::var("NFS_EMITTER_VIEW").is_ok()
+                && let Some(p) = self.track_particles.as_mut()
+            {
+                for _ in 0..300 {
+                    p.step();
+                }
+                let sp = p.sprites();
+                tracing::info!(sprites = sp.len(), first = ?sp.first(), "emitter view");
+            }
+        }
+        if let Some(p) = self.track_particles.as_mut() {
+            p.step();
+        }
         self.render_prev = Some((self.car_pos, self.car_rot));
         self.road.opp_prev = self
             .road.opponents
@@ -4112,6 +4216,9 @@ impl App {
             .collect();
         let net_seats = self.net_step();
         let view = self.camera_view();
+        // whether the camera key steps the replay's own nine ids (`replay.md` §8) — taken before
+        // the car is borrowed
+        let replay_camera = self.replay_view().is_some();
         let Some(v) = self.vehicle.as_mut() else {
             return;
         };
@@ -4233,15 +4340,13 @@ impl App {
                     self.race.as_ref().map(|r| r.slice).unwrap_or(0)
                 );
             }
-            let drivable = |p: Vec3| {
-                w.collision
-                    .ground(p.x, p.y + 2.0, p.z, 6.0)
-                    .map(|h| h.surface & 0xF != 0)
-                    .unwrap_or(false)
-            };
+            // `Car_wallCollide` 0x495020's corner skip: the drivable patch that contains the
+            // corner in plan and its height, which the collider compares with the car's own y
+            // (§6.1). It used to be a downward ray with a 6 m window, which is not the rule.
+            let patch_height = |p: Vec3| w.collision.find_patch_height(p).and_then(|(word, h)| (word & 0xF != 0).then_some(h));
             let landing = v.impact; // set by a hard landing during step32 (closing speed)
             v.impact = 0.0;
-            if v.collide_walls(&w.walls, &drivable, 0.0, 0.0, 0.0) {
+            if v.collide_walls(&w.walls, &patch_height, 0.0, 0.0, 0.0) {
                 self.wall_hits += 1;
                 if let (Some(a), Some(s)) = (&self.snd.audio, self.snd.sfx.as_mut()) {
                     let j = v.impact;
@@ -4616,7 +4721,7 @@ impl App {
                             .collect::<Vec<_>>(),
                     );
                     o.vehicle.step32(&c, &o.specs, &w.collision);
-                    if o.vehicle.collide_walls(&w.walls, &drivable, 0.0, 0.0, 0.0) {
+                    if o.vehicle.collide_walls(&w.walls, &patch_height, 0.0, 0.0, 0.0) {
                         o.wall_hits += 1;
                     }
                     o.vehicle.collide_props(&w.props, self.tick as u32);
@@ -4660,7 +4765,7 @@ impl App {
             let tick = self.tick as u32;
             let mut racer_walls = |c: &mut nfs_physics::vehicle::Vehicle| {
                 if !c.is_traffic {
-                    c.collide_walls(&w.walls, &drivable, 0.0, 0.0, 0.0);
+                    c.collide_walls(&w.walls, &patch_height, 0.0, 0.0, 0.0);
                     c.collide_props(&w.props, tick);
                 }
             };
@@ -4772,6 +4877,17 @@ impl App {
             // (`Vehicle::reset_countdown_tick`), which runs eight times faster off the road
             // surface — `car+0x464 == 0`, the body tracker's word (0x49AFA1…0x49AFDB), which
             // `find_patch` answers. The placement is the port's own (APPROXIMATION of 0x40F540).
+            // diagnostic: `NFS_ESCAPE_LOG=x0,x1` prints the player's state while its x is in that
+            // band, for chasing a car that gets past the wall line
+            if let Ok(band) = std::env::var("NFS_ESCAPE_LOG") {
+                let mut it = band.split(',').filter_map(|v| v.parse::<f32>().ok());
+                if let (Some(a), Some(b)) = (it.next(), it.next())
+                    && v.position.x >= a.min(b)
+                    && v.position.x <= a.max(b)
+                {
+                    tracing::info!(t = self.tick, pos = ?v.position, kmh = v.speed() * 3.6, patch = w.collision.find_patch(v.position) & 0xF, wall = ?w.walls.nearest(v.position, 20.0).map(|(n, d)| (n.x, n.y, d)), "escape watch");
+                }
+            }
             let off_surface = w.collision.find_patch(v.position) & 0xF == 0;
             let crashed = v.reset_countdown_tick(off_surface);
             // headless runs stand in for a human pressing reset: a scripted bot that is stuck below
@@ -4835,10 +4951,41 @@ impl App {
                     .collect();
                 for (oi, o) in self.road.opponents.iter_mut().enumerate() {
                     // stuck: reset onto the slice (AI reset request car+0xD8B = 5)
+                    // the two triggers are kept apart for the log: `ai.md` §3.2's five seconds
+                    // under 2 m/s, and facing the wrong way at over 10 m/s
+                    let (was_stuck, was_wrong, facing) = match &o.controller {
+                        Controller::Ai(ai) => (ai.stuck_ticks >= 0xA0, ai.wrong_way, ai.dbg_facing),
+                        _ => (false, false, 0.0),
+                    };
                     let stuck = match &mut o.controller {
                         Controller::Ai(ai) => ai.wants_reset(),
                         _ => false,
                     };
+                    // diagnostic: `NFS_SLOW_LOG=1` prints every opponent that is barely moving,
+                    // which is how a car that cannot get going is told from one that is merely slow
+                    if self.tick % 32 == 0
+                        && o.vehicle.speed() < 3.0
+                        && std::env::var_os("NFS_SLOW_LOG").is_some()
+                    {
+                        let surf: Vec<u32> = o.vehicle.wheels.iter().map(|wh| w.collision.find_patch(wh.world_pos) & 0xF).collect();
+                        tracing::info!(
+                            opponent = oi,
+                            t = self.tick / 64,
+                            kmh = o.vehicle.speed() * 3.6,
+                            rpm = o.vehicle.rpm,
+                            gear = o.vehicle.gear,
+                            engine = o.vehicle.engine_alive,
+                            thr = o.vehicle.throttle,
+                            arm = o.vehicle.engine_arm,
+                            alive_ticks = o.vehicle.ticks_alive,
+                            brk = o.vehicle.brake,
+                            contact = o.vehicle.wheels.iter().filter(|wh| wh.contact).count(),
+                            surf = ?surf,
+                            slip = ?o.vehicle.wheels.iter().map(|wh| wh.slip as i32).collect::<Vec<_>>(),
+                            pos = ?o.vehicle.position,
+                            "slow opponent"
+                        );
+                    }
                     // 0x40F740's crash countdown runs for the AI cars too, with the same
                     // off-surface rule (`car+0x464 == 0`)
                     let off_surface = w.collision.find_patch(o.vehicle.position) & 0xF == 0;
@@ -4856,6 +5003,20 @@ impl App {
                         let fwd = sl.forward.normalize();
                         let up = sl.up.normalize();
                         let right = up.cross(fwd).normalize();
+                        tracing::debug!(
+                            opponent = oi,
+                            why = if !stuck { "crash countdown" } else if was_wrong { "wrong way" } else if was_stuck { "stuck 5 s" } else { "reset request" },
+                            from_slice = o.progress.slice,
+                            to_slice = slice,
+                            pos = ?o.vehicle.position,
+                            kmh = o.vehicle.speed() * 3.6,
+                            engine = o.vehicle.engine_alive,
+                            killed_by = o.vehicle.engine_kill,
+                            wheels_down = o.vehicle.wheels.iter().filter(|w| w.contact).count(),
+                            gear = o.vehicle.gear,
+                            facing,
+                            "opponent reset"
+                        );
                         o.vehicle.reset_to(
                             sl.centre + up * 0.8,
                             glam::Mat3::from_cols(right, fwd.cross(right).normalize(), fwd)
@@ -5188,7 +5349,15 @@ impl App {
                     }
                 }
             }
-            if self.input.take_pressed(Action::CameraNext) {
+            if self.input.take_pressed(Action::CameraNext) && replay_camera {
+                // A playing replay steps its own nine ids instead (`replay.md` §8). 0x414953 skips
+                // **0x0B `SplineCam`** unless the track is `skidpad` (the `strcmp` at 0x414A28) and
+                // retries with the next entry; APPROXIMATION: which key the original cycles them
+                // with is UNKNOWN (§15), so this port reuses `I_CYCLECAMERA`, the same choice it
+                // made for the four playback speeds on the digits.
+                let skidpad = self.track.name.eq_ignore_ascii_case("skidpad");
+                self.replay.camera = nfs_game::replay::next_camera(self.replay.camera as usize, skidpad) as u8;
+            } else if self.input.take_pressed(Action::CameraNext) {
                 // `I_CYCLECAMERA`: step through the car's own camera list (`car[0].camera`)
                 let n = self.camera_cycle.len().max(1) as u8;
                 let driver = nfs_game::camera::VIEW_DRIVER as u16;
@@ -6357,6 +6526,10 @@ impl App {
             }
             // slot 9 runs for every car's model: the opponents' own too
             let k = if self.mirror { -1.0 } else { 1.0 };
+            // 0x43846F: with `[0x657424] >= 2` (a replay) the steer channels take the smoothed
+            // angle `car+0xAC8` / `+0xACC` instead of the wheels' own
+            let replaying = self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted));
+            let wheel_steer = |v: &nfs_physics::vehicle::Vehicle| if replaying { v.steer_smoothed } else { [v.wheels[0].steer, v.wheels[1].steer] };
             for o in &self.road.opponents {
                 let Some(m) = self.road.opponent_models.get_mut(o.model) else { continue };
                 let v = &o.vehicle;
@@ -6375,18 +6548,20 @@ impl App {
                         lat_acc: v.lateral_filtered,
                     },
                 );
+                let ws = wheel_steer(v);
                 m.update_race_channels(
                     16,
-                    [v.wheels[0].steer / 216.0 * k, v.wheels[1].steer / 216.0 * k],
+                    [ws[0] / 216.0 * k, ws[1] / 216.0 * k],
                     [v.wheels[0].rotation, v.wheels[1].rotation, v.wheels[2].rotation, v.wheels[3].rotation],
                     v.rpm,
                     v.speed(),
                 );
             }
             if let Some(v) = self.vehicle.as_ref() {
+                let ws = wheel_steer(v);
                 c.update_race_channels(
                     16,
-                    [v.wheels[0].steer / 216.0 * k, v.wheels[1].steer / 216.0 * k],
+                    [ws[0] / 216.0 * k, ws[1] / 216.0 * k],
                     [v.wheels[0].rotation, v.wheels[1].rotation, v.wheels[2].rotation, v.wheels[3].rotation],
                     v.rpm,
                     v.speed(),
@@ -6399,13 +6574,15 @@ impl App {
         let Some(w) = self.world.as_ref() else { return };
         let slice = self.race.as_ref().map(|r| r.slice as u32).unwrap_or(0);
         let covered = w.in_tunnel(self.car_pos);
-        let want = w.env_for(slice, covered).or(w.env_map);
-        if want == self.env_bound {
+        let mut layers = w.env_layers_for(slice, covered);
+        // outside every section the track's own default entry stands in, as it always has
+        layers[0] = layers[0].or(w.env_map);
+        if layers == self.env_bound {
             return;
         }
-        self.env_bound = want;
-        if let (Some(r), Some(t)) = (self.renderer.as_mut(), want) {
-            r.set_env_texture(t);
+        self.env_bound = layers;
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_env_textures(layers);
         }
     }
 
@@ -6495,12 +6672,47 @@ impl App {
         }
     }
 
+    /// The shadow projector a car at `pos` takes, 0x43A6F1 → 0x456160 (`crp-geometry.md` §8).
+    /// APPROXIMATION: `[0x6197CA]`, the detail option that gates it, is taken as set, and every
+    /// projector of the track is a candidate (the original's register as their articles draw).
+    fn projector_planes(&self, pos: Vec3) -> Option<([f32; 4], [f32; 4])> {
+        self.world.as_ref().and_then(|w| w.projector_for(pos)).map(|q| (q.u, q.v))
+    }
+
     /// The view the camera is on, by the original's ids (`nfs_game::camera`).
     fn camera_view(&self) -> u16 {
+        if let Some(v) = self.replay_view() {
+            return v;
+        }
         self.camera_cycle
             .get(self.camera_mode as usize)
             .copied()
             .unwrap_or(0x02)
+    }
+
+    /// The view a **playing** replay is on — its own nine-entry cycle (`replay::CAMERA_IDS`, the
+    /// table 0x5CC654), not the car's camera list. 0x414953 applies the entry: `0x14` is the
+    /// track-side "TV" camera only while the track has camera nodes and **id 3** (`TailCam1`) when
+    /// it has none, and every other id goes through as it is.
+    ///
+    /// APPROXIMATION: `0x0A CircleCam` and `0x0B SplineCam` have no motion of their own here —
+    /// their entries in `VIEW_OFFSETS` are zero and what moves them is not read — so on those two
+    /// the scene falls into the trackside branch and shows the nearest camera element.
+    fn replay_view(&self) -> Option<u16> {
+        let playing = self.replay.stream.as_ref().is_some_and(|r| {
+            matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted)
+        });
+        if !playing {
+            return None;
+        }
+        let id = *nfs_game::replay::CAMERA_IDS.get(self.replay.camera as usize)?;
+        Some(nfs_game::replay::apply_camera(id as u8, self.track_has_camera_nodes()) as u16)
+    }
+
+    /// `0x46D960()` — whether the track carries any camera node at all, which is what decides
+    /// between the "TV" camera and its fallback both at 0x413F3A and at 0x414960.
+    fn track_has_camera_nodes(&self) -> bool {
+        self.track_cameras.as_ref().is_some_and(|t| !t.cameras.is_empty())
     }
 
     fn rebuild_scene(&mut self) {
@@ -6920,6 +7132,39 @@ impl App {
                 }
             }
         }
+        // **The police beacon's projector** 0x4526C0's second half: on a night track
+        // (`word [0x628A28] != 0`) it walks the car list and keeps the live car whose `car+0xECC & 2`
+        // (lights on) is set and whose octagonal distance to the camera in the xz plane,
+        // `max(|dx|,|dz|) + 0.25·min(|dx|,|dz|)` (0x4527DB…0x45284D), is smallest — starting from
+        // **180** (`0x43340000`, 0x4527AF), so a farther one lights nothing. Its frame is the car's
+        // own (`car+0x330` / `car+0x364`) turned about the car's **y** by `TIMER_getTicks() × 0.02`
+        // **turns** (`[0x5B3714]`, through 0x5564A0 whose sine takes turns, `[0x5BB2C0]` = 2π), and
+        // 0x539CD0 stores world → that frame in `[0x61E184]`. The 128 Hz TIMER is two of this
+        // port's 64 Hz game ticks.
+        self.scene.beacon = self.track.is_night().then(|| {
+            let cam = self.camera.position;
+            // diagnostic: `NFS_BEACON_VIEW=1` spins the beacon on the player's own car, the only
+            // way to watch the sweep without a pursuit
+            if std::env::var("NFS_BEACON_VIEW").is_ok() {
+                let turns = (self.tick * 2) as f32 * 0.02;
+                let rot = car_rot * Quat::from_rotation_y(turns * std::f32::consts::TAU);
+                return Some(Mat4::from_rotation_translation(rot, car_pos).inverse());
+            }
+            let pol = self.road.police.as_ref()?;
+            let (car, _) = pol
+                .cars
+                .iter()
+                .filter(|c| c.active && c.lights)
+                .filter_map(|c| {
+                    let (dx, dz) = ((c.position.x - cam.x).abs(), (c.position.z - cam.z).abs());
+                    let d = dx.max(dz) + 0.25 * dx.min(dz);
+                    (d < 180.0).then_some((c, d))
+                })
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())?;
+            let turns = (self.tick * 2) as f32 * 0.02;
+            let rot = Quat::from_mat3(&car.orientation) * Quat::from_rotation_y(turns * std::f32::consts::TAU);
+            Some(Mat4::from_rotation_translation(rot, car.position).inverse())
+        }).flatten();
         // draw distance from `<track>_{forward,backwards}.key` for the camera's slice, scaled by the
         // detail setting (0x44F1A0: `value × {0.5, 0.67, 0.83, 1.0}`, at least 50 m). The sky is drawn
         // around the camera, so distant terrain simply stops at this range as in the original.
@@ -6968,9 +7213,10 @@ impl App {
                 let m = Mat4::from_rotation_translation(r, p);
                 let spin = c.speed.abs() * self.tick as f32 / 64.0 / 0.32;
                 let block = self.world.as_ref().map(|w| w.car_light(p));
-                self.scene
-                    .items
-                    .extend(match &block { Some(b) => self.road.police_models[c.model].draw_items_block(m, [spin; 4], [0.0; 2], b), None => self.road.police_models[c.model].draw_items(m, [spin; 4], [0.0; 2]) });
+                let model = &self.road.police_models[c.model];
+                let mut items = match &block { Some(b) => model.draw_items_block(m, [spin; 4], [0.0; 2], b), None => model.draw_items(m, [spin; 4], [0.0; 2]) };
+                model.apply_projector(&mut items, self.projector_planes(p));
+                self.scene.items.extend(items);
             }
         }
         if let Some(tr) = &self.road.traffic {
@@ -6989,9 +7235,10 @@ impl App {
                 // a kinematic car has no wheel state: the wheels are rolled from the distance driven
                 let spin = self.road.traffic_spin.get(i).copied().unwrap_or(0.0);
                 let block = self.world.as_ref().map(|w| w.car_light(p));
-                self.scene
-                    .items
-                    .extend(match &block { Some(b) => self.road.traffic_models[c.model].draw_items_block(m, [spin; 4], [0.0; 2], b), None => self.road.traffic_models[c.model].draw_items(m, [spin; 4], [0.0; 2]) });
+                let model = &self.road.traffic_models[c.model];
+                let mut items = match &block { Some(b) => model.draw_items_block(m, [spin; 4], [0.0; 2], b), None => model.draw_items(m, [spin; 4], [0.0; 2]) };
+                model.apply_projector(&mut items, self.projector_planes(p));
+                self.scene.items.extend(items);
             }
         }
         for (i, o) in self.road.opponents.iter().enumerate() {
@@ -7011,10 +7258,12 @@ impl App {
             // the front wheels' `+0xB4` over 216 (slot 9's channels 1 and 2)
             let (spin, steer) = ([w[0].rotation, w[1].rotation, w[2].rotation, w[3].rotation], [w[0].steer / 216.0, w[1].steer / 216.0]);
             let model = &self.road.opponent_models[o.model];
-            self.scene.items.extend(match &block {
+            let mut items = match &block {
                 Some(b) => model.draw_items_block(m, spin, steer, b),
                 None => model.draw_items(m, spin, steer),
-            });
+            };
+            model.apply_projector(&mut items, self.projector_planes(p));
+            self.scene.items.extend(items);
         }
         // every car drops a blob shadow on the ground under it (0x43B820)
         if let Some((_, material)) = self.shadow_draw {
@@ -7102,9 +7351,17 @@ impl App {
             // the car's light block — the ground under it times the `.map` colours, and the sun of
             // the track's sky (`RE/notes/lighting.md` §6)
             let block = self.world.as_ref().map(|w| w.car_light(car_pos));
-            self.scene
-                .items
-                .extend(match &block { Some(b) => c.draw_items_block(m, spin, steer, b), None => c.draw_items(m, spin, steer) });
+            let mut items = match &block { Some(b) => c.draw_items_block(m, spin, steer, b), None => c.draw_items(m, spin, steer) };
+            c.apply_projector(&mut items, self.projector_planes(car_pos));
+            self.scene.items.extend(items);
+        }
+        // diagnostic: `NFS_EMITTER_VIEW=k` puts the camera 6 m off the track's k-th particle
+        // emitter, looking at it
+        if let Some(k) = std::env::var("NFS_EMITTER_VIEW").ok().and_then(|v| v.parse::<usize>().ok())
+            && let Some(e) = self.world.as_ref().and_then(|w| w.emitters.get(k))
+        {
+            self.camera.target = e.position;
+            self.camera.position = e.position + e.dir_a * 6.0 + Vec3::Y * 1.5;
         }
         {
             let fwd = (self.camera.target - self.camera.position).normalize_or_zero();
@@ -7167,6 +7424,72 @@ impl App {
                     );
                 }
                 self.scene.items.extend(glares);
+            }
+            let mut flares = Vec::new();
+            self.flare_items(&mut flares, fwd, right, up);
+            self.scene.items.extend(flares);
+            if let Some(p) = self.track_particles.as_ref() {
+                // 0x454430 → 0x44F6E0: a camera-facing billboard per particle, turned about the
+                // view axis. APPROXIMATION: the blend mode (`+0x28`, 0x537A50) and the depth bias
+                // are not read — the glare material stands in
+                for sp in p.sprites() {
+                    let Some(&(mesh, material)) = self.track_particle_sprites.get(&sp.material) else { continue };
+                    let (s, c) = sp.degrees.to_radians().sin_cos();
+                    let (r, u) = (right * c + up * s, up * c - right * s);
+                    let m = Mat4::from_cols((r * sp.size).extend(0.0), (u * sp.size).extend(0.0), right.cross(up).extend(0.0), sp.position.extend(1.0));
+                    let a = sp.argb;
+                    self.scene.items.push(nfs_renderer::DrawItem {
+                        light: [((a >> 16) & 0xFF) as f32 / 255.0, ((a >> 8) & 0xFF) as f32 / 255.0, (a & 0xFF) as f32 / 255.0],
+                        alpha: (a >> 24) as f32 / 255.0,
+                        ..nfs_renderer::DrawItem::new(mesh, material, m)
+                    });
+                }
+            }
+        }
+    }
+
+    /// The track's flares, `RDrawArticleBundle`'s slot 3 for kind 2 (0x451940,
+    /// `RE/notes/crp-geometry.md` §8): the part's definition by its id (0x452510), shown while its
+    /// blink says so (`FlareDef::lit` on the game tick), and for each of the two layers with a
+    /// texture a camera-facing billboard (0x44F6E0, `RBillBoard`) at the part's point, a side of
+    /// `size × 0.1`, the layer's ARGB colour, turned about the view axis by — flag 4 —
+    /// `√d² · 3.6 + facing · 120` degrees, `d` from the camera and `facing = −dir · forward`
+    /// (0x451A5A…0x451B62; the root is the image's own `(bits >> 1) + 0x1FC00000`). Every shipped
+    /// definition carries flags 4 alone, so 0x4515F0's other fades (flags 1, 2, 8, 0x20, 0x40) have
+    /// nothing to act on and are not carried; the fog's (`[0x61BCA8]`) has no fog here.
+    /// APPROXIMATION: every flare of the track is tried — the original's come with the articles its
+    /// renderer finds in view — and the depth bias 0x537A60 and the batch's blend are not read
+    /// (the lamps' glare material stands in). MEDIUM: the row 0x451A57 dots is taken as the
+    /// camera's forward and the turn's sense as the axis-angle build's (0x539BD0).
+    fn flare_items(&self, out: &mut Vec<nfs_renderer::DrawItem>, fwd: Vec3, right: Vec3, up: Vec3) {
+        let Some(w) = self.world.as_ref() else { return };
+        if self.flare_defs.is_empty() {
+            return;
+        }
+        let tick = self.tick as u32;
+        let cam = self.camera.position;
+        for f in &w.flares {
+            let Some(def) = self.flare_defs.iter().find(|d| d.id == f.id) else { continue };
+            if !def.lit(f.phase, tick) {
+                continue;
+            }
+            let d2 = (f.position - cam).length_squared();
+            let dist = f32::from_bits((d2.to_bits() >> 1).wrapping_add(0x1FC0_0000));
+            let facing = -f.direction.dot(fwd);
+            let angle = if def.flags & 4 != 0 { (dist * 3.6 + facing * 120.0).to_radians() } else { 0.0 };
+            let (s, c) = angle.sin_cos();
+            let (r, u) = (right * c + up * s, up * c - right * s);
+            for k in 0..2 {
+                let Some(name) = def.textures[k].as_ref() else { continue };
+                let Some(&(mesh, material)) = self.flare_sprites.get(name) else { continue };
+                let size = def.sizes[k] * 0.1;
+                let argb = def.colours[k];
+                let m = Mat4::from_cols((r * size).extend(0.0), (u * size).extend(0.0), right.cross(up).extend(0.0), f.position.extend(1.0));
+                out.push(nfs_renderer::DrawItem {
+                    light: [((argb >> 16) & 0xFF) as f32 / 255.0, ((argb >> 8) & 0xFF) as f32 / 255.0, (argb & 0xFF) as f32 / 255.0],
+                    alpha: (argb >> 24) as f32 / 255.0,
+                    ..nfs_renderer::DrawItem::new(mesh, material, m)
+                });
             }
         }
     }
@@ -8320,6 +8643,27 @@ impl App {
         {
             m.update(a);
         }
+        // the end-of-era show's sting, once, 128 ticks in (0x4FFA7C): `0x4A6270(k)` queues speech
+        // id 4 + k — `Era-ClassictoGolden`, `Era-GoldentoModern`, `Era-CEvoModecomplet`
+        // (`RE/notes/sfx.md` §7.1)
+        if self.vehicle.is_none()
+            && let Some(k) = self.fe.layout_preview.as_ref().and_then(|l| l.take_end_of_era_sting())
+        {
+            if self.snd.speech.is_none() {
+                self.snd.speech = nfs_audio::speech::Speech::load(&self.paths.game_data().join("Speech"))
+                    .map_err(|e| tracing::warn!(error = %e, "speech unavailable"))
+                    .ok();
+            }
+            const ERA_STING: [&str; 3] = ["Era-ClassictoGolden.bnk", "Era-GoldentoModern.bnk", "Era-CEvoModecomplet.bnk"];
+            if let (Some(a), Some(sp)) = (&self.snd.audio, &self.snd.speech) {
+                sp.say(a, ERA_STING[k.clamp(0, 2) as usize], 0.9);
+            }
+        }
+        if self.vehicle.is_none()
+            && let (Some(a), Some(sp)) = (&self.snd.audio, &self.snd.speech)
+        {
+            sp.update(a);
+        }
         self.fe_career_dialog();
         self.fe_offer_check();
         // the steering band is the front end's own `XAxis.Min` / `XAxis.Max`, not a constant of
@@ -8805,6 +9149,7 @@ impl App {
             self.bind_showcase_pictures();
             self.bind_track_maps();
             self.bind_player_pictures();
+            self.bind_end_of_era();
                 if let Some(l) = self.fe.layout_preview.as_mut() {
                     l.transition_in();
                 }
@@ -8986,6 +9331,7 @@ impl App {
             self.bind_showcase_pictures();
             self.bind_track_maps();
             self.bind_player_pictures();
+            self.bind_end_of_era();
             if let Some(l) = self.fe.layout_preview.as_ref() {
                 for (c, n) in l.unrendered() {
                     tracing::info!(
@@ -9140,16 +9486,11 @@ impl App {
             r.start_race();
         }
         if playing {
-            // playback opens on `DirectorsCam` (0x14) — "whichever track-side camera the viewed car
-            // is currently passing", the classic NFS director's cut (`replay.md` §8)
-            if !self.camera_cycle.contains(&0x14) {
-                self.camera_cycle.push(0x14);
-            }
-            self.camera_mode = self
-                .camera_cycle
-                .iter()
-                .position(|v| *v == 0x14)
-                .unwrap_or(0) as u8;
+            // `Replay_startRace` 0x413EA0 opens playback on the **first** entry of the cycle
+            // table, `DirectorsCam` (0x14) — "whichever track-side camera the viewed car is
+            // currently passing", the classic NFS director's cut. Playback does not cycle the
+            // car's own camera list at all: it has its own nine ids (`replay.md` §8).
+            self.replay.camera = 0;
         }
         if !playing {
             // A fresh race gets a fresh seed unless the run pinned one.
@@ -9186,6 +9527,8 @@ impl App {
         self.replay.loop_count = 0;
         nfs_game::rng::seed(self.traffic_seed);
         let mut world = TrackWorld::upload(&mut renderer, &self.track).expect("track");
+        // the car shadow projectors' texture, `[0x6115CC]+0x18C` (`crp-geometry.md` §8)
+        renderer.set_projector_texture(world.projector_texture);
         self.car.tiny = self.cheat_bits & (1 << 1) != 0;
         let car = CarModel::upload_with_env(
             &mut renderer,
@@ -9947,6 +10290,74 @@ impl App {
         self.particle_draw = sprite(&mut renderer, &quad, "SKDP");
         self.shadow_draw = sprite(&mut renderer, &quad, "SHAD");
         self.glare_draw = sprite(&mut renderer, &quad, "CARG");
+        // the track flares' definitions and their textures, out of `common.fsh` by the exact
+        // name the loader swapped into place (the pack has both `spik` and `SPIK`)
+        self.flare_defs = std::fs::read(self.paths.render_dir().join("flare.dat")).map(|d| nfs_formats::flare::parse(&d)).unwrap_or_default();
+        self.flare_sprites.clear();
+        if let Some(path) = nfs_assets::GamePaths::find_file(&self.paths.render_dir(), "common.fsh")
+            && let Ok(data) = std::fs::read(&path)
+            && let Ok(images) = nfs_assets::texture::decode_pack(&path, &data)
+        {
+            let mut names: Vec<String> = self.flare_defs.iter().flat_map(|d| d.textures.iter().flatten().cloned()).collect();
+            names.sort();
+            names.dedup();
+            for name in names {
+                let Some(img) = images.iter().find(|t| t.name.trim() == name) else {
+                    tracing::debug!(name, "flare texture not in common.fsh");
+                    continue;
+                };
+                let tex = renderer.upload_texture(&nfs_renderer::TextureData { width: img.width, height: img.height, mips: img.mips.clone() });
+                let mesh = renderer.upload_mesh(&quad);
+                let material = renderer.create_material(nfs_renderer::MaterialDesc {
+                    alpha_blend: true,
+                    cull_back: false,
+                    depth_test: true,
+                    ..nfs_renderer::MaterialDesc::textured(tex)
+                });
+                self.flare_sprites.insert(name, (mesh, material));
+            }
+        }
+        // `HEAD` — what `Headlights::LayerUVLight` projects (0x452645 fetches it by that
+        // four-character code into `[0x61E1D4]`, whatever the night flag says)
+        if let Some(path) = nfs_assets::GamePaths::find_file(&self.paths.render_dir(), "common.fsh")
+            && let Ok(data) = std::fs::read(&path)
+            && let Ok(images) = nfs_assets::texture::decode_pack(&path, &data)
+            && let Some(img) = images.iter().find(|t| t.name.trim() == "HEAD")
+        {
+            let tex = renderer.upload_texture(&nfs_renderer::TextureData { width: img.width, height: img.height, mips: img.mips.clone() });
+            renderer.set_headlight_texture(Some(tex));
+        }
+        // the track's particle systems, started by its kind-3 `ef` parts (`particles.md` §6).
+        // APPROXIMATION: the budget `[0x6197E0]` is the detail level's (0, 100, 200, 256 at
+        // 0x44ED10) and this port has none, so it takes the highest
+        let defs = std::fs::read(self.paths.render_dir().join("particle.dat")).map(|d| nfs_formats::particle_dat::parse(&d)).unwrap_or_default();
+        self.track_particle_sprites.clear();
+        if let Some(path) = nfs_assets::GamePaths::find_file(&self.paths.render_dir(), "particle.fsh")
+            && let Ok(data) = std::fs::read(&path)
+            && let Ok(images) = nfs_assets::texture::decode_pack(&path, &data)
+        {
+            let mut names: Vec<String> = defs.iter().map(|d| d.material.clone()).collect();
+            names.sort();
+            names.dedup();
+            for name in names {
+                let Some(img) = images.iter().find(|t| t.name.trim() == name) else {
+                    tracing::debug!(name, "particle texture not in particle.fsh");
+                    continue;
+                };
+                let tex = renderer.upload_texture(&nfs_renderer::TextureData { width: img.width, height: img.height, mips: img.mips.clone() });
+                let mesh = renderer.upload_mesh(&quad);
+                let material = renderer.create_material(nfs_renderer::MaterialDesc {
+                    alpha_blend: true,
+                    cull_back: false,
+                    depth_test: true,
+                    ..nfs_renderer::MaterialDesc::textured(tex)
+                });
+                self.track_particle_sprites.insert(name, (mesh, material));
+            }
+        }
+        // made on the first update, once the track is up
+        self.track_particle_defs = defs;
+        self.track_particles = None;
         self.particles.clear();
         // the trackside cameras and their triggers travel with the track (`race-logic.md` §3.3)
         self.track_cameras = self
@@ -9969,6 +10380,16 @@ impl App {
             renderer.set_headlight_map(&m);
         }
         self.world = Some(world);
+        // diagnostic: `NFS_PROJECTOR_VIEW=k` sets the car down on the track's k-th shadow projector
+        if let Some(k) = std::env::var("NFS_PROJECTOR_VIEW").ok().and_then(|v| v.parse::<usize>().ok())
+            && let Some(q) = self.world.as_ref().and_then(|w| w.projectors.get(k)).cloned()
+        {
+            let ground = self.world.as_ref().and_then(|w| w.collision.ground(q.point.x, q.point.y + 50.0, q.point.z, 200.0)).map(|h| h.point.y).unwrap_or(q.point.y);
+            if let Some(v) = self.vehicle.as_mut() {
+                v.position = Vec3::new(q.point.x, ground + 0.5, q.point.z);
+                self.car_pos = v.position;
+            }
+        }
         let mut car = car;
         // `.TINYCAR`: the model at 0.4 (0x4433D2)
         if self.cheat_bits & (1 << 1) != 0 {
@@ -10829,6 +11250,11 @@ impl ApplicationHandler for App {
                 if self.fe_dialog_answer(event_loop) {
                     return;
                 }
+                // the end-of-era show's tick (0x4FF180): back one screen when it is over
+                if self.fe.layout_preview.as_ref().is_some_and(|l| l.end_of_era_leave()) {
+                    self.menu_key(MenuKey::Back, event_loop);
+                    return;
+                }
                 // the front end draws from `rebuild_scene` like everything else, so it keeps
                 // animating between key presses
                 let now = Instant::now();
@@ -11287,6 +11713,7 @@ fn main() -> Result<()> {
     let music_lengths = nfs_audio::music::song_lengths_ms(&paths.game_data().join("Music")).unwrap_or_default();
     let mut app = App {
         fe: FrontEnd {
+            era_music: false,
             bar_grab: None,
             chronicle_group: CHRONICLE_GROUP,
             chronicle_col: None,
@@ -11401,6 +11828,7 @@ fn main() -> Result<()> {
             saved: false,
             loop_count: 0,
             end_ticks: 0,
+            camera: 0,
         },
         // the original seeds the race RNG from the registry's RAND_SEED (replay.md §11); a replay
         // carries the seed so playback re-simulates the same traffic, police and AI
@@ -11463,8 +11891,13 @@ fn main() -> Result<()> {
         shadow_draw: None,
         shadow_meshes: Vec::new(),
         glare_draw: None,
+        flare_defs: Vec::new(),
+        flare_sprites: std::collections::HashMap::new(),
+        track_particles: None,
+        track_particle_defs: Vec::new(),
+        track_particle_sprites: std::collections::HashMap::new(),
         track_cameras: None,
-        env_bound: None,
+        env_bound: [None; 3],
         slices: None,
         race: None,
         road: RoadCars {

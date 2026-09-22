@@ -18,6 +18,8 @@ pub mod edg;
 pub mod error;
 pub mod fedata;
 pub mod fetxt;
+pub mod flare;
+pub mod particle_dat;
 pub mod fnt;
 pub mod fsh;
 pub mod ini;

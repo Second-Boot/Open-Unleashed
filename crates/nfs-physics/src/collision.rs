@@ -178,6 +178,44 @@ impl TriangleGrid {
         best.map(|(_, w)| w).unwrap_or(0)
     }
 
+    /// The same query as [`Self::find_patch`], also answering the chosen patch's **plane height**
+    /// at the point — what `Car_wallCollide` 0x495020 needs: after `updateZone(corner, 1)` it
+    /// evaluates the patch plane through vertex 0 (`Tracker::point(0)` 0x4745F0 and
+    /// `Tracker::normal()` 0x474420) at the corner,
+    /// `h = p0.y - ((p.x - p0.x)·n.x + (p.z - p0.z)·n.z) / n.y` (0x4952A0…0x4952B6), and skips the
+    /// corner when `|h - car+0x334| <= 4.0` (`[0x5B2404]`, 0x4952B9…0x4952D9).
+    ///
+    /// `None` when no drivable patch contains the point in plan — then the wall test runs.
+    pub fn find_patch_height(&self, p: Vec3) -> Option<(u32, f32)> {
+        if self.tris.is_empty() {
+            return None;
+        }
+        let (cx, cz) = Self::cell_of(self.min, self.cell_size, self.nx, self.nz, p);
+        let mut best: Option<(f32, u32, f32)> = None;
+        for &ti in &self.cells[cz * self.nx + cx] {
+            let t = &self.tris[ti as usize];
+            if t.surface & 0xF == 0 {
+                continue;
+            }
+            let side = |a: Vec3, b: Vec3| (b.x - a.x) * (p.z - a.z) - (b.z - a.z) * (p.x - a.x);
+            let (d0, d1, d2) = (side(t.a, t.b), side(t.b, t.c), side(t.c, t.a));
+            let inside = (d0 >= 0.0 && d1 >= 0.0 && d2 >= 0.0) || (d0 <= 0.0 && d1 <= 0.0 && d2 <= 0.0);
+            if !inside {
+                continue;
+            }
+            let n = (t.b - t.a).cross(t.c - t.a);
+            if n.y.abs() < 1e-9 {
+                continue;
+            }
+            let h = t.a.y - (n.x * (p.x - t.a.x) + n.z * (p.z - t.a.z)) / n.y;
+            let d = (h - p.y).abs();
+            if best.map(|(bd, _, _)| d < bd).unwrap_or(true) {
+                best = Some((d, t.surface, h));
+            }
+        }
+        best.map(|(_, w, h)| (w, h))
+    }
+
     /// Ground under (x, z): highest surface below `y_from` within `depth`.
     pub fn ground(&self, x: f32, y_from: f32, z: f32, depth: f32) -> Option<Hit> {
         self.raycast(Vec3::new(x, y_from, z), Vec3::NEG_Y, depth)

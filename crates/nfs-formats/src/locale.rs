@@ -10,6 +10,12 @@ use std::collections::HashMap;
 #[derive(Debug, Default, Clone)]
 pub struct Strings {
     pub by_id: HashMap<u32, String>,
+    /// The rows whose `Conditionals` column (9) names `fe` — the front end's own table
+    /// (`festrings.h`), the first such row per id. The file carries the HUD table (`hud`) in the
+    /// same id space and 36 ids are in both (`IDS_ERACONGRATS` 18164 is "Congratulations" for the
+    /// front end and "Observe previous car" for the HUD); `by_id` keeps whichever row came last,
+    /// and [`Strings::get`] asks this map first.
+    pub fe_by_id: HashMap<u32, String>,
 }
 
 /// Windows-1252 → Unicode. The shipped text uses the 0x80..0x9F block (typographic quotes and
@@ -28,17 +34,24 @@ impl Strings {
     pub fn parse(data: &[u8], lang: usize) -> Strings {
         let text: String = data.iter().map(|&b| cp1252(b)).collect();
         let mut by_id = HashMap::new();
+        let mut fe_by_id = HashMap::new();
         for row in csv_rows(&text) {
             let Some(id) = row.first().and_then(|f| f.trim().parse::<u32>().ok()) else { continue };
             if let Some(s) = row.get(1 + lang) {
                 by_id.insert(id, s.clone());
+                if row.get(9).is_some_and(|c| c.split('|').any(|t| t.trim().eq_ignore_ascii_case("fe"))) {
+                    fe_by_id.entry(id).or_insert_with(|| s.clone());
+                }
             }
         }
-        Strings { by_id }
+        Strings { by_id, fe_by_id }
     }
 
+
+    /// The string for `id`: the front end's own row when the file has one (0x4E06D0 walks the
+    /// loaded tables with the front end's first), else the only row there is.
     pub fn get(&self, id: u32) -> Option<&str> {
-        self.by_id.get(&id).map(|s| s.as_str())
+        self.fe_by_id.get(&id).or_else(|| self.by_id.get(&id)).map(|s| s.as_str())
     }
 
     /// The text for `id`, or `#id` when the table lacks it.
@@ -88,6 +101,15 @@ fn csv_rows(text: &str) -> Vec<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An id both tables give reads the front end's row; a HUD-only id still reads.
+    #[test]
+    fn front_end_rows_win() {
+        let csv = b"1,Congratulations,,,,,,,IDS_A,fe|needh,,!fe\r\n2,WINNINGS,,,,,,,IDS_W,hud,,!hud\r\n1,Observe previous car,,,,,,,IDS_B,hud,,!hud\r\n";
+        let s = Strings::parse(csv, 0);
+        assert_eq!(s.get(1), Some("Congratulations"));
+        assert_eq!(s.get(2), Some("WINNINGS"));
+    }
 
     #[test]
     fn quotes_and_line_ends() {

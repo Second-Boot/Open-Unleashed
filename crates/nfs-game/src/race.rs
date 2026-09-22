@@ -195,28 +195,82 @@ impl SliceTable {
     /// `SliceTable::findSlice` 0x481400: hill-climb in the xz plane from `prev`, with a coarse global
     /// scan over every 8th slice when farther than 128 m. Restricted to the main lap (junction branch
     /// picking not implemented — MEDIUM).
-    /// `0x4816C0` — the nearest slice of one section to `pos` (2-D, as the tracker measures).
-    pub fn nearest_in_section(&self, section: usize, pos: Vec3) -> Option<usize> {
+    /// `0x4816C0` — the slice of one section nearest `pos` (2-D, as the tracker measures), **hill-
+    /// climbed from `from`**, not scanned.
+    ///
+    /// 0x4816C0 is a thin wrapper: it reads the section record's first (`+0`) and last (`+0x10`)
+    /// slice and calls **0x4812C0(first, last, pos, from)**, which
+    ///
+    /// * keeps `from` as the seed when `first <= from <= last` (0x4812D4…0x4812DA), and otherwise
+    ///   seeds at whichever **end** of the section is nearer to `pos` (0x4812DC…0x481335);
+    /// * then walks ±1 while a neighbour is nearer, **bounded by the section**: the backward step
+    ///   stops at `first` (`cmp edx, [esp+0x14]; jle` at 0x4813A1) and the loop ends on reaching
+    ///   `last` (`cmp [esp+0x20], edx; jne` at 0x4813D4).
+    ///
+    /// *This used to be a linear scan of the whole section, which let a car snap to any slice of
+    /// it — on monaco4 an opponent jumped 82 -> 463 where the route doubles back near itself
+    /// (2026-09-23).*
+    pub fn nearest_in_section(&self, section: usize, pos: Vec3, from: usize) -> Option<usize> {
         let s = self.sections.get(section)?;
-        let mut best: Option<(f32, usize)> = None;
-        for i in s.first..=s.last.min(self.slices.len().saturating_sub(1)) {
-            let d = self.d2(i, pos);
-            if best.is_none_or(|(bd, _)| d < bd) {
-                best = Some((d, i));
-            }
+        let n = self.slices.len();
+        if n == 0 {
+            return None;
         }
-        best.map(|(_, i)| i)
+        let (first, last) = (s.first.min(n - 1), s.last.min(n - 1));
+        if first > last {
+            return None;
+        }
+        let mut p = if (first..=last).contains(&from) {
+            from
+        } else if self.d2(first, pos) <= self.d2(last, pos) {
+            first
+        } else {
+            last
+        };
+        // each step strictly shortens the distance, so this ends; the bound is only a guard
+        for _ in 0..=(last - first) {
+            let d = self.d2(p, pos);
+            if p < last && self.d2(p + 1, pos) < d {
+                p += 1;
+                continue;
+            }
+            if p > first && self.d2(p - 1, pos) < d {
+                p -= 1;
+                continue;
+            }
+            break;
+        }
+        Some(p)
+    }
+
+    /// `0x481C80` — the section a slice belongs to.
+    fn section_of(&self, slice: usize) -> Option<usize> {
+        self.sections.iter().position(|s| (s.first..=s.last).contains(&slice))
     }
 
     /// `Tracker::update` 0x474440 with a `preferredSection`: when the car has chosen a branch, its
     /// slice is resolved against that section as well, and the nearer of the two candidates wins.
     /// Without a preference (or on a single-section table) this is plain [`Self::find_slice`].
     pub fn track_slice(&self, pos: Vec3, prev: usize, preferred: Option<usize>) -> usize {
-        let plain = self.find_slice(pos, prev);
-        let Some(sec) = preferred.filter(|_| self.sections.len() > 1) else { return plain };
-        match self.nearest_in_section(sec, pos) {
-            Some(cand) if self.d2(cand, pos) < self.d2(plain, pos) => cand,
-            _ => plain,
+        let Some(sec) = preferred.filter(|_| self.sections.len() > 1) else { return self.find_slice(pos, prev) };
+        // 0x474444…0x4744A6: **both** candidates are 0x4816C0 calls seeded at the car's current
+        // slice — one for the section that slice is in (0x481C80), one for the preferred section —
+        // and the nearer centre wins. The plain `findSlice` runs only when there is no preference
+        // or the table has one section (0x474460 / 0x474474).
+        let here = self.section_of(prev.min(self.slices.len().saturating_sub(1)));
+        let a = here.and_then(|h| self.nearest_in_section(h, pos, prev));
+        let b = self.nearest_in_section(sec, pos, prev);
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                if self.d2(b, pos) < self.d2(a, pos) {
+                    b
+                } else {
+                    a
+                }
+            }
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => self.find_slice(pos, prev),
         }
     }
 

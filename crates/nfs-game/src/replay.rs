@@ -352,6 +352,28 @@ impl Speed {
 /// skidpad-only.
 pub const CAMERA_IDS: [u8; 9] = [0x14, 0x0A, 0x0B, 0x08, 0x09, 0x06, 0x04, 0x0F, 0x00];
 
+/// Applying a cycle entry, 0x414953…0x414ACD: **0x14** is the track-side "TV" camera only while
+/// the track carries camera nodes (`0x46D960()`), and **id 3** when it carries none; every other
+/// id goes through unchanged.
+pub fn apply_camera(id: u8, has_camera_nodes: bool) -> u8 {
+    if id == 0x14 && !has_camera_nodes { 3 } else { id }
+}
+
+/// Stepping the cycle, the same function's retry arm: **0x0B `SplineCam`** is skipped unless the
+/// track is `skidpad` (the `strcmp` against `[0x657444]` at 0x414A28), and the index wraps over
+/// the nine entries.
+pub fn next_camera(index: usize, is_skidpad: bool) -> usize {
+    let n = CAMERA_IDS.len();
+    let mut i = index;
+    for _ in 0..n {
+        i = (i + 1) % n;
+        if CAMERA_IDS[i] != 0x0B || is_skidpad {
+            break;
+        }
+    }
+    i
+}
+
 /// Ticks the race keeps running after the stream is exhausted (0x415CB3: one second).
 pub const END_GRACE_TICKS: u64 = 64;
 
@@ -764,6 +786,21 @@ mod tests {
         assert_eq!((0..8).map(|t| Speed::Normal.ticks_at(t)).sum::<u32>(), 8);
         assert_eq!((0..8).map(|t| Speed::Double.ticks_at(t)).sum::<u32>(), 16);
         assert_eq!(Speed::Quarter.camera_lag(), 0.0025);
+    }
+
+    /// §8's two rules for the playback camera cycle.
+    #[test]
+    fn playback_camera_cycle() {
+        // the "TV" camera falls back to id 3 on a track with no camera nodes
+        assert_eq!(apply_camera(0x14, true), 0x14);
+        assert_eq!(apply_camera(0x14, false), 3);
+        assert_eq!(apply_camera(0x0A, false), 0x0A);
+        // 0x0B `SplineCam` is stepped over everywhere but skidpad
+        assert_eq!(CAMERA_IDS[1], 0x0A);
+        assert_eq!(next_camera(0, false), 1, "0x14 -> 0x0A");
+        assert_eq!(next_camera(1, false), 3, "0x0A skips 0x0B to 0x08");
+        assert_eq!(next_camera(1, true), 2, "on skidpad 0x0B is kept");
+        assert_eq!(next_camera(8, false), 0, "the ninth wraps to the first");
     }
 
     #[test]

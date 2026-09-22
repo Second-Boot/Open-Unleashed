@@ -54,6 +54,20 @@ pub fn vertex_light_methods(crp: &Crp, data: &[u8]) -> std::collections::HashSet
         .collect()
 }
 
+/// The render methods that build `Headlights::LayerUVLight` — the serialised class code **0x8004**
+/// (its allocator 0x449C6D takes the jump table's index 3 to the constructor 0x453C60, which sets
+/// the vtable 0x5B3DAC). Two of them sit in every night track's `Opaque` method and none in a day
+/// track's, so the decal is live in shipped content (`RE/notes/lighting.md` §5.2).
+pub fn uv_light_methods(crp: &Crp, data: &[u8]) -> std::collections::HashSet<String> {
+    crp.level
+        .iter()
+        .filter(|e| e.is_level(b"RMth"))
+        .filter_map(|e| data.get(e.data_offset()..e.data_offset() + e.data_len()))
+        .filter(|bytes| bytes.len() > 16 && bytes[16..].chunks_exact(4).any(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]) == 0x8004))
+        .map(|bytes| bytes[..16].iter().take_while(|b| **b != 0).map(|b| *b as char).collect())
+        .collect()
+}
+
 /// `GameData/Render/night.psh`'s one entry, `nght` — 128 × 128 bytes the headlight projector
 /// 0x452910 indexes directly, read at `entry + 0x10` (0x45261B).
 pub fn night_map(paths: &crate::GamePaths) -> Option<Vec<u8>> {

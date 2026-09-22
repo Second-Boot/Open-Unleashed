@@ -58,7 +58,7 @@ fn vehicle_wall_response_synthetic() {
     // the sweep runs after integration: the +x corners (x ≈ pos.x + 0.9) have just passed the edge
     let mut v = Vehicle::new(Vec3::new(1.5, 0.3, 0.0), glam::Mat3::IDENTITY, &specs, 0.75, 0.3);
     v.velocity = Vec3::new(64.0, 0.0, 0.0); // 2 m per tick
-    let hit = v.collide_walls(&walls, &|_| false, 0.0, 0.0, 0.0);
+    let hit = v.collide_walls(&walls, &|_| None, 0.0, 0.0, 0.0);
     eprintln!("hit={hit} pos={:?} vel={:?}", v.position, v.velocity);
     assert!(hit);
     assert!(v.velocity.x < 0.0 && v.velocity.x > -10.0, "restitution 0.1 expected, got {:?}", v.velocity);

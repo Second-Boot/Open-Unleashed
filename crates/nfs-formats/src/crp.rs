@@ -581,6 +581,13 @@ pub struct Material {
     pub unknown_20: u32,
     /// The `R3DLightLayer` (0x8104) parameters a car material carries — `RE/notes/lighting.md` §6.
     pub light: Option<LayerLight>,
+    /// `R3DSpecularTextureLayer`'s **reflection strength** — the first of the four 4-byte
+    /// parameters at data offsets 0x18…0x24 (record +284…+296), which 0x445520 buckets at 0.05 and
+    /// 0.95 to pick one of the three environment textures (`RE/notes/lighting.md` §3.1). Every
+    /// shipped `mt` of every car and track keeps the four equal — 0.0, 0.5 or 1.0, and non-zero
+    /// only on `CarExtEnv` and `CarWindow` — so which one the layer reads cannot be told apart and
+    /// does not matter.
+    pub reflection: f32,
 }
 
 /// `R3DLightLayer`'s parameter block `{f32 p0, f32 p1, u32 slot}` (read at 0x446600, 0x446886 and
@@ -592,6 +599,18 @@ pub struct LayerLight {
     pub p0: f32,
     pub p1: f32,
     pub slot: u32,
+}
+
+/// 0x445520's buckets: under `[0x5B38B0]` = 0.05 the first environment texture, under
+/// `[0x5B38B4]` = 0.95 the second, else the third (`RE/notes/lighting.md` §3.1).
+pub fn env_variant(reflection: f32) -> usize {
+    if reflection < 0.05 {
+        0
+    } else if reflection < 0.95 {
+        1
+    } else {
+        2
+    }
 }
 
 impl Material {
@@ -611,6 +630,7 @@ impl Material {
                 p1: f32::from_bits(u32::from_le_bytes([b[304], b[305], b[306], b[307]])),
                 slot: u32::from_le_bytes([b[308], b[309], b[310], b[311]]),
             }),
+            reflection: if b.len() >= 288 { f32::from_bits(u32::from_le_bytes([b[284], b[285], b[286], b[287]])) } else { 0.0 },
         })
     }
     pub fn texture_name(&self) -> String {
