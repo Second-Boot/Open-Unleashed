@@ -1093,6 +1093,10 @@ impl LayoutScreen {
         // at 0x4CDB61, and reaches the parts after (0x4CDB72), so the oval goes over
         // the picture. `NFS5.MOVIEBOX` has no such parts.
         if e.class == "NFS5.MOVIECIRCLE" {
+            // the overlay goes where the clip goes: the original draws both inside the oval's
+            // stencil (0x4DAAC0 … 0x4DAB00 around 0x4CDB61 and 0x4CDB72), which this port stands
+            // for by putting the oval over them
+            self.draw_movie_overlay(i, e, talpha, aspect, out);
             for (px, py, pw, ph, file, index, flip) in self.shape_parts(e) {
                 let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
                 let (dw, dh) = (if pw > 0.0 { pw } else { aw }, if ph > 0.0 { ph } else { ah });
@@ -1101,6 +1105,156 @@ impl LayoutScreen {
                 let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
                 out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
             }
+        }
+    }
+
+    /// **0x4CDF40**, after the clip and the oval: the overlay's lines, flashes and runs in three
+    /// tints — 0x4CFFFFFF, 0xA0FFFFFF, 0x30FFFFFF, or on the credits screen (`ID_CREDITS`, the one
+    /// screen class whose slot 0x2C answers true, 0x510E90) 0x26FAB400, 0x50FAB400, 0x18FAB400 —
+    /// each through 0x4D87F0 with the widget's fade. The box is the widget's own `pos` and `size`
+    /// (0x4CDC9A). `crate::movie_overlay` has the objects.
+    fn draw_movie_overlay(&self, i: usize, e: &nfs_formats::lay::Element, talpha: f32, aspect: f32, out: &mut Vec<Sprite>) {
+        use crate::movie_overlay::{Box4, Draw, MovieOverlay, RUN_TEXT};
+        let ((px, py), (pw, ph)) = (e.position(), e.size());
+        let b = Box4 { left: px as i32, top: py as i32, right: (px + pw) as i32, bottom: (py + ph) as i32 };
+        let now = self.clock_ms as i64;
+        let mut map = self.movie_overlays.borrow_mut();
+        let o = map.entry(i).or_insert_with(|| MovieOverlay::new(b, 0, 1));
+        o.advance(now);
+        let credits = self.layout.elements.iter().any(|x| x.get("callbacklist").is_some_and(|c| c.eq_ignore_ascii_case("ID_CREDITS")));
+        let argb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8, (v >> 24) as u8];
+        let (line, flash, run) = if credits { (0x26FAB400, 0x50FAB400, 0x18FAB400) } else { (0x4CFFFFFF, 0xA0FFFFFF, 0x30FFFFFF) };
+        let faded = |v: u32| {
+            let mut c = tint(argb(v));
+            c[3] *= talpha;
+            c
+        };
+        let (line_c, flash_c) = (faded(line), faded(flash));
+        for d in o.draws() {
+            match d {
+                Draw::Bar { x, y, w, h } => out.push(self.quad(aspect, x, y, w, h, line_c)),
+                Draw::Sweep { horizontal, cross, s_lo, len, along, width, forward } => {
+                    // the sweep's bright end is 0xDDFFFFFF through the line tint's alpha (0x51FBA1)
+                    if let Some((s, l, c0, c1)) = crate::layout::glint_sweep(len, along, width, forward) {
+                        let k = line_c[3];
+                        let (a, bcol) = (tint(c0), tint(c1));
+                        let (a, bcol) = ([a[0], a[1], a[2], a[3] * k], [bcol[0], bcol[1], bcol[2], bcol[3] * k]);
+                        let (qx, qy, qw, qh) = if horizontal { (s_lo + s, cross, l, 1.0) } else { (cross, s_lo + s, 1.0, l) };
+                        let pts = [[qx, qy], [qx + qw, qy], [qx, qy + qh], [qx + qw, qy + qh]];
+                        let cols = if horizontal { [a, bcol, a, bcol] } else { [a, a, bcol, bcol] };
+                        self.gouraud(out, aspect, pts, cols);
+                    }
+                }
+                Draw::Flash { frame, cx, cy } => {
+                    let Some(&(tex, fw, fh)) = self.shapes.get(&(crate::layout::MOVIE_FLASHES.to_string(), frame)) else { continue };
+                    let (pos, size) = self.place(aspect, cx - (fw / 2.0).trunc(), cy - (fh / 2.0).trunc(), fw, fh);
+                    out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: flash_c, rotation: 0.0, pivot: [0.5, 0.5] });
+                }
+                Draw::Run { font, x, y, alpha, gap, align, vertical } => {
+                    let Some(f) = self.fonts.get(crate::layout::RUN_FONTS[font.min(1)]) else { continue };
+                    // 0x520A9A: the run tint's own alpha scaled by the fade the run computed, then
+                    // the widget's
+                    let mut c = faded(run);
+                    c[3] *= alpha as f32 / 255.0;
+                    // 0x522050: a letter at a time, each advancing by its own measure plus the gap.
+                    // APPROXIMATION: 0x536970's second measure, used on the vertical axis, is taken
+                    // as the font's line height
+                    let sizes: Vec<f32> = RUN_TEXT.chars().map(|ch| if vertical { f.line_px() } else { f.place(&ch.to_string()).1 }).collect();
+                    let total: f32 = sizes.iter().sum::<f32>() + (RUN_TEXT.chars().count() as i32 * gap) as f32;
+                    let (mut cx, mut cy) = (x, y);
+                    let shift = match align {
+                        1 => total,
+                        2 => total * 0.5,
+                        _ => 0.0,
+                    };
+                    if vertical {
+                        cy = (cy - shift).trunc();
+                    } else {
+                        cx = (cx - shift).trunc();
+                    }
+                    for (ch, sz) in RUN_TEXT.chars().zip(sizes) {
+                        // APPROXIMATION: the original's letters are cut by the oval's stencil;
+                        // without one a letter is kept only when it starts inside the box
+                        let inside = cx >= b.left as f32 && cx < b.right as f32 && cy >= b.top as f32 && cy < b.bottom as f32;
+                        if inside {
+                            self.text(out, aspect, f, &ch.to_string(), cx, cy, 0.0, 0, c);
+                        }
+                        if vertical {
+                            cy = (cy + sz + gap as f32).trunc();
+                        } else {
+                            cx = (cx + sz + gap as f32).trunc();
+                        }
+                    }
+                }
+            }
+        }
+        drop(map);
+        if credits {
+            self.draw_credits_roll(b, now, talpha, aspect, out);
+        }
+    }
+
+    /// **0x4CE0F0**, the credits roll: `FEStrings` 6000 … 6467 down the box, centred, from the
+    /// string `[+0x23C]` less `[+0x244]` pixels. The speed is the credits screen's `[0x5D8BEC]` —
+    /// −3 while `ID_CREDSBACK` is hovered, +3 on `ID_CREDSFWD`, 1 otherwise (0x50EB0D…0x50EB38). A
+    /// line starting `#` or `!` drops the marker and takes the heading font 3 px lower and 2 px
+    /// taller, `*` drops it and takes the body font, the rest take the body font; each line is
+    /// `max(height + 2, 12)` tall (0x4CE47B…0x4CE495). With the yraGyraG code the line
+    /// `"Gary Steinke"` is 10 taller and has `"(my cat's name is mittens)"` 13 below it, in the
+    /// heading font at 0xC0 of the colour (0x4CE348…0x4CE3B7). The colour is white at the widget's
+    /// fade (0x4D87D0).
+    ///
+    /// APPROXIMATION: 0x536970's height of a line is taken as its font's line height, and a line is
+    /// drawn only when it starts inside the box (the original cuts with the oval's stencil).
+    fn draw_credits_roll(&self, b: crate::movie_overlay::Box4, now: i64, talpha: f32, aspect: f32, out: &mut Vec<Sprite>) {
+        use crate::movie_overlay::{credits_wrap, CreditsRoll};
+        let (Some(body), Some(head)) = (self.fonts.get(crate::layout::ROLL_FONTS[0]), self.fonts.get(crate::layout::ROLL_FONTS[1])) else { return };
+        let gary = self.cheat_bits & (1 << 6) != 0;
+        let text = |id: i32| self.fe_strings.get(id as u32).unwrap_or_default().to_string();
+        let height = |id: i32| -> i32 {
+            let t = text(id);
+            let h = if t.starts_with('#') || t.starts_with('!') {
+                head.line_px() + 2.0
+            } else if gary && t == "Gary Steinke" {
+                body.line_px() + 10.0
+            } else {
+                body.line_px()
+            };
+            (h as i32 + 2).max(12)
+        };
+        let hovered = self.hovered().and_then(|k| self.layout.elements.get(k)).and_then(|e| e.get("name")).unwrap_or("");
+        let speed = match hovered {
+            "ID_CREDSBACK" => -3,
+            "ID_CREDSFWD" => 3,
+            _ => 1,
+        };
+        let mut slot = self.credits_roll.borrow_mut();
+        let roll = slot.get_or_insert_with(|| CreditsRoll::new(0));
+        roll.advance(now, speed, height);
+        let white = [1.0, 1.0, 1.0, talpha];
+        let centre = ((b.right - b.left) / 2 + b.left) as f32;
+        let mut acc = 0;
+        let mut id = roll.id;
+        while acc < b.bottom - b.top {
+            id = credits_wrap(id);
+            let t = text(id);
+            let y = (b.top - roll.offset + acc) as f32;
+            let inside = y >= b.top as f32 && y < b.bottom as f32;
+            if inside {
+                if let Some(rest) = t.strip_prefix('#').or_else(|| t.strip_prefix('!')) {
+                    self.text(out, aspect, head, rest, centre, y + 3.0, 0.0, 1, white);
+                } else if let Some(rest) = t.strip_prefix('*') {
+                    self.text(out, aspect, body, rest, centre, y, 0.0, 1, white);
+                } else {
+                    self.text(out, aspect, body, &t, centre, y, 0.0, 1, white);
+                    if gary && t == "Gary Steinke" {
+                        let c = [1.0, 1.0, 1.0, talpha * 0xC0 as f32 / 255.0];
+                        self.text(out, aspect, head, "(my cat's name is mittens)", centre, y + 13.0, 0.0, 1, c);
+                    }
+                }
+            }
+            acc += height(id);
+            id += 1;
         }
     }
 

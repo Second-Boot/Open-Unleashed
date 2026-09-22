@@ -144,6 +144,39 @@ impl CarStyle {
     /// ```
     ///
     /// The port renders at the best detail the table has, so it takes the `detail >= 8` arm.
+    /// Slot 19's roof line in a race (`[0x65B928] == 0`, 0x43AE7A…0x43AE9F): `slot41 = 2·slot37`,
+    /// one less when the car's `.CABRIODOWN` option `[carinfo+0x50C]` (id 0x24B) is **0**, and
+    /// then `slot37 = 0`. With slot 41's pairs (`CabrioDown` 1 / `CabrioUp` 2, …) a 0 picks the
+    /// odd article of the family. A car with no roof family ends on 41 = −1 or 0, which no
+    /// article carries.
+    /// Slot 19's tail, **0x43B0B7…0x43B0DC**, in both branches: every one of the 120 dwords of
+    /// `carinfo+0x32C` that is not negative replaces the style's own — the geometry slots 0…59
+    /// and the texture slots 60…119, after every write slot 19 made. The port's array holds only
+    /// what the parts wrote; the rest is taken as −1 (what the launch leaves there is not read).
+    pub fn apply_overlay(&mut self, swaps: &[[i16; 3]]) {
+        for &[group, slot, value] in swaps {
+            if value < 0 || !(0..60).contains(&slot) {
+                continue;
+            }
+            match group {
+                0 => {
+                    self.geometry.insert(slot as u32, value as u32);
+                }
+                1 => {
+                    self.texture.insert(slot as u32, value as u32);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn apply_race_roof(&mut self, cabrio_down: u32) {
+        let family = self.geometry.get(&37).copied().unwrap_or(0);
+        let v = (2 * family).wrapping_sub(u32::from(cabrio_down == 0));
+        self.geometry.insert(41, v);
+        self.geometry.insert(37, 0);
+    }
+
     pub fn apply_driver_detail(&mut self, detail: u32, no_driver: bool, factory_driver: bool) {
         if no_driver {
             self.geometry.insert(9, 0);
@@ -200,6 +233,14 @@ pub struct CarAssets {
     /// Zero until somebody sets it, which is the right default: `style1` is what a model with one
     /// style has.
     pub style_index: usize,
+    /// The catalogue record's convertible flag `nfs5.car +0x1BF` (see [`Self::with_style`]).
+    pub cabrio: bool,
+    /// `carinfo+0x32C`, the style overlay a race car's installed parts write: `{group, slot,
+    /// value}` from each part's `+0x8E` swaps (0x49C5F7…0x49C635), group 0 a geometry slot and 1 a
+    /// texture slot (`slot + 60` in the 120-dword array)
+    pub style_overlay: Vec<[i16; 3]>,
+    /// `.TINYCAR` (`carinfo+0x518`), which slot 19's tail copies into style slot 58 (0x43B0E5)
+    pub tiny: bool,
 }
 
 impl CarAssets {
@@ -244,6 +285,9 @@ impl CarAssets {
             textures_night,
             tpg: Ini::parse(&String::from_utf8_lossy(&read(&tpg_path)?)),
             style_index: 0,
+            cabrio: false,
+            style_overlay: Vec::new(),
+            tiny: false,
         })
     }
 
@@ -251,6 +295,18 @@ impl CarAssets {
     /// style 1 the way an unset `car+0x568` would.
     pub fn with_style(mut self, variant: i16) -> Self {
         self.style_index = variant.max(0) as usize;
+        self
+    }
+
+    /// Carry the installed parts' geometry swaps (`Part::geometry_swaps`).
+    pub fn with_style_overlay(mut self, swaps: Vec<[i16; 3]>) -> Self {
+        self.style_overlay = swaps;
+        self
+    }
+
+    /// Carry the catalogue record's convertible flag `+0x1BF`.
+    pub fn with_cabrio(mut self, cabrio: bool) -> Self {
+        self.cabrio = cabrio;
         self
     }
 

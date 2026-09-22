@@ -45,8 +45,10 @@ pub struct Controls {
     pub brake: u8,
     pub steer: i32,
     pub handbrake: bool,
-    /// Requested gear slot for manual boxes (0 = R, 1 = N, 2.. = 1st..); `None` = keep.
-    pub gear_request: Option<u8>,
+    /// The packet's **command code**, byte 0 bits 3..7 (`controls.md`, the packer's command codes):
+    /// 1 leave race, **2 shift up**, **3 shift down**, 4 abort, 5 reset, … — set on the tick a
+    /// command fires and 0 otherwise.
+    pub command: u8,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -113,6 +115,34 @@ pub struct Vehicle {
     pub gear: usize,
     pub prev_gear: usize,
     pub shift_timer: u32,
+    /// `car+0xD7E`, the requested gear: 1 at car creation (0x410C2F), moved by the shift codes
+    /// (0x499475) and taken by 0x49DD20.
+    pub requested_gear: usize,
+    /// `car+0xD83`, set on a manual downshift into a forward gear (0x49DEF1). Its readers — the
+    /// neutral rpm blip and the previous gear's ratio while blipping (`physics.md` §4.1) — are
+    /// not in this port's engine model.
+    pub downshift_blip: bool,
+    /// `car+0xD98`, the automatic's reverse latch (0x49DE72, 0x49DEC2).
+    pub reverse_latch: bool,
+    /// `gGameTick` `[0x606AC4]` (64 Hz), which 0x49DD20 gates the gearbox on: nothing before 0x1C0,
+    /// first gear requested until 0x1C4. The race sets it every step; `step64` counts it on
+    /// otherwise.
+    pub game_tick: u64,
+    /// `car+0xB50`, the finish state: 0 racing, 2 finished, 3 out.
+    pub race_state: u8,
+    /// `RALLY` `[0x6573F8]`, the race option the Dakar code sets (cheat bit 0) — global, so every
+    /// car in the race has it: surfaces 1 and 10 read as 2 (0x499B90, 0x49AFE1), the steering
+    /// ramps 18 a tick (0x49DFC0), the front grip limits ×1.1 (0x4A1ADD), the drive
+    /// ×1.25·min(1 + |slip tangent|, 2) (0x49EE0B), the friction circle's longitudinal ×0.5 (0x4A1DC1)
+    /// and the front lateral ×1.2 after it (0x4A26DE)
+    pub rally: bool,
+    /// `.TRACTION` `carinfo+0x20` (option 0x23B), the traction control of the friction circle
+    /// 0x4A1DC0: a rear wheel over its limit is scaled back to it — no slide — while
+    /// `|car+0xDC0| < 0.15` (0x4A1F38…0x4A1F6E), a spinning rear axle does not slide outright
+    /// (0x4A2072), and the slide intensity is halved at the end (0x4A20AA)
+    pub tcs: bool,
+    /// `.TINYCAR` `carinfo+0x518`: the steering ramps 18 a tick as under `RALLY` (0x49DFCF)
+    pub tiny: bool,
     pub ignition_cut: u32,
     pub throttle_raw: u8,
     pub brake_raw: u8,
@@ -157,6 +187,19 @@ pub struct Vehicle {
     pub long_filtered: f32,
     pub gravity_scale: f32,
     pub ticks_alive: u32,
+    /// `car+0xDB0`: 1 at the race init (0x410BD6), counted up every input step while non-zero
+    /// (0x49DD29…0x49DD34). Zero is a dead car — 0x49DD4E holds the pedals, throttle 0 and the
+    /// brake full, and skips the gearbox — and two things kill it: an impact past 120 on a car
+    /// that is not tiny (`Damage` 0x4948C1) and a body-ground contact that leaves the car
+    /// upside down (`car+0x3A0 < 0`, 0x49C01B). A reset re-arms it (0x49E220, 0x49E31E…0x49E3E5):
+    /// 60 when it was alive, 1 when it was dead.
+    pub engine_alive: u32,
+    /// `car+0x1100`, the crash reset countdown (32 Hz ticks) that 0x40F740 runs — see
+    /// [`Self::reset_countdown_tick`]. `Damage` loads it with 0xC0 on a heavy impact (0x4948E6).
+    pub reset_countdown: i32,
+    /// `car+0xB4C`, the hold after a reset request went through: 0xA0 ticks (0x40F841), one off
+    /// every 0x40F740 pass (0x40F854…0x40F85F).
+    pub reset_hold: u32,
     /// nominal wheel offsets in body space (x right, y up, z forward) — from the model
     pub wheel_offsets: [Vec3; 4],
     pub ride_height: f32,
@@ -180,6 +223,9 @@ pub struct Vehicle {
     /// first four are the wheel contact set. Empty falls back to the eight corners of
     /// [`Self::half_extents`], which is what the port did before the records were decoded.
     pub body_points: Vec<Vec3>,
+    /// The `.sim` mass the body-ground impulse divides by (`CarSpecs::mass`), kept so the prop
+    /// collider can run it without the specs
+    pub sim_mass: f32,
     /// last wall impulse magnitude (car+0x430)
     pub impact: f32,
     /// LCG state (the original's `0x5D1028 × 0x5D102C`) for road roughness and the engine's noise.
@@ -208,6 +254,15 @@ impl Vehicle {
             gear: 1,
             prev_gear: 1,
             shift_timer: 0,
+            requested_gear: 1,
+            downshift_blip: false,
+            reverse_latch: false,
+            // a car no race clock drives (the scenarios) behaves as one made on the start tick
+            game_tick: 0x1C1,
+            race_state: 0,
+            rally: false,
+            tcs: false,
+            tiny: false,
             ignition_cut: 0,
             throttle_raw: 0,
             brake_raw: 0,
@@ -233,6 +288,9 @@ impl Vehicle {
             long_filtered: 0.0,
             gravity_scale: 1.16,
             ticks_alive: 0,
+            engine_alive: 1,
+            reset_countdown: 0,
+            reset_hold: 0,
             wheel_offsets: [
                 Vec3::new(-half_track, wheel_radius, hb),
                 Vec3::new(half_track, wheel_radius, hb),
@@ -247,6 +305,7 @@ impl Vehicle {
             min_height: 0.0,
             half_extents: Vec3::new(half_track + 0.15, 0.6, hb + 0.9),
             body_points: Vec::new(),
+            sim_mass: specs.mass,
             impact: 0.0,
             rng: 0x3ADE_68B1,
         }
@@ -268,6 +327,12 @@ impl Vehicle {
     /// `state = prod & 0xFFFF`, `rand16 = (prod >> 8) & 0xFFFF` (`traffic.md` §14.7). The original
     /// keeps **one** stream for the whole game; this crate sits below `nfs-game`, so it carries its
     /// own state with the same arithmetic.
+    /// `ClampAngVel`'s limit in turns/s: 0.75, or 2.25 for a `.TINYCAR` (0x4964D0, 0x49BBA0). The
+    /// 6.75 of a light simplified-AI car (`car+0x52C & 0x80`, 0x4964F4) has no car in this port.
+    fn ang_limit(&self) -> f32 {
+        if self.tiny { 2.25 } else { 0.75 }
+    }
+
     fn rand16(&mut self) -> u32 {
         let prod = self.rng.wrapping_mul(123_456_789);
         self.rng = prod & 0xFFFF;
@@ -289,6 +354,34 @@ impl Vehicle {
     pub fn speed(&self) -> f32 {
         self.velocity.length()
     }
+
+    /// `car+0x35C`: `max(|vx|, |vz|) + 0.25·min(|vx|, |vz|)` of the world velocity (0x49BEA9…0x49BF02)
+    /// — the estimate the original's gates read, not a true norm.
+    pub fn horizontal_speed(&self) -> f32 {
+        let (a, b) = (self.velocity.x.abs(), self.velocity.z.abs());
+        a.max(b) + 0.25 * a.min(b)
+    }
+
+    /// 0x40F7DB…0x40F865, the reset request: the command `car+0xD8B == 5` (the AI's, or a human's
+    /// button byte `>> 3`, 0x499344) goes through to `0x40F540(car, 2, 0)` only while the car is
+    /// racing (`car+0xB50 == 0`), the game tick is past 0x300, no hold is running and
+    /// `car+0x35C` is under 27.6 (`[0x5B2734]`); then the hold is 0xA0. The hold counts down on
+    /// every pass. (`car+0x540` / `+0x544`, also required to be 0, never leave 0 in a race —
+    /// `physics.md` §4.1c; `car+0xD89`, the other request, is only ever cleared.)
+    pub fn reset_request(&mut self, requested: bool, game_tick: u64) -> bool {
+        let go = requested
+            && self.race_state == 0
+            && game_tick > 0x300
+            && self.reset_hold == 0
+            && self.horizontal_speed() < 27.6;
+        if go {
+            self.reset_hold = 0xA0;
+        }
+        if self.reset_hold > 0 {
+            self.reset_hold -= 1;
+        }
+        go
+    }
     pub fn v_long(&self) -> f32 {
         self.v_local.z
     }
@@ -301,7 +394,8 @@ impl Vehicle {
         self.handbrake = c.handbrake;
         // steering ramp: at most 12 per physics tick
         let d = self.steer_target - self.steer;
-        self.steer += d.clamp(-12, 12);
+        let ramp = if self.rally || self.tiny { 18 } else { 12 };
+        self.steer += d.clamp(-ramp, ramp);
         self.steer = self.steer.clamp(-127, 127);
         // pedals 0..1 (divisor 252)
         let mut thr = (self.throttle_raw as f32 / 252.0).min(1.0);
@@ -310,36 +404,112 @@ impl Vehicle {
             thr = 0.0;
             brk = 1.0;
         }
-        // gear selection
-        if self.automatic {
-            if self.gear == 1 && self.ticks_alive >= 0x40 {
-                self.gear = 2;
+        // 0x49DD29…0x49DD78: the alive count steps on; a dead car — or a human one that has
+        // finished (`car+0xB50 >= 2`) — gets throttle 0, the brake full, the downshift flag, the
+        // shift timer and the reverse latch cleared, and no gearbox
+        if self.engine_alive != 0 {
+            self.engine_alive += 1;
+        }
+        if self.engine_alive == 0 || (!self.ai_driven && self.race_state >= 2) {
+            self.downshift_blip = false;
+            self.shift_timer = 0;
+            self.reverse_latch = false;
+            self.throttle = 0.0;
+            self.brake = 1.0;
+            return;
+        }
+        // gear selection. An AI car leaves neutral or reverse in its own pedal routine
+        // (0x40C051…0x40C0AB): past tick 0x1C0 it is put straight into 1st — `car+0xD82` and
+        // `+0xD7E` both 2 — with a shift timer of `4 + (rand·8 >> 16)`, one draw; a human car's
+        // automatic is 0x49DD20's (below, after the request)
+        if self.ai_driven && self.gear <= 1 && self.game_tick > 0x1C0 {
+            self.shift_timer = 4 + self.rand_below(8);
+            self.gear = 2;
+            self.requested_gear = 2;
+        }
+        // `Car_applyInput`'s tail (0x499435…0x499475): 0x413890 turns the packet's code into a
+        // gear — code 2 (`& 0xF8 == 0x10`) one up while below `specs[0x50] − 1`, code 3 (`== 0x18`)
+        // one down while above 0 — counted from the **current** gear, and a downshift is refused
+        // while the rpm `car+0xDB4` is past the redline `specs[0x94]`
+        if !self.ai_driven {
+            let g = self.gear;
+            let req = match c.command {
+                2 if g + 1 < specs.gear_slots => g + 1,
+                3 if g > 0 => g - 1,
+                _ => g,
+            };
+            if !(self.rpm > specs.redline && req < g) {
+                self.requested_gear = req;
             }
-            // reverse toggle when stopped with brake and no throttle
-            let speed = self.speed();
-            if speed < 0.2 && self.brake_raw > 0x80 && self.throttle_raw == 0 && self.shift_timer == 0 && self.gear >= 2 {
-                self.gear = 0;
+        }
+        // 0x49DD20 for a manual human car (0x49DEDC / 0x49DEE1), after the start tick (0x49DDAE):
+        // the request is taken as it stands — the previous gear kept, the downshift flag set when
+        // going down into a forward gear, the shift timer loaded with `specs[0x54]`
+        if !self.ai_driven && self.game_tick > 0x1C0 {
+            if self.automatic {
+                self.automatic_request();
             }
-            if self.gear == 0 {
-                // in reverse the pedals are swapped: throttle drives backwards
-                std::mem::swap(&mut thr, &mut brk);
-                if self.throttle_raw > 0x80 && speed < 0.2 && self.brake_raw == 0 {
-                    // throttle while stopped in reverse → back to drive (choose highest gear for speed)
-                    self.gear = 2;
-                    std::mem::swap(&mut thr, &mut brk);
+            let (g, req) = (self.gear, self.requested_gear);
+            if req != g {
+                if !self.automatic {
+                    self.downshift_blip = g > req && req > 1;
+                    self.prev_gear = g;
+                    self.gear = req;
+                    self.shift_timer = specs.shift_ticks;
+                } else if req < 2 {
+                    // 0x49DEFA: reverse or neutral is taken as it stands
+                    self.downshift_blip = false;
+                    self.prev_gear = g;
+                    self.gear = req;
+                    self.shift_timer = specs.shift_ticks;
+                } else if req == 2 && g < 2 {
+                    // 0x49DF24…0x49DF7B: out of reverse / neutral, the highest gear whose
+                    // `redline · specs[0x170 + 4g]` is below the forward speed `car+0xD60`, else 1st
+                    let mut pick = 2;
+                    for k in 2..specs.gear_slots {
+                        if specs.redline * specs.mps_per_rpm[k] < self.v_local.z {
+                            pick = k;
+                        }
+                    }
+                    self.downshift_blip = false;
+                    self.prev_gear = g;
+                    self.gear = pick;
+                    self.shift_timer = specs.shift_ticks;
                 }
             }
-        } else if let Some(g) = c.gear_request
-            && (g as usize) < specs.gear_slots
-            && g as usize != self.gear
-            && self.shift_timer == 0
-        {
-            self.prev_gear = self.gear;
-            self.gear = g as usize;
-            self.shift_timer = specs.shift_ticks;
+        }
+        // in reverse an automatic swaps the pedals: the throttle drives backwards (0x49DD20's tail)
+        if self.automatic && !self.ai_driven && self.gear == 0 {
+            std::mem::swap(&mut thr, &mut brk);
         }
         self.throttle = thr;
         self.brake = brk;
+    }
+
+    /// 0x49DDDE…0x49DEC2 — an automatic human car's own requests: first gear until tick 0x1C4,
+    /// then, while the request stands and the car is racing (`car+0xB50 == 0`), reverse when it is
+    /// stopped (`car+0x35C < 0.2`) with the brake past 0x80 and no throttle in a forward gear, and
+    /// first again when it is stopped in reverse with the throttle past 0x80 — each once, through
+    /// the latch `car+0xD98`, which a request that differs from the gear clears.
+    /// `car+0x540` / `+0x544` are not carried.
+    fn automatic_request(&mut self) {
+        if self.game_tick < 0x1C4 {
+            self.requested_gear = 2;
+            return;
+        }
+        if self.requested_gear != self.gear || self.race_state != 0 {
+            self.reverse_latch = false;
+            return;
+        }
+        let (a, b) = (self.v_local.x.abs(), self.v_local.z.abs());
+        let stopped = a.max(b) + 0.25 * a.min(b) < 0.2;
+        if stopped && self.brake_raw > 0x80 && self.throttle_raw == 0 && self.gear > 1 && !self.reverse_latch {
+            self.requested_gear = 0;
+            self.reverse_latch = true;
+        } else if stopped && self.throttle_raw > 0x80 && self.gear == 0 && self.reverse_latch {
+            self.requested_gear = 2;
+            self.reverse_latch = false;
+        }
     }
 
     /// `AutoShift` 0x49DAF0 (CONFIRMED).
@@ -370,6 +540,9 @@ impl Vehicle {
             new_gear = g - 1;
         }
         if new_gear != g {
+            // `car+0xD83`: set on the two downshifts (0x49DC92, 0x49DCEE), cleared on the upshift
+            // (0x49DCCC)
+            self.downshift_blip = new_gear < g;
             self.prev_gear = g;
             self.gear = new_gear;
             self.shift_timer = specs.shift_ticks;
@@ -447,33 +620,54 @@ impl Vehicle {
         // in neutral or mid-shift is never "spinning". This port used to set it only inside the
         // block below, so on those paths it kept the previous tick's value.
         self.rear_spin = false;
-        if neutral {
-            if self.rpm < rpm_target {
-                self.rpm += 250.0;
-            } else if self.rpm > rpm_target {
-                self.rpm -= if gear >= 4 { 200.0 } else { 100.0 };
-            }
-            self.rpm = self.rpm.max(0.0);
-            return -a_drag;
-        }
-        if self.shift_timer > 0 || !rear_contact {
-            if self.shift_timer > 0 {
+        // `misfire = engineDamage/300 > rand01` (§4.3), drawn at the top of the routine (0x49E4BD)
+        let misfire = self.part_wear(&specs.zone_masks.engine, &specs.wear.engine) / 300.0 > self.misfire_roll;
+        // **The no-drive path, 0x49EF36…0x49F075**, entered in neutral, mid-shift or with the rear
+        // off the ground (0x49E84F / 0x49E85D / 0x49E869):
+        //
+        // * a misfire takes 100 off (0x49EF40);
+        // * below the target and not shifting, +250, up to the target (0x49EF66…0x49EF87);
+        // * shifting, unless it is out of neutral (`car+0xD81 == 1`, 0x49EF94): with the downshift
+        //   flag the blip `[0x5D0C70 + 4·req]` (250, 200, 175, 150, 125) — `[0x5D0C90]` (200 … 100)
+        //   with the brake past 0x40 — up to the redline (0x49EFA1…0x49EFFD), without it 100 off, or
+        //   200 in fourth and up (0x49EFFF…0x49F018);
+        // * otherwise, at or above the target, 200 off, down to the target (0x49F03B…0x49F06F);
+        //
+        // never below 0, and the boost bleeds 0.1 on the way out (0x49F075).
+        if neutral || self.shift_timer > 0 || !rear_contact {
+            let shifting = self.shift_timer > 0;
+            if shifting {
                 self.shift_timer -= 1;
             }
-            self.rpm = (self.rpm - 100.0).max(0.0);
-            // 0x49F075: the boost bleeds off on the no-drive path
+            let mut rpm = self.rpm;
+            if misfire {
+                rpm -= 100.0;
+            } else if rpm < rpm_target && !shifting {
+                rpm = (rpm + 250.0).min(rpm_target);
+            } else if shifting && self.prev_gear != 1 {
+                if self.downshift_blip {
+                    const BLIP: [f32; 8] = [0.0, 0.0, 250.0, 200.0, 175.0, 150.0, 125.0, 0.0];
+                    const BLIP_BRAKING: [f32; 8] = [0.0, 0.0, 200.0, 175.0, 150.0, 125.0, 100.0, 0.0];
+                    let t = if self.brake_raw > 0x40 { &BLIP_BRAKING } else { &BLIP };
+                    rpm = (rpm + t[self.requested_gear.min(7)]).min(specs.redline);
+                } else {
+                    rpm -= if gear >= 4 { 200.0 } else { 100.0 };
+                }
+            } else if rpm >= rpm_target {
+                rpm = (rpm - 200.0).max(rpm_target);
+            }
+            self.rpm = rpm.max(0.0);
             self.boost = (self.boost - 0.1).max(0.0);
             return -a_drag;
         }
         if self.automatic {
             self.auto_shift(specs);
-            if self.shift_timer > 0 {
-                // shift just started: no drive this tick
-                return -a_drag;
-            }
         }
         let gear = self.gear;
-        let rpm_wheel = specs.ratio_rpm_per_mps[gear] * vz;
+        // 0x49E898…0x49E8C4: while a shift runs without the downshift flag the wheel rpm is still
+        // the **previous** gear's
+        let ratio_gear = if self.shift_timer > 0 && !self.downshift_blip { self.prev_gear } else { gear };
+        let rpm_wheel = specs.ratio_rpm_per_mps[ratio_gear] * vz;
         let rpm_c = self.rpm.clamp(0.0, specs.redline);
         let t = specs.torque_at(rpm_c);
         let mut a_drive = t * specs.accel_per_torque[gear] * (1.0 - self.part_wear(&specs.zone_masks.engine, &specs.wear.engine) / 300.0) * (1.0 - 0.005 * self.part_wear(&specs.zone_masks.gearbox, &specs.wear.gearbox));
@@ -482,10 +676,9 @@ impl Vehicle {
             diff = 0.0;
         }
         let slip = self.rpm - rpm_wheel.abs();
-        // `misfire = engineDamage/300 > rand01` (§4.3): a damaged engine stumbles, which stops the
-        // clutch model pulling the revs down and kills the drive when it is over its target. The
-        // draw comes from the shared LCG, so the caller fills `misfire_roll` each tick.
-        let misfire = self.part_wear(&specs.zone_masks.engine, &specs.wear.engine) / 300.0 > self.misfire_roll;
+        // (`misfire`, above: a damaged engine stumbles, which stops the clutch model pulling the revs
+        // down and kills the drive when it is over its target. The draw comes from the shared LCG,
+        // so the caller fills `misfire_roll` each tick.)
         // **The clutch-slip block of `Engine_update` 0x49E440, read to the instruction on
         // 2026-09-21** (`physics.md` §4.1a). The note this used to follow had three comparisons the
         // wrong way round, and the port had simplified the rest; together they left the rear axle
@@ -567,7 +760,10 @@ impl Vehicle {
         // Drive is proportional to throttle (the original scales `a_drive` by the throttle in the
         // over-target branch and by the clutch model otherwise; a linear throttle map is used for the
         // launch/rev-up branches — MEDIUM).
-        a_drive * throttle - a_drag
+        // 0x49EE0B: RALLY scales the drive by 1.25 · min(1 + |slip tangent|, 2) — in the original
+        // on the throttle-scaled branch, which this port folds into its final line
+        let rally_k = if self.rally { 1.25 * (1.0 + self.slip_tangent.abs()).min(2.0) } else { 1.0 };
+        a_drive * throttle * rally_k - a_drag
     }
 
     /// `LoadTransfer` 0x4A1900 (CONFIRMED).
@@ -594,6 +790,10 @@ impl Vehicle {
         self.wheels[1].limit -= dz;
         self.wheels[2].limit += dz;
         self.wheels[3].limit += dz;
+        if self.rally {
+            self.wheels[0].limit *= 1.1;
+            self.wheels[1].limit *= 1.1;
+        }
         let dx = self.accel_local.x * specs.weight_transfer * (-1.0 / GRAVITY) * g_eff * 0.2 / specs.transfer_div;
         let dx2 = dx / specs.lateral_div;
         self.wheels[0].limit -= dx;
@@ -649,7 +849,11 @@ impl Vehicle {
     ///
     /// The roof zone is gated: 0x494E69 takes it only when `car+0x52C & 0x80` is **clear**, and
     /// that bit marks a traffic car (`ai.md` §7), so traffic never takes roof damage.
-    pub fn damage_by_normal(&mut self, effect: f32, n_world: Vec3) {
+    ///
+    /// `flag` is `Damage`'s fourth argument — 0 from the body-ground contact (0x49684A), 1 from the
+    /// wall collider (0x495563), 2 from the car-car solver (0x496F8E) — and `mass` is the car's
+    /// collision mass `car+0x354`; both only feed [`Self::crash_response`].
+    pub fn damage_by_normal(&mut self, effect: f32, n_world: Vec3, flag: u8, mass: f32) {
         if effect <= 10.0 {
             return;
         }
@@ -669,6 +873,93 @@ impl Vehicle {
             4
         };
         self.damage_zone(effect, zone);
+        self.crash_response(effect, zone, flag, mass);
+    }
+
+    /// `Damage` 0x494500's tail (0x49481A…0x494DD9), which runs whatever the damage switch says
+    /// and only for a non-zero `flag`: a knock to the body's spin, and on a heavy impact a hop.
+    ///
+    /// `a` is the amount, doubled for a `.TINYCAR` (0x494863) — the ×0.5 of a knockout run over
+    /// the network (`[0x6573E8] == 3 && [0x657408]`, 0x494826) has no race in this port. Past 80
+    /// (`[0x5B26D4]`) the amount is taken ×0.125 (`[0x5B272C]`), the body is lifted 0.1 m when it
+    /// sits within 0.1 of the ground (`car+0x424`, 0x4948FA), the velocity's `y` gains `a/3` —
+    /// for a traffic car of collision mass under 1, `max(mass, 0.1 + 0.05·rand) · a · 0.33`
+    /// (0x494964…0x4949D7) — the knock is `min(a/32, 2)` with each axis ×1.2 (×3.0 tiny,
+    /// 0x49494E), and a car-car hit (`flag == 2`) with the world spin under 0.5 turns/s on `x`
+    /// and `z` draws a new one (0x494A0A…0x494C14): `x, z ∈ [−2.5, 2.5)`, `y ∈ [−1, 1)`, or
+    /// `[−10, 10)` and `[−5, 5)` for traffic or a tiny car. Otherwise the knock is `min(a/32, 0.33)`.
+    ///
+    /// The knock goes on in the body frame (0x494C45…0x494D16): pitch `−k/2` for the front zones
+    /// 0…2 and `+k/2` for the rest, yaw and roll `+k/2` for zones 2…4 and `−k/2` for the rest.
+    /// Unless the other body was a car (`car+0x434`, which only the car-car solver writes,
+    /// 0x496CC9 — MEDIUM that nothing else leaves it set), the body then drops by the height of
+    /// `(−sin 2πroll · hx, −cos 2πroll · hy, 0)` over 32 (0x494D3C…0x494D92). The wall's
+    /// call ends in `ClampAngVel` 0x49BBA0 (0x494DD4); the car-car solver clamps on its own.
+    ///
+    /// It also loads the reset countdown `car+0x1100 = 0xC0` (0x4948E6) and, past 120 on a car
+    /// that is not tiny, kills the car (`car+0xDB0 = 0`, 0x4948A6…0x4948C1). Not carried, each
+    /// without a counterpart in this port: `+0x1104 = 1`, `+0x418 = 1`, `+0x450 = 0`
+    /// (0x4948D5…0x4948F0) and the prop's knocked-over `+0x42C` (0x49489A).
+    fn crash_response(&mut self, amount: f32, zone: usize, flag: u8, mass: f32) {
+        if flag == 0 {
+            return;
+        }
+        let mut a = amount;
+        if self.tiny {
+            a *= 2.0;
+        }
+        let (k, m) = if a > 80.0 {
+            if !self.tiny && a > 120.0 {
+                self.engine_alive = 0;
+            }
+            a *= 0.125;
+            if self.height_marker < 0.1 {
+                self.position.y += 0.1;
+            }
+            let k = (a * 0.031_25).min(2.0);
+            let m = if self.tiny { 3.0 } else { 1.2 };
+            self.velocity.y += if self.is_traffic && mass < 1.0 {
+                let t = self.rand16() as f32 * 0.05 * 1.525_878_9e-5 + 0.1;
+                mass.max(t) * a * 0.33
+            } else {
+                a * 0.333_333_34
+            };
+            self.reset_countdown = 0xC0;
+            let w = self.angular_velocity;
+            if flag == 2 && w.x.abs() < 0.5 && w.z.abs() < 0.5 {
+                let big = self.is_traffic || self.tiny;
+                let (h, v) = if big { (20.0, 10.0) } else { (5.0, 2.0) };
+                let x = self.rand16() as f32 * h * 1.525_878_9e-5 - h * 0.5;
+                let y = self.rand16() as f32 * v * 1.525_878_9e-5 - v * 0.5;
+                let z = self.rand16() as f32 * h * 1.525_878_9e-5 - h * 0.5;
+                self.angular_velocity = Vec3::new(x, y, z);
+            }
+            (k, m)
+        } else {
+            ((a * 0.031_25).min(0.33), 1.0)
+        };
+        let o = self.orientation;
+        let w = self.angular_velocity;
+        let (mut pitch, mut yaw, mut roll) = (w.dot(o.row(0)), w.dot(o.row(1)), w.dot(o.row(2)));
+        let d = m * k * 0.5;
+        pitch += if zone <= 2 { -d } else { d };
+        if (2..=4).contains(&zone) {
+            yaw += d;
+            roll += d;
+        } else {
+            yaw -= d;
+            roll -= d;
+        }
+        if flag != 2 {
+            let (sr, cr) = (roll * std::f32::consts::TAU).sin_cos();
+            let u = Vec3::new(-sr * self.half_extents.x, -cr * self.half_extents.y, 0.0);
+            self.position.y += (u.x * o.row(0).y + u.y * o.row(1).y) * 0.031_25;
+        }
+        self.angular_velocity = o.transpose() * Vec3::new(pitch, yaw, roll);
+        if flag != 2 {
+            let lim = self.ang_limit();
+            self.angular_velocity = self.angular_velocity.clamp(Vec3::splat(-lim), Vec3::splat(lim));
+        }
     }
 
     /// `Damage` 0x494500 (CONFIRMED): `a = min(amount·0.5, 100)` (the ×1.5 branch belongs to the
@@ -744,6 +1035,9 @@ impl Vehicle {
     fn tyre(&mut self, i: usize, specs: &CarSpecs) {
         let front = i < 2;
         let ai = self.traction_control;
+        let rally = self.rally;
+        let tcs = self.tcs;
+        let slip_tangent = self.slip_tangent;
         let rear_spin = self.rear_spin;
         let handbrake = self.handbrake;
         let vz = self.v_local.z;
@@ -835,13 +1129,13 @@ impl Vehicle {
         }
         w.longitudinal = d;
         // §3 friction circle
-        let lon_w = w.longitudinal.abs() * 0.9;
+        let lon_w = w.longitudinal.abs() * if rally { 0.5 } else { 0.9 };
         let lat_a = w.lateral.abs();
         let comb = lat_a.max(lon_w) + 0.25 * lat_a.min(lon_w);
         let spin = (w.longitudinal.abs() > limit && throttle_raw > 0x80) || (!front && rear_spin);
         let k = if !front && spin { 4.0 } else { k_class };
         if comb > limit && comb > 0.0 {
-            let hard = ai && (w.surface > 1 || class == 2);
+            let hard = (tcs && !front && slip_tangent.abs() < 0.15) || (ai && (w.surface > 1 || class == 2));
             if hard {
                 let s = limit / comb;
                 w.slip = 0.0;
@@ -857,10 +1151,16 @@ impl Vehicle {
                 w.longitudinal *= s;
             }
         }
-        if !front && spin {
+        if rally && front {
+            w.lateral *= 1.2;
+        }
+        if !front && spin && !tcs {
             w.slip = comb;
         }
         w.slip = w.slip.min(1.0);
+        if tcs {
+            w.slip *= 0.5;
+        }
         w.sliding = w.slip > 0.5;
         if ang != 0.0 {
             let a = -ang / 256.0 * TAU;
@@ -906,6 +1206,10 @@ impl Vehicle {
     /// angular velocity is in turns/s and is converted to rad/s the way the original does.
     /// `car+0x428` (mean of the three lowest body points) is approximated by `body_height` (MEDIUM).
     fn body_ground_collide(&mut self, specs: &CarSpecs, n: Vec3, plane_pt: Vec3, k: f32) {
+        self.body_ground_collide_mass(specs.mass, n, plane_pt, k);
+    }
+
+    fn body_ground_collide_mass(&mut self, mass: f32, n: Vec3, plane_pt: Vec3, k: f32) {
         let m = self.orientation;
         let (hw, hh, hl) = (self.half_extents.x, self.half_extents.y, self.half_extents.z);
         let (bx, by, bz) = (m.row(0), m.row(1), m.row(2));
@@ -936,8 +1240,8 @@ impl Vehicle {
             return;
         }
         let c = centroid / count as f32;
-        let inv_m = 1.0 / specs.mass.max(1.0);
-        let inv_i = 1.0 / (6.0 * specs.mass.max(1.0));
+        let inv_m = 1.0 / mass.max(1.0);
+        let inv_i = 1.0 / (6.0 * mass.max(1.0));
         let mut w = self.angular_velocity * TAU; // rad/s
         let r = c - self.position;
         let v_c = self.velocity + w.cross(r);
@@ -975,10 +1279,12 @@ impl Vehicle {
         for wh in &mut self.wheels {
             wh.world_pos += n * lift;
         }
-        // ClampAngVel 0x4964D0: each component to ±0.75 turns/s for a normal car
-        self.angular_velocity = (w / TAU).clamp(Vec3::splat(-0.75), Vec3::splat(0.75));
+        // ClampAngVel 0x4964D0: each component to ±0.75 turns/s for a normal car, ±2.25 for a
+        // `.TINYCAR` (0x4964E0…0x4964EC, `[0x5B49C0]`)
+        let lim = self.ang_limit();
+        self.angular_velocity = (w / TAU).clamp(Vec3::splat(-lim), Vec3::splat(lim));
         let effect = 4.0 * self.velocity.dot(n).abs();
-        self.damage_by_normal(effect, n);
+        self.damage_by_normal(effect, n, 0, mass);
     }
 
     /// `Susp_update` 0x499A70 + `Car_ground` 0x49BD40 (CONFIRMED, `RE/notes/suspension-collision.md` §3–4).
@@ -1001,7 +1307,8 @@ impl Vehicle {
             let hit = grid.ground(probe.x, probe.y + 4.0, probe.z, 8.0 + 4.0);
             let h_i = match hit {
                 Some(h) if h.surface & 0xF != 0 && (h.point.y - self.position.y).abs() < 4.0 => {
-                    self.wheels[i].surface = (h.surface as usize) & 0xF;
+                    let surface = (h.surface as usize) & 0xF;
+                    self.wheels[i].surface = if self.rally && (surface == 1 || surface == 10) { 2 } else { surface };
                     h.point.y
                 }
                 _ => self.ground_h,
@@ -1031,7 +1338,8 @@ impl Vehicle {
             if d_i < -0.2041667 {
                 w.airborne = true;
                 n_air += 1;
-                susp_y[i] = v_y * 0.8;
+                // `.TINYCAR` keeps the whole of it (0x49A01B skips the ×0.8)
+                susp_y[i] = if self.tiny { v_y } else { v_y * 0.8 };
             } else {
                 w.airborne = false;
                 susp_y[i] = v_y;
@@ -1058,14 +1366,16 @@ impl Vehicle {
             self.dive *= 0.5;
             self.roll_lp *= 0.5;
         } else if n_air < 4 {
-            let div = 8.0;
+            // 8, or 4 for `.TINYCAR` (0x49A438…0x49A44A)
+            let div = if self.tiny { 4.0 } else { 8.0 };
             let w_body = m * self.angular_velocity; // (pitch, yaw, roll) rates in body axes
             let p_in = ((susp_y[2] + susp_y[3]) - (susp_y[0] + susp_y[1])) / div;
             let a_l = self.accel_local.z;
-            self.dive = 0.8 * self.dive + specs.dive_gain * a_l * if a_l > 0.0 { 0.125 } else { 0.175 };
+            // `.TINYCAR` takes the gain unfiltered (0x49A522…0x49A53E, 0x49A647…0x49A655)
+            self.dive = if self.tiny { specs.dive_gain * a_l } else { 0.8 * self.dive + specs.dive_gain * a_l * if a_l > 0.0 { 0.125 } else { 0.175 } };
             let p = (p_in - self.dive).clamp(-specs.pitch_clamp, specs.pitch_clamp);
             let r_in = ((susp_y[1] + susp_y[3]) - (susp_y[0] + susp_y[2])) / div;
-            self.roll_lp = 0.8 * self.roll_lp + 0.25 * specs.roll_gain * self.accel_local.x;
+            self.roll_lp = if self.tiny { specs.roll_gain * self.accel_local.x } else { 0.8 * self.roll_lp + 0.25 * specs.roll_gain * self.accel_local.x };
             let rr = (r_in + (1.0 - self.throttle * 254.0 / 1275.0) * self.roll_lp).clamp(-specs.roll_clamp, specs.roll_clamp);
             let wp = (0.925 * specs.pitch_ret * w_body.x + p).clamp(-0.75, 0.75);
             let wr = (specs.roll_ret * w_body.z + rr).clamp(-0.75, 0.75);
@@ -1088,7 +1398,9 @@ impl Vehicle {
         // ---- Car_ground 0x49BD40 (upright branch; tilted cars are damped instead of the body impulse) ----
         let dh = (h - self.ground_h) * 32.0;
         self.ground_h = h;
-        if self.min_height > 0.005 {
+        // 0x49BE59…0x49BE8B: gravity while the lowest point is off the ground (`car+0x428` past
+        // `[0x5B2738]`) — and always for a `.TINYCAR` (0x49BE75)
+        if self.min_height > 0.005 || self.tiny {
             self.velocity.y -= GRAVITY / 32.0 * self.gravity_scale;
         }
         let closing = dh - self.velocity.y;
@@ -1115,6 +1427,10 @@ impl Vehicle {
             // tilted car with the body on the ground: the impulse of §6.3 instead of plain damping
             let plane_pt = Vec3::new(self.position.x, h, self.position.z);
             self.body_ground_collide(specs, self.ground_normal, plane_pt, SURFACE_BOUNCE[surf][0]);
+            // 0x49C005…0x49C01B: left upside down by the contact, the car is dead
+            if self.cos_tilt < 0.0 {
+                self.engine_alive = 0;
+            }
         }
         let n = self.ground_normal;
         let mut z = self.orientation.row(2);
@@ -1236,9 +1552,15 @@ impl Vehicle {
             self.velocity += acc * DT32;
             self.angular_velocity.x += angacc.x * DT32;
             self.angular_velocity.z += angacc.z * DT32;
-            self.angular_velocity.y += angacc.y * (1.0 / 48.0);
+            // the yaw step is 1/48 of the angular acceleration, 1/32 for `.TINYCAR` (0x49FAD4)
+            self.angular_velocity.y += angacc.y * if self.tiny { 1.0 / 32.0 } else { 1.0 / 48.0 };
             self.lateral_filtered = 0.25 * fx + 0.75 * self.lateral_filtered;
             self.long_filtered = 0.9 * self.long_filtered + 0.1 * self.accel_local.z;
+            // 0x49FB3A: under `RALLY` the velocity loses `0.002 · min(|car+0xDC0|, 5)` of itself
+            // each step (0x532360 over `car+0x33C`, `[0x5B2400]` 5, `[0x5B4A30]` 0.002)
+            if self.rally {
+                self.velocity *= 1.0 - 0.002 * self.slip_tangent.abs().min(5.0);
+            }
             // **Coast yaw damping / handbrake — both conditions were inverted, 2026-09-21.**
             // 0x49FBE5 loads the speed and compares it with `[0x5B2408]` = 30.0; 0x49FBF3's
             // `test ah,1; je` **bails** when `speed >= 30`, so the damping is a *low*-speed
@@ -1270,6 +1592,7 @@ impl Vehicle {
 
     /// 64 Hz integration (`0x49B7A0` / `0x49B8E0`) and wheel rotation (`0x4A2790`).
     pub fn step64(&mut self, specs: &CarSpecs) {
+        self.game_tick = self.game_tick.saturating_add(1);
         self.position += self.velocity * DT64;
         let w = self.angular_velocity * DT64; // turns
         // 0x49B8E0 builds three axis rotations and multiplies them **X, then Y, then Z**:
@@ -1337,7 +1660,8 @@ impl Vehicle {
             }
             self.velocity += n * (1.1 * j);
             self.position += push;
-            self.damage_by_normal(3.0 * j, n);
+            // the collision mass only matters to a traffic car, which never runs this collider
+            self.damage_by_normal(3.0 * j, n, 1, 0.0);
             for w in &mut self.wheels {
                 w.world_pos += push;
             }
@@ -1355,6 +1679,177 @@ impl Vehicle {
         hit
     }
 
+    /// `Car_propPass` 0x498DE0: the props whose AABB meets the car's position ± 5 m (0x473870 with
+    /// 0x486510 — the tree query's 3 m leaf search is not reproduced, every prop is tried), each
+    /// through 0x498280 — `|d·x| ≤ r + hx` and `|d·fwd| ≤ r + hz` for `d` the x-z offset to its
+    /// centre — and then its slot 8 (0x487290) on the car's velocity `car+0x33C`: **2** (solid, and
+    /// every prop without pieces) takes the cylinder's push 0x498AA0 or the box's 0x498690; **1**,
+    /// the hit that starts a breakable's pieces (`Breakable::answer` on `tick`, the game tick), is
+    /// the event `car+0x438 = 0x50000 | car+0x44C` with `car+0x430 = 15` at the car's position
+    /// (0x498F21…0x498F56) and no push; **0** (its pieces started) lets the car through. The
+    /// answer is the last hit's impact and its class — the event word `0x50000 | class` the sound
+    /// takes (0x498DAD, 0x498A3B); for a start the class is `car+0x44C`, which only the smackable
+    /// setup 0x4A12D7…0x4A136D writes, so a racing car's is 0 (MEDIUM: its allocation's zero). Not
+    /// carried: the `car+0x43C` hold that skips the pass (its writer is not read).
+    pub fn collide_props(&mut self, props: &[crate::props::Prop], tick: u32) -> Option<(f32, u32)> {
+        let mut hit = None;
+        for p in props {
+            if !p.near(self.position, 5.0) {
+                continue;
+            }
+            let c = p.centre();
+            let d = Vec3::new(c.x - self.position.x, 0.0, c.z - self.position.z);
+            let (bx, bz) = (self.orientation.row(0), self.orientation.row(2));
+            let r = p.radius();
+            if d.dot(bx).abs() > r + self.half_extents.x || d.dot(bz).abs() > r + self.half_extents.z {
+                continue;
+            }
+            match p.breakable.as_ref().map_or(2, |b| b.answer(tick, self.velocity)) {
+                2 => {}
+                1 => {
+                    self.impact = self.impact.max(15.0);
+                    hit = Some((15.0, 0));
+                    continue;
+                }
+                _ => continue,
+            }
+            let before = self.impact;
+            self.impact = 0.0;
+            let touched = match &p.shape {
+                crate::props::PropShape::Cylinder { radius } => self.prop_cylinder(c, *radius),
+                crate::props::PropShape::Box { corners, .. } => self.prop_box(corners),
+            };
+            if touched {
+                hit = Some((self.impact, p.class));
+            }
+            self.impact = self.impact.max(before);
+        }
+        hit
+    }
+
+    /// 0x498AA0: `d = car − centre` in 3D (nothing under 0.01), `n = d/|d|`; the car's reach along
+    /// `n` is `min(hx / |n·x|, hz / |n·fwd|)` (10 for an axis within 0.1 of square); when the reach
+    /// plus the radius exceeds the x-z distance, the solid hit 0x498380 with the object's surface
+    /// point `centre + n·R` and the car's `pos − n·reach` — the normal turned round first when the
+    /// car is past 5 m/s (`car+0x35C`), its heading within 60° of `n` and the reach under 0.75.
+    fn prop_cylinder(&mut self, c: Vec3, radius: f32) -> bool {
+        let d = self.position - c;
+        if d.length() <= 0.01 {
+            return false;
+        }
+        let mut n = d.normalize();
+        let dist = Vec3::new(d.x, 0.0, d.z).length();
+        let (bx, bz) = (self.orientation.row(0), self.orientation.row(2));
+        let ax = n.dot(bx).abs();
+        let rx = if ax > 0.1 { self.half_extents.x / ax } else { 10.0 };
+        let az = n.dot(bz).abs();
+        let rz = if az > 0.1 { self.half_extents.z / az } else { 10.0 };
+        let reach = rx.min(rz);
+        if reach + radius <= dist {
+            return false;
+        }
+        if self.horizontal_speed() > 5.0 && self.velocity.normalize_or_zero().dot(n) > 0.5 && reach < 0.75 {
+            n = -n;
+        }
+        let a = c + n * radius;
+        let b = self.position - n * reach;
+        self.solid_hit(n, a, b);
+        true
+    }
+
+    /// 0x498690: the car's footprint edges in x-z — corners `pos ± hz·fwd ± hx·right` in the order
+    /// `+F−R`, `+F+R`, `−F−R`, `−F+R`, edges (2,0), (0,1), (1,3), (3,2) (`0x5D0B6C`) — against the
+    /// box (0x486FB0): two crossings take the crossing's point and normal at once; one takes the
+    /// deepest of the car's body points behind it, `−(p − point)·n` above −0.01, when that is
+    /// under the best so far (from 999) and under `max(0.1, 0.125·car+0x35C)`. The contact goes to
+    /// `BodyGroundCollide` 0x496610 with `k = 0.1`.
+    fn prop_box(&mut self, corners: &[Vec3; 4]) -> bool {
+        let (f, r) = (self.orientation.row(2) * self.half_extents.z, self.orientation.row(0) * self.half_extents.x);
+        let flat = |v: Vec3| Vec3::new(v.x, 0.0, v.z);
+        let p = [flat(self.position + f - r), flat(self.position + f + r), flat(self.position - f - r), flat(self.position - f + r)];
+        let limit = (self.horizontal_speed() * 0.125).max(0.1);
+        let mut best_depth = 999.0f32;
+        let mut contact: Option<(Vec3, Vec3)> = None;
+        let mt = self.orientation.transpose();
+        let body: Vec<Vec3> = self.body_points.iter().map(|q| self.position + mt * *q).collect();
+        for (a, b) in [(2usize, 0usize), (0, 1), (1, 3), (3, 2)] {
+            let (count, point, n) = crate::props::box_edge_test(corners, p[a], p[b]);
+            if count > 1 {
+                contact = Some((point, n));
+                break;
+            }
+            if count == 1 {
+                let mut d = -99.0f32;
+                for q in &body {
+                    let v = -(*q - point).dot(n);
+                    if v > -0.01 && v > d {
+                        d = v;
+                    }
+                }
+                if d < best_depth && d > -0.01 && d < limit {
+                    best_depth = d;
+                    contact = Some((point, n));
+                }
+            }
+        }
+        let Some((point, n)) = contact else { return false };
+        self.body_ground_collide_mass(self.sim_mass, n, point, 0.1);
+        true
+    }
+
+    /// 0x498380, the solid hit: `m = n·((a − b)·n)` moves the car and its wheels' x and z; the impact
+    /// `car+0x430 = |3·(v·n)|`; the velocity gains `32·m` and, when that raises the horizontal
+    /// estimate past the old `car+0x35C`, it and the impact are scaled back by the ratio; WallSpin
+    /// 0x493F10 and PostHit 0x493E40 as the wall collider has them; past 10 `Damage(…, zone, 1)`
+    /// with the zone from `z = n·fwd`, `x = n·right` (0x4985A7…0x49867A).
+    fn solid_hit(&mut self, n: Vec3, a: Vec3, b: Vec3) {
+        let m = n * (a - b).dot(n);
+        self.position += m;
+        for w in &mut self.wheels {
+            w.world_pos.x += m.x;
+            w.world_pos.z += m.z;
+        }
+        let old = self.horizontal_speed();
+        let vclose = -self.velocity.dot(n);
+        let mut impact = (3.0 * vclose).abs();
+        self.velocity += m * 32.0;
+        let new = self.horizontal_speed();
+        if new > 0.0 {
+            let k = old / new;
+            if k < 1.0 {
+                self.velocity *= k;
+                impact *= k;
+            }
+        }
+        if !(vclose >= 15.0 && self.v_local.z >= 20.0) {
+            let side = n.dot(self.orientation.row(0));
+            let spin = 0.25 * vclose.abs().min(side.abs());
+            self.angular_velocity.y = -spin * side.signum() * self.v_local.z.signum();
+        }
+        self.velocity *= 0.998;
+        self.impact = self.impact.max(impact);
+        if impact > 10.0 {
+            let (z, x) = (n.dot(self.orientation.row(2)), n.dot(self.orientation.row(0)));
+            let zone = if z < -0.95 {
+                1
+            } else if z > 0.95 {
+                5
+            } else if x < -0.95 {
+                3
+            } else if x > 0.95 {
+                7
+            } else if z < 0.0 {
+                if x < 0.0 { 0 } else { 2 }
+            } else if x < 0.0 {
+                6
+            } else {
+                4
+            };
+            self.damage_zone(impact, zone);
+            self.crash_response(impact, zone, 1, 0.0);
+        }
+    }
+
     /// Reset onto the track at a slice pose (the game's "reset car" 0x40F540 mode 3 — placement only,
     /// the original's exact conditions are not reproduced).
     pub fn reset_to(&mut self, position: Vec3, orientation: Mat3) {
@@ -1365,10 +1860,50 @@ impl Vehicle {
         self.angular_velocity = Vec3::ZERO;
         self.rpm = 0.0;
         self.gear = if self.automatic { 2 } else { 1 };
+        self.requested_gear = self.gear;
         self.shift_timer = 0;
         for w in &mut self.wheels {
             *w = Wheel::default();
         }
+        self.rearm_after_reset();
+        // 0x40F59D: every reset clears the crash countdown
+        self.reset_countdown = 0;
+    }
+
+    /// 0x40F740's countdown (0x40FB13…0x40FBA2, 32 Hz, every car but traffic): while it runs it
+    /// loses a tick, eight more off the road surface (`car+0x464 == 0`); an upright car
+    /// (`car+0x3A0 > 0.75`) that is alive stops it, otherwise at zero the car is reset to its
+    /// slice (`0x40F540(car, 0, 0)`) — the `true` returned, and the caller resets the car before
+    /// [`Self::reset_countdown_start`] runs, as the original's start test reads the new pose.
+    /// `off_surface` is the caller's.
+    pub fn reset_countdown_tick(&mut self, off_surface: bool) -> bool {
+        let mut reset = false;
+        if self.reset_countdown > 0 {
+            self.reset_countdown -= 1;
+            if off_surface {
+                self.reset_countdown -= 8;
+            }
+            if self.cos_tilt > 0.75 && self.engine_alive != 0 {
+                self.reset_countdown = 0;
+            } else if self.reset_countdown <= 0 {
+                reset = true;
+            }
+        }
+        reset
+    }
+
+    /// 0x40FB6D…0x40FBA2: while the countdown is not running it starts at 0xC0 when the car's up
+    /// is less than 0.1 along the slice's (`car+0x370 · car+0x3C4`) or the car is off the surface.
+    pub fn reset_countdown_start(&mut self, slice_up: Vec3, off_surface: bool) {
+        if self.reset_countdown <= 0 && (self.orientation.row(1).dot(slice_up) < 0.1 || off_surface) {
+            self.reset_countdown = 0xC0;
+        }
+    }
+
+    /// The alive count's part of 0x49E220, which every reset through 0x40F540 runs (0x40F694):
+    /// 60 when the car was alive, 1 when it was dead (0x49E31E…0x49E3E5).
+    pub fn rearm_after_reset(&mut self) {
+        self.engine_alive = if self.engine_alive != 0 { 0x3C } else { 1 };
     }
 
     /// Re-orthonormalise the orientation (every 32 ticks in the original, 0x4A4810).
@@ -1545,68 +2080,228 @@ pub fn draft_factor(position: Vec3, forward: Vec3, forward_speed: f32, others: &
     1.0 - best
 }
 
-fn flat(v: Vec3) -> Vec3 {
-    Vec3::new(v.x, 0.0, v.z).normalize_or_zero()
+/// The broad phase in front of the pair test (0x498FF0, 0x499077…0x499101): each of `|Δy|`, `|Δx|`
+/// and `|Δz|` under the sum of the two bounding radii `car+0x3B4` — `|car+0x3A8…+0x3B0|`, the half
+/// extents' length (0x44519A, 0x49B5CD).
+fn near(a: &Vehicle, b: &Vehicle) -> bool {
+    let r = a.half_extents.length() + b.half_extents.length();
+    let d = (b.position - a.position).abs();
+    d.y < r && d.x < r && d.z < r
 }
 
-/// The footprint overlap: the shallowest of the four axes, and the normal pointing from `a` to `b`.
+/// The face centres `0x496FD0` samples, in its order (0x497006…0x497103).
+const FACES: [Vec3; 6] = [Vec3::X, Vec3::Y, Vec3::Z, Vec3::NEG_X, Vec3::NEG_Y, Vec3::NEG_Z];
+/// And the corners (0x497113…0x4971EB, 0x4975EE…0x4976C6).
+const CORNERS: [Vec3; 8] = [
+    Vec3::new(1.0, 1.0, 1.0),
+    Vec3::new(1.0, 1.0, -1.0),
+    Vec3::new(1.0, -1.0, 1.0),
+    Vec3::new(1.0, -1.0, -1.0),
+    Vec3::new(-1.0, 1.0, 1.0),
+    Vec3::new(-1.0, 1.0, -1.0),
+    Vec3::new(-1.0, -1.0, 1.0),
+    Vec3::new(-1.0, -1.0, -1.0),
+];
+
+/// `0x496FD0(A, B, &point, &normal)` — whether the two bodies' boxes (`car+0x330` centred, rows
+/// `car+0x364…`, half extents `car+0x3A8…`) overlap, and if so where and along what: **28 point
+/// tests**, the first hit deciding.
 ///
-/// The original tests in three dimensions and by **sampling**, not by a separating axis:
-/// `0x496FD0` runs each box's six face centres and eight corners against the other box —
-/// `0x495600` and `0x495890` for the face centres, `0x495B30` and `0x495D30` for the corners,
-/// twenty-eight point tests in all — against the basis `0x497B10` sets up in `0x628F08 …`. This
-/// port keeps its own two-dimensional test, which is stricter in the plane and blind to the
-/// height the original's would catch; that is the standing **APPROXIMATION**.
-fn footprint_overlap(a: &Vehicle, b: &Vehicle) -> Option<(f32, Vec3)> {
-    // pre-test 0x498FF0: axis-aligned distance against the sum of the bounding radii
-    let r_a = a.half_extents.x.max(a.half_extents.z);
-    let r_b = b.half_extents.x.max(b.half_extents.z);
+/// 1. B's six face centres against A (0x495600): the point is the face centre, the normal B's
+///    face normal.
+/// 2. A's six against B (0x495890): A's face normal **negated** (0x4959DC).
+/// 3. B's eight corners against A (0x495B30), then 4. A's eight against B (0x495D30): the point
+///    is the corner; the normal is one of the other box's axes. When the bodies' velocities
+///    differ by more than 15 m/s on some axis (`[0x5B243C]`, 0x4971FB…0x497297) it is the axis —
+///    each turned to face away from the corner's side — most aligned with the corner owner's
+///    velocity (0x4972A7…0x4974C3); otherwise the axis of least penetration `h − |q|`, turned the
+///    same way (0x4974C4…0x4975EC, 0x497ACD).
+///
+/// A point is inside when every coordinate is within the half extent, both ends inclusive. The
+/// normal always points from B toward A, which is the way `0x496860` wants it.
+pub(crate) fn box_contact(a: &Vehicle, b: &Vehicle) -> Option<(Vec3, Vec3)> {
+    let ra = [a.orientation.row(0), a.orientation.row(1), a.orientation.row(2)];
+    let rb = [b.orientation.row(0), b.orientation.row(1), b.orientation.row(2)];
+    let (ha, hb) = (a.half_extents, b.half_extents);
     let d = b.position - a.position;
-    if d.x.abs() >= r_a + r_b || d.z.abs() >= r_a + r_b || d.y.abs() >= a.half_extents.y + b.half_extents.y + 0.5 {
-        return None;
-    }
-    let axes = [flat(a.orientation.row(0)), flat(a.orientation.row(2)), flat(b.orientation.row(0)), flat(b.orientation.row(2))];
-    let ext = |v: &Vehicle, axis: Vec3| -> f32 { (flat(v.orientation.row(0)).dot(axis) * v.half_extents.x).abs() + (flat(v.orientation.row(2)).dot(axis) * v.half_extents.z).abs() };
-    let mut best: Option<(f32, Vec3)> = None;
-    for axis in axes {
-        if axis.length_squared() < 1e-6 {
-            continue;
-        }
-        let dist = d.dot(axis);
-        let overlap = ext(a, axis) + ext(b, axis) - dist.abs();
-        if overlap <= 0.0 {
-            return None;
-        }
-        if best.is_none_or(|(o, _)| overlap < o) {
-            best = Some((overlap, if dist >= 0.0 { axis } else { -axis }));
+    // a point of B's box (`s` in B's unit coordinates) in A's frame, and the other way round
+    let b_in_a = |s: Vec3| -> Vec3 {
+        let p = rb[0] * (hb.x * s.x) + rb[1] * (hb.y * s.y) + rb[2] * (hb.z * s.z) + d;
+        Vec3::new(p.dot(ra[0]), p.dot(ra[1]), p.dot(ra[2]))
+    };
+    let a_in_b = |s: Vec3| -> Vec3 {
+        let p = ra[0] * (ha.x * s.x) + ra[1] * (ha.y * s.y) + ra[2] * (ha.z * s.z) - d;
+        Vec3::new(p.dot(rb[0]), p.dot(rb[1]), p.dot(rb[2]))
+    };
+    let inside = |q: Vec3, h: Vec3| q.x.abs() <= h.x && q.y.abs() <= h.y && q.z.abs() <= h.z;
+    let world = |pos: Vec3, r: &[Vec3; 3], h: Vec3, s: Vec3| pos + r[0] * (h.x * s.x) + r[1] * (h.y * s.y) + r[2] * (h.z * s.z);
+    for s in FACES {
+        if inside(b_in_a(s), ha) {
+            return Some((world(b.position, &rb, hb, s), rb[0] * s.x + rb[1] * s.y + rb[2] * s.z));
         }
     }
-    best
+    for s in FACES {
+        if inside(a_in_b(s), hb) {
+            return Some((world(a.position, &ra, ha, s), -(ra[0] * s.x + ra[1] * s.y + ra[2] * s.z)));
+        }
+    }
+    // the corner's normal: `axes` the other box's rows, `q` the corner in its frame, `flip` the
+    // side rule (B's corner: an axis is turned where `q > 0`; A's: where `q < 0`), `v` the corner
+    // owner's velocity
+    let fast = {
+        let dv = (b.velocity - a.velocity).abs();
+        dv.max_element() > 15.0
+    };
+    let corner_normal = |axes: &[Vec3; 3], q: Vec3, h: Vec3, flip: &dyn Fn(f32) -> bool, v: Vec3| -> Vec3 {
+        let q = q.to_array();
+        let turned: [Vec3; 3] = std::array::from_fn(|i| if flip(q[i]) { -axes[i] } else { axes[i] });
+        if fast {
+            let dots: [f32; 3] = std::array::from_fn(|i| turned[i].dot(v).abs());
+            let k = if dots[0] > dots[1] && dots[0] > dots[2] {
+                0
+            } else if dots[1] > dots[2] {
+                1
+            } else {
+                2
+            };
+            turned[k]
+        } else {
+            let h = h.to_array();
+            let p: [f32; 3] = std::array::from_fn(|i| h[i] - q[i].abs());
+            let k = if p[0] < p[1] && p[0] < p[2] {
+                0
+            } else if p[1] < p[2] {
+                1
+            } else {
+                2
+            };
+            turned[k]
+        }
+    };
+    for s in CORNERS {
+        let q = b_in_a(s);
+        if inside(q, ha) {
+            return Some((world(b.position, &rb, hb, s), corner_normal(&ra, q, ha, &|x| x > 0.0, b.velocity)));
+        }
+    }
+    for s in CORNERS {
+        let q = a_in_b(s);
+        if inside(q, hb) {
+            return Some((world(a.position, &ra, ha, s), corner_normal(&rb, q, hb, &|x| x < 0.0, a.velocity)));
+        }
+    }
+    None
 }
 
 /// `0x497B10` runs its separation up to this many times.
 const SEPARATION_PASSES: usize = 0x20;
 
+/// `0x497B10(A, B, &point, &normal)`: up to 32 passes (0x497D42…0x4980B7) of `0x496FD0`; while
+/// the boxes overlap both bodies move by the pass's push, and the first overlap fixes the push
+/// (0x497E03): with a horizontal closing speed `|vA − vB|` over **60 m/s** (`[0x5B49CC]` = 3600 on
+/// the squares) and either the centres within √0.05 of each other or the closing direction
+/// within `acos 0.85` of the line to B, each body backs up along its **own** velocity by
+/// `v / (32 · |vA − vB|)` (0x497E4B…0x497FC0); otherwise the two move apart along the line of
+/// centres, A by `mB / (mA + mB) / 32`, B by `mA / (mA + mB) / 32` (0x497FC5…0x498079). The
+/// contact is the last overlapping pass's; none when the first pass finds the boxes clear.
+fn separate(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32) -> Option<(Vec3, Vec3)> {
+    let mut contact = None;
+    let (mut push_a, mut push_b) = (Vec3::ZERO, Vec3::ZERO);
+    for _ in 0..SEPARATION_PASSES {
+        let Some(c) = box_contact(a, b) else { break };
+        if contact.is_none() {
+            let dv = a.velocity - b.velocity;
+            let d = b.position - a.position;
+            let along = if dv.x * dv.x + dv.z * dv.z > 3600.0 {
+                if d.x * d.x + d.z * d.z < 0.05 {
+                    true
+                } else {
+                    d.normalize_or_zero().dot(dv.normalize_or_zero()) > 0.85
+                }
+            } else {
+                false
+            };
+            if along {
+                let s = dv.length() * 0.5;
+                let k = -(if s == 0.0 { 1.0 } else { 0.5 / s });
+                push_a = a.velocity * k * 0.031_25;
+                push_b = b.velocity * k * 0.031_25;
+            } else {
+                let n = d.normalize_or_zero();
+                let sum = mass_a + mass_b;
+                push_a = n * (mass_b / sum) * -0.031_25;
+                push_b = n * (mass_a / sum) * 0.031_25;
+            }
+        }
+        contact = Some(c);
+        a.position += push_a;
+        b.position += push_b;
+        for w in &mut a.wheels {
+            w.world_pos += push_a;
+        }
+        for w in &mut b.wheels {
+            w.world_pos += push_b;
+        }
+    }
+    contact
+}
+
+/// `CarPair_collide` 0x4980D0 without the walls: see [`collide_cars_with`].
 pub fn collide_cars(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32) -> Option<f32> {
-    let (depth, n) = footprint_overlap(a, b)?;
-    // `CarCarImpulse` 0x496860 (`RE/notes/traffic.md` §21.6), symmetric and with no special case for
-    // traffic. The contact point the original gets from its SAT is not recovered, so the midpoint of
-    // the two centres stands in for it (APPROXIMATION) — which is also what the original uses for the
-    // effect position. The solver works in rad/s, so the stored turns/s angular velocities are scaled
-    // by 2π around it exactly as 0x498FF0 does.
+    collide_cars_with(a, mass_a, b, mass_b, &mut |_| {})
+}
+
+/// `CarPair_collide` 0x4980D0: the separation (`0x497B10`); only when the boxes overlapped,
+/// `CarCarImpulse` 0x496860 at the contact point and normal it left (`RE/notes/traffic.md` §21.6),
+/// then each car's walls (`walls`, 0x495020) — A's, then B's (0x49810E…0x498126); then up to **four**
+/// more rounds (`ebx = 4`, 0x49810F): separate again, and while the boxes still overlap and the
+/// impulse still acts (0x496860 returns 0 on a separating pair, 0x498164), the walls again
+/// (0x49816C…0x49817F). The answer is the last impulse's effect (`car+0x430` is overwritten by each).
+/// Not carried: the props test 0x498DE0 beside each wall call (this port's props are the skill
+/// test's cones, handled on their own).
+pub fn collide_cars_with(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, walls: &mut dyn FnMut(&mut Vehicle)) -> Option<f32> {
+    if !near(a, b) {
+        return None;
+    }
+    let (pt, ni) = separate(a, mass_a, b, mass_b)?;
+    // the first impulse's answer is not tested (0x498109 → 0x49810E): the walls follow regardless
+    let mut effect = pair_impulse(a, mass_a, b, mass_b, pt, ni).unwrap_or(0.0);
+    walls(a);
+    walls(b);
+    for _ in 0..4 {
+        let Some((pt, ni)) = separate(a, mass_a, b, mass_b) else { break };
+        let Some(e) = pair_impulse(a, mass_a, b, mass_b, pt, ni) else { break };
+        effect = e;
+        walls(a);
+        walls(b);
+    }
+    // ClampAngVel 0x4964D0 once the pair is done — 0x498FF0 calls it for both cars when 0x4980D0
+    // returns (0x499152 / 0x499158)
+    let clamp = |w: Vec3, lim: f32| w.clamp(Vec3::splat(-lim), Vec3::splat(lim));
+    a.angular_velocity = clamp(a.angular_velocity, a.ang_limit());
+    b.angular_velocity = clamp(b.angular_velocity, b.ang_limit());
+    Some(effect)
+}
+
+/// `CarCarImpulse` 0x496860 at `pt` along `ni` (from B toward A); `None` when the pair is
+/// separating (`j < 0`, 0x4969DF) and nothing happens.
+fn pair_impulse(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, pt: Vec3, ni: Vec3) -> Option<f32> {
+    // `CarCarImpulse` 0x496860, symmetric and with no special case for traffic; the solver works in
+    // rad/s, so the stored turns/s angular velocities are scaled by 2π around it exactly as 0x498FF0
+    // does. `ni` points from B toward A.
+    let n = -ni;
     let (inv_a, inv_b) = (1.0 / mass_a.max(1.0), 1.0 / mass_b.max(1.0));
     let (inv6_a, inv6_b) = (inv_a / 6.0, inv_b / 6.0);
-    let pt = (a.position + b.position) * 0.5;
     let (r_a, r_b) = (pt - a.position, pt - b.position);
-    // the SAT above returns the normal pointing from A to B; the solver's `n` points the other way
-    let ni = -n;
     let (c_a, c_b) = (r_a.cross(ni), r_b.cross(ni));
     let (w_a, w_b) = (a.angular_velocity * TAU, b.angular_velocity * TAU);
     let vrel = b.velocity.dot(ni) - a.velocity.dot(ni) - w_a.dot(c_a) + w_b.dot(c_b);
     let den = 0.5 * (c_a.length_squared() * inv6_a + c_b.length_squared() * inv6_b + inv_b + inv_a);
-    let mut effect = 0.0;
     let j = if den > 1e-9 { vrel / den } else { 0.0 };
-    if j >= 0.0 {
+    if j < 0.0 {
+        return None;
+    }
+    {
         let jj = j * 0.5;
         let imp = ni * jj;
         // impact magnitude 0x430: `min(4·|Δv|, |vclose·(mA+mB)|/m)`, floored at 9 when the other body
@@ -1616,56 +2311,23 @@ pub fn collide_cars(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32) 
         let sp = 4.0 * (a.velocity - b.velocity).length();
         let eff_a = if mass_b > 0.65 { sp.min(p.abs() * inv_a) } else { 9.0 };
         let eff_b = if mass_a > 0.65 { sp.min(p.abs() * inv_b) } else { 9.0 };
-        effect = eff_a.max(eff_b);
+        let effect = eff_a.max(eff_b);
         a.velocity += imp * inv_a * if eff_a >= 80.0 { 1.25 } else { 1.0 };
         b.velocity -= imp * inv_b * if eff_b >= 80.0 { 1.25 } else { 1.0 };
         let (t_a, t_b) = (if eff_a >= 80.0 { 3.0 } else { 1.5 }, if eff_b >= 80.0 { 3.0 } else { 1.5 });
         let w_a = w_a + r_a.cross(imp) * (t_a * inv6_a);
         let w_b = w_b - r_b.cross(imp) * (t_b * inv6_b);
-        // back to turns/s, then ClampAngVel 0x4964D0 on each component
-        let clamp = |w: Vec3| (w / TAU).clamp(Vec3::splat(-0.75), Vec3::splat(0.75));
-        a.angular_velocity = clamp(w_a);
-        b.angular_velocity = clamp(w_b);
+        // back to turns/s; `Damage`'s crash response (0x496F8E / 0x496FB9) runs on those, and
+        // the clamp waits for the whole pair (`collide_cars_with`). The damage normals keep this port's convention
+        // (A's from A toward B); which vector 0x496F38 hands 0x494DF0 was not settled — MEDIUM.
+        a.angular_velocity = w_a / TAU;
+        b.angular_velocity = w_b / TAU;
         a.impact = a.impact.max(eff_a);
         b.impact = b.impact.max(eff_b);
-        a.damage_by_normal(eff_a, n);
-        b.damage_by_normal(eff_b, -n);
+        a.damage_by_normal(eff_a, n, 2, mass_a);
+        b.damage_by_normal(eff_b, -n, 2, mass_b);
+        Some(effect)
     }
-    // `0x497B10`: **up to 32 passes**. Each one recomputes the delta (`0x532330`), puts it in both
-    // bodies' frames with six dot products, asks whether the boxes still overlap and, if they do,
-    // moves both positions (`car+0x330`) apart through `0x532300`; it stops the moment they are
-    // clear. A single push, which is what this used to do, leaves a deeply interlocked pair still
-    // touching — the first pass here is that same push, and the rest are what the original adds.
-    //
-    // **What is not resolved:** the size of one pass. The original scales its move by a stack value
-    // and then by `1/32` (0x498059), and the two bodies get vectors built from separate slots whose
-    // magnitudes were not traced. This port moves the measured depth each pass, split by mass, and
-    // re-measures — which separates, and separates by as little as the overlap demands.
-    let share_a = inv_a / (inv_a + inv_b);
-    let (mut depth, mut n) = (depth, n);
-    for _ in 0..SEPARATION_PASSES {
-        let d = b.position - a.position;
-        let dir = flat(d);
-        let dir = if dir.length_squared() < 1e-6 { n } else { dir };
-        let push = depth * 1.01;
-        let (da, db) = (dir * (push * share_a), dir * (push * (1.0 - share_a)));
-        a.position -= da;
-        b.position += db;
-        for w in &mut a.wheels {
-            w.world_pos -= da;
-        }
-        for w in &mut b.wheels {
-            w.world_pos += db;
-        }
-        match footprint_overlap(a, b) {
-            Some((o, axis)) => {
-                depth = o;
-                n = axis;
-            }
-            None => break,
-        }
-    }
-    Some(effect)
 }
 
 #[cfg(test)]
@@ -1680,28 +2342,34 @@ mod car_car_tests {
         v
     }
 
-    /// `0x497B10` keeps going until the boxes are clear. A pair dropped deeply inside each other
-    /// must come out separated, which a single push of the measured depth does not guarantee.
+    /// `0x497B10`: each pass moves the pair 1/32 m apart along the line of centres, split by mass,
+    /// until `0x496FD0` finds the boxes clear — at most 32 passes, so a deep interlock is not
+    /// cleared in one call.
     #[test]
-    fn deeply_interlocked_cars_end_up_clear() {
+    fn separation_moves_a_thirty_second_a_pass() {
         let mut a = car(Vec3::ZERO, Vec3::ZERO, 0.0);
-        let mut b = car(Vec3::new(0.15, 0.0, 0.2), Vec3::ZERO, 0.7);
-        assert!(footprint_overlap(&a, &b).is_some(), "the pair has to start overlapping");
-        collide_cars(&mut a, 1.0, &mut b, 1.0);
-        assert!(footprint_overlap(&a, &b).is_none(), "still overlapping after the separation loop");
+        let x = a.half_extents.x * 2.0 - 0.05;
+        let mut b = car(Vec3::new(x, 0.0, 0.0), Vec3::ZERO, 0.0);
+        assert!(box_contact(&a, &b).is_some(), "the pair has to start overlapping");
+        let before = b.position.x - a.position.x;
+        collide_cars(&mut a, 1.0, &mut b, 3.0);
+        assert!(box_contact(&a, &b).is_none());
+        let moved = (b.position.x - a.position.x) - before;
+        // two passes of 1/32 clear a 5 cm overlap; A (the lighter) takes three quarters of each
+        assert!((moved - 2.0 / 32.0).abs() < 1e-4, "moved {moved}");
+        assert!((a.position.x + 2.0 * 0.75 / 32.0).abs() < 1e-4, "{:?}", a.position);
     }
 
-    /// And a pair that only just touches is moved as little as it takes.
+    /// `0x496FD0`'s first hit is a face centre of B inside A, with B's face normal — here B's −x
+    /// face, pointing from B toward A.
     #[test]
-    fn a_shallow_touch_barely_moves_the_cars() {
-        let mut a = car(Vec3::ZERO, Vec3::ZERO, 0.0);
-        let x = a.half_extents.x * 2.0 - 0.01;
-        let mut b = car(Vec3::new(x, 0.0, 0.0), Vec3::ZERO, 0.0);
-        let before = (a.position, b.position);
-        collide_cars(&mut a, 1.0, &mut b, 1.0);
-        assert!(footprint_overlap(&a, &b).is_none());
-        let moved = (a.position - before.0).length() + (b.position - before.1).length();
-        assert!(moved < 0.2, "moved {moved} m to clear a 1 cm overlap");
+    fn box_contact_samples_faces_first() {
+        let a = car(Vec3::ZERO, Vec3::ZERO, 0.0);
+        let x = a.half_extents.x * 2.0 - 0.05;
+        let b = car(Vec3::new(x, 0.0, 0.0), Vec3::ZERO, 0.0);
+        let (p, n) = box_contact(&a, &b).unwrap();
+        assert!((n - Vec3::NEG_X).length() < 1e-5, "{n:?}");
+        assert!((p.x - (x - b.half_extents.x)).abs() < 1e-5, "{p:?}");
     }
 
     #[test]
@@ -1761,16 +2429,16 @@ mod damage_tests {
         let specs = tests::specs_993();
         let mut v = Vehicle::new(Vec3::ZERO, Mat3::IDENTITY, &specs, 0.8, 0.3);
         // hitting the front (normal points backwards into the car → z < −0.1 in the body frame)
-        v.damage_by_normal(60.0, Vec3::new(0.0, 0.0, -1.0));
+        v.damage_by_normal(60.0, Vec3::new(0.0, 0.0, -1.0), 0, 1.0);
         assert_eq!(v.damage[1], 30.0, "front zone takes min(60·0.5, 100)");
         assert_eq!(v.damage[0], 15.0, "ring neighbours get the mean of their neighbours");
         assert_eq!(v.damage[2], 15.0);
         assert_eq!(v.damage[5], 0.0);
         // small effects do nothing
-        v.damage_by_normal(5.0, Vec3::new(0.0, 0.0, 1.0));
+        v.damage_by_normal(5.0, Vec3::new(0.0, 0.0, 1.0), 0, 1.0);
         assert_eq!(v.damage[5], 0.0);
         // roof
-        v.damage_by_normal(300.0, Vec3::new(0.0, -1.0, 0.0));
+        v.damage_by_normal(300.0, Vec3::new(0.0, -1.0, 0.0), 0, 1.0);
         assert_eq!(v.damage[8], 100.0);
         assert!((v.damage_avg() - (30.0 + 15.0 + 15.0 + 100.0) / 10.0).abs() < 1e-4);
         assert!(v.part_damage(&specs.zone_masks.brakes) > 0.0);
@@ -1815,6 +2483,85 @@ mod body_ground_tests {
         v.body_height = 0.0;
         v.body_ground_collide(&specs, Vec3::Y, Vec3::ZERO, 0.5);
         assert!(v.damage[8] > 0.0, "roof zone damaged: {:?}", v.damage);
+    }
+
+    /// `Damage`'s crash response (0x49481A): a heavy wall hit on the front hops the car
+    /// (`a·0.125/3` on the velocity's `y`, doubled for `.TINYCAR`) and pitches it back; the
+    /// body-ground contact (flag 0) does neither; a light hit only knocks the spin.
+    #[test]
+    fn crash_response_follows_the_flag() {
+        let specs = tests::specs_993();
+        let mut v = Vehicle::new(Vec3::new(0.0, 0.5, 0.0), Mat3::IDENTITY, &specs, 0.8, 0.3);
+        v.damage_by_normal(200.0, Vec3::new(0.0, 0.0, -1.0), 0, 1.0);
+        assert_eq!(v.velocity, Vec3::ZERO);
+        assert_eq!(v.angular_velocity, Vec3::ZERO);
+        v.damage_by_normal(200.0, Vec3::new(0.0, 0.0, -1.0), 1, 1.0);
+        assert!((v.velocity.y - 200.0 * 0.125 / 3.0).abs() < 1e-3, "{:?}", v.velocity);
+        // zone 1 (front): pitch −m·k/2 with k = min(25/32, 2), m = 1.2, then clamped to 0.75
+        let k = 25.0f32 / 32.0;
+        assert!((v.angular_velocity.x + 1.2 * k * 0.5).abs() < 1e-4, "{:?}", v.angular_velocity);
+        assert!((v.angular_velocity.y + 1.2 * k * 0.5).abs() < 1e-4);
+        let mut t = Vehicle::new(Vec3::new(0.0, 0.5, 0.0), Mat3::IDENTITY, &specs, 0.8, 0.3);
+        t.tiny = true;
+        t.damage_by_normal(200.0, Vec3::new(0.0, 0.0, -1.0), 1, 1.0);
+        assert!((t.velocity.y - 400.0 * 0.125 / 3.0).abs() < 1e-3);
+        let mut l = Vehicle::new(Vec3::new(0.0, 0.5, 0.0), Mat3::IDENTITY, &specs, 0.8, 0.3);
+        l.damage_by_normal(20.0, Vec3::new(0.0, 0.0, 1.0), 1, 1.0);
+        assert_eq!(l.velocity, Vec3::ZERO);
+        // zone 5 (rear): pitch +k/2, yaw −k/2 with k = min(20/32, 0.33)
+        assert!((l.angular_velocity.x - 0.165).abs() < 1e-5, "{:?}", l.angular_velocity);
+        assert!((l.angular_velocity.y + 0.165).abs() < 1e-5);
+    }
+
+    /// 0x40F740's countdown: a heavy hit starts it; an upright live car stops it; a dead car runs
+    /// it out and is reset, and the reset re-arms the alive count at 1.
+    #[test]
+    fn crash_countdown_and_dead_car() {
+        let specs = tests::specs_993();
+        let mut v = Vehicle::new(Vec3::new(0.0, 0.5, 0.0), Mat3::IDENTITY, &specs, 0.8, 0.3);
+        v.cos_tilt = 1.0;
+        v.damage_by_normal(100.0, Vec3::new(0.0, 0.0, -1.0), 1, 1.0);
+        assert_eq!(v.reset_countdown, 0xC0);
+        assert!(v.engine_alive != 0, "100 does not kill");
+        assert!(!v.reset_countdown_tick(false));
+        assert_eq!(v.reset_countdown, 0, "upright and alive: stopped");
+        v.damage_by_normal(130.0, Vec3::new(0.0, 0.0, -1.0), 1, 1.0);
+        assert_eq!(v.engine_alive, 0, "past 120: dead");
+        let mut n = 0;
+        while !v.reset_countdown_tick(false) {
+            n += 1;
+            assert!(n < 0xC0);
+        }
+        assert_eq!(n, 0xBF);
+        v.reset_to(Vec3::ZERO, Mat3::IDENTITY);
+        assert_eq!(v.engine_alive, 1);
+        v.reset_countdown_start(Vec3::Y, false);
+        assert_eq!(v.reset_countdown, 0, "upright on the slice: no restart");
+        v.orientation = Mat3::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        v.reset_countdown_start(Vec3::Y, false);
+        assert_eq!(v.reset_countdown, 0xC0, "on its side: started");
+    }
+
+    /// 0x40F7EB's gates: not before tick 0x301, not at 27.6 on `car+0x35C`, not once finished, and
+    /// a request that goes through holds the next one off for 0xA0 passes.
+    #[test]
+    fn reset_request_gates_and_hold() {
+        let specs = tests::specs_993();
+        let mut v = Vehicle::new(Vec3::ZERO, Mat3::IDENTITY, &specs, 0.8, 0.3);
+        assert!(!v.reset_request(true, 0x300));
+        v.velocity = Vec3::new(27.6, 0.0, 0.0);
+        assert!(!v.reset_request(true, 0x400));
+        // the estimate of (20, 20) is 25, under 27.6, though the true speed is 28.3
+        v.velocity = Vec3::new(20.0, 0.0, 20.0);
+        assert!(v.reset_request(true, 0x400));
+        assert_eq!(v.reset_hold, 0x9F);
+        for _ in 0..0x9F {
+            assert!(!v.reset_request(true, 0x400));
+        }
+        assert!(v.reset_request(true, 0x400), "the hold has run out");
+        v.race_state = 2;
+        v.reset_hold = 0;
+        assert!(!v.reset_request(true, 0x400), "finished");
     }
 
     /// No body point below the plane: nothing happens.

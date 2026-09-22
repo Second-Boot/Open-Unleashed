@@ -308,9 +308,12 @@ impl SliceTable {
     /// Slice arithmetic along the main lap (wrapping), following the section chain (0x4817D0 for
     /// the lap's own junctions; branch links are not followed).
     pub fn add(&self, slice: usize, delta: i32) -> usize {
-        let n = self.lap_len as i32;
-        let p = self.route_pos.get(slice).copied().unwrap_or(0) as i32;
-        self.route[(p + delta).rem_euclid(n) as usize]
+        if self.junctions.segments.is_empty() {
+            let n = self.lap_len as i32;
+            let p = self.route_pos.get(slice).copied().unwrap_or(0) as i32;
+            return self.route[(p + delta).rem_euclid(n) as usize];
+        }
+        self.add_graph(slice, delta, None)
     }
 
     /// Load `<track>.jnc`'s branch weights. The original rejects the file unless its size is exactly

@@ -233,7 +233,7 @@ impl App {
             "Comms.PhoneNumber" => String::new(),
             // chat is carried by a message the port has not traced, so the box stays empty
             "Comms.ChatInput" => String::new(),
-            "Chronicle.Year" => career?.career.year.to_string(),
+            "Chronicle.Year" => self.chronicle_year().to_string(),
             "Graphics.Resolutions" => "640 x 480 x 16".to_string(),
             "Controller.AllControllers" | "Controller.AllPads" => {
                 let pads_only = name == "Controller.AllPads";

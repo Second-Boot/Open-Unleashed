@@ -189,6 +189,20 @@ impl CollisionSfx {
         self.play_one_shot(out, slot, level, master);
     }
 
+    /// A track prop's hit (event kind 5 with no other car, `sfx.md` §2/§4): CarBody against
+    /// `0x5CC534[class]` = WoodSign, MetalSign, Glass, WoodBox, Pylon, Tree for classes 0…5 —
+    /// groups 0x70, 0x73, 0x76, 0x79, 0x56, 0x53 — at `vol = 0x430 · 0.125 · 8` over the 1.5 gate
+    /// (0x40F740), the level as `car_car`'s.
+    pub fn prop_hit(&mut self, out: &AudioOutput, impact: f32, class: u32, master: f32) {
+        if impact <= 1.5 {
+            return;
+        }
+        let Some(base) = [0x70usize, 0x73, 0x76, 0x79, 0x56, 0x53].get(class as usize).copied() else { return };
+        let slot = self.pick(base);
+        let level = 64.0 + (impact * 6.3).clamp(2.0, 63.0);
+        self.play_one_shot(out, slot, level, master);
+    }
+
     /// Hard landing with closing speed `closing` (> 6 m/s): Tires × Asphalt, level `64 + clamp(6.3·closing, 2, 63)`.
     pub fn landing(&mut self, out: &AudioOutput, closing: f32, master: f32) {
         let slot = self.pick(GROUP_LANDING);

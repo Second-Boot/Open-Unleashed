@@ -5,6 +5,7 @@
 //! ratios, drag/brake/load-transfer/tyre/friction-circle laws). `collision` is a native
 //! triangle grid used for the ground query the original performs through its own track structures.
 pub mod collision;
+pub mod props;
 pub mod specs;
 pub mod vehicle;
 pub mod walls;

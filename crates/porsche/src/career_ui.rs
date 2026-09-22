@@ -25,6 +25,9 @@ pub struct CareerOpponent {
     pub grid: Option<u32>,
     /// `nfs5.per` id of the driver, when one was drawn for this slot (knockout, §5.2).
     pub personality: i16,
+    /// The opponent record's installed parts (`opp+0x04`, resolved through the parts table), which
+    /// 0x4ED880 puts on its FE car's `+0x758` for the race — specs, grip ratio and style overlay.
+    pub parts: Vec<Part>,
 }
 
 /// Everything the app needs to start a career event.
@@ -280,6 +283,7 @@ impl CareerUi {
                     skill,
                     grid: None,
                     personality: *per,
+                    parts: Vec::new(),
                 })
             })
             .collect();
@@ -930,6 +934,7 @@ impl CareerUi {
                             skill,
                             grid: None,
                             personality: o.driver,
+                            parts: o.parts.iter().filter_map(|id| self.tables.parts.iter().find(|p| p.id == *id).cloned()).collect(),
                         })
                     })
                     .collect();

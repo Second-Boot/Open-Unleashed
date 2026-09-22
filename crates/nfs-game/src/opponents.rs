@@ -262,6 +262,8 @@ mod tests {
         let mut e = CarCatalogEntry {
             compare: [0; 5],
             variant: 0,
+            cabrio: false,
+            stock_parts: Vec::new(),
             display_name: String::new(),
             family: String::new(),
             locale_key: String::new(),
@@ -284,6 +286,7 @@ mod tests {
             interior_colours: vec![[0, 0, 0]; 3],
             value_curve: [0.0; 51],
             age_curve_head: [0.0; 2],
+            dash: [0.0; 4],
             dial_kmh: nfs_formats::fedata::DialSpec { style: 0, total_units: 1, needle_style: 0, start_deg: 0, deg_per_unit_x1000: 0, needle_pivot: 0 },
             dial_mph: nfs_formats::fedata::DialSpec { style: 0, total_units: 1, needle_style: 0, start_deg: 0, deg_per_unit_x1000: 0, needle_pivot: 0 },
             dial_tach: nfs_formats::fedata::DialSpec { style: 0, total_units: 1, needle_style: 0, start_deg: 0, deg_per_unit_x1000: 0, needle_pivot: 0 },

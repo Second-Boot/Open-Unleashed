@@ -483,6 +483,21 @@ impl CarSpecs {
         self.inv_grip = 1.0 / self.grip;
     }
 
+    /// `.TINYCAR` (`carinfo+0x518`, the Gulliver code, cheat bit 1 — on every car but traffic,
+    /// 0x4EF46D…0x4EF489) as the `.sim` loader applies it, 0x49C9B2…0x49CA10: the wheelbase ×0.8,
+    /// the pitch and roll retentions (+0x114 / +0x118) ×`[0x5B4A24]` = 0.8333 and the grip ×1.25,
+    /// ahead of the tables that derive from them (the yaw lever, `1/grip`).
+    pub fn apply_tinycar(&mut self) {
+        let k = f32::from_bits(0x3F555555);
+        self.wheelbase *= 0.8;
+        self.pitch_ret *= k;
+        self.roll_ret *= k;
+        self.grip *= 1.25;
+        self.yaw_lever = self.wheelbase * 0.5 * 0.025 * 256.0;
+        self.inv_yaw_lever = 1.0 / self.yaw_lever;
+        self.inv_grip = 1.0 / self.grip;
+    }
+
     pub fn rebuild_tables(&mut self, automatic: bool) {
         for i in 0..8 {
             self.ratio_rpm_per_mps[i] = self.final_drive * self.gear_ratio[i] * 60.0 / self.circumference;

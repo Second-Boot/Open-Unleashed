@@ -17,6 +17,8 @@ pub struct ArticleMeshes {
     pub tag: u32,
     /// `Anim` / `Anqt` rotation track when the article has one (`RE/notes/crp-geometry.md` §7).
     pub animation: Option<nfs_formats::crp::AnimTrack>,
+    /// The article's position in the `.crp`'s article list.
+    pub index: usize,
 }
 
 /// One placement of a library article requested by a `.scn` GEOM element.
@@ -296,14 +298,14 @@ impl TrackAssets {
         let mut world = Vec::new();
         let mut library = Vec::new();
         let mut skipped = 0usize;
-        for a in &arts {
+        for (index, a) in arts.iter().enumerate() {
             let g = self.crp.article_geometry(&self.crp_data, a).map_err(fmt_err(&crp_path))?;
             let Some(lod) = g.primitives.iter().map(|p| p.lod).min() else { continue };
             let meshes = article_meshes(&g, lod, &mut skipped);
             let transform = g.transform.as_ref().map(tr_to_mat4).unwrap_or(glam::Mat4::IDENTITY);
             let (is_lib, tag) = g.base.as_ref().map(|b| (b.is_library(), b.tag_u32())).unwrap_or((false, 0));
             let animation = self.crp.article_animation(&self.crp_data, a);
-            let item = ArticleMeshes { name: g.name.clone(), meshes, transform, tag, animation };
+            let item = ArticleMeshes { name: g.name.clone(), meshes, transform, tag, animation, index };
             if is_lib { library.push(item) } else { world.push(item) }
         }
         let mut instances = Vec::new();

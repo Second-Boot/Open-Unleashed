@@ -361,6 +361,9 @@ pub const RIDE_HEIGHT: f32 = 1.0;
 pub struct TrafficSet {
     /// `[0x5E8BF8]` — how many AI opponents are in the race, for the §5.2 rule 3 boost.
     pub opponents: u32,
+    /// `RACE_TYPE == 1`, the cops race of the Fuzzyfuz code: 0x40AEF0's early-race boost is skipped
+    /// (`modes.md` §3).
+    pub cops_race: bool,
     /// `WEATHER` (`[0x657A24] > 0`): the longitudinal rate is scaled by 0.9 (`ai.md` §5.2.3). It is
     /// 0 in the shipped options, so this is off in every normal race.
     /// `[0x657A24]`, which the option registry names **`WEATHER`** (id 0x1E, record 0x5D1F90) —
@@ -397,7 +400,7 @@ impl TrafficSet {
                 c
             })
             .collect();
-        Self { cars, opponents: 0, weather: false, scripts: nfs_formats::scripts::Scripts::default(), rng, one_way, race_dir, linear, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: TrafficPhysics::default() }
+        Self { cars, opponents: 0, cops_race: false, weather: false, scripts: nfs_formats::scripts::Scripts::default(), rng, one_way, race_dir, linear, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: TrafficPhysics::default() }
     }
 
     pub fn active_count(&self) -> usize {
@@ -588,7 +591,7 @@ impl TrafficSet {
             let aim = aidrive::aim_direction(table, &self.cfg, &st);
             let err = aidrive::heading_error(&st, aim);
             let road = (sl.width_a, sl.width_b);
-            let boost = early_boost(self.opponents, tick, 1, reference.laps as f32 + table.frac(reference.slice), c.progress, 0);
+            let boost = if self.cops_race { 1.0 } else { early_boost(self.opponents, tick, 1, reference.laps as f32 + table.frac(reference.slice), c.progress, 0) };
             let rate = accel_rate(st.speed) * burst * boost * if self.weather { 0.9 } else { 1.0 };
             let bend = aidrive::road_bend(table, c.slice, c.dir);
             let cmd = if aidrive::out_of_control(&st, &self.cfg.out_of_control, err, road, bend) {

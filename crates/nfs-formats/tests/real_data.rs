@@ -286,9 +286,13 @@ fn animdefs_parses_the_shipped_file() {
     };
     let text: String = bytes.iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
     let defs = nfs_formats::animdefs::AnimDefs::parse(&text);
-    // 64 `SECTION:ANIM` blocks but three tags appear twice (`WELD`, `GATE`, `FTRK`), and the last
-    // of a repeated tag is the one the game keeps
-    assert_eq!(defs.len(), 61);
+    // 64 `SECTION:ANIM` blocks, all kept in file order; three tags appear twice (`WELD`, `GATE`,
+    // `FTRK`) and 0x47ED90's linear search finds the **first** of each
+    assert_eq!(defs.len(), 64);
+    assert_eq!(defs.get("WELD").map(|d| d.collide_type.as_str()), Some("kCylinder"));
+    // a tag with no definition falls back to the file's first, `ENDW` (0x47EDCC)
+    assert_eq!(defs.lookup(u32::from_le_bytes(*b"RHEL")).map(|d| d.tag.as_str()), Some("ENDW"));
+    assert!(defs.lookup(0).is_none());
 
     // the cone the skill tests count (`skill-tests.md` §5.3)
     let cone = defs.get("CONE").expect("CONE");

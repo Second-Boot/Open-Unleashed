@@ -514,3 +514,86 @@ fn the_driver_name_cheats() {
     n.apply_driver_name("Hans", true);
     assert_eq!(n, base);
 }
+
+/// An automatic human car (0x49DD20): neutral until the start tick, first requested and taken
+/// with the shift timer inside 0x1C1…0x1C3, then reverse once stopped on the brake and first
+/// again once stopped on the throttle — each through the latch.
+#[test]
+fn the_automatic_starts_and_reverses_as_0x49dd20_does() {
+    let Some(specs) = specs_993() else { return };
+    let grid = flat();
+    let mut v = Vehicle::new(Vec3::new(0.0, 0.3, 0.0), Mat3::IDENTITY, &specs, 0.75, 0.3);
+    v.game_tick = 0x1C0;
+    v.step32(&Controls::default(), &specs, &grid);
+    assert_eq!(v.gear, 1, "nothing before 0x1C0");
+    v.game_tick = 0x1C1;
+    v.step32(&Controls::default(), &specs, &grid);
+    assert_eq!(v.gear, 2, "first from neutral at rest");
+    assert!(v.shift_timer > 0);
+    v.shift_timer = 0;
+    v.game_tick = 0x200;
+    v.step32(&Controls { brake: 254, ..Default::default() }, &specs, &grid);
+    assert_eq!(v.gear, 0, "stopped on the brake: reverse");
+    assert!(v.reverse_latch);
+    v.shift_timer = 0;
+    v.step32(&Controls { brake: 254, ..Default::default() }, &specs, &grid);
+    assert_eq!(v.gear, 0, "the latch holds it there");
+    v.step32(&Controls { throttle: 254, ..Default::default() }, &specs, &grid);
+    assert_eq!(v.gear, 2, "stopped in reverse on the throttle: first");
+    assert!(!v.reverse_latch);
+    // a shift-down code from first asks for neutral, which an automatic takes (0x49DEFA)
+    v.shift_timer = 0;
+    v.step32(&Controls { command: 3, ..Default::default() }, &specs, &grid);
+    assert_eq!(v.gear, 1);
+}
+
+/// The manual gearbox (0x413890, 0x499475, 0x49DD20): a shift-up code steps the requested gear
+/// from the current one and a manual car takes it at once; no code, no change; a downshift is
+/// refused while the rpm is past the redline; nothing moves before the start.
+#[test]
+fn the_manual_gearbox_takes_the_shift_codes() {
+    let Some(specs) = specs_993() else { return };
+    let grid = flat();
+    let mut v = Vehicle::new(Vec3::new(0.0, 0.3, 0.0), Mat3::IDENTITY, &specs, 0.75, 0.3);
+    v.automatic = false;
+    v.game_tick = 0;
+    v.step32(&Controls { command: 2, ..Default::default() }, &specs, &grid);
+    assert_eq!(v.gear, 1, "no shift before the start tick (0x49DDAE)");
+    v.game_tick = 0x1C5;
+    v.gear = 1;
+    v.requested_gear = 1;
+    v.step32(&Controls { command: 2, ..Default::default() }, &specs, &grid);
+    // the timer is loaded with specs[0x54] and the same step's engine update counts one off
+    assert_eq!((v.gear, v.shift_timer), (2, specs.shift_ticks - 1), "N -> 1st");
+    v.shift_timer = 0;
+    v.step32(&Controls::default(), &specs, &grid);
+    assert_eq!(v.gear, 2, "no code, no change");
+    v.gear = 4;
+    v.requested_gear = 4;
+    v.step32(&Controls { command: 3, ..Default::default() }, &specs, &grid);
+    assert_eq!(v.gear, 3);
+    assert!(v.downshift_blip, "a downshift into a forward gear sets car+0xD83");
+    v.rpm = specs.redline + 10.0;
+    v.step32(&Controls { command: 3, ..Default::default() }, &specs, &grid);
+    assert_eq!(v.gear, 3, "no downshift past the redline (0x49945D)");
+    // the top: code 2 in the last slot leaves it there
+    let top = specs.gear_slots - 1;
+    v.rpm = 0.0;
+    v.gear = top;
+    v.requested_gear = top;
+    v.step32(&Controls { command: 2, ..Default::default() }, &specs, &grid);
+    assert_eq!(v.gear, top);
+}
+
+/// `RALLY` (the Dakar code): the steering ramps 18 a tick instead of 12 (0x49DFC0).
+#[test]
+fn rally_steers_eighteen_a_tick() {
+    let Some(specs) = specs_993() else { return };
+    let grid = flat();
+    for (rally, want) in [(false, 12), (true, 18)] {
+        let mut v = Vehicle::new(Vec3::new(0.0, 0.3, 0.0), Mat3::IDENTITY, &specs, 0.75, 0.3);
+        v.rally = rally;
+        v.step32(&Controls { steer: 126, ..Default::default() }, &specs, &grid);
+        assert_eq!(v.steer, want);
+    }
+}

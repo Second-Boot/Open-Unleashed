@@ -14,9 +14,10 @@
 //!
 //! `SECTION:Audio` blocks (the ambience patches) are parsed by `engine-audio.md` §7 and skipped here.
 
-use std::collections::HashMap;
 
-/// `properties=` flags of a piece. `LOOP` is bit 0 — the sampler's looping flag (0x47EB21).
+/// `properties=` flags of a piece. `LOOP` is bit 0 — the sampler's looping flag (0x47EB21) —,
+/// `DIRECTED` bit 8 and `LANDFLAT` bit 0x10 (`[0x5B45AC]` / `[0x5B45B0]`, 0x47EB43…0x47EB72), the
+/// two turns 0x470F70 gives a piece about y by the hit's heading.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PieceFlags {
     pub looping: bool,
@@ -71,12 +72,19 @@ pub struct AnimDef {
     pub drive_through: bool,
     /// `velocityFactor` — `+0x80`, **scaled by a thousandth on the way in** (0x47E618 multiplies
     /// the stored float by `[0x5B3060]` = 0.001), so `BBOX`'s `velocityFactor=18` is **0.018**.
-    /// Only `BBOX` carries it, and no scene places a `BBOX`.
+    /// Only `BBOX` carries it — the crates the tracks place as world articles (coastal, castle,
+    /// industrial), whose pieces drift by it (0x476641).
     pub velocity_factor: f32,
     /// `frameTickOffset` — `+0x84`. No shipped definition sets it.
     pub frame_tick_offset: i32,
     /// pieces with the `speed=` they were listed under
     pub pieces: Vec<(f32, Piece)>,
+    /// The `speed=` values in file order: every `speed=` line stores its value at `+0x60 + 4·n`
+    /// and counts `+0x5C` up (0x47DFAC / 0x47DFCD).
+    pub bands: Vec<f32>,
+    /// `+0x70…`, the pieces per band: every piece counts up `+0x70[n − 1]`, or `+0x70[0]` before
+    /// the first band (0x47DE5F…0x47DE77).
+    pub band_pieces: Vec<usize>,
 }
 
 impl Default for AnimDef {
@@ -94,11 +102,21 @@ impl Default for AnimDef {
             velocity_factor: 0.0,
             frame_tick_offset: 0,
             pieces: Vec::new(),
+            bands: Vec::new(),
+            band_pieces: Vec::new(),
         }
     }
 }
 
 impl AnimDef {
+    /// The pieces 0x476380 starts for a hit at `speed` (`|v|`, 0x532B20), as a range of `pieces`:
+    /// the bands are walked while `speed` is above the band's value (0x4763ED…0x476400); none passed
+    /// gives the first piece alone, else the last band passed with the pieces of the bands before
+    /// it skipped (0x476402…0x476422).
+    pub fn group(&self, speed: f32) -> std::ops::Range<usize> {
+        band_group(&self.bands, &self.band_pieces, speed)
+    }
+
     /// The pieces of the lowest `speed=` group — the one an object at rest plays.
     pub fn resting_pieces(&self) -> impl Iterator<Item = &Piece> {
         let lowest = self.pieces.iter().map(|(s, _)| *s).fold(f32::MAX, f32::min);
@@ -106,14 +124,39 @@ impl AnimDef {
     }
 }
 
+/// [`AnimDef::group`] over a definition's `speed=` values and pieces per band.
+pub fn band_group(bands: &[f32], band_pieces: &[usize], speed: f32) -> std::ops::Range<usize> {
+    let passed = bands.iter().take_while(|v| speed > **v).count();
+    if passed == 0 {
+        return 0..1;
+    }
+    let count = |i: usize| band_pieces.get(i).copied().unwrap_or(0);
+    let start: usize = (0..passed - 1).map(count).sum();
+    start..start + count(passed - 1)
+}
+
+/// The definitions **in file order**: 0x47DCF0 appends each `SECTION:ANIM` through 0x525AE0, and
+/// the lookup 0x47ED90 is a linear search that returns the **first** record whose tag matches
+/// (so of `WELD`'s two definitions the `kCylinder` one wins), and — for a tag it does not find —
+/// the vector's first record, `ENDW` (0x47EDCC…0x47EDD1).
 #[derive(Debug, Clone, Default)]
 pub struct AnimDefs {
-    by_tag: HashMap<String, AnimDef>,
+    defs: Vec<AnimDef>,
 }
 
 impl AnimDefs {
+    /// The first definition with this tag (0x47ED90's search), `None` when there is none.
     pub fn get(&self, tag: &str) -> Option<&AnimDef> {
-        self.by_tag.get(&tag.to_ascii_uppercase())
+        self.defs.iter().find(|d| d.tag.eq_ignore_ascii_case(tag))
+    }
+
+    /// 0x47ED90 in full: the tag's first definition, else the file's first — `None` only for a zero
+    /// tag (0x47ED9E) or an empty file.
+    pub fn lookup(&self, tag: u32) -> Option<&AnimDef> {
+        if tag == 0 {
+            return None;
+        }
+        self.by_fourcc(tag).or_else(|| self.defs.first())
     }
 
     /// By the FourCC an article's `Base` record carries, little-endian.
@@ -124,15 +167,15 @@ impl AnimDefs {
     }
 
     pub fn len(&self) -> usize {
-        self.by_tag.len()
+        self.defs.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_tag.is_empty()
+        self.defs.is_empty()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &AnimDef> {
-        self.by_tag.values()
+        self.defs.iter()
     }
 
     pub fn parse(text: &str) -> AnimDefs {
@@ -172,10 +215,15 @@ impl AnimDefs {
                     && let Some(d) = def.as_mut()
                 {
                     d.pieces.push((speed, p));
+                    let band = d.bands.len().saturating_sub(1);
+                    if d.band_pieces.len() <= band {
+                        d.band_pieces.resize(band + 1, 0);
+                    }
+                    d.band_pieces[band] += 1;
                 } else if let Some(d) = def.take()
                     && !d.tag.is_empty()
                 {
-                    out.by_tag.insert(d.tag.to_ascii_uppercase(), d);
+                    out.defs.push(d);
                 }
                 continue;
             }
@@ -210,7 +258,10 @@ impl AnimDefs {
                 "drivethru" | "drivethrough" => d.drive_through = v != "0",
                 "velocityfactor" => d.velocity_factor = v.parse().unwrap_or(0.0) * 0.001,
                 "frametickoffset" => d.frame_tick_offset = v.parse().unwrap_or(0),
-                "speed" => speed = v.parse().unwrap_or(0.0),
+                "speed" => {
+                    speed = v.parse().unwrap_or(0.0);
+                    d.bands.push(speed);
+                }
                 _ => {}
             }
         }
@@ -333,6 +384,13 @@ SECTION:ANIM
         assert_eq!(rest.playback_rate, 3.0);
         assert!((rest.seconds_per_frame() - 0.1 / 3.0).abs() < 1e-6);
         assert!(rest.flags.landflat && rest.flags.directed && !rest.flags.looping);
+        // 0x476380's group: at rest (no band passed) the first piece; above 0 the first band;
+        // above 5 the second
+        assert_eq!((temp.bands.clone(), temp.band_pieces.clone()), (vec![0.0, 5.0], vec![1, 1]));
+        assert_eq!(temp.group(0.0), 0..1);
+        assert_eq!(temp.group(3.0), 0..1);
+        assert_eq!(temp.group(5.0), 0..1);
+        assert_eq!(temp.group(9.0), 1..2);
     }
 
     #[test]

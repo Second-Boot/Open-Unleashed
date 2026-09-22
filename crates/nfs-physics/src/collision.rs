@@ -138,6 +138,46 @@ impl TriangleGrid {
         best
     }
 
+    /// `Tracker::findPatch` 0x473240 as `Tracker::updateZone` 0x474060 uses it: of the patches
+    /// in the point's cell whose **plan** contains it (0x486090 / 0x485780 test the edges in the
+    /// x-z plane only, 0x4860B9…0x486176) and whose flags word has a surface nibble
+    /// (`word & 0xF`, 0x4732CC), the one whose height at the point is nearest `p.y` — at any
+    /// distance (0x4732DE…0x473303). The word, or 0 when there is none (0x474060's
+    /// `zoneWord = patch ? word : 0`).
+    ///
+    /// MEDIUM on two counts: the port's patches are the primitives' triangles, so a quad is
+    /// its two halves and its height their planes', and the tracker's `keep` (a cached patch
+    /// that still contains the point is kept) is not carried — the nearest is taken every time.
+    pub fn find_patch(&self, p: Vec3) -> u32 {
+        if self.tris.is_empty() {
+            return 0;
+        }
+        let (cx, cz) = Self::cell_of(self.min, self.cell_size, self.nx, self.nz, p);
+        let mut best: Option<(f32, u32)> = None;
+        for &ti in &self.cells[cz * self.nx + cx] {
+            let t = &self.tris[ti as usize];
+            if t.surface & 0xF == 0 {
+                continue;
+            }
+            let side = |a: Vec3, b: Vec3| (b.x - a.x) * (p.z - a.z) - (b.z - a.z) * (p.x - a.x);
+            let (d0, d1, d2) = (side(t.a, t.b), side(t.b, t.c), side(t.c, t.a));
+            let inside = (d0 >= 0.0 && d1 >= 0.0 && d2 >= 0.0) || (d0 <= 0.0 && d1 <= 0.0 && d2 <= 0.0);
+            if !inside {
+                continue;
+            }
+            let n = (t.b - t.a).cross(t.c - t.a);
+            if n.y.abs() < 1e-9 {
+                continue;
+            }
+            let h = t.a.y - (n.x * (p.x - t.a.x) + n.z * (p.z - t.a.z)) / n.y;
+            let d = (h - p.y).abs();
+            if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                best = Some((d, t.surface));
+            }
+        }
+        best.map(|(_, w)| w).unwrap_or(0)
+    }
+
     /// Ground under (x, z): highest surface below `y_from` within `depth`.
     pub fn ground(&self, x: f32, y_from: f32, z: f32, depth: f32) -> Option<Hit> {
         self.raycast(Vec3::new(x, y_from, z), Vec3::NEG_Y, depth)
@@ -212,5 +252,25 @@ mod tests {
         let g = TriangleGrid::build(t, 5.0);
         let h = g.ground(0.0, 10.0, 0.0, 20.0).unwrap();
         assert!((h.point.y - 2.0).abs() < 1e-5);
+    }
+
+    /// `Tracker::findPatch` 0x473240: the drivable patch nearest in height over the point, at any
+    /// height; a surface nibble of 0 is skipped; nothing under the point answers 0.
+    #[test]
+    fn find_patch_takes_the_nearest_drivable_patch() {
+        let mut t = quad(0.0);
+        t.extend(quad(40.0).into_iter().map(|mut q| {
+            q.surface = 0x13;
+            q
+        }));
+        t.extend(quad(3.0).into_iter().map(|mut q| {
+            q.surface = 0x20;
+            q
+        }));
+        let g = TriangleGrid::build(t, 5.0);
+        assert_eq!(g.find_patch(Vec3::new(1.0, 2.0, 1.0)), 7, "the wall class at 3 m is not a surface");
+        assert_eq!(g.find_patch(Vec3::new(1.0, 30.0, 1.0)), 0x13, "no height window");
+        assert_eq!(g.find_patch(Vec3::new(1.0, -100.0, 1.0)), 7);
+        assert_eq!(g.find_patch(Vec3::new(30.0, 0.0, 30.0)), 0, "off the patches");
     }
 }

@@ -21,6 +21,10 @@ pub struct AiDriver {
     /// factor is applied to it — kept so `set_track` can re-scale from the original rather than
     /// compound onto an already-scaled curve.
     bend_speed_base: [f32; 40],
+    /// `car+0x10D8` as the `.ais` loader reads it: the grip ratio `CarSim_applyParts` leaves there,
+    /// `grip_after / grip_before` (0x49CC93, 0x49D272) — 1.0 for a car without parts, which is every
+    /// opponent this port fields
+    pub grip_ratio: f32,
     /// carSpecs[0x13C]/[0x140]/[0x144] (raw `.sim` +0x13C..+0x144, i.e. `unknown_tail[19..22]`)
     pub k_lookahead: f32,
     pub k_steer: f32,
@@ -194,7 +198,7 @@ fn curve_factor_dir(track: &str, family: &str, backwards: bool) -> f32 {
 
 impl AiDriver {
     pub fn new(data: AiCarData, specs: &CarSpecs, sim_tail: &[f32; 22]) -> Self {
-        Self { data, bend_speed_base: [0.0; 40], k_lookahead: sim_tail[19], k_steer: sim_tail[20], k_steer_base: sim_tail[20], k_angle: sim_tail[21], stuck_ticks: 0, wrong_way: false, target_speed: 0.0, skill_mean: [1.0; 4], skill_range: [0.0; 4], band: None, skill: 0, catchup: None, last_node: None, link: None, preferred_segment: None, speed_factor: 1.0, rng: 0x1234_5679, wf_div: 12.0, track: String::new(), backwards: false, dbg_n: 0, dbg_offset: 0.0, dbg_dot: 0.0 }
+        Self { data, bend_speed_base: [0.0; 40], grip_ratio: 1.0, k_lookahead: sim_tail[19], k_steer: sim_tail[20], k_steer_base: sim_tail[20], k_angle: sim_tail[21], stuck_ticks: 0, wrong_way: false, target_speed: 0.0, skill_mean: [1.0; 4], skill_range: [0.0; 4], band: None, skill: 0, catchup: None, last_node: None, link: None, preferred_segment: None, speed_factor: 1.0, rng: 0x1234_5679, wf_div: 12.0, track: String::new(), backwards: false, dbg_n: 0, dbg_offset: 0.0, dbg_dot: 0.0 }
             .tap(|d| {
                 // The curve factor is per track *and* per car class, so it cannot be applied here
                 // — `set_track` does it, over a pristine copy of the curve so that re-entering a
@@ -213,9 +217,12 @@ impl AiDriver {
         // per car family, and 1.0 unless the table names the pair
         self.k_steer = self.k_steer_base * steer_factor(track, family, backwards);
         // …and `0x4A2DC0`'s return value scales the whole bend-speed curve (0x49CAF5)
+        // — after the loader's rescale about the curve's floor: `mn = min(200, min f[24..64))`,
+        // `f[i] = (f[i] − mn)·ratio + mn` (0x49CAD7), then the factor
         let f = curve_factor_dir(track, family, backwards);
+        let mn = self.bend_speed_base.iter().fold(200.0f32, |m, &v| m.min(v));
         for (v, base) in self.data.bend_speed.iter_mut().zip(self.bend_speed_base.iter()) {
-            *v = base * f;
+            *v = ((base - mn) * self.grip_ratio + mn) * f;
         }
     }
 
@@ -448,7 +455,7 @@ impl AiDriver {
         }
         let facing = table.slices[s0].forward.normalize_or_zero().dot(v.forward());
         self.wrong_way = v.race_started && v.speed() > 10.0 && if self.backwards { facing > 0.707 } else { facing < -0.707 };
-        Controls { throttle, brake, steer, handbrake: false, gear_request: None }
+        Controls { throttle, brake, steer, handbrake: false, command: 0 }
     }
 
     pub fn wants_reset(&mut self) -> bool {

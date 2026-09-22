@@ -162,6 +162,43 @@ fn slot_19s_roof_arithmetic_always_lands_on_geometry_that_exists() {
     assert!(seen >= 10, "only {seen} cabriolet styles checked");
 }
 
+/// Slot 19's roof line in a race (0x43AE7A…0x43AE9F), on a real style: the 356 B Roadster authors
+/// 37 = 2, 41 = 3; a race rewrites 41 to 3 with `.CABRIODOWN` 0 and to 4 with 1, and zeroes 37.
+#[test]
+fn the_race_roof_line_rewrites_slot_41_and_clears_37() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let Ok(assets) = nfs_assets::car::CarAssets::load(&paths, "356b") else { return };
+    let Some(i) = (1..=16).find(|i| CarStyle::from_tpg(&assets.tpg, *i).geometry.get(&37) == Some(&2)) else {
+        panic!("no 356b style with roof family 2");
+    };
+    for (opt, want) in [(0u32, 3u32), (1, 4)] {
+        let mut st = CarStyle::from_tpg(&assets.tpg, i);
+        st.apply_race_roof(opt);
+        assert_eq!(st.geometry.get(&41), Some(&want));
+        assert_eq!(st.geometry.get(&37), Some(&0));
+    }
+    // a coupé has no family: 41 ends on −1 / 0, variants no article carries
+    let mut coupe = CarStyle::from_tpg(&assets.tpg, i);
+    coupe.geometry.remove(&37);
+    coupe.apply_race_roof(0);
+    assert_eq!(coupe.geometry.get(&41), Some(&u32::MAX));
+}
+
+/// Slot 19's tail (0x43B0B7): a part's `{group, slot, value}` swap replaces the style's slot —
+/// group 0 a geometry slot, group 1 a texture one — and a negative value leaves it.
+#[test]
+fn the_part_overlay_replaces_style_slots() {
+    let mut st = CarStyle::default();
+    st.geometry.insert(5, 1);
+    st.apply_overlay(&[[0, 5, 3], [1, 13, 2], [0, 6, -1]]);
+    assert_eq!(st.geometry.get(&5), Some(&3));
+    assert_eq!(st.texture.get(&13), Some(&2));
+    assert_eq!(st.geometry.get(&6), None);
+}
+
 /// The animation channels: `Base+75` is the rotation channel and the map is the same on every
 /// shipped car — wheels 1/3, `Steer` 5, doors 6/7, hood 8, engine lid 9, needles 11/12,
 /// `MoveSpoiler` **16**, the pop-up `HeadLight` **17** (`car-model.md`).

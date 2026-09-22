@@ -14,10 +14,13 @@ fn run(track: &str, seed: u32) -> Option<(SliceTable, TrafficSet)> {
     let mut set = TrafficSet::new(&specs, &table, 1.0, false, seed);
 
     // drive a reference car around the lap at 30 m/s, stepping five slices per 32 Hz tick
-    let mut slice = 0usize;
+    // (the test's own driver walks the lap route and wraps; `SliceTable::add` is 0x4817D0 and
+    // stops at a point-to-point track's dead end)
+    let mut p = 0usize;
     for tick in 0..20_000u64 {
         if tick % 2 == 0 {
-            slice = table.add(slice, 1);
+            p = (p + 1) % table.lap_len;
+            let slice = table.route[p];
             let r = Reference { position: table.slices[slice].centre, slice, laps: 0, speed: 30.0, dir: 1.0 };
             set.update(&table, tick, r, &[]);
             set.update(&table, tick, r, &[]);

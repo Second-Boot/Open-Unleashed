@@ -52,6 +52,13 @@ pub struct CarCatalogEntry {
     /// wider than [`Self::family`]: the 356 A, its Convertible and its Speedster share one run.
     /// `RE/notes/controls.md` §4.145. Nothing in this port reads it yet.
     pub variant: i16,
+    /// `+0x1BF` u8 — the car is a **convertible**: `Car.Roof`'s predicate 0x4F1E40 reads it off the
+    /// car `CARSETTINGS.CAR` names and forces the roof to 0 when it is clear. 1 on every Cabriolet,
+    /// Speedster, Roadster, Convertible D and the 964 / 993 cabriolets, 0 on the coupés and Targas.
+    pub cabrio: bool,
+    /// `+0x3BC` i16 count, `+0x3BE` i16 ids: the record's stock parts, which the 3D car widget
+    /// walks for a car that is not a garage record (0x4C036A…0x4C0405) to build its style overlay.
+    pub stock_parts: Vec<i16>,
     pub logo_pair: i16,
     /// +0x1F4 u16 — what the car *is*, and which of the front end's lists it joins (the `switch` at
     /// 0x4F400E): **0 a racing car** (87 records, the player's, the opponents' and the dealer's),
@@ -75,6 +82,13 @@ pub struct CarCatalogEntry {
     pub value_curve: [f32; 51],
     /// +0x20C, +0x210: the two entries before the value curve (dealer ages 0 and 1).
     pub age_curve_head: [f32; 2],
+    /// +0x2F0 … +0x2FC f32 — the dash needles' calibration, in turns: rest angle and per-1000-rpm
+    /// of the rev counter, rest angle and scale of the speedometer. The per-car routine 0x4EEDA0
+    /// sends them as options 0x251…0x254 `.TACH0RPM`, `.TACH1000RPM`, `.SPEEDO0KM`,
+    /// `.SPEEDO100KM` (0x4EF331…0x4EF37B, off `this+0x2F4`: the FE car object keeps a 4-byte
+    /// header before the record) into `carinfo+0x524…+0x530`, which slot 9 turns into channels
+    /// 11 and 12 (`car-model.md` "Slot 9"). The 993: −0.37, 0.09, −0.34, 0.08.
+    pub dash: [f32; 4],
     /// +0x300 / +0x30C / +0x318: km/h, mph and tach dial records (`RE/notes/hud.md` §3.1).
     pub dial_kmh: DialSpec,
     pub dial_mph: DialSpec,
@@ -214,6 +228,11 @@ pub fn parse_car_catalog(data: &[u8]) -> Result<Vec<CarCatalogEntry>, FormatErro
             displacement: s(0x1C2, 16)?,
             id: u16_le(r, 0, "nfs5.car id")?,
             variant: u16_le(r, 0x1C0, "nfs5.car +0x1C0")? as i16,
+            cabrio: r[0x1BF] != 0,
+            stock_parts: {
+                let n = (u16_le(r, 0x3BC, "nfs5.car +0x3BC")? as i16).clamp(0, 40) as usize;
+                (0..n).filter_map(|k| u16_le(r, 0x3BE + 2 * k, "nfs5.car +0x3BE").ok().map(|v| v as i16)).collect()
+            },
             logo_pair: u16_le(r, 0x1F6, "nfs5.car +0x1F6")? as i16,
             kind: u16_le(r, 0x1F4, "nfs5.car +0x1F4")?,
             dealer_flag_204: u16_le(r, 0x204, "nfs5.car +0x204")?,
@@ -228,6 +247,13 @@ pub fn parse_car_catalog(data: &[u8]) -> Result<Vec<CarCatalogEntry>, FormatErro
                 c
             },
             age_curve_head: [f32::from_bits(u32_le(r, 0x20C, "nfs5.car +0x20C")?), f32::from_bits(u32_le(r, 0x210, "nfs5.car +0x210")?)],
+            dash: {
+                let mut d = [0f32; 4];
+                for (i, v) in d.iter_mut().enumerate() {
+                    *v = f32::from_bits(u32_le(r, 0x2F0 + i * 4, "nfs5.car dash")?);
+                }
+                d
+            },
             dial_kmh: DialSpec::parse(r, 0x300)?,
             dial_mph: DialSpec::parse(r, 0x30C)?,
             dial_tach: DialSpec::parse(r, 0x318)?,

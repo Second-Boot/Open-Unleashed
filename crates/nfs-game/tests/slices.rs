@@ -85,7 +85,10 @@ fn monaco1_lap_chains_all_sections() {
     }
     assert!(max_gap < 15.0, "max gap along the lap {max_gap}"); // 13.3 m at the section 3 → 0 join
     assert_eq!(table.add(140, 1), 557);
-    assert_eq!(table.add(557, -1), 140);
+    // stepping back across a node lands two slices short: 0x4817D0 keeps `s − edge − 1` as the
+    // remainder in both directions (0x481877 / 0x48187B) and adds it to the exit link's slice, the
+    // segment's last (140), so 557 − 1 is 138
+    assert_eq!(table.add(557, -1), 138);
     assert!((table.frac(557) - 141.0 / 623.0).abs() < 1e-4);
     // find_slice lands on the chained section, not on the file-order neighbour
     let probe = table.slices[560].centre + Vec3::new(0.5, 0.0, 0.5);
@@ -94,7 +97,8 @@ fn monaco1_lap_chains_all_sections() {
     let alps = TrackAssets::load(&paths, "alps").unwrap();
     let a = SliceTable::from_crp(&alps.crp, &alps.crp_data).unwrap();
     assert_eq!(a.route.len(), 1795);
-    assert_eq!(a.add(1794, 1), 0);
+    // and it does not wrap: past a dead end 0x4817D0 hands back the slice it was given (0x4818E8)
+    assert_eq!(a.add(1794, 1), 1794);
 }
 
 /// A car on one of a track's branch roads is tracked onto that road, not snapped to the main lap

@@ -15,6 +15,9 @@ pub struct TrackWorld {
     /// environment map for car reflections (`.env` "SKY " entry, else the first)
     pub env_map: Option<nfs_renderer::TextureId>,
     pub collision: nfs_physics::collision::TriangleGrid,
+    /// The collision props the loader 0x4750B0 builds from the track's tagged articles
+    /// ([`track_props`]) — `Car_propPass` 0x498DE0's objects.
+    pub props: Vec<nfs_physics::props::Prop>,
     pub walls: nfs_physics::walls::WallSet,
     pub start: Vec3,
     pub ambient: f32,
@@ -35,6 +38,8 @@ pub struct TrackWorld {
     /// dockers — every other animation there is played on impact, which needs the smackable bodies
     /// the port does not simulate.
     animated: Vec<AnimatedProp>,
+    /// The breakable props drawn in the world, with their pieces once a car has started them.
+    broken: Vec<BrokenProp>,
 }
 
 /// One `[sectionN]` of a track's `.map`: the slice range it covers and the six environment-map ids
@@ -216,8 +221,14 @@ impl TrackWorld {
         };
         // Static world: merge every article's meshes per material into one GPU mesh each
         // (transforms baked on the CPU) — 4k draw calls → ~200.
+        let props = track_props(track);
+        // a breakable's own article is drawn on its own so that its pieces can replace it
+        let breakable_articles: std::collections::HashSet<usize> = props.iter().filter_map(|p| p.breakable.as_ref().map(|b| b.article)).collect();
         let mut merged: HashMap<u16, nfs_renderer::MeshData> = HashMap::new();
         for art in &geometry.world {
+            if breakable_articles.contains(&art.index) {
+                continue;
+            }
             for mm in &art.meshes {
                 let dst = merged.entry(mm.material).or_default();
                 let base = dst.vertices.len() as u32;
@@ -238,6 +249,7 @@ impl TrackWorld {
             let material = material_for(r, m);
             items.push(DrawItem::new(r.upload_mesh(&merged[&m]), material, Mat4::IDENTITY));
         }
+        let broken = Self::breakables(r, track, &geometry, &props, &mut items, &mut material_for);
         let mut lib_gpu: HashMap<u32, Vec<(MeshId, MaterialId)>> = HashMap::new();
         for art in &geometry.library {
             let entry = lib_gpu.entry(art.tag).or_default();
@@ -364,7 +376,8 @@ impl TrackWorld {
         for it in &mut items {
             it.headlit = lit.contains(&it.material);
         }
-        Ok(Self { items, item_element, hidden: std::collections::HashSet::new(), env_map, collision, walls, start, ambient, map_light, mean_ground, sun_direction, map_sections, env_by_id, knocked: Vec::new(), animated })
+        tracing::info!(props = props.len(), breakable = props.iter().filter(|p| p.breakable.is_some()).count(), "track props");
+        Ok(Self { items, item_element, hidden: std::collections::HashSet::new(), env_map, collision, props, walls, start, ambient, map_light, mean_ground, sun_direction, map_sections, env_by_id, knocked: Vec::new(), animated, broken })
     }
 
     /// Advance every looping prop animation to `seconds` since the race started
@@ -388,7 +401,132 @@ impl TrackWorld {
 
     /// Draw items with the hidden mission elements filtered out.
     pub fn visible_items(&self) -> impl Iterator<Item = DrawItem> + '_ {
-        self.items.iter().zip(self.item_element.iter()).filter(|(_, e)| e.map(|e| !self.hidden.contains(&e)).unwrap_or(true)).map(|(i, _)| *i)
+        self.items
+            .iter()
+            .enumerate()
+            .zip(self.item_element.iter())
+            .filter(|((k, _), e)| e.map(|e| !self.hidden.contains(&e)).unwrap_or(true) && !self.broken.iter().any(|b| b.hides(*k)))
+            .map(|((_, i), _)| *i)
+            .chain(self.broken.iter().flat_map(|b| b.pieces.iter().copied()))
+    }
+
+    /// The breakable props of the world (`BBOX`, the crate stacks): each world article whose prop
+    /// has a `Breakable` is drawn on its own, and every piece of its definition gets its template
+    /// — the `BaseGroup` article's meshes (0x478640 by tag, else the record's entry 0: the prop's own
+    /// article for the first piece, the first piece's afterwards — 0x476471) and the track it plays:
+    /// the `QuatGroup` article's `Anqt`, or the base article's when the `QuatGroup`'s `Anim` has
+    /// vertex frames (its second word, 0x476525…0x476552).
+    fn breakables(
+        r: &mut Renderer,
+        track: &TrackAssets,
+        geometry: &nfs_assets::track::TrackGeometry,
+        props: &[nfs_physics::props::Prop],
+        items: &mut Vec<DrawItem>,
+        material_for: &mut dyn FnMut(&mut Renderer, u16) -> MaterialId,
+    ) -> Vec<BrokenProp> {
+        let Ok(arts) = track.crp.articles(&track.crp_data) else { return Vec::new() };
+        let tags = article_tags(track, &arts);
+        let by_index: HashMap<usize, &nfs_assets::track::ArticleMeshes> = geometry.world.iter().chain(geometry.library.iter()).map(|a| (a.index, a)).collect();
+        let mut uploaded: HashMap<usize, Vec<(MeshId, MaterialId)>> = HashMap::new();
+        let mut upload = |r: &mut Renderer, k: usize| -> Vec<(MeshId, MaterialId)> {
+            uploaded
+                .entry(k)
+                .or_insert_with(|| by_index.get(&k).map(|a| a.meshes.iter().map(|mm| (r.upload_mesh(&mm.mesh), material_for(r, mm.material))).collect()).unwrap_or_default())
+                .clone()
+        };
+        let mut out = Vec::new();
+        for (pi, p) in props.iter().enumerate() {
+            let Some(b) = p.breakable.as_ref() else { continue };
+            let Some(own) = geometry.world.iter().find(|a| a.index == b.article) else { continue };
+            let Some(def) = track.animdefs.lookup(own.tag) else { continue };
+            let first = items.len();
+            for (mesh, material) in upload(r, own.index) {
+                items.push(DrawItem::new(mesh, material, own.transform));
+            }
+            let mut entry0 = own.index;
+            let mut templates = Vec::new();
+            for (k, (_, piece)) in def.pieces.iter().enumerate() {
+                let base = first_by_tag(&tags, group_tag(&piece.base_group)).unwrap_or(entry0);
+                if k == 0 {
+                    entry0 = base;
+                }
+                let quat = first_by_tag(&tags, group_tag(&piece.quat_group));
+                let vertex_frames = quat.and_then(|q| tags[q].1).is_some_and(|w| w[1] > 0);
+                let source = if vertex_frames { Some(base) } else { quat };
+                let track_of = source.and_then(|k| by_index.get(&k)).and_then(|a| a.animation.clone());
+                templates.push(PieceTemplate {
+                    meshes: upload(r, base),
+                    track: track_of,
+                    seconds_per_frame: piece.seconds_per_frame(),
+                    flags: piece.flags,
+                });
+            }
+            out.push(BrokenProp {
+                prop: pi,
+                items: first..items.len(),
+                instance: own.transform,
+                velocity_factor: def.velocity_factor,
+                templates,
+                players: Vec::new(),
+                pieces: Vec::new(),
+                state: BreakState::Whole,
+            });
+        }
+        out
+    }
+
+    /// The breakables' side of the anim world on game tick `tick` (64 Hz): a prop a car has just
+    /// started (`Breakable::started`) builds a player for each piece of its speed group (0x476380 —
+    /// up to the first that does not resolve) and stops drawing its own article (the record's
+    /// entry 0 now holds the first piece); each frame every player is sampled (0x4769E0: the
+    /// piece's matrix, then the instance's); once the lead player — the first piece's twin at
+    /// `rec+0x1C` — has run out (0x4715A0 answers 2 when the draw samples it through 0x450010's
+    /// `rec+8` branch), the next update 0x476810 tears the pieces down (0x476710) and nothing of
+    /// the prop is drawn again; its answer stays 0, so cars pass.
+    pub fn break_props(&mut self, tick: u32) {
+        for b in &mut self.broken {
+            if let BreakState::Whole = b.state
+                && let Some((start, velocity)) = self.props.get(b.prop).and_then(|p| p.breakable.as_ref()).and_then(|x| x.started.get())
+            {
+                let Some(br) = self.props[b.prop].breakable.as_ref() else { continue };
+                let group = nfs_formats::animdefs::band_group(&br.bands, &br.band_pieces, velocity.length());
+                // 0x476588…0x4765E0 / 0x476618…0x476641: the velocity in the instance's frame
+                // (0x532A00 transposes its rotation, 0x532A40 applies it), its heading
+                // `atan2(x, z)` in turns (0x532860) and the piece's drift `v·velocityFactor`
+                let local = b.instance.inverse().transform_vector3(velocity);
+                let heading = local.x.atan2(local.z);
+                for i in group {
+                    if !br.resolved.get(i).copied().unwrap_or(false) {
+                        break;
+                    }
+                    b.players.push(PiecePlayer { template: i, heading, drift: local * b.velocity_factor });
+                }
+                b.state = BreakState::Playing { start, lead_done: false };
+            }
+            if let BreakState::Playing { start, lead_done } = b.state {
+                if lead_done {
+                    b.state = BreakState::Gone;
+                    b.players.clear();
+                    b.pieces.clear();
+                    continue;
+                }
+                let ticks = tick.saturating_sub(start);
+                b.pieces.clear();
+                let mut lead = true;
+                for (k, pl) in b.players.iter().enumerate() {
+                    let t = &b.templates[pl.template];
+                    let Some(track) = t.track.as_ref() else { continue };
+                    let (m, playing) = sample_piece(track, t.seconds_per_frame, t.flags, pl.heading, pl.drift, ticks);
+                    if k == 0 {
+                        lead = playing;
+                    }
+                    for (mesh, material) in &t.meshes {
+                        b.pieces.push(DrawItem::new(*mesh, *material, b.instance * m));
+                    }
+                }
+                b.state = BreakState::Playing { start, lead_done: !lead };
+            }
+        }
     }
 
     /// Show exactly the mission elements in `shown` among `all` (arrow markers, 0x482F70).
@@ -497,19 +635,117 @@ struct AnimatedProp {
     looping: bool,
 }
 
+/// A breakable prop drawn in the world (`TrackWorld::break_props`).
+struct BrokenProp {
+    /// its index in `TrackWorld::props`
+    prop: usize,
+    /// its own article's draw items, drawn while it is whole
+    items: std::ops::Range<usize>,
+    /// the instance's matrix, `world+0x40 + 56·id` (0x539CD0 at 0x476A54)
+    instance: Mat4,
+    /// `def+0x80`, already scaled by 0.001
+    velocity_factor: f32,
+    /// one per piece of the definition
+    templates: Vec<PieceTemplate>,
+    /// the pieces started (the record's entries `rec+0x34`, `rec+0x14` of them)
+    players: Vec<PiecePlayer>,
+    /// this frame's draw items of the pieces
+    pieces: Vec<DrawItem>,
+    state: BreakState,
+}
+
+impl BrokenProp {
+    fn hides(&self, item: usize) -> bool {
+        !matches!(self.state, BreakState::Whole) && self.items.contains(&item)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BreakState {
+    Whole,
+    /// started on game tick `start`; `lead_done` once the lead player has run out
+    Playing { start: u32, lead_done: bool },
+    Gone,
+}
+
+struct PieceTemplate {
+    meshes: Vec<(MeshId, MaterialId)>,
+    track: Option<nfs_formats::crp::AnimTrack>,
+    seconds_per_frame: f32,
+    flags: nfs_formats::animdefs::PieceFlags,
+}
+
+/// 0x471490's player: the track's `+0x10` heading (radians here) and `+0x14` drift.
+struct PiecePlayer {
+    template: usize,
+    heading: f32,
+    drift: Vec3,
+}
+
+/// `AnimPlayer::sample` 0x470E90 with 0x470F70 for a piece `ticks` game ticks after its start:
+/// `rate = secondsPerFrame / (1/64)` ticks a frame (`[0x628938]+8`, 0x471700's 0.015625);
+/// `f = ticks / rate`; a looping track wraps at `frames − 2`, a one-shot holds `frames − 1`; the
+/// quaternion and the position are lerped component by component (0x48A150, **not** normalised),
+/// the matrix built from that quaternion as it is (0x48A1E0) with the lerped scale; `DIRECTED`
+/// (flag 8) turns it after about y by the heading (0x47108A…0x4710C0, `M·R`), `LANDFLAT` (flag
+/// 0x10) before about y by `−heading·(1 − (i + frac)/frames)` (0x4710C3…0x47112C, `R·M`); the
+/// translation then gains `drift · ticks · rate` (0x470F17…0x470F51). The answer's flag is
+/// `i + 1 < frames`, the player still running.
+fn sample_piece(track: &nfs_formats::crp::AnimTrack, seconds_per_frame: f32, flags: nfs_formats::animdefs::PieceFlags, heading: f32, drift: Vec3, ticks: u32) -> (Mat4, bool) {
+    let n = track.frames.len();
+    if n == 0 {
+        return (Mat4::IDENTITY, false);
+    }
+    let rate = seconds_per_frame / 0.015625;
+    let f = ticks as f32 / rate;
+    let mut i = f as usize;
+    let mut frac = f - i as f32;
+    if flags.looping && n > 2 {
+        i %= n - 2;
+    } else if i + 2 >= n {
+        i = n - 1;
+        frac = 0.0;
+    }
+    let (a, b) = (&track.frames[i], &track.frames[(i + 1).min(n - 1)]);
+    let lerp = |x: f32, y: f32| x + (y - x) * frac;
+    let q = glam::Quat::from_xyzw(lerp(a.rotation[0], b.rotation[0]), lerp(a.rotation[1], b.rotation[1]), lerp(a.rotation[2], b.rotation[2]), lerp(a.rotation[3], b.rotation[3]));
+    let pos = Vec3::from(a.position).lerp(Vec3::from(b.position), frac);
+    let scale = Vec3::from(a.scale).lerp(Vec3::from(b.scale), frac);
+    let mut m = Mat4::from_translation(pos) * Mat4::from_mat3(glam::Mat3::from_quat(q)) * Mat4::from_scale(scale);
+    if flags.directed {
+        m = Mat4::from_rotation_y(heading) * m;
+    }
+    if flags.landflat {
+        m *= Mat4::from_rotation_y(-heading * (1.0 - (i as f32 + frac) / n as f32));
+    }
+    let off = drift * ticks as f32 * rate;
+    m.w_axis += off.extend(0.0);
+    (m, i + 1 < n)
+}
+
 /// GPU-resident car model at one LOD, split into body parts (with their pivots applied) and
 /// wheels (kept separate so they can spin/steer). Model space (RE/notes/car-model.md §3) is
 /// +Y up, −Z front, +X left; `MODEL_TO_BODY` rotates it into the physics body frame (+Z forward).
 pub struct CarModel {
+    /// The model's scale in its render matrix: 1, or **0.4** for a `.TINYCAR` (`[0x5B37C8]`, the
+    /// scale 0x4433D2 builds into the car's matrix through 0x539B30)
+    pub scale: f32,
     pub body: Vec<(MeshId, MaterialId, Mat4)>,
     /// Each material's `R3DLightLayer` parameters (`RE/notes/lighting.md` §6) — every shipped car
     /// material has them.
     material_light: HashMap<MaterialId, nfs_formats::crp::LayerLight>,
-    /// The meshes animation 1 — the convertible's roof — morphs, with each frame's positions.
-    roof: Vec<MorphPart>,
-    /// `0x438190(1)`: the roof animation's length in frames, 0 for a car without one
-    pub roof_length: u32,
+    /// The meshes each **model animation** morphs (`Base+77`, index 1…7), with every frame's
+    /// positions: 1 the convertible's roof, 2 the `SpoilerW` wing, 3 the wipers, 4 / 5 / 6 the
+    /// driver's right arm, left arm and body, 7 the aerial (`anims` example over every car).
+    morph: [Vec<MorphPart>; ANIMS],
+    /// `0x438190(n)`: animation `n`'s length in frames, 0 for a car without it
+    anim_length: [u32; ANIMS],
+    /// the time each animation was last set to (0x4380D0), so an unchanged one is not re-uploaded
+    anim_time: [f32; ANIMS],
     roof_state: i32,
+    driver: DriverAnim,
+    /// the `{frame, next, frac}` each animation's meshes were last blended to
+    blended: [Option<(usize, usize, f32)>; ANIMS],
     /// The **rotation channel** of each `body` entry — the article's `Base+75`, 0 for a part that
     /// never moves (`car-model.md`). `R3DCarLOD::draw` picks it at 0x43C98A and turns
     /// `channel_turns[n]` into `Rx·Ry·Rz` about the part's own origin.
@@ -538,6 +774,15 @@ pub struct CarModel {
     /// axis-angle build 0x539BD0). Only the x column is used so far: channel **16** is
     /// `MoveSpoiler` and **17** the pop-up `HeadLight`.
     pub channel_turns: [f32; 32],
+    /// the same channels' `y` and `z` turns — the wheels' steer and camber, the steering wheel's
+    /// and the dial needles' `z`, the siren's `y` (slot 9, `car-model.md` "Slot 9")
+    channel_yz: [[f32; 2]; 32],
+    /// `nfs5.car +0x2F0…+0x2FC` (the options 0x251…0x254 `.TACH0RPM`, `.TACH1000RPM`,
+    /// `.SPEEDO0KM`, `.SPEEDO100KM`, sent at 0x4EF331…0x4EF37B into `carinfo+0x524…+0x530`): the
+    /// dash needles' rest angle and scale, in turns
+    dash: [f32; 4],
+    /// the frame clock the race channels run on, ms (`TIMER_getTicks` is 128 Hz)
+    clock_ms: u64,
     /// (pivot in body space, is_front, is_left, parts)
     pub wheels: Vec<CarWheelModel>,
     pub bbox_min: Vec3,
@@ -567,6 +812,119 @@ pub struct CarLight {
     pub position: Vec3,
     /// +1 for a lamp that faces the car's front, −1 for the tail lights
     pub facing: f32,
+}
+
+/// Model animations are numbered 1…7 in the shipped cars; slot 0 is unused.
+const ANIMS: usize = 8;
+
+/// One of slot 9's eight keyframe players, `R3DCar+0x484 + 0x1C·n` (0x438B66…0x438C3D) — player
+/// `n` drives animation `n`: `{count, table, start, duration, frame, next, frac}`.
+#[derive(Debug, Clone, Copy, Default)]
+struct KeyPlayer {
+    table: &'static [u32],
+    start_ms: u64,
+    duration_ms: u64,
+    frame: u32,
+    next: u32,
+    frac: f32,
+}
+
+impl KeyPlayer {
+    fn active(&self) -> bool {
+        !self.table.is_empty()
+    }
+
+    /// A gesture starting now: frame and next are the table's first two when it has two
+    /// (0x438DF1…0x438E18), the fraction 0.
+    fn start(&mut self, table: &'static [u32], now: u64, duration_ms: u64) {
+        self.table = table;
+        self.start_ms = now;
+        self.duration_ms = duration_ms;
+        if table.len() > 1 {
+            self.frame = table[0];
+            self.next = table[1];
+        }
+        self.frac = 0.0;
+    }
+
+    /// 0x438B73…0x438C30: while the elapsed time is under the duration, `p = elapsed / duration ·
+    /// (count − 1)`, the frame `table[fistp(p − 0.5)]`, the next `table[fistp(p + 0.5)]` and the
+    /// fraction `p − fistp(p − 0.5)`; past it the player stops, its last frame kept.
+    fn step(&mut self, now: u64) {
+        if !self.active() {
+            return;
+        }
+        let elapsed = now.saturating_sub(self.start_ms);
+        if elapsed >= self.duration_ms {
+            self.table = &[];
+            return;
+        }
+        let p = elapsed as f32 / self.duration_ms as f32 * (self.table.len() as f32 - 1.0);
+        let i = (p - 0.5).round_ties_even().max(0.0) as usize;
+        let j = (p + 0.5).round_ties_even().max(0.0) as usize;
+        self.frame = self.table[i.min(self.table.len() - 1)];
+        self.next = self.table[j.min(self.table.len() - 1)];
+        self.frac = p - i as f32;
+    }
+}
+
+/// The right arm's gear-change gestures, by the steering frame 0…9 (`0x5CD3AC`…`0x5CD4C0`, the
+/// ten `{count, table}` pairs 0x438CD1…0x438D42 builds): from the wheel out to the lever's frames
+/// 10…15 and back.
+const GEAR_GESTURES: [&[u32]; 10] = [
+    &[0, 10, 11, 12, 14, 15, 14, 12, 11, 10, 0],
+    &[1, 10, 11, 12, 14, 15, 14, 12, 11, 10, 1],
+    &[2, 11, 12, 14, 15, 14, 12, 11, 2],
+    &[3, 11, 12, 14, 15, 14, 12, 11, 3],
+    &[4, 12, 14, 15, 14, 12, 4],
+    &[5, 12, 14, 15, 14, 12, 5],
+    &[6, 13, 15, 13, 6],
+    &[7, 13, 15, 13, 7],
+    &[8, 13, 15, 13, 8],
+    &[9, 13, 15, 13, 9],
+];
+
+/// The handbrake's, three frames each (`0x5CD2BC` pulling, `0x5CD334` letting go, 12 bytes apart,
+/// 0x438EB0…0x438F85): to the lever at 16…18 and the held frame 19.
+const HANDBRAKE_ON: [[u32; 3]; 10] =
+    [[0, 16, 19], [1, 16, 19], [2, 16, 19], [3, 16, 19], [4, 16, 19], [5, 17, 19], [6, 17, 19], [7, 18, 19], [8, 18, 19], [9, 18, 19]];
+const HANDBRAKE_OFF: [[u32; 3]; 10] =
+    [[19, 16, 0], [19, 16, 1], [19, 16, 2], [19, 16, 3], [19, 16, 4], [19, 17, 5], [19, 17, 6], [19, 18, 7], [19, 18, 8], [19, 18, 9]];
+
+/// The body's turn to look back, by the body frame 0…4 (`0x5CD568` into reverse, `0x5CD590` out
+/// of it, `{count, table}` pairs, 0x43914F / 0x4391A3): toward frame 7 and back.
+const REVERSE_ON: [&[u32]; 5] = [&[0, 1, 2, 6, 7], &[1, 2, 6, 7], &[2, 6, 7], &[3, 6, 7], &[4, 6, 7]];
+const REVERSE_OFF: [&[u32]; 5] = [&[7, 6, 2, 1, 0], &[7, 6, 2, 1], &[7, 6, 2], &[7, 6, 3], &[7, 6, 4]];
+
+/// What slot 9's driver half reads off the car each frame (0x438B2C…0x439352).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DriverInputs {
+    /// `[0x6197C4]`, the car detail (`CARDETAIL`, 0x44EF80…0x44EFA7): under 1 the driver is posed,
+    /// not animated
+    pub detail: u8,
+    /// channel 5's `.z`: `ch1.y + ch2.y` — the two front wheels' `+0xB4` steering values over 216,
+    /// negated in a mirrored race (0x438461…0x4384EB) — clamped to ±4.5/23 (0x4385AF…0x4385EB)
+    pub wheel_turns: f32,
+    /// `car+0xD84`, the shift timer (ticks)
+    pub shift_timer: u32,
+    /// `car+0xB50 == 0` and neither pause flag (`[0x606A90]`, `[0x606A98]`) set (0x438CA0…0x438CC2)
+    pub racing: bool,
+    /// `car+0xD86`
+    pub handbrake: bool,
+    /// `car+0xD82 == 0`
+    pub reverse: bool,
+    /// `car+0xE04` / `+0xE08`, the filtered longitudinal and lateral accelerations
+    pub long_acc: f32,
+    pub lat_acc: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DriverAnim {
+    clock_ms: u64,
+    players: [KeyPlayer; ANIMS],
+    /// `R3DCar+0x564` / `+0x566`: the handbrake and reverse states the gestures were last started for
+    handbrake: bool,
+    reverse: bool,
 }
 
 /// One `{start, duration, from, to}` easer — the 16-byte record the original keeps per channel at
@@ -625,11 +983,16 @@ pub const MODEL_TO_BODY: Mat4 = Mat4::from_cols(
 
 impl CarModel {
     pub fn upload(r: &mut Renderer, car: &CarAssets, paths: &nfs_assets::GamePaths, lod: u8, paint: [u8; 3]) -> anyhow::Result<Self> {
-        Self::upload_with_env(r, car, paths, lod, paint, None, false)
+        Self::upload_with_env(r, car, paths, lod, paint, None, false, None)
     }
 
     /// `env`: track environment map (`.env` entry, e.g. "SKY ") for `CarExtEnv` paint reflections.
-    pub fn upload_with_env(r: &mut Renderer, car: &CarAssets, paths: &nfs_assets::GamePaths, lod: u8, paint: [u8; 3], env: Option<nfs_renderer::TextureId>, night: bool) -> anyhow::Result<Self> {
+    ///
+    /// `race_roof`: in a race, the car's `.CABRIODOWN` option for slot 19's roof line
+    /// ([`nfs_assets::car::CarStyle::apply_race_roof`]); `None` in the front end, whose branch
+    /// (0x43B003) does not take it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_with_env(r: &mut Renderer, car: &CarAssets, paths: &nfs_assets::GamePaths, lod: u8, paint: [u8; 3], env: Option<nfs_renderer::TextureId>, night: bool, race_roof: Option<u32>) -> anyhow::Result<Self> {
         // `[styleN]` is **1-based** and `CarAssets::style_index` is the raw 0-based `nfs5.car
         // +0x1C0`, which is what 0x437B33's `inc esi` turns into the section name.
         let mut style = nfs_assets::car::CarStyle::from_tpg(&car.tpg, car.style_index + 1);
@@ -640,10 +1003,21 @@ impl CarModel {
         // deliberately: slot 42 (`SpoilerDown` / `SpoilerUp`) is zeroed by 0x43AEB2, which hides
         // both halves of the pop-up spoiler until the animation channel picks one, and the port
         // does not run that channel — so zeroing it would leave a hole in the engine lid where
-        // the style's own `42 = 1`, the retracted spoiler, belongs. Slot 41's
-        // `2 × slot37 (− 1 when the roof is down)` needs `[carinfo+0x50C]`, which the port has no
-        // equivalent of.
+        // the style's own `42 = 1`, the retracted spoiler, belongs. Slot 41 is recomputed from
+        // the roof option in a race (0x43AE7A).
         style.apply_driver_detail(8, false, false);
+        match race_roof {
+            Some(v) => style.apply_race_roof(v),
+            // slot 19's front-end branch, 0x43B003: slot 41 and slot 6 to 0
+            None => {
+                style.geometry.insert(41, 0);
+                style.geometry.insert(6, 0);
+            }
+        }
+        // and both branches end in the overlay, 0x43B0B7…0x43B0DC, and in `slot58 =
+        // carinfo+0x518`, the `.TINYCAR` flag (0x43B0E5)
+        style.apply_overlay(&car.style_overlay);
+        style.geometry.insert(58, u32::from(car.tiny));
         tracing::info!(style = style.name, "car style");
         let pages = car.build_pages(paths, paint, &style)?;
         let page_tex: Vec<(nfs_renderer::TextureId, bool)> = pages
@@ -679,8 +1053,8 @@ impl CarModel {
         let mut min = Vec3::splat(f32::MAX);
         let mut max = Vec3::splat(f32::MIN);
         let mut lights: Vec<CarLight> = Vec::new();
-        let mut roof: Vec<MorphPart> = Vec::new();
-        let mut roof_length = 0u32;
+        let mut morph: [Vec<MorphPart>; ANIMS] = Default::default();
+        let mut anim_length = [0u32; ANIMS];
         let mut wheel_radius: f32 = 0.3;
         let mut half_track: f32 = 0.7;
         for a in &arts {
@@ -698,10 +1072,11 @@ impl CarModel {
             let mut parts = Vec::new();
             let mut part_channels: Vec<u8> = Vec::new();
             let (mut lamp_sum, mut lamp_n) = (Vec3::ZERO, 0.0f32);
-            // the roof's morph frames (animation 1): each frame's meshes, in frame 0's order —
+            // an animated article's morph frames: each frame's meshes, in frame 0's order —
             // 0x43C4FB probes `vt` part `frame·0x10 + index` until one is missing, and the count
             // is the animation's length when it is the largest (0x43C54B…0x43C56F)
-            let roof_frames: Vec<Vec<MeshData>> = if !is_wheel && g.base.as_ref().is_some_and(|b| b.anim == 1) {
+            let anim = g.base.as_ref().map(|b| b.anim as usize).filter(|&n| n > 0 && n < ANIMS).unwrap_or(0);
+            let roof_frames: Vec<Vec<MeshData>> = if !is_wheel && anim != 0 {
                 let mut frames = Vec::new();
                 for f in 1u16.. {
                     let Ok(gf) = car.crp.article_geometry_frame(&car.crp_data, a, f) else { break };
@@ -713,7 +1088,7 @@ impl CarModel {
                 Vec::new()
             };
             if !roof_frames.is_empty() {
-                roof_length = roof_length.max(roof_frames.len() as u32 + 1);
+                anim_length[anim] = anim_length[anim].max(roof_frames.len() as u32 + 1);
             }
             for (k, mm) in article_meshes(&g, lod, &mut skipped).into_iter().enumerate() {
                 let mut mesh = mm.mesh;
@@ -745,7 +1120,7 @@ impl CarModel {
                             _ => break,
                         }
                     }
-                    roof.push(MorphPart { mesh: id, base: mesh.vertices.clone(), frames: positions });
+                    morph[anim].push(MorphPart { mesh: id, base: mesh.vertices.clone(), frames: positions });
                 }
                 parts.push((id, material, local));
                 part_channels.push(g.base.as_ref().map(|b| b.rot_channel).unwrap_or(0));
@@ -763,7 +1138,7 @@ impl CarModel {
                 body_channel.extend(part_channels);
             }
         }
-        tracing::info!(body_parts = body.len(), wheels = wheels.len(), lights = lights.len(), roof_parts = roof.len(), roof_length, skipped, pages = pages.len(), wheel_radius, half_track, "car uploaded");
+        tracing::info!(body_parts = body.len(), wheels = wheels.len(), lights = lights.len(), roof_parts = morph[1].len(), roof_length = anim_length[1], anims = ?anim_length, skipped, pages = pages.len(), wheel_radius, half_track, "car uploaded");
         // the windscreen seen from the driver's seat: the `Wndo` quad with `INTGLASS`'s `glai`
         // entry. 0x43A490 draws it whenever the camera's view id is 0 or 1 — the two views that do
         // not draw the car itself — and skips it in a replay.
@@ -806,13 +1181,20 @@ impl CarModel {
         })();
         tracing::info!(patches = damage_patches.len(), night, glass = window.is_some(), "damage decals");
         Ok(Self {
+            scale: 1.0,
             body,
             body_channel,
             material_light,
-            roof,
-            roof_length,
+            morph,
+            anim_length,
+            anim_time: [-1.0; ANIMS],
             roof_state: 0,
+            driver: DriverAnim::default(),
+            blended: [None; ANIMS],
             channel_turns: [0.0; 32],
+            channel_yz: [[0.0; 2]; 32],
+            dash: [0.0; 4],
+            clock_ms: 0,
             move_spoiler_extent: tpg_f32(&car.tpg, "movespoilerextent"),
             headlight_extent: tpg_f32(&car.tpg, "headlightextent"),
             spoiler: ChannelEase::default(),
@@ -870,50 +1252,181 @@ impl CarModel {
         }
     }
 
-    /// Step the two animated channels this port drives — `car-model.md`.
+    /// Slot 9's race branch for the parts this port animates (0x43891E…0x438B27, the race only —
+    /// `[0x65B928]` set skips it) and slot 6's headlight easer.
     ///
-    /// **The spoiler**, channel 16, is slot 9's block at 0x438931…0x438A57: deploy above
-    /// `[0x5B3698]` = 22.222 m/s (**80 km/h**), retract below `[0x5B3694]` = 13.889 (**50**),
-    /// over `0x7D0` = **2000 ms**, and a travel already running is never interrupted — 0x438950
-    /// compares `now − start` against the duration before it re-arms. The angle is
-    /// `t × movespoilerextent` turns (0x43878D clamps it to `[0, extent]` against 1.0).
+    /// **The pop-up wing is animation 2**, the `SpoilerW` morph — not channel 16, which this said
+    /// until 2026-09-22 (channel 16 is written only in the front end, from the roof: see
+    /// [`Self::follow_roof`]). Above `[0x5B3698]` = 22.222 m/s (**80 km/h**) of `car+0xEC4`, and
+    /// only once the easer at `car+0x64 + 0x170` has run its course (0x438950), it restarts from
+    /// where it is toward animation 2's length (`[car+0x59C]`, 0x43895E) over **2000 ms**; below
+    /// `[0x5B3694]` = 13.889 (**50**) the same toward 0 (0x4389D1…0x438A57). It re-arms whenever
+    /// the gate holds and the last travel is over, even toward the value it already has — so a
+    /// retract can wait out an idle travel. The value (0x438A5E…0x438AD1: `from + (to − from)·t`,
+    /// `to` once `t` passes 1) goes to 0x4380D0(2, ·).
     ///
-    /// **The headlights**, channel 17, are slot 6's easer at 0x43950E…0x439620: the same shape
-    /// with a **1000 ms** duration, from the car's headlight bit — which `Car_init` freezes at
-    /// 0x410C74 as `word[0x628A28] ? 3 : 0`, so it is the track's night flag and never changes
-    /// during a race.
-    pub fn update_animation(&mut self, dt_ms: u32, speed_mps: f32, headlights_on: bool) {
-        let step = |e: &mut ChannelEase, dt: u32, want: f32, duration: u32| {
+    /// **The aerial is animation 7**, and only a `.TINYCAR` moves it (0x438ADE…0x438B27):
+    /// `min(0.067 · car+0xEC4, 1)` (`[0x5B3690]`), 0 in reverse (`car+0xD82 == 0`).
+    ///
+    /// **The headlights**, channel 17, are slot 6's easer at 0x43950E…0x439620: a **1000 ms**
+    /// travel from the car's headlight bit — which `Car_init` freezes at 0x410C74 as
+    /// `word[0x628A28] ? 3 : 0`, so it is the track's night flag and never changes during a race.
+    pub fn update_animation(&mut self, r: &mut Renderer, dt_ms: u32, speed_mps: f32, headlights_on: bool, tiny: bool, reverse: bool) {
+        // the wing's easer: advance, then (0x43892B) re-arm when the gate holds and it is done
+        let e = &mut self.spoiler;
+        if e.elapsed < e.duration {
+            e.elapsed = e.elapsed.saturating_add(dt_ms);
+        }
+        let len = self.anim_length[2] as f32;
+        let want = if speed_mps > 22.222 {
+            Some(len)
+        } else if speed_mps < 13.889 {
+            Some(0.0)
+        } else {
+            None
+        };
+        if let Some(want) = want
+            && e.elapsed >= e.duration
+        {
+            // 0x438970…0x4389CC: the travel's current value becomes the new start
+            e.from = e.to;
+            e.to = want;
+            e.elapsed = 0;
+            e.duration = 2000;
+        }
+        let v = if e.duration == 0 || e.elapsed >= e.duration {
+            e.to
+        } else {
+            e.from + (e.to - e.from) * (e.elapsed as f32 / e.duration as f32)
+        };
+        self.set_anim(r, 2, v);
+        if tiny {
+            let t = if reverse { 0.0 } else { (speed_mps * 0.067).min(1.0) };
+            self.set_anim(r, 7, t);
+        }
+        if self.headlight_extent != 0.0 {
+            let e = &mut self.headlight;
+            let want = if headlights_on { 1.0 } else { 0.0 };
             if e.elapsed < e.duration {
-                e.elapsed = e.elapsed.saturating_add(dt);
+                e.elapsed = e.elapsed.saturating_add(dt_ms);
             } else if e.to != want {
                 e.from = e.to;
                 e.to = want;
                 e.elapsed = 0;
-                e.duration = duration;
+                e.duration = 1000;
             }
             let t = if e.duration == 0 { 1.0 } else { (e.elapsed as f32 / e.duration as f32).min(1.0) };
-            e.from + (e.to - e.from) * t
-        };
-        if self.move_spoiler_extent != 0.0 {
-            // the gate has a dead band between 50 and 80 km/h: neither test fires, so the
-            // spoiler stays where it is
-            let want = if speed_mps > 22.222 {
-                1.0
-            } else if speed_mps < 13.889 {
-                0.0
+            let v = e.from + (e.to - e.from) * t;
+            let x = self.headlight_extent;
+            self.set_channel(17, v * x);
+        }
+    }
+
+    /// Slot 9's driver half (0x438B2C…0x439352, the race only): the right arm (animation 4), the
+    /// left arm (5) and the body (6), `CarModel`'s eight keyframe players, and `R3DCar+0x564` /
+    /// `+0x566`. `RE/notes/car-model.md` "Slot 9" has the whole of it.
+    pub fn update_driver(&mut self, r: &mut Renderer, dt_ms: u32, d: &DriverInputs) {
+        // under detail 1 the driver is posed and nothing else runs (0x438B2C…0x438B5A)
+        if d.detail < 1 {
+            self.set_anim(r, 4, 4.5);
+            self.set_anim(r, 5, 4.5);
+            self.set_anim(r, 6, 5.0);
+            return;
+        }
+        self.driver.clock_ms += dt_ms as u64;
+        let now = self.driver.clock_ms;
+        for p in &mut self.driver.players {
+            p.step(now);
+        }
+        // the steering frame: 23·ch5.z + 4.5 (0x438C4F…0x438C6B), 0…9 as a table index
+        // (0x438CC8…0x438D7E: under 0 → 0, over 9 → 9, else fistp(f − 0.5))
+        let f = d.wheel_turns.clamp(-4.5 / 23.0, 4.5 / 23.0) * 23.0 + 4.5;
+        let index = |f: f32| -> usize {
+            if f < 0.0 {
+                0
+            } else if f > 9.0 {
+                9
             } else {
-                self.spoiler.to
+                (f - 0.5).round_ties_even().max(0.0) as usize
+            }
+        };
+        self.set_anim(r, 5, f);
+        // a gesture already running is copied into the arm's record (0x438C7A → 0x439035);
+        // otherwise the gear change may start one (0x438C92…0x438E18), then the handbrake
+        // (0x438E3A…0x438FEA), and on the frame one starts the arm is not written (0x438FF4)
+        let arm = self.driver.players[4];
+        if arm.active() {
+            self.set_anim_keys(r, 4, arm.frame, arm.next, arm.frac);
+        } else {
+            if d.shift_timer > 0 && d.racing {
+                let ms = (d.shift_timer as i64 * 2000 / 32) as u64;
+                self.driver.players[4].start(GEAR_GESTURES[index(f)], now, ms);
+            }
+            if !self.driver.players[4].active() && d.handbrake != self.driver.handbrake {
+                self.driver.handbrake = d.handbrake;
+                let i = index(f);
+                let t: &'static [u32] = if d.handbrake { &HANDBRAKE_ON[i] } else { &HANDBRAKE_OFF[i] };
+                self.driver.players[4].start(t, now, 125);
+            }
+            if !self.driver.players[4].active() {
+                self.set_anim(r, 4, if self.driver.handbrake { 19.0 } else { f });
+            }
+        }
+        // the body: 2 − 0.1·car+0xE08, the lateral acceleration's dead band 0.1 (0x439091…0x4390D5)
+        let lat = if d.lat_acc.abs() < 0.1 { 0.0 } else { -d.lat_acc };
+        let b = 0.1 * lat + 2.0;
+        let body = self.driver.players[6];
+        if body.active() {
+            // 0x4390DA → 0x4392F1
+            self.set_anim_keys(r, 6, body.frame, body.next, body.frac);
+            return;
+        }
+        if d.reverse != self.driver.reverse {
+            self.driver.reverse = d.reverse;
+            let i = if b < 0.0 {
+                0
+            } else if b > 4.0 {
+                4
+            } else {
+                (b + 0.5) as usize
             };
-            let t = step(&mut self.spoiler, dt_ms, want, 2000);
-            let e = self.move_spoiler_extent;
-            self.set_channel(16, t * e);
+            let t = if d.reverse { REVERSE_ON[i] } else { REVERSE_OFF[i] };
+            self.driver.players[6].start(t, now, 250);
         }
-        if self.headlight_extent != 0.0 {
-            let t = step(&mut self.headlight, dt_ms, if headlights_on { 1.0 } else { 0.0 }, 1000);
-            let e = self.headlight_extent;
-            self.set_channel(17, t * e);
+        if self.driver.players[6].active() {
+            // 0x439216: started this frame, not written
+        } else if self.driver.reverse {
+            // looking back over the shoulder (0x43922E…0x439241)
+            self.set_anim(r, 6, 7.0);
+        } else if d.long_acc <= -0.1 {
+            // braking: the body frame toward frame 5 by 0.1·|car+0xE04| (0x43924D…0x4392D9)
+            let frame = (b - 0.5).round_ties_even().max(0.0) as u32;
+            self.set_anim_keys(r, 6, frame, 5, -0.1 * d.long_acc);
+        } else {
+            self.set_anim(r, 6, b);
         }
+    }
+
+    /// Slot 9's front-end branch for channel **16**, `MoveSpoiler` (0x438751…0x4387CC): it
+    /// follows the **roof**, animation 1 (`car+0x57C` frame + `+0x584` fraction = its time `v`,
+    /// `+0x588` its length `L`): `v · extent` over the first frame, the full `movespoilerextent`
+    /// until the last, `(L − v) · extent` over it. So the 996's and the Boxster's rear lid turns
+    /// out of the way while the roof folds, and back.
+    pub fn follow_roof(&mut self) {
+        if self.move_spoiler_extent == 0.0 || self.anim_length[1] == 0 {
+            return;
+        }
+        let v = self.anim_time[1].max(0.0);
+        let l = self.anim_length[1] as f32;
+        let e = self.move_spoiler_extent;
+        let t = if (0.0..1.0).contains(&v) {
+            v * e
+        } else if v < l - 1.0 {
+            e
+        } else {
+            (l - v) * e
+        };
+        self.set_channel(16, t);
     }
 
     /// The rotation a channel's three floats compose to: `Rx·Ry·Rz`, each angle in **turns**
@@ -924,7 +1437,8 @@ impl CarModel {
     /// written this way round so a later channel that uses them lands in the right order.
     fn channel_matrix(&self, n: u8) -> Mat4 {
         let t = self.channel_turns.get(n as usize).copied().unwrap_or(0.0);
-        if t == 0.0 {
+        let [y, z] = self.channel_yz.get(n as usize).copied().unwrap_or([0.0; 2]);
+        if t == 0.0 && y == 0.0 && z == 0.0 {
             return Mat4::IDENTITY;
         }
         // **Channels 6 and 7 are the doors** (0x43CA5A): they turn about the `.tpg` `dooraxis`,
@@ -938,7 +1452,59 @@ impl CarModel {
             }
             return Mat4::from_axis_angle(a.normalize_or(Vec3::Y), t * std::f32::consts::TAU);
         }
-        Mat4::from_rotation_x(t * std::f32::consts::TAU)
+        // Rx·Ry·Rz, in that order (0x43CA26 / 0x43CA38); the y and z senses follow the x one,
+        // MEDIUM until the needles and the steering wheel have been seen turning the right way
+        use std::f32::consts::TAU;
+        Mat4::from_rotation_x(t * TAU) * Mat4::from_rotation_y(y * TAU) * Mat4::from_rotation_z(z * TAU)
+    }
+
+    /// The dash needles' calibration from the car's `nfs5.car` record (see `dash`).
+    pub fn set_dash(&mut self, tach0: f32, tach1000: f32, speedo0: f32, speedo100: f32) {
+        self.dash = [tach0, tach1000, speedo0, speedo100];
+    }
+
+    /// Slot 9's race channels (0x438461…0x43874C) other than the wheels' own draw: the steering
+    /// wheel, the two needles, the non-spinning wheel parts and the siren.
+    ///
+    /// `steer` is each front wheel's `+0xB4` over 216 (turns, negated in a mirrored race); `rpm`
+    /// is `car+0xDB4`, `speed` `car+0xEC4`; `dt_ms` advances the clock 0x53C2E0 stands for.
+    pub fn update_race_channels(&mut self, dt_ms: u32, steer: [f32; 2], spin: [f32; 4], rpm: f32, speed: f32) {
+        self.clock_ms += dt_ms as u64;
+        // `TIMER_getTicks` (0x53C2E0 → `[0x6B7C7C]`) counts at 128 Hz (`timing.md`)
+        let clock = (self.clock_ms * 128 / 1000) as u32;
+        let yz = &mut self.channel_yz;
+        // 1, 2 `.y` = the fronts' steer; 1…4 `.x` = −the wheel's turn (`+0x88`); `.z` is the
+        // wheel's `+0x70`, which this port's suspension does not produce (left at 0)
+        for (k, s) in steer.iter().enumerate() {
+            yz[1 + k][0] = *s;
+        }
+        for k in 0..4 {
+            self.channel_turns[1 + k] = -spin[k];
+        }
+        // 11 `.z`: `.TACH0RPM + .TACH1000RPM · rpm · 0.001` (0x43853C…0x438561); 12 `.z`:
+        // `.SPEEDO0KM + .SPEEDO100KM · car+0xEC4 · 0.144` (0x43856C…0x438593)
+        let [t0, t1, s0, s1] = self.dash;
+        yz[11][1] = t0 + t1 * rpm * 0.001;
+        yz[12][1] = s0 + s1 * speed * 0.144;
+        // 5 `.z`: the steering wheel, `ch1.y + ch2.y` within ±4.5/23 (0x43858F…0x4385FB)
+        yz[5][1] = (steer[0] + steer[1]).clamp(-4.5 / 23.0, 4.5 / 23.0);
+        // 18…21: channels 1…4 with `.x` = 0 — the tread and the shadow turn but do not spin
+        // (0x438669…0x438726)
+        for k in 0..4 {
+            yz[18 + k] = yz[1 + k];
+            self.channel_turns[18 + k] = 0.0;
+        }
+        // 22 `.y`: 0x53C2E0() · 1/128 — the cop's siren glare, a turn a second (0x43872C…0x43874C)
+        yz[22][0] = (clock as f32 * 0.007_812_5).fract();
+    }
+
+    /// Channel 22 alone — the one slot 9 channel that reads no car state, only the clock — for the
+    /// models every car of a type shares (traffic, the cops): their sirens turn as one, which is
+    /// what the original's per-car copies do too.
+    pub fn update_clock_channels(&mut self, dt_ms: u32) {
+        self.clock_ms += dt_ms as u64;
+        let clock = (self.clock_ms * 128 / 1000) as u32;
+        self.channel_yz[22][0] = (clock as f32 * 0.007_812_5).fract();
     }
 
     /// The lids' two easers, 0x439A00 / 0x439AA0 (hood) and 0x439B30 / 0x439BD0 (engine lid):
@@ -989,7 +1555,8 @@ impl CarModel {
     /// Draw items for a car at `car_to_world` (body frame → world). `wheel_spin` in turns,
     /// `steer` in turns for the front wheels, positive to the right — take it from
     /// `Vehicle::wheel_steer_turns`, not from the raw `Wheel::steer`.
-    pub fn draw_items(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: f32) -> Vec<DrawItem> {
+    pub fn draw_items(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2]) -> Vec<DrawItem> {
+        let car_to_world = car_to_world * Mat4::from_scale(Vec3::splat(self.scale));
         let mut out = Vec::with_capacity(self.body.len() + 4 * 8);
         for (i, (mesh, material, local)) in self.body.iter().enumerate() {
             // A part bound to a rotation channel turns about **its own origin**: 0x43CA19…
@@ -1008,13 +1575,19 @@ impl CarModel {
                 (false, true) => 2,
                 (false, false) => 3,
             };
-            let spin = Mat4::from_rotation_x(-wheel_spin[idx] * std::f32::consts::TAU);
+            // The original draws its wheels through channels 1…4 like every other moving part:
+            // `.x = −(wheel+0x88)` (0x438600…0x438660), in **model** space, which is the body
+            // frame turned half a turn about y — so `+turn` about the body's x. This read
+            // `−turn` until 2026-09-22 and rolled the wheels backwards.
+            let spin = Mat4::from_rotation_x(wheel_spin[idx] * std::f32::consts::TAU);
             // **Positive steer is a right turn** (the right arrow gives +1, and the car yaws right
             // on it), and in the body frame +X is right and +Z forward — so the wheel turns by
             // `+steer`: `from_rotation_y(θ)` carries forward (0,0,1) to (sin θ, 0, cos θ), toward
             // +X. This said `-steer` until 2026-09-21 and drew the front wheels turned the wrong
             // way while the car steered correctly — found in play.
-            let st = if w.is_front { Mat4::from_rotation_y(steer * std::f32::consts::TAU) } else { Mat4::IDENTITY };
+            // `.y` is the wheel's own `+0xB4` over 216 (channels 1 and 2, 0x438461…0x4384EB); a
+            // turn about y is the same in both frames
+            let st = if w.is_front { Mat4::from_rotation_y(steer[if w.is_left { 0 } else { 1 }] * std::f32::consts::TAU) } else { Mat4::IDENTITY };
             for (mesh, material, local) in &w.parts {
                 // local has translation = pivot; rotate about the pivot in model space
                 let pivot = local.w_axis.truncate();
@@ -1043,16 +1616,55 @@ impl CarModel {
     /// the draw (0x43E2FD…0x43E35B) blends each vertex `A + (B − A)·frac` between that frame and
     /// the next — the frame alone where there is no next. Past the last frame the part keeps it.
     pub fn set_roof(&mut self, r: &mut Renderer, state: i32) {
-        if self.roof_length == 0 || state == self.roof_state {
+        if self.anim_length[1] == 0 || state == self.roof_state {
             return;
         }
         self.roof_state = state;
-        let t = (self.roof_length as f32 * state as f32 * (1.0 / 255.0)).clamp(0.0, self.roof_length as f32);
+        let t = self.anim_length[1] as f32 * state as f32 * (1.0 / 255.0);
+        self.set_anim(r, 1, t);
+    }
+
+    /// `0x438190(n)`: animation `n`'s length in frames, 0 when the car has none.
+    pub fn anim_length(&self, n: usize) -> u32 {
+        self.anim_length.get(n).copied().unwrap_or(0)
+    }
+
+    /// **0x4380D0(n, t)**: animation `n` to time `t` frames, clamped to `[0, length]`.
+    pub fn set_anim(&mut self, r: &mut Renderer, n: usize, t: f32) {
+        let len = self.anim_length(n);
+        if len == 0 {
+            return;
+        }
+        let t = t.clamp(0.0, len as f32);
+        if t == self.anim_time[n] {
+            return;
+        }
+        self.anim_time[n] = t;
         let frame = (t - 0.5).round_ties_even().max(0.0) as usize;
         let frac = t - frame as f32;
-        for p in &self.roof {
+        self.blend(r, n, frame, frame + 1, frac);
+    }
+
+    /// Write animation `n`'s `{frame, next, frac}` straight into its record, as slot 9's keyframe
+    /// copies do (0x439035…0x43908D for the right arm, 0x4392F1…0x43933C for the body): the draw
+    /// (0x43E2FD…0x43E35B) blends each vertex from `frame` toward `next` by `frac`.
+    fn set_anim_keys(&mut self, r: &mut Renderer, n: usize, frame: u32, next: u32, frac: f32) {
+        if self.anim_length(n) == 0 {
+            return;
+        }
+        // a key write is not a time: forget the last one so a later 0x4380D0 re-uploads
+        self.anim_time[n] = -1.0;
+        self.blend(r, n, frame as usize, next as usize, frac);
+    }
+
+    fn blend(&mut self, r: &mut Renderer, n: usize, frame: usize, next: usize, frac: f32) {
+        if self.blended[n] == Some((frame, next, frac)) {
+            return;
+        }
+        self.blended[n] = Some((frame, next, frac));
+        for p in &self.morph[n] {
             let Some(a) = p.frames.get(frame.min(p.frames.len() - 1)) else { continue };
-            let b = p.frames.get(frame + 1);
+            let b = p.frames.get(next);
             let frac = if frame >= p.frames.len() { 0.0 } else { frac };
             let mut v = p.base.clone();
             for (i, out) in v.iter_mut().enumerate() {
@@ -1110,7 +1722,7 @@ impl LightBlock {
 
 impl CarModel {
     /// `draw_items` lit through each material's `R3DLightLayer` from `block`.
-    pub fn draw_items_block(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: f32, block: &LightBlock) -> Vec<DrawItem> {
+    pub fn draw_items_block(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2], block: &LightBlock) -> Vec<DrawItem> {
         let mut out = self.draw_items(car_to_world, wheel_spin, steer);
         for it in &mut out {
             it.layer_light = self.material_light.get(&it.material).and_then(|l| block.layer_light(*l));
@@ -1135,4 +1747,161 @@ fn flat_colour(i: u16) -> [f32; 4] {
         _ => (v, p, q),
     };
     [r, g, b, 1.0]
+}
+
+/// The track loader's collision objects (0x4750B0 at 0x475152…0x475302): every article of the
+/// track's `.crp` whose `Base` byte 0 lacks 0x40 (0x47515A) and whose tag is set, through
+/// `AnimDefs::lookup` (0x47ED90 — an unknown tag gets the file's first definition, `ENDW`):
+///
+/// * `kCylinder` → a cylinder whose radius is the constant **0.25** the loader pushes, with
+///   `int(def.radius)` — `_ftol` 0x5A0F98 — where the base keeps the event class `+0x20`
+///   (0x4751D5…0x47520B; the arguments are read as the image passes them);
+/// * `kBox` → a box on 0x474CB0's footprint of the article's vertices, through its `tr`, class 0
+///   (0x475241…0x475302), radius `|(max.x − c.x, 0, max.z − c.z)| × 1.05`.
+///
+/// The AABB is the article's world-space vertex box at its lowest LOD — MEDIUM: the original takes
+/// eight corners from the bundle's box slot, whose frame was not settled.
+pub fn track_props(track: &TrackAssets) -> Vec<nfs_physics::props::Prop> {
+    use nfs_physics::props::{Breakable, Prop, PropShape, box_footprint};
+    let mut out = Vec::new();
+    let Ok(arts) = track.crp.articles(&track.crp_data) else { return out };
+    let tags = article_tags(track, &arts);
+    for (index, a) in arts.iter().enumerate() {
+        let Ok(g) = track.crp.article_geometry(&track.crp_data, a) else { continue };
+        let Some(b) = g.base.as_ref() else { continue };
+        if b.flags & 0x40 != 0 || b.tag_u32() == 0 {
+            continue;
+        }
+        let Some(def) = track.animdefs.lookup(b.tag_u32()) else { continue };
+        let Some(lod) = g.primitives.iter().map(|p| p.lod).min() else { continue };
+        let tr = g.transform.as_ref().map(Mat4::from_cols_array).unwrap_or(Mat4::IDENTITY);
+        let mut skipped = 0;
+        let local: Vec<Vec3> = article_meshes(&g, lod, &mut skipped)
+            .iter()
+            .flat_map(|m| m.mesh.vertices.iter().map(|v| Vec3::from(v.position)))
+            .collect();
+        if local.is_empty() {
+            continue;
+        }
+        let world: Vec<Vec3> = local.iter().map(|p| tr.transform_point3(*p)).collect();
+        let (mn, mx) = world.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
+        // 0x476380 finds each piece's `QuatGroup` among the instances by tag (0x478640 / 0x478670)
+        // and gives up at one whose `Anim` part is missing or has both words 0 (0x476501…0x47651F)
+        let breakable = (!def.pieces.is_empty()).then(|| Breakable {
+            bands: def.bands.clone(),
+            band_pieces: def.band_pieces.clone(),
+            resolved: def
+                .pieces
+                .iter()
+                .map(|(_, p)| first_by_tag(&tags, group_tag(&p.quat_group)).and_then(|k| tags[k].1).is_some_and(|w| w != [0, 0]))
+                .collect(),
+            started: std::cell::Cell::new(None),
+            article: index,
+        });
+        let shape = match def.collide_type.as_str() {
+            "kCylinder" => PropShape::Cylinder { radius: 0.25 },
+            "kBox" => {
+                let corners = box_footprint(&local).map(|c| tr.transform_point3(c));
+                let c = (mn + mx) * 0.5;
+                let radius = Vec3::new(mx.x - c.x, 0.0, mx.z - c.z).length() * 1.05;
+                PropShape::Box { corners, radius }
+            }
+            _ => continue,
+        };
+        let class = if matches!(shape, PropShape::Cylinder { .. }) { def.radius as i32 as u32 } else { 0 };
+        out.push(Prop { shape, aabb_min: mn, aabb_max: mx, class, breakable });
+    }
+    out
+}
+
+/// Every article's `Base+0x44` tag and its `Anim` part's first two words (the frame count and the
+/// vertex-frame count), in `.crp` order — what 0x478640 / 0x478670 search and 0x476380 reads.
+fn article_tags(track: &TrackAssets, arts: &[nfs_formats::crp::Article]) -> Vec<(u32, Option<[u32; 2]>)> {
+    arts.iter()
+        .map(|art| {
+            let tag = track.crp.article_geometry(&track.crp_data, art).ok().and_then(|g| g.base.map(|b| b.tag_u32())).unwrap_or(0);
+            let anim = art.level(b"Anim").and_then(|e| track.crp.entry_data(&track.crp_data, e).ok()).filter(|d| d.len() >= 8).map(|d| {
+                [u32::from_le_bytes([d[0], d[1], d[2], d[3]]), u32::from_le_bytes([d[4], d[5], d[6], d[7]])]
+            });
+            (tag, anim)
+        })
+        .collect()
+}
+
+/// 0x478640: the first instance whose tag is `tag` (a linear search, `-1` when none).
+fn first_by_tag(tags: &[(u32, Option<[u32; 2]>)], tag: u32) -> Option<usize> {
+    tags.iter().position(|t| t.0 == tag)
+}
+
+/// A piece's group name as the parser keeps it: four characters upper-cased (0x5A262C at 0x47E8D7)
+/// packed into the dword the search compares, 0 when the key is absent.
+fn group_tag(name: &Option<String>) -> u32 {
+    let Some(n) = name else { return 0 };
+    let mut b = [0u8; 4];
+    for (k, c) in n.bytes().take(4).enumerate() {
+        b[k] = c.to_ascii_uppercase();
+    }
+    u32::from_le_bytes(b)
+}
+
+#[cfg(test)]
+mod driver_tests {
+    use super::*;
+
+    /// 0x470E90 for a one-shot piece: 31 frames at `playbackrate=5` run 1.28 ticks a frame and stop
+    /// once frame 29 is reached; the drift grows as `ticks · rate`.
+    #[test]
+    fn piece_sampler_runs_out_and_drifts() {
+        use nfs_formats::crp::{AnimFrame, AnimTrack};
+        let frames = (0..31).map(|k| AnimFrame { rotation: [0.0, 0.0, 0.0, 1.0], position: [0.0, k as f32, 0.0], scale: [1.0; 3] }).collect();
+        let track = AnimTrack { frames };
+        let flags = nfs_formats::animdefs::PieceFlags::default();
+        let (m, playing) = sample_piece(&track, 0.1 / 5.0, flags, 0.0, Vec3::X, 0);
+        assert!(playing && m.w_axis.truncate().length() < 1e-6);
+        // 16 ticks = 12.5 frames: y halfway between 12 and 13, x drift 16 · 1.28
+        let (m, playing) = sample_piece(&track, 0.1 / 5.0, flags, 0.0, Vec3::X, 16);
+        assert!(playing);
+        assert!((m.w_axis.y - 12.5).abs() < 1e-4 && (m.w_axis.x - 16.0 * 1.28).abs() < 1e-3, "{m:?}");
+        // 29 frames = 37.12 ticks: the last frame, held, and the player done
+        let (m, playing) = sample_piece(&track, 0.1 / 5.0, flags, 0.0, Vec3::ZERO, 38);
+        assert!(!playing && (m.w_axis.y - 30.0).abs() < 1e-6);
+        assert!(sample_piece(&track, 0.1 / 5.0, flags, 0.0, Vec3::ZERO, 37).1);
+    }
+
+    /// 0x438B73…0x438C30: a player walks its table over the duration — frame, next and the
+    /// fraction between — and stops, keeping its last frame, once the duration is out.
+    #[test]
+    fn key_player_walks_its_table() {
+        let mut p = KeyPlayer::default();
+        p.start(GEAR_GESTURES[0], 1000, 500);
+        assert_eq!((p.frame, p.next, p.frac), (0, 10, 0.0));
+        // half way: p = 0.5 · 10 = 5 → table[fistp(4.5)] = table[4], table[fistp(5.5)] = table[6]
+        p.step(1250);
+        assert_eq!((p.frame, p.next), (GEAR_GESTURES[0][4], GEAR_GESTURES[0][6]));
+        assert!((p.frac - 1.0).abs() < 1e-6);
+        p.step(1499);
+        assert!(p.active());
+        p.step(1500);
+        assert!(!p.active());
+        assert_eq!(p.frame, GEAR_GESTURES[0][9]);
+    }
+
+    /// Every gesture starts and ends on its steering frame, and the handbrake and reverse tables
+    /// meet in the held frame (19 / 7) — the tables as the image has them.
+    #[test]
+    fn gesture_tables_round_trip() {
+        for (i, g) in GEAR_GESTURES.iter().enumerate() {
+            assert_eq!((g[0], *g.last().unwrap()), (i as u32, i as u32));
+        }
+        for i in 0..10 {
+            assert_eq!(HANDBRAKE_ON[i][0], i as u32);
+            assert_eq!(HANDBRAKE_ON[i][2], 19);
+            assert_eq!(HANDBRAKE_OFF[i][0], 19);
+            assert_eq!(HANDBRAKE_OFF[i][2], i as u32);
+        }
+        for i in 0..5 {
+            assert_eq!(*REVERSE_ON[i].last().unwrap(), 7);
+            assert_eq!(REVERSE_OFF[i][0], 7);
+        }
+    }
 }

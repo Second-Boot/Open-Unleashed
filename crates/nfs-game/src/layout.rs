@@ -239,6 +239,13 @@ pub struct LayoutScreen {
     badges: HashMap<usize, (String, String, [f32; 4])>,
     /// milliseconds this screen has been up, for the map widget's own cycle (0x4FCB50)
     clock_ms: u32,
+    /// each `NFS5.MOVIECIRCLE`'s overlay (0x4CDC80), made on its first draw
+    movie_overlays: std::cell::RefCell<HashMap<usize, crate::movie_overlay::MovieOverlay>>,
+    /// the credits roll the movie circle draws on the credits screen (0x4CE0F0)
+    credits_roll: std::cell::RefCell<Option<crate::movie_overlay::CreditsRoll>>,
+    /// `[0x65B940]`, the name-box codes the player has typed (`nfs_game::cheats`) — bit 6 is read
+    /// by the credits roll
+    pub cheat_bits: u32,
     /// the `weeicons.fsh` entry tagged `GLNT`, when this screen has a `NFS5.HEADER` to sweep it
     /// across — `RE/notes/controls.md` §4.25
     glint: Option<usize>,
@@ -842,6 +849,12 @@ fn tint(c: [u8; 4]) -> [f32; 4] {
     [lin(c[0]), lin(c[1]), lin(c[2]), c[3] as f32 / 255.0]
 }
 
+/// `NFS5.MOVIECIRCLE`'s flash frames and its two run fonts (0x4CDE99, 0x4CDED3).
+const MOVIE_FLASHES: &str = "circles.fsh";
+const RUN_FONTS: [&str; 2] = ["univers7b.ffn", "univers11b.ffn"];
+/// The credits roll's body `[+0x21C]` and heading `[+0x220]` fonts.
+const ROLL_FONTS: [&str; 2] = ["univers11b.ffn", "univers8b.ffn"];
+
 /// The tag the chronicle's picture tiles carry, which the control's own name repeats at 0x5DBBFE.
 const CHRONICLE_PICTURE_TAG: &str = "1111";
 
@@ -1283,6 +1296,13 @@ impl LayoutScreen {
         // The pointer belongs to no widget — the front end draws it itself out of
         // `FEData/Art/Pointer.fsh` every frame (§4.152), so its 34 entries have to be asked for
         // here or nothing would ever load them.
+        // `NFS5.MOVIECIRCLE`'s flashes are the five entries of `circles.fsh` its constructor loads
+        // (0x52069C…0x5206D5)
+        if layout.elements.iter().any(|e| e.class == "NFS5.MOVIECIRCLE") {
+            for i in 0..5 {
+                wanted.push((MOVIE_FLASHES.to_string(), i));
+            }
+        }
         for i in 0..34 {
             wanted.push((POINTER.to_string(), i));
         }
@@ -1314,6 +1334,15 @@ impl LayoutScreen {
         let mut want: Vec<String> = vec![DEFAULT_FONT.to_string(), DIALOG_TEXT_FONT.to_string(), DIALOG_BUTTON_FONT.to_string()];
         // `NFS5.BADGE` builds its own two fonts rather than taking one from the file: 0x4CF25C
         // loads `Univers14b.ffn` for the player's name and 0x4CF2A0 `Univers10b.ffn` for the rank
+        // and `NFS5.MOVIECIRCLE`'s overlay two for its runs, `Univers7b.ffn` and `Univers11b.ffn`
+        // (0x4CDE99, 0x4CDED3)
+        if layout.elements.iter().any(|e| e.class == "NFS5.MOVIECIRCLE") {
+            want.push(RUN_FONTS[0].to_string());
+            want.push(RUN_FONTS[1].to_string());
+            // …and the roll's two, `Univers11B` and `Univers8B` (0x4CDF01, 0x4CDF0E)
+            want.push(ROLL_FONTS[0].to_string());
+            want.push(ROLL_FONTS[1].to_string());
+        }
         if layout.elements.iter().any(|e| e.class == "NFS5.BADGE") {
             want.push(BADGE_NAME_FONT.to_string());
             want.push(BADGE_RANK_FONT.to_string());
@@ -1368,6 +1397,9 @@ impl LayoutScreen {
             // `NFS_FE_CLOCK` preloads the screen clock in milliseconds, so a still can be taken
             // part way through an animation the front end would otherwise only show in motion
             clock_ms: std::env::var("NFS_FE_CLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0), glint, colb, arcs,
+            movie_overlays: Default::default(),
+            credits_roll: Default::default(),
+            cheat_bits: 0,
             // `NFS_FE_CURSOR=x,y` parks the pointer for a still, the way `NFS_FE_CLOCK` parks the
             // clock — a screenshot has no pointer of its own
             cursor: std::env::var("NFS_FE_CURSOR").ok().and_then(|v| {

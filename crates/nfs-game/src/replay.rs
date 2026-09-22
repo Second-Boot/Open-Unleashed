@@ -63,7 +63,7 @@ impl Packet {
     /// are the packet shifted left by one.
     pub fn from_controls(c: &Controls) -> Self {
         Self {
-            buttons: u8::from(c.handbrake),
+            buttons: u8::from(c.handbrake) | (c.command << 3),
             steer: (c.steer / 2).clamp(-63, 63) as i8,
             throttle: (c.throttle >> 1).min(0x7E),
             brake: (c.brake >> 1).min(0x7E),
@@ -75,7 +75,7 @@ impl Packet {
             brake: self.brake << 1,
             steer: (self.steer as i32) << 1,
             handbrake: self.buttons & 1 != 0,
-            gear_request: None,
+            command: self.buttons >> 3,
         }
     }
 }
@@ -746,11 +746,15 @@ mod tests {
 
     #[test]
     fn controls_round_trip_through_the_packet() {
-        let c = Controls { throttle: 200, brake: 40, steer: -100, handbrake: true, gear_request: None };
+        let c = Controls { throttle: 200, brake: 40, steer: -100, handbrake: true, command: 0 };
         let p = Packet::from_controls(&c);
         assert_eq!((p.throttle, p.brake, p.steer, p.buttons), (100, 20, -50, 1));
         let back = p.to_controls();
         assert_eq!((back.throttle, back.brake, back.steer, back.handbrake), (200, 40, -100, true));
+        // the command code rides in bits 3..7 (a shift-down, code 3, is 0x18)
+        let p = Packet::from_controls(&Controls { command: 3, ..c });
+        assert_eq!(p.buttons, 0x19);
+        assert_eq!(p.to_controls().command, 3);
     }
 
     #[test]
