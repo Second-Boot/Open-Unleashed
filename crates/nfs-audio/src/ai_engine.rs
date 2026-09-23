@@ -97,11 +97,16 @@ impl AiEngines {
     /// the listener, `cos` the listener→car direction against the car's forward, `pan` −1..1,
     /// `speed` |v_long| m/s, `crowding` `[0x655F34]` 0..128.
     #[allow(clippy::too_many_arguments)]
-    pub fn update(&mut self, out: &AudioOutput, index: usize, set: &str, rpm_frac: f32, distance: f32, cos: f32, pan: f32, speed: f32, doppler: f32, detail: u8, crowding: u8, master: f32) {
+    /// `spline_cam` is `word[0x627F3C] == 0x0B`: on that one view 0x4AA973…0x4AA99F divides
+    /// `0x10000000` by `d + 1 m` instead of `0x8000000` by `d + 2 m`, so an AI car is about twice
+    /// as loud there (`engine-audio.md` §5). This port had only the second form.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update(&mut self, out: &AudioOutput, index: usize, set: &str, rpm_frac: f32, distance: f32, cos: f32, pan: f32, speed: f32, doppler: f32, detail: u8, crowding: u8, spline_cam: bool, master: f32) {
         if self.cars.len() <= index {
             self.cars.resize_with(index + 1, CarVoices::default);
         }
-        let atten = 2048 / (distance.max(0.0) as i32 + 2);
+        let d = distance.max(0.0) as i32;
+        let atten = if spline_cam { 4096 / (d + 1) } else { 2048 / (d + 2) };
         if atten == 0 {
             self.stop(out, index);
             return;

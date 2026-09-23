@@ -210,8 +210,15 @@ impl SliceTable {
     /// *This used to be a linear scan of the whole section, which let a car snap to any slice of
     /// it — on monaco4 an opponent jumped 82 -> 463 where the route doubles back near itself
     /// (2026-09-23).*
+    /// **The "section" here is a junction graph segment, not a `SimT` section.** `SliceTable::build`
+    /// 0x480140 seeds `this+0x18` with the `SimT` list and then **splits it at every crossing**
+    /// (`splitSegmentsAtCrossings` 0x480900, `race-logic.md` §10.1), and it is that split list
+    /// 0x481C80 indexes and `car+0xC` (`preferredSection`, the chosen link's `link+4`) points into.
+    /// This port kept the unsplit `SimT` sections here until 2026-09-23, so a preferred **segment**
+    /// index selected an unrelated slice range: on industrial (23 sections, 29 segments) that pinned
+    /// cars 120 m from their own slice.
     pub fn nearest_in_section(&self, section: usize, pos: Vec3, from: usize) -> Option<usize> {
-        let s = self.sections.get(section)?;
+        let s = self.junctions.segments.get(section)?;
         let n = self.slices.len();
         if n == 0 {
             return None;
@@ -244,15 +251,17 @@ impl SliceTable {
     }
 
     /// `0x481C80` — the section a slice belongs to.
+    /// 0x481C80 — the **segment** a slice is in, over the split list (see [`Self::nearest_in_section`]).
     fn section_of(&self, slice: usize) -> Option<usize> {
-        self.sections.iter().position(|s| (s.first..=s.last).contains(&slice))
+        self.junctions.segments.iter().position(|s| (s.first..=s.last).contains(&slice))
     }
 
     /// `Tracker::update` 0x474440 with a `preferredSection`: when the car has chosen a branch, its
     /// slice is resolved against that section as well, and the nearer of the two candidates wins.
     /// Without a preference (or on a single-section table) this is plain [`Self::find_slice`].
     pub fn track_slice(&self, pos: Vec3, prev: usize, preferred: Option<usize>) -> usize {
-        let Some(sec) = preferred.filter(|_| self.sections.len() > 1) else { return self.find_slice(pos, prev) };
+        // 0x481C60's count is the same split list (`(end − begin) / 20` over `this+0x18`)
+        let Some(sec) = preferred.filter(|_| self.junctions.segments.len() > 1) else { return self.find_slice(pos, prev) };
         // 0x474444…0x4744A6: **both** candidates are 0x4816C0 calls seeded at the car's current
         // slice — one for the section that slice is in (0x481C80), one for the preferred section —
         // and the nearer centre wins. The plain `findSlice` runs only when there is no preference

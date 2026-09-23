@@ -104,6 +104,9 @@ pub fn draws_own_car(view: u16) -> bool {
 /// `0x4AA95C`): 1 for the bumper view, 2 for the three chase views, and for everything else 3 when
 /// the camera is detached from the car, 0 (the `.cct`/`.clt` cockpit layers) when it is attached
 /// and interior. MEDIUM.
+/// `attached` is `[0x627F43] & 8`, which 0x46596B…0x465986 computes as **`viewId <= 1`** (`cmp word
+/// [0x627F3C], 1 ; setle ; shl 3`), and `interior` is `!0x443EE0(cam)` — the camera's own exterior
+/// flag, MEDIUM (`engine-audio.md` §4.2), which this port reads as "the driver view".
 pub fn audio_mode(view: u16, attached: bool, interior: bool) -> u8 {
     match view {
         0 | 15 => 1,

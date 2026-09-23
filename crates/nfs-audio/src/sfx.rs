@@ -36,7 +36,20 @@ pub fn surface_material(nibble: usize) -> Material {
     [Snow, Asphalt, Gravel, Earth, Rock, Earth, WetAsphalt, Wood, Ice, Snow, Asphalt, Metal, Gravel, Gravel, Gravel, Snow][nibble & 0xF]
 }
 
-/// Tyre squeal loop slot (§5.2) for a tyre class (0 road, 1 race, 2 rain) on a surface.
+/// `carInfo+0x1C0` → the slot table's column (`idA`), which is **not** the identity:
+/// 0x40FD0C…0x40FD27 maps 0 → 0, **1 → 2** and **2 → 1**, so a race car (class 2) takes the
+/// `RaceTires` column and class 1 the `RainTires` one. This port indexed the table with the raw
+/// class until 2026-09-23, giving every race car the rain-tyre sample.
+pub fn tyre_column(class: usize) -> usize {
+    match class {
+        0 => 0,
+        1 => 2,
+        _ => 1,
+    }
+}
+
+/// Tyre squeal loop slot (§5.2) for a **column** (0 Tires, 1 RaceTires, 2 RainTires — see
+/// [`tyre_column`]) on a surface.
 pub fn squeal_slot(tyre_class: usize, m: Material) -> usize {
     use Material::*;
     match m {
@@ -84,6 +97,36 @@ pub struct CollisionSfx {
     wind_pitch_step: i32,
     /// turbo / blower loop (voice 0, slot 0x0F, §4.6)
     turbo: Option<VoiceId>,
+}
+
+/// The **CarBody** column of §5.2's slot table — what the body sounds like dragged over a surface:
+/// Gravel 0x29, Snow and Ice 0x2B, Earth 0x2C, everything else (Asphalt, WetAsphalt, Metal, Wood,
+/// Rock) 0x28.
+pub fn body_scrape_slot(m: Material) -> usize {
+    use Material::*;
+    match m {
+        Gravel => 0x29,
+        Snow | Ice => 0x2B,
+        Earth => 0x2C,
+        _ => 0x28,
+    }
+}
+
+/// The landing group for a surface (`0x4A8E8A…0x4A8FF8`, the `idA == 0 Tires` arm of 0x4A8E60):
+/// Asphalt, Metal, Wood and Tires share 0x40, Snow takes 0x43, Gravel 0x46, Earth 0x4C and Ice
+/// 0x50. **Rock and WetAsphalt are not in the arm at all** — it falls through with the slot still
+/// 0, so a landing there is silent. This port played the hard-ground group on every surface until
+/// 2026-09-23.
+pub fn landing_group(m: Material) -> Option<usize> {
+    use Material::*;
+    match m {
+        Asphalt | Metal | Wood => Some(GROUP_LANDING),
+        Snow => Some(0x43),
+        Gravel => Some(GROUP_LANDING_GRAVEL),
+        Earth => Some(0x4C),
+        Ice => Some(0x50),
+        Rock | WetAsphalt => None,
+    }
 }
 
 impl CollisionSfx {
@@ -203,9 +246,11 @@ impl CollisionSfx {
         self.play_one_shot(out, slot, level, master);
     }
 
-    /// Hard landing with closing speed `closing` (> 6 m/s): Tires × Asphalt, level `64 + clamp(6.3·closing, 2, 63)`.
-    pub fn landing(&mut self, out: &AudioOutput, closing: f32, master: f32) {
-        let slot = self.pick(GROUP_LANDING);
+    /// Hard landing with closing speed `closing` (> 6 m/s), level `64 + clamp(6.3·closing, 2, 63)`,
+    /// on the group [`landing_group`] gives the surface under the wheels.
+    pub fn landing(&mut self, out: &AudioOutput, closing: f32, surface_nibble: usize, master: f32) {
+        let Some(base) = landing_group(surface_material(surface_nibble)) else { return };
+        let slot = self.pick(base);
         let level = 64.0 + (closing * 6.3).clamp(2.0, 63.0);
         self.play_one_shot(out, slot, level, master);
     }
@@ -221,9 +266,46 @@ impl CollisionSfx {
         self.play_one_shot(out, SLOT_CRASH, 127.0, master);
     }
 
+    /// §5.3's roof / side scrape, producer **0x40FFF0**: while the car is on its side or roof
+    /// (`car+0x3A0 <= 0.2`) with the body near the ground (`car+0x424 < 0.2`) and `speedEst/4 > 0.1`,
+    /// it pushes `{4, 0x14, CarBody, surf, speedEst/4 · (1 − rand/3), 0}` — so the **rear** squeal
+    /// channel carries a fluttering CarBody × surface loop instead of the tyres'. Upright, the
+    /// caller stops it and runs the squeal producer again.
+    pub fn body_scrape(&mut self, out: &AudioOutput, surface_nibble: usize, vol: f32, master: f32) {
+        let slot = body_scrape_slot(surface_material(surface_nibble));
+        let flutter = 1.0 - (self.rand() as f32 / 65536.0) / 3.0;
+        let level = (vol * flutter * 127.0).clamp(0.0, 127.0);
+        if let Some((id, _)) = self.front.take() {
+            out.stop(id);
+        }
+        match self.rear {
+            Some((id, s)) if s == slot => out.set(id, level / 127.0 * master, 1.0),
+            Some((id, _)) => {
+                out.stop(id);
+                self.rear = None;
+                if let Some(clip) = self.clip(slot) {
+                    self.rear = Some((out.play(clip, level / 127.0 * master, 1.0, true), slot));
+                }
+            }
+            None => {
+                if let Some(clip) = self.clip(slot) {
+                    self.rear = Some((out.play(clip, level / 127.0 * master, 1.0, true), slot));
+                }
+            }
+        }
+    }
+
     /// Tyre squeal loops (§5): `front` / `rear` = clamped slip sums (0..10), surface nibble of the car.
-    pub fn squeal(&mut self, out: &AudioOutput, tyre_class: usize, surface_nibble: usize, front: f32, rear: f32, master: f32) {
-        let slot = squeal_slot(tyre_class, surface_material(surface_nibble));
+    /// `no_patch` is `Tracker::wordAt == 0` — nothing drivable under the car. 0x40FCF3…0x40FCFC
+    /// then turns an **Asphalt** surface into **WetAsphalt** (slot 0x2D), which is what the tyres
+    /// sound like off the road.
+    #[allow(clippy::too_many_arguments)]
+    pub fn squeal(&mut self, out: &AudioOutput, tyre_class: usize, surface_nibble: usize, no_patch: bool, front: f32, rear: f32, master: f32) {
+        let m = match surface_material(surface_nibble) {
+            Material::Asphalt if no_patch => Material::WetAsphalt,
+            other => other,
+        };
+        let slot = squeal_slot(tyre_column(tyre_class), m);
         let front = if rear > 0.0 { front.clamp(0.0, 10.0) } else { 0.0 };
         let rear = rear.clamp(0.0, 10.0);
         for (which, vol) in [(0usize, front), (1usize, rear * 0.5)] {
@@ -255,11 +337,17 @@ impl CollisionSfx {
         }
     }
 
-    /// §4.4 road / tyre roll — voice 0x18, `SND_coll` slots 0x11..0x1C picked by the surface nibble
-    /// (or 0x15 while the handbrake is locked). `gain` is the engine distance gain `A` of §4.1 and
+    /// §4.4 road / tyre roll — voice 0x18, `SND_coll` slots 0x11..0x1C picked by the surface nibble.
+    ///
+    /// The original's slot is `0x11 + (car+0x540 != 0 ? 4 : nibble)`, and `car+0x540` is the
+    /// **damage counter** 0x40F740 raises only while it is already non-zero — whose one non-zero
+    /// writer is the front-end path 0x439206, so in a race it stays 0 and the `+4` arm never fires
+    /// (`traffic.md` §21.7, `physics.md` §4.1). This port read that arm as the **handbrake** and so
+    /// swapped the surface loop for slot 0x15 whenever the handbrake was down; that was an
+    /// invention and is gone (2026-09-23). `gain` is the engine distance gain `A` of §4.1 and
     /// `doppler` the same factor the engine layers use.
-    pub fn road_roll(&mut self, out: &AudioOutput, speed: f32, nibble: usize, handbrake: bool, gain: i32, doppler: f32, pan: f32, master: f32) {
-        let slot = 0x11 + if handbrake { 4 } else { nibble.min(11) };
+    pub fn road_roll(&mut self, out: &AudioOutput, speed: f32, nibble: usize, gain: i32, doppler: f32, pan: f32, master: f32) {
+        let slot = 0x11 + nibble.min(11);
         let v = (speed.abs() as i32) * if nibble == 1 { 1 } else { 3 };
         let level = (v / 2 + 64).clamp(0, 127);
         let vol = (gain * (v - 15).max(0) / 128).min(122);
@@ -393,6 +481,25 @@ mod tests {
         assert_eq!(squeal_slot(1, surface_material(1)), 0x2E, "race tyres on asphalt");
         assert_eq!(squeal_slot(1, surface_material(2)), 0x29, "gravel");
         assert_eq!(squeal_slot(0, surface_material(6)), 0x2D, "wet asphalt");
+        // 0x40FD0C's column map: the raw `carInfo+0x1C0` is not the column
+        assert_eq!(tyre_column(0), 0);
+        assert_eq!(tyre_column(1), 2, "class 1 takes the RainTires column");
+        assert_eq!(tyre_column(2), 1, "a race car takes the RaceTires column");
+        assert_eq!(squeal_slot(tyre_column(2), surface_material(1)), 0x2E, "race car on asphalt");
+        // 0x4A8E8A's Tires arm: the landing group is the surface's, and two surfaces are silent
+        assert_eq!(landing_group(Material::Asphalt), Some(0x40));
+        assert_eq!(landing_group(Material::Gravel), Some(0x46));
+        assert_eq!(landing_group(Material::Snow), Some(0x43));
+        assert_eq!(landing_group(Material::Ice), Some(0x50));
+        assert_eq!(landing_group(Material::Earth), Some(0x4C));
+        assert_eq!(landing_group(Material::Rock), None, "not in the arm at all");
+        assert_eq!(landing_group(Material::WetAsphalt), None);
+        // §5.2's CarBody column, what the roof scrape plays
+        assert_eq!(body_scrape_slot(Material::Asphalt), 0x28);
+        assert_eq!(body_scrape_slot(Material::Rock), 0x28);
+        assert_eq!(body_scrape_slot(Material::Gravel), 0x29);
+        assert_eq!(body_scrape_slot(Material::Ice), 0x2B);
+        assert_eq!(body_scrape_slot(Material::Earth), 0x2C);
         assert_eq!(surface_material(4), Material::Rock);
     }
 }

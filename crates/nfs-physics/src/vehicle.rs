@@ -745,9 +745,21 @@ impl Vehicle {
                 self.rpm -= slip / 6.0;
             }
         } else if diff > 0.0 {
-            // engine wants to rev: rate limited
-            let step = (81920.0 * specs.mps_per_rpm[gear]).min(-slip.min(0.0) + specs.rev_rate * diff);
-            self.rpm = (self.rpm + step.max(0.0)).min(rpm_target);
+            // The rev arm, 0x49EC47…0x49EC8B (and its boosted twin 0x49ECD8…0x49ED45): the revs
+            // gain `min(−slip, specs[0x170 + 4·gear] · 81920)` — `[0x5B4A50]` — and that is the
+            // **whole** delta. `[esp+0xC]` is the slip: 0x49EA0D loads `car+0xDB4` and subtracts
+            // the signed wheel rpm. In reverse (`car+0xD82 == 0`) the `test al, al` at 0x49EC4C
+            // turns the `min` into a `max`, the ratio there being negative.
+            //
+            // **`specs[0x98]` is not a rev rate** (`RE/PHYSICS.md` +0x98, read 2026-09-23): its
+            // only read in the whole of `Engine_update` (0x49E440…0x49F400, 1045 instructions) is
+            // 0x49ECA0, inside the induction arm gated on `car+0x548`. The port added
+            // `+ rev_rate · diff` here, which is in no instruction; removed 2026-09-23.
+            let cap = 81920.0 * specs.mps_per_rpm[gear];
+            let step = if gear == 0 { (-slip).max(cap) } else { (-slip).min(cap) };
+            self.rpm += step;
+            // the floor the arm ends on (0x49ED24…0x49ED3F on the boosted side, and the port has
+            // carried it on both): the revs never sit below the wheels'
             if rpm_wheel.abs() > self.rpm {
                 self.rpm = rpm_wheel.abs();
             }

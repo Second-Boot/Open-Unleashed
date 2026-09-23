@@ -100,6 +100,9 @@ pub struct EngineInput {
     pub engine_level: u8,
     /// `(shift timer, specs[0x54] shift ticks)` while an upshift is in progress
     pub shift: Option<(u32, u32)>,
+    /// `byte[0x627F43] & 8` (viewId <= 1) **and** `0x443EE0()` — an attached exterior view, which
+    /// halves the engine gain (§4.3's last line). MEDIUM only in what `0x443EE0` means.
+    pub attached_exterior: bool,
 }
 
 impl Default for EngineInput {
@@ -121,6 +124,7 @@ impl Default for EngineInput {
             crowding: 0,
             engine_level: 127,
             shift: None,
+            attached_exterior: false,
         }
     }
 }
@@ -289,6 +293,10 @@ impl EngineSound {
         let rpm_lvl = (inp.rpm * 127.0 / (inp.redline + 2000.0)) as i32;
         let a = atten.max(atten * (rpm_lvl.clamp(0, 150) + 40) / 128);
         let mut gain = a * 127 / 128;
+        // §4.3: an attached exterior view is half as loud
+        if inp.attached_exterior {
+            gain /= 2;
+        }
         if let Some((timer, ticks)) = inp.shift {
             // 1.0 at the start of the shift falling to 0.5 at its end
             gain = (gain + timer as i32 * gain / ticks.max(1) as i32) / 2;

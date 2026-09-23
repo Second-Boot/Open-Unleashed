@@ -50,6 +50,13 @@ pub struct StartRequest {
     /// Number of traffic cars the race is set up with (`traffic.md` §1: the level indexes
     /// `{0, 2, 4, 8}` for tournament events and factory-driver missions).
     pub traffic: u32,
+    /// The tournament's own traffic models, `trn+0x382[0..7]`, when its flag `trn+0x380` is set
+    /// (club events 46, 47, 55, 59). 0x4FC4C8 then makes the count the number of non-zero ids and
+    /// 0x4ED3E7 builds each traffic car from **these** car ids (`0x4F4400(id)`), not from the
+    /// track's `trk+0x7C` list. CONFIRMED.
+    pub traffic_ids: Option<Vec<u16>>,
+    /// The player's 0-based grid slot (`STARTINGPOS − 1`), when the event sets one.
+    pub player_grid: Option<u32>,
 }
 
 /// `[0x5DB438]` / `[0x5DB448]` — traffic level → number of cars for career events (`traffic.md` §1).
@@ -313,6 +320,8 @@ impl CareerUi {
                 narrator: self.narrator_name(m.narrator),
             }),
             traffic: CAREER_TRAFFIC[(m.traffic_level.max(0) as usize).min(3)],
+            traffic_ids: None,
+            player_grid: None,
             skill: m.skill.clamp(0, 2) as u8,
         })
     }
@@ -565,7 +574,7 @@ impl CareerUi {
 
     /// `Parts.ShoppingList(TOTAL)`.
     pub fn basket_total(&self) -> i64 {
-        self.basket_parts().iter().map(|p| p.price as i64).sum()
+        self.basket_parts().iter().map(|p| self.career.part_buy_price(p)).sum()
     }
 
     /// Pay for the basket and install everything in it, in order. Stops at the first part that
@@ -594,7 +603,7 @@ impl CareerUi {
                 .parts
                 .iter()
                 .find(|p| p.id == id)
-                .map(|p| p.price as i64)
+                .map(|p| self.career.part_buy_price(p))
                 .unwrap_or(0);
             match self.career.buy_part(&self.tables, i, id) {
                 Ok(()) => {
@@ -662,6 +671,8 @@ impl CareerUi {
                             format!("{name} LISTED AT ${ask}   (OFFERS COME IN AFTER A RACE)");
                         self.save();
                     }
+                    // 0x50FCF1: `push 0x2BE` (the "ok" label, 702) / `push 0x3C` (the text, 60)
+                    Err(nfs_game::career::CareerError::LastCar) => self.dialog = Some((60, false)),
                     Err(e) => self.message = e.to_string().to_uppercase(),
                 }
             }
@@ -835,6 +846,8 @@ impl CareerUi {
                     }
                     // 0x501D41 / 0x501F86: not enough credits for the car -> one-button 802
                     Err(nfs_game::career::CareerError::NoMoney { .. }) => self.dialog = Some((802, false)),
+                    // 0x501D94: eighty cars already -> one-button 61
+                    Err(nfs_game::career::CareerError::GarageFull) => self.dialog = Some((61, false)),
                     Err(e) => self.message = e.to_string().to_uppercase(),
                 }
                 None
@@ -901,10 +914,26 @@ impl CareerUi {
                         .map(|i| self.career.garage[i].paint_set as usize)
                         .unwrap_or(0),
                 );
+                // **The grid is the standings.** 0x4ED040's mode-4 arm gives racer slot `i` the
+                // `STARTINGPOS` `0x503660(tid, i)` — slot 0 the player, slot `i` opponent record
+                // `i`. With no event of the attempt done that function returns **8** for the
+                // player and `i` for opponent `i` (0x503750, 0x503745), the usual "player last";
+                // after that it is each driver's 1-based rank in the table, so the leader starts
+                // on pole. `None` for a finale, which is not a tournament of the standings.
+                let ranks: Option<[u32; 8]> = (event > 0 && finale.is_none()).then(|| {
+                    let mut r = [8u32; 8];
+                    for (pos, row) in self.career.standings(&t).iter().enumerate() {
+                        if row.0 < 8 {
+                            r[row.0] = pos as u32 + 1;
+                        }
+                    }
+                    r
+                });
                 let opponents: Vec<CareerOpponent> = t
                     .opponents
                     .iter()
-                    .filter_map(|o| {
+                    .enumerate()
+                    .filter_map(|(slot, o)| {
                         let car = self.tables.car(o.car_id as u16)?.clone();
                         if car.sim.is_empty() {
                             return None;
@@ -932,7 +961,7 @@ impl CareerUi {
                             name: self.tables.driver_name(o.driver),
                             difficulty: ev.difficulty,
                             skill,
-                            grid: None,
+                            grid: ranks.map(|r| r[slot + 1] - 1),
                             personality: o.driver,
                             parts: o.parts.iter().filter_map(|id| self.tables.parts.iter().find(|p| p.id == *id).cloned()).collect(),
                         })
@@ -975,7 +1004,15 @@ impl CareerUi {
                     opponents,
                     parts,
                     mission: None,
-                    traffic: CAREER_TRAFFIC[(t.traffic_level as usize).min(3)],
+                    traffic: match &t.custom_traffic {
+                        Some(ids) => ids.len() as u32,
+                        None => CAREER_TRAFFIC[(t.traffic_level as usize).min(3)],
+                    },
+                    player_grid: ranks.map(|r| r[0] - 1),
+                    traffic_ids: t
+                        .custom_traffic
+                        .as_ref()
+                        .map(|ids| ids.iter().map(|id| *id as u16).collect()),
                     skill: t.difficulty_level.min(2) as u8,
                 })
             }
@@ -1031,7 +1068,7 @@ impl CareerUi {
         }
     }
 
-    pub fn finish(&mut self, order: &[usize], times: &[u64; 8]) {
+    pub fn finish(&mut self, order: &[usize], times: &[u64; 8], clean: &[bool; 8]) {
         let Some(p) = self.pending.take() else { return };
         if p.mission.is_some() {
             // missions are settled through `finish_mission`
@@ -1060,7 +1097,7 @@ impl CareerUi {
         };
         let o = self
             .career
-            .record_event(&self.tables, &t, p.event, order, times, p.garage_idx);
+            .record_event(&self.tables, &t, p.event, order, times, clean, p.garage_idx);
         // used-car offers are refreshed after every career race (0x4F7DB0)
         let mut seed = (o.result.position as u32).wrapping_mul(2_654_435_761)
             ^ (times[0] as u32).wrapping_mul(40_503)
@@ -1336,7 +1373,7 @@ impl CareerUi {
                     parts.len(),
                     p.kind_name.to_uppercase(),
                     self.tables.strings.text(p.name_string_id).to_uppercase(),
-                    p.price,
+                    self.career.part_buy_price(p),
                     mark,
                     total
                 )
@@ -1431,7 +1468,7 @@ mod tests {
         assert!(n_parts > 10, "{n_parts} parts for the 356");
         ui.career.money = 100_000;
         let pid = ui.part_choices()[0].id;
-        let price = ui.part_choices()[0].price as i64;
+        let price = ui.career.part_buy_price(&ui.part_choices()[0].clone());
         // Enter fills the transaction list, Backspace pays for it (the original's parts.lay flow)
         assert!(ui.activate().is_none());
         assert_eq!(ui.basket, vec![pid]);
@@ -1460,7 +1497,7 @@ mod tests {
         );
         assert_eq!(req.laps, 1, "point-to-point stage");
         assert!(ui.pending.is_some());
-        ui.finish(&[0, 1, 2, 3, 4, 5, 6, 7], &[6400; 8]);
+        ui.finish(&[0, 1, 2, 3, 4, 5, 6, 7], &[6400; 8], &[true; 8]);
         assert!(ui.pending.is_none());
         let st = ui.career.state(1);
         assert_eq!(st.events.len(), 1);

@@ -174,7 +174,9 @@ impl CarCatalogEntry {
             1 => self.age_curve_head[1],
             a => self.value_curve.get(a - 2).copied().unwrap_or(100.0),
         };
-        (self.price as f64 * pct as f64 / 100.0).round() as u32
+        // 0x4EE24C…0x4EE273: `_ftol(price · curve)` — the float product truncated — and then a C
+        // integer `/ 100`, so both steps truncate; the port used to round the quotient
+        ((self.price as f64 * pct as f64) as i64 / 100) as u32
     }
 
     /// Value in per cent of the catalogue price in `year` (`0x4F8E50`, index `year − 1950`).

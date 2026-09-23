@@ -26,8 +26,14 @@ pub const SPAWN_COOLDOWN: i64 = 2560;
 pub const HUMAN_VETO: f32 = 172.0;
 /// The sweep since the last query must be this short, or the search is skipped.
 pub const MAX_SWEEP: i32 = 6;
-/// A clean perp only gets a cop when every active cop is further than this away (`0x403120`).
+/// A clean perp only gets a cop when every active cop is further than this away (`0x403120`, which
+/// returns 0 as soon as one cop's signed track gap `0x40E740` is inside the distance).
 pub const CLEAN_PERP_CLEARANCE: f32 = 500.0;
+/// `lim[role]` for role 0 out of the **pinned** heat record — chain 0, record 0 of `0x5CBD20`
+/// (`+0x9C` is written only by the ctor 0x405C40 and 0x405CE0, both with the same value, so the
+/// chain never advances; §25.5). Dumped from the image: `lim = {2, 0, 0}`, and every cop in this
+/// build is role 0 (§17.1), so **two** cops may be assigned to a wanted perp.
+pub const HEAT_LIM_ROLE0: usize = 2;
 /// The race must be this far in before a pursuit may start (0x403990).
 pub const PURSUIT_START_TICK: u64 = 0x200;
 
@@ -48,12 +54,15 @@ impl Violation {
     }
 }
 
-/// `AIHigh_Perp::check` 0x403990 (§17.3). `speed` is `car+0xEC0`, `route_dir` the direction the race
-/// runs in, `one_way` the `[0x5E7544]` flag, `hit_cop` whether the player hit a cop within the last 15
-/// ticks and `hit_effect` that impact's magnitude (`car+0x458`). `current` is the violation already
-/// being served. Returns the new violation, which is only *committed* when a cop is in the world and
-/// the race is past tick 0x200.
-pub fn check_violation(current: Violation, speed: f32, route_dir: f32, one_way: bool, hit_cop: bool, hit_effect: f32) -> Violation {
+/// `AIHigh_Perp::check` 0x403990 (§17.3). `speed` is `car+0xEC0` — **`velocity · slice forward`**,
+/// written at 0x4178BE…0x4178E6 from `car+0x3D0..0x3D8` and the world velocity, for every car
+/// (0x408810's gate is `car+0x52C & 0x800` or `car+0x7E == 0`, and `+0x7E` is never anything but 0).
+/// `lane` is `car+0x1020`, the centre lane 0x40EB30 puts the car in. `route_dir` is the direction of
+/// the race, `one_way` the `[0x5E7544]` flag, `hit_cop` whether the player hit a cop within the last
+/// 15 ticks and `hit_effect` that impact's magnitude (`car+0x458`). `current` is the violation
+/// already being served. Returns the new violation, which is only *committed* when a cop is in the
+/// world and the race is past tick 0x200.
+pub fn check_violation(current: Violation, speed: f32, route_dir: f32, one_way: bool, lane: i32, hit_cop: bool, hit_effect: f32) -> Violation {
     let mut v = current;
     if hit_cop {
         v = if hit_effect > 20.0 {
@@ -71,8 +80,29 @@ pub fn check_violation(current: Violation, speed: f32, route_dir: f32, one_way: 
     if speed.abs() > SPEED_LIMIT && v == Violation::None {
         v = Violation::Speeding;
     }
-    // wrong way is only ever detected on a one-way road — the test is gated on `[0x5E7544]`
-    if one_way && route_dir * speed < 0.0 && speed.abs() > 4.0 && v == Violation::None {
+    // **Both** arms of 0x403A72, read to the instruction 2026-09-23. `[0x5E7544]` (the alternate
+    // lane-width mode) picks between them:
+    //
+    // * set — 0x403A7B multiplies the speed by `[0x657430] ? -1 : +1` and 0x403AA0 keeps only the
+    //   arm where the product is **below** zero: the car is making progress against the race;
+    // * clear — 0x403AC1 takes the product through `[0x5E753C]`, which 0x40E680 sets to the
+    //   constant **1**, so it is the plain `car+0xEC0`; then 0x403ADE pairs its sign with the
+    //   **side of the centreline** the car is on: forward (`>= 0`) needs `lane < 7`, backwards
+    //   needs `lane >= 7`. `lane_of` bases the negative side at 6 and the positive at 7, so the
+    //   test is "the side does not match the direction of travel" — the oncoming lanes — and it
+    //   holds in either race direction, `car+0xEC0` being signed by the slice's own forward.
+    //
+    // Both then need **more** than 4 m/s (`[0x5B2404]`, 0x403B00 / 0x403B33: `test ah, 0x41` is
+    // *below or equal* and the `jne` jumps past the type store). This port had only the `one_way`
+    // arm, so on every track where that flag is clear no wrong-way offence was ever raised.
+    let wrong_way = if one_way {
+        route_dir * speed < 0.0
+    } else if speed >= 0.0 {
+        lane < 7
+    } else {
+        lane >= 7
+    };
+    if wrong_way && speed.abs() > 4.0 && v == Violation::None {
         v = Violation::WrongWay;
     }
     v
@@ -110,9 +140,26 @@ impl CopManager {
 
     /// `0x405440` — the spawn-point search. Returns the index of a usable record, having stamped its
     /// cooldown. `humans` are the route positions of the human cars, for the 172 m veto.
+    ///
+    /// `seen` is `pai+0x70[role]`, the cops already assigned to this perp, and it does two things:
+    /// `if seen >= lim: continue` caps how many ever come out — `lim` is 2 for a wanted perp
+    /// ([`HEAT_LIM_ROLE0`]) and, for a clean one, 1 only while no cop is inside
+    /// [`CLEAN_PERP_CLEARANCE`] (`cop_near`, which is `0x403120(perp.slice, 500.0) == 0`) — and
+    /// `seen != 0` then makes reinforcements free of the probability roll (0x405620). The port has
+    /// no claim system, so the caller passes the number of **active** cops: in the original a cop
+    /// spawns into state 2 and claims as soon as it acquires the perp (0x403FCA), which is at once.
     #[allow(clippy::too_many_arguments)]
-    pub fn find_spawn(&mut self, table: &SliceTable, perp_slice: usize, perp_speed: f32, tick: i64, roll01: f32, clean: bool, skill: u8, humans: &[usize], has_cop: bool) -> Option<usize> {
+    pub fn find_spawn(&mut self, table: &SliceTable, perp_slice: usize, perp_speed: f32, tick: i64, roll01: f32, clean: bool, skill: u8, humans: &[usize], seen: usize, cop_near: bool) -> Option<usize> {
         if self.file.records.is_empty() {
+            return None;
+        }
+        // 0x4055F1's gate, before the cursor is touched (0x405600 writes `pai+0x88` after it)
+        let lim = if clean {
+            if HEAT_LIM_ROLE0 > 0 && !cop_near { 1 } else { 0 }
+        } else {
+            HEAT_LIM_ROLE0
+        };
+        if seen >= lim {
             return None;
         }
         let n = table.lap_len as i32;
@@ -146,7 +193,7 @@ impl CopManager {
             passed.push(table.route[p as usize]);
         }
 
-        let accept = has_cop || roll01 < self.spawn_probability(clean, skill);
+        let accept = seen != 0 || roll01 < self.spawn_probability(clean, skill);
         for slice in passed {
             for (i, r) in self.file.records.iter().enumerate() {
                 if !r.spawnable() || r.slice() as usize != slice {
@@ -237,19 +284,27 @@ mod tests {
     }
 
     #[test]
-    fn the_speed_limit_is_flat_and_wrong_way_needs_a_one_way_road() {
-        // 22 m/s = 79.2 km/h, everywhere
-        assert_eq!(check_violation(Violation::None, 21.0, 1.0, false, false, 0.0), Violation::None);
-        assert_eq!(check_violation(Violation::None, 23.0, 1.0, false, false, 0.0), Violation::Speeding);
-        // driving backwards on a two-way road is not an offence
-        assert_eq!(check_violation(Violation::None, -10.0, 1.0, false, false, 0.0), Violation::None);
-        assert_eq!(check_violation(Violation::None, -10.0, 1.0, true, false, 0.0), Violation::WrongWay);
+    fn the_speed_limit_is_flat_and_wrong_way_is_the_side_of_the_centreline() {
+        // 22 m/s = 79.2 km/h, everywhere. Lane 7 is the first on the positive side, which a car
+        // going forward is entitled to.
+        assert_eq!(check_violation(Violation::None, 21.0, 1.0, false, 7, false, 0.0), Violation::None);
+        assert_eq!(check_violation(Violation::None, 23.0, 1.0, false, 7, false, 0.0), Violation::Speeding);
+        // the two-way arm, 0x403ADE: forward on the oncoming side, or backwards on its own side
+        assert_eq!(check_violation(Violation::None, 10.0, 1.0, false, 6, false, 0.0), Violation::WrongWay);
+        assert_eq!(check_violation(Violation::None, -10.0, 1.0, false, 7, false, 0.0), Violation::WrongWay);
+        assert_eq!(check_violation(Violation::None, -10.0, 1.0, false, 6, false, 0.0), Violation::None, "backwards on the oncoming side is its own side");
+        // and it needs **more** than 4 m/s, on either arm
+        assert_eq!(check_violation(Violation::None, 4.0, 1.0, false, 6, false, 0.0), Violation::None);
+        assert_eq!(check_violation(Violation::None, -4.0, 1.0, true, 7, false, 0.0), Violation::None);
+        // the one-way arm ignores the lane and asks only for progress against the race
+        assert_eq!(check_violation(Violation::None, -10.0, 1.0, true, 6, false, 0.0), Violation::WrongWay);
+        assert_eq!(check_violation(Violation::None, 10.0, 1.0, true, 6, false, 0.0), Violation::None);
         // hitting a cop: light under an impact of 20, heavy above it
-        assert_eq!(check_violation(Violation::None, 5.0, 1.0, false, true, 10.0), Violation::LightContact);
-        assert_eq!(check_violation(Violation::None, 5.0, 1.0, false, true, 30.0), Violation::HeavyContact);
+        assert_eq!(check_violation(Violation::None, 5.0, 1.0, false, 7, true, 10.0), Violation::LightContact);
+        assert_eq!(check_violation(Violation::None, 5.0, 1.0, false, 7, true, 30.0), Violation::HeavyContact);
         // an existing pursuit only escalates on a heavy hit
-        assert_eq!(check_violation(Violation::Speeding, 30.0, 1.0, false, false, 0.0), Violation::Speeding);
-        assert_eq!(check_violation(Violation::Speeding, 30.0, 1.0, false, true, 30.0), Violation::HeavyContact);
+        assert_eq!(check_violation(Violation::Speeding, 30.0, 1.0, false, 7, false, 0.0), Violation::Speeding);
+        assert_eq!(check_violation(Violation::Speeding, 30.0, 1.0, false, 7, true, 30.0), Violation::HeavyContact);
     }
 
     #[test]
@@ -257,19 +312,41 @@ mod tests {
         let t = ring(400);
         let mut m = mgr(&[100, 200, 300], true);
         // the first query only arms the cursor: the marker sits 31 slices ahead, so at slice 91
-        assert_eq!(m.find_spawn(&t, 60, 20.0, 5000, 0.0, false, 0, &[], true), None);
+        assert_eq!(m.find_spawn(&t, 60, 20.0, 5000, 0.0, false, 0, &[], 1, true), None);
         // a five-slice step sweeps 92..96 — nothing there
-        assert_eq!(m.find_spawn(&t, 65, 20.0, 5000, 0.0, false, 0, &[], true), None);
+        assert_eq!(m.find_spawn(&t, 65, 20.0, 5000, 0.0, false, 0, &[], 1, true), None);
         // the next one sweeps 97..101 and passes the record at 100
-        assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, false, 0, &[], true), Some(0));
+        assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, false, 0, &[], 1, true), Some(0));
         // the record is then on a 40 s cooldown, so sweeping it again finds nothing
         m.cursor = Some(96);
-        assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, false, 0, &[], true), None);
+        assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, false, 0, &[], 1, true), None);
         m.cursor = Some(96);
-        assert_eq!(m.find_spawn(&t, 70, 20.0, 5000 + SPAWN_COOLDOWN, 0.0, false, 0, &[], true), Some(0), "and is free again after it");
+        assert_eq!(m.find_spawn(&t, 70, 20.0, 5000 + SPAWN_COOLDOWN, 0.0, false, 0, &[], 1, true), Some(0), "and is free again after it");
         // a jump of six slices or more is too big a sweep to search
         m.cursor = Some(90);
-        assert_eq!(m.find_spawn(&t, 70, 20.0, 9000 + SPAWN_COOLDOWN, 0.0, false, 0, &[], true), None);
+        assert_eq!(m.find_spawn(&t, 70, 20.0, 9000 + SPAWN_COOLDOWN, 0.0, false, 0, &[], 1, true), None);
+    }
+
+    /// §25.5's `if seen >= lim: continue`, with the pinned heat record's `lim[0] = 2`.
+    #[test]
+    fn only_two_cops_are_ever_assigned_to_a_wanted_perp() {
+        let t = ring(400);
+        // records at 100 and 105; the marker runs 31 slices ahead of the perp
+        let mut m = mgr(&[100, 105], true);
+        // wanted: the first comes out on the roll, the second free of it (`seen != 0`), a third never
+        assert_eq!(m.find_spawn(&t, 65, 20.0, 5000, 0.0, false, 0, &[], 0, false), None, "arms the cursor at 96");
+        assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, false, 0, &[], 0, false), Some(0), "sweeps 97..101");
+        assert_eq!(m.find_spawn(&t, 75, 20.0, 5000, 1.0, false, 0, &[], 1, true), Some(1), "a reinforcement skips the roll");
+        m.cursor = Some(96);
+        assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, false, 0, &[], 2, true), None, "lim[0] is 2");
+        // clean: one, and only while no cop is inside 500 m (0x403120)
+        let mut m = mgr(&[100], true);
+        assert_eq!(m.find_spawn(&t, 65, 20.0, 5000, 0.0, true, 0, &[], 0, false), None, "arms the cursor");
+        assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, true, 0, &[], 0, true), None, "a cop is already close by");
+        m.cursor = Some(96);
+        assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, true, 0, &[], 0, false), Some(0));
+        m.cursor = Some(96);
+        assert_eq!(m.find_spawn(&t, 70, 20.0, 5000 + SPAWN_COOLDOWN, 0.0, true, 0, &[], 1, false), None, "one patrol is the limit");
     }
 
     #[test]
@@ -278,10 +355,10 @@ mod tests {
         let mut m = mgr(&[100], true);
         m.cursor = Some(96);
         // a human 20 slices (120 m) from slice 100 is inside the 172 m veto
-        assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, false, 0, &[120], true), None);
+        assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, false, 0, &[120], 1, true), None);
         // 40 slices (240 m) away is outside it
         m.cursor = Some(96);
-        assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, false, 0, &[140], true), Some(0));
+        assert_eq!(m.find_spawn(&t, 70, 20.0, 5000, 0.0, false, 0, &[140], 1, true), Some(0));
     }
 
     #[test]

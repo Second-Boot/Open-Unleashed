@@ -116,7 +116,7 @@ impl Run {
             self.check_race(e.track_id, e.backwards, car_id, None, &what);
             let order: Vec<usize> = (0..8).collect();
             let times: [u64; 8] = std::array::from_fn(|i| 100_000 + i as u64 * 1000);
-            let out = self.career.record_event(&self.tables, &t, ev, &order, &times, Some(idx));
+            let out = self.career.record_event(&self.tables, &t, ev, &order, &times, &[true; 8], Some(idx));
             if out.reset {
                 self.blockers.push(format!("tournament {id}: reset after winning every event"));
                 return false;

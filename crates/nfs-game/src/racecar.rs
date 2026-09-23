@@ -28,6 +28,8 @@ pub struct RaceCar {
     pub resets: u32,
     /// Knocked out (lap knockout / series): parked, ranked below the runners.
     pub eliminated: bool,
+    /// diagnostic only: was the car off every drivable patch last tick (`NFS_OFFROAD_LOG`)
+    pub off_surface: bool,
 }
 
 impl RaceCar {

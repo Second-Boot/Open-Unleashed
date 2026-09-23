@@ -54,6 +54,8 @@ pub enum CareerError {
     PartMismatch { id: i16 },
     #[error("the last car cannot be sold")]
     LastCar,
+    #[error("no more than {MAX_OWNED_CARS} cars can be owned")]
+    GarageFull,
     #[error("no offer has been made for this car")]
     NoOffer,
 }
@@ -528,7 +530,14 @@ pub struct EventOutcome {
 }
 
 impl Career {
+    /// Where the career lives. `NFS5_SAVE_DIR` moves it, the same way it moves `SaveData`
+    /// ([`crate::save::save_dir`]) — without that, a headless sweep or a test run writes into the
+    /// player's own career, and since the front end's bottom bar shows the money on every screen,
+    /// that silently moves all 97 screenshot goldens (found 2026-09-23 by doing exactly that).
     pub fn default_save_path() -> PathBuf {
+        if std::env::var_os("NFS5_SAVE_DIR").is_some() {
+            return crate::save::save_dir().join("career.json");
+        }
         let base = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
         base.join("Library").join("Application Support").join("PorscheUnleashed").join("career.json")
     }
@@ -589,38 +598,46 @@ impl Career {
         if self.money < price {
             return Err(CareerError::NoMoney { need: price, have: self.money });
         }
+        if self.garage.len() >= MAX_OWNED_CARS {
+            return Err(CareerError::GarageFull);
+        }
         self.money -= price;
         self.garage.push(OwnedCar::new(car_id, paint_set, price as u32));
         Ok(())
     }
 
-    /// Current value of garage car `idx` (`0x4F8E50`, HIGH): catalogue price × year curve, mileage
-    /// and damage deductions, +1 % per win, installed parts at their aged value, floor 5 %.
+    /// Current value of garage car `idx` (`0x4F8E50`, CONFIRMED — see [`Career::value_of`]).
     pub fn car_value(&self, tables: &CareerTables, idx: usize) -> Option<i64> {
         self.value_of(tables, self.garage.get(idx)?)
     }
 
-    /// The same figure for any car, garage or market.
+    /// The same figure for any car, garage or market — `0x4F8E50`, read 2026-09-23, **all
+    /// integer** after the first step:
+    ///
+    /// ```text
+    /// base  = _ftol(price · curve[year − 1950] · 0.01)                ; 0x4F8E60…0x4F8E73, truncates
+    /// m     = (pct_m · base) / −100   pct_m by mileage, 0x5B7C08       ; 0x4F8E9A…0x4F8EB1
+    /// d     = (pct_d · base) /  100   pct_d by _ftol(damage %), 0x5B7C48 ; 0x4F8EEE…0x4F8F05
+    /// w     = (wins · base) / 100                                      ; 0x4F8F14…0x4F8F3B
+    /// value = base + m + d + w + Σ part value(installed) − Σ part value(spares)
+    /// value < base · 0.05f → _ftol(base · 0.05f)                       ; 0x4F8FCE…0x4F8FF1
+    /// ```
+    ///
+    /// Every division is C's, truncating toward zero. **The mileage arm divides by −100** — its
+    /// magic is `0xAE147AE1`, the negation of the damage arm's `0x51EB851F` — while the table
+    /// holds 0, −10, −15, −25, −30, so mileage *raises* the value by 10…30 %. That is the
+    /// original's arithmetic and it is kept. Each table matches `lo <= x <= hi` over integer
+    /// bands and a value outside every band adds nothing. The spare-parts list `car+0x75C` is
+    /// not ported (the port keeps no spares), so nothing is subtracted for it.
     pub fn value_of(&self, tables: &CareerTables, owned: &OwnedCar) -> Option<i64> {
         let car = tables.car(owned.car_id)?;
-        let base = (car.price as f64 * car.value_pct(self.year) as f64 / 100.0).round();
-        let pct_m = match owned.mileage {
-            0..=5000 => 0.0,
-            5001..=10000 => -10.0,
-            10001..=15000 => -15.0,
-            15001..=20000 => -25.0,
-            _ => -30.0,
-        };
-        let d = owned.damage_pct;
-        let pct_d = if d <= 5.0 { -1.0 } else if d <= 10.0 { -6.0 } else if d <= 15.0 { -11.0 } else if d <= 25.0 { -16.0 } else { -26.0 };
-        let parts: f64 = owned
+        let parts: i64 = owned
             .parts
             .iter()
             .filter_map(|id| tables.parts.iter().find(|p| p.id == *id))
-            .map(|p| part_value(p, self.year, owned.part_state.iter().find(|(id, _)| *id == p.id).map(|(_, s)| *s).unwrap_or(p.state as f32)))
+            .map(|p| part_resale(p, self.year, owned.part_state.iter().find(|(id, _)| *id == p.id).map(|(_, s)| *s).unwrap_or(p.state as f32)))
             .sum();
-        let value = base + base * pct_m / 100.0 + base * pct_d / 100.0 + base * owned.wins as f64 / 100.0 + parts;
-        Some(value.max((0.05 * base).round()) as i64)
+        Some(car_value_from(car.price, car.value_pct(self.year), owned.mileage, owned.damage_pct, owned.wins, parts))
     }
 
     /// **The used-car market.** `0x4F80C0`, run by `0x4F7DB0(year)` after every career race and by
@@ -747,6 +764,9 @@ impl Career {
         if self.money < price {
             return Err(CareerError::NoMoney { need: price, have: self.money });
         }
+        if self.garage.len() >= MAX_OWNED_CARS {
+            return Err(CareerError::GarageFull);
+        }
         let mut car = self.market.remove(idx);
         self.money -= price;
         car.purchase_price = price as u32;
@@ -776,13 +796,13 @@ impl Career {
         }
         let Some(owned) = self.garage.get_mut(idx) else { return };
         owned.damage = zones;
-        owned.damage_pct = zones.iter().sum::<f32>() / 10.0;
         for (id, d) in add {
             match owned.part_state.iter_mut().find(|(pid, _)| *pid == id) {
                 Some((_, s)) => *s += d,
                 None => owned.part_state.push((id, d)),
             }
         }
+        owned.damage_pct = car_damage_pct(tables, owned);
     }
 
     /// `part+0x164` — how damaged one installed part is, as the percentage the two damage lists
@@ -843,7 +863,7 @@ impl Career {
                 }
             }
         }
-        owned.damage_pct = owned.damage.iter().sum::<f32>() / 10.0;
+        owned.damage_pct = car_damage_pct(tables, owned);
         self.money -= cost;
         Ok(cost)
     }
@@ -852,7 +872,12 @@ impl Career {
     /// (`car+0x68C`, `+0x691 = 1`); the car stays owned until an offer is accepted. The original
     /// refuses to list a car when fewer than two remain (0x50FCB0).
     pub fn list_for_sale(&mut self, idx: usize, ask: u32) -> Result<(), CareerError> {
-        if self.garage.len() < 2 {
+        // 0x50FCB0: the owned cars (0x501AC0) **minus the ones already listed** (0x4F93C0, the
+        // used-car list filtered on `+0x6A0`) must be at least 2 (`cmp esi, 2 / jge`), else
+        // one-button `FEStrings` 60 (0x50FCF6 `push 0x3C`; the 0x2BE beside it is the "ok" label). A listed car stays in the garage, so with two cars one can be listed
+        // and not the other. CONFIRMED.
+        let listed = self.garage.iter().filter(|c| c.asking_price.is_some()).count();
+        if self.garage.len().saturating_sub(listed) < 2 {
             return Err(CareerError::LastCar);
         }
         let car = self.garage.get_mut(idx).ok_or(CareerError::UnknownCar { id: 0 })?;
@@ -902,43 +927,60 @@ impl Career {
         }
     }
 
-    /// `0x4F7E90` (run after every career race): score each listed car and, depending on the
-    /// bracket, make an offer. `rand` yields the original's 16-bit LCG values.
+    /// `0x4F7E90`, run first by `0x4F7DB0` after every career race: every car on the used-car
+    /// list — the player's listings **and** the market's own cars — is scored and may get an
+    /// offer. Read 2026-09-23, CONFIRMED:
+    ///
+    /// ```text
+    /// score = _ftol((value − ask)·100.0/value) − _ftol(damage %) + 100
+    ///       + mileage_score(age, km) + wins/5                      ; 0x4F7ED8…0x4F7FC1
+    /// bracket 0x5B7D88 → (pct, immediate); no bracket → immediate  ; 0x4F7FC3…0x4F7FE5
+    /// immediate: offer = clamp(min(ask, value + _ftol((rand%601 − 300)·1e-4f·value)), ≥ 0)
+    /// otherwise: rand%100 < pct → the player's car is offered its asking price,
+    ///                             a market car is bought by someone else (`+0x690`)
+    /// ```
+    ///
+    /// Nothing is skipped for already holding an offer: an immediate offer is re-drawn after every
+    /// race, and a failed roll leaves the old one in place. `0x4F7DB0` then deletes every market
+    /// car so bought (0x4F7DE0…0x4F7E3F) before re-pricing the rest. The original draws from the
+    /// CRT `rand()` it has just seeded from the clock (0x5A17EB, 0x538110); `rand` stands in.
     pub fn generate_offers(&mut self, tables: &CareerTables, rand: &mut impl FnMut() -> u32) {
-        for idx in 0..self.garage.len() {
-            let Some(ask) = self.garage[idx].asking_price else { continue };
-            if self.garage[idx].offer.is_some() {
-                continue;
-            }
-            let Some(value) = self.car_value(tables, idx) else { continue };
+        let year = self.year;
+        let decide = |this: &Self, car: &OwnedCar, rand: &mut dyn FnMut() -> u32| -> Option<Offer> {
+            let ask = car.asking_price? as i64;
+            let value = this.value_of(tables, car)?;
             if value <= 0 {
-                continue;
+                return None;
             }
-            let car = &self.garage[idx];
-            let model_year = tables.car(car.car_id).map(|c| c.year).unwrap_or(self.year);
-            let age = self.year.saturating_sub(model_year);
-            let mileage_pct = mileage_score(age, car.mileage);
-            let score = (((value - ask as i64) as f64 * 100.0 / value as f64).round() as i64) - (car.damage_pct.round() as i64) + 100 + mileage_pct + (car.wins / 5) as i64;
-            // bracket table 0x5B7D88
-            let (pct, immediate) = match score {
-                s if s <= 83 => (20, true),
-                s if s <= 89 => (40, true),
-                s if s <= 95 => (60, true),
-                s if s <= 99 => (80, true),
-                s if s <= 104 => (80, false),
-                s if s <= 109 => (90, false),
-                _ => (100, false),
-            };
-            let offer = if immediate {
-                // asking above the value / damaged: an offer around the value is made at once
-                let jitter = ((rand() % 601) as f64 - 300.0) * 1e-4 * value as f64;
-                (ask as i64).min(value + jitter.round() as i64).max(0) as u32
-            } else if (rand() % 100) < pct {
-                ask
+            let model_year = tables.car(car.car_id).map(|c| c.year).unwrap_or(year);
+            let age = year as i64 - model_year as i64;
+            let ratio = ((value - ask) as f64 * 100.0 / value as f64) as i64;
+            let score = ratio - car.damage_pct as i64 + 100 + mileage_score(age, car.mileage) + (car.wins / 5) as i64;
+            let bracket = OFFER_BRACKETS.iter().rev().find(|(lo, hi, _, _)| (*lo..=*hi).contains(&score));
+            let (pct, immediate) = bracket.map_or((0, true), |(_, _, p, i)| (*p, *i));
+            Some(if immediate {
+                let jitter = (((rand() % 601) as f64 - 300.0) * 1e-4f32 as f64 * value as f64) as i64;
+                Offer::Now(ask.min(value + jitter).max(0) as u32)
+            } else if ((rand() % 100) as i64) < pct {
+                Offer::Taken(ask as u32)
             } else {
-                continue;
-            };
-            self.garage[idx].offer = Some(offer);
+                Offer::None
+            })
+        };
+        for idx in 0..self.garage.len() {
+            match decide(self, &self.garage[idx], rand) {
+                Some(Offer::Now(o)) | Some(Offer::Taken(o)) => self.garage[idx].offer = Some(o),
+                _ => {}
+            }
+        }
+        let mut gone = Vec::new();
+        for idx in 0..self.market.len() {
+            if let Some(Offer::Taken(_)) = decide(self, &self.market[idx], rand) {
+                gone.push(idx);
+            }
+        }
+        for idx in gone.into_iter().rev() {
+            self.market.remove(idx);
         }
     }
 
@@ -958,6 +1000,15 @@ impl Career {
         self.garage.get(idx).map(|c| c.parts.iter().filter_map(|id| tables.parts.iter().find(|p| p.id == *id)).collect()).unwrap_or_default()
     }
 
+    /// What the parts shop charges for `p` — **`0x5181C0(part, year)`**, the aged price
+    /// `price + price·Σ PART_AGE_PCT[0..year − part.year] / 100` in the chronicle year
+    /// (0x5032C0). CONFIRMED: the shop list shows it for a part to buy (0x51590A) and the
+    /// `Parts.ShoppingList(TOTAL)` accessor 0x516480 subtracts it per part to buy (0x516578) while
+    /// adding `0x518220` per part to sell. The port used to charge the bare `part+0x5C`.
+    pub fn part_buy_price(&self, p: &Part) -> i64 {
+        part_aged_price(p, self.year)
+    }
+
     /// Buy and install `part_id` on garage car `idx`; a part of the same type and type name is
     /// replaced (MEDIUM: the original keeps replaced parts as spares).
     pub fn buy_part(&mut self, tables: &CareerTables, idx: usize, part_id: i16) -> Result<(), CareerError> {
@@ -966,7 +1017,7 @@ impl Career {
         if part_family(car) != Some(part.family.as_str()) {
             return Err(CareerError::PartMismatch { id: part_id });
         }
-        let price = part.price as i64;
+        let price = self.part_buy_price(part);
         if self.money < price {
             return Err(CareerError::NoMoney { need: price, have: self.money });
         }
@@ -1032,8 +1083,11 @@ impl Career {
 
     /// Record event `event` of `t`. `order` = finishing order of driver indices (0 = player,
     /// 1..=7 = tournament opponents in table order); `times[driver]` = finishing time in ticks
-    /// (0 = did not finish). `garage_idx` = the player's car (mileage / wins).
-    pub fn record_event(&mut self, tables: &CareerTables, t: &Tournament, event: usize, order: &[usize], times: &[u64; 8], garage_idx: Option<usize>) -> EventOutcome {
+    /// (0 = did not finish). `clean[driver]` = the car took no new body damage in the race
+    /// ([`clean_race`]) — the event bonus is paid only then. `garage_idx` = the player's car
+    /// (mileage / wins).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_event(&mut self, tables: &CareerTables, t: &Tournament, event: usize, order: &[usize], times: &[u64; 8], clean: &[bool; 8], garage_idx: Option<usize>) -> EventOutcome {
         let ev = &t.events[event];
         let mut points = [0u8; 8];
         let mut earned = [0u32; 8];
@@ -1042,11 +1096,19 @@ impl Career {
             let pos = (pos0 + 1).min(8) as u8;
             if driver < 8 {
                 points[driver] = 9 - pos;
-                let bonus = match pos {
-                    1 => ev.bonus,
-                    2 => ev.bonus / 2,
-                    3 => ev.bonus / 4,
-                    _ => 0,
+                // `0x503960(i, time, pos, ok)`: the bonus arm runs only when `ok`, i.e. the
+                // result record's byte `+0x1EC` (`car+0xCC0`) is clear (0x5039D3 `test al, al /
+                // je`). The fractions are `_ftol(bonus · 1 / 0.5 / 0.25)` (0x5039E9, 0x503A1E,
+                // `[0x5B23F0] = 0.5`, `[0x5B2468] = 0.25`), which truncates like `/ 2` and `/ 4`.
+                let bonus = if !clean[driver] {
+                    0
+                } else {
+                    match pos {
+                        1 => ev.bonus,
+                        2 => ev.bonus / 2,
+                        3 => ev.bonus / 4,
+                        _ => 0,
+                    }
                 };
                 earned[driver] = ev.prize[pos as usize - 1] + bonus;
             }
@@ -1059,7 +1121,13 @@ impl Career {
         self.money = (self.money + prize as i64 + bonus as i64).clamp(-999_999_999, 999_999_999);
         if let Some(car) = garage_idx.and_then(|i| self.garage.get_mut(i)) {
             car.mileage += 3000;
-            if position == 1 {
+            // **The original counts a win for the player's car whoever won.** 0x4EDFE6's loop runs
+            // over every racer's result record and, after `0x503960`, tests *that racer's*
+            // position — `cmp [esi], 1` at 0x4EE011, `esi` walking the records by 0x258 — and on a
+            // match increments the **player's** car, `[0x690ADC]+0x69C` (0x4EE01B). One racer is
+            // always first, so every career race adds one win to the car the player drove. Kept:
+            // it feeds the car's value (`w = base · wins / 100`) and the used-car offers.
+            if !order.is_empty() {
                 car.wins += 1;
             }
         }
@@ -1099,7 +1167,13 @@ impl Career {
         st.completions += 1;
         st.events.clear();
         st.entered = false;
-        if first && let Some(next) = YEAR_TABLE.iter().find(|y| **y > self.year) {
+        // 0x503BBC…0x503BE8: look the current year up **by equality** in the table at 0x5B8670 and,
+        // unless it is the last entry (0x503BCD `cmp eax, 0x5B86B0`), step to the next one. A year
+        // that is not in the table — only reachable from a save written elsewhere — stays put.
+        if first
+            && let Some(i) = YEAR_TABLE.iter().position(|y| *y == self.year)
+            && let Some(next) = YEAR_TABLE.get(i + 1)
+        {
             self.year = *next;
         }
         let era = t.era();
@@ -1190,21 +1264,46 @@ impl Career {
     }
 }
 
-/// Mileage score of a listed car (`0x4F7E90` tables 0x5B7C88.., CONFIRMED brackets by age).
-fn mileage_score(age: u16, km: u32) -> i64 {
-    let (good, mid, ok, limit) = match age {
-        0..=10 => (500, 2000, 5000, 5000),
-        11..=20 => (500, 2000, 5000, 10000),
-        21..=30 => (500, 2000, 5000, 15000),
-        _ => (500, 2000, 5000, 20000),
+/// Mileage score of a listed car — `0x4F7E90`'s four tables, picked by the model's age
+/// (≤ 10, ≤ 20, ≤ 30, older: 0x5B7C88, 0x5B7CB8, 0x5B7CE8, 0x5B7D18). Each is `(lo, hi, score)`
+/// matched `lo <= km <= hi`; **a mileage in none of the bands scores 0** — the tables jump from
+/// 5000 to 10000 / 15000 / 20000 km for the three older ages. CONFIRMED.
+fn mileage_score(age: i64, km: u32) -> i64 {
+    const TABLES: [[(i64, i64, i64); 4]; 4] = [
+        [(0, 500, 3), (501, 2000, 2), (2001, 5000, 1), (5001, 1_000_000, -1)],
+        [(0, 500, 4), (501, 2000, 3), (2001, 5000, 2), (10000, 1_000_000, -1)],
+        [(0, 500, 8), (501, 2000, 6), (2001, 5000, 4), (15000, 1_000_000, -1)],
+        [(0, 500, 15), (501, 2000, 10), (2001, 5000, 5), (20000, 1_000_000, -1)],
+    ];
+    let t = match age {
+        a if a <= 10 => &TABLES[0],
+        a if a <= 20 => &TABLES[1],
+        a if a <= 30 => &TABLES[2],
+        _ => &TABLES[3],
     };
-    let (a, b, c) = match age {
-        0..=10 => (3, 2, 1),
-        11..=20 => (4, 3, 2),
-        21..=30 => (8, 6, 4),
-        _ => (15, 10, 5),
-    };
-    if km <= good { a } else if km <= mid { b } else if km <= ok { c } else if km > limit { -1 } else { c }
+    let km = km as i64;
+    t.iter().rev().find(|(lo, hi, _)| (*lo..=*hi).contains(&km)).map_or(0, |(_, _, v)| *v)
+}
+
+/// `0x5B7D88`: `(lo, hi, pct, immediate)`. The 90…95 and 95…99 bands overlap at 95 and the
+/// loop keeps the **last** match. CONFIRMED.
+const OFFER_BRACKETS: [(i64, i64, i64, bool); 7] = [
+    (0, 83, 20, true),
+    (84, 89, 40, true),
+    (90, 95, 60, true),
+    (95, 99, 80, true),
+    (100, 104, 80, false),
+    (105, 109, 90, false),
+    (110, 1_000_000, 100, false),
+];
+
+/// What `0x4F7E90` decided for one car.
+enum Offer {
+    None,
+    /// an offer made at once (the flag-1 brackets)
+    Now(u32),
+    /// the roll succeeded: the player's car is offered its asking price, a market car is sold
+    Taken(u32),
 }
 
 /// Aged value of an installed part (`0x518220`): price × (1 + Σ yearly increments) × condition.
@@ -1218,6 +1317,12 @@ pub const PART_AGE_PCT: [u32; 62] = [
 
 /// `price + price·Σ PART_AGE_PCT[0..age] / 100` — what a part is worth before its condition is
 /// taken off (0x518900, first half). CONFIRMED.
+/// How many cars the player may own: both purchases — the dealer's at 0x501D8C and the used-car
+/// lot's at 0x501FD0 — test the owned list's byte length against **0x140** (80 pointers) after
+/// the money check and refuse with `FEStrings` 61, "you cannot purchase more than 80 cars".
+/// CONFIRMED.
+pub const MAX_OWNED_CARS: usize = 80;
+
 /// How many cars the used-car market holds before the oldest generated one is dropped —
 /// `0x4F8171` compares the list length against **0x19**.
 pub const USED_CAR_MARKET_MAX: usize = 25;
@@ -1272,20 +1377,108 @@ pub fn part_repair_cost(p: &Part, year: u16, state: f32) -> i64 {
     part_aged_price(p, year) * (2.0 * state) as i64 / 100
 }
 
-/// `PartValue` 0x518900 (CONFIRMED): `price + price·sum/100 − (100 − c)·aged/100` with
-/// `c = clamp((int)(2·state + 20), 0, 100)`, floored at 0 — so a brand-new part (state 0, age 0) is
-/// worth a fifth of its price, and age lifts that slowly.
-fn part_value(p: &Part, year: u16, state: f32) -> f64 {
-    let aged = part_aged_price(p, year);
-    let c = ((2.0 * state + 20.0) as i64).clamp(0, 100);
-    let price = p.price as i64;
-    let sum: u32 = PART_AGE_PCT.iter().take((year as i64 - p.year as i64).max(0) as usize).sum();
-    let v = price * sum as i64 / 100 - (100 - c) * aged / 100 + price;
-    v.max(0) as f64
+/// What an installed part adds to its car's value — **`0x518220`**, the function `0x4F8E50` calls for
+/// every part on the car (0x4F8F6D). CONFIRMED, read 2026-09-23:
+///
+/// ```text
+/// aged  = price + price·Σ PART_AGE_PCT[0..age] / 100            ; 0x51822C…0x51827F, age = year − part+0x46
+/// c     = min(_ftol(2.0·state + 20.0), 100), negatives → 0       ; 0x51825C…0x5182A0
+/// value = (100 − c)·aged / 100                                   ; 0x5182A2…0x5182BA
+/// ```
+///
+/// `state` is `part+0x164`, the damage the part carries, so an undamaged part is worth **80 %** of
+/// its aged price and one at 40 damage nothing. The port used to call this through `0x518900`'s
+/// formula (`price·sum/100 − (100 − c)·aged/100 + price`), the complementary share — 20 % for an
+/// undamaged part, rising with damage. `0x518900` is a different function, used by the parts shop
+/// (0x5171C5, 0x5175F8), which this port does not call.
+fn part_resale(p: &Part, year: u16, state: f32) -> i64 {
+    part_resale_from(part_aged_price(p, year), state)
+}
+
+/// [`part_resale`] given the aged price.
+fn part_resale_from(aged: i64, state: f32) -> i64 {
+    let c = ((2.0f32 * state + 20.0) as i64).clamp(0, 100);
+    (100 - c) * aged / 100
+}
+
+/// A car's damage figure — **`0x4EF960`**, read 2026-09-23, CONFIRMED. It is not the body zones'
+/// mean: it averages the damage `part+0x164` of the **installed** parts (`car+0x758`) by part type,
+///
+/// ```text
+/// M_k   = mean of part+0x164 over installed parts with type (+0x26) k, 0 when there is none
+///         (0x4EF580 for k = 1, 2, 3, 7; the same loop inlined for 4, 5, 6, 8, 9, 10)
+/// value = (M1 + M2 + M3 + M4 + M5 + (M6 + M7)·0.5 + M8 + M9 + M10) · (1/9)f   ; 0x4EFB82…0x4EFBB1
+/// ```
+///
+/// Each `M_k` is stored as an `f32`; the sum runs on the x87. A new car's installed list is
+/// empty — the FE car constructor 0x4EEBA0 clears `+0x758` (0x4EEC86…) — so a car carrying only
+/// its stock parts reads **0 %** however dented its body is; this port's `owned.parts` holds the
+/// same list. The value is what `0x4F8E50` and `0x4F7E90` truncate into their damage bands.
+/// APPROXIMATION of the last bit only: the result is stored as `f32` here, the original hands the
+/// x87 value straight to `_ftol`.
+pub fn car_damage_pct(tables: &CareerTables, owned: &OwnedCar) -> f32 {
+    let parts: Vec<(u16, f32)> = owned
+        .parts
+        .iter()
+        .filter_map(|id| tables.parts.iter().find(|p| p.id == *id))
+        .map(|p| (p.kind, owned.part_state.iter().find(|(id, _)| *id == p.id).map(|(_, s)| *s).unwrap_or(p.state as f32)))
+        .collect();
+    damage_pct_from(&parts)
+}
+
+/// [`car_damage_pct`] over `(part type, part+0x164)` pairs.
+fn damage_pct_from(parts: &[(u16, f32)]) -> f32 {
+    let mean = |kind: u16| -> f64 {
+        let v: Vec<f64> = parts.iter().filter(|(k, _)| *k == kind).map(|(_, s)| *s as f64).collect();
+        let sum: f64 = v.iter().sum();
+        (if v.len() > 1 { sum / v.len() as f64 } else { sum }) as f32 as f64
+    };
+    let total = mean(1) + mean(2) + mean(3) + mean(4) + mean(5) + (mean(6) + mean(7)) * 0.5 + mean(8) + mean(9) + mean(10);
+    (total * (1.0f32 / 9.0) as f64) as f32
+}
+
+/// `0x4F8E50`'s arithmetic, given the installed parts' total (see [`Career::value_of`]).
+pub fn car_value_from(price: u32, curve_pct: f32, mileage: u32, damage_pct: f32, wins: u32, parts: i64) -> i64 {
+    const MILEAGE: [(i64, i64, i64); 5] = [(0, 5000, 0), (5001, 10000, -10), (10001, 15000, -15), (15001, 20000, -25), (20001, 1_000_000, -30)];
+    const DAMAGE: [(i64, i64, i64); 5] = [(0, 5, -1), (6, 10, -6), (11, 15, -11), (16, 25, -16), (26, 100, -26)];
+    let base = (price as f64 * curve_pct as f64 * 0.01) as i64;
+    let mileage = mileage as i64;
+    let m = MILEAGE.iter().find(|(lo, hi, _)| (*lo..=*hi).contains(&mileage)).map_or(0, |(_, _, p)| p * base / -100);
+    let dmg = damage_pct as i64;
+    let d = DAMAGE.iter().find(|(lo, hi, _)| (*lo..=*hi).contains(&dmg)).map_or(0, |(_, _, p)| p * base / 100);
+    let w = wins as i64 * base / 100;
+    let value = base + m + d + w + parts;
+    let floor = base as f64 * 0.05f32 as f64;
+    if (value as f64) < floor { floor as i64 } else { value }
+}
+
+/// The body-damage total the tournament bonus is judged on: the ten zones `car+0x4E4..` summed
+/// into an integer **truncating after every add** — `fild [acc] / fadd [zone] / call _ftol`, at
+/// 0x426AEF…0x426B08 for the start and 0x4276E0…0x4276FB for the finish. The x87 runs at MSVC's
+/// 53-bit precision, so the add is an `f64` one. CONFIRMED.
+pub fn damage_sum(zones: &[f32; 10]) -> i32 {
+    zones.iter().fold(0i32, |acc, z| (acc as f64 + *z as f64) as i32)
+}
+
+/// Whether a car raced **clean** — no new body damage between the start and the finish.
+///
+/// `0x426A80(0)`, the HUD's race-start arm, stores [`damage_sum`] of every racer at
+/// `[0x60C9C8 + i·4]` and clears each result record's `+0x1EC` byte (0x426AD6, 0x426B0F). In a
+/// tournament race (`[0x6573E8] == 4`, 0x426C36) the finish arm calls 0x427660, which sums the
+/// finishing zones — `car+0xC98`, which 0x416AC0 copies from `car+0x4E4` — and when that total is
+/// **greater** than the start total sets `car+0xCC0 = 1` (0x4276FD `jle` skip, 0x427708). The flag
+/// reaches the result record as `+0x1EC`, and `0x503960` pays the event bonus only when it is
+/// clear. A car carrying garage damage into the race is judged against that, not against zero.
+/// CONFIRMED.
+pub fn clean_race(start: i32, finish: &[f32; 10]) -> bool {
+    damage_sum(finish) <= start
 }
 
 /// Standings `0x503660` / sort `0x502880`: points desc, money earned desc, total time asc; time-ranked
-/// club events: time asc, money asc. Drivers without a finishing time sort last within a tie.
+/// club events: time asc, money asc. CONFIRMED — the sort is a bubble pass over 16-byte rows
+/// `{points, Σtime, Σmoney, idx}` that swaps only on a strict compare (0x50290F…0x50291E for points,
+/// 0x5028C4…0x5028D0 for time), so it is stable, and it has **no special case for a zero time**:
+/// every racer arrives with one, because 0x416AC0 projects a time for any car still racing.
 fn standings_of(events: &[EventResult], time_ranked: bool) -> Vec<(usize, u32, u32, u64)> {
     let mut rows: Vec<(usize, u32, u32, u64)> = (0..8).map(|d| (d, 0u32, 0u32, 0u64)).collect();
     for e in events {
@@ -1295,11 +1488,10 @@ fn standings_of(events: &[EventResult], time_ranked: bool) -> Vec<(usize, u32, u
             rows[d].3 += e.times[d];
         }
     }
-    let time_key = |t: u64| if t == 0 { u64::MAX } else { t };
     if time_ranked {
-        rows.sort_by(|a, b| time_key(a.3).cmp(&time_key(b.3)).then(a.2.cmp(&b.2)));
+        rows.sort_by(|a, b| a.3.cmp(&b.3).then(a.2.cmp(&b.2)));
     } else {
-        rows.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(time_key(a.3).cmp(&time_key(b.3))));
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.3.cmp(&b.3)));
     }
     rows
 }
@@ -1337,6 +1529,96 @@ mod tests {
 
     fn tables(ts: Vec<Tournament>) -> CareerTables {
         CareerTables { raw: Default::default(), tracks: vec![], tournaments: ts, parts: vec![], personalities: vec![], missions: vec![], strings: Strings::default(), catalog: vec![] }
+    }
+
+    /// 0x501FD0: an eighty-first car is refused after the money check, and nothing is spent.
+    #[test]
+    fn no_more_than_eighty_cars() {
+        let mut c = Career::default();
+        for _ in 0..MAX_OWNED_CARS {
+            c.garage.push(OwnedCar::new(76, 0, 0));
+        }
+        let mut lot = OwnedCar::new(76, 0, 0);
+        lot.asking_price = Some(1_000);
+        c.market.push(lot);
+        let money = c.money;
+        assert!(matches!(c.buy_used_car(0), Err(CareerError::GarageFull)));
+        assert_eq!((c.money, c.garage.len(), c.market.len()), (money, 80, 1));
+        c.money = 0;
+        assert!(matches!(c.buy_used_car(0), Err(CareerError::NoMoney { .. })), "money is checked first");
+    }
+
+    /// `0x4EF960`: a mean per part type, types 6 and 7 sharing one slot, over nine.
+    #[test]
+    fn a_cars_damage_figure_is_its_parts_by_type() {
+        assert_eq!(damage_pct_from(&[]), 0.0, "stock parts only: nothing on the list, 0 %");
+        // one type-1 part at 45 → 45 / 9
+        assert!((damage_pct_from(&[(1, 45.0)]) - 5.0).abs() < 1e-5);
+        // two type-2 parts average; a type-6 part counts half
+        assert!((damage_pct_from(&[(2, 10.0), (2, 30.0), (6, 36.0)]) - (20.0 + 18.0) / 9.0).abs() < 1e-5);
+        // types outside 1..10 are not counted
+        assert_eq!(damage_pct_from(&[(11, 90.0), (0, 90.0)]), 0.0);
+    }
+
+    /// `0x518220`: an undamaged part keeps 80 % of its aged price, damage takes it away, and 40
+    /// damage leaves nothing.
+    #[test]
+    fn a_parts_share_of_the_car_value_falls_with_its_damage() {
+        assert_eq!(part_resale_from(1000, 0.0), 800);
+        assert_eq!(part_resale_from(1000, 10.0), 600);
+        assert_eq!(part_resale_from(1000, 40.0), 0);
+        assert_eq!(part_resale_from(1000, 90.0), 0);
+        // `_ftol` truncates: 2·4.9 + 20 = 29.8 → 29
+        assert_eq!(part_resale_from(999, 4.9), 709);
+    }
+
+    /// `0x4F8E50`: truncation everywhere, and mileage **adds** value — the mileage arm divides by
+    /// −100 (`0xAE147AE1`) against a table of negative percentages.
+    #[test]
+    fn car_value_is_the_originals_integer_arithmetic() {
+        // base = _ftol(11000 · 93.5 · 0.01) = 10285 (not 10285.0 rounded — the same here)
+        assert_eq!(car_value_from(11_000, 93.5, 0, 0.0, 0, 0), 10285 - 102);
+        // 7000 km: −10 / −100 → +1028, damage 0 → −102 (the 0..5 band still costs 1 %)
+        assert_eq!(car_value_from(11_000, 93.5, 7000, 0.0, 0, 0), 10285 + 1028 - 102);
+        // damage 5.9 % truncates to 5, the −1 band — not the −6 one
+        assert_eq!(car_value_from(11_000, 93.5, 0, 5.9, 0, 0), 10285 - 102);
+        assert_eq!(car_value_from(11_000, 93.5, 0, 6.0, 0, 0), 10285 - 617);
+        // three wins: +3 %, truncated
+        assert_eq!(car_value_from(11_000, 93.5, 0, 0.0, 3, 0), 10285 - 102 + 308);
+        // the floor: 5 % of base, truncated, when the sum falls under it
+        assert_eq!(car_value_from(11_000, 93.5, 0, 0.0, 0, -20_000), 514);
+    }
+
+    /// The tournament bonus goes only to a car that raced clean (0x426A80 / 0x427660 / 0x503960):
+    /// a winner that picked up new damage keeps its prize and points but not its bonus, and the
+    /// damage it carried in from the garage does not count against it.
+    #[test]
+    fn a_damaged_car_forfeits_the_event_bonus() {
+        // truncation after every add, not once at the end: 0.6 × 10 is 6.0 but sums to 0
+        assert_eq!(damage_sum(&[0.6; 10]), 0);
+        assert_eq!(damage_sum(&[1.5; 10]), 10);
+        let carried = [10.0; 10];
+        let start = damage_sum(&carried);
+        assert!(clean_race(start, &carried), "garage damage alone is clean");
+        let mut dented = carried;
+        dented[1] += 1.0;
+        assert!(!clean_race(start, &dented));
+
+        let t = tournament(1, 2, false);
+        let tables = tables(vec![t.clone()]);
+        let mut c = Career::default();
+        c.garage.push(OwnedCar::new(76, 0, 11_000));
+        c.enter(&tables, &t).unwrap();
+        let before = c.money;
+        let mut clean = [true; 8];
+        clean[0] = false;
+        clean[2] = false;
+        let o = c.record_event(&tables, &t, 0, &[0, 1, 2, 3, 4, 5, 6, 7], &[6400; 8], &clean, Some(0));
+        assert_eq!((o.result.position, o.result.prize, o.result.bonus), (1, 1000, 0));
+        assert_eq!(o.result.points[0], 8, "points do not depend on it");
+        assert_eq!(o.result.earned[1], 800 + 200, "second place was clean");
+        assert_eq!(o.result.earned[2], 600, "third place was not");
+        assert_eq!(c.money, before + 1000);
     }
 
     /// 0x503E40 clears a forfeited tournament's records; 0x4F9720 drops an offer and keeps the
@@ -1381,7 +1663,7 @@ mod tests {
         assert_eq!(c.enter(&tables, &t).unwrap(), 0);
         assert_eq!(c.money, STARTING_MONEY - 500);
         let times = [6400, 6500, 6600, 6700, 6800, 6900, 7000, 7100];
-        let o = c.record_event(&tables, &t, 0, &[0, 1, 2, 3, 4, 5, 6, 7], &times, Some(0));
+        let o = c.record_event(&tables, &t, 0, &[0, 1, 2, 3, 4, 5, 6, 7], &times, &[true; 8], Some(0));
         assert_eq!((o.result.position, o.result.prize, o.result.bonus), (1, 1000, 400));
         assert_eq!(o.result.points, [8, 7, 6, 5, 4, 3, 2, 1]);
         assert_eq!(o.result.earned[1], 800 + 200);
@@ -1389,8 +1671,11 @@ mod tests {
         assert_eq!(c.garage[0].wins, 1);
         assert_eq!(c.enter(&tables, &t).unwrap(), 1, "fee not paid again");
         assert_eq!(c.money, STARTING_MONEY - 500 + 1400);
-        let o = c.record_event(&tables, &t, 1, &[1, 0, 2, 3, 4, 5, 6, 7], &times, Some(0));
+        let o = c.record_event(&tables, &t, 1, &[1, 0, 2, 3, 4, 5, 6, 7], &times, &[true; 8], Some(0));
         assert_eq!((o.result.position, o.result.prize, o.result.bonus), (2, 800, 200));
+        // second place, and the car still gains a win: 0x4EE011 tests each racer's position and
+        // credits the player's car for whoever was first
+        assert_eq!((c.garage[0].mileage, c.garage[0].wins), (6000, 2));
         // player 8+7 = 15 pts / $2400, driver 1 = 7+8 = 15 pts / $2400 → tie on money, player's time
         // 6400+6400 < driver 1's 6500+6500 → player ranks first
         assert_eq!(o.final_rank, Some(1));
@@ -1413,7 +1698,7 @@ mod tests {
         let mut c = Career::default();
         c.garage.push(OwnedCar::new(76, 0, 11_000));
         c.enter(&tables, &t).unwrap();
-        let o = c.record_event(&tables, &t, 0, &[1, 2, 3, 4, 0, 5, 6, 7], &[0; 8], Some(0));
+        let o = c.record_event(&tables, &t, 0, &[1, 2, 3, 4, 0, 5, 6, 7], &[0; 8], &[true; 8], Some(0));
         assert!(o.reset && o.final_rank == Some(5));
         assert_eq!(o.tournament_prize, 1000, "tournament prize paid for any rank");
         let st = c.state(1);
@@ -1452,6 +1737,9 @@ mod tests {
         let mut one = Career::default();
         one.garage.push(OwnedCar::new(76, 0, 11_000));
         assert!(matches!(one.list_for_sale(0, 1), Err(CareerError::LastCar)));
+        // with car 0 listed, the second of two cars cannot be listed too (0x50FCB0 subtracts the
+        // listings)
+        assert!(matches!(c.list_for_sale(1, 9_000), Err(CareerError::LastCar)));
         // accepting an offer pays and removes the car
         c.garage[0].offer = Some(12_345);
         let money = c.money;
@@ -1470,7 +1758,12 @@ mod tests {
         assert_eq!(mileage_score(5, 9_000), -1);
         // older cars tolerate more mileage and score higher when barely used
         assert_eq!(mileage_score(35, 400), 15);
-        assert_eq!(mileage_score(35, 18_000), 5);
+        // …but the older tables jump from 5000 to 10000 / 15000 / 20000 km, and a mileage in the
+        // gap is in no band: 0 (0x5B7CB8, 0x5B7D18)
+        assert_eq!(mileage_score(35, 18_000), 0);
+        assert_eq!(mileage_score(15, 7_000), 0);
+        assert_eq!(mileage_score(15, 10_000), -1);
+        assert_eq!(mileage_score(35, 20_000), -1);
         assert_eq!(mileage_score(35, 25_000), -1);
     }
 
@@ -1533,9 +1826,11 @@ mod tests {
             *z = 60.0;
         }
         c.record_damage(&tables, 0, zones);
-        assert_eq!(c.garage[0].damage_pct, 60.0);
         let state = c.garage[0].part_state.iter().find(|(id, _)| *id == part.id).map(|(_, s)| *s).unwrap();
         assert!((state - (1.5 - 0.005 * part.condition) * 60.0).abs() < 0.01, "{state}");
+        // the car's damage figure is 0x4EF960's — its one installed part, type 1, over nine — not
+        // the zones' mean of 60
+        assert!((c.garage[0].damage_pct - state / 9.0).abs() < 1e-4, "{}", c.garage[0].damage_pct);
 
         // and that is the number the two damage lists print (0x516EF6's `"%d %"`), where a part the
         // car never raced falls back to the table's own state

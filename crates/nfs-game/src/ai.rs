@@ -447,46 +447,78 @@ impl AiDriver {
             self.dbg_offset = (target - sl.centre).dot(sl.lateral);
         }
         let steer = if std::env::var_os("NFS_AI_FLIP").is_some() { -steer } else { steer };
-        // `AIState_Racing` 0x40CA20's reset triggers (`ai.md` §3.2): five seconds below 2 m/s after
-        // the start, or facing the wrong way at more than 10 m/s — `dot(slice forward, car
-        // forward) < −0.707` against the table the race is actually run on.
+        // the stuck counter `car+0xEA4` (0x40C934): one tick per control tick under 2 m/s once the
+        // race has started, cleared otherwise. Only the **alive** arm below reads it.
         if v.v_long() < 2.0 && v.race_started {
             self.stuck_ticks += 1;
         } else {
             self.stuck_ticks = 0;
         }
-        // **The original's wrong way is a sign, not an angle** (`AIHigh::check` 0x403990, read
-        // 2026-09-23, `ai.md` §2.9a): 0x403AC7 multiplies the route-signed speed `car+0xEC0` by
-        // the direction multiplier `[0x5E753C]` and takes the arm where the product is **below
-        // zero** — the car is making progress *against* the race direction — and 0x403B00 then
-        // requires `|car+0xEC0| <= [0x5B2404]` = **4.0 m/s** before it sets the type. So the
-        // original marks a car that is **crawling backwards along the route**, not one sliding at
-        // speed. This port used to reset a car whose *heading* was past 135° from its slice at
-        // over 10 m/s, which is neither test: on farmland it fired 13 times in 120 s across five
-        // cars, every one of them at 43–62 km/h in an open corner.
+        // **The reset request is `AIState_Racing`'s, and it is a slow car facing backwards**
+        // (0x40C959…0x40CA17, read instruction by instruction 2026-09-23; `ai.md` §3.2):
         //
-        // The direction multiplier needs no counterpart here: `SliceTable::reversed` negates every
-        // slice's `forward`, so the projection below is already signed by the race's own direction.
+        // ```text
+        // if car+0xDB0 != 0:                                   ; alive
+        //     d = dot(car+0x37C /*forward*/, car+0x3D0 /*slice forward*/)      ; 0x532910
+        //     if ([0x657430] == 0 ? d < -0.707 : d > +0.707)    ; [0x5B269C] / [0x5B2698]
+        //        and car+0x35C < [0x5B241C] = 10.0:  car+0xD8B = 5
+        //     elif car+0xEA4 >= 0xA0:                car+0xEA4 = 0, car+0xD8B = 5
+        // else:  if car+0x1100 < 0x40:               car+0xD8B = 5
+        // ```
         //
-        // Gaps, recorded not filled: `car+0x1020` gates the arm (`< 7` here, and a second arm at
-        // 0x403B13 for `>= 7`) and is **not read**; and what the original does with the type it
-        // stores in `AIHigh+0x78` is a separate path this port does not have — here the mark goes
-        // straight to a reset request, as the port's own rule did.
+        // Two corrections to what this port had (both my own earlier claims, overturned by the
+        // instructions):
+        //
+        // * the speed test is `< 10 m/s`, **not** `> 10`: 0x40C999 compares `car+0x35C` with 10.0
+        //   and 0x40C9A4's `jne` takes the reset arm when C0 is set, i.e. when the speed is
+        //   *below* it. So the original resets a car that has swapped ends and **stopped**, not
+        //   one sliding backwards at speed.
+        // * `AIHigh::check` 0x403990, which 03e6b83 wired in here, is **not** this trigger: its
+        //   types land in `AIHigh+0x78`, and the two `Car_resetToSlice(car, 1, 1)` calls that
+        //   depend on that state (0x4048FC, 0x404B0A) are gated on `AIState+0x54 == 1` — a field
+        //   nothing in the image ever sets to anything but 0, so those calls are dead code in this
+        //   build (`ai.md` §2.9a). The types are a violation report, not a reset.
+        //
+        // The direction needs no multiplier here: `SliceTable::reversed` negates every slice's
+        // `forward`, so the dot below is already signed by the race's own direction and the
+        // `[0x657430]` arm is that same test (cb1ad65).
         let fwd = table.slices[s0].forward.normalize_or_zero();
         self.dbg_facing = fwd.dot(v.forward());
-        let v_route = v.velocity.dot(fwd);
-        // and the check's own gates: 0x4039BD returns unless **0x280** ticks have passed since the
-        // state started (`gGameTick − AIHigh+0x68`), 0x4039CB returns for a car that has finished,
-        // and 0x403B49 stores the type only past tick **0x200**. This port has no per-state start
-        // tick, so the race's own clock stands in for `AIHigh+0x68` — the state is created with
-        // the racing car, so the two agree for an opponent that has not been through another state.
-        self.wrong_way =
-            v.race_started && v.game_tick >= 0x280 && v_route < 0.0 && -v_route <= 4.0;
+        // the dead-car arm reads the same countdown 0x40F740 runs, which the port carries
+        self.wrong_way = v.race_started
+            && if v.engine_alive == 0 {
+                // the dead-car arm reads the same countdown 0x40F740 runs, which the port carries
+                v.reset_countdown < 0x40
+            } else if self.dbg_facing < -0.707 && v.horizontal_speed() < 10.0 {
+                true
+            } else {
+                // the stuck arm is the `elif`: it belongs to the alive car only
+                self.stuck_ticks >= 0xA0
+            };
         Controls { throttle, brake, steer, handbrake: false, command: 0 }
     }
 
+    /// Every reset clears the branch latch, as the original's do: `car+0xE94 = 0` (the node a branch
+    /// was last chosen at) and `car+0xC = -1` (the tracker's `preferredSection`) at 0x49E421,
+    /// 0x4A03A3 and 0x4A047F. Without it a car keeps a **stale** preferred segment, and
+    /// `Tracker::update` 0x474440 then never falls back to `findSlice` (0x474460 takes that path
+    /// only when there is no preference), so its slice stays pinned to a segment it has driven off —
+    /// on industrial backwards that pinned five cars 120 m from their own slice with 9–15 resets
+    /// each (`tools/sweep/README.md`). The `last_node` half is the same latch the original clears:
+    /// with it stale, `choose_branch` refuses to choose again at the node it is standing on.
+    pub fn clear_branch(&mut self) {
+        self.last_node = None;
+        self.link = None;
+        self.preferred_segment = None;
+    }
+
     pub fn wants_reset(&mut self) -> bool {
-        if self.stuck_ticks >= 0xA0 || self.wrong_way {
+        if std::env::var_os("NFS_NO_AIRESET").is_some() {
+            self.stuck_ticks = 0;
+            self.wrong_way = false;
+            return false;
+        }
+        if self.wrong_way {
             self.stuck_ticks = 0;
             self.wrong_way = false;
             true
