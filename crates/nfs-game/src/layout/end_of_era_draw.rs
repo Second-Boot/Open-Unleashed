@@ -103,7 +103,7 @@ impl LayoutScreen {
             let (pos, size) = self.place(aspect, x, y, a.1, a.2);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
-            out.push(Sprite { texture: a.0, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: c, rotation: 0.0, pivot: [0.5, 0.5] });
+            out.push(Sprite { texture: a.0, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: c, rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         };
         let amber = argb(eoe::AMBER);
         for d in draws {
@@ -134,7 +134,7 @@ impl LayoutScreen {
                 Draw::Movie { x, y, w, h, alpha } => {
                     if let Some(m) = e.movie.as_ref() {
                         let (pos, size) = self.place(aspect, x as f32, y as f32, w as f32, h as f32);
-                        out.push(Sprite { texture: m.tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: argb((alpha as u32) << 24 | 0xFF_FFFF), rotation: 0.0, pivot: [0.5, 0.5] });
+                        out.push(Sprite { texture: m.tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: argb((alpha as u32) << 24 | 0xFF_FFFF), rotation: 0.0, pivot: [0.5, 0.5], tri: None });
                     }
                 }
                 Draw::Line { x, y, flip } => {
@@ -172,7 +172,7 @@ impl LayoutScreen {
         let top = y.round();
         for g in &glyphs {
             let (pos, size) = self.place(aspect, left + g.x * sx, top + g.y, g.w * sx, g.h);
-            out.push(Sprite { texture: f.texture(), pos, size, uv_min: g.uv_min, uv_max: g.uv_max, color, rotation: 0.0, pivot: [0.5, 0.5] });
+            out.push(Sprite { texture: f.texture(), pos, size, uv_min: g.uv_min, uv_max: g.uv_max, color, rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         }
     }
 }

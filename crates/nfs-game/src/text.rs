@@ -26,6 +26,11 @@ impl BitmapFont {
         self.texture
     }
 
+    /// Whether the font has a glyph for `ch` (after the same folding `place` applies).
+    pub fn has_glyph(&self, ch: char) -> bool {
+        self.font.glyph(fold(ch)).is_some()
+    }
+
     /// The font's line height in texels.
     pub fn line_px(&self) -> f32 {
         self.font.line_height.max(1) as f32
@@ -87,6 +92,7 @@ impl BitmapFont {
                 color,
                 rotation: 0.0,
                 pivot: [0.0, 0.0],
+                tri: None,
             })
             .collect()
     }

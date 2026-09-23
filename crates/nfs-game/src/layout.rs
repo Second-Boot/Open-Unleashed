@@ -2282,7 +2282,7 @@ impl LayoutScreen {
             let (pos, size) = self.place(aspect, x + px, y + py, dw, dh);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
-            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         }
         let Some(c) = self.controls.get(&e.class) else { return };
         for p in c.state_parts(state).iter().filter_map(|n| c.part(n)) {
@@ -2461,6 +2461,7 @@ impl LayoutScreen {
             color: [0.0, 0.0, 0.0, 1.0],
             rotation: 0.0,
             pivot: [0.5, 0.5],
+            tri: None,
         };
         vec![bar(0.0), bar(1.0 - w)]
     }
@@ -3348,7 +3349,7 @@ impl LayoutScreen {
         // retires §4.152's last approximation. The port used to offset `x` alone.
         let o = cursor_hot_spot(shape);
         let (pos, size) = self.place(aspect, cx + o, cy + o, w, h);
-        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
     }
 
     pub fn advance_movies(&mut self, r: &mut Renderer, dt_ms: u32) {
@@ -3634,7 +3635,7 @@ impl LayoutScreen {
 
     fn quad(&self, aspect: f32, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) -> Sprite {
         let (pos, size) = self.place(aspect, x, y, w, h);
-        Sprite { texture: self.white, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5] }
+        Sprite { texture: self.white, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None }
     }
 
     /// One gouraud quad of the front end's own primitive **0x4D98D0**, whose four `(x, y, colour)`
@@ -3964,7 +3965,7 @@ impl LayoutScreen {
             for (n, ay) in [(frame(0, 1), y), (frame(3, 2), y + h - ARROW_H)] {
                 let Some(&(tex, aw, ah)) = self.shapes.get(&("weeicons.fsh".to_string(), n)) else { continue };
                 let (pos, size) = self.place(aspect, x, ay, aw, ah);
-                out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+                out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
             }
         }
         // the knob: its height is 0x4DAFC5's, and its travel the port's own first row
@@ -4654,7 +4655,7 @@ impl LayoutScreen {
             && let Some(&(tex, sw, sh)) = self.shapes.get(&("weeicons.fsh".to_string(), n))
         {
             let (pos, size) = self.place(aspect, cx0, cy0, sw, sh);
-            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: white, rotation: 0.0, pivot: [0.5, 0.5] });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: white, rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         }
         outline(out, cx0 - 1.0, cy0 - 1.0, (cx1 - cx0) + 2.0, (cy1 - cy0) + 2.0, black);
         // 6 — the eight wells, and the selected one in white
@@ -5081,7 +5082,7 @@ impl LayoutScreen {
             return;
         }
         let (pos, size) = self.place(aspect, phase as f32, y, aw, ah);
-        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, alpha], rotation: 0.0, pivot: [0.5, 0.5] });
+        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, alpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
     }
 
 }
@@ -5761,13 +5762,13 @@ impl LayoutScreen {
             // `NFS_TEXT_BIG=1` draws the quads four times the size
             let size = if std::env::var("NFS_TEXT_BIG").is_ok() { [size[0] * 4.0, size[1] * 4.0] } else { size };
             let tex = if solid { self.white } else { f.texture() };
-            out.push(Sprite { texture: tex, pos, size, uv_min: uv0, uv_max: uv1, color, rotation: 0.0, pivot: [0.0, 0.0] });
+            out.push(Sprite { texture: tex, pos, size, uv_min: uv0, uv_max: uv1, color, rotation: 0.0, pivot: [0.0, 0.0], tri: None });
             // `NFS_TEXT_AB=1` repeats each glyph one line lower **in red**, same texture, same UV
             // window, same size — so one image carries the widget's text twice and the only
             // difference between the two is `color.rgb`. The red copy draws and the black original
             // does not (`AUDIT.md` F2).
             if std::env::var("NFS_TEXT_AB").is_ok() {
-                out.push(Sprite { texture: f.texture(), pos: [pos[0], pos[1] + size[1] * 1.2], size, uv_min: uv0, uv_max: uv1, color: [1.0, 0.0, 0.0, 1.0], rotation: 0.0, pivot: [0.0, 0.0] });
+                out.push(Sprite { texture: f.texture(), pos: [pos[0], pos[1] + size[1] * 1.2], size, uv_min: uv0, uv_max: uv1, color: [1.0, 0.0, 0.0, 1.0], rotation: 0.0, pivot: [0.0, 0.0], tri: None });
             }
         }
     }

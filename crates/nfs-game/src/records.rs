@@ -108,6 +108,52 @@ impl Records {
     }
 }
 
+/// The post-race "Track Records" / "Lap Records" table, `HTrackRecords` (0x433830). CONFIRMED.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HudRecords {
+    /// `LINEAR_TRACK`: the title is 18133 "Track Records" when set, 18158 "Lap Records" when not
+    /// (0x433833…0x433846, `neg / sbb / and 0xE7 / add 0x46EE`).
+    pub linear: bool,
+    /// the eight `(driver, car, time)` rows the table prints, after the player's insert
+    pub rows: Vec<(String, String, u32)>,
+    /// the row drawn selected (`HTable [+0x7AC]`), if any
+    pub highlight: Option<usize>,
+}
+
+/// Build that table the way the HUD does, from the track's records as they were before the race.
+///
+/// `HTrackRecords::insertPlayer` 0x433A20 works on the race's own copies `TRACKRECORDS1..8`
+/// `[0x657498]` and `LAPRECORDS1..8` `[0x6574B8]`, which 0x4ECB70 filled with the **same** eight
+/// times. On a point-to-point track it inserts the player's total `car+0xCD8` into the first, on a
+/// circuit the best lap `car+0xCFC` into the second, at the first slot where the time is
+/// **strictly less and not zero** (0x433A58 `jge` skip, `test edx, edx / jne`) — the zero test the
+/// persistent `Records_insert` 0x4FAFC0 does not have — shifting the slots below down one and the
+/// names and cars with them. The draw 0x433CF0 prints the array it inserted into, the name cut to
+/// 31 characters (0x433E09 `push 0x1F`), and selects the **first** row `k` with
+/// `TRACKRECORDS[k] == total || LAPRECORDS[k] == best` (0x433ED9…0x433EF4) — an equality test, not
+/// the insert's index.
+pub fn hud_records(before: &[TrackRecord], linear: bool, driver: &str, car: &str, total: u32, best: u32) -> HudRecords {
+    let mut names: Vec<(String, String)> = before.iter().map(|e| (e.driver.clone(), e.car.clone())).collect();
+    let mut track: Vec<u32> = before.iter().map(|e| e.time).collect();
+    let mut lap = track.clone();
+    let time = if linear { total } else { best };
+    let arr = if linear { &mut track } else { &mut lap };
+    if let Some(k) = arr.iter().position(|e| time < *e && time != 0) {
+        arr.insert(k, time);
+        arr.truncate(before.len());
+        names.insert(k, (driver.chars().take(31).collect(), car.to_string()));
+        names.truncate(before.len());
+    }
+    let highlight = (0..track.len()).find(|&k| track[k] == total || lap[k] == best);
+    let shown = if linear { &track } else { &lap };
+    let rows = names
+        .into_iter()
+        .zip(shown.iter())
+        .map(|((d, c), t)| (d.chars().take(31).collect(), c, *t))
+        .collect();
+    HudRecords { linear, rows, highlight }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +182,26 @@ mod tests {
         assert_eq!(r.track("coastal").unwrap().entries[0].time, 5000);
         assert_eq!(r.track("coastal").unwrap().entries[1].time, NO_RECORD_TIME);
         assert_eq!(r.insert("nowhere", "ME", "911", 5000), None);
+    }
+
+    /// 0x433A20 / 0x433CF0: the player's lap goes in above the first slower one, a zero time
+    /// never does, and the selected row is found by equality.
+    #[test]
+    fn the_hud_records_table() {
+        let rec = |d: &str, t: u32| TrackRecord { driver: d.into(), car: "911".into(), time: t };
+        let before = vec![rec("A", 100), rec("B", 200), rec("C", 300)];
+        let h = hud_records(&before, false, "ME", "356", 9_999, 150);
+        assert_eq!(h.rows.iter().map(|r| r.2).collect::<Vec<_>>(), vec![100, 150, 200]);
+        assert_eq!(h.rows[1].0, "ME");
+        assert_eq!(h.highlight, Some(1));
+        assert!(!h.linear);
+        // a zero lap is not inserted (the persistent table would take it)
+        let z = hud_records(&before, false, "ME", "356", 0, 0);
+        assert_eq!(z.rows.iter().map(|r| r.2).collect::<Vec<_>>(), vec![100, 200, 300]);
+        assert_eq!(z.highlight, None);
+        // point-to-point: the total goes into the other copy
+        let l = hud_records(&before, true, "ME", "356", 250, 50);
+        assert_eq!(l.rows.iter().map(|r| r.2).collect::<Vec<_>>(), vec![100, 200, 250]);
+        assert_eq!(l.highlight, Some(2));
     }
 }

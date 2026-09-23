@@ -128,6 +128,10 @@ pub struct Sprite {
     /// rotation in turns about `pivot` (in sprite-local 0..1 coordinates)
     pub rotation: f32,
     pub pivot: [f32; 2],
+    /// A flat triangle instead of the quad: three corners in the same screen units as `pos`
+    /// (`pos` / `size` / `rotation` are then unused) — for the HUD's untextured polygons such as
+    /// H321Go's sweep (0x466100).
+    pub tri: Option<[[f32; 2]; 3]>,
 }
 
 #[derive(Clone, Debug)]

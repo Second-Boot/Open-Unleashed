@@ -717,8 +717,9 @@ impl Renderer {
     /// Render a scene's meshes into an offscreen texture that the sprite pass can then draw, so a
     /// 3D view can sit **inside** the 2D screen in the right drawing order — what the front end's
     /// `NFS5.3DCAR` widgets need (`RE/notes/frontend-3d.md` §4). The clear is transparent, so only
-    /// the geometry shows. Passing the id of a texture this returned earlier reuses it.
-    pub fn render_offscreen(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32, reuse: Option<TextureId>) -> TextureId {
+    /// the geometry shows, unless `clear` gives an opaque colour (the in-race rear-view mirror).
+    /// Passing the id of a texture this returned earlier reuses it.
+    pub fn render_offscreen(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32, reuse: Option<TextureId>, clear_colour: Option<[f64; 4]>) -> TextureId {
         let (width, height) = (width.max(1), height.max(1));
         let id = match reuse.filter(|t| self.offscreen.get(&t.0).is_some_and(|(w, h)| *w == width && *h == height)) {
             Some(t) => t,
@@ -751,7 +752,7 @@ impl Renderer {
         let depth = Self::make_depth(&self.device, &cfg);
         let view = self.textures[id.0 as usize].view.clone();
         let mut clear = scene.clone();
-        clear.clear_color = [0.0, 0.0, 0.0, 0.0];
+        clear.clear_color = clear_colour.unwrap_or([0.0, 0.0, 0.0, 0.0]);
         clear.sprites.clear();
         self.encode_frame(&clear, camera, &view, &depth, width as f32 / height as f32);
         id
@@ -928,6 +929,11 @@ impl Renderer {
 
 /// Build the two triangles of a sprite in clip space (y up), rotating about its pivot in screen space.
 fn sprite_quad(sp: &Sprite, aspect: f32) -> [SpriteVertex; 6] {
+    if let Some(t) = sp.tri {
+        let v = |p: [f32; 2]| SpriteVertex { pos: [p[0] * 2.0 - 1.0, 1.0 - p[1] * 2.0], uv: sp.uv_min, color: sp.color };
+        let (a, b, c) = (v(t[0]), v(t[1]), v(t[2]));
+        return [a, b, c, c, c, c];
+    }
     let (sx, sy) = (sp.size[0] / aspect, sp.size[1]);
     let (px, py) = (sp.pos[0] + sp.pivot[0] * sx, sp.pos[1] + sp.pivot[1] * sy);
     let (sn, cs) = (sp.rotation * std::f32::consts::TAU).sin_cos();

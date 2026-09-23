@@ -635,7 +635,7 @@ impl Vehicle {
         // block below, so on those paths it kept the previous tick's value.
         self.rear_spin = false;
         // `misfire = engineDamage/300 > rand01` (§4.3), drawn at the top of the routine (0x49E4BD)
-        let misfire = self.part_wear(&specs.zone_masks.engine, &specs.wear.engine) / 300.0 > self.misfire_roll;
+        let misfire = self.engine_wear(specs) / 300.0 > self.misfire_roll;
         // **The no-drive path, 0x49EF36…0x49F075**, entered in neutral, mid-shift or with the rear
         // off the ground (0x49E84F / 0x49E85D / 0x49E869):
         //
@@ -684,7 +684,7 @@ impl Vehicle {
         let rpm_wheel = specs.ratio_rpm_per_mps[ratio_gear] * vz;
         let rpm_c = self.rpm.clamp(0.0, specs.redline);
         let t = specs.torque_at(rpm_c);
-        let mut a_drive = t * specs.accel_per_torque[gear] * (1.0 - self.part_wear(&specs.zone_masks.engine, &specs.wear.engine) / 300.0) * (1.0 - 0.005 * self.part_wear(&specs.zone_masks.gearbox, &specs.wear.gearbox));
+        let mut a_drive = t * specs.accel_per_torque[gear] * (1.0 - self.engine_wear(specs) / 300.0) * (1.0 - 0.005 * self.part_wear(&specs.zone_masks.gearbox, &specs.wear.gearbox));
         let mut diff = rpm_target - rpm_wheel.abs();
         if diff.abs() < 125.0 && rpm_target >= specs.redline - 300.0 {
             diff = 0.0;
@@ -871,6 +871,34 @@ impl Vehicle {
             }
         }
         if n == 0 { 0.0 } else { sum / n as f32 }
+    }
+
+    /// `0x4938A0`, the engine figure: unlike the rest of the family it starts from **zone 1**
+    /// (`fld [car+0x4E8]`, 0x4938AE) and counts from 1 (0x4938A9), so it is
+    /// `(zone1 + Σ part terms) / (1 + n)` and always divides (0x493946). The misfire, the drive
+    /// force and HTextDamage's "drivetrain" row read it. This port used the bare sum.
+    pub fn engine_wear(&self, specs: &crate::specs::CarSpecs) -> f32 {
+        (self.damage[1] + self.part_wear(&specs.zone_masks.engine, &specs.wear.engine)) / (1 + specs.wear.engine.count) as f32
+    }
+
+    /// `0x493BC0`, the suspension figure: the part terms of types 4, 5 and 8 summed, then divided by
+    /// their count when it is above 1 (0x493C78…0x493C7E). The brakes, gearbox, aero and tyre getters
+    /// (0x493A10, 0x493AA0, 0x493B30, 0x493980) have no outer division.
+    pub fn suspension_wear(&self, specs: &crate::specs::CarSpecs) -> f32 {
+        let w = self.part_wear(&specs.zone_masks.suspension, &specs.wear.suspension);
+        let n = specs.wear.suspension.count;
+        if n > 1 { w / n as f32 } else { w }
+    }
+
+    /// `0x493960`, the steering figure: `(zone2 + zone0) · 0.5` (`car+0x4EC`, `+0x4E4`, `[0x5B23F0]`).
+    pub fn steering_damage(&self) -> f32 {
+        (self.damage[2] + self.damage[0]) * 0.5
+    }
+
+    /// `0x493C90`, the body figure: zones 0…8 summed and scaled by `[0x5B49B0]` = 1/12 — nine zones
+    /// over twelve, as the binary has it (0x493C94 `mov ecx, 9`).
+    pub fn body_damage(&self) -> f32 {
+        self.damage[..9].iter().sum::<f32>() * (1.0f32 / 12.0)
     }
 
     /// Average body damage in per cent (10 zones, `0x434FA0`).
@@ -1523,7 +1551,7 @@ impl Vehicle {
         let mut pull = (self.damage[2] - self.damage[0]) * 0.25;
         if self.ticks_alive.is_multiple_of(4) {
             let r = ((self.ticks_alive.wrapping_mul(1103515245).wrapping_add(12345) >> 16) & 0xFFFF) as f32 / 65535.0 - 0.5;
-            pull += r * 0.5 * if speed > 15.0 { speed / 15.0 } else { 1.0 } * self.part_wear(&specs.zone_masks.suspension, &specs.wear.suspension) * 0.01;
+            pull += r * 0.5 * if speed > 15.0 { speed / 15.0 } else { 1.0 } * self.suspension_wear(specs) * 0.01;
         }
         self.damage_pull = pull;
         self.set_wheel_steer(specs, (self.steer + fistp(pull) + g_off).clamp(-127, 127) as f32, speed, vl.z);
@@ -2781,6 +2809,23 @@ mod roughness_tests {
         assert!(v.part_damage(&specs.zone_masks.engine) / 300.0 > 0.0);
         let dmg = v.part_damage(&specs.zone_masks.engine) / 300.0;
         assert!(dmg > 0.5 && dmg <= 1.0, "engine damage {dmg}");
+    }
+
+    #[test]
+    fn the_engine_figure_counts_zone_one_and_divides_by_one_more_part() {
+        // 0x4938A0: `(zone1 + Σ part terms) / (1 + n)`; 0x493BC0: `Σ / n` only when n > 1
+        let mut specs = tests::specs_993();
+        let mut v = Vehicle::new(Vec3::ZERO, Mat3::IDENTITY, &specs, 0.8, 0.3);
+        v.damage = [0.0; 10];
+        v.damage[1] = 40.0;
+        let sum = v.part_wear(&specs.zone_masks.engine, &specs.wear.engine);
+        assert_eq!(v.engine_wear(&specs), (40.0 + sum) / 2.0);
+        v.damage = [20.0; 10];
+        specs.wear.suspension.count = 1;
+        let one = v.suspension_wear(&specs);
+        specs.wear.suspension.count = 3;
+        assert_eq!(v.suspension_wear(&specs) * 3.0, v.part_wear(&specs.zone_masks.suspension, &specs.wear.suspension));
+        assert_eq!(one, v.part_wear(&specs.zone_masks.suspension, &specs.wear.suspension));
     }
 }
 

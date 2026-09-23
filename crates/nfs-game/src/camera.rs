@@ -26,6 +26,38 @@ use glam::Vec3;
 /// whose offset is zero take their position from somewhere else: `TVCam` from the `.scn` camera
 /// element a trigger switched to (§12), `AnimCam` from a `CmAn` animation, the cop cameras from the
 /// car they follow.
+/// A camera slot's field-of-view half-angle as SetSlotView 0x465790 leaves it (`+0x58` = 37.5,
+/// 0x46584F…0x465886), in degrees.
+pub const DEFAULT_HALF_ANGLE: f32 = 37.5;
+
+/// The vertical field of view, in radians, of a slot half-angle `h` (degrees). The build 0x464F80
+/// hands the view `+0x130 = h` (0x4653E9…0x46540B) and the projection 0x5391B0 takes `2·h` as the
+/// **horizontal** angle with the viewport's aspect in 640 × 480 units (0x466FD7…0x46700C:
+/// `m00 = cot h`, `m11 = m00 · 640/480`), so the full-screen view is `2·atan(tan h · 0.75)` high —
+/// 59.8° for the default. (`[0x657D5C]`'s ×1.2 is not carried.)
+pub fn fov_y(half_angle_deg: f32) -> f32 {
+    2.0 * (half_angle_deg.to_radians().tan() * 0.75).atan()
+}
+
+/// `[0x657D5C]` — the front end's "wide screen" (`Graphics.WideScreen`). The main view's viewport is
+/// then `y` 0.15…0.85 of the screen (0x468E96…0x468EA4 / 0x468E30 → 0x466EB0) and the half-angle ×1.2
+/// (`[0x5B2480]`, 0x4653E9) unless the slot's view is 1. The projection's aspect is the viewport's,
+/// so the band shows `2·atan(tan h · 0.75 / 0.7)` of the full window's height.
+pub const WIDESCREEN_BAND: f32 = 0.7;
+pub const WIDESCREEN_ZOOM: f32 = 1.2;
+
+/// The slot half-angle with the wide-screen factor applied (`view` is the slot's view id).
+pub fn half_angle(base: f32, widescreen: bool, view: u16) -> f32 {
+    if widescreen && view != 1 { base * WIDESCREEN_ZOOM } else { base }
+}
+
+/// The full-window vertical field of view that puts the wide-screen band's projection on the
+/// band: the viewport is `WIDESCREEN_BAND` of the height, so the whole window spans `1/0.7` of it.
+pub fn fov_y_window(half_angle_deg: f32, widescreen: bool) -> f32 {
+    let band = if widescreen { WIDESCREEN_BAND } else { 1.0 };
+    2.0 * (half_angle_deg.to_radians().tan() * 0.75 / band).atan()
+}
+
 pub const VIEW_OFFSETS: [Vec3; 20] = [
     Vec3::new(0.0, 0.40, 0.90),   // 0x00 BumperCam
     Vec3::new(0.0, 0.40, 0.90),   // 0x01 BumperCam2 — replaced per car
@@ -122,6 +154,58 @@ pub fn audio_mode(view: u16, attached: bool, interior: bool) -> u8 {
     }
 }
 
+/// **The look-around step 0x4611C0**, run by the bumper (0x461D50) and driver (0x461A30) updates
+/// once the slot's matrix is the car's: the target is 0°, −90° / +90° for input bits 0x14 / 0x15,
+/// `180 − that/2` with 0x13 (look back), halved again with 0x16; the slot's yaw `+0xC6` (a word,
+/// reset to 0 by SetSlotView 0x4658B2 and by 0x465A60) moves toward it by a quarter of the
+/// difference, truncated, the short way round, and wraps at 360 (a value of exactly 360 is kept,
+/// 0x4612CE `jle`). A quarter truncates to 0 inside 4°, so the yaw settles 1–3° short of the target
+/// (180 is reached as 183 from above, 0 as 357 coming back). Returns the new yaw and whether the
+/// matrix is turned by it: the update skips the turn only when the yaw already equals the target
+/// (0x46123D), so a settled yaw still turns the view every update.
+pub fn look_step(cur: i16, target: i16) -> (i16, bool) {
+    if target == cur {
+        return (cur, false);
+    }
+    let mut si = target as i32;
+    if si < 0 {
+        si += 360;
+    }
+    let mut bp = si + 180;
+    if bp >= 360 {
+        bp -= 360;
+    }
+    let cx = cur as i32;
+    // `(d + (d < 0 ? 3 : 0)) >> 2`, made positive (0x46126A…0x461284)
+    let q = |d: i32| (d / 4).abs();
+    let diff = si - cx;
+    let step = q(diff);
+    let new = if si < 180 {
+        if cx > si {
+            if cx <= bp { cx - step } else { cx + q(diff + 360) }
+        } else if cx == si {
+            cx
+        } else {
+            cx + step
+        }
+    } else if cx > si {
+        cx - step
+    } else if cx == si {
+        cx
+    } else if cx > bp {
+        cx + step
+    } else {
+        cx - q(diff - 360)
+    };
+    let mut ax = new as i16;
+    if ax > 360 {
+        ax -= 360;
+    } else if ax < 0 {
+        ax += 360;
+    }
+    (ax, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +239,24 @@ mod tests {
         assert_eq!(audio_mode(1, true, true), 0);
         assert_eq!(audio_mode(3, true, false), 2);
         assert_eq!(audio_mode(12, false, false), 3);
+    }
+
+    #[test]
+    fn look_back_swings_the_short_way_and_settles_short() {
+        // 0 → 180 goes down through 315 and stops at 183; back to 0 climbs to 357
+        let mut y = 0i16;
+        let mut seen = vec![];
+        for _ in 0..40 {
+            y = look_step(y, 180).0;
+            seen.push(y);
+        }
+        assert_eq!(seen[0], 315);
+        assert_eq!(y, 183);
+        for _ in 0..40 {
+            y = look_step(y, 0).0;
+        }
+        assert_eq!(y, 357);
+        assert_eq!(look_step(0, 0), (0, false));
+        assert_eq!(look_step(357, 0), (357, true));
     }
 }

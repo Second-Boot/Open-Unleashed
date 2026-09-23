@@ -37,7 +37,8 @@ pub struct CarStyle {
 pub struct DriverCam {
     /// the eye point in the car body frame: +x right, +y up, +z forward
     pub position: glam::Vec3,
-    /// pitch, yaw and roll in **degrees**, applied to the camera matrix in that order
+    /// pitch, yaw and roll in **degrees**, each pre-multiplying the camera matrix in that order
+    /// (so `car · Rx · Ry · Rz` on column vectors)
     /// (0x461B48 multiplies by `angle/360` turns and calls the x/y/z rotations 0x5563D0 /
     /// 0x5564A0 / 0x556560). A positive pitch tilts the forward row towards −up, i.e. **down**:
     /// 0x5563D0 leaves the x row alone and does `up' = cos·up + sin·fwd`,

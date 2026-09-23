@@ -216,6 +216,43 @@ impl TriangleGrid {
         best.map(|(_, w, h)| (w, h))
     }
 
+    /// Every patch of the point's cell with a surface nibble (`word & 0xF`) whose plan contains
+    /// the point, with its plane height there — the list 0x473650 builds (its radius only picks
+    /// the cells, 0x484630; the footprint test vt+0xC and the nibble 0x473705 pick the patches) and
+    /// 0x48A060's `h = −(n·v0 … )/n.y` on it. Same MEDIUM as [`Self::find_patch`]: a quad is its two
+    /// triangles.
+    pub fn patches_at(&self, p: Vec3) -> impl Iterator<Item = (&Triangle, f32)> + '_ {
+        self.patches_where(p, |w| w & 0xF != 0)
+    }
+
+    /// [`Self::patches_at`] with another test on the flags word — 0x473420, the ceiling list, keeps
+    /// the words with bit 15 set and **no** surface nibble (0x4734D6…0x4734E5).
+    pub fn patches_where(&self, p: Vec3, keep: impl Fn(u32) -> bool + 'static) -> impl Iterator<Item = (&Triangle, f32)> + '_ {
+        let cell = if self.tris.is_empty() {
+            &[][..]
+        } else {
+            let (cx, cz) = Self::cell_of(self.min, self.cell_size, self.nx, self.nz, p);
+            &self.cells[cz * self.nx + cx][..]
+        };
+        cell.iter().filter_map(move |&ti| {
+            let t = &self.tris[ti as usize];
+            if !keep(t.surface) {
+                return None;
+            }
+            let side = |a: Vec3, b: Vec3| (b.x - a.x) * (p.z - a.z) - (b.z - a.z) * (p.x - a.x);
+            let (d0, d1, d2) = (side(t.a, t.b), side(t.b, t.c), side(t.c, t.a));
+            let inside = (d0 >= 0.0 && d1 >= 0.0 && d2 >= 0.0) || (d0 <= 0.0 && d1 <= 0.0 && d2 <= 0.0);
+            if !inside {
+                return None;
+            }
+            let n = (t.b - t.a).cross(t.c - t.a);
+            if n.y.abs() < 1e-9 {
+                return None;
+            }
+            Some((t, t.a.y - (n.x * (p.x - t.a.x) + n.z * (p.z - t.a.z)) / n.y))
+        })
+    }
+
     /// Ground under (x, z): highest surface below `y_from` within `depth`.
     pub fn ground(&self, x: f32, y_from: f32, z: f32, depth: f32) -> Option<Hit> {
         self.raycast(Vec3::new(x, y_from, z), Vec3::NEG_Y, depth)

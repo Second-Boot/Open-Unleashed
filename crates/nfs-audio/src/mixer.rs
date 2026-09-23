@@ -42,6 +42,8 @@ struct Shared {
     /// wet level 0..1, set from the tunnel reverb state (`engine-audio.md` §4.7)
     reverb: f32,
     tail: Option<Reverb>,
+    /// every voice at volume 0 — the race pause (see [`AudioOutput::set_muted`])
+    muted: bool,
 }
 
 /// A small Schroeder reverb — four combs into two all-passes, per channel.
@@ -174,7 +176,10 @@ impl AudioOutput {
                         }
                     }
                 }
-                if g.reverb > 0.0 {
+                if g.muted {
+                    out.fill(0.0);
+                }
+                if g.reverb > 0.0 && !g.muted {
                     let wet = g.reverb;
                     let rate_hz = out_rate as u32;
                     let rv = g.tail.get_or_insert_with(|| Reverb::new(rate_hz));
@@ -244,6 +249,13 @@ impl AudioOutput {
     }
 
     /// Wet level of the tunnel reverb, 0..1 (`Reverb::wet` from the game's 0..100 level).
+    /// The race pause's audio side, 0x4AB150: `Voice_setVolume(h, 0)` on the player's engine voices
+    /// (0x4AF900) and on every voice of the table `0x656180` — they keep running, silent — until the
+    /// resume 0x4AB200 puts the saved levels back. Here the whole mix is held at zero instead.
+    pub fn set_muted(&self, muted: bool) {
+        self.shared.lock().unwrap().muted = muted;
+    }
+
     pub fn set_reverb(&self, wet: f32) {
         let mut g = self.shared.lock().unwrap();
         g.reverb = wet.clamp(0.0, 1.0);

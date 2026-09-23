@@ -250,8 +250,9 @@ impl SkillTest {
     }
 
     /// `HMissionSummary::evaluate` (§10). `position` = finishing position for race missions,
-    /// `damage_pct` = average body damage. Returns (pass, effective time in ticks incl. penalty).
-    pub fn evaluate(&self, mission: &Mission, position: usize, damage_pct: f32) -> (bool, u64) {
+    /// `zones` = the player's ten body-damage zones. Returns (pass, effective time in ticks incl.
+    /// penalty).
+    pub fn evaluate(&self, mission: &Mission, position: usize, zones: &[f32; 10]) -> (bool, u64) {
         let cones = self.cones_knocked() as u64;
         // no finish trigger taken = DNF (`car+0xB24 = 99999`)
         let mut t = self.time_ticks.unwrap_or(99_999);
@@ -266,13 +267,26 @@ impl SkillTest {
                 pass = false;
             }
         }
-        if let Some(d) = mission.damage_limit_pct && damage_pct > d as f32 {
+        if damage_over_limit(mission, zones) {
             pass = false;
         }
         if let Some(ConeRule::Limit(n)) = mission.cone_rule && cones > n as u64 {
             pass = false;
         }
         (pass, t)
+    }
+}
+
+/// `0x434FA0` (§9) — the mission's damage test, CONFIRMED (read 2026-09-23): the ten zones are
+/// summed into an integer **truncating after every add** (`fild acc / fadd zone / _ftol`,
+/// 0x434FD6…0x43500C, the same arithmetic as `career::damage_sum`), the sum is divided by ten as a
+/// C integer (the `0x66666667 / sar 2` pair at 0x435019) and the mission fails when that is
+/// **greater** than `FACTORYDRIVERDAMAGELIMIT [0x657828]`. The float mean the port used to compare
+/// failed a 5 % mission on a car whose zones held 5.99 each; this passes it, as the original does.
+pub fn damage_over_limit(mission: &Mission, zones: &[f32; 10]) -> bool {
+    match mission.damage_limit_pct {
+        Some(limit) => (crate::career::damage_sum(zones) / 10) as i64 > limit as i64,
+        None => false,
     }
 }
 
@@ -332,24 +346,28 @@ mod tests {
         let mut m = nfs_formats::career::parse_missions(&[0u8; 0xF0]).unwrap().remove(0);
         m.time_limit_s = Some(27);
         m.cone_rule = Some(ConeRule::PenaltySeconds(1));
-        assert_eq!(st.evaluate(&m, 1, 0.0), (true, 26 * 64));
+        let clean = [0.0f32; 10];
+        assert_eq!(st.evaluate(&m, 1, &clean), (true, 26 * 64));
         m.cone_rule = Some(ConeRule::PenaltySeconds(3));
-        assert_eq!(st.evaluate(&m, 1, 0.0).0, false, "25 + 3 s ≥ 27 s");
+        assert_eq!(st.evaluate(&m, 1, &clean).0, false, "25 + 3 s ≥ 27 s");
         m.cone_rule = None;
         m.damage_limit_pct = Some(5);
-        assert!(!st.evaluate(&m, 1, 7.0).0);
+        assert!(!st.evaluate(&m, 1, &[7.0; 10]).0);
+        // 0x434FA0 truncates after every add: 5.99 × 10 sums to 50, and 50 / 10 = 5 is not over 5
+        assert!(st.evaluate(&m, 1, &[5.99; 10]).0);
+        assert!(!st.evaluate(&m, 1, &[6.0; 10]).0);
         m.damage_limit_pct = None;
         m.min_rank = Some(1);
-        assert!(st.evaluate(&m, 1, 0.0).0 && !st.evaluate(&m, 2, 0.0).0);
+        assert!(st.evaluate(&m, 1, &clean).0 && !st.evaluate(&m, 2, &clean).0);
         // DNF makes any time limit fail
         m.min_rank = None;
         m.time_limit_s = Some(385);
         st.dnf = true;
         st.time_ticks = Some(99_999);
-        assert!(!st.evaluate(&m, 1, 0.0).0);
+        assert!(!st.evaluate(&m, 1, &clean).0);
         // never reached the finish: also a fail
         st.dnf = false;
         st.time_ticks = None;
-        assert!(!st.evaluate(&m, 1, 0.0).0);
+        assert!(!st.evaluate(&m, 1, &clean).0);
     }
 }

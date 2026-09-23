@@ -37,16 +37,18 @@ impl Default for ZoneMasks {
 /// What a part-damage getter adds to the live zone damage (`physics.md` §10, 0x4938A0 family):
 /// it returns `Σ (1.5 − 0.005·part.condition)·meanZoneDamage + part.state` over the car's parts of
 /// that type, so each group is a scale and an offset the career fills from the installed parts.
-/// The defaults are one standard part in perfect condition.
+/// The defaults are one standard part in perfect condition. `count` is the number of parts summed:
+/// the engine getter divides by `1 + count` and the suspension one by `count` (when above 1).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PartWear {
     pub scale: f32,
     pub offset: f32,
+    pub count: u32,
 }
 
 impl Default for PartWear {
     fn default() -> Self {
-        Self { scale: 1.5, offset: 0.0 }
+        Self { scale: 1.5, offset: 0.0, count: 1 }
     }
 }
 

@@ -5,7 +5,7 @@
 //! The junction branch choice of `race-logic.md` §10.4 is in: once per junction the lookahead reaches,
 //! the car draws from the original's single global stream and picks a link, which every road preview
 //! then follows. Not yet reproduced:
-//! skill randomisation (fe.txt has all skills 1.0), damage/wet factors, and the tracker's
+//! skill randomisation (fe.txt has all skills 1.0), the wet factor, and the tracker's
 //! `preferredSection` hop (the port's `find_slice` still hill-climbs). Avoidance (§3.2) follows the
 //! notes for the two cars directly ahead in race order.
 
@@ -363,6 +363,10 @@ impl AiDriver {
         let ang = ((max_l + max_r) * self.k_angle * zone).min(115.0);
         let c3 = (ang / 3.0) as usize;
         let mut vt = self.data.bend_speed[c3.min(39)];
+        // the car's own steering damage slows it through the bend: `vt /= 1 + 0x493960(car) · [0x5B267C]`
+        // (0x40BACE…0x40BAEA, `[0x5B267C]` = 0.0066667 = 1/150, `[0x5B24A8]` = 1.0) — the steering
+        // figure `(zone2 + zone0)·0.5`, not the body mean `ai.md` §3 called it
+        vt /= 1.0 + v.steering_damage() * f32::from_bits(0x3BDA_740E);
         // surface factor from the car's surface (`car+0x464`): dry table row × class column, ≤ 1
         // (off the tarmac the target drops to 0.5–0.85 of the curve — §3.1)
         let surface = v.wheels[0].surface & 0xF;

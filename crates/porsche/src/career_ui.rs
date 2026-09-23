@@ -68,7 +68,6 @@ pub struct MissionStart {
     pub mission: Mission,
     /// `_st<N>.scn` suffix for skill tests (None for race missions / circuit lap races).
     pub scene_suffix: Option<String>,
-    pub narrator: String,
 }
 
 #[derive(Debug, Clone)]
@@ -317,7 +316,6 @@ impl CareerUi {
                 index: idx,
                 mission: m.clone(),
                 scene_suffix,
-                narrator: self.narrator_name(m.narrator),
             }),
             traffic: CAREER_TRAFFIC[(m.traffic_level.max(0) as usize).min(3)],
             traffic_ids: None,
@@ -327,18 +325,12 @@ impl CareerUi {
     }
 
     /// Mission over: `passed` from `SkillTest::evaluate` / the race position.
-    pub fn finish_mission(&mut self, idx: usize, passed: bool, time_ticks: u64, cones: usize) {
+    /// `text` is the result line the race's `HMissionSummary` chose (0x4293F0), and `driver` the
+    /// name its `%s` takes.
+    pub fn finish_mission(&mut self, idx: usize, passed: bool, time_ticks: u64, cones: usize, text: Option<u32>, driver: &str) {
         self.pending = None;
         let m = self.tables.missions[idx].clone();
-        let texts = if passed {
-            m.success_string_ids
-        } else {
-            m.failure_string_ids
-        };
-        let ids: Vec<u32> = texts.iter().copied().filter(|t| *t != 0).collect();
-        let pick = ids
-            .get((time_ticks as usize + cones) % ids.len().max(1))
-            .copied();
+        let pick = text;
         let promotion = self.career.record_mission(&self.tables, idx, passed);
         let secs = time_ticks as f32 / 64.0;
         let mut msg = format!(
@@ -350,7 +342,7 @@ impl CareerUi {
             cones
         );
         if let Some(id) = pick {
-            msg += &self.tables.strings.text(id).replace("%s", "DRIVER");
+            msg += &self.tables.strings.text(id).replacen("%s", driver, 1);
         }
         if let Some(stage) = promotion {
             msg += &format!("   STAGE {stage} COMPLETE: PROMOTION!");

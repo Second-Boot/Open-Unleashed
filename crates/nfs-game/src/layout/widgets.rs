@@ -104,7 +104,7 @@ impl LayoutScreen {
         let Some(file) = e.get("shapePathName").filter(|v| !v.is_empty()) else { return };
         let Some(&(tex, aw, ah)) = self.shapes.get(&(file.to_string(), index)) else { return };
         let (pos, size) = self.place(aspect, x, y, aw, ah);
-        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
     }
 
     // `NFS5.CarSettingSlider` is the template's transparent track (`color.value` is
@@ -133,7 +133,7 @@ impl LayoutScreen {
             let (dw, dh) = (if pw > 0.0 { pw } else { aw }, if ph > 0.0 { ph } else { ah });
             let dx = if count > 1 { (idx * (w - dw).max(0.0) as i32 / (count - 1)) as f32 } else { 0.0 };
             let (pos, size) = self.place(aspect, x + px + dx, y + py, dw, dh);
-            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         }
     }
 
@@ -214,7 +214,7 @@ impl LayoutScreen {
             let (pos, size) = self.place(aspect, x + px, y + py, dw, dh);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
-            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         }
         // the caption, where the template puts it
         if let Some(c) = self.controls.get(&e.class)
@@ -518,7 +518,7 @@ impl LayoutScreen {
             && let Some(&(tex, aw, ah)) = self.shapes.get(&(CAMERA_PICTURES.to_string(), n.max(0.0) as usize))
         {
             let (pos, size) = self.place(aspect, x, y, aw, ah);
-            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5] });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         }
         self.template_widget(out, aspect, e, state, x, y, strings);
         if e.class == "NFS5.TABBUTTON" {
@@ -616,7 +616,7 @@ impl LayoutScreen {
             let Some(&(lt, lw, lh)) = self.shapes.get(&(SHOWCASE_ANIM.to_string(), n + 4)) else { return };
             for (t, dx, w2, h2) in [(tex, 0.0, aw, ah), (lt, aw, lw, lh)] {
                 let (pos, size) = self.place(aspect, x + dx, y, w2, h2);
-                out.push(Sprite { texture: t, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, a * talpha], rotation: 0.0, pivot: [0.5, 0.5] });
+                out.push(Sprite { texture: t, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, a * talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
             }
         };
         if phase < REST {
@@ -655,7 +655,7 @@ impl LayoutScreen {
             false => (0.0, 0.0),
         };
         let (pos, size) = self.place(aspect, x - px, y - py, dw, dh);
-        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         // `NFS5.ChroniclePictureIcon`'s draw ends with the bevel over **the art's own
         // size** — 0x508906 and 0x508910 read `[entry+0x18]` and `[entry+0x14]`, the
         // height and width of the `.fsh` entry it just drew, not the widget's box —
@@ -696,10 +696,10 @@ impl LayoutScreen {
         };
         let top = y + ((h - ah) * 0.5).trunc();
         let (pos, size) = self.place(aspect, left, top, aw, ah);
-        out.push(Sprite { texture: ta, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+        out.push(Sprite { texture: ta, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         if let Some(tb) = tb {
             let (pos, size) = self.place(aspect, left + aw, top, bw, bh);
-            out.push(Sprite { texture: tb, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+            out.push(Sprite { texture: tb, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         }
         // The glint, 0x4C1CE0…0x4C1DAF, and it is the **same sweep the header has**
         // (§4.25): the `GLNT` entry of `weeicons.fsh` that the activate looks up by
@@ -799,7 +799,7 @@ impl LayoutScreen {
                         && let Some(&(tex, aw, ah)) = self.shapes.get(&(self.chronicle_icons.0.clone(), if on { *over } else { *rest }))
                     {
                         let (pos, size) = self.place(aspect, cx + 1.0, by + 1.0, aw, ah);
-                        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5] });
+                        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
                     }
                     for (bx, by, bw, bh) in [(cx, by, 90.0, 1.0), (cx, by + 59.0, 90.0, 1.0), (cx, by, 1.0, 60.0), (cx + 89.0, by, 1.0, 60.0)] {
                         out.push(self.quad(aspect, bx, by, bw, bh, black));
@@ -845,7 +845,7 @@ impl LayoutScreen {
         if let Some(&(tex, aw, ah)) = self.shapes.get(&(file.to_string(), frame)) {
             let (dw, dh) = (if w > 0.0 { w } else { aw }, if h > 0.0 { h } else { ah });
             let (pos, size) = self.place(aspect, x, y, dw, dh);
-            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: tint([255, 255, 255, 255]), rotation: 0.0, pivot: [0.5, 0.5] });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: tint([255, 255, 255, 255]), rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         }
     }
 
@@ -992,7 +992,7 @@ impl LayoutScreen {
         let picture = |out: &mut Vec<Sprite>, art: Option<(TextureId, f32, f32, f32, f32)>, color: [f32; 4]| {
             let Some((tex, aw, ah, ax, ay)) = art else { return };
             let (pos, size) = self.place(aspect, ax, ay, aw, ah);
-            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5] });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         };
         picture(out, ev.map, [1.0, 0xBB as f32 / 255.0, 0.0, talpha * ramp as f32 / 255.0]);
         picture(out, ev.marker, [1.0, 1.0, 1.0, talpha]);
@@ -1017,7 +1017,7 @@ impl LayoutScreen {
         let Some(key) = self.logos.get(&i) else { return };
         let Some(&(tex, aw, ah)) = self.shapes.get(key) else { return };
         let (pos, size) = self.place(aspect, x, y, aw, ah);
-        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5] });
+        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
     }
 
     // a widget that is only a place, with its picture put there from code: one entry
@@ -1039,7 +1039,7 @@ impl LayoutScreen {
         let stretch = e.class.starts_with("NFS5.MINI");
         let (dw, dh) = if stretch && w > 0.0 && h > 0.0 { (w, h) } else { (aw, ah) };
         let (pos, size) = self.place(aspect, x, y, dw, dh);
-        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5] });
+        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         let Some((name, rank, colour)) = self.badges.get(&i) else { return };
         // the shadow: entry 0 at x+244 and entry 1 at y+131 (0x4CF499, 0x4CF4C4). The
         // original also gates it on a start-up timer (0x4E35D0 wants the game to have
@@ -1048,7 +1048,7 @@ impl LayoutScreen {
         for (entry, dx, dy) in [(0usize, 244.0, 0.0), (1, 0.0, 131.0)] {
             let Some(&(t, sw, sh)) = self.shapes.get(&(LICENSE_SHADOW.to_string(), entry)) else { continue };
             let (pos, size) = self.place(aspect, x + dx, y + dy, sw, sh);
-            out.push(Sprite { texture: t, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5] });
+            out.push(Sprite { texture: t, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         }
         // the name, centred (the fourth argument of 0x4DA350 is the alignment: 1 pulls
         // back half the text's width, 2 the whole of it — 0x4DA3D7…0x4DA405) at
@@ -1084,7 +1084,7 @@ impl LayoutScreen {
             // written out. **One** differs: `credits.lay`'s `ID_MOVIECIRCLE` at
             // `0xff55afbe`, a pale blue over the credits clip. §4.83.
             let c = e.color("tint").map(tint).unwrap_or([1.0, 1.0, 1.0, 1.0]);
-            out.push(Sprite { texture: m.tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [c[0], c[1], c[2], c[3] * talpha], rotation: 0.0, pivot: [0.5, 0.5] });
+            out.push(Sprite { texture: m.tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [c[0], c[1], c[2], c[3] * talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         }
         // `NFS5.MOVIECIRCLE`'s template carries nine `stencilshape` parts out of
         // `movieoval.fsh` — the oval that frames the clip — and only its
@@ -1103,7 +1103,7 @@ impl LayoutScreen {
                 let (pos, size) = self.place(aspect, x + px, y + py, dw, dh);
                 let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
                 let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
-                out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+                out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
             }
         }
     }
@@ -1148,7 +1148,7 @@ impl LayoutScreen {
                 Draw::Flash { frame, cx, cy } => {
                     let Some(&(tex, fw, fh)) = self.shapes.get(&(crate::layout::MOVIE_FLASHES.to_string(), frame)) else { continue };
                     let (pos, size) = self.place(aspect, cx - (fw / 2.0).trunc(), cy - (fh / 2.0).trunc(), fw, fh);
-                    out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: flash_c, rotation: 0.0, pivot: [0.5, 0.5] });
+                    out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: flash_c, rotation: 0.0, pivot: [0.5, 0.5], tri: None });
                 }
                 Draw::Run { font, x, y, alpha, gap, align, vertical } => {
                     let Some(f) = self.fonts.get(crate::layout::RUN_FONTS[font.min(1)]) else { continue };
@@ -1339,7 +1339,7 @@ impl LayoutScreen {
         {
             let (pos, size) = self.place(aspect, x + w - sw - 4.0, y + 2.0, sw, sh);
             let color = [1.0, 1.0, 1.0, talpha * 0xD0 as f32 / 255.0];
-            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5] });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None });
             right -= sw + 4.0;
         }
         let Some(f) = self.fonts.get("univers8b.ffn").or_else(|| self.font_for(e)) else { return };
@@ -1507,7 +1507,7 @@ impl LayoutScreen {
         if let Some(&tex) = self.car_views.get(&i) {
             let design = DESIGN.0 / DESIGN.1;
             let (fw, x0) = if aspect > design { (design / aspect, (1.0 - design / aspect) * 0.5) } else { (1.0, 0.0) };
-            out.push(Sprite { texture: tex, pos: [x0, 0.0], size: [fw * aspect, 1.0], uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5] });
+            out.push(Sprite { texture: tex, pos: [x0, 0.0], size: [fw * aspect, 1.0], uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         }
     }
 
@@ -1808,11 +1808,11 @@ impl LayoutScreen {
             out.push(self.quad(aspect, sx, py, track_w, panel_h, tint([0xff, 0xbb, 0x00, 0xff])));
             if let Some((tex, aw, ah)) = up {
                 let (pos, size) = self.place(aspect, sx, py + 7.0, aw, ah);
-                out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+                out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
             }
             if let Some((tex, aw, ah)) = down {
                 let (pos, size) = self.place(aspect, sx, py + panel_h - ah, aw, ah);
-                out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+                out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
             }
             // the knob's own travel, straight out of `list_scrollbar` so that where
             // it is drawn and where a drag puts it are the same arithmetic
@@ -2010,7 +2010,7 @@ impl LayoutScreen {
             let (pos, size) = self.place(aspect, x + px, y + py, dw, dh);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
-            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
             from_template = true;
         }
         // anything with a picture draws it; anything with a string draws that.
@@ -2032,7 +2032,7 @@ impl LayoutScreen {
             let flip = e.int("flip").unwrap_or(0).max(0);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
-            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5] });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         }
         // `NFS5.PLAYERDRIVERPICTURE`'s draw 0x4CF7C0 ends the way the buttons' do:
         // the bevel 0x521050 over the widget's own box (0x4C8670's corners differenced

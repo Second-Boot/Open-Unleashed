@@ -30,6 +30,13 @@ fn main() {
                 }
             }
         }
+        // the camera's ceiling list 0x473420: bit 15 set and no surface nibble, above the slice
+        let cam_ceiling = t
+            .slices
+            .iter()
+            .filter(|s| grid.patches_where(s.centre, |w| w & 0x8000 != 0 && w & 0xF == 0).any(|(_, h)| h > s.centre.y + 1.0))
+            .count();
+        println!("{name}: {cam_ceiling} slices under a camera ceiling patch (0x473420)");
         let total: usize = runs.iter().map(|(a, b)| b - a + 1).sum();
         println!("{name}: {} slices, {roofed} with anything overhead, {total} in tunnel, runs {:?}", t.slices.len(), runs.iter().take(12).collect::<Vec<_>>());
     }

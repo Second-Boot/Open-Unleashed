@@ -35,8 +35,6 @@ pub enum Action {
     /// Reset the car onto the track (original "reset car" mode 3).
     Reset,
     Horn,
-    /// Cycle the `SPLITTIMES` display (record lap / best lap / last lap).
-    SplitTimes,
 }
 
 const ALL_ACTIONS: [Action; 11] = [
@@ -70,7 +68,6 @@ pub fn default_binding(key: KeyCode) -> Option<Action> {
         KeyCode::KeyR => Action::Reset,
         KeyCode::KeyB => Action::RearView,
         KeyCode::KeyH => Action::Horn,
-        KeyCode::KeyT => Action::SplitTimes,
         KeyCode::KeyP | KeyCode::Escape => Action::Pause,
         KeyCode::KeyW => Action::FreeForward,
         KeyCode::KeyS => Action::FreeBack,

@@ -53,7 +53,61 @@ use winit::window::{Window, WindowId};
 /// dials bottom-right, needle sweep `φ = start + v·deg` calibrated clockwise-from-12 as `φ − 90°`
 /// (Boxster/996 records `−φ − 90°`, HYPOTHESIS on the projection sign), texts in `UniversC12b`.
 /// Not reproduced: translucent trays, slide-in, track map, mirror.
+/// The in-race trays' strings, each fetched from `FEStrings` by the element that draws it.
+struct HudText {
+    /// `HSpeed` 0x42E570: the value and FE 11 "km/h" / FE 20 "mph"
+    speed: String,
+    speed_label: String,
+    /// `HGear` 0x421CB0: FE 18145 "R" / 18146 "N" / "1"…"7", under FE 10 "gear"
+    gear: String,
+    gear_label: String,
+    /// `HTime` 0x4317B0: FE 18 "time"
+    time_label: String,
+    /// `HWrongWay` 0x436FD7: FE 18159 "WRONG WAY"
+    wrong_way: String,
+    /// `SPEEDOMETER` / `HUDTACHOMETER` (0 off, 1 digital, 2 analog) and `GEAR` (0 off, 1 on): the
+    /// analog dials draw only on 2 (0x41E940 / 0x41E960), `HSpeed` only on 1 (0x41E920), `HGear`
+    /// only on 1 (0x41E900); `fe.txt` ships 2, 2, 1. The digital tachometer (`HTachDigital`, 1 —
+    /// 0x41E980) is not ported.
+    speedometer: usize,
+    tachometer: usize,
+    gear_on: bool,
+    /// `HTachDigital` 0x42F740: FE 18144 "rpm"
+    rpm_label: String,
+    /// `HTach`'s needle scale `[+0xA9D0] = (R − 750) / R`, `R = car+0xEE0 = ftol(carSpecs+0x94)` the
+    /// redline (0x406EF0 / 0x42F50F…0x42F52C)
+    tach_scale: f32,
+}
+
 struct Hud {
+    /// `HTray`'s fill: a 1 × 2 texture, black at alpha 63 over black at 255, sampled between the
+    /// texel centres so the quad runs top to bottom from one to the other (see [`Hud::tray`])
+    tray_fill: TextureId,
+    /// `HGraphicDamage`: `car.fsh` entries 0…6 (six body parts and the backdrop) and the two
+    /// gauge gradients (0xB2058228 → 0xB2FFFF00, 0xB2FFFF00 → 0xB2DC1905)
+    damage_parts: [Option<TextureId>; 7],
+    damage_gauge: (TextureId, TextureId),
+    /// `HBillBoard`'s fill (1 × 2: 0xB2FEDD81 over 0x8082A8B0) and its strip shade (2 × 1: black at
+    /// alpha 0x80 beside black at 0xFF), used the same way
+    billboard_fill: TextureId,
+    strip_shade: TextureId,
+    /// `HButtonVisual`'s `+0x103` dressing (0x41B4A4…0x41B50C), as two-texel gradients sampled
+    /// texel centre to texel centre: `[gloss top, gloss bottom, dark ↓, dark →, light ↓, light →]` —
+    /// the gloss of 0x435DA0 (white a → 0 over the top half, black 0 → a over the bottom, `a = 127`
+    /// for its 100 %), and the 0xCC / 0x19 ramps of the bevel 0x436130 and the shadow 0x435F80.
+    button_ramps: [TextureId; 6],
+    /// `HBillBoard`'s raised border 0x435A20(…, style 1, width `[0x5CC8E8]` = 4): `[white ↓, white →,
+    /// black ↑, black ←]`, each 0x05 at the outer edge to 0x4C against the box (tables 0x5B3398…0x5B33C8).
+    frame_ramps: [TextureId; 4],
+    /// The height the billboard currently has while it opens (`HBillBoard +0xE8`, see
+    /// [`Hud::billboard`]); set by the caller before a post-race page is drawn
+    billboard_h: std::cell::Cell<f32>,
+    /// `[0x606AC8]` now and at the billboard's creation, for its strips' moving split
+    billboard_clock: std::cell::Cell<(u64, u64)>,
+    /// `DISPLAYCOLORS` (0x4204F0, `Display.DispCols`): 0xCCFAB400 orange, 0xCCFF0606 red, 0xCC1EE605
+    /// green — every value text's colour (the 32 callers pass it to `HTextVisual`'s constructor or
+    /// its `+0x24`) and, as RGB at alpha 0x3F, the trays' outline and rule (0x4345F0). Set each frame.
+    display: std::cell::Cell<[f32; 4]>,
     dial: TextureId,
     /// speedometer needle: texture, (width, height) px, pivot px above the bottom
     needle: (TextureId, f32, f32, f32),
@@ -63,17 +117,83 @@ struct Hud {
     /// countdown digits 3, 2, 1 (solid) from `321go.fsh` / `321go2.fsh`
     digits: [Option<TextureId>; 3],
     rings: Option<(TextureId, TextureId)>,
+    /// `HDial`'s ring `+0xC8` (0x42131C…0x42135D): `circletach.fsh` entry 0 over the dial's 128 × 128,
+    /// all four corners 0x80000000 — a half-black disc under the face, drawn while 0x41E5C0 is
+    /// false (0x42166A), i.e. while `TRANSLUCENCY` is 0 (see [`Hud::boxes`]). Both dials pass it.
+    dial_ring: Option<TextureId>,
+    /// `HTrackMap`'s blip `+0xE4` (0x432122…0x432143): `radar.fsh` entry 0, "Car" (26 × 63), a white
+    /// top-down car the blip loop tints with each car's paint.
+    radar_car: Option<TextureId>,
+    /// `TRANSLUCENCY == 0` — the shipped default, which the options screen labels "on" (the accessor
+    /// lists 1501, 1500). 0x425298 / 0x4267A0 call 0x41E540 for 0, which puts `[0x5CCB34]` = 0x80 into
+    /// the top byte of the layout record's flags `cfg1+0x14`, and 0x41E590 otherwise, which clears it;
+    /// 0x41E5C0 tests that byte. With it clear no tray draws its fill, rule or frame (0x4341B6 →
+    /// 0x4342CF) and the dials lose their ring. Set each frame.
+    boxes: std::cell::Cell<bool>,
     font: Option<BitmapFont>,
+    /// `unviers9b.ffn` (0x420600) and `unviers9bi.ffn` (0x420620), drawn at their own size when a
+    /// text asks for `FONT_SMALL` / `FONT_ITALIC` (see [`Hud::font_for`])
+    font_small: Option<BitmapFont>,
+    font_italic: Option<BitmapFont>,
     tach: Option<(TextureId, (TextureId, f32, f32, f32))>,
     /// 1×1 white texture for the translucent trays (HTray: dark box + orange outline)
     white: TextureId,
     /// track map (120×120 @ (0,358) in the original, an HRenderVisual top-down render; here the
     /// lap route rasterised once — MEDIUM) and its world→map projection (x0, z0, scale)
+    /// the map texture and `[centre x, centre z, half width]` of `HTrackMap`'s whole-track view
     map: Option<(TextureId, [f32; 3])>,
+    /// the route the map draws, and the transform of the last frame (`[cx, cz, scale, fx, fz]`)
+    map_route: Vec<(f32, f32)>,
+    map_frame: std::cell::Cell<[f32; 5]>,
     /// `HReplay`'s twelve glyphs from `DashHud/replay.fsh`, by the file's own index
     /// (`RE/notes/hud.md` §5.2): 0 cam, 1 paus, 2 quit, 3 rest, 4 Irac, 5…8 the speed steps,
     /// 9 save, 10 next, 11 play.
     replay_glyphs: [Option<(TextureId, f32, f32)>; 12],
+    /// `HCongrats` 0x41CAF0's pictures: the solid place digits `1.tg`/`2.tg`/`3.tg`, the outline
+    /// digits `1OL`…`8OL`, and `circlefull` / `congrats1` / `circleoutline`
+    congrats: CongratsTex,
+    /// `HMissionSummary`'s portraits: `factorypeople.fsh`, 54×64, one per narrator (0x428A19)
+    portraits: [Option<TextureId>; 6],
+}
+
+/// The textures `HCongrats`' constructor loads (0x41CB84…0x41CED8), in its own field order.
+struct CongratsTex {
+    /// `+0x1C…+0x24`: `congrats3`/`1.tg`, `congrats4`/`2.tg`, `congrats4`/`3.tg`
+    solid: [Option<TextureId>; 3],
+    /// `+0x28…+0x44`: `321go2`/`1OL`, `321go`/`2OL`, `321go`/`3OL`, `congrats2`/`4OL`…`7OL`,
+    /// `congrats3`/`8OL`
+    outline: [Option<TextureId>; 8],
+    /// `+0x10` `circlefull`, `+0x14` `congrats1` (the broken ring), `+0x18` `circleoutline`
+    full: Option<TextureId>,
+    cut: Option<TextureId>,
+    ring: Option<TextureId>,
+}
+
+/// `[0x5B29B8…]`: the solid digits' width × height, and `[0x5B29D0…]` the outline digits'.
+const CONGRATS_SOLID: [(f32, f32); 3] = [(42.0, 55.0), (44.0, 57.0), (45.0, 59.0)];
+const CONGRATS_OUTLINE: [(f32, f32); 8] =
+    [(44.0, 57.0), (46.0, 59.0), (47.0, 60.0), (48.0, 57.0), (43.0, 58.0), (44.0, 59.0), (41.0, 57.0), (45.0, 59.0)];
+/// `[0x5B2A10…]` (read as `[0x5B2A0C + place·4]`): gold, silver, bronze for places 1–3.
+const CONGRATS_RGB: [u32; 3] = [0xFFBE02, 0xB4B4B4, 0xC36405];
+
+/// Where the `HCongrats` picture sits and how big it is, `t` ticks after it opened — in the HUD's
+/// 640×480 space. It starts at the screen centre (0x41DE29, `+0x54/+0x58`). The **tournament**
+/// instance, past 0xC0 ticks, slides for 32 ticks (`_ftol(0.5 · 64)`, 0x41DE71) towards
+/// `(_ftol(W·0.2 − 128·0.5·0.5), _ftol(H·0.2))` (0x41DE2F…0x41DE6B), each axis clamped at its target,
+/// and shrinks as it goes: `scale = 1 − 0.5 · moved_x / total_x` (0x41D2CD…0x41D357). CONFIRMED.
+fn congrats_layout(t: u64, tournament: bool) -> (f32, f32, f32) {
+    let (cx, cy) = (320.0f32, 240.0f32);
+    if !tournament || t < 0xC0 {
+        return (cx, cy, 1.0);
+    }
+    let (tx, ty) = ((640.0f64 * 0.2f32 as f64 - 128.0 * 0.5 * 0.5) as i64, (480.0f64 * 0.2f32 as f64) as i64);
+    let steps = (0.5f64 * 64.0) as f64;
+    let (rx, ry) = ((cx as i64 - tx) as f64 / steps, (cy as i64 - ty) as f64 / steps);
+    let d = (t - 0xC0) as f64;
+    let x = ((cx as f64 - d * rx) as i64).max(tx);
+    let y = ((cy as f64 - d * ry) as i64).max(ty);
+    let scale = 1.0 - (cx as i64 - x) as f64 * 0.5 / (cx as i64 - tx) as f64;
+    (x as f32, y as f32, scale as f32)
 }
 
 const MAP_PX: u32 = 120;
@@ -95,7 +215,48 @@ const HUD_ORANGE: [f32; 4] = [0.98, 0.706, 0.0, 1.0];
 /// This port has no in-race pointer, so only the idle pair is reachable.
 const HBUTTON_IDLE: [f32; 4] = [0.737, 0.0, 0.0, 1.0];
 const HBUTTON_IDLE_GLYPH: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+/// Every `HBillBoard` dialog — race summary, standings, records, `HInfo`, mission summary, pause
+/// menu, yes/no — is constructed **500 × 325** (`[0x5B2C70]`/`[0x5B2C74]` and the nine other
+/// pairs passed to 0x41A510, all equal) and centred by 0x41B100: `((W − w)/2, (H − h)/2)`, i.e.
+/// (70, 77) on the 640 × 480 layout. This port's pages each had a box of their own size.
+const BILLBOARD: (f32, f32, f32, f32) = (70.0, 77.0, 500.0, 325.0);
+
+/// One row of `HRaceSummary`'s table.
+pub struct SummaryRow {
+    pub name: String,
+    pub car: String,
+    pub colour: [f32; 4],
+    pub best: Option<u64>,
+    pub total: Option<u64>,
+}
+
+/// What an `HBillBoard` frame carries (constructor 0x41A510's third to sixth arguments): the
+/// text drawn left in the top strip, the one drawn right, and whether the bottom strip shows FE
+/// 18100 "Esc to exit" (`+0x108`) and, with it, 18101 "Spacebar to proceed" (the enable byte
+/// `+8`, 0x41AC56…0x41ACBC). Most dialogs pass the empty string `0x5E8E50` on the left.
+pub struct Billboard<'a> {
+    pub left: &'a str,
+    pub right: &'a str,
+    /// `(esc text, Some(space text))` when the bottom strip is shown
+    pub hints: Option<(&'a str, Option<&'a str>)>,
+}
+
+/// `HButtonVisual` (0x41B140) size on the dialogs: 142 × 19 (`[0x5B2C78]`/`[0x5B2D48]`).
+const HUD_BUTTON: (f32, f32) = (142.0, 19.0);
+
 const HUD_GREY: [f32; 4] = [0.706, 0.706, 0.706, 1.0];
+/// The HUD's fonts at their own size — the original draws them in native pixels on the 640 × 480 layout.
+/// The port draws every text with `UniversC12b`'s atlas, so a size here is a **line height**:
+/// `UniversC12b.ffn` has line 18 (`FONT_MAIN`); `unviers9b` has line 14 and capitals 10 px against
+/// C12b's 13, which the C12b atlas meets at 18·10/13 ≈ 14 (`FONT_SMALL`, also taken for the digits-only
+/// `unviers9bi` — APPROXIMATION). The text measure 0x431400 reports as a text's height the extent of
+/// "abcdefghijkl…" (0x5CD0D4): 16 in C12b (`EXT_MAIN`), 13 in 9b (`EXT_SMALL`) — `fntextent` example.
+/// This port had drawn the texts at 10–12 (and 16 for a few values), about two thirds of their size.
+const FONT_MAIN: f32 = 18.0;
+const FONT_SMALL: f32 = 14.0;
+const FONT_ITALIC: f32 = 11.0;
+const EXT_MAIN: f32 = 16.0;
+const EXT_SMALL: f32 = 13.0;
 
 impl Hud {
     /// `night` picks the `*N.fsh` faces and needles the original switches to when the night flag
@@ -103,8 +264,11 @@ impl Hud {
     fn load(
         r: &mut Renderer,
         paths: &GamePaths,
-        dials: Option<(nfs_formats::fedata::DialSpec, nfs_formats::fedata::DialSpec)>,
+        dials: Option<(nfs_formats::fedata::DialSpec, nfs_formats::fedata::DialSpec, nfs_formats::fedata::DialSpec)>,
         night: bool,
+        // `Display.SpeedUnits` → `SPEEDUNITS`: the FE copies the car's km/h or mph dial group into
+        // the options (0x4EBA8E…, `hud.md` §3.1) and the face comes from `speedK` or `speedM` (§3.2)
+        mph: bool,
     ) -> Option<Self> {
         let dir = paths.game_data().join("DashHud");
         let load_idx = |r: &mut Renderer,
@@ -128,7 +292,9 @@ impl Hud {
             ))
         };
         // defaults = '94 993 (style 4 / tach 6 / needle 2, pivot 18) when the car record is unknown
-        let (kmh, tach_spec) = dials.unwrap_or((
+        // (with no car record the mph group is not known either: the km/h default stands in —
+        // APPROXIMATION, as the default itself is)
+        let (kmh, tach_spec) = dials.map(|(k, m, t)| (if mph { m } else { k }, t)).unwrap_or((
             nfs_formats::fedata::DialSpec {
                 style: 4,
                 total_units: 300,
@@ -148,12 +314,15 @@ impl Hud {
         ));
         let needle_style = tach_spec.needle_style.max(0) as usize;
         let pivot = tach_spec.needle_pivot.max(0) as f32;
-        let (speed_f, tach_f, n2_f, n_f) = if night {
-            ("speedKN.fsh", "tachN.fsh", "needle2N.fsh", "needleN.fsh")
-        } else {
-            ("speedK.fsh", "tach.fsh", "needle2.fsh", "needle.fsh")
+        let mph = mph && dials.is_some();
+        let (speed_f, tach_f, n2_f, n_f) = match (night, mph) {
+            (true, false) => ("speedKN.fsh", "tachN.fsh", "needle2N.fsh", "needleN.fsh"),
+            (true, true) => ("speedMN.fsh", "tachN.fsh", "needle2N.fsh", "needleN.fsh"),
+            (false, false) => ("speedK.fsh", "tach.fsh", "needle2.fsh", "needle.fsh"),
+            (false, true) => ("speedM.fsh", "tach.fsh", "needle2.fsh", "needle.fsh"),
         };
-        let dial = load_idx(r, speed_f, Some(kmh.style.max(0) as usize), Some("300k"))?.0;
+        let fallback = if mph { "200m" } else { "300k" };
+        let dial = load_idx(r, speed_f, Some(kmh.style.max(0) as usize), Some(fallback))?.0;
         let n = load_idx(r, n2_f, Some(needle_style), Some("need"))?;
         let hub = (needle_style == 0)
             .then(|| load_idx(r, n2_f, None, Some("cent")).map(|h| h.0))
@@ -175,14 +344,43 @@ impl Hud {
         // **their own files** (`circlefull.fsh` holds one entry `circ`, `circleoutline.fsh` one
         // called `full`), not entries of `321go.fsh`. This port asked `321go.fsh` for them, got
         // nothing, and drew no rings at all until 2026-09-23.
+        let dial_ring = load_idx(r, "circletach.fsh", Some(0), None).map(|t| t.0);
+        let radar_car = load_idx(r, "radar.fsh", Some(0), None).map(|t| t.0);
         let rings = load_idx(r, "circlefull.fsh", Some(0), None)
             .zip(load_idx(r, "circleoutline.fsh", Some(0), None))
             .map(|(a, b)| (a.0, b.0));
-        let font = GamePaths::find_file(&dir, "UniversC12b.ffn")
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|d| nfs_formats::fnt::Font::parse(&d).ok())
-            .map(|f| BitmapFont::upload(r, f));
+        let mut load_font = |name: &str| {
+            GamePaths::find_file(&dir, name)
+                .and_then(|p| std::fs::read(p).ok())
+                .and_then(|d| nfs_formats::fnt::Font::parse(&d).ok())
+                .map(|f| BitmapFont::upload(r, f))
+        };
+        let font = load_font("UniversC12b.ffn");
+        let font_small = load_font("unviers9b.ffn");
+        let font_italic = load_font("unviers9bi.ffn");
         let white = r.upload_texture(&TextureData::single(1, 1, vec![255, 255, 255, 255]));
+        let damage_parts: [Option<TextureId>; 7] = std::array::from_fn(|i| load_idx(r, "car.fsh", Some(i), None).map(|t| t.0));
+        let damage_gauge = (
+            r.upload_texture(&TextureData::single(2, 1, vec![0x05, 0x82, 0x28, 0xB2, 0xFF, 0xFF, 0x00, 0xB2])),
+            r.upload_texture(&TextureData::single(2, 1, vec![0xFF, 0xFF, 0x00, 0xB2, 0xDC, 0x19, 0x05, 0xB2])),
+        );
+        let tray_fill = r.upload_texture(&TextureData::single(1, 2, vec![0, 0, 0, 63, 0, 0, 0, 255]));
+        let billboard_fill = r.upload_texture(&TextureData::single(1, 2, vec![0xFE, 0xDD, 0x81, 0xB2, 0x82, 0xA8, 0xB0, 0x80]));
+        let strip_shade = r.upload_texture(&TextureData::single(2, 1, vec![0, 0, 0, 0x80, 0, 0, 0, 0xFF]));
+        let frame_ramps = [
+            r.upload_texture(&TextureData::single(1, 2, vec![255, 255, 255, 0x05, 255, 255, 255, 0x4C])),
+            r.upload_texture(&TextureData::single(2, 1, vec![255, 255, 255, 0x05, 255, 255, 255, 0x4C])),
+            r.upload_texture(&TextureData::single(1, 2, vec![0, 0, 0, 0x4C, 0, 0, 0, 0x05])),
+            r.upload_texture(&TextureData::single(2, 1, vec![0, 0, 0, 0x4C, 0, 0, 0, 0x05])),
+        ];
+        let button_ramps = [
+            r.upload_texture(&TextureData::single(1, 2, vec![255, 255, 255, 127, 255, 255, 255, 0])),
+            r.upload_texture(&TextureData::single(1, 2, vec![0, 0, 0, 0, 0, 0, 0, 127])),
+            r.upload_texture(&TextureData::single(1, 2, vec![0, 0, 0, 0xCC, 0, 0, 0, 0x19])),
+            r.upload_texture(&TextureData::single(2, 1, vec![0, 0, 0, 0xCC, 0, 0, 0, 0x19])),
+            r.upload_texture(&TextureData::single(1, 2, vec![255, 255, 255, 0x19, 255, 255, 255, 0xCC])),
+            r.upload_texture(&TextureData::single(2, 1, vec![255, 255, 255, 0x19, 255, 255, 255, 0xCC])),
+        ];
         Some(Self {
             dial,
             needle: (n.0, n.1, n.2, pivot),
@@ -192,14 +390,58 @@ impl Hud {
             digits,
             rings,
             font,
+            font_small,
+            font_italic,
             tach,
             white,
+            tray_fill,
+            damage_parts,
+            damage_gauge,
+            billboard_fill,
+            strip_shade,
+            button_ramps,
+            frame_ramps,
+            billboard_h: std::cell::Cell::new(BILLBOARD.3),
+            billboard_clock: std::cell::Cell::new((0, 0)),
+            display: std::cell::Cell::new(Hud::display_colour(0)),
+            dial_ring,
+            radar_car,
+            boxes: std::cell::Cell::new(true),
             map: None,
+            map_route: Vec::new(),
+            map_frame: std::cell::Cell::new([0.0, 0.0, 1.0, 0.0, -1.0]),
             replay_glyphs: std::array::from_fn(|i| load_idx(r, "replay.fsh", Some(i), None)),
+            congrats: CongratsTex {
+                solid: [
+                    load_idx(r, "congrats3.fsh", None, Some("1.tg")).map(|x| x.0),
+                    load_idx(r, "congrats4.fsh", None, Some("2.tg")).map(|x| x.0),
+                    load_idx(r, "congrats4.fsh", None, Some("3.tg")).map(|x| x.0),
+                ],
+                outline: [
+                    ("321go2.fsh", "1OL"),
+                    ("321go.fsh", "2OL"),
+                    ("321go.fsh", "3OL"),
+                    ("congrats2.fsh", "4OL"),
+                    ("congrats2.fsh", "5OL"),
+                    ("congrats2.fsh", "6OL"),
+                    ("congrats2.fsh", "7OL"),
+                    ("congrats3.fsh", "8OL"),
+                ]
+                .map(|(f, e)| load_idx(r, f, None, Some(e)).map(|x| x.0)),
+                full: load_idx(r, "circlefull.fsh", Some(0), None).map(|x| x.0),
+                cut: load_idx(r, "congrats1.fsh", Some(0), None).map(|x| x.0),
+                ring: load_idx(r, "circleoutline.fsh", Some(0), None).map(|x| x.0),
+            },
+            portraits: std::array::from_fn(|i| load_idx(r, "factorypeople.fsh", Some(i), None).map(|x| x.0)),
         })
     }
 
-    /// Rasterise the lap route into the map texture (north up, fitted with a 6 px margin).
+    /// `HTrackMap`'s whole-track view (0x43277E…0x432849, 0x433440): the route's extent is
+    /// `max(ftol x-span, ftol z-span)` with the min / max **starting at 0** (so the world origin is
+    /// always inside), the centre `ftol(min + span/2)` per axis, and the view reaches `extent/2 +
+    /// 200` (`[0x5B2484]`) either side of it — that is what `mapscale=4` (zoom 4.15·100 + 185 =
+    /// 600 = 0x41EA40's value) selects, and the shipped default. The map itself is drawn every frame
+    /// by [`Hud::map_update`].
     fn set_map(&mut self, r: &mut Renderer, table: &SliceTable) {
         let pts: Vec<(f32, f32)> = table
             .route
@@ -209,19 +451,44 @@ impl Hud {
         if pts.len() < 2 {
             return;
         }
-        let (mut x0, mut x1, mut z0, mut z1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        let (mut x0, mut x1, mut z0, mut z1) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
         for &(x, z) in &pts {
             x0 = x0.min(x);
             x1 = x1.max(x);
             z0 = z0.min(z);
             z1 = z1.max(z);
         }
-        let span = (x1 - x0).max(z1 - z0).max(1.0);
-        let scale = (MAP_PX as f32 - 12.0) / span;
-        let cx = (x0 + x1) * 0.5;
-        let cz = (z0 + z1) * 0.5;
-        let origin_x = cx - (MAP_PX as f32 * 0.5) / scale;
-        let origin_z = cz - (MAP_PX as f32 * 0.5) / scale;
+        let (sx, sz) = ((x1 - x0).trunc(), (z1 - z0).trunc());
+        let extent = sx.max(sz);
+        let (cx, cz) = ((x0 + sx * 0.5).trunc(), (z0 + sz * 0.5).trunc());
+        let half = extent * 0.5 + 200.0;
+        let tex = r.upload_texture(&TextureData::single(MAP_PX, MAP_PX, vec![0u8; (MAP_PX * MAP_PX * 4) as usize]));
+        self.map = Some((tex, [cx, cz, half]));
+        self.map_route = pts;
+    }
+
+    /// Redraw the map for this frame. `heading` is the player car's forward `(x, z)` when the map
+    /// rotates (`MAP` 1 or 3, 0x41E770): 0x433440 turns the top-down view by `atan2(x, z)·360/2π −
+    /// 90` degrees (0x5335A6…0x4335B4) about the view's centre — here the car's heading is put
+    /// straight up (the on-screen orientation of that turn is this port's reading, APPROXIMATION).
+    /// `None` is the static, north-up view.
+    fn map_update(&self, r: &mut Renderer, heading: Option<(f32, f32)>, route: bool, follow: Option<(f32, f32, f32)>) {
+        let Some((tex, [mut cx, mut cz, mut half])) = self.map else { return };
+        // a zoom other than the whole-track 600 puts the camera over the player car
+        // (`car+0x330`) with that zoom as its reach (0x4334BF…0x4334F2, 0x433613)
+        if let Some((x, z, reach)) = follow {
+            (cx, cz, half) = (x, z, reach);
+        }
+        let scale = (MAP_PX as f32 * 0.5) / half;
+        let (fx, fz) = match heading {
+            Some((x, z)) if x.hypot(z) > 1e-4 => {
+                let l = x.hypot(z);
+                (x / l, z / l)
+            }
+            _ => (0.0, -1.0),
+        };
+        self.map_frame.set([cx, cz, scale, fx, fz]);
+        let to_px = |(x, z): (f32, f32)| Self::map_px([cx, cz, scale, fx, fz], x, z);
         let mut img = vec![0u8; (MAP_PX * MAP_PX * 4) as usize];
         let mut plot = |x: i32, y: i32| {
             if x >= 0 && y >= 0 && (x as u32) < MAP_PX && (y as u32) < MAP_PX {
@@ -229,17 +496,15 @@ impl Hud {
                 img[o..o + 4].copy_from_slice(&[255, 255, 255, 220]);
             }
         };
-        let to_px = |(x, z): (f32, f32)| {
-            (
-                ((x - origin_x) * scale) as i32,
-                ((z - origin_z) * scale) as i32,
-            )
-        };
-        for w in pts
-            .windows(2)
-            .chain(std::iter::once(&[pts[pts.len() - 1], pts[0]][..]))
-        {
-            let ((ax, ay), (bx, by)) = (to_px(w[0]), to_px(w[1]));
+        // radar mode draws no route line (0x4336CC skips it)
+        let pts: &[(f32, f32)] = if route { &self.map_route } else { &[] };
+        if pts.len() < 2 {
+            r.update_texture(tex, &TextureData::single(MAP_PX, MAP_PX, img));
+            return;
+        }
+        for w in pts.windows(2).chain(std::iter::once(&[pts[pts.len() - 1], pts[0]][..])) {
+            let (a, b) = (to_px(w[0]), to_px(w[1]));
+            let (ax, ay, bx, by) = (a.0 as i32, a.1 as i32, b.0 as i32, b.1 as i32);
             if (ax - bx).abs() > MAP_PX as i32 / 2 || (ay - by).abs() > MAP_PX as i32 / 2 {
                 continue; // point-to-point tracks: no closing line
             }
@@ -248,8 +513,99 @@ impl Hud {
                 plot(ax + (bx - ax) * t / steps, ay + (by - ay) * t / steps);
             }
         }
-        let tex = r.upload_texture(&TextureData::single(MAP_PX, MAP_PX, img));
-        self.map = Some((tex, [origin_x, origin_z, scale]));
+        r.update_texture(tex, &TextureData::single(MAP_PX, MAP_PX, img));
+    }
+
+    /// World `(x, z)` → map pixels for the frame transform `[cx, cz, scale, fx, fz]`: the heading
+    /// `(fx, fz)` points up, its right-hand side right (for the static `(0, −1)` this is the plain
+    /// `x` right, `z` down of the north-up picture).
+    fn map_px(f: [f32; 5], x: f32, z: f32) -> (f32, f32) {
+        let [cx, cz, scale, fx, fz] = f;
+        let (dx, dz) = (x - cx, z - cz);
+        let u = dx * -fz + dz * fx;
+        let v = -(dx * fx + dz * fz);
+        let m = MAP_PX as f32 * 0.5;
+        (m + u * scale, m + v * scale)
+    }
+
+    /// `HTable` (ctor 0x42E8B0, draw 0x42EA50) inside the billboard box: the column widths it is
+    /// given, centred — `left = x0 + (w − Σwidths)/2`, `top = y0 + (h − (rows + 1)·20)/2` — with a
+    /// 20-px header row filled 0xFFFAB400, the body filled 0x40FFFFFF, the selected row 0x80FAB400,
+    /// black grid lines (`[0x5B3064]`), and every cell's text black (`unviers9b`, 0xFF000000) at
+    /// `cell left + 4`, centred vertically in its row. A cell with a colour draws an 18 × 6 swatch
+    /// at `(x, row top + 7)` and its text 22 px further right (0x42F0D0; black when the colour has no
+    /// alpha byte). The first header is the empty string at `0x5B2E08`. This port uses its one HUD
+    /// font for `unviers9b` (APPROXIMATION).
+    fn table(&self, out: &mut Vec<Sprite>, aspect: f32, widths: &[f32], head: &[String], rows: &[Vec<(String, Option<[f32; 4]>)>], selected: Option<usize>) {
+        let (bx, by, bw, bh) = BILLBOARD;
+        let n = 8.0;
+        let total: f32 = widths.iter().sum();
+        let left = (bx + ((bw - total) / 2.0).trunc()).trunc();
+        let top = by + ((bh - (n + 1.0) * 20.0) / 2.0).trunc();
+        let argb = |c: u32| [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0, (c >> 24) as f32 / 255.0];
+        out.push(self.quad(aspect, left, top, total, 20.0, argb(0xFFFA_B400)));
+        out.push(self.quad(aspect, left, top + 20.0, total, n * 20.0, argb(0x40FF_FFFF)));
+        if let Some(k) = selected {
+            out.push(self.quad(aspect, left, top + 20.0 * (k as f32 + 1.0), total, 20.0, argb(0x80FA_B400)));
+        }
+        let black = argb(0xFF00_0000);
+        let full = (n + 1.0) * 20.0;
+        // the header's raised 4-px bevel 0x436420(left, top, total, 20, 4): white 0xCC → 0x19 inward
+        // along the top and left (0x5B3478, 0x5B34A8), black 0x19 → 0xCC outward along the right and
+        // bottom (0x5B3488, 0x5B3498) — sides by the 0x436130 order (APPROXIMATION)
+        let [_, _, dark_v, dark_h, light_v, light_h] = self.button_ramps;
+        let rev = |mut sp: Sprite| {
+            std::mem::swap(&mut sp.uv_min, &mut sp.uv_max);
+            sp
+        };
+        let b = 4.0;
+        out.push(rev(Self::ramp(aspect, light_v, left, top, total, b, true)));
+        out.push(rev(Self::ramp(aspect, light_h, left, top, b, 20.0, false)));
+        out.push(rev(Self::ramp(aspect, dark_v, left, top + 20.0 - b, total, b, true)));
+        out.push(rev(Self::ramp(aspect, dark_h, left + total - b, top, b, 20.0, false)));
+        // the grid (0x42EB3E…0x42ED15, 0x42ED1D…0x42EE03): five strokes in `[0x5B3064]` black — taken
+        // as the frame and the header's underline (MEDIUM on which five) — and `columns − 1` column
+        // separators that start **below the header** (0x4359E0 moves the top end down 0x14) and run to
+        // the bottom. There is no line per row: the only loop over rows draws text. This port drew a
+        // line under every row and ran the separators through the header.
+        for yy in [top, top + 20.0, top + full] {
+            out.push(self.quad(aspect, left, yy, total, 1.0, black));
+        }
+        out.push(self.quad(aspect, left, top, 1.0, full, black));
+        out.push(self.quad(aspect, left + total, top, 1.0, full, black));
+        let mut cx = left;
+        for w in widths.iter().take(widths.len().saturating_sub(1)) {
+            cx += w;
+            out.push(self.quad(aspect, cx, top + 20.0, 1.0, full - 20.0, black));
+        }
+        let th = FONT_SMALL;
+        let row_text = |y: f32| y + ((20.0 - EXT_SMALL) / 2.0).trunc();
+        let mut cx = left;
+        for (i, h) in head.iter().enumerate() {
+            self.text(out, aspect, h, cx + 4.0, row_text(top), th, black);
+            cx += widths.get(i).copied().unwrap_or(0.0);
+        }
+        for (k, row) in rows.iter().take(n as usize).enumerate() {
+            let ry = top + 20.0 * (k as f32 + 1.0);
+            let mut cx = left;
+            for (i, (t, colour)) in row.iter().enumerate() {
+                let mut tx = cx + 4.0;
+                if let Some(c) = colour {
+                    // 0x42F0D0: the fill is the colour, or opaque black when it has no alpha byte
+                    // (0x42F0F2…0x42F0FE), then its four edges stroked in `[0x5B306C]` = 0xFF000000
+                    let fill = if c[3] > 0.0 { *c } else { black };
+                    let (sx, sy) = (tx, ry + 7.0);
+                    out.push(self.quad(aspect, sx, sy, 18.0, 6.0, fill));
+                    out.push(self.quad(aspect, sx, sy, 18.0, 1.0, black));
+                    out.push(self.quad(aspect, sx, sy + 5.0, 18.0, 1.0, black));
+                    out.push(self.quad(aspect, sx, sy, 1.0, 6.0, black));
+                    out.push(self.quad(aspect, sx + 17.0, sy, 1.0, 6.0, black));
+                    tx += 22.0;
+                }
+                self.text(out, aspect, t, tx, row_text(ry), th, black);
+                cx += widths.get(i).copied().unwrap_or(0.0);
+            }
+        }
     }
 
     /// Results table (HBillBoard, hud.md §5/§9): rank, NAME, CAR, BEST LAP, TIME; dashes for no time.
@@ -260,62 +616,465 @@ impl Hud {
     /// `"--------------"` rather than a dash. `title` is the billboard's, by game type: 18130
     /// `Race Summary`, 18129 `Single Race`, 18169 `Knockout`, 18175 `Quick Knockout`
     /// (`RE/notes/hud.md` §5). The box's own geometry is still this port's — see the same section.
+    #[allow(clippy::too_many_arguments)]
     pub fn results_sprites(
         &self,
         out: &mut Vec<Sprite>,
         aspect: f32,
-        rows: &[(String, String, Option<u64>, Option<u64>)],
+        rows: &[SummaryRow],
         player: usize,
-        title: &str,
-        head: &[String; 4],
+        bb: &Billboard,
+        head: &[String],
+        widths: &[f32],
+        best_lap: bool,
+        points: bool,
         ord: &[String],
     ) {
         if self.font.is_none() {
             return;
         }
-        let n = rows.len().max(1) as f32;
-        let (x, y, w, h) = (60.0, 120.0, 520.0, 26.0 + 20.0 * n + 24.0);
-        self.tray(out, aspect, x, y, w, h);
-        let cols = [x + 8.0, x + 46.0, x + 190.0, x + 380.0, x + 450.0];
-        self.text(out, aspect, title, x + 8.0, y - 16.0, 13.0, HUD_ORANGE);
-        for (i, t) in head.iter().enumerate() {
-            self.text(out, aspect, t, cols[i + 1], y + 6.0, 11.0, HUD_GREY);
+        if !self.billboard(out, aspect, bb) {
+            return;
         }
-        for (k, (name, car, best, total)) in rows.iter().enumerate() {
-            let yy = y + 26.0 + 20.0 * k as f32;
-            let color = if k == player {
-                HUD_ORANGE
-            } else {
-                [1.0, 1.0, 1.0, 0.95]
-            };
-            let none = || "--------------".to_string();
-            let cells = [
-                ord.get(k).cloned().unwrap_or_default(),
-                name.chars().take(18).collect::<String>(),
-                car.chars().take(24).collect::<String>(),
-                best.map(format_ticks).unwrap_or_else(none),
-                total.map(format_ticks).unwrap_or_else(none),
-            ];
-            for (i, t) in cells.iter().enumerate() {
-                self.text(out, aspect, t, cols[i], yy, 12.0, color);
-            }
-        }
-        self.text(
-            out,
-            aspect,
-            "ENTER  CONTINUE",
-            x + 8.0,
-            y + h - 18.0,
-            10.0,
-            HUD_GREY,
-        );
+        // 0x42C1D9…0x42C1F4: the summary selects the player's row — `HTable` slot 2 (0x42F290,
+        // `+0x7AC`) is given `car+0xCD4`, the 1-based final place, i.e. the row under the header
+        let none = || "--------------".to_string();
+        let rows: Vec<Vec<(String, Option<[f32; 4]>)>> = rows
+            .iter()
+            .enumerate()
+            .map(|(k, r)| {
+                // the name is cut to 31 characters (`strncpy …, 0x1F`), the car's short name to 15
+                // and marked with its paint swatch (`HTable` slot 5 at 0x42C3DD)
+                let mut cells = vec![
+                    (ord.get(k).cloned().unwrap_or_default(), None),
+                    (r.name.chars().take(31).collect::<String>(), None),
+                    (r.car.chars().take(15).collect::<String>(), Some(r.colour)),
+                ];
+                if best_lap {
+                    cells.push((r.best.map(format_ticks).unwrap_or_else(none), None));
+                }
+                cells.push((r.total.map(format_ticks).unwrap_or_else(none), None));
+                // POINTS: `TOURNAMENTRACEPOINTS[row]` (0x42C4AE), which 0x4EC689 sets to 8, 7, … 1
+                if points {
+                    cells.push(((8 - k.min(7)).to_string(), None));
+                }
+                cells
+            })
+            .collect();
+        let mut header = vec![String::new()];
+        header.extend(head.iter().cloned());
+        self.table(out, aspect, widths, &header, &rows, Some(player));
     }
 
-    /// Map tray with the route and car dots (player orange, others grey).
+    /// `HCongrats` 0x41D050, `t` ticks after it opened, for `place` 1–3. Per frame: the frame lines
+    /// 0x41D3B0, the three circles 0x41D8B0, then the digit.
+    /// * Lines: a horizontal and a vertical line through the centre across the whole screen, colour
+    ///   0x66FFFFFF (0x41D3B9…0x41D48A); then, in the place colour, two of the four outer arms (screen
+    ///   edge to circle) and two of the four radii (centre to circle, `r = _ftol(128·scale·0.5)`),
+    ///   picked per ring step by the tables at `[esp+0x28]` / `+0x3C` / `+0x4C` / `+0x38`
+    ///   (0x41D63B, 0x41D694, 0x41D815, 0x41D89A — each read after its own stack shift).
+    /// * Circles: `circlefull`, `circleoutline`, `congrats1`, each 128 × `scale`, centred and
+    ///   untinted — opaque white, `HGraphicVisual`'s default vertex colour (0x422E70…0x422E83).
+    ///   `congrats1` is mirrored per ring step: 0x423C70 sets `+0xEC` and 0x423D60 `+0xED` from the
+    ///   byte tables at 0x41D976, the draw 0x423A10 picks UV set `(+0xED≠0) + 2·(+0xEC≠0)`, and
+    ///   0x4238F0 builds the sets normal / mirrored in x / mirrored in y / both — so the steps show
+    ///   y, both, normal, y, x.
+    /// * The ring counter `+0x70` steps every nine ticks through five states (period 8 with a strict
+    ///   `>`, count 5, 0x41DDE6), starting one step in because its stamp starts at 0.
+    /// * Race place (`tournament == false`): the solid digit in the place colour, alpha
+    ///   `min(t·255/128, 255)` (0x41D282…0x41D29D → 0x41DBA0).
+    /// * Tournament place: before 0xB0 ticks an outline digit rolls through 1…8, one step every five
+    ///   ticks (the counter at `+0x88`, period 4 with a strict `>`), in the place colour, with the
+    ///   previous digit ghosted at alpha 0x80 on the step (0x41D9F0); from 0xB0 to 0xC0 the white
+    ///   solid digit at ×2, ×4, ×6 its size (`_ftol((t − 176) · 0.0625 · −3)` picks from
+    ///   {2, 4, 6}, 0x41DC70); from 0xC0 the solid digit in the place colour.
+    pub fn congrats_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, place: usize, t: u64, tournament: bool) {
+        if !(1..=3).contains(&place) {
+            return;
+        }
+        let (cx, cy, scale) = congrats_layout(t, tournament);
+        let rgb = CONGRATS_RGB[place - 1];
+        let col = |a: u32| {
+            [((rgb >> 16) & 0xFF) as f32 / 255.0, ((rgb >> 8) & 0xFF) as f32 / 255.0, (rgb & 0xFF) as f32 / 255.0, a as f32 / 255.0]
+        };
+        let seg = |out: &mut Vec<Sprite>, (x0, y0): (f32, f32), (x1, y1): (f32, f32), color: [f32; 4]| {
+            let (x, y) = (x0.min(x1), y0.min(y1));
+            let mut l = self.image(aspect, self.white, x, y, (x1 - x0).abs().max(1.0), (y1 - y0).abs().max(1.0));
+            l.color = color;
+            out.push(l);
+        };
+        let white66 = [1.0, 1.0, 1.0, 0x66 as f32 / 255.0];
+        seg(out, (0.0, cy), (640.0, cy), white66);
+        seg(out, (cx, 0.0), (cx, 480.0), white66);
+        let ring_step = ((1 + t / 9) % 5) as usize;
+        let rr = ((128.0f32 * scale * 0.5) as i64) as f32;
+        // outer arms: 0 left, 1 bottom, 2 top, 3 right; radii: 0 up, 1 down, 2 left, 3 right
+        let outer = [((0.0, cy), (cx - rr, cy)), ((cx, cy + rr), (cx, 480.0)), ((cx, 0.0), (cx, cy - rr)), ((cx + rr, cy), (640.0, cy))];
+        let inner = [((cx, cy), (cx, cy - rr)), ((cx, cy), (cx, cy + rr)), ((cx, cy), (cx - rr, cy)), ((cx, cy), (cx + rr, cy))];
+        const OUTER: [[usize; 2]; 5] = [[0, 1], [0, 1], [0, 2], [2, 3], [3, 1]];
+        const INNER: [[usize; 2]; 5] = [[0, 3], [0, 3], [3, 1], [2, 1], [0, 2]];
+        for k in OUTER[ring_step] {
+            seg(out, outer[k].0, outer[k].1, col(0xFF));
+        }
+        for k in INNER[ring_step] {
+            seg(out, inner[k].0, inner[k].1, col(0xFF));
+        }
+        let r = 128.0 * scale;
+        for tex in [self.congrats.full, self.congrats.ring].into_iter().flatten() {
+            out.push(self.image(aspect, tex, cx - r * 0.5, cy - r * 0.5, r, r));
+        }
+        if let Some(tex) = self.congrats.cut {
+            // UV set per step: 2 (y), 3 (both), 0, 2 (y), 1 (x)
+            let set = [2, 3, 0, 2, 1][ring_step];
+            let mut sp = self.image(aspect, tex, cx - r * 0.5, cy - r * 0.5, r, r);
+            if set & 1 != 0 {
+                (sp.uv_min[0], sp.uv_max[0]) = (1.0, 0.0);
+            }
+            if set & 2 != 0 {
+                (sp.uv_min[1], sp.uv_max[1]) = (1.0, 0.0);
+            }
+            out.push(sp);
+        }
+        let put = |out: &mut Vec<Sprite>, tex: Option<TextureId>, (w, h): (f32, f32), k: f32, color: [f32; 4]| {
+            if let Some(tex) = tex {
+                let (w, h) = (w * k, h * k);
+                let mut sp = self.image(aspect, tex, cx - w * 0.5, cy - h * 0.5, w, h);
+                sp.color = color;
+                out.push(sp);
+            }
+        };
+        let i = place - 1;
+        if !tournament {
+            let a = ((t * 255) / 128).min(255) as u32;
+            put(out, self.congrats.solid[i], CONGRATS_SOLID[i], scale, col(a));
+        } else if t < 0xB0 {
+            let roll = ((1 + t / 5) % 8) as usize;
+            put(out, self.congrats.outline[roll], CONGRATS_OUTLINE[roll], scale, col(0xFF));
+            if t % 5 == 0 {
+                let prev = (roll + 7) % 8;
+                put(out, self.congrats.outline[prev], CONGRATS_OUTLINE[prev], scale, col(0x80));
+            }
+        } else if t < 0xC0 {
+            let k = ((t - 176) as f32 * 0.0625 * -3.0) as i64;
+            let mult = [2.0, 4.0, 6.0][(-k).clamp(0, 2) as usize];
+            put(out, self.congrats.solid[i], CONGRATS_SOLID[i], mult, [1.0; 4]);
+        } else {
+            put(out, self.congrats.solid[i], CONGRATS_SOLID[i], scale, col(0xFF));
+        }
+    }
+
+    /// `HMissionSummary` 0x428940: an `HBillBoard` titled 18134 "Factory Driver" over 18135 "Mission
+    /// Summary" (0x42894F / 0x428963), the narrator's portrait `factorypeople.fsh[CHARACTER]`
+    /// (54×64, 0x428A19) with the name 18176 + CHARACTER under it (`0x4700 +`, 0x428BBE, 66 px
+    /// below, 0x428C1B), the result lines typed out from `(W/2 − w/4, H/2 − h/4)`, and the "race
+    /// again" button (18109, `+0x124`). The box is the dialogs' shared 500 × 325.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mission_summary_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, bb: &Billboard, narrator: Option<usize>, name: &str, lines: &[String], race_again: &str, typed: Option<usize>) {
+        if self.font.is_none() {
+            return;
+        }
+        let (x, _, _, h) = BILLBOARD;
+        if !self.billboard(out, aspect, bb) {
+            return;
+        }
+        // portrait 54×64 at (origin.x + 0x14, H/2 − 64) (0x428A19), the name 66 px under it
+        // (0x428C1B), the "race again" button at (W/2 − 71, H/2 + h/2 − 4·19) (0x428A2F…0x428A6F)
+        let py = HUD_REF_H / 2.0 - 64.0;
+        if let Some(tex) = narrator.and_then(|n| self.portraits.get(n).copied().flatten()) {
+            out.push(self.image(aspect, tex, x + 20.0, py, 54.0, 64.0));
+        }
+        // the name (`+0x144`, 0x428B7B…0x428C22): `unviers9b` in 0xCC000000, centred under the
+        // 54-px portrait (`[0x5B2C80]`), or at `x + 2` when it is wider (flag `+0x148`)
+        let nh = FONT_SMALL;
+        let nw = self.text_width(name, nh);
+        let nx = if nw < 54.0 { (x + 20.0 + (54.0 - nw) * 0.5).trunc() } else { x + 20.0 + 2.0 };
+        self.text(out, aspect, name, nx, py + 66.0, nh, [0.0, 0.0, 0.0, 0xCC as f32 / 255.0]);
+        let (bw, bh) = HUD_BUTTON;
+        let by = HUD_REF_H / 2.0 + (h / 2.0).trunc() - 4.0 * bh;
+        self.button_sprites(out, aspect, HUD_REF_W / 2.0 - bw / 2.0, by, race_again, false);
+        // the result text (`+0x12C`, 0x428AEB…0x428B06): `unviers9b` in 0xFF000000, one visual moved
+        // line by line from `(W/2 − w/4, H/2 − h/4)` (`+0x130`/`+0x134`, 0x428B15…0x428B67), each line
+        // `measured height · [0x5B2CC0] 1.5` below the last (0x4291FC…0x429210), and **typed out**: the
+        // lines before `+0x138` whole, the current one's first `+0x13C` characters, one more each
+        // draw (0x429233…0x429293). `typed` is the characters shown so far (None: all).
+        let (_, _, bw0, _) = BILLBOARD;
+        let lx = (HUD_REF_W / 2.0 - (bw0 / 4.0).trunc()).trunc();
+        let mut ly = (HUD_REF_H / 2.0 - (h / 4.0).trunc()).trunc();
+        let th = FONT_SMALL;
+        let mut left = typed.unwrap_or(usize::MAX);
+        for l in lines {
+            let n = l.chars().count();
+            let shown: String = l.chars().take(left.min(n)).collect();
+            self.text(out, aspect, &shown, lx, ly, th, [0.0, 0.0, 0.0, 1.0]);
+            ly += EXT_SMALL * 1.5;
+            if left <= n {
+                break;
+            }
+            left -= n;
+        }
+    }
+
+    /// An `HBillBoard` frame (layout 0x41AE20, draw 0x41A7A0): the box, a 22-px strip along its top
+    /// and one along `h − 44` (0x435920 twice, `[0x5B265C]` = 22.0), the left text at `left + 10`
+    /// and the right one right-aligned at `right − 10` (`[0x5B241C]` = 10.0), each centred
+    /// vertically in its strip (`(22 − text height)·0.5`), all four in `UniversC12b`, white.
+    /// The text is drawn only once the box is fully open (state 3, 0x41AC11) — this port does not
+    /// animate the opening. The text height is the draw size here (APPROXIMATION).
+    ///
+    /// **Opening** (0x41A7A0 state 1): the box starts 40 px tall (`+0xE8 = 0x28`, 0x41A69B) and
+    /// grows by `h/5` (`+0xEC`, 65) each frame, centred, until it reaches `h` (state 3); only then
+    /// are its texts and the page's own content drawn (0x41AC11, and each page's `0x42A410`
+    /// test). Returns whether it is fully open.
+    fn billboard(&self, out: &mut Vec<Sprite>, aspect: f32, bb: &Billboard) -> bool {
+        let (x, _, w, full) = BILLBOARD;
+        let h = self.billboard_h.get().min(full);
+        let y = ((HUD_REF_H - h) / 2.0).trunc();
+        // the box (`+0x9C`, 0x41A890…0x41A89C): its four corners from 0x5B2858 — 0xB2FEDD81 at
+        // the top, 0x8082A8B0 at the bottom
+        let tex_quad = |tex: TextureId, x: f32, y: f32, w: f32, h: f32, uv_min: [f32; 2], uv_max: [f32; 2]| {
+            let (pos, size) = Self::place(aspect, x, y, w, h);
+            Sprite { texture: tex, pos, size, uv_min, uv_max, color: [1.0; 4], rotation: 0.0, pivot: [0.5, 0.5], tri: None }
+        };
+        out.push(tex_quad(self.billboard_fill, x, y, w, h, [0.5, 0.25], [0.5, 0.75]));
+        // the two 22-px strips (0x41A97D…0x41AC02): each a pair of black quads, 0x5B2898 on the
+        // left (alpha 0x80 at its outer edge to 0xFF inward) and 0x5B28A8 on the right (the
+        // mirror), meeting at a moving point. 0x41A8A1…0x41A91E: `v = ftol(fmod([0x606AC8], 32)) ·
+        // w >> 5`, so the point crosses the whole width every 32 ticks, and `+0x110` flips each time
+        // `v` wraps (it starts 0 at the constructor); the top strip meets at `left + v` while the
+        // flag is clear and `right − v` while it is set, the bottom one the other way round
+        // (0x41AA75…0x41AA83)
+        let (clock, born) = self.billboard_clock.get();
+        let v = ((clock % 32) as f32 * w / 32.0).trunc();
+        let flipped = (clock / 32).saturating_sub(born / 32) % 2 == 1;
+        for (k, sy) in [y, y + h - 44.0].into_iter().enumerate() {
+            if sy < y || sy + 22.0 > y + h {
+                continue;
+            }
+            let from_left = flipped == (k == 1);
+            let split = if from_left { x + v } else { x + w - v };
+            if split > x {
+                out.push(tex_quad(self.strip_shade, x, sy, split - x, 22.0, [0.25, 0.5], [0.75, 0.5]));
+            }
+            if split < x + w {
+                out.push(tex_quad(self.strip_shade, split, sy, x + w - split, 22.0, [0.75, 0.5], [0.25, 0.5]));
+            }
+        }
+        if h < full {
+            return false;
+        }
+        // once open, under the texts (the `HTextVisual`s draw after their parent), (0x41ACC1…0x41AD81): the raised 4-px border 0x435A20(x, y, w, h, 1, 4) outside
+        // the box — white along the top and left, black along the bottom and right, 0x05 at the outer
+        // edge to 0x4C against the box (APPROXIMATION: the side each table goes to is taken from the
+        // bevel 0x436130's order) — and the gloss 0x435DA0(…, 100) over both 22-px strips
+        let b = 4.0;
+        let [wv, wh, kv, kh] = self.frame_ramps;
+        out.push(Self::ramp(aspect, wv, x - b, y - b, w + 2.0 * b, b, true));
+        out.push(Self::ramp(aspect, wh, x - b, y, b, h, false));
+        out.push(Self::ramp(aspect, kv, x - b, y + h, w + 2.0 * b, b, true));
+        out.push(Self::ramp(aspect, kh, x + w, y, b, h, false));
+        self.gloss(out, aspect, x, y, w, 22.0);
+        self.gloss(out, aspect, x, y + h - 44.0, w, 22.0);
+        let white = [1.0, 1.0, 1.0, 1.0];
+        let th = FONT_MAIN;
+        let strip = |top: f32| (top + (22.0 - EXT_MAIN) * 0.5).trunc();
+        self.text(out, aspect, bb.left, x + 10.0, strip(y), th, white);
+        let rw = self.text_width(bb.right, th);
+        self.text(out, aspect, bb.right, x + w - 10.0 - rw, strip(y), th, white);
+        if let Some((esc, space)) = bb.hints {
+            let by = strip(y + h - 44.0);
+            self.text(out, aspect, esc, x + 10.0, by, th, white);
+            if let Some(sp) = space {
+                let sw = self.text_width(sp, th);
+                self.text(out, aspect, sp, x + w - 10.0 - sw, by, th, white);
+            }
+        }
+        true
+    }
+
+    /// One `HButtonVisual` (ctor 0x41B140, geometry 0x41B520, draw 0x41B340): a 142 × 19 box
+    /// filled **0xFFBC0000** (red) with its label in white, or — while the mouse is over it
+    /// (`+0x100`, set from the cursor 0x5372A0(6) against the box, with sound 9 on entering,
+    /// 0x41B3BA…0x41B3CE) — filled **0xFFFAB400** with the label in **0xFF000000**; the fill is
+    /// 0x419F50 and the outline strokes 0x419E90 in 0xFF000000 (`[0x5B28F8]`). The original picks
+    /// with the mouse; this port's keyboard selection takes the hover look (APPROXIMATION); the
+    /// `+0x103` dressing (0x436130 / 0x435DA0 / 0x435F80) is drawn below.
+    /// A two-texel gradient texture stretched over a rectangle, sampled texel centre to texel
+    /// centre, top to bottom (`vertical`) or left to right.
+    fn ramp(aspect: f32, tex: TextureId, x: f32, y: f32, w: f32, h: f32, vertical: bool) -> Sprite {
+        let (pos, size) = Self::place(aspect, x, y, w, h);
+        let (uv_min, uv_max) = if vertical { ([0.5, 0.25], [0.5, 0.75]) } else { ([0.25, 0.5], [0.75, 0.5]) };
+        Sprite { texture: tex, pos, size, uv_min, uv_max, color: [1.0; 4], rotation: 0.0, pivot: [0.5, 0.5], tri: None }
+    }
+
+    /// The gloss 0x435DA0(x, y, w, h, 100): white 127 → 0 over the top half, black 0 → 127 below.
+    fn gloss(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32) {
+        let half = (h / 2.0).trunc();
+        out.push(Self::ramp(aspect, self.button_ramps[0], x, y, w, half, true));
+        out.push(Self::ramp(aspect, self.button_ramps[1], x, y + half, w, h - half, true));
+    }
+
+    fn button_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, label: &str, selected: bool) {
+        let (bw, bh) = HUD_BUTTON;
+        let argb = |c: u32| [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0, (c >> 24) as f32 / 255.0];
+        let (fill, text) = if selected { (0xFFFA_B400, 0xFF00_0000) } else { (0xFFBC_0000, 0xFFFF_FFFF) };
+        out.push(self.quad(aspect, x, y, bw, bh, argb(fill)));
+        let edge = argb(0xFF00_0000);
+        out.push(self.quad(aspect, x, y, bw, 1.0, edge));
+        out.push(self.quad(aspect, x, y + bh - 1.0, bw, 1.0, edge));
+        out.push(self.quad(aspect, x, y, 1.0, bh, edge));
+        out.push(self.quad(aspect, x + bw - 1.0, y, 1.0, bh, edge));
+        // `+0x103`, set by every in-race dialog's buttons (the sixth constructor argument, 1 at
+        // 0x42A4EC and its siblings): hovered, the 4-px bevel 0x436130 (`[0x5CC910]` = 4) — dark
+        // 0xCC → 0x19 on the top and left, light 0x19 → 0xCC on the bottom and right; otherwise the
+        // gloss 0x435DA0(…, 100); then the 5 × 5 drop shadow 0x435F80 (0xCC → 0x19 away from the box).
+        // APPROXIMATION: the bevel's trapezoids are drawn as strips and its vertex order is taken
+        // from the colour tables' (0x5B3438…0x5B3468).
+        let ramp = |tex: TextureId, x: f32, y: f32, w: f32, h: f32, vertical: bool| Self::ramp(aspect, tex, x, y, w, h, vertical);
+        let [_, _, dark_v, dark_h, light_v, light_h] = self.button_ramps;
+        let b = 4.0;
+        if selected {
+            out.push(ramp(dark_v, x, y, bw, b, true));
+            out.push(ramp(dark_h, x, y, b, bh, false));
+            out.push(ramp(light_v, x, y + bh - b, bw, b, true));
+            out.push(ramp(light_h, x + bw - b, y, b, bh, false));
+        } else {
+            self.gloss(out, aspect, x, y, bw, bh);
+        }
+        out.push(ramp(dark_h, x + bw, y + 5.0, 5.0, bh, false));
+        out.push(ramp(dark_v, x + 5.0, y + bh, bw, 5.0, true));
+        let tw = self.text_width(label, FONT_MAIN);
+        self.text(out, aspect, label, x + (bw - tw) / 2.0, (y + (bh - EXT_MAIN) / 2.0).trunc(), FONT_MAIN, argb(text));
+    }
+
+    /// `HPauseMenu` (0x42A440): the billboard titled FE 18128 with three buttons — 18108 continue,
+    /// 18109 race again, 18110 quit — at `x = W/2 − 71` and `y = ftol(H/2 − 1.5·step) + k·step`
+    /// with `step = 19 · 1.6` (0x42A482…0x42A587, each `ftol`'d from the previous one).
+    pub fn pause_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, bb: &Billboard, labels: &[String; 3], sel: usize) {
+        if !self.billboard(out, aspect, bb) {
+            return;
+        }
+        let (bw, bh) = HUD_BUTTON;
+        let step = bh * 1.6;
+        let mut by = (HUD_REF_H / 2.0 - step * 3.0 * 0.5).trunc();
+        for (k, l) in labels.iter().enumerate() {
+            self.button_sprites(out, aspect, HUD_REF_W / 2.0 - bw / 2.0, by, l, k == sel);
+            by = (by + step).trunc();
+        }
+    }
+
+    /// `HYesNoOverlay` (0x437440): the billboard ("" | 18174 "Confirmation", no hints) with a
+    /// column at `x = W/2 − 71`, `step = 19 · 1.4` (`[0x5B2938]`), `y0 = ftol(H/2 − 2·step)`
+    /// (`[0x5B2404]` = 4.0): two text lines (`+0x120`, `+0x124`, `UniversC12b` in **0xC0000000**)
+    /// and then the 18141 "yes" / 18142 "no" buttons, each `ftol` one step below the last —
+    /// 186 / 212 / 238 / 264 (0x437482…0x43760E). The question is 18171 on the first line.
+    pub fn yes_no_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, bb: &Billboard, lines: [&str; 2], buttons: [&str; 2], sel: usize) {
+        if !self.billboard(out, aspect, bb) {
+            return;
+        }
+        let (bw, bh) = HUD_BUTTON;
+        let step = bh * 1.4;
+        let x = HUD_REF_W / 2.0 - bw / 2.0;
+        let mut y = (HUD_REF_H / 2.0 - step * 4.0 * 0.5).trunc();
+        for l in lines {
+            self.text(out, aspect, l, x, y, FONT_MAIN, [0.0, 0.0, 0.0, 0xC0 as f32 / 255.0]);
+            y = (y + step).trunc();
+        }
+        for (k, b) in buttons.iter().enumerate() {
+            self.button_sprites(out, aspect, x, y, b, k == sel);
+            y = (y + step).trunc();
+        }
+    }
+
+    /// A one-message box (`HInfo` 0x4282F0): one `HTextVisual` (`+0x124`, 0x428347…0x428366) in
+    /// `UniversC12b` and **0xFF000000**, given no box to wrap in; its setter 0x428410 measures the text
+    /// (0x431400) and centres it on the billboard, `x + w/2 − text w·0.5`, `y + h/2 − text h·0.5`
+    /// (0x42846C…0x4284C0), once the box is open (0x4283E5). This port broke the text into 44-character
+    /// lines in white from the top-left. The text height is the draw size (APPROXIMATION, as elsewhere).
+    pub fn notice_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, bb: &Billboard, text: &str) {
+        if self.font.is_none() {
+            return;
+        }
+        let (x, y, w, h) = BILLBOARD;
+        if !self.billboard(out, aspect, bb) {
+            return;
+        }
+        let th = FONT_MAIN;
+        let tw = self.text_width(text, th);
+        let tx = (x + (w / 2.0).trunc() - tw * 0.5).trunc();
+        let ty = (y + (h / 2.0).trunc() - EXT_MAIN * 0.5).trunc();
+        self.text(out, aspect, text, tx, ty, th, [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    /// The tournament standings (`HTournamentStandings` 0x431860, rows 0x431D33…0x431E46): ordinal,
+    /// driver name, points or total time, winnings; the player's row selected (0x431E1A). Same box
+    /// as the summary — its placement is this port's (APPROXIMATION).
+    pub fn standings_sprites(
+        &self,
+        out: &mut Vec<Sprite>,
+        aspect: f32,
+        rows: &[(String, String, String)],
+        player: Option<usize>,
+        bb: &Billboard,
+        head: &[String; 3],
+        timed: bool,
+        ord: &[String],
+    ) {
+        if self.font.is_none() {
+            return;
+        }
+        if !self.billboard(out, aspect, bb) {
+            return;
+        }
+        // 0x4319A1…0x4319BD: widths (40, 90, 100, 100) for points, (40, 90, 120, 100) for a
+        // time-ranked club event (the RALLY TIME header set)
+        let widths: &[f32] = if !timed { &[40.0, 90.0, 100.0, 100.0] } else { &[40.0, 90.0, 120.0, 100.0] };
+        let rows: Vec<Vec<(String, Option<[f32; 4]>)>> = rows
+            .iter()
+            .enumerate()
+            .map(|(k, (name, mid, money))| vec![(ord.get(k).cloned().unwrap_or_default(), None), (name.clone(), None), (mid.clone(), None), (money.clone(), None)])
+            .collect();
+        let mut header = vec![String::new()];
+        header.extend(head.iter().cloned());
+        self.table(out, aspect, widths, &header, &rows, player);
+    }
+
+    /// The post-race records table (`HTrackRecords` draw 0x433CF0): ordinal, NAME, CAR, TIME for the
+    /// eight entries, the selected row in HUD orange. It is an `HTable` like the summary, so it is
+    /// drawn in the same box — whose position and size are this port's (APPROXIMATION, as for the
+    /// summary; `hud.md` §5).
+    pub fn records_sprites(
+        &self,
+        out: &mut Vec<Sprite>,
+        aspect: f32,
+        rec: &nfs_game::records::HudRecords,
+        bb: &Billboard,
+        head: &[String; 3],
+        ord: &[String],
+    ) {
+        if self.font.is_none() {
+            return;
+        }
+        if !self.billboard(out, aspect, bb) {
+            return;
+        }
+        // 0x43394C: widths (40, 100, 120, 100)
+        let rows: Vec<Vec<(String, Option<[f32; 4]>)>> = rec
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(k, (name, car, time))| vec![(ord.get(k).cloned().unwrap_or_default(), None), (name.clone(), None), (car.clone(), None), (format_ticks(*time as u64), None)])
+            .collect();
+        let mut header = vec![String::new()];
+        header.extend(head.iter().cloned());
+        self.table(out, aspect, &[40.0, 100.0, 120.0, 100.0], &header, &rows, rec.highlight);
+    }
+
+    /// Map tray with the route and the car blips (each the car's footprint, see below).
     /// `0x433328` — the HUD blip loop walks the whole racer list. A car's blip takes its paint colour
     /// (`[[car+0x558]+0x218]`), floored to `0xFF202020` when every channel is under 0x14 so a black car
-    /// still shows; a police car instead alternates blue and red twice a second (§17.7). The player's
-    /// own blip keeps the display colour.
+    /// still shows; a police car instead alternates blue and red twice a second (§17.7). There is no
+    /// case for the player: its blip is its own paint like any racer's (this port had drawn it in
+    /// the HUD orange).
     fn blip_color(paint: [u8; 3], police: bool, tick: u64) -> [f32; 4] {
         if police {
             // 0xC00000FF <-> 0xC0FF0000, toggled every 0x20 ticks
@@ -346,9 +1105,8 @@ impl Hud {
     /// `paused` picks `play` over `paus` in cell 2 (the original keeps both widgets, `this+0xC8` and
     /// `this+0xCC`, and draws one — 0x42D31E switches on `this+0x199`), and `speed` picks one of the
     /// four speed glyphs in cell 4. The frame the bar sits on is `this+0x164/+0x168`, three pixels up
-    /// and left of the first cell; the original draws it through the widget's own vtable, which this
-    /// port has not read, so it is the HUD's ordinary tray — **APPROXIMATION**, and the only part of
-    /// the bar that is.
+    /// and left of the first cell. The widget is itself an `HTray` (vtable 0x5B2F3C, its slot 13
+    /// 0x42DEF0 forwarding `(333, 24, 0)` to 0x4340A0), so the frame is the ordinary tray, no rule.
     fn replay_bar(&self, out: &mut Vec<Sprite>, aspect: f32, paused: bool, speed: nfs_game::replay::Speed) {
         use nfs_game::replay::{cell_glyph_origin, control_bar, BAR, BAR_CELL, BAR_PITCH, BAR_PLAY};
         let (cells, frame) = control_bar(HUD_REF_W, HUD_REF_H);
@@ -365,7 +1123,7 @@ impl Hud {
             let Some((tex, _, _)) = self.replay_glyphs[glyph] else { continue };
             let (x, y) = cell_glyph_origin(*cell, c.box_w, c.box_h);
             let (pos, size) = Self::place(aspect, x, y, c.box_w, c.box_h);
-            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: HBUTTON_IDLE_GLYPH, rotation: 0.0, pivot: [0.5, 0.5] });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: HBUTTON_IDLE_GLYPH, rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         }
     }
 
@@ -373,36 +1131,367 @@ impl Hud {
         &self,
         out: &mut Vec<Sprite>,
         aspect: f32,
-        player: Vec3,
-        others: &[(Vec3, [f32; 4])],
+        // every blip, the player last (the loop runs from the last car down to car 0, so the
+        // player's is drawn on top): position, forward, half width / half length, colour
+        blips: &[(Vec3, Vec3, [f32; 2], [f32; 4])],
+        // the footprint scale 0x4337D2…0x4337ED: 60 in the whole-track view (`+0x14A`, set by the
+        // camera 0x433498 when the zoom is 0x41EA40's 600), 20 otherwise, 1 in radar mode (0x41E7C0)
+        k: f32,
+        // the counter and its `hud.loc` 0x13 (FE 19 "lap") label, drawn on the map (0x432EB0…
+        // 0x43304C): `itoa(min(car+0xB20 + 1, laps))` + "/" (0x5CCDE0) in the display colour (`+0xD8`)
+        // right-aligned against `itoa(laps)` in grey (`+0xDC`), both in `UniversC12b`; where on the
+        // map the three sit (their stored positions) is not read, so this port puts the label
+        // top-left and the count top-right (APPROXIMATION)
+        lap: Option<(&str, String, String)>,
     ) {
-        let Some((tex, [ox, oz, scale])) = self.map else {
+        let Some((tex, _)) = self.map else {
             return;
         };
+        let frame = self.map_frame.get();
         let m = MAP_PX as f32;
         self.tray(out, aspect, 0.0, 358.0, m, m);
-        out.push(self.image(aspect, tex, 0.0, 358.0, m, m));
-        let mut dot = |p: Vec3, color: [f32; 4], d: f32| {
-            let (mx, my) = ((p.x - ox) * scale, (p.z - oz) * scale);
-            if mx < 0.0 || my < 0.0 || mx > m || my > m {
-                return;
-            }
-            out.push(self.quad(aspect, mx - d * 0.5, 358.0 + my - d * 0.5, d, d, color));
-        };
-        for &(o, c) in others {
-            dot(o, c, 3.0);
+        // 0x432BA9…0x432C57: while TRANSLUCENCY is 0 the map's target first gets a full quad through
+        // 0x4660A0, whose four vertex colours are the dword 0x3F000000 — black at alpha 0x3F
+        if self.boxes.get() {
+            out.push(self.quad(aspect, 0.0, 358.0, m, m, [0.0, 0.0, 0.0, 0x3F as f32 / 255.0]));
         }
-        dot(player, HUD_ORANGE, 4.0);
+        out.push(self.image(aspect, tex, 0.0, 358.0, m, m));
+        if let Some((label, current, total)) = &lap {
+            self.text(out, aspect, label, 5.0, 361.0, FONT_MAIN, HUD_GREY);
+            let tw = self.text_width(total, FONT_MAIN);
+            self.text(out, aspect, total, m - 5.0 - tw, 361.0, FONT_MAIN, HUD_GREY);
+            let cw = self.text_width(current, FONT_MAIN);
+            self.text(out, aspect, current, m - 5.0 - tw - cw, 361.0, FONT_MAIN, self.display());
+        }
+        // each blip is the car's footprint (0x433174…0x43331A → 0x423C00): a quad along its matrix,
+        // `2·half width × 2·half length` times `k`, in the map's own projection
+        let scale = frame[2];
+        for &(p, fwd, half, colour) in blips {
+            let (mx, my) = Self::map_px(frame, p.x, p.z);
+            if mx < 0.0 || my < 0.0 || mx > m || my > m {
+                continue;
+            }
+            let (w, l) = ((2.0 * half[0] * k * scale).max(1.0), (2.0 * half[1] * k * scale).max(1.0));
+            // the car's forward in map pixels (right, down), measured clockwise from "up"
+            let (tx, ty) = Self::map_px(frame, p.x + fwd.x, p.z + fwd.z);
+            let turns = (tx - mx).atan2(-(ty - my)) / std::f32::consts::TAU;
+            // the `radar.fsh` "Car" sprite tinted with the colour (MEDIUM: the base quad 0x423C00 maps
+            // the matrix onto is taken as ±1, i.e. the full `2·half` footprint)
+            let mut q = match self.radar_car {
+                Some(tex) => {
+                    let mut i = self.image(aspect, tex, mx - w * 0.5, 358.0 + my - l * 0.5, w, l);
+                    i.color = colour;
+                    i
+                }
+                None => self.quad(aspect, mx - w * 0.5, 358.0 + my - l * 0.5, w, l, colour),
+            };
+            q.rotation = turns;
+            out.push(q);
+        }
     }
 
-    /// HTray (0x434110): translucent dark box with a 1 px outline in the display colour (alpha 0x3F).
+    /// HTray (0x434110): the fill is one quad (0x419F90) whose four vertex colours are the RGB
+    /// table 0x5B32E4 (all black) under the alpha table 0x5B3304 = **63, 63, 255, 255** scaled by
+    /// the fade (0…100, `vtable[+0x38]` while sliding), in the quad's own order top-left, top-right,
+    /// bottom-right, bottom-left — a vertical gradient from translucent at the top to opaque black
+    /// at the bottom (0x434234…0x43427B). This port filled the tray a flat 0.45 black. None of it is
+    /// drawn with `TRANSLUCENCY` ≠ 0
+    /// ([`Hud::boxes`], 0x41E5C0). The slide is not carried.
     fn tray(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32) {
-        out.push(self.quad(aspect, x, y, w, h, [0.0, 0.0, 0.0, 0.45]));
-        let o = [0.98, 0.706, 0.0, 0.25];
-        out.push(self.quad(aspect, x, y, w, 1.0, o));
-        out.push(self.quad(aspect, x, y + h - 1.0, w, 1.0, o));
-        out.push(self.quad(aspect, x, y, 1.0, h, o));
-        out.push(self.quad(aspect, x + w - 1.0, y, 1.0, h, o));
+        if !self.boxes.get() {
+            return;
+        }
+        let (pos, size) = Self::place(aspect, x, y, w, h);
+        out.push(Sprite {
+            texture: self.tray_fill,
+            pos,
+            size,
+            uv_min: [0.5, 0.25],
+            uv_max: [0.5, 0.75],
+            color: [1.0; 4],
+            rotation: 0.0,
+            pivot: [0.5, 0.5],
+            tri: None,
+        });
+        // No outline: the draw's only stroke is the rule (0x4342A4, one segment through 0x419E90's
+        // two-vertex line batch) and the only frame the `+0xC1` gloss 0x435DA0, which no element's
+        // constructor sets (0x433FF5). This port drew a four-edge outline in the edge colour, read
+        // from a note that had taken the rule for it.
+    }
+
+    /// The display colour for a `DISPLAYCOLORS` index (0x420503…0x42051A; anything else is orange).
+    fn display_colour(index: usize) -> [f32; 4] {
+        let c: u32 = match index {
+            1 => 0xCCFF_0606,
+            2 => 0xCC1E_E605,
+            _ => 0xCCFA_B400,
+        };
+        [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0, (c >> 24) as f32 / 255.0]
+    }
+
+    fn display(&self) -> [f32; 4] {
+        self.display.get()
+    }
+
+    /// The trays' outline and rule: the display colour masked to 24 bits with alpha 0x3F (0x4345F0).
+    fn edge(&self) -> [f32; 4] {
+        let [r, g, b, _] = self.display.get();
+        [r, g, b, 0x3F as f32 / 255.0]
+    }
+
+    /// `HTray`'s rule (0x434280…0x4342A4): when the third argument of the geometry setter (vtable
+    /// slot 13, 0x4340A0, stored at `+0x9C`) is positive and the tray is fully in (0x42A400 `== 3`),
+    /// the draw adds a 1-px stroke (0x419E90) across the tray at `y + dy` in the outline colours.
+    /// `HComboTextVisual` passes `h/2` (0x41C9F0 — HGear, HSpeed, HTime, HMultiTime, HTachDigital),
+    /// HPosition `pad + rows·row` (0x42A84D, 0x42BBB1), HGraphicDamage and HTextDamage the line one
+    /// pixel above their title, `(h − pad) − title height − pad/2` (0x422D2A, 0x42FE78). The port
+    /// drew none of them. The slide is not carried, so the rule is always drawn.
+    fn tray_rule(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, dy: f32) {
+        if dy > 0.0 && self.boxes.get() {
+            out.push(self.quad(aspect, x, y + dy, w, 1.0, self.edge()));
+        }
+    }
+
+    /// `HComboTextVisual` (ctor 0x41C740, draw 0x41C8C0, layout 0x41C910): a tray with two
+    /// `HTextVisual`s, **both `UniversC12b`** at scale 1 (0x41C7BA / 0x41C7F7, 0x41C8DD…0x41C906) —
+    /// the value `+0xC8` in the display colour right-aligned at `x + w − 5` (`[0x4205A0]`), `y + 2`
+    /// (`[0x4205C0]`), and the label `+0xC4` in grey at `x + 5` with its bottom `2` above the tray's
+    /// (0x41C983…0x41C9DC, measured on 0x5CCAD0). This port drew the value in a larger size at its own
+    /// offsets. Sizes are the port's 12 for `UniversC12b` (APPROXIMATION, as elsewhere).
+    fn combo_sprites(
+        &self,
+        out: &mut Vec<Sprite>,
+        aspect: f32,
+        (x, y, w, h): (f32, f32, f32, f32),
+        value: &str,
+        label: &str,
+        color: [f32; 4],
+    ) {
+        self.tray(out, aspect, x, y, w, h);
+        self.tray_rule(out, aspect, x, y, w, (h / 2.0).trunc());
+        let th = FONT_MAIN;
+        let vw = self.text_width(value, th);
+        self.text(out, aspect, value, x + w - 5.0 - vw, y + 2.0, th, color);
+        self.text(out, aspect, label, x + 5.0, y + h - 2.0 - EXT_MAIN, th, HUD_GREY);
+    }
+
+    /// `HWrongWay` (layout 0x437360, draw 0x436FCB…0x437345): FE 18159 with its top-left at
+    /// `(W/2 − w/2, H/2)` — the text's top on the centre line, not centred on it — in 0xFFFAB400, and
+    /// eight 5-px strokes (0x419E90) in the same colour making four corner brackets on the box
+    /// `l = W/2 − w/2 − 5`, `r = W/2 + w/2 + 5`, `t = H/2 − 5`, `b = H/2 + h + 5` (`[0x5B2400]` = 5.0,
+    /// each `_ftol`'d).
+    fn wrong_way_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, s: &str) {
+        // `UniversC12b` at its own size; the box takes the measured height (`EXT_MAIN`)
+        let (cx, cy, h) = (HUD_REF_W / 2.0, HUD_REF_H / 2.0, EXT_MAIN);
+        let w = self.text_width(s, FONT_MAIN);
+        let x = (cx - w / 2.0).trunc();
+        self.text(out, aspect, s, x, cy, FONT_MAIN, HUD_ORANGE);
+        let (l, r) = ((cx - w / 2.0 - 5.0).trunc(), (cx + w / 2.0 + 5.0).trunc());
+        let (t, b) = (cy - 5.0, (cy + h + 5.0).trunc());
+        for (px, py, dx, dy) in [(l, t, 1.0, 1.0), (l, b, 1.0, -1.0), (r, t, -1.0, 1.0), (r, b, -1.0, -1.0)] {
+            let hx = if dx > 0.0 { px } else { px - 5.0 };
+            let vy = if dy > 0.0 { py } else { py - 5.0 };
+            out.push(self.quad(aspect, hx, py, 5.0, 1.0, HUD_ORANGE));
+            out.push(self.quad(aspect, px, vy, 1.0, 5.0, HUD_ORANGE));
+        }
+    }
+
+    /// `HGraphicDamage` (ctor 0x421E00, layout 0x4229D0, draw 0x422470) — `DAMAGEDISPLAY == 1`, which
+    /// `fe.txt` ships: a 127 × 105 tray at (0, 0) holding a top-down car. Each of the ten zones
+    /// (`car+0x4E4…`, this port's `v.damage`) becomes a level `ftol(zone · 10 · 0.01)`; level 0
+    /// tints a part 0x55058228, level k the k-th of ten colours green → yellow → red (0x422162…).
+    /// The six parts (`car.fsh` 3, 0, 4, 5, 2, 1) sit at the backdrop's corner + their offsets
+    /// (0x420AF0…0x420B40); parts 3, 4 and 5 are drawn again flipped vertically for the other
+    /// side's zone at `y + offset − 1` (37, 43, 32 — 0x423C70's `[0x5CCC98]` = 1); then the backdrop
+    /// (entry 6, tinted 0xCC000000) plain and flipped below itself. Under it a 6-px gauge in two
+    /// gradients, "0%" / "100%" over its ends in `unviers9bi` and the display colour, and FE 12
+    /// "damage" at the bottom in grey `UniversC12b` — red 0xCCFF0000 in a mission over its damage
+    /// limit (0x42294D…). The port uses its one HUD font; the label height is the draw size.
+    fn damage_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, zones: &[f32; 10], labels: [&str; 3], over_limit: bool) {
+        let (tx, ty, tw, th) = (0.0, 0.0, 127.0, 105.0);
+        self.tray(out, aspect, tx, ty, tw, th);
+        // the rule over the title: `(h − 2) − title height − 1` (0x422CFE…0x422D2A)
+        self.tray_rule(out, aspect, tx, ty, tw, th - 2.0 - EXT_MAIN - 1.0);
+        let argb = |c: u32| [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0, (c >> 24) as f32 / 255.0];
+        const LEVELS: [u32; 10] = [
+            0xAA05_8228, 0xAA02_912D, 0xAA00_9B32, 0xAAFF_E100, 0xAAFF_CD05,
+            0xAAFF_B405, 0xAAFF_A005, 0xAADC_6E05, 0xAADC_4605, 0xAADC_1905,
+        ];
+        let tint = |zone: usize| {
+            let level = (zones[zone] * 10.0 * 0.01) as i32;
+            if level <= 0 { argb(0x5505_8228) } else { argb(LEVELS[(level as usize - 1).min(9)]) }
+        };
+        let quad = |tex: TextureId, x: f32, y: f32, w: f32, h: f32, flip: bool, colour: [f32; 4]| {
+            let (pos, size) = Self::place(aspect, x, y, w, h);
+            let (uv_min, uv_max) = if flip { ([0.0, 1.0], [1.0, 0.0]) } else { ([0.0, 0.0], [1.0, 1.0]) };
+            Sprite { texture: tex, pos, size, uv_min, uv_max, color: colour, rotation: 0.0, pivot: [0.5, 0.5], tri: None }
+        };
+        let (bx, by) = (tx + 5.0, ty + 4.0);
+        // (car.fsh entry, offset, quad size, zone, mirrored zone and its y offset)
+        const PARTS: [(usize, f32, f32, f32, f32, usize, Option<(usize, f32)>); 6] = [
+            (3, 2.0, 2.0, 52.0, 13.0, 2, Some((0, 37.0))),
+            (0, 1.0, 5.0, 49.0, 44.0, 1, None),
+            (4, 54.0, 1.0, 41.0, 9.0, 3, Some((7, 43.0))),
+            (5, 95.0, 4.0, 24.0, 14.0, 4, Some((6, 32.0))),
+            (2, 110.0, 17.0, 9.0, 19.0, 5, None),
+            (1, 64.0, 9.0, 31.0, 35.0, 8, None),
+        ];
+        for (entry, gx, gy, w, h, zone, mirror) in PARTS {
+            let Some(tex) = self.damage_parts[entry] else { continue };
+            let (px, py) = (bx + gx, by + gy);
+            out.push(quad(tex, px, py, w, h, false, tint(zone)));
+            if let Some((mz, off)) = mirror {
+                out.push(quad(tex, px, py + off - 1.0, w, h, true, tint(mz)));
+            }
+        }
+        if let Some(tex) = self.damage_parts[6] {
+            out.push(quad(tex, bx, by, 120.0, 27.0, false, argb(0xCC00_0000)));
+            out.push(quad(tex, bx, by + 27.0 - 1.0, 120.0, 27.0, true, argb(0xCC00_0000)));
+        }
+        // the labels over the gauge at `y + 2 + 2·27 + 4`, the gauge 6 px lower plus a label height
+        let label_y = ty + 2.0 + 54.0 + 4.0;
+        let lh = FONT_ITALIC;
+        self.text(out, aspect, labels[0], tx + 5.0, label_y, lh, self.display());
+        let w100 = self.text_width(labels[1], lh);
+        self.text(out, aspect, labels[1], tx + tw - 6.0 - w100, label_y, lh, self.display());
+        let gy = label_y + 4.0 + EXT_SMALL;
+        let mid = tx + (tw / 2.0).trunc();
+        out.push(quad(self.damage_gauge.0, tx + 5.0, gy, mid - tx - 5.0, 6.0, false, [1.0; 4]));
+        out.push(quad(self.damage_gauge.1, mid, gy, tx + tw - 5.0 - mid, 6.0, false, [1.0; 4]));
+        // correct the gauge textures' sampling to run texel centre to texel centre
+        let n = out.len();
+        for s in &mut out[n - 2..] {
+            s.uv_min = [0.25, 0.5];
+            s.uv_max = [0.75, 0.5];
+        }
+        let colour = if over_limit { argb(0xCCFF_0000) } else { HUD_GREY };
+        self.text(out, aspect, labels[2], tx + 5.0, ty + th - 2.0 - EXT_MAIN, FONT_MAIN, colour);
+    }
+
+    /// `HTextDamage` (ctor 0x42F900, positions 0x430870, draw 0x430150) — `DAMAGEDISPLAY` 2 "bar graph"
+    /// or 3 "percentages" (0x41E8D0): a 124 × 100 tray at (0, 0) with four rows `H/5` = 20 px apart,
+    /// labels FE 13…16 (drivetrain, steering, body, handling) at `(x + 5, y + i·H/5)` in the grey of
+    /// `+0x1C` and `unviers9b`, and FE 12 "damage" in grey `UniversC12b` at `(x + 5, h − 2 − its height)`
+    /// under the tray's rule (0x42FE1F…0x42FE78). The four figures are `ftol` of 0x4938A0, 0x493960,
+    /// 0x493C90 and 0x493BC0 (0x43017F…0x4301E9; the mean of the ten zones the draw also sums at
+    /// 0x430212 is never used). **Percentages** (`[0x657DC8] == 3`): `itoa(v)` + "%" (0x5CCC90), "0%"
+    /// (0x5CCC8C) for 0, right-aligned at `x + W − 5` in the display colour and `unviers9bi`
+    /// (0x42FA4B…0x42FA73). **Bars** (0x430535…): a 3-px bar (0x420560) at `y + i·H/5 + 4 + label
+    /// height` from `x + 5`, `v·(W − 2·5)/100` long in 0xFFD70A0F (0x420520), and the rest of the
+    /// 114 px in 0xC8A58C0A (0x420540) unless `v == 100` (0x43076D). The draw's `edi == 4` branch is
+    /// dead — the loop stops at 3 (0x430855). In a mission over its damage limit the title turns
+    /// 0xCCFF0000 (0x4302DE…). Text heights are the draw sizes, as elsewhere in this HUD; a figure over
+    /// 100 would give the rest a reversed quad, drawn here over the same span (APPROXIMATION).
+    fn text_damage_sprites(
+        &self,
+        out: &mut Vec<Sprite>,
+        aspect: f32,
+        values: [i32; 4],
+        labels: [&str; 5],
+        percentages: bool,
+        over_limit: bool,
+    ) {
+        let (x, y, w, h) = (0.0, 0.0, 124.0, 100.0);
+        let (lh, th) = (FONT_SMALL, FONT_MAIN);
+        self.tray(out, aspect, x, y, w, h);
+        self.tray_rule(out, aspect, x, y, w, h - 2.0 - EXT_MAIN - 1.0);
+        let argb = |c: u32| [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0, (c >> 24) as f32 / 255.0];
+        let row_h = (h / 5.0).trunc();
+        let span = w - 2.0 * 5.0;
+        for (i, &v) in values.iter().enumerate() {
+            let ry = y + row_h * i as f32;
+            self.text(out, aspect, labels[i], x + 5.0, ry, lh, HUD_GREY);
+            if percentages {
+                let s = format!("{v}%");
+                let sw = self.text_width(&s, FONT_ITALIC);
+                self.text(out, aspect, &s, x + w - 5.0 - sw, ry, FONT_ITALIC, self.display());
+            } else {
+                let by = ry + 4.0 + EXT_SMALL;
+                let end = x + 5.0 + (v * span as i32 / 100) as f32;
+                out.push(self.quad(aspect, x + 5.0, by, end - x - 5.0, 3.0, argb(0xFFD7_0A0F)));
+                if v != 100 {
+                    let (l, r) = (end.min(x + 5.0 + span), end.max(x + 5.0 + span));
+                    out.push(self.quad(aspect, l, by, r - l, 3.0, argb(0xC8A5_8C0A)));
+                }
+            }
+        }
+        let colour = if over_limit { argb(0xCCFF_0000) } else { HUD_GREY };
+        self.text(out, aspect, labels[4], x + 5.0, y + h - 2.0 - EXT_MAIN, th, colour);
+    }
+
+    /// The font a size stands for: `FONT_SMALL` is `unviers9b` and `FONT_ITALIC` `unviers9bi`, each at
+    /// its own line height, when loaded and when it has every glyph of `s` (the italic one holds only
+    /// digits and a few signs); anything else, or a fallback, is `UniversC12b` at `h` (the italic's
+    /// fallback at `FONT_SMALL`).
+    fn font_for(&self, s: &str, h: f32) -> Option<(&BitmapFont, f32)> {
+        fn own<'a>(f: &'a Option<BitmapFont>, s: &str) -> Option<(&'a BitmapFont, f32)> {
+            f.as_ref().filter(|f| s.chars().all(|c| c == ' ' || f.has_glyph(c))).map(|f| (f, f.line_px()))
+        }
+        if h == FONT_SMALL
+            && let Some(r) = own(&self.font_small, s)
+        {
+            return Some(r);
+        }
+        if h == FONT_ITALIC {
+            if let Some(r) = own(&self.font_italic, s) {
+                return Some(r);
+            }
+            return self.font.as_ref().map(|f| (f, FONT_SMALL));
+        }
+        self.font.as_ref().map(|f| (f, h))
+    }
+
+    /// Width of `s` drawn `h` pixels tall by [`Hud::text`], in design pixels.
+    fn text_width(&self, s: &str, h: f32) -> f32 {
+        self.font_for(s, h).map_or(0.0, |(f, h)| f.place(s).1 * h / f.line_px())
+    }
+
+    /// `HPosition` (ctor 0x42A790, layout 0x42B650, draw 0x42B000): the opponent list. A tray
+    /// 138 wide at (502,1) and `(rows + 1) · 15 + 2·2` tall; each car's row sits at
+    /// `(place − 1) · 15` below the top padding with an 8×8 swatch in its paint (0x419F50), the
+    /// driver's name in grey fitted to 55 px (0x42AD6A…0x42AD87), and the gap right-aligned in the
+    /// display colour 5 + 8 px in from the right edge; under the rows FE 17 "position" in grey and
+    /// the player's place over the row count (`"%d" "/"` 0x42B5B1…0x42B609, then the count 0x42B61E).
+    /// The fonts are `unviers9b` / `unviers9bi` / `UniversC12b` there; this port draws everything in
+    /// its one HUD font at the sizes its other trays use, and the swatch's vertical offset (0x42BA5A,
+    /// half a measured glyph height less 4) is taken as the row's middle — APPROXIMATION.
+    fn opponent_list_sprites(
+        &self,
+        out: &mut Vec<Sprite>,
+        aspect: f32,
+        rows: &[(usize, [f32; 4], String, String)],
+        place: usize,
+        label: &str,
+    ) {
+        let (x, y, w, rh) = (502.0, 1.0, 138.0, 15.0);
+        let h = (rows.len() as f32 + 1.0) * rh + 4.0;
+        self.tray(out, aspect, x, y, w, h);
+        // the rule over the footer row: `pad + rows·row` (0x42A83A…0x42A84D)
+        self.tray_rule(out, aspect, x, y, w, 2.0 + rh * rows.len() as f32);
+        for (row, colour, name, value) in rows {
+            let ry = y + 2.0 + rh * *row as f32;
+            out.push(self.quad(aspect, x + 5.0, ry + 3.5, 8.0, 8.0, *colour));
+            // the name loses a character at a time until it fits; an empty one becomes " "
+            let mut name = name.clone();
+            while !name.is_empty() && self.text_width(&name, FONT_SMALL) > 55.0 {
+                name.pop();
+            }
+            self.text(out, aspect, &name, x + 18.0, ry + 1.0, FONT_SMALL, HUD_GREY);
+            let vw = self.text_width(value, FONT_ITALIC);
+            self.text(out, aspect, value, x + w - 13.0 - vw, ry + 1.0, FONT_ITALIC, self.display());
+        }
+        // the footer (0x42B569…0x42B639): FE 17 `+0x10C` in grey `UniversC12b`, `itoa(position)` + "/"
+        // `+0x110` in the display colour and **`UniversC12b` too**, the count `+0x114` in grey
+        // `unviers9b` — this port had drawn the place at 16 and the label at 10; sizes are the port's
+        // 12 / 10 for the two fonts, bottoms aligned (APPROXIMATION, as elsewhere)
+        let fy = y + h - 2.0 - rh;
+        self.text(out, aspect, label, x + 5.0, fy, FONT_MAIN, HUD_GREY);
+        let n = rows.len().to_string();
+        let nw = self.text_width(&n, FONT_SMALL);
+        self.text(out, aspect, &n, x + w - 5.0 - nw, fy + 3.0, FONT_SMALL, HUD_GREY);
+        let p = format!("{place}/");
+        let pw = self.text_width(&p, FONT_MAIN);
+        self.text(out, aspect, &p, x + w - 5.0 - nw - 1.0 - pw, fy, FONT_MAIN, self.display());
     }
 
     /// Screen rotation (turns, clockwise positive) for a dial value — `hud.md` §3.3, H32 settled:
@@ -442,6 +1531,7 @@ impl Hud {
             color,
             rotation: 0.0,
             pivot: [0.5, 0.5],
+            tri: None,
         }
     }
 
@@ -457,6 +1547,7 @@ impl Hud {
             color: [1.0; 4],
             rotation: 0.0,
             pivot: [0.5, 0.5],
+            tri: None,
         }
     }
 
@@ -472,7 +1563,7 @@ impl Hud {
         h: f32,
         color: [f32; 4],
     ) {
-        let Some(f) = &self.font else { return };
+        let Some((f, h)) = self.font_for(s, h) else { return };
         let scale = h / f.line_px();
         let (glyphs, _) = f.place(s);
         for g in &glyphs {
@@ -492,6 +1583,7 @@ impl Hud {
                 color,
                 rotation: 0.0,
                 pivot: [0.0, 0.0],
+                tri: None,
             });
         }
     }
@@ -507,6 +1599,14 @@ impl Hud {
         spec: &nfs_formats::fedata::DialSpec,
         value: i32,
     ) {
+        // the ring under the face (0x42166A → `[+0xC8]` vtable slot 1), while TRANSLUCENCY is 0
+        if self.boxes.get()
+            && let Some(ring) = self.dial_ring
+        {
+            let mut r = self.image(aspect, ring, centre[0] - 64.0, centre[1] - 64.0, 128.0, 128.0);
+            r.color = [0.0, 0.0, 0.0, 128.0 / 255.0];
+            out.push(r);
+        }
         out.push(self.image(
             aspect,
             face,
@@ -527,9 +1627,52 @@ impl Hud {
             color: [1.0; 4],
             rotation: Self::needle_turns(spec, value),
             pivot: [0.5, piv_y],
+            tri: None,
         });
         if let Some(hub) = self.hub {
             out.push(self.image(aspect, hub, centre[0] - 10.0, centre[1] - 10.0, 20.0, 20.0));
+        }
+    }
+
+    /// Move the sprites an element pushed since `n0` by its slide (hud.md, "The slide", 0x434630 /
+    /// 0x4346A0), or drop them when the trays are down. The edge code of the tray `(x, y, w, h)`
+    /// against the screen centre: `x ≥ W/2` → the right edge, else `x + w > W/2` → the top or
+    /// bottom edge, else the left, top or bottom by `y ≥ H/2`; sliding in, `x = −w + t·(x + w)/11`
+    /// (left), `W − t·(W − x)/11` (right), `y = −h + t·(y + h)/11` (top), `H − t·(H − y)/11`
+    /// (bottom), each held at its target; sliding out the same paths back.
+    fn slide(out: &mut Vec<Sprite>, n0: usize, aspect: f32, (x, y, w, h): (f32, f32, f32, f32), s: TraySlide) {
+        let (xi, yi, wi, hi, t) = (x as i32, y as i32, w as i32, h as i32, s.t);
+        let (sw, sh) = (HUD_REF_W as i32, HUD_REF_H as i32);
+        let (right, bottom) = (xi >= sw / 2, yi >= sh / 2);
+        let across = !right && xi + wi > sw / 2;
+        let (dx, dy) = match s.state {
+            0 => {
+                out.truncate(n0);
+                return;
+            }
+            1 if across && !bottom => (0, (-hi + t * (yi + hi) / 11).min(yi) - yi),
+            1 if across => (0, (sh - t * (sh - yi) / 11).max(yi) - yi),
+            1 if right => ((sw - t * (sw - xi) / 11).max(xi) - xi, 0),
+            1 => ((-wi + t * (xi + wi) / 11).min(xi) - xi, 0),
+            2 if across && !bottom => (0, (yi - t * (yi + hi) / 11).max(-hi) - yi),
+            2 if across => (0, (yi + t * (sh - yi) / 11).min(sh) - yi),
+            2 if right => ((xi + t * (sw - xi) / 11).min(sw) - xi, 0),
+            2 => ((xi - t * (xi + wi) / 11).max(-wi) - xi, 0),
+            _ => (0, 0),
+        };
+        if (dx, dy) == (0, 0) {
+            return;
+        }
+        let (o, _) = Self::place(aspect, 0.0, 0.0, 0.0, 0.0);
+        let (p, _) = Self::place(aspect, dx as f32, dy as f32, 0.0, 0.0);
+        let d = [p[0] - o[0], p[1] - o[1]];
+        for sp in &mut out[n0..] {
+            sp.pos = [sp.pos[0] + d[0], sp.pos[1] + d[1]];
+            if let Some(t) = sp.tri.as_mut() {
+                for v in t {
+                    *v = [v[0] + d[0], v[1] + d[1]];
+                }
+            }
         }
     }
 
@@ -540,39 +1683,44 @@ impl Hud {
         speed_kmh: f32,
         rpm: f32,
         tick: u64,
-        gear: usize,
         race: Option<&RaceProgress>,
-        num_laps: u32,
-        // `LINEAR_TRACK` `[0x657494]` (`race-logic.md` §14): a point-to-point track has **no lap
-        // counter at all** — 0x432EA3 skips the whole `<lap>/<laps>` draw when it is set, label and
-        // all. This port used to key that off its own "99 laps" skill-test sentinel instead.
-        linear: bool,
-        // `HWrongWay` 0x436F70 draws only outside a mission and outside a replay (and past tick
-        // 448, which `RACE_START_TICK` already is)
-        mission_or_replay: bool,
         // `H321Go` 0x4184F0 returns before drawing anything when `FEGAME_TYPE [0x6573E8]` is 6, 7 or
         // 8 — the three **test drives** (dealer / used / owned, `modes.md` §0) — or when
         // `REPLAY [0x657424]` is set. The window itself is `[0x5B27D8] … [0x5B27E4]` = 256 … 448
         // ticks with the digit thresholds 256 / 320 / 384, which this port already had.
         countdown: bool,
-        // `HPosition` 0x42B279: a car whose finish state `car+0xB50` is **3** (eliminated) shows
-        // FE 18191 "DNF" where its position would be (0x42B2B6). State 2, finished, keeps the
-        // number.
-        dnf: bool,
-        position: Option<(usize, usize)>,
+        // `HTime` 0x4316F0: the cone penalty added to the time — `+0xE4` (the knocked cones) ×
+        // `FACTORYDRIVERTCONEPENALTY [0x657830]` (seconds, or −1 when the mission has none) × 64
+        time_penalty: i64,
+        // `HTime` in `0xCCFF0000` (0x41CA60) instead of the display colour: a mission over its
+        // damage limit (`0x434FA0(1)` on the live zones, 0x431710…0x431729) or the flash after a
+        // cone (`+0xE0 = 16`, 0x431830)
+        time_alert: bool,
+        text: &HudText,
+        // `HWrongWay` is up and in the visible half of its blink
+        wrong_way: bool,
+        // the `+4` trays' shared slide (`TraySlide`)
+        slide: TraySlide,
     ) -> Vec<Sprite> {
         let mut out = Vec::new();
         // dials: speedometer tray (392,352) and tach (512,307) at 640×480, 128 px faces (hud.md §2/§6)
-        self.dial_sprites(
-            &mut out,
-            aspect,
-            self.dial,
-            self.needle,
-            [392.0 + 64.0, 352.0 + 64.0],
-            &self.kmh,
-            speed_kmh as i32,
-        );
-        if let Some((td, tn)) = self.tach {
+        let n0 = out.len();
+        if text.speedometer == 2 {
+            self.dial_sprites(
+                &mut out,
+                aspect,
+                self.dial,
+                self.needle,
+                [392.0 + 64.0, 352.0 + 64.0],
+                &self.kmh,
+                speed_kmh as i32,
+            );
+            Self::slide(&mut out, n0, aspect, (392.0, 352.0, 128.0, 128.0), slide);
+        }
+        let n0 = out.len();
+        if text.tachometer == 2
+            && let Some((td, tn)) = self.tach
+        {
             self.dial_sprites(
                 &mut out,
                 aspect,
@@ -580,111 +1728,160 @@ impl Hud {
                 tn,
                 [512.0 + 64.0, 307.0 + 64.0],
                 &self.tach_spec,
-                (rpm / 10.0) as i32,
+                // `HTach` 0x42F660: `ftol(car+0xDB4 · [+0xA9D0] + 750.0) / 10` (0x42F678…0x42F6A2,
+                // `[0x5B30D8]` = 750) — the dial's scale starts at idle, so the needle reads 750 at
+                // rest and the redline at the redline. This port passed the bare rpm.
+                (rpm * text.tach_scale + 750.0) as i32 / 10,
             );
+            Self::slide(&mut out, n0, aspect, (512.0, 307.0, 128.0, 128.0), slide);
         }
         if self.font.is_some() {
             // trays: digital speed 73×35 @ (460,444), gear 85×35 @ (555,444), time 73×35 @ (427,33), position 138×15 @ (502,1)
-            self.tray(&mut out, aspect, 460.0, 444.0, 73.0, 35.0);
-            self.tray(&mut out, aspect, 555.0, 444.0, 85.0, 35.0);
-            if race.is_some_and(|r| !r.finished) {
-                self.tray(&mut out, aspect, 427.0, 33.0, 73.0, 35.0);
-                self.tray(&mut out, aspect, 502.0, 1.0, 138.0, 15.0);
+            // each an `HComboTextVisual`, so each carries its `h/2` rule (0x41C9F0)
+            if text.speedometer == 1 {
+                let n0 = out.len();
+                self.combo_sprites(&mut out, aspect, (460.0, 444.0, 73.0, 35.0), &text.speed, &text.speed_label, self.display());
+                Self::slide(&mut out, n0, aspect, (460.0, 444.0, 73.0, 35.0), slide);
             }
-            // digital speed / gear: value top-right orange, label bottom-left grey
-            self.text(
-                &mut out,
-                aspect,
-                &format!("{:03}", speed_kmh as i32),
-                500.0,
-                446.0,
-                16.0,
-                HUD_ORANGE,
-            );
-            self.text(&mut out, aspect, "km/h", 462.0, 464.0, 10.0, HUD_GREY);
-            let gear_s = match gear {
-                0 => "R".to_string(),
-                1 => "N".to_string(),
-                g => (g - 1).to_string(),
-            };
-            self.text(&mut out, aspect, &gear_s, 615.0, 446.0, 16.0, HUD_ORANGE);
-            self.text(&mut out, aspect, "gear", 557.0, 464.0, 10.0, HUD_GREY);
+            if text.gear_on {
+                let n0 = out.len();
+                self.combo_sprites(&mut out, aspect, (555.0, 444.0, 85.0, 35.0), &text.gear, &text.gear_label, self.display());
+                Self::slide(&mut out, n0, aspect, (555.0, 444.0, 85.0, 35.0), slide);
+            }
+            // `HTachDigital` (0x42F740, `HUDTACHOMETER == 1`): `ftol(car+0xDB4)` zero-padded to four
+            // digits ("0000" below 1) under FE 18144, a 73 × 35 tray at (380, 444) (`nfs5-2.hud`)
+            if text.tachometer == 1 {
+                let r = rpm as i32;
+                let value = if r < 1 { "0000".to_string() } else { format!("{r:04}") };
+                let n0 = out.len();
+                self.combo_sprites(&mut out, aspect, (380.0, 444.0, 73.0, 35.0), &value, &text.rpm_label, self.display());
+                Self::slide(&mut out, n0, aspect, (380.0, 444.0, 73.0, 35.0), slide);
+            }
             if let Some(r) = race {
                 let race_t = tick.saturating_sub(RACE_START_TICK);
-                let lap_t = tick.saturating_sub(r.lap_start_tick.max(RACE_START_TICK));
                 // race time tray 73×35 @ (427,33); lap counter / position 138×15 @ (502,1)
                 if !r.finished {
-                    let shown = if num_laps >= 99 { race_t } else { lap_t };
-                    self.text(
-                        &mut out,
-                        aspect,
-                        &format_ticks(shown),
-                        440.0,
-                        36.0,
-                        16.0,
-                        HUD_ORANGE,
-                    );
-                    self.text(
-                        &mut out,
-                        aspect,
-                        if num_laps >= 99 { "time" } else { "lap time" },
-                        429.0,
-                        54.0,
-                        10.0,
-                        HUD_GREY,
-                    );
-                    let mut top = String::new();
-                    // 0x432F92: the current lap is `min(car+0xB20 + 1, NUM_LAPS)` — the laps already
-                    // timed, plus one — and 0x432EA3 suppresses the whole counter on a linear track
-                    if num_laps < 99 && !linear {
-                        top += &format!("LAP {}/{}", (r.laps + 1).min(num_laps), num_laps);
-                    }
-                    if dnf {
-                        top += "   DNF";
-                    } else if let Some((p, n)) = position {
-                        top += &format!("   POS {}/{}", p + 1, n);
-                    }
-                    self.text(&mut out, aspect, &top, 504.0, 3.0, 12.0, HUD_ORANGE);
+                    // `HTime` 0x4316F0 shows the **race** time, `clock − 448` (0x431756), plus the
+                    // cone penalty, under FE 18 "time" (0x4317B0) — on every track. This port showed
+                    // the lap time on circuits, labelled "lap time".
+                    let shown = (race_t as i64 + time_penalty).max(0) as u64;
+                    let colour = if time_alert { [1.0, 0.0, 0.0, 0xCC as f32 / 255.0] } else { self.display() };
+                    let n0 = out.len();
+                self.combo_sprites(&mut out, aspect, (427.0, 33.0, 73.0, 35.0), &format_ticks(shown), &text.time_label, colour);
+                Self::slide(&mut out, n0, aspect, (427.0, 33.0, 73.0, 35.0), slide);
                 }
-                // wrong way: centred, orange, blinking 64 frames on / 32 off, and only when
-                // `car+0xD30` is set past tick 448 **outside a mission or a replay** (0x436F70)
-                if r.wrong_way_ticks > 0 && tick > 448 && !mission_or_replay && tick % 96 < 64 {
-                    self.text(
-                        &mut out,
-                        aspect,
-                        "WRONG WAY",
-                        256.0,
-                        230.0,
-                        24.0,
-                        HUD_ORANGE,
-                    );
+                // `HWrongWay` 0x436F70 (the blink state is the caller's, see `wrong_way_blink`)
+                if wrong_way {
+                    self.wrong_way_sprites(&mut out, aspect, &text.wrong_way);
                 }
             }
         }
-        // countdown: digit and rings centred (hud.md §4, H321Go 0x4184F0)
+        // countdown: **H321Go 0x4184F0** (hud.md §4)
         if countdown && tick < RACE_START_TICK {
             let idx = COUNTDOWN_TICKS.iter().rposition(|&t| tick >= t);
             if let Some(i) = idx {
+                // the phase `t = ftol(fmod(clock, 64))` and the step `size = ftol((3t + 3)·5/64)`,
+                // 0…15 (0x418590…0x4185BD)
+                let t = (tick % 64) as i32;
+                let size = ((3 * t + 3) * 5) / 64;
                 if let Some((full, outline)) = self.rings {
-                    // 0x4185D9 / 0x4185F8: the four corner colours are 0x80FAB400 and 0x3FFAB400 —
-                    // the HUD orange at alpha 0x80 and 0x3F, not white
-                    let mut ring =
-                        self.image(aspect, full, 320.0 - 64.0, 240.0 - 64.0, 128.0, 128.0);
-                    ring.color = [HUD_ORANGE[0], HUD_ORANGE[1], HUD_ORANGE[2], 128.0 / 255.0];
-                    out.push(ring);
-                    let mut ring =
-                        self.image(aspect, outline, 320.0 - 64.0, 240.0 - 64.0, 128.0, 128.0);
+                    // 0x4185D3…0x418624: `circleoutline` (+0x4A0) takes 0x80FAB400 and `circlefull`
+                    // (+0x49C) 0x3FFAB400, and `circlefull` is drawn first
+                    let mut ring = self.image(aspect, full, 320.0 - 64.0, 240.0 - 64.0, 128.0, 128.0);
                     ring.color = [HUD_ORANGE[0], HUD_ORANGE[1], HUD_ORANGE[2], 63.0 / 255.0];
                     out.push(ring);
+                    let mut ring = self.image(aspect, outline, 320.0 - 64.0, 240.0 - 64.0, 128.0, 128.0);
+                    ring.color = [HUD_ORANGE[0], HUD_ORANGE[1], HUD_ORANGE[2], 128.0 / 255.0];
+                    out.push(ring);
                 }
-                if let Some(tex) = self.digits[i] {
-                    let h = 106.0;
-                    out.push(self.image(aspect, tex, 320.0 - h * 0.4, 240.0 - h * 0.5, h * 0.8, h));
+                // 0x419C50: two lines through the centre, across and down the whole screen, both
+                // ends 0x80000000 (0x419E90 queues a line)
+                let black = [0.0, 0.0, 0.0, 128.0 / 255.0];
+                out.push(self.quad(aspect, 0.0, 240.0, 640.0, 1.0, black));
+                out.push(self.quad(aspect, 320.0, 0.0, 1.0, 480.0, black));
+                // 0x418670(digit, size): the digit objects' sizes are the table at 0x5CC838 — "1"
+                // 41×55, "2" 44×57, "3" 45×58, outlines "1OL" 44×57, "2OL" 46×59, "3OL" 47×60 —
+                // each placed centred on (320, 240). Digit 0 is "3" (+0x48C), 1 "2", 2 "1".
+                const SOLID: [(f32, f32); 3] = [(45.0, 58.0), (44.0, 57.0), (41.0, 55.0)];
+                const OUTLINE: [(f32, f32); 3] = [(47.0, 60.0), (46.0, 59.0), (44.0, 57.0)];
+                // the constructor's second key table (`+0x204 + 0x14·size`, 0x417D8D…0x417FC4):
+                // the solid digit's scale and its four-corner colour
+                const SCALE: [f32; 16] = [0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 1.0, 1.0, 1.0];
+                const ALPHA: [u8; 16] = [0x80, 0x80, 0x80, 0x80, 0x80, 0x3F, 0x3F, 0x3F, 0x3F, 0x80, 0x80, 0x80, 0xBF, 0xBF, 0x80, 0x80];
+                let white = |a: u32| [1.0, 1.0, 1.0, (a & 0xFF) as f32 / 255.0];
+                let centred = |(w, h): (f32, f32)| (320.0 - (w / 2.0).trunc(), 240.0 - (h / 2.0).trunc(), w, h);
+                let solid = |d: usize| self.digits[d];
+                let outline = |d: usize| self.congrats.outline[2 - d];
+                let s = size as usize;
+                // the solid digit, only while the scale is above 0: `ftol(w·scale)` wide, half of
+                // that (truncated) either side of the centre (0x4186EB…0x4187F9)
+                if SCALE[s] > 0.0
+                    && let Some(tex) = solid(i)
+                {
+                    let (w, h) = SOLID[i];
+                    let (w2, h2) = (((w * SCALE[s]) as i32 / 2) as f32, ((h * SCALE[s]) as i32 / 2) as f32);
+                    let mut sp = self.image(aspect, tex, 320.0 - w2, 240.0 - h2, 2.0 * w2, 2.0 * h2);
+                    sp.color = white(ALPHA[s] as u32);
+                    out.push(sp);
+                }
+                // the previous digit again, at its own rest size, 0x80FFFFFF, while `size ≤ 4`
+                // (0x418804…0x41884F)
+                if i > 0
+                    && size <= 4
+                    && let Some(tex) = solid(i - 1)
+                {
+                    let (x, y, w, h) = centred(SOLID[i - 1]);
+                    let mut sp = self.image(aspect, tex, x, y, w, h);
+                    sp.color = white(0x80);
+                    out.push(sp);
+                }
+                // the outline, `(size << 29) | 0xFFFFFF` (0x418866…0x4188AA)
+                if let Some(tex) = outline(i) {
+                    let (x, y, w, h) = centred(OUTLINE[i]);
+                    let mut sp = self.image(aspect, tex, x, y, w, h);
+                    sp.color = white(((size as u32) << 29) >> 24);
+                    out.push(sp);
+                }
+                // and the previous outline fading, alpha `0x100 / size` in the top byte — 0 for
+                // size 0 and 1 (0x4188B2…0x418905)
+                if i > 0
+                    && let Some(tex) = outline(i - 1)
+                {
+                    let a = if size == 0 { 0x100 } else { 0x100 / size as u32 };
+                    let (x, y, w, h) = centred(OUTLINE[i - 1]);
+                    let mut sp = self.image(aspect, tex, x, y, w, h);
+                    sp.color = white(a);
+                    out.push(sp);
+                }
+                // **the sweep 0x418910(digit, size)**: a fan of sixteen triangles from the screen
+                // centre to the edge, clockwise from twelve o'clock in steps of W/4 along the top and
+                // bottom and H/4 down the sides (the same fan for each digit, 48 records built on the
+                // stack); triangles `16·digit … 16·digit + size` are drawn in 0x33000000 (0x419C13…
+                // 0x419C34, 0x466100) — the dark wedge grows round the screen through the second
+                const EDGE: [(f32, f32); 17] = [
+                    (320.0, 0.0), (480.0, 0.0), (640.0, 0.0), (640.0, 120.0), (640.0, 240.0), (640.0, 360.0),
+                    (640.0, 480.0), (480.0, 480.0), (320.0, 480.0), (160.0, 480.0), (0.0, 480.0), (0.0, 360.0),
+                    (0.0, 240.0), (0.0, 120.0), (0.0, 0.0), (160.0, 0.0), (320.0, 0.0),
+                ];
+                let pt = |(x, y): (f32, f32)| Self::place(aspect, x, y, 0.0, 0.0).0;
+                for k in 0..=s.min(15) {
+                    let mut sp = self.quad(aspect, 0.0, 0.0, 0.0, 0.0, [0.0, 0.0, 0.0, 0x33 as f32 / 255.0]);
+                    sp.tri = Some([pt((320.0, 240.0)), pt(EDGE[k]), pt(EDGE[k + 1])]);
+                    out.push(sp);
                 }
             }
         }
         out
     }
+}
+
+/// The shared state of the race HUD's `+4` trays (the factory 0x424460 gives every tray the byte
+/// `+4` = 1; the map and the mirror `+5` too): `state` 0 hidden, 1 sliding in, 2 sliding out, 3 in
+/// place, `t` the `[0x606AC8]` ticks since the transition began.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TraySlide {
+    state: u8,
+    t: i32,
 }
 
 /// `0x5B8B18` — the model-group letter the chronicle's file names use, indexed by the group at
@@ -1134,7 +2331,9 @@ impl App {
         let (_, key, options) = CHOICE_ACCESSORS.iter().find(|(n, _, _)| *n == name)?;
         let v = match self.choices.get(Self::choice_slot(name, key)) {
             Some(v) => *v,
-            None => self.registry.u32(key, 0) as usize,
+            // a Display option `fe.txt` does not carry keeps its `nfs5-2.hud` Config 1 default
+            // (hud.md §2) — only `gear` is missing from the shipped file, and its default is 1
+            None => self.registry.u32(key, if *key == "gear" { 1 } else { 0 }) as usize,
         };
         Some((v.min(options.len() - 1), options))
     }
@@ -1555,6 +2754,27 @@ struct App {
     /// Seconds since the previous frame (camera low-pass time constants).
     frame_dt: f32,
     paused: bool,
+    /// 64 Hz ticks of wall time since the pause began. `[0x606AC8]` — the counter the HUD and the
+    /// dialogs animate on — is advanced by one per pass of the frame driver's tick loop until it
+    /// reaches the clock `[0x5E99B8]` (0x415B3E…0x415B4D; snapped when more than 16 behind,
+    /// 0x4154D4…0x4154E9), and the pause only raises `[0x606A98]` (0x415819…0x415824) inside that
+    /// loop, so the counter runs on while paused. This port's tick stops, so the pause dialogs add
+    /// this to it.
+    pause_ticks: f64,
+    /// the pauses so far folded in, so `tick + pause_offset + pause_ticks` is a clock that, like
+    /// `[0x606AC8]`, never runs back when a pause ends
+    pause_offset: f64,
+    /// the race HUD trays' slide: state and the `[0x606AC8]` stamp of its last transition
+    tray_slide: (u8, u64),
+    /// whether the audio has been put into its pause state (0x4AB150 / 0x4AB200)
+    audio_paused: bool,
+    /// The results page whose billboard is open (not closing) this frame, set by `rebuild_scene`.
+    results_billboard: Option<u32>,
+    /// Which billboard is up: 0 none, 1 the pause menu, 2 its quit question, 10 + page a results
+    /// page. `HBillBoard`'s state setter 0x41ADD0 plays the front end's sound 4 (0x4AADB0) on
+    /// entering state 1 (opening, 0x41ADFA) and state 2 (closing, 0x41AE0E), so every change of
+    /// this key is one of those.
+    billboard_key: u32,
     knockout: Option<KnockoutSeries>,
     player_grid_override: Option<u32>,
     /// Drive the track backwards (`REVERSE`): `_bstart` scene, reversed slice route, `<track>1.lsp`.
@@ -1583,9 +2803,38 @@ struct App {
     detail: f32,
     /// `SPLITTIMES` (`[0x657DD8]`): 1 record lap, 2 best lap, 3 last lap — circuits only; the
     /// record time is always shown on point-to-point tracks (`HRecordTime` 0x42A200, hud.md §6.3).
-    split_times: u8,
     records_path: std::path::PathBuf,
     record_done: bool,
+    /// The post-race records table (`HTrackRecords`, `nfs_game::records::hud_records`), built when
+    /// the player's time goes in; `None` when the race has none to show.
+    hud_records: Option<nfs_game::records::HudRecords>,
+    /// `HPauseMenu` 0x42A440: the highlighted button — 0 continue, 1 race again, 2 quit
+    pause_sel: u8,
+    /// `(tick, place)` when the player crossed the line — the first `HCongrats` (0x60CA64) opens
+    /// then with the race place (0x426D54) and closes itself past 0xC0 ticks (0x41D364)
+    finish_mark: Option<(u64, usize)>,
+    /// The mission's verdict and result text, fixed once at the race end as
+    /// `HMissionSummary::evaluate` 0x4293F0 does
+    mission_result: Option<(bool, Option<u32>)>,
+    /// `HTime +0xE0`: set to 16 on a cone hit (0x431830) and counted down per update; this port
+    /// counts ticks (APPROXIMATION — the original counts HUD updates, i.e. frames)
+    cone_flash_until: u64,
+    /// the tick the current post-race page opened
+    results_page_tick: u64,
+    /// the quit confirmation (`HYesNoOverlay`, 0x426154) when it is up: 0 yes, 1 no
+    pause_confirm: Option<u8>,
+    /// Index into [`App::result_pages`] of the page that is up. 0x427273 queues `HRaceSummary` and
+    /// then `HTrackRecords` (0x4272FF) for game types 0, 1, 2 and 5; 0x426DF9 queues the summary,
+    /// `HTournamentStandings` and the records for a tournament; the next opens when the one before
+    /// closes.
+    results_page: u8,
+    /// the post-race page the billboard animation last counted, its frames since it opened, and
+    /// the tick it opened at (`HBillBoard +0x11C`, stamped by setState(1) at 0x41ADF4)
+    page_seen: Option<u8>,
+    page_frames: u32,
+    page_open_tick: Option<u64>,
+    /// frames the page on top has been shrinking for (`HBillBoard` state 2)
+    page_closing: Option<u32>,
     /// Every racer's body-damage total at the start, `[0x60C9C8 + i·4]` — taken by the HUD's
     /// race-start arm 0x426A80(0) and judged against at the finish (`career::clean_race`).
     /// Index 0 is the player, `i + 1` opponent `i`.
@@ -1657,6 +2906,20 @@ struct App {
     num_opponents: u32,
     player_grid: u32,
     player_progress_tick: u64,
+    /// `car+0xB54` per racer (player first): metres covered, `fistp(min(car+0xAF8, NUM_LAPS) ·
+    /// [[0x628BC0]+4] · 6.0)` — refreshed only when `gGameTick % 64 == 1` and there is more than
+    /// one racer (0x417010…0x4170A2); `HPosition`'s distance / time gaps are taken from it
+    hud_metres: Vec<i32>,
+    /// The rear-view mirror's camera for this frame (AUDIT §O), and the texture it renders into.
+    rear_mirror: Option<Camera>,
+    mirror_tex: Option<TextureId>,
+    /// `HWrongWay`'s blink: `+0x14` ticks counted, `+0x18` the tick of the last draw, `+0x24`
+    /// visible. Every draw adds the ticks since the last one, and the visible half flips off once
+    /// the count passes 64, the hidden half back on once it passes 32, the count restarting
+    /// (0x436F86…0x436FBD). Only the HUD reset 0x426A80 → 0x436F60 zeroes it (visible, 0, 0) —
+    /// nothing does when the car turns round — so the first draw after a reset, at a tick past
+    /// 448, flips straight to hidden. This port blinked on `tick % 96 < 64`.
+    wrong_way_blink: (u64, u64, bool),
     /// `--record path`: per-32Hz-tick CSV of controls and vehicle state (regression fixtures)
     record: Option<std::io::BufWriter<std::fs::File>>,
     num_laps: u32,
@@ -1665,11 +2928,22 @@ struct App {
     car_half_width: f32,
     cam_dir: Vec3,
     cam_y: f32,
+    /// The chase camera's slot state (0x461E80): the eye's offset from the car `+0x08`, the view it
+    /// was built for, and the `+0xC1` settle count SetSlotView starts at 0x32 (0x465848).
+    chase_offset: Option<(Vec3, u16)>,
+    chase_settle: u8,
+    /// The bumper / driver slot's look-around yaw `+0xC6` in degrees (0x4611C0,
+    /// `camera::look_step`) and the view it belongs to; a view switch starts it again at 0
+    /// (SetSlotView 0x4658B2).
+    look_yaw: Option<(i16, u16)>,
+    /// The chase / heli slot's eye `+0x24` as its update left it (before the build's clamps, which
+    /// work on a copy, 0x4651BF…0x4651DB) — the "old eye" of the next update's ceiling test.
+    slot_eye: Option<Vec3>,
     wall_hits: u32,
     resets: u32,
     hud: Option<Hud>,
     /// current car's HUD dial records (km/h, tach) from `nfs5.car`
-    dials: Option<(nfs_formats::fedata::DialSpec, nfs_formats::fedata::DialSpec)>,
+    dials: Option<(nfs_formats::fedata::DialSpec, nfs_formats::fedata::DialSpec, nfs_formats::fedata::DialSpec)>,
     /// player body paint (catalogue set 0 by default)
     paint: [u8; 3],
     /// everything that makes a sound — see [`AudioState`]
@@ -4239,6 +5513,25 @@ impl App {
 
     fn simulate(&mut self) {
         self.tick += 1;
+        if self.race.as_ref().is_some_and(|r| r.finished)
+            && let Some(page) = self.result_pages().get(self.results_page as usize).copied()
+            && let (Some(limit), Some(t0)) = (Self::page_timeout(page), self.page_open_tick)
+            && self.page_seen == Some(self.results_page)
+            && self.tick.saturating_sub(t0) > limit
+        {
+            self.page_open_tick = None;
+            self.close_results_page();
+        }
+        if self.tick % 64 == 1
+            && !self.road.opponents.is_empty()
+            && let Some(t) = &self.slices
+        {
+            let laps = self.num_laps as f32;
+            let m = |p: f32| (p.min(laps) * t.lap_len as f32 * 6.0).round_ties_even() as i32;
+            self.hud_metres = std::iter::once(self.race.as_ref().map_or(0, |r| m(r.progress)))
+                .chain(self.road.opponents.iter().map(|o| m(o.progress.progress)))
+                .collect();
+        }
         // the track's particle systems run on the 64 Hz clock (0x4689C0 → 0x4551E0)
         if self.track_particles.is_none()
             && !self.track_particle_defs.is_empty()
@@ -4518,6 +5811,7 @@ impl App {
                         } => {
                             self.world_actions
                                 .push(WorldAction::Knock(element, away, launch));
+                            self.cone_flash_until = self.tick + 16;
                             if let (Some(a), Some(s)) = (&self.snd.audio, self.snd.sfx.as_mut()) {
                                 s.pylon_hit(a, 0.8);
                             }
@@ -5355,12 +6649,23 @@ impl App {
                 }
                 if r.finished && !was_finished {
                     tracing::info!(place, n_cars, "race finished");
+                    self.finish_mark = Some((self.tick, place));
                     // `MusicPlay("win*"|"lose*", 1)` — only in a race with opponents, `win*` iff first
                     // (`engine-audio.md` §8.3); the jingle is appended to the playlist and plays loud
+                    // (a mission plays its own, by the verdict — 0x4295B8 / 0x4295E8)
                     if n_cars > 1
+                        && self.mission.is_none()
                         && let (Some(a), Some(m)) = (&self.snd.audio, self.snd.music.as_mut())
                     {
                         m.play_pattern(a, if place == 1 { "win*" } else { "lose*" }, 1);
+                    }
+                    // the finale's queue says **kWon996Turbo** `Bon-youwonboncar` (0x4A6680, id 160)
+                    // with the "won" notice, outside a replay (0x42722F…0x427245)
+                    if place == 1
+                        && self.career.as_ref().and_then(|c| c.pending.as_ref()).is_some_and(|p| p.finale)
+                        && let (Some(a), Some(sp)) = (&self.snd.audio, &self.snd.speech)
+                    {
+                        sp.say(a, "Bon-youwonboncar.bnk", 0.9);
                     }
                 }
                 // track records (modes.md §6): player's total time on point-to-point tracks, best
@@ -5386,6 +6691,14 @@ impl App {
                     } as u32;
                     let car_name = self.specs.name.clone();
                     let driver = self.player_name.clone();
+                    // the HUD's own copy, from the table as it stood before this race (0x433A20)
+                    if let Some(t) = self.records.track(&self.track.name) {
+                        let total = r.lap_times.iter().sum::<u64>() as u32;
+                        let best = r.lap_times.iter().copied().min().unwrap_or(0) as u32;
+                        self.hud_records = Some(nfs_game::records::hud_records(
+                            &t.entries, !circuit, &driver, &car_name, total, best,
+                        ));
+                    }
                     if let Some(rank) =
                         self.records
                             .insert(&self.track.name, &driver, &car_name, time)
@@ -5469,9 +6782,6 @@ impl App {
                 {
                     self.camera_mode = (self.camera_mode + 1) % n;
                 }
-            }
-            if self.input.take_pressed(Action::SplitTimes) {
-                self.split_times = self.split_times % 3 + 1;
             }
             self.input.end_tick();
         }
@@ -6548,7 +7858,7 @@ impl App {
             let Some(r) = self.renderer.as_mut() else {
                 return;
             };
-            rendered.push((slot, r.render_offscreen(&scene, &camera, w, h, reuse)));
+            rendered.push((slot, r.render_offscreen(&scene, &camera, w, h, reuse, None)));
         }
         if let Some(l) = self.fe.layout_preview.as_mut() {
             for (slot, tex) in rendered {
@@ -6815,6 +8125,11 @@ impl App {
     }
 
     /// The view the camera is on, by the original's ids (`nfs_game::camera`).
+    /// `Graphics.WideScreen` on (`[0x657D5C]`, `camera::WIDESCREEN_BAND`).
+    fn widescreen(&self) -> bool {
+        self.choice_index("Graphics.WideScreen").is_some_and(|(i, _)| i == 1)
+    }
+
     fn camera_view(&self) -> u16 {
         if let Some(v) = self.replay_view() {
             return v;
@@ -6850,7 +8165,25 @@ impl App {
         self.track_cameras.as_ref().is_some_and(|t| !t.cameras.is_empty())
     }
 
+    /// The mirror's view (AUDIT §O), rendered before the frame into its own texture at the tray's
+    /// 240 × 84 on the window's scale, cleared 0xFF77BBFF.
+    fn render_mirror(&mut self) {
+        if let (Some(cam), Some(r)) = (self.rear_mirror, self.renderer.as_mut()) {
+            let k = r.size().1 as f32 / HUD_REF_H;
+            let (w, h) = ((240.0 * k).round() as u32, (84.0 * k).round() as u32);
+            let sky = [0x77 as f64 / 255.0, 0xBB as f64 / 255.0, 1.0, 1.0];
+            self.mirror_tex = Some(r.render_offscreen(&self.scene, &cam, w, h, self.mirror_tex, Some(sky)));
+        }
+    }
+
+    /// The trays' slide as this frame left it (`tray_slide`, stepped in `rebuild_scene`).
+    fn tray_slide_now(&self) -> TraySlide {
+        let clock = (self.tick as f64 + self.pause_offset + self.pause_ticks) as u64;
+        TraySlide { state: self.tray_slide.0, t: clock.saturating_sub(self.tray_slide.1).min(1 << 20) as i32 }
+    }
+
     fn rebuild_scene(&mut self) {
+        self.fix_mission_result();
         // the port's own overlays lay their text out in screen units, so the fonts need to know
         // what shape the window is (the HUD and the front end place glyphs in 640×480 themselves)
         let a = self
@@ -6858,8 +8191,10 @@ impl App {
             .as_ref()
             .map(|r| r.aspect())
             .unwrap_or(HUD_REF_W / HUD_REF_H);
-        if let Some(f) = self.hud.as_mut().and_then(|h| h.font.as_mut()) {
-            f.set_aspect(a);
+        if let Some(h) = self.hud.as_mut() {
+            for f in [&mut h.font, &mut h.font_small, &mut h.font_italic].into_iter().flatten() {
+                f.set_aspect(a);
+            }
         }
         if let Some(f) = self.fe.menu.as_mut().and_then(|m| m.font.as_mut()) {
             f.set_aspect(a);
@@ -6901,23 +8236,92 @@ impl App {
             .as_ref()
             .map(|r| r.aspect())
             .unwrap_or(HUD_REF_W / HUD_REF_H);
-        if let (Some(h), Some(v)) = (&self.hud, &self.vehicle) {
-            let position = if self.road.opponents.is_empty() {
-                None
-            } else {
-                // rank the player among the opponents by progress (ties: earlier progress tick)
-                let mut better = 0;
-                if let Some(r) = &self.race {
-                    for o in &self.road.opponents {
-                        if o.progress.progress > r.progress
-                            || (o.progress.progress == r.progress
-                                && o.last_progress_tick < self.player_progress_tick)
-                        {
-                            better += 1;
-                        }
-                    }
+        // `HWrongWay` is drawn only while `car+0xD30` is set past tick 448, outside a mission and
+        // a replay (0x436F70's callers); each draw steps its blink
+        let wrong_way = {
+            let playing = self.replay.stream.as_ref().is_some_and(|r| r.mode == nfs_game::replay::Mode::Playing);
+            let up = self.race.as_ref().is_some_and(|r| !r.finished && r.wrong_way_ticks > 0)
+                && self.tick > 448
+                && self.mission.is_none()
+                && !playing;
+            if up {
+                let (count, last, visible) = &mut self.wrong_way_blink;
+                *count += self.tick.saturating_sub(*last);
+                if (*visible && *count > 0x40) || (!*visible && *count > 0x20) {
+                    *visible = !*visible;
+                    *count = 0;
                 }
-                Some((better, self.road.opponents.len() + 1))
+                *last = self.tick;
+            }
+            up && self.wrong_way_blink.2
+        };
+        let mut finish_close = false;
+        if let (Some(h), Some(v)) = (&self.hud, &self.vehicle) {
+            h.display.set(Hud::display_colour(self.choice_index("Display.DispCols").map_or(0, |(i, _)| i)));
+            h.boxes.set(self.choice_index("Display.Translucency").is_none_or(|(i, _)| i == 0));
+            // `HPosition` 0x42B000 — only with `OPPONENTLIST` on (0x41E880), never in a replay
+            // (0x42B010), and like every racing tray only while the race is on. The port used to
+            // print "POS p/N" (or "DNF") in the top tray instead.
+            let opp_mode = self.choice_index("Display.OppList").map_or(0, |(i, _)| i);
+            let playing_back = self
+                .replay
+                .stream
+                .as_ref()
+                .is_some_and(|r| r.mode == nfs_game::replay::Mode::Playing);
+            let opp_list = if opp_mode != 0
+                && !playing_back
+                && !self.road.opponents.is_empty()
+                && let Some(r) = self.race.as_ref().filter(|r| !r.finished)
+            {
+                let (order, _) = self.finishing_order();
+                let metres = |d: usize| self.hud_metres.get(d).copied().unwrap_or(0);
+                let p_speed = v.horizontal_speed();
+                let mut rows = Vec::new();
+                for &d in &order {
+                    let (progress, eliminated, name, paint, speed) = if d == 0 {
+                        (r, self.player_eliminated, self.player_name.clone(), self.paint, p_speed)
+                    } else {
+                        let o = &self.road.opponents[d - 1];
+                        let paint = self.road.opponent_paints.get(d - 1).copied().unwrap_or([0x20, 0x40, 0xC0]);
+                        (&o.progress, o.eliminated, o.name.clone(), paint, o.vehicle.horizontal_speed())
+                    };
+                    // Quick Knockout (game type 1) drops the knocked-out cars from the list and
+                    // closes it up (0x42B04E…0x42B06C, 0x42B1C9…0x42B1E0)
+                    if self.quick_knockout && eliminated {
+                        continue;
+                    }
+                    let gap = metres(d) - metres(0);
+                    let value = if progress.finished && !eliminated {
+                        // state 2: the car's race time (0x42B33A…0x42B34C)
+                        format_ticks(progress.lap_times.iter().sum())
+                    } else if opp_mode == 1 {
+                        // "position": the gap in metres, "-----" when level (0x42B39D…0x42B3E4)
+                        if gap != 0 { gap.to_string() } else { "-----".to_string() }
+                    } else {
+                        // "time": the gap over the faster-ish of the two speeds — the leader's own,
+                        // or half the other's (0x42B420…0x42B458), signed; "-----" when level or
+                        // while the player is at 13.39 m/s or less (0x42B45B)
+                        let vv = if gap > 0 { p_speed.max(0.5 * speed) } else { speed.max(0.5 * p_speed) };
+                        if p_speed > 13.39 && gap != 0 {
+                            let t = ((gap * 64) as f32 / vv).round_ties_even() as i64;
+                            format!("{}{}", if t >= 0 { "+" } else { "-" }, format_ticks(t.unsigned_abs()))
+                        } else {
+                            "-----".to_string()
+                        }
+                    };
+                    let colour = [paint[0] as f32 / 255.0, paint[1] as f32 / 255.0, paint[2] as f32 / 255.0, 1.0];
+                    rows.push((d, colour, name, value));
+                }
+                // rows are laid out by live position among the cars still listed
+                let listed: Vec<_> = rows
+                    .into_iter()
+                    .enumerate()
+                    .map(|(k, (d, c, n, val))| (d, (k, c, n, val)))
+                    .collect();
+                let place = listed.iter().position(|(d, _)| *d == 0).map_or(0, |k| k + 1);
+                Some((listed.into_iter().map(|(_, r)| r).collect::<Vec<_>>(), place))
+            } else {
+                None
             };
             let in_replay_now = self
                 .replay
@@ -6925,21 +8329,155 @@ impl App {
                 .as_ref()
                 .map(|r| r.mode == nfs_game::replay::Mode::Playing)
                 .unwrap_or(false);
+            let (time_penalty, time_alert) = match (&self.mission, &self.skill) {
+                (Some(ms), Some(sk)) => {
+                    let per = match ms.mission.cone_rule {
+                        Some(nfs_formats::career::ConeRule::PenaltySeconds(s)) => s as i64,
+                        _ => -1,
+                    };
+                    let over = nfs_game::skill::damage_over_limit(&ms.mission, &v.damage);
+                    (sk.cones_knocked() as i64 * per * 64, over || self.tick < self.cone_flash_until)
+                }
+                (Some(ms), None) => (0, nfs_game::skill::damage_over_limit(&ms.mission, &v.damage)),
+                _ => (0, false),
+            };
+            let fe = |id: u32| self.fe.strings.get(id).unwrap_or_default().to_string();
+            // `HSpeed` 0x42E593: `SPEEDUNITS [0x657DC0]` 0 → `_ftol(car+0xEC4 · 3.6)` under FE 11,
+            // otherwise `· 2.2374139` under FE 20; "00" below 10, "0" below 100 (0x42E5E9…0x42E656),
+            // and "000" outright below 1 m/s (0x42E66D). This port always showed km/h, and "001"…"003"
+            // where the original shows "000".
+            let mph = self.choice_index("Display.SpeedUnits").is_some_and(|(i, _)| i != 0);
+            let ms = v.speed();
+            let text = HudText {
+                speed: if ms < 1.0 {
+                    "000".to_string()
+                } else {
+                    format!("{:03}", (ms * if mph { 2.237_413_9 } else { 3.6 }) as i32)
+                },
+                speed_label: fe(if mph { 20 } else { 11 }),
+                gear: match v.gear {
+                    0 => fe(18145),
+                    1 => fe(18146),
+                    g @ 2..=8 => (g - 1).to_string(),
+                    _ => fe(18146),
+                },
+                gear_label: fe(10),
+                time_label: fe(18),
+                wrong_way: fe(18159),
+                speedometer: self.choice_index("Display.Speedometer").map_or(2, |(i, _)| i),
+                tachometer: self.choice_index("Display.Tach").map_or(2, |(i, _)| i),
+                // `fe.txt` has no `gear` line, so `GEAR [0x657DF0]` keeps the `nfs5-2.hud` Config 1
+                // default, 1 (hud.md §2) — `choice_index` answers that default too
+                gear_on: self.choice_index("Display.Gear").is_some_and(|(i, _)| i == 1),
+                rpm_label: fe(18144),
+                tach_scale: {
+                    let r = self.specs.redline as i32;
+                    if r != 0 { (r - 750) as f32 / r as f32 } else { 1.0 }
+                },
+            };
+            // "wide screen" (0x4259B2 → 0x427B00): two opaque black bars over the full width,
+            // `ftol(H·0.15 + 2)` high at the top and from `H − that` at the bottom, drawn under the
+            // HUD elements (0x41A330 follows)
+            if self.widescreen() {
+                // in screen pixels, then back into the 640 × 480 design space
+                let sh = self.renderer.as_ref().map_or(HUD_REF_H, |r| r.size().1 as f32);
+                let b = (sh * 0.15 + 2.0).trunc() * HUD_REF_H / sh;
+                let black = [0.0, 0.0, 0.0, 1.0];
+                let mut bars = vec![h.quad(hud_aspect, -HUD_REF_W, 0.0, 3.0 * HUD_REF_W, b, black)];
+                bars.push(h.quad(hud_aspect, -HUD_REF_W, HUD_REF_H - b, 3.0 * HUD_REF_W, b, black));
+                self.scene.sprites.extend(bars);
+            }
+            // **The trays' slide** (0x425950): the `+4` trays are drawn only past clock 0x1C0 (448,
+            // 0x425A29 / 0x425BAB); with the billboard queue `[0x60C9C4]` empty and the clock past 448,
+            // 0x425E20(0) puts every tray still in state 0 into state 1 (0x425CCA…0x425CE2, 0x425ED8),
+            // and while a billboard is queued every tray in state 3 gets state 2 (0x425C86…0x425CC0).
+            // A transition stamps `[0x606AC8]` (0x434490) and runs 11 ticks (slot 14, 0x4349F0).
+            let slide = {
+                let clock = (self.tick as f64 + self.pause_offset + self.pause_ticks) as u64;
+                let (mut st, mut stamp) = self.tray_slide;
+                if self.tick <= RACE_START_TICK {
+                    st = 0;
+                } else if self.billboard_key != 0 {
+                    if st == 3 {
+                        (st, stamp) = (2, clock);
+                    }
+                } else if st == 0 {
+                    (st, stamp) = (1, clock);
+                }
+                let t = clock.saturating_sub(stamp).min(1 << 20) as i32;
+                if t >= 11 {
+                    st = match st {
+                        1 => 3,
+                        2 => 0,
+                        x => x,
+                    };
+                }
+                self.tray_slide = (st, stamp);
+                TraySlide { state: st, t }
+            };
             self.scene.sprites.extend(h.sprites(
                 hud_aspect,
-                v.speed() * 3.6,
+                // `HSpeedometer`: `speed · 3.6` or `· 2.237` by `SPEEDUNITS` (`hud.md` §3.3)
+                v.speed() * if mph { 2.237_413_9 } else { 3.6 },
                 v.rpm,
                 self.tick,
-                v.gear,
                 self.race.as_ref(),
-                self.num_laps,
-                !self.records.track(&self.track.name).map(|t| t.circuit).unwrap_or(true),
-                self.mission.is_some() || in_replay_now,
                 // no countdown in a replay or in one of the three test drives (0x4184FC…0x41850E)
                 !in_replay_now && self.fe.test_drive.is_none(),
-                self.player_eliminated,
-                position,
+                time_penalty,
+                time_alert,
+                &text,
+                wrong_way,
+                slide,
             ));
+            // `HGraphicDamage` with `Display.Damage` on its first choice (0x41E8B0 `== 1`), while the
+            // racing trays are up
+            if self.choice_index("Display.Damage").is_some_and(|(i, _)| i == 1)
+                && self.race.as_ref().is_some_and(|r| !r.finished)
+            {
+                let over = self.mission.as_ref().is_some_and(|ms| nfs_game::skill::damage_over_limit(&ms.mission, &v.damage));
+                let fe = |id: u32| self.fe.strings.get(id).unwrap_or_default().to_string();
+                let mut dmg = Vec::new();
+                h.damage_sprites(&mut dmg, hud_aspect, &v.damage, ["0%", "100%", &fe(12)], over);
+                Hud::slide(&mut dmg, 0, hud_aspect, (0.0, 0.0, 127.0, 105.0), slide);
+                self.scene.sprites.extend(dmg);
+            }
+            // `HTextDamage` with `Display.Damage` on "bar graph" or "percentages" (0x41E8D0 `== 2 ||
+            // (== 3 && [0x60C970])` — the "HUD is live" flag is not modelled), while racing
+            if let Some((mode @ (2 | 3), _)) = self.choice_index("Display.Damage")
+                && self.race.as_ref().is_some_and(|r| !r.finished)
+            {
+                let over = self.mission.as_ref().is_some_and(|ms| nfs_game::skill::damage_over_limit(&ms.mission, &v.damage));
+                let fe = |id: u32| self.fe.strings.get(id).unwrap_or_default().to_string();
+                let values = [
+                    v.engine_wear(&self.specs) as i32,
+                    v.steering_damage() as i32,
+                    v.body_damage() as i32,
+                    v.suspension_wear(&self.specs) as i32,
+                ];
+                let mut dmg = Vec::new();
+                h.text_damage_sprites(&mut dmg, hud_aspect, values, [&fe(13), &fe(14), &fe(15), &fe(16), &fe(12)], mode == 3, over);
+                Hud::slide(&mut dmg, 0, hud_aspect, (0.0, 0.0, 124.0, 100.0), slide);
+                self.scene.sprites.extend(dmg);
+            }
+            // `HRearview` (draw 0x42C740): the 240 × 84 tray at (185, 0) with the mirror's view filling
+            // it (0x42C510 / 0x42C680 hand 0x4691D0 the tray's own rectangle)
+            if self.rear_mirror.is_some()
+                && let Some(tex) = self.mirror_tex
+            {
+                let mut m = Vec::new();
+                h.tray(&mut m, hud_aspect, 185.0, 0.0, 240.0, 84.0);
+                m.push(h.image(hud_aspect, tex, 185.0, 0.0, 240.0, 84.0));
+                Hud::slide(&mut m, 0, hud_aspect, (185.0, 0.0, 240.0, 84.0), slide);
+                self.scene.sprites.extend(m);
+            }
+            if let Some((rows, place)) = &opp_list {
+                let mut list = Vec::new();
+                let label = self.fe.strings.get(17).unwrap_or_default().to_string();
+                h.opponent_list_sprites(&mut list, hud_aspect, rows, *place, &label);
+                Hud::slide(&mut list, 0, hud_aspect, (502.0, 1.0, 138.0, (rows.len() as f32 + 1.0) * 15.0 + 4.0), slide);
+                self.scene.sprites.extend(list);
+            }
             // `HReplay` is up for as long as the stream is playing (`hud.md` §5.2)
             if let Some(r) = &self.replay.stream
                 && r.mode == nfs_game::replay::Mode::Playing
@@ -6948,15 +8486,19 @@ impl App {
                 h.replay_bar(&mut bar, hud_aspect, self.paused, self.replay.speed);
                 self.scene.sprites.extend(bar);
             }
-            // the original's blip loop walks the whole racer list (0x433328), so traffic is on the map too
+            // the blip loop 0x433110 walks every car (`[0x5E8B58]` of them) but skips one with neither
+            // `car+0x52C` bit 0 (a racing car — the player and the opponents) nor bit 0x20 (a cop), so
+            // **no traffic** is on the map (0x43312B…0x433142); this port drew the traffic too
             let tick = self.tick;
-            let mut others: Vec<(Vec3, [f32; 4])> = self
+            let mut others: Vec<(Vec3, Vec3, [f32; 2], [f32; 4])> = self
                 .road.opponents
                 .iter()
                 .enumerate()
                 .map(|(i, o)| {
                     (
                         o.vehicle.position,
+                        o.vehicle.forward(),
+                        [o.vehicle.half_extents.x, o.vehicle.half_extents.z],
                         Hud::blip_color(
                             self.road.opponent_paints
                                 .get(i)
@@ -6972,28 +8514,11 @@ impl App {
                 p.cars.iter().filter(|c| c.active).map(|c| {
                     (
                         c.position,
+                        c.orientation.row(2),
+                        [c.half_extents.x, c.half_extents.z],
                         Hud::blip_color([0xE0, 0xE0, 0xE0], c.lights, tick),
                     )
                 })
-            }));
-            others.extend(self.road.traffic.iter().flat_map(|tr| {
-                tr.cars
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| c.active)
-                    .map(|(i, c)| {
-                        (
-                            c.position,
-                            Hud::blip_color(
-                                self.road.traffic_paints
-                                    .get(i)
-                                    .copied()
-                                    .unwrap_or([0x8C, 0x8C, 0x90]),
-                                false,
-                                tick,
-                            ),
-                        )
-                    })
             }));
             // 0x432A61: the track map is **not drawn in a replay** — the gate returns at once when
             // `REPLAY [0x657424]` is 2 or 3 (`modes.md` §`0x657424`, `hud.md` §5). The two debug
@@ -7004,12 +8529,82 @@ impl App {
                 .as_ref()
                 .map(|r| r.mode == nfs_game::replay::Mode::Playing)
                 .unwrap_or(false);
-            if !in_replay {
+            // HTrackMap draws only while `MAP != 0` (0x432A8B → 0x41E7A0); its "rotating" / "static" /
+            // "radar" modes are not carried (AUDIT §P)
+            if !in_replay && self.choice_index("Display.Map").is_none_or(|(i, _)| i != 0) {
                 let mut map = Vec::new();
-                h.map_sprites(&mut map, hud_aspect, v.position, &others);
+                // 0x432F92: the current lap is `min(car+0xB20 + 1, NUM_LAPS)` — the laps already
+                // timed, plus one — and 0x432EA3 suppresses the whole counter on a linear track.
+                // This port printed it as "LAP n/N" in the top-right tray.
+                let linear = !self.records.track(&self.track.name).map(|t| t.circuit).unwrap_or(true);
+                let lap_label = self.fe.strings.get(19).unwrap_or_default().to_string();
+                let lap = self
+                    .race
+                    .as_ref()
+                    .filter(|r| !r.finished && self.num_laps < 99 && !linear)
+                    .map(|r| (lap_label.as_str(), format!("{}/", (r.laps + 1).min(self.num_laps)), self.num_laps.to_string()));
+                // MAP 1 "rotating" and 3 "radar" turn the view (0x4336BF / 0x4336B9 → 0x433440): by
+                // the car's heading, or in radar mode by its slice's direction; 2 "static" does not
+                let map_mode = self.choice_index("Display.Map").map_or(1, |(i, _)| i);
+                let heading = match map_mode {
+                    1 => Some((v.forward().x, v.forward().z)),
+                    3 => self
+                        .slices
+                        .as_ref()
+                        .zip(self.race.as_ref())
+                        .and_then(|(t, r)| t.slices.get(r.slice))
+                        .map(|sl| (sl.forward.x, sl.forward.z)),
+                    _ => None,
+                };
+                // the zoom 0x41E9C0: base 0 / 0 / 33 / 66 / 100 by MAPSCALE, then `· 4.15 + 185`, or
+                // `· 0.15 + 5` in radar mode; 600 (= 0x41EA40) is the whole-track view
+                let base = [0.0f32, 0.0, 33.0, 66.0, 100.0][self.choice_index("Display.MapScale").map_or(4, |(i, _)| i.min(4))];
+                let zoom = if map_mode == 3 { base * 0.15 + 5.0 } else { base * 4.15 + 185.0 };
+                let follow = (zoom != 600.0).then_some((v.position.x, v.position.z, zoom));
+                if let Some(r) = self.renderer.as_mut() {
+                    h.map_update(r, heading, map_mode != 3, follow);
+                }
+                // the player is one of the racers the loop walks: its blip is its own paint too
+                others.push((v.position, v.forward(), [v.half_extents.x, v.half_extents.z], Hud::blip_color(self.paint, false, tick)));
+                let k = if map_mode == 3 { 1.0 } else if zoom == 600.0 { 60.0 } else { 20.0 };
+                h.map_sprites(&mut map, hud_aspect, &others, k, lap);
+                Hud::slide(&mut map, 0, hud_aspect, (0.0, 358.0, MAP_PX as f32, MAP_PX as f32), slide);
                 self.scene.sprites.extend(map);
             }
-            if self.race.as_ref().map(|r| r.finished).unwrap_or(false) {
+            // diagnostic: `NFS_CONGRATS=<place>,<tick>,<0|1 tournament>` draws the `HCongrats`
+            // picture at that point of its timeline, for a `--screenshot` without finishing a race
+            if let Ok(spec) = std::env::var("NFS_CONGRATS") {
+                let v: Vec<u64> = spec.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if let [place, t, tour] = v[..] {
+                    let mut c = Vec::new();
+                    h.congrats_sprites(&mut c, hud_aspect, place as usize, t, tour != 0);
+                    self.scene.sprites.extend(c);
+                }
+            }
+            // diagnostic: `NFS_BILLBOARD=pause|mission|yesno|summary` draws that dialog over the race, for a
+            // `--screenshot` of its layout
+            if let Ok(which) = std::env::var("NFS_BILLBOARD") {
+                let fe = |id: u32| self.fe.strings.get(id).unwrap_or_default().to_string();
+                let mut c = Vec::new();
+                match which.as_str() {
+                    "summary" => {
+                        let rows = vec![
+                            SummaryRow { name: self.player_name.clone(), car: self.specs.name.clone(), colour: [0.83, 0.06, 0.06, 1.0], best: Some(3999), total: Some(8100) },
+                            SummaryRow { name: "Stroller".into(), car: "'94 911 Carrera".into(), colour: [0.2, 0.4, 0.8, 1.0], best: None, total: None },
+                        ];
+                        let head = [fe(18111), fe(18112), fe(18113), fe(18114), fe(18115)];
+                        let bb = Billboard { left: &fe(18129), right: &fe(18130), hints: Some((&fe(18100), Some(&fe(18101)))) };
+                        let ord: Vec<String> = (18116..18124).map(fe).collect();
+                        h.results_sprites(&mut c, hud_aspect, &rows, 0, &bb, &head, &[30.0, 90.0, 140.0, 100.0, 80.0, 60.0], true, true, &ord);
+                    }
+                    "yesno" => h.yes_no_sprites(&mut c, hud_aspect, &Billboard { left: "", right: &fe(18174), hints: None }, [&fe(18171), ""], [&fe(18141), &fe(18142)], 1),
+                    "pause" => h.pause_sprites(&mut c, hud_aspect, &Billboard { left: "", right: &fe(18128), hints: None }, &[fe(18108), fe(18109), fe(18110)], 0),
+                    "mission" => h.mission_summary_sprites(&mut c, hud_aspect, &Billboard { left: &fe(18134), right: &fe(18135), hints: Some((&fe(18100), Some(&fe(18101)))) }, Some(0), &fe(18176), &[fe(18156)], &fe(18109), None),
+                    _ => {}
+                }
+                self.scene.sprites.extend(c);
+            }
+            if self.race.as_ref().map(|r| r.finished).unwrap_or(false) && !self.result_pages().is_empty() {
                 let (order, _) = self.finishing_order();
                 // cars still racing get the original's projected time (Race_finalize 0x416AC0);
                 // eliminated cars (knockout) keep no time at all
@@ -7024,11 +8619,16 @@ impl App {
                 // position is not 1, in which case it is state 3 with **time 0** — no time at all.
                 let ko = self.quick_knockout;
                 let leader = order.first().copied();
-                let row = |d: usize| -> (String, String, Option<u64>, Option<u64>) {
-                    let (name, car, p, elim) = if d == 0 {
+                // the NAME cell is every car's `.DRIVERNAME` (car-info `+0x17C`, 0x42C327…0x42C34E) —
+                // the player's own name too, where this port printed "YOU" — and the CAR cell is
+                // drawn in the car's paint `[[car+0x558]+0x218]` (0x42C3BE…0x42C3DD)
+                let paint = |c: [u8; 3]| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, 1.0];
+                let row = |d: usize| -> SummaryRow {
+                    let (name, car, colour, p, elim) = if d == 0 {
                         (
-                            "YOU".to_string(),
+                            self.player_name.clone(),
                             self.specs.name.clone(),
+                            paint(self.paint),
                             self.race.as_ref(),
                             self.player_eliminated,
                         )
@@ -7037,6 +8637,7 @@ impl App {
                         (
                             o.name.clone(),
                             o.specs.name.clone(),
+                            paint(self.road.opponent_paints.get(d - 1).copied().unwrap_or([0x20, 0x40, 0xC0])),
                             Some(&o.progress),
                             o.eliminated,
                         )
@@ -7049,106 +8650,199 @@ impl App {
                         }
                         _ => None,
                     };
-                    (name, car, laps.iter().copied().min(), total)
+                    SummaryRow { name, car, colour, best: laps.iter().copied().min(), total }
                 };
                 let rows: Vec<_> = order.iter().map(|&d| row(d)).collect();
                 let player = order.iter().position(|d| *d == 0).unwrap_or(0);
                 let mut table = Vec::new();
                 // the headers, the ordinals and the billboard's title come from `FEStrings`
                 let fe = |id: u32| self.fe.strings.get(id).unwrap_or_default().to_string();
-                let head = [fe(18111), fe(18112), fe(18113), fe(18114)];
+                // `HRaceSummary`'s four column sets (0x42BF43…0x42BFED): a tournament event ranked by
+                // points adds POINTS; a point-to-point track (or a network race) drops BEST LAP
+                let points = self.tournament_event().is_some_and(|(t, _)| !t.time_ranked());
+                let (head, widths): (Vec<String>, &[f32]) = match (points, circuit) {
+                    (true, false) => (vec![fe(18111), fe(18112), fe(18114), fe(18115)], &[30.0, 90.0, 140.0, 80.0, 60.0]),
+                    (true, true) => (vec![fe(18111), fe(18112), fe(18113), fe(18114), fe(18115)], &[30.0, 90.0, 140.0, 100.0, 80.0, 60.0]),
+                    (false, true) => (vec![fe(18111), fe(18112), fe(18113), fe(18114)], &[30.0, 90.0, 140.0, 100.0, 80.0]),
+                    (false, false) => (vec![fe(18111), fe(18112), fe(18114)], &[30.0, 90.0, 140.0, 80.0]),
+                };
                 let ordinals: Vec<String> = (18116..18124).map(fe).collect();
+                let (esc, space) = (fe(18100), fe(18101));
                 let title = fe(match self.fe.menu.as_ref().map(|m| m.mode) {
                     Some(1) => 18175,
                     Some(2) => 18169,
                     _ => 18129,
                 });
-                h.results_sprites(&mut table, hud_aspect, &rows, player, &title, &head, &ordinals);
-                self.scene.sprites.extend(table);
-            }
-            if let Some(f) = &h.font {
-                if self.player_eliminated {
-                    self.scene.sprites.extend(f.sprites(
-                        "KNOCKED OUT",
-                        [0.38, 0.22],
-                        0.06,
-                        [1.0, 0.3, 0.2, 1.0],
-                    ));
-                } else if let Some(t) = self.records.track(&self.track.name)
-                    && self.mission.is_none()
-                {
-                    // HRecordTime 0x42A200: point-to-point → the track record; circuits → the
-                    // SPLITTIMES selection (record lap / best lap so far / last lap)
-                    let record = t.entries.first().map(|e| e.time as u64);
-                    let laps = self
-                        .race
-                        .as_ref()
-                        .map(|r| r.lap_times.clone())
-                        .unwrap_or_default();
-                    let (label, value) = if !t.circuit {
-                        ("RECORD", record)
+                let page = self.result_pages().get(self.results_page as usize).copied().unwrap_or(ResultPage::Closed);
+                // the race's own `HCongrats` is the first thing the queue shows (0x426D54), for
+                // game types 0…4 (0x426CCD…0x426CEC, and 0x41D080 skips type 5), places 1–3 and in a
+                // Quick Knockout only the winner (show 0x41DD40); it closes itself past 0xC0 ticks
+                let race_congrats = self.finish_mark.and_then(|(ft, place)| {
+                    let t = self.tick.saturating_sub(ft);
+                    let allowed = self.mission.is_none()
+                        && self.career.as_ref().and_then(|c| c.pending.as_ref()).is_none_or(|p| !p.finale)
+                        && if self.quick_knockout { place == 1 } else { place <= 3 };
+                    (page == ResultPage::Summary && allowed && t <= 0xC0).then_some((place, t))
+                });
+                // the billboard opening (`Hud::billboard`): frames since this page first showed,
+                    // counted only once the race's own `HCongrats` has made way for it
+                let mut closed_now = false;
+                self.results_billboard = None;
+                let billboard_up = race_congrats.is_none() && !matches!(page, ResultPage::Closed | ResultPage::TournamentPlace(_));
+                if billboard_up {
+                    if self.page_seen != Some(self.results_page) {
+                        self.page_seen = Some(self.results_page);
+                        self.page_frames = 0;
+                        self.page_open_tick = Some(self.tick);
                     } else {
-                        // before the first lap is in, both of these read **zero** and are still
-                        // drawn: `car+0xB20` (the lap count) being 0 takes the `xor esi, esi` arms
-                        // at 0x42A2E6 and 0x42A2A8, and the element formats and draws `esi`
-                        // whatever it is. The min at 0x42A2D4 has no non-zero filter either, and
-                        // the car it reads is `[0x65741C]` — the player's own index, not the
-                        // camera's (`replay.md` §2).
-                        match self.split_times {
-                            2 => ("BEST LAP", Some(laps.iter().copied().min().unwrap_or(0))),
-                            3 => ("LAST LAP", Some(laps.last().copied().unwrap_or(0))),
-                            _ => ("RECORD LAP", record),
+                        self.page_frames += 1;
+                    }
+                    let mut height = (40.0 + 65.0 * (self.page_frames as f32 + 1.0)).min(BILLBOARD.3);
+                    if let Some(f) = self.page_closing.as_mut() {
+                        *f += 1;
+                        height = (BILLBOARD.3 - 65.0 * *f as f32).max(40.0);
+                        if height <= 40.0 {
+                            closed_now = true;
+                        }
+                    }
+                    h.billboard_h.set(height);
+                    h.billboard_clock.set((self.tick, self.page_open_tick.unwrap_or(0)));
+                    self.results_billboard = self.page_closing.is_none().then_some(self.results_page as u32);
+                } else if let ResultPage::TournamentPlace(_) = page
+                    && self.page_seen != Some(self.results_page)
+                {
+                    self.page_seen = Some(self.results_page);
+                    self.page_open_tick = Some(self.tick);
+                }
+                if page == ResultPage::Closed {
+                } else if page == ResultPage::MissionSummary {
+                    let narrator = self.mission.as_ref().map(|m| m.mission.narrator.clamp(0, 5) as usize);
+                    let name = narrator.map(|n| fe(18176 + n as u32)).unwrap_or_default();
+                    let lines = self.mission_text_lines();
+                    // 0x428947…0x428986: 18134 left, 18135 right, both hints (`push 1, push 1`)
+                    let bb = Billboard { left: &fe(18134), right: &fe(18135), hints: Some((&esc, Some(&space))) };
+                    h.mission_summary_sprites(&mut table, hud_aspect, &bb, narrator, &name, &lines, &fe(18109), Some(self.page_frames as usize));
+                } else if let Some((place, t)) = race_congrats {
+                    h.congrats_sprites(&mut table, hud_aspect, place, t, false);
+                } else if let ResultPage::TournamentPlace(rank) = page {
+                    h.congrats_sprites(&mut table, hud_aspect, rank, self.tick.saturating_sub(self.results_page_tick), true);
+                } else if page == ResultPage::Standings
+                    && let Some((t, event)) = self.tournament_event()
+                    && let Some(c) = self.career.as_ref()
+                {
+                    // `HTournamentStandings` 0x431860: title 18132, NAME 18111 / TOTAL POINTS 18127
+                    // / WINNINGS 18161, or NAME / RALLY TIME 18162 / WINNINGS for a club event
+                    // ranked by time (0x4318A2…0x431957; `[0x6577E4]` picks at 0x431DAA)
+                    let (order, times) = self.finishing_order();
+                    let clean = self.clean_racers();
+                    let st = c.career.standings_after(&t, event, &order, &times, &clean);
+                    let name = |d: usize| {
+                        if d == 0 {
+                            self.player_name.clone()
+                        } else {
+                            self.career_opponents.as_ref().and_then(|l| l.get(d - 1)).map(|o| o.name.clone()).unwrap_or_default()
                         }
                     };
-                    if let Some(v) = value {
-                        self.scene.sprites.extend(f.sprites(
-                            &format!("{label}  {}", format_ticks(v)),
-                            [0.70, 0.03],
-                            0.03,
-                            [0.9, 0.9, 0.9, 0.8],
-                        ));
-                    }
+                    let timed = t.time_ranked();
+                    let rows: Vec<(String, String, String)> = st
+                        .iter()
+                        .filter(|(d, ..)| *d == 0 || *d <= self.career_opponents.as_ref().map_or(0, |l| l.len()))
+                        .map(|(d, pts, money, tm)| {
+                            let mid = if timed { format_ticks(*tm) } else { pts.to_string() };
+                            (name(*d).chars().take(31).collect(), mid, money.to_string())
+                        })
+                        .collect();
+                    let player = st.iter().filter(|(d, ..)| *d == 0 || *d <= self.career_opponents.as_ref().map_or(0, |l| l.len())).position(|(d, ..)| *d == 0);
+                    let head = [fe(18111), fe(if timed { 18162 } else { 18127 }), fe(18161)];
+                    // 0x431897: "" left, 18132 right, both hints
+                    let bb = Billboard { left: "", right: &fe(18132), hints: Some((&esc, Some(&space))) };
+                    h.standings_sprites(&mut table, hud_aspect, &rows, player, &bb, &head, timed, &ordinals);
+                } else if let ResultPage::Notice(id) = page {
+                    // `HInfo` 0x4282F0: the text centred on the 500 × 325 box (`[0x5B2BF0]`/`[0x5B2BF4]`)
+                    // `HInfo` 0x428328: "" left, 18157 "Race Info" right, both hints — its Spacebar
+                    // byte is its own constructor argument, and the post-race one `[0x60C9FC]` is
+                    // built with 1 (`push 1` before 0x4250BF)
+                    let bb = Billboard { left: "", right: &fe(18157), hints: Some((&esc, Some(&space))) };
+                    h.notice_sprites(&mut table, hud_aspect, &bb, &fe(id));
+                } else if page == ResultPage::Records
+                    && let Some(rec) = &self.hud_records
+                {
+                    // `HTrackRecords` 0x433830: 18133 "Track Records" / 18158 "Lap Records", columns
+                    // NAME 18111, CAR 18112, TIME 18114, rows 1st…8th
+                    let title = fe(if rec.linear { 18133 } else { 18158 });
+                    let head = [fe(18111), fe(18112), fe(18114)];
+                    // 0x433874: "" left, 18133 / 18158 right, both hints
+                    let bb = Billboard { left: "", right: &title, hints: Some((&esc, Some(&space))) };
+                    h.records_sprites(&mut table, hud_aspect, rec, &bb, &head, &ordinals);
+                } else {
+                    // 0x42BD08: the game type's title left, 18130 "Race Summary" right, both hints
+                    let bb = Billboard { left: &title, right: &fe(18130), hints: Some((&esc, Some(&space))) };
+                    h.results_sprites(&mut table, hud_aspect, &rows, player, &bb, &head, widths, circuit, points, &ordinals);
+                }
+                h.billboard_h.set(BILLBOARD.3);
+                self.scene.sprites.extend(table);
+                if closed_now {
+                    finish_close = true;
                 }
             }
-            if let (Some(f), Some(ms)) = (&h.font, &self.mission) {
-                let m = &ms.mission;
-                let mut line = format!("{}   ", ms.narrator.to_uppercase());
-                if let Some(t) = m.time_limit_s {
-                    line += &format!("GOAL {}:{:02}   ", t / 60, t % 60);
+            // `HMultiTime` 0x42A200 — a `HComboTextVisual` like `HTime`: the tray 73×34 at (427,0)
+            // (`nfs5-2.hud`), the value top-right and a `FEStrings` label bottom-left (0x41C8C0).
+            // It shows only while the racing trays do (they slide out for the post-race billboards).
+            // This port printed an upper-case "RECORD LAP  m:ss.hh" line with no tray, and a
+            // "KNOCKED OUT" banner for an eliminated player that has no string in the game —
+            // HPosition's FE 18191 "DNF" is the original's only sign of that (0x42B2B6).
+            let racing = self.race.as_ref().is_some_and(|r| !r.finished);
+            // the gate 0x41E850: `SPLITTIMES != 0`
+            let split_times = self.choice_index("Display.SplitTimes").map_or(0, |(i, _)| i);
+            let multi = if !racing || split_times == 0 {
+                None
+            } else if let Some(ms) = &self.mission {
+                // game type 9: FE 18172 "goal time" (0x42A22B) over
+                // `_ftol(FACTORYDRIVERTIMELIMIT · 64.0)` (0x42A24E…0x42A25A); nothing when the
+                // limit is −1 (0x42A245)
+                ms.mission.time_limit_s.map(|limit| (18172, limit as u64 * 64))
+            } else if let Some(t) = self.records.track(&self.track.name) {
+                // point-to-point (`[0x657494]`) → FE 21 "record" and the track record; circuits →
+                // the SPLITTIMES selection: 1 FE 22 "record lap", 2 FE 23 "best lap", 3 FE 24
+                // "last lap" (0x42A279…0x42A2F2)
+                let record = t.entries.first().map(|e| e.time as u64);
+                let laps = self
+                    .race
+                    .as_ref()
+                    .map(|r| r.lap_times.clone())
+                    .unwrap_or_default();
+                if !t.circuit {
+                    record.map(|v| (21, v))
+                } else {
+                    // before the first lap is in, both of these read **zero** and are still
+                    // drawn: `car+0xB20` (the lap count) being 0 takes the `xor esi, esi` arms
+                    // at 0x42A2E6 and 0x42A2A8, and the element formats and draws `esi`
+                    // whatever it is. The min at 0x42A2D4 has no non-zero filter either, and
+                    // the car it reads is `[0x65741C]` — the player's own index, not the
+                    // camera's (`replay.md` §2).
+                    // `SPLITTIMES [0x657DD8]` is the `Display.SplitTimes` choice (0 off, which
+                    // the gate below already returned on); this port had it start at 1 and cycled
+                    // it on its own T key, which the original has no binding for
+                    match split_times {
+                        2 => Some((23, laps.iter().copied().min().unwrap_or(0))),
+                        3 => Some((24, laps.last().copied().unwrap_or(0))),
+                        _ => record.map(|v| (22, v)),
+                    }
                 }
-                if let Some(sk) = &self.skill {
-                    let cones = sk.cones_knocked();
-                    line += &format!("CONES {cones}");
-                    if let Some(nfs_formats::career::ConeRule::PenaltySeconds(s)) = m.cone_rule
-                        && cones > 0
-                    {
-                        line += &format!(" (+{} S)", s as usize * cones);
-                    }
-                    if let Some(d) = m.damage_limit_pct {
-                        line += &format!("   DAMAGE {:.0}% / {d}%", v.damage_avg());
-                    }
-                    if sk.finished || sk.dnf {
-                        let (pass, t) = sk.evaluate(m, 1, v.damage_avg());
-                        let secs = t as f32 / 64.0;
-                        line += &format!(
-                            "   {}  {}:{:05.2}",
-                            if pass {
-                                "MISSION PASSED"
-                            } else {
-                                "MISSION FAILED"
-                            },
-                            (secs / 60.0) as u32,
-                            secs % 60.0
-                        );
-                    }
-                }
-                self.scene.sprites.extend(f.sprites(
-                    &line,
-                    [0.02, 0.13],
-                    0.035,
-                    [1.0, 0.9, 0.5, 0.95],
-                ));
+            } else {
+                None
+            };
+            if let Some((label, value)) = multi {
+                let label = self.fe.strings.get(label).unwrap_or_default().to_string();
+                let mut tray = Vec::new();
+                h.combo_sprites(&mut tray, hud_aspect, (427.0, 0.0, 73.0, 34.0), &format_ticks(value), &label, h.display());
+                Hud::slide(&mut tray, 0, hud_aspect, (427.0, 0.0, 73.0, 34.0), self.tray_slide_now());
+                self.scene.sprites.extend(tray);
             }
+        }
+        // the page that finished shrinking this frame makes way for the next (state 0)
+        if finish_close {
+            self.advance_results_page();
         }
         // render pose = previous tick → current tick, by the accumulator fraction
         let alpha = (self.accumulator.as_secs_f32() / GAME_TICK.as_secs_f32()).clamp(0.0, 1.0);
@@ -7171,7 +8865,32 @@ impl App {
         });
         let dt = self.frame_dt.clamp(0.001, 0.1);
         let fwd = car_rot * Vec3::Z;
-        let rear_view = self.input.held(Action::RearView) && self.vehicle.is_some();
+        // diagnostic: `NFS_LOOKBACK=1` holds look-back (`I_LOOKBEHIND`) for a `--screenshot`
+        let rear_view = (self.input.held(Action::RearView) || std::env::var("NFS_LOOKBACK").is_ok())
+            && self.vehicle.is_some();
+        // **The rear-view mirror** (AUDIT §O): the pass 0x468CA0 renders the view 0x4691D0 made — near
+        // 1, far 65000, cleared 0xFF77BBFF — with camera slot 0 in its type-1 form (0x464F80's branch at
+        // 0x46503B): the eye at the car's position raised by the current view's height (`[0x5CF614 +
+        // 16·view]`, y only), the car's matrix with its right and forward rows negated — a half turn
+        // about the car's up axis, not a left-right mirror. Skipped in a replay (`[0x657424]` 2/3) and
+        // unless the tray is in (0x4275A0); `REARVIEWMIRRROR` gates the tray (0x41E9A0). The field of
+        // view: 0x464F80 overwrites the view's `+0x130` with slot 0's half-angle `+0x58` (0x4653E9…
+        // 0x46540B; ×1.2 `[0x5B2480]` when `[0x657D5C]` is set and the view is not 1), and the
+        // projection 0x5391B0 takes `2·+0x130` as the **horizontal** angle with the viewport's
+        // aspect in 640 × 480 units (0x466FD7…0x46700C), so the vertical half-angle is
+        // `atan(tan(h)·84/240)`. SetSlotView gives `+0x58` 37.5 (0x46584F); its animation
+        // (0x462D4C…) and `[0x657D5C]` are not carried. The pass's `+0x120…+0x128` (a distance from
+        // the draw distance `[0x6197CC]`, min 50) and the 0x537890 state it sets are not carried either.
+        let in_replay_now = self.replay.stream.as_ref().is_some_and(|r| r.mode == nfs_game::replay::Mode::Playing);
+        self.rear_mirror = (self.choice_index("Display.RearView").is_some_and(|(i, _)| i != 0)
+            && self.vehicle.is_some()
+            && !in_replay_now
+            && self.race.as_ref().is_some_and(|r| !r.finished))
+        .then(|| {
+            let h = nfs_game::camera::VIEW_OFFSETS.get(self.camera_view() as usize).map_or(0.0, |o| o.y);
+            let position = car_pos + Vec3::new(0.0, h, 0.0);
+            Camera { position, target: position - fwd * 20.0, up: car_rot * Vec3::Y, fov_y_radians: 2.0 * (nfs_game::camera::half_angle(nfs_game::camera::DEFAULT_HALF_ANGLE, self.widescreen(), self.camera_view()).to_radians().tan() * 84.0 / 240.0).atan(), near: 1.0, far: 65000.0 }
+        });
         // the horn is a loop on the car's own engine bank (`engine-audio.md` §6)
         if let (Some(a), Some(e)) = (&self.snd.audio, self.snd.engine_sound.as_mut()) {
             e.horn(
@@ -7182,38 +8901,220 @@ impl App {
         }
         if self.paused
             && let Some(h) = &self.hud
-            && let Some(f) = &h.font
+            && h.font.is_some()
         {
-            self.scene.sprites.extend(f.sprites(
-                "PAUSED",
-                [0.42, 0.40],
-                0.07,
-                [1.0, 1.0, 1.0, 1.0],
-            ));
-            self.scene.sprites.extend(f.sprites(
-                "ENTER RESUME     ESC MENU",
-                [0.33, 0.50],
-                0.035,
-                [0.8, 0.8, 0.8, 1.0],
-            ));
+            // `HPauseMenu` 0x42A440: title 18128 "Pause Menu" (0x46D0) over three buttons, 18108
+            // continue / 18109 race again / 18110 quit; the quit question is `HYesNoOverlay`
+            // 0x437440, 18174 "Confirmation" with 18171 and 18141 yes / 18142 no. The strings are
+            // the original's; where they sit is this port's (APPROXIMATION).
+            let fe = |id: u32| self.fe.strings.get(id).unwrap_or_default().to_string();
+            match self.pause_confirm {
+                None => {
+                    let mut menu = Vec::new();
+                    let aspect = self.renderer.as_ref().map(|r| r.aspect()).unwrap_or(HUD_REF_W / HUD_REF_H);
+                    // 0x42A477: "" left, 18128 right, no hints
+                    let bb = Billboard { left: "", right: &fe(18128), hints: None };
+                    // `[0x606AC8]` keeps running through the pause (see `pause_ticks`)
+                    h.billboard_clock.set((self.tick + self.pause_ticks as u64, 0));
+                    h.pause_sprites(&mut menu, aspect, &bb, &[fe(18108), fe(18109), fe(18110)], self.pause_sel as usize);
+                    self.scene.sprites.extend(menu);
+                }
+                Some(sel) => {
+                    let mut dlg = Vec::new();
+                    let aspect = self.renderer.as_ref().map(|r| r.aspect()).unwrap_or(HUD_REF_W / HUD_REF_H);
+                    let bb = Billboard { left: "", right: &fe(18174), hints: None };
+                    // `[0x606AC8]` keeps running through the pause (see `pause_ticks`)
+                    h.billboard_clock.set((self.tick + self.pause_ticks as u64, 0));
+                    h.yes_no_sprites(&mut dlg, aspect, &bb, [&fe(18171), ""], [&fe(18141), &fe(18142)], sel as usize);
+                    self.scene.sprites.extend(dlg);
+                }
+            }
         }
-        // the driving views keep the port's own field of view; only a trackside camera element
-        // brings its own (`+0x9C`, 37.5 or 45 degrees in the shipped scenes)
-        self.camera.fov_y_radians = 60f32.to_radians();
+        // every view is slot 0's half-angle, 37.5° by default, across (`camera::fov_y`); only a
+        // trackside camera element brings its own (`+0x9C` when `+0x98` is set)
         let view = self.camera_view();
+        let ws = self.widescreen();
+        let fov_of = |h: f32| nfs_game::camera::fov_y_window(nfs_game::camera::half_angle(h, ws, view), ws);
+        self.camera.fov_y_radians = fov_of(nfs_game::camera::DEFAULT_HALF_ANGLE);
+        self.camera.up = Vec3::Y;
         let off = nfs_game::camera::VIEW_OFFSETS
             .get(view as usize)
             .copied()
             .unwrap_or(nfs_game::camera::VIEW_OFFSETS[2]);
         // a view that rides the car and looks forward from it: the bumper and shotgun cameras
-        let rides_car = matches!(view, 0x00 | 0x08 | 0x09);
+        let rides_car = view == 0x00;
         // the chase family — behind the car, heading and height low-passed
         let chases = matches!(view, 0x02..=0x07 | 0x0D);
-        if rear_view && view != 0x0C && view != 0x14 {
-            // `ReverseCam1` (0x0F): its own offset, looking back down the car's axis
-            let r = nfs_game::camera::VIEW_OFFSETS[0x0F];
-            self.camera.position = car_pos + car_rot * r;
-            self.camera.target = self.camera.position - fwd * 20.0;
+        // **0x4611C0**: the bumper and driver views turn about the slot's up axis toward 180° while
+        // look-back (input bit 0x13, `I_LOOKBEHIND`) is held and back to 0 when released
+        // (`camera::look_step`); the port has no look-left / right keys (bits 0x14 / 0x15 / 0x16)
+        let look = if matches!(view, 0x00 | 0x01) && self.vehicle.is_some() {
+            let cur = match self.look_yaw {
+                Some((y, v)) if v == view => y,
+                _ => 0,
+            };
+            let (y, turn) = nfs_game::camera::look_step(cur, if rear_view { 180 } else { 0 });
+            self.look_yaw = Some((y, view));
+            Quat::from_rotation_y(if turn { (y as f32).to_radians() } else { 0.0 })
+        } else {
+            self.look_yaw = None;
+            Quat::IDENTITY
+        };
+        // **The ceiling test 0x461370(slot, p, &y)**: `y` is an eye height over the car's y. Over the
+        // ceiling patches at `p` in plan (0x473420 from `(p.x, car.y, p.z)`), skipping one whose corners
+        // are all within 1.0 of both the eye `car.y + y` and `p.y` or below (0x461408…0x461450) and one
+        // whose centre (vt+4, the corners' mean) is within 2.0 of the car's y (0x461462…0x461494): when
+        // the plane's height `h` at `p` less 1.0 is below the eye, `y = max(h − car.y − 1, 1.0)`
+        // (0x4614B6…0x4614F9) — the last such patch wins; the eye it compares with stays the first.
+        let ceiling = |w: &nfs_game::world::TrackWorld, p: Vec3, y: f32| -> f32 {
+            let eye = car_pos.y + y;
+            let mut out = y;
+            for (t, h) in w.collision.patches_where(p, |word| word & 0x8000 != 0 && word & 0xF == 0) {
+                if [t.a, t.b, t.c].iter().all(|v| v.y - 1.0 <= eye && v.y - 1.0 <= p.y) {
+                    continue;
+                }
+                let c = (t.a + t.b + t.c) * (1.0 / 3.0);
+                if c.y >= car_pos.y - 2.0 && c.y <= car_pos.y + 2.0 {
+                    continue;
+                }
+                if h - 1.0 < eye {
+                    out = (h - car_pos.y - 1.0).max(1.0);
+                }
+            }
+            out
+        };
+        // look-back (bit 0x13) is read only by views 0…7 (0x4611C0, 0x461B96, 0x461E80, 0x4623D0; the
+        // one other reader, 0x444F89, gates a draw): elsewhere it changes nothing
+        if matches!(view, 0x08 | 0x09 | 0x0F) {
+            // **0x4618B0** (`ShotgunCam2` / `ShotgunCam3` / `ReverseCam1`, dispatch 0x464005): the eye is
+            // the car plus its matrix times the table offset, whose y is the lower of the two ceiling
+            // tests at the car and the old eye (0x461903…0x461964); the slot's offset is that; the
+            // slot matrix is the car's with its right and forward rows negated — a half turn about
+            // its up (0x4619BD…0x461A1E). SetSlotView puts the table's flag bits one place up in
+            // `+0xC0` (0x4658C0…0x465965), so the aim bit 0x08 is the table's 0x04: view 8 (0x3C) is
+            // aimed at the car's origin with the world's up by 0x464BF0; 9 (0x38) and 0x0F (0x12)
+            // keep the half-turned matrix and look back down the car.
+            let mut a = car_rot * off;
+            if let Some(w) = self.world.as_ref() {
+                let old_eye = self.slot_eye.unwrap_or(car_pos + a);
+                a.y = ceiling(w, car_pos, a.y).min(ceiling(w, old_eye, a.y));
+            }
+            self.camera.position = car_pos + a;
+            if view != 0x08 {
+                self.camera.target = self.camera.position - fwd * 20.0;
+                self.camera.up = car_rot * Vec3::Y;
+            } else {
+                self.camera.target = car_pos;
+            }
+        } else if matches!(view, 0x02..=0x07)
+            && let Some(v) = self.vehicle.as_ref()
+        {
+            // **The chase cameras 0x461E80** (views 2 / 3 / 4 with argument 0 / 1 / 2, race-logic §11.2):
+            // the view's offset less the car's half length, lifted on a slope by the height difference
+            // of the slices three behind and three ahead, turned by the car's matrix; the slot's offset
+            // follows it by `k` in x and z and 0.05 in y, is kept at least 4.94 long, and the eye is the
+            // car plus it, aimed above the car's centre (`aim_lift` below). APPROXIMATION: the build's
+            // collision pushes 0x4649E0 / 0x464500 and its own ceiling test, which `+0xC0` bit 0x10
+            // (the table's 0x08, set in 0x2D) turns on at 0x4651E4, are not carried.
+            // the heli cameras 5 / 6 / 7 run **0x4623D0** with arguments 0 / 1 / 2, the same routine
+            // but for: no half-length, the offset pulled back by `min(speed·[0x5B3F6C] 0.05, 2.0)`
+            // (0x46256F…0x4625F6), the slope term halved (`[0x5B23F0]`) and clamped [0.25, 1.25] /
+            // [−0.75, 3.0], and no 4.94 minimum
+            let heli = view >= 5;
+            let arg = if heli { view - 5 } else { view - 2 };
+            let (a, b) = (v.v_local.z.abs(), v.v_local.x.abs());
+            let speed = a.max(b) + 0.25 * a.min(b);
+            let table_off = off;
+            let mut off = off;
+            if heli {
+                off.z -= (speed * 0.05).min(2.0);
+            } else {
+                off.z -= v.half_extents.z;
+            }
+            let lift = match (arg, self.slices.as_ref(), self.race.as_ref()) {
+                (1 | 2, Some(t), Some(r)) if !t.slices.is_empty() => {
+                    // the step is +3 when wrong-way XOR REVERSE, else −3 (0x461EE2…0x461EFC)
+                    let step: i32 = if (r.wrong_way_ticks > 0) != self.backwards { 3 } else { -3 };
+                    let y = |d: i32| t.slices[t.add_graph(r.slice, d, None)].centre.y;
+                    let dy = y(step) - y(-step);
+                    match (heli, arg) {
+                        (false, 1) => (dy * (1.0f32 / 3.0)).clamp(0.25, 1.0),
+                        (false, _) => (dy * (1.0f32 / 3.0)).clamp(-0.25, 2.0),
+                        (true, 1) => (dy * 0.5).clamp(0.25, 1.25),
+                        (true, _) => (dy * 0.5).clamp(-0.75, 3.0),
+                    }
+                }
+                _ => 0.0,
+            };
+            // look-back (bit 0x13) first snaps the slot's offset `+0x08` to the car-turned offset —
+            // the chase one with the half length taken off (0x46200C…0x46202A), the heli one the
+            // table's (0x462549…0x462567) — so the follow restarts from there on release
+            let snap = car_rot * if heli { table_off } else { off };
+            // the aim 0x464BF0: forward `(car − eye)·0.25` plus, with `+0xC0` bit 0x02 (the table's
+            // 0x01, set in 0x2D), 0.325 (views 2…4, `[0x5B3F84]`) or 0.4 (`[0x5B261C]`) on y before
+            // normalising (0x464E6B…0x464ED3): aimed 1.3 / 1.6 above the car's origin
+            let aim_lift = Vec3::Y * 4.0 * if heli { 0.4 } else { 0.325 };
+            off.y += lift;
+            let mut target = car_rot * off;
+            // both branches seed 0x461370 at the car and at the slot's old eye with the offset's y
+            // and keep the lower answer (0x462280 / 0x462292 then 0x462297…0x4622B7; the rigid
+            // branch 0x4621BB / 0x4621CD)
+            let old_eye = self.slot_eye.unwrap_or(car_pos + target);
+            let world = self.world.as_ref();
+            let lowest = |y: f32| world.map_or(y, |w| ceiling(w, car_pos, y).min(ceiling(w, old_eye, y)));
+            // the follow rate: 0.1 for views 2 / 5; else `clamp((max + ¼ min of |v_long|, |v_lat|) / 900,
+            // 0.02, 0.1 or 0.05)` (0x461F7D…0x462008)
+            let mut k = match arg {
+                0 => 0.1,
+                1 => (speed * (1.0 / 900.0)).clamp(0.02, 0.1),
+                _ => (speed * (1.0 / 900.0)).clamp(0.02, 0.05),
+            };
+            let mut ky = 0.05;
+            // SetSlotView (0x465848…0x46588C) resets the settle count but not the offset `+0x08`, so a
+            // new view starts from where the last one left the eye and glides in at 0.1 for 0x32 updates
+            let mut cur = match self.chase_offset {
+                Some((o, v0)) if v0 == view => o,
+                Some((o, _)) => {
+                    self.chase_settle = 0x32;
+                    o
+                }
+                None => {
+                    self.chase_settle = 0x32;
+                    target
+                }
+            };
+            if rear_view {
+                // **the rigid branch** 0x462136…0x462235 (heli 0x4626F1…0x4627F0): the eye is the car
+                // plus the car-turned offset with its z negated — ahead of the car — aimed back at its
+                // centre, and the update returns before the follow; the eye's y is the lower of the
+                // two ceiling tests
+                self.chase_offset = Some((snap, view));
+                let mut a = car_rot * Vec3::new(off.x, off.y, -off.z);
+                a.y = lowest(a.y);
+                self.camera.position = car_pos + a;
+                self.camera.target = car_pos + aim_lift;
+                self.camera.up = Vec3::Y;
+            } else {
+                target.y = lowest(target.y);
+                if self.chase_settle > 0 {
+                    self.chase_settle -= 1;
+                    k = 0.1;
+                    ky = 0.1;
+                }
+                cur.x += (target.x - cur.x) * k;
+                cur.y += (target.y - cur.y) * ky;
+                cur.z += (target.z - cur.z) * k;
+                if self.chase_settle == 0 && !heli {
+                    let len = cur.length();
+                    if len > 0.0 && len < 4.94 {
+                        cur *= 4.94 / len;
+                    }
+                }
+                self.chase_offset = Some((cur, view));
+                self.camera.position = car_pos + cur;
+                self.camera.target = car_pos + aim_lift;
+                self.camera.up = Vec3::Y;
+            }
         } else if chases {
             // APPROXIMATION: the heading and height are low-passed so suspension pitch/roll and
             // small yaw wobble do not shake the view, where the original rides the car's matrix.
@@ -7247,35 +9148,63 @@ impl App {
                 base + smoothed * off.z + Vec3::Y * off.y + smoothed.cross(Vec3::Y) * off.x;
             self.camera.target = base + Vec3::Y * 0.9 + smoothed * 2.0;
         } else if rides_car {
-            // bumper / shotgun: the table's offset in the car's own frame, looking along it
+            // bumper: the table's offset in the car's own frame, looking along it
             self.camera.position = car_pos + car_rot * off;
-            let ahead = if off.z > 0.0 && view == 0x09 {
-                -1.0
-            } else {
-                1.0
-            };
-            self.camera.target = self.camera.position + fwd * 20.0 * ahead;
+            self.camera.target = self.camera.position + car_rot * (look * Vec3::Z) * 20.0;
+            // `BumperCam` (view 0, 0x461D50): the slot's matrix is the car's own `car+0x364` copied
+            // whole (0x461DAF…0x461DC7), so the view rolls and pitches with the car; this port kept
+            // the world's up; 0x4611C0 then turns it by the look-around yaw (`look` above).
+            self.camera.up = car_rot * Vec3::Y;
         } else if view == nfs_game::camera::VIEW_DRIVER as u16
             && let Some(dc) = self.driver_cam
         {
             // driver (`BumperCam2`): the car's own `drivercampos` / `drivercamrot`, in the same body
-            // frame as the table, aimed by the file's pitch and yaw in degrees
-            let aim = Quat::from_rotation_y(dc.rotation.y.to_radians())
-                * Quat::from_rotation_x(dc.rotation.x.to_radians());
-            self.camera.position = car_pos + car_rot * dc.position;
-            self.camera.target = self.camera.position + car_rot * (aim * Vec3::Z) * 20.0;
-            self.camera.up = car_rot * Vec3::Y;
+            // frame as the table, turned by the file's x / y / z in degrees: 0x5563D0 / 0x5564A0 /
+            // 0x556560 each pre-multiply the slot matrix by 0x532600's family `M_x` / `M_y` / `M_z`
+            // (0x461B5A…0x461B8E), so the car's matrix ends up `M_z·M_y·M_x·M` — in this port's
+            // column form `car · Rx · Ry · Rz`, the roll innermost
+            let aim = Quat::from_rotation_x(dc.rotation.x.to_radians())
+                * Quat::from_rotation_y(dc.rotation.y.to_radians())
+                * Quat::from_rotation_z(dc.rotation.z.to_radians());
+            // 0x461A30 does not put the eye at the offset outright: the slot's world offset `+0x08`
+            // moves toward `car matrix · offset` by `[0x5B23F4]` 0.2 in x and y and `[0x5B23F0]` 0.5 in
+            // z each update (0x461BC5…0x461C25), so the head lags the body a little.
+            // with look-back held the table offset's x is 0 (0x461B96…0x461B9F)
+            let mut pos = dc.position;
+            if rear_view {
+                pos.x = 0.0;
+            }
+            let target = car_rot * pos;
+            let mut cur = self.chase_offset.map_or(target, |(o, _)| o);
+            cur.x += (target.x - cur.x) * 0.2;
+            cur.y += (target.y - cur.y) * 0.2;
+            cur.z += (target.z - cur.z) * 0.5;
+            self.chase_offset = Some((cur, view));
+            self.camera.position = car_pos + cur;
+            // the look-around yaw turns the car's matrix before the slot's own turns (0x461B07 is
+            // ahead of 0x5563D0…0x556560)
+            // the view is the slot matrix whole, so its up row carries the turns too (the roll)
+            let frame = car_rot * look * aim;
+            self.camera.target = self.camera.position + frame * Vec3::Z * 20.0;
+            self.camera.up = frame * Vec3::Y;
         } else {
             // `TVCam` / `DirectorsCam`: the camera the last camera trigger switched to
             // (0x413B80 → 0x413960), with its own field of view; before any trigger has fired, the
             // nearest element
+            let slot_eye = self.slot_eye;
             let cam = self
                 .track_cameras
-                .as_ref()
+                .as_mut()
                 .and_then(|t| {
-                    t.current()
-                        .filter(|c| c.has_position)
-                        .map(|c| (c.position, c.fov))
+                    // 0x462E30: the eye rises above where the switch put it by the element's `+0x84`
+                    // as the car moves off, `d` measured from last update's eye; then 0x462B80(d)
+                    // steps the half-angle (`TvSlot`)
+                    let base = t.tv.eye?;
+                    let last = slot_eye.filter(|e| e.x == base.x && e.z == base.z).unwrap_or(base);
+                    let d = car_pos.distance(last);
+                    let lift = t.tv.eye_lift(d);
+                    t.tv.update(d);
+                    Some((base + Vec3::Y * lift, t.tv.half_angle, t.tv.fixed_view, t.tv.frozen))
                 })
                 .or_else(|| {
                     self.track.cameras.as_ref().and_then(|c| {
@@ -7286,20 +9215,58 @@ impl App {
                                     .partial_cmp(&b.distance_squared(self.car_pos))
                                     .unwrap()
                             })
-                            .map(|p| (p, 45.0))
+                            .map(|p| (p, nfs_game::camera::DEFAULT_HALF_ANGLE, None, false))
                     })
                 });
             match cam {
-                Some((p, fov)) if p.distance(car_pos) < 400.0 => {
+                Some((p, fov, fixed, frozen)) if p.distance(car_pos) < 400.0 => {
+                    // view 12's flags 0x14 carry the aim bit, so 0x464BF0 points it at the car's
+                    // origin; a camera whose `+0x88` is 0 instead gets the element's own matrix and
+                    // loses the aim bit (0x413A4B…0x413A7F)
                     self.camera.position = p;
-                    self.camera.target = car_pos + Vec3::Y * 0.7;
-                    self.camera.fov_y_radians = fov.to_radians();
+                    match fixed {
+                        Some((f, u)) => {
+                            self.camera.target = p + f * 20.0;
+                            self.camera.up = u;
+                        }
+                        // a disabled `+0x88` 0 camera leaves the last matrix in place
+                        None if frozen => {
+                            let dir = self.camera.target - self.camera.position;
+                            self.camera.target = p + dir;
+                        }
+                        None => self.camera.target = car_pos,
+                    }
+                    self.camera.fov_y_radians = fov_of(fov);
                 }
                 _ => {
                     self.camera.position = car_pos - fwd * 7.5 + Vec3::Y * 2.3;
                     self.camera.target = car_pos + Vec3::Y * 0.9;
                 }
             }
+        }
+        // **The ground clamp 0x464330**, which the build 0x464F80 runs on the eye for views above 1
+        // other than 0x0C (0x46524C…0x465261), before it aims: of the drivable patches under the eye
+        // (0x473650), one whose three corners are all more than `[0x5B24A8]` 1.0 below the eye is
+        // passed over (0x464397…0x4643C2); otherwise when its height `h` at the eye (0x48A060) plus
+        // 1.0 is above the eye, the eye is lifted to `h + 1` — but only when `h` is within
+        // `[0x5B38EC]` 3.5 of the car's ground height `car+0x41C`, unless `[0x5CF584]` is 0, which
+        // 0x4642CC sets from `strcmp(track, "castle")`: on Castle any patch lifts it.
+        self.slot_eye = Some(self.camera.position);
+        if view > 1
+            && view != 0x0C
+            && let (Some(w), Some(v)) = (self.world.as_ref(), self.vehicle.as_ref())
+        {
+            let any_height = self.track.name.eq_ignore_ascii_case("castle");
+            let mut eye = self.camera.position;
+            for (t, h) in w.collision.patches_at(eye) {
+                if t.a.y.max(t.b.y).max(t.c.y) + 1.0 < eye.y {
+                    continue;
+                }
+                if h + 1.0 > eye.y && (any_height || (h - v.ground_h).abs() <= 3.5) {
+                    eye.y = h + 1.0;
+                }
+            }
+            self.camera.position = eye;
         }
         // **The police beacon's projector** 0x4526C0's second half: on a night track
         // (`word [0x628A28] != 0`) it walks the car list and keeps the live car whose `car+0xECC & 2`
@@ -7684,6 +9651,27 @@ struct KnockoutSeries {
     message: String,
 }
 
+/// One page of the post-race queue `[0x60C9C4]` (0x426C90): each opens when the one before closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultPage {
+    /// every queued page has closed (the last one timed out) — nothing is drawn
+    Closed,
+    /// `HRaceSummary`
+    Summary,
+    /// the second `HCongrats` with the tournament place, queued after the summary on a
+    /// tournament's last race when the place is 1–3 (0x426E5D)
+    TournamentPlace(usize),
+    /// `HTournamentStandings`, queued after the summary in a tournament (0x426EB9)
+    Standings,
+    /// `HInfo` 0x4282F0 with a text id — 18160 "You must place in the top 3…", queued after the
+    /// standings on a tournament's last race when the player is not in the top three (0x426F52)
+    Notice(u32),
+    /// `HTrackRecords`, queued last (0x426F71, 0x4272FF)
+    Records,
+    /// `HMissionSummary` 0x428940 — the only page of a factory-driver mission (0x426FB8)
+    MissionSummary,
+}
+
 /// World edits requested by the simulation.
 enum WorldAction {
     Show(Vec<usize>, Vec<usize>),
@@ -7937,7 +9925,7 @@ impl App {
                         }
                         self.snd.sound_set = car.sound_set.clone();
                         self.sim_name = car.sim.clone();
-                        self.dials = Some((car.dial_kmh, car.dial_tach));
+                        self.dials = Some((car.dial_kmh, car.dial_mph, car.dial_tach));
                         self.fe.menu = None;
                         let (renderer, window) =
                             (self.renderer.take().unwrap(), self.window.take().unwrap());
@@ -7963,17 +9951,6 @@ impl App {
                 // new series unless one is active
                 if !self.knockout.as_ref().map(|k| k.active).unwrap_or(false) {
                     let n = m.ko_opponents.clamp(1, 7);
-                    let mut seed = (std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(1))
-                        | 1;
-                    let mut next = move || {
-                        seed ^= seed << 13;
-                        seed ^= seed >> 7;
-                        seed ^= seed << 17;
-                        seed
-                    };
                     // the series runs the locations the player set on `locationsetup.lay`, one
                     // row per opponent — `Knockout.TrackNumber`'s own table. A row the table does
                     // not have (it is kept the length of the opponent count, so this is only
@@ -7995,60 +9972,19 @@ impl App {
                             m.tracks.get(k.track_idx).cloned().unwrap_or_else(|| m.track().to_string())
                         })
                         .collect();
-                    let mut used: Vec<String> = vec![car.model.to_lowercase()];
-                    let mut opponents = Vec::new();
-                    // `0x4E3160`: one `nfs5.per` driver per opponent, drawn without replacement from
-                    // the records whose era matches the difficulty selection (`modes.md` §5.2)
-                    let drivers: Vec<i16> = match self.career.as_ref() {
-                        Some(cu) => nfs_game::career::pick_personalities(
-                            &cu.tables.personalities,
-                            Some(self.race_skill as u32),
-                            n as usize,
-                            |len| (next() % len as u64) as usize,
-                        ),
-                        None => Vec::new(),
-                    };
-                    for i in 0..n {
-                        let Some(entry) = m
-                            .cars
-                            .iter()
-                            .filter(|c| {
-                                !c.sim.is_empty()
-                                    && c.year >= 1990
-                                    && !used.iter().any(|u| u.eq_ignore_ascii_case(&c.model))
-                            })
-                            .nth((i as usize * 7 + (next() % 5) as usize) % 12)
-                        else {
-                            break;
-                        };
-                        used.push(entry.model.to_lowercase());
-                        let paint = entry
-                            .paint_sets
-                            .get((i as usize + 1) % entry.paint_sets.len().max(1))
-                            .map(|p| p.colours[0])
-                            .unwrap_or([0x20, 0x40, 0xC0]);
-                        let per = drivers.get(i as usize).copied().unwrap_or(0);
-                        let (name, skill) = match self.career.as_ref().and_then(|cu| {
-                            cu.tables
-                                .personalities
-                                .iter()
-                                .find(|p| p.id == per)
-                                .map(|p| (cu.tables.driver_name(per), p.skill))
-                        }) {
-                            Some((n, s)) => (n, s),
-                            None => (entry.display_name.clone(), [[1.0, 0.0]; 4]),
-                        };
-                        opponents.push(CareerOpponent {
-                            car: entry.clone(),
-                            paint,
-                            name,
-                            difficulty: 1.0,
-                            skill,
-                            grid: None,
-                            personality: per,
-                            parts: Vec::new(),
-                        });
-                    }
+                    // `Knockout_start` 0x4DDF30: `0x4F4FA0(OpponentCar.Car)` and one `0x4E3160` draw
+                    // for the whole series (`modes.md` §5.3) — the quick race's own opponents. This
+                    // port picked "distinct 1990s models" by a formula of its own, stepped the paint
+                    // sets by slot, and named the drivers only inside a career.
+                    let catalog = nfs_formats::fedata::parse_car_catalog(
+                        &std::fs::read(self.paths.fe_data().join("Data").join("nfs5.car")).unwrap_or_default(),
+                    )
+                    .unwrap_or_default();
+                    let selected = catalog
+                        .iter()
+                        .position(|c| c.model.eq_ignore_ascii_case(&car.model) && !c.sim.is_empty())
+                        .unwrap_or(0);
+                    let opponents = Self::quick_opponents(&self.paths, &self.fe.strings, self.opp_choice, self.race_skill, &catalog, selected, n as usize);
                     let n = opponents.len() as u32;
                     let mut start_pos = vec![n + 1];
                     start_pos.extend(1..=n);
@@ -8156,7 +10092,7 @@ impl App {
                         }
                         self.snd.sound_set = car.sound_set.clone();
                         self.sim_name = car.sim.clone();
-                        self.dials = Some((car.dial_kmh, car.dial_tach));
+                        self.dials = Some((car.dial_kmh, car.dial_mph, car.dial_tach));
                         self.fe.menu = None;
                         let (renderer, window) =
                             (self.renderer.take().unwrap(), self.window.take().unwrap());
@@ -8251,7 +10187,7 @@ impl App {
                         }
                         self.snd.sound_set = car.sound_set.clone();
                         self.sim_name = car.sim.clone();
-                        self.dials = Some((car.dial_kmh, car.dial_tach));
+                        self.dials = Some((car.dial_kmh, car.dial_mph, car.dial_tach));
                         self.fe.menu = None;
                         let (renderer, window) =
                             (self.renderer.take().unwrap(), self.window.take().unwrap());
@@ -8974,6 +10910,7 @@ impl App {
         self.rebuild_scene();
         self.update_damage_decals();
         self.update_env_map();
+        self.render_mirror();
         if let Some(r) = self.renderer.as_mut()
             && let Err(e) = r.render(&self.scene, &self.camera)
         {
@@ -9086,7 +11023,7 @@ impl App {
                 }
                 self.snd.sound_set = car.sound_set.clone();
                 self.sim_name = car.sim.clone();
-                self.dials = Some((car.dial_kmh, car.dial_tach));
+                self.dials = Some((car.dial_kmh, car.dial_mph, car.dial_tach));
                 self.fe.test_drive = Some((game_type, owned));
                 self.fe.menu_template = self.fe.menu.take();
                 self.fe.layout_preview = None;
@@ -9146,7 +11083,7 @@ impl App {
                 }
                 self.snd.sound_set = car.sound_set.clone();
                 self.sim_name = car.sim.clone();
-                self.dials = Some((car.dial_kmh, car.dial_tach));
+                self.dials = Some((car.dial_kmh, car.dial_mph, car.dial_tach));
                 self.fe.layout_preview = None;
                 self.fe.layout_name = None;
                 self.fe.menu = None;
@@ -9391,27 +11328,20 @@ impl App {
     }
 
     /// Mission over: evaluate the skill test (or the race position) and store the result.
-    fn settle_mission(&mut self) {
-        let Some(ms) = self.mission.clone() else {
-            return;
-        };
-        if !self
-            .career
-            .as_ref()
-            .is_some_and(|c| c.pending.as_ref().is_some_and(|p| p.mission.is_some()))
-        {
-            return;
-        }
+    /// The mission's `(pass, time in ticks, cones)` as things stand — `HMissionSummary::evaluate`
+    /// 0x4293F0 for a skill test, position / time / damage for a race mission.
+    fn mission_outcome(&self) -> Option<(bool, u64, usize)> {
+        let ms = self.mission.as_ref()?;
         let (order, times) = self.finishing_order();
         let position = order
             .iter()
             .position(|d| *d == 0)
             .map(|p| p + 1)
             .unwrap_or(8);
-        let damage = self.vehicle.as_ref().map(|v| v.damage_avg()).unwrap_or(0.0);
-        let (pass, t, cones) = match &self.skill {
+        let zones = self.vehicle.as_ref().map(|v| v.damage).unwrap_or([0.0; 10]);
+        Some(match &self.skill {
             Some(sk) => {
-                let (pass, t) = sk.evaluate(&ms.mission, position, damage);
+                let (pass, t) = sk.evaluate(&ms.mission, position, &zones);
                 (pass, t, sk.cones_knocked())
             }
             None => {
@@ -9425,14 +11355,70 @@ impl App {
                 if let Some(limit) = ms.mission.time_limit_s {
                     pass &= t < limit as u64 * 64;
                 }
-                if let Some(d) = ms.mission.damage_limit_pct {
-                    pass &= damage <= d as f32;
-                }
+                // the same 0x434FA0 test — `HMissionSummary::evaluate` runs it for every mission
+                pass &= !nfs_game::skill::damage_over_limit(&ms.mission, &zones);
                 (pass, t, 0)
             }
+        })
+    }
+
+    /// Fix the mission's verdict once, at the race end (`HMissionSummary::evaluate` 0x4293F0):
+    /// `[0x657834] = pass`; one of the up-to-three pass or fail text ids — the non-zero entries of
+    /// `[0x65780C…]` or `[0x657818…]` — chosen by `rand() % count` (0x429588…0x4295ED, after
+    /// `srand(time(0))` in the constructor, 0x428C25); and the `win*` / `lose*` music cue
+    /// (0x4AE4D0). The clock stands in for the CRT `rand()`.
+    fn fix_mission_result(&mut self) {
+        if self.mission_result.is_some() || !self.race.as_ref().is_some_and(|r| r.finished) {
+            return;
+        }
+        let Some((pass, _, _)) = self.mission_outcome() else { return };
+        let Some(ms) = self.mission.as_ref() else { return };
+        let ids = if pass { ms.mission.success_string_ids } else { ms.mission.failure_string_ids };
+        let ids: Vec<u32> = ids.iter().copied().filter(|t| *t != 0).collect();
+        let roll = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos() as usize);
+        let text = ids.get(roll % ids.len().max(1)).copied();
+        if let (Some(a), Some(m)) = (&self.snd.audio, self.snd.music.as_mut()) {
+            m.play_pattern(a, if pass { "win*" } else { "lose*" }, 1);
+        }
+        self.mission_result = Some((pass, text));
+    }
+
+    /// The mission's result line as `HMissionSummary` prints it: the text id `sprintf`ed with the
+    /// driver's name (`car+0x558 → +0x17C`, 0x429608…0x42962B) and broken at spaces into lines
+    /// shorter than 50 characters (0x42965A…).
+    fn mission_text_lines(&self) -> Vec<String> {
+        let Some((_, Some(id))) = self.mission_result else { return Vec::new() };
+        let text = self.fe.strings.get(id).unwrap_or_default().replacen("%s", &self.player_name, 1);
+        let mut lines: Vec<String> = Vec::new();
+        for w in text.split(' ').filter(|w| !w.is_empty()) {
+            match lines.last_mut() {
+                Some(l) if l.len() + 1 + w.len() < 50 => {
+                    l.push(' ');
+                    l.push_str(w);
+                }
+                _ => lines.push(w.to_string()),
+            }
+        }
+        lines
+    }
+
+    fn settle_mission(&mut self) {
+        let Some(ms) = self.mission.clone() else {
+            return;
         };
+        if !self
+            .career
+            .as_ref()
+            .is_some_and(|c| c.pending.as_ref().is_some_and(|p| p.mission.is_some()))
+        {
+            return;
+        }
+        self.fix_mission_result();
+        let Some((pass, t, cones)) = self.mission_outcome() else { return };
+        let text = self.mission_result.and_then(|r| r.1);
+        let driver = self.player_name.clone();
         if let Some(c) = self.career.as_mut() {
-            c.finish_mission(ms.index, pass, t, cones);
+            c.finish_mission(ms.index, pass, t, cones, text, &driver);
             tracing::info!(
                 mission = ms.mission.code,
                 pass,
@@ -9446,6 +11432,150 @@ impl App {
 
     /// Finishing order as driver indices (0 = player, 1.. = opponents in grid order): finished cars
     /// by total time, then unfinished cars by progress.
+    /// The post-race pages this race queues, in order.
+    fn result_pages(&self) -> Vec<ResultPage> {
+        if self.mission.is_some() {
+            return vec![ResultPage::MissionSummary];
+        }
+        // the three test drives (game types 6, 7, 8) queue nothing at all (0x426C98…0x426CB2)
+        if self.fe.test_drive.is_some() {
+            return Vec::new();
+        }
+        if let Some(id) = self.finale_notice() {
+            return vec![ResultPage::Notice(id)];
+        }
+        let mut pages = vec![ResultPage::Summary];
+        if let Some((rank, last, _)) = self.tournament_rank() {
+            if last && rank <= 3 {
+                pages.push(ResultPage::TournamentPlace(rank));
+            }
+            pages.push(ResultPage::Standings);
+            if last && rank > 3 {
+                pages.push(ResultPage::Notice(18160));
+            }
+        }
+        if self.hud_records.is_some() {
+            pages.push(ResultPage::Records);
+        }
+        pages
+    }
+
+    /// The player's rank in the standings with this race in them (1-based), and the front end's
+    /// `(TOURNAMENTLASTRACE, TOURNAMENTENDOFERA)` for this event — `None` outside a tournament.
+    fn tournament_rank(&self) -> Option<(usize, bool, bool)> {
+        let (t, event) = self.tournament_event()?;
+        let c = self.career.as_ref()?;
+        let (order, times) = self.finishing_order();
+        let clean = self.clean_racers();
+        let st = c.career.standings_after(&t, event, &order, &times, &clean);
+        let rank = st.iter().position(|(d, ..)| *d == 0)? + 1;
+        let (last, end_of_era) = c.career.tournament_flags(&c.tables, &t);
+        Some((rank, last, end_of_era))
+    }
+
+    /// Speech as the page after the summary opens in a tournament. On the last race the queue first
+    /// shows `HCongrats` with the tournament place when it is 1–3 (0x426E5D), whose update says
+    /// **kTourPlaced** `0x4A6500(place − 1)` — `Tour-Cwon`/`Cplaced2nd`/`Cplaced3rd` or
+    /// `Tour-won`/`placed2nd`/`placed3rd` by `rand & 1` — and then **kNextTournament**
+    /// (`Bon-moveon` / `Bon-readytochalnexttour`) unless `TOURNAMENTENDOFERA` (0x41D10D…0x41D140).
+    /// On any other race the standings say **kTournamentLeader** `Bon-youretournleader` when the
+    /// player's row is the first (0x4A64D0, `sfx.md` §7.2, MEDIUM). The `HCongrats` picture itself
+    /// is not drawn by this port.
+    /// An era finale (game type 10) queues **only** an `HInfo` (0x4270EF…0x42726E): no
+    /// `HCongrats`, no summary, no records. The text is FE 18153 / 18154 / 18155 "you have won the
+    /// Classic / Golden / Modern Era bonus car" by `TOURNAMENTERA [0x6577E0]` when the player's
+    /// place `car+0xCD4` is 1, otherwise FE 18156 "Sorry, you did not win the bonus car". This port
+    /// showed the ordinary summary and records pages.
+    fn finale_notice(&self) -> Option<u32> {
+        let c = self.career.as_ref()?;
+        c.pending.as_ref().filter(|p| p.finale)?;
+        let era = match c.career.finale.as_ref()?.era {
+            nfs_formats::career::Era::Classic => 0,
+            nfs_formats::career::Era::Golden => 1,
+            nfs_formats::career::Era::Modern => 2,
+        };
+        let won = self.finishing_order().0.first() == Some(&0);
+        Some(if won { 18153 + era } else { 18156 })
+    }
+
+    /// The page on top closes and the queue shows the next one (0x4261ED, or the page's own
+    /// timeout), with the speech the next one opens with. Past the last page nothing is shown.
+    /// Close the page on top: a billboard first **shrinks** (state 2, 0x41A814…0x41A839: `h/5` a
+    /// frame down to the 40-px floor, then state 0), and only then does the queue show the next
+    /// page ([`App::advance_results_page`]). The tournament `HCongrats` just goes.
+    fn close_results_page(&mut self) {
+        let page = self.result_pages().get(self.results_page as usize).copied();
+        if matches!(page, Some(ResultPage::TournamentPlace(_)) | None) {
+            self.advance_results_page();
+        } else if self.page_closing.is_none() {
+            self.page_closing = Some(0);
+        }
+    }
+
+    fn advance_results_page(&mut self) {
+        self.page_closing = None;
+        self.results_page += 1;
+        self.results_page_tick = self.tick;
+        match self.result_pages().get(self.results_page as usize) {
+            // the tournament `HCongrats` speaks as it opens; with no top-three page the
+            // standings may say "tournament leader"
+            Some(ResultPage::TournamentPlace(_)) => self.tournament_speech(),
+            Some(ResultPage::Standings)
+                if !matches!(
+                    self.result_pages().get(self.results_page as usize - 1),
+                    Some(ResultPage::TournamentPlace(_))
+                ) =>
+            {
+                self.tournament_speech()
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the page on top closes by itself, and after how many ticks: an `HBillBoard` built
+    /// with its timeout byte `+0x118` closes once `[0x606AC4]` is more than **0x280** past the tick
+    /// it opened at (0x41A7B6…0x41A7E3) — the summary, the standings, the records and `HInfo`
+    /// pass 1 as the constructor's seventh argument (calls 0x42BD08, 0x431897, 0x433874, 0x428328); the
+    /// mission summary and the pause menu pass 0. The tournament `HCongrats` closes itself past
+    /// 0xC0 ticks (0x41DD40).
+    fn page_timeout(page: ResultPage) -> Option<u64> {
+        match page {
+            ResultPage::Summary | ResultPage::Standings | ResultPage::Records | ResultPage::Notice(_) => Some(0x280),
+            ResultPage::TournamentPlace(_) => Some(0xC0),
+            ResultPage::MissionSummary | ResultPage::Closed => None,
+        }
+    }
+
+    fn tournament_speech(&self) {
+        let Some((rank, last, end_of_era)) = self.tournament_rank() else { return };
+        let (Some(a), Some(sp)) = (&self.snd.audio, &self.snd.speech) else { return };
+        let rnd = self.tick as usize;
+        if last && rank <= 3 {
+            let set = if rnd & 1 == 0 {
+                ["Tour-Cwon.bnk", "Tour-Cplaced2nd.bnk", "Tour-Cplaced3rd.bnk"]
+            } else {
+                ["Tour-won.bnk", "Tour-placed2nd.bnk", "Tour-placed3rd.bnk"]
+            };
+            sp.say(a, set[rank - 1], 0.9);
+            if !end_of_era {
+                sp.say(a, if (rnd >> 1) & 1 == 0 { "Bon-moveon.bnk" } else { "Bon-readytochalnexttour.bnk" }, 0.9);
+            }
+        } else if !last && rank == 1 {
+            sp.say(a, "Bon-youretournleader.bnk", 0.9);
+        }
+    }
+
+    /// The tournament and event this race is, when it is one (game type 4 — not a mission, not a
+    /// finale).
+    fn tournament_event(&self) -> Option<(nfs_formats::career::Tournament, usize)> {
+        let c = self.career.as_ref()?;
+        let p = c.pending.as_ref()?;
+        if p.mission.is_some() || p.finale {
+            return None;
+        }
+        Some((c.tables.tournament(p.tournament)?.clone(), p.event))
+    }
+
     /// Which racers took no new body damage (`career::clean_race`), by driver index.
     fn clean_racers(&self) -> [bool; 8] {
         let mut clean = [true; 8];
@@ -9456,6 +11586,111 @@ impl App {
             clean[i + 1] = nfs_game::career::clean_race(self.start_damage[i + 1], &o.vehicle.damage);
         }
         clean
+    }
+
+    /// The opponents of a quick race, a quick knockout and a knockout series: `FEOpponentCarAccessor`
+    /// 0x4F4FA0 (`modes.md` §1.1a) — the candidate list is every racing-car record with a model on
+    /// disk (0x4F3E40), the choice is the menu's `OpponentCar.Car`, and each opponent draws its own
+    /// paint set — then one `nfs5.per` driver each (0x4E3160, §1.1). `selected` is the player's
+    /// catalogue index. The skill pairs go in with the knockout series' own 1.0 difficulty.
+    fn quick_opponents(
+        paths: &GamePaths,
+        strings: &nfs_formats::locale::Strings,
+        opp_choice: u32,
+        difficulty: u8,
+        catalog: &[nfs_formats::fedata::CarCatalogEntry],
+        selected: usize,
+        n: usize,
+    ) -> Vec<CareerOpponent> {
+        use nfs_game::opponents::{CRand, FeRng, OpponentChoice, fill};
+        let dir = paths.car_model_dir();
+        let candidates: Vec<usize> = catalog
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.kind == 0
+                    && !c.sim.is_empty()
+                    && GamePaths::find_file(&dir, &format!("{}.crp", c.model))
+                        .is_some()
+            })
+            .map(|(i, _)| i)
+            .collect();
+        // the paint packages of `GameData/CarModel/packages.ini` (`[header] count`)
+        let package_count = std::fs::read_to_string(dir.join("packages.ini"))
+            .ok()
+            .and_then(|t| {
+                t.lines().find_map(|l| {
+                    l.trim()
+                        .strip_prefix("count=")
+                        .and_then(|v| v.trim().parse::<u32>().ok())
+                })
+            })
+            .unwrap_or(0);
+        let choice = OpponentChoice::from_index(opp_choice);
+        let mut crand = CRand::default();
+        let picks = fill(
+            &catalog,
+            &candidates,
+            selected,
+            choice,
+            &mut FeRng::from_clock(),
+            &mut crand,
+            package_count,
+        );
+        // `0x4EBBA0` then draws `0x4E3160(nOpp, Game.Difficutly)`: one `nfs5.per`
+        // driver per opponent, without replacement, from the records of that
+        // difficulty class (`modes.md` §1.1), and hands each car
+        // `.DRIVERNAME = FEStrings[per+4]` (0x4E30E0 → 0x4EEDA0 → option 0x13B,
+        // car-info `+0x17C`) and the record's skill pairs (0x240…0x246). This port
+        // gave a quick race's opponents no driver at all: the car's name stood in for
+        // theirs, and their skill was left at the default.
+        let per_table = std::fs::read(paths.fe_data().join("Data").join("nfs5.per"))
+            .ok()
+            .and_then(|d| nfs_formats::career::parse_personalities(&d).ok())
+            .unwrap_or_default();
+        let drivers = nfs_game::career::pick_personalities(
+            &per_table,
+            Some(difficulty as u32),
+            n,
+            |len| crand.next() as usize % len,
+        );
+        tracing::info!(
+            choice = choice.label(),
+            candidates = candidates.len(),
+            player = catalog[selected].display_name,
+            cars = ?picks.iter().take(n).map(|p| (catalog[p.car].display_name.as_str(), p.paint_set, p.package, p.decal)).collect::<Vec<_>>(),
+            "opponent cars"
+        );
+        picks
+            .iter()
+            .take(n)
+            .enumerate()
+            .map(|(i, p)| {
+                let entry = catalog[p.car].clone();
+                let paint = entry
+                    .paint_sets
+                    .get(p.paint_set)
+                    .map(|s| s.colours[0])
+                    .unwrap_or([0x20, 0x40, 0xC0]);
+                let driver = drivers
+                    .get(i)
+                    .and_then(|id| per_table.iter().find(|p| p.id == *id));
+                let name = driver
+                    .and_then(|p| strings.get(p.name_string_id))
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| entry.display_name.clone());
+                CareerOpponent {
+                    car: entry,
+                    paint,
+                    name,
+                    difficulty: 1.0,
+                    skill: driver.map_or([[1.0, 0.0]; 4], |p| p.skill),
+                    grid: None,
+                    personality: driver.map_or(0, |p| p.id),
+                    parts: Vec::new(),
+                }
+            })
+            .collect()
     }
 
     fn finishing_order(&self) -> (Vec<usize>, [u64; 8]) {
@@ -9594,6 +11829,7 @@ impl App {
                         color: c,
                         rotation: 0.0,
                         pivot: [0.0, 0.0],
+                        tri: None,
                     };
                     let mut scene = nfs_renderer::Scene::default();
                     let _ = &atlas;
@@ -9620,6 +11856,7 @@ impl App {
                             color: c,
                             rotation: 0.0,
                             pivot: [0.0, 0.0],
+                            tri: None,
                         };
                         scene.sprites.push(a(0.15, [0.0, 0.0, 0.0, 1.0]));
                         scene.sprites.push(a(0.45, [1.0, 1.0, 1.0, 1.0]));
@@ -9695,6 +11932,18 @@ impl App {
             }
             return;
         }
+        self.start_race(renderer, window, event_loop);
+    }
+
+    /// "race again" — command 3 at 0x415721: the race audio is reset (0x4AB360), the simulation is
+    /// set up again (0x412090) with the same options, `REPLAY [0x657424]` and `[0x5E99F4]` are
+    /// cleared so the new run records afresh, and the frame loop carries on — no front-end round
+    /// trip. Here that is `start_race` again on the loaded track and car.
+    fn restart_race(&mut self, event_loop: &ActiveEventLoop) {
+        self.stop_race_audio();
+        self.replay.stream = Some(nfs_game::replay::Replay::new());
+        let (Some(renderer), Some(window)) = (self.renderer.take(), self.window.take()) else { return };
+        self.tick = 0;
         self.start_race(renderer, window, event_loop);
     }
 
@@ -9784,7 +12033,9 @@ impl App {
         if night {
             tracing::info!(track = self.track.name, "night track");
         }
-        self.hud = Hud::load(&mut renderer, &self.paths, self.dials, night);
+        let mph = self.choice_index("Display.SpeedUnits").is_some_and(|(i, _)| i != 0);
+        self.hud = Hud::load(&mut renderer, &self.paths, self.dials, night, mph);
+        self.wrong_way_blink = (0, 0, true);
         if let (Some(h), Some(t)) = (
             self.hud.as_mut(),
             SliceTable::from_crp(&self.track.crp, &self.track.crp_data).ok(),
@@ -9878,6 +12129,12 @@ impl App {
         };
         self.player_eliminated = false;
         self.record_done = false;
+        self.hud_records = None;
+        self.results_page = 0;
+        self.page_seen = None;
+        self.page_open_tick = None;
+        self.finish_mark = None;
+        self.mission_result = None;
         let n_cars = self.num_opponents + 1;
         // grid order: the player starts last (HYPOTHESIS — the original reads the slot from the
         // per-player record 0x658200+idx*0x580, not yet traced), opponents fill the slots ahead
@@ -9928,19 +12185,6 @@ impl App {
                     // list is every racing-car record with a model on disk (0x4F3E40), the choice is
                     // the menu's `OpponentCar.Car`, and each opponent draws its own paint set.
                     None => {
-                        use nfs_game::opponents::{CRand, FeRng, OpponentChoice, fill};
-                        let dir = self.paths.car_model_dir();
-                        let candidates: Vec<usize> = catalog
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, c)| {
-                                c.kind == 0
-                                    && !c.sim.is_empty()
-                                    && GamePaths::find_file(&dir, &format!("{}.crp", c.model))
-                                        .is_some()
-                            })
-                            .map(|(i, _)| i)
-                            .collect();
                         let selected = self
                             .player_car_id
                             .and_then(|id| catalog.iter().position(|c| c.id == id))
@@ -9951,47 +12195,9 @@ impl App {
                                 })
                             })
                             .unwrap_or(0);
-                        // the paint packages of `GameData/CarModel/packages.ini` (`[header] count`)
-                        let package_count = std::fs::read_to_string(dir.join("packages.ini"))
-                            .ok()
-                            .and_then(|t| {
-                                t.lines().find_map(|l| {
-                                    l.trim()
-                                        .strip_prefix("count=")
-                                        .and_then(|v| v.trim().parse::<u32>().ok())
-                                })
-                            })
-                            .unwrap_or(0);
-                        let choice = OpponentChoice::from_index(self.opp_choice);
-                        let picks = fill(
-                            &catalog,
-                            &candidates,
-                            selected,
-                            choice,
-                            &mut FeRng::from_clock(),
-                            &mut CRand::default(),
-                            package_count,
-                        );
-                        tracing::info!(
-                            choice = choice.label(),
-                            candidates = candidates.len(),
-                            player = catalog[selected].display_name,
-                            cars = ?picks.iter().take(self.num_opponents as usize).map(|p| (catalog[p.car].display_name.as_str(), p.paint_set, p.package, p.decal)).collect::<Vec<_>>(),
-                            "opponent cars"
-                        );
-                        picks
-                            .iter()
-                            .take(self.num_opponents as usize)
-                            .map(|p| {
-                                let entry = catalog[p.car].clone();
-                                let paint = entry
-                                    .paint_sets
-                                    .get(p.paint_set)
-                                    .map(|s| s.colours[0])
-                                    .unwrap_or([0x20, 0x40, 0xC0]);
-                                let name = entry.display_name.clone();
-                                (entry, paint, name, None, None)
-                            })
+                        Self::quick_opponents(&self.paths, &self.fe.strings, self.opp_choice, self.race_skill, &catalog, selected, self.num_opponents as usize)
+                            .into_iter()
+                            .map(|o| (o.car, o.paint, o.name, (o.personality != 0).then_some((o.difficulty, o.skill)), None))
                             .collect()
                     }
                 };
@@ -10739,6 +12945,15 @@ impl App {
             }
         }
         if let Some(path) = self.screenshot.take() {
+            // a scripted run seldom redraws, so the mirror may not have a texture yet: render it,
+            // and rebuild the scene once more so the HUD carries it
+            if self.rear_mirror.is_some() {
+                let first = self.mirror_tex.is_none();
+                self.render_mirror();
+                if first {
+                    self.rebuild_scene();
+                }
+            }
             let rgba = self
                 .renderer
                 .as_mut()
@@ -10859,17 +13074,27 @@ impl ApplicationHandler for App {
                     self.input.end_tick();
                     return;
                 }
-                // Esc / P / Start: pause; while paused Enter resumes, Esc again leaves to the menu (or quits)
-                if self.input.take_pressed(Action::Pause) {
+                // Esc / P / Start: pause. While paused the pause key backs out of the quit question,
+                // or else resumes — which key does that in the original was not read (APPROXIMATION);
+                // leaving goes through the menu's quit button and its question, as 0x426154 does.
+                // the pause action opens the pause menu (0x426800) only while the HUD's dialog queue
+                // is empty — 0x415180 / 0x415231 test it with 0x426A60 first — so with a post-race
+                // page on screen it does nothing (outside a network game); once the pages have
+                // closed it opens the menu, whose quit leaves
+                let page_up = self.race.as_ref().is_some_and(|r| r.finished)
+                    && !self.paused
+                    && self.result_pages().get(self.results_page as usize).is_some();
+                if page_up {
+                    let _ = self.input.take_pressed(Action::Pause);
+                } else if self.input.take_pressed(Action::Pause) {
                     if self.paused {
-                        self.paused = false;
-                        if self.leave_race() {
-                            self.input.end_tick();
-                            return;
+                        if self.pause_confirm.take().is_none() {
+                            self.paused = false;
                         }
-                        event_loop.exit();
                     } else if self.vehicle.is_some() {
                         self.paused = true;
+                        self.pause_sel = 0;
+                        self.pause_confirm = None;
                         if let (Some(a), Some(s)) = (&self.snd.audio, self.snd.sfx.as_mut()) {
                             s.stop_loops(a);
                         }
@@ -10900,19 +13125,77 @@ impl ApplicationHandler for App {
                         tracing::info!(speed = ?sp, "replay speed");
                     }
                 }
-                if self.paused
-                    && event.state == winit::event::ElementState::Pressed
-                    && event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Enter)
-                {
-                    self.paused = false;
+                // `HPauseMenu` 0x42A440: continue (0x46BC) answers 2 and closes it, race again (0x46BD)
+                // answers 3 — command 3, the in-place restart 0x415721 — and quit (0x46BE) answers
+                // 0x1A, the "Are you sure you want to exit?" question (0x46FB); its yes sets
+                // `[0x657E34] = 1` (aborted, 0x426182) and issues command 4, the exit
+                if self.paused && event.state == winit::event::ElementState::Pressed {
+                    use winit::keyboard::{KeyCode, PhysicalKey};
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::ArrowUp | KeyCode::ArrowLeft) => match self.pause_confirm.as_mut() {
+                            Some(c) => *c = 0,
+                            None => self.pause_sel = self.pause_sel.saturating_sub(1),
+                        },
+                        PhysicalKey::Code(KeyCode::ArrowDown | KeyCode::ArrowRight) => match self.pause_confirm.as_mut() {
+                            Some(c) => *c = 1,
+                            None => self.pause_sel = (self.pause_sel + 1).min(2),
+                        },
+                        PhysicalKey::Code(KeyCode::Enter) => match (self.pause_confirm, self.pause_sel) {
+                            (Some(0), _) => {
+                                self.paused = false;
+                                self.pause_confirm = None;
+                                if !self.leave_race() {
+                                    event_loop.exit();
+                                }
+                            }
+                            (Some(_), _) => self.pause_confirm = None,
+                            (None, 0) => self.paused = false,
+                            (None, 1) => {
+                                self.paused = false;
+                                self.restart_race(event_loop);
+                            }
+                            _ => self.pause_confirm = Some(1),
+                        },
+                        _ => {}
+                    }
                     self.input.end_tick();
                     return;
                 }
-                // after the finish, Enter returns to the menu (window and renderer are kept)
+                // `HMissionSummary`'s input slot 0x429390: a click on its "race again" button answers
+                // event 3 — the pause menu's restart — but **only when the mission failed**
+                // (`[0x657834] == 0`, 0x4293BB); otherwise it falls through to the billboard's Space.
+                // The HUD here has no mouse, so Enter stands in for the click (APPROXIMATION, as the
+                // pause menu's selection does)
                 if event.state == winit::event::ElementState::Pressed
                     && event.physical_key
                         == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Enter)
+                    && self.race.as_ref().is_some_and(|r| r.finished)
+                    && self.result_pages().get(self.results_page as usize) == Some(&ResultPage::MissionSummary)
+                    && self.mission_result.is_some_and(|(passed, _)| !passed)
+                {
+                    self.restart_race(event_loop);
+                    self.input.end_tick();
+                    return;
+                }
+                // **Space** closes the page on top and the queue shows the next (0x4272FF): the
+                // billboard's input slot 0x42A3D0 answers event 0x19 on the key-down edge of
+                // `[0x5DE028 + DIK_SPACE]` while its enable byte is set, and 0x4261ED slides the
+                // current page out. This port used Enter, which no billboard reads.
+                if event.state == winit::event::ElementState::Pressed
+                    && event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Space)
+                    && self.race.as_ref().map(|r| r.finished).unwrap_or(false)
+                    && (self.results_page as usize) + 1 < self.result_pages().len()
+                {
+                    self.close_results_page();
+                    self.input.end_tick();
+                    return;
+                }
+                // Space on the last page closes it and returns to the menu (window and renderer are
+                // kept); with no page at all (a test drive) the same key leaves
+                if event.state == winit::event::ElementState::Pressed
+                    && event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Space)
                     && self.race.as_ref().map(|r| r.finished).unwrap_or(false)
                     && let Some(menu) = self.fe.menu_template.take()
                 {
@@ -11521,6 +13804,36 @@ impl ApplicationHandler for App {
                 self.gamepads.poll(&mut self.input);
                 let now = Instant::now();
                 self.frame_dt = (now - self.last_frame).as_secs_f32();
+                if !self.paused {
+                    self.pause_offset += self.pause_ticks;
+                }
+                self.pause_ticks = if self.paused { self.pause_ticks + self.frame_dt as f64 * 64.0 } else { 0.0 };
+                // a billboard opening or closing plays sound 4 (0x41ADD0)
+                let key = if self.paused {
+                    if self.pause_confirm.is_some() { 2 } else { 1 }
+                } else {
+                    self.results_billboard.map_or(0, |p| 10 + p)
+                };
+                if key != self.billboard_key {
+                    self.billboard_key = key;
+                    self.fe_sound(4);
+                }
+                // the pause silences the race (0x4AB150: every voice to volume 0, `MusicStop(0)`) and
+                // the resume brings it back (0x4AB200: the levels restored, `MusicPlay(NULL, 0)`)
+                if self.paused != self.audio_paused {
+                    self.audio_paused = self.paused;
+                    if let Some(a) = &self.snd.audio {
+                        a.set_muted(self.paused);
+                        if let Some(m) = self.snd.music.as_mut() {
+                            if self.paused {
+                                m.stop(a);
+                            } else if self.race.as_ref().is_some_and(|r| !r.finished) && self.vehicle.is_some() {
+                                // not when the pause ended by leaving the race
+                                m.start_race(a);
+                            }
+                        }
+                    }
+                }
                 self.accumulator += now - self.last_frame;
                 self.last_frame = now;
                 if self.accumulator > Duration::from_millis(250) {
@@ -12051,6 +14364,12 @@ fn main() -> Result<()> {
         world_actions: Vec::new(),
         render_prev: None,
         frame_dt: 1.0 / 60.0,
+        pause_ticks: 0.0,
+        pause_offset: 0.0,
+        tray_slide: (0, 0),
+        audio_paused: false,
+        results_billboard: None,
+        billboard_key: 0,
         paused: false,
         knockout: None,
         player_grid_override: None,
@@ -12122,7 +14441,6 @@ fn main() -> Result<()> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1.0),
-        split_times: 1,
         records_path,
         car_id: catalog
             .iter()
@@ -12134,6 +14452,18 @@ fn main() -> Result<()> {
             .map(|p| p.name)
             .unwrap_or_else(|| "DRIVER".to_string()),
         record_done: false,
+        hud_records: None,
+        results_page: 0,
+        page_seen: None,
+        page_frames: 0,
+        page_open_tick: None,
+        page_closing: None,
+        pause_sel: 0,
+        pause_confirm: None,
+        finish_mark: None,
+        results_page_tick: 0,
+        mission_result: None,
+        cone_flash_until: 0,
         start_damage: [0; 8],
         track,
         car,
@@ -12211,19 +14541,27 @@ fn main() -> Result<()> {
         num_opponents,
         player_grid: 0,
         player_progress_tick: 0,
+        hud_metres: Vec::new(),
+        rear_mirror: None,
+        mirror_tex: None,
+        wrong_way_blink: (0, 0, true),
         record,
         num_laps,
         follow_road,
         car_half_width: 0.9,
         cam_dir: Vec3::ZERO,
         cam_y: 0.0,
+        chase_offset: None,
+        chase_settle: 0,
+        look_yaw: None,
+        slot_eye: None,
         wall_hits: 0,
         resets: 0,
         hud: None,
         dials: catalog
             .iter()
             .find(|c| c.sim.eq_ignore_ascii_case(&sim_name))
-            .map(|c| (c.dial_kmh, c.dial_tach)),
+            .map(|c| (c.dial_kmh, c.dial_mph, c.dial_tach)),
         paint,
         snd: AudioState {
             audio: None,
@@ -12285,3 +14623,22 @@ fn quickfix_kinds(name: &str) -> Option<&'static [u16]> {
 const QUICKFIX_NAMES: [&str; 10] = [
     "ENGINE", "BRAKES", "TRANSMISSION", "SUSPENSION", "SHOCKS", "BODYWORK", "SWAYBARS", "TIRES", "COSMETIC", "OVERALL",
 ];
+
+#[cfg(test)]
+mod congrats_tests {
+    use super::congrats_layout;
+
+    /// 0x41DDD0 / 0x41D2CD: the race instance stays centred; the tournament one leaves the centre at
+    /// 0xC0 ticks and reaches (96, 96) at half size 32 ticks later, and stays there.
+    #[test]
+    fn the_tournament_place_slides_to_the_corner_and_halves() {
+        assert_eq!(congrats_layout(500, false), (320.0, 240.0, 1.0));
+        assert_eq!(congrats_layout(0xBF, true), (320.0, 240.0, 1.0));
+        assert_eq!(congrats_layout(0xC0, true), (320.0, 240.0, 1.0));
+        let (x, y, s) = congrats_layout(0xC0 + 16, true);
+        assert_eq!((x, y), (208.0, 168.0));
+        assert!((s - 0.75).abs() < 1e-6);
+        assert_eq!(congrats_layout(0xC0 + 32, true), (96.0, 96.0, 0.5));
+        assert_eq!(congrats_layout(0xC0 + 400, true), (96.0, 96.0, 0.5));
+    }
+}

@@ -407,6 +407,7 @@ pub fn part_wear_for(tables: &CareerTables, owned: &OwnedCar) -> nfs_physics::sp
         let w = nfs_physics::specs::PartWear {
             scale: parts.iter().map(|p| 1.5 - 0.005 * p.condition).sum(),
             offset: parts.iter().map(|p| owned.part_state.iter().find(|(id, _)| *id == p.id).map(|(_, s)| *s).unwrap_or(p.state as f32)).sum(),
+            count: parts.len() as u32,
         };
         match group {
             "engine" => out.engine = w,
@@ -1087,7 +1088,9 @@ impl Career {
     /// ([`clean_race`]) — the event bonus is paid only then. `garage_idx` = the player's car
     /// (mileage / wins).
     #[allow(clippy::too_many_arguments)]
-    pub fn record_event(&mut self, tables: &CareerTables, t: &Tournament, event: usize, order: &[usize], times: &[u64; 8], clean: &[bool; 8], garage_idx: Option<usize>) -> EventOutcome {
+    /// `0x503960` for every racer of one event: points `9 − pos`, prize by position, and the
+    /// bonus for a clean top three. Returns the record the event is stored as.
+    fn event_result(t: &Tournament, event: usize, order: &[usize], times: &[u64; 8], clean: &[bool; 8]) -> EventResult {
         let ev = &t.events[event];
         let mut points = [0u8; 8];
         let mut earned = [0u32; 8];
@@ -1118,6 +1121,39 @@ impl Career {
         }
         let prize = ev.prize[position as usize - 1];
         let bonus = earned[0] - prize;
+        EventResult { position, prize, bonus, points, earned, times: *times }
+    }
+
+    /// The two race options the front end sets for a tournament event (0x4ECAFD…0x4ECB5B), as
+    /// `(TOURNAMENTLASTRACE, TOURNAMENTENDOFERA)` — options 0xB9 `[0x6577D8]` and 0xBA
+    /// `[0x6577DC]`. CONFIRMED:
+    /// * last race: exactly one event of the tournament is still undone (`0x504300(tid) == 1`);
+    /// * end of era: the last race, **and** only one visible tournament of the current era is
+    ///   still uncompleted (`0x5047B0(era) == 1`), **and** this one is not a `+0xE2` club event
+    ///   (`0x504B00`), **and** it has never been completed (`+0xD3C == 0`, `0x503A70`).
+    pub fn tournament_flags(&self, tables: &CareerTables, t: &Tournament) -> (bool, bool) {
+        let st = self.state(t.id);
+        let last = t.events.len().saturating_sub(st.events.len()) == 1;
+        let open_in_era = tables
+            .era_tournaments(self.era)
+            .iter()
+            .filter(|x| !x.is_hidden() && !self.state(x.id).completed)
+            .count();
+        let end_of_era = last && open_in_era == 1 && !t.knockout && st.completions == 0;
+        (last, end_of_era)
+    }
+
+    /// The standings as they will stand once this event is recorded — what `HTournamentStandings`
+    /// shows at the end of the race, before the front end files the result.
+    pub fn standings_after(&self, t: &Tournament, event: usize, order: &[usize], times: &[u64; 8], clean: &[bool; 8]) -> Vec<(usize, u32, u32, u64)> {
+        let mut events = self.state(t.id).events.clone();
+        events.push(Self::event_result(t, event, order, times, clean));
+        standings_of(&events, t.time_ranked())
+    }
+
+    pub fn record_event(&mut self, tables: &CareerTables, t: &Tournament, event: usize, order: &[usize], times: &[u64; 8], clean: &[bool; 8], garage_idx: Option<usize>) -> EventOutcome {
+        let result = Self::event_result(t, event, order, times, clean);
+        let (prize, bonus) = (result.prize, result.bonus);
         self.money = (self.money + prize as i64 + bonus as i64).clamp(-999_999_999, 999_999_999);
         if let Some(car) = garage_idx.and_then(|i| self.garage.get_mut(i)) {
             car.mileage += 3000;
@@ -1131,7 +1167,6 @@ impl Career {
                 car.wins += 1;
             }
         }
-        let result = EventResult { position, prize, bonus, points, earned, times: *times };
         let mut outcome = EventOutcome { result: result.clone(), final_rank: None, tournament_prize: 0, reset: false, era_advanced: false };
         let st = self.tournaments.entry(t.id).or_default();
         st.entered = true;
@@ -1529,6 +1564,36 @@ mod tests {
 
     fn tables(ts: Vec<Tournament>) -> CareerTables {
         CareerTables { raw: Default::default(), tracks: vec![], tournaments: ts, parts: vec![], personalities: vec![], missions: vec![], strings: Strings::default(), catalog: vec![] }
+    }
+
+    /// 0x4ECAFD…0x4ECB5B: the last race is the one undone event; the end of the era also needs it
+    /// to be the era's only open tournament, never completed before.
+    #[test]
+    fn last_race_and_end_of_era_flags() {
+        let a = tournament(1, 2, false);
+        let b = tournament(2, 2, false);
+        let tables = tables(vec![a.clone(), b.clone()]);
+        let mut c = Career::default();
+        let r = EventResult { position: 1, prize: 0, bonus: 0, points: [0; 8], earned: [0; 8], times: [0; 8] };
+        assert_eq!(c.tournament_flags(&tables, &a), (false, false), "two events to go");
+        c.tournaments.entry(1).or_default().events.push(r.clone());
+        assert_eq!(c.tournament_flags(&tables, &a), (true, false), "b is still open");
+        c.tournaments.entry(2).or_default().completed = true;
+        assert_eq!(c.tournament_flags(&tables, &a), (true, true), "a is the era's last");
+        c.tournaments.entry(1).or_default().completions = 1;
+        assert_eq!(c.tournament_flags(&tables, &a), (true, false), "won before: not the era's end");
+    }
+
+    /// `HTournamentStandings` shows the table with this event in it, before the front end files
+    /// the result — and building it changes nothing.
+    #[test]
+    fn standings_after_the_race_include_it_without_recording_it() {
+        let t = tournament(1, 2, false);
+        let c = Career::default();
+        let st = c.standings_after(&t, 0, &[2, 0, 1, 3, 4, 5, 6, 7], &[6400; 8], &[true; 8]);
+        assert_eq!(st[0].0, 2, "the winner leads");
+        assert_eq!((st[1].0, st[1].1, st[1].2), (0, 7, 800 + 200));
+        assert!(c.state(1).events.is_empty(), "nothing recorded");
     }
 
     /// 0x501FD0: an eighty-first car is refused after the money check, and nothing is spent.
