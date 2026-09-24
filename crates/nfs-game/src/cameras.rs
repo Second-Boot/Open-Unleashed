@@ -48,6 +48,15 @@ pub struct TrackCamera {
     /// `+0x90` set: the dolly law of 0x462B80 with `+0x94` as its near distance (the switch,
     /// 0x413AF1…0x413B06). 382 of the shipped cameras.
     pub dolly: Option<f32>,
+    /// `+0x80` (line 4's first integer): with view 11 the switch raises the eye by `+0x84` at once
+    /// (0x413B23…0x413B3A)
+    pub raise: bool,
+    /// `+0xA0` (line 5's last float, 0.6 in the sample): the switch stores it in the slot's `+0xCC`
+    /// (0x413B42…0x413B47) — SplineCam's pace
+    pub pace: f32,
+    /// `+0xB4` (line 6), copied by vt 0x469B20 into the slot's `+0x60…+0x68` (0x413B4D…0x413B6D) —
+    /// SplineCam's offset along the slice's lateral / up / forward axes
+    pub spline_offset: Vec3,
 }
 
 /// The TV view's slot state — what the switch 0x413960 leaves in slot 0 and what 0x462E30 /
@@ -56,6 +65,10 @@ pub struct TrackCamera {
 pub struct TvSlot {
     /// the eye as the last enabled switch placed it (`+0x24`, 0x413A00…0x413A16)
     pub eye: Option<Vec3>,
+    /// the view the last enabled switch set: 0x413960 runs SetSlotView(0, `+0x78`) (0x4139D3…
+    /// 0x4139DD), so a camera element whose id is not 12 puts the TV slot into that view — 11
+    /// SplineCam on 52 shipped cameras, 8 on 24, 10 CircleCam on 13, 6 / 9 / 3 on four
+    pub view: Option<u16>,
     /// the element's own matrix (forward, up) when its `+0x88` is 0 (0x413A5A…0x413A7F)
     pub fixed_view: Option<(Vec3, Vec3)>,
     /// a **disabled** camera with `+0x88` 0 clears the aim bit without giving a matrix
@@ -65,6 +78,11 @@ pub struct TvSlot {
     pub lift: f32,
     /// `+0x58`, the half-angle the build takes (degrees)
     pub half_angle: f32,
+    /// SplineCam's eye (`+0x24`), its tracker slice (`+0xDC`), pace `+0xCC` and offset `+0x60`
+    pub spline_eye: Option<Vec3>,
+    pub spline_slice: Option<usize>,
+    pub pace: f32,
+    pub spline_offset: Vec3,
     flag34: bool,
     a38: f32,
     a78: f32,
@@ -78,7 +96,24 @@ impl Default for TvSlot {
         let h = crate::camera::DEFAULT_HALF_ANGLE;
         // SetSlotView 0x465790: +0x34 0, +0x38 = +0x78 = +0x58 = 37.5, +0x44 1.0, +0x48 0.02,
         // +0x3C 0, +0x30 3.0 (0x465854…0x465896)
-        Self { eye: None, fixed_view: None, frozen: false, lift: 3.0, half_angle: h, flag34: false, a38: h, a78: h, t44: 1.0, step48: 0.02, dolly: None }
+        Self {
+            eye: None,
+            view: None,
+            fixed_view: None,
+            frozen: false,
+            lift: 3.0,
+            half_angle: h,
+            spline_eye: None,
+            spline_slice: None,
+            pace: 0.0,
+            spline_offset: Vec3::ZERO,
+            flag34: false,
+            a38: h,
+            a78: h,
+            t44: 1.0,
+            step48: 0.02,
+            dolly: None,
+        }
     }
 }
 
@@ -96,9 +131,13 @@ impl TvSlot {
     pub fn switch(&mut self, c: &TrackCamera) {
         let fov = c.fov_flag.then_some(c.half_angle);
         if c.enabled {
-            *self = Self { eye: self.eye, ..Self::default() };
+            *self = Self { eye: self.eye, pace: self.pace, ..Self::default() };
+            self.view = u16::try_from(c.view).ok();
             if c.has_position {
                 self.eye = Some(c.position);
+                // SplineCam starts from the element's place, raised by `+0x84` when `+0x80` is set
+                let raise = if c.view == 11 && c.raise { c.lift } else { 0.0 };
+                self.spline_eye = Some(c.position + Vec3::Y * raise);
             }
             self.fixed_view = c.fixed_view;
             if let Some(a) = fov {
@@ -119,6 +158,8 @@ impl TvSlot {
         // `+0x3C` takes `+0x90` either way; `+0x40` only when it is set
         self.dolly = c.dolly;
         self.lift = c.lift;
+        self.pace = c.pace;
+        self.spline_offset = c.spline_offset;
     }
 
     /// 0x462B80(slot, d), `d` the car's distance from the eye. With the dolly: nothing while
@@ -222,6 +263,9 @@ impl TrackCameras {
                 _ => None,
             },
             fov_flag: p.get(6).is_some_and(|&f| f != 0.0),
+            raise: e.params.first().and_then(|l| l.first()).is_some_and(|&f| f != 0.0),
+            pace: p.get(8).copied().unwrap_or(0.0),
+            spline_offset: e.params.get(2).and_then(|l| Some(Vec3::new(*l.first()?, *l.get(1)?, *l.get(2)?))).unwrap_or(Vec3::ZERO),
             dolly: match (p.get(3), p.get(5)) {
                 (Some(&f), Some(&d0)) if f != 0.0 => Some(d0),
                 _ => None,
@@ -311,7 +355,7 @@ mod tests {
 
     #[test]
     fn tv_dolly_holds_the_car_size() {
-        let c = TrackCamera { position: Vec3::ZERO, view: 12, enabled: true, has_position: true, half_angle: 37.5, lift: 0.0, fov_flag: false, fixed_view: None, dolly: Some(5.0) };
+        let c = TrackCamera { position: Vec3::ZERO, view: 12, enabled: true, has_position: true, half_angle: 37.5, lift: 0.0, fov_flag: false, fixed_view: None, dolly: Some(5.0), raise: false, pace: 0.0, spline_offset: Vec3::ZERO };
         let mut tv = TvSlot::default();
         tv.switch(&c);
         tv.update(3.0); // nearer than +0x40: unchanged

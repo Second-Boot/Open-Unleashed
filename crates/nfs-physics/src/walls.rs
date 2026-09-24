@@ -18,6 +18,9 @@ pub struct Wall {
     /// 3 m from the car, which is why a car that had dropped into a dip drove straight through the
     /// wall line and out of the world (`RE/notes/physics.md` §4.1c-bis, found 2026-09-23).
     pub y_mid: f32,
+    /// The two ends' heights, lower and higher.
+    pub y_lo: f32,
+    pub y_hi: f32,
     /// Wall material class 0..5 = metal, wood, snow, ice, earth, rock (`WallImpulse` 0x494000
     /// byte tables 0x49442C / 0x4943BC over the `.edg` word 0x10..0x60; other words → rock).
     pub class: u8,
@@ -54,7 +57,14 @@ impl WallSet {
     /// Build from `(p1, p2, wall word)` segments (`.edg` records; barrier boxes use 0x60).
     pub fn build(segments: impl Iterator<Item = ([f32; 3], [f32; 3], u32)>, cell: f32) -> Self {
         let walls: Vec<Wall> = segments
-            .map(|(p1, p2, word)| Wall { a: Vec2::new(p1[0], p1[2]), b: Vec2::new(p2[0], p2[2]), y_mid: (p1[1] + p2[1]) * 0.5, class: wall_class(word) })
+            .map(|(p1, p2, word)| Wall {
+                a: Vec2::new(p1[0], p1[2]),
+                b: Vec2::new(p2[0], p2[2]),
+                y_mid: (p1[1] + p2[1]) * 0.5,
+                y_lo: p1[1].min(p2[1]),
+                y_hi: p1[1].max(p2[1]),
+                class: wall_class(word),
+            })
             .filter(|w| (w.a - w.b).length_squared() > 1e-6)
             .collect();
         let mut min = Vec2::splat(f32::MAX);
@@ -168,5 +178,78 @@ impl WallSet {
             }
         }
         best.map(|(_, _, n, q, c)| (n, q, c))
+    }
+}
+
+impl WallSet {
+    /// **The camera's wall push 0x464500** on the eye `eye` of a camera following a car at `car`
+    /// whose ground height is `car+0x41C` = `ground`: for each edge near the segment (0x473E00),
+    /// the xz crossing of `eye → car` with the edge (0x489CC0: both parameters within [0, 1]); an
+    /// edge whose higher end is more than `[0x5B38EC]` 3.5 below `ground`, or whose lower end is
+    /// more than 3.5 above it, is passed over unless `any_height` (`[0x5CF584]` = 0, Castle); else
+    /// the eye moves to the crossing plus the edge's unit left normal `(−e.z, 0, e.x)`, its height
+    /// `2·y₀ − crossing.y` with `y₀` the eye's height on entry (0x4646BE…0x4646DE), and the next
+    /// edge is tested from there. Returns whether the eye moved.
+    pub fn camera_push(&self, eye: &mut Vec3, car: Vec3, ground: f32, any_height: bool) -> bool {
+        if self.walls.is_empty() {
+            return false;
+        }
+        let y0 = eye.y;
+        let idx = |v: Vec2| ((((v.x - self.min.x) / self.cell).floor().max(0.0) as usize).min(self.nx - 1), (((v.y - self.min.y) / self.cell).floor().max(0.0) as usize).min(self.nz - 1));
+        let (a, b) = (Vec2::new(eye.x, eye.z), Vec2::new(car.x, car.z));
+        let (x0, z0) = idx(a.min(b));
+        let (x1, z1) = idx(a.max(b));
+        let mut seen = std::collections::HashSet::new();
+        let mut moved = false;
+        for z in z0..=z1 {
+            for x in x0..=x1 {
+                for &wi in &self.cells[z * self.nx + x] {
+                    if !seen.insert(wi) {
+                        continue;
+                    }
+                    let w = &self.walls[wi as usize];
+                    // 0x489CC0 with A = eye → car and B = the edge
+                    let (dax, daz) = (car.x - eye.x, car.z - eye.z);
+                    let (dbx, dbz) = (w.b.x - w.a.x, w.b.y - w.a.y);
+                    let denom = dax * dbz - dbx * daz;
+                    if denom == 0.0 {
+                        continue;
+                    }
+                    let (wx, wz) = (eye.x - w.a.x, eye.z - w.a.y);
+                    let u = (wz * dbx - wx * dbz) / denom;
+                    let v = (wz * dax - wx * daz) / denom;
+                    if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                        continue;
+                    }
+                    if !any_height && (w.y_hi + 3.5 < ground || w.y_lo - 3.5 > ground) {
+                        continue;
+                    }
+                    let hit = *eye + (car - *eye) * u;
+                    let e = Vec2::new(dbx, dbz).normalize_or_zero();
+                    *eye = Vec3::new(hit.x - e.y, 2.0 * y0 - hit.y, hit.z + e.x);
+                    moved = true;
+                }
+            }
+        }
+        moved
+    }
+}
+
+#[cfg(test)]
+mod camera_push_tests {
+    use super::*;
+
+    #[test]
+    fn a_wall_between_the_car_and_the_eye_pulls_the_eye_in_front_of_it() {
+        // a wall along x at z = 5, drawn left to right; the car at z = 10, the eye behind the wall
+        let set = WallSet::build([([-10.0, 0.0, 5.0], [10.0, 0.0, 5.0], 0x60)].into_iter(), 30.0);
+        let mut eye = Vec3::new(0.0, 3.0, 0.0);
+        assert!(set.camera_push(&mut eye, Vec3::new(0.0, 1.0, 10.0), 0.0, false));
+        // crossing at z = 5 (y = 2 there), plus the left normal (0, 0, 1): z = 6; y = 2·3 − 2 = 4
+        assert!((eye - Vec3::new(0.0, 4.0, 6.0)).length() < 1e-5, "{eye}");
+        // an edge far below the car's ground is passed over, except on Castle
+        let mut eye = Vec3::new(0.0, 3.0, 0.0);
+        assert!(!set.camera_push(&mut eye, Vec3::new(0.0, 1.0, 10.0), 10.0, false));
+        assert!(set.camera_push(&mut eye, Vec3::new(0.0, 1.0, 10.0), 10.0, true));
     }
 }

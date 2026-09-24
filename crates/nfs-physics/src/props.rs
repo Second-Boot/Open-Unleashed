@@ -25,6 +25,10 @@ pub struct Prop {
     /// `None` for a definition without pieces: slot 8 (0x487290 → 0x4767D0 → 0x476380) then always
     /// answers 2, a solid hit (`def+0x18 == 0`, 0x4763BC…0x4763C5).
     pub breakable: Option<Breakable>,
+    /// `+0x24`, the definition's `drivethru` byte (`def+0x14`, passed by the loader 0x4751EC /
+    /// 0x4752D9 through the base constructor 0x486340): without an animation instance slot 8
+    /// answers `2 + (+0x24 != 0)` (0x4872CD…0x4872D7) — 3, a drive-through scrape, for `BUSH`
+    pub drive_through: bool,
 }
 
 /// A prop whose `animdefs.txt` definition has pieces (`BBOX`, the crate stacks): the answer of
@@ -64,6 +68,15 @@ impl Breakable {
 }
 
 impl Prop {
+    /// Slot 8, 0x487290: the pieces' answer when the object has an animation instance, else
+    /// `2 + drivethru` (0x4872CD…0x4872D7).
+    pub fn answer(&self, tick: u32, velocity: Vec3) -> u32 {
+        match &self.breakable {
+            Some(b) => b.answer(tick, velocity),
+            None => 2 + u32::from(self.drive_through),
+        }
+    }
+
     /// Slot 1, 0x486490: the AABB's middle.
     pub fn centre(&self) -> Vec3 {
         (self.aabb_min + self.aabb_max) * 0.5
@@ -103,7 +116,7 @@ pub fn segments_cross(a0: Vec3, a1: Vec3, b0: Vec3, b1: Vec3) -> Option<Vec3> {
     Some(a0 + (a1 - a0) * ua)
 }
 
-/// The box's slot 6, 0x486FB0(seg, …, &normal, &point): each of its edges `i → i+1` against the
+/// The box's slot 7 (vtable 0x5B4938), 0x486FB0(seg, …, &normal, &point): each of its edges `i → i+1` against the
 /// car's edge `seg`. The answer is the number of crossings; the first sets the point, the edge's
 /// normal `(e.z, 0, −e.x)` and the distance from the car edge's start; a later one moves the point
 /// only when nearer — without keeping the new distance — and always takes the normal
@@ -187,6 +200,14 @@ pub fn box_footprint(points: &[Vec3]) -> [Vec3; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0x487290 without an animation instance: 2 (solid), or 3 for a `drivethru` object.
+    #[test]
+    fn a_bush_is_driven_through() {
+        let p = |drive_through| Prop { shape: PropShape::Cylinder { radius: 0.25 }, aabb_min: Vec3::ZERO, aabb_max: Vec3::ONE, class: 1, breakable: None, drive_through };
+        assert_eq!(p(false).answer(0, Vec3::X), 2);
+        assert_eq!(p(true).answer(0, Vec3::X), 3);
+    }
 
     /// 0x4767D0: the first hit starts the pieces (1), every later one passes (0); a group whose
     /// first piece does not resolve stays solid (2) and starts nothing.

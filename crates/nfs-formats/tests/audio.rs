@@ -286,7 +286,7 @@ fn music_stream_first_two_seconds() {
         }
     }
     samples.truncate(want * 2);
-    let pcm = PcmSample { rate: s.header.sample_rate, channels: 2, samples, loop_range: None, padded_tail: 0, gain: 1.0 };
+    let pcm = PcmSample { rate: s.header.sample_rate, channels: 2, samples, loop_range: None, padded_tail: 0, gain: 1.0, bend_cents: 0 };
     assert_eq!(pcm.samples_per_channel(), want);
     check_plausible(&pcm, &format!("music {} ({blocks} blocks)", e.name));
     wav(&format!("music_{}_2s.wav", e.name.split('-').next().unwrap()), &pcm);

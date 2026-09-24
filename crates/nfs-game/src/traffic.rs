@@ -198,6 +198,8 @@ pub struct TrafficCar {
     pub collisions: u32,
     /// `car+0x104C` and its timers — the gear the drive model runs in (`aidrive::Gear`)
     pub gear: aidrive::Gear,
+    /// `car+0xD80`, the brake-light counter (`aidrive::brake_light`)
+    pub brake_light: u8,
     /// `car+0xEC0`: speed along `dir`
     pub speed: f32,
     /// `car+0xEB8`
@@ -224,6 +226,7 @@ impl TrafficCar {
     pub fn new(spec: TrafficSpec) -> Self {
         Self {
             gear: aidrive::Gear::default(),
+            brake_light: 0,
             model: spec.model,
             half_extents: spec.half_extents,
             mass: spec.mass(),
@@ -352,10 +355,15 @@ impl Default for TrafficPhysics {
     }
 }
 
-/// Where the body sits above the surface under it while a traffic car is resting on the ground.
-/// The original derives it from the suspension; the port has none for a traffic car, so it keeps
-/// the 1 m the slice height used to carry — APPROXIMATION.
-pub const RIDE_HEIGHT: f32 = 1.0;
+/// Where the body's origin sits above the surface under it while a traffic car rests on the
+/// ground. A traffic car (`car+0x52C & 0x80`) takes `Susp_AI` 0x4998C0 and `Car_ground`'s
+/// non-upright arm, where `BodyGroundCollide` 0x496610 pushes the body out until its lowest
+/// `BndP` points lie on the plane (`suspension-collision.md` §4.2, §5, §6.3) — and on every
+/// traffic and police model those points are at `y = −0.001` (−0.002 on `eas4`, `eas10`;
+/// `nfs-game/examples/bndp.rs`), the model's origin being on the ground as the player's is. The
+/// port used 1 m, a leftover of the slice height, and every traffic and police car floated a
+/// metre up.
+pub const RIDE_HEIGHT: f32 = 0.001;
 
 #[derive(Debug, Clone)]
 pub struct TrafficSet {
@@ -603,6 +611,8 @@ impl TrafficSet {
             };
             tracing::trace!(car = i, err, ooc = aidrive::out_of_control(&st, &self.cfg.out_of_control, err, road, bend), lat = st.lateral, lat_t = st.lateral_target, speed = st.speed, yaw = st.angular_velocity.y, cmd_lat = cmd.lateral, cmd_yaw = cmd.yaw, "traffic drive");
             aidrive::integrate(&mut st, &cmd, ai_dt);
+            // `[0x5E6D78]`: the 64 Hz ticks this AI step covers
+            c.brake_light = aidrive::brake_light(c.brake_light, cmd.braking, (ai_dt * 64.0).round() as u8);
             c.velocity = st.velocity;
             c.angular_velocity = st.angular_velocity;
             c.lateral_rate = c.velocity.dot(sl.lateral.normalize_or_zero());

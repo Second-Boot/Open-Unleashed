@@ -28,4 +28,16 @@ fn main() {
     for p in all.iter().take(4) {
         println!("   ({:>6.3}, {:>6.3}, {:>6.3})", p[0], p[1], p[2]);
     }
+    // the mesh's own vertical range at LOD 1 (no `tr` applied), against the body points
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for art in c.crp.articles(&c.crp_data).unwrap() {
+        let Ok(g) = c.crp.article_geometry(&c.crp_data, &art) else { continue };
+        for p in g.primitives.iter().filter(|p| p.lod == 1) {
+            for v in &p.positions {
+                lo = lo.min(v[1]);
+                hi = hi.max(v[1]);
+            }
+        }
+    }
+    println!("mesh y at LOD 1: {lo:.3}..{hi:.3}");
 }

@@ -85,6 +85,14 @@ pub struct Wheel {
     pub rough_phase: f32,
 }
 
+/// The event a prop contact leaves in `car+0x438` (`sfx.md` §2): `0x50000 | class` for a prop, or
+/// `0x6000F` for a drive-through object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropEvent {
+    Prop(u32),
+    Bush,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Vehicle {
     pub position: Vec3,
@@ -396,6 +404,16 @@ impl Vehicle {
         }
         go
     }
+    /// The brake lamps' pedal (0x43937A…0x439392): `car+0xD7F` (throttle) while the automatic's
+    /// reverse latch `car+0xD98` is set, else `car+0xD80` (brake) — the bytes as 0x49DD92…0x49E066
+    /// leave them, before the reverse gear swaps the pedals for driving. So in reverse the throttle
+    /// key lights them, and once the latch is gone (a race that has ended) the brake key does again.
+    pub fn brake_lamp(&self) -> bool {
+        // undo the automatic's reverse swap at the end of the controls step to get the bytes back
+        let (d7f, d80) = if self.automatic && !self.ai_driven && self.gear == 0 { (self.brake, self.throttle) } else { (self.throttle, self.brake) };
+        if self.reverse_latch { d7f > 0.0 } else { d80 > 0.0 }
+    }
+
     pub fn v_long(&self) -> f32 {
         self.v_local.z
     }
@@ -1767,7 +1785,7 @@ impl Vehicle {
     /// takes (0x498DAD, 0x498A3B); for a start the class is `car+0x44C`, which only the smackable
     /// setup 0x4A12D7…0x4A136D writes, so a racing car's is 0 (MEDIUM: its allocation's zero). Not
     /// carried: the `car+0x43C` hold that skips the pass (its writer is not read).
-    pub fn collide_props(&mut self, props: &[crate::props::Prop], tick: u32) -> Option<(f32, u32)> {
+    pub fn collide_props(&mut self, props: &[crate::props::Prop], tick: u32) -> Option<(f32, PropEvent)> {
         let mut hit = None;
         for p in props {
             if !p.near(self.position, 5.0) {
@@ -1780,11 +1798,20 @@ impl Vehicle {
             if d.dot(bx).abs() > r + self.half_extents.x || d.dot(bz).abs() > r + self.half_extents.z {
                 continue;
             }
-            match p.breakable.as_ref().map_or(2, |b| b.answer(tick, self.velocity)) {
+            match p.answer(tick, self.velocity) {
                 2 => {}
                 1 => {
                     self.impact = self.impact.max(15.0);
-                    hit = Some((15.0, 0));
+                    hit = Some((15.0, PropEvent::Prop(0)));
+                    continue;
+                }
+                // a drive-through object (`BUSH`): above 2 m/s (`car+0x35C`, 0x498ED7…0x498EE8) the
+                // event 0x6000F at 15 (0x498EF6…0x498F1A) and no push
+                3 => {
+                    if self.horizontal_speed() > 2.0 {
+                        self.impact = self.impact.max(15.0);
+                        hit = Some((15.0, PropEvent::Bush));
+                    }
                     continue;
                 }
                 _ => continue,
@@ -1796,7 +1823,7 @@ impl Vehicle {
                 crate::props::PropShape::Box { corners, .. } => self.prop_box(corners),
             };
             if touched {
-                hit = Some((self.impact, p.class));
+                hit = Some((self.impact, PropEvent::Prop(p.class)));
             }
             self.impact = self.impact.max(before);
         }
@@ -1995,6 +2022,20 @@ impl Vehicle {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn brake_lamps_follow_the_latch() {
+        // 0x43937A: the throttle byte while the reverse latch is set, the brake byte otherwise
+        let specs = specs_993();
+        let mut v = Vehicle::new(Vec3::ZERO, Mat3::IDENTITY, &specs, 0.7, 0.3);
+        v.automatic = true;
+        v.gear = 0;
+        v.reverse_latch = true;
+        (v.throttle, v.brake) = (0.0, 1.0); // swapped: the raw throttle key is down
+        assert!(v.brake_lamp());
+        v.reverse_latch = false; // the raw throttle is not the brake byte
+        assert!(!v.brake_lamp());
+    }
+
     use super::*;
     use crate::collision::{Triangle, TriangleGrid};
 
@@ -2184,9 +2225,6 @@ mod tests {
     }
 }
 
-/// Car–car separation (APPROXIMATION until 0x4A0F80 is read): bodies are treated as circles of
-/// `radius` in the xz plane; on overlap they are pushed apart equally and the closing normal
-/// velocity is exchanged with restitution `bounce` (equal masses). Returns true on contact.
 /// Car–car contact `0x498FF0` → `0x4980D0` → impulse `0x496860` (`RE/notes/suspension-collision.md`
 /// §6.4, HIGH for the linear impulse). The bodies are tested as oriented boxes in the ground plane
 /// (separating axes = both cars' right/forward axes; the original's 9-axis OBB test is 3-D, MEDIUM);

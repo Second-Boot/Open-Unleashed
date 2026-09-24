@@ -26,6 +26,7 @@ pub mod racecar;
 pub mod records;
 pub mod save;
 pub mod scripts;
+pub mod skidmarks;
 pub mod skill;
 pub mod sky;
 pub mod start;

@@ -674,6 +674,11 @@ fn wrap(d: i32, lap: i32) -> i32 {
     if d > half { d - lap } else if d < -half { d + lap } else { d }
 }
 
+/// A scalar per-slice track evaluated at `slice` the way 0x45A350 does ([`SkyBin::sample_track_a`]).
+pub fn sample_track(keys: &[(i32, f32)], slice: i32, lap_slices: i32) -> Option<f32> {
+    sample(keys, slice, lap_slices, |v| *v)
+}
+
 fn sample<T: Copy>(keys: &[(i32, T)], slice: i32, lap: i32, get: impl Fn(&T) -> f32) -> Option<f32> {
     if keys.is_empty() {
         return None;

@@ -141,6 +141,21 @@ pub struct DriveCommand {
     pub lateral: f32,
     pub forward: f32,
     pub yaw: f32,
+    /// Which longitudinal arm ran: `Some(false)` the throttle, `Some(true)` the brake, `None`
+    /// neither (the out-of-control controller at a standstill) — what the brake light follows.
+    pub braking: Option<bool>,
+}
+
+/// `car+0xD80`, the AI brake-light counter, inside both controllers (0x409720 / 0x409C70): the
+/// brake arm adds `4 · [0x5E6D78]` saturating at 0xFF (0x409B0E…), the throttle arm takes
+/// `[0x5E6D78]` off down to 0 (0x409ABD…); `[0x5E6D78]` is the 64 Hz ticks the AI step covers.
+/// 0x439360 lights the brake lamps while the byte is non-zero (0x43938C…0x43939B).
+pub fn brake_light(counter: u8, braking: Option<bool>, ticks: u8) -> u8 {
+    match braking {
+        Some(true) => counter.saturating_add(ticks.saturating_mul(4)),
+        Some(false) => counter.saturating_sub(ticks),
+        None => counter,
+    }
 }
 
 /// `0x409720` — the out-of-control controller, in full.
@@ -187,12 +202,12 @@ pub fn out_of_control_command(car: &AiCarState, cfg: &AiPhysics, heading_err: f3
     let in_band = if want >= 0.0 { (-2.0..=want).contains(&v) } else { (want..=2.0).contains(&v) };
     // `car+0x544 == 0` (0x409A5E) is the post-finish forced-brake state, which no AI car this port
     // drives ever has; `car+0xEAC == car+0xEB0` (0x409AAF) is the gate below.
-    let mut fwd = if in_band && car.requested_dir == car.dir {
-        accel_rate * car.sense
+    let (mut fwd, braking) = if in_band && car.requested_dir == car.dir {
+        (accel_rate * car.sense, Some(false))
     } else if v.abs() > 0.0 {
-        -v.signum() * brake_force
+        (-v.signum() * brake_force, Some(true))
     } else {
-        0.0
+        (0.0, None)
     };
     let mut la = la;
     let mut aa = aa;
@@ -202,7 +217,7 @@ pub fn out_of_control_command(car: &AiCarState, cfg: &AiPhysics, heading_err: f3
         aa *= k;
         la *= 0.375;
     }
-    DriveCommand { lateral: la, forward: fwd, yaw: aa }
+    DriveCommand { lateral: la, forward: fwd, yaw: aa, braking }
 }
 
 /// The gear / heading sense an AI car carries (`car+0x104C`, `+0x1048`, `+0x1050`, `+0x1080`), and
@@ -324,12 +339,12 @@ pub fn in_control_command(car: &AiCarState, cfg: &AiPhysics, heading_err: f32, a
     // no AI car this port drives ever has, and `car+0xEAC == car+0xEB0` (0x40A09B), so a car asked to
     // turn round coasts until it has. The brake, like the drive force, acts along the car's own
     // forward axis, so its sign comes from the body-frame speed and not from the route-signed one.
-    let forward = if car.dir * car.speed < car.dir * car.target_speed && car.requested_dir == car.dir {
-        accel_rate
+    let (forward, braking) = if car.dir * car.speed < car.dir * car.target_speed && car.requested_dir == car.dir {
+        (accel_rate, false)
     } else {
-        -body_forward_speed(car).signum() * brake_force
+        (-body_forward_speed(car).signum() * brake_force, true)
     };
-    DriveCommand { lateral, forward, yaw }
+    DriveCommand { lateral, forward, yaw, braking: Some(braking) }
 }
 
 /// `0x40A1D0` — rotate the body-frame command into world space and integrate it. `dt` is the AI dt.
@@ -353,6 +368,16 @@ pub fn integrate(car: &mut AiCarState, cmd: &DriveCommand, dt: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_brake_light_counter() {
+        // two 64 Hz ticks an AI step: +8 braking, saturating; −2 on the throttle, down to 0
+        assert_eq!(brake_light(0, Some(true), 2), 8);
+        assert_eq!(brake_light(250, Some(true), 2), 255);
+        assert_eq!(brake_light(8, Some(false), 2), 6);
+        assert_eq!(brake_light(1, Some(false), 2), 0);
+        assert_eq!(brake_light(5, None, 2), 5);
+    }
     use crate::race::{Section, Slice, SLICE_SPACING};
 
     fn straight(n: usize) -> SliceTable {
@@ -565,7 +590,7 @@ mod tests {
     #[test]
     fn the_integrator_moves_velocity_and_spin_by_dt() {
         let mut c = car();
-        let cmd = DriveCommand { lateral: 2.0, forward: 1.0, yaw: 0.5 };
+        let cmd = DriveCommand { lateral: 2.0, forward: 1.0, yaw: 0.5, braking: None };
         let v0 = c.velocity;
         integrate(&mut c, &cmd, 1.0 / 32.0);
         assert!((c.velocity.x - (v0.x + 2.0 / 32.0)).abs() < 1e-6);

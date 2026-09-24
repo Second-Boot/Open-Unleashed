@@ -147,6 +147,9 @@ pub struct PcmSample {
     /// The patch's own volume, `PtHeader::patch_volume() / 127` (`audio.md` §2). The library
     /// multiplies the caller's level by it, so a clip is never played at more than this.
     pub gain: f32,
+    /// `voice+0x66`: code 0x0A · 100 cents (0x590604) — how far the caller's **bend byte** moves
+    /// the pitch: `(byte − 0x40) · bend_cents >> 6` cents (0x589F75…0x589F90).
+    pub bend_cents: i32,
 }
 
 impl PcmSample {
@@ -219,7 +222,7 @@ impl PtHeader {
         self.param(0x0D, 0)
     }
     /// Code 0x07, default 60: the key the sample was recorded at; the playback pitch is
-    /// `(key − root)·100 + fine_tune() + 100·coarse_tune() + rand(pitch_spread())` cents (0x5904EC).
+    /// `(key − root)·100 + fine_tune() + rand(pitch_spread())` cents (0x5904EC…0x590549).
     pub fn root_key(&self) -> u32 {
         self.param(0x07, 60)
     }
@@ -227,7 +230,8 @@ impl PtHeader {
     pub fn fine_tune(&self) -> u32 {
         self.param(0x10, 0)
     }
-    /// Code 0x0A, default 0 — semitones.
+    /// Code 0x0A, default 0 — semitones, a signed byte: **not** part of the base pitch but the range
+    /// of the caller's bend byte (`voice+0x66 = value · 100`, 0x5905EF…0x59060D; used at 0x589F75).
     pub fn coarse_tune(&self) -> u32 {
         self.param(0x0A, 0)
     }
@@ -439,6 +443,7 @@ impl PtHeader {
             loop_range: self.loop_range(),
             padded_tail: padded_tail as u32,
             gain: self.patch_volume().min(127) as f32 / 127.0,
+            bend_cents: self.coarse_tune() as u8 as i8 as i32 * 100,
         })
     }
 }

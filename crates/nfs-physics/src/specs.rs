@@ -119,6 +119,8 @@ pub struct CarSpecs {
     pub lateral_div: f32,
     /// tyre circumference m (derived +0x148)
     pub circumference: f32,
+    /// tyre width in mm (+0x84), which also sizes the skid marks (0x478EA0)
+    pub tyre_width_mm: f32,
     /// 1 / ratio' per slot (m/s per rpm) (+0x170); 0.1 when ratio is 0
     pub mps_per_rpm: [f32; 8],
     /// acceleration per unit torque per slot (+0x190)
@@ -194,6 +196,7 @@ impl CarSpecs {
             transfer_div: t[11],
             lateral_div: t[16],
             circumference,
+            tyre_width_mm: sim.tyre_width_mm,
             mps_per_rpm: [0.1; 8],
             accel_per_torque: [0.0; 8],
             drag: 0.0,

@@ -712,6 +712,8 @@ pub struct CopCar {
     pub stuck_ticks: i32,
     /// `car+0x104C` and its timers — the gear the drive model runs in (`aidrive::Gear`)
     pub gear: aidrive::Gear,
+    /// `car+0xD80`, the brake-light counter (`aidrive::brake_light`)
+    pub brake_light: u8,
     /// `chase+0x60`-side bookkeeping for §27.8: this cop's rank in the target's queue, the
     /// formation offset that rank implies and the two desired sectors it maps to.
     pub rank: usize,
@@ -730,6 +732,7 @@ impl CopCar {
     pub fn new(model: usize, half_extents: Vec3, mass: f32, level: usize) -> Self {
         Self {
             gear: aidrive::Gear::default(),
+            brake_light: 0,
             model,
             active: false,
             lights: false,
@@ -1101,6 +1104,8 @@ impl Police {
         };
         aidrive::integrate(&mut st, &cmd, 1.0 / 32.0);
         let c = &mut self.cars[i];
+        // `[0x5E6D78]` = 2: the cops' AI step is 1/32 s here
+        c.brake_light = aidrive::brake_light(c.brake_light, cmd.braking, 2);
         c.velocity = st.velocity;
         c.angular_velocity = st.angular_velocity;
         // `0x408360` only grants the requested direction once the car is slow enough to turn round

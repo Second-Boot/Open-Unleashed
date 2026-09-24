@@ -38,4 +38,17 @@ fn main() {
             Err(e) => println!("{}: {e}", p.file_name().unwrap().to_string_lossy()),
         }
     }
+    // each track's `.bin`: the per-slice blend `t` (track A, 0x45D077) and region B's layers
+    for name in ["alps", "autobahn", "canyon", "castle", "coastal", "farmland", "foothills", "forest", "industrial", "monaco1", "skidpad"] {
+        let Ok(t) = nfs_assets::track::TrackAssets::load(&paths, name) else { continue };
+        let Some(bin) = t.sky_bin.as_ref() else { println!("{name}: no .bin"); continue };
+        let (lo, hi) = bin.track_a.iter().fold((f32::MAX, f32::MIN), |(l, h), (_, v)| (l.min(*v), h.max(*v)));
+        let b = SkyFile::parse(&t.sky_params.join("\n")).ok().and_then(|f| {
+            f.for_capability("HIGH").map(|b| {
+                let r = &b.regions[1];
+                (r.move_ratio, r.warp_speed, r.warp_amount, r.layers.iter().map(|l| format!("{:?} {}×{} wind {}@{}", l.map, l.scale[0], l.scale[1], l.wind_speed, l.wind_direction)).collect::<Vec<_>>())
+            })
+        });
+        println!("{name}: t keys {} range {lo}..{hi}; ring B {:?}; region B (move, warp, layers) {:?}", bin.track_a.len(), bin.rings[1], b);
+    }
 }

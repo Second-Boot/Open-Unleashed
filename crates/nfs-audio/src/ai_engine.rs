@@ -54,6 +54,16 @@ pub struct AiEngines {
     horn: Option<Arc<Clip>>,
     cars: Vec<CarVoices>,
     viv: Vec<u8>,
+    /// `game.spl[12]` — the mix level of `SND_coll` slots 0x0A / 0x0B (the horn)
+    horn_trim: u32,
+    /// `game.spl[10]` / `[11]` — the AI engine bank's and the road loop's (slot 0x10) mix levels
+    engine_trim: u32,
+    road_trim: u32,
+}
+
+/// 0x4A9C10's mixer volume, `(categoryLevel · game.spl[k] · vol · 85) >> 21`, as a gain.
+fn mix(category: u8, trim: u32, vol: i32) -> f32 {
+    ((category as i32 * trim as i32 * vol * 85) >> 21).clamp(0, 127) as f32 / 127.0
 }
 
 impl AiEngines {
@@ -64,10 +74,11 @@ impl AiEngines {
         let slot = |n: usize| -> Option<Arc<Clip>> {
             let d = coll.as_ref()?;
             let p = Bnk::parse(d).ok()?.decode_slot(d, n).ok()?;
-            Some(Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range, gain: p.gain }))
+            Some(Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range, gain: p.gain, bend_cents: p.bend_cents }))
         };
         let (road, horn) = (slot(AI_ROAD_SLOT), slot(AI_HORN_SLOT));
-        Ok(Self { sets: HashMap::new(), road, horn, cars: Vec::new(), viv })
+        let spl = nfs_formats::spl::GameSpl::load(sounds_dir);
+        Ok(Self { sets: HashMap::new(), road, horn, cars: Vec::new(), viv, horn_trim: spl.slots_0a0b(), engine_trim: spl.ai_engine(), road_trim: spl.ai_road() })
     }
 
     fn samples(&mut self, set: &str) -> (Option<Arc<Clip>>, Option<Arc<Clip>>) {
@@ -81,7 +92,7 @@ impl AiEngines {
             let bank = Bnk::parse(bytes).ok()?;
             let p = bank.decode_slot(bytes, 0).ok()?;
             let frames = (p.samples.len() / p.channels.max(1) as usize) as u32;
-            Some(Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range.or(Some((0, frames))), gain: p.gain }))
+            Some(Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range.or(Some((0, frames))), gain: p.gain, bend_cents: p.bend_cents }))
         };
         let pair = (load(&format!("{key}lden.bnk")), load(&format!("{key}ldex.bnk")));
         if pair.0.is_none() && pair.1.is_none() {
@@ -100,8 +111,12 @@ impl AiEngines {
     /// `spline_cam` is `word[0x627F3C] == 0x0B`: on that one view 0x4AA973…0x4AA99F divides
     /// `0x10000000` by `d + 1 m` instead of `0x8000000` by `d + 2 m`, so an AI car is about twice
     /// as loud there (`engine-audio.md` §5). This port had only the second form.
+    ///
+    /// The mix is 0x4A9C10's: the two engine loops (bank `[0x6564C0]`) as `EngineLevel ·
+    /// game.spl[10]`, the road loop (slot 0x10) as `AmbientLevel · game.spl[11]`. The port had both
+    /// at `EngineLevel / 255` with no trim until 2026-09-24.
     #[allow(clippy::too_many_arguments)]
-    pub fn update(&mut self, out: &AudioOutput, index: usize, set: &str, rpm_frac: f32, distance: f32, cos: f32, pan: f32, speed: f32, doppler: f32, detail: u8, crowding: u8, spline_cam: bool, master: f32) {
+    pub fn update(&mut self, out: &AudioOutput, index: usize, set: &str, rpm_frac: f32, distance: f32, cos: f32, pan: f32, speed: f32, doppler: f32, detail: u8, crowding: u8, spline_cam: bool, engine_level: u8, ambient_level: u8) {
         if self.cars.len() <= index {
             self.cars.resize_with(index + 1, CarVoices::default);
         }
@@ -128,7 +143,7 @@ impl AiEngines {
         };
 
         for (slot, clip, vol) in [(0usize, near_clip, v_near), (1, far_clip, v_far)] {
-            let amp = vol as f32 / 127.0 * master;
+            let amp = mix(engine_level, self.engine_trim, vol);
             let voice = if slot == 0 { &mut self.cars[index].near } else { &mut self.cars[index].far };
             match (*voice, clip) {
                 (Some(id), _) => {
@@ -139,18 +154,20 @@ impl AiEngines {
                 (None, None) => {}
             }
         }
-        // the road loop plays at the car's own pan; its `level` argument in the original is literally
-        // `rpmFrac`, which only matters for the mixer's own headroom, so the port drives the volume
+        // the road loop plays at the car's own pan; its third argument is `rpmFrac` (16.16), which
+        // Voice_play clamps to 127 (0x4A9C1F) as the **bend byte** — so it sounds bent up by nearly
+        // the patch's whole range once the engine turns at all. The port had read it as headroom.
+        let road_bend = self.road.as_ref().map_or(1.0, |c| c.bend(((rpm_frac.clamp(0.0, 2.0) * 65536.0) as i32).min(127)));
         match (self.cars[index].road, road_vol, &self.road) {
             (Some(id), 0, _) => {
                 out.stop(id);
                 self.cars[index].road = None;
             }
             (Some(id), v, _) => {
-                out.set(id, v as f32 / 127.0 * master, doppler);
+                out.set(id, mix(ambient_level, self.road_trim, v), doppler * road_bend);
                 out.set_pan(id, pan);
             }
-            (None, v, Some(c)) if v > 0 => self.cars[index].road = Some(out.play_panned(c.clone(), v as f32 / 127.0 * master, doppler, pan, true)),
+            (None, v, Some(c)) if v > 0 => self.cars[index].road = Some(out.play_panned(c.clone(), mix(ambient_level, self.road_trim, v), doppler * road_bend, pan, true)),
             _ => {}
         }
     }
@@ -159,14 +176,20 @@ impl AiEngines {
     /// action is running (`traffic.md` §12.3: `0x4013D0` calls `Honk(car, 1)` on mask 8, and
     /// `0x4A754B` keeps the loop going while the honk timer `audioSlot+0x20` has not run out).
     ///
-    /// Level and attenuation follow the engine loops: `2048/(d+2)` against a full 0x7F.
-    pub fn honk(&mut self, out: &AudioOutput, index: usize, on: bool, distance: f32, pan: f32, master: f32) {
+    /// The volume is the siren's distance law (0x4A7554…0x4A7592: `(0x1324 − min(m², 0x1324)) · 127
+    /// / 0x1324`, silent from 70 m) in the slot-0x0A/0x0B category `(AmbientLevel · game.spl[12] ·
+    /// vol · 85) >> 21` of 0x4A9C10; the pitch is `pitchBase`, 1.0 in this build. This port had the
+    /// engine loops' `2048/(d+2)` in the engine level until 2026-09-24. APPROXIMATION: the level byte
+    /// is the per-model `0x5D1478[.TYPE]`, and the port does not know an AI car's `nfs5.car` id, so
+    /// it keeps the full 0x7F.
+    pub fn honk(&mut self, out: &AudioOutput, index: usize, on: bool, distance: f32, pan: f32, ambient_level: u8) {
         if self.cars.len() <= index {
             self.cars.resize_with(index + 1, CarVoices::default);
         }
-        let atten = 2048 / (distance.max(0.0) as i32 + 2);
-        let amp = (atten.min(127) as f32 / 127.0) * master;
-        match (self.cars[index].horn, on && atten > 0, &self.horn) {
+        let v = crate::sfx::siren_volume(distance);
+        let vol = ((ambient_level as i32 * self.horn_trim as i32 * v * 85) >> 21).clamp(0, 127);
+        let amp = vol as f32 / 127.0;
+        match (self.cars[index].horn, on && vol > 0, &self.horn) {
             (Some(id), true, _) => {
                 out.set(id, amp, 1.0);
                 out.set_pan(id, pan);
@@ -196,6 +219,13 @@ impl AiEngines {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_mix_is_the_category_formula() {
+        // (level · game.spl[k] · vol · 85) >> 21: the shipped spl[10] = 60 puts a full AI loop at 39
+        assert_eq!(mix(127, 60, 127), 39.0 / 127.0);
+        assert_eq!(mix(0, 60, 127), 0.0);
+    }
+
     use super::*;
 
     #[test]

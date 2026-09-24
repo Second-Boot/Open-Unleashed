@@ -147,7 +147,7 @@ impl Ambience {
             let bytes = self.viv.get(o..o + l)?;
             let bank = Bnk::parse(bytes).ok()?;
             let p = (0..bank.slot_count().max(1)).find_map(|s| bank.decode_slot(bytes, s).ok())?;
-            Some(Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range, gain: p.gain }))
+            Some(Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range, gain: p.gain, bend_cents: p.bend_cents }))
         });
         if clip.is_none() {
             tracing::debug!(patch, "ambience bank missing or unreadable");

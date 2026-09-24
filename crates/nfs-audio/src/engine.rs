@@ -153,10 +153,32 @@ pub struct EngineSound {
     started: bool,
     /// Engine bank slot 2: the gear-shift click (§4.3).
     shift_click: Option<Arc<Clip>>,
-    /// Engine bank slot 5: the horn loop (§6 — `0x5D14EC[0x2B] = 3` routes the horn voice to the
+    /// Engine bank slots 3, 4, 5: the horns (§6 — `0x5D14EC[0x2B] = 3` routes the horn voice to the
     /// car's own engine bank, not to `SND_coll`; this corrects `sfx.md` §4.6).
-    horn_clip: Option<Arc<Clip>>,
-    horn_voice: Option<VoiceId>,
+    horn_clips: [Option<Arc<Clip>>; 3],
+    /// the playing horn and its slot
+    horn_voice: Option<(VoiceId, usize)>,
+    /// `game.spl[8]` — the horns' mix level
+    horn_trim: u32,
+}
+
+/// The horn `Horn_start` 0x4AAC00 picks for the view `word[0x627F3C]`: slot 4 on view 0 or 0x0F,
+/// otherwise 3 when `[0x627F43] & 8` (`viewId <= 1`) and 5 for the rest (0x4AAC7D…0x4AACBA).
+pub fn horn_slot(view: u16) -> usize {
+    if view == 0 || view == 0x0F {
+        4
+    } else if view <= 1 {
+        3
+    } else {
+        5
+    }
+}
+
+/// `Horn_start`'s volume (0x4AAC10…0x4AAC5E): `0x8000000 / (d + 2 m)` in 16.16, i.e. `2048/(d+2)`,
+/// or `4 · 2048/(d+1)` on view 0x0C.
+pub fn horn_volume(view: u16, distance: f32) -> i32 {
+    let d = distance.max(0.0);
+    if view == 0x0C { (2048.0 / (d + 1.0)) as i32 * 4 } else { (2048.0 / (d + 2.0)) as i32 }
 }
 
 impl EngineSound {
@@ -195,7 +217,7 @@ impl EngineSound {
             }
         }
         let decode = |slot: usize| -> Option<Arc<Clip>> {
-            bank.decode_slot(bank_bytes, slot).ok().map(|p| Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range, gain: p.gain }))
+            bank.decode_slot(bank_bytes, slot).ok().map(|p| Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range, gain: p.gain, bend_cents: p.bend_cents }))
         };
         let clips: Vec<Option<Arc<Clip>>> = layers
             .iter()
@@ -235,44 +257,67 @@ impl EngineSound {
             stop_voice: None,
             started: false,
             shift_click: decode(2).map(|c| Arc::new(Clip { loop_range: None, ..(*c).clone() })),
-            horn_clip: decode(5).map(|c| {
-                let frames = (c.samples.len() / c.channels.max(1) as usize) as u32;
-                Arc::new(Clip { loop_range: c.loop_range.or(Some((0, frames))), ..(*c).clone() })
+            // `Horn_start` restarts the voice whenever it has finished, so a sample without a loop
+            // (3 and 4) repeats; the port loops it whole
+            horn_clips: [3, 4, 5].map(|n| {
+                decode(n).map(|c| {
+                    let frames = (c.samples.len() / c.channels.max(1) as usize) as u32;
+                    Arc::new(Clip { loop_range: c.loop_range.or(Some((0, frames))), ..(*c).clone() })
+                })
             }),
             horn_voice: None,
+            horn_trim: nfs_formats::spl::GameSpl::load(sounds_dir).horn(),
         })
     }
 
     /// Stop every voice (leaving the race).
     pub fn stop(&mut self, out: &AudioOutput) {
-        for v in self.voices.iter_mut().chain(self.voices_b.iter_mut()).chain([&mut self.start_voice, &mut self.stop_voice, &mut self.horn_voice]) {
+        for v in self.voices.iter_mut().chain(self.voices_b.iter_mut()).chain([&mut self.start_voice, &mut self.stop_voice]) {
             if let Some(id) = v.take() {
                 out.stop(id);
             }
+        }
+        if let Some((id, _)) = self.horn_voice.take() {
+            out.stop(id);
         }
         self.level.iter_mut().for_each(|l| *l = 0);
     }
 
     /// Gear-shift click (engine bank slot 2). The original fires it on the **last** tick of the shift.
-    pub fn play_shift(&self, out: &AudioOutput, master: f32) {
+    ///
+    /// `Bank_playOneShot(engineBank, 2, pan 0, volume 0x7F, bend byte 0x40, 0x10000, 0x7F)`, and
+    /// slot 2 of the player banks mixes as `min(SfxLevel · vol, 127)` (0x4A9994…0x4A99BE) — full
+    /// volume for any slider above 0. The port had a fixed 0.6 until 2026-09-24.
+    pub fn play_shift(&self, out: &AudioOutput, sfx_level: u8) {
         if let Some(c) = &self.shift_click {
-            out.play(c.clone(), master, 1.0, false);
+            let vol = (sfx_level as i32 * 0x7F).min(0x7F);
+            out.play(c.clone(), vol as f32 / 127.0, 1.0, false);
         }
     }
 
-    /// Horn — the car's own engine bank, slot 5 held while the button is down (§6).
-    pub fn horn(&mut self, out: &AudioOutput, on: bool, master: f32) {
-        match (on, self.horn_voice) {
-            (true, None) => {
-                if let Some(c) = &self.horn_clip {
-                    self.horn_voice = Some(out.play(c.clone(), master, 1.0, true));
-                }
-            }
-            (false, Some(id)) => {
-                out.stop(id);
-                self.horn_voice = None;
-            }
-            _ => {}
+    /// The player's horn while `car+0xD86` is set: 0x4A7CBF → `Horn_start(idx, dist, 0x40,
+    /// pitchBase, pan)` → `Voice_play(0x2B, horn_slot(view), bend 0x40, pitch, horn_volume, pan, 0x7F)`,
+    /// mixed as slots 3…5 of the engine bank, `SfxLevel · game.spl[8]` (0x4A99C7…0x4A99E1). The
+    /// voice is only (re)started when idle, so its volume is the one it started with. This port had
+    /// slot 5 on every view at a fixed 0.6 until 2026-09-24.
+    #[allow(clippy::too_many_arguments)]
+    pub fn horn(&mut self, out: &AudioOutput, on: bool, view: u16, distance: f32, pan: f32, sfx_level: u8) {
+        let slot = horn_slot(view);
+        if let Some((id, s)) = self.horn_voice
+            && (!on || s != slot || !out.is_playing(id))
+        {
+            out.stop(id);
+            self.horn_voice = None;
+        }
+        if !on || self.horn_voice.is_some() {
+            return;
+        }
+        let vol = horn_volume(view, distance).min(0x7F);
+        let mixed = ((sfx_level as i32 * self.horn_trim as i32 * vol * 85) >> 21).clamp(0, 127);
+        // bend byte 0x40: no bend
+        let amp = mixed as f32 / 127.0;
+        if let Some(c) = &self.horn_clips[slot - 3] {
+            self.horn_voice = Some((out.play_panned(c.clone(), amp, 1.0, pan, true), slot));
         }
     }
 
@@ -464,6 +509,15 @@ impl EngineSound {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_horn_follows_the_view_and_the_distance() {
+        // slot 4 on views 0 and 0x0F, 3 on view 1, 5 otherwise (0x4AAC7D…0x4AACBA)
+        assert_eq!((horn_slot(0), horn_slot(0x0F), horn_slot(1), horn_slot(2)), (4, 4, 3, 5));
+        // 2048/(d+2), four times 2048/(d+1) on view 0x0C
+        assert_eq!(horn_volume(2, 30.0), 64);
+        assert_eq!(horn_volume(0x0C, 31.0), 256);
+    }
+
     use super::*;
 
     #[test]

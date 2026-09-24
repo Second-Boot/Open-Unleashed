@@ -38,6 +38,7 @@ pub struct TriangleGrid {
     tris: Vec<Triangle>,
     cells: Vec<Vec<u32>>,
     min: Vec3,
+    max: Vec3,
     cell_size: f32,
     nx: usize,
     nz: usize,
@@ -69,7 +70,12 @@ impl TriangleGrid {
                 }
             }
         }
-        Self { tris, cells, min, cell_size, nx, nz }
+        Self { tris, cells, min, max, cell_size, nx, nz }
+    }
+
+    /// The box every triangle lies in (zero for an empty grid).
+    pub fn bounds(&self) -> (Vec3, Vec3) {
+        (self.min, self.max)
     }
 
     fn cell_of(min: Vec3, cs: f32, nx: usize, nz: usize, p: Vec3) -> (usize, usize) {
@@ -80,28 +86,6 @@ impl TriangleGrid {
 
     pub fn triangle_count(&self) -> usize {
         self.tris.len()
-    }
-
-    /// Mean vertex colour of the triangles a predicate accepts (used to normalise the ground light
-    /// a car picks up against the track's own average).
-    pub fn mean_color(&self, keep: &dyn Fn(u32) -> bool) -> [f32; 3] {
-        let mut sum = [0.0f64; 3];
-        let mut n = 0.0f64;
-        for t in &self.tris {
-            if !keep(t.surface) {
-                continue;
-            }
-            for c in &t.colors {
-                for k in 0..3 {
-                    sum[k] += c[k] as f64 / 255.0;
-                }
-            }
-            n += 3.0;
-        }
-        if n == 0.0 {
-            return [1.0; 3];
-        }
-        [(sum[0] / n) as f32, (sum[1] / n) as f32, (sum[2] / n) as f32]
     }
 
     /// Nearest intersection along `dir` from `origin` within `max_dist`, searching the cells the

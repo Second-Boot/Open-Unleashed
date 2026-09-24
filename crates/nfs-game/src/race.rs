@@ -441,6 +441,12 @@ impl SliceTable {
     }
 }
 
+/// 0x4A7734…0x4A7744: the "wrong way" cue 0x4AAE70 sounds when `car+0xD30` reaches 64, 96 and 128
+/// (`≥ 0x40`, a multiple of 32, `< 0x94`).
+pub fn wrong_way_cue(steps: u32) -> bool {
+    steps >= 0x40 && steps & 0x1F == 0 && steps < 0x94
+}
+
 /// Per-car race bookkeeping (`car+0x530..`).
 #[derive(Debug, Clone, Default)]
 pub struct RaceProgress {
@@ -452,16 +458,38 @@ pub struct RaceProgress {
     pub lap_start_tick: u64,
     pub lap_times: Vec<u64>,
     pub wrong_way_ticks: u32,
+    /// `car+0xD30` as the original counts it: 0x4A7660 runs in the odd-tick group 0x4A8120, so one
+    /// step per two 64 Hz ticks while the car heads against the slice.
+    pub wrong_way_steps: u32,
     pub finished: bool,
     /// Lap fraction the car started from (needed for the projected time of a car that is still
     /// racing when the race ends, `Race_finalize` 0x416AC0).
     pub start_progress: f32,
+    /// A point-to-point track's bounds (`car+0xB04`, `car+0xB08`, 0x410979…0x410A0A): the finish
+    /// fraction and the fraction below which the car is sent back to its start. `None` on a circuit,
+    /// which counts laps by crossing the line instead.
+    pub linear: Option<(f32, f32)>,
+    /// Set by [`Self::update`] when a car on a point-to-point track falls below its start fraction:
+    /// 0x4174A2…0x4174B8 then calls 0x40F540(car, 3, 0) — the caller's to act on.
+    pub behind_start: bool,
+    /// `car+0xAFC`, the slice the car started on (0x410973) — where 0x40F540's mode 3 puts it back.
+    pub start_slice: usize,
 }
 
 impl RaceProgress {
     pub fn new(start_slice: usize, table: &SliceTable) -> Self {
         let p = table.frac(start_slice);
-        Self { slice: start_slice, progress: p, prev_progress: p, start_progress: p, ..Default::default() }
+        Self { slice: start_slice, progress: p, prev_progress: p, start_progress: p, start_slice, ..Default::default() }
+    }
+
+    /// `Car_raceInit` 0x410979…0x410A0A on a point-to-point track (`LINEAR_TRACK [0x657494]`): the
+    /// start fraction `car+0xB00` is the car's own start slice's, the reset bound `car+0xB08` is
+    /// that less `[0x5B2738]` 0.005, and the finish `car+0xB04` is the fraction of the slice of
+    /// the scene's type-1 trigger (0x46D290(1, 0)) — or, with none, the 0.98 0x41076F set first.
+    pub fn set_linear(&mut self, table: &SliceTable, finish_slice: Option<usize>) {
+        let start = table.frac(self.slice);
+        let finish = finish_slice.map_or(0.98, |s| table.frac(s));
+        self.linear = Some((finish, start - 0.005));
     }
 
     /// `Race_finalize` 0x416AC0 (CONFIRMED): the finishing time of a car that is still racing when
@@ -505,7 +533,24 @@ impl RaceProgress {
         let fn_ = frac;
         let fp = self.prev_progress.rem_euclid(1.0);
         let mut lap_done = false;
-        if fn_ > 0.5 && fp < 0.1 && self.prev_progress != new {
+        if let Some((finish, below)) = self.linear {
+            // `Lap_check` 0x417440 on a linear track (0x41748D…0x4174C4): a lap — the race, on a
+            // point-to-point track — once the progress is past the finish fraction; below the
+            // start bound the car goes back to its start. Nothing happens while it does not move.
+            if new != self.prev_progress {
+                if new > finish {
+                    self.laps += 1;
+                    self.lap_times.push(tick - self.lap_start_tick);
+                    self.lap_start_tick = tick;
+                    lap_done = true;
+                    if self.laps >= num_laps {
+                        self.finished = true;
+                    }
+                } else if new < below {
+                    self.behind_start = true;
+                }
+            }
+        } else if fn_ > 0.5 && fp < 0.1 && self.prev_progress != new {
             self.unlaps += 1;
         } else if fn_ < 0.1 && fp > 0.5 {
             if self.unlaps > 0 {
@@ -524,11 +569,24 @@ impl RaceProgress {
         self.progress = self.laps as f32 + frac - self.unlaps as f32;
         if forward.dot(table.slices[self.slice].forward) < 0.0 {
             self.wrong_way_ticks += 1;
+            if tick & 1 == 1 {
+                self.wrong_way_steps += 1;
+            }
         } else {
             self.wrong_way_ticks = 0;
+            self.wrong_way_steps = 0;
         }
         lap_done
     }
+}
+
+/// The slice of the start scene's finish line — its type-1 trigger (0x46D290(1, 0), read by
+/// `Car_raceInit` at 0x4109CF for a point-to-point track's finish fraction).
+pub fn finish_slice(table: &SliceTable, start_scene: Option<&Scene>) -> Option<usize> {
+    let s = start_scene?;
+    s.of_kind(&ElementKind::Trigger)
+        .find(|e| e.params.first().and_then(|p| p.first()).map(|t| *t as i32) == Some(1))
+        .map(|e| table.find_slice(Vec3::from(e.position), 0))
 }
 
 /// Start pose from the grid rule (`Grid_slot` 0x410580 + `Car_placeAtSlice` 0x49B090).
@@ -554,6 +612,12 @@ pub fn grid_pose(table: &SliceTable, start_scene: Option<&Scene>, grid_pos: u32,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_wrong_way_cue_fires_at_64_96_128() {
+        let hits: Vec<u32> = (0..200).filter(|&n| wrong_way_cue(n)).collect();
+        assert_eq!(hits, vec![64, 96, 128]);
+    }
+
     use super::*;
 
     /// Synthetic circular lap of `n` slices, radius r, 6 m apart.
@@ -661,6 +725,27 @@ fn two_branch_table() -> SliceTable {
         }
         assert_eq!(p.laps, 0);
         assert_eq!(p.unlaps, 0);
+    }
+
+    #[test]
+    fn a_point_to_point_race_ends_past_the_finish_fraction() {
+        // 0x41748D: past `car+0xB04` the lap (and the one-lap race) is done; below `car+0xB08`
+        // the car is flagged to go back to its start
+        let t = ring(100);
+        let mut p = RaceProgress::new(5, &t);
+        p.set_linear(&t, Some(90));
+        let (finish, below) = p.linear.unwrap();
+        assert!((finish - t.frac(90)).abs() < 1e-6 && (below - (t.frac(5) - 0.005)).abs() < 1e-6);
+        for s in 6..=90usize {
+            assert!(!p.update(&t, t.slices[s].centre, t.slices[s].forward, s as u64, 1));
+        }
+        assert!(p.update(&t, t.slices[91].centre, t.slices[91].forward, 91, 1));
+        assert!(p.finished && p.laps == 1);
+        // and backing up behind the start raises the flag instead of an un-lap
+        let mut q = RaceProgress::new(5, &t);
+        q.set_linear(&t, None);
+        q.update(&t, t.slices[3].centre, t.slices[3].forward, 1, 1);
+        assert!(q.behind_start && q.laps == 0 && q.unlaps == 0);
     }
 
     #[test]

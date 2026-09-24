@@ -14,6 +14,20 @@ pub struct Clip {
     /// The patch's own volume (`PcmSample::gain`, `RE/notes/audio.md` §2): the sound library
     /// multiplies the level the game asks for by it, so it belongs to the clip, not the call.
     pub gain: f32,
+    /// The patch's bend range in cents (`PcmSample::bend_cents`, code 0x0A · 100).
+    pub bend_cents: i32,
+}
+
+impl Clip {
+    /// The pitch factor of the caller's **bend byte** — the third argument of `Voice_play` 0x4A9C10
+    /// and the fifth of `Bank_playOneShot` 0x4A98E0, clamped to 0…127 (0x4A9C1F) and stored in
+    /// `voice+0x3F` (0x5905FE): `(byte − 0x40) · bend_cents >> 6` cents on top of the sample's pitch
+    /// (0x589F75…0x589F90, cents → ratio at 0x589E80, 1200 an octave). 0x40 leaves it alone.
+    /// The port read this byte as a volume until 2026-09-24.
+    pub fn bend(&self, byte: i32) -> f32 {
+        let cents = ((byte.clamp(0, 127) - 0x40) * self.bend_cents) >> 6;
+        (cents as f32 / 1200.0).exp2()
+    }
 }
 
 struct Voice {
@@ -307,4 +321,20 @@ pub(crate) struct StreamVoice {
     pub(crate) volume: f32,
     pub(crate) frac: f64,
     pub(crate) last: [f32; 2],
+}
+
+#[cfg(test)]
+mod bend_tests {
+    use super::Clip;
+
+    #[test]
+    fn the_bend_byte_moves_the_pitch_about_0x40() {
+        // (byte − 0x40) · bend >> 6 cents: a 4-semitone patch at 127 is 393 cents up, at 0 400 down
+        let c = Clip { rate: 22050, channels: 1, samples: Vec::new(), loop_range: None, gain: 1.0, bend_cents: 400 };
+        assert_eq!(c.bend(0x40), 1.0);
+        assert!((c.bend(127) - (393.0f32 / 1200.0).exp2()).abs() < 1e-6);
+        assert!((c.bend(0) - (-400.0f32 / 1200.0).exp2()).abs() < 1e-6);
+        // clamped to 0…127 like Voice_play's argument (0x4A9C1F)
+        assert_eq!(c.bend(1000), c.bend(127));
+    }
 }

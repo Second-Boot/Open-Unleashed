@@ -929,9 +929,9 @@ impl Renderer {
 
 /// Build the two triangles of a sprite in clip space (y up), rotating about its pivot in screen space.
 fn sprite_quad(sp: &Sprite, aspect: f32) -> [SpriteVertex; 6] {
-    if let Some(t) = sp.tri {
-        let v = |p: [f32; 2]| SpriteVertex { pos: [p[0] * 2.0 - 1.0, 1.0 - p[1] * 2.0], uv: sp.uv_min, color: sp.color };
-        let (a, b, c) = (v(t[0]), v(t[1]), v(t[2]));
+    if let Some((t, col)) = sp.tri {
+        let v = |p: [f32; 2], c: [f32; 4]| SpriteVertex { pos: [p[0] * 2.0 - 1.0, 1.0 - p[1] * 2.0], uv: sp.uv_min, color: c };
+        let (a, b, c) = (v(t[0], col[0]), v(t[1], col[1]), v(t[2], col[2]));
         return [a, b, c, c, c, c];
     }
     let (sx, sy) = (sp.size[0] / aspect, sp.size[1]);
