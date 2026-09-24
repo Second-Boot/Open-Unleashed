@@ -588,6 +588,12 @@ pub struct Material {
     /// only on `CarExtEnv` and `CarWindow` — so which one the layer reads cannot be told apart and
     /// does not matter.
     pub reflection: f32,
+    /// The texture's state block at `+0x30…+0x48` — seven values for Thrash states 5, 7, 0x0C,
+    /// 0x0B, 8, 0x41, 0x42, which the loader 0x44D550 copies into the texture (compared at
+    /// 0x44AC66, `RE/notes/thrash.md` §7). `+0x40` is state 8, `MIPMAPLODBIAS`, as a float.
+    pub lod_bias: f32,
+    /// `+0x44` / `+0x48`: states 0x41 / 0x42, `ADDRESSU` / `ADDRESSV` — 0 clamp, 1 wrap, 2 mirror.
+    pub address: [u32; 2],
 }
 
 /// `R3DLightLayer`'s parameter block `{f32 p0, f32 p1, u32 slot}` (read at 0x446600, 0x446886 and
@@ -630,6 +636,8 @@ impl Material {
                 p1: f32::from_bits(u32::from_le_bytes([b[304], b[305], b[306], b[307]])),
                 slot: u32::from_le_bytes([b[308], b[309], b[310], b[311]]),
             }),
+            lod_bias: f32::from_bits(u32_le(b, 0x40, "mt lod bias")?),
+            address: [u32_le(b, 0x44, "mt address u")?, u32_le(b, 0x48, "mt address v")?],
             reflection: if b.len() >= 288 { f32::from_bits(u32::from_le_bytes([b[284], b[285], b[286], b[287]])) } else { 0.0 },
         })
     }

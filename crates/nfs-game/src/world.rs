@@ -353,7 +353,9 @@ impl TrackWorld {
                 let m = materials.get(id as usize);
                 let tex = m.and_then(|m| tex_ids.get(&m.texture_name()));
                 let alpha = tex.map(|t| t.1).unwrap_or(false) && m.map(|m| m.render_method != "Opaque").unwrap_or(true);
-                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0 })
+                // the material's address modes, states 0x41 / 0x42 (`thrash.md` §7): 0 clamps
+                let clamp = m.map_or([false; 2], |m| m.address.map(|a| a == 0));
+                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp, lod_bias: m.map_or(0.0, |m| m.lod_bias) })
             })
         };
         // Static world: merge every article's meshes per material into one GPU mesh each
@@ -1181,6 +1183,9 @@ impl CarModel {
         // carinfo+0x518`, the `.TINYCAR` flag (0x43B0E5)
         style.apply_overlay(&car.style_overlay);
         style.geometry.insert(58, u32::from(car.tiny));
+        // the entry test's context (0x439C60): the front-end branch is the one without a race roof
+        style.front_end = race_roof.is_none();
+        style.night = night;
         tracing::info!(style = style.name, "car style");
         let pages = car.build_pages(paths, paint, &style)?;
         let page_tex: Vec<(nfs_renderer::TextureId, bool)> = pages
@@ -1206,7 +1211,7 @@ impl CarModel {
             // which of the three environment textures it reflects (`lighting.md` §3.1); the 0.3
             // blend stays the APPROXIMATION it was, since the pass's combine is AUDIT.md §E
             let variant = nfs_formats::crp::env_variant(m.map(|m| m.reflection).unwrap_or(0.0));
-            let mid = r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: !blend, depth_test: true, env_texture: if reflective { env } else { None }, env_mix: 0.3, env_variant: variant });
+            let mid = r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: !blend, depth_test: true, env_texture: if reflective { env } else { None }, env_mix: 0.3, env_variant: variant, blend_pair: 0, clamp: m.map_or([false; 2], |m| m.address.map(|a| a == 0)), lod_bias: m.map_or(0.0, |m| m.lod_bias) });
             if let Some(l) = m.and_then(|m| m.light) {
                 material_light.insert(mid, l);
             }
@@ -1357,7 +1362,10 @@ impl CarModel {
             let p: Vec<Vec3> = quad.points.iter().take(4).map(|q| MODEL_TO_BODY.transform_point3(Vec3::from(*q))).collect();
             let g = nfs_assets::car::global_texture(paths, "INTGLASS.FSH", "glai").ok()??;
             let tex = r.upload_texture(&TextureData { width: g.width, height: g.height, mips: g.mips.clone() });
-            let mat = r.create_material(MaterialDesc { texture: Some(tex), alpha_blend: true, cull_back: false, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0 });
+            // the batch's state object (0x5379F0 at 0x4578AB) is set to blend 1 at 0x4578B4 and
+            // handed to the batch with the uv and colour buffers (0x4578F2 → 0x4685E0): Thrash
+            // 0x38 = 1, `SRCALPHA` / `ONE` — the glass adds its light (`RE/notes/thrash.md` §6)
+            let mat = r.create_material(MaterialDesc { texture: Some(tex), alpha_blend: true, cull_back: false, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 1, clamp: [false; 2], lod_bias: 0.0 });
             // **The quad is mapped to the whole texture**, and that is traced now. The batcher's
             // three parallel buffers are positions at `acc+0x0C` (stride 0x10), **texture
             // coordinates at `acc+0x25BC` (stride 8)** and colours at `acc+0x3894` (stride 4), 201

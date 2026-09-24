@@ -1,7 +1,8 @@
 //! `GameData/Track/Sky/<Track>.txt` — the layered sky definition (`RE/RENDERING.md`).
 //!
-//! The file is a list of `BEGIN … END` blocks, one per computer capability, and the game keeps the
-//! first block whose capability matches the `Graphics.SkyRendering` setting. Everything after a `#`
+//! The file is a list of `BEGIN … END` blocks, one per computer capability, and the game keeps
+//! **every** block whose capability line holds the `SKYRENDERING` level's word or `all`
+//! ([`SkyFile::for_level`]). Everything after a `#`
 //! is a comment — and the shipped files document their own fields in those comments. The loader
 //! 0x45FB80 reads the whole file, folds it to lower case (`toupper`'s counterpart at 0x5A2248) and
 //! walks the non-comment lines in order, so the parse below is positional, exactly as the game's is.
@@ -280,20 +281,36 @@ impl SkyFile {
         Ok(Self { blocks })
     }
 
-    /// The block the game would use for a capability, falling back to the first usable one.
+    /// The first usable block whose capability is exactly `capability` (a diagnostic's view; the
+    /// game picks by [`SkyFile::for_level`]).
     ///
     /// "Usable" is [`SkyKind::builds_a_level`]: 0x45D920's chain has no branch for `additive`,
     /// `config` or an unrecognised keyword, so such a block builds nothing and the game draws no
     /// layer for it. `Sky/default.txt`'s only `HIGH` block is `ADDITIVE`, which is exactly that
-    /// case — so this skips it rather than drawing a sky the original does not. (The fallback to
-    /// *some* block is this port's own: the original would simply have no level.)
+    /// case. *(Until 2026-09-25 this fell back to the first usable block of any capability — the
+    /// port's own; the original has no level then.)*
     pub fn for_capability(&self, capability: &str) -> Option<&SkyBlock> {
-        let usable = |b: &&SkyBlock| b.kind.builds_a_level();
+        self.blocks.iter().filter(|b| b.kind.builds_a_level()).find(|b| b.capability.eq_ignore_ascii_case(capability))
+    }
+
+    /// The usable blocks the game builds at `SKYRENDERING` level `level` (`[0x657D9C]`): the loader
+    /// 0x45FB80 lower-cases the file and keeps every block whose capability line — the first
+    /// non-comment line after `begin` — contains, anywhere, the level's word from the table at
+    /// 0x5CF3A0 (20 bytes apart: `low`, `medium`, `high`, `amazing`) or `all` (0x45FCA5…0x45FD18),
+    /// walking on to the next `begin` to the end of the file (0x4600DB…0x460147); 0x45D8F0 then
+    /// builds a level for each. The shipped tracks carry `HIGH` and `MEDIUM` blocks only, so at
+    /// level 0 (the option's "off", the shipped value) they build none; `default.txt` has two `LOW`.
+    pub fn for_level(&self, level: usize) -> Vec<&SkyBlock> {
+        const WORDS: [&str; 4] = ["low", "medium", "high", "amazing"];
+        let Some(word) = WORDS.get(level) else { return Vec::new() };
         self.blocks
             .iter()
-            .filter(usable)
-            .find(|b| b.capability.eq_ignore_ascii_case(capability))
-            .or_else(|| self.blocks.iter().find(usable))
+            .filter(|b| b.kind.builds_a_level())
+            .filter(|b| {
+                let c = b.capability.to_ascii_lowercase();
+                c.contains(word) || c.contains("all")
+            })
+            .collect()
     }
 }
 

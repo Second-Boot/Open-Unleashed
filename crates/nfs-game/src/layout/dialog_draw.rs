@@ -80,6 +80,11 @@ impl LayoutScreen {
         let fade = d.fade as f32 / 255.0;
         for s in &mut out {
             s.color[3] *= fade;
+            if let Some((_, cols)) = s.tri.as_mut() {
+                for c in cols {
+                    c[3] *= fade;
+                }
+            }
         }
         out
     }

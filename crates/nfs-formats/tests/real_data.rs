@@ -401,6 +401,20 @@ fn sky_definitions() {
     let coastal = String::from_utf8_lossy(&std::fs::read(dir.join("Coastal.txt")).unwrap()).into_owned();
     let f = nfs_formats::sky::SkyFile::parse(&coastal).unwrap();
     assert_eq!(f.for_capability("HIGH").unwrap().regions[0].layers[0].map.as_deref(), Some("sm1b"));
+    // `SKYRENDERING` 0 ("off") asks for `low` blocks, which no track file has; 1 `medium`, 2 `high`
+    // (0x45FCA5, the words at 0x5CF3A0); `farmland` spells its `medium` in lower case
+    for name in ["Coastal.txt", "Farmland.txt", "Canyon.txt"] {
+        let t = String::from_utf8_lossy(&std::fs::read(dir.join(name)).unwrap()).into_owned();
+        let f = nfs_formats::sky::SkyFile::parse(&t).unwrap();
+        assert!(f.for_level(0).is_empty(), "{name}");
+        assert_eq!(f.for_level(1).iter().map(|b| b.capability.to_ascii_lowercase()).collect::<Vec<_>>(), ["medium"], "{name}");
+        assert_eq!(f.for_level(2).iter().map(|b| b.capability.to_ascii_lowercase()).collect::<Vec<_>>(), ["high"], "{name}");
+    }
+    let d = String::from_utf8_lossy(&std::fs::read(dir.join("default.txt")).unwrap()).into_owned();
+    let f = nfs_formats::sky::SkyFile::parse(&d).unwrap();
+    assert_eq!(f.for_level(0).len(), 2);
+    // its one `HIGH` block is `ADDITIVE`, which builds no level
+    assert!(f.for_level(2).is_empty());
 }
 
 /// `BndP` gives every car the same body: a wheel-contact quad on the ground, two end boxes and a

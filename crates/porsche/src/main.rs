@@ -523,8 +523,8 @@ impl Hud {
     /// black grid lines (`[0x5B3064]`), and every cell's text black (`unviers9b`, 0xFF000000) at
     /// `cell left + 4`, centred vertically in its row. A cell with a colour draws an 18 × 6 swatch
     /// at `(x, row top + 7)` and its text 22 px further right (0x42F0D0; black when the colour has no
-    /// alpha byte). The first header is the empty string at `0x5B2E08`. This port uses its one HUD
-    /// font for `unviers9b` (APPROXIMATION).
+    /// alpha byte). The first header is the empty string at `0x5B2E08`. `unviers9b` is the HUD's
+    /// `FONT_SMALL`, drawn from its own atlas.
     fn table(&self, out: &mut Vec<Sprite>, aspect: f32, widths: &[f32], head: &[String], rows: &[Vec<(String, Option<[f32; 4]>)>], selected: Option<usize>) {
         let (bx, by, bw, bh) = BILLBOARD;
         let n = 8.0;
@@ -1272,7 +1272,7 @@ impl Hud {
     /// the value `+0xC8` in the display colour right-aligned at `x + w − 5` (`[0x4205A0]`), `y + 2`
     /// (`[0x4205C0]`), and the label `+0xC4` in grey at `x + 5` with its bottom `2` above the tray's
     /// (0x41C983…0x41C9DC, measured on 0x5CCAD0). This port drew the value in a larger size at its own
-    /// offsets. Sizes are the port's 12 for `UniversC12b` (APPROXIMATION, as elsewhere).
+    /// offsets. `UniversC12b` is the HUD's `FONT_MAIN`, drawn from its own atlas.
     fn combo_sprites(
         &self,
         out: &mut Vec<Sprite>,
@@ -1321,7 +1321,7 @@ impl Hud {
     /// (entry 6, tinted 0xCC000000) plain and flipped below itself. Under it a 6-px gauge in two
     /// gradients, "0%" / "100%" over its ends in `unviers9bi` and the display colour, and FE 12
     /// "damage" at the bottom in grey `UniversC12b` — red 0xCCFF0000 in a mission over its damage
-    /// limit (0x42294D…). The port uses its one HUD font; the label height is the draw size.
+    /// limit (0x42294D…). Each text is drawn in its own font's atlas (`FONT_ITALIC`, `FONT_MAIN`).
     fn damage_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, zones: &[f32; 10], labels: [&str; 3], over_limit: bool) {
         let (tx, ty, tw, th) = (0.0, 0.0, 127.0, 105.0);
         self.tray(out, aspect, tx, ty, tw, th);
@@ -1467,9 +1467,9 @@ impl Hud {
     /// driver's name in grey fitted to 55 px (0x42AD6A…0x42AD87), and the gap right-aligned in the
     /// display colour 5 + 8 px in from the right edge; under the rows FE 17 "position" in grey and
     /// the player's place over the row count (`"%d" "/"` 0x42B5B1…0x42B609, then the count 0x42B61E).
-    /// The fonts are `unviers9b` / `unviers9bi` / `UniversC12b` there; this port draws everything in
-    /// its one HUD font at the sizes its other trays use, and the swatch's vertical offset (0x42BA5A,
-    /// half a measured glyph height less 4) is taken as the row's middle — APPROXIMATION.
+    /// The fonts are `unviers9b` / `unviers9bi` / `UniversC12b` there, each drawn from its own atlas
+    /// (`FONT_SMALL` / `FONT_ITALIC` / `FONT_MAIN`); the swatch's vertical offset (0x42BA5A, half a
+    /// measured glyph height less 4) is taken as the row's middle — APPROXIMATION.
     fn opponent_list_sprites(
         &self,
         out: &mut Vec<Sprite>,
@@ -1497,8 +1497,8 @@ impl Hud {
         }
         // the footer (0x42B569…0x42B639): FE 17 `+0x10C` in grey `UniversC12b`, `itoa(position)` + "/"
         // `+0x110` in the display colour and **`UniversC12b` too**, the count `+0x114` in grey
-        // `unviers9b` — this port had drawn the place at 16 and the label at 10; sizes are the port's
-        // 12 / 10 for the two fonts, bottoms aligned (APPROXIMATION, as elsewhere)
+        // `unviers9b` — this port had drawn the place at 16 and the label at 10; the fonts are their
+        // own now, and the count's 3-px drop that aligns the bottoms is the port's (APPROXIMATION)
         let fy = y + h - 2.0 - rh;
         self.text(out, aspect, label, x + 5.0, fy, FONT_MAIN, HUD_GREY);
         let n = rows.len().to_string();
@@ -2916,7 +2916,7 @@ struct App {
     /// `Render/particle.fsh`
     track_particles: Option<nfs_game::track_particles::TrackParticles>,
     track_particle_defs: Vec<nfs_formats::particle_dat::ParticleDef>,
-    track_particle_sprites: std::collections::HashMap<String, (nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
+    track_particle_sprites: std::collections::HashMap<(String, u32), (nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
     /// trackside cameras and the triggers that switch them (`RE/notes/race-logic.md` §3.3)
     track_cameras: Option<nfs_game::cameras::TrackCameras>,
     /// environment map currently bound on the car materials
@@ -3669,15 +3669,14 @@ impl App {
                 })?;
                 return c.tables.car(m.prize_car as u16);
             }
-            // `0x50E6B0` hands back whichever car list the compare screen was opened from — the five
-            // setters at 0x50DA68… pass `GenericCar.Car`, `OwnedCars.Car`, `UsedCar.Car`,
-            // `DealerCar.Car` and `zMergedList.Car`. The port has no "screen I came from", so the
-            // garage car stands in when a career is loaded (APPROXIMATION of which list it was).
-            Some("CarCompare1") => {
-                let c = self.career.as_ref()?;
-                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                return c.tables.car(c.career.garage.get(idx)?.car_id);
-            }
+            // `0x50E6B0` hands back `[0x699FE0]`, the accessor the button that opened the compare
+            // screen set through 0x50E6A0: the callbacks `CARCOMPARE.*` / `SHOWCASE.*` (registered
+            // at 0x50C23F…0x50C4D3; `SHOWCASE.DEALERCAR` is 0x50DB20, `CARCOMPARE.MERGEDCAR`
+            // 0x50DCC0). The shipped layouts use only `CARCOMPARE.MERGEDCAR` (QuickRace, knockout,
+            // quickknockout) and `SHOWCASE.DEALERCAR` (dealership) — `zMergedList.Car` and
+            // `DealerCar.Car`, both the front end's selected car here — so the logo is the
+            // compare column's own left car. (Until 2026-09-25 the garage car stood in.)
+            Some("CarCompare1") => return self.compare_cars().map(|(a, _)| a),
             // handled by `bind_car_logos`, which loads a whole picture out of `FEData/Chron`
             Some("Chron") => return None,
             _ => match accessor {
@@ -5580,14 +5579,14 @@ impl App {
                 && let Some(p) = self.track_particles.as_mut()
             {
                 for _ in 0..300 {
-                    p.step();
+                    p.step(self.camera.position, self.camera.far);
                 }
                 let sp = p.sprites();
                 tracing::info!(sprites = sp.len(), first = ?sp.first(), "emitter view");
             }
         }
         if let Some(p) = self.track_particles.as_mut() {
-            p.step();
+            p.step(self.camera.position, self.camera.far);
         }
         self.render_prev = Some((self.car_pos, self.car_rot));
         self.road.opp_prev = self
@@ -6515,10 +6514,23 @@ impl App {
                 let before = r.progress;
                 let was_finished = r.finished;
                 let steps_before = r.wrong_way_steps;
+                // 0x4A7660's gates: finished or in a mission clears the counter; more than one
+                // wheel off the ground (`word car+0x418`) holds it. APPROXIMATION: the crash
+                // response also sets `+0x418` and `+0x1104` (0x4948D5…0x4948F0), as does a hard
+                // impact (0x40F8E3); the per-car pass clears `+0x1104` once `+0x418` is 0
+                // (0x40F865…0x40F876) and the suspension recomputes `+0x418` each step, so the hold
+                // they add lasts about a step and is not carried. `+0xDA8` (AI-driven) and `+0x544`
+                // (post-finish) are 0 for the player in a race
+                let gate = if r.finished || self.mission.is_some() {
+                    nfs_game::race::WrongWayGate::Reset
+                } else if v.wheels.iter().filter(|w| w.airborne).count() > 1 {
+                    nfs_game::race::WrongWayGate::Hold
+                } else {
+                    nfs_game::race::WrongWayGate::Count
+                };
+                r.wrong_way_gate = gate;
                 let lap_done = r.update(t, v.position, v.forward(), self.tick, self.num_laps);
-                // the "wrong way" cue at 64, 96 and 128 steps, outside a mission (`[0x6573E8] != 9`,
-                // 0x4A76FE). APPROXIMATION: 0x4A7660's other gates (`car+0x418`, `+0x1104`,
-                // `+0xDA8`, `+0x544`) are not kept, as for the HUD element
+                // the "wrong way" cue at 64, 96 and 128 steps (0x4A7734…0x4A7744)
                 if r.wrong_way_steps != steps_before
                     && nfs_game::race::wrong_way_cue(r.wrong_way_steps)
                     && self.mission.is_none()
@@ -7587,10 +7599,16 @@ impl App {
 
     /// The pre-race screen's tick (0x505E58…0x505ED3): with no offer dialog up and a garage car
     /// holding an offer, ask about it — `FEStrings` 807 over the offer, the car's name and its
-    /// asking price — with yes / no.
+    /// asking price — with yes / no. The tick is slot 1 (0x505D50) of `FETournamentCallBackList`
+    /// (0x5B8798), the class `callbacklist=ID_TOURNYSCREEN` builds — `prerace.lay` **and**
+    /// `tournament.lay` (until 2026-09-24 the port asked for `prerace` alone).
     fn fe_offer_check(&mut self) {
-        let on_career = self.fe.layout_name.as_deref() == Some("prerace")
-            || self.fe.menu.as_ref().is_some_and(|m| (1..=3).contains(&m.mode));
+        let tourny_screen = self
+            .fe.layout_preview
+            .as_ref()
+            .and_then(|l| l.layout.elements.first().and_then(|e| e.get("callbacklist")).map(|c| c.eq_ignore_ascii_case("ID_TOURNYSCREEN")))
+            .unwrap_or(false);
+        let on_career = tourny_screen || self.fe.menu.as_ref().is_some_and(|m| (1..=3).contains(&m.mode));
         if !on_career || self.fe.dialog.is_some() {
             return;
         }
@@ -8419,8 +8437,12 @@ impl App {
         // the sky's own colour, from the track's `Sky/<Track>.bin` (`RE/RENDERING.md`): black on the
         // Monaco circuits, sunset on coastal, plain blue on forest. It shows wherever the sky layers
         // do not cover, and the layers are drawn over it.
+        // The record is the `SKYRENDERING` level's (`[0x657D9C]`, the `Graphics.SkyRendering`
+        // choice): 0x459970 addresses `bin + 0xCE8 + 60·level` and steps down past unused records
+        // (0x459983…0x45998E). The port read level 0 whatever the option said.
+        let sky_level = self.choice_index("Graphics.SkyRendering").map_or(0, |(i, _)| i);
         if self.vehicle.is_some()
-            && let Some(c) = self.track.sky_bin.as_ref().and_then(|b| b.background())
+            && let Some(c) = self.track.sky_bin.as_ref().and_then(|b| b.background_for(sky_level))
         {
             self.scene.clear_color = [c[0] as f64, c[1] as f64, c[2] as f64, 1.0];
         }
@@ -9691,6 +9713,10 @@ impl App {
             _ => car_slice,
         };
         self.cam_slice = Some(cam_slice);
+        // the camera object's near plane: 0.15, set by its constructor 0x4677E0 (0x4677F5) and
+        // handed to every race view (0x468E6A); its 700 far plane is the projection's, while the
+        // view stops at the draw distance below (`RE/notes/thrash.md` §6)
+        self.camera.near = 0.15;
         self.camera.far = if self.vehicle.is_some() {
             keys.far_distance(cam_slice, self.detail)
         } else {
@@ -9905,8 +9931,14 @@ impl App {
             // the skid marks: 0x478AA0 draws a strip of more than two points when both of its ends
             // lie within 100 of the camera, as a strip with the UV table `[0x628B64]` — `(0,0)
             // (1,0) (0,1) (1,1)` over and over (0x478930) — its colours and `SKDP`, unlit.
-            // APPROXIMATION: the depth bias (0x537A60, −80000·cam+0xC / d², clamped −1…−10) is a
-            // 2 cm lift here, and the render states of 0x468240 are not read (alpha blended)
+            // The depth bias (0x478B51…0x478BA2): `−80000 · cam[+0xC] / d²` with `d²` the nearer
+            // end's horizontal square distance, rounded by `fistp` and clamped to −10…−1, handed to
+            // Thrash state 0x18, which `dx7z.dll` adds as `b / 32768` to the vertex's screen z —
+            // and that z is `(z − near) / (far − near)` (`RE/notes/thrash.md` §6). `cam[+0xC]` is
+            // `far · near / (far − near)` (0x467247…0x467261) of the 0.15 / 700 planes. So each
+            // vertex moves toward the eye by `b · (far − near) / 32768` of view depth, along its own
+            // ray so it stays where it is on screen. The render states of 0x468240 are not read
+            // (alpha blended)
             if let (Some((_, material)), Some(r)) = (self.particle_draw, self.renderer.as_mut()) {
                 let cam = self.camera.position;
                 let near = |p: Vec3| (p.x - cam.x).powi(2) + (p.z - cam.z).powi(2) <= nfs_game::skidmarks::DRAW_DISTANCE.powi(2);
@@ -9917,13 +9949,29 @@ impl App {
                     if !near(first) || !near(last) {
                         continue;
                     }
-                    let Some(&mesh) = self.skid_pool.get(used) else { break };
+                    // the pool grows as more strips come into range, so none is left out
+                    if self.skid_pool.len() <= used {
+                        let cap = nfs_game::skidmarks::MAX_CAPACITY as u32;
+                        let mut skid = nfs_renderer::MeshData::default();
+                        skid.vertices = vec![nfs_renderer::Vertex { position: [0.0; 3], normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: [0.0; 4] }; cap as usize];
+                        skid.indices = (0..cap - 2).flat_map(|k| [k, k + 1, k + 2]).collect();
+                        self.skid_pool.push(r.upload_dynamic_mesh(&skid));
+                    }
+                    let mesh = self.skid_pool[used];
                     used += 1;
+                    const NEAR: f32 = 0.15;
+                    const FAR: f32 = 700.0;
+                    let k = FAR * NEAR / (FAR - NEAR);
+                    let d2 = |p: Vec3| ((p.x - cam.x).powi(2) + (p.z - cam.z).powi(2)).max(1e-6);
+                    let bias = ((-80000.0 * k / d2(first).min(d2(last))).round() as i32).clamp(-10, -1);
+                    let pull = -(bias as f32) * (FAR - NEAR) / 32768.0;
                     let mut verts = vec![nfs_renderer::Vertex { position: [0.0; 3], normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: [0.0; 4] }; nfs_game::skidmarks::MAX_CAPACITY];
                     for (k, v) in verts.iter_mut().enumerate() {
                         // past the strip's end every vertex sits on its last point: no area
                         let i = k.min(strip.points.len() - 1);
-                        let p = strip.points[i] + Vec3::Y * 0.02;
+                        let q = strip.points[i];
+                        let depth = (q - cam).dot(fwd);
+                        let p = if depth > pull { q + (cam - q) * (pull / depth) } else { q };
                         let c = strip.colours[i];
                         v.position = p.into();
                         v.uv = UV[k % 4];
@@ -9968,8 +10016,9 @@ impl App {
                     let r = Quat::from_mat3(&c.orientation.transpose()).normalize();
                     // the brake lamps follow the AI's own counter `car+0xD80` (0x439360, `aidrive::brake_light`);
                     // the reverse lamp its gear byte `car+0xD82`, 0 once the race is on while the AI
-                    // backs up at 2 m/s or more (0x408495…0x4084A1 → 0x408130). APPROXIMATION: the
-                    // byte's refresh timer `car+0xEDC` is not kept, it is taken every frame
+                    // backs up at 2 m/s or more (0x408495…0x4084A1 → 0x408130), refreshed every
+                    // frame: its timer `car+0xEDC` is only ever cleared (0x406D22, 0x406E04), so
+                    // the decrement 0x40847E, taken while it is positive, never runs
                     let reverse = self.tick >= RACE_START_TICK && c.gear.sense < 0.0 && c.speed_estimate() >= 2.0;
                     let slots = Self::lamp_slots(self.track.is_night(), fade, c.brake_light > 0, reverse, None, None);
                     self.glare_items(&mut glares, &self.road.traffic_models[c.model], c.position, r, slots);
@@ -9984,8 +10033,9 @@ impl App {
                     let r = Quat::from_mat3(&c.orientation.transpose()).normalize();
                     // the brake lamps follow the AI's own counter `car+0xD80` (0x439360, `aidrive::brake_light`);
                     // the reverse lamp its gear byte `car+0xD82`, 0 once the race is on while the AI
-                    // backs up at 2 m/s or more (0x408495…0x4084A1 → 0x408130). APPROXIMATION: the
-                    // byte's refresh timer `car+0xEDC` is not kept, it is taken every frame
+                    // backs up at 2 m/s or more (0x408495…0x4084A1 → 0x408130), refreshed every
+                    // frame: its timer `car+0xEDC` is only ever cleared (0x406D22, 0x406E04), so
+                    // the decrement 0x40847E, taken while it is positive, never runs
                     let reverse = self.tick >= RACE_START_TICK && c.gear.sense < 0.0 && c.speed_estimate() >= 2.0;
                     let slots = Self::lamp_slots(self.track.is_night(), fade, c.brake_light > 0, reverse, None, None);
                     self.glare_items(&mut glares, &self.road.police_models[c.model], c.position, r, slots);
@@ -10006,13 +10056,27 @@ impl App {
             self.scene.items.extend(flares);
             if let Some(p) = self.track_particles.as_ref() {
                 // 0x454430 → 0x44F6E0: a camera-facing billboard per particle, turned about the
-                // view axis. APPROXIMATION: the blend mode (`+0x28`, 0x537A50) and the depth bias
-                // are not read — the glare material stands in
+                // view axis, under the definition's blend (`+0x28` → Thrash 0x38, above) and
+                // depth bias: `round(zbias · cam[+0xC] / d²)` (0x45445C…0x454491), `d²` the
+                // system's `+0x10` — its article's square distance to the camera, here the
+                // emitter's — as Thrash state 0x18, `b / 32768` of the linear screen z over
+                // 0.15…700 (`thrash.md` §6): a positive bias moves the sprite away along the view
                 for sp in p.sprites() {
-                    let Some(&(mesh, material)) = self.track_particle_sprites.get(&sp.material) else { continue };
+                    let Some(&(mesh, material)) = self.track_particle_sprites.get(&(sp.material.clone(), sp.blend)) else { continue };
                     let (s, c) = sp.degrees.to_radians().sin_cos();
                     let (r, u) = (right * c + up * s, up * c - right * s);
-                    let m = Mat4::from_cols((r * sp.size).extend(0.0), (u * sp.size).extend(0.0), right.cross(up).extend(0.0), sp.position.extend(1.0));
+                    const NEAR: f32 = 0.15;
+                    const FAR: f32 = 700.0;
+                    let d2 = (sp.emitter - self.camera.position).length_squared().max(1e-6);
+                    let bias = (sp.zbias as f32 * (FAR * NEAR / (FAR - NEAR)) / d2).round();
+                    let shift = bias * (FAR - NEAR) / 32768.0;
+                    let depth = (sp.position - self.camera.position).dot(fwd);
+                    // along the eye's ray and scaled with it, so only the depth changes, not the
+                    // sprite's place or size on screen
+                    let f = if depth > 0.0 && depth + shift > 0.0 { (depth + shift) / depth } else { 1.0 };
+                    let pos = self.camera.position + (sp.position - self.camera.position) * f;
+                    let size = sp.size * f;
+                    let m = Mat4::from_cols((r * size).extend(0.0), (u * size).extend(0.0), right.cross(up).extend(0.0), pos.extend(1.0));
                     let a = sp.argb;
                     let tint = [((a >> 16) & 0xFF) as f32 / 255.0, ((a >> 8) & 0xFF) as f32 / 255.0, (a & 0xFF) as f32 / 255.0];
                     self.scene.items.push(nfs_renderer::DrawItem {
@@ -10036,8 +10100,8 @@ impl App {
     /// definition carries flags 4 alone, so 0x4515F0's other fades (flags 1, 2, 8, 0x20, 0x40) have
     /// nothing to act on and are not carried; the fog's (`[0x61BCA8]`) has no fog here.
     /// APPROXIMATION: every flare of the track is tried — the original's come with the articles its
-    /// renderer finds in view — and the depth bias 0x537A60 and the batch's blend are not read
-    /// (the lamps' glare material stands in). MEDIUM: the row 0x451A57 dots is taken as the
+    /// renderer finds in view; the blend is the state object's 1, additive (0x4514E7), and the
+    /// depth bias is carried (below). MEDIUM: the row 0x451A57 dots is taken as the
     /// camera's forward and the turn's sense as the axis-angle build's (0x539BD0).
     fn flare_items(&self, out: &mut Vec<nfs_renderer::DrawItem>, fwd: Vec3, right: Vec3, up: Vec3) {
         let Some(w) = self.world.as_ref() else { return };
@@ -10057,12 +10121,26 @@ impl App {
             let angle = if def.flags & 4 != 0 { (dist * 3.6 + facing * 120.0).to_radians() } else { 0.0 };
             let (s, c) = angle.sin_cos();
             let (r, u) = (right * c + up * s, up * c - right * s);
+            // the depth bias (0x451AD2…0x451B21): `round(−250000 · cam[+0xC] / d²)`, `d²` the
+            // eye-to-flare square distance, unclamped, as Thrash state 0x18 — `b / 32768` of the
+            // linear 0.15…700 screen z (`thrash.md` §6). The quad moves that much view depth
+            // toward the eye along its ray, scaled with it so it stays put on screen.
+            // APPROXIMATION at the near end: where the pull would pass the near plane the original's
+            // screen z goes below 0, which the driver's clipping (not read) decides; here the quad
+            // stops at the near plane.
+            const NEAR: f32 = 0.15;
+            const FAR: f32 = 700.0;
+            let bias = (-250000.0 * (FAR * NEAR / (FAR - NEAR)) / d2.max(1e-6)).round();
+            let depth = (f.position - cam).dot(fwd);
+            let target = (depth + bias * (FAR - NEAR) / 32768.0).max(NEAR);
+            let scale = if depth > NEAR { target / depth } else { 1.0 };
+            let pos = cam + (f.position - cam) * scale;
             for k in 0..2 {
                 let Some(name) = def.textures[k].as_ref() else { continue };
                 let Some(&(mesh, material)) = self.flare_sprites.get(name) else { continue };
-                let size = def.sizes[k] * 0.1;
+                let size = def.sizes[k] * 0.1 * scale;
                 let argb = def.colours[k];
-                let m = Mat4::from_cols((r * size).extend(0.0), (u * size).extend(0.0), right.cross(up).extend(0.0), f.position.extend(1.0));
+                let m = Mat4::from_cols((r * size).extend(0.0), (u * size).extend(0.0), right.cross(up).extend(0.0), pos.extend(1.0));
                 let tint = [((argb >> 16) & 0xFF) as f32 / 255.0, ((argb >> 8) & 0xFF) as f32 / 255.0, (argb & 0xFF) as f32 / 255.0];
                 out.push(nfs_renderer::DrawItem {
                     light: tint,
@@ -10954,8 +11032,12 @@ impl App {
     /// stream index made the current song `[0x5D7938]` when it differs (and is not −1), and played
     /// at once — `MusicStop(0)`, `MusicPlay(name, 0)` — when the current screen answers its slot
     /// 0xA8 true, which only the CD player's does (0x510E90; every other screen's is 0x50DD60,
-    /// false). APPROXIMATION: which layouts get that screen class is not read; the port takes the
-    /// two that carry its callbacks, `audioreal` and `cdplayer`.
+    /// false). The screen object `[[0x65B928]+0xE0]` is the one the layout's `callbacklist=` id
+    /// builds, and of the 41 screen classes (every vtable holding 0x4E0B30) only `FEScreenOptions`
+    /// (0x5B9F58, registered as `ID_OPTIONSSCREEN` at 0x511540) answers slot 0xA8 true — and
+    /// `Options.lay` alone names that id, with `Audio` / `audioreal` / `cdplayer` inside it. (Until
+    /// 2026-09-24 the port asked for `audioreal` or `cdplayer` by name, which as panels of
+    /// `Options` are never the screen.)
     fn cd_set_title(&mut self, index: usize) {
         let table = Self::cd_table(&self.cd_names());
         let Some((id, name)) = table.get(index.min(table.len().saturating_sub(1))).cloned() else { return };
@@ -10964,7 +11046,11 @@ impl App {
             return;
         }
         self.fe.cd_current = id as i32;
-        let cd_screen = self.fe.layout_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("audioreal") || n.eq_ignore_ascii_case("cdplayer"));
+        let cd_screen = self
+            .fe.layout_preview
+            .as_ref()
+            .and_then(|l| l.layout.elements.first().and_then(|e| e.get("callbacklist")).map(|c| c.eq_ignore_ascii_case("ID_OPTIONSSCREEN")))
+            .unwrap_or(false);
         if cd_screen {
             self.fe_music(|m, a| {
                 m.stop(a);
@@ -11355,6 +11441,12 @@ impl App {
         self.rebuild_scene();
         self.update_damage_decals();
         self.update_env_map();
+        // the mip filter's promotion `[0x69DD1D]`: the race's 0x44ED10 sets it at `SPECIALFX` 3
+        // only (0x44EDD1 clears, 0x44EF04 sets), the front end's 0x44F020 clears it (0x44F080)
+        let trilinear = self.race.is_some() && self.choice_index("Graphics.SpecialFX").is_none_or(|(i, _)| i >= 3);
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_trilinear(trilinear);
+        }
         self.render_mirror();
         if let Some(r) = self.renderer.as_mut()
             && let Err(e) = r.render(&self.scene, &self.camera)
@@ -12487,7 +12579,8 @@ impl App {
             Some(if self.car.cabrio { self.choice_index("Car.Roof").map_or(0, |(i, _)| i as u32) } else { 0 }),
         )
         .expect("car");
-        self.sky = Sky::upload(&mut renderer, &self.track);
+        let sky_level = self.choice_index("Graphics.SkyRendering").map_or(0, |(i, _)| i);
+        self.sky = Sky::upload(&mut renderer, &self.track, sky_level);
         // a night track switches the dials to their `*N` faces and needles (`hud.md` §3.2)
         let night = self.track.is_night();
         if night {
@@ -13182,9 +13275,12 @@ impl App {
         // `GameData/Render/common.fsh`: `SKDP` is the skid marks' texture (the one the original's
         // per-surface table points at throughout, 0x5D00E8) and `SHAD` the shadow every car casts
         // (0x43B960 looks it up by that FourCC)
+        // `pair` is the draw's Thrash 0x38 blend (`thrash.md` §6): the skid marks and the shadow
+        // keep the state object's default 0, the lamp glare's object gets 1 (0x43CF5B, additive)
         let sprite = |renderer: &mut Renderer,
                       quad: &nfs_renderer::MeshData,
-                      name: &str|
+                      name: &str,
+                      pair: u8|
          -> Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)> {
             let path = nfs_assets::GamePaths::find_file(&self.paths.render_dir(), "common.fsh")?;
             let data = std::fs::read(&path).ok()?;
@@ -13204,6 +13300,7 @@ impl App {
                 alpha_blend: true,
                 cull_back: false,
                 depth_test: true,
+                blend_pair: pair,
                 ..nfs_renderer::MaterialDesc::textured(tex)
             });
             Some((mesh, material))
@@ -13223,10 +13320,10 @@ impl App {
             });
         }
         quad.indices = vec![0, 1, 2, 0, 2, 3];
-        self.particle_draw = sprite(&mut renderer, &quad, "SKDP");
-        self.shadow_draw = sprite(&mut renderer, &quad, "SHAD");
-        self.glare_draw = sprite(&mut renderer, &quad, "CARG");
-        self.glare_star = [sprite(&mut renderer, &quad, "SPIK"), sprite(&mut renderer, &quad, "GLNT")];
+        self.particle_draw = sprite(&mut renderer, &quad, "SKDP", 0);
+        self.shadow_draw = sprite(&mut renderer, &quad, "SHAD", 0);
+        self.glare_draw = sprite(&mut renderer, &quad, "CARG", 1);
+        self.glare_star = [sprite(&mut renderer, &quad, "SPIK", 1), sprite(&mut renderer, &quad, "GLNT", 1)];
         // the beams: 16 meshes of the strip's 18 vertices as a triangle list
         self.beam_material = Some(renderer.create_material(nfs_renderer::MaterialDesc {
             alpha_blend: true,
@@ -13246,8 +13343,7 @@ impl App {
         let mut skid = nfs_renderer::MeshData::default();
         skid.vertices = vec![nfs_renderer::Vertex { position: [0.0; 3], normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: [0.0; 4] }; cap as usize];
         skid.indices = (0..cap - 2).flat_map(|k| [k, k + 1, k + 2]).collect();
-        // APPROXIMATION: the port draws at most this many strips a frame (the original's cells
-        // within 100 of the camera hold 20 each)
+        // a first pool; the draw adds meshes when more strips are in range
         self.skid_pool = (0..160).map(|_| renderer.upload_dynamic_mesh(&skid)).collect();
         // the track flares' definitions and their textures, out of `common.fsh` by the exact
         // name the loader swapped into place (the pack has both `spik` and `SPIK`)
@@ -13267,10 +13363,12 @@ impl App {
                 };
                 let tex = renderer.upload_texture(&nfs_renderer::TextureData { width: img.width, height: img.height, mips: img.mips.clone() });
                 let mesh = renderer.upload_mesh(&quad);
+                // the flares' state object `[0x61BCB4]` is set to blend 1, additive, at 0x4514E7
                 let material = renderer.create_material(nfs_renderer::MaterialDesc {
                     alpha_blend: true,
                     cull_back: false,
                     depth_test: true,
+                    blend_pair: 1,
                     ..nfs_renderer::MaterialDesc::textured(tex)
                 });
                 self.flare_sprites.insert(name, (mesh, material));
@@ -13295,23 +13393,28 @@ impl App {
             && let Ok(data) = std::fs::read(&path)
             && let Ok(images) = nfs_assets::texture::decode_pack(&path, &data)
         {
-            let mut names: Vec<String> = defs.iter().map(|d| d.material.clone()).collect();
-            names.sort();
-            names.dedup();
-            for name in names {
+            // one material per texture and blend: the definition's `+0x28` is the draw's Thrash
+            // state 0x38 (0x454756…0x454766 → 0x537A50; `thrash.md` §6) — 0 the plain alpha blend,
+            // 1 additive, 2 darkening by alpha, as shipped (45 / 16 / 1 of the 62)
+            let mut keys: Vec<(String, u32)> = defs.iter().map(|d| (d.material.clone(), d.blend)).collect();
+            keys.sort();
+            keys.dedup();
+            let mut textures = std::collections::HashMap::new();
+            for (name, blend) in keys {
                 let Some(img) = images.iter().find(|t| t.name.trim() == name) else {
                     tracing::debug!(name, "particle texture not in particle.fsh");
                     continue;
                 };
-                let tex = renderer.upload_texture(&nfs_renderer::TextureData { width: img.width, height: img.height, mips: img.mips.clone() });
+                let tex = *textures.entry(name.clone()).or_insert_with(|| renderer.upload_texture(&nfs_renderer::TextureData { width: img.width, height: img.height, mips: img.mips.clone() }));
                 let mesh = renderer.upload_mesh(&quad);
                 let material = renderer.create_material(nfs_renderer::MaterialDesc {
                     alpha_blend: true,
                     cull_back: false,
                     depth_test: true,
+                    blend_pair: blend.min(3) as u8,
                     ..nfs_renderer::MaterialDesc::textured(tex)
                 });
-                self.track_particle_sprites.insert(name, (mesh, material));
+                self.track_particle_sprites.insert((name, blend), (mesh, material));
             }
         }
         // made on the first update, once the track is up

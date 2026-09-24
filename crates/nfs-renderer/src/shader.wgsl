@@ -78,10 +78,9 @@ fn uvlight(world: vec3<f32>) -> vec3<f32> {
         uv = vec2<f32>(i * p.x + 0.5, i * p.y + 0.5);
     }
     let c = textureSampleLevel(t_head, s_proj, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).rgb;
-    // the pack is uploaded as sRGB, so the sample comes back linear; the original multiplies the
-    // stored bytes, and the stored byte is what makes 132/255 the neutral point of the 2×
-    let stored = select(1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055, c * 12.92, c <= vec3<f32>(0.0031308));
-    return 2.0 * stored;
+    // textures are bytes (no sRGB decode), so the sample is the stored value the original
+    // multiplies — 132/255 is the neutral point of the 2×
+    return 2.0 * c;
 }
 
 struct Object {
@@ -173,9 +172,22 @@ fn vs_main(in: VsIn) -> VsOut {
     return out;
 }
 
+// An opaque draw covers its pixel whatever the texture's alpha says: the original's back buffer
+// has no alpha channel, and a car page keeps its texels' alpha (a wheel face's clear corners), which
+// must not punch holes in a screenshot or in an off-screen view the front end lays over its screen.
+@fragment
+fn fs_opaque(in: VsOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(shade(in).rgb, 1.0);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let tex = textureSample(t_diffuse, s_diffuse, in.uv);
+    return shade(in);
+}
+
+fn shade(in: VsOut) -> vec4<f32> {
+    // the material's mip LOD bias, Thrash state 8 (`RE/notes/thrash.md` §7), in `shadow_on.z`
+    let tex = textureSampleBias(t_diffuse, s_diffuse, in.uv, object.shadow_on.z);
     let n = normalize(in.normal);
     let diffuse = max(dot(n, normalize(globals.sun_dir.xyz)), 0.0);
     // the per-object light multiplies the ambient term only: the original keeps one ambient slot
@@ -217,7 +229,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
     if object.shadow_on.x > 0.5 {
         let uv = vec2<f32>(dot(object.shadow_u.xyz, in.world) + object.shadow_u.w, dot(object.shadow_v.xyz, in.world) + object.shadow_v.w);
-        let sh = textureSample(t_proj, s_proj, uv);
+        // `sh80`'s material asks for a LOD bias of −1 (`mt+0x40`, `RE/notes/thrash.md` §7)
+        let sh = textureSampleBias(t_proj, s_proj, uv, -1.0);
         lit = mix(lit, sh.rgb, sh.a);
     }
     return vec4<f32>(lit, base.a * object.light.a);

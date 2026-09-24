@@ -65,6 +65,8 @@ pub fn update_progress(cars: &mut [RaceCar], table: &SliceTable, tick: u64, num_
     for c in cars.iter_mut() {
         let before = c.progress.progress;
         let (pos, fwd) = (c.vehicle.position, c.vehicle.forward());
+        // an AI-driven car (`car+0xDA8`) keeps its wrong-way counter clear (0x4A76EE)
+        c.progress.wrong_way_gate = crate::race::WrongWayGate::Reset;
         c.progress.update(table, pos, fwd, tick, num_laps);
         if c.progress.progress > before {
             c.last_progress_tick = tick;

@@ -20,7 +20,7 @@ fn main() {
                 print!(" [{} {} m{:#x} {:#x}]", d(o), d(o + 4), d(o + 8), d(o + 12));
             }
             let base = 0x1C + 16 * passes;
-            let ops: Vec<String> = (0..ops).map(|i| base + 16 * i).map(|o| format!("{:#x}:{:#x}/{:#x}", d(o), d(o + 4), d(o + 12))).collect();
+            let ops: Vec<String> = (0..ops).map(|i| base + 16 * i).map(|o| format!("{:#x}:{:#x}:{:#x}/{:#x}", d(o), d(o + 4), d(o + 8), d(o + 12))).collect();
             println!("  size {len} expect {}  ops {}", base + 16 * ops.len(), ops.join(" "));
         }
     }

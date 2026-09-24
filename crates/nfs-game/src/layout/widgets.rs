@@ -1370,10 +1370,8 @@ impl LayoutScreen {
     // otherwise scales *its own alpha byte* by the fade — the same thing this port
     // does to every sprite after the fact.
     //
-    // The sprite pipeline has one colour per axis-aligned quad, so the box is still a
-    // grid of cells, but now bilinear in **position** as well as colour, which gets
-    // the skew. APPROXIMATION, and the grid is only subdivided along an axis that
-    // actually varies.
+    // Drawn as the primitive's two per-corner triangles (`gouraud`); this port stepped it
+    // into a 16 × 16 grid of flat cells until 2026-09-24.
     pub(super) fn draw_gouraud_box(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
         let WidgetDraw { e, x, y, w, h, aspect, .. } = d;
         let c = |k: &str| e.color(k).map(tint).unwrap_or([0.0, 0.0, 0.0, 0.0]);
@@ -1385,36 +1383,7 @@ impl LayoutScreen {
             [x + off("BLoffX"), y + off("BLoffy") + h],
             [x + off("BRoffX") + w, y + off("BRoffY") + h],
         ];
-        let differs = |a: [f32; 4], b: [f32; 4]| (0..4).any(|j| (a[j] - b[j]).abs() > 1.0 / 255.0);
-        let moved = |a: [f32; 2], b: [f32; 2], d: usize| (a[d] - b[d]).abs() > 0.5;
-        // x varies if the two top corners differ from each other, or the sides slant
-        let skew_x = moved(corner[0], corner[2], 0) || moved(corner[1], corner[3], 0);
-        let skew_y = moved(corner[0], corner[1], 1) || moved(corner[2], corner[3], 1);
-        let nx = if differs(ul, ur) || differs(bl, br) || skew_x || skew_y { 16 } else { 1 };
-        let ny = if differs(ul, bl) || differs(ur, br) || skew_x || skew_y { 16 } else { 1 };
-        let at = |u: f32, v: f32, d: usize| {
-            let top = corner[0][d] + (corner[1][d] - corner[0][d]) * u;
-            let bot = corner[2][d] + (corner[3][d] - corner[2][d]) * u;
-            top + (bot - top) * v
-        };
-        for gy in 0..ny {
-            for gx in 0..nx {
-                let (u0, v0) = (gx as f32 / nx as f32, gy as f32 / ny as f32);
-                let (u1, v1) = ((gx + 1) as f32 / nx as f32, (gy + 1) as f32 / ny as f32);
-                let (u, v) = ((u0 + u1) * 0.5, (v0 + v1) * 0.5);
-                let mut col = [0.0f32; 4];
-                for j in 0..4 {
-                    let top = ul[j] + (ur[j] - ul[j]) * u;
-                    let bot = bl[j] + (br[j] - bl[j]) * u;
-                    col[j] = top + (bot - top) * v;
-                }
-                // the cell's own corners, so a slanted edge is followed a step at a time
-                let (px, py) = (at(u0, v0, 0).min(at(u0, v1, 0)), at(u0, v0, 1).min(at(u1, v0, 1)));
-                let cw = (at(u1, v0, 0).max(at(u1, v1, 0)) - px).max(0.5);
-                let ch = (at(u0, v1, 1).max(at(u1, v1, 1)) - py).max(0.5);
-                out.push(self.quad(aspect, px, py, cw, ch, col));
-            }
-        }
+        self.gouraud(out, aspect, corner, [ul, ur, bl, br]);
     }
 
     // `FEGlintyRectangle`'s constructor (0x522530) reads **`width`, `height`, `col` and

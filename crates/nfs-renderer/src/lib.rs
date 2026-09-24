@@ -55,14 +55,23 @@ pub struct MaterialDesc {
     /// Which of the three environment textures this material reflects — `R3DSpecularTextureLayer`
     /// buckets its own reflection strength at 0.05 and 0.95 (`RE/notes/lighting.md` §3.1).
     pub env_variant: usize,
+    /// The frame-buffer blend of an `alpha_blend` material, as Thrash state 0x38 takes it
+    /// (`dx7z.dll` 0x600046BB, `RE/notes/thrash.md` §6): 0 `SRCALPHA` / `INVSRCALPHA`, 1 `SRCALPHA` /
+    /// `ONE`, 2 `ZERO` / `INVSRCALPHA`, 3 `DESTCOLOR` / `ZERO`.
+    pub blend_pair: u8,
+    /// Clamp the texture in u / v instead of repeating it — Thrash states 0x41 / 0x42 = 0
+    /// (`ADDRESSU` / `ADDRESSV` `CLAMP`, `RE/notes/thrash.md` §7).
+    pub clamp: [bool; 2],
+    /// The texture's mip LOD bias — Thrash state 8, `D3DTSS_MIPMAPLODBIAS` (`thrash.md` §7).
+    pub lod_bias: f32,
 }
 
 impl MaterialDesc {
     pub fn textured(texture: TextureId) -> Self {
-        Self { texture: Some(texture), alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0 }
+        Self { texture: Some(texture), alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0 }
     }
     pub fn flat() -> Self {
-        Self { texture: None, alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0 }
+        Self { texture: None, alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0 }
     }
 }
 

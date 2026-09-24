@@ -884,22 +884,15 @@ fn parse_color(v: &str) -> Option<[u8; 4]> {
     Some([((n >> 16) & 0xFF) as u8, ((n >> 8) & 0xFF) as u8, (n & 0xFF) as u8, ((n >> 24) & 0xFF) as u8])
 }
 
-/// A front-end colour, as the shader wants it.
+/// A front-end colour, as the shader wants it: the byte over 255.
 ///
 /// The original writes these bytes into an 8-bit frame buffer with no colour management at all:
-/// a `NFS5.GOTOBUTTON`'s `0xFFBC0000` is red **188** on the player's screen. This port's surface
-/// is sRGB, so a value handed to the shader is treated as *linear* and encoded on the way out —
-/// 188 came back as **223**, and every flat colour in the front end was that much too light.
-/// Undoing the encoding here puts the byte back where the file put it. Measured, not assumed:
-/// sampling a pill over black gave 223 before and 188 after.
-///
-/// Only the three colour channels; alpha is not encoded.
+/// a `NFS5.GOTOBUTTON`'s `0xFFBC0000` is red **188** on the player's screen. The renderer is a
+/// byte pipeline now (no sRGB surface or textures, `RE/RENDERING.md` "Colour space"), so the byte
+/// goes through as it is. (Until 2026-09-24 this undid the sRGB encoding of the surface, which
+/// fixed flat colours but left blends and gradients in linear light.)
 fn tint(c: [u8; 4]) -> [f32; 4] {
-    let lin = |v: u8| {
-        let s = v as f32 / 255.0;
-        if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
-    };
-    [lin(c[0]), lin(c[1]), lin(c[2]), c[3] as f32 / 255.0]
+    [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, c[3] as f32 / 255.0]
 }
 
 /// `NFS5.MOVIECIRCLE`'s flash frames and its two run fonts (0x4CDE99, 0x4CDED3).
@@ -2180,6 +2173,12 @@ impl LayoutScreen {
             for sp in &mut inner {
                 sp.pos[0] += dx;
                 sp.pos[1] += dy;
+                // a per-corner triangle carries its own points
+                if let Some((t, _)) = sp.tri.as_mut() {
+                    for v in t {
+                        *v = [v[0] + dx, v[1] + dy];
+                    }
+                }
             }
         }
         inner
@@ -3641,41 +3640,30 @@ impl LayoutScreen {
     /// One gouraud quad of the front end's own primitive **0x4D98D0**, whose four `(x, y, colour)`
     /// triples arrive in the order upper-left, upper-right, lower-left, lower-right (§4.7).
     ///
-    /// APPROXIMATION, the one §4.7 already carries: the sprite pipeline has a single colour per
-    /// quad, so the quad is stepped into a grid and each cell is filled with the colour at its
-    /// middle. An axis is stepped only when something varies along it — the colour, or the two
-    /// opposite edges running out of parallel — and then by a step a pixel, to at most eight.
+    /// Drawn as the two gouraud triangles a card makes of it: the primitive hands its corners on
+    /// bottom-right, bottom-left, top-right, top-left (controls.md §4.7), which as a strip splits the
+    /// quad along the bottom-left – top-right diagonal. APPROXIMATION in that one respect — the
+    /// submission below 0x4D9450 into the Thrash driver was not followed to the draw call. This
+    /// port used to step the quad into a grid of flat cells (up to 8 × 8), since its sprites had
+    /// one colour a quad; the renderer's per-corner triangles make that unnecessary.
     fn gouraud(&self, out: &mut Vec<Sprite>, aspect: f32, p: [[f32; 2]; 4], c: [[f32; 4]; 4]) {
-        let differs = |a: [f32; 4], b: [f32; 4]| (0..4).any(|j| (a[j] - b[j]).abs() > 1.0 / 255.0);
-        let steps = |vary: bool, extent: f32| if vary { (extent.abs().ceil() as usize).clamp(2, 8) } else { 1 };
-        // u runs UL→UR and BL→BR; v runs UL→BL and UR→BR
-        let slant_u = (p[0][1] - p[1][1]).abs() > 0.5 || (p[2][1] - p[3][1]).abs() > 0.5;
-        let slant_v = (p[0][0] - p[2][0]).abs() > 0.5 || (p[1][0] - p[3][0]).abs() > 0.5;
-        let nx = steps(differs(c[0], c[1]) || differs(c[2], c[3]) || slant_u || slant_v, p[1][0] - p[0][0]);
-        let ny = steps(differs(c[0], c[2]) || differs(c[1], c[3]) || slant_u || slant_v, p[2][1] - p[0][1]);
-        let at = |u: f32, v: f32, d: usize| {
-            let top = p[0][d] + (p[1][d] - p[0][d]) * u;
-            let bot = p[2][d] + (p[3][d] - p[2][d]) * u;
-            top + (bot - top) * v
+        let design_aspect = DESIGN.0 / DESIGN.1;
+        let (fw, x0) = if aspect > design_aspect { (design_aspect / aspect, (1.0 - design_aspect / aspect) * 0.5) } else { (1.0, 0.0) };
+        let at = |k: usize| [x0 + p[k][0] / DESIGN.0 * fw, p[k][1] / DESIGN.1];
+        let tri = |a: usize, b: usize, d: usize| Sprite {
+            texture: self.white,
+            pos: [0.0; 2],
+            size: [0.0; 2],
+            uv_min: [0.0, 0.0],
+            uv_max: [1.0, 1.0],
+            color: [1.0; 4],
+            rotation: 0.0,
+            pivot: [0.5, 0.5],
+            tri: Some(([at(a), at(b), at(d)], [c[a], c[b], c[d]])),
         };
-        for gy in 0..ny {
-            for gx in 0..nx {
-                let (u0, v0) = (gx as f32 / nx as f32, gy as f32 / ny as f32);
-                let (u1, v1) = ((gx + 1) as f32 / nx as f32, (gy + 1) as f32 / ny as f32);
-                let (u, v) = ((u0 + u1) * 0.5, (v0 + v1) * 0.5);
-                let col: [f32; 4] = std::array::from_fn(|j| {
-                    let top = c[0][j] + (c[1][j] - c[0][j]) * u;
-                    let bot = c[2][j] + (c[3][j] - c[2][j]) * u;
-                    top + (bot - top) * v
-                });
-                let xs = [at(u0, v0, 0), at(u0, v1, 0), at(u1, v0, 0), at(u1, v1, 0)];
-                let ys = [at(u0, v0, 1), at(u0, v1, 1), at(u1, v0, 1), at(u1, v1, 1)];
-                let (px, py) = (xs.iter().fold(f32::MAX, |m, v| m.min(*v)), ys.iter().fold(f32::MAX, |m, v| m.min(*v)));
-                let cw = xs.iter().fold(f32::MIN, |m, v| m.max(*v)) - px;
-                let ch = ys.iter().fold(f32::MIN, |m, v| m.max(*v)) - py;
-                out.push(self.quad(aspect, px, py, cw.max(0.5), ch.max(0.5), col));
-            }
-        }
+        // UL 0, UR 1, BL 2, BR 3 — the strip BR, BL, TR, TL: (BR, BL, UR) and (BL, UR, UL)
+        out.push(tri(3, 2, 1));
+        out.push(tri(2, 1, 0));
     }
 
     /// The state a widget draws in, which `FeWidget::updateState` **0x4C82A0** decides from its
@@ -5430,9 +5418,7 @@ impl LayoutScreen {
     /// screen. The whole thing is behind the global gate 0x4E35E0 that §4.9 records, the one the
     /// glinty classes share; this port draws those, so it draws this.
     ///
-    /// APPROXIMATION in one respect only, the same one §4.7 carries: each band is a gouraud
-    /// trapezoid and the sprite pipeline has one colour per quad, so a band is stepped across its
-    /// depth — `t` strips, each between two interpolated edges, in the colour at its middle.
+    /// Each band is one gouraud trapezoid, drawn as two per-corner triangles ([`Self::gouraud`]).
     /// **0x521810** — the inset highlight the text boxes and the dead-zone marker carry. Two
     /// gouraud halves through `0x4D96B0(x, y, w, h, c00, c10, c01, c11)`, inset one pixel and two
     /// smaller than the box:
@@ -5450,24 +5436,21 @@ impl LayoutScreen {
     /// through 0x4D9200 at the widget's own fade (0x4D87E0, which is just `fade << 24`). This
     /// port takes the other arm, the same choice §4.21 makes for the bevel.
     ///
-    /// APPROXIMATION, the one every gradient here carries: the sprite pipeline has one colour per
-    /// quad, so each half is stepped in one-pixel strips.
+    /// Each half is one gouraud rectangle ([`Self::gouraud`]); the port stepped them in one-pixel
+    /// strips until 2026-09-24.
     fn glass(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32, tint: &dyn Fn([u8; 4]) -> [f32; 4]) {
         let half = (h - 2.0) * 0.5;
         if half < 1.0 || w < 3.0 {
             return;
         }
+        // each half one 0x4D96B0 rectangle, its top pair one colour and its bottom pair the other
         for (top, c0, c1) in [
             (y + 1.0, tint([0xFF, 0xFF, 0xFF, 0x80]), tint([0xFF, 0xFF, 0xFF, 0])),
             (y + 1.0 + half, tint([0, 0, 0, 0]), tint([0, 0, 0, 0x91])),
         ]
         {
-            let n = half.round().max(1.0) as usize;
-            for d in 0..n {
-                let u = (d as f32 + 0.5) / n as f32;
-                let col = std::array::from_fn(|j| c0[j] + (c1[j] - c0[j]) * u);
-                out.push(self.quad(aspect, x + 1.0, top + d as f32 * half / n as f32, w - 2.0, (half / n as f32).max(0.5), col));
-            }
+            let (l, r, b) = (x + 1.0, x + w - 1.0, top + half);
+            self.gouraud(out, aspect, [[l, top], [r, top], [l, b], [r, b]], [c0, c0, c1, c1]);
         }
     }
 
@@ -5491,8 +5474,7 @@ impl LayoutScreen {
     /// mirror of 0x521050 — and the top band alone also fades **along its length**, bright at the
     /// left corner and dim at the right, which is the one thing neither bevel's other bands do.
     ///
-    /// APPROXIMATION, the same one `bevel` carries: one colour per quad, so each band is stepped
-    /// across its depth, and the top band along its length as well.
+    /// Each band is one gouraud quad ([`Self::bevel_bands`]).
     fn bevel_up(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32, t: f32) {
         let (lit_out, lit_in) = (tint([0xff, 0xff, 0xff, 0xcc]), tint([0xff, 0xff, 0xff, 0x33]));
         let (dark_out, dark_in) = (tint([0, 0, 0, 0xcc]), tint([0, 0, 0, 0x33]));
@@ -5507,40 +5489,21 @@ impl LayoutScreen {
         self.bevel_bands(out, aspect, &bands, t);
     }
 
-    /// The stepping the four-band bevels share: each band is an **outer** segment with a colour at
-    /// either end and an **inner** one the same, and the quad ramps between them across its depth
-    /// as well as along its length. APPROXIMATION — the sprite pipeline has one colour per quad,
-    /// so a band is cut into `t` strips across and, where its two ends differ, twelve along.
+    /// What the four-band bevels share: each band is an **outer** segment with a colour at either
+    /// end and an **inner** one the same — one call of the gouraud quad primitive 0x4D98D0 with the
+    /// outer pair as its upper corners and the inner pair as its lower ones (§4.74), drawn through
+    /// [`Self::gouraud`]. This port stepped each band into `t` strips across and twelve along until
+    /// 2026-09-24; `t` is kept in the signature for the callers.
     #[allow(clippy::type_complexity)]
     fn bevel_bands(
         &self,
         out: &mut Vec<Sprite>,
         aspect: f32,
         bands: &[([f32; 2], [f32; 2], [[f32; 4]; 2], [f32; 2], [f32; 2], [[f32; 4]; 2])],
-        t: f32,
+        _t: f32,
     ) {
-        let n = (t.round() as usize).max(1);
         for &(a0, a1, ca, c0, c1, cb) in bands {
-            let m = if ca[0] == ca[1] && cb[0] == cb[1] { 1 } else { 12 };
-            for d in 0..n {
-                let (s0, s1) = (d as f32 / n as f32, (d + 1) as f32 / n as f32);
-                let at = |s: f32, p: [f32; 2], q: [f32; 2]| [p[0] + (q[0] - p[0]) * s, p[1] + (q[1] - p[1]) * s];
-                for k in 0..m {
-                    let (u0, u1) = (k as f32 / m as f32, (k + 1) as f32 / m as f32);
-                    let e0 = (at(u0, a0, a1), at(u0, c0, c1));
-                    let e1 = (at(u1, a0, a1), at(u1, c0, c1));
-                    let corners =
-                        [at(s0, e0.0, e0.1), at(s0, e1.0, e1.1), at(s1, e0.0, e0.1), at(s1, e1.0, e1.1)];
-                    let (px, py) = (corners.iter().fold(f32::MAX, |m, c| m.min(c[0])), corners.iter().fold(f32::MAX, |m, c| m.min(c[1])));
-                    let cw = corners.iter().fold(f32::MIN, |m, c| m.max(c[0])) - px;
-                    let ch = corners.iter().fold(f32::MIN, |m, c| m.max(c[1])) - py;
-                    let (s, u) = ((s0 + s1) * 0.5, (u0 + u1) * 0.5);
-                    let outer: [f32; 4] = std::array::from_fn(|j| ca[0][j] + (ca[1][j] - ca[0][j]) * u);
-                    let inner: [f32; 4] = std::array::from_fn(|j| cb[0][j] + (cb[1][j] - cb[0][j]) * u);
-                    let col = std::array::from_fn(|j| outer[j] + (inner[j] - outer[j]) * s);
-                    out.push(self.quad(aspect, px, py, cw.max(0.5), ch.max(0.5), col));
-                }
-            }
+            self.gouraud(out, aspect, [a0, a1, c0, c1], [ca[0], ca[1], cb[0], cb[1]]);
         }
     }
 
@@ -5884,6 +5847,12 @@ impl LayoutScreen {
             if talpha < 1.0 {
                 for s in &mut out[first..] {
                     s.color[3] *= talpha;
+                    // a per-corner triangle carries its own colours
+                    if let Some((_, cols)) = s.tri.as_mut() {
+                        for c in cols {
+                            c[3] *= talpha;
+                        }
+                    }
                 }
             }
             // the first block is the screen's own descriptor, not a widget: it is the one that

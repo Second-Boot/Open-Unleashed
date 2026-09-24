@@ -411,16 +411,20 @@ impl EngineSound {
             let lvl = self.level[i];
             // §3.4's voice management: a stereo layer (`slotId >= 0x40`) plays **two** voices at
             // `pan ± spread` whenever the in-car spread is open; a mono one goes dead-behind
-            // instead. The original's pans are 16-bit angles; this port's are scalars, so the
-            // spread maps onto the pan axis as a fraction of a half turn — APPROXIMATION.
+            // instead. The original's pans are 16-bit angles (a half turn is 0x8000); this port's
+            // pan is the sine of the angle, so the pair is `sin(θ ∓ spread·π/0x8000)` — the angles
+            // wrap and the mixer mirrors front and back (`mixer::pan_gains`)
             let stereo_pair = d.slot >= 0x40 && spread != 0;
-            let sp = spread as f32 / 32768.0;
             let (pan_a, pan_b) = if stereo_pair {
-                ((pan - sp).clamp(-1.0, 1.0), (pan + sp).clamp(-1.0, 1.0))
+                let theta = pan.clamp(-1.0, 1.0).asin();
+                let sp = spread as f32 * std::f32::consts::PI / 32768.0;
+                ((theta - sp).sin(), (theta + sp).sin())
             } else if d.slot >= 0x40 {
                 (pan, pan)
             } else {
-                (if spread != 0 { -1.0 } else { pan }, pan)
+                // mono in-car: dead behind, angle 0x8000 — sin π, the two speakers equal
+                // (until 2026-09-25 this was −1.0, hard left)
+                (if spread != 0 { 0.0 } else { pan }, pan)
             };
             let half = if stereo_pair { 0.5 } else { 1.0 };
             let vol = lvl as f32 / 127.0 * half;

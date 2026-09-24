@@ -16,7 +16,7 @@ fn main() {
                 amin = amin.min(c[3]);
                 amax = amax.max(c[3]);
             }
-            println!("{:?} {}x{} alpha {} red {rmin}..{rmax} a {amin}..{amax}", x.name, x.width, x.height, x.has_alpha);
+            println!("{:?} {}x{} mips {} alpha {} red {rmin}..{rmax} a {amin}..{amax}", x.name, x.width, x.height, x.mips.len(), x.has_alpha);
         }
     }
 }

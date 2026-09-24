@@ -36,16 +36,34 @@ struct Voice {
     pos: f64,
     pitch: f32,
     volume: f32,
-    /// −1 = hard left, 0 = centre, +1 = hard right (equal power)
+    /// −1 = hard left, 0 = centre, +1 = hard right: the sine of the source's angle off the
+    /// listener's forward (see `pan_gains`)
     pan: f32,
     looping: bool,
     finished: bool,
 }
 
-/// Equal-power stereo gains for a pan in −1..1.
+/// The software mixer's stereo law (`RE/notes/engine-audio.md`, "The pan law"): 0x58E0E0 builds a
+/// 256-step table over the voice's angle with the two speakers at 0x4000 (left) and 0xC000
+/// (right); between them the angle splits **linearly**, and each speaker's share `x` (0…127,
+/// integer division) becomes `f(x) = 2x − x²/127` (0x58E0B0), scaled by 1/127 (`[0x5C1788]`).
+/// Front and back mirror. `pan` is the sine of the angle off forward, as this port computes it,
+/// so it is taken back to the angle first.
+///
+/// This is the path of a voice the driver cannot give hardware 3D (`[0x6B48DF]` hardware 3D
+/// voices, 0 on a card without DirectSound3D buffers, drops every 3D type from the table at
+/// 0x58A7C4…0x58A7D6); a card with them positions the voice with `SetPosition` instead
+/// (0x596370) and the stereo image is the card's — APPROXIMATION that the software path is the one.
+/// (Until 2026-09-25 this was an equal-power cos / sin law of the port's own.)
 fn pan_gains(pan: f32) -> [f32; 2] {
-    let a = (pan.clamp(-1.0, 1.0) + 1.0) * (std::f32::consts::FRAC_PI_4);
-    [a.cos(), a.sin()]
+    let p = pan.clamp(-1.0, 1.0).asin() / std::f32::consts::FRAC_PI_2;
+    // the angle on the table's 256-step grid: 128 steps across the half turn between the speakers
+    let steps = ((1.0 + p) * 0.5 * 128.0).round() as i32;
+    let from_left = steps * 256;
+    let from_right = 0x8000 - from_left;
+    let f = |x: i32| (2 * x - x * x / 127) as f32 / 127.0;
+    // each speaker's share grows with the distance to the other one
+    [f(127 * from_right / 0x8000), f(127 * from_left / 0x8000)]
 }
 
 #[derive(Default)]
@@ -336,5 +354,20 @@ mod bend_tests {
         assert!((c.bend(0) - (-400.0f32 / 1200.0).exp2()).abs() < 1e-6);
         // clamped to 0…127 like Voice_play's argument (0x4A9C1F)
         assert_eq!(c.bend(1000), c.bend(127));
+    }
+}
+
+#[cfg(test)]
+mod pan_tests {
+    use super::pan_gains;
+
+    #[test]
+    fn the_pan_law_is_the_software_mixers() {
+        // hard left / right: one speaker at 127/127, the other silent (0x58E0E0)
+        assert_eq!(pan_gains(-1.0), [1.0, 0.0]);
+        assert_eq!(pan_gains(1.0), [0.0, 1.0]);
+        // centre: x = 63, f = 126 − 31 = 95 → 95/127 on both (0x58E0B0)
+        let c = pan_gains(0.0);
+        assert!((c[0] - 95.0 / 127.0).abs() < 1e-6 && (c[1] - 95.0 / 127.0).abs() < 1e-6);
     }
 }

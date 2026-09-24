@@ -441,6 +441,19 @@ impl SliceTable {
     }
 }
 
+/// What 0x4A7660's gates let the wrong-way counter `car+0xD30` do this step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WrongWayGate {
+    /// counts while the car heads against the slice
+    #[default]
+    Count,
+    /// holds its value — `word car+0x418` (more than one wheel airborne, suspension-collision.md
+    /// §1.3) or `car+0x1104` set
+    Hold,
+    /// cleared — finished, AI-driven, post-finish or a mission
+    Reset,
+}
+
 /// 0x4A7734…0x4A7744: the "wrong way" cue 0x4AAE70 sounds when `car+0xD30` reaches 64, 96 and 128
 /// (`≥ 0x40`, a multiple of 32, `< 0x94`).
 pub fn wrong_way_cue(steps: u32) -> bool {
@@ -461,6 +474,8 @@ pub struct RaceProgress {
     /// `car+0xD30` as the original counts it: 0x4A7660 runs in the odd-tick group 0x4A8120, so one
     /// step per two 64 Hz ticks while the car heads against the slice.
     pub wrong_way_steps: u32,
+    /// what 0x4A7660's gates allow this step — set by the caller before `update`
+    pub wrong_way_gate: WrongWayGate,
     pub finished: bool,
     /// Lap fraction the car started from (needed for the projected time of a car that is still
     /// racing when the race ends, `Race_finalize` 0x416AC0).
@@ -567,14 +582,20 @@ impl RaceProgress {
         }
         self.prev_progress = new;
         self.progress = self.laps as f32 + frac - self.unlaps as f32;
-        if forward.dot(table.slices[self.slice].forward) < 0.0 {
+        // 0x4A7660: a car that has finished (`car+0xB50 == 2`), is AI-driven, is in the
+        // post-finish state or races a mission (`[0x6573E8] == 9`) clears its counter, and so does
+        // one heading along the slice; one heading against it counts on — unless it is airborne
+        // (`word car+0x418`) or crash-inhibited (`car+0x1104`), when the counter holds
+        // (0x4A76E5…0x4A774D)
+        let gate = self.wrong_way_gate;
+        if gate == WrongWayGate::Reset || forward.dot(table.slices[self.slice].forward) >= 0.0 {
+            self.wrong_way_ticks = 0;
+            self.wrong_way_steps = 0;
+        } else if gate == WrongWayGate::Count {
             self.wrong_way_ticks += 1;
             if tick & 1 == 1 {
                 self.wrong_way_steps += 1;
             }
-        } else {
-            self.wrong_way_ticks = 0;
-            self.wrong_way_steps = 0;
         }
         lap_done
     }
@@ -786,6 +807,34 @@ mod finish_tests {
         assert_eq!(p.laps, 1);
         assert_eq!(p.lap_times.len(), 1, "no laps after the finish");
         assert!((p.progress - 1.0).abs() < 0.01);
+    }
+
+    /// 0x4A7660: heading against the slice counts, an airborne car holds, a gated one clears.
+    #[test]
+    fn wrong_way_counter_follows_its_gates() {
+        let n = 100;
+        let r = n as f32 * SLICE_SPACING / std::f32::consts::TAU;
+        let slices: Vec<Slice> = (0..n)
+            .map(|i| {
+                let a = i as f32 / n as f32 * std::f32::consts::TAU;
+                let centre = Vec3::new(a.cos() * r, 0.0, a.sin() * r);
+                let forward = Vec3::new(-a.sin(), 0.0, a.cos());
+                Slice { centre, up: Vec3::Y, forward, lateral: Vec3::Y.cross(forward), lane_mask: 0, lanes_a: 1, lanes_b: 1, width_a: 5.0, width_b: 5.0, lane_width_a: 5.0, lane_width_b: 5.0 }
+            })
+            .collect();
+        let t = SliceTable::build(slices, vec![Section { first: 0, last: n - 1, f0: 0.0, f1: 1.0 }]);
+        let mut p = RaceProgress::new(10, &t);
+        let back = |p: &mut RaceProgress, tick: u64| p.update(&t, t.slices[10].centre, -t.slices[10].forward, tick, 3);
+        for tick in 1..=4 {
+            back(&mut p, tick);
+        }
+        assert_eq!(p.wrong_way_steps, 2);
+        p.wrong_way_gate = WrongWayGate::Hold;
+        back(&mut p, 5);
+        assert_eq!(p.wrong_way_steps, 2, "held while airborne");
+        p.wrong_way_gate = WrongWayGate::Reset;
+        back(&mut p, 7);
+        assert_eq!(p.wrong_way_steps, 0, "cleared when gated");
     }
 }
 

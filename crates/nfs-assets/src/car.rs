@@ -23,6 +23,10 @@ pub struct CarStyle {
     pub name: String,
     pub geometry: std::collections::HashMap<u32, u32>,
     pub texture: std::collections::HashMap<u32, u32>,
+    /// the page builder's context for 0x439C60: whether this is the front end (`[0x65B928] != 0`)
+    pub front_end: bool,
+    /// the track's night flag `word[0x628A28]`, which a race entry's `night` key must equal
+    pub night: bool,
 }
 
 /// Where the driver's view sits and how it is aimed, from the car's `.tpg`
@@ -106,24 +110,43 @@ impl CarStyle {
         }
         st
     }
-    /// Whether an entry/article section with `textureK/geometryK` + `typeK` pairs is enabled.
+    /// Whether an entry/article section with `geometryK`/`textureK` + `typeK` pairs is enabled —
+    /// 0x439C60: enabled by default; with a `count` above 0 it is enabled only when **any** of the
+    /// `count` pairs matches, `carinfo[0x56C + 4·slot] == typeK` with the slot `geometryK`, or
+    /// `textureK + 0x3C` when `geometryK` is absent (0x439D07…0x439DA0: the first match sets the
+    /// flag and leaves the loop); then the `frontend`, `night` and `testdrive` keys below. *(Until 2026-09-25 the pairs had
+    /// to match all at once, which a section listing two values of one slot — the 993's `top`,
+    /// `geometry1=7 type1=0`, `geometry2=7 type2=1` — never could, and its texels stayed black.)*
     pub fn entry_enabled(&self, sec: &nfs_formats::ini::IniSection) -> bool {
-        if sec.get_i64("frontend") == Some(1) {
+        let count = sec.get_i64("count").unwrap_or(0);
+        let pairs = count <= 0
+            || (1..=count).any(|k| {
+            let want = sec.get_i64(&format!("type{k}")).unwrap_or(0) as u32;
+            match sec.get_i64(&format!("geometry{k}")) {
+                Some(g) if g >= 0 => self.geometry.get(&(g as u32)).copied().unwrap_or(0) == want,
+                _ => self.texture.get(&(sec.get_i64(&format!("texture{k}")).unwrap_or(0) as u32)).copied().unwrap_or(0) == want,
+            }
+        });
+        if !pairs {
             return false;
         }
-        let count = sec.get_i64("count").unwrap_or(1);
-        for k in 1..=count {
-            let want = sec.get_i64(&format!("type{k}")).unwrap_or(0) as u32;
-            if let Some(t) = sec.get_i64(&format!("texture{k}"))
-                && self.texture.get(&(t as u32)).copied().unwrap_or(0) != want {
-                    return false;
-                }
-            if let Some(g) = sec.get_i64(&format!("geometry{k}"))
-                && self.geometry.get(&(g as u32)).copied().unwrap_or(0) != want {
-                    return false;
-                }
+        // `frontend` must say whether this is the front end (0x439DD9…0x439DED)
+        if let Some(f) = sec.get_i64("frontend")
+            && (f != 0) != self.front_end
+        {
+            return false;
         }
-        true
+        // in a race, `night` must match the track (0x439DF8…0x439E07)
+        if !self.front_end
+            && let Some(n) = sec.get_i64("night")
+            && (n != 0) != self.night
+        {
+            return false;
+        }
+        // `testdrive` must be 0 off `skidpad` (0x439E75…0x439EC1). APPROXIMATION: on `skidpad`
+        // the original wants it to equal `[0x6573E8] == 9`; the page builder has no track name
+        // here, so skidpad's own rule is not carried
+        !matches!(sec.get_i64("testdrive"), Some(t) if t != 0)
     }
     /// The render overlay `R3DCar` slot 19 lays over the `.tpg` style at model load
     /// (0x43AEA5…0x43AF6B). It is not a separate mechanism — it writes the **same** array, so
@@ -455,10 +478,12 @@ fn blit(page: &mut TexturePage, src: &[u8], w: u32, h: u32, x: i64, y: i64, tint
                 d[2] = ((paint[2] as u32 * grey) >> 8) as u8;
                 d[3] = 255;
             } else {
+                // copied unchanged, alpha and all (0x444130's slots 0 / 10 / 20, and every texel
+                // of an untinted page): a wheel face's corners outside the tyre keep their 0 and
+                // the blended `CarWheel` pass leaves them out. *(Until 2026-09-25 the port forced
+                // 255 on every page but the window and alpha ones, its own rule, which drew the
+                // corners of the spinning face square as black wedges past the tyre.)*
                 d.copy_from_slice(s);
-                if !page.is_window && !page.is_alpha {
-                    d[3] = 255;
-                }
             }
         }
     }

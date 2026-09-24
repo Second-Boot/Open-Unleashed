@@ -17,8 +17,10 @@
 //! that leaves its cell opens a new strip in the next (0x4793AE…0x479452). A strip holds 192
 //! points on a world under 1200 across, else 12 (0x47993F…0x47995C).
 //!
-//! APPROXIMATION: the world's box is the box of the port's collision triangles (the original's is
-//! its bundles' boxes, 0x47B6C6…0x47B89C); the original finds a cell's record with a
+//! The world's box is the box of the port's collision triangles; the original's is its bundles'
+//! boxes (0x47B6C6…0x47B89C). Checked 2026-09-24: the box of every drawn article and instance
+//! comes out the same (skidpad 750 m, monaco1 1818 m across), so the level and the 192 / 12
+//! capacity agree. APPROXIMATION left: the original finds a cell's record with a
 //! `lower_bound` over the cells that hold geometry (0x47A300), the port keys a cell by its index.
 
 use crate::particles::SURFACE_ARGB;

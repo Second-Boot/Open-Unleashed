@@ -450,7 +450,11 @@ impl App {
             b if modifier == "SHORT" && matches!(b, "OwnedCars.Car" | "DealerCar.Car" | "GenericCar.Car" | "CARSETTINGS.CAR") => {
                 self.logo_car(Some(base), None)?.family.to_uppercase()
             }
-            "OwnedCars.Car" | "DealerCar.Car" | "GenericCar.Car" | "CARSETTINGS.CAR" => {
+            // the dealer's and the car-select list's own car by its full name — the same car their
+            // `SHORT` and `CLASSLISTING` forms above resolve. (Until 2026-09-25 these fell into the
+            // garage arm below, so `dealership.lay`'s name line showed the player's own car.)
+            "DealerCar.Car" | "GenericCar.Car" => self.logo_car(Some(base), None)?.display_name.to_uppercase(),
+            "OwnedCars.Car" | "CARSETTINGS.CAR" => {
                 // the garage screens ask the same accessor for the car's money and damage figures
                 let c = career?;
                 let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));

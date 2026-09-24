@@ -3,10 +3,9 @@
 //! `crp-geometry.md` §8): the constructor 0x454250, the 64 Hz update 0x454C30 with the birth
 //! 0x454860, and the draw 0x454430's billboards.
 //!
-//! APPROXIMATION: every system is made when the track loads and lives for the race — the
-//! original makes one the first time its article is drawn and drops it 100 updates after it was
-//! last drawn (0x4551E0), and a system's emission fades past `volume ×` the draw distance
-//! (0x454C7E…0x454CD2), which this port has no counterpart for.
+//! A system's emission fades past `volume ×` the draw distance ([`emission_scale`],
+//! 0x454C7B…0x454CD2), and a system lives only while its article is drawn: made on the first
+//! draw, dropped 100 updates after the last ([`TrackParticles::step`], 0x455150 / 0x4551E0).
 
 use glam::Vec3;
 use nfs_formats::particle_dat::ParticleDef;
@@ -79,6 +78,10 @@ struct System {
     /// `+0x2E & 2`: both sizes 0, no billboards
     no_sprites: bool,
     particles: Vec<Particle>,
+    /// whether the system exists — made on its article's first draw (0x455150)
+    live: bool,
+    /// `+8`: set to 100 by each draw, counted down by each update, dropped at 0 (0x4551E0)
+    countdown: u32,
 }
 
 /// One billboard of a frame: the definition's texture, the particle's point, its side, its ARGB
@@ -86,6 +89,14 @@ struct System {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sprite {
     pub material: String,
+    /// the definition's `+0x28`, handed to the state object's `+8` (0x454756…0x454766 → 0x537A50),
+    /// the Thrash 0x38 value of the draw (`RE/notes/thrash.md` §6)
+    pub blend: u32,
+    /// the definition's `+0x2C`, the depth bias's numerator (0x45445C…0x454491)
+    pub zbias: i32,
+    /// the emitter the system belongs to — the original's `+0x10` is its article's square
+    /// distance to the camera (0x455150)
+    pub emitter: Vec3,
     pub position: Vec3,
     pub size: f32,
     pub argb: u32,
@@ -128,30 +139,62 @@ impl TrackParticles {
                 emitting: d.flags & 2 == 0,
                 no_sprites: d.start_size == 0.0 && d.end_size == 0.0,
                 particles: Vec::new(),
+                live: false,
+                countdown: 0,
             };
-            let prime = d.prime;
             me.systems.push(sys);
-            let k = me.systems.len() - 1;
-            for _ in 0..prime {
-                me.step_one(k);
-            }
         }
         me
+    }
+
+    /// The constructor 0x454250 for system `k`: a fresh state, then its `prime` updates at once —
+    /// before any draw has set the distance, so at the full rate.
+    fn make(&mut self, k: usize) {
+        let d = &self.defs[self.systems[k].def];
+        let (emitting, prime) = (d.flags & 2 == 0, d.prime);
+        let s = &mut self.systems[k];
+        (s.tick, s.spawned, s.accumulated, s.emitting, s.live) = (0, 0.0, 0.0, emitting, true);
+        s.particles.clear();
+        for _ in 0..prime {
+            self.step_one(k, None);
+        }
     }
 
     pub fn systems(&self) -> usize {
         self.systems.len()
     }
 
-    /// One 64 Hz update of every system (0x4551E0 → slot 2).
-    pub fn step(&mut self) {
+    /// One 64 Hz update (0x4551E0), with the camera's eye and the scaled draw distance
+    /// `[0x6197CC]` (0x44F1A0). A system whose article is drawn is made if it does not exist
+    /// (0x455150, prime and all) and its `+8` set to 100; every live system then counts `+8` down
+    /// and runs its update (slot 2), or is dropped when it reaches 0 — so one out of sight stops
+    /// 100 updates later, and starts afresh when it is drawn again.
+    ///
+    /// APPROXIMATION: "drawn" is the emitter within the draw distance of the eye; the original's
+    /// is its article getting through the render's culling, frustum included.
+    pub fn step(&mut self, eye: Vec3, draw: f32) {
         for k in 0..self.systems.len() {
-            self.step_one(k);
+            if (self.systems[k].emitter.position - eye).length_squared() <= draw * draw {
+                if !self.systems[k].live {
+                    self.make(k);
+                }
+                self.systems[k].countdown = 100;
+            }
+            if !self.systems[k].live {
+                continue;
+            }
+            self.systems[k].countdown = self.systems[k].countdown.saturating_sub(1);
+            if self.systems[k].countdown == 0 {
+                self.systems[k].live = false;
+                self.systems[k].particles.clear();
+                continue;
+            }
+            self.step_one(k, Some((eye, draw)));
         }
     }
 
-    /// 0x454C30.
-    fn step_one(&mut self, k: usize) {
+    /// 0x454C30. `view` is the camera's eye and the draw distance for the emission fade.
+    fn step_one(&mut self, k: usize, view: Option<(Vec3, f32)>) {
         let d = &self.defs[self.systems[k].def];
         let s = &mut self.systems[k];
         if s.particles.is_empty() && !s.emitting {
@@ -160,7 +203,7 @@ impl TrackParticles {
         let period = d.period_on + d.period_off;
         let off_part = d.period_off != 0 && s.tick > d.period_on;
         if s.emitting && !off_part {
-            s.accumulated += s.rate;
+            s.accumulated += s.rate * view.map_or(1.0, |(eye, draw)| emission_scale((s.emitter.position - eye).length_squared(), draw, d.volume));
             while s.accumulated > s.spawned + 1.0 {
                 if s.particles.len() < s.max {
                     let p = birth(&mut self.rng, d, &s.emitter, s.axis);
@@ -200,7 +243,7 @@ impl TrackParticles {
     /// 0x454430's billboards for every particle.
     pub fn sprites(&self) -> Vec<Sprite> {
         let mut out = Vec::new();
-        for s in &self.systems {
+        for s in self.systems.iter().filter(|s| s.live) {
             if s.no_sprites {
                 continue;
             }
@@ -209,6 +252,9 @@ impl TrackParticles {
                 let t = p.age / d.lifetime.max(1) as f32;
                 out.push(Sprite {
                     material: d.material.clone(),
+                    blend: d.blend,
+                    zbias: d.zbias,
+                    emitter: s.emitter.position,
                     position: p.pos,
                     size: (t * (d.end_size - d.start_size) + d.start_size) * 10.0,
                     argb: ramp(d, t),
@@ -218,6 +264,21 @@ impl TrackParticles {
         }
         out
     }
+}
+
+/// The emission's distance factor (0x454C7B…0x454CD2): 1 while the square distance `sqd` is within
+/// `(volume · draw)²`, else `(draw − √sqd) / ((1 − volume) · draw)` — falling to 0 at the draw
+/// distance and below it past that — with the square root the image's bit trick,
+/// `bits(sqd) >> 1 + 0x1FC00000` (0x454CA3…0x454CB4). The system's own factor `+0x44` is the 1.0
+/// the constructor sets (0x454305). APPROXIMATION: `sqd` is the camera's distance to the emitter,
+/// where the original takes its article's `+0xC`, set when the article is drawn (0x455150).
+pub fn emission_scale(sqd: f32, draw: f32, volume: f32) -> f32 {
+    let r = volume * draw;
+    if r * r >= sqd {
+        return 1.0;
+    }
+    let s = f32::from_bits(((sqd.to_bits() as i32 >> 1) + 0x1FC0_0000) as u32);
+    (draw - s) / ((1.0 - volume) * draw)
 }
 
 /// 0x454860: the point with `x` / `z` spread by `emit`, the speed `emit.y + rand` along the second
@@ -265,6 +326,33 @@ pub fn ramp(d: &ParticleDef, t: f32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_system_lives_while_its_article_is_drawn() {
+        // 0x455150 makes it on the first draw; 0x4551E0 drops it 100 updates after the last
+        let e = Emitter { position: Vec3::ZERO, dir_a: Vec3::X, dir_b: Vec3::Y, tag: 1 };
+        let mut p = TrackParticles::new(vec![def()], &[e], 0, 256);
+        let far = Vec3::new(5000.0, 0.0, 0.0);
+        p.step(far, 1000.0);
+        assert!(!p.systems[0].live);
+        p.step(Vec3::ZERO, 1000.0);
+        assert!(p.systems[0].live);
+        for _ in 0..98 {
+            p.step(far, 1000.0);
+        }
+        assert!(p.systems[0].live);
+        p.step(far, 1000.0);
+        assert!(!p.systems[0].live && p.sprites().is_empty());
+    }
+
+    #[test]
+    fn emission_fades_from_the_volume_to_the_draw_distance() {
+        // full within volume × draw; past it the bit-trick root (√90000 → 303.78, √160000 → 412.25)
+        // makes it 0.481 half-way and slightly negative at the draw distance itself
+        assert_eq!(super::emission_scale(100.0 * 100.0, 400.0, 0.5), 1.0);
+        assert!((super::emission_scale(300.0 * 300.0, 400.0, 0.5) - 0.481_093_75).abs() < 1e-5);
+        assert!((super::emission_scale(400.0 * 400.0, 400.0, 0.5) + 0.061_25).abs() < 1e-5);
+    }
+
     use super::*;
 
     fn def() -> ParticleDef {
@@ -303,13 +391,13 @@ mod tests {
         assert_eq!(p.systems(), 1);
         // 20 over a 100-tick life: 0.2 a tick, the first one born once 1.2 has accumulated
         for _ in 0..5 {
-            p.step();
+            p.step(Vec3::ZERO, 1000.0);
         }
         assert_eq!(p.sprites().len(), 0);
-        p.step();
+        p.step(Vec3::ZERO, 1000.0);
         assert_eq!(p.sprites().len(), 1);
         for _ in 0..200 {
-            p.step();
+            p.step(Vec3::ZERO, 1000.0);
         }
         // the population settles at what 100 ticks of life hold
         let n = p.sprites().len();
@@ -340,7 +428,7 @@ mod tests {
         d.flags = 2;
         let mut p = TrackParticles::new(vec![d], &[e], 0, 256);
         for _ in 0..50 {
-            p.step();
+            p.step(Vec3::ZERO, 1000.0);
         }
         assert!(p.sprites().is_empty(), "flag 2 waits for a trigger");
     }

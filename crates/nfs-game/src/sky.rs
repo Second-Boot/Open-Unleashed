@@ -1,7 +1,7 @@
 //! Sky: the layers `Track/Sky/<Track>.txt` asks for, on a dome (`SkyLevel_*`, RE/RENDERING.md).
 //!
 //! The layer list, the textures, their UV repeats, the wind and the warp all come from the track's
-//! own sky file now (`nfs_formats::sky`): the block whose capability matches is taken, weather
+//! own sky file now (`nfs_formats::sky`): the block of the `SKYRENDERING` level is taken, weather
 //! region A is used, and each layer that names a sky map is drawn as one dome, the first opaque and
 //! the rest alpha-blended (the shipped tracks are all `MULTINORMAL` or `basic`). The `horz` horizon
 //! strips keep their ring.
@@ -160,7 +160,9 @@ impl Jitter {
 #[derive(Debug, Clone, Copy)]
 enum Motion {
     Still,
-    /// the dome of a track without a `.bin`: UV units per second (APPROXIMATION)
+    /// the dome of a track without a `.bin`: UV units per second (APPROXIMATION). Unreachable with
+    /// the shipped data: every track has its `.bin` (`alps.bin` in lower case) and `default.bin`
+    /// is the loader's fallback (0x459680 / 0x4596A1), so this only draws a broken install
     Dome([f32; 2]),
     /// a grid layer: index into `Sky::grids`
     Grid(usize),
@@ -311,16 +313,22 @@ fn ring(radius: f32, y0: f32, y1: f32, segs: u32, repeats: f32, v0: f32, v1: f32
 }
 
 impl Sky {
-    pub fn upload(r: &mut Renderer, track: &TrackAssets) -> Option<Self> {
+    /// `level` is `SKYRENDERING` (`[0x657D9C]`, `Graphics.SkyRendering`).
+    pub fn upload(r: &mut Renderer, track: &TrackAssets, level: usize) -> Option<Self> {
         let find = |n: &str| track.sky_textures.iter().find(|t| t.name.trim() == n);
         fn tex(r: &mut Renderer, t: &nfs_assets::texture::TextureImage) -> nfs_renderer::TextureId {
             r.upload_texture(&TextureData { width: t.width, height: t.height, mips: t.mips.clone() })
         }
         let mut parts = Vec::new();
-        let sky_mat = |r: &mut Renderer, id, blend| r.create_material(MaterialDesc { texture: Some(id), alpha_blend: blend, cull_back: false, depth_test: false, env_texture: None, env_mix: 0.0, env_variant: 0 });
+        let sky_mat = |r: &mut Renderer, id, blend| r.create_material(MaterialDesc { texture: Some(id), alpha_blend: blend, cull_back: false, depth_test: false, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0 });
 
         let file = nfs_formats::sky::SkyFile::parse(&track.sky_params.join("\n")).ok();
-        let block = file.as_ref().and_then(|f| f.for_capability("HIGH"));
+        // the blocks of the `SKYRENDERING` level (0x45D8F0 → 0x45FB80, `SkyFile::for_level`) — none
+        // at level 0 on any shipped track. The port read the `HIGH` block whatever the option said.
+        // APPROXIMATION of an unreachable case: the original builds a level for **every** matching
+        // block; only `default.txt`'s two `LOW` blocks are ever more than one, and every shipped
+        // track has its own file, so the port builds the first
+        let block = file.as_ref().and_then(|f| f.for_level(level).first().copied());
         let mut grids = Vec::new();
         let mut jitter = Jitter::new([0.0; 2], [0.0; 2]);
         if let Some(b) = block {
@@ -358,7 +366,11 @@ impl Sky {
                 }
             }
         }
-        if let Some(hz) = find("horz") {
+        // the horizon's texture `+0x44` is `hor<level>` when the pack has one and `horz` otherwise
+        // (0x459C1F…0x459C4D) — the existence test before it (0x459B8D…0x459BB7) asks the other
+        // way round, but either name keeps the ring. At the shipped level 0 `Industrial` and
+        // `foothills` carry a `hor0`, and `Canyon` a `hor1` / `hor2`; the port had always taken `horz`.
+        if let Some(hz) = find(&format!("hor{level}")).or_else(|| find("horz")) {
             let id = tex(r, hz);
             let m = sky_mat(r, id, true);
             match track.sky_bin.as_ref().filter(|b| b.tile_cols > 0) {

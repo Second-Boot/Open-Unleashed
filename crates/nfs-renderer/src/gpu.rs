@@ -70,12 +70,19 @@ struct SpriteVertex {
 struct GpuMaterial {
     bind_group: wgpu::BindGroup,
     alpha_blend: bool,
+    blend_pair: u8,
+    /// the address-mode half of the index into `samplers` (`clamp_u | clamp_v << 1`)
+    sampler: usize,
+    /// Thrash state 8, `MIPMAPLODBIAS` (`RE/notes/thrash.md` §7)
+    lod_bias: f32,
     cull_back: bool,
     depth_test: bool,
     env_mix: f32,
     env_variant: usize,
     /// the diffuse texture, kept so the material can be rebound to another environment map
     texture: TextureId,
+    /// the environment map bound now
+    env: TextureId,
 }
 
 pub struct Renderer {
@@ -88,7 +95,8 @@ pub struct Renderer {
     globals_buf: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
     globals_layout: wgpu::BindGroupLayout,
-    proj_sampler: wgpu::Sampler,
+    /// the projector's sampler, trilinear and with the `POINT` mip filter (`trilinear` picks)
+    proj_samplers: [wgpu::Sampler; 2],
     _proj_default: wgpu::Texture,
     proj_default_view: wgpu::TextureView,
     headlight_map_buf: wgpu::Buffer,
@@ -96,7 +104,11 @@ pub struct Renderer {
     head_tex: Option<TextureId>,
     object_layout: wgpu::BindGroupLayout,
     material_layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
+    /// the scene samplers by address mode and mip filter — index `clamp_u | clamp_v << 1 |
+    /// point_mip << 2`
+    samplers: [wgpu::Sampler; 8],
+    /// the mip filter's `POINT` → `LINEAR` promotion, `[0x69DD1D]` (`set_trilinear`); clear at start, as the image has it
+    trilinear: bool,
     sprite_sampler: wgpu::Sampler,
     object_buf: wgpu::Buffer,
     object_bg: wgpu::BindGroup,
@@ -142,7 +154,15 @@ impl Renderer {
         .context("request device")?;
 
         let caps = surface.get_capabilities(&adapter);
-        let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
+        // a byte surface, as Direct3D 7's was: colours, blends and interpolation work on the stored
+        // bytes, not in linear light (`RE/RENDERING.md`, "Colour space")
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| matches!(f, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm))
+            .or_else(|| caps.formats.iter().copied().find(|f| !f.is_srgb()))
+            .unwrap_or(caps.formats[0]);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -239,7 +259,20 @@ impl Renderer {
             bind_group_layouts: &[&globals_layout, &object_layout, &material_layout],
             push_constant_ranges: &[],
         });
-        let make_pipeline = |blend: bool, cull: bool, depth: bool| {
+        // Thrash state 0x38's pairs (`dx7z.dll` 0x600046BB): 1 `SRCALPHA`/`ONE` (the general arm;
+        // two device kinds take `ONE`/`ONE`), 2 `ZERO`/`INVSRCALPHA`, 3 `DESTCOLOR`/`ZERO`
+        let pair_state = |pair: u8| {
+            use wgpu::BlendFactor as F;
+            let (src, dst) = match pair {
+                1 => (F::SrcAlpha, F::One),
+                2 => (F::Zero, F::OneMinusSrcAlpha),
+                3 => (F::Dst, F::Zero),
+                _ => return wgpu::BlendState::ALPHA_BLENDING,
+            };
+            let c = wgpu::BlendComponent { src_factor: src, dst_factor: dst, operation: wgpu::BlendOperation::Add };
+            wgpu::BlendState { color: c, alpha: c }
+        };
+        let make_pipeline = |blend: bool, pair: u8, cull: bool, depth: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("mesh pipeline"),
                 layout: Some(&pipeline_layout),
@@ -255,11 +288,11 @@ impl Renderer {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(if blend { "fs_main" } else { "fs_opaque" }),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format,
-                        blend: Some(if blend { wgpu::BlendState::ALPHA_BLENDING } else { wgpu::BlendState::REPLACE }),
+                        blend: Some(if blend { pair_state(pair) } else { wgpu::BlendState::REPLACE }),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
@@ -282,9 +315,15 @@ impl Renderer {
                 cache: None,
             })
         };
-        let mut pipelines = Vec::with_capacity(8);
+        // 0…7: blend off / the plain alpha pair × cull × depth; 8 + 4·(pair − 1) + …: the other pairs
+        let mut pipelines = Vec::with_capacity(20);
         for i in 0..8u8 {
-            pipelines.push(make_pipeline(i & 4 != 0, i & 2 == 0, i & 1 == 0));
+            pipelines.push(make_pipeline(i & 4 != 0, 0, i & 2 == 0, i & 1 == 0));
+        }
+        for pair in 1..4u8 {
+            for i in 0..4u8 {
+                pipelines.push(make_pipeline(true, pair, i & 2 == 0, i & 1 == 0));
+            }
         }
 
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -299,26 +338,34 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // APPROXIMATION: the projector's address mode is not read; clamping keeps the one shadow
-        // from repeating across the track
-        let proj_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("projector clamp"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            lod_max_clamp: 0.0,
-            ..Default::default()
-        });
+        // The projector's texture is the one its track's `sh80` material loaded: 0x44B000 →
+        // 0x44D320 only looks it up, by the part's key `(+0x18, +0x1C)`, which on each of the five
+        // tracks with projectors is that material's `(mt+0x24, mt+0x28)` (`texblock` example). The
+        // material's block is `{…, bias −1, 0, 0}` on every one — `ADDRESSU` / `ADDRESSV` `CLAMP`
+        // (`RE/notes/thrash.md` §7) — and `sh80` has 7 mips, so the mip filter is the loader's
+        // `POINT`, `LINEAR` at `SPECIALFX` 3 (0x44D571, 0x535A60); the bias is the shader's. (Until
+        // 2026-09-25 this sampler clamped as an APPROXIMATION and read the top level only.) The
+        // `HEAD` decal samples its top level explicitly through the same sampler.
+        let make_proj_sampler = |mip: wgpu::FilterMode| {
+            device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("projector clamp"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: mip,
+                ..Default::default()
+            })
+        };
+        let proj_samplers = [make_proj_sampler(wgpu::FilterMode::Linear), make_proj_sampler(wgpu::FilterMode::Nearest)];
         let proj_default = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("projector default"),
             size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -336,7 +383,7 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 0, resource: globals_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: headlight_map_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&proj_default_view) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&proj_sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&proj_samplers[0]) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&proj_default_view) },
             ],
         });
@@ -360,19 +407,33 @@ impl Renderer {
                 }),
             }],
         });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("linear repeat"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
-            anisotropy_clamp: 8,
-            ..Default::default()
+        // A texture's own state block (0x5379D0, `RE/notes/thrash.md` §7) asks for linear
+        // magnification and minification (Thrash 7 = 1 → `MAG`/`MINFILTER` `LINEAR`), and a mip
+        // filter that is `POINT` for a texture with mips (0x44D571…0x44D587) and becomes `LINEAR`
+        // at `SPECIALFX` 3, the default (0x535A60). No Thrash state reaches `MAXANISOTROPY` or an
+        // anisotropic filter, so there is none here (until 2026-09-24 this sampler clamped
+        // anisotropy at 8, the port's own). The promotion to `LINEAR` is `[0x69DD1D]`, which
+        // 0x44ED10 clears and sets again only at `SPECIALFX` 3 (0x44EDD1, 0x44EF04) and the front
+        // end's 0x44F020 clears (0x44F080) — `set_trilinear`; below it the mip filter is `POINT`.
+        let make_sampler = |clamp_u: bool, clamp_v: bool, mip: wgpu::FilterMode| {
+            let mode = |c: bool| if c { wgpu::AddressMode::ClampToEdge } else { wgpu::AddressMode::Repeat };
+            device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("scene"),
+                address_mode_u: mode(clamp_u),
+                address_mode_v: mode(clamp_v),
+                address_mode_w: wgpu::AddressMode::Repeat,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: mip,
+                ..Default::default()
+            })
+        };
+        let samplers = std::array::from_fn(|i| {
+            let mip = if i & 4 == 0 { wgpu::FilterMode::Linear } else { wgpu::FilterMode::Nearest };
+            make_sampler(i & 1 != 0, i & 2 != 0, mip)
         });
 
-        // The 2D pass needs its own sampler. The 3D one asks for `anisotropy_clamp: 8` and
+        // The 2D pass needs its own sampler. The 3D one once asked for `anisotropy_clamp: 8` and
         // `mipmap_filter: Linear`, which on a single-level texture — every sprite atlas is one —
         // sampled by a quad a dozen pixels across returns nothing on Metal. That is the fault
         // recorded as `RE/AUDIT.md` F2: a glyph quad drawn with a 1×1 texture composites fine while
@@ -421,7 +482,7 @@ impl Renderer {
             globals_buf,
             globals_bg,
             globals_layout,
-            proj_sampler,
+            proj_samplers,
             _proj_default: proj_default,
             proj_default_view,
             headlight_map_buf,
@@ -429,7 +490,8 @@ impl Renderer {
             head_tex: None,
             object_layout,
             material_layout,
-            sampler,
+            samplers,
+            trilinear: false,
             sprite_sampler,
             object_buf,
             object_bg,
@@ -544,7 +606,7 @@ impl Renderer {
             mip_level_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -590,25 +652,22 @@ impl Renderer {
     }
 
     pub fn create_material(&mut self, desc: MaterialDesc) -> MaterialId {
-        let tex = &self.textures[desc.texture.unwrap_or(self.white).0 as usize];
-        let env = &self.textures[desc.env_texture.unwrap_or(self.white).0 as usize];
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("material"),
-            layout: &self.material_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&tex.view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&env.view) },
-            ],
-        });
+        let texture = desc.texture.unwrap_or(self.white);
+        let env = desc.env_texture.unwrap_or(self.white);
+        let sampler = desc.clamp[0] as usize | (desc.clamp[1] as usize) << 1;
+        let bind_group = self.material_bind_group(texture, sampler, env);
         self.materials.push(GpuMaterial {
             bind_group,
             alpha_blend: desc.alpha_blend,
+            blend_pair: desc.blend_pair.min(3),
+            sampler,
+            lod_bias: desc.lod_bias,
             cull_back: desc.cull_back,
             depth_test: desc.depth_test,
             env_mix: if desc.env_texture.is_some() { desc.env_mix } else { 0.0 },
             env_variant: desc.env_variant.min(2),
-            texture: desc.texture.unwrap_or(self.white),
+            texture,
+            env,
         });
         MaterialId(self.materials.len() as u32 - 1)
     }
@@ -649,7 +708,7 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 0, resource: self.globals_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: self.headlight_map_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(proj) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.proj_sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.proj_samplers[!self.trilinear as usize]) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(head) },
             ],
         });
@@ -666,35 +725,49 @@ impl Renderer {
                 continue;
             }
             let Some(e) = views[self.materials[i].env_variant] else { continue };
-            let env_view = &self.textures[e.0 as usize].view;
-            let tex = &self.textures[self.materials[i].texture.0 as usize];
-            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("material"),
-                layout: &self.material_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&tex.view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(env_view) },
-                ],
-            });
-            self.materials[i].bind_group = bg;
+            self.materials[i].env = e;
+            self.materials[i].bind_group = self.material_bind_group(self.materials[i].texture, self.materials[i].sampler, e);
         }
     }
 
     pub fn set_env_texture(&mut self, env: TextureId) {
-        let env_view = &self.textures[env.0 as usize].view;
-        for m in self.materials.iter_mut().filter(|m| m.env_mix > 0.0) {
-            let tex = &self.textures[m.texture.0 as usize];
-            m.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("material"),
-                layout: &self.material_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&tex.view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(env_view) },
-                ],
-            });
+        for i in 0..self.materials.len() {
+            if self.materials[i].env_mix > 0.0 {
+                self.materials[i].env = env;
+                self.materials[i].bind_group = self.material_bind_group(self.materials[i].texture, self.materials[i].sampler, env);
+            }
         }
+    }
+
+    /// A material's bind group: its texture, the sampler for its address modes under the current
+    /// mip filter, and the environment map.
+    fn material_bind_group(&self, texture: TextureId, sampler: usize, env: TextureId) -> wgpu::BindGroup {
+        let sampler = &self.samplers[sampler | (!self.trilinear as usize) << 2];
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("material"),
+            layout: &self.material_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.textures[texture.0 as usize].view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.textures[env.0 as usize].view) },
+            ],
+        })
+    }
+
+    /// `[0x69DD1D]`, the mip filter's promotion (0x535B40 / 0x535A60, `RE/notes/thrash.md` §4):
+    /// set, every texture with mips is sampled trilinear; clear, `POINT` between the levels.
+    /// 0x44ED10 sets it only at `SPECIALFX` 3 on a card that took `setstate(0x0B, 3)`
+    /// (`[0x6197A6]`, taken as accepted); the front end's 0x44F020 clears it.
+    pub fn set_trilinear(&mut self, on: bool) {
+        if self.trilinear == on {
+            return;
+        }
+        self.trilinear = on;
+        for i in 0..self.materials.len() {
+            let m = &self.materials[i];
+            self.materials[i].bind_group = self.material_bind_group(m.texture, m.sampler, m.env);
+        }
+        self.rebuild_globals_bg();
     }
 
     pub fn render(&mut self, scene: &Scene, camera: &Camera) -> Result<()> {
@@ -831,6 +904,7 @@ impl Renderer {
         let mut staging = vec![0u8; self.object_stride as usize * n];
         for (i, item) in scene.items.iter().take(n).enumerate() {
             let env_mix = self.materials.get(item.material.0 as usize).map(|m| m.env_mix).unwrap_or(0.0);
+            let lod_bias = self.materials.get(item.material.0 as usize).map(|m| m.lod_bias).unwrap_or(0.0);
             let o = ObjectUniform {
                 model: item.transform.to_cols_array_2d(),
                 // .x is the environment-map mix, .zw a uv offset (the sky layers scroll with it)
@@ -843,7 +917,7 @@ impl Renderer {
                 shadow_u: item.shadow.map_or([0.0; 4], |s| s.0),
                 shadow_v: item.shadow.map_or([0.0; 4], |s| s.1),
                 // .y flags the item `Headlights::LayerUVLight` lays the `HEAD` decal over
-                shadow_on: [item.shadow.is_some() as u32 as f32, item.uv_lit as u32 as f32, 0.0, 0.0],
+                shadow_on: [item.shadow.is_some() as u32 as f32, item.uv_lit as u32 as f32, lod_bias, 0.0],
             };
             let off = i * self.object_stride as usize;
             staging[off..off + std::mem::size_of::<ObjectUniform>()].copy_from_slice(bytemuck::bytes_of(&o));
@@ -883,7 +957,8 @@ impl Renderer {
                     let mesh = &self.meshes[item.mesh.0 as usize];
                     // mirrored world: the winding flips, so draw both faces instead of culling the wrong one
                     let cull = mat.cull_back && !scene.mirror;
-                    let pipeline = &self.pipelines[(mat.alpha_blend as usize) * 4 + (!cull as usize) * 2 + (!mat.depth_test as usize)];
+                    let sub = (!cull as usize) * 2 + (!mat.depth_test as usize);
+                    let pipeline = &self.pipelines[if mat.alpha_blend && mat.blend_pair > 0 { 8 + (mat.blend_pair as usize - 1) * 4 + sub } else { (mat.alpha_blend as usize) * 4 + sub }];
                     pass.set_pipeline(pipeline);
                     pass.set_bind_group(1, &self.object_bg, &[(i as u64 * self.object_stride) as u32]);
                     pass.set_bind_group(2, &mat.bind_group, &[]);
