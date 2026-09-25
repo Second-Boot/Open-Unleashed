@@ -5,6 +5,10 @@ use nfs_assets::{car::CarAssets, mesh::article_meshes, track::TrackAssets};
 use nfs_renderer::{DrawItem, LayerLight, MaterialDesc, MaterialId, MeshData, MeshId, Renderer, TextureData, Vertex};
 use std::collections::HashMap;
 
+/// The light a track item is drawn under: none of its own, so the shader's `min(A + D·d, 1)`
+/// leaves the texture × vertex colour product as it is ([`TrackWorld::visible_items`]).
+pub const TRACK_LIGHT: LayerLight = LayerLight { ambient: [1.0; 3], diffuse: [0.0; 3], direction: [0.0; 3] };
+
 /// GPU-resident track: static draw items plus the collision grid.
 pub struct TrackWorld {
     /// Per item: the mission-scene element it belongs to (None for track geometry).
@@ -20,21 +24,32 @@ pub struct TrackWorld {
     pub props: Vec<nfs_physics::props::Prop>,
     pub walls: nfs_physics::walls::WallSet,
     pub start: Vec3,
+    /// The `.map` `ambient`'s mean, clamped 0.2…0.9 — the port's scene ambient for an item that
+    /// has no light of its own. APPROXIMATION: not the original's; the track's own items no longer
+    /// take it ([`TRACK_LIGHT`]), nor the sky (`Sky::draw_items`, `RE/notes/thrash.md` §6d.5). What
+    /// is left on it in a race: the car's cockpit glass (`CarModel::window`) and the cars' blob
+    /// shadows (0x43B820), whose draws' layers are not read here.
     pub ambient: f32,
     /// The `.map` header's five light colours (`RE/notes/lighting.md`).
     pub map_light: MapLight,
     /// The way the sun's light travels, `−normalize(SkyBin::sun_position)` (0x43AC8D…0x43AD36);
     /// straight down when the track has no sky configuration.
     pub sun_direction: Vec3,
-    /// Smackable props knocked loose and still moving.
-    knocked: Vec<KnockedProp>,
+    /// The mission scene's smackables — every GEOM element whose `animdefs.txt` definition says
+    /// `kSmackable` (0x4772F0's `def+0x10 == 3`), with what their car records are built from
+    /// (`nfs_physics::smackable`). The skill test's cones.
+    pub smackables: Vec<SmackableSpawn>,
+    /// The draw items a smackable's body carries: by element, the inverse of its authored pose and
+    /// each item with its authored transform ([`Self::place_smackable`]).
+    moved: HashMap<usize, (Mat4, Vec<(usize, Mat4)>)>,
     /// `.map` sections, and every `.env` entry by its SHPI name (`RE/notes/lighting.md` §3).
     pub map_sections: Vec<MapSection>,
     env_by_id: HashMap<u32, nfs_renderer::TextureId>,
     /// Props whose article carries an `Anim` / `Anqt` track and whose `animdefs.txt` definition
     /// loops it (`RE/notes/crp-geometry.md` §7). The shipped file loops exactly two — the two
-    /// dockers — every other animation there is played on impact, which needs the smackable bodies
-    /// the port does not simulate.
+    /// dockers — every other animation there is played on impact — the breakables below, and
+    /// what the smackables would play, which the port does not (only a mission scene's
+    /// smackables are bodies, `nfs_physics::smackable`, and none of those animates).
     animated: Vec<AnimatedProp>,
     /// The breakable props drawn in the world, with their pieces once a car has started them.
     broken: Vec<BrokenProp>,
@@ -347,15 +362,34 @@ impl TrackWorld {
             let id = r.upload_texture(&TextureData { width: tex.width, height: tex.height, mips: tex.mips.clone() });
             tex_ids.insert(tex.name.clone(), (id, tex.has_alpha));
         }
+        let methods = track.crp.render_methods(&track.crp_data).unwrap_or_default();
         let mut mat_ids: HashMap<u16, MaterialId> = HashMap::new();
         let mut material_for = |r: &mut Renderer, id: u16| {
             *mat_ids.entry(id).or_insert_with(|| {
                 let m = materials.get(id as usize);
                 let tex = m.and_then(|m| tex_ids.get(&m.texture_name()));
-                let alpha = tex.map(|t| t.1).unwrap_or(false) && m.map(|m| m.render_method != "Opaque").unwrap_or(true);
+                // blending is the `Rs` block's state 0x0A (2 = on, `thrash.md` §6c) — the material's
+                // own block where its `mt` carries one (the `…MatState` materials, 0x44AD3B), else
+                // its method's; with it on, an opaque texture draws as if it were off. Every shipped
+                // material has a block; the rule by name stays only for a broken file
+                let rs = m.and_then(|m| nfs_assets::track::render_states(&methods, m));
+                let blend = |m: &nfs_formats::crp::Material| rs.map_or(m.render_method != "Opaque", |rs| rs[1] == 2);
+                let alpha = tex.map(|t| t.1).unwrap_or(false) && m.map(blend).unwrap_or(true);
+                // the cull, Thrash state 2 (`thrash.md` §6d.2): 1 is the view's own — back faces,
+                // the other winding under `MIRROR` (`view_cull`) — and 0 none (the `…MatState`
+                // materials' own blocks)
+                let cull_back = rs.is_none_or(|rs| rs[3] == 1);
+                // the depth bias, Thrash state 0x18 (`thrash.md` §6d.3): −3 on the `S_Normal` /
+                // `S_UVAnimate` ground shadows (castle, coastal, farmland, forest, canyon), 0 else
+                let depth_bias = rs.map_or(0, |rs| rs[4]);
+                // `FakeSort`'s `LayerFalseSort1` / `2` (0x800F / 0x8010): drawn twice, depth writes
+                // off and then on, at `SPECIALFX` 3 (`thrash.md` §6d.4). APPROXIMATION: the shipped
+                // `SPECIALFX` is taken; below it 0x44EC80 picks the other arm (one draw, the
+                // texture filter `POINT`), not carried
+                let false_sort = m.and_then(|m| methods.iter().find(|r| r.name == m.render_method).map(|r| r.built_ops(0, m.op_mask).any(|o| o.class == 0x800F))).unwrap_or(false);
                 // the material's address modes, states 0x41 / 0x42 (`thrash.md` §7): 0 clamps
                 let clamp = m.map_or([false; 2], |m| m.address.map(|a| a == 0));
-                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp, lod_bias: m.map_or(0.0, |m| m.lod_bias), device_states: false })
+                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp, lod_bias: m.map_or(0.0, |m| m.lod_bias), device_states: true, view_cull: true, depth_bias, false_sort })
             })
         };
         // Static world: merge every article's meshes per material into one GPU mesh each
@@ -406,6 +440,7 @@ impl TrackWorld {
         // edges join the wall set so the course is closed for the physics too
         let mut extra_walls: Vec<([f32; 3], [f32; 3], u32)> = Vec::new();
         let mut animated: Vec<AnimatedProp> = Vec::new();
+        let mut smackables: Vec<SmackableSpawn> = Vec::new();
         for inst in &geometry.instances {
             if let Some(parts) = lib_gpu.get(&inst.tag) {
                 let art = geometry.library.iter().find(|a| a.tag == inst.tag);
@@ -428,6 +463,9 @@ impl TrackWorld {
                             looping: p.flags.looping,
                         });
                     }
+                }
+                if let Some(sp) = art.and_then(|a| smackable_spawn(track, a, inst)) {
+                    smackables.push(sp);
                 }
                 if inst.source == 1 && inst.tag == u32::from_le_bytes(*b"ENDW") && let Some(a) = art {
                     let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
@@ -525,7 +563,7 @@ impl TrackWorld {
         tracing::info!(props = props.len(), breakable = props.iter().filter(|p| p.breakable.is_some()).count(), "track props");
         let projectors = track_projectors(track);
         let projector_texture = projectors.first().and_then(|p| tex_ids.get(&p.texture)).map(|t| t.0);
-        Ok(Self { items, item_element, hidden: std::collections::HashSet::new(), env_map, collision, props, walls, start, ambient, map_light, sun_direction, map_sections, env_by_id, knocked: Vec::new(), animated, broken, flares: track_flares(track), emitters: track_emitters(track), projectors, projector_texture })
+        Ok(Self { items, item_element, hidden: std::collections::HashSet::new(), env_map, collision, props, walls, start, ambient, map_light, sun_direction, map_sections, env_by_id, smackables, moved: HashMap::new(), animated, broken, flares: track_flares(track), emitters: track_emitters(track), projectors, projector_texture })
     }
 
     /// Advance every looping prop animation to `seconds` since the race started
@@ -548,6 +586,12 @@ impl TrackWorld {
     }
 
     /// Draw items with the hidden mission elements filtered out.
+    ///
+    /// Every one is lit by its vertex colour alone ([`TRACK_LIGHT`]): no track render method
+    /// carries an `R3DLightLayer` (0x8104, `RE/notes/lighting.md` §6), the `.map` header reaches
+    /// only the car's light block and environment maps (§2), and the class-0 draw copies the `df`
+    /// stream into the vertex colour untouched (0x540E1D) — or an `Am` op has written its flat
+    /// colour there (§5.4) — for stage 0 to `MODULATE` with the texture (`thrash.md` §5).
     pub fn visible_items(&self) -> impl Iterator<Item = DrawItem> + '_ {
         self.items
             .iter()
@@ -556,6 +600,7 @@ impl TrackWorld {
             .filter(|((k, _), e)| e.map(|e| !self.hidden.contains(&e)).unwrap_or(true) && !self.broken.iter().any(|b| b.hides(*k)))
             .map(|((_, i), _)| *i)
             .chain(self.broken.iter().flat_map(|b| b.pieces.iter().copied()))
+            .map(|i| DrawItem { layer_light: Some(TRACK_LIGHT), ..i })
     }
 
     /// The breakable props of the world (`BBOX`, the crate stacks): each world article whose prop
@@ -687,90 +732,75 @@ impl TrackWorld {
         }
     }
 
-    /// Knock a smackable prop loose: it leaves with `launch` and tumbles until it settles.
-    ///
-    /// The original hands a smackable to the car physics — 0x4A17F0 gives every one a car-like
-    /// record simulated as an extra car with the `animdefs.txt` mass (`CONE` = 20 kg,
-    /// `skill-tests.md` §5.3). APPROXIMATION: the port integrates a point body with a fixed spin
-    /// instead, with the same launch direction and a ground bounce.
-    pub fn knock(&mut self, element: usize, away: Vec3, launch: Vec3) {
-        if self.knocked.iter().any(|k| k.element == element) {
-            return;
-        }
-        let items: Vec<(usize, Mat4)> = self
-            .item_element
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| **e == Some(element))
-            .map(|(i, _)| (i, self.items[i].transform))
-            .collect();
-        if items.is_empty() {
-            return;
-        }
-        let origin = items[0].1.transform_point3(Vec3::ZERO);
-        let ground = self.collision.ground(origin.x, origin.y + 2.0, origin.z, 20.0).map(|h| h.point.y).unwrap_or(origin.y);
-        // it tips about the edge it was struck on and keeps turning that way
-        let axis = Vec3::Y.cross(away).normalize_or_zero();
-        let axis = if axis.length_squared() > 1e-6 { axis } else { Vec3::X };
-        self.knocked.push(KnockedProp {
-            element,
-            items,
-            origin,
-            offset: Vec3::ZERO,
-            velocity: launch,
-            axis,
-            angle: 0.0,
-            rate: 6.0 + launch.length() * 0.6,
-            ground,
-            resting: false,
+    /// Draw a smackable's article where its body is: `0x483590` (from 0x4A1510) points the prop
+    /// record's pose at the car record's own (`car+0x330` / `car+0x364`), so the renderer draws the
+    /// article with the body's pose (`skill-tests.md` §5.3). `pose` is that pose, body to world;
+    /// the element's items keep their authored transforms relative to the authored pose.
+    pub fn place_smackable(&mut self, element: usize, pose: Mat4) {
+        let Some(spawn) = self.smackables.iter().find(|s| s.element == element) else { return };
+        let authored = spawn.pose();
+        let items = &self.items;
+        let item_element = &self.item_element;
+        let (inv, list) = self.moved.entry(element).or_insert_with(|| {
+            let list = item_element.iter().enumerate().filter(|(_, e)| **e == Some(element)).map(|(i, _)| (i, items[i].transform)).collect();
+            (authored.inverse(), list)
         });
-    }
-
-    /// Advance the knocked props (gravity, ground bounce, drag) and write their transforms.
-    pub fn step_props(&mut self, dt: f32) {
-        let dt = dt.clamp(0.0, 0.1);
-        let mut knocked = std::mem::take(&mut self.knocked);
-        for k in knocked.iter_mut().filter(|k| !k.resting) {
-            k.velocity.y -= 9.8 * dt;
-            k.offset += k.velocity * dt;
-            k.angle += k.rate * dt;
-            if k.origin.y + k.offset.y <= k.ground {
-                k.offset.y = k.ground - k.origin.y;
-                if k.velocity.y < -0.5 {
-                    k.velocity.y = -k.velocity.y * 0.3;
-                    k.velocity.x *= 0.6;
-                    k.velocity.z *= 0.6;
-                    k.rate *= 0.5;
-                } else {
-                    // it comes to rest lying on its side
-                    k.velocity = Vec3::ZERO;
-                    k.angle = std::f32::consts::FRAC_PI_2;
-                    k.rate = 0.0;
-                    k.resting = true;
-                }
-            }
-            let m = Mat4::from_translation(k.origin + k.offset) * Mat4::from_axis_angle(k.axis, k.angle) * Mat4::from_translation(-k.origin);
-            for (i, base) in &k.items {
-                self.items[*i].transform = m * *base;
-            }
+        for (i, base) in list.iter() {
+            self.items[*i].transform = pose * *inv * *base;
         }
-        self.knocked = knocked;
     }
 }
 
-/// A smackable prop that has been knocked loose (`TrackWorld::knock`).
-struct KnockedProp {
-    element: usize,
-    /// (scene item index, its transform when it was still standing)
-    items: Vec<(usize, Mat4)>,
-    origin: Vec3,
-    offset: Vec3,
-    velocity: Vec3,
-    axis: Vec3,
-    angle: f32,
-    rate: f32,
-    ground: f32,
-    resting: bool,
+/// A mission-scene instance's smackable, when its `animdefs.txt` definition (0x47ED90's lookup)
+/// says `kSmackable` (0x4772F0's `def+0x10 == 3`): a car record of its own is built from it
+/// (0x476ED0, then 0x4A17F0 / 0x4A1280) with its points from the library article's vertices in
+/// the instance's frame. MEDIUM: that frame folds the GEOM scale and the article's own `tr` into
+/// the points and keeps the instance's rotation and position as the body's pose — the original's
+/// record pose (`rec+0x28` / `+0x34`, 0x539CD0 on the instance matrix) was not followed that far;
+/// and the vertices are the port's article meshes (the original reads the `vt` stream).
+pub fn smackable_spawn(track: &TrackAssets, art: &nfs_assets::track::ArticleMeshes, inst: &nfs_assets::track::PropInstance) -> Option<SmackableSpawn> {
+    if inst.source != 1 {
+        return None;
+    }
+    let def = track.animdefs.lookup(inst.tag).filter(|d| d.collide_type == "kSmackable")?;
+    let local = Mat4::from_scale(inst.scale) * art.transform;
+    let verts: Vec<Vec3> = art.meshes.iter().flat_map(|mm| mm.mesh.vertices.iter().map(|v| local.transform_point3(Vec3::from(v.position)))).collect();
+    let (_, rot, pos) = inst.transform.to_scale_rotation_translation();
+    Some(SmackableSpawn {
+        element: inst.element,
+        position: pos,
+        orientation: glam::Mat3::from_quat(rot).transpose(),
+        points: nfs_physics::smackable::point_cloud(&verts),
+        mass: def.mass,
+        audio_type: def.audio_type_index().unwrap_or(0),
+    })
+}
+
+/// A smackable of the mission scene, as `nfs_physics::smackable::Smackable::new` takes it.
+#[derive(Debug, Clone)]
+pub struct SmackableSpawn {
+    pub element: usize,
+    pub position: Vec3,
+    /// rows = the body axes, as `Vehicle::orientation`
+    pub orientation: glam::Mat3,
+    /// `nfs_physics::smackable::point_cloud` of the article, in the body's frame
+    pub points: Vec<Vec3>,
+    /// the definition's `mass` (kg)
+    pub mass: f32,
+    /// the definition's `audioType` index
+    pub audio_type: u32,
+}
+
+impl SmackableSpawn {
+    /// The authored pose, body to world.
+    pub fn pose(&self) -> Mat4 {
+        body_pose(self.position, self.orientation)
+    }
+}
+
+/// A body's pose as a matrix from its position and its orientation (rows = the body axes).
+pub fn body_pose(position: Vec3, orientation: glam::Mat3) -> Mat4 {
+    Mat4::from_translation(position) * Mat4::from_mat3(orientation.transpose())
 }
 
 /// One prop playing its own looping animation.
@@ -1128,11 +1158,18 @@ pub struct CarWheelModel {
     pub parts: Vec<(MeshId, MaterialId, Mat4)>,
 }
 
-/// The car's collision body points in the physics body frame, `y = 0` on the wheel contact plane
-/// (`BndP`, `RE/notes/car-model.md` §12), sorted ascending by height the way 0x49ABC0 does — so the
-/// first four are the wheel contact set. Only the records every car carries are taken: a record
-/// naming a style slot is part of the body only when that slot holds its value, and the port does
-/// not track the style array yet, so spoilers and wings are left out.
+/// The car's collision body points `car+0x8C` (`BndP`, `RE/notes/car-model.md` §12): the records
+/// the body style admits, their points **as the loader 0x442080 stores them** — the model's own
+/// axes, not turned into the body frame the model is drawn in (0x49AE30 uses them unturned with
+/// the physics rows) — then 0x49ABC0's sort by height and quadrant permutation
+/// ([`nfs_physics::vehicle::body_points_setup`]), so the first four are the ground probes FL, FR,
+/// RL, RR. *(Corrected 2026-09-25: these went through `MODEL_TO_BODY`, x and z negated, which put
+/// the front box behind and the wheel quad's longer half in front.)*
+///
+/// `y` here keeps the model's `y = 0` on the contact plane; the loader then subtracts `car+0x3AC`
+/// — half the model box's height, set by 0x445090 before it (0x4420A3 → 0x442775) — which
+/// [`car_body`] does, so a racer built from that carries the original's origin, half the model's
+/// height above the ground (`Vehicle::set_car_body`).
 pub fn car_body_points(car: &CarAssets) -> Vec<Vec3> {
     let Ok(recs) = car.crp.bound_points(&car.crp_data) else { return Vec::new() };
     // The loader's filter is `carinfo[0x56C + 4·slot] == value` (0x4420B9), i.e. the body style's
@@ -1142,10 +1179,91 @@ pub fn car_body_points(car: &CarAssets) -> Vec<Vec3> {
     let mut pts: Vec<Vec3> = recs
         .iter()
         .filter(|r| style.article_enabled(r.style_slot as u8, r.style_value as u8))
-        .flat_map(|r| r.points.iter().map(|p| MODEL_TO_BODY.transform_point3(Vec3::from(*p))))
+        .flat_map(|r| r.points.iter().map(|p| Vec3::from(*p)))
         .collect();
-    pts.sort_by(|a, b| a.y.total_cmp(&b.y));
+    nfs_physics::vehicle::body_points_setup(&mut pts);
     pts
+}
+
+/// The render model's local box that **0x445090** (`RCarPages::finishLoad`, tail of 0x4425B0,
+/// called from `RCar::load` 0x442775) halves into `car+0x3A8 / +0x3AC / +0x3B0` — before the `BndP`
+/// loader 0x442080 runs (0x4420A3 → 0x4425B0), so its `y` is what the loader subtracts.
+///
+/// 0x445090 asks the LOD object `[this+0xB0][4]` (`[this+0xB0][0]` for traffic, `car+0x52C &
+/// 0x10`) for its box through vtable `+0x10`, **0x43DE90**; `d = max − min` (0x532330),
+/// `car+0x3A8…+0x3B0 = 0.5·d` (0x532360), `× 0.4` for `.TINYCAR` (0x445140…0x44517C, `[0x5B37C8]`).
+/// The seven LOD objects are built by 0x4425B0 through slot 17 (0x43ADB0: `+8 = i`, `i = 1…7`,
+/// the count from slot 16 0x43ADA0), so `[4]` is **LOD 5** and `[0]` LOD 1. 0x43DE90 starts `min`
+/// and `max` at **zero** (0x43DE99…0x43DEDA — the box always holds the model origin) and folds in,
+/// for every article the LOD lists — 0x43C1B0: the style admits it (`carinfo[0x56C + 4·Base+68] ==
+/// Base+69`, 0x43C2A1) and one of its `Base` LOD records carries this LOD (`word Base+0x6C + 12k`,
+/// 0x43C2BC) — every vertex of its `vt#lod` part (count = the part entry's `b`, 16 bytes each),
+/// through its `tr#lod` matrix when it has one (0x59F220 `'tr' | lod`, 0x53A330 `v·M`).
+///
+/// CONFIRMED for the code path; the port's reading of the `vt` part is the one its mesh loader
+/// uses. A racer's box is LOD 5 ([`car_body`]); traffic's LOD 1 (`crates/porsche`'s traffic set-up,
+/// `nfs_game::traffic::TrafficCar::draw_origin`).
+pub fn car_model_box(car: &CarAssets, lod: u16) -> (Vec3, Vec3) {
+    let (mut lo, mut hi) = (Vec3::ZERO, Vec3::ZERO);
+    let Ok(arts) = car.crp.articles(&car.crp_data) else { return (lo, hi) };
+    let style = nfs_assets::car::CarStyle::from_tpg(&car.tpg, car.style_index + 1);
+    for a in &arts {
+        let Some(base) = a
+            .level(b"Base")
+            .and_then(|e| car.crp.entry_data(&car.crp_data, e).ok().map(|d| (e, d)))
+            .and_then(|(e, d)| nfs_formats::crp::Base::parse(d, e.data_offset()).ok())
+        else {
+            continue;
+        };
+        if !style.article_enabled(base.tag[0], base.tag[1]) || !base.lods.iter().any(|r| r.lod == lod) {
+            continue;
+        }
+        let Some(vt) = a.find(b"vt", lod) else { continue };
+        let Ok(bytes) = car.crp.entry_data(&car.crp_data, vt) else { continue };
+        let count = match vt {
+            nfs_formats::crp::CrpEntry::Part { b, .. } => (*b as usize).min(bytes.len() / 16),
+            _ => 0,
+        };
+        let tr = a.find(b"tr", lod).and_then(|e| car.crp.entry_data(&car.crp_data, e).ok()).filter(|b| b.len() >= 64).map(|b| {
+            let f = |i: usize| f32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]);
+            // row-major, translation in row 3, `v' = v·M` — glam's column-major reading of the
+            // same sixteen floats is that matrix transposed, which is `M` applied to a column
+            Mat4::from_cols_array(&std::array::from_fn(|i| f(i)))
+        });
+        for k in 0..count {
+            let f = |o: usize| f32::from_le_bytes([bytes[k * 16 + o], bytes[k * 16 + o + 1], bytes[k * 16 + o + 2], bytes[k * 16 + o + 3]]);
+            let mut p = Vec3::new(f(0), f(4), f(8));
+            if let Some(m) = tr {
+                p = m.transform_point3(p);
+            }
+            lo = lo.min(p);
+            hi = hi.max(p);
+        }
+    }
+    (lo, hi)
+}
+
+/// A racer's collision body as `RCar::load` leaves it, in the original's own frame: the half
+/// extents `car+0x3A8…+0x3B0` of 0x445090 ([`car_model_box`], LOD 5, `× 0.4` for `.TINYCAR`) and
+/// the `BndP` points of 0x442080 — the style's records, `× 0.4` for `.TINYCAR` (0x442140…), then
+/// **`y −= car+0x3AC`** (0x4421BE, `fsub [ecx+0x3AC]`) — through 0x49ABC0's sort and quadrant deal
+/// ([`nfs_physics::vehicle::body_points_setup`]; a constant shift leaves both unchanged).
+///
+/// So the body origin `car+0x330` sits `car+0x3AC` — half the model box's height, the box holding
+/// the model's `y = 0` ground plane — above the plane the wheel quad stands on, and the renderer
+/// draws the model that far below it (`R3DCar` slot 5 0x43A410, `Vehicle::draw_origin`). Racers
+/// only: nothing re-cuts a racer's box afterwards (0x4A1280's `(max − min)/2` of the body points,
+/// 0x4A1472…0x4A14A6, runs from 0x4107B6 only for `car+0x52C & 0x80`, a smackable).
+pub fn car_body(car: &CarAssets, tiny: bool) -> (Vec<Vec3>, Vec3) {
+    let (lo, hi) = car_model_box(car, 5);
+    let scale = if tiny { 0.4 } else { 1.0 };
+    let half = (hi - lo) * 0.5 * scale;
+    let mut pts = car_body_points(car);
+    for p in &mut pts {
+        *p *= scale;
+        p.y -= half.y;
+    }
+    (pts, half)
 }
 
 pub const MODEL_TO_BODY: Mat4 = Mat4::from_cols(
@@ -1178,8 +1296,9 @@ impl CarModel {
         // 0x4D1800 does the same from the car's `DecalNum`). A car without page text is the
         // front end's or one whose number was not read, and −1 is what both hold.
         style.geometry.insert(10, u32::from(car.page_text.as_ref().is_some_and(|t| t.race_number >= 0)));
-        // Slot 19 overlays the driver's variants onto the same array at model load — the port
-        // draws at the best detail the table carries, so `slot9 = 1, slot43 = 1`.
+        // Slot 19 overlays the driver's variants onto the same array at model load, in its race
+        // branch only (0x43AEA5…0x43AF6B; the front end's, 0x43B003, jumps past them), keyed on
+        // the car's `.DRIVER` pick (`CarAssets::driver`).
         //
         // The other two things that block writes (`car-model.md`) are **left to the style**, and
         // deliberately: slot 42 (`SpoilerDown` / `SpoilerUp`) is zeroed by 0x43AEB2, which hides
@@ -1187,9 +1306,11 @@ impl CarModel {
         // does not run that channel — so zeroing it would leave a hole in the engine lid where
         // the style's own `42 = 1`, the retracted spoiler, belongs. Slot 41 is recomputed from
         // the roof option in a race (0x43AE7A).
-        style.apply_driver_detail(8, false, false);
         match race_roof {
-            Some(v) => style.apply_race_roof(v),
+            Some(v) => {
+                style.apply_race_roof(v);
+                style.apply_driver_detail(car.driver.driver, car.driver.no_driver, car.driver.factory_driver);
+            }
             // slot 19's front-end branch, 0x43B003: slot 41 and slot 6 to 0
             None => {
                 style.geometry.insert(41, 0);
@@ -1229,12 +1350,23 @@ impl CarModel {
             // which of the three environment textures it reflects (`lighting.md` §3.1); the 0.3
             // blend stays the APPROXIMATION it was, since the pass's combine is AUDIT.md §E
             let variant = nfs_formats::crp::env_variant(m.map(|m| m.reflection).unwrap_or(0.0));
-            // the cull mode is the material's own `Rs` block, Thrash state 2 at `mt+272`: 1 `CCW`
-            // (the back faces), 0 none (`thrash.md` §6) — the port had culled every opaque one and
+            // the cull mode is the material's own `Rs` block, Thrash state 2 at `mt+272`: 1 the
+            // view's own (the back faces, `thrash.md` §6d.2), 0 none — the port had culled every opaque one and
             // none of the blended, which with depth writes on let a wheel well's outer faces cover
             // the wheel
-            let cull = m.and_then(|m| m.rs).filter(|_| !car.front_end_room).map_or(!blend, |rs| rs[3] == 1);
-            let mid = r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: cull, depth_test: true, env_texture: if reflective { env } else { None }, env_mix: 0.3, env_variant: variant, blend_pair: 0, clamp: m.map_or([false; 2], |m| m.address.map(|a| a == 0)), lod_bias: m.map_or(0.0, |m| m.lod_bias), device_states: !car.front_end_room });
+            let cull = m.and_then(|m| m.rs).map_or(!blend, |rs| rs[3] == 1);
+            // A front-end room is drawn by the car's own class (`nfs_assets::car::CarAssets::
+            // front_end_room`), so its `Rs` block is what `LayerState` hands the driver: Thrash
+            // 0x0A = 2 blends every one of its materials, and 0x38 picks the pair — 0 the plain
+            // alpha pair, **1 `SRCALPHA` / `ONE`** for the light pools and light cones on the 4444
+            // pages (`Lightcast*`, `SpotLight`, `GarageSpot`'s `ligh` / `spot`), which add their light
+            // to what is under them (`RE/notes/frontend-3d.md` §9). The cars keep the port's rule by
+            // method and page: every shipped car block is `{1, 2, 0, …}`, the plain pair.
+            let (blend, blend_pair) = match m.and_then(|m| m.rs) {
+                Some(rs) if car.front_end_room => (rs[1] == 2, rs[2].clamp(0, 3) as u8),
+                _ => (blend, 0),
+            };
+            let mid = r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: cull, depth_test: true, env_texture: if reflective { env } else { None }, env_mix: 0.3, env_variant: variant, blend_pair, clamp: m.map_or([false; 2], |m| m.address.map(|a| a == 0)), lod_bias: m.map_or(0.0, |m| m.lod_bias), device_states: true, view_cull: false, depth_bias: 0, false_sort: false });
             if let Some(l) = m.and_then(|m| m.light) {
                 material_light.insert(mid, l);
             }
@@ -1368,10 +1500,10 @@ impl CarModel {
                 let pivot = MODEL_TO_BODY.transform_point3(local.w_axis.truncate());
                 half_track = half_track.max(pivot.x.abs());
                 let channel = g.base.as_ref().map(|b| b.rot_channel).unwrap_or(0);
-                let key = g.base.as_ref().filter(|_| !car.front_end_room).map_or(0, |b| b.tag[2] as i8);
+                let key = g.base.as_ref().map_or(0, |b| b.tag[2] as i8);
                 wheels.push(CarWheelModel { pivot, is_front: ty == 0x0D, is_left: local.w_axis.x > 0.0, channel, key, parts });
             } else {
-                body_key.extend(std::iter::repeat_n(g.base.as_ref().filter(|_| !car.front_end_room).map_or(0, |b| b.tag[2] as i8), parts.len()));
+                body_key.extend(std::iter::repeat_n(g.base.as_ref().map_or(0, |b| b.tag[2] as i8), parts.len()));
                 body.extend(parts);
                 body_channel.extend(part_channels);
             }
@@ -1391,7 +1523,7 @@ impl CarModel {
             // the batch's state object (0x5379F0 at 0x4578AB) is set to blend 1 at 0x4578B4 and
             // handed to the batch with the uv and colour buffers (0x4578F2 → 0x4685E0): Thrash
             // 0x38 = 1, `SRCALPHA` / `ONE` — the glass adds its light (`RE/notes/thrash.md` §6)
-            let mat = r.create_material(MaterialDesc { texture: Some(tex), alpha_blend: true, cull_back: false, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 1, clamp: [false; 2], lod_bias: 0.0, device_states: false });
+            let mat = r.create_material(MaterialDesc { texture: Some(tex), alpha_blend: true, cull_back: false, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 1, clamp: [false; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false });
             // **The quad is mapped to the whole texture**, and that is traced now. The batcher's
             // three parallel buffers are positions at `acc+0x0C` (stride 0x10), **texture
             // coordinates at `acc+0x25BC` (stride 8)** and colours at `acc+0x3894` (stride 4), 201

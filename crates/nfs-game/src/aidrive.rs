@@ -148,7 +148,9 @@ pub struct DriveCommand {
 
 /// `car+0xD80`, the AI brake-light counter, inside both controllers (0x409720 / 0x409C70): the
 /// brake arm adds `4 · [0x5E6D78]` saturating at 0xFF (0x409B0E…), the throttle arm takes
-/// `[0x5E6D78]` off down to 0 (0x409ABD…); `[0x5E6D78]` is the 64 Hz ticks the AI step covers.
+/// `[0x5E6D78]` off down to 0 (0x409ABD…); `[0x5E6D78]` is the **32 Hz** ticks the drive step
+/// covers — `0x5CC71C[k]` from the drive's gate 0x414B10 (row 1: 1 within 160 m of a racer, 2
+/// beyond; `traffic.md` §14.3). *(Corrected 2026-09-25: this said 64 Hz ticks.)*
 /// 0x439360 lights the brake lamps while the byte is non-zero (0x43938C…0x43939B).
 pub fn brake_light(counter: u8, braking: Option<bool>, ticks: u8) -> u8 {
     match braking {
@@ -233,7 +235,7 @@ pub struct Gear {
     pub since: i64,
     /// `car+0x1048` — the period the flip is timed against
     pub period: i64,
-    /// `car+0x1080` — AI ticks spent reversing, reset whenever the gear is forward
+    /// `car+0x1080` — 32 Hz ticks spent reversing (`+= [0x5E6D78]`), reset whenever the gear is forward
     pub reverse_ticks: i32,
 }
 
@@ -246,7 +248,8 @@ impl Default for Gear {
 /// `0x40A5A0(car)` — "is this car in trouble?", the gate on the oscillator.
 ///
 /// True when the car has left the slice's lane extent **and** either it has been reversing for more
-/// than eight AI ticks or its up axis has tipped past 0.85 (`car+0x3C8`, the y of the frame's up
+/// than eight 32 Hz ticks — `car+0x1080 += [0x5E6D78]` (0x40A5E7), the drive step's `nTicks`, so a
+/// quarter of a second — or its up axis has tipped past 0.85 (`car+0x3C8`, the y of the frame's up
 /// row). An upright car that merely wandered off the lanes is *not* in trouble, so the oscillator
 /// only ever starts on a car that is tipped over.
 pub fn in_trouble(gear: &mut Gear, lane: i32, lanes_a: i32, lanes_b: i32, up_y: f32, ai_ticks: i32) -> bool {
@@ -371,7 +374,8 @@ mod tests {
 
     #[test]
     fn the_brake_light_counter() {
-        // two 64 Hz ticks an AI step: +8 braking, saturating; −2 on the throttle, down to 0
+        // a 16 Hz drive step covers two 32 Hz ticks: +8 braking, saturating; −2 on the throttle,
+        // down to 0
         assert_eq!(brake_light(0, Some(true), 2), 8);
         assert_eq!(brake_light(250, Some(true), 2), 255);
         assert_eq!(brake_light(8, Some(false), 2), 6);

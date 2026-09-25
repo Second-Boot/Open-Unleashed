@@ -78,11 +78,17 @@ pub struct TvSlot {
     pub lift: f32,
     /// `+0x58`, the half-angle the build takes (degrees)
     pub half_angle: f32,
+    /// `+0x5C`, the near plane the build gives the main view (`camera::near_plane`), written by
+    /// 0x462B80 beside the half-angle (`camera::zoom_near`)
+    pub near: f32,
     /// SplineCam's eye (`+0x24`), its tracker slice (`+0xDC`), pace `+0xCC` and offset `+0x60`
     pub spline_eye: Option<Vec3>,
     pub spline_slice: Option<usize>,
     pub pace: f32,
     pub spline_offset: Vec3,
+    /// how many enabled switches have run SetSlotView(0, `+0x78`) — each one resets the slot's
+    /// per-view words, such as CircleCam's count `+0xC6` (0x4658B2), even when the view stays
+    pub switches: u32,
     flag34: bool,
     a38: f32,
     a78: f32,
@@ -95,7 +101,7 @@ impl Default for TvSlot {
     fn default() -> Self {
         let h = crate::camera::DEFAULT_HALF_ANGLE;
         // SetSlotView 0x465790: +0x34 0, +0x38 = +0x78 = +0x58 = 37.5, +0x44 1.0, +0x48 0.02,
-        // +0x3C 0, +0x30 3.0 (0x465854…0x465896)
+        // +0x3C 0, +0x30 3.0, +0x5C 0.5 (0x465854…0x465896)
         Self {
             eye: None,
             view: None,
@@ -103,10 +109,12 @@ impl Default for TvSlot {
             frozen: false,
             lift: 3.0,
             half_angle: h,
+            near: crate::camera::DEFAULT_NEAR,
             spline_eye: None,
             spline_slice: None,
             pace: 0.0,
             spline_offset: Vec3::ZERO,
+            switches: 0,
             flag34: false,
             a38: h,
             a78: h,
@@ -131,7 +139,7 @@ impl TvSlot {
     pub fn switch(&mut self, c: &TrackCamera) {
         let fov = c.fov_flag.then_some(c.half_angle);
         if c.enabled {
-            *self = Self { eye: self.eye, pace: self.pace, ..Self::default() };
+            *self = Self { eye: self.eye, pace: self.pace, switches: self.switches.wrapping_add(1), ..Self::default() };
             self.view = u16::try_from(c.view).ok();
             if c.has_position {
                 self.eye = Some(c.position);
@@ -168,7 +176,13 @@ impl TvSlot {
     /// `37.5·+0x40/d`, a zoom that holds the car's size (0x462BE6…0x462C9F); `t` then grows by
     /// `+0x48·(1 − t)` within [0.01, 1] (0x462CE3…0x462D41). Without it, when `+0x34` is set: a
     /// non-zero `t` first copies `+0x38` into `+0x58` and zeroes `t`, then `+0x58` steps toward
-    /// `+0x78` by `+0x48` (0x462D4C…0x462DC5); when clear, 37.5.
+    /// `+0x78` by `+0x48` (0x462D4C…0x462DC5); when clear, 37.5. Each branch that writes `+0x58`
+    /// also writes the near plane `+0x5C` from the same angle (`camera::zoom_near`, 0x462CA5…
+    /// 0x462CE3 and 0x462DC7…0x462E19); the early return leaves both.
+    ///
+    /// Re-read 2026-09-25: the stepping branch stores `+0x58` into `+0x38` first (`fst`, 0x462D89)
+    /// and then adds or takes `+0x48` by its compare with `+0x78` (equal leaves it), with no clamp —
+    /// so the half-angle hunts ±0.02° about a target it rarely lands on exactly.
     pub fn update(&mut self, d: f32) {
         if let Some(d0) = self.dolly {
             if d < d0 {
@@ -180,6 +194,7 @@ impl TvSlot {
             // equal distances load the slot index's bits (`[esp+8]`, 0x462C93) — 0 for slot 0
             let v = if d0 < dp { dp - e } else if d0 > dp { dp + e } else { 0.0 };
             self.half_angle = v * a / dp;
+            self.near = crate::camera::zoom_near(self.half_angle);
             let t = self.t44 + self.step48 * (1.0 - self.t44);
             self.t44 = if t >= 1.0 { 1.0 } else if t <= 0.01 { 0.01 } else { t };
         } else if self.flag34 {
@@ -196,8 +211,10 @@ impl TvSlot {
                 cur
             };
             self.half_angle = self.a38;
+            self.near = crate::camera::zoom_near(self.half_angle);
         } else {
             self.half_angle = crate::camera::DEFAULT_HALF_ANGLE;
+            self.near = crate::camera::DEFAULT_NEAR;
         }
     }
 }
@@ -360,8 +377,11 @@ mod tests {
         tv.switch(&c);
         tv.update(3.0); // nearer than +0x40: unchanged
         assert_eq!(tv.half_angle, 37.5);
+        assert_eq!(tv.near, 0.5);
         tv.update(50.0);
         assert!((tv.half_angle - 3.75).abs() < 1e-4, "{}", tv.half_angle);
+        // the zoom pushes the near plane out with it: (37.5 − 3.75) / 3.75
+        assert!((tv.near - 9.0).abs() < 1e-3, "{}", tv.near);
         // a disabled camera starts the blend again from t = 0: the angle stays A = 37.5 at first
         tv.switch(&TrackCamera { enabled: false, ..c });
         tv.update(50.0);

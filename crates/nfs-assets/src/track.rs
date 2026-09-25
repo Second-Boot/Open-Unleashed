@@ -54,6 +54,50 @@ pub fn vertex_light_methods(crp: &Crp, data: &[u8]) -> std::collections::HashSet
         .collect()
 }
 
+/// The flat vertex colour of every material whose method builds, for its `op_mask`, an `Am` op —
+/// `RCustomLayers::LayerAmbient` **0x8007** by day or `Headlights::LayerVertexLight_Ambient`
+/// **0x8011** by night — keyed by the material's index. Both write the first dword of the op's
+/// slot over every vertex's colour (0x448C83…0x448C97; 0x45360B, then 0x453BDF with the lamps off
+/// or 0x453763…0x4537D6 with the headlight added and clamped), and the slot is the method's own
+/// `Am` data block (0x44C313…0x44C366 → 0x44A580). The same op mask drops the `df` colours
+/// (`LayerColours`, mask 8), so the class-0 draw's copy of the stream (0x540E1D) never runs:
+/// such a material is drawn **in this colour, whatever its `df` says**. Every shipped track's
+/// block is 0xFFFFFFFF, and the op is built for the materials with bit 0x10 (0x30010, 0x13;
+/// `RE/notes/lighting.md` §5.4).
+pub fn ambient_colours(crp: &Crp, data: &[u8]) -> std::collections::HashMap<u16, u32> {
+    let (Ok(methods), Ok(materials)) = (crp.render_methods(data), crp.materials(data)) else { return Default::default() };
+    materials
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| {
+            let method = methods.iter().find(|r| r.name == m.render_method)?;
+            // pass masks are only ever set on later passes; the `Am` op sits in pass 1 (mask 0)
+            let op = method.built_ops(0, m.op_mask).find(|o| matches!(o.class, 0x8007 | 0x8011))?;
+            let b = method.block(op.key)?;
+            Some((i as u16, u32::from_le_bytes(b.get(..4)?.try_into().ok()?)))
+        })
+        .collect()
+}
+
+/// The `Rs` block a material's first pass applies — Thrash states **6, 0x0A, 0x38, 2, 0x18** and a
+/// closing −1 (`LayerState` 0x53F780 → 0x540660, `RE/notes/thrash.md` §6) — when its render
+/// method carries one: the first `LayerState` (class 8) op the material builds, and the block its
+/// slot holds at draw time. 0x44A250 lays the material object's own list (`[mat+0x10]`) over the
+/// method's slots first, so the material's `mt` block under that key wins
+/// ([`Material::blocks`], built at 0x44AD3B…0x44ADFF); otherwise it is the method's data block
+/// (0x44C313…0x44C366 → 0x44A580). The shipped tracks' blocks: `Normal`, `FakeSort`, `FullAmbient`,
+/// `UVAnimate`, `FA_UVAnim` `{1, 2, 0, 1, 0}` (blending on, `SRCALPHA` / `INVSRCALPHA`, the view's
+/// cull), `Opaque` `{1, 0, 0, 1, 0}` (off), `S_Normal` / `S_UVAnimate` `{1, 2, 0, 1, −3}`, and every
+/// `…MatState` material's own `{1, 2, 0, 0, 0}` — blending on, **no culling** — as are the own blocks
+/// of 108 `FakeSort` materials and one `Opaque` (monaco3), which override their methods'.
+pub fn render_states(methods: &[nfs_formats::crp::RenderMethod], m: &Material) -> Option<[i32; 6]> {
+    let method = methods.iter().find(|r| r.name == m.render_method)?;
+    let op = method.built_ops(0, m.op_mask).find(|o| o.class == 8)?;
+    let own = m.blocks.iter().find(|(k, _)| method.resolve(*k) == Some(op.key)).map(|(_, b)| b.as_slice());
+    let b = own.or_else(|| method.block(op.key))?;
+    (b.len() >= 24).then(|| std::array::from_fn(|k| i32::from_le_bytes([b[4 * k], b[4 * k + 1], b[4 * k + 2], b[4 * k + 3]])))
+}
+
 /// The render methods that build `Headlights::LayerUVLight` — the serialised class code **0x8004**
 /// (its allocator 0x449C6D takes the jump table's index 3 to the constructor 0x453C60, which sets
 /// the vtable 0x5B3DAC). Two of them sit in every night track's `Opaque` method and none in a day
@@ -312,10 +356,18 @@ impl TrackAssets {
         let mut world = Vec::new();
         let mut library = Vec::new();
         let mut skipped = 0usize;
+        let flat = ambient_colours(&self.crp, &self.crp_data);
         for (index, a) in arts.iter().enumerate() {
             let g = self.crp.article_geometry(&self.crp_data, a).map_err(fmt_err(&crp_path))?;
             let Some(lod) = g.primitives.iter().map(|p| p.lod).min() else { continue };
-            let meshes = article_meshes(&g, lod, &mut skipped);
+            let mut meshes = article_meshes(&g, lod, &mut skipped);
+            // an `Am` material's colour is its method's block, not its `df` stream
+            for mm in &mut meshes {
+                if let Some(c) = flat.get(&mm.material) {
+                    let c = c.to_le_bytes().map(|b| b as f32 / 255.0);
+                    mm.mesh.vertices.iter_mut().for_each(|v| v.color = c);
+                }
+            }
             let transform = g.transform.as_ref().map(tr_to_mat4).unwrap_or(glam::Mat4::IDENTITY);
             let (is_lib, tag) = g.base.as_ref().map(|b| (b.is_library(), b.tag_u32())).unwrap_or((false, 0));
             let animation = self.crp.article_animation(&self.crp_data, a);
@@ -383,5 +435,53 @@ mod headlight_tests {
         assert!(lit.contains("Normal") && lit.contains("Opaque"), "{lit:?}");
         let day = TrackAssets::load(&paths, "alps").unwrap();
         assert!(vertex_light_methods(&day.crp, &day.crp_data).is_empty());
+    }
+
+    /// Exactly the materials with op-mask bit 0x10 build an `Am` op — `…_Ambient` 0x8011 by
+    /// night, `LayerAmbient` 0x8007 by day — and every shipped `Am` block is opaque white.
+    #[test]
+    fn ambient_ops_follow_the_op_mask() {
+        let Ok(paths) = crate::GamePaths::locate() else { return };
+        for (name, class) in [("monaco1", 0x8011), ("alps", 0x8007)] {
+            let t = TrackAssets::load(&paths, name).unwrap();
+            let flat = ambient_colours(&t.crp, &t.crp_data);
+            let methods = t.crp.render_methods(&t.crp_data).unwrap();
+            let mats = t.materials().unwrap();
+            assert!(!flat.is_empty());
+            for (i, m) in mats.iter().enumerate() {
+                let am = methods.iter().find(|r| r.name == m.render_method).is_some_and(|r| r.ops.iter().any(|o| o.class == class));
+                assert_eq!(flat.contains_key(&(i as u16)), am && m.op_mask & 0x10 != 0, "{name} {i} {} {:#x}", m.render_method, m.op_mask);
+            }
+            assert!(flat.values().all(|&c| c == 0xFFFF_FFFF));
+        }
+    }
+
+    /// Where a track method carries an `Rs` block, its blend state (0x0A = 2) says exactly what
+    /// the port's former rule by name said — blend unless the method is `Opaque`. The `…MatState`
+    /// methods carry none, and every one of their materials carries its own; so do 108 `FakeSort`
+    /// ones (`mt+4` class 0x281) and one of monaco3's `Opaque` — all `{1, 2, 0, 0, 0}`, blending on
+    /// and no culling.
+    #[test]
+    fn track_render_states_from_the_method_blocks() {
+        let Ok(paths) = crate::GamePaths::locate() else { return };
+        let mut own = 0;
+        for name in TrackAssets::list(&paths) {
+            let t = TrackAssets::load(&paths, &name).unwrap();
+            let methods = t.crp.render_methods(&t.crp_data).unwrap();
+            for m in t.materials().unwrap() {
+                let rs = render_states(&methods, &m).unwrap_or_else(|| panic!("{name} {}", m.render_method));
+                let method = methods.iter().find(|r| r.name == m.render_method).unwrap();
+                if m.blocks.iter().any(|(k, _)| method.resolve(*k) == Some(0x5273_0001)) {
+                    assert_eq!(rs, [1, 2, 0, 0, 0, -1], "{name} {}", m.render_method);
+                    own += 1;
+                } else {
+                    assert!(!m.render_method.ends_with("MatState"), "{name} {}", m.render_method);
+                    assert_eq!(rs[1] == 2, m.render_method != "Opaque", "{name} {}", m.render_method);
+                    assert_eq!((rs[3], rs[5]), (1, -1));
+                    assert_eq!(rs[4], if m.render_method.starts_with("S_") { -3 } else { 0 }, "{name} {}", m.render_method);
+                }
+            }
+        }
+        assert!(own > 0);
     }
 }

@@ -175,6 +175,19 @@ pub struct LaneSelf {
 impl LaneScratch {
     /// `0x401F20(car)` (§12.4) — who is in each lane and how fast this car may go there. Must run before
     /// the scorers: `0x402200` and `0x401C60` read what it writes.
+    ///
+    /// `cars` is every other car in the world, **in registration order** (0x40F189: the human, the
+    /// opponents, the cops, the traffic) — the order ties keep in the race-order array. The walk is
+    /// 0x401FA2…0x401FD3's: `0x5E8B88[(car+0xEB0·i + n + car+0x528) mod n]` for `i = 0, 1, …` while
+    /// fewer than three lanes are filled (0x4021E9), i.e. outward from the car's own place in the
+    /// array, in its travel direction, wrapping round. `0x5E8B88` is sorted by 0x417710 on
+    /// `+0xAF8 − +0xB20`, stable; for a traffic car or a cop `+0xAF8` is the bare lap fraction of
+    /// its slice (0x4169B0's non-racer branch, 0x416A21…0x416AA1) and `+0xB20` is 0, for a racer it
+    /// is `frac − unlaps` — so the key here is the slice's place on the lap. APPROXIMATIONS: a racer
+    /// that is unlapping or has finished (`+0xB20` ahead of the lap, `traffic.md` §17.5c) is keyed
+    /// on its slice all the same; ties keep the registration order where the original keeps the
+    /// previous sort's; and the original sorts at 0x417800, the end of the previous even tick,
+    /// while this sorts on the slices the cars have now.
     pub fn find_blockers(&mut self, table: &SliceTable, me: &LaneSelf, cars: &[LaneCar], pers: &Personality) {
         self.hard = [me.target_speed; 3];
         self.soft = [me.target_speed; 3];
@@ -182,21 +195,22 @@ impl LaneScratch {
         self.gap = [0.0; 3];
         let masks = [lane_bit(me.lane - 1), lane_bit(me.lane), lane_bit(me.lane + 1)];
         let lanes = [me.lane - 1, me.lane, me.lane + 1];
-        // the original walks the race order outward in the travel direction and stops once three lanes
-        // are filled; nearest-first over the whole list reaches the same three cars
-        let mut order: Vec<usize> = (0..cars.len()).collect();
-        order.sort_by(|&a, &b| {
-            let ga = (me.dir * gap_between(table, cars[a].slice, me.slice)).abs();
-            let gb = (me.dir * gap_between(table, cars[b].slice, me.slice)).abs();
-            ga.partial_cmp(&gb).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // the race-order array without this car, sorted stably by the lap place of the slice; this
+        // car sits before the others on its own slice (which are all skipped: their gap is 0)
+        let key = |slice: usize| table.route_pos.get(slice).copied().unwrap_or(0);
+        let mut sorted: Vec<usize> = (0..cars.len()).collect();
+        sorted.sort_by_key(|&i| key(cars[i].slice));
+        let own = sorted.partition_point(|&i| key(cars[i].slice) < key(me.slice));
+        let m = sorted.len();
+        let walk = (0..m).map(|k| if me.dir > 0.0 { sorted[(own + k) % m] } else { sorted[(own + m - 1 - k) % m] });
         let mut used = 0u32;
         let mut found = 0;
-        for i in order {
-            if found >= 3 {
+        for i in walk {
+            if found == 3 {
                 break;
             }
             let o = &cars[i];
+            // `0x40E860(car, o)` and `gd = car+0xEB0 · g`
             let g = gap_between(table, o.slice, me.slice);
             let gd = me.dir * g;
             // the closing-rate weights: gentler when almost stopped, much gentler inside 15 m
@@ -208,10 +222,29 @@ impl LaneScratch {
             if me.half_len >= gd || gd >= pers.lookahead {
                 continue;
             }
-            let t = (g.abs() - 2.0).max(0.0);
-            let (hard, soft) = (o.speed + a * t * me.dir, o.speed + b * t * me.dir);
-            for k in 0..3 {
-                if o.lane_mask & masks[k] != 0 && used & masks[k] == 0 && (0..14).contains(&lanes[k]) {
+            // 0x402095…0x4020EB: the gap `fistp`-rounded, less the 2 m margin, towards zero never
+            // past it; a cop or an opponent (`52C & 0x28`) keeps at least 1 m going forwards and
+            // takes −1 going backwards once the sum passes 1 — neither can happen once the gap has
+            // cleared `car+0x3B0`, as the checks above require
+            let gi = g.round_ties_even() as i32;
+            let t = if me.dir == 1.0 {
+                let mut t = gi - 2;
+                if !me.is_traffic && t < 1 {
+                    t = 1;
+                }
+                t.max(0)
+            } else {
+                let mut t = gi + 2;
+                if !me.is_traffic && t > 1 {
+                    t = -1;
+                }
+                t.min(0)
+            };
+            let (hard, soft) = (o.speed + a * t as f32, o.speed + b * t as f32);
+            // the own lane first (0x4020F3…0x402145), then lane−1 (…0x40218F), then lane+1 (…0x4021D9);
+            // the own lane has no range test, its neighbours need `0 <= lane < 14`
+            for k in [1, 0, 2] {
+                if o.lane_mask & masks[k] != 0 && used & masks[k] == 0 && (k == 1 || (0..14).contains(&lanes[k])) {
                     self.hard[k] = hard;
                     self.soft[k] = soft;
                     self.blocker[k] = Some(i);
@@ -586,6 +619,30 @@ mod tests {
         assert_eq!(lane_span(sl, 1.0, 0.9), lane_bit(7), "a car well inside one lane spans only that lane");
         assert_eq!(lane_span(sl, 2.0, 0.9), lane_bit(7) | lane_bit(8), "straddling the 7/8 line spans both");
         assert_eq!(lane_span(sl, 4.0, 0.9), lane_bit(8), "a car well inside lane 8");
+    }
+
+    #[test]
+    fn the_blockers_are_found_by_walking_the_race_order_in_the_travel_direction() {
+        // 0x401F20 walks `0x5E8B88` from the car's own place in its travel direction; two cars on
+        // the same slice keep their registration order there, so going forwards the earlier one is
+        // met first and going backwards the later one
+        let t = ring(400, 2, 2);
+        let car = |slice: usize, speed: f32| LaneCar { slice, lane: 8, lane_mask: lane_bit(8), speed, speed_est: speed, half_len: 2.1, lateral: 6.0, half_span: 0.9, is_human: false, is_racer: false };
+        let mut s = LaneScratch::default();
+        let fwd = me(8, 6.0);
+        s.find_blockers(&t, &fwd, &[car(15, 4.0), car(15, 5.0)], &PERSONALITIES[0]);
+        assert_eq!(s.blocker[1], Some(0));
+        let back = LaneSelf { dir: -1.0, speed: -16.5, target_speed: -16.5, ..fwd };
+        s.find_blockers(&t, &back, &[car(5, -4.0), car(5, -5.0)], &PERSONALITIES[0]);
+        assert_eq!(s.blocker[1], Some(1));
+        // across the lap line: at slice 398 going forwards, a car at slice 2 is 24 m ahead and
+        // one at slice 390 is behind; the walk wraps from the top of the array to its bottom
+        let late = LaneSelf { slice: 398, ..fwd };
+        s.find_blockers(&t, &late, &[car(390, 4.0), car(2, 5.0), car(6, 6.0)], &PERSONALITIES[0]);
+        assert_eq!(s.blocker[1], Some(1));
+        assert_eq!(s.gap[1], 24.0);
+        // the permitted speed is the blocker's plus `a · (round(gap) − 2)`
+        assert!((s.hard[1] - (5.0 + 1.25 * 22.0)).abs() < 1e-4, "{:?}", s.hard);
     }
 
     #[test]

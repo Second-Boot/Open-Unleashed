@@ -57,6 +57,20 @@ impl LayoutScreen {
                 self.glass(&mut out, aspect, bx, by, bw, bh, &tint);
             }
         }
+        // the input dialog's field, its draw 0x514AF0: the typed text in the buttons' font, black,
+        // its left `(tw + 8)·0.5` short of the field's centre `x + 160` (the field's own x, 160,
+        // over the dialog's), at `y + th`; then while `ticks & 63 < 32` (0x514BD6) a 1 × 14 cursor
+        // at `left + tw`, a pixel higher (0x514C02…0x514C4C)
+        if let (Some(field), Some(f)) = (d.field.as_ref(), self.fonts.get(DIALOG_BUTTON_FONT)) {
+            let (_, _, _, _, dth) = d.frame(th);
+            let tw = f.place(&field.text).1;
+            let left = x + 160.0 - (tw + 8.0) * 0.5;
+            let black = [0.0, 0.0, 0.0, 1.0];
+            self.text(&mut out, aspect, f, &field.text, left, y + dth, 0.0, 0, black);
+            if self.ticks() & 63 < 32 {
+                out.push(self.quad(aspect, left + tw, y + dth - 1.0, 1.0, 14.0, black));
+            }
+        }
         // 0x512B65: the text, black, centred in its 300-wide block at (x+10, y+10)
         if let Some(f) = self.fonts.get(DIALOG_TEXT_FONT) {
             self.wrapped_text(&mut out, aspect, f, &d.text, x + 10.0, y + 10.0, 300.0, 1, [0.0, 0.0, 0.0, 1.0], None);

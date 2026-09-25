@@ -48,8 +48,7 @@ impl App {
             "Tournament.RemainingTracks" if modifier.is_empty() => {
                 let c = self.career.as_ref()?;
                 let t = c.current()?;
-                let done = c.career.tournaments.get(&t.id).map_or(0, |s| s.events.len());
-                c.tables.track_name(t.events.get(done)?.track_id).to_uppercase()
+                c.tables.track_name(t.events.get(c.career.next_event(t)?)?.track_id).to_uppercase()
             }
             "Tournament.Tournament" => {
                 let c = self.career.as_ref()?;
@@ -67,9 +66,10 @@ impl App {
                     "PRIZEMONEY" => with_thousands(*t.prize.first()? as i64),
                     "DIFFICULTY" => self.fe.strings.get(450 + t.difficulty_level.min(2) as u32)?.to_string(),
                     "LOCATION" => {
-                        // the event the tournament is on: the first one the player has not finished
-                        let done = c.career.tournaments.get(&t.id).map_or(0, |s| s.events.len());
-                        let ev = t.events.get(done.min(t.events.len().saturating_sub(1)))?;
+                        // the event `Tournament.RemainingTracks` is on — `[0x691E7C]`, the row's
+                        // undone event (0x504F00); the last event once none is left
+                        let done = c.career.remaining_event(t, self.fe.remaining_sel).unwrap_or(t.events.len().saturating_sub(1));
+                        let ev = t.events.get(done)?;
                         c.tables.track_name(ev.track_id).to_uppercase()
                     }
                     // the record on the track the tournament is on. 0x506895 asks
@@ -78,8 +78,8 @@ impl App {
                     // entry, the fastest — and 0x5068BB takes its `+0x48`, the time, into the
                     // formatter 0x4356E0.
                     "RECORDTIME" => {
-                        let done = c.career.tournaments.get(&t.id).map_or(0, |s| s.events.len());
-                        let ev = t.events.get(done.min(t.events.len().saturating_sub(1)))?;
+                        let done = c.career.remaining_event(t, self.fe.remaining_sel).unwrap_or(t.events.len().saturating_sub(1));
+                        let ev = t.events.get(done)?;
                         format_lap_time(c.tables.track(ev.track_id)?.records.first()?.time)
                     }
                     // `"%d"` of `trn+0xD3C` (0x506929), the tournament's own completion counter
@@ -237,12 +237,10 @@ impl App {
             "Graphics.Resolutions" => "640 x 480 x 16".to_string(),
             "Controller.AllControllers" | "Controller.AllPads" => {
                 let pads_only = name == "Controller.AllPads";
-                self.gamepads
-                    .devices()
-                    .into_iter()
-                    .find(|(_, is_pad)| !pads_only || *is_pad)
-                    .map(|(n, _)| n.to_uppercase())
-                    .unwrap_or_default()
+                let v: Vec<String> =
+                    self.gamepads.devices().into_iter().filter(|(_, is_pad)| !pads_only || *is_pad).map(|(n, _)| n).collect();
+                let sel = if pads_only { self.fe.pads_sel } else { self.fe.controllers_sel };
+                v.get(sel.min(v.len().saturating_sub(1))).map(|n| n.to_uppercase()).unwrap_or_default()
             }
             "Game.Damage" => {
                 let id = BOOL_OPTIONS[usize::from(menu?.damage)];
@@ -304,30 +302,23 @@ impl App {
             // answer the same way: 0x516480 and 0x517500 compare the modifier against the literal
             // **`TOTAL`** (0x5DCE04) and, on a match, print `this->slot6(modifier)` with
             // **`"%d"`** (0x5CD1B0) — a bare number, no currency sign and no thousands commas.
-            // The sum itself (0x517580 for the repair one) walks the basket and takes each
-            // entry's repair cost (0x518900) or its price (0x518880) by the entry's own
-            // `[+4]` byte, so an **empty** basket prints **`0`**, not nothing. Any other modifier
-            // answers null, which is `CANTFINDSTRING` in the original (§4.10) and nothing here.
+            // Slot 6 is the sum over the basket: 0x516500 for the shop (resale in, aged price
+            // out, so a basket of buys prints **negative**) and 0x517580 for the repair screen
+            // (each entry's replace cost 0x518900 or fix cost 0x518880 by its `[+4]` byte). An
+            // **empty** basket prints **`0`**, not nothing. Any other modifier answers null, which
+            // is `CANTFINDSTRING` in the original (§4.10) and nothing here.
             //
-            // The `$` this port used to print was its own.
-            "Parts.ShoppingList" if modifier == "TOTAL" => format!("{}", career?.basket_total()),
-            // **and it counts only the categories that are ticked.** The screen's own sum,
-            // 0x50F110, takes the car from `OwnedCars.Car` (0x4F5A20) and then adds one
-            // category's cost per `if (accessor->slot27())` — ten of them, 0x50F14A onwards, each
-            // guarded by its own `QUICKFIX.*` bool and each cost from its own getter (0x4EFBC0,
-            // 0x4EFC20, 0x4EFC80, …). All ten bools start false (§4.84) and 0x50F0D1 resets them
-            // to false as a group, so the total starts at **0** and grows as boxes are ticked —
-            // where this port used to sum every damaged part unconditionally. §4.96.
+            // *(Corrected 2026-09-25: the repair total was taken from the `QUICKFIX.*` ticks —
+            // `repair.lay`'s sum 0x50F110 — which `advancedrepair.lay` has nothing to do with; and
+            // 0x518900 is the replace cost, 0x518880 the fix cost, not a price.)* §4.160.
+            "Parts.ShoppingList" if modifier == "TOTAL" => {
+                let c = career?;
+                format!("{}", c.career.shop_total(&c.tables, &self.fe.shop.basket))
+            }
             "Parts.RepairShoppingList" if modifier == "TOTAL" => {
                 let c = career?;
                 let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                let mut kinds: Vec<u16> = Vec::new();
-                for name in &self.fe.repair_ticks {
-                    kinds.extend(quickfix_kinds(name).unwrap_or(&[]));
-                }
-                kinds.sort_unstable();
-                kinds.dedup();
-                format!("{}", c.career.repair_cost(&c.tables, idx, &kinds))
+                format!("{}", c.career.repair_total(&c.tables, idx, &self.fe.shop.repair))
             }
             // A `Parts.*` accessor with **no** modifier: `FEAccessorWatch::tick` asks vtable +0x10
             // (§4.10), which is the base's 0x4BC4E0 — `this->slot12([this+0x18])`, the text of the
@@ -337,7 +328,9 @@ impl App {
             // For `Parts.AllParts` row 0 is the first section header (0x5152E0's `row == 0` arm),
             // whose text is `FEStrings` 2550, "PARTS AVAILABLE FOR %s", with the car (0x5157A1).
             // For `Parts.InstallList` slot 12 is 0x516B50: `"%s %s"` of the row's part name and
-            // its type name, so row 0 is the first installed part.
+            // its type name, so row 0 is the first row of the list 0x5166E0 builds — the car's
+            // parts but the body and the spares that fit it, in 0x49C350's order
+            // (`Career::install_list`). *(Until 2026-09-25 this was the first installed part.)*
             "Parts.AllParts" if modifier.is_empty() => {
                 let c = self.career.as_ref()?;
                 let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
@@ -347,7 +340,10 @@ impl App {
             "Parts.InstallList" if modifier.is_empty() => {
                 let c = self.career.as_ref()?;
                 let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                let p = c.career.installed_parts(&c.tables, idx).into_iter().next()?;
+                let p = match c.career.install_list(&c.tables, idx).first()? {
+                    nfs_game::shop::InstallRow::Fitted(id) => c.tables.parts.iter().find(|p| p.id == *id)?,
+                    nfs_game::shop::InstallRow::Spare(i) => c.career.spare_part(&c.tables, *i)?.0,
+                };
                 format!("{} {}", self.fe.strings.get(p.name_string_id).unwrap_or(""), p.kind_name)
             }
             // A `Parts.*` accessor **with** a modifier goes to vtable +0x14, and these two classes
@@ -364,7 +360,10 @@ impl App {
             "Parts.InstallList" => {
                 let c = self.career.as_ref()?;
                 let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                let p = c.career.installed_parts(&c.tables, idx).into_iter().next()?;
+                let p = match c.career.install_list(&c.tables, idx).first()? {
+                    nfs_game::shop::InstallRow::Fitted(id) => c.tables.parts.iter().find(|p| p.id == *id)?,
+                    nfs_game::shop::InstallRow::Spare(i) => c.career.spare_part(&c.tables, *i)?.0,
+                };
                 self.fe.strings.get(p.name_string_id + 500)?.to_string()
             }
             // one cell of `locationsetup.lay`'s table. The modifier is `<row>TRACK<FIELD>`:

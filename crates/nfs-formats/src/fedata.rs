@@ -59,6 +59,11 @@ pub struct CarCatalogEntry {
     /// `+0x3BC` i16 count, `+0x3BE` i16 ids: the record's stock parts, which the 3D car widget
     /// walks for a car that is not a garage record (0x4C036A…0x4C0405) to build its style overlay.
     pub stock_parts: Vec<i16>,
+    /// `+0x32E` i16 count, `+0x330` i16 ids: every part that **fits** the car. The parts shop's
+    /// first section is built from it — 0x517D10 walks `FECar+0x332` / `+0x334`, the record at
+    /// `FECar+4` — and so is the carsetup inventory filter 0x517F70. Up to 61 in the shipped file
+    /// (room for 70 before `+0x3BC`).
+    pub compatible_parts: Vec<i16>,
     pub logo_pair: i16,
     /// +0x1F4 u16 — what the car *is*, and which of the front end's lists it joins (the `switch` at
     /// 0x4F400E): **0 a racing car** (87 records, the player's, the opponents' and the dealer's),
@@ -237,6 +242,10 @@ pub fn parse_car_catalog(data: &[u8]) -> Result<Vec<CarCatalogEntry>, FormatErro
             stock_parts: {
                 let n = (u16_le(r, 0x3BC, "nfs5.car +0x3BC")? as i16).clamp(0, 40) as usize;
                 (0..n).filter_map(|k| u16_le(r, 0x3BE + 2 * k, "nfs5.car +0x3BE").ok().map(|v| v as i16)).collect()
+            },
+            compatible_parts: {
+                let n = (u16_le(r, 0x32E, "nfs5.car +0x32E")? as i16).clamp(0, 70) as usize;
+                (0..n).filter_map(|k| u16_le(r, 0x330 + 2 * k, "nfs5.car +0x330").ok().map(|v| v as i16)).collect()
             },
             logo_pair: u16_le(r, 0x1F6, "nfs5.car +0x1F6")? as i16,
             kind: u16_le(r, 0x1F4, "nfs5.car +0x1F4")?,

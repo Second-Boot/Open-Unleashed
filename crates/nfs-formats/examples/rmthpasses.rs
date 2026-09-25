@@ -1,5 +1,6 @@
 //! Diagnostic: every `RMth` record's pass table — sixteen bytes a pass from `+0x1C`, the third
-//! dword the option mask 0x44C185 tests against `[0x6197F8]` — and the ops' own `+0xC` words.
+//! dword the option mask 0x44C185 tests against `[0x6197F8]` — and the ops' own `+0xC` words,
+//! then the method's keyed data blocks.
 use nfs_formats::refpack;
 
 fn main() {
@@ -22,6 +23,17 @@ fn main() {
             let base = 0x1C + 16 * passes;
             let ops: Vec<String> = (0..ops).map(|i| base + 16 * i).map(|o| format!("{:#x}:{:#x}:{:#x}/{:#x}", d(o), d(o + 4), d(o + 8), d(o + 12))).collect();
             println!("  size {len} expect {}  ops {}", base + 16 * ops.len(), ops.join(" "));
+            // The keyed data blocks after the ops (0x44C313…0x44C366): `+0x18` records of
+            // `{key, offset, size, ?}`, each block at `offset` past the records, handed to 0x44A580.
+            let (n_ops, extra) = (ops.len(), d(0x18) as usize);
+            let recs = base + 16 * n_ops;
+            let data0 = recs + 16 * extra;
+            for k in 0..extra {
+                let o = recs + 16 * k;
+                let (key, at, size) = (d(o), d(o + 4) as usize, d(o + 8) as usize);
+                let words: Vec<String> = (0..size / 4).map(|i| format!("{:#x}", d(data0 + at + 4 * i))).collect();
+                println!("    block {key:#x} @{at} +{size} [{:#x}]: {}", d(o + 12), words.join(" "));
+            }
         }
     }
 }

@@ -67,6 +67,24 @@ impl BitmapFont {
         (out, x)
     }
 
+    /// The string's measure as 0x536970 → 0x53ECE0 gives it: the box of its glyph quads, the
+    /// width reaching to the pen's end when that is further right (0x53EDB3), the height the
+    /// quads' own span — not the font's line height. `(0, 0)` for a string with no glyph.
+    /// (The low pen mark 0x53ECE0 also folds in starts 1000 right of the pen and moves only on a
+    /// space or a line break, 0x53DAD6 / 0x53DB4D; a leading space is the one case it matters,
+    /// and it is left out.)
+    pub fn measure(&self, text: &str) -> (f32, f32) {
+        let (glyphs, pen) = self.place(text);
+        if glyphs.is_empty() {
+            return (0.0, 0.0);
+        }
+        let min_x = glyphs.iter().map(|g| g.x).fold(f32::MAX, f32::min);
+        let max_x = glyphs.iter().map(|g| g.x + g.w).fold(f32::MIN, f32::max).max(pen);
+        let min_y = glyphs.iter().map(|g| g.y).fold(f32::MAX, f32::min);
+        let max_y = glyphs.iter().map(|g| g.y + g.h).fold(f32::MIN, f32::max);
+        (max_x - min_x, max_y - min_y)
+    }
+
     /// Sprites for `text` with its top-left at `pos` (screen units 0..1); `height` = line height in
     /// screen units. Used by the HUD, whose sprites are square in screen units.
     /// Lay a line out at `pos` in **screen** units with glyphs `height` tall (also in screen units,

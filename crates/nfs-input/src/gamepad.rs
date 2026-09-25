@@ -30,8 +30,11 @@
 //! and the packer 0x412E70 makes steering `(C1_RIGHT − C1_LEFT) / 4` (0x412F39…0x412F4B, `cdq /
 //! and 3 / sar 2`, truncating). Steering is those two directional bindings on one axis, `dir` +1
 //! and −1, so with the factory 0 / 0x80 the right half runs 0x80…0xFF and the left 0x80…0x00.
-//! The triggers and buttons below are still this port's own fixed map — the original's pad
-//! bindings are `fe.txt`'s commented examples only (`RE/notes/controls.md` §4.117).
+//! The triggers and buttons below are still this port's own fixed map, used for an action with no
+//! pad binding. *(Corrected 2026-09-25: this said the original's pad bindings were `fe.txt`'s
+//! commented examples only. `DEFAULTCONTROLS`' 0x51D1D0 binds a pad's X and Y axes and six of its
+//! buttons, and the front end's factory runs it on the first pad at start-up —
+//! `RE/notes/controls.md` §4.103a, `bindings::default_bindings`.)*
 
 use crate::{Action, InputState};
 use gilrs::{Axis, Button, EventType, Gilrs};
@@ -131,8 +134,11 @@ impl Gamepads {
                 }
                 EventType::ButtonChanged(Button::RightTrigger2, v, _) => self.axes.throttle = v,
                 EventType::ButtonChanged(Button::LeftTrigger2, v, _) => self.axes.brake = v,
+                // an action bound to a pad control is pressed by that control and no other, as a
+                // key-bound one is by its key (`InputState::key_event`) — so `DEFAULTCONTROLS`
+                // putting the handbrake on button 0 does not leave `South` also accelerating
                 EventType::ButtonPressed(b, _) => {
-                    if let Some(a) = map_button(b) {
+                    if let Some(a) = map_button(b).filter(|&a| !input.pad_bound(a)) {
                         input.press(a);
                     }
                 }
@@ -241,6 +247,11 @@ impl Gamepads {
                 let mut r = crate::bindings::PadRecord { mask: set.mask, axes: set.values, ..Default::default() };
                 for (n, b) in BUTTON_ORDER.iter().enumerate() {
                     r.buttons[n] = gp.is_pressed(*b);
+                    // `[info+0xC]`, the buttons 0x51F140 asks about: the ones the pad's mapping
+                    // has, in this port's numbering
+                    if gp.button_code(*b).is_some() {
+                        r.button_mask |= 1 << n;
+                    }
                 }
                 let (u, d, l, rt) = (
                     gp.is_pressed(Button::DPadUp),
@@ -281,7 +292,15 @@ impl Gamepads {
                         // `DIPROP_BUFFERSIZE`), so an absolute axis keeps DirectInput's default
                         // 0…65535 with the centre at 32767, which is the range `NFS5.DEADZONE`'s
                         // marker divides by 65536 (0x51B819). `gilrs` reads -1…1.
-                        set.values[n] = (((d.value() + 1.0) * 0.5 * 65535.0) as i32).clamp(0, 0xFFFF);
+                        //
+                        // A stick's Y runs **down**, as DirectInput's `lY` / `lRy` do: `gilrs`
+                        // turns the platform's downward Y round to point up (its
+                        // `IS_Y_AXIS_REVERSED`), and this turns it back. The image depends on
+                        // it — `DEFAULTCONTROLS` puts `Accel` on Y **−1** and `Brake` on Y **+1**
+                        // (0x51D60A…0x51D6EB), which is stick forward to accelerate only with
+                        // a Y that grows downward.
+                        let v = if n == 1 || n == 4 { -d.value() } else { d.value() };
+                        set.values[n] = (((v + 1.0) * 0.5 * 65535.0) as i32).clamp(0, 0xFFFF);
                     }
                 }
                 set

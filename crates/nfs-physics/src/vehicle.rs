@@ -23,7 +23,7 @@
 //! * The per-part condition terms of the damage getters (`physics.md` §10) are `specs.wear`: the
 //!   career fills a scale and an offset per group from the parts on the car.
 
-use crate::collision::TriangleGrid;
+use crate::collision::{PatchTracker, TriangleGrid};
 use crate::specs::{CarSpecs, CIRCLE_SOFTNESS, GRAVITY, GRIP_DRY, GRIP_WET, SURFACE_BOUNCE};
 use glam::{Mat3, Vec3};
 use std::f32::consts::TAU;
@@ -57,7 +57,17 @@ pub struct Wheel {
     pub wet: bool,
     /// rotation angle, turns in [0,1)
     pub rotation: f32,
+    /// The surface nibble, `zone & 0xF` — what the grip table (0x4A1962 `and eax, 0xF`),
+    /// `Roughness` (0x49976F) and the car renderer (0x43F02B) read.
     pub surface: usize,
+    /// `wheel+0x8C`, the **whole** zone word: `Susp_update` stores the wheel tracker's `u16`
+    /// `+0x24` zero-extended (0x499B84…0x499B8A), or 2 under `RALLY` when its nibble is 1 or 10
+    /// (0x499BA7 — the whole dword). The `Tyre` tests compare it whole, signed, with 1
+    /// (0x4A1F7A `cmp [esi+0x8C], 1; jg`, 0x4A2373 `cmp [esi+0x8C], ebx` with `ebx = 1` from
+    /// 0x4A21A5), and so does the wheel-effects feed 0x4A2880 (`== 9`, `== 6`, `== 1` at
+    /// 0x4A28B9…0x4A28EC, then hands it on as the mark kind): a patch whose flags word has bits
+    /// above the nibble is not "≤ 1" there even when its nibble is 1.
+    pub zone: u32,
     pub lateral: f32,
     pub longitudinal: f32,
     /// contact-patch slip velocities ×(−16): lateral, vertical, longitudinal
@@ -74,7 +84,10 @@ pub struct Wheel {
     pub sliding: bool,
     /// world position (rendering)
     pub world_pos: Vec3,
-    /// ground height under the probe minus probe height, clamped (`d_i`, wheel+0x64)
+    /// `wheel+0x64`, the ground height under the probe minus the probe's height, **as stored**:
+    /// 0x499F77 `fst`s it before the clamp at −0.30625, which only the copy `Susp_update` keeps
+    /// on the FPU stack gets (0x499F7A…0x499F9B). *(Corrected 2026-09-25: the port stored the
+    /// clamped value.)*
     pub height_d: f32,
     pub airborne: bool,
     pub compression: f32,
@@ -83,6 +96,10 @@ pub struct Wheel {
     pub rough_prev: f32,
     pub rough_target: f32,
     pub rough_phase: f32,
+    /// The wheel's own ground tracker `wheel+4` (`suspension-collision.md` §1.1): `Susp_update`
+    /// runs `Tracker::updateZone(probe, 1)` 0x474060 on it every pass (0x499B64) and takes the
+    /// surface word, the patch normal and `point(0)` from it.
+    pub tracker: PatchTracker,
 }
 
 /// The event a prop contact leaves in `car+0x438` (`sfx.md` §2): `0x50000 | class` for a prop, or
@@ -176,10 +193,33 @@ pub struct Vehicle {
     /// `car+0x52C & 4` is clear — the car is driven by the AI, not a human. The rev limiter's
     /// standing-start branch is the one place the original asks (`physics.md` §4.1).
     pub ai_driven: bool,
-    /// `car+0x52C` bit 7 — the car is **traffic** (`ai.md` §7: the registration at 0x40F160 sets
-    /// 0x80 for traffic, and `AIHigh_Traffic` hangs off it). `Damage_byNormal` 0x494E69 tests it
-    /// and skips the roof zone for a traffic car.
+    /// The port's own marker for the stand-in bodies it builds for its kinematic traffic (the
+    /// caller skips their walls). *(Corrected 2026-09-25:)* this read "`car+0x52C` bit 7, traffic";
+    /// bit 0x80 is the **smackables'** (`ai.md` §6, 0x40F160) — [`Self::smackable`] — and the
+    /// traffic's is 0x10, which none of the physics below tests.
     pub is_traffic: bool,
+    /// `car+0x52C & 0x80` — a **smackable**: a world prop the race gives a car record of its own
+    /// (0x4A17F0, `skill-tests.md` §5.3, `nfs_physics::smackable`). `Damage_byNormal` 0x494E69
+    /// skips the roof zone for one, `Damage`'s crash response hops and spins it harder
+    /// (0x494964, 0x494A0A), `ClampAngVel` 0x4964F4 lets a light one spin to 6.75 turns/s, the
+    /// ground impulse 0x495F30 takes 0.3 of its `j`, and the car–car solver 0x496860 has its own
+    /// branches for it.
+    pub smackable: bool,
+    /// `car+0x44C` — the smackable's material class from its `audioType` (0x4A12D0's switch;
+    /// `kAudPylon` → **0x10**). 0 on every other car: only the smackable setup writes it.
+    pub material_class: u32,
+    /// `car+0x7C` — "disturbed": `RigidBody_init` 0x49B510 sets it, 0x4A1510 clears it on a
+    /// smackable, and the car–car solver sets it again on the smackable's first contact
+    /// (0x4969B8 / 0x4969DB), forcing that contact's `j` non-negative.
+    pub disturbed: bool,
+    /// `car+0x42C` on a smackable — "has been hit": set by the car–car solver when the contact's
+    /// `j` is not negative and the class is 0x10 (0x496A10 / 0x496A2B). The skill test's cone
+    /// count is the number of these (0x425950, 0x416AC0). Never cleared during a race.
+    pub knocked_over: bool,
+    /// `car+0x354`, the collision mass in the original's units (kg / 128, 0x4107CD) — read here
+    /// only for a smackable (`ClampAngVel` 0x4964FD compares it with 0.75, and the wall / prop
+    /// hits hand it to `Damage`'s crash response, 0x494964).
+    pub collision_mass: f32,
     /// Engine wheelspin state (`car+0xDB8 == 2`, clutch slipping / spinning rear axle).
     pub rear_spin: bool,
     /// Body damage per zone 0..100 (`car+0x4E4..`, `Damage` 0x494500). The ring runs **0 front-left,
@@ -196,8 +236,32 @@ pub struct Vehicle {
     /// `Damage` 0x494500: a corner / roof zone crossed 30 this tick → play the crash one-shot
     /// (`RE/notes/suspension-collision.md` §6.5, `sfx.md` §4.3). Cleared by the caller.
     pub crash_sound: bool,
+    /// `word car+0x418`: `Susp_update` writes `nAir > 1` into it every ground pass (0x49A8B3…
+    /// 0x49A8C0); a landing clears it when upright (`cosTilt > 0.9` hard, `> 0.86` resting,
+    /// 0x49C23B / 0x49C2C4 — the `flags & 0x400` exemption is dead, `physics.md` §9); a car–car
+    /// contact steps it for both cars (0x496F1E / 0x496F25); `Damage`'s heavy impact sets it to 1
+    /// (0x4948D5); a reset clears it (0x40F43C). Readers outside this crate: the wrong-way
+    /// counter's hold (0x4A7714), the crash-hold clear (0x40F86D), the reset exit
+    /// (`<= 5`, 0x40F615), the engine sound (`> 5`, 0x4A79E9), 0x412730 and 0x4124AC.
+    pub airborne_count: u16,
+    /// `Car_ground`'s hard-landing event `0x40F020(car, 1, −1, 0, 5, closing, 0)` (0x49C1D6…
+    /// 0x49C1E6), pushed for every car: the closing speed. Taken (and cleared) by the caller.
+    pub landing_sound: Option<f32>,
+    /// `Car_ground`'s roll-over event `0x40F020(car, 1, −1, 4, 3, 40.0, 0)` (0x49C0CE…0x49C0DE).
+    /// Taken (and cleared) by the caller.
+    pub rollover_sound: bool,
+    /// `car+0x348`, the direction of travel: `normalize(vel)` at the end of every `Car_ground`, or
+    /// the body's forward row `car+0x37C` when the velocity is exactly zero (0x49C14F…0x49C341).
+    /// The skid-mark feed 0x4A2880 reads it (0x4A28CB…0x4A291D).
+    pub travel_dir: Vec3,
     pub wheels: [Wheel; 4],
     pub accel_local: Vec3,
+    /// `car+0xD40…+0xD48`, the acceleration in world axes: the physics frame's transpose times
+    /// the local one after the stability assist (0x49F9E6…0x49FA1B). Written only when a wheel
+    /// is on the ground — the no-contact exit 0x49F715 clears `car+0xD4C…+0xD54` and returns
+    /// before it — and zeroed by the resets (0x49E379, 0x410AB5). `Susp_update`'s lateral term
+    /// reads it (0x49A13C).
+    pub accel_world: Vec3,
     pub lateral_filtered: f32,
     pub long_filtered: f32,
     pub gravity_scale: f32,
@@ -229,31 +293,52 @@ pub struct Vehicle {
     pub ground_h: f32,
     pub body_height: f32,
     pub min_height: f32,
-    /// `car+0x3A8`, `+0x3AC`, `+0x3B0` — **half the span of the body points**, which is what
-    /// 0x4A1472…0x4A14A6 computes: the loop walks `car+0x8C + 12i` for `car+0x32C` points,
-    /// keeping a min and a max per axis, and stores `(max − min) × 0.5` for each
-    /// (`[0x5B23F0]` is the 0.5). `Car_physInit` 0x49B510 then only writes them back where they
-    /// already were (0x4107C1). They are the half extents the prop-footprint test reads
-    /// (`RE/AUDIT.md` §B) and the ones the car's drop shadow is cut to (`R3DCar` slot 22,
-    /// 0x43B220). [`Vehicle::fit_half_extents`] is the same computation.
+    /// `car+0x3A8`, `+0x3AC`, `+0x3B0`. For a **racer** they are half the render model's LOD-5
+    /// box, the box holding the model origin — **0x445090** at load (`nfs_game::world::car_body`),
+    /// `× 0.4` for `.TINYCAR` — and nothing re-cuts them: `Car_physInit` 0x49B510 only writes them
+    /// back where they already were (0x4107C1). *(Corrected 2026-09-25: this said every car's were
+    /// half the span of the body points; that re-cut, 0x4A1472…0x4A14A6 in 0x4A1280, runs only
+    /// for a smackable, `car+0x52C & 0x80` at 0x4107A1 — [`Vehicle::fit_half_extents`].)* They
+    /// are the half extents the prop-footprint test reads (`RE/AUDIT.md` §B), the car–car box, the
+    /// wall corners, and the ones the car's drop shadow is cut to (`R3DCar` slot 22, 0x43B220).
     pub half_extents: Vec3,
-    /// The car's collision body points in the body frame, `y = 0` on the wheel contact plane
-    /// (`BndP`, `RE/notes/car-model.md` §12). `0x49ABC0` sorts them ascending by height, so the
-    /// first four are the wheel contact set. Empty falls back to the eight corners of
-    /// [`Self::half_extents`], which is what the port did before the records were decoded.
+    /// `car+0x3AC` as the model is **drawn**: `R3DCar` slot 5, **0x43A410**, returns
+    /// `M[1] · car+0x3AC`, and the draw 0x443490 (0x4434D7) and the view-box test 0x439F90
+    /// (0x43A147) place the model at `car+0x330` minus it ([`Self::draw_origin`]); `R3DObject`'s
+    /// slot 5 (0x444DC0) returns zero. It is also the `y` the `BndP` loader took off every body
+    /// point (0x4421BE), so the body origin `car+0x330` sits this far above the model's ground
+    /// plane. 0 until [`Self::set_car_body`] — the port's older frame, origin on the contact plane.
+    pub body_lift: f32,
+    /// The car's collision body points `car+0x8C` in the body frame (`BndP`,
+    /// `RE/notes/car-model.md` §12), relative to the body origin: for a racer the loader's
+    /// `y −= car+0x3AC` puts the wheel quad [`Self::body_lift`] below it
+    /// ([`Self::set_car_body`]). `0x49ABC0` sorts them ascending by height, so the first four are
+    /// the wheel contact set. Empty falls back to the eight corners of [`Self::half_extents`],
+    /// which is what the port did before the records were decoded.
     pub body_points: Vec<Vec3>,
     /// The `.sim` mass the body-ground impulse divides by (`CarSpecs::mass`), kept so the prop
     /// collider can run it without the specs
     pub sim_mass: f32,
     /// last wall impulse magnitude (car+0x430)
     pub impact: f32,
+    /// The body's own ground tracker `car+8` and the plane `car+0x3E8` / `car+0x400` 0x499520
+    /// keeps from it ([`PatchTracker`]): 0x49AF70 runs it at the head of every physics tick
+    /// ([`Self::step32`]); `Car_ground`'s tilted arm, the 8 m ceiling rule and `Susp_update`'s
+    /// no-patch fallback read it.
+    pub tracker: PatchTracker,
     /// LCG state (the original's `0x5D1028 × 0x5D102C`) for road roughness and the engine's noise.
     rng: u32,
 }
 
 impl Vehicle {
     pub fn new(position: Vec3, orientation: Mat3, specs: &CarSpecs, half_track: f32, wheel_radius: f32) -> Self {
-        let hb = specs.wheelbase * 0.5;
+        Self::bare(position, orientation, specs.wheelbase, specs.mass, half_track, wheel_radius)
+    }
+
+    /// The fields [`Self::new`] fills, from the two numbers of the specs it reads — so a body that
+    /// has no `carSpecs` block (a smackable, `Car_installHandlers` 0x410D9B) can be built too.
+    pub fn bare(position: Vec3, orientation: Mat3, wheelbase: f32, mass: f32, half_track: f32, wheel_radius: f32) -> Self {
+        let hb = wheelbase * 0.5;
         Self {
             position,
             velocity: Vec3::ZERO,
@@ -297,14 +382,24 @@ impl Vehicle {
             traction_control: false,
             ai_driven: false,
             is_traffic: false,
+            smackable: false,
+            material_class: 0,
+            disturbed: true,
+            knocked_over: false,
+            collision_mass: mass / 128.0,
             rear_spin: false,
             damage: [0.0; 10],
             damage_enabled: true,
             damage_pull: 0.0,
             last_wall_class: 5,
             crash_sound: false,
+            airborne_count: 0,
+            landing_sound: None,
+            rollover_sound: false,
+            travel_dir: orientation.row(2),
             wheels: [Wheel::default(); 4],
             accel_local: Vec3::ZERO,
+            accel_world: Vec3::ZERO,
             lateral_filtered: 0.0,
             long_filtered: 0.0,
             gravity_scale: 1.16,
@@ -326,15 +421,52 @@ impl Vehicle {
             body_height: 0.0,
             min_height: 0.0,
             half_extents: Vec3::new(half_track + 0.15, 0.6, hb + 0.9),
+            body_lift: 0.0,
             body_points: Vec::new(),
-            sim_mass: specs.mass,
+            sim_mass: mass,
             impact: 0.0,
+            tracker: PatchTracker::new(Vec3::new(position.x, position.y - wheel_radius, position.z)),
             rng: 0x3ADE_68B1,
         }
     }
 
+    /// The four ground probes `car+0x8C[0…3]` in the body frame: the first four [`Self::body_points`]
+    /// as [`body_points_setup`] (0x49ABC0) leaves them — FL, FR, RL, RR by quadrant. A body with
+    /// fewer than four points (the port's scenarios) takes its tyre bottoms, `wheel_offsets` less
+    /// `ride_height` (port fallback, no original counterpart).
+    fn probe_points(&self) -> [Vec3; 4] {
+        if self.body_points.len() >= 4 {
+            std::array::from_fn(|i| self.body_points[i])
+        } else {
+            std::array::from_fn(|i| {
+                let off = self.wheel_offsets[i];
+                Vec3::new(off.x, off.y - self.ride_height, off.z)
+            })
+        }
+    }
+
+    /// A racer's body as `RCar::load` leaves it (`nfs_game::world::car_body`): the `BndP` points
+    /// already lowered by `car+0x3AC` (0x4421BE) and the half extents of 0x445090. The position
+    /// the car was placed at is taken as the model's ground origin — where the port kept the body
+    /// origin — and the origin `car+0x330` is lifted `M[1]·car+0x3AC` above it, so the model is
+    /// drawn where it was ([`Self::draw_origin`]) and the physics turns about the original's point.
+    pub fn set_car_body(&mut self, points: Vec<Vec3>, half_extents: Vec3) {
+        self.body_points = points;
+        self.half_extents = half_extents;
+        self.position += self.orientation.row(1) * (half_extents.y - self.body_lift);
+        self.body_lift = half_extents.y;
+    }
+
+    /// Where the model is drawn: `car+0x330 − M[1]·car+0x3AC` (`R3DCar` slot 5 0x43A410, the draw
+    /// 0x443490 at 0x4434D7…0x4435A0) — [`Self::body_lift`]; the body origin itself when it is 0.
+    pub fn draw_origin(&self) -> Vec3 {
+        self.position - self.orientation.row(1) * self.body_lift
+    }
+
     /// Re-cut [`Self::half_extents`] to the body points, as **0x4A1472** does: half the span of
-    /// `body_points` on each axis. A car with no points keeps whatever it was built with.
+    /// `body_points` on each axis. A car with no points keeps whatever it was built with. That
+    /// re-cut is a **smackable's** (0x4A1280, reached from 0x4107B6 only when `car+0x52C & 0x80`);
+    /// a racer keeps 0x445090's model box ([`Self::set_car_body`]).
     pub fn fit_half_extents(&mut self) {
         let Some(first) = self.body_points.first().copied() else { return };
         let (mut lo, mut hi) = (first, first);
@@ -349,11 +481,17 @@ impl Vehicle {
     /// `state = prod & 0xFFFF`, `rand16 = (prod >> 8) & 0xFFFF` (`traffic.md` §14.7). The original
     /// keeps **one** stream for the whole game; this crate sits below `nfs-game`, so it carries its
     /// own state with the same arithmetic.
-    /// `ClampAngVel`'s limit in turns/s: 0.75, or 2.25 for a `.TINYCAR` (0x4964D0, 0x49BBA0). The
-    /// 6.75 of a light smackable (`car+0x52C & 0x80` — not the traffic, `ai.md` §6; 0x4964F4) has
-    /// no car in this port.
-    fn ang_limit(&self) -> f32 {
-        if self.tiny { 2.25 } else { 0.75 }
+    /// `ClampAngVel`'s limit in turns/s (0x4964D0, 0x49BBA0): 0.75; 2.25 for a `.TINYCAR`
+    /// (`carinfo+0x518`, tested first, 0x4964E0); **6.75** for a smackable (`car+0x52C & 0x80`)
+    /// whose collision mass `car+0x354` is under 0.75 (0x4964F4…0x496512, `[0x5B49BC]`).
+    pub(crate) fn ang_limit(&self) -> f32 {
+        if self.tiny {
+            2.25
+        } else if self.smackable && self.collision_mass < 0.75 {
+            6.75
+        } else {
+            0.75
+        }
     }
 
     fn rand16(&mut self) -> u32 {
@@ -929,7 +1067,8 @@ impl Vehicle {
     /// contact normal in the body frame (`x = n·right, y = n·up, z = n·forward`).
     ///
     /// The roof zone is gated: 0x494E69 takes it only when `car+0x52C & 0x80` is **clear**, and
-    /// that bit marks a traffic car (`ai.md` §7), so traffic never takes roof damage.
+    /// that bit marks a smackable ([`Self::smackable`]; it read "traffic" here until 2026-09-25 —
+    /// the traffic's bit is 0x10, `ai.md` §6).
     ///
     /// `flag` is `Damage`'s fourth argument — 0 from the body-ground contact (0x49684A), 1 from the
     /// wall collider (0x495563), 2 from the car-car solver (0x496F8E) — and `mass` is the car's
@@ -940,7 +1079,7 @@ impl Vehicle {
         }
         let m = self.orientation;
         let (x, y, z) = (n_world.dot(m.row(0)), n_world.dot(m.row(1)), n_world.dot(m.row(2)));
-        let zone = if y < -0.5 && !self.is_traffic {
+        let zone = if y < -0.5 && !self.smackable {
             8
         } else if x.abs() < 0.1 {
             if z < -0.1 { 1 } else if z > 0.1 { 5 } else { return }
@@ -964,11 +1103,11 @@ impl Vehicle {
     /// the network (`[0x6573E8] == 3 && [0x657408]`, 0x494826) has no race in this port. Past 80
     /// (`[0x5B26D4]`) the amount is taken ×0.125 (`[0x5B272C]`), the body is lifted 0.1 m when it
     /// sits within 0.1 of the ground (`car+0x424`, 0x4948FA), the velocity's `y` gains `a/3` —
-    /// for a traffic car of collision mass under 1, `max(mass, 0.1 + 0.05·rand) · a · 0.33`
+    /// for a smackable of collision mass under 1, `max(mass, 0.1 + 0.05·rand) · a · 0.33`
     /// (0x494964…0x4949D7) — the knock is `min(a/32, 2)` with each axis ×1.2 (×3.0 tiny,
     /// 0x49494E), and a car-car hit (`flag == 2`) with the world spin under 0.5 turns/s on `x`
     /// and `z` draws a new one (0x494A0A…0x494C14): `x, z ∈ [−2.5, 2.5)`, `y ∈ [−1, 1)`, or
-    /// `[−10, 10)` and `[−5, 5)` for traffic or a tiny car. Otherwise the knock is `min(a/32, 0.33)`.
+    /// `[−10, 10)` and `[−5, 5)` for a smackable or a tiny car. Otherwise the knock is `min(a/32, 0.33)`.
     ///
     /// The knock goes on in the body frame (0x494C45…0x494D16): pitch `−k/2` for the front zones
     /// 0…2 and `+k/2` for the rest, yaw and roll `+k/2` for zones 2…4 and `−k/2` for the rest.
@@ -978,9 +1117,12 @@ impl Vehicle {
     /// call ends in `ClampAngVel` 0x49BBA0 (0x494DD4); the car-car solver clamps on its own.
     ///
     /// It also loads the reset countdown `car+0x1100 = 0xC0` (0x4948E6) and, past 120 on a car
-    /// that is not tiny, kills the car (`car+0xDB0 = 0`, 0x4948A6…0x4948C1). Not carried, each
-    /// without a counterpart in this port: `+0x1104 = 1`, `+0x418 = 1`, `+0x450 = 0`
-    /// (0x4948D5…0x4948F0) and the prop's knocked-over `+0x42C` (0x49489A).
+    /// that is not tiny, kills the car (`car+0xDB0 = 0`, 0x4948A6…0x4948C1), and sets
+    /// [`Self::airborne_count`] to 1 (0x4948D5). Not carried, each without a counterpart in this
+    /// port: `+0x1104 = 1`, `+0x450 = 0`
+    /// (0x4948D5…0x4948F0) and `+0x42C = 1` on a car that is **not** a smackable (0x49488C…0x49489A,
+    /// `ebx` = 1 from 0x494516 — read 2026-09-25; `traffic.md` §21.7 listed it as a clear). A
+    /// smackable's `+0x42C` is the solver's ([`Self::knocked_over`]).
     fn crash_response(&mut self, amount: f32, zone: usize, flag: u8, mass: f32) {
         if flag == 0 {
             return;
@@ -1002,16 +1144,18 @@ impl Vehicle {
             }
             let k = (a * 0.031_25).min(2.0);
             let m = if self.tiny { 3.0 } else { 1.2 };
-            self.velocity.y += if self.is_traffic && mass < 1.0 {
+            self.velocity.y += if self.smackable && mass < 1.0 {
                 let t = self.rand16() as f32 * 0.05 * 1.525_878_9e-5 + 0.1;
                 mass.max(t) * a * 0.33
             } else {
                 a * 0.333_333_34
             };
             self.reset_countdown = 0xC0;
+            // 0x4948D5: `word car+0x418 = 1` (`ebx`)
+            self.airborne_count = 1;
             let w = self.angular_velocity;
             if flag == 2 && w.x.abs() < 0.5 && w.z.abs() < 0.5 {
-                let big = self.is_traffic || self.tiny;
+                let big = self.smackable || self.tiny;
                 let (h, v) = if big { (20.0, 10.0) } else { (5.0, 2.0) };
                 let x = self.rand16() as f32 * h * 1.525_878_9e-5 - h * 0.5;
                 let y = self.rand16() as f32 * v * 1.525_878_9e-5 - v * 0.5;
@@ -1170,7 +1314,8 @@ impl Vehicle {
             } else if !ai {
                 true
             } else {
-                w.surface <= 1 && class != 2
+                // 0x4A2373: the whole word against 1
+                w.zone <= 1 && class != 2
             };
             if lock {
                 // §4 Slide: kinetic friction opposing the slip velocity, no back-rotation (original)
@@ -1220,7 +1365,7 @@ impl Vehicle {
         let spin = (w.longitudinal.abs() > limit && throttle_raw > 0x80) || (!front && rear_spin);
         let k = if !front && spin { 4.0 } else { k_class };
         if comb > limit && comb > 0.0 {
-            let hard = (tcs && !front && slip_tangent.abs() < 0.15) || (ai && (w.surface > 1 || class == 2));
+            let hard = (tcs && !front && slip_tangent.abs() < 0.15) || (ai && (w.zone > 1 || class == 2));
             if hard {
                 let s = limit / comb;
                 w.slip = 0.0;
@@ -1289,12 +1434,8 @@ impl Vehicle {
     /// §6.3, HIGH): body corners below the contact plane take a normal impulse with surface friction
     /// `k`. `invM = 1/mass`, `invI = 1/(6·mass)` (`Car_physInit` 0x49B510, CONFIRMED). The stored
     /// angular velocity is in turns/s and is converted to rad/s the way the original does.
-    /// `car+0x428` (mean of the three lowest body points) is approximated by `body_height` (MEDIUM).
-    fn body_ground_collide(&mut self, specs: &CarSpecs, n: Vec3, plane_pt: Vec3, k: f32) {
-        self.body_ground_collide_mass(specs.mass, n, plane_pt, k);
-    }
-
-    fn body_ground_collide_mass(&mut self, mass: f32, n: Vec3, plane_pt: Vec3, k: f32) {
+    /// `car+0x428` is [`Self::min_height`] from [`Self::body_height_on`].
+    pub(crate) fn body_ground_collide_mass(&mut self, mass: f32, n: Vec3, plane_pt: Vec3, k: f32) {
         let m = self.orientation;
         let (hw, hh, hl) = (self.half_extents.x, self.half_extents.y, self.half_extents.z);
         let (bx, by, bz) = (m.row(0), m.row(1), m.row(2));
@@ -1335,7 +1476,14 @@ impl Vehicle {
         let denom = 0.25 * inv_m + inv_i * r.cross(n).length();
         let mut j = if denom > 1e-6 { -vrel / denom } else { 0.0 };
         let min_extent = hw.min(hh).min(hl);
-        j *= if min_extent > 1.5 { 0.6 / min_extent } else { 0.4 };
+        // a smackable's `j` is scaled by 0.3 whatever its size (0x495F30, `flags & 0x80`)
+        j *= if self.smackable {
+            0.3
+        } else if min_extent > 1.5 {
+            0.6 / min_extent
+        } else {
+            0.4
+        };
         self.impact = self.impact.max(self.velocity.dot(n).abs());
         if k > 0.0 {
             // friction along the contact plane, limited so it cannot reverse the tangential motion
@@ -1353,8 +1501,10 @@ impl Vehicle {
         } else {
             self.velocity += n * (j * 0.5 * inv_m);
             w += r.cross(n * j) * (2.0 * inv_i);
-            // settle a car resting on its body
-            if (self.cos_tilt < 0.2 || min_extent < 0.0) && self.body_height < 0.005 && vrel.abs() < 10.0 && w.abs().max_element() < 1.0 {
+            // settle a body resting on its points:
+            // `(cosTilt < 0.2 or flags & 0x80) and car+0x428 < 0.005` (§6.3), `car+0x428` being
+            // [`Self::min_height`] (`BodyHeight` 0x49A900, [`Self::body_height_on`])
+            if (self.cos_tilt < 0.2 || self.smackable) && self.min_height < 0.005 && vrel.abs() < 10.0 && w.abs().max_element() < 1.0 {
                 w *= 0.75;
                 self.velocity *= 0.95;
             }
@@ -1372,10 +1522,242 @@ impl Vehicle {
         self.damage_by_normal(effect, n, 0, mass);
     }
 
+    /// `BodyHeight` 0x49A900 (car, &n, &q) — read 2026-09-25, CONFIRMED: the height of the body's
+    /// lowest points above the plane through `q` with normal `n`, measured on the world collision
+    /// points `car+0x1DC` (`0x49AE30`: `M·car+0x8C[i] + pos`). `d = (p − q)·n` (0x532330 /
+    /// 0x532910) goes into a four-slot ascending list that starts at 1000 (0x49A917…0x49A92F,
+    /// `0x447A0000`).
+    ///
+    /// * **Upright** — `car+0x3A0 > 0.939` (`[0x5B4A0C]`, the previous `Car_ground`'s) and not a
+    ///   smackable (0x49A90A…0x49A949): the **first four** points only (the counter at
+    ///   0x49A95D), which 0x49ABC0 leaves as the four lowest `BndP` points — the tyre contact set.
+    ///   `car+0x424` **and** `car+0x428` both get `½·(mean + min)` of them
+    ///   (`[0x5B2468]` = 0.25, `[0x5B23F0]` = 0.5, 0x49AA23…0x49AA4C).
+    /// * **Tilted, or a smackable** (0x49AA57): all `car+0x32C` points; `car+0x424` = the lowest,
+    ///   `car+0x428` = the mean of the three lowest (`[0x5B2680]` = 1/3, 0x49AB33…0x49AB52).
+    ///
+    /// `Susp_update` 0x499A70 hands it its own ground normal and `Σc/4`, the mean of the four
+    /// wheel contact points (0x49A8CF…0x49A8DD; the same vector whose `.y` it returns);
+    /// `Susp_AI` 0x4998C0 the tracker's normal and plane point `car+0x400` (0x499934).
+    ///
+    /// A body with no [`Self::body_points`] (the port's scenarios) measures its four tyre-bottom
+    /// points, which is what the first four `BndP` points are on a real car (port fallback).
+    pub(crate) fn body_height_on(&mut self, n: Vec3, q: Vec3) {
+        let mt = self.orientation.transpose();
+        let upright = self.cos_tilt > 0.939 && !self.smackable;
+        let fallback = self.probe_points();
+        let pts: &[Vec3] = if self.body_points.is_empty() { &fallback } else { &self.body_points };
+        let pts = if upright { &pts[..pts.len().min(4)] } else { pts };
+        let mut low = [1000.0f32; 4];
+        for p in pts {
+            let d = (self.position + mt * *p - q).dot(n);
+            // 0x49A998…0x49AA0F: shift down from the first slot `d` is not above
+            if let Some(k) = low.iter().position(|l| d <= *l) {
+                low[k..].rotate_right(1);
+                low[k] = d;
+            }
+        }
+        if upright {
+            let v = ((low[0] + low[1] + low[2] + low[3]) * 0.25 + low[0]) * 0.5;
+            self.body_height = v;
+            self.min_height = v;
+        } else {
+            self.body_height = low[0];
+            self.min_height = (low[0] + low[1] + low[2]) * (1.0 / 3.0);
+        }
+    }
+
+    /// `ClampAngVel` 0x49BBA0: each component of the world spin `car+0x388` to ±[`Self::ang_limit`]
+    /// (0.75; 2.25 for a `.TINYCAR`; 6.75 for a smackable lighter than 0.75, 0x49BBAA…0x49BBE2) —
+    /// per component, not on the length.
+    fn clamp_ang_vel(&mut self) {
+        let lim = self.ang_limit();
+        self.angular_velocity = self.angular_velocity.clamp(Vec3::splat(-lim), Vec3::splat(lim));
+    }
+
+    /// `Susp_applyLift` 0x49AEC0 (car, dy): after `Car_ground` moved the body by `dy`, each wheel's
+    /// compression `wheel+0x68` (`car+0x820 + 0xC4·i`) becomes `c = compr − dy·M[1].y` (`car+0x374`),
+    /// clamped to `(i < 2 ? 0.9 : 0.75)·(specs[0x124] − specs[0x120])` above 0 and to
+    /// `−specs[0x124]` below (0x49AEE0…0x49AF50). `travel` is `(specs[0x120], specs[0x124])`;
+    /// `None` is the smackable's early return (0x49AEC5).
+    fn susp_apply_lift(&mut self, dy: f32, travel: Option<(f32, f32)>) {
+        let Some((probe, bump)) = travel else { return };
+        let up_y = self.orientation.row(1).y;
+        for (i, w) in self.wheels.iter_mut().enumerate() {
+            let c = w.compression - dy * up_y;
+            w.compression = if c > 0.0 { c.min(if i < 2 { 0.9 } else { 0.75 } * (bump - probe)) } else { c.max(-bump) };
+        }
+    }
+
+    /// `Car_ground` 0x49BD40 from the gravity on (0x49BE53…0x49C344), the part a car and a
+    /// smackable share — read 2026-09-25, CONFIRMED. The caller has run `Susp_update` 0x499A70 (a
+    /// car) or `Susp_AI` 0x4998C0 (a smackable, `car+0x52C & 0x80`), set [`Self::cos_tilt`]
+    /// (`car+0x3A0 = N·M[1]`), [`Self::body_height`] (`car+0x424`) and [`Self::min_height`]
+    /// (`car+0x428`), and works out `dh = (h − car+0x41C)·rateHz`. `n` / `q` are the tracker's
+    /// patch normal and plane point (`car+0x400`), `surf` the surface nibble `car+0x2C & 0xF`,
+    /// `mass` the body's for `BodyGroundCollide`, `travel` [`Self::susp_apply_lift`]'s.
+    ///
+    /// * gravity `0.30625 · nTicks · car+0x84` while `car+0x428 > 0.005` or the car is a
+    ///   `.TINYCAR` (0x49BE59…0x49BE97); `vy` is the velocity after it, `closing = dh − vy`
+    ///   (0x49BF36);
+    /// * the **tilted test** — `cosTilt < 0.939` (0x49BF48), or any smackable (0x49BF55) — asks
+    ///   `car+0x424 < 0.001` (0x49BF62). When it holds: `BodyGroundCollide` 0x496610 with the
+    ///   surface's friction `0x5D0B94[surf][0]`, **0.1** instead when `cosTilt < 0.707` on a car
+    ///   that is not a smackable (0x49BFC0…0x49BFE8); a car left upside down (`cosTilt < 0`) dies
+    ///   (`car+0xDB0 = 0`, 0x49C01B); and when `cosTilt < 0.707` and `vy < −2` a bounce
+    ///   `vel.y −= 0x5D0B98[surf] · vy` with ×0.95 on `vel.x`, `vel.z` and the spin
+    ///   (0x49C038…0x49C08D) — `vy` is reloaded at 0x49BF87 and is the value **before** the
+    ///   impulse, not `closing`;
+    /// * otherwise (upright, or the test failed) the **upright arm** 0x49C19A: `closing > 6` and
+    ///   `car+0x424 < −0.05` is a hard landing — `lift = −0.05 − car+0x424`, `car+0x424 = −0.05`,
+    ///   `pos.y += lift`, `Susp_applyLift(lift)`, `car+0xAD0 = closing`,
+    ///   `vel.y = 0.4 · 0x5D0B98[surf] · closing + dh`, `ClampAngVel` (0x49C1D6…0x49C270);
+    ///   `closing ≤ 6` and `car+0x424 < 0.005` sets the body on the plane — `pos.y −= car+0x424`,
+    ///   `car+0x424 = 0`, `vel.y = dh` unless both `vy` and `dh` are positive, then the larger —
+    ///   and `Susp_applyLift(−car+0x424_old)` (0x49C27D…0x49C321);
+    /// * then always (0x49C0F4…0x49C149) the **8 m ceiling rule**: when the enclosure test
+    ///   0x473330 finds a patch more than 3.5 m overhead with a non-zero word, the body is rising
+    ///   and `pos.y − car+0x404 > 8`, `vel.y = −vel.y`.
+    ///
+    /// Also (read 2026-09-25): the hard landing runs 0x493DD0 for the human car
+    /// ([`Self::landing_reset`]) and pushes the landing event ([`Self::landing_sound`]); both
+    /// landings clear [`Self::airborne_count`] when upright; in the tilted arm a car upside down
+    /// (`cosTilt < −0.86`) with damage on, roof damage `car+0x504` under 40 and still racing
+    /// (`car+0xB50 == 0`) pushes the roll-over event and has its roof damage **set to 40**
+    /// (0x49C095…0x49C0E6); last, [`Self::travel_dir`] (`car+0x348`). Dead, so not carried:
+    /// `car+0x40C = (dh − car+0x420 + 7·car+0x40C)/8`, `car+0x420 = dh` (0x49BF08…0x49BF30) and
+    /// `car+0xAD0 = closing` — nothing but the resets (0x40F461 / 0x40F473, 0x49B6BC / 0x49B6D4,
+    /// 0x410D10…0x410D1C) touches them; nor is `car+0x88 = tick` (0x49C105), which has no reader found.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn car_ground_body(&mut self, dh: f32, n: Vec3, q: Vec3, surf: usize, mass: f32, travel: Option<(f32, f32)>, grid: &TriangleGrid) {
+        if self.min_height > 0.005 || self.tiny {
+            self.velocity.y -= GRAVITY / 32.0 * self.gravity_scale;
+        }
+        let vy = self.velocity.y;
+        let closing = dh - vy;
+        let surf = surf & 15;
+        if (self.cos_tilt < 0.939 || self.smackable) && self.body_height < 0.001 {
+            let k = if self.cos_tilt < 0.707 && !self.smackable { 0.1 } else { SURFACE_BOUNCE[surf][0] };
+            self.body_ground_collide_mass(mass, n, q, k);
+            // 0x49C005…0x49C01B: left upside down by the contact, the car is dead
+            if self.cos_tilt < 0.0 {
+                if self.engine_alive != 0 {
+                    self.engine_kill = 2;
+                }
+                self.engine_alive = 0;
+            }
+            if self.cos_tilt < 0.707 && vy < -2.0 {
+                self.velocity.y -= SURFACE_BOUNCE[surf][1] * vy;
+                self.velocity.x *= 0.95;
+                self.velocity.z *= 0.95;
+                self.angular_velocity *= 0.95;
+            }
+            // 0x49C095…0x49C0E6: rolled over with damage on (`[0x657A2C]`), roof under 40, still
+            // racing — the roll-over event, and the roof damage is set to 40
+            if self.damage_enabled && self.cos_tilt < -0.86 && self.damage[8] < 40.0 && self.race_state == 0 {
+                self.rollover_sound = true;
+                self.damage[8] = 40.0;
+            }
+        } else if closing > 6.0 {
+            if self.body_height < -0.05 {
+                // hard landing: the human's 0x493DD0 (`flags & 1`, 0x49C1C4), the event
+                if self.is_human() {
+                    self.landing_reset();
+                }
+                self.landing_sound = Some(closing);
+                let lift = -0.05 - self.body_height;
+                self.body_height = -0.05;
+                self.position.y += lift;
+                self.susp_apply_lift(lift, travel);
+                // 0x49C223…0x49C23B
+                if self.cos_tilt > 0.9 {
+                    self.airborne_count = 0;
+                }
+                // `car+0x430` is not written here — the original stores the closing speed in the
+                // dead `car+0xAD0`; the event is [`Self::landing_sound`]
+                self.velocity.y = 0.4 * SURFACE_BOUNCE[surf][1] * closing + dh;
+                self.clamp_ang_vel();
+            }
+        } else if self.body_height < 0.005 {
+            // resting / soft landing: follow the ground
+            let old = self.body_height;
+            self.position.y -= old;
+            self.body_height = 0.0;
+            // 0x49C2B1…0x49C2C4
+            if self.cos_tilt > 0.86 {
+                self.airborne_count = 0;
+            }
+            self.height_marker = 0.0;
+            self.velocity.y = if vy <= 0.0 || dh <= 0.0 { dh } else { vy.max(dh) };
+            self.susp_apply_lift(-old, travel);
+        }
+        // the 8 m ceiling rule; the enclosure test walks the whole quadtree cell, so no depth limit
+        if self.velocity.y > 0.0
+            && self.position.y - q.y > 8.0
+            && grid.ceiling(self.position.x, self.position.y, self.position.z, 3.5, 1.0e6).is_some_and(|h| h.surface & 0xFFFF != 0)
+        {
+            self.velocity.y = -self.velocity.y;
+        }
+        // `car+0x348` (0x49C14F…0x49C341, 0x5328D0)
+        self.travel_dir = if self.velocity == Vec3::ZERO { self.orientation.row(2) } else { self.velocity.normalize() };
+    }
+
+    /// `flags & 1`, the human-driven car — in this port's fields, one that is neither AI-driven,
+    /// traffic nor a smackable (the port keeps no flags word).
+    pub fn is_human(&self) -> bool {
+        !self.ai_driven && !self.is_traffic && !self.smackable
+    }
+
+    /// `PostHit` 0x493E40 (car) — read 2026-09-25, CONFIRMED: after a wall (0x494351) or a solid
+    /// prop (0x498588) hit, `vel *= 0.998` (`0x3F7F7CEE`, 0x493E4D), the body-frame velocity
+    /// `car+0xD58…+0xD60` from the body rows `car+0x364…` (0x493E5A…0x493E8D), the speed estimate
+    /// `car+0x35C` (the port works it out where it is read), and **for the human**
+    /// (`car+0x52C & 4`, 0x493EF1 — the human's flags 0x105 carry it, an opponent's 0x10B does not)
+    /// 0x493DD0 ([`Self::landing_reset`]). *(Corrected 2026-09-25: the notes had "AI cars call
+    /// 0x493DD0".)*
+    fn post_hit(&mut self) {
+        self.velocity *= 0.998;
+        self.v_local = self.orientation * self.velocity;
+        if self.is_human() {
+            self.landing_reset();
+        }
+    }
+
+    /// 0x493DD0 (car) — read 2026-09-25, CONFIRMED: the body-frame velocity `car+0xD58` /
+    /// `+0xD60` from the physics frame rows `car+0x490` / `+0x4A8` (0x493DD6…0x493DFC; the `|vz|`
+    /// it works out goes nowhere), the slip tangent `car+0xDC0 = 0`, every wheel's airborne flag
+    /// `wheel+0x84 = 0` (`car+0x870 + 0xC4·i`) and the wheelspin state `car+0xDB8 = 0`
+    /// (0x493E1A…0x493E37). Callers: `Car_ground`'s hard landing for the human (0x49C1CE),
+    /// [`Self::post_hit`] for the human (0x493EF6) and the crash counter 0x40F740 (0x40F8DB) —
+    /// the last not wired: it runs for the human only when the impact `car+0x430` is non-zero, no
+    /// other car is recorded (`car+0x434 == 0`) and the impact is above `[0x5B2730]` =
+    /// **6553600.0** (0x40F891…0x40F8DB), which no hit in the game reaches.
+    pub fn landing_reset(&mut self) {
+        let f = self.frame;
+        self.v_local.x = f.row(0).dot(self.velocity);
+        self.v_local.z = f.row(2).dot(self.velocity);
+        self.slip_tangent = 0.0;
+        for w in &mut self.wheels {
+            w.airborne = false;
+            w.contact = true;
+        }
+        self.rear_spin = false;
+    }
+
     /// `Susp_update` 0x499A70 + `Car_ground` 0x49BD40 (CONFIRMED, `RE/notes/suspension-collision.md` §3–4).
     /// Wheel reference points (tyre bottoms) probe the ground; pitch/roll rates are driven by the
     /// front/rear and left/right contact height differences; the body follows the contact plane.
     fn ground_contact(&mut self, grid: &TriangleGrid, specs: &CarSpecs) {
+        let h = self.susp_update(grid, specs);
+        let up = self.orientation.row(1);
+        self.car_ground_rest(h, up, grid, specs);
+    }
+
+    /// `Susp_update` 0x499A70 (car, &normalOut) → the ground height `(Σc/4).y`
+    /// (`RE/notes/suspension-collision.md` §3): the four wheel probes, the compression, the
+    /// suspension vectors, the ground normal ([`Self::ground_normal`]), the pitch / roll rates,
+    /// `car+0x418` and `BodyHeight` 0x49A900 into `car+0x424` / `+0x428`.
+    fn susp_update(&mut self, grid: &TriangleGrid, specs: &CarSpecs) -> f32 {
         let m = self.orientation; // rows = body axes in world space
         let mt = m.transpose();
         let up = m.row(1);
@@ -1384,50 +1766,100 @@ impl Vehicle {
         let mut susp_y = [0f32; 4];
         let mut n_air = 0;
         let mut heights = [0f32; 4];
+        let probes = self.probe_points();
         for i in 0..4 {
-            let off = self.wheel_offsets[i];
-            // tyre-bottom reference point (wheel centre minus the radius along body up)
-            let world_pt = self.position + mt * Vec3::new(off.x, off.y - self.ride_height, off.z);
+            // the world collision point `car+0x1DC + 12i` (0x49AE30: `pos + Σ p_k·M[k]`) of body
+            // point i, which 0x49ABC0 left as wheel i's ground reference (0x499AD4…0x499B13)
+            let world_pt = self.position + mt * probes[i];
             let probe = world_pt + Vec3::new(0.0, specs.probe_offset * up.y, 0.0);
-            let hit = grid.ground(probe.x, probe.y + 4.0, probe.z, 8.0 + 4.0);
-            let h_i = match hit {
-                Some(h) if h.surface & 0xF != 0 && (h.point.y - self.position.y).abs() < 4.0 => {
-                    let surface = (h.surface as usize) & 0xF;
-                    self.wheels[i].surface = if self.rally && (surface == 1 || surface == 10) { 2 } else { surface };
-                    h.point.y
+            // the wheel's tracker (0x499B64 `updateZone(probe, 1)`); its zone word — 0 with no
+            // patch — is the wheel's surface `wheel+0x8C` on **both** branches (0x499B86…0x499BA7,
+            // `RALLY` turning nibbles 1 and 10 into 2)
+            self.wheels[i].tracker.update_zone(grid, probe);
+            let nibble = (self.wheels[i].tracker.word & 0xF) as usize;
+            let zone = if self.rally && (nibble == 1 || nibble == 10) { 2 } else { self.wheels[i].tracker.word & 0xFFFF };
+            self.wheels[i].zone = zone;
+            self.wheels[i].surface = (zone & 0xF) as usize;
+            // 0x494480: no surface nibble ⇒ 1; the patch plane more than 4 m from the body's
+            // `car+0x334` ⇒ 2 (0x4944CB…0x4944F0, `[0x5B2404]`); else 0, the patch branch
+            let patch_h = if nibble == 0 {
+                None
+            } else {
+                self.wheels[i].tracker.patch_height(probe.x, probe.z).filter(|h| (h - self.position.y).abs() <= 4.0)
+            };
+            let h_i = match patch_h {
+                Some(h) => {
+                    // road roughness (0x499730), added on the patch branch only
+                    let speed_est = {
+                        let (a, b) = (self.v_local.x.abs(), self.v_local.z.abs());
+                        a.max(b) + 0.25 * a.min(b)
+                    };
+                    let mut h = h + self.roughness(i, speed_est);
+                    // the front wheels' wobble from suspension damage (0x499C8B…0x499CC1):
+                    // `SuspDamage(car)·sin(6.28318·(0.5·i + wheel+0x88))·(1/1500)` — 0x493BC0,
+                    // `[0x5B23F0]` 0.5, `[0x5B4A08]` 6.28318, the double `[0x5B4A00]` 1/1500
+                    if i < 2 {
+                        let arg = (0.5 * i as f32 + self.wheels[i].rotation) * 6.283_18;
+                        h += self.suspension_wear(specs) * arg.sin() * (1.0 / 1500.0);
+                    }
+                    h
                 }
-                _ => self.ground_h,
+                // no usable patch: the kept plane `car+0x3E8` / `car+0x400` (0x499BC4…0x499C2E),
+                // with no roughness — the branch jumps straight to the sum at 0x499CC9
+                None => self.tracker.plane_height(probe.x, probe.z),
             };
-            // road roughness (0x499730), added to the probed ground height
-            let speed_est = {
-                let (a, b) = (self.v_local.x.abs(), self.v_local.z.abs());
-                a.max(b) + 0.25 * a.min(b)
-            };
-            let h_i = h_i + self.roughness(i, speed_est);
+            // the plane's normal the branch used, `wheel+0x4C` (0x499D0F…0x499D12): the tracker's
+            // on the patch branch, `car+0x3E8` or `(0, 1, 0)` on the fallback
+            let n_i = if patch_h.is_some() { self.wheels[i].tracker.normal } else { self.tracker.fallback_normal() };
+            let (vel, acc, row0) = (self.velocity, self.accel_world, m.row(0));
             let w = &mut self.wheels[i];
             heights[i] = h_i;
             contacts[i] = Vec3::new(probe.x, h_i, probe.z);
             w.world_pos = Vec3::new(probe.x, h_i + self.ride_height, probe.z);
-            // compression (feeds the wheel render height only)
-            let c = (h_i - probe.y) * up.y;
+            // compression (feeds the wheel render height only), and the wheel's stiffness: 1.0,
+            // or **1.25** when the compression is past twice its cap (0x499DD6…0x499DE7 front,
+            // 0x499E14…0x499E25 rear; `stiff[4]` at `[esp+0x9C]`, 1.0 each at 0x499A81)
+            // `c = (contact − probe)·M[1]`, and −0.1 when `M[1].y < 0.3` (0x499D78…0x499D90,
+            // `[0x5B25F0]` / `[0x5B2444]`)
+            let c = if up.y < 0.3 { -0.1 } else { (h_i - probe.y) * up.y };
+            let mut stiff = 1.0;
             if c > 0.0 {
                 let cmax = if i < 2 { 0.9 } else { 0.75 } * (specs.bump_travel - specs.probe_offset);
+                if c > 2.0 * cmax {
+                    stiff = 1.25;
+                }
                 w.compression = c.min(cmax);
             } else {
                 let c = c.max(-(if w.airborne { 1.65 } else { 1.6 }) * specs.bump_travel);
                 w.compression = 0.5 * (c + w.compression);
             }
-            let d_i = (h_i - probe.y).max(-0.30625);
-            w.height_d = d_i;
+            w.height_d = h_i - probe.y;
+            let d_i = w.height_d.max(-0.30625);
             let v_y = s_sign * d_i * up.y;
             if d_i < -0.2041667 {
                 w.airborne = true;
                 n_air += 1;
                 // `.TINYCAR` keeps the whole of it (0x49A01B skips the ×0.8)
-                susp_y[i] = if self.tiny { v_y } else { v_y * 0.8 };
+                susp_y[i] = stiff * if self.tiny { v_y } else { v_y * 0.8 };
             } else {
+                // **The lateral term** (0x49A050…0x49A1A7): with the velocity's `|x|` and `|z|`
+                // both over 0.01 (`[0x5B27A8]`, `test ah,0x41; jne` skips at ≤), `u = normalize(−vx,
+                // 0, −vz)`, `u' = (n_i × u) × n_i` (0x532880 twice — the ground-plane direction
+                // against the motion), `k = 0.0666667·|vel·M[0]|` (`[0x5B49EC]`) when the wheel
+                // hung last tick (`wheel+0x84` is read before 0x49A1AC clears it) or
+                // `0.0625·|car+0xD40·M[0]|` (`[0x5B26A4]`) — positive either way, the `fchs` at
+                // 0x49A11F / 0x49A163 takes the absolute value — and `(k·u')·M[1]` is added to
+                // `susp.y` **after** the stiffness (0x49A1DA `fadd st(1)`). Anything else leaves the
+                // 0.0 pushed at 0x499F60.
+                let mut lat = 0.0;
+                if vel.x.abs() > 0.01 && vel.z.abs() > 0.01 {
+                    let u = Vec3::new(-vel.x, 0.0, -vel.z).normalize();
+                    let u2 = n_i.cross(u).cross(n_i);
+                    let k = if w.airborne { 0.066_666_67 * vel.dot(row0).abs() } else { 0.0625 * acc.dot(row0).abs() };
+                    lat = (u2 * k).dot(up);
+                }
                 w.airborne = false;
-                susp_y[i] = v_y;
+                susp_y[i] = stiff * v_y + lat;
             }
             w.contact = !w.airborne;
         }
@@ -1446,6 +1878,8 @@ impl Vehicle {
             n_air = 4;
         }
         self.ground_normal = n;
+        // 0x49A8AA…0x49A8C0: `word car+0x418 = nAir > 1` (after `nAir = 4` for a steep normal)
+        self.airborne_count = u16::from(n_air > 1);
         // pitch / roll rate kinematics
         if self.cos_tilt < 0.707 {
             self.dive *= 0.5;
@@ -1466,60 +1900,49 @@ impl Vehicle {
             let wr = (specs.roll_ret * w_body.z + rr).clamp(-0.75, 0.75);
             let wy = w_body.y.clamp(-0.75, 0.75);
             self.angular_velocity = mt * Vec3::new(wp, wy, wr);
+            // 0x49A756…0x49A8A4: on two wheels — some wheel hangs but not a wheel on **each** side
+            // (left = wheels 0 / 2, `car+0x83C` / `+0x9C4`; right = 1 / 3, `+0x900` / `+0xA88`) —
+            // the body is shifted by `Mᵀ·v/32` (`[0x5B24B8]`), `v = (−2·sin(2π·wr)·halfW,
+            // −2·cos(2π·wr)·halfH, 0)` (`[0x5B2628]` = −2, 0x5327E0 / 0x5327F0 take turns, the
+            // clamped roll rate `car+0xD6C`, the half extents `car+0x3A8` / `+0x3AC`), `v.y` negated
+            // when the left side hangs and `wr < 0` or the right side hangs and `wr > 0`
+            let left_air = self.wheels[0].airborne || self.wheels[2].airborne;
+            let right_air = self.wheels[1].airborne || self.wheels[3].airborne;
+            if n_air > 0 && !(left_air && right_air) {
+                let a = wr * 6.283_184_5;
+                let mut v = Vec3::new(-2.0 * a.sin() * self.half_extents.x, -2.0 * a.cos() * self.half_extents.y, 0.0);
+                if (left_air && wr < 0.0) || (right_air && wr > 0.0) {
+                    v.y = -v.y;
+                }
+                self.position += mt * v * (1.0 / 32.0);
+            }
         }
-        // body height above the contact plane (BodyHeight 0x49A900): heights of the wheel points
-        let mut mean = 0.0;
-        let mut min = f32::MAX;
-        for w in &self.wheels {
-            let hh = -w.height_d;
-            mean += hh * 0.25;
-            min = min.min(hh);
-        }
-        // height_d is clamped at −0.30625 so an airborne car reads ≥ 0.2 here
-        self.body_height = 0.5 * (mean + min);
-        self.min_height = min;
+        // body height above the contact plane: `BodyHeight` 0x49A900 on Susp_update's normal and
+        // `Σc/4` (0x49A8CF…0x49A8DD), over the body points (`Self::body_height_on`)
+        let centre = (contacts[0] + contacts[1] + contacts[2] + contacts[3]) * 0.25;
+        self.body_height_on(n, centre);
         self.height_marker = if self.body_height > 0.05 { self.body_height } else { 0.0 };
+        h
+    }
 
-        // ---- Car_ground 0x49BD40 (upright branch; tilted cars are damped instead of the body impulse) ----
+    /// `Car_ground` 0x49BD40 after its `Susp_update` call, `h` that call's height.
+    fn car_ground_rest(&mut self, h: f32, up: Vec3, grid: &TriangleGrid, specs: &CarSpecs) {
+        // ---- Car_ground 0x49BD40 from 0x49BDBD on (`RE/notes/suspension-collision.md` §4.2) ----
+        // `Lod_shouldUpdate` 0x414B10 hands a racer the full rate: 0x417190 leaves `car+0x78` 0
+        // for the human (`flags & 1`, 0x4171A5) and the octagonal distance to the nearest racer
+        // `0x5E8E2C[]` for anyone else, which for a racer is itself (0); the player also has the
+        // force flag `car+0x10B8` (0x406E7F). Every car this runs for is a racer, so
+        // `rateHz = 32`, `nTicks = 1` always (0x5CC700 / 0x5CC71C at index 6).
         let dh = (h - self.ground_h) * 32.0;
         self.ground_h = h;
-        // 0x49BE59…0x49BE8B: gravity while the lowest point is off the ground (`car+0x428` past
-        // `[0x5B2738]`) — and always for a `.TINYCAR` (0x49BE75)
-        if self.min_height > 0.005 || self.tiny {
-            self.velocity.y -= GRAVITY / 32.0 * self.gravity_scale;
-        }
-        let closing = dh - self.velocity.y;
-        let surf = self.wheels[0].surface & 15;
+        // `car+0x2C & 0xF`, the car tracker's zone word (0x49BF96, 0x49C244)
+        let surf = (self.tracker.word & 15) as usize;
         // physics frame (0x49BA30): row0 body x, row1 ground normal, row2 body z, re-orthogonalised
         self.cos_tilt = self.ground_normal.dot(up);
-        if self.cos_tilt >= 0.939 {
-            if closing > 6.0 && self.body_height < -0.05 {
-                // hard landing
-                let lift = -0.05 - self.body_height;
-                self.position.y += lift;
-                self.body_height = -0.05;
-                self.velocity.y = 0.4 * SURFACE_BOUNCE[surf][1] * closing + dh;
-                self.angular_velocity = self.angular_velocity.clamp_length_max(0.75);
-                self.impact = closing;
-            } else if closing <= 6.0 && self.body_height < 0.005 {
-                // resting / soft landing: follow the ground
-                self.position.y -= self.body_height;
-                self.body_height = 0.0;
-                self.height_marker = 0.0;
-                self.velocity.y = if self.velocity.y <= 0.0 || dh <= 0.0 { dh } else { self.velocity.y.max(dh) };
-            }
-        } else if self.body_height < 0.01 {
-            // tilted car with the body on the ground: the impulse of §6.3 instead of plain damping
-            let plane_pt = Vec3::new(self.position.x, h, self.position.z);
-            self.body_ground_collide(specs, self.ground_normal, plane_pt, SURFACE_BOUNCE[surf][0]);
-            // 0x49C005…0x49C01B: left upside down by the contact, the car is dead
-            if self.cos_tilt < 0.0 {
-                if self.engine_alive != 0 {
-                    self.engine_kill = 2;
-                }
-                self.engine_alive = 0;
-            }
-        }
+        // the tilted arm's `BodyGroundCollide` takes the car tracker's normal (0x474420,
+        // 0x49BFB3) and the patch centre `car+0x400` (0x49BF77); the ceiling rule `car+0x404`
+        let (tn, tq) = (self.tracker.normal, self.tracker.plane_point);
+        // the physics frame 0x49BA30 comes before the arms (0x49BE4E), so 0x493DD0 reads it
         let n = self.ground_normal;
         let mut z = self.orientation.row(2);
         let mut x = self.orientation.row(0);
@@ -1528,10 +1951,14 @@ impl Vehicle {
             z = n.cross(x).normalize_or_zero();
         }
         self.frame = Mat3::from_cols(x, n, z).transpose();
+        self.car_ground_body(dh, tn, tq, surf, specs.mass, Some((specs.probe_offset, specs.bump_travel)), grid);
     }
 
     /// 32 Hz step: input, forces, velocity integration, ground contact (`Car_simulate`).
     pub fn step32(&mut self, controls: &Controls, specs: &CarSpecs, grid: &TriangleGrid) {
+        // 0x49AF70 (`+0xE0C`, priority 6, ahead of `Car_simulate` / `Car_ground` at 0x1E): the car
+        // tracker at the position and, on a new patch, the plane 0x499520 keeps
+        self.tracker.track(grid, self.position);
         self.ticks_alive += 1;
         self.process_input(controls, specs);
         let m = self.frame;
@@ -1636,6 +2063,7 @@ impl Vehicle {
                 local.z += -4.9 * m.row(2).y;
             }
             let acc = m.transpose() * local;
+            self.accel_world = acc;
             let angacc = m.transpose() * Vec3::new(0.0, torque_y, 0.0);
             self.velocity += acc * DT32;
             self.angular_velocity.x += angacc.x * DT32;
@@ -1681,6 +2109,25 @@ impl Vehicle {
     /// 64 Hz integration (`0x49B7A0` / `0x49B8E0`) and wheel rotation (`0x4A2790`).
     pub fn step64(&mut self, specs: &CarSpecs) {
         self.game_tick = self.game_tick.saturating_add(1);
+        self.integrate64();
+        // wheel rotation
+        let vz = self.v_local.z;
+        for (i, wh) in self.wheels.iter_mut().enumerate() {
+            let driven = if i < 2 { specs.front_drive >= 0.01 } else { specs.front_drive <= 0.99 };
+            let v = if driven && self.gear != 1 && !wh.locked && specs.ratio_rpm_per_mps[self.gear] != 0.0 {
+                self.rpm / specs.ratio_rpm_per_mps[self.gear]
+            } else {
+                vz
+            };
+            if !wh.locked {
+                wh.rotation = (wh.rotation + v / specs.circumference / 64.0).rem_euclid(1.0);
+            }
+        }
+    }
+
+    /// The two shared 64 Hz integrators every car record runs (`car+0xE24` / `+0xE28`):
+    /// `0x49B7A0` `pos += vel · 1/64` and `0x49B8E0`'s rotation by `ω/64`.
+    pub fn integrate64(&mut self) {
         self.position += self.velocity * DT64;
         let w = self.angular_velocity * DT64; // turns
         // 0x49B8E0 builds three axis rotations and multiplies them **X, then Y, then Z**:
@@ -1700,19 +2147,6 @@ impl Vehicle {
         // rows are body axes in world space: rotate each row
         let m = self.orientation;
         self.orientation = Mat3::from_cols(rot * m.row(0), rot * m.row(1), rot * m.row(2)).transpose();
-        // wheel rotation
-        let vz = self.v_local.z;
-        for (i, wh) in self.wheels.iter_mut().enumerate() {
-            let driven = if i < 2 { specs.front_drive >= 0.01 } else { specs.front_drive <= 0.99 };
-            let v = if driven && self.gear != 1 && !wh.locked && specs.ratio_rpm_per_mps[self.gear] != 0.0 {
-                self.rpm / specs.ratio_rpm_per_mps[self.gear]
-            } else {
-                vz
-            };
-            if !wh.locked {
-                wh.rotation = (wh.rotation + v / specs.circumference / 64.0).rem_euclid(1.0);
-            }
-        }
     }
 
     /// `Car_wallCollide` 0x495020 + `WallImpulse` 0x494000 (CONFIRMED): the 8 body corners are swept
@@ -1755,8 +2189,8 @@ impl Vehicle {
             }
             self.velocity += n * (1.1 * j);
             self.position += push;
-            // the collision mass only matters to a traffic car, which never runs this collider
-            self.damage_by_normal(3.0 * j, n, 1, 0.0);
+            // `car+0x354` only matters to a smackable's crash response (0x494964)
+            self.damage_by_normal(3.0 * j, n, 1, self.collision_mass);
             for w in &mut self.wheels {
                 w.world_pos += push;
             }
@@ -1766,7 +2200,7 @@ impl Vehicle {
                 let spin = 0.25 * j.abs().min(side.abs());
                 self.angular_velocity.y = -spin * side.signum() * self.v_local.z.signum();
             }
-            self.velocity *= 0.998;
+            self.post_hit();
             max_j = max_j.max(j);
             hit = true;
         }
@@ -1784,8 +2218,9 @@ impl Vehicle {
     /// (0x498F21…0x498F56) and no push; **0** (its pieces started) lets the car through. The
     /// answer is the last hit's impact and its class — the event word `0x50000 | class` the sound
     /// takes (0x498DAD, 0x498A3B); for a start the class is `car+0x44C`, which only the smackable
-    /// setup 0x4A12D7…0x4A136D writes, so a racing car's is 0 (MEDIUM: its allocation's zero). Not
-    /// carried: the `car+0x43C` hold that skips the pass (its writer is not read).
+    /// setup 0x4A12D7…0x4A136D writes, so a racing car's is 0 (MEDIUM: its allocation's zero). The
+    /// `car+0x43C` hold that would skip the pass (0x498DE9) never runs: every writer in the image
+    /// stores 0 (`suspension-collision.md` §4.2 item 10; corrected 2026-09-25 from "not carried").
     pub fn collide_props(&mut self, props: &[crate::props::Prop], tick: u32) -> Option<(f32, PropEvent)> {
         let mut hit = None;
         for p in props {
@@ -1930,7 +2365,7 @@ impl Vehicle {
             let spin = 0.25 * vclose.abs().min(side.abs());
             self.angular_velocity.y = -spin * side.signum() * self.v_local.z.signum();
         }
-        self.velocity *= 0.998;
+        self.post_hit();
         self.impact = self.impact.max(impact);
         if impact > 10.0 {
             let (z, x) = (n.dot(self.orientation.row(2)), n.dot(self.orientation.row(0)));
@@ -1950,7 +2385,7 @@ impl Vehicle {
                 4
             };
             self.damage_zone(impact, zone);
-            self.crash_response(impact, zone, 1, 0.0);
+            self.crash_response(impact, zone, 1, self.collision_mass);
         }
     }
 
@@ -1962,6 +2397,8 @@ impl Vehicle {
         self.frame = orientation;
         self.velocity = Vec3::ZERO;
         self.angular_velocity = Vec3::ZERO;
+        // 0x40F694 → 0x49E220, which clears `car+0xD40…+0xD48` (0x49E379)
+        self.accel_world = Vec3::ZERO;
         self.rpm = 0.0;
         self.gear = if self.automatic { 2 } else { 1 };
         self.requested_gear = self.gear;
@@ -1970,8 +2407,102 @@ impl Vehicle {
             *w = Wheel::default();
         }
         self.rearm_after_reset();
-        // 0x40F59D: every reset clears the crash countdown
+        // 0x40F59D: every reset clears the crash countdown; 0x40F400 the `+0x418` word (0x40F43C)
         self.reset_countdown = 0;
+        self.airborne_count = 0;
+    }
+
+    /// `Car_placeAtSlice` **0x49B090** (car, slice, &offset, dir) — read to the instruction
+    /// 2026-09-25, CONFIRMED. `centre` / `slice_fwd` are the slice's `+0x04` / `+0x1C`, `offset`
+    /// the slice-local `{lateral, up, along}` the caller hands in (`Grid_slot` 0x410580:
+    /// `{±½ lane width, 0.5, 0}`; a reset 0x40F540: zero, or an opponent's racing-line point),
+    /// `opponent` the `car+0x52C & 8` bit and `flip` the `dir != 1` flag (0x49B0B9).
+    ///
+    /// 1. `L` = the slice centre — or, for an opponent after tick 0x1C0 (`[0x606AC4]`) with a
+    ///    non-zero offset, the offset itself as a world position (0x49B0F1…0x49B14A); the car
+    ///    tracker `updateZone(L, 1)`, the plane point `car+0x400` = the patch's mean corner and
+    ///    `car+0x3E8` its normal (`PatchTracker::seat`).
+    /// 2. The frame `car+0x3B8`: up `N` = the tracker's patch normal (0x474420), lateral
+    ///    `normalize(N × F)`, forward `normalize(lateral × N)` with `F` the slice's forward
+    ///    (0x49B22F…0x49B2AD, `0x532880(a, b)` = `a × b`).
+    /// 3. `car+0x330` = the slice centre + `offset.x·lateral + offset.y·N + offset.z·forward`
+    ///    (0x532A00 transposes the frame, three dots 0x532910; 0x49B3B7…0x49B3F2), or `L` in the
+    ///    opponent case (0x49B397). The orientation and the physics frame `car+0x490` are that
+    ///    frame, lateral and forward negated when `flip` (0x417260 / 0x417310).
+    /// 4. 0x49AF70 (the car tracker at the new position), then — the car alive (`car+0x7F`) —
+    ///    **`Susp_update` twice with the body dropped in between**: `car+0x41C = h`,
+    ///    `car+0x334 −= car+0x424` (`BodyHeight`'s height of the lowest body points above the
+    ///    contact plane), `car+0x424 = 0`, `car+0x41C = h` again (0x49B493…0x49B4C7); last every
+    ///    wheel's compression `+0x68`, airborne `+0x84` and `+0x70` are zeroed (0x49B4D0…0x49B4E9).
+    ///
+    /// So a racer's origin ends half its model box (`car+0x3AC`) above the road, whatever the
+    /// offset's 0.5: the drop is along world `y`, the whole `car+0x424`. Not carried: the wheel
+    /// trackers' slice (0x49B183, the port's trackers keep none), `car+0x35C = 0` and
+    /// `car+0x7E = 0` (0x49B403 / 0x49B409 — the speed estimate is recomputed each tick here),
+    /// the wheels' `+0x34` / `+0x40` seeded with the world body points (0x49B439…0x49B47D,
+    /// overwritten by the first `Susp_update`), and the slice the frame reads: the tracker's after
+    /// `updateZone(L)` (0x49B1F6) — the port takes the slice it was given (APPROXIMATION).
+    #[allow(clippy::too_many_arguments)]
+    pub fn place_at_slice(&mut self, grid: &TriangleGrid, specs: &CarSpecs, centre: Vec3, slice_fwd: Vec3, offset: Vec3, opponent: bool, flip: bool) {
+        let absolute = opponent && self.game_tick > 0x1C0 && offset != Vec3::ZERO;
+        let l = if absolute { offset } else { centre };
+        self.tracker.seat(grid, l);
+        let n = self.tracker.normal;
+        let lat = n.cross(slice_fwd).normalize_or_zero();
+        let fwd = lat.cross(n).normalize_or_zero();
+        self.position = if absolute { offset } else { centre + lat * offset.x + n * offset.y + fwd * offset.z };
+        let s = if flip { -1.0 } else { 1.0 };
+        self.orientation = Mat3::from_cols(lat * s, n, fwd * s).transpose();
+        self.frame = self.orientation;
+        self.tracker.track(grid, self.position);
+        self.ground_h = self.susp_update(grid, specs);
+        self.position.y -= self.body_height;
+        self.body_height = 0.0;
+        self.ground_h = self.susp_update(grid, specs);
+        for w in &mut self.wheels {
+            w.compression = 0.0;
+            w.airborne = false;
+            w.contact = true;
+        }
+    }
+
+    /// **The skill-test start, 0x410430** (`Car_raceInit` 0x4108B2, taken instead of
+    /// `Grid_slot` + `Car_placeAtSlice` when the scene has a type-2 trigger and `[0x6573EC] == 4`):
+    ///
+    /// 1. `car+0x330` = the trigger's position (vtable `+0x38`, 0x41045A…0x410483) — no offset;
+    ///    the car tracker and the four wheel trackers `setSlice(1)` (0x473210, 0x410486…0x4104A6:
+    ///    no cached patch), then 0x49AF70 tracks the car at that position, and the zone having
+    ///    changed, 0x499520 takes the patch normal into `car+0x3E8` (`PatchTracker::track`).
+    /// 2. The frame: forward `car+0x37C` = the trigger's `+0xC8` (0x46F0F0), up `car+0x370` =
+    ///    `car+0x3E8`, right `car+0x364` = up × forward, forward = right × up (two 0x532880),
+    ///    re-orthonormalised by 0x4A4810 — and copied to `car+0x3B8` and to the physics frame
+    ///    `car+0x490` (0x410504…0x410528).
+    /// 3. 0x49AB60 (the world body points into the wheels), then **one** `Susp_update`: `car+0x41C`
+    ///    = it, `car+0x334 −= car+0x424`, `car+0x424 = 0` (0x41052F…0x41055F) — the body dropped
+    ///    (or lifted) onto the pad by `BodyHeight`, as 0x49B090 does but without its second
+    ///    `Susp_update`; last each wheel's `+0x68`, `+0x84`, `+0x70` are zeroed (0x41056C…0x41057A).
+    ///
+    /// Not carried: `car+0x80 = 0x20` (0x410521, no reader known to the port), 0x49AB60's seeds
+    /// (overwritten by the first `Susp_update` here as in `place_at_slice`), the wheel trackers'
+    /// reset (the port's re-find their patch each `Susp_update`).
+    pub fn place_at_trigger(&mut self, grid: &TriangleGrid, specs: &CarSpecs, position: Vec3, heading: Vec3) {
+        self.position = position;
+        self.tracker.forget_patch();
+        self.tracker.track(grid, self.position);
+        let up = self.tracker.plane_normal;
+        let right = up.cross(heading);
+        let fwd = right.cross(up);
+        self.orientation = Mat3::from_cols(right, up, fwd).transpose();
+        self.renormalise();
+        self.frame = self.orientation;
+        self.ground_h = self.susp_update(grid, specs);
+        self.position.y -= self.body_height;
+        self.body_height = 0.0;
+        for w in &mut self.wheels {
+            w.compression = 0.0;
+            w.airborne = false;
+            w.contact = true;
+        }
     }
 
     /// 0x40F740's countdown (0x40FB13…0x40FBA2, 32 Hz, every car but traffic): while it runs it
@@ -2058,6 +2589,29 @@ mod tests {
         v.body_points.clear();
         v.fit_half_extents();
         assert_eq!(v.half_extents, before);
+    }
+
+    /// A racer's body (0x445090 + 0x4421BE): the origin `car+0x330` goes `M[1]·car+0x3AC` above
+    /// where the car was placed, the model is drawn back there (`R3DCar` slot 5 0x43A410), and
+    /// the world points — `pos + Mᵀ·p` of the lowered points — are where they were.
+    #[test]
+    fn a_racers_origin_is_lifted_and_drawn_back_down() {
+        let specs = specs_993();
+        let tilt = Mat3::from_rotation_z(0.2).transpose();
+        let mut v = Vehicle::new(Vec3::new(1.0, 2.0, 3.0), tilt, &specs, 0.7, 0.3);
+        assert_eq!(v.draw_origin(), v.position, "no body yet: drawn at the origin");
+        let ground = [Vec3::new(-0.7, 0.0, 1.2), Vec3::new(0.7, 0.0, 1.2), Vec3::new(-0.7, 0.0, -1.1), Vec3::new(0.7, 0.0, -1.1)];
+        let before: Vec<Vec3> = ground.iter().map(|p| v.position + tilt.transpose() * *p).collect();
+        let half = Vec3::new(0.9, 0.63, 2.1);
+        v.set_car_body(ground.iter().map(|p| *p - Vec3::Y * half.y).collect(), half);
+        assert!((v.position - (Vec3::new(1.0, 2.0, 3.0) + tilt.row(1) * 0.63)).length() < 1e-6);
+        assert!((v.draw_origin() - Vec3::new(1.0, 2.0, 3.0)).length() < 1e-6);
+        for (p, b) in v.body_points.iter().zip(&before) {
+            assert!((v.position + tilt.transpose() * *p - *b).length() < 1e-5);
+        }
+        // setting it again does not lift twice
+        v.set_car_body(v.body_points.clone(), half);
+        assert!((v.draw_origin() - Vec3::new(1.0, 2.0, 3.0)).length() < 1e-6);
     }
 
     /// A plane tilted by `grade` (rise per run) about x, so +z is uphill.
@@ -2240,6 +2794,55 @@ mod tests {
 /// of this car's heading (`cos > 0.991`) cuts the drag: the deepest of
 /// `(1 − 3·dist/v)·(cos − 0.991)·111.1·0.5` wins and the factor is `1 − that`, so the drag can fall
 /// by at most half. Only the racer array `0x5E8B34` is scanned — traffic and police do not draft.
+/// **0x49ABC0** (car) — read 2026-09-25, CONFIRMED: the body points `car+0x8C` (count `car+0x32C`)
+/// from the model's `BndP` array (`carObj+0xFC`, count `+0xF8`, loader 0x442080), made ready for
+/// the physics. A smackable (`car+0x52C & 0x80`) returns at once (0x49ABC7) — this is for cars.
+///
+/// 1. **Bubble sort ascending by `y`** (0x49AC3B…0x49ACBC): `n` passes over the `n − 1` pairs,
+///    swapping when the second is strictly lower (`fcomp; test ah,1`) — stable for equal heights.
+/// 2. **Quadrant permutation of the first four** (0x49ACC2…0x49AE21): into four slots zeroed first,
+///    each of points 0…3 goes to the first slot whose test it passes, against `[0x5B23F8]` = 0:
+///    slot 0 `x < 0, z > 0`; slot 1 `x > 0, z > 0`; slot 2 `x < 0, z < 0`; slot 3 `x > 0, z < 0` —
+///    front-left, front-right, rear-left, rear-right in the physics frame (x right, z forward),
+///    the wheel order of `Susp_update` 0x499A70. A later point overwrites an earlier one in the
+///    same slot; a slot no point reaches (a point on an axis) stays the zero vector. The twelve
+///    dwords are copied back over points 0…3 (`rep movsd` 0x49AE21).
+///
+/// The points are the loader's **as stored**: 0x442080 copies `BndP`'s `x, y, z` with no change of
+/// axes (only ×0.4 for `.TINYCAR` and `y −= car+0x3AC`), and 0x49AE30 puts them in the world as
+/// `pos + Σ p_k·M[k]` with the physics rows `car+0x364` — so the model's own frame (its front at
+/// −z) is used unturned as the physics body frame. The four probes a car's wheels carry are the
+/// model's rear wheel contacts in front and its front ones behind.
+pub fn body_points_setup(points: &mut [Vec3]) {
+    let n = points.len();
+    for _ in 0..n {
+        for i in 0..n.saturating_sub(1) {
+            if points[i + 1].y < points[i].y {
+                points.swap(i, i + 1);
+            }
+        }
+    }
+    if n < 4 {
+        return;
+    }
+    let mut slots = [Vec3::ZERO; 4];
+    for p in points.iter().take(4) {
+        let k = if p.x < 0.0 && p.z > 0.0 {
+            0
+        } else if p.x > 0.0 && p.z > 0.0 {
+            1
+        } else if p.x < 0.0 && p.z < 0.0 {
+            2
+        } else if p.x > 0.0 && p.z < 0.0 {
+            3
+        } else {
+            continue;
+        };
+        slots[k] = *p;
+    }
+    points[..4].copy_from_slice(&slots);
+}
+
 pub fn draft_factor(position: Vec3, forward: Vec3, forward_speed: f32, others: &[Vec3]) -> f32 {
     if forward_speed <= 15.0 {
         return 1.0;
@@ -2263,7 +2866,8 @@ pub fn draft_factor(position: Vec3, forward: Vec3, forward_speed: f32, others: &
 
 /// The broad phase in front of the pair test (0x498FF0, 0x499077…0x499101): each of `|Δy|`, `|Δx|`
 /// and `|Δz|` under the sum of the two bounding radii `car+0x3B4` — `|car+0x3A8…+0x3B0|`, the half
-/// extents' length (0x44519A, 0x49B5CD).
+/// extents' length: `RigidBody_init` 0x49B510 stores it at 0x49B5CD in every `Car_reset`, over
+/// the load-time `√(|h|² + h_z²)` of 0x4451A0 (`car-model.md` §12).
 fn near(a: &Vehicle, b: &Vehicle) -> bool {
     let r = a.half_extents.length() + b.half_extents.length();
     let d = (b.position - a.position).abs();
@@ -2441,12 +3045,19 @@ pub fn collide_cars(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32) 
 /// Not carried: the props test 0x498DE0 beside each wall call (this port's props are the skill
 /// test's cones, handled on their own).
 pub fn collide_cars_with(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, walls: &mut dyn FnMut(&mut Vehicle)) -> Option<f32> {
+    collide_pair(a, mass_a, b, mass_b, walls).map(|(ea, eb)| ea.max(eb))
+}
+
+/// [`collide_cars_with`], answering each body's own impact `car+0x430` from the last impulse
+/// (A's, B's) — what each car's post-impact pass 0x410280 then reads for itself. Both are 0 when
+/// the boxes overlapped but the first impulse found the pair separating.
+pub fn collide_pair(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, walls: &mut dyn FnMut(&mut Vehicle)) -> Option<(f32, f32)> {
     if !near(a, b) {
         return None;
     }
     let (pt, ni) = separate(a, mass_a, b, mass_b)?;
     // the first impulse's answer is not tested (0x498109 → 0x49810E): the walls follow regardless
-    let mut effect = pair_impulse(a, mass_a, b, mass_b, pt, ni).unwrap_or(0.0);
+    let mut effect = pair_impulse(a, mass_a, b, mass_b, pt, ni).unwrap_or((0.0, 0.0));
     walls(a);
     walls(b);
     for _ in 0..4 {
@@ -2465,37 +3076,88 @@ pub fn collide_cars_with(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: 
 }
 
 /// `CarCarImpulse` 0x496860 at `pt` along `ni` (from B toward A); `None` when the pair is
-/// separating (`j < 0`, 0x4969DF) and nothing happens.
-fn pair_impulse(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, pt: Vec3, ni: Vec3) -> Option<f32> {
+/// separating (`j < 0`, 0x4969DF) and nothing happens. The answer is (A's, B's) `car+0x430`.
+///
+/// The masses are `car+0x354`. Every branch that compares one with a constant — 0.65, 0.75, 3.0,
+/// and the `4 − mA` below — is in the original's units (kg / 128); a pair of cars given in kg
+/// never meets any of them, which is why the racers' pairs can pass kg. A pair with a smackable
+/// has to pass the original's units for both.
+///
+/// The smackable (`car+0x52C & 0x80`) branches, read 2026-09-25:
+/// * 0x496985…0x4969DB: on a smackable's **first** contact (`car+0x7C == 0`) `j` is made
+///   non-negative (`fchs` when below 0) and `car+0x7C = 1` — so the first touch always pushes.
+/// * 0x4969F8…0x496A2B: a contact that goes on (`j ≥ 0`) marks a smackable whose class
+///   `car+0x44C` is **0x10** (a pylon) as hit, `car+0x42C = 1`.
+/// * 0x496ADD…0x496B42 / 0x496B97…0x496BEF: a smackable lighter than **3.0** takes
+///   `car+0x430 = min((4 − mA)·S, |P|·invM)` — **`mA` for both sides** (0x496B1F and 0x496BCC both
+///   read `[esi+0x354]`, A's mass), where the other rule is `mOther > 0.65 ? min(S, |P|·invM) : 9`.
+/// * 0x496DDB…0x496E08 / 0x496E83…0x496EA6: a smackable lighter than **0.75** turns with
+///   `1.5 / m` instead of 3.0 / 1.5.
+///
+/// And for every body (0x496E0A…0x496E25, 0x496EAC…0x496EC7): the angular factor is 3.0 only when
+/// `car+0x430` is **above** 80 (`test ah, 0x41` — at exactly 80 it is 1.5), while the linear
+/// ×1.25 takes 80 itself (0x496C4A…0x496C5A, `test ah, 1`). The port had `≥ 80` for both.
+fn pair_impulse(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, pt: Vec3, ni: Vec3) -> Option<(f32, f32)> {
     // `CarCarImpulse` 0x496860, symmetric and with no special case for traffic; the solver works in
     // rad/s, so the stored turns/s angular velocities are scaled by 2π around it exactly as 0x498FF0
     // does. `ni` points from B toward A.
     let n = -ni;
-    let (inv_a, inv_b) = (1.0 / mass_a.max(1.0), 1.0 / mass_b.max(1.0));
+    // `car+0x358` = 1/mass (0x49B652); the port's kg masses are never below 1
+    let (inv_a, inv_b) = (1.0 / mass_a.max(1e-6), 1.0 / mass_b.max(1e-6));
     let (inv6_a, inv6_b) = (inv_a / 6.0, inv_b / 6.0);
     let (r_a, r_b) = (pt - a.position, pt - b.position);
     let (c_a, c_b) = (r_a.cross(ni), r_b.cross(ni));
     let (w_a, w_b) = (a.angular_velocity * TAU, b.angular_velocity * TAU);
     let vrel = b.velocity.dot(ni) - a.velocity.dot(ni) - w_a.dot(c_a) + w_b.dot(c_b);
     let den = 0.5 * (c_a.length_squared() * inv6_a + c_b.length_squared() * inv6_b + inv_b + inv_a);
-    let j = if den > 1e-9 { vrel / den } else { 0.0 };
+    let mut j = if den > 1e-9 { vrel / den } else { 0.0 };
+    // a smackable's first contact (0x496985 / 0x4969BC)
+    for body in [&mut *a, &mut *b] {
+        if body.smackable && !body.disturbed {
+            j = j.abs();
+            body.disturbed = true;
+        }
+    }
     if j < 0.0 {
         return None;
+    }
+    // a pylon that is struck is down for the count (0x496A08 / 0x496A23)
+    for body in [&mut *a, &mut *b] {
+        if body.smackable && body.material_class == 0x10 {
+            body.knocked_over = true;
+        }
     }
     {
         let jj = j * 0.5;
         let imp = ni * jj;
         // impact magnitude 0x430: `min(4·|Δv|, |vclose·(mA+mB)|/m)`, floored at 9 when the other body
-        // is lighter than 0.65 mass units
+        // is lighter than 0.65 mass units; a smackable under 3.0 has its own rule
         let vclose = a.velocity.dot(ni) - b.velocity.dot(ni);
         let p = vclose * (mass_a + mass_b);
         let sp = 4.0 * (a.velocity - b.velocity).length();
-        let eff_a = if mass_b > 0.65 { sp.min(p.abs() * inv_a) } else { 9.0 };
-        let eff_b = if mass_a > 0.65 { sp.min(p.abs() * inv_b) } else { 9.0 };
-        let effect = eff_a.max(eff_b);
+        let own = |body: &Vehicle, m: f32, inv: f32, other: f32| -> f32 {
+            if body.smackable && m < 3.0 {
+                ((4.0 - mass_a) * sp).min(p.abs() * inv)
+            } else if other > 0.65 {
+                sp.min(p.abs() * inv)
+            } else {
+                9.0
+            }
+        };
+        let eff_a = own(a, mass_a, inv_a, mass_b);
+        let eff_b = own(b, mass_b, inv_b, mass_a);
         a.velocity += imp * inv_a * if eff_a >= 80.0 { 1.25 } else { 1.0 };
         b.velocity -= imp * inv_b * if eff_b >= 80.0 { 1.25 } else { 1.0 };
-        let (t_a, t_b) = (if eff_a >= 80.0 { 3.0 } else { 1.5 }, if eff_b >= 80.0 { 3.0 } else { 1.5 });
+        let turn = |body: &Vehicle, m: f32, eff: f32| -> f32 {
+            if body.smackable && m < 0.75 {
+                1.5 / m
+            } else if eff > 80.0 {
+                3.0
+            } else {
+                1.5
+            }
+        };
+        let (t_a, t_b) = (turn(a, mass_a, eff_a), turn(b, mass_b, eff_b));
         let w_a = w_a + r_a.cross(imp) * (t_a * inv6_a);
         let w_b = w_b - r_b.cross(imp) * (t_b * inv6_b);
         // back to turns/s; `Damage`'s crash response (0x496F8E / 0x496FB9) runs on those, and
@@ -2503,11 +3165,14 @@ fn pair_impulse(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, pt: 
         // (A's from A toward B); which vector 0x496F38 hands 0x494DF0 was not settled — MEDIUM.
         a.angular_velocity = w_a / TAU;
         b.angular_velocity = w_b / TAU;
+        // 0x496F1E / 0x496F25: `word car+0x418` steps for both bodies
+        a.airborne_count = a.airborne_count.wrapping_add(1);
+        b.airborne_count = b.airborne_count.wrapping_add(1);
         a.impact = a.impact.max(eff_a);
         b.impact = b.impact.max(eff_b);
         a.damage_by_normal(eff_a, n, 2, mass_a);
         b.damage_by_normal(eff_b, -n, 2, mass_b);
-        Some(effect)
+        Some((eff_a, eff_b))
     }
 }
 
@@ -2643,7 +3308,7 @@ mod body_ground_tests {
         v.cos_tilt = -1.0;
         v.body_height = 0.0;
         let plane = Vec3::ZERO;
-        v.body_ground_collide(&specs, Vec3::Y, plane, 0.5);
+        v.body_ground_collide_mass(specs.mass, Vec3::Y, plane, 0.5);
         assert!(v.velocity.y > -8.0, "downward speed reduced: {:?}", v.velocity);
         assert!(v.position.y >= 0.2, "pushed out of the ground: {}", v.position.y);
         assert!(v.angular_velocity.abs().max_element() <= 0.75 + 1e-6, "ω clamped: {:?}", v.angular_velocity);
@@ -2662,7 +3327,7 @@ mod body_ground_tests {
         v.velocity = Vec3::new(0.0, -30.0, 0.0);
         v.cos_tilt = -1.0;
         v.body_height = 0.0;
-        v.body_ground_collide(&specs, Vec3::Y, Vec3::ZERO, 0.5);
+        v.body_ground_collide_mass(specs.mass, Vec3::Y, Vec3::ZERO, 0.5);
         assert!(v.damage[8] > 0.0, "roof zone damaged: {:?}", v.damage);
     }
 
@@ -2752,7 +3417,7 @@ mod body_ground_tests {
         let mut v = Vehicle::new(Vec3::new(0.0, 10.0, 0.0), Mat3::IDENTITY, &specs, 0.8, 0.3);
         v.velocity = Vec3::new(1.0, -2.0, 3.0);
         let before = (v.position, v.velocity, v.angular_velocity);
-        v.body_ground_collide(&specs, Vec3::Y, Vec3::ZERO, 0.5);
+        v.body_ground_collide_mass(specs.mass, Vec3::Y, Vec3::ZERO, 0.5);
         assert_eq!((v.position, v.velocity, v.angular_velocity), before);
     }
 }
@@ -2949,5 +3614,233 @@ mod steer_taper_tests {
         // below 10 the slope is twice as steep as above it
         assert!((r(0.0) - 0.75).abs() < 1e-6);
         assert!((r(50.0) - 1.5).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod car_ground_tests {
+    use super::*;
+    use crate::collision::Triangle;
+
+    /// A flat plane at y = 0, drivable (surface 1).
+    fn flat() -> TriangleGrid {
+        let s = 50.0;
+        let (a, b, c, d) = (Vec3::new(-s, 0.0, -s), Vec3::new(s, 0.0, -s), Vec3::new(s, 0.0, s), Vec3::new(-s, 0.0, s));
+        TriangleGrid::build(vec![Triangle::new(a, b, c, 1), Triangle::new(a, c, d, 1)], 10.0)
+    }
+
+    #[test]
+    fn a_wheel_off_every_patch_reads_surface_zero_and_the_kept_plane() {
+        // road (surface 3) only in front of z = 0; the rear wheels hang over nothing
+        let s = 50.0;
+        let (a, b, c, d) = (Vec3::new(-s, 0.0, 0.0), Vec3::new(s, 0.0, 0.0), Vec3::new(s, 0.0, s), Vec3::new(-s, 0.0, s));
+        let grid = TriangleGrid::build(vec![Triangle::new(a, b, c, 3), Triangle::new(a, c, d, 3)], 10.0);
+        let specs = super::tests::specs_993();
+        let mut v = Vehicle::bare(Vec3::new(0.0, 0.0, 0.0), Mat3::IDENTITY, 2.5, 1300.0, 0.8, 0.3);
+        v.tracker.plane_point = Vec3::new(0.0, -0.5, 0.0);
+        v.wheels[2].surface = 5;
+        v.ground_contact(&grid, &specs);
+        assert_eq!(v.wheels[0].surface, 3);
+        assert_eq!(v.wheels[1].surface, 3);
+        assert_eq!(v.wheels[2].surface, 0, "no patch: the tracker's zone word 0");
+        assert_eq!(v.wheels[3].surface, 0);
+        // the rear wheels stood on the kept plane `car+0x400` (0.5 m down: hanging)
+        assert!(v.wheels[2].airborne && v.wheels[3].airborne && !v.wheels[0].airborne);
+    }
+
+    /// 0x49B090: the offset in the slice frame, then the drop by `car+0x424` puts the wheel quad
+    /// on the road and the origin `car+0x3AC` above it; an opponent after tick 0x1C0 takes the
+    /// offset as a world position.
+    #[test]
+    fn place_at_slice_drops_the_body_onto_the_road() {
+        let grid = flat();
+        let specs = super::tests::specs_993();
+        let quad = [(-0.66, 1.2), (0.66, 1.2), (-0.66, -1.1), (0.66, -1.1)];
+        let mut pts: Vec<Vec3> = quad.iter().map(|&(x, z)| Vec3::new(x, 0.0, z)).collect();
+        pts.push(Vec3::new(0.0, 1.26, 0.0));
+        pts.iter_mut().for_each(|p| p.y -= 0.631);
+        body_points_setup(&mut pts);
+        let mut v = Vehicle::bare(Vec3::new(0.0, 3.0, 0.0), Mat3::IDENTITY, 2.3, 1300.0, 0.8, 0.3);
+        v.set_car_body(pts, Vec3::new(0.91, 0.631, 2.1));
+        v.game_tick = 0;
+        v.place_at_slice(&grid, &specs, Vec3::new(5.0, 0.0, 5.0), Vec3::Z, Vec3::new(1.5, 0.5, 0.0), true, false);
+        assert!((v.position - Vec3::new(6.5, 0.631, 5.0)).length() < 1e-4, "{:?}", v.position);
+        assert!((v.draw_origin().y).abs() < 1e-4);
+        assert_eq!(v.body_height, 0.0);
+        v.game_tick = 0x1C1;
+        v.place_at_slice(&grid, &specs, Vec3::new(5.0, 0.0, 5.0), Vec3::Z, Vec3::new(-2.0, 0.0, 7.0), true, true);
+        assert!((v.position - Vec3::new(-2.0, 0.631, 7.0)).length() < 1e-4, "{:?}", v.position);
+        assert!((v.orientation.row(2) - Vec3::NEG_Z).length() < 1e-5, "flipped: forward negated");
+    }
+
+    /// 0x410430: the skill start puts `car+0x330` on the trigger (on the pad here), turns the
+    /// frame onto the patch normal with the trigger's `+0xC8` as forward, and one `Susp_update`
+    /// lifts the body until the wheel quad stands on the pad — the origin half the box up.
+    #[test]
+    fn place_at_trigger_stands_the_car_on_the_pad() {
+        let grid = flat();
+        let specs = super::tests::specs_993();
+        let quad = [(-0.66, 1.2), (0.66, 1.2), (-0.66, -1.1), (0.66, -1.1)];
+        let mut pts: Vec<Vec3> = quad.iter().map(|&(x, z)| Vec3::new(x, 0.0, z)).collect();
+        pts.push(Vec3::new(0.0, 1.26, 0.0));
+        pts.iter_mut().for_each(|p| p.y -= 0.631);
+        body_points_setup(&mut pts);
+        let mut v = Vehicle::bare(Vec3::new(0.0, 3.0, 0.0), Mat3::IDENTITY, 2.3, 1300.0, 0.8, 0.3);
+        v.set_car_body(pts, Vec3::new(0.91, 0.631, 2.1));
+        v.place_at_trigger(&grid, &specs, Vec3::new(-6.8, 0.0, 14.0), Vec3::new(0.0, 0.0, -2.0));
+        assert!((v.position - Vec3::new(-6.8, 0.631, 14.0)).length() < 1e-4, "{:?}", v.position);
+        assert!(v.draw_origin().y.abs() < 1e-4);
+        assert!((v.orientation.row(2) - Vec3::NEG_Z).length() < 1e-5, "forward = +0xC8, normalised");
+        assert!((v.orientation.row(1) - Vec3::Y).length() < 1e-5);
+        assert_eq!(v.body_height, 0.0);
+    }
+
+    /// `wheel+0x8C` keeps the whole word (0x499B84…0x499B8A); `RALLY` turns nibble 1 or 10 into
+    /// the dword 2 (0x499BA7).
+    #[test]
+    fn the_wheel_keeps_the_whole_zone_word() {
+        let s = 50.0;
+        let (a, b, c, d) = (Vec3::new(-s, 0.0, -s), Vec3::new(s, 0.0, -s), Vec3::new(s, 0.0, s), Vec3::new(-s, 0.0, s));
+        let grid = TriangleGrid::build(vec![Triangle::new(a, b, c, 0x0101), Triangle::new(a, c, d, 0x0101)], 10.0);
+        let specs = super::tests::specs_993();
+        let mut v = Vehicle::bare(Vec3::ZERO, Mat3::IDENTITY, 2.5, 1300.0, 0.8, 0.3);
+        v.ground_contact(&grid, &specs);
+        assert!(v.wheels.iter().all(|w| w.zone == 0x0101 && w.surface == 1));
+        v.rally = true;
+        v.ground_contact(&grid, &specs);
+        assert!(v.wheels.iter().all(|w| w.zone == 2 && w.surface == 2));
+    }
+
+    #[test]
+    fn body_setup_sorts_by_height_and_deals_the_lowest_four_by_quadrant() {
+        // the 993's wheel quad as `BndP` stores it (model axes), a roof point and a box corner
+        let mut p = vec![
+            Vec3::new(0.0, 1.2, 0.0),
+            Vec3::new(0.66, 0.0, -1.075),
+            Vec3::new(-0.66, 0.0, -1.075),
+            Vec3::new(0.9, 0.3, 2.0),
+            Vec3::new(0.66, -0.001, 0.926),
+            Vec3::new(-0.66, 0.0, 0.926),
+        ];
+        body_points_setup(&mut p);
+        assert_eq!(
+            &p[..4],
+            &[Vec3::new(-0.66, 0.0, 0.926), Vec3::new(0.66, -0.001, 0.926), Vec3::new(-0.66, 0.0, -1.075), Vec3::new(0.66, 0.0, -1.075)]
+        );
+        assert_eq!(&p[4..], &[Vec3::new(0.9, 0.3, 2.0), Vec3::new(0.0, 1.2, 0.0)]);
+        // a point on an axis reaches no slot, which stays zero; a second one in a slot wins
+        let mut q = vec![Vec3::new(0.0, 0.0, 1.0), Vec3::new(1.0, 0.0, 1.0), Vec3::new(2.0, 0.0, 1.0), Vec3::new(-1.0, 0.0, -1.0)];
+        body_points_setup(&mut q);
+        assert_eq!(q, vec![Vec3::ZERO, Vec3::new(2.0, 0.0, 1.0), Vec3::new(-1.0, 0.0, -1.0), Vec3::ZERO]);
+    }
+
+    #[test]
+    fn body_height_reads_the_first_four_points_upright_and_all_of_them_tilted() {
+        let mut v = Vehicle::bare(Vec3::new(0.0, 1.0, 0.0), Mat3::IDENTITY, 2.5, 1300.0, 0.8, 0.3);
+        // four tyre points 1 m below the centre at 0.1, 0.2, 0.3, 0.4 above the plane, then a
+        // body point that pokes 0.05 below it
+        v.body_points = vec![
+            Vec3::new(-0.8, -0.9, 1.2),
+            Vec3::new(0.8, -0.8, 1.2),
+            Vec3::new(-0.8, -0.7, -1.2),
+            Vec3::new(0.8, -0.6, -1.2),
+            Vec3::new(0.0, -1.05, 0.0),
+        ];
+        v.cos_tilt = 1.0;
+        v.body_height_on(Vec3::Y, Vec3::ZERO);
+        // ½·(mean + min) of the first four, into both fields (0x49AA46 / 0x49AA4C)
+        let want = 0.5 * (0.25 + 0.1);
+        assert!((v.body_height - want).abs() < 1e-5 && v.min_height == v.body_height, "{} {}", v.body_height, v.min_height);
+        v.cos_tilt = 0.9;
+        v.body_height_on(Vec3::Y, Vec3::ZERO);
+        assert!((v.body_height + 0.05).abs() < 1e-5, "{}", v.body_height);
+        assert!((v.min_height - (-0.05 + 0.1 + 0.2) / 3.0).abs() < 1e-5, "{}", v.min_height);
+    }
+
+    /// 0x49C095…0x49C0E6: a car on its roof with damage on and the roof under 40 has the roof set
+    /// to 40 and the roll-over event raised, once.
+    #[test]
+    fn a_rolled_car_takes_forty_on_the_roof_once() {
+        let mut v = Vehicle::bare(Vec3::new(0.0, 0.5, 0.0), Mat3::from_diagonal(Vec3::new(1.0, -1.0, -1.0)), 2.5, 1300.0, 0.8, 0.3);
+        v.cos_tilt = -1.0;
+        v.body_height = 0.0;
+        v.min_height = 0.0;
+        v.car_ground_body(0.0, Vec3::Y, Vec3::ZERO, 1, 1300.0, None, &flat());
+        assert!(v.rollover_sound && v.damage[8] == 40.0);
+        v.rollover_sound = false;
+        v.car_ground_body(0.0, Vec3::Y, Vec3::ZERO, 1, 1300.0, None, &flat());
+        assert!(!v.rollover_sound, "the roof is at 40 now");
+        // the direction of travel follows the velocity, or the forward row at rest
+        assert!(v.travel_dir.is_normalized());
+    }
+
+    /// 0x49C1C4…0x49C27D: a hard landing raises the event, clears the `+0x418` word when upright
+    /// and, for the human, 0x493DD0 clears the wheels' airborne flags.
+    #[test]
+    fn a_hard_landing_resets_the_human_car() {
+        let mut v = Vehicle::bare(Vec3::new(0.0, 0.5, 0.0), Mat3::IDENTITY, 2.5, 1300.0, 0.8, 0.3);
+        v.cos_tilt = 1.0;
+        v.body_height = -0.2;
+        v.min_height = -0.2;
+        v.velocity.y = -10.0;
+        v.airborne_count = 1;
+        for w in &mut v.wheels {
+            w.airborne = true;
+        }
+        v.car_ground_body(0.0, Vec3::Y, Vec3::ZERO, 1, 1300.0, None, &flat());
+        assert!(v.landing_sound.is_some_and(|c| c > 6.0));
+        assert_eq!(v.airborne_count, 0);
+        assert!(v.wheels.iter().all(|w| !w.airborne));
+    }
+
+    #[test]
+    fn a_tilted_car_off_its_body_falls_through_to_the_resting_arm() {
+        // 0x49BF62: `car+0x424 < 0.001` fails, so the upright arm 0x49C19A sets the body on the
+        // plane (`car+0x424 < 0.005`, closing ≤ 6)
+        let grid = flat();
+        let mut v = Vehicle::bare(Vec3::new(0.0, 0.003, 0.0), Mat3::IDENTITY, 2.5, 1300.0, 0.8, 0.3);
+        v.cos_tilt = 0.8;
+        v.body_height = 0.003;
+        v.min_height = 0.003;
+        v.velocity = Vec3::new(5.0, -0.1, 0.0);
+        v.car_ground_body(0.0, Vec3::Y, Vec3::ZERO, 1, 1300.0, None, &grid);
+        assert!(v.position.y.abs() < 1e-6, "{:?}", v.position);
+        assert_eq!(v.body_height, 0.0);
+        assert_eq!(v.velocity, Vec3::new(5.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn the_rollover_bounce_reads_the_velocity_from_before_the_impulse() {
+        // 0x49C038: `vel.y −= bounce[surf] · vy` only while `vy < −2`; a body moving up gains nothing
+        let grid = flat();
+        let far = Vec3::new(0.0, -100.0, 0.0); // no body point reaches this plane: no impulse
+        let mut v = Vehicle::bare(Vec3::new(0.0, 10.0, 0.0), Mat3::IDENTITY, 2.5, 1300.0, 0.8, 0.3);
+        v.cos_tilt = 0.5;
+        v.body_height = 0.0;
+        v.min_height = 0.0;
+        v.velocity = Vec3::new(0.0, 3.0, 0.0);
+        v.car_ground_body(0.0, Vec3::Y, far, 1, 1300.0, None, &grid);
+        assert_eq!(v.velocity.y, 3.0);
+        v.velocity = Vec3::new(1.0, -4.0, 0.0);
+        v.car_ground_body(0.0, Vec3::Y, far, 1, 1300.0, None, &grid);
+        // surface 1's bounce is 0.7: −4 + 0.7·4
+        assert!((v.velocity.y - (-4.0 + 0.7 * 4.0)).abs() < 1e-5, "{:?}", v.velocity);
+        assert!((v.velocity.x - 0.95).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_hard_landing_clamps_the_spin_per_component() {
+        // 0x49BBA0 clamps each of ω's components to ±0.75, not its length
+        let grid = flat();
+        let mut v = Vehicle::bare(Vec3::new(0.0, -0.2, 0.0), Mat3::IDENTITY, 2.5, 1300.0, 0.8, 0.3);
+        v.cos_tilt = 1.0;
+        v.body_height = -0.2;
+        v.min_height = -0.2;
+        v.velocity = Vec3::new(0.0, -8.0, 0.0);
+        v.angular_velocity = Vec3::new(0.7, -0.7, 2.0);
+        v.car_ground_body(0.0, Vec3::Y, Vec3::ZERO, 1, 1300.0, None, &grid);
+        assert_eq!(v.angular_velocity, Vec3::new(0.7, -0.7, 0.75));
+        assert!((v.position.y + 0.05).abs() < 1e-6);
+        assert!((v.velocity.y - 0.4 * 0.7 * 8.0).abs() < 1e-5, "{:?}", v.velocity);
     }
 }

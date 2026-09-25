@@ -21,9 +21,13 @@ pub const AI_ROAD_SLOT: usize = 0x10;
 
 /// `SND_coll` slots 0xA / 0xB — the AI horn (`sfx.md` §4.6, §6). `0x4A754B` plays
 /// `0xA + (*(u32*)car[0x558] == 0x30)` on voice `aiIndex + 0x27`, and §6's "slots 6, 10, 11 force
-/// kind 3" routes that to `SND_coll` whatever the voice table says. Which car-info records carry
-/// `0x30` in their first dword was not identified, so the port always takes slot 0xA.
+/// kind 3" routes that to `SND_coll` whatever the voice table says. No car record carries `0x30`
+/// in its first dword (`.TYPE` is 11 for all of them, see `AiEngines::honk`), so it is slot 0xA.
 pub const AI_HORN_SLOT: usize = 0xA;
+
+/// The horn's bend byte `0x5D1478[.TYPE]` with `.TYPE` = 11: the table reads 88, 80, 70, 65, 60,
+/// 50, 85, 90, 60, 45, 90, **50**, … — about −100 cents under the patch's range (`Clip::bend`).
+const HORN_BEND: i32 = 50;
 
 fn curve(i: i32) -> i32 {
     WEIGHT_CURVE[i.clamp(0, 128) as usize] as i32
@@ -179,9 +183,12 @@ impl AiEngines {
     /// The volume is the siren's distance law (0x4A7554…0x4A7592: `(0x1324 − min(m², 0x1324)) · 127
     /// / 0x1324`, silent from 70 m) in the slot-0x0A/0x0B category `(AmbientLevel · game.spl[12] ·
     /// vol · 85) >> 21` of 0x4A9C10; the pitch is `pitchBase`, 1.0 in this build. This port had the
-    /// engine loops' `2048/(d+2)` in the engine level until 2026-09-24. APPROXIMATION: the level byte
-    /// is the per-model `0x5D1478[.TYPE]`, and the port does not know an AI car's `nfs5.car` id, so
-    /// it keeps the full 0x7F.
+    /// engine loops' `2048/(d+2)` in the engine level until 2026-09-24. The bend byte is
+    /// `0x5D1478[.TYPE]` and the slot `0xA + (.TYPE == 0x30)`; `.TYPE` (registry id 0x21F, the car
+    /// record's `+0x00`) is **11** for every car — `fe.txt` sets `car[i].type=11`, 0x4EEDA0 streams
+    /// `0x21F = 0xB` for each FE-configured car (0x4EEFAC…0x4EEFB5), and 0x4A17F0 builds the world
+    /// props' records with `+0x00 = 0x0B` — so the bend is `0x5D1478[11]` = 50 and the slot 0xA.
+    /// *(Until 2026-09-25 the port played the horn unbent, taking `.TYPE` for an unknown per-model id.)*
     pub fn honk(&mut self, out: &AudioOutput, index: usize, on: bool, distance: f32, pan: f32, ambient_level: u8) {
         if self.cars.len() <= index {
             self.cars.resize_with(index + 1, CarVoices::default);
@@ -189,16 +196,17 @@ impl AiEngines {
         let v = crate::sfx::siren_volume(distance);
         let vol = ((ambient_level as i32 * self.horn_trim as i32 * v * 85) >> 21).clamp(0, 127);
         let amp = vol as f32 / 127.0;
+        let pitch = self.horn.as_ref().map_or(1.0, |c| c.bend(HORN_BEND));
         match (self.cars[index].horn, on && vol > 0, &self.horn) {
             (Some(id), true, _) => {
-                out.set(id, amp, 1.0);
+                out.set(id, amp, pitch);
                 out.set_pan(id, pan);
             }
             (Some(id), false, _) => {
                 out.stop(id);
                 self.cars[index].horn = None;
             }
-            (None, true, Some(c)) => self.cars[index].horn = Some(out.play_panned(c.clone(), amp, 1.0, pan, true)),
+            (None, true, Some(c)) => self.cars[index].horn = Some(out.play_panned(c.clone(), amp, pitch, pan, true)),
             _ => {}
         }
     }

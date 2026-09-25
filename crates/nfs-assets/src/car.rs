@@ -249,7 +249,7 @@ impl CarStyle {
     /// | 56 | 0x38 | `LeftHand`, `RightHand` — two |
     ///
     /// ```text
-    /// 0x43AEAB  slot9  = 0x5CD5C4[detail]                ; {2,3,4,5,10,8,9,7,1}
+    /// 0x43AEAB  slot9  = 0x5CD5C4[.DRIVER]               ; {2,3,4,5,10,8,9,7,1}
     /// 0x43AED4  car+0x52C & 0x10   -> slot9 = 0, done    ; no driver at all
     /// 0x43AEEA  detail >= 8        -> slot9 = 1, slot43 = 1, and slot56 is left alone
     /// 0x43AF0B  GameType 9, detail >= 4 -> 6, 3, 1       ; a factory-driver mission
@@ -257,7 +257,10 @@ impl CarStyle {
     /// 0x43AF51  otherwise -> slot43 = 2·(detail/4) + 2, slot56 = detail/4 + 1
     /// ```
     ///
-    /// The port renders at the best detail the table has, so it takes the `detail >= 8` arm.
+    /// `detail` is `.DRIVER`, `rand() & 7` from the race set-up — a pick among the bodies, not a
+    /// level of detail: the `>= 8` arm is reached only by a record set past 7 by hand. *(Until
+    /// 2026-09-25 the port read it as a detail level and always took that arm, so every driver was
+    /// `DriverBody1`.)* The front-end branch (0x43B003) makes none of these writes.
     /// Slot 19's roof line in a race (`[0x65B928] == 0`, 0x43AE7A…0x43AE9F): `slot41 = 2·slot37`,
     /// one less when the car's `.CABRIODOWN` option `[carinfo+0x50C]` (id 0x24B) is **0**, and
     /// then `slot37 = 0`. With slot 41's pairs (`CabrioDown` 1 / `CabrioUp` 2, …) a 0 picks the
@@ -349,10 +352,16 @@ pub struct CarAssets {
     pub style_index: usize,
     /// The catalogue record's convertible flag `nfs5.car +0x1BF` (see [`Self::with_style`]).
     pub cabrio: bool,
-    /// A front-end room model (`FEData/Models`, `RE/notes/frontend-3d.md`) rather than a car: the
-    /// port keeps the car's draw states (`nfs_renderer::MaterialDesc::device_states`, the `Rs`
-    /// cull, the `Base+70` order) to cars — APPROXIMATION for the rooms, whose page formats and
-    /// draw class were not read (their spotlight layers turned stepped under the car's states).
+    /// A front-end room model (`FEData/Models`, `RE/notes/frontend-3d.md` §9) rather than a car.
+    /// The original builds a room with the car's own class — `FE3DRoom`'s constructor 0x4E9ED0
+    /// hands the name to the front end's car object 0x4D1160 (first argument 2), whose model is
+    /// 0x437920, `R3DCar` — so its `.tpg` pages (565 and 4444 only) are built the way a car's are
+    /// and it is drawn by `R3DCarLOD::draw` 0x43C830 with a car's states: `GREATER 10`, depth
+    /// writes, the `Rs` cull, the `Base+70` order. The one thing the flag changes in the port is
+    /// the `Rs` block's blending: a room's materials take its blend flag and pair (pair 1,
+    /// `SRCALPHA` / `ONE`, for the light pools and cones), where the cars keep the port's rule.
+    /// *(Until 2026-09-25 this was an APPROXIMATION that kept the rooms off the car's states, with
+    /// their page formats and draw class not read.)*
     pub front_end_room: bool,
     /// `carinfo+0x32C`, the style overlay a race car's installed parts write: `{group, slot,
     /// value}` from each part's `+0x8E` swaps (0x49C5F7…0x49C635), group 0 a geometry slot and 1 a
@@ -363,6 +372,19 @@ pub struct CarAssets {
     /// The car-info strings the page builder writes into `license` / `racedecal` entries —
     /// `None` leaves those entries' texels as they are (`car-model.md` §5.3).
     pub page_text: Option<PageText>,
+    /// What slot 19's race branch keys the driver's articles on ([`CarStyle::apply_driver_detail`])
+    pub driver: DriverSeat,
+}
+
+/// The inputs of slot 19's driver writes (0x43AEA5…0x43AF6B): car-info `+0x150` **`.DRIVER`**
+/// (registry id 0x23D), which the front end's per-car race set-up 0x4EEDA0 sets to `rand() & 7`
+/// (0x4EEDAC…0x4EEDE2) for every car it launches; `car+0x52C & 0x10`, a traffic car (0x43AECA),
+/// which gets no driver; and `FEGAME_TYPE [0x6573E8] == 9`, a Factory Driver mission (0x43AEFD).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DriverSeat {
+    pub driver: u32,
+    pub no_driver: bool,
+    pub factory_driver: bool,
 }
 
 impl CarAssets {
@@ -412,6 +434,7 @@ impl CarAssets {
             page_text: None,
             style_overlay: Vec::new(),
             tiny: false,
+            driver: DriverSeat::default(),
         })
     }
 
@@ -436,8 +459,10 @@ impl CarAssets {
 
     /// Build the texture pages the car materials index (`RE/notes/car-model.md` §2.2, CONFIRMED):
     /// each embedded `sf#k` SHPI corresponds to `.tpg` `file(k+1)`; `[file(k+1).details] tpage=N`
-    /// selects the page (1-based), entries are blitted at `(misc[2] & 0xFFF, misc[3] & 0xFFF)` plus
-    /// `offsetx/y`; `global=K` files come from `CarModel/{Shadow,INTGLASS,Suit,Head,Cabrio}.fsh`.
+    /// selects the page (1-based) — a page with `sourcetpage=M` is built again from page M's file —
+    /// and entries are blitted at `(misc[2] & 0xFFF, misc[3] & 0xFFF)`, a `mirror=1` file's twice
+    /// (the second at `mirroroffsetx/y`), each copy followed by its text (0x444880); `global=K`
+    /// files come from `CarModel/{Shadow,INTGLASS,Suit,Head,Cabrio}.fsh`.
     /// Alternates (`[fileN.<entry>]` with `typeK != 0`, `frontend=1`) are skipped (coupe defaults).
     /// Paint: greyscale body texels with alpha in the tint slots get `tint × grey` (§5), `tint` the
     /// 18-slot table `Paint::tint_table` builds as 0x443DB0 does (§5.0a).
@@ -462,17 +487,32 @@ impl CarAssets {
         let sf_indices: Vec<u16> = self.crp.material_entries.iter().filter(|e| e.is_part(b"sf")).map(|e| e.part_index()).collect();
         const GLOBALS: [&str; 5] = ["Shadow.fsh", "INTGLASS.FSH", "Suit.fsh", "Head.fsh", "Cabrio.fsh"];
         let mut owned_globals: Vec<Vec<u8>> = Vec::new();
+        // 0x442EC5…0x442F09: each page's file — the last `[file<n>.details]` naming it as its
+        // `tpage` (one byte per page, the file's 0-based number)
+        let mut page_file: Vec<Option<usize>> = vec![None; numpages];
         for file_no in 1..=numfiles {
-            let Some(det) = self.tpg.section(&format!("file{file_no}.details")) else { continue };
-            let Some(page_no) = det.get_i64("tpage") else { continue };
-            let page_no = page_no as usize;
-            if page_no == 0 || page_no > pages.len() {
-                continue;
+            let t = self.tpg.section(&format!("file{file_no}.details")).and_then(|d| d.get_i64("tpage")).unwrap_or(0);
+            if t >= 1 && t as usize <= numpages {
+                page_file[t as usize - 1] = Some(file_no);
             }
-            let offx = det.get_i64("offsetx").unwrap_or(0);
-            let offy = det.get_i64("offsety").unwrap_or(0);
-            let mirror = det.get_i64("mirror").unwrap_or(0) == 1;
-            let mirror_page = self.tpg.section(&format!("tpage{page_no}.details")).and_then(|d| d.get_i64("mirrortpage")).map(|m| m as usize);
+        }
+        // 0x442F22…0x44303D: every page in turn, built by the car's slot +0x28 (0x443F60) from its
+        // file; a page whose `sourcetpage` (default itself, 0x442F73) names another takes that
+        // page's file (0x442F83…0x442F8E) and is built from it in full — so the second body page
+        // (`[tpage2] sourcetpage=1`) is page 1 built again, text and all. `mirrortpage`,
+        // `offsetx` and `offsety` are not keys the exe reads (no such strings; every shipped value
+        // of the two offsets is 0). *(Until 2026-09-25 the port blitted a `mirror = 1` file's
+        // entries into the page its own page's `mirrortpage` named, and nothing else there.)*
+        for page_no in 1..=numpages {
+            let src = self.tpg.section(&format!("tpage{page_no}.details")).and_then(|d| d.get_i64("sourcetpage")).unwrap_or(page_no as i64);
+            if src != page_no as i64 && src >= 1 && src as usize <= numpages {
+                page_file[page_no - 1] = page_file[src as usize - 1];
+            }
+            // a page no file names (none shipped within `numtpages`) would read an unset byte
+            let Some(file_no) = page_file[page_no - 1] else { continue };
+            let Some(det) = self.tpg.section(&format!("file{file_no}.details")) else { continue };
+            // 0x443F97…0x443FD2: `mirror` (default 0) and its two offsets
+            let mirror = det.get_i64("mirror").unwrap_or(0) != 0;
             let (moffx, moffy) = (det.get_i64("mirroroffsetx").unwrap_or(0), det.get_i64("mirroroffsety").unwrap_or(0));
             // source SHPI bytes
             let data: &[u8] = if let Some(g) = det.get_i64("global") {
@@ -503,55 +543,78 @@ impl CarAssets {
                 {
                     continue;
                 }
-                let Ok(img) = fsh.decode(data, ei) else { continue };
                 let b = &entry.blocks[0];
+                let Some(fmt) = nfs_formats::fsh::PixelFormat::from_code(b.format_code()) else { continue };
                 let x = (b.misc[2] & 0xFFF) as i64;
                 let y = (b.misc[3] & 0xFFF) as i64;
-                // In a race `RCar` tints nothing (vtable +0x30 = 0x444120 answers 0); the port's
-                // paint on the embedded body pages stands in for the race's own, unread paint path
-                // (APPROXIMATION, `car-model.md` §5), and stops there: a global file's entry — the
-                // `Shadow.fsh` wheel shadows above all, whose alpha is a gradient — keeps its texels
-                // in a race. *(Until 2026-09-25 it was tinted too and drew opaque painted bands
-                // over the tops of the wheels.)*
+                // The tint flag `bl` is the car object's vtable slot 12 (+0x30), called by the
+                // builder at 0x444063 — and a race car is the same `R3DCar` as the front end's:
+                // `Car_init` 0x410F1C and the front end's 0x4D1381 both construct it with 0x437920,
+                // which runs the `R3DObject` constructor 0x4414C0 (vtable 0x5B37F0, whose slot 12
+                // 0x444120 answers 0) and then stores its own vtable **0x5B3620** (0x43797A), whose
+                // slot 12 is 0x439EE0. `Car_init` fills the tint table (0x443DB0, 0x410F6F) before
+                // it calls the loader (slot 1 0x441A10, 0x410F81) that builds the pages, so a race
+                // car's pages are built and painted exactly as the front end's (CONFIRMED).
+                // 0x439EE0: `[file<n>.details] tint`, default 1 (0x439F19), replaced by the entry's
+                // own `[file<n>.<name>] tint` when that section exists (0x439F69), default the
+                // former. *(Until 2026-09-25 the port read slot 12 off the `R3DObject` vtable —
+                // "`RCar` tints nothing in a race" — and kept a global file's entries untinted in a
+                // race, painting the embedded ones as a labelled stand-in.)*
                 //
-                // Which texels the front end's builder tints (0x443F60, handed the page's `.tpg`
-                // `bpp` — default 0x613 = 1555 at 0x442F5F — by 0x44300C): an 8-bit source through
-                // its palette (0x444130), a 32-bit one texel by texel onto a 32-bit page (0x444494)
-                // or a 1555 one (0x444602); a 4444 page — the wheel shadows' — takes no tint at all.
+                // Which path the builder (0x443F60, handed the page's `.tpg` `bpp` — default
+                // 0x613 = 1555 at 0x442F5F — by 0x44300C) sends an entry down, by `bl` and its
+                // source's depth (`BlitPath`): an 8-bit source through its palette (0x444130), a
+                // 32-bit one texel by texel onto a 32-bit page (0x444494) or a 1555 one (0x444602);
+                // anything else — a 4444 or 565 page's 32-bit source (the wheel shadows', the
+                // front-end rooms'), a 24-bit one, and every untinted entry — straight or through
+                // the software blitter (0x4447BA / 0x444843 → 0x53D570), untinted. No shipped
+                // source is 16-bit. A 24-bit one (the traffic's `tdri`, the cops' `sire`, the
+                // rooms') always takes the blitter — 0x444494 / 0x444602 / 0x4447BA all want a
+                // source depth of 32 (0x537F90: 0x7F → 24) — which has no direct 888 → 16-bit
+                // converter and so goes through 0x534D40: an 8888 copy made by 0x570A00 (`FF r g b`
+                // from the file's `b g r`, alpha always 0xFF), then that copy through the 32-bit
+                // converter of the page's format (0x570510 565, 0x570370 1555, 0x570540 4444), and
+                // the result copied row by row (the mode's per-depth routine, 0x571847…0x571871).
+                // So it is the 32-bit rule on an opaque texel, which is what `blit` does with the
+                // decoded image (alpha 255) — CONFIRMED, `car-model.md` §5.4. *(Until 2026-09-25
+                // this was an APPROXIMATION, the second stage unread.)*
                 let page_bpp = self.tpg.section(&format!("tpage{page_no}.details")).and_then(|d| d.get_i64("bpp")).unwrap_or(1555);
-                let tint = self.tpg.section(&format!("file{file_no}.{}", ename.to_lowercase())).and_then(|s| s.get_i64("tint")).unwrap_or(1) != 0
-                    && (style.front_end || det.get_i64("global").is_none())
-                    && match img.source_format {
-                        nfs_formats::fsh::PixelFormat::Indexed8 => true,
-                        nfs_formats::fsh::PixelFormat::Argb8888 => page_bpp == 32 || page_bpp == 1555,
-                        _ => false,
-                    };
-                blit(&mut pages[page_no - 1], &img.rgba, img.width, img.height, x + offx, y + offy, tint, &tints);
-                // 0x444880, right after the entry's blit: the licence / race number / flyer text
-                if let (Some(text), Some(sec)) = (&self.page_text, self.tpg.section(&format!("file{file_no}.{}", ename.to_lowercase()))) {
-                    let flag = |k: &str| sec.get_i64(k).unwrap_or(0) != 0;
-                    let (sx, sy) = (sign12(b.misc[2]), sign12(b.misc[3]));
-                    let rect = (sx, sy, entry.blocks[0].width as i64, entry.blocks[0].height as i64);
+                let file_tint = det.get_i64("tint").unwrap_or(1) != 0;
+                let bl = self.tpg.section(&format!("file{file_no}.{}", ename.to_lowercase())).and_then(|s| s.get_i64("tint")).map_or(file_tint, |t| t != 0);
+                let path = match fmt {
+                    nfs_formats::fsh::PixelFormat::Indexed8 if bl => BlitPath::Palette,
+                    nfs_formats::fsh::PixelFormat::Argb8888 if bl && (page_bpp == 32 || page_bpp == 1555) => BlitPath::Texel,
+                    _ => BlitPath::Blitter,
+                };
+                // the palette path reads its palette as 0x444130 does — the block 0x537FB0 finds,
+                // taken as 255 raw dwords whatever its format — tints it, not the texels, and never
+                // writes its last entry (`palette_path_texels`)
+                let (w, h) = (b.width as u32, b.height as u32);
+                let src = if path == BlitPath::Palette {
+                    let (Some(ix), Some(pal)) = (indexed_texels(&fsh, data, ei), palette_path_palette(data, entry.offset as usize)) else { continue };
+                    palette_path_texels(&pal, &ix, &tints)
+                } else {
+                    let Ok(img) = fsh.decode(data, ei) else { continue };
+                    img.rgba
+                };
+                // 0x44407E: the first copy, offsets (0, 0); then 0x444880 draws the entry's text.
+                // With `mirror` set, 0x4440BA blits the entry again into the same page at the
+                // mirror offsets (the software blitter 0x444843 ignores them; the builder's own
+                // paths, the 32-on-32 copy 0x4447BA among them, add them) and 0x4440CC draws the
+                // text again — on the same surface, `ebx`, at the same place: 0x444880 takes
+                // (page, entry, file, name) and no offsets.
+                let text_page = self.page_text.as_ref().zip(self.tpg.section(&format!("file{file_no}.{}", ename.to_lowercase())));
+                let (sx, sy) = (sign12(b.misc[2]), sign12(b.misc[3]));
+                let rect = (sx, sy, b.width as i64, b.height as i64);
+                let copies: &[(i64, i64)] = if mirror { &[(0, 0), (moffx, moffy)] } else { &[(0, 0)] };
+                for &(ox, oy) in copies {
+                    let soft = path == BlitPath::Blitter && !(page_bpp == 32 && fmt == nfs_formats::fsh::PixelFormat::Argb8888);
+                    let (ox, oy) = if soft { (0, 0) } else { (ox, oy) };
                     let page = &mut pages[page_no - 1];
-                    if flag("license") {
-                        let s: String = text.license.chars().take(8).collect();
-                        page_text_draw(page, paths, "license.ffn", &s, rect, [0xFF00_0000, 0, 0xFF00_0000], false);
+                    blit(page, &src, w, h, x + ox, y + oy, path, &tints);
+                    if let Some((text, sec)) = text_page {
+                        draw_entry_text(page, paths, text, sec, rect, &paint);
                     }
-                    if flag("racedecal") {
-                        let n = text.race_number;
-                        let s = if n < 10 { format!("0{n}") } else { format!("{n}") };
-                        // `this+0xAA`, the exterior's HSV value `max(r, g, b)` (0x443CA0 on car-info
-                        // `+0x218`, 0x443E18)
-                        let v = paint.exterior.into_iter().max().unwrap_or(0);
-                        let (fill, edge) = if v >= 0xBE { (0xFF00_0000, 0xFFFF_FFFF) } else { (0xFFFF_FFFF, 0xFF00_0000) };
-                        page_text_draw(page, paths, "racedecal.ffn", &s, rect, [fill, 0, edge], false);
-                    }
-                    if flag("flyer") {
-                        page_text_draw(page, paths, "license.ffn", "456787", rect, [0xFF00_0000, 0, 0xFF00_0000], true);
-                    }
-                }
-                if mirror && let Some(mp) = mirror_page && mp >= 1 && mp <= pages.len() {
-                    blit(&mut pages[mp - 1], &img.rgba, img.width, img.height, x + moffx, y + moffy, tint, &tints);
                 }
             }
         }
@@ -603,6 +666,28 @@ impl CarAssets {
 pub struct PageText {
     pub license: String,
     pub race_number: i32,
+}
+
+/// 0x444880 for one entry: its `[file<n>.<name>]` section's `license`, `racedecal` and `flyer`
+/// (each default 0, 0x4448D4…0x4448FF) and the text each draws, centred in the entry's rectangle.
+fn draw_entry_text(page: &mut TexturePage, paths: &GamePaths, text: &PageText, sec: &nfs_formats::ini::IniSection, rect: (i64, i64, i64, i64), paint: &Paint) {
+    let flag = |k: &str| sec.get_i64(k).unwrap_or(0) != 0;
+    if flag("license") {
+        let s: String = text.license.chars().take(8).collect();
+        page_text_draw(page, paths, "license.ffn", &s, rect, [0xFF00_0000, 0, 0xFF00_0000], false);
+    }
+    if flag("racedecal") {
+        let n = text.race_number;
+        let s = if n < 10 { format!("0{n}") } else { format!("{n}") };
+        // `this+0xAA`, the exterior's HSV value `max(r, g, b)` (0x443CA0 on car-info `+0x218`,
+        // 0x443E18)
+        let v = paint.exterior.into_iter().max().unwrap_or(0);
+        let (fill, edge) = if v >= 0xBE { (0xFF00_0000, 0xFFFF_FFFF) } else { (0xFFFF_FFFF, 0xFF00_0000) };
+        page_text_draw(page, paths, "racedecal.ffn", &s, rect, [fill, 0, edge], false);
+    }
+    if flag("flyer") {
+        page_text_draw(page, paths, "license.ffn", "456787", rect, [0xFF00_0000, 0, 0xFF00_0000], true);
+    }
 }
 
 /// A 12-bit SHPI position field, sign-extended as 0x4449FA / 0x444A0D read it.
@@ -727,7 +812,10 @@ fn page_text_draw(page: &mut TexturePage, paths: &GamePaths, font_file: &str, te
         return;
     }
     let min_x = quads.iter().map(|q| q.0).min().unwrap_or(0);
-    let max_x = quads.iter().map(|q| q.0 + q.2.width as i32).max().unwrap_or(0);
+    // 0x53ECE0 also takes the pen's end (`mesh+0x18`, 0x53EDB3) into the right edge; its low
+    // pen mark (`mesh+0x1C`) starts 1000 right of the pen (0x53DAD6) and moves only on a space
+    // or a line break, so it never reaches the left edge of these strings
+    let max_x = quads.iter().map(|q| q.0 + q.2.width as i32).max().unwrap_or(0).max(pen);
     let min_y = quads.iter().map(|q| q.1).min().unwrap_or(0);
     let max_y = quads.iter().map(|q| q.1 + q.2.height as i32).max().unwrap_or(0);
     let (x0, y0, w, h) = rect;
@@ -757,10 +845,154 @@ fn page_text_draw(page: &mut TexturePage, paths: &GamePaths, font_file: &str, te
     }
 }
 
+/// Which of the page builder's paths an entry takes (`RE/notes/car-model.md` §5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlitPath {
+    /// 0x444130: an 8-bit source with the tint flag set — its palette tinted, then written by the
+    /// page's format (32 0x444400, 1555 0x444329, 4444 0x444255; a 565 page gets nothing).
+    Palette,
+    /// 0x444494 (32-bit page) / 0x444602 (1555 page): a 32-bit source tinted texel by texel.
+    Texel,
+    /// Everything else, untinted: a straight copy of a 32-bit source onto a 32-bit page
+    /// (0x4447BA), else the software blitter 0x444843 → 0x53D570 → 0x571630, whose converter for
+    /// a 32-bit or palette source comes from the table 0x5DE3FC (0x534B90); a 24-bit source is
+    /// first made an opaque 8888 copy (0x534D40 → 0x570A00) and takes the 32-bit converter from it.
+    Blitter,
+}
+
+/// The raw palette indices of an 8-bit SHPI entry's base level (inline or RefPack-packed).
+fn indexed_texels(fsh: &Fsh, data: &[u8], idx: usize) -> Option<Vec<u8>> {
+    let b = &fsh.entries.get(idx)?.blocks[0];
+    let n = b.width as usize * b.height as usize;
+    let off = b.offset + 16;
+    let px = if b.is_compressed() {
+        refpack::decompress(data.get(off..b.offset + fsh.image_block_len(data.len(), idx))?).ok()?
+    } else {
+        data.get(off..off + n)?.to_vec()
+    };
+    (px.len() >= n).then(|| px[..n].to_vec())
+}
+
+/// What 0x444130's palette entry 255 holds when a texel of index 255 reaches the page — see
+/// `palette_path_texels`. APPROXIMATION: a zero dword.
+const PALETTE_ENTRY_255: [u8; 4] = [0, 0, 0, 0];
+
+/// 0x444130's palette path, texel by texel: the palette is copied to a stack buffer through the
+/// tint rule (`tint_texel`) and the texels written through the copy. The copy loop runs **255**
+/// times (0x444181 `mov [ebp−8], 0xFF` … 0x44422A), so entry 255 is never written. The buffer is
+/// `_alloca(0x41C)` (0x444159 `mov eax, 0x41C; call 0x5A1E90` — the CRT stack probe, which moves
+/// `esp` and only reads the pages it touches) rounded up to 32 bytes (0x444163…0x444169); nothing
+/// clears it, so entry 255 is whatever dword lies there: 0x4C…0x30 bytes below the stack pointer
+/// of the builder's call (0x44407E / 0x4440BA), at a place set by that pointer's 32-byte phase.
+/// For the first copy (0x44407E) the eight places hold, from the top: 0x00444163 (the probe's
+/// return, 0x44415E), 0x7B (its saved `ecx`, the source's SHPI code left by 0x537F90), then what
+/// 0x439EE0's last 0x523B00 (the entry section's `tint`) left — the key `"tint"` 0x5CD714, the
+/// `.tpg` object `[car+4]`, 0x523ADD, the saved `edi` (the file number) and `esi` (`car+4`), the
+/// key again — or, for an entry with no section of its own, what the section lookup 0x523E20 and
+/// `sprintf` left (the name buffer's address, 0x439F62, …). For the mirror copy (0x4440BA) the
+/// place lies in 0x444880's frame, whose `"file%d.%c%c%c%c"` name text sits there. Which of them
+/// it is the exe does not fix (MSVC 6 frames, no stack alignment; the thread's first `esp` is the
+/// system's) — UNKNOWN. Every index-255 texel of the shipped data takes a **1555** page
+/// (`examples/pagesrc.rs`: the drivers' `Suit.fsh` / `Head.fsh` entries, the `f901` `flag` / `eng`,
+/// the `eas8` `hood`), whose writer 0x444329 keeps bit 15 = `alpha > 0`. The candidates of the
+/// first copy with the alpha byte zero — all but the two `.tpg` pointers — leave the texel
+/// transparent there, so the port takes a zero dword (APPROXIMATION; the colour bits differ by
+/// candidate and only reach the screen through the filter).
+fn palette_path_texels(palette: &[[u8; 4]; 255], indices: &[u8], tints: &[[u8; 3]; 18]) -> Vec<u8> {
+    let pal: Vec<[u8; 4]> = palette.iter().map(|&c| tint_texel(c, tints)).collect();
+    let mut out = Vec::with_capacity(indices.len() * 4);
+    for &ix in indices {
+        out.extend_from_slice(&pal.get(ix as usize).copied().unwrap_or(PALETTE_ENTRY_255));
+    }
+    out
+}
+
+/// 0x537FB0: the palette block of the SHPI entry at `entry` — the chain walked from the image
+/// block by each block's 24-bit size field (`dword >> 8`, 0 = the last block) to the first block
+/// whose code is one of 0x22, 0x23, 0x24, 0x29, 0x2A, 0x2C, 0x2D, 0x2E; `None` (a null pointer)
+/// when there is none.
+fn clut_block(data: &[u8], entry: usize) -> Option<usize> {
+    let mut at = entry;
+    loop {
+        let d = u32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?);
+        if matches!(d & 0xFF, 0x22 | 0x24 | 0x23 | 0x29 | 0x2A | 0x2C | 0x2D | 0x2E) {
+            return Some(at);
+        }
+        if d & 0xFFFF_FF00 == 0 {
+            return None;
+        }
+        at = at.checked_add_signed(((d as i32) >> 8) as isize)?;
+    }
+}
+
+/// The palette 0x444130 tints: 0x537FB0's block (`clut_block`), read from `block + 0x10` as
+/// **255 little-endian dwords** `B G R A` (0x44417B `add edi, 0x10`, 0x44418F `[edi+3]`,
+/// 0x4441B7 `[edi]`, 0x44421D `add edi, 4`) whatever the block's own format — the builder never
+/// calls the converter 0x5346D0 the blitter uses. For a 0x2A palette (`B G R A` per colour) that
+/// is the palette itself. The `eas8` `hood` / `grad` and `gt3` `det2` entries carry a **0x24**
+/// block instead (three bytes a colour, 256 of them): read as dwords, colour `k` is bytes
+/// `4k…4k+3` of it — channels of neighbouring colours, the fourth byte (another colour's) standing
+/// for the alpha that picks the paint slot — and past colour 191 the dwords run on into the next
+/// entry's header and texels (`hood` into `rea`, `det2` into `dec`; `examples/pagesrc.rs`), all
+/// inside the same SHPI. A dword past the end of the file here would be whatever follows the SHPI
+/// in the loaded `.crp`; the port takes the zero dword there (no shipped palette-path entry reads
+/// that far). `None` when there is no palette block at all — 0x444130 would read through a null
+/// pointer; no shipped entry does.
+fn palette_path_palette(data: &[u8], entry: usize) -> Option<[[u8; 4]; 255]> {
+    let base = clut_block(data, entry)? + 0x10;
+    let mut pal = [[0u8; 4]; 255];
+    for (k, c) in pal.iter_mut().enumerate() {
+        if let Some(d) = data.get(base + 4 * k..base + 4 * k + 4) {
+            *c = [d[2], d[1], d[0], d[3]];
+        }
+    }
+    Some(pal)
+}
+
+/// The paint-slot rule of 0x444130 (palette) and 0x444494 / 0x444602 (texels):
+/// `slot = 20 − ((a+1)·20 >> 8)`; slots 0 / 10 / 20 are kept as they are, the others become
+/// `tint[slot − 1 − (slot > 10)] × grey >> 8` (grey = the red byte) with alpha `a > 0 ? FF : 0` —
+/// 0xFF on every tinted slot (0x4441AA…0x4441FC, 0x444576).
+fn tint_texel(s: [u8; 4], tints: &[[u8; 3]; 18]) -> [u8; 4] {
+    let slot = 20 - (((s[3] as u32 + 1) * 20) >> 8);
+    if slot == 0 || slot == 10 || slot == 20 {
+        // copied unchanged, alpha and all: a wheel face's corners outside the tyre keep their 0
+        // and the blended `CarWheel` pass leaves them out. *(Until 2026-09-25 the port forced 255
+        // on every page but the window and alpha ones, its own rule, which drew the corners of
+        // the spinning face square as black wedges past the tyre.)*
+        return s;
+    }
+    let paint = tints[(slot - 1 - u32::from(slot > 10)) as usize];
+    let grey = s[0] as u32;
+    [((paint[0] as u32 * grey) >> 8) as u8, ((paint[1] as u32 * grey) >> 8) as u8, ((paint[2] as u32 * grey) >> 8) as u8, 255]
+}
+
+/// A channel cut to its high `bits` and brought back to eight bits by repeating them — what the
+/// sampler reads out of the D3D 4444 / 1555 / 565 texture dx7z makes of the page (its format
+/// classifier 0x60003710 knows 1555, 565, 4444, 888 and 8888). For 4 bits this is `x·17`, exactly
+/// `x/15`; for 5 and 6 bits the byte nearest `x/31`, `x/63` up to rounding (APPROXIMATION: the
+/// hardware's expansion is in no code).
+fn expand(v: u8, bits: u32) -> u8 {
+    let x = (v >> (8 - bits)) as u32;
+    ((x << (8 - bits)) | (x >> (2 * bits - 8))) as u8
+}
+
 /// Copy `src` into the page at (x, y), applying the paint-slot rule (RE/notes/car-model.md §5):
-/// `slot = 20 − ((a+1)·20 >> 8)`; slots 0/10/20 are copied unchanged, others become `tint × grey`.
+/// `tint_texel` on the `Texel` path (the `Palette` path's texels come already tinted through their
+/// palette, `palette_path_texels`; the blitter tints nothing). Then the texel is stored as the original's writer for that
+/// path stores it in the page's format, and read back at eight bits (`expand`) — §5.4:
+///
+/// * **4444** — every channel truncated to its high nibble, alpha too: the blitter's 32 → 4444
+///   converter 0x570540 (`byte >> 4`, no rounding, no dither) and the palette path's 0x444255.
+/// * **565** — `r >> 3`, `g >> 2`, `b >> 3`, alpha dropped (0x570510 → 0x572F30); the palette
+///   path has no 565 writer (0x44424F leaves), so a tinted 8-bit source leaves the page as it was.
+/// * **1555** — `r`, `g`, `b` truncated to five bits; the alpha bit is `alpha > 0` on the builder's
+///   own paths (0x4446DD…0x4446F3, 0x444730…0x444740, 0x444383…0x44438E) and "the source dword is
+///   not 0" through the blitter (0x570370 → 0x572F5B: an all-zero texel stays 0, any other gets
+///   0x8000, so a coloured texel with alpha 0 turns opaque there).
+/// * **32** — kept as it is.
 #[allow(clippy::too_many_arguments)]
-fn blit(page: &mut TexturePage, src: &[u8], w: u32, h: u32, x: i64, y: i64, tint: bool, tints: &[[u8; 3]; 18]) {
+fn blit(page: &mut TexturePage, src: &[u8], w: u32, h: u32, x: i64, y: i64, path: BlitPath, tints: &[[u8; 3]; 18]) {
     for row in 0..h as i64 {
         let py = y + row;
         if py < 0 || py >= page.height as i64 {
@@ -773,32 +1005,21 @@ fn blit(page: &mut TexturePage, src: &[u8], w: u32, h: u32, x: i64, y: i64, tint
             }
             let s = &src[((row as u32 * w + col as u32) * 4) as usize..][..4];
             let d = &mut page.rgba[((py as u32 * page.width + px as u32) * 4) as usize..][..4];
-            let a = s[3] as u32;
-            let slot = 20 - (((a + 1) * 20) >> 8);
-            if tint && slot != 0 && slot != 10 && slot != 20 {
-                // `idx = slot − 1 − (slot > 10)`, the band (0x4441AA…0x4441B4)
-                let paint = tints[(slot - 1 - u32::from(slot > 10)) as usize];
-                let grey = s[0] as u32;
-                d[0] = ((paint[0] as u32 * grey) >> 8) as u8;
-                d[1] = ((paint[1] as u32 * grey) >> 8) as u8;
-                d[2] = ((paint[2] as u32 * grey) >> 8) as u8;
-                d[3] = 255;
-            } else {
-                // copied unchanged, alpha and all (0x444130's slots 0 / 10 / 20, and every texel
-                // of an untinted page): a wheel face's corners outside the tyre keep their 0 and
-                // the blended `CarWheel` pass leaves them out. *(Until 2026-09-25 the port forced
-                // 255 on every page but the window and alpha ones, its own rule, which drew the
-                // corners of the spinning face square as black wedges past the tyre.)*
-                d.copy_from_slice(s);
-            }
-            // what the page's surface keeps of the alpha: none in 565, one bit in 1555 — set for
-            // any alpha above 0, as the 1555 tint path computes it (0x4446DD…0x4446F3; taken for
-            // the untinted texels too, APPROXIMATION) — and all eight bits in 32 (4444's four are
-            // kept as eight, APPROXIMATION)
+            // the `Texel` path tints here; the `Palette` path's texels come tinted through their
+            // palette (`palette_path_texels`); the blitter tints nothing
+            let t: [u8; 4] = if path == BlitPath::Texel { tint_texel([s[0], s[1], s[2], s[3]], tints) } else { [s[0], s[1], s[2], s[3]] };
+            // what the page's surface keeps of the texel (see above). *(Until 2026-09-25 a 4444
+            // page kept all eight bits of every channel and a 565 / 1555 one all eight of colour,
+            // and the 1555 alpha bit was `alpha > 0` on every path.)*
             match page.bpp {
-                565 => d[3] = 255,
-                1555 => d[3] = if d[3] > 0 { 255 } else { 0 },
-                _ => {}
+                4444 => d.copy_from_slice(&t.map(|c| expand(c, 4))),
+                565 if path == BlitPath::Palette => {}
+                565 => d.copy_from_slice(&[expand(t[0], 5), expand(t[1], 6), expand(t[2], 5), 255]),
+                1555 => {
+                    let bit = if path == BlitPath::Blitter { t != [0; 4] } else { t[3] > 0 };
+                    d.copy_from_slice(&[expand(t[0], 5), expand(t[1], 5), expand(t[2], 5), if bit { 255 } else { 0 }]);
+                }
+                _ => d.copy_from_slice(&t),
             }
         }
     }
@@ -856,7 +1077,7 @@ pub fn damage_patches(paths: &GamePaths, model: &str, night: bool) -> Result<Vec
             x: (b.misc[2] & 0xFFF) as u32,
             y: (b.misc[3] & 0xFFF) as u32,
             threshold: b.misc[1] as f32,
-            image: TextureImage { name: e.name.clone(), width: img.width, height: img.height, mips: vec![img.rgba], has_alpha: true, page: b.misc[0] as usize, x: (b.misc[2] & 0xFFF) as u32, y: (b.misc[3] & 0xFFF) as u32, place: [b.misc[0] as i16 as i32, b.misc[1] as i16 as i32], text: None },
+            image: TextureImage { name: e.name.clone(), width: img.width, height: img.height, mips: vec![img.rgba], has_alpha: true, code: b.code, page: b.misc[0] as usize, x: (b.misc[2] & 0xFFF) as u32, y: (b.misc[3] & 0xFFF) as u32, place: [b.misc[0] as i16 as i32, b.misc[1] as i16 as i32], text: None },
         });
     }
     Ok(out)
@@ -939,6 +1160,47 @@ mod wheel_channel_tests {
 }
 
 #[cfg(test)]
+mod race_page_tests {
+    use super::*;
+
+    /// A race car is the front end's `R3DCar` (0x437920 stores vtable 0x5B3620 over the
+    /// `R3DObject` one), so its tint flag is 0x439EE0's in both: the 993's driver pages (10 suit,
+    /// 11 head — global 8-bit files, no `frontend` / `night` / `testdrive` keys) come out the same.
+    #[test]
+    fn race_pages_are_painted_as_the_front_ends() {
+        let Ok(paths) = GamePaths::locate() else { return };
+        let Ok(car) = CarAssets::load(&paths, "993") else { return };
+        let mut style = CarStyle::from_tpg(&car.tpg, 1);
+        style.front_end = true;
+        let fe = car.build_pages(&paths, [200, 0, 0], &style).unwrap();
+        style.front_end = false;
+        let race = car.build_pages(&paths, [200, 0, 0], &style).unwrap();
+        for n in [10, 11] {
+            assert!(fe[n - 1].rgba == race[n - 1].rgba, "page {n} differs between the front end and a race");
+        }
+    }
+}
+
+#[cfg(test)]
+mod mirror_page_tests {
+    use super::*;
+
+    /// `[tpage2] sourcetpage=1`: page 2 is page 1 built again from `file1` (0x442F73…0x442F8E),
+    /// the race number of `[file1.decr] racedecal=1` included (0x444880 after each copy).
+    #[test]
+    fn source_page_is_built_again_with_its_text() {
+        let Ok(paths) = GamePaths::locate() else { return };
+        let Ok(mut car) = CarAssets::load(&paths, "993") else { return };
+        let style = CarStyle::from_tpg(&car.tpg, 1);
+        let plain = car.build_pages(&paths, [200, 0, 0], &style).unwrap();
+        car.page_text = Some(PageText { license: "I8A4RE".into(), race_number: 7 });
+        let text = car.build_pages(&paths, [200, 0, 0], &style).unwrap();
+        assert!(text[0].rgba == text[1].rgba, "page 2 differs from page 1");
+        assert!(text[1].rgba != plain[1].rgba, "no race number on page 2");
+    }
+}
+
+#[cfg(test)]
 mod entry_tests {
     use super::*;
 
@@ -957,5 +1219,80 @@ mod entry_tests {
         // skidpad, anything else
         st.skidpad = Some(false);
         assert!(!st.entry_enabled(a) && st.entry_enabled(b));
+    }
+}
+
+#[cfg(test)]
+mod page_format_tests {
+    use super::*;
+
+    fn page(bpp: i64) -> TexturePage {
+        TexturePage { width: 1, height: 1, rgba: vec![9; 4], is_window: false, is_alpha: false, bpp }
+    }
+
+    /// What each page format keeps of one texel (0x570540, 0x572F30, 0x572F5B, 0x4446DD).
+    #[test]
+    fn texel_per_format() {
+        let tints = [[0; 3]; 18];
+        let put = |bpp, src: [u8; 4], path| {
+            let mut p = page(bpp);
+            blit(&mut p, &src, 1, 1, 0, 0, path, &tints);
+            [p.rgba[0], p.rgba[1], p.rgba[2], p.rgba[3]]
+        };
+        // 4444: high nibbles, alpha too, read back as x·17
+        assert_eq!(put(4444, [0x1F, 0x80, 0xFF, 0x0B], BlitPath::Blitter), [0x11, 0x88, 0xFF, 0x00]);
+        // 565: 5/6/5 truncated, opaque
+        assert_eq!(put(565, [0x0F, 0x07, 0xFF, 0x00], BlitPath::Blitter), [0x08, 0x04, 0xFF, 0xFF]);
+        // a tinted 8-bit source on a 565 page writes nothing
+        assert_eq!(put(565, [0x0F, 0x07, 0xFF, 0xFF], BlitPath::Palette), [9; 4]);
+        // 1555 through the blitter: any non-zero dword is opaque, zero stays zero
+        assert_eq!(put(1555, [0x80, 0, 0, 0], BlitPath::Blitter), [0x84, 0, 0, 0xFF]);
+        assert_eq!(put(1555, [0, 0, 0, 0], BlitPath::Blitter), [0; 4]);
+        // 1555 on the builder's own path: alpha > 0
+        assert_eq!(put(1555, [0x80, 0, 0, 0], BlitPath::Texel), [0x84, 0, 0, 0]);
+        // 32: unchanged
+        assert_eq!(put(32, [1, 2, 3, 4], BlitPath::Blitter), [1, 2, 3, 4]);
+        // a 24-bit source: 0x570A00's copy is opaque (alpha 0xFF), then the 32-bit converter —
+        // a black texel is not the zero dword, so it is opaque on 1555 too (0x572F5B)
+        assert_eq!(put(1555, [0, 0, 0, 0xFF], BlitPath::Blitter), [0, 0, 0, 0xFF]);
+        assert_eq!(put(565, [0x0F, 0x07, 0xFF, 0xFF], BlitPath::Blitter), [0x08, 0x04, 0xFF, 0xFF]);
+    }
+
+    /// 0x444130 tints palette entries 0…254 and never writes 255 (0x444181): a texel of index
+    /// 255 takes `PALETTE_ENTRY_255`, whatever the file's palette holds there, and on a 1555 page
+    /// its alpha bit is clear.
+    #[test]
+    fn palette_entry_255_is_not_the_files() {
+        let mut tints = [[0; 3]; 18];
+        tints[3] = [255, 0, 0];
+        // α 204 → slot 4 → tint 3; the same colour as index 254 and index 255
+        let mut pal = [[0u8; 4]; 255];
+        pal[254] = [200, 200, 200, 204];
+        pal[0] = [7, 7, 7, 255];
+        let out = palette_path_texels(&pal, &[254, 255, 0], &tints);
+        assert_eq!(&out[0..4], &[199, 0, 0, 255]);
+        assert_eq!(&out[4..8], &PALETTE_ENTRY_255);
+        assert_eq!(&out[8..12], &[7, 7, 7, 255]);
+        let mut p = page(1555);
+        blit(&mut p, &out[4..8], 1, 1, 0, 0, BlitPath::Palette, &tints);
+        assert_eq!(p.rgba[3], 0);
+    }
+
+    /// 0x537FB0 walks the block chain to the first palette code, and 0x444130 reads that block
+    /// as dwords whatever its format — a 0x24 (3-byte) palette mixes neighbouring colours.
+    #[test]
+    fn palette_block_is_read_as_dwords() {
+        // image block 0x7B, 2x1, next block at +0x12; then a 0x24 block, the last
+        let mut d = vec![0x7B, 0x12, 0, 0, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        d.extend_from_slice(&[0x24, 0, 0, 0, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        d.extend_from_slice(&[10, 20, 30, 11, 21, 31]);
+        assert_eq!(clut_block(&d, 0), Some(0x12));
+        let pal = palette_path_palette(&d, 0).unwrap();
+        // dword 0 = bytes 10 20 30 11: B G R A
+        assert_eq!(pal[0], [30, 20, 10, 11]);
+        // dword 1 = 21 31 and two bytes past the file: zero
+        assert_eq!(pal[1], [0, 0, 0, 0]);
+        // no palette block: a null pointer
+        assert_eq!(clut_block(&d[..0x12], 0), None);
     }
 }

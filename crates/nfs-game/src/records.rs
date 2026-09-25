@@ -76,6 +76,17 @@ impl Records {
         Self { file, meta }
     }
 
+    /// `RESETRECORDS`, 0x4FB500: 0x4FB1A0 copies `FEData\Data\nfs5.trk` over the save
+    /// (`CopyFileA` with fail-if-exists 0, so it overwrites), 0x4FAFB0 frees the table and
+    /// 0x4FAE20 reads it back.
+    pub fn reset(paths: &GamePaths, save: &Path) -> Self {
+        let seed_path = paths.fe_data().join("Data").join("nfs5.trk");
+        if let Err(e) = std::fs::copy(&seed_path, save) {
+            tracing::warn!(error = %e, "track records not reset");
+        }
+        Self::load(paths, save)
+    }
+
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         if self.file.raw.is_empty() {
             return Ok(());

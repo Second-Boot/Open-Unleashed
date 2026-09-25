@@ -23,16 +23,20 @@ pub enum CopRecord {
     },
     /// Type 3 — an explicit world placement. No shipped file contains one.
     Placed { slice: i32, direction: i32, position: [f32; 3], speed_kmh: i32, goto_slice: i32 },
-    /// Type 5 — a group with trailing 20-byte sub-records whose contents are UNKNOWN.
-    Group { sub_count: u32 },
+    /// Type 5 — a group with trailing 20-byte sub-records whose contents are UNKNOWN. `+0x04` is
+    /// its slice like every other type's: the sort key 0x40E5F0 and the cursor walk 0x40E4B0 read
+    /// `rec+4` whatever the type.
+    Group { slice: i32, sub_count: u32 },
 }
 
 impl CopRecord {
+    /// `rec+0x04`, for every type — what 0x40E5F0 sorts on (`[a]+4 − [b]+4`, 0x40E5FC…0x40E602)
+    /// and 0x40E4B0 walks.
     pub fn slice(&self) -> i32 {
         match self {
             CopRecord::Point { slice, .. } => *slice,
             CopRecord::Placed { slice, .. } => *slice,
-            CopRecord::Group { .. } => 0,
+            CopRecord::Group { slice, .. } => *slice,
         }
     }
 
@@ -75,7 +79,7 @@ impl CopFile {
                 ),
                 5 => {
                     let sub = u32_le(data, p + 0x38, what)?;
-                    (CopRecord::Group { sub_count: sub }, 0x40 + 20 * sub as usize)
+                    (CopRecord::Group { slice: i(p + 4)?, sub_count: sub }, 0x40 + 20 * sub as usize)
                 }
                 // the original's parse loop would advance by zero bytes here and spin for ever
                 other => return Err(FormatError::UnexpectedValue { what, offset: p, expected: "record type 1, 2, 3 or 5".into(), found: other.to_string() }),
@@ -111,6 +115,22 @@ mod tests {
         assert_eq!(f.records.iter().map(|r| r.slice()).collect::<Vec<_>>(), vec![100, 900, 1500], "sorted by slice");
         assert_eq!(f.records[0], CopRecord::Point { kind: 1, slice: 100, moving: false });
         assert!(f.records[0].spawnable());
+    }
+
+    #[test]
+    fn a_type_five_record_sorts_on_its_slice() {
+        // type 5: `+0x04` slice, `+0x38` sub-record count, 0x40 + 20·count bytes in all
+        let mut g = vec![0u8; 0x40 + 20 * 2];
+        g[0..4].copy_from_slice(&5u32.to_le_bytes());
+        g[4..8].copy_from_slice(&700i32.to_le_bytes());
+        g[0x38..0x3C].copy_from_slice(&2u32.to_le_bytes());
+        let mut d = 3u32.to_le_bytes().to_vec();
+        d.extend(point(1500, 1));
+        d.extend(g);
+        d.extend(point(100, 0));
+        let f = CopFile::parse(&d).unwrap();
+        assert_eq!(f.records.iter().map(|r| r.slice()).collect::<Vec<_>>(), vec![100, 700, 1500]);
+        assert_eq!(f.records[1], CopRecord::Group { slice: 700, sub_count: 2 });
     }
 
     #[test]

@@ -156,7 +156,8 @@ pub struct SavedPart {
 pub struct SavedCar {
     /// The 0x758-byte FE car object verbatim; it begins with the 1648-byte `nfs5.car` record.
     pub image: Vec<u8>,
-    /// `car+0x75C` — written first (`career.md` §10 calls it the spare/removed list).
+    /// `car+0x75C` — written first: the car's **stock** parts (0x4EE9A0; `controls.md` §4.169.6
+    /// corrects `career.md` §10's "spare/removed list"). The field keeps its old name.
     pub removed: Vec<SavedPart>,
     /// `car+0x758` — the installed list.
     pub installed: Vec<SavedPart>,

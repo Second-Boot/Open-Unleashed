@@ -38,6 +38,8 @@ use crate::text::BitmapFont;
 
 mod dialog_draw;
 mod end_of_era_draw;
+pub mod loading;
+pub mod nav;
 mod widgets;
 use widgets::WidgetDraw;
 
@@ -145,6 +147,9 @@ struct MoviePlayer {
     clock_q16: u64,
     tex: TextureId,
     size: (f32, f32),
+    /// The clip has played to its last frame at least once — what `NFS5.MOVIECIRCLE`'s tick asks
+    /// the player (0x4E2960) before `careerfirst` moves on (0x4CD608).
+    finished: bool,
 }
 
 impl MoviePlayer {
@@ -172,7 +177,7 @@ impl MoviePlayer {
             return None;
         }
         let tex = r.upload_texture(&TextureData::single(f.width as u32, f.height as u32, f.rgba));
-        Some(MoviePlayer { data, chunks, decoder, next: 1, period_q16: header.period.max(1) as u64, clock_q16: 0, tex, size: (f.width as f32, f.height as f32) })
+        Some(MoviePlayer { data, chunks, decoder, next: 1, period_q16: header.period.max(1) as u64, clock_q16: 0, tex, size: (f.width as f32, f.height as f32), finished: false })
     }
 
     /// Step by `dt_ms`, decoding and uploading the frames the period calls for; a movie that has
@@ -184,6 +189,7 @@ impl MoviePlayer {
             self.clock_q16 -= self.period_q16;
             if self.next >= self.chunks.len() {
                 self.next = 0;
+                self.finished = true;
             }
             let (off, len) = self.chunks[self.next];
             self.next += 1;
@@ -299,6 +305,11 @@ pub struct LayoutScreen {
     /// `[0x65B940]`, the name-box codes the player has typed (`nfs_game::cheats`) — bit 6 is read
     /// by the credits roll
     pub cheat_bits: u32,
+    /// `[0x5D8F2C]`, the driver picture the front end has chosen: 8 in the image, written by
+    /// `CREATEPLAYERENTER`'s 0x4CF790(8) and by `NFS5.PLAYERDRIVERPICTURE`'s release 0x4CF940.
+    /// The app owns the global and hands it to each screen it opens; the pictures' draw 0x4CF7C0
+    /// compares it against their own `data.ournumber` (0x4CF83B, 0x4CF8E1).
+    pub driver_picture: i32,
     /// the `weeicons.fsh` entry tagged `GLNT`, when this screen has a `NFS5.HEADER` to sweep it
     /// across — `RE/notes/controls.md` §4.25
     glint: Option<usize>,
@@ -761,6 +772,9 @@ pub struct ListBoxWidget {
 pub struct ListCell {
     /// the `name` of the widget whose x this column sits at
     pub anchor: String,
+    /// the offset from the anchor. Its **sign** is the alignment: a negative offset — `-0.0`
+    /// included — right-aligns the text there (align 2), any other left-aligns it, so `-0.0` is
+    /// "right-aligned at the anchor itself" (the parts basket's `ID_PRICEPOS`, 0x516051)
     pub dx: f32,
     pub text: String,
 }
@@ -1447,6 +1461,7 @@ impl LayoutScreen {
             credits_roll: Default::default(),
             end_of_era: None,
             cheat_bits: 0,
+            driver_picture: crate::save::DEFAULT_PICTURE as i32,
             // `NFS_FE_CURSOR=x,y` parks the pointer for a still, the way `NFS_FE_CLOCK` parks the
             // clock — a screenshot has no pointer of its own
             cursor: std::env::var("NFS_FE_CURSOR").ok().and_then(|v| {
@@ -2573,9 +2588,9 @@ impl LayoutScreen {
             .elements
             .iter()
             .enumerate()
-            // `NFS5.CHATDISPLAYBOX` takes the same binding: its draw is a row walk over its own
-            // accessor too, only with a fixed spacing rather than the list box's 14 (§4.131)
-            .filter(|(_, e)| e.class == "NFS5.ListBox" || e.class == "NFS5.CHATDISPLAYBOX")
+            // `NFS5.CHATDISPLAYBOX` is not one: its rows are the chat's, and its accessor only
+            // names the players (see `chat_boxes`). *(It was bound here until 2026-09-25.)*
+            .filter(|(_, e)| e.class == "NFS5.ListBox")
             .map(|(index, e)| ListBoxWidget { index, accessor: self.attr(e, "accessor").map(str::to_string) })
             .collect();
         // …and the ones inside the panels this screen holds, in the flattened index space, as
@@ -2590,6 +2605,51 @@ impl LayoutScreen {
             base += self.groups[&k].span();
         }
         out
+    }
+
+    /// The `NFS5.CHATDISPLAYBOX` widgets on this screen (top level; the three shipped ones are).
+    ///
+    /// Their rows are **not** their accessor's. The bind 0x4C2B60 keeps two accessors: `[+0x154]`
+    /// is `data.accessor` — `Comms.PlayerList` on all three shipped boxes — and is only asked for
+    /// **names** (0x4C2530, 0x4C259A: 0x4BBB60 finds a player's row, slot 12 its text); `[+0x150]`
+    /// is a range accessor of the box's own, `"%s.SliderBar"` (0x4C2BEF, 0x4BA310), which the
+    /// scrollbar moves. The rows the draw 0x4C2F50 walks are the vector `[0x65B6A8]` of chat
+    /// lines (0x4C2FD1), filled by 0x4C24F0 as lines arrive. *(Corrected 2026-09-25: §4.131 read
+    /// the rows as the accessor's, and the box showed the player list.)*
+    pub fn chat_boxes(&self) -> Vec<usize> {
+        self.layout.elements.iter().enumerate().filter(|(_, e)| e.class == "NFS5.CHATDISPLAYBOX").map(|(i, _)| i).collect()
+    }
+
+    /// Fill a chat box with its lines — what **0x4C24F0** does with each one after formatting it:
+    ///
+    /// ```text
+    /// 0x4C2600  at_end = slider.index == slider.count - 1
+    /// 0x4C2625  wrap the line in "Univers8b" to [0x5D7DE0] - 8   ; 0x523080, the box's width
+    ///           (0x4C29F7) less eight
+    /// 0x4C267D  push every wrapped row onto [0x65B6A8]
+    /// 0x4C2711  while there are more than 100 rows, drop the first
+    /// 0x4C2764  slider range = 0 .. max(0, rows - fit)          ; fit = [+0x148], §4.131
+    /// 0x4C27A2  at_end -> slider.index = the new last
+    /// ```
+    ///
+    /// This port has no scrolling of its own for the box, so the slider is always at its end and
+    /// the first row drawn is `max(0, rows − fit)`; its count, which the scrollbar's knob is laid
+    /// out by, is that plus one.
+    pub fn set_chat_lines(&mut self, index: usize, lines: &[String]) {
+        let Some(e) = self.layout.elements.get(index) else { return };
+        let (w, _) = self.box_of(e, 0);
+        let spacing = self.attr_num(e, "spacing").unwrap_or(14.0) as f32;
+        let fit = if spacing > 0.0 { (self.attr_num(e, "height").unwrap_or(0.0) as f32 / spacing) as usize } else { 0 };
+        let Some(f) = self.fonts.get("univers8b.ffn") else { return };
+        let mut rows: Vec<ListRow> = lines.iter().flat_map(|l| wrap_lines(f, l, w - 8.0)).map(ListRow::Text).collect();
+        let over = rows.len().saturating_sub(100);
+        rows.drain(..over);
+        let first = rows.len().saturating_sub(fit);
+        if rows.is_empty() {
+            self.lists.remove(&index);
+        } else {
+            self.lists.insert(index, (rows, Some(first)));
+        }
     }
 
     /// The combo sliders and colour boxes, which take the same row binding as a list box: their
@@ -3351,6 +3411,11 @@ impl LayoutScreen {
         out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
     }
 
+    /// True once any movie on this screen has played through (0x4E2960).
+    pub fn movie_finished(&self) -> bool {
+        self.movies.values().any(|m| m.finished)
+    }
+
     pub fn advance_movies(&mut self, r: &mut Renderer, dt_ms: u32) {
         for m in self.movies.values_mut() {
             m.advance(r, dt_ms);
@@ -4080,6 +4145,18 @@ impl LayoutScreen {
         self.layout.elements.get(index).map(|e| e.class.clone())
     }
 
+    /// `NFS5.PLAYERDRIVERPICTURE`'s slot 9, **0x4CF940** — the release on one of
+    /// `createplayer.lay`'s eight pictures answers its `data.ournumber` (`[this+0x140]`, bound by
+    /// slot 20 0x4CF7A0 through 0x4C8B00), which the caller stores in `[0x5D8F2C]`. No sound, no
+    /// other state; the slot returns 1. `None` for any other widget.
+    pub fn driver_picture_of(&self, index: usize) -> Option<i32> {
+        if let Some((k, j)) = self.route(index) {
+            return self.groups.get(&k)?.driver_picture_of(j);
+        }
+        let e = self.layout.elements.get(index)?;
+        (e.class == "NFS5.PLAYERDRIVERPICTURE").then(|| self.attr_num(e, "ournumber").unwrap_or(0.0) as i32)
+    }
+
     /// An activate on an input box takes focus, as `FeInputBox`'s slot 9 does:
     ///
     /// ```text
@@ -4330,7 +4407,8 @@ impl LayoutScreen {
     /// `FEStringAccessor`'s constructor 0x4BC8B0 — the ctor allocates `maxLen + 1` bytes and the
     /// insert at `vt[0x30]` refuses to pass it. Read out of the three registrations that carry a
     /// name this port can see: `UserList.NameInput` at 0x4E5D9E pushes **8**, `ANOTHER` at
-    /// 0x4E6016 pushes **15**, `COMMS.PASSWORD` at 0x50B9C1 pushes **7**.
+    /// 0x4E6016 pushes **15**, `COMMS.PASSWORD` at 0x50B9C1 pushes **7**, `Comms.ChatInput` at
+    /// 0x50BA95 pushes **45** (0x2D).
     ///
     /// Every other box's limit lives in a registration this port has not read, so it is left
     /// **unlimited** rather than guessed — a cap invented here would silently truncate a name the
@@ -4340,6 +4418,7 @@ impl LayoutScreen {
             "UserList.NameInput" => Some(8),
             "ANOTHER" => Some(15),
             "COMMS.PASSWORD" => Some(7),
+            "Comms.ChatInput" => Some(45),
             _ => None,
         }
     }
@@ -4398,6 +4477,23 @@ impl LayoutScreen {
         let text = self.edits.get(&index)?.clone();
         self.focused.remove(&index);
         Some((name, text))
+    }
+
+    /// `NFS5.CHATINPUTBOX`'s Return — its slot 4, **0x4C3310**, which the chat box has in place of
+    /// the input boxes' 0x4CCC20:
+    ///
+    /// ```text
+    /// 0x4C3325  focused? and 0x4C3332 the key is 0x0D?   otherwise 0x4CCC20, the shared handler
+    /// 0x4C3364  text = accessor->vt[0x10]()              ; sent by 0x48D9B0, the caller's part
+    /// 0x4C3376  accessor->vt[0x44]()                     ; clear (0x4BC9C0)
+    /// 0x4C3388  this->vt[0x38]()                         ; slot 14, 0x4CC7B0, the box's re-measure
+    /// ```
+    ///
+    /// so, unlike 0x4CCDB5's commit, the box **keeps its focus** and the line is taken whatever it
+    /// holds, an empty one included. Answers the text when `index` is a chat input box.
+    pub fn take_chat(&mut self, index: usize) -> Option<String> {
+        (self.layout.elements.get(index)?.class == "NFS5.CHATINPUTBOX").then_some(())?;
+        Some(self.edits.remove(&index).unwrap_or_default())
     }
 
     /// Empty the input box bound to `accessor` — the string accessor's clear, its slot 0x44.
@@ -5395,6 +5491,28 @@ impl LayoutScreen {
         self.gouraud(out, aspect, [[r, y + b], [r + a, y + b], [r, y + 2.0 * b], [r, y + 2.0 * b]], [edge, edge, near, near]);
     }
 
+    /// The chosen driver picture's frame, **0x521B60** — one caller, `NFS5.PLAYERDRIVERPICTURE`'s
+    /// draw at 0x4CF87C, with `(x, y, w, h, fade, 5)`. Two colours go through the fade (0x4D87F0):
+    /// **0xFFFFFFFF** (0x521B6E) and **0x80FFFFFF** (0x521B7B). Four gouraud quads 0x4D98D0 ring
+    /// the box `t` pixels wide, opaque white where they touch it and half white at the outside:
+    ///
+    /// | band | upper-left | upper-right | lower-left | lower-right |
+    /// |---|---|---|---|---|
+    /// | top (0x521BE2) | `(x−t, y−t)` 80 | `(x+w+t, y−t)` 80 | `(x, y)` FF | `(x+w, y)` FF |
+    /// | bottom (0x521C26) | `(x, y+h)` FF | `(x+w, y+h)` FF | `(x−t, y+h+t)` 80 | `(x+w+t, y+h+t)` 80 |
+    /// | left (0x521C63) | `(x−t, y−t)` 80 | `(x, y)` FF | `(x−t, y+h+t)` 80 | `(x, y+h)` FF |
+    /// | right (0x521C9C) | `(x+w, y)` FF | `(x+w+t, y−t)` 80 | `(x+w, y+h)` FF | `(x+w+t, y+h+t)` 80 |
+    ///
+    /// Unlike 0x521050 and 0x520F00 it asks no global gate. CONFIRMED (symbolic walk of the stack).
+    fn picture_frame(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32, t: f32) {
+        let (inner, outer) = (tint([0xff, 0xff, 0xff, 0xff]), tint([0xff, 0xff, 0xff, 0x80]));
+        let (r, b) = (x + w, y + h);
+        self.gouraud(out, aspect, [[x - t, y - t], [r + t, y - t], [x, y], [r, y]], [outer, outer, inner, inner]);
+        self.gouraud(out, aspect, [[x, b], [r, b], [x - t, b + t], [r + t, b + t]], [inner, inner, outer, outer]);
+        self.gouraud(out, aspect, [[x - t, y - t], [x, y], [x - t, b + t], [x, b]], [outer, inner, outer, inner]);
+        self.gouraud(out, aspect, [[r, y], [r + t, y - t], [r, b], [r + t, b + t]], [inner, outer, inner, outer]);
+    }
+
     /// The front end's beveled frame, **0x521050** — a shared painter with twenty call sites, of
     /// which `NFS5.BEVELEDOPTIONBOX`'s (0x520EEC, thickness **3**) is the one this port draws so
     /// far. It takes `(x, y, w, h, fade, thickness)` as four floats and two ints, and paints four
@@ -5753,9 +5871,26 @@ impl LayoutScreen {
         blank
     }
 
+    /// The screen **without** the background screen it names — how a screen draws when it is
+    /// one layer of several: the manager's draw 0x4D2B80 paints the one background object
+    /// `[fe+0xE4]` (the top screen's `data.screen`, swapped by 0x4D1BD0) and then every layer's
+    /// screen, bottom first (0x4D2BD9…0x4D2C0C), so a covered screen shows between the two.
+    pub fn sprites_own(&self, aspect: f32, strings: &Strings, selected: Option<usize>, accessor: &dyn Fn(&str) -> Option<String>) -> Vec<Sprite> {
+        self.sprites_reporting_bg(aspect, strings, selected, accessor, &mut Vec::new(), false)
+    }
+
+    /// The background screen alone (`[fe+0xE4]`), empty when the screen names none.
+    pub fn background_sprites(&self, aspect: f32, strings: &Strings, accessor: &dyn Fn(&str) -> Option<String>) -> Vec<Sprite> {
+        self.background.as_ref().map(|bg| bg.sprites(aspect, strings, None, accessor)).unwrap_or_default()
+    }
+
     fn sprites_reporting(&self, aspect: f32, strings: &Strings, selected: Option<usize>, accessor: &dyn Fn(&str) -> Option<String>, blank: &mut Vec<(String, String)>) -> Vec<Sprite> {
+        self.sprites_reporting_bg(aspect, strings, selected, accessor, blank, true)
+    }
+
+    fn sprites_reporting_bg(&self, aspect: f32, strings: &Strings, selected: Option<usize>, accessor: &dyn Fn(&str) -> Option<String>, blank: &mut Vec<(String, String)>, with_bg: bool) -> Vec<Sprite> {
         let mut out = Vec::new();
-        if let Some(bg) = &self.background {
+        if let Some(bg) = self.background.as_ref().filter(|_| with_bg) {
             // the background's own gaps are not this screen's: every background layout is one of
             // the 98 in `FEData/Layouts` and the sweep measures it in its own right, so reporting
             // it here would count it once per screen that sits on it

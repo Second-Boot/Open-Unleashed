@@ -23,12 +23,19 @@ pub const LAST: u8 = 0xC6;
 /// The ids this port understands by name. The rest travel as [`Kind::Other`], which keeps a
 /// conversation going without pretending to know what a message means.
 pub mod kind {
-    /// 0x48F3D2 — a peer joins; the body is the player record `0x48C840` builds from.
+    /// 0x48F3D2 — a player is in the room; the body is its name, which `0x48C840` copies into a
+    /// new record (`crate::room`).
     pub const JOIN: u8 = 0xB0;
-    /// 0x48F46F — a peer leaves; the handler removes it from the list at `net+0x260`.
+    /// 0x48F46F — a player has gone; the handler removes it from the list at `net+0x260`.
     pub const LEAVE: u8 = 0xB1;
-    /// 0x48F38B — the second player-building message.
-    pub const JOIN_ALT: u8 = 0xBB;
+    /// 0x48F38B — a chat line (`crate::room::ChatLine`). *(This was named `JOIN_ALT`, "the second
+    /// player-building message", until 2026-09-25; 0x48F38B builds nothing — it hands the text to
+    /// the callback at `[net+0x20]`.)*
+    pub const CHAT: u8 = 0xBB;
+    /// 0x48F6AD — the first chunk of a player's file (`crate::room::Chunk`).
+    pub const DATA_FIRST: u8 = 0xBF;
+    /// 0x48F6AD — every later chunk of it.
+    pub const DATA_MORE: u8 = 0xC0;
     /// 0x48EDF0 / 0x48F5E8 — the per-tick car state of [`crate::state`].
     pub const CAR_STATE: u8 = 0xBE;
     /// 0x48F34F — eject / shut down (`push 0xC6` at 0x491748, under "Ejected by host").

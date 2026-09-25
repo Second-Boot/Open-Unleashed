@@ -1,10 +1,11 @@
 //! Sky: the layers `Track/Sky/<Track>.txt` asks for, on a dome (`SkyLevel_*`, RE/RENDERING.md).
 //!
 //! The layer list, the textures, their UV repeats, the wind and the warp all come from the track's
-//! own sky file now (`nfs_formats::sky`): the block of the `SKYRENDERING` level is taken, weather
-//! region A is used, and each layer that names a sky map is drawn as one dome, the first opaque and
-//! the rest alpha-blended (the shipped tracks are all `MULTINORMAL` or `basic`). The `horz` horizon
-//! strips keep their ring.
+//! own sky file now (`nfs_formats::sky`): the block of the `SKYRENDERING` level is taken, and each
+//! stage is the grid below with its **cloud** as the texture (`flat`: none) and its **sky map** —
+//! region A's, blended towards region B's by `t` — as the 16 × 16 vertices' colours (`MapBlend`),
+//! blended into the frame unless 0x45BBA5's test calls it opaque (the shipped tracks are all
+//! `MULTINORMAL` or `basic`). The `horz` horizon strips keep their ring.
 //!
 //! The **horizon ring is the original's own** now (`RE/RENDERING.md`, sky `.bin`): sixteen quads on
 //! a circle of the radius the `.bin`'s weather-region-A record gives, spanning `+0x14` to
@@ -25,8 +26,9 @@
 //! within `±warpAmount` that is redrawn every 32 steps.
 //!
 //! **APPROXIMATION** in what is left: the jitter's random numbers come from the port's own
-//! generator, not the game's shared 0x538040 sequence; and `basic` skies' cloud / alpha maps, which
-//! are drawn as a plain layer. *(Region B's own maps are blended in by `t` now, `MapBlend`.)*
+//! generator, not the game's shared 0x538040 sequence. Not ported: `basic`'s `noise` alpha maps
+//! (0x45E680, folded into the colours' alpha by 0x45E27D…; no shipped block names one), and what
+//! 0x45DF50 does instead of the blend while `[0x627E38]` is set (0x45CEF0, a flash — not read).
 
 use glam::Vec3;
 use nfs_assets::track::TrackAssets;
@@ -205,34 +207,77 @@ struct GridLayer {
     angle: f32,
     step: [f32; 2],
     offset: [f32; 2],
-    /// A MultiSky stage whose region-B map differs from region A's: its texture is 0x45DD90's
-    /// blend of the two, redone by 0x45E160 at each `t` — `(A·wa + B·wb) >> 16` per byte with
-    /// `wa = fistp((1 − t)·65536)`, `wb = fistp(t·65536)` (0x45E188…0x45E25D). Only `Alps.txt`
-    /// names such a pair (`st1a`/`st1b`, `sc1a`/`sc1b`, all 16 × 16).
-    blend: Option<MapBlend>,
+    /// The layer's colour stream: its sky maps as one colour per grid vertex.
+    colours: MapBlend,
 }
 
+/// The 0x45DD90 object of a stage (MultiSky 0x45B7FA, BasicSky 0x45AFCB): region A's and B's
+/// sky maps, each a 16 × 16 ARGB8888 entry read in place — 0x45E640(16, entry) keeps `entry + 0x10`,
+/// the pixels right after the SHPI entry header, and resamples nothing — and a 16 × 16 array of
+/// dwords at `+0x14` which is the layer's **vertex colour** stream (0x45BB66 / 0x45B21B → the
+/// helper's `LayerColours`, 0x4685A8), one texel per vertex of the 16 × 16 grid. It starts as A's
+/// copy (0x45DDEB) and 0x45E160 rewrites it at every `t` as `(A·wa + B·wb) >> 16` per byte with
+/// `wa = fistp((1 − t)·65536)`, `wb = fistp(t·65536)` (0x45E188…0x45E25D) — skipped when A and B
+/// are one entry (0x45E1B2…0x45E1C8). The file's bytes are `B, G, R, A`, the dword a D3DCOLOR,
+/// so the vertex colour is the texel's own RGBA; the blend is per byte, so its order is moot.
 struct MapBlend {
-    texture: nfs_renderer::TextureId,
-    width: u32,
-    height: u32,
     a: Vec<u8>,
-    b: Vec<u8>,
-    /// the `wb` last drawn, so an unchanged `t` costs nothing
-    wb: i32,
+    /// region B's map when it is another entry
+    b: Option<Vec<u8>>,
+    /// the `(wa, wb)` last written, so an unchanged `t` costs nothing
+    w: (i32, i32),
 }
 
-/// 0x45E160's blend of two maps' bytes at `t`: returns `wb` and the pixels.
-fn blend_maps(a: &[u8], b: &[u8], t: f32) -> (i32, Vec<u8>) {
+impl MapBlend {
+    /// The colour of vertex `k` (row `k / 16`, column `k % 16`) from the stream's bytes.
+    fn colour(px: &[u8], k: usize) -> [f32; 4] {
+        let o = k * 4;
+        [px[o] as f32 / 255.0, px[o + 1] as f32 / 255.0, px[o + 2] as f32 / 255.0, px[o + 3] as f32 / 255.0]
+    }
+
+    /// 0x45E5E0: every one of the 16 × 16 alpha bytes is 0xFF.
+    fn opaque(px: &[u8]) -> bool {
+        px.chunks_exact(4).all(|p| p[3] == 0xFF)
+    }
+
+    /// 0x45E110 for a stage without noise objects: A's test when A and B are one entry, else
+    /// both maps'.
+    fn is_opaque(&self) -> bool {
+        Self::opaque(&self.a) && self.b.as_deref().is_none_or(Self::opaque)
+    }
+}
+
+/// 0x45E160's blend of two maps' bytes at `t`: returns `(wa, wb)` and the pixels.
+fn blend_maps(a: &[u8], b: &[u8], t: f32) -> ((i32, i32), Vec<u8>) {
     let wa = ((1.0 - t) * 65536.0).round_ties_even() as i32;
     let wb = (t * 65536.0).round_ties_even() as i32;
     let px = a.iter().zip(b).map(|(&a, &b)| ((a as i32 * wa + b as i32 * wb) >> 16) as u8).collect();
-    (wb, px)
+    ((wa, wb), px)
+}
+
+/// Whether 0x460D40 calls a texture alpha-free: 0x556690 puts its format code in class 3, 4 or 5 —
+/// `0x03 / 0x42 / 0x7E` (1555), `0x21 / 0x2A / 0x78` (565), `0x04 / 0x43 / 0x7F` (888), read off
+/// the tables at 0x556748 / 0x556774.
+fn alpha_free(code: u8) -> bool {
+    matches!(code, 0x03 | 0x42 | 0x7E | 0x21 | 0x2A | 0x78 | 0x04 | 0x43 | 0x7F)
+}
+
+/// A cloud name `flat`: 0x45B967 / 0x45B1BC compare four bytes, a prefix, on the lower-cased file.
+fn is_flat(name: &str) -> bool {
+    name.len() >= 4 && name[..4].eq_ignore_ascii_case("flat")
+}
+
+/// `NFS_SKY_LEVEL=<n>`: a diagnostic that draws the sky at `SKYRENDERING` level `n` (0 off / low,
+/// 1 medium, 2 high) whatever the option says — the shipped option is 0, where no track has a
+/// block, so the layers are otherwise never seen.
+pub fn forced_level() -> Option<usize> {
+    std::env::var("NFS_SKY_LEVEL").ok()?.parse().ok()
 }
 
 /// The 16 × 16 layer grid of 0x460EC0(15, …) / 0x460F40, normalised by `norm` like the horizon
-/// ring, with the base UVs of 0x45EC40 (`j/a`, `i/b`), as the 15 × 15 quads' triangles.
-fn layer_grid(ring: &nfs_formats::sky::SkyRing, scale: f32, a: f32, b: f32, norm: f32) -> MeshData {
+/// ring, with the base UVs of 0x45EC40 (`j/a`, `i/b`) and the colour stream `colours` (vertex
+/// `16·i + j` takes texel `16·i + j`), as the 15 × 15 quads' triangles.
+fn layer_grid(ring: &nfs_formats::sky::SkyRing, scale: f32, a: f32, b: f32, norm: f32, colours: &[u8]) -> MeshData {
     const N: usize = 15;
     let mut m = MeshData::default();
     let side = ring.radius;
@@ -246,7 +291,8 @@ fn layer_grid(ring: &nfs_formats::sky::SkyRing, scale: f32, a: f32, b: f32, norm
             let x = (c * v + sn * u) * scale * norm;
             let y = (ring.height - ring.small * (u * u + v * v)) * scale * norm;
             let z = (c * u - sn * v) * scale * norm;
-            m.vertices.push(Vertex { position: [x, y, z], normal: [0.0, 1.0, 0.0], uv: [j as f32 / a, i as f32 / b], color: [1.0; 4] });
+            let color = MapBlend::colour(colours, i * (N + 1) + j);
+            m.vertices.push(Vertex { position: [x, y, z], normal: [0.0, 1.0, 0.0], uv: [j as f32 / a, i as f32 / b], color });
         }
     }
     for i in 0..N as u32 {
@@ -301,7 +347,7 @@ impl Sky {
             r.upload_texture(&TextureData { width: t.width, height: t.height, mips: t.mips.clone() })
         }
         let mut parts = Vec::new();
-        let sky_mat = |r: &mut Renderer, id, blend| r.create_material(MaterialDesc { texture: Some(id), alpha_blend: blend, cull_back: false, depth_test: false, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0, device_states: false });
+        let sky_mat = |r: &mut Renderer, texture, blend, blend_pair| r.create_material(MaterialDesc { texture, alpha_blend: blend, cull_back: false, depth_test: false, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair, clamp: [false; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false });
 
         let file = nfs_formats::sky::SkyFile::parse(&track.sky_params.join("\n")).ok();
         // the blocks of the `SKYRENDERING` level (0x45D8F0 → 0x45FB80, `SkyFile::for_level`) — none
@@ -316,45 +362,75 @@ impl Sky {
             jitter = Jitter::new([b.regions[0].warp_speed, b.regions[1].warp_speed], [b.regions[0].warp_amount, b.regions[1].warp_amount]);
             let region = &b.regions[0];
             let region_b = &b.regions[1];
+            // with no usable `.bin` no layer is drawn: the loader falls back to `default.bin`
+            // (0x459680 / 0x4596A1, as `TrackAssets` does), so only a broken install gets here, and
+            // what the original then does was not read. *(Until 2026-09-25 the port drew an
+            // invented dome scrolled by an untraced wind rule.)*
             let bin = track.sky_bin.as_ref().filter(|b| b.rings[0].radius > 0.0);
-            let multi = matches!(b.kind, nfs_formats::sky::SkyKind::Multi { .. });
-            for (i, layer) in region.layers.iter().enumerate() {
-                let Some(map) = layer.map.as_deref().and_then(find) else { continue };
-                // region B's own map, blended in by `t` (MultiSky only — BasicSky keeps region A's)
-                let map_b = region_b.layers.get(i).and_then(|l| l.map.as_deref()).filter(|n| multi && Some(*n) != layer.map.as_deref()).and_then(find);
-                let blend = map_b.filter(|mb| mb.width == map.width && mb.height == map.height && bin.is_some()).and_then(|mb| {
-                    let (a, b) = (map.mips.first()?.clone(), mb.mips.first()?.clone());
-                    let texture = r.upload_texture(&TextureData { width: map.width, height: map.height, mips: vec![a.clone()] });
-                    Some(MapBlend { texture, width: map.width, height: map.height, a, b, wb: 0 })
-                });
-                let id = match &blend {
-                    Some(bl) => bl.texture,
-                    None => tex(r, map),
+            // A stage `k` draws the grid with **cloud `k` as its texture** and **sky map `k` as its
+            // vertex colours** (MultiSky 0x45BB56…0x45BB82, BasicSky 0x45B20A…0x45B236 → 0x468630):
+            // the helper's `LayerTexture` takes `[this+0x64+4k]` (MultiSky; BasicSky `+0x50`) and its
+            // `LayerColours` the 0x45DD90 object's `+0x14` over the region-A / region-B sky maps.
+            // MultiSky has as many stages as its three cloud names have entries other than `none`
+            // (`+0x80`, 0x45B97B / 0x45B9AD) and takes them in order from 0; BasicSky one, with region
+            // A's cloud only (0x45B1AB). *(Corrected 2026-09-25: the port drew the sky map as the
+            // texture and never read the clouds.)*
+            let (clouds, pair): (Vec<Option<String>>, u8) = match b.kind {
+                // the factory's blend argument (0x45D997 / 0x45D9C7 / 0x45DA13 / 0x45DA6C: 0, 1, 2, 3)
+                // is the stage state block's `+8` (0x537A50 at 0x45B827), Thrash 0x38
+                nfs_formats::sky::SkyKind::Multi { blend, .. } => (
+                    b.clouds.clone(),
+                    match blend {
+                        nfs_formats::sky::SkyBlend::Normal => 0,
+                        nfs_formats::sky::SkyBlend::Additive => 1,
+                        nfs_formats::sky::SkyBlend::Attenuate => 2,
+                        nfs_formats::sky::SkyBlend::Modulate => 3,
+                    },
+                ),
+                // BasicSky leaves the block at 0x5379F0's pair 0
+                _ => (vec![region.cloud.clone()], 0),
+            };
+            let stages = clouds.iter().filter(|c| c.is_some()).count();
+            // a sky map is read in place as 16 × 16 dwords (0x45E640(16, …)); every shipped one is
+            // a 16 × 16 `0x7D`. APPROXIMATION of an unreachable case: any other entry is dropped.
+            let map = |n: Option<&str>| n.and_then(find).filter(|t| t.width == 16 && t.height == 16 && t.code == 0x7D).and_then(|t| t.mips.first().cloned());
+            for (i, (layer, cloud)) in region.layers.iter().zip(&clouds).take(stages).enumerate() {
+                // unreachable with the shipped files, which list their stages' maps and clouds
+                // first: a stage whose cloud is `none` or whose region-A map is missing
+                let (Some(bin), Some(cloud), Some(a_px)) = (bin, cloud.as_deref(), map(layer.map.as_deref())) else { continue };
+                let lb = region_b.layers.get(i);
+                // region B's map when it is another entry; `none` there (a null the original's
+                // 0x45E160 would read through) keeps A's — unreachable, no shipped block has it
+                let b_px = lb.and_then(|l| l.map.as_deref()).filter(|n| Some(*n) != layer.map.as_deref()).and_then(|n| map(Some(n)));
+                let colours = MapBlend { a: a_px, b: b_px, w: (65536, 0) };
+                // `flat` is the pack's image-less texture `[pack+0]` (0x460A99 → 0x535ED0(dev, 0, 0)),
+                // bound as driver handle 0 — `dx7z` `SetTexture(stage, NULL)` (0x60007F61…0x60007F7B):
+                // the vertex colours alone — and its stage never blends (0x537A40(0) at 0x45B998 /
+                // 0x45B1D9). A named cloud blends unless both sky maps are opaque and the cloud's
+                // format is alpha-free (0x45BBA5…0x45BBB9 / 0x45B23B…0x45B250, 0x460D40).
+                let (texture, blend) = if is_flat(cloud) {
+                    (None, false)
+                } else {
+                    let Some(t) = find(cloud) else { continue };
+                    (Some(tex(r, t)), !(colours.is_opaque() && alpha_free(t.code)))
                 };
-                let m = sky_mat(r, id, i > 0);
+                let m = sky_mat(r, texture, blend, pair);
                 let scale = [layer.scale[0].max(0.01), layer.scale[1].max(0.01)];
-                // with no usable `.bin` the layer is not drawn: the loader falls back to
-                // `default.bin` (0x459680 / 0x4596A1, as `TrackAssets` does), so only a broken
-                // install gets here, and what the original then does was not read. *(Until
-                // 2026-09-25 the port drew an invented dome scrolled by an untraced wind rule.)*
-                if let Some(bin) = bin {
-                    {
-                        let ring = &bin.rings[0];
-                        // normalised as the horizon ring is, the higher layers a little closer
-                        let norm = RADIUS * 0.9 / ring.radius * (1.0 - 0.02 * i as f32);
-                        let mesh = layer_grid(ring, bin.scalar_ce4, scale[0], scale[1], norm);
-                        // 0x45F1B0: both regions' numbers for this stage; the wind flag when either
-                        // region's speed is over 0.25, the parallax when either move ratio is over 1
-                        let lb = region_b.layers.get(i);
-                        let a = StageParams::of(Some(layer), region.move_ratio);
-                        let bp = StageParams::of(lb, region_b.move_ratio);
-                        let wind_on = layer.wind_speed > 0.25 || lb.is_some_and(|l| l.wind_speed > 0.25);
-                        let parallax_on = region.move_ratio > 1.0 || region_b.move_ratio > 1.0;
-                        let handle = r.upload_dynamic_mesh(&mesh);
-                        grids.push(GridLayer { mesh: handle, vertices: mesh.vertices, a, b: bp, wind_on, parallax_on, angle: ring.angle_turns, step: a.step, offset: [0.0, 0.0], blend });
-                        parts.push((handle, m, Motion::Grid(grids.len() - 1)));
-                    }
-                }
+                let ring = &bin.rings[0];
+                // normalised as the horizon ring is; every stage shares the one grid (`[this+0x30]`,
+                // bound once per block at 0x45BED5), so no stage sits nearer than another. *(Until
+                // 2026-09-25 each higher layer was drawn 2 % closer, the port's own.)*
+                let norm = RADIUS * 0.9 / ring.radius;
+                let mesh = layer_grid(ring, bin.scalar_ce4, scale[0], scale[1], norm, &colours.a);
+                // 0x45F1B0: both regions' numbers for this stage; the wind flag when either
+                // region's speed is over 0.25, the parallax when either move ratio is over 1
+                let a = StageParams::of(Some(layer), region.move_ratio);
+                let bp = StageParams::of(lb, region_b.move_ratio);
+                let wind_on = layer.wind_speed > 0.25 || lb.is_some_and(|l| l.wind_speed > 0.25);
+                let parallax_on = region.move_ratio > 1.0 || region_b.move_ratio > 1.0;
+                let handle = r.upload_dynamic_mesh(&mesh);
+                grids.push(GridLayer { mesh: handle, vertices: mesh.vertices, a, b: bp, wind_on, parallax_on, angle: ring.angle_turns, step: a.step, offset: [0.0, 0.0], colours });
+                parts.push((handle, m, Motion::Grid(grids.len() - 1)));
             }
         }
         // the horizon's texture `+0x44` is `hor<level>` when the pack has one and `horz` otherwise
@@ -363,7 +439,7 @@ impl Sky {
         // `foothills` carry a `hor0`, and `Canyon` a `hor1` / `hor2`; the port had always taken `horz`.
         if let Some(hz) = find(&format!("hor{level}")).or_else(|| find("horz")) {
             let id = tex(r, hz);
-            let m = sky_mat(r, id, true);
+            let m = sky_mat(r, Some(id), true, 0);
             match track.sky_bin.as_ref().filter(|b| b.tile_cols > 0) {
                 // the ring the track's own `.bin` describes
                 Some(bin) => {
@@ -411,11 +487,16 @@ impl Sky {
         let (rate, amp) = (lerp(jit.rate), lerp(jit.amp));
         jit.step(ticks_i, rate, amp);
         for g in &mut self.grids {
-            if let Some(bl) = g.blend.as_mut() {
-                let (wb, px) = blend_maps(&bl.a, &bl.b, t);
-                if wb != bl.wb {
-                    bl.wb = wb;
-                    r.update_texture(bl.texture, &TextureData { width: bl.width, height: bl.height, mips: vec![px] });
+            let mut dirty = false;
+            // the stage's colour stream at this `t` (slot 0 → 0x45DF50 → 0x45E160, 0x45BCFE / 0x45B352)
+            if let Some(b) = g.colours.b.as_deref() {
+                let (w, px) = blend_maps(&g.colours.a, b, t);
+                if w != g.colours.w {
+                    g.colours.w = w;
+                    for (k, v) in g.vertices.iter_mut().enumerate() {
+                        v.color = MapBlend::colour(&px, k);
+                    }
+                    dirty = true;
                 }
             }
             let p = StageParams::lerp(&g.a, &g.b, t);
@@ -428,6 +509,9 @@ impl Sky {
                     let d = jit.pos[k];
                     v.uv = [j as f32 * a[0] + d[0], i as f32 * a[1] + d[1]];
                 }
+                dirty = true;
+            }
+            if dirty {
                 r.write_mesh_vertices(g.mesh, &g.vertices);
             }
             if g.wind_on {
@@ -448,11 +532,17 @@ impl Sky {
     /// Draw items centred on the camera (sky follows the viewer). `far` is the camera's far plane —
     /// the sky is scaled to sit just inside it, since the draw distance the track's `.key` file
     /// asks for is far shorter than the sky's nominal radius.
+    ///
+    /// Unlit: the layers and the horizon ring are drawn through the primitive helper 0x468240 /
+    /// 0x468310, whose chain (0x468440…0x4685CE, 0x4685E0, 0x468630) is `LayerUV`, `LayerTexture`,
+    /// `LayerState`, `LayerColours` and the draw — no light layer — so a sky pixel is the texture ×
+    /// its own colour stream (`RE/notes/thrash.md` §6d.5), not the scene's ambient-and-sun term.
     pub fn draw_items(&self, camera_pos: Vec3, far: f32) -> impl Iterator<Item = DrawItem> + '_ {
         let k = (far * 0.9 / RADIUS).clamp(0.02, 4.0);
         let t = glam::Mat4::from_translation(camera_pos) * glam::Mat4::from_scale(Vec3::splat(k));
+        const UNLIT: nfs_renderer::LayerLight = nfs_renderer::LayerLight { ambient: [1.0; 3], diffuse: [0.0; 3], direction: [0.0; 3] };
         self.parts.iter().map(move |(mesh, material, motion)| {
-            let mut item = DrawItem::new(*mesh, *material, t);
+            let mut item = DrawItem { layer_light: Some(UNLIT), ..DrawItem::new(*mesh, *material, t) };
             item.uv_offset = match *motion {
                 Motion::Still => [0.0, 0.0],
                 Motion::Grid(i) => self.grids[i].offset,
@@ -472,7 +562,25 @@ mod stage_tests {
         // t = 1: wa = 0, wb = 65536
         assert_eq!(blend_maps(&a, &b, 1.0).1, [0, 100, 255, 255]);
         // t = 0.5: (a + b)·32768 >> 16
-        assert_eq!(blend_maps(&a, &b, 0.5), (32768, vec![100, 100, 127, 255]));
+        assert_eq!(blend_maps(&a, &b, 0.5), ((32768, 32768), vec![100, 100, 127, 255]));
+    }
+
+    #[test]
+    fn stage_colours_and_blend_state() {
+        // vertex k takes texel k as its RGBA
+        let px: Vec<u8> = (0..256u32).flat_map(|k| [k as u8, 0, 255, 255]).collect();
+        assert_eq!(MapBlend::colour(&px, 17), [17.0 / 255.0, 0.0, 1.0, 1.0]);
+        let mut m = MapBlend { a: px.clone(), b: None, w: (65536, 0) };
+        assert!(m.is_opaque());
+        // one texel under 0xFF in either map makes the stage blend (0x45E5E0, 0x45E110)
+        let mut b = px;
+        b[3] = 0xFE;
+        m.b = Some(b);
+        assert!(!m.is_opaque());
+        // 0x556690 classes 3, 4, 5 are alpha-free; 8888 and 4444 are not
+        assert!(alpha_free(0x7E) && alpha_free(0x78) && alpha_free(0x7F));
+        assert!(!alpha_free(0x7D) && !alpha_free(0x6D) && !alpha_free(0x7B));
+        assert!(is_flat("flat") && is_flat("FLAT") && !is_flat("cc1a") && !is_flat("fl"));
     }
     use super::*;
 

@@ -116,6 +116,16 @@ fn the_driver_detail_overlay_names_driver_articles() {
     bodies.sort_unstable();
     // one per LOD family, and both are variant 1
     assert_eq!(bodies, vec!["DriverBody1", "LODDriver1"], "the overlay picks variant 1");
+    // every `.DRIVER` the race set-up can draw (`rand() & 7`, 0x4EEDA0) lands on one body per
+    // LOD family, its limbs and its hands
+    for d in 0..8 {
+        let mut st = CarStyle::from_tpg(&assets.tpg, 1);
+        st.apply_driver_detail(d, false, false);
+        for slot in [9u8, 43, 56] {
+            let on: Vec<&str> = by_slot[&slot].iter().filter(|(_, v)| st.article_enabled(slot, *v)).map(|(n, _)| n.as_str()).collect();
+            assert!(!on.is_empty(), ".DRIVER {d}: nothing in slot {slot}");
+        }
+    }
     // no driver at all when `car+0x52C & 0x10` (0x43AED4)
     let mut none = CarStyle::from_tpg(&assets.tpg, 1);
     none.apply_driver_detail(8, true, false);

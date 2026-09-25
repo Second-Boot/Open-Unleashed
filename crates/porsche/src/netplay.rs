@@ -16,7 +16,10 @@
 //! the port understand each other; the original will not.
 
 use glam::{Mat3, Quat, Vec3};
+use nfs_net::msg::kind;
+use nfs_net::room::{self, ChatLine, ChatRequest, Heard, Room, To};
 use nfs_net::session::{Event, Net, Role, name16, name32};
+use nfs_renderer::{Renderer, TextureData, TextureId};
 use nfs_net::socket::CommSocket;
 use nfs_net::state::{CarState, TICK_MASK};
 use nfs_physics::vehicle::Vehicle;
@@ -56,6 +59,25 @@ pub struct NetPlay {
     pub seats: Vec<usize>,
     /// `Comms.Positional`: with it off the `0xBE` broadcast is not sent at all.
     pub positional: bool,
+    /// The game room over the session — who is in it, their chat and their files
+    /// (`nfs_net::room`, `network.md` §10). The host also plays the room object's part.
+    pub room: Room,
+    /// The lines the chat box's callback has taken (`[net+0x20]` = 0x4C2CE0), as they came.
+    chat: Vec<ChatLine>,
+    /// Whether that callback is set: a chat display box opens it (0x4C2A09) and closes it
+    /// (0x4C2A80), and a line that arrives with it clear is dropped (0x48F3B1).
+    chat_open: bool,
+    /// `Comms.PlayerList`'s selection — `+0x1D` clear and `+0x18` the row (0x4BC630, 0x4BC4B0).
+    /// The accessor starts with none (0x4BC235 sets `+0x1D`); the chat input box sends to the
+    /// selected row's player when there is one (0x4C3338…0x4C3362).
+    pub player_sel: Option<usize>,
+    /// Set whenever the room or the chat changed, so the front end knows to rebind its lists.
+    dirty: bool,
+    /// `GetTickCount`'s stand-in for the room's send clock (0x48EFB5).
+    started: Instant,
+    /// `HLeader`'s pictures, uploaded once per player (0x423DE0 uploads each frame; the bytes
+    /// never change once whole, so once is the same picture).
+    pictures: HashMap<i32, Option<TextureId>>,
     next_seat: usize,
     /// When `0x587CE0` was last run. Its two counters — 100 between pings, 450 before a peer is
     /// dropped — are in **polls**, and the original registers it as a periodic task (0x587CC0 →
@@ -112,15 +134,74 @@ impl NetPlay {
             ),
         };
         let id = if net.role == Role::Host { 0 } else { u8::MAX }; // a client's id arrives with its 'a'
-        Ok(Self {
+        let mut n = Self {
             net,
             id,
             remotes: HashMap::new(),
             seats: Vec::new(),
             positional: true,
+            room: Room::new(if id == u8::MAX { -1 } else { id as i32 }),
+            chat: Vec::new(),
+            chat_open: false,
+            player_sel: None,
+            dirty: true,
+            started: Instant::now(),
+            pictures: HashMap::new(),
             next_seat: 0,
             last_poll: Instant::now(),
-        })
+        };
+        // the host's own player is the room's first, id 0: in the original the host's game
+        // joins the room object like any other (0x48BB50 hands out the lowest clear bit of
+        // `room+0xCC0`, and the room is empty)
+        if n.is_host() {
+            let out = n.room.admit(0, &who.as_bytes()[..who.len().min(room::NAME_MAX)]);
+            n.dispatch(out);
+        }
+        Ok(n)
+    }
+
+    /// Deliver what the room object sends — the host's half (0x48C870 on the room's links). Every
+    /// link means every peer and the host's own player; one player's link is that peer's address,
+    /// or the host itself for id 0.
+    fn dispatch(&mut self, out: Vec<(To, Vec<u8>)>) {
+        for (to, m) in out {
+            match to {
+                To::All => {
+                    if let Err(e) = self.net.send_game(&m) {
+                        tracing::debug!(error = %e, "room message not sent");
+                    }
+                    self.hear(&m);
+                }
+                To::Player(id) if id == self.id as i32 => self.hear(&m),
+                To::Player(id) => {
+                    if let Some(a) = u32::try_from(id - 1).ok().and_then(|s| self.net.peer_addr(s))
+                        && let Err(e) = self.net.send_game_to(&[a], &m)
+                    {
+                        tracing::debug!(error = %e, "room message not sent");
+                    }
+                }
+            }
+        }
+    }
+
+    /// One room message for our own player (0x48F0A0's cases).
+    fn hear(&mut self, m: &[u8]) {
+        match self.room.hear(m) {
+            // the chat box's callback 0x4C2CE0 queues `(text, from, to)`; with no box open the
+            // callback slot is clear and the line goes nowhere (0x48F3B1)
+            Some(Heard::Chat(line)) if self.chat_open => {
+                self.chat.push(line);
+                // 0x4C2711: the box keeps a hundred lines, dropping the oldest
+                let over = self.chat.len().saturating_sub(100);
+                self.chat.drain(..over);
+                self.dirty = true;
+            }
+            Some(Heard::Chat(_)) | None => {}
+            Some(h) => {
+                tracing::info!(target: "netplay", "room: {h:?}");
+                self.dirty = true;
+            }
+        }
     }
 
     pub fn is_host(&self) -> bool {
@@ -141,13 +222,23 @@ impl NetPlay {
             match e {
                 Event::Joined { slot } => {
                     self.id = slot as u8 + 1;
+                    self.room.me = self.id as i32;
                     log.push(format!("joined at slot {slot}, player id {}", self.id));
                 }
                 Event::Refused { status } => log.push(format!("the host refused: {status:?}")),
                 Event::PeerJoined { slot, from } => {
-                    log.push(format!("slot {slot} taken by {from}"))
+                    log.push(format!("slot {slot} taken by {from}"));
+                    // 0x48BB50: the room tells the newcomer who is there, and everyone of it
+                    let name = self.net.peers.get(slot as usize).and_then(|p| p.as_ref()).map(|p| p.name).unwrap_or_default();
+                    let name = name.split(|&c| c == 0).next().unwrap_or_default().to_vec();
+                    let out = self.room.admit(slot as i32 + 1, &name);
+                    self.dispatch(out);
                 }
-                Event::PeerLeft { slot } => log.push(format!("slot {slot} left")),
+                Event::PeerLeft { slot } => {
+                    log.push(format!("slot {slot} left"));
+                    // 0x48BE05: the room tells everyone left that the player has gone
+                    self.dispatch(vec![(To::All, room::player_out(slot as i32 + 1))]);
+                }
                 Event::Quit { from } => log.push(format!("{from} quit")),
                 Event::Found { from, describe } => {
                     let n = String::from_utf8_lossy(&describe.name)
@@ -155,6 +246,17 @@ impl NetPlay {
                         .to_string();
                     log.push(format!("found \"{n}\" at {from}"));
                 }
+                // a player's chat line reaches the host as a request, and the room object
+                // passes it on rewritten (0x4912D4…0x4913AC)
+                Event::Data { slot: Some(s), bytes, .. }
+                    if self.is_host() && bytes.first() == Some(&kind::CHAT) =>
+                {
+                    if let Some(r) = ChatRequest::parse(&bytes) {
+                        let out = self.room.route_chat(s as i32 + 1, r.to, &r.text);
+                        self.dispatch(out);
+                    }
+                }
+                Event::Data { bytes, .. } if bytes.first() != Some(&kind::CAR_STATE) => self.hear(&bytes),
                 Event::Data { bytes, .. } => {
                     // 0x48F5E8: our own id comes back on a relayed packet, and it is dropped
                     let Some((who, st)) = CarState::from_packet(&bytes, self.id) else {
@@ -207,11 +309,29 @@ impl NetPlay {
                     log.push(format!("slot {slot} timed out"));
                     self.remotes
                         .retain(|_, r| Some(r.seat) != self.seats.get(slot as usize).copied());
+                    self.dispatch(vec![(To::All, room::player_out(slot as i32 + 1))]);
                 }
                 other => log.push(format!("{other:?}")),
             }
         }
+        // the room's files go out a chunk at a time on their own clock (0x48EFB5…0x48F02E), on
+        // the broadcast channel `[net+8]` — which is `send_game` here, relayed by the host
+        let ms = self.started.elapsed().as_millis() as u32;
+        for m in self.room.tick(ms) {
+            if let Err(e) = self.net.send_game(&m) {
+                tracing::debug!(error = %e, "file chunk not sent");
+            }
+        }
         log
+    }
+
+    /// The front end's poll: the same drain as the race's, with no seats to drive. Answers whether
+    /// the room or the chat changed, i.e. whether the lists want binding again.
+    pub fn poll_lobby(&mut self) -> bool {
+        for line in self.poll(0, |_| (Vec3::ZERO, Quat::IDENTITY)) {
+            tracing::info!(target: "netplay", "{line}");
+        }
+        std::mem::take(&mut self.dirty)
     }
 
     /// Put the last received state on a seat's car. `alpha` is how far to blend from where the car
@@ -281,34 +401,122 @@ impl NetPlay {
         }
     }
 
-    /// `Comms.PlayerList` once a session is open: the host lists itself and every peer that has a
-    /// slot, a client lists the host and the slots the `'a'` it got told it about.
-    pub fn players(&self) -> Vec<String> {
-        let mut v = vec![if self.is_host() {
-            "HOST (YOU)".to_string()
-        } else {
-            "HOST".to_string()
-        }];
-        for (i, p) in self.net.peers.iter().enumerate() {
-            let Some(p) = p else { continue };
-            let name = String::from_utf8_lossy(&p.name);
-            let name = name.trim_end_matches('\0').trim();
-            let label = if name.is_empty() {
-                format!("PLAYER {}", i + 1)
-            } else {
-                name.to_uppercase()
-            };
-            v.push(match self.net.slot == Some(i as u32) {
-                true => format!("{label} (YOU)"),
-                false => label,
-            });
-        }
-        if !self.is_host() && self.net.peers.iter().all(Option::is_none) {
-            if let Some(slot) = self.net.slot {
-                v.push(format!("PLAYER {} (YOU)", slot + 1));
-            }
+    /// `Comms.PlayerList` — **0x4BBBD0**, the accessor's refill: one row per player on
+    /// `net+0x260` in the order the room announced them, the name as it came (`player+0`) and the
+    /// id `player+0x40` kept with the row (`+0xC`, which 0x4BBB40 and 0x4BBB60 read), then rows of
+    /// FE 287 "empty" with id −1 until there are eight (0x4BBD07…0x4BBDA9). *(Until 2026-09-25 this
+    /// answered "HOST (YOU)" and "PLAYER n", upper-cased — not the original's.)*
+    ///
+    /// Not carried: the row draw 0x4BBEB0, which numbers the rows and marks a player whose ready
+    /// bit (`net+0xE5`, 0x490390) is set — `READY` has no port.
+    pub fn players(&self, empty: &str) -> Vec<(String, i32)> {
+        let mut v: Vec<(String, i32)> = self
+            .room
+            .players
+            .iter()
+            .map(|p| (p.name.iter().map(|&b| nfs_formats::locale::cp1252(b)).collect(), p.id))
+            .collect();
+        while v.len() < room::MAX_PLAYERS {
+            v.push((empty.to_string(), -1));
         }
         v
+    }
+
+    /// Step `Comms.PlayerList`'s selection. With none yet the step lands on row 0.
+    pub fn step_player(&mut self, delta: i32) {
+        let n = room::MAX_PLAYERS.max(self.room.players.len()) as i32;
+        let cur = self.player_sel.map_or(0, |s| s as i32 + delta);
+        self.player_sel = Some(cur.rem_euclid(n) as usize);
+    }
+
+    /// Open or close the chat box's callback — the box's slots 21 and 22 (0x4C2940, 0x4C2A80).
+    /// Opening drains what the box held (0x4C2A10…0x4C2A6A), so a box always opens empty.
+    pub fn chat_box(&mut self, open: bool) {
+        if open && !self.chat_open {
+            self.chat.clear();
+        }
+        self.chat_open = open;
+    }
+
+    /// The chat input box's Return — **0x4C3310**: the addressee is the selected player row's id
+    /// when `Comms.PlayerList` has a selection (0x4BC630, 0x4BBB40), everyone otherwise, and the
+    /// line goes out through **0x48D9B0**, on the link to the host. The host's own line is the
+    /// room object's to pass on straight away. Nothing is sent before the session has given us an
+    /// id (0x48D9B0's gate).
+    pub fn say(&mut self, text: &str, empty: &str) {
+        if self.id == u8::MAX {
+            return;
+        }
+        let to = self
+            .player_sel
+            .and_then(|r| self.players(empty).get(r).map(|p| p.1))
+            .unwrap_or(room::TO_ALL);
+        // the box took only 0x20…0xFE (0x4CCD95…0x4CCD9D), one byte each
+        let text: Vec<u8> = text.chars().map(|c| c as u32).filter(|&c| c < 0x100).map(|c| c as u8).collect();
+        if self.is_host() {
+            let out = self.room.route_chat(0, to, &text);
+            self.dispatch(out);
+        } else if let Err(e) = self.net.send_game(&ChatRequest { to, text }.encode()) {
+            tracing::warn!(error = %e, "chat line not sent");
+        }
+    }
+
+    /// The chat box's rows, formatted the way **0x4C24F0** formats each line: `"%s: %s"`
+    /// (0x5D7E24) for a line to everyone, FE 580 `IDS_WHISPER` for one to us, FE 581
+    /// `IDS_WHISPERTO` otherwise. The names come from `Comms.PlayerList` (the box's
+    /// `data.accessor`, `[this+0x154]`): 0x4BBB60 finds the row with that id and answers **row 0**
+    /// when there is none. "Us" is `net+0xDC`, or −2 with no session (0x4C2559…0x4C257B).
+    ///
+    /// The original formats a line once, when its box's tick 0x4C2DB0 drains it; this formats the
+    /// kept lines each time the list is bound, so a name that changes in between would read the
+    /// new way — which no shipped path does.
+    pub fn chat_rows(&self, empty: &str, whisper: &str, whisper_to: &str) -> Vec<String> {
+        let rows = self.players(empty);
+        let name = |id: i32| rows.iter().find(|r| r.1 == id).or(rows.first()).map_or(String::new(), |r| r.0.clone());
+        let me = if self.id == u8::MAX { -2 } else { self.id as i32 };
+        self.chat
+            .iter()
+            .map(|l| {
+                let text: String = l.text.iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+                if l.to == room::TO_ALL {
+                    room::format("%s: %s", &[&name(l.from), &text])
+                } else if l.to == me {
+                    room::format(whisper, &[&name(l.from), &text])
+                } else {
+                    room::format(whisper_to, &[&name(l.from), &name(l.to), &text])
+                }
+            })
+            .collect()
+    }
+
+    /// **0x427A60**, from the race load 0x4B67B0 (which zeroes the game clock at 0x4B67F3): read
+    /// `pic16.fsh` from the HUD folder and post it as file type 0 (0x48CB50), so every other
+    /// player's `HLeader` can show it.
+    pub fn post_picture(&mut self, bytes: &[u8]) {
+        self.room.post(room::PICTURE, bytes);
+    }
+
+    /// **`HLeader`'s** picture (draw 0x4286F0): the car in first place is `seat` (`None` for our
+    /// own), its player is the one whose car it is (0x48D720 matches `player+0x4C` against
+    /// `car+0x524`; here a seat is a remote id's through [`Remote::seat`] — **APPROXIMATION**, as
+    /// what writes `player+0x4C` has not been read), and its picture is file type 0 once whole
+    /// (0x4903F0, 0x428772). The upload takes the file's first image, the record `[file+0x14]`
+    /// points at (0x42878E) — an FSH's first directory entry.
+    pub fn leader_picture(&mut self, r: &mut Renderer, seat: Option<usize>) -> Option<TextureId> {
+        let id = match seat {
+            None => self.id as i32,
+            Some(s) => *self.remotes.iter().find(|(_, x)| x.seat == s)?.0 as i32,
+        };
+        if let Some(t) = self.pictures.get(&id) {
+            return *t;
+        }
+        let f = self.room.player(id)?.files.iter().find(|f| f.kind == room::PICTURE && f.complete())?;
+        let tex = nfs_formats::fsh::Fsh::parse(&f.bytes)
+            .ok()
+            .and_then(|fsh| fsh.decode(&f.bytes, 0).ok())
+            .map(|img| r.upload_texture(&TextureData::single(img.width, img.height, img.rgba)));
+        self.pictures.insert(id, tex);
+        tex
     }
 
     /// `Comms.Data(GAMENAME)` — the session's own name.
@@ -337,8 +545,8 @@ impl NetPlay {
         }
     }
 
-    /// `'K'` — tell the others we are going (0x589152 clears our bit on the host).
-    #[allow(dead_code)]
+    /// `'K'` — tell the others we are going (0x589152 clears our bit on the host). The comms
+    /// screens' back sends it (`App::fe_session_leave`, 0x48E6F0 / 0x48E9C0).
     pub fn leave(&mut self) {
         let _ = self.net.leave();
     }
@@ -514,5 +722,41 @@ impl Lobby {
             .target()
             .ok_or_else(|| anyhow::anyhow!("no address to connect to"))?;
         NetPlay::start(&format!("join:{a}"), &self.who)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What 0x427A60 posts and `HLeader` shows: the shipped `DashHud/pic16.fsh`, sent through the
+    /// room's chunks and decoded the way [`NetPlay::leader_picture`] decodes it — the first entry,
+    /// 54 × 64. Skipped without the game's files.
+    #[test]
+    fn the_shipped_picture_survives_the_chunks_and_decodes_at_54_by_64() {
+        let root = std::env::var_os("NFS5_GAME_PATH").map(std::path::PathBuf::from).or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Games/NFS-Porsche-Unleashed/game_info/data"))
+        });
+        let Some(bytes) = root.and_then(|r| std::fs::read(r.join("GameData/DashHud/pic16.fsh")).ok()) else {
+            return;
+        };
+        let mut a = Room::new(2);
+        a.hear(&room::player_in(2, b"anna"));
+        a.post(room::PICTURE, &bytes);
+        let mut b = Room::new(0);
+        b.hear(&room::player_in(2, b"anna"));
+        a.tick(0);
+        let mut t = 0;
+        while a.sending() {
+            t += 100;
+            for m in a.tick(t) {
+                b.hear(&m);
+            }
+        }
+        let f = &b.player(2).unwrap().files[0];
+        assert!(f.complete());
+        let fsh = nfs_formats::fsh::Fsh::parse(&f.bytes).unwrap();
+        let img = fsh.decode(&f.bytes, 0).unwrap();
+        assert_eq!((img.width, img.height), (54, 64));
     }
 }

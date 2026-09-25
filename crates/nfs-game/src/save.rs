@@ -169,7 +169,7 @@ fn car_image(tables: &CareerTables, c: &OwnedCar, instance: u32) -> SavedCar {
     }
     // The six appearance dwords (`savegame.md` §4.7a): the colours the paint shop's rows hold —
     // interior `rec+0x530 + 16·i`, stripes `rec+0x3F0` / `rec+0x3F4 + 16·i`, each packed
-    // big-endian as the getters read them — the package index and decal −1 (0x502710). A bought
+    // big-endian as the getters read them — the package index and the race number. A bought
     // car's rows are what the dealership had (0x501CF0: the interior chosen there, paint set 0's
     // stripes, package 0x508E70's 0).
     // *(Until 2026-09-25 the port wrote the paint set's first dword as the package — 0 or 205
@@ -184,7 +184,7 @@ fn car_image(tables: &CareerTables, c: &OwnedCar, instance: u32) -> SavedCar {
         car.set_field_u32(car::S1_COLOUR, s1);
         car.set_field_u32(car::S2_COLOUR, s2);
         car.set_field_u32(car::PACKAGE_NUM, t.package as u32);
-        car.set_field_u32(car::DECAL_NUM, u32::MAX);
+        car.set_field_u32(car::DECAL_NUM, t.decal as i32 as u32);
     }
     car.set_field_u32(car::ASKING_PRICE, c.asking_price.unwrap_or(0));
     car.set_field_u8(car::LISTED, u8::from(c.asking_price.is_some()));
@@ -197,11 +197,13 @@ fn car_image(tables: &CareerTables, c: &OwnedCar, instance: u32) -> SavedCar {
     // the setup and the copy the screen's "cancel" restores from (0x4EF4C0/0x4EF4E0)
     for (i, v) in c.setup.iter().enumerate() {
         car.set_field_u32(car::SETUP + i * 4, v.to_bits());
-        car.set_field_u32(car::SETUP_BACKUP + i * 4, v.to_bits());
+        car.set_field_u32(car::SETUP_BACKUP + i * 4, c.setup_backup[i].to_bits());
     }
     // Only the part id and the float at part+0x164 survive a save/load (§4.7). That float is the
     // damage the part carries, so the port writes what the car has accumulated and falls back to
-    // the `nfs5.prt` record for a part that has never been raced.
+    // the `nfs5.prt` record for a part that has never been raced. The stock list `car+0x75C` goes
+    // first (0x4EE8D0), each copy with its own `+0x164`.
+    car.removed = c.stock.iter().map(|(id, state)| SavedPart { id: *id as i32, state: *state }).collect();
     car.installed = c
         .parts
         .iter()
@@ -242,23 +244,35 @@ fn owned_from_image(tables: &CareerTables, car: &SavedCar) -> OwnedCar {
         stripe2: row(0x3F4, 0x3E6, car.field_u32(car::S2_COLOUR)),
         // the list has eight rows; anything else is an older port save's paint-set dword (0 / 205)
         package: Some(car.field_u32(car::PACKAGE_NUM)).filter(|p| *p < 8).unwrap_or(0) as u8,
+        decal: (car.field_u32(car::DECAL_NUM) as i32).clamp(-1, 99) as i8,
     };
-    OwnedCar {
+    // 0x4EE6A0 clears both lists and pushes the first n1 saved parts onto `+0x75C`, the rest onto
+    // `+0x758` (0x4EE7F2 / 0x4EE817), each a fresh copy of the table record (0x49C470) with the
+    // saved `+0x164`; an id the table lacks fails the load (0x4EE7BA), here it is dropped
+    let known = |p: &&SavedPart| tables.parts.iter().any(|t| t.id as i32 == p.id);
+    let mut owned = OwnedCar {
         car_id,
         paint_set,
         trim,
-        parts: car.installed.iter().map(|p| p.id as i16).collect(),
+        parts: car.installed.iter().filter(known).map(|p| p.id as i16).collect(),
+        stock: car.removed.iter().filter(known).map(|p| (p.id as i16, p.state)).collect(),
         mileage: car.field_u32(car::MILEAGE),
         wins: car.field_u32(car::WINS),
         // the container carries the damage a car has taken as the state of each of its parts
         damage_pct: 0.0,
         damage: [0.0; 10],
-        part_state: car.installed.iter().map(|p| (p.id as i16, p.state)).collect(),
+        part_state: car.installed.iter().filter(known).map(|p| (p.id as i16, p.state)).collect(),
         setup: std::array::from_fn(|i| f32::from_bits(car.field_u32(car::SETUP + i * 4))),
+        setup_backup: std::array::from_fn(|i| f32::from_bits(car.field_u32(car::SETUP_BACKUP + i * 4))),
         purchase_price: car.field_u32(car::PURCHASE_PRICE),
         asking_price: (car.field_u8(car::LISTED) != 0).then(|| car.field_u32(car::ASKING_PRICE)),
         offer: (car.field_u8(car::OFFER_PENDING) != 0).then(|| car.field_u32(car::OFFER)),
-    }
+    };
+    // a `.sav` the port wrote before 2026-09-25 has no stock list (`n1 = 0`) and only the bought
+    // parts installed — port-only, see `OwnedCar::adopt_implicit_stock`
+    owned.adopt_implicit_stock(tables);
+    owned.damage_pct = crate::career::car_damage_pct(tables, &owned);
+    owned
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -300,7 +314,7 @@ fn tournament_table(tables: &CareerTables, c: &Career) -> Vec<u8> {
         }
         let Some(st) = c.tournaments.get(&tour.id) else { continue };
         put_i16(&mut t, base + trn::COMPLETED, st.completions.min(i16::MAX as u32) as i16);
-        for (e, r) in st.events.iter().enumerate() {
+        for (e, r) in st.done_events().into_iter().zip(&st.events) {
             let ev = base + trn::EVENTS + e * trn::EVENT;
             if ev + trn::EVENT > t.len() {
                 break;
@@ -333,10 +347,15 @@ fn tournaments_from_table(tables: &CareerTables, table: &[u8]) -> std::collectio
         let mut events = Vec::new();
         for e in 0..tour.events.len() {
             let ev = base + trn::EVENTS + e * trn::EVENT;
-            if ev + trn::EVENT > table.len() || table[ev + trn::DONE] == 0 {
+            if ev + trn::EVENT > table.len() {
                 break;
             }
-            let mut r = EventResult { position: 1, prize: get_u32(table, ev + trn::PRIZE), bonus: get_u32(table, ev + trn::BONUS), points: [0; 8], earned: [0; 8], times: [0; 8] };
+            // every record whose done byte is set, wherever it is: the events are raced in any
+            // order (0x504F00), so an undone one may sit before a done one
+            if table[ev + trn::DONE] == 0 {
+                continue;
+            }
+            let mut r = EventResult { position: 1, prize: get_u32(table, ev + trn::PRIZE), bonus: get_u32(table, ev + trn::BONUS), points: [0; 8], earned: [0; 8], times: [0; 8], event: Some(e as u8) };
             for d in 0..8 {
                 r.points[d] = get_i16(table, ev + trn::POINTS + d * 2).clamp(0, 9) as u8;
                 r.times[d] = get_u32(table, ev + trn::TIMES + d * 4) as u64;
@@ -491,8 +510,9 @@ pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, 
         picture: profile.picture as u32,
         player_name: profile.name.clone(),
         driver_name: profile.name.clone(),
-        // The port has no first-time message gates; the original clears all three on a new career.
-        seen_evolution_intro: 0,
+        // The original clears all three on a new career; the port keeps the first (`careerfirst`,
+        // `Career::seen_evolution_intro`) and has no gates for the other two.
+        seen_evolution_intro: u8::from(c.seen_evolution_intro),
         seen_factory_welcome: 0,
         seen_first_mission: 0,
         colours: [0; 8],
@@ -553,7 +573,9 @@ pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, 
     let accessors = AccessorBlock { entries };
     SaveFile {
         missions: Some(mission_table(tables, c)),
-        parts_market: None,
+        // §4.2: the player's parts inventory `[0x69A0EC]`, each part its whole `nfs5.prt` record by
+        // value (0x517A30) — the table's bytes with the spare's own damage at `+0x164`
+        parts_market: Some(spare_records(tables, c)),
         tournament: Some(tournament),
         player: Some(player),
         track_records: true,
@@ -568,8 +590,23 @@ pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, 
     }
 }
 
+/// The inventory as `PartsMarket` writes it (0x517A30): a 0x168-byte record per spare, copied from
+/// the table and carrying the spare's damage. A spare whose id is not in the table is left out.
+fn spare_records(tables: &CareerTables, c: &Career) -> Vec<Vec<u8>> {
+    c.spares
+        .iter()
+        .filter_map(|s| {
+            let i = tables.parts.iter().position(|p| p.id == s.id)?;
+            let mut r = tables.raw.prt.get(i * PART_RECORD_SIZE..(i + 1) * PART_RECORD_SIZE)?.to_vec();
+            r[0x164..0x168].copy_from_slice(&s.state.to_le_bytes());
+            Some(r)
+        })
+        .collect()
+}
+
 /// Read back what the original's format can hold. Port-side bookkeeping the format has no field
-/// for is lost and left at its default: the per-car damage percentage, a tournament's
+/// for is lost and left at its default: a car's ten zone damages (the damage figure is rebuilt
+/// from its parts, 0x4EF960), a tournament's
 /// `final_rank` / `prize` / `failed_attempts`, `eras_completed`, a pending finale and
 /// `promotions_accepted`. That is why the port's JSON career, not this file, is the live save.
 pub fn career_from_sav(s: &SaveFile, tables: &CareerTables) -> Career {
@@ -595,6 +632,14 @@ pub fn career_from_sav(s: &SaveFile, tables: &CareerTables) -> Career {
             }
         }
     }
+    // 0x517810 reads the records back by value; the id and the damage are all the port keeps
+    if let Some(recs) = &s.parts_market {
+        c.spares = recs
+            .iter()
+            .filter(|r| r.len() >= PART_RECORD_SIZE)
+            .map(|r| crate::shop::SparePart { id: get_i16(r, 0), state: f32::from_le_bytes([r[0x164], r[0x165], r[0x166], r[0x167]]) })
+            .collect();
+    }
     if let Some(m) = &s.missions {
         c.missions = (0..m.len() / MISSION_RECORD_SIZE).map(|i| get_i16(m, i * MISSION_RECORD_SIZE + 0xE8)).collect();
     }
@@ -611,6 +656,26 @@ pub fn write_profile(dir: &Path, profile: &Profile, save: &SaveFile) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §4.2: the parts inventory goes out as whole `nfs5.prt` records carrying each spare's own
+    /// damage (0x517A30) and comes back from them (0x517810).
+    #[test]
+    fn the_parts_inventory_round_trips_as_part_records() {
+        let mut prt = vec![0u8; 2 * PART_RECORD_SIZE];
+        prt[0..2].copy_from_slice(&7i16.to_le_bytes());
+        prt[PART_RECORD_SIZE..PART_RECORD_SIZE + 2].copy_from_slice(&9i16.to_le_bytes());
+        prt[PART_RECORD_SIZE + 0x5C..PART_RECORD_SIZE + 0x60].copy_from_slice(&1234u32.to_le_bytes());
+        let parts = nfs_formats::career::parse_parts(&prt).unwrap();
+        let tables = CareerTables { raw: crate::career::RawTables { prt, ..Default::default() }, tracks: vec![], tournaments: vec![], parts, personalities: vec![], missions: vec![], strings: Default::default(), catalog: vec![], package_count: 0 };
+        let mut c = Career::default();
+        c.spares = vec![crate::shop::SparePart { id: 9, state: 12.5 }, crate::shop::SparePart { id: 7, state: 0.0 }, crate::shop::SparePart { id: 99, state: 1.0 }];
+        let recs = spare_records(&tables, &c);
+        assert_eq!(recs.len(), 2, "an id the table lacks is left out");
+        assert_eq!(&recs[0][0x5C..0x60], &1234u32.to_le_bytes(), "the record goes by value");
+        let s = SaveFile { parts_market: Some(recs), ..SaveFile::default() };
+        let back = career_from_sav(&SaveFile::parse(&s.write()).unwrap(), &tables);
+        assert_eq!(back.spares, c.spares[..2]);
+    }
 
     /// A rebound control survives the `.sav`: six dwords under its `Controller.*` name, read back
     /// by name (0x51D060 / 0x51D080).

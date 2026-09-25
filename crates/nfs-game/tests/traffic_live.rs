@@ -6,7 +6,7 @@ use nfs_assets::{track::TrackAssets, GamePaths};
 use nfs_game::race::SliceTable;
 use nfs_game::traffic::{Reference, TrafficSet, TrafficSpec, DESPAWN_DISTANCE, MAX_ACTIVE};
 
-fn run(track: &str, seed: u32) -> Option<(SliceTable, TrafficSet)> {
+fn run(track: &str, seed: u32) -> Option<(SliceTable, TrafficSet, u64)> {
     let paths = GamePaths::locate().ok()?;
     let t = TrackAssets::load(&paths, track).ok()?;
     let table = SliceTable::from_crp(&t.crp, &t.crp_data).ok()?;
@@ -17,27 +17,38 @@ fn run(track: &str, seed: u32) -> Option<(SliceTable, TrafficSet)> {
     // (the test's own driver walks the lap route and wraps; `SliceTable::add` is 0x4817D0 and
     // stops at a point-to-point track's dead end)
     let mut p = 0usize;
+    // the 64 Hz ticks of the last quarter with at least one car out
+    let mut out_late = 0u64;
     for tick in 0..20_000u64 {
         if tick % 2 == 0 {
             p = (p + 1) % table.lap_len;
             let slice = table.route[p];
             let r = Reference { position: table.slices[slice].centre, slice, laps: 0, speed: 30.0, dir: 1.0 };
-            set.update(&table, tick, r, &[]);
-            set.update(&table, tick, r, &[]);
+            // the even tick as `GameTick` 0x414FF0 runs it: the AI pass, the trackers (Sc32
+            // priority 6, `car+0x78` from 0x417190 — the reference is the only racer here), then
+            // the drive (priority 0x1E)
+            set.ai(&table, tick, r, &[]);
+            set.track_racers(&[r.position]);
+            set.drive(&table, tick, r);
         }
         set.integrate(&table, 1.0 / 64.0);
+        if tick >= 15_000 && set.cars.iter().any(|c| c.active) {
+            out_late += 1;
+        }
     }
-    Some((table, set))
+    Some((table, set, out_late))
 }
 
 #[test]
 fn traffic_stays_on_the_road_and_recycles() {
-    let Some((table, set)) = run("coastal", 12345) else {
+    let Some((table, set, out_late)) = run("coastal", 12345) else {
         eprintln!("skipping: no game data");
         return;
     };
     assert!(set.active_count() <= MAX_ACTIVE, "at most five alive at once");
-    assert!(set.active_count() > 0, "the set keeps respawning over a full lap");
+    // over the last quarter, not at the last tick: the AI pass's gate can leave a moment with
+    // every car in purgatory (see `every_car_is_used_over_a_lap`)
+    assert!(out_late > 0, "the set keeps respawning over a full lap");
     for c in set.cars.iter().filter(|c| c.active) {
         assert!(c.position.is_finite(), "{:?}", c.position);
         assert!(c.velocity.is_finite(), "{:?}", c.velocity);
@@ -54,13 +65,17 @@ fn traffic_stays_on_the_road_and_recycles() {
 
 #[test]
 fn every_car_is_used_over_a_lap() {
-    let Some((_, set)) = run("autobahn", 99) else {
+    let Some((_, set, out_late)) = run("autobahn", 99) else {
         eprintln!("skipping: no game data");
         return;
     };
     // over 10 000 AI ticks the set keeps cycling: cars are out, and a slot that is not is either
     // counting down or waiting at zero for one of the five places to come free
-    assert!(set.cars.iter().any(|c| c.active), "cars are out");
-    assert!(set.cars.iter().all(|c| c.active || c.respawn_ticks >= 0), "a purgatory countdown ran away");
+    // (over the last quarter, not at the last tick: the AI pass's 8 Hz gate and its 32 Hz-tick
+    // purgatory countdown, `traffic::ai_pass_due`, can leave a moment with every car in purgatory)
+    assert!(out_late > 0, "cars are out");
+    // `car+0xEE8` has no floor (0x40E140), but the gate 0x40E060 either spawns the car or re-arms
+    // it to 1 as soon as it is not positive, so it never gets more than one step (8) below zero
+    assert!(set.cars.iter().all(|c| c.active || c.respawn_ticks > -8), "a purgatory countdown ran away");
     assert!(DESPAWN_DISTANCE > 0.0);
 }

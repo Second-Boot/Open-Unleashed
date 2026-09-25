@@ -232,9 +232,16 @@ impl Net {
     /// The connection id and the flags byte are **zero**: `0x5951A0` starts both at 0 and what
     /// fills them later has not been read (§7.17). The sequence is this side's own counter.
     pub fn send_game(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let to = self.everyone();
+        self.send_game_to(&to, bytes)
+    }
+
+    /// [`Net::send_game`] to the addresses named — what the host's room object does when 0x48C980
+    /// finds one player's link for it (`crate::room::To::Player`).
+    pub fn send_game_to(&mut self, addrs: &[SocketAddr], bytes: &[u8]) -> io::Result<()> {
         let seq = self.data_seq;
         self.data_seq = crate::data::Frame::next_seq(seq);
-        for to in self.everyone() {
+        for &to in addrs {
             let f = crate::data::Frame {
                 // what we next expect from *this* peer, which is what the original's per-peer
                 // connection carries at `conn+0x5E`
@@ -357,7 +364,7 @@ impl Net {
             }
             tag::ALIVE => {
                 let slot = if self.role == Role::Host { self.refresh(from) } else { None };
-                if self.relay {
+                if self.relay && !for_the_host(p) {
                     for to in self.everyone() {
                         if to != from {
                             let _ = self.sock.send_to(to, crate::data::TAG, p);
@@ -532,6 +539,15 @@ impl Net {
             self.peers.get(slot as usize)?.as_ref().and_then(|p| addr_of(&p.addr))
         })
     }
+}
+
+/// Whether a data frame carries a message a player sends on its link to the host (`[net+0xC]`)
+/// rather than on the broadcast channel (`[net+8]`) — which the relay, a stand-in for the
+/// broadcast, must then leave alone. The chat request 0x48D9B0 is one (`crate::room`): the host
+/// rewrites it before anyone else sees it (0x491324). The other `[net+0xC]` senders — 0x48D38B,
+/// 0x48D3BB, 0x48D97B, 0x48DA22, 0x48DAA4 … — are not ported, so they are not listed.
+fn for_the_host(p: &[u8]) -> bool {
+    crate::data::Frame::decode(p).is_ok_and(|f| f.pieces.iter().any(|x| x.body.first() == Some(&crate::msg::kind::CHAT)))
 }
 
 /// A `'d'` answers either an `'r'` (echoing its request number) or a `'w'` (echoing 0, because a

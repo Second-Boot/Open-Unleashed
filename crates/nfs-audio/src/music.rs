@@ -131,6 +131,10 @@ pub struct MusicPlayer {
     saved: Vec<usize>,
     pos: usize,
     shuffle: bool,
+    /// `[0x65B928] != 0` — the front end is running. `MusicPlay` and the end-of-stream advance
+    /// take the shuffle flag as `[0x65B928] ? 1 : RANDOMPLAYLIST` (§8.3), so in the front end the
+    /// list always shuffles. 0x4D3420 sets the pointer at 0x4D3564 and clears it at 0x4D559A.
+    front_end: bool,
     level: u8,
     /// `game.spl[0]` — the music trim (52 shipped, 80 compiled in).
     trim: u32,
@@ -150,6 +154,7 @@ impl MusicPlayer {
             playlist,
             pos: 0,
             shuffle: settings.shuffle,
+            front_end: false,
             level: settings.music_level,
             trim: nfs_formats::spl::GameSpl::load(sounds_dir).music(),
             current: None,
@@ -170,6 +175,11 @@ impl MusicPlayer {
     /// The saved playlist the race starts from, as the CD player edited it.
     pub fn set_saved(&mut self, list: Vec<usize>) {
         self.saved = list;
+    }
+
+    /// Whether the front end is running (`[0x65B928]`), which forces the shuffle on.
+    pub fn set_front_end(&mut self, on: bool) {
+        self.front_end = on;
     }
 
     pub fn now_playing(&self) -> Option<&str> {
@@ -246,7 +256,7 @@ impl MusicPlayer {
         }
         self.pos = if n == 1 {
             0
-        } else if self.shuffle {
+        } else if self.shuffle || self.front_end {
             (self.rand() % (n - 1) + self.pos + 1) % n
         } else {
             (self.pos + 1) % n
@@ -350,7 +360,7 @@ mod tests {
 
     #[test]
     fn jingles_are_louder_than_the_race_playlist() {
-        let p = MusicPlayer { dir: PathBuf::new(), names: Vec::new(), playlist: Vec::new(), saved: Vec::new(), pos: 0, shuffle: false, level: 127, trim: 52, current: None, rng: 1 };
+        let p = MusicPlayer { dir: PathBuf::new(), names: Vec::new(), playlist: Vec::new(), saved: Vec::new(), pos: 0, shuffle: false, front_end: false, level: 127, trim: 52, current: None, rng: 1 };
         // the shipped game.spl[0] = 52: 52 · 127 >> 7 = 51 of 127 for a race track, the raw 127 for a jingle
         assert!((p.volume_for("game13-Activator-Morphadron") - 51.0 / 127.0).abs() < 1e-6);
         assert_eq!(p.volume_for("win04-Victory-Cypher"), 1.0);

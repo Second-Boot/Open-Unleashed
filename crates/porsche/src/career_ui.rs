@@ -40,6 +40,9 @@ pub struct StartRequest {
     /// Event direction flag (`event+0x04`): the race runs the track backwards — reversed slice
     /// table, `_backwards` start scene and draw keys.
     pub backwards: bool,
+    /// The event's second direction byte `event+0x05`, 0x4FC0B0's `MIRROR` for types 4 / 5 / 10
+    /// / 11 (`modes.md` §2); 0 in every shipped event. A mission has none (type 9's row).
+    pub mirror: bool,
     pub opponents: Vec<CareerOpponent>,
     /// Installed parts of the player's car (applied to the `.sim` before the specs are built).
     pub parts: Vec<Part>,
@@ -80,6 +83,24 @@ pub struct PendingEvent {
     pub garage_idx: Option<usize>,
     /// Factory Driver mission index.
     pub mission: Option<usize>,
+    /// Started by the layout front end's `PLAYGAME` (`start_selected_event`), whose garage
+    /// selection is `OwnedCars.Car` and must survive the race — the text screen's `car_sel` is an
+    /// index into `car_choices` instead and is put back to 0.
+    pub layout: bool,
+}
+
+/// The three bytes 0x4D3420's type-4 branch reads when it comes back from a tournament race
+/// (0x4D4757…0x4D476F, `controls.md` §4.163).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TournamentRaceFlags {
+    /// `TOURNAMENTLASTRACE` `[0x6577D8]` (option 0xB9), set at the launch (0x4ECAFD…): exactly one
+    /// event of the tournament was left undone
+    pub last_race: bool,
+    /// `TOURNAMENTENDOFERA` `[0x6577DC]` (option 0xBA), set at the launch beside it
+    pub end_of_era: bool,
+    /// 0x505800 = `[0x691E81]`: 0x503AD0 clears it on every call (0x503B01) and sets it when the
+    /// tournament it files closes the era (0x503C69)
+    pub era_changed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -117,6 +138,8 @@ pub struct CareerUi {
     /// `[screen+0x174]` — the player said "yes" to 858 (0x4D2C94), so the check does not ask again
     pub reset_confirmed: bool,
     pub pending: Option<PendingEvent>,
+    /// What the front end's way back from a tournament race reads (0x4D3420).
+    pub race_flags: TournamentRaceFlags,
     /// The profile the career belongs to: `SaveData/<digit><Name>.sav` (`RE/notes/savegame.md` §2).
     pub profile: Profile,
     pub save_dir: PathBuf,
@@ -143,7 +166,9 @@ impl CareerUi {
             .or_else(|| nfs_game::save::list_profiles(&dir).into_iter().next())
             .unwrap_or_else(|| Profile::new("DRIVER", nfs_game::save::DEFAULT_PICTURE));
         let career = match Career::load(&save_path) {
-            Ok(c) => {
+            Ok(mut c) => {
+                // an older port career keeps its cars' stock parts implicit (`Career::upgrade`)
+                c.upgrade(&tables);
                 tracing::info!(path = %save_path.display(), era = ?c.era, money = c.money, cars = c.garage.len(), "career loaded");
                 c
             }
@@ -184,6 +209,7 @@ impl CareerUi {
             dialog: None,
             reset_confirmed: false,
             pending: None,
+            race_flags: TournamentRaceFlags::default(),
         })
     }
 
@@ -302,6 +328,7 @@ impl CareerUi {
             finale: false,
             garage_idx: None,
             mission: Some(idx),
+            layout: false,
         });
         tracing::info!(mission = m.code, track = track.file, scene = ?scene_suffix, car = car.model, opponents = opponents.len(), "mission start");
         Some(StartRequest {
@@ -310,6 +337,7 @@ impl CareerUi {
             paint,
             laps: m.laps.max(1) as u32,
             backwards: m.backwards,
+            mirror: false,
             opponents,
             parts,
             mission: Some(MissionStart {
@@ -895,124 +923,190 @@ impl CareerUi {
                         )
                     }
                 };
-                let ev = &t.events[event];
-                let Some(track) = self.tables.track(ev.track_id) else {
-                    self.message = format!("UNKNOWN TRACK {}", ev.track_id);
-                    return None;
-                };
-                let paint = self.paint_for(
-                    &car,
-                    garage_idx
-                        .map(|i| self.career.garage[i].paint_set as usize)
-                        .unwrap_or(0),
-                );
-                // **The grid is the standings.** 0x4ED040's mode-4 arm gives racer slot `i` the
-                // `STARTINGPOS` `0x503660(tid, i)` — slot 0 the player, slot `i` opponent record
-                // `i`. With no event of the attempt done that function returns **8** for the
-                // player and `i` for opponent `i` (0x503750, 0x503745), the usual "player last";
-                // after that it is each driver's 1-based rank in the table, so the leader starts
-                // on pole. `None` for a finale, which is not a tournament of the standings.
-                let ranks: Option<[u32; 8]> = (event > 0 && finale.is_none()).then(|| {
-                    let mut r = [8u32; 8];
-                    for (pos, row) in self.career.standings(&t).iter().enumerate() {
-                        if row.0 < 8 {
-                            r[row.0] = pos as u32 + 1;
-                        }
-                    }
-                    r
-                });
-                let opponents: Vec<CareerOpponent> = t
-                    .opponents
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(slot, o)| {
-                        let car = self.tables.car(o.car_id as u16)?.clone();
-                        if car.sim.is_empty() {
-                            return None;
-                        }
-                        let skill = self
-                            .tables
-                            .personalities
-                            .iter()
-                            .find(|p| p.id == o.driver)
-                            .map(|p| p.skill)
-                            .unwrap_or([[1.0, 0.0]; 4]);
-                        let c = o.colours[0];
-                        // opponent colour record is RGBA (bytes r g b a); an all-zero entry means "catalogue default"
-                        let paint = if c[..3] == [0, 0, 0] {
-                            car.paint_sets
-                                .first()
-                                .map(|p| p.colours[0])
-                                .unwrap_or([0x20, 0x40, 0xC0])
-                        } else {
-                            [c[0], c[1], c[2]]
-                        };
-                        Some(CareerOpponent {
-                            car,
-                            paint,
-                            name: self.tables.driver_name(o.driver),
-                            difficulty: ev.difficulty,
-                            skill,
-                            grid: ranks.map(|r| r[slot + 1] - 1),
-                            personality: o.driver,
-                            parts: o.parts.iter().filter_map(|id| self.tables.parts.iter().find(|p| p.id == *id).cloned()).collect(),
-                        })
-                    })
-                    .collect();
-                self.pending = Some(PendingEvent {
-                    tournament: t.id,
-                    event,
-                    finale: finale.is_some(),
-                    garage_idx,
-                    mission: None,
-                });
-                let parts: Vec<Part> = garage_idx
-                    .map(|i| {
-                        self.career
-                            .installed_parts(&self.tables, i)
-                            .into_iter()
-                            .cloned()
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                tracing::info!(
-                    tournament = t.id,
-                    event,
-                    finale = finale.is_some(),
-                    track = track.file,
-                    laps = ev.laps,
-                    backwards = ev.backwards,
-                    car = car.model,
-                    opponents = opponents.len(),
-                    parts = parts.len(),
-                    "career event start"
-                );
-                Some(StartRequest {
-                    track_file: track.file.clone(),
-                    car,
-                    paint,
-                    laps: ev.laps.max(1) as u32,
-                    backwards: ev.backwards,
-                    opponents,
-                    parts,
-                    mission: None,
-                    traffic: match &t.custom_traffic {
-                        Some(ids) => ids.len() as u32,
-                        None => CAREER_TRAFFIC[(t.traffic_level as usize).min(3)],
-                    },
-                    player_grid: ranks.map(|r| r[0] - 1),
-                    traffic_ids: t
-                        .custom_traffic
-                        .as_ref()
-                        .map(|ids| ids.iter().map(|id| *id as u16).collect()),
-                    skill: t.difficulty_level.min(2) as u8,
-                })
+                self.event_request(car, &t, event, garage_idx, finale.is_some(), false)
             }
             None => {
                 self.message = "NO CAR AVAILABLE".into();
                 None
             }
         }
+    }
+
+    /// **`PLAYGAME` on the layout front end for `Game.GameType` 4** — `prerace.lay` or
+    /// `tournament.lay`, both `canplaygame=2`. The handler 0x50CE90's single-player tail
+    /// (0x50D25E…0x50D274) runs the start check **0x4D5730** and races only when it passes:
+    ///
+    /// * the car is `OwnedCars.Car` (0x4D5A01…0x4D5A1B, the garage selection `garage_idx`), tested
+    ///   against the selected tournament `[0x691E6C]` by 0x504A70 → one-button **813** and no race
+    ///   (0x4D5A88);
+    /// * 0x504B60, another tournament part-way through, unless `[screen+0x174]` already said yes →
+    ///   two-button **858** (0x4D5AE8);
+    /// * type 4 only (0x4D58FB): when no event of the tournament is done yet
+    ///   (`0x503370 − 0x504300 == 0`, 0x4D591F) the fee 0x503430 against the money 0x5012D0 —
+    ///   short → one-button **857** (0x4D5967), else `0x5012E0(−fee)` (0x4D5B42); then **0x503940**,
+    ///   the current tournament and event `[0x5DB76C]` / `[0x5DB768]` = the selected ones
+    ///   `[0x691E6C]` / `[0x691E7C]`.
+    ///
+    /// Then the launch 0x4ED5D0 builds the race from them ([`Self::event_request`]). The event
+    /// is `[0x691E7C]`:
+    /// `Tournament.RemainingTracks` row `row`'s undone event (0x504F00, `Career::enter_event`). The
+    /// dialogs are raised through `self.dialog`.
+    pub fn start_selected_event(&mut self, garage_idx: usize, row: usize) -> Option<StartRequest> {
+        let t = self.current()?.clone();
+        let owned = self.career.garage.get(garage_idx)?;
+        let car = self.tables.car(owned.car_id)?.clone();
+        if !self.career.eligible_garage(&t).contains(&garage_idx) {
+            self.dialog = Some((813, false));
+            return None;
+        }
+        if !self.reset_confirmed && self.career.partial_elsewhere(&self.tables, t.id) {
+            self.dialog = Some((858, true));
+            return None;
+        }
+        let event = match self.career.enter_event(&self.tables, &t, row) {
+            Ok(e) => e,
+            Err(CareerError::NoMoney { .. }) => {
+                self.dialog = Some((857, false));
+                return None;
+            }
+            Err(e) => {
+                tracing::info!(error = %e, "tournament event not started");
+                return None;
+            }
+        };
+        self.reset_confirmed = false;
+        self.save();
+        self.event_request(car, &t, event, Some(garage_idx), false, true)
+    }
+
+    /// A tournament event's race, as 0x4ED5D0 sets it up for game type 4 (and 10 for a finale):
+    /// the event's track, laps and direction (0x4FC0B0), the seven opponents of the record at the
+    /// event's difficulty (0x4EBDA0), the grid by the standings (0x4ED040) and the traffic. Marks
+    /// the event pending, and for a tournament sets `TOURNAMENTLASTRACE` / `TOURNAMENTENDOFERA`
+    /// as the launch does (0x4ECAFD…0x4ECB5B).
+    fn event_request(&mut self, car: CarCatalogEntry, t: &Tournament, event: usize, garage_idx: Option<usize>, finale: bool, layout: bool) -> Option<StartRequest> {
+        let ev = &t.events[event];
+        let Some(track) = self.tables.track(ev.track_id) else {
+            self.message = format!("UNKNOWN TRACK {}", ev.track_id);
+            return None;
+        };
+        let paint = self.paint_for(
+            &car,
+            garage_idx
+                .map(|i| self.career.garage[i].paint_set as usize)
+                .unwrap_or(0),
+        );
+        // **The grid is the standings.** 0x4ED040's mode-4 arm gives racer slot `i` the
+        // `STARTINGPOS` `0x503660(tid, i)` — slot 0 the player, slot `i` opponent record
+        // `i`. With no event of the attempt done that function returns **8** for the
+        // player and `i` for opponent `i` (0x503750, 0x503745), the usual "player last";
+        // after that it is each driver's 1-based rank in the table, so the leader starts
+        // on pole. `None` for a finale, which is not a tournament of the standings.
+        let ranks: Option<[u32; 8]> = (!self.career.state(t.id).events.is_empty() && !finale).then(|| {
+            let mut r = [8u32; 8];
+            for (pos, row) in self.career.standings(&t).iter().enumerate() {
+                if row.0 < 8 {
+                    r[row.0] = pos as u32 + 1;
+                }
+            }
+            r
+        });
+        let opponents: Vec<CareerOpponent> = t
+            .opponents
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, o)| {
+                let car = self.tables.car(o.car_id as u16)?.clone();
+                if car.sim.is_empty() {
+                    return None;
+                }
+                let skill = self
+                    .tables
+                    .personalities
+                    .iter()
+                    .find(|p| p.id == o.driver)
+                    .map(|p| p.skill)
+                    .unwrap_or([[1.0, 0.0]; 4]);
+                let c = o.colours[0];
+                // opponent colour record is RGBA (bytes r g b a); an all-zero entry means "catalogue default"
+                let paint = if c[..3] == [0, 0, 0] {
+                    car.paint_sets
+                        .first()
+                        .map(|p| p.colours[0])
+                        .unwrap_or([0x20, 0x40, 0xC0])
+                } else {
+                    [c[0], c[1], c[2]]
+                };
+                Some(CareerOpponent {
+                    car,
+                    paint,
+                    name: self.tables.driver_name(o.driver),
+                    difficulty: ev.difficulty,
+                    skill,
+                    grid: ranks.map(|r| r[slot + 1] - 1),
+                    personality: o.driver,
+                    parts: o.parts.iter().filter_map(|id| self.tables.parts.iter().find(|p| p.id == *id).cloned()).collect(),
+                })
+            })
+            .collect();
+        // 0x4ECAFD…0x4ECB5B, before the race: the last race when one event is left undone
+        // (0x504300), the end of the era beside it. `[0x691E81]` keeps whatever the last 0x503AD0
+        // left in it until the race is filed. A finale (type 10) leaves the pair alone; the way
+        // back from it does not read them.
+        if !finale {
+            let (last_race, end_of_era) = self.career.tournament_flags(&self.tables, t);
+            self.race_flags = TournamentRaceFlags { last_race, end_of_era, era_changed: self.race_flags.era_changed };
+        }
+        self.pending = Some(PendingEvent {
+            tournament: t.id,
+            event,
+            finale,
+            garage_idx,
+            mission: None,
+            layout,
+        });
+        let parts: Vec<Part> = garage_idx
+            .map(|i| {
+                self.career
+                    .installed_parts(&self.tables, i)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        tracing::info!(
+            tournament = t.id,
+            event,
+            finale,
+            track = track.file,
+            laps = ev.laps,
+            backwards = ev.backwards,
+            car = car.model,
+            opponents = opponents.len(),
+            parts = parts.len(),
+            "career event start"
+        );
+        Some(StartRequest {
+            track_file: track.file.clone(),
+            car,
+            paint,
+            laps: ev.laps.max(1) as u32,
+            backwards: ev.backwards,
+            mirror: ev.direction_flag != 0,
+            opponents,
+            parts,
+            mission: None,
+            traffic: match &t.custom_traffic {
+                Some(ids) => ids.len() as u32,
+                None => CAREER_TRAFFIC[(t.traffic_level as usize).min(3)],
+            },
+            player_grid: ranks.map(|r| r[0] - 1),
+            traffic_ids: t
+                .custom_traffic
+                .as_ref()
+                .map(|ids| ids.iter().map(|id| *id as u16).collect()),
+            skill: t.difficulty_level.min(2) as u8,
+        })
     }
 
     /// CLI smoke helper: buy the cheapest eligible car of the selected tournament if the garage
@@ -1120,16 +1214,33 @@ impl CareerUi {
             msg += &format!("   {:?} ERA COMPLETE", t.era()).to_uppercase();
         }
         self.message = msg;
+        // 0x505800 reads what 0x503AD0 left in `[0x691E81]`: cleared at 0x503B01, set at 0x503C69
+        // when the era moved on
+        self.race_flags.era_changed = o.era_advanced;
         self.save();
-        // move the cursor to the next open tournament
-        let list = self.tournaments();
-        if let Some(i) = list
-            .iter()
-            .position(|x| self.career.availability(&self.tables, x) == Availability::Open)
-        {
-            self.t_idx = i;
+        // **The selected tournament `[0x691E6C]` moves only when one is completed** (rank ≤ 3 in
+        // an era tournament): 0x503C76…0x503CA8 walks the records of the career's era, now the
+        // next one when this closed it, and takes the first visible one not completed yet, else
+        // the last completed one (0 when the era has none). A reset (rank > 3, 0x503CB3), a club
+        // event (0x503D23) and an event that is not the last (0x503CD3) leave it where it was.
+        // (Until 2026-09-25 the port moved to the first open tournament after every event.)
+        if o.final_rank.is_some() && !o.reset && !t.is_club() {
+            let list = self.tournaments();
+            let mut pick = 0;
+            for (i, x) in list.iter().enumerate() {
+                if self.career.availability(&self.tables, x) == Availability::Open {
+                    pick = i;
+                    break;
+                }
+                pick = i;
+            }
+            self.t_idx = pick;
         }
-        self.car_sel = 0;
+        // the text screen's car row indexes `car_choices`, which the tournament decides; the
+        // layout front end's is `OwnedCars.Car`, which the race end does not move
+        if !p.layout {
+            self.car_sel = 0;
+        }
     }
 
     pub fn sprites(&self, f: &BitmapFont, active: Option<u8>) -> Vec<Sprite> {
@@ -1413,6 +1524,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The picture a player clicks on `createplayer` (`[0x5D8F2C]`, 0x4CF940) is what
+    /// `CREATEPLAYERDONE` hands 0x4DE5B0 (0x510874): it becomes `[0x5DB748]` (0x4DE82F), so it is
+    /// both the digit of `<N><name>.sav` and `PlayerInfo`'s picture field, and the profile list
+    /// reads it back out of the file name. `savegame.md` §2.2, `controls.md` §4.162.
+    #[test]
+    fn the_chosen_picture_is_the_file_digit_and_the_saved_field() {
+        let Ok(paths) = GamePaths::locate() else {
+            eprintln!("skipping: original game data not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("nfs-picture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ui = CareerUi::load(&paths).unwrap();
+        ui.save_dir = dir.clone();
+        ui.save_path = dir.join("career.json");
+        assert!(ui.create_profile("Greta", 5));
+        let file = dir.join("5Greta.sav");
+        assert!(file.exists());
+        let sav = nfs_formats::sav::SaveFile::parse(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(sav.player.as_ref().map(|p| p.picture), Some(5));
+        let listed = nfs_game::save::list_profiles(&dir);
+        assert_eq!(listed, vec![Profile::new("Greta", 5)]);
+        assert!(ui.switch_profile(&listed[0]));
+        assert_eq!(ui.profile.picture, 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn first_classic_tournament_flow() {
         let Ok(paths) = GamePaths::locate() else {
@@ -1465,21 +1603,26 @@ mod tests {
         assert!(ui.activate().is_none());
         assert_eq!(ui.basket, vec![pid]);
         assert_eq!(ui.basket_total(), price);
-        assert!(
-            ui.career.garage[0].parts.is_empty(),
-            "nothing is bought before the list is accepted"
-        );
+        // a new car carries copies of its stock parts (0x4EE9A0)
+        let stock_fitted = ui.career.garage[0].parts.clone();
+        assert!(!stock_fitted.is_empty());
+        assert!(ui.career.spares.is_empty(), "nothing is bought before the list is accepted");
         assert!(ui.activate().is_none());
         assert!(ui.basket.is_empty(), "Enter again takes it back out");
         assert!(ui.activate().is_none());
+        assert_eq!(ui.career.garage[0].parts, stock_fitted);
         ui.back();
-        assert_eq!(ui.career.garage[0].parts, vec![pid]);
+        // bought and installed: the part it replaces (0x518510) goes to the inventory
+        assert!(ui.career.garage[0].parts.contains(&pid));
+        let fitted = ui.career.garage[0].parts.len();
+        assert_eq!(fitted + ui.career.spares.len(), stock_fitted.len() + 1);
         assert_eq!(ui.career.money, 100_000 - price);
         assert!(ui.basket.is_empty());
         assert!(ui.message.starts_with("INSTALLED"));
         ui.row = 1;
         let req = ui.activate().expect("event starts");
-        assert_eq!(req.parts.len(), 1);
+        // the race gets every installed part, the stock copies with the bought one (0x49CB50)
+        assert_eq!(req.parts.len(), fitted);
         assert_eq!(req.opponents.len(), 7);
         assert!(["farmland", "coastal"].contains(&req.track_file.as_str()));
         assert!(

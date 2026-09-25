@@ -26,8 +26,14 @@ fn every_car_has_the_same_default_body() {
             return;
         };
         assert_eq!(p.len(), want, "{model}");
-        // sorted by height, and the four lowest are the wheel contact quad on the body origin's plane
-        assert!(p.windows(2).all(|w| w[0].y <= w[1].y), "{model}: not sorted by height");
+        // sorted by height (0x49ABC0) — the first four then permuted by quadrant — and the four
+        // lowest are the wheel contact quad on the body origin's plane
+        assert!(p[3..].windows(2).all(|w| w[0].y <= w[1].y), "{model}: not sorted by height");
+        assert!(p[..4].iter().all(|q| p[4..].iter().all(|r| q.y <= r.y)), "{model}: the first four are not the lowest");
+        // FL, FR, RL, RR by the signs of x and z
+        for (i, q) in p[..4].iter().enumerate() {
+            assert_eq!((q.x > 0.0, q.z > 0.0), (i % 2 == 1, i < 2), "{model}: probe {i} at {q:?}");
+        }
         assert!(p[..4].iter().all(|q| q.y.abs() < 0.01), "{model}: the lowest four are not on y = 0");
         // the quad is symmetric across the car and spans a plausible wheelbase and track
         let (xmin, xmax) = p[..4].iter().fold((f32::MAX, f32::MIN), |(a, b), q| (a.min(q.x), b.max(q.x)));
@@ -40,8 +46,8 @@ fn every_car_has_the_same_default_body() {
     }
 }
 
-/// The body frame is the physics one: +x right, +z forward. The front box reaches further forward
-/// than the wheel quad does, and the rear box further back.
+/// The points are the model's own axes, used unturned as the physics body frame (0x442080,
+/// 0x49AE30): both boxes overhang the wheel quad, whichever end they are on.
 #[test]
 fn the_body_is_oriented_like_the_physics_frame() {
     let Some(p) = points("993") else { return };
@@ -70,4 +76,24 @@ fn a_993s_spoiler_comes_with_its_body_style() {
     let coupe_zmin = coupe.iter().fold(f32::MAX, |a, q| a.min(q.z));
     let extra: Vec<_> = gt2.iter().filter(|q| q.z < coupe_zmin + 0.01 || q.y > 1.05).collect();
     assert!(extra.len() >= 4, "the spoiler points are not where a spoiler is: {extra:?}");
+}
+
+/// `car+0x3A8…+0x3B0` of a racer — half the LOD-5 model box, the box holding the origin (0x445090
+/// → 0x43DE90) — and the `BndP` points lowered by its `y` (0x4421BE): the wheel quad sits
+/// `car+0x3AC` below the body origin.
+#[test]
+fn a_racers_body_origin_is_half_the_model_box_up() {
+    for model in ["993", "356_1", "Boxster", "GT1"] {
+        let Ok(paths) = GamePaths::locate() else { return };
+        let Ok(car) = CarAssets::load(&paths, model) else { return };
+        let car = car.with_style(0);
+        let (lo, hi) = nfs_game::world::car_model_box(&car, 5);
+        let (pts, half) = nfs_game::world::car_body(&car, false);
+        eprintln!("{model}: box {lo:?} … {hi:?}, half {half:?}, wheel quad y {}", pts[0].y);
+        assert!(lo.y.abs() < 0.05, "{model}: the model stands on y = 0 ({lo:?})");
+        assert!((0.4..0.8).contains(&half.y), "{model}: half height {}", half.y);
+        assert!(pts[..4].iter().all(|q| (q.y + half.y).abs() < 0.01), "{model}: wheel quad not at −halfH");
+        let (tp, th) = nfs_game::world::car_body(&car, true);
+        assert!((th - half * 0.4).length() < 1e-5 && (tp[0].y + th.y).abs() < 0.01, "{model}: tiny");
+    }
 }

@@ -109,6 +109,15 @@ impl Default for AnimDef {
 }
 
 impl AnimDef {
+    /// The `audioType` as the parser stores it at `+0x0C`: its index among the thirteen `kAud…`
+    /// names (the order in [`AnimDef::audio_type`]'s doc); `None` for a name that is not one.
+    pub fn audio_type_index(&self) -> Option<u32> {
+        const NAMES: [&str; 13] = [
+            "kAudSign", "kAudMetalSign", "kAudGlass", "kAudWoodbox", "kAudPylon", "kAudTree", "kAudBush", "kAudCarBody", "kAudWood", "kAudSnow", "kAudIce", "kAudEarth", "kAudRock",
+        ];
+        NAMES.iter().position(|n| n.eq_ignore_ascii_case(&self.audio_type)).map(|i| i as u32)
+    }
+
     /// The pieces 0x476380 starts for a hit at `speed` (`|v|`, 0x532B20), as a range of `pieces`:
     /// the bands are walked while `speed` is above the band's value (0x4763ED…0x476400); none passed
     /// gives the first piece alone, else the last band passed with the pieces of the bands before

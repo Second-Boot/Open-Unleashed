@@ -1156,10 +1156,12 @@ impl LayoutScreen {
                     // the widget's
                     let mut c = faded(run);
                     c[3] *= alpha as f32 / 255.0;
-                    // 0x522050: a letter at a time, each advancing by its own measure plus the gap.
-                    // APPROXIMATION: 0x536970's second measure, used on the vertical axis, is taken
-                    // as the font's line height
-                    let sizes: Vec<f32> = RUN_TEXT.chars().map(|ch| if vertical { f.line_px() } else { f.place(&ch.to_string()).1 }).collect();
+                    // 0x522050: a letter at a time, each advancing by its own 0x536970 measure —
+                    // the width across, the height (the glyph's own span) down — plus the gap
+                    let sizes: Vec<f32> = RUN_TEXT.chars().map(|ch| {
+                        let (w, h) = f.measure(&ch.to_string());
+                        if vertical { h } else { w }
+                    }).collect();
                     let total: f32 = sizes.iter().sum::<f32>() + (RUN_TEXT.chars().count() as i32 * gap) as f32;
                     let (mut cx, mut cy) = (x, y);
                     let shift = match align {
@@ -1204,8 +1206,9 @@ impl LayoutScreen {
     /// heading font at 0xC0 of the colour (0x4CE348…0x4CE3B7). The colour is white at the widget's
     /// fade (0x4D87D0).
     ///
-    /// APPROXIMATION: 0x536970's height of a line is taken as its font's line height, and a line is
-    /// drawn only when it starts inside the box (the original cuts with the oval's stencil).
+    /// A line's height is 0x536970's second measure of its text (the marker dropped) in its font —
+    /// the span of its glyph quads (`BitmapFont::measure`). APPROXIMATION: a line is drawn only
+    /// when it starts inside the box (the original cuts with the oval's stencil).
     fn draw_credits_roll(&self, b: crate::movie_overlay::Box4, now: i64, talpha: f32, aspect: f32, out: &mut Vec<Sprite>) {
         use crate::movie_overlay::{credits_wrap, CreditsRoll};
         let (Some(body), Some(head)) = (self.fonts.get(crate::layout::ROLL_FONTS[0]), self.fonts.get(crate::layout::ROLL_FONTS[1])) else { return };
@@ -1214,11 +1217,11 @@ impl LayoutScreen {
         let height = |id: i32| -> i32 {
             let t = text(id);
             let h = if t.starts_with('#') || t.starts_with('!') {
-                head.line_px() + 2.0
+                head.measure(&t[1..]).1 + 2.0
             } else if gary && t == "Gary Steinke" {
-                body.line_px() + 10.0
+                body.measure(&t).1 + 10.0
             } else {
-                body.line_px()
+                body.measure(t.strip_prefix('*').unwrap_or(&t)).1
             };
             (h as i32 + 2).max(12)
         };
@@ -1530,8 +1533,9 @@ impl LayoutScreen {
         // 0x4C304F    0x4DA350(font, x, y, 0, 0x4D87E0(fade), row, 1.0, 1.0)
         // ```
         //
-        // so the rows are **black** at the widget's fade, `spacing` apart, and the
-        // list is `Comms.PlayerList` on all three shipped widgets. §4.131.
+        // so the rows are **black** at the widget's fade, `spacing` apart. They are the
+        // chat's lines, `[0x65B6A8]` (0x4C2FD1), which `set_chat_lines` puts here — not
+        // `Comms.PlayerList`, which the box only asks for names. §4.131, §4.151.
         if e.class == "NFS5.CHATDISPLAYBOX"
             && let Some(cf) = self.fonts.get("univers8b.ffn").or_else(|| self.font_for(e))
             && let Some((rows, cur)) = self.lists.get(&i)
@@ -1545,8 +1549,10 @@ impl LayoutScreen {
                 }
             }
             // **And its scrollbar, ported 2026-09-21 (§4.131).** 0x4C2F91 asks the
-            // accessor for its row count and 0x4C2F94's `cmp eax, 1 ; jle` skips the
-            // bar unless there is **more than one row**; 0x4C2FA6 then calls 0x4DB530
+            // accessor — the box's own `SliderBar` range, `0 … max(0, rows − fit)` — for
+            // its count and 0x4C2F94's `cmp eax, 1 ; jle` skips the bar unless that is
+            // **more than one**, i.e. unless the lines overflow the box *(corrected
+            // 2026-09-25: this tested the row count itself)*; 0x4C2FA6 then calls 0x4DB530
             // with `x = y = 0` (both `xor`ed at 0x4C2F8B and 0x4C2F8D), so the
             // sub-object's rectangles are already absolute.
             //
@@ -1558,8 +1564,9 @@ impl LayoutScreen {
             // 0x4DB030 (`edi -= eax` at 0x4C2C79), so the bar owns the rightmost
             // sixteen pixels of the box over its whole height — exactly the combo's
             // arrangement, which is why `combo_scrollbar` serves both.
-            if rows.len() > 1 {
-                self.combo_scrollbar(out, aspect, x + w - LIST_SCROLLBAR_W, y, h, rows.len(), first, &tint);
+            let count = rows.len().saturating_sub(fit) + 1;
+            if count > 1 {
+                self.combo_scrollbar(out, aspect, x + w - LIST_SCROLLBAR_W, y, h, count, first, &tint);
             }
         }
         // The three input boxes share one class — `NFS5.INPUTBOX`,
@@ -1627,6 +1634,13 @@ impl LayoutScreen {
                 self.glass(out, aspect, x, y, w, h, &tint);
             }
             // and 0x51C670 returns there: no caret, which is the input boxes' (0x4CC9D7)
+            return;
+        }
+        // `NFS5.CHATDISPLAYBOX`'s draw 0x4C2F50 is the chat's rows and its scrollbar, above, and
+        // nothing else — its `data.accessor` (`Comms.PlayerList`) only names players. *(Until
+        // 2026-09-25 it fell through to the input boxes' value and printed that list's first row
+        // — "empty" — in the chat once the list had rows.)*
+        if e.class == "NFS5.CHATDISPLAYBOX" {
             return;
         }
         let Some(f) = self.font_for(e) else { return };
@@ -1892,7 +1906,7 @@ impl LayoutScreen {
                     for cell in cells {
                         // a cell with no anchor of its own sits at the panel's left edge
                         let ax = if cell.anchor.is_empty() { px } else { self.anchor_x(&cell.anchor).unwrap_or(px) };
-                        let align = if cell.dx < 0.0 { 2 } else { 0 };
+                        let align = if cell.dx.is_sign_negative() { 2 } else { 0 };
                         self.text(out, aspect, f, &cell.text, ax + cell.dx, ry, 0.0, align, tint(text_c));
                     }
                 }
@@ -2003,21 +2017,27 @@ impl LayoutScreen {
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         }
-        // `NFS5.PLAYERDRIVERPICTURE`'s draw 0x4CF7C0 ends the way the buttons' do:
-        // the bevel 0x521050 over the widget's own box (0x4C8670's corners differenced
-        // at 0x4CF89E and 0x4CF8AE) with a thickness of 3, ungated but for the two
-        // visibility tests (0x4CF88D, 0x4CF896). Eight widgets.
-        // — and, when it is **not** pressed, the drop shadow 0x520F00 with (4, 4)
-        // at 0x4CF92A, behind one gate: 0x4CF8E1 skips it when `data.ournumber`
-        // (`[this+0x140]`, bound at 0x4CF7A8) equals the **8** at 0x5D8F2C. The eight
-        // shipped widgets are `createplayer.lay`'s and carry `ournumber` 0…7, so all
-        // eight have one; the ninth portrait `ALLdrivr.fsh` holds is what the gate is
-        // for. §4.126.
+        // `NFS5.PLAYERDRIVERPICTURE`'s draw **0x4CF7C0**, after the template's picture
+        // (0x4C8260): the box is `0x4C8670`'s — this class autosizes (§4.62), so it is the
+        // union of its parts, the 54×64 `ALLdrivr.fsh` entry, and not the `size=50,150` the
+        // `.lay` blocks carry (which the port drew the shadow over until 2026-09-25).
+        //
+        // 1. `[0x5D8F2C] == data.ournumber` (0x4CF83B; `[this+0x140]`, bound at 0x4CF7A8): the
+        //    chosen picture's frame 0x521B60 with a thickness of **5** (0x4CF84B).
+        // 2. pressed (0x4CF886 0x4C7C90, 0x4CF88F 0x5299C0): the bevel 0x521050 with 3, and
+        //    the draw ends (0x4CF8DE).
+        // 3. otherwise, unless it is the chosen one (0x4CF8E1), the drop shadow 0x520F00 with
+        //    (4, 4) at 0x4CF92A. §4.126, §4.162.
         if e.class == "NFS5.PLAYERDRIVERPICTURE" {
+            let (bw, bh) = self.box_hit(e);
+            let chosen = self.attr_num(e, "ournumber").unwrap_or(0.0) as i32 == self.driver_picture;
+            if chosen {
+                self.picture_frame(out, aspect, x, y, bw, bh, 5.0);
+            }
             if self.pressed_on(i, hovered) {
-                self.bevel(out, aspect, x, y, w, h, 3.0);
-            } else if self.attr_num(e, "ournumber").unwrap_or(0.0) != 8.0 {
-                self.drop_shadow(out, aspect, x, y, w, h, 4.0, 4.0);
+                self.bevel(out, aspect, x, y, bw, bh, 3.0);
+            } else if !chosen {
+                self.drop_shadow(out, aspect, x, y, bw, bh, 4.0, 4.0);
             }
         }
         if code_placed(&e.class) {

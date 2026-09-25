@@ -1069,6 +1069,28 @@ fn the_classes_that_carry_a_bevel() {
     assert_eq!(at("NFS5.BEVELEDOPTIONBOX"), 16);
 }
 
+/// `createplayer.lay`'s chooser: eight `NFS5.PLAYERDRIVERPICTURE`s carrying `ournumber` 0…7, one
+/// each, so the 8 `CREATEPLAYERENTER` stores in `[0x5D8F2C]` (0x51078B) matches none of them and
+/// the screen opens with no frame (0x4CF83B) and eight drop shadows (0x4CF8E1). §4.162.
+#[test]
+fn the_driver_pictures_are_numbered_0_to_7() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let f = paths.fe_data().join("Layouts").join("createplayer.lay");
+    let text: String = std::fs::read(f).unwrap().iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+    let mut numbers: Vec<i64> = nfs_formats::lay::Layout::parse(&text)
+        .elements
+        .iter()
+        .filter(|e| e.class == "NFS5.PLAYERDRIVERPICTURE")
+        .map(|e| e.get("ournumber").and_then(|v| v.trim().parse().ok()).unwrap())
+        .collect();
+    numbers.sort_unstable();
+    assert_eq!(numbers, (0..8).collect::<Vec<_>>());
+    assert!(!numbers.contains(&(nfs_game::save::DEFAULT_PICTURE as i64)));
+}
+
 /// The stems — the thin verticals a menu button hangs off its ends — are drawn when
 /// `data.glintybox` is not −1, and **none** of the 153 shipped buttons carries −1.
 /// `RE/notes/controls.md` §4.24.

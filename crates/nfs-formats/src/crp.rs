@@ -292,6 +292,12 @@ impl Crp {
         Ok(b[..end].iter().map(|&c| c as char).collect())
     }
 
+    /// Every `RMth` level record ([`RenderMethod`]), in file order.
+    pub fn render_methods(&self, data: &[u8]) -> Result<Vec<RenderMethod>, FormatError> {
+        self.check(data)?;
+        self.level.iter().filter(|e| e.is_level(b"RMth")).map(|e| RenderMethod::parse(self.entry_data(data, e)?, e.data_offset())).collect()
+    }
+
     /// Materials in table order (`pr.material` indexes this list).
     pub fn materials(&self, data: &[u8]) -> Result<Vec<Material>, FormatError> {
         self.check(data)?;
@@ -580,6 +586,13 @@ impl Base {
 pub struct Material {
     pub flags: u32,
     pub class: u32,
+    /// `+0x0C`: the **op mask** the material hands its render method's builder 0x44BF70 as its
+    /// second argument (0x44AB8B → 0x44BBE0), which builds an op only when the op's own mask
+    /// (`op+0xC`) is 0 or shares a bit with it (0x44C1B0…0x44C1BC). On the tracks it is 0x30008,
+    /// 0x30010, 0x13, 0xB or 0x1000A: bit 8 builds the `df` colours and
+    /// `Headlights::LayerVertexLight`, bit 0x10 the method's `Am` op in their place
+    /// ([`RenderMethod::built_ops`], `RE/notes/lighting.md` §5.4).
+    pub op_mask: u32,
     /// e.g. "Opaque", "Normal", "NormMatState", "FakeSort", "FullAmbient"; cars "CarExtEnv"...
     pub render_method: String,
     /// SHPI entry FourCC in the file named by `sn` (tracks); garbage/empty when untextured.
@@ -605,8 +618,17 @@ pub struct Material {
     /// (`RE/notes/thrash.md` §6). It is the extension table's entry at data offset 0 of size 0x18
     /// (`{key, 0, 0x18, 0}` at `+164`), whose data start at `+260`. Over every shipped car it reads
     /// `{1, 2, 0, cull, bias, −1}`: gouraud, **blending on**, the plain alpha pair, the cull mode
-    /// (0 none, 1 `CCW` — `dx7z.dll` 0x60003C4E) and a small depth bias. `None` off a car.
+    /// (0 none, 1 the view's own — 0x540590, `thrash.md` §6d.2) and a small depth bias. `None` off
+    /// a car.
     pub rs: Option<[i32; 6]>,
+    /// The record's own keyed data blocks, `(key, bytes)` — what the material builder puts on the
+    /// material object's list `[mat+0x10]` (0x44AD3B…0x44ADFF) for 0x44A250 to lay over the
+    /// method's slots at every draw, ahead of the method's own blocks. `mt+0x08` counts the texture
+    /// entries (low half, 0x2C bytes each from `+0x20`) and these (high half); their `{key, offset,
+    /// size, ?}` records follow the texture entries and the data follows the records. A key below
+    /// 0x10000 is an index into the method's key table ([`RenderMethod::resolve`]). On the tracks
+    /// only the `…MatState` materials carry any: the `Rs` block (`RE/notes/thrash.md` §6c).
+    pub blocks: Vec<(u32, Vec<u8>)>,
 }
 
 /// `R3DLightLayer`'s parameter block `{f32 p0, f32 p1, u32 slot}` (read at 0x446600, 0x446886 and
@@ -641,6 +663,7 @@ impl Material {
         Ok(Self {
             flags: u32_le(b, 0, "mt flags")?,
             class: u32_le(b, 4, "mt class")?,
+            op_mask: u32_le(b, 0x0C, "mt op mask")?,
             render_method: b[16..16 + name_end].iter().map(|&c| c as char).collect(),
             texture: [b[40], b[41], b[42], b[43]],
             unknown_20: u32_le(b, 32, "mt +32")?,
@@ -655,7 +678,26 @@ impl Material {
             rs: (b.len() >= 312 && u32_le(b, 168, "mt +168")? == 0 && u32_le(b, 172, "mt +172")? == 0x18).then(|| {
                 std::array::from_fn(|k| i32::from_le_bytes([b[260 + 4 * k], b[261 + 4 * k], b[262 + 4 * k], b[263 + 4 * k]]))
             }),
+            blocks: Self::parse_blocks(b),
         })
+    }
+
+    /// 0x44AD3B…0x44ADFF: `n` = `mt+0x0A`, the records at `0x20 + 0x2C·textures`, the data after
+    /// them (`(n + 2) << 4` past the texture entries, plus the record's offset). A record whose data
+    /// lies outside the `mt` is skipped.
+    fn parse_blocks(b: &[u8]) -> Vec<(u32, Vec<u8>)> {
+        let d = |o: usize| b.get(o..o + 4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+        let Some(counts) = d(8) else { return Vec::new() };
+        let (textures, n) = ((counts & 0xFFFF) as usize, (counts >> 16) as usize);
+        let table = 0x20 + 0x2C * textures;
+        let data0 = table + 16 * n;
+        (0..n)
+            .filter_map(|k| {
+                let o = table + 16 * k;
+                let (key, at, size) = (d(o)?, d(o + 4)? as usize, d(o + 8)? as usize);
+                Some((key, b.get(data0 + at..data0 + at + size)?.to_vec()))
+            })
+            .collect()
     }
     pub fn texture_name(&self) -> String {
         self.texture.iter().map(|&c| c as char).collect()
@@ -663,6 +705,98 @@ impl Material {
     /// Cars: `+40` is a 0-based texture-page index (`.tpg` `[tpage(N+1).details]`). CONFIRMED.
     pub fn page_index(&self) -> u32 {
         u32::from_le_bytes(self.texture)
+    }
+}
+
+/// One op of an `RMth` record, sixteen bytes `{key, class, param, mask}` (`RE/notes/thrash.md`
+/// §6c). `key` is two characters over a pass number (`0x416D0001` = `"Am"`, pass 1) — what the
+/// method's slot table and its data blocks are keyed by; `class` the layer factory's code (0x53F980
+/// takes 0…0x13, 0x449B70 0x8001…0x8105); `mask` the bits a material's `op_mask` must share for
+/// the op to be built (0 = always, 0x44C1B0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderOp {
+    pub key: u32,
+    pub class: u32,
+    pub param: u32,
+    pub mask: u32,
+}
+
+/// A pass of an `RMth` record: its ops `first .. first + count` and the option mask 0x44C185
+/// tests against the render flags `[0x6197F8]` (`RE/notes/lighting.md` §5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderPass {
+    pub first: u32,
+    pub count: u32,
+    pub mask: u32,
+}
+
+/// An `RMth` level record, the render method a material names (`RE/notes/thrash.md` §6c): the
+/// 16-byte name, `u32 passes` (`+0x10`), `u32 ops` (`+0x14`), `u32 blocks` (`+0x18`), the passes
+/// from `+0x1C`, the ops after them, then `blocks` records `{key, offset, size, ?}` and the data
+/// they point into, `offset` counted from the end of those records. The builder 0x44BF70 hands
+/// every block to 0x44A580 (0x44C313…0x44C366), which stores `{size, pointer}` in the slot the
+/// block's key owns: the method's own data for that op — the `Am` colour `LayerAmbient` /
+/// `Headlights::LayerVertexLight_Ambient` write, the `Rs` render states `LayerState` applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderMethod {
+    pub name: String,
+    pub passes: Vec<RenderPass>,
+    pub ops: Vec<RenderOp>,
+    /// `(key, bytes)` of each data block.
+    pub blocks: Vec<(u32, Vec<u8>)>,
+}
+
+impl RenderMethod {
+    pub fn parse(b: &[u8], off: usize) -> Result<Self, FormatError> {
+        let name_end = b.iter().take(16).position(|&c| c == 0).unwrap_or(16.min(b.len()));
+        let name = b[..name_end].iter().map(|&c| c as char).collect();
+        let (n_passes, n_ops, n_blocks) = (u32_le(b, 0x10, "RMth passes")? as usize, u32_le(b, 0x14, "RMth ops")? as usize, u32_le(b, 0x18, "RMth blocks")? as usize);
+        let d = |o: usize| u32_le(b, o, "RMth record");
+        let ops0 = 0x1C + 16 * n_passes;
+        let recs = ops0 + 16 * n_ops;
+        let data0 = recs + 16 * n_blocks;
+        if data0 > b.len() {
+            return Err(FormatError::Truncated { what: "RMth record", offset: off, needed: data0 - b.len() });
+        }
+        let passes = (0..n_passes).map(|k| 0x1C + 16 * k).map(|o| Ok(RenderPass { first: d(o)?, count: d(o + 4)?, mask: d(o + 8)? })).collect::<Result<Vec<_>, FormatError>>()?;
+        let ops = (0..n_ops).map(|k| ops0 + 16 * k).map(|o| Ok(RenderOp { key: d(o)?, class: d(o + 4)?, param: d(o + 8)?, mask: d(o + 12)? })).collect::<Result<Vec<_>, FormatError>>()?;
+        let blocks = (0..n_blocks)
+            .map(|k| recs + 16 * k)
+            .map(|o| {
+                let (key, at, size) = (d(o)?, d(o + 4)? as usize, d(o + 8)? as usize);
+                let bytes = b.get(data0 + at..data0 + at + size).ok_or(FormatError::Truncated { what: "RMth block", offset: off + data0 + at, needed: size })?;
+                Ok((key, bytes.to_vec()))
+            })
+            .collect::<Result<Vec<_>, FormatError>>()?;
+        Ok(Self { name, passes, ops, blocks })
+    }
+
+    /// The ops a material with `op_mask` builds, over the passes whose option mask the render
+    /// flags `flags` let through — 0x44BF70's two tests, 0x44C185 and 0x44C1B0.
+    pub fn built_ops(&self, flags: u32, op_mask: u32) -> impl Iterator<Item = &RenderOp> + '_ {
+        self.passes
+            .iter()
+            .filter(move |p| p.mask == 0 || p.mask & flags != 0)
+            .flat_map(move |p| self.ops.iter().skip(p.first as usize).take(p.count as usize))
+            .filter(move |o| o.mask == 0 || o.mask & op_mask != 0)
+    }
+
+    /// The method's data block for `key`.
+    pub fn block(&self, key: u32) -> Option<&[u8]> {
+        self.blocks.iter().find(|(k, _)| *k == key).map(|(_, b)| b.as_slice())
+    }
+
+    /// The op key a data block's `key` stands for: 0x44A220 takes a key below 0x10000 as an index
+    /// into the method's key table — every op's key, sorted and de-duplicated by the builder
+    /// (0x44C003…0x44C14E) — and any other as itself. `None` for an index past the table.
+    pub fn resolve(&self, key: u32) -> Option<u32> {
+        if key >= 0x10000 {
+            return Some(key);
+        }
+        let mut keys: Vec<u32> = self.ops.iter().map(|o| o.key).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys.get(key as usize).copied()
     }
 }
 
@@ -789,5 +923,49 @@ impl Crp {
     /// Article count declared in the header (`+4 >> 5`).
     pub fn article_count(&self) -> u32 {
         self.header_a >> 5
+    }
+}
+
+#[cfg(test)]
+mod render_method_tests {
+    use super::*;
+
+    /// A two-pass method laid out as monaco1's `Opaque`: pass 1 builds `df` (mask 8) or `Am`
+    /// (mask 0x10) and an `Rs`, pass 2 (option mask 8) its own `Rs`; two data blocks follow.
+    fn opaque_like() -> Vec<u8> {
+        let mut b = b"Opaque\0\0\0\0\0\0\0\0\0\0".to_vec();
+        let words: Vec<u32> = [
+            vec![2, 4, 2],                                                    // passes, ops, blocks
+            vec![0, 3, 0, 1, 3, 1, 8, 3],                                     // the two passes
+            vec![0x6466_0001, 6, 2, 8, 0x416D_0001, 0x8011, 1, 0x10],         // `df`, `Am`
+            vec![0x5273_0001, 8, 0, 0, 0x5273_0003, 8, 0, 0],                 // the two `Rs`
+            vec![0x416D_0001, 0, 4, 0, 0x5273_0003, 4, 24, 0],                // block records
+            vec![0xFFFF_FFFF, 0, 2, 0xFFFF_FFFF, 1, 0, 0xFFFF_FFFF],          // their data
+        ]
+        .concat();
+        words.iter().for_each(|v| b.extend_from_slice(&v.to_le_bytes()));
+        b
+    }
+
+    #[test]
+    fn parses_ops_and_blocks() {
+        let m = RenderMethod::parse(&opaque_like(), 0).unwrap();
+        assert_eq!(m.name, "Opaque");
+        assert_eq!(m.passes[1], RenderPass { first: 3, count: 1, mask: 8 });
+        assert_eq!(m.ops[1], RenderOp { key: 0x416D_0001, class: 0x8011, param: 1, mask: 0x10 });
+        assert_eq!(m.block(0x416D_0001), Some(&[0xFF, 0xFF, 0xFF, 0xFF][..]));
+        let rs: Vec<i32> = m.block(0x5273_0003).unwrap().chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        assert_eq!(rs, [0, 2, -1, 1, 0, -1]);
+        assert!(m.block(0x5273_0001).is_none());
+    }
+
+    #[test]
+    fn op_and_pass_masks_select_ops() {
+        let m = RenderMethod::parse(&opaque_like(), 0).unwrap();
+        let classes = |flags, mask| m.built_ops(flags, mask).map(|o| o.class).collect::<Vec<_>>();
+        // bit 8 builds the colour stream, bit 0x10 the `Am` op; pass 2 only under render flag 8
+        assert_eq!(classes(1, 0x30008), [6, 8]);
+        assert_eq!(classes(1, 0x30010), [0x8011, 8]);
+        assert_eq!(classes(9, 0x30010), [0x8011, 8, 8]);
     }
 }

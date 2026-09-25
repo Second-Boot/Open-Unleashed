@@ -10,9 +10,11 @@
 //! ```
 //!
 //! `car+0x364` has the car's axes in its rows (`physics.md` §2: +0x364 x-axis, +0x370 up,
-//! +0x37C forward) and `car+0x330` is the position the body is drawn at, which the ground code
-//! keeps at `ground + 0.05` (`physics.md` §6). So the offsets below are metres in the car's body
-//! frame — +x right, +y up, +z forward — measured from a point 5 cm above the road.
+//! +0x37C forward) and `car+0x330` is the body's origin — half the model box (`car+0x3AC`,
+//! 0x445090) above the contact plane; the body is drawn `M[1]·car+0x3AC` below it (0x43A410).
+//! *(Corrected 2026-09-25: this said `car+0x330` is where the body is drawn, 5 cm above the road.)*
+//! So the offsets below are metres in the car's body frame — +x right, +y up, +z forward —
+//! measured from that origin.
 
 use glam::Vec3;
 
@@ -56,6 +58,98 @@ pub fn half_angle(base: f32, widescreen: bool, view: u16) -> f32 {
 pub fn fov_y_window(half_angle_deg: f32, widescreen: bool) -> f32 {
     let band = if widescreen { WIDESCREEN_BAND } else { 1.0 };
     2.0 * (half_angle_deg.to_radians().tan() * 0.75 / band).atan()
+}
+
+/// A scene view's own half-angle `+0x130` as its constructor 0x4672F0 sets it (0x4673D5, `0x42340000`).
+/// The build 0x464F80 overwrites it only in the scene manager's **first** view — `[[0x628140] + 4]`
+/// (0x464F91…0x464FA0), the main view 0x468E60 makes (0x468E93) — even when it builds the rear
+/// camera (type 1, 0x4611A0 from the mirror pass 0x468D94), so the rear-view mirror `[0x628144]`
+/// keeps this: 90° across, and no wide-screen ×1.2.
+pub const VIEW_HALF_ANGLE: f32 = 45.0;
+
+/// The vertical field of view (radians) of a horizontal half-angle `h` (degrees) on a viewport of
+/// `w` × `h_px` in 640 × 480 units — 0x466F30's aspect (0x466FD7…0x466FF8) into 0x5391B0's
+/// `m11 = cot h · aspect`.
+pub fn fov_y_viewport(half_angle_deg: f32, w: f32, h_px: f32) -> f32 {
+    2.0 * (half_angle_deg.to_radians().tan() * h_px / w).atan()
+}
+
+/// A camera slot's `+0x5C` as SetSlotView leaves it (0x46588C, `0x3F000000`): the **near plane**
+/// the build 0x464F80 gives the main view. It stores `+0x5C` in the view's `+0x18` (0x465425 /
+/// 0x46542D → 0x465439), which 0x466F30 hands the projection 0x5391B0 as its near (0x466FE0; the
+/// camera's `+0xCC`, where the depth range starts).
+pub const DEFAULT_NEAR: f32 = 0.5;
+
+/// The main view's near plane from the slot's `+0x5C`: less `[0x5B3EB0]` 0.35 when the slot's view
+/// is 1 (the driver view) — and in the rear build, type 1, whose write lands on the main view after
+/// it is drawn — else as it is (0x465413…0x465439). So the driver view has 0.15, the camera
+/// object's own near (0x4677F5), and every other view 0.5.
+pub fn near_plane(slot_near: f32, view: u16) -> f32 {
+    if view == 1 { slot_near - 0.35 } else { slot_near }
+}
+
+/// The near plane 0x462B80 writes to `+0x5C` with a new half-angle `a` (degrees): below 37.5
+/// (`[0x5B3C9C]`), `max((37.5 − a) / a, [0x5B23F4] 0.2)`, else `[0x5B23F0]` 0.5 — the dolly branch
+/// 0x462CA5…0x462CE3 and the stepping one 0x462DC7…0x462E09 alike. A narrow zoom pushes the near
+/// plane out: 9.0 at 3.75°.
+pub fn zoom_near(a: f32) -> f32 {
+    if a < DEFAULT_HALF_ANGLE { ((DEFAULT_HALF_ANGLE - a) / a).max(0.2) } else { DEFAULT_NEAR }
+}
+
+/// **CircleCam 0x462980** (view 0x0A), the slot's two words: the angle count `+0xC6` and the
+/// height step `+0xC4`. `+0xC6` is the same word the look-around yaw uses (0x4611C0); SetSlotView
+/// zeroes it (0x4658B2, and 0x465BB8), while `+0xC4` has no writer but this update's `inc`
+/// (0x462A47 — a byte scan of `0x627F44` finds nothing else), so the height step carries over from
+/// one circling to the next.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CircleCam {
+    /// `+0xC6`, a signed word, one up per update
+    pub count: i16,
+    /// `+0xC4`, a signed word, one up whenever `(count − 0x100) & 0x1FF` is 0
+    pub step: i16,
+}
+
+impl CircleCam {
+    /// The three eye heights, built on the stack at 0x462988…0x46299A (1.0, 2.0, 3.0).
+    pub const HEIGHTS: [f32; 3] = [1.0, 2.0, 3.0];
+    /// The ellipse's half-axes across and along the car: `[0x5B369C]` 4.5 on x and `[0x5B2460]`
+    /// 6.0 on z (0x462A17 / 0x462A35).
+    pub const RADII: (f32, f32) = (4.5, 6.0);
+
+    /// SetSlotView's reset of `+0xC6` (0x4658B2); `+0xC4` is kept.
+    pub fn reset(&mut self) {
+        self.count = 0;
+    }
+
+    /// One update of 0x462980 (0x4629E9…0x462AD8): the eye's offset from `car+0x330` in the car's
+    /// body frame, before the matrix `car+0x364` turns it (0x532A40) and the two ceiling tests
+    /// 0x461370 at the car and at the old eye bound its y (the lower wins, 0x462B15…0x462B35).
+    ///
+    /// `+0xC6` goes up one; the angle is `count · [0x5B25B8]` 1/1024 of a turn, whose sine and
+    /// cosine 0x532800 returns (its second and third arguments), and the offset is
+    /// `(cos · 4.5, y, sin · 6.0)`. `+0xC4` steps when `(count − 0x100) & 0x1FF == 0`; `y` is
+    /// `HEIGHTS[step mod 3]`, and while `(count − 0x80) & 0x1FF < 0x80` it blends toward
+    /// `HEIGHTS[(step + 1) mod 3]` by `(count & 0x7F) · [0x5B273C]` 1/128 (0x462A4E…0x462ABC). So one
+    /// lap is 1024 updates, the height changes twice a lap, and each change is a 128-update ramp
+    /// that ends where `+0xC4` steps.
+    pub fn step(&mut self) -> Vec3 {
+        self.count = self.count.wrapping_add(1);
+        let c = self.count as i32;
+        let (s, co) = (c as f32 * (1.0 / 1024.0) * std::f32::consts::TAU).sin_cos();
+        if (c - 0x100) & 0x1FF == 0 {
+            self.step = self.step.wrapping_add(1);
+        }
+        // `idiv 3` is a signed remainder; `+0xC4` would need 2^15 steps (2^24 updates) to go
+        // negative, so the euclidean one is the same here
+        let h = |k: i32| Self::HEIGHTS[k.rem_euclid(3) as usize];
+        let k = self.step as i32;
+        let y = if (c - 0x80) & 0x1FF < 0x80 {
+            h(k) + (h(k + 1) - h(k)) * (c & 0x7F) as f32 * (1.0 / 128.0)
+        } else {
+            h(k)
+        };
+        Vec3::new(co * Self::RADII.0, y, s * Self::RADII.1)
+    }
 }
 
 pub const VIEW_OFFSETS: [Vec3; 20] = [
@@ -239,6 +333,62 @@ mod tests {
         assert_eq!(audio_mode(1, true, true), 0);
         assert_eq!(audio_mode(3, true, false), 2);
         assert_eq!(audio_mode(12, false, false), 3);
+    }
+
+    #[test]
+    fn circle_cam_laps_the_car_on_its_ellipse() {
+        let mut c = CircleCam::default();
+        // the first update is one 1024th of a turn: nearly straight out along +x at 4.5
+        let o = c.step();
+        assert!((o.x - 4.5).abs() < 1e-3 && o.z > 0.0 && o.z < 0.05, "{o}");
+        assert_eq!(o.y, 1.0);
+        // count 0x100 is a quarter lap: along +z at the ellipse's 6.0
+        let o = CircleCam { count: 0xFF, step: 0 }.step();
+        assert!(o.x.abs() < 1e-3 && (o.z - 6.0).abs() < 1e-3, "{o}");
+        // half a lap: behind on −x
+        let o = CircleCam { count: 0x1FF, step: 0 }.step();
+        assert!((o.x + 4.5).abs() < 1e-3 && o.z.abs() < 1e-3, "{o}");
+    }
+
+    #[test]
+    fn circle_cam_height_ramps_then_steps() {
+        let mut c = CircleCam::default();
+        let ys: Vec<f32> = (0..0x300).map(|_| c.step().y).collect();
+        // counts 1…0x7F: flat at 1.0; 0x80…0xFF: the ramp toward 2.0 by (count & 0x7F)/128
+        assert_eq!(ys[0x7E], 1.0);
+        assert_eq!(ys[0x7F], 1.0, "count 0x80 starts the ramp at 0");
+        assert!((ys[0xBF] - 1.5).abs() < 1e-6, "count 0xC0 is half way");
+        assert!((ys[0xFE] - (1.0 + 127.0 / 128.0)).abs() < 1e-6);
+        // count 0x100: `+0xC4` steps, the height is 2.0 and stays until the next ramp at 0x280
+        assert_eq!(ys[0xFF], 2.0);
+        assert_eq!(ys[0x27E], 2.0);
+        assert!((ys[0x2BF] - 2.5).abs() < 1e-6);
+        assert_eq!(c.step, 2, "stepped at counts 0x100 and 0x300");
+        // the third height ramps back to the first
+        let mut d = CircleCam { count: 0x4BF, step: 2 };
+        assert!((d.step().y - 2.0).abs() < 1e-6, "3.0 halfway back to 1.0");
+        // SetSlotView restarts the angle but keeps the height step
+        c.reset();
+        assert_eq!((c.count, c.step), (0, 2));
+    }
+
+    #[test]
+    fn the_mirror_keeps_its_own_45_degrees() {
+        // 90° across the 240 × 84 tray is 2·atan(84/240) = 38.6° high
+        let v = fov_y_viewport(VIEW_HALF_ANGLE, 240.0, 84.0).to_degrees();
+        assert!((v - 38.58).abs() < 0.01, "{v}");
+        // the full-screen main view agrees with `fov_y`
+        assert!((fov_y_viewport(DEFAULT_HALF_ANGLE, 640.0, 480.0) - fov_y(DEFAULT_HALF_ANGLE)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn near_planes() {
+        assert_eq!(near_plane(DEFAULT_NEAR, 2), 0.5);
+        assert!((near_plane(DEFAULT_NEAR, 1) - 0.15).abs() < 1e-6, "the driver view");
+        assert_eq!(zoom_near(37.5), 0.5);
+        assert_eq!(zoom_near(40.0), 0.5);
+        assert!((zoom_near(3.75) - 9.0).abs() < 1e-5);
+        assert_eq!(zoom_near(35.0), 0.2, "(37.5 − 35) / 35 is under the 0.2 floor");
     }
 
     #[test]

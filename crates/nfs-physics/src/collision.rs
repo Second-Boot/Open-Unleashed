@@ -20,6 +20,163 @@ impl Triangle {
     pub fn new(a: Vec3, b: Vec3, c: Vec3, surface: u32) -> Self {
         Self { a, b, c, surface, colors: [[255; 4]; 3] }
     }
+
+    /// The patch's `contains(pt)` (vtable +0xC): the point's plan inside the triangle's, edges
+    /// included — the test [`TriangleGrid::patches_at`] makes.
+    pub fn contains_xz(&self, p: Vec3) -> bool {
+        let side = |a: Vec3, b: Vec3| (b.x - a.x) * (p.z - a.z) - (b.z - a.z) * (p.x - a.x);
+        let (d0, d1, d2) = (side(self.a, self.b), side(self.b, self.c), side(self.c, self.a));
+        (d0 >= 0.0 && d1 >= 0.0 && d2 >= 0.0) || (d0 <= 0.0 && d1 <= 0.0 && d2 <= 0.0)
+    }
+}
+
+/// A body's own ground tracker `car+8` (`suspension-collision.md` §1.1) with the plane
+/// `car+0x3E8` / `car+0x400` that 0x499520 keeps from it — read 2026-09-25, CONFIRMED unless a
+/// line says otherwise.
+///
+/// * [`Self::update_zone`] is `Tracker::updateZone(pos, keep = 1)` 0x474060: a cached patch that
+///   still contains the point is kept and `changed` (`+9`) cleared; otherwise `findPatch`
+///   0x473240 — the drivable patch (`word & 0xF`) under the point whose height is nearest `p.y`
+///   ([`TriangleGrid::patches_at`]) — with `changed = (patch != old)`, the zone word `+0x24`
+///   the patch's or 0. The normal `+0xC` (0x474420 → 0x474320) is the patch's; with no patch it
+///   keeps the last one's.
+/// * [`Self::refresh_plane`] is 0x499520: the plane point `car+0x400` becomes the **patch centre**
+///   `¼·Σ point(i), i = 0…3` (0x49953C…0x4995F2) — for a triangle `point(3)` is `point(0)`
+///   (0x486030's `i mod 3`), so `(2a + b + c)/4`; a zero result (no patch: `Tracker::point`
+///   0x4745F0 answers the zero vector) restores the old one and returns (0x4995F8…0x499642);
+///   else, when the zone changed, the plane normal `car+0x3E8` becomes the tracker's
+///   (0x499643…0x49966D). The tangent `+0x3F4`, `+0x3DC` and the slice vectors `+0x3B8…` it also
+///   writes have no reader in this port.
+///
+/// The car runs both from **0x49AF70** (`+0xE0C`, 32 Hz, priority 6 — before `Car_simulate` and
+/// `Car_ground` at 0x1E; gated on `+0x7F`, `!+0x7D`, `+0x7C`), `Susp_AI` 0x4998C0 runs
+/// `updateZone` again without the refresh, and a smackable's setup 0x4A1510 runs 0x4994F0
+/// (`update` + `updateZone`) and then 0x499520.
+///
+/// MEDIUM: the port's patches are the primitives' triangles, so a quad of the original is two
+/// patches here and its centre the chosen half's `(2a + b + c)/4`; the `+0xC` normal is the
+/// triangle's, turned to face up.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PatchTracker {
+    /// the cached patch `+0x28` (its corners and flags word)
+    patch: Option<(Vec3, Vec3, Vec3, u32)>,
+    /// `+9`, the zone changed on the last update
+    pub changed: bool,
+    /// `+0x24` (→ `car+0x2C`), the zone word: the patch's flags word, 0 with no patch
+    pub word: u32,
+    /// `+0xC`, the patch normal (`Tracker::normal`)
+    pub normal: Vec3,
+    /// `car+0x3E8`, the plane normal 0x499520 keeps
+    pub plane_normal: Vec3,
+    /// `car+0x400`, the plane point (the patch centre) 0x499520 keeps; `.y` is `car+0x404`
+    pub plane_point: Vec3,
+}
+
+impl Default for PatchTracker {
+    /// A tracker with no patch — a wheel's `wheel+4` before its first `updateZone`.
+    fn default() -> Self {
+        Self::new(Vec3::ZERO)
+    }
+}
+
+impl PatchTracker {
+    /// A tracker with no patch yet, its plane `(0, 1, 0)` through `point` (the port's start value;
+    /// the original's is whatever the car record held).
+    pub fn new(point: Vec3) -> Self {
+        Self { patch: None, changed: false, word: 0, normal: Vec3::Y, plane_normal: Vec3::Y, plane_point: point }
+    }
+
+    /// `Tracker::setSlice(s)` 0x473210's patch half: the cached patch index `+4 = −1`, the zone
+    /// word `+0x24` and the changed flags `+8…+0xA` cleared — so the next `updateZone` finds a
+    /// patch afresh and reports a change. The normal `+0xC` and the car's plane are left alone.
+    pub fn forget_patch(&mut self) {
+        self.patch = None;
+        self.changed = false;
+        self.word = 0;
+    }
+
+    /// `Tracker::updateZone(p, 1)` 0x474060.
+    pub fn update_zone(&mut self, grid: &TriangleGrid, p: Vec3) {
+        if let Some((a, b, c, w)) = self.patch
+            && Triangle::new(a, b, c, w).contains_xz(p)
+        {
+            self.changed = false;
+            return;
+        }
+        let old = self.patch;
+        let best = grid.patches_at(p).min_by(|x, y| (x.1 - p.y).abs().total_cmp(&(y.1 - p.y).abs()));
+        self.patch = best.map(|(t, _)| (t.a, t.b, t.c, t.surface));
+        self.changed = self.patch != old;
+        if let Some((a, b, c, w)) = self.patch {
+            self.word = w & 0xFFFF;
+            let mut n = (b - a).cross(c - a).normalize_or_zero();
+            if n.y < 0.0 {
+                n = -n;
+            }
+            self.normal = n;
+        } else {
+            self.word = 0;
+        }
+    }
+
+    /// The cached patch's plane height at `(x, z)` — `Tracker::point(0)` 0x4745F0 and
+    /// `Tracker::normal()` 0x474420 into `p0.y − ((x − p0.x)·n.x + (z − p0.z)·n.z)/n.y`, the form
+    /// 0x494480 and `Susp_update` (0x499C37…0x499C7B) evaluate. `None` with no patch.
+    pub fn patch_height(&self, x: f32, z: f32) -> Option<f32> {
+        let (p0, _, _, _) = self.patch?;
+        let n = self.normal;
+        Some(p0.y - ((x - p0.x) * n.x + (z - p0.z) * n.z) / n.y)
+    }
+
+    /// 0x499520, `Car_refreshGroundPlane`.
+    pub fn refresh_plane(&mut self) {
+        let centre = self.patch.map(|(a, b, c, _)| (a * 2.0 + b + c) * 0.25).unwrap_or(Vec3::ZERO);
+        if centre == Vec3::ZERO {
+            return;
+        }
+        self.plane_point = centre;
+        if self.changed {
+            self.plane_normal = self.normal;
+        }
+    }
+
+    /// `Car_placeAtSlice` 0x49B090's tracker part (0x49B14E…0x49B1F9, 0x49B2D2…0x49B30D):
+    /// `updateZone(p, 1)`, then the plane point `car+0x400` = the mean of the patch's
+    /// `point(0…3)` (a triangle's `point(3)` is `point(0)`) and the plane normal `car+0x3E8` = the
+    /// patch normal — both unconditionally, unlike 0x499520. With no patch the port keeps the old
+    /// plane (the original averages whatever `point(i)` returns then — not traced).
+    pub fn seat(&mut self, grid: &TriangleGrid, p: Vec3) {
+        self.update_zone(grid, p);
+        if let Some((a, b, c, _)) = self.patch {
+            self.plane_point = (a * 2.0 + b + c) * 0.25;
+            self.plane_normal = self.normal;
+        }
+    }
+
+    /// 0x49AF70's part of it: `updateZone(pos, 1)` and, when the zone changed, 0x499520.
+    pub fn track(&mut self, grid: &TriangleGrid, pos: Vec3) {
+        self.update_zone(grid, pos);
+        if self.changed {
+            self.refresh_plane();
+        }
+    }
+
+    /// `p.y − ((x − q.x)·n.x + (z − q.z)·n.z)/n.y` on the kept plane, `Susp_update`'s fallback
+    /// for a wheel with no usable patch (0x499BC4…0x499C2E, no roughness added): `car+0x3E8` when
+    /// `car+0x3EC > 0.1`, else `(0, 1, 0)`, through `car+0x400`.
+    pub fn plane_height(&self, x: f32, z: f32) -> f32 {
+        let q = self.plane_point;
+        let n = self.fallback_normal();
+        q.y - ((x - q.x) * n.x + (z - q.z) * n.z) / n.y
+    }
+
+    /// The normal of that fallback plane — `car+0x3E8` when `car+0x3EC > 0.1` (`[0x5B2604]`,
+    /// 0x499BCA `test ah,0x41; jne`), else `(0, 1, 0)` (0x499BF3…0x499C01) — which the branch
+    /// also leaves as the wheel's normal `wheel+0x4C` (0x499D0C…0x499D12: `n.x` is still on the
+    /// FPU stack, `n.y`/`n.z` in `[esp+0x20]`/`[esp+0x24]`).
+    pub fn fallback_normal(&self) -> Vec3 {
+        if self.plane_normal.y > 0.1 { self.plane_normal } else { Vec3::Y }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -331,5 +488,26 @@ mod tests {
         assert_eq!(g.find_patch(Vec3::new(1.0, 30.0, 1.0)), 0x13, "no height window");
         assert_eq!(g.find_patch(Vec3::new(1.0, -100.0, 1.0)), 7);
         assert_eq!(g.find_patch(Vec3::new(30.0, 0.0, 30.0)), 0, "off the patches");
+    }
+
+    /// 0x474060 + 0x499520: the plane point is the patch centre `(2a + b + c)/4`, kept while the
+    /// cached patch still holds the point and kept again when the point leaves every patch.
+    #[test]
+    fn the_tracker_keeps_the_patch_centre() {
+        let g = TriangleGrid::build(quad(1.5), 5.0);
+        let mut t = PatchTracker::new(Vec3::ZERO);
+        t.track(&g, Vec3::new(5.0, 2.0, -3.0));
+        // the first triangle (a, b, c) = (−10,−10), (10,−10), (10,10): centre (−10+10+10−10)/4 …
+        assert!(t.changed && t.word == 7);
+        assert_eq!(t.plane_point, Vec3::new(0.0, 1.5, -5.0));
+        assert_eq!(t.plane_normal, Vec3::Y);
+        // still inside the same triangle: nothing changes
+        t.track(&g, Vec3::new(6.0, 2.0, -4.0));
+        assert!(!t.changed);
+        // off every patch: no word, the old plane stays
+        t.track(&g, Vec3::new(50.0, 2.0, 50.0));
+        assert!(t.changed && t.word == 0);
+        assert_eq!(t.plane_point, Vec3::new(0.0, 1.5, -5.0));
+        assert!((t.plane_height(30.0, 30.0) - 1.5).abs() < 1e-6);
     }
 }

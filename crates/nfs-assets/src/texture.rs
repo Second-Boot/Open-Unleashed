@@ -13,6 +13,9 @@ pub struct TextureImage {
     pub mips: Vec<Vec<u8>>,
     /// True when any decoded texel has alpha < 255.
     pub has_alpha: bool,
+    /// The entry's pixel-format code (`0x7D` ARGB8888, `0x7E` 1555, `0x78` 565, `0x7F` 888, …) —
+    /// what 0x556690 classifies, e.g. for the sky's "has no alpha" test 0x460D40.
+    pub code: u8,
     /// Where the entry says it belongs: `misc[0]` (the page a car's day/night pack blits onto) and
     /// the blit position `misc[2] & 0xFFF` / `misc[3] & 0xFFF` (`car-model.md` §2.2).
     pub page: usize,
@@ -65,6 +68,7 @@ pub fn decode_pack(path: &Path, data: &[u8]) -> Result<Vec<TextureImage>, AssetE
             height,
             mips,
             has_alpha,
+            code: b.code,
             page: b.misc[0] as usize,
             x: (b.misc[2] & 0xFFF) as u32,
             y: (b.misc[3] & 0xFFF) as u32,

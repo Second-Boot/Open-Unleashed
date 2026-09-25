@@ -20,12 +20,14 @@ fn career_round_trips_through_the_original_format() {
     c.money = 123_456;
     c.year = 1969;
     c.era = nfs_formats::career::Era::Golden;
-    let mut owned = OwnedCar::new(car_id, 1, 30_000);
+    let mut owned = OwnedCar::construct(&t, car_id, 1, 30_000);
+    assert!(!owned.stock.is_empty(), "the constructor fits the record's stock parts (0x4EE9A0)");
     owned.mileage = 9000;
     owned.wins = 2;
     owned.asking_price = Some(41_000);
     owned.offer = Some(38_500);
-    owned.parts = t.parts.iter().take(2).map(|p| p.id).collect();
+    // one stock part carries damage, so both lists' `+0x164` must survive
+    owned.part_state[0].1 = 12.5;
     c.garage.push(owned.clone());
     let tour = t.tournaments[0].id;
     c.tournaments.insert(
@@ -34,7 +36,7 @@ fn career_round_trips_through_the_original_format() {
             entered: true,
             completed: true,
             completions: 2,
-            events: vec![EventResult { position: 1, prize: 5000, bonus: 2500, points: [8, 7, 6, 5, 4, 3, 2, 1], earned: [7500, 3000, 2000, 1500, 1000, 800, 600, 400], times: [10_000, 10_500, 11_000, 0, 0, 0, 0, 0] }],
+            events: vec![EventResult { position: 1, prize: 5000, bonus: 2500, points: [8, 7, 6, 5, 4, 3, 2, 1], earned: [7500, 3000, 2000, 1500, 1000, 800, 600, 400], times: [10_000, 10_500, 11_000, 0, 0, 0, 0, 0], event: Some(1) }],
             final_rank: Some(1),
             prize: 20_000,
             failed_attempts: 0,
@@ -48,7 +50,8 @@ fn career_round_trips_through_the_original_format() {
     // The container the original writes: no header, module names NUL-terminated, in its own order.
     assert!(bytes.starts_with(b"Missions\0"));
     let parsed = SaveFile::parse(&bytes).expect("the writer produces a file the reader accepts");
-    assert_eq!(parsed.order, ["Missions", "Tournament", "PlayerInfo", "TrackRecords", "Personalities", "Knockout", "CDPlayer", "accessor"]);
+    // `PartsMarket` is the player's parts inventory (§4.2), written even when it is empty
+    assert_eq!(parsed.order, ["Missions", "PartsMarket", "Tournament", "PlayerInfo", "TrackRecords", "Personalities", "Knockout", "CDPlayer", "accessor"]);
     // the knockout module is the raw 0x84-byte state block, switched off when no series is running
     let k = nfs_formats::sav::KnockoutState::parse(parsed.knockout.as_ref().unwrap());
     assert!(!k.active && k.opponents == 0);
@@ -81,7 +84,10 @@ fn career_round_trips_through_the_original_format() {
     assert_eq!(saved.field_u32(car::MILEAGE), 9000);
     assert_eq!(saved.field_u8(car::OWNED), 1, "a garage car is marked as the player's");
     assert_eq!(saved.field_u32(car::PURCHASE_PRICE), 30_000);
-    assert_eq!(saved.installed.len(), 2);
+    // `car+0x75C`, the stock list, is written first, then `car+0x758` (0x4EE8D0)
+    assert_eq!(saved.removed.iter().map(|p| p.id as i16).collect::<Vec<_>>(), owned.stock.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+    assert_eq!(saved.installed.iter().map(|p| p.id as i16).collect::<Vec<_>>(), owned.parts);
+    assert_eq!(saved.installed[0].state, 12.5);
 
     let back = career_from_sav(&parsed, &t);
     assert_eq!(back.money, c.money);
@@ -92,11 +98,26 @@ fn career_round_trips_through_the_original_format() {
     assert_eq!(back.garage[0].paint_set, owned.paint_set, "the paint set is recovered from the stored colours");
     assert_eq!(back.garage[0].trim, owned.trim, "a bought car's rows are all 0 and come back so");
     assert_eq!(back.garage[0].parts, owned.parts);
+    assert_eq!(back.garage[0].stock, owned.stock);
+    assert_eq!(back.garage[0].part_state, owned.part_state);
     assert_eq!(back.garage[0].mileage, owned.mileage);
     assert_eq!(back.garage[0].wins, owned.wins);
     assert_eq!(back.garage[0].asking_price, owned.asking_price);
     assert_eq!(back.garage[0].offer, owned.offer);
     assert_eq!(back.missions, c.missions);
+    // a `.sav` the port wrote before the stock list: no `+0x75C` parts and only what was bought
+    // installed — the stock list comes back from the record and fills the empty slots
+    let mut old = parsed.clone();
+    let oc = &mut old.player.as_mut().unwrap().cars[0];
+    oc.removed.clear();
+    oc.installed.truncate(1);
+    let back_old = career_from_sav(&old, &t);
+    assert_eq!(back_old.garage[0].stock.iter().map(|(id, _)| *id).collect::<Vec<_>>(), owned.stock.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+    let mut ids = back_old.garage[0].parts.clone();
+    ids.sort_unstable();
+    let mut want = owned.parts.clone();
+    want.sort_unstable();
+    assert_eq!(ids, want);
     let st = back.tournaments.get(&tour).expect("the tournament state survives in the nfs5.trn image");
     assert!(st.completed);
     assert_eq!(st.events.len(), 1);
@@ -105,6 +126,8 @@ fn career_round_trips_through_the_original_format() {
     assert_eq!(st.events[0].earned, c.tournaments[&tour].events[0].earned);
     assert_eq!(st.events[0].prize, 5000);
     assert_eq!(st.events[0].bonus, 2500);
+    // the second event record, raced first (0x504F00): it comes back in its own slot
+    assert_eq!(st.events[0].event, Some(1));
 }
 
 /// The embedded tables must stay byte-identical to the shipped ones apart from the runtime fields.
@@ -181,6 +204,8 @@ fn the_used_car_market_fills_and_caps() {
     };
     let mut c = Career::default();
     c.year = 1975;
+    // `[0x6115F8]`, the shipped `packages.ini`'s `[header] count`
+    assert_eq!(t.package_count, 8);
     // the original's 16-bit LCG stands in for `0x538040`; any uniform source exercises the rules
     let mut seed = 12345u32;
     let mut rand = || {
@@ -198,14 +223,23 @@ fn the_used_car_market_fills_and_caps() {
         // mileage and wins come from their bands, and the price is the car's own value
         assert!(car.mileage <= 100_000);
         assert!(car.wins <= 50);
+        // the appearance 0x4F82C0 draws: one paint set for the body and both stripes, an interior
+        // of its own, a package below `packages.ini`'s count and a race number −1…98
+        assert!((car.paint_set as usize) < rec.paint_sets.len());
+        assert_eq!((car.trim.stripe1, car.trim.stripe2), (car.paint_set, car.paint_set));
+        assert!((car.trim.interior as usize) < rec.interior_colours.len());
+        assert!((car.trim.package as u32) < t.package_count);
+        assert!((-1..=98).contains(&car.trim.decal));
         assert_eq!(car.asking_price, Some(c.value_of(&t, car).unwrap().max(0) as u32));
         // a market car is mechanically fresh — the generator never damages it
         assert_eq!(car.damage_pct, 0.0);
         assert!(car.part_state.iter().all(|(_, s)| *s == 0.0));
-        // and it never carries two engines (0x4F877E's four compares)
+        // and it never picks two engines (0x4F877E's four compares) — the back-fill
+        // (0x4F89D7…) may still put a stock `"Engine (Standard)"` beside a picked `"Engine"`
         let engines = car
             .parts
             .iter()
+            .filter(|id| !car.stock.iter().any(|(s, _)| s == *id))
             .filter_map(|id| t.parts.iter().find(|p| p.id == *id))
             .filter(|p| p.kind_name == "Engine" || p.kind_name == "Engine (Standard)")
             .count();
@@ -311,7 +345,7 @@ fn paint_shop_trim_round_trips() {
         .expect("a car with distinguishable rows");
     let mut c = Career::default();
     let mut owned = OwnedCar::new(e.id, 0, 0);
-    owned.trim = nfs_game::career::Trim { interior: 1, stripe1: 1, stripe2: 2, package: 3 };
+    owned.trim = nfs_game::career::Trim { interior: 1, stripe1: 1, stripe2: 2, package: 3, decal: 42 };
     c.garage.push(owned.clone());
     let parsed = SaveFile::parse(&career_to_sav(&c, &t, &Profile::new("Hans", 0)).write()).unwrap();
     let img = &parsed.player.as_ref().unwrap().cars[0];
@@ -319,6 +353,6 @@ fn paint_shop_trim_round_trips() {
     assert_eq!(f(car::S1_COLOUR), e.paint_sets[1].packed[1]);
     assert_eq!(f(car::S2_COLOUR), e.paint_sets[2].packed[2]);
     assert_eq!(f(car::PACKAGE_NUM), 3);
-    assert_eq!(f(car::DECAL_NUM), u32::MAX, "decal −1, 0x502710");
+    assert_eq!(f(car::DECAL_NUM), 42, "the race number, FECar+0x688");
     assert_eq!(career_from_sav(&parsed, &t).garage[0].trim, owned.trim);
 }

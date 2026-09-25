@@ -25,7 +25,7 @@ fn alps_slices() {
     assert!((s.forward.length() - 1.0).abs() < 1e-3 && (s.up.length() - 1.0).abs() < 1e-3);
     assert!((s.up.cross(s.forward) - s.lateral).length() < 0.05, "lateral {:?} vs {:?}", s.lateral, s.up.cross(s.forward));
     // start trigger lies near its slice
-    let (pos, rot, slice) = grid_pose(&table, t.start_forward.as_ref(), 0, 1);
+    let (pos, rot, slice) = grid_pose(&table, t.start_forward.as_ref(), 0, 1, &nfs_game::race::GridRule { linear: true, derby_cars: None });
     let trig = t.start_forward.as_ref().unwrap().of_kind(&nfs_formats::scn::ElementKind::Trigger).next().unwrap().position;
     let d = (pos - Vec3::from(trig)).length();
     eprintln!("start slice {slice} at {pos:?}, trigger at {trig:?}, distance {d:.1} m, forward {:?}", rot.row(2));

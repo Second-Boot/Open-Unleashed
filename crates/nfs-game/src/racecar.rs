@@ -75,6 +75,6 @@ pub fn update_progress(cars: &mut [RaceCar], table: &SliceTable, tick: u64, num_
 }
 
 /// Grid placement for `n` cars, car `g` (0 = pole) — see `race::grid_pose`.
-pub fn grid_position(table: &SliceTable, start: Option<&nfs_formats::scn::Scene>, g: u32, n: u32) -> (Vec3, glam::Mat3, usize) {
-    crate::race::grid_pose(table, start, g, n)
+pub fn grid_position(table: &SliceTable, start: Option<&nfs_formats::scn::Scene>, g: u32, n: u32, rule: &crate::race::GridRule) -> (Vec3, glam::Mat3, usize) {
+    crate::race::grid_pose(table, start, g, n, rule)
 }

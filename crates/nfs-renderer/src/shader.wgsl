@@ -60,12 +60,16 @@ fn headlit(world: vec3<f32>, c: vec4<f32>) -> vec4<f32> {
 // same 0x452910 weight but **per vertex**, not per piece, which is the one place the footprint
 // can differ from the original's.
 //
-// Two gaps, recorded not filled: the original runs this as its own textured pass, and how that
-// pass combines is the RMth op semantics of AUDIT.md §E; and 0x453EE1 multiplies the vertex's
-// first float by `w`, which this port does not read. APPROXIMATION: the 64 × 64 `HEAD` art is a
-// flat 132/255 grey with two bright pools reaching 206, so it is laid over the lit colour as a
-// **modulate 2×** — the grey is then neutral and the pools brighten by up to 1.6 — and the
-// coordinates are clamped, which is what keeps the pools from tiling over the world.
+// The pass's combine is read (`RE/notes/thrash.md` §6c): its `Rs` block, the `Opaque` method's
+// data block under the second pass's key 0x52730003, is `{0, 2, −1, 1, 0}` — blending on, and state 0x38 = −1, which 0x540550 turns
+// into Thrash 0x194 ← 7 and 0x195 ← 6, `D3DBLEND_DESTCOLOR` / `D3DBLEND_SRCCOLOR` in `dx7z.dll`
+// (0x60005538 / 0x6000562B): the frame becomes `2 · src · dst`. The source is `HEAD` × the vertex
+// colour, which in that pass is `LayerFullAmbient`'s white block (0x448C30, layer id 5 — the
+// colour stream the draw copies, 0x540E1D). So the decal **multiplies the pass-1 pixel by
+// 2 × `HEAD`**, 132/255 being the neutral grey and the pools brightening by up to 1.6. Gap,
+// recorded not filled: 0x453EE1 multiplies the vertex's first float by `w`, not read.
+// APPROXIMATION: the coordinates are clamped, which keeps the pools from tiling over the world
+// (`HEAD`'s own address mode is not read).
 fn uvlight(world: vec3<f32>) -> vec3<f32> {
     let p = globals.headlight * vec4<f32>(world, 1.0);
     let w = p.z + 16.0;
@@ -79,7 +83,7 @@ fn uvlight(world: vec3<f32>) -> vec3<f32> {
     }
     let c = textureSampleLevel(t_head, s_proj, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).rgb;
     // textures are bytes (no sRGB decode), so the sample is the stored value the original
-    // multiplies — 132/255 is the neutral point of the 2×
+    // multiplies — 132/255 is the neutral point of the 2× (`DESTCOLOR` / `SRCCOLOR`)
     return 2.0 * c;
 }
 
@@ -152,6 +156,17 @@ fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
     let world = object.model * vec4<f32>(in.position, 1.0);
     out.clip = globals.view_proj * world;
+    // Thrash state 0x18, the depth bias (`lit_dir.w`, a pull in view depth): `dx7z.dll` adds it to
+    // the screen z alone, so the vertex slides toward the eye along its own ray and stays where it
+    // is on screen (`RE/notes/thrash.md` §6d.3); a vertex nearer than the pull is left alone
+    let pull = object.lit_dir.w;
+    if pull > 0.0 {
+        let depth = -(globals.view * world).z;
+        if depth > pull {
+            let eye = globals.cam_pos.xyz;
+            out.clip = globals.view_proj * vec4<f32>(eye + (world.xyz - eye) * (1.0 - pull / depth), 1.0);
+        }
+    }
     out.normal = normalize((object.model * vec4<f32>(in.normal, 0.0)).xyz);
     // env_mix.zw carries a per-object uv offset (the sky layers scroll with it)
     out.uv = in.uv + object.env_mix.zw;
@@ -176,14 +191,17 @@ fn vs_main(in: VsIn) -> VsOut {
 // has no alpha channel, and a car page keeps its texels' alpha (a wheel face's clear corners), which
 // must not punch holes in a screenshot or in an off-screen view the front end lays over its screen.
 //
-// Both run, for a material with the device's states (`shadow_on.w`, the car's), the alpha test
-// `dx7z.dll` turns on with the device and never turns off — `ALPHATESTENABLE` 1, `ALPHAFUNC`
-// `GREATER`, `ALPHAREF` 0 (0x6000A4FF…0x6000A51C): a fragment whose alpha is 0 is dropped, colour
-// and depth alike.
+// Both run, for a material with the race's states (`shadow_on.w`, the car's and the track's), the
+// alpha test — `ALPHAFUNC` `GREATER` from the device (0x6000A50E, `[0x600180E8]` = 5) and the
+// reference **10** the race sets through Thrash 0x24 (`dx7z.dll` 0x60003F9C; 0x443615, 0x452085,
+// `RE/notes/thrash.md` §6d.4): a fragment whose alpha is 10/255 or less is dropped, colour and depth
+// alike.
+const ALPHA_REF: f32 = 10.5 / 255.0;
+
 @fragment
 fn fs_opaque(in: VsOut) -> @location(0) vec4<f32> {
     let c = shade(in);
-    if object.shadow_on.w > 0.5 && c.a < 0.5 / 255.0 {
+    if object.shadow_on.w > 0.5 && c.a < ALPHA_REF {
         discard;
     }
     return vec4<f32>(c.rgb, 1.0);
@@ -192,7 +210,7 @@ fn fs_opaque(in: VsOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let c = shade(in);
-    if object.shadow_on.w > 0.5 && c.a < 0.5 / 255.0 {
+    if object.shadow_on.w > 0.5 && c.a < ALPHA_REF {
         discard;
     }
     return c;
@@ -236,7 +254,7 @@ fn shade(in: VsOut) -> vec4<f32> {
     // APPROXIMATION: the pass's combine is not read — the texture (`sh80`, a flat dark colour under
     // its alpha) is laid over the lit colour by its alpha
     var lit = base.rgb * light;
-    // the headlight decal, over the vertex light the same layer chain has already added
+    // the headlight decal, `Opaque`'s second pass: the first pass's pixel × 2 · `HEAD`
     if object.shadow_on.y > 0.5 && globals.headlight_on.x > 0.5 && in.head_w > 0.0 {
         lit = lit * uvlight(in.world);
     }

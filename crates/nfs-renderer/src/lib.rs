@@ -64,23 +64,43 @@ pub struct MaterialDesc {
     pub clamp: [bool; 2],
     /// The texture's mip LOD bias — Thrash state 8, `D3DTSS_MIPMAPLODBIAS` (`thrash.md` §7).
     pub lod_bias: f32,
-    /// The draw state `dx7z.dll` gives every draw, which the port gives the **car's** materials:
-    /// depth writes even when blended and the alpha test. The device is made with `ZWRITEENABLE`
-    /// 1, `ZFUNC` `LESSEQUAL`, `ALPHATESTENABLE` 1, `ALPHAFUNC` `GREATER` and `ALPHAREF` 0
-    /// (0x6000A4FF…0x6000A549), and no Thrash state the game sets touches any of them
-    /// (`thrash.md` §6). APPROXIMATION for everything else: which surface format a track or front
-    /// end texture lands in — with or without alpha, so whether the test can drop anything — is
-    /// not read, and the port's other blended draws (particles, glare) keep depth writes off until
-    /// their draw order is the original's; the car pages' formats are the `.tpg`'s (`bpp`).
+    /// The race's draw state, which the port gives the **car's** (and the front-end rooms', which
+    /// are car models, `RE/notes/frontend-3d.md` §9) and the **track's** materials:
+    /// depth writes even when blended and the alpha test `GREATER 10`. The device is made with
+    /// `ZWRITEENABLE` 1, `ZFUNC` `LESSEQUAL`, `ALPHATESTENABLE` 1, `ALPHAFUNC` `GREATER`
+    /// (0x6000A4FF…0x6000A549); the game keeps depth writes on through the view's settings (Thrash
+    /// 0x39 ← 1, 0x468B39) and sets the alpha reference to 10 through Thrash 0x24 (0x443615, the
+    /// car draw, and 0x43C876 at the start of `R3DCarLOD::draw`, which draws the rooms too;
+    /// 0x452085, 0x45D68D, 0x466703, `thrash.md` §6d.4). APPROXIMATION for everything else: the
+    /// port's other blended draws (particles, 0x454456 sets 1; glare) keep depth writes off until
+    /// their draw order is the original's. *(The front-end rooms were among them until 2026-09-25,
+    /// on the reading that their views set 0x24 to 1 — 0x4C6696 / 0x4DA923 are 2D draws.)* The
+    /// alpha a texture keeps is the decoded file's — the loader's pick of the surface format is
+    /// not read.
     pub device_states: bool,
+    /// The cull follows the view's: the `Rs` cull 1 hands Thrash state 2 the view's own mode
+    /// (0x540590 → `[[[0x69ED0C]]+4]+0x10`), which the race pass sets to `CW` (2), or to `CCW` (1)
+    /// under `MIRROR` (0x468C2C…0x468C55) — so in the mirrored world the other winding is culled,
+    /// the same back faces. Without it a mirrored draw culls nothing (the port's rule for the
+    /// car, whose own flips 0x443385 / 0x44347F are not carried).
+    pub view_cull: bool,
+    /// Thrash state 0x18, the depth bias the `Rs` block hands the driver (0x540500 adds the view's
+    /// own, `[[[0x69ED0C]]+4]+0x30`, which stays 0): `dx7z.dll` adds `b / 32768` to the vertex's
+    /// linear screen z `(z − near) / (far − near)`, so a vertex moves `−b · (far − near) / 32768`
+    /// of view depth toward the eye along its own ray (`RE/notes/thrash.md` §6d.3).
+    pub depth_bias: i32,
+    /// `RCustomLayers::LayerFalseSort1` / `2` (0x449AA0 / 0x449AF0, the `FakeSort` method's ops
+    /// 0x800F / 0x8010): at `SPECIALFX` 3 the material is drawn twice, first with depth writes off
+    /// (Thrash 0x39 ← 0), then on (← 1) — blended both times (`RE/notes/thrash.md` §6d.4).
+    pub false_sort: bool,
 }
 
 impl MaterialDesc {
     pub fn textured(texture: TextureId) -> Self {
-        Self { texture: Some(texture), alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0, device_states: false }
+        Self { texture: Some(texture), alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false }
     }
     pub fn flat() -> Self {
-        Self { texture: None, alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0, device_states: false }
+        Self { texture: None, alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false }
     }
 }
 

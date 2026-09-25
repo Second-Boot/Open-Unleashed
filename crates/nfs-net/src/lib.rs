@@ -12,6 +12,7 @@ pub mod comm;
 pub mod data;
 pub mod frame;
 pub mod msg;
+pub mod room;
 pub mod session;
 pub mod socket;
 pub mod state;

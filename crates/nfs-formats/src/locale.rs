@@ -16,6 +16,11 @@ pub struct Strings {
     /// front end and "Observe previous car" for the HUD); `by_id` keeps whichever row came last,
     /// and [`Strings::get`] asks this map first.
     pub fe_by_id: HashMap<u32, String>,
+    /// The rows whose `Conditionals` names `hud` — the race HUD's own table (`hudstrings.h`), the
+    /// first per id. Four ids are in both tables: 18161…18164 are `IDS_TESTDRIVER` … /
+    /// `IDS_ERACONGRATS` for the front end and `IDS_WINNINGS`, `RALLY TIME`, the two observe
+    /// hints for the HUD. [`Strings::hud`] asks this map first.
+    pub hud_by_id: HashMap<u32, String>,
 }
 
 /// Windows-1252 → Unicode. The shipped text uses the 0x80..0x9F block (typographic quotes and
@@ -35,16 +40,21 @@ impl Strings {
         let text: String = data.iter().map(|&b| cp1252(b)).collect();
         let mut by_id = HashMap::new();
         let mut fe_by_id = HashMap::new();
+        let mut hud_by_id = HashMap::new();
         for row in csv_rows(&text) {
             let Some(id) = row.first().and_then(|f| f.trim().parse::<u32>().ok()) else { continue };
             if let Some(s) = row.get(1 + lang) {
                 by_id.insert(id, s.clone());
-                if row.get(9).is_some_and(|c| c.split('|').any(|t| t.trim().eq_ignore_ascii_case("fe"))) {
+                let tagged = |tag: &str| row.get(9).is_some_and(|c| c.split('|').any(|t| t.trim().eq_ignore_ascii_case(tag)));
+                if tagged("fe") {
                     fe_by_id.entry(id).or_insert_with(|| s.clone());
+                }
+                if tagged("hud") {
+                    hud_by_id.entry(id).or_insert_with(|| s.clone());
                 }
             }
         }
-        Strings { by_id, fe_by_id }
+        Strings { by_id, fe_by_id, hud_by_id }
     }
 
 
@@ -52,6 +62,13 @@ impl Strings {
     /// loaded tables with the front end's first), else the only row there is.
     pub fn get(&self, id: u32) -> Option<&str> {
         self.fe_by_id.get(&id).or_else(|| self.by_id.get(&id)).map(|s| s.as_str())
+    }
+
+    /// The string for `id` as the race HUD reads it: the HUD table's row when the file has one,
+    /// else the front end's (`get`). The HUD loads its own string table; the four ids both tables
+    /// use read the HUD's way here (`IDS_WINNINGS` 18161 is "WINNINGS", not "Test Driver").
+    pub fn hud(&self, id: u32) -> Option<&str> {
+        self.hud_by_id.get(&id).map(|s| s.as_str()).or_else(|| self.get(id))
     }
 
     /// The text for `id`, or `#id` when the table lacks it.

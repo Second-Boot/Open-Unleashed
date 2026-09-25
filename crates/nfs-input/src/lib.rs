@@ -237,6 +237,17 @@ impl InputState {
             }
         }
     }
+    /// **0x51D1D0** for pad `pad` of [`pads`](Self::pads), committed over the bindings
+    /// ([`bindings::Bindings::set_defaults`]). No pad, or one that is not there, is the device
+    /// 0x51F230 answers for a row it does not find — **0**, which is not analogue, so every row
+    /// gets its key. The language is **0**, English: the one this port reads everything in.
+    /// `id_of` names the option id behind a `Controller.*` row.
+    pub fn default_controls(&mut self, pad: Option<usize>, id_of: impl Fn(&str) -> Option<u16>) {
+        let (device, caps) = pad
+            .and_then(|p| self.pads.get(p).map(|r| (p as u32, r.caps())))
+            .unwrap_or((0, bindings::DeviceCaps::default()));
+        self.bindings.set_defaults(&bindings::default_bindings(device, caps, 0), id_of);
+    }
     /// How many keys are down — 0x51C610 takes a key for a binding row only when exactly one is.
     pub fn keys_down_count(&self) -> usize {
         self.keys_down.len()
@@ -267,7 +278,7 @@ impl InputState {
     }
     /// Whether an action is bound to a pad control (kinds 1, 2, 5), which the packer then reads
     /// through its reader rather than through a held key.
-    fn pad_bound(&self, a: Action) -> bool {
+    pub fn pad_bound(&self, a: Action) -> bool {
         binding_id(a).and_then(|i| self.bindings.get(i)).is_some_and(|b| matches!(b.kind, 1 | 2 | 5))
     }
     /// `.RAMPS` / `.RAMPG` / `.RAMPB` — 0x51CC00 writes `kind != 1` for the `C1_RIGHT`, `C1_GAS`

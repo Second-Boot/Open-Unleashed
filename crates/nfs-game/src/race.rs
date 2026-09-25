@@ -582,6 +582,18 @@ impl RaceProgress {
         }
         self.prev_progress = new;
         self.progress = self.laps as f32 + frac - self.unlaps as f32;
+        if self.finished {
+            // The finish, 0x416721…0x416838 (`Race_updateProgress` 0x416310, the tick the lap
+            // counter reaches the race's laps): `car+0xB50 = 2`, `car+0xB10 = (laps timed + 1) ·
+            // nSlicesLap`, and `car+0xAF8` is **rewritten** from the car's slice — the same
+            // section-interpolated fraction 0x416290 gives — as the bare fraction on a
+            // point-to-point track (0x4167B9, no lap added: `lap + frac` drops by 1.0) and as
+            // `(float)car+0xB20 + frac` on a circuit (0x416830…0x416838, the laps just timed; no
+            // `− unlaps`, which is 0 on the crossing that counted the lap, so the value is unchanged
+            // there). From then on `car+0xB50 != 0` skips the recompute (0x416365), so this is what
+            // the ranking table 0x608B38, `0x417710`'s two sorts and every other `+0xAF8` reader see.
+            self.progress = if self.linear.is_some() { frac } else { self.lap_times.len() as f32 + frac };
+        }
         // 0x4A7660: a car that has finished (`car+0xB50 == 2`), is AI-driven, is in the
         // post-finish state or races a mission (`[0x6573E8] == 9`) clears its counter, and so does
         // one heading along the slice; one heading against it counts on — unless it is airborne
@@ -610,20 +622,94 @@ pub fn finish_slice(table: &SliceTable, start_scene: Option<&Scene>) -> Option<u
         .map(|e| table.find_slice(Vec3::from(e.position), 0))
 }
 
-/// Start pose from the grid rule (`Grid_slot` 0x410580 + `Car_placeAtSlice` 0x49B090).
-/// `grid_pos` 0 = pole, `n` racers. Returns (position, orientation rows x/up/forward, slice).
-pub fn grid_pose(table: &SliceTable, start_scene: Option<&Scene>, grid_pos: u32, n: u32) -> (Vec3, Mat3, usize) {
-    // start slice = slice nearest the type-2 trigger, else 1
-    let start_slice = start_scene
+/// What `Grid_slot` 0x410580 and `Car_raceInit` 0x410730 read besides the table and the scene.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GridRule {
+    /// `LINEAR_TRACK [0x657494]` (`trk+0x6E != 1`): a point-to-point track
+    pub linear: bool,
+    /// `FEGAME_TYPE [0x6573E8] == 3 && DERBY [0x657400]` — the network smash-up — with `NUMCARS`
+    /// `[0x658080]`, the divisor of its spacing (0x4105DB…0x41060D)
+    pub derby_cars: Option<u32>,
+}
+
+/// `Car_raceInit`'s start slice (0x410896…0x410924): the slice the tracker puts the scene's type-2
+/// trigger on (0x46D290(2, 0), `setSlice(1)` then 0x474440 at its position); with no such
+/// trigger, a point-to-point track whose lap has at least 100 slices starts at **50**, every other
+/// track at **1** (`setge / dec / and 0xCF / add 0x32`, 0x410917…0x410921 — `[0x628BC0]+4` is the
+/// lap's slice count, §1.3).
+pub fn start_slice(table: &SliceTable, start_scene: Option<&Scene>, linear: bool) -> usize {
+    start_scene
         .and_then(|s| {
             s.of_kind(&ElementKind::Trigger).find(|e| e.params.first().and_then(|p| p.first()).map(|t| *t as i32) == Some(2)).map(|e| table.find_slice(Vec3::from(e.position), 0))
         })
-        .unwrap_or(1);
-    let delta = if n > 2 { 3 * (n as i32 - grid_pos as i32) + 1 } else { 1 };
-    let slice = table.add(start_slice, delta);
+        .unwrap_or(if linear && table.lap_len >= 100 { 50 } else { 1 })
+}
+
+/// `Grid_slot` 0x410580: the slice and the slice-local offset `{lateral, 0.5, 0}` for
+/// `Car_placeAtSlice` 0x49B090. `grid_pos` is `.STARTINGPOS − 1` (`[0x658200 + idx·0x580]`,
+/// 1 = pole, `modes.md` §1 — so 0 here is the pole) and `n` the racers `[0x5E8AE8]`.
+///
+/// ```text
+/// dir = REVERSE [0x657430] ? −1 : +1                                  ; 0x410592…0x4105C2
+/// REVERSE on a circuit (!LINEAR [0x657494]): start = addSlices(0, −start, −1)      ; 0x4105A4
+/// g = STARTINGPOS                                                     ; 0x4105C2…0x4105D5
+/// slice = addSlices(start, dir·k, −1),  k = derby ? (n − g − 1)·(0xEA / NUMCARS) + 1   ; 0x4105E0
+///                                        : n > 2 ? 3·(n − g) + 1 : 1                   ; 0x41060F
+/// side = g & 1, flipped (1 − side) when car+0xEAC · [0x5E753C] == −1   ; 0x410638…0x410656
+/// slices[1].lanesA != 0 (0x40E650):  lateral = side ? +½·laneWidthB : −½·laneWidthA   ; 0x4106D5
+/// else (the alternate, one-way mode):  T = wA·nA + wB·nB, c = ½T − wA·nA, w = T / (nA + nB),
+///                                      lateral = side ? c + w : c − w                 ; 0x410661
+/// out = {lateral, 0.5, 0}                                            ; 0x41070F…0x410718
+/// ```
+///
+/// `car+0xEAC` is `REVERSE ? −1 : +1` (`Car_raceInit` 0x410789…0x41079B, before this call) and
+/// `[0x5E753C]` the constant 1 (0x40E670, run by the race load 0x414E57 → 0x4068A0 before the reset
+/// 0x414F12 → `Cars_resetAll` → `Car_raceInit`): **the side flips in every backwards race**. The
+/// port's backwards table (`SliceTable::reversed`) already negates `lateral` and swaps the A / B
+/// widths and lane counts, which is the same flip — `+½·wB` along the original lateral is
+/// `−½·wA` along the reversed one, and `c ± w` turns into `c' ∓ w` — so here the side stays
+/// `g & 1` in the table's own frame and lands where the original's does. Likewise `dir`: a
+/// positive step along the reversed table is the original's negative one, and the circuit's
+/// mirrored start `addSlices(0, −start)` is `add(0, +start)` here. `slices[1].lanesA` is read in
+/// the original's frame (`lanes_b` of a reversed table). No shipped track has `lanesA == 0` on
+/// slice 1 (every one is 1/1 or 2/2), so the alternate mode is never taken with the shipped data;
+/// the `max(1)` on its lane count only keeps the port from dividing by zero where the original
+/// would (`fidiv`, 0x4106C3).
+pub fn grid_slot(table: &SliceTable, start: usize, grid_pos: u32, n: u32, rule: &GridRule) -> (usize, Vec3) {
+    let start = if table.backwards && !rule.linear { table.add(0, start as i32) } else { start };
+    let g = grid_pos as i32 + 1;
+    let n = n as i32;
+    let k = match rule.derby_cars {
+        Some(cars) => (n - g - 1) * (0xEA / cars.max(1) as i32) + 1,
+        None if n > 2 => 3 * (n - g) + 1,
+        None => 1,
+    };
+    let slice = table.add(start, k);
+    let side = g & 1 == 1;
     let s = &table.slices[slice];
-    let lateral = if grid_pos & 1 == 1 { 0.5 * s.lane_width_b } else { -0.5 * s.lane_width_a };
-    let pos = s.centre + s.lateral * lateral + s.up * 0.5;
+    let s1 = &table.slices[1.min(table.slices.len() - 1)];
+    let lanes_a1 = if table.backwards { s1.lanes_b } else { s1.lanes_a };
+    let lateral = if lanes_a1 != 0 {
+        if side { 0.5 * s.lane_width_b } else { -0.5 * s.lane_width_a }
+    } else {
+        let a = s.lane_width_a * s.lanes_a as f32;
+        let total = a + s.lane_width_b * s.lanes_b as f32;
+        let c = 0.5 * total - a;
+        let w = total / (s.lanes_a + s.lanes_b).max(1) as f32;
+        if side { c + w } else { c - w }
+    };
+    (slice, Vec3::new(lateral, 0.5, 0.0))
+}
+
+/// Start pose from the grid rule (`Grid_slot` 0x410580 + `Car_placeAtSlice` 0x49B090's frame
+/// before the drop): the slice-local offset put in the world along the slice's own axes.
+/// `grid_pos` 0 = pole (`.STARTINGPOS − 1`), `n` racers. Returns (position, orientation rows
+/// x/up/forward, slice).
+pub fn grid_pose(table: &SliceTable, start_scene: Option<&Scene>, grid_pos: u32, n: u32, rule: &GridRule) -> (Vec3, Mat3, usize) {
+    let start = start_slice(table, start_scene, rule.linear);
+    let (slice, off) = grid_slot(table, start, grid_pos, n, rule);
+    let s = &table.slices[slice];
+    let pos = s.centre + s.lateral * off.x + s.up * off.y;
     let fwd = s.forward.normalize();
     let up = s.up.normalize();
     let right = up.cross(fwd).normalize();
@@ -653,6 +739,62 @@ mod tests {
             })
             .collect();
         SliceTable::build(slices, vec![Section { first: 0, last: n - 1, f0: 0.0, f1: 1.0 }])
+    }
+
+    /// `Grid_slot` 0x410580: `STARTINGPOS = grid_pos + 1`, 3 slices a car, the pole furthest
+    /// ahead; the side is `STARTINGPOS & 1`, the `+0x4C` half-lane for odd.
+    #[test]
+    fn grid_slot_spaces_by_startingpos_and_alternates_sides() {
+        let t = ring(100);
+        let rule = GridRule::default();
+        // four racers from slice 10: STARTINGPOS 1 (pole) → 3·3 + 1 = 10 ahead, 4 (last) → 1
+        assert_eq!(grid_slot(&t, 10, 0, 4, &rule), (20, Vec3::new(2.5, 0.5, 0.0)));
+        assert_eq!(grid_slot(&t, 10, 3, 4, &rule), (11, Vec3::new(-2.5, 0.5, 0.0)));
+        // two racers: both one slice past the line
+        assert_eq!(grid_slot(&t, 10, 1, 2, &rule).0, 11);
+        // the smash-up spacing: (n − g − 1)·(0xEA / NUMCARS) + 1
+        let derby = GridRule { linear: true, derby_cars: Some(8) };
+        assert_eq!(grid_slot(&t, 10, 0, 4, &derby).0, 10 + 2 * 29 + 1);
+    }
+
+    /// Backwards: the original flips the side (`car+0xEAC · [0x5E753C] == −1`) in its own frame
+    /// and mirrors a circuit's start (`addSlices(0, −start)`); on the port's reversed table the
+    /// same world position comes out of the unflipped rule.
+    #[test]
+    fn grid_slot_backwards_lands_where_the_originals_flip_puts_it() {
+        let mut fwd = ring(100);
+        for s in &mut fwd.slices {
+            s.lane_width_a = 4.0;
+            s.lane_width_b = 6.0;
+        }
+        let back = fwd.reversed();
+        let circuit = GridRule::default();
+        for g in 0..4u32 {
+            // the original, by hand: start = addSlices(0, −1) = 99, dir −1, side flipped
+            let gp = g as i32 + 1;
+            let slice = fwd.add(fwd.add(0, -1), -(3 * (4 - gp) + 1));
+            let side = 1 - (gp & 1);
+            let lat = if side == 1 { 0.5 * 6.0 } else { -0.5 * 4.0 };
+            let want = fwd.slices[slice].centre + fwd.slices[slice].lateral * lat;
+            let (s, off) = grid_slot(&back, 1, g, 4, &circuit);
+            assert_eq!(s, slice, "grid {g}");
+            let got = back.slices[s].centre + back.slices[s].lateral * off.x;
+            assert!((got - want).length() < 1e-4, "grid {g}: {got:?} vs {want:?}");
+        }
+    }
+
+    /// The alternate mode (`slices[1].lanesA == 0`, 0x40E650): `c ± w` with `T = wA·nA + wB·nB`,
+    /// `c = ½T − wA·nA`, `w = T / (nA + nB)`.
+    #[test]
+    fn grid_slot_alternate_mode_centres_on_the_road() {
+        let mut t = ring(100);
+        for s in &mut t.slices {
+            (s.lanes_a, s.lanes_b, s.lane_width_a, s.lane_width_b) = (0, 3, 4.0, 4.0);
+        }
+        let rule = GridRule::default();
+        // T = 12, c = 6, w = 4: odd STARTINGPOS 10, even 2
+        assert_eq!(grid_slot(&t, 10, 0, 4, &rule).1, Vec3::new(10.0, 0.5, 0.0));
+        assert_eq!(grid_slot(&t, 10, 1, 4, &rule).1, Vec3::new(2.0, 0.5, 0.0));
     }
 
 fn two_branch_table() -> SliceTable {
@@ -762,6 +904,11 @@ fn two_branch_table() -> SliceTable {
         }
         assert!(p.update(&t, t.slices[91].centre, t.slices[91].forward, 91, 1));
         assert!(p.finished && p.laps == 1);
+        // 0x4167B9: the finish rewrites `car+0xAF8` as the bare fraction — the lap is not added
+        assert_eq!(p.progress, t.frac(91));
+        // and it stays there (0x416365 skips a finished car)
+        p.update(&t, t.slices[93].centre, t.slices[93].forward, 92, 1);
+        assert_eq!(p.progress, t.frac(91));
         // and backing up behind the start raises the flag instead of an un-lap
         let mut q = RaceProgress::new(5, &t);
         q.set_linear(&t, None);
@@ -806,7 +953,8 @@ mod finish_tests {
         assert!(p.finished);
         assert_eq!(p.laps, 1);
         assert_eq!(p.lap_times.len(), 1, "no laps after the finish");
-        assert!((p.progress - 1.0).abs() < 0.01);
+        // 0x416838 on a circuit: laps timed + the fraction of the slice it crossed on
+        assert_eq!(p.progress, 1.0 + t.frac(0));
     }
 
     /// 0x4A7660: heading against the slice counts, an airborne car holds, a gated one clears.

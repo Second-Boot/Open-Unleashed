@@ -19,6 +19,19 @@ pub enum DialogKind {
     One,
     /// `FEDialogTwoItem` — two buttons, 702 "ok" / 703 "cancel" by default
     Two,
+    /// The input dialog, vtable 0x5BA1E4 (ctor 0x514240 → 0x514280): a text field (0x5149A0) at
+    /// `th`, then "ok" (702) at `th + 18` and "cancel" (703) at `th + 39`, `h = th + 60`.
+    Input,
+}
+
+/// The input dialog's field (`FEInputBox`, vtable 0x5BA23C, ctor 0x5149A0): its text buffer
+/// `[+0xE4]` of `max` bytes (`[+0xE8]`), the digits-only byte `[+0xF1]` and the Enter latch `[+0xF0]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InputField {
+    pub text: String,
+    pub digits: bool,
+    pub max: usize,
+    enter: bool,
 }
 
 /// One button: its `FEStrings` id, and the hover and clicked bytes `[+0xEC]`, `[+0xF4]`.
@@ -35,6 +48,8 @@ pub struct Dialog {
     /// the text, already resolved from its `FEStrings` id
     pub text: String,
     pub buttons: Vec<DialogButton>,
+    /// the input dialog's field
+    pub field: Option<InputField>,
     /// `[+0xD8]` — wanted up
     pub up: bool,
     /// `[+0xDC]` — the fade, 0…0xFF
@@ -53,16 +68,59 @@ impl Dialog {
         let pick = |l: u32, d: u32| if l == 0 { d } else { l };
         let buttons = match kind {
             DialogKind::One => vec![DialogButton { label: pick(labels[0], 702), hovered: false, clicked: false }],
-            DialogKind::Two => vec![
+            DialogKind::Two | DialogKind::Input => vec![
                 DialogButton { label: pick(labels[0], 702), hovered: false, clicked: false },
                 DialogButton { label: pick(labels[1], 703), hovered: false, clicked: false },
             ],
         };
-        Self { kind, text, buttons, up: false, fade: 0, stamp: 0, answered: false, yes: false }
+        Self { kind, text, buttons, field: None, up: false, fade: 0, stamp: 0, answered: false, yes: false }
+    }
+
+    /// An input dialog (0x514240) — `digits` and `max` are the field's `[+0xF1]` and `[+0xE8]`.
+    pub fn input(text: String, digits: bool, max: usize) -> Self {
+        let mut d = Self::new(DialogKind::Input, text, [0, 0]);
+        d.field = Some(InputField { text: String::new(), digits, max, enter: false });
+        d
+    }
+
+    /// The field's key handler, slot 4 0x514C60, for one typed character (the keypad's scan codes
+    /// are mapped to their digits before this, 0x514C6C…0x514D13). `'%'` is refused and not taken
+    /// (0x514D15); any other printable one plays sound 9 (0x514D45) — then a digits-only field
+    /// drops what is not `0…9` (0x514D55) and a full one drops the rest (0x514D7B). Returns the
+    /// sound to play, `None` when the key was not taken.
+    pub fn type_char(&mut self, c: char) -> Option<u8> {
+        let f = self.field.as_mut()?;
+        let code = c as u32;
+        if c == '%' || !(0x20..0xFF).contains(&code) {
+            return None;
+        }
+        if (!f.digits || c.is_ascii_digit()) && f.text.chars().count() < f.max {
+            f.text.push(c);
+        }
+        Some(9)
+    }
+
+    /// Backspace (8, 0x514DAE): the last byte goes; sound 9 either way.
+    pub fn backspace(&mut self) -> Option<u8> {
+        let f = self.field.as_mut()?;
+        f.text.pop();
+        Some(9)
+    }
+
+    /// Enter (0xD, 0x514D95): the field's latch, which the dialog's tick reads as "ok"; sound 9.
+    pub fn enter(&mut self) -> Option<u8> {
+        let f = self.field.as_mut()?;
+        f.enter = true;
+        Some(9)
     }
 
     /// Slot 13, 0x5128A0: up, the fade restarting now, both latches clear.
     pub fn raise(&mut self, now: u32) {
+        // the input dialog's raise 0x514880 with 1 empties the field first
+        if let Some(f) = self.field.as_mut() {
+            f.text.clear();
+            f.enter = false;
+        }
         self.up = true;
         self.stamp = now;
         self.answered = false;
@@ -99,6 +157,22 @@ impl Dialog {
         } else if self.fade > 0 {
             self.fade = (0xFF - e * 8).clamp(0, 0xFF) as u32;
         }
+        // the input dialog's tick 0x514810: "cancel" first (no), then "ok" or the field's Enter (yes)
+        if self.kind == DialogKind::Input {
+            let cancel = self.buttons.get(1).is_some_and(|b| b.clicked);
+            let ok = self.buttons.first().is_some_and(|b| b.clicked);
+            let entered = self.field.as_ref().is_some_and(|f| f.enter);
+            if cancel || ok || entered {
+                self.buttons.iter_mut().for_each(|b| b.clicked = false);
+                if let Some(f) = self.field.as_mut() {
+                    f.enter = false;
+                }
+                self.answered = true;
+                self.yes = !cancel;
+                self.dismiss(now);
+            }
+            return;
+        }
         let first = self.buttons.first().is_some_and(|b| b.clicked);
         let second = self.buttons.get(1).is_some_and(|b| b.clicked);
         if first {
@@ -120,6 +194,7 @@ impl Dialog {
         let h = match self.kind {
             DialogKind::One => th + 21.0,
             DialogKind::Two => th + 42.0,
+            DialogKind::Input => th + 60.0,
         };
         let y = (240 - (h as i32) / 2) as f32;
         (160.0, y, 320.0, h, th)
@@ -128,7 +203,8 @@ impl Dialog {
     /// Button `i`'s rectangle `(x, y, 80, 18)`.
     pub fn button_rect(&self, i: usize, text_h: f32) -> (f32, f32, f32, f32) {
         let (x, y, _, _, th) = self.frame(text_h);
-        (x + 120.0, y + th + 21.0 * i as f32, 80.0, 18.0)
+        let first = if self.kind == DialogKind::Input { 18.0 } else { 0.0 };
+        (x + 120.0, y + th + first + 21.0 * i as f32, 80.0, 18.0)
     }
 
     /// Slot 8 on each button, 0x515060: the hover byte from the pointer; returns the sounds to
@@ -162,6 +238,27 @@ impl Dialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_input_dialog_takes_two_digits() {
+        let mut d = Dialog::input("Race number".into(), true, 2);
+        d.raise(0);
+        assert_eq!(d.type_char('7'), Some(9));
+        assert_eq!(d.type_char('x'), Some(9), "a letter clicks but is dropped");
+        assert_eq!(d.type_char('%'), None);
+        d.type_char('3');
+        d.type_char('9');
+        assert_eq!(d.field.as_ref().unwrap().text, "73");
+        d.backspace();
+        assert_eq!(d.field.as_ref().unwrap().text, "7");
+        // geometry: th 32 → buttons at th + 18 and th + 39, h = th + 60
+        let (_, y, _, h, th) = d.frame(12.0);
+        assert_eq!((h, th), (92.0, 32.0));
+        assert_eq!(d.button_rect(0, 12.0).1, y + 50.0);
+        d.enter();
+        d.tick(1);
+        assert_eq!(d.take_answer(), Some(true));
+    }
 
     #[test]
     fn a_two_button_dialog_fades_answers_and_goes() {

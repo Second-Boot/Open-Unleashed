@@ -77,6 +77,10 @@ struct GpuMaterial {
     /// Thrash state 8, `MIPMAPLODBIAS` (`RE/notes/thrash.md` §7)
     lod_bias: f32,
     cull_back: bool,
+    view_cull: bool,
+    /// Thrash state 0x18 (`MaterialDesc::depth_bias`)
+    depth_bias: i32,
+    false_sort: bool,
     depth_test: bool,
     env_mix: f32,
     env_variant: usize,
@@ -130,6 +134,9 @@ const MAX_SPRITES: u64 = 8192;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const MAX_OBJECTS: u64 = 8192;
+/// The main view's far plane — the camera object's `+8`, 700.0 (0x4677FC) — over which the screen
+/// z the depth bias moves is linear (`RE/notes/thrash.md` §6).
+const VIEW_FAR: f32 = 700.0;
 
 impl Renderer {
     pub fn new(window: Arc<Window>) -> Result<Self> {
@@ -273,7 +280,7 @@ impl Renderer {
             let c = wgpu::BlendComponent { src_factor: src, dst_factor: dst, operation: wgpu::BlendOperation::Add };
             wgpu::BlendState { color: c, alpha: c }
         };
-        let make_pipeline = |blend: bool, pair: u8, cull: bool, depth: bool, zwrite: bool| {
+        let make_pipeline = |blend: bool, pair: u8, cull: Option<wgpu::Face>, depth: bool, zwrite: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("mesh pipeline"),
                 layout: Some(&pipeline_layout),
@@ -301,17 +308,21 @@ impl Renderer {
                     topology: wgpu::PrimitiveTopology::TriangleList,
                     // mirrored clip x (see Camera::view_projection) flips the apparent winding
                     front_face: wgpu::FrontFace::Cw,
-                    cull_mode: if cull { Some(wgpu::Face::Back) } else { None },
+                    cull_mode: cull,
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
                     depth_write_enabled: depth && (!blend || zwrite),
-                    // APPROXIMATION: `dx7z.dll` makes the device with `ZFUNC` `LESSEQUAL`
-                    // (0x6000A545); under it the front end rooms' coplanar floor layers fight in
-                    // this port's depth (a stepped spotlight edge, the floor through one of its
-                    // triangles), so `LESS` stays until the depth values are the original's
-                    depth_compare: if depth { wgpu::CompareFunction::Less } else { wgpu::CompareFunction::Always },
+                    // `ZFUNC` `LESSEQUAL`: `dx7z.dll` makes the device with it (0x6000A545) and the
+                    // game sets it again through the view (Thrash 0x28 ← 3: the race pass
+                    // 0x468B54, the front end's 3D pass 0x4D301D). The front-end rooms' layers —
+                    // light pools and cones on the floor and walls — share their surface's depth
+                    // and pass because of it, drawn after it in `Base+70` order
+                    // (`RE/notes/frontend-3d.md` §9). *(The port kept `LESS` until 2026-09-25,
+                    // for a fight that was the rooms' own states — file order, no pair — not the
+                    // depth test.)*
+                    depth_compare: if depth { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Always },
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
@@ -320,20 +331,14 @@ impl Renderer {
                 cache: None,
             })
         };
-        // 0…7: blend off / the plain alpha pair × cull × depth; 8 + 4·(pair − 1) + …: the other pairs;
-        // 20 + 4·pair + …: every pair again with depth writes on (`device_states`)
-        let mut pipelines = Vec::with_capacity(36);
-        for i in 0..8u8 {
-            pipelines.push(make_pipeline(i & 4 != 0, 0, i & 2 == 0, i & 1 == 0, false));
-        }
-        for pair in 1..4u8 {
-            for i in 0..4u8 {
-                pipelines.push(make_pipeline(true, pair, i & 2 == 0, i & 1 == 0, false));
-            }
-        }
-        for pair in 0..4u8 {
-            for i in 0..4u8 {
-                pipelines.push(make_pipeline(true, pair, i & 2 == 0, i & 1 == 0, true));
+        // six a group — the cull (back, none, front) × depth (on, off), `2·cull + !depth` — and the
+        // groups: 0 blend off, 1 the plain alpha pair, 2…4 the other pairs, 5…8 every pair again
+        // with depth writes on (`device_states`)
+        const CULLS: [Option<wgpu::Face>; 3] = [Some(wgpu::Face::Back), None, Some(wgpu::Face::Front)];
+        let mut pipelines = Vec::with_capacity(54);
+        for (blend, pair, zwrite) in [(false, 0, false), (true, 0, false), (true, 1, false), (true, 2, false), (true, 3, false), (true, 0, true), (true, 1, true), (true, 2, true), (true, 3, true)] {
+            for i in 0..6 {
+                pipelines.push(make_pipeline(blend, pair, CULLS[i / 2], i % 2 == 0, zwrite));
             }
         }
 
@@ -675,6 +680,9 @@ impl Renderer {
             sampler,
             lod_bias: desc.lod_bias,
             cull_back: desc.cull_back,
+            view_cull: desc.view_cull,
+            depth_bias: desc.depth_bias,
+            false_sort: desc.false_sort,
             depth_test: desc.depth_test,
             env_mix: if desc.env_texture.is_some() { desc.env_mix } else { 0.0 },
             env_variant: desc.env_variant.min(2),
@@ -918,6 +926,11 @@ impl Renderer {
             let env_mix = self.materials.get(item.material.0 as usize).map(|m| m.env_mix).unwrap_or(0.0);
             let lod_bias = self.materials.get(item.material.0 as usize).map(|m| m.lod_bias).unwrap_or(0.0);
             let alpha_test = self.materials.get(item.material.0 as usize).is_some_and(|m| m.device_states);
+            // state 0x18 as a pull toward the eye in view depth: `−b · (far − near) / 32768` over
+            // the main view's planes — its near, and the camera object's far 700 (0x4677FC), which
+            // no later write changes (`RE/notes/thrash.md` §6). APPROXIMATION in the rear view, whose
+            // planes are 1 / 65000 in the original (AUDIT.md §O) and whose far the port shortens
+            let pull = self.materials.get(item.material.0 as usize).map_or(0.0, |m| -(m.depth_bias as f32) * (VIEW_FAR - camera.near) / 32768.0);
             let o = ObjectUniform {
                 model: item.transform.to_cols_array_2d(),
                 // .x is the environment-map mix, .zw a uv offset (the sky layers scroll with it)
@@ -926,7 +939,8 @@ impl Renderer {
                 light: [item.light[0], item.light[1], item.light[2], item.alpha],
                 lit_a: item.layer_light.map_or([0.0; 4], |l| [l.ambient[0], l.ambient[1], l.ambient[2], 1.0]),
                 lit_d: item.layer_light.map_or([0.0; 4], |l| [l.diffuse[0], l.diffuse[1], l.diffuse[2], 0.0]),
-                lit_dir: item.layer_light.map_or([0.0; 4], |l| [l.direction[0], l.direction[1], l.direction[2], 0.0]),
+                // .w the depth bias's pull, in view depth
+                lit_dir: item.layer_light.map_or([0.0, 0.0, 0.0, pull], |l| [l.direction[0], l.direction[1], l.direction[2], pull]),
                 shadow_u: item.shadow.map_or([0.0; 4], |s| s.0),
                 shadow_v: item.shadow.map_or([0.0; 4], |s| s.1),
                 // .y flags the item `Headlights::LayerUVLight` lays the `HEAD` decal over
@@ -969,21 +983,28 @@ impl Renderer {
                         continue;
                     }
                     let mesh = &self.meshes[item.mesh.0 as usize];
-                    // mirrored world: the winding flips, so draw both faces instead of culling the wrong one
-                    let cull = mat.cull_back && !scene.mirror;
-                    let sub = (!cull as usize) * 2 + (!mat.depth_test as usize);
-                    let pipeline = &self.pipelines[if mat.alpha_blend && mat.device_states {
-                        20 + mat.blend_pair as usize * 4 + sub
-                    } else if mat.alpha_blend && mat.blend_pair > 0 {
-                        8 + (mat.blend_pair as usize - 1) * 4 + sub
-                    } else {
-                        (mat.alpha_blend as usize) * 4 + sub
-                    }];
-                    pass.set_pipeline(pipeline);
+                    // mirrored world: the winding flips, so a material whose cull is the view's culls
+                    // the other one (0x468C45); any other draws both faces rather than the wrong one
+                    let cull = match (mat.cull_back, scene.mirror, mat.view_cull) {
+                        (false, _, _) | (true, true, false) => 1,
+                        (true, false, _) => 0,
+                        (true, true, true) => 2,
+                    };
+                    let sub = cull * 2 + (!mat.depth_test as usize);
+                    // the blend group without depth writes, and with them (`device_states`)
+                    let plain = if mat.alpha_blend && mat.blend_pair > 0 { 1 + mat.blend_pair as usize } else { mat.alpha_blend as usize };
+                    let group = if mat.alpha_blend && mat.device_states { 5 + mat.blend_pair as usize } else { plain };
                     pass.set_bind_group(1, &self.object_bg, &[(i as u64 * self.object_stride) as u32]);
                     pass.set_bind_group(2, &mat.bind_group, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    // `LayerFalseSort1` / `2`: the same draw first with depth writes off, then on
+                    // (0x449ADB / 0x449B2A, `RE/notes/thrash.md` §6d.4)
+                    if mat.false_sort && mat.alpha_blend {
+                        pass.set_pipeline(&self.pipelines[plain * 6 + sub]);
+                        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    }
+                    pass.set_pipeline(&self.pipelines[group * 6 + sub]);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
                 }
             }
