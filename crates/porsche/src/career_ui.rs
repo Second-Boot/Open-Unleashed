@@ -643,7 +643,7 @@ impl CareerUi {
                 .unwrap_or_default();
             let car = &self.career.garage[i];
             if car.offer.is_some() {
-                match self.career.accept_offer(i) {
+                match self.career.accept_offer(&self.tables, i) {
                     Ok(v) => {
                         self.message = format!("SOLD {name} FOR ${v}");
                         self.car_sel = 0;
@@ -821,7 +821,7 @@ impl CareerUi {
         let t = self.current()?.clone();
         match choice {
             Some(CarChoice::Buy(id, _)) => {
-                match self.career.buy_car(&self.tables, id, 0) {
+                match self.career.buy_car(&self.tables, id, 0, nfs_game::career::Trim::default()) {
                     Ok(()) => {
                         let name = self
                             .tables
@@ -1039,7 +1039,7 @@ impl CareerUi {
         {
             let _ = self
                 .career
-                .buy_car(&self.tables, id, 0)
+                .buy_car(&self.tables, id, 0, nfs_game::career::Trim::default())
                 .map_err(|e| tracing::warn!(error = %e, "ensure_car"));
         }
     }

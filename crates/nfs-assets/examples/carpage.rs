@@ -1,11 +1,15 @@
 //! Diagnostic: build a car's texture pages for the front end and for a race (`CarStyle::front_end`)
-//! and write one page of each as PNG — `carpage <model> <page, 1-based> <outdir>`.
+//! and write one page of each as PNG — `carpage <model> <page, 1-based> <outdir> [licence [number]]`
+//! (with a licence the page builder's text is drawn too, `car-model.md` §5.3).
 use nfs_assets::{car::CarAssets, car::CarStyle, GamePaths};
 
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let paths = GamePaths::locate().unwrap();
-    let car = CarAssets::load(&paths, &a[0]).unwrap();
+    let mut car = CarAssets::load(&paths, &a[0]).unwrap();
+    if let Some(l) = a.get(3) {
+        car.page_text = Some(nfs_assets::car::PageText { license: l.clone(), race_number: a.get(4).and_then(|n| n.parse().ok()).unwrap_or(-1) });
+    }
     let n: usize = a[1].parse().unwrap();
     for fe in [true, false] {
         let mut style = CarStyle::from_tpg(&car.tpg, 1);

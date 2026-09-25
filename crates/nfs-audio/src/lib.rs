@@ -15,6 +15,7 @@ pub mod mixer;
 pub mod music;
 pub mod reverb;
 pub mod sfx;
+pub mod slots;
 pub mod speech;
 
 pub use mixer::{AudioOutput, VoiceId};

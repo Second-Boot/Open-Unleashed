@@ -1,6 +1,7 @@
 //! What `Car_wheelEffects` **0x4A2880** hands each wheel's mark emitter, and the surface colours.
 //!
-//! Once per 64 Hz position step (0x49B84F, skipped for traffic, `car+0x52C & 0x80`) the original
+//! Once per 64 Hz position step (0x49B84F, skipped only for the smackables, `car+0x52C & 0x80` — not
+//! the traffic, `ai.md` §6) the original
 //! walks the four wheels and hands each one's emitter a strength, a kind and the car's motion:
 //!
 //! ```text

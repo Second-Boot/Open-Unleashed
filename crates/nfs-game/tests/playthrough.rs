@@ -94,8 +94,9 @@ impl Run {
             ));
             return None;
         };
-        self.career.buy_car(&self.tables, id, 0).ok()?;
-        Some(self.career.garage.len() - 1)
+        self.career.buy_car(&self.tables, id, 0, Default::default()).ok()?;
+        // the garage is sorted after a purchase (0x4F0EE0): find the new car, fresh from the dealer
+        self.career.garage.iter().position(|g| g.car_id == id && g.mileage == 0 && g.wins == 0)
     }
 
     /// Race every event of `t` with the player first. Returns false when something stopped it.

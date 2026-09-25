@@ -167,12 +167,24 @@ fn car_image(tables: &CareerTables, c: &OwnedCar, instance: u32) -> SavedCar {
             image[car::RECORD..car::RECORD + CAR_RECORD_SIZE].copy_from_slice(rec);
         }
     }
+    // The six appearance dwords (`savegame.md` §4.7a): the colours the paint shop's rows hold —
+    // interior `rec+0x530 + 16·i`, stripes `rec+0x3F0` / `rec+0x3F4 + 16·i`, each packed
+    // big-endian as the getters read them — the package index and decal −1 (0x502710). A bought
+    // car's rows are what the dealership had (0x501CF0: the interior chosen there, paint set 0's
+    // stripes, package 0x508E70's 0).
+    // *(Until 2026-09-25 the port wrote the paint set's first dword as the package — 0 or 205
+    // over `nfs5.car`, not a package — the chosen set's stripes, no interior and decal 0.)*
+    let be = |o: usize| image.get(car::RECORD + o..car::RECORD + o + 4).map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let t = c.trim;
+    let (s1, s2, int) = (be(0x3F0 + 16 * t.stripe1 as usize), be(0x3F4 + 16 * t.stripe2 as usize), be(0x530 + 16 * t.interior as usize));
     let mut car = SavedCar::new(image);
     if let Some(p) = tables.car(c.car_id).and_then(|e| e.paint_sets.get(c.paint_set as usize)) {
         car.set_field_u32(car::EXT_COLOUR, p.packed[0]);
-        car.set_field_u32(car::S1_COLOUR, p.packed[1]);
-        car.set_field_u32(car::S2_COLOUR, p.packed[2]);
-        car.set_field_u32(car::PACKAGE_NUM, p.package);
+        car.set_field_u32(car::INT_COLOUR, int);
+        car.set_field_u32(car::S1_COLOUR, s1);
+        car.set_field_u32(car::S2_COLOUR, s2);
+        car.set_field_u32(car::PACKAGE_NUM, t.package as u32);
+        car.set_field_u32(car::DECAL_NUM, u32::MAX);
     }
     car.set_field_u32(car::ASKING_PRICE, c.asking_price.unwrap_or(0));
     car.set_field_u8(car::LISTED, u8::from(c.asking_price.is_some()));
@@ -212,14 +224,29 @@ fn car_image(tables: &CareerTables, c: &OwnedCar, instance: u32) -> SavedCar {
 fn owned_from_image(tables: &CareerTables, car: &SavedCar) -> OwnedCar {
     let car_id = u16::from_le_bytes([car.image.get(car::RECORD).copied().unwrap_or(0), car.image.get(car::RECORD + 1).copied().unwrap_or(0)]);
     let ext = car.field_u32(car::EXT_COLOUR);
-    let package = car.field_u32(car::PACKAGE_NUM);
     let paint_set = tables
         .car(car_id)
-        .and_then(|e| e.paint_sets.iter().position(|p| p.packed[0] == ext && p.package == package))
+        .and_then(|e| e.paint_sets.iter().position(|p| p.packed[0] == ext))
         .unwrap_or(0) as u8;
+    // the other rows back from the colours they hold (row 0 when none matches)
+    let rec = car.image.get(car::RECORD..car::RECORD + CAR_RECORD_SIZE).unwrap_or(&[]);
+    let row = |base: usize, count_at: usize, v: u32| -> u8 {
+        let n = rec.get(count_at..count_at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]) as usize).min(40);
+        (0..n)
+            .position(|i| rec.get(base + 16 * i..base + 16 * i + 4).is_some_and(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) == v))
+            .unwrap_or(0) as u8
+    };
+    let trim = crate::career::Trim {
+        interior: row(0x530, 0x528, car.field_u32(car::INT_COLOUR)),
+        stripe1: row(0x3F0, 0x3E6, car.field_u32(car::S1_COLOUR)),
+        stripe2: row(0x3F4, 0x3E6, car.field_u32(car::S2_COLOUR)),
+        // the list has eight rows; anything else is an older port save's paint-set dword (0 / 205)
+        package: Some(car.field_u32(car::PACKAGE_NUM)).filter(|p| *p < 8).unwrap_or(0) as u8,
+    };
     OwnedCar {
         car_id,
         paint_set,
+        trim,
         parts: car.installed.iter().map(|p| p.id as i16).collect(),
         mileage: car.field_u32(car::MILEAGE),
         wins: car.field_u32(car::WINS),

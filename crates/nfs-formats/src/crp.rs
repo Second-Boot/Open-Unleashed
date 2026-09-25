@@ -511,6 +511,11 @@ pub struct Base {
     pub anim: u8,
     /// `Base+76` — the frame count those `vt` parts run to.
     pub anim_frames: u8,
+    /// `Base+78…+83`, the bytes `R3DCarLOD::draw` 0x43C830 sorts a car's parts by (`[part+0x44]`
+    /// is `Base+68`): `+78` meets the call's mask (`& mask & 0xF0`, 0x43C8DF), `+81` set puts a
+    /// part in the call with the flag argument (0x43C8C7), `+82` set keeps it out of the other
+    /// (0x43C8D4).
+    pub draw_bytes: [u8; 6],
     pub lod_count: u32,
     pub bbox_min: [f32; 3],
     pub bbox_max: [f32; 3],
@@ -559,6 +564,7 @@ impl Base {
             rot_channel: if b.len() > 75 { b[75] } else { 0 },
             anim: if b.len() > 77 { b[77] } else { 0 },
             anim_frames: if b.len() > 76 { b[76] } else { 0 },
+            draw_bytes: [b[78], b[79], b[80], b[81], b[82], b[83]],
             lod_count,
             bbox_min: [f(20)?, f(24)?, f(28)?],
             bbox_max: [f(32)?, f(36)?, f(40)?],
@@ -594,6 +600,13 @@ pub struct Material {
     pub lod_bias: f32,
     /// `+0x44` / `+0x48`: states 0x41 / 0x42, `ADDRESSU` / `ADDRESSV` — 0 clamp, 1 wrap, 2 mirror.
     pub address: [u32; 2],
+    /// A car material's `Rs` block — the render states `LayerState` hands the driver, Thrash
+    /// **6, 0x0A, 0x38, 2, 0x18** and a closing −1, the layout of the state object 0x5379F0
+    /// (`RE/notes/thrash.md` §6). It is the extension table's entry at data offset 0 of size 0x18
+    /// (`{key, 0, 0x18, 0}` at `+164`), whose data start at `+260`. Over every shipped car it reads
+    /// `{1, 2, 0, cull, bias, −1}`: gouraud, **blending on**, the plain alpha pair, the cull mode
+    /// (0 none, 1 `CCW` — `dx7z.dll` 0x60003C4E) and a small depth bias. `None` off a car.
+    pub rs: Option<[i32; 6]>,
 }
 
 /// `R3DLightLayer`'s parameter block `{f32 p0, f32 p1, u32 slot}` (read at 0x446600, 0x446886 and
@@ -639,6 +652,9 @@ impl Material {
             lod_bias: f32::from_bits(u32_le(b, 0x40, "mt lod bias")?),
             address: [u32_le(b, 0x44, "mt address u")?, u32_le(b, 0x48, "mt address v")?],
             reflection: if b.len() >= 288 { f32::from_bits(u32::from_le_bytes([b[284], b[285], b[286], b[287]])) } else { 0.0 },
+            rs: (b.len() >= 312 && u32_le(b, 168, "mt +168")? == 0 && u32_le(b, 172, "mt +172")? == 0x18).then(|| {
+                std::array::from_fn(|k| i32::from_le_bytes([b[260 + 4 * k], b[261 + 4 * k], b[262 + 4 * k], b[263 + 4 * k]]))
+            }),
         })
     }
     pub fn texture_name(&self) -> String {

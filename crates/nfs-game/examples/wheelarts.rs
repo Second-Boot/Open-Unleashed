@@ -13,12 +13,14 @@ fn main() {
         if !matches!(b.tag[0], 0x0D | 0x0E) {
             continue;
         }
+        let pflags: std::collections::BTreeSet<(u8, u16, u16)> = g.primitives.iter().map(|p| (p.lod, p.prim_type, p.flags)).collect();
+        println!("  {} prim (lod, type, flags): {pflags:?}", g.name);
         let mut by_lod = std::collections::BTreeMap::<u8, Vec<String>>::new();
         for p in &g.primitives {
             let rm = mats.get(p.material as usize).map(|m| format!("{}:{}", m.render_method, m.texture_name())).unwrap_or_default();
             by_lod.entry(p.lod).or_default().push(rm);
         }
-        println!("{} tag {:02x?} chan {} lods {:?}", g.name, b.tag, b.rot_channel, by_lod.iter().map(|(l, v)| (*l, v.len())).collect::<Vec<_>>());
+        println!("{} tag {:02x?} chan {} draw {:02x?} lods {:?}", g.name, b.tag, b.rot_channel, b.draw_bytes, by_lod.iter().map(|(l, v)| (*l, v.len())).collect::<Vec<_>>());
         if std::env::args().nth(2).is_some_and(|n| n == g.name) {
             println!("  tr lod1 {:?}", g.transform_for_lod(1));
             for p in g.primitives.iter().filter(|p| p.lod == 1) {

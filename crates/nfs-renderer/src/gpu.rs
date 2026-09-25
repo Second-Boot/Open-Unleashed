@@ -71,6 +71,7 @@ struct GpuMaterial {
     bind_group: wgpu::BindGroup,
     alpha_blend: bool,
     blend_pair: u8,
+    device_states: bool,
     /// the address-mode half of the index into `samplers` (`clamp_u | clamp_v << 1`)
     sampler: usize,
     /// Thrash state 8, `MIPMAPLODBIAS` (`RE/notes/thrash.md` §7)
@@ -91,7 +92,7 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
-    pipelines: Vec<wgpu::RenderPipeline>, // index = blend*4 + nocull*2 + nodepth
+    pipelines: Vec<wgpu::RenderPipeline>, // see `make_pipeline`'s loops for the index
     globals_buf: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
     globals_layout: wgpu::BindGroupLayout,
@@ -272,7 +273,7 @@ impl Renderer {
             let c = wgpu::BlendComponent { src_factor: src, dst_factor: dst, operation: wgpu::BlendOperation::Add };
             wgpu::BlendState { color: c, alpha: c }
         };
-        let make_pipeline = |blend: bool, pair: u8, cull: bool, depth: bool| {
+        let make_pipeline = |blend: bool, pair: u8, cull: bool, depth: bool, zwrite: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("mesh pipeline"),
                 layout: Some(&pipeline_layout),
@@ -305,7 +306,11 @@ impl Renderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
-                    depth_write_enabled: !blend && depth,
+                    depth_write_enabled: depth && (!blend || zwrite),
+                    // APPROXIMATION: `dx7z.dll` makes the device with `ZFUNC` `LESSEQUAL`
+                    // (0x6000A545); under it the front end rooms' coplanar floor layers fight in
+                    // this port's depth (a stepped spotlight edge, the floor through one of its
+                    // triangles), so `LESS` stays until the depth values are the original's
                     depth_compare: if depth { wgpu::CompareFunction::Less } else { wgpu::CompareFunction::Always },
                     stencil: Default::default(),
                     bias: Default::default(),
@@ -315,14 +320,20 @@ impl Renderer {
                 cache: None,
             })
         };
-        // 0…7: blend off / the plain alpha pair × cull × depth; 8 + 4·(pair − 1) + …: the other pairs
-        let mut pipelines = Vec::with_capacity(20);
+        // 0…7: blend off / the plain alpha pair × cull × depth; 8 + 4·(pair − 1) + …: the other pairs;
+        // 20 + 4·pair + …: every pair again with depth writes on (`device_states`)
+        let mut pipelines = Vec::with_capacity(36);
         for i in 0..8u8 {
-            pipelines.push(make_pipeline(i & 4 != 0, 0, i & 2 == 0, i & 1 == 0));
+            pipelines.push(make_pipeline(i & 4 != 0, 0, i & 2 == 0, i & 1 == 0, false));
         }
         for pair in 1..4u8 {
             for i in 0..4u8 {
-                pipelines.push(make_pipeline(true, pair, i & 2 == 0, i & 1 == 0));
+                pipelines.push(make_pipeline(true, pair, i & 2 == 0, i & 1 == 0, false));
+            }
+        }
+        for pair in 0..4u8 {
+            for i in 0..4u8 {
+                pipelines.push(make_pipeline(true, pair, i & 2 == 0, i & 1 == 0, true));
             }
         }
 
@@ -660,6 +671,7 @@ impl Renderer {
             bind_group,
             alpha_blend: desc.alpha_blend,
             blend_pair: desc.blend_pair.min(3),
+            device_states: desc.device_states,
             sampler,
             lod_bias: desc.lod_bias,
             cull_back: desc.cull_back,
@@ -905,6 +917,7 @@ impl Renderer {
         for (i, item) in scene.items.iter().take(n).enumerate() {
             let env_mix = self.materials.get(item.material.0 as usize).map(|m| m.env_mix).unwrap_or(0.0);
             let lod_bias = self.materials.get(item.material.0 as usize).map(|m| m.lod_bias).unwrap_or(0.0);
+            let alpha_test = self.materials.get(item.material.0 as usize).is_some_and(|m| m.device_states);
             let o = ObjectUniform {
                 model: item.transform.to_cols_array_2d(),
                 // .x is the environment-map mix, .zw a uv offset (the sky layers scroll with it)
@@ -917,7 +930,8 @@ impl Renderer {
                 shadow_u: item.shadow.map_or([0.0; 4], |s| s.0),
                 shadow_v: item.shadow.map_or([0.0; 4], |s| s.1),
                 // .y flags the item `Headlights::LayerUVLight` lays the `HEAD` decal over
-                shadow_on: [item.shadow.is_some() as u32 as f32, item.uv_lit as u32 as f32, lod_bias, 0.0],
+                // .w the alpha test of a material with `device_states`
+                shadow_on: [item.shadow.is_some() as u32 as f32, item.uv_lit as u32 as f32, lod_bias, alpha_test as u32 as f32],
             };
             let off = i * self.object_stride as usize;
             staging[off..off + std::mem::size_of::<ObjectUniform>()].copy_from_slice(bytemuck::bytes_of(&o));
@@ -958,7 +972,13 @@ impl Renderer {
                     // mirrored world: the winding flips, so draw both faces instead of culling the wrong one
                     let cull = mat.cull_back && !scene.mirror;
                     let sub = (!cull as usize) * 2 + (!mat.depth_test as usize);
-                    let pipeline = &self.pipelines[if mat.alpha_blend && mat.blend_pair > 0 { 8 + (mat.blend_pair as usize - 1) * 4 + sub } else { (mat.alpha_blend as usize) * 4 + sub }];
+                    let pipeline = &self.pipelines[if mat.alpha_blend && mat.device_states {
+                        20 + mat.blend_pair as usize * 4 + sub
+                    } else if mat.alpha_blend && mat.blend_pair > 0 {
+                        8 + (mat.blend_pair as usize - 1) * 4 + sub
+                    } else {
+                        (mat.alpha_blend as usize) * 4 + sub
+                    }];
                     pass.set_pipeline(pipeline);
                     pass.set_bind_group(1, &self.object_bg, &[(i as u64 * self.object_stride) as u32]);
                     pass.set_bind_group(2, &mat.bind_group, &[]);

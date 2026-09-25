@@ -175,14 +175,27 @@ fn vs_main(in: VsIn) -> VsOut {
 // An opaque draw covers its pixel whatever the texture's alpha says: the original's back buffer
 // has no alpha channel, and a car page keeps its texels' alpha (a wheel face's clear corners), which
 // must not punch holes in a screenshot or in an off-screen view the front end lays over its screen.
+//
+// Both run, for a material with the device's states (`shadow_on.w`, the car's), the alpha test
+// `dx7z.dll` turns on with the device and never turns off — `ALPHATESTENABLE` 1, `ALPHAFUNC`
+// `GREATER`, `ALPHAREF` 0 (0x6000A4FF…0x6000A51C): a fragment whose alpha is 0 is dropped, colour
+// and depth alike.
 @fragment
 fn fs_opaque(in: VsOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(shade(in).rgb, 1.0);
+    let c = shade(in);
+    if object.shadow_on.w > 0.5 && c.a < 0.5 / 255.0 {
+        discard;
+    }
+    return vec4<f32>(c.rgb, 1.0);
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return shade(in);
+    let c = shade(in);
+    if object.shadow_on.w > 0.5 && c.a < 0.5 / 255.0 {
+        discard;
+    }
+    return c;
 }
 
 fn shade(in: VsOut) -> vec4<f32> {

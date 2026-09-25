@@ -350,7 +350,8 @@ impl Vehicle {
     /// keeps **one** stream for the whole game; this crate sits below `nfs-game`, so it carries its
     /// own state with the same arithmetic.
     /// `ClampAngVel`'s limit in turns/s: 0.75, or 2.25 for a `.TINYCAR` (0x4964D0, 0x49BBA0). The
-    /// 6.75 of a light simplified-AI car (`car+0x52C & 0x80`, 0x4964F4) has no car in this port.
+    /// 6.75 of a light smackable (`car+0x52C & 0x80` — not the traffic, `ai.md` §6; 0x4964F4) has
+    /// no car in this port.
     fn ang_limit(&self) -> f32 {
         if self.tiny { 2.25 } else { 0.75 }
     }

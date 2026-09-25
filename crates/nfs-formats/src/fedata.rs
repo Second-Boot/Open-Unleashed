@@ -112,6 +112,9 @@ pub struct CarCatalogEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaintSet {
+    /// The set's first dword. Not the paint shop's stripe `PackageNum` (`car+0x684`, the row of
+    /// `packages.ini` 0x443DB0 tints by — `car-model.md` §5.0a): over `nfs5.car` it is only ever 0
+    /// or 205 (`examples/paintpkgs.rs`). What it is was not read.
     pub package: u32,
     pub colours: [[u8; 3]; 3],
     /// The same three colours in the dword form the front-end's colour accessors hand out and the

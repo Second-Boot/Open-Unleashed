@@ -25,8 +25,8 @@
 //! within `±warpAmount` that is redrawn every 32 steps.
 //!
 //! **APPROXIMATION** in what is left: the jitter's random numbers come from the port's own
-//! generator, not the game's shared 0x538040 sequence; region B's own textures (the numbers are blended by the `.bin`'s per-slice `t`, the maps
-//! stay region A's), and `basic` skies' cloud / alpha maps, which are drawn as a plain layer.
+//! generator, not the game's shared 0x538040 sequence; and `basic` skies' cloud / alpha maps, which
+//! are drawn as a plain layer. *(Region B's own maps are blended in by `t` now, `MapBlend`.)*
 
 use glam::Vec3;
 use nfs_assets::track::TrackAssets;
@@ -160,10 +160,6 @@ impl Jitter {
 #[derive(Debug, Clone, Copy)]
 enum Motion {
     Still,
-    /// the dome of a track without a `.bin`: UV units per second (APPROXIMATION). Unreachable with
-    /// the shipped data: every track has its `.bin` (`alps.bin` in lower case) and `default.bin`
-    /// is the loader's fallback (0x459680 / 0x4596A1), so this only draws a broken install
-    Dome([f32; 2]),
     /// a grid layer: index into `Sky::grids`
     Grid(usize),
 }
@@ -209,6 +205,29 @@ struct GridLayer {
     angle: f32,
     step: [f32; 2],
     offset: [f32; 2],
+    /// A MultiSky stage whose region-B map differs from region A's: its texture is 0x45DD90's
+    /// blend of the two, redone by 0x45E160 at each `t` — `(A·wa + B·wb) >> 16` per byte with
+    /// `wa = fistp((1 − t)·65536)`, `wb = fistp(t·65536)` (0x45E188…0x45E25D). Only `Alps.txt`
+    /// names such a pair (`st1a`/`st1b`, `sc1a`/`sc1b`, all 16 × 16).
+    blend: Option<MapBlend>,
+}
+
+struct MapBlend {
+    texture: nfs_renderer::TextureId,
+    width: u32,
+    height: u32,
+    a: Vec<u8>,
+    b: Vec<u8>,
+    /// the `wb` last drawn, so an unchanged `t` costs nothing
+    wb: i32,
+}
+
+/// 0x45E160's blend of two maps' bytes at `t`: returns `wb` and the pixels.
+fn blend_maps(a: &[u8], b: &[u8], t: f32) -> (i32, Vec<u8>) {
+    let wa = ((1.0 - t) * 65536.0).round_ties_even() as i32;
+    let wb = (t * 65536.0).round_ties_even() as i32;
+    let px = a.iter().zip(b).map(|(&a, &b)| ((a as i32 * wa + b as i32 * wb) >> 16) as u8).collect();
+    (wb, px)
 }
 
 /// The 16 × 16 layer grid of 0x460EC0(15, …) / 0x460F40, normalised by `norm` like the horizon
@@ -242,28 +261,6 @@ fn layer_grid(ring: &nfs_formats::sky::SkyRing, scale: f32, a: f32, b: f32, norm
 
 const RADIUS: f32 = 3000.0;
 
-fn dome_uv(radius: f32, rings: u32, segs: u32, uv_scale: [f32; 2], y_min: f32) -> MeshData {
-    let mut m = MeshData::default();
-    for r in 0..=rings {
-        let t = r as f32 / rings as f32; // 0 = horizon, 1 = zenith
-        let el = y_min + (std::f32::consts::FRAC_PI_2 - y_min) * t;
-        for s in 0..=segs {
-            let az = s as f32 / segs as f32 * std::f32::consts::TAU;
-            let p = Vec3::new(az.cos() * el.cos(), el.sin(), az.sin() * el.cos()) * radius;
-            m.vertices.push(Vertex { position: p.to_array(), normal: [0.0, 1.0, 0.0], uv: [s as f32 / segs as f32 * uv_scale[0], (1.0 - t) * uv_scale[1]], color: [1.0; 4] });
-        }
-    }
-    for r in 0..rings {
-        for s in 0..segs {
-            let a = r * (segs + 1) + s;
-            let b = a + segs + 1;
-            // inward-facing (viewed from inside): reverse winding
-            m.indices.extend_from_slice(&[a, a + 1, b, a + 1, b + 1, b]);
-        }
-    }
-    m
-}
-
 /// The horizon ring of `Sky/<Track>.bin`: sixteen quads, each one tile of the `horz` grid, with the
 /// four `hzcl` colours of its two edges. `colour(i)` is the strip's pixel `i` on row 0 (the top) and
 /// row 1 (the bottom); the original reads them as two runs of sixteen dwords 0x40 bytes apart
@@ -296,22 +293,6 @@ fn horizon_ring(bin: &nfs_formats::sky::SkyBin, y0: f32, y1: f32, colour: impl F
     m
 }
 
-fn ring(radius: f32, y0: f32, y1: f32, segs: u32, repeats: f32, v0: f32, v1: f32) -> MeshData {
-    let mut m = MeshData::default();
-    for s in 0..=segs {
-        let az = s as f32 / segs as f32 * std::f32::consts::TAU;
-        let (x, z) = (az.cos() * radius, az.sin() * radius);
-        let u = s as f32 / segs as f32 * repeats;
-        m.vertices.push(Vertex { position: [x, y0, z], normal: [0.0, 1.0, 0.0], uv: [u, v1], color: [1.0; 4] });
-        m.vertices.push(Vertex { position: [x, y1, z], normal: [0.0, 1.0, 0.0], uv: [u, v0], color: [1.0; 4] });
-    }
-    for s in 0..segs {
-        let a = s * 2;
-        m.indices.extend_from_slice(&[a, a + 1, a + 2, a + 1, a + 3, a + 2]);
-    }
-    m
-}
-
 impl Sky {
     /// `level` is `SKYRENDERING` (`[0x657D9C]`, `Graphics.SkyRendering`).
     pub fn upload(r: &mut Renderer, track: &TrackAssets, level: usize) -> Option<Self> {
@@ -320,7 +301,7 @@ impl Sky {
             r.upload_texture(&TextureData { width: t.width, height: t.height, mips: t.mips.clone() })
         }
         let mut parts = Vec::new();
-        let sky_mat = |r: &mut Renderer, id, blend| r.create_material(MaterialDesc { texture: Some(id), alpha_blend: blend, cull_back: false, depth_test: false, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0 });
+        let sky_mat = |r: &mut Renderer, id, blend| r.create_material(MaterialDesc { texture: Some(id), alpha_blend: blend, cull_back: false, depth_test: false, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0, device_states: false });
 
         let file = nfs_formats::sky::SkyFile::parse(&track.sky_params.join("\n")).ok();
         // the blocks of the `SKYRENDERING` level (0x45D8F0 → 0x45FB80, `SkyFile::for_level`) — none
@@ -336,13 +317,28 @@ impl Sky {
             let region = &b.regions[0];
             let region_b = &b.regions[1];
             let bin = track.sky_bin.as_ref().filter(|b| b.rings[0].radius > 0.0);
+            let multi = matches!(b.kind, nfs_formats::sky::SkyKind::Multi { .. });
             for (i, layer) in region.layers.iter().enumerate() {
                 let Some(map) = layer.map.as_deref().and_then(find) else { continue };
-                let id = tex(r, map);
+                // region B's own map, blended in by `t` (MultiSky only — BasicSky keeps region A's)
+                let map_b = region_b.layers.get(i).and_then(|l| l.map.as_deref()).filter(|n| multi && Some(*n) != layer.map.as_deref()).and_then(find);
+                let blend = map_b.filter(|mb| mb.width == map.width && mb.height == map.height && bin.is_some()).and_then(|mb| {
+                    let (a, b) = (map.mips.first()?.clone(), mb.mips.first()?.clone());
+                    let texture = r.upload_texture(&TextureData { width: map.width, height: map.height, mips: vec![a.clone()] });
+                    Some(MapBlend { texture, width: map.width, height: map.height, a, b, wb: 0 })
+                });
+                let id = match &blend {
+                    Some(bl) => bl.texture,
+                    None => tex(r, map),
+                };
                 let m = sky_mat(r, id, i > 0);
                 let scale = [layer.scale[0].max(0.01), layer.scale[1].max(0.01)];
-                match bin {
-                    Some(bin) => {
+                // with no usable `.bin` the layer is not drawn: the loader falls back to
+                // `default.bin` (0x459680 / 0x4596A1, as `TrackAssets` does), so only a broken
+                // install gets here, and what the original then does was not read. *(Until
+                // 2026-09-25 the port drew an invented dome scrolled by an untraced wind rule.)*
+                if let Some(bin) = bin {
+                    {
                         let ring = &bin.rings[0];
                         // normalised as the horizon ring is, the higher layers a little closer
                         let norm = RADIUS * 0.9 / ring.radius * (1.0 - 0.02 * i as f32);
@@ -355,13 +351,8 @@ impl Sky {
                         let wind_on = layer.wind_speed > 0.25 || lb.is_some_and(|l| l.wind_speed > 0.25);
                         let parallax_on = region.move_ratio > 1.0 || region_b.move_ratio > 1.0;
                         let handle = r.upload_dynamic_mesh(&mesh);
-                        grids.push(GridLayer { mesh: handle, vertices: mesh.vertices, a, b: bp, wind_on, parallax_on, angle: ring.angle_turns, step: a.step, offset: [0.0, 0.0] });
+                        grids.push(GridLayer { mesh: handle, vertices: mesh.vertices, a, b: bp, wind_on, parallax_on, angle: ring.angle_turns, step: a.step, offset: [0.0, 0.0], blend });
                         parts.push((handle, m, Motion::Grid(grids.len() - 1)));
-                    }
-                    None => {
-                        // the higher layers sit slightly closer so they sort in front of the base
-                        let radius = RADIUS * (1.0 - 0.02 * i as f32);
-                        parts.push((r.upload_mesh(&dome_uv(radius, 12, 48, scale, if i == 0 { -0.15 } else { 0.0 })), m, Motion::Dome(scroll(layer, region.move_ratio))));
                     }
                 }
             }
@@ -390,11 +381,9 @@ impl Sky {
                     let (y0, y1) = (bin.height_pair[0], bin.height_pair[0] + bin.height_pair[1]);
                     parts.push((r.upload_mesh(&horizon_ring(bin, y0, y1, colour)), m, Motion::Still));
                 }
-                // no `.bin`: the old two-strip guess
-                None => {
-                    parts.push((r.upload_mesh(&ring(RADIUS * 0.96, -RADIUS * 0.02, RADIUS * 0.12, 64, 4.0, 0.0, 0.5)), m, Motion::Still));
-                    parts.push((r.upload_mesh(&ring(RADIUS * 0.94, -RADIUS * 0.02, RADIUS * 0.10, 64, 5.0, 0.5, 1.0)), m, Motion::Still));
-                }
+                // no usable `.bin` (a broken install, see the layers above): no ring. *(The port
+                // drew an invented two-strip ring here until 2026-09-25.)*
+                None => {}
             }
         }
         let blend = track.sky_bin.as_ref().map(|b| b.track_a.clone()).unwrap_or_default();
@@ -422,6 +411,13 @@ impl Sky {
         let (rate, amp) = (lerp(jit.rate), lerp(jit.amp));
         jit.step(ticks_i, rate, amp);
         for g in &mut self.grids {
+            if let Some(bl) = g.blend.as_mut() {
+                let (wb, px) = blend_maps(&bl.a, &bl.b, t);
+                if wb != bl.wb {
+                    bl.wb = wb;
+                    r.update_texture(bl.texture, &TextureData { width: bl.width, height: bl.height, mips: vec![px] });
+                }
+            }
             let p = StageParams::lerp(&g.a, &g.b, t);
             if p.step != g.step || jit.on {
                 g.step = p.step;
@@ -451,15 +447,14 @@ impl Sky {
 
     /// Draw items centred on the camera (sky follows the viewer). `far` is the camera's far plane —
     /// the sky is scaled to sit just inside it, since the draw distance the track's `.key` file
-    /// asks for is far shorter than the sky's nominal radius. `seconds` scrolls a dome.
-    pub fn draw_items(&self, camera_pos: Vec3, far: f32, seconds: f32) -> impl Iterator<Item = DrawItem> + '_ {
+    /// asks for is far shorter than the sky's nominal radius.
+    pub fn draw_items(&self, camera_pos: Vec3, far: f32) -> impl Iterator<Item = DrawItem> + '_ {
         let k = (far * 0.9 / RADIUS).clamp(0.02, 4.0);
         let t = glam::Mat4::from_translation(camera_pos) * glam::Mat4::from_scale(Vec3::splat(k));
         self.parts.iter().map(move |(mesh, material, motion)| {
             let mut item = DrawItem::new(*mesh, *material, t);
             item.uv_offset = match *motion {
                 Motion::Still => [0.0, 0.0],
-                Motion::Dome(v) => [v[0] * seconds, v[1] * seconds],
                 Motion::Grid(i) => self.grids[i].offset,
             };
             item
@@ -467,20 +462,18 @@ impl Sky {
     }
 }
 
-/// Wind speed ("0 for none, 10 for lots") and direction (degrees, north 0, east 90) into a UV
-/// velocity, damped by the region's move ratio ("50 is fast and 400 is slow", 0 = still).
-/// APPROXIMATION: the original's units were not traced, only the sense of each field.
-fn scroll(layer: &nfs_formats::sky::SkyLayer, move_ratio: f32) -> [f32; 2] {
-    if layer.wind_speed == 0.0 || move_ratio == 0.0 {
-        return [0.0, 0.0];
-    }
-    let rate = layer.wind_speed / 400.0 * (400.0 / move_ratio.max(1.0));
-    let a = layer.wind_direction.to_radians();
-    [rate * a.sin() * 0.01, rate * a.cos() * 0.01]
-}
-
 #[cfg(test)]
 mod stage_tests {
+
+    #[test]
+    fn map_blend_is_0x45e160s_fixed_point_lerp() {
+        let (a, b) = ([200u8, 100, 0, 255], [0u8, 100, 255, 255]);
+        assert_eq!(blend_maps(&a, &b, 0.0).1, [200, 100, 0, 255]);
+        // t = 1: wa = 0, wb = 65536
+        assert_eq!(blend_maps(&a, &b, 1.0).1, [0, 100, 255, 255]);
+        // t = 0.5: (a + b)·32768 >> 16
+        assert_eq!(blend_maps(&a, &b, 0.5), (32768, vec![100, 100, 127, 255]));
+    }
     use super::*;
 
     #[test]

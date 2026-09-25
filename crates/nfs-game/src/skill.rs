@@ -78,8 +78,14 @@ fn is_arrow(tag: u32) -> bool {
     &b[..3] == b"ARW"
 }
 
-/// The prop radius `0x498280`'s caller reads from the prop's own `vtable[+0x14]`. A cone's value
-/// has not been read; this is an **APPROXIMATION** of it.
+/// The prop radius `0x498280`'s caller reads from the prop's own `vtable[+0x14]`. *(Read
+/// 2026-09-25:)* for a `WTreeElem_CylinderObject` (vtable 0x5B490C) that is `+0x34` (0x4866E0),
+/// which its constructor 0x486690 sets from an argument its one caller passes as the constant
+/// 0.25 (0x4751D8) and floors at `[0x5B2468]` = 0.25 — so every `kCylinder` prop is 0.25. A
+/// `WTreeElem_BoxObject` answers `+0x64`. **But a cone is neither:** `animdefs.txt` gives `CONE`
+/// `collideType=kSmackable`, so the original builds it as a smackable car (`car+0x52C & 0x80`,
+/// the list `0x5E8C24`) and it is struck through the car–car collision, not this prop test.
+/// APPROXIMATION: the port keeps the cones as tree props with the cylinder's 0.25.
 const CONE_RADIUS: f32 = 0.25;
 
 impl SkillTest {

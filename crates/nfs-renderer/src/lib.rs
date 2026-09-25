@@ -64,14 +64,23 @@ pub struct MaterialDesc {
     pub clamp: [bool; 2],
     /// The texture's mip LOD bias — Thrash state 8, `D3DTSS_MIPMAPLODBIAS` (`thrash.md` §7).
     pub lod_bias: f32,
+    /// The draw state `dx7z.dll` gives every draw, which the port gives the **car's** materials:
+    /// depth writes even when blended and the alpha test. The device is made with `ZWRITEENABLE`
+    /// 1, `ZFUNC` `LESSEQUAL`, `ALPHATESTENABLE` 1, `ALPHAFUNC` `GREATER` and `ALPHAREF` 0
+    /// (0x6000A4FF…0x6000A549), and no Thrash state the game sets touches any of them
+    /// (`thrash.md` §6). APPROXIMATION for everything else: which surface format a track or front
+    /// end texture lands in — with or without alpha, so whether the test can drop anything — is
+    /// not read, and the port's other blended draws (particles, glare) keep depth writes off until
+    /// their draw order is the original's; the car pages' formats are the `.tpg`'s (`bpp`).
+    pub device_states: bool,
 }
 
 impl MaterialDesc {
     pub fn textured(texture: TextureId) -> Self {
-        Self { texture: Some(texture), alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0 }
+        Self { texture: Some(texture), alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0, device_states: false }
     }
     pub fn flat() -> Self {
-        Self { texture: None, alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0 }
+        Self { texture: None, alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0, device_states: false }
     }
 }
 

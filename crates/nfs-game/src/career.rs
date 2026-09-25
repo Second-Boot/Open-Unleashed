@@ -155,7 +155,11 @@ impl CareerTables {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OwnedCar {
     pub car_id: u16,
+    /// The exterior: the paint set whose colour 0 is `FECar+0x674` (`OwnedCar.ExtColour`).
     pub paint_set: u8,
+    /// The other four appearance dwords the paint shop edits (`savegame.md` §4.7a).
+    #[serde(default)]
+    pub trim: Trim,
     /// Installed `nfs5.prt` ids (one per part type / type name).
     #[serde(default)]
     pub parts: Vec<i16>,
@@ -193,9 +197,23 @@ pub struct OwnedCar {
     pub offer: Option<u32>,
 }
 
+/// A garage car's interior, stripes and package, as list indices into its `nfs5.car` record — the
+/// rows `OwnedCar.IntColour` (`rec+0x530 + 16·i`), `.S1Colour` (`rec+0x3F0 + 16·i`), `.S2Colour`
+/// (`rec+0x3F4 + 16·i`) offer and the `OwnedCar.PackageNum` index (0 "none" … 7). The original
+/// keeps the chosen colours themselves in `FECar+0x678…+0x684`; the port keeps the rows and the
+/// save writes the colours (`save::car_image`). Row 0 everywhere is what a bought car starts with
+/// (0x501CF0 with no interior chosen: interior 0, paint set 0's stripes, package 0).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Trim {
+    pub interior: u8,
+    pub stripe1: u8,
+    pub stripe2: u8,
+    pub package: u8,
+}
+
 impl OwnedCar {
     pub fn new(car_id: u16, paint_set: u8, purchase_price: u32) -> Self {
-        Self { car_id, paint_set, parts: Vec::new(), mileage: 0, wins: 0, damage_pct: 0.0, damage: [0.0; 10], part_state: Vec::new(), setup: CAR_SETUP_DEFAULT, purchase_price, asking_price: None, offer: None }
+        Self { car_id, paint_set, trim: Trim::default(), parts: Vec::new(), mileage: 0, wins: 0, damage_pct: 0.0, damage: [0.0; 10], part_state: Vec::new(), setup: CAR_SETUP_DEFAULT, purchase_price, asking_price: None, offer: None }
     }
 }
 
@@ -593,7 +611,10 @@ impl Career {
         c.dealer_price(self.year)
     }
 
-    pub fn buy_car(&mut self, tables: &CareerTables, car_id: u16, paint_set: u8) -> Result<(), CareerError> {
+    /// **0x501CF0**, the dealership's `BUYCAR`: the price (0x4EE220) against the money, the garage
+    /// against 80, then the new car — its trim the rows chosen at the dealer — and the garage
+    /// sorted (0x4F0EE0).
+    pub fn buy_car(&mut self, tables: &CareerTables, car_id: u16, paint_set: u8, trim: Trim) -> Result<(), CareerError> {
         let car = tables.car(car_id).ok_or(CareerError::UnknownCar { id: car_id })?;
         let price = self.dealer_price(car) as i64;
         if self.money < price {
@@ -603,8 +624,26 @@ impl Career {
             return Err(CareerError::GarageFull);
         }
         self.money -= price;
-        self.garage.push(OwnedCar::new(car_id, paint_set, price as u32));
+        let mut car = OwnedCar::new(car_id, paint_set, price as u32);
+        car.trim = trim;
+        self.garage.push(car);
+        self.sort_garage(tables);
         Ok(())
+    }
+
+    /// **0x4F0EE0** — the garage's order after a purchase (0x501ED3, 0x502161) or a sale
+    /// (0x502255): for each `i`, every later `j` that 0x4EF560 puts first swaps with it. 0x4EF560
+    /// is 0x4F1D40 on the two FE cars' records (`+4`): era `+0x1B0`, then class `+0x1AC`, then
+    /// first year `+0x1F8`, each ascending. A prize car (0x502270) is appended unsorted.
+    pub fn sort_garage(&mut self, tables: &CareerTables) {
+        let key = |c: &OwnedCar| tables.car(c.car_id).map(|e| (e.era_string_id as i32, e.class_string_id as i32, e.year as i16));
+        for i in 0..self.garage.len() {
+            for j in i + 1..self.garage.len() {
+                if key(&self.garage[j]) < key(&self.garage[i]) {
+                    self.garage.swap(i, j);
+                }
+            }
+        }
     }
 
     /// Current value of garage car `idx` (`0x4F8E50`, CONFIRMED — see [`Career::value_of`]).
@@ -759,7 +798,7 @@ impl Career {
 
     /// `0x501F40`: buy market car `idx` at its asking price. The car joins the garage exactly as it
     /// stands, mileage, wins, parts and all.
-    pub fn buy_used_car(&mut self, idx: usize) -> Result<(), CareerError> {
+    pub fn buy_used_car(&mut self, tables: &CareerTables, idx: usize) -> Result<(), CareerError> {
         let car = self.market.get(idx).ok_or(CareerError::UnknownCar { id: 0 })?;
         let price = car.asking_price.unwrap_or(0) as i64;
         if self.money < price {
@@ -774,6 +813,7 @@ impl Career {
         car.asking_price = None;
         car.offer = None;
         self.garage.push(car);
+        self.sort_garage(tables);
         Ok(())
     }
 
@@ -896,11 +936,12 @@ impl Career {
     }
 
     /// `0x502190(car)`: accept the standing offer — the money is paid and the car leaves the garage.
-    pub fn accept_offer(&mut self, idx: usize) -> Result<i64, CareerError> {
+    pub fn accept_offer(&mut self, tables: &CareerTables, idx: usize) -> Result<i64, CareerError> {
         let car = self.garage.get(idx).ok_or(CareerError::UnknownCar { id: 0 })?;
         let offer = car.offer.ok_or(CareerError::NoOffer)? as i64;
         self.money = (self.money + offer).clamp(-999_999_999, 999_999_999);
         self.garage.remove(idx);
+        self.sort_garage(tables);
         Ok(offer)
     }
 
@@ -1599,6 +1640,11 @@ mod tests {
     /// 0x501FD0: an eighty-first car is refused after the money check, and nothing is spent.
     #[test]
     fn no_more_than_eighty_cars() {
+        let Ok(paths) = nfs_assets::GamePaths::locate() else {
+            eprintln!("skipping: no game data");
+            return;
+        };
+        let Ok(tables) = CareerTables::load(&paths) else { return };
         let mut c = Career::default();
         for _ in 0..MAX_OWNED_CARS {
             c.garage.push(OwnedCar::new(76, 0, 0));
@@ -1607,10 +1653,10 @@ mod tests {
         lot.asking_price = Some(1_000);
         c.market.push(lot);
         let money = c.money;
-        assert!(matches!(c.buy_used_car(0), Err(CareerError::GarageFull)));
+        assert!(matches!(c.buy_used_car(&tables, 0), Err(CareerError::GarageFull)));
         assert_eq!((c.money, c.garage.len(), c.market.len()), (money, 80, 1));
         c.money = 0;
-        assert!(matches!(c.buy_used_car(0), Err(CareerError::NoMoney { .. })), "money is checked first");
+        assert!(matches!(c.buy_used_car(&tables, 0), Err(CareerError::NoMoney { .. })), "money is checked first");
     }
 
     /// `0x4EF960`: a mean per part type, types 6 and 7 sharing one slot, over nine.
@@ -1695,7 +1741,7 @@ mod tests {
         c.tournaments.entry(4).or_default().events.push(r);
         c.forfeit(4);
         assert!(c.state(4).events.is_empty());
-        c.garage.push(OwnedCar { car_id: 76, paint_set: 0, parts: vec![], mileage: 0, wins: 0, damage_pct: 0.0, damage: [0.0; 10], part_state: Vec::new(), setup: CAR_SETUP_DEFAULT, purchase_price: 0, asking_price: Some(9_000), offer: Some(8_000) });
+        c.garage.push(OwnedCar { car_id: 76, paint_set: 0, trim: Trim::default(), parts: vec![], mileage: 0, wins: 0, damage_pct: 0.0, damage: [0.0; 10], part_state: Vec::new(), setup: CAR_SETUP_DEFAULT, purchase_price: 0, asking_price: Some(9_000), offer: Some(8_000) });
         assert_eq!(c.pending_offer(), Some(0));
         c.decline_offer(0);
         assert_eq!(c.pending_offer(), None);
@@ -1808,10 +1854,10 @@ mod tests {
         // accepting an offer pays and removes the car
         c.garage[0].offer = Some(12_345);
         let money = c.money;
-        assert_eq!(c.accept_offer(0).unwrap(), 12_345);
+        assert_eq!(c.accept_offer(&tables, 0).unwrap(), 12_345);
         assert_eq!(c.money, money + 12_345);
         assert_eq!(c.garage.len(), 1);
-        assert!(matches!(c.accept_offer(0), Err(CareerError::NoOffer)));
+        assert!(matches!(c.accept_offer(&tables, 0), Err(CareerError::NoOffer)));
     }
 
     #[test]
@@ -1835,7 +1881,7 @@ mod tests {
     #[test]
     fn save_roundtrip() {
         let mut c = Career::default();
-        c.garage.push(OwnedCar { car_id: 76, paint_set: 2, parts: vec![13], mileage: 3000, wins: 1, damage_pct: 0.0, damage: [0.0; 10], part_state: Vec::new(), setup: CAR_SETUP_DEFAULT, purchase_price: 11_000, asking_price: Some(9_000), offer: None });
+        c.garage.push(OwnedCar { car_id: 76, paint_set: 2, trim: Trim::default(), parts: vec![13], mileage: 3000, wins: 1, damage_pct: 0.0, damage: [0.0; 10], part_state: Vec::new(), setup: CAR_SETUP_DEFAULT, purchase_price: 11_000, asking_price: Some(9_000), offer: None });
         c.tournaments.insert(9, TournamentState { entered: true, ..Default::default() });
         let dir = std::env::temp_dir().join(format!("nfs-career-{}", std::process::id()));
         let path = dir.join("career.json");
@@ -1879,7 +1925,7 @@ mod tests {
         let mut c = Career::default();
         c.money = 200_000;
         let car = tables.catalog.iter().find(|c| c.price > 0).unwrap().clone();
-        c.buy_car(&tables, car.id, 0).unwrap();
+        c.buy_car(&tables, car.id, 0, Trim::default()).unwrap();
         let part = tables.parts.iter().find(|p| p.family == part_family(&car).unwrap_or_default() && p.kind == 1).cloned();
         let Some(part) = part else { return };
         c.buy_part(&tables, 0, part.id).unwrap();

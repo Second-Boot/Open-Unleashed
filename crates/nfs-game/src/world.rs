@@ -355,7 +355,7 @@ impl TrackWorld {
                 let alpha = tex.map(|t| t.1).unwrap_or(false) && m.map(|m| m.render_method != "Opaque").unwrap_or(true);
                 // the material's address modes, states 0x41 / 0x42 (`thrash.md` §7): 0 clamps
                 let clamp = m.map_or([false; 2], |m| m.address.map(|a| a == 0));
-                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp, lod_bias: m.map_or(0.0, |m| m.lod_bias) })
+                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp, lod_bias: m.map_or(0.0, |m| m.lod_bias), device_states: false })
             })
         };
         // Static world: merge every article's meshes per material into one GPU mesh each
@@ -900,6 +900,13 @@ pub struct CarModel {
     /// never moves (`car-model.md`). `R3DCarLOD::draw` picks it at 0x43C98A and turns
     /// `channel_turns[n]` into `Rx·Ry·Rz` about the part's own origin.
     body_channel: Vec<u8>,
+    /// The **draw order** key of each `body` entry — the article's `Base+70` byte. 0x43C1B0 lists
+    /// a LOD's parts as `{article, lod, Base+70}` and `std::sort`s them by that byte, signed and
+    /// ascending (0x43C35B → 0x43E710 / 0x43E910, `cmp bl, cl` on `+8`), and `R3DCarLOD::draw`
+    /// 0x43C830 walks them in that order. On the 993 the wheels are 0x0A and the wheel shadows,
+    /// the `Shadow.fsh` quads over the wheels' outer faces, 0x0B — drawn after the wheel they
+    /// darken.
+    body_key: Vec<i8>,
     /// `.tpg` `movespoilerextent` → `R3DCar+0x74` (0x441D08), in **turns**: −0.04 on the 996 and
     /// the GT3, −0.08 on the two Boxsters, and absent everywhere else.
     move_spoiler_extent: f32,
@@ -1116,6 +1123,8 @@ pub struct CarWheelModel {
     /// but not the spin, because 0x438669…0x438726 copy channels 1…4 into 18…21 with `.x` cleared
     /// (`cargo run -p nfs-formats --example rotchan`).
     pub channel: u8,
+    /// the article's `Base+70` draw-order key (see `CarModel::body_key`)
+    pub key: i8,
     pub parts: Vec<(MeshId, MaterialId, Mat4)>,
 }
 
@@ -1147,8 +1156,8 @@ pub const MODEL_TO_BODY: Mat4 = Mat4::from_cols(
 );
 
 impl CarModel {
-    pub fn upload(r: &mut Renderer, car: &CarAssets, paths: &nfs_assets::GamePaths, lod: u8, paint: [u8; 3]) -> anyhow::Result<Self> {
-        Self::upload_with_env(r, car, paths, lod, paint, None, false, None)
+    pub fn upload(r: &mut Renderer, car: &CarAssets, paths: &nfs_assets::GamePaths, lod: u8, paint: impl Into<nfs_assets::car::Paint>) -> anyhow::Result<Self> {
+        Self::upload_with_env(r, car, paths, lod, paint, None, false, None, None)
     }
 
     /// `env`: track environment map (`.env` entry, e.g. "SKY ") for `CarExtEnv` paint reflections.
@@ -1156,11 +1165,19 @@ impl CarModel {
     /// `race_roof`: in a race, the car's `.CABRIODOWN` option for slot 19's roof line
     /// ([`nfs_assets::car::CarStyle::apply_race_roof`]); `None` in the front end, whose branch
     /// (0x43B003) does not take it.
+    ///
+    /// `skidpad`: the `.tpg` entry test's `testdrive` context — `Some(Factory Driver mission)` on
+    /// `skidpad`, `None` elsewhere ([`nfs_assets::car::CarStyle::skidpad`]).
     #[allow(clippy::too_many_arguments)]
-    pub fn upload_with_env(r: &mut Renderer, car: &CarAssets, paths: &nfs_assets::GamePaths, lod: u8, paint: [u8; 3], env: Option<nfs_renderer::TextureId>, night: bool, race_roof: Option<u32>) -> anyhow::Result<Self> {
+    pub fn upload_with_env(r: &mut Renderer, car: &CarAssets, paths: &nfs_assets::GamePaths, lod: u8, paint: impl Into<nfs_assets::car::Paint>, env: Option<nfs_renderer::TextureId>, night: bool, race_roof: Option<u32>, skidpad: Option<bool>) -> anyhow::Result<Self> {
         // `[styleN]` is **1-based** and `CarAssets::style_index` is the raw 0-based `nfs5.car
         // +0x1C0`, which is what 0x437B33's `inc esi` turns into the section name.
         let mut style = nfs_assets::car::CarStyle::from_tpg(&car.tpg, car.style_index + 1);
+        // …and after the section `applyStyle` writes slot 10 (`car+0x594`) from the race number:
+        // 1 when car-info `+0x510` is 0 or more, else 0 (0x437C09…0x437C2B; the front end's
+        // 0x4D1800 does the same from the car's `DecalNum`). A car without page text is the
+        // front end's or one whose number was not read, and −1 is what both hold.
+        style.geometry.insert(10, u32::from(car.page_text.as_ref().is_some_and(|t| t.race_number >= 0)));
         // Slot 19 overlays the driver's variants onto the same array at model load — the port
         // draws at the best detail the table carries, so `slot9 = 1, slot43 = 1`.
         //
@@ -1186,6 +1203,7 @@ impl CarModel {
         // the entry test's context (0x439C60): the front-end branch is the one without a race roof
         style.front_end = race_roof.is_none();
         style.night = night;
+        style.skidpad = skidpad;
         tracing::info!(style = style.name, "car style");
         let pages = car.build_pages(paths, paint, &style)?;
         let page_tex: Vec<(nfs_renderer::TextureId, bool)> = pages
@@ -1211,7 +1229,12 @@ impl CarModel {
             // which of the three environment textures it reflects (`lighting.md` §3.1); the 0.3
             // blend stays the APPROXIMATION it was, since the pass's combine is AUDIT.md §E
             let variant = nfs_formats::crp::env_variant(m.map(|m| m.reflection).unwrap_or(0.0));
-            let mid = r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: !blend, depth_test: true, env_texture: if reflective { env } else { None }, env_mix: 0.3, env_variant: variant, blend_pair: 0, clamp: m.map_or([false; 2], |m| m.address.map(|a| a == 0)), lod_bias: m.map_or(0.0, |m| m.lod_bias) });
+            // the cull mode is the material's own `Rs` block, Thrash state 2 at `mt+272`: 1 `CCW`
+            // (the back faces), 0 none (`thrash.md` §6) — the port had culled every opaque one and
+            // none of the blended, which with depth writes on let a wheel well's outer faces cover
+            // the wheel
+            let cull = m.and_then(|m| m.rs).filter(|_| !car.front_end_room).map_or(!blend, |rs| rs[3] == 1);
+            let mid = r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: cull, depth_test: true, env_texture: if reflective { env } else { None }, env_mix: 0.3, env_variant: variant, blend_pair: 0, clamp: m.map_or([false; 2], |m| m.address.map(|a| a == 0)), lod_bias: m.map_or(0.0, |m| m.lod_bias), device_states: !car.front_end_room });
             if let Some(l) = m.and_then(|m| m.light) {
                 material_light.insert(mid, l);
             }
@@ -1226,6 +1249,7 @@ impl CarModel {
         let arts = car.crp.articles(&car.crp_data)?;
         let mut body = Vec::new();
         let mut body_channel: Vec<u8> = Vec::new();
+        let mut body_key: Vec<i8> = Vec::new();
         let mut wheels = Vec::new();
         let mut skipped = 0;
         let mut min = Vec3::splat(f32::MAX);
@@ -1344,8 +1368,10 @@ impl CarModel {
                 let pivot = MODEL_TO_BODY.transform_point3(local.w_axis.truncate());
                 half_track = half_track.max(pivot.x.abs());
                 let channel = g.base.as_ref().map(|b| b.rot_channel).unwrap_or(0);
-                wheels.push(CarWheelModel { pivot, is_front: ty == 0x0D, is_left: local.w_axis.x > 0.0, channel, parts });
+                let key = g.base.as_ref().filter(|_| !car.front_end_room).map_or(0, |b| b.tag[2] as i8);
+                wheels.push(CarWheelModel { pivot, is_front: ty == 0x0D, is_left: local.w_axis.x > 0.0, channel, key, parts });
             } else {
+                body_key.extend(std::iter::repeat_n(g.base.as_ref().filter(|_| !car.front_end_room).map_or(0, |b| b.tag[2] as i8), parts.len()));
                 body.extend(parts);
                 body_channel.extend(part_channels);
             }
@@ -1365,7 +1391,7 @@ impl CarModel {
             // the batch's state object (0x5379F0 at 0x4578AB) is set to blend 1 at 0x4578B4 and
             // handed to the batch with the uv and colour buffers (0x4578F2 → 0x4685E0): Thrash
             // 0x38 = 1, `SRCALPHA` / `ONE` — the glass adds its light (`RE/notes/thrash.md` §6)
-            let mat = r.create_material(MaterialDesc { texture: Some(tex), alpha_blend: true, cull_back: false, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 1, clamp: [false; 2], lod_bias: 0.0 });
+            let mat = r.create_material(MaterialDesc { texture: Some(tex), alpha_blend: true, cull_back: false, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 1, clamp: [false; 2], lod_bias: 0.0, device_states: false });
             // **The quad is mapped to the whole texture**, and that is traced now. The batcher's
             // three parallel buffers are positions at `acc+0x0C` (stride 0x10), **texture
             // coordinates at `acc+0x25BC` (stride 8)** and colours at `acc+0x3894` (stride 4), 201
@@ -1399,6 +1425,7 @@ impl CarModel {
             scale: 1.0,
             body,
             body_channel,
+            body_key,
             material_light,
             shadowed,
             morph,
@@ -1774,6 +1801,7 @@ impl CarModel {
     pub fn draw_items(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2]) -> Vec<DrawItem> {
         let car_to_world = car_to_world * Mat4::from_scale(Vec3::splat(self.scale));
         let mut out = Vec::with_capacity(self.body.len() + 4 * 8);
+        let mut keys: Vec<i8> = Vec::with_capacity(self.body.len() + 4 * 8);
         for (i, (mesh, material, local)) in self.body.iter().enumerate() {
             // A part bound to a rotation channel turns about **its own origin**: 0x43CA19…
             // 0x43CA38 compose Rx·Ry·Rz and 0x43CA43 multiplies that into the part's transform,
@@ -1793,6 +1821,7 @@ impl CarModel {
                 n => *local * self.channel_matrix(n),
             };
             out.push(DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * m));
+            keys.push(self.body_key.get(i).copied().unwrap_or(0));
         }
         for w in &self.wheels {
             let idx = match (w.is_front, w.is_left) {
@@ -1825,9 +1854,15 @@ impl CarModel {
                 let pivot = local.w_axis.truncate();
                 let m = Mat4::from_translation(pivot) * MODEL_TO_BODY * st * spin * MODEL_TO_BODY.inverse() * Mat4::from_translation(-pivot) * *local;
                 out.push(DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * m));
+                keys.push(w.key);
             }
         }
-        out
+        // the parts in `Base+70` order (0x43C1B0's sort). APPROXIMATION within one key: the
+        // original's `std::sort` is not stable, the port keeps the file's order there
+        let mut order: Vec<usize> = (0..out.len()).collect();
+        order.sort_by_key(|&k| keys[k]);
+        let mut slots: Vec<Option<DrawItem>> = out.into_iter().map(Some).collect();
+        order.into_iter().filter_map(|k| slots[k].take()).collect()
     }
 }
 

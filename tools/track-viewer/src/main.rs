@@ -103,7 +103,7 @@ impl Viewer {
                 let tex = m.and_then(|m| tex_ids.get(&m.texture_name()));
                 if tex.is_none() { missing += 1; }
                 let alpha = tex.map(|t| t.1).unwrap_or(false) && m.map(|m| m.render_method != "Opaque").unwrap_or(true);
-                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0 })
+                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0, device_states: false })
             })
         };
         for art in &geometry.world {
@@ -149,7 +149,7 @@ impl Viewer {
             "scene built"
         );
         let grid = r.upload_mesh(&MeshData::grid(50.0, 5.0));
-        let mat = r.create_material(MaterialDesc { texture: None, alpha_blend: false, cull_back: false, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0 });
+        let mat = r.create_material(MaterialDesc { texture: None, alpha_blend: false, cull_back: false, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0, device_states: false });
         self.scene.items.push(DrawItem::new(grid, mat, Mat4::from_translation(Vec3::new(start.x, start.y - 0.5, start.z))));
         self.camera.position = start + Vec3::new(0.0, 3.0, 12.0);
         self.camera.target = start;

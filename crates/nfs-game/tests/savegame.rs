@@ -90,6 +90,7 @@ fn career_round_trips_through_the_original_format() {
     assert_eq!(back.garage.len(), 1);
     assert_eq!(back.garage[0].car_id, owned.car_id);
     assert_eq!(back.garage[0].paint_set, owned.paint_set, "the paint set is recovered from the stored colours");
+    assert_eq!(back.garage[0].trim, owned.trim, "a bought car's rows are all 0 and come back so");
     assert_eq!(back.garage[0].parts, owned.parts);
     assert_eq!(back.garage[0].mileage, owned.mileage);
     assert_eq!(back.garage[0].wins, owned.wins);
@@ -218,11 +219,11 @@ fn the_used_car_market_fills_and_caps() {
     // buying takes the money and moves the car across untouched
     c.money = 10_000_000;
     let want = c.market[0].clone();
-    c.buy_used_car(0).unwrap();
+    c.buy_used_car(&t, 0).unwrap();
     assert_eq!(c.money, 10_000_000 - want.asking_price.unwrap() as i64);
-    assert_eq!(c.garage.last().unwrap().car_id, want.car_id);
-    assert_eq!(c.garage.last().unwrap().mileage, want.mileage);
-    assert_eq!(c.garage.last().unwrap().asking_price, None);
+    // the garage is sorted after the purchase (0x4F0EE0), so the car is found, not taken last
+    let got = c.garage.iter().find(|g| g.car_id == want.car_id && g.mileage == want.mileage && g.parts == want.parts).expect("the bought car");
+    assert_eq!(got.asking_price, None);
 }
 
 /// `nfs5.exe`'s virtual addresses mapped to file offsets, so a table the port transcribed can be
@@ -284,4 +285,40 @@ fn the_used_car_tables_match_the_image() {
     // right not to carry it — this pins that it is the one with the 1…20 / 20…40 / 40…100 bands, so
     // a future reader does not mistake it for one of the three above.
     assert_eq!(img.i32s(0x5B7B88, 16), vec![0, 5, 0, 0, 6, 20, 1, 20, 21, 80, 20, 40, 81, 100, 40, 100]);
+}
+
+/// The paint shop's rows — interior, stripes, package — go out as the colours they hold
+/// (`FECar+0x678…+0x684`, `savegame.md` §4.7a) and come back as the same rows.
+#[test]
+fn paint_shop_trim_round_trips() {
+    let Some(t) = tables() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    // a car whose rows are told apart by their colours: distinct stripe-1 colours on sets 0 and
+    // 1, distinct stripe-2 colours on sets 0 and 2, and two distinct interiors
+    let e = t
+        .catalog
+        .iter()
+        .find(|c| {
+            c.paint_sets.len() >= 3
+                && c.paint_sets[1].packed[1] != c.paint_sets[0].packed[1]
+                && c.paint_sets[2].packed[2] != c.paint_sets[0].packed[2]
+                && c.paint_sets[2].packed[2] != c.paint_sets[1].packed[2]
+                && c.interior_colours.len() >= 2
+                && c.interior_colours[1] != c.interior_colours[0]
+        })
+        .expect("a car with distinguishable rows");
+    let mut c = Career::default();
+    let mut owned = OwnedCar::new(e.id, 0, 0);
+    owned.trim = nfs_game::career::Trim { interior: 1, stripe1: 1, stripe2: 2, package: 3 };
+    c.garage.push(owned.clone());
+    let parsed = SaveFile::parse(&career_to_sav(&c, &t, &Profile::new("Hans", 0)).write()).unwrap();
+    let img = &parsed.player.as_ref().unwrap().cars[0];
+    let f = |o: usize| u32::from_le_bytes([img.image[o], img.image[o + 1], img.image[o + 2], img.image[o + 3]]);
+    assert_eq!(f(car::S1_COLOUR), e.paint_sets[1].packed[1]);
+    assert_eq!(f(car::S2_COLOUR), e.paint_sets[2].packed[2]);
+    assert_eq!(f(car::PACKAGE_NUM), 3);
+    assert_eq!(f(car::DECAL_NUM), u32::MAX, "decal −1, 0x502710");
+    assert_eq!(career_from_sav(&parsed, &t).garage[0].trim, owned.trim);
 }

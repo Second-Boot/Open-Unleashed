@@ -45,6 +45,12 @@ pub struct Font {
     pub atlas: Vec<u8>,
     /// max glyph height
     pub line_height: u8,
+    /// The header dword at `+0xC`. Bit 2 selects the three-colour palette (0x594980 → 0x594B50),
+    /// bit 4 the four-colour one (0x594C30); `(flags >> 16) & 3` the glyph lookup (0x53C736).
+    pub flags: u32,
+    /// The signed bytes at `+0x10` / `+0x11`: the pen's start, `font+4` / `font+8` (0x53C6FC), added
+    /// to the draw position before the first glyph (0x53DAEB…0x53DB06).
+    pub origin: [i8; 2],
 }
 
 impl Font {
@@ -70,7 +76,9 @@ impl Font {
         let n = atlas_width as usize * atlas_height as usize / 2;
         let atlas = data.get(atlas_off + 16..atlas_off + 16 + n).ok_or(FormatError::Truncated { what: "FNTF atlas pixels", offset: atlas_off + 16, needed: n })?.to_vec();
         let line_height = glyphs.iter().map(|g| g.height).max().unwrap_or(0);
-        Ok(Self { glyphs, atlas_width, atlas_height, atlas, line_height })
+        let flags = u32_le(data, 12, "FNTF flags")?;
+        let origin = [*data.get(16).unwrap_or(&0) as i8, *data.get(17).unwrap_or(&0) as i8];
+        Ok(Self { glyphs, atlas_width, atlas_height, atlas, line_height, flags, origin })
     }
 
     pub fn glyph(&self, ch: char) -> Option<&Glyph> {

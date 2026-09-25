@@ -900,11 +900,26 @@ impl Police {
             if !self.cars[i].active {
                 continue;
             }
-            // §17.5 give-up: too far, too long unable to reach the target's lane, or the race is over
+            // §17.5 give-up: too far or the race is over
             let d = crate::traffic::oct_distance(self.cars[i].position, target.position);
-            if d > GIVE_UP_DISTANCE || self.cars[i].stuck_ticks > STUCK_LIMIT || target.finished {
+            if d > GIVE_UP_DISTANCE || target.finished {
                 self.retire(i);
                 continue;
+            }
+            // too long unable to reach the target's lane (`chase+0x90 > 160`): the original does
+            // **not** drop the cop. State 4 builds an `AIState_GotoSlice` to the cop's own current
+            // slice `[[car+0xED4]+8]` and goes to state 9 (0x4044FC…0x404548); state 9 pops back to
+            // state 2 once `0x40E330(state, 10.0)` holds — the signed track gap to that slice under
+            // 10 m, true at once — and state 2 acquires the target and builds a fresh `AIState_Chase`
+            // (→ state 4), whose constructor starts the stuck timer, the boost budget and the
+            // blackout deadline over. The port retired the cop here until 2026-09-25. APPROXIMATION:
+            // the one GotoSlice update in between is not driven.
+            if self.cars[i].stuck_ticks > STUCK_LIMIT {
+                let c = &mut self.cars[i];
+                c.stuck_ticks = 0;
+                c.boost_budget = [0x200, 0x300, 0x480][c.level.min(2)];
+                c.blackout_until = tick;
+                tracing::debug!(cop = i, "police chase restarted after 160 stuck ticks");
             }
             // A cop that spawned while the perp was clean patrols (§17.4 states 2/3): it drives the
             // road like traffic does and never runs the chase. The original moves it to state 4 on

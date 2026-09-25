@@ -22,7 +22,7 @@ mod netplay;
 use anyhow::Result;
 use career_ui::{CareerOpponent, CareerUi};
 use glam::{Mat4, Quat, Vec3};
-use nfs_assets::{GamePaths, car::CarAssets, track::TrackAssets};
+use nfs_assets::{GamePaths, car::{CarAssets, Paint}, track::TrackAssets};
 use nfs_game::layout::{ListCell, ListRow, TrackMapEvent};
 use nfs_game::{
     lanes::{LaneCar, lane_of, lane_span},
@@ -2091,6 +2091,49 @@ impl App {
         c.career.market.iter().chain(c.career.garage.iter().filter(|o| o.asking_price.is_some())).collect()
     }
 
+    /// Race slot `slot`'s car-info `.LICENSE` (`+0x1C0`) and `.RACENUMBER` (`+0x510`) — `fe.txt`'s
+    /// `car[n].license` / `car[n].racenumber` (registry ids 0x13C / 0x24D, `replay.md` §16), which
+    /// the page builder writes into the plate and the race-number patch (0x444880,
+    /// `car-model.md` §5.3). A slot without the keys has an empty licence and number 0, the
+    /// cleared record's (APPROXIMATION: what the race set-up leaves there was not read).
+    fn page_text(&self, slot: usize) -> nfs_assets::car::PageText {
+        nfs_assets::car::PageText {
+            license: self.registry.get(&format!("car[{slot}].license")).unwrap_or_default().to_string(),
+            race_number: self.registry.get(&format!("car[{slot}].racenumber")).and_then(|v| v.parse().ok()).unwrap_or(0),
+        }
+    }
+
+    /// The garage's selected car and its catalogue record — what every `OwnedCar.*` accessor reads.
+    fn garage_car(&self) -> Option<(&nfs_formats::fedata::CarCatalogEntry, &nfs_game::career::OwnedCar)> {
+        let c = self.career.as_ref()?;
+        let o = c.career.garage.get(c.car_sel.min(c.career.garage.len().saturating_sub(1)))?;
+        Some((c.tables.car(o.car_id)?, o))
+    }
+
+    /// `DealerCar.Car`'s list `[0x691A00]`, filled by 0x4F4000…0x4F4294: every catalogue record the
+    /// dealer offers this year (`Career::dealer_lists`), then 0x4F0F50's exchange sort — for each
+    /// `i`, every later `j` that 0x4F1D40 puts first swaps with it — on era `+0x1B0`, then class
+    /// `+0x1AC`, then first year `+0x1F8`, each ascending. Outside a career, `None`.
+    fn dealer_cars(&self) -> Option<Vec<&nfs_formats::fedata::CarCatalogEntry>> {
+        let c = self.career.as_ref()?;
+        let mut v: Vec<&nfs_formats::fedata::CarCatalogEntry> = c.tables.catalog.iter().filter(|e| c.career.dealer_lists(e)).collect();
+        let key = |e: &nfs_formats::fedata::CarCatalogEntry| (e.era_string_id as i32, e.class_string_id as i32, e.year as i16);
+        for i in 0..v.len() {
+            for j in i + 1..v.len() {
+                if key(v[j]) < key(v[i]) {
+                    v.swap(i, j);
+                }
+            }
+        }
+        Some(v)
+    }
+
+    /// The dealership's selected car, when a career has a dealer list.
+    fn dealer_car(&self) -> Option<&nfs_formats::fedata::CarCatalogEntry> {
+        let v = self.dealer_cars()?;
+        v.get(self.fe.dealer.car.min(v.len().saturating_sub(1))).copied()
+    }
+
     /// The car the used-car screens are on — `UsedCar.Car`'s current row.
     fn used_car(&self) -> Option<&nfs_game::career::OwnedCar> {
         let all = self.used_cars();
@@ -2219,6 +2262,10 @@ impl App {
                 let at = self.garage_rows(&mut rows, modifier == "SHORT", c.car_sel.min(c.career.garage.len().saturating_sub(1)));
                 Some((rows, at))
             }
+            "DealerCar.Car" if let Some(v) = self.dealer_cars() => {
+                let rows = v.iter().map(|c| ListRow::Text(if modifier == "SHORT" { c.family.to_uppercase() } else { c.display_name.to_uppercase() })).collect();
+                Some((rows, Some(self.fe.dealer.car.min(v.len().saturating_sub(1)))))
+            }
             "PrizeCars.Car"
             | "DealerCar.Car" | "GenericCar.Car" | "CARSETTINGS.CAR" | "GenericCar2.Car" => {
                 let rows = m
@@ -2236,6 +2283,23 @@ impl App {
             }
             // a paint combo counts the selected car's own sets from 1, which is what its caption
             // shows (`m.paint_idx + 1`)
+            "DealerCar.Colour" | "DealerCar.IntColour" if let Some(e) = self.dealer_car() => {
+                let (n, at) = if base == "DealerCar.Colour" { (e.paint_sets.len(), self.fe.dealer.paint) } else { (e.interior_colours.len(), self.fe.dealer.interior) };
+                num(1, n.max(1) as i64, at as i64 + 1)
+            }
+            // the paint shop's four lists are the garage car's (`savegame.md` §4.7a): the paint
+            // sets for the exterior and both stripes, the interior list for the interior
+            "OwnedCar.ExtColour" | "OwnedCar.IntColour" | "OwnedCar.S1Colour" | "OwnedCar.S2Colour"
+                if let Some((e, o)) = self.garage_car() =>
+            {
+                let (n, at) = match base {
+                    "OwnedCar.ExtColour" => (e.paint_sets.len(), o.paint_set),
+                    "OwnedCar.IntColour" => (e.interior_colours.len(), o.trim.interior),
+                    "OwnedCar.S1Colour" => (e.paint_sets.len(), o.trim.stripe1),
+                    _ => (e.paint_sets.len(), o.trim.stripe2),
+                };
+                num(1, n.max(1) as i64, at as i64 + 1)
+            }
             "OwnedCar.ExtColour" | "OwnedCar.IntColour" | "OwnedCar.S1Colour" | "OwnedCar.S2Colour"
             | "GenericCar.Colour" | "DealerCar.Colour" | "DealerCar.IntColour" => {
                 let n = m.cars.get(m.car_idx).map(|c| c.paint_sets.len()).unwrap_or(0).max(1) as i64;
@@ -2344,6 +2408,12 @@ impl App {
 
     fn choice_index(&self, name: &str) -> Option<(usize, &'static [u32])> {
         let (_, key, options) = CHOICE_ACCESSORS.iter().find(|(n, _, _)| *n == name)?;
+        // `OwnedCar.PackageNum` shows the garage car's `FECar+0x684` (slot 33, 0x4F6F50)
+        if name == "OwnedCar.PackageNum"
+            && let Some((_, o)) = self.garage_car()
+        {
+            return Some(((o.trim.package as usize).min(options.len() - 1), options));
+        }
         let v = match self.choices.get(Self::choice_slot(name, key)) {
             Some(v) => *v,
             // a Display option `fe.txt` does not carry keeps its `nfs5-2.hud` Config 1 default
@@ -2361,6 +2431,15 @@ impl App {
     fn choice_slot<'a>(name: &'a str, key: &'a str) -> &'a str {
         if key.is_empty() { name } else { key }
     }
+}
+
+/// The dealership's current car, paint set and interior rows (`DealerCar.Car`, `.Colour`,
+/// `.IntColour`). A change of car puts both colour rows back to 0 (0x4F30A4…0x4F3110).
+#[derive(Debug, Clone, Copy, Default)]
+struct DealerSel {
+    car: usize,
+    paint: usize,
+    interior: usize,
 }
 
 /// The repair screens' per-category condition accessors and the `nfs5.prt` category (`part+0x26`)
@@ -2974,6 +3053,9 @@ struct App {
     dials: Option<(nfs_formats::fedata::DialSpec, nfs_formats::fedata::DialSpec, nfs_formats::fedata::DialSpec)>,
     /// player body paint (catalogue set 0 by default)
     paint: [u8; 3],
+    /// the garage car's full appearance when a career race set `paint` from one — used while
+    /// `paint` still equals its exterior
+    owned_paint: Option<Paint>,
     /// everything that makes a sound — see [`AudioState`]
     snd: AudioState,
     /// `.sim` name — also the name of the car's `.spl` engine-audio parameters
@@ -2991,11 +3073,23 @@ struct App {
 /// player's engine, the AI and traffic engine loops, the collision and squeal sounds, the
 /// ambience, the reverb, music and speech — with the settings they are mixed by. Split out of
 /// `App` on 2026-09-21; every field kept its name, so `self.x` became `self.snd.x`.
+/// A car the audio slots can hold — the non-player cars of a race.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioCar {
+    Opponent(usize),
+    Traffic(usize),
+    Police(usize),
+}
+
 struct AudioState {
     audio: Option<nfs_audio::AudioOutput>,
     engine_sound: Option<nfs_audio::engine::EngineSound>,
     sfx: Option<nfs_audio::sfx::CollisionSfx>,
     ai_engines: Option<nfs_audio::ai_engine::AiEngines>,
+    /// the audio car slots `0x655D60` (`nfs_audio::slots`)
+    slots: nfs_audio::slots::AudioSlots<AudioCar>,
+    /// `[0x655F34]`, the crowding factor 0x4A8199 works out over the slots' cars
+    crowding: u8,
     ambience: Option<nfs_audio::ambience::Ambience>,
     /// tunnel reverb level (`engine-audio.md` §4.7)
     reverb: nfs_audio::reverb::Reverb,
@@ -3044,6 +3138,10 @@ struct RoadCars {
     /// police: the spawn manager, the cop cars and their models (`traffic.md` §17, §25, §27)
     police: Option<nfs_game::police::Police>,
     police_models: Vec<CarModel>,
+    /// per cop car: its catalogue engine sound set and its own `.sim`'s specs (§17.1), for the
+    /// engine it sounds from an audio slot (0x4A7080, as any car)
+    police_sets: Vec<String>,
+    police_specs: Vec<CarSpecs>,
     police_prev: Vec<(Vec3, Quat)>,
     police_bodies: Vec<Vehicle>,
     /// whether the race was set up with police at all (`COPS`)
@@ -3124,7 +3222,7 @@ struct FrontEnd {
     /// the reload key — see `fe_room_models`.
     cars: Vec<(usize, String, i16, [u8; 3], CarModel)>,
     /// what `cars` was loaded for, with each car's style overlay (the widget's 0x4C0340…0x4C0486)
-    cars_key: Vec<(usize, String, i16, [u8; 3], Vec<[i16; 3]>)>,
+    cars_key: Vec<(usize, String, i16, Paint, Vec<[i16; 3]>)>,
     /// milliseconds the front end has been up, for the turntable
     ms: u64,
     /// `--layout <name>`: draw a `FEData/Layouts/<name>.lay` screen instead of the menu
@@ -3162,6 +3260,12 @@ struct FrontEnd {
     usedcars_showparts: bool,
     /// Which market car `UsedCar.Car` is on — the used-car list's current row.
     usedcar_sel: usize,
+    /// The dealership's `DealerCar.Car` / `.Colour` / `.IntColour` rows in a career — its own
+    /// list (`fn dealer_cars`), not the quick race's catalogue index.
+    dealer: DealerSel,
+    /// `[0x699FE0]` is `DealerCar.Car` — the showcase / compare screen was opened by
+    /// `SHOWCASE.DEALERCAR` (0x50DB20) rather than `CARCOMPARE.MERGEDCAR` (0x50DCC0)
+    compare_dealer: bool,
     /// Which row of `Parts.AllParts` the player has clicked — the accessor's own current index in
     /// the original, which its refresh reads back through `slot27` (§4.114).
     parts_sel: Option<usize>,
@@ -3446,7 +3550,9 @@ impl App {
     /// is.
     fn compare_cars(&self) -> Option<(&nfs_formats::fedata::CarCatalogEntry, &nfs_formats::fedata::CarCatalogEntry)> {
         let m = self.fe.menu.as_ref()?;
-        Some((m.cars.get(m.car_idx)?, m.cars.get(m.car2_idx)?))
+        // opened from the dealership, the left car is `DealerCar.Car`'s — in a career its own list
+        let left = if self.fe.compare_dealer { self.dealer_car().or(m.cars.get(m.car_idx))? } else { m.cars.get(m.car_idx)? };
+        Some((left, m.cars.get(m.car2_idx)?))
     }
 
     /// One bar or number of the car-compare screen. The source name is `<n>CarCompareCar<m>`:
@@ -3703,6 +3809,8 @@ impl App {
                 let c = self.career.as_ref()?;
                 c.tables.car(self.used_car()?.car_id)
             }
+            // in a career the dealership has its own list (`fn dealer_cars`)
+            "DealerCar.Car" if self.career.is_some() => self.dealer_car(),
             // the same list the port's other car accessors answer from
             "zMergedList.Car" | "OpponentCar.Car" | "PrizeCars.Car"
             | "DealerCar.Car" | "GenericCar.Car" | "CARSETTINGS.CAR" => {
@@ -5769,12 +5877,14 @@ impl App {
                 self.snd.crash_played = false;
             }
             v.crash_sound = false;
-            // the skid marks, per wheel of every racer (0x4A2880 from the 64 Hz position step
-            // 0x49B84F; traffic, `car+0x52C & 0x80`, lays none). The emitter 0x478F30 is gated by
+            // the skid marks, per wheel (0x4A2880 from the 64 Hz position step 0x49B84F, which
+            // skips only the smackables, `car+0x52C & 0x80` — the traffic and the cops run it too,
+            // `ai.md` §6 corrected 2026-09-25). The emitter 0x478F30 is gated by
             // `byte [0x6197E7]`, which 0x44ED10 sets only when `SPECIALFX` is 2 or 3 (0x44EE93,
             // 0x44EEDC; `fe.txt` ships 3) — `fx_marks`, above. The point is `wheel+0x40`, the ground
             // contact `(probe.x, h_i, probe.z)` (`suspension-collision.md` §2) — the port's hub
-            // position less its ride height. APPROXIMATION: the police cars' wheels are not fed
+            // position less its ride height. APPROXIMATION: the traffic's and the police cars' wheels
+            // are not fed — the port's are kinematic, with no slip to feed
             if fx_marks {
                 let feed = |skid: &mut nfs_game::skidmarks::SkidMarks, base: usize, car: &nfs_physics::vehicle::Vehicle, tyre_mm: f32| {
                     let dir = car.velocity.normalize_or_zero();
@@ -6902,12 +7012,45 @@ impl App {
             sp.update(a);
         }
         let mirror = self.mirror;
-        // AI engine loops (`engine-audio.md` §5): two crossfaded samples plus a road loop per opponent.
-        // Traffic cars are left silent: the original drives their loops from `car+0xDB4`, and the port's
-        // kinematic traffic has no engine speed to drive them with.
-        let crowding = crowding_factor(self.camera.position, &self.road.opponents);
+        // **The audio car slots** (0x4A7DC0, `nfs_audio::slots`): only the nearest
+        // `{4, 2, 1}[AUDIOQUALITY]` cars inside 300 m of the listener are heard — their engines,
+        // horns and sirens all run on the slot's voices (engine `slot + 6`, 0x4A7080) — and a car
+        // keeps its slot while it stays among them. The port had given every opponent and every
+        // traffic car its own engine voices, and each cop a siren by its index in the police list.
+        // APPROXIMATION: the car list's own order (`0x5E8B34`), which only breaks exact ties, is
+        // taken as the opponents, then the traffic, then the cops.
+        let cam = self.camera.position;
+        let count = nfs_audio::slots::slot_count(self.snd.audio_settings.audio_quality);
+        let mut cars: Vec<(AudioCar, f32)> = Vec::new();
+        for (i, o) in self.road.opponents.iter().enumerate() {
+            cars.push((AudioCar::Opponent(i), (o.vehicle.position - cam).length()));
+        }
+        if let Some(tr) = &self.road.traffic {
+            for (i, c) in tr.cars.iter().enumerate().filter(|(_, c)| c.active) {
+                cars.push((AudioCar::Traffic(i), (c.position - cam).length()));
+            }
+        }
+        if let Some(pol) = &self.road.police {
+            for (i, c) in pol.cars.iter().enumerate().filter(|(_, c)| c.active) {
+                cars.push((AudioCar::Police(i), (c.position - cam).length()));
+            }
+        }
+        let released = self.snd.slots.update(count, cars.iter().copied());
+        if let Some(a) = &self.snd.audio {
+            for (slot, _) in &released {
+                if let Some(ai) = self.snd.ai_engines.as_mut() {
+                    ai.stop(a, *slot);
+                }
+                if let Some(s) = self.snd.sfx.as_mut() {
+                    s.siren(a, *slot, false, 0.0, 0.0, 0);
+                }
+            }
+        }
+        // the crowding factor over the slot table's cars (0x4A8199)
+        let held: Vec<(usize, AudioCar)> = self.snd.slots.held().collect();
+        let crowding = crowding_factor(held.iter().filter_map(|(_, k)| cars.iter().find(|c| c.0 == *k).map(|c| c.1)));
+        self.snd.crowding = crowding;
         if let (Some(a), Some(ai)) = (&self.snd.audio, self.snd.ai_engines.as_mut()) {
-            let cam = self.camera.position;
             // `MIRROR` negates the pan angle before the atan2 that produces it (0x4A704D, 0x4A78C1
             // and the other four sites of `modes.md` §2.1), so flip the right vector with the world
             let cam_right = (self.camera.target - cam)
@@ -6915,117 +7058,147 @@ impl App {
                 .cross(Vec3::Y)
                 .normalize_or_zero()
                 * if mirror { -1.0 } else { 1.0 };
-            for (i, o) in self.road.opponents.iter().enumerate() {
-                let set = self.road.opponent_sets.get(i).cloned().unwrap_or_default();
-                if set.is_empty() {
-                    continue;
-                }
-                let rel = o.vehicle.position - cam;
-                let d = rel.length();
-                let (cos, pan) = if d > 0.1 {
-                    ((rel / d).dot(o.vehicle.forward()), (rel / d).dot(cam_right))
-                } else {
-                    (0.0, 0.0)
-                };
-                let frac = if o.specs.redline > 0.0 {
-                    o.vehicle.rpm / o.specs.redline
-                } else {
-                    0.0
-                };
-                ai.update(
-                    a,
-                    i,
-                    &set,
-                    frac,
-                    d,
-                    cos,
-                    pan,
-                    o.vehicle.v_long(),
-                    1.0,
-                    self.snd.audio_settings.audio_quality,
-                    crowding,
-                    view == 0x0B,
-                    self.snd.audio_settings.engine_level,
-                    self.snd.audio_settings.ambient_level,
-                );
-            }
-            // traffic uses the same cheap path. Its engine speed is real: `0x408360` computes
-            // `car+0xDB4 = carSpecs[0x60 + 4·gear] · speed` at 0x4084AD with the gear from
-            // `Traffic_pickGear` 0x408130 — 1 below 2 m/s, otherwise 0 while the car has not been hit
-            // (`car+0x104C == −1`), and the highest gear whose top speed is under the current speed
-            // while it is recovering from one.
-            if let (Some(tr), Some(specs)) = (&self.road.traffic, &self.road.traffic_specs) {
-                let base = self.road.opponents.len();
-                for (i, c) in tr.cars.iter().enumerate() {
-                    let set = self.road.traffic_sets.get(i).cloned().unwrap_or_default();
-                    if !c.active || set.is_empty() {
-                        ai.stop(a, base + i);
-                        continue;
+            for &(slot, key) in &held {
+                match key {
+                    // AI engine loops (`engine-audio.md` §5): two crossfaded samples plus a road loop
+                    AudioCar::Opponent(i) => {
+                        let Some(o) = self.road.opponents.get(i) else { continue };
+                        let set = self.road.opponent_sets.get(i).cloned().unwrap_or_default();
+                        if set.is_empty() {
+                            continue;
+                        }
+                        let rel = o.vehicle.position - cam;
+                        let d = rel.length();
+                        let (cos, pan) = if d > 0.1 {
+                            ((rel / d).dot(o.vehicle.forward()), (rel / d).dot(cam_right))
+                        } else {
+                            (0.0, 0.0)
+                        };
+                        let frac = if o.specs.redline > 0.0 {
+                            o.vehicle.rpm / o.specs.redline
+                        } else {
+                            0.0
+                        };
+                        ai.update(
+                            a,
+                            slot,
+                            &set,
+                            frac,
+                            d,
+                            cos,
+                            pan,
+                            o.vehicle.v_long(),
+                            1.0,
+                            self.snd.audio_settings.audio_quality,
+                            crowding,
+                            view == 0x0B,
+                            self.snd.audio_settings.engine_level,
+                            self.snd.audio_settings.ambient_level,
+                        );
                     }
-                    let rel = c.position - cam;
-                    let d = rel.length();
-                    let (cos, pan) = if d > 0.1 {
-                        (
-                            (rel / d).dot(c.orientation.row(2) * c.dir),
-                            (rel / d).dot(cam_right),
-                        )
-                    } else {
-                        (0.0, 0.0)
-                    };
-                    let gear = if c.speed < 2.0 { 1 } else { 0 };
-                    let rpm = specs.ratio_rpm_per_mps.get(gear).copied().unwrap_or(0.0) * c.speed;
-                    let frac = if specs.redline > 0.0 {
-                        rpm / specs.redline
-                    } else {
-                        0.0
-                    };
-                    ai.update(
-                        a,
-                        base + i,
-                        &set,
-                        frac,
-                        d,
-                        cos,
-                        pan,
-                        c.speed,
-                        1.0,
-                        self.snd.audio_settings.audio_quality,
-                        crowding,
-                        view == 0x0B,
-                        self.snd.audio_settings.engine_level,
-                        self.snd.audio_settings.ambient_level,
-                    );
-                    // `traffic.md` §12.3: a car whose `scripts.bin` HONK_HORN action is running
-                    // sounds its horn (`Honk(car, 1)` on mask 8). Traffic runs personality row 0,
-                    // whose collision script is `HONK_HORN(2) END HONK_HORN(2) END` — so a car the
-                    // player runs into leans on the horn.
-                    let honking = c
-                        .script
-                        .query(nfs_formats::scripts::mask::HONK_HORN)
-                        .is_some()
-                        || c.script
-                            .query(nfs_formats::scripts::mask::CRAZY_HORN)
-                            .is_some();
-                    ai.honk(a, base + i, honking, d, pan, self.snd.audio_settings.ambient_level);
+                    // traffic uses the same cheap path. Its engine speed is real: `0x408360`
+                    // computes `car+0xDB4 = carSpecs[0x60 + 4·gear] · speed` at 0x4084AD with the
+                    // gear from `Traffic_pickGear` 0x408130 — 1 below 2 m/s, otherwise 0 while the
+                    // car has not been hit (`car+0x104C == −1`), and the highest gear whose top
+                    // speed is under the current speed while it is recovering from one.
+                    AudioCar::Traffic(i) => {
+                        let (Some(tr), Some(specs)) = (&self.road.traffic, &self.road.traffic_specs) else { continue };
+                        let Some(c) = tr.cars.get(i) else { continue };
+                        let set = self.road.traffic_sets.get(i).cloned().unwrap_or_default();
+                        if set.is_empty() {
+                            continue;
+                        }
+                        let rel = c.position - cam;
+                        let d = rel.length();
+                        let (cos, pan) = if d > 0.1 {
+                            ((rel / d).dot(c.orientation.row(2) * c.dir), (rel / d).dot(cam_right))
+                        } else {
+                            (0.0, 0.0)
+                        };
+                        let gear = if c.speed < 2.0 { 1 } else { 0 };
+                        let rpm = specs.ratio_rpm_per_mps.get(gear).copied().unwrap_or(0.0) * c.speed;
+                        let frac = if specs.redline > 0.0 {
+                            rpm / specs.redline
+                        } else {
+                            0.0
+                        };
+                        ai.update(
+                            a,
+                            slot,
+                            &set,
+                            frac,
+                            d,
+                            cos,
+                            pan,
+                            c.speed,
+                            1.0,
+                            self.snd.audio_settings.audio_quality,
+                            crowding,
+                            view == 0x0B,
+                            self.snd.audio_settings.engine_level,
+                            self.snd.audio_settings.ambient_level,
+                        );
+                        // `traffic.md` §12.3: a car whose `scripts.bin` HONK_HORN action is running
+                        // sounds its horn (`Honk(car, 1)` on mask 8). Traffic runs personality row
+                        // 0, whose collision script is `HONK_HORN(2) END HONK_HORN(2) END` — so a
+                        // car the player runs into leans on the horn.
+                        let honking = c.script.query(nfs_formats::scripts::mask::HONK_HORN).is_some()
+                            || c.script.query(nfs_formats::scripts::mask::CRAZY_HORN).is_some();
+                        ai.honk(a, slot, honking, d, pan, self.snd.audio_settings.ambient_level);
+                    }
+                    // a cop is an AI car like the traffic (`AIHigh_Cop`): its engine speed is 0x408360's
+                    // `carSpecs[0x60 + 4·gear] · speed` with 0x408130's gear, off its own `.sim`
+                    AudioCar::Police(i) => {
+                        let Some(c) = self.road.police.as_ref().and_then(|p| p.cars.get(i)) else { continue };
+                        let (Some(set), Some(specs)) = (self.road.police_sets.get(i), self.road.police_specs.get(i)) else { continue };
+                        if set.is_empty() {
+                            continue;
+                        }
+                        let rel = c.position - cam;
+                        let d = rel.length();
+                        let (cos, pan) = if d > 0.1 {
+                            ((rel / d).dot(c.orientation.row(2) * c.dir), (rel / d).dot(cam_right))
+                        } else {
+                            (0.0, 0.0)
+                        };
+                        let gear = if c.speed < 2.0 { 1 } else { 0 };
+                        let rpm = specs.ratio_rpm_per_mps.get(gear).copied().unwrap_or(0.0) * c.speed;
+                        let frac = if specs.redline > 0.0 { rpm / specs.redline } else { 0.0 };
+                        ai.update(
+                            a,
+                            slot,
+                            set,
+                            frac,
+                            d,
+                            cos,
+                            pan,
+                            c.speed,
+                            1.0,
+                            self.snd.audio_settings.audio_quality,
+                            crowding,
+                            view == 0x0B,
+                            self.snd.audio_settings.engine_level,
+                            self.snd.audio_settings.ambient_level,
+                        );
+                    }
                 }
             }
         }
         // the police sirens (`sfx.md` §6): a cop with its lights on sounds SND_coll 6 / 8 by its
-        // audio slot's parity, full on top of the listener and silent from 70 m. APPROXIMATION: the
-        // port keeps no audio car-slot table (0x655D60), so a cop's slot is its index in the police
-        // list — which sample a cop plays and how many can sound at once follow from that
+        // audio slot's parity, full on top of the listener and silent from 70 m
         if let (Some(a), Some(s), Some(pol)) = (&self.snd.audio, self.snd.sfx.as_mut(), self.road.police.as_ref()) {
-            let cam = self.camera.position;
             let cam_right = (self.camera.target - cam)
                 .normalize_or_zero()
                 .cross(Vec3::Y)
                 .normalize_or_zero()
                 * if mirror { -1.0 } else { 1.0 };
-            for (i, c) in pol.cars.iter().enumerate() {
+            for &(slot, key) in &held {
+                let AudioCar::Police(i) = key else { continue };
+                let Some(c) = pol.cars.get(i) else { continue };
                 let rel = c.position - cam;
                 let d = rel.length();
                 let pan = if d > 0.1 { (rel / d).dot(cam_right) } else { 0.0 };
-                s.siren(a, i, c.active && c.lights, d, pan, self.snd.audio_settings.ambient_level);
+                s.siren(a, slot, c.active && c.lights, d, pan, self.snd.audio_settings.ambient_level);
             }
         }
         // track ambience: a quarter of the elements per update (0x4AEF30)
@@ -7098,7 +7271,7 @@ impl App {
                     // after the road and turbo layers have taken theirs
                     doppler: if self.cheat_bits & (1 << 1) != 0 { 2.0 } else { 1.0 },
                     detail: self.snd.audio_settings.audio_quality,
-                    crowding: crowding_factor(self.camera.position, &self.road.opponents),
+                    crowding: self.snd.crowding,
                     engine_level: self.snd.audio_settings.engine_level,
                     // §4.3's dip runs while the shift timer is up, `car+0xD82 > car+0xD81` (an
                     // upshift) **and `car+0xD81 != 1`** — out of neutral it does not dip at all
@@ -7298,13 +7471,13 @@ impl App {
             .as_ref()
             .map(|l| l.car_3d())
             .unwrap_or_default();
-        let mut wanted: Vec<(usize, String, i16, Vec<[i16; 3]>)> = Vec::new();
+        let mut wanted: Vec<(usize, String, i16, Vec<[i16; 3]>, Paint)> = Vec::new();
         for w in &widgets {
             let model = self
                 .logo_car(w.accessor.as_deref(), w.othersource.as_deref())
-                .map(|c| (c.model.clone(), c.variant, self.fe_car_swaps(w.accessor.as_deref(), c)))
-                .or_else(|| fallback.clone().map(|(m, v)| (m, v, Vec::new())));
-            if let Some((model, variant, swaps)) = model {
+                .map(|c| (c.model.clone(), c.variant, self.fe_car_swaps(w.accessor.as_deref(), c), self.fe_car_paint(w.accessor.as_deref(), c)))
+                .or_else(|| fallback.clone().map(|(m, v)| (m, v, Vec::new(), self.paint.into())));
+            if let Some((model, variant, swaps, paint)) = model {
                 wanted.push((
                     if w.position_type == 0 {
                         usize::MAX
@@ -7314,6 +7487,7 @@ impl App {
                     model,
                     variant,
                     swaps,
+                    paint,
                 ));
             }
         }
@@ -7323,7 +7497,7 @@ impl App {
             && !room.models.is_empty()
             && let Some((model, variant)) = fallback
         {
-            wanted.push((usize::MAX, model, variant, Vec::new()));
+            wanted.push((usize::MAX, model, variant, Vec::new(), self.paint.into()));
         }
         if self
             .fe.room
@@ -7338,6 +7512,10 @@ impl App {
                     return;
                 };
                 let loaded = nfs_assets::car::CarAssets::load_in(&dir, name)
+                    .map(|mut a| {
+                        a.front_end_room = true;
+                        a
+                    })
                     .map_err(anyhow::Error::from)
                     .and_then(|a| CarModel::upload(r, &a, &self.paths, 1, [0xC0, 0xC0, 0xC0]));
                 match loaded {
@@ -7359,12 +7537,11 @@ impl App {
         // file for twelve cars and twelve styles, `964` one for eight. Keyed on the file alone,
         // stepping through a family never reloaded, so the showroom kept the first car's body
         // and paint while the name under it changed. Found in play, 2026-09-21.
-        let paint = self.paint;
-        let key: Vec<(usize, String, i16, [u8; 3], Vec<[i16; 3]>)> = wanted.iter().map(|(i, n, v, sw)| (*i, n.clone(), *v, paint, sw.clone())).collect();
+        let key: Vec<(usize, String, i16, Paint, Vec<[i16; 3]>)> = wanted.iter().map(|(i, n, v, sw, p)| (*i, n.clone(), *v, *p, sw.clone())).collect();
         if self.fe.cars_key != key || self.fe.cars.len() != key.len() {
             self.fe.cars.clear();
             self.fe.cars_key = key;
-            for (slot, model, variant, swaps) in wanted {
+            for (slot, model, variant, swaps, paint) in wanted {
                 let Some(r) = self.renderer.as_mut() else {
                     return;
                 };
@@ -7373,7 +7550,7 @@ impl App {
                     .map_err(anyhow::Error::from)
                     .and_then(|a| CarModel::upload(r, &a, &self.paths, 1, paint));
                 match loaded {
-                    Ok(m) => self.fe.cars.push((slot, model, variant, paint, m)),
+                    Ok(m) => self.fe.cars.push((slot, model, variant, paint.exterior, m)),
                     Err(e) => tracing::warn!(model, error = %e, "front-end car model unavailable"),
                 }
             }
@@ -7385,6 +7562,35 @@ impl App {
     /// written in (`+0x758`, 0x4C0420…0x4C0486), and otherwise the catalogue record its slot 0x90
     /// answers has its **stock** parts' (`+0x3BC` / `+0x3BE`, 0x4C036A…0x4C0405, each through the
     /// part lookup 0x49C470).
+    /// A garage car's four colours and package — what `FEOwnedCarAccessor`'s slots +0x74…+0x84
+    /// answer from `FECar+0x674…+0x684`, the 3D car widget's colour pulls (0x4C014F…0x4C0299).
+    fn paint_of(entry: &nfs_formats::fedata::CarCatalogEntry, o: &nfs_game::career::OwnedCar) -> Paint {
+        let t = o.trim;
+        Paint::owned(entry, o.paint_set as usize, t.interior as usize, t.stripe1 as usize, t.stripe2 as usize, t.package as u32)
+    }
+
+    /// The paint the 3D car widget puts on `car`: a garage car's own (`OwnedCars.Car`), otherwise
+    /// the catalogue accessor's — the chosen exterior, interior 0, set 0's stripes, package 0.
+    fn fe_car_paint(&self, accessor: Option<&str>, car: &nfs_formats::fedata::CarCatalogEntry) -> Paint {
+        let base = accessor.map(|a| a.split_once('(').map_or(a, |(b, _)| b));
+        if base == Some("OwnedCars.Car")
+            && let Some((_, o)) = self.garage_car()
+            && !car.paint_sets.is_empty()
+        {
+            return Self::paint_of(car, o);
+        }
+        // the dealership's car wears the rows chosen on it: slot 29 the paint set's exterior,
+        // slot 30 the interior, 31 / 32 paint set 0's stripes, 33 package 0 (§4.137)
+        if base == Some("DealerCar.Car")
+            && self.dealer_cars().is_some()
+            && !car.paint_sets.is_empty()
+        {
+            let d = self.fe.dealer;
+            return Paint::owned(car, d.paint, d.interior, 0, 0, 0);
+        }
+        Paint::matching(car, self.paint)
+    }
+
     fn fe_car_swaps(&self, accessor: Option<&str>, car: &nfs_formats::fedata::CarCatalogEntry) -> Vec<[i16; 3]> {
         let Some(cu) = self.career.as_ref() else { return Vec::new() };
         let base = accessor.map(|a| a.split_once('(').map_or(a, |(b, _)| b));
@@ -7462,6 +7668,7 @@ impl App {
         self.num_laps = setup.laps.max(1);
         self.backwards = setup.backwards;
         self.mirror = setup.mirror;
+        self.owned_paint = None;
         self.paint = setup.paint;
         self.road.traffic_count = TRAFFIC_COUNT[(setup.traffic as usize).min(3)];
         self.road.traffic_ids = None;
@@ -7526,7 +7733,7 @@ impl App {
                 let mut sold = false;
                 if let Some(c) = self.career.as_mut() {
                     if yes {
-                        sold = c.career.accept_offer(i).is_ok();
+                        sold = c.career.accept_offer(&c.tables, i).is_ok();
                         c.car_sel = 0;
                     } else {
                         c.career.decline_offer(i);
@@ -8235,7 +8442,9 @@ impl App {
     /// rectangle seen from the camera: the two half-axes taken into the view plane, scaled by `b`
     /// (MEDIUM: the original turns and stretches a unit quad by the rectangle's projected axes,
     /// 0x43D1A9…0x43D2F4, with one more ratio term not carried), and the second sprite on the same
-    /// quad. Not carried: the sort key.
+    /// quad. Not carried: the depth bias `b · [0x5B36EC] − 20000 · K / d²` (0x43D419…0x43D45C →
+    /// 0x537A60, Thrash 0x18 — once read as a sort key), which the port keeps as its small lift
+    /// because its draw order is not the original's (`thrash.md` §6).
     #[allow(clippy::too_many_arguments)]
     fn glare_items(
         &self,
@@ -8342,6 +8551,13 @@ impl App {
             return None;
         }
         self.world.as_ref().and_then(|w| w.projector_for(pos)).map(|q| (q.u, q.v))
+    }
+
+    /// The `.tpg` entry test's `testdrive` context (0x439E75…0x439EC1): on `skidpad` an entry's
+    /// `testdrive` must equal `[0x6573E8] == 9` — `Game.GameType` 9 is a Factory Driver mission —
+    /// and elsewhere `testdrive = 1` rules it out. `Some(mission)` on `skidpad`, `None` elsewhere.
+    fn skidpad_rule(&self) -> Option<bool> {
+        self.track.name.eq_ignore_ascii_case("skidpad").then_some(self.mission.is_some())
     }
 
     /// The view the camera is on, by the original's ids (`nfs_game::camera`).
@@ -9621,9 +9837,10 @@ impl App {
             // The tree query 0x4739E0 walks the quadtree cells that overlap the segment's x-z box
             // (0x4848B0 on the min / max of its ends) and keeps each object whose own slot 7 cuts
             // the segment (0x473AB6) — the same cut test as below, so an x-z box test over every prop
-            // gives the same set. APPROXIMATION, narrowed: whether a prop sits in the cells its box
-            // covers or only in its centre's (the tree's insert) was not read; only in the second
-            // case could the original miss a prop straddling a cell edge that the port pushes off.
+            // gives the same set: the tree's insert **0x484AE0** descends into every child that
+            // **0x484320** accepts — the object's centre (vtable +4) inside the cell, or else its
+            // box (vtable +8) overlapping it — so a prop sits in every cell its box covers
+            // (read 2026-09-25; it had been left open whether only the centre's cell held it).
             let (lo, hi) = (eye.min(v.position), eye.max(v.position));
             for p in &w.props {
                 if p.aabb_max.x < lo.x || p.aabb_min.x > hi.x || p.aabb_max.z < lo.z || p.aabb_min.z > hi.z {
@@ -9728,11 +9945,7 @@ impl App {
             s.update(r, self.camera.position, cam_slice as i32, lap, self.tick);
         }
         if let Some(s) = &self.sky {
-            self.scene.items.extend(s.draw_items(
-                self.camera.position,
-                self.camera.far,
-                self.tick as f32 / 64.0,
-            ));
+            self.scene.items.extend(s.draw_items(self.camera.position, self.camera.far));
         }
         if let Some(w) = self.world.as_mut() {
             // knocked-over smackables keep tumbling (`RE/notes/skill-tests.md` §5.3)
@@ -10369,6 +10582,7 @@ impl App {
                 self.fe.menu_template = Some(template);
                 self.num_opponents = req.opponents.len() as u32;
                 self.num_laps = req.laps;
+                self.owned_paint = None;
                 self.paint = req.paint;
                 self.career_opponents = Some(req.opponents.clone());
                 self.road.traffic_count = req.traffic;
@@ -10577,6 +10791,7 @@ impl App {
                     row: m.row,
                     font: m.font.take(),
                 };
+                self.owned_paint = None;
                 self.paint = car
                     .paint_sets
                     .get(m.paint_idx % car.paint_sets.len().max(1))
@@ -10672,6 +10887,7 @@ impl App {
                 self.road.cops_race = m.mode == 0 && self.cheat_bits & (1 << 5) != 0;
                 self.road.cops_enabled = m.cops || self.road.cops_race;
                 self.road.cop_count = 4;
+                self.owned_paint = None;
                 self.paint = car
                     .paint_sets
                     .get(m.paint_idx % car.paint_sets.len().max(1))
@@ -10782,6 +10998,50 @@ impl App {
                     self.network_callback(cb, event_loop);
                     return;
                 }
+                // `dealership.lay`'s three (`ID_DEALERCBL`, 0x50EC10): `DEALERCARDEC` / `INC` run
+                // `DealerCar.Car`'s slots 0x50 / 0x54 (0x50ED20 / 0x50ED50) — one row back or on,
+                // wrapping — and `BUYCAR` is **0x501CF0**: dialog 802 when the price (0x4EE220) is
+                // more than the money, 61 when the garage holds 80, else a new FECar from the
+                // accessor's slots +0x74…+0x88 (exterior, interior, stripes, package 0, decal −1)
+                // with the price at `+0x6A4`, the money going with it
+                // the two showcase callbacks set the accessor the next screen's left car reads
+                // (0x50E6A0) and let the button's `destination` go on
+                match c.callback.as_deref() {
+                    Some("SHOWCASE.DEALERCAR") => self.fe.compare_dealer = true,
+                    Some("CARCOMPARE.MERGEDCAR") => self.fe.compare_dealer = false,
+                    _ => {}
+                }
+                let on_dealer = self.fe.layout_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("dealership")) && self.career.is_some();
+                if on_dealer
+                    && let Some(cb @ ("DEALERCARDEC" | "DEALERCARINC")) = c.callback.as_deref()
+                {
+                    self.set_accessor("DealerCar.Car", if cb == "DEALERCARDEC" { -1 } else { 1 });
+                    self.bind_car_logos();
+                    self.bind_indicator_bars();
+                    return;
+                }
+                if on_dealer && c.callback.as_deref() == Some("BUYCAR") {
+                    let d = self.fe.dealer;
+                    let pick = self.dealer_car().map(|e| e.id);
+                    if let (Some(id), Some(cu)) = (pick, self.career.as_mut()) {
+                        let trim = nfs_game::career::Trim { interior: d.interior as u8, ..Default::default() };
+                        match cu.career.buy_car(&cu.tables, id, d.paint as u8, trim) {
+                            Ok(()) => {
+                                // `buy_car` sorted the garage (0x4F0EE0); sound 0xB (0x501ED8)
+                                self.fe_sound(0xB);
+                                self.bind_lists();
+                            }
+                            Err(nfs_game::career::CareerError::NoMoney { .. }) => {
+                                self.fe_raise_dialog(nfs_game::dialog::DialogKind::One, 802, [0, 0], DialogFor::Notice)
+                            }
+                            Err(nfs_game::career::CareerError::GarageFull) => {
+                                self.fe_raise_dialog(nfs_game::dialog::DialogKind::One, 61, [0, 0], DialogFor::Notice)
+                            }
+                            Err(e) => tracing::info!("dealer: {e}"),
+                        }
+                    }
+                    return;
+                }
                 // `usedcars.lay`'s `ID_BUYCARBUTTON` — `callback=BUYCAR`, which for the used-car
                 // lot is 0x501F40: the money goes and the car moves across as it stands, mileage,
                 // parts and all. The player's own listings are on the same lot and cannot be
@@ -10794,8 +11054,10 @@ impl App {
                     if idx < n
                         && let Some(cu) = self.career.as_mut()
                     {
-                        match cu.career.buy_used_car(idx) {
+                        match cu.career.buy_used_car(&cu.tables, idx) {
                             Ok(()) => {
+                                // 0x502161 sorts the garage (in `buy_used_car`), then sound 0xB (0x502166)
+                                self.fe_sound(0xB);
                                 self.fe.usedcar_sel = 0;
                                 self.bind_lists();
                                 self.bind_indicator_bars();
@@ -11500,8 +11762,9 @@ impl App {
         let Some(m) = self.fe.menu.as_ref() else { return };
         let track_name = m.track().to_string();
         let (car, owned) = match game_type {
+            // a new car's test drive is the dealership's car in a career, in the rows chosen on it
             6 => {
-                let Some(car) = m.car().cloned() else { return };
+                let Some(car) = self.dealer_car().or(m.car()).cloned() else { return };
                 (car, None)
             }
             7 => {
@@ -11516,8 +11779,14 @@ impl App {
                 (car, Some(o))
             }
         };
-        let paint_set = owned.as_ref().map_or(m.paint_idx, |o| o.paint_set as usize);
+        let dealer = (game_type == 6 && self.dealer_cars().is_some()).then_some(self.fe.dealer);
+        let paint_set = owned.as_ref().map_or(dealer.map_or(m.paint_idx, |d| d.paint), |o| o.paint_set as usize);
         self.paint = car.paint_sets.get(paint_set % car.paint_sets.len().max(1)).map(|p| p.colours[0]).unwrap_or([0xD4, 0x10, 0x10]);
+        self.owned_paint = match (owned.as_ref(), dealer) {
+            (Some(o), _) if !car.paint_sets.is_empty() => Some(Self::paint_of(&car, o)),
+            (None, Some(d)) if !car.paint_sets.is_empty() => Some(Paint::owned(&car, d.paint, d.interior, 0, 0, 0)),
+            _ => None,
+        };
         self.num_opponents = 0;
         self.num_laps = 1;
         self.backwards = false;
@@ -11588,6 +11857,7 @@ impl App {
         self.road.cops_race = self.cheat_bits & (1 << 5) != 0;
         self.road.cops_enabled = m.cops || self.road.cops_race;
         self.road.cop_count = 4;
+        self.owned_paint = None;
         self.paint = car
             .paint_sets
             .get(m.paint_idx % car.paint_sets.len().max(1))
@@ -11669,6 +11939,25 @@ impl App {
 
     fn set_accessor(&mut self, name: &str, delta: i32) {
         let base = name.split_once('(').map(|(b, _)| b.trim()).unwrap_or(name);
+        // the paint shop edits the garage car itself — `FEOwnedCarAccessor`'s setters, slots 37…41
+        // (0x4F6F90…0x4F7050), write `FECar+0x674…+0x684` (`savegame.md` §4.7a)
+        if matches!(base, "OwnedCar.ExtColour" | "OwnedCar.IntColour" | "OwnedCar.S1Colour" | "OwnedCar.S2Colour" | "OwnedCar.PackageNum")
+            && let Some((sets, ints)) = self.garage_car().map(|(e, _)| (e.paint_sets.len().max(1) as i32, e.interior_colours.len().max(1) as i32))
+        {
+            let n_pkg = CHOICE_ACCESSORS.iter().find(|(n, ..)| *n == "OwnedCar.PackageNum").map_or(8, |(.., o)| o.len()) as i32;
+            let Some(c) = self.career.as_mut() else { return };
+            let sel = c.car_sel.min(c.career.garage.len().saturating_sub(1));
+            let Some(o) = c.career.garage.get_mut(sel) else { return };
+            let step = |v: u8, n: i32| ((v as i32 + delta).rem_euclid(n)) as u8;
+            match base {
+                "OwnedCar.ExtColour" => o.paint_set = step(o.paint_set, sets),
+                "OwnedCar.IntColour" => o.trim.interior = step(o.trim.interior, ints),
+                "OwnedCar.S1Colour" => o.trim.stripe1 = step(o.trim.stripe1, sets),
+                "OwnedCar.S2Colour" => o.trim.stripe2 = step(o.trim.stripe2, sets),
+                _ => o.trim.package = step(o.trim.package, n_pkg),
+            }
+            return;
+        }
         if let Some((v, lo, hi)) = self.range_value(base).filter(|_| !base.starts_with("Audio.")) {
             let key = RANGE_ACCESSORS.iter().find(|(n, ..)| *n == base).map(|(_, k, ..)| *k).unwrap_or_default();
             // **one index per press.** An int range is a list of `max − min + 1` entries
@@ -11711,6 +12000,34 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        // the dealership's three in a career: the car wraps both ways (0x4BC660 / 0x4BC690) and
+        // a new car puts the colour rows back to 0 (0x4F30A4…); the colours step their own lists
+        if matches!(base, "DealerCar.Car" | "DealerCar.Colour" | "DealerCar.IntColour")
+            && let Some(v) = self.dealer_cars()
+        {
+            let n_cars = v.len().max(1) as i32;
+            let (sets, ints) = self.dealer_car().map_or((1, 1), |e| (e.paint_sets.len().max(1) as i32, e.interior_colours.len().max(1) as i32));
+            let d = &mut self.fe.dealer;
+            let step = |v: usize, n: i32| ((v.min(n as usize - 1) as i32 + delta).rem_euclid(n)) as usize;
+            match base {
+                "DealerCar.Car" => *d = DealerSel { car: step(d.car, n_cars), paint: 0, interior: 0 },
+                "DealerCar.Colour" => d.paint = step(d.paint, sets),
+                _ => d.interior = step(d.interior, ints),
+            }
+            return;
+        }
+        // `OwnedCars.Car` is the garage (`FEOwnedCarAccessor`, §4.144): its index is the garage
+        // selection every other owned-car accessor, the logo and the 3D car read. *(Until
+        // 2026-09-25 it stepped the quick race's catalogue index, so the garage's and the paint
+        // shop's car combos moved nothing on screen.)* Outside a career it keeps that meaning.
+        if base == "OwnedCars.Car"
+            && let Some(c) = self.career.as_mut()
+        {
+            let n = c.career.garage.len().max(1) as i32;
+            c.car_sel = ((c.car_sel.min(n as usize - 1) as i32 + delta).rem_euclid(n)) as usize;
+            c.part_sel = 0;
+            return;
         }
         let Some(m) = self.fe.menu.as_mut() else { return };
         let step = |i: usize, n: usize| ((i as i32 + delta).rem_euclid(n.max(1) as i32)) as usize;
@@ -11848,6 +12165,7 @@ impl App {
 
     /// Silence the race audio (engine layers, squeal / horn loops) when leaving to the menu.
     fn stop_race_audio(&mut self) {
+        self.snd.slots.clear();
         if let Some(a) = &self.snd.audio {
             if let Some(mut e) = self.snd.engine_sound.take() {
                 e.stop(a);
@@ -12565,18 +12883,29 @@ impl App {
         // the car shadow projectors' texture, `[0x6115CC]+0x18C` (`crp-geometry.md` §8)
         renderer.set_projector_texture(world.projector_texture);
         self.car.tiny = self.cheat_bits & (1 << 1) != 0;
+        // the driven car's catalogue record gives the stripe and interior colours that go with
+        // the paint (0x443DB0, `car-model.md` §5.0a)
+        let player_paint = nfs_formats::fedata::parse_car_catalog(&std::fs::read(self.paths.fe_data().join("Data").join("nfs5.car")).unwrap_or_default())
+            .unwrap_or_default()
+            .iter()
+            .find(|c| c.sim.eq_ignore_ascii_case(&self.sim_name) && c.model.eq_ignore_ascii_case(&self.car.model))
+            .map(|c| Paint::matching(c, self.paint))
+            .unwrap_or(self.paint.into());
+        let player_paint = self.owned_paint.filter(|p| p.exterior == self.paint).unwrap_or(player_paint);
+        self.car.page_text = Some(self.page_text(0));
         let car = CarModel::upload_with_env(
             &mut renderer,
             &self.car,
             &self.paths,
             1,
-            self.paint,
+            player_paint,
             car_env,
             self.track.is_night(),
             // `.CABRIODOWN` 0x24B: the player's car (kind 1) keeps `Car.Roof`, which 0x4F1E40
             // forces to 0 on a car without the convertible flag; every other car is sent 0
             // (0x4EEF0C…0x4EEF1A)
             Some(if self.car.cabrio { self.choice_index("Car.Roof").map_or(0, |(i, _)| i as u32) } else { 0 }),
+            self.skidpad_rule(),
         )
         .expect("car");
         let sky_level = self.choice_index("Graphics.SkyRendering").map_or(0, |(i, _)| i);
@@ -12775,7 +13104,9 @@ impl App {
                     ) else {
                         continue;
                     };
-                    let paint = *paint;
+                    let paint = Paint::matching(entry, *paint);
+                    let mut assets = assets;
+                    assets.page_text = Some(self.page_text(g as usize + 1));
                     let Ok(model) = CarModel::upload_with_env(
                         &mut renderer,
                         &assets,
@@ -12785,6 +13116,7 @@ impl App {
                         car_env,
                         self.track.is_night(),
                         Some(0),
+                        self.skidpad_rule(),
                     ) else {
                         continue;
                     };
@@ -12845,7 +13177,7 @@ impl App {
                         }
                     };
                     self.road.opponent_sets.push(entry.sound_set.clone());
-                    self.road.opponent_paints.push(paint);
+                    self.road.opponent_paints.push(paint.exterior);
                     self.road.opponents.push(RaceCar {
                         name: name.clone(),
                         vehicle,
@@ -12933,11 +13265,7 @@ impl App {
                                         continue;
                                     }
                                 };
-                                let paint = entry
-                                    .paint_sets
-                                    .first()
-                                    .map(|p| p.colours[0])
-                                    .unwrap_or([0x8C, 0x8C, 0x90]);
+                                let paint = if entry.paint_sets.is_empty() { Paint::from([0x8C, 0x8C, 0x90]) } else { Paint::from_catalogue(entry, 0) };
                                 let model = match CarModel::upload_with_env(
                                     &mut renderer,
                                     &assets,
@@ -12947,6 +13275,7 @@ impl App {
                                     car_env,
                                     self.track.is_night(),
                                     Some(0),
+                                    self.skidpad_rule(),
                                 ) {
                                     Ok(m) => m,
                                     Err(e) => {
@@ -13048,6 +13377,8 @@ impl App {
                 // and the spawn points `GameData/Track/Cops/<track>.cop`; a single race gets four cars.
                 self.road.police = None;
                 self.road.police_models.clear();
+                self.road.police_sets.clear();
+                self.road.police_specs.clear();
                 self.road.police_prev.clear();
                 self.road.police_bodies.clear();
                 if self.road.cops_enabled {
@@ -13089,11 +13420,7 @@ impl App {
                                     else {
                                         continue;
                                     };
-                                    let paint = entry
-                                        .paint_sets
-                                        .first()
-                                        .map(|p| p.colours[0])
-                                        .unwrap_or([0xE0, 0xE0, 0xE0]);
+                                    let paint = if entry.paint_sets.is_empty() { Paint::from([0xE0, 0xE0, 0xE0]) } else { Paint::from_catalogue(entry, 0) };
                                     let Ok(model) = CarModel::upload_with_env(
                                         &mut renderer,
                                         &assets,
@@ -13103,6 +13430,7 @@ impl App {
                                         car_env,
                                         self.track.is_night(),
                                         Some(0),
+                                        self.skidpad_rule(),
                                     ) else {
                                         continue;
                                     };
@@ -13118,10 +13446,10 @@ impl App {
                             let m = &self.road.police_models[slot];
                             let half = (m.bbox_max - m.bbox_min) * 0.5;
                             // a cop car has a real `.sim` (§17.1), so its mass is the sim's
-                            let mass = CarAssets::load_sim(&self.paths, &entry.sim)
-                                .ok()
-                                .map(|s| CarSpecs::from_sim(&s, false).mass)
-                                .unwrap_or(1400.0);
+                            let specs = CarAssets::load_sim(&self.paths, &entry.sim).ok().map(|s| CarSpecs::from_sim(&s, false));
+                            let mass = specs.as_ref().map(|s| s.mass).unwrap_or(1400.0);
+                            self.road.police_sets.push(entry.sound_set.clone());
+                            self.road.police_specs.push(specs.unwrap_or_else(|| self.specs.clone()));
                             // §17.2: the cop's chase level is the heat record's `level[role]`, not
                             // the race skill — role 0 is always level 2
                             cars.push(nfs_game::police::CopCar::new(
@@ -13420,8 +13748,12 @@ impl App {
         // made on the first update, once the track is up
         self.track_particle_defs = defs;
         self.track_particles = None;
-        // the skid marks' quadtree cells over the world's box (0x479900; APPROXIMATION: the box of
-        // the collision triangles, `nfs_game::skidmarks`)
+        // the skid marks' quadtree cells over the world's box (0x479900). 0x47B660 takes the eight
+        // corners every placed bundle item answers (vtable +8, 0x47B6C6…0x47B89C); the collision
+        // grid holds the triangles of the same articles — the world's and every instance's — so
+        // its box is theirs. APPROXIMATION, narrowed 2026-09-25: an item's box corners were not
+        // read; they match the vertex box for an unrotated article and can reach past it for a
+        // rotated one
         let (lo, hi) = world.collision.bounds();
         self.skid = nfs_game::skidmarks::SkidMarks::for_world(lo, hi);
         // the trackside cameras and their triggers travel with the track (`race-logic.md` §3.3)
@@ -14509,10 +14841,9 @@ fn unlit(tint: [f32; 3]) -> nfs_renderer::LayerLight {
     nfs_renderer::LayerLight { ambient: tint, diffuse: [0.0; 3], direction: [0.0; 3] }
 }
 
-fn crowding_factor(cam: Vec3, opponents: &[nfs_game::racecar::RaceCar]) -> u8 {
+fn crowding_factor(distances: impl IntoIterator<Item = f32>) -> u8 {
     let mut x = 192.0f32;
-    for o in opponents.iter().take(8) {
-        let d = (o.vehicle.position - cam).length();
+    for d in distances {
         if d < 128.0 {
             x -= 128.0 - d;
         }
@@ -14917,6 +15248,8 @@ fn main() -> Result<()> {
             chronicle_col: None,
             usedcars_showparts: false,
             usedcar_sel: 0,
+            dealer: DealerSel::default(),
+            compare_dealer: false,
             parts_sel: None,
             setting_repeat: None,
             mouse_down: false,
@@ -15132,6 +15465,8 @@ fn main() -> Result<()> {
             traffic_paints: Vec::new(),
             police: None,
             police_models: Vec::new(),
+            police_sets: Vec::new(),
+            police_specs: Vec::new(),
             police_prev: Vec::new(),
             police_bodies: Vec::new(),
             cops_race: false,
@@ -15182,11 +15517,14 @@ fn main() -> Result<()> {
             .find(|c| c.sim.eq_ignore_ascii_case(&sim_name))
             .map(|c| (c.dial_kmh, c.dial_mph, c.dial_tach)),
         paint,
+        owned_paint: None,
         snd: AudioState {
             audio: None,
             engine_sound: None,
             sfx: None,
             ai_engines: None,
+            slots: Default::default(),
+            crowding: 128,
             ambience: None,
             reverb: nfs_audio::reverb::Reverb::default(),
             music: None,

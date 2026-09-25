@@ -356,13 +356,18 @@ impl Default for TrafficPhysics {
 }
 
 /// Where the body's origin sits above the surface under it while a traffic car rests on the
-/// ground. A traffic car (`car+0x52C & 0x80`) takes `Susp_AI` 0x4998C0 and `Car_ground`'s
-/// non-upright arm, where `BodyGroundCollide` 0x496610 pushes the body out until its lowest
-/// `BndP` points lie on the plane (`suspension-collision.md` §4.2, §5, §6.3) — and on every
-/// traffic and police model those points are at `y = −0.001` (−0.002 on `eas4`, `eas10`;
-/// `nfs-game/examples/bndp.rs`), the model's origin being on the ground as the player's is. The
-/// port used 1 m, a leftover of the slice height, and every traffic and police car floated a
-/// metre up.
+/// ground: the model's lowest `BndP` points, at `y = −0.001` on every traffic and police model
+/// (−0.002 on `eas4`, `eas10`; `nfs-game/examples/bndp.rs`), laid on the plane. The port used 1 m,
+/// a leftover of the slice height, and every traffic and police car floated a metre up.
+/// *(Corrected 2026-09-25:)* this said a traffic car is `car+0x52C & 0x80` and so takes `Susp_AI`
+/// 0x4998C0, whose `BodyGroundCollide` 0x496610 is what lays those points on the plane. `0x80` is
+/// the smackables' flag; the traffic's is 0x10 (`ai.md` §6), so a traffic car goes through
+/// `Susp_update` 0x499A70 like any other (`suspension-collision.md` §4.2). That path rests the car
+/// at the same height: upright, `BodyHeight` 0x49A900 puts `+0x424` at `½(mean + min)` of the four
+/// lowest body points — the `BndP` wheel quad, sorted first by 0x49ABC0 (`car-model.md` §12) — and
+/// `Car_ground` 0x49BD40's resting branch drops the body by it (`pos.y −= +0x424`), so the quad sits
+/// on the plane. APPROXIMATION in what is left: the port's kinematic traffic has no per-wheel
+/// contacts, so none of `Susp_update`'s pitch / roll or per-wheel roughness.
 pub const RIDE_HEIGHT: f32 = 0.001;
 
 #[derive(Debug, Clone)]
