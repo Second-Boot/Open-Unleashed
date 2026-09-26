@@ -12,7 +12,7 @@ fn main() {
         let Some(e) = a.edges.as_ref() else { continue };
         let mut hist: BTreeMap<u32, usize> = BTreeMap::new();
         for s in &e.segments {
-            *hist.entry(if (0x10..=0x60).contains(&s.tag) { s.tag } else { u32::MAX }).or_default() += 1;
+            *hist.entry(if (0x10..=0x60).contains(&(s.tag & 0xFF)) { s.tag & 0xFF } else { u32::MAX }).or_default() += 1;
         }
         let in_range_odd: usize = hist.iter().filter(|(k, _)| **k != u32::MAX && **k % 0x10 != 0).map(|(_, n)| *n).sum();
         odd += in_range_odd;

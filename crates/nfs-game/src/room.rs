@@ -214,6 +214,10 @@ pub struct DealerRow {
     pub sliding: bool,
     pub start: u32,
     pub progress: f32,
+    /// The room's busy byte `[+0x264]` as the tick leaves it: cleared at 0x4E93FF once no slide
+    /// runs, raised at 0x4E961F on every tick that does (a slide just started included). The
+    /// draw's wrap cut (0x4E9043) drops `sliding` without touching it, so it is kept apart.
+    pub busy: bool,
 }
 
 /// What [`DealerRow::layout`] places: the car at `pos`, the sections `first ..= last` about it.
@@ -230,7 +234,7 @@ pub struct DealerLayout {
 
 impl DealerRow {
     pub fn new(index: i32) -> Self {
-        DealerRow { cur: index, shown: index, sliding: false, start: 0, progress: 0.0 }
+        DealerRow { cur: index, shown: index, sliding: false, start: 0, progress: 0.0, busy: false }
     }
 
     /// The tick, slot 1 **0x4E93B0**. `now` is `TIMER_getTicks` (128 Hz), `index` the accessor's
@@ -264,6 +268,7 @@ impl DealerRow {
             let p = (now.wrapping_sub(self.start) as i32 as f64 / DEALER_SLIDE_TICKS as f64) as f32;
             self.progress = p.clamp(0.0, 1.0);
         }
+        self.busy = self.sliding;
         started
     }
 
@@ -414,6 +419,11 @@ pub struct TrackRoom {
     pub frame: i32,
     pub flipping: bool,
     pub flip_start: u32,
+    /// The room's busy byte `[+0x264]` as this tick leaves it: 0x4EAB08 compares the reached
+    /// quarter `[+0x308]` with the target `[+0x30C]` **before** the turn step and raises it
+    /// (0x4E7810) when they differ, clears it (0x4E7820, 0x4EAC66) when not. The front end's
+    /// input dispatch 0x4D2850 drops every event while it is up (0x4D2892 → 0x4E7850).
+    pub busy: bool,
 }
 
 impl TrackRoom {
@@ -437,6 +447,7 @@ impl TrackRoom {
             frame: -1,
             flipping: false,
             flip_start: now,
+            busy: false,
         }
     }
 
@@ -489,6 +500,7 @@ impl TrackRoom {
         }
         self.track = Some(track);
         // 0x4EAAF0…0x4EAC66: turn toward `target / 4` at 1/350 turn a tick
+        self.busy = self.reached != self.target;
         if self.reached != self.target {
             let mut t = self.target as f32 * 0.25;
             if t == 0.0 && back {
@@ -695,6 +707,36 @@ mod tests {
         assert_eq!(b, [PanelBlit { page: 2, frame: 0 }]);
         assert!(r.flipping);
         assert!(r.yrot > 0.99, "turned a hair back from 0, wrapped to just under 1");
+        // the busy byte is the test before the step (0x4EAB08): up while the wall turns
+        assert!(r.busy);
+    }
+
+    #[test]
+    fn the_rooms_are_busy_while_the_dealer_slides_and_the_wall_turns() {
+        // 0x4E961F raises it on every sliding tick, 0x4E93FF drops it once the slide is over
+        let mut d = DealerRow::new(0);
+        d.tick(10, 0);
+        assert!(!d.busy);
+        d.tick(11, 1);
+        assert!(d.busy && d.sliding);
+        d.tick(11 + DEALER_SLIDE_TICKS, 1);
+        assert!(d.busy);
+        d.tick(12 + DEALER_SLIDE_TICKS, 1);
+        assert!(!d.busy && !d.sliding);
+        // the wall: a new track sets a target; the tick that reaches it still reports busy
+        let mut r = TrackRoom::new(0);
+        r.tick(1, 7, false, false, false);
+        assert!(!r.busy);
+        r.tick(2, 8, false, false, true);
+        assert!(r.busy);
+        let mut t = 2;
+        while r.reached != r.target {
+            t += 8;
+            r.tick(t, 8, false, false, true);
+            assert!(r.busy);
+        }
+        r.tick(t + 1, 8, false, false, true);
+        assert!(!r.busy);
     }
 
     #[test]

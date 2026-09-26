@@ -487,6 +487,20 @@ impl CarSpecs {
         self.inv_grip = 1.0 / self.grip;
     }
 
+    /// `carSpecs[0x60 + 4·slot]` as the tables leave it: slots 0…7 are `ratio'` — 0x49D634's loop
+    /// overwrites all eight, `+0x60 … +0x7C`, whatever the gear count (`cmp ecx, 0x80; jl`) — and
+    /// slot 8 is `+0x80` itself, the final drive, which that loop multiplies by and leaves as it
+    /// is. What 0x408495…0x4084BD reads for the traffic / cop engine speed with 0x408130's gear,
+    /// which reaches slot 8 on a six-speed car past its top gear. Past slot 8 (not reachable:
+    /// `carSpecs[0x50]` is at most 8) 0.
+    pub fn ratio_slot(&self, slot: usize) -> f32 {
+        match slot {
+            0..=7 => self.ratio_rpm_per_mps[slot],
+            8 => self.final_drive,
+            _ => 0.0,
+        }
+    }
+
     pub fn rebuild_tables(&mut self, automatic: bool) {
         for i in 0..8 {
             self.ratio_rpm_per_mps[i] = self.final_drive * self.gear_ratio[i] * 60.0 / self.circumference;

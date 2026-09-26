@@ -1031,10 +1031,11 @@ impl TrafficSet {
                 if let Some(t) = r.query(nfs_formats::scripts::mask::SWIPE)
                     && let Some(o) = cars.get(t.max(0) as usize)
                     // `0x40E860(car, o)` (0x401503: `push edi` the target, `push esi` the car) is
-                    // positive when **this car** is ahead — `gap_between(car, o)`; the port had the
-                    // arguments the other way round, i.e. the sign flipped. The slice gap alone
-                    // (APPROXIMATION inside ±12 m; dead data for traffic: row 0 has no SWIPE)
-                    && crate::lanes::gap_between(table, me.slice, o.slice) * me.dir < 4.0
+                    // positive when **this car** is ahead — `gap_fine(car, o)`, the slice gap and
+                    // inside ±12 m the offset on this car's slice forward; the port had the
+                    // arguments the other way round, i.e. the sign flipped. Then `· car+0xEB0 < 4`
+                    // (0x40150A…0x401522, `test ah, 1`). Dead data for traffic: row 0 has no SWIPE.
+                    && crate::lanes::gap_fine(table, me.slice, o.slice, fine_ok.then(|| positions.get(t.max(0) as usize).map(|p| (self.cars[i].position, *p))).flatten()) * me.dir < 4.0
                 {
                     match o.lane.cmp(&me.lane) {
                         std::cmp::Ordering::Greater => sc.score[2] += 5.0,
@@ -1463,13 +1464,20 @@ impl TrafficSet {
     /// as the port did until 2026-09-26.
     pub fn integrate_tick(&mut self, table: &SliceTable, dt: f32, ground: Option<&nfs_physics::collision::TriangleGrid>, tick: Option<u64>) {
         let bodied = !self.bodies.is_empty() && ground.is_some();
-        for c in self.cars.iter_mut().filter(|c| c.active) {
+        for (i, c) in self.cars.iter_mut().enumerate().filter(|(_, c)| c.active) {
             if let Some(t) = tick
                 && t % 2 == 0
             {
                 c.progress = table.frac(c.slice);
             }
             c.position += c.velocity * dt;
+            // 0x49B7A0 moves the four contacts `wheel+0x40` by the same `vel/64` as the body
+            // (0x49B7F5…0x49B84C; every car but a smackable) — what the skid marks read after it
+            if bodied && let Some(b) = self.bodies.get_mut(i) {
+                for w in &mut b.wheels {
+                    w.world_pos += c.velocity * dt;
+                }
+            }
             if bodied {
                 c.orientation = nfs_physics::vehicle::orientation_step(c.orientation, c.angular_velocity * dt);
             } else {

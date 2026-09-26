@@ -286,7 +286,7 @@ fn music_stream_first_two_seconds() {
         }
     }
     samples.truncate(want * 2);
-    let pcm = PcmSample { rate: s.header.sample_rate, channels: 2, samples, loop_range: None, padded_tail: 0, gain: 1.0, bend_cents: 0, fx_send: 0 };
+    let pcm = PcmSample { rate: s.header.sample_rate, channels: 2, samples, loop_range: None, padded_tail: 0, gain: 1.0, bend_cents: 0, fx_send: 0, priority: 0, pan: 64, pan_scale: 1, records: Vec::new(), parts: Vec::new(), tables: Vec::new() };
     assert_eq!(pcm.samples_per_channel(), want);
     check_plausible(&pcm, &format!("music {} ({blocks} blocks)", e.name));
     wav(&format!("music_{}_2s.wav", e.name.split('-').next().unwrap()), &pcm);
@@ -362,6 +362,35 @@ fn collision_bank_slots() {
         assert!(pcm.loop_range.is_none(), "slot {slot:#x} is a one-shot");
         assert!(pcm.samples.len() > 1000, "slot {slot:#x} has {} samples", pcm.samples.len());
     }
+    // 48 slots of more than one record (91 with LilSND_coll's 43), each record decoded as a
+    // sample of its own (0x599100 per record)
+    let mut multi = 0;
+    for slot in bank.used_slots() {
+        let pcm = bank.decode_slot(&data, slot).unwrap();
+        if pcm.parts.is_empty() {
+            continue;
+        }
+        multi += 1;
+        assert_eq!(pcm.parts.len(), pcm.records.len());
+        for (k, part) in pcm.parts.iter().enumerate() {
+            assert_eq!(part.records, vec![pcm.records[k]]);
+            assert!(part.samples.len() > 100, "slot {slot:#x} record {k}");
+        }
+    }
+    assert_eq!(multi, 48);
+    // the wind slot (the header at 0x454, two records): the envelope and the volume step table
+    // at their self-relative pointers (codes 0x19 / 0x1D), code 0x09 segments and code 0x1E steps
+    let wind = bank.slots.iter().flatten().find(|s| s.header_offset == 0x454).unwrap();
+    let t = &wind.header.tables[0];
+    assert_eq!(t.envelope, [(8, 50), (8, 120), (0x7FFF_FFFF, 0), (244, 0)]);
+    let v = t.volume.as_ref().unwrap();
+    assert_eq!((v.len(), &v[..8]), (100, &[0, 0, 0, 0, 47, 51, 56, 63][..]));
+    assert!(t.pitch.is_none() && t.curve.is_none());
+    assert_eq!(wind.header.patch_records()[0].env_level, 0);
+    assert_eq!(wind.header.tables[1].volume.as_ref().unwrap().len(), 128);
+    // a record without code 0x19 holds the image's default at 0x5E3498
+    let plain = bank.header(0x30).unwrap();
+    assert_eq!(plain.tables[0].envelope, [(0x7FFF_FFFF, 127)]);
 }
 
 /// The PT patch codes of `RE/notes/audio.md` §2: the engine bank gives nearly every sample its own

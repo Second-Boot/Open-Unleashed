@@ -508,6 +508,18 @@ impl Renderer {
         });
 
         // 2D sprite pipeline (HUD)
+        //
+        // Blended for every sprite, the front end's included (`RE/notes/thrash.md` §8, settled
+        // 2026-09-26): the FE kit 0x4D8E10 has an opaque `Rs` block `[0x65B948]` (Thrash 0x0A ← 0)
+        // that the flush 0x4DA5F0 picks by the queued item's byte `+8`, but only the untextured
+        // fills set it — 0x4D9280 / 0x4D96B0 / 0x4D98D0 from colours that are all `0xFF` alpha,
+        // where blending gives the same pixel — while every image draw takes it from its caller
+        // (0x4D9B30's arg 8, also via 0x4D9AF0's arg 6; 0x4D9E70's arg 12, also via 0x4D9E10's
+        // arg 10), and all 72 call sites pass 0. `dx7z.dll` turns `ALPHABLENDENABLE` on or off
+        // only for Thrash 0x0A (0x60003EFE) and at device creation; binding a texture
+        // (0x60008000 → 0x60007F30) sets nothing else. Not carried: the device's alpha test
+        // (`GREATER`, reference 0 / 1 / 10 by what the front end drew last), which drops texels
+        // of alpha ≤ 10 that blending would lay at ≤ 4 %.
         let sprite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("sprite"), source: wgpu::ShaderSource::Wgsl(include_str!("sprite.wgsl").into()) });
         let sprite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sprite"),

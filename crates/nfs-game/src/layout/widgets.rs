@@ -125,10 +125,18 @@ impl LayoutScreen {
     // shipped sliders are `width=90 height=13` against a 6×11 knob, so they are
     // horizontal. The index and the count come from the accessor's own registration
     // (`career::car_setup_index`).
+    //
+    // The knob is one of **three** parts, and the state picks which: the helper binds
+    // `knob.pos`, `hoverknob.pos` and `hovermousedownknob.pos` (0x4D0831…0x4D08AA, into
+    // `[helper+0xEC/+0xF0/+0xF4]`) and moves all three to the same place (0x5276E0 at
+    // 0x4D0C7B, 0x4D0C8F, 0x4D0CA5); the class's draw, slot 15, **is** 0x4C8260, which walks
+    // the part list of the **current** state (0x525830: `[[this+0xD4]] + 0x525570()·4`) —
+    // `[state.normal]` the knob (`weeicons.fsh` 8), `[state.hover]` `hoverknob` (34),
+    // `[state.focused]` `hovermousedownknob` (35) — [`drawn_state`](Self::drawn_state).
     pub(super) fn draw_car_setting_slider(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
-        let WidgetDraw { i, e, x, y, w, aspect, .. } = d;
+        let WidgetDraw { i, e, x, y, w, aspect, selected, hovered, .. } = d;
         let (idx, count) = self.knobs.get(&i).copied().unwrap_or((0, 1));
-        for (px, py, file, index, _) in self.shape_parts(e) {
+        for (px, py, file, index, _) in self.shape_parts_at(e, self.drawn_state(e, i, selected, hovered), None) {
             let Some(&(tex, dw, dh)) = self.shapes.get(&(file, index)) else { continue };
             let dx = if count > 1 { (idx * (w - dw).max(0.0) as i32 / (count - 1)) as f32 } else { 0.0 };
             let (pos, size) = self.place(aspect, x + px + dx, y + py, dw, dh);
@@ -160,7 +168,7 @@ impl LayoutScreen {
     // to sit in one function when this arm was moved out of the class match.)*
     pub(super) fn draw_combo(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>, overlay: &mut Vec<Sprite>) {
         let WidgetDraw { i, e, x, y, w, h, aspect, strings, selected, hovered, accessor, .. } = d;
-        self.glinty_box(out, aspect, e, i, x, y, tint);
+        self.glinty_box(out, aspect, e, i, x, y, selected, hovered, tint);
         // The combo's own bevel, 0x4C69DF — the last call site of 0x521050 whose
         // arguments were not all read (§4.58, §4.68). Its gate is four tests at
         // 0x4C6947…0x4C698D: not a list box (`[+0x1DD]`), hovered (0x4C7C90), a
@@ -176,9 +184,10 @@ impl LayoutScreen {
         }
         let state = self.state_for(e, i, selected, hovered);
         if self.open_combo == Some(i) {
-            // a colour box with no custom colour to offer is an ordinary drop-down of
-            // the car's paint sets — §4.86
-            if e.class == "NFS5.ColorBox" && self.attr_num(e, "allowcustom").unwrap_or(0.0) != 0.0 {
+            // a colour box's list is an ordinary drop-down of swatches (§4.171); the
+            // editor replaces it once the custom row has raised the latch (0x4C3D0C:
+            // focus and `[0x65B710]`) — §4.66, §4.86
+            if self.open_picker() == Some(i) {
                 self.color_picker(overlay, aspect, x, y, w, h, tint);
             } else {
                 self.drop_down(overlay, aspect, e, i, x, y, tint);
@@ -186,6 +195,18 @@ impl LayoutScreen {
         }
         for (px, py, pw, ph, col) in self.state_rects(e, state) {
             out.push(self.quad(aspect, x + px, y + py, pw.max(1.0), ph.max(1.0), tint(col)));
+        }
+        // `data.dropshadow == 2` replaces the `backrect`'s plain fill with §4.22's red
+        // ramp, 0x521900 — the combo has its own call at 0x4C5EC9, on the
+        // `data.nolabel != 4` path, over the same `backrect` box. Three of the 86
+        // sliders carry 2 and all three are `nolabel=2`, so all three reach it. §4.78.
+        // **Under the text**: 0x4C5EC9 comes before the stems (0x4C5F50…), the caption
+        // (0x4C6054) and the value (0x4C6237). *(Until 2026-09-27 the port drew it after
+        // both, which blanked the CD player's three combos on `audioreal.lay`.)*
+        if self.attr_num(e, "dropshadow") == Some(2.0) {
+            let (l, r) = (tint([0xe0, 0x0c, 0x0c, 0xff]), tint([0x82, 0, 0, 0xff]));
+            let (x0, y0, x1, y1) = (x + 1.0, y + 1.0, x + w - 1.0, y + h - 1.0);
+            self.gouraud(out, aspect, [[x0, y0], [x1, y0], [x0, y1], [x1, y1]], [l, r, l, r]);
         }
         // The same stems the buttons have (§4.24), from the same draw — a combo slider
         // and a colour box share `FeComboBox`'s slot 1, and 0x4C5F18…0x4C5FB2 is its
@@ -207,7 +228,17 @@ impl LayoutScreen {
             out.push(self.quad(aspect, x, y, 1.0, at("stemleftheight"), stem));
             out.push(self.quad(aspect, x + bw, y, 1.0, at("stemrightheight"), stem));
         }
-        for (px, py, file, index, flip) in self.shape_parts(e) {
+        // The arrow is **not** drawn from a state's part list: the family's slot 1 / 15 / 27
+        // (0x4C5460 / 0x4C6A60 / 0x4C5810) never reach 0x4C8260; the bind looks `arrowbutton`
+        // up by name (0x4C535D → `[+0x19C]`) and the draw paints that part's entry itself,
+        // through 0x4D9AF0, whenever the widget is not hidden (0x4C5818: 0x4C7ED0) — at
+        // 0x4C5DB4 on the `nolabel == 4` path and 0x4C62BA on the other. So the part is
+        // fixed, whatever the state (every non-hidden state of `ComboBox.ctr` /
+        // `ColorBox.ctr` lists it anyway). GAP: that code places it itself — 0x4C629E:
+        // `x + backrect.width − entry.width − 3` (the template says −4), `y` at
+        // `(backrect.height − entry.height)/2 + 1` over a base not traced; 0x4C5DA1 centres
+        // it on `data.width` — and the port keeps the template's `pos`.
+        for (px, py, file, index, flip) in self.shape_parts_in(e, &["arrowbutton".to_string()], None) {
             let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
             let (pos, size) = self.place(aspect, x + px, y + py, aw, ah);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
@@ -256,7 +287,26 @@ impl LayoutScreen {
         // is the same right edge one pixel further in and two rows down; the code is
         // what runs, so the port follows the code. That retires the approximation this
         // arm used to carry.
-        if let Some(v) = e.get("accessor").filter(|a| !a.is_empty()).and_then(accessor) {
+        //
+        // **A colour box shows no value text.** Past the caption, 0x4C60FA tests the class's
+        // `[this+0x1DE]` (set for `NFS5.ColorBox` alone, §4.44) and draws, in place of the
+        // value, a **20 × 10 swatch** of the accessor's current colour — slot 29 0x4C4BF0 →
+        // `FEColourAccessor` 0x4B94C0, `[+0x2C]` — at `(x + width − 40, y + 4)`, `width` the
+        // `backrect`'s (0x4E2B90 on `[+0x17C]`, the same the value's `x + width − 12` uses),
+        // filled `0x4D87F0(colour, fade)` through 0x4D9280 (0x4C6154) and outlined black
+        // `0x4D87E0(fade)` through 0x4D9200 (0x4C618B); then 0x4C6193 jumps past the value
+        // draw to the arrow (0x4C623F). `nolabel == 1` is tested first (0x4C6062) and keeps
+        // the left-aligned value — no shipped colour box has it (all eleven carry 0). §4.171.4.
+        if e.class == "NFS5.ColorBox" && self.attr_num(e, "nolabel") != Some(1.0) {
+            if let Some(c) = self.swatches.get(&i) {
+                let (sx, sy, sw, sh) = (x + w - 40.0, y + 4.0, 20.0, 10.0);
+                let black = tint([0, 0, 0, 0xff]);
+                out.push(self.quad(aspect, sx, sy, sw, sh, tint(*c)));
+                for (bx, by, bw, bh) in [(sx, sy, sw, 1.0), (sx, sy + sh - 1.0, sw, 1.0), (sx, sy, 1.0, sh), (sx + sw - 1.0, sy, 1.0, sh)] {
+                    out.push(self.quad(aspect, bx, by, bw, bh, black));
+                }
+            }
+        } else if let Some(v) = e.get("accessor").filter(|a| !a.is_empty()).and_then(accessor) {
             let f = self
                 .controls
                 .get(&e.class)
@@ -326,16 +376,17 @@ impl LayoutScreen {
                 self.text(out, aspect, f, &shown, bx + (gscw / 2.0).trunc(), y + 2.0, 0.0, 1, tint([0xff, 0xff, 0xff, 0xaa]));
                 return;
             }
-            self.text(out, aspect, f, &v, x + w - 12.0, y, 0.0, 2, colour);
-        }
-        // `data.dropshadow == 2` replaces the `backrect`'s plain fill with §4.22's red
-        // ramp, 0x521900 — the combo has its own call at 0x4C5EC9, on the
-        // `data.nolabel != 4` path, over the same `backrect` box. Three of the 86
-        // sliders carry 2 and all three are `nolabel=2`, so all three reach it. §4.78.
-        if self.attr_num(e, "dropshadow") == Some(2.0) {
-            let (l, r) = (tint([0xe0, 0x0c, 0x0c, 0xff]), tint([0x82, 0, 0, 0xff]));
-            let (x0, y0, x1, y1) = (x + 1.0, y + 1.0, x + w - 1.0, y + h - 1.0);
-            self.gouraud(out, aspect, [[x0, y0], [x1, y0], [x0, y1], [x1, y1]], [l, r, l, r]);
+            // **`nolabel == 2` draws no value at all**: past the caption, 0x4C6198
+            // `cmp eax, 2` / `je 0x4C623F` jumps over the value's 0x4DA350 straight to
+            // the arrow. The seven shipped are `audioreal.lay`'s CD player (`CDPlayer.View`,
+            // `.Options`, `.Title`), `GameCtrl.lay`'s `Controller.AllControllers`,
+            // `deadzone.lay`'s `Controller.AllPads`, `PeerToPeerIP.lay`'s `Comms.IPList` and
+            // `modem.lay`'s `Comms.PhoneList`; a closed one reads as its caption alone.
+            // *(Until 2026-09-27 the port right-aligned the value against the arrow, and
+            // "осталось времени трека" / "играть последовательно" ran out of the box.)*
+            if self.attr_num(e, "nolabel") != Some(2.0) {
+                self.text(out, aspect, f, &v, x + w - 12.0, y, 0.0, 2, colour);
+            }
         }
         // and last of all, over everything it has just drawn — the label included —
         // the inset highlight 0x521810 (0x4C5E6A in the closed arm, 0x4C636D in the
@@ -472,7 +523,7 @@ impl LayoutScreen {
             out.push(self.quad(aspect, x + w, y, 1.0, at("stemrightheight"), stem));
         }
         // and the glinty box itself, which is the last thing the draw does (0x4C9461)
-        self.glinty_box(out, aspect, e, i, x, y, tint);
+        self.glinty_box(out, aspect, e, i, x, y, selected, hovered, tint);
     }
 
     // Two more that are only their template, and both had their caption in the wrong
@@ -520,7 +571,7 @@ impl LayoutScreen {
         }
         self.template_widget(out, aspect, e, state, x, y, strings);
         if e.class == "NFS5.TABBUTTON" {
-            self.glinty_box(out, aspect, e, i, x, y, tint);
+            self.glinty_box(out, aspect, e, i, x, y, selected, hovered, tint);
         }
         // The tab buttons' draw 0x4D0350 draws the parts first (0x4D036D) and then,
         // **when `data.dropshadow` is set** (`[this+0x144]`, bound at 0x4D00E0), the
@@ -739,7 +790,7 @@ impl LayoutScreen {
         // own (0x4C1BBB). One difference: the colour goes through 0x4D87F0 a second
         // time with **0x40** (0x4C1D7E), so the logo's sweep is a quarter as strong as
         // the header's.
-        self.sweep_glint(out, aspect, y, 0x40 as f32 / 255.0);
+        self.sweep_glint(i, true, out, aspect, y, 0x40 as f32 / 255.0);
     }
 
     // `FEKnockoutTrackList::draw` (0x4FA190) is a **seven-slot** strip: the widget's box
@@ -858,21 +909,27 @@ impl LayoutScreen {
     // wait at all and the run simply repeats. That is what the port draws, and it is
     // the whole of the class's shipped use.
     pub(super) fn draw_animating_picture(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
-        let WidgetDraw { e, x, y, w, h, aspect, .. } = d;
+        let WidgetDraw { i, e, x, y, w, h, aspect, .. } = d;
         let Some(file) = e.get("shapePathName").filter(|f| !f.is_empty()) else { return };
         let a = e.int("start_frame").unwrap_or(0).max(0) as usize;
         let b = e.int("end_frame").unwrap_or(0).max(0) as usize;
-        let ticks = (self.clock_ms as u64 * 128 / 1000) as i64;
+        // the widget's own clock (`glints::Anim`, bind 0x4BD8BE, tick 0x4BD8F0): its wait
+        // `mindelay + rand() % (maxdelay − mindelay)` when `maxdelay > mindelay`, the run until the
+        // tick passes `numticks`, and with `maxdelay` 0 the run simply starts again
         let n = e.int("numticks").filter(|v| *v > 0).unwrap_or(1);
-        let lo = e.int("mindelay").unwrap_or(0).max(0);
-        let hi = e.int("maxdelay").unwrap_or(0).max(lo);
-        // the cycle is the run plus the delay it waits out; with the shipped zeros the
-        // delay is zero and the period is `numticks`. APPROXIMATION where it is not:
-        // the port takes the middle of the random wait, as it does for the glint
-        let period = n + (lo + hi) / 2;
-        let t = if period > 0 { ticks.rem_euclid(period) } else { 0 };
-        let span = b as i64 - a as i64;
-        let frame = (a as i64 + (t.min(n) * span / n)).clamp(a.min(b) as i64, a.max(b) as i64) as usize;
+        let lo = e.int("mindelay").unwrap_or(0);
+        let hi = e.int("maxdelay").unwrap_or(0);
+        let now = self.ticks() as i64;
+        let frame = self.step_glint(
+            i,
+            now,
+            || crate::layout::glints::Glint::Anim(crate::layout::glints::Anim::new(0, lo, hi)),
+            |g, t, _| match g {
+                crate::layout::glints::Glint::Anim(an) => an.step(t, a as i64, b as i64, n, lo, hi),
+                _ => a as i64,
+            },
+        )
+        .max(0) as usize;
         if let Some(&(tex, aw, ah)) = self.shapes.get(&(file.to_string(), frame)) {
             let (dw, dh) = (if w > 0.0 { w } else { aw }, if h > 0.0 { h } else { ah });
             let (pos, size) = self.place(aspect, x, y, dw, dh);
@@ -925,28 +982,34 @@ impl LayoutScreen {
         // The header's glint, **0x4CB024…0x4CB0F6** — its colour is 0x4D87D0 of
         // the fade, so white at full (§4.25).
         if e.class == "NFS5.HEADER" {
-            self.sweep_glint(out, aspect, y, 1.0);
+            self.sweep_glint(i, false, out, aspect, y, 1.0);
         }
         // `NFS5.GLINTYLINE`'s sweep, on top of the bar its template just drew
         // (§4.28, §4.29). The long axis is the one the sweep runs along: `x` when
         // `data.horizontal` is set — the class's own test is `!= 0`, so its 2 counts
         // as set — and `y` when it is not.
         if e.class == "NFS5.GLINTYLINE" {
-            // APPROXIMATION, as with every other flourish here: the original redraws
-            // the speed (`rand() % 3 + 3`), the direction (a coin) and the wait
-            // (`rand() % 128`) for each run, so the port takes the middle of the
-            // speed, runs forward, and takes half the wait.
-            const SPEED: u32 = 4;
-            const WAIT: u32 = 64;
+            // The sweep's own timer and draws (`glints::Line`, 0x51FB0A…0x51FC24): a run of
+            // `rand() % 3 + 3` pixels a tick in a coin's direction, from one width outside one end
+            // to one width past the other, then `rand() % 128` ticks of rest.
             let horizontal = self.attr_num(e, "horizontal").unwrap_or(1.0) != 0.0;
             let len = if horizontal { w } else { h };
-            let width = (len / 5.0).floor();
-            if width >= 1.0 {
-                let travel = (len + 2.0 * width) as u32;
-                let ticks = travel.div_ceil(SPEED);
-                let phase = (self.clock_ms * 128 / 1000) % (ticks + WAIT);
-                if phase < ticks
-                    && let Some((s, l, c0, c1)) = glint_sweep(len, (phase * SPEED) as f32 - width, width, true)
+            let now = self.ticks() as i64;
+            let run = self.step_glint(
+                i,
+                now,
+                || {
+                    let short = if horizontal { h } else { w };
+                    crate::layout::glints::Glint::Line(crate::layout::glints::Line::new(0, short as i32, len as i64))
+                },
+                |g, t, _| match g {
+                    crate::layout::glints::Glint::Line(l) => l.step(t).map(|p| (p, l.width, l.dir)),
+                    _ => None,
+                },
+            );
+            if let Some((along, width, dir)) = run {
+                if width >= 1
+                    && let Some((s, l, c0, c1)) = glint_sweep(len, along as f32, width as f32, dir == 1)
                 {
                     let (a, b) = (tint(c0), tint(c1));
                     let (px, py, pw, ph) = if horizontal { (x + s, y, l, 1.0) } else { (x, y + s, 1.0, l) };
@@ -1106,7 +1169,11 @@ impl LayoutScreen {
     pub(super) fn draw_movie(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
         let WidgetDraw { i, e, x, y, w, h, talpha, aspect, .. } = d;
         if let Some(m) = self.movies.get(&i) {
+            // the box is the widget's `size` (0x4CD034…0x4CD05E into `[+0x14C]`, `[+0x150]`,
+            // handed to the player's constructor 0x4E1EB0 as its `[+4]`, `[+8]`); a widget with
+            // no size falls back on the clip's own (the port's; no shipped widget lacks one)
             let (dw, dh) = (if w > 0.0 { w } else { m.size.0 }, if h > 0.0 { h } else { m.size.1 });
+            let v_max = movie_blit_v(dw, dh, m.size);
             let (pos, size) = self.place(aspect, x, y, dw, dh);
             // **`data.tint`** is the widget base's own colour, `[this+0x120]`, bound at
             // 0x4C7652 and read back by the getter 0x528C90 that ten draws call —
@@ -1117,27 +1184,83 @@ impl LayoutScreen {
             // written out. **One** differs: `credits.lay`'s `ID_MOVIECIRCLE` at
             // `0xff55afbe`, a pale blue over the credits clip. §4.83.
             let c = e.color("tint").map(tint).unwrap_or([1.0, 1.0, 1.0, 1.0]);
-            out.push(Sprite { texture: m.tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [c[0], c[1], c[2], c[3] * talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: m.tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, v_max], color: [c[0], c[1], c[2], c[3] * talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         }
         // `NFS5.MOVIECIRCLE`'s template carries nine `stencilshape` parts out of
-        // `movieoval.fsh` — the oval that frames the clip — and only its
-        // **`[state.test1]`** lists them, which is the state all three shipped widgets
-        // ask for. Its draw plays the movie first, through `NFS5.MOVIEBOX`'s own draw
-        // at 0x4CDB61, and reaches the parts after (0x4CDB72), so the oval goes over
-        // the picture. `NFS5.MOVIEBOX` has no such parts.
+        // `movieoval.fsh` — the oval that frames the clip. Its draw 0x4CDAE0 holds them
+        // **by pointer** (`[+0x1C4]`, `[+0x1C8…+0x1E4]`, bound by name 0x4CD898…0x4CDA4D)
+        // and paints all nine whatever the state (vtable +0x14, 0x4CDB2C…0x4CDB57), so the
+        // part list is fixed — not the `.lay` block's state nor the live one (all three
+        // shipped widgets say `test1`, which lists the nine, so the picture is the same).
+        // *Corrected 2026-09-27: this said the draw "reaches the parts after (0x4CDB72)";
+        // 0x4CDB72 is 0x4CDF40, the overlay's lists and the roll. The parts are painted
+        // **before** the clip (0x4CDB61), as the depth mask the clip lands in
+        // (`layouts.md` "Clip = a depth mask").* The port draws them over the clip as its
+        // stand-in for that mask (APPROXIMATION, below). `NFS5.MOVIEBOX` has no such parts.
         if e.class == "NFS5.MOVIECIRCLE" {
             // the overlay goes where the clip goes: the original draws both inside the oval's
             // stencil (0x4DAAC0 … 0x4DAB00 around 0x4CDB61 and 0x4CDB72), which this port stands
             // for by putting the oval over them
             self.draw_movie_overlay(i, e, talpha, aspect, out);
-            for (px, py, file, index, flip) in self.shape_parts(e) {
+            for (px, py, file, index, flip) in self.shape_parts_in(e, &stencil_parts(), None) {
                 let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
                 let (pos, size) = self.place(aspect, x + px, y + py, aw, ah);
                 let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
                 let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
                 out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
             }
+            // The credits roll is the last thing 0x4CDF40 draws (0x4CE0CD), still inside the
+            // mask, so it goes over the parts — the one piece of the widget this port cuts to the
+            // mask the original's way. APPROXIMATION left: the clip and the overlay are still drawn
+            // whole under the parts rather than cut to them, so in the oval's ring the roll shows
+            // over the parts' black, where the original shows it over the clip.
+            let credits = self.layout.elements.iter().any(|x| x.get("callbacklist").is_some_and(|c| c.eq_ignore_ascii_case("ID_CREDITS")));
+            if credits {
+                let ((px, py), (pw, ph)) = (e.position(), e.size());
+                let b = crate::movie_overlay::Box4 { left: px as i32, top: py as i32, right: (px + pw) as i32, bottom: (py + ph) as i32 };
+                let mask = self.movie_mask(e, x, y);
+                self.draw_credits_roll(b, &mask, self.clock_ms as i64, talpha, aspect, out);
+            }
         }
+    }
+
+    /// The depth mask `NFS5.MOVIECIRCLE` draws its clip, overlay and roll through (0x4CDAE0,
+    /// `movie_overlay::RowMask`): the rows its `stencilshape` parts cover, the widget at `(x, y)`.
+    /// `stencilshape1` is a `RECT` (`0xFF000000`, 256 × 232) and the other eight `SHAPE`s of
+    /// `movieoval.fsh`, whose opaque pixels are what they write under the alpha test; a part's
+    /// `flip` mirrors its art (bit 0 across, bit 1 down) as it does when it is painted. The bind
+    /// takes all nine by name (0x4CD898…0x4CDA4D) and the draw paints them whatever the state
+    /// (0x4CDB2C…0x4CDB57); every shipped circle is in `test1`, which lists all nine.
+    fn movie_mask(&self, e: &nfs_formats::lay::Element, x: f32, y: f32) -> crate::movie_overlay::RowMask {
+        let mut m = crate::movie_overlay::RowMask::default();
+        if let Some(c) = self.controls.get(&e.class) {
+            for p in (1..=9).filter_map(|k| c.part(&format!("stencilshape{k}"))) {
+                if p.kind() != nfs_formats::ctr::PartKind::Rect {
+                    continue;
+                }
+                let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)));
+                let (Some((px, py)), Some((pw, ph))) = (at("pos"), at("size")) else { continue };
+                if self.part_colour(e, p, "color").is_none_or(|c| c[3] == 0) {
+                    continue;
+                }
+                let (l, t) = (x + px as f32, (y + py as f32).round() as i32);
+                for row in t..t + ph as i32 {
+                    m.add(row, l, l + pw as f32);
+                }
+            }
+        }
+        for (px, py, file, index, flip) in self.shape_parts_in(e, &stencil_parts(), None) {
+            let (Some(runs), Some(&(_, aw, ah))) = (self.mask_runs.get(&(file.clone(), index)), self.shapes.get(&(file, index))) else { continue };
+            let (l, t) = (x + px as f32, (y + py as f32).round() as i32);
+            for (sy, row) in runs.iter().enumerate() {
+                let ry = if flip & 2 != 0 { ah as i32 - 1 - sy as i32 } else { sy as i32 };
+                for &(a, z) in row {
+                    let (a, z) = if flip & 1 != 0 { (aw - z as f32, aw - a as f32) } else { (a as f32, z as f32) };
+                    m.add(t + ry, l + a, l + z);
+                }
+            }
+        }
+        m
     }
 
     /// **0x4CDF40**, after the clip and the oval: the overlay's lines, flashes and runs in three
@@ -1222,10 +1345,6 @@ impl LayoutScreen {
                 }
             }
         }
-        drop(map);
-        if credits {
-            self.draw_credits_roll(b, now, talpha, aspect, out);
-        }
     }
 
     /// **0x4CE0F0**, the credits roll: `FEStrings` 6000 … 6467 down the box, centred, from the
@@ -1233,29 +1352,41 @@ impl LayoutScreen {
     /// −3 while `ID_CREDSBACK` is hovered, +3 on `ID_CREDSFWD`, 1 otherwise (0x50EB0D…0x50EB38). A
     /// line starting `#` or `!` drops the marker and takes the heading font 3 px lower and 2 px
     /// taller, `*` drops it and takes the body font, the rest take the body font; each line is
-    /// `max(height + 2, 12)` tall (0x4CE47B…0x4CE495). With the yraGyraG code the line
+    /// `max(height + 2, 12)` tall (0x4CE47B…0x4CE495, `pitch` below). With the yraGyraG code the line
     /// `"Gary Steinke"` is 10 taller and has `"(my cat's name is mittens)"` 13 below it, in the
     /// heading font at 0xC0 of the colour (0x4CE348…0x4CE3B7). The colour is white at the widget's
     /// fade (0x4D87D0).
     ///
-    /// A line's height is 0x536970's second measure of its text (the marker dropped) in its font —
-    /// the span of its glyph quads (`BitmapFont::measure`). APPROXIMATION: a line is drawn only
-    /// when it starts inside the box (the original cuts with the oval's stencil).
-    fn draw_credits_roll(&self, b: crate::movie_overlay::Box4, now: i64, talpha: f32, aspect: f32, out: &mut Vec<Sprite>) {
+    /// A line's height is 0x536970's fourth output, 0x53ECE0's `maxY − minY` of the string's glyph
+    /// quads (`BitmapFont::measure().1`) — not the font's line step.
+    ///
+    /// **Every** line the loop reaches is drawn, whether it starts above the box (the one
+    /// scrolled part way off the top) or ends below it (the last): the loop runs while the lines'
+    /// sum is short of the box's height (0x4CE4A0) and has no test of its own. What cuts them is
+    /// the movie circle's depth mask, `mask` (0x4DAAC0 … 0x4DAB00, `movie_overlay::RowMask`): a
+    /// glyph shows only over the pixels the nine `stencilshape` parts cover — the oval, 113…527 ×
+    /// 94…454 on the credits screen, which is not the widget's box.
+    fn draw_credits_roll(&self, b: crate::movie_overlay::Box4, mask: &crate::movie_overlay::RowMask, now: i64, talpha: f32, aspect: f32, out: &mut Vec<Sprite>) {
         use crate::movie_overlay::{credits_wrap, CreditsRoll};
         let (Some(body), Some(head)) = (self.fonts.get(crate::layout::ROLL_FONTS[0]), self.fonts.get(crate::layout::ROLL_FONTS[1])) else { return };
         let gary = self.cheat_bits & (1 << 6) != 0;
         let text = |id: i32| self.fe_strings.get(id as u32).unwrap_or_default().to_string();
-        let height = |id: i32| -> i32 {
+        // A line's pitch is `max(round(h) + 2, 12)` — `fistp`, round to nearest (0x4CE1FF,
+        // 0x4CE47E) — with `h` 0x536970's height of the string in the line's font (+2 for a
+        // heading, +10 for Gary under bit 6). The two measures differ in one thing: the step
+        // (0x4CE16B…0x4CE1F9) drops a heading's `#` / `!` before measuring (`inc edi` at
+        // 0x4CE1E8), the row loop (0x4CE3FC…0x4CE478) measures the string **as stored**, marker
+        // and all — and neither drops a `*` (the draw alone skips it, 0x4CE2D7).
+        let pitch = |id: i32, drop_heading_marker: bool| -> i32 {
             let t = text(id);
             let h = if t.starts_with('#') || t.starts_with('!') {
-                head.measure(&t[1..]).1 + 2.0
+                head.measure(if drop_heading_marker { &t[1..] } else { &t }).1 + 2.0
             } else if gary && t == "Gary Steinke" {
                 body.measure(&t).1 + 10.0
             } else {
-                body.measure(t.strip_prefix('*').unwrap_or(&t)).1
+                body.measure(&t).1
             };
-            (h as i32 + 2).max(12)
+            (h.round_ties_even() as i32 + 2).max(12)
         };
         let hovered = self.hovered().and_then(|k| self.layout.elements.get(k)).and_then(|e| e.get("name")).unwrap_or("");
         let speed = match hovered {
@@ -1265,7 +1396,7 @@ impl LayoutScreen {
         };
         let mut slot = self.credits_roll.borrow_mut();
         let roll = slot.get_or_insert_with(|| CreditsRoll::new(0));
-        roll.advance(now, speed, height);
+        roll.advance(now, speed, |id| pitch(id, true));
         let white = [1.0, 1.0, 1.0, talpha];
         let centre = ((b.right - b.left) / 2 + b.left) as f32;
         let mut acc = 0;
@@ -1274,21 +1405,18 @@ impl LayoutScreen {
             id = credits_wrap(id);
             let t = text(id);
             let y = (b.top - roll.offset + acc) as f32;
-            let inside = y >= b.top as f32 && y < b.bottom as f32;
-            if inside {
-                if let Some(rest) = t.strip_prefix('#').or_else(|| t.strip_prefix('!')) {
-                    self.text(out, aspect, head, rest, centre, y + 3.0, 0.0, 1, white);
-                } else if let Some(rest) = t.strip_prefix('*') {
-                    self.text(out, aspect, body, rest, centre, y, 0.0, 1, white);
-                } else {
-                    self.text(out, aspect, body, &t, centre, y, 0.0, 1, white);
-                    if gary && t == "Gary Steinke" {
-                        let c = [1.0, 1.0, 1.0, talpha * 0xC0 as f32 / 255.0];
-                        self.text(out, aspect, head, "(my cat's name is mittens)", centre, y + 13.0, 0.0, 1, c);
-                    }
+            if let Some(rest) = t.strip_prefix('#').or_else(|| t.strip_prefix('!')) {
+                self.text_masked(out, aspect, head, rest, centre, y + 3.0, 1, white, mask);
+            } else if let Some(rest) = t.strip_prefix('*') {
+                self.text_masked(out, aspect, body, rest, centre, y, 1, white, mask);
+            } else {
+                self.text_masked(out, aspect, body, &t, centre, y, 1, white, mask);
+                if gary && t == "Gary Steinke" {
+                    let c = [1.0, 1.0, 1.0, talpha * 0xC0 as f32 / 255.0];
+                    self.text_masked(out, aspect, head, "(my cat's name is mittens)", centre, y + 13.0, 1, c, mask);
                 }
             }
-            acc += height(id);
+            acc += pitch(id, false);
             id += 1;
         }
     }
@@ -1468,10 +1596,11 @@ impl LayoutScreen {
         // every run** (0x51FE8E) — 93 of the 181 ask for 5. The port has no per-widget
         // generator, so it spreads those over the four by the widget's own index:
         // APPROXIMATION, and the only invention-shaped choice here.
+        // A run may start only with the fade at 0 (0x522622…0x52262C); the object is built by
+        // the bind, at the screen's open.
+        let fade_zero = self.widget_progress() * 255 / TRANS_FULL == 0;
         match self.attr_num(e, "animate").unwrap_or(0.0) as i32 {
-            0 => {}
-            5 => self.glinty_flourish(out, aspect, x, y, gw as i32, gh as i32, (i % 4) as i32 + 1),
-            v @ 1..=4 => self.glinty_flourish(out, aspect, x, y, gw as i32, gh as i32, v),
+            v @ 1..=5 => self.glinty_flourish(i, Some(0), &|_| fade_zero, v, out, aspect, x, y, gw as i32, gh as i32),
             _ => {}
         }
     }
@@ -1939,7 +2068,11 @@ impl LayoutScreen {
                         // a cell with no anchor of its own sits at the panel's left edge
                         let ax = if cell.anchor.is_empty() { px } else { self.anchor_x(&cell.anchor).unwrap_or(px) };
                         let align = if cell.dx.is_sign_negative() { 2 } else { 0 };
-                        self.text(out, aspect, f, &cell.text, ax + cell.dx, ry, 0.0, align, tint(text_c));
+                        let mut c = text_c;
+                        if cell.fade != 0xFF {
+                            c[3] = ((c[3] as u32 * cell.fade as u32) / 255) as u8;
+                        }
+                        self.text(out, aspect, f, &cell.text, ax + cell.dx, ry, 0.0, align, tint(c));
                     }
                 }
                 // `drawPartsHeading` 0x518DE0: a black rule at the top and another 13
@@ -1950,16 +2083,29 @@ impl LayoutScreen {
                     out.push(self.quad(aspect, px, ry, panel_w, 1.0, black));
                     out.push(self.quad(aspect, px, ry + PART_HEADER_H, panel_w, 1.0, black));
                     self.text(out, aspect, f, t, px, ry + 2.0, panel_w, 1, tint(text_c));
+                    // and over it 0x521400's bevel, `(x, y, w, 13.0, fade, 2)` (0x518E7F…)
+                    self.bevel_heading(out, aspect, px, ry, panel_w, PART_HEADER_H, 2.0);
                 }
                 // the garage list's grouping heading (§4.144): the same two rules 13
                 // apart, but drawn by the row painter itself — 0x4F5D67 puts a bar at
                 // the row's y and 0x4F5D8D another at `y + [0x5B7734]` (13.0), with
                 // `FEStrings[era or class]` between them at 0x4F5DB3
+                // `FEColourAccessor`'s rows (0x4B9390): the bar, then the swatch or the
+                // custom row's string — a list box hands the same 3.0 inset (0x4C688F)
+                ListRow::Swatch(_) | ListRow::CustomColour(_) => {
+                    if let Some(c) = bar {
+                        out.push(self.quad(aspect, px, ry, panel_w, row.height(), tint(c)));
+                    }
+                    self.colour_row(out, aspect, f, row, px, ry, 3.0, &tint);
+                }
                 ListRow::GroupHeading(t) => {
                     let black = [0.0, 0.0, 0.0, 1.0];
                     out.push(self.quad(aspect, px, ry, panel_w, 1.0, black));
                     out.push(self.quad(aspect, px, ry + PART_HEADER_H, panel_w, 1.0, black));
                     self.text(out, aspect, f, t, px, ry + 2.0, panel_w, 1, tint(text_c));
+                    // and 0x521400's bevel one pixel down, `(x, y + 1, w, 12.0, fade, 2)`
+                    // (0x4F5DF1…0x4F5E0C)
+                    self.bevel_heading(out, aspect, px, ry + 1.0, panel_w, 12.0, 2.0);
                 }
             }
             if let Some(cx) = price_x {
@@ -2017,9 +2163,16 @@ impl LayoutScreen {
         // solid red bar behind every label on `QuickRace.lay`. A class that really is
         // a box draws its rects from its own arm, as `NFS5.CONTROLLERSETUP` does.
         // the art the widget's class template carries, at the places the template puts
-        // it — `NFS5.CARSETTINGBUTTON`'s arrows, the popup circles, the tab buttons
+        // it — `NFS5.CARSETTINGBUTTON`'s arrows, the popup circles, the tab buttons — from
+        // the part list of the state the widget is in **now**: every class that reaches this
+        // arm and whose states list different art draws through 0x4C8260 → 0x525830 —
+        // `NFS5.CARSETTINGBUTTON` (slot 15 of 0x5B5970 is 0x4C8260: `picnonsel` / `picsel` on
+        // hover / `picseldown` focused), `NFS5.PLAYERDRIVERPICTURE` (0x4CF7C0 → 0x4CF7CE),
+        // `NFS5.CHRONICLESLIDER` (0x4C8260) and the pure-template `NFS5.POPUPCIRCLE` (the base
+        // draw 0x520E50 → 0x520E5E). Until 2026-09-27 this took the `.lay` block's `state=`,
+        // so no car-setting arrow ever showed its hover or pressed art.
         let mut from_template = false;
-        for (px, py, file, index, flip) in self.shape_parts(e) {
+        for (px, py, file, index, flip) in self.shape_parts_at(e, self.drawn_state(e, i, selected, hovered), None) {
             let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
             let (pos, size) = self.place(aspect, x + px, y + py, aw, ah);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
@@ -2174,18 +2327,17 @@ impl LayoutScreen {
             let animating = self.attr_num(e, "animating").unwrap_or(0.0) != 0.0;
             let mut watches = self.wrap_watch.borrow_mut();
             let w = watches.entry(i).or_insert_with(|| crate::layout::WrapWatch { text: text.clone(), changing: None, restart: None });
+            let before = w.restart;
             w.tick(&text, now, animating);
-            let budget = match w.restart {
-                Some(at) if animating => Some(((now - at).max(0) / 3) as usize),
-                _ => self.typewriter(e),
-            };
+            // a rebuild restamps the typing (0x52301A) and leaves its wait as it was
+            let budget = self.typewriter(i, e, w.restart.filter(|_| w.restart != before));
             let mut color = color;
             color[3] *= w.fade(now);
             if budget != Some(0) {
                 self.wrapped_text(out, aspect, f, &w.text, x, y, box_w, e.int("align").unwrap_or(0), color, budget);
             }
         } else if e.class.to_ascii_lowercase().contains("wordwrap") {
-            let budget = self.typewriter(e);
+            let budget = self.typewriter(i, e, None);
             if budget != Some(0) {
                 self.wrapped_text(out, aspect, f, &text, x, y, box_w, e.int("align").unwrap_or(0), color, budget);
             }
@@ -2193,5 +2345,44 @@ impl LayoutScreen {
             self.text(out, aspect, f, &text, x, y, box_w, e.int("align").unwrap_or(0), color);
         }
         closed
+    }
+}
+
+/// `NFS5.MOVIECIRCLE`'s nine stencil parts in the order its draw holds them — `[+0x1C4]` then
+/// `[+0x1C8…+0x1E4]`, bound by name at 0x4CD898…0x4CDA4D and painted whatever the state
+/// (0x4CDB2C…0x4CDB57).
+fn stencil_parts() -> Vec<String> {
+    (1..=9).map(|k| format!("stencilshape{k}")).collect()
+}
+
+/// `FEMovie`'s frame blit **0x4E2820** (slot 1, vtable 0x5B6BE4), after the upload 0x536510: the
+/// frame goes at `origin + ([+0x14], [+0x18])` — the widget's `pos` — and
+///
+/// * when the box is **shorter** than the clip and **wider** than it (`[+8] < [+0x10]` and
+///   `[+4] > [+0xC]`, signed, 0x4E2885 / 0x4E28A3) through the clipped blit 0x4D9E70 at
+///   `w × clip height`, cut to the rectangle `ftol(x), ftol(y), ftol(x + w), ftol(y + h)` — the
+///   frame stretched across and shown 1:1 down to the box's foot, its texture cut in proportion;
+/// * otherwise through 0x4D9B30 at the box's `w × h` — the frame stretched to the box.
+///
+/// The entry covers the clip's own `width/256 × height/256` of the 256×256 surface
+/// (0x4E219C…0x4E21B3), so `v = 1` is the frame's last row. Returns the `v` the quad of height
+/// `box_h` reaches: 1, or `box_h / clip height` on the clipped arm. The 454×280 and 416×348 boxes
+/// are at least their clips (192×144, 208×144) both ways, so they stretch; `chronicle.lay`'s
+/// 454×46 strip (`othersource=chroniclemain`, the group's `ch*.mad`) is shorter and wider, so it
+/// shows the clip's top 46 rows stretched across — not the whole frame squeezed into the strip.
+fn movie_blit_v(box_w: f32, box_h: f32, clip: (f32, f32)) -> f32 {
+    if box_h < clip.1 && box_w > clip.0 { box_h / clip.1 } else { 1.0 }
+}
+
+#[cfg(test)]
+mod movie_blit_tests {
+    #[test]
+    fn a_movie_box_stretches_unless_it_is_shorter_and_wider_than_the_clip() {
+        assert_eq!(super::movie_blit_v(454.0, 280.0, (192.0, 144.0)), 1.0);
+        assert_eq!(super::movie_blit_v(416.0, 348.0, (192.0, 144.0)), 1.0);
+        // shorter and wider: 1:1 rows, cut at the box's foot
+        assert_eq!(super::movie_blit_v(454.0, 46.0, (192.0, 144.0)), 46.0 / 144.0);
+        // shorter but not wider: 0x4E28A9's `jle` takes the stretch
+        assert_eq!(super::movie_blit_v(192.0, 46.0, (192.0, 144.0)), 1.0);
     }
 }

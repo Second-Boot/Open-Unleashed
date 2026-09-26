@@ -227,9 +227,11 @@ pub fn cycle_from_registry(r: &nfs_formats::fetxt::Registry, car: usize) -> Vec<
 /// The view whose offset the car's `.tpg` replaces.
 pub const VIEW_DRIVER: usize = 1;
 
-/// Whether the camera's own car is drawn in this view — **it is not**, in the bumper and driver
-/// views (0x4383FD: when `carInfo+0x520` is the car the camera follows and the view id is 0 or 1,
-/// the per-car render call `0x43EF80` is skipped). CONFIRMED.
+/// Whether the camera's own car runs its particle effects' drive in this view — **it does not**
+/// in the bumper and driver views (0x4383FD: when `carInfo+0x520` is the car the camera follows and
+/// the view id is 0 or 1, `[car+0x704] → 0x43EF80(1)` is skipped; `nfs_game::car_effects`).
+/// CONFIRMED. *(Corrected 2026-09-26/27: this was read as "the car is not drawn"; 0x43EF80 is the
+/// cars' `carpart.dat` effects, not the body — `car-model.md` §13, `particles.md` §11.)*
 pub fn draws_own_car(view: u16) -> bool {
     view > 1
 }
@@ -320,6 +322,173 @@ pub fn look_step(cur: i16, target: i16) -> (i16, bool) {
         ax += 360;
     }
     (ax, true)
+}
+
+/// **`AnimCam`, view 0x0E — the race's opening camera path** (`race-logic.md` §13).
+///
+/// A track's `.crp` carries five `CmAn` level entries (every shipped track: 6340 bytes each, named
+/// `camera00` … `camera04` at `+0`). The track load 0x471850 (called at 0x48779C) makes one record
+/// per entry, in table order, into the set `[0x628938]` — the set 0x471700 made at 0x48778A with
+/// the clock `&gGameTick` (`[0x606AC4]`) and the step `0x3C800000` = 1/64 s. The entry's `+0x28` is
+/// the key count (121 in every shipped one) and its keys start at `+0x2C`, 0x34 bytes each: the
+/// quaternion `+0x00`, the position `+0x10`, the scale `+0x20` — the `Anqt` layout the article
+/// animations use, read by the same sampler.
+///
+/// `0x471A50(set, 0)`, which the view's update 0x462F30 calls when its slot `+0x0C` holds no
+/// animation: **the counter `[0x62893C]` is stepped first**, `(c + 1) mod count` (0x471A70…
+/// 0x471A90), and the record at that index is played. The counter is a `.bss` word no other code
+/// writes, so the rotation runs on through the process — the first race after launch plays
+/// `camera01`. The player it builds (outer vtable 0x5B4634, inner record at `+0x10`) has flags 0,
+/// **`0x3D124925` = 1/28 s a key** (0x471AEC — not the entry's `+0x24` 0.1, which 0x471850 keeps
+/// but nothing reads), no drift, state 1 and the start `+0x08` = `gGameTick` at the pick.
+pub mod anim_cam {
+    use glam::{Mat3, Vec3};
+    use nfs_formats::crp::{AnimFrame, AnimTrack};
+
+    /// 0x471AEC: the player's seconds per key, `0x3D124925`.
+    pub const SECONDS_PER_KEY: f32 = f32::from_bits(0x3D12_4925);
+    /// `[0x628938]+8`, 0x471700's step (`0x3C800000`): a game tick.
+    pub const STEP: f32 = 1.0 / 64.0;
+
+    /// The five `CmAn` animations of a track, in table order (0x471850 walks the level entries from
+    /// the first `CmAn`, 0x59F700, `ebx += 0x10`). An entry too short for its count is skipped.
+    pub fn load(crp: &nfs_formats::crp::Crp, data: &[u8]) -> Vec<AnimTrack> {
+        let f = |b: &[u8], o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        crp.level
+            .iter()
+            .filter(|e| e.is_level(b"CmAn"))
+            .filter_map(|e| {
+                let b = crp.entry_data(data, e).ok()?;
+                if b.len() < 0x2C {
+                    return None;
+                }
+                let n = u32::from_le_bytes([b[0x28], b[0x29], b[0x2A], b[0x2B]]) as usize;
+                if n < 2 || b.len() < 0x2C + n * 0x34 {
+                    return None;
+                }
+                let frames = (0..n)
+                    .map(|k| {
+                        let o = 0x2C + k * 0x34;
+                        AnimFrame {
+                            rotation: [f(b, o), f(b, o + 4), f(b, o + 8), f(b, o + 12)],
+                            position: [f(b, o + 0x10), f(b, o + 0x14), f(b, o + 0x18)],
+                            scale: [f(b, o + 0x20), f(b, o + 0x24), f(b, o + 0x28)],
+                        }
+                    })
+                    .collect();
+                Some(AnimTrack { frames })
+            })
+            .collect()
+    }
+
+    /// `0x471A50(set, 0)`: steps the rotation counter `[0x62893C]` and answers the index to play,
+    /// `None` with no animation (the counter then stays: `test edx, ~3` on the vector's byte size,
+    /// 0x471A68).
+    pub fn pick(counter: &mut u32, count: usize) -> Option<usize> {
+        if count == 0 {
+            return None;
+        }
+        *counter = (counter.wrapping_add(1)) % count as u32;
+        Some(*counter as usize)
+    }
+
+    /// The player's slot 1, 0x471670 → `AnimPlayer::sample` 0x470E90 → 0x470F70, `ticks` after
+    /// its start (`max(0, gGameTick − start)`, 0x4716A2…0x4716B6): `rate = (1/28) / (1/64)` ticks
+    /// a key (stored as a float, 0x470EAB), `f = ticks / rate`, `i = _ftol(f)`, `frac = f − i`; no
+    /// loop flag, so `i >= count − 2` (unsigned, 0x470EF2) holds `i = count − 1`, `frac = 0`, and
+    /// the answer `i + 1 < count` is false — status 2, the animation over (0x4716C4…0x4716CB).
+    /// Otherwise the key pair's quaternion and position lerped per component (0x48A150), the
+    /// matrix of the unnormalised quaternion as 0x48A1E0 fills it — rows of `R(q)ᵀ` — each row
+    /// scaled by the lerped scale (0x5329A0), the position the translation (0x539CD0); the drift
+    /// `+0x14` is zero. Answers `(A, t)`: `A` in the original's row-major sense (row `k` is the
+    /// animation's axis `k`), `t` in the car's body frame.
+    pub fn sample(track: &AnimTrack, ticks: i64) -> Option<(Mat3, Vec3)> {
+        let n = track.frames.len();
+        if n < 2 {
+            return None;
+        }
+        let rate = SECONDS_PER_KEY / STEP;
+        // `fild` / `fdiv` on the x87's wide stack, then `_ftol`
+        let f = ticks.max(0) as f64 / rate as f64;
+        let mut i = f as usize;
+        let mut frac = (f - i as f64) as f32;
+        if i >= n - 2 {
+            i = n - 1;
+            frac = 0.0;
+        }
+        if i + 1 >= n {
+            return None;
+        }
+        let (a, b) = (&track.frames[i], &track.frames[i + 1]);
+        let l = |x: f32, y: f32| (y - x) * frac + x;
+        let q: [f32; 4] = std::array::from_fn(|k| l(a.rotation[k], b.rotation[k]));
+        let p = Vec3::new(l(a.position[0], b.position[0]), l(a.position[1], b.position[1]), l(a.position[2], b.position[2]));
+        let s = Vec3::new(l(a.scale[0], b.scale[0]), l(a.scale[1], b.scale[1]), l(a.scale[2], b.scale[2]));
+        let [x, y, z, w] = q;
+        let (x2, y2, z2) = (x + x, y + y, z + z);
+        let (wx, wy, wz) = (x2 * w, y2 * w, z2 * w);
+        let (xx, xy, xz) = (x2 * x, y2 * x, z2 * x);
+        let (yy, yz, zz) = (y2 * y, z2 * y, z2 * z);
+        let rows = [
+            Vec3::new(1.0 - yy - zz, xy + wz, xz - wy) * s.x,
+            Vec3::new(xy - wz, 1.0 - xx - zz, yz + wx) * s.y,
+            Vec3::new(xz + wy, yz - wx, 1.0 - xx - yy) * s.z,
+        ];
+        Some((Mat3::from_cols(rows[0], rows[1], rows[2]).transpose(), p))
+    }
+
+    /// `0x4A4810`, the re-orthonormalisation 0x462F30 runs on the slot matrix last (0x463071):
+    /// four passes of `D = MᵀM − I`, `S = I − D/8 + 3D²/32 − 5D³/64`, `M ← M·S` — the same
+    /// routine `nfs_physics::vehicle::Vehicle::renormalise` ports for the car, on a plain matrix.
+    pub fn renormalise(m: Mat3) -> Mat3 {
+        type M3 = [[f32; 3]; 3];
+        fn mul(a: &M3, b: &M3) -> M3 {
+            let mut d = [[0.0; 3]; 3];
+            for i in 0..3 {
+                for j in 0..3 {
+                    d[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+                }
+            }
+            d
+        }
+        const I: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        const C: [f32; 3] = [-0.125, 0.093_75, -0.078_125];
+        let mut a: M3 = [m.row(0).to_array(), m.row(1).to_array(), m.row(2).to_array()];
+        for _ in 0..4 {
+            let t: M3 = std::array::from_fn(|i| std::array::from_fn(|j| a[j][i]));
+            let mut d = mul(&t, &a);
+            for (i, row) in d.iter_mut().enumerate() {
+                row[i] -= 1.0;
+            }
+            let (mut r, mut s) = (I, I);
+            for c in C {
+                r = mul(&r, &d);
+                for i in 0..3 {
+                    for j in 0..3 {
+                        s[i][j] += r[i][j] * c;
+                    }
+                }
+            }
+            a = mul(&a, &s);
+        }
+        Mat3::from_cols(Vec3::from(a[0]), Vec3::from(a[1]), Vec3::from(a[2])).transpose()
+    }
+
+    /// **0x462F30's pose** from a sample `(A, t)` and the car's matrix `C` (`car+0x364`, row-major
+    /// in the original's sense — this port's `car_rot` is `Cᵀ`) and origin `car+0x330`:
+    ///
+    /// * the eye `+0x10` = `car + t·C` (0x539D40 splits the 4×4, 0x532A40 turns `t`, 0x532300 adds);
+    /// * the matrix `+0x68` = `R · A · C` (0x532470 at 0x46302E for `A·C`, then 0x539BD0(90°, (1, 0,
+    ///   0)) through 0x5326C0 — rows `(1,0,0)`, `(0,0,1)`, `(0,−1,0)` — multiplied on the left at
+    ///   0x46306B), re-orthonormalised (0x4A4810).
+    ///
+    /// So the camera's up row is the animation's `z` axis and its forward row the animation's
+    /// `−y`, carried by the car. Answers the eye and the matrix (rows: right, up, forward).
+    pub fn pose(a: Mat3, t: Vec3, car: Mat3, car_pos: Vec3) -> (Vec3, Mat3) {
+        let eye = car_pos + car.transpose() * t;
+        let r = Mat3::from_cols(Vec3::X, Vec3::new(0.0, 0.0, -1.0), Vec3::Y);
+        (eye, renormalise(r * a * car))
+    }
 }
 
 #[cfg(test)]
@@ -449,5 +618,45 @@ mod tests {
         assert_eq!(y, 357);
         assert_eq!(look_step(0, 0), (0, false));
         assert_eq!(look_step(357, 0), (357, true));
+    }
+
+    #[test]
+    fn anim_cam_rotation_steps_before_it_picks() {
+        let mut c = 0;
+        assert_eq!(anim_cam::pick(&mut c, 5), Some(1));
+        assert_eq!(anim_cam::pick(&mut c, 5), Some(2));
+        c = 4;
+        assert_eq!(anim_cam::pick(&mut c, 5), Some(0));
+        assert_eq!(anim_cam::pick(&mut c, 0), None);
+        assert_eq!(c, 0);
+    }
+
+    #[test]
+    fn anim_cam_runs_119_keys_of_121_and_stops_at_tick_273() {
+        use nfs_formats::crp::{AnimFrame, AnimTrack};
+        let frame = |z: f32| AnimFrame { rotation: [0.0, 0.0, 0.0, 1.0], position: [0.0, 0.0, z], scale: [1.0; 3] };
+        let track = AnimTrack { frames: (0..121).map(|k| frame(k as f32)).collect() };
+        // 2.2857144 ticks a key: tick 272 is key 118.99…, tick 273 key 119.4 → held, status 2
+        let (a, t) = anim_cam::sample(&track, 272).unwrap();
+        assert!(t.z > 118.9 && t.z < 119.0);
+        assert_eq!(a, glam::Mat3::IDENTITY);
+        assert!(anim_cam::sample(&track, 273).is_none());
+        assert_eq!(anim_cam::sample(&track, -5).unwrap().1, Vec3::ZERO);
+        let (_, t) = anim_cam::sample(&track, 16).unwrap();
+        assert!((t.z - 7.0).abs() < 1e-4, "{t}");
+    }
+
+    #[test]
+    fn anim_cam_looks_down_the_animations_minus_y_with_its_z_up() {
+        // an identity key and an unturned car: the eye at the key's position, looking along −y
+        let (eye, m) = anim_cam::pose(glam::Mat3::IDENTITY, Vec3::new(1.0, 2.0, 3.0), glam::Mat3::IDENTITY, Vec3::new(10.0, 0.0, 0.0));
+        assert_eq!(eye, Vec3::new(11.0, 2.0, 3.0));
+        assert!((m.row(2) - Vec3::new(0.0, -1.0, 0.0)).length() < 1e-6);
+        assert!((m.row(1) - Vec3::Z).length() < 1e-6);
+        // a car turned a quarter about y (rows: x-axis, up, forward) carries both
+        let car = glam::Mat3::from_cols(Vec3::new(0.0, 0.0, 1.0), Vec3::Y, Vec3::new(-1.0, 0.0, 0.0));
+        let (eye, m) = anim_cam::pose(glam::Mat3::IDENTITY, Vec3::new(0.0, 0.0, 3.0), car, Vec3::ZERO);
+        assert!((eye - car.row(2) * 3.0).length() < 1e-6);
+        assert!((m.row(1) - car.row(2)).length() < 1e-6);
     }
 }

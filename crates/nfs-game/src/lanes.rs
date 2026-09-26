@@ -97,16 +97,20 @@ pub fn gap_between(table: &SliceTable, a_slice: usize, b_slice: usize) -> f32 {
 /// `0x40E860(a, b)` in full (0x40E860…0x40E91B, read 2026-09-26): the coarse slice gap of
 /// [`gap_between`], and when that is within ±12 m (`[0x5B240C]` / `[0x5B24C8]`, neither `> 12` nor
 /// `< −12`) instead `dot2D(a+0x330 − b+0x330, a+0x3D0)` — the x–z projection of the offset on `a`'s
-/// forward axis, which the tracker keeps on the slice's forward (`race-logic.md` §6). The port takes
-/// that axis as the slice's `forward`, normalised in x–z — APPROXIMATION for `+0x3D0`, which is
-/// orthogonalised against the patch normal first. Positions `None`: the coarse gap alone.
+/// forward axis. `+0x3D0` is the slice record's own forward `+0x1C`, copied as it stands by the
+/// tracker refresh 0x499520 whenever the car's patch changes (0x4996A3…0x49971E: `+0x3B8` ← slice
+/// `+0x28`, `+0x3C4` ← `+0x10`, `+0x3D0` ← `+0x1C` of `slices[car+8]`, read 2026-09-26); only
+/// `Car_placeAtSlice` orthogonalises it, and the 0x49AF70 it ends with refreshes it again. So the
+/// dot is with the raw `x` / `z` of the slice's forward, **not** renormalised in x–z (0x40E8E9…
+/// 0x40E913: `f.x·dx + f.z·dz`). *(Until 2026-09-26 the port normalised it in x–z, an
+/// APPROXIMATION that read `+0x3D0` as orthogonalised.)* Positions `None`: the coarse gap alone.
 pub fn gap_fine(table: &SliceTable, a_slice: usize, b_slice: usize, pos: Option<(glam::Vec3, glam::Vec3)>) -> f32 {
     let d = gap_between(table, a_slice, b_slice);
     match pos {
         Some((pa, pb)) if (-12.0..=12.0).contains(&d) => {
             let f = table.slices[a_slice].forward;
-            let f = glam::Vec2::new(f.x, f.z).normalize_or_zero();
-            (pa.x - pb.x) * f.x + (pa.z - pb.z) * f.y
+            // 0x532330(1, a+0x330, b+0x330): the offset `a − b`; then `f.x·dx + f.z·dz`
+            f.x * (pa.x - pb.x) + f.z * (pa.z - pb.z)
         }
         _ => d,
     }

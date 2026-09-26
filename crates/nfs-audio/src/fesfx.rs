@@ -52,7 +52,7 @@ impl FeSfx {
             return Some(c.clone());
         }
         let pcm = self.bank.decode_slot(&self.data, slot).ok()?;
-        let clip = Arc::new(Clip { rate: pcm.rate, channels: pcm.channels, samples: pcm.samples, loop_range: pcm.loop_range, gain: pcm.gain, bend_cents: pcm.bend_cents, fx_send: pcm.fx_send });
+        let clip = Arc::new(Clip::from_pcm(pcm));
         self.clips.insert(slot, clip.clone());
         Some(clip)
     }

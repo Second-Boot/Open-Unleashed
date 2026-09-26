@@ -118,9 +118,10 @@ pub fn segments_cross(a0: Vec3, a1: Vec3, b0: Vec3, b1: Vec3) -> Option<Vec3> {
 
 /// The box's slot 7 (vtable 0x5B4938), 0x486FB0(seg, …, &normal, &point): each of its edges `i → i+1` against the
 /// car's edge `seg`. The answer is the number of crossings; the first sets the point, the edge's
-/// normal `(e.z, 0, −e.x)` and the distance from the car edge's start; a later one moves the point
-/// only when nearer — without keeping the new distance — and always takes the normal
-/// (0x4871AD…0x487253).
+/// normal and the distance from the car edge's start; a later one moves the point only when nearer
+/// — without keeping the new distance (0x4871AD…0x48721A). The normals are [`edge_normals`]'s:
+/// *(until 2026-09-27 this took `(e.z, 0, −e.x)` of every crossed edge — the opposite sign, and
+/// never the segment's; the camera, its only user, reads the count and the point alone.)*
 pub fn box_edge_test(corners: &[Vec3; 4], s0: Vec3, s1: Vec3) -> (u32, Vec3, Vec3) {
     let (mut count, mut point, mut normal) = (0u32, Vec3::ZERO, Vec3::ZERO);
     let mut best = 0.0f32;
@@ -128,18 +129,63 @@ pub fn box_edge_test(corners: &[Vec3; 4], s0: Vec3, s1: Vec3) -> (u32, Vec3, Vec
         let (c0, c1) = (corners[i], corners[(i + 1) % 4]);
         let Some(hit) = segments_cross(c0, c1, s0, s1) else { continue };
         count += 1;
-        let e = Vec3::new(c1.x - c0.x, c1.y - c0.y, c1.z - c0.z).normalize_or_zero();
-        let n = Vec3::new(e.z, 0.0, -e.x);
         let dist = (hit - s0).length();
-        if count == 1 {
-            normal = n;
+        if normal == Vec3::ZERO {
             point = hit;
             best = dist;
+            normal = edge_normal(c0, c1);
         } else {
             if dist < best {
                 point = hit;
             }
-            normal = n;
+            normal = segment_normal(s0, s1);
+        }
+    }
+    (count, point, normal)
+}
+
+/// The normal both box slots (0x486D70, 0x486FB0) give their **first** crossing, while the out
+/// normal is still zero (the three `fcomp 0.0` tests, 0x486EB0…0x486EE0 / 0x4870F4…0x48712C): the
+/// edge `e = c1 − c0` (0x532330 is `a − b`) with its y cleared, made unit (0x5328D0), turned to
+/// `(−e.z, 0, e.x)` (0x486E6F…0x486E92). For the footprint's winding (0x474CB0: `(min.x, min.z)`,
+/// `(min.x, max.z)`, `(max.x, max.z)`, `(max.x, min.z)`) that is the box's **outward** normal.
+fn edge_normal(c0: Vec3, c1: Vec3) -> Vec3 {
+    let e = Vec3::new(c1.x - c0.x, 0.0, c1.z - c0.z).normalize_or_zero();
+    Vec3::new(-e.z, 0.0, e.x)
+}
+
+/// The normal of every **later** crossing (0x486F42…0x486F7B, 0x48721A…0x487253): the car's own
+/// edge `d = s1 − s0` made unit, turned to `(d.z, 0, −d.x)`.
+fn segment_normal(s0: Vec3, s1: Vec3) -> Vec3 {
+    let d = (s1 - s0).normalize_or_zero();
+    Vec3::new(d.z, 0.0, -d.x)
+}
+
+/// The box's **slot 6** (vtable 0x5B4938 `+0x18`), **0x486D70**(pos, seg, &normal, &point) — the one
+/// the car's box push 0x498690 calls (0x4988D5), read 2026-09-27. Each edge `i → (i+1) & 3` of the
+/// footprint against the car's edge `seg` (0x489CC0 at 0x486E14, the point written on the **box
+/// edge**); the answer is the number of crossings (0x486E5B). The first crossing takes the edge's
+/// outward normal ([`edge_normal`]) and remembers the edge (0x486EE2…0x486F26); a later one moves the
+/// point to where the crossed edge meets that first edge (0x489CC0 again at 0x486F3D — the shared
+/// corner of two neighbours; parallel edges do not meet and leave the point on this crossing) and
+/// takes the car edge's normal ([`segment_normal`]). The `pos − normal` dot product at
+/// 0x486E9A…0x486EAE is thrown away (`fstp st(0)`).
+pub fn box_push_edge_test(corners: &[Vec3; 4], s0: Vec3, s1: Vec3) -> (u32, Vec3, Vec3) {
+    let (mut count, mut point, mut normal) = (0u32, Vec3::ZERO, Vec3::ZERO);
+    let mut first = (Vec3::ZERO, Vec3::ZERO);
+    for i in 0..4 {
+        let (c0, c1) = (corners[i], corners[(i + 1) % 4]);
+        let Some(hit) = segments_cross(c0, c1, s0, s1) else { continue };
+        point = hit;
+        count += 1;
+        if normal == Vec3::ZERO {
+            first = (c0, c1);
+            normal = edge_normal(c0, c1);
+        } else {
+            if let Some(corner) = segments_cross(c0, c1, first.0, first.1) {
+                point = corner;
+            }
+            normal = segment_normal(s0, s1);
         }
     }
     (count, point, normal)
@@ -258,10 +304,31 @@ mod tests {
         // straight through: two crossings
         let (n2, _, _) = box_edge_test(&c, Vec3::new(-1.0, 0.0, 1.0), Vec3::new(3.0, 0.0, 1.0));
         assert_eq!(n2, 2);
-        // into it: one crossing, on the x = 0 edge, whose normal is (e.z, 0, −e.x) of e = +z
+        // into it: one crossing, on the x = 0 edge, whose normal is (−e.z, 0, e.x) of e = +z: out
         let (n1, p, n) = box_edge_test(&c, Vec3::new(-1.0, 0.0, 1.0), Vec3::new(1.0, 0.0, 1.0));
         assert_eq!(n1, 1);
         assert!((p - Vec3::new(0.0, 0.0, 1.0)).length() < 1e-6);
-        assert!((n - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-6, "{n:?}");
+        assert!((n - Vec3::new(-1.0, 0.0, 0.0)).length() < 1e-6, "{n:?}");
+    }
+
+    #[test]
+    fn box_push_edge_test_takes_the_corner_and_the_car_edge_normal() {
+        let c = [Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 2.0), Vec3::new(2.0, 0.0, 2.0), Vec3::new(2.0, 0.0, 0.0)];
+        // one crossing: the point on the box edge, the edge's outward normal
+        let (n1, p, n) = box_push_edge_test(&c, Vec3::new(-1.0, 0.0, 1.0), Vec3::new(1.0, 0.0, 1.0));
+        assert_eq!(n1, 1);
+        assert!((p - Vec3::new(0.0, 0.0, 1.0)).length() < 1e-6);
+        assert!((n - Vec3::new(-1.0, 0.0, 0.0)).length() < 1e-6, "{n:?}");
+        // across a corner: edges 0 (x = 0) and 1 (z = 2) — the point is their shared corner, the
+        // normal the car edge's (d.z, 0, −d.x) for d = unit (1, 0, 1)
+        let (n2, p, n) = box_push_edge_test(&c, Vec3::new(-0.5, 0.0, 1.5), Vec3::new(0.5, 0.0, 2.5));
+        assert_eq!(n2, 2);
+        assert!((p - Vec3::new(0.0, 0.0, 2.0)).length() < 1e-6, "{p:?}");
+        let k = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((n - Vec3::new(k, 0.0, -k)).length() < 1e-6, "{n:?}");
+        // straight through two parallel edges: they do not meet, the point stays on the second
+        let (n3, p, _) = box_push_edge_test(&c, Vec3::new(-1.0, 0.0, 1.0), Vec3::new(3.0, 0.0, 1.0));
+        assert_eq!(n3, 2);
+        assert!((p - Vec3::new(2.0, 0.0, 1.0)).length() < 1e-6, "{p:?}");
     }
 }

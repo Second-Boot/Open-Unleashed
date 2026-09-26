@@ -1,4 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use crate::resample::{self, Cursor, Gains, Interp};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -14,39 +15,490 @@ pub struct Clip {
     /// The patch's own volume (`PcmSample::gain`, `RE/notes/audio.md` §2): the sound library
     /// multiplies the level the game asks for by it, so it belongs to the clip, not the call.
     pub gain: f32,
-    /// The patch's bend range in cents (`PcmSample::bend_cents`, code 0x0A · 100).
+    /// The patch's bend range in cents (`PcmSample::bend_cents`, code 0x0A · 100) — `voice+0x66`, which
+    /// scales the caller's bend byte `voice+0x3F` ([`Voice::pitch_word`]).
     pub bend_cents: i32,
     /// The patch's effect send, code 0x13 → `voice+0x44` (`PcmSample::fx_send`).
     pub fx_send: u8,
+    /// The patch's voice priority, code 0x06 → `voice+0x1A` (`PcmSample::priority`): below
+    /// [`STEAL_BELOW`] the voice can be taken by a later start when the budget is full.
+    pub priority: u8,
+    /// The patch's pan byte, code 0x0C (`PcmSample::pan`) — `voice+0x3E`.
+    pub pan: u8,
+    /// The patch's pan scale, code 0x25 (`PcmSample::pan_scale`) — `voice+0x43`.
+    pub pan_scale: i8,
+    /// The patch's records (`PcmSample::records`): what the start tests and draws from
+    /// ([`crate::librand::patch_start`]). Empty for a clip that is not a bank patch.
+    pub records: Vec<nfs_formats::bnk::PatchRecord>,
+    /// For a patch of more than one record, each record's own clip (`PcmSample::parts`), in
+    /// record order: 0x590420 starts every matching record as a voice of its own. Empty for a
+    /// one-record patch, whose sample is this clip's.
+    pub layers: Vec<Arc<Clip>>,
+    /// The records' tables (`PcmSample::tables`), in record order: the envelope, the volume and
+    /// pitch step tables and the level curve the library service walks ([`Shared::service`]).
+    pub tables: Vec<nfs_formats::bnk::RecordTables>,
 }
 
 impl Clip {
-    /// The pitch factor of the caller's **bend byte** — the third argument of `Voice_play` 0x4A9C10
-    /// and the fifth of `Bank_playOneShot` 0x4A98E0, clamped to 0…127 (0x4A9C1F) and stored in
-    /// `voice+0x3F` (0x5905FE): `(byte − 0x40) · bend_cents >> 6` cents on top of the sample's pitch
-    /// (0x589F75…0x589F90, cents → ratio at 0x589E80, 1200 an octave). 0x40 leaves it alone.
-    /// The port read this byte as a volume until 2026-09-24.
-    pub fn bend(&self, byte: i32) -> f32 {
-        let cents = ((byte.clamp(0, 127) - 0x40) * self.bend_cents) >> 6;
-        (cents as f32 / 1200.0).exp2()
+    /// A bank patch's decoded sample as a clip, its records' own samples as its layers.
+    pub fn from_pcm(p: nfs_formats::bnk::PcmSample) -> Clip {
+        Clip {
+            rate: p.rate,
+            channels: p.channels,
+            samples: p.samples,
+            loop_range: p.loop_range,
+            gain: p.gain,
+            bend_cents: p.bend_cents,
+            fx_send: p.fx_send,
+            priority: p.priority,
+            pan: p.pan,
+            pan_scale: p.pan_scale,
+            records: p.records,
+            layers: p.parts.into_iter().map(|q| Arc::new(Clip::from_pcm(q))).collect(),
+            tables: p.tables,
+        }
     }
+
+    /// The clip record `i` plays: its layer, or the clip itself for a one-record patch.
+    fn layer(self: &Arc<Self>, i: usize) -> Arc<Clip> {
+        self.layers.get(i).cloned().unwrap_or_else(|| Arc::clone(self))
+    }
+}
+
+/// **0x565BB0**, the game's `atan2` on a 1024-step circle, of `x` (the side) and `y` (forward):
+/// the octant from the signs and the larger magnitude, then `0x5E24AC[(x·256 + y/2) / y]` (x ≤ y,
+/// `div`, so rounded) — the table is `round(atan(i/256) · 1024/2π)` for `i` in 0…256 (checked
+/// against all 257 bytes of the file: every one within 0.4999) — or, for `x ≥ 0x800000`, the
+/// 64-bit quotient `(x << 32) / y` rounded at bit 23 (0x565C18…0x565C3E). `x == y` is 0x80.
+pub fn atan2_1024(x: i32, y: i32) -> i32 {
+    let (mut esi, mut ecx) = (y, x);
+    let (mut neg, mut base) = (false, 0i32);
+    if esi < 0 {
+        esi = esi.wrapping_neg();
+        neg = true;
+        base = 0x200;
+    }
+    if ecx < 0 {
+        neg = !neg;
+        ecx = ecx.wrapping_neg();
+        base = -base;
+    }
+    if ecx > esi {
+        std::mem::swap(&mut ecx, &mut esi);
+        base += if neg { -0x100 } else { 0x100 };
+        neg = !neg;
+    }
+    let t = if ecx == esi {
+        0x80
+    } else {
+        let i = if ecx as u32 & 0xFF80_0000 != 0 {
+            let q = ((ecx as u32 as u64) << 32) / esi as u32 as u64;
+            (q >> 24) as u32 + ((q >> 23) & 1) as u32
+        } else {
+            ((esi as u32 >> 1) + ((ecx as u32) << 8)) / esi as u32
+        };
+        ((i as f64 / 256.0).atan() * 1024.0 / std::f64::consts::TAU).round() as i32
+    };
+    if neg { base - t } else { base + t }
+}
+
+/// **0x4A6FE0**'s angle of a sound source: `side` and `fwd` are the offset from the listener
+/// dotted with the listener's row `+0xC` (`[0x655E5C]`) and row `+0x24` (`[0x655E74]`), each
+/// `· 65536` and `_ftol`'d (0x5A0F98, toward zero), `sar 8`, then
+/// `(atan2_1024(side, fwd) & 0x3FF) << 6` — a full-circle 16-bit angle, 0x4000 on the `+side`
+/// hand, 0x8000 behind. `MIRROR` `[0x65742C]` negates `side` (0x4A704D): the caller passes it
+/// negated. Without 3-D positioning (`[0x5D1760] == 0`, never in the shipped `fe.txt`) it is 0.
+pub fn pan_angle(side: f32, fwd: f32) -> u16 {
+    let sx = (side * 65536.0) as i32 >> 8;
+    let sy = (fwd * 65536.0) as i32 >> 8;
+    ((atan2_1024(sx, sy) & 0x3FF) << 6) as u16
+}
+
+/// The **pan byte** `Voice_play` 0x4A98E0 stores in the request's `+7` (0x4A9B4B…0x4A9B84) and
+/// the loops' update hands to `Voice_setPan8` 0x566100 (0x4A9F3D…0x4A9F79, 0x4AB0F1…0x4AB13D),
+/// because `[0x655D40]` — the 3-D pan path, `Voice_setPanAngle` — is always 0 (only 0x4A66B0's dead
+/// branch sets it): the rear half folds onto the front, `(0xBFFF − a) >> 8` for
+/// `0x3FFF < a < 0xC000`, else `((a + 0x4000) >> 8) & 0xFF` — 0x40 ahead, 0x7F at 0x4000 (and just
+/// behind it), 0 at 0xC000, 0x3F dead behind.
+pub fn pan_byte(a: u16) -> u8 {
+    let a = a as i32;
+    if a > 0x3FFF && a < 0xC000 { ((0xBFFF - a) >> 8) as u8 } else { (((a + 0x4000) >> 8) & 0xFF) as u8 }
+}
+
+/// The library's pan for a voice from the caller's byte (0x590560…0x5905A3 at the start,
+/// 0x566171…0x5661A2 on `Voice_setPan8`): scaled about 0x40 by the patch's code 0x25 unless 1,
+/// plus the patch's code 0x0C less 0x40, clamped to 0…127. The angle the backend is handed is then
+/// `(p − 0x40) << 8` (0x59070C…0x590716, `(p + 0xC0) << 8` at 0x5661A4) — the byte back on the
+/// front half circle, 0x4000 at 0x80. `patch_pan` is the start's `voice+0x3E`, code 0x0C plus
+/// its random spread (code 0x0D, [`crate::librand::patch_start`]).
+pub fn voice_pan(byte: u8, patch_pan: u8, scale: i8) -> u8 {
+    let mut p = byte as i8 as i32;
+    if scale != 1 {
+        p = (p - 0x40) * scale as i32 + 0x40;
+    }
+    (p + patch_pan as i32 - 0x40).clamp(0, 127) as u8
+}
+
+/// The sound library's software voice count per `AUDIOQUALITY` `[0x657C98]`: `0x5B4B08[q]` = 48 /
+/// 24 / 12, a byte of the configuration 0x4A66B0 hands to 0x5656D0 (0x4A66F3, 0x4A6719), copied to
+/// `[0x6B48DD]` (0x5656E6) and capped at the library's 128 (`[0x6B48C6]` = 0x80, 0x58A545; the cap
+/// 0x58A731…0x58A742). At quality 3 the configuration is skipped (0x4A66E8) and the library's
+/// default 24 stays (0x58A5B5) — the sound is closed at that setting anyway (0x4A6854 / 0x4A6A09).
+///
+/// The hardware-3D voices `[0x6B48DF]` (`min(device's, 0x5B4AF0[q])`, 0x4A6755…0x4A67A1) are never
+/// configured: that branch needs `[0x657C9C]`, which both start-ups clear just before the call
+/// (0x4A684C, 0x4A6A61), so the device's own voice count does not enter the budget.
+/// `[0x6B49A4]` = software + hardware (0x58A786…0x58A7A8) is the voice table's length (0x565792).
+pub fn voice_budget(audio_quality: u8) -> usize {
+    match audio_quality {
+        0 => 48,
+        1 => 24,
+        2 => 12,
+        _ => 24,
+    }
+}
+
+/// The priority a stream voice is started with — `push 0x65` at 0x5613B2 in the stream voice
+/// start 0x5612A0 (the stream player 0x566FE3 / 0x567304: music, the movies' sound). It is not
+/// below [`STEAL_BELOW`], so a stream is never taken.
+pub const STREAM_PRIORITY: u8 = 0x65;
+
+/// The allocator's second pass takes only voices whose `voice+0x1A` is below this (0x589A38
+/// `cmp cl, 0x65 ; jae`, unsigned): a priority of 0x65 or more is never stolen.
+pub const STEAL_BELOW: u8 = 0x65;
+
+/// **0x5898F0(n, priority, &handle, lo, hi)**, the voice allocator, for a start that needs `need`
+/// voices (the patch's channel count, code 0x82 → layer `+3`, 0x5904CD) out of `budget`, with the
+/// live voices given as `(priority, channels, start order)`:
+///
+/// * pass 1 (0x589943…0x5899CA) takes free voices (`voice+0xF == 0`);
+/// * pass 2 (0x5899EF…0x589AA8) takes, one at a time, the voice with the **lowest** priority below
+///   [`STEAL_BELOW`], ties to the **smallest** stamp `voice+0x20` (unsigned `jae`) — the service
+///   tick `[0x6B49A8]` it was started at (0x589B3F…0x589B54), so the oldest. The request's own
+///   priority is **not** compared: any start takes a stealable voice;
+/// * fewer than `need` found → −9 (0x589BE9) and nothing is stopped (the victims are only
+///   stopped, 0x565D60 on their handle, after the count matched, 0x589B26).
+///
+/// Returns the indices of the voices to stop, or `None` for the refusal. A stolen stereo voice
+/// frees both its channels (0x565D60 stops the whole handle). APPROXIMATION: the stamp is the
+/// port's start order; the library's is the service tick, and two voices started in one tick tie
+/// to the lower voice index, which depends on the free list's history.
+pub fn pick_victims(live: &[(u8, u16, u32)], budget: usize, need: usize) -> Option<Vec<usize>> {
+    let used: usize = live.iter().map(|&(_, ch, _)| ch.max(1) as usize).sum();
+    let mut free = budget.saturating_sub(used);
+    if free >= need {
+        return Some(Vec::new());
+    }
+    let mut order: Vec<usize> = (0..live.len()).filter(|&i| live[i].0 < STEAL_BELOW).collect();
+    order.sort_by_key(|&i| (live[i].0, live[i].2));
+    let mut victims = Vec::new();
+    for i in order {
+        victims.push(i);
+        free += live[i].1.max(1) as usize;
+        if free >= need {
+            return Some(victims);
+        }
+    }
+    None
 }
 
 struct Voice {
     clip: Arc<Clip>,
-    /// position in frames (fractional)
-    pos: f64,
+    /// where the resampler is in the voice's input stream ([`resample::Cursor`]) — for a loop
+    /// the stream runs on past the end (`0…hi`, then `lo…hi` again, the looped decoder 0x59CBA0)
+    cur: Cursor,
+    /// the channel gains and their ramp (0x598700 / 0x5980C0)
+    gains: Gains,
     pitch: f32,
     volume: f32,
-    /// −1 = hard left, 0 = centre, +1 = hard right: the sine of the source's angle off the
-    /// listener's forward (see `pan_gains`)
-    pan: f32,
+    /// the caller's pan byte `voice+0x1F` ([`pan_byte`]; 0x40, the request's default from
+    /// 0x561960, until one is given) — the patch's pan is applied at the mix ([`voice_pan`])
+    pan: u8,
     looping: bool,
     finished: bool,
     /// `voice+0x45`: the request's `+0xA`, 0x7F unless the caller passes an aux byte — 0x561960
     /// fills every request with 0x7F (0x56199F) and 0x4A9A5F writes `0x7F − aux` for the
     /// collision one-shots (slots from 0x30). 0x5906D7 copies it into the voice.
     fx_scale: u8,
+    /// `voice+0x20` at the start (0x589B54) — here the start order ([`pick_victims`])
+    stamp: u32,
+    /// `voice+0x3E`, the patch pan with its spread drawn at the start ([`voice_pan`])
+    patch_pan: u8,
+    /// `voice+0x3C`: the patch volume with its spread, times the request's byte `+6` over 127
+    /// (0x5905D0) — a factor of the voice's level byte ([`Voice::level_byte`], 0x589E1C)
+    level: i8,
+    /// `voice+0x68`, the voice's own cents: [`base_cents`] plus the draws of codes 0x24 / 0x11
+    /// (0x59052E, 0x590549)
+    cents: i16,
+    /// the envelope (`voice+0x30`…`+0x41`, [`Envelope`])
+    env: Envelope,
+    /// `voice+0x4A` / `+0x4B`: the steps of the volume and pitch tables (drawn at the start,
+    /// stepped by the service)
+    volume_phase: u8,
+    pitch_phase: u8,
+    /// the resampler has made its first pull (0x59BE00's `+0x1C`)
+    pulled: bool,
+    /// `voice+0x1B`: the last record started by a patch start of more than one (0x590A5C) — the
+    /// voice whose handle the start answers; it outlives the group's others ([`Shared::free`])
+    anchor: bool,
+    /// the anchor's state 2 (0x589CF8): its own sample has ended, and it holds its voice of the
+    /// budget until the last other voice of the group ends; it mixes nothing
+    held: bool,
+    /// `voice+0x3F`, the caller's **bend byte**: the request's `+9` at the start (0x5905FE;
+    /// 0x561960's default 0x40), `Voice_setBend` 0x5660C0 → 0x566020 after (the byte, then the
+    /// pitch word made again). 0x589F75…0x589F90 add `((i8)byte − 0x40) · (i16)voice+0x66 >> 6`
+    /// cents ([`Clip::bend_cents`], code 0x0A · 100) to the voice's cents ([`Voice::pitch_word`]).
+    bend: i8,
+}
+
+/// A voice's envelope, **0x590607…0x590655** at the start and **0x58961E…0x589687** every
+/// service tick: a 16.16 level `voice+0x34`, its step `+0x30`, the ticks left `+0x38`, the
+/// segment `+0x41` of `+0x40` (code 0x09) over the record's `{ticks, target}` table (code 0x19,
+/// [`nfs_formats::bnk::RecordTables::envelope`]). Code 0x08 (`+0xE` → `voice+0x42`) is stored and
+/// never read (a byte scan of the library finds no reader), so there is no release: a segment of
+/// negative ticks — 0x7FFFFFFF — holds for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Envelope {
+    level: i32,
+    step: i32,
+    left: i32,
+    seg: i8,
+    segments: i8,
+}
+
+impl Envelope {
+    /// The start: `level = (i8)code 0x1C << 16`, the first segment's ticks (negative →
+    /// 0x7FFFFFFF) and step `((target << 16) − level) / ticks` (`idiv`, toward zero).
+    fn start(level: i8, segments: i8, table: &[(i32, i32)]) -> Self {
+        let mut e = Envelope { level: (level as i32) << 16, step: 0, left: 0, seg: 0, segments };
+        e.load(table.first().copied().unwrap_or((0x7FFF_FFFF, 0)));
+        e
+    }
+
+    fn load(&mut self, (ticks, target): (i32, i32)) {
+        self.left = if ticks < 0 { 0x7FFF_FFFF } else { ticks };
+        // a segment of 0 ticks divides by zero in the original; no shipped table has one
+        self.step = if self.left == 0 { 0 } else { target.wrapping_shl(16).wrapping_sub(self.level) / self.left };
+    }
+
+    /// One service tick: the level takes its step; with no tick left the next segment is loaded
+    /// — or, past the last (`jl`, signed), the voice is to be stopped (`true`); then a tick is
+    /// counted off (`dec`). The step is taken before the count is looked at, so a segment runs
+    /// its ticks plus one.
+    fn tick(&mut self, table: &[(i32, i32)]) -> bool {
+        if self.step != 0 {
+            self.level = self.level.wrapping_add(self.step);
+        }
+        if self.left == 0 {
+            self.seg = self.seg.wrapping_add(1);
+            if self.seg >= self.segments {
+                return true;
+            }
+            self.load(table.get(self.seg as usize).copied().unwrap_or((0x7FFF_FFFF, 0)));
+        }
+        self.left = self.left.wrapping_sub(1);
+        false
+    }
+}
+
+/// The record's tuning, the start of the pitch word `voice+0x68` (0x5904EC…0x590528):
+/// `(note − root) · 100 + fine` cents, the note the request's byte `+5` (0x3C, 0x561983, which no
+/// caller of the game changes), the root code 0x07 (default 60, 0x5991A2), the fine tune code
+/// 0x10; a 16-bit word (`add ax, [edi+4]`, `mov word [esi+0x68], ax`). So a sample recorded
+/// with its root off middle C plays that many semitones off unless the caller's pitch
+/// makes up for it — the engine banks (`sd*.viv`) carry roots of 28…72 (most 50…66) and fine
+/// tunes of −80…113 cents.
+/// *(Until 2026-09-27 the port left both out: "decoded but not yet applied".)*
+pub fn base_cents(r: &nfs_formats::bnk::PatchRecord) -> i16 {
+    ((crate::librand::REQUEST_NOTE as i32 - r.root as i32) * 100 + r.fine as i32) as i16
+}
+
+/// `x / 127³` as 0x589E29…0x589E3B makes it: `imul` by 0x4186143D, the high word `sar 0x13`,
+/// the sign bit added back — toward zero.
+fn div_127_cubed(x: i32) -> i32 {
+    let q = ((x as i64 * 0x4186_143D) >> 32) as i32 >> 19;
+    q + ((q as u32) >> 31) as i32
+}
+
+/// `x / 127` as 0x589E53…0x589E64 makes it: `imul` by 0x81020409, `add edx, x`, `sar 6`, the
+/// sign bit added back — toward zero.
+fn div_127(x: i32) -> i32 {
+    let q = (((x as i64 * 0x8102_0409u32 as i32 as i64) >> 32) as i32).wrapping_add(x) >> 6;
+    q + ((q as u32) >> 31) as i32
+}
+
+/// 0x5E1D3C…0x5E1E3B, the image's 256 bytes 0x589E80 reads: the mantissa of `2^(i/256)`, less
+/// one, in 256ths (not exactly any rounding of it — the bytes as they are).
+const CENTS_MANTISSA: [u8; 256] = [
+    0, 1, 2, 2, 3, 4, 4, 5, 6, 7, 7, 8, 9, 9, 10, 11, 12, 12, 13, 14, 14, 15, 16, 17, 17, 18, 19, 20, 20, 21, 22, 23, 23, 24, 25, 26, 26, 27, 28, 29, 30, 30,
+    31, 32, 33, 33, 34, 35, 36, 37, 37, 38, 39, 40, 41, 41, 42, 43, 44, 45, 45, 46, 47, 48, 49, 50, 50, 51, 52, 53, 54, 55, 55, 56, 57, 58, 59, 60, 61, 61,
+    62, 63, 64, 65, 66, 67, 67, 68, 69, 70, 71, 72, 73, 74, 75, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96,
+    97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 119, 120, 121, 122, 123, 124, 125, 126, 127,
+    128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 154, 155, 156, 157, 158, 159, 160,
+    161, 163, 164, 165, 166, 167, 168, 169, 171, 172, 173, 174, 175, 176, 178, 179, 180, 181, 182, 183, 185, 186, 187, 188, 189, 191, 192, 193, 194, 196, 197,
+    198, 199, 200, 202, 203, 204, 205, 207, 208, 209, 210, 212, 213, 214, 216, 217, 218, 219, 221, 222, 223, 225, 226, 227, 229, 230, 231, 232, 234, 235, 236,
+    238, 239, 240, 242, 243, 245, 246, 247, 249, 250, 251, 253, 254, 255,
+];
+
+/// **0x589E80**, cents to the library's 4096-based pitch word: whole octaves shift 0x1000
+/// (`c ≥ 1200`: `c / 1200` by the magic 0x1B4E81B5, `shl` that many times; `c ≤ −1200` the
+/// same on `−c`, `sar`), the rest `i = c · 13981 >> 16` (≈ `c · 256 / 1200`, `sar`), not below
+/// −255, and the word `(mantissa[i] + 256) · w >> 8`, or for a negative `i`
+/// `(mantissa[256 + i] + 256) · w >> 9` (the byte at 0x5E1E3C + i). The word is a u16
+/// (`mov word [esi+0x6A], ax`).
+pub fn cents_word(cents: i32) -> u16 {
+    let mut c = cents;
+    let mut w: i32 = 0x1000;
+    if c >= 1200 {
+        let q = c as u32 / 1200;
+        c -= (q * 1200) as i32;
+        for _ in 0..q.min(40) {
+            w = w.wrapping_shl(1);
+        }
+    }
+    if c <= -1200 {
+        let q = c.wrapping_neg() as u32 / 1200;
+        c += (q * 1200) as i32;
+        for _ in 0..q.min(40) {
+            w >>= 1;
+        }
+    }
+    let i = (c.wrapping_mul(13981) >> 16).max(-255);
+    let out = if i < 0 {
+        ((CENTS_MANTISSA[(256 + i) as usize] as i32 + 256).wrapping_mul(w)) >> 9
+    } else {
+        ((CENTS_MANTISSA[i as usize] as i32 + 256).wrapping_mul(w)) >> 8
+    };
+    out as u16
+}
+
+impl Voice {
+    fn new(clip: Arc<Clip>, pitch: f32, volume: f32, looping: bool, stamp: u32) -> Self {
+        let (patch_pan, level) = (clip.pan, (clip.gain * 127.0).round() as i8);
+        let env = match (clip.records.first(), clip.tables.first()) {
+            (Some(r), Some(t)) => Envelope::start(r.env_level, r.env_segments, &t.envelope),
+            _ => Envelope::start(0x7F, 1, &nfs_formats::bnk::DEFAULT_ENVELOPE),
+        };
+        Voice { clip, cur: Cursor::default(), gains: Gains::default(), pitch, volume, pan: 0x40, looping, finished: false, fx_scale: 0x7F, stamp, patch_pan, level, cents: 0, env, volume_phase: 0, pitch_phase: 0, pulled: false, anchor: false, held: false, bend: 0x40 }
+    }
+
+    /// **0x589DF0**, the voice's level byte `voice+0x3D`: `(envelope >> 16) · (volume >> 16) ·
+    /// voice+0x3C · [0x6B499D] / 127³` (`imul`s, the magic 0x4186143D, `sar 0x13`, toward zero),
+    /// stored as a byte; with a volume table, `· (i8)table[voice+0x4A] / 127` (0x81020409, toward
+    /// zero); with a level curve, `curve[(i8)level]` (0x589E69…0x589E78). `[0x6B499D]` is the
+    /// library's master level, 0x7F from its start (0x5657D7). Its only setter 0x5663C0 (the
+    /// byte, then every playing voice's level made again, 0x5663E2…0x56641F) has four calls, all
+    /// in the race audio's two resets — 0x4AB270 (called at 0x41523A, 0x415299, 0x4156A1, 0x415754,
+    /// 0x41580D; `replay.md`) and 0x4AB360 (the race restart, 0x415721 / 0x4157F2): 0 at 0x4AB2B1 / 0x4AB3A2 before the
+    /// voices are stopped, then 0, 1, …, 0x7F in a loop (0x4AB348…0x4AB35A, 0x4AB41B…0x4AB42D)
+    /// within the same call. No option, slider, fade or front-end level touches it — the Audio
+    /// options reach a voice through its `setVolume` byte (`sfx::category`) — so between those
+    /// microseconds it is 0x7F, and the port keeps the constant. The volume word `voice+0x2C >> 16`
+    /// is the caller's `setVolume` int (`<< 16`, 0x5662E3, not clamped); the port's callers hand
+    /// `byte / 127`, which `round(volume · 127)` gives back exactly (the clamp to 0…127 never
+    /// bites: every caller's byte is in 0…127).
+    fn level_byte(&self) -> i8 {
+        const MASTER: i32 = 0x7F;
+        let volume = (self.volume * 127.0).round().clamp(0.0, 127.0) as i32;
+        let x = (self.env.level >> 16).wrapping_mul(volume).wrapping_mul(self.level as i32).wrapping_mul(MASTER);
+        let mut l = div_127_cubed(x) as i8;
+        if let Some(t) = self.clip.tables.first() {
+            if let Some(v) = &t.volume {
+                let e = v.get(self.volume_phase as usize).copied().unwrap_or(0) as i32;
+                l = div_127(e * l as i32) as i8;
+            }
+            if let Some(c) = &t.curve {
+                l = c[(l as i32 + 128) as usize] as i8;
+            }
+        }
+        l
+    }
+
+    /// **0x589F40**'s pitch word `voice+0x6E`: the cents `voice+0x68` plus, with a pitch table,
+    /// `((i8)table[voice+0x4B] − 0x40) · (i16)depth >> 6` (0x589F92…0x589FAF, `sar`), through
+    /// 0x589E80 ([`cents_word`]) into `voice+0x6A`, then `voice+0x6C · voice+0x6A >> 12` (0x589FBE…
+    /// 0x589FD0) — `voice+0x6C` the caller's pitch word ([`resample::pitch_word`] of the float
+    /// callers' factor, exact for the callers that hand a word, [`AudioOutput::play_word`]). The
+    /// bend term (0x589F60…0x589F90): `((i8)voice+0x3F − 0x40) · (i16)voice+0x66 >> 6` (`sar`)
+    /// when `+0x66` is not 0; through code 0x17's curve `+0x58` when set — no shipped bank has it.
+    /// *(Until 2026-09-27 the bend was the caller's float factor `Clip::bend`, multiplied into the
+    /// pitch — an octave's cents through `exp2` rather than the table 0x589E80 walks.)*
+    fn pitch_word(&self) -> u16 {
+        let mut cents = self.cents as i32;
+        if self.clip.bend_cents != 0 {
+            cents += ((self.bend as i32 - 0x40) * self.clip.bend_cents as i16 as i32) >> 6;
+        }
+        if let (Some(r), Some(Some(t))) = (self.clip.records.first(), self.clip.tables.first().map(|t| t.pitch.as_ref())) {
+            let e = t.get(self.pitch_phase as usize).copied().unwrap_or(0) as i32;
+            cents += ((e - 0x40) * r.pitch_depth as i32) >> 6;
+        }
+        let word = cents_word(cents) as i32;
+        ((resample::pitch_word(self.pitch) as i32).wrapping_mul(word) >> 12) as u16
+    }
+
+    /// The looped range the stream repeats, `(lo, hi)` in frames.
+    fn range(&self) -> (usize, usize) {
+        let nframes = self.clip.samples.len() / self.clip.channels.max(1) as usize;
+        match (self.looping, self.clip.loop_range) {
+            (true, Some((a, b))) if b > a && (b as usize) <= nframes => (a as usize, b as usize),
+            _ => (0, nframes),
+        }
+    }
+
+    /// The frame of the sample a stream index `k` reads: `k` up to the end, then round the loop;
+    /// `None` before the start (the resampler's zeroed history) and past the end of a one-shot
+    /// (the decoder's zero fill, 0x597BF2).
+    fn frame_of(&self, k: i64) -> Option<usize> {
+        let (lo, hi) = self.range();
+        if k < 0 {
+            return None;
+        }
+        let k = k as usize;
+        if k < hi {
+            Some(k)
+        } else if self.looping && hi > lo {
+            Some(lo + (k - hi) % (hi - lo))
+        } else {
+            None
+        }
+    }
+
+    /// Whether this block's pull fails, which frees the voice (0x5987D2…0x5987DC): only a
+    /// one-shot's decoder fails — the PCM one 0x597B60 when its position `+0x10` has reached the
+    /// sample's end `+0x14` (`jb`, unsigned; it zero-fills past the end and moves on, 0x597BF2),
+    /// the EA-XA one 0x597C40 when its decoded count `+0x28` has (`jl`), the looped one 0x59CBA0
+    /// never. The resampler 0x59BE00 asks the decoder for `(step · n + frac) >> 16` samples a
+    /// block (none, and no failure, when that is 0, 0x59BF88), the first time for its history
+    /// less the zeroed look-behind on top (`+0x22 − +0x20`: 4 − 1 cubic, 2 − 0 linear,
+    /// 0x59C0A0…0x59C0C2; 0x59BF4D…0x59BF53); so the decoder runs that many samples ahead of the
+    /// resampler's position, and the pull fails on the first block that starts with the position
+    /// that close to the end. The failure goes up the chain (0x59BFA5 → the negative return).
+    /// *(Until 2026-09-27 the port ended a one-shot once its position passed the last sample —
+    /// up to a block earlier, the voice's budget freed that much sooner.)*
+    fn pull_fails(&self, step: u32, n: usize, interp: Interp) -> bool {
+        if self.looping {
+            return false;
+        }
+        let lead = match interp {
+            Interp::Cubic => 3,
+            Interp::Linear => 2,
+        };
+        let mut need = (step as u64 * n as u64 + self.cur.frac as u64) >> 16;
+        let at = if self.pulled {
+            self.cur.pos + lead
+        } else {
+            need += lead;
+            0
+        };
+        let (_, hi) = self.range();
+        need > 0 && at >= hi as u64
+    }
+
+    /// The position in the sample, in frames (fractional).
+    fn position(&self) -> f64 {
+        let whole = self.frame_of(self.cur.pos as i64).unwrap_or(self.cur.pos as usize);
+        whole as f64 + self.cur.frac as f64 / 65536.0
+    }
 }
 
 /// **0x589D70**: a voice's two effect sends are `e = voice+0x45 · voice+0x44` (both signed bytes)
@@ -62,8 +514,8 @@ fn fx_send(fx_scale: u8, patch: u8, bus: i8) -> i32 {
 /// flag 0x10 is clear, 0x58A455…0x58A468): `voice+0x46 / 127` per channel (0x599800), which
 /// 0x5980A0 turns into the channel's wet gain `volume · send · 1.5`. The DirectSound path (flag
 /// 0x10, 0x596400) sends `voice+0x47 / 127` — the `0x80` bus — as the EAX buffer reverb mix
-/// (property set {4A4E6FC0-C341-11D1-B73A-444553540000}) instead; like the pan law, the port
-/// takes the software path.
+/// (property set {4A4E6FC0-C341-11D1-B73A-444553540000}) instead. The game never takes that path:
+/// its only voice type is 0x24 (see `pan_gains`).
 fn reverb_input(fx_scale: u8, patch: u8, bus_c: i8) -> f32 {
     fx_send(fx_scale, patch, bus_c) as f32 / 127.0 * 1.5
 }
@@ -73,26 +525,42 @@ fn reverb_input(fx_scale: u8, patch: u8, bus_c: i8) -> f32 {
 const REVERB_RETURN: f32 = 0.5;
 
 /// The software mixer's stereo law (`RE/notes/engine-audio.md`, "The pan law"): 0x58E0E0 builds a
-/// 256-step table over the voice's angle with the two speakers at 0x4000 (left) and 0xC000
-/// (right); between them the angle splits **linearly**, and each speaker's share `x` (0…127,
-/// integer division) becomes `f(x) = 2x − x²/127` (0x58E0B0), scaled by 1/127 (`[0x5C1788]`).
-/// Front and back mirror. `pan` is the sine of the angle off forward, as this port computes it,
-/// so it is taken back to the angle first.
+/// 256-step table over the voice's angle (`[0x6B1820 + 4·(angle >> 8)]`, 0x58E290) with channel 0
+/// at 0x4000 and channel 1 at 0xC000 (`[0x6B48FC]` / `[0x6B48FE]`, 0x58A5DF / 0x58A5E8); between
+/// them the angle splits **linearly**, and each channel's share `x` (0…127, `idiv`) becomes
+/// `f(x) = 2x − x²/127` (0x58E0B0), scaled by 1/127 (`[0x5C1788]`). Front and back mirror.
 ///
-/// This is the path of a voice the driver cannot give hardware 3D (`[0x6B48DF]` hardware 3D
-/// voices, 0 on a card without DirectSound3D buffers, drops every 3D type from the table at
-/// 0x58A7C4…0x58A7D6); a card with them positions the voice with `SetPosition` instead
-/// (0x596370) and the stereo image is the card's — APPROXIMATION that the software path is the one.
+/// The angle is the library's `(p − 0x40) << 8` of the voice's pan byte `p` ([`voice_pan`]), so
+/// the step is `(p − 0x40) & 0xFF` and the two shares come out as `127·p/128` for channel 0 and
+/// `127·(128 − p)/128` for channel 1 — 0x7F: 127 / 0, 0x40: 95 / 95, 0: 0 / 127. Channel 0 is the
+/// first of the stereo pair the buffer holds (`nChannels` 2, 0x58ED6A) — the port's first output
+/// channel; a source on the `+side` hand of [`pan_angle`] is heard there.
+///
+/// This is the path of every voice the game starts: the hardware-3D voice count `[0x6B48DF]` is
+/// 0 whatever the card — 0x4A66B0 configures it only when `[0x657C9C]` is set, and both start-ups
+/// clear that just before the call (0x4A684C, 0x4A6A61) — so 0x58A7C4…0x58A7D6 drops every 3D
+/// type and the one voice type left is the configuration's 0x24 (0x4A670B), never flag 0x10. A
+/// hardware-3D voice would be positioned with `SetPosition` (0x596370) instead. *(Until
+/// 2026-09-27 this was an APPROXIMATION "for a card without DirectSound3D buffers".)*
 /// (Until 2026-09-25 this was an equal-power cos / sin law of the port's own.)
-fn pan_gains(pan: f32) -> [f32; 2] {
-    let p = pan.clamp(-1.0, 1.0).asin() / std::f32::consts::FRAC_PI_2;
-    // the angle on the table's 256-step grid: 128 steps across the half turn between the speakers
-    let steps = ((1.0 + p) * 0.5 * 128.0).round() as i32;
-    let from_left = steps * 256;
-    let from_right = 0x8000 - from_left;
-    let f = |x: i32| (2 * x - x * x / 127) as f32 / 127.0;
-    // each speaker's share grows with the distance to the other one
-    [f(127 * from_right / 0x8000), f(127 * from_left / 0x8000)]
+/// (Until 2026-09-27 the port fed this law the sine of the angle, taken back to an angle and
+/// rounded onto the grid, instead of the pan byte.)
+fn pan_gains(p: u8) -> [f32; 2] {
+    // the table's step and the angle it stands for
+    let x = (((p as i32 - 0x40) & 0xFF) << 8) as i32;
+    let (s0, s1) = (0x4000, 0xC000);
+    // (distance to channel 0, distance to channel 1) along the arc between them (0x58E137…0x58E24C)
+    let (d0, d1) = if x <= s0 {
+        (s0 - x, x - s1 + 0x10000)
+    } else if x >= s1 {
+        (s0 - x + 0x10000, x - s1)
+    } else {
+        (x - s0, s1 - x)
+    };
+    // the byte · `[0x5C1788]` (f32 1/127) stored as an f32 (0x59694C)
+    let f = |x: i32| ((2 * x - x * x / 127) as f64 * (1.0f32 / 127.0) as f64) as f32;
+    // each channel's share grows with the distance to the other one
+    [f(127 * d1 / (d0 + d1)), f(127 * d0 / (d0 + d1))]
 }
 
 #[derive(Default)]
@@ -110,6 +578,523 @@ struct Shared {
     queued: Option<(u64, std::time::Instant)>,
     /// every voice at volume 0 — the race pause (see [`AudioOutput::set_muted`])
     muted: bool,
+    /// the software voice count `[0x6B48DD]` ([`voice_budget`]); `None` until the quality is
+    /// given — the library's default 24 (0x58A5B5)
+    budget: Option<usize>,
+    /// the most voices in use at once (a debug log line only)
+    peak: usize,
+    /// the mix rate `[0x6B48DA]` ([`mix_rate`]); `None` until the quality is given
+    mix_rate: Option<u32>,
+    /// the mixed frames on their way to the device's rate
+    bridge: Bridge,
+    /// the driver thread's writes ([`Pump`]) the mix is rendered in
+    pump: Pump,
+    /// the driver thread's `Sleep` `[0x6B48E1]` ([`pump_sleep_ms`]); `None` until the quality is
+    /// given — the library's default 10 (0x58A570)
+    sleep_ms: Option<u32>,
+    /// the resampler's interpolator, `[0x6B48E5]` ([`Interp::for_quality`]); linear until the
+    /// quality is given (the library's 0, 0x58A5D2)
+    interp: Interp,
+    /// the library's random generator 0x598FF0 ([`crate::librand`]), which every bank-patch start
+    /// draws from
+    rand: crate::librand::LibRand,
+    /// the service ticks the mix is counted in (0x58FBC0)
+    clock: ServiceClock,
+}
+
+/// The most frames 0x598940 mixes at once (`cmp edi, 0x100`, 0x598979): a block, the unit every
+/// voice's chain is pulled in (0x598760).
+pub const BLOCK: usize = 256;
+
+/// **0x58FBC0**'s count of the mix in service ticks: before each tick's frames the library
+/// service runs (`call [0x6B49AC]` = 0x589520, set at 0x5657C2), and a tick is a hundredth of a
+/// second of the mix rate — `[0x6AD7AC]` the ticks, `[0x6AD7B0]` the frames counted so far,
+/// `rate · tick / 100` (`imul`, the magic 0x51EB851F, `sar 5`, toward zero) less those, rounded
+/// down to 16 (`and edx, 0xFFFFFF0`); both reset after tick 30000 (`cmp esi, 0x7530 ; jle`).
+/// `[0x6AD7A8]` is what is left of the tick (0x58FC5F). At 32000 Hz a tick is 320 frames; at
+/// 22050 it is 208, 224, 224, … (220.5 on average); at 16000, 160.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServiceClock {
+    pub tick: u32,
+    pub counted: u32,
+    pub left: u32,
+}
+
+impl ServiceClock {
+    /// The next tick's frames (0x58FBF6…0x58FC47).
+    pub fn next_tick(&mut self, mix_rate: u32) -> u32 {
+        self.tick += 1;
+        let total = (mix_rate as i64 * self.tick as i64 / 100) as u32;
+        let frames = total.wrapping_sub(self.counted) & 0x0FFF_FFF0;
+        self.counted = self.counted.wrapping_add(frames);
+        if self.tick > 30000 {
+            self.tick = 0;
+            self.counted = 0;
+        }
+        frames
+    }
+}
+
+/// The library's mixing rate per `AUDIOQUALITY` `[0x657C98]`: `0x5B4AE4[q]` = 32000 / 22050 /
+/// 16000 (0x4A67AE), taken as the smaller of it and the caps word `[0x6B48C2]` — the library's
+/// constant 48000 (0x58A555), so always the table's — into config `+0x1A` (0x4A67D0 / 0x4A67D7),
+/// which 0x5656D0 copies to `[0x6B48DA]`; 0x58A703…0x58A72A clamps it to 11025…48000. At quality 3
+/// the configuration is skipped and the library's 22050 stays (0x58A5C2).
+///
+/// The DirectSound driver opens its **primary** buffer at that rate (`SetFormat`, vtable `+0x38`:
+/// PCM, 2 channels, `[0x6B48DA]` a second, 16 bits, 0x58ED4B…0x58ED88) and its mixing buffer
+/// (`CreateSoundBuffer`, flags 0x18000) the same (0x58EDBC…0x58EE6B), and every software voice
+/// steps through its sample at `sample rate / [0x6B48DA]` (0x596B60). So the bank samples are
+/// resampled to this rate, and the card (or the system mixer) plays that.
+pub fn mix_rate(audio_quality: u8) -> u32 {
+    match audio_quality {
+        0 => 32000,
+        1 => 22050,
+        2 => 16000,
+        _ => 22050,
+    }
+}
+
+/// The driver thread's `Sleep` between two passes, `[0x6B48E1]` (0x58F8AD…0x58F8B3, `Sleep` the
+/// import at 0x5B220C): config `+0x21` from `0x5B4B14[q]` = 8 / 20 / 50 ms (0x4A67B5, stored at
+/// 0x4A67C4 — `[esp+0x2D]` under the pushed `edi`; copied by 0x5656D0 from `+0x14` to 0x6B48D4),
+/// clamped to 200 (0x58A855…0x58A86B); the library's default 10 (0x58A570) at quality 3, where the
+/// configuration is skipped.
+pub fn pump_sleep_ms(audio_quality: u8) -> u32 {
+    match audio_quality {
+        0 => 8,
+        1 => 20,
+        2 => 50,
+        _ => 10,
+    }
+}
+
+/// The DirectSound mixing buffer, in frames `[0x6AD7B4]`: `rate · 400 / 1000` (`lea ·5 ; lea ·5 ;
+/// shl 4`, the magic 0x10624DD3 `sar 6`) rounded down to 16 (`and 0xFFFF0`, 0x58EDD5…0x58EE19) —
+/// 0.4 s of the mix rate.
+pub fn ring_frames(mix_rate: u32) -> u32 {
+    (mix_rate * 400 / 1000) & 0xF_FFF0
+}
+
+/// **The driver thread's writes** (0x58F880 → 0x58F8E0 → 0x58F8F0): each pass takes the play
+/// cursor (`GetCurrentPosition`, vtable `+0x10`, in frames, `and 0xFFFFF0`, 0x58F94D…0x58F985),
+/// writes from the last write's end `[0x6AD78C]` up to `cursor + lead [0x6AD790]` rounded down to
+/// 16 (0x58F9BE…0x58F9C7), wrapping at [`ring_frames`], and hands each of the (one or two) locked
+/// parts to 0x58FBC0 (0x58FA40…0x58FADD), which mixes it in service ticks and blocks
+/// ([`Shared::render`]); then it `Sleep`s [`pump_sleep_ms`]. So a write is the frames the cursor
+/// moved in one pass, in multiples of 16 (at 22050 Hz and 20 ms: 432 or 448, 441 on average),
+/// cut in two at the ring's end. APPROXIMATION: the cursor is taken to move exactly the sleep's
+/// frames a pass (`n · sleep · rate / 1000` after `n` passes) — the thread's own work, the
+/// scheduler and the first pass's lead fill are not modelled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Pump {
+    pub passes: u64,
+    /// the frames written so far (the write end, unwrapped)
+    pub end: u64,
+}
+
+impl Pump {
+    /// The next pass's parts: up to the ring's end, then the rest from its start.
+    pub fn next_write(&mut self, mix_rate: u32, sleep_ms: u32) -> [u32; 2] {
+        self.passes += 1;
+        let end = (self.passes * sleep_ms as u64 * mix_rate as u64 / 1000) & !15;
+        let w = end.saturating_sub(self.end) as u32;
+        let ring = ring_frames(mix_rate).max(16);
+        let pos = (self.end % ring as u64) as u32;
+        self.end = end.max(self.end);
+        let first = w.min(ring - pos);
+        [first, w - first]
+    }
+}
+
+/// From the mix rate to the output device's: the port mixes at [`mix_rate`] and interpolates
+/// linearly between two mixed frames per device frame. APPROXIMATION of that one step: the
+/// original hands the mix-rate buffer to DirectSound, and the conversion to the card's rate (if
+/// any) is the card's or the system mixer's, not the game's.
+#[derive(Default)]
+struct Bridge {
+    pending: std::collections::VecDeque<[f32; 2]>,
+    /// the position between `pending[0]` and `pending[1]`, in mix frames
+    t: f64,
+}
+
+impl Bridge {
+    /// The next device frame. `step` is the mix rate over the device rate; `left` the device
+    /// frames still wanted in this callback, which `render` is offered (the stream's renders one
+    /// driver pass whatever it is offered, [`Shared::pump`]).
+    fn next(&mut self, step: f64, left: usize, mut render: impl FnMut(usize) -> Vec<[f32; 2]>) -> [f32; 2] {
+        while self.pending.len() < 2 {
+            let want = (left as f64 * step).ceil() as usize + 2;
+            self.pending.extend(render(want));
+        }
+        let (a, b, t) = (self.pending[0], self.pending[1], self.t as f32);
+        self.t += step;
+        while self.t >= 1.0 && self.pending.len() > 1 {
+            self.t -= 1.0;
+            self.pending.pop_front();
+        }
+        [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+    }
+}
+
+impl Shared {
+    /// The library's mix rate `[0x6B48DA]`: the table's once 0x4A66B0 has configured the sound
+    /// ([`mix_rate`]), the library's own 22050 (`mov word [0x6B48DA], 0x5622`, 0x58A5C2) before.
+    fn mix_rate(&self) -> u32 {
+        self.mix_rate.unwrap_or(mix_rate(3))
+    }
+
+    /// One pass of the driver thread ([`Pump`]): its one or two parts, each rendered as 0x58FBC0
+    /// renders it.
+    fn pump(&mut self, mix_rate: u32) -> Vec<[f32; 2]> {
+        let sleep = self.sleep_ms.unwrap_or(pump_sleep_ms(3));
+        let mut out = Vec::new();
+        for part in self.pump.next_write(mix_rate, sleep) {
+            if part > 0 {
+                out.extend(self.render(part as usize, mix_rate));
+            }
+        }
+        out
+    }
+
+    /// The software mixer's output for `n` stereo frames at `mix_rate`, as **0x58FBC0** drives it:
+    /// whenever the frames of the last service tick are used up, the library service 0x589520
+    /// runs ([`Shared::service`]) and the next tick's frames are counted ([`ServiceClock`]); the
+    /// frames are mixed in blocks of at most [`BLOCK`] (0x598940 → 0x598760), never across a
+    /// tick. Every voice is resampled to the mix rate by the library's kernel ([`resample`]: the
+    /// 16.16 step of 0x596B60 / 0x596A50, the cubic or linear interpolator of `[0x6B48E5]`), mixed
+    /// at its channel gains with their ramp (0x598760 / 0x5980C0) into floats of 16-bit scale,
+    /// then the streams, the reverb and the 16-bit store (0x59A350). [`Bridge`] takes these frames
+    /// on to the device's rate.
+    ///
+    /// 0x58FBC0 is handed one part of the driver thread's write, and a block ends where that part
+    /// ends too: the port renders the same parts ([`Pump`], [`Shared::pump`]). *(Until 2026-09-27
+    /// a block ended where the device callback's request did.)*
+    fn render(&mut self, n: usize, mix_rate: u32) -> Vec<[f32; 2]> {
+        let mut out = vec![[0.0f32; 2]; n];
+        // the reverb's input: each voice's output times its effect send (0x589D70) — the
+        // bus the environment level drives (`[0x6B4A0C]`, 0x565CD0), not the whole mix
+        let mut send = vec![0.0f32; n];
+        let mut at = 0;
+        while at < n {
+            if self.clock.left == 0 {
+                // 0x58FBF6…0x58FC3A: the service first, then the tick's frames (0 for a tick
+                // that rounds to nothing, which only runs the service again)
+                self.service();
+                self.clock.left = self.clock.next_tick(mix_rate);
+                continue;
+            }
+            let len = (n - at).min(self.clock.left as usize).min(BLOCK);
+            self.mix_block(&mut out[at..at + len], &mut send[at..at + len], mix_rate);
+            self.clock.left -= len as u32;
+            at += len;
+        }
+        if self.muted {
+            out.fill([0.0, 0.0]);
+        }
+        if self.bus_c != 0 && !self.muted {
+            let rv = self.tail.get_or_insert_with(|| Reverb::new(mix_rate));
+            for (frame, dry) in out.iter_mut().zip(send.iter()) {
+                let w = rv.tick(*dry);
+                for o in frame.iter_mut() {
+                    *o += w * REVERB_RETURN * 32768.0;
+                }
+            }
+        }
+        // the 16-bit store of the mix (0x59A350), back to the port's float scale
+        for frame in out.iter_mut() {
+            for s in frame.iter_mut() {
+                *s = resample::to_i16(*s) as f32 / 32768.0;
+            }
+        }
+        out
+    }
+
+    /// **0x589520**, the library service, once a tick of mixed frames ([`ServiceClock`]), over
+    /// every voice playing (state 1, a handle of its own, 0x589581…0x58958D), in this order:
+    ///
+    /// * a **pitch table** (`voice+0x60`): its step `+0x4B` moves on one, back to 0 at the
+    ///   length `+0x49` (code 0x21, unsigned `jb`), and the pitch is made again (0x589593…0x5895B7);
+    /// * a **volume table** (`+0x5C`): its step `+0x4A` likewise at `+0x48` (code 0x1E)
+    ///   (0x5895BF…0x5895DE);
+    /// * the ramp `voice+0x24` (0x5895E1…0x589619) — a stream's volume ramp here;
+    /// * the **envelope** ([`Envelope::tick`], 0x58961E…0x589687), which stops the voice's handle
+    ///   — its group — once its segments have run (0x58964D → 0x565D60);
+    /// * the level made again (0x589DF0) when any of these changed it.
+    ///
+    /// The port makes the level and the pitch word from the voice's state at every block
+    /// ([`Voice::level_byte`], [`Voice::pitch_word`]), which is the same between two ticks —
+    /// except that a caller's volume or pitch counts from the next block, where the library's
+    /// `setVolume` ramp waits for the next tick.
+    fn service(&mut self) {
+        for (_, sv) in self.streams.iter_mut() {
+            if let Some(f) = sv.fade.as_mut() {
+                sv.volume = f.advance(sv.volume);
+                if f.steps_left == 0 {
+                    sv.fade = None;
+                }
+            }
+        }
+        let mut stop = Vec::new();
+        for (id, v) in self.voices.iter_mut() {
+            if v.finished || v.held {
+                continue;
+            }
+            let (Some(r), Some(t)) = (v.clip.records.first().copied(), v.clip.tables.first()) else { continue };
+            if t.pitch.is_some() {
+                v.pitch_phase = v.pitch_phase.wrapping_add(1);
+                if v.pitch_phase >= r.pitch_table_len {
+                    v.pitch_phase = 0;
+                }
+            }
+            if t.volume.is_some() {
+                v.volume_phase = v.volume_phase.wrapping_add(1);
+                if v.volume_phase >= r.volume_table_len as u8 {
+                    v.volume_phase = 0;
+                }
+            }
+            let segments = t.envelope.clone();
+            if v.env.tick(&segments) {
+                stop.push(*id);
+            }
+        }
+        if !stop.is_empty() {
+            self.voices.retain(|(i, _)| !stop.contains(i));
+        }
+    }
+
+    /// One block of 0x598760 (≤ [`BLOCK`] frames): each voice pulls its chain once — a one-shot
+    /// whose decoder has nothing left fails the pull and is freed before it mixes anything
+    /// ([`Voice::pull_fails`], 0x5987DC → 0x598670 → 0x589C00) — then the streams.
+    fn mix_block(&mut self, out: &mut [[f32; 2]], send: &mut [f32], mix_rate: u32) {
+        let n = out.len();
+        let bus_c = self.bus_c;
+        let interp = self.interp;
+        let mut failed = Vec::new();
+        for (k, (_, v)) in self.voices.iter_mut().enumerate() {
+            if v.finished || v.held {
+                continue;
+            }
+            let c = Arc::clone(&v.clip);
+            let cc = c.channels.max(1) as usize;
+            // the 16.16 step, 0x596B60 → 0x596A50 → 0x599830
+            let step = resample::step_16_16(v.pitch_word(), c.rate, mix_rate);
+            if v.pull_fails(step, n, interp) {
+                failed.push(k);
+                continue;
+            }
+            v.pulled = true;
+            // the level byte (0x589DF0) · `[0x5C1788]` (f32 1/127) as an f32 (0x59697A)
+            let vol = (v.level_byte() as f64 * (1.0f32 / 127.0) as f64) as f32;
+            let pg = pan_gains(voice_pan(v.pan, v.patch_pan, c.pan_scale));
+            v.gains.set([resample::channel_gain(vol, pg[0]), resample::channel_gain(vol, pg[1])]);
+            let ramp = v.gains.ramp(n);
+            let fx = reverb_input(v.fx_scale, c.fx_send, bus_c);
+            for (fi, frame) in out.iter_mut().enumerate() {
+                let at = |sc: usize| {
+                    resample::interpolate(interp, v.cur.frac, v.cur.pos as i64, |k| {
+                        v.frame_of(k).map_or(0.0, |f| c.samples[f * cc + sc] as f32)
+                    })
+                };
+                let x0 = at(0);
+                let xs = [x0, if cc > 1 { at(1) } else { x0 }];
+                let ramping = ramp.filter(|r| fi < r.len);
+                for (ch, o) in frame.iter_mut().enumerate() {
+                    let g = match ramping {
+                        Some(r) => v.gains.ramp_next(&r, ch),
+                        // a channel at gain 0 is skipped (0x59881E)
+                        None if v.gains.cur[ch] == 0.0 => continue,
+                        None => v.gains.cur[ch],
+                    };
+                    *o = resample::mix_into(*o, xs[ch], g);
+                    if fx != 0.0 {
+                        send[fi] += xs[ch] * g / 32768.0 * fx * 0.5;
+                    }
+                }
+                if ramp.is_some_and(|r| fi + 1 == r.len) {
+                    v.gains.ramp_done();
+                }
+                v.cur.advance(step);
+            }
+        }
+        // 0x598760 frees each failing strip as it comes to it (0x598670 → 0x589C00)
+        for &k in &failed {
+            self.free(k);
+        }
+        self.voices.retain(|(_, v)| !v.finished);
+        // streamed sources: a stream is a voice of the library too (0x5612A0 → 0x5898F0), so it
+        // takes the same resampler, at the pitch word 4096: 0x5612A0 sets `voice+0x68` (cents)
+        // from the descriptor's word `+0`, which 0x561900 clears and the stream header parser
+        // 0x590F70 never writes, `voice+0x6C` from the request's `+0xC`, 0x561960's 0x1000 (the
+        // music start 0x4AE087…0x4AE0A9 writes only `+8` and `+0xA`, the movie's 0x4E213B nothing
+        // there), and the bend `+0x3F` from the request's 0x40 (0x561429…0x561458 → 0x589F40);
+        // the library's `setPitch` 0x565F80 is called only by `Voice_play`'s update (0x4A9FA3) and
+        // the engine mixer (0x4AC608, 0x4AC6F9), never on a stream. *(Until 2026-09-27 an
+        // APPROXIMATION "the stream player's own pitch call is not read".)* `window` holds
+        // `s[P−1] … s[P+2]` of each channel
+        for (_, sv) in self.streams.iter_mut() {
+            let cc = sv.src.channels.max(1) as usize;
+            let step = resample::step_16_16(4096, sv.src.rate, mix_rate);
+            let mut q = sv.src.queue.lock().unwrap();
+            // the next source frame, zeros when the feeder is behind
+            let pop = |q: &mut std::collections::VecDeque<i16>| -> [f32; 2] {
+                if q.len() >= cc {
+                    let l = q[0] as f32;
+                    let r = if cc > 1 { q[1] as f32 } else { l };
+                    q.drain(..cc);
+                    [l, r]
+                } else {
+                    [0.0, 0.0]
+                }
+            };
+            if !sv.primed {
+                sv.primed = true;
+                for j in 1..4 {
+                    let f = pop(&mut q);
+                    for c in 0..2 {
+                        sv.window[c][j] = f[c];
+                    }
+                }
+            }
+            for frame in out.iter_mut() {
+                for (ch, o) in frame.iter_mut().enumerate() {
+                    let w = sv.window[ch];
+                    let x = resample::interpolate(interp, sv.frac, 0, |k| w[(k + 1) as usize]);
+                    *o = resample::mix_into(*o, x, sv.volume);
+                }
+                let f = sv.frac + step;
+                sv.frac = f & 0xFFFF;
+                for _ in 0..(f >> 16) {
+                    let nf = pop(&mut q);
+                    for c in 0..2 {
+                        sv.window[c].rotate_left(1);
+                        sv.window[c][3] = nf[c];
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`AudioOutput::play_sel`]'s start (0x5907B0).
+    fn start_patch(&mut self, clip: Arc<Clip>, volume: f32, pitch: f32, looping: bool, sel: u8) -> VoiceId {
+        let g = self;
+        let id = VoiceId(g.next_id);
+        g.next_id += 1;
+        if clip.records.is_empty() {
+            // not a bank patch: one voice, no draw, the clip's own values scaled by `sel`
+            if g.allocate(clip.channels.max(1) as usize, clip.priority, Some(id)) {
+                let mut v = Voice::new(clip.clone(), pitch, volume, looping, id.0);
+                v.level = ((clip.gain * 127.0).round() as i32 * sel as i8 as i32 / 127) as i8;
+                g.voices.push((id, v));
+            }
+            return id;
+        }
+        let patch_cents = crate::librand::patch_draw(&mut g.rand, &clip.records);
+        let mut started = 0;
+        for (i, r) in clip.records.iter().enumerate() {
+            if !r.matches(sel as i8, crate::librand::REQUEST_NOTE) {
+                continue;
+            }
+            let pan = crate::librand::record_pan(&mut g.rand, r);
+            let layer = clip.layer(i);
+            if !g.allocate(layer.channels.max(1) as usize, layer.priority, Some(id)) {
+                // 0x5908F1 → 0x5909A6: every handle started so far is stopped again
+                g.voices.retain(|(j, _)| *j != id);
+                tracing::trace!(record = i, sel, "patch start refused");
+                return id;
+            }
+            let d = crate::librand::record_draws(&mut g.rand, r, sel as i8, patch_cents, pan);
+            let mut v = Voice::new(layer, pitch, volume, looping, id.0);
+            v.patch_pan = d.pan;
+            v.level = d.level as i8;
+            v.cents = base_cents(r).wrapping_add(d.cents as i16);
+            (v.volume_phase, v.pitch_phase) = (d.volume_phase, d.pitch_phase);
+            tracing::trace!(record = i, ?d, sel, "patch start");
+            g.voices.push((id, v));
+            started += 1;
+        }
+        if started > 1 {
+            // 0x590A5C: the last one still standing is the anchor
+            if let Some((_, v)) = g.voices.iter_mut().rev().find(|(j, _)| *j == id) {
+                v.anchor = true;
+            }
+        }
+        id
+    }
+
+    fn budget(&self) -> usize {
+        self.budget.unwrap_or(24)
+    }
+
+    /// **0x589C00**, a voice freed when its sample has ended (the failed pull's callback,
+    /// 0x58EC19): a voice outside a group (`voice+0x1E` 0, every one-record start) is freed.
+    /// In a group — the voices of one patch start of several records (0x590A04…0x590A5C) — the
+    /// live members are counted (0x589C39…0x589C79) and the anchor found (`voice+0x1B`):
+    /// the anchor ending while others play is **held** (state 2, 0x589CF8) instead of freed; the
+    /// second-last member ending beside a held anchor frees both (0x589CB6…0x589CE6); any other
+    /// member is freed. So the group's handle — the anchor's — stays good, and its voice stays
+    /// in the budget, until every record's sample has ended. Marks the freed voices `finished`.
+    fn free(&mut self, k: usize) {
+        let id = self.voices[k].0;
+        let members: Vec<usize> = (0..self.voices.len()).filter(|&j| self.voices[j].0 == id && !self.voices[j].1.finished).collect();
+        let anchor = members.iter().copied().find(|&j| self.voices[j].1.anchor);
+        match anchor {
+            Some(a) if members.len() > 1 => {
+                if self.voices[a].1.held && a != k && members.len() == 2 {
+                    self.voices[k].1.finished = true;
+                    self.voices[a].1.finished = true;
+                } else if !self.voices[a].1.held && a == k {
+                    self.voices[a].1.held = true;
+                } else {
+                    self.voices[k].1.finished = true;
+                }
+            }
+            _ => self.voices[k].1.finished = true,
+        }
+    }
+
+    /// 0x5898F0 for a start needing `need` voices: `true` with the victims stopped, `false` for the
+    /// refusal (−9) with nothing touched. A victim playing is stopped by its handle (0x589B26,
+    /// 0x565D60), which stops its whole group; a held anchor (state 2) is taken without a stop
+    /// (0x589B09 `cmp cl, 1 ; jne`), and so is a voice of the start in progress, whose group is not
+    /// made yet (`voice+0x1E` is set after every record has started, 0x590A04).
+    fn allocate(&mut self, need: usize, priority: u8, starting: Option<VoiceId>) -> bool {
+        let live_ids: Vec<VoiceId> = self.voices.iter().filter(|(_, v)| !v.finished).map(|(i, _)| *i).collect();
+        let live_held: Vec<bool> = self.voices.iter().filter(|(_, v)| !v.finished).map(|(_, v)| v.held).collect();
+        let live: Vec<(u8, u16, u32)> = self
+            .voices
+            .iter()
+            .filter(|(_, v)| !v.finished)
+            .map(|(_, v)| (v.clip.priority, v.clip.channels, v.stamp))
+            .chain(self.streams.iter().map(|(id, sv)| (STREAM_PRIORITY, sv.src.channels, id.0)))
+            .collect();
+        let Some(victims) = pick_victims(&live, self.budget(), need) else {
+            tracing::debug!(need, priority, budget = self.budget(), "voice start refused: no voice free or below 0x65");
+            return false;
+        };
+        if !victims.is_empty() {
+            // streams sit after the voices in `live` and are never victims; `live` lists the
+            // voices in order, so a victim's index is its place among the unfinished voices
+            let live_at: Vec<usize> = (0..self.voices.len()).filter(|&j| !self.voices[j].1.finished).collect();
+            tracing::debug!(need, priority, stolen = victims.len(), "voice budget full: the lowest priority, oldest voice stolen");
+            for &k in &victims {
+                let one = live_held[k] || Some(live_ids[k]) == starting;
+                for j in 0..self.voices.len() {
+                    if (one && j == live_at[k]) || (!one && self.voices[j].0 == live_ids[k]) {
+                        self.voices[j].1.finished = true;
+                    }
+                }
+            }
+            self.voices.retain(|(_, v)| !v.finished);
+        }
+        let ch = |k: usize| live[k].1.max(1) as usize;
+        let in_use = (0..live.len()).map(ch).sum::<usize>() - victims.iter().map(|&k| ch(k)).sum::<usize>() + need;
+        if in_use > self.peak {
+            self.peak = in_use;
+            tracing::debug!(voices = in_use, budget = self.budget(), "voices in use: a new peak");
+        }
+        true
+    }
 }
 
 /// A small Schroeder reverb — four combs into two all-passes, per channel.
@@ -176,112 +1161,25 @@ impl AudioOutput {
         let stream = device.build_output_stream(
             &config.into(),
             move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
-                out.fill(0.0);
                 let mut g = sh.lock().unwrap();
                 let ts = info.timestamp();
                 let delay = ts.playback.duration_since(&ts.callback).unwrap_or_default();
                 let frames = (out.len() / channels.max(1)) as u64 + (delay.as_secs_f64() * out_rate).round() as u64;
                 g.queued = Some((frames, std::time::Instant::now()));
-                // the reverb's input: each voice's output times its effect send (0x589D70) — the
-                // bus the environment level drives (`[0x6B4A0C]`, 0x565CD0), not the whole mix
-                let mut send = vec![0.0f32; out.len() / channels.max(1)];
-                let bus_c = g.bus_c;
-                for (_, v) in g.voices.iter_mut() {
-                    if v.finished {
-                        continue;
-                    }
-                    let c = &v.clip;
-                    let cc = c.channels as usize;
-                    let nframes = c.samples.len() / cc;
-                    let (lo, hi) = match (v.looping, c.loop_range) {
-                        (true, Some((a, b))) if b > a && (b as usize) <= nframes => (a as usize, b as usize),
-                        (true, _) => (0, nframes),
-                        _ => (0, nframes),
-                    };
-                    let step = v.pitch as f64 * c.rate as f64 / out_rate;
-                    // the library scales the caller's level by the patch's own volume (0x5905A5)
-                    let vol = v.volume * c.gain;
-                    let fx = reverb_input(v.fx_scale, c.fx_send, bus_c);
-                    for (fi, frame) in out.chunks_exact_mut(channels).enumerate() {
-                        if v.pos >= hi as f64 {
-                            if v.looping && hi > lo {
-                                v.pos = lo as f64 + (v.pos - hi as f64) % (hi - lo) as f64;
-                            } else {
-                                v.finished = true;
-                                break;
-                            }
-                        }
-                        let i = v.pos as usize;
-                        let f = (v.pos - i as f64) as f32;
-                        let j = if i + 1 < hi { i + 1 } else if v.looping { lo } else { i };
-                        let g = pan_gains(v.pan);
-                        for (ch, o) in frame.iter_mut().enumerate() {
-                            let sc = ch.min(cc - 1);
-                            let a = c.samples[i * cc + sc] as f32;
-                            let b = c.samples[j * cc + sc] as f32;
-                            let x = (a + (b - a) * f) / 32768.0 * vol * g[ch.min(1)];
-                            *o += x;
-                            if ch < 2 && fx != 0.0 {
-                                send[fi] += x * fx * 0.5;
-                            }
-                        }
-                        v.pos += step;
+                // the library mixes at `[0x6B48DA]` into a buffer of that rate; the device's own
+                // rate is reached from there ([`Bridge`])
+                let mix_rate = g.mix_rate();
+                let step = mix_rate as f64 / out_rate;
+                let n = out.len() / channels.max(1);
+                let mut bridge = std::mem::take(&mut g.bridge);
+                for (k, frame) in out.chunks_exact_mut(channels).enumerate() {
+                    let lr = bridge.next(step, n - k, |_| g.pump(mix_rate));
+                    // a mono device takes the left channel, a third and later one the right
+                    for (ch, o) in frame.iter_mut().enumerate() {
+                        *o = lr[ch.min(1)];
                     }
                 }
-                g.voices.retain(|(_, v)| !v.finished);
-                // streamed sources: pull frames at src.rate, hold the last frame between source frames
-                let fade_frames = (out_rate as u32 * Fade::STEP_MS / 1000).max(1) as usize;
-                for (_, sv) in g.streams.iter_mut() {
-                    let cc = sv.src.channels.max(1) as usize;
-                    let step = sv.src.rate as f64 / out_rate;
-                    let mut q = sv.src.queue.lock().unwrap();
-                    for frame in out.chunks_exact_mut(channels) {
-                        if let Some(f) = sv.fade.as_mut() {
-                            sv.fade_frames += 1;
-                            if sv.fade_frames >= fade_frames {
-                                sv.fade_frames = 0;
-                                sv.volume = f.advance(sv.volume);
-                                if f.steps_left == 0 {
-                                    sv.fade = None;
-                                }
-                            }
-                        }
-                        sv.frac += step;
-                        while sv.frac >= 1.0 {
-                            sv.frac -= 1.0;
-                            if q.len() >= cc {
-                                for c in 0..cc.min(2) {
-                                    sv.last[c] = q[c] as f32 / 32768.0;
-                                }
-                                if cc == 1 {
-                                    sv.last[1] = sv.last[0];
-                                }
-                                q.drain(..cc);
-                            } else {
-                                sv.last = [0.0, 0.0];
-                            }
-                        }
-                        for (ch, o) in frame.iter_mut().enumerate() {
-                            *o += sv.last[ch.min(1)] * sv.volume;
-                        }
-                    }
-                }
-                if g.muted {
-                    out.fill(0.0);
-                }
-                if g.bus_c != 0 && !g.muted {
-                    let rate_hz = out_rate as u32;
-                    let rv = g.tail.get_or_insert_with(|| Reverb::new(rate_hz));
-                    for (frame, dry) in out.chunks_exact_mut(channels).zip(send.iter()) {
-                        let w = rv.tick(*dry);
-                        for o in frame.iter_mut() {
-                            *o += w * REVERB_RETURN;
-                        }
-                    }
-                }
-                for s in out.iter_mut() {
-                    *s = s.clamp(-1.0, 1.0);
-                }
+                g.bridge = bridge;
             },
             |e| tracing::error!(error = %e, "audio stream"),
             None,
@@ -291,17 +1189,70 @@ impl AudioOutput {
         Ok(Self { _stream: stream, shared, rate })
     }
 
+    /// Start a voice of a bank patch (`Voice_start` 0x565E70 → 0x5907B0 → 0x590420): it takes
+    /// `clip.channels` voices of the budget through the allocator ([`pick_victims`]). A refused
+    /// start still returns a handle, one that names no voice — the library's −9, on which every
+    /// later call fails ([`is_playing`](Self::is_playing) is false).
     pub fn play(&self, clip: Arc<Clip>, volume: f32, pitch: f32, looping: bool) -> VoiceId {
-        let mut g = self.shared.lock().unwrap();
-        let id = VoiceId(g.next_id);
-        g.next_id += 1;
-        g.voices.push((id, Voice { clip, pos: 0.0, pitch, volume, pan: 0.0, looping, finished: false, fx_scale: 0x7F }));
-        id
+        self.play_sel(clip, volume, pitch, looping, 0x7F)
     }
 
-    /// `play` with a stereo position (−1..1).
-    pub fn play_panned(&self, clip: Arc<Clip>, volume: f32, pitch: f32, pan: f32, looping: bool) -> VoiceId {
-        let id = self.play(clip, volume, pitch, looping);
+    /// [`play`](Self::play) with the request's byte `+6`, `sel`: `Voice_play`'s seventh argument
+    /// (0x4A9B89…0x4A9B90), 0x7F (0x561960's default) for every start but the collision
+    /// one-shot's. The start (0x5907B0) tests each record's codes 0x01 / 0x02 against it and
+    /// multiplies the patch volume by `sel / 127` (0x5905D0), and draws from the library's
+    /// generator ([`crate::librand::patch_start`]) in the original's order.
+    ///
+    /// Every record whose ranges hold the request's bytes starts as a voice of its own, with its
+    /// own sample ([`Clip::layers`]), its own allocation (0x590420 → 0x5898F0 with the record's
+    /// channel count and priority) and its own draws, in record order (0x590841…0x590992). A
+    /// refused allocation stops the records already started and the start fails (0x5909A6).
+    /// Two or more started make a **group** (0x5909DB…0x590A5C): one id (`voice+0x1E` from
+    /// 0x5903D0), the last started the anchor (`+0x1B`), and the start answers the anchor's
+    /// handle (`[esp+0x14]`, 0x590420's last answer). Every later call on the handle walks the
+    /// group (0x590340: stop 0x565D60, volume, pitch, pan), which here is every voice with the
+    /// returned [`VoiceId`]. *(Until 2026-09-27 the port played one merged sample per patch, the
+    /// last record's, with the last record's draws — an APPROXIMATION.)*
+    pub fn play_sel(&self, clip: Arc<Clip>, volume: f32, pitch: f32, looping: bool, sel: u8) -> VoiceId {
+        self.shared.lock().unwrap().start_patch(clip, volume, pitch, looping, sel)
+    }
+
+    /// What 0x4A66B0 configures for `AUDIOQUALITY` when the sound opens (both start-ups 0x4A6840 /
+    /// 0x4A6A00; the latter reopens on a quality change): the software voice count
+    /// ([`voice_budget`]) and the mix rate ([`mix_rate`]). Voices already playing are left alone;
+    /// later starts obey the new count, and the mix goes on at the new rate.
+    pub fn set_audio_quality(&self, audio_quality: u8) {
+        let budget = voice_budget(audio_quality);
+        let rate = mix_rate(audio_quality);
+        let interp = Interp::for_quality(audio_quality);
+        let sleep = pump_sleep_ms(audio_quality);
+        let mut g = self.shared.lock().unwrap();
+        g.sleep_ms = Some(sleep);
+        if g.interp != interp {
+            g.interp = interp;
+            tracing::info!(?interp, audio_quality, "mix interpolator");
+        }
+        if g.budget != Some(budget) {
+            g.budget = Some(budget);
+            tracing::info!(budget, audio_quality, "voice budget");
+        }
+        if g.mix_rate != Some(rate) {
+            g.mix_rate = Some(rate);
+            // the reverb's delay lines are sized in frames of the mix rate
+            g.tail = None;
+            tracing::info!(mix_rate = rate, device_rate = self.rate, audio_quality, "mix rate");
+        }
+    }
+
+    /// `play` with the caller's 16-bit pan angle ([`pan_angle`]) — `Voice_play` folds it into the
+    /// request's pan byte ([`pan_byte`]) before the start.
+    pub fn play_panned(&self, clip: Arc<Clip>, volume: f32, pitch: f32, pan: u16, looping: bool) -> VoiceId {
+        self.play_panned_sel(clip, volume, pitch, pan, looping, 0x7F)
+    }
+
+    /// [`play_panned`](Self::play_panned) with the request's byte `+6` ([`play_sel`](Self::play_sel)).
+    pub fn play_panned_sel(&self, clip: Arc<Clip>, volume: f32, pitch: f32, pan: u16, looping: bool, sel: u8) -> VoiceId {
+        let id = self.play_sel(clip, volume, pitch, looping, sel);
         self.set_pan(id, pan);
         id
     }
@@ -310,7 +1261,7 @@ impl AudioOutput {
     /// (0x4A9A5F…0x4A9A6C → 0x5906D7), so a loud hit sends less to the reverb.
     pub fn set_fx_aux(&self, id: VoiceId, aux: u8) {
         let mut g = self.shared.lock().unwrap();
-        if let Some((_, v)) = g.voices.iter_mut().find(|(i, _)| *i == id) {
+        for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
             v.fx_scale = 0x7F - aux.min(0x7F);
         }
     }
@@ -325,19 +1276,30 @@ impl AudioOutput {
         }
     }
 
-    pub fn set_pan(&self, id: VoiceId, pan: f32) {
+    /// A playing voice's pan from the caller's 16-bit angle: the pan byte ([`pan_byte`]) to
+    /// `Voice_setPan8` 0x566100, which stores it in `voice+0x1F` (and does nothing when it is the
+    /// same, 0x56616D).
+    pub fn set_pan(&self, id: VoiceId, pan: u16) {
         let mut g = self.shared.lock().unwrap();
-        if let Some((_, v)) = g.voices.iter_mut().find(|(i, _)| *i == id) {
-            v.pan = pan.clamp(-1.0, 1.0);
+        for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
+            v.pan = pan_byte(pan);
         }
+    }
+
+    /// The voice a status call answers for: the handle's own — a group's anchor, else its one
+    /// voice — while it plays; a held anchor's group by its first playing voice. APPROXIMATION:
+    /// which voice 0x566910 reads for a group is not read.
+    fn status_voice(g: &Shared, id: VoiceId) -> Option<&Voice> {
+        let all: Vec<&Voice> = g.voices.iter().filter(|(i, v)| *i == id && !v.finished && !v.held).map(|(_, v)| v).collect();
+        all.iter().copied().find(|v| v.anchor).or_else(|| all.first().copied())
     }
 
     /// Fraction of the clip already played (0..1), or None when the voice is gone.
     pub fn progress(&self, id: VoiceId) -> Option<f32> {
         let g = self.shared.lock().unwrap();
-        g.voices.iter().find(|(i, _)| *i == id).map(|(_, v)| {
+        Self::status_voice(&g, id).map(|v| {
             let n = (v.clip.samples.len() / v.clip.channels.max(1) as usize).max(1) as f64;
-            (v.pos / n).clamp(0.0, 1.0) as f32
+            (v.position() / n).clamp(0.0, 1.0) as f32
         })
     }
 
@@ -346,12 +1308,39 @@ impl AudioOutput {
     /// `None` once the voice has ended (its state 3, 0x566A1E).
     pub fn position_ms(&self, id: VoiceId) -> Option<i32> {
         let g = self.shared.lock().unwrap();
-        g.voices.iter().find(|(i, v)| *i == id && !v.finished).map(|(_, v)| played_ms(v.pos as u64, v.clip.rate))
+        Self::status_voice(&g, id).map(|v| played_ms(v.position() as u64, v.clip.rate))
+    }
+
+    /// `Voice_play` 0x4A9C10's start in the library's own units (0x4A98E0 → 0x561960's request):
+    /// the pitch **word** `+0xC` (4096 = the sample's root, `pitch16_16 >> 4`, 0x4A9AC5), the
+    /// **bend byte** `+9` (`voice+0x3F`) and the pan byte `+7` ([`pan_byte`] of the angle), taken
+    /// together — no float in between. The word is carried as `word / 4096`, which
+    /// [`resample::pitch_word`] gives back exactly.
+    pub fn play_word(&self, clip: Arc<Clip>, volume: f32, word: u16, bend: u8, pan: u16, looping: bool) -> VoiceId {
+        let mut g = self.shared.lock().unwrap();
+        let id = g.start_patch(clip, volume, word as f32 / 4096.0, looping, 0x7F);
+        for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
+            v.bend = bend as i8;
+            v.pan = pan_byte(pan);
+        }
+        id
+    }
+
+    /// `Voice_play`'s update of a playing voice (0x4A9E1F…0x4A9FA3): `setVolume`, `Voice_setBend`
+    /// 0x5660C0 with the byte, `Voice_setPitch` 0x565F80 with the word (`pitch16_16 >> 4`, the low
+    /// 16 bits into `voice+0x6C`, 0x565FEB) — the pan is [`set_pan`](Self::set_pan).
+    pub fn set_word(&self, id: VoiceId, volume: f32, word: u16, bend: u8) {
+        let mut g = self.shared.lock().unwrap();
+        for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
+            v.volume = volume;
+            v.pitch = word as f32 / 4096.0;
+            v.bend = bend as i8;
+        }
     }
 
     pub fn set(&self, id: VoiceId, volume: f32, pitch: f32) {
         let mut g = self.shared.lock().unwrap();
-        if let Some((_, v)) = g.voices.iter_mut().find(|(i, _)| *i == id) {
+        for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
             v.volume = volume;
             v.pitch = pitch.max(0.05);
         }
@@ -435,7 +1424,6 @@ impl AudioOutput {
         let mut g = self.shared.lock().unwrap();
         if let Some((_, sv)) = g.streams.iter_mut().find(|(i, _)| *i == id) {
             sv.fade = Some(Fade::new(sv.volume, ms, target));
-            sv.fade_frames = 0;
         }
     }
 
@@ -446,12 +1434,17 @@ impl AudioOutput {
         g.streams.iter().find(|(i, _)| *i == id).map(|(_, sv)| sv.volume)
     }
 
-    /// Play a streamed source at its native rate (simple nearest-frame resampling), returns a stop handle.
+    /// Play a streamed source at its native rate (the voices' resampler, [`resample`]), returns a stop
+    /// handle. Its channels take voices of the budget at [`STREAM_PRIORITY`] (0x5612A0), so it is
+    /// never stolen; a refused start (the budget full of unstealable voices) returns a dead handle.
     pub fn play_stream(&self, src: Arc<StreamSource>, volume: f32) -> VoiceId {
         let mut g = self.shared.lock().unwrap();
         let id = VoiceId(g.next_id);
         g.next_id += 1;
-        g.streams.push((id, StreamVoice { src, volume, frac: 0.0, last: [0.0, 0.0], fade: None, fade_frames: 0 }));
+        if !g.allocate(src.channels.max(1) as usize, STREAM_PRIORITY, None) {
+            return id;
+        }
+        g.streams.push((id, StreamVoice { src, volume, frac: 0, window: [[0.0; 4]; 2], primed: false, fade: None }));
         id
     }
 }
@@ -459,18 +1452,20 @@ impl AudioOutput {
 pub(crate) struct StreamVoice {
     pub(crate) src: Arc<StreamSource>,
     pub(crate) volume: f32,
-    pub(crate) frac: f64,
-    pub(crate) last: [f32; 2],
+    /// the resampler's 16-bit fraction ([`resample::Cursor`])
+    pub(crate) frac: u32,
+    /// per channel `s[P−1], s[P], s[P+1], s[P+2]` around the stream's position, 16-bit scale
+    pub(crate) window: [[f32; 4]; 2],
+    /// the first three frames are in `window`
+    pub(crate) primed: bool,
     pub(crate) fade: Option<Fade>,
-    /// output frames since the fade's last step
-    pub(crate) fade_frames: usize,
 }
 
 /// A volume ramp, **0x565DD0(voice, steps, target)** as `0x566AE0(stream, ms, target)` calls it:
 /// `steps = ms / 10` toward zero (the magic 0x66666667, `sar 2`), at least 1 (0x565DFF…0x565E03);
 /// the goal `voice+0x28 = target << 16` and the step `voice+0x24 = (goal − volume) / steps`
-/// (`idiv`). One step per 10 ms of output — the divisor's unit; the library's service period
-/// itself is not read, so the 10 ms is HIGH, not CONFIRMED.
+/// (`idiv`). One step per service tick (0x589520's `voice+0x24` branch), a hundredth of a second
+/// of the mix ([`ServiceClock`], 0x58FBC0 — read 2026-09-27; the 10 ms was HIGH before).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Fade {
     pub step: f32,
@@ -479,14 +1474,12 @@ pub struct Fade {
 }
 
 impl Fade {
-    pub const STEP_MS: u32 = 10;
-
     pub fn new(volume: f32, ms: i32, goal: f32) -> Self {
         let steps = (ms / 10).max(1) as u32;
         Self { step: (goal - volume) / steps as f32, goal, steps_left: steps }
     }
 
-    /// One 10 ms step: the new volume, `None` once the goal is reached.
+    /// One service tick's step: the new volume, `None` once the goal is reached.
     pub fn advance(&mut self, volume: f32) -> f32 {
         if self.steps_left <= 1 {
             self.steps_left = 0;
@@ -576,32 +1569,591 @@ mod position_tests {
 }
 
 #[cfg(test)]
-mod bend_tests {
-    use super::Clip;
+mod pan_tests {
+    use super::{atan2_1024, pan_angle, pan_byte, pan_gains, voice_pan};
 
     #[test]
-    fn the_bend_byte_moves_the_pitch_about_0x40() {
-        // (byte − 0x40) · bend >> 6 cents: a 4-semitone patch at 127 is 393 cents up, at 0 400 down
-        let c = Clip { rate: 22050, channels: 1, samples: Vec::new(), loop_range: None, gain: 1.0, bend_cents: 400, fx_send: 0 };
-        assert_eq!(c.bend(0x40), 1.0);
-        assert!((c.bend(127) - (393.0f32 / 1200.0).exp2()).abs() < 1e-6);
-        assert!((c.bend(0) - (-400.0f32 / 1200.0).exp2()).abs() < 1e-6);
-        // clamped to 0…127 like Voice_play's argument (0x4A9C1F)
-        assert_eq!(c.bend(1000), c.bend(127));
+    fn the_angle_is_the_games_atan2_on_the_listener_axes() {
+        // (side, forward): ahead 0, the +side hand 0x100, behind 0x200, the other hand −0x100
+        assert_eq!(atan2_1024(0, 256), 0);
+        assert_eq!(atan2_1024(256, 0), 0x100);
+        assert_eq!(atan2_1024(0, -256), 0x200);
+        assert_eq!(atan2_1024(-256, 0), -0x100);
+        assert_eq!(atan2_1024(256, 256), 0x80);
+        // x/y = 0.5: step (100·256 + 100) / 200 = 128 → atan(0.5) in 1024ths = 75.56 → 76; the
+        // 64-bit path for x ≥ 0x800000 lands on the same step
+        assert_eq!(atan2_1024(100, 200), 76);
+        assert_eq!(atan2_1024(0x90_0000, 0x120_0000), 76);
+        // the 16-bit angle: ·65536, toward zero, sar 8, & 0x3FF, << 6
+        assert_eq!(pan_angle(1.0, 0.0), 0x4000);
+        assert_eq!(pan_angle(-1.0, 0.0), 0xC000);
+        assert_eq!(pan_angle(0.0, -3.0), 0x8000);
+        assert_eq!(pan_angle(2.0, 2.0), 0x2000);
+    }
+
+    #[test]
+    fn the_pan_byte_folds_the_rear_onto_the_front() {
+        // 0x4A9B4B…0x4A9B84: 0x40 ahead, 0x7F at the +side hand, 0 at the other
+        assert_eq!(pan_byte(0), 0x40);
+        assert_eq!(pan_byte(0x2000), 0x60);
+        assert_eq!(pan_byte(0x3FFF), 0x7F);
+        assert_eq!(pan_byte(0x4000), 0x7F);
+        // dead behind is 0x3F, one step off the front's 0x40
+        assert_eq!(pan_byte(0x8000), 0x3F);
+        assert_eq!(pan_byte(0xC000), 0);
+        assert_eq!(pan_byte(0xFFFF), 0x3F);
+    }
+
+    #[test]
+    fn the_patch_scales_and_offsets_the_pan_byte() {
+        // no code 0x0C / 0x25: the caller's byte as it is
+        assert_eq!(voice_pan(0x7F, 64, 1), 0x7F);
+        // SND_coll's pan 40 on a centred call: 0x40 + 40 − 0x40
+        assert_eq!(voice_pan(0x40, 40, 1), 40);
+        assert_eq!(voice_pan(0, 90, 1), 26);
+        // fesfx's scale 4 about 0x40, clamped to 0…127
+        assert_eq!(voice_pan(0x48, 64, 4), 96);
+        assert_eq!(voice_pan(0x60, 64, 4), 127);
+        assert_eq!(voice_pan(0x20, 64, 4), 0);
+    }
+
+    #[test]
+    fn the_pan_law_is_the_software_mixers() {
+        // one channel at 127/127, the other silent (0x58E0E0)
+        assert_eq!(pan_gains(0x7F), [1.0, 0.0]);
+        assert_eq!(pan_gains(0), [0.0, 1.0]);
+        // centre: x = 63, f = 126 − 31 = 95 → 95/127 on both (0x58E0B0)
+        let c = pan_gains(0x40);
+        assert!((c[0] - 95.0 / 127.0).abs() < 1e-6 && (c[1] - 95.0 / 127.0).abs() < 1e-6);
+        // 0x60 (angle 0x2000): shares 127·96/128 = 95 and 127·32/128 = 31 → f = 119 and 55
+        let g = pan_gains(0x60);
+        assert!((g[0] - 119.0 / 127.0).abs() < 1e-6 && (g[1] - 55.0 / 127.0).abs() < 1e-6);
     }
 }
 
 #[cfg(test)]
-mod pan_tests {
-    use super::pan_gains;
+mod budget_tests {
+    use super::{pick_victims, voice_budget, STREAM_PRIORITY};
 
     #[test]
-    fn the_pan_law_is_the_software_mixers() {
-        // hard left / right: one speaker at 127/127, the other silent (0x58E0E0)
-        assert_eq!(pan_gains(-1.0), [1.0, 0.0]);
-        assert_eq!(pan_gains(1.0), [0.0, 1.0]);
-        // centre: x = 63, f = 126 − 31 = 95 → 95/127 on both (0x58E0B0)
-        let c = pan_gains(0.0);
-        assert!((c[0] - 95.0 / 127.0).abs() < 1e-6 && (c[1] - 95.0 / 127.0).abs() < 1e-6);
+    fn the_budget_is_the_quality_tables() {
+        // 0x5B4B08: 48 / 24 / 12; quality 3 keeps the library's 24 (0x58A5B5)
+        assert_eq!([0, 1, 2, 3].map(voice_budget), [48, 24, 12, 24]);
+    }
+
+    #[test]
+    fn a_free_voice_is_taken_first() {
+        let live = vec![(100, 1, 0); 23];
+        assert_eq!(pick_victims(&live, 24, 1), Some(vec![]));
+    }
+
+    #[test]
+    fn a_full_budget_steals_the_lowest_priority_then_the_oldest() {
+        // 24 voices: engine layers at 100, a collision at 26 started late, one at 26 earlier
+        let mut live: Vec<(u8, u16, u32)> = (0..22).map(|i| (100, 1, i)).collect();
+        live.push((26, 1, 30));
+        live.push((26, 1, 25));
+        // the lowest priority goes first, of the two the older (stamp 25, index 23)
+        assert_eq!(pick_victims(&live, 24, 1), Some(vec![23]));
+        // two needed: both 26s, oldest first
+        assert_eq!(pick_victims(&live, 24, 2), Some(vec![23, 22]));
+        // the request's own priority is not compared: any start takes a voice, and with only
+        // 100s left the oldest of them
+        let live: Vec<(u8, u16, u32)> = (0..24).map(|i| (100, 1, 50 - i)).collect();
+        assert_eq!(pick_victims(&live, 24, 1), Some(vec![23]));
+    }
+
+    #[test]
+    fn streams_and_priorities_from_0x65_are_never_stolen() {
+        // a stereo stream (0x65) and 22 voices at 0x65 or above: nothing can be taken
+        let mut live: Vec<(u8, u16, u32)> = vec![(STREAM_PRIORITY, 2, 0)];
+        live.extend((1..23).map(|i| (if i % 2 == 0 { 0x65 } else { 0xC8 }, 1, i)));
+        assert_eq!(pick_victims(&live, 24, 1), None);
+        // one stealable voice among them is the one taken
+        live.push((100, 1, 99));
+        assert_eq!(pick_victims(&live, 26, 2), Some(vec![23]));
+        // with no free voice beside it, one stealable mono voice cannot make room for a stereo start
+        assert_eq!(pick_victims(&live, 25, 2), None);
+    }
+
+    #[test]
+    fn a_refusal_stops_nothing_and_a_stereo_victim_frees_two() {
+        // 12 voices (quality 2), ten mono at 100 and one stereo at 90: a stereo start needs 2
+        let mut live: Vec<(u8, u16, u32)> = (0..10).map(|i| (100, 1, i)).collect();
+        live.push((90, 2, 20));
+        assert_eq!(pick_victims(&live, 12, 2), Some(vec![10]));
+        // a stereo start into a budget of one voice: refused, not one voice given up
+        assert_eq!(pick_victims(&[(0, 1, 0)], 1, 2), None);
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::{mix_rate, Bridge, Shared};
+
+    fn ramp(sign: f32) -> impl FnMut(usize) -> Vec<[f32; 2]> {
+        let mut next = 0.0f32;
+        move |n| {
+            (0..n)
+                .map(|_| {
+                    next += 1.0;
+                    [next, sign * next]
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn the_driver_writes_a_sleep_of_frames_in_sixteens() {
+        use super::{Pump, pump_sleep_ms, ring_frames};
+        assert_eq!([0, 1, 2, 3].map(pump_sleep_ms), [8, 20, 50, 10]);
+        // 0.4 s of the mix rate, in sixteens
+        assert_eq!([32000, 22050, 16000].map(ring_frames), [12800, 8816, 6400]);
+        // 22050 Hz, 20 ms: 441 frames a pass, written as 432 / 448 (the cursor's sixteens)
+        let mut p = Pump::default();
+        let w: Vec<u32> = (0..4).map(|_| p.next_write(22050, 20).iter().sum()).collect();
+        assert_eq!(w, [432, 448, 432, 448]);
+        // 32000 Hz, 8 ms: 256 a pass, the ring of 12800 = 50 passes, so no pass is cut
+        let mut p = Pump::default();
+        assert!((0..200).all(|_| p.next_write(32000, 8)[1] == 0));
+        // a pass across the ring's end is two parts (0x58F9DB…0x58F9F5): the shipped qualities'
+        // passes land on the ring's end (20 · 441 → 8816, 8 · 800 = 6400, 50 · 256 = 12800), the
+        // library's 10 ms at 22050 does not — its 160th pass is 208 + 16
+        let mut p = Pump::default();
+        let parts: Vec<[u32; 2]> = (0..160).map(|_| p.next_write(22050, 10)).collect();
+        assert_eq!(parts[159], [208, 16]);
+        assert!(parts[..159].iter().all(|x| x[1] == 0));
+        assert_eq!(parts.iter().map(|x| x[0] + x[1]).sum::<u32>(), (160 * 2205 / 10) & !15);
+    }
+
+    #[test]
+    fn the_mix_is_rendered_in_the_driver_passes() {
+        // each pass is one or two 0x58FBC0 calls: at 22050 Hz / 20 ms the first pass of 432
+        // frames spans the first tick (208) and 224 of the second (224), so the service runs twice
+        let mut s = Shared::default();
+        s.sleep_ms = Some(20);
+        assert_eq!(s.pump(22050).len(), 432);
+        assert_eq!(s.clock.tick, 2);
+        assert_eq!(s.clock.left, 0);
+        assert_eq!(s.pump(22050).len(), 448);
+    }
+
+    #[test]
+    fn the_service_tick_is_a_hundredth_of_a_second_in_sixteens() {
+        use super::ServiceClock;
+        // 0x58FBC0: rate · tick / 100 less what was counted, rounded down to 16
+        let mut c = ServiceClock::default();
+        let ticks: Vec<u32> = (0..6).map(|_| c.next_tick(22050)).collect();
+        assert_eq!(ticks, [208, 224, 224, 224, 208, 224]);
+        let mut c = ServiceClock::default();
+        assert!((0..100).all(|_| c.next_tick(32000) == 320));
+        // on average the rate: 100 ticks of 22050 are 22048 frames (the last 16 not yet due)
+        let mut c = ServiceClock::default();
+        assert_eq!((0..100).map(|_| c.next_tick(22050)).sum::<u32>(), 22048);
+        // both counters start over after tick 30000
+        let mut c = ServiceClock { tick: 30000, counted: 30000 * 160, left: 0 };
+        assert_eq!(c.next_tick(16000), 160);
+        assert_eq!((c.tick, c.counted), (0, 0));
+    }
+
+    #[test]
+    fn a_one_shot_is_freed_at_the_first_failing_pull() {
+        use crate::resample::Interp;
+        // 1000 frames at the mix rate (step 0x10000), linear: the decoder runs 2 ahead
+        let clip = std::sync::Arc::new(super::Clip { rate: 22050, channels: 1, samples: vec![100; 1000], loop_range: None, gain: 1.0, bend_cents: 0, fx_send: 0, priority: 0, pan: 64, pan_scale: 1, records: Vec::new(), layers: Vec::new(), tables: Vec::new() });
+        let mut s = Shared::default();
+        s.interp = Interp::Linear;
+        s.voices.push((super::VoiceId(0), super::Voice::new(clip.clone(), 1.0, 1.0, false, 0)));
+        // blocks: the ticks 208, 224, 224, 224, 208; before the fifth the position is 880:
+        // 880 + 2 < 1000, so the fifth block (to 1088) pulls and mixes the tail and the zeros
+        s.render(208 + 224 * 3 + 208, 22050);
+        assert_eq!(s.voices.len(), 1);
+        assert_eq!(s.voices[0].1.cur.pos, 1088);
+        // the sixth block's pull fails: 1088 + 2 ≥ 1000 — the voice is gone before it mixes
+        s.render(1, 22050);
+        assert!(s.voices.is_empty());
+        // a looped voice never fails
+        let mut s = Shared::default();
+        s.voices.push((super::VoiceId(0), super::Voice::new(clip, 1.0, 1.0, true, 0)));
+        s.render(5000, 22050);
+        assert_eq!(s.voices.len(), 1);
+    }
+
+    #[test]
+    fn a_stream_fade_steps_once_a_tick() {
+        let src = super::StreamSource::new(22050, 1);
+        let mut s = Shared::default();
+        s.streams.push((super::VoiceId(0), super::StreamVoice { src, volume: 1.0, frac: 0, window: [[0.0; 4]; 2], primed: false, fade: Some(super::Fade::new(1.0, 30, 0.0)) }));
+        // the first render runs the service before its first frame: one of the three steps
+        s.render(1, 22050);
+        assert!((s.streams[0].1.volume - 2.0 / 3.0).abs() < 1e-6);
+        // the rest of the first tick (208 frames) has no service; the next tick's has
+        s.render(207, 22050);
+        assert!((s.streams[0].1.volume - 2.0 / 3.0).abs() < 1e-6);
+        s.render(1, 22050);
+        assert!((s.streams[0].1.volume - 1.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_mix_rate_is_the_quality_table() {
+        // 0x5B4AE4: 32000 / 22050 / 16000; quality 3 keeps the library's 22050 (0x58A5C2)
+        assert_eq!([0, 1, 2, 3].map(mix_rate), [32000, 22050, 16000, 22050]);
+        assert_eq!(Shared::default().mix_rate(), 22050);
+    }
+
+    #[test]
+    fn the_bridge_interpolates_the_mix_to_the_device_rate() {
+        // a ramp mixed at 16000 heard at 48000: three device frames per mix frame
+        let mut r = ramp(-1.0);
+        let mut b = Bridge::default();
+        let got: Vec<f32> = (0..7).map(|k| b.next(16000.0 / 48000.0, 7 - k, &mut r)[0]).collect();
+        let want = [1.0, 4.0 / 3.0, 5.0 / 3.0, 2.0, 7.0 / 3.0, 8.0 / 3.0, 3.0];
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-5, "{got:?}");
+        }
+        // at the same rate the mix passes through unchanged
+        let mut r = ramp(1.0);
+        let mut b = Bridge::default();
+        assert_eq!((0..4).map(|k| b.next(1.0, 4 - k, &mut r)[1]).collect::<Vec<_>>(), [1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn a_voice_steps_through_its_sample_at_the_mix_rate() {
+        // a 22050 Hz sample mixed at 16000 (quality 2): 22050/16000 sample frames a mix frame
+        let clip = std::sync::Arc::new(super::Clip { rate: 22050, channels: 1, samples: vec![0; 100_000], loop_range: None, gain: 1.0, bend_cents: 0, fx_send: 0, priority: 0, pan: 64, pan_scale: 1, records: Vec::new(), layers: Vec::new(), tables: Vec::new() });
+        let mut s = Shared::default();
+        s.voices.push((super::VoiceId(0), super::Voice::new(clip, 1.0, 1.0, false, 0)));
+        s.render(16000, 16000);
+        // the step 22050·16/16000 = 22.05 (an f32) · 4096 → 90316 (truncated): 16000 of them
+        let want = 90316u64 * 16000;
+        assert_eq!((s.voices[0].1.cur.pos, s.voices[0].1.cur.frac as u64), (want >> 16, want & 0xFFFF));
+    }
+
+    #[test]
+    fn a_known_sample_through_the_kernel_the_gains_and_the_store() {
+        use crate::resample::{channel_gain, cubic, linear, mix_into, to_i16, Interp};
+        // an 11025 Hz sample at the 22050 mix: step 0x8000, half a sample a frame
+        let samples: Vec<i16> = vec![1000, -2000, 3000, 12000, -500];
+        let clip = std::sync::Arc::new(super::Clip { rate: 11025, channels: 1, samples: samples.clone(), loop_range: None, gain: 1.0, bend_cents: 0, fx_send: 0, priority: 0, pan: 64, pan_scale: 1, records: Vec::new(), layers: Vec::new(), tables: Vec::new() });
+        let s_at = |k: i64| if (0..5).contains(&k) { samples[k as usize] as f32 } else { 0.0 };
+        let g = channel_gain(1.0, super::pan_gains(0x40)[0]);
+        for interp in [Interp::Cubic, Interp::Linear] {
+            let mut s = Shared::default();
+            s.interp = interp;
+            s.voices.push((super::VoiceId(0), super::Voice::new(clip.clone(), 1.0, 1.0, false, 0)));
+            let out = s.render(12, 22050);
+            for (k, frame) in out.iter().enumerate() {
+                let (p, frac) = ((k / 2) as i64, if k % 2 == 1 { 0x8000 } else { 0 });
+                // past the end the decoder's zeros go on through the kernel (0x597BF2)
+                let x = if interp == Interp::Cubic {
+                    cubic(s_at(p - 1), s_at(p), s_at(p + 1), s_at(p + 2), frac)
+                } else {
+                    linear(s_at(p), s_at(p + 1), frac)
+                };
+                let want = to_i16(mix_into(0.0, x, g)) as f32 / 32768.0;
+                assert_eq!(frame[0], want, "{interp:?} frame {k}");
+                assert_eq!(frame[1], want);
+            }
+            // the zeros past the end were mixed, and the voice is still held: its decoder fails
+            // only at the next block's pull (cubic: 6 + 3 ≥ 5 samples; linear: 6 + 2)
+            assert_eq!(s.voices.len(), 1);
+            // a one-frame block asks the decoder for nothing (half a sample, 0x59BF88): no failure
+            s.render(1, 22050);
+            assert_eq!(s.voices.len(), 1);
+            let out = s.render(2, 22050);
+            assert_eq!(out, [[0.0, 0.0]; 2]);
+            assert!(s.voices.is_empty());
+        }
+        // the cubic's first half-step reads the zeroed s[−1]: (−2000 − 0)/2 · t …, not s0 again
+        assert_ne!(cubic(0.0, 1000.0, -2000.0, 3000.0, 0x8000), linear(1000.0, -2000.0, 0x8000));
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::{Clip, Shared, Voice, VoiceId};
+    use nfs_formats::bnk::PatchRecord;
+    use std::sync::Arc;
+
+    fn layer(frames: usize, priority: u8) -> Arc<Clip> {
+        Arc::new(Clip { rate: 22050, channels: 1, samples: vec![100; frames], loop_range: None, gain: 1.0, bend_cents: 0, fx_send: 0, priority, pan: 64, pan_scale: 1, records: Vec::new(), layers: Vec::new(), tables: Vec::new() })
+    }
+
+    /// A patch of three records like `SND_coll`'s 0xD34: 72…97, 98…115 and 0…78 — a level of
+    /// 75 starts the first and the third.
+    fn patch(frames: [usize; 3]) -> Arc<Clip> {
+        let rec = |lo: i32, hi: i32| PatchRecord::from_codes(&[(0x01, lo), (0x02, hi)]);
+        let layers: Vec<Arc<Clip>> = frames.iter().map(|&n| layer(n, 26)).collect();
+        Arc::new(Clip { records: vec![rec(72, 97), rec(98, 115), rec(0, 78)], layers, ..(*layer(10, 26)).clone() })
+    }
+
+    fn start(s: &mut Shared, clip: &Arc<Clip>, sel: u8) -> VoiceId {
+        s.start_patch(clip.clone(), 1.0, 1.0, false, sel)
+    }
+
+    #[test]
+    fn every_matching_record_starts_its_own_voice() {
+        let clip = patch([300, 5000, 2000]);
+        let mut s = Shared::default();
+        let id = start(&mut s, &clip, 75);
+        // records 0 and 2, each on its own sample, the last the anchor
+        let lens: Vec<usize> = s.voices.iter().map(|(_, v)| v.clip.samples.len()).collect();
+        assert_eq!(lens, [300, 2000]);
+        assert!(s.voices.iter().all(|(i, _)| *i == id));
+        assert_eq!(s.voices.iter().map(|(_, v)| v.anchor).collect::<Vec<_>>(), [false, true]);
+        // a level of 100 starts record 1 alone: no group
+        let mut s = Shared::default();
+        start(&mut s, &clip, 100);
+        assert_eq!(s.voices.len(), 1);
+        assert!(!s.voices[0].1.anchor);
+        assert_eq!(s.voices[0].1.clip.samples.len(), 5000);
+    }
+
+    #[test]
+    fn the_anchor_is_held_until_the_group_ends() {
+        // the anchor (record 2, 300 frames) ends first: held, in the budget, silent
+        let clip = patch([2000, 10, 300]);
+        let mut s = Shared::default();
+        s.interp = crate::resample::Interp::Linear;
+        start(&mut s, &clip, 75);
+        s.render(1000, 22050);
+        assert_eq!(s.voices.len(), 2);
+        assert!(s.voices[1].1.held && !s.voices[0].1.held);
+        // the other one's end frees both (0x589CB6)
+        s.render(2000, 22050);
+        assert!(s.voices.is_empty());
+        // the other way round: the first record ends first and is freed alone
+        let clip = patch([300, 10, 2000]);
+        let mut s = Shared::default();
+        start(&mut s, &clip, 75);
+        s.render(1000, 22050);
+        assert_eq!(s.voices.len(), 1);
+        assert!(s.voices[0].1.anchor && !s.voices[0].1.held);
+        s.render(2000, 22050);
+        assert!(s.voices.is_empty());
+    }
+
+    #[test]
+    fn a_refused_record_stops_the_ones_started() {
+        // one voice free: record 0 takes it, record 2 finds only the patch's own voice at 26 —
+        // stealable, so it takes it: the first is stopped by the steal, the second plays
+        let clip = patch([300, 10, 2000]);
+        let mut s = Shared::default();
+        s.budget = Some(1);
+        start(&mut s, &clip, 75);
+        assert_eq!(s.voices.len(), 1);
+        assert_eq!(s.voices[0].1.clip.samples.len(), 2000);
+        // two voices, one held by a voice at 0x65: record 0 (at 0x65 too) takes the free one,
+        // record 2 finds nothing it may steal — refused, and record 0 is stopped again
+        let mut s = Shared::default();
+        s.budget = Some(2);
+        s.voices.push((VoiceId(900), Voice::new(layer(10, 0x65), 1.0, 1.0, true, 0)));
+        let unstealable = Arc::new(Clip { layers: clip.layers.iter().map(|l| Arc::new(Clip { priority: 0x65, ..(**l).clone() })).collect(), ..(*clip).clone() });
+        let id = start(&mut s, &unstealable, 75);
+        // record 0 took the free voice, record 2 was refused: record 0 is stopped again
+        assert!(s.voices.iter().all(|(i, _)| *i != id));
+        assert_eq!(s.voices.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::{cents_word, div_127, div_127_cubed, Clip, Envelope, Shared, Voice, VoiceId};
+    use nfs_formats::bnk::{PatchRecord, RecordTables};
+    use std::sync::Arc;
+
+    #[test]
+    fn cents_to_the_pitch_word() {
+        // 0x589E80 against the image's table (worked in scratch `audio6/chk_tbl.py`)
+        let want = [(0, 4096), (1, 4096), (100, 4336), (-100, 3864), (600, 5792), (-600, 2904), (1199, 8176), (1200, 8192), (-1200, 2048), (2400, 16384), (-1600, 1624), (-1, 4088), (5, 4112), (-5, 4080)];
+        for (c, w) in want {
+            assert_eq!(cents_word(c), w, "{c} cents");
+        }
+    }
+
+    #[test]
+    fn the_root_and_the_fine_tune_start_the_pitch() {
+        use super::base_cents;
+        let rec = |codes: &[(u8, i32)]| PatchRecord::from_codes(codes);
+        // no code 0x07 / 0x10: middle C, 0 cents
+        assert_eq!(base_cents(&rec(&[])), 0);
+        // sd6a's first slot: root 66 → six semitones down
+        assert_eq!(base_cents(&rec(&[(0x07, 66)])), -600);
+        // SND_coll's wind: root 76; a fine tune of −12 (the byte 244) on top
+        assert_eq!(base_cents(&rec(&[(0x07, 76), (0x10, -12)])), -1612);
+        // the start adds the draws to it (a record without spreads draws nothing)
+        let mut s = Shared::default();
+        let c = Arc::new(Clip { records: vec![rec(&[(0x07, 48), (0x10, 25)])], tables: vec![tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())], ..(*clip(PatchRecord::from_codes(&[]), RecordTables::default())).clone() });
+        s.start_patch(c, 1.0, 1.0, false, 0x7F);
+        assert_eq!(s.voices[0].1.cents, 1225);
+        assert_eq!(s.voices[0].1.pitch_word(), cents_word(1225));
+    }
+
+    #[test]
+    fn an_engine_layer_pitch_end_to_end() {
+        use super::base_cents;
+        use crate::resample;
+        // sd7a's layer 0x51 (44100 Hz, root 61, fine −43) at half the redline, spl[8] = 80, no
+        // doppler — worked from the image in scratch `audio7/worked.py`: the record's word 3583
+        // (0x4AC7F6…0x4AC81F), −143 cents → 3776 (0x589E80), +0x6E = 3583 · 3776 >> 12 = 3303
+        // (0x589FCA), the step 3303 · f32(44100 · 16 / 32000) truncated = 72831 (0x596A50)
+        let spl = nfs_formats::spl::Spl::default();
+        let word = spl.pitch_word(nfs_formats::spl::rpm_frac_16(3000.0, 6000.0), 0x10000);
+        assert_eq!(word, 3583);
+        assert_eq!(resample::pitch_word(word as f32 / 4096.0), 3583);
+        let r = PatchRecord::from_codes(&[(0x07, 61), (0x10, -43)]);
+        assert_eq!(base_cents(&r), -143);
+        assert_eq!(cents_word(-143), 3776);
+        let mut s = Shared::default();
+        let c = Arc::new(Clip { rate: 44100, records: vec![r], tables: vec![tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())], ..(*clip(PatchRecord::from_codes(&[]), RecordTables::default())).clone() });
+        s.start_patch(c, 1.0, word as f32 / 4096.0, true, 0x7F);
+        assert_eq!(s.voices[0].1.pitch_word(), 3303);
+        assert_eq!(resample::step_16_16(3303, 44100, 32000), 72831);
+    }
+
+    #[test]
+    fn an_ai_engine_loop_pitch_end_to_end() {
+        use super::base_cents;
+        use crate::resample;
+        // aud1ldex.bnk slot 0 (16000 Hz, root 61, fine +44, bend range 700 at the byte 0x40) at
+        // half the redline, no doppler — worked from the image in scratch `audio8/worked.py`:
+        // 0x4AAAAC…0x4AAAD1 give 3583, `<< 4` to Voice_play and `>> 4` back into `voice+0x6C`;
+        // −56 cents → 3968 (0x589E80), `+0x6E` = 3583 · 3968 >> 12 = 3471, the step
+        // 3471 · f32(16000 · 16 / 32000) = 27768 (0x596A50) at 32 kHz
+        let word = crate::ai_engine::ai_pitch_word(crate::ai_engine::ai_rpm_frac(3000.0, 6000.0), crate::ai_engine::PITCH_BASE_STILL);
+        assert_eq!(word, 3583);
+        let r = PatchRecord::from_codes(&[(0x07, 61), (0x10, 44)]);
+        assert_eq!(base_cents(&r), -56);
+        assert_eq!(cents_word(-56), 3968);
+        let mut s = Shared::default();
+        let c = Arc::new(Clip { rate: 16000, bend_cents: 700, records: vec![r], tables: vec![tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())], ..(*clip(PatchRecord::from_codes(&[]), RecordTables::default())).clone() });
+        s.start_patch(c, 1.0, word as f32 / 4096.0, true, 0x7F);
+        assert_eq!(s.voices[0].1.bend, 0x40);
+        assert_eq!(s.voices[0].1.pitch_word(), 3471);
+        assert_eq!(resample::step_16_16(3471, 16000, 32000), 27768);
+    }
+
+    #[test]
+    fn the_bend_byte_is_cents_on_the_voice() {
+        // SND_coll 0x10 (root 57, bend range 1200 cents) at the AI road loop's byte 127 and the
+        // word 0x1000: 300 + ((127 − 64) · 1200 >> 6) = 1481 cents → 9632 (0x589E80), and
+        // `+0x6E` = 0x1000 · 9632 >> 12 (0x589FCA; scratch `audio8/worked.py`)
+        let r = PatchRecord::from_codes(&[(0x07, 57)]);
+        let mut s = Shared::default();
+        let c = Arc::new(Clip { bend_cents: 1200, records: vec![r], tables: vec![tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())], ..(*clip(PatchRecord::from_codes(&[]), RecordTables::default())).clone() });
+        s.start_patch(c, 1.0, 1.0, true, 0x7F);
+        assert_eq!(s.voices[0].1.pitch_word(), cents_word(300), "0x40 is no bend");
+        s.voices[0].1.bend = 127;
+        assert_eq!(s.voices[0].1.pitch_word(), 9632);
+        // (0 − 0x40) · 1200 >> 6 = −1200, an octave down; `sar` rounds a negative term down
+        s.voices[0].1.bend = 0;
+        assert_eq!(s.voices[0].1.pitch_word(), cents_word(-900));
+        s.voices[0].1.bend = 0x3F;
+        assert_eq!(s.voices[0].1.pitch_word(), cents_word(300 - 19));
+    }
+
+    #[test]
+    fn the_magic_divides_go_toward_zero() {
+        for x in [-5_000_000, -2_048_383, -2_048_382, -1, 0, 1, 2_048_382, 2_048_383, 16_387_064, 260_144_641] {
+            assert_eq!(div_127_cubed(x), x / 2_048_383, "{x}");
+        }
+        for x in (-16129..=16129).step_by(7) {
+            assert_eq!(div_127(x), x / 127, "{x}");
+        }
+    }
+
+    #[test]
+    fn the_envelope_steps_once_a_tick_and_runs_a_segment_one_tick_over() {
+        // SND_coll's common table: 22 ticks to 127, 20 to 126, hold at 121, 24 to 0; from 0
+        let table = [(22, 127), (20, 126), (0x7FFF_FFFF, 121), (24, 0)];
+        let mut e = Envelope::start(0, 4, &table);
+        assert_eq!((e.level, e.step, e.left), (0, 378_321, 22));
+        for _ in 0..22 {
+            assert!(!e.tick(&table));
+        }
+        assert_eq!(e.level >> 16, 126);
+        // the 23rd tick steps once more — 132 — and then loads the second segment
+        assert!(!e.tick(&table));
+        assert_eq!((e.level >> 16, e.seg, e.step, e.left), (132, 1, ((126 << 16) - 8_701_383) / 20, 19));
+        // the hold (0x7FFFFFFF ticks) keeps it for good: the step rounds to 0 there
+        for _ in 0..200 {
+            assert!(!e.tick(&table));
+        }
+        assert_eq!(e.seg, 2);
+        // a table that runs out stops the voice: 2 ticks to 50, then 3 to 0, two segments
+        let table = [(2, 50), (3, 0)];
+        let mut e = Envelope::start(0, 2, &table);
+        // (the first segment steps on ticks 1–3, the second is loaded on tick 3 and has run
+        // out by tick 6)
+        let stops: Vec<bool> = (0..6).map(|_| e.tick(&table)).collect();
+        assert_eq!(stops, [false, false, false, false, false, true]);
+        // the default (no code 0x19): 127 for good
+        let mut e = Envelope::start(0x7F, 1, &nfs_formats::bnk::DEFAULT_ENVELOPE);
+        assert_eq!((e.level, e.step), (127 << 16, 0));
+        assert!(!e.tick(&nfs_formats::bnk::DEFAULT_ENVELOPE));
+    }
+
+    fn clip(r: PatchRecord, t: RecordTables) -> Arc<Clip> {
+        Arc::new(Clip { rate: 22050, channels: 1, samples: vec![100; 50_000], loop_range: None, gain: 1.0, bend_cents: 0, fx_send: 0, priority: 0, pan: 64, pan_scale: 1, records: vec![r], layers: Vec::new(), tables: vec![t] })
+    }
+
+    fn tables(envelope: Vec<(i32, i32)>) -> RecordTables {
+        RecordTables { envelope, ..Default::default() }
+    }
+
+    #[test]
+    fn the_level_byte_takes_the_envelope_the_table_and_the_curve() {
+        let r = PatchRecord { env_level: 0x7F, env_segments: 1, volume_table_len: 3, ..PatchRecord::from_codes(&[]) };
+        let t = RecordTables { volume: Some(vec![127, 64, -10]), ..tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec()) };
+        let mut v = Voice::new(clip(r, t.clone()), 1.0, 100.0 / 127.0, false, 0);
+        v.level = 99;
+        // 127 · 100 · 99 · 127 / 127³ = 77.95 → 77, then · 127 / 127
+        assert_eq!(v.level_byte(), 77);
+        v.volume_phase = 1;
+        assert_eq!(v.level_byte() as i32, 77 * 64 / 127);
+        v.volume_phase = 2;
+        assert_eq!(v.level_byte() as i32, (77 * -10) / 127);
+        // a curve maps the byte: entry `level + 128`
+        let mut curve = vec![0u8; 256];
+        curve[128 + 77] = 120;
+        let t = RecordTables { volume: None, curve: Some(curve), ..t };
+        let mut v = Voice::new(clip(r, t), 1.0, 100.0 / 127.0, false, 0);
+        v.level = 99;
+        assert_eq!(v.level_byte(), 120);
+    }
+
+    #[test]
+    fn the_service_walks_the_tables_once_a_tick() {
+        // a pitch table of 3 entries (depth 128: two cents a step from 0x40) and a volume table of 2
+        let r = PatchRecord { env_level: 0x7F, env_segments: 1, volume_table_len: 2, pitch_table_len: 3, pitch_depth: 128, ..PatchRecord::from_codes(&[]) };
+        let t = RecordTables { volume: Some(vec![127, 0]), pitch: Some(vec![0x40, 0x40 + 50, 0x40 - 50]), ..tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec()) };
+        let mut s = Shared::default();
+        s.voices.push((VoiceId(0), Voice::new(clip(r, t), 1.0, 1.0, false, 0)));
+        let phases = |s: &Shared| (s.voices[0].1.volume_phase, s.voices[0].1.pitch_phase);
+        assert_eq!(phases(&s), (0, 0));
+        // the first render runs the service before its first frame
+        s.render(1, 22050);
+        assert_eq!(phases(&s), (1, 1));
+        assert_eq!(s.voices[0].1.pitch_word(), cents_word(100));
+        assert_eq!(s.voices[0].1.level_byte(), 0);
+        s.render(207 + 1, 22050);
+        assert_eq!(phases(&s), (0, 2));
+        assert_eq!(s.voices[0].1.pitch_word(), cents_word(-100));
+        s.render(224, 22050);
+        assert_eq!(phases(&s), (1, 0));
+        assert_eq!(s.voices[0].1.pitch_word(), 4096);
+    }
+
+    #[test]
+    fn a_run_out_envelope_stops_the_group() {
+        let r = PatchRecord { env_level: 0x7F, env_segments: 1, ..PatchRecord::from_codes(&[]) };
+        let mut s = Shared::default();
+        s.voices.push((VoiceId(3), Voice::new(clip(r, tables(vec![(1, 127)])), 1.0, 1.0, true, 0)));
+        s.voices.push((VoiceId(3), Voice::new(clip(r, tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())), 1.0, 1.0, true, 0)));
+        // tick 1: one tick left → 0; tick 2: past the only segment → 0x565D60 on the handle
+        s.render(1, 22050);
+        assert_eq!(s.voices.len(), 2);
+        s.render(208, 22050);
+        assert!(s.voices.is_empty());
     }
 }

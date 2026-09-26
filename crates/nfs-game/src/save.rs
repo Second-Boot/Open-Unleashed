@@ -192,11 +192,14 @@ fn car_image(tables: &CareerTables, c: &OwnedCar, instance: u32, players: bool) 
     let t = c.trim;
     let (s1, s2, int) = (be(0x3F0 + 16 * t.stripe1 as usize), be(0x3F4 + 16 * t.stripe2 as usize), be(0x530 + 16 * t.interior as usize));
     let mut car = SavedCar::new(image);
+    // a colour that is not a row — a saved custom colour chosen in the paint shop — is written as
+    // the dword itself, which is all the original ever keeps there (§4.7a, `OwnedCar::custom`)
+    let [cx, ci, c1, c2] = c.custom;
     if let Some(p) = tables.car(c.car_id).and_then(|e| e.paint_sets.get(c.paint_set as usize)) {
-        car.set_field_u32(car::EXT_COLOUR, p.packed[0]);
-        car.set_field_u32(car::INT_COLOUR, int);
-        car.set_field_u32(car::S1_COLOUR, s1);
-        car.set_field_u32(car::S2_COLOUR, s2);
+        car.set_field_u32(car::EXT_COLOUR, cx.unwrap_or(p.packed[0]));
+        car.set_field_u32(car::INT_COLOUR, ci.unwrap_or(int));
+        car.set_field_u32(car::S1_COLOUR, c1.unwrap_or(s1));
+        car.set_field_u32(car::S2_COLOUR, c2.unwrap_or(s2));
         car.set_field_u32(car::PACKAGE_NUM, t.package as u32);
         car.set_field_u32(car::DECAL_NUM, t.decal as i32 as u32);
     }
@@ -243,23 +246,23 @@ fn car_image(tables: &CareerTables, c: &OwnedCar, instance: u32, players: bool) 
 
 fn owned_from_image(tables: &CareerTables, car: &SavedCar) -> OwnedCar {
     let car_id = u16::from_le_bytes([car.image.get(car::RECORD).copied().unwrap_or(0), car.image.get(car::RECORD + 1).copied().unwrap_or(0)]);
-    let ext = car.field_u32(car::EXT_COLOUR);
-    let paint_set = tables
-        .car(car_id)
-        .and_then(|e| e.paint_sets.iter().position(|p| p.packed[0] == ext))
-        .unwrap_or(0) as u8;
-    // the other rows back from the colours they hold (row 0 when none matches)
+    // the rows back from the colours they hold; a colour no row holds — a custom one — is kept as
+    // the colour with row 0 under it (`OwnedCar::custom`), a zero dword as row 0
     let rec = car.image.get(car::RECORD..car::RECORD + CAR_RECORD_SIZE).unwrap_or(&[]);
-    let row = |base: usize, count_at: usize, v: u32| -> u8 {
+    let mut custom = [None; 4];
+    let mut row = |slot: usize, base: usize, count_at: usize, v: u32| -> u8 {
         let n = rec.get(count_at..count_at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]) as usize).min(40);
-        (0..n)
-            .position(|i| rec.get(base + 16 * i..base + 16 * i + 4).is_some_and(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) == v))
-            .unwrap_or(0) as u8
+        let at = (0..n).position(|i| rec.get(base + 16 * i..base + 16 * i + 4).is_some_and(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) == v));
+        if at.is_none() && v != 0 {
+            custom[slot] = Some(v);
+        }
+        at.unwrap_or(0) as u8
     };
+    let paint_set = row(0, 0x3EC, 0x3E6, car.field_u32(car::EXT_COLOUR));
     let trim = crate::career::Trim {
-        interior: row(0x530, 0x528, car.field_u32(car::INT_COLOUR)),
-        stripe1: row(0x3F0, 0x3E6, car.field_u32(car::S1_COLOUR)),
-        stripe2: row(0x3F4, 0x3E6, car.field_u32(car::S2_COLOUR)),
+        interior: row(1, 0x530, 0x528, car.field_u32(car::INT_COLOUR)),
+        stripe1: row(2, 0x3F0, 0x3E6, car.field_u32(car::S1_COLOUR)),
+        stripe2: row(3, 0x3F4, 0x3E6, car.field_u32(car::S2_COLOUR)),
         // the list has eight rows; anything else is an older port save's paint-set dword (0 / 205)
         package: Some(car.field_u32(car::PACKAGE_NUM)).filter(|p| *p < 8).unwrap_or(0) as u8,
         decal: (car.field_u32(car::DECAL_NUM) as i32).clamp(-1, 99) as i8,
@@ -272,6 +275,7 @@ fn owned_from_image(tables: &CareerTables, car: &SavedCar) -> OwnedCar {
         car_id,
         paint_set,
         trim,
+        custom,
         parts: car.installed.iter().filter(known).map(|p| p.id as i16).collect(),
         stock: car.removed.iter().filter(known).map(|p| (p.id as i16, p.state)).collect(),
         mileage: car.field_u32(car::MILEAGE),
@@ -455,7 +459,8 @@ impl KnockoutProgress {
         }
     }
 
-    fn to_state(&self) -> KnockoutState {
+    /// The block back, as the module writes it (the inverse of [`Self::from_state`]).
+    pub fn to_state(&self) -> KnockoutState {
         let mut k = KnockoutState { active: self.active, race_index: self.race_index as i32, opponents: self.opponents as i32, ..Default::default() };
         for (i, a) in self.alive.iter().take(16).enumerate() {
             k.alive[i] = u8::from(*a);
@@ -472,6 +477,73 @@ impl KnockoutProgress {
             k.last_pos[i] = *p;
         }
         k
+    }
+}
+
+/// One of `OpponentCar.Car`'s seven embedded FE cars (`FEOpponentCarAccessor + 0x24 + i·0x760`,
+/// `modes.md` §1.1a): the record 0x4F4FA0 drew and the six values it handed `FECar::init`
+/// 0x4EEBA0 — one paint set `k` for the exterior and both stripes, an interior row, a package and
+/// a decal. The accessor's Save 0x4F56C0 writes its selection (0x4BC460) and then each car through
+/// 0x4EE8D0; its Load 0x4F56F0 reads them back through 0x4EE6A0, and nothing redraws them until
+/// the next 0x4F4FA0 (its refresh slot 0x4BC4F0 → 0x4F57A0 only answers row text) — so a knockout
+/// series loaded half-way races the cars it was started with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OpponentCarSave {
+    pub car_id: u16,
+    pub paint_set: usize,
+    pub interior: usize,
+    pub package: u32,
+    pub decal: i32,
+}
+
+/// The FE car image of one [`OpponentCarSave`]: the `nfs5.car` record at `+4` and the six
+/// appearance dwords as 0x4F500C…0x4F51B6 fill them — each colour `0xFFFF0000` unless the record
+/// has paint sets (`rec+0x3E6`) / interiors (`rec+0x528`), then `rec+0x3EC` / `+0x3F0` / `+0x3F4
+/// + 16k` and `rec+0x530 + 16i`. The instance dword and the career fields stay 0: the seven are
+/// built by the plain constructor 0x4EE5C0, not `FECar::init`'s instance search (APPROXIMATION —
+/// what 0x4EE5C0 leaves in them was not read).
+pub fn opponent_car_image(tables: &CareerTables, o: &OpponentCarSave) -> SavedCar {
+    let mut image = vec![0u8; FE_CAR_IMAGE];
+    if let Some(i) = tables.catalog.iter().position(|e| e.id == o.car_id)
+        && let Some(rec) = tables.raw.car.get(i * CAR_RECORD_SIZE..(i + 1) * CAR_RECORD_SIZE)
+    {
+        image[car::RECORD..car::RECORD + CAR_RECORD_SIZE].copy_from_slice(rec);
+    }
+    let rec = |o: usize| image.get(car::RECORD + o..car::RECORD + o + 4).map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let count = |o: usize| image.get(car::RECORD + o..car::RECORD + o + 2).map_or(0, |b| i16::from_le_bytes([b[0], b[1]]));
+    let none = 0xFFFF_0000u32;
+    let (mut ext, mut s1, mut s2, mut int) = (none, none, none, none);
+    if count(0x3E6) > 0 {
+        let k = 16 * o.paint_set;
+        (ext, s1, s2) = (rec(0x3EC + k), rec(0x3F0 + k), rec(0x3F4 + k));
+    }
+    if count(0x528) > 0 {
+        int = rec(0x530 + 16 * o.interior);
+    }
+    let mut c = SavedCar::new(image);
+    c.set_field_u32(car::EXT_COLOUR, ext);
+    c.set_field_u32(car::INT_COLOUR, int);
+    c.set_field_u32(car::S1_COLOUR, s1);
+    c.set_field_u32(car::S2_COLOUR, s2);
+    c.set_field_u32(car::PACKAGE_NUM, o.package);
+    c.set_field_u32(car::DECAL_NUM, o.decal as u32);
+    c
+}
+
+/// [`opponent_car_image`] read back: the record id, the paint set and interior rows whose colours
+/// the image holds (row 0 when none matches), the package and the decal.
+pub fn opponent_car_of(car: &SavedCar) -> OpponentCarSave {
+    let rec = car.image.get(car::RECORD..car::RECORD + CAR_RECORD_SIZE).unwrap_or(&[]);
+    let row = |base: usize, count_at: usize, v: u32| -> usize {
+        let n = rec.get(count_at..count_at + 2).map_or(0, |b| i16::from_le_bytes([b[0], b[1]]).max(0) as usize).min(40);
+        (0..n).position(|i| rec.get(base + 16 * i..base + 16 * i + 4).is_some_and(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) == v)).unwrap_or(0)
+    };
+    OpponentCarSave {
+        car_id: car.car_id(),
+        paint_set: row(0x3EC, 0x3E6, car.field_u32(car::EXT_COLOUR)),
+        interior: row(0x530, 0x528, car.field_u32(car::INT_COLOUR)),
+        package: car.field_u32(car::PACKAGE_NUM),
+        decal: car.field_u32(car::DECAL_NUM) as i32,
     }
 }
 
@@ -497,6 +569,9 @@ pub struct SaveSide {
     pub settings: SavedSettings,
     /// `Tournament`'s four front-end dwords (§4.3).
     pub tournament: TournamentFe,
+    /// `OpponentCar.Car` (`FEOpponentCarAccessor`, §6.1): its selection and its seven cars
+    /// (`opponent_car_image` / `opponent_car_of`). `None` leaves the accessor out of the block.
+    pub opponent_cars: Option<(u32, Vec<SavedCar>)>,
 }
 
 /// The four dwords of the `Tournament` module (§4.3) that belong to the front end, not to the
@@ -710,6 +785,9 @@ pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, 
             entries.push((name.clone(), AccessorValue::Dword(*index)));
         }
     }
+    if let Some((selection, cars)) = &side.opponent_cars {
+        entries.push(("OpponentCar.Car".into(), AccessorValue::OpponentCars { selection: *selection, cars: cars.clone() }));
+    }
     // the selected car's setup, which the screen mirrors into `FEFloatAccessor`s — a float rides in
     // the same dword (`career.md` §12, `layouts.md`)
     if let Some(car) = c.garage.first() {
@@ -728,10 +806,11 @@ pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, 
         track_records: true,
         // §4.4, 0x4F7A10: the market's year, then every car of `[0x691B88]` whose `+0x6A0` is 0 —
         // always written, as the module is always registered. The year is `[0x691B58]`, which
-        // 0x4F7DC7 sets to the chronicle year each time the market is refreshed after a race; the
-        // port does not keep it apart and writes the career's year (APPROXIMATION: it differs
-        // only when the year has turned since the last refresh). The instance dwords continue
-        // after the garage's (see `car_image`).
+        // 0x4F7DC7 sets to the chronicle year each time the market is refreshed after a race.
+        // Every change of the chronicle year (0x502A08, 0x503BE8 inside 0x4EDF00) comes before
+        // the next refresh or read, so outside the unported year cheats the two are equal and the
+        // career's year is the dword (`career.md`, "The market year, settled"). The instance
+        // dwords continue after the garage's (see `car_image`).
         used_cars: Some(UsedCarMarket {
             year: c.year as u32,
             cars: c.market.iter().enumerate().map(|(i, car)| car_image(tables, car, (c.garage.len() + i) as u32, false)).collect(),
@@ -845,7 +924,9 @@ pub fn side_from_sav(s: &SaveFile) -> SaveSide {
         settings: SavedSettings::default(),
         // 0x5029F0 stores the four back as they are
         tournament: s.tournament.as_ref().map_or_else(TournamentFe::default, |t| TournamentFe { selected: t.selected, next_event: t.remaining_tracks, current_event: t.current_event, current_tournament: t.current_tournament }),
+        opponent_cars: None,
     };
+    let mut opponent_cars = None;
     let st = &mut side.settings;
     for (name, v) in s.accessors.iter().flat_map(|a| a.entries.iter()) {
         match (name.as_str(), v) {
@@ -867,6 +948,8 @@ pub fn side_from_sav(s: &SaveFile) -> SaveSide {
                 }
                 st.options.push((name.clone(), d));
             }
+            // 0x4F56F0: the selection through 0x4BC480, then seven cars through 0x4EE6A0
+            (_, AccessorValue::OpponentCars { selection, cars }) => opponent_cars = Some((*selection, cars.clone())),
             (_, AccessorValue::DeadZone { values, .. }) => {
                 if let Some((axis, k)) = name.split_once('.').and_then(|(a, m)| Some((DEADZONE_AXES.iter().position(|x| *x == a)?, ["Min", "Max"].iter().position(|x| *x == m)?))) {
                     st.deadzone[axis][k] = values[0];
@@ -875,6 +958,7 @@ pub fn side_from_sav(s: &SaveFile) -> SaveSide {
             _ => {}
         }
     }
+    side.opponent_cars = opponent_cars;
     side
 }
 

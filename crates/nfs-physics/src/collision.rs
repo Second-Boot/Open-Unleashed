@@ -36,7 +36,7 @@ impl Triangle {
 ///
 /// * [`Self::update_zone`] is `Tracker::updateZone(pos, keep = 1)` 0x474060: a cached patch that
 ///   still contains the point is kept and `changed` (`+9`) cleared; otherwise `findPatch`
-///   0x473240 — the drivable patch (`word & 0xF`) under the point whose height is nearest `p.y`
+///   0x473240 — the drivable patch (`word & 0xF`) under the point whose centre height is nearest `p.y`
 ///   ([`TriangleGrid::patches_at`]) — with `changed = (patch != old)`, the zone word `+0x24`
 ///   the patch's or 0. The normal `+0xC` (0x474420 → 0x474320) is the patch's; with no patch it
 ///   keeps the last one's.
@@ -104,8 +104,12 @@ impl PatchTracker {
             return;
         }
         let old = self.patch;
-        let best = grid.patches_at(p).min_by(|x, y| (x.1 - p.y).abs().total_cmp(&(y.1 - p.y).abs()));
-        self.patch = best.map(|(t, _)| (t.a, t.b, t.c, t.surface));
+        // `findPatch` 0x473240: the patch whose centre height is nearest `p.y`, the first of equals
+        let best = grid.patches_at(p).map(|(t, _)| t).fold(None::<&Triangle>, |b, t| match b {
+            Some(b) if (patch_centre_y(b) - p.y).abs() <= (patch_centre_y(t) - p.y).abs() => Some(b),
+            _ => Some(t),
+        });
+        self.patch = best.map(|t| (t.a, t.b, t.c, t.surface));
         self.changed = self.patch != old;
         if let Some((a, b, c, w)) = self.patch {
             self.word = w & 0xFFFF;
@@ -177,6 +181,12 @@ impl PatchTracker {
     pub fn fallback_normal(&self) -> Vec3 {
         if self.plane_normal.y > 0.1 { self.plane_normal } else { Vec3::Y }
     }
+}
+
+/// A patch's centre height, the key `findPatch` 0x473240 sorts by: the triangle's vtable +4
+/// 0x485E40 answers `(a + b + c)/3` (`[0x5B2680]`).
+fn patch_centre_y(t: &Triangle) -> f32 {
+    (t.a.y + t.b.y + t.c.y) * (1.0 / 3.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -282,12 +292,19 @@ impl TriangleGrid {
     /// `Tracker::findPatch` 0x473240 as `Tracker::updateZone` 0x474060 uses it: of the patches
     /// in the point's cell whose **plan** contains it (0x486090 / 0x485780 test the edges in the
     /// x-z plane only, 0x4860B9…0x486176) and whose flags word has a surface nibble
-    /// (`word & 0xF`, 0x4732CC), the one whose height at the point is nearest `p.y` — at any
-    /// distance (0x4732DE…0x473303). The word, or 0 when there is none (0x474060's
-    /// `zoneWord = patch ? word : 0`).
+    /// (`word & 0xF`, 0x4732CC), the one whose **centre** height is nearest `p.y` — at any
+    /// distance (0x4732D2…0x473303: vtable +4 is the patch centre, `(a + b + c)/3` for a triangle
+    /// 0x485E40, `¼·Σ` of a quad's four points 0x4855C0; `|centre.y − p.y|`, a strict `<` keeps
+    /// the first of equals). The word, or 0 when there is none (0x474060's
+    /// `zoneWord = patch ? word : 0`). *(Until 2026-09-26 the port compared the plane's height
+    /// at the point.)*
+    ///
+    /// The containment is exact: each edge's x-z cross product is stored as a float and tested
+    /// as a signed integer (`jg` / `jl` on its bits, the patch's winding byte `+8` choosing the
+    /// sign), so a point on an edge is inside and there is no epsilon.
     ///
     /// MEDIUM on two counts: the port's patches are the primitives' triangles, so a quad is
-    /// its two halves and its height their planes', and the tracker's `keep` (a cached patch
+    /// its two halves and its centre each half's, and the tracker's `keep` (a cached patch
     /// that still contains the point is kept) is not carried — the nearest is taken every time.
     pub fn find_patch(&self, p: Vec3) -> u32 {
         if self.tris.is_empty() {
@@ -310,8 +327,7 @@ impl TriangleGrid {
             if n.y.abs() < 1e-9 {
                 continue;
             }
-            let h = t.a.y - (n.x * (p.x - t.a.x) + n.z * (p.z - t.a.z)) / n.y;
-            let d = (h - p.y).abs();
+            let d = (patch_centre_y(t) - p.y).abs();
             if best.map(|(bd, _)| d < bd).unwrap_or(true) {
                 best = Some((d, t.surface));
             }
@@ -349,7 +365,7 @@ impl TriangleGrid {
                 continue;
             }
             let h = t.a.y - (n.x * (p.x - t.a.x) + n.z * (p.z - t.a.z)) / n.y;
-            let d = (h - p.y).abs();
+            let d = (patch_centre_y(t) - p.y).abs();
             if best.map(|(bd, _, _)| d < bd).unwrap_or(true) {
                 best = Some((d, t.surface, h));
             }

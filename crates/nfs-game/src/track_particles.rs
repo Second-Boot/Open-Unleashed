@@ -67,22 +67,32 @@ struct Particle {
 }
 
 #[derive(Debug, Clone)]
-struct System {
-    def: usize,
-    emitter: Emitter,
-    /// `+0x30` — `cross(dir_a, dir_b)` (0x532880)
-    axis: Vec3,
+pub(crate) struct System {
+    pub(crate) def: usize,
+    /// the part the system reads through `+0x28`: its point `+0`, its two directions `+0x10` /
+    /// `+0x1C` and its tag `+0x28` — a car's effect slot rewrites them every frame
+    /// (`crate::car_effects`), so the births take the values of the update they happen in
+    pub(crate) emitter: Emitter,
+    /// `+0x30` — `cross(dir_a, dir_b)` (0x532880), made once by the constructor (0x454395)
+    pub(crate) axis: Vec3,
     /// `+0x54` — `count × budget >> 8`
-    max: usize,
+    pub(crate) max: usize,
     /// `+0x40`
-    rate: f32,
+    pub(crate) rate: f32,
     /// `+0x0C`, `+0x14`, `+0x18`, `+0x2C`
-    tick: u32,
-    spawned: f32,
-    accumulated: f32,
-    emitting: bool,
+    pub(crate) tick: u32,
+    pub(crate) spawned: f32,
+    pub(crate) accumulated: f32,
+    pub(crate) emitting: bool,
     /// `+0x2E & 2`: both sizes 0, no billboards
-    no_sprites: bool,
+    pub(crate) no_sprites: bool,
+    /// `+0x2E & 1` with `+0x4C` pointing at a car's `+0x330` (the sparks, 0x43EEF2…0x43EF03): the
+    /// particles live in the car's frame of translation and the draw adds the car's position
+    /// (0x4546A3…0x4546CA)
+    pub(crate) relative: bool,
+    /// `+0x44`, the emission's own factor: 1.0 from the constructor (0x454305), a car effect's
+    /// strength (0x43F09C, 0x43F163, 0x43F2EB)
+    pub(crate) strength: f32,
     particles: Vec<Particle>,
     /// whether the system exists — made on its article's first draw (0x455150)
     live: bool,
@@ -90,7 +100,172 @@ struct System {
     countdown: u32,
     /// `+0x10`: the value its article was last drawn with (0x4551BF) — the walk's square distance
     /// (`s²` of the sphere's near edge, or `d²` for a mid-ground article), rounded
-    sqd: f32,
+    pub(crate) sqd: f32,
+}
+
+/// The constructor's and the retag's rate `+0x40` (0x454322…0x45437C, 0x454BC2…0x454C25): `n /
+/// lifetime`, or with an off time and `lifetime ≥ on`: `n / on` when `lifetime ≤ on + off`, else
+/// `n / ((lifetime / (on + off)) · on)` — `n` the definition's count in the constructor, the
+/// budget's maximum in the retag.
+pub(crate) fn rate_of(n: u32, d: &ParticleDef) -> f32 {
+    let (on, off, life) = (d.period_on, d.period_off, d.lifetime);
+    if off != 0 && life >= on {
+        if life <= on + off { n as f32 / on as f32 } else { n as f32 / ((life as f32 / (on + off) as f32) * on as f32) }
+    } else {
+        n as f32 / life.max(1) as f32
+    }
+}
+
+impl System {
+    /// 0x454250 `(value, part, 1)` with no prime run: the definition `di`, `max = count × budget
+    /// >> 8`, the rate, the axis, emitting (`+0x2C = 1`) unless flag 2.
+    pub(crate) fn new(defs: &[ParticleDef], di: usize, emitter: Emitter, budget: u32) -> Self {
+        let d = &defs[di];
+        System {
+            def: di,
+            axis: emitter.dir_a.cross(emitter.dir_b),
+            emitter,
+            max: ((d.count as u64 * budget as u64) >> 8) as usize,
+            rate: rate_of(d.count, d),
+            tick: 0,
+            spawned: 0.0,
+            accumulated: 0.0,
+            emitting: d.flags & 2 == 0,
+            no_sprites: d.start_size == 0.0 && d.end_size == 0.0,
+            relative: false,
+            strength: 1.0,
+            particles: Vec::new(),
+            live: false,
+            countdown: 0,
+            sqd: 0.0,
+        }
+    }
+
+    /// **0x454AC0**, the retag: nothing when the part already carries `tag`; else the part takes
+    /// it (0x454AD6), the system the definition it names (0x454BEF…), its texture, `max = count ×
+    /// budget >> 8` and the rate **from that maximum**, not from the count as the constructor
+    /// (0x454BDD `fild`s the stack slot 0x454B64 stored the maximum in); every particle is freed
+    /// only when the new definition's count differs from the old one's (0x454B62…0x454BB8) —
+    /// `RDDT` ↔ `WTSP` (35 each) keep theirs. The tick, the accumulator and the emission are left
+    /// alone.
+    pub(crate) fn retag(&mut self, defs: &[ParticleDef], tag: u32, budget: u32) {
+        if self.emitter.tag == tag {
+            return;
+        }
+        self.emitter.tag = tag;
+        // 0x455D20 finds the tag in the map; a missing one would be default-inserted (0x50E2C0) —
+        // every tag the car effects hand it is in `carpart.dat`
+        let Some(di) = defs.iter().position(|d| d.tag == tag) else { return };
+        let d = &defs[di];
+        let max = (d.count as u64 * budget as u64) >> 8;
+        if d.count != defs[self.def].count {
+            self.particles.clear();
+        }
+        self.max = max as usize;
+        self.rate = rate_of(max as u32, d);
+        self.def = di;
+    }
+
+    /// Slot 3, **0x454420**: `+0x2C = 1` and the period's tick `+0xC = 0`.
+    pub(crate) fn start(&mut self) {
+        self.emitting = true;
+        self.tick = 0;
+    }
+
+    /// **0x454C30**, one update. `draw` is the draw distance for the emission fade, which goes by
+    /// the system's `+0x10`.
+    pub(crate) fn update(&mut self, defs: &[ParticleDef], rng: &mut ParticleRng, draw: f32) {
+        let d = &defs[self.def];
+        let s = self;
+        if s.particles.is_empty() && !s.emitting {
+            return;
+        }
+        let period = d.period_on + d.period_off;
+        let off_part = d.period_off != 0 && s.tick > d.period_on;
+        if s.emitting && !off_part {
+            // 0x454C7B…0x454CD4: `acc += rate · (k · +0x44)`
+            s.accumulated += s.rate * (emission_scale(s.sqd, draw, d.volume) * s.strength);
+            while s.accumulated > s.spawned + 1.0 {
+                if s.particles.len() < s.max {
+                    let p = birth(rng, d, &s.emitter, s.axis);
+                    s.particles.insert(0, p);
+                }
+                s.spawned += 1.0;
+            }
+            s.tick += 1;
+        } else if s.tick <= period {
+            s.tick += 1;
+        } else {
+            // 0x454DEA…0x454DF7: the period starts again, and a once-only system stops
+            s.tick -= period;
+            if d.flags & 2 != 0 {
+                s.emitting = false;
+            }
+        }
+        // flag 1's floor is the part's `+0xC` (0x454DB6…0x454DD2 `fcomp [part+0xC]`), which the
+        // port does not carry: it keeps the emitter's height. No shipped definition has flag 1
+        // (`particles.md` §11).
+        let floor_y = s.emitter.position.y;
+        let life = d.lifetime as f32;
+        s.particles.retain_mut(|p| {
+            p.pos += p.vel;
+            if d.flags & 1 != 0 && p.pos.y < floor_y {
+                p.pos.y = floor_y;
+                p.vel.y *= -0.5;
+            }
+            p.vel.y -= p.gravity;
+            if d.air_friction < 1.0 {
+                p.vel.x *= d.air_friction;
+            }
+            // 0x454E24…0x454E35: `z` is taken by the friction whatever its value
+            p.vel.z *= d.air_friction;
+            p.age += 1.0;
+            p.age <= life
+        });
+    }
+
+    /// **0x454430**'s per-particle records: a billboard each unless `+0x2E & 2` (0x454781), and a
+    /// streak each when the definition has flag 4 (0x45482F → 0x454EC0). `offset` is what a
+    /// relative system's draw adds, its `+0x4C`'s point (0x4546A3…0x4546CA).
+    pub(crate) fn draw_into(&self, defs: &[ParticleDef], offset: Vec3, sprites: &mut Vec<Sprite>, streaks: &mut Vec<Streak>) {
+        let d = &defs[self.def];
+        let offset = if self.relative { offset } else { Vec3::ZERO };
+        for p in &self.particles {
+            let t = p.age / d.lifetime.max(1) as f32;
+            let argb = ramp(d, t);
+            let position = p.pos + offset;
+            if !self.no_sprites {
+                sprites.push(Sprite {
+                    material: d.material.clone(),
+                    blend: d.blend,
+                    zbias: d.zbias,
+                    sqd: self.sqd,
+                    position,
+                    size: (t * (d.end_size - d.start_size) + d.start_size) * 10.0,
+                    argb,
+                    degrees: t * p.turn,
+                });
+            }
+            if d.flags & 4 != 0 {
+                // 0x4546F8…0x454739: the tail `pos − 3·vel` (`[0x5B2600]`)
+                streaks.push(Streak { head: position, tail: position - p.vel * 3.0, argb, blend: d.blend, zbias: d.zbias, sqd: self.sqd });
+            }
+        }
+    }
+}
+
+/// One streak of 0x454EC0: a triangle `(head + (0, 0.025, 0), tail, head)` (`[0x5B26DC]` on the
+/// first vertex's `y`, 0x454F72…0x454F80) in the particle's ramp colour on all three vertices,
+/// drawn untextured (`[0x6221D8]+0x40 = 0`, 0x454ECC) as a triangle list (0x59F1D0 type 3, 80 a
+/// batch) under the definition's blend and depth bias.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Streak {
+    pub head: Vec3,
+    pub tail: Vec3,
+    pub argb: u32,
+    pub blend: u32,
+    pub zbias: i32,
+    pub sqd: f32,
 }
 
 /// One billboard of a frame: the definition's texture, the particle's point, its side, its ARGB
@@ -128,30 +303,7 @@ impl TrackParticles {
         }
         for e in emitters {
             let Some(di) = me.defs.iter().position(|d| d.tag == e.tag) else { continue };
-            let d = &me.defs[di];
-            // 0x454322…0x45437C
-            let (count, on, off, life) = (d.count, d.period_on, d.period_off, d.lifetime);
-            let rate = if off != 0 && life >= on {
-                if life <= on + off { count as f32 / on as f32 } else { count as f32 / ((life as f32 / (on + off) as f32) * on as f32) }
-            } else {
-                count as f32 / life.max(1) as f32
-            };
-            let sys = System {
-                def: di,
-                emitter: e.clone(),
-                axis: e.dir_a.cross(e.dir_b),
-                max: ((count as u64 * budget as u64) >> 8) as usize,
-                rate,
-                tick: 0,
-                spawned: 0.0,
-                accumulated: 0.0,
-                emitting: d.flags & 2 == 0,
-                no_sprites: d.start_size == 0.0 && d.end_size == 0.0,
-                particles: Vec::new(),
-                live: false,
-                countdown: 0,
-                sqd: 0.0,
-            };
+            let sys = System::new(&me.defs, di, e.clone(), budget);
             me.systems.push(sys);
         }
         me
@@ -170,7 +322,7 @@ impl TrackParticles {
         (s.tick, s.spawned, s.accumulated, s.emitting, s.live, s.sqd) = (0, 0.0, 0.0, true, true, value);
         s.particles.clear();
         for _ in 0..prime {
-            self.step_one(k, draw);
+            self.systems[k].update(&self.defs, &mut self.rng, draw);
         }
         self.systems[k].emitting = emitting;
     }
@@ -226,79 +378,15 @@ impl TrackParticles {
                 self.systems[k].particles.clear();
                 continue;
             }
-            self.step_one(k, draw);
+            self.systems[k].update(&self.defs, &mut self.rng, draw);
         }
-    }
-
-    /// 0x454C30. `draw` is the draw distance for the emission fade, which goes by the system's
-    /// `+0x10`.
-    fn step_one(&mut self, k: usize, draw: f32) {
-        let d = &self.defs[self.systems[k].def];
-        let s = &mut self.systems[k];
-        if s.particles.is_empty() && !s.emitting {
-            return;
-        }
-        let period = d.period_on + d.period_off;
-        let off_part = d.period_off != 0 && s.tick > d.period_on;
-        if s.emitting && !off_part {
-            s.accumulated += s.rate * emission_scale(s.sqd, draw, d.volume);
-            while s.accumulated > s.spawned + 1.0 {
-                if s.particles.len() < s.max {
-                    let p = birth(&mut self.rng, d, &s.emitter, s.axis);
-                    s.particles.insert(0, p);
-                }
-                s.spawned += 1.0;
-            }
-            s.tick += 1;
-        } else if s.tick <= period {
-            s.tick += 1;
-        } else {
-            // 0x454DEA…0x454DF7: the period starts again, and a once-only system stops
-            s.tick -= period;
-            if d.flags & 2 != 0 {
-                s.emitting = false;
-            }
-        }
-        let floor_y = s.emitter.position.y;
-        let life = d.lifetime as f32;
-        s.particles.retain_mut(|p| {
-            p.pos += p.vel;
-            if d.flags & 1 != 0 && p.pos.y < floor_y {
-                p.pos.y = floor_y;
-                p.vel.y *= -0.5;
-            }
-            p.vel.y -= p.gravity;
-            if d.air_friction < 1.0 {
-                p.vel.x *= d.air_friction;
-            }
-            // 0x454E24…0x454E35: `z` is taken by the friction whatever its value
-            p.vel.z *= d.air_friction;
-            p.age += 1.0;
-            p.age <= life
-        });
     }
 
     /// 0x454430's billboards for every particle.
     pub fn sprites(&self) -> Vec<Sprite> {
-        let mut out = Vec::new();
+        let (mut out, mut streaks) = (Vec::new(), Vec::new());
         for s in self.systems.iter().filter(|s| s.live) {
-            if s.no_sprites {
-                continue;
-            }
-            let d = &self.defs[s.def];
-            for p in &s.particles {
-                let t = p.age / d.lifetime.max(1) as f32;
-                out.push(Sprite {
-                    material: d.material.clone(),
-                    blend: d.blend,
-                    zbias: d.zbias,
-                    sqd: s.sqd,
-                    position: p.pos,
-                    size: (t * (d.end_size - d.start_size) + d.start_size) * 10.0,
-                    argb: ramp(d, t),
-                    degrees: t * p.turn,
-                });
-            }
+            s.draw_into(&self.defs, Vec3::ZERO, &mut out, &mut streaks);
         }
         out
     }

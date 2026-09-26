@@ -304,21 +304,26 @@ pub struct CollisionSfx {
     /// the queue's distance attenuation for the player car (0x4A93D0…0x4A9420): `512/(d+2)`, or
     /// `4 · 2048/(d+1)` on view 0x0C — the volume of the one-shots and the base of the squeal's
     atten: i32,
-    /// the pan the queue's loop voices take (0x4A93C0's sixth argument, −1..1 as the mixer has
-    /// it): the car's own pan angle (see [`CollisionSfx::set_levels`])
-    pan: f32,
+    /// the pan the queue's loop voices take (0x4A93C0's sixth argument, the 16-bit angle of
+    /// `mixer::pan_angle`): the car's own pan angle (see [`CollisionSfx::set_levels`])
+    pan: u16,
     /// the pan the queue's one-shots take: for the player the angle to the car's last contact
     /// point `car+0x440` (0x4A7BB1…0x4A7C3B, [`CollisionSfx::set_one_shot_pan`])
-    one_shot_pan: f32,
+    one_shot_pan: u16,
     /// the slot cars' loop voices `slot + 0x22` by audio slot: the voice, the `SND_coll` slot it
     /// plays (`[0x656184 + 8·voice]`) and the bend byte latched when it started (`0x5D17E8[voice]`)
     ai_loops: HashMap<usize, (VoiceId, usize, i32)>,
 }
 
-/// 0x4A98E0 / 0x4A9C10's mixer volume `(categoryLevel · game.spl[k] · vol · 85) >> 21`, as the
-/// gain that multiplies `vol / 127`.
-fn category(level: u8, trim: u32) -> f32 {
-    level as f32 * trim as f32 * 85.0 / 2_097_152.0
+/// 0x4A98E0 / 0x4A9C10's mixer volume `(categoryLevel · game.spl[k] · vol · 85) >> 21` — `imul`s,
+/// `shl 4 ; add ; lea ·5` for the 85, `sar 0x15` (0x4A9E96…0x4A9EB0) — the int `setVolume`
+/// 0x566340 stores `<< 16` in `voice+0x2C` (0x5662E3, no clamp). This is where the Audio options'
+/// levels reach a voice; the library's master `[0x6B499D]` stays 0x7F (`mixer::level_byte`). The
+/// port hands the mixer `byte / 127`, which its `round(v · 127)` gives back exactly. *(Until
+/// 2026-09-27 the port multiplied `vol / 127` by the float `level · trim · 85 / 2²¹`, rounding
+/// what the original truncates — a byte high about half the time.)*
+fn category(level: u8, trim: u32, vol: i32) -> i32 {
+    (level as i32).wrapping_mul(trim as i32).wrapping_mul(vol).wrapping_mul(85) >> 21
 }
 
 /// The siren's distance term (0x4A72F3…0x4A7309 then 0x4A7607…0x4A7626): the car's distance to the
@@ -329,6 +334,57 @@ pub fn siren_volume(distance: f32) -> i32 {
     let m = (distance as i32).clamp(0, 71);
     let d = (m * m).min(0x1324);
     (0x1324 - d) * 127 / 0x1324
+}
+
+/// `Voice_play`'s pitch 0x10000 (the sample at its root) as the word `>> 4` — what 0x4A93C0's loops
+/// (0x4A984C) and every `pitch 1.0` call hand.
+const WORD_UNIT: u16 = 0x1000;
+
+/// **The turbo's volume and 16.16 pitch** (0x4AA74A…0x4AA831), on the x87 stack:
+/// * `f0 = (int)throttle · boost · f32(1/127.5)` (`fild`, `fmul`, the f32 0.0078431377 at 0x5B4B50);
+/// * `g`: when `0.5 · redline < rpm` (`fcomp`, `test ah, 1`) `x = 0.9 · redline − rpm` over
+///   `0.9 · redline` (the f32 0.9 at 0x5B25E8), else `x = 0.5 · rpm − 0.25 · redline` over
+///   `0.25 · redline`; `x` below 0 is 0 (`test ah, 0x41`); the product is `f0 · (x / den)`;
+/// * the pitch `(rpm · 2.5 / redline + 0.5) · (int)pitchBase` (`fimul`), stored as an f32
+///   (`fstp dword`), then `fistp` — rounded to nearest (even), the default control word;
+/// * the volume `(int)lvl · f0 · g` stored as an f32, `fistp`, then `min(·, 0x7F)` and `≤ 0 → 0`
+///   (0x4AA807…0x4AA82B).
+///
+/// APPROXIMATION: the x87's 64-bit intermediate precision is taken as f64 (the f32 stores, which
+/// round far coarser, are kept).
+pub fn turbo_terms(boost: f32, throttle: u8, rpm: f32, redline: f32, lvl: i32, pitch_base: i32) -> (i32, i32) {
+    let (b, r, dbs) = (boost as f64, redline as f64, rpm as f64);
+    let f0 = throttle as f64 * b * (1.0f32 / 127.5) as f64;
+    let (x, den) = if 0.5 * r < dbs {
+        let den = r * 0.9f32 as f64;
+        (den - dbs, den)
+    } else {
+        let den = r * 0.25;
+        (dbs * 0.5 - den, den)
+    };
+    let x = if x >= 0.0 { x } else { 0.0 };
+    let fg = f0 * (x / den);
+    let pitch = ((dbs * 2.5 / r + 0.5) * pitch_base as f64) as f32;
+    let vol = ((lvl as f64 * fg) as f32).round_ties_even() as i32;
+    let vol = vol.min(0x7F).max(0);
+    (vol, pitch.round_ties_even() as i32)
+}
+
+/// The siren's start: the word of 0x4AAE90's pitch 0x10000 (`>> 4`, 0x4A9AC5), which no later
+/// call changes.
+const SIREN_WORD: u16 = 0x1000;
+
+/// The siren's bend byte at the start, `0x5D1878[slot]` — 0x20 for every slot in the image, and
+/// 0x4AAF50 writes 0x20 again at every release; no other writer (byte scan, `sfx.md` §6).
+const SIREN_START_BEND: u8 = 0x20;
+
+/// 0x4AAFB0's bend byte (0x4AB033…0x4AB056): `pitchBase << 6`, `>> 16` toward zero (`cdq ; and
+/// edx, 0xFFFF ; add ; sar 16`), negative → 0 (`sets ; dec ; and`), capped at 0x7F — 0x40, no
+/// bend, at the still listener's `pitchBase` 0x10000.
+pub fn siren_bend(pitch_base: i32) -> u8 {
+    let x = pitch_base.wrapping_shl(6);
+    let q = (x + ((x >> 31) & 0xFFFF)) >> 16;
+    q.clamp(0, 0x7F) as u8
 }
 
 /// The siren sample 0x4AAE90 picks: slot 9 for a car with `0x52C & 0x40` (no cop has it in this
@@ -442,10 +498,11 @@ impl CollisionSfx {
             rear: None,
             road: None,
             wind: None,
+            // the image's `[0x5D1838]` / `[0x5D1840]` / `[0x5D183C]` / `[0x5D1844]`
             wind_level: 0x28,
-            wind_level_step: 1,
-            wind_pitch: 0x1_0000,
-            wind_pitch_step: 10,
+            wind_level_step: -1,
+            wind_pitch: 0xFA24,
+            wind_pitch_step: -1,
             turbo: None,
             sirens: HashMap::new(),
             siren_trim: nfs_formats::spl::GameSpl::load(sounds_dir).loops_6564d0(),
@@ -454,8 +511,8 @@ impl CollisionSfx {
             engine_level: 127,
             reverb: 8,
             atten: 256,
-            pan: 0.0,
-            one_shot_pan: 0.0,
+            pan: 0,
+            one_shot_pan: 0,
             ai_loops: HashMap::new(),
         })
     }
@@ -465,7 +522,7 @@ impl CollisionSfx {
             return Some(c.clone());
         }
         let pcm = self.bank.decode_slot(&self.data, slot).ok()?;
-        let clip = Arc::new(Clip { rate: pcm.rate, channels: pcm.channels, samples: pcm.samples, loop_range: pcm.loop_range, gain: pcm.gain, bend_cents: pcm.bend_cents, fx_send: pcm.fx_send });
+        let clip = Arc::new(Clip::from_pcm(pcm));
         self.clips.insert(slot, clip.clone());
         Some(clip)
     }
@@ -515,7 +572,7 @@ impl CollisionSfx {
     /// `pan` here is the loops'; the one-shots' comes from [`Self::set_one_shot_pan`].
     /// *(2026-09-26: the "APPROXIMATION: every one-shot takes the car's pan" that stood here is
     /// withdrawn — `nfs_physics::vehicle::Vehicle::last_contact` now carries `car+0x440`.)*
-    pub fn set_levels(&mut self, sfx_level: u8, engine_level: u8, reverb: i32, distance: f32, view_0c: bool, pan: f32) {
+    pub fn set_levels(&mut self, sfx_level: u8, engine_level: u8, reverb: i32, distance: f32, view_0c: bool, pan: u16) {
         self.sfx_level = sfx_level;
         self.engine_level = engine_level;
         self.reverb = reverb;
@@ -532,21 +589,24 @@ impl CollisionSfx {
     /// the one-shot plays. APPROXIMATION of the timing only: the original reads `car+0x440` once,
     /// at the drain after the physics tick, so every one-shot of a tick takes the tick's last
     /// contact; the port plays each one-shot as its event happens.
-    pub fn set_one_shot_pan(&mut self, pan: f32) {
+    pub fn set_one_shot_pan(&mut self, pan: u16) {
         self.one_shot_pan = pan;
     }
 
     /// The default category, `SfxLevel · game.spl[9]` — everything in this bank but the slots below.
-    fn sfx_gain(&self) -> f32 {
-        category(self.sfx_level, self.spl.sfx())
+    fn sfx_volume(&self, vol: i32) -> f32 {
+        category(self.sfx_level, self.spl.sfx(), vol) as f32 / 127.0
     }
 
-    /// A one-shot's gain (0x4A98E0): the default category, and for slots from 0x30 (the collision
-    /// groups) the volume further scaled by `(0x96 − reverb) / 150` (0x4A9A56…0x4A9A90), so a hit
-    /// in a tunnel (reverb 100) is a third as loud as outside (8).
-    fn one_shot_gain(&self, slot: usize) -> f32 {
-        let g = self.sfx_gain();
-        if slot >= 0x30 { g * (0x96 - self.reverb) as f32 / 150.0 } else { g }
+    /// A one-shot's volume byte (0x4A98E0): the default category (0x4A9A49…0x4A9A59, stored as
+    /// the request's byte), and for slots from 0x30 (the collision groups) that byte further
+    /// scaled by `(0x96 − reverb) · (i8)byte / 150` (0x4A9A56…0x4A9A90: `imul`, the magic
+    /// 0x1B4E81B5 `sar 4`, the sign bit added back — toward zero), so a hit in a tunnel (reverb
+    /// 100) is a third as loud as outside (8).
+    fn one_shot_volume(&self, slot: usize, vol: i32) -> f32 {
+        let b = category(self.sfx_level, self.spl.sfx(), vol) as i8 as i32;
+        let b = if slot >= 0x30 { ((0x96 - self.reverb) * b / 150) as i8 as i32 } else { b };
+        b as f32 / 127.0
     }
 
     /// Call once per audio update: the one-shot gate decays by one.
@@ -554,13 +614,17 @@ impl CollisionSfx {
         self.gate = (self.gate - 1).max(0);
     }
 
-    /// The collision one-shot of 0x4A93C0 (chan −1): `level` only decides the gate; the call is
-    /// `Voice_play(0x33, slot, bend 0x40, 0x10000, vol = atten, pan, aux = level)` (0x4A94D5…0x4A94EA),
-    /// so the loudness is the distance's, and `level` goes on as the aux byte, which 0x4A9A5F turns
-    /// into `0x7F − level` in the request's `+0xA` → `voice+0x45` (0x5906D7). Not a volume (that is
-    /// `voice+0x2C`): its consumer is 0x589D70, the voice's **effect send** — `+0x45 · +0x44` (the
-    /// patch's code 0x13) times the environment bus over 127·127 — so a hard hit is heard nearly
-    /// dry in a tunnel (`AudioOutput::set_fx_aux`). The port had `level` as the gain.
+    /// The collision one-shot of 0x4A93C0 (chan −1): `level` decides the gate; the call is
+    /// `Voice_play(0x33, slot, bend 0x40, 0x10000, vol = atten, pan, aux = level)` (0x4A94D5…0x4A94EA).
+    /// The aux byte goes two ways in 0x4A98E0: `0x7F − level` into the request's `+0xA` →
+    /// `voice+0x45` (0x4A9A5F, slots from 0x30, → 0x5906D7), whose consumer is 0x589D70, the
+    /// voice's **effect send** — `+0x45 · +0x44` (the patch's code 0x13) times the environment bus
+    /// over 127·127 — so a hard hit is heard nearly dry in a tunnel (`AudioOutput::set_fx_aux`);
+    /// and, for every slot, the request's `+6` (0x4A9B89…0x4A9B90), which the patch start tests
+    /// against each record's codes 0x01 / 0x02 and multiplies the patch volume by, over 127
+    /// (0x5905D0 → `voice+0x3C`, a factor of the voice level at 0x589E1C) — the port passes it as
+    /// `sel` (`AudioOutput::play_panned_sel`). *(Until 2026-09-27 this said the level was "not a
+    /// volume"; before 2026-09-26 the port had it as the gain.)*
     fn play_one_shot(&mut self, out: &AudioOutput, slot: usize, level: f32) {
         let level = level.clamp(0.0, 127.0);
         if (level as i32) >> 4 <= self.gate {
@@ -569,7 +633,7 @@ impl CollisionSfx {
         self.gate = (level as i32) >> 4;
         let vol = self.atten.clamp(0, 127);
         if let Some(clip) = self.clip(slot) {
-            let id = out.play_panned(clip, vol as f32 / 127.0 * self.one_shot_gain(slot), 1.0, self.one_shot_pan, false);
+            let id = out.play_panned_sel(clip, self.one_shot_volume(slot, vol), 1.0, self.one_shot_pan, false, level as i32 as u8);
             // the aux byte is taken only for slots from 0x30 (0x4A9A56 `jl`), which every
             // collision group is
             if slot >= 0x30 {
@@ -684,25 +748,31 @@ impl CollisionSfx {
     /// of `SND_coll` straight through 0x4A98E0 at level 0x7F, pan 0x40, pitch 0x10000.
     pub fn trigger_chime(&mut self, out: &AudioOutput) {
         if let Some(clip) = self.clip(2) {
-            out.play(clip, self.sfx_gain(), 1.0, false);
+            out.play(clip, self.sfx_volume(0x7F), 1.0, false);
         }
     }
 
     /// The "wrong way" cue 0x4AAE70 (0x4A7744): slot 1 of `SND_coll` straight at level 0x28.
     pub fn wrong_way_cue(&mut self, out: &AudioOutput) {
         if let Some(clip) = self.clip(1) {
-            out.play(clip, 0x28 as f32 / 127.0 * self.sfx_gain(), 1.0, false);
+            out.play(clip, self.sfx_volume(0x28), 1.0, false);
         }
     }
 
     /// The police siren for one audio slot (0x4A75C2…0x4A765C): a cop (`0x52C & 0x20`) with its
-    /// lights on (`0xECC & 2`) starts [`siren_slot`] once (0x4AAE90 — volume 0, level byte
-    /// `0x5D1878[slot]` = 0x20) and then every update 0x4AAFB0 restarts it if it has finished (the
-    /// three samples loop, so it never does), sets the bend byte `min(pitchBase · 64 >> 16, 127)`
-    /// — 64, no bend, since the listener velocity `[0x655E44]` is NULL and `pitchBase` is 1.0 — the volume
-    /// `(AmbientLevel · game.spl[5] · v · 85) >> 21` with `v` = [`siren_volume`], and the pan.
-    /// Lights off releases the voice (0x4AAF50, 0x4A9890).
-    pub fn siren(&mut self, out: &AudioOutput, audio_slot: usize, on: bool, distance: f32, pan: f32, ambient_level: u8) {
+    /// lights on (`0xECC & 2`) starts [`siren_slot`] once — 0x4AAE90: 0x4A98E0(`[0x6564D0]`,
+    /// sample, pan angle 0x40, volume 0, bend byte `0x5D1878[slot]` (0x20 in the image and after
+    /// every release), pitch 0x10000 → the word 0x1000, 0x7F), nothing else that pass — and every
+    /// later update 0x4AAFB0 restarts it if it has finished (the three samples loop, so it never
+    /// does), sets the bend byte [`siren_bend`] of `pitchBase` (0x4AB033…0x4AB05F), the volume
+    /// `(AmbientLevel · game.spl[5] · v · 85) >> 21` with `v` = [`siren_volume`] (0x4AB0A0…
+    /// 0x4AB0C7) and the pan byte (0x4AB0F1…0x4AB13E). No `setPitch`: the word stays the start's
+    /// 0x1000. Lights off releases the voice (0x4AAF50, 0x4A9890). *(Until 2026-09-27 the start
+    /// took the car's pan and no bend; both silent at volume 0, but the bend 0x20 holds for that
+    /// first pass.)* The `0x52C & 0x40` kind's `((AmbientLevel · spl[5] · 85) >> 7) · v >> 14`
+    /// (0x4AB073…0x4AB099) has no cop in this build.
+    #[allow(clippy::too_many_arguments)]
+    pub fn siren(&mut self, out: &AudioOutput, audio_slot: usize, on: bool, distance: f32, pan: u16, pitch_base: i32, ambient_level: u8) {
         if !on {
             if let Some(id) = self.sirens.remove(&audio_slot) {
                 tracing::debug!(audio_slot, "siren stop");
@@ -710,20 +780,17 @@ impl CollisionSfx {
             }
             return;
         }
-        let v = siren_volume(distance);
-        let vol = ((ambient_level as i32 * self.siren_trim as i32 * v * 85) >> 21).clamp(0, 127);
-        // the bend byte is 64: no bend
-        let amp = vol as f32 / 127.0;
         match self.sirens.get(&audio_slot) {
             Some(&id) => {
-                out.set(id, amp, 1.0);
+                let v = siren_volume(distance);
+                let vol = category(ambient_level, self.siren_trim, v);
+                out.set_word(id, vol as f32 / 127.0, SIREN_WORD, siren_bend(pitch_base));
                 out.set_pan(id, pan);
             }
             None => {
-                // the start plays at volume 0; the first update brings the level in
                 if let Some(c) = self.clip(siren_slot(audio_slot, false)) {
                     tracing::debug!(audio_slot, sample = siren_slot(audio_slot, false), distance, "siren start");
-                    self.sirens.insert(audio_slot, out.play_panned(c, 0.0, 1.0, pan, true));
+                    self.sirens.insert(audio_slot, out.play_word(c, 0.0, SIREN_WORD, SIREN_START_BEND, 0x40, true));
                 }
             }
         }
@@ -735,7 +802,7 @@ impl CollisionSfx {
     /// (The port had CarBody × Pylon, group 0x56, at the gated fixed-15 level.)
     pub fn pylon_hit(&mut self, out: &AudioOutput) {
         if let Some(clip) = self.clip(0) {
-            out.play(clip, self.sfx_gain(), 1.0, false);
+            out.play(clip, self.sfx_volume(0x7F), 1.0, false);
         }
     }
 
@@ -749,11 +816,14 @@ impl CollisionSfx {
     /// it pushes `{4, 0x14, CarBody, surf, speedEst/4 · (1 − rand/3), 0}` — so the **rear** squeal
     /// channel carries a fluttering CarBody × surface loop instead of the tyres'. Upright, the
     /// caller stops it and runs the squeal producer again.
-    pub fn body_scrape(&mut self, out: &AudioOutput, surface_nibble: usize, vol: f32) {
+    ///
+    /// `r16` is the game's LCG draw `[0x5D1028] · [0x5D102C] >> 8 & 0xFFFF` (0x4100F8…0x41011E) —
+    /// the caller's `nfs_game::rng::rand16`, the stream the AI draws from too.
+    pub fn body_scrape(&mut self, out: &AudioOutput, surface_nibble: usize, vol: f32, r16: u32) {
         let slot = body_scrape_slot(surface_material(surface_nibble));
         // 0x41010C…0x41010F: a 16-bit draw (`>> 8 & 0xFFFF`), so `r/65536` stays under 1. The port
         // divided the 24-bit `rand()` by 65536, which let the flutter reach −84 (corrected 2026-09-26)
-        let flutter = 1.0 - (self.rand16() as f32 / 65536.0) / 3.0;
+        let flutter = 1.0 - ((r16 & 0xFFFF) as f32 / 65536.0) / 3.0;
         if let Some((id, _)) = self.front.take() {
             out.stop(id);
         }
@@ -766,7 +836,7 @@ impl CollisionSfx {
     /// `atten · min(127·v, 127) / 128` (0x4A96FA…0x4A9724); `v ≤ 0` releases it. The port had
     /// `min(127·v, 127)` as a gain with no distance until 2026-09-24.
     fn loop_voice(&mut self, out: &AudioOutput, which: usize, slot: usize, v: f32) {
-        let master = self.sfx_gain();
+        let master = (self.sfx_level, self.spl.sfx());
         let v16 = (v.max(0.0) * 65536.0) as i64;
         let bend = ((v16 * 127 / 10) >> 16).min(127) as i32;
         let level = ((v16 * 127) >> 16).min(127) as i32;
@@ -778,23 +848,21 @@ impl CollisionSfx {
             }
             return;
         }
-        let amp = vol as f32 / 127.0 * master;
+        let amp = category(master.0, master.1, vol) as f32 / 127.0;
         // the loops take the car's own pan (0x4A7C61 → 0x4A983A)
         let pan = self.pan;
+        // 0x4A9840…0x4A9854: `Voice_play(voice, slot, bend, 0x10000, vol, pan, 0x7F)` — the word
+        // 0x1000, the bend byte on the voice
         match *voice {
             Some((id, s)) if s == slot => {
-                let pitch = self.clips.get(&slot).map_or(1.0, |c| c.bend(bend));
-                out.set(id, amp, pitch);
+                out.set_word(id, amp, WORD_UNIT, bend as u8);
                 out.set_pan(id, pan);
             }
             other => {
                 if let Some((id, _)) = other {
                     out.stop(id);
                 }
-                let voice_slot = self.clip(slot).map(|clip| {
-                    let pitch = clip.bend(bend);
-                    (out.play_panned(clip, amp, pitch, pan, true), slot)
-                });
+                let voice_slot = self.clip(slot).map(|clip| (out.play_word(clip, amp, WORD_UNIT, bend as u8, pan, true), slot));
                 if which == 0 { self.front = voice_slot } else { self.rear = voice_slot }
             }
         }
@@ -839,9 +907,15 @@ impl CollisionSfx {
     /// `vol = (A · max(edi − 15, 0)) >> 7`, capped at 122, with `A` the rpm-boosted distance gain
     /// (not `engineGain`'s `· 127/128`), or `12800/(d+1)` on view 0x0C (0x4AA3B2…0x4AA3E1); `V` is
     /// [`road_v`]. The port had `V` in every view and fed `2048/(d+2) · 127/128` with no rpm boost.
+    ///
+    /// The call (0x4AA419…0x4AA42E): `Voice_play(0x18, 0x11 + idx, level, pitchBase, vol, pan,
+    /// 0x7F)` — `pitch_base` is 0x4AA050's own argument `[ebp+0x14]` (0x4A781D's doppler word; the
+    /// tiny car's doubling at 0x4AA906 is the engine record's only), the word `pitchBase >> 4`, and
+    /// `level` the bend byte on the voice. *(Until 2026-09-27 the float `Clip::bend(level) ·
+    /// doppler`.)*
     #[allow(clippy::too_many_arguments)]
-    pub fn road_roll(&mut self, out: &AudioOutput, speed: f32, nibble: usize, a: i32, half: bool, doppler: f32, pan: f32) {
-        let master = category(self.sfx_level, self.spl.road_roll());
+    pub fn road_roll(&mut self, out: &AudioOutput, speed: f32, nibble: usize, a: i32, half: bool, pitch_base: i32, pan: u16) {
+        let master = (self.sfx_level, self.spl.road_roll());
         let slot = 0x11 + nibble.min(11);
         let v = road_v(speed, nibble);
         let level = (v / 2 + 64).clamp(0, 127);
@@ -852,12 +926,12 @@ impl CollisionSfx {
             }
             return;
         }
-        // `level` is the bend byte: the roll rises in pitch with speed (`Clip::bend`)
-        let amp = vol as f32 / 127.0 * master;
+        // `level` is the bend byte: the roll rises in pitch with speed
+        let amp = category(master.0, master.1, vol) as f32 / 127.0;
+        let word = (pitch_base >> 4) as u16;
         match self.road {
             Some((id, s)) if s == slot => {
-                let pitch = self.clips.get(&slot).map_or(1.0, |c| c.bend(level)) * doppler;
-                out.set(id, amp, pitch);
+                out.set_word(id, amp, word, level as u8);
                 out.set_pan(id, pan);
             }
             _ => {
@@ -865,8 +939,7 @@ impl CollisionSfx {
                     out.stop(id);
                 }
                 if let Some(c) = self.clip(slot) {
-                    let pitch = c.bend(level) * doppler;
-                    self.road = Some((out.play_panned(c, amp, pitch, pan, true), slot));
+                    self.road = Some((out.play_word(c, amp, word, level as u8, pan, true), slot));
                 }
             }
         }
@@ -880,8 +953,17 @@ impl CollisionSfx {
     /// layer's `min((V >> 1) + 0x40, 0x7F)` (`[ebp−0x10]`, [`road_v`] of `road_speed` on
     /// `nibble`). The port took `car+0xD60` for both, without the surface factor, and stopped under
     /// an invented 0.5 m/s.
+    ///
+    /// The call (0x4AA5CC…0x4AA5DF): `Voice_play(0x1A, 0x1F, level, [0x5D183C], vol, 0, 0x7F)` —
+    /// the walk is the 16.16 pitch, the word `walk >> 4` (0xFA2…0x105D), `level` the bend byte on
+    /// the voice, the pan angle 0 (the byte 0x40). The walk's four globals start as the image has
+    /// them — level 0x28, pitch 0xFA24, both steps −1 — and only 0x4AA050 writes them (byte scan),
+    /// so they carry over from race to race; the port starts them afresh with each bank load.
+    /// *(Until 2026-09-27 the port started at 0x28 / +1 and 0x10000 / +10, and multiplied the
+    /// float bend into the float walk.)* APPROXIMATION: the draws are 0x538040's, the front end's
+    /// generator; the port takes this bank's own LCG ([`Self::rand`]).
     pub fn wind(&mut self, out: &AudioOutput, active: bool, speed_est: f32, road_speed: f32, nibble: usize) {
-        let master = self.sfx_gain();
+        let master = (self.sfx_level, self.spl.sfx());
         let s = (speed_est.abs() * 5.0) as i32;
         if !active || s == 0 {
             if let Some(id) = self.wind.take() {
@@ -909,63 +991,55 @@ impl CollisionSfx {
         let vol = ((s * self.wind_level) >> 7).min(127);
         let level = (road_v(road_speed, nibble) / 2 + 64).clamp(0, 127);
         // `level` is the bend byte on top of the random-walk pitch
-        let amp = vol as f32 / 127.0 * master;
-        let pitch = self.wind_pitch as f32 / 65536.0;
+        let amp = category(master.0, master.1, vol) as f32 / 127.0;
+        let word = (self.wind_pitch >> 4) as u16;
         match self.wind {
             Some(id) => {
-                let bend = self.clips.get(&0x1F).map_or(1.0, |c| c.bend(level));
-                out.set(id, amp, pitch * bend)
+                out.set_word(id, amp, word, level as u8);
+                out.set_pan(id, 0);
             }
             None => {
                 if let Some(c) = self.clip(0x1F) {
-                    let bend = c.bend(level);
-                    self.wind = Some(out.play(c, amp, pitch * bend, true));
+                    self.wind = Some(out.play_word(c, amp, word, level as u8, 0, true));
                 }
             }
         }
     }
 
-    /// §4.6 turbo / blower — voice 0, `SND_coll` slot 0x0F. `boost` is the turbo state 0..1,
-    /// `throttle` the raw pedal 0..255, `base` the `.spl` aux volume for the view mode and `gain` the
-    /// engine distance gain. The shipped curve is silent below half the redline, jumps there and fades
-    /// to nothing at 0.9 × redline — reproduced as written.
+    /// §4.6 turbo / blower — voice 0, `SND_coll` slot 0x0F. `boost` is the turbo state `car+0x54C`,
+    /// `throttle` the raw pedal byte `car+0xD7F`, `base` the `.spl` aux volume for the view mode
+    /// (0x4AD640) and `gain` the engine distance gain `[ebp−4]`. The shipped curve is silent below
+    /// half the redline, jumps there and fades to nothing at 0.9 × redline — reproduced as written.
+    ///
+    /// `boost` not above 0.1 releases the voice (0x4AA72E…0x4AA744 → 0x4AA851); otherwise it is
+    /// played every update with [`turbo_terms`]' volume and pitch — at volume 0 too: nothing but
+    /// the boost test stops it. `Voice_play(0, 0xF, 0x40, pitch, vol, pan, 0x7F)` (0x4AA834…
+    /// 0x4AA847): the word `pitch >> 4`, no bend. *(Until 2026-09-27 the port stopped the voice at
+    /// volume 0, and its pitch was the float `(2.5 · rpm/redline + 0.5) · doppler` rounded to the
+    /// word — where the original rounds the f32 to an int (`fistp`) before the `>> 4`.)*
+    /// APPROXIMATION: a zero redline (x87: an infinite or indefinite result) releases the voice.
     #[allow(clippy::too_many_arguments)]
-    pub fn turbo(&mut self, out: &AudioOutput, boost: f32, throttle: u8, rpm: f32, redline: f32, base: i32, gain: i32, doppler: f32, pan: f32) {
-        let master = category(self.engine_level, self.spl.turbo());
+    pub fn turbo(&mut self, out: &AudioOutput, boost: f32, throttle: u8, rpm: f32, redline: f32, base: i32, gain: i32, pitch_base: i32, pan: u16) {
+        let master = (self.engine_level, self.spl.turbo());
         if boost <= 0.1 || redline <= 0.0 {
             if let Some(id) = self.turbo.take() {
                 out.stop(id);
             }
             return;
         }
-        let lvl = (base * gain / 128).min(127);
-        let f0 = throttle as f32 * boost / 127.5;
-        let g = if rpm > 0.5 * redline {
-            (0.9 * redline - rpm).max(0.0) / (0.9 * redline)
-        } else {
-            // the low branch can never be positive with the shipped constants
-            (0.5 * rpm - 0.25 * redline).max(0.0) / (0.25 * redline)
-        };
-        // `fistp` (0x4AA804) rounds to nearest under the default control word — not `_ftol`'s
-        // truncation (the port truncated until 2026-09-26)
-        let vol = ((lvl as f32 * f0 * g).round_ties_even() as i32).clamp(0, 127);
-        if vol == 0 {
-            if let Some(id) = self.turbo.take() {
-                out.stop(id);
-            }
-            return;
-        }
-        let pitch = (2.5 * rpm / redline + 0.5) * doppler;
-        // bend byte 0x40: no bend
-        let amp = vol as f32 / 127.0 * master;
+        // 0x4AA70F…0x4AA72E: `min(auxVolume(mode) · gain >> 7, 0x7F)`
+        let lvl = (base.wrapping_mul(gain) >> 7).min(127);
+        let (vol, pitch) = turbo_terms(boost, throttle, rpm, redline, lvl, pitch_base);
+        let word = (pitch >> 4) as u16;
+        let amp = category(master.0, master.1, vol) as f32 / 127.0;
         match self.turbo {
             Some(id) => {
-                out.set(id, amp, pitch);
+                out.set_word(id, amp, word, 0x40);
                 out.set_pan(id, pan);
             }
             None => {
                 if let Some(c) = self.clip(0x0F) {
-                    self.turbo = Some(out.play_panned(c, amp, pitch, pan, true));
+                    self.turbo = Some(out.play_word(c, amp, word, 0x40, pan, true));
                 }
             }
         }
@@ -990,7 +1064,7 @@ impl CollisionSfx {
     /// latched in `0x5D17E8[voice]` (0x4A9654…0x4A968F), and the volume the plain
     /// `min(atten, 127)` (0x4A9821…0x4A9854) — not scaled by the slip as the player's is.
     #[allow(clippy::too_many_arguments)]
-    pub fn drain_ai(&mut self, out: &AudioOutput, audio_slot: usize, queue: &SfxQueue, distance: f32, view_0c: bool, pan: f32) {
+    pub fn drain_ai(&mut self, out: &AudioOutput, audio_slot: usize, queue: &SfxQueue, distance: f32, view_0c: bool, pan: u16) {
         if queue.entries.is_empty() {
             return;
         }
@@ -1022,12 +1096,11 @@ impl CollisionSfx {
             self.stop_ai_loop(out, audio_slot);
             return;
         }
-        let amp = self.atten.clamp(0, 127) as f32 / 127.0 * self.sfx_gain();
+        let amp = self.sfx_volume(self.atten.clamp(0, 127));
         let pan = self.pan;
         match self.ai_loops.get(&audio_slot).copied() {
             Some((id, s, bend)) if s == sample => {
-                let pitch = self.clips.get(&sample).map_or(1.0, |c| c.bend(bend));
-                out.set(id, amp, pitch);
+                out.set_word(id, amp, WORD_UNIT, bend as u8);
                 out.set_pan(id, pan);
             }
             other => {
@@ -1039,9 +1112,8 @@ impl CollisionSfx {
                 let v16 = (v * 65536.0) as i64;
                 let bend = ((v16 * 127 / 10) >> 16).min(127) as i32;
                 if let Some(clip) = self.clip(sample) {
-                    let pitch = clip.bend(bend);
                     tracing::debug!(audio_slot, sample, bend, amp, "ai loop start (voice slot + 0x22)");
-                    self.ai_loops.insert(audio_slot, (out.play_panned(clip, amp, pitch, pan, true), sample, bend));
+                    self.ai_loops.insert(audio_slot, (out.play_word(clip, amp, WORD_UNIT, bend as u8, pan, true), sample, bend));
                 }
             }
         }
@@ -1091,9 +1163,33 @@ mod tests {
     #[test]
     fn the_category_gain_matches_the_integer_mix() {
         // (127 · 107 · 127 · 85) >> 21 = 69 of 127 for a full default-category sound
-        let g = super::category(127, 107);
-        assert_eq!((127.0 * g) as i32, (127 * 107 * 127 * 85) >> 21);
-        assert_eq!(super::category(0, 107), 0.0);
+        assert_eq!(super::category(127, 107, 127), 69);
+        assert_eq!(super::category(0, 107, 127), 0);
+        // truncated, not rounded: 100 · 107 · 100 · 85 / 2²¹ = 43.36 and 64 · 110 · 90 · 85 / 2²¹ = 25.68
+        assert_eq!(super::category(100, 107, 100), 43);
+        assert_eq!(super::category(64, 110, 90), 25);
+        // the byte survives the mixer's `round(v · 127)`
+        for b in 0..=127i32 {
+            assert_eq!(((b as f32 / 127.0) * 127.0).round() as i32, b);
+        }
+    }
+
+    #[test]
+    fn the_turbo_rounds_its_pitch_as_an_f32_then_shifts_it() {
+        // 4500 of a 6000 redline, full throttle and boost, lvl 100, no doppler: g = (5400 − 4500)
+        // / 5400 (0.9 as the f32 0.89999998), f0 = 255 · f32(1/127.5) = 2.0000001; the pitch
+        // (4500 · 2.5 / 6000 + 0.5) · 65536 = 155648 → the word 9728 (2.375)
+        let (vol, pitch) = super::turbo_terms(1.0, 255, 4500.0, 6000.0, 100, 0x1_0000);
+        assert_eq!(pitch, 155648);
+        assert_eq!(pitch >> 4, 9728);
+        let g = (6000.0 * 0.9f32 as f64 - 4500.0) / (6000.0 * 0.9f32 as f64);
+        assert_eq!(vol, ((100.0 * (255.0 * (1.0f32 / 127.5) as f64 * g)) as f32).round_ties_even() as i32);
+        assert_eq!(vol, 33);
+        // at or under half the redline the low branch is 0: silent, but the voice plays on
+        assert_eq!(super::turbo_terms(1.0, 255, 3000.0, 6000.0, 100, 0x1_0000).0, 0);
+        // (1000 · 2.5 / 6000 + 0.5) · 65536 = 60074.67: `fistp` rounds to 60075, the `>> 4` 3754
+        let (_, p) = super::turbo_terms(1.0, 255, 1000.0, 6000.0, 100, 0x1_0000);
+        assert_eq!((p, p >> 4), (60075, 3754));
     }
 
     #[test]
@@ -1105,6 +1201,12 @@ mod tests {
         assert_eq!(super::siren_volume(1.0e6), 0);
         // odd audio slots take sample 6, even ones 8; the 0x40 cop kind 9 (0x4AAF1A…0x4AAF29)
         assert_eq!((super::siren_slot(1, false), super::siren_slot(2, false), super::siren_slot(2, true)), (6, 8, 9));
+        // the bend byte of pitchBase: 0x40 still, toward zero, never negative, capped
+        assert_eq!(super::siren_bend(0x1_0000), 0x40);
+        assert_eq!(super::siren_bend(0x1_03FF), 0x40);
+        assert_eq!(super::siren_bend(0x1_0400), 0x41);
+        assert_eq!(super::siren_bend(0x2_0000), 0x7F);
+        assert_eq!(super::siren_bend(-0x1_0000), 0);
     }
 
     use super::*;

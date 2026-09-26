@@ -22,7 +22,7 @@
 //! doppler that goes with them) — the port has no animated objects yet. Static elements are never
 //! doppler-shifted in the original either, so the rest plays at exactly 1.0.
 
-use crate::mixer::{AudioOutput, Clip, VoiceId};
+use crate::mixer::{pan_angle, AudioOutput, Clip, VoiceId};
 use nfs_formats::{bigf::Bigf, bnk::Bnk, scn::{ElementKind, Scene}};
 use std::collections::HashMap;
 use std::path::Path;
@@ -34,7 +34,7 @@ pub const VOICES: usize = 16;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Element {
     pub position: [f32; 3],
-    /// 0/2/3/4 = periodic one-shot, 1 = triggered (see the module doc), 2 = non-positional, 3/4 = hard left/right
+    /// 0/2/3/4 = periodic one-shot, 1 = triggered (see the module doc), 2 = non-positional, 3/4 = `panBase − 0x4000` / `panBase + 0x3FFF`
     pub kind: i32,
     /// `rec+0xE`, an `i16`: 0x470DA8 and 0x4AEB16 refuse a negative one
     pub patch: i16,
@@ -193,6 +193,65 @@ pub struct Ambience {
     pub ambient_level: u8,
     /// `game.spl[3]` (100 shipped)
     game_trim: u32,
+    /// the sky lightning's thunder ([`Thunder`])
+    pub thunder: Thunder,
+}
+
+/// The thunder of the sky's lightning (`RE/RENDERING.md` "Lightning", `sfx.md` "The thunder"): three
+/// globals — `[0x656494]` the countdown, `[0x656834]` the patch, `[0x656498]` the pan angle — that
+/// the race audio's init 0x4A8660 sets to 0, −1, 0 (0x4A87B7…0x4A87C3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Thunder {
+    pub delay: i32,
+    pub patch: i32,
+    pub pan: i32,
+}
+
+impl Default for Thunder {
+    fn default() -> Self {
+        Self { delay: 0, patch: -1, pan: 0 }
+    }
+}
+
+/// What one pass of 0x4A8380 does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThunderStep {
+    /// nothing pending
+    Idle,
+    /// counting down: `SndBank_get(0, patch, 0)` — the patch's bank asked for (0x4A8570, the
+    /// streamed-patch cache), the answer dropped
+    Fetch(i32),
+    /// the countdown is out: `Bank_playOneShot` 0x4A98E0 on bank `[0x6564F0]` (−2, 0x4A8DA0: the
+    /// same streamed-patch lookup, kind 0, 0x4A9B8D…0x4A9BAE) with the patch, the pan angle, level
+    /// 0x7F, bend 0x40, pitch 0x10000 (`>> 4`: the word 4096) and aux 0x7F; the patch back to −1
+    Play { patch: i32, pan: i32 },
+}
+
+impl Thunder {
+    /// **0x4A8340**(lead, pan) as a strike calls it: the patch `0x3DF + r % 9` (991…999,
+    /// `thunder_991.bnk`…`thunder_999.bnk` in `track.viv`; `div` unsigned) of the `0x538040`
+    /// random the sky drew, the countdown `0x87 − lead` (95 / 55 / 9 updates for the modes' 0x28 /
+    /// 0x50 / 0x7E), the pan kept. A second call before the play replaces all three.
+    pub fn call(&mut self, lead: i32, pan: i32, draw: u32) {
+        self.patch = 0x3DF + (draw % 9) as i32;
+        self.delay = 0x87 - lead;
+        self.pan = pan;
+    }
+
+    /// **0x4A8380**, once an audio update (0x4A813F, after the speech service): a positive countdown
+    /// goes down by one and fetches the patch; at 0 a patch above −1 plays and is cleared.
+    pub fn step(&mut self) -> ThunderStep {
+        if self.delay > 0 {
+            self.delay -= 1;
+            return ThunderStep::Fetch(self.patch);
+        }
+        if self.patch > -1 {
+            let patch = self.patch;
+            self.patch = -1;
+            return ThunderStep::Play { patch, pan: self.pan };
+        }
+        ThunderStep::Idle
+    }
 }
 
 impl Ambience {
@@ -216,7 +275,7 @@ impl Ambience {
             base += s.elements.len();
         }
         tracing::info!(elements = elements.len(), banks = index.len(), ambient_level, "ambience loaded");
-        Ok(Self { elements, index, viv, clips: HashMap::new(), pool: [Slot::default(); VOICES], rng: 0x1234_5678, ambient_level, game_trim })
+        Ok(Self { elements, index, viv, clips: HashMap::new(), pool: [Slot::default(); VOICES], rng: 0x1234_5678, ambient_level, game_trim, thunder: Thunder::default() })
     }
 
     fn rand(&mut self) -> i32 {
@@ -235,7 +294,7 @@ impl Ambience {
             let bytes = self.viv.get(o..o + l)?;
             let bank = Bnk::parse(bytes).ok()?;
             let p = (0..bank.slot_count().max(1)).find_map(|s| bank.decode_slot(bytes, s).ok())?;
-            Some(Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range, gain: p.gain, bend_cents: p.bend_cents, fx_send: p.fx_send }))
+            Some(Arc::new(Clip::from_pcm(p)))
         });
         if clip.is_none() {
             tracing::debug!(patch, "ambience bank missing or unreadable");
@@ -273,9 +332,12 @@ impl Ambience {
         ((self.ambient_level as i32 * self.game_trim as i32 * level * 85) >> 21).clamp(0, 127) as f32 / 127.0
     }
 
-    /// One update (`0x4AEF30`). `tick` is the 64 Hz game tick; `right` and `forward` are the
-    /// listener's axes.
-    pub fn update(&mut self, out: &AudioOutput, tick: u64, listener: [f32; 3], right: [f32; 3], _forward: [f32; 3]) {
+    /// One update (`0x4AEF30`). `tick` is the 64 Hz game tick; `side` and `forward` are the
+    /// listener's rows `+0xC` / `+0x24` of `mixer::pan_angle` (`side` negated under `MIRROR`), and
+    /// `pan_base` the angle 0x4A7A4E…0x4A7AAC hands 0x4AEF30: `pan_angle` of the player car's
+    /// forward `car+0x3D0` dotted with the same two rows (not an offset — a direction).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update(&mut self, out: &AudioOutput, tick: u64, listener: [f32; 3], side: [f32; 3], forward: [f32; 3], pan_base: u16) {
         if self.ambient_level == 0 || self.elements.is_empty() {
             return;
         }
@@ -303,13 +365,13 @@ impl Ambience {
                 continue;
             }
             let d = (dx * dx + dy * dy + dz * dz).sqrt();
-            self.update_element(out, i, tick8, d, listener, [dx, dy, dz], right);
+            self.update_element(out, i, tick8, d, listener, [dx, dy, dz], (side, forward, pan_base));
         }
     }
 
     /// `Ambience_updateElement` 0x4AEAC0.
     #[allow(clippy::too_many_arguments)]
-    fn update_element(&mut self, out: &AudioOutput, i: usize, tick8: i32, d: f32, listener: [f32; 3], rel: [f32; 3], right: [f32; 3]) {
+    fn update_element(&mut self, out: &AudioOutput, i: usize, tick8: i32, d: f32, listener: [f32; 3], rel: [f32; 3], (side, forward, pan_base): ([f32; 3], [f32; 3], u16)) {
         let e = self.elements[i].clone();
         // 0x4AEAE1…0x4AEB28: `d > Range + 100` (`test ah, 0x41`), a PatchID out of the index or
         // negative, or an empty bank
@@ -388,19 +450,19 @@ impl Ambience {
         }
         let level = e.level(d);
         let vol = self.voice_volume(level);
-        // §7.5 pan, folded to the mixer's left/right: Type 2 is non-positional, 3 and 4 are
-        // pinned; outside `Range` the pan stays 0 with the level (0x4AED39, 0x4AED9F)
-        let pan = if d >= e.range {
-            0.0
+        // §7.5 pan, the 16-bit angle: Type 2 is non-positional (0), 3 is `panBase − 0x4000` and 4
+        // `panBase + 0x3FFF` (0x4AEDAF…0x4AEDC5), the rest 0x4A6FE0 of the element's offset;
+        // outside `Range` the pan stays 0 with the level (0x4AED39, 0x4AED9F). (Until 2026-09-27
+        // Types 3 / 4 were pinned hard to the two sides, the other way round at `panBase` 0.)
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let pan: u16 = if d >= e.range {
+            0
         } else {
             match e.kind {
-                2 => 0.0,
-                3 => -1.0,
-                4 => 1.0,
-                _ => {
-                    let len = (rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]).sqrt().max(0.001);
-                    ((rel[0] * right[0] + rel[1] * right[1] + rel[2] * right[2]) / len).clamp(-1.0, 1.0)
-                }
+                2 => 0,
+                3 => pan_base.wrapping_sub(0x4000),
+                4 => pan_base.wrapping_add(0x3FFF),
+                _ => pan_angle(dot(rel, side), dot(rel, forward)),
             }
         };
         match self.pool[slot].voice {
@@ -443,6 +505,33 @@ impl Ambience {
     pub fn stop(&mut self, out: &AudioOutput) {
         for s in 0..VOICES {
             self.release_slot(out, s);
+        }
+    }
+
+    /// The thunder's pass 0x4A8380 ([`Thunder::step`]). The play is `Bank_playOneShot` 0x4A98E0's
+    /// kind-5 arm: the level `([0x5D1750] AmbientLevel · [0x5D14BC] game.spl[3] · 0x7F · 85) >> 21`
+    /// (0x4A9969…0x4A9A30, the ambience's own [`Self::voice_volume`]), the pan byte of the angle
+    /// ([`crate::mixer::pan_byte`], 0x4A9B4B…0x4A9B84), no bend, the patch as the bank has it.
+    /// APPROXIMATION: the original plays only if the streamed patch has loaded during the
+    /// countdown (0x4A8570 answers −1 until then, and 0x4A9BC7 then plays nothing); the port's
+    /// banks are in memory, so it always plays.
+    pub fn thunder_update(&mut self, out: &AudioOutput) {
+        match self.thunder.step() {
+            ThunderStep::Idle => {}
+            ThunderStep::Fetch(patch) => {
+                let _ = self.clip(patch as u16);
+            }
+            ThunderStep::Play { patch, pan } => {
+                let vol = self.voice_volume(0x7F);
+                match self.clip(patch as u16) {
+                    Some(c) => {
+                        let looping = c.loop_range.is_some();
+                        let id = out.play_panned(c, vol, 1.0, pan as u16, looping);
+                        tracing::info!(patch, pan, vol, playing = out.is_playing(id), "thunder");
+                    }
+                    None => tracing::info!(patch, "thunder: patch missing from track.viv"),
+                }
+            }
         }
     }
 }
@@ -570,5 +659,33 @@ mod tests {
         assert_eq!(e.level(150.0), raw * 88 / 100);
         assert_eq!(e.level(200.0), 0);
         assert_eq!(e.level(250.0), 0);
+    }
+}
+
+#[cfg(test)]
+mod thunder_tests {
+    use super::{Thunder, ThunderStep};
+
+    #[test]
+    fn the_thunder_counts_down_then_plays_once() {
+        let mut t = Thunder::default();
+        assert_eq!(t.step(), ThunderStep::Idle);
+        // mode 2's lead 0x7E: 9 updates of countdown, the play on the tenth; 0x538040 → 20 % 9 = 2
+        t.call(0x7E, 0x4000, 20);
+        assert_eq!((t.patch, t.delay, t.pan), (993, 9, 0x4000));
+        for left in (0..9).rev() {
+            assert_eq!(t.step(), ThunderStep::Fetch(993));
+            assert_eq!(t.delay, left);
+        }
+        assert_eq!(t.step(), ThunderStep::Play { patch: 993, pan: 0x4000 });
+        assert_eq!(t.step(), ThunderStep::Idle);
+        // the other modes wait 95 and 55 updates; a second call replaces the first
+        t.call(0x28, 1, 0);
+        assert_eq!((t.patch, t.delay), (991, 95));
+        t.call(0x50, 2, 8);
+        assert_eq!((t.patch, t.delay, t.pan), (999, 55, 2));
+        // the patch draw is unsigned
+        t.call(0x7E, 0, u32::MAX);
+        assert_eq!(t.patch, 0x3DF + (u32::MAX % 9) as i32);
     }
 }

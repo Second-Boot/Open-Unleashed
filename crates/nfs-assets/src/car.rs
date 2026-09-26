@@ -71,6 +71,22 @@ impl Paint {
         p
     }
 
+    /// The colours a car wears that are not rows of its lists — `[exterior, interior, stripe 1,
+    /// stripe 2]`, the order of `FECar+0x674…+0x680`, each an accessor dword (`b0<<24 | b1<<16 |
+    /// b2<<8 | b3`) — laid over the rows' colours. The tint table takes `b1 b2 b3`; `b0`, the
+    /// alpha, is 0xFF in every shipped entry and in every colour the editor makes (0x4D8900
+    /// packs it at 0x4D8B91, §4.66), and what the race does with another is not traced.
+    pub fn with_custom(mut self, custom: [Option<u32>; 4]) -> Self {
+        let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+        let slots = [&mut self.exterior, &mut self.interior, &mut self.stripe1, &mut self.stripe2];
+        for (slot, c) in slots.into_iter().zip(custom) {
+            if let Some(c) = c {
+                *slot = rgb(c);
+            }
+        }
+        self
+    }
+
     /// The paint set of `entry` whose exterior is `colour` (the port keeps the chosen paint as its
     /// exterior colour), or `colour` everywhere when none is.
     pub fn matching(entry: &nfs_formats::fedata::CarCatalogEntry, colour: [u8; 3]) -> Self {
@@ -801,12 +817,8 @@ fn page_text_draw(page: &mut TexturePage, paths: &GamePaths, font_file: &str, te
             pen += font.glyph(' ').map_or(0, |g| g.advance as i32);
             continue;
         }
-        let swapped = match c {
-            0x41..=0x5A | 0xC0..=0xD6 | 0xD8..=0xDE => c + 0x20,
-            0x61..=0x7A | 0xE0..=0xF6 => c - 0x20,
-            _ => c,
-        };
-        let Some(g) = font.glyph(ch).or_else(|| char::from_u32(swapped).and_then(|s| font.glyph(s))) else { continue };
+        // the byte, else its other case (0x53E270 — `ø…þ` included), else skipped
+        let Some(g) = font.lookup(ch) else { continue };
         quads.push((pen + g.offset_x as i32, font.origin[1] as i32 + g.offset_y as i32, *g));
         pen += g.advance as i32;
     }
@@ -1087,11 +1099,23 @@ pub fn damage_patches(paths: &GamePaths, model: &str, light: bool) -> Result<Vec
             page: b.misc[0] as usize,
             x: (b.misc[2] & 0xFFF) as u32,
             y: (b.misc[3] & 0xFFF) as u32,
-            threshold: b.misc[1] as f32,
+            // `movsx` of the word (0x447DAC): signed
+            threshold: b.misc[1] as i16 as f32,
             image: TextureImage { name: e.name.clone(), width: img.width, height: img.height, mips: vec![img.rgba], has_alpha: true, code: b.code, page: b.misc[0] as usize, x: (b.misc[2] & 0xFFF) as u32, y: (b.misc[3] & 0xFFF) as u32, place: [b.misc[0] as i16 as i32, b.misc[1] as i16 as i32], text: None },
         });
     }
+    // 0x447E2C…0x447E61: the records are sorted by page with the VC6 `std::sort` (key `movsx` of
+    // `misc[0]`, compared unsigned — `cmp; jae`, 0x44841C), 0x4483D0 / 0x4485A0 — and 0x448010
+    // blends each page's decals in that order. The shipped packs hold 23…46 records, above the
+    // sort's 16-element cut, so its partitions reorder the decals of a page; where two overlap,
+    // the later one blends on top. *(Until 2026-09-27 the port kept the pack's own order.)*
+    nfs_formats::stl_sort::vc6_sort(&mut out, |a: &DamagePatch, b: &DamagePatch| page_key(a) < page_key(b));
     Ok(out)
+}
+
+/// A decal's sort key in 0x447C50: `misc[0]` sign-extended, then compared as a `u32`.
+fn page_key(p: &DamagePatch) -> u32 {
+    p.image.place[0] as u32
 }
 
 /// Blend one damage patch onto a page, as 0x448110 does: skipped while the zone is undamaged,

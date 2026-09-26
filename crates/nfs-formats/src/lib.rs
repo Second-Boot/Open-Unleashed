@@ -30,6 +30,7 @@ pub mod loc;
 pub mod locale;
 pub mod mad;
 pub mod refpack;
+pub mod regfile;
 pub mod schl;
 pub mod scn;
 pub mod sav;
@@ -38,6 +39,7 @@ pub mod sim;
 pub mod trafcfg;
 pub mod sky;
 pub mod spl;
+pub mod stl_sort;
 
 pub use error::FormatError;
 

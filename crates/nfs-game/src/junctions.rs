@@ -274,7 +274,15 @@ impl Junctions {
             // right there (depth limit `2·log2(n)`, the sixteen-element cutoff). `findSlice`'s
             // window scan depends on it: it walks to the first key inside the window and stops at
             // the first one past it.
-            node_slices[ni].sort_by(|a, b| a.1.total_cmp(&b.1));
+            //
+            // It is the VC6 `std::sort` of the `{slice, d²}` pairs on `d² <` (read 2026-09-27: the
+            // loop inlined at 0x48074A…0x4807F9 with median 0x4821E0, partition 0x482240, the
+            // recursion 0x482070, the heap fallback 0x482350, the insertion sorts 0x482290 /
+            // 0x482560 / 0x4825F0), which is not stable — and every shipped track but forest,
+            // monaco5 and skidpad has entries of equal `d²` for different slices (coincident slice
+            // centres at a node), whose order decides which one `resolve_branch` 0x481190 returns.
+            // The port used a stable sort until 2026-09-27.
+            nfs_formats::stl_sort::vc6_sort(&mut node_slices[ni], |a, b| a.1 < b.1);
         }
         Junctions { segments, nodes, slice_node, near_node, node_slices, lap_slices, finish_slice, lap_route }
     }

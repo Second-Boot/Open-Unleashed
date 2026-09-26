@@ -1925,6 +1925,11 @@ pub struct CopCar {
     /// state 2/3 head and its `0x405220` only run from the next tick on.
     pub placed: bool,
     pub slice: usize,
+    /// `car+0xAF8` — for a cop, as for a traffic car, the **bare lap fraction** of its slice:
+    /// 0x4169B0 (`car+0xE18`, Sc64 priority 0x19, even ticks) writes `frac(car+8)` for a car
+    /// without the racer bit (0x416A21…0x416AA1) and 0 while `car+0x7F == 0` (0x416AAC) — before
+    /// the integrators (priority 0x1E) move the car. What 0x417710's two sorts read.
+    pub progress: f32,
     /// `car+0xEB0`
     pub dir: f32,
     /// `car+0xEAC` — the direction the chase asks for; the car turns round to obey it
@@ -2091,6 +2096,7 @@ impl CopCar {
             parked: false,
             placed: false,
             slice: 0,
+            progress: 0.0,
             dir: 1.0,
             requested_dir: 1.0,
             lateral: 0.0,
@@ -3571,8 +3577,30 @@ impl Police {
     /// [`Police::integrate`] with `grounded` saying whether [`Police::ground`] runs: when it does
     /// not (no collision grid), the height is the slice's (port fallback, no original counterpart).
     pub fn integrate_at(&mut self, table: &SliceTable, dt: f32, grounded: bool) {
+        self.integrate_tick(table, dt, grounded, None)
+    }
+
+    /// [`Police::integrate_at`] with the 64 Hz game tick: on an even tick every cop's `car+0xAF8`
+    /// ([`CopCar::progress`]) is written first, from the slice the tracker found last tick (0 for
+    /// a cop out of the world), as 0x4169B0 does before the integrators — as
+    /// `TrafficSet::integrate_tick` keeps the traffic's.
+    pub fn integrate_tick(&mut self, table: &SliceTable, dt: f32, grounded: bool, tick: Option<u64>) {
+        if let Some(t) = tick
+            && t % 2 == 0
+        {
+            for c in self.cars.iter_mut() {
+                c.progress = if c.active { table.frac(c.slice) } else { 0.0 };
+            }
+        }
         for c in self.cars.iter_mut().filter(|c| c.active) {
             c.position += c.velocity * dt;
+            // 0x49B7A0 moves the four contacts `wheel+0x40` by the same `vel/64` as the body
+            // (0x49B7F5…0x49B84C; every car but a smackable) — what the skid marks read after it
+            if grounded {
+                for w in &mut c.body.wheels {
+                    w.world_pos += c.velocity * dt;
+                }
+            }
             c.orientation = nfs_physics::vehicle::orientation_step(c.orientation, c.angular_velocity * dt);
             c.slice = table.find_slice(c.position, c.slice);
             let sl = &table.slices[c.slice];

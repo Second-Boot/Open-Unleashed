@@ -1277,7 +1277,8 @@ fn the_settings_choice_lists() {
         eprintln!("skipping: no game data");
         return;
     };
-    let s = nfs_game::layout::load_strings(&paths);
+    // the ids' meaning, pinned in the English column (the game reads `FEStrings.loc`, Russian here)
+    let s = nfs_formats::locale::Strings::parse(&std::fs::read(GamePaths::find_file(&paths.fe_data().join("Locale"), "FEStrings.csv").unwrap()).unwrap(), 0);
     let at = |id: u32| s.get(id).map(|t| t.to_ascii_lowercase());
     // Car.ABS, Car.Traction and Comms.Collision all take 0x5DAA20's pair
     assert_eq!(at(1500).as_deref(), Some("off"));
@@ -1616,7 +1617,8 @@ fn the_colour_editor_strings() {
         eprintln!("skipping: no game data");
         return;
     };
-    let s = nfs_game::layout::load_strings(&paths);
+    // the ids' meaning, pinned in the English column (the game reads `FEStrings.loc`, Russian here)
+    let s = nfs_formats::locale::Strings::parse(&std::fs::read(GamePaths::find_file(&paths.fe_data().join("Locale"), "FEStrings.csv").unwrap()).unwrap(), 0);
     assert_eq!(s.get(610).unwrap_or_default().to_ascii_lowercase(), "custom color editor");
     assert_eq!(s.get(702).unwrap_or_default().to_ascii_lowercase(), "ok");
     assert_eq!(s.get(703).unwrap_or_default().to_ascii_lowercase(), "cancel");
@@ -3331,4 +3333,25 @@ fn every_font_the_front_end_asks_for_loads() {
     assert!(by_attribute.iter().all(|s| s.starts_with("MultiAccessor.ctr:")), "a new template asks for a font by attribute: {by_attribute:?}");
     assert_eq!(uses_multi, 0, "a layout now uses NFS5.MULTIACCESSOR, whose font comes from %data.font%");
     assert_eq!(font_attrs, 0, "a .lay block now carries a font= attribute");
+}
+
+/// `load_strings` reads what the original reads: `FEStrings.loc` for the front end and
+/// `GameData/DashHud/hud.loc` for the HUD, in the `language` of `fe.txt` (0 here), block 0 of both
+/// being Russian Windows-1251 in this install — each byte carried as one char.
+#[test]
+fn the_strings_are_the_loc_files() {
+    let Ok(paths) = GamePaths::locate() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let s = nfs_game::layout::load_strings(&paths);
+    let bytes = |t: Option<&str>| t.map(|t| t.chars().map(|c| nfs_formats::locale::to_cp1252(c).unwrap()).collect::<Vec<u8>>());
+    // 612 "н/д", 18161 "Испытатель" for the front end, "ПРИЗ  " for the HUD
+    assert_eq!(bytes(s.get(612)), Some(vec![0xED, b'/', 0xE4]));
+    assert_eq!(bytes(s.get(18161)).map(|b| b.len()), Some(10));
+    assert_eq!(bytes(s.hud(18161)), Some(vec![0xCF, 0xD0, 0xC8, 0xC7, b' ', b' ']));
+    // the HUD reads its own table only: an FE-only id is NULL there (0x536DA0)
+    assert_eq!(s.hud(612), None);
+    // the opponents' five rows (`opponents.rs`) all resolve
+    assert!([640, 641, 642, 643, 644].iter().all(|&id| s.get(id).is_some_and(|t| !t.is_empty())));
 }

@@ -26,20 +26,85 @@ pub const AI_ROAD_SLOT: usize = 0x10;
 pub const AI_HORN_SLOT: usize = 0xA;
 
 /// The horn's bend byte `0x5D1478[.TYPE]` with `.TYPE` = 11: the table reads 88, 80, 70, 65, 60,
-/// 50, 85, 90, 60, 45, 90, **50**, … — about −100 cents under the patch's range (`Clip::bend`).
-const HORN_BEND: i32 = 50;
+/// 50, 85, 90, 60, 45, 90, **50**, … (`movsx`, 0x4A7586) — `(50 − 0x40) · 1200 >> 6` = −263 cents
+/// on `SND_coll` 0xA's bend range of 1200 (`mixer`'s `voice+0x3F`).
+const HORN_BEND: u8 = 50;
 
 fn curve(i: i32) -> i32 {
     WEIGHT_CURVE[i.clamp(0, 128) as usize] as i32
 }
 
-/// `blend` of §5: `clamp((cos + cos/2) >> 10, −0x40, 0x40)` with `cos` in 16.16.
+/// `blend` of §5 (0x4AAAD4…0x4AAB10): `clamp((cos + (cos >> 1)) >> 10, −0x40, 0x40)` with `cos`
+/// in 16.16 — `sar eax, 1`, a floor, not the `cos / 2` toward zero the port had until 2026-09-27
+/// (they differ on a negative odd `cos`) — or 0x3F from detail 2 (`[0x657C98] >= 2`).
 pub fn ai_blend(cos: f32, detail: u8) -> i32 {
     if detail >= 2 {
         return 0x3F;
     }
     let c = (cos.clamp(-1.0, 1.0) * 65536.0) as i32;
-    ((c + c / 2) >> 10).clamp(-0x40, 0x40)
+    ((c + (c >> 1)) >> 10).clamp(-0x40, 0x40)
+}
+
+/// `pitchBase` of 0x4A715E…0x4A717B, `_ftol(340 / (340 + relSpeed) · 65536)`: with the listener
+/// velocity `[0x655E44]` NULL — always in this build (`engine-audio.md` §5) — `relSpeed` is 0 and
+/// the word is 0x10000.
+pub const PITCH_BASE_STILL: i32 = 0x1_0000;
+
+/// `rpmFrac` of 0x4A735E…0x4A7392: `_ftol(car+0xDB4 / carSpecs[0x94] · 65536.0)`
+/// ([`nfs_formats::spl::rpm_frac_16`], truncated; the indefinite 0x80000000 for a zero redline),
+/// then clamped to 0…0x20000 (`jge` / `jle`, signed).
+pub fn ai_rpm_frac(rpm: f32, redline: f32) -> i32 {
+    nfs_formats::spl::rpm_frac_16(rpm, redline).clamp(0, 0x2_0000)
+}
+
+/// The road loop's speed argument (0x4A7392…0x4A73B3): `_ftol(car+0xD60 · 65536.0)`, and when
+/// that is not above 0, `_ftol(car+0xD60 · −65536.0)` — `|v| · 65536` truncated.
+pub fn ai_speed_16(v: f32) -> i32 {
+    let ftol = |x: f64| if x.is_finite() && x > i32::MIN as f64 - 1.0 && x < i32::MAX as f64 + 1.0 { x as i32 } else { i32::MIN };
+    let a = ftol(v as f64 * 65536.0);
+    if a > 0 { a } else { ftol(v as f64 * -65536.0) }
+}
+
+/// **The AI engine loops' pitch word** (0x4AAAAC…0x4AAAD1, 0x4AAB32, then `Voice_play` 0x4A9C10):
+/// `(rpmFrac + 0x3333) · pitchBase` as a 64-bit `imul`, its middle 32 bits rounded on bit 15
+/// (`shl edx, 16 ; shr eax, 16 ; adc eax, edx`), `· 80` (`lea [eax+eax·4] ; shl 4`), `sar 10` —
+/// the player's record word with `spl[8]` fixed at 80 (`nfs_formats::spl::Spl::pitch_word`) —
+/// handed `<< 4` as `Voice_play`'s 16.16 pitch, which takes it `>> 4` (`sar`) into the request's
+/// word `+0xC` at a start (0x4A9ABD…0x4A9AC8) or `Voice_setPitch` 0x565F80 on a playing voice
+/// (0x4A9F93…0x4A9FA3) — the low 16 bits, `voice+0x6C`. 4096 plays the sample at its root:
+/// the library adds `(0x3C − root) · 100 + fine` cents (`mixer::base_cents`).
+pub fn ai_pitch_word(rpm_frac: i32, pitch_base: i32) -> u16 {
+    let a = rpm_frac.wrapping_add(0x3333) as i64 * pitch_base as i64;
+    let m = ((a >> 16) as i32).wrapping_add(((a >> 15) & 1) as i32);
+    let esi = m.wrapping_mul(80) >> 10;
+    (esi.wrapping_shl(4) >> 4) as u16
+}
+
+/// The road loop's volume argument (0x4AAB7B…0x4AABB1): `s = min(speed16, 0x280000)`, `atten · s`
+/// (`imul`, 32-bit — it wraps for `atten` above 819, inside half a metre), divided by 0x280000
+/// through the magic 0x66666667 (`imul`, `sar 0x14` of the high word, the sign bit added back —
+/// toward zero), `· [0x655F34]` (`imul`), `sar 7`. `Voice_play` then clamps it to 0…0x7F
+/// (0x4A9C34…0x4A9C4D). *(The port had the float `atten · s · 0.4 · 65536 >> 20`.)*
+pub fn ai_road_volume(atten: i32, speed16: i32, crowding: u8) -> i32 {
+    let x = atten.wrapping_mul(speed16.min(0x28_0000));
+    let q = ((x as i64 * 0x6666_6667) >> 32) as i32 >> 20;
+    let q = q + ((q as u32) >> 31) as i32;
+    q.wrapping_mul(crowding as i32) >> 7
+}
+
+/// `Voice_play`'s clamp of its volume argument to 0…0x7F (0x4A9C34…0x4A9C4D: `setl ; dec ; and`
+/// then `cmp 0x7F ; jle`).
+fn vol_arg(v: i32) -> i32 {
+    v.clamp(0, 0x7F)
+}
+
+/// The three Audio options' levels the mix categories take (`[0x5D1744]` SfxLevel, `[0x5D1748]`
+/// EngineLevel, `[0x5D1750]` AmbientLevel).
+#[derive(Debug, Clone, Copy)]
+pub struct Levels {
+    pub sfx: u8,
+    pub engine: u8,
+    pub ambient: u8,
 }
 
 /// `Traffic_pickGear` **0x408130** — the gear `0x408360` (the traffic / cop drive) stores in
@@ -58,7 +123,7 @@ pub fn ai_blend(cos: f32, detail: u8) -> i32 {
 /// per slot and `gear_slots` `carSpecs[0x50]` (forward gears + 2). The answer can be `gear_slots`
 /// itself (faster than the top gear at the redline): the original then reads the ratio slot past
 /// the last gear (0 when the `.sim` has none there; with six forward gears slot 8 is `+0x80`, the
-/// final drive) — the port reads its own table's slot, and 0 past slot 7 (APPROXIMATION there).
+/// final drive) — `nfs_physics::specs::CarSpecs::ratio_slot`.
 pub fn ai_gear(speed_est: f32, reversing: bool, mps_per_rpm: &[f32], gear_slots: usize, redline: f32) -> usize {
     if speed_est < 2.0 {
         return 1;
@@ -205,6 +270,8 @@ pub struct AiEngines {
     /// `game.spl[10]` / `[11]` — the AI engine bank's and the road loop's (slot 0x10) mix levels
     engine_trim: u32,
     road_trim: u32,
+    /// `game.spl[9]` — 0x4A98E0's default category, which the road loop's start takes
+    sfx_trim: u32,
 }
 
 /// 0x4A9C10's mixer volume, `(categoryLevel · game.spl[k] · vol · 85) >> 21`, as a gain.
@@ -220,11 +287,11 @@ impl AiEngines {
         let slot = |n: usize| -> Option<Arc<Clip>> {
             let d = coll.as_ref()?;
             let p = Bnk::parse(d).ok()?.decode_slot(d, n).ok()?;
-            Some(Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range, gain: p.gain, bend_cents: p.bend_cents, fx_send: p.fx_send }))
+            Some(Arc::new(Clip::from_pcm(p)))
         };
         let (road, horn) = (slot(AI_ROAD_SLOT), slot(AI_HORN_SLOT));
         let spl = nfs_formats::spl::GameSpl::load(sounds_dir);
-        Ok(Self { sets: HashMap::new(), road, horn, cars: Vec::new(), honks: Vec::new(), viv, horn_trim: spl.slots_0a0b(), engine_trim: spl.ai_engine(), road_trim: spl.ai_road() })
+        Ok(Self { sets: HashMap::new(), road, horn, cars: Vec::new(), honks: Vec::new(), viv, horn_trim: spl.slots_0a0b(), engine_trim: spl.ai_engine(), road_trim: spl.ai_road(), sfx_trim: spl.sfx() })
     }
 
     fn samples(&mut self, set: &str) -> (Option<Arc<Clip>>, Option<Arc<Clip>>) {
@@ -238,7 +305,7 @@ impl AiEngines {
             let bank = Bnk::parse(bytes).ok()?;
             let p = bank.decode_slot(bytes, 0).ok()?;
             let frames = (p.samples.len() / p.channels.max(1) as usize) as u32;
-            Some(Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range.or(Some((0, frames))), gain: p.gain, bend_cents: p.bend_cents, fx_send: p.fx_send }))
+            Some(Arc::new(Clip { loop_range: p.loop_range.or(Some((0, frames))), ..Clip::from_pcm(p) }))
         };
         let pair = (load(&format!("{key}lden.bnk")), load(&format!("{key}ldex.bnk")));
         if pair.0.is_none() && pair.1.is_none() {
@@ -250,26 +317,40 @@ impl AiEngines {
         pair
     }
 
-    /// One update for AI car `index`. `rpm_frac` is rpm/redline clamped to 0..2, `distance` metres to
-    /// the listener, `cos` the listener→car direction against the car's forward, `pan` −1..1,
-    /// `speed` |v_long| m/s, `crowding` `[0x655F34]` 0..128.
-    #[allow(clippy::too_many_arguments)]
+    /// One update for AI car `index` — `AiEngine` 0x4AA970. `rpm_frac` is [`ai_rpm_frac`],
+    /// `distance` metres to the listener, `cos` the listener→car direction against the car's
+    /// forward, `pan` the 16-bit angle of `mixer::pan_angle`, `speed16` [`ai_speed_16`],
+    /// `pitch_base` 0x4A717B's doppler word ([`PITCH_BASE_STILL`]), `crowding` `[0x655F34]` 0…128.
+    ///
     /// `spline_cam` is `word[0x627F3C] == 0x0B`: on that one view 0x4AA973…0x4AA99F divides
     /// `0x10000000` by `d + 1 m` instead of `0x8000000` by `d + 2 m`, so an AI car is about twice
-    /// as loud there (`engine-audio.md` §5). This port had only the second form.
+    /// as loud there (`engine-audio.md` §5).
     ///
-    /// The mix is 0x4A9C10's: the two engine loops (bank `[0x6564C0]`) as `EngineLevel ·
-    /// game.spl[10]`, the road loop (slot 0x10) as `AmbientLevel · game.spl[11]`. The port had both
-    /// at `EngineLevel / 255` with no trim until 2026-09-24.
+    /// Three `Voice_play` 0x4A9C10 calls, every update, whatever the level:
+    /// * voice `v + 4`, bank slot `2·carIdx + 1` (`lden`): bend 0x40, pitch [`ai_pitch_word`],
+    ///   volume `tbl[0x40 − blend] · atten >> 7`; voice `v + 8` (`ldex`) the same with
+    ///   `tbl[0x40 + blend]` (`movsx`, `imul`, `sar 7`);
+    /// * voice `v`, `SND_coll` slot 0x10: the bend byte is `rpmFrac` clamped to 0…127 (0x4A9C1F),
+    ///   the pitch `pitchBase` (word `pitchBase >> 4`), the volume [`ai_road_volume`].
+    ///
+    /// The mix category is 0x4A9C10's on an update — the loops `EngineLevel · game.spl[10]`, the
+    /// road loop (slot 0x10) `AmbientLevel · game.spl[11]` — but 0x4A98E0's at a start, where slot
+    /// 0x10 has no case of its own and takes the default `SfxLevel · game.spl[9]` (0x4A9A38…0x4A9A53;
+    /// the loops' bank `[0x6564C0]` is the same there, 0x4A9932…0x4A9955). *(Until 2026-09-27 the
+    /// road loop started in the ambient category, and was stopped — not started — at volume 0,
+    /// where the original keeps it playing silent; the pitch was the float `(rpm/redline + 0.2) ·
+    /// doppler · 1.25` floored at 0.05, a word off at the rounding.)*
     #[allow(clippy::too_many_arguments)]
-    pub fn update(&mut self, out: &AudioOutput, index: usize, set: &str, rpm_frac: f32, distance: f32, cos: f32, pan: f32, speed: f32, doppler: f32, detail: u8, crowding: u8, spline_cam: bool, engine_level: u8, ambient_level: u8) {
+    pub fn update(&mut self, out: &AudioOutput, index: usize, set: &str, rpm_frac: i32, distance: f32, cos: f32, pan: u16, speed16: i32, pitch_base: i32, detail: u8, crowding: u8, spline_cam: bool, levels: Levels) {
         if self.cars.len() <= index {
             self.cars.resize_with(index + 1, CarVoices::default);
         }
         // of the fractional distance (`crate::fix_atten`); the port took whole metres until 2026-09-26
         let atten = if spline_cam { crate::fix_atten(0x1000_0000, 0x1_0000, 0, distance) } else { crate::fix_atten(0x800_0000, 0x2_0000, 0, distance) };
         if atten == 0 {
-            // 0x4AA9C0…0x4AAAA4 releases the engine voices `v`, `v + 4`, `v + 8` only
+            // 0x4AA9C0…0x4AAAA4 releases the engine voices `v`, `v + 4`, `v + 8` only.
+            // APPROXIMATION: the release is 0x565DD0(h, 5, −1), a five-tick ramp to below 0; the
+            // port stops the voices at once.
             let c = &mut self.cars[index];
             for v in [c.near.take(), c.far.take(), c.road.take()].into_iter().flatten() {
                 out.stop(v);
@@ -282,42 +363,32 @@ impl AiEngines {
         }
         let (near_clip, far_clip) = self.samples(set);
         let blend = ai_blend(cos, detail);
-        let pitch = (rpm_frac.clamp(0.0, 2.0) + 0.2) * doppler * 1.25;
-        let v_near = ((curve(0x40 - blend) * atten) >> 7).min(127);
-        let v_far = ((curve(0x40 + blend) * atten) >> 7).min(127);
-        let road_vol = if crowding == 0 {
-            0
-        } else {
-            let s = speed.abs().min(40.0);
-            ((((atten as f32 * s * 0.4 * 65536.0) as i32 >> 20) * crowding as i32) >> 7).min(127)
-        };
+        let word = ai_pitch_word(rpm_frac, pitch_base);
+        let v_near = vol_arg((curve(0x40 - blend) * atten) >> 7);
+        let v_far = vol_arg((curve(0x40 + blend) * atten) >> 7);
 
         for (slot, clip, vol) in [(0usize, near_clip, v_near), (1, far_clip, v_far)] {
-            let amp = mix(engine_level, self.engine_trim, vol);
+            // the bank `[0x6564C0]` category, the same at a start and an update
+            let amp = mix(levels.engine, self.engine_trim, vol);
             let voice = if slot == 0 { &mut self.cars[index].near } else { &mut self.cars[index].far };
             match (*voice, clip) {
                 (Some(id), _) => {
-                    out.set(id, amp, pitch.max(0.05));
+                    out.set_word(id, amp, word, 0x40);
                     out.set_pan(id, pan);
                 }
-                (None, Some(c)) => *voice = Some(out.play_panned(c, amp, pitch.max(0.05), pan, true)),
+                (None, Some(c)) => *voice = Some(out.play_word(c, amp, word, 0x40, pan, true)),
                 (None, None) => {}
             }
         }
-        // the road loop plays at the car's own pan; its third argument is `rpmFrac` (16.16), which
-        // Voice_play clamps to 127 (0x4A9C1F) as the **bend byte** — so it sounds bent up by nearly
-        // the patch's whole range once the engine turns at all. The port had read it as headroom.
-        let road_bend = self.road.as_ref().map_or(1.0, |c| c.bend(((rpm_frac.clamp(0.0, 2.0) * 65536.0) as i32).min(127)));
-        match (self.cars[index].road, road_vol, &self.road) {
-            (Some(id), 0, _) => {
-                out.stop(id);
-                self.cars[index].road = None;
-            }
-            (Some(id), v, _) => {
-                out.set(id, mix(ambient_level, self.road_trim, v), doppler * road_bend);
+        let road_vol = vol_arg(ai_road_volume(atten, speed16, crowding));
+        let road_bend = rpm_frac.clamp(0, 127) as u8;
+        let road_word = (pitch_base >> 4) as u16;
+        match (self.cars[index].road, &self.road) {
+            (Some(id), _) => {
+                out.set_word(id, mix(levels.ambient, self.road_trim, road_vol), road_word, road_bend);
                 out.set_pan(id, pan);
             }
-            (None, v, Some(c)) if v > 0 => self.cars[index].road = Some(out.play_panned(c.clone(), mix(ambient_level, self.road_trim, v), doppler * road_bend, pan, true)),
+            (None, Some(c)) => self.cars[index].road = Some(out.play_word(c.clone(), mix(levels.sfx, self.sfx_trim, road_vol), road_word, road_bend, pan, true)),
             _ => {}
         }
     }
@@ -326,33 +397,37 @@ impl AiEngines {
     /// action is running (`traffic.md` §12.3: `0x4013D0` calls `Honk(car, 1)` on mask 8, and
     /// `0x4A754B` keeps the loop going while the honk timer `audioSlot+0x20` has not run out).
     ///
-    /// The volume is the siren's distance law (0x4A7554…0x4A7592: `(0x1324 − min(m², 0x1324)) · 127
-    /// / 0x1324`, silent from 70 m) in the slot-0x0A/0x0B category `(AmbientLevel · game.spl[12] ·
-    /// vol · 85) >> 21` of 0x4A9C10; the pitch is `pitchBase`, 1.0 in this build. This port had the
-    /// engine loops' `2048/(d+2)` in the engine level until 2026-09-24. The bend byte is
-    /// `0x5D1478[.TYPE]` and the slot `0xA + (.TYPE == 0x30)`; `.TYPE` (registry id 0x21F, the car
-    /// record's `+0x00`) is **11** for every car — `fe.txt` sets `car[i].type=11`, 0x4EEDA0 streams
-    /// `0x21F = 0xB` for each FE-configured car (0x4EEFAC…0x4EEFB5), and 0x4A17F0 builds the world
-    /// props' records with `+0x00 = 0x0B` — so the bend is `0x5D1478[11]` = 50 and the slot 0xA.
-    /// *(Until 2026-09-25 the port played the horn unbent, taking `.TYPE` for an unknown per-model id.)*
-    pub fn honk(&mut self, out: &AudioOutput, index: usize, on: bool, distance: f32, pan: f32, ambient_level: u8) {
+    /// 0x4A754B…0x4A75A4: `Voice_play(slot + 0x27, 0xA + (.TYPE == 0x30), 0x5D1478[.TYPE],
+    /// pitchBase, v, pan, 0x7F)` every update the timer runs ([`HonkStep::Play`]), whatever `v` —
+    /// the voice plays on silent past 70 m; only the timer's stop (0x4A9890) ends it. `v` is the
+    /// siren's distance law ([`crate::sfx::siren_volume`], 0x4A7554…0x4A7592: `(0x1324 − min(m²,
+    /// 0x1324)) · 127 / 0x1324`) in the slot-0x0A/0x0B category `(AmbientLevel · game.spl[12] · v ·
+    /// 85) >> 21` of 0x4A9C10 (0x4A9EF4) and of 0x4A98E0 at the start (0x4A9A9A); the word is
+    /// `pitchBase >> 4` ([`PITCH_BASE_STILL`] → 0x1000), the bend byte [`HORN_BEND`]. `.TYPE`
+    /// (registry id 0x21F, the car record's `+0x00`) is **11** for every car — `fe.txt` sets
+    /// `car[i].type=11`, 0x4EEDA0 streams `0x21F = 0xB` for each FE-configured car (0x4EEFAC…
+    /// 0x4EEFB5), and 0x4A17F0 builds the world props' records with `+0x00 = 0x0B` — so the bend
+    /// is `0x5D1478[11]` = 50 and the slot 0xA. *(Until 2026-09-25 the port played the horn
+    /// unbent; until 2026-09-27 the bend was a float factor on the pitch and the horn stopped at
+    /// volume 0.)*
+    #[allow(clippy::too_many_arguments)]
+    pub fn honk(&mut self, out: &AudioOutput, index: usize, on: bool, distance: f32, pan: u16, pitch_base: i32, ambient_level: u8) {
         if self.cars.len() <= index {
             self.cars.resize_with(index + 1, CarVoices::default);
         }
-        let v = crate::sfx::siren_volume(distance);
-        let vol = ((ambient_level as i32 * self.horn_trim as i32 * v * 85) >> 21).clamp(0, 127);
-        let amp = vol as f32 / 127.0;
-        let pitch = self.horn.as_ref().map_or(1.0, |c| c.bend(HORN_BEND));
-        match (self.cars[index].horn, on && vol > 0, &self.horn) {
+        let v = vol_arg(crate::sfx::siren_volume(distance));
+        let amp = mix(ambient_level, self.horn_trim, v);
+        let word = (pitch_base >> 4) as u16;
+        match (self.cars[index].horn, on, &self.horn) {
             (Some(id), true, _) => {
-                out.set(id, amp, pitch);
+                out.set_word(id, amp, word, HORN_BEND);
                 out.set_pan(id, pan);
             }
             (Some(id), false, _) => {
                 out.stop(id);
                 self.cars[index].horn = None;
             }
-            (None, true, Some(c)) => self.cars[index].horn = Some(out.play_panned(c.clone(), amp, pitch, pan, true)),
+            (None, true, Some(c)) => self.cars[index].horn = Some(out.play_word(c.clone(), amp, word, HORN_BEND, pan, true)),
             _ => {}
         }
     }
@@ -481,11 +556,59 @@ mod tests {
     }
 
     #[test]
+    fn the_ai_pitch_word_is_the_player_rule_at_80() {
+        // 3000 / 6000 rpm, no doppler (scratch `audio8/worked.py`): rpmFrac 32768, the middle
+        // word 45875, · 80 >> 10 = 3583 — the float (0.5 + 0.2) · 1.25 = 0.875 rounds to 3584
+        let rf = ai_rpm_frac(3000.0, 6000.0);
+        assert_eq!(rf, 32768);
+        assert_eq!(ai_pitch_word(rf, PITCH_BASE_STILL), 3583);
+        assert_eq!(ai_pitch_word(rf, PITCH_BASE_STILL), nfs_formats::spl::Spl::default().pitch_word(rf, PITCH_BASE_STILL));
+        // at rest 1023 (0x3333 · 80 >> 10); at the clamp 0x20000 (2 × redline) 11263
+        assert_eq!(ai_pitch_word(ai_rpm_frac(0.0, 6000.0), PITCH_BASE_STILL), 1023);
+        assert_eq!(ai_pitch_word(ai_rpm_frac(20000.0, 6000.0), PITCH_BASE_STILL), 11263);
+        // a zero redline: the indefinite 0x80000000, clamped to 0
+        assert_eq!(ai_rpm_frac(3000.0, 0.0), 0);
+        // the bit-15 rounding: (0x10000 + 0x3333) · 0x8001 has bit 15 set in its low word
+        let a = (0x1_0000i64 + 0x3333) * 0x8001;
+        assert_eq!((a >> 15) & 1, 1);
+        assert_eq!(ai_pitch_word(0x1_0000, 0x8001), (((((a >> 16) + 1) * 80) >> 10) as u16));
+    }
+
+    #[test]
+    fn the_horn_is_bent_263_cents_down_at_the_root() {
+        // SND_coll 0xA: root 60, bend range 1200 (code 0x0A = 12) — (50 − 0x40) · 1200 >> 6
+        // floors −262.5 to −263 (0x589F8D `sar`), on the word pitchBase >> 4 = 0x1000
+        assert_eq!(((HORN_BEND as i8 as i32 - 0x40) * 1200) >> 6, -263);
+        assert_eq!((PITCH_BASE_STILL >> 4) as u16, 0x1000);
+        assert_eq!(crate::mixer::cents_word(-263), 3512, "the image table, scratch audio8/worked.py");
+    }
+
+    #[test]
+    fn the_road_loop_volume_divides_by_0x280000_toward_zero() {
+        // 10 m (atten 170), 25 m/s, crowding 64: 170 · 1638400 / 2621440 = 106, · 64 >> 7 = 53
+        assert_eq!(ai_speed_16(25.0), 25 * 65536);
+        assert_eq!(ai_speed_16(-25.0), 25 * 65536);
+        assert_eq!(ai_road_volume(170, ai_speed_16(25.0), 64), 53);
+        // the speed is capped at 40 m/s
+        assert_eq!(ai_road_volume(170, ai_speed_16(60.0), 128), 170);
+        // 32-bit wrap of atten · s inside half a metre (atten 1000 · 0x280000 > 2³¹): negative,
+        // toward zero, then clamped by Voice_play
+        let v = ai_road_volume(1000, 0x28_0000, 128);
+        assert!(v < 0, "{v}");
+        assert_eq!(vol_arg(v), 0);
+        assert_eq!(ai_road_volume(170, ai_speed_16(25.0), 0), 0);
+    }
+
+    #[test]
     fn the_crossfade_follows_the_listener() {
         // in front of the car (cos = −1) the near voice takes the whole level, behind it the far one
         assert_eq!(ai_blend(-1.0, 1), -0x40);
         assert_eq!(ai_blend(1.0, 1), 0x40);
         assert_eq!(ai_blend(0.0, 1), 0);
+        // `sar 1` floors: −683 + (−683 >> 1) = −1025, `>> 10` = −2, where the `/ 2` toward zero
+        // made −1024 and −1
+        assert_eq!(ai_blend(-683.0 / 65536.0, 1), -2);
+        assert_eq!(ai_blend(-682.0 / 65536.0, 1), -1);
         // two thirds of the way round is already saturated (the slope is 96, not 64)
         assert_eq!(ai_blend(0.7, 1), 0x40);
         // low detail pins it just short of the end of the curve

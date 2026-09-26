@@ -106,7 +106,7 @@ pub fn grouped<'a>(items: impl IntoIterator<Item = (&'a Part, ListCell)>, string
             owner.push(k);
         }
         let name = strings.get(p.name_string_id).unwrap_or("").to_string();
-        rows.push(ListRow::Columns(vec![ListCell { anchor: String::new(), dx: 3.0, text: format!("{name} {}", p.kind_name) }, right]));
+        rows.push(ListRow::Columns(vec![ListCell { fade: 0xFF, anchor: String::new(), dx: 3.0, text: format!("{name} {}", p.kind_name) }, right]));
         owner.push(k);
     }
     (rows, owner)
@@ -115,7 +115,7 @@ pub fn grouped<'a>(items: impl IntoIterator<Item = (&'a Part, ListCell)>, string
 /// `"%d"` right-aligned (align 2) at a named widget's x plus `dx` — `-0.0` for the widget's x
 /// itself (0x516051, 0x5171EE), which a `ListCell` reads as right-aligned by its sign.
 fn at(anchor: &str, dx: f32, v: i64) -> ListCell {
-    ListCell { anchor: anchor.into(), dx, text: format!("{v}") }
+    ListCell { fade: 0xFF, anchor: anchor.into(), dx, text: format!("{v}") }
 }
 
 impl PartsShop {
@@ -144,7 +144,7 @@ impl PartsShop {
     pub fn all_parts_rows(c: &CareerUi, strings: &Strings, open: [bool; 2]) -> Option<(Vec<ListRow>, Vec<AllPartsRow>)> {
         let idx = car_of(c)?;
         let car = c.tables.car(c.career.garage[idx].car_id)?;
-        let title = car.display_name.to_uppercase();
+        let title = car.display_name.to_string();
         let mut rows = vec![ListRow::Header(strings.get(2550).unwrap_or_default().replacen("%s", &title, 1))];
         let mut kinds = vec![AllPartsRow::Header];
         if open[0] {
@@ -201,7 +201,7 @@ impl PartsShop {
         let Some(car) = car_of(c) else { return (Vec::new(), Vec::new()) };
         let parts = c.career.installed_parts(&c.tables, car);
         let (rows, owner) = grouped(
-            parts.iter().map(|p| (*p, ListCell { anchor: "ID_DAMAGEPOS".into(), dx: 3.0, text: format!("{} %", c.career.part_damage(car, p) as i64) })),
+            parts.iter().map(|p| (*p, ListCell { fade: 0xFF, anchor: "ID_DAMAGEPOS".into(), dx: 3.0, text: format!("{} %", c.career.part_damage(car, p) as i64) })),
             strings,
         );
         (rows, owner.iter().map(|k| parts[*k].id).collect())
@@ -209,8 +209,8 @@ impl PartsShop {
 
     /// `Parts.InstallList` — each row's part and, at `ID_INSTALLYPOS + 3`, `FEStrings` **2552**
     /// "INSTALLED" for a part on the car (0x516A85) or **2565** "UNINSTALLED" for a spare
-    /// (0x516A49). APPROXIMATION: the original draws "UNINSTALLED" in the row colour with its
-    /// alpha cut to 0x80 (0x516A44, 0x4D87F0); a `ListCell` has no colour of its own.
+    /// (0x516A49). "UNINSTALLED" is drawn in the row colour with its alpha scaled by 0x80 / 255
+    /// (0x516A3E…0x516A44 → 0x4D87F0), "INSTALLED" in the row colour as it is (0x516A85…).
     pub fn install_rows(c: &CareerUi, strings: &Strings) -> (Vec<ListRow>, Vec<InstallRow>) {
         let Some(car) = car_of(c) else { return (Vec::new(), Vec::new()) };
         let list = c.career.install_list(&c.tables, car);
@@ -222,7 +222,7 @@ impl PartsShop {
             })
             .collect();
         let (rows, owner) = grouped(
-            items.iter().map(|(p, id)| (*p, ListCell { anchor: "ID_INSTALLYPOS".into(), dx: 3.0, text: strings.get(*id).unwrap_or_default().to_string() })),
+            items.iter().map(|(p, id)| (*p, ListCell { fade: if *id == 2565 { 0x80 } else { 0xFF }, anchor: "ID_INSTALLYPOS".into(), dx: 3.0, text: strings.get(*id).unwrap_or_default().to_string() })),
             strings,
         );
         (rows, owner.iter().map(|k| list[*k]).collect())

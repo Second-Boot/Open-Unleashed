@@ -361,6 +361,19 @@ fn paint_shop_trim_round_trips() {
     assert_eq!(f(car::PACKAGE_NUM), 3);
     assert_eq!(f(car::DECAL_NUM), 42, "the race number, FECar+0x688");
     assert_eq!(career_from_sav(&parsed, &t).garage[0].trim, owned.trim);
+
+    // a saved custom colour on the exterior and stripe 2 (the paint shop's rows past the custom
+    // row, 0x4B92ED) is the dword itself in `FECar+0x674` / `+0x680`, and comes back as that
+    owned.custom = [Some(0xFF3F_BFBF), None, None, Some(0xFF12_3456)];
+    c.garage[0] = owned.clone();
+    let parsed = SaveFile::parse(&career_to_sav(&c, &t, &Profile::new("Hans", 0)).write()).unwrap();
+    let img = &parsed.player.as_ref().unwrap().cars[0];
+    let f = |o: usize| u32::from_le_bytes([img.image[o], img.image[o + 1], img.image[o + 2], img.image[o + 3]]);
+    assert_eq!((f(car::EXT_COLOUR), f(car::S2_COLOUR)), (0xFF3F_BFBF, 0xFF12_3456));
+    assert_eq!(f(car::S1_COLOUR), e.paint_sets[1].packed[1]);
+    let back = &career_from_sav(&parsed, &t).garage[0];
+    assert_eq!((back.custom, back.trim.stripe1), (owned.custom, 1));
+    assert_eq!(back.colour_words(e), [0xFF3F_BFBF, owned.colour_words(e)[1], e.paint_sets[1].packed[1], 0xFF12_3456]);
 }
 
 /// 0x4EE853…0x4EE8AE: the car loader exchange-sorts the installed list by 0x49C350 whatever
@@ -450,7 +463,13 @@ fn the_front_end_modules_and_options_come_back() {
         playlist: vec![3, 1, 4],
         settings: SavedSettings { laps: 5, opponents: 6, traffic: 2, ko_opponents: 7, music: 90, options: vec![("Display.SpeedUnits".into(), 1), ("Graphics.CarDetail".into(), 2)], ..SavedSettings::default() },
         tournament: nfs_game::save::TournamentFe { selected: 4, next_event: 2, current_event: 1, current_tournament: 4 },
+        opponent_cars: None,
     };
+    // `OpponentCar.Car`'s seven (0x4F56C0 / 0x4F56F0): a record with paint sets and interiors
+    let with_paint = t.catalog.iter().find(|c| c.paint_sets.len() > 2 && c.interior_colours.len() > 1).expect("a painted car");
+    let opp = nfs_game::save::OpponentCarSave { car_id: with_paint.id, paint_set: 2, interior: 1, package: 3, decal: -1 };
+    let mut side = side;
+    side.opponent_cars = Some((4, (0..7).map(|_| nfs_game::save::opponent_car_image(&t, &opp)).collect()));
     let sav = career_to_sav_with(&Career::default(), &t, &Profile::new("Hans", 0), &side);
     let bytes = sav.write();
     let parsed = SaveFile::parse(&bytes).unwrap();
@@ -484,6 +503,9 @@ fn the_front_end_modules_and_options_come_back() {
     assert_eq!((st.laps, st.opponents, st.traffic, st.ko_opponents, st.music), (5, 6, 2, 7, 90));
     assert!(st.options.contains(&("Display.SpeedUnits".to_string(), 1)));
     assert!(st.options.contains(&("Graphics.CarDetail".to_string(), 2)));
+    let (sel, cars) = back.opponent_cars.as_ref().expect("OpponentCar.Car");
+    assert_eq!((*sel, cars.len()), (4, 7));
+    assert!(cars.iter().all(|c| nfs_game::save::opponent_car_of(c) == opp), "record, paint set, interior, package and decal back");
     // and a second save of what was loaded writes the same file
     assert_eq!(career_to_sav_with(&Career::default(), &t, &Profile::new("Hans", 0), &back).write(), bytes);
 

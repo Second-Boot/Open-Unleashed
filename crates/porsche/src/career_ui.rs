@@ -221,6 +221,61 @@ impl CareerUi {
         }
     }
 
+    /// Which of 0x5053C0's vectors `Tournament.EventType`'s index `ev_type` stands for, as the
+    /// jump table at 0x505450 reads it: 0 the career era's list (0x505404, by `[0x691E50]`), 1…3
+    /// the classic, golden and modern club lists (0x505447 / 0x505441 / 0x50543B). Once the
+    /// Evolution is finished (`[0x691E54]`, `Career::evolution_complete`) the index is taken one
+    /// down: 0…2 are the three club lists (0x50542B…0x50543B) and anything else the era list.
+    pub fn event_type_kind(&self, ev_type: usize) -> usize {
+        if self.career.evolution_complete { ev_type + 1 } else { ev_type }
+    }
+
+    /// The vector **0x5053C0** returns for `Tournament.EventType`'s index (`event_type_kind`):
+    /// the era's list with the era finale left out (0x504D00 skips `+0xE4 == 2`), or one of the
+    /// three club lists.
+    pub fn event_type_list(&self, ev_type: usize) -> Vec<&Tournament> {
+        use nfs_formats::career::Era;
+        match self.event_type_kind(ev_type) {
+            1 => self.tables.club_tournaments_of(Era::Classic),
+            2 => self.tables.club_tournaments_of(Era::Golden),
+            3 => self.tables.club_tournaments_of(Era::Modern),
+            _ => self.tables.era_tournaments(self.career.era).into_iter().filter(|t| !t.is_hidden()).collect(),
+        }
+    }
+
+    /// `Tournament.EventType`'s rows (`FEStrings` ids). The accessor is built (0x4FD13E →
+    /// 0x506A70 → 0x4BB6F0) over the table 0x5B81A4 — 470…473, four rows — and every refresh
+    /// 0x505570 cuts its count by the era (**0x506AA0**: `setCount` 0x4BC310 of 1, 2, 3 for
+    /// 521, 522, 523): the club races of an era are offered from the next era on, the modern
+    /// ones not until the Evolution is over. Then 0x4FD1A0 rebuilds it over **0x5B81CC** —
+    /// 471, 472, 473, the three club lists alone (short forms 0x5B81DC) — and the era count
+    /// is 3 again.
+    pub fn event_type_rows(&self) -> &'static [u32] {
+        use nfs_formats::career::Era;
+        if self.career.evolution_complete {
+            return &[471, 472, 473];
+        }
+        let n = match self.career.era {
+            Era::Classic => 1,
+            Era::Golden => 2,
+            Era::Modern => 3,
+        };
+        &[470, 471, 472, 473][..n]
+    }
+
+    /// **0x505570**'s tournament half: `Tournament.Tournament` onto the row 0x5045C0 picks from
+    /// the list `Tournament.EventType` shows (`Career::default_tournament_row`), and the
+    /// selected tournament `[0x691E6C]` onto that record (0x5055CD…0x5055F9). A club list makes
+    /// the port's club mode, as the combo's own step does.
+    pub fn refresh_tournament(&mut self, ev_type: usize) {
+        let list = self.event_type_list(ev_type);
+        let Some(id) = self.career.default_tournament_row(&list).map(|k| list[k].id) else { return };
+        self.club = (1..=3).contains(&self.event_type_kind(ev_type));
+        if let Some(i) = self.tournaments().iter().position(|t| t.id == id) {
+            self.t_idx = i;
+        }
+    }
+
     /// Menu mode: 1 Evolution, 2 Tournament (club events), 3 Factory Driver.
     pub fn set_mode(&mut self, mode: u8) {
         let (club, factory) = (mode == 2, mode == 3);
@@ -246,7 +301,7 @@ impl CareerUi {
                     "PRIZE CAR ACCEPTED: {}",
                     self.tables
                         .car(car)
-                        .map(|c| c.display_name.to_uppercase())
+                        .map(|c| c.display_name.to_string())
                         .unwrap_or_default()
                 );
                 self.save();
@@ -360,7 +415,7 @@ impl CareerUi {
         let mut msg = format!(
             "{}: {}  ({}:{:05.2}, {} CONES)  ",
             if passed { "PASSED" } else { "FAILED" },
-            m.code.to_uppercase(),
+            m.code.to_string(),
             (secs / 60.0) as u32,
             secs % 60.0,
             cones
@@ -408,7 +463,7 @@ impl CareerUi {
             let car = self
                 .tables
                 .car(p.prize_car as u16)
-                .map(|c| c.display_name.to_uppercase())
+                .map(|c| c.display_name.to_string())
                 .unwrap_or_default();
             out.extend(f.sprites(
                 &format!("PROMOTION  < ACCEPT THE {car} >"),
@@ -429,7 +484,7 @@ impl CareerUi {
             .enumerate()
             {
                 out.extend(f.sprites(
-                    &line.to_uppercase(),
+                    line,
                     [0.08, 0.37 + i as f32 * 0.036],
                     0.026,
                     dim,
@@ -441,8 +496,8 @@ impl CareerUi {
             out.extend(f.sprites(
                 &format!(
                     "MISSION {}  < {} >",
-                    m.code.to_uppercase(),
-                    title.to_uppercase()
+                    m.code.to_string(),
+                    title.to_string()
                 ),
                 [0.08, 0.30],
                 0.045,
@@ -451,11 +506,11 @@ impl CareerUi {
             let car = self
                 .tables
                 .car(m.car_id as u16)
-                .map(|c| c.display_name.to_uppercase())
+                .map(|c| c.display_name.to_string())
                 .unwrap_or_default();
             let mut rules = vec![format!(
                 "{} - {}",
-                self.tables.track_name(m.track_id).to_uppercase(),
+                self.tables.track_name(m.track_id).to_string(),
                 car
             )];
             if let Some(t) = m.time_limit_s {
@@ -489,7 +544,7 @@ impl CareerUi {
             }
             let y0 = 0.36 + rule_lines.len().min(2) as f32 * 0.035 + 0.02;
             out.extend(f.sprites(
-                &format!("{}:", self.narrator_name(m.narrator).to_uppercase()),
+                &format!("{}:", self.narrator_name(m.narrator).to_string()),
                 [0.08, y0],
                 0.028,
                 grey,
@@ -507,7 +562,7 @@ impl CareerUi {
             .enumerate()
             {
                 out.extend(f.sprites(
-                    &line.to_uppercase(),
+                    line,
                     [0.08, y0 + 0.04 + i as f32 * 0.036],
                     0.026,
                     dim,
@@ -519,7 +574,7 @@ impl CareerUi {
         if !self.message.is_empty() {
             for (i, line) in wrap(&self.message, 70).iter().take(4).enumerate() {
                 out.extend(f.sprites(
-                    &line.to_uppercase(),
+                    line,
                     [0.08, 0.72 + i as f32 * 0.033],
                     0.026,
                     [0.4, 1.0, 0.5, 1.0],
@@ -666,7 +721,7 @@ impl CareerUi {
             let name = self
                 .tables
                 .car(self.career.garage[i].car_id)
-                .map(|c| c.display_name.to_uppercase())
+                .map(|c| c.display_name.to_string())
                 .unwrap_or_default();
             let car = &self.career.garage[i];
             if car.offer.is_some() {
@@ -752,8 +807,17 @@ impl CareerUi {
         if let Some(i) = self.current().and_then(|t| index_of(t.id)) {
             self.side.tournament.selected = i as u32;
         }
-        let running = self.pending.as_ref().filter(|p| p.mission.is_none() && !p.finale).and_then(|p| Some((p.event as i32, index_of(p.tournament)? as i32)));
-        (self.side.tournament.current_event, self.side.tournament.current_tournament) = running.unwrap_or((-1, -1));
+        // The pair is a pair of globals, not a function of the pending race: 0x503940 sets it at a
+        // tournament launch, 0x503A50 puts the −1s back at that race's end (`finish` / `abort`),
+        // and nothing else writes it — so a pair a loaded file carried stays until then, and is
+        // saved again as it is. Nothing reads it outside a tournament race's end (0x503960 at
+        // 0x4EE007, the getters 0x5056D0…0x5057D0 called from 0x4EE040…0x4EE068), so **a saved
+        // running event is not turned back into a race**: the original drops the attempt the same
+        // way (the fee was paid before that save). *(Until 2026-09-26 the port rewrote the pair
+        // from the pending race on every save, so a loaded pair was lost at the next save.)*
+        if let Some(r) = self.pending.as_ref().filter(|p| p.mission.is_none() && !p.finale).and_then(|p| Some((p.event as i32, index_of(p.tournament)? as i32))) {
+            (self.side.tournament.current_event, self.side.tournament.current_tournament) = r;
+        }
         // …and the same career in the original's format, so `SaveData/` matches what the game
         // itself would leave behind (`RE/notes/savegame.md` §3).
         let sav = nfs_game::save::career_to_sav_with(
@@ -811,13 +875,21 @@ impl CareerUi {
     /// otherwise the pristine career (`XXDefXX`, the defaults 0x4DE880 saved at start-up), the
     /// name, the picture, and `SaveInfo` under `<picture><name>`. The per-profile HUD copies it
     /// also makes are not ported.
+    #[cfg(test)]
     pub fn create_profile(&mut self, name: &str, picture: u8) -> bool {
+        self.create_profile_from(name, picture, &nfs_game::save::SaveSide::default())
+    }
+
+    /// [`Self::create_profile`] with `XXDefXX`'s modules and accessors — the front end's start-up
+    /// state 0x4DE880 saved (0x4D3B76) and 0x4DE5B0 loads before it saves the new profile — so the
+    /// new file carries those options, not the ones of the profile that was up.
+    pub fn create_profile_from(&mut self, name: &str, picture: u8, template: &nfs_game::save::SaveSide) -> bool {
         if (0..=9).any(|d| self.save_dir.join(format!("{d}{name}.sav")).exists()) {
             return false;
         }
         let old = (std::mem::take(&mut self.career), self.profile.clone());
         self.profile = Profile::new(name, picture);
-        let sav = nfs_game::save::career_to_sav(&self.career, &self.tables, &self.profile);
+        let sav = nfs_game::save::career_to_sav_with(&self.career, &self.tables, &self.profile, template);
         if nfs_game::save::write_profile(&self.save_dir, &self.profile, &sav).is_err() {
             (self.career, self.profile) = old;
             return false;
@@ -853,12 +925,12 @@ impl CareerUi {
             // the shop fills a basket and charges for it on confirmation
             if let Some(k) = self.basket.iter().position(|id| *id == part.0) {
                 self.basket.remove(k);
-                self.message = format!("REMOVED {}", part.1.to_uppercase());
+                self.message = format!("REMOVED {}", part.1.to_string());
             } else {
                 self.basket.push(part.0);
                 self.message = format!(
                     "ADDED {}  (TOTAL ${})",
-                    part.1.to_uppercase(),
+                    part.1.to_string(),
                     self.basket_total()
                 );
             }
@@ -878,7 +950,7 @@ impl CareerUi {
                             .car(id)
                             .map(|c| c.display_name.clone())
                             .unwrap_or_default();
-                        self.message = format!("BOUGHT {}", name.to_uppercase());
+                        self.message = format!("BOUGHT {}", name.to_string());
                         self.car_sel = self
                             .car_choices()
                             .iter()
@@ -934,7 +1006,6 @@ impl CareerUi {
                             }
                         };
                         self.reset_confirmed = false;
-                        self.save();
                         (
                             t,
                             event,
@@ -945,7 +1016,10 @@ impl CareerUi {
                         )
                     }
                 };
-                self.event_request(car, &t, event, garage_idx, finale.is_some(), false)
+                let req = self.event_request(car, &t, event, garage_idx, finale.is_some(), false);
+                // the launch's `SaveInfo` (0x4D52EA), after the fee and 0x503940
+                self.save();
+                req
             }
             None => {
                 self.message = "NO CAR AVAILABLE".into();
@@ -997,8 +1071,13 @@ impl CareerUi {
             }
         };
         self.reset_confirmed = false;
+        let req = self.event_request(car, &t, event, Some(garage_idx), false, true);
+        // **the launch saves the profile after 0x503940** (0x4D5B4A sets the running pair, then
+        // the front end's shut-down runs `SaveInfo` at 0x4D52EA), so the file holds the event
+        // being raced. *(Until 2026-09-26 the port saved before the event was pending, writing
+        // the −1s.)*
         self.save();
-        self.event_request(car, &t, event, Some(garage_idx), false, true)
+        req
     }
 
     /// A tournament event's race, as 0x4ED5D0 sets it up for game type 4 (and 10 for a finale):
@@ -1018,6 +1097,11 @@ impl CareerUi {
                 .map(|i| self.career.garage[i].paint_set as usize)
                 .unwrap_or(0),
         );
+        // a garage car in a saved custom colour wears that, `FECar+0x674` (`OwnedCar::custom`)
+        let paint = match garage_idx.and_then(|i| self.career.garage[i].custom[0]) {
+            Some(c) => [(c >> 16) as u8, (c >> 8) as u8, c as u8],
+            None => paint,
+        };
         // **The grid is the standings.** 0x4ED040's mode-4 arm gives racer slot `i` the
         // `STARTINGPOS` `0x503660(tid, i)` — slot 0 the player, slot `i` opponent record
         // `i`. With no event of the attempt done that function returns **8** for the
@@ -1206,6 +1290,8 @@ impl CareerUi {
         self.career.refresh_market(&self.tables, &mut rand);
         // 0x503AD0 clears the era-changed byte `[0x691E81]` (0x503B01) and files nothing
         self.race_flags.era_changed = false;
+        // 0x503A50 at 0x4EDF1A: the running pair back to −1
+        (self.side.tournament.current_event, self.side.tournament.current_tournament) = (-1, -1);
         self.save();
         true
     }
@@ -1223,7 +1309,7 @@ impl CareerUi {
                     "FINALE WON: {} IS YOURS",
                     self.tables
                         .car(car)
-                        .map(|c| c.display_name.to_uppercase())
+                        .map(|c| c.display_name.to_string())
                         .unwrap_or_default()
                 ),
                 Some((false, _)) => "FINALE LOST".into(),
@@ -1240,6 +1326,8 @@ impl CareerUi {
         let o = self
             .career
             .record_event(&self.tables, &t, p.event, order, times, clean, p.garage_idx);
+        // 0x503A50 at 0x4EE076, once the result is filed through the pair: −1 again
+        (self.side.tournament.current_event, self.side.tournament.current_tournament) = (-1, -1);
         // used-car offers are refreshed after every career race (0x4F7DB0)
         let mut seed = (o.result.position as u32).wrapping_mul(2_654_435_761)
             ^ (times[0] as u32).wrapping_mul(40_503)
@@ -1280,6 +1368,8 @@ impl CareerUi {
         // the last completed one (0 when the era has none). A reset (rank > 3, 0x503CB3), a club
         // event (0x503D23) and an event that is not the last (0x503CD3) leave it where it was.
         // (Until 2026-09-25 the port moved to the first open tournament after every event.)
+        // The layout front end then re-picks the row on its way back all the same: 0x505570 at
+        // 0x4D5267 (`refresh_tournament`) — this pick is what the text menu keeps.
         if o.final_rank.is_some() && !o.reset && !t.is_club() {
             let list = self.tournaments();
             let mut pick = 0;
@@ -1332,12 +1422,12 @@ impl CareerUi {
             let car = self
                 .tables
                 .car(t.prize_car)
-                .map(|c| c.display_name.to_uppercase())
+                .map(|c| c.display_name.to_string())
                 .unwrap_or_default();
             out.extend(f.sprites(
                 &format!(
                     "ERA FINALE  < {} >",
-                    self.tables.tournament_title(t).to_uppercase()
+                    self.tables.tournament_title(t).to_string()
                 ),
                 [0.08, 0.30],
                 0.045,
@@ -1400,7 +1490,7 @@ impl CareerUi {
                 self.t_idx + 1,
                 list.len(),
                 era_tag,
-                self.tables.tournament_title(t).to_uppercase()
+                self.tables.tournament_title(t).to_string()
             ),
             [0.08, 0.30],
             0.045,
@@ -1414,7 +1504,7 @@ impl CareerUi {
                     self.tables
                         .strings
                         .text(t.restriction_string_id)
-                        .to_uppercase()
+                        .to_string()
                 ),
                 [0.12, 0.36],
                 0.03,
@@ -1425,7 +1515,7 @@ impl CareerUi {
             out.extend(f.sprites(
                 &format!(
                     "NEXT: {}   1ST ${}  BONUS ${}",
-                    self.tables.track_name(e.track_id).to_uppercase(),
+                    self.tables.track_name(e.track_id).to_string(),
                     e.prize[0],
                     e.bonus
                 ),
@@ -1447,7 +1537,7 @@ impl CareerUi {
                         } else {
                             t.opponents
                                 .get(d - 1)
-                                .map(|o| self.tables.driver_name(o.driver).to_uppercase())
+                                .map(|o| self.tables.driver_name(o.driver).to_string())
                                 .unwrap_or_default()
                         },
                         p
@@ -1467,7 +1557,7 @@ impl CareerUi {
                 let name = self
                     .tables
                     .car(*id)
-                    .map(|c| c.display_name.to_uppercase())
+                    .map(|c| c.display_name.to_string())
                     .unwrap_or_default();
                 let value = self.career.car_value(&self.tables, *i).unwrap_or(0);
                 let car = &self.career.garage[*i];
@@ -1485,7 +1575,7 @@ impl CareerUi {
                 "BUY  < {} >  ${}",
                 self.tables
                     .car(*id)
-                    .map(|c| c.display_name.to_uppercase())
+                    .map(|c| c.display_name.to_string())
                     .unwrap_or_default(),
                 price
             ),
@@ -1493,7 +1583,7 @@ impl CareerUi {
                 "CAR  < {} >  (LOANED FOR THE FINALE)",
                 self.tables
                     .car(*id)
-                    .map(|c| c.display_name.to_uppercase())
+                    .map(|c| c.display_name.to_string())
                     .unwrap_or_default()
             ),
             None => "NO ELIGIBLE CAR".to_string(),
@@ -1530,8 +1620,8 @@ impl CareerUi {
                     "PART {}/{}  < {}: {} >  ${}{}{}",
                     self.part_sel + 1,
                     parts.len(),
-                    p.kind_name.to_uppercase(),
-                    self.tables.strings.text(p.name_string_id).to_uppercase(),
+                    p.kind_name.to_string(),
+                    self.tables.strings.text(p.name_string_id).to_string(),
                     self.career.part_buy_price(p),
                     mark,
                     total
@@ -1578,6 +1668,41 @@ mod tests {
         nfs_game::save::delete_profile(&dir, &p).unwrap();
         assert!(!ui.switch_profile(&p), "806: nothing to load");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 0x506AA0 / 0x4FD1A0: `Tournament.EventType` has one row per era reached, the club lists
+    /// alone once the Evolution is over — and then its index 0 is the classic club list
+    /// (0x50542B). 0x505570 → 0x5045C0 puts the screen on the first tournament under way.
+    #[test]
+    fn event_type_rows_follow_the_era() {
+        use nfs_formats::career::Era;
+        let Ok(paths) = GamePaths::locate() else {
+            eprintln!("skipping: original game data not found");
+            return;
+        };
+        let mut ui = CareerUi::load(&paths).unwrap();
+        ui.career = Career::default();
+        assert_eq!(ui.event_type_rows(), &[470]);
+        ui.career.era = Era::Golden;
+        assert_eq!(ui.event_type_rows(), &[470, 471]);
+        ui.career.era = Era::Modern;
+        assert_eq!(ui.event_type_rows(), &[470, 471, 472]);
+        ui.career.evolution_complete = true;
+        assert_eq!(ui.event_type_rows(), &[471, 472, 473]);
+        let classic_clubs: Vec<i16> = ui.tables.club_tournaments_of(Era::Classic).iter().map(|t| t.id).collect();
+        let listed: Vec<i16> = ui.event_type_list(0).iter().map(|t| t.id).collect();
+        assert_eq!(listed, classic_clubs);
+        ui.career.evolution_complete = false;
+        ui.career.era = Era::Classic;
+        let era: Vec<i16> = ui.event_type_list(0).iter().map(|t| t.id).collect();
+        assert!(era.len() > 1);
+        // the second tournament of the era under way: the refresh lands on it
+        let second = ui.event_type_list(0)[1].clone();
+        let r = nfs_game::career::EventResult { position: 1, prize: 0, bonus: 0, points: [0; 8], earned: [0; 8], times: [0; 8], event: Some(0) };
+        ui.career.tournaments.entry(second.id).or_default().events.push(r);
+        ui.refresh_tournament(0);
+        assert_eq!(ui.current().map(|t| t.id), Some(second.id));
+        assert!(!ui.club);
     }
 
     /// The picture a player clicks on `createplayer` (`[0x5D8F2C]`, 0x4CF940) is what
@@ -1639,6 +1764,15 @@ mod tests {
         let fe = nfs_game::save::side_from_sav(&sav).tournament;
         assert_eq!(ui.apply_tournament_fe(fe), Some(1));
         assert_eq!(ui.t_idx, 1);
+        // a pair a file carried (the launch's save, 0x4D52EA after 0x503940) is only globals: no
+        // race comes back from it, and the next save writes it again (0x503A50 is the only reset)
+        ui.side.tournament.current_event = 2;
+        ui.side.tournament.current_tournament = table_index as i32;
+        ui.save();
+        assert!(ui.pending.is_none(), "not turned back into a race");
+        let sav = nfs_formats::sav::SaveFile::parse(&std::fs::read(ui.profile.path(&dir)).unwrap()).unwrap();
+        let tm = sav.tournament.as_ref().unwrap();
+        assert_eq!((tm.current_event, tm.current_tournament), (2, table_index as i32));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

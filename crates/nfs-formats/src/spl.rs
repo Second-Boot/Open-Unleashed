@@ -59,15 +59,35 @@ impl Spl {
         }
     }
 
-    /// `spl[9]` — rpm → bin scale. `bin = min(spl[9] · rpm/redline · 4, 511)`.
-    pub fn bin(&self, rpm_frac: f32) -> usize {
-        ((self.0[9] as f32 * rpm_frac.max(0.0) * 4.0) as usize).min(511)
+    /// `spl[9]` — rpm → bin (0x4AC7D6…0x4AC7FC): `p = spl[9] · rpmFrac` (`imul`, signed), then 0x1FF
+    /// when `p & 0xFFFFC000 >= 0x7FC000` (signed `jge`) and else `p >> 14` (`sar`), stored as the
+    /// record's u16 `+8` — a negative `p` wraps to a bin past every window (0x4AC32B reads it
+    /// zero-extended). `rpm_frac` is [`rpm_frac_16`]'s 16.16 word.
+    pub fn bin(&self, rpm_frac: i32) -> usize {
+        let p = (self.0[9] as i32).wrapping_mul(rpm_frac);
+        let b = if ((p as u32 & 0xFFFF_C000) as i32) >= 0x7F_C000 { 0x1FF } else { p >> 14 };
+        b as u16 as usize
     }
 
-    /// `spl[8]` — playback ratio `spl[8] · (rpm/redline + 0.2) / 64`, times the doppler factor.
-    pub fn pitch(&self, rpm_frac: f32, doppler: f32) -> f32 {
-        self.0[8] as f32 * (rpm_frac.max(0.0) + 0.2) * doppler / 64.0
+    /// `spl[8]` — the ring record's pitch word `+2` (0x4AC7F6…0x4AC81F): `(rpmFrac + 0x3333) ·
+    /// pitchBase` as a 64-bit `imul`, its middle 32 bits rounded on bit 15 (`shl edx, 16 ; shr eax,
+    /// 16 ; adc eax, edx`), times `spl[8]` (`imul`), `sar 10`, stored as a u16. 4096 is 1.0: the word
+    /// goes as it is to `Voice_setPitch` 0x565F80 / the start's request `+0xC` (0x4AC49D, 0x4AC545),
+    /// the voice's `+0x6C`. `pitch_base` is the 16.16 doppler word of 0x4A781D (`_ftol`), doubled
+    /// for the tiny car (0x4AA906). So `spl[8] = 80` gives 1023 at rest, 4095 at 0.6 × the redline.
+    pub fn pitch_word(&self, rpm_frac: i32, pitch_base: i32) -> u16 {
+        let a = rpm_frac.wrapping_add(0x3333) as i64 * pitch_base as i64;
+        let m = ((a >> 16) as i32).wrapping_add(((a >> 15) & 1) as i32);
+        ((self.0[8] as i32).wrapping_mul(m) >> 10) as u16
     }
+}
+
+/// `rpmFrac` of 0x4AA89F…0x4AA8B7: `car+0xDB4 / specs+0x94 · 65536.0` on the x87 stack (`fdiv`,
+/// `fmul` the f32 65536.0 at 0x5B3E68), truncated by `_ftol` 0x5A0F98 — out of range (a zero
+/// redline) the x87 integer indefinite 0x80000000.
+pub fn rpm_frac_16(rpm: f32, redline: f32) -> i32 {
+    let x = rpm as f64 / redline as f64 * 65536.0;
+    if x.is_finite() && x > i32::MIN as f64 - 1.0 && x < i32::MAX as f64 + 1.0 { x as i32 } else { i32::MIN }
 }
 
 #[cfg(test)]
@@ -80,15 +100,22 @@ mod tests {
         assert_eq!(s.record_volume(0), 70);
         assert_eq!(s.record_volume(1), 50);
         assert_eq!(s.record_volume(3), 170);
-        // 416 bins per redline, saturating at 511
-        assert_eq!(s.bin(0.0), 0);
-        assert_eq!(s.bin(0.5), 208);
-        assert_eq!(s.bin(1.0), 416);
-        assert_eq!(s.bin(2.0), 511);
-        // 0.25× at rest, 1.0× at 0.6 redline, 1.5× at redline
-        assert!((s.pitch(0.0, 1.0) - 0.25).abs() < 1e-6);
-        assert!((s.pitch(0.6, 1.0) - 1.0).abs() < 1e-6);
-        assert!((s.pitch(1.0, 1.0) - 1.5).abs() < 1e-6);
+        // 416 bins per redline, saturating at 511; a negative product wraps past every window
+        assert_eq!(s.bin(0), 0);
+        assert_eq!(s.bin(rpm_frac_16(1.0, 2.0)), 208);
+        assert_eq!(s.bin(0x10000), 416);
+        assert_eq!(s.bin(0x13A00), 510);
+        assert_eq!(s.bin(0x20000), 511);
+        assert_eq!(s.bin(-0x10000), 0xFFFF - 415);
+        // ≈ 0.25× at rest, 1.0× at 0.6 redline, 1.5× at redline — in the record's integers
+        assert_eq!(s.pitch_word(0, 0x10000), 1023);
+        assert_eq!(s.pitch_word(rpm_frac_16(0.6, 1.0), 0x10000), 4095);
+        assert_eq!(s.pitch_word(0x10000, 0x10000), 6143);
+        // the middle word rounds on bit 15: (0x8000 + 0x3333) · 0x18000 = 0x10CCC8000
+        assert_eq!(s.pitch_word(0x8000, 0x18000), ((80 * 0x10CCD) >> 10) as u16);
+        assert_eq!(rpm_frac_16(3000.0, 6000.0), 0x8000);
+        assert_eq!(rpm_frac_16(1.0, 3.0), 21845);
+        assert_eq!(rpm_frac_16(1.0, 0.0), i32::MIN);
         // the shipped slopes put the blend at 0 in front of the car and 0x80 behind it
         assert_eq!(s.blend(2, -1.0), 0);
         assert_eq!(s.blend(2, 1.0), 0x80);

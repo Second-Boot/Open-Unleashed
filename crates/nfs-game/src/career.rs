@@ -98,8 +98,8 @@ impl CareerTables {
             std::fs::read(&path).map_err(|source| CareerError::Io { path, source })
         };
         let tbl = |file: &'static str| move |source| CareerError::Table { file, source };
-        let strings_path = paths.fe_data().join("Locale").join("FEStrings.csv");
-        let strings = Strings::parse(&std::fs::read(&strings_path).map_err(|source| CareerError::Io { path: strings_path, source })?, 0);
+        // the same table the front end reads: `FEStrings.loc` in the current language
+        let strings = crate::layout::load_strings(paths);
         let raw = RawTables { car: read("nfs5.car")?, trn: read("nfs5.trn")?, fac: read("nfs5.fac")?, prt: read("nfs5.prt")? };
         Ok(Self {
             tracks: career::parse_track_table(&read("nfs5.trk")?).map_err(tbl("nfs5.trk"))?,
@@ -168,6 +168,16 @@ pub struct OwnedCar {
     /// The other four appearance dwords the paint shop edits (`savegame.md` §4.7a).
     #[serde(default)]
     pub trim: Trim,
+    /// A colour the car wears that is **not a row of its list** — `FECar+0x674` (exterior),
+    /// `+0x678` (interior), `+0x67C` (stripe 1), `+0x680` (stripe 2), in that order — as the
+    /// accessor dword it was chosen as (`b0<<24 | b1<<16 | b2<<8 | b3`, `b0` the alpha). The
+    /// original keeps the colour itself in those four slots: the paint shop's tick 0x511220 hands
+    /// each `OwnedCar.*Colour` accessor's `[+0x2C]` to `FEOwnedCarAccessor`'s setters 37…40
+    /// (0x511472…0x5114EC) every frame, and a saved custom colour's row puts that RGBA in `[+0x2C]`
+    /// (0x4B92ED…0x4B930C). The port keeps a list row where the colour is one
+    /// (`paint_set`, `trim`) and the colour here where it is not; `None` means the row.
+    #[serde(default)]
+    pub custom: [Option<u32>; 4],
     /// `car+0x758`, the **installed** parts as `nfs5.prt` ids (one per category and type name,
     /// 0x518510). A new car's are copies of its stock parts ([`OwnedCar::fit_stock`], 0x4EE9A0).
     #[serde(default)]
@@ -188,7 +198,7 @@ pub struct OwnedCar {
     /// Body damage in per cent — the mean of `damage`, the figure the value formula and the
     /// garage screens use.
     #[serde(default)]
-    pub damage_pct: f32,
+    pub damage_pct: f64,
     /// The ten body zones as the race left them (`car+0x4E4…`), 0..100 each.
     #[serde(default)]
     pub damage: [f32; 10],
@@ -247,7 +257,19 @@ impl Default for Trim {
 
 impl OwnedCar {
     pub fn new(car_id: u16, paint_set: u8, purchase_price: u32) -> Self {
-        Self { car_id, paint_set, trim: Trim::default(), parts: Vec::new(), stock: Vec::new(), mileage: 0, wins: 0, damage_pct: 0.0, damage: [0.0; 10], part_state: Vec::new(), setup: CAR_SETUP_DEFAULT, setup_backup: CAR_SETUP_DEFAULT, purchase_price, asking_price: None, offer: None }
+        Self { car_id, paint_set, trim: Trim::default(), custom: [None; 4], parts: Vec::new(), stock: Vec::new(), mileage: 0, wins: 0, damage_pct: 0.0, damage: [0.0; 10], part_state: Vec::new(), setup: CAR_SETUP_DEFAULT, setup_backup: CAR_SETUP_DEFAULT, purchase_price, asking_price: None, offer: None }
+    }
+
+    /// The four colours as `FECar+0x674…+0x680` hold them — exterior, interior, stripe 1,
+    /// stripe 2 — each an accessor dword (`b0<<24 | b1<<16 | b2<<8 | b3`): [`OwnedCar::custom`]
+    /// where one was chosen, else the list row's, `rec+0x3EC` / `+0x530` / `+0x3F0` / `+0x3F4
+    /// + 16·row` (`savegame.md` §4.7a). An interior carries alpha 0xFF, as all 443 shipped entries
+    /// do (the catalogue keeps its interiors as RGB). 0 for a row the record lacks.
+    pub fn colour_words(&self, e: &CarCatalogEntry) -> [u32; 4] {
+        let set = |row: u8, k: usize| e.paint_sets.get(row as usize).map_or(0, |p| p.packed[k]);
+        let int = e.interior_colours.get(self.trim.interior as usize).map_or(0, |c| 0xFF00_0000 | (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32);
+        let rows = [set(self.paint_set, 0), int, set(self.trim.stripe1, 1), set(self.trim.stripe2, 2)];
+        std::array::from_fn(|k| self.custom[k].unwrap_or(rows[k]))
     }
 
     /// **0x4EEBA0**, the FE car constructor, which ends in 0x4EE9A0 (0x4EED28): a car with its
@@ -330,6 +352,95 @@ pub fn pick_personalities(personalities: &[Personality], era: Option<u32>, count
         pool.remove(k);
     }
     out
+}
+
+/// **`Knockout_start` 0x4DDF30** on the block `[0x690410]` (`modes.md` §5.3), run by the launch
+/// 0x4D52D9 when `Game.GameType` is 2 and no series is running. `n` is `Game.NumKOOpponents`'
+/// value (read twice through `vt[0x6C]`, 0x4DDF7A / 0x4DDF8A) and `drawn` the ids its `0x4E3160(n,
+/// Game.Difficutly)` draw returned (0x4DE011). CONFIRMED:
+///
+/// * `active = 1`, `race_index = 0`, `opponents = n` (0x4DDF68…0x4DDF83);
+/// * the first **nine** `alive` bytes cleared (a dword, a dword and a byte, 0x4DDF91…0x4DDFA0) —
+///   the other seven are left as they were;
+/// * `start_pos[i] = −1 − i` and `last_pos[i] = −1` for `i` in 0…8 (0x4DDFA8 loop);
+/// * the player `start_pos[0] = n + 1`, `alive[0] = 1`; opponent `i` in 1…n `alive[i] = 1`,
+///   `start_pos[i] = i` (0x4DDFBA…0x4DDFE2);
+/// * `personalities[j] = drawn[j]` for `j` in 0…n−1, sign-extended words (0x4DE025…0x4DE035).
+///   Slots past `n` keep what they held. A draw shorter than `n` (a pool smaller than the series)
+///   would read past the vector in the original; the port writes 0 there.
+pub fn knockout_start(k: &mut nfs_formats::sav::KnockoutState, n: i32, drawn: &[i16]) {
+    k.active = true;
+    k.race_index = 0;
+    k.opponents = n;
+    for a in k.alive.iter_mut().take(9) {
+        *a = 0;
+    }
+    for i in 0..9 {
+        k.start_pos[i] = -1 - i as i32;
+        k.last_pos[i] = -1;
+    }
+    k.start_pos[0] = n + 1;
+    k.alive[0] = 1;
+    for i in 1..=n.min(8) {
+        k.alive[i as usize] = 1;
+        k.start_pos[i as usize] = i;
+    }
+    for j in 0..n.clamp(0, 8) as usize {
+        k.personalities[j] = drawn.get(j).copied().unwrap_or(0) as i32;
+    }
+}
+
+/// **`Knockout_afterRace` 0x4DE060(pos)**, run by the race end 0x4EDF00 for a type-2 race that was
+/// not aborted. `pos[k]` is the `k`-th racer's 1-based place — racers in slot order, the player
+/// first, then the opponents still in the series in series order — padded with 99 to nine
+/// (0x690AB0). `live_count` is `Game.NumKOOpponents`' value **now**: both loops ask the accessor
+/// (`vt[0x6C]`, 0x4DE0A2 / 0x4DE0CC and 0x4DE0DD / 0x4DE111) rather than the block's `opponents`.
+/// CONFIRMED, instruction by instruction:
+///
+/// ```text
+/// remaining = opponents − race_index ; active = 1 ; start_pos[i] = −1 − i  (i in 0…8)
+/// if pos[0] > remaining: active = 0 ; return                ; signed `jg`, 0x4DE090
+/// k = 0 ; for car in 0…live_count: if alive[car]: last_pos[car] = pos[k++]
+/// for car in 0…live_count: if alive[car] and last_pos[car] <= remaining: start_pos[car] = last_pos[car]
+///                          else alive[car] = 0
+/// race_index += 1 ; if race_index >= opponents: active = 0
+/// ```
+pub fn knockout_after_race(k: &mut nfs_formats::sav::KnockoutState, pos: &[i32], live_count: i32) {
+    let remaining = k.opponents.wrapping_sub(k.race_index);
+    k.active = true;
+    for i in 0..9 {
+        k.start_pos[i] = -1 - i as i32;
+    }
+    let at = |i: usize| pos.get(i).copied().unwrap_or(99);
+    if at(0) > remaining {
+        k.active = false;
+        return;
+    }
+    let last = live_count.clamp(-1, 8);
+    let mut n = 0;
+    for car in 0..=last.max(0) as usize {
+        if last < 0 {
+            break;
+        }
+        if k.alive[car] != 0 {
+            k.last_pos[car] = at(n);
+            n += 1;
+        }
+    }
+    for car in 0..=last.max(0) as usize {
+        if last < 0 {
+            break;
+        }
+        if k.alive[car] != 0 && k.last_pos[car] <= remaining {
+            k.start_pos[car] = k.last_pos[car];
+        } else {
+            k.alive[car] = 0;
+        }
+    }
+    k.race_index += 1;
+    if k.race_index >= k.opponents {
+        k.active = false;
+    }
 }
 
 /// Chronicle years (`0x5B8670`): the year steps to the next entry on each first tournament completion.
@@ -1380,6 +1491,30 @@ impl Career {
         (0..t.events.len()).filter(|i| !done.contains(i)).collect()
     }
 
+    /// **0x5045C0** — the row of `list` (the vector `Tournament.EventType` picks, 0x5053C0) the
+    /// front end puts `Tournament.Tournament` on each time 0x505570 refreshes it. CONFIRMED,
+    /// read to the instruction 2026-09-27:
+    /// * the first tournament **under way**: its undone events (done byte `+0x30` of each of the
+    ///   `+0x39C` records at `+0x3A0 + i·0xA4`, 0x5046B3…0x5046D1) more than none and fewer than
+    ///   all (`jle` / `jl`, 0x5046D3…0x5046DB);
+    /// * else the first **never completed** one, `trn+0xD3C == 0` (0x50475F);
+    /// * else row 0 (the defaults set at 0x50460D / 0x504613 before either walk).
+    ///
+    /// An id the table does not hold is looked up as record 0 (the walks fall through to
+    /// `[0x691E58]`, 0x50467D / 0x50475D); every id of the six vectors is the table's own, so
+    /// the port does not model that. An empty list is `None` — the original reads
+    /// `list.begin[0]` anyway (0x5045E4), past an empty vector.
+    pub fn default_tournament_row(&self, list: &[&Tournament]) -> Option<usize> {
+        if list.is_empty() {
+            return None;
+        }
+        let under_way = list.iter().position(|t| {
+            let undone = self.undone_events(t).len();
+            undone > 0 && undone < t.events.len()
+        });
+        Some(under_way.or_else(|| list.iter().position(|t| self.state(t.id).completions == 0)).unwrap_or(0))
+    }
+
     /// **0x504F00(k)**: the index of the `k`-th undone event (0x504F43…0x504FFD) — the event
     /// `Tournament.RemainingTracks` row `k` stands for. A row past the end keeps the last one
     /// (the port's rows never go past it: 0x4FA575 wraps them).
@@ -1897,9 +2032,10 @@ fn part_resale_from(aged: i64, state: f32) -> i64 {
 /// — whose `+0x164` is the table's 0.0, so a new car reads **0 %** however dented its body is;
 /// the port's `owned.parts` holds those copies too since 2026-09-25 ([`OwnedCar::fit_stock`]).
 /// The value is what `0x4F8E50` and `0x4F7E90` truncate into their damage bands.
-/// APPROXIMATION of the last bit only: the result is stored as `f32` here, the original hands the
-/// x87 value straight to `_ftol`.
-pub fn car_damage_pct(tables: &CareerTables, owned: &OwnedCar) -> f32 {
+/// The result is the x87 value (53-bit, MSVC's precision control) that the callers hand straight
+/// to `_ftol` — an `f64` here, never rounded to `f32` on the way. *(Until 2026-09-26 it was stored
+/// as `f32`, an APPROXIMATION that could round a total just under an integer up to it.)*
+pub fn car_damage_pct(tables: &CareerTables, owned: &OwnedCar) -> f64 {
     let parts: Vec<(u16, f32)> = owned
         .parts
         .iter()
@@ -1910,18 +2046,18 @@ pub fn car_damage_pct(tables: &CareerTables, owned: &OwnedCar) -> f32 {
 }
 
 /// [`car_damage_pct`] over `(part type, part+0x164)` pairs.
-fn damage_pct_from(parts: &[(u16, f32)]) -> f32 {
+fn damage_pct_from(parts: &[(u16, f32)]) -> f64 {
     let mean = |kind: u16| -> f64 {
         let v: Vec<f64> = parts.iter().filter(|(k, _)| *k == kind).map(|(_, s)| *s as f64).collect();
         let sum: f64 = v.iter().sum();
         (if v.len() > 1 { sum / v.len() as f64 } else { sum }) as f32 as f64
     };
     let total = mean(1) + mean(2) + mean(3) + mean(4) + mean(5) + (mean(6) + mean(7)) * 0.5 + mean(8) + mean(9) + mean(10);
-    (total * (1.0f32 / 9.0) as f64) as f32
+    total * (1.0f32 / 9.0) as f64
 }
 
 /// `0x4F8E50`'s arithmetic, given the installed parts' total (see [`Career::value_of`]).
-pub fn car_value_from(price: u32, curve_pct: f32, mileage: u32, damage_pct: f32, wins: u32, parts: i64) -> i64 {
+pub fn car_value_from(price: u32, curve_pct: f32, mileage: u32, damage_pct: f64, wins: u32, parts: i64) -> i64 {
     const MILEAGE: [(i64, i64, i64); 5] = [(0, 5000, 0), (5001, 10000, -10), (10001, 15000, -15), (15001, 20000, -25), (20001, 1_000_000, -30)];
     const DAMAGE: [(i64, i64, i64); 5] = [(0, 5, -1), (6, 10, -6), (11, 15, -11), (16, 25, -16), (26, 100, -26)];
     let base = (price as f64 * curve_pct as f64 * 0.01) as i64;
@@ -2088,6 +2224,28 @@ mod tests {
             assert_eq!(a.0, b.0, "same order");
             assert_eq!(b.2, a.2 + t.prize[k]);
         }
+    }
+
+    /// 0x5045C0: the first tournament under way, else the first never completed, else row 0.
+    #[test]
+    fn default_tournament_row_order() {
+        let (a, b, x) = (tournament(1, 2, false), tournament(2, 3, false), tournament(3, 2, false));
+        let list = [&a, &b, &x];
+        let mut c = Career::default();
+        assert_eq!(c.default_tournament_row(&[]), None);
+        assert_eq!(c.default_tournament_row(&list), Some(0), "none under way, none completed: the first");
+        c.tournaments.entry(1).or_default().completions = 1;
+        assert_eq!(c.default_tournament_row(&list), Some(1), "the first never completed");
+        let r = EventResult { position: 1, prize: 0, bonus: 0, points: [0; 8], earned: [0; 8], times: [0; 8], event: Some(0) };
+        c.tournaments.entry(3).or_default().events.push(r.clone());
+        assert_eq!(c.default_tournament_row(&list), Some(2), "one of two done: under way beats never completed");
+        c.tournaments.entry(3).or_default().events.push(EventResult { event: Some(1), ..r });
+        assert_eq!(c.default_tournament_row(&list), Some(1), "all done is not under way");
+        for id in [2, 3] {
+            c.tournaments.entry(id).or_default().completions = 1;
+        }
+        c.tournaments.entry(3).or_default().events.clear();
+        assert_eq!(c.default_tournament_row(&list), Some(0), "every one completed: row 0");
     }
 
     /// 0x501FD0: an eighty-first car is refused after the money check, and nothing is spent.
@@ -2339,7 +2497,7 @@ mod tests {
         c.tournaments.entry(4).or_default().events.push(r);
         c.forfeit(4);
         assert!(c.state(4).events.is_empty());
-        c.garage.push(OwnedCar { car_id: 76, paint_set: 0, trim: Trim::default(), parts: vec![], stock: vec![], mileage: 0, wins: 0, damage_pct: 0.0, damage: [0.0; 10], part_state: Vec::new(), setup: CAR_SETUP_DEFAULT, setup_backup: CAR_SETUP_DEFAULT, purchase_price: 0, asking_price: Some(9_000), offer: Some(8_000) });
+        c.garage.push(OwnedCar { car_id: 76, paint_set: 0, trim: Trim::default(), custom: [None; 4], parts: vec![], stock: vec![], mileage: 0, wins: 0, damage_pct: 0.0, damage: [0.0; 10], part_state: Vec::new(), setup: CAR_SETUP_DEFAULT, setup_backup: CAR_SETUP_DEFAULT, purchase_price: 0, asking_price: Some(9_000), offer: Some(8_000) });
         assert_eq!(c.pending_offer(), Some(0));
         c.decline_offer(0);
         assert_eq!(c.pending_offer(), None);
@@ -2706,13 +2864,51 @@ mod tests {
     #[test]
     fn save_roundtrip() {
         let mut c = Career::default();
-        c.garage.push(OwnedCar { car_id: 76, paint_set: 2, trim: Trim::default(), parts: vec![13], stock: vec![], mileage: 3000, wins: 1, damage_pct: 0.0, damage: [0.0; 10], part_state: Vec::new(), setup: CAR_SETUP_DEFAULT, setup_backup: CAR_SETUP_DEFAULT, purchase_price: 11_000, asking_price: Some(9_000), offer: None });
+        c.garage.push(OwnedCar { car_id: 76, paint_set: 2, trim: Trim::default(), custom: [None; 4], parts: vec![13], stock: vec![], mileage: 3000, wins: 1, damage_pct: 0.0, damage: [0.0; 10], part_state: Vec::new(), setup: CAR_SETUP_DEFAULT, setup_backup: CAR_SETUP_DEFAULT, purchase_price: 11_000, asking_price: Some(9_000), offer: None });
         c.tournaments.insert(9, TournamentState { entered: true, ..Default::default() });
         let dir = std::env::temp_dir().join(format!("nfs-career-{}", std::process::id()));
         let path = dir.join("career.json");
         c.save(&path).unwrap();
         assert_eq!(Career::load(&path).unwrap(), c);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_knockout_series_runs_as_the_block_says() {
+        let mut k = nfs_formats::sav::KnockoutState::default();
+        k.alive[12] = 7; // past the nine bytes the start clears
+        knockout_start(&mut k, 3, &[11, 12, 13]);
+        assert!(k.active);
+        assert_eq!((k.race_index, k.opponents), (0, 3));
+        assert_eq!(&k.alive[..5], &[1, 1, 1, 1, 0]);
+        assert_eq!(k.alive[12], 7);
+        assert_eq!(k.start_pos, [4, 1, 2, 3, -5, -6, -7, -8, -9]);
+        assert_eq!(k.last_pos, [-1; 9]);
+        assert_eq!(&k.personalities[..4], &[11, 12, 13, 0]);
+        // race 1: the player 2nd, opponents 1, 3, 4 — opponent 3 (last) is out
+        knockout_after_race(&mut k, &[2, 1, 4, 3, 99, 99, 99, 99, 99], 3);
+        assert!(k.active);
+        assert_eq!(k.race_index, 1);
+        assert_eq!(&k.alive[..4], &[1, 1, 0, 1]);
+        assert_eq!(&k.last_pos[..4], &[2, 1, 4, 3]);
+        assert_eq!(k.start_pos, [2, 1, -3, 3, -5, -6, -7, -8, -9]);
+        // race 2: three cars, the player last — out, the series over, nothing else touched
+        knockout_after_race(&mut k, &[3, 1, 2, 99, 99, 99, 99, 99, 99], 3);
+        assert!(!k.active);
+        assert_eq!(k.race_index, 1);
+        assert_eq!(k.start_pos, [-1, -2, -3, -4, -5, -6, -7, -8, -9]);
+        assert_eq!(&k.last_pos[..4], &[2, 1, 4, 3]);
+    }
+
+    #[test]
+    fn the_knockout_final_ends_the_series() {
+        let mut k = nfs_formats::sav::KnockoutState::default();
+        knockout_start(&mut k, 1, &[5]);
+        knockout_after_race(&mut k, &[1, 2, 99, 99, 99, 99, 99, 99, 99], 1);
+        assert!(!k.active, "race_index reached the opponent count (0x4DE12E)");
+        assert_eq!(k.race_index, 1);
+        assert_eq!(&k.alive[..2], &[1, 0]);
+        assert_eq!(k.start_pos[0], 1);
     }
 
     #[test]

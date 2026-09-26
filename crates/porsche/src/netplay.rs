@@ -524,7 +524,7 @@ impl NetPlay {
         String::from_utf8_lossy(&self.net.name)
             .trim_end_matches('\0')
             .trim()
-            .to_uppercase()
+            .to_string()
     }
 
     /// `Comms.Data(MYIPADDRESS)`.
@@ -646,7 +646,7 @@ impl Lobby {
                 let name = String::from_utf8_lossy(&d.name)
                     .trim_end_matches('\0')
                     .trim()
-                    .to_uppercase();
+                    .to_string();
                 let taken = d.slot_mask.count_ones() + 1;
                 format!("{name}   {taken}/{}   {a}", d.player_limit.max(1))
             })
@@ -703,8 +703,8 @@ impl Lobby {
             Some((_, d)) => String::from_utf8_lossy(&d.name)
                 .trim_end_matches('\0')
                 .trim()
-                .to_uppercase(),
-            None => format!("{}'S RACE", self.who.to_uppercase()),
+                .to_string(),
+            None => format!("{}'S RACE", self.who.to_string()),
         }
     }
 

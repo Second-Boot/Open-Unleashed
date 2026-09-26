@@ -42,12 +42,46 @@ pub struct TextureImage {
     pub text: Option<String>,
 }
 
-/// Decode every entry of a SHPI pack. `path` is used for diagnostics only.
+/// How many levels the texture build 0x44D7E0 gives a texture whose pack descriptor asks for a
+/// chain (flag 2 of the 0x5CE59C entry): `c + 1` with `c = 1 + floor(log2(width / 4))`
+/// (0x44D95F…0x44D976 counts the halvings of `width >> 2`; the Thrash `talloc` 0x60008420 makes
+/// `n + 1` levels of the `n` it is handed), so the chain stops at a 2-texel side — one level short
+/// of the file's, which runs to 1×1. Every shipped track texture is square.
+pub fn build_levels(width: u32) -> u32 {
+    let mut c = 0;
+    let mut x = width >> 2;
+    while x > 0 {
+        x >>= 1;
+        c += 1;
+    }
+    c + 1
+}
+
+/// Decode every entry of a SHPI pack, **the base level only**. `path` is used for diagnostics only.
+///
+/// The original samples every texture but a track's with the mip filter `NONE`, i.e. its top level
+/// (`RE/notes/thrash.md` §7, "The texture build"): the mip filter is set only by the material loader
+/// 0x44D550, only when the pack's descriptor (0x44DFE0 → 0x5CE59C, by the pack's key and
+/// `TEXTUREDETAIL`) carries flag 4, and only key 0 — the track's `.fsh` — has it; the sky (key 1),
+/// the track's `.env` and the cars (2 / 3), `common.fsh` (4) and the front end (5) do not, and the
+/// packs loaded whole (0x44D270) keep the default block 0x5379D0, mip `NONE`, anyway.
 pub fn decode_pack(path: &Path, data: &[u8]) -> Result<Vec<TextureImage>, AssetError> {
+    decode_pack_levels(path, data, |_, _| 1)
+}
+
+/// Decode a track's `.fsh` (pack key 0) with the chain the original uploads for it: the file's
+/// levels, [`build_levels`] of them (0x44D7E0 → 0x535BC0 → the driver's per-level copy
+/// 0x6000C390, which reads the levels one after another from the converted file data — nothing
+/// is filtered or generated).
+pub fn decode_pack_mipped(path: &Path, data: &[u8]) -> Result<Vec<TextureImage>, AssetError> {
+    decode_pack_levels(path, data, |file, width| file.min(build_levels(width)))
+}
+
+fn decode_pack_levels(path: &Path, data: &[u8], pick: impl Fn(u32, u32) -> u32) -> Result<Vec<TextureImage>, AssetError> {
     let fsh = Fsh::parse(data).map_err(fmt_err(path))?;
     let mut out = Vec::with_capacity(fsh.entries.len());
     for (i, e) in fsh.entries.iter().enumerate() {
-        let levels = e.blocks[0].mip_levels();
+        let levels = pick(e.blocks[0].mip_levels(), e.blocks[0].width as u32).max(1);
         let mut mips = Vec::with_capacity(levels as usize);
         let mut width = 0;
         let mut height = 0;

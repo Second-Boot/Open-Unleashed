@@ -183,6 +183,59 @@ fn fntf_fonts() {
     assert_eq!((d.atlas_width, d.atlas_height, d.glyphs.len()), (256, 60, 224));
 }
 
+/// Every character of every shipped `FEStrings.csv` string (all seven languages) against every
+/// front-end and HUD font, through the text draw's own lookup (`Font::lookup`: the Windows-1252
+/// byte, then the other case, 0x53E270). The characters left over are the ones the original
+/// skips — no quad, no advance (0x53DBE9 / 0x53DBFD) — whenever a string holding them is drawn in
+/// that font. The expected lists were worked out from the raw bytes of the file and the fonts'
+/// key tables alone (`RE/notes/hud.md` "Glyph lookup", 2026-09-26).
+#[test]
+fn festrings_glyphs_the_fonts_lack() {
+    let r = need_game!();
+    let csv = std::fs::read(r.join("FEData/Locale/FEStrings.csv")).unwrap();
+    let mut used = std::collections::BTreeSet::new();
+    for lang in 0..7 {
+        let s = nfs_formats::locale::Strings::parse(&csv, lang);
+        for t in s.by_id.values().chain(s.fe_by_id.values()).chain(s.hud_by_id.values()) {
+            used.extend(t.chars().filter(|&c| c > ' '));
+        }
+    }
+    // every character the table holds is one Windows-1252 byte, so none is lost on the way in
+    assert!(used.iter().all(|&c| nfs_formats::locale::to_cp1252(c).is_some()));
+    // the accented letters decode to themselves (`Côte d'Azur`, 0xF4)
+    assert!(used.contains(&'ô') && used.contains(&'\u{2019}'));
+    let fonts = [
+        ("FEData/Art/Univers10b.ffn", "!"),
+        ("FEData/Art/Univers11b.ffn", "!"),
+        ("FEData/Art/Univers14b.ffn", "!"),
+        ("FEData/Art/Univers17b.ffn", "…‘’“”–¡ª°º¿"),
+        ("FEData/Art/Univers20b.ffn", "!"),
+        ("FEData/Art/Univers24b.ffn", "!…‘’“”–¡ª°º¿"),
+        ("FEData/Art/Univers45b.FFN", "!…‘’“”–¡ª°º¿"), // (it lacks `_` too, which no string holds)
+        ("FEData/Art/Univers7b.ffn", "!"),
+        ("FEData/Art/Univers8b.ffn", "!…“”–"),
+        ("FEData/Art/UniversC11b.ffn", "!"),
+        ("FEData/Art/UniversC11m.ffn", "!"),
+        ("FEData/Art/UniversC12b.ffn", "!…‘’“”–¡ª°º¿"),
+        ("GameData/DashHud/UniversC12b.ffn", "!…‘’“”–¡ª°º¿"),
+        ("GameData/DashHud/debug.ffn", ""),
+        ("GameData/DashHud/instrument.ffn", ""),
+        ("GameData/DashHud/profiler.ffn", ""),
+        ("GameData/DashHud/unviers9b.ffn", "!"),
+        // the italic HUD font holds digits and a few signs; the HUD falls back for anything else
+        // (it lacks `|` too, which only the tag column holds)
+        ("GameData/DashHud/unviers9bi.ffn", "#&*+;ABCDEFGHIJKLMOPQSTUVWXYZabcdefghijklmopqstuvwxyz‘“”ªÁÂÃÄÅÇÉÊÍÑÓÕÖÚßàáâãäåçèéêìíîñòóôõöùúû"),
+    ];
+    for (file, expect) in fonts {
+        let f = nfs_formats::fnt::Font::parse(&std::fs::read(r.join(file)).unwrap()).unwrap();
+        let lacking: String = used.iter().filter(|&&c| f.lookup(c).is_none()).collect();
+        // the table's own order is by byte; compare as sets of bytes
+        let bytes = |s: &str| s.chars().map(|c| nfs_formats::locale::to_cp1252(c).unwrap()).collect::<std::collections::BTreeSet<u8>>();
+        assert_eq!(bytes(&lacking), bytes(expect), "{file}: lacks {lacking:?}");
+        eprintln!("{file}: no glyph for {lacking:?}");
+    }
+}
+
 #[test]
 fn career_tables() {
     use nfs_formats::career::*;
@@ -579,9 +632,10 @@ fn car_locale_files() {
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("loc")))
-        // `festrings.loc` and `hud.loc` are the game's own string tables, not a car's: their
-        // header names seven language offsets but only the first is a `LOCL` block, so they are a
-        // different arrangement and `locale::Strings` reads them instead.
+        // `festrings.loc` and `hud.loc` are the game's own string tables, not a car's — the same
+        // container, keyed by string id (`festrings_loc_and_hud_loc`). Their headers' offsets 1…6
+        // do not lead to a `LOCL` block in this install. *(Corrected 2026-09-27: this said they
+        // were a different arrangement.)*
         .filter(|p| !["festrings.loc", "hud.loc"].iter().any(|n| p.file_name().is_some_and(|f| f.eq_ignore_ascii_case(n))))
         .collect();
     files.sort();
@@ -610,6 +664,55 @@ fn car_locale_files() {
         }
     }
     assert!(filled >= 90, "only {filled} of {} .loc files carry strings", files.len());
+}
+
+/// `FEStrings.loc` and `hud.loc` through the game's own lookup (`nfs_formats::loc::LocTable`,
+/// 0x536DA0): the index, the bsearch, block 0 — Russian Windows-1251 in this install — and the
+/// header's six other offsets, which do not lead to a `LOCL` (the blocks are in the file, at
+/// other offsets: whoever put the Russian block in did not rewrite the header).
+#[test]
+fn festrings_loc_and_hud_loc() {
+    use nfs_formats::loc::LocTable;
+    let r = need_game!();
+    let cp1251 = |s: &str| -> Vec<u8> {
+        s.chars()
+            .map(|c| match c {
+                'А'..='я' => (c as u32 - 'А' as u32 + 0xC0) as u8,
+                c => c as u8,
+            })
+            .collect()
+    };
+    let fe = LocTable::parse(std::fs::read(r.join("FEData/Locale/FEStrings.loc")).unwrap()).unwrap();
+    assert_eq!((fe.language_count(), fe.language()), (7, 0));
+    assert_eq!(fe.index().len(), 2846);
+    // 539 is listed twice (indices 183, 184); the bsearch lands on the second
+    assert_eq!(fe.ids().len(), 2845);
+    assert_eq!(fe.get(539), Some(&cp1251("Класс 3 / Модерн")[..]));
+    assert_eq!(fe.get(0), Some(&cp1251("Здравствуй, Мир!")[..]));
+    assert_eq!(fe.get(612), Some(&cp1251("н/д")[..]));
+    assert_eq!(fe.get(521), Some(&cp1251("КЛАССИКА")[..]));
+    assert_eq!(fe.get(300), Some(&cp1251("Нормандия")[..]));
+    // the translation keeps the source's trailing blanks
+    assert_eq!(fe.get(2550), Some(&cp1251("КУПИТЬ ЗАПЧАСТИ ДЛЯ %s    ")[..]));
+    assert_eq!(fe.get(18161), Some(&cp1251("Испытатель")[..]));
+    assert_eq!(fe.get(3), None);
+    let d = std::fs::read(r.join("FEData/Locale/FEStrings.loc")).unwrap();
+    let tag = |o: u32| &d[o as usize..o as usize + 4];
+    assert_eq!(tag(fe.block_offset(0).unwrap()), b"LOCL");
+    assert!((1..7).all(|l| tag(fe.block_offset(l).unwrap()) != b"LOCL"));
+
+    let hud = LocTable::parse(std::fs::read(r.join("GameData/DashHud/hud.loc")).unwrap()).unwrap();
+    assert_eq!(hud.index().len(), 252);
+    assert_eq!(hud.get(10), Some(&cp1251("передача")[..]));
+    assert_eq!(hud.get(12), Some(&cp1251("повреждения")[..]));
+    // the four ids both tables use: the HUD's own meaning
+    assert_eq!(hud.get(18161), Some(&cp1251("ПРИЗ  ")[..]));
+    assert_eq!(hud.get(18164), Some(&cp1251("Осмотреть предыдущую машину")[..]));
+    // the bytes of 0x80…0xBF block 0 holds: none in the front end's, `…` 0x85 twice in the HUD's
+    // ("настройки…", "выход…"); everything else is ASCII or a Cyrillic letter 0xC0…0xFF
+    let high = |t: &LocTable| -> Vec<u8> { t.ids().iter().filter_map(|&id| t.get(id.into())).flat_map(|s| s.iter().copied().filter(|b| (0x80..0xC0).contains(b))).collect() };
+    assert_eq!(high(&fe), Vec::<u8>::new());
+    assert_eq!(high(&hud), vec![0x85, 0x85]);
 }
 
 /// The `.mad` container walks to the last byte of every shipped movie, and every video chunk's

@@ -11,6 +11,14 @@ impl App {
     /// actually has state for are answered; anything else returns `None` and the watch is left
     /// blank rather than filled with something invented. The `(MODIFIER)` suffix the layouts use
     /// (`OwnedCars.Car(SHORT)`) selects a shorter form of the same value.
+    ///
+    /// **Nothing is upper-cased.** The CRT `toupper` 0x5A262C is called only from the four-byte
+    /// tag readers at 0x47D8F4 / 0x47DF2C / 0x47E8D7 / 0x47E98D / 0x47EA2B, a character code
+    /// at 0x53053F, a keyword lookup 0x531789 and the CRT itself (0x5A32D4), and `_strupr` 0x5AF440
+    /// only from 0x46CE1B / 0x46CE4E (path compare) — no front-end text goes through either, so
+    /// every answer is the table's bytes as stored (`RE/notes/modes.md` "Case"). The port's
+    /// `to_uppercase` here was Unicode upper-casing of cp1251 bytes read as Latin-1: `я` 0xFF came
+    /// out `џ`, `Я` 0xDF "SS".
     pub(crate) fn accessor_value(&self, name: &str) -> Option<String> {
         let (base, modifier) = match name.split_once('(') {
             Some((b, m)) => (b.trim(), m.trim_end_matches(')')),
@@ -48,13 +56,13 @@ impl App {
             "Tournament.RemainingTracks" if modifier.is_empty() => {
                 let c = self.career.as_ref()?;
                 let t = c.current()?;
-                c.tables.track_name(t.events.get(c.career.next_event(t)?)?.track_id).to_uppercase()
+                c.tables.track_name(t.events.get(c.career.next_event(t)?)?.track_id).to_string()
             }
             "Tournament.Tournament" => {
                 let c = self.career.as_ref()?;
                 let t = c.current()?;
                 match modifier {
-                    "SHORT" | "" => self.fe.strings.get(t.name_string_id)?.to_uppercase(),
+                    "SHORT" | "" => self.fe.strings.get(t.name_string_id)?.to_string(),
                     "DESCRIPTION" => self.fe.strings.get(t.description_string_id)?.to_string(),
                     "CARRESTRICTION" => self.fe.strings.get(t.restriction_string_id)?.to_string(),
                     // 0x50666D and 0x506749: both are `sprintf("%s", 0x4DBF80(value))` — the
@@ -70,7 +78,7 @@ impl App {
                         // undone event (0x504F00); the last event once none is left
                         let done = c.career.remaining_event(t, self.fe.remaining_sel).unwrap_or(t.events.len().saturating_sub(1));
                         let ev = t.events.get(done)?;
-                        c.tables.track_name(ev.track_id).to_uppercase()
+                        c.tables.track_name(ev.track_id).to_string()
                     }
                     // the record on the track the tournament is on. 0x506895 asks
                     // `Tournament.RemainingTracks` for the current track id, 0x4FB120 finds that
@@ -126,7 +134,7 @@ impl App {
                     // the promotion line at the end of a stage: 0x519E31 reads `[record+0xC]` and
                     // looks it up, and +0x0C is the port's `promotion_string_id`
                     "ENDOFLEVEL" => self.fe.strings.get(m.promotion_string_id)?.to_string(),
-                    _ => c.tables.track_name(m.track_id).to_uppercase(),
+                    _ => c.tables.track_name(m.track_id).to_string(),
                 }
             }
             // one of the factory team's profiles (`teamprofile.lay`). Each getter ends in the same
@@ -178,43 +186,69 @@ impl App {
             "CarCompare.Data" => format!("{:02}", self.compare_rating(modifier)?),
             // the network screens (`netplay::Lobby`): the names come out of the layouts themselves
             "Comms.IP" => self.net.lobby.as_ref()?.ip.clone(),
+            // **`FECommInfoAccessor`'s modified text 0x50BDD0** (vtable 0x5B9604 slot 5; its plain
+            // text, slot 4 0x50BDC0, is `""`). Every arm but the two names is a `FEStrings` id
+            // through 0x4E06D0, indexed by the front end's option globals (`modes.md` registry):
+            //
+            // * `TRACKNAME` (0x5D7400): `FEStrings[TRACKLOCALEID0 + 0x28]` (0x50BE2B) — the track
+            //   record's `+4` name id (0x4FBFBC compares against it) plus 0x28, the short name
+            //   `Track1.Track(SHORT)` answers too
+            // * `TRACKDIRECTION`: `0x5B963C[TRACKDIRECTION0]` = 410…413 (`DIRECTION_OPTIONS`)
+            // * `TRACKTRAFFIC` (0x5D73D4): `0x5B9628[TRACKTRAFFIC0]` = 403…400 (`TRAFFIC_OPTIONS`)
+            // * `TRACKLAPS`: when `0x4FBF70(3, 0)` finds the track a circuit (`trk+0x6E == 1`),
+            //   `0x5B9650[TRACKLAPS0]` = 420…427 ("1".."8", the laps list's index = laps − 1);
+            //   else **299** `IDS_NA` (0x50BEDF)
+            // * `POSITIONALUPDATES`: `0x5B9674[COMMSPOSITIONAL]` = 281 / 282 (`POSITIONAL_OPTIONS`)
+            // * anything else: the literal **"NOT FOUND"** (0x5D73BC, 0x50C031)
+            //
+            // *(Until 2026-09-27 the port drew English "ON"/"OFF", "FORWARD"/"REVERSE", the track's
+            // file name and the bare lap count here.)* Which message carries the host's race to a
+            // joiner has not been traced, so the track fields show this machine's own settings.
             "Comms.Data" => {
                 // once a session is open the lobby screens read from it, not from the browser
-                if let Some(n) = self.net.session.as_ref() {
-                    return Some(match modifier {
-                        "GAMENAME" => n.game_name(),
-                        "MYIPADDRESS" => n.my_address(),
-                        "POSITIONALUPDATES" => if n.positional { "ON" } else { "OFF" }.to_string(),
-                        "TRACKNAME" => menu.map(|m| m.track().to_uppercase())?,
-                        "TRACKLAPS" => menu?.laps.to_string(),
-                        "TRACKDIRECTION" => if menu?.backwards {
-                            "REVERSE"
-                        } else {
-                            "FORWARD"
-                        }
-                        .to_string(),
-                        _ => return None,
-                    });
-                }
-                let l = self.net.lobby.as_ref()?;
-                match modifier {
-                    "GAMENAME" => l.game_name(),
-                    // `[desc+0x44]` copies the socket's own record out of `sock+0x08` (0x5878F0)
-                    "MYIPADDRESS" => l.my_address(),
-                    // the `0xBE` broadcast of §5.2, which `Comms.Positional` switches
-                    "POSITIONALUPDATES" => if l.positional { "ON" } else { "OFF" }.to_string(),
-                    // the race the host chose. Which message carries it to a joiner has not been
-                    // traced, so these show this machine's own settings and no more.
-                    "TRACKNAME" => menu.map(|m| m.track().to_uppercase())?,
-                    "TRACKLAPS" => menu?.laps.to_string(),
-                    "TRACKDIRECTION" => if menu?.backwards {
-                        "REVERSE"
-                    } else {
-                        "FORWARD"
+                let session = self.net.session.as_ref();
+                let id = match modifier {
+                    "GAMENAME" => {
+                        return Some(match session {
+                            Some(n) => n.game_name(),
+                            None => self.net.lobby.as_ref()?.game_name(),
+                        });
                     }
-                    .to_string(),
-                    _ => return None,
-                }
+                    // `[desc+0x44]` copies the socket's own record out of `sock+0x08` (0x5878F0)
+                    "MYIPADDRESS" => {
+                        return Some(match session {
+                            Some(n) => n.my_address(),
+                            None => self.net.lobby.as_ref()?.my_address(),
+                        });
+                    }
+                    // the `0xBE` broadcast of §5.2, which `Comms.Positional` switches
+                    "POSITIONALUPDATES" => {
+                        let on = match session {
+                            Some(n) => n.positional,
+                            None => self.net.lobby.as_ref()?.positional,
+                        };
+                        POSITIONAL_OPTIONS[usize::from(on)]
+                    }
+                    "TRACKNAME" => {
+                        let t = menu?.track();
+                        self.fe.track_tables.tracks.iter().find(|r| r.file.eq_ignore_ascii_case(t))?.name_string_id + 0x28
+                    }
+                    "TRACKDIRECTION" => {
+                        let m = menu?;
+                        DIRECTION_OPTIONS[usize::from(m.backwards) + 2 * usize::from(m.mirror)]
+                    }
+                    "TRACKTRAFFIC" => TRAFFIC_OPTIONS[(menu?.traffic as usize).min(3)],
+                    "TRACKLAPS" => {
+                        let m = menu?;
+                        if m.circuits.iter().any(|c| c.eq_ignore_ascii_case(m.track())) {
+                            420 + m.laps.clamp(1, LAPS_MAX) - 1
+                        } else {
+                            299
+                        }
+                    }
+                    _ => return Some("NOT FOUND".to_string()),
+                };
+                self.fe.strings.text(id)
             }
             // **not** off/on. 0x50BB03 registers it with 0x4BB680 and the option list 0x5B9674,
             // which is `0x119, 0x11A, 0` — `FEStrings` **281 "input exchange"** and **282
@@ -226,7 +260,7 @@ impl App {
                     Some(n) => n.positional,
                     None => self.net.lobby.as_ref().map_or(true, |l| l.positional),
                 };
-                self.fe.strings.get(POSITIONAL_OPTIONS[usize::from(on)]).unwrap_or_default().to_uppercase()
+                self.fe.strings.get(POSITIONAL_OPTIONS[usize::from(on)]).unwrap_or_default().to_string()
             }
             // this port has no modem, so the modem screen's fields are blank, which is what a
             // machine without one shows
@@ -240,7 +274,7 @@ impl App {
                 let v: Vec<String> =
                     self.gamepads.devices().into_iter().filter(|(_, is_pad)| !pads_only || *is_pad).map(|(n, _)| n).collect();
                 let sel = if pads_only { self.fe.pads_sel } else { self.fe.controllers_sel };
-                v.get(sel.min(v.len().saturating_sub(1))).map(|n| n.to_uppercase()).unwrap_or_default()
+                v.get(sel.min(v.len().saturating_sub(1))).map(|n| n.to_string()).unwrap_or_default()
             }
             "Game.Damage" => {
                 let id = BOOL_OPTIONS[usize::from(menu?.damage)];
@@ -249,31 +283,39 @@ impl App {
             "Game.NumOpponents" => menu?.opponents.to_string(),
             "Game.NumKOOpponents" => menu?.ko_opponents.to_string(),
             "Game.Difficutly" => {
-                ["EASY", "MEDIUM", "HARD"][(self.race_skill as usize).min(2)].to_string()
+                // the current row's text: `FEStrings[0x5D9F08[i]]` (`DIFFICULTY_OPTIONS`)
+                self.fe.strings.get(DIFFICULTY_OPTIONS[(menu?.difficulty as usize).min(2)])?.to_string()
             }
             "Track1.Track" | "LoopedTrack.Track" | "Knockout.Track" | "Record.Track"
             | "Track.Track" => {
+                // each accessor's own selection in its own list: `LoopedTrack.Track` over
+                // `[0x691D08]`, `Knockout.Track` the selected row's `Track<n>.Track` (0x4B8580),
+                // `Record.Track` the looped one in Quick Knockout, the `Track<n>.Track`
+                // `Knockout.TrackNumber` links to in a knockout and `Track1.Track` otherwise
+                // (0x4FB580, `App::record_track`); a selection past the end reads row 0 (0x4FA690)
                 let t = menu
-                    .map(|m| m.track().to_string())
+                    .map(|m| match base {
+                        "LoopedTrack.Track" => m.looped_track().to_string(),
+                        "Record.Track" => self.record_track().unwrap_or_default(),
+                        "Knockout.Track" => m.ko_track(m.ko_sel).to_string(),
+                        _ => m.track().to_string(),
+                    })
                     .unwrap_or_else(|| self.track.name.clone());
+                // the list holds the `nfs5.trk` records themselves, so every field is the record's
+                let rec = self.fe.track_tables.tracks.iter().find(|r| r.file.eq_ignore_ascii_case(&t));
                 match modifier {
                     // the track's own best time, which is what the port's records table holds
                     "RECORDTIME" => {
                         format_ticks(self.records.track(&t)?.entries.first()?.time as u64)
                     }
-                    // the track record's `+0x78`, as `FEStrings[0x1C2 + it]` — 450…452, the same
-                    // three names `Game.Difficutly` uses (0x4FB730) — and the **short** name, which
-                    // is the name id plus 40 (0x4FA845 adds 0x28), not the full one
-                    "DIFFICULTY" | "SHORT" => {
-                        let c = career?;
-                        let rec = c.tables.tracks.iter().find(|r| c.tables.strings.text(r.name_string_id).eq_ignore_ascii_case(&t))?;
-                        if modifier == "SHORT" {
-                            self.fe.strings.get(rec.name_string_id + 40)?.to_uppercase()
-                        } else {
-                            self.fe.strings.get(450 + rec.difficulty.min(2))?.to_string()
-                        }
-                    }
-                    _ => t.to_uppercase(),
+                    // 0x4FA750: `DIFFICULTY` is the record's `+0x78` word (signed, 0x4FA7C1) as
+                    // `FEStrings[0x1C2 + it]` — 450…452, the three names `Game.Difficutly` uses —
+                    // and `SHORT` the name id plus 0x28 (0x4FA845) — the 340 block, mixed case
+                    "DIFFICULTY" => self.fe.strings.get((0x1C2 + rec?.difficulty as i16 as i32) as u32)?.to_string(),
+                    "SHORT" => self.fe.strings.get(rec?.name_string_id + 0x28)?.to_string(),
+                    // the row text 0x4FA560: `FEStrings[trk+4]`, the full name, as the table has
+                    // it (`App::track_full_name`; until 2026-09-26 both were upper-cased)
+                    _ => self.track_full_name(&t),
                 }
             }
             // the car-setup screen: the 17 floats the original keeps on the car and reads back
@@ -335,7 +377,7 @@ impl App {
                 let c = self.career.as_ref()?;
                 let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
                 let car = c.tables.car(c.career.garage.get(idx)?.car_id)?;
-                self.fe.strings.get(2550)?.replacen("%s", &car.display_name.to_uppercase(), 1)
+                self.fe.strings.get(2550)?.replacen("%s", &car.display_name.to_string(), 1)
             }
             "Parts.InstallList" if modifier.is_empty() => {
                 let c = self.career.as_ref()?;
@@ -380,10 +422,15 @@ impl App {
                 if row >= m.ko_opponents as usize {
                     return None;
                 }
-                let slot = m.ko.get(row)?;
+                // row 0 is `Track1` (`Menu::ko_row`)
+                let slot = m.ko_row(row);
+                let name = m.ko_track(row).to_string();
+                let rec = self.fe.track_tables.tracks.iter().find(|r| r.file.eq_ignore_ascii_case(&name));
                 match field {
                     "TRACKNUMBER" => (row + 1).to_string(),
-                    "TRACKNAME" => m.tracks.get(slot.track_idx)?.to_uppercase(),
+                    // 0x4BA881: the row accessor's slot 0x6C on its selection, 0x4FA5E0 —
+                    // `FEStrings[trk+4 + 0x3C]`, the short capitalised name
+                    "TRACKNAME" => self.fe.strings.get(rec?.name_string_id + 0x3C)?.to_string(),
                     "TRACKLAPS" => slot.laps.to_string(),
                     // **the short, capitalised forms.** 0x4BAA3B adds **0x23** to the traffic
                     // accessor's own string id and 0x4BAA03 adds **0x14** to the direction's —
@@ -396,13 +443,10 @@ impl App {
                     // record's `+0x78` as `FEStrings[0x1C2 + it]` (0x4BA8F5) and its best time
                     // (0x4BA913)
                     "DIFFICULTY" | "RECORDTIME" => {
-                        let name = m.tracks.get(slot.track_idx)?;
                         if field == "RECORDTIME" {
-                            format_ticks(self.records.track(name)?.entries.first()?.time as u64)
+                            format_ticks(self.records.track(&name)?.entries.first()?.time as u64)
                         } else {
-                            let c = career?;
-                            let rec = c.tables.tracks.iter().find(|r| c.tables.strings.text(r.name_string_id).eq_ignore_ascii_case(name))?;
-                            self.fe.strings.get(450 + rec.difficulty.min(2))?.to_string()
+                            self.fe.strings.get((0x1C2 + rec?.difficulty as i16 as i32) as u32)?.to_string()
                         }
                     }
                     _ => return None,
@@ -434,6 +478,23 @@ impl App {
                 };
                 self.fe.strings.get(DIRECTION_OPTIONS[usize::from(b)])?.to_string()
             }
+            // **`UsedCar.Car` on an empty lot is not an empty answer.** `FEOwnedCarAccessor`'s
+            // modified text, slot 5 **0x4F6150**, takes the current car only when the index is inside the list
+            // (0x4F6177 `cmp; jae`) and otherwise keeps a null car in `ebp`. Its first arm is
+            // `ASKINGPRICE` (0x5DAE60): a null car there answers the shared empty string 0x5E8E50
+            // (0x4F61BF…0x4F61C6). **Every other modifier** meets 0x4F61FC first, and a null car
+            // answers `FEStrings[0x264]` = 612, `ID_NA`, **"n/a"** (0x4F6200). The plain text — a
+            // bare watch, and a combo's caption — is the base's 0x4BC4E0, slot 12 of the current
+            // row, which is **0x4F5C30**: an empty vector (0x4F5C3D `test eax, 0xFFFFFFFC`) answers
+            // `FEStrings[[this+0x28]]` (0x4F5C48), and `+0x28` is the constructor's second
+            // argument (0x4F5A90) — **0x33** for `UsedCar.Car` (0x4F2224), FEStrings 51, "no cars
+            // for sale". The port routes `(SHORT)` — a combo's caption, the only widget on that
+            // form — through the same slot-12 arm.
+            "UsedCar.Car" if career.is_some() && self.used_car().is_none() => match modifier {
+                "" | "SHORT" => self.fe.strings.get(51)?.to_string(),
+                "ASKINGPRICE" => String::new(),
+                _ => self.fe.strings.get(612)?.to_string(),
+            },
             // `"%s %s"` of the car's era and its class, as `FEStrings[era − 10]` and
             // `FEStrings[class + 13]` (0x4F0AAE…0x4F0AD4): 521 − 10 is "Classic" and 501 + 13 is
             // "3", so a `'50 356` reads "Classic 3".
@@ -447,12 +508,12 @@ impl App {
             // accessor's `SHORT` hands the index to a virtual of its own (0x4BC54D) rather than
             // falling through to the display name.
             b if modifier == "SHORT" && matches!(b, "OwnedCars.Car" | "DealerCar.Car" | "GenericCar.Car" | "CARSETTINGS.CAR") => {
-                self.logo_car(Some(base), None)?.family.to_uppercase()
+                self.logo_car(Some(base), None)?.family.to_string()
             }
             // the dealer's and the car-select list's own car by its full name — the same car their
             // `SHORT` and `CLASSLISTING` forms above resolve. (Until 2026-09-25 these fell into the
             // garage arm below, so `dealership.lay`'s name line showed the player's own car.)
-            "DealerCar.Car" | "GenericCar.Car" => self.logo_car(Some(base), None)?.display_name.to_uppercase(),
+            "DealerCar.Car" | "GenericCar.Car" => self.logo_car(Some(base), None)?.display_name.to_string(),
             "OwnedCars.Car" | "CARSETTINGS.CAR" => {
                 // the garage screens ask the same accessor for the car's money and damage figures
                 let c = career?;
@@ -464,8 +525,8 @@ impl App {
                         .garage
                         .get(idx)
                         .and_then(|o| c.tables.car(o.car_id))
-                        .map(|e| e.display_name.to_uppercase())
-                        .unwrap_or_else(|| self.specs.name.to_uppercase()),
+                        .map(|e| e.display_name.to_string())
+                        .unwrap_or_else(|| self.specs.name.to_string()),
                 }
             }
             // the car the front end has selected, and (quick race puts the field in every car) the
@@ -484,38 +545,46 @@ impl App {
             "UsedCar.Car" => {
                 let c = career?;
                 let e = c.tables.car(self.used_car()?.car_id)?;
-                if modifier == "SHORT" { e.family.to_uppercase() } else { e.display_name.to_uppercase() }
+                if modifier == "SHORT" { e.family.to_string() } else { e.display_name.to_string() }
             }
             // the same five strings the drop-down lists — `SHORT` is the same jump table
             // (0x4F57A0), so both forms answer alike
             "OpponentCar.Car" => {
                 let m = menu?;
                 let c = nfs_game::opponents::OpponentChoice::from_index(m.opp_car as u32);
-                self.fe.strings.get(c.string_id())?.to_uppercase()
+                self.fe.strings.get(c.string_id())?.to_string()
             }
             "zMergedList.Car" | "PrizeCars.Car" => match menu {
                 _ if !matches!(modifier, "" | "SHORT") => return None,
                 // `(SHORT)` asks for the short form, which for a car is its family name
-                Some(m) if modifier == "SHORT" => (*m.car()?).family.to_uppercase(),
-                Some(m) => (*m.car()?).display_name.to_uppercase(),
-                None => self.specs.name.to_uppercase(),
+                Some(m) if modifier == "SHORT" => (*m.car()?).family.to_string(),
+                Some(m) => (*m.car()?).display_name.to_string(),
+                None => self.specs.name.to_string(),
             },
-            // All seven colour combos count the same way — the paint set's number from 1, which
-            // is what `combo_rows` enumerates (§4.91). The original keeps four separate values
-            // per car (exterior, interior, and the two stripes) and this port keeps one, so the
-            // other three read the exterior's: an APPROXIMATION, and the one this arm carries.
+            // All seven colour combos count the same way — their row's number from 1, which is what
+            // `combo_rows` enumerates (§4.91) — and each reads **its own** row: the garage car keeps
+            // four (`FECar+0x674…+0x680`, exterior, interior and the two stripes — the port's
+            // `paint_set` and `trim`, which the paint shop's setters 0x4F6F90…0x4F7020 step), the
+            // dealership its chosen paint and interior (`[this+0x30]` / `[this+0x34]`, 0x501DB4).
+            // *(Until 2026-09-26 this read the quick race's paint for all seven, "one colour per
+            // owned car" — an APPROXIMATION left over from before the port kept the trims.)*
             "OwnedCar.ExtColour" | "OwnedCar.IntColour" | "OwnedCar.S1Colour" | "OwnedCar.S2Colour"
             | "GenericCar.Colour" | "DealerCar.Colour" | "DealerCar.IntColour" => {
-                format!("{}", menu.map(|m| m.paint_idx + 1).unwrap_or(1))
+                let at = self.combo_rows(base).and_then(|(_, at)| at).unwrap_or_else(|| menu.map_or(0, |m| m.paint_idx));
+                format!("{}", at + 1)
             }
             // the compare screen's right-hand car, the one `GenericCar2.Car` steps with `car2_idx`
             "GenericCar2.Car" => match menu {
                 _ if !matches!(modifier, "" | "SHORT") => return None,
-                Some(m) if modifier == "SHORT" => m.cars.get(m.car2_idx)?.family.to_uppercase(),
-                Some(m) => m.cars.get(m.car2_idx)?.display_name.to_uppercase(),
+                Some(m) if modifier == "SHORT" => m.cars.get(m.car2_idx)?.family.to_string(),
+                Some(m) => m.cars.get(m.car2_idx)?.display_name.to_string(),
                 None => return None,
             },
-            "Game.GameType" => "QUICK RACE".to_string(),
+            // an integer accessor, not a caption: 0x4E55B0 registers it with 0x4BA310 (range 0…0xC,
+            // vtable 0x5B502C), whose text (slot 4 0x4BC4E0 → slot 12 0x4BA440) is
+            // `sprintf("%d", min + index)` (0x5CD1B0, 0x4BA461) — "0" for a quick race. No layout
+            // draws it. *(Until 2026-09-27: the port's own "QUICK RACE".)*
+            "Game.GameType" => self.fe.game_type.to_string(),
             // the key-binding rows of `GameCtrl.lay` / `fluffctrl.lay`: `"keyboard %s"` over
             // 0x51C050's name for the row's key (`nfs_game::keyname`), and nothing for a binding of
             // kind 0 — what a row shows after 0x51DCC0 took its control for another (0x51C997).
@@ -556,10 +625,8 @@ impl App {
             "CDPlayer.SelectedList" | "CDPlayer.Title"
                 if matches!(modifier, "TOTALPLAY" | "TRACKPLAY" | "SONGTIMEREMAIN") =>
             {
-                let list: Vec<usize> = match self.snd.music.as_ref() {
-                    Some(m) => m.playlist().to_vec(),
-                    None => self.snd.audio_settings.playlist.iter().map(|i| *i as usize).collect(),
-                };
+                // `[0x65B62C]`, the CD player's own list (`App::cd_playlist`)
+                let list: Vec<usize> = self.cd_playlist();
                 let len = |i: usize| self.snd.music_lengths.get(i).copied().unwrap_or(0) as u64;
                 let ms = match modifier {
                     "TOTALPLAY" => list.iter().map(|i| len(*i)).sum::<u64>(),
@@ -579,7 +646,7 @@ impl App {
                 let names = self.cd_names();
                 let table = Self::cd_table(&names);
                 let (_, n) = table.get(self.fe.cd_title.min(table.len().checked_sub(1)?))?;
-                nfs_audio::music::split_title(n).0.to_uppercase()
+                nfs_audio::music::split_title(n).0.to_string()
             }
             "Audio.Quality" => self.snd.audio_settings.audio_quality.to_string(),
             // the draw-distance setting, as the original's index into `0x5CE90C` = {0.5, .67, .83, 1}

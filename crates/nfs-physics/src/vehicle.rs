@@ -379,6 +379,11 @@ pub struct Vehicle {
     /// (not the reset 0x40F400). Readers: the force-feedback jolt 0x40F91A → 0x412230 and the
     /// player's one-shot pan 0x4A7BB1…0x4A7BDB. Output only — nothing in the physics reads it.
     pub last_contact: Vec3,
+    /// Output only: the largest `3·|mag|` `WallImpulse` answered in the last wall pass
+    /// ([`Self::collide_walls`]; 0 without a hit) — the `car+0x430` the wall pass keeps
+    /// (0x49557D…0x495594) for 0x40F740, whose kind-4 arm fires the sparks 0x43F4C0 over 1.5
+    /// (0x40F944…0x40F9B9). Nothing in the physics reads it.
+    pub last_wall_effect: f32,
     /// The body's own ground tracker `car+8` and the plane `car+0x3E8` / `car+0x400` 0x499520
     /// keeps from it ([`PatchTracker`]): 0x49AF70 runs it at the head of every physics tick
     /// ([`Self::step32`]); `Car_ground`'s tilted arm, the 8 m ceiling rule and `Susp_update`'s
@@ -492,6 +497,7 @@ impl Vehicle {
             impact: 0.0,
             pair_event: 0,
             last_contact: Vec3::ZERO,
+            last_wall_effect: 0.0,
             tracker: PatchTracker::new(Vec3::new(position.x, position.y - wheel_radius, position.z)),
             rng: 0x3ADE_68B1,
         }
@@ -1636,7 +1642,7 @@ impl Vehicle {
                 w.demand = d;
                 return;
             }
-            d = d.clamp(-lim0, lim0);
+            d = tyre_demand_clamp(d, lim0);
         }
         w.demand = d;
         // §2.4 lateral force from the slip angle (1/256 turn)
@@ -2281,7 +2287,7 @@ impl Vehicle {
             } else {
                 0.8 * self.dive + specs.dive_gain * a_l * if a_l > 0.0 { 0.125 } else { 0.175 }
             };
-            let p = (p_in - self.dive).clamp(-specs.pitch_clamp, specs.pitch_clamp);
+            let p = sign_clamp(p_in - self.dive, specs.pitch_clamp);
             let r_in = ((susp_y[1] + susp_y[3]) - (susp_y[0] + susp_y[2])) / div;
             // the cop's roll filter takes 0.15 (`[0x5B2638]`, 0x49A627…0x49A639), anyone else 0.25
             self.roll_lp = if police {
@@ -2297,7 +2303,7 @@ impl Vehicle {
             // 2026-09-26: the port took the pedal float `[0x628FB0]` · 254, which is 254 at a
             // byte of 252 and follows the automatic's reverse swap of the floats.)*
             let thr = self.throttle_byte as f32 * f32::from_bits(0x3A4D_9A67);
-            let rr = (r_in + (1.0 - thr) * self.roll_lp).clamp(-specs.roll_clamp, specs.roll_clamp);
+            let rr = sign_clamp(r_in + (1.0 - thr) * self.roll_lp, specs.roll_clamp);
             // `fld specs[0x114]; fmul [car+0xD64]; fmul [0x5B49DC]` (0.925), then `+ p`, in that
             // order (0x49A6DC…0x49A6EB); the roll `D6C · specs[0x118] + r` (0x49A6F1…0x49A6F9);
             // then `ClampAngVel`'s sibling 0x49BC80 clamps `D64` / `D68` / `D6C` to ±0.75 each
@@ -2670,17 +2676,30 @@ impl Vehicle {
         self.orientation = orientation_step(self.orientation, self.angular_velocity * DT64);
     }
 
-    /// `Car_wallCollide` 0x495020 + `WallImpulse` 0x494000 (CONFIRMED): the 8 body corners are swept
-    /// over the last tick against the `.edg` edges; a crossing reflects the normal velocity with
-    /// restitution 0.1 (no friction), pushes the body 1.05× back onto the edge line and sets the
-    /// yaw rate `WallSpin` 0x493F10 does ([`Self::wall_spin`]).
+    /// `Car_wallCollide` 0x495020 + `WallImpulse` 0x494000 (CONFIRMED): each of the 8 body corners
+    /// that is off the road is tested with the segment **from the car's centre to the corner**
+    /// against the `.edg` edges; a crossing reflects the normal velocity with restitution 0.1 (no
+    /// friction), pushes the body 1.05× back onto the edge line and sets the yaw rate `WallSpin`
+    /// 0x493F10 does ([`Self::wall_spin`]).
     ///
-    /// `patch_height` answers the height of the drivable patch that contains a corner in plan, or
+    /// `patch_height` answers the height of the drivable patch that contains a point in plan, or
     /// `None` when there is none — `CollisionGrid::find_patch_height`. 0x495020 skips a corner only
     /// when **both** halves of its conjunction hold: the patch under it is drivable
     /// (`(T.word & 0xF) != 0`, 0x49527A) **and** that patch's height is within 4 m of the car's own
     /// y (`|h − car+0x334| <= [0x5B2404]`, 0x4952B9…0x4952D9). So a car sailing over drivable road
     /// is still tested against the walls, and a car that has dropped away from it is too.
+    ///
+    /// The tested segment (read to the instruction 2026-09-26, 0x4952DF…0x495410): its start is the
+    /// car's position `car+0x330` when the same test passes there (`updateZone(pos, 1)`, nibble,
+    /// `|h(pos) − car+0x334| <= 4`, 0x4952DF…0x49536A), else `pos − vel/32` (0x49536C…0x49538F,
+    /// `updateZone` on it); the end is the corner. `Tracker::edgeHit` 0x4740D0 answers nothing when
+    /// the tracker holds no patch after that (`[ecx+0x28] == 0`, 0x4740D0…0x4740DC) — so a car
+    /// whose start point is off every drivable patch meets no wall. Among the crossed edges it keeps
+    /// the one whose endpoint-mid height is nearest the **segment's** mid height
+    /// (`(from.y + to.y)/2`, 0x474185…0x4741BF). *(Until 2026-09-26 the port swept each corner
+    /// from `corner − vel/32` to the corner, which misses a corner that a yawing car swings across
+    /// the line, and a car turned so that the sweep ran along the wall; the original has no
+    /// per-corner sweep at all.)*
     pub fn collide_walls(&mut self, walls: &crate::walls::WallSet, patch_height: &dyn Fn(Vec3) -> Option<f32>, _unused: f32, _b: f32, _f: f32) -> bool {
         let m = self.orientation;
         let (hw, hh, hl) = (self.half_extents.x, self.half_extents.y, self.half_extents.z);
@@ -2692,20 +2711,45 @@ impl Vehicle {
                 corners.push(self.position + by * hh + bz * (sz * hl * 0.5) + bx * (sx * hw));
             }
         }
+        // `vel/32` once, before any impulse (0x49507D); the corners too (0x4950F7…0x495254)
         let v_tick = self.velocity / 32.0;
+        let on_road = |q: Vec3, y: f32| patch_height(q).is_some_and(|h| (h - y).abs() <= 4.0);
         let mut max_j: f32 = 0.0;
+        let mut max_effect: f32 = 0.0;
         let mut hit = false;
         for p in corners {
-            if patch_height(p).is_some_and(|h| (h - self.position.y).abs() <= 4.0) {
+            if on_road(p, self.position.y) {
                 continue;
             }
-            let p0 = p - v_tick;
-            let Some((n2, q, class)) = walls.segment_hit(p0, p) else { continue };
+            // the segment's start, from the car's position as an earlier corner's push left it
+            // (`car+0x330` is read per corner, 0x4952DF), and whether the tracker then holds a
+            // patch, which `edgeHit` needs (0x4740D6)
+            let from = if on_road(self.position, self.position.y) {
+                self.position
+            } else {
+                let back = self.position - v_tick;
+                if patch_height(back).is_none() {
+                    continue;
+                }
+                back
+            };
+            let Some((n2, q, class)) = walls.segment_hit(from, p) else { continue };
             self.last_wall_class = class;
             // 0x495506: `car+0x440 = p`, the corner, after `WallImpulse` whatever it answered
             self.last_contact = p;
             let n = Vec3::new(n2.x, 0.0, n2.y);
-            let push = Vec3::new(q.x - p.x, 0.0, q.y - p.z) * 1.01 * 1.05;
+            // `push = 1.01·(q − p)`, `push.y = 0` (0x495479…0x4954A4); `WallImpulse` 0x494000 runs
+            // `updateZone(p + push, 0)` on a copy of the car's tracker and, when no drivable patch
+            // contains that point (`(word & 0xF) == 0`, 0x494059…0x494063), pushes by `n·0`
+            // (0x494065…0x494077), else by the push; then `×1.05` (0x4940A9). The `.edg` lines are
+            // sides of the drivable triangles (every segment of monaco1/5, alps, skidpad), so a
+            // corner pushed back across its own wall lands on the road; a push that lands off it —
+            // past a joint, onto another wall — is dropped.
+            let mut push = Vec3::new(q.x - p.x, 0.0, q.y - p.z) * 1.01;
+            if patch_height(p + push).is_none() {
+                push = Vec3::ZERO;
+            }
+            let push = push * 1.05;
             let j = -self.velocity.dot(n);
             if j <= 0.0 {
                 continue;
@@ -2732,9 +2776,11 @@ impl Vehicle {
                 self.damage_by_normal(effect, n, 1, self.collision_mass);
             }
             max_j = max_j.max(j);
+            max_effect = max_effect.max(effect);
             hit = true;
         }
         self.impact = self.impact.max(max_j);
+        self.last_wall_effect = max_effect;
         hit
     }
 
@@ -2800,18 +2846,30 @@ impl Vehicle {
         hit
     }
 
-    /// 0x498AA0: `d = car − centre` in 3D (nothing under 0.01), `n = d/|d|`; the car's reach along
-    /// `n` is `min(hx / |n·x|, hz / |n·fwd|)` (10 for an axis within 0.1 of square); when the reach
-    /// plus the radius exceeds the x-z distance, the solid hit 0x498380 with the object's surface
-    /// point `centre + n·R` and the car's `pos − n·reach` — the normal turned round first when the
-    /// car is past 5 m/s (`car+0x35C`), its heading within 60° of `n` and the reach under 0.75.
+    /// 0x498AA0, read to the instruction 2026-09-26: everything in the x-z plane. It copies the
+    /// car's position and the object's centre (slot 1) and **zeroes both `y`** (0x498B2C
+    /// `[esp+0x5C]` = centre.y, 0x498B34 `[esp+0x38]` = pos.y) before `d = pos − centre`
+    /// (0x532330); nothing under 0.01 (`|d|`, 0x498B46…0x498B59), `n = d/|d|` (0x5328D0), the
+    /// x-z distance again (0x498B6F…0x498B9E). The car's reach along `n` is
+    /// `min(hx / |n·x|, hz / |n·fwd|)` (10 for an axis within 0.1 of square); when the reach plus
+    /// the radius exceeds the distance, the solid hit 0x498380 with the object's surface point
+    /// `centre + n·R` and the car's `pos − n·reach`, both at `y = 0` — the normal turned round
+    /// first when the car is past 5 m/s (`car+0x35C`), its velocity within 60° of `n` and the
+    /// **distance** (`[esp+0x5C]` at 0x498D03, not the reach in `[esp+0x58]`) under 0.75.
+    /// No height term anywhere: the candidate query (0x473870 → 0x484630 / 0x486510) and
+    /// 0x498280 are x-z too, so a pole over a tunnel pushes a car below it sideways.
+    /// *(Corrected 2026-09-26: the port took `d` and `n` in 3D — a pole 15 m above the car pushed
+    /// it along a nearly vertical normal, vy 1.1 → 58.8 m/s on monaco5 — and tested the reach
+    /// against 0.75.)*
     fn prop_cylinder(&mut self, c: Vec3, radius: f32) -> bool {
-        let d = self.position - c;
+        let c = Vec3::new(c.x, 0.0, c.z);
+        let pos = Vec3::new(self.position.x, 0.0, self.position.z);
+        let d = pos - c;
         if d.length() <= 0.01 {
             return false;
         }
         let mut n = d.normalize();
-        let dist = Vec3::new(d.x, 0.0, d.z).length();
+        let dist = d.length();
         let (bx, bz) = (self.orientation.row(0), self.orientation.row(2));
         let ax = n.dot(bx).abs();
         let rx = if ax > 0.1 { self.half_extents.x / ax } else { 10.0 };
@@ -2821,20 +2879,22 @@ impl Vehicle {
         if reach + radius <= dist {
             return false;
         }
-        if self.horizontal_speed() > 5.0 && self.velocity.normalize_or_zero().dot(n) > 0.5 && reach < 0.75 {
+        if self.horizontal_speed() > 5.0 && self.velocity.normalize_or_zero().dot(n) > 0.5 && dist < 0.75 {
             n = -n;
         }
         let a = c + n * radius;
-        let b = self.position - n * reach;
+        let b = pos - n * reach;
         self.solid_hit(n, a, b);
-        // 0x498DCA: `car+0x440 = a`, the prop's surface point (0x498DA5…0x498DD5)
+        // 0x498DCA: `car+0x440 = a`, the prop's surface point at `y = 0` (0x498DA5…0x498DD5)
         self.last_contact = a;
         true
     }
 
     /// 0x498690: the car's footprint edges in x-z — corners `pos ± hz·fwd ± hx·right` in the order
     /// `+F−R`, `+F+R`, `−F−R`, `−F+R`, edges (2,0), (0,1), (1,3), (3,2) (`0x5D0B6C`) — against the
-    /// box (0x486FB0): two crossings take the crossing's point and normal at once; one takes the
+    /// box's slot 6 (0x486D70, [`crate::props::box_push_edge_test`] — *until 2026-09-27 the camera's
+    /// slot 7 0x486FB0 with the normal's sign reversed*): two crossings take the
+    /// crossing's point and normal at once; one takes the
     /// deepest of the car's body points behind it, `−(p − point)·n` above −0.01, when that is
     /// under the best so far (from 999) and under `max(0.1, 0.125·car+0x35C)`. The contact goes to
     /// `BodyGroundCollide` 0x496610 with `k = 0.1`.
@@ -2848,7 +2908,7 @@ impl Vehicle {
         let mt = self.orientation.transpose();
         let body: Vec<Vec3> = self.body_points.iter().map(|q| self.position + mt * *q).collect();
         for (a, b) in [(2usize, 0usize), (0, 1), (1, 3), (3, 2)] {
-            let (count, point, n) = crate::props::box_edge_test(corners, p[a], p[b]);
+            let (count, point, n) = crate::props::box_push_edge_test(corners, p[a], p[b]);
             if count > 1 {
                 contact = Some((point, n));
                 break;
@@ -3164,6 +3224,27 @@ impl Vehicle {
 
 #[cfg(test)]
 mod tests {
+    /// 0x498AA0 zeroes the car's and the pole's `y` (0x498B2C / 0x498B34): a pole 15 m above the
+    /// car (the monaco5 harbour tunnel) pushes it in the x-z plane only.
+    #[test]
+    fn a_pole_pushes_in_the_xz_plane() {
+        let specs = specs_993();
+        let mut v = Vehicle::new(Vec3::new(0.0, -4.0, 0.0), Mat3::IDENTITY, &specs, 0.7, 0.3);
+        v.velocity = Vec3::new(1.0, 1.1, 0.0);
+        let pole = crate::props::Prop {
+            shape: crate::props::PropShape::Cylinder { radius: 0.25 },
+            aabb_min: Vec3::new(0.3, 9.0, -0.25),
+            aabb_max: Vec3::new(0.8, 13.0, 0.25),
+            class: 1,
+            breakable: None,
+            drive_through: false,
+        };
+        assert!(v.collide_props(&[pole], 0).is_some());
+        assert!(v.velocity.y.abs() <= 1.1, "no vertical push: {:?}", v.velocity);
+        assert_eq!(v.position.y, -4.0);
+        assert!(v.velocity.x < 1.0, "pushed away from the pole: {:?}", v.velocity);
+    }
+
     #[test]
     fn brake_lamps_follow_the_latch() {
         // 0x43937A: the throttle byte while the reverse latch is set, the brake byte otherwise
@@ -4426,6 +4507,64 @@ mod roughness_tests {
 fn fistp(v: f32) -> i32 {
     let r = v.round();
     if (v - v.trunc()).abs() == 0.5 && (r as i32) % 2 != 0 { r as i32 - v.signum() as i32 } else { r as i32 }
+}
+
+/// `Tyre` 0x4A238E…0x4A23CA, the over-limit clamp of the demand `d` (`[esp+0x24]`) to the raw
+/// limit `L` (`wheel+0xAC`), written to `wheel+0xA8`: `fcomp [esi+0xAC]; test ah,0x41; jne` —
+/// above `L` it takes `L`; otherwise `fld L; fchs; fld d; fcomp st(1); test ah,1; je` — below
+/// `−L` (or unordered) it takes `−L`; else `d` stays. Two one-sided compares, never a panic: a
+/// negative `L` (no floor since the 2026-09-26 audit) gives `L` for `d > L` and `−L` otherwise.
+fn tyre_demand_clamp(d: f32, lim: f32) -> f32 {
+    if d > lim {
+        lim
+    } else if !(d >= -lim) {
+        -lim
+    } else {
+        d
+    }
+}
+
+/// `Susp_update`'s sign-first clamps of the pitch (0x49A5A5…0x49A5EC, `specs[0x134]`) and the roll
+/// (0x49A695…0x49A6D8, `specs[0x138]`): `fcom 0; test ah,0x41; jne` splits on `x > 0`. Above zero
+/// `test ah,0x41; jne` keeps `x <= c`, else `c`; at or below zero (or unordered) `fchs` builds `−c`
+/// and `test ah,0x41; je` keeps `x > −c`, else `−c`. For a negative `c` that is `c` for every
+/// positive `x` and `−c` for every other — not `f32::clamp`, which panics on inverted bounds.
+fn sign_clamp(x: f32, c: f32) -> f32 {
+    if x > 0.0 {
+        if x <= c { x } else { c }
+    } else if x > -c {
+        x
+    } else {
+        -c
+    }
+}
+
+#[cfg(test)]
+mod clamp_ladder_tests {
+    use super::*;
+
+    #[test]
+    fn tyre_demand_clamp_follows_0x4a238e() {
+        assert_eq!(tyre_demand_clamp(5.0, 3.0), 3.0);
+        assert_eq!(tyre_demand_clamp(-5.0, 3.0), -3.0);
+        assert_eq!(tyre_demand_clamp(1.0, 3.0), 1.0);
+        // a negative limit: `d > L` takes `L`, everything else `−L` (no panic)
+        assert_eq!(tyre_demand_clamp(0.5, -2.0), -2.0);
+        assert_eq!(tyre_demand_clamp(-2.0, -2.0), 2.0);
+        assert_eq!(tyre_demand_clamp(-7.0, -2.0), 2.0);
+        assert_eq!(tyre_demand_clamp(f32::NAN, 3.0), -3.0);
+    }
+
+    #[test]
+    fn sign_clamp_follows_0x49a5a5() {
+        assert_eq!(sign_clamp(0.3, 0.2), 0.2);
+        assert_eq!(sign_clamp(-0.3, 0.2), -0.2);
+        assert_eq!(sign_clamp(0.1, 0.2), 0.1);
+        assert_eq!(sign_clamp(0.0, 0.2), 0.0);
+        assert_eq!(sign_clamp(0.1, -0.2), -0.2);
+        assert_eq!(sign_clamp(-0.1, -0.2), 0.2);
+        assert_eq!(sign_clamp(0.0, -0.2), 0.2);
+    }
 }
 
 #[cfg(test)]

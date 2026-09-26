@@ -13,8 +13,10 @@
 //! engine start/stop one-shots and their duck of the loop bed (§3.6), the smoothed pedal "load" and the
 //! gear-shift dip (§4.3), and the distance gain with its rpm boost (§4.1).
 //!
-//! The stereo `pan ± spread` pair of §3.4 is played as two voices at half level each, and `spread`
-//! also moves the mono layers dead-behind, as the original does. The tunnel reverb of §4.7 lives in
+//! The stereo `pan ± spread` pair of §3.4 is played as two voices, each at the layer's full level
+//! (0x4AC660 starts the second from the same request, level byte `bl`; 0x4AC69F sets it `ebx`), and
+//! `spread` also moves the mono layers dead-behind, as the original does. *(Until 2026-09-27 the
+//! port halved both voices of a pair — no source.)* The tunnel reverb of §4.7 lives in
 //! `reverb.rs`. The road, wind and turbo layers of §4.4–§4.6 live in `sfx.rs`.
 
 use crate::mixer::{AudioOutput, Clip, VoiceId};
@@ -86,11 +88,11 @@ pub struct EngineInput {
     pub mode: u8,
     /// listener→car direction against the car's forward, −1 in front of the car, +1 behind
     pub cos: f32,
-    /// stereo position −1..1 (detached modes only)
-    pub pan: f32,
+    /// the car's 16-bit pan angle (`mixer::pan_angle`; used in the detached modes only)
+    pub pan: u16,
     /// metres to the listener
     pub distance: f32,
-    /// `340 / (340 + closing speed)`
+    /// `340 / (340 + closing speed)`, taken as the 16.16 `pitchBase` word `(doppler · 65536)` truncated (0x4A781D `_ftol`)
     pub doppler: f32,
     /// detail setting; above 1 the directional blend is dropped and the mono layers are muted
     pub detail: u8,
@@ -128,7 +130,7 @@ impl Default for EngineInput {
             rev_cut: false,
             mode: 3,
             cos: 0.0,
-            pan: 0.0,
+            pan: 0,
             distance: 0.0,
             doppler: 1.0,
             detail: 1,
@@ -160,6 +162,15 @@ pub struct EngineSound {
     voices: Vec<Option<VoiceId>>,
     /// the second half of a stereo layer's `pan ± spread` pair (§3.4)
     voices_b: Vec<Option<VoiceId>>,
+    /// the first voice's pan and level as the mixer last gave them (`[esi]`, `[esi−4]` of
+    /// 0x4AC290's layer record, `+0x458` / `+0x454` + 0xC·layer of the engine object) — kept
+    /// through a stop ([`layer_pan_level`]). Their first value is whatever the heap block held:
+    /// the object comes from 0x531CA0 (`0x4ACC64`: name 0x5D1B94, 0x758 bytes, flags 0), which
+    /// clears nothing — it links a free block and writes its 16-byte header (0x5320B0; a guard
+    /// or name only under flags 0x200 / 0x100) — and the init loop 0x4ACCB5…0x4ACCE1 writes the
+    /// record's handle (`+0x45C`, −1) but not these two. APPROXIMATION of that undefined start:
+    /// (0, 0), the plain arm of [`layer_pan_level`] (no silent pass on the first rise).
+    kept: Vec<(u16, i32)>,
     /// `[0x6563C8 + 4·idx]` — the smoothed pedal value
     pedal: i32,
     /// engine start / stop one-shots per view class (bank slots 6..8 / 9..11)
@@ -182,6 +193,60 @@ pub struct EngineSound {
 
 /// The horn `Horn_start` 0x4AAC00 picks for the view `word[0x627F3C]`: slot 4 on view 0 or 0x0F,
 /// otherwise 3 when `[0x627F43] & 8` (`viewId <= 1`) and 5 for the rest (0x4AAC7D…0x4AACBA).
+/// What `Engine_mixLayers` 0x4AC290 does with one voice of a layer this pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerStep {
+    /// no handle and nothing to play
+    Idle,
+    /// no handle (−1): `Voice_start` (0x4AC572 / 0x4AC660), the handle kept whatever it is
+    Start,
+    /// a handle: `Voice_setVolume` / `Voice_setPanAngle` / `Voice_setPitch` on it when the value
+    /// changed (0x4AC5BB…0x4AC61B, 0x4AC692…0x4AC70C)
+    Update,
+    /// the level is 0 (or the second voice is not wanted): `0x565D60` and the handle back to −1
+    /// (0x4AC73F…0x4AC76D, 0x4AC718…0x4AC730)
+    Stop,
+}
+
+/// **A stolen or refused voice stays in its layer until the level falls to 0.** 0x4AC290 tests
+/// the handle it keeps (`[esi+4]`, the second voice's `[esi+0x184]`) only against −1
+/// (0x4AC537, 0x4AC645): it stores whatever `Voice_start` answered, −9 for a refusal (0x589BE9)
+/// included, and never asks whether the voice still plays. A voice the allocator 0x5898F0 took
+/// for a later start keeps its old handle, which 0x589D20 no longer matches (`voice+0 != handle`,
+/// → −8), so the per-pass `set` calls fail silently; the layer is restarted only after its level
+/// has been 0 once (the stop sets −1) and rises again. A handle-less pass (`Some` of a dead id in
+/// the port) is therefore an update, never a restart.
+pub fn layer_step(wanted: bool, voice: Option<VoiceId>) -> LayerStep {
+    match (wanted, voice) {
+        (false, Some(_)) => LayerStep::Stop,
+        (false, None) => LayerStep::Idle,
+        (true, Some(_)) => LayerStep::Update,
+        (true, None) => LayerStep::Start,
+    }
+}
+
+/// The pans and the first voice's level of one layer this pass (0x4AC4D4…0x4AC521): a stereo
+/// layer (`slot >= 0x40`) takes `pan − spread` / `pan + spread` (16-bit wrap); a mono one 0x8000
+/// while the in-car spread is open (`[edi+0xC8] > 0`, signed). With the spread closed, a mono
+/// layer whose first voice was last given pan 0x8000 (`cmp word [esi], 0x8000`) at a level above
+/// 0 (`[esi−4]`, signed) gets **pan 0x8000 at level 0 for this pass** (0x4AC501…0x4AC518: `xor ebx,
+/// ebx`) — after the level test that stops a voice (0x4AC4CE), so the voice is set silent, not
+/// stopped, and is started silent when it has no handle; the next pass, its kept level being 0,
+/// it takes its pan and level. So the pass after the spread closes is silent, and a mono layer
+/// whose own pan is 0x8000 (dead behind) with the spread closed is silent every other pass.
+/// Answers `((pan_a, level_a), pan_b)`; `kept` is `(pan, level)` of [`EngineSound::kept`].
+pub fn layer_pan_level(slot: u8, pan: u16, spread: i32, level: i32, kept: (u16, i32)) -> ((u16, i32), u16) {
+    if slot >= 0x40 {
+        ((pan.wrapping_sub(spread as u16), level), pan.wrapping_add(spread as u16))
+    } else if spread > 0 {
+        ((0x8000, level), 0x8000)
+    } else if kept.0 == 0x8000 && kept.1 as i8 > 0 {
+        ((0x8000, 0), 0x8000)
+    } else {
+        ((pan, level), pan)
+    }
+}
+
 pub fn horn_slot(view: u16) -> usize {
     if view == 0 || view == 0x0F {
         4
@@ -246,7 +311,7 @@ impl EngineSound {
             }
         }
         let decode = |slot: usize| -> Option<Arc<Clip>> {
-            bank.decode_slot(bank_bytes, slot).ok().map(|p| Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range, gain: p.gain, bend_cents: p.bend_cents, fx_send: p.fx_send }))
+            bank.decode_slot(bank_bytes, slot).ok().map(|p| Arc::new(Clip::from_pcm(p)))
         };
         let clips: Vec<Option<Arc<Clip>>> = layers
             .iter()
@@ -281,6 +346,7 @@ impl EngineSound {
             level: vec![0; 32],
             voices: vec![None; 32],
             voices_b: vec![None; 32],
+            kept: vec![(0, 0); 32],
             pedal: 0,
             start_clips,
             stop_clips,
@@ -332,7 +398,7 @@ impl EngineSound {
     /// voice is only (re)started when idle, so its volume is the one it started with. This port had
     /// slot 5 on every view at a fixed 0.6 until 2026-09-24.
     #[allow(clippy::too_many_arguments)]
-    pub fn horn(&mut self, out: &AudioOutput, on: bool, view: u16, distance: f32, pan: f32, sfx_level: u8) {
+    pub fn horn(&mut self, out: &AudioOutput, on: bool, view: u16, distance: f32, pan: u16, sfx_level: u8) {
         let slot = horn_slot(view);
         // a playing voice is left alone — 0x4AACBF…0x4AACD6 returns before `Voice_play` while
         // 0x566380 says it plays — so a view change mid-honk keeps the slot it started with (the
@@ -434,20 +500,30 @@ impl EngineSound {
         let x = load_word.max(0);
         let load = (x + x / 64 + x / 32).clamp(0, 0x80);
 
-        let rpm_frac = if inp.redline > 0.0 { inp.rpm / inp.redline } else { 0.0 };
+        // §3.3 in the record's integers: `rpmFrac` the 16.16 word of 0x4AA8B7 (`_ftol`), the bin
+        // and the pitch word from it (`Spl::bin`, `Spl::pitch_word`); `pitchBase` 16.16 as well.
+        // The word goes unchanged to the voice's `+0x6C` (the start's request `+0xC`, 0x4AC545;
+        // `setPitch` 0x565F80 at 0x4AC608 / 0x4AC6F9) — relative to the sample's root: 0x590420
+        // starts every layer at `(0x3C − root)·100 + fine` cents (`mixer::base_cents`) and 0x589F40
+        // makes `+0x6E = +0x6C · cents_word >> 12`. `word / 4096` is exact in an f32, so the
+        // mixer's `resample::pitch_word` gives the word back. *(Until 2026-09-27 the port took the
+        // float `spl[8]·(rpm/redline + 0.2)·doppler/64`, a word off at the rounding — 3584 for
+        // 3583 at half the redline — and floored it at 0.05, which has no source.)*
+        let rpm_frac = nfs_formats::spl::rpm_frac_16(inp.rpm, inp.redline);
         let bin = self.spl.bin(rpm_frac);
         let blend = self.spl.blend(inp.mode, inp.cos);
-        let pitch = self.spl.pitch(rpm_frac, inp.doppler).max(0.05);
+        let pitch_word = self.spl.pitch_word(rpm_frac, (inp.doppler as f64 * 65536.0) as i32);
+        let pitch = pitch_word as f32 / 4096.0;
         let spread = if inp.mode < 2 { (inp.crowding as i32 * 0x3FFF) >> 7 } else { 0 };
-        let pan = if inp.mode < 2 { 0.0 } else { inp.pan };
+        let pan = if inp.mode < 2 { 0 } else { inp.pan };
 
         // §4.1 master volume, §3.6 duck while the start sample plays
         (self.last_a, self.turbo_gain, self.last_gain) = self.engine_gain(&inp);
         let master_vol = (((inp.engine_level as i32 * self.game_trim as i32 * 85) >> 7) * self.last_gain) >> 14;
         let mut rec_volume = ((self.spl.record_volume(inp.mode) as i32 * master_vol) >> 6).min(0x7FF);
-        rec_volume = rec_volume * self.start_stop(out, &inp, pan) / 512;
+        rec_volume = (rec_volume * self.start_stop(out, &inp, pan, rec_volume)) >> 9;
 
-        tracing::trace!(rpm = inp.rpm, bin, load, blend, rec_volume, pitch, mode = inp.mode, audible = self.level.iter().filter(|l| **l > 0).count(), "engine record");
+        tracing::trace!(rpm = inp.rpm, bin, load, blend, rec_volume, pitch_word, mode = inp.mode, audible = self.level.iter().filter(|l| **l > 0).count(), "engine record");
         for i in 0..32 {
             let Some(d) = self.layers[i].clone() else { continue };
             // mode 0 plays the cockpit half, every other mode the exterior half
@@ -465,103 +541,132 @@ impl EngineSound {
             let lvl = self.level[i];
             // §3.4's voice management: a stereo layer (`slotId >= 0x40`) plays **two** voices at
             // `pan ± spread` whenever the in-car spread is open; a mono one goes dead-behind
-            // instead. The original's pans are 16-bit angles (a half turn is 0x8000); this port's
-            // pan is the sine of the angle, so the pair is `sin(θ ∓ spread·π/0x8000)` — the angles
-            // wrap and the mixer mirrors front and back (`mixer::pan_gains`)
+            // instead. The pans are the 16-bit angles: `pan − spread` / `pan + spread`, wrapping
+            // (0x4AC4D8…0x4AC4EA, 16-bit `sub` / `add`), and 0x8000 for a mono layer while the
+            // spread is open (0x4AC4F8) — the mixer folds each into its pan byte. (Until
+            // 2026-09-27 the port took the pair as `sin(θ ∓ spread·π/0x8000)` of its sine pan.)
             let stereo_pair = d.slot >= 0x40 && spread != 0;
-            let (pan_a, pan_b) = if stereo_pair {
-                let theta = pan.clamp(-1.0, 1.0).asin();
-                let sp = spread as f32 * std::f32::consts::PI / 32768.0;
-                ((theta - sp).sin(), (theta + sp).sin())
-            } else if d.slot >= 0x40 {
-                (pan, pan)
-            } else {
-                // mono in-car: dead behind, angle 0x8000 — sin π, the two speakers equal
-                // (until 2026-09-25 this was −1.0, hard left)
-                (if spread != 0 { 0.0 } else { pan }, pan)
-            };
-            let half = if stereo_pair { 0.5 } else { 1.0 };
-            let vol = lvl as f32 / 127.0 * half;
-            match (lvl, self.voices[i]) {
-                (0, Some(v)) => {
-                    out.stop(v);
-                    self.voices[i] = None;
-                }
-                (0, None) => {}
-                (_, Some(v)) => {
-                    out.set(v, vol, pitch);
-                    out.set_pan(v, pan_a);
-                }
-                (_, None) => {
-                    if let Some(c) = &self.clips[i] {
-                        self.voices[i] = Some(out.play_panned(c.clone(), vol, pitch, pan_a, true));
+            // the mono layer's silent pass after the spread closes ([`layer_pan_level`])
+            let ((pan_a, lvl_a), pan_b) = layer_pan_level(d.slot, pan, spread, lvl, self.kept[i]);
+            // a voice the budget took (or refused) keeps its id until the level falls to 0
+            // ([`layer_step`]); the updates on it do nothing, as 0x589D20 fails the old handle
+            for (k, slot, wanted, pan_x, lvl_x) in [(0, &mut self.voices[i], lvl > 0, pan_a, lvl_a), (1, &mut self.voices_b[i], lvl > 0 && stereo_pair, pan_b, lvl)] {
+                let vol = lvl_x as f32 / 127.0;
+                match (layer_step(wanted, *slot), *slot) {
+                    (LayerStep::Stop, Some(v)) => {
+                        out.stop(v);
+                        *slot = None;
                     }
-                }
-            }
-            // the second half of a stereo pair
-            match (lvl > 0 && stereo_pair, self.voices_b[i]) {
-                (false, Some(v)) => {
-                    out.stop(v);
-                    self.voices_b[i] = None;
-                }
-                (false, None) => {}
-                (true, Some(v)) => {
-                    out.set(v, vol, pitch);
-                    out.set_pan(v, pan_b);
-                }
-                (true, None) => {
-                    if let Some(c) = &self.clips[i] {
-                        self.voices_b[i] = Some(out.play_panned(c.clone(), vol, pitch, pan_b, true));
+                    (LayerStep::Update, Some(v)) => {
+                        out.set(v, vol, pitch);
+                        out.set_pan(v, pan_x);
+                        if k == 0 {
+                            self.kept[i] = (pan_x, lvl_x);
+                        }
                     }
+                    (LayerStep::Start, _) => {
+                        if let Some(c) = &self.clips[i] {
+                            *slot = Some(out.play_panned(c.clone(), vol, pitch, pan_x, true));
+                            // 0x4AC57E / 0x4AC581: the start keeps its level and pan
+                            if k == 0 {
+                                self.kept[i] = (pan_x, lvl_x);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
     }
 
-    /// §3.6: the engine start / stop one-shots. Returns the duck factor (0..512) for the loop bed.
-    fn start_stop(&mut self, out: &AudioOutput, inp: &EngineInput, pan: f32) -> i32 {
+    /// §3.6: the engine start / stop one-shots (0x4AC97F…0x4ACB5F). Returns the duck factor
+    /// `ebx` the record's volume is scaled by (`· ebx >> 9`, 0x4ACB54…0x4ACB5F): 0x200 once the
+    /// start has played (0x4AC9B1) or finished (0x4ACA7B); `0x200 − progress` while it plays
+    /// (0x4ACA53…0x4ACA74; a negative one → 0, `js`); and **0** (0x4ACB52 `xor ebx, ebx`) on the
+    /// update that starts it and on every update with the engine off — the loop bed is silent
+    /// then. Both one-shots take the level `min(EngineLevel, record volume)` (`cmp; jg`, the
+    /// record's word before the duck; 0x4AC9C8…0x4AC9DD / 0x4ACAC3…0x4ACAD8) and the record's pan
+    /// at their start, and **every update while they play** `setVolume` of the same min and
+    /// `setPan` (0x4ACA22…0x4ACA45, 0x4ACB1A…0x4ACB3D). *(Until 2026-09-27 the port gave them
+    /// `EngineLevel` alone, set once, and a duck of 512 on the starting and the engine-off
+    /// updates.)*
+    fn start_stop(&mut self, out: &AudioOutput, inp: &EngineInput, pan: u16, rec_volume: i32) -> i32 {
         let class = (inp.mode as usize).min(2);
-        let level = inp.engine_level as f32 / 127.0;
+        let level = (inp.engine_level as i32).min(rec_volume) as f32 / 127.0;
         if inp.running {
+            // 0x4AC990…0x4AC9A8: a stop sample still playing is cut and the start armed again
             if let Some(v) = self.stop_voice.take() {
                 out.stop(v);
+                self.started = false;
             }
-            if !self.started {
-                match self.start_voice {
-                    Some(v) if out.is_playing(v) => {
-                        let progress = out.progress(v).unwrap_or(1.0);
-                        return 512 - (progress * 512.0) as i32;
+            if self.started {
+                return start_duck(true, true, None);
+            }
+            match self.start_voice {
+                None => {
+                    match &self.start_clips[class] {
+                        Some(c) => self.start_voice = Some(out.play_panned(c.clone(), level, 1.0, pan, false)),
+                        // a start that fails leaves an error handle, whose status (0x566380) ends
+                        // it on the next update at 0x200 — the same as `started` now
+                        None => self.started = true,
                     }
-                    Some(_) => {
-                        self.start_voice = None;
-                        self.started = true;
-                    }
-                    None => {
-                        if let Some(c) = &self.start_clips[class] {
-                            self.start_voice = Some(out.play_panned(c.clone(), level, 1.0, pan, false));
-                            return 512;
-                        }
-                        self.started = true;
-                    }
+                    start_duck(true, false, None)
+                }
+                Some(v) if out.is_playing(v) => {
+                    out.set(v, level, 1.0);
+                    out.set_pan(v, pan);
+                    start_duck(true, false, Some(Some(out.progress(v).unwrap_or(1.0))))
+                }
+                Some(_) => {
+                    self.start_voice = None;
+                    self.started = true;
+                    start_duck(true, false, Some(None))
                 }
             }
         } else {
             if let Some(v) = self.start_voice.take() {
                 out.stop(v);
+                self.started = true;
             }
             if self.started {
-                if self.stop_voice.is_none_or(|v| !out.is_playing(v)) {
-                    match &self.stop_clips[class] {
+                match self.stop_voice {
+                    None => match &self.stop_clips[class] {
                         Some(c) => self.stop_voice = Some(out.play_panned(c.clone(), level, 1.0, pan, false)),
+                        // the failed start's error handle ends it on the next update; every update
+                        // answers 0 either way
                         None => self.started = false,
+                    },
+                    Some(v) if out.is_playing(v) => {
+                        out.set(v, level, 1.0);
+                        out.set_pan(v, pan);
                     }
-                    if self.stop_voice.is_some_and(|v| !out.is_playing(v)) {
+                    Some(_) => {
+                        self.stop_voice = None;
                         self.started = false;
                     }
                 }
             }
+            start_duck(false, self.started, None)
         }
-        512
+    }
+}
+
+/// The duck `ebx` of one update of §3.6 (0x4AC97F…0x4ACB54): engine off → 0 (every path of
+/// 0x4ACA8B… ends at 0x4ACB52); the start already played → 0x200 (0x4AC9B1); the start voice
+/// `start` = `None` being started this update → 0 (0x4ACA10); `Some(Some(progress))` playing →
+/// `0x200 − progress·0x200`, 0 when negative (0x4ACA53…0x4ACA74, `js`); `Some(None)` just
+/// finished → 0x200 (0x4ACA7B).
+fn start_duck(running: bool, started: bool, start: Option<Option<f32>>) -> i32 {
+    if !running {
+        return 0;
+    }
+    if started {
+        return 0x200;
+    }
+    match start {
+        None => 0,
+        Some(Some(p)) => (0x200 - (p * 512.0) as i32).max(0),
+        Some(None) => 0x200,
     }
 }
 
@@ -587,6 +692,34 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_mono_layer_is_silent_for_one_pass_after_the_spread_closes() {
+        // in-car, spread open: a mono layer dead behind at its level
+        assert_eq!(layer_pan_level(0x10, 0, 0x2000, 90, (0, 0)), ((0x8000, 90), 0x8000));
+        // the spread closes: kept 0x8000 at 90 → this pass 0x8000 at level 0
+        assert_eq!(layer_pan_level(0x10, 0x1234, 0, 90, (0x8000, 90)), ((0x8000, 0), 0x8000));
+        // the next pass (kept level 0) takes its own pan and level
+        assert_eq!(layer_pan_level(0x10, 0x1234, 0, 90, (0x8000, 0)), ((0x1234, 90), 0x1234));
+        // its own pan dead behind: silent every other pass
+        assert_eq!(layer_pan_level(0x10, 0x8000, 0, 90, (0x8000, 90)), ((0x8000, 0), 0x8000));
+        assert_eq!(layer_pan_level(0x10, 0x8000, 0, 90, (0x8000, 0)), ((0x8000, 90), 0x8000));
+        // a stereo layer is never touched: `pan ∓ spread` with its level
+        assert_eq!(layer_pan_level(0x40, 0x8000, 0, 90, (0x8000, 90)), ((0x8000, 90), 0x8000));
+        assert_eq!(layer_pan_level(0x41, 0x100, 0x200, 90, (0, 0)), ((0xFF00, 90), 0x300));
+    }
+
+    #[test]
+    fn a_stolen_layer_voice_waits_for_the_level_to_fall() {
+        let dead = Some(VoiceId(7));
+        // the handle is only compared with −1: a stolen / refused one is updated, not restarted
+        assert_eq!(layer_step(true, dead), LayerStep::Update);
+        // the level at 0 stops it and frees the slot (−1) ...
+        assert_eq!(layer_step(false, dead), LayerStep::Stop);
+        assert_eq!(layer_step(false, None), LayerStep::Idle);
+        // ... and the next rise starts a new voice
+        assert_eq!(layer_step(true, None), LayerStep::Start);
+    }
 
     #[test]
     fn the_weight_curve_is_monotonic_and_spans_the_range() {
@@ -636,14 +769,30 @@ mod tests {
     }
 
     #[test]
+    fn the_start_sample_ducks_the_bed() {
+        use super::start_duck;
+        // engine off: the bed is silent whatever the one-shots do
+        assert_eq!(start_duck(false, true, None), 0);
+        assert_eq!(start_duck(false, false, Some(Some(0.5))), 0);
+        // the update that starts the start sample is silent, then it fades in with the progress
+        assert_eq!(start_duck(true, false, None), 0);
+        assert_eq!(start_duck(true, false, Some(Some(0.25))), 384);
+        assert_eq!(start_duck(true, false, Some(Some(1.0))), 0);
+        // finished, and every update after
+        assert_eq!(start_duck(true, false, Some(None)), 512);
+        assert_eq!(start_duck(true, true, None), 512);
+    }
+
+    #[test]
     fn the_bin_and_pitch_match_the_shipped_parameters() {
         let s = Spl::default();
+        let f = |x: f32| nfs_formats::spl::rpm_frac_16(x, 1.0);
         // a layer window of [259, 512) only opens above 0.62 redline
-        assert!(s.bin(0.6) < 259);
-        assert!(s.bin(0.65) >= 259);
-        // one global ratio for every layer
-        assert!((s.pitch(0.6, 1.0) - 1.0).abs() < 1e-6);
-        // closing on the car raises the pitch
-        assert!(s.pitch(0.6, 340.0 / (340.0 - 30.0)) > 1.0);
+        assert!(s.bin(f(0.6)) < 259);
+        assert!(s.bin(f(0.65)) >= 259);
+        // one global word for every layer, 4096 = 1.0 (0.6 of the redline truncates to 4095)
+        assert_eq!(s.pitch_word(f(0.6), 0x10000), 4095);
+        // the tiny car's doubled base doubles the word, to the rounding
+        assert_eq!(s.pitch_word(f(0.6), 0x20000), 8191);
     }
 }

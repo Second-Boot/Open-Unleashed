@@ -37,7 +37,7 @@ fn alps_walls_near_road_edge() {
     let Ok(paths) = GamePaths::locate() else { return };
     let t = TrackAssets::load(&paths, "alps").unwrap();
     let edges = t.edges.as_ref().unwrap();
-    let walls = nfs_physics::walls::WallSet::build(edges.segments.iter().map(|s| (s.p1, s.p2, s.tag)), 30.0);
+    let walls = nfs_physics::walls::WallSet::build(edges.segments.iter().map(|s| s.loaded()), 30.0);
     assert_eq!(walls.len(), 7694);
     // point known to be 0.99 m from segment (199.6,68.9,-529.6)-(190.1,70.2,-535.2)
     let hit = walls.nearest(Vec3::new(193.9, 66.6, -531.8), 1.3);
@@ -58,7 +58,9 @@ fn vehicle_wall_response_synthetic() {
     // the sweep runs after integration: the +x corners (x ≈ pos.x + 0.9) have just passed the edge
     let mut v = Vehicle::new(Vec3::new(1.5, 0.3, 0.0), glam::Mat3::IDENTITY, &specs, 0.75, 0.3);
     v.velocity = Vec3::new(64.0, 0.0, 0.0); // 2 m per tick
-    let hit = v.collide_walls(&walls, &|_| None, 0.0, 0.0, 0.0);
+    // road (a drivable patch at y = 0) up to the wall line: the centre is on it, the +x corners
+    // are not (0x495020 tests a corner off the road with the segment centre → corner)
+    let hit = v.collide_walls(&walls, &|p| (p.x <= 2.0).then_some(0.0), 0.0, 0.0, 0.0);
     eprintln!("hit={hit} pos={:?} vel={:?}", v.position, v.velocity);
     assert!(hit);
     assert!(v.velocity.x < 0.0 && v.velocity.x > -10.0, "restitution 0.1 expected, got {:?}", v.velocity);

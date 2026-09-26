@@ -159,7 +159,7 @@ impl Speech {
             let bank = Bnk::parse(bytes).ok()?;
             let slot = bank.slots.iter().position(|s| s.is_some())?;
             let pcm = bank.decode_slot(bytes, slot).ok()?;
-            Some(Arc::new(Clip { rate: pcm.rate, channels: pcm.channels, samples: pcm.samples, loop_range: None, gain: pcm.gain, bend_cents: pcm.bend_cents, fx_send: pcm.fx_send }))
+            Some(Arc::new(Clip { loop_range: None, ..Clip::from_pcm(pcm) }))
         });
         if decoded.is_none() {
             tracing::warn!(name, "speech bank missing");
@@ -209,6 +209,21 @@ impl Speech {
             return;
         }
         q.push_back((name.to_string(), countdown));
+    }
+
+    /// **The speech flushed — 0x4AFD30**: every queued entry between the ring's read and write
+    /// indices is marked dead (`+0x1E` = −1, 0x4AFD53…0x4AFD6A) and the loader drained
+    /// (0x4AFD6C…0x4AFD88), the playing phrase's voices `[0x6573A8]` / `[0x6573AC]` and the two at
+    /// `0x656AE8` stopped (0x565D60) and set to −1, and the ring's indices `[0x657300]` /
+    /// `[0x656AE4]` put back to 0 (0x4AFE15 / 0x4AFE24). The race's audio entry `AudioLoadTrack`
+    /// 0x4A88A0 runs it on every pass of the session loop (0x4A88D0), as do the restart's audio
+    /// reset 0x4AB360 (0x4AB39B) and the shutdown's 0x4A8A80 (0x4A8A8C): nothing said in one race
+    /// is heard in the next, its replay or the front end.
+    pub fn flush(&self, out: &AudioOutput) {
+        self.queue.lock().unwrap().clear();
+        if let Some(id) = self.current.lock().unwrap().take() {
+            out.stop(id);
+        }
     }
 
     /// **The announcer is busy** — what race over 0x417010 asks before it lets a finished car's

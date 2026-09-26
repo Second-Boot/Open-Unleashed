@@ -9,8 +9,10 @@
 //!   across all 566 SHPI files (channel layouts RGB565 / ARGB1555 / ARGB4444 / BGR are HYPOTHESES
 //!   until rendered). Bit 7 of the code (`0xF8`, `0xFB`, `0xED`) marks **RefPack-compressed pixel
 //!   data** (CONFIRMED: decompressed size = w·h·bpp). `misc[3] >> 12` = number of mip levels
-//!   including the base (CONFIRMED: 0x8000 for 256², 0x7000 for 128², the following block is a
-//!   downsampled copy). Palette attachments: `0x2A` 32-bit, `0x29`/`0x2D` 16-bit (HYPOTHESIS on
+//!   **after** the base (0x8000 for 256², 0x7000 for 128²: the chain runs down to 1×1, and the
+//!   pixel block is the base plus that many quarter-size levels, padded to 16 — `mipchain`
+//!   example; the game's own reader 0x44D710 sums the levels the same way and decrements the
+//!   nibble when it drops the top level. *Corrected 2026-09-26: this said "including the base".*) Palette attachments: `0x2A` 32-bit, `0x29`/`0x2D` 16-bit (HYPOTHESIS on
 //!   channel order). `0x6F` = text comment, `0x7C` = hot-spot table.
 //!
 //! ```text
@@ -77,9 +79,10 @@ impl FshBlock {
     pub fn is_compressed(&self) -> bool {
         self.code & 0x80 != 0 && self.code != 0xFF
     }
-    /// Number of mip levels including the base level (`misc[3] >> 12`; 0 ⇒ base only).
+    /// Number of mip levels in the file, the base included: `misc[3] >> 12` counts the levels
+    /// **after** the base (0x44D710), so 0 ⇒ base only.
     pub fn mip_levels(&self) -> u32 {
-        ((self.misc[3] >> 12) as u32).max(1)
+        (self.misc[3] >> 12) as u32 + 1
     }
 }
 

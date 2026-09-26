@@ -1,6 +1,10 @@
-//! `FEData/Locale/FEStrings.csv` — the front-end string table.
+//! The front end's and the HUD's string tables.
 //!
-//! Windows-1252 CSV with CRLF (and stray CR / NEL) line ends; column 0 = numeric string id, column 1 =
+//! The original reads **`FEStrings.loc`** and **`hud.loc`** ([`Strings::from_loc`],
+//! `crate::loc::LocTable`); nothing in `nfs5.exe` names `FEStrings.csv`. The CSV is the port's
+//! fallback for an install without the `.loc` (`nfs_game::layout::load_strings`):
+//!
+//! `FEData/Locale/FEStrings.csv` — Windows-1252 CSV with CRLF (and stray CR / NEL) line ends; column 0 = numeric string id, column 1 =
 //! English text, further columns = other languages. Quoted fields follow the usual CSV rules
 //! (`""` = literal quote, commas and line breaks allowed inside quotes). Ids referenced by the
 //! career tables (`RE/notes/career.md`) are looked up here.
@@ -21,6 +25,10 @@ pub struct Strings {
     /// `IDS_ERACONGRATS` for the front end and `IDS_WINNINGS`, `RALLY TIME`, the two observe
     /// hints for the HUD. [`Strings::hud`] asks this map first.
     pub hud_by_id: HashMap<u32, String>,
+    /// Whether `hud_by_id` is the HUD's own `hud.loc` ([`Strings::from_loc`]): the HUD reads that
+    /// table and nothing else (0x536DA0 on `[0x60C974]`, 0x41E160), so [`Strings::hud`] does not
+    /// fall back to the front end's.
+    pub hud_table: bool,
 }
 
 /// Windows-1252 → Unicode. The shipped text uses the 0x80..0x9F block (typographic quotes and
@@ -32,6 +40,20 @@ pub fn cp1252(b: u8) -> char {
         '\u{90}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}', '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}', '\u{0153}', '\u{9D}', '\u{017E}', '\u{0178}',
     ];
     if (0x80..0xA0).contains(&b) { HIGH[(b - 0x80) as usize] } else { b as char }
+}
+
+/// Unicode → the Windows-1252 byte the original's text holds, the inverse of [`cp1252`]: the
+/// strings the game draws are byte strings and its fonts are keyed by those bytes (0x573AB0 hands
+/// the glyph lookup one unsigned byte at a time, `RE/notes/hud.md` "Glyph lookup"). A char below
+/// U+0100 is its own byte — which also takes back the C1 controls a byte-for-byte (`b as char`)
+/// decode leaves for 0x80…0x9F — and the typographic block maps back to 0x80…0x9F. `None` for a
+/// char no Windows-1252 byte stands for (the original never holds one).
+pub fn to_cp1252(ch: char) -> Option<u8> {
+    let c = ch as u32;
+    if c < 0x100 {
+        return Some(c as u8);
+    }
+    (0x80u8..0xA0).find(|&b| cp1252(b) == ch)
 }
 
 impl Strings {
@@ -54,7 +76,22 @@ impl Strings {
                 }
             }
         }
-        Strings { by_id, fe_by_id, hud_by_id }
+        Strings { by_id, fe_by_id, hud_by_id, hud_table: false }
+    }
+
+    /// The original's tables: `FEStrings.loc` for the front end (the one table 0x4E04F0 puts in
+    /// the list 0x4E06D0 walks, `[0x690714]`) and `hud.loc` for the HUD (0x41E1DD, `[0x60C974]`),
+    /// each already set to its language (0x536D80). Every id of the index is looked up the way
+    /// 0x536DA0 does (so a duplicated id holds what the bsearch finds) and kept when the lookup
+    /// answers. The bytes are carried as [`cp1252`] chars — one char per byte, which
+    /// [`to_cp1252`] and the glyph lookup turn back into the same byte, whatever code page the
+    /// file is in (Windows-1251 here).
+    pub fn from_loc(fe: &crate::loc::LocTable, hud: Option<&crate::loc::LocTable>) -> Strings {
+        let read = |t: &crate::loc::LocTable| -> HashMap<u32, String> {
+            t.ids().into_iter().filter_map(|id| Some((u32::from(id), t.get(u32::from(id))?.iter().map(|&b| cp1252(b)).collect()))).collect()
+        };
+        let fe_by_id = read(fe);
+        Strings { by_id: fe_by_id.clone(), fe_by_id, hud_by_id: hud.map(read).unwrap_or_default(), hud_table: hud.is_some() }
     }
 
 
@@ -64,16 +101,25 @@ impl Strings {
         self.fe_by_id.get(&id).or_else(|| self.by_id.get(&id)).map(|s| s.as_str())
     }
 
-    /// The string for `id` as the race HUD reads it: the HUD table's row when the file has one,
-    /// else the front end's (`get`). The HUD loads its own string table; the four ids both tables
-    /// use read the HUD's way here (`IDS_WINNINGS` 18161 is "WINNINGS", not "Test Driver").
+    /// The string for `id` as the race HUD reads it. With `hud.loc` loaded ([`Strings::from_loc`])
+    /// that table only — 0x536DA0(0x41E160(), id), NULL (`None`) for an id it lacks. From the CSV
+    /// fallback: the `hud` row when the file has one, else the front end's (`get`) — the port's
+    /// own rule for a table the original never reads. The four ids both tables use read the HUD's
+    /// way (`IDS_WINNINGS` 18161 is "WINNINGS" / "ПРИЗ", not "Test Driver").
     pub fn hud(&self, id: u32) -> Option<&str> {
-        self.hud_by_id.get(&id).map(|s| s.as_str()).or_else(|| self.get(id))
+        let own = self.hud_by_id.get(&id).map(|s| s.as_str());
+        if self.hud_table { own } else { own.or_else(|| self.get(id)) }
     }
 
-    /// The text for `id`, or `#id` when the table lacks it.
+    /// The text for `id` as the front end's accessor **0x4E06D0** answers it: id 0 is the shared
+    /// empty string 0x5E8E50 (0x4E06D7…0x4E06E3, before any table is asked), an id no table
+    /// holds is **`"Not Found"`** (0x5D9B38, 0x4E073D). Its third arm, `sprintf("%d", id)` while
+    /// `[0x690718]` is set (0x4E06E4), is not ported: nothing writes that byte.
     pub fn text(&self, id: u32) -> String {
-        self.get(id).map(str::to_owned).unwrap_or_else(|| format!("#{id}"))
+        if id == 0 {
+            return String::new();
+        }
+        self.get(id).unwrap_or("Not Found").to_owned()
     }
 }
 
@@ -134,7 +180,9 @@ mod tests {
         assert_eq!(s.get(0), Some("Hello, World!"));
         assert_eq!(s.get(2), Some("\"q\""));
         assert_eq!(s.get(5), Some("plain"));
-        assert_eq!(s.text(9), "#9");
+        assert_eq!(s.text(9), "Not Found");
+        // 0x4E06D7: id 0 answers "" even when the table has a row 0
+        assert_eq!(s.text(0), "");
     }
 
     #[test]
@@ -148,5 +196,15 @@ mod tests {
         assert_eq!(cp1252(0xE9), '\u{E9}');
         let s = Strings::parse(b"1,I\x92m sorry\r\n", 0);
         assert_eq!(s.get(1), Some("I\u{2019}m sorry"));
+    }
+
+    #[test]
+    fn to_cp1252_inverts_the_decode() {
+        for b in 0..=255u8 {
+            assert_eq!(to_cp1252(cp1252(b)), Some(b), "byte {b:#04X}");
+            assert_eq!(to_cp1252(b as char), Some(b), "Latin-1 {b:#04X}");
+        }
+        assert_eq!(to_cp1252('\u{2019}'), Some(0x92));
+        assert_eq!(to_cp1252('\u{0100}'), None);
     }
 }

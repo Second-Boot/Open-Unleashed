@@ -17,10 +17,11 @@ fn argb(c: u32) -> [f32; 4] {
 
 impl LayoutScreen {
     /// The height of a dialog's text block — 0x523250's `[+4]`, which the wrap 0x523600 builds as
-    /// `(line height + 2)` a line (0x523912…0x523932), wrapped at **300** (0x512792).
+    /// each line's **measured** height + 2 (0x523912…0x523932, `wrap_metrics`), wrapped at
+    /// **300** (0x512792).
     pub fn dialog_text_height(&self, text: &str) -> f32 {
         let Some(f) = self.fonts.get(DIALOG_TEXT_FONT) else { return 0.0 };
-        super::wrap_lines(f, text, 300.0).len() as f32 * (f.line_px() + 2.0)
+        super::wrap_metrics(f, &super::wrap_lines(f, text, 300.0)).1
     }
 
     /// Slot 15, 0x512A40, and the buttons' 0x514DF0 — `pressed` is 0x5299C0, a button held.

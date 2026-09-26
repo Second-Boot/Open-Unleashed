@@ -1233,7 +1233,7 @@ impl TrackWorld {
         let flags: Vec<u32> = materials.iter().map(|m| m.flags).collect();
         let collision = geometry.collision_grid(20.0, &|mat| flags.get(mat as usize).copied().unwrap_or(0));
         let n_extra = extra_walls.len();
-        let walls = nfs_physics::walls::WallSet::build(track.edges.iter().flat_map(|e| e.segments.iter().map(|s| (s.p1, s.p2, s.tag))).chain(extra_walls), 30.0);
+        let walls = nfs_physics::walls::WallSet::build(track.edges.iter().flat_map(|e| e.segments.iter().map(|s| s.loaded())).chain(extra_walls), 30.0);
         if n_extra > 0 {
             tracing::info!(segments = n_extra, "barrier boxes added to the wall set");
         }
@@ -1859,13 +1859,14 @@ pub struct CarModel {
     /// never moves (`car-model.md`). `R3DCarLOD::draw` picks it at 0x43C98A and turns
     /// `channel_turns[n]` into `Rx·Ry·Rz` about the part's own origin.
     body_channel: Vec<u8>,
-    /// The **draw order** key of each `body` entry — the article's `Base+70` byte. 0x43C1B0 lists
-    /// a LOD's parts as `{article, lod, Base+70}` and `std::sort`s them by that byte, signed and
-    /// ascending (0x43C35B → 0x43E710 / 0x43E910, `cmp bl, cl` on `+8`), and `R3DCarLOD::draw`
-    /// 0x43C830 walks them in that order. On the 993 the wheels are 0x0A and the wheel shadows,
-    /// the `Shadow.fsh` quads over the wheels' outer faces, 0x0B — drawn after the wheel they
-    /// darken.
-    body_key: Vec<i8>,
+    /// The **draw order** of each `body` entry — its article's place in its LOD's part list after
+    /// 0x43C1B0's sort. 0x43C1B0 lists a LOD's parts as `{article, lod, Base+70}` in file order and
+    /// `std::sort`s them by the byte at `+8`, signed, `a < b` (0x43C35B → 0x43E710 / 0x43E910 /
+    /// 0x43EA20, `cmp bl, cl` / `jge`), and `R3DCarLOD::draw` 0x43C830 walks them in that order
+    /// (the `lod_list` of the car's load, sorted by [`nfs_formats::stl_sort::vc6_sort`]). On the
+    /// 993 the wheels are 0x0A and the wheel shadows, the `Shadow.fsh` quads over the wheels'
+    /// outer faces, 0x0B — drawn after the wheel they darken.
+    body_order: Vec<u32>,
     /// Each `body` entry's LOD and pass bytes ([`PartInfo`]): the model holds **every** LOD, and
     /// the car draw 0x444E00 picks per pass which one a part is drawn from ([`CarPass`]).
     body_info: Vec<PartInfo>,
@@ -2127,8 +2128,8 @@ pub struct CarWheelModel {
     /// but not the spin, because 0x438669…0x438726 copy channels 1…4 into 18…21 with `.x` cleared
     /// (`cargo run -p nfs-formats --example rotchan`).
     pub channel: u8,
-    /// the article's `Base+70` draw-order key (see `CarModel::body_key`)
-    pub key: i8,
+    /// the article's place in its LOD's sorted part list (see `CarModel::body_order`)
+    pub order: u32,
     /// the LOD these parts are and the article's pass bytes
     pub info: PartInfo,
     pub parts: Vec<(MeshId, MaterialId, Mat4)>,
@@ -2512,7 +2513,9 @@ impl CarModel {
         let arts = car.crp.articles(&car.crp_data)?;
         let mut body = Vec::new();
         let mut body_channel: Vec<u8> = Vec::new();
-        let mut body_key: Vec<i8> = Vec::new();
+        // each `body` entry's article index, for its place in `lod_list` after the loop
+        let mut body_art: Vec<usize> = Vec::new();
+        let mut wheel_art: Vec<usize> = Vec::new();
         let mut wheels = Vec::new();
         let mut skipped = 0;
         let mut min = Vec3::splat(f32::MAX);
@@ -2526,7 +2529,10 @@ impl CarModel {
         let mut deform: Vec<DeformPart> = Vec::new();
         let mut lod_parts = [0u32; 7];
         let mut lod_moves = [[false; 4]; 7];
-        for a in &arts {
+        // 0x43C1B0's 12-byte records `{article, lod record, Base+70}` of each LOD, in article order
+        // (0x43C2D5…0x43C2F3: one per admitted article, the first `Base` LOD record for the LOD)
+        let mut lod_list: [Vec<(usize, i8)>; 7] = Default::default();
+        for (ai, a) in arts.iter().enumerate() {
             // 0x43C1B0's part list of each LOD: the articles the style admits with a `Base` LOD
             // record for it (0x43C2A1…0x43C2C9) — glares included — and, per part, its
             // translation channel `Base+72` into the LOD's gate `+0x14 + 4m` (0x43C66D…0x43C67C)
@@ -2540,6 +2546,9 @@ impl CarModel {
                     let Some(w) = d.get(o + 8..o + 10) else { break };
                     let l = u16::from_le_bytes([w[0], w[1]]) as usize;
                     if (1..=7).contains(&l) {
+                        if !lod_list[l - 1].iter().any(|&(i, _)| i == ai) {
+                            lod_list[l - 1].push((ai, d[0x46] as i8));
+                        }
                         lod_parts[l - 1] += 1;
                         if let Ok(m) = usize::try_from(d[0x48] as i8)
                             && m < 4
@@ -2778,21 +2787,49 @@ impl CarModel {
                 if parts.is_empty() {
                     continue;
                 }
-                let key = g.base.as_ref().map_or(0, |b| b.tag[2] as i8);
                 if is_wheel && tr.is_some() {
                     let pivot = MODEL_TO_BODY.transform_point3(local.w_axis.truncate());
                     if l == lod {
                         half_track = half_track.max(pivot.x.abs());
                     }
-                    wheels.push(CarWheelModel { pivot, is_front: ty == 0x0D, is_left: local.w_axis.x > 0.0, channel: rot_channel, key, info, parts });
+                    wheels.push(CarWheelModel { pivot, is_front: ty == 0x0D, is_left: local.w_axis.x > 0.0, channel: rot_channel, order: u32::MAX, info, parts });
+                    wheel_art.push(ai);
                 } else {
-                    body_key.extend(std::iter::repeat_n(key, parts.len()));
+                    body_art.extend(std::iter::repeat_n(ai, parts.len()));
                     body_info.extend(std::iter::repeat_n(info, parts.len()));
                     body.extend(parts);
                     body_channel.extend(part_channels);
                 }
             }
         }
+        // 0x43C1B0's sort of each LOD's list (0x43C31B…0x43C38A): the VC6 `std::sort` — introsort
+        // 0x43E710, then 0x43E910 / 0x43EA20 — over the records, `less` = the signed byte at `+8`
+        // (`cmp al, cl; jge` in the median 0x43E77D, `cmp [esi+8], cl; jge` in the partition
+        // 0x43E7B1, `cmp bl, cl; jge` 0x43E950 / `cmp dl, bl; jge` 0x43E9D3 / 0x43EA49 in the
+        // inserts, `cmp dl, [edi-4]; jge` / `cmp dl, bl; jge` in the heap 0x43EA90 / 0x43EBE0).
+        // Above 16 parts it is not stable, so equal keys draw in the order it leaves them.
+        let mut order_of: std::collections::HashMap<(u8, usize), u32> = std::collections::HashMap::new();
+        for (l, list) in lod_list.iter_mut().enumerate() {
+            nfs_formats::stl_sort::vc6_sort(list, |a, b| a.1 < b.1);
+            for (rank, &(ai, _)) in list.iter().enumerate() {
+                order_of.insert((l as u8 + 1, ai), rank as u32);
+            }
+        }
+        // A part with primitives at a LOD but not in that LOD's list (no `Base` record for it)
+        // is not drawn by the original at all; the port keeps it, last. APPROXIMATION (kept from
+        // before); `unlisted` counts them.
+        let mut unlisted = 0usize;
+        let mut order = |lod: u8, ai: usize| {
+            order_of.get(&(lod, ai)).copied().unwrap_or_else(|| {
+                unlisted += 1;
+                u32::MAX
+            })
+        };
+        let body_order: Vec<u32> = body_info.iter().zip(&body_art).map(|(info, &ai)| order(info.lod, ai)).collect();
+        for (w, &ai) in wheels.iter_mut().zip(&wheel_art) {
+            w.order = order(w.info.lod, ai);
+        }
+        tracing::info!(unlisted, "car part order");
         tracing::info!(body_parts = body.len(), wheels = wheels.len(), lights = lights.len(), roof_parts = morph[1].len(), roof_length = anim_length[1], anims = ?anim_length, skipped, pages = pages.len(), wheel_radius, half_track, "car uploaded");
         tracing::info!(patches = damage_patches.len(), night, "damage decals");
         Ok(Self {
@@ -2800,7 +2837,7 @@ impl CarModel {
             mirror: false,
             body,
             body_channel,
-            body_key,
+            body_order,
             body_info,
             lod_parts,
             lod_moves,
@@ -3298,7 +3335,7 @@ impl CarModel {
         let lift = |m: i8| usize::try_from(m).ok().and_then(|m| travel.get(m).copied()).map_or(Mat4::IDENTITY, |y| Mat4::from_translation(Vec3::new(0.0, y, 0.0)));
         let mut out = Vec::with_capacity(self.body.len() / 4 + 4 * 8);
         for pass in passes {
-            let mut items: Vec<(i8, DrawItem)> = Vec::new();
+            let mut items: Vec<(u32, DrawItem)> = Vec::new();
             for (i, (mesh, material, local)) in self.body.iter().enumerate() {
                 let Some(info) = self.body_info.get(i).filter(|info| info.in_pass(pass)) else { continue };
                 // A part bound to a rotation channel turns about **its own origin**: 0x43CA19…
@@ -3319,7 +3356,7 @@ impl CarModel {
                     5 => *local * Mat4::from_rotation_z((steer[0] + steer[1]).clamp(-4.5 / 23.0, 4.5 / 23.0) * std::f32::consts::TAU),
                     n => *local * self.channel_matrix(n),
                 };
-                items.push((self.body_key.get(i).copied().unwrap_or(0), DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * m)));
+                items.push((self.body_order.get(i).copied().unwrap_or(u32::MAX), DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * m)));
             }
             for w in self.wheels.iter().filter(|w| w.info.in_pass(pass)) {
                 let idx = match (w.is_front, w.is_left) {
@@ -3352,11 +3389,14 @@ impl CarModel {
                     // about the pivot in model space, the lift before it: `tr · T · R`
                     let pivot = local.w_axis.truncate();
                     let m = lift(w.info.move_channel) * Mat4::from_translation(pivot) * MODEL_TO_BODY * st * spin * MODEL_TO_BODY.inverse() * Mat4::from_translation(-pivot) * *local;
-                    items.push((w.key, DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * m)));
+                    items.push((w.order, DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * m)));
                 }
             }
-            // the parts in `Base+70` order (0x43C1B0's sort). APPROXIMATION within one key: the
-            // original's `std::sort` is not stable, the port keeps the file's order there
+            // the parts in the order 0x43C1B0's sort left the LOD's list (`body_order`, read
+            // 2026-09-27: the VC6 `std::sort` of the whole list at load, reproduced by `vc6_sort`),
+            // which 0x43C830 walks skipping the parts not in the pass (0x43C8AC…0x43C8E9) — so
+            // the pass's parts keep their places in the sorted whole list. One article's meshes
+            // share a place and keep their own order (the stable sort).
             items.sort_by_key(|(k, _)| *k);
             out.extend(items.into_iter().map(|(_, it)| it));
         }

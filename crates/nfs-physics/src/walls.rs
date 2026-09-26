@@ -21,6 +21,10 @@ pub struct Wall {
     /// The two ends' heights, lower and higher.
     pub y_lo: f32,
     pub y_hi: f32,
+    /// The heights of the ends `a` and `b` themselves (the camera pushes 0x464500 take the
+    /// edge's direction as the **3-D** unit `p1 − p0`, 0x532330 + 0x5328D0).
+    pub ya: f32,
+    pub yb: f32,
     /// Wall material class 0..5 = metal, wood, snow, ice, earth, rock (`WallImpulse` 0x494000
     /// byte tables 0x49442C / 0x4943BC over the `.edg` word 0x10..0x60; other words → rock).
     pub class: u8,
@@ -63,6 +67,8 @@ impl WallSet {
                 y_mid: (p1[1] + p2[1]) * 0.5,
                 y_lo: p1[1].min(p2[1]),
                 y_hi: p1[1].max(p2[1]),
+                ya: p1[1],
+                yb: p2[1],
                 class: wall_class(word),
             })
             .filter(|w| (w.a - w.b).length_squared() > 1e-6)
@@ -139,9 +145,10 @@ impl WallSet {
 }
 
 impl WallSet {
-    /// First wall crossed by the xz segment `p0 → p1` (within the wall's height span at `p1.y`).
-    /// Returns (edge normal `normalize(−d.z, 0, d.x)`, projection of `p1` onto the edge line,
-    /// material class).
+    /// `Tracker::edgeHit` 0x4740D0 on the segment `p0 → p1`: of the edges it crosses in xz (0x489CC0,
+    /// both parameters in `[0, 1]`), the one whose endpoint-mid height is nearest the segment's mid
+    /// height `(p0.y + p1.y)/2` (0x474185…0x4741BF). Returns (edge normal `normalize(−d.z, 0, d.x)`,
+    /// projection of `p1` onto the edge line (0x489F10), material class).
     pub fn segment_hit(&self, p0: Vec3, p1: Vec3) -> Option<(Vec2, Vec2, u8)> {
         if self.walls.is_empty() {
             return None;
@@ -165,12 +172,19 @@ impl WallSet {
                     let t = (s.y * d.x - s.x * d.y) / denom; // along the motion segment
                     let u = (s.y * r.x - s.x * r.y) / denom; // along the wall
                     if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
-                        // 0x4740D0 keeps the crossed edge nearest **in height** to the segment;
-                        // ties go to the one crossed first
-                        let key = ((w.y_mid - p1.y).abs(), t);
+                        // 0x4740D0 keeps the crossed edge nearest **in height** to the segment's
+                        // middle (0x474191…0x47419D; `p1.y` alone until 2026-09-26); ties go to
+                        // the one crossed first (APPROXIMATION: the original keeps the first in
+                        // its quadtree order, `fcom`/`test ah,1` a strict `<`)
+                        let key = ((w.y_mid - (p0.y + p1.y) * 0.5).abs(), t);
                         if best.map(|b| key < (b.0, b.1)).unwrap_or(true) {
                             let n = Vec2::new(-d.y, d.x).normalize_or_zero();
-                            let proj = w.a + d * (((b - w.a).dot(d)) / d.length_squared()).clamp(0.0, 1.0);
+                            // 0x489F10 projects onto the edge's infinite **line** — `t = (p − e0)·d /
+                            // d·d` with no clamp (0x489F43…0x489F84) — so near a joint the push stays
+                            // perpendicular to the wall. The port clamped `t` to the segment until
+                            // 2026-09-26, which there turned the push along the wall and let a car
+                            // scraping it at speed work through the wall line (monaco5, skidpad)
+                            let proj = w.a + d * ((b - w.a).dot(d) / d.length_squared());
                             best = Some((key.0, t, n, proj, w.class));
                         }
                     }
@@ -187,52 +201,121 @@ impl WallSet {
     /// the xz crossing of `eye → car` with the edge (0x489CC0: both parameters within [0, 1]); an
     /// edge whose higher end is more than `[0x5B38EC]` 3.5 below `ground`, or whose lower end is
     /// more than 3.5 above it, is passed over unless `any_height` (`[0x5CF584]` = 0, Castle); else
-    /// the eye moves to the crossing plus the edge's unit left normal `(−e.z, 0, e.x)`, its height
+    /// the eye moves to the crossing plus the edge's left normal `n = (−e.z, 0, e.x)`, its height
     /// `2·y₀ − crossing.y` with `y₀` the eye's height on entry (0x4646BE…0x4646DE), and the next
-    /// edge is tested from there. Returns whether the eye moved.
+    /// edge is tested from there.
+    ///
+    /// `e` is the edge's **3-D** unit direction `normalize(p1 − p0)` (0x532330, then 0x5328D0 whose
+    /// length 0x532B20 takes all three components), so on a sloped edge `n` is shorter than 1 — the
+    /// port normalised in xz until 2026-09-27.
+    ///
+    /// **When no edge moved the eye** (0x464768…0x46476E), a second pass (0x464774…0x464961): the
+    /// edges that cross the 1.0 circle about the eye in xz (0x473BA0 with radius 1.0, whose test is
+    /// 0x489DF0 — a root of `|p0 + t·(p1 − p0) − eye|² = 1` in [0, 1], so an edge lying wholly
+    /// inside the circle is *not* listed); for each, the probe `eye → eye − n` (the current eye)
+    /// is crossed with the edge (0x489CC0), the same height gate applies, and the eye becomes the
+    /// crossing plus `n`, its height `y₀` (0x46494A…0x464951). This keeps the eye off a wall it is
+    /// already standing beside. Returns whether either pass moved the eye.
+    ///
+    /// APPROXIMATION: the original walks the edges in its quadtree's cell order and lists an edge
+    /// once per leaf it lies in; the port walks its own grid, each edge once.
     pub fn camera_push(&self, eye: &mut Vec3, car: Vec3, ground: f32, any_height: bool) -> bool {
         if self.walls.is_empty() {
             return false;
         }
         let y0 = eye.y;
-        let idx = |v: Vec2| ((((v.x - self.min.x) / self.cell).floor().max(0.0) as usize).min(self.nx - 1), (((v.y - self.min.y) / self.cell).floor().max(0.0) as usize).min(self.nz - 1));
-        let (a, b) = (Vec2::new(eye.x, eye.z), Vec2::new(car.x, car.z));
-        let (x0, z0) = idx(a.min(b));
-        let (x1, z1) = idx(a.max(b));
-        let mut seen = std::collections::HashSet::new();
-        let mut moved = false;
-        for z in z0..=z1 {
-            for x in x0..=x1 {
-                for &wi in &self.cells[z * self.nx + x] {
-                    if !seen.insert(wi) {
-                        continue;
-                    }
-                    let w = &self.walls[wi as usize];
-                    // 0x489CC0 with A = eye → car and B = the edge
-                    let (dax, daz) = (car.x - eye.x, car.z - eye.z);
-                    let (dbx, dbz) = (w.b.x - w.a.x, w.b.y - w.a.y);
-                    let denom = dax * dbz - dbx * daz;
-                    if denom == 0.0 {
-                        continue;
-                    }
-                    let (wx, wz) = (eye.x - w.a.x, eye.z - w.a.y);
-                    let u = (wz * dbx - wx * dbz) / denom;
-                    let v = (wz * dax - wx * daz) / denom;
-                    if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
-                        continue;
-                    }
-                    if !any_height && (w.y_hi + 3.5 < ground || w.y_lo - 3.5 > ground) {
-                        continue;
-                    }
-                    let hit = *eye + (car - *eye) * u;
-                    let e = Vec2::new(dbx, dbz).normalize_or_zero();
-                    *eye = Vec3::new(hit.x - e.y, 2.0 * y0 - hit.y, hit.z + e.x);
-                    moved = true;
-                }
+        let gated = |w: &Wall| !any_height && (w.y_hi + 3.5 < ground || w.y_lo - 3.5 > ground);
+        // 0x489CC0 with A = `from → to` and B = the edge: the parameter along A, both in [0, 1]
+        let cross = |from: Vec3, to: Vec3, w: &Wall| -> Option<f32> {
+            let (dax, daz) = (to.x - from.x, to.z - from.z);
+            let (dbx, dbz) = (w.b.x - w.a.x, w.b.y - w.a.y);
+            let denom = dax * dbz - dbx * daz;
+            if denom == 0.0 {
+                return None;
             }
+            let (wx, wz) = (from.x - w.a.x, from.z - w.a.y);
+            let u = (wz * dbx - wx * dbz) / denom;
+            let v = (wz * dax - wx * daz) / denom;
+            ((0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v)).then_some(u)
+        };
+        // 0x532330 (p1 − p0) and 0x5328D0 (3-D normalise), then `(−e.z, 0, e.x)`
+        let normal = |w: &Wall| {
+            let e = Vec3::new(w.b.x - w.a.x, w.yb - w.ya, w.b.y - w.a.y);
+            let e = e / e.length();
+            Vec3::new(-e.z, 0.0, e.x)
+        };
+        let mut moved = false;
+        for wi in self.cells_over(Vec2::new(eye.x, eye.z), Vec2::new(car.x, car.z)) {
+            let w = &self.walls[wi as usize];
+            let Some(u) = cross(*eye, car, w) else { continue };
+            if gated(w) {
+                continue;
+            }
+            let hit = *eye + (car - *eye) * u;
+            let n = normal(w);
+            *eye = Vec3::new(hit.x + n.x, 2.0 * y0 - hit.y, hit.z + n.z);
+            moved = true;
+        }
+        if moved {
+            return true;
+        }
+        // the second pass: 0x473BA0(eye, 1.0), the list taken once at the eye on entry
+        let q = Vec2::new(eye.x, eye.z);
+        let near: Vec<u32> = self
+            .cells_over(q - Vec2::ONE, q + Vec2::ONE)
+            .into_iter()
+            .filter(|&wi| circle_cross(&self.walls[wi as usize], q, 1.0))
+            .collect();
+        for wi in near {
+            let w = &self.walls[wi as usize];
+            let n = normal(w);
+            let Some(u) = cross(*eye, *eye - n, w) else { continue };
+            if gated(w) {
+                continue;
+            }
+            let hit = *eye - n * u;
+            *eye = Vec3::new(hit.x + n.x, y0, hit.z + n.z);
+            moved = true;
         }
         moved
     }
+
+    /// The edges listed in the grid cells covering the xz box of `p` and `q`, each once, in the
+    /// grid's order.
+    fn cells_over(&self, p: Vec2, q: Vec2) -> Vec<u32> {
+        let idx = |v: Vec2| ((((v.x - self.min.x) / self.cell).floor().max(0.0) as usize).min(self.nx - 1), (((v.y - self.min.y) / self.cell).floor().max(0.0) as usize).min(self.nz - 1));
+        let (x0, z0) = idx(p.min(q));
+        let (x1, z1) = idx(p.max(q));
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for z in z0..=z1 {
+            for x in x0..=x1 {
+                for &wi in &self.cells[z * self.nx + x] {
+                    if seen.insert(wi) {
+                        out.push(wi);
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// **0x489DF0** `(x0, z0, x1, z1, px, pz, r, &t1, &t2)`: whether the xz segment `p0 → p1` crosses
+/// the circle of radius `r` about `(px, pz)` — the roots `t = (−b ∓ √(b² − 4ac)) / 2a` of
+/// `|p0 + t·d − p|² = r²` (`a = d·d`, `b = 2·d·(p0 − p)`), true when the first lies in [0, 1] or
+/// else the second does (0x489EC8…0x489F07). A negative discriminant gives a NaN root (the plain
+/// `fsqrt` 0x5327D0), which no comparison accepts; a segment wholly inside the circle has
+/// `t1 < 0 < 1 < t2` and is refused.
+fn circle_cross(w: &Wall, p: Vec2, r: f32) -> bool {
+    let d = w.b - w.a;
+    let a = d.x * d.x + d.y * d.y;
+    let b = 2.0 * (d.x * (w.a.x - p.x) + d.y * (w.a.y - p.y));
+    let c = w.a.x * w.a.x + w.a.y * w.a.y + p.x * p.x + p.y * p.y - 2.0 * (w.a.x * p.x + w.a.y * p.y) - r * r;
+    let s = (b * b - 4.0 * a * c).sqrt();
+    let t1 = (-b - s) / (2.0 * a);
+    let t2 = (s - b) / (2.0 * a);
+    (0.0..=1.0).contains(&t1) || (0.0..=1.0).contains(&t2)
 }
 
 #[cfg(test)]
@@ -251,5 +334,32 @@ mod camera_push_tests {
         let mut eye = Vec3::new(0.0, 3.0, 0.0);
         assert!(!set.camera_push(&mut eye, Vec3::new(0.0, 1.0, 10.0), 10.0, false));
         assert!(set.camera_push(&mut eye, Vec3::new(0.0, 1.0, 10.0), 10.0, true));
+    }
+
+    #[test]
+    fn an_eye_beside_a_wall_is_stepped_off_it() {
+        // the same wall, its left normal n = (0, 0, 1); an eye 0.5 on the normal's side of the
+        // wall line, the car beside it (the first pass finds no crossing)
+        let set = WallSet::build([([-10.0, 0.0, 5.0], [10.0, 0.0, 5.0], 0x60)].into_iter(), 30.0);
+        let mut eye = Vec3::new(0.0, 3.0, 5.5);
+        // the probe eye → eye − n = (0, 3, 4.5) reaches the wall at z = 5; the eye becomes z = 6
+        assert!(set.camera_push(&mut eye, Vec3::new(3.0, 1.0, 8.0), 0.0, false));
+        assert!((eye - Vec3::new(0.0, 3.0, 6.0)).length() < 1e-5, "{eye}");
+        // an eye on the other side is not moved: its probe points away from the wall
+        let mut eye = Vec3::new(0.0, 3.0, 4.5);
+        assert!(!set.camera_push(&mut eye, Vec3::new(3.0, 1.0, 4.0), 0.0, false));
+        // a short edge wholly inside the 1.0 circle is not listed (0x489DF0)
+        let set = WallSet::build([([-0.2, 0.0, 5.0], [0.2, 0.0, 5.0], 0x60)].into_iter(), 30.0);
+        let mut eye = Vec3::new(0.0, 3.0, 5.5);
+        assert!(!set.camera_push(&mut eye, Vec3::new(3.0, 1.0, 8.0), 0.0, false));
+    }
+
+    #[test]
+    fn a_sloped_edge_gives_a_shorter_normal() {
+        // e = normalize(20, 20, 0): n = (0, 0, 0.7071); crossing at (0, 2, 5) → eye z = 5.7071
+        let set = WallSet::build([([-10.0, -10.0, 5.0], [10.0, 10.0, 5.0], 0x60)].into_iter(), 30.0);
+        let mut eye = Vec3::new(0.0, 3.0, 0.0);
+        assert!(set.camera_push(&mut eye, Vec3::new(0.0, 1.0, 10.0), 0.0, true));
+        assert!((eye.z - (5.0 + std::f32::consts::FRAC_1_SQRT_2)).abs() < 1e-5, "{eye}");
     }
 }

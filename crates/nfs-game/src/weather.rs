@@ -19,12 +19,15 @@
 //! the player's car in the driver view only, on the plane of the car's `Wndo` corners.
 //!
 //! The draws from 0x5561D0 / 0x538040 — the emitters' flutter timers and gusts, the drops' points
-//! and alphas — come from the front end's generator itself (`opponents::FeRng`), **one** state the
-//! three members share in the original's call order (the constructor, the prime, then per frame
-//! snow, rain, splat). APPROXIMATION: its state — the game's is wherever the front end (seeded from
-//! `time(0)`) and the sky's jitter left it; here it starts at the image's own `.data` values
-//! (`FeRng::new(0)`) when the layer is made. *(Until 2026-09-26 the emitters drew from a stand-in,
-//! the race's 16-bit LCG form, and the splat from a state of its own.)*
+//! and alphas — come from the front end's generator itself (`opponents::FeRng`), the game's **one**
+//! state, which the caller hands in: the race's, seeded from `time(0)` by the HUD's init and shared
+//! with the sky's jitter and the announcer (`App::fe_rng` in `porsche`), drawn in the original's call
+//! order (the prime, then per frame snow, rain, splat). The constructor's draws (0x456F5F, at the
+//! track load 0x469092) come from the state the track load's 0x44F240 left, which that reseed
+//! replaces and the prime's reset draws again: they leave no trace, and are made from a state of
+//! their own here. *(Until 2026-09-26 the emitters drew from a stand-in, the race's 16-bit LCG
+//! form, and the splat from a state of its own; then all three from one state of the layer's own
+//! starting at the image's `.data` values.)*
 
 use glam::{Mat3, Vec3};
 
@@ -880,26 +883,36 @@ pub struct Weather {
     pub snow: Emitter,
     pub rain: Emitter,
     pub splat: Splat,
-    /// 0x538040's state, shared by the three (see the module's note)
-    fe: FeRng,
 }
 
 impl Weather {
-    /// 0x458C90 at `SPECIALFX` level `level`, then 0x459260 with the strengths at load.
-    pub fn new(level: usize, snow: f32, rain: f32, rng: &mut ParticleRng) -> Self {
+    /// 0x458C90 at `SPECIALFX` level `level`, then 0x459260 with the strengths at load, its draws
+    /// from `fe` (see the module's note for the constructor's).
+    pub fn new(level: usize, snow: f32, rain: f32, rng: &mut ParticleRng, fe: &mut FeRng) -> Self {
         let d = density(level);
-        let mut fe = FeRng::new(0);
-        let (snow_e, rain_e) = (Emitter::new(Params::snow(d), &mut fe), Emitter::new(Params::rain(d), &mut fe));
-        let mut me = Self { last_tick: 0, snow: snow_e, rain: rain_e, splat: Splat::new(), fe };
-        me.snow.prime(snow, rng, &mut me.fe);
-        me.rain.prime(rain, rng, &mut me.fe);
-        me.splat.prime(rain, snow, &mut me.fe);
+        let mut load = FeRng::new(0);
+        let (snow_e, rain_e) = (Emitter::new(Params::snow(d), &mut load), Emitter::new(Params::rain(d), &mut load));
+        let mut me = Self { last_tick: 0, snow: snow_e, rain: rain_e, splat: Splat::new() };
+        me.prime(snow, rain, rng, fe);
         me
+    }
+
+    /// **0x459260**, the prime — at the track load (0x4690AF from 0x469040's caller) and again at
+    /// every pass of the session loop on the same object (0x4690A0 from 0x414EB0: a restart, the
+    /// automatic replay): `+0` (the last tick) = 0 (0x459272), then each emitter's reset with its
+    /// strength (the snow's from 0x45CFD0, the rain's from 0x45D000; `+8` recomputed only when the
+    /// strength differs, `test ah, 0x40` at 0x4592F6 / 0x459478) and the drops' 0x4581A0. The
+    /// emitters' gust and last view and the drops' plane, colours and last eye are not touched.
+    pub fn prime(&mut self, snow: f32, rain: f32, rng: &mut ParticleRng, fe: &mut FeRng) {
+        self.last_tick = 0;
+        self.snow.prime(snow, rng, fe);
+        self.rain.prime(rain, rng, fe);
+        self.splat.prime(rain, snow, fe);
     }
 
     /// 0x459020's step: `frozen` (the dialog queue up, no replay) steps by one on every call;
     /// otherwise by the ticks since the last call, nothing when none passed.
-    pub fn frame(&mut self, tick: u32, snow: f32, rain: f32, view: View, frozen: bool, rng: &mut ParticleRng) {
+    pub fn frame(&mut self, tick: u32, snow: f32, rain: f32, view: View, frozen: bool, rng: &mut ParticleRng, fe: &mut FeRng) {
         let n = if frozen {
             1
         } else {
@@ -910,11 +923,11 @@ impl Weather {
             }
             n
         };
-        self.snow.step(n, snow, view, frozen, rng, &mut self.fe);
-        self.rain.step(n, rain, view, frozen, rng, &mut self.fe);
+        self.snow.step(n, snow, view, frozen, rng, fe);
+        self.rain.step(n, rain, view, frozen, rng, fe);
         // the splat only in the second branch (0x459112); `[cam+0xF8]` is the rotation's m[1][1]
         if !frozen {
-            self.splat.step(n, rain, snow, view.eye, view.to_camera.col(1).y, &mut self.fe);
+            self.splat.step(n, rain, snow, view.eye, view.to_camera.col(1).y, fe);
         }
     }
 
@@ -935,7 +948,7 @@ mod tests {
     #[test]
     fn target_from_strength_and_density() {
         let mut rng = ParticleRng::new(0);
-        let w = Weather::new(3, 1.0, 0.0, &mut rng);
+        let w = Weather::new(3, 1.0, 0.0, &mut rng, &mut FeRng::new(0));
         // fistp(300 − 0.5) = 300 (ties to even) — the prime fills the box
         assert_eq!(w.snow.count(), 300);
         assert_eq!(w.rain.count(), 0);
@@ -949,7 +962,7 @@ mod tests {
     #[test]
     fn primed_particles_are_in_the_box() {
         let mut rng = ParticleRng::new(7);
-        let w = Weather::new(3, 0.0, 1.0, &mut rng);
+        let w = Weather::new(3, 0.0, 1.0, &mut rng, &mut FeRng::new(0));
         let p = &w.rain.params;
         for t in w.rain.pos.iter().take(w.rain.count()) {
             assert!(t.x >= p.min.x && t.x < p.max.x && t.y >= p.min.y && t.y < p.max.y && t.z >= p.min.z && t.z < p.max.z);
@@ -959,10 +972,11 @@ mod tests {
     #[test]
     fn a_still_camera_lets_the_rain_fall_and_wrap() {
         let mut rng = ParticleRng::new(3);
-        let mut w = Weather::new(3, 0.0, 1.0, &mut rng);
-        w.frame(1, 0.0, 1.0, view(), false, &mut rng); // first frame: no camera delta
+        let mut fe = FeRng::new(0);
+        let mut w = Weather::new(3, 0.0, 1.0, &mut rng, &mut fe);
+        w.frame(1, 0.0, 1.0, view(), false, &mut rng, &mut fe); // first frame: no camera delta
         let before: Vec<Vec3> = w.rain.pos[..w.rain.count()].to_vec();
-        w.frame(2, 0.0, 1.0, view(), false, &mut rng);
+        w.frame(2, 0.0, 1.0, view(), false, &mut rng, &mut fe);
         // −0.8 a tick down (0x458EE7), or wrapped to the top
         for (a, b) in before.iter().zip(&w.rain.pos) {
             let fell = (b.y - (a.y - 0.8)).abs() < 1e-4 && (b.x - a.x).abs() < 1e-5;
@@ -1063,8 +1077,9 @@ mod tests {
     #[test]
     fn the_gate_is_the_count() {
         let mut rng = ParticleRng::new(0);
-        assert!(!Weather::new(3, 0.0, 0.0, &mut rng).visible());
-        assert!(Weather::new(0, 0.5, 0.0, &mut rng).visible());
+        let mut fe = FeRng::new(0);
+        assert!(!Weather::new(3, 0.0, 0.0, &mut rng, &mut fe).visible());
+        assert!(Weather::new(0, 0.5, 0.0, &mut rng, &mut fe).visible());
         assert_eq!(Params::snow(0.0).texture_names(3), ["sno3".to_string(), "snow".to_string()]);
     }
 }

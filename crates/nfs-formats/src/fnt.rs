@@ -51,6 +51,9 @@ pub struct Font {
     /// The signed bytes at `+0x10` / `+0x11`: the pen's start, `font+4` / `font+8` (0x53C6FC), added
     /// to the draw position before the first glyph (0x53DAEB…0x53DB06).
     pub origin: [i8; 2],
+    /// The line break's step, `font+0x14` = the signed bytes `+0x12` plus `+0x13` (0x53C70A…0x53C71A):
+    /// a `'\n'` puts the pen back at the line's start and moves it down by this (0x53DB60…0x53DB77).
+    pub line_step: i32,
 }
 
 impl Font {
@@ -78,12 +81,45 @@ impl Font {
         let line_height = glyphs.iter().map(|g| g.height).max().unwrap_or(0);
         let flags = u32_le(data, 12, "FNTF flags")?;
         let origin = [*data.get(16).unwrap_or(&0) as i8, *data.get(17).unwrap_or(&0) as i8];
-        Ok(Self { glyphs, atlas_width, atlas_height, atlas, line_height, flags, origin })
+        let line_step = *data.get(0x12).unwrap_or(&0) as i8 as i32 + *data.get(0x13).unwrap_or(&0) as i8 as i32;
+        Ok(Self { glyphs, atlas_width, atlas_height, atlas, line_height, flags, origin, line_step })
     }
 
+    /// The record whose code is exactly `ch`'s code point — no encoding, no case swap. What the
+    /// game draws goes through [`Font::lookup`].
     pub fn glyph(&self, ch: char) -> Option<&Glyph> {
         let c = ch as u32;
         self.glyphs.iter().find(|g| g.ch as u32 == c)
+    }
+
+    /// The record keyed `code` — 0x53D920: record `code − 0x20` when its key matches, else a
+    /// binary search of the sorted table (0x53D970). Every shipped table is sorted with unique
+    /// keys, so both are this exact match.
+    pub fn glyph_code(&self, code: u16) -> Option<&Glyph> {
+        self.glyphs.iter().find(|g| g.ch == code)
+    }
+
+    /// The glyph the text draw 0x53DAB0 takes for `ch`, CONFIRMED:
+    ///
+    /// * the string is read a **byte** at a time, zero-extended (0x573AB0) — the reader
+    ///   0x53C736…0x53C77F installs for a font whose `(flags >> 16) & 3` is 0 or 3, with at most
+    ///   255 records and a first key ≤ 0xFF, which is every shipped `.ffn` (the others, UTF-16
+    ///   0x573A90 and a double-byte reader 0x573AE0, have no font to serve). So `ch` is looked up
+    ///   by its Windows-1252 byte ([`crate::locale::to_cp1252`]): `'ô'` is 0xF4, `'’'` 0x92;
+    /// * a key the font lacks is tried once more in the other case, 0x53E270: `A…Z`, `À…Ö`,
+    ///   `Ø…Þ` +0x20, `a…z`, `à…ö`, `ø…þ` −0x20; any other byte (`ß`, `ÿ`, `×`, `÷`, the
+    ///   punctuation) swaps to 0, which the caller takes as "none" (0x53DBE7);
+    /// * still nothing → `None`: the character is **skipped** — no quad and the pen does not move
+    ///   (0x53DBE9 / 0x53DBFD jump back to the reader).
+    ///
+    /// `None` too for a char no Windows-1252 byte stands for (APPROXIMATION of "cannot happen":
+    /// the original's strings are bytes).
+    pub fn lookup(&self, ch: char) -> Option<&Glyph> {
+        let b = crate::locale::to_cp1252(ch)?;
+        self.glyph_code(b as u16).or_else(|| match case_swap(b) {
+            0 => None,
+            s => self.glyph_code(s as u16),
+        })
     }
 
     /// Atlas intensity (0..15) at (x, y).
@@ -104,5 +140,49 @@ impl Font {
             }
         }
         out
+    }
+}
+
+/// 0x53E270: the other case of a Windows-1252 letter, 0 for anything else.
+pub fn case_swap(b: u8) -> u8 {
+    match b {
+        0x41..=0x5A | 0xC0..=0xD6 | 0xD8..=0xDE => b + 0x20,
+        0x61..=0x7A | 0xE0..=0xF6 | 0xF8..=0xFE => b - 0x20,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn case_swap_is_0x53e270() {
+        assert_eq!(case_swap(b'A'), b'a');
+        assert_eq!(case_swap(b'z'), b'Z');
+        assert_eq!(case_swap(0xC0), 0xE0); // À → à
+        assert_eq!(case_swap(0xF4), 0xD4); // ô → Ô
+        assert_eq!(case_swap(0xFE), 0xDE); // þ → Þ
+        // outside the six ranges: no other case
+        for b in [0xD7u8, 0xF7, 0xDF, 0xFF, b'0', b' ', 0x92, 0x8A, 0x9A] {
+            assert_eq!(case_swap(b), 0, "{b:#04X}");
+        }
+    }
+
+    fn font(keys: &[u16]) -> Font {
+        let glyphs = keys.iter().map(|&ch| Glyph { ch, width: 1, height: 1, x: 0, y: 0, advance: 1, offset_x: 0, offset_y: 0 }).collect();
+        Font { glyphs, atlas_width: 2, atlas_height: 2, atlas: vec![0; 2], line_height: 1, flags: 0, origin: [0, 0], line_step: 0 }
+    }
+
+    #[test]
+    fn lookup_takes_the_byte_then_the_other_case() {
+        let f = font(&[0x41, 0x92, 0xD4]);
+        assert_eq!(f.lookup('A').map(|g| g.ch), Some(0x41));
+        assert_eq!(f.lookup('a').map(|g| g.ch), Some(0x41)); // swapped
+        assert_eq!(f.lookup('\u{2019}').map(|g| g.ch), Some(0x92)); // cp1252 0x92, not U+2019
+        assert_eq!(f.lookup('ô').map(|g| g.ch), Some(0xD4)); // 0xF4 missing → Ô
+        assert!(f.lookup('b').is_none());
+        assert!(f.lookup('\u{2018}').is_none()); // 0x91: no other case
+        assert!(f.lookup('\u{4E00}').is_none());
     }
 }

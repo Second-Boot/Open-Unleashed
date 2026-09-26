@@ -46,7 +46,8 @@ pub struct TrackInfo {
     pub display_name: String,
     pub art: String,
     pub art_small: String,
-    /// 0 = always available, 3 = locked until the era's unlock list names it.
+    /// 0 = always available, 3 = locked until a tournament whose era has ended lists it
+    /// (0x4FBC10, `nfs_game::track_list`).
     pub lock_mode: u16,
     pub circuit: bool,
     pub unknown_70: f32,
@@ -180,7 +181,8 @@ pub struct Tournament {
     pub id: i16,
     pub kind: TournamentKind,
     pub start_year: u16,
-    /// Track ids unlocked while this era is active.
+    /// Track ids unlocked once the chronicle year reaches the year this tournament's era ends
+    /// (0x502990: 1970 / 1989 / 2000; 0x4FBC10) — not while the era is active.
     pub unlock_tracks: Vec<i16>,
     pub name_string_id: u32,
     pub title_string_id: u32,

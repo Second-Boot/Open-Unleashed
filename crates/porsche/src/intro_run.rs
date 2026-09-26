@@ -113,10 +113,11 @@ impl IntroRun {
                 *started = true;
                 player.preload(&mut decode);
                 // the sound starts once the ring is full, then the clock (0x4DCB8F…0x4DCC19); the
-                // library plays it at its own level — 0x567550 takes none
+                // library plays it at its own level — 0x567550 takes none; a stream voice, started
+                // at priority 0x65 (0x5612A0) and so never stolen
                 *voice = audio.and_then(|a| {
                     let pcm = nfs_formats::schl::decode_all(&nfs_formats::mad::audio_track(data)).ok()?;
-                    let clip = nfs_audio::mixer::Clip { rate: pcm.rate, channels: pcm.channels, samples: pcm.samples, loop_range: None, gain: 1.0, bend_cents: 0, fx_send: pcm.fx_send };
+                    let clip = nfs_audio::mixer::Clip { rate: pcm.rate, channels: pcm.channels, samples: pcm.samples, loop_range: None, gain: 1.0, bend_cents: 0, fx_send: pcm.fx_send, priority: nfs_audio::mixer::STREAM_PRIORITY, pan: pcm.pan, pan_scale: pcm.pan_scale, records: Vec::new(), layers: Vec::new(), tables: Vec::new() };
                     Some(a.play(Arc::new(clip), 1.0, 1.0, false))
                 });
                 player.start(self.t0.elapsed().as_millis() as i32, voice.is_some());

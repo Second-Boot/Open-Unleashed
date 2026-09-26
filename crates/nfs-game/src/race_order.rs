@@ -36,8 +36,10 @@ impl RaceOrder {
     }
 
     /// `0x417710`'s first sort on this tick's keys, one per registration index (`car+0xAF8 −
-    /// car+0xB20`; a car out of the world keeps the 0 its progress holds). A different car count
-    /// starts the array afresh in registration order (a new race).
+    /// car+0xB20`; a car out of the world keeps the 0 its progress holds). An empty array — what
+    /// the race start leaves, `Cars_resetAll` 0x4110A0 putting both arrays back in registration
+    /// order on every pass of the session loop — or a different car count starts in registration
+    /// order.
     pub fn resort(&mut self, keys: &[f32]) {
         let n = keys.len();
         if self.order.len() != n {

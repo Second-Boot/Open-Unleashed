@@ -2,7 +2,7 @@
 //! converted to meshes (mesh conversion lands once the CRP geometry layout is established —
 //! see `RE/notes/crp-geometry.md`).
 
-use crate::{fmt_err, read, texture::{decode_pack, TextureImage}, AssetError, GamePaths};
+use crate::{fmt_err, read, texture::{decode_pack, decode_pack_mipped, TextureImage}, AssetError, GamePaths};
 use crate::mesh::{article_parts, MaterialMesh};
 use nfs_formats::{crp::{Crp, Material}, edg::EdgeFile, ini::Ini, refpack, scn::Scene};
 use std::path::PathBuf;
@@ -282,7 +282,8 @@ impl TrackAssets {
 
         let fsh_path = file(".fsh")?;
         let fsh_data = refpack::maybe_decompress(&read(&fsh_path)?).map_err(fmt_err(&fsh_path))?.into_owned();
-        let textures = decode_pack(&fsh_path, &fsh_data)?;
+        // pack key 0, the one with a mip chain (0x4877BD; `texture::decode_pack_mipped`)
+        let textures = decode_pack_mipped(&fsh_path, &fsh_data)?;
 
         let env_path = file(".env")?;
         let env_data = refpack::maybe_decompress(&read(&env_path)?).map_err(fmt_err(&env_path))?.into_owned();
