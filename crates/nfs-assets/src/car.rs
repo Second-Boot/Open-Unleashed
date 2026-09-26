@@ -378,7 +378,9 @@ pub struct CarAssets {
 
 /// The inputs of slot 19's driver writes (0x43AEA5…0x43AF6B): car-info `+0x150` **`.DRIVER`**
 /// (registry id 0x23D), which the front end's per-car race set-up 0x4EEDA0 sets to `rand() & 7`
-/// (0x4EEDAC…0x4EEDE2) for every car it launches; `car+0x52C & 0x10`, a traffic car (0x43AECA),
+/// (0x4EEDAC…0x4EEDE2) for every car it launches but the player's, which gets the profile's picture
+/// `[0x5DB748]` (kind 1, 0x4EEDBD → 0x5024E0; 0…9, 8 with no profile) — the draw is still made;
+/// `car+0x52C & 0x10`, a traffic car (0x43AECA),
 /// which gets no driver; and `FEGAME_TYPE [0x6573E8] == 9`, a Factory Driver mission (0x43AEFD).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DriverSeat {
@@ -977,6 +979,20 @@ fn expand(v: u8, bits: u32) -> u8 {
     ((x << (8 - bits)) | (x >> (2 * bits - 8))) as u8
 }
 
+/// What a page of format `bpp` keeps of one texel the **blitter** writes into it — `blit`'s
+/// `BlitPath::Blitter` arm, for a caller outside this module that writes a page at run time (the
+/// track room's picture panels, 0x4EAD74 → 0x53D570, and their marker, 0x56D4C0 → 0x571630): 4444
+/// every channel to its high nibble, 565 `r >> 3`, `g >> 2`, `b >> 3` with the alpha dropped, 1555
+/// five bits and the alpha bit "the source dword is not 0", 32 kept.
+pub fn blitter_texel(bpp: i64, t: [u8; 4]) -> [u8; 4] {
+    match bpp {
+        4444 => t.map(|c| expand(c, 4)),
+        565 => [expand(t[0], 5), expand(t[1], 6), expand(t[2], 5), 255],
+        1555 => [expand(t[0], 5), expand(t[1], 5), expand(t[2], 5), if t != [0; 4] { 255 } else { 0 }],
+        _ => t,
+    }
+}
+
 /// Copy `src` into the page at (x, y), applying the paint-slot rule (RE/notes/car-model.md §5):
 /// `tint_texel` on the `Texel` path (the `Palette` path's texels come already tinted through their
 /// palette, `palette_path_texels`; the blitter tints nothing). Then the texel is stored as the original's writer for that
@@ -1025,15 +1041,6 @@ fn blit(page: &mut TexturePage, src: &[u8], w: u32, h: u32, x: i64, y: i64, path
     }
 }
 
-/// One entry of a global car texture file (`CarModel/{Shadow,INTGLASS,Suit,Head,Cabrio}.fsh`) by
-/// name — the packs the `.tpg` pulls page pieces from, which also hold standalone textures such as
-/// `INTGLASS`'s `glai` windscreen glass.
-pub fn global_texture(paths: &GamePaths, file: &str, entry: &str) -> Result<Option<TextureImage>, AssetError> {
-    let Some(p) = GamePaths::find_file(&paths.car_model_dir(), file) else { return Ok(None) };
-    let data = refpack::maybe_decompress(&read(&p)?).map_err(fmt_err(&p))?.into_owned();
-    Ok(decode_pack(&p, &data)?.into_iter().find(|t| t.name.trim().eq_ignore_ascii_case(entry)))
-}
-
 /// One patch of a `<model>D.fsh` / `<model>L.fsh` damage pack (`RE/notes/car-model.md` §11).
 #[derive(Debug, Clone)]
 pub struct DamagePatch {
@@ -1049,10 +1056,14 @@ pub struct DamagePatch {
     pub image: TextureImage,
 }
 
-/// Read the damage decals beside a car's `.crp`. `night` picks `<model>L.fsh` over `<model>D.fsh`,
-/// as `car+0xAA <= 0x50` does in the original (0x442011 / 0x44204E).
-pub fn damage_patches(paths: &GamePaths, model: &str, night: bool) -> Result<Vec<DamagePatch>, AssetError> {
-    let suffix = if night { "L" } else { "D" };
+/// Read the damage decals beside a car's `.crp`. `light` picks `<model>L.fsh` over `<model>D.fsh`:
+/// the loader 0x441FF2…0x442086 opens `%sl.fsh` when `R3DCar+0xAA` is above 0x50 and `%sd.fsh`
+/// otherwise (the front end both), and applies `[+0x90 + 4·(0x50 < +0xAA)]` — and `+0xAA` is the
+/// **exterior paint's** HSV value, `max(r, g, b)` of car-info `+0x218` (0x443CA0, from 0x443DB0's
+/// 0x443E18). So a light car takes the black `L` scratches, a dark one the greyer `D` ones.
+/// *(Corrected 2026-09-26: this was the track's night flag, read as a light level.)*
+pub fn damage_patches(paths: &GamePaths, model: &str, light: bool) -> Result<Vec<DamagePatch>, AssetError> {
+    let suffix = if light { "L" } else { "D" };
     let Some(p) = GamePaths::find_file(&paths.car_model_dir(), &format!("{model}{suffix}.fsh")) else { return Ok(Vec::new()) };
     let data = refpack::maybe_decompress(&read(&p)?).map_err(fmt_err(&p))?.into_owned();
     let fsh = Fsh::parse(&data).map_err(fmt_err(&p))?;
@@ -1084,8 +1095,13 @@ pub fn damage_patches(paths: &GamePaths, model: &str, night: bool) -> Result<Vec
 }
 
 /// Blend one damage patch onto a page, as 0x448110 does: skipped while the zone is undamaged,
-/// otherwise drawn with a constant `alpha = min(damage · 3.5, 255)` on top of the patch's own
-/// per-pixel alpha.
+/// otherwise drawn with a constant alpha on top of the patch's own per-pixel alpha — an
+/// **integer**, `fistp(float(damage · 3.5))` (round to nearest even), above 255 taken as 255
+/// (0x44816E…0x44818A, `cmp edx, 0xFF; jbe`), which 0x5400B0 puts in the modulate colour's alpha
+/// `[0x5DFB7C]` (0x540152…0x54016B). *(Until 2026-09-26 the port used the unrounded product.)*
+/// APPROXIMATION: the blend itself — `page·(1 − a) + patch·a` with `a` = texel alpha × level / 255,
+/// rounded, on the page's 8-bit copy — is not the traced software blitter 0x572B40 on the 16-bit
+/// surface 0x448010 makes (0x448056, format 0x10).
 pub fn blend_patch(page: &mut TexturePage, patch: &DamagePatch, damage: f32) {
     if patch.threshold > 0.0 {
         if damage <= patch.threshold {
@@ -1094,7 +1110,7 @@ pub fn blend_patch(page: &mut TexturePage, patch: &DamagePatch, damage: f32) {
     } else if damage <= 0.0 {
         return;
     }
-    let level = if patch.threshold > 0.0 { 255.0 } else { (damage * 3.5).min(255.0) };
+    let level = if patch.threshold > 0.0 { 255.0 } else { ((damage * 3.5).round_ties_even() as i64).min(255) as f32 };
     let src = &patch.image.mips[0];
     for row in 0..patch.image.height {
         let dy = patch.y + row;

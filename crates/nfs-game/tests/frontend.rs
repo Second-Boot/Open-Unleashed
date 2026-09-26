@@ -137,7 +137,7 @@ fn the_control_templates_carry_the_class_defaults() {
         for p in c.parts.values() {
             for key in ["pos", "size"] {
                 let Some(v) = p.value(key).filter(|v| !v.is_empty()) else { continue };
-                let all = |_: &str| Some(10.0);
+                let all = |_: &str| nfs_formats::ctr::Macro::Text("10".into());
                 assert!(nfs_formats::ctr::eval_pair(v, &all).is_some(), "{class}.{}.{key} = {v}", p.name);
                 exprs += 1;
             }
@@ -498,19 +498,19 @@ fn a_goto_button_is_a_pill() {
     assert_eq!(c.part("bg").unwrap().value("color"), Some("data.maincolor"));
     assert_eq!(c.part("hoverbg").unwrap().value("color"), Some("data.hovercolor"));
     // exactly one caption is opaque for each shipped `medium`
-    let opaque = |medium: f64| -> Vec<&str> {
+    let opaque = |medium: i32| -> Vec<&str> {
         ["label", "mediumlabel", "smalllabel"]
             .into_iter()
             .filter(|n| {
                 let v = c.part(n).unwrap().value("foreColor").unwrap();
-                let r = |x: &str| if x == "data.medium" { Some(medium) } else { None };
-                nfs_formats::ctr::eval(v, &r).is_some_and(|n| (n as u64) >> 24 != 0)
+                let r = |x: &str| if x == "data.medium" { nfs_formats::ctr::Macro::Text(medium.to_string()) } else { nfs_formats::ctr::Macro::Undefined };
+                nfs_formats::ctr::eval(v, &r).is_some_and(|n| (n as u32) >> 24 != 0)
             })
             .collect()
     };
-    assert_eq!(opaque(0.0), ["label"]);
-    assert_eq!(opaque(1.0), ["mediumlabel"]);
-    assert_eq!(opaque(4.0), ["smalllabel"]);
+    assert_eq!(opaque(0), ["label"]);
+    assert_eq!(opaque(1), ["mediumlabel"]);
+    assert_eq!(opaque(4), ["smalllabel"]);
 
     // and every shipped button carries a colour of its own
     let lay = paths.fe_data().join("Layouts");
@@ -744,13 +744,13 @@ fn a_label_is_one_text_part_and_its_alignment_is_the_templates() {
     assert_eq!(label.screen_key("foreColor").as_deref(), Some("foreColor"));
     assert_eq!(label.screen_key("pos"), None);
     // and the expression is the alignment rule: 0 keeps it, 1 pulls back half, 2 the whole width
-    for (align, want) in [(0.0, 0.0), (1.0, -20.0), (2.0, -40.0)] {
+    for (align, want) in [(0, 0), (1, -20), (2, -40)] {
         let r = |n: &str| match n {
-            "label.size.width" => Some(40.0),
-            "data.align" => Some(align),
-            _ => None,
+            "label.size.width" => nfs_formats::ctr::Macro::Text("40".into()),
+            "data.align" => nfs_formats::ctr::Macro::Text(i32::to_string(&align)),
+            _ => nfs_formats::ctr::Macro::Undefined,
         };
-        assert_eq!(nfs_formats::ctr::eval_pair(label.value("pos").unwrap(), &r), Some((want, 0.0)));
+        assert_eq!(nfs_formats::ctr::eval_pair(label.value("pos").unwrap(), &r), Some((want, 0)));
     }
     // a picture is one SHAPE part and nothing else
     assert_eq!(read("Picture.ctr").state_parts("normal"), ["data", "picture"]);
@@ -3147,13 +3147,13 @@ fn an_input_box_puts_its_caret_one_pixel_past_the_text() {
         nfs_formats::ctr::Control::parse(&text)
     };
     // a stand-in box 100 wide and 14 tall with 40 pixels of text in it
-    const W: f64 = 100.0;
-    const TW: f64 = 40.0;
+    const W: i32 = 100;
+    const TW: i32 = 40;
     let refs = |n: &str| match n {
-        "data.width" => Some(W),
-        "data.height" => Some(14.0),
-        "hitext.size.width" => Some(TW),
-        _ => None,
+        "data.width" => nfs_formats::ctr::Macro::Text(W.to_string()),
+        "data.height" => nfs_formats::ctr::Macro::Text("14".into()),
+        "hitext.size.width" => nfs_formats::ctr::Macro::Text(TW.to_string()),
+        _ => nfs_formats::ctr::Macro::Undefined,
     };
     for name in ["InputBox.ctr", "CharVectInputBox.ctr", "ChatInputBox.ctr"] {
         let c = load(name);
@@ -3161,15 +3161,15 @@ fn an_input_box_puts_its_caret_one_pixel_past_the_text() {
         let hitext = c.part("hitext").unwrap_or_else(|| panic!("{name} should have a hitext part"));
         let (cx, _) = nfs_formats::ctr::eval_pair(cursor.value("pos").unwrap(), &refs).unwrap();
         let (hx, _) = nfs_formats::ctr::eval_pair(hitext.value("pos").unwrap(), &refs).unwrap();
-        assert_eq!(cx, hx + TW + 1.0, "{name}: the caret is one pixel past the text");
+        assert_eq!(cx, hx + TW + 1, "{name}: the caret is one pixel past the text");
     }
     // the bar
     let c = load("InputBox.ctr");
     let p = c.part("cursor").unwrap();
     assert_eq!(p.kind(), nfs_formats::ctr::PartKind::Rect);
     assert_eq!(p.value("color"), Some("0xff000000"));
-    assert_eq!(nfs_formats::ctr::eval_pair(p.value("size").unwrap(), &refs), Some((1.0, 8.0)));
-    assert_eq!(nfs_formats::ctr::eval_pair(p.value("pos").unwrap(), &refs).map(|(_, y)| y), Some(3.0));
+    assert_eq!(nfs_formats::ctr::eval_pair(p.value("size").unwrap(), &refs), Some((1, 8)));
+    assert_eq!(nfs_formats::ctr::eval_pair(p.value("pos").unwrap(), &refs).map(|(_, y)| y), Some(3));
     // and the two underscores
     for name in ["CharVectInputBox.ctr", "ChatInputBox.ctr"] {
         let c = load(name);
@@ -3178,7 +3178,7 @@ fn an_input_box_puts_its_caret_one_pixel_past_the_text() {
         assert_eq!(p.value("text"), Some("_"), "{name}");
         assert_eq!(p.value("fontPathName"), Some("univers8b.ffn"), "{name}");
         assert_eq!(p.value("foreColor"), Some("0xFF000000"), "{name}");
-        assert_eq!(nfs_formats::ctr::eval_pair(p.value("pos").unwrap(), &refs).map(|(_, y)| y), Some(2.0), "{name}");
+        assert_eq!(nfs_formats::ctr::eval_pair(p.value("pos").unwrap(), &refs).map(|(_, y)| y), Some(2), "{name}");
     }
 }
 

@@ -16,7 +16,9 @@ pub struct TrackWorld {
     /// Mission elements currently hidden (arrow markers not yet reached).
     pub hidden: std::collections::HashSet<usize>,
     pub items: Vec<DrawItem>,
-    /// environment map for car reflections (`.env` "SKY " entry, else the first)
+    /// the `.env` "SKY " entry, else the first. *(2026-09-26: no longer bound to the cars — the
+    /// specular layer draws `carcmn.fsh`'s `SPC` maps and the sky-map layer the section's, none
+    /// outside a section; `RE/notes/lighting.md` §3.1, §3.2.)*
     pub env_map: Option<nfs_renderer::TextureId>,
     pub collision: nfs_physics::collision::TriangleGrid,
     /// The collision props the loader 0x4750B0 builds from the track's tagged articles
@@ -27,29 +29,34 @@ pub struct TrackWorld {
     /// The `.map` `ambient`'s mean, clamped 0.2…0.9 — the port's scene ambient for an item that
     /// has no light of its own. APPROXIMATION: not the original's; the track's own items no longer
     /// take it ([`TRACK_LIGHT`]), nor the sky (`Sky::draw_items`, `RE/notes/thrash.md` §6d.5). What
-    /// is left on it in a race: the car's cockpit glass (`CarModel::window`) and the cars' blob
-    /// shadows (0x43B820), whose draws' layers are not read here.
+    /// is left on it in a race: the cars' blob shadows (0x43B820), whose draws' layers are not read
+    /// here.
     pub ambient: f32,
     /// The `.map` header's five light colours (`RE/notes/lighting.md`).
     pub map_light: MapLight,
     /// The way the sun's light travels, `−normalize(SkyBin::sun_position)` (0x43AC8D…0x43AD36);
     /// straight down when the track has no sky configuration.
     pub sun_direction: Vec3,
-    /// The mission scene's smackables — every GEOM element whose `animdefs.txt` definition says
-    /// `kSmackable` (0x4772F0's `def+0x10 == 3`), with what their car records are built from
-    /// (`nfs_physics::smackable`). The skill test's cones.
+    /// The race's smackables in `[WTrack+0x34]` order (0x4888B0): the mission scene's GEOM
+    /// elements whose `animdefs.txt` definition says `kSmackable` (0x4772F0's `def+0x10 == 3`) —
+    /// the skill test's cones — then the track's own placed `kSmackable` articles (signs,
+    /// hydrants, pipes, sawhorses …), at most 125 in all (0x488926), with what their car records
+    /// are built from (`nfs_physics::smackable`, `crate::smackables`).
     pub smackables: Vec<SmackableSpawn>,
-    /// The draw items a smackable's body carries: by element, the inverse of its authored pose and
+    /// The draw items a smackable's body carries: by owner, the inverse of its authored pose and
     /// each item with its authored transform ([`Self::place_smackable`]).
-    moved: HashMap<usize, (Mat4, Vec<(usize, Mat4)>)>,
+    moved: HashMap<SmackableOwner, (Mat4, Vec<(usize, Mat4)>)>,
+    /// The track smackables' side of the anim world (`suspension-collision.md` §9 "The track's
+    /// smackables"): each one's player state and record `+8`.
+    smack_anims: Vec<SmackAnim>,
     /// `.map` sections, and every `.env` entry by its SHPI name (`RE/notes/lighting.md` §3).
     pub map_sections: Vec<MapSection>,
     env_by_id: HashMap<u32, nfs_renderer::TextureId>,
     /// Props whose article carries an `Anim` / `Anqt` track and whose `animdefs.txt` definition
     /// loops it (`RE/notes/crp-geometry.md` §7). The shipped file loops exactly two — the two
-    /// dockers — every other animation there is played on impact — the breakables below, and
-    /// what the smackables would play, which the port does not (only a mission scene's
-    /// smackables are bodies, `nfs_physics::smackable`, and none of those animates).
+    /// dockers — every other animation there is played on impact: the breakables below. (The
+    /// smackables are car records whose player only follows the body, 0x471180 — none of their
+    /// definitions has pieces.)
     animated: Vec<AnimatedProp>,
     /// The breakable props drawn in the world, with their pieces once a car has started them.
     broken: Vec<BrokenProp>,
@@ -62,11 +69,550 @@ pub struct TrackWorld {
     /// — and the one texture every shipped one names (`sh80`), uploaded.
     pub projectors: Vec<Projector>,
     pub projector_texture: Option<nfs_renderer::TextureId>,
+    /// Which projectors are in the map `[0x627DFC]`: 0x450DBD → 0x456090 puts one there when its
+    /// article draws, and nothing takes it out before the track is unloaded (0x455FF0 ← 0x46912C).
+    projector_registered: Vec<bool>,
+    /// By `.crp` article index, the track walk's view of every placed article ([`CullArticle`],
+    /// `RE/RENDERING.md` "The track draw's culling").
+    pub cull_articles: Vec<Option<CullArticle>>,
+    /// The track's own geometry, one entry per placed article (the breakables' apart), each LOD's
+    /// draw items uploaded — what the walk's draw picks from per frame ([`Self::visible_items`]).
+    /// *(Until 2026-09-26 every article's lowest LOD was merged per material into a few hundred
+    /// meshes and clipped by the far plane alone.)*
+    pub track_lods: Vec<TrackArticleGpu>,
+    /// The `Vis ` segments the walk's occlusion test 0x488B50 uses.
+    pub occluders: Vec<Occluder>,
+    /// The instance drawer's items outside [`Self::cull_articles`]: one per breakable
+    /// (`WInstanceBundle`'s item, drawn apart so that its pieces can replace it) and one per `.scn`
+    /// GEOM instance (`WSceneBundle`'s slot) — the walk answers them after the articles
+    /// ([`Self::article_draws`]).
+    instance_culls: Vec<InstanceCull>,
+    /// Per item of [`Self::items`]: the [`Self::instance_culls`] entry it belongs to and the LOD
+    /// number its meshes are of — drawn only when the walk answers that entry with that LOD.
+    item_cull: Vec<Option<(usize, u8)>>,
+    /// The kind-2 `ef` parts of the `.scn` GEOM instances' library articles, each with its
+    /// [`Self::instance_culls`] entry and in the article's own frame: the scene drawer's 0x450380
+    /// runs them (0x450883 → 0x451940) under the matrix it pushed for the item (0x450465…0x450477),
+    /// within the LOD's part range — [`Self::running_flares`].
+    instance_flares: Vec<(usize, TrackFlare)>,
+}
+
+/// An item of the instance drawer 0x5B3CB8 the port keeps apart from the `.crp` placement: its
+/// article's `Base` sphere in the article's own frame and its LOD records (0x4786A0 / 0x450010 —
+/// the LOD from the item's own article, the cursor 0x477C30); `first_item` is the draw item whose
+/// transform is slot 5's matrix.
+#[derive(Debug, Clone)]
+struct InstanceCull {
+    centre: Vec3,
+    radius: f32,
+    lods: Vec<CullLod>,
+    first_item: usize,
+    /// a breakable's [`TrackWorld::broken`] index: its matrix and, once its pieces play, its
+    /// article come from there
+    broken: Option<usize>,
+}
+
+/// The drawer an article reaches the track walk 0x47F890 through. `WTrack::load` builds the
+/// bundles Scene, Instance, Anim, MidGround, Static over one article array and the last four each
+/// take theirs out of it: `WInstanceBundle` every article with a `tr` (0x47859E), `WAnimBundle` an
+/// `Anqt` one, `WMidGroundBundle` `Base & 0x6000`, `WStaticBundle` the rest
+/// (`RE/RENDERING.md` "The track draw's culling").
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ArticleDrawer {
+    /// `WStaticBundle`'s drawer 0x5B3CF0: every `ef` part of the article goes to 0x450D10.
+    Static,
+    /// `WMidGroundBundle`'s, the same drawer: its sphere's radius `max(2.25·r, 200)` (0x47CF00)
+    /// and its band — **600** for `Base & 0x2000` (the ref flag 0x400000), else **700** (0x20)
+    /// (0x47CE72…0x47CE8E; 0x47FA08 / 0x47FA3D).
+    MidGround { band: f32 },
+    /// `WInstanceBundle`'s drawer 0x5B3CB8 — slot 3 is `ret 8`, so only its draw 0x450380 runs
+    /// `ef` parts: kind 2, within the chosen LOD's part range (0x450819 → 0x451940).
+    Instance,
+    /// `WAnimBundle`'s, the same drawer as the instances'.
+    Anim,
+}
+
+/// One LOD record of `Base+0x64`: its switch distance `+0xA`, its byte `+1` (the `ef` parts run),
+/// its part range `+4…+6` and the LOD number `+8` its `pr` parts carry (`crp-geometry.md` §2.1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CullLod {
+    pub distance: u16,
+    pub effects: bool,
+    pub first: u16,
+    pub last: u16,
+    pub lod: u8,
+}
+
+/// A placed article as the walk sees it: its drawer and the sphere the drawer answers (the
+/// bundle's slot 3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CullArticle {
+    /// the article's `Name` (diagnostics)
+    pub name: String,
+    pub drawer: ArticleDrawer,
+    pub centre: Vec3,
+    pub radius: f32,
+    pub lods: Vec<CullLod>,
+}
+
+/// A placed article's uploaded LODs: by LOD number, the draw items (one per `pr` part, in the
+/// file's order) at the article's own transform.
+#[derive(Debug, Clone)]
+pub struct TrackArticleGpu {
+    /// the `.crp` article index — [`TrackWorld::cull_articles`]'s
+    pub article: usize,
+    pub lods: Vec<(u8, Vec<DrawItem>)>,
+    /// per entry of [`Self::lods`], per draw item: its part's flag word and sphere centre in the
+    /// world — what the static drawer queues it by ([`TrackWorld::visible_items`])
+    pub parts: Vec<Vec<(u16, Vec3)>>,
+}
+
+/// The view's draw lists `[cam+0x54]` (built by 0x466380) that the track's drawers file into,
+/// in the order the flush 0x466660 draws them (`RE/RENDERING.md` "The view's lists").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ViewList {
+    /// `+4` (0x4668F0): ascending by key, under the alpha test `GREATER 10` (0x46666D) — the parts
+    /// with `pr` flag 2
+    Near,
+    /// `+0xC` (0x466A90): descending by key, `GREATER 10` again (0x466703) — the parts with flag 1
+    /// (and flag 4 while `[0x6197E6]`), the instance drawer's whole items (0x44FFC0) and the cars
+    /// (0x443229)
+    Far,
+}
+
+/// 0x450F30…0x450F9B: the list a static / mid-ground drawer's part goes to by its `pr` flag word
+/// (`[part] >> 16`): 2 → `+4`, else 1 → `+0xC`, else 0x10 → `+8` (no shipped track part carries
+/// it: `nfs-game/examples/prflags.rs`), else 4 → `+0xC` while `[0x6197E6]` (`SPECIALFX` ≥ 2 and
+/// `[0x6197B0]` ≠ 0xE — taken as set, as for the projectors), else none: the part is not drawn.
+fn part_list(flags: u16) -> Option<ViewList> {
+    if flags & 2 != 0 {
+        Some(ViewList::Near)
+    } else if flags & 1 != 0 || flags & 4 != 0 {
+        Some(ViewList::Far)
+    } else {
+        None
+    }
+}
+
+/// One `Vis ` segment as 0x487330 keeps it: `raised = a.y ≠ 0`, the start and the delta in xz,
+/// `len²` and `1/len²`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Occluder {
+    pub raised: bool,
+    pub a: [f32; 2],
+    pub d: [f32; 2],
+    pub len2: f32,
+    pub inv_len2: f32,
+}
+
+/// The view the walk culls with: the eye and the camera's axes, the tangents of the horizontal and
+/// vertical half-angles, the near plane and the draw distance `[0x6197CC]` (the view's `+0x124`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CullView {
+    pub eye: Vec3,
+    pub forward: Vec3,
+    pub right: Vec3,
+    pub up: Vec3,
+    pub tan_h: f32,
+    pub tan_v: f32,
+    pub near: f32,
+    pub draw: f32,
+}
+
+/// An article the walk draws this frame: the LOD its drawer picks and the value the walk hands the
+/// drawer, rounded as the render queue carries it (`fistp`, 0x44FFC9 / 0x45101E) — the effect
+/// system's `+0x10` (0x4551BF).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArticleDraw {
+    pub lod: usize,
+    pub value: f32,
+}
+
+/// The 3-D camera's far plane as the frustum test 0x539480 has it (`[+0x1EC]`): taken as the
+/// projection's **700** (`RE/notes/thrash.md` §6) — MEDIUM, its writer is not traced.
+pub const FRUSTUM_FAR: f32 = 700.0;
+
+/// The image's square root, `(bits >> 1) + 0x1FC00000` (0x47F347, 0x47FA72).
+fn bit_root(x: f32) -> f32 {
+    f32::from_bits(((x.to_bits() as i32 >> 1) + 0x1FC0_0000) as u32)
+}
+
+/// 0x489CC0: whether the xz segments `p0 → p1` and `q0 → q1` cross — both parameters in [0, 1],
+/// a zero denominator none.
+fn segments_cross(p0: [f32; 2], p1: [f32; 2], q0: [f32; 2], q1: [f32; 2]) -> bool {
+    let r = [p1[0] - p0[0], p1[1] - p0[1]];
+    let s = [q1[0] - q0[0], q1[1] - q0[1]];
+    let den = r[0] * s[1] - r[1] * s[0];
+    if den == 0.0 {
+        return false;
+    }
+    let w = [q0[0] - p0[0], q0[1] - p0[1]];
+    let t = (w[0] * s[1] - w[1] * s[0]) / den;
+    let u = (w[0] * r[1] - w[1] * r[0]) / den;
+    (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u)
+}
+
+impl CullView {
+    /// 0x539480 for a perspective camera: the centre in view space (looking down −z), then the
+    /// near / far pair and the two side pairs, each pair taken by the sign of its first form.
+    /// The tangents and cosines `[+0xF8…+0x104]` are the port's own frustum's (MEDIUM).
+    fn sphere_visible(&self, c: Vec3, r: f32) -> bool {
+        let rel = c - self.eye;
+        let depth = rel.dot(self.forward);
+        let a = self.near - depth;
+        if a > 0.0 {
+            if a > r {
+                return false;
+            }
+        } else if depth - FRUSTUM_FAR > r {
+            return false;
+        }
+        for (x, t) in [(rel.dot(self.right), self.tan_h), (rel.dot(self.up), self.tan_v)] {
+            let cos = 1.0 / (1.0 + t * t).sqrt();
+            let p = x - depth * t;
+            if p > 0.0 {
+                if p * cos > r {
+                    return false;
+                }
+            } else {
+                let q = x + depth * t;
+                if q < 0.0 && -q * cos > r {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// 0x47F550's footprint: the eye and the four far corners `(±t·far, ±0.75·t·far, far)`
+    /// (0x47F210) dropped on the ground; their bounds' centre and the largest `dx² + dz²` from it
+    /// (the hull 0x5A0480 keeps the extremes, so its answer is theirs).
+    fn footprint(&self) -> ([f32; 2], f32) {
+        let (t, far) = (self.tan_h, self.draw);
+        let mut pts = vec![self.eye];
+        for sx in [-1.0, 1.0] {
+            for sy in [-1.0, 1.0] {
+                pts.push(self.eye + self.forward * far + self.right * (sx * t * far) + self.up * (sy * 0.75 * t * far));
+            }
+        }
+        let (mut lo, mut hi) = ([1e9f32; 2], [-1e9f32; 2]);
+        for p in &pts {
+            lo = [lo[0].min(p.x), lo[1].min(p.z)];
+            hi = [hi[0].max(p.x), hi[1].max(p.z)];
+        }
+        let c = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5];
+        let r2 = pts.iter().map(|p| (p.x - c[0]).powi(2) + (p.z - c[1]).powi(2)).fold(0.0, f32::max);
+        (c, r2)
+    }
+}
+
+impl Occluder {
+    /// 0x4873B0: 1 (true) when the square distance from `c` to the segment passes `r2`.
+    fn far_from(&self, c: [f32; 2], r2: f32) -> bool {
+        let (px, pz) = (c[0] - self.a[0], c[1] - self.a[1]);
+        let t = (px * self.d[0] + pz * self.d[1]) * self.inv_len2;
+        let (ex, ez) = (px - t * self.d[0], pz - t * self.d[1]);
+        let along = if t >= 1.0 {
+            (t - 1.0) * (t - 1.0) * self.len2
+        } else if t > 0.0 {
+            0.0
+        } else {
+            t * t * self.len2
+        };
+        ex * ex + ez * ez + along > r2
+    }
+}
+
+/// One item of the walk 0x47F890 past the node pass: the sphere through the frustum (0x539480),
+/// the `Vis ` occlusion (0x488B50 over the near segments; a mid-ground item only the raised ones),
+/// the distance and the drawer's LOD (see [`TrackWorld::article_draws`]).
+fn walk_item(v: &CullView, near: &[&Occluder], drawer: ArticleDrawer, centre: Vec3, radius: f32, lods: &[CullLod]) -> Option<ArticleDraw> {
+    if !v.sphere_visible(centre, radius) {
+        return None;
+    }
+    let mid = matches!(drawer, ArticleDrawer::MidGround { .. });
+    let (eye, c) = ([v.eye.x, v.eye.z], [centre.x, centre.z]);
+    if near.iter().any(|o| (!mid || o.raised) && segments_cross([o.a[0], o.a[1]], [o.a[0] + o.d[0], o.a[1] + o.d[1]], eye, c)) {
+        return None;
+    }
+    let d2 = (centre - v.eye).length_squared();
+    let value = match drawer {
+        ArticleDrawer::MidGround { band } => (d2 < band * band).then_some(d2)?,
+        _ => {
+            let s = (bit_root(d2) - radius).max(0.0);
+            (s * s < v.draw * v.draw).then_some(s * s)?
+        }
+    };
+    let rounded = value.round_ties_even();
+    let key = match drawer {
+        ArticleDrawer::Static | ArticleDrawer::MidGround { .. } => value.trunc() as f64,
+        ArticleDrawer::Instance | ArticleDrawer::Anim => rounded as f64,
+    };
+    let lod = lods.iter().position(|l| key < (l.distance as f64) * (l.distance as f64))?;
+    Some(ArticleDraw { lod, value: rounded })
+}
+
+impl TrackWorld {
+    /// The track walk 0x47F890 for the `ef`-bearing articles, by `.crp` article index: the drawer's
+    /// sphere through the frustum (0x539480), the `Vis ` occlusion (0x488B50 over the segments
+    /// 0x488B00 keeps near the footprint), the distance — a mid-ground article's `d² < band²`
+    /// drawn with `d²`, any other's `s² < draw²` with `s = max(√d² − r, 0)` — and the drawer's LOD:
+    /// the first record with `trunc(v) < distance²` (0x450E36; the instance drawer's `v` comes
+    /// rounded through the queue), none = not drawn.
+    ///
+    /// APPROXIMATION: the node pass 0x47F400 is not carried (the fitted tree is not built); it only
+    /// takes out items whose nodes all lie outside the ground wedge or the far circle, so this set is
+    /// the original's or more (`RE/RENDERING.md` "The track draw's culling").
+    ///
+    /// After the `.crp` articles come the instance drawer's items the port keeps apart, at
+    /// `cull_articles.len() + k` in [`Self::instance_culls`] order: the `.scn` GEOM instances
+    /// (`WSceneBundle`'s items — not `bl` items, 0x4892F0, so the ordinary occlusion and distance
+    /// rule) and the breakables (`WInstanceBundle`'s), their spheres from this frame's matrices
+    /// ([`Self::instance_sphere`]; `RE/RENDERING.md` "The instance and scene items").
+    pub fn article_draws(&self, v: &CullView) -> Vec<Option<ArticleDraw>> {
+        let (fc, fr2) = v.footprint();
+        let near: Vec<&Occluder> = self.occluders.iter().filter(|o| !o.far_from(fc, fr2)).collect();
+        let articles = self.cull_articles.iter().map(|a| {
+            let a = a.as_ref()?;
+            walk_item(v, &near, a.drawer, a.centre, a.radius, &a.lods)
+        });
+        let instances = self.instance_culls.iter().map(|ic| {
+            let (c, r) = self.instance_sphere(ic)?;
+            walk_item(v, &near, ArticleDrawer::Instance, c, r, &ic.lods)
+        });
+        articles.chain(instances).collect()
+    }
+
+    /// 0x4786A0 for an item of [`Self::instance_culls`]: its article's `Base` sphere through slot
+    /// 5's matrix (0x4780C0 / 0x4828A0) — the centre transformed, the radius the largest component
+    /// of `M·(r, r, r) − M.t`. A GEOM instance's matrix is its first draw item's: the placement,
+    /// with the looping animation or the smackable's body pose folded in (slot 5's `lead sample ×
+    /// instance`, 0x4769E0). A breakable's is its `tr` while whole; once its pieces play, the
+    /// first started piece's `Base` (the record's entry 0, 0x4786EC…0x478710) through `lead sample
+    /// × tr` — the player's own radius (slot 8, 0x471150) is 0.
+    fn instance_sphere(&self, ic: &InstanceCull) -> Option<(Vec3, f32)> {
+        let (m, c, r) = match ic.broken {
+            Some(k) => {
+                let b = self.broken.get(k)?;
+                match (&b.state, b.players.first()) {
+                    (BreakState::Playing { .. }, Some(pl)) => {
+                        let (c, r) = b.templates.get(pl.template).and_then(|t| t.base).unwrap_or((ic.centre, ic.radius));
+                        (b.instance * b.lead.unwrap_or(Mat4::IDENTITY), c, r)
+                    }
+                    _ => (b.instance, ic.centre, ic.radius),
+                }
+            }
+            None => (self.items.get(ic.first_item)?.transform, ic.centre, ic.radius),
+        };
+        Some((m.transform_point3(c), m.transform_vector3(Vec3::splat(r)).max_element()))
+    }
+
+    /// Whether the `ef` part `part` of kind `kind` of article `article` runs this frame, and with
+    /// what value: the article is drawn, its LOD's byte `+1` is set, and its drawer runs that kind —
+    /// the static / mid-ground drawer every part through 0x450D10; the instance / anim drawer kind 2
+    /// (0x450883) within the LOD's part range (0x450819), and kind 3 only through 0x450980 on the
+    /// animated branch of 0x450010 (0x45023D: the anim world's record `+8` set): from the first
+    /// frame after a crate's pieces start or a smackable is pushed 1 cm off its place, **every
+    /// drawn frame for the rest of the race** — `+8` is kept while the lead's state is 1 or 2
+    /// (0x476810) and cleared only by the race start's reset 0x476170 (`suspension-collision.md`
+    /// §9 "The track's smackables"). Every shipped kind-3 part on a `tr` article sits on a `BBOX` /
+    /// `HYDR` / `PSTV` / `TRSH` prop (`nfs-game/examples/ef3anim.rs`). *(Corrected 2026-09-26:
+    /// the earlier reading ran it on the start frame alone, "once per hit" — 0x4761FC, taken for
+    /// the clear, is in the race-start reset; and until that day kind 3 ran on every drawn frame of
+    /// such an article, as kind 2 does, whether struck or not.)* A track smackable's article is
+    /// drawn apart, so the walk's answer is its instance entry's (its sphere through the body's
+    /// pose, 0x4786A0). APPROXIMATION: the value is the walk's, where 0x450980 reads the view's
+    /// `+0xC` (its first argument) — the same distance, not traced to its writer.
+    pub fn effect_runs(&self, draws: &[Option<ArticleDraw>], article: usize, part: u16, kind: u32) -> Option<f32> {
+        self.effect_run(draws, article, part, kind).map(|(v, _)| v)
+    }
+
+    /// [`Self::effect_runs`] with the trigger: `true` when the part goes through 0x450980, which
+    /// hands the system's slot 3 (0x454420: emitting, period tick 0) the record's `+4` — 1 from
+    /// the start on (0x476868), so every drawn frame (0x450B25…0x450B2F).
+    pub fn effect_run(&self, draws: &[Option<ArticleDraw>], article: usize, part: u16, kind: u32) -> Option<(f32, bool)> {
+        let apart = self.smack_anims.iter().find(|a| a.article == article).and_then(|a| a.slot);
+        let (d, lod, drawer) = match apart {
+            Some(slot) => {
+                let d = draws.get(self.cull_articles.len() + slot).copied().flatten()?;
+                (d, *self.instance_culls.get(slot)?.lods.get(d.lod)?, ArticleDrawer::Instance)
+            }
+            None => {
+                let d = draws.get(article).copied().flatten()?;
+                let a = self.cull_articles.get(article)?.as_ref()?;
+                (d, *a.lods.get(d.lod)?, a.drawer)
+            }
+        };
+        if !lod.effects {
+            return None;
+        }
+        match drawer {
+            ArticleDrawer::Static | ArticleDrawer::MidGround { .. } => Some((d.value, false)),
+            ArticleDrawer::Instance | ArticleDrawer::Anim => {
+                if !(lod.first..=lod.last).contains(&part) {
+                    return None;
+                }
+                match kind {
+                    2 => Some((d.value, false)),
+                    3 => self.record_armed(article).then_some((d.value, true)),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// The anim world's record `+8` of the item whose article is `article`: set by 0x476810 once
+    /// the lead's state is 1 and kept for the race — a crate from the frame its pieces start
+    /// (the lead twin's state 1 at 0x4716E0 inside the hit, then 2, which keeps it), a track
+    /// smackable from the update after the draw that found it pushed ([`Self::smackables_sample`]).
+    fn record_armed(&self, article: usize) -> bool {
+        self.broken
+            .iter()
+            .any(|b| !matches!(b.state, BreakState::Whole) && self.props.get(b.prop).and_then(|p| p.breakable.as_ref()).is_some_and(|x| x.article == article))
+            || self.smack_anims.iter().any(|a| a.article == article && a.armed)
+    }
+
+    /// 0x476810 for the track's smackables, at the head of the frame's track draw (the prep
+    /// 0x488CC0): a record whose lead is in state 1 and whose `+8` is clear gets `rec+4 = 1` and
+    /// `rec+8` = its own article (0x476868…0x476876), and 0x4AF440 flags the nearest `Type`-1
+    /// `CAudioElem` within 5 m — a byte nothing reads, so nothing is played.
+    pub fn smackables_prep(&mut self) {
+        for a in self.smack_anims.iter_mut().filter(|a| a.state == 1 && !a.armed) {
+            a.armed = true;
+            tracing::debug!(article = a.article, position = ?a.position, "smackable's record +8 set (0x476876): its kind-3 ef parts run from this frame (0x450980)");
+        }
+    }
+
+    /// The draw's sample of each track smackable's player (0x450010's entry loop → 0x4769E0 →
+    /// 0x4711E0) for the items the walk answered this frame: once the body has moved more than
+    /// 0.01 in x or z off its record's place (0x4835B0, `[0x5B2BC0]`) the player's state turns 1
+    /// (0x47139E) — for good, until the race's reset.
+    pub fn smackables_sample(&mut self, draws: &[Option<ArticleDraw>]) {
+        let n = self.cull_articles.len();
+        for a in self.smack_anims.iter_mut().filter(|a| a.state != 1) {
+            let Some(slot) = a.slot else { continue };
+            if draws.get(n + slot).copied().flatten().is_none() {
+                continue;
+            }
+            if (a.home.x - a.position.x).abs() > 0.01 || (a.home.z - a.position.z).abs() > 0.01 {
+                a.state = 1;
+                tracing::debug!(article = a.article, moved = ?(a.position - a.home), "smackable pushed off its place: its player's state 1 (0x4711E0 / 0x4835B0)");
+            }
+        }
+    }
+
+    /// Diagnostic: the `k`-th track smackable's article, its place (where its particle systems
+    /// are) and its body's position now.
+    pub fn track_smackable(&self, k: usize) -> Option<(usize, Vec3, Vec3)> {
+        self.smack_anims.get(k).map(|a| (a.article, a.home, a.position))
+    }
+
+    /// Diagnostic: the `k`-th scene instance flare's point and direction in world space, whether it
+    /// runs or not.
+    pub fn instance_flare(&self, k: usize) -> Option<(Vec3, Vec3)> {
+        let (slot, f) = self.instance_flares.get(k)?;
+        let m = self.items.get(self.instance_culls.get(*slot)?.first_item)?.transform;
+        Some((m.transform_point3(f.position), m.transform_vector3(f.direction)))
+    }
+
+    /// The flares that run this frame, in world space: the placed articles' ([`Self::flares`],
+    /// through [`Self::effect_runs`]) and the `.scn` GEOM instances' — the scene drawer's 0x450380
+    /// runs an instance's kind-2 parts only when the walk answers its entry, the LOD's byte `+1` is
+    /// set and the part lies in the LOD's range `+4…+6` (0x4507F4…0x450819, 0x450883), and 0x451940
+    /// takes the part's point and direction through the matrix 0x450380 pushed for the item
+    /// (0x450465…0x450477 — slot 5's, the looping animation or the smackable's pose folded in as for
+    /// its draw items; the stack top at 0x451A0C…0x451A36). A hidden mission element is not drawn
+    /// (its sphere is 10000 below the view in the original, 0x482E50), so neither are its flares.
+    pub fn running_flares(&self, draws: &[Option<ArticleDraw>]) -> Vec<TrackFlare> {
+        let n = self.cull_articles.len();
+        let placed = self.flares.iter().filter(|f| self.effect_runs(draws, f.article, f.part, 2).is_some()).cloned();
+        let instances = self.instance_flares.iter().filter_map(|(slot, f)| {
+            let d = draws.get(n + slot).copied().flatten()?;
+            let ic = self.instance_culls.get(*slot)?;
+            let lod = ic.lods.get(d.lod)?;
+            if !lod.effects || !(lod.first..=lod.last).contains(&f.part) {
+                return None;
+            }
+            if self.item_element.get(ic.first_item).copied().flatten().is_some_and(|e| self.hidden.contains(&e)) {
+                return None;
+            }
+            let m = self.items.get(ic.first_item)?.transform;
+            Some(TrackFlare { position: m.transform_point3(f.position), direction: m.transform_vector3(f.direction), ..f.clone() })
+        });
+        placed.chain(instances).collect()
+    }
+}
+
+/// The `Vis ` level record's segments (loader 0x488A60 → 0x487330): `b` records of two vec3.
+pub fn track_occluders(track: &TrackAssets) -> Vec<Occluder> {
+    let Some(e) = track.crp.level.iter().find(|e| e.is_level(b"Vis ")) else { return Vec::new() };
+    let nfs_formats::crp::CrpEntry::Level { b: count, .. } = e else { return Vec::new() };
+    let Ok(d) = track.crp.entry_data(&track.crp_data, e) else { return Vec::new() };
+    let f = |o: usize| f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+    (0..*count as usize)
+        .take_while(|i| (i + 1) * 24 <= d.len())
+        .map(|i| {
+            let o = i * 24;
+            let (a, b) = (Vec3::new(f(o), f(o + 4), f(o + 8)), Vec3::new(f(o + 12), f(o + 16), f(o + 20)));
+            let dd = [b.x - a.x, b.z - a.z];
+            let len2 = dd[0] * dd[0] + dd[1] * dd[1];
+            Occluder { raised: a.y != 0.0, a: [a.x, a.z], d: dd, len2, inv_len2: 1.0 / len2 }
+        })
+        .collect()
+}
+
+/// Every placed article that carries `ef` parts, by `.crp` article index, with its drawer, the
+/// drawer's sphere and its LOD records. The sphere: `Base+0x2C…` and `Base+0x3C` (0x477DB0); for an
+/// instance through its `tr` — the centre transformed, the radius the largest component of
+/// `M·(r, r, r)` (0x4786A0 — its player's own radius, slot 8 0x471150, is 0);
+/// the mid-ground's `max(2.25·r, 200)` (0x47CF00). APPROXIMATION: an anim article's sphere is
+/// `Base`'s untransformed (the port does not animate them).
+pub fn cull_articles(track: &TrackAssets) -> Vec<Option<CullArticle>> {
+    let Ok(arts) = track.crp.articles(&track.crp_data) else { return Vec::new() };
+    arts.iter()
+        .map(|a| {
+            let g = track.crp.article_geometry(&track.crp_data, a).ok()?;
+            let base = g.base.as_ref()?;
+            if base.is_library() {
+                return None;
+            }
+            let (centre, r, lods) = article_base(track, a)?;
+            let (drawer, centre, radius) = if let Some(t) = g.transform.as_ref().map(Mat4::from_cols_array) {
+                (ArticleDrawer::Instance, t.transform_point3(centre), t.transform_vector3(Vec3::splat(r)).max_element())
+            } else if a.level(b"Anqt").is_some() {
+                (ArticleDrawer::Anim, centre, r)
+            } else if base.flags & 0x6000 != 0 {
+                (ArticleDrawer::MidGround { band: if base.flags & 0x2000 != 0 { 600.0 } else { 700.0 } }, centre, (2.25 * r).max(200.0))
+            } else {
+                (ArticleDrawer::Static, centre, r)
+            };
+            Some(CullArticle { name: g.name.clone(), drawer, centre, radius, lods })
+        })
+        .collect()
+}
+
+/// An article's `Base` sphere in its own frame — `Base+0x2C…` and `Base+0x3C` — and its LOD
+/// records `Base+0x64` (`Base+0xC` of them, 12 bytes each).
+fn article_base(track: &TrackAssets, a: &nfs_formats::crp::Article) -> Option<(Vec3, f32, Vec<CullLod>)> {
+    let g = track.crp.article_geometry(&track.crp_data, a).ok()?;
+    let base = g.base.as_ref()?;
+    let bytes = track.crp.entry_data(&track.crp_data, a.level(b"Base")?).ok()?;
+    let lods = (0..base.lod_count as usize)
+        .map_while(|i| {
+            let o = 100 + 12 * i;
+            let w = |k: usize| u16::from_le_bytes([bytes[o + k], bytes[o + k + 1]]);
+            (o + 12 <= bytes.len()).then(|| CullLod { distance: w(10), effects: bytes[o + 1] != 0, first: w(4), last: w(6), lod: w(8) as u8 })
+        })
+        .collect();
+    Some((Vec3::from(base.centre), base.radius, lods))
 }
 
 /// One kind-4 `ef` part: its sixteen floats from `+8`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Projector {
+    /// the `.crp` index of the article carrying it, and the part's own index
+    pub article: usize,
+    pub part: u16,
     /// `[0…2]`, `[3]`
     pub point: Vec3,
     pub radius: f32,
@@ -80,10 +626,11 @@ pub struct Projector {
 impl TrackWorld {
     /// 0x456160: the projector nearest to `pos` by `max(|dx|, |dz|) + 0.25 · min(|dx|, |dz|)`,
     /// below the running best from **400** and below its radius + 2.5.
+    /// Only the registered ones are candidates ([`Self::register_projectors`]).
     pub fn projector_for(&self, pos: Vec3) -> Option<&Projector> {
         let mut best = 400.0f32;
         let mut found = None;
-        for p in &self.projectors {
+        for (p, _) in self.projectors.iter().zip(&self.projector_registered).filter(|(_, r)| **r) {
             let (dx, dz) = ((pos.x - p.point.x).abs(), (pos.z - p.point.z).abs());
             let d = dx.max(dz) + 0.25 * dx.min(dz);
             if d < best && d < p.radius + 2.5 {
@@ -93,6 +640,16 @@ impl TrackWorld {
         }
         found
     }
+
+    /// 0x450D10's kind 4 for this frame's draws: a projector whose article the walk draws goes
+    /// into the map `[0x627DFC]` (0x456090) and stays there. `[0x6197E6]` is taken as set.
+    pub fn register_projectors(&mut self, draws: &[Option<ArticleDraw>]) {
+        for k in 0..self.projectors.len() {
+            if !self.projector_registered[k] && self.effect_runs(draws, self.projectors[k].article, self.projectors[k].part, 4).is_some() {
+                self.projector_registered[k] = true;
+            }
+        }
+    }
 }
 
 /// The kind-4 `ef` parts of every placed article. The planes are taken as the file has them: the
@@ -101,7 +658,7 @@ impl TrackWorld {
 pub fn track_projectors(track: &TrackAssets) -> Vec<Projector> {
     let mut out = Vec::new();
     let Ok(arts) = track.crp.articles(&track.crp_data) else { return out };
-    for a in &arts {
+    for (article, a) in arts.iter().enumerate() {
         let Ok(g) = track.crp.article_geometry(&track.crp_data, a) else { continue };
         if g.base.as_ref().is_some_and(|b| b.is_library()) {
             continue;
@@ -117,6 +674,8 @@ pub fn track_projectors(track: &TrackAssets) -> Vec<Projector> {
                 f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
             };
             out.push(Projector {
+                article,
+                part: p.part_index(),
                 point: tr.transform_point3(Vec3::new(f(0), f(1), f(2))),
                 radius: f(3),
                 u: [f(6), f(7), f(8), f(10)],
@@ -132,6 +691,10 @@ pub fn track_projectors(track: &TrackAssets) -> Vec<Projector> {
 /// transform.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackFlare {
+    /// the `.crp` index of the article carrying it, and the part's own index (the instance drawer
+    /// runs only the parts of its LOD's range)
+    pub article: usize,
+    pub part: u16,
     /// `+0…+8`
     pub position: Vec3,
     /// `+0x10…+0x18` — what the draw turns towards the camera for its angle (0x451A0C…0x451A90)
@@ -147,7 +710,7 @@ pub struct TrackFlare {
 pub fn track_emitters(track: &TrackAssets) -> Vec<crate::track_particles::Emitter> {
     let mut out = Vec::new();
     let Ok(arts) = track.crp.articles(&track.crp_data) else { return out };
-    for a in &arts {
+    for (article, a) in arts.iter().enumerate() {
         let Ok(g) = track.crp.article_geometry(&track.crp_data, a) else { continue };
         if g.base.as_ref().is_some_and(|b| b.is_library()) {
             continue;
@@ -160,6 +723,8 @@ pub fn track_emitters(track: &TrackAssets) -> Vec<crate::track_particles::Emitte
             }
             let f = |o: usize| f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
             out.push(crate::track_particles::Emitter {
+                article,
+                part: p.part_index(),
                 position: tr.transform_point3(Vec3::new(f(8), f(0xC), f(0x10))),
                 dir_a: tr.transform_vector3(Vec3::new(f(0x18), f(0x1C), f(0x20))),
                 dir_b: tr.transform_vector3(Vec3::new(f(0x24), f(0x28), f(0x2C))),
@@ -171,43 +736,55 @@ pub fn track_emitters(track: &TrackAssets) -> Vec<crate::track_particles::Emitte
 }
 
 /// The kind-2 `ef` parts of every placed article (library articles are drawn only through
-/// scenes; 0x450D10 runs for `RDrawArticleBundle`, the placed ones).
+/// scenes — [`TrackWorld::running_flares`]; 0x450D10 runs for `RDrawArticleBundle`, the placed ones).
 pub fn track_flares(track: &TrackAssets) -> Vec<TrackFlare> {
     let mut out = Vec::new();
     let Ok(arts) = track.crp.articles(&track.crp_data) else { return out };
-    for a in &arts {
+    for (article, a) in arts.iter().enumerate() {
         let Ok(g) = track.crp.article_geometry(&track.crp_data, a) else { continue };
         if g.base.as_ref().is_some_and(|b| b.is_library()) {
             continue;
         }
         let tr = g.transform.as_ref().map(Mat4::from_cols_array).unwrap_or(Mat4::IDENTITY);
-        for p in a.parts.iter().filter(|p| p.is_part(b"ef")) {
-            let Ok(d) = track.crp.entry_data(&track.crp_data, p) else { continue };
-            if d.len() < 0x2C || u32::from_le_bytes([d[0], d[1], d[2], d[3]]) != 2 {
-                continue;
-            }
-            let f = |o: usize| f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
-            let w = |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
-            out.push(TrackFlare {
-                position: tr.transform_point3(Vec3::new(f(8), f(0xC), f(0x10))),
-                direction: tr.transform_vector3(Vec3::new(f(0x18), f(0x1C), f(0x20))),
-                id: w(0x24),
-                phase: w(0x28),
-            });
+        out.extend(article_flares(track, article, a, tr));
+    }
+    out
+}
+
+/// The kind-2 `ef` parts of one article, their data from `+8` through `tr`.
+fn article_flares(track: &TrackAssets, article: usize, a: &nfs_formats::crp::Article, tr: Mat4) -> Vec<TrackFlare> {
+    let mut out = Vec::new();
+    for p in a.parts.iter().filter(|p| p.is_part(b"ef")) {
+        let Ok(d) = track.crp.entry_data(&track.crp_data, p) else { continue };
+        if d.len() < 0x2C || u32::from_le_bytes([d[0], d[1], d[2], d[3]]) != 2 {
+            continue;
         }
+        let f = |o: usize| f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+        let w = |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+        out.push(TrackFlare {
+            article,
+            part: p.part_index(),
+            position: tr.transform_point3(Vec3::new(f(8), f(0xC), f(0x10))),
+            direction: tr.transform_vector3(Vec3::new(f(0x18), f(0x1C), f(0x20))),
+            id: w(0x24),
+            phase: w(0x28),
+        });
     }
     out
 }
 
 /// One `[sectionN]` of a track's `.map`: the slice range it covers and the six environment-map ids
-/// the car's three reflection layers take inside it, open and covered.
+/// a car's `R3DSkyMapTextureLayer` takes inside it, open and covered (`RE/notes/lighting.md` §3.2 —
+/// *corrected 2026-09-26*: these are the **sky-map** pass's textures, `[0x6115CC]+0xD0…+0xD8`; the
+/// specular layer reads `+0xDC…+0xE4`, `carcmn.fsh`'s `SPC1…SPC3`).
 ///
 /// The record is 0x48 bytes in the game (`race-logic.md` §6.4); `EnvSet::select(slice)` 0x441140 is
 /// a linear search for the first section with `startslice ≤ slice ≤ endslice` and leaves the
 /// current section **null** when none matches, and `EnvSet::texture(covered, layer)` 0x441180 reads
 /// `ids[layer + 3·covered]`. The shipped sections mark exactly the covered stretches — monaco1's
-/// (141, 244) is its tunnel — so a car reflects the section's map inside them and the default
-/// everywhere else.
+/// (141, 244) is its tunnel — so a car's sky-map pass draws inside them and **nothing** anywhere else:
+/// with no section `EnvSet::texture` answers 0 (0x4411AD), and the layer skips its pass's draw when
+/// it has no texture (0x445B86…0x445BB1).
 #[derive(Debug, Clone, Copy)]
 pub struct MapSection {
     pub start: u32,
@@ -295,10 +872,61 @@ impl MapLight {
     }
 }
 
+/// `R3DSkyMapTextureLayer`'s two planes for a car (0x445B10, `RE/notes/lighting.md` §3.2), over the
+/// world point `p` the shader makes of `normal + 3.33 · position`:
+///
+/// ```text
+/// u = ((p − o) · lat) / size          + 0.5 + 0.1 · ((o − c) · lat) / 6
+/// v = ((p − o) · fwd) · aspect / size + 0.5 +       ((o − c) · fwd) / 6
+/// ```
+///
+/// `o` is the car's `car+0x330`, copied to `[0x6115CC]+0xE8` (0x43A582); the matrix the layer uses
+/// is the object's, then the translation by `−o` (0x445CB1) and the **transposed** `car+0x3B8`
+/// frame — the slice's lateral, up and forward rows (0x43A862…0x43A8A4, `0x53A650` transposes) — of
+/// which `u` takes column 0, `v` column 2 (0x445E04…0x445E42). `1 / size` is `[0x6115CC]+4` and
+/// `aspect × 1 / size` its `+8` product (0x43A79D…0x43A7C1 from the section's `texturesize` /
+/// `aspect`, 0x4411C0 / 0x4411E0). The offsets are `+0x144` = `(o − c) · lat / 6` and `+0x148` =
+/// `(o − c) · fwd / 6` of the car's slice record (`c` its centre `+4`, 0x43A7C4…0x43A850, `[0x5B2420]`
+/// = 1/6); the layer adds `0.1 · +0x144 + 0.5` and `+0x148 + 0.5` (0x445D2C…0x445D5D).
+pub fn sky_planes(origin: Vec3, centre: Vec3, lateral: Vec3, forward: Vec3, texture_size: f32, aspect: f32) -> ([f32; 4], [f32; 4]) {
+    let k = 1.0 / texture_size;
+    let ka = aspect * k;
+    let off = origin - centre;
+    let u0 = 0.5 + 0.1 * (off.dot(lateral) / 6.0);
+    let v0 = 0.5 + off.dot(forward) / 6.0;
+    let u = lateral * k;
+    let v = forward * ka;
+    ([u.x, u.y, u.z, u0 - origin.dot(u)], [v.x, v.y, v.z, v0 - origin.dot(v)])
+}
+
+/// The three textures `RCar::load` hands the specular layer (0x441AA1…0x441B3E → 0x440940,
+/// `[0x6115CC]+0xDC + 4·bucket`), all from `CarModel/carcmn.fsh` (the pack `[0x6115E8]`, loaded
+/// from `"%scarcmn.fsh"` at 0x4437A9…0x4437E4 in both modes): `SPC1`, `SPC2`, `SPC3` in a race and
+/// **`FEDU`, `FE  `, `FESH`** in the front end — the test is `[0x65B928] != 0` (0x441AA1…0x441AB0).
+/// The shipped file has only `FESH`, `FE  `, `SPC2` and `SPC3`, so bucket 0 — a strength under
+/// 0.05 — finds no texture (0x44D36D) in either mode and draws no specular pass.
+pub fn car_specular_maps(r: &mut Renderer, paths: &nfs_assets::GamePaths, front_end: bool) -> [Option<nfs_renderer::TextureId>; 3] {
+    let path = paths.car_model_dir().join("carcmn.fsh");
+    let Ok(data) = std::fs::read(&path) else {
+        return [None; 3];
+    };
+    let Ok(pack) = nfs_assets::texture::decode_pack(&path, &data) else {
+        return [None; 3];
+    };
+    // the FourCCs 0x31/0x32/0x33435053 `SPC1…3` (0x441AB8…0x441AEA) or 0x55444546 `FEDU`,
+    // 0x20204546 `FE  `, 0x48534546 `FESH` (0x441AF7…0x441B29); names compare trimmed
+    let names = if front_end { ["FEDU", "FE", "FESH"] } else { ["SPC1", "SPC2", "SPC3"] };
+    names.map(|name| {
+        pack.iter()
+            .find(|t| t.name.trim() == name)
+            .map(|t| r.upload_texture(&TextureData { width: t.width, height: t.height, mips: t.mips.clone() }))
+    })
+}
+
 impl TrackWorld {
-    /// The environment map a car reflects at `slice`: the `.map` section covering it, layer 0, in
-    /// its covered or open variant (`RE/notes/lighting.md` §3). `None` outside every section, where
-    /// the original leaves the car on the default maps.
+    /// The sky-map texture of layer 0 at `slice`: the `.map` section covering it, in its covered or
+    /// open variant (`RE/notes/lighting.md` §3, §3.2). `None` outside every section, where the
+    /// original binds none (0x4411AD) — *corrected 2026-09-26: not "the default maps"*.
     pub fn env_for(&self, slice: u32, covered: bool) -> Option<nfs_renderer::TextureId> {
         self.env_layers_for(slice, covered)[0]
     }
@@ -311,6 +939,23 @@ impl TrackWorld {
             return [None; 3];
         };
         std::array::from_fn(|l| self.env_by_id.get(&sec.ids[l + 3 * covered as usize]).copied())
+    }
+
+    /// A car's `R3DSkyMapTextureLayer` (`RE/notes/lighting.md` §3.2), built per car as 0x43A560
+    /// does it: the section of the car's own slice (`car+8`, 0x43A71F → 0x441140), its three maps
+    /// in the open or covered variant by the car's own enclosure test (0x473330's flags `& 0xC000`,
+    /// 0x43A6E8), and the planes of [`sky_planes`] for the car's `car+0x330` (`origin`) against
+    /// that slice's record. `None` when no map is bound — no section covers the slice — where the
+    /// layer draws nothing. The caller gates it on `[0x6197CB]` (`Graphics.CarChrome` High).
+    pub fn sky_map(&self, origin: Vec3, slice: usize, record: &crate::race::Slice) -> Option<nfs_renderer::SkyMap> {
+        let sec = self.map_sections.iter().find(|s| slice as u32 >= s.start && slice as u32 <= s.end)?;
+        let covered = self.overhead_flags(origin) & 0xC000 != 0;
+        let textures: [Option<nfs_renderer::TextureId>; 3] = std::array::from_fn(|l| self.env_by_id.get(&sec.ids[l + 3 * covered as usize]).copied());
+        if textures.iter().all(Option::is_none) {
+            return None;
+        }
+        let (u, v) = sky_planes(origin, record.centre, record.lateral, record.forward, sec.texture_size, sec.aspect);
+        Some(nfs_renderer::SkyMap { textures, u, v })
     }
 
     /// The original's enclosure test (0x473330, `race-logic.md` §12): the flags word of the lowest
@@ -389,51 +1034,95 @@ impl TrackWorld {
                 let false_sort = m.and_then(|m| methods.iter().find(|r| r.name == m.render_method).map(|r| r.built_ops(0, m.op_mask).any(|o| o.class == 0x800F))).unwrap_or(false);
                 // the material's address modes, states 0x41 / 0x42 (`thrash.md` §7): 0 clamps
                 let clamp = m.map_or([false; 2], |m| m.address.map(|a| a == 0));
-                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp, lod_bias: m.map_or(0.0, |m| m.lod_bias), device_states: true, view_cull: true, depth_bias, false_sort })
+                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, sky_map: false, blend_pair: 0, clamp, lod_bias: m.map_or(0.0, |m| m.lod_bias), device_states: true, view_cull: true, depth_bias, false_sort })
             })
         };
-        // Static world: merge every article's meshes per material into one GPU mesh each
-        // (transforms baked on the CPU) — 4k draw calls → ~200.
+        // The track's own geometry: the walk 0x47F890 draws each article on its own through its
+        // drawer with the LOD the distance picks (`RE/RENDERING.md` "The track draw's culling"), so
+        // every placed article keeps its own meshes per LOD and per material, at its own transform.
+        // *(Until 2026-09-26 the lowest LODs were merged per material — a few hundred meshes clipped
+        // by the far plane alone; the original's mid-ground reaches 600 / 700 m past the draw
+        // distance and the near articles switch LOD.)*
         let props = track_props(track);
         // a breakable's own article is drawn on its own so that its pieces can replace it
         let breakable_articles: std::collections::HashSet<usize> = props.iter().filter_map(|p| p.breakable.as_ref().map(|b| b.article)).collect();
-        let mut merged: HashMap<u16, nfs_renderer::MeshData> = HashMap::new();
+        // the track's smackables (0x4772F0 over the instance bundle), after the mission scene's in
+        // `[WTrack+0x34]` and at most 125 in all (0x4888B0, 0x488926): each is a car record whose
+        // article is drawn apart, at its body's pose
+        let scene_smackables = geometry
+            .instances
+            .iter()
+            .filter(|i| i.source == 1 && geometry.library.iter().any(|a| a.tag == i.tag) && track.animdefs.lookup(i.tag).is_some_and(|d| d.collide_type == "kSmackable"))
+            .count();
+        let track_smackables: Vec<SmackableSpawn> = track_smackable_articles(track)
+            .into_iter()
+            .filter_map(|k| geometry.world.iter().find(|a| a.index == k))
+            .filter_map(|a| track_smackable_spawn(track, a))
+            .take(MAX_SMACKABLES.saturating_sub(scene_smackables))
+            .collect();
+        let smackable_articles: std::collections::HashSet<usize> = track_smackables
+            .iter()
+            .filter_map(|s| match s.owner {
+                SmackableOwner::Article(k) => Some(k),
+                SmackableOwner::Element(_) => None,
+            })
+            .collect();
+        let mut track_lods: Vec<TrackArticleGpu> = Vec::new();
         for art in &geometry.world {
-            if breakable_articles.contains(&art.index) {
+            if breakable_articles.contains(&art.index) || smackable_articles.contains(&art.index) {
                 continue;
             }
-            for mm in &art.meshes {
-                let dst = merged.entry(mm.material).or_default();
-                let base = dst.vertices.len() as u32;
-                let nrm = art.transform.inverse().transpose();
-                dst.vertices.extend(mm.mesh.vertices.iter().map(|v| {
-                    let mut o = *v;
-                    o.position = art.transform.transform_point3(Vec3::from(v.position)).to_array();
-                    o.normal = nrm.transform_vector3(Vec3::from(v.normal)).normalize_or_zero().to_array();
-                    o
-                }));
-                dst.indices.extend(mm.mesh.indices.iter().map(|i| i + base));
-            }
+            let lods = art
+                .lods
+                .iter()
+                .map(|(lod, meshes)| {
+                    (*lod, meshes.iter().map(|mm| DrawItem::new(r.upload_mesh(&mm.mesh), material_for(r, mm.material), art.transform)).collect())
+                })
+                .collect();
+            let parts = art.lods.iter().map(|(_, meshes)| meshes.iter().map(|mm| (mm.flags, art.transform.transform_point3(Vec3::from(mm.centre)))).collect()).collect();
+            track_lods.push(TrackArticleGpu { article: art.index, lods, parts });
         }
         let mut items = Vec::new();
-        let mut mats: Vec<u16> = merged.keys().copied().collect();
-        mats.sort_unstable();
-        for m in mats {
-            let material = material_for(r, m);
-            items.push(DrawItem::new(r.upload_mesh(&merged[&m]), material, Mat4::IDENTITY));
+        let mut instance_culls: Vec<InstanceCull> = Vec::new();
+        let mut item_cull: Vec<Option<(usize, u8)>> = Vec::new();
+        let broken = Self::breakables(r, track, &geometry, &props, &mut items, &mut instance_culls, &mut item_cull, &mut material_for);
+        // each track smackable's article: an instance item of its own (the walk answers it through
+        // 0x4786A0 with the body's pose, 0x450010 picks the LOD from its own records), every LOD
+        // uploaded, drawn at `pose · home⁻¹ · tr` ([`Self::place_smackable`])
+        let mut moved: HashMap<SmackableOwner, (Mat4, Vec<(usize, Mat4)>)> = HashMap::new();
+        let mut smack_anims: Vec<SmackAnim> = Vec::new();
+        {
+            let arts = track.crp.articles(&track.crp_data).unwrap_or_default();
+            for sp in &track_smackables {
+                let SmackableOwner::Article(k) = sp.owner else { continue };
+                let Some(own) = geometry.world.iter().find(|a| a.index == k) else { continue };
+                let slot = arts.get(k).and_then(|a| article_base(track, a)).map(|(centre, radius, lods)| {
+                    instance_culls.push(InstanceCull { centre, radius, lods, first_item: items.len(), broken: None });
+                    instance_culls.len() - 1
+                });
+                let first = items.len();
+                let drawn = if slot.is_some() { &own.lods[..] } else { &own.lods[..own.lods.len().min(1)] };
+                for (lod, meshes) in drawn {
+                    for mm in meshes {
+                        items.push(DrawItem::new(r.upload_mesh(&mm.mesh), material_for(r, mm.material), own.transform));
+                        item_cull.push(slot.map(|s| (s, *lod)));
+                    }
+                }
+                moved.insert(sp.owner, (sp.pose().inverse(), (first..items.len()).map(|i| (i, own.transform)).collect()));
+                smack_anims.push(SmackAnim { article: k, slot, home: sp.position, position: sp.position, state: 0, armed: false });
+            }
         }
-        let broken = Self::breakables(r, track, &geometry, &props, &mut items, &mut material_for);
-        let mut lib_gpu: HashMap<u32, Vec<(MeshId, MaterialId)>> = HashMap::new();
+        // every LOD of each library article, by tag (the first article with it, as 0x478640 finds
+        // the template); every shipped one has a single LOD
+        let mut lib_gpu: HashMap<u32, Vec<(u8, Vec<(MeshId, MaterialId)>)>> = HashMap::new();
         for art in &geometry.library {
-            let entry = lib_gpu.entry(art.tag).or_default();
-            if !entry.is_empty() {
+            if lib_gpu.contains_key(&art.tag) {
                 continue;
             }
-            for mm in &art.meshes {
-                let material = material_for(r, mm.material);
-                entry.push((r.upload_mesh(&mm.mesh), material));
-            }
+            let lods = art.lods.iter().map(|(lod, meshes)| (*lod, meshes.iter().map(|mm| (r.upload_mesh(&mm.mesh), material_for(r, mm.material))).collect())).collect();
+            lib_gpu.insert(art.tag, lods);
         }
+        let arts = track.crp.articles(&track.crp_data).unwrap_or_default();
         let mut item_element = vec![None; items.len()];
         let mut missing_tags = std::collections::HashSet::new();
         // `ENDW` barrier boxes of a skill test (`animdefs.txt` collideType=kBox): their footprint
@@ -441,28 +1130,52 @@ impl TrackWorld {
         let mut extra_walls: Vec<([f32; 3], [f32; 3], u32)> = Vec::new();
         let mut animated: Vec<AnimatedProp> = Vec::new();
         let mut smackables: Vec<SmackableSpawn> = Vec::new();
+        let mut instance_flares: Vec<(usize, TrackFlare)> = Vec::new();
         for inst in &geometry.instances {
-            if let Some(parts) = lib_gpu.get(&inst.tag) {
+            if let Some(lods) = lib_gpu.get(&inst.tag) {
                 let art = geometry.library.iter().find(|a| a.tag == inst.tag);
-                let lib_tr = art.map(|a| a.transform).unwrap_or(Mat4::IDENTITY);
-                let world_tr = inst.transform * Mat4::from_scale(inst.scale) * lib_tr;
+                // the scene record's matrix (slot 5, 0x4828A0 → 0x539CD0): the element's position
+                // and its 3×3 scaled by the per-cent values (0x482EA0, 0x46B020) — and nothing of the
+                // library article's own `tr`: the template's record is the identity (0x482BF1), and
+                // the draw 0x450380 pushes this matrix (0x450465…0x450477) and draws the article's
+                // `vt` as they are, with no `tr` lookup on the way (`RE/RENDERING.md` "The instance
+                // and scene items"). *(Until 2026-09-26 the port applied the `tr` too — the cones
+                // at 0.585 of their size.)*
+                let world_tr = inst.transform * Mat4::from_scale(inst.scale);
                 // a looping `animdefs.txt` piece makes this prop play its own track
                 let loop_piece = track
                     .animdefs
                     .by_fourcc(inst.tag)
                     .and_then(|d| d.resting_pieces().find(|p| p.flags.looping).cloned());
-                for (mesh, material) in parts {
-                    items.push(DrawItem::new(*mesh, *material, world_tr));
-                    item_element.push((inst.source == 1).then_some(inst.element));
-                    if let (Some(p), Some(t)) = (loop_piece.as_ref(), art.and_then(|a| a.animation.as_ref())) {
-                        animated.push(AnimatedProp {
-                            item: items.len() - 1,
-                            base: world_tr,
-                            track: t.clone(),
-                            seconds_per_frame: p.seconds_per_frame(),
-                            looping: p.flags.looping,
-                        });
+                // the scene bundle's slot (0x482EA0): the walk answers it through 0x4786A0 with the
+                // library article's `Base` and picks the LOD from its records (0x450010).
+                // The sphere goes through the same matrix, the record's (0x4786A0).
+                let cull = art.and_then(|a| arts.get(a.index)).and_then(|a| article_base(track, a)).map(|(centre, radius, clods)| {
+                    instance_culls.push(InstanceCull { centre, radius, lods: clods, first_item: items.len(), broken: None });
+                    instance_culls.len() - 1
+                });
+                // with no `Base` the lowest LOD alone, drawn always (port fallback)
+                let drawn = if cull.is_some() { &lods[..] } else { &lods[..lods.len().min(1)] };
+                for (lod, parts) in drawn {
+                    for (mesh, material) in parts {
+                        items.push(DrawItem::new(*mesh, *material, world_tr));
+                        item_element.push((inst.source == 1).then_some(inst.element));
+                        item_cull.push(cull.map(|k| (k, *lod)));
+                        if let (Some(p), Some(t)) = (loop_piece.as_ref(), art.and_then(|a| a.animation.as_ref())) {
+                            animated.push(AnimatedProp {
+                                item: items.len() - 1,
+                                base: world_tr,
+                                track: t.clone(),
+                                seconds_per_frame: p.seconds_per_frame(),
+                                looping: p.flags.looping,
+                            });
+                        }
                     }
+                }
+                // its flares, drawn with the item (0x450380's `ef` loop); an instance the walk has
+                // no entry for (no `Base`) has none here
+                if let (Some(k), Some(a)) = (cull, art.and_then(|a| arts.get(a.index).map(|c| (a.index, c)))) {
+                    instance_flares.extend(article_flares(track, a.0, a.1, Mat4::IDENTITY).into_iter().map(|f| (k, f)));
                 }
                 if let Some(sp) = art.and_then(|a| smackable_spawn(track, a, inst)) {
                     smackables.push(sp);
@@ -477,7 +1190,7 @@ impl TrackWorld {
                         }
                     }
                     if lo.x <= hi.x {
-                        let local = Mat4::from_scale(inst.scale) * lib_tr;
+                        let local = Mat4::from_scale(inst.scale);
                         let corners = [Vec3::new(lo.x, lo.y, lo.z), Vec3::new(hi.x, lo.y, lo.z), Vec3::new(hi.x, lo.y, hi.z), Vec3::new(lo.x, lo.y, hi.z)]
                             .map(|c| inst.transform.transform_point3(local.transform_point3(c)));
                         for k in 0..4 {
@@ -488,6 +1201,9 @@ impl TrackWorld {
             } else if inst.source == 1 {
                 missing_tags.insert(inst.tag);
             }
+        }
+        if !instance_flares.is_empty() {
+            tracing::info!(flares = instance_flares.len(), "scene instance flares");
         }
         if !missing_tags.is_empty() {
             tracing::warn!(tags = ?missing_tags.iter().map(|t| String::from_utf8_lossy(&t.to_le_bytes()).into_owned()).collect::<Vec<_>>(), "mission props without a library article");
@@ -556,14 +1272,55 @@ impl TrackWorld {
             .filter(|(id, _)| materials.get(**id as usize).is_some_and(|m| uv_methods.contains(&m.render_method)))
             .map(|(_, mid)| *mid)
             .collect();
-        for it in &mut items {
+        for it in items.iter_mut().chain(track_lods.iter_mut().flat_map(|a| a.lods.iter_mut().flat_map(|(_, v)| v.iter_mut()))) {
             it.headlit = lit.contains(&it.material);
             it.uv_lit = uv.contains(&it.material);
         }
         tracing::info!(props = props.len(), breakable = props.iter().filter(|p| p.breakable.is_some()).count(), "track props");
         let projectors = track_projectors(track);
         let projector_texture = projectors.first().and_then(|p| tex_ids.get(&p.texture)).map(|t| t.0);
-        Ok(Self { items, item_element, hidden: std::collections::HashSet::new(), env_map, collision, props, walls, start, ambient, map_light, sun_direction, map_sections, env_by_id, smackables, moved: HashMap::new(), animated, broken, flares: track_flares(track), emitters: track_emitters(track), projectors, projector_texture })
+        let projector_registered = vec![false; projectors.len()];
+        let cull_articles = cull_articles(track);
+        let occluders = track_occluders(track);
+        tracing::info!(articles = cull_articles.iter().flatten().count(), drawn = track_lods.len(), lods = track_lods.iter().map(|a| a.lods.len()).sum::<usize>(), occluders = occluders.len(), instances = instance_culls.len(), "track culling");
+        Ok(Self {
+            items,
+            item_element,
+            hidden: std::collections::HashSet::new(),
+            env_map,
+            collision,
+            props,
+            walls,
+            start,
+            ambient,
+            map_light,
+            sun_direction,
+            map_sections,
+            env_by_id,
+            smackables: smackables.into_iter().chain(track_smackables).take(MAX_SMACKABLES).collect(),
+            moved,
+            smack_anims,
+            animated,
+            broken,
+            flares: track_flares(track),
+            emitters: track_emitters(track),
+            projectors,
+            projector_texture,
+            projector_registered,
+            cull_articles,
+            track_lods,
+            occluders,
+            instance_culls,
+            instance_flares,
+            item_cull,
+        })
+    }
+
+    /// `Graphics.Headlights` below Projected: no item takes the `HEAD` decal (`main.rs`).
+    pub fn clear_uv_lit(&mut self) {
+        for it in self.items.iter_mut().chain(self.track_lods.iter_mut().flat_map(|a| a.lods.iter_mut().flat_map(|(_, v)| v.iter_mut()))) {
+            it.uv_lit = false;
+        }
     }
 
     /// Advance every looping prop animation to `seconds` since the race started
@@ -592,15 +1349,89 @@ impl TrackWorld {
     /// only the car's light block and environment maps (§2), and the class-0 draw copies the `df`
     /// stream into the vertex colour untouched (0x540E1D) — or an `Am` op has written its flat
     /// colour there (§5.4) — for stage 0 to `MODULATE` with the texture (`thrash.md` §5).
-    pub fn visible_items(&self) -> impl Iterator<Item = DrawItem> + '_ {
-        self.items
-            .iter()
-            .enumerate()
-            .zip(self.item_element.iter())
-            .filter(|((k, _), e)| e.map(|e| !self.hidden.contains(&e)).unwrap_or(true) && !self.broken.iter().any(|b| b.hides(*k)))
-            .map(|((_, i), _)| *i)
-            .chain(self.broken.iter().flat_map(|b| b.pieces.iter().copied()))
+    ///
+    /// **The order** is the view's lists' (`RE/RENDERING.md` "The view's lists", read 2026-09-26):
+    /// the static / mid-ground drawer 0x450DE0 queues each `pr` part of the chosen LOD on its own
+    /// (0x450EDB…0x450FCF) keyed by `round(d²)`, `d` from the eye (`[[0x628130]+0x10]+0x34`) to the
+    /// part's sphere centre (`pr+8`, 0x450EF8…0x450F25) — a flag-2 part in the list `+4`, drawn
+    /// first and **nearest first**, a flag-1 or flag-4 part in `+0xC`, drawn after and **farthest
+    /// first** ([`part_list`]); the instance drawer queues its whole item in `+0xC` with the walk's
+    /// `round(v)` (0x44FFC0 → 0x466A90), and 0x450010 draws its parts together there. Equal keys keep
+    /// the order they were queued in (each tree insert goes right on equal, 0x466933 / 0x466AD3).
+    /// So the flag-2 parts — every `Opaque` one, but also 7 000 blended `Normal` / `NormMatState` /
+    /// `FullAmbient` / `FakeSort` ones — are drawn front to back before anything of `+0xC`: they come
+    /// first here and are marked `early` (the renderer's opaque stage, in this order); the `+0xC`
+    /// ones follow, farthest first, in the blended stage. APPROXIMATIONS: equal keys keep the port's
+    /// article order, not the node pass's (the fitted tree is not built); the cars share the list
+    /// `+0xC` with the track (0x443229, keyed by `round(d²)` 0x4431F8) but are drawn after it here;
+    /// an item with no `Base` (port fallback) goes last.
+    pub fn visible_items(&self, draws: &[Option<ArticleDraw>], eye: Vec3) -> Vec<DrawItem> {
+        let key = |c: Vec3| (c - eye).length_squared().round_ties_even() as u32;
+        let mut near: Vec<(u32, DrawItem)> = Vec::new();
+        let mut far: Vec<(u32, DrawItem)> = Vec::new();
+        let mut rest: Vec<DrawItem> = Vec::new();
+        // the walk's draw of the track geometry: each drawn article at the LOD its drawer picked
+        // (0x450DE0 / 0x450010 — the record's `pr` range is the parts of that LOD number); an
+        // article the walk has no record of (no `Base`) is drawn at its lowest LOD (port fallback)
+        for a in &self.track_lods {
+            match self.cull_articles.get(a.article).map(|c| c.as_ref()) {
+                Some(Some(c)) => {
+                    let Some(d) = draws.get(a.article).copied().flatten() else { continue };
+                    let Some(lod) = c.lods.get(d.lod).map(|l| l.lod) else { continue };
+                    let Some(k) = a.lods.iter().position(|(n, _)| *n == lod) else { continue };
+                    let parts = a.parts.get(k).map(|p| p.as_slice()).unwrap_or(&[]);
+                    for (i, item) in a.lods[k].1.iter().enumerate() {
+                        let (flags, centre) = parts.get(i).copied().unwrap_or((2, Vec3::ZERO));
+                        match c.drawer {
+                            ArticleDrawer::Static | ArticleDrawer::MidGround { .. } => match part_list(flags) {
+                                Some(ViewList::Near) => near.push((key(centre), *item)),
+                                Some(ViewList::Far) => far.push((key(centre), *item)),
+                                None => {}
+                            },
+                            ArticleDrawer::Instance | ArticleDrawer::Anim => far.push((d.value as u32, *item)),
+                        }
+                    }
+                }
+                _ => rest.extend(a.lods.first().map(|(_, v)| v.as_slice()).unwrap_or(&[]).iter().copied()),
+            }
+        }
+        // the instance drawer's own items (the `.scn` GEOM instances): each at the LOD the walk
+        // answered its entry with, none when it did not ([`Self::article_draws`]), queued with the
+        // walk's value
+        let n = self.cull_articles.len();
+        for (k, (item, e)) in self.items.iter().zip(self.item_element.iter()).enumerate() {
+            if e.is_some_and(|e| self.hidden.contains(&e)) || self.broken.iter().any(|b| b.hides(k)) {
+                continue;
+            }
+            match self.item_cull.get(k).copied().flatten() {
+                Some((slot, lod)) => {
+                    let Some(d) = draws.get(n + slot).copied().flatten() else { continue };
+                    if self.instance_culls.get(slot).and_then(|ic| ic.lods.get(d.lod)).is_some_and(|l| l.lod == lod) {
+                        far.push((d.value as u32, *item));
+                    }
+                }
+                None => rest.push(*item),
+            }
+        }
+        // a breakable's pieces are the entries 0x450010 draws when the walk answers the item
+        for b in &self.broken {
+            match b.slot {
+                Some(k) => {
+                    if let Some(d) = draws.get(n + k).copied().flatten() {
+                        far.extend(b.pieces.iter().map(|i| (d.value as u32, *i)));
+                    }
+                }
+                None => rest.extend(b.pieces.iter().copied()),
+            }
+        }
+        near.sort_by_key(|(k, _)| *k);
+        far.sort_by_key(|(k, _)| std::cmp::Reverse(*k));
+        near.into_iter()
+            .map(|(_, i)| DrawItem { early: true, ..i })
+            .chain(far.into_iter().map(|(_, i)| i))
+            .chain(rest)
             .map(|i| DrawItem { layer_light: Some(TRACK_LIGHT), ..i })
+            .collect()
     }
 
     /// The breakable props of the world (`BBOX`, the crate stacks): each world article whose prop
@@ -615,13 +1446,15 @@ impl TrackWorld {
         geometry: &nfs_assets::track::TrackGeometry,
         props: &[nfs_physics::props::Prop],
         items: &mut Vec<DrawItem>,
+        culls: &mut Vec<InstanceCull>,
+        item_cull: &mut Vec<Option<(usize, u8)>>,
         material_for: &mut dyn FnMut(&mut Renderer, u16) -> MaterialId,
     ) -> Vec<BrokenProp> {
         let Ok(arts) = track.crp.articles(&track.crp_data) else { return Vec::new() };
         let tags = article_tags(track, &arts);
         let by_index: HashMap<usize, &nfs_assets::track::ArticleMeshes> = geometry.world.iter().chain(geometry.library.iter()).map(|a| (a.index, a)).collect();
         let mut uploaded: HashMap<usize, Vec<(MeshId, MaterialId)>> = HashMap::new();
-        let mut upload = |r: &mut Renderer, k: usize| -> Vec<(MeshId, MaterialId)> {
+        let mut upload = |r: &mut Renderer, material_for: &mut dyn FnMut(&mut Renderer, u16) -> MaterialId, k: usize| -> Vec<(MeshId, MaterialId)> {
             uploaded
                 .entry(k)
                 .or_insert_with(|| by_index.get(&k).map(|a| a.meshes.iter().map(|mm| (r.upload_mesh(&mm.mesh), material_for(r, mm.material))).collect()).unwrap_or_default())
@@ -632,9 +1465,20 @@ impl TrackWorld {
             let Some(b) = p.breakable.as_ref() else { continue };
             let Some(own) = geometry.world.iter().find(|a| a.index == b.article) else { continue };
             let Some(def) = track.animdefs.lookup(own.tag) else { continue };
+            // an item of `WInstanceBundle` (its record `world+0x40 + 56·id`, 0x476A54): the walk
+            // answers it through 0x4786A0 and 0x450010 picks the LOD from its own article's records
+            // (the cursor 0x477C30), so every LOD of the article is uploaded
+            let slot = arts.get(own.index).and_then(|a| article_base(track, a)).map(|(centre, radius, lods)| {
+                culls.push(InstanceCull { centre, radius, lods, first_item: items.len(), broken: Some(out.len()) });
+                culls.len() - 1
+            });
             let first = items.len();
-            for (mesh, material) in upload(r, own.index) {
-                items.push(DrawItem::new(mesh, material, own.transform));
+            let drawn = if slot.is_some() { &own.lods[..] } else { &own.lods[..own.lods.len().min(1)] };
+            for (lod, meshes) in drawn {
+                for mm in meshes {
+                    items.push(DrawItem::new(r.upload_mesh(&mm.mesh), material_for(r, mm.material), own.transform));
+                    item_cull.push(slot.map(|k| (k, *lod)));
+                }
             }
             let mut entry0 = own.index;
             let mut templates = Vec::new();
@@ -648,7 +1492,8 @@ impl TrackWorld {
                 let source = if vertex_frames { Some(base) } else { quat };
                 let track_of = source.and_then(|k| by_index.get(&k)).and_then(|a| a.animation.clone());
                 templates.push(PieceTemplate {
-                    meshes: upload(r, base),
+                    meshes: upload(r, &mut *material_for, base),
+                    base: arts.get(base).and_then(|a| article_base(track, a)).map(|(c, r, _)| (c, r)),
                     track: track_of,
                     seconds_per_frame: piece.seconds_per_frame(),
                     flags: piece.flags,
@@ -662,7 +1507,9 @@ impl TrackWorld {
                 templates,
                 players: Vec::new(),
                 pieces: Vec::new(),
+                lead: None,
                 state: BreakState::Whole,
+                slot,
             });
         }
         out
@@ -701,6 +1548,7 @@ impl TrackWorld {
                     b.state = BreakState::Gone;
                     b.players.clear();
                     b.pieces.clear();
+                    b.lead = None;
                     continue;
                 }
                 let ticks = tick.saturating_sub(start);
@@ -712,6 +1560,7 @@ impl TrackWorld {
                     let (m, playing) = sample_piece(track, t.seconds_per_frame, t.flags, pl.heading, pl.drift, ticks);
                     if k == 0 {
                         lead = playing;
+                        b.lead = Some(m);
                     }
                     for (mesh, material) in &t.meshes {
                         b.pieces.push(DrawItem::new(*mesh, *material, b.instance * m));
@@ -734,19 +1583,30 @@ impl TrackWorld {
 
     /// Draw a smackable's article where its body is: `0x483590` (from 0x4A1510) points the prop
     /// record's pose at the car record's own (`car+0x330` / `car+0x364`), so the renderer draws the
-    /// article with the body's pose (`skill-tests.md` §5.3). `pose` is that pose, body to world;
-    /// the element's items keep their authored transforms relative to the authored pose.
-    pub fn place_smackable(&mut self, element: usize, pose: Mat4) {
-        let Some(spawn) = self.smackables.iter().find(|s| s.element == element) else { return };
+    /// article with the body's pose (`skill-tests.md` §5.3) — the player's sample is the pose times
+    /// the inverse of the home pose (0x4711E0), then the item's own matrix (0x4769E0). `pose` is
+    /// the body's, body to world; the items keep their authored transforms relative to the
+    /// authored pose.
+    pub fn place_smackable(&mut self, owner: SmackableOwner, pose: Mat4) {
+        let Some(spawn) = self.smackables.iter().find(|s| s.owner == owner) else { return };
         let authored = spawn.pose();
         let items = &self.items;
         let item_element = &self.item_element;
-        let (inv, list) = self.moved.entry(element).or_insert_with(|| {
-            let list = item_element.iter().enumerate().filter(|(_, e)| **e == Some(element)).map(|(i, _)| (i, items[i].transform)).collect();
+        let (inv, list) = self.moved.entry(owner).or_insert_with(|| {
+            let list = match owner {
+                SmackableOwner::Element(element) => item_element.iter().enumerate().filter(|(_, e)| **e == Some(element)).map(|(i, _)| (i, items[i].transform)).collect(),
+                // the article's items are registered at upload
+                SmackableOwner::Article(_) => Vec::new(),
+            };
             (authored.inverse(), list)
         });
         for (i, base) in list.iter() {
             self.items[*i].transform = pose * *inv * *base;
+        }
+        if let SmackableOwner::Article(article) = owner
+            && let Some(a) = self.smack_anims.iter_mut().find(|a| a.article == article)
+        {
+            a.position = pose.w_axis.truncate();
         }
     }
 }
@@ -754,20 +1614,24 @@ impl TrackWorld {
 /// A mission-scene instance's smackable, when its `animdefs.txt` definition (0x47ED90's lookup)
 /// says `kSmackable` (0x4772F0's `def+0x10 == 3`): a car record of its own is built from it
 /// (0x476ED0, then 0x4A17F0 / 0x4A1280) with its points from the library article's vertices in
-/// the instance's frame. MEDIUM: that frame folds the GEOM scale and the article's own `tr` into
-/// the points and keeps the instance's rotation and position as the body's pose — the original's
-/// record pose (`rec+0x28` / `+0x34`, 0x539CD0 on the instance matrix) was not followed that far;
-/// and the vertices are the port's article meshes (the original reads the `vt` stream).
+/// the instance's frame. The article's own `tr` is **not** applied: 0x476ED0 reads only the
+/// article's `Base` and `vt` (0x476F35, 0x476FAB), and 0x483360 takes the pose from the scene
+/// record's matrix (0x4774F8…0x477515), which has no `tr` in it (0x482BF1 / 0x482EA0) — CONFIRMED.
+/// *(Until 2026-09-26 the port folded the `tr` into the points.)* MEDIUM: the GEOM scale is folded
+/// into the points and the instance's rotation and position kept as the body's pose — 0x476A80
+/// splits the record matrix into the unscaled pose and the axis lengths `rec+0x58`, and where the
+/// latter is used again was not read; and the vertices are the port's article meshes (the original
+/// reads the `vt` stream).
 pub fn smackable_spawn(track: &TrackAssets, art: &nfs_assets::track::ArticleMeshes, inst: &nfs_assets::track::PropInstance) -> Option<SmackableSpawn> {
     if inst.source != 1 {
         return None;
     }
     let def = track.animdefs.lookup(inst.tag).filter(|d| d.collide_type == "kSmackable")?;
-    let local = Mat4::from_scale(inst.scale) * art.transform;
+    let local = Mat4::from_scale(inst.scale);
     let verts: Vec<Vec3> = art.meshes.iter().flat_map(|mm| mm.mesh.vertices.iter().map(|v| local.transform_point3(Vec3::from(v.position)))).collect();
     let (_, rot, pos) = inst.transform.to_scale_rotation_translation();
     Some(SmackableSpawn {
-        element: inst.element,
+        owner: SmackableOwner::Element(inst.element),
         position: pos,
         orientation: glam::Mat3::from_quat(rot).transpose(),
         points: nfs_physics::smackable::point_cloud(&verts),
@@ -776,10 +1640,43 @@ pub fn smackable_spawn(track: &TrackAssets, art: &nfs_assets::track::ArticleMesh
     })
 }
 
-/// A smackable of the mission scene, as `nfs_physics::smackable::Smackable::new` takes it.
+/// A track article's smackable (0x4772F0 over the instance bundle's items — every article with a
+/// `tr`, 0x47859E — whose `Base` byte 0 lacks 0x40, 0x477377, and whose definition says
+/// `kSmackable`, 0x4773EE): its pose is the item record's — the `tr`'s position and its rows,
+/// normalised as 0x4A1510 does — and its points `SIGN`'s 0x476B30 (the vertices scaled by the
+/// rows' lengths, `nfs_physics::smackable::sign_point_cloud`) or everyone else's 0x476ED0, which
+/// takes no scale (`suspension-collision.md` §9 "The track's smackables"). MEDIUM: the vertices
+/// are the port's lowest-LOD meshes (the original reads a `vt` stream: 0x476ED0 the article's,
+/// 0x476B30 the one the LOD record `Base+0x64 + 12·Base[+4]` names).
+pub fn track_smackable_spawn(track: &TrackAssets, art: &nfs_assets::track::ArticleMeshes) -> Option<SmackableSpawn> {
+    let def = track.animdefs.lookup(art.tag).filter(|d| d.collide_type == "kSmackable")?;
+    let tr = art.transform;
+    let rows = [tr.x_axis.truncate(), tr.y_axis.truncate(), tr.z_axis.truncate()];
+    let lengths = Vec3::new(rows[0].length(), rows[1].length(), rows[2].length());
+    let verts: Vec<Vec3> = art.meshes.iter().flat_map(|mm| mm.mesh.vertices.iter().map(|v| Vec3::from(v.position))).collect();
+    let points = if def.tag.eq_ignore_ascii_case("SIGN") { nfs_physics::smackable::sign_point_cloud(&verts, lengths) } else { nfs_physics::smackable::point_cloud(&verts) };
+    let unit = |v: Vec3| v.normalize_or_zero();
+    Some(SmackableSpawn {
+        owner: SmackableOwner::Article(art.index),
+        position: tr.w_axis.truncate(),
+        orientation: glam::Mat3::from_cols(unit(rows[0]), unit(rows[1]), unit(rows[2])).transpose(),
+        points,
+        mass: def.mass,
+        audio_type: def.audio_type_index().unwrap_or(0),
+    })
+}
+
+/// What a smackable's body draws: a mission scene's GEOM element, or a track article.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SmackableOwner {
+    Element(usize),
+    Article(usize),
+}
+
+/// A smackable, as `nfs_physics::smackable::Smackable::new` takes it.
 #[derive(Debug, Clone)]
 pub struct SmackableSpawn {
-    pub element: usize,
+    pub owner: SmackableOwner,
     pub position: Vec3,
     /// rows = the body axes, as `Vehicle::orientation`
     pub orientation: glam::Mat3,
@@ -817,7 +1714,8 @@ struct AnimatedProp {
 struct BrokenProp {
     /// its index in `TrackWorld::props`
     prop: usize,
-    /// its own article's draw items, drawn while it is whole
+    /// its own article's draw items, every LOD — drawn while it is whole, those of the LOD the walk
+    /// answers its [`Self::slot`] with
     items: std::ops::Range<usize>,
     /// the instance's matrix, `world+0x40 + 56·id` (0x539CD0 at 0x476A54)
     instance: Mat4,
@@ -829,7 +1727,30 @@ struct BrokenProp {
     players: Vec<PiecePlayer>,
     /// this frame's draw items of the pieces
     pieces: Vec<DrawItem>,
+    /// this frame's sample of the lead player (`rec+0x1C`, piece 0's twin) — slot 5's
+    /// `lead sample × instance` (0x4769E0 with −1) for the walk's sphere
+    lead: Option<Mat4>,
     state: BreakState,
+    /// its [`TrackWorld::instance_culls`] entry (none without a `Base`: drawn always)
+    slot: Option<usize>,
+}
+
+/// A track smackable's anim-world record (0x4772F0): entry 0 and the lead are the one player
+/// 0x471180 on its prop record (0x4775F7), whose sample 0x4711E0 follows the body.
+#[derive(Debug, Clone)]
+struct SmackAnim {
+    /// the `.crp` article index — the record's own article, which `rec+8` takes (0x476876)
+    article: usize,
+    /// its [`TrackWorld::instance_culls`] entry (none without a `Base`: drawn always, never sampled)
+    slot: Option<usize>,
+    /// the prop record's position `+0x28…+0x30` — the item record's, where the body started
+    home: Vec3,
+    /// the body's position now (`car+0x330`, through the pose pointers 0x483590)
+    position: Vec3,
+    /// the player's state `+0xC`: 0, or 1 once a draw's sample found the body 1 cm off its place
+    state: u8,
+    /// `rec+8` set (0x476876) — kept for the race
+    armed: bool,
 }
 
 impl BrokenProp {
@@ -848,6 +1769,8 @@ enum BreakState {
 
 struct PieceTemplate {
     meshes: Vec<(MeshId, MaterialId)>,
+    /// the `BaseGroup` article's `Base` sphere in its own frame (0x4786A0's entry-0 article)
+    base: Option<(Vec3, f32)>,
     track: Option<nfs_formats::crp::AnimTrack>,
     seconds_per_frame: f32,
     flags: nfs_formats::animdefs::PieceFlags,
@@ -908,11 +1831,17 @@ pub struct CarModel {
     /// The model's scale in its render matrix: 1, or **0.4** for a `.TINYCAR` (`[0x5B37C8]`, the
     /// scale 0x4433D2 builds into the car's matrix through 0x539B30)
     pub scale: f32,
+    /// A mirrored race (`[0x65742C]`, the race option `MIRROR`): the car draw 0x4433A1…0x4433F8
+    /// builds the model's x scale as `−m·s` with `m = −1` there (0x44339B) — the model flipped
+    /// back across the body's x, so under the mirrored view a car still reads the right way round
+    /// (plates, the driver's side) — and slot 9 negates the steer channels 1 / 2 `.y` (0x438471).
+    pub mirror: bool,
     pub body: Vec<(MeshId, MaterialId, Mat4)>,
     /// Each material's `R3DLightLayer` parameters (`RE/notes/lighting.md` §6) — every shipped car
     /// material has them.
     material_light: HashMap<MaterialId, nfs_formats::crp::LayerLight>,
-    /// The materials whose render method takes the shadow projector (layer 0x8101).
+    /// The materials whose render method takes the shadow projector (layer class 0x8102,
+    /// `R3DShadowMapTextureLayer`).
     shadowed: std::collections::HashSet<MaterialId>,
     /// The meshes each **model animation** morphs (`Base+77`, index 1…7), with every frame's
     /// positions: 1 the convertible's roof, 2 the `SpoilerW` wing, 3 the wipers, 4 / 5 / 6 the
@@ -937,6 +1866,16 @@ pub struct CarModel {
     /// the `Shadow.fsh` quads over the wheels' outer faces, 0x0B — drawn after the wheel they
     /// darken.
     body_key: Vec<i8>,
+    /// Each `body` entry's LOD and pass bytes ([`PartInfo`]): the model holds **every** LOD, and
+    /// the car draw 0x444E00 picks per pass which one a part is drawn from ([`CarPass`]).
+    body_info: Vec<PartInfo>,
+    /// `R3DCarLOD+0x10` of each LOD 1…7 — how many parts 0x43C1B0 listed for it (the admitted
+    /// articles with a `Base` LOD record for that LOD); the LOD pick 0x43A0DC…0x43A117 stops at
+    /// the first empty one
+    lod_parts: [u32; 7],
+    /// `R3DCarLOD+0x14 + 4m` of each LOD: whether a part of it rides translation channel `m`
+    /// (`Base+72`, 0x43C66D…0x43C67C) — the gate 0x43E670 writes channel `m` behind
+    lod_moves: [[bool; 4]; 7],
     /// `.tpg` `movespoilerextent` → `R3DCar+0x74` (0x441D08), in **turns**: −0.04 on the 996 and
     /// the GT3, −0.08 on the two Boxsters, and absent everywhere else.
     move_spoiler_extent: f32,
@@ -984,11 +1923,37 @@ pub struct CarModel {
     damage_pages: Vec<nfs_assets::car::TexturePage>,
     damage_patches: Vec<nfs_assets::car::DamagePatch>,
     page_textures: Vec<nfs_renderer::TextureId>,
-    /// last damage the pages were composed for, rounded, so a page is only rebuilt when it changes
-    damage_shown: [u8; 10],
-    /// The windscreen quad (`Wndo`) with the `INTGLASS` glass texture, drawn only from inside the
-    /// car (`RE/notes/car-model.md` §12).
-    pub window: Option<(MeshId, MaterialId)>,
+    /// `R3DCar+0x6A8`: the ten zone values ([`zone_damage`]) the car was last brought up to date
+    /// with — 0x438230 compares them exactly every frame (0x438240…0x438259)
+    damage_shown: [f32; 10],
+    /// the meshes 0x43E390 crushes: every part of an article with `Base+78 & 8` and a `dz` part
+    deform: Vec<DeformPart>,
+}
+
+/// One mesh of a crushable part (0x43E390): its undamaged vertices (`vt#lod`), each vertex's crush
+/// vector (`vt#(0x8000|lod)`, `w` 0) and its damage zone (the `dz#lod` list it is in; 255 none).
+struct DeformPart {
+    mesh: MeshId,
+    base: Vec<Vertex>,
+    delta: Vec<[f32; 3]>,
+    zone: Vec<u8>,
+}
+
+/// `0x5B35AC` / `0x5B35D4`: the caps 0x4382E0 puts on each zone's damage, × 100 — every zone 1 on
+/// a car the camera does not follow, and on the one it does (`carInfo+0x520 == 0x465D80(0)`, with
+/// slot 0's view non-zero or `[0x627F43] & 8` — any view) **0** on zones 3, 7 and 8, the sides and
+/// the roof.
+const ZONE_CAP: [f32; 10] = [1.0; 10];
+const OWN_ZONE_CAP: [f32; 10] = [1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0];
+
+/// **0x4382E0(zone)**: the zone's damage `car+0x4E4 + 4·zone` capped at `100 · cap` — `fst` of the
+/// cap to a float, then the smaller (0x43831F…0x43837A, `test ah, 1`).
+pub fn zone_damage(damage: &[f32; 10], own_car: bool) -> [f32; 10] {
+    let caps = if own_car { OWN_ZONE_CAP } else { ZONE_CAP };
+    std::array::from_fn(|z| {
+        let cap = caps[z] * 100.0;
+        if cap < damage[z] { cap } else { damage[z] }
+    })
 }
 
 /// A lamp's `ef` record (`RE/notes/particles.md` §4), in the body frame.
@@ -1009,6 +1974,15 @@ pub struct CarLight {
     pub slot: u8,
     /// `L+0x4F`: the headlight that also throws the night beam 0x43D4F0
     pub night: bool,
+    /// The article's own frame, model space (column form): its `tr` part for the LOD being drawn
+    /// (0x59F220 looks up `"tr"` + `[this+8]`, 0x43D8FB…0x43D907), identity when it has none. The
+    /// mirrored copy's is that matrix with its rotation transposed and its translation's x
+    /// negated (0x43DB5B…0x43DC0D).
+    pub frame: Mat4,
+    /// The rotation channel turning the lamp inside that frame (0 = none): the article's
+    /// `Base+0x4B` for the primary (0x43D943), `L+0x4D` for the mirrored copy (0x43DC36) — both
+    /// only when the article has a `tr` and `Base+0x4B` is non-zero (0x43D94A / 0x43DC30).
+    pub channel: u8,
 }
 
 /// Model animations are numbered 1…7 in the shipped cars; slot 0 is unused.
@@ -1155,7 +2129,115 @@ pub struct CarWheelModel {
     pub channel: u8,
     /// the article's `Base+70` draw-order key (see `CarModel::body_key`)
     pub key: i8,
+    /// the LOD these parts are and the article's pass bytes
+    pub info: PartInfo,
     pub parts: Vec<(MeshId, MaterialId, Mat4)>,
+}
+
+/// What the car draw needs of one article's `Base` record to place a part in a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartInfo {
+    /// the LOD (1…7) the part's primitives belong to
+    pub lod: u8,
+    /// `Base+78`, the pass bits: `R3DCarLOD::draw` 0x43C830 draws the part in a call whose mask
+    /// meets it, `Base+78 & mask & 0xF0` (0x43C8DF…0x43C8E9)
+    pub mask: u8,
+    /// `Base+81`: the part takes part in a call with the flag argument set (0x43C8C7)
+    pub inside: bool,
+    /// `Base+82`: the part stays out of a call without it (0x43C8D4) — the driver's hands
+    pub inside_only: bool,
+    /// `Base+72`, the translation channel, −1 for none (0x43C945)
+    pub move_channel: i8,
+}
+
+impl PartInfo {
+    /// Whether 0x43C830 draws this part in `pass` (0x43C8AC…0x43C8E9).
+    pub fn in_pass(&self, pass: &CarPass) -> bool {
+        self.lod == pass.lod && self.mask & pass.mask & 0xF0 != 0 && if pass.flag { self.inside } else { !self.inside_only }
+    }
+}
+
+/// One `R3DCarLOD::draw` 0x43C830 call of the car draw **0x444E00**: the LOD object (`[R3DCar+0xB0]
+/// [lod − 1]`), the mask its parts' `Base+78` must meet and the flag argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CarPass {
+    pub lod: u8,
+    pub mask: u8,
+    pub flag: bool,
+}
+
+/// The front end's two calls (0x444E86…0x444EBD): mask **0x50** from the LOD of the class
+/// `R3DCar+0x2C0`, which the front end's branch of 0x439F90 zeroes every frame (0x439FF1), and mask
+/// **0x20** from LOD 1 — no 0x80 call, so no driver.
+pub const FRONT_END_PASSES: [CarPass; 2] = [CarPass { lod: 1, mask: 0x50, flag: false }, CarPass { lod: 1, mask: 0x20, flag: false }];
+
+/// `0x5CDB28[class]`: the driver call's LOD object, class 0…3 only (0x444E5E…0x444E83)
+const DRIVER_LOD: [u8; 7] = [0, 0, 0, 1, 1, 2, 3];
+/// `0x5CDB44[7·CARDETAIL + class]`: the wheels' LOD object (0x444EF5…0x444F22)
+const WHEEL_LOD: [[u8; 7]; 3] = [[0, 0, 1, 1, 1, 5, 6], [0, 0, 0, 0, 1, 5, 6], [0, 0, 0, 0, 1, 5, 6]];
+/// `0x5CDB98[class]`: a traffic car's wheels (0x444EC0…0x444EF2)
+const TRAFFIC_WHEEL_LOD: [u8; 7] = [0, 0, 1, 2, 2, 2, 2];
+/// `0x5CD5B8[CARDETAIL]`: the class a racer or cop starts from (0x43A083)
+const CLASS_BIAS: [i32; 4] = [3, 3, 2, 2];
+/// `0x5CDB1C[CARDETAIL]`: the hands' LOD object in the driver view (0x444F9B)
+const HANDS_LOD: [u8; 3] = [1, 0, 0];
+
+/// The race's calls of 0x444E00 outside the driver view, for LOD class `class`: mask **0x80** (the
+/// driver) from `0x5CDB28[class]` while `class < 4`, **0x50** (the body, its interior, the steering
+/// wheel) from the class's own LOD, **0x20** (the wheels) from `0x5CDB44[7·CARDETAIL + class]`, or
+/// for traffic (`car+0x52C & 0x10`) from `0x5CDB98[class]` — all without the flag, so a part with
+/// `Base+82` (the hands) is left out.
+pub fn race_passes(class: u8, detail: u8, traffic: bool) -> Vec<CarPass> {
+    let c = (class as usize).min(6);
+    let mut v = Vec::with_capacity(3);
+    if c < 4 {
+        v.push(CarPass { lod: DRIVER_LOD[c] + 1, mask: 0x80, flag: false });
+    }
+    v.push(CarPass { lod: c as u8 + 1, mask: 0x50, flag: false });
+    let w = if traffic { TRAFFIC_WHEEL_LOD[c] } else { WHEEL_LOD[(detail as usize).min(2)][c] };
+    v.push(CarPass { lod: w + 1, mask: 0x20, flag: false });
+    v
+}
+
+/// 0x444F4E…0x444FB5: the camera's own car in views 0 and 1 (`[0x627F43] & 8`) — mask **0x10**
+/// with the flag from LOD **2** (the shell and the cabin, the parts with `Base+81`), **0x40** with
+/// the flag from LOD 1 (the steering wheel), and, at `CARDETAIL` above 0 and with none of the look
+/// inputs 0x13 / 0x14 / 0x15 held (`[0x5E99B0]`, `[0x5E99B4]`, `[0x5E99AC]`), **0x80** with the
+/// flag from `0x5CDB1C[CARDETAIL]` (LOD 1: the hands and a passenger).
+pub fn in_car_passes(detail: u8, looking: bool) -> Vec<CarPass> {
+    let mut v = vec![CarPass { lod: 2, mask: 0x10, flag: true }, CarPass { lod: 1, mask: 0x40, flag: true }];
+    if detail > 0 && !looking {
+        v.push(CarPass { lod: HANDS_LOD[(detail as usize).min(2)] + 1, mask: 0x80, flag: true });
+    }
+    v
+}
+
+/// What the LOD pick needs of a car beside its model: `car+0x52C`'s traffic (0x10) and opponent
+/// (8) bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarKind {
+    /// the player, a cop
+    Racer,
+    Opponent,
+    Traffic,
+}
+
+/// A car's own LOD state, which the original keeps on its `R3DCar`: the class `+0x2C0` and the
+/// translation channels' `.y` (`+0x6D0 + 12m`, 0x438210). The traffic and the cops share one
+/// model per type, so this lives with each car.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CarLodState {
+    pub class: u8,
+    pub travel: [f32; 4],
+}
+
+/// The screen the LOD pick projects on (0x539700 through the view `[[0x628130]+0x10]+0xC`) and its
+/// width in pixels `[0x657A48]`.
+#[derive(Debug, Clone, Copy)]
+pub struct LodView {
+    pub view_projection: Mat4,
+    pub width: f32,
+    pub height: f32,
 }
 
 /// The car's collision body points `car+0x8C` (`BndP`, `RE/notes/car-model.md` §12): the records
@@ -1266,6 +2348,22 @@ pub fn car_body(car: &CarAssets, tiny: bool) -> (Vec<Vec3>, Vec3) {
     (pts, half)
 }
 
+/// What a car's reflection passes draw with, set per race.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CarEnv {
+    /// `R3DSpecularTextureLayer`'s three textures, `[0x6115CC]+0xDC…+0xE4` — [`car_specular_maps`]:
+    /// `SPC1…3` in a race, `FEDU` / `FE  ` / `FESH` in the front end (0x441AF1). *(Until
+    /// 2026-09-26 the front end's cars were uploaded with none.)*
+    pub specular: [Option<nfs_renderer::TextureId>; 3],
+    /// `[0x6197F8]` has bit 2 — `Graphics.CarChrome` ≥ Medium (0x44EF3A / 0x44EF5D) — so the
+    /// `CarExtEnv` / `CarExtEnvNS` passes of mask 2 are built (`lighting.md` §5.3)
+    pub chrome_passes: bool,
+    /// Give each material its `Rs` block's depth bias (Thrash 0x18, `mt+276`) — set for the race,
+    /// whose view's depth scale is read (the view's near and the camera object's far 700,
+    /// `thrash.md` §6); the front end's 3D view's planes are not read, so its cars keep 0 there.
+    pub rs_bias: bool,
+}
+
 pub const MODEL_TO_BODY: Mat4 = Mat4::from_cols(
     glam::Vec4::new(-1.0, 0.0, 0.0, 0.0),
     glam::Vec4::new(0.0, 1.0, 0.0, 0.0),
@@ -1275,10 +2373,11 @@ pub const MODEL_TO_BODY: Mat4 = Mat4::from_cols(
 
 impl CarModel {
     pub fn upload(r: &mut Renderer, car: &CarAssets, paths: &nfs_assets::GamePaths, lod: u8, paint: impl Into<nfs_assets::car::Paint>) -> anyhow::Result<Self> {
-        Self::upload_with_env(r, car, paths, lod, paint, None, false, None, None)
+        Self::upload_with_env(r, car, paths, lod, paint, CarEnv::default(), false, None, None)
     }
 
-    /// `env`: track environment map (`.env` entry, e.g. "SKY ") for `CarExtEnv` paint reflections.
+    /// `env`: the specular layer's three textures and whether the option word builds the `CarExtEnv`
+    /// passes ([`CarEnv`]).
     ///
     /// `race_roof`: in a race, the car's `.CABRIODOWN` option for slot 19's roof line
     /// ([`nfs_assets::car::CarStyle::apply_race_roof`]); `None` in the front end, whose branch
@@ -1287,7 +2386,7 @@ impl CarModel {
     /// `skidpad`: the `.tpg` entry test's `testdrive` context — `Some(Factory Driver mission)` on
     /// `skidpad`, `None` elsewhere ([`nfs_assets::car::CarStyle::skidpad`]).
     #[allow(clippy::too_many_arguments)]
-    pub fn upload_with_env(r: &mut Renderer, car: &CarAssets, paths: &nfs_assets::GamePaths, lod: u8, paint: impl Into<nfs_assets::car::Paint>, env: Option<nfs_renderer::TextureId>, night: bool, race_roof: Option<u32>, skidpad: Option<bool>) -> anyhow::Result<Self> {
+    pub fn upload_with_env(r: &mut Renderer, car: &CarAssets, paths: &nfs_assets::GamePaths, lod: u8, paint: impl Into<nfs_assets::car::Paint>, env: CarEnv, night: bool, race_roof: Option<u32>, skidpad: Option<bool>) -> anyhow::Result<Self> {
         // `[styleN]` is **1-based** and `CarAssets::style_index` is the raw 0-based `nfs5.car
         // +0x1C0`, which is what 0x437B33's `inc esi` turns into the section name.
         let mut style = nfs_assets::car::CarStyle::from_tpg(&car.tpg, car.style_index + 1);
@@ -1326,13 +2425,17 @@ impl CarModel {
         style.night = night;
         style.skidpad = skidpad;
         tracing::info!(style = style.name, "car style");
+        let paint: nfs_assets::car::Paint = paint.into();
+        // `R3DCar+0xAA`, the exterior's HSV value `max(r, g, b)` (0x443CA0 from 0x443E18), which
+        // picks the damage pack below (0x441FFD, 0x442080)
+        let light_paint = paint.exterior.iter().copied().max().unwrap_or(0) > 0x50;
         let pages = car.build_pages(paths, paint, &style)?;
         let page_tex: Vec<(nfs_renderer::TextureId, bool)> = pages
             .iter()
             .map(|p| (r.upload_texture(&TextureData::single(p.width, p.height, p.rgba.clone())), p.is_window || p.is_alpha))
             .collect();
-        // the damage decals; `night` follows the same `car+0xAA <= 0x50` rule the original uses
-        let damage_patches = nfs_assets::car::damage_patches(paths, &car.model, night).unwrap_or_default();
+        // the damage decals, `L` for a paint brighter than 0x50, `D` otherwise
+        let damage_patches = nfs_assets::car::damage_patches(paths, &car.model, light_paint).unwrap_or_default();
         let page_textures: Vec<nfs_renderer::TextureId> = page_tex.iter().map(|p| p.0).collect();
         let materials = car.crp.materials(&car.crp_data)?;
         let mut mat_ids: HashMap<u16, MaterialId> = HashMap::new();
@@ -1345,11 +2448,24 @@ impl CarModel {
             let m = materials.get(id as usize);
             let page = m.map(|m| m.page_index() as usize).and_then(|p| page_tex.get(p));
             let blend = m.map(|m| matches!(m.render_method.as_str(), "CarWindow" | "CarWheel")).unwrap_or(false) || page.map(|p| p.1).unwrap_or(false);
-            let reflective = m.map(|m| m.render_method == "CarExtEnv").unwrap_or(false);
-            // `R3DSpecularTextureLayer` buckets the material's own reflection strength to pick
-            // which of the three environment textures it reflects (`lighting.md` §3.1); the 0.3
-            // blend stays the APPROXIMATION it was, since the pass's combine is AUDIT.md §E
+            // the specular and sky-map passes belong to `CarExtEnv` and `CarExtEnvNS` (passes of
+            // option mask 2, built at CarChrome ≥ Medium) and to `CarWindow` (mask 0, always built)
+            // — `rmthpasses`, `lighting.md` §5.3. *(Until 2026-09-26 only `CarExtEnv` reflected, and
+            // at Low not even `CarWindow`.)*
+            let reflective = m.is_some_and(|m| match m.render_method.as_str() {
+                "CarExtEnv" | "CarExtEnvNS" => env.chrome_passes,
+                "CarWindow" => true,
+                _ => false,
+            });
+            // `R3DSpecularTextureLayer` and `R3DSkyMapTextureLayer` bucket the material's own
+            // reflection strength to pick which of their three textures they take (0x44553F,
+            // 0x445B33; `lighting.md` §3.1, §3.2 — the four strength dwords at `mt+284…+296` are equal
+            // in every shipped material, so the one `reflection` stands for each layer's own). The
+            // passes' combine is their `Rs` block `{1, 2, 0, 1, 0, −1}` (`rmthpasses`): alpha-blended
+            // over the pixel by the texel's own alpha — `env_mix` is only the switch
             let variant = nfs_formats::crp::env_variant(m.map(|m| m.reflection).unwrap_or(0.0));
+            // the specular texture is the car's own `SPC{bucket+1}` (0x441AB2), not a section map
+            let spec = if reflective { env.specular[variant] } else { None };
             // the cull mode is the material's own `Rs` block, Thrash state 2 at `mt+272`: 1 the
             // view's own (the back faces, `thrash.md` §6d.2), 0 none — the port had culled every opaque one and
             // none of the blended, which with depth writes on let a wheel well's outer faces cover
@@ -1366,13 +2482,28 @@ impl CarModel {
                 Some(rs) if car.front_end_room => (rs[1] == 2, rs[2].clamp(0, 3) as u8),
                 _ => (blend, 0),
             };
-            let mid = r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: cull, depth_test: true, env_texture: if reflective { env } else { None }, env_mix: 0.3, env_variant: variant, blend_pair, clamp: m.map_or([false; 2], |m| m.address.map(|a| a == 0)), lod_bias: m.map_or(0.0, |m| m.lod_bias), device_states: true, view_cull: false, depth_bias: 0, false_sort: false });
+            // Thrash 0x18 from the same block, `rs[4]` (`LayerState` 0x53F780 → 0x540660 hands the
+            // driver states 6, 0x0A, 0x38, 2 and 0x18, the last through 0x540500): over the shipped
+            // cars −10, −3, −2, −1, 0, 1, 3 and 5 (`nfs-formats/examples/rsblock.rs`) — a pull of
+            // `−b · (far − near) / 32768` in view depth, 2.1 cm a unit in the race's main view and
+            // ~2 m in the rear view (far 65000). *(Until 2026-09-26 the cars took 0.)*
+            let depth_bias = if env.rs_bias { m.and_then(|m| m.rs).map_or(0, |rs| rs[4]) } else { 0 };
+            let mid = r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: cull, depth_test: true, env_texture: spec, env_mix: 1.0, env_variant: variant, sky_map: reflective, blend_pair, clamp: m.map_or([false; 2], |m| m.address.map(|a| a == 0)), lod_bias: m.map_or(0.0, |m| m.lod_bias), device_states: true, view_cull: false, depth_bias, false_sort: false });
             if let Some(l) = m.and_then(|m| m.light) {
                 material_light.insert(mid, l);
             }
-            // the methods whose second pass lists layer 0x8101, `R3DShadowMapTextureLayer`
-            // (`RE/notes/lighting.md` §3)
-            if m.is_some_and(|m| matches!(m.render_method.as_str(), "CarExtEnv" | "CarExtEnvNS" | "CarWindow")) {
+            // the methods with a pass of layer class **0x8102**, `R3DShadowMapTextureLayer` (the
+            // factory's 0x449FB4 arm → vtable 0x5B3964) that the option word builds (`rmthpasses`
+            // over every shipped car and room `.crp`, `lighting.md` §5.3): `CarExt` and `CarIntShd`
+            // (pass 1, mask 0), `CarWindow` (pass 3, mask 0) and `CarExtEnv` (pass 3, mask 2 — built
+            // at CarChrome ≥ Medium). `CarExtEnvNS` ("no shadow") lists it only in its dead mask-4
+            // passes, `CarInt` and `CarWheel` not at all. *(Corrected 2026-09-26: this was
+            // `CarExtEnv` / `CarExtEnvNS` / `CarWindow`, "the layer 0x8101" — 0x8101 is the sky map.)*
+            if m.is_some_and(|m| match m.render_method.as_str() {
+                "CarExt" | "CarIntShd" | "CarWindow" => true,
+                "CarExtEnv" => env.chrome_passes,
+                _ => false,
+            }) {
                 shadowed.insert(mid);
             }
             mat_ids.insert(id, mid);
@@ -1391,10 +2522,63 @@ impl CarModel {
         let mut anim_length = [0u32; ANIMS];
         let mut wheel_radius: f32 = 0.3;
         let mut half_track: f32 = 0.7;
+        let mut body_info: Vec<PartInfo> = Vec::new();
+        let mut deform: Vec<DeformPart> = Vec::new();
+        let mut lod_parts = [0u32; 7];
+        let mut lod_moves = [[false; 4]; 7];
         for a in &arts {
+            // 0x43C1B0's part list of each LOD: the articles the style admits with a `Base` LOD
+            // record for it (0x43C2A1…0x43C2C9) — glares included — and, per part, its
+            // translation channel `Base+72` into the LOD's gate `+0x14 + 4m` (0x43C66D…0x43C67C)
+            if let Some(d) = a.level(b"Base").and_then(|e| car.crp.entry_data(&car.crp_data, e).ok())
+                && d.len() > 0x48
+                && style.article_enabled(d[0x44], d[0x45])
+            {
+                let u32_at = |o: usize| d.get(o..o + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+                for k in u32_at(8)..u32_at(12) {
+                    let o = 0x64 + 12 * k;
+                    let Some(w) = d.get(o + 8..o + 10) else { break };
+                    let l = u16::from_le_bytes([w[0], w[1]]) as usize;
+                    if (1..=7).contains(&l) {
+                        lod_parts[l - 1] += 1;
+                        if let Ok(m) = usize::try_from(d[0x48] as i8)
+                            && m < 4
+                        {
+                            lod_moves[l - 1][m] = true;
+                        }
+                    }
+                }
+            }
             // the glare articles hold no geometry, only an `ef` record (`particles.md` §4): its
             // lamp, the slot `Base[0x50]` that switches it (0x43C427 / 0x43D8C0), and a mirrored copy
-            // across x with the slot `L+0x4E` (0x43DAC5…0x43DB32). The two LOD copies are the same.
+            // across x with the slot `L+0x4E` (0x43DAC5…0x43DB32) when `L+0x48 & 8`. One `ef` per article in
+            // every shipped model (0x43DDA5…0x43DE48 would walk on through consecutive ones).
+            //
+            // The effect pass 0x43D800 walks the LOD's part list, which 0x43C1B0 builds from the
+            // articles the style admits (`carinfo[0x56C + 4·Base+68] == Base+69`, 0x43C2A1) that have
+            // a `Base` LOD record for this LOD — the first `k` in `[Base+8, Base+0xC)` whose `word
+            // Base+0x6C + 12k` is it (0x43C2AA…0x43C2C9); the part's `[article+0x48]` is that record
+            // (0x43C42A…0x43C431), and the pass skips the part when the record's **byte +1** is 0
+            // (0x43D863…0x43D872) before it looks for the `ef` (0x43D88B). Across every shipped
+            // model the byte is 1 on each LOD record of an article with an `ef` and 0 on every
+            // other, so it is the "has effects" flag; the style test is what drops lamps: glare
+            // articles carry types 0, 1, 4, 5, 7, 18, 19, 20 and 27 with their variants, and one
+            // of another variant was lit alongside the style's own.
+            let effect_part = a
+                .level(b"Base")
+                .and_then(|e| car.crp.entry_data(&car.crp_data, e).ok())
+                .is_some_and(|d| {
+                    let u32_at = |o: usize| d.get(o..o + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+                    d.len() > 0x45
+                        && style.article_enabled(d[0x44], d[0x45])
+                        && (u32_at(8)..u32_at(12))
+                            .map(|k| 0x64 + 12 * k)
+                            .find(|&o| d.get(o + 8..o + 10).is_some_and(|w| u16::from_le_bytes([w[0], w[1]]) == u16::from(lod)))
+                            .is_some_and(|o| d.get(o + 1).is_some_and(|&b| b != 0))
+                });
+            if !effect_part && a.parts.iter().any(|p| p.is_part(b"ef")) {
+                continue;
+            }
             if let Some(ef) = a.parts.iter().find(|p| p.is_part(b"ef"))
                 && let Ok(b) = car.crp.entry_data(&car.crp_data, ef)
                 && b.len() >= 88
@@ -1410,6 +2594,26 @@ impl CarModel {
                     .unwrap_or(9);
                 let to_body = |p: Vec3| MODEL_TO_BODY.transform_point3(p);
                 let dir_body = |d: Vec3| MODEL_TO_BODY.transform_vector3(d);
+                // the article's frame for this LOD: 0x59F220 finds the part `"tr"` + `[this+8]` — the
+                // LOD itself, no fallback (0x59F238, `or eax, 0x74720000`) — and the pass multiplies
+                // it in front of the car's matrix (0x43D915…0x43D929, `0x539B00`: `arg · this`),
+                // then, while `Base+0x4B` names a channel, the channel's `Rx·Ry·Rz` in front of
+                // that (0x43D943…0x43D9FE). Shipped: the pop-up headlights (channel 17), the cops'
+                // sirens (22), a wheel glint (1), the lids' and doors' glints (6, 8, 9) — every
+                // glare `tr` has an identity rotation, only a translation.
+                let tr = a
+                    .parts
+                    .iter()
+                    .find(|t| t.is_part(b"tr") && t.part_index() == u16::from(lod))
+                    .and_then(|t| car.crp.entry_data(&car.crp_data, t).ok())
+                    .filter(|m| m.len() >= 64)
+                    .map(|m| Mat4::from_cols_array(&std::array::from_fn(|i| f32::from_le_bytes([m[4 * i], m[4 * i + 1], m[4 * i + 2], m[4 * i + 3]]))));
+                let base_channel = a
+                    .level(b"Base")
+                    .and_then(|e| car.crp.entry_data(&car.crp_data, e).ok())
+                    .and_then(|d| d.get(0x4B).copied())
+                    .unwrap_or(0);
+                let channel = if tr.is_some() { base_channel } else { 0 };
                 let lamp = CarLight {
                     position: to_body(v(0)),
                     axis1: dir_body(v(0x10)),
@@ -1419,145 +2623,187 @@ impl CarModel {
                     kind: b[8 + 0x4C],
                     slot,
                     night: b[8 + 0x4F] != 0,
+                    frame: tr.unwrap_or(Mat4::IDENTITY),
+                    channel,
                 };
-                if !lights.iter().any(|l| l.position == lamp.position && l.slot == lamp.slot) {
+                // the mirrored copy only when `L+0x48 & 8` (0x43DAB6…0x43DABA): 804 of the shipped
+                // records carry 8 there and 126 carry 0, and those have no copy across x. (Until
+                // 2026-09-26 every lamp was mirrored, and the LOD 1 / LOD 2 copies were folded
+                // into one by position; the part list above now admits the LOD's own only.)
+                lights.push(lamp);
+                if b[8 + 0x48] & 8 != 0 {
                     let flip = |d: Vec3| Vec3::new(-d.x, d.y, d.z);
-                    let mirror = CarLight {
+                    lights.push(CarLight {
                         position: flip(lamp.position),
                         axis1: -lamp.axis1,
                         axis2: flip(lamp.axis2),
                         facing: flip(lamp.facing),
                         slot: b[8 + 0x4E],
+                        // 0x43DB5B…0x43DC0D: the `tr` copied with its translation zeroed, transposed
+                        // (0x53A650), and `T(−t.x, t.y, t.z) · that` (0x539B80, 0x539B00) — in
+                        // column form `Rᵀ · T`; the channel's value is `L+0x4D`'s (0x43DC36), the
+                        // gate still the primary's `Base+0x4B` (0x43DC29)
+                        frame: tr.map_or(Mat4::IDENTITY, |m| {
+                            let t = m.w_axis.truncate();
+                            Mat4::from_mat3(glam::Mat3::from_mat4(m).transpose()) * Mat4::from_translation(Vec3::new(-t.x, t.y, t.z))
+                        }),
+                        channel: if tr.is_some() && base_channel != 0 { b[8 + 0x4D] } else { 0 },
                         ..lamp
-                    };
-                    lights.push(lamp);
-                    lights.push(mirror);
+                    });
                 }
                 continue;
             }
             let g = car.crp.article_geometry(&car.crp_data, a)?;
-            if !g.primitives.iter().any(|p| p.lod == lod) {
-                continue;
-            }
             let (ty, variant) = g.base.as_ref().map(|b| (b.tag[0], b.tag[1])).unwrap_or((0, 0));
             if !style.article_enabled(ty, variant) {
                 continue;
             }
             let is_wheel = matches!(ty, 0x0D | 0x0E);
-            let local = g.transform_for_lod(lod).map(|m| Mat4::from_cols_array(&m)).unwrap_or(Mat4::IDENTITY);
-            let mut parts = Vec::new();
-            let mut part_channels: Vec<u8> = Vec::new();
-            // an animated article's morph frames: each frame's meshes, in frame 0's order —
-            // 0x43C4FB probes `vt` part `frame·0x10 + index` until one is missing, and the count
-            // is the animation's length when it is the largest (0x43C54B…0x43C56F)
+            // an animated article's morph frames: each frame's geometry — 0x43C4FB probes `vt`
+            // part `frame·0x10 + index` until one is missing, and the count is the animation's
+            // length when it is the largest (0x43C54B…0x43C56F)
             let anim = g.base.as_ref().map(|b| b.anim as usize).filter(|&n| n > 0 && n < ANIMS).unwrap_or(0);
-            let roof_frames: Vec<Vec<MeshData>> = if !is_wheel && anim != 0 {
-                let mut frames = Vec::new();
-                for f in 1u16.. {
-                    let Ok(gf) = car.crp.article_geometry_frame(&car.crp_data, a, f) else { break };
-                    let mut sk = 0;
-                    frames.push(article_meshes(&gf, lod, &mut sk).into_iter().map(|m| m.mesh).collect());
-                }
-                frames
+            let frame_geometry: Vec<nfs_formats::crp::ArticleGeometry> = if !is_wheel && anim != 0 {
+                (1u16..).map_while(|f| car.crp.article_geometry_frame(&car.crp_data, a, f).ok()).collect()
             } else {
                 Vec::new()
             };
-            if !roof_frames.is_empty() {
-                anim_length[anim] = anim_length[anim].max(roof_frames.len() as u32 + 1);
-            }
-            for (k, mm) in article_meshes(&g, lod, &mut skipped).into_iter().enumerate() {
-                let mut mesh = mm.mesh;
-                for v in &mut mesh.vertices {
-                    let p = (MODEL_TO_BODY * local).transform_point3(Vec3::from(v.position));
-                    if !is_wheel {
-                        min = min.min(p);
-                        max = max.max(p);
-                    } else {
-                        // the tyre's rolling radius is its extent about the hub, not the distance
-                        // to a corner of the wheel's quad: the 993's wheel mesh spans ±0.3148 in
-                        // both y and z, and the `.sim` tyre (16\" rim, 205/55) has a radius of
-                        // 16·12.7 + 205·0.55 = 315.95 mm
-                        let lp = Vec3::from(v.position);
-                        wheel_radius = wheel_radius.max(lp.y.abs()).max(lp.z.abs());
-                    }
-                }
-                let material = material_for(r, mm.material);
-                let id = r.upload_mesh(&mesh);
+            // 0x43E390 crushes the parts whose `Base+78` has bit 3 (0x43E3D8) from their
+            // `vt#(0x8000|lod)` vectors by their `dz#lod` zones. APPROXIMATION: a part that also
+            // morphs (the convertibles' roof, `Base+77`) is left uncrushed — which of the two
+            // writers of its vertex copy `part+0x40` wins is not read.
+            let damage_geometry = if anim == 0 && g.base.as_ref().is_some_and(|b| b.draw_bytes[0] & 8 != 0) { car.crp.article_geometry_damage(&car.crp_data, a).ok() } else { None };
+            // Every LOD the article has primitives in: the car draw 0x444E00 takes each pass from
+            // its own LOD object (`CarPass`). *(Until 2026-09-26 the port built LOD 1 alone and
+            // drew every part of it in every view.)*
+            let lods: std::collections::BTreeSet<u8> = g.primitives.iter().map(|p| p.lod).filter(|l| (1..=7).contains(l)).collect();
+            for l in lods {
+                // 0x43C8F8: the part's `"tr"` + the LOD, **no fallback** — without one the part
+                // is drawn in the car's own frame and the whole matrix block, the translation and
+                // rotation channels with it, is skipped (0x43C902 → 0x43CAFA). Such parts are
+                // modelled in car space: the 356's `DoorWindow` at LOD 4 sits where LOD 1's does
+                // through its `tr` (`lodtris` example; 314 articles of the shipped cars, none at
+                // LOD 1).
+                let tr = g.transforms.iter().find(|(i, _)| *i == l).map(|t| Mat4::from_cols_array(&t.1));
+                let local = tr.unwrap_or(Mat4::IDENTITY);
+                let info = PartInfo {
+                    lod: l,
+                    mask: g.base.as_ref().map_or(0, |b| b.draw_bytes[0]),
+                    inside: g.base.as_ref().is_some_and(|b| b.draw_bytes[3] != 0),
+                    inside_only: g.base.as_ref().is_some_and(|b| b.draw_bytes[4] != 0),
+                    move_channel: if tr.is_some() { g.base.as_ref().map_or(-1, |b| b.move_channel) } else { -1 },
+                };
+                let rot_channel = if tr.is_some() { g.base.as_ref().map_or(0, |b| b.rot_channel) } else { 0 };
+                let roof_frames: Vec<Vec<MeshData>> = frame_geometry
+                    .iter()
+                    .map(|gf| {
+                        let mut sk = 0;
+                        article_meshes(gf, l, &mut sk).into_iter().map(|m| m.mesh).collect()
+                    })
+                    .collect();
                 if !roof_frames.is_empty() {
-                    let mut positions = vec![mm_positions(&mesh)];
-                    for f in &roof_frames {
-                        match f.get(k) {
-                            Some(m) if m.vertices.len() == mesh.vertices.len() => positions.push(mm_positions(m)),
-                            _ => break,
+                    anim_length[anim] = anim_length[anim].max(roof_frames.len() as u32 + 1);
+                }
+                // the crush vectors and zones laid out as the meshes are: the damage geometry, and
+                // the geometry with each vertex's position replaced by its zone (the `dz` lists
+                // index the whole `vt#lod`, a primitive's window starting at `vt_first`)
+                let crush: Option<(Vec<nfs_assets::mesh::MaterialMesh>, Vec<nfs_assets::mesh::MaterialMesh>)> = damage_geometry.as_ref().and_then(|dg| {
+                    let dz = car.crp.damage_zones(&car.crp_data, a, l).ok()??;
+                    let n = dz.zones.iter().flat_map(|z| z.1.iter()).map(|&i| i as usize + 1).max().unwrap_or(0);
+                    let mut zone_of = vec![255u8; n];
+                    for (z, list) in &dz.zones {
+                        for &i in list {
+                            zone_of[i as usize] = u8::try_from(*z).unwrap_or(255);
                         }
                     }
-                    morph[anim].push(MorphPart { mesh: id, base: mesh.vertices.clone(), frames: positions });
+                    let mut gz = g.clone();
+                    for p in gz.primitives.iter_mut().filter(|p| p.lod == l) {
+                        let first = p.vt_first as usize;
+                        for (i, q) in p.positions.iter_mut().enumerate() {
+                            *q = [zone_of.get(first + i).copied().unwrap_or(255) as f32, 0.0, 0.0];
+                        }
+                    }
+                    let mut sk = 0;
+                    Some((article_meshes(dg, l, &mut sk), article_meshes(&gz, l, &mut sk)))
+                });
+                let mut parts = Vec::new();
+                let mut part_channels: Vec<u8> = Vec::new();
+                for (k, mm) in article_meshes(&g, l, &mut skipped).into_iter().enumerate() {
+                    let mut mesh = mm.mesh;
+                    // the port's own measures (the model box, the tyre radius, the track) come
+                    // from the reference LOD alone
+                    if l == lod {
+                        for v in &mut mesh.vertices {
+                            let p = (MODEL_TO_BODY * local).transform_point3(Vec3::from(v.position));
+                            if !is_wheel {
+                                min = min.min(p);
+                                max = max.max(p);
+                            } else {
+                                // the tyre's rolling radius is its extent about the hub, not the distance
+                                // to a corner of the wheel's quad: the 993's wheel mesh spans ±0.3148 in
+                                // both y and z, and the `.sim` tyre (16\" rim, 205/55) has a radius of
+                                // 16·12.7 + 205·0.55 = 315.95 mm
+                                let lp = Vec3::from(v.position);
+                                wheel_radius = wheel_radius.max(lp.y.abs()).max(lp.z.abs());
+                            }
+                        }
+                    }
+                    let material = material_for(r, mm.material);
+                    let id = r.upload_mesh(&mesh);
+                    if !roof_frames.is_empty() {
+                        let mut positions = vec![mm_positions(&mesh)];
+                        for f in &roof_frames {
+                            match f.get(k) {
+                                Some(m) if m.vertices.len() == mesh.vertices.len() => positions.push(mm_positions(m)),
+                                _ => break,
+                            }
+                        }
+                        morph[anim].push(MorphPart { mesh: id, base: mesh.vertices.clone(), frames: positions });
+                    }
+                    if let Some((dm, zm)) = &crush
+                        && let (Some(d), Some(z)) = (dm.get(k), zm.get(k))
+                        && d.mesh.vertices.len() == mesh.vertices.len()
+                        && z.mesh.vertices.len() == mesh.vertices.len()
+                    {
+                        deform.push(DeformPart {
+                            mesh: id,
+                            base: mesh.vertices.clone(),
+                            delta: d.mesh.vertices.iter().map(|v| v.position).collect(),
+                            zone: z.mesh.vertices.iter().map(|v| v.position[0] as u8).collect(),
+                        });
+                    }
+                    parts.push((id, material, local));
+                    part_channels.push(rot_channel);
                 }
-                parts.push((id, material, local));
-                part_channels.push(g.base.as_ref().map(|b| b.rot_channel).unwrap_or(0));
-            }
-            if is_wheel {
-                let pivot = MODEL_TO_BODY.transform_point3(local.w_axis.truncate());
-                half_track = half_track.max(pivot.x.abs());
-                let channel = g.base.as_ref().map(|b| b.rot_channel).unwrap_or(0);
+                if parts.is_empty() {
+                    continue;
+                }
                 let key = g.base.as_ref().map_or(0, |b| b.tag[2] as i8);
-                wheels.push(CarWheelModel { pivot, is_front: ty == 0x0D, is_left: local.w_axis.x > 0.0, channel, key, parts });
-            } else {
-                body_key.extend(std::iter::repeat_n(g.base.as_ref().map_or(0, |b| b.tag[2] as i8), parts.len()));
-                body.extend(parts);
-                body_channel.extend(part_channels);
+                if is_wheel && tr.is_some() {
+                    let pivot = MODEL_TO_BODY.transform_point3(local.w_axis.truncate());
+                    if l == lod {
+                        half_track = half_track.max(pivot.x.abs());
+                    }
+                    wheels.push(CarWheelModel { pivot, is_front: ty == 0x0D, is_left: local.w_axis.x > 0.0, channel: rot_channel, key, info, parts });
+                } else {
+                    body_key.extend(std::iter::repeat_n(key, parts.len()));
+                    body_info.extend(std::iter::repeat_n(info, parts.len()));
+                    body.extend(parts);
+                    body_channel.extend(part_channels);
+                }
             }
         }
         tracing::info!(body_parts = body.len(), wheels = wheels.len(), lights = lights.len(), roof_parts = morph[1].len(), roof_length = anim_length[1], anims = ?anim_length, skipped, pages = pages.len(), wheel_radius, half_track, "car uploaded");
-        // the windscreen seen from the driver's seat: the `Wndo` quad with `INTGLASS`'s `glai`
-        // entry. 0x43A490 draws it whenever the camera's view id is 0 or 1 — the two views that do
-        // not draw the car itself — and skips it in a replay.
-        let window = (|| {
-            let quad = car.crp.window_points(&car.crp_data).ok()?.into_iter().find(|w| w.style_slot == 0 && w.style_value == 0)?;
-            if quad.points.len() < 4 {
-                return None;
-            }
-            let p: Vec<Vec3> = quad.points.iter().take(4).map(|q| MODEL_TO_BODY.transform_point3(Vec3::from(*q))).collect();
-            let g = nfs_assets::car::global_texture(paths, "INTGLASS.FSH", "glai").ok()??;
-            let tex = r.upload_texture(&TextureData { width: g.width, height: g.height, mips: g.mips.clone() });
-            // the batch's state object (0x5379F0 at 0x4578AB) is set to blend 1 at 0x4578B4 and
-            // handed to the batch with the uv and colour buffers (0x4578F2 → 0x4685E0): Thrash
-            // 0x38 = 1, `SRCALPHA` / `ONE` — the glass adds its light (`RE/notes/thrash.md` §6)
-            let mat = r.create_material(MaterialDesc { texture: Some(tex), alpha_blend: true, cull_back: false, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 1, clamp: [false; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false });
-            // **The quad is mapped to the whole texture**, and that is traced now. The batcher's
-            // three parallel buffers are positions at `acc+0x0C` (stride 0x10), **texture
-            // coordinates at `acc+0x25BC` (stride 8)** and colours at `acc+0x3894` (stride 4), 201
-            // triangles of three vertices each. The whole image holds **three** references to
-            // `+0x25BC`: two are the flush in 0x457E60, and the third, 0x4578EB, registers the
-            // buffer as a stream. Nothing ever writes it per quad — it is filled **once**, at
-            // 0x458150 from the accumulator's setup (0x457864), with a fixed pattern that
-            // alternates on the triangle index:
-            //
-            // ```text
-            // even: (1,0) (1,1) (0,0)      odd: (0,1) (0,0) (1,1)
-            // ```
-            //
-            // so each **pair** of triangles covers the unit square. There is no generated mapping
-            // to find, which is what an earlier note had guessed at.
-            //
-            // What is left is which corner takes which of the four: the original's vertices reach
-            // the buffer through 0x4583F0 (`origin + (a·len)·u + b·v` on the plane 0x457920 sorts
-            // by y and then x), and this port uses the record's own order. That ordering is the
-            // one residual here.
-            let uv = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
-            let mut mesh = MeshData::default();
-            for (i, q) in p.iter().enumerate() {
-                mesh.vertices.push(Vertex { position: q.to_array(), normal: [0.0, 1.0, 0.0], uv: uv[i], color: [1.0; 4] });
-            }
-            mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-            Some((r.upload_mesh(&mesh), mat))
-        })();
-        tracing::info!(patches = damage_patches.len(), night, glass = window.is_some(), "damage decals");
+        tracing::info!(patches = damage_patches.len(), night, "damage decals");
         Ok(Self {
             scale: 1.0,
+            mirror: false,
             body,
             body_channel,
             body_key,
+            body_info,
+            lod_parts,
+            lod_moves,
             material_light,
             shadowed,
             morph,
@@ -1594,22 +2840,53 @@ impl CarModel {
             damage_pages: pages,
             damage_patches,
             page_textures,
-            damage_shown: [0; 10],
-            window,
+            damage_shown: [0.0; 10],
+            deform,
         })
     }
 
-    /// Recompose the texture pages the damage decals touch (`RE/notes/car-model.md` §11). Cheap to
-    /// call every frame: it does nothing until a zone's damage changes by a whole per cent.
-    pub fn update_damage(&mut self, r: &mut Renderer, damage: &[f32; 10]) {
-        if self.damage_patches.is_empty() {
-            return;
-        }
-        let now: [u8; 10] = std::array::from_fn(|i| damage[i].clamp(0.0, 100.0) as u8);
+    /// **0x438230(0)**, which `R3DCar` slot 7 runs every frame (0x4383CC): when any of the ten
+    /// [`zone_damage`] values differs from the last ones kept at `+0x6A8` (an exact `fcomp`,
+    /// 0x438240…0x438259), keep the new ones (0x4382A4…0x4382B7) and recompose the texture pages
+    /// the damage decals touch from the car's **raw** zone damage `car+0x4E4` (0x4451E0 → 0x448010,
+    /// `RE/notes/car-model.md` §11). `own_car`: the car the camera follows, whose side and roof
+    /// zones are capped at 0 here — their changes alone do not trigger it. *(Until 2026-09-26 the
+    /// port rebuilt whenever a zone's damage crossed a whole per cent.)*
+    ///
+    /// Before the pages, **0x43E390** crushes the body for every LOD (0x438273…0x4382A2): at
+    /// `CARDETAIL` (`detail`) above 0 (0x43E3E2), each part with `Base+78 & 8`, per `dz` zone whose
+    /// value changed (0x438390): `f = value · 0.02`, 1 above 1 (0x43E54D…0x43E571), and each of the
+    /// zone's vertices `vt + f · vt#(0x8000|lod)` (0x53C5D0, 0x43E5D4…0x43E617). *(Until 2026-09-26
+    /// the port never moved a vertex: damage was decals alone.)* The byte `part+0x50` it sets
+    /// above `f = 0.5` (0x43E584) is not read here — its reader is not found.
+    pub fn update_damage(&mut self, r: &mut Renderer, damage: &[f32; 10], own_car: bool, detail: u8) {
+        let now = zone_damage(damage, own_car);
         if now == self.damage_shown {
             return;
         }
+        let changed: [bool; 10] = std::array::from_fn(|z| now[z] != self.damage_shown[z]);
         self.damage_shown = now;
+        if detail > 0 {
+            let f: [f32; 10] = std::array::from_fn(|z| {
+                let f = now[z] * 0.02;
+                if f <= 1.0 { f } else { 1.0 }
+            });
+            for p in &self.deform {
+                if !p.zone.iter().any(|&z| changed.get(z as usize).copied().unwrap_or(false)) {
+                    continue;
+                }
+                let mut v = p.base.clone();
+                for (k, out) in v.iter_mut().enumerate() {
+                    let Some(&k_f) = f.get(p.zone[k] as usize) else { continue };
+                    let d = p.delta[k];
+                    out.position = [out.position[0] + k_f * d[0], out.position[1] + k_f * d[1], out.position[2] + k_f * d[2]];
+                }
+                r.update_mesh_vertices(p.mesh, &v);
+            }
+        }
+        if self.damage_patches.is_empty() {
+            return;
+        }
         let touched: Vec<usize> = {
             let mut v: Vec<usize> = self.damage_patches.iter().map(|p| p.page).collect();
             v.sort_unstable();
@@ -1833,6 +3110,35 @@ impl CarModel {
         Mat4::from_rotation_x(t * TAU) * Mat4::from_rotation_y(y * TAU) * Mat4::from_rotation_z(z * TAU)
     }
 
+    /// A lamp's two frames in the body frame (lamp's body-frame data → car body), as the effect
+    /// pass 0x43D800 builds them per `ef` record: the **glare's** `Rch · tr` in front of the car's
+    /// matrix (0x43D8D1…0x43DA46; `Rch` = `Rx·Ry·Rz` of the channel's three turns, 0x43D952…
+    /// 0x43D9FE) — the sprite, the reflection and the beam's rings go through it — and the
+    /// **beam's** own, the same with the x term left out (0x43DA03 resets to identity and
+    /// multiplies only `Ry·Rz`, 0x43DA0F…0x43DA46), through which 0x43D4F0 carries only the
+    /// forward `(0, 0, −1)` (0x43D5A3…0x43D5F4): a pop-up headlight's glare tips with the lamp,
+    /// its beam still points down the road. The three floats compose straight, with no door
+    /// case (unlike the body's 0x43CA5A); the order and senses are `channel_matrix`'s.
+    pub fn lamp_frames(&self, l: &CarLight) -> (Mat4, Mat4) {
+        use std::f32::consts::TAU;
+        let n = l.channel as usize;
+        let (x, [y, z]) = if n == 0 {
+            (0.0, [0.0; 2])
+        } else {
+            (self.channel_turns.get(n).copied().unwrap_or(0.0), self.channel_yz.get(n).copied().unwrap_or([0.0; 2]))
+        };
+        let yz = Mat4::from_rotation_y(y * TAU) * Mat4::from_rotation_z(z * TAU);
+        let body = |m: Mat4| MODEL_TO_BODY * l.frame * m * MODEL_TO_BODY;
+        (body(Mat4::from_rotation_x(x * TAU) * yz), body(yz))
+    }
+
+    /// Whether the car has pop-up headlights: `headlightextent`, `R3DCar+0x70`, non-zero only on
+    /// the 914, 928 and 944. 0x439627 tests it: only then do the headlight slots take the ramp's
+    /// value over it (0x43963B…0x43969E); with 0 they are 1.0 or 0 at once (0x43972D…0x43973E).
+    pub fn has_headlight_extent(&self) -> bool {
+        self.headlight_extent != 0.0
+    }
+
     /// The dash needles' calibration from the car's `nfs5.car` record (see `dash`).
     pub fn set_dash(&mut self, tach0: f32, tach1000: f32, speedo0: f32, speedo100: f32) {
         self.dash = [tach0, tach1000, speedo0, speedo100];
@@ -1927,74 +3233,212 @@ impl CarModel {
         }
     }
 
-    /// Draw items for a car at `car_to_world` (body frame → world). `wheel_spin` in turns,
-    /// `steer` in turns for the front wheels, positive to the right — take it from
-    /// `Vehicle::wheel_steer_turns`, not from the raw `Wheel::steer`.
-    pub fn draw_items(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2]) -> Vec<DrawItem> {
-        let car_to_world = car_to_world * Mat4::from_scale(Vec3::splat(self.scale));
-        let mut out = Vec::with_capacity(self.body.len() + 4 * 8);
-        let mut keys: Vec<i8> = Vec::with_capacity(self.body.len() + 4 * 8);
-        for (i, (mesh, material, local)) in self.body.iter().enumerate() {
-            // A part bound to a rotation channel turns about **its own origin**: 0x43CA19…
-            // 0x43CA38 compose Rx·Ry·Rz and 0x43CA43 multiplies that into the part's transform,
-            // so the rotation is on the right of the part's own matrix.
-            let m = match self.body_channel.get(i).copied().unwrap_or(0) {
-                0 => *local,
-                // 18…21 are channels 1…4 with `.x` cleared (0x438669…0x438726) — the wheel shadow
-                // and the parts that turn with the steer but do not spin. Taking them from the
-                // caller's `steer` instead of this model's own channels is what lets the traffic
-                // and the cops have them: those share one upload per car type.
-                n @ 18..=21 if n <= 19 => *local * Mat4::from_rotation_y(steer[(n - 18) as usize] * std::f32::consts::TAU),
-                20..=21 => *local,
-                // 5, the steering wheel: `.z = ch1.y + ch2.y` within ±4.5/23 (0x43858F…0x4385FB).
-                // Off the caller's `steer` for the same reason as 18…21 — the traffic and the cops
-                // share one model per car type and would otherwise hold the wheel straight.
-                5 => *local * Mat4::from_rotation_z((steer[0] + steer[1]).clamp(-4.5 / 23.0, 4.5 / 23.0) * std::f32::consts::TAU),
-                n => *local * self.channel_matrix(n),
-            };
-            out.push(DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * m));
-            keys.push(self.body_key.get(i).copied().unwrap_or(0));
+    /// Set all three turns of one channel — `R3DCar` 0x443F30(n, &v), which copies the vector
+    /// into `object + 0x2DC + 12n` whole.
+    pub fn set_channel_vec(&mut self, n: u8, v: [f32; 3]) {
+        if let (Some(x), Some(yz)) = (self.channel_turns.get_mut(n as usize), self.channel_yz.get_mut(n as usize)) {
+            *x = v[0];
+            *yz = [v[1], v[2]];
         }
-        for w in &self.wheels {
-            let idx = match (w.is_front, w.is_left) {
-                (true, true) => 0,
-                (true, false) => 1,
-                (false, true) => 2,
-                (false, false) => 3,
-            };
-            // The original draws its wheels through channels 1…4 like every other moving part:
-            // `.x = −(wheel+0x88)` (0x438600…0x438660), in **model** space, which is the body
-            // frame turned half a turn about y — so `+turn` about the body's x. This read
-            // `−turn` until 2026-09-22 and rolled the wheels backwards.
-            // a wheel article on channels 18…21 takes the steer but **not** the spin: `.x` of those
-            // channels is cleared at 0x438669…0x438726
-            let spin = if (18..=21).contains(&w.channel) {
-                Mat4::IDENTITY
-            } else {
-                Mat4::from_rotation_x(wheel_spin[idx] * std::f32::consts::TAU)
-            };
-            // **Positive steer is a right turn** (the right arrow gives +1, and the car yaws right
-            // on it), and in the body frame +X is right and +Z forward — so the wheel turns by
-            // `+steer`: `from_rotation_y(θ)` carries forward (0,0,1) to (sin θ, 0, cos θ), toward
-            // +X. This said `-steer` until 2026-09-21 and drew the front wheels turned the wrong
-            // way while the car steered correctly — found in play.
-            // `.y` is the wheel's own `+0xB4` over 216 (channels 1 and 2, 0x438461…0x4384EB); a
-            // turn about y is the same in both frames
-            let st = if w.is_front { Mat4::from_rotation_y(steer[if w.is_left { 0 } else { 1 }] * std::f32::consts::TAU) } else { Mat4::IDENTITY };
-            for (mesh, material, local) in &w.parts {
-                // local has translation = pivot; rotate about the pivot in model space
-                let pivot = local.w_axis.truncate();
-                let m = Mat4::from_translation(pivot) * MODEL_TO_BODY * st * spin * MODEL_TO_BODY.inverse() * Mat4::from_translation(-pivot) * *local;
-                out.push(DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * m));
-                keys.push(w.key);
+    }
+
+    /// Write `src` (RGBA, `w` × `h`) into texture page `page` (0-based, `tpage<page+1>` — the
+    /// order of the model's page array `[R3DCar+0x78]`, 0x34 bytes an entry, 0x442F1B) at `(x, y)`
+    /// the way the software blitter stores a texel in the page's format
+    /// ([`nfs_assets::car::blitter_texel`]), clipped to the page, and upload it — what 0x534480
+    /// (the page as the destination), a blit and 0x443C80 (the page's refresh, 0x447AF0) do. The
+    /// page stays written: a later blit lands over it, as on the original's surface.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_page(&mut self, r: &mut Renderer, page: usize, src: &[u8], w: u32, h: u32, x: i64, y: i64) {
+        let (Some(p), Some(&tex)) = (self.damage_pages.get_mut(page), self.page_textures.get(page)) else { return };
+        for row in 0..h as i64 {
+            let py = y + row;
+            if py < 0 || py >= p.height as i64 {
+                continue;
+            }
+            for col in 0..w as i64 {
+                let px = x + col;
+                if px < 0 || px >= p.width as i64 {
+                    continue;
+                }
+                let Some(s) = src.get(((row as u32 * w + col as u32) * 4) as usize..).and_then(|s| s.get(..4)) else { continue };
+                let t = nfs_assets::car::blitter_texel(p.bpp, [s[0], s[1], s[2], s[3]]);
+                let k = ((py as u32 * p.width + px as u32) * 4) as usize;
+                p.rgba[k..k + 4].copy_from_slice(&t);
             }
         }
-        // the parts in `Base+70` order (0x43C1B0's sort). APPROXIMATION within one key: the
-        // original's `std::sort` is not stable, the port keeps the file's order there
-        let mut order: Vec<usize> = (0..out.len()).collect();
-        order.sort_by_key(|&k| keys[k]);
-        let mut slots: Vec<Option<DrawItem>> = out.into_iter().map(Some).collect();
-        order.into_iter().filter_map(|k| slots[k].take()).collect()
+        r.update_texture(tex, &TextureData::single(p.width, p.height, p.rgba.clone()));
+    }
+
+    /// A channel's three turns — 0x443F10(n).
+    pub fn channel_vec(&self, n: u8) -> [f32; 3] {
+        let x = self.channel_turns.get(n as usize).copied().unwrap_or(0.0);
+        let [y, z] = self.channel_yz.get(n as usize).copied().unwrap_or([0.0; 2]);
+        [x, y, z]
+    }
+
+    /// Draw items for a car at `car_to_world` (body frame → world). `wheel_spin` in turns,
+    /// `steer` in turns for the front wheels, positive to the right — take it from
+    /// `Vehicle::wheel_steer_turns`, not from the raw `Wheel::steer`. `travel` is the car's four
+    /// translation channels' `.y` ([`CarLodState::travel`]) and `passes` the car draw's calls
+    /// ([`race_passes`], [`in_car_passes`], [`FRONT_END_PASSES`]).
+    ///
+    /// Each pass is one `R3DCarLOD::draw` 0x43C830: the parts of its LOD whose `Base+78` meets its
+    /// mask ([`PartInfo::in_pass`]) in `Base+70` order (0x43C1B0's sort of that LOD's list), and
+    /// the passes one after the other as 0x444E00 makes them — the driver, then the body, then the
+    /// wheels.
+    pub fn draw_items(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2], travel: [f32; 4], passes: &[CarPass]) -> Vec<DrawItem> {
+        // 0x4433D2 / 0x4433BC: `(−m·s, s, −s)` — `MODEL_TO_BODY` scaled, its x turned back in a
+        // mirrored race; and the steer channels negated there (0x438471)
+        let car_to_world = car_to_world * Mat4::from_scale(Vec3::new(if self.mirror { -self.scale } else { self.scale }, self.scale, self.scale));
+        let steer = if self.mirror { [-steer[0], -steer[1]] } else { steer };
+        // the translation channel `Base+72` (0x43C945…0x43C982): `T(object + 0x6D0 + 12m)` into the
+        // part's matrix after its `tr` and before its rotation — the only float of it written is
+        // `.y` (0x43E6E1…0x43E6F1), so a lift along the model's (and the body's) up
+        let lift = |m: i8| usize::try_from(m).ok().and_then(|m| travel.get(m).copied()).map_or(Mat4::IDENTITY, |y| Mat4::from_translation(Vec3::new(0.0, y, 0.0)));
+        let mut out = Vec::with_capacity(self.body.len() / 4 + 4 * 8);
+        for pass in passes {
+            let mut items: Vec<(i8, DrawItem)> = Vec::new();
+            for (i, (mesh, material, local)) in self.body.iter().enumerate() {
+                let Some(info) = self.body_info.get(i).filter(|info| info.in_pass(pass)) else { continue };
+                // A part bound to a rotation channel turns about **its own origin**: 0x43CA19…
+                // 0x43CA38 compose Rx·Ry·Rz and 0x43CA43 multiplies that into the part's transform,
+                // so the rotation is on the right of the part's own matrix.
+                let local = &(*local * lift(info.move_channel));
+                let m = match self.body_channel.get(i).copied().unwrap_or(0) {
+                    0 => *local,
+                    // 18…21 are channels 1…4 with `.x` cleared (0x438669…0x438726) — the wheel shadow
+                    // and the parts that turn with the steer but do not spin. Taking them from the
+                    // caller's `steer` instead of this model's own channels is what lets the traffic
+                    // and the cops have them: those share one upload per car type.
+                    n @ 18..=21 if n <= 19 => *local * Mat4::from_rotation_y(steer[(n - 18) as usize] * std::f32::consts::TAU),
+                    20..=21 => *local,
+                    // 5, the steering wheel: `.z = ch1.y + ch2.y` within ±4.5/23 (0x43858F…0x4385FB).
+                    // Off the caller's `steer` for the same reason as 18…21 — the traffic and the cops
+                    // share one model per car type and would otherwise hold the wheel straight.
+                    5 => *local * Mat4::from_rotation_z((steer[0] + steer[1]).clamp(-4.5 / 23.0, 4.5 / 23.0) * std::f32::consts::TAU),
+                    n => *local * self.channel_matrix(n),
+                };
+                items.push((self.body_key.get(i).copied().unwrap_or(0), DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * m)));
+            }
+            for w in self.wheels.iter().filter(|w| w.info.in_pass(pass)) {
+                let idx = match (w.is_front, w.is_left) {
+                    (true, true) => 0,
+                    (true, false) => 1,
+                    (false, true) => 2,
+                    (false, false) => 3,
+                };
+                // The original draws its wheels through channels 1…4 like every other moving part:
+                // `.x = −(wheel+0x88)` (0x438600…0x438660), in **model** space, which is the body
+                // frame turned half a turn about y — so `+turn` about the body's x. This read
+                // `−turn` until 2026-09-22 and rolled the wheels backwards.
+                // a wheel article on channels 18…21 takes the steer but **not** the spin: `.x` of those
+                // channels is cleared at 0x438669…0x438726
+                let spin = if (18..=21).contains(&w.channel) {
+                    Mat4::IDENTITY
+                } else {
+                    Mat4::from_rotation_x(wheel_spin[idx] * std::f32::consts::TAU)
+                };
+                // **Positive steer is a right turn** (the right arrow gives +1, and the car yaws right
+                // on it), and in the body frame +X is right and +Z forward — so the wheel turns by
+                // `+steer`: `from_rotation_y(θ)` carries forward (0,0,1) to (sin θ, 0, cos θ), toward
+                // +X. This said `-steer` until 2026-09-21 and drew the front wheels turned the wrong
+                // way while the car steered correctly — found in play.
+                // `.y` is the wheel's own `+0xB4` over 216 (channels 1 and 2, 0x438461…0x4384EB); a
+                // turn about y is the same in both frames
+                let st = if w.is_front { Mat4::from_rotation_y(steer[if w.is_left { 0 } else { 1 }] * std::f32::consts::TAU) } else { Mat4::IDENTITY };
+                for (mesh, material, local) in &w.parts {
+                    // local has translation = pivot (every wheel `tr` is a pure translation); rotate
+                    // about the pivot in model space, the lift before it: `tr · T · R`
+                    let pivot = local.w_axis.truncate();
+                    let m = lift(w.info.move_channel) * Mat4::from_translation(pivot) * MODEL_TO_BODY * st * spin * MODEL_TO_BODY.inverse() * Mat4::from_translation(-pivot) * *local;
+                    items.push((w.key, DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * m)));
+                }
+            }
+            // the parts in `Base+70` order (0x43C1B0's sort). APPROXIMATION within one key: the
+            // original's `std::sort` is not stable, the port keeps the file's order there
+            items.sort_by_key(|(k, _)| *k);
+            out.extend(items.into_iter().map(|(_, it)| it));
+        }
+        out
+    }
+
+    /// The class count the LOD pick scales by (0x43A0DC…0x43A117): the 1-based number of the first
+    /// LOD whose part list is empty (`R3DCarLOD` slot 6, 0x43ADF0, `+0x10`), 7 when none is.
+    fn lod_span(&self) -> i32 {
+        self.lod_parts.iter().position(|&n| n == 0).map_or(7, |k| k as i32 + 1)
+    }
+
+    /// `R3DCar` slot 13, **0x439F90**, in a race past its camera test (0x43A060…0x43A3B0): the LOD
+    /// class `+0x2C0`, or `None` when the car covers 3 pixels or less and is not drawn (0x43A2E8,
+    /// the caller 0x443192).
+    ///
+    /// The class starts from `0x5CD5B8[CARDETAIL]` = 3, 3, 2 (and 1 more on a machine under 40 MB,
+    /// `GlobalMemoryStatus` 0x53C3D0 — never here); a replay (`[0x657424] >= 2`) with `CARDETAIL`
+    /// above 0 takes 1 off, an opponent (`car+0x52C & 8`) at `CARDETAIL` 0 adds 1, and a traffic car
+    /// (`& 0x10`) starts from 0. The car's box — `car+0x3A8` as `(x, y, z)`, `(−2x, y, z)` and
+    /// `(x, y, −z)` about the draw origin, through the car's rows (0x43A18D…0x43A206) — is projected
+    /// (0x539700), and `size` = the bit-trick roots of the two edges' squared screen lengths from
+    /// the first point, × 640 / screen width (0x43A26A…0x43A2E5). Then `t = max(1 − rsqrt₁₂₀ · √size,
+    /// 0) · (N − bias − 1)` with the bit-trick `rsqrt(120)` (0x5F400000 − bits/2) and `N`
+    /// [`Self::lod_span`]; `t · (t + 1) / 2` for all but traffic; the class is `bias + fistp(t −
+    /// 0.5)`, within `0 … 7 − (CARDETAIL > 1 ? 2 : 1)` (0x43A305…0x43A3B0).
+    #[allow(clippy::too_many_arguments)]
+    pub fn lod_class(&self, view: &LodView, origin: Vec3, rotation: glam::Quat, half: Vec3, detail: u8, kind: CarKind, replay: bool) -> Option<u8> {
+        let cd = detail as i32;
+        let mut bias = CLASS_BIAS[(cd as usize).min(3)];
+        if replay && cd > 0 {
+            bias -= 1;
+        } else if cd == 0 && kind == CarKind::Opponent {
+            bias += 1;
+        }
+        if kind == CarKind::Traffic {
+            bias = 0;
+        }
+        let span = self.lod_span() - bias;
+        let screen = |p: Vec3| {
+            let c = view.view_projection * (origin + rotation * p).extend(1.0);
+            glam::Vec2::new(c.x / c.w * view.width * 0.5, c.y / c.w * view.height * 0.5)
+        };
+        let s0 = screen(Vec3::new(half.x, half.y, half.z));
+        let s1 = screen(Vec3::new(-2.0 * half.x, half.y, half.z));
+        let s2 = screen(Vec3::new(half.x, half.y, -half.z));
+        let d1 = (s1 - s0).length_squared();
+        let d2 = (s2 - s0).length_squared();
+        // x87: the two roots summed and scaled on the stack, `fst` to a float for the root below
+        let size = (bit_root(d1) as f64 + bit_root(d2) as f64) * (640.0 / view.width as f64);
+        if size <= 3.0 {
+            return None;
+        }
+        let rsqrt_120 = f32::from_bits(0x5F40_0000 - (120f32.to_bits() >> 1));
+        let mut t = 1.0 - rsqrt_120 as f64 * bit_root(size as f32) as f64;
+        if t < 0.0 {
+            t = 0.0;
+        }
+        t *= (span - 1) as f64;
+        if kind != CarKind::Traffic {
+            t *= (t + 1.0) * 0.5;
+        }
+        let k = ((t - 0.5) as f32).round_ties_even() as i32;
+        let max = 7 - if cd > 1 { 2 } else { 1 };
+        let class = bias + k;
+        Some(if class >= max { max } else { class.max(0) } as u8)
+    }
+
+    /// The translation channels after a class: 0x43E670 over the LOD objects `0 … class − 1`
+    /// (0x43A3B6…0x43A3F8; the driver view jumps there with the class it had), each writing channel
+    /// `m`'s `.y` from wheel `[0x5B36F0 + 4m]`'s `+0x68` — `(0, 1, 2, 3)`, or `(1, 0, 3, 2)` in a
+    /// mirrored race (`[0x65742C]`, 0x43E6B1…0x43E6C2) — while its gate says one of the LOD's parts
+    /// rides it. So a car at class 0 keeps what it had: none of its LODs is walked.
+    pub fn update_travel(&self, state: &mut CarLodState, compression: [f32; 4], mirror: bool) {
+        let map = if mirror { [1, 0, 3, 2] } else { [0, 1, 2, 3] };
+        for moves in self.lod_moves.iter().take(state.class as usize) {
+            for m in 0..4 {
+                if moves[m] {
+                    state.travel[m] = compression[map[m]];
+                }
+            }
+        }
     }
 }
 
@@ -2021,6 +3465,12 @@ impl CarModel {
         self.roof_state = state;
         let t = self.anim_length[1] as f32 * state as f32 * (1.0 / 255.0);
         self.set_anim(r, 1, t);
+    }
+
+    /// The roof state [`set_roof`](Self::set_roof) last took — what the front end's car object
+    /// keeps at `+4` and 0x4D19E0(1) answers.
+    pub fn roof_state(&self) -> i32 {
+        self.roof_state
     }
 
     /// `0x438190(n)`: animation `n`'s length in frames, 0 when the car has none.
@@ -2129,8 +3579,17 @@ impl CarModel {
         }
     }
 
-    pub fn draw_items_block(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2], block: &LightBlock) -> Vec<DrawItem> {
-        let mut out = self.draw_items(car_to_world, wheel_spin, steer);
+    /// `R3DSkyMapTextureLayer` for this car's items (`TrackWorld::sky_map`); the renderer draws
+    /// the pass only on the items whose material has it (`MaterialDesc::sky_map`).
+    pub fn apply_sky(&self, items: &mut [DrawItem], sky: Option<nfs_renderer::SkyMap>) {
+        for it in items {
+            it.sky = sky;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_items_block(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2], travel: [f32; 4], passes: &[CarPass], block: &LightBlock) -> Vec<DrawItem> {
+        let mut out = self.draw_items(car_to_world, wheel_spin, steer, travel, passes);
         for it in &mut out {
             it.layer_light = self.material_light.get(&it.material).and_then(|l| block.layer_light(*l));
         }
@@ -2154,6 +3613,30 @@ fn flat_colour(i: u16) -> [f32; 4] {
         _ => (v, p, q),
     };
     [r, g, b, 1.0]
+}
+
+/// `[WTrack+0x34]` holds at most **125** smackables: 0x4888B0 stops adding at `size ≥ 0x7D`
+/// (0x488926), the mission scene's first (0x487DEE), then the instance bundle's (0x487DFE).
+pub const MAX_SMACKABLES: usize = 125;
+
+/// The `.crp` articles 0x4772F0 makes smackables of among the instance bundle's items, in `.crp`
+/// order (the bundle's item order): an article with a `tr` (`WInstanceBundle::Load` takes those,
+/// 0x47859E) that is not a library template (`Base & 0x8000` — the scene bundle's,
+/// `RENDERING.md` "The scene item's draw matrix"; whether a template record is itself a scene
+/// item the anim world builds for is not read, so none is taken here), whose `Base` byte 0 lacks
+/// 0x40 (0x477377) and whose definition (0x47ED90) says `kSmackable` (0x4773EE). The loader
+/// 0x4750B0 builds no collision object for these (0x47533A), so 0x498DE0 never meets them
+/// (`suspension-collision.md` §9 "The track's smackables").
+pub fn track_smackable_articles(track: &TrackAssets) -> Vec<usize> {
+    let Ok(arts) = track.crp.articles(&track.crp_data) else { return Vec::new() };
+    arts.iter()
+        .enumerate()
+        .filter_map(|(k, a)| {
+            let g = track.crp.article_geometry(&track.crp_data, a).ok()?;
+            let b = g.base.as_ref()?;
+            (g.transform.is_some() && !b.is_library() && b.flags & 0x40 == 0 && track.animdefs.lookup(b.tag_u32()).is_some_and(|d| d.collide_type == "kSmackable")).then_some(k)
+        })
+        .collect()
 }
 
 /// The track loader's collision objects (0x4750B0 at 0x475152…0x475302): every article of the
@@ -2255,6 +3738,55 @@ fn group_tag(name: &Option<String>) -> u32 {
 mod driver_tests {
     use super::*;
 
+    /// 0x444E00's calls: the driver from `0x5CDB28` below class 4, the body from the class's LOD,
+    /// the wheels from `0x5CDB44` (or the traffic's `0x5CDB98`), none with the flag.
+    #[test]
+    fn race_passes_follow_the_tables() {
+        let p = |lod, mask| CarPass { lod, mask, flag: false };
+        assert_eq!(race_passes(2, 2, false), vec![p(1, 0x80), p(3, 0x50), p(1, 0x20)]);
+        assert_eq!(race_passes(3, 0, false), vec![p(2, 0x80), p(4, 0x50), p(2, 0x20)]);
+        assert_eq!(race_passes(5, 1, false), vec![p(6, 0x50), p(6, 0x20)]);
+        assert_eq!(race_passes(3, 2, true), vec![p(2, 0x80), p(4, 0x50), p(3, 0x20)]);
+        // the driver view: the cabin of LOD 2, the steering wheel, the hands at CARDETAIL > 0
+        let f = |lod, mask| CarPass { lod, mask, flag: true };
+        assert_eq!(in_car_passes(0, false), vec![f(2, 0x10), f(1, 0x40)]);
+        assert_eq!(in_car_passes(2, false), vec![f(2, 0x10), f(1, 0x40), f(1, 0x80)]);
+        assert_eq!(in_car_passes(2, true), vec![f(2, 0x10), f(1, 0x40)]);
+    }
+
+    /// 0x43C8AC…0x43C8E9: the LOD, `Base+78 & mask & 0xF0`, and the two flag bytes — the hands
+    /// (`Base+81` and `+82`) only ever in a flagged call.
+    #[test]
+    fn a_part_meets_a_pass_by_its_bytes() {
+        let hand = PartInfo { lod: 1, mask: 0x81, inside: true, inside_only: true, move_channel: -1 };
+        let driver = PartInfo { inside: false, inside_only: false, ..hand };
+        let body = PartInfo { lod: 3, mask: 0x1A, inside: true, inside_only: false, move_channel: -1 };
+        assert!(!hand.in_pass(&CarPass { lod: 1, mask: 0x80, flag: false }));
+        assert!(hand.in_pass(&CarPass { lod: 1, mask: 0x80, flag: true }));
+        assert!(driver.in_pass(&CarPass { lod: 1, mask: 0x80, flag: false }));
+        assert!(!driver.in_pass(&CarPass { lod: 1, mask: 0x80, flag: true }));
+        assert!(body.in_pass(&CarPass { lod: 3, mask: 0x50, flag: false }));
+        assert!(!body.in_pass(&CarPass { lod: 3, mask: 0x20, flag: false }));
+        assert!(!body.in_pass(&CarPass { lod: 2, mask: 0x50, flag: false }));
+    }
+
+    /// 0x445B10's coordinates: `1 / size` on the lateral axis, `aspect / size` on the forward one,
+    /// and the offsets `0.5 + 0.1 · lat / 6`, `0.5 + fwd / 6` of the car against its slice centre.
+    #[test]
+    fn sky_planes_follow_the_layer() {
+        let at = |pl: [f32; 4], p: Vec3| pl[0] * p.x + pl[1] * p.y + pl[2] * p.z + pl[3];
+        let c = Vec3::new(100.0, 5.0, -40.0);
+        let (lat, fwd) = (Vec3::X, Vec3::Z);
+        let (u, v) = sky_planes(c, c, lat, fwd, 6.0, 0.5);
+        assert!((at(u, c) - 0.5).abs() < 1e-5 && (at(v, c) - 0.5).abs() < 1e-5);
+        assert!((at(u, c + Vec3::new(3.0, 7.0, 0.0)) - 1.0).abs() < 1e-5);
+        assert!((at(v, c + Vec3::new(0.0, 0.0, 6.0)) - 1.0).abs() < 1e-5);
+        let o = c + Vec3::new(6.0, 0.0, 6.0);
+        let (u, v) = sky_planes(o, c, lat, fwd, 6.0, 0.5);
+        assert!((at(u, o) - 0.6).abs() < 1e-5);
+        assert!((at(v, o) - 1.5).abs() < 1e-5);
+    }
+
     /// 0x470E90 for a one-shot piece: 31 frames at `playbackrate=5` run 1.28 ticks a frame and stop
     /// once frame 29 is reached; the drift grows as `ticks · rate`.
     #[test]
@@ -2310,5 +3842,50 @@ mod driver_tests {
             assert_eq!(*REVERSE_ON[i].last().unwrap(), 7);
             assert_eq!(REVERSE_OFF[i][0], 7);
         }
+    }
+}
+
+#[cfg(test)]
+mod cull_tests {
+    use super::*;
+
+    fn view() -> CullView {
+        CullView { eye: Vec3::ZERO, forward: Vec3::Z, right: Vec3::X, up: Vec3::Y, tan_h: 1.0, tan_v: 0.75, near: 0.5, draw: 400.0 }
+    }
+
+    /// 0x539480: a sphere ahead is in, one behind the near plane by more than its radius or past
+    /// a side plane by more than its radius is out; a straddling one stays in.
+    #[test]
+    fn frustum_sphere() {
+        let v = view();
+        assert!(v.sphere_visible(Vec3::new(0.0, 0.0, 50.0), 1.0));
+        assert!(!v.sphere_visible(Vec3::new(0.0, 0.0, -5.0), 1.0));
+        assert!(v.sphere_visible(Vec3::new(0.0, 0.0, -5.0), 6.0));
+        // 45° half-angle: x = 60 at depth 50 is 10·cos45 ≈ 7.07 outside the right plane
+        assert!(!v.sphere_visible(Vec3::new(60.0, 0.0, 50.0), 7.0));
+        assert!(v.sphere_visible(Vec3::new(60.0, 0.0, 50.0), 7.1));
+        assert!(!v.sphere_visible(Vec3::new(-60.0, 0.0, 50.0), 7.0));
+        assert!(!v.sphere_visible(Vec3::new(0.0, 0.0, FRUSTUM_FAR + 10.0), 5.0));
+    }
+
+    /// 0x489CC0 and 0x4873B0.
+    #[test]
+    fn occluder_tests() {
+        assert!(segments_cross([-1.0, 5.0], [1.0, 5.0], [0.0, 0.0], [0.0, 10.0]));
+        assert!(!segments_cross([-1.0, 15.0], [1.0, 15.0], [0.0, 0.0], [0.0, 10.0]));
+        assert!(!segments_cross([0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]));
+        let o = Occluder { raised: false, a: [0.0, 0.0], d: [10.0, 0.0], len2: 100.0, inv_len2: 0.01 };
+        assert!(!o.far_from([5.0, 3.0], 10.0));
+        assert!(o.far_from([5.0, 4.0], 10.0));
+        assert!(o.far_from([13.0, 1.0], 9.0));
+        assert!(!o.far_from([-2.0, 1.0], 5.0));
+    }
+
+    /// 0x47F550: the footprint of a camera looking along +z covers the eye and the far corners.
+    #[test]
+    fn footprint_bounds() {
+        let (c, r2) = view().footprint();
+        assert!((c[0]).abs() < 1e-3 && (c[1] - 200.0).abs() < 1e-3);
+        assert!((r2 - (400.0f32 * 400.0 + 200.0 * 200.0)).abs() < 1.0);
     }
 }

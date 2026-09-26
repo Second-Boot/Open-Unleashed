@@ -356,6 +356,25 @@ impl Crp {
     /// `frame·0x10 + ` the stream's own index (0x43E242…0x43E254, 0x43E2A4…0x43E2B4), everything
     /// else as frame 0. `None`-like failure when that frame's `vt` is missing.
     pub fn article_geometry_frame(&self, data: &[u8], art: &Article, frame: u16) -> Result<ArticleGeometry, FormatError> {
+        self.article_geometry_with(data, art, frame, false)
+    }
+
+    /// The geometry with each primitive's `vt` stream taken from the **damage** part
+    /// `vt#(0x8000 | lod)` (0x43E4A7…0x43E4C0): the per-vertex crush vectors, in the same windows
+    /// and order as the plain geometry's positions. Fails when the article has none.
+    pub fn article_geometry_damage(&self, data: &[u8], art: &Article) -> Result<ArticleGeometry, FormatError> {
+        self.article_geometry_with(data, art, 0, true)
+    }
+
+    /// The article's `dz#lod` part (0x59F2A0: `"dz"` + the LOD), if it has one.
+    pub fn damage_zones(&self, data: &[u8], art: &Article, lod: u8) -> Result<Option<DamageZones>, FormatError> {
+        match art.find(b"dz", u16::from(lod)) {
+            Some(e) => Ok(Some(DamageZones::parse(self.entry_data(data, e)?)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn article_geometry_with(&self, data: &[u8], art: &Article, frame: u16, damage: bool) -> Result<ArticleGeometry, FormatError> {
         self.check(data)?;
         let name = match art.level(b"Name") {
             Some(e) => self.entry_string(data, e)?,
@@ -393,7 +412,8 @@ impl Crp {
                 };
                 let idx = if tag == b"pr" { 0 } else { sd.lod };
                 let idx = if kind == 0 && frame > 0 { frame * 0x10 + idx } else { idx };
-                let part = art.find(tag, idx).or_else(|| if frame > 0 && kind == 0 { None } else { art.parts.iter().find(|p| p.is_part(tag) && p.lod() == lod) }).ok_or(FormatError::UnexpectedValue {
+                let idx = if kind == 0 && damage { 0x8000 | idx } else { idx };
+                let part = art.find(tag, idx).or_else(|| if (frame > 0 || damage) && kind == 0 { None } else { art.parts.iter().find(|p| p.is_part(tag) && p.lod() == lod) }).ok_or(FormatError::UnexpectedValue {
                     what: "CRP primitive stream",
                     offset: pr.data_offset(),
                     expected: format!("a '{}' part for lod {lod}", String::from_utf8_lossy(tag)),
@@ -405,6 +425,7 @@ impl Crp {
                 Ok(Some(pb.get(s..e).ok_or(FormatError::InvalidOffset { what: "CRP stream window", offset: part.data_offset() + e, len: part.data_offset() + pb.len() })?))
             };
             let vt = stream_bytes(0)?;
+            let vt_first = rec.streams.iter().find(|s| s.kind == 0 && s.slot != 0xFFFF_FFFF).map_or(0, |s| s.byte_offset / 16);
             let nm = stream_bytes(1)?;
             let uv = stream_bytes(2)?;
             let df = stream_bytes(3)?;
@@ -450,7 +471,7 @@ impl Crp {
                     });
                 }
             }
-            primitives.push(Primitive { lod, prim_type: rec.prim_type, flags: rec.flags, material: rec.material, positions, normals, uvs, colors, vertex_indices, uv_indices });
+            primitives.push(Primitive { lod, prim_type: rec.prim_type, flags: rec.flags, material: rec.material, sphere: rec.sphere, positions, normals, uvs, colors, vertex_indices, uv_indices, vt_first });
         }
         Ok(ArticleGeometry { name, base, transform, transforms, primitives })
     }
@@ -893,12 +914,43 @@ pub struct Primitive {
     pub prim_type: u16,
     pub flags: u16,
     pub material: u16,
+    /// The record's bounding sphere, centre and radius (`+8`).
+    pub sphere: [f32; 4],
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
     pub colors: Vec<u32>,
     pub vertex_indices: Vec<u8>,
     pub uv_indices: Vec<u8>,
+    /// The first vertex of the primitive's `vt` window in its `vt` part (the window's byte offset
+    /// over 16): `positions[i]` is that part's vertex `vt_first + i`, the numbering the `dz`
+    /// zone lists use.
+    pub vt_first: u32,
+}
+
+/// A car article's `dz#lod` part (`RE/notes/car-model.md` §4.2): `u32 nzones`, then per zone
+/// `{u32 zone, u32 count, u32 first}`, then the `vt#lod` vertex indices the zones list —
+/// 0x43E390 walks it to move each zone's vertices by its damage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DamageZones {
+    /// `(zone, vertex indices)` in the file's order
+    pub zones: Vec<(u32, Vec<u32>)>,
+}
+
+impl DamageZones {
+    pub fn parse(b: &[u8]) -> Result<Self, FormatError> {
+        let u = |o: usize| u32_le(b, o, "CRP dz");
+        let n = u(0)? as usize;
+        let list = 4 + 12 * n;
+        let mut zones = Vec::with_capacity(n);
+        for k in 0..n {
+            let r = 4 + 12 * k;
+            let (zone, count, first) = (u(r)?, u(r + 4)? as usize, u(r + 8)? as usize);
+            let idx = (first..first + count).map(|i| u(list + 4 * i)).collect::<Result<Vec<u32>, _>>()?;
+            zones.push((zone, idx));
+        }
+        Ok(Self { zones })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

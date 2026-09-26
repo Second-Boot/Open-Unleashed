@@ -563,8 +563,9 @@ fn the_manual_gearbox_takes_the_shift_codes() {
     v.gear = 1;
     v.requested_gear = 1;
     v.step32(&Controls { command: 2, ..Default::default() }, &specs, &grid);
-    // the timer is loaded with specs[0x54] and the same step's engine update counts one off
-    assert_eq!((v.gear, v.shift_timer), (2, specs.shift_ticks - 1), "N -> 1st");
+    // the timer is loaded with specs[0x54] after 0x49DD9E counted the old one down, so it
+    // stands whole at the end of the step (the engine only reads it)
+    assert_eq!((v.gear, v.shift_timer), (2, specs.shift_ticks), "N -> 1st");
     v.shift_timer = 0;
     v.step32(&Controls::default(), &specs, &grid);
     assert_eq!(v.gear, 2, "no code, no change");

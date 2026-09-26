@@ -2,7 +2,7 @@
 use nfs_assets::GamePaths;
 use nfs_formats::sav::{SaveFile, FE_CAR_IMAGE};
 use nfs_game::career::{Career, CareerTables, EventResult, OwnedCar, TournamentState};
-use nfs_game::save::{car, career_from_sav, career_to_sav, Profile};
+use nfs_game::save::{car, career_from_sav, career_to_sav, career_to_sav_with, Profile};
 
 fn tables() -> Option<CareerTables> {
     let paths = GamePaths::locate().ok()?;
@@ -51,7 +51,8 @@ fn career_round_trips_through_the_original_format() {
     assert!(bytes.starts_with(b"Missions\0"));
     let parsed = SaveFile::parse(&bytes).expect("the writer produces a file the reader accepts");
     // `PartsMarket` is the player's parts inventory (§4.2), written even when it is empty
-    assert_eq!(parsed.order, ["Missions", "PartsMarket", "Tournament", "PlayerInfo", "TrackRecords", "Personalities", "Knockout", "CDPlayer", "accessor"]);
+    // and `UsedCarMarket` (§4.4) is always registered, so always written, empty market or not
+    assert_eq!(parsed.order, ["Missions", "PartsMarket", "Tournament", "PlayerInfo", "TrackRecords", "UsedCarMarket", "Personalities", "Knockout", "CDPlayer", "accessor"]);
     // the knockout module is the raw 0x84-byte state block, switched off when no series is running
     let k = nfs_formats::sav::KnockoutState::parse(parsed.knockout.as_ref().unwrap());
     assert!(!k.active && k.opponents == 0);
@@ -59,6 +60,7 @@ fn career_round_trips_through_the_original_format() {
     let acc = parsed.accessors.as_ref().expect("accessor block");
     assert!(acc.entries.iter().any(|(n, v)| n == "Chronicle.Year" && *v == nfs_formats::sav::AccessorValue::Dword(1969)));
     assert!(acc.entries.iter().any(|(n, _)| n == "OwnedCars.Car"));
+    assert!(!acc.entries.iter().any(|(n, _)| n == "Game.GameType"), "the mode is not the career's to write");
     // …the settings screens' values, each a plain dword (§6.1)
     assert!(acc.entries.iter().any(|(n, v)| n == "Audio.MusicLevel" && *v == nfs_formats::sav::AccessorValue::Dword(127)));
     assert!(acc.entries.iter().any(|(n, _)| n == "Graphics.ViewDistance"));
@@ -105,6 +107,10 @@ fn career_round_trips_through_the_original_format() {
     assert_eq!(back.garage[0].asking_price, owned.asking_price);
     assert_eq!(back.garage[0].offer, owned.offer);
     assert_eq!(back.missions, c.missions);
+    assert!(!back.seen_evolution_intro);
+    let mut seen = parsed.clone();
+    seen.player.as_mut().unwrap().seen_evolution_intro = 1;
+    assert!(career_from_sav(&seen, &t).seen_evolution_intro, "[0x691DD5] comes back (0x501859)");
     // a `.sav` the port wrote before the stock list: no `+0x75C` parts and only what was bought
     // installed — the stock list comes back from the record and fills the empty slots
     let mut old = parsed.clone();
@@ -166,7 +172,7 @@ fn the_dead_zone_accessors_ride_in_the_save() {
     assert_eq!(settings.deadzone, [[0, 0x80]; 8]);
     settings.deadzone[2] = [40, 100];
 
-    let sav = nfs_game::save::career_to_sav_with(&career, &tables, &profile, None, &[], &settings);
+    let sav = nfs_game::save::career_to_sav_with(&career, &tables, &profile, &nfs_game::save::SaveSide { settings, ..Default::default() });
     let a = sav.accessors.as_ref().expect("an accessor block");
     let find = |n: &str| a.entries.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
 
@@ -355,4 +361,184 @@ fn paint_shop_trim_round_trips() {
     assert_eq!(f(car::PACKAGE_NUM), 3);
     assert_eq!(f(car::DECAL_NUM), 42, "the race number, FECar+0x688");
     assert_eq!(career_from_sav(&parsed, &t).garage[0].trim, owned.trim);
+}
+
+/// 0x4EE853…0x4EE8AE: the car loader exchange-sorts the installed list by 0x49C350 whatever
+/// order the file had it in.
+#[test]
+fn the_loader_sorts_a_cars_installed_parts() {
+    let Some(t) = tables() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let car_id = t.catalog.iter().find(|c| !c.sim.is_empty() && t.car(c.id).is_some_and(|r| r.stock_parts.len() > 2)).unwrap().id;
+    let owned = OwnedCar::construct(&t, car_id, 0, 10_000);
+    let mut c = Career::default();
+    c.garage.push(owned.clone());
+    let mut sav = career_to_sav(&c, &t, &Profile::new("Hans", 0));
+    sav.player.as_mut().unwrap().cars[0].installed.reverse();
+    let back = career_from_sav(&SaveFile::parse(&sav.write()).unwrap(), &t);
+    assert_ne!(sav.player.as_ref().unwrap().cars[0].installed.iter().map(|p| p.id as i16).collect::<Vec<_>>(), owned.parts);
+    assert_eq!(back.garage[0].parts, owned.parts, "fit_stock's order is 0x49C350's, and the loader restores it");
+}
+
+/// §4.4, 0x4F7A10 / 0x4F7750: the used-car market goes out as its own module — the year, then the
+/// generated cars with `+0x6A0 = 0` and their price at `+0x68C` — and comes back from it.
+#[test]
+fn the_used_car_market_rides_in_its_module() {
+    let Some(t) = tables() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let mut c = Career::default();
+    c.year = 1975;
+    let mut seed = 7u32;
+    let mut rand = move || {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        seed >> 8
+    };
+    c.refresh_market(&t, &mut rand);
+    assert!(!c.market.is_empty());
+    let sav = career_to_sav(&c, &t, &Profile::new("Hans", 0));
+    let bytes = sav.write();
+    let parsed = SaveFile::parse(&bytes).unwrap();
+    assert_eq!(parsed.write(), bytes, "the file re-writes byte for byte");
+    let m = parsed.used_cars.as_ref().expect("the module");
+    assert_eq!(m.year, 1975);
+    assert_eq!(m.cars.len(), c.market.len());
+    for (img, car) in m.cars.iter().zip(&c.market) {
+        assert_eq!(img.field_u8(car::OWNED), 0, "a car the market generated (0x4F853E)");
+        assert_eq!(img.field_u8(car::LISTED), 0, "the listed byte is the player's own flag");
+        assert_eq!(img.field_u32(car::ASKING_PRICE), car.asking_price.unwrap());
+    }
+    let back = career_from_sav(&parsed, &t);
+    assert_eq!(back.market.len(), c.market.len());
+    for (a, b) in back.market.iter().zip(&c.market) {
+        assert_eq!((a.car_id, a.mileage, a.wins, a.asking_price), (b.car_id, b.mileage, b.wins, b.asking_price));
+        // the generator 0x4F8590 does not sort the parts it fits; the loader does (0x4EE853)
+        let (mut x, mut y) = (a.parts.clone(), b.parts.clone());
+        x.sort_unstable();
+        y.sort_unstable();
+        assert_eq!(x, y);
+    }
+}
+
+/// What `LoadInfo` hands the front end's own loaders comes back: `Knockout` 0x4DDD60 (the whole
+/// 0x84-byte block), `Personalities` 0x4E2CA0 (the last draw), `CDPlayer` 0x4BE170 (the list) and
+/// the option accessors (0x4BC480), each as the index the accessor stores — `Track1.Laps` one
+/// below the lap count (0x4FC1BC) and `Game.NumKOOpponents` one below the count (minimum 1,
+/// 0x4E556A) — clamped into the list by `SetSelection` 0x4BC240.
+#[test]
+fn the_front_end_modules_and_options_come_back() {
+    let Some(t) = tables() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    use nfs_game::save::{side_from_sav, KnockoutProgress, SaveSide, SavedSettings};
+    let ko = KnockoutProgress {
+        active: true,
+        race_index: 2,
+        opponents: 3,
+        alive: vec![true, true, false, true],
+        start_pos: vec![2, 1, u32::MAX, 3],
+        personalities: vec![11, 17, 23],
+        last_pos: vec![3, 1, 4, 2, -1, -1, -1, -1, -1],
+    };
+    let side = SaveSide {
+        knockout: Some(ko),
+        personalities: Some(vec![40, 41]),
+        playlist: vec![3, 1, 4],
+        settings: SavedSettings { laps: 5, opponents: 6, traffic: 2, ko_opponents: 7, music: 90, options: vec![("Display.SpeedUnits".into(), 1), ("Graphics.CarDetail".into(), 2)], ..SavedSettings::default() },
+        tournament: nfs_game::save::TournamentFe { selected: 4, next_event: 2, current_event: 1, current_tournament: 4 },
+    };
+    let sav = career_to_sav_with(&Career::default(), &t, &Profile::new("Hans", 0), &side);
+    let bytes = sav.write();
+    let parsed = SaveFile::parse(&bytes).unwrap();
+    assert_eq!(parsed.write(), bytes, "the file re-writes byte for byte");
+    let acc = parsed.accessors.as_ref().unwrap();
+    let dword = |n: &str| acc.entries.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    // the indices the accessors hold, not the counts
+    assert_eq!(dword("Track1.Laps"), Some(nfs_formats::sav::AccessorValue::Dword(4)));
+    assert_eq!(dword("Game.NumKOOpponents"), Some(nfs_formats::sav::AccessorValue::Dword(6)));
+    assert_eq!(dword("Game.NumOpponents"), Some(nfs_formats::sav::AccessorValue::Dword(6)));
+    assert_eq!(dword("Display.SpeedUnits"), Some(nfs_formats::sav::AccessorValue::Dword(1)));
+    // a name the fixed fields carry is written once
+    assert_eq!(acc.entries.iter().filter(|(k, _)| k == "Audio.MusicLevel").count(), 1);
+
+    let back = side_from_sav(&parsed);
+    // 0x4DDD60 copies the block whole: all sixteen `alive` bytes, eight personalities, nine places
+    let k = back.knockout.as_ref().expect("the block");
+    assert_eq!((k.active, k.race_index, k.opponents), (true, 2, 3));
+    assert_eq!(k.alive[..4], [true, true, false, true]);
+    assert!(k.alive[4..].iter().all(|a| !a) && k.alive.len() == 16);
+    assert_eq!(k.start_pos[..4], [2, 1, u32::MAX, 3]);
+    assert_eq!(k.personalities[..3], [11, 17, 23]);
+    assert_eq!(k.last_pos, side.knockout.as_ref().unwrap().last_pos);
+    assert_eq!(back.personalities, side.personalities);
+    assert_eq!(back.playlist, side.playlist);
+    // `Tournament`'s four front-end dwords, in the writer's order 0x502AE0 and back through 0x5029F0
+    let tm = parsed.tournament.as_ref().unwrap();
+    assert_eq!((tm.remaining_tracks, tm.selected, tm.current_event, tm.current_tournament), (2, 4, 1, 4));
+    assert_eq!(back.tournament, side.tournament);
+    let st = &back.settings;
+    assert_eq!((st.laps, st.opponents, st.traffic, st.ko_opponents, st.music), (5, 6, 2, 7, 90));
+    assert!(st.options.contains(&("Display.SpeedUnits".to_string(), 1)));
+    assert!(st.options.contains(&("Graphics.CarDetail".to_string(), 2)));
+    // and a second save of what was loaded writes the same file
+    assert_eq!(career_to_sav_with(&Career::default(), &t, &Profile::new("Hans", 0), &back).write(), bytes);
+
+    // `SetSelection` 0x4BC240: above the list → its last row, negative (signed) → row 0
+    assert_eq!(nfs_game::save::clamp_index(9, 4), 3);
+    assert_eq!(nfs_game::save::clamp_index(u32::MAX, 4), 0);
+    assert_eq!(nfs_game::save::clamp_index(2, 4), 2);
+}
+
+/// All nineteen `Controller.*` rows the factory 0x51E030 builds ride in the profile, six dwords
+/// each (0x51D060), and come back by name (0x51D080).
+#[test]
+fn all_nineteen_control_rows_are_saved() {
+    let Some(t) = tables() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    use nfs_game::save::{saved_controls, SaveSide, SavedSettings, CONTROL_ROWS};
+    const NAMES: [&str; CONTROL_ROWS] = [
+        "Controller.Accel", "Controller.Brake", "Controller.HandBrake", "Controller.SteerLeft", "Controller.SteerRight", "Controller.ShiftUp", "Controller.ShiftDown",
+        "Controller.Horn", "Controller.LookBehind", "Controller.Lights", "Controller.ResetCar", "Controller.CameraView", "Controller.Pause", "Controller.LeftTurnSignal",
+        "Controller.RightTurnSignal", "Controller.Hazards", "Controller.LookLeft", "Controller.LookRight", "Controller.LookForward",
+    ];
+    let mut settings = SavedSettings::default();
+    for (i, n) in NAMES.iter().enumerate() {
+        assert_eq!(nfs_formats::sav::accessor_kind(n), Some(nfs_formats::sav::AccessorKind::ControllerInput), "{n}");
+        settings.controls[i] = Some((NAMES[i], [3, 0, 0x10 + i as u32, 0, 0, b'A' as u32 + i as u32]));
+    }
+    let sav = career_to_sav_with(&Career::default(), &t, &Profile::new("Hans", 0), &SaveSide { settings, ..Default::default() });
+    let back = saved_controls(&SaveFile::parse(&sav.write()).unwrap());
+    assert_eq!(back.len(), CONTROL_ROWS);
+    for (i, n) in NAMES.iter().enumerate() {
+        let f = back.iter().find(|(k, _)| k == n).unwrap_or_else(|| panic!("{n} saved")).1;
+        assert_eq!(f[2], 0x10 + i as u32);
+    }
+}
+
+/// `PlayerInfo`'s tail (0x5018B0 / 0x501610): the three first-time bytes `[0x691DD5]`,
+/// `[0x691D94]`, `[0x691DF5]` and the eight custom colours `[0x691D98]` go out and come back.
+#[test]
+fn the_first_time_flags_and_custom_colours_come_back() {
+    let Some(t) = tables() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let mut c = Career::default();
+    c.seen_factory_welcome = true;
+    c.seen_first_mission = true;
+    c.custom_colours = [0xFF10_2030, 0, 0xFF00_FF00, 0, 0, 0, 0, 0xFFFF_FFFF];
+    let bytes = career_to_sav(&c, &t, &Profile::new("Hans", 0)).write();
+    let parsed = SaveFile::parse(&bytes).unwrap();
+    let p = parsed.player.as_ref().unwrap();
+    assert_eq!((p.seen_evolution_intro, p.seen_factory_welcome, p.seen_first_mission), (0, 1, 1));
+    assert_eq!(p.colours, c.custom_colours);
+    let back = career_from_sav(&parsed, &t);
+    assert!(back.seen_factory_welcome && back.seen_first_mission && !back.seen_evolution_intro);
+    assert_eq!(back.custom_colours, c.custom_colours);
 }

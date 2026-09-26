@@ -36,7 +36,7 @@ pub const DEFAULT_HALF_ANGLE: f32 = 37.5;
 /// hands the view `+0x130 = h` (0x4653E9…0x46540B) and the projection 0x5391B0 takes `2·h` as the
 /// **horizontal** angle with the viewport's aspect in 640 × 480 units (0x466FD7…0x46700C:
 /// `m00 = cot h`, `m11 = m00 · 640/480`), so the full-screen view is `2·atan(tan h · 0.75)` high —
-/// 59.8° for the default. (`[0x657D5C]`'s ×1.2 is not carried.)
+/// 59.8° for the default. (`[0x657D5C]`'s ×1.2 is [`half_angle`]'s, with [`fov_y_window`] for its band.)
 pub fn fov_y(half_angle_deg: f32) -> f32 {
     2.0 * (half_angle_deg.to_radians().tan() * 0.75).atan()
 }
@@ -133,12 +133,20 @@ impl CircleCam {
     /// lap is 1024 updates, the height changes twice a lap, and each change is a 128-update ramp
     /// that ends where `+0xC4` steps.
     pub fn step(&mut self) -> Vec3 {
-        self.count = self.count.wrapping_add(1);
+        self.step_count(1)
+    }
+
+    /// `n` updates (one per game tick, 0x463C30 being a 64 Hz scheduler entry), then the offset
+    /// the last of them leaves; with `n` = 0 the offset of the current count.
+    pub fn step_count(&mut self, n: u32) -> Vec3 {
+        for _ in 0..n {
+            self.count = self.count.wrapping_add(1);
+            if (self.count as i32 - 0x100) & 0x1FF == 0 {
+                self.step = self.step.wrapping_add(1);
+            }
+        }
         let c = self.count as i32;
         let (s, co) = (c as f32 * (1.0 / 1024.0) * std::f32::consts::TAU).sin_cos();
-        if (c - 0x100) & 0x1FF == 0 {
-            self.step = self.step.wrapping_add(1);
-        }
         // `idiv 3` is a signed remainder; `+0xC4` would need 2^15 steps (2^24 updates) to go
         // negative, so the euclidean one is the same here
         let h = |k: i32| Self::HEIGHTS[k.rem_euclid(3) as usize];
@@ -246,6 +254,20 @@ pub fn audio_mode(view: u16, attached: bool, interior: bool) -> u8 {
         }
         _ => 3,
     }
+}
+
+/// The up row of an aimed view's matrix (0x464BF0, the build's aim for `+0xC0 & 0x08`):
+/// `fwd` is the unit direction from the eye to the aim point. The up starts as the world's
+/// (0, 1, 0) (0x464C0B) and is kept when `|up · fwd|` is at most `[0x5B3F80]` 0.99
+/// (0x464EE8…0x464F31, C0|C3 → keep); otherwise — looking nearly straight down or up, as the
+/// BlimpCam always does from 15 m over and 2 m behind — the matrix's **previous** up row
+/// `[out + 0xC]` is taken instead (0x464F33…0x464F45). Then `right = up × fwd` and
+/// `up = fwd × right`, each normalised (0x532880 / 0x5328D0 at 0x464F48…0x464F67): the result is
+/// that up with its part along `fwd` removed.
+pub fn aim_up(fwd: Vec3, prev_up: Vec3) -> Vec3 {
+    let up = if Vec3::Y.dot(fwd).abs() > 0.99 { prev_up } else { Vec3::Y };
+    let right = up.cross(fwd).normalize_or_zero();
+    fwd.cross(right).normalize_or_zero()
 }
 
 /// **The look-around step 0x4611C0**, run by the bumper (0x461D50) and driver (0x461A30) updates
@@ -389,6 +411,25 @@ mod tests {
         assert_eq!(zoom_near(40.0), 0.5);
         assert!((zoom_near(3.75) - 9.0).abs() < 1e-5);
         assert_eq!(zoom_near(35.0), 0.2, "(37.5 − 35) / 35 is under the 0.2 floor");
+    }
+
+    #[test]
+    fn aim_keeps_the_world_up_unless_looking_nearly_straight_down() {
+        // a chase view: the world's up, made square to the view
+        let f = Vec3::new(0.0, -0.3, 1.0).normalize();
+        let u = aim_up(f, Vec3::X);
+        assert!(u.dot(f).abs() < 1e-5 && u.y > 0.9);
+        // the BlimpCam, 15 over and 2 behind: |up·fwd| = 0.991 > 0.99, the old up row is kept
+        let f = Vec3::new(0.0, -15.0, 2.0).normalize();
+        let prev = Vec3::new(0.0, 0.0, 1.0);
+        let u = aim_up(f, prev);
+        assert!(u.dot(f).abs() < 1e-5);
+        assert!(u.z > 0.9, "{u}");
+        // the car slides sideways under it: the world-up rule would turn the picture, the old
+        // row does not
+        let f2 = Vec3::new(2.0, -15.0, 0.0).normalize();
+        let u2 = aim_up(f2, u);
+        assert!(u2.z > 0.9, "{u2}");
     }
 
     #[test]

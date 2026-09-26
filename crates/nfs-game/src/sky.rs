@@ -8,9 +8,10 @@
 //! `MULTINORMAL` or `basic`). The `horz` horizon strips keep their ring.
 //!
 //! The **horizon ring is the original's own** now (`RE/RENDERING.md`, sky `.bin`): sixteen quads on
-//! a circle of the radius the `.bin`'s weather-region-A record gives, spanning `+0x14` to
+//! a circle of 400 m (0x459F92) from the `.bin`'s `+0x04` turn, spanning `+0x14` to
 //! `+0x14 + +0x18` in y, each showing the tile of the `horz` grid the `.bin` names for it (mirrored
-//! where it says so) and tinted per corner from the `hzcl` 16 × 2 strip, rotated by `+0x08`.
+//! where it says so) and tinted per corner from the `hzcl` 16 × 2 strip, rotated by `+0x08`. The whole sky is drawn in metres around the eye and clipped at the far plane
+//! 700 (0x45D4F0).
 //!
 //! **The layers are the original's grid** now (`RE/RENDERING.md`, "The sky layers are a curved
 //! grid"): a 16 × 16 vertex cap built by 0x460F40 from region A's `.bin` record, each vertex
@@ -25,8 +26,10 @@
 //! position and velocity per vertex, shared by all the layers, accelerating towards a random target
 //! within `±warpAmount` that is redrawn every 32 steps.
 //!
-//! **APPROXIMATION** in what is left: the jitter's random numbers come from the port's own
-//! generator, not the game's shared 0x538040 sequence. Not ported: `basic`'s `noise` alpha maps
+//! **APPROXIMATION** in what is left: the jitter draws from the front end's generator 0x538040
+//! (`opponents::FeRng`, through 0x5561D0 at 0x45EEA1 / 0x45F3D3) on a state of its own that starts
+//! at the image's `.data` values, where the game's one global state is shared with the weather and
+//! the front end. *(Until 2026-09-26 it drew from an LCG of the port's own.)* Not ported: `basic`'s `noise` alpha maps
 //! (0x45E680, folded into the colours' alpha by 0x45E27D…; no shipped block names one), and what
 //! 0x45DF50 does instead of the blend while `[0x627E38]` is set (0x45CEF0, a flash — not read).
 
@@ -35,8 +38,8 @@ use nfs_assets::track::TrackAssets;
 use nfs_renderer::{DrawItem, MaterialDesc, MaterialId, MeshData, MeshId, Renderer, TextureData, Vertex};
 
 pub struct Sky {
-    /// mesh, material and how the layer's UVs move
-    parts: Vec<(MeshId, MaterialId, Motion)>,
+    /// mesh, material, how the layer's UVs move, and whether the part draws after the sun
+    parts: Vec<(MeshId, MaterialId, Motion, bool)>,
     grids: Vec<GridLayer>,
     /// the `.bin`'s per-slice blend between the regions (track A, 0x45A350 at 0x45D077)
     blend: Vec<(i32, f32)>,
@@ -72,7 +75,8 @@ struct Jitter {
     pos: Vec<[f32; 2]>,
     target: Vec<[f32; 2]>,
     vel: Vec<[f32; 2]>,
-    rng: u32,
+    /// 0x538040's state (see the module's note)
+    fe: crate::opponents::FeRng,
 }
 
 impl Jitter {
@@ -90,7 +94,7 @@ impl Jitter {
             pos: vec![[0.0; 2]; Self::VERTICES],
             target: vec![[0.0; 2]; Self::VERTICES],
             vel: vec![[0.0; 2]; Self::VERTICES],
-            rng: 0x1234_5678,
+            fe: crate::opponents::FeRng::new(0),
         };
         // 0x45F3C0, with the numbers 0x45F1B0 copied from region A (0x45F366…0x45F375)
         let (rate, amp) = (j.rate[0], j.amp[0]);
@@ -104,10 +108,10 @@ impl Jitter {
         j
     }
 
+    /// The thirteen randoms, each 0x5561D0 = `(0x538040() & 0xFFFF) / 65536` (0x45EEA1 / 0x45F3D3).
     fn refill(&mut self) {
         for k in 0..13 {
-            self.rng = self.rng.wrapping_mul(0x0001_9660).wrapping_add(0x3C6E_F35F);
-            self.table[k] = ((self.rng >> 8) & 0xFFFF) as f32 * (1.0 / 65536.0);
+            self.table[k] = (self.fe.next_u32() & 0xFFFF) as f32 * (1.0 / 65536.0);
         }
     }
 
@@ -274,10 +278,9 @@ pub fn forced_level() -> Option<usize> {
     std::env::var("NFS_SKY_LEVEL").ok()?.parse().ok()
 }
 
-/// The 16 × 16 layer grid of 0x460EC0(15, …) / 0x460F40, normalised by `norm` like the horizon
-/// ring, with the base UVs of 0x45EC40 (`j/a`, `i/b`) and the colour stream `colours` (vertex
+/// The 16 × 16 layer grid of 0x460EC0(15, …) / 0x460F40 in metres around the eye, with the base UVs of 0x45EC40 (`j/a`, `i/b`) and the colour stream `colours` (vertex
 /// `16·i + j` takes texel `16·i + j`), as the 15 × 15 quads' triangles.
-fn layer_grid(ring: &nfs_formats::sky::SkyRing, scale: f32, a: f32, b: f32, norm: f32, colours: &[u8]) -> MeshData {
+fn layer_grid(ring: &nfs_formats::sky::SkyRing, scale: f32, a: f32, b: f32, colours: &[u8]) -> MeshData {
     const N: usize = 15;
     let mut m = MeshData::default();
     let side = ring.radius;
@@ -288,9 +291,9 @@ fn layer_grid(ring: &nfs_formats::sky::SkyRing, scale: f32, a: f32, b: f32, norm
         let u = -0.5 * N as f32 * cell + i as f32 * cell;
         for j in 0..=N {
             let v = 0.5 * N as f32 * cell - j as f32 * cell;
-            let x = (c * v + sn * u) * scale * norm;
-            let y = (ring.height - ring.small * (u * u + v * v)) * scale * norm;
-            let z = (c * u - sn * v) * scale * norm;
+            let x = (c * v + sn * u) * scale;
+            let y = (ring.height - ring.small * (u * u + v * v)) * scale;
+            let z = (c * u - sn * v) * scale;
             let color = MapBlend::colour(colours, i * (N + 1) + j);
             m.vertices.push(Vertex { position: [x, y, z], normal: [0.0, 1.0, 0.0], uv: [j as f32 / a, i as f32 / b], color });
         }
@@ -305,26 +308,29 @@ fn layer_grid(ring: &nfs_formats::sky::SkyRing, scale: f32, a: f32, b: f32, norm
     m
 }
 
-const RADIUS: f32 = 3000.0;
+/// The horizon ring's radius in metres: 0x459D30's first point is `(0, 0, 400.0)` (`[0x5B25C4]`,
+/// 0x459F92), whatever the `.bin`'s grid side says.
+const RING_RADIUS: f32 = 400.0;
 
-/// The horizon ring of `Sky/<Track>.bin`: sixteen quads, each one tile of the `horz` grid, with the
-/// four `hzcl` colours of its two edges. `colour(i)` is the strip's pixel `i` on row 0 (the top) and
-/// row 1 (the bottom); the original reads them as two runs of sixteen dwords 0x40 bytes apart
-/// (0x459D8F / 0x459DE5), which is exactly the two rows of the 16 × 2 image.
+/// The horizon ring of `Sky/<Track>.bin` as 0x459D30 builds it: sixteen quads, each one tile of the
+/// `horz` grid, with the four `hzcl` colours of its two edges. The points are `(0, 0, 400)` turned
+/// about y by the `.bin`'s `+0x04` (in turns) and then by 1/16 of a turn per point (`[0x3D800000]`,
+/// 0x45A014…0x45A08A: `x' = x·cos δ + z·sin δ`, `z' = z·cos δ − x·sin δ`) — point `k` at
+/// `(400·sin φ, 400·cos φ)`, `φ = +0x04 + k/16` turns — and quad `k` spans points `k` and `k + 1`,
+/// its top row at `y = +0x14 + +0x18` and its bottom at `+0x14` (0x45A0B4…0x45A181), in metres
+/// around the eye. `colour(i)` is the strip's pixel `i` on row 0 (the top) and row 1 (the bottom);
+/// the original reads them as two runs of sixteen dwords 0x40 bytes apart (0x459D8F / 0x459DE5),
+/// which is exactly the two rows of the 16 × 2 image. *(Until 2026-09-26 the port put point `k` at
+/// `(cos, sin)` of `k/16` without the start turn — the ring mirrored and turned — on a circle of the
+/// grid's side, 500…1500 m, rescaled with its heights: every ring sat 1.25…3.75 times flatter.)*
 fn horizon_ring(bin: &nfs_formats::sky::SkyBin, y0: f32, y1: f32, colour: impl Fn(usize, usize) -> [f32; 4]) -> MeshData {
     let mut m = MeshData::default();
-    // the file's radius is in metres (500 … 1500) but the whole sky is rebuilt at `RADIUS` and then
-    // scaled into the camera's far plane, so the ring is normalised here and its heights with it —
-    // the shape the data asks for is the ratio, not the absolute size
-    let k = RADIUS * 0.9 / bin.rings[0].radius.max(1.0);
-    let (r, y0, y1) = (RADIUS * 0.9, y0 * k, y1 * k);
     for k in 0..16usize {
         let uv = bin.segment_uv(k);
         let c = bin.segment_colour(k);
         let p = |j: usize| {
-            // the original steps 1/16 of a turn per vertex (0x3D800000 = 0.0625, 0x45A03D)
-            let az = (k + j) as f32 / 16.0 * std::f32::consts::TAU;
-            (az.cos() * r, az.sin() * r)
+            let az = ((bin.ring_turn + (k + j) as f32 * 0.0625) as f64 * 6.28318452835083) as f32;
+            (az.sin() * RING_RADIUS, az.cos() * RING_RADIUS)
         };
         let (x0, z0) = p(0);
         let (x1, z1) = p(1);
@@ -347,7 +353,7 @@ impl Sky {
             r.upload_texture(&TextureData { width: t.width, height: t.height, mips: t.mips.clone() })
         }
         let mut parts = Vec::new();
-        let sky_mat = |r: &mut Renderer, texture, blend, blend_pair| r.create_material(MaterialDesc { texture, alpha_blend: blend, cull_back: false, depth_test: false, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair, clamp: [false; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false });
+        let sky_mat = |r: &mut Renderer, texture, blend, blend_pair| r.create_material(MaterialDesc { texture, alpha_blend: blend, cull_back: false, depth_test: false, env_texture: None, env_mix: 0.0, env_variant: 0, sky_map: false, blend_pair, clamp: [false; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false });
 
         let file = nfs_formats::sky::SkyFile::parse(&track.sky_params.join("\n")).ok();
         // the blocks of the `SKYRENDERING` level (0x45D8F0 → 0x45FB80, `SkyFile::for_level`) — none
@@ -417,11 +423,10 @@ impl Sky {
                 let m = sky_mat(r, texture, blend, pair);
                 let scale = [layer.scale[0].max(0.01), layer.scale[1].max(0.01)];
                 let ring = &bin.rings[0];
-                // normalised as the horizon ring is; every stage shares the one grid (`[this+0x30]`,
-                // bound once per block at 0x45BED5), so no stage sits nearer than another. *(Until
-                // 2026-09-25 each higher layer was drawn 2 % closer, the port's own.)*
-                let norm = RADIUS * 0.9 / ring.radius;
-                let mesh = layer_grid(ring, bin.scalar_ce4, scale[0], scale[1], norm, &colours.a);
+                // every stage shares the one grid (`[this+0x30]`, bound once per block at 0x45BED5),
+                // so no stage sits nearer than another. *(Until 2026-09-25 each higher layer was drawn
+                // 2 % closer, the port's own.)*
+                let mesh = layer_grid(ring, bin.scalar_ce4, scale[0], scale[1], &colours.a);
                 // 0x45F1B0: both regions' numbers for this stage; the wind flag when either
                 // region's speed is over 0.25, the parallax when either move ratio is over 1
                 let a = StageParams::of(Some(layer), region.move_ratio);
@@ -430,7 +435,9 @@ impl Sky {
                 let parallax_on = region.move_ratio > 1.0 || region_b.move_ratio > 1.0;
                 let handle = r.upload_dynamic_mesh(&mesh);
                 grids.push(GridLayer { mesh: handle, vertices: mesh.vertices, a, b: bp, wind_on, parallax_on, angle: ring.angle_turns, step: a.step, offset: [0.0, 0.0], colours });
-                parts.push((handle, m, Motion::Grid(grids.len() - 1)));
+                // a level whose sun token starts with `no` carries flag 0x400 (0x45B6FE…0x45B723,
+                // BasicSky 0x45AEBC…0x45AEDD) and draws before the sun, any other after it
+                parts.push((handle, m, Motion::Grid(grids.len() - 1), b.blocks_sun));
             }
         }
         // the horizon's texture `+0x44` is `hor<level>` when the pack has one and `horz` otherwise
@@ -455,7 +462,9 @@ impl Sky {
                         [px[o] as f32 / 255.0, px[o + 1] as f32 / 255.0, px[o + 2] as f32 / 255.0, 1.0]
                     };
                     let (y0, y1) = (bin.height_pair[0], bin.height_pair[0] + bin.height_pair[1]);
-                    parts.push((r.upload_mesh(&horizon_ring(bin, y0, y1, colour)), m, Motion::Still));
+                    // the ring is the list's last level, flags 0x80 (0x459B53 → 0x45AAA0, 0x45DADF):
+                    // no 0x400, so it draws after the sun
+                    parts.push((r.upload_mesh(&horizon_ring(bin, y0, y1, colour)), m, Motion::Still, true));
                 }
                 // no usable `.bin` (a broken install, see the layers above): no ring. *(The port
                 // drew an invented two-strip ring here until 2026-09-25.)*
@@ -529,20 +538,30 @@ impl Sky {
         }
     }
 
-    /// Draw items centred on the camera (sky follows the viewer). `far` is the camera's far plane —
-    /// the sky is scaled to sit just inside it, since the draw distance the track's `.key` file
-    /// asks for is far shorter than the sky's nominal radius.
+    /// Draw items centred on the camera, in metres: the sky pass 0x45D4F0 moves the camera's eye to
+    /// the origin (0x45D63D…0x45D679, `0x466220` with `(0, 0, 0)`; the eye back at 0x45D794) and sets
+    /// the view's planes to 0.15 / 700 (0x45D501…0x45D51D → 0x467120), so the grid and the ring are
+    /// drawn unscaled around the eye and whatever lies beyond 700 m of view depth is clipped — the
+    /// grid's far corners on `alps`, `Canyon`, `Castle`, `Farmland` and `foothills` (whose side ×
+    /// `+0xCE4` puts them past it). *(Until 2026-09-26 the port scaled the whole sky to 0.9 of the
+    /// draw distance, its own rule: the same picture, but nothing ever clipped.)* The port keeps the
+    /// view's own near plane (0.5, the driver view's 0.15) — no sky point comes within 10 m.
     ///
     /// Unlit: the layers and the horizon ring are drawn through the primitive helper 0x468240 /
     /// 0x468310, whose chain (0x468440…0x4685CE, 0x4685E0, 0x468630) is `LayerUV`, `LayerTexture`,
     /// `LayerState`, `LayerColours` and the draw — no light layer — so a sky pixel is the texture ×
     /// its own colour stream (`RE/notes/thrash.md` §6d.5), not the scene's ambient-and-sun term.
-    pub fn draw_items(&self, camera_pos: Vec3, far: f32) -> impl Iterator<Item = DrawItem> + '_ {
-        let k = (far * 0.9 / RADIUS).clamp(0.02, 4.0);
-        let t = glam::Mat4::from_translation(camera_pos) * glam::Mat4::from_scale(Vec3::splat(k));
+    ///
+    /// `after_sun` picks the levels the pass draws after the sun (0x45D6F0 → 0x460290): the pass
+    /// runs its list twice, first the levels with flag 0x400 (0x45D6A5…0x45D6EE), then the sun, then
+    /// the rest (0x45D704…0x45D748).
+    pub fn draw_items(&self, camera_pos: Vec3, after_sun: bool) -> impl Iterator<Item = DrawItem> + '_ {
+        let t = glam::Mat4::from_translation(camera_pos);
         const UNLIT: nfs_renderer::LayerLight = nfs_renderer::LayerLight { ambient: [1.0; 3], diffuse: [0.0; 3], direction: [0.0; 3] };
-        self.parts.iter().map(move |(mesh, material, motion)| {
-            let mut item = DrawItem { layer_light: Some(UNLIT), ..DrawItem::new(*mesh, *material, t) };
+        self.parts.iter().filter(move |p| p.3 == after_sun).map(move |(mesh, material, motion, _)| {
+            // the pass sets Thrash 0x24 ← 10 before its levels and the ring (0x45D689…0x45D68D): the
+            // alpha test `GREATER 10` (`RE/notes/thrash.md` §6d.4)
+            let mut item = DrawItem { layer_light: Some(UNLIT), alpha_test: true, sky_pass: true, ..DrawItem::new(*mesh, *material, t) };
             item.uv_offset = match *motion {
                 Motion::Still => [0.0, 0.0],
                 Motion::Grid(i) => self.grids[i].offset,

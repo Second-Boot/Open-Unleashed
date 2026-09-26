@@ -44,11 +44,34 @@ pub mod id {
     pub const C1_ABORT: u16 = 0x16B;
     pub const C1_RESET: u16 = 0x16C;
     pub const C1_AIDRIVE: u16 = 0x16D;
-    /// `I_LOOKBEHIND` and `I_CYCLECAMERA` (the option table's entries at 0x4B41F7 / 0x4B425B) —
-    /// the ids `Controller.LookBehind` and `Controller.CameraView` are built with (0x51E1A9,
-    /// 0x51E22D)
+    /// the plain commands 10…13 — `Controller.LeftTurnSignal`, `RightTurnSignal`, `Hazards`
+    /// and `Lights` are built with these (0x51E285, 0x51E2B1, 0x51E2DD, 0x51E1D5)
+    pub const C1_SIGNALLEFT: u16 = 0x171;
+    pub const C1_SIGNALRIGHT: u16 = 0x172;
+    pub const C1_SIREN: u16 = 0x173;
+    pub const C1_LIGHTSON: u16 = 0x174;
+    /// The interface keys, 0x1EE…0x20D: the packer files bit `id − 0x1EE` (0x413755…0x4137A0).
+    /// `Controller.Pause` is built with `I_PAUSE` (0x51E259), `LookBehind` with `I_LOOKBEHIND`
+    /// (0x51E1A9), `LookLeft` / `LookRight` / `LookForward` with 0x202 / 0x203 / 0x204
+    /// (0x51E309, 0x51E335, 0x51E361), `CameraView` with `I_CYCLECAMERA` (0x51E22D).
+    pub const I_PAUSE: u16 = 0x1F6;
+    pub const I_ROTCAMCCLOCK: u16 = 0x1F8;
+    pub const I_ROTCAMSTOP: u16 = 0x1F9;
+    pub const I_ROTCAMCLOCK: u16 = 0x1FA;
+    pub const I_TOGGLEPAUSEMENU: u16 = 0x1FC;
+    pub const I_SFX: u16 = 0x1FF;
+    pub const I_MUSIC: u16 = 0x200;
     pub const I_LOOKBEHIND: u16 = 0x201;
+    pub const I_LOOKLEFT: u16 = 0x202;
+    pub const I_LOOKRIGHT: u16 = 0x203;
+    pub const I_LOOKFORWARD: u16 = 0x204;
     pub const I_CYCLECAMERA: u16 = 0x205;
+    pub const I_TOGGLEHUD: u16 = 0x206;
+    pub const I_CYCLEHUD: u16 = 0x207;
+    pub const I_TOGGLEREARVIEW: u16 = 0x208;
+    pub const I_TOGGLEMAP: u16 = 0x209;
+    pub const I_CYCLEMAP: u16 = 0x20A;
+    pub const I_HUDTRANSPARENCY: u16 = 0x20D;
 }
 
 /// One binding's six fields, `[binding+0x14…+0x28]`.
@@ -245,10 +268,16 @@ pub fn axis_read(b: &Binding, pads: &[PadRecord], bands: &[[i32; 2]; 8]) -> u8 {
     crate::gamepad::analog_read(p.axes[n], lo, hi) as u8
 }
 
-/// The player's key bindings by option id, from `fe.txt`'s `C1_*` lines.
+/// The player's bindings by option id: `fe.txt`'s `C1_*` / `I_*` lines, then the nineteen
+/// `Controller.*` rows over them ([`set_defaults`](Self::set_defaults)).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Bindings {
     pub by_id: std::collections::HashMap<u16, Binding>,
+    /// The option ids of the `Controller.*` rows, the only bindings **0x51DCC0** walks
+    /// (0x51DCD5…0x51DFA5) when it takes a duplicate: a binding only `fe.txt` sets (`C1_ABORT`,
+    /// the `I_*` function keys) is never cleared by a row taking its key. Empty until
+    /// [`set_defaults`](Self::set_defaults) names them; then every binding is walked.
+    pub rows: Vec<u16>,
 }
 
 impl Bindings {
@@ -265,11 +294,31 @@ impl Bindings {
             ("C1_ABORT", id::C1_ABORT),
             ("C1_RESET", id::C1_RESET),
             ("C1_AIDRIVE", id::C1_AIDRIVE),
+            ("C1_SIGNALLEFT", id::C1_SIGNALLEFT),
+            ("C1_SIGNALRIGHT", id::C1_SIGNALRIGHT),
+            ("C1_SIREN", id::C1_SIREN),
+            ("C1_LIGHTSON", id::C1_LIGHTSON),
+            ("I_PAUSE", id::I_PAUSE),
+            ("I_ROTCAMCCLOCK", id::I_ROTCAMCCLOCK),
+            ("I_ROTCAMSTOP", id::I_ROTCAMSTOP),
+            ("I_ROTCAMCLOCK", id::I_ROTCAMCLOCK),
+            ("I_TOGGLEPAUSEMENU", id::I_TOGGLEPAUSEMENU),
+            ("I_SFX", id::I_SFX),
+            ("I_MUSIC", id::I_MUSIC),
             ("I_LOOKBEHIND", id::I_LOOKBEHIND),
+            ("I_LOOKLEFT", id::I_LOOKLEFT),
+            ("I_LOOKRIGHT", id::I_LOOKRIGHT),
+            ("I_LOOKFORWARD", id::I_LOOKFORWARD),
             ("I_CYCLECAMERA", id::I_CYCLECAMERA),
+            ("I_TOGGLEHUD", id::I_TOGGLEHUD),
+            ("I_CYCLEHUD", id::I_CYCLEHUD),
+            ("I_TOGGLEREARVIEW", id::I_TOGGLEREARVIEW),
+            ("I_TOGGLEMAP", id::I_TOGGLEMAP),
+            ("I_CYCLEMAP", id::I_CYCLEMAP),
+            ("I_HUDTRANSPARENCY", id::I_HUDTRANSPARENCY),
         ];
         let by_id = names.iter().filter_map(|&(n, i)| Some((i, parse(get(n)?)?))).collect();
-        Self { by_id }
+        Self { by_id, rows: Vec::new() }
     }
     pub fn get(&self, id: u16) -> Option<&Binding> {
         self.by_id.get(&id)
@@ -285,12 +334,18 @@ impl Bindings {
         if self.by_id.get(&id).is_some_and(|b| same(b, &new)) {
             return;
         }
-        for b in self.by_id.values_mut() {
-            if same(b, &new) {
+        self.take_duplicates(&new);
+        self.by_id.insert(id, new);
+    }
+
+    /// **0x51DCC0**: every row's binding equal to `new` loses its kind ([`rows`](Self::rows)).
+    fn take_duplicates(&mut self, new: &Binding) {
+        let rows = &self.rows;
+        for (i, b) in self.by_id.iter_mut() {
+            if (rows.is_empty() || rows.contains(i)) && same(b, new) {
                 b.kind = 0;
             }
         }
-        self.by_id.insert(id, new);
     }
 }
 
@@ -450,16 +505,13 @@ impl Bindings {
     /// at in the pad half, and in 0x51D0A0 only when its third argument is set, which here it is
     /// not (0x51DA5A pushes `ebx` = 0) — so unlike [`assign`](Self::assign) there is no early
     /// out. The nineteen are pairwise different, so their order does not change the outcome.
-    /// `id_of` names the option id behind a row where this port has one; the rest (lights,
-    /// pause, the turn signals, the hazards and the three look rows) have no binding here.
+    /// `id_of` names the option id behind a row (0x51E049…0x51E361); a row it has none for is
+    /// skipped.
     pub fn set_defaults(&mut self, defaults: &[Binding; 19], id_of: impl Fn(&str) -> Option<u16>) {
+        self.rows = CONTROLLER_ROWS.iter().filter_map(|r| id_of(r)).collect();
         for (row, b) in defaults.iter().enumerate() {
             let Some(id) = id_of(CONTROLLER_ROWS[row]) else { continue };
-            for other in self.by_id.values_mut() {
-                if same(other, b) {
-                    other.kind = 0;
-                }
-            }
+            self.take_duplicates(b);
             self.by_id.insert(id, *b);
         }
     }
@@ -605,6 +657,29 @@ mod tests {
         assert_eq!(kinds, [2, 2, 2, 3, 3, 3]);
         let not_analogue = default_bindings(1, DeviceCaps { analogue: false, axes: 0xFF, buttons: !0 }, 0);
         assert_eq!(not_analogue, default_bindings(0, DeviceCaps::default(), 0));
+    }
+
+    /// 0x51DCC0 walks the nineteen rows only: a row taking F1 leaves `fe.txt`'s
+    /// `I_TOGGLEPAUSEMENU` its key, and takes it from another row.
+    #[test]
+    fn only_rows_lose_a_duplicate() {
+        let mut bs = Bindings::from_registry(|k| match k {
+            "I_TOGGLEPAUSEMENU" => Some("key,SC_F1"),
+            _ => None,
+        });
+        let id_of = |n: &str| match n {
+            "Controller.Horn" => Some(id::C1_HORN),
+            "Controller.Lights" => Some(id::C1_LIGHTSON),
+            _ => None,
+        };
+        bs.set_defaults(&default_bindings(0, DeviceCaps::default(), 0), id_of);
+        assert_eq!(bs.rows, vec![id::C1_HORN, id::C1_LIGHTSON]);
+        let f1 = parse("key,SC_F1").unwrap();
+        bs.assign(id::C1_HORN, f1);
+        assert_eq!(bs.get(id::I_TOGGLEPAUSEMENU).map(|b| b.kind), Some(3));
+        bs.assign(id::C1_LIGHTSON, f1);
+        assert_eq!(bs.get(id::C1_HORN).map(|b| b.kind), Some(0));
+        assert_eq!(bs.get(id::I_TOGGLEPAUSEMENU).map(|b| b.kind), Some(3));
     }
 
     /// Storing the defaults over rebound rows: a row whose control another row held is simply

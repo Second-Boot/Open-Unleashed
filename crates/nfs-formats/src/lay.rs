@@ -35,8 +35,7 @@ impl Element {
     pub fn pair(&self, key: &str) -> Option<(f32, f32)> {
         let v = self.get(key)?;
         let (a, b) = v.split_once(',')?;
-        let n = |t: &str| t.trim().parse::<f32>().ok().or_else(|| crate::ctr::eval(t, &|_| None).map(|v| v as f32));
-        Some((n(a)?, n(b)?))
+        Some((number(a)? as f32, number(b)? as f32))
     }
 
     /// An integer value. 0x527D60: an empty string is 0, a `0x` prefix goes to the hex parser
@@ -52,7 +51,7 @@ impl Element {
         v.split(',')
             .map(|t| t.trim())
             .filter(|t| !t.is_empty())
-            .filter_map(|t| t.parse::<f32>().ok().or_else(|| crate::ctr::eval(t, &|_| None).map(|v| v as f32)))
+            .filter_map(|t| number(t).map(|v| v as f32))
             .collect()
     }
 
@@ -61,7 +60,7 @@ impl Element {
         if let Some(h) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
             i64::from_str_radix(h, 16).ok()
         } else {
-            v.parse().ok().or_else(|| crate::ctr::eval(v, &|_| None).map(|v| v as i64))
+            v.parse().ok().or_else(|| number(v).map(|v| v as i64))
         }
     }
 
@@ -97,6 +96,19 @@ impl Element {
         }
         Some((p, self.int("shapeIndex").unwrap_or(0).max(0) as usize))
     }
+}
+
+/// One component of a `.lay` value as a number: a plain decimal as it is, anything else through
+/// the evaluator (`crate::expr`). A `.lay` value has no macro dictionary to draw on at this level,
+/// so every name is left unanswered, and an **empty** component is no number at all — the port's
+/// reading of the tokeniser 0x4B58E9, which skips an empty token (§4.116), not of the evaluator,
+/// which would read it as 0.
+fn number(t: &str) -> Option<f64> {
+    let t = t.trim();
+    if t.is_empty() {
+        return None;
+    }
+    t.parse::<f64>().ok().or_else(|| crate::expr::eval(t, &|_| crate::expr::Macro::Unanswerable).map(f64::from))
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

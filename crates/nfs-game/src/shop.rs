@@ -88,8 +88,8 @@ fn set_state(owned: &mut OwnedCar, id: i16, state: f32) {
 }
 
 impl Career {
-    /// 0x5012E0: add `delta`, held to ±999 999 999 first.
-    fn add_money(&mut self, delta: i64) {
+    /// 0x5012E0: add `delta`, held to ±999 999 999 first. The sum itself is never clamped.
+    pub(crate) fn add_money(&mut self, delta: i64) {
         self.money += delta.clamp(-MONEY_STEP, MONEY_STEP);
     }
 

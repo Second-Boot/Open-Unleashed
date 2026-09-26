@@ -128,9 +128,8 @@ impl LayoutScreen {
     pub(super) fn draw_car_setting_slider(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
         let WidgetDraw { i, e, x, y, w, aspect, .. } = d;
         let (idx, count) = self.knobs.get(&i).copied().unwrap_or((0, 1));
-        for (px, py, pw, ph, file, index, _) in self.shape_parts(e) {
-            let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
-            let (dw, dh) = (if pw > 0.0 { pw } else { aw }, if ph > 0.0 { ph } else { ah });
+        for (px, py, file, index, _) in self.shape_parts(e) {
+            let Some(&(tex, dw, dh)) = self.shapes.get(&(file, index)) else { continue };
             let dx = if count > 1 { (idx * (w - dw).max(0.0) as i32 / (count - 1)) as f32 } else { 0.0 };
             let (pos, size) = self.place(aspect, x + px + dx, y + py, dw, dh);
             out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
@@ -208,10 +207,9 @@ impl LayoutScreen {
             out.push(self.quad(aspect, x, y, 1.0, at("stemleftheight"), stem));
             out.push(self.quad(aspect, x + bw, y, 1.0, at("stemrightheight"), stem));
         }
-        for (px, py, pw, ph, file, index, flip) in self.shape_parts(e) {
+        for (px, py, file, index, flip) in self.shape_parts(e) {
             let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
-            let (dw, dh) = (if pw > 0.0 { pw } else { aw }, if ph > 0.0 { ph } else { ah });
-            let (pos, size) = self.place(aspect, x + px, y + py, dw, dh);
+            let (pos, size) = self.place(aspect, x + px, y + py, aw, ah);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
@@ -225,7 +223,7 @@ impl LayoutScreen {
             let (px, py) = self
                 .part_attr(e, p, "pos")
                 .and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)))
-                .unwrap_or((0.0, 0.0));
+                .unwrap_or((0, 0));
             // **`data.usesmallfont`** puts both strings in `univers8b.ffn`. The class
             // keeps two hard-coded fonts — `[this+0x184]` is `univers8b.ffn`
             // (0x4C4E8E) and `[this+0x188]` `universC11b.ffn` (0x4C4EC6) — and
@@ -628,14 +626,53 @@ impl LayoutScreen {
         }
     }
 
-    // `NFS5.ChroniclePicture` (0x508310) lays the grid out at the widget's box, clipped
-    // to it and panned by the two offsets the drag keeps at `+0x14C` / `+0x150`. The
-    // port composes the grid into one texture and draws it unpanned, which is the same
-    // picture whenever it fits — and it does: the widget is `size=458,286` and so is
-    // the picture.
+    // `NFS5.ChroniclePicture` (0x508310) lays the grid out at the widget's position, each
+    // tile at **its own size** and clipped to the widget's box by 0x4D9E70, offset by the
+    // pan the drag keeps at `+0x14C` / `+0x150` (clamped, `chronicle_pan`). The port
+    // composes the grid into one texture (`set_chronicle_picture`) and clips that. The
+    // box is 458×286 on both screens, and so is the picture in 140 of the 183 packs — but
+    // 43 are bigger (`MA601a.fsh` is five rows, 458×650; `MC951a.fsh` 626 wide), and those
+    // the original shows a box-sized window of and lets the player drag, where this port
+    // used to squeeze the whole picture into the box.
+    //
+    // 0x4D9E70 is the front end's clipped blit (ten callers): `(entry, x, y, w, h, clip
+    // l, t, r, b, colour, flip, flag)`. Per axis it cuts what lies past the far edge
+    // (`x + entry.w > r` → visible `r − x`, 0x4D9EAB…0x4D9ECE) and before the near one
+    // (`x < l` → cut `l − x`, `x = l`, 0x4D9ED6…0x4D9EFA), rejects the tile when the
+    // visible extent is negative or the cut exceeds `w` (0x4D9F5D…0x4D9FAD), and takes the
+    // texture coordinates in the same proportions (`u0 + du·cut/w`, `u0 + du·visible/w`,
+    // 0x4DA14D…0x4DA1FE). Unlike 0x4D9B30 it applies no 1/512 inset. The colour is the
+    // widget's tint (0x528C90, opaque white on both screens) with the transition's fade
+    // (0x4C8840) folded in by 0x4D87F0 at 0x508361.
     pub(super) fn draw_chronicle_or_showcase_picture(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
-        let WidgetDraw { i, e, x, y, w, h, aspect, hovered, .. } = d;
+        let WidgetDraw { i, e, x, y, w, h, talpha, aspect, hovered, .. } = d;
         let Some(key) = self.logos.get(&i) else { return };
+        if e.class == "NFS5.ChroniclePicture" {
+            let Some(&(tex, _, _)) = self.shapes.get(key) else { return };
+            let Some((px, py, pw, ph)) = self.chronicle_pan(i) else { return };
+            // the picture moves with the transition (0x4C8760 on the position, 0x50834A), the
+            // clip rectangle does not (0x4C8670)
+            let (cx, cy) = self.position_of(e);
+            let (l, t) = (x - px, y - py);
+            let (x0, x1) = (l.max(cx), (l + pw).min(cx + w));
+            let (y0, y1) = (t.max(cy), (t + ph).min(cy + h));
+            if x1 <= x0 || y1 <= y0 {
+                return;
+            }
+            let (pos, size) = self.place(aspect, x0, y0, x1 - x0, y1 - y0);
+            out.push(Sprite {
+                texture: tex,
+                pos,
+                size,
+                uv_min: [(x0 - l) / pw, (y0 - t) / ph],
+                uv_max: [(x1 - l) / pw, (y1 - t) / ph],
+                color: [1.0, 1.0, 1.0, talpha],
+                rotation: 0.0,
+                pivot: [0.5, 0.5],
+                tri: None,
+            });
+            return;
+        }
         // `NFS5.ChroniclePictureIcon` keeps **two** entries, 0 and 1, and 0x508819
         // picks between them on 0x4C7C90 — `[this+0x10C] & 4`, which is bit 2 of the
         // state mask, **hover** (§4.109). Entry 1 is therefore the hovered frame, not
@@ -648,13 +685,7 @@ impl LayoutScreen {
         };
         let Some(&(tex, aw, ah)) = self.shapes.get(key) else { return };
         let (dw, dh) = (if w > 0.0 { w } else { aw }, if h > 0.0 { h } else { ah });
-        // `NFS5.ChroniclePicture` is draggable: `[this+0x14C]` and `[+0x150]` are a
-        // pan the mouse slots move against the pointer (§4.119)
-        let (px, py) = match e.class == "NFS5.ChroniclePicture" {
-            true => self.picture_pan.get(&i).copied().unwrap_or((0.0, 0.0)),
-            false => (0.0, 0.0),
-        };
-        let (pos, size) = self.place(aspect, x - px, y - py, dw, dh);
+        let (pos, size) = self.place(aspect, x, y, dw, dh);
         out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         // `NFS5.ChroniclePictureIcon`'s draw ends with the bevel over **the art's own
         // size** — 0x508906 and 0x508910 read `[entry+0x18]` and `[entry+0x14]`, the
@@ -1042,9 +1073,11 @@ impl LayoutScreen {
         out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
         let Some((name, rank, colour)) = self.badges.get(&i) else { return };
         // the shadow: entry 0 at x+244 and entry 1 at y+131 (0x4CF499, 0x4CF4C4). The
-        // original also gates it on a start-up timer (0x4E35D0 wants the game to have
-        // been up 0x2100000 ticks) and on `[0x657E60]`; neither is state this port
-        // keeps, so the shadow is always drawn.
+        // original also gates it on the machine (0x4E35D0: at least 0x2100000 bytes of
+        // total physical memory, `GlobalMemoryStatus` at 0x53C3D0 — not a start-up
+        // timer, as this said until 2026-09-26), on the low-end-card gate `[0x5D9D38]`
+        // and on the `FENOUSELESSART` option `[0x657E60]`; a default install on a machine
+        // with memory to spare passes all three, so the shadow is always drawn.
         for (entry, dx, dy) in [(0usize, 244.0, 0.0), (1, 0.0, 131.0)] {
             let Some(&(t, sw, sh)) = self.shapes.get(&(LICENSE_SHADOW.to_string(), entry)) else { continue };
             let (pos, size) = self.place(aspect, x + dx, y + dy, sw, sh);
@@ -1097,10 +1130,9 @@ impl LayoutScreen {
             // stencil (0x4DAAC0 … 0x4DAB00 around 0x4CDB61 and 0x4CDB72), which this port stands
             // for by putting the oval over them
             self.draw_movie_overlay(i, e, talpha, aspect, out);
-            for (px, py, pw, ph, file, index, flip) in self.shape_parts(e) {
+            for (px, py, file, index, flip) in self.shape_parts(e) {
                 let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
-                let (dw, dh) = (if pw > 0.0 { pw } else { aw }, if ph > 0.0 { ph } else { ah });
-                let (pos, size) = self.place(aspect, x + px, y + py, dw, dh);
+                let (pos, size) = self.place(aspect, x + px, y + py, aw, ah);
                 let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
                 let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
                 out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
@@ -1705,7 +1737,7 @@ impl LayoutScreen {
             // other name goes to the normal resolver.
             let at = |expr: &str| {
                 nfs_formats::ctr::eval_pair(expr, &|n: &str| match n {
-                    "hitext.size.width" => Some(tw as f64),
+                    "hitext.size.width" => nfs_formats::ctr::Macro::Text((tw as i32).to_string()),
                     _ => self.reference(e, n, 0, true),
                 })
             };
@@ -1725,7 +1757,7 @@ impl LayoutScreen {
                     self.text(out, aspect, cf, p.value("text").unwrap_or("_"), cx, cy, 0.0, 0, ink);
                 }
                 _ => {
-                    let (cw, ch) = p.value("size").and_then(&at).unwrap_or((1.0, 8.0));
+                    let (cw, ch) = p.value("size").and_then(&at).unwrap_or((1, 8));
                     let colour = p.value("color").and_then(parse_color).unwrap_or([0, 0, 0, 255]);
                     out.push(self.quad(aspect, cx, cy, (cw as f32).max(1.0), (ch as f32).max(1.0), tint(colour)));
                 }
@@ -1987,10 +2019,9 @@ impl LayoutScreen {
         // the art the widget's class template carries, at the places the template puts
         // it — `NFS5.CARSETTINGBUTTON`'s arrows, the popup circles, the tab buttons
         let mut from_template = false;
-        for (px, py, pw, ph, file, index, flip) in self.shape_parts(e) {
+        for (px, py, file, index, flip) in self.shape_parts(e) {
             let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
-            let (dw, dh) = (if pw > 0.0 { pw } else { aw }, if ph > 0.0 { ph } else { ah });
-            let (pos, size) = self.place(aspect, x + px, y + py, dw, dh);
+            let (pos, size) = self.place(aspect, x + px, y + py, aw, ah);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
@@ -2125,15 +2156,34 @@ impl LayoutScreen {
             })
             .and_then(|c| c.state_parts(e.get("state").unwrap_or("normal")).iter().filter_map(|n| c.part(n)).find(|p| p.kind() == nfs_formats::ctr::PartKind::Text))
             .and_then(|p| {
-                let tw = f.place(&text).1 as f64;
+                // the tick's write (0x4BD32C) is what the part measures from now on (0x4E7160)
+                self.watch_text.borrow_mut().insert(i, text.clone());
+                // 0x536970's width, truncated (`_ftol` at 0x4E7280) — not the pen's advance
+                let tw = f.measure(&text).0.trunc();
                 let v = p.value("pos")?;
                 nfs_formats::ctr::eval_pair(v, &|n| match n {
-                    "label.size.width" => Some(tw),
+                    "label.size.width" => nfs_formats::ctr::Macro::Text((tw as i32).to_string()),
                     other => self.reference(e, other, 0, true),
                 })
             });
         if let Some((px, py)) = watch_pos {
             self.text(out, aspect, f, &text, x + px as f32, y + py as f32, 0.0, 0, color);
+        } else if e.class.eq_ignore_ascii_case("NFS5.WORDWRAPACCESSORWATCH") {
+            // the change fade and the typing's restart (`WrapWatch`, 0x522EC0 / 0x522D60)
+            let now = self.ticks() as i64;
+            let animating = self.attr_num(e, "animating").unwrap_or(0.0) != 0.0;
+            let mut watches = self.wrap_watch.borrow_mut();
+            let w = watches.entry(i).or_insert_with(|| crate::layout::WrapWatch { text: text.clone(), changing: None, restart: None });
+            w.tick(&text, now, animating);
+            let budget = match w.restart {
+                Some(at) if animating => Some(((now - at).max(0) / 3) as usize),
+                _ => self.typewriter(e),
+            };
+            let mut color = color;
+            color[3] *= w.fade(now);
+            if budget != Some(0) {
+                self.wrapped_text(out, aspect, f, &w.text, x, y, box_w, e.int("align").unwrap_or(0), color, budget);
+            }
         } else if e.class.to_ascii_lowercase().contains("wordwrap") {
             let budget = self.typewriter(e);
             if budget != Some(0) {

@@ -42,6 +42,146 @@ pub fn ai_blend(cos: f32, detail: u8) -> i32 {
     ((c + c / 2) >> 10).clamp(-0x40, 0x40)
 }
 
+/// `Traffic_pickGear` **0x408130** — the gear `0x408360` (the traffic / cop drive) stores in
+/// `car+0xD82` and turns into the engine speed `car+0xDB4 = carSpecs[0x60 + 4·gear] · car+0x35C`
+/// (0x408495…0x4084BD) that 0x4A7080 divides by the redline `carSpecs[0x94]` for the engine loops:
+///
+/// * `car+0x35C` (the speed estimate `max(|vx|,|vz|) + ¼·min`) under 2 m/s → **1** (neutral);
+/// * `car+0x104C == −1` (reversing out of trouble, `traffic.md` §27.2a) → **0** (reverse);
+/// * otherwise **2**, raised to `k + 1` for every forward slot `k` in `2 .. carSpecs[0x50]` whose
+///   top speed `carSpecs[0x170 + 4k] · redline` (m/s per rpm × rpm) is under the speed
+///   (0x408165…0x40819D) — the gear the speed calls for.
+///
+/// `car+0x104C` is `+1` from every spawn (0x406CF9, 0x406DAC) and only the trouble oscillator
+/// (0x40A701, 0x40A82B, 0x40A8D2) sets `−1`, so a moving AI car runs the scan; `traffic.md` §24's
+/// "gear 0 almost always" read `car+0x104C` the other way round. `mps_per_rpm` is `carSpecs+0x170`
+/// per slot and `gear_slots` `carSpecs[0x50]` (forward gears + 2). The answer can be `gear_slots`
+/// itself (faster than the top gear at the redline): the original then reads the ratio slot past
+/// the last gear (0 when the `.sim` has none there; with six forward gears slot 8 is `+0x80`, the
+/// final drive) — the port reads its own table's slot, and 0 past slot 7 (APPROXIMATION there).
+pub fn ai_gear(speed_est: f32, reversing: bool, mps_per_rpm: &[f32], gear_slots: usize, redline: f32) -> usize {
+    if speed_est < 2.0 {
+        return 1;
+    }
+    if reversing {
+        return 0;
+    }
+    let mut g = 2;
+    for k in 2..gear_slots.min(mps_per_rpm.len()) {
+        if mps_per_rpm[k] * redline < speed_est {
+            g = k + 1;
+        }
+    }
+    g
+}
+
+/// The CRAZY_HORN patterns `(len, reload, repeats)` 0x4013D0 hands `HonkPattern` by
+/// `(gGameTick >> 3) & 3` (0x40142A…0x40145F, jump table 0x401568).
+pub const CRAZY_HORN_PATTERNS: [(i32, i32, i32); 4] = [(4, 0x10, 8), (2, 0x20, 0xC), (7, 0x28, 0x10), (1, 0x20, 0)];
+
+/// The oncoming traffic car's random honk, `HonkPattern(car, 2, 0x20, 8)` (0x401230…0x401237).
+pub const ONCOMING_HONK_PATTERN: (i32, i32, i32) = (2, 0x20, 8);
+
+/// What one honk-timer step asks of the horn voice `slot + 0x27`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HonkStep {
+    /// `Voice_play` (0x4A754B…0x4A75A4): the timer is still up
+    Play,
+    /// 0x4A9890 (0x4A7527…0x4A7532): the timer has just run out
+    Stop,
+    /// nothing voiced this update (the timer is 0, or counting up through a pause)
+    Idle,
+}
+
+/// **The honk timers of an audio slot** — `+0x20` timer, `+0x24` length, `+0x28` reload, `+0x2C`
+/// repeats of the slot record `0x655D60 + 0x38·i` — and the car's horn byte `car+0xD86`, which for
+/// an AI car only this pass writes (0x4A752A / 0x4A754B; the input copy 0x499279…0x499330 runs for a
+/// human, `car+0x52C & 4`, only). Read to the instruction 2026-09-26, CONFIRMED.
+///
+/// `Honk(car, on)` 0x4A6D90 and `HonkPattern(car, len, reload, repeats)` 0x4A6DE0 look the car up
+/// in the slot table (`[slot] == car`) and program these fields — a car without a slot is not
+/// touched; 0x4A7DC0 zeroes `+0x20` when it gives a slot a new car (0x4A801B) or empties it
+/// (0x4A80E7). `Audio_updateAiCar` 0x4A7080 steps them once per audio update ([`Self::step`]).
+///
+/// The one caller that matters, `0x4013D0` (`traffic.md` §12.3), runs for a traffic car on every
+/// even tick: HONK_HORN (mask 8) ⇒ `Honk(car, 1)`, **else when `car+0xD86` is set ⇒ `Honk(car, 0)`**;
+/// then CRAZY_HORN (mask 0x1000) ⇒ `HonkPattern` with [`CRAZY_HORN_PATTERNS`]. Played through, a
+/// pattern is therefore cut after its first audible update — the `Honk(car, 0)` of the next tick
+/// sees the horn byte the step set and ends it — and the fourth pattern `(1, 0x20, 0)` never sounds
+/// and never ends (its length 1 runs out on the first step, its repeat count 0 goes negative and
+/// reloads for ever), which holds the timer non-zero so no later pattern is taken until the slot
+/// changes hands or a HONK_HORN comes. That is the binary's behaviour, reproduced, not a guess.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HonkTimer {
+    pub timer: i32,
+    pub len: i32,
+    pub reload: i32,
+    pub repeats: i32,
+    /// `car+0xD86`
+    pub horn: bool,
+}
+
+impl HonkTimer {
+    /// `Honk(car, on)` 0x4A6D90: on ⇒ `timer = 1, len = 0` (held: a zero length never counts down);
+    /// off ⇒ when the timer runs, `timer = 1, len = 1, repeats = 1` — it ends on the next step.
+    pub fn honk(&mut self, on: bool) {
+        if on {
+            self.timer = 1;
+            self.len = 0;
+        } else if self.timer != 0 {
+            self.timer = 1;
+            self.len = 1;
+            self.repeats = 1;
+        }
+    }
+
+    /// `HonkPattern(car, len, reload, repeats)` 0x4A6DE0: taken only while the timer is 0 —
+    /// `timer = len = len`, `+0x28 = −reload`, `+0x2C = repeats` (0x4A6E03…0x4A6E14).
+    pub fn pattern(&mut self, len: i32, reload: i32, repeats: i32) {
+        if self.timer == 0 {
+            self.timer = len;
+            self.len = len;
+            self.reload = -reload;
+            self.repeats = repeats;
+        }
+    }
+
+    /// One step of 0x4A750A…0x4A75BF (the `car+0x52C & 4` clear arm — every car but a human):
+    /// ```text
+    /// if timer > 0:
+    ///     if len > 0: timer −= 1
+    ///     if timer == 0: horn = 0 ; stop ; if −−repeats != 0: timer = reload      ; (a negative pause)
+    ///     else:          horn = 1 ; Voice_play
+    /// elif timer < 0:  if ++timer == 0: timer = len
+    /// ```
+    pub fn step(&mut self) -> HonkStep {
+        if self.timer > 0 {
+            if self.len > 0 {
+                self.timer -= 1;
+            }
+            if self.timer == 0 {
+                self.horn = false;
+                self.repeats = self.repeats.wrapping_sub(1);
+                if self.repeats != 0 {
+                    self.timer = self.reload;
+                }
+                HonkStep::Stop
+            } else {
+                self.horn = true;
+                HonkStep::Play
+            }
+        } else {
+            if self.timer < 0 {
+                self.timer += 1;
+                if self.timer == 0 {
+                    self.timer = self.len;
+                }
+            }
+            HonkStep::Idle
+        }
+    }
+}
+
 #[derive(Default)]
 struct CarVoices {
     near: Option<VoiceId>,
@@ -57,6 +197,8 @@ pub struct AiEngines {
     road: Option<Arc<Clip>>,
     horn: Option<Arc<Clip>>,
     cars: Vec<CarVoices>,
+    /// the honk timers of each audio slot ([`HonkTimer`])
+    honks: Vec<HonkTimer>,
     viv: Vec<u8>,
     /// `game.spl[12]` — the mix level of `SND_coll` slots 0x0A / 0x0B (the horn)
     horn_trim: u32,
@@ -78,11 +220,11 @@ impl AiEngines {
         let slot = |n: usize| -> Option<Arc<Clip>> {
             let d = coll.as_ref()?;
             let p = Bnk::parse(d).ok()?.decode_slot(d, n).ok()?;
-            Some(Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range, gain: p.gain, bend_cents: p.bend_cents }))
+            Some(Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range, gain: p.gain, bend_cents: p.bend_cents, fx_send: p.fx_send }))
         };
         let (road, horn) = (slot(AI_ROAD_SLOT), slot(AI_HORN_SLOT));
         let spl = nfs_formats::spl::GameSpl::load(sounds_dir);
-        Ok(Self { sets: HashMap::new(), road, horn, cars: Vec::new(), viv, horn_trim: spl.slots_0a0b(), engine_trim: spl.ai_engine(), road_trim: spl.ai_road() })
+        Ok(Self { sets: HashMap::new(), road, horn, cars: Vec::new(), honks: Vec::new(), viv, horn_trim: spl.slots_0a0b(), engine_trim: spl.ai_engine(), road_trim: spl.ai_road() })
     }
 
     fn samples(&mut self, set: &str) -> (Option<Arc<Clip>>, Option<Arc<Clip>>) {
@@ -96,7 +238,7 @@ impl AiEngines {
             let bank = Bnk::parse(bytes).ok()?;
             let p = bank.decode_slot(bytes, 0).ok()?;
             let frames = (p.samples.len() / p.channels.max(1) as usize) as u32;
-            Some(Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range.or(Some((0, frames))), gain: p.gain, bend_cents: p.bend_cents }))
+            Some(Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range.or(Some((0, frames))), gain: p.gain, bend_cents: p.bend_cents, fx_send: p.fx_send }))
         };
         let pair = (load(&format!("{key}lden.bnk")), load(&format!("{key}ldex.bnk")));
         if pair.0.is_none() && pair.1.is_none() {
@@ -124,10 +266,14 @@ impl AiEngines {
         if self.cars.len() <= index {
             self.cars.resize_with(index + 1, CarVoices::default);
         }
-        let d = distance.max(0.0) as i32;
-        let atten = if spline_cam { 4096 / (d + 1) } else { 2048 / (d + 2) };
+        // of the fractional distance (`crate::fix_atten`); the port took whole metres until 2026-09-26
+        let atten = if spline_cam { crate::fix_atten(0x1000_0000, 0x1_0000, 0, distance) } else { crate::fix_atten(0x800_0000, 0x2_0000, 0, distance) };
         if atten == 0 {
-            self.stop(out, index);
+            // 0x4AA9C0…0x4AAAA4 releases the engine voices `v`, `v + 4`, `v + 8` only
+            let c = &mut self.cars[index];
+            for v in [c.near.take(), c.far.take(), c.road.take()].into_iter().flatten() {
+                out.stop(v);
+            }
             return;
         }
         if self.cars[index].set != set {
@@ -211,6 +357,24 @@ impl AiEngines {
         }
     }
 
+    /// The honk timers of audio slot `index`, for the `Honk` / `HonkPattern` calls of 0x4013D0.
+    pub fn honk_timer(&mut self, index: usize) -> &mut HonkTimer {
+        if self.honks.len() <= index {
+            self.honks.resize_with(index + 1, HonkTimer::default);
+        }
+        &mut self.honks[index]
+    }
+
+    /// 0x4A7DC0 gives slot `index` to another car or empties it: its voices stop (0x4A7FC8…0x4A8005,
+    /// 0x4A808B…0x4A80C6) and its honk timer is zeroed (0x4A801B / 0x4A80E7). The horn byte is the
+    /// car's, but a stale one only ever meets a zero timer, where `Honk(car, 0)` does nothing.
+    pub fn release(&mut self, out: &AudioOutput, index: usize) {
+        self.stop(out, index);
+        if let Some(h) = self.honks.get_mut(index) {
+            *h = HonkTimer::default();
+        }
+    }
+
     pub fn stop(&mut self, out: &AudioOutput, index: usize) {
         let Some(c) = self.cars.get_mut(index) else { return };
         for v in [c.near.take(), c.far.take(), c.road.take(), c.horn.take()].into_iter().flatten() {
@@ -235,6 +399,86 @@ mod tests {
     }
 
     use super::*;
+
+    fn run(t: &mut HonkTimer, n: usize) -> String {
+        (0..n).map(|_| match t.step() { HonkStep::Play => 'P', HonkStep::Stop => 's', HonkStep::Idle => '.' }).collect()
+    }
+
+    #[test]
+    fn a_pattern_played_through_honks_len_minus_one_updates_then_pauses_reload() {
+        // (4, 0x10, 8) with nothing cutting it: 3 updates on, the stop, 15 updates of pause, the
+        // reload update, and again — 8 times
+        let mut t = HonkTimer::default();
+        t.pattern(4, 0x10, 8);
+        assert_eq!((t.timer, t.len, t.reload, t.repeats), (4, 4, -0x10, 8));
+        let cycle = format!("PPPs{}", ".".repeat(0x10));
+        assert_eq!(run(&mut t, cycle.len() * 8), cycle.repeat(8));
+        assert_eq!(t.timer, 0, "the eighth stop does not reload");
+        // a pattern is taken only while the timer is 0
+        t.honk(true);
+        t.pattern(7, 0x28, 0x10);
+        assert_eq!((t.timer, t.len), (1, 0));
+    }
+
+    #[test]
+    fn honk_on_holds_and_honk_off_ends_on_the_next_step() {
+        let mut t = HonkTimer::default();
+        t.honk(true);
+        assert_eq!(run(&mut t, 5), "PPPPP");
+        assert!(t.horn);
+        t.honk(false);
+        assert_eq!(run(&mut t, 3), "s..");
+        assert_eq!(t, HonkTimer { timer: 0, len: 1, reload: 0, repeats: 0, horn: false });
+        // off with the timer at 0 does nothing
+        t.honk(false);
+        assert_eq!(t.timer, 0);
+    }
+
+    #[test]
+    fn the_controls_handler_cuts_a_pattern_after_one_update() {
+        // 0x4013D0 each tick before the step: HONK_HORN off ⇒ `Honk(car, 0)` when the horn byte is
+        // set, then the pattern (the oncoming honk's (2, 0x20, 8) here)
+        let mut t = HonkTimer::default();
+        let mut out = String::new();
+        for _ in 0..6 {
+            if t.horn {
+                t.honk(false);
+            }
+            let (l, r, n) = ONCOMING_HONK_PATTERN;
+            t.pattern(l, r, n);
+            out.push(match t.step() {
+                HonkStep::Play => 'P',
+                HonkStep::Stop => 's',
+                HonkStep::Idle => '.',
+            });
+        }
+        // one update on, one off, and the pattern taken again
+        assert_eq!(out, "PsPsPs");
+    }
+
+    #[test]
+    fn the_fourth_crazy_horn_pattern_is_silent_and_never_ends() {
+        let mut t = HonkTimer::default();
+        let (l, r, n) = CRAZY_HORN_PATTERNS[3];
+        t.pattern(l, r, n);
+        let s = run(&mut t, 200);
+        assert!(!s.contains('P'), "{s}");
+        assert_ne!(t.timer, 0, "the timer stays busy, so no other pattern is taken");
+        assert!(t.repeats < 0);
+    }
+
+    #[test]
+    fn the_ai_gear_follows_the_speed() {
+        // slots: reverse, neutral, then four forward gears topping out at 10, 20, 30, 40 m/s at 5000 rpm
+        let mps = [0.0, 0.1, 0.002, 0.004, 0.006, 0.008];
+        assert_eq!(ai_gear(1.9, false, &mps, 6, 5000.0), 1, "neutral under 2 m/s");
+        assert_eq!(ai_gear(15.0, true, &mps, 6, 5000.0), 0, "reverse while backing out");
+        assert_eq!(ai_gear(5.0, false, &mps, 6, 5000.0), 2);
+        assert_eq!(ai_gear(15.0, false, &mps, 6, 5000.0), 3);
+        assert_eq!(ai_gear(35.0, false, &mps, 6, 5000.0), 5);
+        // past the top gear's redline speed the scan runs one past the last slot
+        assert_eq!(ai_gear(45.0, false, &mps, 6, 5000.0), 6);
+    }
 
     #[test]
     fn the_crossfade_follows_the_listener() {

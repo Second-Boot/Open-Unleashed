@@ -5,70 +5,54 @@ use nfs_formats::sim::CarSim;
 
 pub const GRAVITY: f32 = 9.8;
 
-/// Damage zones (0..7 ring around the body, 8 roof, 9 spare) that feed each part-damage getter
-/// (`0x4938A0` family: mean zone damage over the part's mask, `part+0x48[10]`).
+/// One entry of the car's installed-part list `car+0x768` (twenty pointers to 0x168-byte part
+/// records, `loaders.md` §1) as the part-damage getters read it (`physics.md` §10, CONFIRMED —
+/// 0x4938A0, 0x493980, 0x493A10, 0x493AA0, 0x493B30, 0x493BC0 read to the instruction 2026-09-26):
+/// each part contributes `scale · mean(zones under mask) + state` over **its own** mask.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ZoneMasks {
-    pub engine: [bool; 10],
-    pub brakes: [bool; 10],
-    pub gearbox: [bool; 10],
-    pub suspension: [bool; 10],
-    pub aero: [bool; 10],
-    pub tyres: [bool; 10],
-}
-
-impl Default for ZoneMasks {
-    /// Masks of the standard parts of a rear-engined 911 in `nfs5.prt` (brakes / suspension /
-    /// tyres on the four corners, engine and gearbox at the rear, aero front and rear) — MEDIUM;
-    /// the career replaces them with the car's own family parts.
-    fn default() -> Self {
-        let corners = [true, false, true, false, true, false, true, false, false, false];
-        Self {
-            engine: [false, false, false, false, true, true, true, false, false, false],
-            brakes: corners,
-            gearbox: [false, false, false, false, true, true, true, false, false, false],
-            suspension: corners,
-            aero: [true, true, true, false, true, true, true, false, false, false],
-            tyres: corners,
-        }
-    }
-}
-
-/// What a part-damage getter adds to the live zone damage (`physics.md` §10, 0x4938A0 family):
-/// it returns `Σ (1.5 − 0.005·part.condition)·meanZoneDamage + part.state` over the car's parts of
-/// that type, so each group is a scale and an offset the career fills from the installed parts.
-/// The defaults are one standard part in perfect condition. `count` is the number of parts summed:
-/// the engine getter divides by `1 + count` and the suspension one by `count` (when above 1).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PartWear {
+pub struct InstalledPart {
+    /// `part+0x26`, the part type the getters select on (1 engine, 2 brakes, 3 gearbox, 4/5/8
+    /// suspension, 6 aero, 9 tyres).
+    pub kind: u16,
+    /// `part+0x48[10]`, one byte per damage zone; non-zero bytes are the zones this part averages.
+    pub mask: [bool; 10],
+    /// `1.5 − 0.005·part+0x60` (the condition %), `[0x5B246C]` / `[0x5B3284]`.
     pub scale: f32,
-    pub offset: f32,
-    pub count: u32,
+    /// `part+0x164`, the damage the part carries from earlier races (`Car_raceInit` 0x41085F).
+    pub state: f32,
 }
 
-impl Default for PartWear {
-    fn default() -> Self {
-        Self { scale: 1.5, offset: 0.0, count: 1 }
+impl InstalledPart {
+    pub fn new(kind: u16, mask: [bool; 10], condition: f32, state: f32) -> Self {
+        Self { kind, mask, scale: 1.5 - 0.005 * condition, state }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct PartWearSet {
-    pub engine: PartWear,
-    pub brakes: PartWear,
-    pub gearbox: PartWear,
-    pub suspension: PartWear,
-    pub aero: PartWear,
-    pub tyres: PartWear,
+/// The part list a car races with when nothing fills [`CarSpecs::parts`] — a quick race, an
+/// opponent, a cop, the traffic. **APPROXIMATION** (MEDIUM): the original always has twenty part
+/// pointers at `car+0x768` (the FE car object's stock copies), which the port does not build
+/// outside the career. These are one part per getter with the masks of the standard parts of a
+/// rear-engined 911 in `nfs5.prt` (brakes / suspension / tyres on the four corners, engine and
+/// gearbox at the rear, aero front and rear), `scale` 1.5 and no carried state — what the port's
+/// one-mask-per-group model (`ZoneMasks` / `PartWear`, until 2026-09-26) used, kept so a race
+/// without a career car behaves as before.
+pub fn fallback_parts() -> Vec<InstalledPart> {
+    let corners = [true, false, true, false, true, false, true, false, false, false];
+    let rear = [false, false, false, false, true, true, true, false, false, false];
+    let aero = [true, true, true, false, true, true, true, false, false, false];
+    [(1, rear), (2, corners), (3, rear), (4, corners), (6, aero), (9, corners)]
+        .into_iter()
+        .map(|(kind, mask)| InstalledPart { kind, mask, scale: 1.5, state: 0.0 })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CarSpecs {
     pub name: String,
     pub mass: f32,
-    pub zone_masks: ZoneMasks,
-    /// Per-group wear carried in from the career (`PartWear`).
-    pub wear: PartWearSet,
+    /// The installed-part list `car+0x768` the part-damage getters walk ([`InstalledPart`]);
+    /// [`fallback_parts`] unless the career fills it from the car's parts.
+    pub parts: Vec<InstalledPart>,
     /// wheelbase in metres (+0x44 ×0.001)
     pub wheelbase: f32,
     /// 0 NA, 1 turbo, 2 supercharged (+0x4C)
@@ -92,8 +76,9 @@ pub struct CarSpecs {
     /// top speed m/s (+0x90 ×0.44643)
     pub top_speed: f32,
     pub redline: f32,
-    /// engine rev-rate factor (+0x98 ×0.01)
-    pub rev_rate: f32,
+    /// engine-braking factor (+0x98 ×0.01, 0x49C880): `Engine_update`'s over-run arm returns
+    /// `−a · specs[0x98] · …` (0x49ECA0, its only reader) — not a rev rate
+    pub engine_brake: f32,
     /// torque curve, 21 points at 0, 500, … 10000 rpm (file units, lb·ft)
     pub torque: [f32; 21],
     /// front static load fraction (+0xF0 ×0.01)
@@ -168,8 +153,7 @@ impl CarSpecs {
         let torque = sim.torque_curve;
         let mut out = Self {
             name: sim.name.clone(),
-            zone_masks: ZoneMasks::default(),
-            wear: PartWearSet::default(),
+            parts: fallback_parts(),
             mass,
             wheelbase: sim.wheelbase_mm * 0.001,
             induction: sim.induction,
@@ -182,7 +166,7 @@ impl CarSpecs {
             ratio_rpm_per_mps: [0.0; 8],
             top_speed,
             redline: sim.redline_rpm,
-            rev_rate: sim.unknown_98_pct * 0.01,
+            engine_brake: sim.unknown_98_pct * 0.01,
             torque,
             front_weight: t[0] * 0.01,
             grip: t[1],

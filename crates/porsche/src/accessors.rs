@@ -519,9 +519,9 @@ impl App {
             // the key-binding rows of `GameCtrl.lay` / `fluffctrl.lay`: `"keyboard %s"` over
             // 0x51C050's name for the row's key (`nfs_game::keyname`), and nothing for a binding of
             // kind 0 — what a row shows after 0x51DCC0 took its control for another (0x51C997).
-            // The binding is `fe.txt`'s, rebindable on the screen (`nfs_input::bindings`);
-            // `CameraView` and `LookBehind` are `I_*` bindings this port does not read, so they
-            // keep the port's own map. `(ARC)` is this port's plumbing, not a layout modifier: the
+            // The binding is the row's own, 0x51D1D0's default over `fe.txt`'s, rebindable on the
+            // screen (`nfs_input::bindings`); all nineteen rows have one (`controller_action`).
+            // `(ARC)` is this port's plumbing, not a layout modifier: the
             // row's draw asks it for the arc 0x51C050 picked, which the original's draw reads
             // straight off the binding.
             b if b.starts_with("Controller.") => {
@@ -625,6 +625,17 @@ pub(crate) fn controller_action(accessor: &str) -> Option<nfs_input::Action> {
         "CameraView" => Action::CameraNext,
         "LookBehind" => Action::RearView,
         "Horn" => Action::Horn,
+        // the other eight rows' option ids (0x51E1D5, 0x51E259…0x51E361): `C1_LIGHTSON`,
+        // `I_PAUSE`, `C1_SIGNALLEFT`, `C1_SIGNALRIGHT`, `C1_SIREN`, `I_LOOKLEFT`, `I_LOOKRIGHT`,
+        // `I_LOOKFORWARD`
+        "Lights" => Action::Lights,
+        "Pause" => Action::Pause,
+        "LeftTurnSignal" => Action::SignalLeft,
+        "RightTurnSignal" => Action::SignalRight,
+        "Hazards" => Action::Hazards,
+        "LookLeft" => Action::LookLeft,
+        "LookRight" => Action::LookRight,
+        "LookForward" => Action::LookForward,
         _ => return None,
     })
 }

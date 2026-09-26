@@ -1,9 +1,11 @@
 //! Input: physical device → native macOS events → logical game actions.
 //!
-//! The action set mirrors the original's logical controls (see `RE/INPUT.md`); the default key
-//! bindings below are the original PC defaults *as far as they are known* and are flagged where
-//! unverified. Steering-ramp and dead-zone behaviour of the original are not yet recovered, so
-//! digital keys map to full-scale axis values here.
+//! The action set is the original's in-race controls ([`Action`]) and each reads through its
+//! binding as the input packer 0x412E70 does (`RE/notes/controls.md`, audit 2026-09-26); the
+//! defaults are 0x51D1D0's nineteen `Controller.*` rows over the shipped `fe.txt`. A key reads
+//! 255, so a key's steering is ±63 in the packet (±126 on the car) and its throttle and brake
+//! 0x7E (252 on the car) — full scale; the ±12-a-tick steering ramp a key gets (`.RAMPS`) is the
+//! physics'.
 
 pub mod bindings;
 pub mod gamepad;
@@ -12,6 +14,20 @@ use std::collections::HashSet;
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
+/// The original's in-race controls, each read through its binding (option ids 0x14E…0x21D,
+/// `[0x5E9130 + id·4]`) by the input packer 0x412E70 (`RE/notes/controls.md`, audit 2026-09-26).
+/// Three kinds of reading:
+///
+/// * **the packet's axes and buttons** (0x412F04…0x41300B): steering, throttle, brake, and bits
+///   0 / 1 of byte 0 for the handbrake and the horn — levels;
+/// * **the commands** (0x41312F…0x41326B), a code in bits 3..7 of byte 0 on the press: 2 shift up,
+///   3 shift down, 4 abort, 5 reset, 6 AI drive, 10 / 11 the turn signals, 12 the siren (the
+///   hazards), 13 the lights — edges;
+/// * **the interface bits** (0x413744…0x4137A0), bit `id − 0x1EE` of the word the packer files in
+///   the ring `0x5E954C`, read by `RaceFrame` through 0x4138D0 — on the press (edge) for 8 pause,
+///   0x0A…0x0C the pause orbit's step, 0x0E the HUD hide, 0x11 / 0x12 the sound and music, 0x17
+///   the camera, 0x18…0x1F the HUD toggles (0x415866…0x415ABE); held (level) for 0x13…0x16, the
+///   looks (0x415AFA…0x415B2C).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     SteerLeft,
@@ -21,23 +37,61 @@ pub enum Action {
     Handbrake,
     ShiftUp,
     ShiftDown,
+    /// `I_CYCLECAMERA`, bit 0x17
     CameraNext,
+    /// `I_LOOKBEHIND`, bit 0x13
     RearView,
+    /// `I_PAUSE`, bit 8
     Pause,
-    // free-camera / debug
-    FreeForward,
-    FreeBack,
-    FreeLeft,
-    FreeRight,
-    FreeUp,
-    FreeDown,
-    FreeFast,
-    /// Reset the car onto the track (original "reset car" mode 3).
+    /// Reset the car onto the track (`C1_RESET`, command 5).
     Reset,
+    /// `C1_HORN`, packet bit 1
     Horn,
+    /// `C1_ABORT`, command 4 — nothing in this build reads the code (`car+0xD8B`)
+    Abort,
+    /// `C1_AIDRIVE`, command 6 — nothing in this build reads the code
+    AiDrive,
+    /// `C1_SIGNALLEFT`, command 10 (`Controller.LeftTurnSignal`)
+    SignalLeft,
+    /// `C1_SIGNALRIGHT`, command 11 (`Controller.RightTurnSignal`)
+    SignalRight,
+    /// `C1_SIREN`, command 12 (`Controller.Hazards`)
+    Hazards,
+    /// `C1_LIGHTSON`, command 13 (`Controller.Lights`)
+    Lights,
+    /// `I_LOOKLEFT`, bit 0x14
+    LookLeft,
+    /// `I_LOOKRIGHT`, bit 0x15
+    LookRight,
+    /// `I_LOOKFORWARD`, bit 0x16
+    LookForward,
+    /// `I_TOGGLEPAUSEMENU`, bit 0x0E — 0x425750, the HUD hide `[0x60CA00]`
+    TogglePauseMenu,
+    /// `I_ROTCAMCCLOCK`, bit 0x0A — 0x461790, the pause orbit's step +3
+    RotCamCounter,
+    /// `I_ROTCAMSTOP`, bit 0x0B — 0x4617B0, step 0
+    RotCamStop,
+    /// `I_ROTCAMCLOCK`, bit 0x0C — 0x4617A0, step −3
+    RotCamClock,
+    /// `I_TOGGLEHUD`, bit 0x18 — 0x4273B0
+    ToggleHud,
+    /// `I_TOGGLEREARVIEW`, bit 0x1A — 0x427550
+    ToggleRearView,
+    /// `I_TOGGLEMAP`, bit 0x1B — 0x427360
+    ToggleMap,
+    /// `I_HUDTRANSPARENCY`, bit 0x1F — 0x4275D0
+    HudTransparency,
+    /// `I_MUSIC`, bit 0x12 — 0x4AD790
+    Music,
+    /// `I_SFX`, bit 0x11 — 0x4AB4E0
+    Sfx,
+    /// `I_CYCLEHUD`, bit 0x19 — 0x427AC0, which answers 0 whatever the HUD: nothing happens
+    CycleHud,
+    /// `I_CYCLEMAP`, bit 0x1C — 0x426740
+    CycleMap,
 }
 
-const ALL_ACTIONS: [Action; 11] = [
+const ALL_ACTIONS: [Action; 33] = [
     Action::CameraNext,
     Action::RearView,
     Action::SteerLeft,
@@ -49,12 +103,40 @@ const ALL_ACTIONS: [Action; 11] = [
     Action::ShiftUp,
     Action::ShiftDown,
     Action::Reset,
+    Action::Pause,
+    Action::Abort,
+    Action::AiDrive,
+    Action::SignalLeft,
+    Action::SignalRight,
+    Action::Hazards,
+    Action::Lights,
+    Action::LookLeft,
+    Action::LookRight,
+    Action::LookForward,
+    Action::TogglePauseMenu,
+    Action::RotCamCounter,
+    Action::RotCamStop,
+    Action::RotCamClock,
+    Action::ToggleHud,
+    Action::ToggleRearView,
+    Action::ToggleMap,
+    Action::HudTransparency,
+    Action::Music,
+    Action::Sfx,
+    Action::CycleHud,
+    Action::CycleMap,
 ];
 
-/// The port's fixed keyboard map, used for every action without an `fe.txt` binding
-/// ([`bindings`]). Its race keys agree with the shipped `fe.txt` (`C1_LEFT = key,SC_LEFT`, …,
-/// `I_CYCLECAMERA = key,SC_C`, `I_LOOKBEHIND = key,SC_B`); the free-camera keys, `T` and `P`/`Esc`
-/// are this port's own.
+/// The original's default key of each action, used only for an action with no binding at all
+/// ([`bindings`]; with the shipped `fe.txt` and 0x51D1D0's rows every action has one). The keys
+/// are 0x51D1D0's keyboard half (English, `lang` 0 — `bindings::default_key`) for its nineteen
+/// rows and the shipped `fe.txt` for the rest: `C1_ABORT = key,SC_Q`, `C1_AIDRIVE = key,SC_D`,
+/// `I_TOGGLEPAUSEMENU` … `I_SFX` = `SC_F1` … `SC_F10`, `I_CYCLEHUD = key,SC_1`, `I_CYCLEMAP =
+/// key,SC_2`. `I_VIEWDISTANCE`, `I_HORIZON` (`SC_F11`, `SC_F12`) and the map zoom (`SC_SUBTRACT`,
+/// `SC_ADD`) name keys the `SC_*` table 0x5D6588 does not have, so they bind nothing. Escape is
+/// no in-race key: no binding names `SC_ESC`, and nothing else reads its entry `[0x5DE029]` of
+/// the key-down table. *(Corrected 2026-09-26: this map also had Escape for pause and the
+/// port's own free-camera keys W / S / Q / E / PageUp / PageDown / Shift, which nothing read.)*
 pub fn default_binding(key: KeyCode) -> Option<Action> {
     Some(match key {
         KeyCode::ArrowLeft => Action::SteerLeft,
@@ -68,14 +150,28 @@ pub fn default_binding(key: KeyCode) -> Option<Action> {
         KeyCode::KeyR => Action::Reset,
         KeyCode::KeyB => Action::RearView,
         KeyCode::KeyH => Action::Horn,
-        KeyCode::KeyP | KeyCode::Escape => Action::Pause,
-        KeyCode::KeyW => Action::FreeForward,
-        KeyCode::KeyS => Action::FreeBack,
-        KeyCode::KeyQ => Action::FreeLeft,
-        KeyCode::KeyE => Action::FreeRight,
-        KeyCode::PageUp => Action::FreeUp,
-        KeyCode::PageDown => Action::FreeDown,
-        KeyCode::ShiftLeft | KeyCode::ShiftRight => Action::FreeFast,
+        KeyCode::KeyP => Action::Pause,
+        KeyCode::KeyL => Action::Lights,
+        KeyCode::KeyW => Action::SignalLeft,
+        KeyCode::KeyE => Action::SignalRight,
+        KeyCode::KeyT => Action::Hazards,
+        KeyCode::KeyY => Action::LookLeft,
+        KeyCode::KeyI => Action::LookRight,
+        KeyCode::KeyU => Action::LookForward,
+        KeyCode::KeyQ => Action::Abort,
+        KeyCode::KeyD => Action::AiDrive,
+        KeyCode::F1 => Action::TogglePauseMenu,
+        KeyCode::F2 => Action::RotCamClock,
+        KeyCode::F3 => Action::RotCamStop,
+        KeyCode::F4 => Action::RotCamCounter,
+        KeyCode::F5 => Action::ToggleHud,
+        KeyCode::F6 => Action::ToggleRearView,
+        KeyCode::F7 => Action::ToggleMap,
+        KeyCode::F8 => Action::HudTransparency,
+        KeyCode::F9 => Action::Music,
+        KeyCode::F10 => Action::Sfx,
+        KeyCode::Digit1 => Action::CycleHud,
+        KeyCode::Digit2 => Action::CycleMap,
         _ => return None,
     })
 }
@@ -83,22 +179,31 @@ pub fn default_binding(key: KeyCode) -> Option<Action> {
 /// The key bound to an action in the original's own key codes, the ones its key formatter
 /// 0x51C050 names (`nfs_game::keyname`): a printable character is itself and an arrow is an
 /// extended code in the high byte — `0x4800` up, `0x4B00` left, `0x4D00` right, `0x5000` down.
-/// The reverse of [`default_binding`] for the rows the controller-setup screens show; actions
-/// with no row of their own return `None`. Letters are given upper case; 0x51C050 prints both
-/// cases the same (0x51C1EE), so which one the original stores does not show on screen.
+/// The reverse of [`default_binding`] for the nineteen rows the controller-setup screens show,
+/// in the codes 0x51D1D0 binds them with (lower-case letters, which 0x51C050 prints as the
+/// capitals, 0x51C1EE); other actions return `None`.
 pub fn key_code_for(action: Action) -> Option<u32> {
+    let c = |ch: u8| ch as u32;
     Some(match action {
         Action::SteerLeft => 0x4B00,
         Action::SteerRight => 0x4D00,
         Action::Throttle => 0x4800,
         Action::Brake => 0x5000,
         Action::Handbrake => 0x20,
-        Action::ShiftUp => b'A' as u32,
-        Action::ShiftDown => b'Z' as u32,
-        Action::CameraNext => b'C' as u32,
-        Action::Reset => b'R' as u32,
-        Action::RearView => b'B' as u32,
-        Action::Horn => b'H' as u32,
+        Action::ShiftUp => c(b'a'),
+        Action::ShiftDown => c(b'z'),
+        Action::CameraNext => c(b'c'),
+        Action::Reset => c(b'r'),
+        Action::RearView => c(b'b'),
+        Action::Horn => c(b'h'),
+        Action::Pause => c(b'p'),
+        Action::Lights => c(b'l'),
+        Action::SignalLeft => c(b'w'),
+        Action::SignalRight => c(b'e'),
+        Action::Hazards => c(b't'),
+        Action::LookLeft => c(b'y'),
+        Action::LookRight => c(b'i'),
+        Action::LookForward => c(b'u'),
         _ => return None,
     })
 }
@@ -126,7 +231,7 @@ pub fn scancode(k: KeyCode) -> Option<u8> {
     })
 }
 
-/// The binding id an action reads through, where the original has one (`bindings::id`).
+/// The binding id each action reads through (`bindings::id`).
 pub fn binding_id(a: Action) -> Option<u16> {
     use bindings::id::*;
     Some(match a {
@@ -138,10 +243,31 @@ pub fn binding_id(a: Action) -> Option<u16> {
         Action::Horn => C1_HORN,
         Action::ShiftUp => C1_SHIFTUP,
         Action::ShiftDown => C1_SHIFTDOWN,
+        Action::Abort => C1_ABORT,
         Action::Reset => C1_RESET,
-        Action::CameraNext => I_CYCLECAMERA,
+        Action::AiDrive => C1_AIDRIVE,
+        Action::SignalLeft => C1_SIGNALLEFT,
+        Action::SignalRight => C1_SIGNALRIGHT,
+        Action::Hazards => C1_SIREN,
+        Action::Lights => C1_LIGHTSON,
+        Action::Pause => I_PAUSE,
+        Action::RotCamCounter => I_ROTCAMCCLOCK,
+        Action::RotCamStop => I_ROTCAMSTOP,
+        Action::RotCamClock => I_ROTCAMCLOCK,
+        Action::TogglePauseMenu => I_TOGGLEPAUSEMENU,
+        Action::Sfx => I_SFX,
+        Action::Music => I_MUSIC,
         Action::RearView => I_LOOKBEHIND,
-        _ => return None,
+        Action::LookLeft => I_LOOKLEFT,
+        Action::LookRight => I_LOOKRIGHT,
+        Action::LookForward => I_LOOKFORWARD,
+        Action::CameraNext => I_CYCLECAMERA,
+        Action::ToggleHud => I_TOGGLEHUD,
+        Action::CycleHud => I_CYCLEHUD,
+        Action::ToggleRearView => I_TOGGLEREARVIEW,
+        Action::ToggleMap => I_TOGGLEMAP,
+        Action::CycleMap => I_CYCLEMAP,
+        Action::HudTransparency => I_HUDTRANSPARENCY,
     })
 }
 
@@ -327,5 +453,88 @@ impl InputState {
     pub fn end_tick(&mut self) {
         self.pressed.clear();
         self.mouse_delta = (0.0, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shipped `fe.txt`'s binding lines (lines 397…436) and 0x51D1D0's keyboard rows give
+    /// every action a key, and it is the one [`default_binding`] names.
+    #[test]
+    fn every_action_has_its_default_key() {
+        let fe = [
+            ("I_PAUSE", "key,SC_P"),
+            ("C1_RIGHT", "key,SC_RIGHT"),
+            ("C1_LEFT", "key,SC_LEFT"),
+            ("C1_GAS", "key,SC_UP"),
+            ("C1_BRAKE", "key,SC_DOWN"),
+            ("C1_HANDBRAKE", "key,SC_SPACE"),
+            ("C1_SHIFTUP", "key,SC_A"),
+            ("C1_SHIFTDOWN", "key,SC_Z"),
+            ("C1_HORN", "key,SC_H"),
+            ("C1_ABORT", "key,SC_Q"),
+            ("C1_RESET", "key,SC_R"),
+            ("C1_AIDRIVE", "key,SC_D"),
+            ("I_CYCLECAMERA", "key,SC_C"),
+            ("I_LOOKBEHIND", "key,SC_B"),
+            ("I_TOGGLEPAUSEMENU", "key,SC_F1"),
+            ("I_ROTCAMCLOCK", "key,SC_F2"),
+            ("I_ROTCAMSTOP", "key,SC_F3"),
+            ("I_ROTCAMCCLOCK", "key,SC_F4"),
+            ("I_TOGGLEHUD", "key,SC_F5"),
+            ("I_TOGGLEREARVIEW", "key,SC_F6"),
+            ("I_TOGGLEMAP", "key,SC_F7"),
+            ("I_HUDTRANSPARENCY", "key,SC_F8"),
+            ("I_MUSIC", "key,SC_F9"),
+            ("I_SFX", "key,SC_F10"),
+            ("I_CYCLEHUD", "key,SC_1"),
+            ("I_CYCLEMAP", "key,SC_2"),
+        ];
+        let mut s = InputState {
+            bindings: bindings::Bindings::from_registry(|k| fe.iter().find(|(n, _)| *n == k).map(|(_, v)| *v)),
+            ..Default::default()
+        };
+        let row_action = |n: &str| {
+            Some(match n.strip_prefix("Controller.")? {
+                "Accel" => Action::Throttle,
+                "Brake" => Action::Brake,
+                "HandBrake" => Action::Handbrake,
+                "SteerLeft" => Action::SteerLeft,
+                "SteerRight" => Action::SteerRight,
+                "Horn" => Action::Horn,
+                "ShiftUp" => Action::ShiftUp,
+                "ShiftDown" => Action::ShiftDown,
+                "LookBehind" => Action::RearView,
+                "Lights" => Action::Lights,
+                "ResetCar" => Action::Reset,
+                "CameraView" => Action::CameraNext,
+                "Pause" => Action::Pause,
+                "LeftTurnSignal" => Action::SignalLeft,
+                "RightTurnSignal" => Action::SignalRight,
+                "Hazards" => Action::Hazards,
+                "LookLeft" => Action::LookLeft,
+                "LookRight" => Action::LookRight,
+                _ => Action::LookForward,
+            })
+        };
+        s.default_controls(None, |n| row_action(n).and_then(binding_id));
+        assert_eq!(s.bindings.rows.len(), 19);
+        let codes = [
+            KeyCode::ArrowLeft, KeyCode::ArrowRight, KeyCode::ArrowUp, KeyCode::ArrowDown, KeyCode::Space,
+            KeyCode::KeyA, KeyCode::KeyZ, KeyCode::KeyC, KeyCode::KeyR, KeyCode::KeyB, KeyCode::KeyH,
+            KeyCode::KeyP, KeyCode::KeyL, KeyCode::KeyW, KeyCode::KeyE, KeyCode::KeyT, KeyCode::KeyY,
+            KeyCode::KeyI, KeyCode::KeyU, KeyCode::KeyQ, KeyCode::KeyD, KeyCode::F1, KeyCode::F2,
+            KeyCode::F3, KeyCode::F4, KeyCode::F5, KeyCode::F6, KeyCode::F7, KeyCode::F8, KeyCode::F9,
+            KeyCode::F10, KeyCode::Digit1, KeyCode::Digit2,
+        ];
+        assert_eq!(codes.len(), ALL_ACTIONS.len());
+        for k in codes {
+            let a = default_binding(k).unwrap();
+            let b = s.bindings.get(binding_id(a).unwrap()).copied().unwrap_or_else(|| panic!("{a:?} unbound"));
+            assert_eq!((b.kind, b.index), (3, scancode(k).unwrap() as u32), "{a:?}");
+        }
+        assert_eq!(default_binding(KeyCode::Escape), None);
     }
 }

@@ -238,7 +238,9 @@ impl SkidMarks {
         if self.emitters.len() <= id {
             return;
         }
-        if strength <= a {
+        // 0x478F40…0x478F4D: `fcomp` then `test ah, 0x41` — C0 or C3, which an unordered compare
+        // sets too, so a NaN strength stops the emitter as `strength <= a` would not
+        if !(strength > a) {
             self.emitters[id].state = 2;
             return;
         }
@@ -363,6 +365,16 @@ mod tests {
         assert_eq!(s.points.len(), 2 * 4);
         // the pair straddles the wheel across its direction of travel
         assert!((s.points[0].x - 0.18375).abs() < 1e-4 && (s.points[1].x + 0.18375).abs() < 1e-4);
+    }
+
+    #[test]
+    fn an_unordered_strength_stops_the_emitter() {
+        // 0x478F4A `test ah, 0x41`: C0|C3, both set by a NaN compare
+        let mut m = SkidMarks::new();
+        m.set_width(0, 0.1);
+        m.emit(0, Vec3::ZERO, 1.0, 1, Vec3::Z, 0.5, 2.0);
+        m.emit(0, Vec3::ZERO, f32::NAN, 1, Vec3::Z, 0.5, 2.0);
+        assert_eq!((m.emitters[0].state, m.emitters[0].counter), (2, 1));
     }
 
     #[test]

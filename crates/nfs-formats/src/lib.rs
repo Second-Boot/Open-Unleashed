@@ -16,6 +16,7 @@ pub mod crp;
 pub mod ctr;
 pub mod edg;
 pub mod error;
+pub mod expr;
 pub mod fedata;
 pub mod fetxt;
 pub mod flare;

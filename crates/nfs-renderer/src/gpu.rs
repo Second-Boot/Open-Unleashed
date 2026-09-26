@@ -20,12 +20,17 @@ struct GlobalsUniform {
     sun_dir: [f32; 4],
     ambient: [f32; 4],
     cam_pos: [f32; 4],
-    /// world → headlight frame; `headlight_on.x` 1 while it lights
+    /// world → headlight frame; `headlight_on.x` 1 while it lights, `.y` 1 while the `HEAD`
+    /// decal's own lamp-0 gate (0x453CA3) holds too
     headlight: [[f32; 4]; 4],
     headlight_on: [f32; 4],
     /// world → the police beacon's frame, and `beacon_on.x` 1 while one spins
     beacon: [[f32; 4]; 4],
     beacon_on: [f32; 4],
+    /// the scene's fog (`Scene::fog`): `.rgb` its colour, `.w` its density (0 off)
+    fog: [f32; 4],
+    /// the sky pass's fog (`Scene::sky_fog`)
+    sky_fog: [f32; 4],
 }
 
 #[repr(C)]
@@ -45,6 +50,11 @@ struct ObjectUniform {
     shadow_u: [f32; 4],
     shadow_v: [f32; 4],
     shadow_on: [f32; 4],
+    /// `R3DSkyMapTextureLayer` (0x445B10): `u = sky_u.xyz · p + sky_u.w`, likewise `v`, over the
+    /// world point `p` of `normal + 3.33 · position`; `sky_on.x` 1 when the item draws the pass
+    sky_u: [f32; 4],
+    sky_v: [f32; 4],
+    sky_on: [f32; 4],
 }
 
 struct GpuMesh {
@@ -83,10 +93,14 @@ struct GpuMaterial {
     false_sort: bool,
     depth_test: bool,
     env_mix: f32,
+    /// the bucket of the material's reflection strength — which of the car's three section maps
+    /// its `R3DSkyMapTextureLayer` samples
     env_variant: usize,
-    /// the diffuse texture, kept so the material can be rebound to another environment map
+    /// the method has a built `R3DSkyMapTextureLayer` pass (`MaterialDesc::sky_map`)
+    sky_map: bool,
+    /// the diffuse texture, kept so the bind group can be rebuilt (`set_trilinear`)
     texture: TextureId,
-    /// the environment map bound now
+    /// the specular map
     env: TextureId,
 }
 
@@ -109,6 +123,12 @@ pub struct Renderer {
     head_tex: Option<TextureId>,
     object_layout: wgpu::BindGroupLayout,
     material_layout: wgpu::BindGroupLayout,
+    /// the car's section map for `R3DSkyMapTextureLayer`, one bind group per texture (group 3)
+    sky_layout: wgpu::BindGroupLayout,
+    sky_bgs: std::collections::HashMap<u32, wgpu::BindGroup>,
+    /// `[0x6115CC]+0x190`: set while the view being drawn is the rear-view mirror's (type 1,
+    /// 0x43AD39…0x43AD4E), when the specular and sky-map layers take no texture and skip their passes
+    no_reflections: bool,
     /// the scene samplers by address mode and mip filter — index `clamp_u | clamp_v << 1 |
     /// point_mip << 2`
     samplers: [wgpu::Sampler; 8],
@@ -135,8 +155,9 @@ const MAX_SPRITES: u64 = 8192;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const MAX_OBJECTS: u64 = 8192;
 /// The main view's far plane — the camera object's `+8`, 700.0 (0x4677FC) — over which the screen
-/// z the depth bias moves is linear (`RE/notes/thrash.md` §6).
-const VIEW_FAR: f32 = 700.0;
+/// z the depth bias moves is linear (`RE/notes/thrash.md` §6). An offscreen pass names its own
+/// (`render_offscreen`'s `depth_far`).
+pub const VIEW_FAR: f32 = 700.0;
 
 impl Renderer {
     pub fn new(window: Arc<Window>) -> Result<Self> {
@@ -260,11 +281,28 @@ impl Renderer {
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
                     count: None,
                 },
+                // the specular texture's sampler: `WRAP` both ways, set on each map by the binder
+                // 0x440940 (0x537A70(1) → `tex+0x38` block `+0x14` / `+0x18`, Thrash 0x41 / 0x42)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
+        });
+        let sky_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sky map"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                count: None,
+            }],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh pipeline layout"),
-            bind_group_layouts: &[&globals_layout, &object_layout, &material_layout],
+            bind_group_layouts: &[&globals_layout, &object_layout, &material_layout, &sky_layout],
             push_constant_ranges: &[],
         });
         // Thrash state 0x38's pairs (`dx7z.dll` 0x600046BB): 1 `SRCALPHA`/`ONE` (the general arm;
@@ -361,7 +399,10 @@ impl Renderer {
         // (`RE/notes/thrash.md` §7) — and `sh80` has 7 mips, so the mip filter is the loader's
         // `POINT`, `LINEAR` at `SPECIALFX` 3 (0x44D571, 0x535A60); the bias is the shader's. (Until
         // 2026-09-25 this sampler clamped as an APPROXIMATION and read the top level only.) The
-        // `HEAD` decal samples its top level explicitly through the same sampler.
+        // `HEAD` decal samples its top level explicitly through the same sampler: `common.fsh`
+        // loads with no state block (0x44D270 → 0x44D2E9 pushes 0), so `HEAD` keeps the
+        // constructor's default 0x5379D0 — `CLAMP` / `CLAMP`, `LINEAR`, mip `NONE`
+        // (`RE/notes/lighting.md` §5.2).
         let make_proj_sampler = |mip: wgpu::FilterMode| {
             device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("projector clamp"),
@@ -506,6 +547,9 @@ impl Renderer {
             head_tex: None,
             object_layout,
             material_layout,
+            sky_layout,
+            sky_bgs: std::collections::HashMap::new(),
+            no_reflections: false,
             samplers,
             trilinear: false,
             sprite_sampler,
@@ -686,6 +730,7 @@ impl Renderer {
             depth_test: desc.depth_test,
             env_mix: if desc.env_texture.is_some() { desc.env_mix } else { 0.0 },
             env_variant: desc.env_variant.min(2),
+            sky_map: desc.sky_map,
             texture,
             env,
         });
@@ -734,29 +779,26 @@ impl Renderer {
         });
     }
 
-    /// The three environment textures the frame binds — `EnvSet::texture` 0x441180 with the layers
-    /// 0, 1 and 2 (0x43A73D…0x43A778) — each material taking the one its reflection strength
-    /// buckets to (`RE/notes/lighting.md` §3.1). A `None` leaves that variant on the one before it.
-    pub fn set_env_textures(&mut self, env: [Option<TextureId>; 3]) {
-        let pick = |v: usize| -> Option<TextureId> { (0..=v).rev().find_map(|i| env[i]) };
-        let views: Vec<Option<TextureId>> = (0..3).map(pick).collect();
-        for i in 0..self.materials.len() {
-            if self.materials[i].env_mix <= 0.0 {
-                continue;
-            }
-            let Some(e) = views[self.materials[i].env_variant] else { continue };
-            self.materials[i].env = e;
-            self.materials[i].bind_group = self.material_bind_group(self.materials[i].texture, self.materials[i].sampler, e);
-        }
+    /// The view about to be drawn is the rear-view mirror's: `[0x6115CC]+0x190` is set from the
+    /// view's type (`[[0x628130]+0x10]+0x2C == 1`, 0x43AD39…0x43AD4E; 0x4691D0 makes the mirror's
+    /// view with type 1), and the specular and sky-map layers then bind no texture and skip their
+    /// passes (0x445578, 0x445B69).
+    /// The same flag keeps out the draws only the main view makes (`DrawItem::main_view_only`).
+    pub fn set_mirror_view(&mut self, on: bool) {
+        self.no_reflections = on;
     }
 
-    pub fn set_env_texture(&mut self, env: TextureId) {
-        for i in 0..self.materials.len() {
-            if self.materials[i].env_mix > 0.0 {
-                self.materials[i].env = env;
-                self.materials[i].bind_group = self.material_bind_group(self.materials[i].texture, self.materials[i].sampler, env);
-            }
+    /// The bind group for a section map, made the first time a car binds it.
+    fn sky_bind_group(&mut self, tex: TextureId) {
+        if self.sky_bgs.contains_key(&tex.0) {
+            return;
         }
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sky map"),
+            layout: &self.sky_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.textures[tex.0 as usize].view) }],
+        });
+        self.sky_bgs.insert(tex.0, bg);
     }
 
     /// A material's bind group: its texture, the sampler for its address modes under the current
@@ -770,6 +812,8 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.textures[texture.0 as usize].view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.textures[env.0 as usize].view) },
+                // `WRAP` / `WRAP` (index 0: no clamp); sampled at level 0, so the mip half is moot
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.samplers[0]) },
             ],
         })
     }
@@ -801,7 +845,7 @@ impl Renderer {
         };
         let view = frame.texture.create_view(&Default::default());
         let aspect = self.aspect();
-        self.encode_frame(scene, camera, &view, &self.depth_view.clone(), aspect);
+        self.encode_frame(scene, camera, &view, &self.depth_view.clone(), aspect, VIEW_FAR);
         frame.present();
         Ok(())
     }
@@ -812,7 +856,9 @@ impl Renderer {
     /// `NFS5.3DCAR` widgets need (`RE/notes/frontend-3d.md` §4). The clear is transparent, so only
     /// the geometry shows, unless `clear` gives an opaque colour (the in-race rear-view mirror).
     /// Passing the id of a texture this returned earlier reuses it.
-    pub fn render_offscreen(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32, reuse: Option<TextureId>, clear_colour: Option<[f64; 4]>) -> TextureId {
+    /// `depth_far` is the far plane of the pass's own screen z — the scale of the state 0x18 depth
+    /// bias (`encode_frame`): `None` for the main view's 700, the rear view's 65000 (0x4691D0).
+    pub fn render_offscreen(&mut self, scene: &Scene, camera: &Camera, width: u32, height: u32, reuse: Option<TextureId>, clear_colour: Option<[f64; 4]>, depth_far: Option<f32>) -> TextureId {
         let (width, height) = (width.max(1), height.max(1));
         let id = match reuse.filter(|t| self.offscreen.get(&t.0).is_some_and(|(w, h)| *w == width && *h == height)) {
             Some(t) => t,
@@ -824,7 +870,7 @@ impl Renderer {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: self.config.format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
                     view_formats: &[],
                 });
                 let view = texture.create_view(&Default::default());
@@ -847,7 +893,7 @@ impl Renderer {
         let mut clear = scene.clone();
         clear.clear_color = clear_colour.unwrap_or([0.0, 0.0, 0.0, 0.0]);
         clear.sprites.clear();
-        self.encode_frame(&clear, camera, &view, &depth, width as f32 / height as f32);
+        self.encode_frame(&clear, camera, &view, &depth, width as f32 / height as f32, depth_far.unwrap_or(VIEW_FAR));
         id
     }
 
@@ -867,7 +913,19 @@ impl Renderer {
         cfg.width = width;
         cfg.height = height;
         let depth = Self::make_depth(&self.device, &cfg);
-        self.encode_frame(scene, camera, &view, &depth, width as f32 / height as f32);
+        self.encode_frame(scene, camera, &view, &depth, width as f32 / height as f32, VIEW_FAR);
+        self.readback(&target, width, height)
+    }
+
+    /// An offscreen texture's pixels as RGBA8 rows (diagnostics: `NFS_MIRROR_DUMP`).
+    pub fn read_texture(&self, id: TextureId) -> Result<(u32, u32, Vec<u8>)> {
+        let (w, h) = *self.offscreen.get(&id.0).ok_or_else(|| anyhow::anyhow!("texture {} is not an offscreen target", id.0))?;
+        let px = self.readback(&self.textures[id.0 as usize]._texture, w, h)?;
+        Ok((w, h, px))
+    }
+
+    /// Copies a `COPY_SRC` texture to the host as tightly packed RGBA8.
+    fn readback(&self, target: &wgpu::Texture, width: u32, height: u32) -> Result<Vec<u8>> {
         let bytes_per_row = (4 * width).div_ceil(256) * 256;
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("readback"), size: (bytes_per_row * height) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
         let mut enc = self.device.create_command_encoder(&Default::default());
@@ -902,7 +960,7 @@ impl Renderer {
         Ok(out)
     }
 
-    fn encode_frame(&mut self, scene: &Scene, camera: &Camera, view: &wgpu::TextureView, depth_view: &wgpu::TextureView, aspect: f32) {
+    fn encode_frame(&mut self, scene: &Scene, camera: &Camera, view: &wgpu::TextureView, depth_view: &wgpu::TextureView, aspect: f32, depth_far: f32) {
 
         let vp = camera.view_projection_mirrored(aspect, scene.mirror);
         self.queue.write_buffer(
@@ -912,25 +970,49 @@ impl Renderer {
                 view_proj: vp.to_cols_array_2d(),
                 view: camera.view().to_cols_array_2d(),
                 sun_dir: scene.sun_direction.extend(0.0).to_array(),
-                ambient: [scene.ambient, 0.0, 0.0, 0.0],
+                // .y the view's near plane: a depth-bias pull past it stops there (the original's
+                // screen z goes to 0 or below — in front of everything, `RE/notes/thrash.md` §6)
+                // .z 1 in the rear-view mirror's view: no specular or sky-map pass (`[0x6115CC]+0x190`)
+                ambient: [scene.ambient, camera.near, self.no_reflections as u32 as f32, 0.0],
                 cam_pos: camera.position.extend(1.0).to_array(),
                 headlight: scene.headlight.unwrap_or(glam::Mat4::IDENTITY).to_cols_array_2d(),
-                headlight_on: [scene.headlight.is_some() as u32 as f32, 0.0, 0.0, 0.0],
+                headlight_on: [scene.headlight.is_some() as u32 as f32, (scene.headlight.is_some() && scene.headlight_decal) as u32 as f32, 0.0, 0.0],
                 beacon: scene.beacon.unwrap_or(glam::Mat4::IDENTITY).to_cols_array_2d(),
                 beacon_on: [scene.beacon.is_some() as u32 as f32, 0.0, 0.0, 0.0],
+                fog: scene.fog.map_or([0.0; 4], |f| [f.colour[0], f.colour[1], f.colour[2], f.density]),
+                sky_fog: scene.sky_fog.map_or([0.0; 4], |f| [f.colour[0], f.colour[1], f.colour[2], f.density]),
             }),
         );
         let n = scene.items.len().min(MAX_OBJECTS as usize);
+        // the section map each item's sky-map pass samples, by its material's bucket
+        let sky_tex = |this: &Self, item: &crate::DrawItem| -> Option<TextureId> {
+            let m = this.materials.get(item.material.0 as usize)?;
+            if !m.sky_map || this.no_reflections {
+                return None;
+            }
+            item.sky.and_then(|s| s.textures[m.env_variant])
+        };
+        let white = self.white;
+        self.sky_bind_group(white);
+        for item in scene.items.iter().take(n) {
+            if let Some(t) = sky_tex(self, item) {
+                self.sky_bind_group(t);
+            }
+        }
         let mut staging = vec![0u8; self.object_stride as usize * n];
         for (i, item) in scene.items.iter().take(n).enumerate() {
             let env_mix = self.materials.get(item.material.0 as usize).map(|m| m.env_mix).unwrap_or(0.0);
             let lod_bias = self.materials.get(item.material.0 as usize).map(|m| m.lod_bias).unwrap_or(0.0);
-            let alpha_test = self.materials.get(item.material.0 as usize).is_some_and(|m| m.device_states);
+            // the alpha test: the material's race states, or the draw's own Thrash 0x24 ← 10
+            let alpha_test = self.materials.get(item.material.0 as usize).is_some_and(|m| m.device_states) || item.alpha_test;
             // state 0x18 as a pull toward the eye in view depth: `−b · (far − near) / 32768` over
-            // the main view's planes — its near, and the camera object's far 700 (0x4677FC), which
-            // no later write changes (`RE/notes/thrash.md` §6). APPROXIMATION in the rear view, whose
-            // planes are 1 / 65000 in the original (AUDIT.md §O) and whose far the port shortens
-            let pull = self.materials.get(item.material.0 as usize).map_or(0.0, |m| -(m.depth_bias as f32) * (VIEW_FAR - camera.near) / 32768.0);
+            // the pass's own planes — the view's near and far, which 0x466F30 hands the projection
+            // 0x5391B0 (`cam+0xCC` / `+0xD0`) and 0x540870 loads as the screen z's range: the main
+            // view's near and the camera object's far 700 (0x4677FC), the rear view's 1 / 65000
+            // (0x4691D0; `RE/notes/thrash.md` §6) — `b` the material's block plus the draw's own
+            // (the lamp glare's, `DrawItem::depth_bias`). The rear view's far is not the port's
+            // clip far there (its cull distance), hence `depth_far` apart from `camera.far`.
+            let pull = self.materials.get(item.material.0 as usize).map_or(0.0, |m| -((m.depth_bias + item.depth_bias) as f32) * (depth_far - camera.near) / 32768.0);
             let o = ObjectUniform {
                 model: item.transform.to_cols_array_2d(),
                 // .x is the environment-map mix, .zw a uv offset (the sky layers scroll with it)
@@ -946,6 +1028,10 @@ impl Renderer {
                 // .y flags the item `Headlights::LayerUVLight` lays the `HEAD` decal over
                 // .w the alpha test of a material with `device_states`
                 shadow_on: [item.shadow.is_some() as u32 as f32, item.uv_lit as u32 as f32, lod_bias, alpha_test as u32 as f32],
+                sky_u: item.sky.map_or([0.0; 4], |s| s.u),
+                sky_v: item.sky.map_or([0.0; 4], |s| s.v),
+                // .y the item is drawn in the sky pass (its fog is the sky's)
+                sky_on: [sky_tex(self, item).is_some() as u32 as f32, item.sky_pass as u32 as f32, 0.0, 0.0],
             };
             let off = i * self.object_stride as usize;
             staging[off..off + std::mem::size_of::<ObjectUniform>()].copy_from_slice(bytemuck::bytes_of(&o));
@@ -974,12 +1060,13 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             pass.set_bind_group(0, &self.globals_bg, &[]);
-            // no-depth (sky) first, then opaque, then blended
+            // no-depth (sky) first, then opaque, then blended — an `early` blended item goes with
+            // the opaque ones, in submission order (`DrawItem::early`)
             for stage in 0..3u8 {
                 for (i, item) in scene.items.iter().take(n).enumerate() {
                     let mat = &self.materials[item.material.0 as usize];
-                    let item_stage = if !mat.depth_test { 0 } else if mat.alpha_blend { 2 } else { 1 };
-                    if item_stage != stage {
+                    let item_stage = if !mat.depth_test { 0 } else if mat.alpha_blend && !item.early { 2 } else { 1 };
+                    if item_stage != stage || (item.main_view_only && self.no_reflections) {
                         continue;
                     }
                     let mesh = &self.meshes[item.mesh.0 as usize];
@@ -996,6 +1083,8 @@ impl Renderer {
                     let group = if mat.alpha_blend && mat.device_states { 5 + mat.blend_pair as usize } else { plain };
                     pass.set_bind_group(1, &self.object_bg, &[(i as u64 * self.object_stride) as u32]);
                     pass.set_bind_group(2, &mat.bind_group, &[]);
+                    let sky = sky_tex(self, item).unwrap_or(white);
+                    pass.set_bind_group(3, &self.sky_bgs[&sky.0], &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     // `LayerFalseSort1` / `2`: the same draw first with depth writes off, then on

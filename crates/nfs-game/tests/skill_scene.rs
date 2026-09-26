@@ -67,9 +67,10 @@ fn skidpad_st1_cones_are_smackables() {
     car.half_extents = Vec3::new(0.9, 0.6, 2.1);
     car.velocity = fwd * 15.0;
     let mut hit = false;
-    for _ in 0..64 {
+    for i in 0..64u64 {
+        cone.track(&grid, &[car.position]);
         cone.damp(&[car.position]);
-        cone.ground(&grid);
+        cone.ground(&grid, 2 * i);
         let mut others = [(&mut car, 1300.0f32 / 128.0)];
         hit |= !cone.collide(&mut others, &mut |_| {}).is_empty();
         cone.post_impact();

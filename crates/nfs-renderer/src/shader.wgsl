@@ -8,6 +8,8 @@ struct Globals {
     headlight_on: vec4<f32>,
     beacon: mat4x4<f32>,
     beacon_on: vec4<f32>,
+    fog: vec4<f32>,
+    sky_fog: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> globals: Globals;
 // `night.psh`'s `nght`, 128 × 128 bytes packed four to a u32
@@ -66,22 +68,54 @@ fn headlit(world: vec3<f32>, c: vec4<f32>) -> vec4<f32> {
 // (0x60005538 / 0x6000562B): the frame becomes `2 · src · dst`. The source is `HEAD` × the vertex
 // colour, which in that pass is `LayerFullAmbient`'s white block (0x448C30, layer id 5 — the
 // colour stream the draw copies, 0x540E1D). So the decal **multiplies the pass-1 pixel by
-// 2 × `HEAD`**, 132/255 being the neutral grey and the pools brightening by up to 1.6. Gap,
-// recorded not filled: 0x453EE1 multiplies the vertex's first float by `w`, not read.
-// APPROXIMATION: the coordinates are clamped, which keeps the pools from tiling over the world
-// (`HEAD`'s own address mode is not read).
-fn uvlight(world: vec3<f32>) -> vec3<f32> {
+// 2 × `HEAD`**, 132/255 being the neutral grey and the pools brightening by up to 1.6.
+//
+// **The divide is per pixel** (read 2026-09-26). After the coordinates, 0x453EDB…0x453EE5 loads the
+// vertex's `w` (`[0x61C17C + 16·k]`: `z + 16`, or the 10.0 the clamp and the behind-the-light arm
+// write) and multiplies it into the float at `edi` = `ctx+0x440` (0x453D05 / 0x453D26), the
+// vertex's **`rhw`**: the pipeline vertex starts at `ctx+0x434` (0x5408F0 hands that to 0x5385B0,
+// 0x540985), and the finishing loop writes `rhw = [0x5E1980] / z` = 1 / view depth at `+0xC`
+// (0x5B12AE…0x5B12EA). The decal pass has no `LayerCoords` op after the layer, and the draw
+// 0x540CE0 writes only `+0x10`, `+0x14` and the UVs, so the scaled `rhw` reaches the card. `rhw`
+// is what the card's perspective-correct interpolation weights the UVs by (D3D7's
+// `TEXTUREPERSPECTIVE`, on by default — whether the game ever turns it off is not read; the depth test uses `sz`,
+// Thrash state 4 never asks for a W-buffer — `thrash.md` §6), so across a triangle the texel is
+// `Σ b·rhw·w·u / Σ b·rhw·w`, and with `u·w = x + 0.5·w`, `v·w = y + 0.5·w` that is the projection
+// divided **per pixel**: the classic projective texture. Here the vertex stage hands on `(u·w,
+// v·w, w)` — the GPU's own interpolation weights by `1 / clip.w`, the same view depth — and the
+// fragment divides. A triangle whose corners took different arms (clamped, behind) interpolates
+// between them exactly as the card does.
+//
+// `HEAD` is sampled `CLAMP` both ways (read 2026-09-26): `common.fsh` is opened by 0x448B10 through
+// 0x44D270, which hands each entry to 0x44D380 with no state block (0x44D2E9 pushes 0), so the
+// loader 0x44D550 leaves the texture alone (0x44D558) and the constructor's default block 0x5379D0
+// stands — `{0, 1, 0, 0, 0, 0, 0}`: `LINEAR`, mip `NONE`, and Thrash 0x41 / 0x42 = 0, which
+// `dx7z.dll` makes `D3DTADDRESS_CLAMP` (0x60003DB6 / 0x60003E1E push 3). Nothing on the layer's path
+// touches the block: 0x453D4D only stores the texture pointer in the slot, and unlike the
+// specular binder 0x440940 there is no 0x537A70 / 0x536470 call; the draw's stage binder 0x536240
+// applies the texture's own block. So the pools do not tile — the projector sampler `s_proj`
+// (`ClampToEdge`, `Linear`, level 0) carries it. *(Until 2026-09-26 this was an APPROXIMATION
+// clamping the coordinates in the shader.)*
+fn uvlight_vertex(world: vec3<f32>) -> vec3<f32> {
     let p = globals.headlight * vec4<f32>(world, 1.0);
-    let w = p.z + 16.0;
+    var w = p.z + 16.0;
     var i = 1.0 / w;
     if i > 0.1 {
         i = 0.1;
+        w = 10.0;
     }
     var uv = vec2<f32>(p.x * 0.1 + 0.5, 0.0);
     if i >= 0.0 {
         uv = vec2<f32>(i * p.x + 0.5, i * p.y + 0.5);
+    } else {
+        w = 10.0;
     }
-    let c = textureSampleLevel(t_head, s_proj, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).rgb;
+    // 0x453EE1: `rhw ·= w`
+    return vec3<f32>(uv * w, w);
+}
+
+fn uvlight(uvw: vec3<f32>) -> vec3<f32> {
+    let c = textureSampleLevel(t_head, s_proj, uvw.xy / uvw.z, 0.0).rgb;
     // textures are bytes (no sRGB decode), so the sample is the stored value the original
     // multiplies — 132/255 is the neutral point of the 2× (`DESTCOLOR` / `SRCCOLOR`)
     return 2.0 * c;
@@ -97,12 +131,18 @@ struct Object {
     shadow_u: vec4<f32>,
     shadow_v: vec4<f32>,
     shadow_on: vec4<f32>,
+    sky_u: vec4<f32>,
+    sky_v: vec4<f32>,
+    sky_on: vec4<f32>,
 };
 @group(1) @binding(0) var<uniform> object: Object;
 
 @group(2) @binding(0) var t_diffuse: texture_2d<f32>;
 @group(2) @binding(1) var s_diffuse: sampler;
 @group(2) @binding(2) var t_env: texture_2d<f32>;
+@group(2) @binding(3) var s_env: sampler;
+// the car's section map for `R3DSkyMapTextureLayer` (`[0x6115CC]+0xD0 + 4·bucket`)
+@group(3) @binding(0) var t_sky: texture_2d<f32>;
 
 // 0x452A50, the police beacon: the same `nght` map through the car's spinning frame — `c = z·3.5`
 // ([0x5CEC6C]) kept strictly inside −127…127, `s = x·3.5` inside −63…63, and the row folded by its
@@ -149,6 +189,10 @@ struct VsOut {
     @location(3) world: vec3<f32>,
     /// 0x452910's weight, so the fragment can tell whether this vertex took headlight
     @location(4) head_w: f32,
+    /// `R3DSkyMapTextureLayer`'s coordinates, made per vertex as the layer makes them
+    @location(5) sky_uv: vec2<f32>,
+    /// `Headlights::LayerUVLight`'s `(u·w, v·w, w)`, divided per fragment (0x453EE1)
+    @location(6) head_uvw: vec3<f32>,
 };
 
 @vertex
@@ -158,13 +202,20 @@ fn vs_main(in: VsIn) -> VsOut {
     out.clip = globals.view_proj * world;
     // Thrash state 0x18, the depth bias (`lit_dir.w`, a pull in view depth): `dx7z.dll` adds it to
     // the screen z alone, so the vertex slides toward the eye along its own ray and stays where it
-    // is on screen (`RE/notes/thrash.md` §6d.3); a vertex nearer than the pull is left alone
+    // is on screen (`RE/notes/thrash.md` §6d.3). The driver adds the bias to the screen z as it
+    // is, so a pull past the near plane leaves the original's vertex at z ≤ 0 — in front of
+    // everything (the lamp glare's `−20000 · b · K / d²` within some 8 m); here it stops just
+    // inside the plane (`globals.ambient.y`), where it is not clipped and still passes any depth
+    // A positive `b` (some car materials' 1, 3, 5) pushes the vertex away the same way.
     let pull = object.lit_dir.w;
-    if pull > 0.0 {
+    if pull != 0.0 {
         let depth = -(globals.view * world).z;
-        if depth > pull {
-            let eye = globals.cam_pos.xyz;
-            out.clip = globals.view_proj * vec4<f32>(eye + (world.xyz - eye) * (1.0 - pull / depth), 1.0);
+        if depth > 0.0 {
+            let pulled = max(depth - pull, globals.ambient.y * 1.001);
+            if pulled != depth {
+                let eye = globals.cam_pos.xyz;
+                out.clip = globals.view_proj * vec4<f32>(eye + (world.xyz - eye) * (pulled / depth), 1.0);
+            }
         }
     }
     out.normal = normalize((object.model * vec4<f32>(in.normal, 0.0)).xyz);
@@ -180,9 +231,23 @@ fn vs_main(in: VsIn) -> VsOut {
         }
     }
     out.world = world.xyz;
+    // `R3DSkyMapTextureLayer` 0x445B10 (class 0x8101), per vertex (0x445DDC…0x445E42): the point
+    // `normal + 3.33 · position` of the part's own streams — the layer's first reference is the
+    // `nm` stream (id 1, key 6), added as it is, its second the `vt` stream (id 1, key 7), scaled
+    // by `[0x6115CC]+0` = 3.33 (0x440783) — goes through the object's matrix, less the car's
+    // `car+0x330`, and onto the slice's lateral and forward axes (the transposed `car+0x3B8`
+    // frame, 0x43A862…0x43A8A4); the planes carry that and the section's 1 / `texturesize`,
+    // `aspect` and the offsets (`RE/notes/lighting.md` §3.2)
+    out.sky_uv = vec2<f32>(0.0);
+    if object.sky_on.x > 0.5 {
+        let p = (object.model * vec4<f32>(in.normal + 3.33 * in.position, 1.0)).xyz;
+        out.sky_uv = vec2<f32>(dot(object.sky_u.xyz, p) + object.sky_u.w, dot(object.sky_v.xyz, p) + object.sky_v.w);
+    }
     out.head_w = 0.0;
+    out.head_uvw = vec3<f32>(0.0, 0.0, 1.0);
     if object.shadow_on.y > 0.5 && globals.headlight_on.x > 0.5 {
         out.head_w = headlight_w(world.xyz);
+        out.head_uvw = uvlight_vertex(world.xyz);
     }
     return out;
 }
@@ -198,13 +263,30 @@ fn vs_main(in: VsIn) -> VsOut {
 // alike.
 const ALPHA_REF: f32 = 10.5 / 255.0;
 
+// The weather fog (`Scene::fog`, `Scene::sky_fog`; 0x45D2E0 / 0x45D3B0): Direct3D 7's table fog
+// `EXP` on the vertex's W, the view depth in metres (`nfs_renderer::Fog`), `f = exp(−density · d)`
+// and the pixel `f · c + (1 − f) · fog`, ahead of the blend. The sky pass's items take its own fog
+// (the eye it moves to the origin keeps the view depth). A density of 0 is the fog off.
+fn fogged(in: VsOut, c: vec4<f32>) -> vec4<f32> {
+    var fog = globals.fog;
+    if object.sky_on.y > 0.5 {
+        fog = globals.sky_fog;
+    }
+    if fog.w <= 0.0 {
+        return c;
+    }
+    let d = max(-(globals.view * vec4<f32>(in.world, 1.0)).z, 0.0);
+    let f = exp(-fog.w * d);
+    return vec4<f32>(mix(fog.rgb, c.rgb, f), c.a);
+}
+
 @fragment
 fn fs_opaque(in: VsOut) -> @location(0) vec4<f32> {
     let c = shade(in);
     if object.shadow_on.w > 0.5 && c.a < ALPHA_REF {
         discard;
     }
-    return vec4<f32>(c.rgb, 1.0);
+    return vec4<f32>(fogged(in, c).rgb, 1.0);
 }
 
 @fragment
@@ -213,7 +295,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if object.shadow_on.w > 0.5 && c.a < ALPHA_REF {
         discard;
     }
-    return c;
+    return fogged(in, c);
 }
 
 fn shade(in: VsOut) -> vec4<f32> {
@@ -237,32 +319,64 @@ fn shade(in: VsOut) -> vec4<f32> {
         light = min(object.lit_a.rgb + object.lit_d.rgb * d, vec3<f32>(1.0));
     }
     var base = tex * in.color;
-    let mix_amt = object.env_mix.x;
-    if mix_amt > 0.0 {
+    // `CarExtEnv`'s pass 1 (option mask 2): its `Rs` block is `{1, 2, 0, 1, 0, −1}` — gouraud,
+    // blending on, pair 0 `SRCALPHA` / `INVSRCALPHA` — and its ops are only that block, the
+    // `R3DSpecularTextureLayer` and the draw, so it draws the environment texture × the colour
+    // stream pass 0 left (the `R3DLightLayer` colour, alpha 0xFF) over the first pass, weighted by
+    // the environment texel's own alpha (the `.env` maps carry one: coastal's Y2T1 averages 18/255,
+    // Y2T2 35/255) under the device's alpha test `GREATER 10`. `env_mix.x` only says the material
+    // has the pass (`rmthpasses`, `RE/notes/lighting.md` §3.1).
+    // `globals.ambient.z` is `[0x6115CC]+0x190`, set in the rear-view mirror's view: the layer
+    // binds no texture there and skips its pass (0x445578 → 0x4455AE)
+    var env_over = vec4<f32>(0.0);
+    if object.env_mix.x > 0.0 && globals.ambient.z < 0.5 {
         // `R3DSpecularTextureLayer` 0x445520 (the layer class code 0x8100): the normal goes into
         // eye space through a matrix whose translation rows are zeroed (0x4456E6…0x445714), and
         // then, with `t = |z| + 1.0` ([0x5B2750]) and `r` the reciprocal square root of `t` —
         // the magic-constant estimate 0x5F400000 with one Newton step of 1.47 / 0.47
         // ([0x5B38D8] / [0x5B38E0]), which this port takes exactly — the coordinates are
         // `u = x·r·0.5 + 0.5` and `v = y·r·0.5 + 0.5` (0x4457C5…0x445828, [0x5B23F0] = 0.5).
+        // The texture is `SPC2` / `SPC3` of `carcmn.fsh` in a race, `FE  ` / `FESH` in the front end
+        // (`SPC1` / `FEDU` are not in the file), loaded with no state block of its own (0x44D2E9
+        // pushes 0, so 0x44D550 leaves it), so it keeps the texture constructor's default 0x5379D0
+        // — `LINEAR`, mip filter `NONE` (0x535BC0 → 0x5379D0, `thrash.md` §7) — except the address
+        // modes, which the binder 0x440940 sets to 1, `WRAP` (0x537A70(1)): `s_env` at level 0.
+        // *(Until 2026-09-26 this sampled `CLAMP`, the default block's.)*
         let ne = (globals.view * vec4<f32>(n, 0.0)).xyz;
         let r = inverseSqrt(abs(ne.z) + 1.0) * 0.5;
-        let env = textureSample(t_env, s_diffuse, vec2<f32>(ne.x * r + 0.5, ne.y * r + 0.5));
-        base = vec4<f32>(mix(base.rgb, env.rgb, mix_amt), base.a);
+        let env = textureSampleLevel(t_env, s_env, vec2<f32>(ne.x * r + 0.5, ne.y * r + 0.5), 0.0);
+        if env.a * 255.0 > 10.0 {
+            env_over = env;
+        }
     }
-    // `R3DShadowMapTextureLayer` (0x446130): the projector's planes over the world position.
-    // APPROXIMATION: the pass's combine is not read — the texture (`sh80`, a flat dark colour under
-    // its alpha) is laid over the lit colour by its alpha
     var lit = base.rgb * light;
+    lit = mix(lit, env_over.rgb * light, env_over.a);
+    // `R3DSkyMapTextureLayer`, pass 2 (option mask 2 on `CarExtEnv` / `CarExtEnvNS`, mask 0 on
+    // `CarWindow`): the same three-op pass as the specular one — the `Rs` block `{1, 2, 0, 1, 0,
+    // −1}` (`rmthpasses`: key 0x52730006), the layer and the draw — so the section map × the light
+    // colour, laid over by its texel alpha under the alpha test `GREATER 10`. The `.env` maps are
+    // loaded like `carcmn.fsh` (0x440AAA → 0x44D270), so `CLAMP`, level 0.
+    if object.sky_on.x > 0.5 {
+        let sky = textureSampleLevel(t_sky, s_proj, in.sky_uv, 0.0);
+        if sky.a * 255.0 > 10.0 {
+            lit = mix(lit, sky.rgb * light, sky.a);
+        }
+    }
+    // `R3DShadowMapTextureLayer` (0x446130), pass 3 with the same `Rs` block: the projector's
+    // texture (`sh80`, a flat dark colour under an alpha of 0…253) × the light colour, blended over
+    // by its alpha under the same `GREATER 10` test
     // the headlight decal, `Opaque`'s second pass: the first pass's pixel × 2 · `HEAD`
-    if object.shadow_on.y > 0.5 && globals.headlight_on.x > 0.5 && in.head_w > 0.0 {
-        lit = lit * uvlight(in.world);
+    // (0x453CA3: only while lamp 0 of the camera's car is lit, `headlight_on.y`)
+    if object.shadow_on.y > 0.5 && globals.headlight_on.y > 0.5 && in.head_w > 0.0 {
+        lit = lit * uvlight(in.head_uvw);
     }
     if object.shadow_on.x > 0.5 {
         let uv = vec2<f32>(dot(object.shadow_u.xyz, in.world) + object.shadow_u.w, dot(object.shadow_v.xyz, in.world) + object.shadow_v.w);
         // `sh80`'s material asks for a LOD bias of −1 (`mt+0x40`, `RE/notes/thrash.md` §7)
         let sh = textureSampleBias(t_proj, s_proj, uv, -1.0);
-        lit = mix(lit, sh.rgb, sh.a);
+        if sh.a * 255.0 > 10.0 {
+            lit = mix(lit, sh.rgb * light, sh.a);
+        }
     }
     return vec4<f32>(lit, base.a * object.light.a);
 }

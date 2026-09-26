@@ -13,9 +13,10 @@
 //! Ported: §23.0 helpers, §12.4 blockers and speed caps, §23.1–§23.6 scorers, §12.5 the pick, §12.6 the
 //! lateral target and §12.7 the speed cap, plus §12.3's script reactions (`traffic.rs` pushes them into
 //! the same scores). Not ported: `0x402F00`'s post-finish pull-over (it asks for a racer, and only cops and
-//! traffic reach it, so it never fires — `traffic.md` §12.10a), and the two abort tests of
-//! §12.6's `0x402790`, which §28.5 shows is dead for traffic (every writer of its `car+0x107C` bias is
-//! an opponent path). `0x402920`, the other early return, **is** ported — see `squeeze_past`.
+//! traffic reach it, so it never fires — `traffic.md` §12.10a). §12.6's `0x402790` is dead for traffic
+//! (no traffic path writes its `car+0x107C` bias) but live for a chasing cop, whose `AIState_Chase`
+//! writes it every tick (`traffic.md` §28.3, corrected 2026-09-26) — `override_holds`. `0x402920`, the
+//! other early return, **is** ported — see `squeeze_past`.
 
 use crate::race::{Slice, SliceTable};
 
@@ -91,6 +92,24 @@ pub fn gap_between(table: &SliceTable, a_slice: usize, b_slice: usize) -> f32 {
         d += n;
     }
     d as f32 * 6.0
+}
+
+/// `0x40E860(a, b)` in full (0x40E860…0x40E91B, read 2026-09-26): the coarse slice gap of
+/// [`gap_between`], and when that is within ±12 m (`[0x5B240C]` / `[0x5B24C8]`, neither `> 12` nor
+/// `< −12`) instead `dot2D(a+0x330 − b+0x330, a+0x3D0)` — the x–z projection of the offset on `a`'s
+/// forward axis, which the tracker keeps on the slice's forward (`race-logic.md` §6). The port takes
+/// that axis as the slice's `forward`, normalised in x–z — APPROXIMATION for `+0x3D0`, which is
+/// orthogonalised against the patch normal first. Positions `None`: the coarse gap alone.
+pub fn gap_fine(table: &SliceTable, a_slice: usize, b_slice: usize, pos: Option<(glam::Vec3, glam::Vec3)>) -> f32 {
+    let d = gap_between(table, a_slice, b_slice);
+    match pos {
+        Some((pa, pb)) if (-12.0..=12.0).contains(&d) => {
+            let f = table.slices[a_slice].forward;
+            let f = glam::Vec2::new(f.x, f.z).normalize_or_zero();
+            (pa.x - pb.x) * f.x + (pa.z - pb.z) * f.y
+        }
+        _ => d,
+    }
 }
 
 /// One of the five reachable `prsonal.bin` rows (§23.9). A traffic car's `PERSONALITY` comes from the
@@ -183,12 +202,32 @@ impl LaneScratch {
     /// array, in its travel direction, wrapping round. `0x5E8B88` is sorted by 0x417710 on
     /// `+0xAF8 − +0xB20`, stable; for a traffic car or a cop `+0xAF8` is the bare lap fraction of
     /// its slice (0x4169B0's non-racer branch, 0x416A21…0x416AA1) and `+0xB20` is 0, for a racer it
-    /// is `frac − unlaps` — so the key here is the slice's place on the lap. APPROXIMATIONS: a racer
-    /// that is unlapping or has finished (`+0xB20` ahead of the lap, `traffic.md` §17.5c) is keyed
-    /// on its slice all the same; ties keep the registration order where the original keeps the
-    /// previous sort's; and the original sorts at 0x417800, the end of the previous even tick,
-    /// while this sorts on the slices the cars have now.
+    /// is `frac − unlaps` — so the key here is the slice's place on the lap. In the race the walk
+    /// takes the real array: [`Self::find_blockers_placed`] with every car's `car+0x528` from
+    /// [`crate::race_order::RaceOrder`], sorted at the end of the previous even tick with the
+    /// original's stable bubble sort. Without places (this entry point, the unit tests) it sorts the
+    /// cars itself on the slices they have now — APPROXIMATIONS there: a racer that is unlapping or
+    /// has finished (`+0xB20` ahead of the lap, `traffic.md` §17.5c) is keyed on its slice all the
+    /// same, and ties keep the registration order where the original keeps the previous sort's.
     pub fn find_blockers(&mut self, table: &SliceTable, me: &LaneSelf, cars: &[LaneCar], pers: &Personality) {
+        self.find_blockers_at(table, me, cars, pers, None)
+    }
+
+    /// [`Self::find_blockers`] with the world positions `0x40E860`'s fine step needs: `positions` is
+    /// `(this car's, one per entry of cars)`. Within ±12 m the gap is the x–z projection of the offset
+    /// on the other car's forward axis ([`gap_fine`]), so a car on the same slice or the next one —
+    /// which the slice gap puts at 0 or ±6 m — is seen at its real distance (audit 2026-09-26,
+    /// `traffic.md` §34.6).
+    pub fn find_blockers_at(&mut self, table: &SliceTable, me: &LaneSelf, cars: &[LaneCar], pers: &Personality, positions: Option<(glam::Vec3, &[glam::Vec3])>) {
+        self.find_blockers_placed(table, me, cars, pers, positions, None)
+    }
+
+    /// [`Self::find_blockers_at`] walking the real `0x5E8B88[]`: `places` is `(this car's
+    /// car+0x528, one per entry of cars)` — the places [`crate::race_order::RaceOrder`] gave every
+    /// car at the end of the previous even tick (0x417800 → 0x417710), which is what 0x401FA2's
+    /// `0x5E8B88[(car+0xEB0·i + n + car+0x528) mod n]` reads. Without them the walk falls back to
+    /// a fresh sort on the slices of this tick (the APPROXIMATION described above).
+    pub fn find_blockers_placed(&mut self, table: &SliceTable, me: &LaneSelf, cars: &[LaneCar], pers: &Personality, positions: Option<(glam::Vec3, &[glam::Vec3])>, places: Option<(usize, &[usize])>) {
         self.hard = [me.target_speed; 3];
         self.soft = [me.target_speed; 3];
         self.blocker = [None; 3];
@@ -196,11 +235,32 @@ impl LaneScratch {
         let masks = [lane_bit(me.lane - 1), lane_bit(me.lane), lane_bit(me.lane + 1)];
         let lanes = [me.lane - 1, me.lane, me.lane + 1];
         // the race-order array without this car, sorted stably by the lap place of the slice; this
-        // car sits before the others on its own slice (which are all skipped: their gap is 0)
-        let key = |slice: usize| table.route_pos.get(slice).copied().unwrap_or(0);
+        // car sits before the others on its own slice (which the slice gap alone skips: gap 0).
+        // With positions (the traffic's pass) the cars of one slice are ordered by how far along
+        // the slice they are: their keys are equal there, and the stable sort keeps the order they
+        // came in — a car further along its slice entered it earlier, travelling either way, and a
+        // car entering from below bubbles up only to the bottom of the equal run, one from above
+        // down only to its top. APPROXIMATION of that history: two cars that pass each other inside
+        // a slice swap here and not in the original (audit 2026-09-26, `traffic.md` §34.11).
+        let along = |slice: usize, p: glam::Vec3| {
+            let sl = &table.slices[slice];
+            (p - sl.centre).dot(sl.forward.normalize_or_zero())
+        };
+        let key = |slice: usize, p: Option<glam::Vec3>| (table.route_pos.get(slice).copied().unwrap_or(0), p.map_or(f32::NEG_INFINITY, |p| along(slice, p)));
+        let pos_of = |i: usize| positions.and_then(|(_, ps)| ps.get(i).copied());
         let mut sorted: Vec<usize> = (0..cars.len()).collect();
-        sorted.sort_by_key(|&i| key(cars[i].slice));
-        let own = sorted.partition_point(|&i| key(cars[i].slice) < key(me.slice));
+        let own = match places.filter(|(_, p)| p.len() == cars.len()) {
+            // the array itself: the others by their `car+0x528`, and this car's own place among them
+            Some((mine, p)) => {
+                sorted.sort_by_key(|&i| p[i]);
+                sorted.partition_point(|&i| p[i] < mine)
+            }
+            None => {
+                sorted.sort_by(|&a, &b| key(cars[a].slice, pos_of(a)).partial_cmp(&key(cars[b].slice, pos_of(b))).unwrap_or(std::cmp::Ordering::Equal));
+                let mine = key(me.slice, positions.map(|(p, _)| p));
+                sorted.partition_point(|&i| key(cars[i].slice, pos_of(i)) < mine)
+            }
+        };
         let m = sorted.len();
         let walk = (0..m).map(|k| if me.dir > 0.0 { sorted[(own + k) % m] } else { sorted[(own + m - 1 - k) % m] });
         let mut used = 0u32;
@@ -210,8 +270,10 @@ impl LaneScratch {
                 break;
             }
             let o = &cars[i];
-            // `0x40E860(car, o)` and `gd = car+0xEB0 · g`
-            let g = gap_between(table, o.slice, me.slice);
+            // `g = 0x40E860(o, car)` (0x401FED…0x401FEF: `push esi` the car, `push edi` the other)
+            // and `gd = car+0xEB0 · g`
+            let pos = positions.and_then(|(mine, ps)| ps.get(i).map(|&p| (p, mine)));
+            let g = gap_fine(table, o.slice, me.slice, pos);
             let gd = me.dir * g;
             // the closing-rate weights: gentler when almost stopped, much gentler inside 15 m
             let (mut a, mut b) = if me.speed.abs() < 2.222 { (0.8333, 0.4) } else { (1.25, 0.5556) };
@@ -294,9 +356,12 @@ impl LaneScratch {
                 continue;
             }
             let (h, s) = (self.hard[k], self.soft[k]);
+            // the scores are ints: every term is `fld e; fmul w; fiadd score; call _ftol`
+            // (0x402302…0x402313 and its seven siblings), i.e. added and **truncated towards zero**
+            // at each step (audit 2026-09-26, `traffic.md` §34.12) — the port kept the fractions
             let mut add = |e: f32, w: f32| {
                 if e >= 0.0 {
-                    self.score[k] += e * w;
+                    self.score[k] = (self.score[k] + e * w).trunc();
                 }
             };
             add(me.dir * (me.speed - h), -1.3);
@@ -469,8 +534,8 @@ impl LaneScratch {
     /// `0x402A40` (§12.6, §28.1) — the chosen lane's lateral target. A blocker within 20 m in that
     /// lane first gets the squeeze-past of §28.3, which bypasses the lane centre and the road clamps;
     /// otherwise the car aims at the lane's centre, or hugs the edge in an outermost lane, clamped to
-    /// the road. (`0x402790`, the other early return, is dead for traffic: every writer of its
-    /// `car+0x107C` bias is an opponent path — §28.5.)
+    /// the road. (`0x402790`, the other early return, is dead for traffic — no traffic path writes its
+    /// `car+0x107C` bias — and the cop's lane pass runs it first, [`LaneScratch::override_holds`].)
     pub fn lateral_target(&self, table: &SliceTable, me: &LaneSelf, lane: i32, slot: usize, cars: &[LaneCar]) -> f32 {
         if let Some(i) = self.blocker[slot]
             && let Some(o) = cars.get(i)
@@ -480,6 +545,41 @@ impl LaneScratch {
             return t;
         }
         self.lane_centre(table, me, lane)
+    }
+
+    /// `0x402790(car)` — read to the instruction 2026-09-17 (§28.3) and again 2026-09-26: does the
+    /// held offset `car+0x1078` (`offset`) still win the lane vote with its bias `car+0x107C`
+    /// (`bias`) added? For each edge of the body widened by 0.25 m — `offset ∓ (car+0x3A8 + 0.25)` —
+    /// the lane it falls in (`0x40EB20`) maps to a slot (the current lane → 1, above → 2, below →
+    /// 0), a fresh copy of the three scores gets the bias on that slot, and the slot must be the
+    /// argmax (first strict `>` wins, ties to the lower slot). Both edges must win; the caller then
+    /// takes `car+0xEB4 = car+0x1078` unclamped. Only a chasing cop ever has a positive bias
+    /// (`traffic.md` §28.3, corrected 2026-09-26).
+    pub fn override_holds(&self, table: &SliceTable, me: &LaneSelf, offset: f32, bias: f32) -> bool {
+        let sl = &table.slices[me.slice.min(table.slices.len() - 1)];
+        let slot_of = |off: f32| {
+            let l = lane_of(sl, off);
+            if l == me.lane {
+                1
+            } else if l >= me.lane {
+                2
+            } else {
+                0
+            }
+        };
+        let wins = |slot: usize| {
+            let mut s = self.score;
+            s[slot] += bias;
+            let mut b = 0;
+            if s[1] > s[0] {
+                b = 1;
+            }
+            if s[2] > s[b] {
+                b = 2;
+            }
+            b == slot
+        };
+        wins(slot_of(offset - me.half_width - 0.25)) && wins(slot_of(me.half_width + offset + 0.25))
     }
 
     /// The lane-centre half of `0x402A40`, with its road clamps.
@@ -643,6 +743,48 @@ mod tests {
         assert_eq!(s.gap[1], 24.0);
         // the permitted speed is the blocker's plus `a · (round(gap) − 2)`
         assert!((s.hard[1] - (5.0 + 1.25 * 22.0)).abs() < 1e-4, "{:?}", s.hard);
+    }
+
+    #[test]
+    fn within_twelve_metres_the_gap_is_the_projection_on_the_other_cars_axis() {
+        // 0x40E860's fine step: a car on the same slice 5 m ahead is a blocker 5 m away, where the
+        // slice gap (0 m) skipped it as overlapping
+        let t = ring(400, 2, 2);
+        let fwd = me(8, 6.0);
+        let sl = t.slices[10];
+        let f = sl.forward.normalize();
+        let car = LaneCar { slice: 10, lane: 8, lane_mask: lane_bit(8), speed: 4.0, speed_est: 4.0, half_len: 2.1, lateral: 6.0, half_span: 0.9, is_human: false, is_racer: false };
+        let mut s = LaneScratch::default();
+        s.find_blockers(&t, &fwd, &[car], &PERSONALITIES[0]);
+        assert_eq!(s.blocker[1], None, "the slice gap alone: 0 m, overlapping");
+        let (mine, other) = (sl.centre, sl.centre + f * 5.0);
+        s.find_blockers_at(&t, &fwd, &[car], &PERSONALITIES[0], Some((mine, &[other])));
+        assert_eq!(s.blocker[1], Some(0));
+        assert!((s.gap[1] - 5.0).abs() < 1e-3, "{}", s.gap[1]);
+        // travelling −1 the car ahead on its own slice sits below it in the race order and is met
+        // first, before a car further down the road in the same lane
+        let back = LaneSelf { dir: -1.0, speed: -16.5, target_speed: -16.5, lane: 5, lateral: -6.0, ..fwd };
+        let near = LaneCar { lane: 5, lane_mask: lane_bit(5), lateral: -6.0, speed: -4.0, ..car };
+        let far = LaneCar { slice: 8, speed: -2.0, ..near };
+        let ps = [t.slices[8].centre, sl.centre - f * 5.0];
+        s.find_blockers_at(&t, &back, &[far, near], &PERSONALITIES[0], Some((sl.centre, &ps)));
+        assert_eq!(s.blocker[1], Some(1), "the nearer car, met first");
+        assert!((s.gap[1] - 5.0).abs() < 1e-3, "{}", s.gap[1]);
+        // beyond ±12 m the slice gap stands, whatever the positions say
+        assert_eq!(gap_fine(&t, 13, 10, Some((other, mine))), 18.0);
+        // slice 12's axis is turned 1.8° from slice 10's on this ring
+        assert!((gap_fine(&t, 12, 10, Some((sl.centre + f * 11.0, mine))) - 11.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn the_blocker_terms_are_truncated_to_ints_at_each_step() {
+        // 0x402302…0x402313: `score = _ftol(score + e·w)`. A blocker 1.9 m/s under the car's speed
+        // and target: −1.3·1.9 = −2.47 → −2, then −0.5·1.9 → −2.95 → −2 ... (each truncated)
+        let mut s = LaneScratch { blocker: [None, Some(0), None], gap: [0.0, 50.0, 0.0], hard: [0.0, 14.6, 0.0], soft: [0.0, 14.6, 0.0], ..Default::default() };
+        let m = LaneSelf { speed: 16.5, target_speed: 16.5, ..me(8, 6.0) };
+        s.score_blockers(&m);
+        // e = 1.9 for all four terms: −2.47 → −2; −2 − 0.95 → −2; −2 − 0.95 → −2; −2 − 0.19 → −2
+        assert_eq!(s.score[1], -2.0, "{:?}", s.score);
     }
 
     #[test]

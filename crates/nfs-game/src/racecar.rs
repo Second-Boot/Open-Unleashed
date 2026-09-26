@@ -1,6 +1,6 @@
 //! Multi-car race state: every racer has a vehicle, race progress and a controller. Positions
-//! follow the original's ranking table (sorted by progress, ties by the earlier progress tick —
-//! `Race_updateProgress` 0x416310). AI controllers are added from `RE/notes/ai.md`.
+//! follow the original's ranking table (sorted by progress, ties by the earlier slice-change tick
+//! `car+0xB14` — `Race_updateProgress` 0x416310, [`crate::race::ranking`]). AI controllers are added from `RE/notes/ai.md`.
 
 use crate::race::{RaceProgress, SliceTable};
 use glam::Vec3;
@@ -23,7 +23,6 @@ pub struct RaceCar {
     pub grid_pos: u32,
     /// index into the app's uploaded car models
     pub model: usize,
-    pub last_progress_tick: u64,
     pub wall_hits: u32,
     pub resets: u32,
     /// Knocked out (lap knockout / series): parked, ranked below the runners.
@@ -34,25 +33,27 @@ pub struct RaceCar {
 
 impl RaceCar {
     pub fn controls_for(&mut self, player: &Controls, table: &SliceTable, line: Option<&nfs_formats::ais::RacingLine>, tick: u64, ahead: &[(Vec3, usize, f32, f32, bool)]) -> Controls {
-        // finish state 2 (`ai.md` §3.2): throttle 0, full brake
-        if self.progress.finished && !matches!(self.controller, Controller::Player) {
-            return Controls { brake: 255, ..Default::default() };
-        }
         match &mut self.controller {
             Controller::Player => *player,
+            // finish state 2 (`ai.md` §3.2): throttle 0, full brake
+            Controller::Parked if self.progress.finished => Controls { brake: 255, ..Default::default() },
             Controller::Parked => Controls { brake: 254, ..Default::default() },
-            Controller::Ai(ai) => ai.controls(table, line, &self.progress, &self.vehicle, &self.specs, tick, ahead, 0.9),
+            // A finished (or knocked-out) opponent still runs the whole of 0x40B650 and 0x40BFE0 —
+            // the draws, the aim point, the avoidance and the steering — and 0x40C5EE only replaces
+            // the pedals (and, knocked out, the aim point) by `car+0xB50`, which the caller keeps in
+            // `Vehicle::race_state` (`AiDriver::controls`). *(Until the audit of 2026-09-26 the port
+            // returned before the AI ran, so a finished car rolled on with the wheel straight and
+            // consumed none of the stream, and a knocked-out one was parked.)* The own half width
+            // is `car+0x3A8` (0x40C577), the model box of 0x445090 — not the 0.9 the port passed.
+            Controller::Ai(ai) => ai.controls(table, line, &self.progress, &self.vehicle, &self.specs, tick, ahead, self.vehicle.half_extents.x),
         }
     }
 }
 
-/// Race positions: index in the ranking table (0 = leader).
+/// Race positions: index in the ranking table (0 = leader), [`crate::race::ranking`].
 pub fn positions(cars: &[RaceCar]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..cars.len()).collect();
-    order.sort_by(|&a, &b| {
-        let (pa, pb) = (cars[a].progress.progress, cars[b].progress.progress);
-        pb.partial_cmp(&pa).unwrap_or(std::cmp::Ordering::Equal).then(cars[a].last_progress_tick.cmp(&cars[b].last_progress_tick))
-    });
+    let keys: Vec<(f32, u64)> = cars.iter().map(|c| (c.progress.progress, c.progress.tick)).collect();
+    let order = crate::race::ranking(&keys);
     let mut pos = vec![0; cars.len()];
     for (rank, &i) in order.iter().enumerate() {
         pos[i] = rank;
@@ -60,17 +61,13 @@ pub fn positions(cars: &[RaceCar]) -> Vec<usize> {
     pos
 }
 
-/// Update every car's progress (32 Hz) and remember when it last advanced.
+/// Update every car's progress (32 Hz).
 pub fn update_progress(cars: &mut [RaceCar], table: &SliceTable, tick: u64, num_laps: u32) {
     for c in cars.iter_mut() {
-        let before = c.progress.progress;
         let (pos, fwd) = (c.vehicle.position, c.vehicle.forward());
         // an AI-driven car (`car+0xDA8`) keeps its wrong-way counter clear (0x4A76EE)
         c.progress.wrong_way_gate = crate::race::WrongWayGate::Reset;
         c.progress.update(table, pos, fwd, tick, num_laps);
-        if c.progress.progress > before {
-            c.last_progress_tick = tick;
-        }
     }
 }
 

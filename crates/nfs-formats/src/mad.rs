@@ -56,6 +56,25 @@ pub fn chunks(d: &[u8]) -> impl Iterator<Item = Chunk<'_>> {
     })
 }
 
+/// The movie's sound track: its `SCHl`, `SCCl`, `SCDl` and `SCEl` chunks in file order, which
+/// together are one ordinary `SCHl` stream ([`crate::schl`]).
+///
+/// The start-up player 0x4DC850 never looks at them itself: it registers the stream's `SC` chunks
+/// with the sound library (0x56B230(stream, 1, 0xFFFF, 0x4353 `"SC"`, 2) at 0x4DC8AC), hands every
+/// chunk that is not a video one back through 0x56C620 as it walks the file, and starts the
+/// library's player on the stream once (0x56CA20 at 0x4DCBCF, 0x56CA00 → 0x567550 at 0x4DCBFB —
+/// no level argument). Every shipped movie's header is 2 channels, no 0x84 rate (22050) and no
+/// 0xA0 codec (EA-XA), the same as the music's.
+pub fn audio_track(d: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for c in chunks(d) {
+        if c.tag[..2] == *b"SC" {
+            out.extend_from_slice(c.data);
+        }
+    }
+    out
+}
+
 /// The header a video chunk carries (0x4DC8D9 … 0x4DCA1D).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MadHeader {
@@ -191,6 +210,7 @@ struct VlcRecord {
 ///
 /// An entry packs, exactly as the executable's does: the number of bits to consume in the low byte,
 /// the signed **level** in `entry >> 22` and the **run** in `(entry >> 16) & 0x3F`.
+#[derive(Clone)]
 pub struct MadTables {
     /// `0x6B51A0 … 0x6B62A0` as one array of dwords
     pub flat: Vec<u32>,
@@ -714,33 +734,72 @@ impl MadDecoder {
         (b.clamp(-64, 63) + 64) as u8
     }
 
-    /// **APPROXIMATION.** The original hands the packed 7-bit 4:2:2 surface straight to the
-    /// hardware, so how it reaches the screen is the display's business, not the codec's. This
-    /// scales the two ranges back up and applies the usual YUV→RGB.
+    /// The software colour conversion, **0x56A920** — which every movie goes through (its callers
+    /// are the intro player 0x4DC710, the `MOVIE` widget 0x4E27FF and the overlay fallback
+    /// 0x5690FE) — with the tables **0x56AD70** builds once per display depth.
+    ///
+    /// A surface dword is read as bytes: byte 0 `V`, byte 1 `U`, byte 3 the first `Y` and byte 2
+    /// the second (0x592628…0x592676). Each is 7-bit with a +64 bias ([`pixel`](Self::pixel)).
+    /// The tables are JFIF's full-range coefficients, as `f32` (0x5BD8AC…0x5BD8B4), applied to the
+    /// chroma **plus a half**: for `c = byte − 64`, `k(c) = rne(f32(c + 0.5) · coef)` (`fistp` in
+    /// the default rounding mode, after the product is stored as an `f32` at 0x56ADA1 / 0x56ADE8).
+    /// The luma table's three fields start at 89 (R), 67 (G) and 113 (B) and step one per `Y`
+    /// (`0x2C821871 + y · 0x800801`, 0x56AD7F / 0x56AE2A); the sums index clamp tables whose entry
+    /// `k` is `start + 2k` clamped to 0…255, `start` −177 (R, 0x56AE46), −133 (G, 0x56AEC6) and
+    /// −225 (B, 0x56AF46). So, with `y` the stored byte:
+    ///
+    /// ```text
+    /// R = clamp(−177 + 2·(89  + y + rne(1.402·(v−63.5))))
+    /// G = clamp(−133 + 2·(67  + y + rne(−0.3441·(u−63.5)) + rne(−0.7141·(v−63.5))))
+    /// B = clamp(−225 + 2·(113 + y + rne(1.772·(u−63.5))))
+    /// ```
+    ///
+    /// The fields are nine bits apiece and the sums never leave the tables (R 0…305 of 306, G
+    /// 0…261 of 262, B 0…353 of 354). This is the 32-bit row writer 0x5926EF; on a 15/16-bit
+    /// display 0x592610 takes the same tables with each entry holding two quantisations —
+    /// `(c + 4) >> 3` (G: `(c + 2) >> 2`) capped, for the first pixel of the pair, and `c >> 3`
+    /// (`c >> 2`) for the second — a horizontal dither this true-colour port does not reproduce.
     fn to_rgba(yuv: &[u32], w: usize, h: usize) -> Vec<u8> {
+        let k = |c: u32, coef: f32| (((c as i32 - 64) as f32 + 0.5) * coef).round_ties_even() as i32;
         let row_dwords = w / 2;
         let mut out = vec![0u8; w * h * 4];
         for y in 0..h {
-            for k in 0..row_dwords {
-                let p = yuv[y * row_dwords + k];
-                let ys = [((p >> 24) & 0xFF) as i32, ((p >> 16) & 0xFF) as i32];
-                let u = (((p >> 8) & 0xFF) as i32 - 64) * 2;
-                let v = ((p & 0xFF) as i32 - 64) * 2;
-                for (j, yv) in ys.into_iter().enumerate() {
-                    let l = yv * 2;
-                    let r = l + (359 * v) / 256;
-                    let g = l - (88 * u) / 256 - (183 * v) / 256;
-                    let b = l + (454 * u) / 256;
-                    let o = (y * w + k * 2 + j) * 4;
+            for x in 0..row_dwords {
+                let p = yuv[y * row_dwords + x];
+                let (u, v) = ((p >> 8) & 0xFF, p & 0xFF);
+                let rv = k(v, 1.402);
+                let g = k(u, -0.3441) + k(v, -0.7141);
+                let bu = k(u, 1.772);
+                for (j, yv) in [(p >> 24) & 0xFF, (p >> 16) & 0xFF].into_iter().enumerate() {
+                    let yv = yv as i32;
+                    let o = (y * w + x * 2 + j) * 4;
                     if o + 4 <= out.len() {
-                        out[o] = r.clamp(0, 255) as u8;
-                        out[o + 1] = g.clamp(0, 255) as u8;
-                        out[o + 2] = b.clamp(0, 255) as u8;
+                        out[o] = (-177 + 2 * (89 + yv + rv)).clamp(0, 255) as u8;
+                        out[o + 1] = (-133 + 2 * (67 + yv + g)).clamp(0, 255) as u8;
+                        out[o + 2] = (-225 + 2 * (113 + yv + bu)).clamp(0, 255) as u8;
                         out[o + 3] = 255;
                     }
                 }
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod colour_tests {
+    /// 0x56AD70's tables at a few points: the neutral grey, full-scale luma, and the chroma
+    /// extremes that set the tables' lengths.
+    #[test]
+    fn the_software_conversion_matches_the_tables() {
+        let px = |y0: u32, y1: u32, u: u32, v: u32| {
+            let rgba = super::MadDecoder::to_rgba(&[(y0 << 24) | (y1 << 16) | (u << 8) | v], 2, 1);
+            ([rgba[0], rgba[1], rgba[2]], [rgba[4], rgba[5], rgba[6]])
+        };
+        // c = 0 → c + 0.5: R +1 (0.701), G 0 and 0, B +1 (0.886)
+        assert_eq!(px(64, 0, 64, 64), ([131, 129, 131], [3, 1, 3]));
+        assert_eq!(px(127, 127, 64, 64).0, [255, 255, 255]);
+        // v = 127: 1.402·63.5 = 89.03 → 89; u = 0: 1.772·−63.5 → −113
+        assert_eq!(px(64, 64, 0, 127).0, [255, 83, 0]);
     }
 }

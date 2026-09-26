@@ -18,7 +18,7 @@
 //! the three modules that carry the career (§9.4) — from the port's own career state, embedding
 //! the same record images the original does (`nfs5.trn`, `nfs5.fac`, the FE car object built on
 //! the `nfs5.car` record), plus an `accessor` block holding the values the port actually has
-//! (§6.2a gives the class, and so the payload shape, of all 221 registered names). A subset is
+//! (§6.2a gives the class, and so the payload shape, of all 220 statically registered names). A subset is
 //! legal: the original looks every name up in its own registry and anything absent keeps its
 //! default (§9.6). Because a few port-side bookkeeping fields still have no home in the format
 //! (see [`career_from_sav`]), the port's own JSON career remains the live save and the `.sav` is
@@ -27,7 +27,7 @@
 use crate::career::{Career, CareerTables, EventResult, OwnedCar, TournamentState};
 use nfs_formats::career::{Era, MISSION_RECORD_SIZE, PART_RECORD_SIZE, TOURNAMENT_RECORD_SIZE};
 use nfs_formats::fedata::CAR_RECORD_SIZE;
-use nfs_formats::sav::{AccessorBlock, AccessorValue, KnockoutState, PlayerInfo, SaveFile, SavedCar, SavedPart, TournamentModule, FE_CAR_IMAGE};
+use nfs_formats::sav::{AccessorBlock, AccessorValue, KnockoutState, PlayerInfo, SaveFile, SavedCar, SavedPart, TournamentModule, UsedCarMarket, FE_CAR_IMAGE};
 use std::path::{Path, PathBuf};
 
 /// `[0x5D8F2C]` / `[0x5DB748]` default driver picture.
@@ -72,13 +72,19 @@ impl Profile {
 }
 
 /// `RebuildUserList` 0x4DEF60: every `*.sav` except the template, sorted by `strcmp(a+1, b+1)`.
+///
+/// The length test (0x4DF08B…0x4DF093, `strlen >= 0x64` skips) is on the **whole file name**:
+/// the enumerator 0x59E270 builds `"%s%s"` of the root and the `"%s*.sav"` pattern, and 0x59FEB0
+/// puts each `FindFirstFileA` / `FindNextFileA` result's `cFileName` (the find data's `+0x2C`,
+/// `[esp+0x58]` there) into the set 0x59FFE0 walks — name and `.sav` together, no directory. So
+/// a stem of 96 characters is already left out. *(Until 2026-09-26 the port tested the stem.)*
 pub fn list_profiles(dir: &Path) -> Vec<Profile> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else { return out };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
         let Some(stem) = name.split('.').next() else { continue };
-        if !name.to_lowercase().ends_with(".sav") || stem.len() >= 0x64 || stem == TEMPLATE_STEM {
+        if !name.to_lowercase().ends_with(".sav") || name.len() >= 0x64 || stem == TEMPLATE_STEM {
             continue;
         }
         if let Some(p) = Profile::from_stem(stem) {
@@ -123,9 +129,16 @@ pub fn delete_profile(dir: &Path, p: &Profile) -> std::io::Result<()> {
 /// Offsets inside the FE car object (`FECar::init` 0x4EEBA0 / 0x4EEC55, CONFIRMED).
 ///
 /// `savegame.md` §4.7 says the image "begins with the 1648-byte `nfs5.car` record"; reading the
-/// constructor shows it is off by four — `car+0x00` is a per-object instance number (0x4EEBFE
-/// picks the lowest value no other car uses) and the `rep movsd` of 0x19C dwords lands the record
-/// at `car+0x04`.
+/// constructor shows it is off by four — `car+0x00` is a per-object instance dword and the
+/// `rep movsd` of 0x19C dwords lands the record at `car+0x04`.
+///
+/// *(Corrected 2026-09-26.)* The instance dword is not "the lowest value no other car uses": the
+/// loop at 0x4EEBFE…0x4EEC1F walks the count of `[0x69188C]` but compares the **new car's own**
+/// `[ebp+0]` (`mov esi, [ebp]` at 0x4EEC0E, `ebp` = this) with the candidate, so it comes out 1
+/// when other cars exist and the fresh object's first dword is 0, and 0 otherwise — the heap's
+/// contents decide. The loader copies the saved dword back verbatim. The port writes the car's
+/// index (garage first, then the market): APPROXIMATION; the port reads nothing from it, and
+/// what the original reads it for is not traced.
 pub mod car {
     /// `car+0x04`, 0x670 bytes: the `nfs5.car` record.
     pub const RECORD: usize = 0x04;
@@ -157,8 +170,9 @@ pub mod car {
     pub const SETUP_BACKUP: usize = 0x714;
 }
 
-/// Build the FE car image the save stores for one garage car.
-fn car_image(tables: &CareerTables, c: &OwnedCar, instance: u32) -> SavedCar {
+/// Build the FE car image the save stores for one garage car (`players = true`) or one car the
+/// used-car market generated (`false`).
+fn car_image(tables: &CareerTables, c: &OwnedCar, instance: u32, players: bool) -> SavedCar {
     let mut image = vec![0u8; FE_CAR_IMAGE];
     image[0..4].copy_from_slice(&instance.to_le_bytes());
     if let Some(i) = tables.catalog.iter().position(|e| e.id == c.car_id) {
@@ -187,12 +201,16 @@ fn car_image(tables: &CareerTables, c: &OwnedCar, instance: u32) -> SavedCar {
         car.set_field_u32(car::DECAL_NUM, t.decal as i32 as u32);
     }
     car.set_field_u32(car::ASKING_PRICE, c.asking_price.unwrap_or(0));
-    car.set_field_u8(car::LISTED, u8::from(c.asking_price.is_some()));
+    // a market car carries its price at `+0x68C` (0x4F8577) but is not "listed": that byte is the
+    // player's own for-sale flag, and the constructor leaves it 0 (0x4EEC55…)
+    car.set_field_u8(car::LISTED, u8::from(players && c.asking_price.is_some()));
     car.set_field_u8(car::OFFER_PENDING, u8::from(c.offer.is_some()));
     car.set_field_u32(car::OFFER, c.offer.unwrap_or(0));
     car.set_field_u32(car::MILEAGE, c.mileage);
     car.set_field_u32(car::WINS, c.wins);
-    car.set_field_u8(car::OWNED, 1);
+    // 0x4F853E: a car the market generated has `+0x6A0 = 0`; the market's writer 0x4F7A10 stores
+    // only those
+    car.set_field_u8(car::OWNED, u8::from(players));
     car.set_field_u32(car::PURCHASE_PRICE, c.purchase_price);
     // the setup and the copy the screen's "cancel" restores from (0x4EF4C0/0x4EF4E0)
     for (i, v) in c.setup.iter().enumerate() {
@@ -268,6 +286,18 @@ fn owned_from_image(tables: &CareerTables, car: &SavedCar) -> OwnedCar {
         asking_price: (car.field_u8(car::LISTED) != 0).then(|| car.field_u32(car::ASKING_PRICE)),
         offer: (car.field_u8(car::OFFER_PENDING) != 0).then(|| car.field_u32(car::OFFER)),
     };
+    // 0x4EE853…0x4EE8AE: the loader ends by exchange-sorting the installed list `+0x758` — for i,
+    // for j > i, swap when 0x49C350(v[j], v[i]) — whatever order the file had it in
+    let rec = |id: i16| tables.parts.iter().find(|p| p.id == id);
+    for i in 0..owned.parts.len() {
+        for j in i + 1..owned.parts.len() {
+            if let (Some(a), Some(b)) = (rec(owned.parts[j]), rec(owned.parts[i])) {
+                if crate::career::part_less(a, b) {
+                    owned.parts.swap(i, j);
+                }
+            }
+        }
+    }
     // a `.sav` the port wrote before 2026-09-25 has no stock list (`n1 = 0`) and only the bought
     // parts installed — port-only, see `OwnedCar::adopt_implicit_stock`
     owned.adopt_implicit_stock(tables);
@@ -404,9 +434,27 @@ pub struct KnockoutProgress {
     pub start_pos: Vec<u32>,
     /// the personality ids drawn for opponents 1..n
     pub personalities: Vec<i16>,
+    /// `+0x60`, where each car finished the last race — what a loaded block held; empty writes the
+    /// −1s of a series that has run no race
+    pub last_pos: Vec<i32>,
 }
 
 impl KnockoutProgress {
+    /// The block as `Knockout`'s loader 0x4DDD60 leaves it: a `rep movsd` of 0x21 dwords into
+    /// `[0x690410]`, nothing checked — every one of the sixteen `alive` bytes, the eight
+    /// personality dwords and both nine-dword position rows, whatever the counts say.
+    pub fn from_state(k: &KnockoutState) -> Self {
+        Self {
+            active: k.active,
+            race_index: k.race_index as u32,
+            opponents: k.opponents as u32,
+            alive: k.alive.iter().map(|a| *a != 0).collect(),
+            start_pos: k.start_pos.iter().map(|p| *p as u32).collect(),
+            personalities: k.personalities.iter().map(|p| *p as i16).collect(),
+            last_pos: k.last_pos.to_vec(),
+        }
+    }
+
     fn to_state(&self) -> KnockoutState {
         let mut k = KnockoutState { active: self.active, race_index: self.race_index as i32, opponents: self.opponents as i32, ..Default::default() };
         for (i, a) in self.alive.iter().take(16).enumerate() {
@@ -420,18 +468,68 @@ impl KnockoutProgress {
             k.start_pos[i] = *p as i32;
         }
         k.last_pos = [-1; 9];
+        for (i, p) in self.last_pos.iter().take(9).enumerate() {
+            k.last_pos[i] = *p;
+        }
         k
     }
 }
 
 /// Build the original's save game from the port's career state.
 pub fn career_to_sav(c: &Career, tables: &CareerTables, profile: &Profile) -> SaveFile {
-    career_to_sav_with(c, tables, profile, None, &[], &SavedSettings::default())
+    career_to_sav_with(c, tables, profile, &SaveSide::default())
 }
 
-/// The same with a knockout series, the personality ids in play and the CD player's track list.
-/// The front-end settings the port keeps, for the accessor block (`savegame.md` §6).
+/// What a `.sav` carries beside the career: the modules and accessors that belong to the front
+/// end rather than to `PlayerInfo` / `Tournament` / `Missions`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SaveSide {
+    /// `Knockout`, the 0x84-byte block `[0x690410]` (§4.6). `None` writes it switched off.
+    pub knockout: Option<KnockoutProgress>,
+    /// `Personalities`, the vector `[0x6907D8]` (§4.5). It is the result of the **last**
+    /// `0x4E3160` draw — the draw clears it (0x4E3176) and pushes the ids it picks (0x4E32B5) —
+    /// and nothing but the draw's two callers (0x4DE011 knockout, 0x4EBC63 quick race) and this
+    /// module read it. `None` writes the running knockout series' ids, as the port did before.
+    pub personalities: Option<Vec<u16>>,
+    /// `CDPlayer`, the selected music tracks `[0x65B62C]` (§4.8).
+    pub playlist: Vec<u32>,
+    /// The front-end settings, for the accessor block.
+    pub settings: SavedSettings,
+    /// `Tournament`'s four front-end dwords (§4.3).
+    pub tournament: TournamentFe,
+}
+
+/// The four dwords of the `Tournament` module (§4.3) that belong to the front end, not to the
+/// `nfs5.trn` table:
+///
+/// * `[0x691E6C]`, the **selected tournament** — a record index into the table: 0x503310 reads the
+///   id at `table + index·0xD40`; the list setters 0x504D00 (0x504DCC) and 0x5055C0 (0x5055EB) and
+///   the race end 0x503AD0 (0x503CA8 / 0x503CCB) write it;
+/// * `[0x691E7C]`, the **next event** — an event index inside that record: what
+///   `Tournament.RemainingTracks`' setter 0x504F00 picks, its getter 0x503330; 0x504D00 puts it on
+///   the first undone event and 0x503A50 back to 0;
+/// * `[0x5DB768]` / `[0x5DB76C]`, the **running event and tournament** — 0x503940, called once, at
+///   0x4D5B4A on the tournament launch after the fee, copies the two above; 0x503A50 (the race end,
+///   0x4EDF1A / 0x4EE076) sets both to −1; 0x503960 files the result through them.
+///
+/// The loader 0x5029F0 stores all four back verbatim.
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TournamentFe {
+    pub selected: u32,
+    pub next_event: u32,
+    pub current_event: i32,
+    pub current_tournament: i32,
+}
+
+impl Default for TournamentFe {
+    /// what 0x503A50 leaves, with the first record selected
+    fn default() -> Self {
+        Self { selected: 0, next_event: 0, current_event: -1, current_tournament: -1 }
+    }
+}
+
+/// The front-end settings the port keeps, for the accessor block (`savegame.md` §6).
+#[derive(Debug, Clone, PartialEq)]
 pub struct SavedSettings {
     /// `Audio.MusicLevel` / `SfxLevel` / `EngineLevel` / `SpeechLevel` / `AmbientLevel`, 0..127
     pub music: u8,
@@ -457,8 +555,41 @@ pub struct SavedSettings {
     /// The `Controller.*` bindings the port has, `(accessor, six fields)` — each an
     /// `FEControllerInputAccessor` (0x51D060: `u32[6]` from `this+0x14`, no selection). The
     /// original keeps the player's rebound controls here, in the profile (`savegame.md` §6.2).
-    pub controls: [Option<(&'static str, [u32; 6])>; 12],
+    /// One slot per row: the factory 0x51E030 builds **nineteen** (0x51E04E…0x51E36D), every one
+    /// in the accessor map and so every one saved by 0x4B80E0. *(Twelve slots until 2026-09-26,
+    /// which left out the eight rows the port bound later — Lights, Pause, the turn signals,
+    /// Hazards and the three looks.)*
+    pub controls: [Option<(&'static str, [u32; 6])>; CONTROL_ROWS],
+    /// Every other option accessor the port keeps, `(name, index)`: the dword each one's generic
+    /// Save 0x4BC460 writes is `[this+0x18]`, the **list index** — for an `FEIntAccessor` the value
+    /// less its minimum (0x4BA342 hands `SetSelection` `default − min`, the getter 0x4BA370 adds
+    /// `[this+0x24]` = min back). A name the fixed fields above already carry is not written twice.
+    pub options: Vec<(String, u32)>,
 }
+
+/// `Track1.Laps` is a list accessor over the rows "1".."8" (`FEStrings` 420…427, 0x4F9A76) and
+/// the launch adds one to its index (0x4FC1BC), so the dword is `laps − 1`.
+pub fn laps_to_index(laps: u32) -> u32 {
+    laps.saturating_sub(1)
+}
+pub fn laps_from_index(i: u32) -> u32 {
+    i + 1
+}
+/// `Game.NumKOOpponents` is `0x4BA310("Game.NumKOOpponents", 0, 4, 1, 7, …)` (0x4E556A…): minimum
+/// **1**, so the dword is `count − 1`; `Game.NumOpponents` (0x4E5537…) has minimum 0 and stores the
+/// count itself.
+pub const KO_OPPONENTS_MIN: u32 = 1;
+
+/// `SetSelection` 0x4BC240, which every dword accessor's Load 0x4BC480 ends in: the index is cut to
+/// `count - 1` when above it (`jl` at 0x4BC269) and then to 0 when negative (`jge` at 0x4BC275) —
+/// both signed compares.
+pub fn clamp_index(d: u32, count: u32) -> u32 {
+    let (v, last) = (d as i32, count.max(1) as i32 - 1);
+    v.min(last).max(0) as u32
+}
+
+/// The `FEControllerInputAccessor`s the factory 0x51E030 registers (`controls.md` §4.170).
+pub const CONTROL_ROWS: usize = 19;
 
 /// The eight axes in the order 0x51E4C0 registers their two accessors, which is `DIJOYSTATE`'s own
 /// field order and therefore the order of the axis bitmask's bits.
@@ -482,7 +613,8 @@ impl Default for SavedSettings {
             traffic: 0,
             ko_opponents: 4,
             deadzone: [[0, 0x80]; 8],
-            controls: [None; 12],
+            controls: [None; CONTROL_ROWS],
+            options: Vec::new(),
         }
     }
 }
@@ -503,34 +635,42 @@ pub fn saved_controls(s: &SaveFile) -> Vec<(String, [u32; 6])> {
         .unwrap_or_default()
 }
 
-pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, knockout: Option<&KnockoutProgress>, playlist: &[u32], settings: &SavedSettings) -> SaveFile {
+pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, side: &SaveSide) -> SaveFile {
+    let (knockout, settings) = (side.knockout.as_ref(), &side.settings);
     let player = PlayerInfo {
-        cars: c.garage.iter().enumerate().map(|(i, car)| car_image(tables, car, i as u32)).collect(),
+        cars: c.garage.iter().enumerate().map(|(i, car)| car_image(tables, car, i as u32, true)).collect(),
         money: c.money.clamp(-MONEY_LIMIT, MONEY_LIMIT) as i32,
         picture: profile.picture as u32,
         player_name: profile.name.clone(),
         driver_name: profile.name.clone(),
-        // The original clears all three on a new career; the port keeps the first (`careerfirst`,
-        // `Career::seen_evolution_intro`) and has no gates for the other two.
+        // The original clears all three on a new career (0x5013F9…); the port gates the first
+        // (`careerfirst`, `Career::seen_evolution_intro`) and carries the other two and the eight
+        // custom colours as loaded — *until 2026-09-26 written as zeros and dropped on load*
         seen_evolution_intro: u8::from(c.seen_evolution_intro),
-        seen_factory_welcome: 0,
-        seen_first_mission: 0,
-        colours: [0; 8],
+        seen_factory_welcome: u8::from(c.seen_factory_welcome),
+        seen_first_mission: u8::from(c.seen_first_mission),
+        colours: c.custom_colours,
     };
     let tournament = TournamentModule {
         year: c.year as u32,
-        remaining_tracks: 0,
-        selected: 0,
+        // the front end's four (`TournamentFe`) — *until 2026-09-26 written as 0 / 0 / −1 / −1*
+        remaining_tracks: side.tournament.next_event,
+        selected: side.tournament.selected,
         era_type: c.era.string_id(),
-        current_event: -1,
-        current_tournament: -1,
+        current_event: side.tournament.current_event,
+        current_tournament: side.tournament.current_tournament,
         club_mode: u32::from(c.evolution_complete),
         table: tournament_table(tables, c),
     };
     // The accessors the port has real values for, each in the shape its class implies (§6.1/§6.2a).
     let mut entries = vec![
         ("Chronicle.Year".into(), AccessorValue::Dword(c.year as u32)),
-        ("Game.GameType".into(), AccessorValue::Dword(u32::from(c.evolution_complete))),
+        // `Game.GameType` is left out: it holds whatever mode the front end was in when the
+        // original saved (0 quick race, 1 quick knockout, 2 knockout, 4 Evolution, 9 factory
+        // driver — `controls.md` §SETTYPE*; 0x4D52EA saves after any race), which the career
+        // does not know. *(Until 2026-09-26 the port wrote `evolution_complete` as 0/1 here — the
+        // club flag `[0x691E54]`, already in the `Tournament` module — so a finished Evolution put
+        // the original into quick knockout on load.)*
         ("OwnedCars.Car".into(), AccessorValue::OwnedCarSel { cars: c.garage.len() as u32, selection: 0 }),
         ("UserList.NameInput".into(), AccessorValue::Text(profile.name.clone())),
         ("Tournament.Data".into(), AccessorValue::Empty),
@@ -544,10 +684,12 @@ pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, 
         ("Audio.AmbientLevel".into(), AccessorValue::Dword(settings.ambient as u32)),
         ("Audio.Quality".into(), AccessorValue::Dword(settings.audio_quality as u32)),
         ("Graphics.ViewDistance".into(), AccessorValue::Dword(settings.view_distance as u32)),
-        ("Track1.Laps".into(), AccessorValue::Dword(settings.laps)),
+        // each the accessor's index, not the port's count *(until 2026-09-26 the port wrote the
+        // lap and knockout-opponent counts themselves, one more than the original reads)*
+        ("Track1.Laps".into(), AccessorValue::Dword(laps_to_index(settings.laps))),
         ("Game.NumOpponents".into(), AccessorValue::Dword(settings.opponents)),
         ("Track1.Traffic".into(), AccessorValue::Dword(settings.traffic)),
-        ("Game.NumKOOpponents".into(), AccessorValue::Dword(settings.ko_opponents)),
+        ("Game.NumKOOpponents".into(), AccessorValue::Dword(settings.ko_opponents.saturating_sub(KO_OPPONENTS_MIN))),
     ];
     // The sixteen dead-zone accessors. Each holds **one value per pad** — `u32[16]` at
     // `this+0x28`, written with the selection in front (0x51BEC0 / 0x51BEF0, `savegame.md` §6.1) —
@@ -562,6 +704,11 @@ pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, 
     }
     for (name, fields) in settings.controls.iter().flatten() {
         entries.push(((*name).into(), AccessorValue::ControllerInput(*fields)));
+    }
+    for (name, index) in &settings.options {
+        if !entries.iter().any(|(n, _)| n == name) {
+            entries.push((name.clone(), AccessorValue::Dword(*index)));
+        }
     }
     // the selected car's setup, which the screen mirrors into `FEFloatAccessor`s — a float rides in
     // the same dword (`career.md` §12, `layouts.md`)
@@ -579,12 +726,21 @@ pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, 
         tournament: Some(tournament),
         player: Some(player),
         track_records: true,
-        used_cars: None,
+        // §4.4, 0x4F7A10: the market's year, then every car of `[0x691B88]` whose `+0x6A0` is 0 —
+        // always written, as the module is always registered. The year is `[0x691B58]`, which
+        // 0x4F7DC7 sets to the chronicle year each time the market is refreshed after a race; the
+        // port does not keep it apart and writes the career's year (APPROXIMATION: it differs
+        // only when the year has turned since the last refresh). The instance dwords continue
+        // after the garage's (see `car_image`).
+        used_cars: Some(UsedCarMarket {
+            year: c.year as u32,
+            cars: c.market.iter().enumerate().map(|(i, car)| car_image(tables, car, (c.garage.len() + i) as u32, false)).collect(),
+        }),
         // §4.6: the raw `[0x690410]` block, and §4.5's list of personality ids in play
         knockout: Some(knockout.map(|k| k.to_state()).unwrap_or_default().write()),
-        personalities: Some(knockout.map(|k| k.personalities.iter().map(|p| *p as u16).collect()).unwrap_or_default()),
+        personalities: Some(side.personalities.clone().unwrap_or_else(|| knockout.map(|k| k.personalities.iter().map(|p| *p as u16).collect()).unwrap_or_default())),
         // §4.8: the selected music tracks
-        cd_player: Some(playlist.to_vec()),
+        cd_player: Some(side.playlist.clone()),
         accessors: Some(accessors),
         order: Vec::new(),
     }
@@ -614,6 +770,26 @@ pub fn career_from_sav(s: &SaveFile, tables: &CareerTables) -> Career {
     if let Some(p) = &s.player {
         c.money = p.money as i64;
         c.garage = p.cars.iter().map(|car| owned_from_image(tables, car)).collect();
+        // `[0x691DD5]`, `[0x691D94]` and `[0x691DF5]`, the three bytes right after the two names
+        // (0x501859, 0x501868, 0x501877), then the eight colours `[0x691D98]` (0x501888)
+        c.seen_evolution_intro = p.seen_evolution_intro != 0;
+        c.seen_factory_welcome = p.seen_factory_welcome != 0;
+        c.seen_first_mission = p.seen_first_mission != 0;
+        c.custom_colours = p.colours;
+    }
+    // 0x4F7750: the market is cleared and rebuilt from the module, each car through the same
+    // loader 0x4EE6A0; its price is `+0x68C` whether or not the listed byte is set
+    if let Some(m) = &s.used_cars {
+        c.market = m
+            .cars
+            .iter()
+            .map(|car| {
+                let mut o = owned_from_image(tables, car);
+                o.asking_price = Some(car.field_u32(car::ASKING_PRICE));
+                o.offer = None;
+                o
+            })
+            .collect();
     }
     if let Some(t) = &s.tournament {
         c.year = t.year as u16;
@@ -646,8 +822,72 @@ pub fn career_from_sav(s: &SaveFile, tables: &CareerTables) -> Career {
     c
 }
 
+/// Read back the modules and accessors that are not the career's (`LoadInfo` 0x4DE9B0 hands each
+/// module blob to its loader, then the accessor block to 0x4B7FD0):
+///
+/// * `Knockout` 0x4DDD60 — `rep movsd` of 0x21 dwords into `[0x690410]`, nothing checked;
+/// * `Personalities` 0x4E2CA0 — clears `[0x6907D8]`, reads a count (signed, `jle` at 0x4E2CF0)
+///   and pushes that many `u16`s;
+/// * `CDPlayer` 0x4BE170 — clears `[0x65B62C]`, reads a count (signed, `jle` at 0x4BE1CD) and
+///   pushes that many dwords;
+/// * every dword accessor — 0x4BC480 stores the dword at `[this+0x18]` and calls
+///   `vtbl[+0x2C]` = 0x4BC240, which clamps it to `0 … count − 1` (0x4BC25E…0x4BC277, signed)
+///   before it selects. [`SavedSettings::options`] keeps them all, raw; the clamp is the
+///   caller's, which knows each list's length.
+///
+/// A module the file does not carry leaves its field at the default here, as the original leaves
+/// the global alone.
+pub fn side_from_sav(s: &SaveFile) -> SaveSide {
+    let mut side = SaveSide {
+        knockout: s.knockout.as_ref().map(|b| KnockoutProgress::from_state(&KnockoutState::parse(b))),
+        personalities: s.personalities.clone(),
+        playlist: s.cd_player.clone().unwrap_or_default(),
+        settings: SavedSettings::default(),
+        // 0x5029F0 stores the four back as they are
+        tournament: s.tournament.as_ref().map_or_else(TournamentFe::default, |t| TournamentFe { selected: t.selected, next_event: t.remaining_tracks, current_event: t.current_event, current_tournament: t.current_tournament }),
+    };
+    let st = &mut side.settings;
+    for (name, v) in s.accessors.iter().flat_map(|a| a.entries.iter()) {
+        match (name.as_str(), v) {
+            (_, AccessorValue::Dword(d)) => {
+                let d = *d;
+                match name.as_str() {
+                    "Audio.MusicLevel" => st.music = clamp_index(d, 128) as u8,
+                    "Audio.SfxLevel" => st.sfx = clamp_index(d, 128) as u8,
+                    "Audio.EngineLevel" => st.engine = clamp_index(d, 128) as u8,
+                    "Audio.SpeechLevel" => st.speech = clamp_index(d, 128) as u8,
+                    "Audio.AmbientLevel" => st.ambient = clamp_index(d, 128) as u8,
+                    "Audio.Quality" => st.audio_quality = clamp_index(d, 4) as u8,
+                    "Graphics.ViewDistance" => st.view_distance = clamp_index(d, 4) as u8,
+                    "Track1.Laps" => st.laps = laps_from_index(clamp_index(d, 8)),
+                    "Game.NumOpponents" => st.opponents = clamp_index(d, 8),
+                    "Track1.Traffic" => st.traffic = clamp_index(d, 4),
+                    "Game.NumKOOpponents" => st.ko_opponents = clamp_index(d, 7) + KO_OPPONENTS_MIN,
+                    _ => {}
+                }
+                st.options.push((name.clone(), d));
+            }
+            (_, AccessorValue::DeadZone { values, .. }) => {
+                if let Some((axis, k)) = name.split_once('.').and_then(|(a, m)| Some((DEADZONE_AXES.iter().position(|x| *x == a)?, ["Min", "Max"].iter().position(|x| *x == m)?))) {
+                    st.deadzone[axis][k] = values[0];
+                }
+            }
+            _ => {}
+        }
+    }
+    side
+}
+
 /// Write `<dir>/<stem>.sav` and `player.lst`, as `SaveInfo` + `LoadInfo`'s tail do.
+///
+/// `SaveInfo` 0x4DEDA0 first compares the name with the text buffer `[0x5E8E50]` and writes
+/// nothing when they match (0x4DEDB9…0x4DEDF4) — the same "empty name" sentinel the name check
+/// 0x4DE510 uses (`savegame.md` §2.2, MEDIUM that the buffer is empty then). So an empty name
+/// makes no file here either.
 pub fn write_profile(dir: &Path, profile: &Profile, save: &SaveFile) -> std::io::Result<()> {
+    if profile.name.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "SaveInfo refuses the empty name (0x4DEDB9)"));
+    }
     std::fs::create_dir_all(dir)?;
     std::fs::write(profile.path(dir), save.write())?;
     write_player_lst(dir, &profile.stem())
@@ -710,8 +950,19 @@ mod tests {
         let names: Vec<String> = list_profiles(&dir).iter().map(|p| p.name.clone()).collect();
         assert_eq!(names, ["Anna", "Mike", "Zoe"], "the template is hidden and the digit does not order");
         assert!(name_taken(&dir, "Anna"), "the name is taken whatever the digit");
+        // 0x4DF090 tests `cFileName`, `.sav` included: 95 + 4 = 99 is listed, 96 + 4 = 100 is not
+        let (ok, long) = (format!("1{}", "a".repeat(94)), format!("2{}", "b".repeat(95)));
+        std::fs::write(dir.join(format!("{ok}.sav")), []).unwrap();
+        std::fs::write(dir.join(format!("{long}.sav")), []).unwrap();
+        let listed = list_profiles(&dir);
+        assert!(listed.iter().any(|p| p.stem() == ok));
+        assert!(!listed.iter().any(|p| p.stem() == long));
+        std::fs::remove_file(dir.join(format!("{ok}.sav"))).unwrap();
+        std::fs::remove_file(dir.join(format!("{long}.sav"))).unwrap();
         assert!(!name_taken(&dir, "Otto"));
         assert!(name_taken(&dir, ""), "the empty name is rejected");
+        assert!(write_profile(&dir, &Profile::new("", 0), &SaveFile::default()).is_err(), "SaveInfo writes no nameless profile");
+        assert!(!dir.join("0.sav").exists());
         write_player_lst(&dir, "4Mike").unwrap();
         assert_eq!(read_player_lst(&dir).as_deref(), Some("4Mike"));
         delete_profile(&dir, &Profile::new("Mike", 4)).unwrap();

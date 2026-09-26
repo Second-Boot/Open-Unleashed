@@ -23,13 +23,13 @@ fn run(track: &str, seed: u32) -> Option<(SliceTable, TrafficSet, u64)> {
         if tick % 2 == 0 {
             p = (p + 1) % table.lap_len;
             let slice = table.route[p];
-            let r = Reference { position: table.slices[slice].centre, slice, laps: 0, speed: 30.0, dir: 1.0 };
+            let r = Reference { position: table.slices[slice].centre, slice, laps: 0, speed: 30.0, dir: 1.0, honking: false };
             // the even tick as `GameTick` 0x414FF0 runs it: the AI pass, the trackers (Sc32
             // priority 6, `car+0x78` from 0x417190 — the reference is the only racer here), then
             // the drive (priority 0x1E)
             set.ai(&table, tick, r, &[]);
             set.track_racers(&[r.position]);
-            set.drive(&table, tick, r);
+            set.drive(&table, tick, r, None, &[]);
         }
         set.integrate(&table, 1.0 / 64.0);
         if tick >= 15_000 && set.cars.iter().any(|c| c.active) {

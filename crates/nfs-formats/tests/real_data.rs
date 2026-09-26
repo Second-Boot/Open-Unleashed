@@ -657,3 +657,43 @@ fn mad_frames_consume_their_payload() {
     }
     assert!(files >= 10, "expected the twelve shipped movies, found {files}");
 }
+
+/// Track B's field 5 (`+0x18`, 0x45D000 → 0x45A560 / 0x45A8E0): 0 on every shipped track but
+/// Autobahn, whose keys run 1.0 at slice 0…171, 0 from 172, 0.495 from 180.
+#[test]
+fn sky_bin_track_b_field_5() {
+    let Some(r) = game_root() else { return };
+    let dir = r.join("GameData/Track/Sky");
+    let Ok(d) = std::fs::read(dir.join("Autobahn.bin")) else { return };
+    let s = nfs_formats::sky::SkyBin::parse(&d).unwrap();
+    assert!(s.track_b.windows(2).all(|w| w[0].0 < w[1].0), "keys ascend");
+    let lap = 3000;
+    assert_eq!(s.sample_track_b(5, 0, lap), 1.0);
+    assert_eq!(s.sample_track_b(5, 171, lap), 1.0);
+    assert_eq!(s.sample_track_b(5, 172, lap), 0.0);
+    assert!((s.sample_track_b(5, 180, lap) - 0.495).abs() < 1e-6);
+    // between 172 (0) and 179 (0), then 179 → 180 rises
+    assert_eq!(s.sample_track_b(5, 175, lap), 0.0);
+    for name in ["Coastal.bin", "alps.bin", "Monaco1.bin", "Forest.bin", "Canyon.bin"] {
+        let Ok(d) = std::fs::read(dir.join(name)) else { continue };
+        let s = nfs_formats::sky::SkyBin::parse(&d).unwrap();
+        for slice in (0..3000).step_by(37) {
+            assert_eq!(s.sample_track_b(5, slice, 3000), 0.0, "{name} {slice}");
+        }
+    }
+}
+
+/// The start-up movies' sound (`RE/notes/mad.md` §12): the `SC**` chunks of a `.mad` are one
+/// `SCHl` stream — 2 channels at 22050 Hz, EA-XA — and decode to the header's 0x85 total.
+#[test]
+fn mad_audio_track_decodes() {
+    let root = need_game!();
+    let dir = root.join("FEData").join("Movies");
+    for (name, frames) in [("EArts-av.mad", 0x01_031E), ("inPC-av.mad", 0x2E_F824)] {
+        let Ok(d) = std::fs::read(dir.join(name)) else { continue };
+        let track = nfs_formats::mad::audio_track(&d);
+        let pcm = nfs_formats::schl::decode_all(&track).expect("SCHl");
+        assert_eq!((pcm.channels, pcm.rate), (2, 22050), "{name}");
+        assert_eq!(pcm.samples.len() / 2, frames, "{name}");
+    }
+}

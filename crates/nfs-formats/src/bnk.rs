@@ -150,6 +150,12 @@ pub struct PcmSample {
     /// `voice+0x66`: code 0x0A · 100 cents (0x590604) — how far the caller's **bend byte** moves
     /// the pitch: `(byte − 0x40) · bend_cents >> 6` cents (0x589F75…0x589F90).
     pub bend_cents: i32,
+    /// `voice+0x44`: code 0x13, default 0 (0x599188 clears its bucket, `[esp+0x74]`) — the patch's
+    /// **effect send**. 0x589D70 multiplies it by `voice+0x45` and by each environment bus level
+    /// (`[0x6B4A0C]` / `[0x6B4A0D]`, set by 0x565CD0 — the reverb of `engine-audio.md` §4.7) over
+    /// 127·127 into the voice's two send bytes `+0x46` / `+0x47`, which the driver is handed
+    /// (0x58A43E / 0x58A45A). A patch without it is never in the reverb.
+    pub fx_send: u8,
 }
 
 impl PcmSample {
@@ -238,6 +244,10 @@ impl PtHeader {
     /// Code 0x11, default 0 — cents.
     pub fn pitch_spread(&self) -> u32 {
         self.param(0x11, 0)
+    }
+    /// Code 0x13, default 0: the effect send (`PcmSample::fx_send`, 0x5906CA → `voice+0x44`).
+    pub fn fx_send(&self) -> u8 {
+        self.param(0x13, 0).min(127) as u8
     }
     /// Code 0x06: the priority the voice allocator 0x5898F0 is given.
     pub fn priority(&self) -> u32 {
@@ -444,6 +454,7 @@ impl PtHeader {
             padded_tail: padded_tail as u32,
             gain: self.patch_volume().min(127) as f32 / 127.0,
             bend_cents: self.coarse_tune() as u8 as i8 as i32 * 100,
+            fx_send: self.fx_send(),
         })
     }
 }

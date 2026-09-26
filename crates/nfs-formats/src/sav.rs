@@ -10,7 +10,7 @@
 //! Nine modules contribute bytes; `TrackRecords` contributes none (its save fn writes
 //! `SaveData\nfs5.trk` as a side effect and its load fn is `mov al,1; ret`). The optional trailing
 //! `"accessor\0" u32 len` block holds the front-end accessors — options, selections, the chronicle
-//! year — in `std::map` (byte-wise `strcmp`) order. All 221 registered names and the class that
+//! year — in `std::map` (byte-wise `strcmp`) order. All 220 statically registered names and the class that
 //! serialises each one are in [`ACCESSORS`] (`savegame.md` §6.2a), so the block is fully typed
 //! here: [`AccessorBlock`] parses and writes it, and a *subset* is legal because the original looks
 //! every name up in its own registry and anything absent keeps its default (§9.6).
@@ -154,7 +154,8 @@ pub struct SavedPart {
 /// `OpponentCar.Car` accessor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SavedCar {
-    /// The 0x758-byte FE car object verbatim; it begins with the 1648-byte `nfs5.car` record.
+    /// The 0x758-byte FE car object verbatim: `+0x00` an instance dword, then the 1648-byte
+    /// `nfs5.car` record at `+0x04` (`FECar::init` 0x4EEBDA `lea edi, [ebp+4]`).
     pub image: Vec<u8>,
     /// `car+0x75C` — written first: the car's **stock** parts (0x4EE9A0; `controls.md` §4.169.6
     /// corrects `career.md` §10's "spare/removed list"). The field keeps its old name.
@@ -209,9 +210,9 @@ impl SavedCar {
         }
         self.image[off] = v;
     }
-    /// `nfs5.car` record id at `car+0x00`.
+    /// `nfs5.car` record id, the record's first word at `car+0x04` (0x4EEBDA).
     pub fn car_id(&self) -> u16 {
-        self.image.get(0..2).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(0)
+        self.image.get(4..6).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(0)
     }
 }
 
@@ -529,7 +530,7 @@ pub enum AccessorKind {
 /// ascending order the `std::map` at `[0x65B3A8]` keeps them in, which is the order the block must
 /// be written in. Extracted from the image: each name's push site names its constructor, the
 /// constructor's vtable store names the class through its RTTI descriptor (`savegame.md` §6.2a).
-pub const ACCESSORS: [(&str, AccessorKind); 221] = [
+pub const ACCESSORS: [(&str, AccessorKind); 220] = [
     ("ABOOL", AccessorKind::Dword), // FEBoolAccessor
     ("ANINTEGER", AccessorKind::Dword), // FEIntAccessor
     ("ANOTHER", AccessorKind::Text), // FEStringAccessor
@@ -734,7 +735,6 @@ pub const ACCESSORS: [(&str, AccessorKind); 221] = [
     ("Track7.Laps", AccessorKind::Dword), // FELocalizedTextAccessor
     ("Track7.Track", AccessorKind::Dword), // FETrackAccessor
     ("Track7.Traffic", AccessorKind::Dword), // FELocalizedTextAccessor
-    ("UVWj", AccessorKind::Dword), // FETournyAccessor
     ("UsedCar.Car", AccessorKind::OwnedCarSel), // FEOwnedCarAccessor
     ("UserList.NameInput", AccessorKind::Text), // FEStringAccessor
     ("UserList.UserList", AccessorKind::CharVect), // FESpecialUserListCharVectAccessor
@@ -754,9 +754,40 @@ pub const ACCESSORS: [(&str, AccessorKind); 221] = [
 ];
 
 /// The class that backs `name` (the `(MODIFIER)` suffix a layout may add is not part of the key).
+///
+/// Besides the static set, two slider widget classes register one accessor each when they are
+/// built, named after the widget: `sprintf("%s.SliderBar", widget)` (0x4C2BEF, an `FEIntAccessor`
+/// through 0x4BA310) and `sprintf("%s.Sliderbar", widget)` (0x4C50B0, an `FEPositionableAccessor`
+/// through 0x4BC1F0). Both go through the base constructor's map insert, so a save the original
+/// makes while such a widget exists carries them — each a plain dword (0x4BC460).
 pub fn accessor_kind(name: &str) -> Option<AccessorKind> {
+    if name.ends_with(".SliderBar") || name.ends_with(".Sliderbar") {
+        return Some(AccessorKind::Dword);
+    }
     let key = name.split_once('(').map(|(b, _)| b.trim()).unwrap_or(name);
     ACCESSORS.iter().find(|(n, _)| *n == key).map(|(_, k)| *k)
+}
+
+/// Whether a `FECharVectAccessor`-class entry writes its list (`u32 n`, `n × char[] NUL`, then the
+/// selection) or only the selection. Save 0x4B8D70 / Load 0x4B8E00 test `this+0x34`, which the
+/// constructor 0x4B8990 stores from its **third argument** (0x4B89CE) and nothing else writes.
+/// The eight constructions push (CONFIRMED, 2026-09-26):
+///
+/// | accessor | site | `+0x34` |
+/// |---|---|---|
+/// | `Comms.IPList` | 0x50B8BE | 0 — owns its list |
+/// | `Comms.PhoneList` | 0x50B920 | 0 — owns its list |
+/// | `Comms.ModemList` | 0x50BB88 | 1 |
+/// | `Replay.List` | 0x4E5DF7 | 1 |
+/// | `Controller.AllControllers` / `Controller.AllPads` | 0x51E4A3 / 0x51E4D6 | 1 |
+/// | `UserList.UserList` (`FESpecialUserListCharVectAccessor`) | 0x4B8F8F | 1 |
+/// | `Graphics.Resolutions` (`FEScreenResolutionAccessor`) | 0x4BC723 | 1 |
+///
+/// *(Until 2026-09-26 the reader guessed the shape from the bytes — a plausible count followed by
+/// that many strings — and read a selection-only entry whose selection is small, `Replay.List` = 0
+/// say, as an empty list, taking the next entry's name as its selection and desyncing the rest.)*
+pub fn char_vect_owns_list(name: &str) -> bool {
+    matches!(name, "Comms.IPList" | "Comms.PhoneList")
 }
 
 /// One accessor's stored value.
@@ -811,26 +842,13 @@ impl AccessorBlock {
                 AccessorKind::Dword => AccessorValue::Dword(r.u32()?),
                 AccessorKind::Text => AccessorValue::Text(r.cstr()?),
                 AccessorKind::CharVect => {
-                    // The writer emits the list only when the accessor owns it; a reader cannot tell
-                    // the two shapes apart from the bytes alone, so the port takes the owning shape
-                    // when the first dword is a plausible count followed by that many strings.
-                    let save = r.pos;
-                    let n = r.u32()? as usize;
-                    let mut items = Vec::new();
-                    let mut ok = n <= 256;
-                    for _ in 0..n {
-                        match r.cstr() {
-                            Ok(s) => items.push(s),
-                            Err(_) => {
-                                ok = false;
-                                break;
-                            }
-                        }
-                    }
-                    if ok && r.pos + 4 <= data.len() {
+                    // The shape is fixed per accessor by its constructor's `+0x34` (see
+                    // [`char_vect_owns_list`]), exactly as the original's Load 0x4B8E00 decides.
+                    if char_vect_owns_list(&name) {
+                        let n = r.u32()? as usize;
+                        let items = (0..n).map(|_| r.cstr()).collect::<Result<Vec<_>, _>>()?;
                         AccessorValue::CharVect { items: Some(items), selection: r.u32()? }
                     } else {
-                        r.pos = save;
                         AccessorValue::CharVect { items: None, selection: r.u32()? }
                     }
                 }
@@ -875,7 +893,9 @@ impl AccessorBlock {
                 AccessorValue::Dword(v) => put_u32(&mut out, *v),
                 AccessorValue::Text(s) => put_cstr(&mut out, s),
                 AccessorValue::CharVect { items, selection } => {
-                    if let Some(items) = items {
+                    // the shape is the accessor's, not the value's (0x4B8D70 tests `+0x34`)
+                    if char_vect_owns_list(name) {
+                        let items = items.as_deref().unwrap_or(&[]);
                         put_u32(&mut out, items.len() as u32);
                         for i in items {
                             put_cstr(&mut out, i);
@@ -965,9 +985,10 @@ mod tests {
 
     #[test]
     fn the_accessor_table_matches_the_registry() {
-        // 221 names, byte-wise ascending — the order the original's std::map keeps and the writer
+        // 220 names, byte-wise ascending — the order the original's std::map keeps and the writer
         // has to reproduce.
-        assert_eq!(ACCESSORS.len(), 221);
+        assert_eq!(ACCESSORS.len(), 220);
+        assert_eq!(accessor_kind("UVWj"), None, "0x4FD0FF pushes a callback, not a name");
         for w in ACCESSORS.windows(2) {
             assert!(w[0].0.as_bytes() < w[1].0.as_bytes(), "{} !< {}", w[0].0, w[1].0);
         }
@@ -984,6 +1005,9 @@ mod tests {
             assert_eq!(accessor_kind(n), Some(AccessorKind::Empty), "{n}");
         }
         assert_eq!(accessor_kind("Nonsense.Accessor"), None);
+        // the per-widget slider accessors (0x4C2BEF / 0x4C50B0) carry one dword
+        assert_eq!(accessor_kind("NFS5.MUSICSLIDER.SliderBar"), Some(AccessorKind::Dword));
+        assert_eq!(accessor_kind("NFS5.GAMMA.Sliderbar"), Some(AccessorKind::Dword));
     }
 
     #[test]
@@ -994,7 +1018,8 @@ mod tests {
                 ("Comms.ChatInput".into(), AccessorValue::Text("hello".into())),
                 ("Comms.Data".into(), AccessorValue::Empty),
                 ("Controller.Brake".into(), AccessorValue::ControllerInput([9, 8, 7, 6, 5, 4])),
-                ("Graphics.Resolutions".into(), AccessorValue::CharVect { items: Some(vec!["640x480".into(), "800x600".into()]), selection: 1 }),
+                ("Comms.IPList".into(), AccessorValue::CharVect { items: Some(vec!["10.0.0.1".into(), "10.0.0.2".into()]), selection: 1 }),
+                ("Graphics.Resolutions".into(), AccessorValue::CharVect { items: None, selection: 2 }),
                 ("OwnedCar.IntColour".into(), AccessorValue::Colour { selection: 3, rgba: 0x11223344 }),
                 ("OwnedCars.Car".into(), AccessorValue::OwnedCarSel { cars: 4, selection: 2 }),
                 ("XAxis.Min".into(), AccessorValue::DeadZone { selection: 1, values: [7; 16] }),
@@ -1013,6 +1038,61 @@ mod tests {
         // and the writer refuses to emit one, because it would desync everything after it
         let skipped = AccessorBlock { entries: vec![("Nonsense".into(), AccessorValue::Dword(1)), ("Chronicle.Year".into(), AccessorValue::Dword(2))] };
         assert_eq!(AccessorBlock::parse(&skipped.write()).unwrap().entries.len(), 1);
+    }
+
+    /// A selection-only list accessor whose selection is 0 is followed by the next name at once;
+    /// the shape comes from the constructor's `+0x34`, not from the bytes (0x4B8E00).
+    #[test]
+    fn a_selection_only_list_does_not_swallow_the_next_entry() {
+        let mut bytes = b"Replay.List\0".to_vec();
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(b"RideHeight\0");
+        bytes.extend_from_slice(&1.5f32.to_bits().to_le_bytes());
+        let b = AccessorBlock::parse(&bytes).expect("parse");
+        assert_eq!(
+            b.entries,
+            vec![("Replay.List".into(), AccessorValue::CharVect { items: None, selection: 0 }), ("RideHeight".into(), AccessorValue::Dword(1.5f32.to_bits()))]
+        );
+        assert_eq!(b.write(), bytes);
+        assert!(char_vect_owns_list("Comms.IPList") && char_vect_owns_list("Comms.PhoneList"));
+        for n in ["Comms.ModemList", "Replay.List", "Controller.AllControllers", "Controller.AllPads", "UserList.UserList", "Graphics.Resolutions"] {
+            assert!(!char_vect_owns_list(n), "{n}");
+        }
+    }
+
+    /// A file shaped the way `SaveInfo` 0x4DEDA0 lays one out — all nine modules in the save
+    /// list's order and an accessor block holding every payload class of §6.1, including the
+    /// selection-only lists and a per-widget slider accessor — parses and re-writes byte for byte.
+    #[test]
+    fn an_original_shaped_file_round_trips_byte_for_byte() {
+        let mut s = sample();
+        let mut opp = SavedCar::new(vec![5u8; FE_CAR_IMAGE]);
+        opp.installed = vec![SavedPart { id: 3, state: 0.0 }];
+        s.accessors = Some(AccessorBlock {
+            entries: vec![
+                ("Audio.MusicLevel".into(), AccessorValue::Dword(100)),
+                ("Chronicle.Year".into(), AccessorValue::Dword(1962)),
+                ("Comms.IPList".into(), AccessorValue::CharVect { items: Some(vec!["1.2.3.4".into()]), selection: 0 }),
+                ("Comms.ModemList".into(), AccessorValue::CharVect { items: None, selection: 0 }),
+                ("Comms.PhoneList".into(), AccessorValue::CharVect { items: Some(vec![]), selection: 0 }),
+                ("Controller.AllPads".into(), AccessorValue::CharVect { items: None, selection: 1 }),
+                ("Controller.Brake".into(), AccessorValue::ControllerInput([3, 0, 0x1F, 0, 0, 0])),
+                ("DealerCar.IntColour".into(), AccessorValue::Colour { selection: 0, rgba: 0xFF00FF00 }),
+                ("Factory.Data".into(), AccessorValue::Empty),
+                ("Graphics.Resolutions".into(), AccessorValue::CharVect { items: None, selection: 3 }),
+                ("NFS5.MUSIC.SliderBar".into(), AccessorValue::Dword(64)),
+                ("OpponentCar.Car".into(), AccessorValue::OpponentCars { selection: 2, cars: vec![opp.clone(); 7] }),
+                ("OwnedCars.Car".into(), AccessorValue::OwnedCarSel { cars: 1, selection: 0 }),
+                ("Replay.List".into(), AccessorValue::CharVect { items: None, selection: 0 }),
+                ("UserList.NameInput".into(), AccessorValue::Text("Hans".into())),
+                ("UserList.UserList".into(), AccessorValue::CharVect { items: None, selection: 0 }),
+                ("XAxis.Min".into(), AccessorValue::DeadZone { selection: 0, values: [0; 16] }),
+            ],
+        });
+        let bytes = s.write();
+        let back = SaveFile::parse(&bytes).expect("parse");
+        assert_eq!(back.accessors.as_ref().unwrap().entries.len(), 17);
+        assert_eq!(back.write(), bytes);
     }
 
     #[test]
@@ -1067,5 +1147,10 @@ mod tests {
         assert_eq!(car.installed[1].id, -1, "part ids are sign-extended i16");
         assert_eq!(car.field_u32(0x698), 6000);
         assert_eq!(car.field_u8(0x6A0), 1);
+        // the record sits after the instance dword
+        let mut c = SavedCar::new(vec![0u8; FE_CAR_IMAGE]);
+        c.set_field_u32(0, 3);
+        c.image[4..6].copy_from_slice(&993u16.to_le_bytes());
+        assert_eq!(c.car_id(), 993);
     }
 }

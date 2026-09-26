@@ -1,19 +1,22 @@
 //! Trackside cameras and the triggers that switch them — `RE/notes/race-logic.md` §3.3.
 //!
-//! A `<track>_cameras.scn` is pairs of `CAMERA_ELEMENT` and `TRIGGER_ELEMENT`. Every tick
-//! `0x413B80` tests every trigger against every car; when a car enters one whose `+0xDC` camera
-//! link differs from the one it already has, that becomes the car's camera (`car+0x10E4`), and for
-//! the car the player is watching (`[0x606858]`) `0x413960(link)` switches the view:
+//! A `<track>_cameras.scn` is pairs of `CAMERA_ELEMENT` and `TRIGGER_ELEMENT`. The sweep
+//! `0x413B80(flag)` runs `CTriggerElem::test` 0x4704E0 for every type-6 trigger against every car;
+//! when a car passes one whose `+0xDC` camera link differs from the one it already has, that
+//! becomes the car's camera (`car+0x10E4`), and — only with `flag` set — for the car the player is
+//! watching (`[0x606858]`) `0x413960(link)` switches the view:
 //!
 //! ```text
-//! cam = 0x46D980(link)                    ; the camera element with that index
+//! cam = 0x46D980(link)                    ; the camera element at that element index
 //! if !cam->+0x7C: keep the eye, reset the zoom (0x413A86)   ; "disabled"
 //! else setView(0, cam->+0x78)             ; the camera's own view id (12 in the shipped files)
 //!      if cam->+0x8C: camera position = cam->vt[0x38]()   ; 0x627EA4…
 //! ```
 //!
-//! The port keeps the same table and the same crossing test, and the app uses the current camera's
-//! position and field of view for its trackside view.
+//! The sweep has three callers, all with `flag = ([0x606850] == 0x14)`, the TV camera chosen:
+//! the camera dispatcher 0x463C30 while a replay plays (`[0x5E99F4] >= 2`, 0x463E14…0x463E28) or,
+//! in a linked network session, when its `+0xBD` is set (0x463E36…0x463E60), and the replay's
+//! input playback (0x414620…0x41463D). A live single-player race never runs it.
 
 use glam::Vec3;
 use nfs_formats::scn::{ElementKind, Scene, SceneElement};
@@ -54,6 +57,11 @@ pub struct TrackCamera {
     /// `+0xA0` (line 5's last float, 0.6 in the sample): the switch stores it in the slot's `+0xCC`
     /// (0x413B42…0x413B47) — SplineCam's pace
     pub pace: f32,
+    /// `+0xC0` (line 5's fifth integer, accessor 0x469B50): the replay's opening camera — 1 on the
+    /// one camera a forward race opens on, 2 on the one a backwards race opens on
+    /// (0x46D890); 0 on the other 688 shipped cameras, and every track has one of each but monaco2
+    /// (no 1) and skidpad (no 2)
+    pub opening: i32,
     /// `+0xB4` (line 6), copied by vt 0x469B20 into the slot's `+0x60…+0x68` (0x413B4D…0x413B6D) —
     /// SplineCam's offset along the slice's lateral / up / forward axes
     pub spline_offset: Vec3,
@@ -228,7 +236,15 @@ pub struct CameraTrigger {
     pub radius: f32,
     pub p1: Vec3,
     pub p2: Vec3,
-    /// `+0xDC`, the camera element this trigger switches to
+    /// `+0xBC`, the direction of travel 0x4704E0 wants (zero = any)
+    pub velocity_dir: Vec3,
+    /// `+0xC8`, the heading 0x4704E0 wants (zero = any)
+    pub heading: Vec3,
+    /// `+0x90` / `+0x94`, the speed window
+    pub speed_min: f32,
+    pub speed_max: f32,
+    /// `+0xDC`, the **element index** (in the scene file, re-based by the parser 0x46C417…
+    /// 0x46C46A onto the combined list `[0x628168]`) of the camera this trigger switches to
     pub link: usize,
 }
 
@@ -236,7 +252,11 @@ pub struct CameraTrigger {
 pub struct TrackCameras {
     pub cameras: Vec<TrackCamera>,
     pub triggers: Vec<CameraTrigger>,
-    /// the camera the watched car is on (`car+0x10E4`)
+    /// element index → index into `cameras`: 0x46D980(link) is `[0x628168][link]` through
+    /// `__RTDynamicCast` to `CCameraElem` (0x46D987…0x46D99E), so a link to any other class
+    /// answers null
+    by_element: Vec<Option<usize>>,
+    /// the watched car's `car+0x10E4`, the element index of the last link it crossed
     current: Option<usize>,
     /// slot 0 as the switches leave it
     pub tv: TvSlot,
@@ -250,6 +270,7 @@ impl TrackCameras {
     pub fn from_scene(scene: &Scene) -> Self {
         let mut out = Self::default();
         for e in &scene.elements {
+            out.by_element.push(matches!(e.kind, ElementKind::Camera).then_some(out.cameras.len()));
             match e.kind {
                 ElementKind::Camera => out.cameras.push(Self::camera(e)),
                 ElementKind::Trigger => {
@@ -282,6 +303,7 @@ impl TrackCameras {
             fov_flag: p.get(6).is_some_and(|&f| f != 0.0),
             raise: e.params.first().and_then(|l| l.first()).is_some_and(|&f| f != 0.0),
             pace: p.get(8).copied().unwrap_or(0.0),
+            opening: p.get(4).copied().unwrap_or(0.0) as i32,
             spline_offset: e.params.get(2).and_then(|l| Some(Vec3::new(*l.first()?, *l.get(1)?, *l.get(2)?))).unwrap_or(Vec3::ZERO),
             dolly: match (p.get(3), p.get(5)) {
                 (Some(&f), Some(&d0)) if f != 0.0 => Some(d0),
@@ -291,7 +313,6 @@ impl TrackCameras {
     }
 
     fn trigger(e: &SceneElement) -> Option<CameraTrigger> {
-        let p = e.params.first()?;
         // Only **type 6**. The scene manager keeps five separate element vectors and
         // 0x46CB00 fills `[0x628174]` with the triggers whose type accessor 0x46AF50
         // (`return [this+0x7C]`) answers 6 (0x46CC56 `cmp eax, 6`); 0x413B80, the
@@ -300,54 +321,98 @@ impl TrackCameras {
         // instead and can never reach the camera switch. All 1297 shipped type-6
         // triggers live in `<track>_cameras.scn` and they are the only ones carrying a
         // camera link. — race-logic.md §3.3.
-        if p.first().copied().map(|t| t as i32) != Some(6) {
+        CameraTrigger::from_element(e, 6, 11)
+    }
+}
+
+impl CameraTrigger {
+    /// A `TRIGGER_ELEMENT` of type `kind` with its shape and gates, `link` taken from line 4's
+    /// token `link_token` (11 = `+0xDC`, the camera; 9 = `+0xD8`, the element a type-4 audio
+    /// trigger flags — `race-logic.md` §3.2) as a **file-local** element index; `None` for another
+    /// type or a negative link.
+    pub fn from_element(e: &SceneElement, kind: i32, link_token: usize) -> Option<CameraTrigger> {
+        let p = e.params.first()?;
+        if p.first().copied().map(|t| t as i32) != Some(kind) {
             return None;
         }
-        let link = p.get(11).copied().filter(|l| *l >= 0.0)? as usize;
+        let link = p.get(link_token).copied().filter(|l| *l >= 0.0)? as usize;
         let ends = e.params.get(1);
+        // line 6: `+0xE4 flag, +0xBC (3), +0xE8 flag, +0xC8 (3)` — the flags are never read
+        let dirs = e.params.get(2);
         Some(CameraTrigger {
             position: Vec3::from(e.position),
             shape: p.get(1).copied().unwrap_or(1.0) as u8,
             radius: p.get(2).copied().unwrap_or(1.0),
             p1: ends.and_then(|l| v3(l, 0)).unwrap_or(Vec3::from(e.position)),
             p2: ends.and_then(|l| v3(l, 3)).unwrap_or(Vec3::from(e.position)),
+            velocity_dir: dirs.and_then(|l| v3(l, 1)).unwrap_or(Vec3::ZERO),
+            heading: dirs.and_then(|l| v3(l, 5)).unwrap_or(Vec3::ZERO),
+            speed_min: p.get(5).copied().unwrap_or(0.0),
+            speed_max: p.get(6).copied().unwrap_or(200.0),
             link,
         })
+    }
+}
+
+impl TrackCameras {
+    /// 0x46D980(link): the camera element at that element index, `None` for any other class.
+    pub fn camera_at(&self, element: usize) -> Option<&TrackCamera> {
+        self.by_element.get(element).copied().flatten().and_then(|i| self.cameras.get(i))
+    }
+
+    /// 0x46D890: the element index of the first camera (in element order) whose `+0xC0` is 1 in a
+    /// forward race or 2 in a backwards one (`REVERSE [0x657430]`, 0x46D8C7…0x46D8EF); failing
+    /// that the first camera element at all (0x46D900…0x46D947); failing that 0.
+    pub fn opening(&self, reverse: bool) -> usize {
+        let want = if reverse { 2 } else { 1 };
+        let cams = || self.by_element.iter().enumerate().filter_map(|(e, c)| Some((e, (*c)?)));
+        cams()
+            .find(|&(_, c)| self.cameras[c].opening == want)
+            .or_else(|| cams().next())
+            .map_or(0, |(e, _)| e)
+    }
+
+    /// The camera part of `Replay_startRace` 0x413EA0 when a replay starts to play and the track
+    /// has camera elements (0x46D960): every car's `car+0x10E4 = 0x46D890()` and 0x413960 on it
+    /// (0x413F08…0x413F37), then `[0x606850] = 0x14`. Not in a factory-driver replay
+    /// (`FEGAME_TYPE [0x6573E8] == 9`), which sets view 0x0A instead (0x413F46) — the caller's test.
+    pub fn open_replay(&mut self, reverse: bool) {
+        let e = self.opening(reverse);
+        self.current = Some(e);
+        if let Some(c) = self.camera_at(e).copied() {
+            self.tv.switch(&c);
+        }
     }
 
     /// The camera the watched car is on, if any has been reached.
     pub fn current(&self) -> Option<&TrackCamera> {
-        self.current.and_then(|i| self.cameras.get(i))
+        self.current.and_then(|i| self.camera_at(i))
     }
 
+    /// The watched car's `car+0x10E4`: the element index of the last link it crossed.
     pub fn current_index(&self) -> Option<usize> {
         self.current
     }
 
     /// One tick of 0x413B80 for the watched car: returns the camera it switched to, if it changed.
-    ///
-    /// The crossing test is `CTriggerElem::hit` (`race-logic.md` §3.2) with the **motion** segment
-    /// of the car this tick. The original tests two of those, for the car's front corners
-    /// (`car+0x7F8→+0xA44` and `+0x8BC→+0x980`); the port tests the centre's, which differs only
-    /// for a trigger line shorter than the car is wide — and a camera trigger in the shipped scenes
-    /// is 25–40 m long.
-    pub fn update(&mut self, pos: Vec3, prev: Vec3) -> Option<usize> {
+    /// `switch` is the sweep's flag, `[0x606850] == 0x14`: without it the car's `+0x10E4` still
+    /// follows the links (0x413BF4) but 0x413960 is not called (0x413BFA).
+    pub fn update(&mut self, car: &crate::skill::TriggerCar, switch: bool) -> Option<usize> {
         for t in &self.triggers {
-            let hit = if t.shape == 0 {
-                (pos - t.position).length() < t.radius
-            } else {
-                (pos.y - t.position.y).abs() <= 3.5
-                    && (prev.y - t.position.y).abs() <= 3.5
-                    && crate::skill::segments_intersect_xz(prev, pos, t.p1, t.p2)
-            };
-            if !hit || self.current == Some(t.link) {
+            // 0x413BBF: `CTriggerElem::test`, then 0x46EE30 (`+0xDC`) against `car+0x10E4`
+            if !t.test(car) || self.current == Some(t.link) {
                 continue;
             }
-            // a disabled camera still becomes the car's camera and still reaches 0x413960, whose
-            // 0x413A86 path keeps the eye but changes the zoom (`TvSlot::switch`)
+            // `car+0x10E4` takes the link whatever it names; 0x413960 returns at once when
+            // 0x46D980 finds no camera there (0x413975) — two monaco3 triggers link to a trigger
             self.current = Some(t.link);
-            if let Some(c) = self.cameras.get(t.link) {
-                self.tv.switch(c);
+            if !switch {
+                continue;
+            }
+            // a disabled camera still reaches 0x413960, whose 0x413A86 path keeps the eye but
+            // changes the zoom (`TvSlot::switch`)
+            if let Some(c) = self.camera_at(t.link).copied() {
+                self.tv.switch(&c);
                 if c.enabled {
                     return Some(t.link);
                 }
@@ -357,9 +422,76 @@ impl TrackCameras {
     }
 }
 
+impl CameraTrigger {
+    /// `CTriggerElem::test(car)` 0x4704E0, the same routine the skill-test checkpoints run
+    /// (`skill-tests.md` §7): `hit` 0x4706C0 — a sphere (`+0x80 == 0`) while `|car+0x330 −
+    /// position| < +0x84` (0x470928…0x4709A6); a line (`+0x80 == 1`) when the car's diagonal wheel 0
+    /// → wheel 3 (`car+0x7F8`, `+0xA44`) crosses it in x–z (0x489CC0), or failing that wheel 1 →
+    /// wheel 2 (`+0x8BC`, `+0x980`), the first refused outright unless both its ends are within
+    /// 3.5 m (inclusive) of endpoint `+0xA4`'s height (0x4707B2…0x470810) — then the heading
+    /// `dot(+0xC8, car+0x37C) > 0.5` (0x4704FA…0x47056A), the direction of travel
+    /// `dot(+0xBC, normalize(car+0x33C)) > 0.5` (0x470575…0x470662; `(0, 1, 0)` for a car at
+    /// rest), each skipped when its vector is exactly zero, and the speed window
+    /// `car+0x35C + 0.1 > +0x90 && +0x94 + 0.1 > car+0x35C` (0x47066B…0x47069D).
+    ///
+    /// *(Until 2026-09-26 the port tested the car centre's path over the tick against the trigger
+    /// position's height and ran no gate: every shipped camera trigger carries a `+0xBC`, so a car
+    /// driving the wrong way — a backwards race on the forward cameras — switched them too.)*
+    pub fn test(&self, car: &crate::skill::TriggerCar) -> bool {
+        let fired = match self.shape {
+            0 => (car.position - self.position).length() < self.radius,
+            1 => {
+                let near = |y: f32| y + 3.5 >= self.p1.y && y - 3.5 <= self.p1.y;
+                let (w0, w3) = (car.wheels[0], car.wheels[3]);
+                if !near(w0.y) || !near(w3.y) {
+                    return false;
+                }
+                crate::skill::segments_intersect_xz(w0, w3, self.p1, self.p2)
+                    || crate::skill::segments_intersect_xz(car.wheels[1], car.wheels[2], self.p1, self.p2)
+            }
+            _ => false,
+        };
+        if !fired {
+            return false;
+        }
+        if self.heading != Vec3::ZERO && self.heading.dot(car.forward) <= 0.5 {
+            return false;
+        }
+        if self.velocity_dir != Vec3::ZERO {
+            let dir = if car.velocity == Vec3::ZERO { Vec3::Y } else { car.velocity.normalize() };
+            if self.velocity_dir.dot(dir) <= 0.5 {
+                return false;
+            }
+        }
+        car.speed + 0.1 > self.speed_min && self.speed_max + 0.1 > car.speed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_type_4_trigger_links_its_audio_element() {
+        // castle_audio.scn's first type-4 trigger: a line across the road at slice 1591, its
+        // `+0xD8` element 296 ("Bad Dog 1592a"), no gates (line 6 all zero), speeds 0…200
+        let Ok(paths) = nfs_assets::GamePaths::locate() else { return };
+        let Ok(text) = std::fs::read_to_string(paths.game_data().join("Track").join("castle_audio.scn")) else { return };
+        let scene = Scene::parse(&text).unwrap();
+        let t: Vec<CameraTrigger> = scene.elements.iter().filter_map(|e| CameraTrigger::from_element(e, 4, 9)).collect();
+        assert_eq!(t.iter().map(|t| t.link).collect::<Vec<_>>(), [296, 294, 297, 295]);
+        assert!(scene.elements.iter().all(|e| CameraTrigger::from_element(e, 6, 11).is_none()), "no camera links here");
+        // a car at the trigger (on slice 1591, 0.7 m off its centre) heading along the slice, its
+        // diagonals straddling the line
+        let (c, f) = (Vec3::new(-522.2, 39.4, -1526.5), Vec3::new(-0.31, 0.0, -0.95).normalize());
+        let l = Vec3::new(f.z, 0.0, -f.x);
+        let w = |a: f32, b: f32| c + f * a + l * b;
+        let car = crate::skill::TriggerCar { position: c, wheels: [w(1.3, -0.8), w(1.3, 0.8), w(-1.3, -0.8), w(-1.3, 0.8)], forward: f, velocity: f * 20.0, speed: 20.0 };
+        assert!(t[0].test(&car));
+        // 10 m further on it has passed it
+        let car2 = crate::skill::TriggerCar { position: c + f * 10.0, wheels: car.wheels.map(|p| p + f * 10.0), ..car };
+        assert!(!t[0].test(&car2));
+    }
 
     #[test]
     fn tv_eye_lift_ramps_to_the_element_height() {
@@ -372,7 +504,7 @@ mod tests {
 
     #[test]
     fn tv_dolly_holds_the_car_size() {
-        let c = TrackCamera { position: Vec3::ZERO, view: 12, enabled: true, has_position: true, half_angle: 37.5, lift: 0.0, fov_flag: false, fixed_view: None, dolly: Some(5.0), raise: false, pace: 0.0, spline_offset: Vec3::ZERO };
+        let c = TrackCamera { position: Vec3::ZERO, view: 12, enabled: true, has_position: true, half_angle: 37.5, lift: 0.0, fov_flag: false, fixed_view: None, dolly: Some(5.0), raise: false, pace: 0.0, opening: 0, spline_offset: Vec3::ZERO };
         let mut tv = TvSlot::default();
         tv.switch(&c);
         tv.update(3.0); // nearer than +0x40: unchanged
@@ -417,19 +549,60 @@ mod tests {
     }
 
     #[test]
+    fn the_replay_opens_on_the_flagged_camera() {
+        // c1 with `+0xC0` 0, then the sample's own camera (`+0xC0` 2) again as c2 at element 2
+        let two = SAMPLE.replacen("1 1 12 0 2 ", "1 1 12 0 0 ", 1) + &SAMPLE.replace("c1\n", "c2\n");
+        let c = TrackCameras::from_scene(&Scene::parse(&two).unwrap());
+        assert_eq!((c.cameras[0].opening, c.cameras[1].opening), (0, 2));
+        assert_eq!(c.opening(true), 2);
+        // no camera flagged 1: the first camera element
+        assert_eq!(c.opening(false), 0);
+        let mut c = c;
+        c.open_replay(true);
+        assert_eq!(c.current_index(), Some(2));
+        assert_eq!(c.tv.eye, Some(c.cameras[1].position));
+    }
+
+    #[test]
+    fn the_link_is_an_element_index() {
+        // alps_cameras.scn: c1, its trigger (link 0), c2, its trigger (link 2) — 0x46D980 indexes
+        // the element list, so link 2 is c2, the second camera, not the third
+        let two = SAMPLE.replace("Replay Camera Trigger\n", "Replay Camera Trigger\n")
+            + &SAMPLE.replace("c1\n", "c2\n").replace("-1 -1 -1 -1 0 -1", "-1 -1 -1 -1 2 -1").replace("1 1 12 0 2", "1 1 11 0 2");
+        let c = TrackCameras::from_scene(&Scene::parse(&two).unwrap());
+        assert_eq!(c.triggers[1].link, 2);
+        assert_eq!(c.camera_at(2).map(|c| c.view), Some(11));
+        // a link to a trigger answers no camera (monaco3's two)
+        assert_eq!(c.camera_at(1), None);
+    }
+
+    #[test]
     fn crossing_the_line_switches_the_camera() {
         let s = Scene::parse(SAMPLE).unwrap();
         let mut c = TrackCameras::from_scene(&s);
         let t = c.triggers[0];
         let mid = (t.p1 + t.p2) * 0.5;
-        // the crossing direction is the trigger's row 0; step across the line through its middle
-        let across = (t.p2 - t.p1).cross(Vec3::Y).normalize() * 3.0;
-        let (prev, pos) = (mid - across, mid + across);
-        assert_eq!(c.update(pos, prev), Some(0));
+        // a car on the line, its diagonals across it, driving along the trigger's `+0xBC`
+        let fwd = t.velocity_dir;
+        let side = (t.p2 - t.p1).normalize();
+        let car = |dir: Vec3| crate::skill::TriggerCar {
+            position: mid,
+            wheels: [mid + fwd * 1.2 - side * 0.8, mid + fwd * 1.2 + side * 0.8, mid - fwd * 1.2 - side * 0.8, mid - fwd * 1.2 + side * 0.8],
+            forward: dir,
+            velocity: dir * 30.0,
+            speed: 30.0,
+        };
+        // the wrong way: the `+0xBC` gate refuses it
+        assert_eq!(c.update(&car(-fwd), true), None);
+        assert_eq!(c.current_index(), None);
+        // without the flag the car takes the link but the view is not switched
+        assert_eq!(c.update(&car(fwd), false), None);
+        assert_eq!(c.current_index(), Some(0));
+        assert_eq!(c.tv.switches, 0);
+        let mut c = TrackCameras::from_scene(&s);
+        assert_eq!(c.update(&car(fwd), true), Some(0));
         assert_eq!(c.current().map(|c| c.view), Some(12));
         // it does not fire again for the camera it is already on
-        assert_eq!(c.update(pos, prev), None);
-        // and a car standing on the line does not re-fire it
-        assert_eq!(c.update(mid, mid), None);
+        assert_eq!(c.update(&car(fwd), true), None);
     }
 }

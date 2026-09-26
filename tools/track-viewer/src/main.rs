@@ -10,14 +10,15 @@ use anyhow::Result;
 use glam::{Mat4, Vec3};
 use nfs_assets::{track::TrackAssets, GamePaths};
 use nfs_formats::scn::ElementKind;
-use nfs_input::{Action, InputState};
+use nfs_input::InputState;
 use nfs_renderer::{Camera, DrawItem, MaterialDesc, MeshData, Renderer, Scene, TextureData};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 fn summarise(t: &TrackAssets) -> Result<()> {
@@ -60,6 +61,7 @@ struct Viewer {
     yaw: f32,
     pitch: f32,
     input: InputState,
+    keys: HashSet<KeyCode>,
     dragging: bool,
     last: Instant,
 }
@@ -103,7 +105,7 @@ impl Viewer {
                 let tex = m.and_then(|m| tex_ids.get(&m.texture_name()));
                 if tex.is_none() { missing += 1; }
                 let alpha = tex.map(|t| t.1).unwrap_or(false) && m.map(|m| m.render_method != "Opaque").unwrap_or(true);
-                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false })
+                r.create_material(MaterialDesc { texture: tex.map(|t| t.0), alpha_blend: alpha, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, sky_map: false, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false })
             })
         };
         for art in &geometry.world {
@@ -149,7 +151,7 @@ impl Viewer {
             "scene built"
         );
         let grid = r.upload_mesh(&MeshData::grid(50.0, 5.0));
-        let mat = r.create_material(MaterialDesc { texture: None, alpha_blend: false, cull_back: false, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false });
+        let mat = r.create_material(MaterialDesc { texture: None, alpha_blend: false, cull_back: false, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, sky_map: false, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false });
         self.scene.items.push(DrawItem::new(grid, mat, Mat4::from_translation(Vec3::new(start.x, start.y - 0.5, start.z))));
         self.camera.position = start + Vec3::new(0.0, 3.0, 12.0);
         self.camera.target = start;
@@ -166,14 +168,16 @@ impl Viewer {
         }
         let dir = Vec3::new(self.yaw.cos() * self.pitch.cos(), self.pitch.sin(), self.yaw.sin() * self.pitch.cos());
         let right = dir.cross(Vec3::Y).normalize();
-        let speed = if self.input.held(Action::FreeFast) { 120.0 } else { 25.0 } * dt;
+        // the viewer's own free-camera keys (not the game's: `nfs_input`'s map is the race's)
+        let held = |k: KeyCode| self.keys.contains(&k);
+        let speed = if held(KeyCode::ShiftLeft) || held(KeyCode::ShiftRight) { 120.0 } else { 25.0 } * dt;
         let mut p = self.camera.position;
-        if self.input.held(Action::FreeForward) { p += dir * speed; }
-        if self.input.held(Action::FreeBack) { p -= dir * speed; }
-        if self.input.held(Action::FreeRight) { p += right * speed; }
-        if self.input.held(Action::FreeLeft) { p -= right * speed; }
-        if self.input.held(Action::FreeUp) { p += Vec3::Y * speed; }
-        if self.input.held(Action::FreeDown) { p -= Vec3::Y * speed; }
+        if held(KeyCode::KeyW) { p += dir * speed; }
+        if held(KeyCode::KeyS) { p -= dir * speed; }
+        if held(KeyCode::KeyE) { p += right * speed; }
+        if held(KeyCode::KeyQ) { p -= right * speed; }
+        if held(KeyCode::PageUp) { p += Vec3::Y * speed; }
+        if held(KeyCode::PageDown) { p -= Vec3::Y * speed; }
         self.camera.position = p;
         self.camera.target = p + dir;
         self.input.end_tick();
@@ -213,9 +217,18 @@ impl ApplicationHandler for Viewer {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. } => {
-                self.input.key_event(&event);
-                if self.input.take_pressed(Action::Pause) {
-                    event_loop.exit();
+                if let PhysicalKey::Code(k) = event.physical_key {
+                    match event.state {
+                        ElementState::Pressed => {
+                            if matches!(k, KeyCode::Escape | KeyCode::KeyP) {
+                                event_loop.exit();
+                            }
+                            self.keys.insert(k);
+                        }
+                        ElementState::Released => {
+                            self.keys.remove(&k);
+                        }
+                    }
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => self.dragging = state == ElementState::Pressed,
@@ -276,6 +289,7 @@ fn main() -> Result<()> {
         yaw: 0.0,
         pitch: 0.0,
         input: InputState::default(),
+        keys: HashSet::new(),
         dragging: false,
         last: Instant::now(),
     };

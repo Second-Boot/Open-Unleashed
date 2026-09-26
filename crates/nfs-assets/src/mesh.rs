@@ -14,6 +14,13 @@ use std::collections::BTreeMap;
 pub struct MaterialMesh {
     pub material: u16,
     pub mesh: MeshData,
+    /// The `pr` record's flag word (`+2`) — of the group's first part in [`article_meshes`]. The
+    /// static drawer 0x450DE0 files a part into the view's lists by it (0x450F30…0x450F9B,
+    /// `RE/RENDERING.md` "The view's lists").
+    pub flags: u16,
+    /// The `pr` record's sphere centre (`+8`), in the article's frame — the point whose square
+    /// distance from the eye keys the part in those lists (0x450EF8…0x450F25).
+    pub centre: [f32; 3],
 }
 
 /// Convert one article's primitives at the given LOD into per-material meshes.
@@ -25,8 +32,33 @@ pub struct MaterialMesh {
 /// between neighbouring faces, against −0.84 as a fan); 4 = sequential quads of 4 vertices
 /// (signs/billboards, HIGH). Anything else is skipped and counted in `skipped`.
 pub fn article_meshes(art: &ArticleGeometry, lod: u8, skipped: &mut usize) -> Vec<MaterialMesh> {
-    let mut by_mat: BTreeMap<u16, MeshData> = BTreeMap::new();
+    let mut by_mat: BTreeMap<u16, MaterialMesh> = BTreeMap::new();
     for p in art.primitives.iter().filter(|p| p.lod == lod) {
+        let Some(corners) = primitive_corners(p, skipped) else { continue };
+        let mm = by_mat.entry(p.material).or_insert_with(|| MaterialMesh { material: p.material, mesh: MeshData::default(), flags: p.flags, centre: [p.sphere[0], p.sphere[1], p.sphere[2]] });
+        append_primitive(&mut mm.mesh, p, &corners);
+    }
+    by_mat.into_values().collect()
+}
+
+/// One article's primitives at the given LOD as the draw takes them: one mesh per `pr` record, in
+/// the file's order — 0x450DE0 queues each part of the LOD's range on its own, keyed by its own
+/// sphere (0x450EDB…0x450FCF). The primitive types are [`article_meshes`]'s.
+pub fn article_parts(art: &ArticleGeometry, lod: u8, skipped: &mut usize) -> Vec<MaterialMesh> {
+    let mut out = Vec::new();
+    for p in art.primitives.iter().filter(|p| p.lod == lod) {
+        let Some(corners) = primitive_corners(p, skipped) else { continue };
+        let mut mesh = MeshData::default();
+        append_primitive(&mut mesh, p, &corners);
+        out.push(MaterialMesh { material: p.material, mesh, flags: p.flags, centre: [p.sphere[0], p.sphere[1], p.sphere[2]] });
+    }
+    out
+}
+
+/// The corners of a primitive's expanded triangle list (see [`article_meshes`]); `None`, counted
+/// in `skipped`, for a shape the builder does not take.
+fn primitive_corners(p: &Primitive, skipped: &mut usize) -> Option<Vec<usize>> {
+    {
         // corners of the expanded triangle list, each as a position in the primitive's own index
         // arrays (which is also what indexes the per-corner colours)
         // a primitive without index arrays runs one corner per vertex, as many as the colour stream
@@ -47,13 +79,11 @@ pub fn article_meshes(art: &ArticleGeometry, lod: u8, skipped: &mut usize) -> Ve
             }
             _ => {
                 *skipped += 1;
-                continue;
+                return None;
             }
         };
-        let mesh = by_mat.entry(p.material).or_default();
-        append_primitive(mesh, p, &corners);
+        Some(corners)
     }
-    by_mat.into_iter().map(|(material, mesh)| MaterialMesh { material, mesh }).collect()
 }
 
 /// Expand a triangle strip into triangle-list corner positions, keeping the file's winding and

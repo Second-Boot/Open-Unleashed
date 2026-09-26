@@ -92,6 +92,7 @@ impl OpponentChoice {
 /// The front end's own generator, **0x538040** — five 32-bit words plus a counter, rippled together
 /// with carry, seeded by `0x538110(seed)`. It is not the simulation's LCG (`crate::rng`): the FE
 /// seeds this one from `time(NULL)` (0x4E3182) before drawing, so the opponents differ every run.
+#[derive(Debug, Clone)]
 pub struct FeRng {
     /// `[0x5DE910] .. [0x5DE924]`
     s: [u32; 6],

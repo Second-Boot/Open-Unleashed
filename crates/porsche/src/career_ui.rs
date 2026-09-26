@@ -143,12 +143,10 @@ pub struct CareerUi {
     /// The profile the career belongs to: `SaveData/<digit><Name>.sav` (`RE/notes/savegame.md` §2).
     pub profile: Profile,
     pub save_dir: PathBuf,
-    /// A knockout series in progress, for the `.sav`'s `Knockout` module (`modes.md` §5.2).
-    pub knockout: Option<nfs_game::save::KnockoutProgress>,
-    /// `CDPlayer`'s selected music tracks (§4.8).
-    pub playlist: Vec<u32>,
-    /// What the settings screens hold, for the save's accessor block (`savegame.md` §6).
-    pub settings: nfs_game::save::SavedSettings,
+    /// What the `.sav` carries beside the career — the `Knockout`, `Personalities` and
+    /// `CDPlayer` modules and the settings screens' accessors (`savegame.md` §4.5, §4.6, §4.8,
+    /// §6) — as the last load left it and the front end keeps it in step.
+    pub side: nfs_game::save::SaveSide,
 }
 
 impl CareerUi {
@@ -195,9 +193,7 @@ impl CareerUi {
             save_path,
             save_dir: dir,
             profile,
-            knockout: None,
-            playlist: Vec::new(),
-            settings: nfs_game::save::SavedSettings::default(),
+            side: nfs_game::save::SaveSide::default(),
             t_idx: 0,
             car_sel: 0,
             row: 0,
@@ -573,13 +569,16 @@ impl CareerUi {
             self.message = "NOTHING TO REPAIR".into();
             return;
         }
-        match self.career.repair(&self.tables, i, &kinds) {
+        // 0x50F232: the repair total above the money -> one-button 809
+        if self.career.money < cost {
+            self.dialog = Some((809, false));
+            return;
+        }
+        match self.career.repair(&self.tables, i, nfs_game::career::QuickFix::Overall) {
             Ok(paid) => {
                 self.message = format!("REPAIRED FOR ${paid}");
                 self.save();
             }
-            // 0x50F232: the repair total above the money -> one-button 809
-            Err(nfs_game::career::CareerError::NoMoney { .. }) => self.dialog = Some((809, false)),
             Err(e) => self.message = e.to_string().to_uppercase(),
         }
     }
@@ -744,19 +743,40 @@ impl CareerUi {
             tracing::error!(error = %e, "career save failed");
             self.message = format!("SAVE FAILED: {e}");
         }
+        // `Tournament`'s front-end dwords (`save::TournamentFe`): the selected tournament
+        // `[0x691E6C]` is the record's index in the table, and the running pair `[0x5DB768]` /
+        // `[0x5DB76C]` is set only by the tournament launch 0x503940 (0x4D5B4A) — so a mission or a
+        // finale leaves the −1s 0x503A50 put there. The next event `[0x691E7C]` is the front
+        // end's (`Tournament.RemainingTracks`), which keeps it in `side` as it moves.
+        let index_of = |id: i16| self.tables.tournaments.iter().position(|t| t.id == id);
+        if let Some(i) = self.current().and_then(|t| index_of(t.id)) {
+            self.side.tournament.selected = i as u32;
+        }
+        let running = self.pending.as_ref().filter(|p| p.mission.is_none() && !p.finale).and_then(|p| Some((p.event as i32, index_of(p.tournament)? as i32)));
+        (self.side.tournament.current_event, self.side.tournament.current_tournament) = running.unwrap_or((-1, -1));
         // …and the same career in the original's format, so `SaveData/` matches what the game
-        // itself would leave behind (`RE/notes/savegame.md` §3; the accessor block is omitted).
+        // itself would leave behind (`RE/notes/savegame.md` §3).
         let sav = nfs_game::save::career_to_sav_with(
             &self.career,
             &self.tables,
             &self.profile,
-            self.knockout.as_ref(),
-            &self.playlist,
-            &self.settings,
+            &self.side,
         );
         if let Err(e) = nfs_game::save::write_profile(&self.save_dir, &self.profile, &sav) {
             tracing::warn!(error = %e, "writing the .sav profile failed");
         }
+    }
+
+    /// The selected tournament `[0x691E6C]` a loaded save carries (0x5029F0), as this screen's row:
+    /// the record at that index in the table, when the list on show holds it. Returns the event
+    /// row `Tournament.RemainingTracks` is on — the saved next event `[0x691E7C]` among the undone
+    /// ones — or `None` when that event is not an undone one of it.
+    pub fn apply_tournament_fe(&mut self, fe: nfs_game::save::TournamentFe) -> Option<usize> {
+        let id = self.tables.tournaments.get(fe.selected as usize)?.id;
+        let row = self.tournaments().iter().position(|t| t.id == id)?;
+        self.t_idx = row;
+        let t = self.current()?;
+        self.career.undone_events(t).iter().position(|e| *e == fe.next_event as usize)
     }
 
     /// `LoadInfo` 0x4DE9B0 with `autosave = 0` (`RE/notes/savegame.md` §2.4, §3): read
@@ -775,7 +795,9 @@ impl CareerUi {
         };
         self.career = nfs_game::save::career_from_sav(&s, &self.tables);
         self.profile = p.clone();
-        self.knockout = None;
+        // the modules `LoadInfo` hands their own loaders — `Knockout` 0x4DDD60, `Personalities`
+        // 0x4E2CA0, `CDPlayer` 0x4BE170 — and the accessor block 0x4B7FD0
+        self.side = nfs_game::save::side_from_sav(&s);
         if nfs_game::save::write_player_lst(&self.save_dir, &p.stem()).is_err() {
             return false;
         }
@@ -1152,6 +1174,40 @@ impl CareerUi {
         if let Some(i) = self.pending.as_ref().and_then(|p| p.garage_idx) {
             self.career.record_damage(&self.tables, i, zones);
         }
+    }
+
+    /// A race left from the pause menu (`[0x657E34]` set). The front end still runs the race end
+    /// 0x4EDD00 on its way back (0x4D3EEC, before it tests the flag at 0x4D3EF1), and for a
+    /// tournament race (`[0x690AD4] == 4`) that is more than filing nothing: 0x4EDD40 (0x4EDD0E)
+    /// puts the race car's damage — folded into its parts by `Race_finalize(1)`'s 0x493CF0,
+    /// which the quit runs too (0x41574E) — back on the owned car, 0x4EDF00's abort arm
+    /// (0x4EDF11…0x4EDF2D) only resets the current event (0x503A50, 0x503AD0), and 0x4F7DB0 still
+    /// ticks the used-car market with the year (0x4EDD1D…0x4EDD2C). *(Until the audit of
+    /// 2026-09-26 the port dropped the damage and skipped the market.)* Returns whether the race
+    /// was a tournament race.
+    pub fn abort(&mut self, zones: Option<[f32; 10]>) -> bool {
+        let Some(p) = self.pending.take() else { return false };
+        if p.mission.is_some() || p.finale {
+            return false;
+        }
+        if let (Some(i), Some(z)) = (p.garage_idx, zones) {
+            self.career.record_damage(&self.tables, i, z);
+        }
+        // 0x4F7DB0 seeds the front end's generator from the clock (0x5A17EB → 0x538110)
+        let mut seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u32).unwrap_or(1) | 1;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed >> 8
+        };
+        self.career.generate_offers(&self.tables, &mut rand);
+        self.career.reprice_market(&self.tables);
+        self.career.refresh_market(&self.tables, &mut rand);
+        // 0x503AD0 clears the era-changed byte `[0x691E81]` (0x503B01) and files nothing
+        self.race_flags.era_changed = false;
+        self.save();
+        true
     }
 
     pub fn finish(&mut self, order: &[usize], times: &[u64; 8], clean: &[bool; 8]) {
@@ -1551,6 +1607,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `Tournament`'s front-end dwords (`savegame.md` §4.3): the selected tournament `[0x691E6C]`
+    /// is the record's index in the table and comes back as the screen's row; the next event
+    /// `[0x691E7C]` comes back as the `Tournament.RemainingTracks` row that stands for it; the
+    /// running pair is −1 unless a tournament event was launched (0x503940 at 0x4D5B4A).
+    #[test]
+    fn the_tournament_selection_rides_in_the_save() {
+        let Ok(paths) = GamePaths::locate() else {
+            eprintln!("skipping: original game data not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("nfs-tourfe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ui = CareerUi::load(&paths).unwrap();
+        ui.save_dir = dir.clone();
+        ui.save_path = dir.join("career.json");
+        ui.career = Career::default();
+        assert!(ui.tournaments().len() >= 2, "the classic era lists several tournaments");
+        ui.t_idx = 1;
+        let t = ui.current().unwrap().clone();
+        let table_index = ui.tables.tournaments.iter().position(|x| x.id == t.id).unwrap() as u32;
+        ui.side.tournament.next_event = ui.career.remaining_event(&t, 1).unwrap() as u32;
+        ui.save();
+        let sav = nfs_formats::sav::SaveFile::parse(&std::fs::read(ui.profile.path(&dir)).unwrap()).unwrap();
+        let tm = sav.tournament.as_ref().unwrap();
+        assert_eq!(tm.selected, table_index);
+        assert_eq!(tm.remaining_tracks, ui.side.tournament.next_event);
+        assert_eq!((tm.current_event, tm.current_tournament), (-1, -1), "nothing launched");
+        // …and back: the screen's row and the remaining-events row
+        ui.t_idx = 0;
+        let fe = nfs_game::save::side_from_sav(&sav).tournament;
+        assert_eq!(ui.apply_tournament_fe(fe), Some(1));
+        assert_eq!(ui.t_idx, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn first_classic_tournament_flow() {
         let Ok(paths) = GamePaths::locate() else {
@@ -1560,6 +1651,11 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("nfs-career-ui-{}.json", std::process::id()));
         unsafe { std::env::set_var("NFS5_CAREER_SAVE", &tmp) };
         let mut ui = CareerUi::load(&paths).unwrap();
+        // the profile's `.sav` and `player.lst` go to a scratch dir, never the real save dir
+        let dir = std::env::temp_dir().join(format!("nfs-career-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        ui.save_dir = dir.clone();
+        ui.save_path = tmp.clone();
         ui.career = Career::default();
         assert_eq!(ui.career.money, 11_000);
         let list = ui.tournaments();

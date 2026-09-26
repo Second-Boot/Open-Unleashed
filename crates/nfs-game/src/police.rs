@@ -369,6 +369,10 @@ pub fn track_distance(table: &SliceTable, a: usize, b: usize) -> f32 {
     d as f32 * 6.0
 }
 
+/// The cop tests' `.sim` fixture, shared with the traffic tests.
+#[cfg(test)]
+pub(crate) use tests::specs as test_specs;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,12 +408,63 @@ mod tests {
         CopManager::new(CopFile { records: slices.iter().map(|&s| CopRecord::Point { kind: 1, slice: s, moving }).collect() })
     }
 
+    /// A cop's `.sim` for the tests: the 993 Carrera 3.6 values of
+    /// `GameData/Simulation/CarData/993coupe36.sim` (the same fixture `nfs_physics`'s tests use).
+    pub(crate) fn specs() -> CarSpecs {
+        let mut sim = nfs_formats::sim::CarSim {
+            name: "993".into(),
+            mass_kg: 1370.0,
+            wheelbase_mm: 2272.0,
+            unknown_48: 0,
+            induction: 0,
+            gear_count: 6,
+            unknown_54: 6,
+            unknown_58_pct: 90.0,
+            unknown_5c_pct: 0.0,
+            reverse_ratio: -2.857,
+            neutral: 0.0,
+            gear_ratios: [3.818, 2.15, 1.56, 1.242, 1.024, 0.82],
+            final_drive: 3.444,
+            tyre_width_mm: 245.0,
+            tyre_aspect: 45.0,
+            rim_inches: 16.0,
+            top_speed_mph: 168.0,
+            redline_rpm: 6700.0,
+            unknown_98_pct: 20.0,
+            torque_curve: [122.0, 138.0, 150.0, 165.0, 201.0, 209.0, 209.0, 209.0, 224.0, 240.0, 243.0, 240.0, 232.0, 207.0, 161.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            unknown_tail: [0.0; 22],
+        };
+        sim.unknown_tail = [46.0, 1.9, 30.0, 16.5, 0.0, 9.5, 60.0, 1.0, 1.1, 77.5, 75.0, 1.0, 0.0, 110.0, 3.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        CarSpecs::from_sim(&sim, false)
+    }
+
+    /// A cop car of half height `hy` (the box 0x445090 halves) at chase level `level`.
+    fn cop(hy: f32, level: usize) -> CopCar {
+        CopCar::new(0, Vec3::new(0.9, hy, 2.1), &specs(), level)
+    }
+
+    /// A flat drivable square, surface 1, `s` metres to a side.
+    fn flat_grid(s: f32) -> nfs_physics::collision::TriangleGrid {
+        use nfs_physics::collision::{Triangle, TriangleGrid};
+        let (a, b, c, d) = (Vec3::new(-s, 0.0, -s), Vec3::new(s, 0.0, -s), Vec3::new(s, 0.0, s), Vec3::new(-s, 0.0, s));
+        TriangleGrid::build(vec![Triangle::new(a, b, c, 1), Triangle::new(a, c, d, 1)], 100.0)
+    }
+
     /// Test setup: put a just-deployed cop straight into a lit state-4 chase, skipping the two
-    /// ticks (placement, acquire) the original takes to get there.
+    /// ticks (placement, acquire) the original takes to get there. The tracker gets the hardest
+    /// skill's gain 1.0, so its first step reads the target exactly wherever the test puts it; the
+    /// formation slot is the rank-0 slot against the tests' 0.9 × 2.2 m target.
     fn chase_now(p: &mut Police, i: usize) {
         p.cars[i].placed = false;
-        p.build_chase(i);
-        p.cars[i].lights = true;
+        let c = &mut p.cars[i];
+        c.chasing = true;
+        c.parked = false;
+        c.lights = true;
+        c.boost_budget = BOOST_BUDGET[c.level.min(2)];
+        c.tracker = ChaseTracker { k: 1.0, ..Default::default() };
+        c.formation = FORMATION[c.level.min(2)][c.rank.min(5)];
+        c.want_lat = sector(c.formation[0], -0.9, 0.9);
+        c.want_lon = sector(c.formation[2], -2.2, 2.2);
     }
 
     #[test]
@@ -597,7 +652,7 @@ mod tests {
     fn a_chase_gives_up_past_216_metres() {
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 50, moving: true }] };
-        let mut p = Police::new(file, vec![CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 0)], 0, false);
+        let mut p = Police::new(file, vec![cop(0.6, 0)], 0, false);
         assert!(p.deploy(&t, 0, 0, 1000));
         assert!(p.cars[0].active && !p.cars[0].lights && !p.cars[0].chasing, "state 1 places a cop in state 2, unlit");
         chase_now(&mut p, 0);
@@ -619,7 +674,7 @@ mod tests {
     fn a_deployed_cop_stands_on_the_road_with_its_origin_half_the_box_up() {
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 50, moving: false }] };
-        let mut p = Police::new(file, vec![CopCar::new(0, Vec3::new(0.9, 0.63, 2.1), 1500.0, 0)], 0, false);
+        let mut p = Police::new(file, vec![cop(0.63, 0)], 0, false);
         assert!(p.deploy(&t, 0, 0, 1000));
         let c = &p.cars[0];
         let road = t.slices[50].centre.y;
@@ -644,23 +699,144 @@ mod tests {
         let tris = vec![Triangle::new(p0, p1, p2, 1), Triangle::new(p0, p2, p3, 1), Triangle::new(p1, q1, q2, 0), Triangle::new(p1, q2, p2, 0)];
         let grid = TriangleGrid::build(tris, 10.0);
         let t = ring(400);
-        let mut p = Police::new(CopFile { records: vec![] }, vec![CopCar::new(0, Vec3::new(0.9, 0.63, 2.1), 1500.0, 0)], 0, false);
-        let c = &mut p.cars[0];
-        c.active = true;
-        c.position = Vec3::new(30.0, h(30.0) + c.rest_height(), 0.0);
-        c.velocity = Vec3::new(20.0, 0.0, 0.0);
+        let mut p = Police::new(CopFile { records: vec![] }, vec![cop(0.63, 0)], 0, false);
         let n = Vec3::new(-0.1, 1.0, 0.0).normalize();
-        for _ in 0..40 {
-            p.integrate_on(&t, 1.0 / 64.0, Some(&grid));
+        {
+            let c = &mut p.cars[0];
+            c.active = true;
+            // placed on the slope, level with it (as `Car_placeAtSlice` leaves a car), rolling +x
+            let right = Vec3::new(1.0, 0.1, 0.0).normalize();
+            c.orientation = Mat3::from_cols(right, n, Vec3::Z).transpose();
+            c.position = Vec3::new(20.0, h(20.0) + c.rest_height() / n.y, 0.0);
+            c.velocity = right * 20.0;
+            c.sync_body_in();
+            c.body.tracker.seat(&grid, c.position);
+        }
+        // 20 m/s for 1.25 s: 32 Hz ground steps between the 64 Hz moves
+        for k in 0..80 {
+            if k % 2 == 0 {
+                p.ground(&t, &grid, 32 + k);
+            }
+            p.integrate_at(&t, 1.0 / 64.0, true);
             let c = &p.cars[0];
-            assert!(c.orientation.row(1).dot(n) > 0.999, "up {:?} at x {}", c.orientation.row(1), c.position.x);
+            assert!(c.orientation.row(1).dot(n) > 0.99, "up {:?} at x {}", c.orientation.row(1), c.position.x);
         }
         let c = &p.cars[0];
         assert!(c.position.x > 42.0, "ran onto the face: x {}", c.position.x);
         // on the extension of the slope's plane, not on the face (or the old slice-height fallback)
         let want = h(c.position.x) + c.rest_height() / n.y;
-        assert!((c.position.y - want).abs() < 1e-2, "y {} vs {}", c.position.y, want);
-        assert_eq!(c.airborne_count, 0);
+        assert!((c.position.y - want).abs() < 0.05, "y {} vs {}", c.position.y, want);
+        assert_eq!(c.body.airborne_count, 0);
+    }
+
+    /// 0x408750 → `0x40F540(car, 1, 0)`: a cop 35 m outside the road's half-width (or past 115 m/s)
+    /// at the end of its drive tick is put back on its own slice's centre, still, on the patch,
+    /// facing the direction it asked for.
+    #[test]
+    fn the_sanity_net_puts_a_cop_that_left_the_road_back_on_its_slice() {
+        let t = ring(400);
+        let grid = flat_grid(5000.0);
+        let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 10, moving: true }] };
+        let mut p = Police::new(file, vec![cop(0.6, 0)], 0, false);
+        assert!(p.deploy_as(&t, 0, 0, 0, false, Some(&grid)));
+        chase_now(&mut p, 0);
+        let sl = t.slices[10];
+        // 50 m off the road's edge (half-width 11): outside the 35 m net
+        p.cars[0].lateral = 11.0 + 36.0;
+        p.cars[0].position = sl.centre + sl.lateral.normalize() * 47.0 + Vec3::Y * p.cars[0].rest_height();
+        p.cars[0].target_speed = 20.0;
+        p.cars[0].body.knocked_over = true;
+        p.cars[0].body.airborne_count = 3;
+        // the knocked-over exit returns before the net (0x4084C3 precedes 0x4086E6)
+        p.drive(&t, 100, Some(CopWorld { grid: &grid, occupied: &[] }));
+        assert!(p.cars[0].lateral > 40.0);
+        p.cars[0].body.knocked_over = false;
+        p.drive(&t, 102, Some(CopWorld { grid: &grid, occupied: &[] }));
+        let c = &p.cars[0];
+        assert_eq!(c.slice, 10);
+        assert!(c.lateral.abs() < 1e-3, "lateral {}", c.lateral);
+        assert!((c.position - sl.centre).with_y(0.0).length() < 1e-3, "pos {:?}", c.position);
+        assert!((c.position.y - c.rest_height()).abs() < 1e-3, "on the patch: y {}", c.position.y);
+        assert_eq!(c.velocity, Vec3::ZERO);
+        assert_eq!(c.angular_velocity, Vec3::ZERO);
+        assert!(c.orientation.row(2).dot(sl.forward.normalize()) > 0.999);
+        // 0x40F400: `+0x418`, `+0x42C`, `+0x430` cleared
+        assert_eq!(c.body.airborne_count, 0);
+        assert!(!c.body.knocked_over && c.body.impact == 0.0);
+        // a taken slice is skipped (0x40F480): the next free one along the race
+        p.cars[0].lateral = 11.0 + 36.0;
+        p.cars[0].position = sl.centre + sl.lateral.normalize() * 47.0 + Vec3::Y * p.cars[0].rest_height();
+        p.cars[0].target_speed = 20.0;
+        p.drive(&t, 104, Some(CopWorld { grid: &grid, occupied: &[10, 11] }));
+        assert_eq!(p.cars[0].slice, 12);
+    }
+
+    /// 0x4084C3: a cop `Damage` knocked over (`car+0x42C == 1`) only damps by 0.98 until a reset
+    /// clears the flag; and `Damage` itself sets the flag on a car that is not a smackable.
+    #[test]
+    fn a_knocked_over_cop_only_damps_until_it_is_reset() {
+        let t = ring(400);
+        let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 10, moving: true }] };
+        let grid = flat_grid(5000.0);
+        let mut p = Police::new(file, vec![cop(0.6, 0)], 0, false);
+        assert!(p.deploy_as(&t, 0, 0, 0, false, Some(&grid)));
+        // an impact of 100 through `Damage_byNormal` with a wall's flag: `+0x42C = 1`, `+0x418 = 1`,
+        // the countdown 0xC0
+        p.cars[0].body.damage_by_normal(100.0, Vec3::Z, 1, 1370.0);
+        assert!(p.cars[0].body.knocked_over);
+        assert_eq!(p.cars[0].body.airborne_count, 1);
+        assert_eq!(p.cars[0].body.reset_countdown, 0xC0);
+        p.cars[0].velocity = Vec3::new(0.0, 0.0, 10.0);
+        p.cars[0].angular_velocity = Vec3::new(0.0, 0.5, 0.0);
+        p.cars[0].accel_local = Vec3::new(1.0, 0.0, 2.0);
+        p.drive(&t, 100, None);
+        let c = &p.cars[0];
+        assert!((c.velocity - Vec3::new(0.0, 0.0, 9.8)).length() < 1e-5, "{:?}", c.velocity);
+        assert!((c.angular_velocity.y - 0.49).abs() < 1e-5);
+        assert_eq!(c.accel_local, Vec3::ZERO);
+        // the countdown (0x40F740) stops on an upright, alive car — and the cop stays knocked
+        // over: nothing but a reset clears `car+0x42C`
+        p.cars[0].body.cos_tilt = 1.0;
+        p.post_impact(&t, &grid, &[]);
+        assert_eq!(p.cars[0].body.reset_countdown, 0);
+        assert!(p.cars[0].body.knocked_over);
+        // a dead car (`car+0xDB0 == 0`, an impact past 120) runs it down and is reset
+        p.cars[0].body.damage_by_normal(130.0, Vec3::Z, 1, 1370.0);
+        assert_eq!(p.cars[0].body.engine_alive, 0);
+        for _ in 0..0xC0 {
+            p.post_impact(&t, &grid, &[]);
+        }
+        let c = &p.cars[0];
+        assert!(!c.body.knocked_over, "reset by 0x40F540 mode 0");
+        assert_eq!(c.body.engine_alive, 1);
+        assert_eq!(c.velocity, Vec3::ZERO);
+    }
+
+    /// `Car_placeAtSlice` 0x49B090 on the deploy: the trackers are seated on the slice centre and
+    /// the body is dropped by `BodyHeight` against the **patch**, so on a road lying 0.8 m below the
+    /// slice plane the cop is on the road from its first tick, not a metre above it.
+    #[test]
+    fn a_deployed_cop_is_dropped_onto_the_patch_not_the_slice_plane() {
+        use nfs_physics::collision::{Triangle, TriangleGrid};
+        let t = ring(400);
+        let s = 5000.0;
+        let (a, b, c, d) = (Vec3::new(-s, -0.8, -s), Vec3::new(s, -0.8, -s), Vec3::new(s, -0.8, s), Vec3::new(-s, -0.8, s));
+        let grid = TriangleGrid::build(vec![Triangle::new(a, b, c, 1), Triangle::new(a, c, d, 1)], 100.0);
+        let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 50, moving: false }] };
+        let mut p = Police::new(file, vec![cop(0.63, 0)], 0, false);
+        assert!(p.deploy_as(&t, 0, 0, 1000, false, Some(&grid)));
+        let c = &p.cars[0];
+        assert!((c.draw_origin().y - (-0.8 + crate::traffic::RIDE_HEIGHT)).abs() < 1e-3, "model ground {}", c.draw_origin().y);
+        assert!((c.position.y - (-0.8 + crate::traffic::RIDE_HEIGHT + 0.63)).abs() < 1e-3, "origin {}", c.position.y);
+        // and the ground step keeps it there, upright, with the countdown clear
+        for k in 0..16u64 {
+            p.ground(&t, &grid, 1000 + 2 * k);
+            p.integrate_at(&t, 1.0 / 64.0, true);
+            p.integrate_at(&t, 1.0 / 64.0, true);
+        }
+        let c = &p.cars[0];
+        assert!((c.draw_origin().y - (-0.8 + crate::traffic::RIDE_HEIGHT)).abs() < 0.02, "model ground {}", c.draw_origin().y);
+        assert!(c.orientation.row(1).y > 0.999);
     }
 
     /// 0x40854C / 0x4085EC: a cop on its side with `car+0x418 == 0`, or with a zero target speed,
@@ -669,25 +845,25 @@ mod tests {
     fn a_cop_on_its_side_or_without_a_target_speed_is_only_damped() {
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 10, moving: true }] };
-        let mut p = Police::new(file, vec![CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 0)], 0, false);
+        let mut p = Police::new(file, vec![cop(0.6, 0)], 0, false);
         p.deploy(&t, 0, 0, 0);
         let v0 = p.cars[0].velocity;
         p.cars[0].orientation = Mat3::from_rotation_z(1.4) * p.cars[0].orientation;
         p.cars[0].angular_velocity = Vec3::new(0.0, 0.5, 0.0);
-        p.drive(&t, 100);
+        p.drive(&t, 100, None);
         assert!((p.cars[0].velocity - v0 * 0.94).length() < 1e-4);
         assert!((p.cars[0].angular_velocity.y - 0.49).abs() < 1e-5);
         // once hit (`car+0x418` stepped) the tipped car drives again
-        p.cars[0].airborne_count = 1;
+        p.cars[0].body.airborne_count = 1;
         let v1 = p.cars[0].velocity;
-        p.drive(&t, 101);
+        p.drive(&t, 101, None);
         assert!((p.cars[0].velocity - v1 * 0.94).length() > 1e-3);
         // upright again, a zero target speed damps
-        let mut p2 = Police::new(CopFile { records: vec![CopRecord::Point { kind: 1, slice: 10, moving: true }] }, vec![CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 0)], 0, false);
+        let mut p2 = Police::new(CopFile { records: vec![CopRecord::Point { kind: 1, slice: 10, moving: true }] }, vec![cop(0.6, 0)], 0, false);
         p2.deploy(&t, 0, 0, 0);
         p2.cars[0].target_speed = 0.0;
         let v2 = p2.cars[0].velocity;
-        p2.drive(&t, 100);
+        p2.drive(&t, 100, None);
         assert!((p2.cars[0].velocity - v2 * 0.94).length() < 1e-4);
     }
 
@@ -695,7 +871,7 @@ mod tests {
     fn the_dispatch_picks_the_documented_behaviour() {
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 10, moving: true }] };
-        let mut p = Police::new(file, vec![CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 0)], 0, false);
+        let mut p = Police::new(file, vec![cop(0.6, 0)], 0, false);
         p.deploy(&t, 0, 0, 0);
         chase_now(&mut p, 0);
         // a long way behind and not closing: catch up, flat out
@@ -710,8 +886,227 @@ mod tests {
         p.cars[0].speed = 5.0;
         let slow = ChaseTarget { position: t.slices[40].centre, slice: 40, lateral: 0.0, lane: 7, speed: 2.0, half_width: 0.9, half_length: 2.2, finished: false };
         p.update(&t, 101, &slow, &[]);
-        assert!(matches!(p.cars[0].mode, Some(ChaseMode::Pursue { .. })), "{:?}", p.cars[0].mode);
+        // within 80 m and not closing faster than 26.67 m/s: the ram (0x40D0D6…0x40D10D)
+        assert_eq!(p.cars[0].mode, Some(ChaseMode::Pursue { hard: true }));
+        assert_eq!(p.cars[0].aim_point, slow.position, "0x40D9A5: the aim point is the target");
         assert!(p.cars[0].target_speed.abs() < 60.0, "capped to {}", p.cars[0].target_speed);
+        // closing fast, or more than 80 m away: no ram
+        p.cars[0].speed = 40.0;
+        p.update(&t, 102, &slow, &[]);
+        assert_eq!(p.cars[0].mode, Some(ChaseMode::Pursue { hard: false }));
+        assert_eq!(p.cars[0].aim_point, Vec3::ZERO);
+    }
+
+    /// 0x40D09B: CLOSE-QUARTERS is `chase+0x60 · chase+0x64 == 1` — the target's direction of travel
+    /// times the cop's — whichever side of the target the cop is on.
+    #[test]
+    fn close_quarters_needs_both_cars_going_the_same_way_on_either_side() {
+        let t = ring(400);
+        let tgt = ChaseTarget { position: t.slices[40].centre, slice: 40, lateral: 2.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
+        for (lat, cop_v, want) in [(-2.0, 20.0, true), (6.0, 20.0, true), (-2.0, -20.0, false)] {
+            let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 10, moving: true }] };
+            let mut p = Police::new(file, vec![cop(0.6, 0)], 0, false);
+            p.deploy(&t, 0, 0, 0);
+            chase_now(&mut p, 0);
+            p.cars[0].slice = 36;
+            p.cars[0].position = t.slices[36].centre;
+            p.cars[0].lateral = lat;
+            p.cars[0].speed = cop_v;
+            p.update(&t, 200, &tgt, &[]);
+            assert_eq!(p.cars[0].mode == Some(ChaseMode::CloseQuarters), want, "lateral {lat}, speed {cop_v}: {:?}", p.cars[0].mode);
+        }
+    }
+
+    /// 0x403650 / 0x4036F0: the tracker starts on the target's raw values (its lateral difference
+    /// mirrored), then follows by `x += (raw − x)·k` with `k = 0x5CBEDC[SKILL]`; `0x40E920` refines
+    /// the slice gap inside ±12 m by the forward projection.
+    #[test]
+    fn the_chase_tracker_lags_by_the_skill_gain() {
+        let t = ring(400);
+        let mut c = cop(0.6, 2);
+        c.slice = 30;
+        c.position = t.slices[30].centre;
+        c.lateral = 1.0;
+        let tgt = ChaseTarget { position: t.slices[40].centre, slice: 40, lateral: 3.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
+        let mut tr = ChaseTracker::new(&t, TRACKER_GAIN[0], &c, &tgt);
+        assert_eq!((tr.gap, tr.slice, tr.lateral, tr.speed), (60.0, 40, 3.0, 20.0));
+        assert_eq!(tr.lat_diff, -2.0, "0x4036B0: cop − target, the step's sign reversed");
+        let faster = ChaseTarget { speed: 40.0, ..tgt };
+        tr.step(&t, &c, &faster);
+        assert!((tr.speed - 21.0).abs() < 1e-4, "0.05 of the way: {}", tr.speed);
+        assert!((tr.lat_diff - (-2.0 + 0.05 * 4.0)).abs() < 1e-5);
+        assert_eq!(tr.slice, 40, "round(60 / 6) = 10 slices ahead of the cop");
+        let mut exact = ChaseTracker { k: TRACKER_GAIN[2], ..tr };
+        exact.step(&t, &c, &faster);
+        assert_eq!((exact.speed, exact.lateral), (40.0, 3.0));
+        // far: the slice gap; within 12 m: the projection on the cop's slice forward
+        assert_eq!(fine_gap(&t, 30, c.position, 40, tgt.position), -60.0);
+        let near = t.slices[31].centre;
+        let g = fine_gap(&t, 30, c.position, 31, near);
+        assert!(g < 0.0 && (g + 6.0).abs() < 0.1, "about a slice behind: {g}");
+    }
+
+    /// 0x403BD0 / 0x403C00 / 0x403BA0: a claimant enters at the bottom and moves up past holes and
+    /// past cops more than 12 m behind it; a release leaves a hole the others walk up through.
+    #[test]
+    fn the_roster_ranks_with_a_12_metre_hysteresis() {
+        let t = ring(400);
+        let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 10, moving: true }] };
+        let mut p = Police::new(file, (0..3).map(|_| cop(0.6, 2)).collect(), 0, false);
+        for (i, s) in [(0, 50), (1, 51), (2, 60)] {
+            p.cars[i].slice = s;
+            p.cars[i].target = Some(0);
+        }
+        assert_eq!(p.roster_claim(&t, 0), 0, "an empty roster: straight to the top");
+        assert_eq!(p.roster_claim(&t, 1), 1, "6 m ahead of cop 0 is not enough to pass it");
+        assert_eq!(p.roster_claim(&t, 2), 0, "60 m ahead: past both");
+        assert_eq!((p.cars[0].roster_pos, p.cars[1].roster_pos), (1, 2), "each passed cop moved down one");
+        // cop 0 falls back: it never moves down by itself, and cop 1 passes it on its own tick
+        p.cars[0].slice = 40;
+        assert_eq!(p.roster_bubble(&t, 0), 1);
+        assert_eq!(p.roster_bubble(&t, 1), 1);
+        assert_eq!(p.cars[0].roster_pos, 2);
+        // cop 2 lets go: a hole, which cop 1 walks up through whatever the gaps
+        p.release(2);
+        assert_eq!(p.roster_bubble(&t, 1), 0);
+    }
+
+    /// 0x40466B…0x4046CE: the ram mode needs the slot held past `0x5CBEA0[lvl]+0` ticks and the cop
+    /// inside both windows, not just the longitudinal one.
+    #[test]
+    fn the_ram_mode_wants_the_slot_held_and_both_windows() {
+        let t = ring(400);
+        let tgt = ChaseTarget { position: t.slices[40].centre, slice: 40, lateral: 0.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
+        for (held, lat, want) in [(0, 1.0, false), (5, 1.0, true), (5, 19.0, false), (4, 1.0, false)] {
+            let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 10, moving: true }] };
+            let mut p = Police::new(file, vec![cop(0.6, 2)], 0, false);
+            p.deploy(&t, 0, 0, 0);
+            chase_now(&mut p, 0);
+            p.cars[0].slice = 40;
+            p.cars[0].position = t.slices[40].centre;
+            p.cars[0].speed = 20.0;
+            (p.cars[0].slot_ticks, p.cars[0].chase_lat_err, p.cars[0].chase_gap) = (held, lat, 3.0);
+            p.update(&t, 300, &tgt, &[]);
+            assert_eq!(p.cars[0].ram, want, "held {held}, lateral {lat}");
+        }
+    }
+
+    /// 0x403850 / 0x4046D3…0x404719: a cop alongside and just ahead of the target, on a passing
+    /// roll, re-aims at the offset `{0, 0, 0}` and rams for 0x20 ticks; the LCG is stepped whatever.
+    #[test]
+    fn the_nudge_rams_a_cop_alongside_on_a_roll() {
+        assert_eq!((nudge_roll(4, 0), nudge_roll(4, 2031), nudge_roll(4, 2032)), (true, true, false), "thr 31: (r·1000)>>16 < 31");
+        assert!(nudge_roll(8, 4031) && !nudge_roll(8, 4064), "thr 62 at 4 Hz");
+        let t = ring(400);
+        let tgt = ChaseTarget { position: t.slices[40].centre, slice: 40, lateral: 0.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 1.5, finished: false };
+        for (roll, want) in [(0u32, true), (0xFFFF, false)] {
+            let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 10, moving: true }] };
+            let mut p = Police::new(file, vec![cop(0.6, 2)], 0, false);
+            p.deploy(&t, 0, 0, 0);
+            chase_now(&mut p, 0);
+            p.set_wanted(true);
+            let sl = t.slices[41];
+            p.cars[0].slice = 41;
+            p.cars[0].lateral = 2.5;
+            p.cars[0].position = sl.centre + sl.lateral.normalize() * 2.5;
+            p.cars[0].speed = 20.0;
+            let mut steps = 0;
+            p.tick(&t, 300, &tgt, &[], &[], &mut || {
+                steps += 1;
+                roll
+            });
+            assert_eq!(steps, 1, "one LCG step per state-4 tick");
+            assert_eq!(p.cars[0].ram, want);
+            if want {
+                assert_eq!((p.cars[0].formation, p.cars[0].ram_until), ([0.0; 3], 300 + NUDGE_TICKS));
+            }
+        }
+    }
+
+    /// 0x40CD70 / 0x40D642: a chase holds `car+0x1078` / `+0x107C` — 1 m at bias 1 on every tick,
+    /// CLOSE-QUARTERS' aim at 15 — and `0x402790` lets it win only when both body edges' lanes are
+    /// still the vote's argmax with the bias added.
+    #[test]
+    fn a_chase_holds_its_lateral_through_0x402790() {
+        let t = ring(400);
+        let me = LaneSelf { slice: 40, lane: 7, lateral: 0.5, dir: 1.0, speed: 20.0, target_speed: 20.0, half_width: 0.9, half_len: 2.2, is_traffic: false, travelled: 1000.0 };
+        let mut sc = LaneScratch::default();
+        // at 1 m the edges (−0.15, 2.15) fall in lanes 6 and 8 — slots 0 and 2 of a car in lane 7 —
+        // and each wins a level vote with its +1
+        assert!(sc.override_holds(&t, &me, 1.0, 1.0));
+        sc.score = [0.0, 2.0, 0.0];
+        assert!(!sc.override_holds(&t, &me, 1.0, 1.0), "the bias cannot lift a slot past a better one");
+        // 4 m: both edges in lane 8, slot 2
+        sc.score = [0.0, 0.0, 0.0];
+        assert!(sc.override_holds(&t, &me, 4.0, 1.0));
+        sc.score = [0.0, 0.0, -1.0];
+        assert!(!sc.override_holds(&t, &me, 4.0, 1.0), "a tie goes to the lower slot");
+        // the chase writes it
+        let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 10, moving: true }] };
+        let mut p = Police::new(file, vec![cop(0.6, 0)], 0, false);
+        p.deploy(&t, 0, 0, 0);
+        chase_now(&mut p, 0);
+        let tgt = ChaseTarget { position: t.slices[40].centre, slice: 40, lateral: 0.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
+        p.cars[0].slice = 36;
+        p.cars[0].position = t.slices[36].centre;
+        p.cars[0].speed = 20.0;
+        p.update(&t, 200, &tgt, &[]);
+        assert_eq!(p.cars[0].mode, Some(ChaseMode::CloseQuarters));
+        assert_eq!(p.cars[0].lane_bias, 15.0, "CLOSE-QUARTERS aims at bias 15");
+        p.cars[0].slice = 10;
+        p.cars[0].position = t.slices[10].centre;
+        p.update(&t, 204, &tgt, &[]);
+        assert_eq!(p.cars[0].mode, Some(ChaseMode::CatchUp));
+        assert_eq!((p.cars[0].lane_override, p.cars[0].lane_bias), (1.0, 1.0), "0x40CD70's 1 m at bias 1");
+    }
+
+    /// 0x40AF9A…0x40AFEC: the lit target speed stores `car+0x108C = car+0x109C` and the gravity
+    /// scale `car+0x84 = max(car+0x109C, 1)`; a cop starts at `RigidBody_init`'s 1.0.
+    #[test]
+    fn the_lit_target_speed_sets_the_rate_multiplier_and_the_gravity_scale() {
+        let t = ring(400);
+        let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 10, moving: true }] };
+        let mut p = Police::new(file, vec![cop(0.6, 0)], 0, false);
+        assert_eq!((p.cars[0].rate_mul, p.cars[0].body.gravity_scale), (1.0, 1.0));
+        p.deploy(&t, 0, 0, 0);
+        chase_now(&mut p, 0);
+        // far behind: CATCH-UP with the boost on (no human within 20 m)
+        let tgt = ChaseTarget { position: t.slices[40].centre, slice: 40, lateral: 0.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
+        p.cars[0].speed = 20.0;
+        p.update(&t, 200, &tgt, &[]);
+        assert_eq!(p.cars[0].mode, Some(ChaseMode::CatchUp));
+        assert_eq!((p.cars[0].rate_mul, p.cars[0].body.gravity_scale), (BOOST_SPEED, BOOST_SPEED));
+    }
+
+    /// 0x40AFF6…0x40B198 for a cop: the oncoming ladder on the reference car's speed, floored at
+    /// 8.8889 with none of traffic's `car+0xEEC` terms.
+    #[test]
+    fn the_unlit_cop_ladder_floors_at_8_889() {
+        assert_eq!(unlit_target_speed(1.0, 1.0, 60.0), 16.5, "going the race's way");
+        assert_eq!(unlit_target_speed(-1.0, 1.0, 30.0), -8.888_889, "traffic's 8.9 floor is not a cop's");
+        assert_eq!(unlit_target_speed(-1.0, 1.0, 60.0), -8.888_889);
+        assert_eq!(unlit_target_speed(-1.0, 1.0, 20.0), -13.333_333);
+    }
+
+    /// 0x40D194…0x40D19F: in the ram mode CLOSE-QUARTERS re-runs the rubber band without the human
+    /// test, so a ramming cop keeps its boost right behind the player.
+    #[test]
+    fn a_ramming_cop_keeps_its_boost_next_to_the_human() {
+        let t = ring(400);
+        let tgt = ChaseTarget { position: t.slices[40].centre, slice: 40, lateral: 0.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
+        for (ram, want) in [(false, 1.0), (true, BOOST_SPEED)] {
+            let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 10, moving: true }] };
+            let mut p = Police::new(file, vec![cop(0.6, 2)], 0, false);
+            p.deploy(&t, 0, 0, 0);
+            chase_now(&mut p, 0);
+            p.cars[0].slice = 38;
+            p.cars[0].position = t.slices[38].centre;
+            p.cars[0].speed = 20.0;
+            (p.cars[0].ram, p.cars[0].ram_until) = (ram, if ram { 10_000 } else { 0 });
+            p.update(&t, 300, &tgt, &[]);
+            assert_eq!(p.cars[0].mode, Some(ChaseMode::CloseQuarters));
+            assert_eq!(p.cars[0].rate_mul, want, "ram {ram}");
+        }
     }
 
     #[test]
@@ -720,7 +1115,7 @@ mod tests {
         // speed, and once it is inside the slot it eases off instead.
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 10, moving: true }] };
-        let mut p = Police::new(file, vec![CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 0)], 0, false);
+        let mut p = Police::new(file, vec![cop(0.6, 0)], 0, false);
         p.deploy(&t, 0, 0, 0);
         chase_now(&mut p, 0);
         let tgt = ChaseTarget { position: t.slices[40].centre, slice: 40, lateral: 0.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
@@ -767,8 +1162,8 @@ mod tests {
         // only becomes a chaser on the first tick of its own that finds the perp wanted (0x405220).
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 50, moving: true }] };
-        let mut p = Police::new(file, vec![CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 2)], 0, false);
-        assert!(p.deploy_as(&t, 0, 0, 1000, false));
+        let mut p = Police::new(file, vec![cop(0.6, 2)], 0, false);
+        assert!(p.deploy_as(&t, 0, 0, 1000, false, None));
         assert!(p.cars[0].active && !p.cars[0].chasing && !p.cars[0].lights, "patrolling, lights off");
         let tgt = ChaseTarget { position: t.slices[60].centre, slice: 60, lateral: 0.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
         p.update(&t, 1002, &tgt, &[]);
@@ -792,8 +1187,8 @@ mod tests {
     fn a_patrol_keeps_the_requested_direction_and_the_grant_waits_for_8_889() {
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 50, moving: true }] };
-        let mut p = Police::new(file, vec![CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 2)], 0, false);
-        assert!(p.deploy_as(&t, 0, 0, 1000, false));
+        let mut p = Police::new(file, vec![cop(0.6, 2)], 0, false);
+        assert!(p.deploy_as(&t, 0, 0, 1000, false, None));
         assert_eq!((p.cars[0].dir, p.cars[0].requested_dir), (1.0, 1.0), "0x407890: car+0xEB0 = car+0xEAC = side");
         let tgt = ChaseTarget { position: t.slices[60].centre, slice: 60, lateral: 0.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
         // too fast to turn round: the request stands and is not granted
@@ -814,10 +1209,10 @@ mod tests {
     fn a_fresh_cop_takes_two_ticks_to_a_lit_chase() {
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 50, moving: true }] };
-        let mut p = Police::new(file, vec![CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 2)], 0, false);
+        let mut p = Police::new(file, vec![cop(0.6, 2)], 0, false);
         let tgt = ChaseTarget { position: t.slices[60].centre, slice: 60, lateral: 0.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
         p.set_wanted(true);
-        assert!(p.deploy_as(&t, 0, 0, 1000, true));
+        assert!(p.deploy_as(&t, 0, 0, 1000, true, None));
         p.update(&t, 1000, &tgt, &[]);
         assert!(!p.cars[0].chasing && !p.cars[0].lights && p.cars[0].mode.is_none(), "the placement tick is AIState_Normal");
         p.update(&t, 1002, &tgt, &[]);
@@ -832,16 +1227,16 @@ mod tests {
     fn the_ai_pass_writes_targets_and_the_drive_moves_the_car() {
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 50, moving: true }] };
-        let cars: Vec<CopCar> = (0..2).map(|_| CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 2)).collect();
+        let cars: Vec<CopCar> = (0..2).map(|_| cop(0.6, 2)).collect();
         let mut p = Police::new(file, cars, 0, false);
         let tgt = ChaseTarget { position: t.slices[60].centre, slice: 60, lateral: 0.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
-        assert!(p.deploy_as(&t, 0, 0, 1000, false));
+        assert!(p.deploy_as(&t, 0, 0, 1000, false, None));
         p.cars[0].placed = false;
         let v0 = p.cars[0].velocity;
-        p.ai(&t, 1002, &tgt, &[], &[60], &mut || 0xFFFF);
+        p.ai(&t, 1002, &tgt, &[], &[60], &mut || 0xFFFF, None);
         assert_eq!(p.cars[0].velocity, v0, "the decision does not drive");
         assert!(p.cars[0].target_speed != 0.0);
-        p.drive(&t, 1002);
+        p.drive(&t, 1002, None);
         assert!(p.cars[0].velocity != v0, "the Sc32 drive does");
         assert!(!p.cars[1].active);
     }
@@ -853,13 +1248,13 @@ mod tests {
     fn the_ai_pass_gates_a_cop_and_its_counters_step_by_the_update() {
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 50, moving: true }] };
-        let mut p = Police::new(file, vec![CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 2)], 0, false);
+        let mut p = Police::new(file, vec![cop(0.6, 2)], 0, false);
         p.slot_base = 3;
         assert!(p.deploy(&t, 0, 0, 900));
         chase_now(&mut p, 0);
         p.cars[0].boost_budget = 100;
         let tgt = ChaseTarget { position: t.slices[60].centre, slice: 60, lateral: 0.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
-        let ai = |p: &mut Police, tick: u64| p.ai(&t, tick, &tgt, &[], &[60], &mut || 0xFFFF);
+        let ai = |p: &mut Police, tick: u64| p.ai(&t, tick, &tgt, &[], &[60], &mut || 0xFFFF, None);
         // slot 3: `(0x103 + tick/2) & 3 == 3` at tick 1000; the boost comes on, nothing is charged yet
         ai(&mut p, 1000);
         assert_eq!((p.cars[0].boost_engine, p.cars[0].boost_budget), (BOOST_ENGINE, 100));
@@ -888,14 +1283,14 @@ mod tests {
     fn the_cop_drive_is_gated_by_row_1() {
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 50, moving: true }] };
-        let mut p = Police::new(file, vec![CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 2)], 0, false);
+        let mut p = Police::new(file, vec![cop(0.6, 2)], 0, false);
         p.slot_base = 4;
         assert!(p.deploy(&t, 0, 0, 900));
         p.cars[0].target_speed = 30.0;
         let mut driven = 0;
         for tick in 1000..1008 {
             let v = p.cars[0].velocity;
-            p.drive(&t, tick);
+            p.drive(&t, tick, None);
             driven += usize::from(p.cars[0].velocity != v);
         }
         assert_eq!(driven, 8, "near a racer: every 32 Hz tick");
@@ -903,7 +1298,7 @@ mod tests {
         let mut due = Vec::new();
         for tick in 1008..1016 {
             let v = p.cars[0].velocity;
-            p.drive(&t, tick);
+            p.drive(&t, tick, None);
             if p.cars[0].velocity != v {
                 due.push(tick);
             }
@@ -918,9 +1313,9 @@ mod tests {
     fn a_parked_cop_stays_put_until_it_chases() {
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 50, moving: false }] };
-        let mut p = Police::new(file, vec![CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 2)], 0, false);
+        let mut p = Police::new(file, vec![cop(0.6, 2)], 0, false);
         let tgt = ChaseTarget { position: t.slices[60].centre, slice: 60, lateral: 0.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
-        assert!(p.deploy_as(&t, 0, 0, 1000, false));
+        assert!(p.deploy_as(&t, 0, 0, 1000, false, None));
         assert!(p.cars[0].parked);
         let lat = p.cars[0].lateral;
         for k in 0..4 {
@@ -939,7 +1334,7 @@ mod tests {
     fn a_stuck_chase_goes_through_goto_slice_and_back() {
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 50, moving: true }] };
-        let mut p = Police::new(file, vec![CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 2)], 0, false);
+        let mut p = Police::new(file, vec![cop(0.6, 2)], 0, false);
         p.racers = vec![RacerRef { position: t.slices[60].centre, slice: 60, progress: 1.0, ..Default::default() }];
         assert!(p.deploy(&t, 0, 0, 1000));
         chase_now(&mut p, 0);
@@ -974,7 +1369,7 @@ mod tests {
     fn the_give_up_distance_is_to_the_leading_racer_latched_at_deploy() {
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 50, moving: true }] };
-        let mut p = Police::new(file, vec![CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 2)], 0, false);
+        let mut p = Police::new(file, vec![cop(0.6, 2)], 0, false);
         // the human at slice 60, an opponent ahead of it at slice 80
         p.racers = vec![RacerRef { position: t.slices[60].centre, slice: 60, progress: 1.0, ..Default::default() }, RacerRef { position: t.slices[80].centre, slice: 80, progress: 2.0, ..Default::default() }];
         assert!(p.deploy(&t, 0, 0, 1000));
@@ -997,11 +1392,11 @@ mod tests {
     fn a_cop_never_acquires_an_opponent() {
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 50, moving: true }] };
-        let mut p = Police::new(file, vec![CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 2), CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 2)], 0, false);
+        let mut p = Police::new(file, vec![cop(0.6, 2), cop(0.6, 2)], 0, false);
         let r = |slice: usize| RacerRef { position: t.slices[slice].centre, slice, progress: slice as f32 / 400.0, laps_timed: 0, speed: 20.0 };
         p.set_racers(vec![r(70), r(51)]);
-        assert!(p.deploy_as(&t, 0, 0, 1000, false));
-        assert!(p.deploy_as(&t, 1, 0, 1000, false));
+        assert!(p.deploy_as(&t, 0, 0, 1000, false, None));
+        assert!(p.deploy_as(&t, 1, 0, 1000, false, None));
         let tgt = ChaseTarget { position: t.slices[70].centre, slice: 70, lateral: 0.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
         p.update(&t, 1002, &tgt, &[]);
         p.update(&t, 1004, &tgt, &[]);
@@ -1022,7 +1417,7 @@ mod tests {
     fn a_patrol_spawns_ahead_of_an_opponent() {
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 233, moving: true }, CopRecord::Point { kind: 1, slice: 43, moving: true }] };
-        let cars: Vec<CopCar> = (0..3).map(|_| CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 2)).collect();
+        let cars: Vec<CopCar> = (0..3).map(|_| cop(0.6, 2)).collect();
         let mut p = Police::new(file, cars, 0, false);
         let r = |slice: usize, progress: f32| RacerRef { position: t.slices[slice].centre, slice, progress, laps_timed: 0, speed: 20.0 };
         let mut draws = 0;
@@ -1053,14 +1448,14 @@ mod tests {
     fn state_one_runs_in_index_order_among_the_other_cops() {
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 43, moving: true }] };
-        let cars: Vec<CopCar> = (0..2).map(|_| CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 2)).collect();
+        let cars: Vec<CopCar> = (0..2).map(|_| cop(0.6, 2)).collect();
         let mut p = Police::new(file, cars, 0, false);
         let r = |slice: usize| RacerRef { position: t.slices[slice].centre, slice, progress: slice as f32 / 400.0, laps_timed: 0, speed: 20.0 };
         let tgt = |slice: usize| ChaseTarget { position: t.slices[slice].centre, slice, lateral: 0.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
         // cop 0 is out, far down the track from the (clean) human, and within 216 m of it in the
         // plane (the give-up test measures octdist to the reference car — here the target)
         p.set_racers(vec![r(10)]);
-        assert!(p.deploy_as(&t, 0, 0, 0, false));
+        assert!(p.deploy_as(&t, 0, 0, 0, false, None));
         p.cars[0].slice = 250;
         p.cars[0].position = t.slices[10].centre;
         p.tick(&t, 1000, &tgt(10), &[], &[10], &mut || 0);
@@ -1111,7 +1506,7 @@ mod tests {
     fn the_reference_order_is_lap_progress_and_ties_keep_the_last_order() {
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 50, moving: true }] };
-        let mut p = Police::new(file, vec![CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 2)], 0, false);
+        let mut p = Police::new(file, vec![cop(0.6, 2)], 0, false);
         let r = |slice: usize, progress: f32, laps: u32| RacerRef { position: t.slices[slice].centre, slice, progress, laps_timed: laps, speed: 20.0 };
         // a tie at the start: registration order, so the later racer is on top
         p.set_racers(vec![r(60, 0.5, 0), r(60, 0.5, 0)]);
@@ -1135,7 +1530,7 @@ mod tests {
     fn a_perp_that_turns_clean_is_dropped_to_state_2() {
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 50, moving: true }] };
-        let mut p = Police::new(file, vec![CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 2)], 0, false);
+        let mut p = Police::new(file, vec![cop(0.6, 2)], 0, false);
         assert!(p.deploy(&t, 0, 0, 1000));
         chase_now(&mut p, 0);
         let tgt = ChaseTarget { position: t.slices[60].centre, slice: 60, lateral: 0.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
@@ -1159,7 +1554,7 @@ mod tests {
         assert_eq!(perp_update(Violation::None, false, |_| Violation::WrongWay), Violation::WrongWay);
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 50, moving: true }] };
-        let mut p = Police::new(file, vec![CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 2)], 0, false);
+        let mut p = Police::new(file, vec![cop(0.6, 2)], 0, false);
         assert!(p.deploy(&t, 0, 0, 1000));
         chase_now(&mut p, 0);
         // even with the perp still marked wanted, 0x40479F alone drops a finished target
@@ -1182,7 +1577,7 @@ mod tests {
         assert_eq!(duty_budget(2, true), 2);
         let t = ring(400);
         let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 50, moving: true }] };
-        let cars: Vec<CopCar> = (0..4).map(|_| CopCar::new(0, Vec3::new(0.9, 0.6, 2.1), 1500.0, 0)).collect();
+        let cars: Vec<CopCar> = (0..4).map(|_| cop(0.6, 0)).collect();
         let mut p = Police::new(file, cars, 0, false);
         assert_eq!(p.budget, 3, "a single racer");
         for i in 0..4 {
@@ -1217,6 +1612,25 @@ mod tests {
 use crate::aidrive::{self, AiCarState};
 use crate::lanes::{lane_of, lane_span, LaneCar, LaneScratch, LaneSelf, PERSONALITIES};
 use glam::{Mat3, Vec3};
+use nfs_physics::collision::TriangleGrid;
+use nfs_physics::specs::CarSpecs;
+use nfs_physics::vehicle::Vehicle;
+
+/// `[0x5B25FC]` / `[0x5B25F8]` — the limits of 0x408750's sanity net: a velocity component or the
+/// speed estimate past 115 m/s, or a lateral offset more than 35 m outside the road's half-width.
+pub const SANITY_SPEED: f32 = 115.0;
+pub const SANITY_OFF_ROAD: f32 = 35.0;
+
+/// The world a cop's drive tick needs beyond the slice table: the collision grid (the reset's
+/// `Car_placeAtSlice` 0x49B090 seats the trackers on it, 0x40F480 asks it for a drivable patch)
+/// and the slices the other live cars stand on (`car+8` of every `0x5E8B34[]` car with
+/// `car+0x7F`, 0x40F4D3…0x40F500 — the humans, the opponents and the traffic; the other cops are
+/// added by [`Police`] itself).
+#[derive(Clone, Copy)]
+pub struct CopWorld<'a> {
+    pub grid: &'a TriangleGrid,
+    pub occupied: &'a [usize],
+}
 
 /// `[0x5B265C]` — `0x40AF70`'s police branch hands the chase this before any cap. `car+0x1024` is a
 /// hardcoded 100.0 (0x406E4F) and `car+0x109C` the rubber-band multiplier.
@@ -1308,6 +1722,37 @@ pub fn duty_budget(racers: usize, two_players: bool) -> usize {
 /// default (`role = (car+0x52C & 0x40) ? 1 : 0`), so **a cop is level 2** whatever the race skill is.
 pub const COP_LEVEL: [usize; 2] = [2, 0];
 
+/// `0x40AF70`'s police mirror for a cop with its lights off (0x40AFF6…0x40B05C, then 0x40B157), read
+/// to the instruction 2026-09-26: 16.5 m/s, or for a car not going the race's way the oncoming ladder
+/// on `|[car+0xED4]+0xEC0|` (the 22.22 store at 0x40B04A is overwritten, as in traffic's copy); then —
+/// the `flags & 0x10` block being traffic's only — straight to the floor `max(v, 8.8889)`
+/// (`[0x5B2430]`, 0x40B157…0x40B178) and `× (int)car+0xEB0`. No `car+0xEEC` / `− 13.4` / 8.9 terms,
+/// which `traffic::target_speed` has. *(Until 2026-09-26 the port used the traffic function, whose
+/// 8.9 floor lifted the 8.8889 rung.)*
+pub fn unlit_target_speed(dir: f32, race_dir: f32, reference_speed: f32) -> f32 {
+    let mut v: f32 = 16.5;
+    if dir != race_dir {
+        let s = reference_speed.abs();
+        // the image's constants: `[0x5B2554]` 13.333333, `[0x5B2650]` 26.666666, `[0x5B2410]` 40,
+        // `[0x5B264C]` 55.555557, `[0x5B2648]` 71.111115; the rungs 0x41555555, 0x410E38E4,
+        // 0x408E38E4, 0x400E38E4, 0x403147AE
+        v = if s < 13.333_333 {
+            16.5
+        } else if s < 26.666_666 {
+            13.333_333
+        } else if s < 40.0 {
+            8.888_889
+        } else if s < 55.555_557 {
+            4.444_444_7
+        } else if s < 71.111_115 {
+            2.222_222_3
+        } else {
+            2.77
+        };
+    }
+    v.max(8.888_889) * dir
+}
+
 /// `0x40D680`'s distance ladder, by skill level. The entries are the speeds for
 /// `d > 150 / 100 / 50 / 25 / 10 / 6 / else`.
 pub const PURSUE_SPEED: [[f32; 7]; 3] = [[60.0, 50.0, 40.0, 35.0, 20.0, 3.0, 0.0], [60.0, 50.0, 40.0, 35.0, 10.0, 3.0, 0.0], [80.0, 70.0, 50.0, 40.0, 14.0, 6.0, 0.0]];
@@ -1342,6 +1787,21 @@ pub const FORMATION: [[[f32; 3]; 6]; 3] = [
 
 /// `0x5CBEA0[level]+0x08` — state 4 switches to the close-in (ram) mode inside this gap (§27.4).
 pub const CLOSE_IN_GAP: [f32; 3] = [13.0, 15.0, 18.0];
+/// `0x5CBEA0[level]+0x00` — the slot-hold ticks (`chase+0x78`) the close-in test wants exceeded.
+pub const CLOSE_IN_SLOT_TICKS: [i32; 3] = [10, 8, 4];
+/// `0x5CBEA0[level]+0x04` — the close-in test's lateral window on `|chase+0x6C|`.
+pub const CLOSE_IN_LATERAL: [f32; 3] = [10.0, 14.0, 18.0];
+/// 0x40470E: the nudge's ram lasts `0x20` ticks.
+pub const NUDGE_TICKS: u64 = 0x20;
+
+/// The roll at the head of `0x403850(cop, p = 0.25, target)`, read to the instruction 2026-09-26
+/// (0x403854…0x4038B1): `thr = fistp([0x5E6654] · p · [0x5B24B8] (1/32) · 1000)` — 31 at an 8 Hz
+/// update, 62 at 4 Hz (round to nearest even) — and the LCG step `r` (the shared `rand16`),
+/// passing when `(r · 1000) >> 16 < thr`: 0.25 per second of AI updates.
+pub fn nudge_roll(ai_ticks: i32, r16: u32) -> bool {
+    let thr = (ai_ticks as f32 * 0.25 * 0.03125 * 1000.0).round_ties_even() as i32;
+    (((r16 * 1000) >> 16) as i32) < thr
+}
 /// `0x5CBEA0[level]+0x0C` — how long the close-in (ram) mode lasts, in ticks: 0x4046C3 hands it to
 /// `0x40CD50(chase, 1, ticks)`.
 pub const CLOSE_IN_TICKS: [u64; 3] = [0x200, 0x300, 0x480];
@@ -1450,6 +1910,9 @@ pub struct CopCar {
     /// index into the caller's model list
     pub model: usize,
     pub active: bool,
+    /// `car+0x528` — this cop's place in `0x5E8B88[]` as the previous even tick's `0x417710` left
+    /// it ([`crate::race_order::RaceOrder`]); the caller writes it before [`Police::update`]
+    pub place: usize,
     /// `car+0xECC & 2` — lights on, which is also what switches the target speed to 100 m/s
     pub lights: bool,
     /// The cop is chasing (`AIHigh_Cop` state 4). Otherwise it patrols (states 2/3) and builds its
@@ -1482,12 +1945,24 @@ pub struct CopCar {
     /// (`nfs_game::world::car_body`), not traffic's LOD 1
     pub half_extents: Vec3,
     pub mass: f32,
-    /// `car+0x1064..0x106C` and `car+0x1070` — the ram aim point
+    /// `car+0x1064..0x106C` and `car+0x1070` — the explicit aim point (PURSUE's ram) and the lane
+    /// offset that goes with it, which `0x4090C0` copies into the drive's `car+0x1074` (0x40954E)
     pub aim_point: Vec3,
     pub aim_lateral: f32,
+    /// `car+0x1078` / `car+0x107C` — a held lateral offset and its score bias. While the bias is
+    /// positive `0x402A40` first asks `0x402790` whether the offset still wins the lane vote and,
+    /// if so, takes it as `car+0xEB4`. Written by the chase only: `0x40CD70` sets both to 1.0 every
+    /// chase tick (0x40CE68 / 0x40CE72), CLOSE-QUARTERS to its aim and 15 / 30 (0x40D642 /
+    /// 0x40D64B); the chase's dtor 0x40CC10 zeroes them.
+    pub lane_override: f32,
+    pub lane_bias: f32,
     /// `car+0x1098` / `car+0x109C` — the engine and speed multipliers
     pub boost_engine: f32,
     pub boost_speed: f32,
+    /// `car+0x108C` — the lit `0x40AF70`'s copy of `car+0x109C` (0x40AFB2), which the drive
+    /// controllers' brake force and in-control lateral gains take when it exceeds 1; `Car_raceInit`
+    /// 0x410730 starts it (0x410A91), nothing else writes it
+    pub rate_mul: f32,
     /// `chase+0x7C` — the boost budget in ticks
     pub boost_budget: i32,
     /// `chase+0x8C`. The original's only writer besides the ctor is the state-4 head 0x404571,
@@ -1520,13 +1995,33 @@ pub struct CopCar {
     pub gear: aidrive::Gear,
     /// `car+0xD80`, the brake-light counter (`aidrive::brake_light`)
     pub brake_light: u8,
-    /// `chase+0x60`-side bookkeeping for §27.8: this cop's rank in the target's queue, the
-    /// formation offset that rank implies and the two desired sectors it maps to.
+    /// `AIHigh_Perp+0x4C[slot]` for this cop — its roster position (entry − 1), which 0x403C00 walks
+    /// up from; left as it was by a release (0x403BA0 does not touch it)
+    pub roster_pos: usize,
+    /// `AIHigh_Cop+0x60` — this cop's rank in the target's queue, as the state-4 arm last saw it
+    /// (0x404615 compares the roster's answer with it to decide whether to re-aim, 0x40CCA0).
     pub rank: usize,
     /// `chase+0x78` — ticks spent standing in the formation slot.
     pub slot_ticks: i32,
-    /// `chase+0x70` / `+0x74` — the close-in (ram) mode and when it lapses.
+    /// `chase+0x70` — the close-in (ram) mode, set by `0x40CD50` only while it is clear and cleared
+    /// by `0x40CD70` once `gGameTick >= chase+0x74` (0x40CE1C…0x40CE33) and by `0x40CCA0`.
+    pub ram: bool,
+    /// `chase+0x74` — the tick the ram mode lapses.
     pub ram_until: u64,
+    /// `AIState_Chase+0x08…+0x40` — the smoothed target tracker (0x403620 / 0x403650 / 0x4036F0).
+    pub tracker: ChaseTracker,
+    /// `chase+0x4C…+0x54` — the formation offset `0x40CCA0` latched: `0x5CBEE8[level][rank]` when the
+    /// chase is built or the rank changes outside the ram mode.
+    pub formation: [f32; 3],
+    /// `chase+0x58` / `chase+0x5C` — the longitudinal / lateral sector of [`Self::formation`] against
+    /// the target's half length / half width, worked out by `0x40CCA0` (0x40CCD6…0x40CD3A).
+    pub want_lon: i32,
+    pub want_lat: i32,
+    /// `chase+0x68` — the signed longitudinal gap `0x40E920(cop, tracker slice, tracker point)`,
+    /// positive with the cop ahead of the tracked target point (`0x40CD70`).
+    pub chase_gap: f32,
+    /// `chase+0x6C` — `cop+0xED0 − chase+0x38`, the cop's lateral less the tracked target lateral.
+    pub chase_lat_err: f32,
     /// `chase+0x88` — the skill level that picks the PURSUE ladder
     pub level: usize,
     /// `car+0x101C` — the lane-existence scan window
@@ -1536,34 +2031,60 @@ pub struct CopCar {
     /// tracker 0x49AF70 (Sc32 priority 6, after the AI pass) while it is in the world
     /// ([`Police::track_racers`]); the AI pass's gate [`crate::traffic::ai_pass_due`] reads it.
     pub racer_distance: f32,
-    /// The four ground probes `Susp_update` 0x499A70 takes (0x499AD4…0x499B13): body points 0…3
-    /// of the `BndP` set after 0x49ABC0's sort and quadrant deal — FL, FR, RL, RR in the model's own
-    /// axes, lowered by `car+0x3AC` (`nfs_game::world::car_body`; a cop takes the `Susp_update` path
-    /// like a racer, only `car+0x52C & 0x80` forks, `suspension-collision.md` §4.2 item 9). The race
-    /// sets them from the cop's model; [`CopCar::new`] starts from the box's bottom corners at the
-    /// wheel-quad height (APPROXIMATION, for callers without a model — the unit tests).
-    pub probes: [Vec3; 4],
-    /// The car tracker `car+0x400` / `car+0x3E8` (0x49AF70 → `updateZone` + 0x499520), whose plane
-    /// is `Susp_update`'s fallback for a probe with no usable patch.
-    pub tracker: nfs_physics::collision::PatchTracker,
-    /// The wheel trackers `wheel_i + 4` `Susp_update` runs `updateZone` on.
-    pub wheel_trackers: [nfs_physics::collision::PatchTracker; 4],
-    /// The trackers were seated since the last deploy — `Car_placeAtSlice` 0x49B090's tracker part
-    /// (`PatchTracker::seat`), which the port runs on the first ground step after [`Police::deploy_as`]
-    /// (the deploy has no collision grid).
-    seated: bool,
-    /// `word car+0x418`: `Susp_update` stores `nAir > 1` (0x49A8AA…0x49A8C0) and the car–car impulse
-    /// steps it on both cars (0x496F1E / 0x496F25, the caller's collision pass). 0x408360 reads it
-    /// at 0x408543: only while it is 0 does the "on its side" exit fire.
-    pub airborne_count: u16,
+    /// The cop's car record as the physics sees it — the same `RigidBody` every car is
+    /// (`RigidBody_init` 0x49B510, `traffic.md` §22): the body points (`car+0x8C`, the first four
+    /// being `Susp_update` 0x499A70's probes, 0x499AD4…0x499B13 — `nfs_game::world::car_body`,
+    /// [`CopCar::set_body`]), the car tracker `car+0x400` / `car+0x3E8` and the four wheel
+    /// trackers, the wheels' compression / airborne / roughness state, `car+0x424` / `+0x428`,
+    /// `word car+0x418` ([`Vehicle::airborne_count`]: `Susp_update` stores `nAir > 1`, the
+    /// car–car impulse steps it, 0x408360 reads it at 0x408543), `car+0x42C`
+    /// ([`Vehicle::knocked_over`], `Damage` 0x49489A → the 0x4084C3 exit), the crash countdown
+    /// `car+0x1100` and the damage zones. The cop's `car+0xE20` is `Car_ground` 0x49BD40 like a
+    /// racer's (`suspension-collision.md` §4.2 item 9), run here through
+    /// [`Vehicle::ai_ground_step`] ([`Police::ground`]); the collision pass 0x498FF0 runs on it
+    /// too (the caller's, `main.rs`). The kinematic truth — `car+0x330`, `+0x364`, `+0x33C`,
+    /// `+0x388` — is this struct's own [`Self::position`], [`Self::orientation`],
+    /// [`Self::velocity`], [`Self::angular_velocity`], copied in and out around each use
+    /// ([`Self::sync_body_in`] / [`Self::sync_body_out`]).
+    pub body: Vehicle,
+    /// The cop's own `.sim` (§17.1) — the suspension constants `Car_ground` reads
+    /// (`specs[0x114…0x138]`, `suspension-collision.md` §8) and the mass.
+    pub specs: CarSpecs,
+    /// `car+0xD4C…+0xD54`, the body-frame force the AI controller wrote (0x409720 / 0x409C70:
+    /// lateral, 0, forward) — what `Susp_update`'s dive / roll filters read as `car+0xD4C` /
+    /// `car+0xD54`; the drive's damped exits zero it (0x4084CE…, 0x4085FF…).
+    pub accel_local: Vec3,
+    /// `car+0xD40…+0xD48`, the world acceleration the AI integrator 0x40A1D0 derives from it
+    /// (0x40A236 / 0x40A27B) — `Susp_update`'s lateral term reads it (0x49A163); the damped exits
+    /// leave it alone.
+    pub accel_world: Vec3,
 }
 
 impl CopCar {
-    pub fn new(model: usize, half_extents: Vec3, mass: f32, level: usize) -> Self {
+    /// A cop car with its own `.sim` (`specs`, §17.1 — the mass is the sim's) and the half box
+    /// 0x445090 takes. The body starts with the box's bottom corners at the wheel-quad height as
+    /// its probes (APPROXIMATION, for callers without a model — the unit tests); the race gives it
+    /// the model's `BndP` points through [`Self::set_body`].
+    pub fn new(model: usize, half_extents: Vec3, specs: &CarSpecs, level: usize) -> Self {
+        let mass = specs.mass;
+        let mut body = Vehicle::new(Vec3::ZERO, Mat3::IDENTITY, specs, half_extents.x, crate::traffic::RIDE_HEIGHT);
+        // an AI car: the human-only arms (0x493DD0 on a landing, the automatic's pedal swap) are
+        // off, `car+0x52C & 1` clear
+        body.ai_driven = true;
+        body.traction_control = true;
+        // `RigidBody_init` 0x49B510: `car+0x84 = 1.0`. Only the racers' `LoadTransfer` 0x4A1900
+        // (Car_simulate) puts 1.16 there; a cop's changes only in the lit `0x40AF70`
+        body.gravity_scale = 1.0;
+        {
+            let (x, y, z) = (half_extents.x, -(crate::traffic::RIDE_HEIGHT + half_extents.y), half_extents.z);
+            body.set_car_body(vec![Vec3::new(-x, y, z), Vec3::new(x, y, z), Vec3::new(-x, y, -z), Vec3::new(x, y, -z)], half_extents);
+        }
+        body.position = Vec3::ZERO;
         Self {
             gear: aidrive::Gear::default(),
             brake_light: 0,
             model,
+            place: 0,
             active: false,
             lights: false,
             chasing: false,
@@ -1584,11 +2105,20 @@ impl CopCar {
             mass,
             aim_point: Vec3::ZERO,
             aim_lateral: 0.0,
+            lane_override: 0.0,
+            lane_bias: 0.0,
             boost_engine: 1.0,
             boost_speed: 1.0,
+            rate_mul: 1.0,
             boost_budget: 0,
             blackout_until: 0,
-            stuck_ticks: 0, rank: 0, slot_ticks: 0, ram_until: 0,
+            stuck_ticks: 0, rank: 0, roster_pos: 0, slot_ticks: 0, ram: false, ram_until: 0,
+            tracker: ChaseTracker::default(),
+            formation: [0.0; 3],
+            want_lon: 0,
+            want_lat: 0,
+            chase_gap: 0.0,
+            chase_lat_err: 0.0,
             goto_slice: None,
             reference: None,
             target: None,
@@ -1596,15 +2126,45 @@ impl CopCar {
             scan: 0,
             mode: None,
             racer_distance: 0.0,
-            probes: {
-                let (x, y, z) = (half_extents.x, -(crate::traffic::RIDE_HEIGHT + half_extents.y), half_extents.z);
-                [Vec3::new(-x, y, z), Vec3::new(x, y, z), Vec3::new(-x, y, -z), Vec3::new(x, y, -z)]
-            },
-            tracker: nfs_physics::collision::PatchTracker::default(),
-            wheel_trackers: [nfs_physics::collision::PatchTracker::default(); 4],
-            seated: false,
-            airborne_count: 0,
+            body,
+            specs: specs.clone(),
+            accel_local: Vec3::ZERO,
+            accel_world: Vec3::ZERO,
         }
+    }
+
+    /// The body `RCar::load` builds for the cop's model: the `BndP` points less `car+0x3AC`
+    /// and the LOD-5 half box (`nfs_game::world::car_body`).
+    pub fn set_body(&mut self, points: Vec<Vec3>, half_extents: Vec3) {
+        self.half_extents = half_extents;
+        self.body.position = Vec3::ZERO;
+        self.body.body_lift = 0.0;
+        self.body.set_car_body(points, half_extents);
+        self.body.position = self.position;
+    }
+
+    /// The kinematic state into the car record before the physics reads it: `car+0x330`,
+    /// `+0x364`, `+0x33C`, `+0x388`, and the body-frame velocity `car+0xD58…` (0x40A1D0 →
+    /// 0x49F0C0 for an AI car), the AI's force `car+0xD4C…` and acceleration `car+0xD40`.
+    pub fn sync_body_in(&mut self) {
+        let b = &mut self.body;
+        b.position = self.position;
+        b.orientation = self.orientation;
+        b.velocity = self.velocity;
+        b.angular_velocity = self.angular_velocity;
+        b.v_local = self.orientation * self.velocity;
+        b.accel_local = self.accel_local;
+        b.accel_world = self.accel_world;
+        b.half_extents = self.half_extents;
+    }
+
+    /// …and back out after it (the ground contact, a placement, the collision pass).
+    pub fn sync_body_out(&mut self) {
+        let b = &self.body;
+        self.position = b.position;
+        self.orientation = b.orientation;
+        self.velocity = b.velocity;
+        self.angular_velocity = b.angular_velocity;
     }
 
     pub fn speed_estimate(&self) -> f32 {
@@ -1669,6 +2229,86 @@ fn oct_norm(x: f32, z: f32) -> f32 {
     x.max(z) + 0.25 * x.min(z)
 }
 
+/// `0x5CBEDC[SKILL [0x6573F4]]` = `{0.05, 0.1, 1.0}` — the chase tracker's gain, the Chase ctor's
+/// eighth argument (state 2 at 0x404360…0x40437C, state 3 the same). **This is where the race's skill
+/// reaches the chase**: at the hardest skill the tracker follows the target exactly, below it the
+/// cop works from a lagging estimate of where the target is.
+pub const TRACKER_GAIN: [f32; 3] = [0.05, 0.1, 1.0];
+
+/// `AIState_Chase+0x08`, the target tracker — read to the instruction 2026-09-26 (0x403620 ctor,
+/// 0x403650 reset, 0x4036F0 step). Every field is a first-order filter `x += (raw − x)·k`, stepped
+/// once per `0x40CD70`. The fields, by their offset in the chase:
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ChaseTracker {
+    /// `+0x08` — the gain, [`TRACKER_GAIN`]
+    pub k: f32,
+    /// `+0x14` — the smoothed `0x40E6E0(target, cop)`, the target's signed slice gap ahead of the cop
+    pub gap: f32,
+    /// `+0x18` — the predicted target slice, `0x4817D0(cop.slice, round(gap / 6), −1)`
+    pub slice: usize,
+    /// `+0x1C…+0x24` — the smoothed `target.pos − cop.pos`
+    pub rel: Vec3,
+    /// `+0x28…+0x30` — the predicted target point, `cop.pos + rel`
+    pub point: Vec3,
+    /// `+0x34` — the smoothed `target+0xED0 − cop+0xED0`
+    pub lat_diff: f32,
+    /// `+0x38` — the predicted target lateral, `cop+0xED0 + lat_diff`
+    pub lateral: f32,
+    /// `+0x3C` — `0x40EB20(slice, lateral)`
+    pub lane: i32,
+    /// `+0x40` — the smoothed target speed `car+0xEC0`
+    pub speed: f32,
+}
+
+impl ChaseTracker {
+    /// `0x403620(this, cop, target, k)` → `0x403650(target)`: the raw values of this instant. One
+    /// quirk carried as read: 0x4036B0…0x4036BF store `+0x34 = cop+0xED0 − target+0xED0`, the
+    /// **opposite** sign of what the step filters toward (`target − cop`), so a slow tracker starts
+    /// with its lateral difference mirrored.
+    pub fn new(table: &SliceTable, k: f32, cop: &CopCar, tgt: &ChaseTarget) -> Self {
+        Self {
+            k,
+            gap: track_distance(table, tgt.slice, cop.slice),
+            slice: tgt.slice,
+            rel: tgt.position - cop.position,
+            point: tgt.position,
+            lat_diff: cop.lateral - tgt.lateral,
+            lateral: tgt.lateral,
+            lane: tgt.lane,
+            speed: tgt.speed,
+        }
+    }
+
+    /// `0x4036F0` — one step (0x40CD79, the head of `0x40CD70`).
+    pub fn step(&mut self, table: &SliceTable, cop: &CopCar, tgt: &ChaseTarget) {
+        let k = self.k;
+        self.gap += (track_distance(table, tgt.slice, cop.slice) - self.gap) * k;
+        // `gap · [0x5B2420] (1/6)`, `fistp` (round to nearest), then 0x4817D0 along the race
+        let n = (self.gap * (1.0 / 6.0)).round_ties_even() as i32;
+        self.slice = table.add(cop.slice, n);
+        self.rel += ((tgt.position - cop.position) - self.rel) * k;
+        self.point = cop.position + self.rel;
+        self.lat_diff += ((tgt.lateral - cop.lateral) - self.lat_diff) * k;
+        self.lateral = cop.lateral + self.lat_diff;
+        self.lane = lane_of(&table.slices[self.slice.min(table.slices.len() - 1)], self.lateral);
+        self.speed += (tgt.speed - self.speed) * k;
+    }
+}
+
+/// `0x40E920(car, slice, point)` — read to the instruction 2026-09-26 (0x40E920…0x40E9D3): the slice
+/// gap `(car.slice − slice)·6`, and when that is within ±12 m (both ends inclusive, 0x40E96B /
+/// 0x40E978) the finer `forward · (car.pos − point)` over x and z, `forward` being the car's slice
+/// forward `car+0x3D0` (the axis `car+0xEC0` is measured along). Positive with the car ahead.
+pub fn fine_gap(table: &SliceTable, car_slice: usize, car_pos: Vec3, slice: usize, point: Vec3) -> f32 {
+    let d = track_distance(table, car_slice, slice);
+    if !(-12.0..=12.0).contains(&d) {
+        return d;
+    }
+    let f = table.slices[car_slice.min(table.slices.len() - 1)].forward.normalize_or_zero();
+    let r = car_pos - point;
+    f.x * r.x + f.z * r.z
+}
+
 /// The physics constants a cop's own `.sim` supplies, same shape as traffic's.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CopPhysics {
@@ -1703,13 +2343,17 @@ pub struct Police {
     pub wanted: bool,
     /// `WEATHER` (`[0x657A24] > 0`). `0x4081B0` scales the longitudinal rate by **0.9** and it does
     /// so *after* the traffic/1.0 split at 0x4081FC, so it applies to a cop as much as to a traffic
-    /// car (0x40825C…0x40826E, `[0x5B25E8]` = 0.9). The shipped `fe.txt` says `weather = 0`, so it
-    /// is off in a normal race — and it is the option, not the track's night flag.
+    /// car (0x40825C…0x40826E, `[0x5B25E8]` = 0.9). The race load 0x414DB0 zeroes `WEATHER` at
+    /// 0x414DF9 before any in-race reader, so it is off in every race — the option, not the night flag.
     pub weather: bool,
     /// The racers (`RacerRef`) in registration order — the perps, and the cars a cop can take as
     /// its reference car — refreshed by the caller every tick through [`Police::set_racers`] before
     /// the spawn pass and `update`; index 0 is the human.
     pub racers: Vec<RacerRef>,
+    /// `car+0x528` of each car the caller passes as `others` to [`Police::update`], in the same
+    /// order ([`crate::race_order::RaceOrder`]); shorter than `others` (the unit tests) and the lane
+    /// pass sorts the cars itself instead.
+    pub other_places: Vec<usize>,
     /// `0x5E8B88[]` restricted to the racers: ascending by `car+0xAF8 − car+0xB20`, stable across
     /// ticks (`0x417710`'s first sort). The purgatory dtor 0x40DFB0 walks it from the top.
     race_order: Vec<usize>,
@@ -1717,6 +2361,9 @@ pub struct Police {
     /// (`0x417710`'s second sort). The spawn search 0x405440 walks it from the top.
     spawn_order: Vec<usize>,
     one_way: bool,
+    /// `AIHigh_Perp+0x14…+0x48` of the human — the chaser roster, entries 1…6 (`+0x1C` + 8·k; entry 0
+    /// at `+0x14` is never written), each the cop that holds it (`{slot, car}` in the original)
+    roster: [Option<usize>; 7],
     /// The racer slot of cop 0 — the cops come after the humans and the opponents (0x4ECF00:
     /// `edi = nP + nOpp` at 0x4ED103 / 0x4ED1ED, `traffic.md` §17.5d). It is the phase of the AI
     /// pass's gate ([`crate::traffic::ai_pass_due`], `car+0` = `slot | 0x100`); the caller sets it.
@@ -1725,7 +2372,7 @@ pub struct Police {
 
 impl Police {
     pub fn new(file: CopFile, cars: Vec<CopCar>, skill: u8, one_way: bool) -> Self {
-        Self { manager: CopManager::new(file), cars, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: CopPhysics::default(), violation: Violation::None, route_dir: 1.0, skill, one_way, wanted: false, weather: false, racers: Vec::new(), race_order: Vec::new(), spawn_order: Vec::new(), budget: duty_budget(1, false), slot_base: 0 }
+        Self { manager: CopManager::new(file), cars, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: CopPhysics::default(), violation: Violation::None, route_dir: 1.0, skill, one_way, wanted: false, weather: false, racers: Vec::new(), other_places: Vec::new(), race_order: Vec::new(), spawn_order: Vec::new(), budget: duty_budget(1, false), slot_base: 0, roster: [None; 7] }
     }
 
     /// This tick's racers, and `0x417710` (called at 0x4179BF at the end of the per-tick car pass):
@@ -1848,11 +2495,27 @@ impl Police {
 
     /// `0x40AF70`'s police branch: a cop with its lights on drives at `100 · boost`, and everything
     /// else is a cap the behaviour applies afterwards. Lights off falls back to the traffic ladder.
-    fn base_target_speed(&self, c: &CopCar, reference_speed: f32) -> f32 {
+    ///
+    /// The lit arm, read to the instruction 2026-09-26 (0x40AF9A…0x40AFEC): `m = car+0x109C · 1.0`
+    /// is stored as **`car+0x108C`** — the multiplier both drive controllers put on the brake force
+    /// and the in-control one on its lateral gains when it exceeds 1 (0x409B46, 0x409E95, 0x40A105)
+    /// — and `car+0x84`, the body's **gravity scale** `Car_ground` reads, becomes `m > 1 ? m : 1.0`
+    /// (0x40AFBF / 0x40AFC9). Both keep their value while the lights are off. *(Until 2026-09-26 the
+    /// port drove the controllers on `car+0x1098` and kept the racers' 1.16 gravity scale on a cop.)*
+    ///
+    /// The unlit arm is §17.6's ladder, whose oncoming branch reads `|[car+0xED4]+0xEC0|` (0x40B01A)
+    /// — the **reference car's** speed, not the target's. *(Until 2026-09-26 the port passed the
+    /// chase target's.)*
+    fn base_target_speed(&mut self, i: usize, target: &ChaseTarget) -> f32 {
+        let reference_speed = self.cars[i].reference.and_then(|r| self.racers.get(r)).map(|r| r.speed).unwrap_or(target.speed);
+        let route_dir = self.route_dir;
+        let c = &mut self.cars[i];
         if c.lights {
-            PURSUIT_BASE_SPEED * c.boost_speed * c.dir
+            c.rate_mul = c.boost_speed;
+            c.body.gravity_scale = if c.rate_mul > 1.0 { c.rate_mul } else { 1.0 };
+            PURSUIT_BASE_SPEED * c.rate_mul * c.dir
         } else {
-            crate::traffic::target_speed(c.dir, self.route_dir, reference_speed, 1.0)
+            unlit_target_speed(c.dir, route_dir, reference_speed)
         }
     }
 
@@ -1862,7 +2525,10 @@ impl Police {
     /// 1.0 for a human whose `0x40E6E0(cop, human) · car+0xEB0` is in `(0, chase+0x80)` or
     /// `(−chase+0x84, 0)` — strictly, so a zero gap keeps the boost. It spends nothing: the budget
     /// is charged by the next update's `0x40CD70` ([`Police::spend_boost`]).
-    fn apply_boost(&mut self, i: usize, tick: u64, gap_to_human: f32) {
+    ///
+    /// `check_humans == false` (0x40CEBA…0x40CEC6: the flag is tested after the two stores) skips the
+    /// suppression — CLOSE-QUARTERS calls it that way a second time in the ram mode (0x40D194…0x40D19F).
+    fn apply_boost(&mut self, i: usize, tick: u64, gap_to_human: f32, check_humans: bool) {
         let c = &mut self.cars[i];
         if c.boost_budget <= 0 || tick < c.blackout_until {
             return;
@@ -1870,7 +2536,7 @@ impl Police {
         c.boost_engine = BOOST_ENGINE;
         c.boost_speed = BOOST_SPEED;
         let g = gap_to_human * c.dir;
-        if (g > 0.0 && g < BOOST_SUPPRESS_AHEAD) || (g < 0.0 && g > -BOOST_SUPPRESS_BEHIND) {
+        if check_humans && ((g > 0.0 && g < BOOST_SUPPRESS_AHEAD) || (g < 0.0 && g > -BOOST_SUPPRESS_BEHIND)) {
             c.boost_engine = 1.0;
             c.boost_speed = 1.0;
         }
@@ -1894,8 +2560,8 @@ impl Police {
     /// tests' entry. The race runs [`Police::ai`] and [`Police::drive`] apart.
     /// Every cop runs on every call, as if due, with `[0x5E6654]` = [`TEST_AI_TICKS`].
     pub fn update(&mut self, table: &SliceTable, tick: u64, target: &ChaseTarget, others: &[LaneCar]) {
-        self.run(table, tick, target, others, None, &|_| Some(TEST_AI_TICKS));
-        self.drive(table, tick);
+        self.run(table, tick, target, others, None, &|_| Some(TEST_AI_TICKS), None);
+        self.drive(table, tick, None);
     }
 
     /// One AI tick for every cop, **in index order** — `0x406720` walks `0x5E6774[]` and calls each
@@ -1929,16 +2595,18 @@ impl Police {
     /// `car+0x101C` (§23.4). *(Until 2026-09-25 every cop updated on every 32 Hz tick and each of
     /// these stepped by 2, so the stuck limit of 160 — 5 s — was reached in 2.5 s and the 16 s /
     /// 32 s boost budgets lasted 8 s / 16 s.)*
-    pub fn ai(&mut self, table: &SliceTable, tick: u64, target: &ChaseTarget, others: &[LaneCar], humans: &[usize], rand16: &mut dyn FnMut() -> u32) {
+    ///
+    /// `grid` is the track's collision grid, for state 1's placement (`Car_placeAtSlice` 0x49B090).
+    pub fn ai(&mut self, table: &SliceTable, tick: u64, target: &ChaseTarget, others: &[LaneCar], humans: &[usize], rand16: &mut dyn FnMut() -> u32, grid: Option<&TriangleGrid>) {
         let (base, dist): (usize, Vec<f32>) = (self.slot_base, self.cars.iter().map(|c| c.racer_distance).collect());
-        self.run(table, tick, target, others, Some((humans, rand16)), &|i| crate::traffic::ai_pass_due(dist[i], false, tick, base + i));
+        self.run(table, tick, target, others, Some((humans, rand16)), &|i| crate::traffic::ai_pass_due(dist[i], false, tick, base + i), grid);
     }
 
     /// The AI half with every cop due on every call, `[0x5E6654]` = [`TEST_AI_TICKS`], then
     /// [`Police::drive`] — the unit tests' entry with the searches.
     pub fn tick(&mut self, table: &SliceTable, tick: u64, target: &ChaseTarget, others: &[LaneCar], humans: &[usize], rand16: &mut dyn FnMut() -> u32) {
-        self.run(table, tick, target, others, Some((humans, rand16)), &|_| Some(TEST_AI_TICKS));
-        self.drive(table, tick);
+        self.run(table, tick, target, others, Some((humans, rand16)), &|_| Some(TEST_AI_TICKS), None);
+        self.drive(table, tick, None);
     }
 
     /// `0x417190`, run by each cop's tracker 0x49AF70 at Sc32 priority 6 (after the AI pass):
@@ -1968,39 +2636,146 @@ impl Police {
     /// is what `car+0x1080` (0x40A5E7) and the brake light (0x409AC8 / 0x409B65, 0x40A0BC /
     /// 0x40A124) step by. *(Until 2026-09-25 every cop drove on every 32 Hz tick with `dt` 1/32 and
     /// both counters stepping by 2 — twice the original's rate near a racer.)*
-    pub fn drive(&mut self, table: &SliceTable, tick: u64) {
+    ///
+    /// `world` is what 0x408750's net at the end of the tick needs to re-place the car
+    /// ([`CopWorld`]); without it (the unit tests' entries) the net is not run.
+    pub fn drive(&mut self, table: &SliceTable, tick: u64, world: Option<CopWorld<'_>>) {
         for i in 0..self.cars.len() {
             if !self.cars[i].active {
                 continue;
             }
             if let Some((dt, n_ticks)) = crate::traffic::drive_due(self.cars[i].racer_distance, false, tick, self.slot_base + i) {
-                self.drive_car(table, tick, i, dt, n_ticks);
+                self.drive_car(table, tick, i, dt, n_ticks, world);
             }
         }
     }
 
-    fn run(&mut self, table: &SliceTable, tick: u64, target: &ChaseTarget, others: &[LaneCar], mut spawn: Option<(&[usize], &mut dyn FnMut() -> u32)>, due: &dyn Fn(usize) -> Option<i32>) {
-        // `AIHigh+0x60`: the chasers are re-sorted by track distance (0x403C00) and each one's place
-        // in that queue picks its formation slot. **Rank 0 is the cop furthest ahead**: the insert
-        // loop walks the roster down while the entry it passes is more than twelve metres *behind*
-        // the target (`0x40E740(cop, perp.slice)` is the signed gap from the perp to that cop,
-        // 6 m a slice, wrapped into half a lap, and 0x403C66 compares it with −12). CONFIRMED —
-        // which is also what slot 0 wants, since it sits 8 m ahead of the target.
-        // A cop in state 9 has given its slot back (0x40503A → 0x403BA0), so it is not in the queue,
-        // and neither is one with no target: the slot is claimed by `0x405220` (0x4053C3), i.e. by
-        // a chaser or a patrol car that builds its chase this tick — not by one state 1 has just
-        // placed.
-        let wanted = self.wanted;
-        let mut order: Vec<usize> = (0..self.cars.len())
-            .filter(|&i| {
-                let c = &self.cars[i];
-                c.active && c.goto_slice.is_none() && !c.placed && (c.chasing || wanted)
-            })
-            .collect();
-        order.sort_by(|&a, &b| track_distance(table, self.cars[b].slice, target.slice).partial_cmp(&track_distance(table, self.cars[a].slice, target.slice)).unwrap_or(std::cmp::Ordering::Equal));
-        for (rank, &i) in order.iter().enumerate() {
-            self.cars[i].rank = rank;
+    /// `Car_ground` 0x49BD40 for every cop in the world — its `car+0xE20` on the Sc32 list at
+    /// priority 0x1E, inserted right after its drive `car+0xE1C` (`Cars_create` 0x411277…0x411349
+    /// and 0x414C30's "after every equal priority", `traffic.md` §17.5e), so it runs after
+    /// [`Police::drive`] and before the collision pass 0x498FF0 at 0x28. First the tracker
+    /// 0x49AF70 (priority 6, every 32 Hz tick: `Tracker::update` / `updateZone` at `car+0x330` and,
+    /// on a new patch, the plane 0x499520 — `PatchTracker::track`); then, when the LOD gate says
+    /// the car is due (`Lod_shouldUpdate(1, 3, car+0x78, …)`, [`nfs_physics::vehicle::ground_due`]:
+    /// 32 Hz within 96 m of a racer, 16 Hz to 128 m, 8 Hz beyond), `Susp_update` 0x499A70 and the
+    /// arms of `Car_ground` on the cop's car record ([`Vehicle::ai_ground_step`]) — the four probes
+    /// on their wheel trackers, the compression, the roughness, the pitch / roll rates into
+    /// `car+0x388` (which the 64 Hz step [`Police::integrate`] then turns the body by), `car+0x418`,
+    /// `BodyHeight`, the gravity while `car+0x428 > 0.005`, the tilted arm's `BodyGroundCollide`,
+    /// the hard landing and the resting drop. *(Until 2026-09-26 the port stood the cop on the
+    /// contact plane at every 64 Hz step with no pitch / roll rates, no roughness and no landing.)*
+    ///
+    /// MEDIUM: `car+0xD7F` (the throttle `Susp_update`'s roll term reads, 0x49A673) has no writer
+    /// in the cop's drive chain (0x408000…0x40B000 store it nowhere; 0x49E220 zeroes it), so it is
+    /// the record's 0 — the port's body keeps its 0.
+    pub fn ground(&mut self, table: &SliceTable, grid: &TriangleGrid, tick: u64) {
+        let _ = table;
+        for i in 0..self.cars.len() {
+            if !self.cars[i].active {
+                continue;
+            }
+            let slot = self.slot_base + i;
+            let c = &mut self.cars[i];
+            c.sync_body_in();
+            c.body.tracker.track(grid, c.body.position);
+            if let Some((rate_hz, n_ticks)) = nfs_physics::vehicle::ground_due(c.racer_distance, false, tick, slot) {
+                c.body.ai_ground_step(grid, &c.specs, rate_hz, n_ticks, true);
+                tracing::trace!(cop = i, tick, patch = c.body.tracker.word & 0xF, cos_tilt = c.body.cos_tilt, air = c.body.airborne_count, h424 = c.body.body_height, y = c.body.position.y, "cop ground");
+            }
+            c.sync_body_out();
         }
+    }
+
+    /// `Car_postImpact` 0x410280 → 0x40F740's crash countdown for every cop in the world (its
+    /// `car+0xE30`, Sc32 priority 0x32, after the collision pass; `physics.md` §4.1c): while
+    /// `car+0x1100` runs — `Damage` loads it with 0xC0 on an impact past 80 — it loses a tick, eight
+    /// more off the road surface (`car+0x464 == 0`, the car tracker's nibble); an upright, alive
+    /// car stops it, otherwise at zero the car is reset to its slice (`0x40F540(car, 0, 0)`,
+    /// [`Police::reset_at`]), and it restarts when the car's up is under 0.1 along the slice's or the
+    /// car is off the surface (0x40FB6D…0x40FBA2). The same port decision as for the racers: mode
+    /// 0's "the car is fine" exit (0x40F5BF…0x40F632) is **not** carried (`race-logic.md` §7 —
+    /// carrying it parked two thirds of a field; it needs the original running), so a knocked-over
+    /// cop that is dead comes back after its countdown where the original may leave it. MEDIUM.
+    /// `occupied` as in [`CopWorld`].
+    pub fn post_impact(&mut self, table: &SliceTable, grid: &TriangleGrid, occupied: &[usize]) {
+        for i in 0..self.cars.len() {
+            if !self.cars[i].active {
+                continue;
+            }
+            let c = &mut self.cars[i];
+            let off_surface = c.body.tracker.word & 0xF == 0;
+            if c.body.reset_countdown_tick(off_surface) {
+                tracing::debug!(cop = i, slice = c.slice, "cop crash countdown: reset to its slice (0x40F540 mode 0)");
+                self.reset_at(table, grid, i, occupied);
+            }
+            let c = &mut self.cars[i];
+            let up = table.slices[c.slice.min(table.slices.len() - 1)].up.normalize_or_zero();
+            c.body.reset_countdown_start(up, off_surface);
+        }
+    }
+
+    /// `Car_resetToSlice` 0x40F540 (car, mode 1 or 0 past its exits, 0) for cop `i`, read to the
+    /// instruction (0x40F540…0x40F733): `car+0x1104 = car+0x1100 = 0` (0x40F597…0x40F59D; a cop's
+    /// `car+0x540` is 0, so no early return); the slice is the car's own `car+8`
+    /// (0x40F654) or, while 0x40F480 says it is taken, the next along the race (0x4817D0 with
+    /// `[0x657430] ? −1 : 1` — +1 on this port's table, 0x40F666…0x40F691). 0x40F480: the slice
+    /// centre is over a drivable patch (the car's tracker, `updateZone(centre, 1)`, then
+    /// `car+0x2C & 0xF`, 0x40F4BF…0x40F4C8) and no other live car of `0x5E8B34[]` (0x40F4D3…0x40F500)
+    /// and no smackable (0x40F502…0x40F523 — not carried, this port's props keep no slice) has
+    /// `car+8 == s`. Then 0x49E220 (the drivetrain and the AI's forces / velocities: `car+0xD40…`,
+    /// `+0xD4C…`, `+0xD58…`, `+0xD64…`, `+0xD7F` / `+0xD80` — `Vehicle::rearm_after_reset` and
+    /// the fields the port's cop has), the offset `{0, 0, 0}` (a cop is not an opponent,
+    /// 0x40F6A2) into `Car_placeAtSlice` 0x49B090 with `car+0xEAC` as the direction (0x40F6E6),
+    /// `car+0x33C…+0x344 = 0` (0x40F712…0x40F71E) and 0x40F400: `car+0x388…` = 0, `+0xD64…`,
+    /// `+0xD4C…`, `word +0x418`, `+0x42C`, `+0x450`, `+0x430`, `+0x434`, `+0x43C`, `+0x420`,
+    /// `+0x35C`, `+0x1104`, `+0x40C` = 0. The camera call 0x4618B0 is the human's (`car+0x520 ==
+    /// [0x65741C]`). The original searches without end; the port stops after one lap (a guard).
+    fn reset_at(&mut self, table: &SliceTable, grid: &TriangleGrid, i: usize, occupied: &[usize]) {
+        let others: Vec<usize> = self.cars.iter().enumerate().filter(|(j, o)| *j != i && o.active).map(|(_, o)| o.slice).collect();
+        let mut s = self.cars[i].slice.min(table.slices.len() - 1);
+        for _ in 0..table.lap_len.max(1) {
+            if grid.find_patch(table.slices[s].centre) & 0xF != 0 && !occupied.contains(&s) && !others.contains(&s) {
+                break;
+            }
+            s = table.add(s, 1);
+        }
+        let c = &mut self.cars[i];
+        c.body.reset_countdown = 0;
+        // 0x49E220
+        c.body.rearm_after_reset();
+        c.accel_local = Vec3::ZERO;
+        c.accel_world = Vec3::ZERO;
+        c.brake_light = 0;
+        for w in &mut c.body.wheels {
+            *w = nfs_physics::vehicle::Wheel::default();
+        }
+        // 0x49B090 with `car+0xEAC`
+        let sl = &table.slices[s];
+        c.slice = s;
+        c.sync_body_in();
+        c.body.place_at_slice(grid, &c.specs, sl.centre, sl.forward.normalize_or_zero(), Vec3::ZERO, false, c.requested_dir < 0.0);
+        c.sync_body_out();
+        // vel = 0 and 0x40F400
+        c.velocity = Vec3::ZERO;
+        c.angular_velocity = Vec3::ZERO;
+        c.body.velocity = Vec3::ZERO;
+        c.body.angular_velocity = Vec3::ZERO;
+        c.body.v_local = Vec3::ZERO;
+        c.body.w_local = Vec3::ZERO;
+        c.body.airborne_count = 0;
+        c.body.knocked_over = false;
+        c.body.impact = 0.0;
+        c.lateral = (c.position - sl.centre).dot(sl.lateral.normalize_or_zero());
+        c.speed = 0.0;
+        tracing::debug!(cop = i, slice = s, pos = ?c.position, "cop reset to slice (0x40F540)");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run(&mut self, table: &SliceTable, tick: u64, target: &ChaseTarget, others: &[LaneCar], mut spawn: Option<(&[usize], &mut dyn FnMut() -> u32)>, due: &dyn Fn(usize) -> Option<i32>, grid: Option<&TriangleGrid>) {
+        // `AIHigh+0x60`, the rank, is each cop's place in the perp's roster (`0x403C00`, run by the
+        // cop itself when it claims the perp and on each of its state-4 ticks — [`Police::roster_bubble`]),
+        // not a sort of all the chasers. *(Until 2026-09-26 the port re-sorted every chasing cop by
+        // its gap to the target at the head of every pass, without the 12 m hysteresis.)*
         for i in 0..self.cars.len() {
             // 0x406745…0x406770: the AI pass's gate, and `[0x5E6654]` for this update
             let Some(ai_ticks) = due(i) else { continue };
@@ -2010,7 +2785,7 @@ impl Police {
                 let Some((humans, rand16)) = spawn.as_mut() else { continue };
                 let Some(rec) = self.find_spawn_point(table, tick, humans, &mut **rand16) else { continue };
                 let wanted = self.wanted;
-                if !self.deploy_as(table, i, rec, tick, wanted) {
+                if !self.deploy_as(table, i, rec, tick, wanted, grid) {
                     continue;
                 }
             }
@@ -2022,6 +2797,9 @@ impl Police {
             // Until then the GotoSlice keeps driving. The arm has none of state 4's give-up tests,
             // so this comes before them.
             if let Some(goal) = self.cars[i].goto_slice {
+                // 0x405024…0x405045: `+0x58` given back (0x403BA0) and cleared — once, the first
+                // state-9 tick after the stuck one
+                self.release(i);
                 if track_distance(table, self.cars[i].slice, goal).abs() < GOTO_SLICE_ARRIVED {
                     self.cars[i].goto_slice = None;
                     self.cars[i].chasing = false;
@@ -2051,6 +2829,55 @@ impl Police {
                 // state 4's head (0x40444C…0x404455) sets `car+0xECC & 2`, the lights, before its
                 // give-up tests
                 self.cars[i].lights = true;
+                // The arm in the binary's order (0x4044FC…0x404719), before its `0x405220`: the stuck
+                // test (acted on below, after the give-up test — the GotoSlice is only driven if
+                // the cop is still out), then on the live chase the roster, the ram latch and the
+                // nudge. The nudge's LCG step comes even on a stuck tick (0x4046E1 runs on the
+                // freed chase), and before any drop or give-up. *(Until 2026-09-26 the port ran
+                // them after the drop and give-up tests.)*
+                let stuck = self.cars[i].stuck_ticks > STUCK_LIMIT;
+                // 0x404600…0x404666: the roster answers this cop's rank; a changed rank re-aims the chase
+                // at the new formation slot through `0x40CCA0` — but only outside the ram mode, so a
+                // cop that is ramming keeps its slot (and `AIHigh+0x60` still takes the new rank).
+                let lvl = self.cars[i].level.min(2);
+                // (On a stuck tick the roster step still runs — it is the perp's object, 0x40460D —
+                // while the re-aim, the latch and the nudge would write the freed chase.)
+                let r = self.roster_bubble(table, i);
+                if r != self.cars[i].rank {
+                    self.cars[i].rank = r;
+                    if !stuck && !self.cars[i].ram {
+                        self.retarget(table, i, target, FORMATION[lvl][r.min(5)], tick, ai_ticks);
+                    }
+                }
+                // §27.4, 0x40466B…0x4046CE, read to the instruction 2026-09-26: the chase latches the ram
+                // mode for 8 / 12 / 18 s (`0x40CD50`, only while it is not already on) when the cop has
+                // held its formation slot for **more** than `0x5CBEA0[lvl]+0x00` = 10 / 8 / 4 ticks of
+                // `[0x5E6654]` (`chase+0x78`, `jle` skips), sits within `+0x04` = 10 / 14 / 18 m of the
+                // tracked target laterally (`|chase+0x6C|`) and within `+0x08` = 13 / 15 / 18 m of it
+                // along the road (`|chase+0x68|`), both strict. The arm reads what the last `0x40CD70` /
+                // CLOSE-QUARTERS left. *(Until 2026-09-26 the port tested the longitudinal gap alone, so
+                // any cop passing within 13–18 m of the target latched a ram.)*
+                let hold = self.cars[i].slot_ticks > CLOSE_IN_SLOT_TICKS[lvl] && self.cars[i].chase_lat_err.abs() < CLOSE_IN_LATERAL[lvl];
+                if !stuck && !self.cars[i].ram && hold && self.cars[i].chase_gap.abs() < CLOSE_IN_GAP[lvl] {
+                    tracing::debug!(cop = i, tick, "police ram: close-in mode latched (0x4046CE)");
+                    self.cars[i].ram = true;
+                    self.cars[i].ram_until = tick + CLOSE_IN_TICKS[lvl];
+                }
+                // 0x4046D3…0x404719: the nudge. `0x403850(cop, 0.25, target)` rolls the shared LCG on
+                // every state-4 tick and then asks whether the cop is alongside and just ahead; if so
+                // and the ram mode is off, `0x40CCA0` re-aims the chase at the offset `{0, 0, 0}` —
+                // right on the target, and latched until the next rank change — and `0x40CD50(chase, 1,
+                // 0x20)` rams for half a second. (Without the LCG — the unit tests' `update` — no roll.)
+                if let Some((_, rand16)) = spawn.as_mut() {
+                    let r = rand16();
+                    if !stuck && nudge_roll(ai_ticks, r) && self.alongside(table, i, target) && !self.cars[i].ram {
+                        self.retarget(table, i, target, [0.0; 3], tick, ai_ticks);
+                        self.cars[i].ram = true;
+                        self.cars[i].ram_until = tick + NUDGE_TICKS;
+                        tracing::debug!(cop = i, tick, "police nudge: dead-on ram for 0x20 ticks (0x404714)");
+                    }
+                }
+
                 // State 4 runs `0x405220` itself (0x40471F). With no wanted perp left both of its
                 // passes come up empty (pass 1's `lim` is 0 for a clean perp, pass 2 asks for
                 // `perp+0x78 != 0`), and since the cop still holds a target it releases the slot
@@ -2082,10 +2909,11 @@ impl Police {
                 // (`AIHigh+0x20`) that could also move state 3 are never set in this build (§17.5b).
                 self.cars[i].lights = false;
                 if let Some(p) = self.acquire(table, i, target) {
-                    // 0x4053AC / 0x4053C3: `+0x58` and the claim on the perp
+                    // 0x4053AC / 0x4053C3: `+0x58` and the claim on the perp; 0x404316 the rank
                     self.cars[i].target = Some(p);
+                    self.cars[i].rank = self.roster_claim(table, i);
                     built_parked = self.cars[i].parked;
-                    self.build_chase(i);
+                    self.build_chase(table, i, target, tick, ai_ticks);
                 }
             }
             // §17.5 give-up: too far (`0x4071E0` — in state 4 at 0x40484D, in state 2 at 0x4043D6
@@ -2118,47 +2946,53 @@ impl Police {
                 let (_, goal) = self.reference_of(i, target);
                 let c = &mut self.cars[i];
                 c.goto_slice = Some(goal);
-                // state 9 gives its slot back and drops the target (0x40503A → 0x403BA0)
-                c.target = None;
                 c.stuck_ticks = 0;
                 // the Chase's deleting dtor 0x40CC10 zeroes `car+0x1064…0x1070`, `+0x1078`, `+0x107C`
                 // (the ram aim point) and puts `car+0x1098` / `+0x109C` back to 1.0
                 c.aim_point = Vec3::ZERO;
                 c.boost_engine = 1.0;
                 c.boost_speed = 1.0;
+                c.ram = false;
+                c.lane_override = 0.0;
+                c.lane_bias = 0.0;
+                // the slot is given back by state 9's own arm on the next tick (0x40503A)
                 tracing::debug!(cop = i, "police stuck 160 ticks: GotoSlice to the reference car's slice (state 9)");
                 self.goto_slice(table, i, target, others, ai_ticks);
                 continue;
             }
 
-            // §27.5 geometry
-            let gap = track_distance(table, self.cars[i].slice, target.slice);
-            let lateral_err = self.cars[i].lateral - target.lateral;
+            // `AIState_Chase::update` 0x40CF70 — `0x40CD70` first: the tracker, the geometry, the
+            // aim point cleared, the ram mode lapsed, the boost charged and reset
+            self.chase_geometry(table, i, target, tick, ai_ticks);
+            let gap = self.cars[i].chase_gap;
+            let lateral_err = self.cars[i].chase_lat_err;
+            // `chase+0x64` = sign of the cop's `car+0xEC0` and `chase+0x60` = sign of the tracked
+            // target speed `chase+0x40` (0x40CD81…0x40CDBB), `>= 0` giving +1 for both
             let sign_speed = if self.cars[i].speed >= 0.0 { 1.0 } else { -1.0 };
-            let sign_lat = if lateral_err >= 0.0 { 1.0 } else { -1.0 };
-            self.cars[i].aim_point = Vec3::ZERO;
-            // 0x40CD70's tail: charge the boost the last update left on, and reset it
-            self.spend_boost(i, ai_ticks);
-            // §27.4 / 0x4046CE: inside the level's close-in gap the chase latches the ram mode for
-            // 8 / 12 / 18 s, and `0x40CD50` only latches it while it is not already running.
-            let lvl = self.cars[i].level.min(2);
-            if tick >= self.cars[i].ram_until && gap.abs() < CLOSE_IN_GAP[lvl] {
-                self.cars[i].ram_until = tick + CLOSE_IN_TICKS[lvl];
-            }
+            let sign_tgt = if self.cars[i].tracker.speed >= 0.0 { 1.0 } else { -1.0 };
 
-            // §27.6 dispatch
+            // §27.6 dispatch: `dv` and `slow` read the target's own `car+0xEC0` (0x40CF9A, 0x40CFF4),
+            // not the tracked one
             let dv = self.cars[i].speed - target.speed;
             let adv = dv.abs();
             let near = gap.abs() * 0.025;
             let slow = target.speed.abs() < 6.667;
             let mode = if near > adv && gap.abs() > 140.0 {
                 ChaseMode::CatchUp
-            } else if sign_lat * sign_speed == 1.0 && !slow {
+            } else if sign_tgt * sign_speed == 1.0 && !slow {
+                // 0x40D09B…0x40D0B3: `chase+0x60 · chase+0x64 == 1` — the cop and the target travel
+                // the same way. *(Until 2026-09-26 the port multiplied the cop's direction by the
+                // sign of the lateral error `chase+0x6C`, so a cop to the left of a target going
+                // its way never took CLOSE-QUARTERS.)*
                 ChaseMode::CloseQuarters
             } else if sign_speed * gap >= 0.0 && !slow {
                 ChaseMode::CatchUp
             } else {
-                ChaseMode::Pursue { hard: adv > 26.67 && gap.abs() > 80.0 }
+                // 0x40D0D6…0x40D10D: `fcomp 26.67 ; test ah, 0x41 ; je push 0` — the flag is 0 when
+                // `adv` is **above** 26.67, and the same idiom on `|chase+0x68|` against 80 (`[0x5B26D4]`),
+                // so the ram is for a cop that is close and not closing fast. *(Until 2026-09-26 the
+                // port — and `traffic.md` §17.5 / §27.6 — had both comparisons the other way round.)*
+                ChaseMode::Pursue { hard: adv <= 26.67 && gap.abs() <= 80.0 }
             };
             self.cars[i].mode = Some(mode);
             // CATCH-UP (0x40D049 / 0x40D055) and PURSUE (0x40D6FE / 0x40D70A) point the car at the
@@ -2169,12 +3003,20 @@ impl Police {
             if !matches!(mode, ChaseMode::CloseQuarters) {
                 self.cars[i].requested_dir = if gap > 0.0 { -1.0 } else { 1.0 };
             }
-            self.apply_boost(i, tick, gap);
+            // `0x40CE80`'s human test is `0x40E6E0(cop, human)`, the plain slice gap
+            let human_gap = track_distance(table, self.cars[i].slice, target.slice);
+            self.apply_boost(i, tick, human_gap, true);
+            // CLOSE-QUARTERS in the ram mode runs `0x40CE80(this, 0)` again (0x40D19F) — the boost
+            // without the human suppression — before its `0x40AF70` (0x40D507). *(Until 2026-09-26
+            // the port suppressed it near the human in the ram mode too.)*
+            if matches!(mode, ChaseMode::CloseQuarters) && self.cars[i].ram {
+                self.apply_boost(i, tick, human_gap, false);
+            }
 
-            let mut speed = self.base_target_speed(&self.cars[i], target.speed);
+            let mut speed = self.base_target_speed(i, target);
             match mode {
-                // §27.7: flat out, no cap at all
-                ChaseMode::CatchUp => {}
+                // §27.7: flat out, no cap at all; out of the slot (`chase+0x78 = 0`, 0x40D029)
+                ChaseMode::CatchUp => self.cars[i].slot_ticks = 0,
                 // §27.8, the formation controller in full: compare the sector the cop is in with
                 // the one its formation slot wants, pick a speed to close the difference and bias
                 // the lateral aim toward the slot.
@@ -2182,11 +3024,11 @@ impl Police {
                     let lvl = self.cars[i].level.min(2);
                     let dir = self.cars[i].dir;
                     let (hw, hl) = (target.half_width, target.half_length);
-                    let ram = tick < self.cars[i].ram_until;
-                    let offset = FORMATION[lvl][self.cars[i].rank.min(5)];
-                    // `chase+0x58` / `+0x5C`: the sectors the offset itself falls in. In the ram mode
-                    // the slot is "dead on" and the boost is not suppressed (0x40D194).
-                    let (want_lon, want_lat) = if ram { (0, 0) } else { (sector(offset[2], -hl, hl), sector(offset[0], -hw, hw)) };
+                    let ram = self.cars[i].ram;
+                    let offset = self.cars[i].formation;
+                    // `chase+0x58` / `+0x5C`: the sectors of the latched offset. In the ram mode the
+                    // slot is "dead on" and the boost is not suppressed (0x40D194).
+                    let (want_lon, want_lat) = if ram { (0, 0) } else { (self.cars[i].want_lon, self.cars[i].want_lat) };
                     let lat = sector(dir * lateral_err, -hw, hw);
                     let g = dir * gap;
                     let p = sector(g, 2.0 - hl, hl + 2.0);
@@ -2203,13 +3045,17 @@ impl Police {
                     } else if want_lon == 1 && lon == 1 && lat == 0 && gap < 20.0 {
                         sub = -2;
                     }
-                    // the target speed the slot implies
-                    let mut want = target.speed.abs();
+                    // the target speed the slot implies, from the tracked `|chase+0x40|`
+                    let mut want = self.cars[i].tracker.speed.abs();
                     if p < want_lon {
                         want *= 1.4; // behind the slot: chase
                     } else if p > want_lon || sub == -1 {
                         want *= close_quarters_factor(gap); // ahead of it: ease off
-                    } else if gap.abs() <= 20.0 {
+                    } else if gap <= 20.0 {
+                        // 0x40D3BC: the **signed** `chase+0x68` against 20 (`test ah, 0x41 ; jne`), so a
+                        // cop more than 20 m behind its slot keeps the target's speed here too.
+                        // *(Until 2026-09-26 the port tested `|chase+0x68|` and eased such a cop off
+                        // by the distance table.)* The branch at 0x40D3CC (`> 20` and `< 10`) is dead.
                         if sub == -2 {
                             want *= CLOSE_QUARTERS_SLOW[lvl];
                         }
@@ -2219,18 +3065,25 @@ impl Police {
                     // `cop+0xEB8 = dir · max(5, min(S, |cop+0xEB8|))`
                     speed = dir * want.min(speed.abs()).max(5.0);
                     if ok {
-                        let y = if ram {
-                            self.cars[i].aim_lateral = 30.0;
-                            target.lateral
+                        // `chase+0x38`, the tracked target lateral
+                        let base = self.cars[i].tracker.lateral;
+                        let (y, bias) = if ram {
+                            (base, 30.0)
                         } else {
-                            self.cars[i].aim_lateral = 15.0;
                             // `+ dir·(half width + 6)` when the cop has to swing out, else the
                             // slot's own lateral offset; then clamped onto the road
-                            let y = target.lateral + if m != 0 { dir * (hw + 6.0) } else { dir * offset[0] };
+                            let y = base + if m != 0 { dir * (hw + 6.0) } else { dir * offset[0] };
+                            // 0x40D5CF…0x40D638: clamped to `[−rec+0x48·rec+0x38, rec+0x4C·rec+0x3C]`
+                            // of the cop's slice — lane width × lane count on each side, not the road
+                            // half-widths `rec+0x40` / `+0x44` the port used until 2026-09-26
                             let sl = &table.slices[self.cars[i].slice.min(table.slices.len() - 1)];
-                            y.min(sl.width_b).max(-sl.width_a)
+                            (y.max(-(sl.lane_width_a * sl.lanes_a as f32)).min(sl.lane_width_b * sl.lanes_b as f32), 15.0)
                         };
-                        self.cars[i].lateral_target = y;
+                        // 0x40D642 / 0x40D64B: `car+0x1078 = y`, `car+0x107C = 15 / 30` — the lane
+                        // pass that follows honours it through `0x402790`. *(Until 2026-09-26 the
+                        // port wrote `y` into the lane target, which its lane pass then overwrote.)*
+                        self.cars[i].lane_override = y;
+                        self.cars[i].lane_bias = bias;
                     }
                 }
                 // §27.9: the distance ladder is a cap on the 100 m/s base, and `hard` rams
@@ -2238,7 +3091,13 @@ impl Police {
                     let d = crate::traffic::oct_distance(self.cars[i].position, target.position);
                     let v = pursue_cap(self.cars[i].level, d);
                     speed = if self.cars[i].dir >= 0.0 { speed.min(v) } else { speed.max(-v) };
+                    // out of the slot (`chase+0x78 = 0`, 0x40D6D6)
+                    self.cars[i].slot_ticks = 0;
                     if hard {
+                        // 0x40D9A7…0x40D9EF, after the lane pass: `car+0x1064… = target.pos`,
+                        // `car+0x1070 = target+0xED0` — and `car+0x1078 = target+0xED0`, `+0x107C =
+                        // 15`, which nothing reads before the next `0x40CD70` puts both back to 1.0
+                        // (or the chase's dtor zeroes them), so they are not carried
                         self.cars[i].aim_point = target.position;
                         self.cars[i].aim_lateral = target.lateral;
                     }
@@ -2275,7 +3134,7 @@ impl Police {
             c.lateral_target = c.lateral;
             return;
         }
-        let speed = self.base_target_speed(&self.cars[i], target.speed);
+        let speed = self.base_target_speed(i, target);
         {
             let c = &mut self.cars[i];
             c.mode = None;
@@ -2315,7 +3174,7 @@ impl Police {
             1.0
         };
         // the U-turn is the throttle gates' (§27.7), as in the chase
-        let speed = self.base_target_speed(&self.cars[i], target.speed);
+        let speed = self.base_target_speed(i, target);
         {
             let c = &mut self.cars[i];
             c.mode = None;
@@ -2327,7 +3186,7 @@ impl Police {
 
     /// §27.2's drive model, the same one traffic runs — `0x408360` for cop `i`.
     /// `dt` / `n_ticks` are `[0x5E6D7C]` / `[0x5E6D78]` from the gate ([`Police::drive`]).
-    fn drive_car(&mut self, table: &SliceTable, tick: u64, i: usize, dt: f32, n_ticks: i32) {
+    fn drive_car(&mut self, table: &SliceTable, tick: u64, i: usize, dt: f32, n_ticks: i32, world: Option<CopWorld<'_>>) {
         // `0x408360` grants the requested direction first (0x4083B6…0x4083CF: `car+0xEB0 =
         // car+0xEAC` while `car+0xEC4 < 8.889`, `[0x5B2430]`) and only then runs the drive chain
         // (0x40A900, 0x4082E0, …) — so a U-turn asked for by this tick's state (0x406720 runs
@@ -2341,18 +3200,29 @@ impl Police {
         }
         let sl = table.slices[self.cars[i].slice.min(table.slices.len() - 1)].clone();
         let st_road = (sl.width_a, sl.width_b);
-        // The exits of 0x40852A…0x408646, taken before the drive chain (`traffic.md` §21.7): a cop
-        // whose `car+0x418` is 0 and whose up axis `car+0x374` is below 0.3 (`[0x5B25F0]`,
-        // 0x40854C) — on its side or its roof — or whose target speed `car+0xEB8` is exactly 0
-        // (0x4085EC) is only damped: `vel ×= 0.94` (`[0x5B25F4]`… 0x40863C, 0x532360) and
-        // `ω.y ×= 0.98` (0x408512), and returns. The damaged-out exit (`car+0x540`, 0.99) has no
-        // writer for a cop and the finished-racer exit needs `car+0x52C & 1`; the knocked-over
-        // one (`car+0x42C == 1`, 0.98) needs `Damage`, which the port's cops do not take (gap).
-        // *(Until 2026-09-25 the cops drove through all of them.)*
+        // The exits of 0x4084C3…0x408646, taken before the drive chain (`traffic.md` §21.7), each
+        // zeroing the AI's force / torque `car+0xD34…`, `+0xD4C…`, `+0xD70…` and damping:
+        // * 0x4084C3 — knocked over, `car+0x42C == 1` (`Damage` 0x49489A on an impact past 80,
+        //   [`Vehicle::knocked_over`]; only a reset clears it): `vel ×= 0.98` (0x408505) and
+        //   `ω.y ×= 0.98` (0x408512). *(Not taken before 2026-09-26: the port's cops took no
+        //   `Damage`.)*
+        // * 0x40854C — `car+0x418 == 0` and the up axis `car+0x374` below 0.3 (`[0x5B25F0]`), on
+        //   its side or its roof, and 0x4085EC — the target speed `car+0xEB8` exactly 0: `vel ×=
+        //   0.94` (`[0x5B25F4]`, 0x40863C, 0x532360) and `ω.y ×= 0.98`. The damaged-out exit
+        //   (`car+0x540`, 0.99) has no writer for a cop and the finished-racer exit needs
+        //   `car+0x52C & 1`. *(Until 2026-09-25 the cops drove through all of them.)*
         {
             let c = &mut self.cars[i];
-            if (c.airborne_count == 0 && c.orientation.row(1).y < 0.3) || c.target_speed == 0.0 {
-                c.velocity *= 0.94;
+            let damp = if c.body.knocked_over {
+                Some(0.98)
+            } else if (c.body.airborne_count == 0 && c.orientation.row(1).y < 0.3) || c.target_speed == 0.0 {
+                Some(0.94)
+            } else {
+                None
+            };
+            if let Some(k) = damp {
+                c.accel_local = Vec3::ZERO;
+                c.velocity *= k;
                 c.angular_velocity.y *= 0.98;
                 return;
             }
@@ -2382,6 +3252,12 @@ impl Police {
             if aidrive::in_trouble(&mut c.gear, lane, sl.lanes_a as i32, sl.lanes_b as i32, up_y, n_ticks) {
                 aidrive::toggle_gear(&mut c.gear, tick, c.speed, aidrive::GEAR_PERIOD);
             }
+            // `0x408F20` → `0x4090C0` (0x4086A9, after the trim and the U-turn zero): with an
+            // explicit aim point `car+0x1074 = car+0x1070` (0x40954E…0x409557). *(Until 2026-09-26
+            // the port drove PURSUE's ram on the lane pass's target.)*
+            if c.aim_point != Vec3::ZERO {
+                target = c.aim_lateral;
+            }
             target
         };
         let mut st = self.cars[i].as_ai_state(self.phys.max_lat_acc, self.phys.max_yaw_acc);
@@ -2403,11 +3279,16 @@ impl Police {
         let accel = crate::traffic::accel_rate_for(false, st.speed, self.cars[i].boost_engine)
             * if self.weather { 0.9 } else { 1.0 };
         let bend = aidrive::road_bend(table, self.cars[i].slice, self.cars[i].dir);
+        // `car+0x108C` (the lit 0x40AF70's `car+0x109C`): the brake force `car+0x1014→+0x80` is
+        // multiplied by it when it exceeds 1 in both controllers (0x409B46 / 0x40A105), and the
+        // in-control lateral pair too (0x409E95…0x409EB2)
+        let rate_mul = self.cars[i].rate_mul;
+        let brake = self.phys.brake_force * if rate_mul > 1.0 { rate_mul } else { 1.0 };
         let cmd = if aidrive::out_of_control(&st, &self.cfg.out_of_control, err, st_road, bend) {
-            aidrive::out_of_control_command(&st, &self.cfg.out_of_control, err, accel, self.phys.brake_force)
+            aidrive::out_of_control_command(&st, &self.cfg.out_of_control, err, accel, brake)
         } else {
             let grip = 1.0 + 0.0015 * aidrive::body_forward_speed(&st);
-            aidrive::in_control_command(&st, &self.cfg.in_control, err, aim, grip, self.cars[i].boost_engine, accel, self.phys.brake_force)
+            aidrive::in_control_command(&st, &self.cfg.in_control, err, aim, grip, rate_mul, accel, brake)
         };
         {
             let c = &self.cars[i];
@@ -2420,6 +3301,25 @@ impl Police {
         c.brake_light = aidrive::brake_light(c.brake_light, cmd.braking, n_ticks as u8);
         c.velocity = st.velocity;
         c.angular_velocity = st.angular_velocity;
+        // the controller's `car+0xD4C…` (lateral, 0, forward; 0x40A18F / 0x40A1B9) and 0x40A1D0's
+        // `car+0xD40…` = that force in the world (0x40A236 / 0x40A27B; `car+0xD70…` is 0)
+        c.accel_local = Vec3::new(cmd.lateral, 0.0, cmd.forward);
+        c.accel_world = c.orientation.row(0) * cmd.lateral + c.orientation.row(2) * cmd.forward;
+        // 0x408750 at the end of every driving tick (0x4086E6), read to the instruction
+        // (0x408750…0x408800): `car+0x344` (`vel.z`) above 115 (`[0x5B25FC]`), or `car+0x33C`
+        // (`vel.x`) above 115, or the speed estimate `car+0x35C` above 115 with `car+0x7E == 0`
+        // (always — `+0x7E` is only ever written 0) — **signed** compares, not magnitudes
+        // (`fcomp; test ah,0x41; je`) — or the lateral offset `car+0xED0` below
+        // `−[slice+0x40] − 35` or above `[slice+0x40] + 35` (`[0x5B25F8]`; the slice's own
+        // half-width field, `width_a` in the track's frame) → `0x40F540(car, 1, 0)`
+        // ([`Police::reset_at`]). *(Not run for a cop before 2026-09-26.)*
+        let w_half = if table.backwards { sl.width_b } else { sl.width_a };
+        let insane = c.velocity.z > SANITY_SPEED || c.velocity.x > SANITY_SPEED || c.speed_estimate() > SANITY_SPEED;
+        let off_road = c.lateral < -(w_half + SANITY_OFF_ROAD) || c.lateral > w_half + SANITY_OFF_ROAD;
+        if (insane || off_road) && let Some(w) = world {
+            tracing::debug!(cop = i, tick, insane, off_road, lat = c.lateral, vel = ?c.velocity, "cop sanity net 0x408750");
+            self.reset_at(table, w.grid, i, w.occupied);
+        }
     }
 
     /// `AIHigh_Perp+0x78`: whether the perp is wanted. A patrol car picks that up in its own next
@@ -2430,19 +3330,137 @@ impl Police {
         self.wanted = wanted;
     }
 
-    /// State 2 → 4 (0x4043A8) / 3 → 4 (0x404E4B): a new `AIState_Chase` (ctor 0x40CB60) — the boost
-    /// budget `+0x7C` from `0x5CBEA0[lvl]+0x10`, the blackout `+0x8C = 0` (0x40CBD8), the stuck
-    /// timer `+0x90 = 0` (0x40CBF1) and `car+0x1098` / `+0x109C = 1.0` (0x40CBA6). The lights are
-    /// not touched: they come on at the next tick's state-4 head.
-    fn build_chase(&mut self, i: usize) {
+    /// The rest of `0x403850` (0x4038B7…0x403937), after the roll: the cop is alongside and just
+    /// ahead — `|cop+0xED0 − target+0xED0|` strictly between `target+0x3A8 + 1` and 4.0, and
+    /// `0x40E860(cop, target) · cop+0xEB0` strictly between `2·(target+0x3B0 + 1)` and 12.0.
+    /// `0x40E860` is `0x40E920`'s rule with the target's own position as the point ([`fine_gap`]).
+    fn alongside(&self, table: &SliceTable, i: usize, target: &ChaseTarget) -> bool {
+        let c = &self.cars[i];
+        let lat = (c.lateral - target.lateral).abs();
+        if !(target.half_width + 1.0 < lat && lat < 4.0) {
+            return false;
+        }
+        let lon = fine_gap(table, c.slice, c.position, target.slice, target.position) * c.dir;
+        2.0 * (target.half_length + 1.0) < lon && lon < 12.0
+    }
+
+    /// `0x403BD0(slot, car, role)` on the perp, read to the instruction 2026-09-26: `+0x70[role]++`
+    /// (here [`Police::claims`]), the new pair stored at `+0x44` / `+0x48` — **entry 6**, the bottom
+    /// of the roster — with the cop's position `+0x4C[slot] = 5`, then `0x403C00` bubbles it up.
+    /// Whatever sat in entry 6 is overwritten (with at most four cops it is always empty by then).
+    /// Returns the rank.
+    fn roster_claim(&mut self, table: &SliceTable, i: usize) -> usize {
+        self.roster[6] = Some(i);
+        self.cars[i].roster_pos = 5;
+        self.roster_bubble(table, i)
+    }
+
+    /// `0x403BA0(slot, car, role)`: `+0x70[role]--` and the cop's entry (`+0x1C + 8·pos`, entry
+    /// `pos + 1`) set to −1 — a hole, which the cops below walk up through on their next state-4
+    /// tick; the position itself is left as it was. Every caller tests `AIHigh+0x58` first, so it
+    /// only runs for a cop that holds the perp; the target is cleared with it (`+0x58 = 0`).
+    fn release(&mut self, i: usize) {
+        if self.cars[i].target.take().is_some() {
+            let e = (self.cars[i].roster_pos + 1).min(6);
+            self.roster[e] = None;
+        }
+    }
+
+    /// `0x403C00(slot, car)` on the perp, read to the instruction 2026-09-26 (0x403C00…0x403CAD) —
+    /// the insertion step that ranks the chasers. From the cop's own position `pos` (entry `pos + 1`)
+    /// it looks at the entry above: an empty one (−1) it always moves past; an occupied one only
+    /// when that cop is more than 12 m **behind** it, `0x40E740(thatCop, thisCop.slice) ·
+    /// perp+0xEB0 < −12` (0x403C45…0x403C71). Each move swaps the two entries and their positions
+    /// (0x403C73…0x403C91); it stops at position 0 (entry 1) or at the first cop it cannot pass. The
+    /// answer is the position — the rank, 0 being the cop furthest ahead. Only the calling cop
+    /// moves up; another is moved down only when one passes it. Called by the claim (0x403BF5), by
+    /// state 2 / 3 right after it (0x404316), and by state 4 every tick (0x404610), each cop in its
+    /// own update. The perp's `car+0xEB0` is the race direction, +1 on this port's table.
+    fn roster_bubble(&mut self, table: &SliceTable, i: usize) -> usize {
+        let mut pos = self.cars[i].roster_pos;
+        while pos > 0 {
+            if let Some(j) = self.roster[pos] {
+                // `· perp+0xEB0`, +1 here
+                let behind = track_distance(table, self.cars[j].slice, self.cars[i].slice);
+                if !(behind < -12.0) {
+                    break;
+                }
+                self.cars[j].roster_pos = pos;
+            }
+            self.roster[pos + 1] = self.roster[pos];
+            self.roster[pos] = Some(i);
+            pos -= 1;
+            self.cars[i].roster_pos = pos;
+        }
+        pos
+    }
+
+    /// State 2 → 4 (0x4043A8) / 3 → 4 (0x404E4B): a new `AIState_Chase`, ctor 0x40CB60 read to the
+    /// instruction 2026-09-26 — the tracker `0x403620` with the gain `0x5CBEDC[SKILL]`, the boost
+    /// budget `+0x7C` from `0x5CBEA0[lvl]+0x10`, then `0x40CCA0(target, 0x5CBEE8[lvl][rank])` (the
+    /// formation latch, which runs `0x40CD70` — a tracker step and the geometry), then `car+0x1098`
+    /// / `+0x109C = 1.0` (0x40CBA6), the blackout `+0x8C = 0` (0x40CBD8), `+0x44 = 0` and the stuck
+    /// timer `+0x90 = 0` (0x40CBF1). The lights are not touched: they come on at the next tick's
+    /// state-4 head. The state then runs the chase's update the same tick (0x405092), whose own
+    /// `0x40CD70` steps the tracker a second time.
+    fn build_chase(&mut self, table: &SliceTable, i: usize, target: &ChaseTarget, tick: u64, ai_ticks: i32) {
+        let k = TRACKER_GAIN[(self.skill as usize).min(2)];
+        let tracker = ChaseTracker::new(table, k, &self.cars[i], target);
         let c = &mut self.cars[i];
         c.chasing = true;
         c.parked = false;
+        c.tracker = tracker;
         c.boost_budget = BOOST_BUDGET[c.level.min(2)];
-        c.blackout_until = 0;
-        c.stuck_ticks = 0;
+        let offset = FORMATION[c.level.min(2)][c.rank.min(5)];
+        self.retarget(table, i, target, offset, tick, ai_ticks);
+        let c = &mut self.cars[i];
         c.boost_engine = 1.0;
         c.boost_speed = 1.0;
+        c.blackout_until = 0;
+        c.stuck_ticks = 0;
+    }
+
+    /// `0x40CCA0(chase, target, &offset)`, read to the instruction 2026-09-26: a different target
+    /// resets the tracker (0x403650 — never in this port, where only the human is ever claimed and
+    /// the chase is rebuilt for it); the offset is latched at `chase+0x4C`, its sectors worked out
+    /// against the target's half width / length (`+0x5C`: `x < −hw` → −1, `x > hw` → +1; `+0x58` the
+    /// same for `z` and `hl`, all strict), the ram mode, its deadline and the slot timer cleared
+    /// (`+0x70`, `+0x74`, `+0x78`), and `0x40CD70` run.
+    fn retarget(&mut self, table: &SliceTable, i: usize, target: &ChaseTarget, offset: [f32; 3], tick: u64, ai_ticks: i32) {
+        let c = &mut self.cars[i];
+        c.formation = offset;
+        c.want_lat = sector(offset[0], -target.half_width, target.half_width);
+        c.want_lon = sector(offset[2], -target.half_length, target.half_length);
+        c.ram = false;
+        c.ram_until = 0;
+        c.slot_ticks = 0;
+        self.chase_geometry(table, i, target, tick, ai_ticks);
+    }
+
+    /// `0x40CD70(chase)`, read to the instruction 2026-09-26 (0x40CD70…0x40CE7B): the tracker step
+    /// (`0x4036F0`), `chase+0x6C = cop+0xED0 − chase+0x38`, `chase+0x68 = 0x40E920(cop, chase+0x18,
+    /// chase+0x28)`, the aim point `car+0x1064…0x1070` zeroed, the ram mode lapsed once `gGameTick >=
+    /// chase+0x74`, and the boost the last update left on charged and reset (0x40CE36…0x40CE72,
+    /// [`Police::spend_boost`]). (`chase+0x60` / `+0x64`, the two direction signs, are read off the
+    /// tracker and the car where the dispatch needs them.)
+    fn chase_geometry(&mut self, table: &SliceTable, i: usize, target: &ChaseTarget, tick: u64, ai_ticks: i32) {
+        let mut tr = self.cars[i].tracker;
+        tr.step(table, &self.cars[i], target);
+        let c = &mut self.cars[i];
+        c.tracker = tr;
+        c.chase_lat_err = c.lateral - tr.lateral;
+        c.chase_gap = fine_gap(table, c.slice, c.position, tr.slice, tr.point);
+        c.aim_point = Vec3::ZERO;
+        c.aim_lateral = 0.0;
+        // 0x40CE68 / 0x40CE72: `car+0x1078 = car+0x107C = 1.0` — a 1 m offset in the track's own
+        // frame (the port's backwards table mirrors the lateral axis) at a bias of 1
+        c.lane_override = if table.backwards { -1.0 } else { 1.0 };
+        c.lane_bias = 1.0;
+        if c.ram && tick >= c.ram_until {
+            c.ram = false;
+            c.ram_until = 0;
+        }
+        self.spend_boost(i, ai_ticks);
     }
 
     /// State 4 → 2 (0x4047D9): the target is gone, an `AIState_Normal` replaces the chase, whose
@@ -2450,9 +3468,12 @@ impl Police {
     /// `car+0x1098` / `+0x109C` back to 1.0. `car+0xEAC` is not written (the 0x4047CA store sits on
     /// the dead order branch), and the lights are left to state 2's head next tick.
     fn drop_chase(&mut self, i: usize) {
+        self.release(i);
         let c = &mut self.cars[i];
         c.chasing = false;
-        c.target = None;
+        c.ram = false;
+        c.lane_override = 0.0;
+        c.lane_bias = 0.0;
         c.mode = None;
         c.aim_point = Vec3::ZERO;
         c.boost_engine = 1.0;
@@ -2465,6 +3486,15 @@ impl Police {
         let sl = table.slices[self.cars[i].slice.min(table.slices.len() - 1)];
         let mut cars: Vec<LaneCar> = others.to_vec();
         cars.extend(self.cars.iter().enumerate().filter(|(j, o)| *j != i && o.active).map(|(_, o)| o.as_lane_car(table)));
+        // `car+0x528` of each entry of `cars`, when the caller gave the others' (the race gives
+        // them; the unit tests do not and the walk sorts the cars itself)
+        let places: Vec<usize> = self
+            .other_places
+            .iter()
+            .copied()
+            .chain(self.cars.iter().enumerate().filter(|(j, o)| *j != i && o.active).map(|(_, o)| o.place))
+            .collect();
+        let placed = self.other_places.len() == others.len();
         let c = &self.cars[i];
         let me = LaneSelf {
             slice: c.slice,
@@ -2481,15 +3511,15 @@ impl Police {
         };
         let mut sc = LaneScratch::default();
         let mut scan = c.scan;
-        sc.find_blockers(table, &me, &cars, &PERSONALITIES[0]);
+        sc.find_blockers_placed(table, &me, &cars, &PERSONALITIES[0], None, placed.then_some((c.place, places.as_slice())));
         sc.score_own_side(&me, self.one_way, true);
         // §27.10 `0x40DA00`: +15 to whichever side the target is on (`0x401380` × 3), but only when
         // the lane corridor between the two cars is broken at the target's slice and whole at the
         // cop's; the stuck timer counts while it is broken at both. `chase+0x68` is the longitudinal
-        // gap 0x40CD70 measures; the port stands the track gap in for it, as the dispatch does.
+        // gap 0x40CD70 measured this tick (`CopCar::chase_gap`).
         let mut stuck = self.cars[i].stuck_ticks;
         if chase {
-            let gap = track_distance(table, me.slice, target.slice);
+            let gap = self.cars[i].chase_gap;
             match lane_bias(table, me.slice, me.lane, target.slice, target.lane, gap) {
                 LaneBias::Skip => {}
                 LaneBias::Clear => stuck = 0,
@@ -2510,111 +3540,55 @@ impl Police {
         sc.score_narrowing(table, &me);
         sc.score_shoulders(table, &me, &cars);
         let (slot, lane) = sc.pick(&me);
-        let lateral_target = sc.lateral_target(table, &me, lane, slot, &cars);
+        // 0x402A5A…0x402A7D: a positive `car+0x107C` first tries the held offset `car+0x1078`
+        // (`0x402790`), which bypasses the squeeze-past and the lane centre when it wins
+        let (held, bias) = (self.cars[i].lane_override, self.cars[i].lane_bias);
+        let lateral_target = if bias > 0.0 && sc.override_holds(table, &me, held, bias) { held } else { sc.lateral_target(table, &me, lane, slot, &cars) };
         let capped = sc.capped_target(&me, lane, lateral_target, 0.0, &cars);
         let c = &mut self.cars[i];
         c.scan = scan;
         c.stuck_ticks = stuck;
-        // a ram aim point overrides the lane target
-        if c.aim_point == Vec3::ZERO {
-            c.lateral_target = lateral_target;
-        }
+        // `car+0xEB4` is written whatever the aim point; the drive's `0x4090C0` takes `car+0x1070`
+        // instead when there is an explicit one. *(Until 2026-09-26 the port kept the old lane
+        // target under an aim point.)*
+        c.lateral_target = lateral_target;
         c.target_speed = capped;
     }
 
-    /// The 64 Hz half: move, turn and re-derive the route frame, exactly as traffic does.
+    /// The 64 Hz half — the two shared Sc64 integrators every car record runs (`car+0xE24` /
+    /// `+0xE28`): `0x49B7A0` `pos += vel · 1/64` and `0x49B8E0`'s rotation by the **whole** `ω/64`
+    /// ([`nfs_physics::vehicle::orientation_step`]: the pitch and roll rates `Susp_update` wrote
+    /// into `car+0x388` turn the body, as for a racer; until 2026-09-26 the port turned a cop
+    /// about its up axis only and stood it on the contact plane instead) — then the route frame:
+    /// the slice, the lateral offset `car+0xED0` and the route speed `car+0xEC0`, exactly as
+    /// traffic does. The ground contact is [`Police::ground`], on the 32 Hz list; without a grid
+    /// (the unit tests' [`Police::integrate`] alone) a cop keeps the slice's height (port
+    /// fallback).
     pub fn integrate(&mut self, table: &SliceTable, dt: f32) {
-        self.integrate_on(table, dt, None)
+        self.integrate_at(table, dt, false)
     }
 
-    /// The same step with the track's collision grid: a cop keeps `car+0xE20 = Car_ground` 0x49BD40
-    /// exactly as traffic does (§14.1), so it follows the surface under it.
-    pub fn integrate_on(&mut self, table: &SliceTable, dt: f32, ground: Option<&nfs_physics::collision::TriangleGrid>) {
+    /// [`Police::integrate`] with `grounded` saying whether [`Police::ground`] runs: when it does
+    /// not (no collision grid), the height is the slice's (port fallback, no original counterpart).
+    pub fn integrate_at(&mut self, table: &SliceTable, dt: f32, grounded: bool) {
         for c in self.cars.iter_mut().filter(|c| c.active) {
             c.position += c.velocity * dt;
-            let yaw = c.angular_velocity.y * dt * std::f32::consts::TAU;
-            if yaw != 0.0 {
-                c.orientation = (Mat3::from_rotation_y(yaw) * c.orientation.transpose()).transpose();
-            }
+            c.orientation = nfs_physics::vehicle::orientation_step(c.orientation, c.angular_velocity * dt);
             c.slice = table.find_slice(c.position, c.slice);
             let sl = &table.slices[c.slice];
             let lat_axis = sl.lateral.normalize_or_zero();
             c.lateral = (c.position - sl.centre).dot(lat_axis);
             c.speed = c.velocity.dot(sl.forward.normalize_or_zero());
-            let rest = c.rest_height();
-            let Some(g) = ground else {
-                c.position.y = sl.centre.y + rest;
+            if !grounded {
+                c.position.y = sl.centre.y + c.rest_height();
                 c.velocity.y = 0.0;
-                continue;
-            };
-            // `Car_ground` 0x49BD40 → `Susp_update` 0x499A70's height and normal. The car tracker
-            // first (0x49AF70, Sc32 priority 6): `updateZone(pos)` and, on a new patch, the plane
-            // 0x499520 — or, on the first step after a deploy, `Car_placeAtSlice`'s seat.
-            if c.seated {
-                c.tracker.track(g, c.position);
-            } else {
-                c.tracker.seat(g, c.position);
-                c.seated = true;
             }
-            // Each probe (0x499AD4…): `updateZone(probe)` on its wheel tracker; a patch counts only
-            // with a surface nibble and within 4 m of `car+0x334` (0x494480, `[0x5B2404]`, exactly 4
-            // is usable) — otherwise the car tracker's kept plane (`car+0x3E8` when `+0x3EC > 0.1`,
-            // else `(0,1,0)`, through `car+0x400`). No roughness: 0x499730 returns 0 below
-            // `cosTilt` 0.86 and the port has no per-wheel state for it (APPROXIMATION).
-            // *(Until 2026-09-25 the port took the highest triangle of any kind 2…8 m under the
-            // model's ground plane and turned the body onto its normal — on coastal a cop that ran
-            // off the shoulder met the cliff face (surface word 0, normal y 0.26), was stood on its
-            // side, and then kept that tilt over the drop at the slice's height.)*
-            let m = c.orientation;
-            let mut contact = [Vec3::ZERO; 4];
-            let mut n_air = 0;
-            for (k, wt) in c.wheel_trackers.iter_mut().enumerate() {
-                let p = c.probes[k];
-                let probe = c.position + m.row(0) * p.x + m.row(1) * p.y + m.row(2) * p.z;
-                wt.update_zone(g, probe);
-                let h = match wt.patch_height(probe.x, probe.z) {
-                    Some(h) if wt.word & 0xF != 0 && (h - c.position.y).abs() <= 4.0 => h,
-                    _ => c.tracker.plane_height(probe.x, probe.z),
-                };
-                // §3.4: a probe more than 9.8/48 above its ground hangs
-                if h - probe.y < -0.204_166_7 {
-                    n_air += 1;
-                }
-                contact[k] = Vec3::new(probe.x, h, probe.z);
-            }
-            // `N = normalize(normalize(F) × normalize(R))`, `F` front − rear and `R` right − left of
-            // the contacts, `(0,1,0)` when it points down; `N.y < 0.5` counts every probe hanging
-            let f = ((contact[0] + contact[1]) - (contact[2] + contact[3])) * 0.5;
-            let r = ((contact[1] + contact[3]) - (contact[0] + contact[2])) * 0.5;
-            let mut up = f.normalize_or_zero().cross(r.normalize_or_zero()).normalize_or_zero();
-            if up.y < 0.0 || up == Vec3::ZERO {
-                up = Vec3::Y;
-            }
-            if up.y < 0.5 {
-                n_air = 4;
-            }
-            c.airborne_count = u16::from(n_air > 1);
-            // The body on that plane through `Σc/4` (0x49A8CF…0x49A8DD): the port's resting arm —
-            // the origin `rest_height / N.y` above the plane under it and the body turned onto `N`
-            // keeping its heading (APPROXIMATION of `BodyHeight` 0x49A900 + the resting drop and
-            // 0x49BA30, as traffic's, `traffic.md` §29; no landing, no tilted arm, `vel.y` zeroed).
-            let q = (contact[0] + contact[1] + contact[2] + contact[3]) * 0.25;
-            let ny = up.y.max(0.1);
-            c.position.y = q.y - ((c.position.x - q.x) * up.x + (c.position.z - q.z) * up.z) / ny + rest / ny;
-            let f0 = c.orientation.row(2);
-            let fwd = (f0 - up * f0.dot(up)).normalize_or_zero();
-            let right = up.cross(fwd).normalize_or_zero();
-            if fwd.length_squared() > 0.5 && right.length_squared() > 0.5 {
-                c.orientation = Mat3::from_cols(right, fwd.cross(right).normalize_or_zero(), fwd).transpose();
-            }
-            tracing::trace!(slice = c.slice, lat = c.lateral, patch = c.tracker.word & 0xF, up_y = up.y, air = n_air, y = c.position.y, "cop ground");
-            c.velocity.y = 0.0;
         }
     }
 
     /// Put a cop on the road at a spawn point (§25.10 step 5).
     pub fn deploy(&mut self, table: &SliceTable, i: usize, record: usize, tick: u64) -> bool {
-        self.deploy_as(table, i, record, tick, true)
+        self.deploy_as(table, i, record, tick, true, None)
     }
 
     /// State 1's type-1 arm (0x40419B…0x4042BE): the cop is placed (0x407890) in **state 2**
@@ -2623,7 +3597,10 @@ impl Police {
     /// says whether the perp is wanted (`AIHigh_Perp+0x78`, as `set_wanted`); a wanted perp is
     /// acquired on the cop's next tick, whose chase update runs unlit, and the tick after that lights
     /// it (§17.5b). *(Until 2026-09-25 `chasing = true` put the cop straight into a lit chase.)*
-    pub fn deploy_as(&mut self, table: &SliceTable, i: usize, record: usize, tick: u64, chasing: bool) -> bool {
+    ///
+    /// `grid` is the track's collision grid for `Car_placeAtSlice` 0x49B090; without one (the unit
+    /// tests) the placement is taken against the slice's own plane (port fallback).
+    pub fn deploy_as(&mut self, table: &SliceTable, i: usize, record: usize, tick: u64, chasing: bool, grid: Option<&TriangleGrid>) -> bool {
         let Some((slice, lateral, moving)) = self.manager.placement(table, record, self.route_dir) else { return false };
         let sl = &table.slices[slice.min(table.slices.len() - 1)];
         let dir = self.route_dir;
@@ -2639,33 +3616,54 @@ impl Police {
         c.lateral_target = lateral;
         c.speed = speed;
         c.target_speed = speed;
-        // 0x407690: `car+0x7F = 1`, then `Car_placeAtSlice` 0x49B090 with `{lateral, 1.0, 0}`
-        // (0x4076D8…0x4076E8) — a cop is not an opponent (`car+0x52C & 8` clear), so the offset is
-        // slice-local: `centre + lateral·L + 1.0·N`; the car alive, the body is then dropped by
-        // `car+0x424` (0x49B4A4…0x49B4BC), which leaves the origin `car+0x330` `rest_height`
-        // along the normal above the road. APPROXIMATION: the drop is taken against the slice's
-        // own plane (the placement point is on it — `lateral ⟂ up`), not the tracker patch
-        // `BodyHeight` 0x49A900 measures; the next `integrate_on` settles it on the patch.
-        c.position = sl.centre + sl.lateral.normalize_or_zero() * lateral + Vec3::Y * (c.rest_height() / up.y.max(0.1));
-        c.orientation = Mat3::from_cols(right, fwd.cross(right).normalize_or_zero(), fwd).transpose();
-        c.velocity = fwd * speed.abs();
+        // 0x407690: `car+0x7F = 1`, 0x40A990, then `Car_placeAtSlice` 0x49B090 (car, car+8,
+        // {car+0xEB4, 1.0, 0}, car+0xEB0) (0x4076BC…0x4076E8) — a cop is not an opponent
+        // (`car+0x52C & 8` clear), so the offset is slice-local: the placement point is `centre +
+        // lateral·L + 1.0·N` in the frame the **tracker's patch normal** gives (0x49B22F…), the
+        // trackers seated on the slice centre, and the body is then dropped by `BodyHeight`'s
+        // `car+0x424` against that patch (0x49B493…0x49B4C7, `Vehicle::place_at_slice`). *(Until
+        // 2026-09-26 the port placed the cop on the slice's own plane and settled it on the
+        // patch at the next 64 Hz step: on a crowned or banked road it was drawn about a metre
+        // above the road for the deploy tick.)*
+        match grid {
+            Some(g) => {
+                c.body.rearm_after_reset();
+                c.sync_body_in();
+                c.body.place_at_slice(g, &c.specs, sl.centre, sl.forward.normalize_or_zero(), Vec3::new(lateral, 1.0, 0.0), false, dir < 0.0);
+                c.sync_body_out();
+                c.lateral = (c.position - sl.centre).dot(sl.lateral.normalize_or_zero());
+                c.lateral_target = c.lateral;
+            }
+            None => {
+                c.position = sl.centre + sl.lateral.normalize_or_zero() * lateral + Vec3::Y * (c.rest_height() / up.y.max(0.1));
+                c.orientation = Mat3::from_cols(right, fwd.cross(right).normalize_or_zero(), fwd).transpose();
+                c.body.tracker = nfs_physics::collision::PatchTracker::new(c.position);
+                c.sync_body_in();
+            }
+        }
+        // 0x4076ED…: the velocity along the car's forward row `car+0x37C` while `car+0xEC0 != 0`
+        c.velocity = c.orientation.row(2) * speed.abs();
         c.angular_velocity = Vec3::ZERO;
+        c.body.velocity = c.velocity;
+        c.body.angular_velocity = Vec3::ZERO;
+        c.accel_local = Vec3::ZERO;
+        c.accel_world = Vec3::ZERO;
         c.active = true;
         c.chasing = false;
-        // state 1 releases any claim before it places the car (0x4041E6 → 0x403BA0)
-        c.target = None;
+        // state 1 releases any claim before it places the car (0x4041E6 → 0x403BA0) — the
+        // give-up that sent it to purgatory already did
         c.parked = !moving;
         c.placed = true;
         c.lights = false;
         c.aim_point = Vec3::ZERO;
         c.stuck_ticks = 0;
         c.goto_slice = None;
-        // `Car_placeAtSlice` 0x49B090 seats the trackers on the placement point (0x49B14E…) —
-        // done on the next ground step, which has the grid
-        c.tracker = nfs_physics::collision::PatchTracker::new(c.position);
-        c.wheel_trackers = [nfs_physics::collision::PatchTracker::default(); 4];
-        c.seated = false;
-        c.airborne_count = 0;
+        // the spawn's 0x406CD0 (§13, through 0x407890): `word car+0x418 = 0`; the record is a
+        // fresh car — no damage flag, no countdown
+        c.body.airborne_count = 0;
+        c.body.knocked_over = false;
+        c.body.reset_countdown = 0;
+        c.body.impact = 0.0;
         // the purgatory dtor 0x40DFB0 run by the placement: `car+0xED4` := the top racer of `0x5E8B88`
         let leader = self.leading_racer();
         let c = &mut self.cars[i];
@@ -2679,9 +3677,13 @@ impl Police {
     }
 
     fn retire(&mut self, i: usize) {
+        // the give-ups release the slot (0x404402 / 0x404942)
+        self.release(i);
         let c = &mut self.cars[i];
         c.active = false;
-        c.target = None;
+        c.ram = false;
+        c.lane_override = 0.0;
+        c.lane_bias = 0.0;
         c.lights = false;
         c.velocity = Vec3::ZERO;
         c.angular_velocity = Vec3::ZERO;

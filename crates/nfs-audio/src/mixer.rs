@@ -16,6 +16,8 @@ pub struct Clip {
     pub gain: f32,
     /// The patch's bend range in cents (`PcmSample::bend_cents`, code 0x0A · 100).
     pub bend_cents: i32,
+    /// The patch's effect send, code 0x13 → `voice+0x44` (`PcmSample::fx_send`).
+    pub fx_send: u8,
 }
 
 impl Clip {
@@ -41,7 +43,34 @@ struct Voice {
     pan: f32,
     looping: bool,
     finished: bool,
+    /// `voice+0x45`: the request's `+0xA`, 0x7F unless the caller passes an aux byte — 0x561960
+    /// fills every request with 0x7F (0x56199F) and 0x4A9A5F writes `0x7F − aux` for the
+    /// collision one-shots (slots from 0x30). 0x5906D7 copies it into the voice.
+    fx_scale: u8,
 }
+
+/// **0x589D70**: a voice's two effect sends are `e = voice+0x45 · voice+0x44` (both signed bytes)
+/// times each environment bus over 127·127 — `0x82061029` then `add edx`, `sar 13` and the sign
+/// bit added back: a divide by 16129 toward zero — stored as the bytes `voice+0x46` (bus `+0xC`,
+/// `Mixer_setEnvParam(0x20, ·)`) and `voice+0x47` (bus `+0xD`, `(0x80, ·)`), set by 0x565CD0.
+/// Recomputed at the voice start (0x5906DA) and on every bus change (0x565D28…0x565D51).
+fn fx_send(fx_scale: u8, patch: u8, bus: i8) -> i32 {
+    (fx_scale as i8 as i32 * patch as i8 as i32) * bus as i32 / 16129
+}
+
+/// The software path's reverb input for a voice (`[drv+0xD8]` = 0x596A10 when the voice start's
+/// flag 0x10 is clear, 0x58A455…0x58A468): `voice+0x46 / 127` per channel (0x599800), which
+/// 0x5980A0 turns into the channel's wet gain `volume · send · 1.5`. The DirectSound path (flag
+/// 0x10, 0x596400) sends `voice+0x47 / 127` — the `0x80` bus — as the EAX buffer reverb mix
+/// (property set {4A4E6FC0-C341-11D1-B73A-444553540000}) instead; like the pan law, the port
+/// takes the software path.
+fn reverb_input(fx_scale: u8, patch: u8, bus_c: i8) -> f32 {
+    fx_send(fx_scale, patch, bus_c) as f32 / 127.0 * 1.5
+}
+
+/// The port's return level from its own reverb unit — APPROXIMATION: the library's reverb
+/// (0x6B17D0's channels) is not reproduced, only what goes into it.
+const REVERB_RETURN: f32 = 0.5;
 
 /// The software mixer's stereo law (`RE/notes/engine-audio.md`, "The pan law"): 0x58E0E0 builds a
 /// 256-step table over the voice's angle with the two speakers at 0x4000 (left) and 0xC000
@@ -71,9 +100,14 @@ struct Shared {
     voices: Vec<(VoiceId, Voice)>,
     streams: Vec<(VoiceId, StreamVoice)>,
     next_id: u32,
-    /// wet level 0..1, set from the tunnel reverb state (`engine-audio.md` §4.7)
-    reverb: f32,
+    /// the environment buses of record 0, `[0x6B4A0C]` (`Mixer_setEnvParam(0x20, ·)`, the tunnel
+    /// reverb's level) and `[0x6B4A0D]` (`(0x80, ·)`, half of it) — `engine-audio.md` §4.7
+    bus_c: i8,
+    bus_d: i8,
     tail: Option<Reverb>,
+    /// what the last callback left queued for the device, in output frames (its delay to the
+    /// playback of the buffer plus the buffer), and when it ran — for [`AudioOutput::latency_ms`]
+    queued: Option<(u64, std::time::Instant)>,
     /// every voice at volume 0 — the race pause (see [`AudioOutput::set_muted`])
     muted: bool,
 }
@@ -141,9 +175,17 @@ impl AudioOutput {
         let out_rate = rate as f64;
         let stream = device.build_output_stream(
             &config.into(),
-            move |out: &mut [f32], _| {
+            move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
                 out.fill(0.0);
                 let mut g = sh.lock().unwrap();
+                let ts = info.timestamp();
+                let delay = ts.playback.duration_since(&ts.callback).unwrap_or_default();
+                let frames = (out.len() / channels.max(1)) as u64 + (delay.as_secs_f64() * out_rate).round() as u64;
+                g.queued = Some((frames, std::time::Instant::now()));
+                // the reverb's input: each voice's output times its effect send (0x589D70) — the
+                // bus the environment level drives (`[0x6B4A0C]`, 0x565CD0), not the whole mix
+                let mut send = vec![0.0f32; out.len() / channels.max(1)];
+                let bus_c = g.bus_c;
                 for (_, v) in g.voices.iter_mut() {
                     if v.finished {
                         continue;
@@ -159,7 +201,8 @@ impl AudioOutput {
                     let step = v.pitch as f64 * c.rate as f64 / out_rate;
                     // the library scales the caller's level by the patch's own volume (0x5905A5)
                     let vol = v.volume * c.gain;
-                    for frame in out.chunks_exact_mut(channels) {
+                    let fx = reverb_input(v.fx_scale, c.fx_send, bus_c);
+                    for (fi, frame) in out.chunks_exact_mut(channels).enumerate() {
                         if v.pos >= hi as f64 {
                             if v.looping && hi > lo {
                                 v.pos = lo as f64 + (v.pos - hi as f64) % (hi - lo) as f64;
@@ -176,18 +219,33 @@ impl AudioOutput {
                             let sc = ch.min(cc - 1);
                             let a = c.samples[i * cc + sc] as f32;
                             let b = c.samples[j * cc + sc] as f32;
-                            *o += (a + (b - a) * f) / 32768.0 * vol * g[ch.min(1)];
+                            let x = (a + (b - a) * f) / 32768.0 * vol * g[ch.min(1)];
+                            *o += x;
+                            if ch < 2 && fx != 0.0 {
+                                send[fi] += x * fx * 0.5;
+                            }
                         }
                         v.pos += step;
                     }
                 }
                 g.voices.retain(|(_, v)| !v.finished);
                 // streamed sources: pull frames at src.rate, hold the last frame between source frames
+                let fade_frames = (out_rate as u32 * Fade::STEP_MS / 1000).max(1) as usize;
                 for (_, sv) in g.streams.iter_mut() {
                     let cc = sv.src.channels.max(1) as usize;
                     let step = sv.src.rate as f64 / out_rate;
                     let mut q = sv.src.queue.lock().unwrap();
                     for frame in out.chunks_exact_mut(channels) {
+                        if let Some(f) = sv.fade.as_mut() {
+                            sv.fade_frames += 1;
+                            if sv.fade_frames >= fade_frames {
+                                sv.fade_frames = 0;
+                                sv.volume = f.advance(sv.volume);
+                                if f.steps_left == 0 {
+                                    sv.fade = None;
+                                }
+                            }
+                        }
                         sv.frac += step;
                         while sv.frac >= 1.0 {
                             sv.frac -= 1.0;
@@ -211,15 +269,13 @@ impl AudioOutput {
                 if g.muted {
                     out.fill(0.0);
                 }
-                if g.reverb > 0.0 && !g.muted {
-                    let wet = g.reverb;
+                if g.bus_c != 0 && !g.muted {
                     let rate_hz = out_rate as u32;
                     let rv = g.tail.get_or_insert_with(|| Reverb::new(rate_hz));
-                    for frame in out.chunks_exact_mut(channels) {
-                        let dry: f32 = frame.iter().take(2).sum::<f32>() / 2.0;
-                        let w = rv.tick(dry);
+                    for (frame, dry) in out.chunks_exact_mut(channels).zip(send.iter()) {
+                        let w = rv.tick(*dry);
                         for o in frame.iter_mut() {
-                            *o += w * wet;
+                            *o += w * REVERB_RETURN;
                         }
                     }
                 }
@@ -239,7 +295,7 @@ impl AudioOutput {
         let mut g = self.shared.lock().unwrap();
         let id = VoiceId(g.next_id);
         g.next_id += 1;
-        g.voices.push((id, Voice { clip, pos: 0.0, pitch, volume, pan: 0.0, looping, finished: false }));
+        g.voices.push((id, Voice { clip, pos: 0.0, pitch, volume, pan: 0.0, looping, finished: false, fx_scale: 0x7F }));
         id
     }
 
@@ -248,6 +304,25 @@ impl AudioOutput {
         let id = self.play(clip, volume, pitch, looping);
         self.set_pan(id, pan);
         id
+    }
+
+    /// The aux byte of `Voice_play` for a collision one-shot: `voice+0x45 = 0x7F − aux`
+    /// (0x4A9A5F…0x4A9A6C → 0x5906D7), so a loud hit sends less to the reverb.
+    pub fn set_fx_aux(&self, id: VoiceId, aux: u8) {
+        let mut g = self.shared.lock().unwrap();
+        if let Some((_, v)) = g.voices.iter_mut().find(|(i, _)| *i == id) {
+            v.fx_scale = 0x7F - aux.min(0x7F);
+        }
+    }
+
+    /// Every one-shot / loop voice at volume 0, the streams (music) left alone — `I_SFX`'s
+    /// `0x566340(h, 0)` over the voice table `0x656180…0x6563C8` and the player's engine voices
+    /// (0x4AF900(0, 0)) at 0x4AB4FB…0x4AB527. The voices the audio update rebuilds each pass
+    /// come back with the levels; a one-shot stays silent to its end.
+    pub fn silence_voices(&self) {
+        for (_, v) in self.shared.lock().unwrap().voices.iter_mut() {
+            v.volume = 0.0;
+        }
     }
 
     pub fn set_pan(&self, id: VoiceId, pan: f32) {
@@ -266,6 +341,14 @@ impl AudioOutput {
         })
     }
 
+    /// The voice's position in ms — what the sound library's status call 0x566910 answers at `+4`:
+    /// the frames played `· 1000 / rate` (0x5669B9…0x5669D5, a 64-bit multiply and divide), or
+    /// `None` once the voice has ended (its state 3, 0x566A1E).
+    pub fn position_ms(&self, id: VoiceId) -> Option<i32> {
+        let g = self.shared.lock().unwrap();
+        g.voices.iter().find(|(i, v)| *i == id && !v.finished).map(|(_, v)| played_ms(v.pos as u64, v.clip.rate))
+    }
+
     pub fn set(&self, id: VoiceId, volume: f32, pitch: f32) {
         let mut g = self.shared.lock().unwrap();
         if let Some((_, v)) = g.voices.iter_mut().find(|(i, _)| *i == id) {
@@ -280,7 +363,6 @@ impl AudioOutput {
         g.streams.retain(|(i, _)| *i != id);
     }
 
-    /// Wet level of the tunnel reverb, 0..1 (`Reverb::wet` from the game's 0..100 level).
     /// The race pause's audio side, 0x4AB150: `Voice_setVolume(h, 0)` on the player's engine voices
     /// (0x4AF900) and on every voice of the table `0x656180` — they keep running, silent — until the
     /// resume 0x4AB200 puts the saved levels back. Here the whole mix is held at zero instead.
@@ -288,11 +370,35 @@ impl AudioOutput {
         self.shared.lock().unwrap().muted = muted;
     }
 
-    pub fn set_reverb(&self, wet: f32) {
+    /// `0x565CD0(id, level)`: bit 0x20 of the id sets the bus `[0x6B4A0C]`, bit 0x80
+    /// `[0x6B4A0D]` (an id with none of 0xE0 sets all, 0x565CDD…0x565CE1), stored as bytes; the
+    /// voices' sends follow at once (0x565D28…0x565D51 → 0x5902A0). `p20` / `p80` are the tunnel
+    /// reverb's two parameters (`reverb::EnvParams`).
+    pub fn set_env(&self, p20: i32, p80: i32) {
         let mut g = self.shared.lock().unwrap();
-        g.reverb = wet.clamp(0.0, 1.0);
-        if g.reverb == 0.0 {
+        g.bus_c = p20 as i8;
+        g.bus_d = p80 as i8;
+        if g.bus_c == 0 {
             g.tail = None;
+        }
+    }
+
+    /// The two buses as `set_env` left them.
+    pub fn env(&self) -> (i8, i8) {
+        let g = self.shared.lock().unwrap();
+        (g.bus_c, g.bus_d)
+    }
+
+    /// **0x56AFA0** → 0x592E40 → 0x58F5D0, the driver's latency in ms: the software mixer's write
+    /// position `[0x6AD78C]` less the primary buffer's play cursor (`GetCurrentPosition`, bytes
+    /// `/ 2 / channels`), wrapped by the buffer length `[0x6AD7B4]`, `· 1000 / rate` (`[0x6B48DA]`,
+    /// `idiv`) — what has been mixed and not yet heard; 0 with no buffer or on a failed call. Here:
+    /// what the last callback queued ([`latency_ms`]) less the time since.
+    pub fn latency_ms(&self) -> i32 {
+        let g = self.shared.lock().unwrap();
+        match g.queued {
+            Some((frames, at)) => latency_ms(frames, at.elapsed(), self.rate),
+            None => 0,
         }
     }
 
@@ -324,12 +430,28 @@ impl StreamSource {
 }
 
 impl AudioOutput {
+    /// `0x566AE0(stream, ms, target)`: ramp a stream's volume to `target` over `ms` ([`Fade`]).
+    pub fn fade(&self, id: VoiceId, ms: i32, target: f32) {
+        let mut g = self.shared.lock().unwrap();
+        if let Some((_, sv)) = g.streams.iter_mut().find(|(i, _)| *i == id) {
+            sv.fade = Some(Fade::new(sv.volume, ms, target));
+            sv.fade_frames = 0;
+        }
+    }
+
+    /// A stream's volume now (0x567850 answers the voice's current level, 0x591320), `None` when
+    /// it is not playing.
+    pub fn stream_volume(&self, id: VoiceId) -> Option<f32> {
+        let g = self.shared.lock().unwrap();
+        g.streams.iter().find(|(i, _)| *i == id).map(|(_, sv)| sv.volume)
+    }
+
     /// Play a streamed source at its native rate (simple nearest-frame resampling), returns a stop handle.
     pub fn play_stream(&self, src: Arc<StreamSource>, volume: f32) -> VoiceId {
         let mut g = self.shared.lock().unwrap();
         let id = VoiceId(g.next_id);
         g.next_id += 1;
-        g.streams.push((id, StreamVoice { src, volume, frac: 0.0, last: [0.0, 0.0] }));
+        g.streams.push((id, StreamVoice { src, volume, frac: 0.0, last: [0.0, 0.0], fade: None, fade_frames: 0 }));
         id
     }
 }
@@ -339,6 +461,118 @@ pub(crate) struct StreamVoice {
     pub(crate) volume: f32,
     pub(crate) frac: f64,
     pub(crate) last: [f32; 2],
+    pub(crate) fade: Option<Fade>,
+    /// output frames since the fade's last step
+    pub(crate) fade_frames: usize,
+}
+
+/// A volume ramp, **0x565DD0(voice, steps, target)** as `0x566AE0(stream, ms, target)` calls it:
+/// `steps = ms / 10` toward zero (the magic 0x66666667, `sar 2`), at least 1 (0x565DFF…0x565E03);
+/// the goal `voice+0x28 = target << 16` and the step `voice+0x24 = (goal − volume) / steps`
+/// (`idiv`). One step per 10 ms of output — the divisor's unit; the library's service period
+/// itself is not read, so the 10 ms is HIGH, not CONFIRMED.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fade {
+    pub step: f32,
+    pub goal: f32,
+    pub steps_left: u32,
+}
+
+impl Fade {
+    pub const STEP_MS: u32 = 10;
+
+    pub fn new(volume: f32, ms: i32, goal: f32) -> Self {
+        let steps = (ms / 10).max(1) as u32;
+        Self { step: (goal - volume) / steps as f32, goal, steps_left: steps }
+    }
+
+    /// One 10 ms step: the new volume, `None` once the goal is reached.
+    pub fn advance(&mut self, volume: f32) -> f32 {
+        if self.steps_left <= 1 {
+            self.steps_left = 0;
+            return self.goal;
+        }
+        self.steps_left -= 1;
+        volume + self.step
+    }
+}
+
+/// The frames still queued `since` the callback that left `frames` for the device, as 0x58F5D0
+/// answers them: `frames · 1000 / rate`, toward zero, never below 0.
+pub fn latency_ms(frames: u64, since: std::time::Duration, rate: u32) -> i32 {
+    let gone = (since.as_secs_f64() * rate as f64) as u64;
+    (frames.saturating_sub(gone) * 1000 / rate.max(1) as u64) as i32
+}
+
+/// `played · 1000 / rate`, truncated (0x590D80 / 0x590DF0 are the 64-bit multiply and unsigned
+/// divide).
+pub fn played_ms(frames: u64, rate: u32) -> i32 {
+    (frames * 1000 / rate.max(1) as u64) as i32
+}
+
+#[cfg(test)]
+mod fx_tests {
+    #[test]
+    fn the_send_is_the_two_bytes_over_127_squared() {
+        // every voice's default 0x7F with the engine banks' 127: the whole bus level
+        assert_eq!(super::fx_send(0x7F, 127, 100), 100);
+        assert_eq!(super::fx_send(0x7F, 127, 8), 8);
+        // a patch without code 0x13 is never in the reverb
+        assert_eq!(super::fx_send(0x7F, 0, 100), 0);
+        // a full-level collision (aux 127) is dry; a light one (aux 66): 61·127·100 / 16129 = 48.03
+        assert_eq!(super::fx_send(0x7F - 127, 127, 100), 0);
+        assert_eq!(super::fx_send(0x7F - 66, 127, 100), 48);
+        // toward zero, not rounded: 61·127·68 / 16129 = 32.66 → 32; the 0x80 bus 34 → 16.33 → 16
+        assert_eq!(super::fx_send(0x7F - 66, 127, 68), 32);
+        assert_eq!(super::fx_send(0x7F - 66, 127, 34), 16);
+        // the software path's wet gain: `send / 127 · 1.5` (0x596A10, 0x5980A0)
+        assert!((super::reverb_input(0x7F, 127, 100) - 100.0 / 127.0 * 1.5).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod fade_tests {
+    use super::Fade;
+
+    #[test]
+    fn a_500_ms_fade_is_fifty_steps_to_the_goal() {
+        // F9's 0x566AE0(stream, 0x1F4, 0): 500 / 10 = 50 steps
+        let mut f = Fade::new(0.5, 500, 0.0);
+        assert_eq!(f.steps_left, 50);
+        let mut v = 0.5;
+        let mut n = 0;
+        while f.steps_left > 0 {
+            v = f.advance(v);
+            n += 1;
+        }
+        assert_eq!(n, 50);
+        assert_eq!(v, 0.0);
+        // a 5 ms ramp (the song start's 0x566AE0(stream, 5, level)) is one step
+        let mut f = Fade::new(0.0, 5, 0.4);
+        assert_eq!(f.steps_left, 1);
+        assert_eq!(f.advance(0.0), 0.4);
+    }
+}
+
+#[cfg(test)]
+mod position_tests {
+    #[test]
+    fn the_latency_is_what_is_queued_and_not_yet_heard() {
+        use std::time::Duration;
+        // 1024 frames of buffer and 1024 of device delay at 48 kHz: 42 ms, toward zero
+        assert_eq!(super::latency_ms(2048, Duration::ZERO, 48000), 42);
+        // 10 ms later 480 frames have gone
+        assert_eq!(super::latency_ms(2048, Duration::from_millis(10), 48000), 32);
+        // never negative
+        assert_eq!(super::latency_ms(2048, Duration::from_secs(1), 48000), 0);
+    }
+
+    #[test]
+    fn the_position_is_whole_milliseconds() {
+        assert_eq!(super::played_ms(22050, 22050), 1000);
+        assert_eq!(super::played_ms(22049, 22050), 999);
+        assert_eq!(super::played_ms(0, 22050), 0);
+    }
 }
 
 #[cfg(test)]
@@ -348,7 +582,7 @@ mod bend_tests {
     #[test]
     fn the_bend_byte_moves_the_pitch_about_0x40() {
         // (byte − 0x40) · bend >> 6 cents: a 4-semitone patch at 127 is 393 cents up, at 0 400 down
-        let c = Clip { rate: 22050, channels: 1, samples: Vec::new(), loop_range: None, gain: 1.0, bend_cents: 400 };
+        let c = Clip { rate: 22050, channels: 1, samples: Vec::new(), loop_range: None, gain: 1.0, bend_cents: 400, fx_send: 0 };
         assert_eq!(c.bend(0x40), 1.0);
         assert!((c.bend(127) - (393.0f32 / 1200.0).exp2()).abs() < 1e-6);
         assert!((c.bend(0) - (-400.0f32 / 1200.0).exp2()).abs() < 1e-6);

@@ -100,9 +100,20 @@ pub struct EngineInput {
     pub engine_level: u8,
     /// `(shift timer, specs[0x54] shift ticks)` while an upshift is in progress
     pub shift: Option<(u32, u32)>,
-    /// `byte[0x627F43] & 8` (viewId <= 1) **and** `0x443EE0()` — an attached exterior view, which
-    /// halves the engine gain (§4.3's last line). MEDIUM only in what `0x443EE0` means.
+    /// `[ebp+0x13]` of 0x4AA050: `0x443EE0()`'s answer, stored **only** on the jump table's
+    /// default arm (views 1, 5…14, > 15) when `byte[0x627F43] & 8` (viewId <= 1) — so view 1 alone
+    /// (0x4AA264, 0x4AA28E…0x4AA2B9; views 0 and 15 take the mode-1 arm 0x4AA279 and leave it 0).
+    /// It halves the engine gain (0x4AA884…0x4AA89C) and gates the wind (0x4AA4D8). MEDIUM only in
+    /// what `0x443EE0` means.
     pub attached_exterior: bool,
+    /// view 0x0C **during a replay's playback** (`[0x5E99F4] >= 2`, 0x4AA072…0x4AA083): the
+    /// distance gain is `2 · 20000/(d+15)` instead of `2048/(d+2)` (§4.1)
+    pub view_0c_replay: bool,
+    /// `carInfo+0x0C == 1`, the automatic gearbox — the rpm level's divisor is `redline + 1000`
+    /// for it and `redline + 2000` for a manual (0x4A79B7…0x4A79E3)
+    pub automatic: bool,
+    /// `word car+0x418` (`Vehicle::airborne_count`): above 5 the divisor loses 500 (0x4A79E9)
+    pub airborne_count: u16,
 }
 
 impl Default for EngineInput {
@@ -125,14 +136,21 @@ impl Default for EngineInput {
             engine_level: 127,
             shift: None,
             attached_exterior: false,
+            view_0c_replay: false,
+            automatic: false,
+            airborne_count: 0,
         }
     }
 }
 
 pub struct EngineSound {
     spl: Spl,
-    /// the `engineGain` of the last update, which the aux layers (road, turbo) scale by
+    /// the `engineGain` of the last update (after the exterior halving: the engine layers' master)
     last_gain: i32,
+    /// the `engineGain` before the exterior halving (0x4AA884), which the turbo layer scales by
+    turbo_gain: i32,
+    /// `A` of §4.1 — the distance gain with its rpm boost — which the road layer scales by
+    last_a: i32,
     /// `game.spl[6]` — the engine trim of the global settings block
     game_trim: u32,
     layers: Vec<Option<LayerDesc>>,
@@ -174,11 +192,22 @@ pub fn horn_slot(view: u16) -> usize {
     }
 }
 
+/// `rpmLvl`, 0x4A79B7…0x4A7A07: `(int)(car+0xDB4 · 127 / (redline + K))` with `K` 1000 for an
+/// automatic (`carInfo+0x0C == 1`) and 2000 otherwise, 500 less while `word car+0x418 > 5`
+/// (unsigned, `jbe`). The port had `redline + 2000` for every car until 2026-09-26.
+pub fn rpm_level(rpm: f32, redline: f32, automatic: bool, airborne_count: u16) -> i32 {
+    let mut div = redline as f64 + if automatic { 1000.0 } else { 2000.0 };
+    if airborne_count > 5 {
+        div -= 500.0;
+    }
+    (rpm as f64 * 127.0 / div) as i32
+}
+
 /// `Horn_start`'s volume (0x4AAC10…0x4AAC5E): `0x8000000 / (d + 2 m)` in 16.16, i.e. `2048/(d+2)`,
 /// or `4 · 2048/(d+1)` on view 0x0C.
+/// The `· 4` is inside the `>> 16` (0x4AAC31), so it is `floor(4 · 2048/(d+1))` (`crate::fix_atten`).
 pub fn horn_volume(view: u16, distance: f32) -> i32 {
-    let d = distance.max(0.0);
-    if view == 0x0C { (2048.0 / (d + 1.0)) as i32 * 4 } else { (2048.0 / (d + 2.0)) as i32 }
+    if view == 0x0C { crate::fix_atten(0x800_0000, 0x1_0000, 2, distance) } else { crate::fix_atten(0x800_0000, 0x2_0000, 0, distance) }
 }
 
 impl EngineSound {
@@ -217,7 +246,7 @@ impl EngineSound {
             }
         }
         let decode = |slot: usize| -> Option<Arc<Clip>> {
-            bank.decode_slot(bank_bytes, slot).ok().map(|p| Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range, gain: p.gain, bend_cents: p.bend_cents }))
+            bank.decode_slot(bank_bytes, slot).ok().map(|p| Arc::new(Clip { rate: p.rate, channels: p.channels, samples: p.samples, loop_range: p.loop_range, gain: p.gain, bend_cents: p.bend_cents, fx_send: p.fx_send }))
         };
         let clips: Vec<Option<Arc<Clip>>> = layers
             .iter()
@@ -244,6 +273,8 @@ impl EngineSound {
         Ok(Self {
             spl,
             last_gain: 0,
+            turbo_gain: 0,
+            last_a: 0,
             game_trim,
             layers,
             clips,
@@ -303,8 +334,11 @@ impl EngineSound {
     #[allow(clippy::too_many_arguments)]
     pub fn horn(&mut self, out: &AudioOutput, on: bool, view: u16, distance: f32, pan: f32, sfx_level: u8) {
         let slot = horn_slot(view);
-        if let Some((id, s)) = self.horn_voice
-            && (!on || s != slot || !out.is_playing(id))
+        // a playing voice is left alone — 0x4AACBF…0x4AACD6 returns before `Voice_play` while
+        // 0x566380 says it plays — so a view change mid-honk keeps the slot it started with (the
+        // port restarted on the new view's slot until 2026-09-26)
+        if let Some((id, _)) = self.horn_voice
+            && (!on || !out.is_playing(id))
         {
             out.stop(id);
             self.horn_voice = None;
@@ -333,20 +367,40 @@ impl EngineSound {
     }
 
     /// `engineGain` — the distance attenuation with its rpm boost and the shift dip (§4.1, §4.3).
-    fn engine_gain(&self, inp: &EngineInput) -> i32 {
-        let atten = 2048 / (inp.distance.max(0.0) as i32 + 2);
-        let rpm_lvl = (inp.rpm * 127.0 / (inp.redline + 2000.0)) as i32;
+    /// Returns `(A, gain for the turbo, engineGain)`.
+    fn engine_gain(&self, inp: &EngineInput) -> (i32, i32, i32) {
+        // 0x4AA072…0x4AA0C8: `fixdiv(0x8000000, d + 2)`, or on view 0x0C in a replay's playback
+        // `fixdiv(20000, d + 15) << 1`, of the fractional distance (`crate::fix_atten`). The port
+        // had only the first, of whole metres, until 2026-09-26.
+        let atten = if inp.view_0c_replay {
+            crate::fix_atten(0x4E20_0000, 0xF_0000, 1, inp.distance)
+        } else {
+            crate::fix_atten(0x800_0000, 0x2_0000, 0, inp.distance)
+        };
+        let rpm_lvl = rpm_level(inp.rpm, inp.redline, inp.automatic, inp.airborne_count);
         let a = atten.max(atten * (rpm_lvl.clamp(0, 150) + 40) / 128);
         let mut gain = a * 127 / 128;
-        // §4.3: an attached exterior view is half as loud
+        if let Some((timer, ticks)) = inp.shift {
+            // 1.0 at the start of the shift falling to 0.5 at its end (0x4AA64B…0x4AA65F)
+            gain = (gain + timer as i32 * gain / ticks.max(1) as i32) / 2;
+        }
+        let turbo_gain = gain;
+        // §4.3: an attached exterior view is half as loud — after the dip and after the turbo
+        // layer took its gain (0x4AA884…0x4AA89C; the port halved first until 2026-09-26)
         if inp.attached_exterior {
             gain /= 2;
         }
-        if let Some((timer, ticks)) = inp.shift {
-            // 1.0 at the start of the shift falling to 0.5 at its end
-            gain = (gain + timer as i32 * gain / ticks.max(1) as i32) / 2;
-        }
-        gain
+        (a, turbo_gain, gain)
+    }
+
+    /// `A` of §4.1 from the last [`Self::update`] — the road layer's distance gain (0x4AA36B…0x4AA38A).
+    pub fn road_gain(&self) -> i32 {
+        self.last_a
+    }
+
+    /// The `engineGain` the turbo layer takes: after the shift dip, before the exterior halving.
+    pub fn turbo_gain(&self) -> i32 {
+        self.turbo_gain
     }
 
     /// One mixer update (§3.3 record, §3.4 levels, §3.5 pitch, §3.6 start/stop).
@@ -388,7 +442,7 @@ impl EngineSound {
         let pan = if inp.mode < 2 { 0.0 } else { inp.pan };
 
         // §4.1 master volume, §3.6 duck while the start sample plays
-        self.last_gain = self.engine_gain(&inp);
+        (self.last_a, self.turbo_gain, self.last_gain) = self.engine_gain(&inp);
         let master_vol = (((inp.engine_level as i32 * self.game_trim as i32 * 85) >> 7) * self.last_gain) >> 14;
         let mut rec_volume = ((self.spl.record_volume(inp.mode) as i32 * master_vol) >> 6).min(0x7FF);
         rec_volume = rec_volume * self.start_stop(out, &inp, pan) / 512;
@@ -513,6 +567,16 @@ impl EngineSound {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_rpm_level_divisor_follows_the_gearbox() {
+        // 7000 rpm at a 7000 redline: 127·7000/9000 = 98 manual, /8000 = 111 automatic,
+        // /7500 = 118 for an automatic with more than five airborne ticks
+        assert_eq!(super::rpm_level(7000.0, 7000.0, false, 0), 98);
+        assert_eq!(super::rpm_level(7000.0, 7000.0, true, 0), 111);
+        assert_eq!(super::rpm_level(7000.0, 7000.0, true, 6), 118);
+        assert_eq!(super::rpm_level(7000.0, 7000.0, false, 5), 98);
+    }
+
     #[test]
     fn the_horn_follows_the_view_and_the_distance() {
         // slot 4 on views 0 and 0x0F, 3 on view 1, 5 otherwise (0x4AAC7D…0x4AACBA)

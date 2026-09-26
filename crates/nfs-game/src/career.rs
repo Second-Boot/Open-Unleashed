@@ -361,23 +361,6 @@ pub fn part_family(car: &CarCatalogEntry) -> Option<&'static str> {
     })
 }
 
-/// Damage-zone masks from the standard parts of the car's family (`part+0x48[10]`): the first
-/// part of each type whose mask is non-zero. Falls back to the defaults per type.
-pub fn zone_masks_for(tables: &CareerTables, car: &CarCatalogEntry) -> nfs_physics::specs::ZoneMasks {
-    let mut m = nfs_physics::specs::ZoneMasks::default();
-    let Some(fam) = part_family(car) else { return m };
-    let pick = |kinds: &[u16]| -> Option<[bool; 10]> {
-        tables.parts.iter().find(|p| p.family == fam && kinds.contains(&p.kind) && p.zone_mask.iter().any(|b| *b != 0)).map(|p| p.zone_mask.map(|b| b != 0))
-    };
-    if let Some(z) = pick(&[1]) { m.engine = z; }
-    if let Some(z) = pick(&[2]) { m.brakes = z; }
-    if let Some(z) = pick(&[3]) { m.gearbox = z; }
-    if let Some(z) = pick(&[4, 5, 8]) { m.suspension = z; }
-    if let Some(z) = pick(&[6]) { m.aero = z; }
-    if let Some(z) = pick(&[9]) { m.tyres = z; }
-    m
-}
-
 /// The car-setup values in the order the setup screen looks them up (0x4F1097…0x4F1311) and the
 /// order they sit in at `FECar+0x6D0`. CONFIRMED.
 ///
@@ -495,44 +478,31 @@ fn default_setup() -> [f32; 17] {
     CAR_SETUP_DEFAULT
 }
 
-/// The part types each damage getter sums over (`physics.md` §10): 1 engine, 2 brakes,
-/// 3 gearbox, 4/5/8 suspension, 6 aero, 9 tyres.
-const WEAR_KINDS: [(&str, &[u16]); 6] =
-    [("engine", &[1]), ("brakes", &[2]), ("gearbox", &[3]), ("suspension", &[4, 5, 8]), ("aero", &[6]), ("tyres", &[9])];
-
-/// The scale and offset each part-damage getter applies (`PartWear`): over the car's installed
-/// parts of the group's types, `scale = Σ (1.5 − 0.005·condition)` and `offset = Σ state` — the
-/// damage those parts carry from earlier races. A group with nothing installed keeps the default
-/// (one standard part, scale 1.5). The getter's formula is from `physics.md` §10; that `+0x164`
-/// is the carried state is CONFIRMED by `Car_raceInit` 0x41085F, a twenty-iteration loop that
-/// copies `carInfo+0x78 … +0xC4` into `[car+0x768 + 4i]->+0x164` — the save keeps the same field.
-pub fn part_wear_for(tables: &CareerTables, owned: &OwnedCar) -> nfs_physics::specs::PartWearSet {
-    let mut out = nfs_physics::specs::PartWearSet::default();
-    for (group, kinds) in WEAR_KINDS {
-        let parts: Vec<&Part> = owned
-            .parts
-            .iter()
-            .filter_map(|id| tables.parts.iter().find(|p| p.id == *id))
-            .filter(|p| kinds.contains(&p.kind))
-            .collect();
-        if parts.is_empty() {
-            continue;
-        }
-        let w = nfs_physics::specs::PartWear {
-            scale: parts.iter().map(|p| 1.5 - 0.005 * p.condition).sum(),
-            offset: parts.iter().map(|p| owned.part_state.iter().find(|(id, _)| *id == p.id).map(|(_, s)| *s).unwrap_or(p.state as f32)).sum(),
-            count: parts.len() as u32,
-        };
-        match group {
-            "engine" => out.engine = w,
-            "brakes" => out.brakes = w,
-            "gearbox" => out.gearbox = w,
-            "suspension" => out.suspension = w,
-            "aero" => out.aero = w,
-            _ => out.tyres = w,
-        }
+/// The installed-part list `car+0x768` the part-damage getters walk (`nfs_physics::specs::
+/// InstalledPart`, `physics.md` §10): one entry per part on the car, in list order, each with
+/// its **own** zone mask `part+0x48[10]`, its condition `+0x60` and the damage it carries,
+/// `+0x164` — the owned car's saved state when it has one, else the table's (`Car_raceInit`
+/// 0x41085F copies `carInfo+0x78 … +0xC4` into each part's `+0x164`; the save keeps the same
+/// field). An empty list keeps `fallback_parts` (APPROXIMATION, see there). *(Until 2026-09-26
+/// this was `zone_masks_for` — one mask per group, the family's first part of the type, whether
+/// installed or not — and `part_wear_for`, one summed scale and offset per group.)*
+pub fn installed_parts(parts: &[&Part], owned: Option<&OwnedCar>) -> Vec<nfs_physics::specs::InstalledPart> {
+    if parts.is_empty() {
+        return nfs_physics::specs::fallback_parts();
     }
-    out
+    parts
+        .iter()
+        .map(|p| {
+            let state = owned.and_then(|o| o.part_state.iter().find(|(id, _)| *id == p.id).map(|(_, s)| *s)).unwrap_or(p.state as f32);
+            nfs_physics::specs::InstalledPart::new(p.kind, p.zone_mask.map(|b| b != 0), p.condition, state)
+        })
+        .collect()
+}
+
+/// [`installed_parts`] for an owned car: its parts looked up in the table.
+pub fn installed_parts_for(tables: &CareerTables, owned: &OwnedCar) -> Vec<nfs_physics::specs::InstalledPart> {
+    let parts: Vec<&Part> = owned.parts.iter().filter_map(|id| tables.parts.iter().find(|p| p.id == *id)).collect();
+    installed_parts(&parts, Some(owned))
 }
 
 /// Where the purchased parts used to be applied. They are applied to the **`carSpecs` block**
@@ -542,12 +512,14 @@ pub fn part_wear_for(tables: &CareerTables, owned: &OwnedCar) -> nfs_physics::sp
 /// counterpart.
 /// The player's money in a tournament as **`HWinnings`** (draw 0x436990) prints it, from the race
 /// options it reads:
-/// * per event slot `k` (0…9, printed `k + 1`), `TOURNAMENTRACEWINNINGS[k]` `[0x657784 + 4k]`
+/// * per event slot `k` (0…9), `TOURNAMENTRACEWINNINGS[k]` `[0x657784 + 4k]`
 ///   (options 0xDF…) and `TOURNAMENTRACESAFEBONUSES[k]` `[0x6577AC + 4k]` (0xE9…): the front end
 ///   copies the player's prize `+0x84` and bonus `+0x64` of each stored event record
 ///   (0x504080 / 0x5040F0 with driver 0, 0x4EC93F…0x4ECAA9), and the race end writes this race's
 ///   into slot `TOURNRACEINDEX [0x657780]` (0x42775F…0x42778B — the bonus 0 unless the car stayed
-///   clean). A slot is listed when either is above 0 (0x4369B3…0x4369BD);
+///   clean). A slot is listed when either is above 0 (0x4369B3…0x4369BD); an empty one is
+///   **skipped** (`jle 0x436BA8`, past the counter's `inc` at 0x436B9F), so the rows are numbered
+///   1, 2, … as they are listed — the label counter `[esp+0x14]` — not by the slot;
 /// * `TOURNBONUSPRIZEMONEY[row]` `[0x657760 + 4·row]` on the last race (`[0x6577D8]`), `row` the
 ///   player's standings row handed over by 0x436E90 (0x431E1A…0x431E27);
 /// * `TOURNPLAYEREARNINGS1 [0x657740]`, the player's total: the front end's sum of prize + bonus
@@ -620,6 +592,19 @@ pub struct FinalePending {
     pub tournament: i16,
 }
 
+/// What one of `repair.lay`'s ten `QUICKFIX` boxes repairs — the fix function 0x50F110 calls for
+/// its slot (0x50F27D…0x50F354). See [`Career::repair`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickFix {
+    /// 0x4F0490, 0x4F04E0, 0x4F0530, 0x4F0580, 0x4F05D0, 0x4F0620, 0x4F06B0, 0x4F0700: the
+    /// installed parts of these categories
+    Kinds(&'static [u16]),
+    /// 0x4F0750, `QUICKFIX.COSMETIC`: the ten body zones and the `"Body"` part
+    Body,
+    /// 0x4F0830, `QUICKFIX.OVERALL`: every installed part, then the same as `Body`
+    Overall,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Career {
     pub version: u32,
@@ -661,6 +646,22 @@ pub struct Career {
     /// sets it (0x5015C0) as it opens the latter; the profile's `PlayerInfo` saves it.
     #[serde(default)]
     pub seen_evolution_intro: bool,
+    /// `[0x691D94]` — the Factory Driver welcome (`factwelcome`) has been shown: the Factory Driver
+    /// screen's constructor 0x5198A0 reads it (0x5015D0 at 0x5198F4) and, when clear, sets it
+    /// (0x5015E0 at 0x5198FD) and opens that screen instead of `missionbrief`. `PlayerInfo`'s byte
+    /// after `[0x691DD5]` (0x501868).
+    #[serde(default)]
+    pub seen_factory_welcome: bool,
+    /// `[0x691DF5]` — the first-mission text (`factfirst`) has been shown: the same constructor,
+    /// when the current mission's record reads 0xBC7 (0x519912), tests it (0x5015F0 at 0x51991A)
+    /// and sets it (0x501600 at 0x519923). The byte after `[0x691D94]` (0x501877).
+    #[serde(default)]
+    pub seen_first_mission: bool,
+    /// `[0x691D98]`, the eight custom paint colours of the colour editor, `0xAARRGGBB`, 0 = slot
+    /// unused — getter 0x5019B0, setter 0x5019C0, count 0x5019D0; `PlayerInfo`'s last 32 bytes
+    /// (`rep movsd` of 8 at 0x501888). Zeroed by the new-career reset (0x501405).
+    #[serde(default)]
+    pub custom_colours: [u32; 8],
 }
 
 fn default_year() -> u16 {
@@ -669,7 +670,7 @@ fn default_year() -> u16 {
 
 impl Default for Career {
     fn default() -> Self {
-        Self { version: SAVE_VERSION, era: Era::Classic, year: 1950, money: STARTING_MONEY, garage: Vec::new(), tournaments: BTreeMap::new(), eras_completed: Vec::new(), finale: None, evolution_complete: false, missions: Vec::new(), promotions_accepted: Vec::new(), market: Vec::new(), spares: Vec::new(), seen_evolution_intro: false }
+        Self { version: SAVE_VERSION, era: Era::Classic, year: 1950, money: STARTING_MONEY, garage: Vec::new(), tournaments: BTreeMap::new(), eras_completed: Vec::new(), finale: None, evolution_complete: false, missions: Vec::new(), promotions_accepted: Vec::new(), market: Vec::new(), spares: Vec::new(), seen_evolution_intro: false, seen_factory_welcome: false, seen_first_mission: false, custom_colours: [0; 8] }
     }
 }
 
@@ -761,9 +762,21 @@ impl Career {
         t.eligible_cars.iter().filter_map(|id| tables.car(*id as u16)).filter(|c| !c.sim.is_empty() && self.dealer_lists(c)).collect()
     }
 
-    /// Dealer availability: model years covering the chronicle year and the record flags.
+    /// Dealer availability — the test 0x4F3E40 puts every record through before it pushes it onto
+    /// the dealer's list `[0x691A00]` (0x4F4240…0x4F428C):
+    ///
+    /// ```text
+    /// 0x4F424B  year <  record+0x1F8 (first model year, signed)  -> only with the cheat flag
+    /// 0x4F4256  year >  record+0x202 (last model year, signed)   -> only with the cheat flag
+    /// 0x4F426B  record+0x204 == 2 or 3, or record+0x1F4 != 0     -> never
+    /// ```
+    ///
+    /// `year` is the chronicle year 0x5032C0. The cheat flag `[0x691A04]` (set only by the
+    /// handler 0x50DD70 → 0x4F4440) is not ported. *(Corrected 2026-09-26: the port widened the
+    /// last year to `max(first, last)`, which no shipped record needs but the original does not do.)*
     pub fn dealer_lists(&self, c: &CarCatalogEntry) -> bool {
-        c.year <= self.year && self.year <= c.year_end.max(c.year) && !matches!(c.dealer_flag_204, 2 | 3) && c.kind == 0
+        let y = self.year as i16;
+        c.year as i16 <= y && y <= c.year_end as i16 && !matches!(c.dealer_flag_204, 2 | 3) && c.kind == 0
     }
 
     pub fn dealer_price(&self, c: &CarCatalogEntry) -> u32 {
@@ -782,7 +795,8 @@ impl Career {
         if self.garage.len() >= MAX_OWNED_CARS {
             return Err(CareerError::GarageFull);
         }
-        self.money -= price;
+        // 0x501EDF…0x501F1D: −price held to ±999 999 999, then added
+        self.add_money(-price);
         let mut car = OwnedCar::construct(tables, car_id, paint_set, price as u32);
         car.trim = trim;
         self.garage.push(car);
@@ -880,10 +894,16 @@ impl Career {
                 continue;
             }
             let car = self.generate_used_car(tables, record, rand);
-            // 0x4F817A walks for the first entry whose `car+0x6A0` is 0 — a car the game put
-            // there rather than one the player listed. This port keeps the player's listings in
-            // the garage, so every entry here qualifies and the oldest goes.
-            if self.market.len() >= USED_CAR_MARKET_MAX {
+            // 0x4F8165…0x4F8174: the count is the **whole** list `[0x691B88]` — the market's own
+            // cars and the player's listings, which 0x4F91C0 appends to the same vector — against
+            // 25 (`cmp ecx, 0x19 / jb`). At 25 or more, 0x4F817A walks for the first entry whose
+            // `car+0x6A0` is 0, a car the game put there, and deletes it; with none (the list all
+            // listings) nothing goes. This port keeps the listings in the garage under an asking
+            // price, so they are counted there, and the market keeps the list's order, so its
+            // first car is the first such entry. *(Corrected 2026-09-26: the listings were not
+            // counted.)*
+            let listed = self.garage.iter().filter(|c| c.asking_price.is_some()).count();
+            if self.market.len() + listed >= USED_CAR_MARKET_MAX && !self.market.is_empty() {
                 self.market.remove(0);
             }
             self.market.push(car);
@@ -1008,7 +1028,8 @@ impl Career {
             return Err(CareerError::GarageFull);
         }
         let mut car = self.market.remove(idx);
-        self.money -= price;
+        // 0x501FE5…0x502023: −ask held to ±999 999 999, then added
+        self.add_money(-price);
         car.purchase_price = price as u32;
         car.asking_price = None;
         car.offer = None;
@@ -1018,29 +1039,33 @@ impl Career {
     }
 
     /// Put the damage a race left on the car away with it: the ten zones, their mean as the
-    /// car's damage figure, and the share each installed part takes — `(1.5 − 0.005·condition) ×
-    /// mean zone damage under its mask`, the term its getter contributes (`physics.md` §10). Parts
-    /// keep what they had, so damage accumulates until the car is repaired.
+    /// car's damage figure, and the share each installed part takes — the race-end fold 0x493CF0
+    /// with its second argument 0 (`modes.md`, `physics.md` §10, CONFIRMED): for every part of
+    /// type 1…10 (0x493D0D…0x493D1A) `+0x164 += (1.5 − 0.005·condition) × mean zone damage under
+    /// its own mask` (the mean divided only when more than one zone), then **clamped at 100**
+    /// (0x493D89…0x493D9C). Parts keep what they had, so damage accumulates until the car is
+    /// repaired. *(2026-09-26: the type gate and the clamp were missing.)*
     pub fn record_damage(&mut self, tables: &CareerTables, idx: usize, zones: [f32; 10]) {
         let Some(owned) = self.garage.get(idx) else { return };
         let ids = owned.parts.clone();
-        let mut add: Vec<(i16, f32)> = Vec::new();
+        let mut add: Vec<(i16, f32, f32)> = Vec::new();
         for id in &ids {
             let Some(p) = tables.parts.iter().find(|p| p.id == *id) else { continue };
-            let mask = p.zone_mask.map(|b| b != 0);
-            let n = mask.iter().filter(|b| **b).count();
-            if n == 0 {
+            if !(1..=10).contains(&p.kind) {
                 continue;
             }
-            let mean: f32 = zones.iter().zip(mask.iter()).filter(|(_, m)| **m).map(|(d, _)| *d).sum::<f32>() / n as f32;
-            add.push((*id, (1.5 - 0.005 * p.condition) * mean));
+            let mask = p.zone_mask.map(|b| b != 0);
+            let n = mask.iter().filter(|b| **b).count();
+            let sum: f32 = zones.iter().zip(mask.iter()).filter(|(_, m)| **m).map(|(d, _)| *d).sum();
+            let mean = if n > 1 { sum / n as f32 } else { sum };
+            add.push((*id, (1.5 - 0.005 * p.condition) * mean, p.state as f32));
         }
         let Some(owned) = self.garage.get_mut(idx) else { return };
         owned.damage = zones;
-        for (id, d) in add {
+        for (id, d, table_state) in add {
             match owned.part_state.iter_mut().find(|(pid, _)| *pid == id) {
-                Some((_, s)) => *s += d,
-                None => owned.part_state.push((id, d)),
+                Some((_, s)) => *s = (*s + d).min(100.0),
+                None => owned.part_state.push((id, (table_state + d).min(100.0))),
             }
         }
         owned.damage_pct = car_damage_pct(tables, owned);
@@ -1071,42 +1096,61 @@ impl Career {
             .sum()
     }
 
-    /// Pay for and carry out that repair: the parts of those categories go back to no damage, and
-    /// so do the body zones they answer for.
-    pub fn repair(&mut self, tables: &CareerTables, idx: usize, kinds: &[u16]) -> Result<i64, CareerError> {
-        let cost = self.repair_cost(tables, idx, kinds);
-        if cost > self.money {
-            return Err(CareerError::NoMoney { need: cost, have: self.money });
+    /// Carry out one ticked `QUICKFIX` box — its fix function, called by 0x50F110 after the money
+    /// check (0x50F232, the ticked boxes' costs summed against the money, `jge` goes on; the
+    /// caller does that). Read 2026-09-26:
+    ///
+    /// ```text
+    /// 0x4F0490…0x4F0700  QuickFix::Kinds — 0x5189F0 on every installed part (+0x758) of the
+    ///                    box's categories (0x4F0620, BODYWORK, walks 6 and then 7)
+    /// 0x4F0750           QuickFix::Body (COSMETIC) — ten times: zone k (FECar+0x6A8+4k) = 0,
+    ///                    then 0x5189F0 on the first installed part of category 10 named "Body"
+    /// 0x4F0830           QuickFix::Overall — 0x5189F0 on every installed part, then 0x4F0750's loop
+    /// 0x5189F0(part)     cb(aged · _ftol(2·part+0x164) / −100) through 0x5012E0; part+0x164 = 0
+    /// ```
+    ///
+    /// So each part pays at the damage it has **then** — a part a box before already fixed pays
+    /// nothing — and the body zones are cleared only by COSMETIC and OVERALL, all ten of them.
+    /// COSMETIC fixes the one `"Body"` part although its cost (0x4EFF20) counts every category-10
+    /// part, rims and roof too. Returns what was spent. *(Corrected 2026-09-26: the port charged
+    /// the box's pre-computed cost, fixed every category-10 part for COSMETIC and cleared the
+    /// zones under the mask of every part it fixed, whatever the box.)*
+    ///
+    /// Gap: a car with no `"Body"` part would hand 0x5189F0 a null part (0x4F07E7 `xor esi,
+    /// esi`), which reads `[0+0x46]`; every shipped car has one, and the port skips it.
+    pub fn repair(&mut self, tables: &CareerTables, idx: usize, fix: QuickFix) -> Result<i64, CareerError> {
+        let owned = self.garage.get(idx).ok_or(CareerError::UnknownCar { id: 0 })?;
+        let parts: Vec<&Part> = owned.parts.iter().filter_map(|id| tables.parts.iter().find(|p| p.id == *id)).collect();
+        let body = parts.iter().find(|p| is_body_part(p)).map(|p| p.id);
+        let mut order: Vec<i16> = match fix {
+            QuickFix::Kinds(kinds) => kinds.iter().flat_map(|k| parts.iter().filter(move |p| p.kind == *k).map(|p| p.id)).collect(),
+            QuickFix::Body => Vec::new(),
+            QuickFix::Overall => parts.iter().map(|p| p.id).collect(),
+        };
+        let zones = matches!(fix, QuickFix::Body | QuickFix::Overall);
+        if zones {
+            // the ten passes of 0x4F0750's loop each fix the body part; after the first it is at 0
+            order.extend(body);
         }
-        let Some(owned) = self.garage.get(idx) else { return Err(CareerError::UnknownCar { id: 0 }) };
-        let ids: Vec<i16> = owned
-            .parts
-            .iter()
-            .filter(|id| tables.parts.iter().any(|p| p.id == **id && kinds.contains(&p.kind)))
-            .copied()
-            .collect();
-        let masks: Vec<[bool; 10]> = ids
-            .iter()
-            .filter_map(|id| tables.parts.iter().find(|p| p.id == *id))
-            .map(|p| p.zone_mask.map(|b| b != 0))
-            .collect();
-        let Some(owned) = self.garage.get_mut(idx) else { return Err(CareerError::UnknownCar { id: 0 }) };
-        for id in &ids {
-            match owned.part_state.iter_mut().find(|(pid, _)| pid == id) {
+        let mut spent = 0;
+        for id in order {
+            let Some(p) = tables.parts.iter().find(|p| p.id == id) else { continue };
+            let owned = &mut self.garage[idx];
+            let state = owned.part_state.iter().find(|(pid, _)| *pid == id).map(|(_, s)| *s).unwrap_or(p.state as f32);
+            let cost = part_repair_cost(p, self.year, state);
+            match owned.part_state.iter_mut().find(|(pid, _)| *pid == id) {
                 Some((_, s)) => *s = 0.0,
-                None => owned.part_state.push((*id, 0.0)),
+                None => owned.part_state.push((id, 0.0)),
             }
+            self.add_money(-cost);
+            spent += cost;
         }
-        for m in &masks {
-            for (z, on) in owned.damage.iter_mut().zip(m.iter()) {
-                if *on {
-                    *z = 0.0;
-                }
-            }
+        let owned = &mut self.garage[idx];
+        if zones {
+            owned.damage = [0.0; 10];
         }
         owned.damage_pct = car_damage_pct(tables, owned);
-        self.money -= cost;
-        Ok(cost)
+        Ok(spent)
     }
 
     /// `SELLCAR` / `0x4F91C0(car, ask)`: list garage car `idx` on the used-car market at `ask`
@@ -1136,10 +1180,13 @@ impl Career {
     }
 
     /// `0x502190(car)`: accept the standing offer — the money is paid and the car leaves the garage.
+    /// The payment is 0x5012E0's inline twin (0x5021DE…0x502226): the **amount** `car+0x694` is
+    /// held to ±999 999 999 and then added to `[0x691D90]`; the sum is not clamped.
+    /// *(Corrected 2026-09-26: the port clamped the new balance.)*
     pub fn accept_offer(&mut self, tables: &CareerTables, idx: usize) -> Result<i64, CareerError> {
         let car = self.garage.get(idx).ok_or(CareerError::UnknownCar { id: 0 })?;
         let offer = car.offer.ok_or(CareerError::NoOffer)? as i64;
-        self.money = (self.money + offer).clamp(-999_999_999, 999_999_999);
+        self.add_money(offer);
         self.garage.remove(idx);
         self.sort_garage(tables);
         Ok(offer)
@@ -1366,7 +1413,8 @@ impl Career {
             if self.money < fee {
                 return Err(CareerError::NoMoney { need: fee, have: self.money });
             }
-            self.money -= fee;
+            // 0x4D5B3F…0x4D5B42: 0x5012E0(−fee)
+            self.add_money(-fee);
         }
         self.tournaments.entry(t.id).or_default().entered = true;
         Ok(event)
@@ -1474,7 +1522,8 @@ impl Career {
         let page = self.standings_page(t, event, order, times, clean, racers, last);
         let row = page.iter().position(|(d, ..)| *d == 0).unwrap_or(0);
         Winnings {
-            events: slots.iter().filter(|(k, e)| *k < 10 && (e.prize > 0 || e.bonus > 0)).map(|(k, e)| (k + 1, e.prize, e.bonus)).collect(),
+            // `[esp+0x14]` starts at 1 and steps only on a listed row (0x4369A2, 0x436B9F)
+            events: slots.iter().filter(|(k, e)| *k < 10 && (e.prize > 0 || e.bonus > 0)).enumerate().map(|(n, (_, e))| (n + 1, e.prize, e.bonus)).collect(),
             tournament_bonus: last.then(|| t.prize.get(row).copied().unwrap_or(0)),
             total: page.get(row).map_or(0, |r| r.2),
             completed: st.events.len() + 1,
@@ -1484,7 +1533,10 @@ impl Career {
     pub fn record_event(&mut self, tables: &CareerTables, t: &Tournament, event: usize, order: &[usize], times: &[u64; 8], clean: &[bool; 8], garage_idx: Option<usize>) -> EventOutcome {
         let result = Self::event_result(t, event, order, times, clean);
         let (prize, bonus) = (result.prize, result.bonus);
-        self.money = (self.money + prize as i64 + bonus as i64).clamp(-999_999_999, 999_999_999);
+        // 0x4EE040…0x4EE051: the event prize and the bonus, each its own 0x5012E0 call — the
+        // amount is clamped, never the balance *(corrected 2026-09-26: the port clamped the sum)*
+        self.add_money(prize as i64);
+        self.add_money(bonus as i64);
         if let Some(car) = garage_idx.and_then(|i| self.garage.get_mut(i)) {
             car.mileage += 3000;
             // **The original counts a win for the player's car whoever won.** 0x4EDFE6's loop runs
@@ -1512,7 +1564,9 @@ impl Career {
         st.prize = tprize;
         outcome.final_rank = Some(rank);
         outcome.tournament_prize = tprize;
-        self.money = (self.money + tprize as i64).clamp(-999_999_999, 999_999_999);
+        // 0x4EE06E: 0x5012E0(tournament prize) — the amount clamped, then added (`st` still
+        // borrows the tournaments, so the clamp is spelt out)
+        self.money += (tprize as i64).clamp(-999_999_999, 999_999_999);
         if t.is_club() {
             st.completed = true;
             st.completions += 1;
@@ -2012,6 +2066,12 @@ mod tests {
         assert_eq!(w.total, 800 + 200 + 1000 + t.prize[row]);
         assert_eq!(page[row].2, w.total);
         assert_eq!(w.completed, 2);
+        // a slot with nothing in it is skipped and the next row takes its number (0x436BA8)
+        let mut c = Career::default();
+        let last = [1, 2, 3, 4, 5, 6, 7, 0];
+        c.tournaments.entry(1).or_default().events.push(Career::event_result(&t, 0, &last, &[6400; 8], &[true; 8]));
+        let w = c.winnings_after(&t, 1, &order, &[6400; 8], &[true; 8], 8, true);
+        assert_eq!(w.events, vec![(1, 800, 200)], "an 8th place with no prize lists no row");
     }
 
     /// 0x431B80: on the last race each place's earnings take the tournament prize of that place,
@@ -2362,7 +2422,9 @@ mod tests {
         assert_eq!(c.enter_event(&tables, &t, 1).unwrap(), 1);
         assert_eq!(c.money, money, "no fee once an event is done");
         let w = c.winnings_after(&t, 1, &[0, 1, 2, 3, 4, 5, 6, 7], &times, &[true; 8], 8, false);
-        assert_eq!(w.events, vec![(2, 1000, 400), (3, 1000, 400)], "each result in its own record's slot");
+        // each result sits in its own record's slot (1 and 2 here); slot 0 is empty, so it is
+        // skipped and the rows are numbered as listed (0x436BA8)
+        assert_eq!(w.events, vec![(1, 1000, 400), (2, 1000, 400)], "listed in slot order, numbered 1, 2");
         c.record_event(&tables, &t, 1, &[0, 1, 2, 3, 4, 5, 6, 7], &times, &[true; 8], Some(0));
         assert_eq!(c.state(1).done_events(), vec![2, 1]);
         assert!(c.tournament_flags(&tables, &t).0, "event 0 is the last undone one");
@@ -2427,6 +2489,133 @@ mod tests {
         assert_eq!(c.money, money + 12_345);
         assert_eq!(c.garage.len(), 1);
         assert!(matches!(c.accept_offer(&tables, 0), Err(CareerError::NoOffer)));
+        // 0x5021FF…0x502226 clamps the amount, not the balance
+        let mut rich = Career { money: 999_999_000, ..Career::default() };
+        rich.garage.push(OwnedCar::new(76, 0, 11_000));
+        rich.garage[0].offer = Some(5_000);
+        rich.accept_offer(&tables, 0).unwrap();
+        assert_eq!(rich.money, 1_000_004_000);
+    }
+
+    /// 0x4F8165…0x4F8174: the top-up's cap of 25 counts the whole used-car list, the player's
+    /// listings as well as the generated cars, and drops the first generated car to make room.
+    #[test]
+    fn the_market_cap_counts_the_players_listings() {
+        let mut t = stock_tables(stock_parts(), &[], &[]);
+        t.catalog[0].year = 1950;
+        t.catalog[0].sim = "356_1".into();
+        let mut c = Career { year: 1975, ..Career::default() };
+        // every draw 30: the rarity roll 30 % 60 = 30 is not below the age-25 entry 5, so the
+        // one catalogue car is generated on every refresh
+        let mut r = || 30u32;
+        let fill = |c: &mut Career| {
+            c.market.clear();
+            for i in 0..24 {
+                let mut car = OwnedCar::new(76, 0, 0);
+                car.mileage = i;
+                c.market.push(car);
+            }
+        };
+        fill(&mut c);
+        c.refresh_market(&t, &mut r);
+        assert_eq!(c.market.len(), 25, "24 on the list: the new car is appended");
+        assert_eq!(c.market[0].mileage, 0);
+        // one listing makes the list 25 long: the first generated car goes, the new one comes
+        fill(&mut c);
+        c.garage.push(OwnedCar::new(76, 0, 0));
+        c.garage.push(OwnedCar::new(76, 0, 0));
+        c.list_for_sale(0, 5_000).unwrap();
+        c.refresh_market(&t, &mut r);
+        assert_eq!(c.market.len(), 24);
+        assert_eq!(c.market[0].mileage, 1);
+        // a list of 25 listings has no generated car to drop (0x4F818B runs off the end): the
+        // new one is appended all the same
+        c.market.clear();
+        for _ in 0..25 {
+            c.garage.push(OwnedCar::new(76, 0, 0));
+        }
+        for i in 1..25 {
+            c.list_for_sale(i, 5_000).unwrap();
+        }
+        assert_eq!(c.garage.iter().filter(|g| g.asking_price.is_some()).count(), 25);
+        c.refresh_market(&t, &mut r);
+        assert_eq!(c.market.len(), 1);
+    }
+
+    /// 0x50F27D…0x50F354: a category box fixes its parts and leaves the zones; COSMETIC (0x4F0750)
+    /// clears the ten zones and fixes the `"Body"` part alone; OVERALL (0x4F0830) fixes every
+    /// part and clears the zones. Each part pays `aged · _ftol(2·state) / 100` at the damage it
+    /// has then (0x5189F0).
+    #[test]
+    fn each_quickfix_box_repairs_what_its_fix_function_does() {
+        let mut parts = stock_parts();
+        parts.push(stock_part(20, 10, "Rims", 500));
+        let t = stock_tables(parts, &[1, 2, 3, 4, 5], &[]);
+        let mut c = Career { money: 100_000, ..Career::default() };
+        let mut car = OwnedCar::construct(&t, 76, 0, 0);
+        car.parts.push(20);
+        car.part_state.push((20, 30.0));
+        for (id, s) in [(4, 10.0), (5, 20.0)] {
+            car.part_state.iter_mut().find(|(p, _)| *p == id).unwrap().1 = s;
+        }
+        car.damage = [7.0; 10];
+        c.garage.push(car);
+        let state = |c: &Career, id: i16| c.garage[0].part_state.iter().find(|(p, _)| *p == id).unwrap().1;
+        // brakes (category 2, $80 at 10): 80 · 20 / 100 = 16; the zones stay
+        assert_eq!(c.repair(&t, 0, QuickFix::Kinds(&[2])).unwrap(), 16);
+        assert_eq!((state(&c, 4), c.garage[0].damage), (0.0, [7.0; 10]));
+        // COSMETIC: the body ($3000 at 20 → 1200) and the zones, not the rims
+        assert_eq!(c.repair(&t, 0, QuickFix::Body).unwrap(), 1_200);
+        assert_eq!((state(&c, 5), state(&c, 20), c.garage[0].damage), (0.0, 30.0, [0.0; 10]));
+        // OVERALL: what is left — the rims, $500 at 30 → 300
+        assert_eq!(c.repair(&t, 0, QuickFix::Overall).unwrap(), 300);
+        assert_eq!(state(&c, 20), 0.0);
+        assert_eq!(c.money, 100_000 - 16 - 1_200 - 300);
+    }
+
+    /// 0x4EE040…0x4EE051: the prize and the bonus each go through 0x5012E0, which clamps the
+    /// amount and adds it — a balance past 999 999 999 is not cut back.
+    #[test]
+    fn race_money_clamps_each_amount_not_the_balance() {
+        let t = tournament(1, 2, false);
+        let tables = tables(vec![t.clone()]);
+        let mut c = Career { money: 999_999_000, ..Career::default() };
+        let o = c.record_event(&tables, &t, 0, &[0, 1, 2, 3, 4, 5, 6, 7], &[6400; 8], &[true; 8], None);
+        assert!(o.result.prize > 0);
+        assert_eq!(c.money, 999_999_000 + (o.result.prize + o.result.bonus) as i64);
+    }
+
+    /// 0x4F4240…0x4F428C: first year ≤ year ≤ last year, never a bonus / factory record or a
+    /// non-playable one.
+    #[test]
+    fn the_dealer_lists_a_car_in_its_production_years() {
+        let mut e = stock_tables(stock_parts(), &[], &[]).catalog.remove(0);
+        (e.year, e.year_end) = (1956, 1959);
+        let at = |y: u16| Career { year: y, ..Career::default() };
+        assert!(!at(1955).dealer_lists(&e));
+        assert!(at(1956).dealer_lists(&e));
+        assert!(at(1959).dealer_lists(&e));
+        assert!(!at(1960).dealer_lists(&e));
+        e.dealer_flag_204 = 2;
+        assert!(!at(1957).dealer_lists(&e));
+        (e.dealer_flag_204, e.kind) = (1, 2);
+        assert!(!at(1957).dealer_lists(&e));
+        // a last year before the first lists nothing, not even the first year
+        (e.kind, e.year_end) = (0, 1950);
+        assert!(!at(1956).dealer_lists(&e));
+        // the price: `+0x208` up to the first year, then `_ftol(P · [+0x20C + 4·age]) / 100`
+        // (0x4EE220), both steps truncating. The shipped '50 356 (id 76): $11 000, +0x20C/+0x210
+        // 100/100, and its 1950-based value curve from +0x214 100, 95, 93 — which the dealer
+        // indexes by age, so age 1 reads +0x210, age 2 the curve's 1950 entry, age 3 its 1951
+        e.price = 11_000;
+        e.year = 1950;
+        e.age_curve_head = [100.0, 100.0];
+        e.value_curve[..3].copy_from_slice(&[100.0, 95.0, 93.0]);
+        assert_eq!(e.dealer_price(1950), 11_000);
+        assert_eq!(e.dealer_price(1951), 11_000);
+        assert_eq!(e.dealer_price(1952), 11_000);
+        assert_eq!(e.dealer_price(1953), 10_450);
+        assert_eq!(e.dealer_price(1954), 10_230);
     }
 
     /// A scripted `rand`: each call hands out the next value, and the test checks none is left.
@@ -2594,13 +2783,28 @@ mod tests {
             assert_eq!(c.part_damage(0, f), f.state as f32);
         }
 
-        // the getter's scale and offset follow the type-1 parts on the car
+        // the race's part list carries each type-1 part with its own mask, condition and state
         let engine: Vec<&Part> = c.garage[0].parts.iter().filter_map(|id| tables.parts.iter().find(|p| p.id == *id)).filter(|p| p.kind == 1).collect();
-        let w = part_wear_for(&tables, &c.garage[0]);
-        let offset: f32 = engine.iter().map(|p| c.part_damage(0, p)).sum();
-        let scale: f32 = engine.iter().map(|p| 1.5 - 0.005 * p.condition).sum();
-        assert!((w.engine.offset - offset).abs() < 0.01);
-        assert!((w.engine.scale - scale).abs() < 0.01);
+        let list = installed_parts_for(&tables, &c.garage[0]);
+        let listed: Vec<_> = list.iter().filter(|p| p.kind == 1).collect();
+        assert_eq!(listed.len(), engine.len());
+        for (l, p) in listed.iter().zip(engine.iter()) {
+            assert_eq!(l.mask, p.zone_mask.map(|b| b != 0));
+            assert!((l.state - c.part_damage(0, p)).abs() < 0.01);
+            assert!((l.scale - (1.5 - 0.005 * p.condition)).abs() < 1e-6);
+        }
+        // and the engine getter 0x4938A0 over it: `(zone1 + Σ scale·mean(own mask) + state) / (1 + n)`
+        let mut specs = crate::police::test_specs();
+        specs.parts = list.clone();
+        let mut v = nfs_physics::vehicle::Vehicle::new(glam::Vec3::ZERO, glam::Mat3::IDENTITY, &specs, 0.8, 0.3);
+        v.damage = std::array::from_fn(|i| 10.0 * i as f32);
+        let mean = |m: &[u8; 10]| {
+            let z: Vec<f32> = (0..10).filter(|i| m[*i] != 0).map(|i| 10.0 * i as f32).collect();
+            if z.len() > 1 { z.iter().sum::<f32>() / z.len() as f32 } else { z.iter().sum() }
+        };
+        let sum: f32 = engine.iter().map(|p| (1.5 - 0.005 * p.condition) * mean(&p.zone_mask) + c.part_damage(0, p)).sum();
+        let expect = (v.damage[1] + sum) / (1 + engine.len()) as f32;
+        assert!((v.engine_wear(&specs) - expect).abs() < 1e-3, "{} vs {expect}", v.engine_wear(&specs));
 
         // repairing costs the aged price times twice the damage, and clears both
         let cost = c.repair_cost(&tables, 0, &[1]);
@@ -2608,9 +2812,14 @@ mod tests {
         assert_eq!(cost, expect);
         assert!(cost > 0);
         let money = c.money;
-        assert_eq!(c.repair(&tables, 0, &[1]).unwrap(), cost);
+        assert_eq!(c.repair(&tables, 0, QuickFix::Kinds(&[1])).unwrap(), cost);
         assert_eq!(c.money, money - cost);
         assert_eq!(c.repair_cost(&tables, 0, &[1]), 0);
-        assert_eq!(part_wear_for(&tables, &c.garage[0]).engine.offset, 0.0);
+        assert!(installed_parts_for(&tables, &c.garage[0]).iter().filter(|p| p.kind == 1).all(|p| p.state == 0.0));
+
+        // 0x493CF0 clamps each part's carried damage at 100 (0x493D89…0x493D9C)
+        c.record_damage(&tables, 0, [100.0; 10]);
+        c.record_damage(&tables, 0, [100.0; 10]);
+        assert_eq!(c.part_damage(0, &part), 100.0);
     }
 }

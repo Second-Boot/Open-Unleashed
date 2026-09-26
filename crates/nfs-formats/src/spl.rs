@@ -109,6 +109,21 @@ mod tests {
     }
 }
 
+/// Which block the race's audio init loads into `0x5D14B0`: **0x4A8660** builds
+/// `[0x65B318] + name + ".spl"` with `name` `"replay"` (0x5CCE90) while `[0x5E99F4] >= 2` — a
+/// playback — and `"game"` (0x5D1A0C) otherwise (0x4A86A1…0x4A86B5), then `0x59DB50(path, 0x5D14B0,
+/// 0x3C)` (0x4A8713). The block stays until the next race's init, front end included.
+static REPLAY_MIX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn mix_file(replay: bool) -> &'static str {
+    if replay { "replay.spl" } else { "game.spl" }
+}
+
+/// The race audio init's choice (see [`REPLAY_MIX`]); `true` when the block changes.
+pub fn select_mix(replay: bool) -> bool {
+    REPLAY_MIX.swap(replay, std::sync::atomic::Ordering::Relaxed) != replay
+}
+
 /// `GameData/Sounds/game.spl` — the fifteen global mixer trims (`RE/notes/engine-audio.md` §6).
 ///
 /// The block is copied over the compiled-in defaults at `0x5D14B0` when the file loads; every entry
@@ -136,9 +151,15 @@ impl GameSpl {
         Ok(Self(v))
     }
 
-    /// Read `<sounds>/game.spl`, falling back to the executable's defaults.
+    /// Read the block the last race audio init chose ([`select_mix`]) — `<sounds>/game.spl`, or
+    /// `replay.spl` for a playback — falling back to the executable's defaults.
     pub fn load(sounds_dir: &std::path::Path) -> Self {
-        std::fs::read(sounds_dir.join("game.spl")).ok().and_then(|d| Self::parse(&d).ok()).unwrap_or_default()
+        Self::load_mix(sounds_dir, REPLAY_MIX.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// `<sounds>/game.spl`, or `<sounds>/replay.spl` when `replay` (0x4A86A1…0x4A86B5).
+    pub fn load_mix(sounds_dir: &std::path::Path, replay: bool) -> Self {
+        std::fs::read(sounds_dir.join(mix_file(replay))).ok().and_then(|d| Self::parse(&d).ok()).unwrap_or_default()
     }
 
     /// `[0]` — streamed music: the volume is `MusicLevel · music() >> 7` (0x4A82F0). A `win`/`lose`/
@@ -210,5 +231,21 @@ mod game_spl_tests {
         // the executable's own defaults are louder for music and quieter for the engine
         assert_eq!(GameSpl::default().music(), 80);
         assert_eq!(GameSpl::default().engine(), 20);
+    }
+}
+
+#[cfg(test)]
+mod mix_tests {
+    #[test]
+    fn a_playback_loads_replay_spl() {
+        assert_eq!(super::mix_file(false), "game.spl");
+        assert_eq!(super::mix_file(true), "replay.spl");
+        // the shipped pair differs in slots 0, 6, 7, 9, 10, 12 and 14 (`replay.md` §9)
+        let dir = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Games/NFS-Porsche-Unleashed/game_info/data/GameData/Sounds");
+        if dir.join("replay.spl").is_file() {
+            let (g, r) = (super::GameSpl::load_mix(&dir, false), super::GameSpl::load_mix(&dir, true));
+            assert_eq!((g.music(), r.music()), (52, 68));
+            assert_eq!((g.engine(), r.engine()), (16, 10));
+        }
     }
 }

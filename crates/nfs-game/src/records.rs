@@ -129,6 +129,11 @@ pub struct HudRecords {
     pub rows: Vec<(String, String, u32)>,
     /// the row drawn selected (`HTable [+0x7AC]`), if any
     pub highlight: Option<usize>,
+    /// `+0x125` / `+0x126` (0x433C73…0x433CD4): on a point-to-point track the total is not 0 and
+    /// not above the first `TRACKRECORDS` after the insert (`jg` skips), on a circuit the best lap
+    /// likewise against the first `LAPRECORDS` — the draw 0x4339C0 then says **kTrackRecord**
+    /// (0x4A6540) or **kLapRecord** (0x4A6600, which wins) once, on its first frame fully open
+    pub first: bool,
 }
 
 /// Build that table the way the HUD does, from the track's records as they were before the race.
@@ -156,13 +161,14 @@ pub fn hud_records(before: &[TrackRecord], linear: bool, driver: &str, car: &str
         names.truncate(before.len());
     }
     let highlight = (0..track.len()).find(|&k| track[k] == total || lap[k] == best);
+    let first = if linear { total != 0 && track.first().is_some_and(|&t| total <= t) } else { best != 0 && lap.first().is_some_and(|&t| best <= t) };
     let shown = if linear { &track } else { &lap };
     let rows = names
         .into_iter()
         .zip(shown.iter())
         .map(|((d, c), t)| (d.chars().take(31).collect(), c, *t))
         .collect();
-    HudRecords { linear, rows, highlight }
+    HudRecords { linear, rows, highlight, first }
 }
 
 #[cfg(test)]
@@ -206,10 +212,15 @@ mod tests {
         assert_eq!(h.rows[1].0, "ME");
         assert_eq!(h.highlight, Some(1));
         assert!(!h.linear);
+        assert!(!h.first, "second is no record");
+        // equal to the first counts (`jg` skips only above it), though the strict insert leaves it out
+        assert!(hud_records(&before, false, "ME", "356", 0, 100).first);
+        assert!(hud_records(&before, true, "ME", "356", 99, 500).first);
         // a zero lap is not inserted (the persistent table would take it)
         let z = hud_records(&before, false, "ME", "356", 0, 0);
         assert_eq!(z.rows.iter().map(|r| r.2).collect::<Vec<_>>(), vec![100, 200, 300]);
         assert_eq!(z.highlight, None);
+        assert!(!z.first, "a zero time is no record");
         // point-to-point: the total goes into the other copy
         let l = hud_records(&before, true, "ME", "356", 250, 50);
         assert_eq!(l.rows.iter().map(|r| r.2).collect::<Vec<_>>(), vec![100, 200, 250]);

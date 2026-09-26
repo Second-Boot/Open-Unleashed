@@ -3,14 +3,20 @@
 //! see `RE/notes/crp-geometry.md`).
 
 use crate::{fmt_err, read, texture::{decode_pack, TextureImage}, AssetError, GamePaths};
-use crate::mesh::{article_meshes, MaterialMesh};
+use crate::mesh::{article_parts, MaterialMesh};
 use nfs_formats::{crp::{Crp, Material}, edg::EdgeFile, ini::Ini, refpack, scn::Scene};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct ArticleMeshes {
     pub name: String,
+    /// The lowest LOD's meshes, one per `pr` part in the file's order ([`crate::mesh::article_parts`]).
     pub meshes: Vec<MaterialMesh>,
+    /// Every LOD the article carries, ascending by its number (`pr.lod`, `RE/notes/crp-geometry.md`
+    /// §2.1), each with its per-part meshes — the drawer's LOD pick (`Base+100`'s records,
+    /// 0x450DE0) chooses one of these per frame. The first is [`Self::meshes`]. *(Until 2026-09-26
+    /// merged per material.)*
+    pub lods: Vec<(u8, Vec<MaterialMesh>)>,
     /// World transform (from the `tr` part, row-major; identity when absent).
     pub transform: glam::Mat4,
     /// Scene-object tag (`Base+68`), zero when none.
@@ -167,7 +173,11 @@ impl TrackGeometry {
         }
         for inst in &self.instances {
             if let Some(art) = self.library.iter().find(|a| a.tag == inst.tag) {
-                push(art, inst.transform * art.transform);
+                // the scene record's matrix — the element's placement and per-cent scale, no `tr`
+                // (0x482EA0 / 0x46B020, 0x482BF1; `RE/RENDERING.md` "The instance and scene items").
+                // *(Until 2026-09-26 this took the article's `tr` and not the scale.)* Whether the
+                // scene items join the ground's triangles at all is not read (port behaviour).
+                push(art, inst.transform * glam::Mat4::from_scale(inst.scale));
             }
         }
         TriangleGrid::build(tris, cell_size)
@@ -178,7 +188,9 @@ impl TrackGeometry {
 pub struct TrackGeometry {
     /// Static world articles (geometry already in world space) and placed objects (`tr` applied).
     pub world: Vec<ArticleMeshes>,
-    /// Library articles (Base flag 0x8000), local space; instanced via `instances`.
+    /// Library articles (Base flag 0x8000), local space; instanced via `instances`. Their own
+    /// [`ArticleMeshes::transform`] (`tr`) is **not** part of an instance's placement: the scene
+    /// bundle's record holds the element's matrix alone (0x482BF1 / 0x482EA0, the draw 0x450380).
     pub library: Vec<ArticleMeshes>,
     /// GEOM elements from the start-grid and `_st*.scn` files.
     pub instances: Vec<PropInstance>,
@@ -232,6 +244,10 @@ pub struct TrackAssets {
     /// Additional scenes whose GEOM props are instanced: the skill-test `_st<N>.scn` of the
     /// current mission (`RE/notes/skill-tests.md` §4 — only loaded for `RACE_TYPE 4`).
     pub extra_scenes: Vec<Scene>,
+    /// `REVERSE [0x657430]` for the race this track is loaded for: which start scene the race
+    /// loads (0x46D600: `_BStart.scn` when set, else `_FStart.scn`) and so whose GEOM elements are
+    /// placed. Set by the caller before [`TrackAssets::build_geometry`].
+    pub reverse: bool,
     /// `Track/animdefs.txt` — every scene-object tag's physical and animation definition
     /// (`RE/notes/crp-geometry.md` §7); shared by all tracks.
     pub animdefs: nfs_formats::animdefs::AnimDefs,
@@ -327,6 +343,7 @@ impl TrackAssets {
             draw_keys_backward: keys("_backwards.key"),
             cameras: scene("_cameras.scn")?,
             extra_scenes: Vec::new(),
+            reverse: false,
             animdefs,
             edges,
             sky_textures,
@@ -359,23 +376,47 @@ impl TrackAssets {
         let flat = ambient_colours(&self.crp, &self.crp_data);
         for (index, a) in arts.iter().enumerate() {
             let g = self.crp.article_geometry(&self.crp_data, a).map_err(fmt_err(&crp_path))?;
-            let Some(lod) = g.primitives.iter().map(|p| p.lod).min() else { continue };
-            let mut meshes = article_meshes(&g, lod, &mut skipped);
-            // an `Am` material's colour is its method's block, not its `df` stream
-            for mm in &mut meshes {
-                if let Some(c) = flat.get(&mm.material) {
-                    let c = c.to_le_bytes().map(|b| b as f32 / 255.0);
-                    mm.mesh.vertices.iter_mut().for_each(|v| v.color = c);
-                }
+            let mut lod_numbers: Vec<u8> = g.primitives.iter().map(|p| p.lod).collect();
+            lod_numbers.sort_unstable();
+            lod_numbers.dedup();
+            if lod_numbers.is_empty() {
+                continue;
             }
+            let mut lods = Vec::new();
+            for &lod in &lod_numbers {
+                let mut meshes = article_parts(&g, lod, &mut skipped);
+                // an `Am` material's colour is its method's block, not its `df` stream
+                for mm in &mut meshes {
+                    if let Some(c) = flat.get(&mm.material) {
+                        let c = c.to_le_bytes().map(|b| b as f32 / 255.0);
+                        mm.mesh.vertices.iter_mut().for_each(|v| v.color = c);
+                    }
+                }
+                lods.push((lod, meshes));
+            }
+            let meshes = lods[0].1.clone();
             let transform = g.transform.as_ref().map(tr_to_mat4).unwrap_or(glam::Mat4::IDENTITY);
             let (is_lib, tag) = g.base.as_ref().map(|b| (b.is_library(), b.tag_u32())).unwrap_or((false, 0));
             let animation = self.crp.article_animation(&self.crp_data, a);
-            let item = ArticleMeshes { name: g.name.clone(), meshes, transform, tag, animation, index };
+            let item = ArticleMeshes { name: g.name.clone(), meshes, lods, transform, tag, animation, index };
             if is_lib { library.push(item) } else { world.push(item) }
         }
         let mut instances = Vec::new();
-        for scene in self.start_forward.iter() {
+        // 0x46D1D0 places every `CGeomElem` of the combined list `[0x628168]` (the cast to
+        // 0x5CFA48 at 0x46D212), and `WTrack::load` 0x4876E0 fills that list with the generic
+        // scenes and then **either** the skill test's `_ST<N>.scn` (0x46D330, game mode 4) **or**
+        // the start scene (0x46D600) — `_BStart.scn` in a backwards race, `_FStart.scn` otherwise.
+        // *(Until 2026-09-26 the port always placed `_FStart`'s geoms, in a skill test too: the
+        // forward finish banners stood at the wrong end of a backwards race and the backwards
+        // ones were never drawn.)*
+        let start = if !self.extra_scenes.is_empty() {
+            None
+        } else if self.reverse {
+            self.start_backward.as_ref()
+        } else {
+            self.start_forward.as_ref()
+        };
+        for scene in start.iter() {
             for e in scene.of_kind(&nfs_formats::scn::ElementKind::Geom) {
                 // GEOM v5 param line: "0 <id> 0 0 -1 1 1 sx sy sz" — id at index 1 (v4: 8 tokens, same prefix)
                 let Some(id) = Scene::param_u32(e, 0, 1) else { continue };

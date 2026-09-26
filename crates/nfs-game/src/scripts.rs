@@ -61,6 +61,11 @@ impl ScriptRunner {
         self.running == IDLE
     }
 
+    /// `script+8`, the id of the running script (`None` when idle)
+    pub fn running(&self) -> Option<u8> {
+        (self.running != IDLE).then_some(self.running)
+    }
+
     /// `0x40AB30(script, targetIdx, id, tick)` — the lowest id seen while idle wins, and any request at
     /// all refreshes the cursor-reset clock.
     pub fn request(&mut self, target: i32, trigger: Trigger, tick: i64) {

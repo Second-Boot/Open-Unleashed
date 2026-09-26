@@ -102,6 +102,59 @@ pub struct Control {
     pub step: i32,
 }
 
+/// `NFS5.WORDWRAPACCESSORWATCH`'s own state beyond the accessor watch's (vtable 0x5BAEF4): the
+/// text its word-wrap object was built from and the change it is fading out of.
+///
+/// ```text
+/// 0x522EC0  tick: the watch's own tick 0x4BD230 (the label's text from the accessor), then
+///           not changing and the label's text != the copy [+0x198]  -> changing [+0x1A0] = 1,
+///                                                                        [+0x1A4] = now
+///           changing and (now − [+0x1A4] > 0x40, or not animating)  -> rebuild the wrap from the
+///           new text (0x523130 / 0x523080), copy it, [+0x184] = [+0x188] = now, changing = 0
+/// 0x522DC0  draw: changing -> the colour's alpha times clamp(([+0x1A4] − now)·4 + 0x100, 0, 0xFF)
+///           (0x4D87F0) — the old text fades out over 64 ticks
+/// ```
+///
+/// So an animating watch (`data.animating`, `[+0x180]`) whose text changes fades the old text out
+/// in half a second and types the new one from its first letter (0x5232E5's budget
+/// `([+0x188] − [+0x184]) / 3` starts again from 0); one that does not animate takes the new text on
+/// the same tick. The shipped animating ones are `tournament`'s description and the four narrative
+/// screens'.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WrapWatch {
+    /// `[+0x198]` — the text the wrap was built from
+    pub text: String,
+    /// `[+0x1A4]` while `[+0x1A0]` is set — the tick the change was seen
+    pub changing: Option<i64>,
+    /// `[+0x184]` after a rebuild — the tick the typing starts again from; `None` until the first
+    /// change, while the activation's wait (`typewriter`) still rules
+    pub restart: Option<i64>,
+}
+
+impl WrapWatch {
+    /// One tick of 0x522EC0 against the label's current `text` at tick `now`.
+    pub fn tick(&mut self, text: &str, now: i64, animating: bool) {
+        if self.changing.is_none() && self.text != text {
+            self.changing = Some(now);
+        }
+        if let Some(at) = self.changing
+            && (now - at > 0x40 || !animating)
+        {
+            self.text = text.to_string();
+            self.restart = Some(now);
+            self.changing = None;
+        }
+    }
+
+    /// The draw's fade while a change runs (0x522DC4…0x522E10), as a factor on the alpha.
+    pub fn fade(&self, now: i64) -> f32 {
+        match self.changing {
+            Some(at) => ((at - now) * 4 + 0x100).clamp(0, 0xFF) as f32 / 255.0,
+            None => 1.0,
+        }
+    }
+}
+
 /// The design space every `.lay` is authored in.
 pub const DESIGN: (f32, f32) = (640.0, 480.0);
 
@@ -300,6 +353,12 @@ pub struct LayoutScreen {
     movie_overlays: std::cell::RefCell<HashMap<usize, crate::movie_overlay::MovieOverlay>>,
     /// the credits roll the movie circle draws on the credits screen (0x4CE0F0)
     credits_roll: std::cell::RefCell<Option<crate::movie_overlay::CreditsRoll>>,
+    /// each `NFS5.WORDWRAPACCESSORWATCH`'s text as it last laid it out, and its change fade
+    /// (`WrapWatch`, 0x522EC0 / 0x522D60), made on its first draw
+    wrap_watch: std::cell::RefCell<HashMap<usize, WrapWatch>>,
+    /// each `NFS5.AccessorWatch`'s `label.text` as its tick last wrote it (0x4BD32C, 0x526980) —
+    /// what the part measures its `size` over (0x4E7160); before the first draw, the template's
+    watch_text: std::cell::RefCell<HashMap<usize, String>>,
     /// `FEEndOfEraCallBackList`'s show, when this is the end-of-era screen (`set_end_of_era`)
     end_of_era: Option<end_of_era_draw::EndOfEraScreen>,
     /// `[0x65B940]`, the name-box codes the player has typed (`nfs_game::cheats`) — bit 6 is read
@@ -372,6 +431,10 @@ pub struct LayoutScreen {
     /// The widgets carrying the **`selected`** flag, `[widget+0x10C] & 8` (§4.109, §4.111). The
     /// front end sets it by name through the helper 0x50D9A0, not from any pointer state.
     selected_flags: std::collections::BTreeSet<usize>,
+    /// The widgets whose `selected` flag has been **cleared** since the screen was built — a tab
+    /// the block starts as `state=selected` (the bind's own flag) that another tab's click has
+    /// since deselected (0x4CFF30 → the old tab's slot 28, 0x4D0310)
+    unselected: std::collections::BTreeSet<usize>,
     /// The widgets the screen has **hidden** — `[widget+0x10C] & 0x20` (§4.112). A hidden widget
     /// draws `[state.hidden]`, whose part list in every shipped template is the non-drawable
     /// `data` alone, so it puts nothing on the screen.
@@ -877,9 +940,11 @@ pub const PICKER_TITLE_FONT: &str = "univers7b.ffn";
 /// The screen block's `screen=` id → the layout drawn underneath it (`FE_loadBackground` 0x4E1470,
 /// CONFIRMED). The original has a second, reduced table — `ID_FULLOVAL` → `screenfulloval` and
 /// everything else → `screenveryempty` — behind a memory/option gate (`[0x5D9D38]`, set at 0x4E3584
-/// only when more than 4 MB are free and `[0x657E5C]` is set), and swaps `screenoptionoval` for
-/// `screenoptionovallite` on a screen with `canplaygame=1` when memory is short. A port with memory
-/// to spare always takes the full table below.
+/// only when the device's texture memory `[0x619790]` is above 4 000 000 **and** the `FELOWENDCARD`
+/// option `[0x657E5C]` is **clear**), and swaps `screenoptionoval` for `screenoptionovallite` on a
+/// screen with `canplaygame=1` when `FENOUSELESSART` `[0x657E60]` is set or the machine has under
+/// 0x2100000 bytes (33 MiB) of **total physical** memory (0x4E35D0 → 0x53C3D0, `GlobalMemoryStatus`'s
+/// `dwTotalPhys`). A port with memory to spare always takes the full table below.
 pub fn background_layout(screen_id: &str) -> Option<&'static str> {
     Some(match screen_id {
         "ID_SCREEN" => "screenempty",
@@ -1459,6 +1524,8 @@ impl LayoutScreen {
             clock_ms: std::env::var("NFS_FE_CLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0), glint, colb, arcs,
             movie_overlays: Default::default(),
             credits_roll: Default::default(),
+            wrap_watch: Default::default(),
+            watch_text: Default::default(),
             end_of_era: None,
             cheat_bits: 0,
             driver_picture: crate::save::DEFAULT_PICTURE as i32,
@@ -1484,6 +1551,7 @@ impl LayoutScreen {
             focused: Default::default(),
             edits: HashMap::new(),
             selected_flags: Default::default(),
+            unselected: Default::default(),
             hidden_flags: Default::default(),
             disabled_flags: Default::default(),
             picture_pan: Default::default(),
@@ -1552,55 +1620,129 @@ impl LayoutScreen {
         }
     }
 
-    /// Resolve one `.ctr` expression reference for `e`: `data.<key>` is the widget's own attribute,
-    /// `control.size.width` its box, and `<part>.<key>` another piece of the same template. A
-    /// reference the port cannot answer — a text part's width, which depends on the string — is
-    /// left unresolved so the whole expression falls back rather than silently reading zero.
-    fn reference(&self, e: &nfs_formats::lay::Element, name: &str, depth: u32, measure: bool) -> Option<f64> {
-        let (head, rest) = name.split_once('.')?;
-        if head == "data" {
-            return self.attr_num(e, rest);
-        }
-        let (bw, bh) = self.box_of(e, depth + 1);
+    /// One name of a `.ctr` expression, answered the way the macro dictionary `[0x69CAF8]`
+    /// answers it: with the **text** a part published, which the evaluator splices in and expands
+    /// again (`nfs_formats::expr`). What is in the dictionary:
+    ///
+    /// * **`<part>.<attr>`** for every attribute of every part — `Attribute::slot3` 0x52C140
+    ///   defines it as the attribute's string `[attr+0x10]` (0x52C1E3), which is the `.lay`
+    ///   block's value for the attribute's screen key when it may be overridden (0x52C000) and
+    ///   the template's `<attr>.value` otherwise. The `DATA` part is called `data`, so this is
+    ///   `data.width` too — and only for an attribute its `attributes.value` **declares**;
+    /// * a **point** attribute (`pos`, `size`) instead defines `<part>.<attr>.x` and `.width` as
+    ///   the text before its first comma and `.y` and `.height` as all of the text after it, and
+    ///   **nothing** — not even the bare name — when the text has no comma (`PointAttribute::slot3`
+    ///   0x5277F0: `strchr` at 0x527814, `je 0x527B68`; the four `0x52DC20` at 0x52794F,
+    ///   0x527A81, 0x527AE4, 0x527B43).
+    ///
+    /// A name that is not there is [`Macro::Undefined`](nfs_formats::ctr::Macro::Undefined) and
+    /// reads 0: `BottomBarButton.ctr`'s `data.area`, `ChatDisplayBox.ctr`'s `backrect.*`,
+    /// `Tab Button.ctr`'s `data.height`.
+    ///
+    /// Three answers are the port's own, as before: `control.size.*` is the widget's box as this
+    /// port computes it (which prefix the original gives the control's own attributes was not
+    /// traced); a `SHAPE` part's `size` the template leaves empty is its art's (the pack loader's
+    /// 0x5276E0 at 0x4E6EE2) — and a **text** part's `size` is always its text's truncated measure,
+    /// which its load 0x4E7160 writes over the attribute and the next update publishes
+    /// (`part_extent`, `part_text`; CONFIRMED 2026-09-26, correcting "no code publishes a
+    /// measured size"); and a name the port
+    /// cannot answer — that extent when it cannot measure, a part attribute the template leaves
+    /// empty whose constructor default the port does not keep, a chain deeper than five — is
+    /// [`Macro::Unanswerable`](nfs_formats::ctr::Macro::Unanswerable), so the caller keeps its
+    /// fallback. Names are matched without regard to case; the original's dictionary is
+    /// case-sensitive (`std::map` over `memcmp`, 0x4242C0), and every reference in the 72
+    /// shipped templates matches its definition exactly, so the two agree on the data.
+    fn reference(&self, e: &nfs_formats::lay::Element, name: &str, depth: u32, measure: bool) -> nfs_formats::ctr::Macro {
+        use nfs_formats::ctr::Macro;
+        let name = name.to_lowercase();
+        // every identifier of the text comes here, `x1f` of a `0x1f` included
+        let Some((head, rest)) = name.split_once('.') else { return Macro::Undefined };
         if head == "control" {
+            if depth > 4 {
+                return Macro::Unanswerable;
+            }
+            let (bw, bh) = self.box_of(e, depth + 1);
             return match rest {
-                "size.width" => Some(bw as f64),
-                "size.height" => Some(bh as f64),
-                _ => None,
+                "size.width" => Macro::Text((bw as i32).to_string()),
+                "size.height" => Macro::Text((bh as i32).to_string()),
+                _ => Macro::Unanswerable,
             };
         }
-        if depth > 4 {
-            return None;
-        }
-        let part = self.controls.get(&e.class)?.part(head)?;
-        let (key, field) = rest.split_once('.')?;
-        // A drawable part's `size` is the extent of **what it draws** when the template does not
-        // give it one: `Picture.ctr`'s picture part and `BottomBarButton.ctr`'s label both carry
-        // `size.flags=HIDDEN|READONLY` and no `size.value` at all, and the bar button's own
-        // position is written over `label.size.width + picture.size.width`. HIGH — the rule is
-        // what the expressions require, the point at which the original measures was not traced.
-        let pair = match part.value(key).filter(|v| !v.trim().is_empty()) {
-            Some(v) => nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, depth + 1, measure))?,
-            // a measured extent is only for an explicit `<part>.size.*` reference, never for the
-            // widget's own box: `Label.ctr`'s `size.value` is `label.size.width*2,…`, and letting
-            // that resolve would give every label a box twice its text and move it, because this
-            // port implements the alignment rule as an anchor in the box rather than as the part
-            // offset the template writes (`(0-label.size.width)/2*data.align`, `layouts.md` §2.1)
-            None if key == "size" && measure => self.part_extent(e, part)?,
-            None => return None,
+        let Some(c) = self.controls.get(&e.class) else { return Macro::Unanswerable };
+        let Some(part) = c.part(head) else { return Macro::Undefined };
+        let point = |key: &str, field: &str, text: &str| -> Macro {
+            let Some((x, y)) = text.split_once(',') else { return Macro::Undefined };
+            match field {
+                "x" | "width" => Macro::Text(x.to_string()),
+                "y" | "height" => Macro::Text(y.to_string()),
+                _ => {
+                    let _ = key;
+                    Macro::Undefined
+                }
+            }
         };
-        match field {
-            "width" | "x" => Some(pair.0),
-            "height" | "y" => Some(pair.1),
-            _ => None,
+        if part.kind() == nfs_formats::ctr::PartKind::Data {
+            // `data.<attr>`: declared attributes only — every shipped one is an `INT`, a `COLOR`
+            // or a `STRING`, none a point, so a dotted field after it names nothing
+            if rest.contains('.') || !part.attributes.iter().any(|a| a == rest) {
+                return Macro::Undefined;
+            }
+            return match self.part_attr(e, part, rest) {
+                Some(t) => Macro::Text(t.to_string()),
+                // declared with no value anywhere: the attribute's constructor string — `"%d"` of
+                // 0 for an INT (0x52B744 → 0x527140 → 0x5242E0), taken as empty for the others
+                None if part.ty(rest).is_some_and(|t| t.trim().eq_ignore_ascii_case("INT")) => Macro::Text("0".into()),
+                None => Macro::Text(String::new()),
+            };
+        }
+        let (key, field) = match rest.split_once('.') {
+            Some((k, f)) => (k, Some(f)),
+            None => (rest, None),
+        };
+        let is_point = key == "pos" || key == "size";
+        let text_part = matches!(part.kind(), nfs_formats::ctr::PartKind::Text | nfs_formats::ctr::PartKind::LocalizedText);
+        match (field, is_point) {
+            // a text part's `text` is what it holds — for `LOCALIZEDTEXT` the string its load
+            // wrote from `stringID` (0x4E66E0 → `[+0x170]`, the string `Attribute::slot3`
+            // publishes)
+            (None, false) if text_part && key == "text" => self.part_text(e, part, depth + 1).map_or(Macro::Unanswerable, Macro::Text),
+            // …and its `size` is always that text's truncated measure: 0x4E7160 writes it over
+            // whatever the template or the block gave (0x4E72A0), and the update 0x5256F0
+            // publishes it (`Part::slot3`, 0x5257CD) before the parts are evaluated again — which
+            // is why every tick that changes a watch's text runs the update **twice** (0x4BD349,
+            // 0x4BD350), and the input box's bind too (0x4CC577 / 0x4CC57E)
+            (Some(f), true) if text_part && key == "size" => match (measure && depth <= 4).then(|| self.part_extent(e, part)).flatten() {
+                Some((w, h)) => point(key, f, &format!("{},{}", w as i32, h as i32)),
+                None => Macro::Unanswerable,
+            },
+            (None, false) => self.part_attr(e, part, key).map_or(Macro::Unanswerable, |t| Macro::Text(t.to_string())),
+            (Some(f), true) => match self.part_attr(e, part, key) {
+                Some(t) => point(key, f, t),
+                // A drawable part's `size` is the extent of **what it draws** when the template
+                // does not give it one: `Picture.ctr`'s picture part and `BottomBarButton.ctr`'s
+                // label both carry `size.flags=HIDDEN|READONLY` and no `size.value` at all, and
+                // the bar button's own position is written over `label.size.width +
+                // picture.size.width`. A measured extent is only for an explicit
+                // `<part>.size.*` reference, never for the widget's own box: `Label.ctr`'s
+                // `size.value` is `label.size.width*2,…`, and letting that resolve would give
+                // every label a box twice its text and move it, because this port implements the
+                // alignment rule as an anchor in the box (`layouts.md` §2.1).
+                None if key == "size" && measure && depth <= 4 => match self.part_extent(e, part) {
+                    Some((w, h)) => point(key, f, &format!("{},{}", w as i32, h as i32)),
+                    None => Macro::Unanswerable,
+                },
+                None => Macro::Unanswerable,
+            },
+            _ => Macro::Undefined,
         }
     }
 
     /// Every part expression on this screen that does **not** resolve, as
     /// `(class, part, key, expression)`.
     ///
-    /// `reference` answers `None` for a name it cannot resolve and every caller falls back to a
-    /// zero or to the widget's box, so a template the port cannot evaluate is silent. This is the
+    /// `reference` answers `Unanswerable` for a name the port cannot resolve and every caller
+    /// falls back to a zero or to the widget's box, so a template the port cannot evaluate is
+    /// silent. (A name the original does not define is not one of these: it reads 0.) This is the
     /// measurement of that: `--layout-sweep` with `NFS_EXPR_SWEEP=1` runs it over all 98 layouts.
     pub fn expr_failures(&self) -> Vec<(String, String, String, String)> {
         let mut out = Vec::new();
@@ -1610,7 +1752,8 @@ impl LayoutScreen {
             for name in c.state_parts(state) {
                 let Some(p) = c.part(&name) else { continue };
                 for key in ["pos", "size"] {
-                    let Some(v) = self.part_attr(e, p, key).filter(|v| !v.trim().is_empty()) else { continue };
+                    // a value with no comma is never evaluated (0x527B80), so it cannot fail
+                    let Some(v) = self.part_attr(e, p, key).filter(|v| v.contains(',')) else { continue };
                     if nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)).is_none() {
                         out.push((e.class.clone(), name.clone(), key.to_string(), v.to_string()));
                     }
@@ -1944,27 +2087,96 @@ impl LayoutScreen {
                 // tabs could not measure the art they centre their captions over.
                 let file = self.part_attr(e, p, "shapePathName").filter(|v| !v.is_empty())?;
                 let index = match self.part_attr(e, p, "shapeIndex") {
-                    Some(v) => nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0, true)).filter(|n| *n >= 0.0)? as usize,
+                    Some(v) => nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0, true)).filter(|n| *n >= 0)? as usize,
                     None => 0,
                 };
                 let &(_, w, h) = self.shapes.get(&(file.to_string(), index))?;
                 Some((w as f64, h as f64))
             }
             nfs_formats::ctr::PartKind::Text | nfs_formats::ctr::PartKind::LocalizedText => {
-                let text = match e.get("text").filter(|t| !t.is_empty()) {
-                    Some(t) => t.to_string(),
-                    None => self.fe_strings.get(e.string_id()?).filter(|t| !t.is_empty())?.to_string(),
-                };
+                // `FETextPart`'s load **0x4E7160**, after the base update 0x52B250 → 0x52A4F0 has
+                // evaluated every attribute: the font `fontPathName` (`[+0xDC]`, rebuilt by
+                // 0x4E37D0 only when the name changed), the part's text `[+0x19C]` measured by
+                // 0x536970 (`BitmapFont::measure`: its third and fourth outputs, 0x4E727C /
+                // 0x4E7285), both **truncated** (`_ftol` 0x5A0F98) and written over the part's
+                // own `size` with the `"%d,%d"` setter 0x5276E0 (0x4E72A0). Whatever the template
+                // says, a text part's `size` is the measure of the string it holds.
+                let text = self.part_text(e, p, 0)?;
                 let named = e
                     .get("fontPathName")
                     .filter(|f| !f.is_empty())
                     .or_else(|| p.value("fontPathName").filter(|f| !f.is_empty()))
                     .map(|f| f.to_lowercase());
                 let f = named.and_then(|n| self.fonts.get(&n)).or_else(|| self.fonts.get(DEFAULT_FONT))?;
-                let (_, w) = f.place(&text);
-                Some((w as f64, f.line_px() as f64))
+                let (w, h) = f.measure(&text);
+                Some((w.trunc() as f64, h.trunc() as f64))
             }
             _ => None,
+        }
+    }
+
+    /// The string a `TEXT` / `LOCALIZEDTEXT` part holds, `[part+0x19C]`: the `text` attribute's
+    /// value after `StringAttribute::slot4` **0x526B60** has spliced each `%name%` with that
+    /// macro's text (0x52DCE0; a name the dictionary does not hold stays as written). `None` when
+    /// a name in it is one the port cannot answer.
+    ///
+    /// * `LOCALIZEDTEXT`'s load **0x4E66E0** first writes the text from its `stringID`: `atoi`
+    ///   (0x5A1F4A) of the attribute's value, then **0x4E06D0** — id 0 is the empty string
+    ///   0x5E8E50, an id no table holds is `"Not Found"` (0x5D9B38). 0x4E06D0 never answers null,
+    ///   so 0x4E66E0's `"stringID = "` arm (0x4E6772) is dead code.
+    /// * `NFS5.AccessorWatch`'s tick writes the accessor's answer into `label.text` (0x4BD32C);
+    ///   the port keeps what its draw last showed (`watch_text`), and before that the part holds
+    ///   the template's `WATCH`.
+    /// * a `TEXT` part whose template gives no text keeps its constructor's `"Hello, World!"`
+    ///   (0x5DDB84, pushed at 0x52B036).
+    fn part_text(&self, e: &nfs_formats::lay::Element, p: &nfs_formats::ctr::Part, depth: u32) -> Option<String> {
+        use nfs_formats::ctr::PartKind;
+        if depth > 4 {
+            return None;
+        }
+        let splice = |v: &str| -> Option<String> {
+            let mut out = String::new();
+            let mut rest = v;
+            // APPROXIMATION: one pass left to right — where 0x526D4D resumes its search after a
+            // splice was not traced (no shipped text holds more than one pair)
+            while let Some(a) = rest.find('%') {
+                let Some(b) = rest[a + 1..].find('%') else { break };
+                out.push_str(&rest[..a]);
+                let x = nfs_formats::expr::expand(&rest[a + 1..a + 1 + b], &|n| self.reference(e, n, depth + 1, true));
+                if x.contains(nfs_formats::expr::UNKNOWN) {
+                    return None;
+                }
+                out.push_str(&x);
+                rest = &rest[a + 2 + b..];
+            }
+            out.push_str(rest);
+            Some(out)
+        };
+        if p.kind() == PartKind::LocalizedText {
+            let raw = splice(self.part_attr(e, p, "stringID").unwrap_or(""))?;
+            // `atoi`: leading white space, a sign, then the digits
+            let t = raw.trim_start();
+            let (neg, t) = match t.as_bytes().first() {
+                Some(b'-') => (true, &t[1..]),
+                Some(b'+') => (false, &t[1..]),
+                _ => (false, t),
+            };
+            let n = t.bytes().take_while(u8::is_ascii_digit).fold(0i32, |a, c| a.wrapping_mul(10).wrapping_add((c - b'0') as i32));
+            let id = if neg { n.wrapping_neg() } else { n };
+            if id == 0 {
+                return Some(String::new());
+            }
+            return Some(self.fe_strings.get(id as u32).unwrap_or("Not Found").to_string());
+        }
+        if e.class.eq_ignore_ascii_case("NFS5.AccessorWatch")
+            && let Some(i) = self.layout.elements.iter().position(|x| std::ptr::eq(x, e))
+            && let Some(t) = self.watch_text.borrow().get(&i)
+        {
+            return Some(t.clone());
+        }
+        match self.part_attr(e, p, "text") {
+            Some(v) => splice(v),
+            None => Some("Hello, World!".to_string()),
         }
     }
 
@@ -2076,9 +2288,11 @@ impl LayoutScreen {
                 continue;
             }
             let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)));
-            let (px, py) = at("pos").unwrap_or((0.0, 0.0));
-            let (pw, ph) = match at("size") {
-                Some(v) => v,
+            let (px, py) = at("pos").unwrap_or((0, 0));
+            // a text part's size is its text's measure whatever the template says (0x4E72A0)
+            let text_part = matches!(p.kind(), nfs_formats::ctr::PartKind::Text | nfs_formats::ctr::PartKind::LocalizedText);
+            let (pw, ph) = match at("size").filter(|_| !text_part) {
+                Some((w, h)) => (w as f64, h as f64),
                 None => self.part_extent(e, p).unwrap_or((0.0, 0.0)),
             };
             l = l.min(px as f32);
@@ -2232,11 +2446,8 @@ impl LayoutScreen {
         if let Some(c) = parse_color(v) {
             return Some(c);
         }
-        let n = nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0, true))?;
-        if !(0.0..=4294967295.0).contains(&n) {
-            return None;
-        }
-        let n = n as u32;
+        // a 32-bit pattern: `0xffffffff` is −1 to the evaluator and every bit of it the colour
+        let n = nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0, true))? as u32;
         Some([((n >> 16) & 0xFF) as u8, ((n >> 8) & 0xFF) as u8, (n & 0xFF) as u8, (n >> 24) as u8])
     }
 
@@ -2290,10 +2501,9 @@ impl LayoutScreen {
         for (px, py, pw, ph, col) in self.state_rects(e, state) {
             out.push(self.quad(aspect, x + px, y + py, pw.max(1.0), ph.max(1.0), tint(col)));
         }
-        for (px, py, pw, ph, file, index, flip) in self.shape_parts_at(e, frame) {
+        for (px, py, file, index, flip) in self.shape_parts_at(e, frame) {
             let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
-            let (dw, dh) = (if pw > 0.0 { pw } else { aw }, if ph > 0.0 { ph } else { ah });
-            let (pos, size) = self.place(aspect, x + px, y + py, dw, dh);
+            let (pos, size) = self.place(aspect, x + px, y + py, aw, ah);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
@@ -2318,7 +2528,7 @@ impl LayoutScreen {
             let (px, py) = self
                 .part_attr(e, p, "pos")
                 .and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)))
-                .unwrap_or((0.0, 0.0));
+                .unwrap_or((0, 0));
             let Some(f) = self
                 .part_attr(e, p, "fontPathName")
                 .map(|f| f.to_lowercase())
@@ -2355,13 +2565,13 @@ impl LayoutScreen {
     /// part `shapePathName=weeicons.fsh` and `shapeIndex=data.nonselindex`, so the widget's own
     /// `nonselindex` picks the arrow. The same shape covers `NFS5.POPUPCIRCLE`,
     /// `NFS5.ExtraCircle`, the tab buttons and the rest of the art-from-template classes.
-    fn shape_parts(&self, e: &nfs_formats::lay::Element) -> Vec<(f32, f32, f32, f32, String, usize, i64)> {
+    fn shape_parts(&self, e: &nfs_formats::lay::Element) -> Vec<(f32, f32, String, usize, i64)> {
         self.shape_parts_at(e, None)
     }
 
     /// The same, with the `picture` part's entry replaced — what `NFS5.BOTTOMBARBUTTON`'s tick
     /// does every frame through `0x5271F0([this+0x17C], frame)` (§4.53).
-    fn shape_parts_at(&self, e: &nfs_formats::lay::Element, frame: Option<usize>) -> Vec<(f32, f32, f32, f32, String, usize, i64)> {
+    fn shape_parts_at(&self, e: &nfs_formats::lay::Element, frame: Option<usize>) -> Vec<(f32, f32, String, usize, i64)> {
         // `NFS5.POPUPCIRCLE` **is drawn**, and the reading that said otherwise rested on the
         // draw order being the wrong way round (§4.67).
         //
@@ -2415,15 +2625,22 @@ impl LayoutScreen {
                 Some(n) => n,
                 None => match self.part_attr(e, p, "shapeIndex") {
                     Some(v) => match nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0, true)) {
-                        Some(n) if n >= 0.0 => n as usize,
+                        Some(n) if n >= 0 => n as usize,
                         _ => continue,
                     },
                     None => 0,
                 },
             };
             let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)));
-            let (px, py) = at("pos").unwrap_or((0.0, 0.0));
-            let (pw, ph) = at("size").unwrap_or((0.0, 0.0));
+            let (px, py) = at("pos").unwrap_or((0, 0));
+            let (px, py) = (px as f64, py as f64);
+            // No size: a `SHAPE` part is always drawn at its **art's** size. `FEShapePart`'s load
+            // (vtable 0x5B6E64 slot 8, **0x4E6AA0**) fetches the entry (0x4D7A10 at 0x4E6EBE) and
+            // writes its width and height (`+0x14`, `+0x18`) over the part's `size` attribute
+            // (0x5276E0 on `[part+0x60]` at 0x4E6EE2), and the draw 0x4E6F60 hands the entry to
+            // 0x4D9AF0, which reads the same two fields for the quad's extent (0x4D9B04, 0x4D9B0E).
+            // The only `SHAPE` parts that write a `size.value` are `CarSettingSlider.ctr`'s three
+            // knobs, `6,11` — which is the art (`weeicons.fsh` 8, 34, 35 are 6×11).
             // **`data.picoffy`** — `NFS5.BOTTOMBARBUTTON`'s own draw, 0x4C9B30, adds it to the
             // `picture` part's y and nothing else: `[this+0x1D4]` (the bind at 0x4C9639) plus the
             // part's own `pos.y` from `0x4E7060([this+0x178])` plus the widget's y, all three at
@@ -2441,10 +2658,10 @@ impl LayoutScreen {
             let flip = self
                 .part_attr(e, p, "flip")
                 .and_then(|v| nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0, true)))
-                .filter(|n| *n >= 0.0)
+                .filter(|n| *n >= 0)
                 .map(|n| n as i64)
                 .unwrap_or_else(|| e.int("flip").unwrap_or(0).max(0));
-            out.push((px as f32, py as f32, pw as f32, ph as f32, file.to_string(), index, flip));
+            out.push((px as f32, py as f32, file.to_string(), index, flip));
         }
         out
     }
@@ -2860,6 +3077,34 @@ impl LayoutScreen {
         }).map(|n| n + first)
     }
 
+    /// `NFS5.KNOCKOUTTRACKLIST`'s slot 9, **0x4FA470**: the row under a release —
+    /// `(ev.y − box.top) · 7 / (box.bottom − box.top)` (`lea eax,[ecx*8]; sub eax,ecx; cdq; idiv`,
+    /// 0x4FA4AF…0x4FA4B9, truncating) over the widget's box (0x4C8670) — handed to the
+    /// `[this+0x144]` accessor's `SetSelection` (slot 0x2C) when it is **below** the count
+    /// `[this+0x140]` answers (slot 0x6C, `jge` at 0x4FA4BD); otherwise nothing, and the slot
+    /// answers 0. There is no lower bound and no x test. `None` for any other widget, or a row
+    /// at or past the count. The pointer is in design pixels, taken whole (APPROXIMATION: the
+    /// original's are the event's integer pixels).
+    pub fn ko_row_at(&self, index: usize, x: f32, y: f32) -> Option<usize> {
+        if let Some((k, j)) = self.route(index) {
+            let (gx, gy) = self.position_of(self.layout.elements.get(k)?);
+            return self.groups.get(&k)?.ko_row_at(j, x - gx, y - gy);
+        }
+        let e = self.layout.elements.get(index)?;
+        if e.class != "NFS5.KNOCKOUTTRACKLIST" {
+            return None;
+        }
+        let &(rows, _) = self.ko_strip.get(&index)?;
+        let (_, wy) = self.position_of(e);
+        let (_, h) = self.box_of(e, 0);
+        let (top, span) = (wy as i32, h as i32);
+        if span == 0 {
+            return None;
+        }
+        let row = (y.floor() as i32 - top).wrapping_mul(7) / span;
+        usize::try_from(row).ok().filter(|r| *r < rows)
+    }
+
     /// Park a list's knob where a press on the **track** put it, until the model moves
     /// (`RE/notes/controls.md` §4.46 — the tail of 0x4D0995). `None` gives it back to the model.
     pub fn park_knob(&mut self, index: usize, y: Option<f32>) {
@@ -3203,6 +3448,18 @@ impl LayoutScreen {
         let mut want = 0usize;
         if let Some(h) = hovered {
             want = want.max(1);
+            // `FEChroniclePicture::draw` asks for shape **4** while it is hovered (0x4C7C90) and
+            // its picture is bigger than its box on either axis (0x50851C…0x508531)
+            if self.layout.elements.get(h).is_some_and(|e| e.class == "NFS5.ChroniclePicture")
+                && let Some((_, _, pw, ph)) = self.chronicle_pan(h)
+                && let Some(e) = self.layout.elements.get(h)
+                && {
+                    let (bw, bh) = self.box_of(e, 0);
+                    pw - bw > 0.0 || ph - bh > 0.0
+                }
+            {
+                want = want.max(4);
+            }
             if let Some(e) = self.layout.elements.get(h)
                 && e.class.eq_ignore_ascii_case("NFS5.3DCAR")
             {
@@ -3547,9 +3804,17 @@ impl LayoutScreen {
             // summing those widths for the picture's width and the height of every row's first
             // entry for its height, and then blits entry `2 + row*cols + col` at the running
             // column x and row y (0x50856A…0x50861E). A pack's second row is tagged `Laye`, not
-            // `1111`, which is why only the first row is matched by name. CONFIRMED by the size:
-            // `MA601a.fsh` measures 4 × (128+128+128+74) by (148+138) = 458×286, and both
-            // `chroniclepicture.lay` and `chroniclemedia.lay` give the widget `size=458,286`.
+            // `1111`, which is why only the first row is matched by name. The widget on both
+            // `chroniclepicture.lay` and `chroniclemedia.lay` is `size=458,286`, which is the
+            // picture in 140 of the 183 packs; the other 43 are bigger — `MA601a.fsh` is **five**
+            // rows, 4 × (128+128+128+74) by (148+138+148+138+78) = 458×650 (this said 458×286
+            // until 2026-09-26, counting only its first two rows) — and the draw shows a
+            // box-sized window of them that the player drags (`chronicle_pan`).
+            //
+            // The measure's own row height is the height of entry `2 + r·cols + 1` for r ≥ 1 (the
+            // first `Laye` entry resets the column without adding, 0x50844D…0x50847F) and the
+            // draw advances by the row's **last** tile (0x5085FE); every shipped row is one
+            // height, so all three agree.
             let tiles: Vec<&nfs_assets::texture::TextureImage> = entries.iter().skip(2).collect();
             let cols = tiles.iter().take_while(|t| t.name.trim() == CHRONICLE_PICTURE_TAG).count();
             if cols == 0 || tiles.is_empty() {
@@ -4157,6 +4422,18 @@ impl LayoutScreen {
         (e.class == "NFS5.PLAYERDRIVERPICTURE").then(|| self.attr_num(e, "ournumber").unwrap_or(0.0) as i32)
     }
 
+    /// `NFS5.CAMERASELECT`'s slot 9, **0x4BF5F0** — the release hands `Camera.Current` (`[this+
+    /// 0x140]`, bound at 0x4BF2DB) its `SetSelection`, slot 0x2C, with the widget's own
+    /// `data.accessornum` (`[this+0x14C]`, 0x4BF2C7), and answers 1. No hit test, no sound. The
+    /// number, for any other widget `None`.
+    pub fn camera_select_of(&self, index: usize) -> Option<i32> {
+        if let Some((k, j)) = self.route(index) {
+            return self.groups.get(&k)?.camera_select_of(j);
+        }
+        let e = self.layout.elements.get(index)?;
+        (e.class == "NFS5.CAMERASELECT").then(|| self.attr_num(e, "accessornum").unwrap_or(0.0) as i32)
+    }
+
     /// An activate on an input box takes focus, as `FeInputBox`'s slot 9 does:
     ///
     /// ```text
@@ -4301,8 +4578,26 @@ impl LayoutScreen {
             }
             return;
         }
-        let (ox, oy) = self.picture_pan.get(&index).copied().unwrap_or((0.0, 0.0));
+        // slot 5 copies the pan as the **draw** last left it, and the draw clamps it in place
+        // (0x5084E8…0x508516), so a drag starts from the clamped value, never from a raw one
+        let (ox, oy) = self.chronicle_pan(index).map_or((0.0, 0.0), |p| (p.0, p.1));
         self.picture_drag = Some((index, x, y, ox, oy));
+    }
+
+    /// `FEChroniclePicture::draw`'s pan, clamped the way the draw clamps it, with the size of the
+    /// whole picture: `(pan_x, pan_y, picture_w, picture_h)`.
+    ///
+    /// 0x5084AC takes the widget's box (0x4C8670: the local rect of vtable slot `0x34` plus the
+    /// parent's origin — **not** moved by the transition), and 0x5084C7…0x5084E2 take
+    /// `picture − box` on each axis as the furthest the pan can go. The stored pan is then
+    /// clamped to that (0x5084E4, 0x5084EE) and **afterwards** to 0 (0x508504, 0x50850E), so a
+    /// picture no bigger than its box never moves. `None` when no picture is bound.
+    pub(crate) fn chronicle_pan(&self, index: usize) -> Option<(f32, f32, f32, f32)> {
+        let e = self.layout.elements.get(index)?;
+        let &(_, pw, ph) = self.shapes.get(self.logos.get(&index)?)?;
+        let (bw, bh) = self.box_of(e, 0);
+        let (rx, ry) = self.picture_pan.get(&index).copied().unwrap_or((0.0, 0.0));
+        Some((rx.min(pw - bw).max(0.0), ry.min(ph - bh).max(0.0), pw, ph))
     }
 
     /// Slot 8, 0x5082A0 — the pan follows the pointer while the button is held.
@@ -4380,8 +4675,10 @@ impl LayoutScreen {
         }
         if on {
             self.selected_flags.insert(index);
+            self.unselected.remove(&index);
         } else {
             self.selected_flags.remove(&index);
+            self.unselected.insert(index);
         }
     }
 
@@ -4975,7 +5272,63 @@ impl LayoutScreen {
         if hot && self.can_hover(&e.class) {
             return "hover";
         }
-        e.get("state").unwrap_or("normal")
+        match e.get("state").unwrap_or("normal") {
+            "selected" if self.unselected.contains(&i) => "normal",
+            s => s,
+        }
+    }
+
+    /// A release on a tab button — `FERadioItem`'s slot 9, **0x4D0290**: the widget's window's
+    /// own parent (`[[this+0xD0]+0xD0]`) cast to `FERadioGroup` (0x5A134B with 0x5D9030) and, when
+    /// it is one, its slot 29 **0x4CFF30** with this button; then sound 5 (0x4AADB0) whatever the
+    /// cast gave — the caller plays it. Answers whether `index` is a tab button.
+    ///
+    /// 0x4CFF30: the button already current (`[group+0x154]`) does nothing; otherwise the current
+    /// one's slot 28 **0x4D0310** hides its panel (0x4CEC50) and the button becomes the pending one
+    /// `[group+0x158]`, which the group's tick **0x4CFEB0** makes current — its slot 27 **0x4D02E0**:
+    /// the `selected` flag (0x4C7D00), the panel's load (+0x6C, 0x4CEA90) and show (0x4CEC60) —
+    /// once the old button is no longer selected and the panel's screen is neither going out
+    /// (0x4E0E00 ≠ 3) nor closed (0x4E0E10). APPROXIMATION: the port's panels have no transition
+    /// of their own, so the switch is made at once. A button's `panel` names a `NFS5.PANEL` of
+    /// the screen that holds the strip (0x4D01F0 looks it up three windows up).
+    pub fn tab_click(&mut self, r: &mut Renderer, paths: &GamePaths, index: usize) -> bool {
+        let Some((k, j)) = self.route(index) else { return false };
+        let is_tab = |c: &str| c == "NFS5.TABBUTTON" || c == "NFS5.GRAPHICTABBUTTON";
+        let strip_here = self.layout.elements.get(k).is_some_and(|e| e.class == "NFS5.RADIOGROUP")
+            && self.groups.get(&k).is_some_and(|g| g.layout.elements.get(j).is_some_and(|e| is_tab(&e.class)));
+        if !strip_here {
+            // deeper: a strip inside a panel this screen holds
+            return match self.groups.get_mut(&k) {
+                Some(g) => g.tab_click(r, paths, j),
+                None => false,
+            };
+        }
+        let (old, new_panel, old_panel) = {
+            let g = &self.groups[&k];
+            let current = g.layout.elements.iter().enumerate().find(|(n, e)| {
+                is_tab(&e.class) && (g.selected_flags.contains(n) || (e.get("state") == Some("selected") && !g.unselected.contains(n)))
+            });
+            let old = current.map(|(n, _)| n);
+            if old == Some(j) {
+                return true;
+            }
+            let panel_of = |n: usize| g.layout.elements.get(n).and_then(|e| e.get("panel")).filter(|p| !p.is_empty()).map(str::to_string);
+            (old, panel_of(j), old.and_then(panel_of))
+        };
+        let g = self.groups.get_mut(&k).expect("strip");
+        if let Some(o) = old {
+            g.selected_flags.remove(&o);
+            g.unselected.insert(o);
+        }
+        g.unselected.remove(&j);
+        g.selected_flags.insert(j);
+        if let Some(p) = old_panel {
+            self.set_panel(r, paths, &p, false);
+        }
+        if let Some(p) = new_panel {
+            self.set_panel(r, paths, &p, true);
+        }
+        true
     }
 
     /// Put the pointer somewhere, in design coordinates, or take it away.
@@ -6043,6 +6396,25 @@ impl LayoutScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wordwrap_watch_fades_its_old_text_out_before_typing_the_new_one() {
+        let mut w = WrapWatch { text: "old".into(), changing: None, restart: None };
+        w.tick("old", 10, true);
+        assert_eq!(w.fade(10), 1.0);
+        w.tick("new", 20, true);
+        assert_eq!((w.text.as_str(), w.changing), ("old", Some(20)));
+        // (20 − 52)·4 + 0x100 = 128
+        assert!((w.fade(52) - 128.0 / 255.0).abs() < 1e-6);
+        w.tick("new", 84, true);
+        assert_eq!(w.text, "old", "64 ticks is not yet more than 0x40");
+        w.tick("new", 85, true);
+        assert_eq!((w.text.as_str(), w.restart, w.changing), ("new", Some(85), None));
+        // one that does not animate takes the new text on the same tick
+        let mut q = WrapWatch { text: "a".into(), changing: None, restart: None };
+        q.tick("b", 5, false);
+        assert_eq!((q.text.as_str(), q.changing), ("b", None));
+    }
 
     /// `FE_transitionBits` 0x4C88C0 — the six names, lower-cased, and 0 for anything else.
     #[test]

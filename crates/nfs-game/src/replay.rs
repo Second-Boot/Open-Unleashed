@@ -161,7 +161,9 @@ pub struct Replay {
     slot: usize,
     /// `[0x606A80]` — the tick recording stopped at, i.e. the replay's length.
     pub final_tick: u64,
-    /// The flags the last played-back sample carried.
+    /// The flags the last sample carried — recorded or played back. Either way they are what
+    /// car-info `+0x14/+0x18/+0x1C` hold at the save: 0x4143F0 reads them from there and 0x4144B0
+    /// writes them there (0x414546…0x4145A3).
     pub ramp: Ramp,
 }
 
@@ -176,11 +178,14 @@ impl Replay {
         Self { mode: Mode::Recording, stream: vec![0; STREAM_LEN], write: 0, read: 0, block: [0; 32], slot: 0, final_tick: 0, ramp: Ramp::default() }
     }
 
-    /// A replay loaded for playback.
+    /// A replay loaded for playback. The loaded bytes count as written, so [`Replay::stream`]
+    /// hands them back: the de-init save 0x413FD0 dumps the buffer whatever the mode, and after a
+    /// playback that is the stream it played.
     pub fn playing(stream: Vec<u8>, final_tick: u64) -> Self {
         let mut s = stream;
+        let write = s.len().min(STREAM_LEN);
         s.resize(STREAM_LEN, 0);
-        Self { mode: Mode::Playing, stream: s, write: 0, read: 0, block: [0; 32], slot: 0, final_tick, ramp: Ramp::default() }
+        Self { mode: Mode::Playing, stream: s, write, read: 0, block: [0; 32], slot: 0, final_tick, ramp: Ramp::default() }
     }
 
     /// `Replay_startRace` 0x413EA0: while recording, clear the buffer and both cursors; while
@@ -197,6 +202,14 @@ impl Replay {
         self.read = 0;
         self.slot = 0;
         self.block = [0; 32];
+    }
+
+    /// The session loop's turn to the automatic replay (0x4B6EF4…0x4B6F18): `REPLAY = 2`,
+    /// `[0x5E99F4] = 2`, back to 0x4B6D9F — the buffer is kept as it was recorded (or as far as it
+    /// filled), and the race's restart, [`Replay::start_race`] (0x413EA0), rewinds only the read
+    /// side. The samples of a block never flushed are not in the stream, as in the original.
+    pub fn replay_in_place(&mut self) {
+        self.mode = Mode::Playing;
     }
 
     pub fn stream(&self) -> &[u8] {
@@ -221,6 +234,7 @@ impl Replay {
 
     /// `Replay_recordInput` 0x4143F0.
     pub fn record(&mut self, p: Packet, ramp: Ramp, tick: u64) {
+        self.ramp = ramp;
         let s = self.slot;
         self.block[s] = (p.steer as i16 + STEER_BIAS as i16) as u8 | if ramp.steer { 0x80 } else { 0 };
         self.block[s + 8] = p.throttle | if ramp.gas { 0x80 } else { 0 };
@@ -234,13 +248,15 @@ impl Replay {
     }
 
     /// `Replay_recordBlock` 0x414060: channel 0 raw, channels 1..3 RLE'd, with the head-room guard
-    /// that stops recording and freezes the final tick.
+    /// that stops recording. The guard does not look at the mode: **every** refused flush writes
+    /// `[0x5E99F4] = 1` and `[0x606A80] = [0x606AC4]` (0x414076…0x414086), so while the stream is
+    /// full the final tick keeps following the block flushes, and the save (0x413FD0, which only
+    /// takes the clock in mode 0) stores the tick of the last refused block. *(Until the audit of
+    /// 2026-09-26 the port froze it at the first refusal.)*
     fn flush(&mut self, tick: u64) {
         if self.write + HEAD_ROOM >= STREAM_LEN {
-            if self.mode == Mode::Recording {
-                self.mode = Mode::Full;
-                self.final_tick = tick;
-            }
+            self.mode = Mode::Full;
+            self.final_tick = tick;
             return;
         }
         let w = self.write;
@@ -338,12 +354,17 @@ impl Speed {
             _ => 0.01,
         }
     }
+    /// The bar's speed cell (0x42DBCF…0x42DC38): `+0x174` steps 5 → 6 → 7 → 8 → 5 and the step
+    /// it lands on is sent through the jump table 0x42DCF8 as event 0xA…0xD, which `RaceFrame`
+    /// turns into command 4…7 (0x415799…0x4157A5) — normal, double, quarter, half. So a click
+    /// goes **normal → double → quarter → half → normal**. *(Until 2026-09-26 this was half →
+    /// quarter → normal → double, with no source; nothing called it.)*
     pub fn next(self) -> Self {
         match self {
-            Speed::Half => Speed::Quarter,
-            Speed::Quarter => Speed::Normal,
             Speed::Normal => Speed::Double,
-            Speed::Double => Speed::Half,
+            Speed::Double => Speed::Quarter,
+            Speed::Quarter => Speed::Half,
+            Speed::Half => Speed::Normal,
         }
     }
 }
@@ -359,23 +380,31 @@ pub fn apply_camera(id: u8, has_camera_nodes: bool) -> u8 {
     if id == 0x14 && !has_camera_nodes { 3 } else { id }
 }
 
-/// Stepping the cycle, the same function's retry arm: **0x0B `SplineCam`** is skipped unless the
-/// track is `skidpad` (the `strcmp` against `[0x657444]` at 0x414A28), and the index wraps over
-/// the nine entries.
+/// Stepping the cycle, command 8 (0x414901…0x414ACD): `idx = (idx + 1) % 9`, and when the new
+/// entry is **0x0B `SplineCam`** the name `TRACK_NAME [0x657444]` is compared with `"skidpad"`
+/// (`_stricmp` 0x5AE3C0 at 0x4149A3): **equal** steps the index once more (0x4149B3…0x4149C4),
+/// **different** keeps 0x0B (`jne 0x414AB7`). So 0x0B is skipped *on* skidpad and offered on every
+/// other track. *(Until the audit of 2026-09-26 this was the other way round, from `replay.md` §8.)*
 pub fn next_camera(index: usize, is_skidpad: bool) -> usize {
     let n = CAMERA_IDS.len();
-    let mut i = index;
-    for _ in 0..n {
+    let mut i = (index + 1) % n;
+    if CAMERA_IDS[i] == 0x0B && is_skidpad {
         i = (i + 1) % n;
-        if CAMERA_IDS[i] != 0x0B || is_skidpad {
-            break;
-        }
     }
     i
 }
 
-/// Ticks the race keeps running after the stream is exhausted (0x415CB3: one second).
-pub const END_GRACE_TICKS: u64 = 64;
+/// The end of a playback, 0x415CB3…0x415CE2 in `RaceFrame`: once the stream has run out
+/// (`[0x5E99F4] == 3`) the race is over as soon as `gGameTick [0x606AC4] > 0x40`
+/// (`cmp …, 0x40 ; jle` skips) — `[0x606A8C] = 1`, `REPLAY = 3`. The 64 is an absolute tick of the
+/// race, not a grace period after the stream ends. *(Until the audit of 2026-09-26 the port kept
+/// the race running for 64 ticks after the exhaustion, from `replay.md` §5.2's "one second after".)*
+pub const END_MIN_TICK: u64 = 0x40;
+
+/// Whether a playback in `mode` at game tick `tick` is over (0x415CB3).
+pub fn playback_over(mode: Mode, tick: u64) -> bool {
+    mode == Mode::Exhausted && tick > END_MIN_TICK
+}
 
 // ---------------------------------------------------------------------------------------------
 // The port's replay file — NOT the original's `.rpl` (see the module docs and notes §6.1/§14.5)
@@ -403,6 +432,10 @@ pub struct ReplaySetup {
     pub opponents: u32,
     pub traffic: u32,
     pub cops: bool,
+    /// `Game.Damage` — the snapshot's `DAMAGE` word (`[0x657A2C]`, registry id 0x20 at +0x644,
+    /// `replay.md` §6); the port's own file keeps it in the byte after `mirror` as "damage off"
+    /// so that a file written before 2026-09-26 (that byte 0) still reads as on
+    pub damage: bool,
     pub backwards: bool,
     pub mirror: bool,
     /// The seed the traffic/AI RNG was started from (`RAND_SEED`'s role in §11).
@@ -437,7 +470,8 @@ impl ReplayFile {
         o.push(u8::from(s.cops));
         o.push(u8::from(s.backwards));
         o.push(u8::from(s.mirror));
-        o.push(0);
+        // "damage off": 0 keeps the files written before the field read as damage on
+        o.push(u8::from(!s.damage));
         o.extend_from_slice(&s.seed.to_le_bytes());
         o.extend_from_slice(&self.final_tick.to_le_bytes());
         o.extend_from_slice(&(self.stream.len() as u32).to_le_bytes());
@@ -471,13 +505,14 @@ impl ReplayFile {
         let opponents = u32at(&mut p)?;
         let traffic = u32at(&mut p)?;
         let (cops, backwards, mirror) = (*d.get(p)? != 0, *d.get(p + 1)? != 0, *d.get(p + 2)? != 0);
+        let damage = *d.get(p + 3)? == 0;
         p += 4;
         let seed = u32at(&mut p)?;
         let final_tick = u64::from_le_bytes(d.get(p..p + 8)?.try_into().ok()?);
         p += 8;
         let len = u32at(&mut p)? as usize;
         let stream = d.get(p..p + len)?.to_vec();
-        Some(Self { setup: ReplaySetup { track, car, sim, car_id, paint, laps, opponents, traffic, cops, backwards, mirror, seed, skill }, final_tick, stream })
+        Some(Self { setup: ReplaySetup { track, car, sim, car_id, paint, laps, opponents, traffic, cops, damage, backwards, mirror, seed, skill }, final_tick, stream })
     }
 }
 
@@ -504,8 +539,10 @@ pub mod snapshot {
     pub const MIRROR: usize = 0x0044;
     pub const REVERSE: usize = 0x0048;
     pub const MEASUREMENT: usize = 0x004C;
-    /// A NUL-terminated name; the next registered variable is at +0xAC.
+    /// A NUL-terminated name; the next registered variable, `FE_PLAYER_FILENAME`, is at +0x9C
+    /// (§16.1), so the field is 0x40 bytes.
     pub const TRACK_NAME: usize = 0x005C;
+    pub const FE_PLAYER_FILENAME: usize = 0x009C;
     pub const LINEAR_TRACK: usize = 0x00AC;
     pub const WEATHER: usize = 0x063C;
     pub const FOG: usize = 0x0640;
@@ -535,7 +572,11 @@ pub mod snapshot {
 /// **Never round-tripped through the original** — there is no copy of the game to load it into on
 /// this machine, so this is written from the documented layout, not from an observed file. The
 /// port's own [`ReplayFile`] stays the format it reads back itself.
-pub fn original_rpl(setup: &ReplaySetup, final_tick: u64, stream: &[u8]) -> Vec<u8> {
+///
+/// `ramp` is the three `.RAMP*` flags car-info slot 0 holds at the save (the last sample's), and
+/// `num_cars` is `NUMCARS` as `Race_setCars` 0x4ECF00 sets it: cops + players + opponents +
+/// traffic, the traffic already cut to fit nine (0x4ED382…0x4ED399) — the caller knows the counts.
+pub fn original_rpl(setup: &ReplaySetup, final_tick: u64, stream: &[u8], ramp: Ramp, num_cars: u32) -> Vec<u8> {
     use snapshot as f;
     let mut out = vec![0u8; RPL_LEN];
     let put = |o: &mut Vec<u8>, at: usize, v: u32| o[at..at + 4].copy_from_slice(&v.to_le_bytes());
@@ -543,21 +584,28 @@ pub fn original_rpl(setup: &ReplaySetup, final_tick: u64, stream: &[u8]) -> Vec<
     put(&mut out, f::NUM_LAPS, setup.laps);
     put(&mut out, f::SKILL, setup.skill as u32);
     put(&mut out, f::COPS, u32::from(setup.cops));
+    put(&mut out, f::DAMAGE, u32::from(setup.damage));
     put(&mut out, f::TRAFFIC_DENSITY, setup.traffic);
     put(&mut out, f::MIRROR, u32::from(setup.mirror));
     put(&mut out, f::REVERSE, u32::from(setup.backwards));
     put(&mut out, f::RAND_SEED, setup.seed);
     // `Replay_save` patches this to 2 so that loading the file lands straight in playback (§6.2)
     put(&mut out, f::REPLAY, 2);
-    put(&mut out, f::NUMCARS, 1 + setup.opponents);
+    put(&mut out, f::NUMCARS, num_cars);
     put(&mut out, f::NUMPLAYERRACECARS, 1);
     put(&mut out, f::NUMOPPONENTRACECARS, setup.opponents);
     let name = setup.track.as_bytes();
-    let n = name.len().min(0x4F);
+    // at most 0x3F characters and the NUL inside the 0x40-byte field; the port wrote up to 0x4F,
+    // over the start of `FE_PLAYER_FILENAME` (until the audit of 2026-09-26)
+    let n = name.len().min(f::FE_PLAYER_FILENAME - f::TRACK_NAME - 1);
     out[f::TRACK_NAME..f::TRACK_NAME + n].copy_from_slice(&name[..n]);
     // slot 0 is the human's car; the port drives everything else off its own setup
     put(&mut out, f::CARS + f::CAR_TYPE, setup.car_id as u32);
-    put(&mut out, f::CARS + f::CAR_RAMPS, 1);
+    // the three flags as the car-info holds them — the port wrote `.RAMPS = 1` and nothing else
+    // (until the audit of 2026-09-26)
+    put(&mut out, f::CARS + f::CAR_RAMPS, u32::from(ramp.steer));
+    put(&mut out, f::CARS + f::CAR_RAMPG, u32::from(ramp.gas));
+    put(&mut out, f::CARS + f::CAR_RAMPB, u32::from(ramp.brake));
     out[SNAPSHOT_LEN..SNAPSHOT_LEN + 4].copy_from_slice(&(final_tick as u32).to_le_bytes());
     let n = stream.len().min(STREAM_LEN);
     out[SNAPSHOT_LEN + 4..SNAPSHOT_LEN + 4 + n].copy_from_slice(&stream[..n]);
@@ -573,7 +621,7 @@ pub fn parse_original_rpl(data: &[u8]) -> Option<(ReplaySetup, u64, Vec<u8>)> {
         return None;
     }
     let u32at = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
-    let end = data[f::TRACK_NAME..f::LINEAR_TRACK].iter().position(|b| *b == 0).unwrap_or(0);
+    let end = data[f::TRACK_NAME..f::FE_PLAYER_FILENAME].iter().position(|b| *b == 0).unwrap_or(0);
     let track: String = data[f::TRACK_NAME..f::TRACK_NAME + end].iter().map(|&b| b as char).collect();
     let setup = ReplaySetup {
         track,
@@ -585,6 +633,7 @@ pub fn parse_original_rpl(data: &[u8]) -> Option<(ReplaySetup, u64, Vec<u8>)> {
         opponents: u32at(f::NUMOPPONENTRACECARS),
         traffic: u32at(f::TRAFFIC_DENSITY),
         cops: u32at(f::COPS) != 0,
+        damage: u32at(f::DAMAGE) != 0,
         backwards: u32at(f::REVERSE) != 0,
         mirror: u32at(f::MIRROR) != 0,
         seed: u32at(f::RAND_SEED),
@@ -681,9 +730,129 @@ pub fn cell_glyph_origin(cell: (f32, f32), box_w: f32, box_h: f32) -> (f32, f32)
     (half(BAR_CELL.0 - box_w) as f32 + cell.0 + 1.0, half(BAR_CELL.1 - box_h) as f32 + cell.1 + 1.0)
 }
 
+/// What a press on one of the bar's cells asks for — `HReplay`'s slot 9, **0x42D880**(x, y, event),
+/// settled from the code (read 2026-09-26). Each cell is hit-tested against its own position field
+/// (the same `+0x12C…+0x160` pairs 0x42DEF0 lays out), `x` in `[cx, cx + 21]` and `y` in
+/// `[cy, cy + 18]` — `jl` / `jg` on integers, so both edges are inside — and answers only **event
+/// 2**, the left button going down (`WM_LBUTTONDOWN` → 0x435180), once per press: a latch per
+/// cell `[0x60CB50 + i]` is set by the answer and cleared by any other event with the pointer in
+/// that cell. The answers, by cell (left to right, 0x42DEF0's order):
+///
+/// | cell | field | answer |
+/// |---|---|---|
+/// | 0 `cam` | `+0x12C` | **6** (0x42D8FC) → `RaceFrame` command 8, the next camera |
+/// | 1 `rest` | `+0x134` | **7** with `+0x174 = 5` (0x42D984…0x42D98E) — or **0x17** when `+0x198` |
+/// | 2 `paus` / `play` | `+0x13C` | **8** with `+0x199` flipped (0x42DA24…0x42DA34) — or **0x16** when `+0x198` |
+/// | 3 `quit` | `+0x144` | **9** (0x42DB45), only without `+0x198` |
+/// | 4 speed | `+0x14C` | `+0x174` stepped, then **0xA…0xD** (0x42DBCF…0x42DC2C), only without `+0x198` |
+/// | 5 `Irac` | `+0x154` | **0xE** (0x42DABD) |
+/// | 6 `save` | `+0x15C` | **0xF** (0x42DCA6), only without `+0x198` |
+///
+/// `+0x198` is the constructor's byte, 1 only for a network race (`FEGAME_TYPE 3`, 0x424F7B…
+/// 0x424F90): there cell 2 shows `next` and the two cells step the car (0x16 → command 9, 0x17 →
+/// command 10), and quit, speed and save are neither drawn (0x42D3CD) nor tested (0x42DAFC). The
+/// in-race action table (`[0x415D9C + event − 1]`, 0x415520) maps 6 → 8, 7 → 1, 8 → 3, 9 → 2,
+/// 0xA…0xD → 4…7, 0x16 → 9, 0x17 → 10; 0xE and 0xF reach no command — the HUD's pump takes them
+/// (0x42664B, 0x4264EE), and it takes 7 as well before passing it on (0x4266BD).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarEvent {
+    /// 6 → command 8
+    Camera,
+    /// 7 → command 1: quit with `[0x657428] = 1`, which the session loop reads as "play it again"
+    Restart,
+    /// 8 → command 3, the pause toggle
+    Pause,
+    /// 9 → command 2, quit
+    Quit,
+    /// 0xA…0xD → command 4…7
+    Speed(Speed),
+    /// 0xE: the result pages again
+    Results,
+    /// 0xF: `HReplaySave`
+    Save,
+    /// 0x16 → command 9 (network only)
+    NextCar,
+    /// 0x17 → command 10 (network only)
+    PrevCar,
+}
+
+impl BarEvent {
+    /// The event number the slot returns.
+    pub fn code(self) -> u8 {
+        match self {
+            BarEvent::Camera => 6,
+            BarEvent::Restart => 7,
+            BarEvent::Pause => 8,
+            BarEvent::Quit => 9,
+            BarEvent::Speed(Speed::Normal) => 0xA,
+            BarEvent::Speed(Speed::Double) => 0xB,
+            BarEvent::Speed(Speed::Quarter) => 0xC,
+            BarEvent::Speed(Speed::Half) => 0xD,
+            BarEvent::Results => 0xE,
+            BarEvent::Save => 0xF,
+            BarEvent::NextCar => 0x16,
+            BarEvent::PrevCar => 0x17,
+        }
+    }
+}
+
+/// Which cell the pointer `(x, y)` (whole pixels, the HUD's 640 × 480) is on — 0x42D8CD…0x42D8EA
+/// and its six twins: `x < cx` or `x > cx + 21` misses (`jl` / `jg`), the same for `y` with 18.
+/// The cells are 30 apart, so at most one matches. The draw 0x42D4C0 lights a cell's outline by
+/// the same test (0x42D6B0…0x42D6D3).
+pub fn bar_cell_at(cells: &[(f32, f32); 7], x: i32, y: i32) -> Option<usize> {
+    cells.iter().position(|&(cx, cy)| {
+        let (cx, cy) = (cx as i32, cy as i32);
+        x >= cx && x <= cx + BAR_CELL.0 as i32 && y >= cy && y <= cy + BAR_CELL.1 as i32
+    })
+}
+
+/// A press on `cell` (0x42D880 with event 2): the answer, given the playback's speed (what
+/// `+0x174` stands for) and `network` (`+0x198`). See [`BarEvent`].
+pub fn bar_event(cell: usize, speed: Speed, network: bool) -> Option<BarEvent> {
+    match (cell, network) {
+        (0, _) => Some(BarEvent::Camera),
+        (1, false) => Some(BarEvent::Restart),
+        (1, true) => Some(BarEvent::PrevCar),
+        (2, false) => Some(BarEvent::Pause),
+        (2, true) => Some(BarEvent::NextCar),
+        (3, false) => Some(BarEvent::Quit),
+        (4, false) => Some(BarEvent::Speed(speed.next())),
+        (5, _) => Some(BarEvent::Results),
+        (6, false) => Some(BarEvent::Save),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0x42D880's answers, cell by cell, and the speed cell's cycle through the jump table 0x42DCF8.
+    #[test]
+    fn the_bar_cells_answer_as_0x42d880() {
+        let codes: Vec<Option<u8>> = (0..7).map(|c| bar_event(c, Speed::Normal, false).map(BarEvent::code)).collect();
+        assert_eq!(codes, [Some(6), Some(7), Some(8), Some(9), Some(0xB), Some(0xE), Some(0xF)]);
+        let net: Vec<Option<u8>> = (0..7).map(|c| bar_event(c, Speed::Normal, true).map(BarEvent::code)).collect();
+        assert_eq!(net, [Some(6), Some(0x17), Some(0x16), None, None, Some(0xE), None]);
+        // +0x174: 5 → 6 → 7 → 8 → 5 is 0xB, 0xC, 0xD, 0xA
+        let mut s = Speed::Normal;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let Some(BarEvent::Speed(n)) = bar_event(4, s, false) else { panic!("the speed cell answers a speed") };
+            seen.push(BarEvent::Speed(n).code());
+            s = n;
+        }
+        assert_eq!(seen, [0xB, 0xC, 0xD, 0xA]);
+        // both edges are inside the cell (`jl` / `jg`), the gap between cells is not
+        let (cells, _) = control_bar(640.0, 480.0);
+        let (x0, y0) = (cells[0].0 as i32, cells[0].1 as i32);
+        assert_eq!(bar_cell_at(&cells, x0, y0), Some(0));
+        assert_eq!(bar_cell_at(&cells, x0 + 21, y0 + 18), Some(0));
+        assert_eq!(bar_cell_at(&cells, x0 + 22, y0), None);
+        assert_eq!(bar_cell_at(&cells, x0 + 51, y0 + 9), Some(1));
+        assert_eq!(bar_cell_at(&cells, x0 + 6 * 51 + 3, y0 - 1), None);
+    }
 
     #[test]
     fn rle_matches_the_originals_shape_and_costs() {
@@ -726,6 +895,7 @@ mod tests {
             rec.record(*p, ramp, 0);
         }
         let mut play = Replay::playing(rec.stream().to_vec(), 0);
+        assert_eq!(play.stream(), rec.stream(), "a playback saves the stream it plays (0x413FD0)");
         for p in &samples {
             assert_eq!(play.playback(), *p);
             assert_eq!(play.ramp, ramp, "the .RAMP* flags travel with the sample");
@@ -733,6 +903,26 @@ mod tests {
         // Past the end the stream reports exhaustion and the car coasts.
         assert_eq!(play.playback(), Packet::default());
         assert_eq!(play.mode, Mode::Exhausted);
+    }
+
+    #[test]
+    fn the_automatic_replay_plays_the_buffer_in_place() {
+        // 20 samples: two blocks flushed, four samples of a third never are
+        let samples: Vec<Packet> = (0..20).map(|i| Packet { buttons: 0, steer: i as i8 - 10, throttle: i as u8, brake: 0 }).collect();
+        let mut r = Replay::new();
+        r.start_race();
+        for p in &samples {
+            r.record(*p, Ramp::default(), 0);
+        }
+        // 0x4B6F0C `[0x5E99F4] = 2`, then the race's restart 0x413EA0
+        r.replay_in_place();
+        r.start_race();
+        assert_eq!(r.mode, Mode::Playing);
+        for p in &samples[..16] {
+            assert_eq!(r.playback(), *p);
+        }
+        assert_eq!(r.playback(), Packet::default());
+        assert_eq!(r.mode, Mode::Exhausted);
     }
 
     #[test]
@@ -761,9 +951,15 @@ mod tests {
         }
         assert_eq!(r.mode, Mode::Full);
         assert!(r.written() + HEAD_ROOM >= STREAM_LEN);
-        assert_eq!(r.final_tick, tick - 16, "the final tick is frozen at the block that would not fit");
+        assert_eq!(r.final_tick, tick - 16, "the final tick is the block that would not fit");
         // 102 272 usable bytes / 35 per block ≈ 2 922 blocks ≈ 730 s of race.
         assert!((700..780).contains(&(r.final_tick / 64)), "{}", r.final_tick / 64);
+        // …and every later refused block moves it on (0x414086 has no mode test)
+        let written = r.written();
+        for i in 0..8u8 {
+            r.record(Packet { buttons: i, ..Default::default() }, Ramp::default(), tick);
+        }
+        assert_eq!((r.mode, r.written(), r.final_tick), (Mode::Full, written, tick));
     }
 
     #[test]
@@ -777,6 +973,13 @@ mod tests {
         let p = Packet::from_controls(&Controls { command: 3, ..c });
         assert_eq!(p.buttons, 0x19);
         assert_eq!(p.to_controls().command, 3);
+    }
+
+    #[test]
+    fn playback_ends_once_exhausted_past_tick_64() {
+        assert!(!playback_over(Mode::Exhausted, 64), "0x415CC2: jle 0x415CE8 at exactly 0x40");
+        assert!(playback_over(Mode::Exhausted, 65));
+        assert!(!playback_over(Mode::Playing, 5000));
     }
 
     #[test]
@@ -795,18 +998,18 @@ mod tests {
         assert_eq!(apply_camera(0x14, true), 0x14);
         assert_eq!(apply_camera(0x14, false), 3);
         assert_eq!(apply_camera(0x0A, false), 0x0A);
-        // 0x0B `SplineCam` is stepped over everywhere but skidpad
+        // 0x0B `SplineCam` is stepped over on skidpad only (the `_stricmp` at 0x4149A3 equal)
         assert_eq!(CAMERA_IDS[1], 0x0A);
         assert_eq!(next_camera(0, false), 1, "0x14 -> 0x0A");
-        assert_eq!(next_camera(1, false), 3, "0x0A skips 0x0B to 0x08");
-        assert_eq!(next_camera(1, true), 2, "on skidpad 0x0B is kept");
+        assert_eq!(next_camera(1, false), 2, "off skidpad 0x0B is offered");
+        assert_eq!(next_camera(1, true), 3, "on skidpad 0x0A skips 0x0B to 0x08");
         assert_eq!(next_camera(8, false), 0, "the ninth wraps to the first");
     }
 
     #[test]
     fn the_port_file_round_trips() {
         let f = ReplayFile {
-            setup: ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993turbo".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, backwards: true, mirror: false, seed: 12345, skill: 1 },
+            setup: ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993turbo".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, damage: true, backwards: true, mirror: false, seed: 12345, skill: 1 },
             final_tick: 40_000,
             stream: (0..500).map(|i| (i % 251 + 1) as u8).collect(),
         };
@@ -820,9 +1023,9 @@ mod tests {
     #[test]
     fn the_original_rpl_has_the_documented_shape() {
         // §6.1: 0x3E24 of setup, the final tick, 0x19000 of stream — 118 312 bytes, always
-        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993coupe36".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, backwards: true, mirror: false, seed: 4321, skill: 2 };
+        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993coupe36".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, damage: false, backwards: true, mirror: false, seed: 4321, skill: 2 };
         let stream: Vec<u8> = (0..1000).map(|i| (i % 251 + 1) as u8).collect();
-        let f = original_rpl(&setup, 12_345, &stream);
+        let f = original_rpl(&setup, 12_345, &stream, Ramp { steer: true, gas: false, brake: true }, 11);
         assert_eq!(f.len(), RPL_LEN);
         assert_eq!(RPL_LEN, 118_312, "0x1CE28 — the note's decimal said 117 800");
         let at = |o: usize| u32::from_le_bytes(f[o..o + 4].try_into().unwrap());
@@ -835,7 +1038,14 @@ mod tests {
         assert_eq!(at(snapshot::RAND_SEED), 4321);
         // the save patches REPLAY to 2 so a load lands in playback (§6.2)
         assert_eq!(at(snapshot::REPLAY), 2);
-        assert_eq!(at(snapshot::NUMCARS), 6);
+        assert_eq!(at(snapshot::NUMCARS), 11);
+        let slot0 = |o: usize| at(snapshot::CARS + o);
+        assert_eq!((slot0(snapshot::CAR_RAMPS), slot0(snapshot::CAR_RAMPG), slot0(snapshot::CAR_RAMPB)), (1, 0, 1));
+        // a long name stays inside TRACK_NAME's 0x40 bytes, NUL included
+        let long = ReplaySetup { track: "x".repeat(100), ..setup.clone() };
+        let g = original_rpl(&long, 0, &[], Ramp::default(), 1);
+        assert_eq!(g[snapshot::FE_PLAYER_FILENAME - 1], 0);
+        assert_eq!(g[snapshot::FE_PLAYER_FILENAME - 2], b'x');
         assert_eq!(&f[snapshot::TRACK_NAME..snapshot::TRACK_NAME + 8], b"coastal\0");
         assert_eq!(at(SNAPSHOT_LEN), 12_345, "the final game tick sits between the block and the stream");
         assert_eq!(&f[SNAPSHOT_LEN + 4..SNAPSHOT_LEN + 4 + 1000], &stream[..]);

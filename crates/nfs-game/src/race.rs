@@ -489,6 +489,10 @@ pub struct RaceProgress {
     pub behind_start: bool,
     /// `car+0xAFC`, the slice the car started on (0x410973) — where 0x40F540's mode 3 puts it back.
     pub start_slice: usize,
+    /// `car+0xB14`: the tick the car's slice last changed while it was racing (0x4164E0…, in the
+    /// `car+8 != car+0xB18` block of 0x416310), the tick it finished (0x416721) or was knocked
+    /// out (0x416649…0x4166FD). The ranking table breaks a progress tie on it ([`ranking`]).
+    pub tick: u64,
 }
 
 impl RaceProgress {
@@ -507,27 +511,6 @@ impl RaceProgress {
         self.linear = Some((finish, start - 0.005));
     }
 
-    /// `Race_finalize` 0x416AC0 (CONFIRMED): the finishing time of a car that is still racing when
-    /// the race ends is extrapolated from how far it got. `elapsed` = ticks since the start
-    /// (`tick − 448`), `circuit` selects the two formulas of the original.
-    pub fn projected_ticks(&self, elapsed: u64, num_laps: u32, circuit: bool) -> u64 {
-        if self.finished {
-            return self.lap_times.iter().sum();
-        }
-        let laps = num_laps.max(1) as f32;
-        if circuit {
-            let frac = (self.progress / laps).max(1e-4);
-            (elapsed as f32 / frac) as u64
-        } else {
-            let span = (1.0 - self.start_progress).max(1e-4);
-            let mut ratio = (self.progress - self.start_progress).max(0.001) / span;
-            if ratio < 0.005 {
-                ratio *= 250_000.0;
-            }
-            (laps * elapsed as f32 / ratio) as u64
-        }
-    }
-
     /// Update at 32 Hz (even ticks): tracker, `Lap_check` 0x417440, `Race_updateProgress` 0x416310,
     /// wrong-way 0x4A7660. Returns true when a lap was completed this call.
     pub fn update(&mut self, table: &SliceTable, pos: Vec3, forward: Vec3, tick: u64, num_laps: u32) -> bool {
@@ -537,11 +520,16 @@ impl RaceProgress {
     /// The same with the tracker's `preferredSection` (`race-logic.md` §1.4): a car that has taken a
     /// junction branch resolves its slice against that branch's section too.
     pub fn update_tracked(&mut self, table: &SliceTable, pos: Vec3, forward: Vec3, tick: u64, num_laps: u32, preferred: Option<usize>) -> bool {
+        let prev_slice = self.slice;
         self.slice = table.track_slice(pos, self.slice, preferred);
         // finished / eliminated cars leave the progress accounting (0x4169B0: `state >= 2 ⇒ return`),
         // so their lap list and rank freeze at the finish
         if self.finished {
             return false;
+        }
+        // `car+0xB14 = gGameTick` whenever the slice changed (0x4164C0…0x416577)
+        if self.slice != prev_slice {
+            self.tick = tick;
         }
         let frac = table.frac(self.slice);
         let new = self.laps as f32 + frac - self.unlaps as f32;
@@ -593,6 +581,8 @@ impl RaceProgress {
             // there). From then on `car+0xB50 != 0` skips the recompute (0x416365), so this is what
             // the ranking table 0x608B38, `0x417710`'s two sorts and every other `+0xAF8` reader see.
             self.progress = if self.linear.is_some() { frac } else { self.lap_times.len() as f32 + frac };
+            // `car+0xB14 = gGameTick` (0x416727)
+            self.tick = tick;
         }
         // 0x4A7660: a car that has finished (`car+0xB50 == 2`), is AI-driven, is in the
         // post-finish state or races a mission (`[0x6573E8] == 9`) clears its counter, and so does
@@ -611,6 +601,29 @@ impl RaceProgress {
         }
         lap_done
     }
+}
+
+/// **The ranking table `0x608B38`** — the race order, `(progress car+0xAF8, tick car+0xB14)` per
+/// racer in the order the cars are updated; returns the racers' indices, leader first.
+///
+/// 0x416140 empties the table (index −1, progress −100.0) and every racer's `Race_updateProgress`
+/// 0x416310 then inserts itself at 0x4168EF…0x4169A0: before the first entry whose progress it
+/// **exceeds** (`fcomp` / `test ah, 0x41` / `je`, 0x41690B), or whose progress it **equals** with an
+/// **earlier** tick (`test ah, 0x40`, then `cmp eax, ebx / jl`, 0x416923…0x41692E); otherwise after
+/// it — so a full tie keeps the update order. That is a stable sort on (progress desc, tick asc).
+/// `Race_finalize` 0x416AC0 gives every racer `car+0xCD4 = 1 + its index here` (0x416CB8…0x416CD2,
+/// 0x416F04…0x416F1D), the place the results, the tournament and the knockouts read. A finished
+/// car is ranked on the progress its finish froze (0x416721…0x416838, [`RaceProgress::update_tracked`])
+/// — not on its time — and a knocked-out one on its progress less 0.01 (0x416649…0x4166FD), so both rank
+/// by where they are, like everyone else.
+pub fn ranking(cars: &[(f32, u64)]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..cars.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (pa, ta) = cars[a];
+        let (pb, tb) = cars[b];
+        pb.partial_cmp(&pa).unwrap_or(std::cmp::Ordering::Equal).then(ta.cmp(&tb))
+    });
+    order
 }
 
 /// The slice of the start scene's finish line — its type-1 trigger (0x46D290(1, 0), read by
@@ -986,30 +999,237 @@ mod finish_tests {
     }
 }
 
+/// `car+0xB50`, the finish state (`race-logic.md` §2): 0 racing, 2 finished, 3 knocked out.
+pub const STATE_RACING: u8 = 0;
+pub const STATE_FINISHED: u8 = 2;
+pub const STATE_OUT: u8 = 3;
+
+/// What `Race_finalize` 0x416AC0 reads of one racer: its progress `car+0xAF8`, the start and
+/// finish fractions `car+0xB00` / `car+0xB04` (0 and 1.0 on a circuit, 0x4109A3; the car's own
+/// start slice's and the finish trigger's on a point-to-point track, 0x41098A / 0x410A0A), the
+/// slice-change / finish tick `car+0xB14`, the state `car+0xB50`, the race time `car+0xB24` (the
+/// finish tick less 448, 0x416840, or 0 once knocked out, 0x41668D), the lap times `car+0xB28[]`
+/// (`gGameTick − car+0xB24` at each line, 0x416626…0x416630),
+/// the live position `car+0xB48` (1-based) and the ten damage zones `car+0x4E4`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FinalizeIn {
+    pub progress: f32,
+    pub start: f32,
+    pub finish: f32,
+    pub tick: u64,
+    pub state: u8,
+    pub time: u64,
+    pub lap_times: Vec<u64>,
+    pub position: u32,
+    pub damage: [f32; 10],
+}
+
+impl FinalizeIn {
+    /// The fields as a [`RaceProgress`] holds them; the state is the caller's (the port keeps the
+    /// knock-out beside the progress, `RaceCar::eliminated` / `App::player_eliminated`). The race
+    /// time `+0xB24` of a finished car is its lap times' sum (the finish tick less 448), 0 for any
+    /// other state — a car still racing gets its projection from [`race_finalize`].
+    pub fn from_progress(p: &RaceProgress, state: u8, position: u32, damage: [f32; 10]) -> Self {
+        // on a circuit 0x4109A3 writes `+0xB00 = 0`, `+0xB04 = 1.0`
+        let (start, finish) = match p.linear {
+            Some((finish, _)) => (p.start_progress, finish),
+            None => (0.0, 1.0),
+        };
+        // the finish leaves `+0xB24` = the finish tick (the lap start just stored, 0x41663D) less
+        // 448 (0x416840…0x41684C) — the race time from the green light. *(The port used the lap
+        // times' sum, which counts the first lap from tick 0 — `RaceProgress::lap_start_tick`'s
+        // start, the countdown included — and so came out 448 ticks longer.)*
+        let time = if state == STATE_FINISHED { p.tick.saturating_sub(0x1C0) } else { 0 };
+        Self { progress: p.progress, start, finish, tick: p.tick, state, time, lap_times: p.lap_times.clone(), position, damage }
+    }
+}
+
+/// One racer's result record — `car+0xCC4 … +0xD2C`, which only `Race_finalize` 0x416AC0 writes
+/// (`+0xCD4` at 0x416CD2 / 0x416F1D, `+0xCD8` at 0x416B1F / 0x416CE2 / 0x416F2B, `+0xC98` in its
+/// three copy loops; the one other writer, 0x426B81…0x426BF6, is the developer "finish 8th" swap).
+/// The result pages, the HUD tally 0x427660, the mission summary 0x4293F0 and the FE's 0x4EDF00
+/// (through the copy at 0x5E75A0, `modes.md` §7.1) read these, never the live car.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RacerResult {
+    /// `+0xCD4`: 1 + the car's row in the ranking table 0x608B38, 0 when it is not in it
+    pub place: u32,
+    /// `+0xCD8`: the total time in ticks, 0 for none (the summary prints dashes, 0x42C41C)
+    pub time: u64,
+    /// `+0xCD0`: the finish state as finalised
+    pub state: u8,
+    /// `+0xCFC`: the best lap
+    pub best_lap: u64,
+    /// `+0xCDC[NUM_LAPS]`: the lap times
+    pub laps: Vec<u64>,
+    /// `+0xC98[10]`: the damage zones at the race's end (0x416B47 / 0x416D39 / 0x416F4D copy
+    /// `car + eax − 0x7B8`, i.e. `+0x4E4…`)
+    pub damage: [f32; 10],
+}
+
+/// `fistp` of a value `fstp`ped to a dword first (0x416BF9…0x416C03): round to nearest, even on
+/// a tie. A negative or unrepresentable result (a car whose `+0xB14` is before 448, a circuit car
+/// with no progress, whose division gives ∞ and so the integer indefinite) is no time; the port
+/// stores 0 there (APPROXIMATION of a case the race does not reach).
+fn fistp_time(v: f32) -> u64 {
+    let r = v.round_ties_even();
+    if r.is_finite() && r >= 0.0 && r <= i32::MAX as f32 { r as u64 } else { 0 }
+}
+
+/// The projected total of a car still racing, the "ratio" arm (the human's 0x416B96…0x416C03, the
+/// opponent's on a point-to-point track 0x416E1F…0x416E92):
+///
+/// ```text
+/// num   = progress − start ; if num <= 0.001 (fcom, test ah,0x41): num = 0.001
+/// ratio = num / (finish − start)
+/// x     = ratio < 0.005 (fcomp, test ah,1) ? ratio · 250000 : (+0xB14 − 448)
+/// time  = fistp((float)(NUM_LAPS · x / ratio))
+/// ```
+///
+/// The stack juggling at 0x416BE5…0x416BF7 is what makes a car that has hardly moved come out at
+/// `NUM_LAPS · 250000` ticks, not at a scaled-up ratio. *(Until 2026-09-26 the port had
+/// `ratio *= 250000` and then `elapsed / ratio`, measured `elapsed` to the current tick rather than
+/// to `+0xB14`, took the finish fraction as 1.0 and truncated.)*
+pub fn projected_ratio(progress: f32, start: f32, finish: f32, tick: u64, num_laps: u32) -> u64 {
+    let mut num = progress as f64 - start as f64;
+    if num <= 0.001f32 as f64 {
+        num = 0.001f32 as f64;
+    }
+    let ratio = num / (finish as f64 - start as f64);
+    let elapsed = tick as i64 - 0x1C0;
+    let x = if ratio < 0.005f32 as f64 { ratio * 250_000.0 } else { elapsed as f64 };
+    fistp_time((num_laps as f64 * x / ratio) as f32)
+}
+
+/// The opponent's circuit arm 0x416E9A…0x416EC2: `(+0xB14 − 448) / (progress / NUM_LAPS)`, no
+/// clamp.
+pub fn projected_circuit(progress: f32, tick: u64, num_laps: u32) -> u64 {
+    let elapsed = (tick as i64 - 0x1C0) as f64;
+    fistp_time((elapsed / (progress as f64 / num_laps as f64)) as f32)
+}
+
+/// `Race_finalize(2)` 0x416AC0 as 0x417010 calls it at race over. `humans` are the first entries
+/// of `cars` (0x5E8C00, `[0x5E8BFC]`), the opponents the rest (0x5E8BD4, `[0x5E8BF8]`); `order`
+/// is the ranking table 0x608B38 as indices into `cars`; `tick` is `[0x606AC4]`; `linear` is
+/// `LINEAR_TRACK [0x657494]` and `lap_knockout` is `RACE_TYPE == 3`. The records come back in the
+/// order of `cars`, and `cars` is left as the function leaves the live cars (a still-racing
+/// opponent finalised to state 2 with its time, or knocked out to 3).
+///
+/// Not carried: the skill-test arm (`RACE_TYPE == 4`, 0x416B14…0x416B6D — the human's time, state,
+/// traffic hits and damage, no place, no opponents), the `flag == 1` arm of an early leave (the
+/// port files nothing then), a human still in state 1 (only that arm makes one), the traffic-hit
+/// counts `+0xCC4…+0xCCC` and the race-end fold of the damage into the parts `0x493CF0(h, 0)`,
+/// which the port runs when the car is parked (`career.md` §11).
+pub fn race_finalize(cars: &mut [FinalizeIn], humans: usize, order: &[usize], num_laps: u32, tick: u64, linear: bool, lap_knockout: bool) -> Vec<RacerResult> {
+    let place = |i: usize| order.iter().position(|&k| k == i).map_or(0, |r| r as u32 + 1);
+    let n = num_laps as usize;
+    let human_start = cars.first().map_or(0.0, |c| c.start);
+    let lap_copy = |c: &FinalizeIn| -> Vec<u64> { (0..n).map(|j| c.lap_times.get(j).copied().unwrap_or(0)).collect() };
+    let mut out = Vec::with_capacity(cars.len());
+    for (i, c) in cars.iter_mut().enumerate() {
+        let mut best;
+        if i < humans {
+            // 0x416CF8: the human's best starts at its first lap `+0xB28[0]`, and 0x416D65… takes
+            // a lap below it that is not 0 — so with no lap at all it stays 0
+            best = c.lap_times.first().copied().unwrap_or(0);
+        } else {
+            if c.state == STATE_RACING {
+                if lap_knockout && c.position != 1 {
+                    // 0x416DE8…0x416E0B: a lap knockout puts every car not leading out, time 0
+                    c.tick = tick;
+                    c.time = 0;
+                    c.state = STATE_OUT;
+                } else {
+                    // 0x416E16: the ratio arm with **the first human's** `+0xB00` on a
+                    // point-to-point track, the plain one on a circuit; state 2; an empty first
+                    // lap takes the projection (0x416ED9…0x416EE5)
+                    let t = if linear { projected_ratio(c.progress, human_start, c.finish, c.tick, num_laps) } else { projected_circuit(c.progress, c.tick, num_laps) };
+                    c.time = t;
+                    c.state = STATE_FINISHED;
+                    match c.lap_times.first_mut() {
+                        Some(l) if *l == 0 => *l = t,
+                        None => c.lap_times.push(t),
+                        _ => {}
+                    }
+                }
+            }
+            // 0x416F6D: 99999, then any lap below it that is positive (0x416F86…)
+            best = 99_999;
+        }
+        let laps = lap_copy(c);
+        // 0x416D65… / 0x416FB9…: `+0xCDC[j] = +0xB28[j]`, and one below the best that is not 0
+        for &l in &laps {
+            if l < best && l != 0 {
+                best = l;
+            }
+        }
+        out.push(RacerResult { place: place(i), time: c.time, state: c.state, best_lap: best, laps, damage: c.damage });
+    }
+    out
+}
+
 #[cfg(test)]
 mod projection_tests {
     use super::*;
 
-    fn progress(p: f32, start: f32) -> RaceProgress {
-        RaceProgress { progress: p, start_progress: start, ..Default::default() }
+    #[test]
+    fn projected_time_extrapolates_the_pace() {
+        // circuit (start 0, finish 1): half of a 2-lap race done 60 s after the start → 120 s
+        assert_eq!(projected_ratio(1.0, 0.0, 1.0, 448 + 60 * 64, 2), 120 * 64);
+        assert_eq!(projected_circuit(1.0, 448 + 60 * 64, 2), 120 * 64);
+        // point-to-point: 40 % of the way in 40 s → 100 s
+        assert_eq!(projected_ratio(0.4, 0.0, 1.0, 448 + 40 * 64, 1), 100 * 64);
+        // a car that started mid-track is measured from its start fraction to the finish's:
+        // 0.2 → 0.6 of 0.2 → 0.98 in 40 s → 40 · 0.78 / 0.4 = 78 s
+        assert!((projected_ratio(0.6, 0.2, 0.98, 448 + 40 * 64, 1) as i64 - 78 * 64).abs() <= 1);
+        // a car that has hardly moved: the x87 stack gives NUM_LAPS · 250000 (0x416BE5…0x416BF7)
+        assert_eq!(projected_ratio(0.0, 0.0, 1.0, 5000, 3), 750_000);
     }
 
     #[test]
-    fn projected_time_extrapolates_the_pace() {
-        // circuit: half of a 2-lap race done in 60 s → projected 120 s
-        let p = progress(1.0, 0.0);
-        assert_eq!(p.projected_ticks(60 * 64, 2, true), 120 * 64);
-        // point-to-point: 40 % of the way in 40 s → 100 s
-        let p = progress(0.4, 0.0);
-        assert_eq!(p.projected_ticks(40 * 64, 1, false), 100 * 64);
-        // a car that started mid-track is measured from its own start fraction
-        // 0.2 → 0.6 of the way (half the remaining span) in 40 s → 80 s
-        let p = progress(0.6, 0.2);
-        assert!((p.projected_ticks(40 * 64, 1, false) as i64 - 80 * 64).abs() <= 2);
-        // finished cars report their real total
-        let mut f = progress(1.0, 0.0);
-        f.finished = true;
-        f.lap_times = vec![1000, 1100];
-        assert_eq!(f.projected_ticks(9999, 2, true), 2100);
+    fn race_over_records() {
+        // the player finished second, one opponent finished first, one is still racing
+        let mut cars = vec![
+            FinalizeIn { progress: 2.0, finish: 1.0, tick: 900, state: STATE_FINISHED, time: 450, lap_times: vec![230, 220], position: 2, ..Default::default() },
+            FinalizeIn { progress: 2.0, finish: 1.0, tick: 880, state: STATE_FINISHED, time: 432, lap_times: vec![216, 216], position: 1, ..Default::default() },
+            FinalizeIn { progress: 1.5, finish: 1.0, tick: 1200, state: STATE_RACING, lap_times: vec![300], position: 3, ..Default::default() },
+        ];
+        let r = race_finalize(&mut cars, 1, &[1, 0, 2], 2, 1300, false, false);
+        assert_eq!((r[0].place, r[0].time, r[0].best_lap, r[0].state), (2, 450, 220, STATE_FINISHED));
+        assert_eq!((r[1].place, r[1].best_lap), (1, 216));
+        // (1200 − 448) / (1.5 / 2) = 1002.67 → 1003, state 2, best lap its one lap
+        assert_eq!((r[2].place, r[2].time, r[2].state, r[2].best_lap), (3, 1003, STATE_FINISHED, 300));
+        assert_eq!(r[2].laps, vec![300, 0]);
+        // a lap knockout: the one still racing and not leading is out, time 0, best 99999
+        let mut cars = vec![
+            FinalizeIn { progress: 2.0, finish: 1.0, tick: 900, state: STATE_FINISHED, time: 450, lap_times: vec![230, 220], position: 1, ..Default::default() },
+            FinalizeIn { progress: 0.5, finish: 1.0, tick: 700, state: STATE_RACING, position: 2, ..Default::default() },
+        ];
+        let r = race_finalize(&mut cars, 1, &[0, 1], 2, 1300, false, true);
+        assert_eq!((r[1].time, r[1].state, r[1].best_lap), (0, STATE_OUT, 99_999));
+        assert_eq!(cars[1].tick, 1300);
+        // a human with no lap: best lap 0 (0x416CF8); an opponent with an empty first lap takes
+        // its projection there
+        let mut cars = vec![
+            FinalizeIn { progress: 0.9, finish: 1.0, tick: 900, state: STATE_OUT, position: 2, ..Default::default() },
+            FinalizeIn { progress: 0.5, finish: 1.0, tick: 448 + 640, state: STATE_RACING, position: 1, ..Default::default() },
+        ];
+        let r = race_finalize(&mut cars, 1, &[1, 0], 1, 1300, false, false);
+        assert_eq!(r[0].best_lap, 0);
+        assert_eq!((r[1].time, r[1].best_lap), (1280, 1280));
+    }
+}
+
+#[cfg(test)]
+mod ranking_tests {
+    use super::ranking;
+
+    #[test]
+    fn the_ranking_table_is_progress_then_the_earlier_tick() {
+        // a finisher frozen at 2.003 (slice 1 when it was seen past the line), one at 2.001 that
+        // got there first, a car knocked out at 1.99 and one still racing at 1.995
+        let cars = [(2.001, 500), (1.99, 480), (2.003, 510), (1.995, 470)];
+        assert_eq!(ranking(&cars), vec![2, 0, 3, 1]);
+        // equal progress: the earlier `car+0xB14` first; a full tie keeps the update order
+        assert_eq!(ranking(&[(1.5, 20), (1.5, 10), (1.5, 10)]), vec![1, 2, 0]);
     }
 }

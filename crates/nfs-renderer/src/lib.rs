@@ -7,7 +7,7 @@ mod camera;
 mod gpu;
 
 pub use camera::Camera;
-pub use gpu::{MaterialId, MeshId, Renderer, TextureId};
+pub use gpu::{MaterialId, MeshId, Renderer, TextureId, VIEW_FAR};
 
 use glam::{Mat4, Vec3};
 
@@ -48,13 +48,20 @@ pub struct MaterialDesc {
     pub cull_back: bool,
     /// When false the item is drawn first without depth test/write (sky, backgrounds).
     pub depth_test: bool,
-    /// Environment (reflection) map blended by `env_mix` using a view-space sphere mapping of the
-    /// normal — the original's `CarExtEnv`/`R3DSpecularTextureLayer` uses the track `.env` maps.
+    /// `R3DSpecularTextureLayer`'s texture (0x445520), sphere-mapped by the eye-space normal —
+    /// the car's own `[0x6115CC]+0xDC + 4·bucket`, which `RCar::load` fills with `SPC1` / `SPC2` /
+    /// `SPC3` of `CarModel/carcmn.fsh` (0x441AB2 → 0x440940; `RE/notes/lighting.md` §3.1). `None`
+    /// is no specular pass: the layer skips its pass's draw when it has no texture (0x4455A2).
     pub env_texture: Option<TextureId>,
+    /// 1 when the material has the specular pass (with `env_texture`); the pass's combine is its
+    /// `Rs` block, so this is only the switch.
     pub env_mix: f32,
-    /// Which of the three environment textures this material reflects — `R3DSpecularTextureLayer`
-    /// buckets its own reflection strength at 0.05 and 0.95 (`RE/notes/lighting.md` §3.1).
+    /// The bucket `R3DSpecularTextureLayer` and `R3DSkyMapTextureLayer` take from the material's
+    /// reflection strength (0.05 / 0.95, 0x44553F / 0x445B33) — which of the three textures.
     pub env_variant: usize,
+    /// The material's method carries a built `R3DSkyMapTextureLayer` pass (class 0x8101, 0x445B10):
+    /// it then samples the car's section map `DrawItem::sky`'s `textures[env_variant]`.
+    pub sky_map: bool,
     /// The frame-buffer blend of an `alpha_blend` material, as Thrash state 0x38 takes it
     /// (`dx7z.dll` 0x600046BB, `RE/notes/thrash.md` §6): 0 `SRCALPHA` / `INVSRCALPHA`, 1 `SRCALPHA` /
     /// `ONE`, 2 `ZERO` / `INVSRCALPHA`, 3 `DESTCOLOR` / `ZERO`.
@@ -72,8 +79,9 @@ pub struct MaterialDesc {
     /// 0x39 ← 1, 0x468B39) and sets the alpha reference to 10 through Thrash 0x24 (0x443615, the
     /// car draw, and 0x43C876 at the start of `R3DCarLOD::draw`, which draws the rooms too;
     /// 0x452085, 0x45D68D, 0x466703, `thrash.md` §6d.4). APPROXIMATION for everything else: the
-    /// port's other blended draws (particles, 0x454456 sets 1; glare) keep depth writes off until
-    /// their draw order is the original's. *(The front-end rooms were among them until 2026-09-25,
+    /// port's other blended draws (particles, 0x454456 sets 1) keep depth writes off until
+    /// their draw order is the original's; the lamp glare and beam draw with them off in the
+    /// original too (0x43D81F, `DrawItem::alpha_test`). *(The front-end rooms were among them until 2026-09-25,
     /// on the reading that their views set 0x24 to 1 — 0x4C6696 / 0x4DA923 are 2D draws.)* The
     /// alpha a texture keeps is the decoded file's — the loader's pick of the surface format is
     /// not read.
@@ -97,10 +105,10 @@ pub struct MaterialDesc {
 
 impl MaterialDesc {
     pub fn textured(texture: TextureId) -> Self {
-        Self { texture: Some(texture), alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false }
+        Self { texture: Some(texture), alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, sky_map: false, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false }
     }
     pub fn flat() -> Self {
-        Self { texture: None, alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false }
+        Self { texture: None, alpha_blend: false, cull_back: true, depth_test: true, env_texture: None, env_mix: 0.0, env_variant: 0, sky_map: false, blend_pair: 0, clamp: [false; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false }
     }
 }
 
@@ -128,15 +136,54 @@ pub struct DrawItem {
     /// `Render/common.fsh` projected from the same headlight frame (`RE/notes/lighting.md` §5.2).
     pub uv_lit: bool,
     /// The car shadow projector's `(u, v)` planes over world positions — `R3DShadowMapTextureLayer`
-    /// (0x446130), for an item whose material carries layer 0x8101 while its car stands near a
+    /// (0x446130), for an item whose material carries layer class 0x8102 while its car stands near a
     /// kind-4 `ef` part (`RE/notes/crp-geometry.md` §8).
     pub shadow: Option<([f32; 4], [f32; 4])>,
+    /// A blended item the original submits **before** the opaque draws that follow it in the
+    /// scene — a car's blob shadow (slots 22 / 23, 0x43B820, ahead of the car's own parts): it is
+    /// drawn in the opaque stage, in submission order, still blended and without depth writes, so
+    /// the parts drawn after it paint over it whatever its depth bias pulled it to. The port's
+    /// stage split (sky, opaque, blended) is its own; the original draws in queue order.
+    pub early: bool,
+    /// The draw's own Thrash state 0x18 — a state object's `+0x10` (0x537A60) set per draw, as the
+    /// lamp glare's `fistp(b · −20000 · cam[+0xC] / d²)` (0x43D419…0x43D45C) — added to the
+    /// material's `depth_bias`: `dx7z.dll` adds `b / 32768` to the vertex's linear screen z, so
+    /// the vertex slides toward the eye along its own ray (`RE/notes/thrash.md` §6, §6d.3).
+    pub depth_bias: i32,
+    /// The alpha test `GREATER 10` for this draw alone — Thrash 0x24 ← 10 at the start of the
+    /// car's effect pass (0x43D83E), which the lamp glare 0x43CDD0 draws under (its texel alpha
+    /// times the vertex alpha `b`), where the night beam 0x43D4F0 puts 0 around its own draw
+    /// (0x43D506 / 0x43D7DB). A material with `device_states` is tested whatever this says.
+    pub alpha_test: bool,
+    /// `R3DSkyMapTextureLayer` (0x445B10) for this car's items whose material has the pass
+    /// ([`MaterialDesc::sky_map`]); `None` when the car binds no section maps.
+    pub sky: Option<SkyMap>,
+    /// Drawn only in the main race view — the view whose `+0x12C` is 2 (0x468BEF), not the
+    /// rear-view mirror's (1, 0x468D2F): the weather's draw is gated on it (0x45913C).
+    pub main_view_only: bool,
+    /// Drawn in the sky pass (0x45D4F0): fogged with [`Scene::sky_fog`] over that pass's planes
+    /// 0.15 / 700 rather than with [`Scene::fog`].
+    pub sky_pass: bool,
 }
 
 impl DrawItem {
     pub fn new(mesh: MeshId, material: MaterialId, transform: Mat4) -> Self {
-        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None }
+        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, sky: None, main_view_only: false, sky_pass: false }
     }
+}
+
+/// One car's `R3DSkyMapTextureLayer` 0x445B10 (`RE/notes/lighting.md` §3.2): the three maps the
+/// car binds for its slice's `.map` section (`EnvSet::texture` 0x441180, `ids[layer + 3·covered]`,
+/// bound per car at 0x43A73D…0x43A778) and the two planes its coordinates come from. Per vertex
+/// the layer takes `p = normal + 3.33 · position` in the part's own frame ([0x6115CC]+0, set once
+/// by 0x440783), carries it to the world through the object's matrix and gives
+/// `u = u.xyz · p_world + u.w`, `v` likewise.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SkyMap {
+    /// the section's three maps; a material samples the one its bucket names, and none is no pass
+    pub textures: [Option<TextureId>; 3],
+    pub u: [f32; 4],
+    pub v: [f32; 4],
 }
 
 /// What `R3DLightLayer` 0x446530 computes a vertex's colour from: `ambient + diffuse · d`, with `d`
@@ -184,14 +231,39 @@ pub struct Scene {
     /// The headlight projector, world → the player car's light frame (0x4526C0), when the car's
     /// lamps are lit; `headlit` items then take 0x452910's weight from `Renderer::set_headlight_map`.
     pub headlight: Option<Mat4>,
+    /// `Headlights::LayerUVLight`'s own gate (0x453CA3): lamp **0** of the camera's car lit —
+    /// the vertex light takes lamp 0 or 1 (0x453177…0x4531BC), so with lamp 0 broken and lamp 1
+    /// whole the beam still lights the road but the `HEAD` decal is not drawn.
+    pub headlight_decal: bool,
     /// World into the nearest lit police car's spinning beacon frame — the second projector on the
     /// same path (0x452A50, `RE/notes/lighting.md` §5).
     pub beacon: Option<Mat4>,
+    /// The weather fog the sky manager sets for the scene after its own pass (0x45D3B0, Thrash
+    /// 0x15 `EXP`, `nfs_formats::sky::SkyBin::fog_at`), over every 3-D item but the sky's; `None`
+    /// is off. The sprites (the HUD) are not fogged.
+    pub fog: Option<Fog>,
+    /// The sky pass's own fog (0x45D2E0), over the items marked [`DrawItem::sky_pass`].
+    pub sky_fog: Option<Fog>,
+}
+
+/// Direct3D 7 table fog as `dx7z.dll` sets it for Thrash 0x15 = 4 (`FOGTABLEMODE` `EXP`, 0x600048B7):
+/// `f = exp(−density · d)` and the pixel `f · colour + (1 − f) · fog` before the blend. The driver
+/// turns table fog on only on a card with `D3DPRASTERCAPS_WFOG` (`[0x60033F6C]`, bit 0x100000 of the
+/// triangle raster caps, 0x60008E4C) — without it the state fails and nothing is fogged — so `d` is
+/// the **W** of the game's pre-transformed vertices, `1 / rhw` = the view depth in metres
+/// (0x5B12AE…, `rhw = 1 / z`). APPROXIMATION of a device behaviour the image cannot settle: whether
+/// the runtime fogs on that W or on the screen z `sz` (the game never hands the device a projection
+/// matrix — no Thrash 0x1A7 in the image). On `sz`, which runs 0…1 over the view, the shipped
+/// densities (at most 0.28³ ≈ 0.02) would fog nothing visibly; on W they are the tracks' haze.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fog {
+    pub colour: [f32; 3],
+    pub density: f32,
 }
 
 impl Default for Scene {
     fn default() -> Self {
-        Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35, mirror: false, headlight: None, beacon: None }
+        Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35, mirror: false, headlight: None, headlight_decal: false, beacon: None, fog: None, sky_fog: None }
     }
 }
 

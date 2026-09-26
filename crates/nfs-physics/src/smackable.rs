@@ -3,8 +3,8 @@
 //! Read 2026-09-25; CONFIRMED unless a line says otherwise.
 //!
 //! **Creation.** `WAnimatableBundle` 0x4772F0 builds a 56-byte record for every article whose
-//! `animdefs.txt` definition says `kSmackable` (`SIGN` through 0x476B30, every other one through
-//! **0x476ED0** — [`point_cloud`]); 0x483360 keeps its point cloud (`rec+0xC`, count `+0x10`), its
+//! `animdefs.txt` definition says `kSmackable` (`SIGN` through **0x476B30** —
+//! [`sign_point_cloud`] — every other one through **0x476ED0** — [`point_cloud`]); 0x483360 keeps its point cloud (`rec+0xC`, count `+0x10`), its
 //! mass (`+0x14`, the definition's, 10.0 without one) and its audio type (`+0x18`). The race init
 //! 0x414DB0 then makes one car record per smackable (0x4A17F0: class 0x80, model "356B") and
 //! `Car_reset` 0x410730 forks on the class (0x4107A1):
@@ -19,18 +19,54 @@
 //!   article is drawn wherever the body is; `car+0x7F = 1`, **`+0x7D = 1` (asleep)**, `+0x7C = 0`
 //!   (undisturbed), and one `Susp_AI` 0x4998C0 / `BodyHeight` 0x49A900 to seat it.
 //!
-//! **Handlers** (`Car_installHandlers` 0x410D60, 0x410E43): `+0xE1C` = **0x4A1030** ([`Smackable::damp`]),
+//! **Handlers** (`Car_installHandlers` 0x410D60, 0x410E43): the tracker slot 0x49AF70
+//! ([`Smackable::track`], priority 6), `+0xE1C` = **0x4A1030** ([`Smackable::damp`]),
 //! `+0xE20` = `Car_ground` 0x49BD40 whose `& 0x80` fork takes `Susp_AI` ([`Smackable::ground`]),
 //! `+0xE2C` = the collision pass 0x498FF0 ([`Smackable::collide`]), `+0xE30` = 0x410280
 //! ([`Smackable::post_impact`]), and the 64 Hz integrators 0x49B7A0 / 0x49B8E0 ([`Smackable::integrate`]).
 //! `+0xE10` / `+0xE14` are cleared: there is no drive and no input.
 //!
-//! **Not carried** (each recorded in the note): the `Lod_shouldUpdate` gate of `Car_ground` —
-//! its distance `car+0x78` is 0x417190's octagonal distance to the nearest racer, and row 3 of
-//! 0x5CC770 runs every tick under 96 m, which is every cone of a skill course; the port runs every
-//! tick — `0x49AF70`'s slice tracking, and 0x410280's sound event (`{1, −1, idA, idB, min(0x430,
-//! 50)}` pushed when `0x430 > 0.15`) — a smackable holds no audio car slot (0x4A7DC0 takes cars),
-//! so nothing drains it (MEDIUM). *(2026-09-25:)* the tracker and its plane (0x49AF70 without
+//! **The LOD gate** (2026-09-26): `Car_ground` asks `Lod_shouldUpdate(1, 3, car+0x78, car+0, …,
+//! car+0x10B8)` (0x49BD6B…0x49BD8C, [`crate::vehicle::ground_due`]) for a prop too. `car+0x78` is
+//! 0x417190's octagonal x–z distance to the nearest racer of `0x5E8E2C[]`, from 1000, and only
+//! 0x49AF70 calls it (0x49AF99), behind the same three gates `Car_ground` has (`+0x7F`, `!+0x7D`,
+//! `+0x7C`), so the value is always fresh when `Car_ground` reads it: a prop can only be disturbed
+//! while awake, and the next tick's tracker (priority 6) runs before its damper can put it to sleep.
+//! `car+0x10B8` is 0: `Car_reset` falls through from the smackable branch (0x4107F6 → 0x410A37) to
+//! `AI_resetState` 0x406D50 (0x410CC8), which stores `flags & 1` there (0x406E16…0x406E7F) and a
+//! smackable has no racer bit. `car+0` is `(slot | 0x100)` with the slot `[0x658080] + k` for the
+//! k-th smackable (the race init's second loop, 0x4110ED…0x41111E, 0x4107AE → `RigidBody_init`
+//! 0x49B51D) — [`Smackable::slot`]. So a prop within 96 m of a racer settles at 32 Hz, farther ones
+//! at 16 / 8 Hz with the gravity of 2 / 4 ticks.
+//!
+//! `0x49AF70`'s slice half lives with the slice table, in `nfs_game::smackables::RaceSmackables`.
+//!
+//! **A heavy, long prop rocks itself off the ground — as the original does** (read 2026-09-26,
+//! `RE/notes/suspension-collision.md` §9 "The heavy smackables", HIGH): the mass and the inertia
+//! unit `6m` come from the definition (0x4A12B5 → 0x49B510), not the points' box, and
+//! `GroundImpulse` 0x495F30 changes a contact's normal speed by `0.6·(1.5 + ρ²)/(1.5 + ρ)` times
+//! its approach, `ρ` its distance from the origin across the normal — past 2.14 m the contact is
+//! thrown back, past 4.17 m faster than it came. A 7000 kg tanker's ends are 4.4 m out; the port
+//! keeps the original's arithmetic (the test `a_long_heavy_smackable_rocks_itself_up`).
+//!
+//! **Every race has them** (2026-09-26): the bundles are the mission scene's and the track's
+//! instance bundle, collected into `[WTrack+0x34]` up to 125 (0x4888B0) — the track's placed
+//! `SIGN`s, hydrants, sawhorses … (`RE/notes/suspension-collision.md` §9 "The track's
+//! smackables"); `nfs_game::world::TrackWorld::smackables` builds both.
+//!
+//! **0x410280's sound event is never heard — CONFIRMED (2026-09-26), so nothing is played for it.**
+//! A smackable pushes `{1, −1, idA, idB, min(0x430, 50), 0}` onto its own queue `car+0x1110`
+//! (count `car+0x110C`, at most 7) when `0x430 > 0.15` (`[0x5B2638]`, 0x4102E1…0x4103F8): `idA =
+//! 0x5CC518[kind]`, replaced by **0 (Tires) on a pylon** (`car+0x44C == 0x10`, 0x41032E) for the
+//! ground / car kinds, and `idB` the event's low byte (a car contact, a wall), `0x5CC4D8[·]` for the
+//! ground or `0x5CC534[·]` for a prop without a car. The only readers of `car+0x110C` in the audio
+//! module are 0x4A73DE (0x4A7080, whose car comes from the slot table 0x655D60 that 0x4A7DC0 fills
+//! from `0x5E8B34[]` — a smackable is not in it) and 0x4A7AF8 (0x4A7660, the human); 0x498220
+//! (← 0x4150A4) zeroes the count of every car of `0x5E8B34` and **every** entry of `0x5E8C24`.
+//! What a cone hit sounds like is the racer's own event — CarBody × the prop's material, since the
+//! solver writes the racer's `car+0x438 = 0x50000 | smackable+0x44C` (0x496CA0…0x496CBD,
+//! [`crate::vehicle::Vehicle::pair_event`]): **Pylon**, group 0x56, for a cone; *corrected
+//! 2026-09-26 from "CarBody × CarBody"* — and the HUD count's 0x4AAE50 (`Sfx::pylon_hit`). *(2026-09-25:)* the tracker and its plane (0x49AF70 without
 //! the slice part, 0x499520) are carried, [`crate::collision::PatchTracker`]. The collision hold
 //! `car+0x43C` needs nothing: every writer in the image stores 0 (0x40DFC7, 0x40E14E, 0x40F45B, 0x410D0A, 0x49B6F2) and 0x499019 only counts it
 //! down while positive, so the 0x498DE9 skip never fires. *(Corrected 2026-09-25: this listed
@@ -92,14 +128,21 @@ pub fn point_cloud(vertices: &[Vec3]) -> Vec<Vec3> {
 /// The convex hull of the points in x–z (y is dropped), counter-clockwise, without duplicates
 /// closer than `√1e-8` (`[0x5C18E4]`) and without collinear points.
 fn hull_xz(points: &[Vec3]) -> Vec<Vec3> {
-    let mut p: Vec<(f32, f32)> = points.iter().map(|v| (v.x, v.z)).collect();
-    p.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
-    p.dedup_by(|a, b| (a.0 - b.0).powi(2) + (a.1 - b.1).powi(2) <= 1e-8);
+    hull_xz_points(points).into_iter().map(|v| Vec3::new(v.x, 0.0, v.z)).collect()
+}
+
+/// [`hull_xz`] keeping each hull point whole: 0x5A0480 copies the 16-byte points it keeps
+/// (0x5A04CA…0x5A04E0, 0x5A0525…0x5A0538), so a hull point carries its own y. Of points closer
+/// than `√1e-8` in x–z the first in input order stays (a stable sort).
+fn hull_xz_points(points: &[Vec3]) -> Vec<Vec3> {
+    let mut p: Vec<Vec3> = points.to_vec();
+    p.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.z.total_cmp(&b.z)));
+    p.dedup_by(|a, b| (a.x - b.x).powi(2) + (a.z - b.z).powi(2) <= 1e-8);
     if p.len() < 3 {
-        return p.into_iter().map(|(x, z)| Vec3::new(x, 0.0, z)).collect();
+        return p;
     }
-    let cross = |o: (f32, f32), a: (f32, f32), b: (f32, f32)| (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0);
-    let mut h: Vec<(f32, f32)> = Vec::with_capacity(2 * p.len());
+    let cross = |o: Vec3, a: Vec3, b: Vec3| (a.x - o.x) * (b.z - o.z) - (a.z - o.z) * (b.x - o.x);
+    let mut h: Vec<Vec3> = Vec::with_capacity(2 * p.len());
     for &q in &p {
         while h.len() >= 2 && cross(h[h.len() - 2], h[h.len() - 1], q) <= 0.0 {
             h.pop();
@@ -114,7 +157,53 @@ fn hull_xz(points: &[Vec3]) -> Vec<Vec3> {
         h.push(q);
     }
     h.pop();
-    h.into_iter().map(|(x, z)| Vec3::new(x, 0.0, z)).collect()
+    h
+}
+
+/// `[0x5B2638]` = 0.15: half a sign's thickness (0x476D0C / 0x476D4D).
+const SIGN_HALF_DEPTH: f32 = 0.15;
+
+/// **0x476B30** — a `SIGN` smackable's collision points (the one definition 0x4772F0 sends here,
+/// 0x477441), from its article's vertices (article frame) and the axis lengths of its instance's
+/// 3×3 (0x476A80 splits the record's matrix into the unscaled rows and these; 0x539B30 /
+/// 0x539F50 scale the vertices by them — the other smackables' 0x476ED0 takes no scale):
+///
+/// 1. the scaled vertices turned **90° about x** (0x539BD0(90, 1, 0, 0), 0x476C9B…0x476CC3), so
+///    the sign's face lies in x–z;
+/// 2. their x–z hull (0x5A0480), each hull point keeping its turned y — the face's depth;
+/// 3. every hull point twice, at `y − 0.15` and then all of them at `y + 0.15` (0x476CF6…0x476D64),
+///    turned back (0x539DB0, the rigid inverse, 0x476D8E…0x476DA3);
+/// 4. the lowest `y` of them all (from 1e9, 0x476DAA…0x476DCA); of the points at or under that
+///    `+ 0.1` (`[0x5B2604]`) only the **first** with `z > 0.001` (`[0x5B27B4]`) and the first with
+///    `z ≤ 0.001` stay, every higher point stays (0x476DED…0x476E72). No cap.
+///
+/// So a sign is a 0.3 m slab of its face's outline standing on two points. MEDIUM: the turn's
+/// sense (glam's right-handed `x` rotation; the ±0.15 pair is symmetric, only which of the two
+/// sets comes first changes) and the hull's order, which picks the two kept bottom points; the
+/// vertices are the port's article meshes (the original reads the `vt` of the LOD record
+/// `Base+0x64 + 12·Base[+4]`, 0x476BA6…0x476C1E).
+pub fn sign_point_cloud(vertices: &[Vec3], axis_lengths: Vec3) -> Vec<Vec3> {
+    let turn = glam::Quat::from_rotation_x(90f32.to_radians());
+    let turned: Vec<Vec3> = vertices.iter().map(|v| turn * (*v * axis_lengths)).collect();
+    let hull = hull_xz_points(&turned);
+    let back = turn.inverse();
+    let pts: Vec<Vec3> = hull
+        .iter()
+        .map(|h| Vec3::new(h.x, h.y - SIGN_HALF_DEPTH, h.z))
+        .chain(hull.iter().map(|h| Vec3::new(h.x, h.y + SIGN_HALF_DEPTH, h.z)))
+        .map(|p| back * p)
+        .collect();
+    let floor = pts.iter().map(|p| p.y).fold(1.0e9f32, f32::min) + COLLAPSE;
+    let (mut front, mut rear) = (false, false);
+    pts.into_iter()
+        .filter(|p| {
+            if floor < p.y {
+                return true;
+            }
+            let side = if p.z > 0.001 { &mut front } else { &mut rear };
+            !std::mem::replace(side, true)
+        })
+        .collect()
 }
 
 /// `max(|dx|, |dz|) + 0.25 · min(|dx|, |dz|)` — the octagonal distance 0x4A0F80 measures.
@@ -132,6 +221,12 @@ pub struct Smackable {
     pub asleep: bool,
     /// `car+0x41C`, the ground height under it the last `Car_ground` saw.
     ground_h: f32,
+    /// `car+0x78` — the octagonal x–z distance to the nearest racer, which only [`Self::track`]
+    /// (0x49AF70 → 0x417190) writes. Its value before the first write is never read (module doc).
+    pub racer_distance: f32,
+    /// `car+0`'s slot, `[0x658080] + k` — the number of cars in `0x5E8B34[]` plus the prop's index
+    /// in `0x5E8C24[]` (0x4110FF…0x41110B) — which staggers the LOD gate ([`crate::vehicle::ground_due`]).
+    pub slot: usize,
 }
 
 impl Smackable {
@@ -158,7 +253,7 @@ impl Smackable {
         body.knocked_over = false;
         body.gravity_scale = 1.0;
         body.tracker = crate::collision::PatchTracker::new(position);
-        let mut s = Self { body, asleep: true, ground_h: position.y };
+        let mut s = Self { body, asleep: true, ground_h: position.y, racer_distance: 0.0, slot: 0 };
         // 0x4A1510: 0x4994F0 (`updateZone(pos, 1)`), 0x49AF70 — which returns at once, the body
         // being asleep — then 0x499520 on its own (0x4A167A…0x4A1686), then `Susp_AI`
         s.body.tracker.update_zone(grid, position);
@@ -214,8 +309,11 @@ impl Smackable {
     /// `Susp_AI` 0x4998C0 and `BodyHeight` 0x49A900's smackable arm: the tracker's plane under the
     /// position, and the body's height over it — `car+0x424` the lowest point's, `car+0x428` the
     /// mean of the three lowest (0x49AA57…0x49AB52, `[0x5B2680]` = 1/3) — over **all** the body
-    /// points. Answers the plane's height at the position, or −2³¹ when the plane is steeper than
-    /// `n.y < 0.1`.
+    /// points. Answers the plane's height at the position, or **−2 097 152 000** (`0xCEFA0000`,
+    /// 0x49993E) when the plane is as steep as `n.y ≤ 0.1` (`test ah, 0x41`, 0x4998FD…0x499908) —
+    /// and then `BodyHeight` is **not** run: `car+0x424` / `+0x428` keep the last tick's.
+    /// *(Corrected 2026-09-26: the port answered −2³¹, took `n.y = 0.1` as flat enough and
+    /// measured the body on the steep plane too.)*
     ///
     /// The plane is the body's [`crate::collision::PatchTracker`]: the patch normal and the centre
     /// `car+0x400` that 0x499520 kept (MEDIUM only in that a patch is one of the port's triangles).
@@ -225,31 +323,50 @@ impl Smackable {
         // (0x4998DF) through `car+0x400`
         self.body.tracker.update_zone(grid, p);
         let (n, q) = (self.body.tracker.normal, self.body.tracker.plane_point);
-        let h = if n.y >= 0.1 { q.y - ((p.x - q.x) * n.x + (p.z - q.z) * n.z) / n.y } else { -2_147_483_648.0 };
-        // BodyHeight 0x49A900, whose smackable arm is the all-points one (0x49A942)
+        if n.y <= 0.1 {
+            return -2_097_152_000.0;
+        }
+        let h = q.y - ((p.x - q.x) * n.x + (p.z - q.z) * n.z) / n.y;
+        // BodyHeight 0x49A900 (0x499934), whose smackable arm is the all-points one (0x49A942)
         self.body.body_height_on(n, q);
         // `Damage`'s crash response tests `car+0x424` through this field
         self.body.height_marker = self.body.body_height;
         h
     }
 
+    /// The tracker slot `0x49AF70` (32 Hz, priority 6 — ahead of every car's drive and ground
+    /// entries): nothing while asleep or undisturbed (0x49AF75…0x49AF90); else 0x417190 —
+    /// `car+0x78` = the least octagonal x–z distance ([`oct_distance`]) from the prop to a racer
+    /// of `0x5E8E2C[]` (`racers`: the humans and the opponents), starting from 1000 (0x4171AA) —
+    /// then the tracker (`Tracker::update` / `updateZone` and, on a new patch, 0x499520; the slice
+    /// half is the caller's). Answers whether it ran.
+    pub fn track(&mut self, grid: &TriangleGrid, racers: &[Vec3]) -> bool {
+        if self.asleep || !self.body.disturbed {
+            return false;
+        }
+        self.racer_distance = racers.iter().map(|r| oct_distance(self.body.position, *r)).fold(1000.0, f32::min);
+        self.body.tracker.track(grid, self.body.position);
+        true
+    }
+
     /// `Car_ground` 0x49BD40 (`+0xE20`, 32 Hz, priority 0x1E) for `flags & 0x80`, read again
     /// 2026-09-25 (0x49BD40…0x49C344): nothing while asleep or undisturbed (`!car+0x7C`,
-    /// 0x49BD55); else `Susp_AI`, `dh = (h − car+0x41C)·rateHz`, and from the gravity on the body
+    /// 0x49BD55), nor when the LOD gate says the prop is not due (`tick` is `gGameTick`, module
+    /// doc); else `Susp_AI`, `dh = (h − car+0x41C)·rateHz`, and from the gravity (× `nTicks`) on the body
     /// a car runs too, [`Vehicle::car_ground_body`] — where a smackable always takes the tilted
     /// test (0x49BF55) and keeps the surface's friction in it (0x49BFDF), its hard landing cannot
     /// happen (`car+0x424 < −0.05` after failing `< 0.001`), and `Susp_applyLift` returns at once
     /// for it (0x49AEC5). The plane point `car+0x404` of the 8 m ceiling rule is the tracker's
     /// patch centre (0x499520, [`crate::collision::PatchTracker`]).
-    pub fn ground(&mut self, grid: &TriangleGrid) {
+    pub fn ground(&mut self, grid: &TriangleGrid, tick: u64) {
         if self.asleep || !self.body.disturbed {
             return;
         }
-        // 0x49AF70 (priority 6, the same gates): the tracker and, on a new patch, 0x499520
-        self.body.tracker.track(grid, self.body.position);
+        // 0x49BD6B…0x49BD96: `Lod_shouldUpdate(1, 3, car+0x78, car+0, …, car+0x10B8 = 0)`
+        let Some((rate_hz, n_ticks)) = crate::vehicle::ground_due(self.racer_distance, false, tick, self.slot) else { return };
         let h = self.susp_ai(grid);
-        // `rateHz` = 32 for a prop within 96 m of a racer (the LOD gate, not carried)
-        let dh = (h - self.ground_h) * 32.0;
+        // 0x49BDC5…0x49BDCD: `fimul rateHz`
+        let dh = (h - self.ground_h) * rate_hz;
         self.ground_h = h;
         let b = &mut self.body;
         let (n, q) = (b.tracker.normal, b.tracker.plane_point);
@@ -257,7 +374,7 @@ impl Smackable {
         b.cos_tilt = n.dot(b.orientation.row(1));
         let mass = b.sim_mass;
         let surf = (b.tracker.word & 0xF) as usize;
-        b.car_ground_body(dh, n, q, surf, mass, None, grid);
+        b.car_ground_body(dh, n, q, surf, mass, None, grid, n_ticks, false); // a smackable is no racer (`car+0x52C` 0x80)
     }
 
     /// `0x498FF0` (`+0xE2C`, 32 Hz, priority 0x28) for this prop: nothing while asleep; once
@@ -285,8 +402,8 @@ impl Smackable {
     }
 
     /// `0x410280` (`+0xE30`, priority 0x32): a prop's impact is spent — `car+0x430 / 0x434 /
-    /// 0x438` cleared (0x410402…0x41040E). The sound event it would push first is not carried
-    /// (module doc).
+    /// 0x438` cleared (0x410402…0x41040E). The sound event it pushes first is dropped unheard in
+    /// the original (module doc), so the port does not make one.
     pub fn post_impact(&mut self) {
         if !self.asleep {
             self.body.impact = 0.0;
@@ -341,6 +458,28 @@ mod tests {
             v.push(Vec3::new(0.02 * a.cos(), 0.5, 0.02 * a.sin()));
         }
         v
+    }
+
+    /// A sign: a 1 × 0.6 face on a 1.6 m post, 2 cm thick, in the article's x–y plane.
+    #[test]
+    fn a_sign_is_a_slab_of_its_outline_on_two_points() {
+        let mut v = Vec::new();
+        for z in [-0.01f32, 0.01] {
+            for (x, y) in [(-0.5, 1.6), (0.5, 1.6), (0.5, 2.2), (-0.5, 2.2), (-0.03, 0.0), (0.03, 0.0), (0.03, 1.6), (-0.03, 1.6)] {
+                v.push(Vec3::new(x, y, z));
+            }
+        }
+        let pts = sign_point_cloud(&v, Vec3::ONE);
+        // the face's corners and the post's foot, each on both sides of the slab ...
+        assert!(pts.iter().all(|p| p.z.abs() > 0.1 && p.z.abs() < 0.2), "{pts:?}");
+        assert!(pts.iter().any(|p| (p.y - 2.2).abs() < 1e-5));
+        // ... of which only two stand on the ground, one each side
+        let feet: Vec<&Vec3> = pts.iter().filter(|p| p.y < 0.1).collect();
+        assert_eq!(feet.len(), 2, "{pts:?}");
+        assert!(feet[0].z * feet[1].z < 0.0);
+        // scaled by the instance's axis lengths
+        let big = sign_point_cloud(&v, Vec3::new(2.0, 1.0, 1.0));
+        assert!(big.iter().any(|p| (p.x.abs() - 1.0).abs() < 1e-5));
     }
 
     #[test]
@@ -412,15 +551,80 @@ mod tests {
     }
 
     #[test]
+    fn a_far_prop_settles_at_the_lod_rate() {
+        // 110 m from the racer: row 3 index 6 → 16 Hz, `nTicks` 2, due when
+        // `(slot | 0x100) + tick/2` is odd (mask 1); the gravity covers the skipped tick
+        let grid = flat();
+        let mut c = cone();
+        c.asleep = false;
+        c.body.disturbed = true;
+        c.body.position.y = 1.0;
+        c.slot = 1;
+        let racer = [Vec3::new(110.0, 0.0, 0.0)];
+        assert!(c.track(&grid, &racer));
+        assert_eq!(c.racer_distance, 110.0);
+        // past the first 15 game ticks, where every car is due
+        let (vy0, y0) = (c.body.velocity.y, c.body.position.y);
+        c.ground(&grid, 34);
+        assert_eq!((c.body.velocity.y, c.body.position.y), (vy0, y0), "(0x101 + 17) & 1 == 0: not due");
+        c.ground(&grid, 36);
+        let g = c.body.velocity.y - vy0;
+        assert!((g + 2.0 * 9.8 / 32.0).abs() < 0.05, "two ticks of gravity: {g}");
+    }
+
+    /// A box of the given half length (x), 2.6 m wide and 3 m tall, as 0x476ED0 would lay it: the
+    /// roof's four corners and the floor's four.
+    fn crate_points(half_len: f32) -> Vec<Vec3> {
+        let mut v = Vec::new();
+        for y in [3.0, 0.0] {
+            for (x, z) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                v.push(Vec3::new(x * half_len, y, z * 1.3));
+            }
+        }
+        v
+    }
+
+    /// `GroundImpulse` 0x495F30's arithmetic throws a contact farther than 2.14 m from the origin
+    /// back and one past 4.17 m back faster than it came (`suspension-collision.md` §6.3, §9 "The
+    /// heavy smackables"): a 7000 kg body 8.8 m long, given a 0.05 turns/s pitch on a flat plane,
+    /// rocks itself off the ground; the same body 1.8 m long settles.
+    #[test]
+    fn a_long_heavy_smackable_rocks_itself_up() {
+        let grid = flat();
+        let run = |half_len: f32| {
+            let mut s = Smackable::new(Vec3::new(0.0, 0.01, 0.0), Mat3::IDENTITY, crate_points(half_len), 7000.0, 7, &grid);
+            s.asleep = false;
+            s.body.disturbed = true;
+            s.body.angular_velocity = Vec3::new(0.0, 0.0, 0.05);
+            let racer = [Vec3::new(5.0, 0.0, 0.0)];
+            let mut top = 0.0f32;
+            for i in 0..320u64 {
+                s.track(&grid, &racer);
+                s.damp(&racer);
+                s.ground(&grid, 2 * i + 100);
+                s.integrate();
+                s.integrate();
+                top = top.max(s.body.position.y);
+            }
+            top
+        };
+        let (long, short) = (run(4.4), run(0.9));
+        assert!(long > 1.0, "the long body climbs: {long}");
+        assert!(short < 0.1, "the short one settles: {short}");
+    }
+
+    #[test]
     fn a_disturbed_cone_falls_and_settles() {
         let mut c = cone();
         c.asleep = false;
         c.body.disturbed = true;
         c.body.position.y = 1.0;
         let grid = flat();
-        for _ in 0..200 {
-            c.damp(&[Vec3::new(5.0, 0.0, 0.0)]);
-            c.ground(&grid);
+        let racer = [Vec3::new(5.0, 0.0, 0.0)];
+        for i in 0..200u64 {
+            assert!(c.track(&grid, &racer) || c.asleep);
+            c.damp(&racer);
+            c.ground(&grid, 2 * i);
             c.post_impact();
             c.integrate();
             c.integrate();

@@ -3,22 +3,22 @@
 //! * The `_st<N>.scn` scene holds the start pose (type-2 trigger), checkpoints (type 0, taken
 //!   strictly in sequence-id order), the finish (type 1), cones (`CONE` smackables) and arrow
 //!   markers (`ARW*`, shown one at a time through the trigger link).
-//! * Per tick (§7): the next checkpoint fires when one of the car's side segments crosses its
-//!   line within ±3.5 m height (or the car centre is inside its sphere); the finish stores the
-//!   race time; a wreck about to auto-reset counts as DNF except on the skidpad.
-//! * Evaluation (§10): min rank ⇒ position; else time + cone penalty < limit; damage cap; cone cap.
+//! * Per tick (§7): the next checkpoint fires when one of the car's diagonals crosses its line
+//!   (the first within ±3.5 m height) or the car centre is inside its sphere, and the car's
+//!   heading, direction of travel and speed pass the trigger's gates (0x4704E0); the finish
+//!   stores the race time; a wreck about to auto-reset counts as DNF except on the skidpad.
+//! * Evaluation (§10, [`evaluate_mission`]): min rank ⇒ position and nothing else; else time +
+//!   cone penalty ≤ limit, damage cap, cone cap.
 //! * Cones (§5.3, §8): each is a **smackable**, a car record of its own (`car+0x52C & 0x80`)
 //!   simulated by the car physics — `nfs_physics::smackable`, spawned from the scene's
 //!   `kSmackable` elements (`TrackWorld::smackables`) and stepped in the handlers' order by
-//!   [`SkillTest::step_props`] / [`SkillTest::integrate_props`]. A cone counts as hit when the
-//!   car–car solver flags it (`car+0x42C`, 0x496A10: any contact that is not separating, on a
-//!   class-0x10 prop), and the HUD's count (0x425950) raises [`SkillEvent::ConeHit`] when it moves.
+//!   `crate::smackables::RaceSmackables`. A cone counts as hit when the car–car solver flags it
+//!   (`car+0x42C`, 0x496A10: any contact that is not separating, on a class-0x10 prop); the
+//!   HUD's frame counts the flags ([`HudCones`], 0x425950).
 
-use glam::{Mat4, Vec3};
+use glam::Vec3;
 use nfs_formats::career::{ConeRule, Mission};
 use nfs_formats::scn::{ElementKind, Scene, SceneElement};
-use nfs_physics::smackable::{collide_among, Smackable};
-use nfs_physics::vehicle::Vehicle;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Checkpoint {
@@ -35,27 +35,77 @@ pub struct Checkpoint {
     /// Element index of the arrow marker to show when this trigger fires.
     pub link: Option<usize>,
     pub chime: bool,
-    /// Required heading when set (`+0xE8` flag, 0x4704E0's `dot(car.fwd, +0xC8) > 0.5`).
-    pub heading: Option<Vec3>,
-    /// `+0xC8` as stored, whatever the flag — what 0x46F0F0 hands the start placement 0x410430
+    /// `+0xBC`, the required direction of travel: 0x4704E0 wants `dot(+0xBC, normalize(car+0x33C))
+    /// > 0.5` unless all three components are exactly 0 (0x470575…0x470662) — the `+0xE4` flag
+    /// beside it is never read
+    pub velocity_dir: Vec3,
+    /// `+0xC8` as stored, whatever the `+0xE8` flag — what 0x46F0F0 hands the start placement
+    /// 0x410430, and 0x4704E0's heading gate `dot(+0xC8, car+0x37C) > 0.5` unless it is exactly
+    /// zero (0x4704FA…0x47056A; the flag is never read)
     pub heading_c8: Vec3,
+    /// `+0x90` / `+0x94`, the speed window 0x4704E0 compares `car+0x35C` with
+    pub speed_min: f32,
+    pub speed_max: f32,
+}
+
+/// What `CTriggerElem::test` 0x4704E0 / `hit` 0x4706C0 read of the car.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TriggerCar {
+    /// `car+0x330`
+    pub position: Vec3,
+    /// The four wheels' world points `wheel+0x40` = `car+0x7F8 + 0xC4·i` — the ground contacts
+    pub wheels: [Vec3; 4],
+    /// `car+0x37C`, the body's forward row
+    pub forward: Vec3,
+    /// `car+0x33C`
+    pub velocity: Vec3,
+    /// `car+0x35C`, `max(|vx|, |vz|) + ¼·min(|vx|, |vz|)`
+    pub speed: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cone {
     pub element: usize,
     pub position: Vec3,
-    pub knocked: bool,
+}
+
+/// The mission HUD's cone count, the tail of the HUD frame 0x425950 (0x425D7F…0x425DFD, read to
+/// the instruction 2026-09-26). Every frame, while not in a replay (`[0x657424]` 0 or 1), in a
+/// Factory Driver mission (`[0x6573E8] == 9`) with a cone rule (`CONEIMIT` or `CONEPENALTY` not
+/// −1), it counts the flagged smackables — **all** of `0x5E8C24[]`, the track's own included —
+/// and when the count differs from the last one `[0x60CA04]` it plays 0x4AAE50, stores the count,
+/// and bumps **by one** `HMissionSummary+0x140` (0x429820 `inc`) and `HTime+0xE4` (0x431840)
+/// besides the flash `HTime+0xE0 = 16` (0x431830). So those two count the frames the count
+/// moved on, not the cones: two cones flagged between two frames cost one penalty.
+/// 0x426B20…0x426B3B zeroes all three when the race (re)starts.
+///
+/// *(Until 2026-09-26 the port counted on the skill tick, without the gates, only the mission
+/// scene's cones, and used the count itself for the HUD's added time and the summary.)*
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HudCones {
+    /// `[0x60CA04]`, the last count
+    pub last: usize,
+    /// `HMissionSummary+0x140` = `HTime+0xE4`: how many times the count moved
+    pub changes: u64,
+}
+
+impl HudCones {
+    /// One HUD frame with `count` flagged smackables; `true` when the count moved (the sound,
+    /// the flash).
+    pub fn frame(&mut self, count: usize) -> bool {
+        if count == self.last {
+            return false;
+        }
+        self.last = count;
+        self.changes += 1;
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SkillEvent {
     Checkpoint { sequence: i32, chime: bool },
     Finish { time_ticks: u64 },
-    /// The HUD's cone count moved (0x425950: the flagged smackables counted every frame against
-    /// the last count `[0x60CA04]`): the sound 0x4AAE50, `HTime+0xE0 = 16` (the flash) and
-    /// `HMissionSummary+0x140 = count`. `count` is the new count.
-    ConeHit { count: usize },
     Dnf,
 }
 
@@ -73,13 +123,6 @@ pub struct SkillTest {
     pub time_ticks: Option<u64>,
     pub shown_arrow: Option<usize>,
     pub skidpad: bool,
-    /// The mission's smackables, built on the first [`Self::step_props`] from
-    /// `TrackWorld::smackables` (0x4A17F0 at race init), and their scene elements.
-    pub props: Vec<Smackable>,
-    pub prop_elements: Vec<usize>,
-    props_spawned: bool,
-    /// `[0x60CA04]`, the HUD's last cone count.
-    last_cone_count: usize,
 }
 
 const RACE_START_TICK: u64 = 448;
@@ -108,7 +151,7 @@ impl SkillTest {
                 ElementKind::Geom => {
                     let Some(tag) = Scene::param_u32(e, 0, 1) else { continue };
                     if tag == u32::from_le_bytes(*b"CONE") {
-                        cones.push(Cone { element: i, position: Vec3::from(e.position), knocked: false });
+                        cones.push(Cone { element: i, position: Vec3::from(e.position) });
                     } else if is_arrow(tag) {
                         arrows.push(i);
                     }
@@ -127,10 +170,6 @@ impl SkillTest {
             time_ticks: None,
             shown_arrow: None,
             skidpad: track_name.eq_ignore_ascii_case("skidpad"),
-            props: Vec::new(),
-            prop_elements: Vec::new(),
-            props_spawned: false,
-            last_cone_count: 0,
         }
     }
 
@@ -154,9 +193,11 @@ impl SkillTest {
         let p1 = v3(ends, 0)?;
         let p2 = v3(ends, 3)?;
         // line 6: `+0xE4 flag, +0xBC velocity dir (3), +0xE8 flag, +0xC8 heading dir (3)`
+        let velocity_dir = e.params.get(2).and_then(|l| v3(l, 1)).unwrap_or(Vec3::ZERO);
         let heading_c8 = e.params.get(2).and_then(|l| v3(l, 5)).unwrap_or(Vec3::ZERO);
-        let heading = e.params.get(2).and_then(|l| if l.get(4).copied().unwrap_or(0.0) != 0.0 { v3(l, 5) } else { None }).filter(|h| h.length_squared() > 0.5);
-        Some(Checkpoint { element: index, kind, shape, radius, position: Vec3::from(e.position), p1, p2, sequence, link, chime, heading, heading_c8 })
+        let speed_min = *p.get(5)?;
+        let speed_max = *p.get(6)?;
+        Some(Checkpoint { element: index, kind, shape, radius, position: Vec3::from(e.position), p1, p2, sequence, link, chime, velocity_dir, heading_c8, speed_min, speed_max })
     }
 
     /// The start trigger's pose for 0x410430: its position (vtable `+0x38`) and `+0xC8` as
@@ -178,33 +219,56 @@ impl SkillTest {
         self.checkpoints.iter().find(|c| c.sequence == self.next_sequence && c.kind != 2)
     }
 
-    /// Does the trigger fire for a car whose side segments are `sides` (FL→RL, FR→RR) and whose
-    /// centre moved `prev → pos` this tick?
-    fn hit(c: &Checkpoint, pos: Vec3, prev: Vec3, sides: &[(Vec3, Vec3); 2]) -> bool {
-        if c.shape == 0 {
-            return (pos - c.position).length() < c.radius;
+    /// `CTriggerElem::test(car)` 0x4704E0: `hit` 0x4706C0, then the direction of travel, the
+    /// heading and the speed window.
+    ///
+    /// `hit`, read to the instruction 2026-09-26: a sphere (`+0x80 == 0`) fires while
+    /// `|car+0x330 − position| < +0x84` (0x470928…0x4709A6); a line (`+0x80 == 1`) takes the car's
+    /// **diagonals** — wheel 0 → wheel 3 (`car+0x7F8`, `+0xA44`) and wheel 1 → wheel 2 (`+0x8BC`,
+    /// `+0x980`) — and fires when the first crosses the line in x–z (0x489CC0) or, failing that,
+    /// the second does; the first is refused outright unless both its ends are within 3.5 m in
+    /// height of endpoint `+0xA4`, inclusive (0x4707B2…0x470810), the second has no height test.
+    /// Any other shape never fires. Not carried: the `carinfo+0x518` (`.TINYCAR`) re-basing of the
+    /// four points (0x470757…0x4707AF), which reads an unwritten local.
+    /// *(Until 2026-09-26 the port took the side segments FL→RL / FR→RR, tested both against the
+    /// trigger's position height, also counted the centre's path over the tick as a crossing,
+    /// and never ran the three gates.)*
+    fn hit(c: &Checkpoint, car: &TriggerCar) -> bool {
+        let fired = match c.shape {
+            0 => (car.position - c.position).length() < c.radius,
+            1 => {
+                let near = |y: f32| y + 3.5 >= c.p1.y && y - 3.5 <= c.p1.y;
+                let (w0, w3) = (car.wheels[0], car.wheels[3]);
+                if !near(w0.y) || !near(w3.y) {
+                    return false;
+                }
+                segments_intersect_xz(w0, w3, c.p1, c.p2) || segments_intersect_xz(car.wheels[1], car.wheels[2], c.p1, c.p2)
+            }
+            _ => false,
+        };
+        if !fired {
+            return false;
         }
-        let crosses = |a: Vec3, b: Vec3| -> bool {
-            if (a.y - c.position.y).abs() > 3.5 || (b.y - c.position.y).abs() > 3.5 {
+        // 0x4704FA…0x47056A: the heading, unless `+0xC8` is exactly zero
+        if c.heading_c8 != Vec3::ZERO && c.heading_c8.dot(car.forward) <= 0.5 {
+            return false;
+        }
+        // 0x470575…0x470662: the direction of travel, `normalize(car+0x33C)` (0x5328D0) or
+        // `(0, 1, 0)` when the velocity is exactly zero, unless `+0xBC` is exactly zero
+        if c.velocity_dir != Vec3::ZERO {
+            let dir = if car.velocity == Vec3::ZERO { Vec3::Y } else { car.velocity.normalize() };
+            if c.velocity_dir.dot(dir) <= 0.5 {
                 return false;
             }
-            segments_intersect_xz(a, b, c.p1, c.p2)
-        };
-        crosses(sides[0].0, sides[0].1) || crosses(sides[1].0, sides[1].1) || crosses(prev, pos)
+        }
+        // 0x47066B…0x47069D: `car+0x35C + 0.1 > +0x90` and `+0x94 + 0.1 > car+0x35C`
+        car.speed + 0.1 > c.speed_min && c.speed_max + 0.1 > car.speed
     }
 
     /// Per-tick update (even ticks). `about_to_reset` = the car is wrecked / upside down and will
     /// be auto-reset (`car+0xDB0 == 0 && car+0x1100 < 4`).
-    pub fn tick(&mut self, tick: u64, pos: Vec3, prev: Vec3, sides: &[(Vec3, Vec3); 2], about_to_reset: bool) -> Vec<SkillEvent> {
+    pub fn tick(&mut self, tick: u64, car: &TriggerCar, about_to_reset: bool) -> Vec<SkillEvent> {
         let mut ev = Vec::new();
-        // the HUD's cone count (0x425950), whatever the car's state. APPROXIMATION: the HUD reads
-        // it every frame and only for `FEGAME_TYPE == 9` with a cone rule on; here it is read on
-        // the skill tick, always
-        let count = self.cones_knocked();
-        if count != self.last_cone_count {
-            self.last_cone_count = count;
-            ev.push(SkillEvent::ConeHit { count });
-        }
         if self.finished || self.dnf {
             return ev;
         }
@@ -215,7 +279,7 @@ impl SkillTest {
             return ev;
         }
         let Some(c) = self.next().cloned() else { return ev };
-        if !Self::hit(&c, pos, prev, sides) {
+        if !Self::hit(&c, car) {
             return ev;
         }
         match c.kind {
@@ -238,101 +302,61 @@ impl SkillTest {
         ev
     }
 
-    /// One 32 Hz tick of the mission's smackables, in the order the priority list runs their
-    /// handlers (`traffic.md` §14.2 / §21.5): per prop `0x4A1030` then `Car_ground` 0x49BD40 (both
-    /// priority 0x1E), then per prop the collision pass 0x498FF0 (0x28) — against `cars`, the
-    /// racers with their `car+0x354` in the original's units (kg / 128), which were all entered in
-    /// this tick's list before any prop, then against the props before it that are awake — and
-    /// last per prop 0x410280 (0x32). The caller runs this after the racers' own collision pass.
-    ///
-    /// `walls` is what 0x4980D0 runs for each body between its rounds and 0x498FF0 for a
-    /// disturbed prop: `Car_wallCollide` 0x495020 and the props' pass 0x498DE0. Answers the pairs
-    /// that touched as (index into `cars`, that car's own `car+0x430`).
-    ///
-    /// The racers' own pass stays the port's (`main.rs`, labelled there); the props' pairs follow
-    /// all of it, which is the original's order. Not carried (`skill-tests.md` §5.4): the
-    /// `Car_ground` LOD gate and the props' sound event. (The 8 m ceiling rule is in
-    /// `Vehicle::car_ground_body`; `car+0x43C` is only ever written 0, so its skip never runs.)
-    pub fn step_props(&mut self, world: &crate::world::TrackWorld, cars: &mut [(&mut Vehicle, f32)], walls: &mut dyn FnMut(&mut Vehicle)) -> Vec<(usize, f32)> {
-        if !self.props_spawned {
-            self.props_spawned = true;
-            self.props = world
-                .smackables
-                .iter()
-                .map(|s| Smackable::new(s.position, s.orientation, s.points.clone(), s.mass, s.audio_type, &world.collision))
-                .collect();
-            self.prop_elements = world.smackables.iter().map(|s| s.element).collect();
-            tracing::info!(props = self.props.len(), "smackables spawned");
-        }
-        let alive: Vec<Vec3> = cars.iter().map(|(c, _)| c.position).collect();
-        for p in self.props.iter_mut() {
-            p.damp(&alive);
-            p.ground(&world.collision);
-        }
-        let mut hits = Vec::new();
-        for k in 0..self.props.len() {
-            hits.extend(self.props[k].collide(cars, walls));
-            collide_among(&mut self.props, k, walls);
-        }
-        for p in self.props.iter_mut() {
-            p.post_impact();
-        }
-        // the cone count reads the flags (`car+0x42C`)
-        for c in self.cones.iter_mut() {
-            if let Some(k) = self.prop_elements.iter().position(|e| *e == c.element) {
-                c.knocked = self.props[k].body.knocked_over;
-            }
-        }
-        hits
+    /// `HMissionSummary::evaluate` (§10) for a skill test: [`evaluate_mission`] with the race time
+    /// `car+0xCD8 = car+0xB24` (99 999 after a DNF or with no finish taken). Returns (pass, the
+    /// time the summary compared, penalty included).
+    /// `cones` is the summary's `+0x140` ([`HudCones::changes`]).
+    pub fn evaluate(&self, mission: &Mission, position: usize, cones: u64, zones: &[f32; 10]) -> (bool, u64) {
+        evaluate_mission(mission, position, self.time_ticks.unwrap_or(99_999), cones, zones)
     }
+}
 
-    /// The props' 64 Hz integrators (0x49B7A0 / 0x49B8E0), after the racers' — and every 32 ticks
-    /// the re-orthonormalisation the port gives every body (0x4A4810).
-    pub fn integrate_props(&mut self, tick: u64) {
-        for p in self.props.iter_mut() {
-            p.integrate();
-            if tick % 32 == 0 {
-                p.body.renormalise();
-            }
+/// `HMissionSummary::evaluate` 0x4293F0, read to the instruction 2026-09-26. `position` is the
+/// player's `car+0xCD4`, `time` its `car+0xCD8` in ticks, `cones` the summary's `+0x140`,
+/// `zones` the ten damage zones. Returns (pass, the time compared with the limit).
+///
+/// ```text
+/// pass = 1
+/// if MINRANK:              pass = car+0xCD4 <= MINRANK, and nothing else    (0x4294A2…0x4294C4)
+/// else:
+///   if TIMELIMIT != −1 and car+0xCD8 != 0:                                   (0x4294C9…0x4294E6)
+///       t = car+0xCD8, + _ftol(CONEPENALTY·cones·64.0) when CONEPENALTY != −1
+///       fail when TIMELIMIT·64 < t                                           (0x42952A)
+///   fail when 0x434FA0(0)                                                    (0x42953F)
+///   fail when CONEIMIT != −1 and cones > CONEIMIT                            (0x429552)
+/// ```
+///
+/// A minimum rank therefore skips the damage and cone-limit tests: `jle 0x429569` (0x4294BE)
+/// lands past both, and the failing `jmp 0x429564` only clears the flag. *(Until 2026-09-26 the
+/// port ran the damage test for every mission and the cone limit after a rank test too; a time
+/// of 0 was compared like any other.)*
+pub fn evaluate_mission(mission: &Mission, position: usize, time: u64, cones: u64, zones: &[f32; 10]) -> (bool, u64) {
+    if let Some(rank) = mission.min_rank {
+        return (position <= rank as usize, time);
+    }
+    let mut pass = true;
+    let mut t = time;
+    if let Some(limit) = mission.time_limit_s
+        && t != 0
+    {
+        if let Some(ConeRule::PenaltySeconds(s)) = mission.cone_rule {
+            t += s as u64 * cones * 64;
         }
-    }
-
-    /// Each prop's pose, body to world, for `TrackWorld::place_smackable` — the record's pose
-    /// pointers are the car's (0x483590).
-    pub fn prop_poses(&self) -> impl Iterator<Item = (usize, Mat4)> + '_ {
-        self.prop_elements.iter().zip(&self.props).map(|(e, p)| (*e, crate::world::body_pose(p.body.position, p.body.orientation)))
-    }
-
-    pub fn cones_knocked(&self) -> usize {
-        self.cones.iter().filter(|c| c.knocked).count()
-    }
-
-    /// `HMissionSummary::evaluate` (§10). `position` = finishing position for race missions,
-    /// `zones` = the player's ten body-damage zones. Returns (pass, effective time in ticks incl.
-    /// penalty).
-    pub fn evaluate(&self, mission: &Mission, position: usize, zones: &[f32; 10]) -> (bool, u64) {
-        let cones = self.cones_knocked() as u64;
-        // no finish trigger taken = DNF (`car+0xB24 = 99999`)
-        let mut t = self.time_ticks.unwrap_or(99_999);
-        let mut pass = true;
-        if let Some(rank) = mission.min_rank {
-            pass = position <= rank as usize;
-        } else if let Some(limit) = mission.time_limit_s {
-            if let Some(ConeRule::PenaltySeconds(s)) = mission.cone_rule {
-                t += s as u64 * cones * 64;
-            }
-            if t >= limit as u64 * 64 {
-                pass = false;
-            }
-        }
-        if damage_over_limit(mission, zones) {
+        // `fild t; fild limit; fmul 64; fcompp; test ah, 1` (0x42951A…0x429531): fails only
+        // when `limit·64 < t` — a time exactly on the limit passes
+        if t > limit as u64 * 64 {
             pass = false;
         }
-        if let Some(ConeRule::Limit(n)) = mission.cone_rule && cones > n as u64 {
-            pass = false;
-        }
-        (pass, t)
     }
+    if damage_over_limit(mission, zones) {
+        pass = false;
+    }
+    if let Some(ConeRule::Limit(n)) = mission.cone_rule
+        && cones > n as u64
+    {
+        pass = false;
+    }
+    (pass, t)
 }
 
 /// `0x434FA0` (§9) — the mission's damage test, CONFIRMED (read 2026-09-23): the ten zones are
@@ -348,15 +372,25 @@ pub fn damage_over_limit(mission: &Mission, zones: &[f32; 10]) -> bool {
     }
 }
 
-/// 2-D segment intersection in the xz plane.
+/// 0x489CC0 with no output point: the segment `a → b` crosses `c → d` in x–z. Both parameters
+/// must lie in [0, 1], ends included, and parallel segments never cross (`den == 0`,
+/// 0x489CFC…0x489D0B). `t` is stored as a float before its compares (0x489D3D), `u` is compared
+/// straight off the FPU stack.
 pub fn segments_intersect_xz(a: Vec3, b: Vec3, c: Vec3, d: Vec3) -> bool {
-    let (ax, az, bx, bz, cx, cz, dx, dz) = (a.x, a.z, b.x, b.z, c.x, c.z, d.x, d.z);
-    let orient = |px: f32, pz: f32, qx: f32, qz: f32, rx: f32, rz: f32| (qx - px) * (rz - pz) - (qz - pz) * (rx - px);
-    let o1 = orient(ax, az, bx, bz, cx, cz);
-    let o2 = orient(ax, az, bx, bz, dx, dz);
-    let o3 = orient(cx, cz, dx, dz, ax, az);
-    let o4 = orient(cx, cz, dx, dz, bx, bz);
-    (o1 * o2 < 0.0) && (o3 * o4 < 0.0)
+    let (sx, sz) = (b.x - a.x, b.z - a.z);
+    let (lx, lz) = (d.x - c.x, d.z - c.z);
+    let den = sx as f64 * lz as f64 - lx as f64 * sz as f64;
+    if den == 0.0 {
+        return false;
+    }
+    let den32 = den as f32 as f64;
+    let (dz, dx) = ((a.z - c.z) as f64, (a.x - c.x) as f64);
+    let t = ((dz * lx as f64 - dx * lz as f64) / den32) as f32;
+    if !(0.0..=1.0).contains(&t) {
+        return false;
+    }
+    let u = (dz * sx as f64 - dx * sz as f64) / den32;
+    (0.0..=1.0).contains(&u)
 }
 
 #[cfg(test)]
@@ -365,8 +399,10 @@ mod tests {
 
     const SCENE: &str = "GEOM_ELEMENT 4\r\n0 0 0\r\n1 0 0\t0 1 0\t0 0 1\r\n0 1162760003 0 0 -1 1 1 100\r\nGeometry Element\r\nTRIGGER_ELEMENT 5\r\n0 0 10\r\n1 0 0\t0 1 0\t0 0 1\r\n2 0 3.0 3.0 0.25 0.0 200.0 0 -1 -1 0 -1 3 0 0 0 0\r\n0 0 11.5\t0 0 8.5\r\n0 0 0 0\t2 0 0 -1\r\nStart\r\nTRIGGER_ELEMENT 5\r\n0 0 -10\r\n0 0 1\t0 1 0\t-1 0 0\r\n0 1 1.0 20.0 0.25 0.0 200.0 1 -1 -1 1 -1 3 0 1 0 0\r\n-10 0 -10\t10 0 -10\r\n0 0 0 0\t0 0 0 0\r\nWaypoint\r\nGEOM_ELEMENT 4\r\n0 0 -20\r\n1 0 0\t0 1 0\t0 0 1\r\n1 827806273 0 0 -1 0 1 41\r\nArrow 1\r\nTRIGGER_ELEMENT 5\r\n0 0 -30\r\n0 0 1\t0 1 0\t-1 0 0\r\n1 1 1.0 20.0 0.25 0.0 200.0 2 -1 -1 2 -1 -1 0 1 0 0\r\n-10 0 -30\t10 0 -30\r\n0 0 0 0\t0 0 0 0\r\nEnd\r\n";
 
-    fn sides(pos: Vec3) -> [(Vec3, Vec3); 2] {
-        [(pos + Vec3::new(-0.8, 0.0, 1.2), pos + Vec3::new(-0.8, 0.0, -1.2)), (pos + Vec3::new(0.8, 0.0, 1.2), pos + Vec3::new(0.8, 0.0, -1.2))]
+    /// A car at `pos` heading −z at 10 m/s, wheels FL, FR, RL, RR.
+    fn car(pos: Vec3) -> TriggerCar {
+        let w = |x: f32, z: f32| pos + Vec3::new(x, 0.0, z);
+        TriggerCar { position: pos, wheels: [w(-0.8, -1.2), w(0.8, -1.2), w(-0.8, 1.2), w(0.8, 1.2)], forward: Vec3::NEG_Z, velocity: Vec3::new(0.0, 0.0, -10.0), speed: 10.0 }
     }
 
     #[test]
@@ -378,20 +414,51 @@ mod tests {
         assert_eq!(st.initial_arrow(), Some(3));
         assert_eq!(st.cones.len(), 1);
         // crossing the finish line first does nothing (strict order)
-        let e = st.tick(500, Vec3::new(0.0, 0.0, -31.0), Vec3::new(0.0, 0.0, -29.0), &sides(Vec3::new(0.0, 0.0, -31.0)), false);
+        let e = st.tick(500, &car(Vec3::new(0.0, 0.0, -31.0)), false);
         assert!(e.is_empty());
-        let e = st.tick(600, Vec3::new(0.0, 0.0, -11.0), Vec3::new(0.0, 0.0, -9.0), &sides(Vec3::new(0.0, 0.0, -11.0)), false);
+        let e = st.tick(600, &car(Vec3::new(0.0, 0.0, -11.0)), false);
         assert_eq!(e, vec![SkillEvent::Checkpoint { sequence: 1, chime: true }]);
         assert_eq!(st.shown_arrow, Some(3));
-        let e = st.tick(700, Vec3::new(0.0, 0.0, -31.0), Vec3::new(0.0, 0.0, -29.0), &sides(Vec3::new(0.0, 0.0, -31.0)), false);
+        let e = st.tick(700, &car(Vec3::new(0.0, 0.0, -31.0)), false);
         assert_eq!(e, vec![SkillEvent::Finish { time_ticks: 700 - 448 }]);
         assert!(st.finished);
-        // the HUD's count: a flagged cone raises one event, and only when the count moves
-        st.cones[0].knocked = true;
-        let e = st.tick(800, Vec3::ZERO, Vec3::ZERO, &sides(Vec3::ZERO), false);
-        assert_eq!(e, vec![SkillEvent::ConeHit { count: 1 }]);
-        assert!(st.tick(802, Vec3::ZERO, Vec3::ZERO, &sides(Vec3::ZERO), false).is_empty());
-        assert_eq!(st.cones_knocked(), 1);
+    }
+
+    #[test]
+    fn the_hud_counts_the_moves_not_the_cones() {
+        let mut h = HudCones::default();
+        assert!(!h.frame(0));
+        // two cones flagged between two frames: one move, one penalty (0x429820 `inc`)
+        assert!(h.frame(2));
+        assert!(!h.frame(2));
+        assert!(h.frame(3));
+        assert_eq!(h, HudCones { last: 3, changes: 2 });
+    }
+
+    #[test]
+    fn the_trigger_gates_heading_travel_and_height() {
+        // the waypoint with `+0xC8` = +x: a car heading −z crosses it without firing (the 360-spin
+        // checkpoints of skidpad_st13 and the rest), one turned to +x fires it
+        let scene = Scene::parse(&SCENE.replacen("0 0 0 0\t0 0 0 0\r\nWaypoint", "0 0 0 0\t2 1 0 0\r\nWaypoint", 1)).unwrap();
+        let mut st = SkillTest::from_scene(&scene, "skidpad");
+        let at = Vec3::new(0.0, 0.0, -10.0);
+        assert!(st.tick(600, &car(at), false).is_empty());
+        let turned = TriggerCar { forward: Vec3::X, ..car(at) };
+        assert_eq!(st.tick(602, &turned, false), vec![SkillEvent::Checkpoint { sequence: 1, chime: true }]);
+        // `+0xBC` = −z: travelling +z does not fire the finish, travelling −z does
+        let scene = Scene::parse(&SCENE.replacen("0 0 0 0\t0 0 0 0\r\nEnd", "2 0 0 -1\t0 0 0 0\r\nEnd", 1)).unwrap();
+        let mut st = SkillTest::from_scene(&scene, "skidpad");
+        st.next_sequence = 2;
+        let at = Vec3::new(0.0, 0.0, -30.0);
+        assert!(st.tick(700, &TriggerCar { velocity: Vec3::new(0.0, 0.0, 10.0), ..car(at) }, false).is_empty());
+        assert!(st.tick(702, &car(at), false).contains(&SkillEvent::Finish { time_ticks: 702 - 448 }));
+        // the first diagonal's ends must be within 3.5 m of the line's height, inclusive
+        let mut st = SkillTest::from_scene(&Scene::parse(SCENE).unwrap(), "skidpad");
+        assert!(st.tick(600, &car(Vec3::new(0.0, 3.6, -10.0)), false).is_empty());
+        assert_eq!(st.tick(602, &car(Vec3::new(0.0, 3.5, -10.0)), false).len(), 1);
+        // 0x489CC0 takes the ends: a diagonal ending exactly on the line crosses it
+        assert!(segments_intersect_xz(Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.0, 0.0, 0.0), Vec3::new(-1.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)));
+        assert!(!segments_intersect_xz(Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.0, 0.0, -0.01), Vec3::new(-1.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)));
     }
 
     #[test]
@@ -399,32 +466,40 @@ mod tests {
         let scene = Scene::parse(SCENE).unwrap();
         let mut st = SkillTest::from_scene(&scene, "skidpad");
         st.time_ticks = Some(25 * 64);
-        st.cones[0].knocked = true;
-        let mut m = nfs_formats::career::parse_missions(&[0u8; 0xF0]).unwrap().remove(0);
+                let mut m = nfs_formats::career::parse_missions(&[0u8; 0xF0]).unwrap().remove(0);
         m.time_limit_s = Some(27);
         m.cone_rule = Some(ConeRule::PenaltySeconds(1));
         let clean = [0.0f32; 10];
-        assert_eq!(st.evaluate(&m, 1, &clean), (true, 26 * 64));
+        assert_eq!(st.evaluate(&m, 1, 1, &clean), (true, 26 * 64));
         m.cone_rule = Some(ConeRule::PenaltySeconds(3));
-        assert_eq!(st.evaluate(&m, 1, &clean).0, false, "25 + 3 s ≥ 27 s");
+        assert_eq!(st.evaluate(&m, 1, 1, &clean).0, false, "25 + 3 s > 27 s");
+        // 0x42952E: a time exactly on the limit passes
+        m.cone_rule = Some(ConeRule::PenaltySeconds(2));
+        assert_eq!(st.evaluate(&m, 1, 1, &clean), (true, 27 * 64));
         m.cone_rule = None;
         m.damage_limit_pct = Some(5);
-        assert!(!st.evaluate(&m, 1, &[7.0; 10]).0);
+        assert!(!st.evaluate(&m, 1, 1, &[7.0; 10]).0);
         // 0x434FA0 truncates after every add: 5.99 × 10 sums to 50, and 50 / 10 = 5 is not over 5
-        assert!(st.evaluate(&m, 1, &[5.99; 10]).0);
-        assert!(!st.evaluate(&m, 1, &[6.0; 10]).0);
+        assert!(st.evaluate(&m, 1, 1, &[5.99; 10]).0);
+        assert!(!st.evaluate(&m, 1, 1, &[6.0; 10]).0);
         m.damage_limit_pct = None;
         m.min_rank = Some(1);
-        assert!(st.evaluate(&m, 1, &clean).0 && !st.evaluate(&m, 2, &clean).0);
+        assert!(st.evaluate(&m, 1, 1, &clean).0 && !st.evaluate(&m, 2, 1, &clean).0);
+        // 0x4294BE: a rank rule skips the damage and cone-limit tests
+        m.damage_limit_pct = Some(5);
+        m.cone_rule = Some(ConeRule::Limit(0));
+        assert!(st.evaluate(&m, 1, 1, &[50.0; 10]).0);
+        m.damage_limit_pct = None;
+        m.cone_rule = None;
         // DNF makes any time limit fail
         m.min_rank = None;
         m.time_limit_s = Some(385);
         st.dnf = true;
         st.time_ticks = Some(99_999);
-        assert!(!st.evaluate(&m, 1, &clean).0);
+        assert!(!st.evaluate(&m, 1, 1, &clean).0);
         // never reached the finish: also a fail
         st.dnf = false;
         st.time_ticks = None;
-        assert!(!st.evaluate(&m, 1, &clean).0);
+        assert!(!st.evaluate(&m, 1, 1, &clean).0);
     }
 }

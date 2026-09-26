@@ -4,15 +4,19 @@
 //!
 //! The junction branch choice of `race-logic.md` §10.4 is in: once per junction the lookahead reaches,
 //! the car draws from the original's single global stream and picks a link, which every road preview
-//! then follows. Not yet reproduced:
-//! skill randomisation (fe.txt has all skills 1.0), the wet factor, and the tracker's
-//! `preferredSection` hop (the port's `find_slice` still hill-climbs). Avoidance (§3.2) follows the
-//! notes for the two cars directly ahead in race order.
+//! then follows (the tracker's `preferredSection` is passed on to `RaceProgress::update_tracked`).
+//! Avoidance (§3.2) follows the notes for the two cars directly after this one in race order, and
+//! the finish states (2 finished, 3 knocked out) are 0x40C5EE's.
+//!
+//! Re-read against 0x40CA20 / 0x40B650 / 0x40BFE0 instruction by instruction on 2026-09-26
+//! (`ai.md` "audit 2026-09-26"). Known gaps: the draws `Car_simulate` takes inside the physics crate
+//! other than the misfire and start-gear rolls use the vehicle's own stream; the race order is
+//! sorted this tick rather than at the end of the previous even tick (ties in registration order).
 
 use crate::race::{RaceProgress, SliceTable};
 use glam::Vec3;
 use nfs_formats::ais::{AiCarData, RacingLine};
-use nfs_physics::specs::{CarSpecs, GRIP_DRY};
+use nfs_physics::specs::{CarSpecs, GRIP_DRY, GRIP_WET};
 use nfs_physics::vehicle::{Controls, Vehicle};
 
 pub struct AiDriver {
@@ -30,15 +34,19 @@ pub struct AiDriver {
     pub k_steer: f32,
     pub k_angle: f32,
     pub stuck_ticks: u32,
-    /// `car+0xD8B = 5` from the facing test: the car is pointing back down the route at speed.
+    /// `car+0xD8B = 5` — the reset request of any of the three arms (0x40C959…0x40CA11)
     pub wrong_way: bool,
+    /// which arm raised it, for the log: "wrong way" (facing back, under 10 m/s), "stuck 5 s"
+    /// (`car+0xEA4 >= 0xA0`) or "dead car" (`car+0x1100 < 0x40`)
+    pub reset_why: Option<&'static str>,
     pub target_speed: f32,
     /// `.SKILL{SLOW,MEDIUM,FAST,DEFAULT}` means and `.SKILLRANGE*` half-ranges (§3.1); quick race
     /// uses 1.0 / 0 (fe.txt), career events `difficulty × per.mean[k]` / `per.range[k]` (0x4EBDA0).
     pub skill_mean: [f32; 4],
     pub skill_range: [f32; 4],
-    /// Current bend class (0 slow, 1 medium, 2 fast) and the personal speed factor drawn for it.
-    pub band: Option<u8>,
+    /// `car+0xE9C`, the current bend class (0 slow, 1 medium, 2 fast) — 0 from `0x406D50` at car
+    /// creation (0x406EE2), so a car whose first bend is slow keeps `car+0xEA0`'s initial 1.0
+    pub band: u8,
     /// `SKILL [0x6573F4]` 0..2 — the difficulty the catch-up band is keyed on
     pub skill: u8,
     /// `car+0xE94` — the junction node a branch was last chosen at, so it is chosen only once
@@ -49,9 +57,18 @@ pub struct AiDriver {
     pub preferred_segment: Option<usize>,
     /// the human's progress in laps and average pace, for the catch-up band (§5.2 rule 1)
     catchup: Option<(f32, f32)>,
+    /// `car+0xEA0`, the personal speed factor — 1.0 from `0x406D50` (0x406EA8)
     pub speed_factor: f32,
-    /// LCG state (`0x5D1028 *= 0x5D102C`, §3.1 random draws).
-    pub rng: u32,
+    /// The start-gear draw of this tick (0x40C051…0x40C09E), for `Vehicle::shift_roll`: taken from
+    /// the shared stream *here*, between the target-speed draws and `Car_simulate`'s misfire roll
+    pub shift_roll: Option<u32>,
+    /// `car+0x1078`, the knocked-out car's pull-over offset (metres, the original's slice frame) —
+    /// 0 from `0x406D50` (0x406D9A)
+    pull_over: f32,
+    /// The wet arm of the surface factor, set by the caller each tick: `[0x606AE0]` (the race load
+    /// 0x414DB0 sets it for `autobahn` only) and nothing overhead, `0x473330(car+8, car+0x330, 0) == 0`
+    /// (0x40BAF0…0x40BB13)
+    pub wet: bool,
     /// Road-width normaliser `[0x5E6E34]`: 12 by default, 10 on castle, 9 on forest (§10.4).
     pub wf_div: f32,
     /// Track name and direction for the per-track speed zones (`crate::zones`, 0x4A2DC0).
@@ -200,7 +217,7 @@ fn curve_factor_dir(track: &str, family: &str, backwards: bool) -> f32 {
 
 impl AiDriver {
     pub fn new(data: AiCarData, specs: &CarSpecs, sim_tail: &[f32; 22]) -> Self {
-        Self { data, bend_speed_base: [0.0; 40], grip_ratio: 1.0, k_lookahead: sim_tail[19], k_steer: sim_tail[20], k_steer_base: sim_tail[20], k_angle: sim_tail[21], stuck_ticks: 0, wrong_way: false, target_speed: 0.0, skill_mean: [1.0; 4], skill_range: [0.0; 4], band: None, skill: 0, catchup: None, last_node: None, link: None, preferred_segment: None, speed_factor: 1.0, rng: 0x1234_5679, wf_div: 12.0, track: String::new(), backwards: false, dbg_n: 0, dbg_offset: 0.0, dbg_dot: 0.0, dbg_facing: 0.0 }
+        Self { data, bend_speed_base: [0.0; 40], grip_ratio: 1.0, k_lookahead: sim_tail[19], k_steer: sim_tail[20], k_steer_base: sim_tail[20], k_angle: sim_tail[21], stuck_ticks: 0, wrong_way: false, reset_why: None, target_speed: 0.0, skill_mean: [1.0; 4], skill_range: [0.0; 4], band: 0, skill: 0, catchup: None, last_node: None, link: None, preferred_segment: None, speed_factor: 1.0, shift_roll: None, pull_over: 0.0, wet: false, wf_div: 12.0, track: String::new(), backwards: false, dbg_n: 0, dbg_offset: 0.0, dbg_dot: 0.0, dbg_facing: 0.0 }
             .tap(|d| {
                 // The curve factor is per track *and* per car class, so it cannot be applied here
                 // — `set_track` does it, over a pristine copy of the curve so that re-entering a
@@ -228,10 +245,13 @@ impl AiDriver {
         }
     }
 
-    /// Speed estimate `car+0x35C = max(|vx|,|vz|) + 0.25·min(|vx|,|vz|)` used by the AI.
+    /// Speed estimate `car+0x35C = max(|vx|,|vz|) + 0.25·min(|vx|,|vz|)` used by the AI — of the
+    /// **world** velocity `car+0x33C/+0x344` (0x49BEA9…0x49BF02), which is
+    /// [`Vehicle::horizontal_speed`]. *(Until the audit of 2026-09-26 this took the body-frame
+    /// components, which differ whenever the car is not heading along a world axis: the estimate
+    /// is not rotation-invariant.)*
     fn speed_est(v: &Vehicle) -> f32 {
-        let (a, b) = (v.v_local.x.abs(), v.v_local.z.abs());
-        a.max(b) + 0.25 * a.min(b)
+        v.horizontal_speed()
     }
 
     /// Career opponents: `SKILL[k] = difficulty × mean[k]`, `RANGE[k] = range[k]` (0x4EBDA0, CONFIRMED).
@@ -240,39 +260,62 @@ impl AiDriver {
             self.skill_mean[k] = difficulty * pairs[k][0];
             self.skill_range[k] = pairs[k][1];
         }
-        self.band = None;
-    }
-
-    /// Uniform draw in 0..1 (multiplicative LCG as in the original, low bits dropped).
-    fn rand01(&mut self) -> f32 {
-        self.rng = self.rng.wrapping_mul(0x0001_9660).wrapping_add(0x3C6E_F35F);
-        ((self.rng >> 8) & 0xFFFF) as f32 * 1.525_878_9e-5
     }
 
     /// Personal speed factor `car+0xEA0`: redrawn whenever the bend class changes (§3.1).
     /// Catch-up rubber band (`ai.md` §3.1 tail / §5.2 rule 1, CONFIRMED). `player_progress` is the
     /// human's progress in laps (`car+0xAF8`), `pace` the `(progress − start)·640000/tick` term.
-    /// At `SKILL` 0 the multiplier is 1.0, so the band does nothing — which is the shipped setting.
+    /// At `SKILL` 0 the multiplier is 1.0, so the band does nothing.
     pub fn set_catchup(&mut self, skill: u8, player_progress: f32, pace: f32) {
         self.skill = skill.min(2);
         self.catchup = Some((player_progress, pace));
     }
 
-    /// `0x5CC384` — how close in laps the opponent must be for the band to apply.
+    /// `0x5CC384` — how far in laps the opponent must be **ahead** of the human for the band to apply.
     const LAP_BAND: [f32; 3] = [1.0, 0.07, 0.03];
     /// `0x5CC378` — the target-speed multiplier once it does.
     const BAND_MULT: [f32; 3] = [1.0, 0.98, 0.95];
 
-    fn draw_speed_factor(&mut self, band: u8) {
-        if self.band == Some(band) {
-            return;
+    /// `mean + range·U(−1, 1)` exactly as 0x40BC70…0x40BCB3 builds it:
+    /// `(mean − range) + rand16 · 2·range · 2⁻¹⁶`, one draw from the game's single stream.
+    fn skill_draw(mean: f32, range: f32) -> f32 {
+        (mean - range) + crate::rng::rand16() as f32 * (range + range) * 1.525_878_9e-5
+    }
+
+    /// The personal speed factor `car+0xEA0` (0x40BC61…0x40BF1D, audit 2026-09-26). `c3` is the
+    /// **unrounded** `min(angle, 115)·⅓` (`[ebp−0x14]`): the band tests are `> 20` (0x40BCBD) and
+    /// `> 10` (0x40BDA0) on it.
+    ///
+    /// ```text
+    /// base = SKILLDEFAULT + SKILLRANGEDEFAULT·U        ; drawn EVERY tick (0x40BC61), used or not
+    /// band = c3 > 20 ? 0 : c3 > 10 ? 1 : 2
+    /// if band != car+0xE9C:
+    ///     r = rand16/65536                           ; 0x40BCDC / 0x40BDC0 / 0x40BE81
+    ///     car+0xEA0 = r <= SKILL[band] ? base        ; 0x40BD19 `test ah,0x41 / jne` -> 0x40BD85
+    ///                 : SKILL[band] + SKILLRANGE[band]·U        ; a third draw
+    ///     car+0xE9C = band
+    /// ```
+    ///
+    /// All three draws are the global stream `[0x5D1028]` (`crate::rng`), the one the branch
+    /// choice and `Car_simulate` pull from. *(Until this audit the port drew them from a per-car
+    /// LCG of its own — `0x19660/0x3C6EF35F` seeded by a slot hash, neither in the image — only on a
+    /// band change, and took the band value when `r <= SKILL[band]`: the opposite arm.)* With the
+    /// quick race's `SKILL* = 1.0` and ranges 0 every arm yields 1.0, so only the stream moves.
+    fn update_speed_factor(&mut self, c3: f32) {
+        let base = Self::skill_draw(self.skill_mean[3], self.skill_range[3]);
+        let band = if c3 > 20.0 {
+            0
+        } else if c3 > 10.0 {
+            1
+        } else {
+            2
+        };
+        if self.band != band {
+            let b = band as usize;
+            let r = crate::rng::rand01();
+            self.speed_factor = if r <= self.skill_mean[b] { base } else { Self::skill_draw(self.skill_mean[b], self.skill_range[b]) };
+            self.band = band;
         }
-        let r01 = self.rand01();
-        let u = |d: &mut Self| d.rand01() * 2.0 - 1.0;
-        let base = self.skill_mean[3] + self.skill_range[3] * u(self);
-        let b = band as usize;
-        self.speed_factor = if r01 <= self.skill_mean[b] { self.skill_mean[b] + self.skill_range[b] * u(self) } else { base };
-        self.band = Some(band);
     }
 
     /// `0x5CC390..0x5CC3A4` — the fixed fork thresholds for the two easier difficulties.
@@ -307,7 +350,8 @@ impl AiDriver {
             let w = table.junctions.segments[l.segment].weight[l.end];
             let take = if mode >= 2 {
                 cum += w;
-                r < cum
+                // 0x40B7E6 `fld r / fcomp cum / test ah,0x41 / jne take` — taken on `r <= cum`
+                r <= cum
             } else {
                 match matches {
                     2 => (r <= Self::FORK_T2[mode]) == (w >= 0.5),
@@ -341,17 +385,21 @@ impl AiDriver {
         let fwd0 = sl0.forward;
         let wf = ((sl0.width_a + sl0.width_b) / self.wf_div).min(1.0);
         let speed = Self::speed_est(v);
-        // round-to-nearest (fistp), lookahead in slices, heading loop inclusive (§10.5)
-        let idx = ((speed * 0.2 * self.k_lookahead).min(23.0).round() as usize).min(23);
-        let lookahead = self.data.lookahead[idx].max(0.0).round() as usize;
+        // round-to-nearest (fistp, ties to even), lookahead in slices, heading loop inclusive (§10.5)
+        let idx = ((speed * 0.2 * self.k_lookahead).min(23.0).round_ties_even() as usize).min(23);
+        // `L = fistp(f[idx])` (0x40B700); a lookahead under 2 runs no heading step at all
+        // (0x40B938 `cmp L, 2 / jl` skips the loop) — the port used to force one at k = 2
+        let lookahead = self.data.lookahead[idx].round_ties_even() as i32;
         let (mut max_l, mut max_r) = (0f32, 0f32);
         // §10.4: pick a branch once per junction, then let every road preview follow it
-        self.choose_branch(table, s0, lookahead as i32);
+        self.choose_branch(table, s0, lookahead);
         let link = self.link;
-        for k in 2..=lookahead.max(2) {
-            let s = table.add_graph(s0, k as i32, link);
+        for k in 2..=lookahead {
+            let s = table.add_graph(s0, k, link);
             let sl = &table.slices[s];
-            let a = sl.forward.dot(fwd0).clamp(-1.0, 1.0).acos().to_degrees();
+            // `acos(dot) · [0x5B2688]` (0x40B9F0…0x40B9F5), and that double is **57.29**, not
+            // 180/π = 57.2958 — the original's own truncated constant
+            let a = ((sl.forward.dot(fwd0).clamp(-1.0, 1.0) as f64).acos() * f64::from_bits(0x404C_A51E_C000_0000)) as f32;
             if sl.lateral.dot(fwd0) < 0.0 {
                 max_r = max_r.max(a);
             } else {
@@ -361,25 +409,44 @@ impl AiDriver {
         // per-track zone multiplier on the bend angle (0x4A2DC0 zones, ai.md §2.3)
         let zone = crate::zones::zone_mult(&self.track, self.backwards, s0);
         let ang = ((max_l + max_r) * self.k_angle * zone).min(115.0);
-        let c3 = (ang / 3.0) as usize;
+        // the curve index is `fistp(ang · [0x5B2680])` (0x40BAA8…0x40BAB4), [0x5B2680] = 0.33333334
+        // — rounded to nearest, not truncated: an angle of 13.6° reads f[24 + 5], not f[24 + 4]
+        let c3f = ang * f32::from_bits(0x3EAA_AAAB);
+        let c3 = c3f.round_ties_even() as usize;
         let mut vt = self.data.bend_speed[c3.min(39)];
         // the car's own steering damage slows it through the bend: `vt /= 1 + 0x493960(car) · [0x5B267C]`
         // (0x40BACE…0x40BAEA, `[0x5B267C]` = 0.0066667 = 1/150, `[0x5B24A8]` = 1.0) — the steering
         // figure `(zone2 + zone0)·0.5`, not the body mean `ai.md` §3 called it
         vt /= 1.0 + v.steering_damage() * f32::from_bits(0x3BDA_740E);
-        // surface factor from the car's surface (`car+0x464`): dry table row × class column, ≤ 1
-        // (off the tarmac the target drops to 0.5–0.85 of the curve — §3.1)
-        let surface = v.wheels[0].surface & 0xF;
-        vt *= GRIP_DRY[surface][specs.class].min(1.0);
+        // surface factor (0x40BAF0…0x40BC5B): the table row is the body's surface `car+0x464`
+        // (0x40BB1F / 0x40BBC2 — not a wheel's, which the port read until this audit), the column
+        // the tyre class `carSpecs+0x1C0`; the dry table 0x5D0D50 or, on the wet autobahn, 0x5D0E4C.
+        // Clamped to `[lo, 1]`, and the floor is per table and class (0x40BC37 0.8 dry, 0x40BBF7 0.6
+        // dry class 2, 0x40BB9B 0.7 wet, 0x40BB54 0.5 wet class 2) — the port had only the ceiling
+        let surface = v.surface_nibble() & 0xF;
+        let class = specs.class.min(2);
+        let (row, lo) = match (self.wet, class == 2) {
+            (false, false) => (&GRIP_DRY[surface], 0.8),
+            (false, true) => (&GRIP_DRY[surface], 0.6),
+            (true, false) => (&GRIP_WET[surface], 0.7),
+            (true, true) => (&GRIP_WET[surface], 0.5),
+        };
+        vt *= row[class].clamp(lo, 1.0);
         // personal speed factor per bend class (slow > 20, medium 10..20, fast ≤ 10)
-        let band = if c3 > 20 { 0 } else if c3 > 10 { 1 } else { 2 };
-        self.draw_speed_factor(band);
+        self.update_speed_factor(c3f);
         let mut vt = vt * self.speed_factor * wf;
-        // catch-up: a slow human close by holds the field back a little
+        // catch-up (0x40BF42…0x40BFC4, re-read 2026-09-26): an opponent that is **ahead** of the
+        // human by **more** than the lap band, while the human's average pace is **over** 35, is
+        // held back. Each test jumps past the multiply on `test ah,0x41 / jne`, i.e. when C0 or C3
+        // is set: 0x40BF85 skips when `|own − P| <= band`, 0x40BFAA when `pace <= 35`, and
+        // 0x40BFB7 (the signed `own − P` still on the stack, against 0) when `own − P <= 0`.
+        // *(The notes and the port had all three the other way round — "within the band, pace
+        // under 35, either side".)* Not in a network race (`[0x6573E8] == 3`, 0x40BF47), which
+        // runs no AI opponents in this port.
         if let Some((player_progress, pace)) = self.catchup {
-            let own = race.progress;
+            let d = race.progress - player_progress;
             let k = self.skill as usize;
-            if (own - player_progress).abs() < Self::LAP_BAND[k] && pace > 0.0 && pace < 35.0 {
+            if d.abs() > Self::LAP_BAND[k] && pace > 35.0 && d > 0.0 {
                 vt *= Self::BAND_MULT[k];
             }
         }
@@ -392,6 +459,10 @@ impl AiDriver {
         let vt = self.target_speed(table, race, v, specs);
         self.target_speed = vt;
         let g = v.gear.max(2).min(specs.gear_slots - 1);
+        // 0x40C051…0x40C0AB: still in neutral or reverse past tick 0x1C0, the car is put into 1st
+        // with a shift timer of `4 + (rand16·8 >> 16)` — one draw from the shared stream, taken
+        // after the pedal law and before the steering. `Vehicle::process_input` applies it.
+        self.shift_roll = (v.gear <= 1 && tick > 0x1C0).then(crate::rng::rand16);
         let ratio = specs.ratio_rpm_per_mps[g];
         let err = ratio * (vt - v.v_long());
         let mut throttle = ((err / specs.redline) * 256.0).clamp(0.0, 254.0) as u8;
@@ -409,7 +480,12 @@ impl AiDriver {
         let mut n = (self.k_steer * v.v_long()).abs() * 4.0 / 21.0;
         n = if wf < 1.0 { (n * wf).max(2.0) } else { n.max(4.0) };
         let speed = Self::speed_est(v);
-        if speed > 16.0 && tick > 0x380 {
+        // **below** 16 m/s, not above (audit 2026-09-26): 0x40C1AC `fld [car+0x35C]`,
+        // 0x40C1B2 `fcomp [0x5B26A8]` = 16.0, 0x40C1BA `test ah, 1` / 0x40C1BD `je 0x40C1D9` —
+        // the jump *past* the multiply is taken when C0 is clear, i.e. when the speed is 16 or
+        // more. So a slow car (after tick 0x380, 0x40C1BF `jle`) pulls its aim point in by
+        // `speed/16`; a fast one keeps `N`
+        if speed < 16.0 && tick > 0x380 {
             n *= speed * 0.0625;
         }
         let n = n as i32;
@@ -440,6 +516,20 @@ impl AiDriver {
                 }
             }
         }
+        // the finish states `car+0xB50` (0x40C5EE…0x40C850), after the avoidance and before the
+        // steering byte: 2 (finished) holds the brake; 3 (knocked out) pulls over
+        match v.race_state {
+            2 => {
+                throttle = 0;
+                brake = 0xFF;
+            }
+            3 => {
+                target = self.pull_over_target(table, s0, v);
+                throttle = 0;
+                brake = 0x28;
+            }
+            _ => {}
+        }
         let dir = (target - v.position).normalize_or_zero();
         let right = v.orientation.row(0);
         let steer = (dir.dot(right) * 256.0).round().clamp(-126.0, 126.0) as i32;
@@ -452,8 +542,10 @@ impl AiDriver {
         }
         let steer = if std::env::var_os("NFS_AI_FLIP").is_some() { -steer } else { steer };
         // the stuck counter `car+0xEA4` (0x40C934): one tick per control tick under 2 m/s once the
-        // race has started, cleared otherwise. Only the **alive** arm below reads it.
-        if v.v_long() < 2.0 && v.race_started {
+        // race has started, cleared otherwise — and cleared for a racing car (`car+0x52C & 1`,
+        // every opponent) that has finished or is out, `car+0xB50 >= 2` (0x40C922…0x40C932).
+        // Only the **alive** arm below reads it.
+        if v.v_long() < 2.0 && v.race_started && v.race_state < 2 {
             self.stuck_ticks += 1;
         } else {
             self.stuck_ticks = 0;
@@ -488,18 +580,45 @@ impl AiDriver {
         // `[0x657430]` arm is that same test (cb1ad65).
         let fwd = table.slices[s0].forward.normalize_or_zero();
         self.dbg_facing = fwd.dot(v.forward());
-        // the dead-car arm reads the same countdown 0x40F740 runs, which the port carries
-        self.wrong_way = v.race_started
-            && if v.engine_alive == 0 {
-                // the dead-car arm reads the same countdown 0x40F740 runs, which the port carries
-                v.reset_countdown < 0x40
-            } else if self.dbg_facing < -0.707 && v.horizontal_speed() < 10.0 {
-                true
-            } else {
-                // the stuck arm is the `elif`: it belongs to the alive car only
-                self.stuck_ticks >= 0xA0
-            };
+        // No race-start gate on the request itself (the counter has one, above): 0x40C959 goes
+        // straight to the arms. Its consumer 0x40F7EB wants the tick past 0x300, long after the
+        // start at 0x1C0, so nothing earlier can act on it.
+        self.reset_why = if v.engine_alive == 0 {
+            // the dead-car arm reads the same countdown 0x40F740 runs, which the port carries
+            (v.reset_countdown < 0x40).then_some("dead car")
+        } else if self.dbg_facing < -0.707 && v.horizontal_speed() < 10.0 {
+            Some("wrong way")
+        } else if self.stuck_ticks >= 0xA0 {
+            // the stuck arm is the `elif`, the alive car's only, and **it alone** clears the
+            // counter (0x40C9F1), whether or not the request then goes through
+            self.stuck_ticks = 0;
+            Some("stuck 5 s")
+        } else {
+            None
+        };
+        self.wrong_way = self.reset_why.is_some();
         Controls { throttle, brake, steer, handbrake: false, command: 0 }
+    }
+
+    /// A knocked-out car's aim point, `car+0xB50 == 3` (0x40C615…0x40C846, read 2026-09-26):
+    ///
+    /// ```text
+    /// n = clamp(fistp(car+0x35C) / 2, 1, 15)            ; the division truncates (cdq/sub/sar)
+    /// s = addSlices(s0, backwards ? -n : n, car+0xE98)
+    /// if car+0x1078 > 0:  car+0x1078 = max(car+0x1078, +0x4C·+0x3C of s)          ; side B
+    /// elif car+0x1078 < 0: car+0x1078 = min(car+0x1078, −(+0x48·+0x38) of s)      ; side A
+    /// else:  c = cross(lat[s0], lat[s]).y · (backwards ? −1 : 1)                   ; 0x532880 = a × b
+    ///        e = c < 0 ? +0x4C·+0x3C : −(+0x48·+0x38)
+    ///        car+0x1078 = |e| <= 5 ? e·10/|e| : 2·e                              ; 0x40C7E3 / 0x40C7F0
+    /// T = slice[s].pos + car+0x1078 · normalize(slice[s].lat)
+    /// ```
+    ///
+    /// `car+0x1078` is 0 from `0x406D50` (0x406D9A), so the side is chosen once, on the first
+    /// knocked-out tick, and only ever widened. The formula is in the original's slice frame;
+    /// the port's reversed table negates `lateral` and swaps the A/B fields, which is undone here.
+    /// *(`ai.md` §3.2 had the scale the other way round — "~10 m, 2× if edge ≤ 5".)*
+    fn pull_over_target(&mut self, table: &SliceTable, s0: usize, v: &Vehicle) -> Vec3 {
+        pull_over_target(table, s0, self.link, self.backwards, v.horizontal_speed(), &mut self.pull_over)
     }
 
     /// Every reset clears the branch latch, as the original's do: `car+0xE94 = 0` (the node a branch
@@ -523,13 +642,40 @@ impl AiDriver {
             return false;
         }
         if self.wrong_way {
-            self.stuck_ticks = 0;
+            // `car+0xD8B = 0` at the next pass (0x40C946…0x40C952); the counter is not touched
+            // here — only the stuck arm clears it (0x40C9F1). *(The port used to clear it on the
+            // facing and dead-car arms too.)*
             self.wrong_way = false;
             true
         } else {
             false
         }
     }
+}
+
+/// [`AiDriver::pull_over_target`]'s arithmetic, with `car+0x35C` as `speed` and `car+0x1078` as
+/// `offset`.
+fn pull_over_target(table: &SliceTable, s0: usize, link: Option<usize>, bw: bool, speed: f32, offset: &mut f32) -> Vec3 {
+    let n = ((speed.round_ties_even() as i32) / 2).clamp(1, 15);
+    let s = table.add_graph(s0, n, link);
+    let (sl0, sl) = (&table.slices[s0], &table.slices[s]);
+    // the original's side A / side B of slice `s`
+    let (lanes_a, lanes_b, lw_a, lw_b) = if bw { (sl.lanes_b, sl.lanes_a, sl.lane_width_b, sl.lane_width_a) } else { (sl.lanes_a, sl.lanes_b, sl.lane_width_a, sl.lane_width_b) };
+    let side_b = lw_b * lanes_b as f32;
+    let side_a = -(lw_a * lanes_a as f32);
+    if *offset > 0.0 {
+        *offset = offset.max(side_b);
+    } else if *offset < 0.0 {
+        *offset = offset.min(side_a);
+    } else {
+        // the cross product is the same in both frames (both laterals are negated)
+        let c = sl0.lateral.cross(sl.lateral).y * if bw { -1.0 } else { 1.0 };
+        let e = if c < 0.0 { side_b } else { side_a };
+        *offset = if e.abs() <= 5.0 { e * (10.0 / e.abs()) } else { e * 2.0 };
+    }
+    // back into the port's frame: the original's lateral is the port's negated when backwards
+    let lat_o = if bw { -sl.lateral } else { sl.lateral };
+    sl.centre + lat_o.normalize_or_zero() * *offset
 }
 
 trait Tap: Sized {
@@ -660,5 +806,72 @@ mod curve_factor_tests {
         assert_eq!(curve_factor_dir("monaco3", "356", false), 1.2);
         assert_eq!(curve_factor_dir("monaco3", "356", true), 1.15);
         assert_eq!(curve_factor_dir("monaco3", "944", true), 1.2);
+    }
+}
+
+#[cfg(test)]
+mod pull_over_tests {
+    use super::pull_over_target;
+    use crate::race::{Section, Slice, SliceTable, SLICE_SPACING};
+    use glam::Vec3;
+
+    /// A straight road along +z, side A narrow (1 lane of 2 m) and side B wide (2 lanes of 4 m).
+    fn straight() -> SliceTable {
+        let slices = (0..64)
+            .map(|i| Slice {
+                centre: Vec3::new(0.0, 0.0, i as f32 * SLICE_SPACING),
+                up: Vec3::Y,
+                forward: Vec3::Z,
+                lateral: Vec3::X,
+                lane_mask: 0,
+                lanes_a: 1,
+                lanes_b: 2,
+                width_a: 6.0,
+                width_b: 11.0,
+                lane_width_a: 2.0,
+                lane_width_b: 4.0,
+            })
+            .collect();
+        SliceTable::build(slices, vec![Section { first: 0, last: 63, f0: 0.0, f1: 1.0 }])
+    }
+
+    /// On a straight the cross product is 0, so the car goes to side A — and side A's 2 m is
+    /// under 5, so the offset is scaled to 10 m (0x40C7F8…0x40C809), not doubled.
+    #[test]
+    fn a_straight_pulls_over_to_side_a_at_ten_metres() {
+        let t = straight();
+        let mut off = 0.0;
+        // 20 m/s → n = 10 slices ahead
+        let p = pull_over_target(&t, 5, None, false, 20.0, &mut off);
+        assert_eq!(off, -10.0);
+        let s = t.add_graph(5, 10, None);
+        assert!((p - (t.slices[s].centre - Vec3::new(10.0, 0.0, 0.0))).length() < 1e-4, "{p}");
+        // the chosen side is then only widened: side A is −2, so min(−10, −2) keeps −10
+        pull_over_target(&t, 5, None, false, 20.0, &mut off);
+        assert_eq!(off, -10.0);
+    }
+
+    /// A positive offset grows to side B (0x40C6C6…0x40C6E7).
+    #[test]
+    fn an_offset_only_widens() {
+        let t = straight();
+        let mut off = 3.0;
+        pull_over_target(&t, 5, None, false, 0.0, &mut off);
+        assert_eq!(off, 8.0, "max(3, 4·2)");
+    }
+
+    /// Backwards the port's table is reversed (lateral negated, A/B swapped), so the original's
+    /// side A of a slice is the port's side B: the same world point comes out.
+    #[test]
+    fn backwards_lands_on_the_originals_side() {
+        let t = straight().reversed();
+        let mut off = 0.0;
+        // c = 0·(−1) = −0: not below 0, so the original's side A — its 1 lane of 2 m → −10
+        let s0 = 40;
+        let p = pull_over_target(&t, s0, None, true, 20.0, &mut off);
+        assert_eq!(off, -10.0);
+        // the original's lateral is +x, so the point is 10 m to −x of the slice 10 ahead
+        let s = t.add_graph(s0, 10, None);
+        assert!((p - (t.slices[s].centre - Vec3::new(10.0, 0.0, 0.0))).length() < 1e-4, "{p}");
     }
 }

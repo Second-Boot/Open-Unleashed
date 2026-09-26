@@ -592,11 +592,14 @@ pub fn parse_missions(data: &[u8]) -> Result<Vec<Mission>, FormatError> {
                 opponents.push((per, car));
             }
         }
+        // 0x4EC102…0x4EC151: `CONEIMIT` takes `+0xCC` only for kind 0 and `CONEPENALTY` `+0xCE`
+        // only for kind 1 (`cmp word [+0xCA], 0 / 1`); any other kind leaves both −1
         let cone_rule = if r[0xC8] != 0 {
-            Some(match u16_le(r, 0xCA, what)? {
-                0 => ConeRule::Limit(u16_le(r, 0xCC, what)?),
-                _ => ConeRule::PenaltySeconds(u16_le(r, 0xCE, what)?),
-            })
+            match u16_le(r, 0xCA, what)? {
+                0 => Some(ConeRule::Limit(u16_le(r, 0xCC, what)?)),
+                1 => Some(ConeRule::PenaltySeconds(u16_le(r, 0xCE, what)?)),
+                _ => None,
+            }
         } else {
             None
         };
@@ -692,8 +695,9 @@ impl TrackRecordFile {
             for k in 0..RECORD_SLOTS {
                 let e = self.slot(t, k);
                 if u32::from_le_bytes([self.raw[e + 0x48], self.raw[e + 0x49], self.raw[e + 0x4A], self.raw[e + 0x4B]]) == 0 {
-                    self.raw[e..e + 20].fill(0);
-                    self.raw[e..e + 3].copy_from_slice(b"n/a");
+                    // `strcpy(e, "n/a")` (0x4FAF41…0x4FAF67): four bytes, the rest of the
+                    // 20-byte name left as it was
+                    self.raw[e..e + 4].copy_from_slice(b"n/a\0");
                     self.raw[e + 0x48..e + 0x4C].copy_from_slice(&NO_RECORD_TIME.to_le_bytes());
                 }
             }
@@ -720,25 +724,106 @@ impl TrackRecordFile {
     /// The driver name is a plain `strcpy` into the 20-byte field (0x4FB0BF); the car name is
     /// `strncpy(slot+0x14, car, 0x11)` followed by `slot[0x25] = 0` (0x4FB0AB/0x4FB0E8), so only the
     /// first **17** characters of a car name are ever stored even though the field is 52 bytes.
+    ///
+    /// Byte for byte (2026-09-26): the compare is `jl`, signed (0x4FB006); the shift moves each
+    /// row with the time dword and two `strcpy`s, driver then car (0x4FB03F…0x4FB09D), and the new
+    /// row gets its time, `strcpy` of the driver and the `strncpy` of the car over whatever the
+    /// slot held — no field is cleared, so bytes past a terminator stay as they were. *(Until this
+    /// date the port copied whole rows and zeroed the new one, and clipped the driver to 19.)* A
+    /// driver name that runs past the 0x48 bytes before the time is cut there (APPROXIMATION: the
+    /// original's `strcpy` would run on into the time it had just stored).
+    ///
+    /// An id no record carries is **not** refused: the search loop 0x4FAFDD…0x4FAFEB falls out
+    /// with `edi` still the table base `[0x691CE8]` and 0x4FAFED adds 0x1B0 to that, so the time
+    /// goes into **record 0**'s table. *(Until 2026-09-26 the port returned `None`.)* With no
+    /// record at all the original would write past its empty buffer; the port refuses that.
     pub fn insert(&mut self, id: u16, driver: &str, car: &str, time: u32) -> Option<usize> {
-        let t = self.index_of(id)?;
-        let times: Vec<u32> = self.entries(t).iter().map(|e| e.time).collect();
-        let k = times.iter().position(|e| time < *e)?;
-        for j in (k + 1..RECORD_SLOTS).rev() {
-            let (dst, src) = (self.slot(t, j), self.slot(t, j - 1));
-            let row = self.raw[src..src + SLOT_STRIDE].to_vec();
-            self.raw[dst..dst + SLOT_STRIDE].copy_from_slice(&row);
+        if self.count() == 0 {
+            return None;
         }
-        let e = self.slot(t, k);
-        self.raw[e..e + SLOT_STRIDE].fill(0);
-        let put = |raw: &mut [u8], at: usize, len: usize, s: &str| {
-            for (i, b) in s.chars().map(|c| c as u32 as u8).take(len - 1).enumerate() {
+        let t = self.index_of(id).unwrap_or(0);
+        let times: Vec<u32> = self.entries(t).iter().map(|e| e.time).collect();
+        let k = times.iter().position(|e| (time as i32) < (*e as i32))?;
+        // `strcpy(raw[dst..], bytes)` kept inside the row's 0x48 bytes of text
+        fn strcpy(raw: &mut [u8], row: usize, at: usize, bytes: &[u8]) {
+            let end = row + 0x48;
+            for (i, b) in bytes.iter().copied().chain(std::iter::once(0)).enumerate() {
+                if at + i >= end {
+                    break;
+                }
                 raw[at + i] = b;
             }
-        };
-        put(&mut self.raw, e, 20, driver);
-        put(&mut self.raw, e + 0x14, 0x12, car);
+        }
+        let cstr = |raw: &[u8], at: usize, end: usize| -> Vec<u8> { raw[at..end].iter().copied().take_while(|b| *b != 0).collect() };
+        for j in (k + 1..RECORD_SLOTS).rev() {
+            let (dst, src) = (self.slot(t, j), self.slot(t, j - 1));
+            let tm = self.raw[src + 0x48..src + 0x4C].to_vec();
+            self.raw[dst + 0x48..dst + 0x4C].copy_from_slice(&tm);
+            let d = cstr(&self.raw, src, src + 0x48);
+            strcpy(&mut self.raw, dst, dst, &d);
+            let c = cstr(&self.raw, src + 0x14, src + 0x48);
+            strcpy(&mut self.raw, dst, dst + 0x14, &c);
+        }
+        let e = self.slot(t, k);
         self.raw[e + 0x48..e + 0x4C].copy_from_slice(&time.to_le_bytes());
+        let d: Vec<u8> = driver.chars().map(|c| c as u32 as u8).collect();
+        strcpy(&mut self.raw, e, e, &d);
+        // strncpy(slot+0x14, car, 0x11): up to 17 bytes, zero-padded to 17 when shorter
+        let c: Vec<u8> = car.chars().map(|c| c as u32 as u8).take(0x11).collect();
+        for i in 0..0x11 {
+            self.raw[e + 0x14 + i] = c.get(i).copied().unwrap_or(0);
+        }
+        self.raw[e + 0x25] = 0;
         Some(k)
+    }
+}
+
+#[cfg(test)]
+mod track_record_tests {
+    use super::*;
+
+    /// 0x4FAE20's fixup is a `strcpy` of `"n/a"`: four bytes, the rest of the name untouched.
+    #[test]
+    fn the_empty_slot_fixup_writes_only_the_string() {
+        let mut d = vec![0u8; TRACK_RECORD_SIZE];
+        d[SLOTS_AT..SLOTS_AT + 8].copy_from_slice(b"Longname");
+        let f = TrackRecordFile::load(&d).unwrap();
+        assert_eq!(&f.raw[SLOTS_AT..SLOTS_AT + 8], b"n/a\0name");
+        assert_eq!(f.entries(0)[0].time, NO_RECORD_TIME);
+    }
+
+    /// 0x4FAFC0 moves rows with `strcpy`s and writes the new one over the old bytes: whatever
+    /// follows a terminator stays.
+    #[test]
+    fn an_insert_leaves_the_bytes_past_each_terminator() {
+        let mut d = vec![0u8; TRACK_RECORD_SIZE];
+        d[0..2].copy_from_slice(&8u16.to_le_bytes());
+        for k in 0..RECORD_SLOTS {
+            let e = SLOTS_AT + k * SLOT_STRIDE;
+            d[e..e + 8].copy_from_slice(b"Speedkng");
+            d[e + 0x14..e + 0x14 + 9].copy_from_slice(b"356 B Car");
+            d[e + 0x48..e + 0x4C].copy_from_slice(&(1000 * (k as u32 + 1)).to_le_bytes());
+        }
+        let mut f = TrackRecordFile::load(&d).unwrap();
+        assert_eq!(f.insert(8, "Hans", "911", 500), Some(0));
+        let e = SLOTS_AT;
+        assert_eq!(&f.raw[e..e + 9], b"Hans\0kng\0", "strcpy over the old name");
+        assert_eq!(&f.raw[e + 0x14..e + 0x14 + 0x12], b"911\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", "strncpy pads to 17, then +0x25 = 0");
+        assert_eq!(f.entries(0)[1].driver, "Speedkng");
+        assert_eq!(f.entries(0)[7].time, 7000, "the slowest dropped off");
+        assert_eq!(f.insert(8, "Hans", "911", 0x8000_0000), Some(0), "the compare is signed (jl): past i32::MAX a time is negative");
+    }
+
+    /// 0x4FAFED: an id no record has falls through to record 0.
+    #[test]
+    fn an_unknown_track_id_goes_into_record_0() {
+        let mut d = vec![0u8; 2 * TRACK_RECORD_SIZE];
+        d[0..2].copy_from_slice(&8u16.to_le_bytes());
+        d[TRACK_RECORD_SIZE..TRACK_RECORD_SIZE + 2].copy_from_slice(&9u16.to_le_bytes());
+        let mut f = TrackRecordFile::load(&d).unwrap();
+        assert_eq!(f.insert(77, "Hans", "911", 500), Some(0));
+        assert_eq!(f.entries(0)[0].time, 500, "record 0 took it");
+        assert_eq!(f.entries(1)[0].time, NO_RECORD_TIME, "record 1 untouched");
+        assert_eq!(TrackRecordFile::load(&[]).map(|mut e| e.insert(8, "Hans", "911", 1)).ok().flatten(), None);
     }
 }
