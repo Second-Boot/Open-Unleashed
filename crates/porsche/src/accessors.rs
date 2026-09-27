@@ -99,8 +99,10 @@ impl App {
             // record: `ENDERAHEADER` is `FEStrings[[rec+0x24]]` (0x506389) and `ENDERADESCRIP`
             // `FEStrings[[rec+0x28]]` (0x5063DE), and +0x24 and +0x28 are the port's
             // `title_string_id` and `description_string_id`. The record is what
-            // `0x504990(0x504800())` returns; the port takes the era's hidden finale, which its
-            // own `visibility == 2` marks.
+            // `0x504990(0x504800())` returns (`Career::completed_era`, `finale_record`): the
+            // finale of the highest **completed** era, not the one the player is now in.
+            // *(Until 2026-09-27 the port took the current era's, so after the Classic era's
+            // last race `VictoryMessage` offered the Golden era's "935 Trophy".)*
             // the price of the car the dealer screen is on: 0x5062FC takes `DealerCar.Car`, asks it
             // for the record (vtable +0x90), runs it through the age curve 0x4EE220 — which is the
             // port's own `dealer_price` — and prints the result with 0x4DBF80's thousands commas.
@@ -114,8 +116,7 @@ impl App {
             }
             "Tournament.Data" if matches!(modifier, "ENDERAHEADER" | "ENDERADESCRIP") => {
                 let c = self.career.as_ref()?;
-                let list = c.tables.era_tournaments(c.career.era);
-                let t = list.iter().find(|t| t.visibility == 2).or_else(|| list.last())?;
+                let t = c.tables.finale_record(c.career.completed_era(&c.tables))?;
                 let id = if modifier == "ENDERAHEADER" { t.title_string_id } else { t.description_string_id };
                 self.fe.strings.get(id)?.to_string()
             }
@@ -553,6 +554,9 @@ impl App {
                 let m = menu?;
                 let c = nfs_game::opponents::OpponentChoice::from_index(m.opp_car as u32);
                 self.fe.strings.get(c.string_id())?.to_string()
+            }
+            "PrizeCars.Car" if let Some(car) = self.prize_car() => {
+                if modifier == "SHORT" { car.family.to_string() } else { car.display_name.to_string() }
             }
             "zMergedList.Car" | "PrizeCars.Car" => match menu {
                 _ if !matches!(modifier, "" | "SHORT") => return None,

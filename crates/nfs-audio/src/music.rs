@@ -123,6 +123,28 @@ impl Settings {
         }
     }
 
+    /// The race pause 0x4AB150 ends by copying the registry variables `[0x657CA0…0x657CB0]` into
+    /// the live levels `[0x5D1740…0x5D1750]` (0x4AB1BF…0x4AB1F1), the resume 0x4AB200 the live
+    /// ones back (0x4AB22F…0x4AB263). They differ only while `I_SFX` has the effects off — the
+    /// registry then keeps the four levels and the live ones are 0 — so **a pause brings the
+    /// effects back** and the resume leaves them on, `[0x656840]` still clear: the next F10 press
+    /// copies the registry back (no change) and sets it. The music level is its own registry value.
+    pub fn pause_levels(&mut self, saved: &Option<[u8; 4]>) {
+        if let Some([sfx, engine, speech, ambient]) = *saved {
+            self.sfx_level = sfx;
+            self.engine_level = engine;
+            self.speech_level = speech;
+            self.ambient_level = ambient;
+        }
+    }
+
+    /// The resume's half of [`Self::pause_levels`]: the registry takes the live levels.
+    pub fn resume_levels(&self, saved: &mut Option<[u8; 4]>) {
+        if saved.is_some() {
+            *saved = Some([self.sfx_level, self.engine_level, self.speech_level, self.ambient_level]);
+        }
+    }
+
     /// Read `fe.txt` from the game root through the shared registry reader.
     pub fn load(game_root: &Path) -> Self {
         let r = nfs_formats::fetxt::Registry::load(game_root);
@@ -181,8 +203,11 @@ impl MusicPlayer {
         Ok(Self {
             dir: music_dir.to_path_buf(),
             names,
-            saved: playlist.clone(),
-            playlist,
+            saved: playlist,
+            // `MusicInit` 0x4AE100 (once, from main's 0x4A6840 at 0x4B6B09) zeroes the list's
+            // length `+8` (0x4ADFA5): nothing is listed until the race start's `MusicSetPlaylist`
+            // or a front-end pattern fills it
+            playlist: Vec::new(),
             pos: 0,
             shuffle: settings.shuffle,
             front_end: false,
@@ -237,6 +262,29 @@ impl MusicPlayer {
         }
         self.pos = if n == 1 { 0 } else { (self.rand() % (n - 1) + self.pos + 1) % n };
         self.play_current(out);
+    }
+
+    /// **`MusicPlay(NULL, 0)`** 0x4AE4D0 alone, over the list as it stands — what the race pause's
+    /// resume 0x4AB200 calls (0x4AB222), with no `MusicSetPlaylist` before it and no replay test:
+    /// nothing with the volume `+0` at 0 or an empty list, else position 0 of a one-song list or
+    /// any entry but the current one. The list is the race's (with a jingle `MusicPlay(…, 1)`
+    /// appended), a `STARTREPLAY` playback's the front end's last pattern, and a command-line
+    /// playback's none (`MusicInit`'s, a playback skipping `MusicSetPlaylist`, 0x4A8A4A).
+    /// Returns whether a song was started.
+    pub fn play_next(&mut self, out: &AudioOutput) -> bool {
+        let n = self.playlist.len();
+        if n == 0 || (self.trim * self.level as u32) >> 7 == 0 {
+            tracing::info!(listed = n, "MusicPlay(NULL, 0): no playlist or no volume, nothing plays");
+            return false;
+        }
+        self.pos = Self::next_pos(n, self.pos, self.rand());
+        self.play_current(out);
+        true
+    }
+
+    /// `MusicPlay`'s mode 0 with no pattern (§8.3): 0 for one song, else `(r % (n − 1) + cur + 1) % n`.
+    fn next_pos(n: usize, cur: usize, r: usize) -> usize {
+        if n == 1 { 0 } else { (r % (n - 1) + cur + 1) % n }
     }
 
     /// `MusicPlay(pattern, mode)`: rebuild the playlist from a name pattern. Mode 1 appends the pick to
@@ -339,7 +387,7 @@ impl MusicPlayer {
         if self.pending.is_none()
             && let Some(m) = &self.current
         {
-            out.fade(m.voice, 500, 0.0);
+            out.fade(m.voice, 500, 0);
         }
         // the draw is taken only on the way to a new song of a longer list (0x4AD87E)
         let draw = if !self.advanced && self.playlist.len() > 1 { draw() } else { 0 };
@@ -432,6 +480,69 @@ impl Music {
 mod tests {
     use super::*;
 
+    /// A bare `MusicPlayer` with no on-disk `zzzymus.viv` (bypassing `MusicPlayer::new`'s file
+    /// read) — `names` only needs to be long enough for `playlist`'s and `saved`'s indices.
+    fn bare(playlist: Vec<usize>, saved: Vec<usize>) -> MusicPlayer {
+        MusicPlayer {
+            dir: PathBuf::new(),
+            names: vec!["a".into(), "b".into()],
+            playlist,
+            saved,
+            pos: 0,
+            shuffle: false,
+            front_end: false,
+            level: 127,
+            trim: 52,
+            current: None,
+            rng: 1,
+            advanced: false,
+            pending: None,
+        }
+    }
+
+    #[test]
+    fn playsong_with_no_current_song_does_not_reset_the_playlist() {
+        // 0x5120D0's `None` arm (0x4BEB40 found no current entry, returning 0) calls
+        // `MusicPlay(NULL, 0)` — 0x4AE4D0 with the candidate pool exhausted (`[edx+8] == 0`,
+        // 0x4ae61c…0x4ae898) does **nothing**: no refill, no `MusicSetPlaylist`, `[edx+8]` stays 0.
+        // `MusicPlayer::play_next` (the port's rule for this call, matched 2026-09-27, §18.12) must
+        // leave an exhausted `playlist` empty and report no song started — unlike `start_race`
+        // (the port's rule for `AudioLoadTrack`'s own `MusicPlay(NULL, 0)` after `MusicSetPlaylist`
+        // rebuilds the list from `saved`), which is what the port's `PLAYSONG` handler wrongly
+        // called here before this fix.
+        let Ok(out) = AudioOutput::new() else { return }; // no audio device on this host
+        let mut exhausted = bare(vec![], vec![0, 1]);
+        assert!(!exhausted.play_next(&out), "no candidates left: MusicPlay(NULL, 0) plays nothing");
+        assert!(exhausted.playlist.is_empty(), "play_next never refills from `saved`");
+
+        // Contrast: `start_race` (the wrong call the port's `PLAYSONG` used to make for this arm)
+        // rebuilds the list from `saved` and would have picked from it — the divergence this test
+        // guards against regressing.
+        let mut same_state = bare(vec![], vec![0, 1]);
+        same_state.start_race(&out);
+        assert_eq!(same_state.playlist, vec![0, 1], "start_race resets the list from `saved` — not PLAYSONG's rule");
+    }
+
+    #[test]
+    fn a_pause_brings_the_effects_back_after_f10() {
+        let mut s = Settings { sfx_level: 100, engine_level: 90, speech_level: 80, ambient_level: 70, ..Settings::default() };
+        let mut saved = None;
+        // no F10: the pause's and the resume's copies change nothing
+        s.pause_levels(&saved);
+        s.resume_levels(&mut saved);
+        assert_eq!((s.sfx_level, saved), (100, None));
+        // F10 off (0x4AB529…0x4AB56F), then a pause: live := registry (0x4AB1BF…0x4AB1F1)
+        s.toggle_effects(&mut saved);
+        assert_eq!((s.sfx_level, s.ambient_level), (0, 0));
+        s.pause_levels(&saved);
+        assert_eq!([s.sfx_level, s.engine_level, s.speech_level, s.ambient_level], [100, 90, 80, 70]);
+        s.resume_levels(&mut saved);
+        assert_eq!(saved, Some([100, 90, 80, 70]));
+        // `[0x656840]` still clear: the next F10 copies the registry back — on, no change
+        s.toggle_effects(&mut saved);
+        assert_eq!((s.sfx_level, saved), (100, None));
+    }
+
     #[test]
     fn patterns_select_the_right_groups() {
         let names = ["game13-Activator-Morphadron", "vic01-Congrats-CaptainGinger", "lose01-Aquadelic-Captain Ginger", "menu02-Aircon-Cypher", "win04-Victory-Cypher"];
@@ -485,6 +596,15 @@ mod toggle_tests {
         s.toggle_effects(&mut saved);
         assert_eq!((s.sfx_level, s.engine_level, s.speech_level, s.ambient_level), (100, 90, 80, 70));
         assert_eq!(saved, None);
+    }
+
+    #[test]
+    fn the_resume_picks_any_other_entry_of_the_list_as_it_stands() {
+        for r in 0..20 {
+            let p = MusicPlayer::next_pos(12, 11, r);
+            assert!(p < 12 && p != 11, "{r} -> {p}");
+        }
+        assert_eq!(MusicPlayer::next_pos(1, 0, 7), 0);
     }
 
     #[test]

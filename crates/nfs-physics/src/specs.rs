@@ -18,40 +18,85 @@ pub struct InstalledPart {
     pub mask: [bool; 10],
     /// `1.5 − 0.005·part+0x60` (the condition %), `[0x5B246C]` / `[0x5B3284]`.
     pub scale: f32,
-    /// `part+0x164`, the damage the part carries from earlier races (`Car_raceInit` 0x41085F).
+    /// `part+0x164` as the race reads it: [`Self::carried`] less the unfold of the body damage
+    /// the car brought in ([`Self::unfold`]).
     pub state: f32,
+    /// `carInfo+0x78 + 4i` (`.PARTDAMAGE`), what `Car_raceInit` copies into `part+0x164`
+    /// (0x41085F…0x410886) — the owned part's saved damage, which already holds the fold of the
+    /// zones the car brings in.
+    pub carried: f32,
 }
 
 impl InstalledPart {
     pub fn new(kind: u16, mask: [bool; 10], condition: f32, state: f32) -> Self {
-        Self { kind, mask, scale: 1.5 - 0.005 * condition, state }
+        Self { kind, mask, scale: 1.5 - 0.005 * condition, state, carried: state }
+    }
+
+    /// **`0x493CF0(car, 1)`** at 0x41088B, the end of `Car_raceInit` — every pass, so the live race,
+    /// a restart and the automatic replay alike (`Cars_resetAll` 0x4110A0 → 0x4110D7): for a part of
+    /// type 1…10 (`test ax, ax; jle` / `cmp ax, 0xB; jge`, 0x493D0D…0x493D1A) the scale is negated
+    /// (`fchs`, 0x493D37) and `part+0x164 = mean·(−scale) + carried` (0x493D6F…0x493D7D), with no
+    /// clamp and no copy to `car+0xC48` (the `jne` at 0x493D85). `mean` is over the part's own mask
+    /// of the zones `car+0x4E4` the car starts with (`.DAMAGEZONES`, 0x41083A). The race-over fold
+    /// `0x493CF0(car, 0)` adds the end zones' back, so a part gains only what this race's damage
+    /// adds (`Career::record_damage`). A part of another type keeps `carried`.
+    pub fn unfold(&mut self, mean: f32) {
+        self.state = if (1..=10).contains(&self.kind) { mean * -self.scale + self.carried } else { self.carried };
     }
 }
 
-/// The part list a car races with when nothing fills [`CarSpecs::parts`] — a quick race, an
-/// opponent, a cop, the traffic. **APPROXIMATION** (MEDIUM): the original always has twenty part
-/// pointers at `car+0x768` (the FE car object's stock copies), which the port does not build
-/// outside the career. These are one part per getter with the masks of the standard parts of a
-/// rear-engined 911 in `nfs5.prt` (brakes / suspension / tyres on the four corners, engine and
-/// gearbox at the rear, aero front and rear), `scale` 1.5 and no carried state — what the port's
-/// one-mask-per-group model (`ZoneMasks` / `PartWear`, until 2026-09-26) used, kept so a race
-/// without a career car behaves as before.
+/// The part list a car races with when nothing better fills [`CarSpecs::parts`] and
+/// [`stock_parts`] cannot resolve any real record (no `nfs5.prt` table loaded, or no id matched —
+/// a cop or a traffic car, whose construction 0x4EE9A0 is not traced to apply to). These are one
+/// part per getter with the masks of the standard parts of a rear-engined 911 in `nfs5.prt`
+/// (brakes / suspension / tyres on the four corners, engine and gearbox at the rear, aero front
+/// and rear), `scale` 1.5 and no carried state — what the port's one-mask-per-group model
+/// (`ZoneMasks` / `PartWear`, until 2026-09-26) used, kept as the last-resort default.
 pub fn fallback_parts() -> Vec<InstalledPart> {
     let corners = [true, false, true, false, true, false, true, false, false, false];
     let rear = [false, false, false, false, true, true, true, false, false, false];
     let aero = [true, true, true, false, true, true, true, false, false, false];
     [(1, rear), (2, corners), (3, rear), (4, corners), (6, aero), (9, corners)]
         .into_iter()
-        .map(|(kind, mask)| InstalledPart { kind, mask, scale: 1.5, state: 0.0 })
+        .map(|(kind, mask)| InstalledPart { kind, mask, scale: 1.5, state: 0.0, carried: 0.0 })
         .collect()
+}
+
+/// The installed-part list `car+0x768` for a racer with no career state to carry — a quick race
+/// or an opponent outside the career: `FECar::init` **0x4EEBA0** (car construction) ends,
+/// unconditionally, in **0x4EE9A0** (`career.md` §11.2d, `controls.md` §4.169.6, CONFIRMED), which
+/// fills the car's installed list `+0x758` with a fresh copy of every part on its **stock** list
+/// `+0x75C` — itself built from the `nfs5.car` record's own stock-part ids (`+0x3BC` count,
+/// `+0x3C2[i]` ids). `CarSim_applyParts` 0x49CB50 then reads `+0x758` into the race's `car+0x768`
+/// (`career.md` §11.2d: "the race's parts … see the stock copies because they read `+0x758`").
+/// So **every** racer — the career's, the market's, an opponent's, and (since 0x4EE9A0 runs
+/// unconditionally in the constructor, not gated on any career state) a quick race's — starts a
+/// race with its stock parts installed unless the career swapped one out.
+///
+/// This port has no career state for a quick race or a non-career opponent, so it has nothing to
+/// swap out: `ids` is the car's `nfs5.car` record's stock-part ids as-is (`CarCatalogEntry::
+/// stock_parts`, nfs-formats). `table` is the `nfs5.prt` records (`nfs_formats::career::Part`),
+/// resolved by id; an id the table has no record for (or an empty/unavailable table) is skipped.
+/// Not carried: `+0x758`'s exchange sort (0x49C350) — order does not change any getter's mean over
+/// a mask, and at most one part occupies a given type+category slot in a shipped stock list, so no
+/// getter's answer depends on it. Falls back to [`fallback_parts`] if nothing resolved.
+pub fn stock_parts(ids: &[i16], table: &[nfs_formats::career::Part]) -> Vec<InstalledPart> {
+    let resolved: Vec<InstalledPart> = ids
+        .iter()
+        .filter_map(|id| table.iter().find(|p| p.id == *id))
+        .map(|p| InstalledPart::new(p.kind, p.zone_mask.map(|b| b != 0), p.condition, p.state as f32))
+        .collect();
+    if resolved.is_empty() { fallback_parts() } else { resolved }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CarSpecs {
     pub name: String,
     pub mass: f32,
-    /// The installed-part list `car+0x768` the part-damage getters walk ([`InstalledPart`]);
-    /// [`fallback_parts`] unless the career fills it from the car's parts.
+    /// The installed-part list `car+0x768` the part-damage getters walk ([`InstalledPart`]):
+    /// [`stock_parts`] for a racer with no career state (a quick race, a non-career opponent), the
+    /// career's own installed parts when it has them, else [`fallback_parts`] (no `nfs5.prt` table
+    /// at hand, or no record matched — a cop, the traffic).
     pub parts: Vec<InstalledPart>,
     /// wheelbase in metres (+0x44 ×0.001)
     pub wheelbase: f32,
@@ -559,3 +604,76 @@ pub const SURFACE_BOUNCE: [[f32; 2]; 16] = [
 ];
 /// Friction-circle softness per class `0x5D0F58`.
 pub const CIRCLE_SOFTNESS: [f32; 3] = [8.0, 8.0, 6.0];
+
+#[cfg(test)]
+mod stock_parts_tests {
+    use super::*;
+    use nfs_formats::career::Part;
+
+    fn part(id: i16, kind: u16, mask: [u8; 10], condition: f32, state: u32) -> Part {
+        Part {
+            id,
+            name_string_id: 0,
+            family: String::new(),
+            unknown_24: 0,
+            kind,
+            kind_name: String::new(),
+            year: 0,
+            zone_mask: mask,
+            mass_delta: 0.0,
+            top_speed_pct: 0.0,
+            price: 0,
+            condition,
+            geometry_swaps: Vec::new(),
+            value_c0: 1.0,
+            boost: 0.0,
+            grip_class: 0,
+            forward_gears: 0,
+            gearbox_param: 0,
+            gear_ratios: [0.0; 8],
+            torque_curve: [0.0; 21],
+            state,
+        }
+    }
+
+    /// `specs.rs`'s `stock_parts`, the port of `FECar::init` 0x4EEBA0's unconditional
+    /// `fit_stock` 0x4EE9A0: given the record's stock ids and the `nfs5.prt` table, resolves to
+    /// one [`InstalledPart`] per id, in the record's own order, each taking that record's own
+    /// `kind` / mask / condition / carried state — not the six-getter, scale-1.5,
+    /// no-carried-state placeholder [`fallback_parts`] is.
+    #[test]
+    fn resolves_the_records_stock_ids() {
+        let table = vec![
+            part(10, 2, [1, 0, 1, 0, 1, 0, 1, 0, 0, 0], 100.0, 0),
+            part(20, 9, [1, 0, 1, 0, 1, 0, 1, 0, 0, 0], 90.0, 5),
+            part(30, 1, [0, 0, 0, 0, 1, 1, 1, 0, 0, 0], 100.0, 0),
+        ];
+        let got = stock_parts(&[10, 30], &table);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].kind, 2);
+        // condition 100 -> scale 1.5 - 0.005*100 = 1.0, not fallback_parts' hardcoded 1.5
+        assert!((got[0].scale - 1.0).abs() < 1e-6, "scale = {}", got[0].scale);
+        assert_eq!(got[0].state, 0.0);
+        assert_eq!(got[1].kind, 1);
+    }
+
+    /// A record's own carried damage (`+0x164`, `Part::state`) comes through, unlike
+    /// [`fallback_parts`]'s hardcoded 0.
+    #[test]
+    fn carries_the_records_own_state() {
+        let table = vec![part(20, 9, [1; 10], 90.0, 5)];
+        let got = stock_parts(&[20], &table);
+        assert_eq!(got.len(), 1);
+        assert!((got[0].scale - (1.5 - 0.005 * 90.0)).abs() < 1e-6);
+        assert_eq!(got[0].state, 5.0);
+        assert_eq!(got[0].carried, 5.0);
+    }
+
+    /// No id resolves (an empty table — a cop or traffic car, or no `nfs5.prt` at hand) ->
+    /// [`fallback_parts`], not an empty list.
+    #[test]
+    fn falls_back_when_nothing_resolves() {
+        let got = stock_parts(&[1, 2, 3], &[]);
+        assert_eq!(got, fallback_parts());
+    }
+}

@@ -272,6 +272,69 @@ pub fn aim_up(fwd: Vec3, prev_up: Vec3) -> Vec3 {
     fwd.cross(right).normalize_or_zero()
 }
 
+/// **The playback's wander of the aim point** — 0x464BF0's `[0x5E99F4] == 2` branch
+/// (0x464C2B…0x464E42), read 2026-09-27. When the build aims a view at its car (no target handed
+/// in: 0x46527F / 0x46560C, not view 0x11's 0x4652A7 / 0x465634) while a replay **plays** (`== 2`:
+/// not once the stream has run out, 3) and the slot's view word `+0xBC` is not 2…7, 0x0A or 0x0B,
+/// the aim point is `car+0x330` plus this offset `[0x6280F8…0x628100]` instead of the car's origin:
+///
+/// * every time `gGameTick − [0x6280E0] > [0x6280E4]` (`jle`, signed) four draws of the track
+///   particles' generator `[0x5CEAE0]` (0x464C8B…0x464D32) give a new goal `[0x6280E8…0x6280F0]`,
+///   each axis `r · s / 65536 − s / 2` with `s = car+0x35C · [0x5B3F6C] 0.05` (the speed estimate,
+///   so the spread grows with speed), and the next interval `fistp(r₄ · 3 / 65536) + 3` ticks (3…6);
+///   `[0x6280E0]` = the tick;
+/// * each build, unless paused (`[0x606860]`, `[0x606A90]`, `[0x606A98]` all 0, 0x464DA4…0x464DBD),
+///   the offset moves toward the goal by `k`: `[0x606864]` 1 (quarter speed) → 0.0025, 0 (half)
+///   → 0.005, else 0.01 (0x464D7E…0x464DA4).
+///
+/// SetSlotView 0x465790 zeroes all of it (0x4657A0…0x4657F3). The branch's other half, 0x464ED6,
+/// takes the up's x from the slot's `+0xA0` `[0x627F20]` in a playback: no writer of it was found
+/// (the one reference in `.text` is that read; it lies in `.bss`), so the up stays (0, 1, 0) and
+/// nothing is carried for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ReplayWander {
+    /// `[0x6280E0]`, the tick of the last goal
+    pub last: i32,
+    /// `[0x6280E4]`, the ticks until the next
+    pub interval: i32,
+    /// `[0x6280E8…0x6280F0]`
+    pub goal: Vec3,
+    /// `[0x6280F8…0x628100]`, added to the aim point
+    pub offset: Vec3,
+}
+
+impl ReplayWander {
+    /// Whether a view word takes the wander (0x464C45…0x464C6A).
+    pub fn applies(view: u16) -> bool {
+        !matches!(view, 0x02..=0x07 | 0x0A | 0x0B)
+    }
+
+    /// One aim: `tick` is `gGameTick`, `speed` the viewed car's `car+0x35C`, `k` the rate
+    /// `[0x606864]` picks (`replay::Speed::camera_lag`), `paused` any of the three pause flags.
+    /// Returns the offset to add to the aim point. The x87 work is done in f64 and stored as the
+    /// original stores (`fstp dword`).
+    pub fn step(&mut self, tick: i32, speed: f32, k: f32, paused: bool, rng: &mut crate::track_particles::ParticleRng) -> Vec3 {
+        if tick.wrapping_sub(self.last) > self.interval {
+            let s = speed as f64 * 0.05f32 as f64;
+            let h = s * 0.5;
+            let scale = 1.0 / 65536.0;
+            let mut axis = || (rng.next() as f64 * s * scale - h) as f32;
+            let (x, y, z) = (axis(), axis(), axis());
+            self.goal = Vec3::new(x, y, z);
+            // `fstp dword` then `fistp` (round to nearest even)
+            let t = (rng.next() as f64 * 3.0 * scale) as f32;
+            self.interval = t.round_ties_even() as i32 + 3;
+            self.last = tick;
+        }
+        let k = k as f64;
+        if !paused {
+            let f = |old: f32, goal: f32| ((1.0 - k) * old as f64 + goal as f64 * k) as f32;
+            self.offset = Vec3::new(f(self.offset.x, self.goal.x), f(self.offset.y, self.goal.y), f(self.offset.z, self.goal.z));
+        }
+        self.offset
+    }
+}
+
 /// **The look-around step 0x4611C0**, run by the bumper (0x461D50) and driver (0x461A30) updates
 /// once the slot's matrix is the car's: the target is 0°, −90° / +90° for input bits 0x14 / 0x15,
 /// `180 − that/2` with 0x13 (look back), halved again with 0x16; the slot's yaw `+0xC6` (a word,
@@ -494,6 +557,25 @@ pub mod anim_cam {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_wander_draws_then_follows() {
+        let mut w = ReplayWander::default();
+        let mut rng = crate::track_particles::ParticleRng::new(7);
+        // tick 1 − 0 > 0: a goal and an interval of 3…6, the offset `k` of the way to it
+        let o = w.step(1, 40.0, 0.01, false, &mut rng);
+        assert_eq!(w.last, 1);
+        assert!((3..=6).contains(&w.interval));
+        for a in [w.goal.x, w.goal.y, w.goal.z] {
+            assert!((-1.0..1.0).contains(&a)); // ±s/2, s = 40 · 0.05
+        }
+        assert!((o - w.goal * 0.01).length() < 1e-6);
+        // paused: no draw before the interval, no move
+        let goal = w.goal;
+        assert_eq!(w.step(2, 40.0, 0.01, true, &mut rng), o);
+        assert_eq!(w.goal, goal);
+        assert!(ReplayWander::applies(0x0C) && ReplayWander::applies(0x08) && !ReplayWander::applies(0x0A) && !ReplayWander::applies(3));
+    }
 
     #[test]
     fn table_matches_the_exe() {

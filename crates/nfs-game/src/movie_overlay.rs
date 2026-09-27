@@ -198,6 +198,15 @@ impl MovieOverlay {
         Self { rand, lines, flashes, runs, at: now }
     }
 
+    /// Text runs alone: `NFS5.ANIMSHOWCASEPICTURE`'s bind 0x4BDB90 hands 0x520860 the box
+    /// `{200, 0, 400, 200}` (0x4BDCE2…0x4BDCFD) and builds **five** runs (0x118 bytes of 0x38,
+    /// 0x4BDD05…0x4BDD2B) with the same 0x520890, and no lines or flashes.
+    pub fn runs_only(b: Box4, n: usize, now: i64, seed: u32) -> Self {
+        let mut rand = CRand::new(seed);
+        let runs = (0..n).map(|_| Run::new(b, now, &mut rand)).collect();
+        Self { rand, lines: Vec::new(), flashes: Vec::new(), runs, at: now }
+    }
+
     /// Run the objects forward to `now` in `STEP_MS` steps.
     pub fn advance(&mut self, now: i64) {
         while self.at + STEP_MS <= now {
@@ -345,139 +354,9 @@ impl CreditsRoll {
     }
 }
 
-/// The opaque runs of each row of an RGBA image — `(first, end)` column pairs where alpha is not
-/// zero. What a `SHAPE` part writes to the depth buffer under the front end's alpha test (every
-/// `movieoval.fsh` entry is 0 or 255, so the reference does not matter).
-pub fn alpha_runs(width: u32, height: u32, rgba: &[u8]) -> Vec<Vec<(u16, u16)>> {
-    let (w, h) = (width as usize, height as usize);
-    (0..h)
-        .map(|y| {
-            let mut runs = Vec::new();
-            let mut start = None;
-            for x in 0..=w {
-                let opaque = x < w && rgba.get((y * w + x) * 4 + 3).is_some_and(|&a| a != 0);
-                match (opaque, start) {
-                    (true, None) => start = Some(x),
-                    (false, Some(s)) => {
-                        runs.push((s as u16, x as u16));
-                        start = None;
-                    }
-                    _ => {}
-                }
-            }
-            runs
-        })
-        .collect()
-}
-
-/// `NFS5.MOVIECIRCLE`'s mask, row by row in design pixels. The draw 0x4CDAE0 paints its nine
-/// `stencilshape` parts between 0x4DAA10 (the sprite depth stepped 0.05 nearer, 0x4DAA65) and
-/// 0x4DAAC0 (`ZFUNC` 6 → `GREATEREQUAL` through 0x537830, the depth 0.001 back), then the clip,
-/// the overlay and the credits roll, then 0x4DAB00 puts both back. The frame's depth is 0.99998
-/// everywhere (0x4DA890's full-screen quad), so what is drawn in between lands **only where the
-/// parts wrote depth** — this set of pixels.
-#[derive(Debug, Clone, Default)]
-pub struct RowMask {
-    top: i32,
-    rows: Vec<Vec<(f32, f32)>>,
-}
-
-impl RowMask {
-    /// Add `[left, right)` to row `y`.
-    pub fn add(&mut self, y: i32, left: f32, right: f32) {
-        if right <= left {
-            return;
-        }
-        if self.rows.is_empty() {
-            self.top = y;
-        }
-        if y < self.top {
-            let n = (self.top - y) as usize;
-            self.rows.splice(0..0, std::iter::repeat_n(Vec::new(), n));
-            self.top = y;
-        }
-        let i = (y - self.top) as usize;
-        if i >= self.rows.len() {
-            self.rows.resize(i + 1, Vec::new());
-        }
-        let row = &mut self.rows[i];
-        row.push((left, right));
-        row.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let mut merged: Vec<(f32, f32)> = Vec::with_capacity(row.len());
-        for &(l, r) in row.iter() {
-            match merged.last_mut() {
-                Some(last) if l <= last.1 => last.1 = last.1.max(r),
-                _ => merged.push((l, r)),
-            }
-        }
-        *row = merged;
-    }
-
-    fn row(&self, y: i32) -> &[(f32, f32)] {
-        if y < self.top {
-            return &[];
-        }
-        self.rows.get((y - self.top) as usize).map_or(&[], |r| r.as_slice())
-    }
-
-    /// The parts of the rectangle `(x, y, w, h)` inside the mask, as rectangles — rows with the
-    /// same cut are merged, so a rectangle wholly inside comes back whole.
-    pub fn clip(&self, x: f32, y: f32, w: f32, h: f32) -> Vec<(f32, f32, f32, f32)> {
-        let mut out = Vec::new();
-        if w <= 0.0 || h <= 0.0 {
-            return out;
-        }
-        // open rectangles: (left, right, top, bottom)
-        let mut open: Vec<(f32, f32, f32, f32)> = Vec::new();
-        for r in (y.floor() as i32)..((y + h).ceil() as i32) {
-            let (t, b) = ((r as f32).max(y), ((r + 1) as f32).min(y + h));
-            let cut: Vec<(f32, f32)> = self.row(r).iter().map(|&(l, rr)| (l.max(x), rr.min(x + w))).filter(|(l, rr)| rr > l).collect();
-            let same = cut.len() == open.len() && cut.iter().zip(&open).all(|(c, o)| c.0 == o.0 && c.1 == o.1);
-            if same {
-                for o in open.iter_mut() {
-                    o.3 = b;
-                }
-            } else {
-                out.extend(open.drain(..).map(|(l, rr, t0, b0)| (l, t0, rr - l, b0 - t0)));
-                open = cut.into_iter().map(|(l, rr)| (l, rr, t, b)).collect();
-            }
-        }
-        out.extend(open.into_iter().map(|(l, rr, t0, b0)| (l, t0, rr - l, b0 - t0)));
-        out
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_mask_cuts_a_rectangle_by_rows() {
-        let mut m = RowMask::default();
-        for y in 10..20 {
-            m.add(y, 0.0, 100.0);
-        }
-        // a narrower row at the bottom, and one below it that is split in two
-        m.add(20, 40.0, 60.0);
-        m.add(21, 0.0, 10.0);
-        m.add(21, 90.0, 100.0);
-        // wholly inside: one piece
-        assert_eq!(m.clip(5.0, 11.0, 10.0, 5.0), vec![(5.0, 11.0, 10.0, 5.0)]);
-        // across the top edge and the narrow row: rows 10..20 whole, row 20 cut to 40..50
-        assert_eq!(m.clip(30.0, 8.0, 20.0, 13.0), vec![(30.0, 10.0, 20.0, 10.0), (40.0, 20.0, 10.0, 1.0)]);
-        // outside: nothing
-        assert!(m.clip(0.0, 30.0, 10.0, 5.0).is_empty());
-        // the split row gives two pieces
-        assert_eq!(m.clip(0.0, 21.0, 100.0, 1.0), vec![(0.0, 21.0, 10.0, 1.0), (90.0, 21.0, 10.0, 1.0)]);
-    }
-
-    #[test]
-    fn alpha_runs_are_the_opaque_spans() {
-        // 4 × 2: row 0 = . X X . ; row 1 = X . . X
-        let a = |on: bool| if on { [0, 0, 0, 255] } else { [0, 0, 0, 0] };
-        let px: Vec<u8> = [false, true, true, false, true, false, false, true].iter().flat_map(|&o| a(o)).collect();
-        assert_eq!(alpha_runs(4, 2, &px), vec![vec![(1, 3)], vec![(0, 1), (3, 4)]]);
-    }
 
     #[test]
     fn the_roll_steps_a_line_at_a_time_and_wraps() {

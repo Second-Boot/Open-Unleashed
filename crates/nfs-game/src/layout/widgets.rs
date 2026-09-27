@@ -104,7 +104,7 @@ impl LayoutScreen {
         let Some(file) = e.get("shapePathName").filter(|v| !v.is_empty()) else { return };
         let Some(&(tex, aw, ah)) = self.shapes.get(&(file.to_string(), index)) else { return };
         let (pos, size) = self.place(aspect, x, y, aw, ah);
-        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
     }
 
     // `NFS5.CarSettingSlider` is the template's transparent track (`color.value` is
@@ -136,11 +136,11 @@ impl LayoutScreen {
     pub(super) fn draw_car_setting_slider(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
         let WidgetDraw { i, e, x, y, w, aspect, selected, hovered, .. } = d;
         let (idx, count) = self.knobs.get(&i).copied().unwrap_or((0, 1));
-        for (px, py, file, index, _) in self.shape_parts_at(e, self.drawn_state(e, i, selected, hovered), None) {
+        for (px, py, file, index, _) in self.shape_parts_at(e, &self.drawn_state(e, i, selected, hovered), None) {
             let Some(&(tex, dw, dh)) = self.shapes.get(&(file, index)) else { continue };
             let dx = if count > 1 { (idx * (w - dw).max(0.0) as i32 / (count - 1)) as f32 } else { 0.0 };
             let (pos, size) = self.place(aspect, x + px + dx, y + py, dw, dh);
-            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         }
     }
 
@@ -166,6 +166,38 @@ impl LayoutScreen {
     // *(This said "the port keeps its own right-aligned draw … APPROXIMATION, as before"
     // until 2026-09-21, eighty lines above the reading that retired it; the two only came
     // to sit in one function when this arm was moved out of the class match.)*
+    /// The caption's font `[+0x190]`: 0x4C555E picks `univers8b.ffn` (`[+0x184]`) under
+    /// `data.usesmallfont`, else `[+0x188]`, `universC11b.ffn` — which is `labelleft`'s own
+    /// `fontPathName` in both templates.
+    fn combo_caption_font(&self, e: &nfs_formats::lay::Element) -> Option<&BitmapFont> {
+        let small = self.attr_num(e, "usesmallfont").is_some_and(|v| v != 0.0);
+        (!small)
+            .then(|| self.controls.get(&e.class).and_then(|c| c.part("labelleft")).and_then(|p| self.part_attr(e, p, "fontPathName")).map(|f| f.to_lowercase()))
+            .flatten()
+            .or_else(|| small.then(|| SMALL_FONT.to_string()))
+            .and_then(|f| self.fonts.get(&f))
+            .or_else(|| self.fonts.get(DEFAULT_FONT))
+    }
+
+    /// `[+0x1F0]`, the **caption strip**'s width, set by slot 1 every tick (0x4C5594…0x4C55E5):
+    /// 0 unless `data.nolabel` (`[+0x1FC]`) is 0 and the `labelleft` part (`[+0x1A0]`) is there;
+    /// then the caption's measured width (0x536970 in the caption font `[+0x190]`) plus 6.0,
+    /// truncated (`_ftol` 0x5A0F98). Settled 2026-09-28: the string measured is `0x4C55C9`'s call
+    /// to `0x4E7310`, which is just `return [part+0x19C]` — the `labelleft` part's own cached
+    /// text, the same field [`part_text`](Self::part_text) documents. That field's `LOCALIZEDTEXT`
+    /// load (0x4E66E0 → 0x4E06D0) already answers id 0 with the empty string 0x5E8E50 (read
+    /// 2026-09-26, layout.rs §"LOCALIZEDTEXT's load"), so a combo with `stringID=0` measures an
+    /// empty caption in the original too — width 0, strip 6, matching this port's own
+    /// `.filter(|n| *n != 0)`.
+    pub(crate) fn combo_strip(&self, e: &nfs_formats::lay::Element) -> f32 {
+        if self.attr_num(e, "nolabel").unwrap_or(0.0) != 0.0 {
+            return 0.0;
+        }
+        let text = e.string_id().filter(|n| *n != 0).and_then(|n| self.fe_strings.get(n)).unwrap_or("");
+        let Some(f) = self.combo_caption_font(e) else { return 0.0 };
+        (f.measure(text).0 + 6.0).trunc()
+    }
+
     pub(super) fn draw_combo(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>, overlay: &mut Vec<Sprite>) {
         let WidgetDraw { i, e, x, y, w, h, aspect, strings, selected, hovered, accessor, .. } = d;
         self.glinty_box(out, aspect, e, i, x, y, selected, hovered, tint);
@@ -177,10 +209,15 @@ impl LayoutScreen {
         // from the widget's box's **bottom** — `[0x4C8670()+0xC]`, copied at
         // 0x4C58D2 and the only write to that slot — `w` the `backrect`'s width
         // (0x4C69BE) and `h` the two rects' heights together (0x4C6998, 0x4C69A5),
-        // which is `data.height + data.selectionboxmaxheight`. Thickness **3**.
+        // which is `data.height` plus the selection box's height — the rows' height slot 1 sets
+        // every tick (0x4C57D5 → 0x4E2C20), **0 while the combo holds no focus** (0x4C53C4) and
+        // the clamped rows' height while its list is open (`drop_down_rect`). *(Corrected
+        // 2026-09-27: this added `data.selectionboxmaxheight` always, on §4.44's "nothing sets
+        // the height". The gate's first test, 0x4C6947, is the list-box byte, not "open".)*
+        // Thickness **3**.
         if self.pressed_on(i, hovered) {
-            let max_h = self.attr_num(e, "selectionboxmaxheight").unwrap_or(160.0) as f32;
-            self.bevel(out, aspect, x, y + h, w, h + max_h, 3.0);
+            let open_h = if self.open_combo == Some(i) { self.drop_down_rect(e, i, x, y).map_or(0.0, |r| r.3) } else { 0.0 };
+            self.bevel(out, aspect, x, y + h, w, h + open_h, 3.0);
         }
         let state = self.state_for(e, i, selected, hovered);
         if self.open_combo == Some(i) {
@@ -219,14 +256,24 @@ impl LayoutScreen {
         //
         // Unlike the buttons' pair this one is not behind `glintybox`: the draw
         // reaches it whichever way the background above it went (0x4C5E8C's two arms
-        // on `dropshadow == 2` both fall into it).
-        {
+        // on `dropshadow == 2` both fall into it). **It is not on the `nolabel == 4`
+        // path**: 0x4C5A29 `jne 0x4C5E74` sends every other value to the background and
+        // the stems, and the `nolabel == 4` arm ends at 0x4C5E6F `jmp 0x4C64FB`, past
+        // them. *(Until 2026-09-27 the port drew the pair on the eleven `nolabel=4`
+        // sliders too.)*
+        //
+        // A third one-pixel bar follows, 0x4C5FB7…0x4C5FF6: black again, `backrect.height`
+        // tall (0x4E2BA0), at `backrect.left + [+0x1F0]` — the end of the caption strip
+        // (`combo_strip`), which a release on a closed combo treats as a step, not an open
+        // (0x4C6BB8, `App` side).
+        if self.attr_num(e, "nolabel") != Some(4.0) {
             let stem = tint([0, 0, 0, 0xff]);
             let bh = self.attr_num(e, "height").unwrap_or(0.0) as f32;
             let bw = self.attr_num(e, "width").unwrap_or(0.0) as f32;
             let at = |k: &str| self.attr_num(e, k).unwrap_or(0.0) as f32 + bh;
             out.push(self.quad(aspect, x, y, 1.0, at("stemleftheight"), stem));
             out.push(self.quad(aspect, x + bw, y, 1.0, at("stemrightheight"), stem));
+            out.push(self.quad(aspect, x + self.combo_strip(e), y, 1.0, bh, stem));
         }
         // The arrow is **not** drawn from a state's part list: the family's slot 1 / 15 / 27
         // (0x4C5460 / 0x4C6A60 / 0x4C5810) never reach 0x4C8260; the bind looks `arrowbutton`
@@ -238,12 +285,13 @@ impl LayoutScreen {
         // `x + backrect.width − entry.width − 3` (the template says −4), `y` at
         // `(backrect.height − entry.height)/2 + 1` over a base not traced; 0x4C5DA1 centres
         // it on `data.width` — and the port keeps the template's `pos`.
+        let arrow_at = out.len();
         for (px, py, file, index, flip) in self.shape_parts_in(e, &["arrowbutton".to_string()], None) {
             let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
             let (pos, size) = self.place(aspect, x + px, y + py, aw, ah);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
-            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         }
         // the caption, where the template puts it
         if let Some(c) = self.controls.get(&e.class)
@@ -374,6 +422,37 @@ impl LayoutScreen {
                     false => v.clone(),
                 };
                 self.text(out, aspect, f, &shown, bx + (gscw / 2.0).trunc(), y + 2.0, 0.0, 1, tint([0xff, 0xff, 0xff, 0xaa]));
+                // **Then a depth mask over the slider's own box** (read 2026-09-27): 0x4DAA10
+                // (0x4C5C39); a fill one pixel inside the `backrect` (`x + 1, y + 1, w − 2, h − 2`,
+                // 0x4C5C3E…0x4C5C93) as the stencil, in 0x4D87F0(0xFFBC0000, fade) — or
+                // 0x4D87F0(0x30FF0000, fade) when disabled (0x4C599C), 0x4D87C0(fade) amber when
+                // hovered or focused (0x4C59AD…0x4C59C2); 0x4DAAC0 (0x4C5C9B); the **same string
+                // again, black** (0x4D87F0(0x4D87E0(fade), 0x30 disabled / 0xFF), 0x4C59E0…0x4C59F5)
+                // at the same centre in the special box (0x4C5CA2…0x4C5D2E); 0x4DAB00 (0x4C5D36). So
+                // the black copy shows only where the string reaches back into the slider's box —
+                // a string wider than `GraphicsSpecialCaseWidth` (172 / 208 shipped), which none of
+                // the shipped values is. Read and not added: the box's own black outline just
+                // before, 0x4D9200 at 0x4C5C31 — the port paints this family's box from the
+                // template's parts, which the original's 0x4C5810 never reaches (§4.35).
+                let mask = super::fe_depth::mask_begin();
+                let disabled = state == "disabled";
+                let fill = if disabled {
+                    [0xff, 0, 0, 0x30]
+                } else if hovered == Some(i) || self.open_combo == Some(i) {
+                    [0xff, 0xbb, 0, 0xff]
+                } else {
+                    [0xbc, 0, 0, 0xff]
+                };
+                let stencil = out.len();
+                out.push(self.quad(aspect, x + 1.0, y + 1.0, bw - 2.0, bh - 2.0, tint(fill)));
+                super::fe_depth::apply(&mut out[stencil..], mask.stencil);
+                let inside = out.len();
+                self.text(out, aspect, f, &shown, bx + (gscw / 2.0).trunc(), y + 2.0, 0.0, 1, tint([0, 0, 0, if disabled { 0x30 } else { 0xff }]));
+                super::fe_depth::apply(&mut out[inside..], mask.inside);
+                // the arrow comes after the mask (0x4C5DB4, past 0x4DAB00): the port drew it
+                // above, so the mask's draws go in under it
+                let masked: Vec<Sprite> = out.drain(stencil..).collect();
+                out.splice(arrow_at..arrow_at, masked);
                 return;
             }
             // **`nolabel == 2` draws no value at all**: past the caption, 0x4C6198
@@ -542,7 +621,46 @@ impl LayoutScreen {
         let WidgetDraw { i, e, x, y, aspect, strings, selected, hovered, .. } = d;
         let state = self.state_for(e, i, selected, hovered);
         let frame = (e.class == "NFS5.BOTTOMBARBUTTON").then(|| self.bar_button_frame(e, hovered == Some(i), self.pressed_on(i, hovered))).flatten();
+        let first = out.len();
         self.template_widget_at(out, aspect, e, state, x, y, strings, frame);
+        if e.class != "NFS5.BOTTOMBARBUTTON" {
+            return;
+        }
+        // **`NFS5.BOTTOMBARBUTTON`'s draw 0x4C9B30 is a depth mask with a hover glint in it**
+        // (read 2026-09-27): the icon (`[+0x178]`, 0x4C9C1A) first, outside it; 0x4DAA10
+        // (0x4C9C22); the caption — the part of the state, `[+0x174]` disabled, `[+0x170]`
+        // hovered, `[+0x16C]` otherwise, painted through its vtable +0x14 (0x4C9C5A) — as the
+        // stencil; 0x4DAAC0 (0x4C9C5D); then, only while the button is hovered (0x4C7C90), not
+        // disabled (0x4C7E40), not hidden (0x4C7ED0), at rest (0x4C8820 = 0) and 0x4E35C0 false,
+        // the `weeicons.fsh` `GLNT` entry the bind looked up (0x4C95E4…0x4C95FE → `[+0x1DC]`) at
+        // x = the ticks since the sweep started, y = the button's own, in 0x4D87D0 of the fade
+        // (0x4C9D40…0x4C9D65); 0x4DAB00. Its timer (`[+0x276]` running, `[+0x278]` stamp,
+        // `[+0x27C]` wait) is the car logo's: a wait of `rand() % 128` (0x4C9D1A, the bind's
+        // 0x4C9616), a run of 640 ticks (0x4E3550) — `glints::Sweep` with `logo` — and it only
+        // moves while those gates pass. So the sweep shows on the caption's letters alone.
+        // 0x4C9616 is this class's own INUSE activate (its slot list carries 21, `controls.md`
+        // §1350, the same slot the other four `activate_glints` rows answer), so *within its own
+        // screen* it belongs in that same widget-order pass, not on the first hovered draw —
+        // `LayoutScreen::activate_glints` now makes the four `NFS5.BOTTOMBARBUTTON` sweeps there
+        // (`Sweep::new(0, true)`, the car logo's convention) instead of lazily on first hover.
+        // *(Tried and reverted 2026-09-28, moving only this one call: the bottom bar was still a
+        // second, known-late offender then — `main.rs` built it after the target screen's own
+        // load (`bar_oval.rs`'s marker) — so the four buttons' activates still landed after the
+        // target screen's, and every later screen's `crt_rand()` draws shifted by four calls that
+        // had not shifted before (48/97 goldens differed). Fixed together with that marker:
+        // `open_layout` and the `--layout` start-up path now build the bar — and so bind these
+        // four sweeps — before loading the opened screen, matching 0x4D3420's own order (the bar's
+        // constructor 0x4D7E70 at 0x4D39C4, the first layout 0x4D67D0 only after).)*
+        let rects = self.state_rects(e, state).len();
+        let shapes = self.shape_parts_at(e, state, frame).into_iter().filter(|(_, _, f, n, _)| self.shapes.contains_key(&(f.clone(), *n))).count();
+        let mask = super::fe_depth::mask_begin();
+        let caption = (first + rects + shapes).min(out.len());
+        super::fe_depth::apply(&mut out[caption..], mask.stencil);
+        if hovered == Some(i) && state != "disabled" && self.widget_progress() * 255 / TRANS_FULL == 0 {
+            let glint = out.len();
+            self.sweep_glint(i, true, out, aspect, y, 1.0);
+            super::fe_depth::apply(&mut out[glint..], mask.inside);
+        }
     }
 
     // The same shape three more times, 19 widgets: a `0xFFBC0000` box inside four
@@ -567,7 +685,7 @@ impl LayoutScreen {
             && let Some(&(tex, aw, ah)) = self.shapes.get(&(CAMERA_PICTURES.to_string(), n.max(0.0) as usize))
         {
             let (pos, size) = self.place(aspect, x, y, aw, ah);
-            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         }
         self.template_widget(out, aspect, e, state, x, y, strings);
         if e.class == "NFS5.TABBUTTON" {
@@ -654,7 +772,12 @@ impl LayoutScreen {
     // `x + picture.width` (0x4BDF72 adds the entry's `+0x14`), the same side-by-side
     // pair `NFS5.CarLogo` draws. §4.127.
     pub(super) fn draw_anim_showcase_picture(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
-        let WidgetDraw { x, y, talpha, aspect, .. } = d;
+        let WidgetDraw { i, e, x, y, talpha, aspect, strings, .. } = d;
+        // **A depth mask** (read 2026-09-27): 0x4DAA10 (0x4BDE12) before the pictures, which are
+        // its stencil (0x4BDE97…0x4BE0A8, white at the fade and the cross-fade's alpha), then
+        // 0x4DAAC0 (0x4BE0B0) and the widget's text runs (below), 0x4DAB00 (0x4BE10C).
+        let mask = super::fe_depth::mask_begin();
+        let stencil = out.len();
         const REST: i64 = 0x80;
         const FADE: i64 = 0x40;
         let ticks = (self.clock_ms as u64 * 128 / 1000) as i64;
@@ -665,7 +788,7 @@ impl LayoutScreen {
             let Some(&(lt, lw, lh)) = self.shapes.get(&(SHOWCASE_ANIM.to_string(), n + 4)) else { return };
             for (t, dx, w2, h2) in [(tex, 0.0, aw, ah), (lt, aw, lw, lh)] {
                 let (pos, size) = self.place(aspect, x + dx, y, w2, h2);
-                out.push(Sprite { texture: t, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, a * talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+                out.push(Sprite { texture: t, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, a * talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
             }
         };
         if phase < REST {
@@ -674,6 +797,31 @@ impl LayoutScreen {
             let t = (phase - REST) as f32 * 255.0 / FADE as f32 / 255.0;
             draw(out, frame, 1.0 - t);
             draw(out, (frame + 1) % 4, t);
+        }
+        super::fe_depth::apply(&mut out[stencil..], mask.stencil);
+        // Inside the mask, the `[+0x15C]` = **five** text runs of 0x5208E0 — the same objects as
+        // `NFS5.MOVIECIRCLE`'s "NEED FOR SPEED" runs (`movie_overlay`), built by the bind over the
+        // box `{200, 0, 400, 200}` (0x4BDCE2…0x4BDD2B) in `Univers7b` / `Univers11b` (0x4BDD48,
+        // 0x4BDD5E; `[+0x1CC]` = 2) — each spelling **the widget's `label` string**, which the bind
+        // copies to `[+0x164]` (0x4C8B60 `"label"`, 0x4E7310, 0x4BDCC4…0x4BDCEA), in
+        // `0x4D87F0(0xA0FFFFFF, fade)` (0x4BE0B6): so the caption drifts across the pictures, cut
+        // to their opaque texels. Not drawn by the port before. APPROXIMATIONS as the circle's
+        // runs: a generator of their own (seed 1) and 16 ms steps.
+        let text = e.string_id().filter(|n| *n != 0).and_then(|n| strings.get(n)).unwrap_or_default().to_string();
+        if !text.is_empty() {
+            let b = crate::movie_overlay::Box4 { left: 200, top: 0, right: 400, bottom: 200 };
+            let now = self.clock_ms as i64;
+            let draws = {
+                let mut map = self.movie_overlays.borrow_mut();
+                let o = map.entry(i).or_insert_with(|| crate::movie_overlay::MovieOverlay::runs_only(b, 5, 0, 1));
+                o.advance(now);
+                o.draws()
+            };
+            let inside = out.len();
+            for d in &draws {
+                self.draw_run(out, aspect, d, &text, [1.0, 1.0, 1.0, 0xA0 as f32 / 255.0]);
+            }
+            super::fe_depth::apply(&mut out[inside..], mask.inside);
         }
     }
 
@@ -721,6 +869,7 @@ impl LayoutScreen {
                 rotation: 0.0,
                 pivot: [0.5, 0.5],
                 tri: None,
+                depth: None,
             });
             return;
         }
@@ -737,7 +886,7 @@ impl LayoutScreen {
         let Some(&(tex, aw, ah)) = self.shapes.get(key) else { return };
         let (dw, dh) = (if w > 0.0 { w } else { aw }, if h > 0.0 { h } else { ah });
         let (pos, size) = self.place(aspect, x, y, dw, dh);
-        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         // `NFS5.ChroniclePictureIcon`'s draw ends with the bevel over **the art's own
         // size** — 0x508906 and 0x508910 read `[entry+0x18]` and `[entry+0x14]`, the
         // height and width of the `.fsh` entry it just drew, not the widget's box —
@@ -777,11 +926,18 @@ impl LayoutScreen {
             _ => x,
         };
         let top = y + ((h - ah) * 0.5).trunc();
+        // **A depth mask** (0x4C1BCB 0x4DAA10 … 0x4C1CE0 0x4DAAC0 … 0x4C1D6B / 0x4C1DB2 0x4DAB00):
+        // the two logo entries are the stencil — drawn in `0x4D87D0(fade)`, white at the
+        // widget's fade (0x4C1C7E, 0x4C1CAC), so they write depth wherever their art's alpha
+        // passes the test — and the glint is drawn inside it: the sweep shows **on the logo
+        // alone**, not across the screen.
+        let mask = super::fe_depth::mask_begin();
+        let stencil = out.len();
         let (pos, size) = self.place(aspect, left, top, aw, ah);
-        out.push(Sprite { texture: ta, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+        out.push(Sprite { texture: ta, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         if let Some(tb) = tb {
             let (pos, size) = self.place(aspect, left + aw, top, bw, bh);
-            out.push(Sprite { texture: tb, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: tb, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         }
         // The glint, 0x4C1CE0…0x4C1DAF, and it is the **same sweep the header has**
         // (§4.25): the `GLNT` entry of `weeicons.fsh` that the activate looks up by
@@ -790,7 +946,10 @@ impl LayoutScreen {
         // own (0x4C1BBB). One difference: the colour goes through 0x4D87F0 a second
         // time with **0x40** (0x4C1D7E), so the logo's sweep is a quarter as strong as
         // the header's.
+        let glint = out.len();
+        super::fe_depth::apply(&mut out[stencil..glint], mask.stencil);
         self.sweep_glint(i, true, out, aspect, y, 0x40 as f32 / 255.0);
+        super::fe_depth::apply(&mut out[glint..], mask.inside);
     }
 
     // `FEKnockoutTrackList::draw` (0x4FA190) is a **seven-slot** strip: the widget's box
@@ -799,8 +958,12 @@ impl LayoutScreen {
     // `0x80FEDD81` the draw pushes at 0x4FA1FA, which is also what the `.lay` block's
     // own `color` says. The row `Knockout.TrackNumber` is on is redrawn in the menu
     // amber `0x4D87C0` gives (0x4FA296), and half-alpha black rules (`0x4D87E0` at
-    // `0x80`) separate the rows and mark two columns, at `x + 0x0B` and `x + 0x71`
-    // (0x4FA35B, 0x4FA39F).
+    // `0x80`) separate the rows and mark **four** columns, at `x + 0x0B`, `x + 0x71`,
+    // `x + 0xA4` and `x + 0xCC` (0x4FA35B, 0x4FA39F, 0x4FA3D5, 0x4FA424), each the filled
+    // height tall; last, the filled strip is outlined in full-fade black, 0x4D9200 of
+    // `0x4D87E0(fade)` over `(x, y, w, n·h/7)` (0x4FA43A…0x4FA45A). *(Until 2026-09-27 the
+    // port drew the first two columns and no outline.)* A `Knockout.TrackNumber` at or past
+    // `n` is put back on row 0 by the draw itself (0x4FA27B…0x4FA28C) — the binding does it.
     pub(super) fn draw_knockout_track_list(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
         let WidgetDraw { i, x, y, w, h, talpha, aspect, .. } = d;
         let Some(&(rows, current)) = self.ko_strip.get(&i) else { return };
@@ -819,8 +982,12 @@ impl LayoutScreen {
         for r in 1..rows {
             out.push(self.quad(aspect, x, y + slot * r as f32, w, 1.0, rule));
         }
-        for dx in [11.0, 113.0] {
+        for dx in [11.0, 113.0, 164.0, 204.0] {
             out.push(self.quad(aspect, x + dx, y, 1.0, filled, rule));
+        }
+        let black = [0.0, 0.0, 0.0, talpha];
+        for (bx, by, bw, bh) in [(x, y, w, 1.0), (x, y + filled - 1.0, w, 1.0), (x, y, 1.0, filled), (x + w - 1.0, y, 1.0, filled)] {
+            out.push(self.quad(aspect, bx, by, bw, bh, black));
         }
     }
 
@@ -881,7 +1048,7 @@ impl LayoutScreen {
                         && let Some(&(tex, aw, ah)) = self.shapes.get(&(self.chronicle_icons.0.clone(), if on { *over } else { *rest }))
                     {
                         let (pos, size) = self.place(aspect, cx + 1.0, by + 1.0, aw, ah);
-                        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+                        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
                     }
                     for (bx, by, bw, bh) in [(cx, by, 90.0, 1.0), (cx, by + 59.0, 90.0, 1.0), (cx, by, 1.0, 60.0), (cx + 89.0, by, 1.0, 60.0)] {
                         out.push(self.quad(aspect, bx, by, bw, bh, black));
@@ -933,7 +1100,7 @@ impl LayoutScreen {
         if let Some(&(tex, aw, ah)) = self.shapes.get(&(file.to_string(), frame)) {
             let (dw, dh) = (if w > 0.0 { w } else { aw }, if h > 0.0 { h } else { ah });
             let (pos, size) = self.place(aspect, x, y, dw, dh);
-            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: tint([255, 255, 255, 255]), rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: tint([255, 255, 255, 255]), rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         }
     }
 
@@ -978,11 +1145,21 @@ impl LayoutScreen {
         let first = out.len();
         let mut closed = false;
         let state = self.state_for(e, i, selected, hovered);
+        // **`NFS5.HEADER`'s draw 0x4CAEA0 is a depth mask**: 0x4DAA10 (0x4CAEB6) before its text
+        // (0x4DA350 at 0x4CAFD8, or the spaced run 0x522050 at 0x4CB007 while it slides in), so
+        // the letters are the stencil, written wherever their glyphs' alpha passes the test; then
+        // — only at rest, the fade 0 (0x4CB01C) — 0x4DAAC0 (0x4CB024) and the glint, which lands
+        // **on the letters alone**; 0x4DAB00 (0x4CB0B4 / 0x4CB0F9). Off rest the draw leaves by
+        // 0x4DA9D0 without the second half (0x4CB0FE), the depth stepped all the same.
+        let header = (e.class == "NFS5.HEADER").then(super::fe_depth::mask_begin);
         self.template_widget(out, aspect, e, state, x, y, strings);
         // The header's glint, **0x4CB024…0x4CB0F6** — its colour is 0x4D87D0 of
         // the fade, so white at full (§4.25).
-        if e.class == "NFS5.HEADER" {
+        if let Some(m) = header {
+            super::fe_depth::apply(&mut out[first..], m.stencil);
+            let glint = out.len();
             self.sweep_glint(i, false, out, aspect, y, 1.0);
+            super::fe_depth::apply(&mut out[glint..], m.inside);
         }
         // `NFS5.GLINTYLINE`'s sweep, on top of the bar its template just drew
         // (§4.28, §4.29). The long axis is the one the sweep runs along: `x` when
@@ -1086,7 +1263,7 @@ impl LayoutScreen {
         let picture = |out: &mut Vec<Sprite>, art: Option<(TextureId, f32, f32, f32, f32)>, color: [f32; 4]| {
             let Some((tex, aw, ah, ax, ay)) = art else { return };
             let (pos, size) = self.place(aspect, ax, ay, aw, ah);
-            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         };
         picture(out, ev.map, [1.0, 0xBB as f32 / 255.0, 0.0, talpha * ramp as f32 / 255.0]);
         picture(out, ev.marker, [1.0, 1.0, 1.0, talpha]);
@@ -1111,7 +1288,7 @@ impl LayoutScreen {
         let Some(key) = self.logos.get(&i) else { return };
         let Some(&(tex, aw, ah)) = self.shapes.get(key) else { return };
         let (pos, size) = self.place(aspect, x, y, aw, ah);
-        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
     }
 
     // a widget that is only a place, with its picture put there from code: one entry
@@ -1133,7 +1310,7 @@ impl LayoutScreen {
         let stretch = e.class.starts_with("NFS5.MINI");
         let (dw, dh) = if stretch && w > 0.0 && h > 0.0 { (w, h) } else { (aw, ah) };
         let (pos, size) = self.place(aspect, x, y, dw, dh);
-        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         let Some((name, rank, colour)) = self.badges.get(&i) else { return };
         // the shadow: entry 0 at x+244 and entry 1 at y+131 (0x4CF499, 0x4CF4C4). The
         // original also gates it on the machine (0x4E35D0: at least 0x2100000 bytes of
@@ -1144,7 +1321,7 @@ impl LayoutScreen {
         for (entry, dx, dy) in [(0usize, 244.0, 0.0), (1, 0.0, 131.0)] {
             let Some(&(t, sw, sh)) = self.shapes.get(&(LICENSE_SHADOW.to_string(), entry)) else { continue };
             let (pos, size) = self.place(aspect, x + dx, y + dy, sw, sh);
-            out.push(Sprite { texture: t, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: t, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         }
         // the name, centred (the fourth argument of 0x4DA350 is the alignment: 1 pulls
         // back half the text's width, 2 the whole of it — 0x4DA3D7…0x4DA405) at
@@ -1168,6 +1345,28 @@ impl LayoutScreen {
     // the player at `[this+0x1C4]`. `RE/notes/controls.md` §4.33.
     pub(super) fn draw_movie(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
         let WidgetDraw { i, e, x, y, w, h, talpha, aspect, .. } = d;
+        // **`NFS5.MOVIECIRCLE`'s draw 0x4CDAE0 is a depth mask** (`RE/notes/layouts.md` "Clip = a
+        // depth mask"): 0x4DAA10 steps the kit's depth `[0x65B954]` nearer and the nine
+        // `stencilshape` parts are painted there (vtable +0x14, 0x4CDB2C…0x4CDB57), writing depth
+        // where the alpha test keeps them; 0x4DAAC0 flushes, sets `ZFUNC` `GREATEREQUAL` (Thrash
+        // 0x28 ← 6 through 0x537830) and steps the depth 0.001 back; then the clip (0x4CDB61 →
+        // 0x4CD640), the overlay and the credits roll (0x4CDB72 → 0x4CDF40) land only where the
+        // parts wrote depth; 0x4DAB00 puts the compare back. The rest of the frame's 2D draws sit
+        // at 0.99998 over a depth cleared to 1.0 (0x4DA890), both behind the mask — the port's
+        // plain sprites write no depth, which leaves the 1.0 and gives the same test.
+        // `NFS5.MOVIEBOX` has no parts and no mask.
+        let circle = e.class == "NFS5.MOVIECIRCLE";
+        // the kit's depth stepped for this mask from where the frame's earlier masks left it, and
+        // the device's alpha test as it stands (`layout::fe_depth`: 10 as the frame's room left it,
+        // 1 after a list box — the credits' first port took the device's initial 0)
+        let mask = circle.then(super::fe_depth::mask_begin);
+        let c = e.color("tint").map(tint).unwrap_or([1.0, 1.0, 1.0, 1.0]);
+        if let Some(m) = mask {
+            let start = out.len();
+            self.draw_stencil_parts(e, x, y, aspect, c, out);
+            super::fe_depth::apply(&mut out[start..], m.stencil);
+        }
+        let start = out.len();
         if let Some(m) = self.movies.get(&i) {
             // the box is the widget's `size` (0x4CD034…0x4CD05E into `[+0x14C]`, `[+0x150]`,
             // handed to the player's constructor 0x4E1EB0 as its `[+4]`, `[+8]`); a widget with
@@ -1183,84 +1382,51 @@ impl LayoutScreen {
             // them movie widgets, and five of those carry `0xFFFFFFFF` — the default
             // written out. **One** differs: `credits.lay`'s `ID_MOVIECIRCLE` at
             // `0xff55afbe`, a pale blue over the credits clip. §4.83.
-            let c = e.color("tint").map(tint).unwrap_or([1.0, 1.0, 1.0, 1.0]);
-            out.push(Sprite { texture: m.tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, v_max], color: [c[0], c[1], c[2], c[3] * talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: m.tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, v_max], color: [c[0], c[1], c[2], c[3] * talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         }
-        // `NFS5.MOVIECIRCLE`'s template carries nine `stencilshape` parts out of
-        // `movieoval.fsh` — the oval that frames the clip. Its draw 0x4CDAE0 holds them
-        // **by pointer** (`[+0x1C4]`, `[+0x1C8…+0x1E4]`, bound by name 0x4CD898…0x4CDA4D)
-        // and paints all nine whatever the state (vtable +0x14, 0x4CDB2C…0x4CDB57), so the
-        // part list is fixed — not the `.lay` block's state nor the live one (all three
-        // shipped widgets say `test1`, which lists the nine, so the picture is the same).
-        // *Corrected 2026-09-27: this said the draw "reaches the parts after (0x4CDB72)";
-        // 0x4CDB72 is 0x4CDF40, the overlay's lists and the roll. The parts are painted
-        // **before** the clip (0x4CDB61), as the depth mask the clip lands in
-        // (`layouts.md` "Clip = a depth mask").* The port draws them over the clip as its
-        // stand-in for that mask (APPROXIMATION, below). `NFS5.MOVIEBOX` has no such parts.
-        if e.class == "NFS5.MOVIECIRCLE" {
-            // the overlay goes where the clip goes: the original draws both inside the oval's
-            // stencil (0x4DAAC0 … 0x4DAB00 around 0x4CDB61 and 0x4CDB72), which this port stands
-            // for by putting the oval over them
+        if let Some(m) = mask {
+            // the overlay's lines, flashes and runs, then the credits roll last (0x4CE0CD)
             self.draw_movie_overlay(i, e, talpha, aspect, out);
-            for (px, py, file, index, flip) in self.shape_parts_in(e, &stencil_parts(), None) {
-                let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
-                let (pos, size) = self.place(aspect, x + px, y + py, aw, ah);
-                let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
-                let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
-                out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
-            }
-            // The credits roll is the last thing 0x4CDF40 draws (0x4CE0CD), still inside the
-            // mask, so it goes over the parts — the one piece of the widget this port cuts to the
-            // mask the original's way. APPROXIMATION left: the clip and the overlay are still drawn
-            // whole under the parts rather than cut to them, so in the oval's ring the roll shows
-            // over the parts' black, where the original shows it over the clip.
             let credits = self.layout.elements.iter().any(|x| x.get("callbacklist").is_some_and(|c| c.eq_ignore_ascii_case("ID_CREDITS")));
             if credits {
                 let ((px, py), (pw, ph)) = (e.position(), e.size());
                 let b = crate::movie_overlay::Box4 { left: px as i32, top: py as i32, right: (px + pw) as i32, bottom: (py + ph) as i32 };
-                let mask = self.movie_mask(e, x, y);
-                self.draw_credits_roll(b, &mask, self.clock_ms as i64, talpha, aspect, out);
+                self.draw_credits_roll(b, self.clock_ms as i64, talpha, aspect, out);
             }
+            super::fe_depth::apply(&mut out[start..], m.inside);
         }
     }
 
-    /// The depth mask `NFS5.MOVIECIRCLE` draws its clip, overlay and roll through (0x4CDAE0,
-    /// `movie_overlay::RowMask`): the rows its `stencilshape` parts cover, the widget at `(x, y)`.
-    /// `stencilshape1` is a `RECT` (`0xFF000000`, 256 × 232) and the other eight `SHAPE`s of
-    /// `movieoval.fsh`, whose opaque pixels are what they write under the alpha test; a part's
-    /// `flip` mirrors its art (bit 0 across, bit 1 down) as it does when it is painted. The bind
-    /// takes all nine by name (0x4CD898…0x4CDA4D) and the draw paints them whatever the state
-    /// (0x4CDB2C…0x4CDB57); every shipped circle is in `test1`, which lists all nine.
-    fn movie_mask(&self, e: &nfs_formats::lay::Element, x: f32, y: f32) -> crate::movie_overlay::RowMask {
-        let mut m = crate::movie_overlay::RowMask::default();
+    /// `NFS5.MOVIECIRCLE`'s nine `stencilshape` parts, the widget at `(x, y)`, in the draw's
+    /// order: `[+0x1C4]` (`stencilshape1`) first, then `[+0x1C8…+0x1E4]` (0x4CDB2C…0x4CDB57; bound
+    /// by name 0x4CD898…0x4CDA4D). The part list is fixed — not the `.lay` block's state nor the
+    /// live one (all three shipped circles say `test1`, which lists the nine). `stencilshape1` is
+    /// a `RECT` (`0xFF000000`, 256 × 232), the other eight `SHAPE`s of `movieoval.fsh` (alpha 0 /
+    /// 255), a part's `flip` mirroring its art (bit 0 across, bit 1 down). **Both kinds take the
+    /// widget's fade** (read 2026-09-27): `FEShapePart`'s paint (vtable 0x5B6E64 slot 5, 0x4E6F60)
+    /// draws in the widget's tint — `0x528C90`, `tint_c` — with its alpha times 0x4C8840's fade
+    /// over 255 (0x4E6F89…0x4E6FBF, while 0x4E3660 — `[0x657E58]`, 0 — allows it), and
+    /// `FERectPart`'s (vtable 0x5B6E0C slot 5, 0x4E68C0) its own colour the same way unless the
+    /// fade is 0xFF (0x4E68CB…0x4E6915): the screen loop's `talpha`. So a fading circle's stencil
+    /// thins with it, and the alpha test stops it writing depth as it goes.
+    fn draw_stencil_parts(&self, e: &nfs_formats::lay::Element, x: f32, y: f32, aspect: f32, tint_c: [f32; 4], out: &mut Vec<Sprite>) {
         if let Some(c) = self.controls.get(&e.class) {
             for p in (1..=9).filter_map(|k| c.part(&format!("stencilshape{k}"))) {
                 if p.kind() != nfs_formats::ctr::PartKind::Rect {
                     continue;
                 }
                 let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)));
-                let (Some((px, py)), Some((pw, ph))) = (at("pos"), at("size")) else { continue };
-                if self.part_colour(e, p, "color").is_none_or(|c| c[3] == 0) {
-                    continue;
-                }
-                let (l, t) = (x + px as f32, (y + py as f32).round() as i32);
-                for row in t..t + ph as i32 {
-                    m.add(row, l, l + pw as f32);
-                }
+                let (Some((px, py)), Some((pw, ph)), Some(col)) = (at("pos"), at("size"), self.part_colour(e, p, "color")) else { continue };
+                out.push(self.quad(aspect, x + px as f32, y + py as f32, pw as f32, ph as f32, tint(col)));
             }
         }
         for (px, py, file, index, flip) in self.shape_parts_in(e, &stencil_parts(), None) {
-            let (Some(runs), Some(&(_, aw, ah))) = (self.mask_runs.get(&(file.clone(), index)), self.shapes.get(&(file, index))) else { continue };
-            let (l, t) = (x + px as f32, (y + py as f32).round() as i32);
-            for (sy, row) in runs.iter().enumerate() {
-                let ry = if flip & 2 != 0 { ah as i32 - 1 - sy as i32 } else { sy as i32 };
-                for &(a, z) in row {
-                    let (a, z) = if flip & 1 != 0 { (aw - z as f32, aw - a as f32) } else { (a as f32, z as f32) };
-                    m.add(t + ry, l + a, l + z);
-                }
-            }
+            let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
+            let (pos, size) = self.place(aspect, x + px, y + py, aw, ah);
+            let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
+            let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
+            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: tint_c, rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         }
-        m
     }
 
     /// **0x4CDF40**, after the clip and the oval: the overlay's lines, flashes and runs in three
@@ -1303,46 +1469,46 @@ impl LayoutScreen {
                 Draw::Flash { frame, cx, cy } => {
                     let Some(&(tex, fw, fh)) = self.shapes.get(&(crate::layout::MOVIE_FLASHES.to_string(), frame)) else { continue };
                     let (pos, size) = self.place(aspect, cx - (fw / 2.0).trunc(), cy - (fh / 2.0).trunc(), fw, fh);
-                    out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: flash_c, rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+                    out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: flash_c, rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
                 }
-                Draw::Run { font, x, y, alpha, gap, align, vertical } => {
-                    let Some(f) = self.fonts.get(crate::layout::RUN_FONTS[font.min(1)]) else { continue };
-                    // 0x520A9A: the run tint's own alpha scaled by the fade the run computed, then
-                    // the widget's
-                    let mut c = faded(run);
-                    c[3] *= alpha as f32 / 255.0;
-                    // 0x522050: a letter at a time, each advancing by its own 0x536970 measure —
-                    // the width across, the height (the glyph's own span) down — plus the gap
-                    let sizes: Vec<f32> = RUN_TEXT.chars().map(|ch| {
-                        let (w, h) = f.measure(&ch.to_string());
-                        if vertical { h } else { w }
-                    }).collect();
-                    let total: f32 = sizes.iter().sum::<f32>() + (RUN_TEXT.chars().count() as i32 * gap) as f32;
-                    let (mut cx, mut cy) = (x, y);
-                    let shift = match align {
-                        1 => total,
-                        2 => total * 0.5,
-                        _ => 0.0,
-                    };
-                    if vertical {
-                        cy = (cy - shift).trunc();
-                    } else {
-                        cx = (cx - shift).trunc();
-                    }
-                    for (ch, sz) in RUN_TEXT.chars().zip(sizes) {
-                        // APPROXIMATION: the original's letters are cut by the oval's stencil;
-                        // without one a letter is kept only when it starts inside the box
-                        let inside = cx >= b.left as f32 && cx < b.right as f32 && cy >= b.top as f32 && cy < b.bottom as f32;
-                        if inside {
-                            self.text(out, aspect, f, &ch.to_string(), cx, cy, 0.0, 0, c);
-                        }
-                        if vertical {
-                            cy = (cy + sz + gap as f32).trunc();
-                        } else {
-                            cx = (cx + sz + gap as f32).trunc();
-                        }
-                    }
-                }
+                d @ Draw::Run { .. } => self.draw_run(out, aspect, &d, RUN_TEXT, faded(run)),
+            }
+        }
+    }
+
+    /// One text run of 0x5208E0 (`movie_overlay::Draw::Run`) spelling `text` in `tint`.
+    fn draw_run(&self, out: &mut Vec<Sprite>, aspect: f32, d: &crate::movie_overlay::Draw, text: &str, tint: [f32; 4]) {
+        let crate::movie_overlay::Draw::Run { font, x, y, alpha, gap, align, vertical } = *d else { return };
+        let Some(f) = self.fonts.get(crate::layout::RUN_FONTS[font.min(1)]) else { return };
+        // 0x520A9A: the run tint's own alpha scaled by the fade the run computed, then
+        // the widget's
+        let mut c = tint;
+        c[3] *= alpha as f32 / 255.0;
+        // 0x522050: a letter at a time, each advancing by its own 0x536970 measure —
+        // the width across, the height (the glyph's own span) down — plus the gap
+        let sizes: Vec<f32> = text.chars().map(|ch| {
+            let (w, h) = f.measure(&ch.to_string());
+            if vertical { h } else { w }
+        }).collect();
+        let total: f32 = sizes.iter().sum::<f32>() + (text.chars().count() as i32 * gap) as f32;
+        let (mut cx, mut cy) = (x, y);
+        let shift = match align {
+            1 => total,
+            2 => total * 0.5,
+            _ => 0.0,
+        };
+        if vertical {
+            cy = (cy - shift).trunc();
+        } else {
+            cx = (cx - shift).trunc();
+        }
+        for (ch, sz) in text.chars().zip(sizes) {
+            // every letter (0x522050 has no box test); the caller's depth mask cuts them
+            self.text(out, aspect, f, &ch.to_string(), cx, cy, 0.0, 0, c);
+            if vertical {
+                cy = (cy + sz + gap as f32).trunc();
+            } else {
+                cx = (cx + sz + gap as f32).trunc();
             }
         }
     }
@@ -1363,10 +1529,10 @@ impl LayoutScreen {
     /// **Every** line the loop reaches is drawn, whether it starts above the box (the one
     /// scrolled part way off the top) or ends below it (the last): the loop runs while the lines'
     /// sum is short of the box's height (0x4CE4A0) and has no test of its own. What cuts them is
-    /// the movie circle's depth mask, `mask` (0x4DAAC0 … 0x4DAB00, `movie_overlay::RowMask`): a
-    /// glyph shows only over the pixels the nine `stencilshape` parts cover — the oval, 113…527 ×
-    /// 94…454 on the credits screen, which is not the widget's box.
-    fn draw_credits_roll(&self, b: crate::movie_overlay::Box4, mask: &crate::movie_overlay::RowMask, now: i64, talpha: f32, aspect: f32, out: &mut Vec<Sprite>) {
+    /// the movie circle's depth mask (0x4DAAC0 … 0x4DAB00, `draw_movie`): a glyph shows only over
+    /// the pixels the nine `stencilshape` parts wrote depth to — the oval, 113…527 × 94…454 on the
+    /// credits screen, which is not the widget's box.
+    fn draw_credits_roll(&self, b: crate::movie_overlay::Box4, now: i64, talpha: f32, aspect: f32, out: &mut Vec<Sprite>) {
         use crate::movie_overlay::{credits_wrap, CreditsRoll};
         let (Some(body), Some(head)) = (self.fonts.get(crate::layout::ROLL_FONTS[0]), self.fonts.get(crate::layout::ROLL_FONTS[1])) else { return };
         let gary = self.cheat_bits & (1 << 6) != 0;
@@ -1406,14 +1572,14 @@ impl LayoutScreen {
             let t = text(id);
             let y = (b.top - roll.offset + acc) as f32;
             if let Some(rest) = t.strip_prefix('#').or_else(|| t.strip_prefix('!')) {
-                self.text_masked(out, aspect, head, rest, centre, y + 3.0, 1, white, mask);
+                self.text(out, aspect, head, rest, centre, y + 3.0, 0.0, 1, white);
             } else if let Some(rest) = t.strip_prefix('*') {
-                self.text_masked(out, aspect, body, rest, centre, y, 1, white, mask);
+                self.text(out, aspect, body, rest, centre, y, 0.0, 1, white);
             } else {
-                self.text_masked(out, aspect, body, &t, centre, y, 1, white, mask);
+                self.text(out, aspect, body, &t, centre, y, 0.0, 1, white);
                 if gary && t == "Gary Steinke" {
                     let c = [1.0, 1.0, 1.0, talpha * 0xC0 as f32 / 255.0];
-                    self.text_masked(out, aspect, head, "(my cat's name is mittens)", centre, y + 13.0, 1, c, mask);
+                    self.text(out, aspect, head, "(my cat's name is mittens)", centre, y + 13.0, 0.0, 1, c);
                 }
             }
             acc += pitch(id, false);
@@ -1502,7 +1668,7 @@ impl LayoutScreen {
         {
             let (pos, size) = self.place(aspect, x + w - sw - 4.0, y + 2.0, sw, sh);
             let color = [1.0, 1.0, 1.0, talpha * 0xD0 as f32 / 255.0];
-            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
             right -= sw + 4.0;
         }
         let Some(f) = self.fonts.get("univers8b.ffn").or_else(|| self.font_for(e)) else { return };
@@ -1640,7 +1806,7 @@ impl LayoutScreen {
         if let Some(&tex) = self.car_views.get(&i) {
             let design = DESIGN.0 / DESIGN.1;
             let (fw, x0) = if aspect > design { (design / aspect, (1.0 - design / aspect) * 0.5) } else { (1.0, 0.0) };
-            out.push(Sprite { texture: tex, pos: [x0, 0.0], size: [fw * aspect, 1.0], uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: tex, pos: [x0, 0.0], size: [fw * aspect, 1.0], uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         }
     }
 
@@ -1903,7 +2069,7 @@ impl LayoutScreen {
         // the rect's width (0x4C5421 with 0x4DB030). Rows are the accessor's own: 14 px each
         // (0x4BC700), the string at (+3, +2) over a bar of the row's colour
         // (0x4BC350). The row loop's own test is at its foot (§4.49), so the row that
-        // crosses the bottom edge is drawn whole and overhangs — there is no scissor.
+        // crosses the bottom edge is drawn — and cut there by the depth mask below.
         let Some((rows, current)) = self.lists.get(&i) else { return };
         let Some(f) = self.font_for(e) else { return };
         let max_h = self.attr_num(e, "selectionboxmaxheight").unwrap_or(0.0) as f32;
@@ -1928,7 +2094,22 @@ impl LayoutScreen {
         // 0x4C6617…0x4C667B: `0x4D9280(x, y, width + 16 when it scrolls, height,
         // 0x10FFFFFF)` — the 16 the rect gave up is taken back for the fill, so the
         // bar spans the whole widget and the scrollbar is drawn over its right edge.
+        //
+        // **And that fill is a depth mask's stencil** (read 2026-09-27): 0x4DAA10 (0x4C6516)
+        // before it, then `THRASH_setstate(0x24, 0)` (0x4C6683) — the alpha test **off** for the
+        // flush 0x4DAAC0 (0x4C668D) does, so the 16-alpha fill writes depth over its whole rect —
+        // then `THRASH_setstate(0x24, 1)` (0x4C6696): the rows, and the scrollbar (0x4DB530 at
+        // 0x4C693D), are drawn `GREATEREQUAL` with the test at 1 until 0x4DAB00 (0x4C6942). **So the
+        // row that overhangs the box is cut at its bottom edge** — by the mask, not by the loop,
+        // which has no test of its own (§4.49). And the reference stays 1 for the rest of the
+        // frame (`fe_depth`).
+        let mask = super::fe_depth::mask_begin();
+        let stencil = out.len();
         out.push(self.quad(aspect, px, py, width, panel_h, [1.0, 1.0, 1.0, 16.0 / 255.0]));
+        super::fe_depth::apply(&mut out[stencil..], nfs_renderer::SpriteDepth { alpha_test: None, ..mask.stencil });
+        super::fe_depth::set_alpha_test(Some(1));
+        let inside_from = out.len();
+        let inside = nfs_renderer::SpriteDepth { alpha_test: Some(1), ..mask.inside };
         // The scrollbar the list grows when it clamps is a `NFS5.VerticalSlider`, and
         // `VerticalSlider.ctr` says what it is: a `track` the full height in
         // **0xffffbb00**, `weeicons.fsh` entry **13** at `0,7` for the up arrow, entry
@@ -1942,8 +2123,18 @@ impl LayoutScreen {
         // 0x4DB030's **16** off the selection box's width and leaves its x alone, so
         // the strip freed is the one to its right. That the bar is drawn at the strip's
         // left edge is this port's reading of that, not a traced placement —
-        // APPROXIMATION. The knob's index is the port's own scroll position now
-        // (§4.45), which is what `[this+0x1BC]->slot10()` is in the original.
+        // APPROXIMATION, kept 2026-09-28. The constructor that plants the four boxes,
+        // 0x4DAF10 (§4.75), is a clean 3-arg `(x, y, h)` `ret 0xC` — `trough.x = x`
+        // unmodified, `trough.y = y`, no width argument at all (0x10 is a constant) — so
+        // *if* the x/y refreshRows (0x4C5460…0x4C57E1) hands it is the selection box's own
+        // shrunk-width origin, this port's placement is exactly right. But that x/y is
+        // built through a chain of single-thiscall-arg getters (0x4E2B50, 0x4E2B30, each
+        // `ret 4`) that leave values staged on the stack across calls rather than in named
+        // locals, and unwinding that staging by hand did not settle cleanly this pass —
+        // the case for "the strip's left edge" stands on the freed-strip argument above,
+        // not on a read of refreshRows' own arithmetic. The knob's index is the port's own
+        // scroll position now (§4.45), which is what `[this+0x1BC]->slot10()` is in the
+        // original.
         if scrolls {
             let sx = px + panel_w;
             let art = |n: usize| self.shapes.get(&("weeicons.fsh".to_string(), n)).copied();
@@ -1952,11 +2143,11 @@ impl LayoutScreen {
             out.push(self.quad(aspect, sx, py, track_w, panel_h, tint([0xff, 0xbb, 0x00, 0xff])));
             if let Some((tex, aw, ah)) = up {
                 let (pos, size) = self.place(aspect, sx, py + 7.0, aw, ah);
-                out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+                out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
             }
             if let Some((tex, aw, ah)) = down {
                 let (pos, size) = self.place(aspect, sx, py + panel_h - ah, aw, ah);
-                out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+                out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
             }
             // the knob's own travel, straight out of `list_scrollbar` so that where
             // it is drawn and where a drag puts it are the same arithmetic
@@ -2005,11 +2196,12 @@ impl LayoutScreen {
         // The row loop starts at the scrollbar's own position — 0x4C66E8 takes
         // `[this+0x1BC]->slot10()` for its first row (§4.45)
         let first = self.scroll.get(&i).copied().unwrap_or(0).min(rows.len().saturating_sub(1));
-        // **The last row is not clipped.** The loop's test is at its *foot*, 0x4C6915:
+        // **The loop does not stop at the edge.** Its test is at its *foot*, 0x4C6915:
         // a row is drawn, its height added, and only then is the running total compared
-        // with `[this+0x1C4]` — so the row that crosses the bottom edge is drawn whole
-        // and overhangs. (0x4DAA10 / 0x4DAAC0, which bracket the draw, are a z step,
-        // not a scissor — §4.44.) The port used to stop one row early.
+        // with `[this+0x1C4]` — so the row that crosses the bottom edge is drawn. The port
+        // used to stop one row early. *(Corrected 2026-09-27: this said the row "overhangs"
+        // and that 0x4DAA10 / 0x4DAAC0 were "a z step, not a scissor" — they are the depth
+        // mask above, which cuts that row at the fill's bottom edge.)*
         let mut acc = 0.0f32;
         let mut ry = py;
         // `Parts.AllParts` overrides the row draw (0x515620, slot 15 of vtable
@@ -2113,6 +2305,7 @@ impl LayoutScreen {
             }
             ry += row.height();
         }
+        super::fe_depth::apply(&mut out[inside_from..], inside);
     }
 }
 
@@ -2172,12 +2365,12 @@ impl LayoutScreen {
         // draw 0x520E50 → 0x520E5E). Until 2026-09-27 this took the `.lay` block's `state=`,
         // so no car-setting arrow ever showed its hover or pressed art.
         let mut from_template = false;
-        for (px, py, file, index, flip) in self.shape_parts_at(e, self.drawn_state(e, i, selected, hovered), None) {
+        for (px, py, file, index, flip) in self.shape_parts_at(e, &self.drawn_state(e, i, selected, hovered), None) {
             let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
             let (pos, size) = self.place(aspect, x + px, y + py, aw, ah);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
-            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
             from_template = true;
         }
         // anything with a picture draws it; anything with a string draws that.
@@ -2199,7 +2392,7 @@ impl LayoutScreen {
             let flip = e.int("flip").unwrap_or(0).max(0);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
-            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         }
         // `NFS5.PLAYERDRIVERPICTURE`'s draw **0x4CF7C0**, after the template's picture
         // (0x4C8260): the box is `0x4C8670`'s — this class autosizes (§4.62), so it is the
@@ -2333,12 +2526,12 @@ impl LayoutScreen {
             let budget = self.typewriter(i, e, w.restart.filter(|_| w.restart != before));
             let mut color = color;
             color[3] *= w.fade(now);
-            if budget != Some(0) {
+            if budget.is_none_or(|(n, _)| n != 0) {
                 self.wrapped_text(out, aspect, f, &w.text, x, y, box_w, e.int("align").unwrap_or(0), color, budget);
             }
         } else if e.class.to_ascii_lowercase().contains("wordwrap") {
             let budget = self.typewriter(i, e, None);
-            if budget != Some(0) {
+            if budget.is_none_or(|(n, _)| n != 0) {
                 self.wrapped_text(out, aspect, f, &text, x, y, box_w, e.int("align").unwrap_or(0), color, budget);
             }
         } else {

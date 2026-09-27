@@ -169,20 +169,30 @@ pub const STEAL_BELOW: u8 = 0x65;
 
 /// **0x5898F0(n, priority, &handle, lo, hi)**, the voice allocator, for a start that needs `need`
 /// voices (the patch's channel count, code 0x82 → layer `+3`, 0x5904CD) out of `budget`, with the
-/// live voices given as `(priority, channels, start order)`:
+/// live voices given as `(priority, channels, stamp)` — `stamp` is [`Voice::stamp`], the service
+/// tick `[0x6B49A8]` the voice started at ([`Shared::service_tick`]):
 ///
 /// * pass 1 (0x589943…0x5899CA) takes free voices (`voice+0xF == 0`);
-/// * pass 2 (0x5899EF…0x589AA8) takes, one at a time, the voice with the **lowest** priority below
-///   [`STEAL_BELOW`], ties to the **smallest** stamp `voice+0x20` (unsigned `jae`) — the service
-///   tick `[0x6B49A8]` it was started at (0x589B3F…0x589B54), so the oldest. The request's own
-///   priority is **not** compared: any start takes a stealable voice;
+/// * pass 2 (0x5899EF…0x589AA8, read to the instruction 2026-09-27) takes, one at a time, the voice
+///   with the **lowest** priority below [`STEAL_BELOW`] (0x589a3b…0x589a48: `jge` skips a
+///   candidate whose priority is not strictly lower than the best so far, so on equal priority
+///   the tie goes to the **smallest** stamp (0x589a51…0x589a58, `jae` — unsigned, so the oldest);
+///   on an exact tie (equal priority *and* stamp) neither replaces the earlier one, so the
+///   **lowest scanned voice-table slot** wins, whatever its stamp. The request's own priority is
+///   **not** compared: any start takes a stealable voice;
 /// * fewer than `need` found → −9 (0x589BE9) and nothing is stopped (the victims are only
 ///   stopped, 0x565D60 on their handle, after the count matched, 0x589B26).
 ///
 /// Returns the indices of the voices to stop, or `None` for the refusal. A stolen stereo voice
-/// frees both its channels (0x565D60 stops the whole handle). APPROXIMATION: the stamp is the
-/// port's start order; the library's is the service tick, and two voices started in one tick tie
-/// to the lower voice index, which depends on the free list's history.
+/// frees both its channels (0x565D60 stops the whole handle). `sort_by_key` is stable, so `live`'s
+/// own order (push order into [`Shared::voices`], not necessarily the original's slot order) is
+/// this port's stand-in for "lowest slot" on an exact tie. *(Until 2026-09-27 `stamp` was the
+/// port's own start-order counter (`VoiceId`), not the service tick — so two voices started in
+/// different ticks but close together could tie here when the original's wouldn't, and vice
+/// versa; withdrawn — [`Shared::service_tick`] now stamps a start with `[0x6B49A8]` exactly as
+/// 0x589B3F…0x589B54 does. The remaining gap — an exact tie's winner depending on the original's
+/// free-list history, which decides which physical slot a voice starts in — is unmodeled and,
+/// short of tracking the 128-slot table itself, unmodelable from the port's `Vec<Voice>`.)*
 pub fn pick_victims(live: &[(u8, u16, u32)], budget: usize, need: usize) -> Option<Vec<usize>> {
     let used: usize = live.iter().map(|&(_, ch, _)| ch.max(1) as usize).sum();
     let mut free = budget.saturating_sub(used);
@@ -202,6 +212,68 @@ pub fn pick_victims(live: &[(u8, u16, u32)], budget: usize, need: usize) -> Opti
     None
 }
 
+/// The port's `byte / 127` volume back to the library's 16.16 `voice+0x2C`: `round(volume ·
+/// 127)` (exact for every caller's byte, all in 0…127; clamped there) `<< 16`.
+fn volume_16(volume: f32) -> i32 {
+    ((volume * 127.0).round().clamp(0.0, 127.0) as i32) << 16
+}
+
+/// The ramps a voice is released with — **0x565DD0(handle, ticks, target)**: [`RELEASE_TICKS`]
+/// from 0x4A9890 and every direct release of the audio update (0x4A9521, 0x4A956F, 0x4A97EF,
+/// 0x4AA454, 0x4AA489, 0x4AA5FF, 0x4AA869, 0x4AA9E4, 0x4AAA2D, 0x4AAA86, 0x4AAD46, 0x4AAF9F), all
+/// to target −1; [`REPLACE_TICKS`] from `Voice_play` 0x4A9C10 when a voice slot is given another
+/// sample (0x4A9D86…0x4A9DA4: the slot's id `+4` differs from the call's) before the new start.
+/// The caller forgets the handle at once (`0x656180[slot] = −1`), so nothing calls the old voice
+/// again: no re-trigger cancels its ramp (a restart takes a new voice; the siren's 0x4AAF50 keeps
+/// the handle, but the next start 0x4AAE90 overwrites it, 0x4AAEEE / 0x4AAF33). The voice stays
+/// in the budget until the ramp stops it.
+pub const RELEASE_TICKS: i32 = 5;
+/// `Voice_play`'s release of a slot's old sample (0x4A9DA1 `push 0x19`), see [`RELEASE_TICKS`].
+pub const REPLACE_TICKS: i32 = 0x19;
+/// The release target (`push −1`, 0x4A98AF …): its goal `−1 << 16` is below 0, so the ramp
+/// ends in the stop.
+pub const RELEASE_TARGET: i32 = -1;
+
+/// A voice's volume ramp `voice+0x24` (the step) / `+0x28` (the goal), **0x565DD0** and
+/// **0x5895E1…0x589619**. The call: `ticks` ≤ 0 → 1 (0x565DFF), goal `= target << 16`, step
+/// `= (goal − voice+0x2C) / ticks` (`idiv`, toward zero), for every voice of the handle's group
+/// (0x590340: state 1, a handle) each from its own `+0x2C`. The service, once a tick, when the
+/// step is not 0: `+0x2C += step`; past the goal (`jl` / `jg` by the step's sign, signed) it is
+/// the goal and the step 0; then `+0x2C < 0` **stops the handle** (0x565D60 — the whole group,
+/// a held anchor too) and the voice's envelope is not stepped that tick (0x589619 → 0x58969E).
+/// `release(5, −1)` from 127: step `(−0x10000 − 0x7F0000) / 5` = −1677721; the volume word
+/// `>> 16` (`sar`) runs 101, 75, 50, 24, and the fifth tick's −65533 stops the voice — four
+/// ticks of fading sound, then silence, where the port stopped at once until 2026-09-27.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Ramp {
+    pub step: i32,
+    pub goal: i32,
+}
+
+impl Ramp {
+    /// 0x565E22…0x565E54 on one voice of volume `vol16`.
+    pub fn start(vol16: i32, ticks: i32, target: i32) -> Self {
+        let ticks = if ticks > 0 { ticks } else { 1 };
+        let goal = target.wrapping_shl(16);
+        Ramp { step: goal.wrapping_sub(vol16) / ticks, goal }
+    }
+
+    /// 0x5895E1…0x58960F: one service tick on `vol16`; `true` when the voice is to be stopped.
+    pub fn tick(&mut self, vol16: &mut i32) -> bool {
+        if self.step == 0 {
+            return false;
+        }
+        let v = vol16.wrapping_add(self.step);
+        *vol16 = v;
+        let past = if self.step >= 0 { v >= self.goal } else { v <= self.goal };
+        if past {
+            *vol16 = self.goal;
+            self.step = 0;
+        }
+        *vol16 < 0
+    }
+}
+
 struct Voice {
     clip: Arc<Clip>,
     /// where the resampler is in the voice's input stream ([`resample::Cursor`]) — for a loop
@@ -210,7 +282,11 @@ struct Voice {
     /// the channel gains and their ramp (0x598700 / 0x5980C0)
     gains: Gains,
     pitch: f32,
-    volume: f32,
+    /// `voice+0x2C`, the caller's volume in 16.16 (`setVolume`'s int `<< 16`, 0x5662E3; the
+    /// request's `+8 << 16` at the start, 0x59055D) — the level byte takes `>> 16`
+    vol16: i32,
+    /// the release ramp `voice+0x24` / `+0x28` ([`Ramp`], 0x565DD0)
+    ramp: Ramp,
     /// the caller's pan byte `voice+0x1F` ([`pan_byte`]; 0x40, the request's default from
     /// 0x561960, until one is given) — the patch's pan is applied at the mix ([`voice_pan`])
     pan: u8,
@@ -220,7 +296,9 @@ struct Voice {
     /// fills every request with 0x7F (0x56199F) and 0x4A9A5F writes `0x7F − aux` for the
     /// collision one-shots (slots from 0x30). 0x5906D7 copies it into the voice.
     fx_scale: u8,
-    /// `voice+0x20` at the start (0x589B54) — here the start order ([`pick_victims`])
+    /// `voice+0x20` at the start (0x589B54): [`Shared::service_tick`] `[0x6B49A8]` as it stood at
+    /// the start — the library service's own tick count, not a start order. *(Until 2026-09-27
+    /// this was the port's `VoiceId`, its own start order — see [`pick_victims`].)*
     stamp: u32,
     /// `voice+0x3E`, the patch pan with its spread drawn at the start ([`voice_pan`])
     patch_pan: u8,
@@ -249,6 +327,87 @@ struct Voice {
     /// pitch word made again). 0x589F75…0x589F90 add `((i8)byte − 0x40) · (i16)voice+0x66 >> 6`
     /// cents ([`Clip::bend_cents`], code 0x0A · 100) to the voice's cents ([`Voice::pitch_word`]).
     bend: i8,
+    /// the software strip's one-pole low-pass (0x5998E0's node, [`LowPass`]), one per channel
+    lowpass: Option<LowPass>,
+    /// Whether the start this voice came from is one [`Shared::silence`] reaches: either the
+    /// voice table `0x656180…0x6563C8` the pause 0x4AB150 walks — `Voice_play` 0x4A9C10's write
+    /// `[voice*8+0x656180] = handle` at a (re)start (0x4a9de9), for every voice number but 0x33 —
+    /// or the speech phrase's own hard stop `0x4AF900`, folded in here for the same observed
+    /// effect (the speech's `[0x6573A8]`/`[0x6573AC]` are not in the table either, but the pause
+    /// silences them by that separate call). `false` for a voice a bare `Voice_start` 0x565E70
+    /// began with no voice number at all: the HUD's `fe_sound` (0x4AADB0), the front end's
+    /// `fesfx`, and — within the race — the checkpoint chime, the wrong-way cue, the pylon-hit cue
+    /// and the cop siren's start (0x4AAE30/0x4AAE50/0x4AAE70/0x4AAE90, straight to
+    /// `Bank_playOneShot` 0x4A98E0 with no `Voice_play` call at all) and the collision one-shots
+    /// (voice 0x33: `wall_hit`, `car_car`, `prop_hit`, `bush_hit`, `landing`, `crash`, … —
+    /// `Voice_play(0x33, …)` 0x4A9C10 takes the `ebx == 0x33` branch at 0x4a9cd4, which calls
+    /// `Bank_playOneShot` and reads the table back at 0x4a9d0b for its answer, but never writes
+    /// it — one voice number shared by every concurrent hit, so tracking a single handle for it
+    /// would make each hit steal the last one's). See [`AudioOutput::silence_voices`].
+    table: bool,
+}
+
+/// **The strip hook `+0xE0`** of the software path — `Voice_setFilter` 0x565F00(handle, value) →
+/// 0x590C20(voice, value) → `strip+0xE0` = **0x596AC0** (set by the strip build 0x589FE0 on the
+/// software arm, flag 4, 0x58A2BE; the hardware arms set 0x596D80 or nothing), for each channel
+/// of the strip (`strip+0xB0`: a count byte, then the channel words): `f = value / (mix rate ·
+/// 0.5)` (`fild`, `fmul` 0.5, `fdivp`, stored f32), then **0x5998E0**(channel, f): `f < 1` puts a
+/// 0x1C-byte node (0x59A170: its pull 0x59A0F0, state `+0xC` = 0) at the head of the channel's
+/// chain (0x596CD0, word `+8` = 0: after the resampler (2) and the optional biquad (1), before
+/// the channel gain) and sets `+0x14 = f`, `+0x10 = 1 − f` (0x59A150); `f ≥ 1` takes the node out
+/// and frees it (0x596D10, the state gone). The node's pull (0x59A0F0 → 0x59C170) runs, per sample
+/// of the resampled block, `y = y · (1 − f) + f · x` and hands `y` on — a **one-pole low-pass**
+/// with its corner at `value` Hz. APPROXIMATION: 0x59C170 keeps `y` on the FPU stack through a
+/// block (its precision is the control word's) and stores it as an f32 between blocks; the port
+/// keeps an f32 throughout.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LowPass {
+    /// `+0x10`, `1 − f`
+    pub a: f32,
+    /// `+0x14`, `f`
+    pub b: f32,
+    /// `+0xC` per channel
+    pub y: [f32; 2],
+}
+
+impl LowPass {
+    /// `f = value / (rate · 0.5)` as 0x596AC0 makes it; `None` for `f ≥ 1` (0x5998E9 `fcomp` 1.0,
+    /// `test ah, 1`).
+    pub fn coefficient(value: i32, mix_rate: u32) -> Option<f32> {
+        let f = (value as f64 / (mix_rate as f64 * 0.5)) as f32;
+        (f < 1.0).then_some(f)
+    }
+
+    /// 0x5998E0 on a voice's node: made at state 0 when there is none, its `f` set.
+    pub fn set(node: &mut Option<LowPass>, value: i32, mix_rate: u32) {
+        match Self::coefficient(value, mix_rate) {
+            Some(f) => {
+                let n = node.get_or_insert(LowPass { a: 0.0, b: 0.0, y: [0.0; 2] });
+                n.b = f;
+                n.a = (1.0f64 - f as f64) as f32;
+            }
+            None => *node = None,
+        }
+    }
+
+    /// 0x59C170 on one sample of channel `ch`.
+    pub fn run(&mut self, ch: usize, x: f32) -> f32 {
+        self.y[ch] = self.y[ch] * self.a + self.b * x;
+        self.y[ch]
+    }
+}
+
+/// The value `Voice_play`'s update hands 0x565F00 (0x4A9FA8…0x4AA03B): nothing (`None`) for the
+/// player's engine banks (`[0x6564A0]` / `[0x6564B0]`, kinds 0 and 1) or at `AUDIOQUALITY`
+/// `[0x657C98]` ≥ 2; else **0xBB8** (3000 Hz) when `[0x627F43] & 8` (view ≤ 1), `0x443EE0` says
+/// not exterior and the view word `[0x627F3C]` is neither 0 nor 0xF — the cockpit — and **0xFFFF**
+/// (no filter) otherwise. Only the update of a playing voice runs it: a start returns before
+/// (0x4A9DC9…0x4A9E03).
+pub fn voice_play_filter(player_engine_bank: bool, audio_quality: u8, cockpit: bool) -> Option<i32> {
+    if player_engine_bank || audio_quality >= 2 {
+        return None;
+    }
+    Some(if cockpit { 0xBB8 } else { 0xFFFF })
 }
 
 /// A voice's envelope, **0x590607…0x590655** at the start and **0x58961E…0x589687** every
@@ -379,7 +538,20 @@ impl Voice {
             (Some(r), Some(t)) => Envelope::start(r.env_level, r.env_segments, &t.envelope),
             _ => Envelope::start(0x7F, 1, &nfs_formats::bnk::DEFAULT_ENVELOPE),
         };
-        Voice { clip, cur: Cursor::default(), gains: Gains::default(), pitch, volume, pan: 0x40, looping, finished: false, fx_scale: 0x7F, stamp, patch_pan, level, cents: 0, env, volume_phase: 0, pitch_phase: 0, pulled: false, anchor: false, held: false, bend: 0x40 }
+        Voice { clip, cur: Cursor::default(), gains: Gains::default(), pitch, vol16: volume_16(volume), ramp: Ramp::default(), pan: 0x40, looping, finished: false, fx_scale: 0x7F, stamp, patch_pan, level, cents: 0, env, volume_phase: 0, pitch_phase: 0, pulled: false, anchor: false, held: false, bend: 0x40, lowpass: None, table: true }
+    }
+
+    /// **`Voice_setVolume` 0x566340 → 0x5662B0** on one voice: the int `<< 16` into `voice+0x2C`
+    /// and the ramp `+0x24` zeroed (0x566303…0x566306) — so a `setVolume` cancels a ramp —
+    /// unless `+0x2C` already holds that value, when nothing is written (0x5662FE `je`; the
+    /// call then returns 0 without walking the rest of the group, 0x566338 — the group's voices
+    /// share their volume, so the port writes each alike).
+    fn set_volume(&mut self, volume: f32) {
+        let v = volume_16(volume);
+        if self.vol16 != v {
+            self.vol16 = v;
+            self.ramp.step = 0;
+        }
     }
 
     /// **0x589DF0**, the voice's level byte `voice+0x3D`: `(envelope >> 16) · (volume >> 16) ·
@@ -394,12 +566,12 @@ impl Voice {
     /// within the same call. No option, slider, fade or front-end level touches it — the Audio
     /// options reach a voice through its `setVolume` byte (`sfx::category`) — so between those
     /// microseconds it is 0x7F, and the port keeps the constant. The volume word `voice+0x2C >> 16`
-    /// is the caller's `setVolume` int (`<< 16`, 0x5662E3, not clamped); the port's callers hand
-    /// `byte / 127`, which `round(volume · 127)` gives back exactly (the clamp to 0…127 never
-    /// bites: every caller's byte is in 0…127).
+    /// (`sar`) is the caller's `setVolume` int (`<< 16`, 0x5662E3, not clamped) — or a release
+    /// ramp's way down ([`Ramp`]); the port's callers hand `byte / 127`, which [`volume_16`]
+    /// gives back exactly.
     fn level_byte(&self) -> i8 {
         const MASTER: i32 = 0x7F;
-        let volume = (self.volume * 127.0).round().clamp(0.0, 127.0) as i32;
+        let volume = self.vol16 >> 16;
         let x = (self.env.level >> 16).wrapping_mul(volume).wrapping_mul(self.level as i32).wrapping_mul(MASTER);
         let mut l = div_127_cubed(x) as i8;
         if let Some(t) = self.clip.tables.first() {
@@ -576,8 +748,6 @@ struct Shared {
     /// what the last callback left queued for the device, in output frames (its delay to the
     /// playback of the buffer plus the buffer), and when it ran — for [`AudioOutput::latency_ms`]
     queued: Option<(u64, std::time::Instant)>,
-    /// every voice at volume 0 — the race pause (see [`AudioOutput::set_muted`])
-    muted: bool,
     /// the software voice count `[0x6B48DD]` ([`voice_budget`]); `None` until the quality is
     /// given — the library's default 24 (0x58A5B5)
     budget: Option<usize>,
@@ -600,6 +770,16 @@ struct Shared {
     rand: crate::librand::LibRand,
     /// the service ticks the mix is counted in (0x58FBC0)
     clock: ServiceClock,
+    /// **`[0x6B49A8]`**, the library service's own tick count (0x589531…0x589538: `inc`ed at the
+    /// top of every call to [`Shared::service`], before anything else): 0 at start-up (`mov
+    /// [0x6B49A8], ebx` with `ebx` 0, 0x5657D1) and never reset — unlike [`ServiceClock::tick`]
+    /// (`[0x6AD7AC]`, 0x58FBC0's own count of mixed frames, which wraps at 30000): the two
+    /// increment in lockstep (0x58FBC0 calls the service once, then counts the next tick's frames,
+    /// [`Shared::render`]) but are different variables, byte-scan confirmed (`bscan.py 0x6b49a8`
+    /// finds no other writer). This is `voice+0x20`'s stamp ([`Voice::stamp`], [`pick_victims`]):
+    /// every start between two service calls reads the same value, so two voices started in the
+    /// same tick tie on it, as the original's do.
+    service_tick: u32,
 }
 
 /// The most frames 0x598940 mixes at once (`cmp edi, 0x100`, 0x598979): a block, the unit every
@@ -789,10 +969,7 @@ impl Shared {
             self.clock.left -= len as u32;
             at += len;
         }
-        if self.muted {
-            out.fill([0.0, 0.0]);
-        }
-        if self.bus_c != 0 && !self.muted {
+        if self.bus_c != 0 {
             let rv = self.tail.get_or_insert_with(|| Reverb::new(mix_rate));
             for (frame, dry) in out.iter_mut().zip(send.iter()) {
                 let w = rv.tick(*dry);
@@ -817,7 +994,8 @@ impl Shared {
     ///   length `+0x49` (code 0x21, unsigned `jb`), and the pitch is made again (0x589593…0x5895B7);
     /// * a **volume table** (`+0x5C`): its step `+0x4A` likewise at `+0x48` (code 0x1E)
     ///   (0x5895BF…0x5895DE);
-    /// * the ramp `voice+0x24` (0x5895E1…0x589619) — a stream's volume ramp here;
+    /// * the ramp `voice+0x24` (0x5895E1…0x589619, [`Ramp`]) — below 0 it stops the handle; a
+    ///   stream's volume ramp is [`Fade`];
     /// * the **envelope** ([`Envelope::tick`], 0x58961E…0x589687), which stops the voice's handle
     ///   — its group — once its segments have run (0x58964D → 0x565D60);
     /// * the level made again (0x589DF0) when any of these changed it.
@@ -827,32 +1005,54 @@ impl Shared {
     /// except that a caller's volume or pitch counts from the next block, where the library's
     /// `setVolume` ramp waits for the next tick.
     fn service(&mut self) {
-        for (_, sv) in self.streams.iter_mut() {
+        // 0x589531…0x589538, the very first thing the service does: `[0x6B49A8] += 1`
+        self.service_tick = self.service_tick.wrapping_add(1);
+        let mut stopped: Vec<VoiceId> = Vec::new();
+        for (id, sv) in self.streams.iter_mut() {
             if let Some(f) = sv.fade.as_mut() {
-                sv.volume = f.advance(sv.volume);
-                if f.steps_left == 0 {
+                if f.tick() {
+                    stopped.push(*id);
+                }
+                sv.volume = f.volume();
+                if f.done() {
                     sv.fade = None;
                 }
             }
         }
-        let mut stop = Vec::new();
+        self.streams.retain(|(i, _)| !stopped.contains(i));
+        let mut stop: Vec<VoiceId> = Vec::new();
         for (id, v) in self.voices.iter_mut() {
-            if v.finished || v.held {
+            // a voice whose group a stop earlier in this pass took is not in state 1 any more
+            if v.finished || v.held || stop.contains(id) {
                 continue;
             }
-            let (Some(r), Some(t)) = (v.clip.records.first().copied(), v.clip.tables.first()) else { continue };
-            if t.pitch.is_some() {
+            let Some(r) = v.clip.records.first().copied() else {
+                // not a bank patch: no tables, no envelope — the ramp only
+                if v.ramp.tick(&mut v.vol16) {
+                    stop.push(*id);
+                }
+                continue;
+            };
+            let tables = v.clip.tables.first();
+            if tables.is_some_and(|t| t.pitch.is_some()) {
                 v.pitch_phase = v.pitch_phase.wrapping_add(1);
                 if v.pitch_phase >= r.pitch_table_len {
                     v.pitch_phase = 0;
                 }
             }
-            if t.volume.is_some() {
+            if tables.is_some_and(|t| t.volume.is_some()) {
                 v.volume_phase = v.volume_phase.wrapping_add(1);
                 if v.volume_phase >= r.volume_table_len as u8 {
                     v.volume_phase = 0;
                 }
             }
+            // the release ramp (0x5895E1…0x589619): below 0 stops the handle, and the envelope
+            // is not stepped
+            if v.ramp.tick(&mut v.vol16) {
+                stop.push(*id);
+                continue;
+            }
+            let Some(t) = tables else { continue };
             let segments = t.envelope.clone();
             if v.env.tick(&segments) {
                 stop.push(*id);
@@ -897,7 +1097,13 @@ impl Shared {
                     })
                 };
                 let x0 = at(0);
-                let xs = [x0, if cc > 1 { at(1) } else { x0 }];
+                let mut xs = [x0, if cc > 1 { at(1) } else { x0 }];
+                // the strip's low-pass at the chain's head, each channel of the voice its own
+                // (a mono voice's one channel feeds both sides)
+                if let Some(lp) = v.lowpass.as_mut() {
+                    xs[0] = lp.run(0, xs[0]);
+                    xs[1] = if cc > 1 { lp.run(1, xs[1]) } else { xs[0] };
+                }
                 let ramping = ramp.filter(|r| fi < r.len);
                 for (ch, o) in frame.iter_mut().enumerate() {
                     let g = match ramping {
@@ -975,16 +1181,40 @@ impl Shared {
         }
     }
 
-    /// [`AudioOutput::play_sel`]'s start (0x5907B0).
-    fn start_patch(&mut self, clip: Arc<Clip>, volume: f32, pitch: f32, looping: bool, sel: u8) -> VoiceId {
+    /// [`AudioOutput::silence_voices`]: only a voice tagged `table` — the pause's own walk never
+    /// reaches the others.
+    fn silence(&mut self) {
+        for (_, v) in self.voices.iter_mut() {
+            if !v.table {
+                continue;
+            }
+            if v.ramp.step != 0 && v.ramp.goal < 0 {
+                continue;
+            }
+            v.set_volume(0.0);
+        }
+    }
+
+    /// [`AudioOutput::ramp`].
+    fn ramp(&mut self, id: VoiceId, ticks: i32, target: i32) {
+        for (_, v) in self.voices.iter_mut().filter(|(i, v)| *i == id && !v.finished && !v.held) {
+            v.ramp = Ramp::start(v.vol16, ticks, target);
+        }
+    }
+
+    /// [`AudioOutput::play_sel`]'s start (0x5907B0). `tabled` is `false` only for the callers
+    /// listed on the `table` field of [`Voice`] — a bare `Voice_start` 0x565E70 in the original,
+    /// never `Voice_play` 0x4A9C10's voice-numbered table.
+    fn start_patch(&mut self, clip: Arc<Clip>, volume: f32, pitch: f32, looping: bool, sel: u8, tabled: bool) -> VoiceId {
         let g = self;
         let id = VoiceId(g.next_id);
         g.next_id += 1;
         if clip.records.is_empty() {
             // not a bank patch: one voice, no draw, the clip's own values scaled by `sel`
             if g.allocate(clip.channels.max(1) as usize, clip.priority, Some(id)) {
-                let mut v = Voice::new(clip.clone(), pitch, volume, looping, id.0);
+                let mut v = Voice::new(clip.clone(), pitch, volume, looping, g.service_tick);
                 v.level = ((clip.gain * 127.0).round() as i32 * sel as i8 as i32 / 127) as i8;
+                v.table = tabled;
                 g.voices.push((id, v));
             }
             return id;
@@ -1004,11 +1234,12 @@ impl Shared {
                 return id;
             }
             let d = crate::librand::record_draws(&mut g.rand, r, sel as i8, patch_cents, pan);
-            let mut v = Voice::new(layer, pitch, volume, looping, id.0);
+            let mut v = Voice::new(layer, pitch, volume, looping, g.service_tick);
             v.patch_pan = d.pan;
             v.level = d.level as i8;
             v.cents = base_cents(r).wrapping_add(d.cents as i16);
             (v.volume_phase, v.pitch_phase) = (d.volume_phase, d.pitch_phase);
+            v.table = tabled;
             tracing::trace!(record = i, ?d, sel, "patch start");
             g.voices.push((id, v));
             started += 1;
@@ -1214,7 +1445,22 @@ impl AudioOutput {
     /// returned [`VoiceId`]. *(Until 2026-09-27 the port played one merged sample per patch, the
     /// last record's, with the last record's draws — an APPROXIMATION.)*
     pub fn play_sel(&self, clip: Arc<Clip>, volume: f32, pitch: f32, looping: bool, sel: u8) -> VoiceId {
-        self.shared.lock().unwrap().start_patch(clip, volume, pitch, looping, sel)
+        self.shared.lock().unwrap().start_patch(clip, volume, pitch, looping, sel, true)
+    }
+
+    /// [`play`](Self::play) for a start the original makes with a bare `Voice_start` 0x565E70,
+    /// never `Voice_play` 0x4A9C10: the HUD's `fe_sound` (0x4AADB0), the front end's `fesfx`, the
+    /// checkpoint chime, the wrong-way cue and the pylon-hit cue (straight to `Bank_playOneShot`
+    /// 0x4A98E0, no voice number at all). Not walked by [`silence_voices`](Self::silence_voices).
+    pub fn play_untabled(&self, clip: Arc<Clip>, volume: f32, pitch: f32, looping: bool) -> VoiceId {
+        self.shared.lock().unwrap().start_patch(clip, volume, pitch, looping, 0x7F, false)
+    }
+
+    /// [`play_untabled`](Self::play_untabled) with the request's byte `+6` ([`play_sel`](Self::play_sel)):
+    /// the collision one-shot's own path, voice 0x33 — `Voice_play` takes it to `Bank_playOneShot`
+    /// (0x4a9cd4…0x4a9d0b) but never writes the table for it (see the `table` field of [`Voice`]).
+    pub fn play_sel_untabled(&self, clip: Arc<Clip>, volume: f32, pitch: f32, looping: bool, sel: u8) -> VoiceId {
+        self.shared.lock().unwrap().start_patch(clip, volume, pitch, looping, sel, false)
     }
 
     /// What 0x4A66B0 configures for `AUDIOQUALITY` when the sound opens (both start-ups 0x4A6840 /
@@ -1257,6 +1503,13 @@ impl AudioOutput {
         id
     }
 
+    /// [`play_panned_sel`](Self::play_panned_sel) over [`play_sel_untabled`](Self::play_sel_untabled).
+    pub fn play_panned_sel_untabled(&self, clip: Arc<Clip>, volume: f32, pitch: f32, pan: u16, looping: bool, sel: u8) -> VoiceId {
+        let id = self.play_sel_untabled(clip, volume, pitch, looping, sel);
+        self.set_pan(id, pan);
+        id
+    }
+
     /// The aux byte of `Voice_play` for a collision one-shot: `voice+0x45 = 0x7F − aux`
     /// (0x4A9A5F…0x4A9A6C → 0x5906D7), so a loud hit sends less to the reverb.
     pub fn set_fx_aux(&self, id: VoiceId, aux: u8) {
@@ -1266,14 +1519,41 @@ impl AudioOutput {
         }
     }
 
-    /// Every one-shot / loop voice at volume 0, the streams (music) left alone — `I_SFX`'s
-    /// `0x566340(h, 0)` over the voice table `0x656180…0x6563C8` and the player's engine voices
-    /// (0x4AF900(0, 0)) at 0x4AB4FB…0x4AB527. The voices the audio update rebuilds each pass
-    /// come back with the levels; a one-shot stays silent to its end.
+    /// `Voice_setVolume(h, 0)` **0x566340** over the voice table `0x656180…0x6563C8` (stride 8)
+    /// — the race pause 0x4AB150 (0x4AB16A…0x4AB18A) and `I_SFX` (0x4AB4FB…0x4AB527) — and over
+    /// the speech phrase's voices `[0x6573A8]` / `[0x6573AC]` (0x4AF900(0, 0), 0x4AF91D…0x4AF944).
+    /// The voices keep running, silent: 0x5662B0 writes `+0x2C = 0` and zeroes the ramp step
+    /// `+0x24` (0x566303…0x566306). The streams (music) are not in the table. **A released voice
+    /// is not either**: every release forgets its handle (`0x656180[slot] = −1`, [`RELEASE_TICKS`]),
+    /// so a voice on its way out ([`Ramp`] toward −1) runs its ramp to the stop, heard. The voices
+    /// the audio update drives come back with its next `setVolume`; a one-shot, the speech phrase
+    /// and a held horn stay silent to their end.
+    ///
+    /// **Settled 2026-09-27** (read to the instruction: 0x4AB150, 0x4A9C10 whole, 0x4A98E0 whole,
+    /// 0x565E70/0x565EA0, 0x4AADB0, 0x4AAE30/0x4AAE50/0x4AAE70/0x4AAE90): the table's entry is 8
+    /// bytes, `+0` the handle (or −1), `+4` the record/patch id last started in that slot, indexed
+    /// by the **voice number** (`Voice_play`'s first argument, 0..0x7F) — not the bank slot. Only
+    /// `Voice_play` 0x4A9C10 ever writes it, at 0x4a9de9 on a genuine (re)start, and only for a
+    /// voice number other than 0x33: at 0x4a9cd4 `cmp ebx, 0x33 ; jne` sends 0x33 (the collision
+    /// one-shot) to `Bank_playOneShot` too but reads the table back for its answer (0x4a9d0b)
+    /// without writing it, since 0x33 is the one voice number every concurrent collision hit
+    /// shares — writing it would make each hit steal the last one's handle. `Bank_playOneShot`
+    /// 0x4A98E0 itself never touches the table (confirmed end to end); called straight from a
+    /// caller with no voice number — the checkpoint chime 0x4AAE30, the wrong-way cue 0x4AAE50,
+    /// the pylon-hit cue 0x4AAE70, the cop siren's start 0x4AAE90 — it is exactly as untracked as
+    /// `Voice_start` 0x565E70's HUD (`fe_sound` 0x4AADB0) and front-end (`fesfx`) one-shots, which
+    /// go through 0x565E70/0x565EA0's own voice pool and never call 0x4A9C10 or 0x4A98E0 at all.
+    /// The port's `Voice` now carries this as `table` (see its field doc), set at every start and
+    /// read by [`Shared::silence`], so the pause silences exactly the table's voices: the loops
+    /// (engine layers, AI engines, road/wind/turbo, the squeal channels), the ambience and the
+    /// player's horn, plus (folded in for the same effect as the speech's own 0x4AF900 stop) the
+    /// announcer phrase — and leaves the HUD/front-end one-shots, the collision one-shots (wall,
+    /// car-car, prop, bush, landing, crash) and the checkpoint chime / wrong-way cue / pylon-hit
+    /// cue / cop siren sounding, as the original does. *(Until 2026-09-27 every voice, table or
+    /// not, was silenced — a collision one-shot, a checkpoint chime or a front-end button click
+    /// still ringing at the instant of the pause fell silent when it should not have.)*
     pub fn silence_voices(&self) {
-        for (_, v) in self.shared.lock().unwrap().voices.iter_mut() {
-            v.volume = 0.0;
-        }
+        self.shared.lock().unwrap().silence();
     }
 
     /// A playing voice's pan from the caller's 16-bit angle: the pan byte ([`pan_byte`]) to
@@ -1286,29 +1566,48 @@ impl AudioOutput {
         }
     }
 
-    /// The voice a status call answers for: the handle's own — a group's anchor, else its one
-    /// voice — while it plays; a held anchor's group by its first playing voice. APPROXIMATION:
-    /// which voice 0x566910 reads for a group is not read.
+    /// The voice a status call answers for — **settled 2026-09-27** (read to the instruction:
+    /// 0x566910 whole, 0x590e20, 0x566d60): the call takes a handle and, via 0x590e20, searches
+    /// the group's own small array for the entry whose *own* handle matches — never a sibling's —
+    /// answering "ended" (state 3, `mov [ebp], 3` at 0x566a1e) only once that entry is gone from
+    /// the array. The game only ever holds the handle 0x590420 answered for a start — the anchor's
+    /// (or the one voice of a solo patch) — so the call always reads the **anchor's own** entry
+    /// while the group has any; there is no reading "the first playing member" or "the lowest
+    /// slot" instead, whatever this note's own preliminary framing said. Found, the entry's own
+    /// remaining-frames field decides 0x566986's `jge`: negative — the held anchor, its sample
+    /// already having run out while the array keeps its bookkeeping ([`Voice::held`], the group
+    /// note) — answers **state 0** with every field left the zero the call started with
+    /// (0x566921…0x56692a): position 0, not the anchor's real (finished) cursor; non-negative
+    /// answers state 1 or 2 (0x566999's `[handle] == the found entry`, an array-index test with no
+    /// bearing on which data is read) from the anchor's own fields either way. The port's `held`
+    /// on the anchor already matches "kept, not freed, no strip" ([`Shared::free`]); this settles
+    /// what a status call answers for it: 0, not a sibling's position and not `None`.
     fn status_voice(g: &Shared, id: VoiceId) -> Option<&Voice> {
-        let all: Vec<&Voice> = g.voices.iter().filter(|(i, v)| *i == id && !v.finished && !v.held).map(|(_, v)| v).collect();
-        all.iter().copied().find(|v| v.anchor).or_else(|| all.first().copied())
+        let group: Vec<&Voice> = g.voices.iter().filter(|(i, _)| *i == id).map(|(_, v)| v).collect();
+        let v = group.iter().copied().find(|v| v.anchor).or_else(|| group.first().copied())?;
+        (!v.finished).then_some(v)
     }
 
-    /// Fraction of the clip already played (0..1), or None when the voice is gone.
+    /// Fraction of the clip already played (0..1), or None when the voice is gone; 0 for a held
+    /// anchor ([`status_voice`](Self::status_voice)).
     pub fn progress(&self, id: VoiceId) -> Option<f32> {
         let g = self.shared.lock().unwrap();
         Self::status_voice(&g, id).map(|v| {
+            if v.held {
+                return 0.0;
+            }
             let n = (v.clip.samples.len() / v.clip.channels.max(1) as usize).max(1) as f64;
             (v.position() / n).clamp(0.0, 1.0) as f32
         })
     }
 
     /// The voice's position in ms — what the sound library's status call 0x566910 answers at `+4`:
-    /// the frames played `· 1000 / rate` (0x5669B9…0x5669D5, a 64-bit multiply and divide), or
-    /// `None` once the voice has ended (its state 3, 0x566A1E).
+    /// the frames played `· 1000 / rate` (0x5669B9…0x5669D5, a 64-bit multiply and divide), 0 for
+    /// a held anchor ([`status_voice`](Self::status_voice)), or `None` once the voice has ended
+    /// (its state 3, 0x566A1E).
     pub fn position_ms(&self, id: VoiceId) -> Option<i32> {
         let g = self.shared.lock().unwrap();
-        Self::status_voice(&g, id).map(|v| played_ms(v.position() as u64, v.clip.rate))
+        Self::status_voice(&g, id).map(|v| if v.held { 0 } else { played_ms(v.position() as u64, v.clip.rate) })
     }
 
     /// `Voice_play` 0x4A9C10's start in the library's own units (0x4A98E0 → 0x561960's request):
@@ -1317,8 +1616,19 @@ impl AudioOutput {
     /// together — no float in between. The word is carried as `word / 4096`, which
     /// [`resample::pitch_word`] gives back exactly.
     pub fn play_word(&self, clip: Arc<Clip>, volume: f32, word: u16, bend: u8, pan: u16, looping: bool) -> VoiceId {
+        self.play_word_tabled(clip, volume, word, bend, pan, looping, true)
+    }
+
+    /// [`play_word`](Self::play_word) for the cop siren's start (0x4AAE90): straight to
+    /// `Bank_playOneShot` 0x4A98E0 with no `Voice_play` voice number, so never in the table (see
+    /// the `table` field of [`Voice`]).
+    pub fn play_word_untabled(&self, clip: Arc<Clip>, volume: f32, word: u16, bend: u8, pan: u16, looping: bool) -> VoiceId {
+        self.play_word_tabled(clip, volume, word, bend, pan, looping, false)
+    }
+
+    fn play_word_tabled(&self, clip: Arc<Clip>, volume: f32, word: u16, bend: u8, pan: u16, looping: bool, tabled: bool) -> VoiceId {
         let mut g = self.shared.lock().unwrap();
-        let id = g.start_patch(clip, volume, word as f32 / 4096.0, looping, 0x7F);
+        let id = g.start_patch(clip, volume, word as f32 / 4096.0, looping, 0x7F, tabled);
         for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
             v.bend = bend as i8;
             v.pan = pan_byte(pan);
@@ -1332,7 +1642,7 @@ impl AudioOutput {
     pub fn set_word(&self, id: VoiceId, volume: f32, word: u16, bend: u8) {
         let mut g = self.shared.lock().unwrap();
         for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
-            v.volume = volume;
+            v.set_volume(volume);
             v.pitch = word as f32 / 4096.0;
             v.bend = bend as i8;
         }
@@ -1341,22 +1651,50 @@ impl AudioOutput {
     pub fn set(&self, id: VoiceId, volume: f32, pitch: f32) {
         let mut g = self.shared.lock().unwrap();
         for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
-            v.volume = volume;
+            v.set_volume(volume);
             v.pitch = pitch.max(0.05);
         }
+    }
+
+    /// **0x565DD0(handle, ticks, target)** on every playing voice of the handle's group
+    /// ([`Ramp`]); a held anchor (state 2) is not walked (0x590340 takes state 1 only).
+    pub fn ramp(&self, id: VoiceId, ticks: i32, target: i32) {
+        self.shared.lock().unwrap().ramp(id, ticks, target);
+    }
+
+    /// **0x565F00(handle, value)**, the strip hook `+0xE0` on every playing voice of the group
+    /// ([`LowPass`]); `value` from [`voice_play_filter`].
+    pub fn set_filter(&self, id: VoiceId, value: i32) {
+        let mut g = self.shared.lock().unwrap();
+        let rate = g.mix_rate();
+        for (_, v) in g.voices.iter_mut().filter(|(i, v)| *i == id && !v.finished && !v.held) {
+            LowPass::set(&mut v.lowpass, value, rate);
+        }
+    }
+
+    /// `Voice_play`'s update tail (0x4A9FA8…0x4AA03B): [`set_filter`](Self::set_filter) with
+    /// `value` when there is one.
+    pub fn voice_play_filter(&self, id: VoiceId, value: Option<i32>) {
+        if let Some(v) = value {
+            self.set_filter(id, v);
+        }
+    }
+
+    /// The audio update's release of a voice, 0x565DD0(h, [`RELEASE_TICKS`], −1) — 0x4A9890 and
+    /// the direct calls ([`RELEASE_TICKS`]'s list). The caller drops the handle.
+    pub fn release(&self, id: VoiceId) {
+        self.ramp(id, RELEASE_TICKS, RELEASE_TARGET);
+    }
+
+    /// `Voice_play`'s release of a slot's previous sample, 0x565DD0(h, 0x19, −1) (0x4A9DA4).
+    pub fn release_replaced(&self, id: VoiceId) {
+        self.ramp(id, REPLACE_TICKS, RELEASE_TARGET);
     }
 
     pub fn stop(&self, id: VoiceId) {
         let mut g = self.shared.lock().unwrap();
         g.voices.retain(|(i, _)| *i != id);
         g.streams.retain(|(i, _)| *i != id);
-    }
-
-    /// The race pause's audio side, 0x4AB150: `Voice_setVolume(h, 0)` on the player's engine voices
-    /// (0x4AF900) and on every voice of the table `0x656180` — they keep running, silent — until the
-    /// resume 0x4AB200 puts the saved levels back. Here the whole mix is held at zero instead.
-    pub fn set_muted(&self, muted: bool) {
-        self.shared.lock().unwrap().muted = muted;
     }
 
     /// `0x565CD0(id, level)`: bit 0x20 of the id sets the bus `[0x6B4A0C]`, bit 0x80
@@ -1419,8 +1757,9 @@ impl StreamSource {
 }
 
 impl AudioOutput {
-    /// `0x566AE0(stream, ms, target)`: ramp a stream's volume to `target` over `ms` ([`Fade`]).
-    pub fn fade(&self, id: VoiceId, ms: i32, target: f32) {
+    /// `0x566AE0(stream, ms, target)`: ramp a stream's volume to the byte `target` over `ms`
+    /// ([`Fade`]).
+    pub fn fade(&self, id: VoiceId, ms: i32, target: i32) {
         let mut g = self.shared.lock().unwrap();
         if let Some((_, sv)) = g.streams.iter_mut().find(|(i, _)| *i == id) {
             sv.fade = Some(Fade::new(sv.volume, ms, target));
@@ -1461,32 +1800,45 @@ pub(crate) struct StreamVoice {
     pub(crate) fade: Option<Fade>,
 }
 
-/// A volume ramp, **0x565DD0(voice, steps, target)** as `0x566AE0(stream, ms, target)` calls it:
-/// `steps = ms / 10` toward zero (the magic 0x66666667, `sar 2`), at least 1 (0x565DFF…0x565E03);
-/// the goal `voice+0x28 = target << 16` and the step `voice+0x24 = (goal − volume) / steps`
-/// (`idiv`). One step per service tick (0x589520's `voice+0x24` branch), a hundredth of a second
-/// of the mix ([`ServiceClock`], 0x58FBC0 — read 2026-09-27; the 10 ms was HIGH before).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// **0x566AE0(stream, ms, target)**: the byte `stream+0xE4 = target` and **0x565DD0**(`stream+8`,
+/// `ms / 10`, target) on the stream's voice — the same [`Ramp`] as a release: `ms / 10` toward
+/// zero (`imul` 0x66666667, `sar 2`, the sign added), at least 1 (0x565DFF…0x565E03); the goal
+/// `target << 16`, the step `(goal − voice+0x2C) / ticks` (`idiv`, toward zero), one step a
+/// service tick, a hundredth of a second of the mix ([`ServiceClock`], 0x58FBC0), until the
+/// volume is past the goal — then it is the goal and the step 0. The voice's level is the word
+/// `>> 16` (0x589DF0), which 0x567850 answers (its `+0x3D`, 0x591320). So F9's
+/// 0x566AE0(stream, 0x1F4, 0) (0x4AD80A) from level 80 steps 50 times by −104857 in 16.16: the
+/// level runs 78, 76, 75 … 1, 0 — 0 on the fiftieth tick with 30 left in the word, the goal
+/// on the fifty-first. A goal below 0 would stop the handle (0x5895E1…0x589619); no stream
+/// caller passes one. *(Until 2026-09-27 the port stepped the float volume in exactly `ms / 10`
+/// even steps, not byte levels.)*
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fade {
-    pub step: f32,
-    pub goal: f32,
-    pub steps_left: u32,
+    pub ramp: Ramp,
+    /// the stream voice's `+0x2C`, 16.16
+    pub vol16: i32,
 }
 
 impl Fade {
-    pub fn new(volume: f32, ms: i32, goal: f32) -> Self {
-        let steps = (ms / 10).max(1) as u32;
-        Self { step: (goal - volume) / steps as f32, goal, steps_left: steps }
+    /// `volume` the stream's current `byte / 127`, `target` the call's byte.
+    pub fn new(volume: f32, ms: i32, target: i32) -> Self {
+        let vol16 = volume_16(volume);
+        Self { ramp: Ramp::start(vol16, ms / 10, target), vol16 }
     }
 
-    /// One service tick's step: the new volume, `None` once the goal is reached.
-    pub fn advance(&mut self, volume: f32) -> f32 {
-        if self.steps_left <= 1 {
-            self.steps_left = 0;
-            return self.goal;
-        }
-        self.steps_left -= 1;
-        volume + self.step
+    /// One service tick: `true` when the ramp went below 0 and stops the handle.
+    pub fn tick(&mut self) -> bool {
+        self.ramp.tick(&mut self.vol16)
+    }
+
+    /// The level byte over 127, as the mix takes the stream's volume.
+    pub fn volume(&self) -> f32 {
+        (self.vol16 >> 16).max(0) as f32 / 127.0
+    }
+
+    /// The ramp has reached its goal.
+    pub fn done(&self) -> bool {
+        self.ramp.step == 0
     }
 }
 
@@ -1528,22 +1880,30 @@ mod fade_tests {
     use super::Fade;
 
     #[test]
-    fn a_500_ms_fade_is_fifty_steps_to_the_goal() {
-        // F9's 0x566AE0(stream, 0x1F4, 0): 500 / 10 = 50 steps
-        let mut f = Fade::new(0.5, 500, 0.0);
-        assert_eq!(f.steps_left, 50);
-        let mut v = 0.5;
-        let mut n = 0;
-        while f.steps_left > 0 {
-            v = f.advance(v);
-            n += 1;
+    fn the_f9_fade_is_the_library_ramp_in_byte_levels() {
+        // F9's 0x566AE0(stream, 0x1F4, 0) on a stream at level 80: 500 / 10 = 50 ticks, step
+        // (0 − 0x500000) / 50 = −104857 toward zero
+        let mut f = Fade::new(80.0 / 127.0, 500, 0);
+        assert_eq!((f.vol16, f.ramp.step, f.ramp.goal), (80 << 16, -104857, 0));
+        let mut levels = Vec::new();
+        while !f.done() {
+            assert!(!f.tick(), "a goal of 0 never stops the stream");
+            levels.push(f.vol16 >> 16);
         }
-        assert_eq!(n, 50);
-        assert_eq!(v, 0.0);
-        // a 5 ms ramp (the song start's 0x566AE0(stream, 5, level)) is one step
-        let mut f = Fade::new(0.0, 5, 0.4);
-        assert_eq!(f.steps_left, 1);
-        assert_eq!(f.advance(0.0), 0.4);
+        assert_eq!(levels.len(), 51);
+        assert_eq!(&levels[..3], &[78, 76, 75]);
+        assert_eq!(&levels[48..], &[1, 0, 0]);
+        // the fiftieth tick leaves 30 in the word (level 0), the fifty-first the goal
+        assert_eq!(f.vol16, 0);
+        assert_eq!(f.volume(), 0.0);
+        // `ms / 10` toward zero, at least one tick: a 5 ms ramp (the song start's) is one step
+        let mut f = Fade::new(0.0, 5, 51);
+        assert!(!f.tick());
+        assert!(f.done());
+        assert_eq!(f.volume(), 51.0 / 127.0);
+        // a negative goal stops the handle when the word goes below 0
+        let mut f = Fade::new(1.0 / 127.0, 10, -1);
+        assert!(f.tick());
     }
 }
 
@@ -1661,6 +2021,16 @@ mod budget_tests {
         // 100s left the oldest of them
         let live: Vec<(u8, u16, u32)> = (0..24).map(|i| (100, 1, 50 - i)).collect();
         assert_eq!(pick_victims(&live, 24, 1), Some(vec![23]));
+    }
+
+    #[test]
+    fn an_exact_tie_of_priority_and_stamp_steals_the_lowest_scanned_slot() {
+        // 0x589a51…0x589a58: on equal priority *and* equal stamp, `jae` skips the later
+        // candidate, so the earlier-scanned slot (the port's earlier-pushed voice, its stand-in
+        // for "lowest slot" — `pick_victims`'s doc) keeps the pick, in whatever order the ties
+        // are given
+        let live: Vec<(u8, u16, u32)> = vec![(26, 1, 5), (26, 1, 5), (26, 1, 5)];
+        assert_eq!(pick_victims(&live, 3, 1), Some(vec![0]));
     }
 
     #[test]
@@ -1783,15 +2153,16 @@ mod rate_tests {
     fn a_stream_fade_steps_once_a_tick() {
         let src = super::StreamSource::new(22050, 1);
         let mut s = Shared::default();
-        s.streams.push((super::VoiceId(0), super::StreamVoice { src, volume: 1.0, frac: 0, window: [[0.0; 4]; 2], primed: false, fade: Some(super::Fade::new(1.0, 30, 0.0)) }));
-        // the first render runs the service before its first frame: one of the three steps
+        s.streams.push((super::VoiceId(0), super::StreamVoice { src, volume: 1.0, frac: 0, window: [[0.0; 4]; 2], primed: false, fade: Some(super::Fade::new(1.0, 30, 0)) }));
+        // the first render runs the service before its first frame: one of the three steps,
+        // 127 << 16 less 2774357 — level 84
         s.render(1, 22050);
-        assert!((s.streams[0].1.volume - 2.0 / 3.0).abs() < 1e-6);
+        assert_eq!(s.streams[0].1.volume, 84.0 / 127.0);
         // the rest of the first tick (208 frames) has no service; the next tick's has
         s.render(207, 22050);
-        assert!((s.streams[0].1.volume - 2.0 / 3.0).abs() < 1e-6);
+        assert_eq!(s.streams[0].1.volume, 84.0 / 127.0);
         s.render(1, 22050);
-        assert!((s.streams[0].1.volume - 1.0 / 3.0).abs() < 1e-6);
+        assert_eq!(s.streams[0].1.volume, 42.0 / 127.0);
     }
 
     #[test]
@@ -1888,7 +2259,7 @@ mod group_tests {
     }
 
     fn start(s: &mut Shared, clip: &Arc<Clip>, sel: u8) -> VoiceId {
-        s.start_patch(clip.clone(), 1.0, 1.0, false, sel)
+        s.start_patch(clip.clone(), 1.0, 1.0, false, sel, true)
     }
 
     #[test]
@@ -1934,6 +2305,25 @@ mod group_tests {
     }
 
     #[test]
+    fn a_held_anchor_answers_zero_never_a_siblings_position() {
+        // 0x566910: the call always reads the handle's own entry (0x590e20's self-match), never a
+        // sibling's; a held anchor's own entry stays in the group's array (it is not freed) but
+        // its remaining-frames field is negative — state 0, every field left the zero the call
+        // started with — and `None` only once the group is fully gone (state 3, 0x566a1e)
+        let clip = patch([2000, 10, 300]);
+        let mut s = Shared::default();
+        s.interp = crate::resample::Interp::Linear;
+        let id = start(&mut s, &clip, 75);
+        s.render(1000, 22050);
+        assert!(s.voices[1].1.held && s.voices[1].1.anchor && !s.voices[0].1.held);
+        let v = super::AudioOutput::status_voice(&s, id).expect("the group is still alive");
+        assert!(v.held, "answers the held anchor, not the still-playing sibling at voices[0]");
+        s.render(2000, 22050);
+        assert!(s.voices.is_empty());
+        assert!(super::AudioOutput::status_voice(&s, id).is_none(), "state 3: gone");
+    }
+
+    #[test]
     fn a_refused_record_stops_the_ones_started() {
         // one voice free: record 0 takes it, record 2 finds only the patch's own voice at 26 —
         // stealable, so it takes it: the first is stopped by the steal, the second plays
@@ -1953,6 +2343,21 @@ mod group_tests {
         // record 0 took the free voice, record 2 was refused: record 0 is stopped again
         assert!(s.voices.iter().all(|(i, _)| *i != id));
         assert_eq!(s.voices.len(), 1);
+    }
+
+    #[test]
+    fn two_starts_before_the_next_service_tick_share_the_voice_steal_stamp() {
+        // 0x589531…0x589538 increments [0x6B49A8] once per call to the service, not once per
+        // start (0x589B3F…0x589B54 just reads it) — so every patch started between two service
+        // calls carries the same `voice+0x20` stamp
+        let clip = layer(10, 50);
+        let mut s = Shared::default();
+        start(&mut s, &clip, 0x7F);
+        start(&mut s, &clip, 0x7F);
+        assert_eq!(s.voices.iter().map(|(_, v)| v.stamp).collect::<Vec<_>>(), [0, 0]);
+        s.service();
+        start(&mut s, &clip, 0x7F);
+        assert_eq!(s.voices[2].1.stamp, 1);
     }
 }
 
@@ -1984,7 +2389,7 @@ mod service_tests {
         // the start adds the draws to it (a record without spreads draws nothing)
         let mut s = Shared::default();
         let c = Arc::new(Clip { records: vec![rec(&[(0x07, 48), (0x10, 25)])], tables: vec![tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())], ..(*clip(PatchRecord::from_codes(&[]), RecordTables::default())).clone() });
-        s.start_patch(c, 1.0, 1.0, false, 0x7F);
+        s.start_patch(c, 1.0, 1.0, false, 0x7F, true);
         assert_eq!(s.voices[0].1.cents, 1225);
         assert_eq!(s.voices[0].1.pitch_word(), cents_word(1225));
     }
@@ -2006,7 +2411,7 @@ mod service_tests {
         assert_eq!(cents_word(-143), 3776);
         let mut s = Shared::default();
         let c = Arc::new(Clip { rate: 44100, records: vec![r], tables: vec![tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())], ..(*clip(PatchRecord::from_codes(&[]), RecordTables::default())).clone() });
-        s.start_patch(c, 1.0, word as f32 / 4096.0, true, 0x7F);
+        s.start_patch(c, 1.0, word as f32 / 4096.0, true, 0x7F, true);
         assert_eq!(s.voices[0].1.pitch_word(), 3303);
         assert_eq!(resample::step_16_16(3303, 44100, 32000), 72831);
     }
@@ -2027,7 +2432,7 @@ mod service_tests {
         assert_eq!(cents_word(-56), 3968);
         let mut s = Shared::default();
         let c = Arc::new(Clip { rate: 16000, bend_cents: 700, records: vec![r], tables: vec![tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())], ..(*clip(PatchRecord::from_codes(&[]), RecordTables::default())).clone() });
-        s.start_patch(c, 1.0, word as f32 / 4096.0, true, 0x7F);
+        s.start_patch(c, 1.0, word as f32 / 4096.0, true, 0x7F, true);
         assert_eq!(s.voices[0].1.bend, 0x40);
         assert_eq!(s.voices[0].1.pitch_word(), 3471);
         assert_eq!(resample::step_16_16(3471, 16000, 32000), 27768);
@@ -2041,7 +2446,7 @@ mod service_tests {
         let r = PatchRecord::from_codes(&[(0x07, 57)]);
         let mut s = Shared::default();
         let c = Arc::new(Clip { bend_cents: 1200, records: vec![r], tables: vec![tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())], ..(*clip(PatchRecord::from_codes(&[]), RecordTables::default())).clone() });
-        s.start_patch(c, 1.0, 1.0, true, 0x7F);
+        s.start_patch(c, 1.0, 1.0, true, 0x7F, true);
         assert_eq!(s.voices[0].1.pitch_word(), cents_word(300), "0x40 is no bend");
         s.voices[0].1.bend = 127;
         assert_eq!(s.voices[0].1.pitch_word(), 9632);
@@ -2155,5 +2560,150 @@ mod service_tests {
         assert_eq!(s.voices.len(), 2);
         s.render(208, 22050);
         assert!(s.voices.is_empty());
+    }
+
+    #[test]
+    fn a_release_is_a_five_tick_ramp_below_zero() {
+        use super::{Ramp, RELEASE_TARGET, RELEASE_TICKS};
+        // 0x565DD0(h, 5, −1) from 127: step (−0x10000 − 0x7F0000) / 5 toward zero
+        let mut v = 127 << 16;
+        let mut r = Ramp::start(v, RELEASE_TICKS, RELEASE_TARGET);
+        assert_eq!(r, Ramp { step: -1677721, goal: -0x10000 });
+        let mut words = Vec::new();
+        let mut stopped = false;
+        for _ in 0..5 {
+            stopped = r.tick(&mut v);
+            words.push(v >> 16);
+        }
+        assert_eq!(words, [101, 75, 50, 24, -1]);
+        assert!(stopped);
+        assert_eq!(v, -65533);
+        // from 40 the fifth tick lands past the goal: clamped to it, the step 0, still below 0
+        let mut v = 40 << 16;
+        let mut r = Ramp::start(v, 5, -1);
+        assert!(!(0..4).any(|_| r.tick(&mut v)));
+        assert!(r.tick(&mut v));
+        // ticks ≤ 0 are 1 (0x565E03); an upward ramp stops at its goal and does nothing more
+        let mut v = 0;
+        let mut r = Ramp::start(v, 0, 100);
+        assert!(!r.tick(&mut v));
+        assert_eq!((v, r.step), (100 << 16, 0));
+        assert!(!r.tick(&mut v));
+    }
+
+    #[test]
+    fn a_released_voice_holds_its_budget_until_the_ramp_stops_it() {
+        let r = PatchRecord { env_level: 0x7F, env_segments: 1, ..PatchRecord::from_codes(&[]) };
+        let mut s = Shared::default();
+        s.voices.push((VoiceId(4), Voice::new(clip(r, tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())), 1.0, 1.0, true, 0)));
+        s.voices.push((VoiceId(5), Voice::new(clip(r, tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())), 1.0, 1.0, true, 0)));
+        s.ramp(VoiceId(4), super::RELEASE_TICKS, super::RELEASE_TARGET);
+        // ticks 1…4 fade it; the fifth (0x589611) stops the handle
+        s.render(1, 22050);
+        assert_eq!(s.voices[0].1.vol16 >> 16, 101);
+        s.render(207 + 224 * 2 + 1, 22050);
+        assert_eq!(s.voices.len(), 2);
+        assert_eq!(s.voices[0].1.vol16 >> 16, 24);
+        // tick 4 is 224 frames, one of them mixed
+        s.render(223, 22050);
+        assert_eq!(s.voices.len(), 2);
+        s.render(1, 22050);
+        assert_eq!(s.voices.len(), 1);
+        assert_eq!(s.voices[0].0, VoiceId(5));
+        // a setVolume (0x5662B0) cancels a ramp: the step zeroed with the new volume
+        s.ramp(VoiceId(5), 5, -1);
+        s.voices[0].1.set_volume(0.5);
+        assert_eq!(s.voices[0].1.ramp.step, 0);
+        assert_eq!(s.voices[0].1.vol16, 64 << 16);
+    }
+
+    #[test]
+    fn the_pause_silences_the_table_but_not_a_released_voice() {
+        // 0x4AB150 → 0x566340(h, 0) over 0x656180…0x6563C8: a released handle is not there any
+        // more (the release forgets it), so its ramp runs on; every other voice goes to 0, its
+        // ramp step zeroed (0x566303…0x566306), and keeps running
+        let r = PatchRecord { env_level: 0x7F, env_segments: 1, ..PatchRecord::from_codes(&[]) };
+        let mut s = Shared::default();
+        for id in 1..=3 {
+            s.voices.push((VoiceId(id), Voice::new(clip(r, tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())), 1.0, 1.0, true, 0)));
+        }
+        s.ramp(VoiceId(1), super::RELEASE_TICKS, super::RELEASE_TARGET);
+        // an upward ramp (a stream's fade-in shape) is a table voice's: cancelled
+        s.ramp(VoiceId(3), 5, 100);
+        s.silence();
+        assert_eq!(s.voices[0].1.vol16, 127 << 16);
+        assert_eq!(s.voices[0].1.ramp.step, -1677721);
+        assert_eq!((s.voices[1].1.vol16, s.voices[1].1.ramp.step), (0, 0));
+        assert_eq!((s.voices[2].1.vol16, s.voices[2].1.ramp.step), (0, 0));
+        // the released one ramps out and stops; the silenced ones still play
+        s.render(22050, 22050);
+        assert_eq!(s.voices.iter().map(|(i, _)| i.0).collect::<Vec<_>>(), [2, 3]);
+        // the next update's setVolume brings a loop back at its level
+        s.voices[0].1.set_volume(0.5);
+        assert_eq!(s.voices[0].1.vol16, 64 << 16);
+    }
+
+    #[test]
+    fn the_pause_leaves_an_untabled_voice_sounding() {
+        // 0x4AB150 walks only 0x656180…0x6563C8; a bare Voice_start 0x565E70 voice — the HUD's
+        // fe_sound, the front end's fesfx, the collision one-shots (voice 0x33), the checkpoint
+        // chime / wrong-way cue / pylon-hit cue and the cop siren's start — is never in it
+        // (`RE/notes/sfx.md` "Audit 2026-09-27, audio port 11")
+        let r = PatchRecord { env_level: 0x7F, env_segments: 1, ..PatchRecord::from_codes(&[]) };
+        let mut s = Shared::default();
+        s.voices.push((VoiceId(1), Voice::new(clip(r, tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())), 1.0, 1.0, true, 0)));
+        s.voices[0].1.table = false;
+        s.voices.push((VoiceId(2), Voice::new(clip(r, tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())), 1.0, 1.0, true, 0)));
+        s.silence();
+        assert_eq!(s.voices[0].1.vol16, 127 << 16, "not in the table: untouched");
+        assert_eq!(s.voices[1].1.vol16, 0, "in the table: silenced");
+    }
+
+    #[test]
+    fn the_strip_hook_is_a_one_pole_low_pass_at_the_value_in_hz() {
+        use super::{voice_play_filter, LowPass};
+        // 0x596AC0: 3000 / (rate · 0.5); 0xFFFF is ≥ 1 at every mix rate — no node
+        assert_eq!(LowPass::coefficient(0xBB8, 22050), Some((3000.0f64 / 11025.0) as f32));
+        assert_eq!(LowPass::coefficient(0xBB8, 32000), Some(0.1875));
+        assert_eq!(LowPass::coefficient(0xFFFF, 32000), None);
+        assert_eq!(LowPass::coefficient(16000, 32000), None);
+        // the node starts at 0 and follows `y = y·(1 − f) + f·x` (0x59C170)
+        let mut n = None;
+        LowPass::set(&mut n, 0xBB8, 32000);
+        let lp = n.as_mut().unwrap();
+        assert_eq!((lp.a, lp.b), (0.8125, 0.1875));
+        assert_eq!(lp.run(0, 1000.0), 187.5);
+        assert_eq!(lp.run(0, 1000.0), 187.5 * 0.8125 + 187.5);
+        assert_eq!(lp.y[1], 0.0);
+        // a new value keeps the state; 0xFFFF takes the node away (0x596D10)
+        LowPass::set(&mut n, 0xBB8, 22050);
+        assert_eq!(n.unwrap().y[0], 187.5 * 0.8125 + 187.5);
+        LowPass::set(&mut n, 0xFFFF, 22050);
+        assert!(n.is_none());
+        // 0x4A9FA8…0x4AA03B: the player's engine banks and AUDIOQUALITY ≥ 2 are left alone
+        assert_eq!(voice_play_filter(true, 0, true), None);
+        assert_eq!(voice_play_filter(false, 2, true), None);
+        assert_eq!(voice_play_filter(false, 1, true), Some(0xBB8));
+        assert_eq!(voice_play_filter(false, 0, false), Some(0xFFFF));
+    }
+
+    #[test]
+    fn a_filtered_voice_mixes_its_low_passed_samples() {
+        use super::LowPass;
+        // a square wave at the Nyquist rate (step 0x10000): the one-pole filter smooths it
+        let alt = Arc::new(Clip { samples: (0..4000).map(|i| if i % 2 == 0 { 8000 } else { -8000 }).collect(), rate: 22050, ..(*clip(PatchRecord::from_codes(&[]), tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec()))).clone() });
+        let peak = |filter: bool| {
+            let mut s = Shared::default();
+            s.interp = crate::resample::Interp::Linear;
+            let mut v = Voice::new(alt.clone(), 1.0, 1.0, true, 0);
+            if filter {
+                LowPass::set(&mut v.lowpass, 0xBB8, 22050);
+            }
+            s.voices.push((VoiceId(1), v));
+            s.render(2000, 22050)[1000..].iter().map(|f| f[0].abs()).fold(0.0f32, f32::max)
+        };
+        let (open, closed) = (peak(false), peak(true));
+        assert!(open > 0.05, "{open}");
+        assert!(closed < open * 0.25, "{closed} vs {open}");
     }
 }

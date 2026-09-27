@@ -1,14 +1,14 @@
-use crate::{Camera, MaterialDesc, MeshData, Scene, Sprite, TextureData, Vertex};
+use crate::{Camera, MaterialDesc, MeshData, Scene, Sprite, SpriteCompare, TextureData, Vertex};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MeshId(u32);
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TextureId(u32);
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MaterialId(u32);
 
 #[repr(C)]
@@ -72,13 +72,21 @@ struct GpuTexture {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SpriteVertex {
-    pos: [f32; 2],
+    /// clip space; z the screen depth of a sprite under a depth state (`Sprite::depth`), else 0
+    pos: [f32; 3],
     uv: [f32; 2],
     color: [f32; 4],
+    /// the alpha test's reference (`SpriteDepth::alpha_test`); −1 when the test is off (every
+    /// pixel's alpha passes), 0 for a plain sprite (unused there)
+    alpha_ref: f32,
 }
 
 struct GpuMaterial {
     bind_group: wgpu::BindGroup,
+    /// `false_sort`'s single-draw arm (`SPECIALFX` below 2, `RE/notes/thrash.md` §6d.4): the same
+    /// bind group with the point-filtered sampler (Thrash 7 ← 0, `LayerFalseSort1` 0x449ABE),
+    /// built alongside `bind_group` and kept only for a `FakeSort` material
+    bind_group_point: Option<wgpu::BindGroup>,
     alpha_blend: bool,
     blend_pair: u8,
     device_states: bool,
@@ -132,8 +140,19 @@ pub struct Renderer {
     /// the scene samplers by address mode and mip filter — index `clamp_u | clamp_v << 1 |
     /// point_mip << 2`
     samplers: [wgpu::Sampler; 8],
+    /// the `FakeSort` single-draw arm's samplers (Thrash 7 ← 0, `MAG`/`MINFILTER` `POINT`), by
+    /// address mode alone — index `clamp_u | clamp_v << 1` — used only while `fakesort_single`
+    point_samplers: [wgpu::Sampler; 4],
     /// the mip filter's `POINT` → `LINEAR` promotion, `[0x69DD1D]` (`set_trilinear`); clear at start, as the image has it
     trilinear: bool,
+    /// `SPECIALFX` `[0x657D6C]` 0 or 1 (0x44EC80's jump table entries 0/1 both go to 0x44EC91):
+    /// `LayerFalseSort1`/`2`'s other arm — one draw, `MAG`/`MINFILTER` forced `POINT` for it,
+    /// depth writes untouched (`RE/notes/thrash.md` §6d.4) — instead of the double blended draw
+    /// with depth writes off then on. At `SPECIALFX` 2 the original picks either arm at runtime,
+    /// by the smoothed frame rate against 37.5 and the article's draw distance against 10000
+    /// (0x44EC9C…0x44ECE6, `[0x657424]`/`[0x627ED8]`/`[0x61975C]`, none read further); the port
+    /// keeps the double-draw arm there, as at 3 — APPROXIMATION.
+    fakesort_single: bool,
     sprite_sampler: wgpu::Sampler,
     object_buf: wgpu::Buffer,
     object_bg: wgpu::BindGroup,
@@ -143,6 +162,9 @@ pub struct Renderer {
     materials: Vec<GpuMaterial>,
     white: TextureId,
     sprite_pipeline: wgpu::RenderPipeline,
+    /// The front end's depth-state sprites (`Sprite::depth`): depth writes on, the alpha test, the
+    /// compare `LESSEQUAL` \[0\] / `GREATEREQUAL` \[1\].
+    sprite_depth_pipelines: [wgpu::RenderPipeline; 2],
     /// offscreen render targets handed out by [`Renderer::render_offscreen`], by texture index
     offscreen: std::collections::HashMap<u32, (u32, u32)>,
     sprite_layout: wgpu::BindGroupLayout,
@@ -472,23 +494,28 @@ impl Renderer {
         // anisotropy at 8, the port's own). The promotion to `LINEAR` is `[0x69DD1D]`, which
         // 0x44ED10 clears and sets again only at `SPECIALFX` 3 (0x44EDD1, 0x44EF04) and the front
         // end's 0x44F020 clears (0x44F080) — `set_trilinear`; below it the mip filter is `POINT`.
-        let make_sampler = |clamp_u: bool, clamp_v: bool, mip: wgpu::FilterMode| {
+        let make_sampler = |clamp_u: bool, clamp_v: bool, mag_min: wgpu::FilterMode, mip: wgpu::FilterMode| {
             let mode = |c: bool| if c { wgpu::AddressMode::ClampToEdge } else { wgpu::AddressMode::Repeat };
             device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("scene"),
                 address_mode_u: mode(clamp_u),
                 address_mode_v: mode(clamp_v),
                 address_mode_w: wgpu::AddressMode::Repeat,
-                mag_filter: wgpu::FilterMode::Linear,
-                min_filter: wgpu::FilterMode::Linear,
+                mag_filter: mag_min,
+                min_filter: mag_min,
                 mipmap_filter: mip,
                 ..Default::default()
             })
         };
         let samplers = std::array::from_fn(|i| {
             let mip = if i & 4 == 0 { wgpu::FilterMode::Linear } else { wgpu::FilterMode::Nearest };
-            make_sampler(i & 1 != 0, i & 2 != 0, mip)
+            make_sampler(i & 1 != 0, i & 2 != 0, wgpu::FilterMode::Linear, mip)
         });
+        // `LayerFalseSort1`/`2`'s other arm sets Thrash 7 ← 0 for the one draw (`MAG`/`MINFILTER`
+        // `POINT`) and never touches state 0x0B, so the mip filter here follows the same `POINT`
+        // default as every other sampler below `SPECIALFX` 3 (`trilinear` is false whenever
+        // `fakesort_single` can be true — the two are set from the same level, `main.rs`)
+        let point_samplers = std::array::from_fn(|i| make_sampler(i & 1 != 0, i & 2 != 0, wgpu::FilterMode::Nearest, wgpu::FilterMode::Nearest));
 
         // The 2D pass needs its own sampler. The 3D one once asked for `anisotropy_clamp: 8` and
         // `mipmap_filter: Linear`, which on a single-level texture — every sprite atlas is one —
@@ -517,9 +544,10 @@ impl Renderer {
         // (0x4D9B30's arg 8, also via 0x4D9AF0's arg 6; 0x4D9E70's arg 12, also via 0x4D9E10's
         // arg 10), and all 72 call sites pass 0. `dx7z.dll` turns `ALPHABLENDENABLE` on or off
         // only for Thrash 0x0A (0x60003EFE) and at device creation; binding a texture
-        // (0x60008000 → 0x60007F30) sets nothing else. Not carried: the device's alpha test
-        // (`GREATER`, reference 0 / 1 / 10 by what the front end drew last), which drops texels
-        // of alpha ≤ 10 that blending would lay at ≤ 4 %.
+        // (0x60008000 → 0x60007F30) sets nothing else. The device's alpha test (`GREATER`,
+        // reference 0 / 1 / 10 by what the front end drew last) is carried only for a sprite
+        // under a depth state (`Sprite::depth`), where it decides which pixels write depth; on a
+        // plain sprite it would drop texels of alpha ≤ 10 that blending lays at ≤ 4 %.
         let sprite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("sprite"), source: wgpu::ShaderSource::Wgsl(include_str!("sprite.wgsl").into()) });
         let sprite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sprite"),
@@ -529,17 +557,29 @@ impl Renderer {
             ],
         });
         let sprite_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("sprite"), bind_group_layouts: &[&sprite_layout], push_constant_ranges: &[] });
-        let sprite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("sprite"),
-            layout: Some(&sprite_pl),
-            vertex: wgpu::VertexState { module: &sprite_shader, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<SpriteVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4] }] },
-            fragment: Some(wgpu::FragmentState { module: &sprite_shader, entry_point: Some("fs_main"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
-            depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: false, depth_compare: wgpu::CompareFunction::Always, stencil: Default::default(), bias: Default::default() }),
-            multisample: Default::default(),
-            multiview: None,
-            cache: None,
-        });
+        let sprite_vertex = [wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<SpriteVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x4, 3 => Float32] }];
+        let make_sprite_pipeline = |label: &str, fs: &str, depth: wgpu::DepthStencilState| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&sprite_pl),
+                vertex: wgpu::VertexState { module: &sprite_shader, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &sprite_vertex },
+                fragment: Some(wgpu::FragmentState { module: &sprite_shader, entry_point: Some(fs), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
+                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+                depth_stencil: Some(depth),
+                multisample: Default::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let sprite_pipeline = make_sprite_pipeline("sprite", "fs_main", wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: false, depth_compare: wgpu::CompareFunction::Always, stencil: Default::default(), bias: Default::default() });
+        // A front-end sprite under the kit's depth state (`crate::SpriteDepth`): Thrash 0x39 ← 1
+        // (0x4D30BE) and the compare Thrash 0x28 sets — 3 `LESSEQUAL` (0x4D30C9), 6 `GREATEREQUAL`
+        // inside a mask (0x4DAAC0 → 0x537830) — with the device's alpha test in the shader.
+        let depth_state = |compare| wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: true, depth_compare: compare, stencil: Default::default(), bias: Default::default() };
+        let sprite_depth_pipelines = [
+            make_sprite_pipeline("sprite lessequal", "fs_alpha_test", depth_state(wgpu::CompareFunction::LessEqual)),
+            make_sprite_pipeline("sprite greaterequal", "fs_alpha_test", depth_state(wgpu::CompareFunction::GreaterEqual)),
+        ];
         let sprite_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("sprites"), size: MAX_SPRITES * 6 * std::mem::size_of::<SpriteVertex>() as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let mut r = Self {
             surface,
@@ -563,7 +603,9 @@ impl Renderer {
             sky_bgs: std::collections::HashMap::new(),
             no_reflections: false,
             samplers,
+            point_samplers,
             trilinear: false,
+            fakesort_single: false,
             sprite_sampler,
             object_buf,
             object_bg,
@@ -573,6 +615,7 @@ impl Renderer {
             materials: Vec::new(),
             white: TextureId(0),
             sprite_pipeline,
+            sprite_depth_pipelines,
             offscreen: std::collections::HashMap::new(),
             sprite_layout,
             sprite_buf,
@@ -728,8 +771,10 @@ impl Renderer {
         let env = desc.env_texture.unwrap_or(self.white);
         let sampler = desc.clamp[0] as usize | (desc.clamp[1] as usize) << 1;
         let bind_group = self.material_bind_group(texture, sampler, env);
+        let bind_group_point = desc.false_sort.then(|| self.material_bind_group_point(texture, sampler, env));
         self.materials.push(GpuMaterial {
             bind_group,
+            bind_group_point,
             alpha_blend: desc.alpha_blend,
             blend_pair: desc.blend_pair.min(3),
             device_states: desc.device_states,
@@ -817,6 +862,16 @@ impl Renderer {
     /// mip filter, and the environment map.
     fn material_bind_group(&self, texture: TextureId, sampler: usize, env: TextureId) -> wgpu::BindGroup {
         let sampler = &self.samplers[sampler | (!self.trilinear as usize) << 2];
+        self.material_bind_group_with(texture, sampler, env)
+    }
+
+    /// The same bind group with `MAG`/`MINFILTER` `POINT` (Thrash 7 ← 0) — `LayerFalseSort1`'s
+    /// other arm, for a `FakeSort` material only.
+    fn material_bind_group_point(&self, texture: TextureId, sampler: usize, env: TextureId) -> wgpu::BindGroup {
+        self.material_bind_group_with(texture, &self.point_samplers[sampler], env)
+    }
+
+    fn material_bind_group_with(&self, texture: TextureId, sampler: &wgpu::Sampler, env: TextureId) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("material"),
             layout: &self.material_layout,
@@ -844,6 +899,11 @@ impl Renderer {
             self.materials[i].bind_group = self.material_bind_group(m.texture, m.sampler, m.env);
         }
         self.rebuild_globals_bg();
+    }
+
+    /// `SPECIALFX` below 2 (`LayerFalseSort1`/`2`'s other arm, see `fakesort_single`'s doc).
+    pub fn set_fakesort_single(&mut self, on: bool) {
+        self.fakesort_single = on;
     }
 
     pub fn render(&mut self, scene: &Scene, camera: &Camera) -> Result<()> {
@@ -1017,6 +1077,9 @@ impl Renderer {
             let lod_bias = self.materials.get(item.material.0 as usize).map(|m| m.lod_bias).unwrap_or(0.0);
             // the alpha test: the material's race states, or the draw's own Thrash 0x24 ← 10
             let alpha_test = self.materials.get(item.material.0 as usize).is_some_and(|m| m.device_states) || item.alpha_test;
+            // `.w` below: 0 no test, else the reference + ½ — a texel alpha under it (≤ the
+            // reference in bytes) fails `GREATER`
+            let alpha_ref = if alpha_test { item.alpha_ref as f32 + 0.5 } else { 0.0 };
             // state 0x18 as a pull toward the eye in view depth: `−b · (far − near) / 32768` over
             // the pass's own planes — the view's near and far, which 0x466F30 hands the projection
             // 0x5391B0 (`cam+0xCC` / `+0xD0`) and 0x540870 loads as the screen z's range: the main
@@ -1038,8 +1101,9 @@ impl Renderer {
                 shadow_u: item.shadow.map_or([0.0; 4], |s| s.0),
                 shadow_v: item.shadow.map_or([0.0; 4], |s| s.1),
                 // .y flags the item `Headlights::LayerUVLight` lays the `HEAD` decal over
-                // .w the alpha test of a material with `device_states`
-                shadow_on: [item.shadow.is_some() as u32 as f32, item.uv_lit as u32 as f32, lod_bias, alpha_test as u32 as f32],
+                // .w the alpha test (a material with `device_states`, or the draw's own): its
+                // reference + ½ in bytes, 0 for none
+                shadow_on: [item.shadow.is_some() as u32 as f32, item.uv_lit as u32 as f32, lod_bias, alpha_ref],
                 sky_u: item.sky.map_or([0.0; 4], |s| s.u),
                 sky_v: item.sky.map_or([0.0; 4], |s| s.v),
                 // .y the item is drawn in the sky pass (its fog is the sky's)
@@ -1099,16 +1163,50 @@ impl Renderer {
                     pass.set_bind_group(3, &self.sky_bgs[&sky.0], &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-                    // `LayerFalseSort1` / `2`: the same draw first with depth writes off, then on
-                    // (0x449ADB / 0x449B2A, `RE/notes/thrash.md` §6d.4)
-                    if mat.false_sort && mat.alpha_blend {
-                        pass.set_pipeline(&self.pipelines[plain * 6 + sub]);
+                    // `LayerFalseSort1` / `2`: at `SPECIALFX` 2 or 3, the same draw first with depth
+                    // writes off, then on (0x449ADB / 0x449B2A, `RE/notes/thrash.md` §6d.4). Below
+                    // 2, the other arm never draws twice: one draw, `MAG`/`MINFILTER` forced
+                    // `POINT` for it (0x449ABE, `fakesort_single`), depth writes untouched.
+                    if mat.false_sort && mat.alpha_blend && self.fakesort_single {
+                        if let Some(bgp) = &mat.bind_group_point {
+                            pass.set_bind_group(2, bgp, &[]);
+                        }
+                        pass.set_pipeline(&self.pipelines[group * 6 + sub]);
+                        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    } else {
+                        if mat.false_sort && mat.alpha_blend {
+                            pass.set_pipeline(&self.pipelines[plain * 6 + sub]);
+                            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                        }
+                        pass.set_pipeline(&self.pipelines[group * 6 + sub]);
                         pass.draw_indexed(0..mesh.index_count, 0, 0..1);
                     }
-                    pass.set_pipeline(&self.pipelines[group * 6 + sub]);
-                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
                 }
             }
+            drop(pass);
+            // The 2D pass, over the 3-D one. Its depth starts at 1.0: the front end clears the
+            // depth window before its 2D draws (0x4DA890 at 0x4D30AC / 0x4D3182: `THRASH_window(3)`
+            // then `THRASH_clearwindow`, which on `dx7z.dll` clears the depth buffer alone —
+            // 0x60001230 → 0x60008380, `D3DCLEAR_ZBUFFER` without the target when the depth window
+            // is current — to the view's `+0x34`, 1.0 (0x537741, Thrash 0x43, 0x60004C90)). Only a
+            // sprite with a depth state (`Sprite::depth`) tests or writes it; every other draws
+            // as before.
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sprite pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
             // HUD sprites
             let n_sprites = scene.sprites.len().min(MAX_SPRITES as usize);
             if scene.sprites.len() > MAX_SPRITES as usize {
@@ -1123,8 +1221,8 @@ impl Renderer {
                     verts.extend_from_slice(&sprite_quad(sp, aspect));
                 }
                 self.queue.write_buffer(&self.sprite_buf, 0, bytemuck::cast_slice(&verts));
-                pass.set_pipeline(&self.sprite_pipeline);
                 pass.set_vertex_buffer(0, self.sprite_buf.slice(..));
+                let mut bound = None;
                 let log = std::env::var("NFS_SPRITE_LOG").is_ok();
                 for (i, sp) in scene.sprites.iter().take(n_sprites).enumerate() {
                     let bg = self.textures[sp.texture.0 as usize].sprite_bg.as_ref();
@@ -1134,6 +1232,15 @@ impl Renderer {
                         tracing::info!(i, tex = sp.texture.0, bound = bg.is_some(), x0 = v.pos[0], y0 = v.pos[1], x1 = w.pos[0], uv0 = ?v.uv, color = ?v.color, "sprite");
                     }
                     if let Some(bg) = bg {
+                        let pipeline = sp.depth.map(|d| d.compare);
+                        if bound != Some(pipeline) {
+                            pass.set_pipeline(match pipeline {
+                                None => &self.sprite_pipeline,
+                                Some(SpriteCompare::LessEqual) => &self.sprite_depth_pipelines[0],
+                                Some(SpriteCompare::GreaterEqual) => &self.sprite_depth_pipelines[1],
+                            });
+                            bound = Some(pipeline);
+                        }
                         pass.set_bind_group(0, bg, &[]);
                         pass.draw((i * 6) as u32..(i * 6 + 6) as u32, 0..1);
                     }
@@ -1146,8 +1253,9 @@ impl Renderer {
 
 /// Build the two triangles of a sprite in clip space (y up), rotating about its pivot in screen space.
 fn sprite_quad(sp: &Sprite, aspect: f32) -> [SpriteVertex; 6] {
+    let (z, alpha_ref) = sp.depth.map_or((0.0, 0.0), |d| (d.z, d.alpha_test.map_or(-1.0, f32::from)));
     if let Some((t, col)) = sp.tri {
-        let v = |p: [f32; 2], c: [f32; 4]| SpriteVertex { pos: [p[0] * 2.0 - 1.0, 1.0 - p[1] * 2.0], uv: sp.uv_min, color: c };
+        let v = |p: [f32; 2], c: [f32; 4]| SpriteVertex { pos: [p[0] * 2.0 - 1.0, 1.0 - p[1] * 2.0, z], uv: sp.uv_min, color: c, alpha_ref };
         let (a, b, c) = (v(t[0], col[0]), v(t[1], col[1]), v(t[2], col[2]));
         return [a, b, c, c, c, c];
     }
@@ -1163,9 +1271,10 @@ fn sprite_quad(sp: &Sprite, aspect: f32) -> [SpriteVertex; 6] {
         let x = px + rx / aspect;
         let y = py + ry;
         SpriteVertex {
-            pos: [x * 2.0 - 1.0, 1.0 - y * 2.0],
+            pos: [x * 2.0 - 1.0, 1.0 - y * 2.0, z],
             uv: [sp.uv_min[0] + (sp.uv_max[0] - sp.uv_min[0]) * u, sp.uv_min[1] + (sp.uv_max[1] - sp.uv_min[1]) * v],
             color: sp.color,
+            alpha_ref,
         }
     };
     let (a, b, c, d) = (corner(0.0, 0.0), corner(1.0, 0.0), corner(1.0, 1.0), corner(0.0, 1.0));

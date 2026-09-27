@@ -260,8 +260,8 @@ fn vs_main(in: VsIn) -> VsOut {
 // alpha test — `ALPHAFUNC` `GREATER` from the device (0x6000A50E, `[0x600180E8]` = 5) and the
 // reference **10** the race sets through Thrash 0x24 (`dx7z.dll` 0x60003F9C; 0x443615, 0x452085,
 // `RE/notes/thrash.md` §6d.4): a fragment whose alpha is 10/255 or less is dropped, colour and depth
-// alike.
-const ALPHA_REF: f32 = 10.5 / 255.0;
+// alike. `shadow_on.w` carries the draw's reference + ½ in bytes (0: no test) — 10 but for a draw
+// that inherits a particle system's 1 (0x454456, `DrawItem::alpha_ref`).
 
 // The weather fog (`Scene::fog`, `Scene::sky_fog`; 0x45D2E0 / 0x45D3B0): Direct3D 7's table fog
 // `EXP` on the vertex's W, the view depth in metres (`nfs_renderer::Fog`), `f = exp(−density · d)`
@@ -283,7 +283,7 @@ fn fogged(in: VsOut, c: vec4<f32>) -> vec4<f32> {
 @fragment
 fn fs_opaque(in: VsOut) -> @location(0) vec4<f32> {
     let c = shade(in);
-    if object.shadow_on.w > 0.5 && c.a < ALPHA_REF {
+    if object.shadow_on.w > 0.0 && c.a * 255.0 < object.shadow_on.w {
         discard;
     }
     return vec4<f32>(fogged(in, c).rgb, 1.0);
@@ -292,7 +292,7 @@ fn fs_opaque(in: VsOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let c = shade(in);
-    if object.shadow_on.w > 0.5 && c.a < ALPHA_REF {
+    if object.shadow_on.w > 0.0 && c.a * 255.0 < object.shadow_on.w {
         discard;
     }
     return fogged(in, c);

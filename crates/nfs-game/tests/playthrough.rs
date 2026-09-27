@@ -19,6 +19,8 @@ struct Run {
     tables: CareerTables,
     career: Career,
     blockers: Vec<String>,
+    /// Finale records won (the award 0x4EE17D leaves only the prize car behind).
+    finales_won: Vec<i16>,
     /// Assets already loaded once, so twenty tournaments on eight tracks stay cheap.
     seen: BTreeSet<String>,
     /// Events whose track has no racing line: the AI has nothing to follow there.
@@ -118,6 +120,11 @@ impl Run {
             let order: Vec<usize> = (0..8).collect();
             let times: [u64; 8] = std::array::from_fn(|i| 100_000 + i as u64 * 1000);
             let out = self.career.record_event(&self.tables, &t, ev, &order, &times, &[true; 8], Some(idx));
+            // the era step's race end lands on `[E, VictoryRoom] endofera` (0x4D476F): the finale
+            // of 0x504800 is offered there and then, and never again (§10.3)
+            if out.era_advanced {
+                self.play_finale();
+            }
             if out.reset {
                 self.blockers.push(format!("tournament {id}: reset after winning every event"));
                 return false;
@@ -131,21 +138,19 @@ impl Run {
     }
 
     fn play_finale(&mut self) {
-        let Some(f) = self.career.finale.clone() else { return };
-        let Some(t) = self.tables.tournament(f.tournament).cloned() else {
-            self.blockers.push(format!("finale of {:?}: no tournament record {}", f.era, f.tournament));
-            self.career.decline_finale();
+        let Some(t) = self.career.finale_tournament(&self.tables).cloned() else {
+            self.blockers.push("finale: no record for 0x504800".into());
             return;
         };
-        // the finale is raced in the loaned prize car (0x4EE17D)
+        // the finale is raced in the loaned prize car (0x4EB710 modes 10 / 11)
         for (ev, e) in t.events.iter().enumerate() {
-            let what = format!("{:?} finale event {ev}", f.era);
+            let what = format!("finale {} event {ev}", t.id);
             self.check_race(e.track_id, e.backwards, t.prize_car, None, &what);
         }
         let order: Vec<usize> = (0..8).collect();
         match self.career.record_finale(&self.tables, &order) {
-            Some((true, _)) => {}
-            other => self.blockers.push(format!("{:?} finale: winning it returned {other:?}", f.era)),
+            Some((true, _)) => self.finales_won.push(t.id),
+            other => self.blockers.push(format!("finale {}: winning it returned {other:?}", t.id)),
         }
     }
 
@@ -181,13 +186,12 @@ fn the_whole_career_can_be_played_through() {
         eprintln!("skipping: tables would not load");
         return;
     };
-    let mut run = Run { paths, tables, career: Career::default(), blockers: Vec::new(), seen: BTreeSet::new(), no_line: BTreeSet::new(), races: 0 };
+    let mut run = Run { paths, tables, career: Career::default(), blockers: Vec::new(), finales_won: Vec::new(), seen: BTreeSet::new(), no_line: BTreeSet::new(), races: 0 };
 
     // Evolution: every listed tournament of the era the player is up to, then the era's finale.
     let mut guard = 0;
     while !run.career.evolution_complete && guard < 200 {
         guard += 1;
-        run.play_finale();
         let era = run.career.era;
         let open: Vec<i16> = run
             .tables
@@ -197,11 +201,8 @@ fn the_whole_career_can_be_played_through() {
             .map(|t| t.id)
             .collect();
         if open.is_empty() {
-            if run.career.finale.is_none() {
-                run.blockers.push(format!("{era:?} has nothing open and no finale, and the career does not advance"));
-                break;
-            }
-            continue;
+            run.blockers.push(format!("{era:?} has nothing open, and the career does not advance"));
+            break;
         }
         for id in open {
             if !run.play(id) {
@@ -209,7 +210,6 @@ fn the_whole_career_can_be_played_through() {
             }
         }
     }
-    run.play_finale();
     if !run.career.evolution_complete {
         run.blockers.push(format!("Evolution never completes — stuck in {:?}", run.career.era));
     }
@@ -242,15 +242,15 @@ fn the_whole_career_can_be_played_through() {
     assert!(era_total >= 3 && club_total >= 3 && run.tables.missions.len() >= 3, "the tables did not load: nothing to play");
 
     eprintln!(
-        "playthrough: {} races started, {} in the bank, {} cars, eras completed {:?}",
+        "playthrough: {} races started, {} in the bank, {} cars, finales won {:?}",
         run.races,
         run.career.money,
         run.career.garage.len(),
-        run.career.eras_completed
+        run.finales_won
     );
     if !run.no_line.is_empty() {
         eprintln!("tracks with no racing line (the AI has nothing to follow): {:?}", run.no_line);
     }
     assert!(run.blockers.is_empty(), "a playthrough is blocked:\n  {}", run.blockers.join("\n  "));
-    assert_eq!(run.career.eras_completed.len(), 3, "all three era finales should be won");
+    assert_eq!(run.finales_won, vec![31, 32, 33], "all three era finales should be won");
 }

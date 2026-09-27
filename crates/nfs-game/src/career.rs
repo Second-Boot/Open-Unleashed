@@ -10,7 +10,8 @@
 //!   `trn.prize[rank]` after the last event for any rank; rank > 3 resets the tournament (0x503AD0).
 //! * Era advances when every visible tournament of the era is completed (rank ≤ 3); the chronicle
 //!   year steps through the year table on each first completion.
-//! * Era finale: one-off event (5 laps) in the loaned prize car `trn+0x10C`; 1st place awards it.
+//! * Era finale: one-off event (5 laps) in the loaned prize car `trn+0x10C` of 0x504990(0x504800());
+//!   1st place awards it (0x4EE17D). No finale state is kept: the offer is the front end's stack.
 //! * Dealer price by age curve (0x4EE220); car value by year curve, mileage, damage, wins, parts
 //!   (0x4F8E50, HIGH); selling pays the value (the original's offer loop is simplified — MEDIUM).
 //! * Career races add 3000 km and one win to the owned car.
@@ -132,6 +133,12 @@ impl CareerTables {
     }
     pub fn track_name(&self, id: i16) -> String {
         self.track(id).map(|t| self.strings.text(t.name_string_id)).unwrap_or_else(|| format!("track {id}"))
+    }
+    /// **0x504990(era)** — the era's finale record: the first record with `+4 == era` and
+    /// `+0xE4 == 2`, or, when none is (an era id 0x504800 did not find, below), the table's
+    /// **first record** (0x5049C6 returns the base), tournament 1.
+    pub fn finale_record(&self, era: Option<Era>) -> Option<&Tournament> {
+        era.and_then(|e| self.tournaments.iter().find(|t| t.kind == TournamentKind::Era(e) && t.is_hidden())).or_else(|| self.tournaments.first())
     }
     /// Era tournaments (Evolution mode) of `era`, visible ones first, hidden finale last.
     pub fn era_tournaments(&self, era: Era) -> Vec<&Tournament> {
@@ -311,12 +318,30 @@ impl OwnedCar {
     }
 
     /// Bring a car from a version-1 port career up to [`SAVE_VERSION`] 2. **Port-only** — the
-    /// original always writes a car's stock list (`savegame.md` §4.7). Those careers kept the
-    /// stock parts implicit: no `stock`, and `parts` holding only what was bought, the stock part
-    /// of a replaced slot simply gone. So the stock list is rebuilt from the record as 0x4EE9A0
-    /// would, and every stock part whose slot no installed part fills (the same type name and
-    /// category — 0x4F0220's test) is put back on the car, appended in stock order
-    /// (APPROXIMATION: the order is the port's). A car that has a stock list is left alone.
+    /// original always writes a car's stock list (`savegame.md` §4.7), so it never actually loads
+    /// this exact state; there is no literal trace for it. So the stock list is rebuilt from the
+    /// record as 0x4EE9A0 would, and every stock part whose slot no installed part fills (the same
+    /// type name and category — 0x4F0220's test, read to the instruction 2026-09-27: it marks each
+    /// `+0x75C` entry found by that test among `+0x758`, no more) is put back on the car.
+    ///
+    /// *(Settled 2026-09-27, order.)* Appended at the end, in the record's own stock order — not
+    /// the replaced slot's position. Two CONFIRMED reads of the *live* object settle which of the
+    /// three the original's own code does whenever it adds a missing stock part to an
+    /// already-populated `+0x758` (the closest a real game gets to this port-only case):
+    /// * **0x518510**, installing a part from the spares inventory: the part it displaces (found by
+    ///   the same name+category test) is erased from **its own index** in `+0x758` — shifting every
+    ///   later element down — and the part going in is **pushed onto the end** (0x518638…0x518708),
+    ///   never written back into the vacated slot.
+    /// * **0x4F8590**'s back-fill (0x4F89D7…0x4F8C63) for a market car whose random picks left a
+    ///   slot empty: for each `+0x75C` entry in turn, unmatched → a fresh copy is **pushed onto the
+    ///   end** of `+0x758` (0x4F8B59…0x4F8C48), in the stock list's own order; matched → nothing.
+    ///   No sort follows either push.
+    /// So "appended at the end, in stock order, no re-sort" is not the port's own choice — it is
+    /// the original's rule for this operation, read off the one case it actually runs. (The
+    /// exchange-sort at `+0x758`'s **construction** and at **load**, `owned_from_image`'s own
+    /// comment, is a different moment and already ported; this function runs after that sort, on
+    /// an already-sorted `parts`, matching 0x4F8590's own precondition.) A car that already has a
+    /// stock list is left alone.
     pub fn adopt_implicit_stock(&mut self, tables: &CareerTables) {
         if !self.stock.is_empty() {
             return;
@@ -695,14 +720,6 @@ pub struct TournamentState {
     pub failed_attempts: u32,
 }
 
-/// One-off era finale offered after an era completes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct FinalePending {
-    pub era: Era,
-    /// Tournament id of the finale record (31 / 32 / 33).
-    pub tournament: i16,
-}
-
 /// What one of `repair.lay`'s ten `QUICKFIX` boxes repairs — the fix function 0x50F110 calls for
 /// its slot (0x50F27D…0x50F354). See [`Career::repair`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -726,11 +743,12 @@ pub struct Career {
     pub money: i64,
     pub garage: Vec<OwnedCar>,
     pub tournaments: BTreeMap<i16, TournamentState>,
-    /// Eras whose finale was won (prize cars awarded).
-    pub eras_completed: Vec<Era>,
-    /// Finale waiting to be raced (or declined).
-    #[serde(default)]
-    pub finale: Option<FinalePending>,
+    // *(Until 2026-09-27 the port also kept `finale` — a pending finale — and `eras_completed`
+    // — the eras whose finale was won. Neither is a field of the original: the finale is keyed
+    // on 0x504800 alone (the launch, 0x4ED66F / 0x4FC5BF, and the award 0x4EE17D through
+    // `PrizeCars.Car` 0x502550), its offer is the front end's screen stack
+    // (`[E, VictoryRoom] endofera`, 0x4D4809…0x4D484F), and a won finale leaves nothing but
+    // the prize car in the garage (0x502270). An older port JSON's two keys are ignored.)*
     /// Evolution finished (Modern era completed, `0x691E54`).
     #[serde(default)]
     pub evolution_complete: bool,
@@ -781,7 +799,7 @@ fn default_year() -> u16 {
 
 impl Default for Career {
     fn default() -> Self {
-        Self { version: SAVE_VERSION, era: Era::Classic, year: 1950, money: STARTING_MONEY, garage: Vec::new(), tournaments: BTreeMap::new(), eras_completed: Vec::new(), finale: None, evolution_complete: false, missions: Vec::new(), promotions_accepted: Vec::new(), market: Vec::new(), spares: Vec::new(), seen_evolution_intro: false, seen_factory_welcome: false, seen_first_mission: false, custom_colours: [0; 8] }
+        Self { version: SAVE_VERSION, era: Era::Classic, year: 1950, money: STARTING_MONEY, garage: Vec::new(), tournaments: BTreeMap::new(), evolution_complete: false, missions: Vec::new(), promotions_accepted: Vec::new(), market: Vec::new(), spares: Vec::new(), seen_evolution_intro: false, seen_factory_welcome: false, seen_first_mission: false, custom_colours: [0; 8] }
     }
 }
 
@@ -853,6 +871,22 @@ impl Career {
         self.tournaments.get(&id).cloned().unwrap_or_default()
     }
 
+    /// **0x504800** — the highest **completed** era: each of 0x209 / 0x20A / 0x20B in turn is
+    /// taken when every record of it that is not hidden (`+0xE4 != 2`) has `+0xD3C != 0`
+    /// (0x504824…0x5048C2), each era tested on its own, a later one overriding. What the
+    /// end-of-era screens key on — the finale's lines (0x50637E / 0x5063D3), its map pack
+    /// (0x506439), `PrizeCars.Car` (0x502550…), the show's music and movie (0x4FD4F0) — so
+    /// after the Classic era's last tournament they name the **Classic** finale, while
+    /// `[0x691E50]` (`era`) has already moved on. `None` when no era is complete: the original
+    /// then answers the stack word its `push ecx` left (0x504800, `[esp+0x10]` at 0x50484A) —
+    /// not an era id in practice, so 0x504990 falls to its first record ([`CareerTables::finale_record`]).
+    /// *(Until 2026-09-27 the port's notes read this as "the first era with an unfinished
+    /// tournament" — the current era — and its finale screens named the next era's finale.)*
+    pub fn completed_era(&self, tables: &CareerTables) -> Option<Era> {
+        let done = |e: Era| tables.tournaments.iter().filter(|t| t.kind == TournamentKind::Era(e) && !t.is_hidden()).all(|t| self.state(t.id).completed);
+        [Era::Modern, Era::Golden, Era::Classic].into_iter().find(|e| done(*e))
+    }
+
     pub fn availability(&self, _tables: &CareerTables, t: &Tournament) -> Availability {
         if t.is_hidden() {
             return Availability::Locked;
@@ -864,6 +898,23 @@ impl Career {
     }
 
     /// Owned cars eligible for `t` (garage indices).
+    /// **0x501AD0** — `OwnedCars.Car`'s list `[0x691DFC]` (its vector getter 0x501AC0): the
+    /// garage `[0x691DF8]` in order, except that when `Game.GameType` is 4 (the Evolution,
+    /// 0x501B80) a car whose record's first model year `+0x1F8` (signed word, 0x501B91) is later
+    /// than the chronicle year 0x5032C0 is left out (`cmp esi, eax / jg`, 0x501B9D) — a Factory
+    /// Driver prize car does not show in 1950. Garage indices. The list is rebuilt by 0x4F3E40
+    /// (0x4F42E4: SETTYPE*, the profile load, the race end) and by the garage's own changes
+    /// (0x501F22 buy, 0x502170 used buy, 0x50225D sale, 0x5022EB award, …); the port derives it
+    /// when read, from the same two inputs.
+    pub fn owned_list(&self, tables: &CareerTables, evolution: bool) -> Vec<usize> {
+        self.garage
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| !evolution || tables.car(o.car_id).is_none_or(|c| c.year as i16 as i32 <= i32::from(self.year)))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     pub fn eligible_garage(&self, t: &Tournament) -> Vec<usize> {
         self.garage.iter().enumerate().filter(|(_, c)| t.eligible_cars.contains(&(c.car_id as i16))).map(|(i, _)| i).collect()
     }
@@ -1149,34 +1200,77 @@ impl Career {
         Ok(())
     }
 
-    /// Put the damage a race left on the car away with it: the ten zones, their mean as the
-    /// car's damage figure, and the share each installed part takes — the race-end fold 0x493CF0
-    /// with its second argument 0 (`modes.md`, `physics.md` §10, CONFIRMED): for every part of
-    /// type 1…10 (0x493D0D…0x493D1A) `+0x164 += (1.5 − 0.005·condition) × mean zone damage under
-    /// its own mask` (the mean divided only when more than one zone), then **clamped at 100**
-    /// (0x493D89…0x493D9C). Parts keep what they had, so damage accumulates until the car is
-    /// repaired. *(2026-09-26: the type gate and the clamp were missing.)*
+    /// Put the damage a race left on the car away with it — the race-over fold 0x493CF0 with its
+    /// second argument 0 (`modes.md`, `physics.md` §10, CONFIRMED) and the front end's 0x4EDD40
+    /// (from 0x4EDD00 for `[0x690AD4] == 4`), read to the instruction 2026-09-27:
+    ///
+    /// ```text
+    /// race start  0x493CF0(car, 1), 0x41088B:  s = carried − scale·mean(Z0)     (no clamp)
+    /// race over   0x493CF0(car, 0), 0x416D31:  s = min(s + scale·mean(Z1), 100); car+0xC48+4i = s
+    /// FE          0x4EDD40:  zones = Z1 (record +0x1C4 → FE car +0x6A8);
+    ///             part+0x164 = s > 0 ? s : 0 (0x4EDDCF…0x4EDDE8, by the record's part id +0x124);
+    ///             body part (0x4F0400) +0x164 = f32(Σ Z1 · 0.1f) (0x4EDD86, 0x4EDD8B, 0x4EDE0B)
+    /// ```
+    ///
+    /// for every part of type 1…10 (0x493D0D…0x493D1A), `scale = 1.5 − 0.005·condition`, `mean`
+    /// over the part's own mask (divided only when more than one zone), `carried` the saved
+    /// `+0x164` (`.PARTDAMAGE`) and `Z0` the zones the car was launched with (`.DAMAGEZONES`, the
+    /// car's own `owned.damage` for a type the launch carries, 0x4EF41B…0x4EF45E). So a part gains
+    /// `scale·(mean(Z1) − mean(Z0))` — this race's dents — and racing a dented car again without a
+    /// scratch leaves it as it was. *(Until 2026-09-27 the port added `scale·mean(Z1)` whole and
+    /// set no body part: every race counted the carried zones again. The type gate and the clamp
+    /// at 100 were added 2026-09-26.)* The automatic replay's second fold (0x416D31 again, from
+    /// the playback's `Race_finalize(2)`) starts from the same `carried` and `Z0` — `Car_raceInit`
+    /// reloads them at every pass — so `zones` is simply the last record's `+0xC98`.
+    ///
+    /// A part of another type is not folded, and 0x4EDD40 hands it its `car+0xC48` slot all the
+    /// same — which holds **0**: the slots' only writers are `Cars_create`'s `rep stosd` over the
+    /// whole 0x1254-byte car (0x4111B9, the race load 0x414DB0 → 0x414E68, every launch) and the
+    /// fold's own `mov [ebx+0x4E0]` (0x493DAE, types 1…10 only; `.text` scanned for `+0xC48`,
+    /// `+0x4E0`, `+0xAD4` and `+0x174`, 2026-09-27). So such a part comes back at 0 (the `else 0`
+    /// arm). No shipped part has such a type (`nfs5.prt`: types 1…10 only), so this is for the
+    /// rule's sake. *(Until 2026-09-27 the port left such a part as it was.)* 0x4EDD40's inner
+    /// loop runs over the installed-part **count** of record slots (`mov edi, edx`, 0x4EDDBC), not
+    /// twenty; the race car's slots are filled in the installed order (0x49C5F1), so every
+    /// installed part finds its own.
     pub fn record_damage(&mut self, tables: &CareerTables, idx: usize, zones: [f32; 10]) {
         let Some(owned) = self.garage.get(idx) else { return };
+        let start = owned.damage;
         let ids = owned.parts.clone();
-        let mut add: Vec<(i16, f32, f32)> = Vec::new();
+        let mean = |z: &[f32; 10], mask: &[bool; 10]| {
+            let n = mask.iter().filter(|b| **b).count();
+            let sum: f32 = z.iter().zip(mask.iter()).filter(|(_, m)| **m).map(|(d, _)| *d).sum();
+            if n > 1 { sum / n as f32 } else { sum }
+        };
+        let mut folded: Vec<(i16, f32)> = Vec::new();
+        let mut body = None;
         for id in &ids {
             let Some(p) = tables.parts.iter().find(|p| p.id == *id) else { continue };
+            if is_body_part(p) && body.is_none() {
+                body = Some(p.id);
+            }
             if !(1..=10).contains(&p.kind) {
+                // 0x4EDDE2: its `car+0xC48` slot is Cars_create's 0 (0x4111B9), not above 0
+                folded.push((p.id, 0.0));
                 continue;
             }
             let mask = p.zone_mask.map(|b| b != 0);
-            let n = mask.iter().filter(|b| **b).count();
-            let sum: f32 = zones.iter().zip(mask.iter()).filter(|(_, m)| **m).map(|(d, _)| *d).sum();
-            let mean = if n > 1 { sum / n as f32 } else { sum };
-            add.push((*id, (1.5 - 0.005 * p.condition) * mean, p.state as f32));
+            let carried = owned.part_state.iter().find(|(pid, _)| *pid == p.id).map(|(_, s)| *s).unwrap_or(p.state as f32);
+            let mut part = nfs_physics::specs::InstalledPart::new(p.kind, mask, p.condition, carried);
+            part.unfold(mean(&start, &mask));
+            let s = (mean(&zones, &mask) * part.scale + part.state).min(100.0);
+            folded.push((p.id, if s > 0.0 { s } else { 0.0 }));
         }
+        let body_state = (zones.iter().map(|z| *z as f64).sum::<f64>() * 0.1f32 as f64) as f32;
         let Some(owned) = self.garage.get_mut(idx) else { return };
         owned.damage = zones;
-        for (id, d, table_state) in add {
+        if let Some(b) = body {
+            folded.push((b, body_state));
+        }
+        for (id, s) in folded {
             match owned.part_state.iter_mut().find(|(pid, _)| *pid == id) {
-                Some((_, s)) => *s = (*s + d).min(100.0),
-                None => owned.part_state.push((id, (table_state + d).min(100.0))),
+                Some((_, v)) => *v = s,
+                None => owned.part_state.push((id, s)),
             }
         }
         owned.damage_pct = car_damage_pct(tables, owned);
@@ -1534,9 +1628,15 @@ impl Career {
     pub fn enter_event(&mut self, tables: &CareerTables, t: &Tournament, row: usize) -> Result<usize, CareerError> {
         // club events are not gated by career progress — the list accessor 0x504D00 filters them by
         // the selected club era alone (H28, CONFIRMED) — while an Evolution tournament belongs to
-        // the era the player is up to
+        // the era the player is up to. **A completed tournament is raced again**: the type-4 start
+        // check 0x4D59F3…0x4D5B3F tests the car restriction (0x504A70 → 813), the part-way
+        // tournaments (0x504B60 → 858) and the fee (0x503430 → 857), and nothing else — the
+        // filing cleared its events (0x503E40), so the fee is due again, and a second completion
+        // counts `+0xD3C` (`TIMESCOMPLETED`) without the year step (`== 1`, 0x503BBC). *(Until
+        // 2026-09-27 the port refused a completed tournament.)* The hidden finales are not
+        // listed (0x504D00), so never selected.
         let era_ok = t.is_club() || t.era() == self.era;
-        if self.availability(tables, t) != Availability::Open || !era_ok {
+        if self.availability(tables, t) == Availability::Locked || !era_ok {
             return Err(CareerError::NotAvailable { id: t.id });
         }
         if self.eligible_garage(t).is_empty() {
@@ -1733,9 +1833,6 @@ impl Career {
         let era = t.era();
         let era_done = tables.era_tournaments(era).iter().filter(|x| !x.is_hidden()).all(|x| self.state(x.id).completed);
         if era_done && era == self.era {
-            if let Some(f) = tables.tournaments.iter().find(|x| x.kind == TournamentKind::Era(era) && x.is_hidden()) {
-                self.finale = Some(FinalePending { era, tournament: f.id });
-            }
             if era == Era::Modern {
                 self.evolution_complete = true;
             }
@@ -1747,24 +1844,29 @@ impl Career {
         outcome
     }
 
-    /// Finale race over: 1st place awards the loaned prize car (0x4EE17D); the pending finale is
-    /// consumed either way.
-    pub fn record_finale(&mut self, tables: &CareerTables, order: &[usize]) -> Option<(bool, u16)> {
-        let f = self.finale.take()?;
-        let t = tables.tournament(f.tournament)?;
-        let won = order.first() == Some(&0);
-        if won {
-            self.garage.push(OwnedCar::construct(tables, t.prize_car, 0, 0));
-            if !self.eras_completed.contains(&f.era) {
-                self.eras_completed.push(f.era);
-            }
-        }
-        Some((won, t.prize_car))
+    /// The finale record the launch and the award use: **0x504990(0x504800())** — the hidden
+    /// record of the highest completed era ([`completed_era`](Self::completed_era),
+    /// [`CareerTables::finale_record`]). The type-10 launch (0x4D5798 → 0x4D59EA → 0x4D5AA3 →
+    /// 0x4D58E3 → 0x4D5B53) writes no profile field — the fee path 0x4D58FB, 0x503940 and the
+    /// `[0x691E6C]` / `[0x691E7C]` / `[0x5DB768]` / `[0x5DB76C]` dwords are type 4's — so this is
+    /// all the original knows about the finale being raced: `Game.GameType` 10 and 0x504800.
+    pub fn finale_tournament<'a>(&self, tables: &'a CareerTables) -> Option<&'a Tournament> {
+        tables.finale_record(self.completed_era(tables))
     }
 
-    /// Decline the pending finale (`DECLINE` on the end-of-era screen).
-    pub fn decline_finale(&mut self) {
-        self.finale = None;
+    /// Finale race over: **0x4EE17D** — game type 10 and the player's place 1 → `PrizeCars.Car`'s
+    /// car, `0x4F4360(0x5048D0(0x504800()))`, appended by 0x502270 (price 0, first paint set);
+    /// nothing else is filed, won or lost — no money, no km / win (the type-4 arm 0x4EDFE6), no
+    /// tournament state, no era flag. Returns (won, prize car id). *(Until 2026-09-27 the award
+    /// read a port-only pending finale, which a profile load dropped, and a win also filed a
+    /// port-only `eras_completed`.)*
+    pub fn record_finale(&mut self, tables: &CareerTables, order: &[usize]) -> Option<(bool, u16)> {
+        let prize = self.finale_tournament(tables)?.prize_car;
+        let won = order.first() == Some(&0);
+        if won {
+            self.garage.push(OwnedCar::construct(tables, prize, 0, 0));
+        }
+        Some((won, prize))
     }
 
     // ---- Factory Driver (`RE/notes/skill-tests.md` §12) ----
@@ -2146,6 +2248,12 @@ mod tests {
         }
     }
 
+    /// A visible record of `era` nobody has completed: 0x504800 takes an era with no visible
+    /// record as completed (its flag starts at 1), so a test of the finale needs the later eras.
+    fn open_in(id: i16, era: Era) -> Tournament {
+        Tournament { kind: TournamentKind::Era(era), ..tournament(id, 1, false) }
+    }
+
     fn tables(ts: Vec<Tournament>) -> CareerTables {
         CareerTables { raw: Default::default(), tracks: vec![], tournaments: ts, parts: vec![], personalities: vec![], missions: vec![], strings: Strings::default(), catalog: vec![], package_count: 0 }
     }
@@ -2524,7 +2632,7 @@ mod tests {
     #[test]
     fn points_prizes_and_standings() {
         let t = tournament(1, 2, false);
-        let tables = tables(vec![t.clone(), tournament(31, 1, true)]);
+        let tables = tables(vec![t.clone(), tournament(31, 1, true), open_in(40, Era::Golden), open_in(41, Era::Modern)]);
         let mut c = Career::default();
         c.garage.push(OwnedCar::new(76, 0, 11_000));
         assert_eq!(c.enter(&tables, &t).unwrap(), 0);
@@ -2550,12 +2658,33 @@ mod tests {
         let st = c.state(1);
         assert!(st.completed && st.events.is_empty());
         assert_eq!(c.money, STARTING_MONEY - 500 + 1400 + 1000 + 5000);
-        // the only visible Classic tournament is done: era advances, finale pending, year steps
+        // the only visible Classic tournament is done: era advances, year steps, and the finale
+        // the end-of-era screens offer is the Classic one (0x504990(0x504800()))
         assert!(o.era_advanced);
         assert_eq!(c.era, Era::Golden);
         assert_eq!(c.year, 1956);
-        assert_eq!(c.finale.as_ref().map(|f| f.tournament), Some(31));
-        assert!(c.enter(&tables, &t).is_err(), "completed tournaments are closed");
+        assert_eq!(c.finale_tournament(&tables).map(|f| f.id), Some(31));
+        assert!(c.enter(&tables, &t).is_err(), "a past era's tournament is not listed");
+    }
+
+    /// 0x4D59F3…0x4D5B3F: no completed test in the type-4 start check — a completed tournament
+    /// is entered again for its fee, and its second completion counts without the year step.
+    #[test]
+    fn completed_tournament_raced_again() {
+        let t = tournament(1, 1, false);
+        let other = tournament(2, 1, false);
+        let tables = tables(vec![t.clone(), other, tournament(31, 1, true)]);
+        let mut c = Career::default();
+        c.garage.push(OwnedCar::new(76, 0, 11_000));
+        let order = [0, 1, 2, 3, 4, 5, 6, 7];
+        c.enter(&tables, &t).unwrap();
+        c.record_event(&tables, &t, 0, &order, &[0; 8], &[true; 8], Some(0));
+        assert_eq!((c.state(1).completions, c.year, c.era), (1, 1956, Era::Classic));
+        let money = c.money;
+        assert_eq!(c.enter(&tables, &t).unwrap(), 0, "a completed tournament is entered again");
+        assert_eq!(c.money, money - 500, "for its fee");
+        c.record_event(&tables, &t, 0, &order, &[0; 8], &[true; 8], Some(0));
+        assert_eq!((c.state(1).completions, c.year), (2, 1956), "no second year step");
     }
 
     /// 0x504F00: `Tournament.RemainingTracks` row k is the k-th undone event, so the events can be
@@ -2612,14 +2741,17 @@ mod tests {
 
     #[test]
     fn finale_awards_the_prize_car() {
-        let tables = tables(vec![tournament(31, 1, true)]);
+        let t = tournament(1, 1, false);
+        let finale = Tournament { prize_car: 169, ..tournament(31, 1, true) };
+        let tables = tables(vec![t.clone(), finale, open_in(40, Era::Golden), open_in(41, Era::Modern)]);
         let mut c = Career::default();
-        c.finale = Some(FinalePending { era: Era::Classic, tournament: 31 });
-        assert_eq!(c.record_finale(&tables, &[0, 1, 2]), Some((true, 168)));
+        c.tournaments.entry(1).or_default().completed = true;
+        // lost: nothing filed, and the award is still 0x504800's the next time
+        assert_eq!(c.record_finale(&tables, &[1, 0, 2]), Some((false, 169)));
+        assert!(c.garage.is_empty());
+        assert_eq!(c.record_finale(&tables, &[0, 1, 2]), Some((true, 169)));
         assert_eq!(c.garage.len(), 1);
-        assert_eq!(c.garage[0].car_id, 168);
-        assert!(c.finale.is_none());
-        assert_eq!(c.eras_completed, vec![Era::Classic]);
+        assert_eq!(c.garage[0].car_id, 169);
     }
 
     #[test]
@@ -2653,6 +2785,26 @@ mod tests {
         rich.garage[0].offer = Some(5_000);
         rich.accept_offer(&tables, 0).unwrap();
         assert_eq!(rich.money, 1_000_004_000);
+    }
+
+    /// 0x501AD0: in the Evolution (`Game.GameType` 4) `OwnedCars.Car` leaves out a car whose
+    /// first model year is later than the chronicle year (`jg`, so the year itself is kept);
+    /// in any other mode it is the whole garage.
+    #[test]
+    fn owned_list_hides_later_model_years_in_the_evolution() {
+        let mut t = stock_tables(stock_parts(), &[], &[]);
+        t.catalog[0].year = 1950;
+        let mut boxster = t.catalog[0].clone();
+        boxster.id = 77;
+        boxster.year = 1996;
+        t.catalog.push(boxster);
+        let mut c = Career { year: 1950, ..Career::default() };
+        c.garage.push(OwnedCar::new(77, 0, 0));
+        c.garage.push(OwnedCar::new(76, 0, 0));
+        assert_eq!(c.owned_list(&t, true), vec![1]);
+        assert_eq!(c.owned_list(&t, false), vec![0, 1]);
+        c.year = 1996;
+        assert_eq!(c.owned_list(&t, true), vec![0, 1], "the model year itself is listed");
     }
 
     /// 0x4F8165…0x4F8174: the top-up's cap of 25 counts the whole used-car list, the player's
@@ -3013,9 +3165,30 @@ mod tests {
         assert_eq!(c.repair_cost(&tables, 0, &[1]), 0);
         assert!(installed_parts_for(&tables, &c.garage[0]).iter().filter(|p| p.kind == 1).all(|p| p.state == 0.0));
 
-        // 0x493CF0 clamps each part's carried damage at 100 (0x493D89…0x493D9C)
+        // the engine repair left the zones at 60: the race's start unfolds them (0x41088B), so a
+        // race to 100 adds only the 40 more (0x416D31), and racing on at 100 adds nothing
+        let scale = 1.5 - 0.005 * part.condition;
+        let mask = part.zone_mask.map(|b| b != 0);
+        let m = |z: f32| if mask.iter().filter(|b| **b).count() > 0 { z } else { 0.0 };
         c.record_damage(&tables, 0, [100.0; 10]);
+        let once = c.part_damage(0, &part);
+        assert!((once - (m(100.0) * scale + (m(60.0) * -scale + 0.0)).clamp(0.0, 100.0)).abs() < 0.01, "{once}");
         c.record_damage(&tables, 0, [100.0; 10]);
-        assert_eq!(c.part_damage(0, &part), 100.0);
+        assert_eq!(c.part_damage(0, &part), once, "the carried zones are not counted twice");
+        // the body part is the zones' sum · 0.1 (0x4EDE0B)
+        if let Some(b) = c.garage[0].parts.iter().filter_map(|id| tables.parts.iter().find(|p| p.id == *id)).find(|p| is_body_part(p)) {
+            assert_eq!(c.part_damage(0, b), 100.0);
+        }
+        // 0x493CF0 clamps each part's damage at 100 (0x493D89…0x493D9C), the front end at 0 (0x4EDDCF)
+        c.garage[0].damage = [0.0; 10];
+        for (id, s) in c.garage[0].part_state.iter_mut() {
+            if *id == part.id {
+                *s = 90.0;
+            }
+        }
+        c.record_damage(&tables, 0, [100.0; 10]);
+        assert_eq!(c.part_damage(0, &part), if m(1.0) > 0.0 { 100.0 } else { 90.0 });
+        c.record_damage(&tables, 0, [0.0; 10]);
+        assert_eq!(c.part_damage(0, &part), if m(1.0) > 0.0 { 0.0 } else { 90.0 }, "below 0 the front end holds it at 0");
     }
 }

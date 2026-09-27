@@ -136,9 +136,20 @@ pub fn delete_profile(dir: &Path, p: &Profile) -> std::io::Result<()> {
 /// loop at 0x4EEBFE…0x4EEC1F walks the count of `[0x69188C]` but compares the **new car's own**
 /// `[ebp+0]` (`mov esi, [ebp]` at 0x4EEC0E, `ebp` = this) with the candidate, so it comes out 1
 /// when other cars exist and the fresh object's first dword is 0, and 0 otherwise — the heap's
-/// contents decide. The loader copies the saved dword back verbatim. The port writes the car's
-/// index (garage first, then the market): APPROXIMATION; the port reads nothing from it, and
-/// what the original reads it for is not traced.
+/// contents decide. The loader copies the saved dword back verbatim.
+///
+/// *(Settled 2026-09-27.)* `career.md` §10.9 "The instance dword, settled as far as it goes"
+/// traces every touch of the registry `[0x69188C]` — its creator 0x4EE2AA, its destructor
+/// 0x4EE2F0, the car destructor's pointer removal 0x4EE56B…0x4EE5B4 and the constructor's own
+/// loop 0x4EEBF0…0x4EEC21 — and finds `car+0x00` read nowhere else. Independently re-walked here
+/// (`fecar_init.txt`/`fecar_save.txt`/`fecar_load.txt`, `$S/save3/`): Save 0x4EE8D0 and Load
+/// 0x4EE6A0 both move it as part of the flat 0x1D6-dword `rep movsd`, never singling it out, and
+/// no accessor vtable (`FEOwnedCarAccessor` 0x5B7868 included) reads `+0x00`. So the field is
+/// dead once written: nothing, on either side, ever reads it back for a decision. The port no
+/// longer writes the car's index (that was invented, and unreachable besides); it writes what the
+/// rule above gives for the case it cannot avoid making concrete — the port's own buffer is
+/// `vec![0u8; FE_CAR_IMAGE]`, so the "fresh object's first dword is 0" half of the rule always
+/// holds, and no other `SavedCar` exists yet at the point each is built, so `0`.
 pub mod car {
     /// `car+0x04`, 0x670 bytes: the `nfs5.car` record.
     pub const RECORD: usize = 0x04;
@@ -172,9 +183,10 @@ pub mod car {
 
 /// Build the FE car image the save stores for one garage car (`players = true`) or one car the
 /// used-car market generated (`false`).
-fn car_image(tables: &CareerTables, c: &OwnedCar, instance: u32, players: bool) -> SavedCar {
+fn car_image(tables: &CareerTables, c: &OwnedCar, players: bool) -> SavedCar {
+    // car+0x00, the instance dword: nothing reads it back (see the module doc above), so it is
+    // left at the buffer's own zero rather than an invented per-car index.
     let mut image = vec![0u8; FE_CAR_IMAGE];
-    image[0..4].copy_from_slice(&instance.to_le_bytes());
     if let Some(i) = tables.catalog.iter().position(|e| e.id == c.car_id) {
         let base = i * CAR_RECORD_SIZE;
         if let Some(rec) = tables.raw.car.get(base..base + CAR_RECORD_SIZE) {
@@ -499,9 +511,22 @@ pub struct OpponentCarSave {
 /// The FE car image of one [`OpponentCarSave`]: the `nfs5.car` record at `+4` and the six
 /// appearance dwords as 0x4F500C…0x4F51B6 fill them — each colour `0xFFFF0000` unless the record
 /// has paint sets (`rec+0x3E6`) / interiors (`rec+0x528`), then `rec+0x3EC` / `+0x3F0` / `+0x3F4
-/// + 16k` and `rec+0x530 + 16i`. The instance dword and the career fields stay 0: the seven are
-/// built by the plain constructor 0x4EE5C0, not `FECar::init`'s instance search (APPROXIMATION —
-/// what 0x4EE5C0 leaves in them was not read).
+/// + 16k` and `rec+0x530 + 16i`.
+///
+/// *(Corrected 2026-09-27.)* This module said the seven were "built by the plain constructor
+/// 0x4EE5C0, not `FECar::init`'s instance search" — wrong, read against 0x4F4FA0 itself
+/// (`f4fa0.txt`/`f4fa0_b.txt`/`f4fa0_c.txt`, `$S/save3/`): both of its draw branches end in `call
+/// 0x4eeba0` (0x4F51B6 and 0x4F548C) on the same `ebp+0x24 + i·0x760` stride the seven cars sit
+/// at, i.e. every drawn car goes through `FECar::init` proper, not the bare sub-object
+/// constructor. So the rest of what `FECar::init` does applies to them too:
+/// * the instance dword `+0x00` — settled module-wide (`car`'s own doc above): nothing reads it
+///   back anywhere, so it is left at the buffer's zero, same as every other saved car;
+/// * `+0x6A0` (`car::OWNED`) — 0x4EEC7F sets it to **1** unconditionally, and nothing in 0x4F4FA0
+///   (unlike the used-car generator's explicit `+0x6A0 = 0`, `career_to_sav`'s `car_image`) ever
+///   clears it back, so a drawn opponent car's image carries `OWNED = 1`;
+/// * `+0x758`/`+0x75C` — 0x4EEA77 calls `fit_stock` 0x4EE9A0 unconditionally at the end of
+///   `FECar::init`, the same call `OwnedCar::construct` makes, so a drawn opponent car carries the
+///   record's stock parts, sorted, exactly as a garage or market car would.
 pub fn opponent_car_image(tables: &CareerTables, o: &OpponentCarSave) -> SavedCar {
     let mut image = vec![0u8; FE_CAR_IMAGE];
     if let Some(i) = tables.catalog.iter().position(|e| e.id == o.car_id)
@@ -527,6 +552,19 @@ pub fn opponent_car_image(tables: &CareerTables, o: &OpponentCarSave) -> SavedCa
     c.set_field_u32(car::S2_COLOUR, s2);
     c.set_field_u32(car::PACKAGE_NUM, o.package);
     c.set_field_u32(car::DECAL_NUM, o.decal as u32);
+    c.set_field_u8(car::OWNED, 1);
+    // fit_stock only depends on `car_id`; an id absent from the catalogue leaves every list empty
+    // (`OwnedCar::fit_stock`'s own early return), matching a blank `image` above.
+    let stocked = OwnedCar::construct(tables, o.car_id, 0, 0);
+    c.removed = stocked.stock.iter().map(|(id, state)| SavedPart { id: *id as i32, state: *state }).collect();
+    c.installed = stocked
+        .parts
+        .iter()
+        .map(|id| {
+            let state = stocked.part_state.iter().find(|(pid, _)| pid == id).map(|(_, s)| *s).unwrap_or(0.0);
+            SavedPart { id: *id as i32, state }
+        })
+        .collect();
     c
 }
 
@@ -713,7 +751,7 @@ pub fn saved_controls(s: &SaveFile) -> Vec<(String, [u32; 6])> {
 pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, side: &SaveSide) -> SaveFile {
     let (knockout, settings) = (side.knockout.as_ref(), &side.settings);
     let player = PlayerInfo {
-        cars: c.garage.iter().enumerate().map(|(i, car)| car_image(tables, car, i as u32, true)).collect(),
+        cars: c.garage.iter().map(|car| car_image(tables, car, true)).collect(),
         money: c.money.clamp(-MONEY_LIMIT, MONEY_LIMIT) as i32,
         picture: profile.picture as u32,
         player_name: profile.name.clone(),
@@ -809,11 +847,10 @@ pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, 
         // 0x4F7DC7 sets to the chronicle year each time the market is refreshed after a race.
         // Every change of the chronicle year (0x502A08, 0x503BE8 inside 0x4EDF00) comes before
         // the next refresh or read, so outside the unported year cheats the two are equal and the
-        // career's year is the dword (`career.md`, "The market year, settled"). The instance
-        // dwords continue after the garage's (see `car_image`).
+        // career's year is the dword (`career.md`, "The market year, settled").
         used_cars: Some(UsedCarMarket {
             year: c.year as u32,
-            cars: c.market.iter().enumerate().map(|(i, car)| car_image(tables, car, (c.garage.len() + i) as u32, false)).collect(),
+            cars: c.market.iter().map(|car| car_image(tables, car, false)).collect(),
         }),
         // §4.6: the raw `[0x690410]` block, and §4.5's list of personality ids in play
         knockout: Some(knockout.map(|k| k.to_state()).unwrap_or_default().write()),
@@ -842,7 +879,7 @@ fn spare_records(tables: &CareerTables, c: &Career) -> Vec<Vec<u8>> {
 /// Read back what the original's format can hold. Port-side bookkeeping the format has no field
 /// for is lost and left at its default: a car's ten zone damages (the damage figure is rebuilt
 /// from its parts, 0x4EF960), a tournament's
-/// `final_rank` / `prize` / `failed_attempts`, `eras_completed`, a pending finale and
+/// `final_rank` / `prize` / `failed_attempts` and
 /// `promotions_accepted`. That is why the port's JSON career, not this file, is the live save.
 pub fn career_from_sav(s: &SaveFile, tables: &CareerTables) -> Career {
     let mut c = Career::default();

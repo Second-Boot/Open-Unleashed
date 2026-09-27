@@ -103,9 +103,13 @@ impl LayoutScreen {
             let (pos, size) = self.place(aspect, x, y, a.1, a.2);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
-            out.push(Sprite { texture: a.0, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: c, rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: a.0, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: c, rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         };
         let amber = argb(eoe::AMBER);
+        // the movie's depth mask, stepped at the first oval piece (0x4FF785). The show's single
+        // steps (0x4DA950 before its ramped tiles, 0x4FF3FE / 0x4FF4F0 / 0x4FF606) move only where
+        // this one steps from, and nothing masks before it in this draw, so they are not carried.
+        let mut mask: Option<super::fe_depth::Mask> = None;
         for d in draws {
             match d {
                 Draw::Tiles { pack, alpha } => {
@@ -125,16 +129,26 @@ impl LayoutScreen {
                     }
                 }
                 Draw::Rule { x, y, w, h } => out.push(self.quad(aspect, x as f32, y as f32, w as f32, h as f32, amber)),
-                // The oval is not painted: 0x4FFAA0 runs between 0x4DAA10 and 0x4DAAC0, which step the
-                // sprite depth and switch the depth compare (0x537830(6)), so the pieces lay down
-                // the mask the movie is then drawn through, until 0x4DAB00 restores the state.
-                // APPROXIMATION: this renderer has no such mask — the movie is drawn as its whole
-                // 416 × 348 rectangle, without the oval's rounded cut
-                Draw::Oval { .. } => {}
+                // **The oval is a depth mask** (read 2026-09-27): 0x4DAA10 (0x4FF785), then 0x4FFAA0
+                // paints the twelve `MovieOval.fsh` pieces — entry 4 (`[+0x2F4]`), 0 (`[+0x2EC]`)
+                // and 1 (`[+0x2F0]`), loaded at 0x4FE59C…0x4FE63C — opaque white (`push -1`,
+                // 0x4FFB66 / 0x4FFB8D / 0x4FFBB7), so they are drawn and write depth where their
+                // art's alpha passes the test; 0x4DAAC0 (0x4FF791); the movie through the player's
+                // slot 1 (0x4FF84F) lands only on them; 0x4DAB00 (0x4FF852), and the four lines after
+                // it (0x4FFBF0) are outside. *(Until 2026-09-27 the pieces were not painted and the
+                // movie was its whole 416 × 348 rectangle, an APPROXIMATION.)*
+                Draw::Oval { entry: k, x, y, flip } => {
+                    let m = *mask.get_or_insert_with(super::fe_depth::mask_begin);
+                    if let Some(a) = entry(eoe::OVAL, k) {
+                        let start = out.len();
+                        sprite(out, a, x as f32, y as f32, flip, [1.0; 4]);
+                        super::fe_depth::apply(&mut out[start..], m.stencil);
+                    }
+                }
                 Draw::Movie { x, y, w, h, alpha } => {
                     if let Some(m) = e.movie.as_ref() {
                         let (pos, size) = self.place(aspect, x as f32, y as f32, w as f32, h as f32);
-                        out.push(Sprite { texture: m.tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: argb((alpha as u32) << 24 | 0xFF_FFFF), rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+                        out.push(Sprite { texture: m.tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: argb((alpha as u32) << 24 | 0xFF_FFFF), rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: mask.map(|m| m.inside) });
                     }
                 }
                 Draw::Line { x, y, flip } => {
@@ -172,7 +186,7 @@ impl LayoutScreen {
         let top = y.round();
         for g in &glyphs {
             let (pos, size) = self.place(aspect, left + g.x * sx, top + g.y, g.w * sx, g.h);
-            out.push(Sprite { texture: f.texture(), pos, size, uv_min: g.uv_min, uv_max: g.uv_max, color, rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: f.texture(), pos, size, uv_min: g.uv_min, uv_max: g.uv_max, color, rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         }
     }
 }

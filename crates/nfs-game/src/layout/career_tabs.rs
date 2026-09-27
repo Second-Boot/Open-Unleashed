@@ -109,7 +109,7 @@ impl LayoutScreen {
         let Some(k) = era.filter(|&k| k < 3) else { return out };
         if let Some(a) = t.tabs[k] {
             let (pos, size) = self.place(aspect, a.3, a.4, a.1, a.2);
-            out.push(Sprite { texture: a.0, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: argb(level << 24 | 0xFF_FFFF), rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: a.0, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: argb(level << 24 | 0xFF_FFFF), rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         }
         if let Some(f) = t.year_font.as_ref() {
             self.text(&mut out, aspect, f, &year.to_string(), COLUMN_X[k], YEAR_Y, 0.0, 1, argb(gold));

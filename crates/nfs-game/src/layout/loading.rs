@@ -99,7 +99,7 @@ impl LoadingScreen {
         };
         let sprite = |tex: TextureId, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]| {
             let (pos, size) = place(x, y, w, h);
-            Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None }
+            Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None }
         };
         let mut out = Vec::new();
         for (first, count, size, y) in ROWS {
@@ -136,6 +136,7 @@ fn design_sprite(aspect: f32, tex: TextureId, x: f32, y: f32, w: f32, h: f32, co
         rotation: 0.0,
         pivot: [0.5, 0.5],
         tri: None,
+        depth: None,
     }
 }
 

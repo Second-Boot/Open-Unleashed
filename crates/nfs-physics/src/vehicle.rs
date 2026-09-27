@@ -2442,12 +2442,18 @@ impl Vehicle {
         // `car+0x35C`, the estimate `Car_ground` makes of the **world** velocity's `x` / `z`
         // (0x49BEA9…0x49BF02) — the roll factor (0x49F2EA), the steering rack (0x49F5EA) and the
         // tail's gates (0x49FB98, 0x49FBE5, 0x49FCF7) all load it; the step never rewrites it,
-        // so the tail sees the value from before this tick's integration. *(Corrected
-        // 2026-09-26: the port took the estimate of the physics-frame `car+0xD58` / `+0xD60`,
-        // which is not rotation-invariant — up to 1/0.884 of it at 45° of heading.)*
-        // APPROXIMATION, as elsewhere in the port: worked out here from the velocity rather than
-        // kept from `Car_ground`, which changes the velocity after it stores the estimate.
-        let speed = self.horizontal_speed();
+        // so the tail sees the value from before this tick's integration. Confirmed by disassembly
+        // 2026-09-27: 0x49F2EA is `fld dword ptr [esi+0x35c]`, a bare memory load, no recompute.
+        // *(Corrected 2026-09-26: the port took the estimate of the physics-frame `car+0xD58` /
+        // `+0xD60`, which is not rotation-invariant — up to 1/0.884 of it at 45° of heading.)*
+        // *(Corrected 2026-09-27: the port then worked it out here from the current velocity —
+        // [`Self::horizontal_speed`] recomputed on `self.velocity`, which `car_ground_body`
+        // (`Car_ground`) already advanced (gravity, the bounce/landing impulses, the ceiling rule)
+        // between when it stored [`Self::speed_est`] and now. [`Self::speed_est`] is [`car_ground_body`]'s
+        // stored `car+0x35C` from the previous tick's `Car_ground` — the same value the ordering
+        // `physics_step` (this tick) then `ground_contact` (this tick, i.e. next tick's `Car_ground`
+        // pass relative to this step) reproduces — and is what the tail below must read.)*
+        let speed = self.speed_est;
         // The two arms are the other way round: 0x49F2F0 compares the speed with `[0x5B241C]` =
         // 10.0 and 0x49F301's `je` goes to the **`+70 … ×0.0125`** arm when `speed >= 10`, while
         // the fall-through at 0x49F303 is `+30 … ×0.025` for `speed < 10`. (Both give `1.0·yaw`
@@ -2474,14 +2480,18 @@ impl Vehicle {
         // draw of the shared LCG (0x49F44B…0x49F473) makes the noise
         // `SuspDamage(car) · (r/65536 − 0.5) · 0.5` (0x493BC0, `[0x5B253C]`, `[0x5B23F0]`), scaled
         // by `car+0x35C · 1/15` **below** 15 m/s (`[0x5B243C]`, `[0x5B49EC]`; `test ah,1; je` skips
-        // it at 15 and above). *(Corrected: the port counted its own ticks, drew from an LCG of its
+        // it at 15 and above; confirmed by disassembly 2026-09-27: 0x49F498 and 0x49F4AE are both
+        // `fld dword ptr [esi+0x35c]`, the same stored estimate `speed` above, not a fresh
+        // recompute). *(Corrected: the port counted its own ticks, drew from an LCG of its
         // own, scaled by speed/15 above 15 instead of below, and took 1/100 of it — none of which
-        // is in the binary; `physics.md` §4 had the speed arm inverted.)*
+        // is in the binary; `physics.md` §4 had the speed arm inverted.)* *(Corrected 2026-09-27:
+        // the port also recomputed this speed from the velocity instead of reading `speed`,
+        // i.e. [`Self::speed_est`] — see the note at the top of this function.)*
         let mut pull = self.damage[2] * 0.25 - self.damage[0] * 0.25;
         if self.game_tick.is_multiple_of(4) {
             let r = self.rand16();
             let mut noise = self.suspension_wear(specs) * (r as f32 * 1.525_878_9e-5 - 0.5) * 0.5;
-            let hs = self.horizontal_speed();
+            let hs = speed;
             if hs < 15.0 {
                 noise = noise * hs * 0.066_666_67;
             }
@@ -3061,8 +3071,31 @@ impl Vehicle {
     /// offset's 0.5: the drop is along world `y`, the whole `car+0x424`. Not carried: the wheel
     /// trackers' slice (0x49B183, the port's trackers keep none), `car+0x7E = 0` (0x49B409),
     /// the wheels' `+0x34` / `+0x40` seeded with the world body points (0x49B439…0x49B47D,
-    /// overwritten by the first `Susp_update`), and the slice the frame reads: the tracker's after
-    /// `updateZone(L)` (0x49B1F6) — the port takes the slice it was given (APPROXIMATION).
+    /// overwritten by the first `Susp_update`).
+    ///
+    /// *(Corrected 2026-09-27, `F`'s source: disassembled to the instruction. `Tracker::setSlice`
+    /// **0x473210** — called on the car tracker at 0x49B0C9, right after the `slice` argument is
+    /// clamped to `max(1, slice)` (0x49B09F…0x49B0A9) and before `L` is read — writes
+    /// `word [tracker] = clamped_slice` (0x47321C); `Tracker::updateZone` **0x474060** (the
+    /// `updateZone(L, 1)` of point 1) never touches that word (it writes only `+2`, `+8…+0xA`,
+    /// `+0x24`, `+0x28`, confirmed by disassembling the whole function). So the `movsx eax, word
+    /// [tracker]` at **0x49B1F6**, which indexes the slice table for `F` (0x49B20D…0x49B24D), reads
+    /// back the *same* `clamped_slice` `setSlice` just stored — not some tracker state left over
+    /// from an earlier, unrelated tick. `F` is therefore deterministically `slices[max(1,
+    /// slice)].forward`, **independent of `L`/`offset`/`absolute`** — including in the opponent
+    /// branch, where `L` is the racing-line point but `F` is still the plain `slice` argument's own
+    /// forward. The earlier note here ("the tracker's after `updateZone(L)`") had the writer wrong;
+    /// there is no "stale tracker" value to fall back to.
+    ///
+    /// This port's `slice_fwd` parameter already plays that role directly — a free input,
+    /// independent of `centre`/`offset` — and every current caller passes it from the *same*
+    /// `Slice` as `centre`/the offset/racing-line point came from (traced 2026-09-27: `main.rs`
+    /// 9831, 9933, 21185, 21668; `police.rs` 2762, 3660; `traffic.rs` 1420, 1676 all index one
+    /// `Slice` for both). So for this port's calling convention the two are never out of step —
+    /// **NOT A BUG**, `vehicle.rs:3065`'s "port takes the slice it was given" APPROXIMATION note
+    /// closed without a behaviour change. The one residual gap is the original's `max(1, ·)` clamp,
+    /// which only bites a caller that resolves slice index 0 — this API takes `Vec3`s, not an
+    /// index, so a caller would have to special-case it; no current caller ever targets slice 0.)*
     #[allow(clippy::too_many_arguments)]
     pub fn place_at_slice(&mut self, grid: &TriangleGrid, specs: &CarSpecs, centre: Vec3, slice_fwd: Vec3, offset: Vec3, opponent: bool, flip: bool) {
         let absolute = opponent && self.game_tick > 0x1C0 && offset != Vec3::ZERO;
@@ -4640,6 +4673,39 @@ mod steer_taper_tests {
         // below 10 the slope is twice as steep as above it
         assert!((r(0.0) - 0.75).abs() < 1e-6);
         assert!((r(50.0) - 1.5).abs() < 1e-6);
+    }
+
+    /// `vehicle.rs:2448`, corrected 2026-09-27: `physics_step` reads the kept `car+0x35C`
+    /// ([`Vehicle::speed_est`], `Car_ground`'s estimate stored on the *previous* tick), not a
+    /// fresh [`Vehicle::horizontal_speed`] of `self.velocity` — 0x49F2EA is a bare
+    /// `fld dword ptr [esi+0x35c]`. Isolated on the roll term, which the branch `speed < 10.0`
+    /// alone decides: with `vl.x == 0` a front wheel's `slip_vel.x` is exactly `roll`. Here
+    /// `speed_est` (5, the `<10` arm) and `self.velocity`'s own horizontal speed (50, the `>=10`
+    /// arm) disagree, so the two arms give visibly different wheel slip — the recompute-from-
+    /// velocity bug picked the wrong one.
+    #[test]
+    fn physics_step_reads_the_kept_speed_estimate_not_the_velocity() {
+        let specs = super::tests::specs_993();
+        let mut v = Vehicle::bare(Vec3::ZERO, Mat3::IDENTITY, specs.wheelbase, 1300.0, 0.8, 0.3);
+        v.angular_velocity.y = 1.0;
+        // world velocity along z only (vl.x stays 0 under the identity frame, isolating roll);
+        // its own horizontal_speed() is 50 — the >=10 arm, the wrong one if recomputed here.
+        v.velocity = Vec3::new(0.0, 0.0, 50.0);
+        // the kept estimate from the previous tick's `Car_ground` — the <10 arm, the right one.
+        v.speed_est = 5.0;
+        v.physics_step(&specs);
+        let yaw = specs.yaw_lever * 1.0 * 32.0 * -0.5;
+        let expected = (5.0 + 30.0) * yaw * 0.025;
+        let wrong = (50.0 + 70.0) * yaw * 0.0125;
+        assert!(
+            (v.wheels[0].slip_vel[0] - expected).abs() < 1e-3,
+            "front wheel lat = {}, expected {expected} (from speed_est)",
+            v.wheels[0].slip_vel[0]
+        );
+        assert!(
+            (v.wheels[0].slip_vel[0] - wrong).abs() > 1e-3,
+            "must not match {wrong}, the value a recompute from velocity would give"
+        );
     }
 }
 

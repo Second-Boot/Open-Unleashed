@@ -380,6 +380,25 @@ impl EngineSound {
         self.level.iter_mut().for_each(|l| *l = 0);
     }
 
+    /// **0x4AD510**, the race pause's (0x4AB1BA) and `I_SFX`'s engine side, over each engine
+    /// object `[0x656AA8 + 4·idx]`: the ring consumed (`+0x2D3 = +0x2D2`, 0x4AD527), the start /
+    /// stop samples' handles `+0x3C` / `+0x38` stopped (0x565D60) and set to −1 (0x4AD533…0x4AD556),
+    /// and for each of the 32 layers both voices `+0x45C` / `+0x5DC` + 0xC·i stopped and set to −1
+    /// and `levelState[i]` (`+0x44` + 4·i) set to 0 (0x4AD559…0x4AD59E). A **hard stop**, not the
+    /// table's `setVolume(h, 0)`: the next audio update after the resume starts the layers again
+    /// from their samples' starts, their levels slewing up from 0 by the ±8 (§3.4). Untouched: the
+    /// start flag `+0x40` — a start sample cut here is started again by that update — the layers'
+    /// kept pan and level `+0x454` / `+0x458` ([`layer_pan_level`]), the pedal `[0x6563C8]`, and
+    /// the horn (voice 0x2B, the table's: silenced by [`AudioOutput::silence_voices`]).
+    pub fn pause(&mut self, out: &AudioOutput) {
+        for v in self.voices.iter_mut().chain(self.voices_b.iter_mut()).chain([&mut self.start_voice, &mut self.stop_voice]) {
+            if let Some(id) = v.take() {
+                out.stop(id);
+            }
+        }
+        self.level.iter_mut().for_each(|l| *l = 0);
+    }
+
     /// Gear-shift click (engine bank slot 2). The original fires it on the **last** tick of the shift.
     ///
     /// `Bank_playOneShot(engineBank, 2, pan 0, volume 0x7F, bend byte 0x40, 0x10000, 0x7F)`, and
@@ -403,10 +422,12 @@ impl EngineSound {
         // a playing voice is left alone — 0x4AACBF…0x4AACD6 returns before `Voice_play` while
         // 0x566380 says it plays — so a view change mid-honk keeps the slot it started with (the
         // port restarted on the new view's slot until 2026-09-26)
+        // the horn off is 0x4AAD00 (from 0x4A7CE6): 0x565DD0(h, 5, −1) (0x4AAD46), the five-tick
+        // ramp; a finished voice has nothing left to release
         if let Some((id, _)) = self.horn_voice
             && (!on || !out.is_playing(id))
         {
-            out.stop(id);
+            out.release(id);
             self.horn_voice = None;
         }
         if !on || self.horn_voice.is_some() {

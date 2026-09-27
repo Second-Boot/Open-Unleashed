@@ -182,6 +182,9 @@ pub fn step(kind: i32, voice: VoiceState, repeats_left: i32, d: f32, range: f32,
 }
 
 pub struct Ambience {
+    /// What `Voice_play`'s update of a playing voice hands the strip hook this pass
+    /// ([`crate::mixer::voice_play_filter`], 0x4A9FA8…0x4AA03B): set by the caller every audio update.
+    pub filter: Option<i32>,
     pub elements: Vec<Element>,
     /// PatchID → bank bytes in `track.viv`
     index: HashMap<u16, (usize, usize)>,
@@ -275,7 +278,7 @@ impl Ambience {
             base += s.elements.len();
         }
         tracing::info!(elements = elements.len(), banks = index.len(), ambient_level, "ambience loaded");
-        Ok(Self { elements, index, viv, clips: HashMap::new(), pool: [Slot::default(); VOICES], rng: 0x1234_5678, ambient_level, game_trim, thunder: Thunder::default() })
+        Ok(Self { filter: None, elements, index, viv, clips: HashMap::new(), pool: [Slot::default(); VOICES], rng: 0x1234_5678, ambient_level, game_trim, thunder: Thunder::default() })
     }
 
     fn rand(&mut self) -> i32 {
@@ -421,8 +424,9 @@ impl Ambience {
         let slot = self.elements[i].slot as usize;
         // 0x4AECA0…0x4AECCB: another patch stops the voice
         if self.pool[slot].patch != e.patch {
+            // 0x4AECB8: 0x4A9890, the five-tick release 0x565DD0(h, 5, −1)
             if let Some(v) = self.pool[slot].voice.take() {
-                out.stop(v);
+                out.release(v);
             }
             self.pool[slot].patch = e.patch;
         }
@@ -469,6 +473,8 @@ impl Ambience {
             Some(v) if out.is_playing(v) => {
                 out.set(v, vol, 1.0);
                 out.set_pan(v, pan);
+                // 0x4AEED6 is `Voice_play` on voice `slot + 0x39` (bank kind 5)
+                out.voice_play_filter(v, self.filter);
             }
             _ => {
                 if let Some(c) = self.clip(e.patch as u16) {
@@ -490,9 +496,11 @@ impl Ambience {
         self.elements[i].slot = -1;
     }
 
+    /// Every release of an ambience voice is 0x4A9890 (0x4AE9F3, 0x4AED19, 0x4AEF0C, 0x4AF0A8,
+    /// and the shutdown 0x4AF760's 0x4AF782): 0x565DD0(h, 5, −1), the five-tick ramp.
     fn release_slot(&mut self, out: &AudioOutput, slot: usize) {
         if let Some(v) = self.pool[slot].voice.take() {
-            out.stop(v);
+            out.release(v);
         }
         if let Some(e) = self.pool[slot].element.take()
             && self.elements[e].slot == slot as i32

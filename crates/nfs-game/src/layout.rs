@@ -40,6 +40,7 @@ mod bar_oval;
 mod career_tabs;
 mod dialog_draw;
 mod end_of_era_draw;
+pub mod fe_depth;
 pub mod glints;
 pub mod loading;
 pub mod nav;
@@ -405,6 +406,10 @@ pub struct LayoutScreen {
     /// scrollbar at `[this+0x1B8]` whether it has the pointer now and returns before the
     /// `mov byte [esi+0x1A4], 0` at 0x4C6F31. So the row stays lit while you reach for the bar.
     combo_hover: std::cell::Cell<Option<(usize, usize)>>,
+    /// the open drop-down's depth mask in the frame's `overlay` list — the stencil
+    /// `[.0 .. .1)`, the masked draws `[.1 .. .2)` — given its depth when the list is appended,
+    /// which is where the original's later pass draws it (`drop_down`)
+    overlay_mask: std::cell::Cell<Option<(usize, usize, usize)>>,
     /// widget classes the file does not place, with how many of each were skipped
     unrendered: Vec<(String, usize)>,
     /// element index of an `NFS5.CarLogo` → the `.fsh` pack and the first of its two entries
@@ -465,9 +470,6 @@ pub struct LayoutScreen {
     movie_overlays: std::cell::RefCell<HashMap<usize, crate::movie_overlay::MovieOverlay>>,
     /// the credits roll the movie circle draws on the credits screen (0x4CE0F0)
     credits_roll: std::cell::RefCell<Option<crate::movie_overlay::CreditsRoll>>,
-    /// the opaque runs of each row of the art `NFS5.MOVIECIRCLE`'s `stencilshape` parts name —
-    /// what those parts write to the depth buffer (0x4CDAE0, `movie_overlay::RowMask`)
-    mask_runs: HashMap<(String, usize), Vec<Vec<(u16, u16)>>>,
     /// each `NFS5.WORDWRAPACCESSORWATCH`'s text as it last laid it out, and its change fade
     /// (`WrapWatch`, 0x522EC0 / 0x522D60), made on its first draw
     wrap_watch: std::cell::RefCell<HashMap<usize, WrapWatch>>,
@@ -480,6 +482,10 @@ pub struct LayoutScreen {
     /// each `NFS5.AccessorWatch`'s `label.text` as its tick last wrote it (0x4BD32C, 0x526980) —
     /// what the part measures its `size` over (0x4E7160); before the first draw, the template's
     watch_text: std::cell::RefCell<HashMap<usize, String>>,
+    /// each widget's last state name the template actually had an entry for ([`drawn_state`](Self::drawn_state)) —
+    /// 0x5271F0 (§"drawn_state") copies nothing when the live state has no entry, so the part
+    /// list it draws is whatever the last successful match left it as, not the current state
+    last_drawn_state: std::cell::RefCell<HashMap<usize, String>>,
     /// `FEEndOfEraCallBackList`'s show, when this is the end-of-era screen (`set_end_of_era`)
     end_of_era: Option<end_of_era_draw::EndOfEraScreen>,
     /// the bottom bar's career era tabs, loaded by its slot 21 0x4D7FD0 (`load_career_tabs`)
@@ -1506,7 +1512,9 @@ impl LayoutScreen {
         // A `NFS5.HEADER` sweeps a glint across the screen (§4.25). Its activate builds
         // `"%sweeicons.fsh"` from the art directory and looks the entry up **by its tag**,
         // `"GLNT"` (0x4CADC0), so the port does the same rather than carry the index.
-        let glint = layout.elements.iter().any(|e| matches!(e.class.as_str(), "NFS5.HEADER" | "NFS5.CarLogo")).then(|| {
+        // The bottom bar's buttons (0x4C95E4…0x4C95FE) and the word-wrap text object (0x5230E1…
+        // 0x523105, the typewriter's leading letter) look up the same entry.
+        let glint = layout.elements.iter().any(|e| matches!(e.class.as_str(), "NFS5.HEADER" | "NFS5.CarLogo" | "NFS5.BOTTOMBARBUTTON") || e.class.to_ascii_lowercase().contains("wordwrap")).then(|| {
             let p = GamePaths::find_file(&art, "weeicons.fsh")?;
             let d = std::fs::read(p).ok()?;
             let pack = nfs_formats::fsh::Fsh::parse(&d).ok()?;
@@ -1584,13 +1592,6 @@ impl LayoutScreen {
         for i in 0..34 {
             wanted.push((POINTER.to_string(), i));
         }
-        // the art of `NFS5.MOVIECIRCLE`'s nine `stencilshape` parts (its bind names them,
-        // 0x4CD898…0x4CDA4D) is kept on this side too, row by row, as the mask it draws through
-        let mask_files: std::collections::HashSet<String> = controls
-            .get("NFS5.MOVIECIRCLE")
-            .map(|c| (1..=9).filter_map(|k| c.part(&format!("stencilshape{k}"))).filter_map(|p| p.value("shapePathName")).map(|f| f.to_ascii_lowercase()).collect())
-            .unwrap_or_default();
-        let mut mask_runs: HashMap<(String, usize), Vec<Vec<(u16, u16)>>> = HashMap::new();
         for (file, index) in wanted {
             let file = file.as_str();
             let key = (file.to_string(), index);
@@ -1608,9 +1609,6 @@ impl LayoutScreen {
                 continue;
             };
             let Some(level0) = img.mips.first() else { continue };
-            if mask_files.contains(&file.to_ascii_lowercase()) {
-                mask_runs.insert(key.clone(), crate::movie_overlay::alpha_runs(img.width, img.height, level0));
-            }
             let id = r.upload_texture(&TextureData::single(img.width, img.height, level0.clone()));
             shapes.insert(key, (id, img.width as f32, img.height as f32));
         }
@@ -1624,6 +1622,11 @@ impl LayoutScreen {
         // loads `Univers14b.ffn` for the player's name and 0x4CF2A0 `Univers10b.ffn` for the rank
         // and `NFS5.MOVIECIRCLE`'s overlay two for its runs, `Univers7b.ffn` and `Univers11b.ffn`
         // (0x4CDE99, 0x4CDED3)
+        // (`NFS5.ANIMSHOWCASEPICTURE`'s runs load the same pair, 0x4BDD48 / 0x4BDD5E)
+        if layout.elements.iter().any(|e| e.class == "NFS5.ANIMSHOWCASEPICTURE") {
+            want.push(RUN_FONTS[0].to_string());
+            want.push(RUN_FONTS[1].to_string());
+        }
         if layout.elements.iter().any(|e| e.class == "NFS5.MOVIECIRCLE") {
             want.push(RUN_FONTS[0].to_string());
             want.push(RUN_FONTS[1].to_string());
@@ -1681,13 +1684,12 @@ impl LayoutScreen {
         let mut unrendered: Vec<(String, usize)> = counts.into_iter().collect();
         unrendered.sort();
         tracing::info!(name, elements = layout.elements.len(), art = shapes.len(), fonts = fonts.len(), skipped = unrendered.len(), "layout loaded");
-        let screen = Self { layout, background: None, shapes, fonts, white, cursor_ms: 0, cursor_shape_at: std::cell::Cell::new((usize::MAX, 0)), cursor_btn_at: std::cell::Cell::new((false, 0)), cursor_btn: false, car_spin: 0.0, car_parts: HashMap::new(), car_roof: Default::default(), covered: false, combo_hover: std::cell::Cell::new(None), unrendered, logos: HashMap::new(), checks: HashMap::new(), knobs: HashMap::new(), closed: std::collections::HashSet::new(), groups: HashMap::new(), bars: HashMap::new(), lists: HashMap::new(), swatches: HashMap::new(), car_views: HashMap::new(), track_maps: HashMap::new(), movies: HashMap::new(), ko_strip: HashMap::new(), badges: HashMap::new(),
+        let screen = Self { layout, background: None, shapes, fonts, white, cursor_ms: 0, cursor_shape_at: std::cell::Cell::new((usize::MAX, 0)), cursor_btn_at: std::cell::Cell::new((false, 0)), cursor_btn: false, car_spin: 0.0, car_parts: HashMap::new(), car_roof: Default::default(), covered: false, combo_hover: std::cell::Cell::new(None), overlay_mask: std::cell::Cell::new(None), unrendered, logos: HashMap::new(), checks: HashMap::new(), knobs: HashMap::new(), closed: std::collections::HashSet::new(), groups: HashMap::new(), bars: HashMap::new(), lists: HashMap::new(), swatches: HashMap::new(), car_views: HashMap::new(), track_maps: HashMap::new(), movies: HashMap::new(), ko_strip: HashMap::new(), badges: HashMap::new(),
             // `NFS_FE_CLOCK` preloads the screen clock in milliseconds, so a still can be taken
             // part way through an animation the front end would otherwise only show in motion
             clock_ms: std::env::var("NFS_FE_CLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0), glint, colb, arcs,
             movie_overlays: Default::default(),
             credits_roll: Default::default(),
-            mask_runs,
             wrap_watch: Default::default(),
             typing: Default::default(),
             pending_tab: None,
@@ -1695,6 +1697,7 @@ impl LayoutScreen {
             glints: Default::default(),
             preload_ticks: std::env::var("NFS_FE_CLOCK").ok().and_then(|v| v.parse::<u64>().ok()).map_or(0, |ms| (ms * 128 / 1000) as i64),
             watch_text: Default::default(),
+            last_drawn_state: Default::default(),
             end_of_era: None,
             career_tabs: None,
             bar_oval: None,
@@ -1743,19 +1746,22 @@ impl LayoutScreen {
     }
 
     /// The activates that draw from `rand` — `NFS5.HEADER` (0x4CAE0D), `NFS5.CarLogo`
-    /// (0x4C1409), `NFS5.GLINTYLINE` (0x5223F0 → 0x51F9A0) and `NFS5.AnimatingPicture`'s bind
-    /// (0x4BD8C7) — each stamping the screen's open, tick 0 of its clock. They are made in the
-    /// widgets' own order: slot 21 is the **`INUSE`** handler — `FEControl`'s slot 12 0x4C7760
-    /// registers 0x4C7B50 (`call [vtbl+0x54]`) under `"INUSE"` through the message-map insert
-    /// 0x526000 (0x4C7916…0x4C792A), and the screen's slot 38 0x4E0C60 broadcasts `INUSE` to its
-    /// children in the child vector's order (read 2026-09-27). The flourish objects draw nothing
-    /// when they are built and are made on their first draw (`glinty_flourish`).
+    /// (0x4C1409), `NFS5.GLINTYLINE` (0x5223F0 → 0x51F9A0), `NFS5.AnimatingPicture`'s bind
+    /// (0x4BD8C7) and `NFS5.BOTTOMBARBUTTON`'s own sweep bind (0x4C9616, `widgets.rs`'s
+    /// `draw_bar_or_graphic_tab`) — each stamping the screen's open, tick 0 of its clock. They are
+    /// made in the widgets' own order: slot 21 is the **`INUSE`** handler — `FEControl`'s slot 12
+    /// 0x4C7760 registers 0x4C7B50 (`call [vtbl+0x54]`) under `"INUSE"` through the message-map
+    /// insert 0x526000 (0x4C7916…0x4C792A), and the screen's slot 38 0x4E0C60 broadcasts `INUSE`
+    /// to its children in the child vector's order (read 2026-09-27) — which for the bottom bar's
+    /// own four buttons is *this* screen (the bar loads and binds them, `bar_oval.rs`'s marker,
+    /// before the front end's first layout). The flourish objects draw nothing when they are built
+    /// and are made on their first draw (`glinty_flourish`).
     fn activate_glints(&self) {
         let mut g = self.glints.borrow_mut();
         for (i, e) in self.layout.elements.iter().enumerate() {
             let made = match e.class.as_str() {
                 "NFS5.HEADER" => glints::Glint::Sweep(glints::Sweep::new(0, false)),
-                "NFS5.CarLogo" => glints::Glint::Sweep(glints::Sweep::new(0, true)),
+                "NFS5.CarLogo" | "NFS5.BOTTOMBARBUTTON" => glints::Glint::Sweep(glints::Sweep::new(0, true)),
                 "NFS5.GLINTYLINE" => {
                     // 0x51F960 parks the widget's box: with `horizontal` set the bar runs top…bottom
                     // and the sweep left…right, and the other way round without it
@@ -2751,7 +2757,7 @@ impl LayoutScreen {
             let (pos, size) = self.place(aspect, x + px, y + py, aw, ah);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
-            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         }
         let Some(c) = self.controls.get(&e.class) else { return };
         for p in c.state_parts(state).iter().filter_map(|n| c.part(n)) {
@@ -2945,6 +2951,7 @@ impl LayoutScreen {
             rotation: 0.0,
             pivot: [0.5, 0.5],
             tri: None,
+            depth: None,
         };
         vec![bar(0.0), bar(1.0 - w)]
     }
@@ -4139,7 +4146,7 @@ impl LayoutScreen {
         // retires §4.152's last approximation. The port used to offset `x` alone.
         let o = cursor_hot_spot(shape);
         let (pos, size) = self.place(aspect, cx + o, cy + o, w, h);
-        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
     }
 
     /// True once any movie on this screen has played through (0x4E2960).
@@ -4438,17 +4445,37 @@ impl LayoutScreen {
 
     fn quad(&self, aspect: f32, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) -> Sprite {
         let (pos, size) = self.place(aspect, x, y, w, h);
-        Sprite { texture: self.white, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None }
+        Sprite { texture: self.white, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None }
     }
 
     /// One gouraud quad of the front end's own primitive **0x4D98D0**, whose four `(x, y, colour)`
     /// triples arrive in the order upper-left, upper-right, lower-left, lower-right (§4.7).
     ///
-    /// Drawn as the two gouraud triangles a card makes of it: the primitive hands its corners on
-    /// bottom-right, bottom-left, top-right, top-left (controls.md §4.7), which as a strip splits the
-    /// quad along the bottom-left – top-right diagonal. APPROXIMATION in that one respect — the
-    /// submission below 0x4D9450 into the Thrash driver was not followed to the draw call. This
-    /// port used to step the quad into a grid of flat cells (up to 8 × 8), since its sprites had
+    /// **The node's own stored order, read to the instruction (2026-09-27):** 0x4D98D0 does not
+    /// draw — it copies its twelve floats into a node and inserts it into a sorted `_Rb_tree`
+    /// rooted at `[0x65B958]` (compare 0x4D9450, node alloc 0x4DAD30, insert 0x4314C0). Its own
+    /// fill (0x4D993F…0x4D99DA) does **not** keep the caller's four corners — bottom-right,
+    /// bottom-left, top-right, top-left (controls.md §4.7) — in that order: it swaps the last two,
+    /// storing pos/colour slot 0 = the caller's corner 0 (BR), slot 1 = corner 1 (BL), slot 2 =
+    /// corner **3** (TL), slot 3 = corner **2** (TR) — traced by which argument offset (`[esp+…]`)
+    /// feeds which output slot. The flush **0x4DA5F0** copies a node's 64 B pos / 16 B colour / 32 B
+    /// uv blocks verbatim (0x4DA79E/0x4DA7BD/0x4DA7D1) into the batch arrays, so this is also the
+    /// order the device sees: **BR, BL, TL, TR**.
+    ///
+    /// **The diagonal.** Which two triangles the device call actually cuts from those four
+    /// vertices was still not read this pass — past the batch-array copy the call goes through an
+    /// `EAGL::Material` (`[0x65B978]`, vtable 0x5B3C94) whose own "apply" (0x53F1B0) only stages a
+    /// render-context and walks a chain of state-layer objects (`LayerColours` 0x5B3BF0 among
+    /// them), and the actual `DrawPrimitive` is somewhere past that chain or inside `dx7z.dll`
+    /// itself — unread. But the stored order settles it anyway: a **strip** split (`(v0,v1,v2)` +
+    /// `(v1,v2,v3)`) of BR, BL, TL, TR shares the edge BL–TL, which is a side of the quad, not a
+    /// diagonal — the two triangles would overlap and not tile the quad at all (checked against
+    /// coordinates). Only a split that shares **v0–v2** (a fan, or any index pattern built on that
+    /// diagonal) tiles the quad correctly for this vertex order — the **BR–TL** diagonal, not the
+    /// BL–TR one this port drew before. *(Until this pass the port kept the caller's own BR, BL,
+    /// TR, TL order and read it as a strip, splitting BL–TR — wrong on two counts now traced: the
+    /// node does not keep that order, and that order read as a strip is not even a valid tiling.)*
+    /// This port used to step the quad into a grid of flat cells (up to 8 × 8), since its sprites had
     /// one colour a quad; the renderer's per-corner triangles make that unnecessary.
     fn gouraud(&self, out: &mut Vec<Sprite>, aspect: f32, p: [[f32; 2]; 4], c: [[f32; 4]; 4]) {
         let design_aspect = DESIGN.0 / DESIGN.1;
@@ -4464,10 +4491,13 @@ impl LayoutScreen {
             rotation: 0.0,
             pivot: [0.5, 0.5],
             tri: Some(([at(a), at(b), at(d)], [c[a], c[b], c[d]])),
+            depth: None,
         };
-        // UL 0, UR 1, BL 2, BR 3 — the strip BR, BL, TR, TL: (BR, BL, UR) and (BL, UR, UL)
-        out.push(tri(3, 2, 1));
-        out.push(tri(2, 1, 0));
+        // UL 0, UR 1, BL 2, BR 3 — 0x4D98D0's node stores them BR, BL, TL, UR (swapping the
+        // caller's TR/TL), which tiles the quad only along the BR–UL diagonal: (BR, BL, UL) and
+        // (BR, UL, UR).
+        out.push(tri(3, 2, 0));
+        out.push(tri(3, 0, 1));
     }
 
     /// The state a widget draws in, which `FeWidget::updateState` **0x4C82A0** decides from its
@@ -4773,7 +4803,7 @@ impl LayoutScreen {
             for (n, ay) in [(frame(0, 1), y), (frame(3, 2), y + h - ARROW_H)] {
                 let Some(&(tex, aw, ah)) = self.shapes.get(&("weeicons.fsh".to_string(), n)) else { continue };
                 let (pos, size) = self.place(aspect, x, ay, aw, ah);
-                out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+                out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
             }
         }
         // the knob: its height is 0x4DAFC5's, and its travel the port's own first row
@@ -4894,8 +4924,11 @@ impl LayoutScreen {
 
     /// The open drop-down's row under the pointer — `[this+0x1A8]`, which the commit at 0x4C6CF7
     /// reads once the release lands inside the selection box (0x4E2970 on `[this+0x178]`). The
-    /// walk is the drop-down's own draw: rows from the top, each its accessor height, the first
-    /// whose running bottom is past the pointer. `(combo, row)`.
+    /// walk is the move handler's, 0x4C6F60: from the scrollbar's position `[+0x1BC]->slot10()`
+    /// (0x4C6FC7, the drop-down's first drawn row), each row its accessor height (slot 26,
+    /// 0x4C6FF6), the first whose running bottom is past the pointer (0x4C7013, signed `jge`) —
+    /// an **absolute** row, which the commit hands to the accessor's slot 11 as it is (0x4C6D82).
+    /// `(combo, row)`.
     pub fn combo_row_at(&self, px: f32, py: f32) -> Option<(usize, usize)> {
         let i = self.open_combo?;
         if let Some((k, j)) = self.route(i) {
@@ -4909,15 +4942,38 @@ impl LayoutScreen {
             return None;
         }
         let (rows, _) = self.lists.get(&i)?;
+        let first = self.scroll.get(&i).copied().unwrap_or(0);
         let mut acc = ry;
-        rows.iter().position(|r| {
+        rows.iter().enumerate().skip(first).find(|(_, r)| {
             acc += r.height();
             py < acc
-        }).map(|n| (i, n))
+        }).map(|(n, _)| (i, n))
     }
 
-    /// The drop-down's panel: `(x, y, rows' width, data.selectionboxmaxheight)` — the same
-    /// arithmetic `drop_down` draws with.
+    /// Whether a release at `(px, py)` on the **closed** combo `index` lands in its caption
+    /// strip — `FeComboBox` slot 9, 0x4C6B7E…0x4C6BB8: inside `backrect` (0x4E2970 on
+    /// `[+0x17C]`, `left ≤ x < right`, `top ≤ y < bottom`) and `x < backrect.left + [+0x1F0]`
+    /// (0x4E2B20, signed `jge`), [`Self::combo_strip`]. Such a release does not open the list.
+    pub fn in_combo_strip(&self, index: usize, px: f32, py: f32) -> bool {
+        if let Some((k, j)) = self.route(index) {
+            let (Some(g), Some(ek)) = (self.groups.get(&k), self.layout.elements.get(k)) else { return false };
+            let (gx, gy) = self.position_of(ek);
+            return g.in_combo_strip(j, px - gx, py - gy);
+        }
+        let Some(e) = self.layout.elements.get(index) else { return false };
+        let (x, y) = self.position_of(e);
+        let w = self.attr_num(e, "width").unwrap_or(0.0) as f32;
+        let h = self.attr_num(e, "height").unwrap_or(0.0) as f32;
+        px >= x && px < x + w && py >= y && py < y + h && px < x + self.combo_strip(e)
+    }
+
+    /// The drop-down's panel, the `selectionbox` rect `[+0x178]`: `(x, y, rows' width, h)` — the
+    /// same arithmetic `drop_down` draws with. `h` is **the rows' height, clamped to
+    /// `data.selectionboxmaxheight`**: `FeComboBox`'s slot 1 0x4C5460 ends each tick with
+    /// 0x4E2C20(selectionbox, h) at 0x4C57D5 — 0x4E2C20 replaces the size pair's **height** — `h`
+    /// the 16-tick ramp `min((now − [+0x1D4])·[+0x1C4]/16, [+0x1C4])` (0x4C5626…0x4C564D) of the
+    /// clamped rows' height `[+0x1C4]` (0x4C53F3), and 0 while the combo is not focused
+    /// (0x4C53C4 zeroes `[+0x1C4]`). The port takes the settled end.
     fn drop_down_rect(&self, e: &nfs_formats::lay::Element, i: usize, x: f32, y: f32) -> Option<(f32, f32, f32, f32)> {
         let (rows, _) = self.lists.get(&i)?;
         let max_h = self.attr_num(e, "selectionboxmaxheight").unwrap_or(160.0) as f32;
@@ -4931,7 +4987,7 @@ impl LayoutScreen {
         let (px, py) = (if left { x - grow } else { x }, y + height);
         let width = width + grow;
         let rect_w = if scrolls { width - LIST_SCROLLBAR_W } else { width };
-        Some((px, py, rect_w, max_h))
+        Some((px, py, rect_w, if scrolls { max_h } else { full }))
     }
 
     /// Remember where the pointer is on the open drop-down's scrollbar, and whether it is held, so
@@ -5332,6 +5388,16 @@ impl LayoutScreen {
         Some(self.edits.remove(&index).unwrap_or_default())
     }
 
+    /// Type `text` into the input box bound to `accessor`, a character at a time through
+    /// [`Self::type_char`] (diagnostic: `NFS_FE_KEYS`'s `type:`).
+    pub fn type_into(&mut self, accessor: &str, text: &str) {
+        if let Some(i) = self.layout.elements.iter().position(|e| e.get("accessor") == Some(accessor)) {
+            for c in text.chars() {
+                self.type_char(i, c);
+            }
+        }
+    }
+
     /// Empty the input box bound to `accessor` — the string accessor's clear, its slot 0x44.
     pub fn clear_input(&mut self, accessor: &str) {
         if let Some(i) = self.layout.elements.iter().position(|e| e.get("accessor") == Some(accessor)) {
@@ -5461,26 +5527,40 @@ impl LayoutScreen {
         };
         let bottom = mix(amber, low);
         let (ca, cb) = (tint(amber), tint(bottom));
+        // **The panel is a depth mask's stencil** (read 2026-09-27): 0x4DAA10 (0x4C6516), the
+        // gouraud (0x4C6605), 0x4DAAC0 (0x4C660D — the combo's arm jumps past the list box's
+        // alpha-test pair, 0x4C6612 → 0x4C669C), then the outline, the rows and the scrollbar
+        // (0x4C66E0, 0x4C670B…0x4C691B, 0x4C693D) and 0x4DAB00 (0x4C6942): everything after
+        // the panel lands on the panel alone, and the row that overhangs its foot is cut there.
+        // The depth is given when the overlay is appended (`overlay_mask`).
+        let stencil = out.len();
         self.gouraud(
             out,
             aspect,
-            [[px, py], [px + rect_w + if scrolls { LIST_SCROLLBAR_W } else { 0.0 }, py], [px, py + max_h], [px + rect_w + if scrolls { LIST_SCROLLBAR_W } else { 0.0 }, py + max_h]],
+            // the rect's height is the rows' `h` 0x4C57D5 set (`drop_down_rect`) — *corrected
+            // 2026-09-27: this drew `selectionboxmaxheight` whatever the list held (§4.44)*
+            [[px, py], [px + rect_w + if scrolls { LIST_SCROLLBAR_W } else { 0.0 }, py], [px, py + rows_h], [px + rect_w + if scrolls { LIST_SCROLLBAR_W } else { 0.0 }, py + rows_h]],
             [ca, ca, cb, cb],
         );
+        let inside = out.len();
         let black = tint([0, 0, 0, 255]);
         // the sixteen pixels the panel gave up carry the drop-down's own scrollbar (§4.90)
         if scrolls {
             self.combo_scrollbar(out, aspect, px + rect_w, py, max_h, rows.len(), self.scroll.get(&i).copied().unwrap_or(0), &tint);
         }
-        for (bx, by, bw, bh) in [(px, py, rect_w, 1.0), (px, py + max_h - 1.0, rect_w, 1.0), (px, py, 1.0, max_h), (px + rect_w - 1.0, py, 1.0, max_h)] {
+        for (bx, by, bw, bh) in [(px, py, rect_w, 1.0), (px, py + rows_h - 1.0, rect_w, 1.0), (px, py, 1.0, rows_h), (px + rect_w - 1.0, py, 1.0, rows_h)] {
             out.push(self.quad(aspect, bx, by, bw.max(1.0), bh.max(1.0), black));
         }
         let text_c = self.attr(e, "textcolor").and_then(parse_color).map(|c| [c[0], c[1], c[2], 255]).unwrap_or([0, 0, 0, 255]);
         let sel_c = self.attr(e, "highlightcolorselected").and_then(parse_color).map(|c| [c[0], c[1], c[2], 255]).unwrap_or([0, 0, 0, 255]);
-        // the same foot-of-loop test as the list box's (0x4C6915): the last row overhangs
+        // the same foot-of-loop test as the list box's (0x4C6915): the last row is drawn and the
+        // mask cuts it at the panel's foot (it "overhangs" until 2026-09-27); the
+        // first row drawn is the scrollbar's position `[+0x1BC]->slot10()` (0x4C66F8, §4.44) —
+        // *until 2026-09-27 the port drew from row 0 whatever the bar said*
         let mut acc = 0.0f32;
         let mut ry = py;
-        for (n, row) in rows.iter().enumerate() {
+        let first = self.scroll.get(&i).copied().unwrap_or(0);
+        for (n, row) in rows.iter().enumerate().skip(first) {
             if acc > max_h {
                 break;
             }
@@ -5497,6 +5577,7 @@ impl LayoutScreen {
             }
             ry += row.height();
         }
+        self.overlay_mask.set(Some((stencil, inside, out.len())));
     }
 
     /// `FEColourAccessor`'s row draw **0x4B9390**, the part after the row's bar: a colour row is a
@@ -5599,7 +5680,7 @@ impl LayoutScreen {
             && let Some(&(tex, sw, sh)) = self.shapes.get(&("weeicons.fsh".to_string(), n))
         {
             let (pos, size) = self.place(aspect, cx0, cy0, sw, sh);
-            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: white, rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: white, rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         }
         outline(out, cx0 - 1.0, cy0 - 1.0, (cx1 - cx0) + 2.0, (cy1 - cy0) + 2.0, black);
         // 6 — the eight wells, and the selected one in white
@@ -5780,15 +5861,27 @@ impl LayoutScreen {
 
     /// The state whose part list a draw ending in **0x525830** walks (`[[this+0xD4]] +
     /// 0x525570()·4`, 0x525876…0x525886): [`state_for`](Self::state_for) when the template
-    /// carries that state. APPROXIMATION: a name the template lacks (the port's keyboard
+    /// carries that state. Settled 2026-09-28: a name the template lacks (the port's keyboard
     /// `selected` on a class with no `[state.selected]`) leaves the list as it was — 0x5271F0
-    /// finds no entry and copies nothing (0x527214) — and the port, keeping no memory of the
-    /// last one, takes the `.lay` block's `state=`.
-    fn drawn_state<'a>(&self, e: &'a nfs_formats::lay::Element, i: usize, selected: Option<usize>, hovered: Option<usize>) -> &'a str {
+    /// finds no entry and copies nothing (0x527214, confirmed by reading it: the "not found" arm
+    /// jumps straight past the `memmove` at 0x527216…0x527263) — so the object goes on drawing
+    /// whichever state it last *did* find an entry for, however many ticks ago that was, not the
+    /// `.lay` block's static `state=`. `last_drawn_state` is that per-widget memory; before the
+    /// first successful match it falls back to the `.lay` block's `state=`, since that is what a
+    /// freshly-bound widget's part list holds before any draw has run.
+    fn drawn_state(&self, e: &nfs_formats::lay::Element, i: usize, selected: Option<usize>, hovered: Option<usize>) -> String {
         let live = self.state_for(e, i, selected, hovered);
         match self.controls.get(&e.class) {
-            Some(c) if c.has_state(live) => live,
-            _ => e.get("state").unwrap_or("normal"),
+            Some(c) if c.has_state(live) => {
+                self.last_drawn_state.borrow_mut().insert(i, live.to_string());
+                live.to_string()
+            }
+            _ => self
+                .last_drawn_state
+                .borrow()
+                .get(&i)
+                .cloned()
+                .unwrap_or_else(|| e.get("state").unwrap_or("normal").to_string()),
         }
     }
 
@@ -6133,7 +6226,7 @@ impl LayoutScreen {
         let Some(n) = self.glint else { return };
         let Some(&(tex, aw, ah)) = self.shapes.get(&("weeicons.fsh".to_string(), n)) else { return };
         let (pos, size) = self.place(aspect, elapsed as f32, y, aw, ah);
-        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, alpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, alpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
     }
 
 }
@@ -6789,7 +6882,11 @@ impl LayoutScreen {
     /// `NFS_FE_CLOCK` preloads that clock with no frames behind it, so a widget first drawn past
     /// the wait takes the wait as having ended on its last tick (152) — the diagnostic's stand-in
     /// for the frames it skipped, which the game never meets (its first draw is at tick 0…2).
-    fn typewriter(&self, i: usize, e: &nfs_formats::lay::Element, restart: Option<i64>) -> Option<usize> {
+    ///
+    /// The answer is the character budget and the ticks into the current character,
+    /// `([+0x150] − [+0x14C]) % 3` — the remainder the same signed divide leaves in `edx`
+    /// (0x52331D), which fades the leading letter in (`wrapped_text`).
+    fn typewriter(&self, i: usize, e: &nfs_formats::lay::Element, restart: Option<i64>) -> Option<(usize, i64)> {
         let animating = self.attr_num(e, "animating").unwrap_or(0.0) != 0.0;
         let now = self.ticks() as i64;
         let mut all = self.typing.borrow_mut();
@@ -6809,7 +6906,7 @@ impl LayoutScreen {
         if !animating {
             return None;
         }
-        Some(shown.unwrap_or(0))
+        Some((shown.unwrap_or(0), ((t.last - t.start) % 3).max(0)))
     }
 
     /// The progress a widget of this screen transitions with — 0x4E0D90(1) as 0x4C8760 and
@@ -6838,7 +6935,7 @@ impl LayoutScreen {
     /// the last line's measured height + 2 apart ([`wrap_metrics`], 0x523916 / 0x523576) — not the
     /// font's line height, as this said before.
     #[allow(clippy::too_many_arguments)]
-    fn wrapped_text(&self, out: &mut Vec<Sprite>, aspect: f32, f: &BitmapFont, s: &str, x: f32, y: f32, w: f32, align: i64, color: [f32; 4], budget: Option<usize>) {
+    fn wrapped_text(&self, out: &mut Vec<Sprite>, aspect: f32, f: &BitmapFont, s: &str, x: f32, y: f32, w: f32, align: i64, color: [f32; 4], budget: Option<(usize, i64)>) {
         if w <= 0.0 {
             self.text(out, aspect, f, s, x, y, w, align, color);
             return;
@@ -6846,50 +6943,79 @@ impl LayoutScreen {
         let mut ly = y;
         // `budget` is `data.animating`'s character allowance — 0x523327's loop walks the line
         // vector and, for each line, draws it whole while `strlen(line) <= ebx` and takes `ebx`
-        // off the budget (0x523340…0x52336E), or stops after truncating one line at `ebx`
-        // characters (0x52337D writes the NUL and 0x523392 puts it back). §4.87.
-        let mut left = budget.unwrap_or(usize::MAX);
+        // off the budget (0x523340…0x52336E), or cuts one line at `ebx` characters and stops
+        // (0x523572 zeroes the budget). §4.87.
+        let (mut left, rem) = budget.unwrap_or((usize::MAX, 0));
         let lines = wrap_lines(f, s, w);
         let (pitch, _) = wrap_metrics(f, &lines);
         for line in lines {
             if left == 0 {
                 break;
             }
-            let n = line.chars().count();
-            let shown: String = if n <= left {
-                left -= n;
-                line
+            let chars: Vec<char> = line.chars().collect();
+            if chars.len() <= left {
+                left -= chars.len();
+                self.text(out, aspect, f, &line, x, ly, w, align, color);
             } else {
-                let t = line.chars().take(left).collect();
+                self.typed_line(out, aspect, f, &chars, left, rem, x, ly, w, align, color);
                 left = 0;
-                t
-            };
-            self.text(out, aspect, f, &shown, x, ly, w, align, color);
+            }
             ly += pitch;
         }
     }
 
-    /// [`text`](Self::text) with no width, each glyph quad cut to `mask` — the parts of it that
-    /// fall where the mask's rows are, with the texture window cut alike.
+    /// The line the typewriter is in, 0x52337D…0x523569 (read 2026-09-27). With `n` the
+    /// characters of it shown, the NUL goes at `n − 1` (0x523392): the first `n − 1` are drawn
+    /// with 0x4DA530, and the **`n`th alone**, `ch`, the leading letter. The anchor `x0` is
+    /// `_ftol` of the aligned x (`x`, `x + w/2`, `x + w`: 0x5232A9…0x5232CD, 0x523395), and per
+    /// alignment (0x5233A2's switch; `p1`/`p3` are 0x536970's minX / width):
+    ///
+    /// ```text
+    /// 0  the prefix at x0, the letter at _ftol(x0 + p3(prefix) − 1)            0x523478…0x5234AA
+    /// 1  the letter at _ftol(p3(prefix)/2 + x0), the prefix at
+    ///    _ftol(x0 − p1(line from n + 1)/2)                                      0x5233FB…0x52346F
+    /// 2  the letter at x0, the prefix at _ftol(x0 − p1(line from n + 1))        0x5233B9…0x5233EF
+    /// ```
+    ///
+    /// — the second measure starts one character past the letter (`[ebx+ebp+1]`) and reads the
+    /// box's **minX**, not its width (`[esp+0x1C]` / `[esp+0x14]` are the first output), as
+    /// written. Then, unless 0x4E35C0 answers true or the object has no `GLNT` (`[+0xDC]`, 0x523105),
+    /// **a depth mask** (0x5234EC 0x4DAA10 … 0x523530 0x4DAAC0 … 0x523569 0x4DAB00): the letter is
+    /// the stencil, in the text's colour at alpha × `rem·255/3` / 255 (0x4D87F0 of the ticks into the
+    /// letter, 0x5234F1…0x523511 — so it fades in over its three ticks, and at 0 it is not drawn
+    /// and writes no depth), and inside it the `weeicons.fsh` `GLNT` at `(letter x − 18, y)` in
+    /// `0x4D87D0(alpha)` (0x523535…0x523561): a glint on the letter being typed. Without the
+    /// mask's conditions the letter is not drawn at all (0x52356E restores it).
     #[allow(clippy::too_many_arguments)]
-    fn text_masked(&self, out: &mut Vec<Sprite>, aspect: f32, f: &BitmapFont, s: &str, x: f32, y: f32, align: i64, color: [f32; 4], mask: &crate::movie_overlay::RowMask) {
-        let (glyphs, width) = f.place(s);
-        let left = match align {
-            1 => x - width * 0.5,
-            2 => x - width,
+    fn typed_line(&self, out: &mut Vec<Sprite>, aspect: f32, f: &BitmapFont, chars: &[char], n: usize, rem: i64, x: f32, y: f32, w: f32, align: i64, color: [f32; 4]) {
+        let prefix: String = chars[..n - 1].iter().collect();
+        let ch = chars[n - 1].to_string();
+        let rest: String = chars.get(n + 1..).map(|r| r.iter().collect()).unwrap_or_default();
+        let x0 = match align {
+            1 => x + w * 0.5,
+            2 => x + w,
             _ => x,
         }
-        .round();
-        let top = y.round();
-        for g in &glyphs {
-            let (gx, gy) = (left + g.x, top + g.y);
-            for (cx, cy, cw, ch) in mask.clip(gx, gy, g.w, g.h) {
-                let u = |px: f32| g.uv_min[0] + (g.uv_max[0] - g.uv_min[0]) * (px - gx) / g.w;
-                let v = |py: f32| g.uv_min[1] + (g.uv_max[1] - g.uv_min[1]) * (py - gy) / g.h;
-                let (pos, size) = self.place(aspect, cx, cy, cw, ch);
-                out.push(Sprite { texture: f.texture(), pos, size, uv_min: [u(cx), v(cy)], uv_max: [u(cx + cw), v(cy + ch)], color, rotation: 0.0, pivot: [0.0, 0.0], tri: None });
-            }
-        }
+        .trunc();
+        let (px, cx) = match align {
+            1 => ((x0 - f.measure_box(&rest).0 * 0.5).trunc(), (f.measure_box(&prefix).2 * 0.5 + x0).trunc()),
+            2 => ((x0 - f.measure_box(&rest).0).trunc(), x0),
+            _ => (x0, (x0 + f.measure_box(&prefix).2 - 1.0).trunc()),
+        };
+        let align = align.clamp(0, 2);
+        self.text(out, aspect, f, &prefix, px, y, 0.0, align, color);
+        let Some(g) = self.glint.and_then(|n| self.shapes.get(&("weeicons.fsh".to_string(), n))).copied() else { return };
+        let mask = fe_depth::mask_begin();
+        // 0x4D87F0: alpha × k / 255 with `mul 0x80808081` (unsigned, truncating), k = rem·255/3
+        let a8 = (color[3].clamp(0.0, 1.0) * 255.0).round() as u32;
+        let k = (rem.clamp(0, 2) * 255 / 3) as u32;
+        let letter = [color[0], color[1], color[2], (a8 * k / 255) as f32 / 255.0];
+        let stencil = out.len();
+        self.text(out, aspect, f, &ch, cx, y, 0.0, align, letter);
+        fe_depth::apply(&mut out[stencil..], mask.stencil);
+        let (tex, gw, gh) = g;
+        let (pos, size) = self.place(aspect, cx - 18.0, y, gw, gh);
+        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, a8 as f32 / 255.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: Some(mask.inside) });
     }
 
     fn text(&self, out: &mut Vec<Sprite>, aspect: f32, f: &BitmapFont, s: &str, x: f32, y: f32, w: f32, align: i64, color: [f32; 4]) {
@@ -6930,13 +7056,13 @@ impl LayoutScreen {
             // `NFS_TEXT_BIG=1` draws the quads four times the size
             let size = if std::env::var("NFS_TEXT_BIG").is_ok() { [size[0] * 4.0, size[1] * 4.0] } else { size };
             let tex = if solid { self.white } else { f.texture() };
-            out.push(Sprite { texture: tex, pos, size, uv_min: uv0, uv_max: uv1, color, rotation: 0.0, pivot: [0.0, 0.0], tri: None });
+            out.push(Sprite { texture: tex, pos, size, uv_min: uv0, uv_max: uv1, color, rotation: 0.0, pivot: [0.0, 0.0], tri: None, depth: None });
             // `NFS_TEXT_AB=1` repeats each glyph one line lower **in red**, same texture, same UV
             // window, same size — so one image carries the widget's text twice and the only
             // difference between the two is `color.rgb`. The red copy draws and the black original
             // does not (`AUDIT.md` F2).
             if std::env::var("NFS_TEXT_AB").is_ok() {
-                out.push(Sprite { texture: f.texture(), pos: [pos[0], pos[1] + size[1] * 1.2], size, uv_min: uv0, uv_max: uv1, color: [1.0, 0.0, 0.0, 1.0], rotation: 0.0, pivot: [0.0, 0.0], tri: None });
+                out.push(Sprite { texture: f.texture(), pos: [pos[0], pos[1] + size[1] * 1.2], size, uv_min: uv0, uv_max: uv1, color: [1.0, 0.0, 0.0, 1.0], rotation: 0.0, pivot: [0.0, 0.0], tri: None, depth: None });
             }
         }
     }
@@ -6998,6 +7124,7 @@ impl LayoutScreen {
         // ordinary draw, and steps the sprite depth for it (0x4DAA10 / 0x4DAAC0) — so it lands over
         // every widget on the screen. The port collects it here and appends it at the end.
         let mut overlay: Vec<Sprite> = Vec::new();
+        self.overlay_mask.set(None);
         // **The draw order is the section order, backwards** — `RE/notes/controls.md` §4.67.
         // `Window::load` (slot 20, 0x5282E0) walks the layout's sections **1 … count-1 forwards**
         // and `Window::addChild` (slot 22, 0x528120) is a `push_back`, so the child vector is in
@@ -7116,6 +7243,13 @@ impl LayoutScreen {
             && let Some(e) = self.layout.elements.get(h)
         {
             self.tooltip(&mut overlay, aspect, e, strings);
+        }
+        // the drop-down's depth mask is stepped here, after every widget's own draw, where its
+        // sprites go (0x4DAA10 at 0x4C6516 in the later pass)
+        if let Some((a, b, c)) = self.overlay_mask.take() {
+            let m = fe_depth::mask_begin();
+            fe_depth::apply(&mut overlay[a..b], m.stencil);
+            fe_depth::apply(&mut overlay[b..c], m.inside);
         }
         out.append(&mut overlay);
         // last of all, over the tooltip and the drop-down alike

@@ -268,7 +268,56 @@ impl SfxQueue {
     }
 }
 
+/// The wind's two random walks, `[0x5D1838]` / `[0x5D1840]` (the level and its step) and
+/// `[0x5D183C]` / `[0x5D1844]` (the 16.16 pitch and its step), stepped once per wind update by
+/// 0x4AA4EB…0x4AA5A5. The image's values start them — 0x28 / −1 and 0xFA24 / −1 — and only
+/// 0x4AA050 writes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindWalk {
+    pub level: i32,
+    pub level_step: i32,
+    pub pitch: i32,
+    pub pitch_step: i32,
+}
+
+impl Default for WindWalk {
+    fn default() -> Self {
+        Self { level: 0x28, level_step: -1, pitch: 0xFA24, pitch_step: -1 }
+    }
+}
+
+impl WindWalk {
+    /// One step: both walks move by their steps (0x4AA4FC…0x4AA50E); then the level is clamped
+    /// into 0x28…0x7F and the pitch into 0xFA24…0x105DC (signed `jle` / `jge`), each clamp drawing
+    /// its new step from `draw` — 0x538040 — the level's first: `−1 − (r & 7)` (0x4AA520…0x4AA52A),
+    /// `(r & 7) + 1` (0x4AA544…0x4AA54D), `−20 − r % 80` (0x4AA566…0x4AA57B), `r % 50 + 10`
+    /// (0x4AA594…0x4AA5A5; `div`, unsigned).
+    pub fn step(&mut self, draw: &mut impl FnMut() -> u32) {
+        self.level = self.level.wrapping_add(self.level_step);
+        self.pitch = self.pitch.wrapping_add(self.pitch_step);
+        if self.level > 0x7F {
+            self.level = 0x7F;
+            self.level_step = -1 - (draw() & 7) as i32;
+        }
+        if self.level < 0x28 {
+            self.level = 0x28;
+            self.level_step = (draw() & 7) as i32 + 1;
+        }
+        if self.pitch > 0x1_05DC {
+            self.pitch = 0x1_05DC;
+            self.pitch_step = -20 - (draw() % 80) as i32;
+        }
+        if self.pitch < 0xFA24 {
+            self.pitch = 0xFA24;
+            self.pitch_step = (draw() % 50) as i32 + 10;
+        }
+    }
+}
+
 pub struct CollisionSfx {
+    /// What `Voice_play`'s update of a playing voice hands the strip hook this pass
+    /// ([`crate::mixer::voice_play_filter`], 0x4A9FA8…0x4AA03B): set by the caller every audio update.
+    pub filter: Option<i32>,
     bank: Bnk,
     data: Vec<u8>,
     clips: HashMap<usize, Arc<Clip>>,
@@ -283,12 +332,8 @@ pub struct CollisionSfx {
     road: Option<(VoiceId, usize)>,
     /// wind loop (voice 0x1A, slot 0x1F, §4.5)
     wind: Option<VoiceId>,
-    /// `[0x5D1838]` / `[0x5D1840]` — the wind level random walk and its step
-    wind_level: i32,
-    wind_level_step: i32,
-    /// `[0x5D183C]` / `[0x5D1844]` — the wind pitch random walk (16.16) and its step
-    wind_pitch: i32,
-    wind_pitch_step: i32,
+    /// the wind's two random walks ([`WindWalk`])
+    wind_walk: WindWalk,
     /// turbo / blower loop (voice 0, slot 0x0F, §4.6)
     turbo: Option<VoiceId>,
     /// the police sirens by audio slot (`0x6562E8[slot]`, started by 0x4AAE90)
@@ -488,6 +533,7 @@ impl CollisionSfx {
         let bank = Bnk::parse(&data)?;
         tracing::info!(slots = bank.slot_count(), "collision bank loaded");
         Ok(Self {
+            filter: None,
             bank,
             data,
             clips: HashMap::new(),
@@ -499,10 +545,7 @@ impl CollisionSfx {
             road: None,
             wind: None,
             // the image's `[0x5D1838]` / `[0x5D1840]` / `[0x5D183C]` / `[0x5D1844]`
-            wind_level: 0x28,
-            wind_level_step: -1,
-            wind_pitch: 0xFA24,
-            wind_pitch_step: -1,
+            wind_walk: WindWalk::default(),
             turbo: None,
             sirens: HashMap::new(),
             siren_trim: nfs_formats::spl::GameSpl::load(sounds_dir).loops_6564d0(),
@@ -569,7 +612,8 @@ impl CollisionSfx {
     /// car's last contact point `car+0x440` (0x4A7BB1…0x4A7C3B) — unless `[0x657404] == 1` (split
     /// screen) or its `idA` is GearShift 0x1C / BackFire 0x1E, which take the car's pan too.
     /// Both reach the voice (0x4A94D5…0x4A94EA, 0x4A983A…0x4A9854). This port had neither pan.
-    /// `pan` here is the loops'; the one-shots' comes from [`Self::set_one_shot_pan`].
+    /// `pan` here is the loops'; the one-shots' comes from [`Self::set_one_shot_pan`], called once
+    /// by [`Self::drain_player`].
     /// *(2026-09-26: the "APPROXIMATION: every one-shot takes the car's pan" that stood here is
     /// withdrawn — `nfs_physics::vehicle::Vehicle::last_contact` now carries `car+0x440`.)*
     pub fn set_levels(&mut self, sfx_level: u8, engine_level: u8, reverb: i32, distance: f32, view_0c: bool, pan: u16) {
@@ -584,11 +628,12 @@ impl CollisionSfx {
     /// The one-shots' pan (0x4A93C0's sixth argument for `chan < 0`): the player's drain measures
     /// it to the car's last contact point `car+0x440` (0x4A7BB1…0x4A7C3B: `atan2` of the offset
     /// from the listener 0x655E50 dotted with its axes 0x655E5C / 0x655E74, negated under `MIRROR`
-    /// 0x4A7C1A) — the same angle as the car's own (0x4A7862…0x4A78E5) with the point swapped. The
-    /// caller hands in the pan of `nfs_physics::vehicle::Vehicle::last_contact` as it stands when
-    /// the one-shot plays. APPROXIMATION of the timing only: the original reads `car+0x440` once,
-    /// at the drain after the physics tick, so every one-shot of a tick takes the tick's last
-    /// contact; the port plays each one-shot as its event happens.
+    /// 0x4A7C1A) — the same angle as the car's own (0x4A7862…0x4A78E5) with the point swapped.
+    /// Called once by [`Self::drain_player`], with `car+0x440` as it stands at the drain (after
+    /// the whole tick's physics) — not per event: see that method. *(Until 2026-09-27 this was
+    /// called once per one-shot, as its event happened, each against `car+0x440`'s value at that
+    /// moment — an APPROXIMATION now withdrawn: `main.rs`'s collision block queues the one-shots
+    /// instead of playing them, so they all reach this the same way the loops do.)*
     pub fn set_one_shot_pan(&mut self, pan: u16) {
         self.one_shot_pan = pan;
     }
@@ -624,7 +669,10 @@ impl CollisionSfx {
     /// against each record's codes 0x01 / 0x02 and multiplies the patch volume by, over 127
     /// (0x5905D0 → `voice+0x3C`, a factor of the voice level at 0x589E1C) — the port passes it as
     /// `sel` (`AudioOutput::play_panned_sel`). *(Until 2026-09-27 this said the level was "not a
-    /// volume"; before 2026-09-26 the port had it as the gain.)*
+    /// volume"; before 2026-09-26 the port had it as the gain.)* Voice 0x33 (0x4A94D5): `Voice_play`
+    /// 0x4A9C10 takes 0x33 to `Bank_playOneShot` but never writes the pause's table for it
+    /// (`AudioOutput::silence_voices`, `RE/notes/sfx.md` "Audit 2026-09-27, audio port 11") — one
+    /// voice number shared by every concurrent hit.
     fn play_one_shot(&mut self, out: &AudioOutput, slot: usize, level: f32) {
         let level = level.clamp(0.0, 127.0);
         if (level as i32) >> 4 <= self.gate {
@@ -633,7 +681,7 @@ impl CollisionSfx {
         self.gate = (level as i32) >> 4;
         let vol = self.atten.clamp(0, 127);
         if let Some(clip) = self.clip(slot) {
-            let id = out.play_panned_sel(clip, self.one_shot_volume(slot, vol), 1.0, self.one_shot_pan, false, level as i32 as u8);
+            let id = out.play_panned_sel_untabled(clip, self.one_shot_volume(slot, vol), 1.0, self.one_shot_pan, false, level as i32 as u8);
             // the aux byte is taken only for slots from 0x30 (0x4A9A56 `jl`), which every
             // collision group is
             if slot >= 0x30 {
@@ -745,17 +793,19 @@ impl CollisionSfx {
     }
 
     /// The trigger chime 0x4AAE30 (a checkpoint whose field 15 is 1, 0x470460 / 0x470D58): slot 2
-    /// of `SND_coll` straight through 0x4A98E0 at level 0x7F, pan 0x40, pitch 0x10000.
+    /// of `SND_coll` straight through 0x4A98E0 at level 0x7F, pan 0x40, pitch 0x10000 — no
+    /// `Voice_play` call, so not in the pause's table (`AudioOutput::silence_voices`).
     pub fn trigger_chime(&mut self, out: &AudioOutput) {
         if let Some(clip) = self.clip(2) {
-            out.play(clip, self.sfx_volume(0x7F), 1.0, false);
+            out.play_untabled(clip, self.sfx_volume(0x7F), 1.0, false);
         }
     }
 
-    /// The "wrong way" cue 0x4AAE70 (0x4A7744): slot 1 of `SND_coll` straight at level 0x28.
+    /// The "wrong way" cue 0x4AAE70 (0x4A7744): slot 1 of `SND_coll` straight at level 0x28 — same
+    /// direct `Bank_playOneShot` path as [`trigger_chime`](Self::trigger_chime), not in the table.
     pub fn wrong_way_cue(&mut self, out: &AudioOutput) {
         if let Some(clip) = self.clip(1) {
-            out.play(clip, self.sfx_volume(0x28), 1.0, false);
+            out.play_untabled(clip, self.sfx_volume(0x28), 1.0, false);
         }
     }
 
@@ -775,8 +825,9 @@ impl CollisionSfx {
     pub fn siren(&mut self, out: &AudioOutput, audio_slot: usize, on: bool, distance: f32, pan: u16, pitch_base: i32, ambient_level: u8) {
         if !on {
             if let Some(id) = self.sirens.remove(&audio_slot) {
-                tracing::debug!(audio_slot, "siren stop");
-                out.stop(id);
+                tracing::debug!(audio_slot, "siren release");
+                // 0x4AAF50: 0x565DD0(h, 5, −1) (0x4AAF9F), the ramp of `mixer::Ramp`
+                out.release(id);
             }
             return;
         }
@@ -790,7 +841,9 @@ impl CollisionSfx {
             None => {
                 if let Some(c) = self.clip(siren_slot(audio_slot, false)) {
                     tracing::debug!(audio_slot, sample = siren_slot(audio_slot, false), distance, "siren start");
-                    self.sirens.insert(audio_slot, out.play_word(c, 0.0, SIREN_WORD, SIREN_START_BEND, 0x40, true));
+                    // 0x4AAE90 is a direct Bank_playOneShot 0x4A98E0, no Voice_play voice number:
+                    // not in the pause's table (AudioOutput::silence_voices)
+                    self.sirens.insert(audio_slot, out.play_word_untabled(c, 0.0, SIREN_WORD, SIREN_START_BEND, 0x40, true));
                 }
             }
         }
@@ -799,10 +852,11 @@ impl CollisionSfx {
     /// Cone hit, from the HUD's cone count (`skill-tests.md` §8): **0x4AAE50** plays slot 0 of the
     /// kind-3 bank `[0x6564D0]` (`SND_coll.bnk`) straight through 0x4A98E0 at level 0x7F, pan 0x40,
     /// pitch 0x10000 — not through the collision queue, so no pair lookup and no one-shot gate.
-    /// (The port had CarBody × Pylon, group 0x56, at the gated fixed-15 level.)
+    /// (The port had CarBody × Pylon, group 0x56, at the gated fixed-15 level.) Same direct
+    /// `Bank_playOneShot` path as [`trigger_chime`](Self::trigger_chime): not in the pause's table.
     pub fn pylon_hit(&mut self, out: &AudioOutput) {
         if let Some(clip) = self.clip(0) {
-            out.play(clip, self.sfx_volume(0x7F), 1.0, false);
+            out.play_untabled(clip, self.sfx_volume(0x7F), 1.0, false);
         }
     }
 
@@ -811,23 +865,50 @@ impl CollisionSfx {
         self.play_one_shot(out, SLOT_CRASH, 127.0);
     }
 
-    /// §5.3's roof / side scrape, producer **0x40FFF0**: while the car is on its side or roof
-    /// (`car+0x3A0 <= 0.2`) with the body near the ground (`car+0x424 < 0.2`) and `speedEst/4 > 0.1`,
-    /// it pushes `{4, 0x14, CarBody, surf, speedEst/4 · (1 − rand/3), 0}` — so the **rear** squeal
-    /// channel carries a fluttering CarBody × surface loop instead of the tyres'. Upright, the
-    /// caller stops it and runs the squeal producer again.
+    /// **The player's queue drain, 0x4A7AF8…0x4A7C97 — one last-first walk of every entry**: the
+    /// tick's collision one-shots (`Car_postImpact` 0x410280 / `Car_ground` 0x49C1D6 / 0x49C095,
+    /// `main.rs`'s collision pass, queued there instead of played straight since 2026-09-27) and,
+    /// pushed after them by this same audio update, the loop entries of 0x40FFF0 / 0x40FBC0
+    /// ([`SfxQueue::produce_loops`]) — each into 0x4A93C0, a loop on voice 0x12 (front) or 0x14
+    /// (rear) ([`Self::loop_voice`]), a one-shot dispatched by kind ([`Self::wall_hit`] etc.).
+    /// `one_shot_pan` is the angle to the car's last contact point `car+0x440` (0x4A7BB1…0x4A7C3B)
+    /// as the caller measures it **once**, at this call — the value the original's drain reads,
+    /// after the whole tick's physics, so every one-shot of the tick takes the same, final contact
+    /// ([`Self::set_one_shot_pan`]); the loops' own pan is the car's ([`Self::set_levels`]).
     ///
-    /// `r16` is the game's LCG draw `[0x5D1028] · [0x5D102C] >> 8 & 0xFFFF` (0x4100F8…0x41011E) —
-    /// the caller's `nfs_game::rng::rand16`, the stream the AI draws from too.
-    pub fn body_scrape(&mut self, out: &AudioOutput, surface_nibble: usize, vol: f32, r16: u32) {
-        let slot = body_scrape_slot(surface_material(surface_nibble));
-        // 0x41010C…0x41010F: a 16-bit draw (`>> 8 & 0xFFFF`), so `r/65536` stays under 1. The port
-        // divided the 24-bit `rand()` by 65536, which let the flutter reach −84 (corrected 2026-09-26)
-        let flutter = 1.0 - ((r16 & 0xFFFF) as f32 / 65536.0) / 3.0;
-        if let Some((id, _)) = self.front.take() {
-            out.stop(id);
+    /// Because the walk is last-first and [`Self::play_one_shot`]'s gate carries across the whole
+    /// call (raised by the first one-shot processed, tested by every one after), the LAST entry
+    /// *pushed* this tick is the FIRST one *played*, and can silence a quieter one-shot pushed
+    /// earlier in the tick, exactly as the original's does. A wall hit and a body–ground scrape
+    /// cannot both queue (a wall contact clears `ground_event`, `main.rs`), but a wall hit and a
+    /// car–car hit can — pushed in that order (walls run before the car-pair rounds) — and a wall
+    /// scrape queued first, silenced by a louder car hit pushed after it, is now inaudible where
+    /// the port's old immediate-play design (each against its own contact, no shared order) played
+    /// both. So this closes a real, if narrow, audible gap, not only the pan's timing.
+    ///
+    /// So the roof scrape (a rear loop entry) never touches the front voice, and when the car comes
+    /// upright after a scrape the scrape's stop, pushed first, is taken last: a rear squeal the
+    /// same tick starts (the scrape's 25-tick replace release) and is released by it (five ticks),
+    /// to start again next update. *(Until 2026-09-27 this was `drain_player_loops`, walking only
+    /// the `Loop` entries; the one-shots were played straight from the collision pass, each against
+    /// `car+0x440` as it stood at its own call — the port had no player one-shot queue at all. See
+    /// `sfx.md`'s "The drain's distance and pan".)*
+    pub fn drain_player(&mut self, out: &AudioOutput, queue: &SfxQueue, one_shot_pan: u16) {
+        self.set_one_shot_pan(one_shot_pan);
+        for e in queue.entries.iter().rev() {
+            match *e {
+                QueuedSfx::WallHit { j, class } => self.wall_hit(out, j, class),
+                QueuedSfx::WallScrape { speed, class } => self.wall_scrape(out, speed, class),
+                QueuedSfx::CarCar { effect } => self.car_car(out, effect),
+                QueuedSfx::Smackable { effect, material } => self.car_smackable(out, effect, material),
+                QueuedSfx::Prop { impact, class } => self.prop_hit(out, impact, class),
+                QueuedSfx::Bush => self.bush_hit(out),
+                QueuedSfx::Ground { effect, nibble } => self.ground_hit(out, effect, nibble),
+                QueuedSfx::Landing { closing } => self.landing(out, closing, 1),
+                QueuedSfx::Crash => self.crash(out),
+                QueuedSfx::Loop { chan, sample, v } => self.loop_voice(out, if chan == 0x12 { 0 } else { 1 }, sample, v),
+            }
         }
-        self.loop_voice(out, 1, slot, vol * flutter);
     }
 
     /// One squeal-channel loop (0x4A93C0, chan ≥ 0, voices 0x12…0x15): for a strength `v` (the
@@ -843,8 +924,9 @@ impl CollisionSfx {
         let vol = ((self.atten * level) >> 7).clamp(0, 127);
         let voice = if which == 0 { &mut self.front } else { &mut self.rear };
         if v <= 0.0 {
+            // 0x4A956F / 0x4A97EF: 0x565DD0(h, 5, −1), the five-tick release (`mixer::Ramp`)
             if let Some((id, _)) = voice.take() {
-                out.stop(id);
+                out.release(id);
             }
             return;
         }
@@ -857,38 +939,18 @@ impl CollisionSfx {
             Some((id, s)) if s == slot => {
                 out.set_word(id, amp, WORD_UNIT, bend as u8);
                 out.set_pan(id, pan);
+                out.voice_play_filter(id, self.filter);
             }
             other => {
+                // `Voice_play` with another sample on the voice: the old one's 25-tick release
+                // (0x4A9DA4) before the start
                 if let Some((id, _)) = other {
-                    out.stop(id);
+                    out.release_replaced(id);
                 }
                 let voice_slot = self.clip(slot).map(|clip| (out.play_word(clip, amp, WORD_UNIT, bend as u8, pan, true), slot));
                 if which == 0 { self.front = voice_slot } else { self.rear = voice_slot }
             }
         }
-    }
-
-
-    /// Tyre squeal loops (§5): `front` / `rear` = clamped slip sums (0..10), surface nibble of the car.
-    /// `wet` is [`LoopInput::wet`]: on the autobahn (`[0x606AE0]`) with nothing overhead (0x473330
-    /// answers 0), 0x40FCF3…0x40FCFC turns an **Asphalt** surface into **WetAsphalt** (slot 0x2D) —
-    /// the rain track's open road; under a bridge or in a tunnel it stays dry. *(Corrected
-    /// 2026-09-26: this read "no drivable patch under the car" and ran on every track; 0x473330 is
-    /// the enclosure test, and `[0x606AE0]` gates it.)*
-    #[allow(clippy::too_many_arguments)]
-    pub fn squeal(&mut self, out: &AudioOutput, tyre_class: usize, surface_nibble: usize, wet: bool, front: f32, rear: f32) {
-        let m = match surface_material(surface_nibble) {
-            Material::Asphalt if wet => Material::WetAsphalt,
-            other => other,
-        };
-        let slot = squeal_slot(tyre_column(tyre_class), m);
-        // 0x40FBC0 clamps the two sums independently: the front push takes the copy of `front` on
-        // the FPU stack (0x40FC80 → 0x40FDAC), whatever the rear (corrected 2026-09-26 — the port
-        // silenced the front whenever the rear was not slipping, after sfx.md §5.1's misreading)
-        let front = front.clamp(0.0, 10.0);
-        let rear = rear.clamp(0.0, 10.0);
-        self.loop_voice(out, 0, slot, front);
-        self.loop_voice(out, 1, slot, rear * 0.5);
     }
 
 
@@ -921,8 +983,9 @@ impl CollisionSfx {
         let level = (v / 2 + 64).clamp(0, 127);
         let vol = road_volume(a, v, half);
         if vol == 0 {
+            // 0x4AA454: 0x565DD0(h, 5, −1)
             if let Some((id, _)) = self.road.take() {
-                out.stop(id);
+                out.release(id);
             }
             return;
         }
@@ -933,10 +996,12 @@ impl CollisionSfx {
             Some((id, s)) if s == slot => {
                 out.set_word(id, amp, word, level as u8);
                 out.set_pan(id, pan);
+                out.voice_play_filter(id, self.filter);
             }
             _ => {
+                // another surface's sample on voice 0x18: `Voice_play`'s 25-tick release (0x4A9DA4)
                 if let Some((id, _)) = self.road.take() {
-                    out.stop(id);
+                    out.release_replaced(id);
                 }
                 if let Some(c) = self.clip(slot) {
                     self.road = Some((out.play_word(c, amp, word, level as u8, pan, true), slot));
@@ -960,43 +1025,36 @@ impl CollisionSfx {
     /// them — level 0x28, pitch 0xFA24, both steps −1 — and only 0x4AA050 writes them (byte scan),
     /// so they carry over from race to race; the port starts them afresh with each bank load.
     /// *(Until 2026-09-27 the port started at 0x28 / +1 and 0x10000 / +10, and multiplied the
-    /// float bend into the float walk.)* APPROXIMATION: the draws are 0x538040's, the front end's
-    /// generator; the port takes this bank's own LCG ([`Self::rand`]).
-    pub fn wind(&mut self, out: &AudioOutput, active: bool, speed_est: f32, road_speed: f32, nibble: usize) {
+    /// float bend into the float walk.)*
+    ///
+    /// The walk's draws (0x4AA520, 0x4AA544, 0x4AA566, 0x4AA594) are **0x538040**'s — the front
+    /// end's generator the race shares (`draw`, the caller's `fe_rng`): at most one for the level
+    /// (`−1 − (r & 7)` at the top, `ebx` −1 on every path in, 0x4AA436 / 0x4AA449 / 0x4AA4AA;
+    /// `(r & 7) + 1` at the bottom) and then at most one for the pitch (`−20 − r % 80` at the top,
+    /// `r % 50 + 10` at the bottom; `div`, unsigned), in that order, only on the updates that hit a
+    /// bound. *(Until 2026-09-27 an APPROXIMATION took them from this bank's own LCG.)*
+    pub fn wind(&mut self, out: &AudioOutput, active: bool, speed_est: f32, road_speed: f32, nibble: usize, draw: &mut impl FnMut() -> u32) {
         let master = (self.sfx_level, self.spl.sfx());
         let s = (speed_est.abs() * 5.0) as i32;
         if !active || s == 0 {
+            // 0x4AA5FF: 0x565DD0(h, 5, −1)
             if let Some(id) = self.wind.take() {
-                out.stop(id);
+                out.release(id);
             }
             return;
         }
         // [0x5D1838] 0x28..0x7F, [0x5D183C] 0xFA24..0x105DC
-        self.wind_level += self.wind_level_step;
-        if self.wind_level > 0x7F {
-            self.wind_level = 0x7F;
-            self.wind_level_step = -1 - (self.rand() & 7) as i32;
-        } else if self.wind_level < 0x28 {
-            self.wind_level = 0x28;
-            self.wind_level_step = (self.rand() & 7) as i32 + 1;
-        }
-        self.wind_pitch += self.wind_pitch_step;
-        if self.wind_pitch > 0x1_05DC {
-            self.wind_pitch = 0x1_05DC;
-            self.wind_pitch_step = -20 - (self.rand() % 80) as i32;
-        } else if self.wind_pitch < 0x0_FA24 {
-            self.wind_pitch = 0x0_FA24;
-            self.wind_pitch_step = (self.rand() % 50) as i32 + 10;
-        }
-        let vol = ((s * self.wind_level) >> 7).min(127);
+        self.wind_walk.step(draw);
+        let vol = ((s * self.wind_walk.level) >> 7).min(127);
         let level = (road_v(road_speed, nibble) / 2 + 64).clamp(0, 127);
         // `level` is the bend byte on top of the random-walk pitch
         let amp = category(master.0, master.1, vol) as f32 / 127.0;
-        let word = (self.wind_pitch >> 4) as u16;
+        let word = (self.wind_walk.pitch >> 4) as u16;
         match self.wind {
             Some(id) => {
                 out.set_word(id, amp, word, level as u8);
                 out.set_pan(id, 0);
+                out.voice_play_filter(id, self.filter);
             }
             None => {
                 if let Some(c) = self.clip(0x1F) {
@@ -1022,8 +1080,9 @@ impl CollisionSfx {
     pub fn turbo(&mut self, out: &AudioOutput, boost: f32, throttle: u8, rpm: f32, redline: f32, base: i32, gain: i32, pitch_base: i32, pan: u16) {
         let master = (self.engine_level, self.spl.turbo());
         if boost <= 0.1 || redline <= 0.0 {
+            // 0x4AA869: 0x565DD0(h, 5, −1)
             if let Some(id) = self.turbo.take() {
-                out.stop(id);
+                out.release(id);
             }
             return;
         }
@@ -1036,6 +1095,7 @@ impl CollisionSfx {
             Some(id) => {
                 out.set_word(id, amp, word, 0x40);
                 out.set_pan(id, pan);
+                out.voice_play_filter(id, self.filter);
             }
             None => {
                 if let Some(c) = self.clip(0x0F) {
@@ -1102,10 +1162,12 @@ impl CollisionSfx {
             Some((id, s, bend)) if s == sample => {
                 out.set_word(id, amp, WORD_UNIT, bend as u8);
                 out.set_pan(id, pan);
+                out.voice_play_filter(id, self.filter);
             }
             other => {
+                // another sample on voice `slot + 0x22`: `Voice_play`'s 25-tick release (0x4A9DA4)
                 if let Some((id, ..)) = other {
-                    out.stop(id);
+                    out.release_replaced(id);
                     self.ai_loops.remove(&audio_slot);
                 }
                 // 0x4A9663…0x4A9687: `min(mag·127/10 >> 16, 127)` from the 16.16 magnitude
@@ -1123,8 +1185,9 @@ impl CollisionSfx {
     /// 0x4A7DC0 when the slot loses its car (0x4A7FF8 / 0x4A80BD).
     pub fn stop_ai_loop(&mut self, out: &AudioOutput, audio_slot: usize) {
         if let Some((id, ..)) = self.ai_loops.remove(&audio_slot) {
-            tracing::debug!(audio_slot, "ai loop stop (voice slot + 0x22)");
-            out.stop(id);
+            tracing::debug!(audio_slot, "ai loop release (voice slot + 0x22)");
+            // 0x4A98B4 / 0x4A9521: 0x565DD0(h, 5, −1)
+            out.release(id);
         }
     }
 
@@ -1144,6 +1207,45 @@ impl CollisionSfx {
         for (_, (id, ..)) in self.ai_loops.drain() {
             out.stop(id);
         }
+    }
+}
+
+#[cfg(test)]
+mod wind_tests {
+    use super::WindWalk;
+
+    #[test]
+    fn the_wind_walk_draws_the_shared_generator_at_its_bounds_level_first() {
+        // from the image's values both walks step below their floors on the first update: the
+        // level's draw, then the pitch's
+        let mut w = WindWalk::default();
+        let seq = [0x0000_0105u32, 0x0000_0077];
+        let mut i = 0;
+        let mut draw = || {
+            i += 1;
+            seq[i - 1]
+        };
+        w.step(&mut draw);
+        assert_eq!(i, 2);
+        // (0x105 & 7) + 1 = 6; 0x77 % 50 + 10 = 29
+        assert_eq!(w, WindWalk { level: 0x28, level_step: 6, pitch: 0xFA24, pitch_step: 29 });
+        // no bound: no draw
+        let mut n = 0;
+        w.step(&mut || {
+            n += 1;
+            0
+        });
+        assert_eq!(n, 0);
+        assert_eq!((w.level, w.pitch), (0x2E, 0xFA24 + 29));
+        // at the top: `−1 − (r & 7)` and `−20 − r % 80`, the `div` unsigned
+        let mut w = WindWalk { level: 0x7F, level_step: 3, pitch: 0x1_05DC, pitch_step: 40 };
+        let seq = [0xFFFF_FFFFu32, 0xFFFF_FFFF];
+        let mut i = 0;
+        w.step(&mut || {
+            i += 1;
+            seq[i - 1]
+        });
+        assert_eq!(w, WindWalk { level: 0x7F, level_step: -8, pitch: 0x1_05DC, pitch_step: -20 - (0xFFFF_FFFFu32 % 80) as i32 });
     }
 }
 
@@ -1250,6 +1352,28 @@ mod tests {
         assert_eq!(q.entries(), &[QueuedSfx::Loop { chan: 0x14, sample: 0x28, v: 0.0 }]);
     }
 
+    /// 0x40FFF0's side / roof arm pushes only the rear channel (0x410142…0x4101CB, 0x4101E5…
+    /// 0x410269) and does not call 0x40FBC0: a front squeal running when the car goes over gets
+    /// no entry — neither a stop nor an update — until it is upright again.
+    #[test]
+    fn the_roof_scrape_leaves_the_front_channel_alone() {
+        let mut q = SfxQueue::default();
+        q.produce_loops(&LoopInput { front_slip: 2.0, human: true, ..input() }, || 0);
+        assert_eq!(q.entries(), &[QueuedSfx::Loop { chan: 0x12, sample: 0x2E, v: 2.0 }]);
+        q.clear();
+        // over in one tick, scraping: the rear scrape only
+        q.produce_loops(&LoopInput { cos_tilt: 0.1, front_slip: 2.0, human: true, ..input() }, || 0);
+        assert!(q.entries().iter().all(|e| matches!(e, QueuedSfx::Loop { chan: 0x14, .. })), "{:?}", q.entries());
+        q.clear();
+        // on its side, too slow to scrape: the rear stop only
+        q.produce_loops(&LoopInput { cos_tilt: 0.1, speed_est: 0.2, human: true, ..input() }, || 0);
+        assert_eq!(q.entries(), &[QueuedSfx::Loop { chan: 0x14, sample: 0x28, v: 0.0 }]);
+        q.clear();
+        // upright but tilted past 0x40FBC0's 0.5: the front's stop comes from the squeal producer
+        q.produce_loops(&LoopInput { cos_tilt: 0.4, human: true, ..input() }, || 0);
+        assert_eq!(q.entries(), &[QueuedSfx::Loop { chan: 0x12, sample: 0x2E, v: 0.0 }]);
+    }
+
     /// 0x40F020 keeps 7 entries; 0x40F740 queues an impact only above 1.5.
     #[test]
     fn queue_cap_and_impact_gate() {
@@ -1261,6 +1385,40 @@ mod tests {
             q.push_impact(QueuedSfx::CarCar { effect: 9.0 });
         }
         assert_eq!(q.entries().len(), SfxQueue::CAP);
+    }
+
+    /// `main.rs`'s player collision pass pushes the tick's one-shots — `Car_ground`'s landing /
+    /// roll-over first, then `Car_postImpact`'s collision one-shot (`sfx.md` §4) — into the SAME
+    /// queue the loop producer (`produce_loops`) appends to in the following audio update, ahead
+    /// of `CollisionSfx::drain_player`'s single last-first walk (0x4A7AF8…0x4A7C97). *(Until
+    /// 2026-09-27 the player's one-shots were never queued at all — each was played straight from
+    /// the collision pass, against `car+0x440` as it stood at its own call, not the tick's final
+    /// contact; `sfx.md`'s "The drain's distance and pan".)* This pins the queue's contract: the
+    /// one-shots keep push order, the loops land after them, and a last-first walk (the drain's)
+    /// takes a loop before any one-shot and the tick's earliest one-shot last.
+    #[test]
+    fn the_players_queue_holds_one_shots_then_loops_in_push_order() {
+        let mut q = SfxQueue::default();
+        q.push(QueuedSfx::Landing { closing: 10.0 });
+        q.push(QueuedSfx::Crash);
+        q.push_impact(QueuedSfx::WallHit { j: 5.0, class: 0 });
+        q.push_impact(QueuedSfx::CarCar { effect: 4.0 });
+        q.produce_loops(&LoopInput { front_slip: 1.0, ..input() }, || 0);
+        let entries = q.entries().to_vec();
+        assert_eq!(
+            entries[..4],
+            [
+                QueuedSfx::Landing { closing: 10.0 },
+                QueuedSfx::Crash,
+                QueuedSfx::WallHit { j: 5.0, class: 0 },
+                QueuedSfx::CarCar { effect: 4.0 },
+            ]
+        );
+        assert!(matches!(entries[4], QueuedSfx::Loop { .. }), "{entries:?}");
+        // the drain's walk (`.iter().rev()`): the loop plays first, this tick's landing last
+        let reversed: Vec<_> = entries.iter().rev().copied().collect();
+        assert!(matches!(reversed[0], QueuedSfx::Loop { .. }));
+        assert_eq!(reversed[reversed.len() - 1], QueuedSfx::Landing { closing: 10.0 });
     }
 
     #[test]

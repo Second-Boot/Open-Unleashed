@@ -261,6 +261,12 @@ fn career_tables() {
     assert!(first.events.iter().all(|e| (0.3..=1.0).contains(&e.difficulty)));
     assert_eq!(trn.iter().filter(|t| t.is_hidden()).count(), 3);
     assert!(trn.iter().all(|t| t.opponents.iter().all(|o| o.car_id > 0)));
+    // `.RACENUMBER`, `+0x52` — `0x4EBDA0` reads a tournament opponent's plate straight from here
+    // (`car-model.md` §5.3, read 2026-09-27), not from a draw: −1 on most tournaments, but tournament
+    // 27's own record carries an authored plate on six of its seven opponents.
+    assert!(trn.iter().flat_map(|t| &t.opponents).any(|o| o.decal == -1));
+    let t27 = trn.iter().find(|t| t.id == 27).unwrap();
+    assert_eq!(t27.opponents.iter().map(|o| o.decal).collect::<Vec<_>>(), vec![6, 12, 35, 45, 77, 19, -1]);
 
     let parts = parse_parts(&std::fs::read(d.join("nfs5.prt")).unwrap()).unwrap();
     assert_eq!(parts.len(), 683);

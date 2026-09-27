@@ -78,13 +78,22 @@ pub struct MaterialDesc {
     /// (0x6000A4FF…0x6000A549); the game keeps depth writes on through the view's settings (Thrash
     /// 0x39 ← 1, 0x468B39) and sets the alpha reference to 10 through Thrash 0x24 (0x443615, the
     /// car draw, and 0x43C876 at the start of `R3DCarLOD::draw`, which draws the rooms too;
-    /// 0x452085, 0x45D68D, 0x466703, `thrash.md` §6d.4). APPROXIMATION for everything else: the
-    /// port's other blended draws (particles, 0x454456 sets 1) keep depth writes off until
-    /// their draw order is the original's; the lamp glare and beam draw with them off in the
-    /// original too (0x43D81F, `DrawItem::alpha_test`). *(The front-end rooms were among them until 2026-09-25,
-    /// on the reading that their views set 0x24 to 1 — 0x4C6696 / 0x4DA923 are 2D draws.)* The
-    /// alpha a texture keeps is the decoded file's — the loader's pick of the surface format is
-    /// not read.
+    /// 0x452085, 0x45D68D, 0x466703, `thrash.md` §6d.4). *(The front-end rooms were among them until 2026-09-25,
+    /// on the reading that their views set 0x24 to 1 — 0x4C6696 / 0x4DA923 are 2D draws.)*
+    /// Every other blended draw the race makes — the particle systems (0x454456 sets the alpha
+    /// ref 1; the depth writes off/on bracket is 0x45477C / 0x45484E, `thrash.md` §6d.6), the skid
+    /// marks (0x47A078 / 0x47A0B8), the weather's rain and snow (0x45919F / 0x4591CA), the
+    /// windscreen drops (0x459200), the car's blob shadow (0x43B820) and the lamp glare, beam and
+    /// road-reflection quad (0x43D81F…0x43DE76, `DrawItem::alpha_test`) — turns depth writes off
+    /// around its own draw in the original too, confirmed to the instruction (`thrash.md` §6d.6,
+    /// 2026-09-28): `device_states` defaulting false for all of them is the settled state, not a
+    /// stand-in for an order not yet read, and their relative order does not read back through the
+    /// depth buffer. What is still the port's own: the **mutual** order of the `device_states:
+    /// true` items (cars, the skid marks and the track's flag-1 / flag-4 parts share one
+    /// distance-sorted list, `+0xC`, in the original — `RENDERING.md` "The view's lists" — but
+    /// draw in separate blocks here), which does write depth and so does matter; that gap is
+    /// unchanged by this reading. The alpha a texture keeps is the decoded file's — the loader's
+    /// pick of the surface format is not read.
     pub device_states: bool,
     /// The cull follows the view's: the `Rs` cull 1 hands Thrash state 2 the view's own mode
     /// (0x540590 → `[[[0x69ED0C]]+4]+0x10`), which the race pass sets to `CW` (2), or to `CCW` (1)
@@ -98,8 +107,10 @@ pub struct MaterialDesc {
     /// of view depth toward the eye along its own ray (`RE/notes/thrash.md` §6d.3).
     pub depth_bias: i32,
     /// `RCustomLayers::LayerFalseSort1` / `2` (0x449AA0 / 0x449AF0, the `FakeSort` method's ops
-    /// 0x800F / 0x8010): at `SPECIALFX` 3 the material is drawn twice, first with depth writes off
-    /// (Thrash 0x39 ← 0), then on (← 1) — blended both times (`RE/notes/thrash.md` §6d.4).
+    /// 0x800F / 0x8010): at `SPECIALFX` 2 or 3 the material is drawn twice, first with depth
+    /// writes off (Thrash 0x39 ← 0), then on (← 1) — blended both times. Below 2 (`Renderer::
+    /// set_fakesort_single`), 0x44EC80's other arm draws it once, `MAG`/`MINFILTER` forced
+    /// `POINT` for that draw (`RE/notes/thrash.md` §6d.4).
     pub false_sort: bool,
 }
 
@@ -155,6 +166,9 @@ pub struct DrawItem {
     /// times the vertex alpha `b`), where the night beam 0x43D4F0 puts 0 around its own draw
     /// (0x43D506 / 0x43D7DB). A material with `device_states` is tested whatever this says.
     pub alpha_test: bool,
+    /// The reference of that test, `ALPHAREF` (Thrash 0x24's value, `dx7z.dll` 0x60003F9C): 10 as
+    /// the race sets it (0x443615, 0x45D68D …), 1 after a particle system's draw (0x454456).
+    pub alpha_ref: u8,
     /// `R3DSkyMapTextureLayer` (0x445B10) for this car's items whose material has the pass
     /// ([`MaterialDesc::sky_map`]); `None` when the car binds no section maps.
     pub sky: Option<SkyMap>,
@@ -168,7 +182,60 @@ pub struct DrawItem {
 
 impl DrawItem {
     pub fn new(mesh: MeshId, material: MaterialId, transform: Mat4) -> Self {
-        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, sky: None, main_view_only: false, sky_pass: false }
+        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, alpha_ref: 10, sky: None, main_view_only: false, sky_pass: false }
+    }
+}
+
+/// The `+0xC` list's flush, farthest first (`0x466660`'s walk of the tree the original builds with
+/// `0x466A90`, `RE/RENDERING.md` "The view's lists"): each entry keyed by its own `round(d²)` /
+/// `round(v)` (a `fistp`-rounded, unsigned-compared `u32` — `RE/notes/thrash.md` §6d.6, 0x466ad3's
+/// `jbe`/`ja`, never signed), sorted descending, **ties kept in the order they were given here** —
+/// the original's tree inserts an equal key to the right, so it keeps its queueing order
+/// (0x466933 / 0x466AD3, and `Vec::sort_by_key`'s own stability). One list holds every kind's
+/// entries in the original — the track's flag-1 / flag-4 parts, the cars and the skid marks
+/// (`RE/notes/thrash.md` §6d.6) — so the caller merges them into one `Vec` before calling this,
+/// rather than sorting each kind's block on its own.
+pub fn farthest_first(mut items: Vec<(u32, DrawItem)>) -> Vec<DrawItem> {
+    items.sort_by_key(|(k, _)| std::cmp::Reverse(*k));
+    items.into_iter().map(|(_, i)| i).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(n: u32) -> DrawItem {
+        // `mesh`/`material` carry no data of their own here — only `depth_bias` distinguishes
+        // one item from another once the key is stripped off
+        DrawItem { depth_bias: n as i32, ..DrawItem::new(MeshId::default(), MaterialId::default(), Mat4::IDENTITY) }
+    }
+
+    #[test]
+    fn farthest_first_sorts_descending() {
+        let out = farthest_first(vec![(10, item(1)), (30, item(2)), (20, item(3))]);
+        assert_eq!(out.iter().map(|i| i.depth_bias).collect::<Vec<_>>(), vec![2, 3, 1]);
+    }
+
+    /// Equal keys keep the order they were given in — the original's tree insert goes right on
+    /// an equal key, so it never reorders same-key entries (`RE/RENDERING.md` "The view's lists").
+    #[test]
+    fn farthest_first_is_stable_on_equal_keys() {
+        let out = farthest_first(vec![(10, item(1)), (10, item(2)), (10, item(3)), (20, item(4))]);
+        assert_eq!(out.iter().map(|i| i.depth_bias).collect::<Vec<_>>(), vec![4, 1, 2, 3]);
+    }
+
+    /// A merged list interleaves two kinds queued in different blocks (as the cars and the
+    /// track's far list are) purely by key, not by which block queued them first.
+    #[test]
+    fn farthest_first_interleaves_two_kinds_by_key() {
+        // "track" queues 40 and 20; "car" queues 30 and 10 — queued in two separate blocks, as
+        // the port's cars and track items are collected, but merged here into one list first
+        let track = vec![(40, item(1)), (20, item(2))];
+        let car = vec![(30, item(3)), (10, item(4))];
+        let mut merged = track;
+        merged.extend(car);
+        let out = farthest_first(merged);
+        assert_eq!(out.iter().map(|i| i.depth_bias).collect::<Vec<_>>(), vec![1, 3, 2, 4]);
     }
 }
 
@@ -217,6 +284,40 @@ pub struct Sprite {
     /// its own colour (`pos` / `size` / `rotation` / `color` are then unused) — for the HUD's
     /// untextured polygons such as H321Go's sweep (0x466100) and the billboard's mitred frame.
     pub tri: Option<([[f32; 2]; 3], [[f32; 4]; 3])>,
+    /// `None`: the port's plain 2D draw — no depth test, no depth write, no alpha test, which is
+    /// the original's pixel for every sprite not drawn under a depth mask. `Some`: the front end's
+    /// own depth state for this draw ([`SpriteDepth`]).
+    pub depth: Option<SpriteDepth>,
+}
+
+/// The depth state the front end's 2D kit draws a sprite under, for its depth masks (0x4DAA10 /
+/// 0x4DAAC0 / 0x4DAB00, `RE/notes/layouts.md` "Clip = a depth mask"): the sprite's screen z is the
+/// kit's current depth `[0x65B954]` (every enqueuer reads it, 0x4D9286 / 0x4D9B36 / 0x4DA374 …),
+/// depth writes are on (the view's Thrash 0x39 ← 1 before the 2D pass, 0x4D30BE), the compare is
+/// Thrash 0x28 (`ZFUNC` = value + 1: 3 `LESSEQUAL` from 0x4D30C9, 6 `GREATEREQUAL` inside a mask,
+/// 0x4DAAC0), and the device's alpha test `GREATER alpha_test` drops a pixel before it writes
+/// anything (`dx7z.dll` 0x6000A4FF…0x6000A51C; Thrash 0x24). The sprite pass starts with the depth
+/// cleared to 1.0 (0x4DA890 → `THRASH_clearwindow` on the depth window, `dx7z.dll` 0x60001230 →
+/// 0x60008380, z = the view's `+0x34`, 1.0 from 0x537741).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpriteDepth {
+    /// screen z, 0 (near) … 1 (far)
+    pub z: f32,
+    pub compare: SpriteCompare,
+    /// Thrash 0x24 at the draw's flush (`dx7z.dll` 0x60003F9C): `Some(ref)` — `ALPHATESTENABLE` 1,
+    /// `ALPHAFUNC` `GREATER`, `ALPHAREF` = ref: the pixel's 8-bit alpha (texture × vertex colour,
+    /// `ALPHAOP` `MODULATE`) must be greater; `None` — the value 0, `ALPHATESTENABLE` 0: every
+    /// pixel passes (the list box's stencil, 0x4C6683)
+    pub alpha_test: Option<u8>,
+}
+
+/// Thrash 0x28's two values the front end's 2D kit uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpriteCompare {
+    /// 3 → `D3DCMP_LESSEQUAL` (0x4D30C9)
+    LessEqual,
+    /// 6 → `D3DCMP_GREATEREQUAL` (0x4DAAC0)
+    GreaterEqual,
 }
 
 #[derive(Clone, Debug)]

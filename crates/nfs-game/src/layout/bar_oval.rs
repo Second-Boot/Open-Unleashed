@@ -88,10 +88,13 @@ impl LayoutScreen {
                 Some((id, img.width as i32, img.height as i32, -img.place[0], -img.place[1]))
             });
         // built at the front end's start (0x4D39D3): a preloaded clock (`NFS_FE_CLOCK`) stands
-        // for that many ticks already run, so the stamp is the clock's start. APPROXIMATION: the
-        // original draws this `rand` before any screen is opened; the port loads the bar after
-        // the first screen, whose glint activates (`activate_glints`) have drawn theirs already
-        // — the `rand` interleaving `layouts.md` already records as not the original's
+        // for that many ticks already run, so the stamp is the clock's start. *(Until this pass
+        // the port loaded the bar after the first screen, whose glint activates
+        // (`activate_glints`) had already drawn theirs, putting this `rand` — and the bottom
+        // bar's own four button sweeps — one screen's worth of draws late against the original's
+        // 0x4D3420, which builds the bar (0x4D7E70 at 0x4D39C4) before the first layout
+        // (0x4D67D0…, `layouts.md`'s "The loading steps"). Fixed in `main.rs`'s `open_layout` and
+        // `--layout` start-up path, which now build the bar first.)*
         let now = self.ticks() as i64 - self.preload_ticks;
         self.bar_oval = Some(BarOval { art, on: Cell::new(false), stamp: Cell::new(now), dur: Cell::new(BarOval::wait()), seen: Cell::new(false) });
     }
@@ -121,7 +124,7 @@ impl LayoutScreen {
             let (pos, size) = self.place(aspect, x as f32, y as f32, big_w as f32, big_h as f32);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
-            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         }
         out
     }

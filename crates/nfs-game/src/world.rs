@@ -28,9 +28,13 @@ pub struct TrackWorld {
     pub start: Vec3,
     /// The `.map` `ambient`'s mean, clamped 0.2…0.9 — the port's scene ambient for an item that
     /// has no light of its own. APPROXIMATION: not the original's; the track's own items no longer
-    /// take it ([`TRACK_LIGHT`]), nor the sky (`Sky::draw_items`, `RE/notes/thrash.md` §6d.5). What
-    /// is left on it in a race: the cars' blob shadows (0x43B820), whose draws' layers are not read
-    /// here.
+    /// take it ([`TRACK_LIGHT`]), nor the sky (`Sky::draw_items`, `RE/notes/thrash.md` §6d.5), nor
+    /// the cars' blob shadows (0x43B820, read 2026-09-27: its own primitive-helper `EAGL::Material`,
+    /// 0x59F070/0x5379F0, carries no light layer at all and no read of any `.map` global — a
+    /// constant, given `TRACK_LIGHT` in `push_shadow`). What is left on it in a race: the car
+    /// materials with no `R3DLightLayer` of their own — the glass (`CarModel::draw_items_block`'s
+    /// `material_light` lookup misses them, `RE/notes/lighting.md` §5.1) — which the original also
+    /// shades by `ambient + (1 − ambient) · max(n·sun, 0)` with no light layer of their own.
     pub ambient: f32,
     /// The `.map` header's five light colours (`RE/notes/lighting.md`).
     pub map_light: MapLight,
@@ -421,8 +425,19 @@ impl TrackWorld {
     /// the clear, is in the race-start reset; and until that day kind 3 ran on every drawn frame of
     /// such an article, as kind 2 does, whether struck or not.)* A track smackable's article is
     /// drawn apart, so the walk's answer is its instance entry's (its sphere through the body's
-    /// pose, 0x4786A0). APPROXIMATION: the value is the walk's, where 0x450980 reads the view's
-    /// `+0xC` (its first argument) — the same distance, not traced to its writer.
+    /// pose, 0x4786A0). The value is the walk's — *(settled 2026-09-27: 0x450980 does read the
+    /// view's `+0xC` twice (its first argument, `[[esp+0x6C]+0xC]`, at 0x4509DC and again at
+    /// 0x450ADD), but that field is `cam[+0xC]`, the per-frame `far · near / (far − near)` the
+    /// view's build folds in every frame (0x467230…0x467261 off `[0x628130]`, `thrash.md` §6d.3)
+    /// — the same `K` every other `C · K / d²` depth bias in the game shares (skids, particles,
+    /// flares, the shadow, the lamp glare), not a distance at all. 0x450980 fild's it to a float and
+    /// hands it straight to **0x455150** (`fstp` over the just-pushed slot, 0x450AED…0x450AFC) —
+    /// the same helper the static / mid-ground drawer's kind-2 effects call the same way
+    /// (0x450D10 → 0x450D8E, off the article's own `+0xC` there), to give the spawned effect
+    /// instance its own future depth bias, not to gate it. The walk's distance — the article's
+    /// squared `d2` ([`walk_item`]) — is the only distance either drawer computes, and it is what
+    /// reaches the effect record (`ArticleDraw::value`, its doc above); `cam[+0xC]` is unrelated, so
+    /// there was nothing to match here.)*
     pub fn effect_runs(&self, draws: &[Option<ArticleDraw>], article: usize, part: u16, kind: u32) -> Option<f32> {
         self.effect_run(draws, article, part, kind).map(|(v, _)| v)
     }
@@ -1028,9 +1043,13 @@ impl TrackWorld {
                 // `S_UVAnimate` ground shadows (castle, coastal, farmland, forest, canyon), 0 else
                 let depth_bias = rs.map_or(0, |rs| rs[4]);
                 // `FakeSort`'s `LayerFalseSort1` / `2` (0x800F / 0x8010): drawn twice, depth writes
-                // off and then on, at `SPECIALFX` 3 (`thrash.md` §6d.4). APPROXIMATION: the shipped
-                // `SPECIALFX` is taken; below it 0x44EC80 picks the other arm (one draw, the
-                // texture filter `POINT`), not carried
+                // off and then on, at `SPECIALFX` 2 or 3; below 2 (0x44EC80's jump table, 0 and 1
+                // unconditionally) one draw, texture filter `POINT` instead — `Renderer::
+                // set_fakesort_single`, gated on `special_fx_level()` in `porsche/main.rs`
+                // (`thrash.md` §6d.4, read to the instruction 2026-09-27). APPROXIMATION: at
+                // `SPECIALFX` 2 the original picks either arm at runtime (frame rate and the
+                // drawn article's distance, not traced further); the port keeps the double-draw
+                // arm there, as at 3
                 let false_sort = m.and_then(|m| methods.iter().find(|r| r.name == m.render_method).map(|r| r.built_ops(0, m.op_mask).any(|o| o.class == 0x800F))).unwrap_or(false);
                 // the material's address modes, states 0x41 / 0x42 (`thrash.md` §7): 0 clamps
                 let clamp = m.map_or([false; 2], |m| m.address.map(|a| a == 0));
@@ -1357,15 +1376,39 @@ impl TrackWorld {
     /// first and **nearest first**, a flag-1 or flag-4 part in `+0xC`, drawn after and **farthest
     /// first** ([`part_list`]); the instance drawer queues its whole item in `+0xC` with the walk's
     /// `round(v)` (0x44FFC0 → 0x466A90), and 0x450010 draws its parts together there. Equal keys keep
-    /// the order they were queued in (each tree insert goes right on equal, 0x466933 / 0x466AD3).
+    /// the order they were queued in (each tree insert goes right on equal, 0x466933 / 0x466AD3;
+    /// `0x466A90`'s walk compares the `fistp`-rounded `u32` key **unsigned**, `jbe`/`ja` at
+    /// 0x466ad3/0x466aed — never signed, though every shipped key is non-negative regardless).
     /// So the flag-2 parts — every `Opaque` one, but also 7 000 blended `Normal` / `NormMatState` /
     /// `FullAmbient` / `FakeSort` ones — are drawn front to back before anything of `+0xC`: they come
     /// first here and are marked `early` (the renderer's opaque stage, in this order); the `+0xC`
-    /// ones follow, farthest first, in the blended stage. APPROXIMATIONS: equal keys keep the port's
-    /// article order, not the node pass's (the fitted tree is not built); the cars share the list
-    /// `+0xC` with the track (0x443229, keyed by `round(d²)` 0x4431F8) but are drawn after it here;
-    /// an item with no `Base` (port fallback) goes last.
+    /// ones follow, farthest first, in the blended stage — merged now with the cars' and the skid
+    /// marks' own `+0xC` entries by [`App::rebuild_scene`] ([`Self::track_draw_lists`]).
+    /// APPROXIMATIONS: equal keys keep the port's article order, not the node pass's (the fitted
+    /// tree is not built); an item with no `Base` (port fallback) goes last.
     pub fn visible_items(&self, draws: &[Option<ArticleDraw>], eye: Vec3) -> Vec<DrawItem> {
+        let (mut near, mut far, rest) = self.track_draw_lists(draws, eye);
+        near.sort_by_key(|(k, _)| *k);
+        far.sort_by_key(|(k, _)| std::cmp::Reverse(*k));
+        near.into_iter()
+            .map(|(_, i)| DrawItem { early: true, ..i })
+            .chain(far.into_iter().map(|(_, i)| i))
+            .chain(rest)
+            .map(|i| DrawItem { layer_light: Some(TRACK_LIGHT), ..i })
+            .collect()
+    }
+
+    /// The `+0xC` list's track-side entries, unsorted and un-flattened: the static / mid-ground
+    /// drawer's flag-1 / flag-4 parts, the instance drawer's whole items and a breakable's pieces
+    /// ([`Self::visible_items`]'s "the view's lists" doc), each still carrying its `round(d²)` /
+    /// `round(v)` key. Split out so the race pass ([`App::rebuild_scene`]) can merge these with the
+    /// cars' and the skid marks' own `+0xC` entries into **one** farthest-first list before the
+    /// flush (`RE/RENDERING.md` "The view's lists"; the original's `0x466660`/`0x467293`) — the
+    /// gap `RE/notes/thrash.md` §6d.6 left open: those three kinds shared one distance-sorted list
+    /// in the original but drew in separate blocks here until now. `near` (list `+4`, unsorted) and
+    /// `rest` (the port's no-`Base` fallback) are returned too, for [`Self::visible_items`]'s own
+    /// use and for the mirror's independent walk ([`App::render_mirror`]).
+    pub fn track_draw_lists(&self, draws: &[Option<ArticleDraw>], eye: Vec3) -> (Vec<(u32, DrawItem)>, Vec<(u32, DrawItem)>, Vec<DrawItem>) {
         let key = |c: Vec3| (c - eye).length_squared().round_ties_even() as u32;
         let mut near: Vec<(u32, DrawItem)> = Vec::new();
         let mut far: Vec<(u32, DrawItem)> = Vec::new();
@@ -1424,14 +1467,7 @@ impl TrackWorld {
                 None => rest.extend(b.pieces.iter().copied()),
             }
         }
-        near.sort_by_key(|(k, _)| *k);
-        far.sort_by_key(|(k, _)| std::cmp::Reverse(*k));
-        near.into_iter()
-            .map(|(_, i)| DrawItem { early: true, ..i })
-            .chain(far.into_iter().map(|(_, i)| i))
-            .chain(rest)
-            .map(|i| DrawItem { layer_light: Some(TRACK_LIGHT), ..i })
-            .collect()
+        (near, far, rest)
     }
 
     /// The breakable props of the world (`BBOX`, the crate stacks): each world article whose prop
@@ -2678,10 +2714,21 @@ impl CarModel {
                 Vec::new()
             };
             // 0x43E390 crushes the parts whose `Base+78` has bit 3 (0x43E3D8) from their
-            // `vt#(0x8000|lod)` vectors by their `dz#lod` zones. APPROXIMATION: a part that also
-            // morphs (the convertibles' roof, `Base+77`) is left uncrushed — which of the two
-            // writers of its vertex copy `part+0x40` wins is not read.
-            let damage_geometry = if anim == 0 && g.base.as_ref().is_some_and(|b| b.draw_bytes[0] & 8 != 0) { car.crp.article_geometry_damage(&car.crp_data, a).ok() } else { None };
+            // `vt#(0x8000|lod)` vectors by their `dz#lod` zones, into the buffer `*(part+0x40)`
+            // points at. *(Settled 2026-09-27: a part that also morphs (the convertibles' roof,
+            // `Base+77`) is not excluded there — 0x43E390 only gates on `Base+78 & 8` and a
+            // non-null `part+0x40` (0x43E3D8, 0x43E3EF) — so it IS crushed. The two writers of
+            // `*(part+0x40)`: the crush, 0x43E390, called from `R3DCar` slot 7's `0x438230(0)`
+            // (0x4383CC); the morph blend, 0x43E120 (its own destination load at 0x43E225,
+            // `ebp = *(part+0x40)`), called from the SAME slot's `0x438030` (0x4383D3) — right
+            // after 0x438230, in the same per-frame update. Both are edge-triggered (0x438230 on a
+            // changed zone value, 0x438030 on a queued, changed animation), so on a frame where
+            // both trigger the morph runs last and wins; the crush persists on a stationary part
+            // between hits and is erased the next time that part's animation changes. Ported: the
+            // article now goes in both `deform` and `morph`; `App::update_damage_decals` already
+            // calls `update_damage` before `update_animation` / `update_driver`
+            // (`CarModel::blend`'s own dedup on `(frame, next, frac)` gives the edge-triggering).)*
+            let damage_geometry = if g.base.as_ref().is_some_and(|b| b.draw_bytes[0] & 8 != 0) { car.crp.article_geometry_damage(&car.crp_data, a).ok() } else { None };
             // Every LOD the article has primitives in: the car draw 0x444E00 takes each pass from
             // its own LOD object (`CarPass`). *(Until 2026-09-26 the port built LOD 1 alone and
             // drew every part of it in every view.)*
@@ -3679,6 +3726,28 @@ pub fn track_smackable_articles(track: &TrackAssets) -> Vec<usize> {
         .collect()
 }
 
+/// The AABB fold 0x486340 (and 0x47B660) run: eight corners of a local box, each carried through
+/// a placement matrix, min/maxed per axis — no other source (a stored box slot, a different
+/// vertex set) was found feeding it. `local` is the same lowest-LOD vertex set [`track_props`]
+/// already collects for the box footprint, so its own min/max stands in for that local box.
+fn rotated_local_box_aabb(local: &[Vec3], tr: Mat4) -> (Vec3, Vec3) {
+    let (lo, hi) = local.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
+    let corners = [
+        Vec3::new(lo.x, lo.y, lo.z),
+        Vec3::new(lo.x, lo.y, hi.z),
+        Vec3::new(lo.x, hi.y, lo.z),
+        Vec3::new(lo.x, hi.y, hi.z),
+        Vec3::new(hi.x, lo.y, lo.z),
+        Vec3::new(hi.x, lo.y, hi.z),
+        Vec3::new(hi.x, hi.y, lo.z),
+        Vec3::new(hi.x, hi.y, hi.z),
+    ];
+    corners
+        .iter()
+        .map(|c| tr.transform_point3(*c))
+        .fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(p), b.max(p)))
+}
+
 /// The track loader's collision objects (0x4750B0 at 0x475152…0x475302): every article of the
 /// track's `.crp` whose `Base` byte 0 lacks 0x40 (0x47515A) and whose tag is set, through
 /// `AnimDefs::lookup` (0x47ED90 — an unknown tag gets the file's first definition, `ENDW`):
@@ -3689,8 +3758,19 @@ pub fn track_smackable_articles(track: &TrackAssets) -> Vec<usize> {
 /// * `kBox` → a box on 0x474CB0's footprint of the article's vertices, through its `tr`, class 0
 ///   (0x475241…0x475302), radius `|(max.x − c.x, 0, max.z − c.z)| × 1.05`.
 ///
-/// The AABB is the article's world-space vertex box at its lowest LOD — MEDIUM: the original takes
-/// eight corners from the bundle's box slot, whose frame was not settled.
+/// The AABB is the axis-aligned box of the article's **local** lowest-LOD vertex box's eight
+/// corners, each carried through the instance's placement `tr` (rotation and translation) — not
+/// the AABB of the individually-transformed mesh vertices (which under-bounds a rotated article,
+/// since a rotated point's extreme coordinate need not come from a vertex the local box itself
+/// reaches). Read 2026-09-27: both object constructors call the shared base ctor 0x486340 first
+/// (`WTreeElem_CylinderObject` 0x486690 at 0x4866AE, `WTreeElem_BoxObject` 0x486C20 at 0x486C42),
+/// which calls a vtable+8 slot (0x48639A) that fills an 8×0x10-byte-stride buffer, then folds it
+/// into a running per-axis min/max over exactly 8 iterations (0x486404…0x486478) — the identical
+/// shape as the world-box fold `main.rs`/f8198d01 already traced at 0x47B6E2…0x47B760 below
+/// 0x47B6C6's own vtable+8 call. No inflation follows either fold. The `kBox` shape's own four
+/// XZ footprint corners (0x474CB0, [`box_footprint`]) are a separate field the loader builds and
+/// transforms the same way (0x475241…0x4752BE) — stored at `+0x34…+0x58`, not fed back into the
+/// AABB; only the box's *radius* (`|(max−c).xz| × 1.05`, 0x486C91) reads the AABB `mn`/`mx`.
 pub fn track_props(track: &TrackAssets) -> Vec<nfs_physics::props::Prop> {
     use nfs_physics::props::{Breakable, Prop, PropShape, box_footprint};
     let mut out = Vec::new();
@@ -3713,8 +3793,7 @@ pub fn track_props(track: &TrackAssets) -> Vec<nfs_physics::props::Prop> {
         if local.is_empty() {
             continue;
         }
-        let world: Vec<Vec3> = local.iter().map(|p| tr.transform_point3(*p)).collect();
-        let (mn, mx) = world.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
+        let (mn, mx) = rotated_local_box_aabb(&local, tr);
         // 0x476380 finds each piece's `QuatGroup` among the instances by tag (0x478640 / 0x478670)
         // and gives up at one whose `Anim` part is missing or has both words 0 (0x476501…0x47651F)
         let breakable = (!def.pieces.is_empty()).then(|| Breakable {
@@ -3927,5 +4006,46 @@ mod cull_tests {
         let (c, r2) = view().footprint();
         assert!((c[0]).abs() < 1e-3 && (c[1] - 200.0).abs() < 1e-3);
         assert!((r2 - (400.0f32 * 400.0 + 200.0 * 200.0)).abs() < 1.0);
+    }
+}
+
+#[cfg(test)]
+mod prop_box_tests {
+    use super::*;
+
+    /// An unrotated article: the eight-corner fold matches the plain per-vertex AABB (translation
+    /// only moves the box, it does not enlarge it).
+    #[test]
+    fn unrotated_box_matches_vertex_aabb() {
+        let local = [Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 3.0, 2.0)];
+        let tr = Mat4::from_translation(Vec3::new(10.0, 0.0, -5.0));
+        let (mn, mx) = rotated_local_box_aabb(&local, tr);
+        assert!((mn - Vec3::new(9.0, 0.0, -7.0)).length() < 1e-5, "{mn:?}");
+        assert!((mx - Vec3::new(11.0, 3.0, -3.0)).length() < 1e-5, "{mx:?}");
+    }
+
+    /// 0x486340's fold takes the AABB of the local box's **rotated corners**, which for a mesh
+    /// whose actual vertices never sit at the same box corner on both axes at once (a diamond, not
+    /// a crate) reaches past the AABB of the individually-rotated mesh vertices the port used
+    /// before this fix (f8198d01 / 0x47B6E2…0x47B760): the diamond's own vertices, turned 45°
+    /// about y, only reach ±half_x = ±2/√2 ≈ ±1.41, but the local **box**'s corner
+    /// (half_x, half_z) = (2, 0.5) turned the same way reaches ±(2 + 0.5)/√2 ≈ ±1.77.
+    #[test]
+    fn rotated_box_reaches_past_the_individually_rotated_vertices() {
+        // a diamond: no single vertex sits at the box's corner (±2, ±0.5) on both axes at once,
+        // but the box built from their extents (lo=(-2,0,-0.5), hi=(2,1,0.5)) does
+        let local = [Vec3::new(-2.0, 0.0, 0.0), Vec3::new(2.0, 0.0, 0.0), Vec3::new(0.0, 0.0, -0.5), Vec3::new(0.0, 1.0, 0.5)];
+        let tr = Mat4::from_rotation_y(std::f32::consts::FRAC_PI_4);
+        let (mn, mx) = rotated_local_box_aabb(&local, tr);
+        let want = (2.0f32 + 0.5) / std::f32::consts::SQRT_2;
+        let old = local.iter().map(|p| tr.transform_point3(*p)).fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(p), b.max(p)));
+        assert!((mx.x - want).abs() < 1e-4, "{mx:?} want {want}");
+        assert!((mx.z - want).abs() < 1e-4, "{mx:?} want {want}");
+        assert!((mn.x + want).abs() < 1e-4, "{mn:?} want {want}");
+        assert!((mn.z + want).abs() < 1e-4, "{mn:?} want {want}");
+        // the y range is untouched by a pure yaw
+        assert!((mn.y - 0.0).abs() < 1e-5 && (mx.y - 1.0).abs() < 1e-5);
+        // and the corner-based box is strictly looser than the pre-fix per-vertex one
+        assert!(mx.x > old.1.x + 0.1, "new {mx:?} old {old:?}");
     }
 }

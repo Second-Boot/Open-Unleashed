@@ -257,6 +257,9 @@ struct CarVoices {
 }
 
 pub struct AiEngines {
+    /// What `Voice_play`'s update of a playing voice hands the strip hook this pass
+    /// ([`crate::mixer::voice_play_filter`], 0x4A9FA8…0x4AA03B): set by the caller every audio update.
+    pub filter: Option<i32>,
     /// `<set>` → (lden, ldex) samples
     sets: HashMap<String, (Option<Arc<Clip>>, Option<Arc<Clip>>)>,
     road: Option<Arc<Clip>>,
@@ -291,7 +294,7 @@ impl AiEngines {
         };
         let (road, horn) = (slot(AI_ROAD_SLOT), slot(AI_HORN_SLOT));
         let spl = nfs_formats::spl::GameSpl::load(sounds_dir);
-        Ok(Self { sets: HashMap::new(), road, horn, cars: Vec::new(), honks: Vec::new(), viv, horn_trim: spl.slots_0a0b(), engine_trim: spl.ai_engine(), road_trim: spl.ai_road(), sfx_trim: spl.sfx() })
+        Ok(Self { filter: None, sets: HashMap::new(), road, horn, cars: Vec::new(), honks: Vec::new(), viv, horn_trim: spl.slots_0a0b(), engine_trim: spl.ai_engine(), road_trim: spl.ai_road(), sfx_trim: spl.sfx() })
     }
 
     fn samples(&mut self, set: &str) -> (Option<Arc<Clip>>, Option<Arc<Clip>>) {
@@ -348,12 +351,12 @@ impl AiEngines {
         // of the fractional distance (`crate::fix_atten`); the port took whole metres until 2026-09-26
         let atten = if spline_cam { crate::fix_atten(0x1000_0000, 0x1_0000, 0, distance) } else { crate::fix_atten(0x800_0000, 0x2_0000, 0, distance) };
         if atten == 0 {
-            // 0x4AA9C0…0x4AAAA4 releases the engine voices `v`, `v + 4`, `v + 8` only.
-            // APPROXIMATION: the release is 0x565DD0(h, 5, −1), a five-tick ramp to below 0; the
-            // port stops the voices at once.
+            // 0x4AA9C0…0x4AAAA4 releases the engine voices `v`, `v + 4`, `v + 8` only, each
+            // 0x565DD0(h, 5, −1) (0x4AA9E4, 0x4AAA2D, 0x4AAA86) — the five-tick ramp of
+            // `mixer::Ramp` (ported 2026-09-27; the port stopped them at once)
             let c = &mut self.cars[index];
             for v in [c.near.take(), c.far.take(), c.road.take()].into_iter().flatten() {
-                out.stop(v);
+                out.release(v);
             }
             return;
         }
@@ -375,6 +378,7 @@ impl AiEngines {
                 (Some(id), _) => {
                     out.set_word(id, amp, word, 0x40);
                     out.set_pan(id, pan);
+                    out.voice_play_filter(id, self.filter);
                 }
                 (None, Some(c)) => *voice = Some(out.play_word(c, amp, word, 0x40, pan, true)),
                 (None, None) => {}
@@ -387,6 +391,7 @@ impl AiEngines {
             (Some(id), _) => {
                 out.set_word(id, mix(levels.ambient, self.road_trim, road_vol), road_word, road_bend);
                 out.set_pan(id, pan);
+                out.voice_play_filter(id, self.filter);
             }
             (None, Some(c)) => self.cars[index].road = Some(out.play_word(c.clone(), mix(levels.sfx, self.sfx_trim, road_vol), road_word, road_bend, pan, true)),
             _ => {}
@@ -422,9 +427,11 @@ impl AiEngines {
             (Some(id), true, _) => {
                 out.set_word(id, amp, word, HORN_BEND);
                 out.set_pan(id, pan);
+                out.voice_play_filter(id, self.filter);
             }
             (Some(id), false, _) => {
-                out.stop(id);
+                // the timer's stop is 0x4A9890: 0x565DD0(h, 5, −1)
+                out.release(id);
                 self.cars[index].horn = None;
             }
             (None, true, Some(c)) => self.cars[index].horn = Some(out.play_word(c.clone(), amp, word, HORN_BEND, pan, true)),
@@ -443,8 +450,13 @@ impl AiEngines {
     /// 0x4A7DC0 gives slot `index` to another car or empties it: its voices stop (0x4A7FC8…0x4A8005,
     /// 0x4A808B…0x4A80C6) and its honk timer is zeroed (0x4A801B / 0x4A80E7). The horn byte is the
     /// car's, but a stale one only ever meets a zero timer, where `Honk(car, 0)` does nothing.
+    /// Each voice goes through 0x4A9890 — 0x565DD0(h, 5, −1), the five-tick ramp.
     pub fn release(&mut self, out: &AudioOutput, index: usize) {
-        self.stop(out, index);
+        if let Some(c) = self.cars.get_mut(index) {
+            for v in [c.near.take(), c.far.take(), c.road.take(), c.horn.take()].into_iter().flatten() {
+                out.release(v);
+            }
+        }
         if let Some(h) = self.honks.get_mut(index) {
             *h = HonkTimer::default();
         }

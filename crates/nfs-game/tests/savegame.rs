@@ -266,6 +266,40 @@ fn the_used_car_market_fills_and_caps() {
     assert_eq!(got.asking_price, None);
 }
 
+/// `car+0x00` (`FECar::init` 0x4EEBA0's instance loop, the `car` module doc in `save.rs`): every
+/// touch of the registry `[0x69188C]` was traced (`career.md` §10.9 "The instance dword, settled
+/// as far as it goes") and no reader of the field turned up anywhere but the constructor's own
+/// loop — Save 0x4EE8D0 and Load 0x4EE6A0 both move it only as part of the flat `rep movsd`. The
+/// port used to write the car's index here (garage first, then the market): an invented value,
+/// since nothing ever reads it back. It now leaves the field at the fresh buffer's own zero.
+#[test]
+fn the_saved_cars_instance_dword_is_zero() {
+    let Some(t) = tables() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let car_id = t.catalog.iter().find(|c| !c.paint_sets.is_empty()).unwrap().id;
+    let mut c = Career::default();
+    c.year = 1975;
+    c.garage.push(OwnedCar::construct(&t, car_id, 0, 1000));
+    c.garage.push(OwnedCar::construct(&t, car_id, 0, 1000));
+    let mut seed = 1u32;
+    let mut rand = || {
+        seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        (seed >> 16) & 0x7FFF
+    };
+    c.refresh_market(&t, &mut rand);
+    assert!(!c.market.is_empty(), "a 1975 market should hold something");
+    let profile = Profile { name: "X".into(), picture: 0 };
+    let sav = career_to_sav(&c, &t, &profile);
+    for car in &sav.player.expect("player module").cars {
+        assert_eq!(car.field_u32(0), 0, "car+0x00 has no reader; the port must not invent a per-car index there");
+    }
+    for car in &sav.used_cars.expect("used-car module").cars {
+        assert_eq!(car.field_u32(0), 0, "car+0x00 has no reader; the port must not invent a per-car index there");
+    }
+}
+
 /// `nfs5.exe`'s virtual addresses mapped to file offsets, so a table the port transcribed can be
 /// compared with the bytes it came from (the same helper `nfs-physics`'s `scenarios.rs` uses for the
 /// surface tables). Minimal PE walking: `e_lfanew` at 0x3C, the COFF header, then the section whose
@@ -374,6 +408,74 @@ fn paint_shop_trim_round_trips() {
     let back = &career_from_sav(&parsed, &t).garage[0];
     assert_eq!((back.custom, back.trim.stripe1), (owned.custom, 1));
     assert_eq!(back.colour_words(e), [0xFF3F_BFBF, owned.colour_words(e)[1], e.paint_sets[1].packed[1], 0xFF12_3456]);
+}
+
+/// `opponent_car_image` (0x4F4FA0's two draw branches both `call 0x4eeba0`, `FECar::init`, for
+/// each of the seven `OpponentCar.Car` slots — not the bare sub-object constructor 0x4EE5C0 the
+/// module doc used to say): a drawn opponent car's image must carry what `FECar::init` actually
+/// leaves — `+0x6A0` (`car::OWNED`) at 1 (0x4EEC7F) and the record's sorted stock parts on
+/// `+0x758`/`+0x75C` (`fit_stock` 0x4EE9A0, unconditional at `FECar::init`'s end) — the same lists
+/// `OwnedCar::construct` puts on a fresh garage or market car.
+#[test]
+fn opponent_cars_carry_fecar_inits_owned_flag_and_stock_parts() {
+    let Some(t) = tables() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let car_id = t.catalog.iter().find(|c| t.car(c.id).is_some_and(|r| !r.stock_parts.is_empty())).unwrap().id;
+    let opp = nfs_game::save::OpponentCarSave { car_id, paint_set: 0, interior: 0, package: 0, decal: -1 };
+    let image = nfs_game::save::opponent_car_image(&t, &opp);
+    assert_eq!(image.field_u32(car::OWNED) & 0xFF, 1, "FECar::init 0x4EEC7F sets +0x6A0 = 1 unconditionally");
+    let want = OwnedCar::construct(&t, car_id, 0, 0);
+    assert!(!want.stock.is_empty(), "the chosen car has stock parts to carry");
+    assert_eq!(image.removed.iter().map(|p| p.id as i16).collect::<Vec<_>>(), want.stock.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+    assert_eq!(image.installed.iter().map(|p| p.id as i16).collect::<Vec<_>>(), want.parts);
+    // the port's own buffer is zeroed, so the untouched half of the instance-dword rule holds and
+    // the value stays 0 — settled module-wide, nothing reads it back either way
+    assert_eq!(image.field_u32(0), 0);
+}
+
+/// `OwnedCar::adopt_implicit_stock` (a version-1 port career's missing stock list, rebuilt):
+/// missing stock parts land at the **end** of `parts`, in the record's own stock order, and the
+/// parts already there keep whatever order they arrived in — not resorted, not interleaved. That
+/// is not this port-only case's own choice; it is read off 0x518510 (`install_spare` erases the
+/// displaced part at its own index and pushes the new one at the end) and 0x4F8590's back-fill
+/// 0x4F89D7…0x4F8C63 (a market car's unmatched stock pushed at the end in `+0x75C`'s order), the
+/// two live cases that add a missing stock part to an already-populated `+0x758`.
+#[test]
+fn adopt_implicit_stock_appends_missing_parts_at_the_end_in_stock_order() {
+    let Some(t) = tables() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let car_id = t
+        .catalog
+        .iter()
+        .find(|c| {
+            t.car(c.id).is_some_and(|r| {
+                r.stock_parts.len() >= 3
+                    && r.stock_parts.iter().filter_map(|id| t.parts.iter().find(|p| p.id == *id)).map(|p| (p.kind, &p.kind_name)).collect::<std::collections::HashSet<_>>().len() == r.stock_parts.len()
+            })
+        })
+        .expect("a car with three or more stock parts in distinct slots")
+        .id;
+    let stock_ids = t.car(car_id).unwrap().stock_parts.clone();
+    let last = stock_ids.len() - 1;
+
+    // deliberately out of the record's own order (last slot first), to show
+    // adopt_implicit_stock does not touch what is already there
+    let mut owned = OwnedCar::new(car_id, 0, 0);
+    owned.parts = vec![stock_ids[last], stock_ids[0]];
+    owned.part_state = owned.parts.iter().map(|id| (*id, 0.0)).collect();
+    assert!(owned.stock.is_empty(), "no stock list — the version-1 state this migrates");
+    owned.adopt_implicit_stock(&t);
+
+    // every other slot is open; the two given parts stay exactly as given, and the rest lands
+    // after them, in the record's own stock order
+    let mut want = vec![stock_ids[last], stock_ids[0]];
+    want.extend(&stock_ids[1..last]);
+    assert_eq!(owned.parts, want);
+    assert_eq!(owned.stock.iter().map(|(id, _)| *id).collect::<Vec<_>>(), stock_ids);
 }
 
 /// 0x4EE853…0x4EE8AE: the car loader exchange-sorts the installed list by 0x49C350 whatever

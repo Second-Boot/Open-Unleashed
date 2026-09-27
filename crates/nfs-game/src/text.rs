@@ -109,15 +109,22 @@ impl BitmapFont {
     /// quads' own span — not the font's line height. `(0, 0)` for a string with no glyph
     /// (0x53ED4C).
     pub fn measure(&self, text: &str) -> (f32, f32) {
+        let (_, _, w, h) = self.measure_box(text);
+        (w, h)
+    }
+
+    /// All four of 0x536970's outputs (0x53EE4B…0x53EE89): `(minX, minY, maxX − minX, maxY −
+    /// minY)`, zeros for a string with no glyph.
+    pub fn measure_box(&self, text: &str) -> (f32, f32, f32, f32) {
         let (glyphs, pen, mark) = self.layout(text);
         if glyphs.is_empty() {
-            return (0.0, 0.0);
+            return (0.0, 0.0, 0.0, 0.0);
         }
         let min_x = glyphs.iter().map(|g| g.x).fold(f32::MAX, f32::min).min(mark);
         let max_x = glyphs.iter().map(|g| g.x + g.w).fold(f32::MIN, f32::max).max(pen);
         let min_y = glyphs.iter().map(|g| g.y).fold(f32::MAX, f32::min);
         let max_y = glyphs.iter().map(|g| g.y + g.h).fold(f32::MIN, f32::max);
-        (max_x - min_x, max_y - min_y)
+        (min_x, min_y, max_x - min_x, max_y - min_y)
     }
 
     /// Sprites for `text` with its top-left at `pos` (screen units 0..1); `height` = line height in
@@ -146,6 +153,7 @@ impl BitmapFont {
                 rotation: 0.0,
                 pivot: [0.0, 0.0],
                 tri: None,
+                depth: None,
             })
             .collect()
     }

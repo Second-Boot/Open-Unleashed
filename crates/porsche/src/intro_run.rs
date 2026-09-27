@@ -175,5 +175,6 @@ fn design_sprite(aspect: f32, texture: TextureId, x: f32, y: f32, w: f32, h: f32
         rotation: 0.0,
         pivot: [0.5, 0.5],
         tri: None,
+        depth: None,
     }
 }

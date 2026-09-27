@@ -336,6 +336,31 @@ mod tests {
         }
     }
 
+    /// The decal draw at the instruction (0x4F517B `rand()%100 > 80` → 0x4F518D `rand()%100 − 1`,
+    /// both on the C-runtime LCG 0x5A17C9: `seed = seed·0x343FD + 0x269EC3`, return `(seed>>16)&0x7FFF`).
+    /// `CRand::default()`'s seed-1 stream drawn by hand (Python, the same recurrence) puts the
+    /// first non−1 decal at the 8th opponent — `fill` always returns seven, so that is the first
+    /// pick of a *second* call sharing the same `CRand` — with value 94: opponents 0…6 draw test
+    /// values (41, 18467), (6334, 26500), (19169, 15724), (11478, 29358), (…)'s `%100` landing at
+    /// or below 80 every time; the 8th's decal test (`%100`) clears 80 and its draw is `%100 − 1 =
+    /// 94`. This also locks the port's known package/decal split (`car-model.md` discrepancy
+    /// "(b)"): the package value is `rng.below` (`FeRng`), not a third `crand.next()`, so exactly
+    /// two `crand` calls are spent per opponent whose package test fails and three when the decal
+    /// test alone passes — matching this function's code, not the original's own third `rand()`
+    /// call at 0x4F516B for the package value.
+    #[test]
+    fn the_decal_draw_matches_the_generator_at_the_instruction() {
+        let catalog = vec![entry(521, 501)];
+        let candidates = vec![0];
+        let mut r = FeRng::new(0);
+        let mut c = CRand::default();
+        let first = fill(&catalog, &candidates, 0, OpponentChoice::SameCar, &mut r, &mut c, 8);
+        assert_eq!(first.len(), 7);
+        assert!(first.iter().all(|p| p.decal == -1), "opponents 0..6: {:?}", first.iter().map(|p| p.decal).collect::<Vec<_>>());
+        let second = fill(&catalog, &candidates, 0, OpponentChoice::SameCar, &mut r, &mut c, 8);
+        assert_eq!(second[0].decal, 94, "opponent 7 (the second call's first pick)");
+    }
+
     /// "Random car" really does spread over the list.
     #[test]
     fn random_car_uses_the_whole_candidate_list() {

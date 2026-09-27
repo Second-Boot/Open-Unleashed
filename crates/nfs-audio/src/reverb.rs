@@ -73,6 +73,19 @@ impl Reverb {
         }
     }
 
+    /// The race pause 0x4AB150 (0x4AB193…0x4AB1B3): with `[0x656868]` set, `Mixer_setEnvParam(0,
+    /// 0)` 0x565CD0 — an id without bits 0xE0 sets both buses — and `[0x656869]` (the level) and
+    /// `[0x656868]` cleared: the disabled-reverb reset of 0x4AA17C…0x4AA198 without its update. The
+    /// first audio update after the resume finds the level 0 and sets 100 or 8 again.
+    pub fn pause(&mut self) -> Option<EnvParams> {
+        if !self.on {
+            return None;
+        }
+        self.level = 0;
+        self.on = false;
+        Some(EnvParams { p80: 0, p20: 0 })
+    }
+
     /// The current level, 0..100.
     pub fn level(&self) -> i32 {
         self.level
@@ -101,6 +114,20 @@ mod tests {
         assert_eq!(r.update(false, false, false), Some(EnvParams { p80: 18, p20: 36 }));
         assert_eq!(r.update(false, false, false), Some(EnvParams { p80: 4, p20: 8 }));
         assert_eq!(r.update(false, false, false), None);
+    }
+
+    #[test]
+    fn the_pause_clears_an_armed_environment() {
+        // 0x4AB193…0x4AB1B3: nothing before the first update armed it
+        let mut r = Reverb::default();
+        assert_eq!(r.pause(), None);
+        r.update(true, false, false);
+        assert_eq!(r.pause(), Some(EnvParams { p80: 0, p20: 0 }));
+        assert_eq!((r.level(), r.pause()), (0, None));
+        // the first update after the resume: straight to 100 in the tunnel, or 8 outside
+        assert_eq!(r.update(true, false, false), Some(EnvParams { p80: 50, p20: 100 }));
+        r.pause();
+        assert_eq!(r.update(false, false, false), Some(EnvParams { p80: 4, p20: 8 }));
     }
 
     #[test]

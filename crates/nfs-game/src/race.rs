@@ -517,6 +517,15 @@ impl RaceProgress {
         self.update_tracked(table, pos, forward, tick, num_laps, None)
     }
 
+    /// A skill test's car (`[0x6573EC] == 4`): the per-car wrapper 0x4169B0 calls the checkpoint
+    /// progression 0x416170 **instead of** `Race_updateProgress` 0x416310 (0x4169FE…0x416A14), so
+    /// neither the progress, the laps (`Lap_check` 0x417440 is 0x416310's, 0x41657F; its other
+    /// caller 0x4179A4 is for cars without `car+0x52C` bit 0) nor `car+0xB14` move — only the
+    /// tracker's slice does. The finish and its tick are 0x416170's (the caller's).
+    pub fn track_only(&mut self, table: &SliceTable, pos: Vec3, preferred: Option<usize>) {
+        self.slice = table.track_slice(pos, self.slice, preferred);
+    }
+
     /// The same with the tracker's `preferredSection` (`race-logic.md` §1.4): a car that has taken a
     /// junction branch resolves its slice against that branch's section too.
     pub fn update_tracked(&mut self, table: &SliceTable, pos: Vec3, forward: Vec3, tick: u64, num_laps: u32, preferred: Option<usize>) -> bool {

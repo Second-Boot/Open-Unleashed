@@ -354,19 +354,6 @@ impl Speed {
             _ => 0.01,
         }
     }
-    /// The bar's speed cell (0x42DBCF…0x42DC38): `+0x174` steps 5 → 6 → 7 → 8 → 5 and the step
-    /// it lands on is sent through the jump table 0x42DCF8 as event 0xA…0xD, which `RaceFrame`
-    /// turns into command 4…7 (0x415799…0x4157A5) — normal, double, quarter, half. So a click
-    /// goes **normal → double → quarter → half → normal**. *(Until 2026-09-26 this was half →
-    /// quarter → normal → double, with no source; nothing called it.)*
-    pub fn next(self) -> Self {
-        match self {
-            Speed::Normal => Speed::Double,
-            Speed::Double => Speed::Quarter,
-            Speed::Quarter => Speed::Half,
-            Speed::Half => Speed::Normal,
-        }
-    }
 }
 
 /// The nine cycleable camera ids of §8 (`0x5CC654`); 0x14 is the track-side "TV" mode and 0x0B is
@@ -680,20 +667,6 @@ pub const BAR_PLAY: usize = 0xB;
 pub const BAR_NEXT: usize = 0xA;
 pub const BAR_SPEEDS: [usize; 4] = [5, 6, 7, 8];
 
-impl Speed {
-    /// Which of the four speed glyphs cell 4 shows. The `.fsh` names them `I.1X`, `I.2X`, `I.25`
-    /// and `I.5`, which is one-for-one with [`Speed`]'s four values — normal, double, a quarter and
-    /// a half — so the mapping is the file's, not a guess.
-    pub fn bar_glyph(self) -> usize {
-        match self {
-            Speed::Normal => BAR_SPEEDS[0],
-            Speed::Double => BAR_SPEEDS[1],
-            Speed::Quarter => BAR_SPEEDS[2],
-            Speed::Half => BAR_SPEEDS[3],
-        }
-    }
-}
-
 /// The cell, `[0x5B2EF0]` × `[0x5B2EF4]`.
 pub const BAR_CELL: (f32, f32) = (21.0, 18.0);
 /// Cell pitch: `+0x15 + 0x1E` at 0x42DF4C and its five twins.
@@ -807,20 +780,176 @@ pub fn bar_cell_at(cells: &[(f32, f32); 7], x: i32, y: i32) -> Option<usize> {
     })
 }
 
-/// A press on `cell` (0x42D880 with event 2): the answer, given the playback's speed (what
-/// `+0x174` stands for) and `network` (`+0x198`). See [`BarEvent`].
-pub fn bar_event(cell: usize, speed: Speed, network: bool) -> Option<BarEvent> {
+/// A press on `cell` (0x42D880 with event 2): the answer, given the bar's own state and `network`
+/// (`+0x198`). The `rest` cell puts the speed step `+0x174` back to 5 (0x42D984) and the speed
+/// cell steps it (0x42DBCF), both on the bar ([`BarState`]). See [`BarEvent`]. *(Until
+/// 2026-09-27 the speed cell stepped from the playback's speed `[0x606864]` — `Speed::next`,
+/// removed — which differs from `+0x174` after a playback start, 0x413ECF.)*
+pub fn bar_event(cell: usize, bar: &mut BarState, network: bool) -> Option<BarEvent> {
     match (cell, network) {
         (0, _) => Some(BarEvent::Camera),
-        (1, false) => Some(BarEvent::Restart),
+        (1, false) => {
+            bar.step = 5;
+            Some(BarEvent::Restart)
+        }
         (1, true) => Some(BarEvent::PrevCar),
         (2, false) => Some(BarEvent::Pause),
         (2, true) => Some(BarEvent::NextCar),
         (3, false) => Some(BarEvent::Quit),
-        (4, false) => Some(BarEvent::Speed(speed.next())),
+        (4, false) => Some(BarEvent::Speed(bar.press_speed())),
         (5, _) => Some(BarEvent::Results),
         (6, false) => Some(BarEvent::Save),
         _ => None,
+    }
+}
+
+/// The bar's frame box for the auto-hide test, `+0x24 / +0x28` and `+0x10 / +0x14`: the tray's
+/// origin is the frame origin of [`control_bar`] (0x42DFEC…0x42DFFC → 0x4342E0 → 0x434310) and its
+/// size the constructor's `[0x60CB48]` × `[0x60CB4C]` (333 × 24, 0x42C96A → 0x42DEF0 → 0x4340A0).
+pub const BAR_FRAME: (f32, f32) = (6.0 * BAR_PITCH + BAR_CELL.0 + 6.0, BAR_CELL.1 + 6.0);
+
+/// `HReplay`'s own state beyond its cells — built once per **session** by the HUD factory (0x424F90
+/// / 0x424FA6 → 0x42C910; a restart and the automatic replay keep it), read 2026-09-27:
+///
+/// * `step` is `+0x174`, the speed cell's step 5…8 (0x42D0B3 sets 5): the draw shows glyph
+///   `+0xDC + 4·step` (0x42D40A…0x42D42F, the four speed widgets `+0xD8…+0xE4` copied to `+0xF0…`,
+///   0x42D095…0x42D0C9) and a press steps it (0x42DBCF…0x42DBE3) and answers by it (table 0x42DCF8)
+///   — **not** by the playback's speed `[0x606864]`, which a playback start puts back to normal
+///   (0x413ECF) without touching `+0x174`. The `rest` cell puts it back to 5 (0x42D984).
+/// * `away` is `+0x124`: slot 9 (0x42D880, the pump's call once per `RaceFrame`, 0x415520 →
+///   0x4264CC) zeroes it with the pointer inside the bar's frame box (0x4344B0, edges inside) and
+///   otherwise counts it up to 0x28 (0x42D8A0…0x42D8BB).
+/// * `hover[i]` are `+0x108 + 4i` (cleared by the constructor, 0x42D076…0x42D093): the same count
+///   per cell, the pointer in the cell (0x42D911…0x42D931 and its six twins) — the tooltip's
+///   (0x42DE1D: drawn from 0x28 on).
+/// * `pinned` is `+0x178`: the HUD's frame 0x425950 sets it while a dialog is queued
+///   (`[0x60C9C4]` not empty, 0x425CF5…0x425D0C) and, once the queue is empty, clears it with
+///   `away` (0x42D4A0 at 0x425D22).
+/// * `state` / `stamp` are the tray's `+0xC` and `+0xB4`. The draw (0x42D22F…0x42D282) closes the
+///   bar — slot 5(2) — when `away >= 0x28` and not `pinned` and the state is 3 or 1, and opens it —
+///   slot 5(1) — otherwise when the state is 0 or 2; slot 5 stamps `[0x606AC8]` (0x434490). The
+///   bar is built with `+0xBC = 1` (0x42C919), so its tray **fades** (slot 14 0x4349F0: `pct =
+///   min((clock − stamp)·100 / 48, 100)`, signed `idiv`) and nothing moves it to 3 or 0 — only
+///   the slide (0x4346A0, for `+0xBC == 0`) does that. So after its first opening the bar lives in
+///   states 1 (fading in, then held at 100) and 2 (fading out, then held at 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BarState {
+    pub step: u8,
+    pub away: i32,
+    pub hover: [i32; 7],
+    pub pinned: bool,
+    pub state: u8,
+    pub stamp: u64,
+}
+
+impl Default for BarState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BarState {
+    /// The constructor 0x42C910: `+0x174 = 5` (0x42D0B3), `+0x178 = 0`, the counters 0
+    /// (0x42D076…), the tray in state 0 with stamp 0 (0x42A369, 0x433FDD).
+    pub fn new() -> Self {
+        Self { step: 5, away: 0, hover: [0; 7], pinned: false, state: 0, stamp: 0 }
+    }
+
+    /// The speed the step stands for, through 0x42DCF8: 5 → 0xA normal, 6 → 0xB double, 7 → 0xC
+    /// quarter, 8 → 0xD half (`RaceFrame`'s commands 4…7).
+    pub fn speed(&self) -> Speed {
+        match self.step {
+            6 => Speed::Double,
+            7 => Speed::Quarter,
+            8 => Speed::Half,
+            _ => Speed::Normal,
+        }
+    }
+
+    /// Which of the four speed glyphs cell 4 shows: widget `+0xDC + 4·step` (0x42D413), i.e.
+    /// `+0xD8…+0xE4` for 5…8, which the constructor built from `replay.fsh` entries 5, 6, 7, 8
+    /// (0x42CC8E, 0x42CD01, 0x42CD74, 0x42CDE7) — `I.1X`, `I.2X`, `I.25`, `I.5`.
+    pub fn glyph(&self) -> usize {
+        BAR_SPEEDS[usize::from(self.step.clamp(5, 8) - 5)]
+    }
+
+    /// A press on the speed cell (0x42DBCF…0x42DBE3): `++step`, above 8 back to 5; the answer is
+    /// the new step's.
+    pub fn press_speed(&mut self) -> Speed {
+        self.step += 1;
+        if self.step > 8 {
+            self.step = 5;
+        }
+        self.speed()
+    }
+
+    /// Slot 9's counting (0x42D892…0x42D8BB and 0x42D8C1…0x42DCE2), run once per frame with the
+    /// pointer in whole pixels, or `None` when the port has none (the pointer off the window —
+    /// counted as off the bar). The cells' latches are [`bar_cell_at`]'s caller's.
+    pub fn count(&mut self, cells: &[(f32, f32); 7], frame: (f32, f32), pointer: Option<(i32, i32)>) {
+        let inside = pointer.is_some_and(|(x, y)| {
+            let (fx, fy) = (frame.0 as i32, frame.1 as i32);
+            x >= fx && x <= fx + BAR_FRAME.0 as i32 && y >= fy && y <= fy + BAR_FRAME.1 as i32
+        });
+        self.away = if inside { 0 } else { (self.away + 1).min(0x28) };
+        let over = pointer.and_then(|(x, y)| bar_cell_at(cells, x, y));
+        for (i, h) in self.hover.iter_mut().enumerate() {
+            *h = if over == Some(i) { (*h + 1).min(0x28) } else { 0 };
+        }
+    }
+
+    /// The draw's transition (0x42D22F…0x42D282) at `[0x606AC8]` = `clock`.
+    pub fn transition(&mut self, clock: u64) {
+        let target = if self.away >= 0x28 && !self.pinned {
+            matches!(self.state, 3 | 1).then_some(2)
+        } else {
+            matches!(self.state, 0 | 2).then_some(1)
+        };
+        if let Some(s) = target {
+            self.state = s;
+            self.stamp = clock;
+        }
+    }
+
+    /// The HUD frame's pin (0x425CF5…0x425D22), after the draw: a dialog queued pins the bar; the
+    /// queue empty again unpins it and zeroes `away`.
+    pub fn pin(&mut self, dialog_queued: bool) {
+        if dialog_queued {
+            self.pinned = true;
+        } else if self.pinned {
+            self.away = 0;
+            self.pinned = false;
+        }
+    }
+
+    /// The fade in per cent the draw scales everything by (0x42D29B…0x42D2D2): slot 14 in state
+    /// 1, `100 − ` it in state 2; `None` in state 0 (0x42D28E: not drawn). State 3 would read a
+    /// local the draw never wrote (0x42D2CE, the `push ecx` slot, i.e. `this`) — unreachable, see
+    /// the struct.
+    pub fn pct(&self, clock: u64) -> Option<i32> {
+        let slot14 = || ((clock as i64 - self.stamp as i64) * 100 / 48).min(100) as i32;
+        match self.state {
+            1 => Some(slot14()),
+            2 => Some(100 - slot14()),
+            3 => Some(100),
+            _ => None,
+        }
+    }
+}
+
+/// The tooltips 0x42DD10 (drawn at the end of the bar's draw, 0x42D478): the FE string of each
+/// cell (`hud.loc` through 0x41E160 → 0x536DA0), `+0x17C…+0x194` rebuilt every draw — cell 2 is
+/// 18149 (0x46E5) while `+0x199` is clear and 18173 (0x46FD) while it is set.
+pub fn bar_tooltip(cell: usize, paused: bool) -> u32 {
+    match cell {
+        0 => 18147,
+        1 => 18148,
+        2 if paused => 18173,
+        2 => 18149,
+        3 => 18194,
+        4 => 18150,
+        5 => 18151,
+        _ => 18152,
     }
 }
 
@@ -828,22 +957,69 @@ pub fn bar_event(cell: usize, speed: Speed, network: bool) -> Option<BarEvent> {
 mod tests {
     use super::*;
 
+    /// The bar's own state: the speed step, the auto-hide count, the pin and the fade (0x42D880,
+    /// 0x42D22F, 0x425CF5, 0x4349F0).
+    #[test]
+    fn the_bar_hides_and_fades_as_0x42d1e0() {
+        let (cells, frame) = control_bar(640.0, 480.0);
+        let mut b = BarState::new();
+        // +0x174: 5 → 6 → 7 → 8 → 5 answers double, quarter, half, normal
+        let seen: Vec<Speed> = (0..4).map(|_| b.press_speed()).collect();
+        assert_eq!(seen, [Speed::Double, Speed::Quarter, Speed::Half, Speed::Normal]);
+        // the first frame opens it (state 0, away 0) and it fades in over 48 ticks
+        b.count(&cells, frame, None);
+        b.transition(100);
+        assert_eq!((b.state, b.stamp), (1, 100));
+        assert_eq!(b.pct(100), Some(0));
+        assert_eq!(b.pct(124), Some(50));
+        assert_eq!(b.pct(200), Some(100));
+        // forty frames off the bar (the first counted above) close it; it never reaches state 3
+        // or 0 again
+        for _ in 0..0x26 {
+            b.count(&cells, frame, None);
+            b.transition(300);
+        }
+        assert_eq!(b.state, 1);
+        b.count(&cells, frame, None);
+        b.transition(300);
+        assert_eq!((b.state, b.away), (2, 0x28));
+        assert_eq!(b.pct(300 + 48), Some(0));
+        assert_eq!(b.pct(1000), Some(0));
+        // a dialog pins it open; its end zeroes the count
+        b.pin(true);
+        b.transition(400);
+        assert_eq!(b.state, 1);
+        b.pin(false);
+        assert_eq!((b.pinned, b.away), (false, 0));
+        // the pointer back on the frame (edges inside) zeroes the count, a cell counts its hover
+        b.count(&cells, frame, Some((frame.0 as i32 + 333, frame.1 as i32 + 24)));
+        assert_eq!(b.away, 0);
+        let (cx, cy) = (cells[4].0 as i32 + 3, cells[4].1 as i32 + 3);
+        for _ in 0..50 {
+            b.count(&cells, frame, Some((cx, cy)));
+        }
+        assert_eq!(b.hover, [0, 0, 0, 0, 0x28, 0, 0]);
+        b.count(&cells, frame, Some((frame.0 as i32 + 334, frame.1 as i32)));
+        assert_eq!((b.away, b.hover[4]), (1, 0));
+    }
+
     /// 0x42D880's answers, cell by cell, and the speed cell's cycle through the jump table 0x42DCF8.
     #[test]
     fn the_bar_cells_answer_as_0x42d880() {
-        let codes: Vec<Option<u8>> = (0..7).map(|c| bar_event(c, Speed::Normal, false).map(BarEvent::code)).collect();
+        let codes: Vec<Option<u8>> = (0..7).map(|c| bar_event(c, &mut BarState::new(), false).map(BarEvent::code)).collect();
         assert_eq!(codes, [Some(6), Some(7), Some(8), Some(9), Some(0xB), Some(0xE), Some(0xF)]);
-        let net: Vec<Option<u8>> = (0..7).map(|c| bar_event(c, Speed::Normal, true).map(BarEvent::code)).collect();
+        let net: Vec<Option<u8>> = (0..7).map(|c| bar_event(c, &mut BarState::new(), true).map(BarEvent::code)).collect();
         assert_eq!(net, [Some(6), Some(0x17), Some(0x16), None, None, Some(0xE), None]);
         // +0x174: 5 → 6 → 7 → 8 → 5 is 0xB, 0xC, 0xD, 0xA
-        let mut s = Speed::Normal;
-        let mut seen = Vec::new();
-        for _ in 0..4 {
-            let Some(BarEvent::Speed(n)) = bar_event(4, s, false) else { panic!("the speed cell answers a speed") };
-            seen.push(BarEvent::Speed(n).code());
-            s = n;
-        }
+        let mut b = BarState::new();
+        let seen: Vec<u8> = (0..4).map(|_| bar_event(4, &mut b, false).map_or(0, BarEvent::code)).collect();
         assert_eq!(seen, [0xB, 0xC, 0xD, 0xA]);
+        // the step is the bar's, not the playback's speed: a playback start leaves it (0x413ECF
+        // writes `[0x606864]` only), the `rest` cell puts it back to 5 (0x42D984)
+        bar_event(4, &mut b, false);
+        assert_eq!(b.step, 6);
+        assert_eq!(bar_event(1, &mut b, false), Some(BarEvent::Restart));
+        assert_eq!((b.step, bar_event(4, &mut b, false)), (5, Some(BarEvent::Speed(Speed::Double))));
         // both edges are inside the cell (`jl` / `jg`), the gap between cells is not
         let (cells, _) = control_bar(640.0, 480.0);
         let (x0, y0) = (cells[0].0 as i32, cells[0].1 as i32);

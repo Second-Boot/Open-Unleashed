@@ -224,6 +224,31 @@ fn parts() -> Option<Vec<nfs_formats::career::Part>> {
     nfs_formats::career::parse_parts(&std::fs::read(p).ok()?).ok()
 }
 
+fn catalog() -> Option<Vec<nfs_formats::fedata::CarCatalogEntry>> {
+    let home = std::env::var_os("HOME")?;
+    let p = std::path::PathBuf::from(home).join("Games/NFS-Porsche-Unleashed/game_info/data/FEData/Data/nfs5.car");
+    nfs_formats::fedata::parse_car_catalog(&std::fs::read(p).ok()?).ok()
+}
+
+/// `specs.rs:49`: a quick race's / a non-career opponent's `car+0x768` is `stock_parts` of the
+/// `nfs5.car` record's own stock-part ids, not the six-getter [`nfs_physics::specs::fallback_parts`]
+/// placeholder — 0x4EE9A0 (`FECar::init`'s unconditional stock fit) applies to every FE car, not
+/// only a career one (`RE/notes/career.md` §11.2d, `controls.md` §4.169.6).
+#[test]
+fn a_quick_race_993_races_on_its_real_stock_parts_not_the_fallback() {
+    let (Some(cat), Some(all)) = (catalog(), parts()) else { return };
+    let Some(entry) = cat.iter().find(|c| c.sim.eq_ignore_ascii_case("993coupe36")) else { return };
+    assert!(!entry.stock_parts.is_empty(), "the 993 coupé must carry a stock list in the shipped data");
+    let got = nfs_physics::specs::stock_parts(&entry.stock_parts, &all);
+    assert_ne!(got, nfs_physics::specs::fallback_parts(), "a real record must not fall back");
+    assert_eq!(got.len(), entry.stock_parts.len(), "one InstalledPart per stock id");
+    // every kind the record's own parts carry, not the fallback's fixed six masks
+    let kinds: std::collections::BTreeSet<u16> = got.iter().map(|p| p.kind).collect();
+    let record_kinds: std::collections::BTreeSet<u16> =
+        entry.stock_parts.iter().filter_map(|id| all.iter().find(|p| p.id == *id)).map(|p| p.kind).collect();
+    assert_eq!(kinds, record_kinds);
+}
+
 /// `+0xC0 = 1` is the identity in the brake, spring, shock and sway-bar arms, and that is a check on
 /// the record layout rather than on the port: if `value_c0` were being read from the wrong offset,
 /// the standard part would not leave the block alone.

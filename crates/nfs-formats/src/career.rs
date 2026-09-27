@@ -153,9 +153,22 @@ pub struct TournamentOpponent {
     /// Installed `nfs5.prt` ids (0-terminated list, up to 22).
     pub parts: Vec<i16>,
     pub unknown_30: u32,
-    /// 8 × RGBA paint / decal colours.
+    /// 8 × RGBA paint colours (`0x4EBDA0` reads `colours[0]` as `FECar::init`'s ExtColour and
+    /// `colours[4]` as IntColour, both byte-swapped; the port has no field for IntColour so only
+    /// `colours[0]` is carried into `CareerOpponent::paint`). Slot 7 (`+0x50..+0x54`) is not really
+    /// a colour — its 4 bytes are `unknown_50` and [`decal`](Self::decal), below.
     pub colours: [[u8; 4]; 8],
+    /// `+0x50`: read as `FECar::init`'s S1Colour *and* S2Colour (the same i16, sign-extended) by
+    /// `0x4EBDA0` (0x4ebe21/0x4ebe67/0x4ebe77) — not a package index, whatever a value in
+    /// `packages.ini`'s range (0..6 across the shipped table) might suggest. UNKNOWN beyond that.
     pub unknown_50: i16,
+    /// `+0x52`: `FECar::init`'s 7th argument, DecalNum (`.RACENUMBER` 0x24D, `car-model.md` §5.3) —
+    /// read straight from the table by `0x4EBDA0` (0x4ebe2d, `mov ecx,[esp+0x44]` → arg7 of
+    /// `call 0x4ee3b0`), **not drawn**: a tournament/finale opponent's race number is authored data,
+    /// unlike a quick-race opponent's (`modes.md` §1.1, `nfs_game::opponents::fill`). −1 = no
+    /// plate; the shipped table carries −1 on 21 of the 35 tournaments' opponents and 0…99 on the
+    /// rest (read 2026-09-27, `python3 -c` over `nfs5.trn`).
+    pub decal: i16,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -277,7 +290,15 @@ pub fn parse_tournaments(data: &[u8]) -> Result<Vec<Tournament>, FormatError> {
                 let o = b + 0x34 + k * 4;
                 c.copy_from_slice(&r[o..o + 4]);
             }
-            opponents.push(TournamentOpponent { driver: i16_le(r, b, what)?, car_id: i16_le(r, b + 2, what)?, parts, unknown_30: u32_le(r, b + 0x30, what)?, colours, unknown_50: i16_le(r, b + 0x50, what)? });
+            opponents.push(TournamentOpponent {
+                driver: i16_le(r, b, what)?,
+                car_id: i16_le(r, b + 2, what)?,
+                parts,
+                unknown_30: u32_le(r, b + 0x30, what)?,
+                colours,
+                unknown_50: i16_le(r, b + 0x50, what)?,
+                decal: i16_le(r, b + 0x52, what)?,
+            });
         }
         // the original clamps the event count to 10 (0x502BA0); the file allows 15 slots
         let n_events = i16_le(r, 0x39C, what)?;

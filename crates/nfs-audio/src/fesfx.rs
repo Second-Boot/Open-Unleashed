@@ -58,14 +58,15 @@ impl FeSfx {
     }
 
     /// 0x4AADB0(`slot`): nothing at sound detail 3; otherwise the slot once, centred, at
-    /// [`level`].
+    /// [`level`]. A bare `Voice_start` 0x565E70, no voice number — not in the pause's table
+    /// (`AudioOutput::silence_voices`, `RE/notes/sfx.md` "Audit 2026-09-27, audio port 11").
     pub fn play(&mut self, out: &AudioOutput, slot: usize, sfx_level: u8, audio_quality: u8) {
         if audio_quality == 3 {
             return;
         }
         let v = level(self.trim, sfx_level);
         if let Some(c) = self.clip(slot) {
-            out.play(c, v as f32 / 127.0, 1.0, false);
+            out.play_untabled(c, v as f32 / 127.0, 1.0, false);
         }
     }
 }

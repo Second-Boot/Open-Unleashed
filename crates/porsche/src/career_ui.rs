@@ -28,6 +28,15 @@ pub struct CareerOpponent {
     /// The opponent record's installed parts (`opp+0x04`, resolved through the parts table), which
     /// 0x4ED880 puts on its FE car's `+0x758` for the race — specs, grip ratio and style overlay.
     pub parts: Vec<Part>,
+    /// `.RACENUMBER` 0x24D — `FECar::init` 0x4EEBA0's 7th argument (`car-model.md` §5.3). A
+    /// quick-race / knockout opponent draws it at 0x4F4FA0 (0x4F517B `rand()%100 > 80` →
+    /// 0x4F518D `rand()%100 − 1`, else −1). A tournament / era-finale opponent is never rebuilt
+    /// through that draw: `0x4EBDA0` reads the number straight out of the table's own opponent
+    /// record (`TournamentOpponent::decal`, `+0x52`), read 2026-09-27. A Factory Driver mission
+    /// opponent's car is built like a used-car-market car (`0x4EC1A0` → `0x4EE3B0` → `0x4EEBA0`,
+    /// same day): its decal *is* drawn, the same two-roll shape as the market's own
+    /// (`nfs_game::career::used_car_trim`), not left at −1.
+    pub decal: i32,
 }
 
 /// Everything the app needs to start a career event.
@@ -140,6 +149,14 @@ pub struct CareerUi {
     pub pending: Option<PendingEvent>,
     /// What the front end's way back from a tournament race reads (0x4D3420).
     pub race_flags: TournamentRaceFlags,
+    /// **Port text menu only**: its stand-in for the original's screen stack
+    /// `[E, VictoryRoom] endofera`, the one place the finale is offered (0x4D476F…0x4D484F, after
+    /// the race whose filing moved the era on). Set by that race's end; cleared by `DECLINE`, by
+    /// the finale's own race end — type 10 goes to `[E] tournament`, won or lost (0x4D4B1A) —
+    /// and by its abort (`E` alone, 0x4D3FF8). Never saved: the original keeps no finale state
+    /// in the profile (the finale is 0x504990(0x504800()), `Career::finale_tournament`), so a
+    /// profile load never lands on the offer.
+    pub victory_room: bool,
     /// The profile the career belongs to: `SaveData/<digit><Name>.sav` (`RE/notes/savegame.md` §2).
     pub profile: Profile,
     pub save_dir: PathBuf,
@@ -206,6 +223,7 @@ impl CareerUi {
             reset_confirmed: false,
             pending: None,
             race_flags: TournamentRaceFlags::default(),
+            victory_room: false,
         })
     }
 
@@ -338,37 +356,24 @@ impl CareerUi {
             .iter()
             .filter_map(|id| self.tables.parts.iter().find(|p| p.id == *id).cloned())
             .collect();
+        // The mission opponents' own cars are built through the same constructor as a used-car-market
+        // car (`0x4EC1A0` read 2026-09-27: `call 0x4f4360` for the record, then the identical paint
+        // set / interior / package / decal draw as `0x4F82C0` — `nfs_game::career::used_car_trim`,
+        // `career.md` §10.5a). 0x4EC1A0 draws the paint set and interior from the front end's
+        // 0x538040 and the package/decal rolls from the CRT `rand()` 0x5A17C9; the port draws all
+        // four (plus the two `%100` tests) from the one generator it is handed, in that order —
+        // `used_car_trim`'s own APPROXIMATION, not invented here.
+        let mut seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u32).unwrap_or(1) | 1;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed >> 8
+        };
         let opponents: Vec<CareerOpponent> = m
             .opponents
             .iter()
-            .filter_map(|(per, car_id)| {
-                let car = self.tables.car(*car_id as u16)?.clone();
-                if car.sim.is_empty() {
-                    return None;
-                }
-                let skill = self
-                    .tables
-                    .personalities
-                    .iter()
-                    .find(|p| p.id == *per)
-                    .map(|p| p.skill)
-                    .unwrap_or([[1.0, 0.0]; 4]);
-                let paint = car
-                    .paint_sets
-                    .first()
-                    .map(|p| p.colours[0])
-                    .unwrap_or([0x20, 0x40, 0xC0]);
-                Some(CareerOpponent {
-                    car,
-                    paint,
-                    name: self.tables.driver_name(*per),
-                    difficulty: 1.0,
-                    skill,
-                    grid: None,
-                    personality: *per,
-                    parts: Vec::new(),
-                })
-            })
+            .filter_map(|(per, car_id)| self.mission_opponent(*per, *car_id, &mut rand))
             .collect();
         let scene_suffix = m
             .scene_file(&track.file)
@@ -381,7 +386,16 @@ impl CareerUi {
             mission: Some(idx),
             layout: false,
         });
-        tracing::info!(mission = m.code, track = track.file, scene = ?scene_suffix, car = car.model, opponents = opponents.len(), "mission start");
+        tracing::info!(
+            mission = m.code,
+            track = track.file,
+            scene = ?scene_suffix,
+            car = car.model,
+            opponents = opponents.len(),
+            // drawn per opponent (`0x4EC1A0` → `used_car_trim`, `career.md` §10.5a), not fixed
+            decals = ?opponents.iter().map(|o| o.decal).collect::<Vec<_>>(),
+            "mission start"
+        );
         Some(StartRequest {
             track_file: track.file.clone(),
             car,
@@ -400,6 +414,39 @@ impl CareerUi {
             traffic_ids: None,
             player_grid: None,
             skill: m.skill.clamp(0, 2) as u8,
+        })
+    }
+
+    /// One mission opponent's car — `0x4EC1A0` (read 2026-09-27): the record from `0x4f4360`, then
+    /// the same paint set / interior / package / decal draw as a used-car-market car (`0x4F82C0`,
+    /// `nfs_game::career::used_car_trim`, `career.md` §10.5a), in that order. `rand` is the one
+    /// generator the caller hands every draw through (the port's APPROXIMATION of the original's
+    /// two — the front end's `0x538040` for the paint set and interior, the CRT `rand()` 0x5A17C9
+    /// for the package and decal rolls, `career.md` §10.5a).
+    fn mission_opponent(&self, per: i16, car_id: i16, rand: &mut impl FnMut() -> u32) -> Option<CareerOpponent> {
+        let car = self.tables.car(car_id as u16)?.clone();
+        if car.sim.is_empty() {
+            return None;
+        }
+        let skill = self
+            .tables
+            .personalities
+            .iter()
+            .find(|p| p.id == per)
+            .map(|p| p.skill)
+            .unwrap_or([[1.0, 0.0]; 4]);
+        let (paint_set, trim) = nfs_game::career::used_car_trim(car.paint_sets.len(), car.interior_colours.len(), self.tables.package_count, rand);
+        let paint = car.paint_sets.get(paint_set as usize).map(|p| p.colours[0]).unwrap_or([0x20, 0x40, 0xC0]);
+        Some(CareerOpponent {
+            car,
+            paint,
+            name: self.tables.driver_name(per),
+            difficulty: 1.0,
+            skill,
+            grid: None,
+            personality: per,
+            parts: Vec::new(),
+            decal: trim.decal as i32,
         })
     }
 
@@ -590,10 +637,10 @@ impl CareerUi {
     }
 
     pub fn car_choices(&self) -> Vec<CarChoice> {
-        if let Some(f) = &self.career.finale {
+        if self.victory_room {
             return self
-                .tables
-                .tournament(f.tournament)
+                .career
+                .finale_tournament(&self.tables)
                 .map(|t| vec![CarChoice::Loaned(t.prize_car)])
                 .unwrap_or_default();
         }
@@ -700,12 +747,12 @@ impl CareerUi {
         }
     }
 
-    /// Backspace / East button: decline a pending finale, or sell the selected garage car.
+    /// Backspace / East button: decline the finale on offer (`victory_room`), or sell the selected garage car.
     pub fn back(&mut self) {
-        if self.career.finale.is_some() {
-            self.career.decline_finale();
+        if self.victory_room {
+            // `DECLINE` leaves the screen (0x506B40…0x506CB0); nothing is filed
+            self.victory_room = false;
             self.message = "FINALE DECLINED".into();
-            self.save();
             return;
         }
         if self.row == 2 {
@@ -858,6 +905,7 @@ impl CareerUi {
             return false;
         };
         self.career = nfs_game::save::career_from_sav(&s, &self.tables);
+        self.victory_room = false;
         self.profile = p.clone();
         // the modules `LoadInfo` hands their own loaders — `Knockout` 0x4DDD60, `Personalities`
         // 0x4E2CA0, `CDPlayer` 0x4BE170 — and the accessor block 0x4B7FD0
@@ -972,10 +1020,10 @@ impl CareerUi {
                     self.message = "CAR HAS NO SIMULATION DATA".into();
                     return None;
                 }
-                let finale = self.career.finale.clone();
-                let (t, event, garage_idx) = match &finale {
-                    Some(f) => (self.tables.tournament(f.tournament)?.clone(), 0usize, None),
-                    None => {
+                let finale = self.victory_room;
+                let (t, event, garage_idx) = match finale {
+                    true => (self.career.finale_tournament(&self.tables)?.clone(), 0usize, None),
+                    false => {
                         // the start check 0x4D5730 in the original's order: the car against the
                         // tournament's restrictions (0x504A70 → 813), another tournament part-way
                         // through (0x504B60 → 858, unless already confirmed), then the fee on the
@@ -1016,7 +1064,7 @@ impl CareerUi {
                         )
                     }
                 };
-                let req = self.event_request(car, &t, event, garage_idx, finale.is_some(), false);
+                let req = self.event_request(car, &t, event, garage_idx, finale, false);
                 // the launch's `SaveInfo` (0x4D52EA), after the fee and 0x503940
                 self.save();
                 req
@@ -1076,6 +1124,24 @@ impl CareerUi {
         // the front end's shut-down runs `SaveInfo` at 0x4D52EA), so the file holds the event
         // being raced. *(Until 2026-09-26 the port saved before the event was pending, writing
         // the −1s.)*
+        self.save();
+        req
+    }
+
+    /// **The era finale from the layout front end** — `PLAYGAME` on `VictoryRoom` (whose creator
+    /// 0x506B40 wrote `Game.GameType` 10): the start check 0x4D5730 sends type 10 straight to the
+    /// launch (0x4D5798 → 0x4D59EA → 0x4D5AA3 → 0x4D58E3) — no car restriction, no part-way
+    /// question, no fee. The race is 0x4ED5D0's type-10 set-up of the finale record's event 0
+    /// in its loaned prize car (0x4EB710 / 0x4EB923: `0x5048D0(0x504800())`) —
+    /// `Career::finale_tournament`. The launch writes no profile field (0x4D58FB: the fee and
+    /// 0x503940 are type 4's). A lost finale is not offered again: type 10's race end opens
+    /// `[E] tournament` (0x4D4B1A) and `VictoryRoom` is pushed only by the era step's race end
+    /// (0x4D47EF, the string's one reference).
+    pub fn start_finale(&mut self) -> Option<StartRequest> {
+        let t = self.career.finale_tournament(&self.tables)?.clone();
+        let car = self.tables.car(t.prize_car)?.clone();
+        let req = self.event_request(car, &t, 0, None, true, true);
+        // the launch's `SaveInfo` (0x4D52EA)
         self.save();
         req
     }
@@ -1152,6 +1218,9 @@ impl CareerUi {
                     grid: ranks.map(|r| r[slot + 1] - 1),
                     personality: o.driver,
                     parts: o.parts.iter().filter_map(|id| self.tables.parts.iter().find(|p| p.id == *id).cloned()).collect(),
+                    // `.RACENUMBER` is the table's own field, not a draw (`car-model.md` §5.3,
+                    // `nfs_formats::career::TournamentOpponent::decal`, `0x4EBDA0` read 2026-09-27)
+                    decal: o.decal as i32,
                 })
             })
             .collect();
@@ -1189,6 +1258,9 @@ impl CareerUi {
             backwards = ev.backwards,
             car = car.model,
             opponents = opponents.len(),
+            // the table's own field (`TournamentOpponent::decal`, `+0x52`), not a draw —
+            // `car-model.md` §5.3, read 2026-09-27
+            decals = ?opponents.iter().map(|o| o.decal).collect::<Vec<_>>(),
             parts = parts.len(),
             "career event start"
         );
@@ -1256,7 +1328,10 @@ impl CareerUi {
     /// The car comes back from a race with the damage it took (`Career::record_damage`).
     pub fn park(&mut self, zones: [f32; 10]) {
         if let Some(i) = self.pending.as_ref().and_then(|p| p.garage_idx) {
+            let before = self.career.garage.get(i).map(|o| (o.damage, o.part_state.clone()));
             self.career.record_damage(&self.tables, i, zones);
+            let after = self.career.garage.get(i).map(|o| (o.damage, o.part_state.clone(), o.damage_pct));
+            tracing::info!(?before, ?after, "the car parked: 0x493CF0's fold and 0x4EDD40");
         }
     }
 
@@ -1271,6 +1346,10 @@ impl CareerUi {
     /// was a tournament race.
     pub fn abort(&mut self, zones: Option<[f32; 10]>) -> bool {
         let Some(p) = self.pending.take() else { return false };
+        if p.finale {
+            // an aborted type 10 goes back to `E` alone (0x4D3FF8): the offer is gone
+            self.victory_room = false;
+        }
         if p.mission.is_some() || p.finale {
             return false;
         }
@@ -1304,6 +1383,8 @@ impl CareerUi {
             return;
         }
         if p.finale {
+            // type 10's race end: `[E] tournament` (0x4D4B1A), won or lost — not offered again
+            self.victory_room = false;
             self.message = match self.career.record_finale(&self.tables, order) {
                 Some((true, car)) => format!(
                     "FINALE WON: {} IS YOURS",
@@ -1361,6 +1442,8 @@ impl CareerUi {
         // 0x505800 reads what 0x503AD0 left in `[0x691E81]`: cleared at 0x503B01, set at 0x503C69
         // when the era moved on
         self.race_flags.era_changed = o.era_advanced;
+        // …and 0x4D476F then lands on `[E, VictoryRoom] endofera` (text menu: the finale offer)
+        self.victory_room = o.era_advanced;
         self.save();
         // **The selected tournament `[0x691E6C]` moves only when one is completed** (rank ≤ 3 in
         // an era tournament): 0x503C76…0x503CA8 walks the records of the career's era, now the
@@ -1416,8 +1499,8 @@ impl CareerUi {
             0.04,
             [0.9, 0.9, 1.0, 1.0],
         );
-        if let Some(fin) = &self.career.finale
-            && let Some(t) = self.tables.tournament(fin.tournament)
+        if self.victory_room
+            && let Some(t) = self.career.finale_tournament(&self.tables)
         {
             let car = self
                 .tables
@@ -1872,6 +1955,74 @@ mod tests {
         assert!(ui.message.starts_with("RESULT: P1"));
         assert_eq!(Career::load(&tmp).unwrap(), ui.career);
         let _ = std::fs::remove_file(tmp);
+    }
+
+    /// `0x4EBDA0` reads a tournament/finale opponent's `.RACENUMBER` straight out of the table
+    /// (`TournamentOpponent::decal`, `+0x52` — `car-model.md` §5.3, read 2026-09-27): it is not
+    /// drawn, so `event_request` must carry the table's own value, in table order, not −1.
+    #[test]
+    fn tournament_opponent_decal_comes_from_the_table() {
+        let Ok(paths) = GamePaths::locate() else {
+            eprintln!("skipping: original game data not found");
+            return;
+        };
+        let mut ui = CareerUi::load(&paths).unwrap();
+        ui.career = Career::default();
+        // tournament 27 (`nfs5.trn` read directly): six of its seven opponents carry a plate
+        let t = ui.tables.tournaments.iter().find(|t| t.id == 27).cloned().expect("tournament 27 ships");
+        assert!(
+            t.opponents.iter().filter(|o| o.decal != -1).count() >= 6,
+            "the table itself: {:?}",
+            t.opponents.iter().map(|o| o.decal).collect::<Vec<_>>()
+        );
+        let car = ui.tables.car(t.opponents[0].car_id as u16).unwrap().clone();
+        let req = ui.event_request(car, &t, 0, None, false, false).expect("tournament 27's first event");
+        assert_eq!(req.opponents.len(), t.opponents.len(), "no opponent record was dropped");
+        for (o, table) in req.opponents.iter().zip(t.opponents.iter()) {
+            assert_eq!(o.decal, table.decal as i32, "opponent driver {}", table.driver);
+        }
+        assert!(req.opponents.iter().any(|o| o.decal != -1));
+    }
+
+    /// `0x4EC1A0` builds a mission opponent's car like a used-car-market car (`career.md` §10.5a,
+    /// `nfs_game::career::used_car_trim`): the decal is a draw, not fixed at −1, and it lands on
+    /// exactly what `used_car_trim` alone would give the same generator.
+    #[test]
+    fn mission_opponent_decal_is_drawn_not_fixed() {
+        let Ok(paths) = GamePaths::locate() else {
+            eprintln!("skipping: original game data not found");
+            return;
+        };
+        let ui = CareerUi::load(&paths).unwrap();
+        // mission "2m07" (`nfs5.fac` read directly) ships three opponents
+        let m = ui.tables.missions.iter().find(|m| m.code == "2m07").expect("mission 2m07 ships");
+        assert_eq!(m.opponents.len(), 3);
+        let mut seed = 3u32;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed >> 8
+        };
+        let mut saw_plate = false;
+        let mut expect = seed;
+        let mut expect_rand = move || {
+            expect ^= expect << 13;
+            expect ^= expect >> 17;
+            expect ^= expect << 5;
+            expect >> 8
+        };
+        for (per, car_id) in &m.opponents {
+            let car = ui.tables.car(*car_id as u16).unwrap();
+            let (want_set, want_trim) = nfs_game::career::used_car_trim(car.paint_sets.len(), car.interior_colours.len(), ui.tables.package_count, &mut expect_rand);
+            let o = ui.mission_opponent(*per, *car_id, &mut rand).expect("every listed opponent car resolves");
+            assert_eq!(o.paint, car.paint_sets.get(want_set as usize).map(|p| p.colours[0]).unwrap());
+            assert_eq!(o.decal, want_trim.decal as i32, "same generator, same draw");
+            if o.decal != -1 {
+                saw_plate = true;
+            }
+        }
+        assert!(saw_plate, "seed 3 over mission 2m07's three opponents never rolled a plate — pick another seed");
     }
 }
 

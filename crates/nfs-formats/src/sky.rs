@@ -445,23 +445,28 @@ mod tests {
 ///
 /// The one this type exposes is the colour array at **`+0xCE8`**, addressed by 0x459970 and
 /// 0x4599E0 as 60-byte records (`buf + 0xCE8 + 60·i`, a record counting as used when its first
-/// dword is non-zero). Each record is two colour **pairs**, one per weather region:
+/// dword is non-zero). Each record is two colour **groups**, picked by `[0x627F43] & 0x10`
+/// (0x459A82) — A for the main view, B for the rear-view mirror, whose pass sets that bit
+/// (0x468DA8); *(corrected 2026-09-27: read before as "one per weather region")*:
 ///
 /// ```text
-/// i32 used                 i32 gradient      f32 rgb_top[3]  f32 rgb_bottom[3]   (region A)
-/// i32 gradient             f32 rgb_top[3]    f32 rgb_bottom[3]                   (region B)
+/// i32 used                 i32 gradient      f32 rgb_top[3]  f32 rgb_bottom[3]   (group A)
+/// i32 gradient             f32 rgb_top[3]    f32 rgb_bottom[3]                   (group B)
 /// ```
 ///
 /// with the components on a 0..254 scale. Record 0 reads as the sky's own colour — black on the five
 /// Monaco circuits, sky blue on forest and skidpad, a warm 254/210/196 on coastal's sunset, and the
-/// only one with a real gradient is alps (128/128/144 over 75/75/144, `gradient = 1`). Records 1 and
-/// 2 carry two further colour pairs whose role is not established.
+/// only one with a real gradient is alps (128/128/144 over 75/75/144, `gradient = 1`). Group B is
+/// the mirror's: Monaco's dark red 31/0/0 → 39/0/0 where A is black, Coastal's peach at levels 1
+/// and 2 where A is mauve.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SkyColours {
     /// `gradient != 0`: the pair is a top-to-bottom ramp rather than one flat colour.
     pub gradient: [bool; 2],
-    /// `[region][0] = top, [region][1] = bottom`, each 0..1.
+    /// `[group][0] = top, [group][1] = bottom`, each 0..1 (the file's value / 254).
     pub rgb: [[[f32; 3]; 2]; 2],
+    /// The same floats as the file stores them, 0..254 — what 0x459A70 blends and `fistp`s.
+    pub raw: [[[f32; 3]; 2]; 2],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -571,6 +576,7 @@ impl SkyBin {
         };
         let f_at = |o: usize| -> f32 { data.get(o..o + 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0.0) / 254.0 };
         let version = u32_at(0)?;
+        let f_raw = |o: usize| -> f32 { data.get(o..o + 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0.0) };
         let mut colours = Vec::new();
         for i in 0..4 {
             let o = Self::COLOURS_AT + Self::RECORD * i;
@@ -579,12 +585,13 @@ impl SkyBin {
                 continue;
             }
             let rgb = |o: usize| [f_at(o), f_at(o + 4), f_at(o + 8)];
+            let raw = |o: usize| [f_raw(o), f_raw(o + 4), f_raw(o + 8)];
             colours.push(Some(SkyColours {
                 gradient: [u32_at(o + 4)? != 0, u32_at(o + 32)? != 0],
                 rgb: [[rgb(o + 8), rgb(o + 20)], [rgb(o + 36), rgb(o + 48)]],
+                raw: [[raw(o + 8), raw(o + 20)], [raw(o + 36), raw(o + 48)]],
             }));
         }
-        let f_raw = |o: usize| -> f32 { data.get(o..o + 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0.0) };
         let i_at = |o: usize| -> i32 { data.get(o..o + 4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(-1) };
         let mut segments = [SkySegment::default(); 16];
         for (i, s) in segments.iter_mut().enumerate() {
@@ -826,22 +833,28 @@ impl SkyBin {
         Some((Self::rgb(colour), density as f32))
     }
 
-    /// What the race clears the frame to — **0x459A70** on the record `0x459950` picks
-    /// ([`Self::colour_index`]), group A (`[0x627F43] & 0x10` is never set on a shipped track):
-    /// with the group's `gradient` flag set, the sky manager's track-B colour
-    /// ([`Self::track_b_colour`], 0x45D2B0); else `(1 − t) · top + t · bottom` with `t` track A's
-    /// value at the camera's slice (0x45CFC0 → 0x45A350, 0x459AC3…0x459B1E), each channel through
-    /// `fistp`. *(Until 2026-09-26 the port used the record's top colour alone, which on
-    /// `Autobahn` — and `alps`' records 1 and 2 — is the tool's pure-red placeholder behind a set
-    /// `gradient` flag: the sky showed red through the trees.)*
-    pub fn background_at(&self, detail: usize, slice: i32, lap_slices: i32) -> Option<[f32; 3]> {
+    /// What a race view clears to — **0x459A70** on the record `0x459950` picks
+    /// ([`Self::colour_index`]), its 28-byte group `group` — `[0x627F43] & 0x10` (0x459A76…0x459A94),
+    /// bit 4 of slot 0's flags, which the rear-view mirror's pass 0x468CA0 sets around its draw
+    /// (0x468DA8, cleared at 0x468E1F): group A (0) for the main view (0x468C63), B (1) for the
+    /// mirror (0x468DE8). With the group's `gradient` flag set, the sky manager's track-B colour
+    /// ([`Self::track_b_colour`], 0x45D2B0); else per channel `fistp((1 − t) · top + t · bottom)`
+    /// with `t` track A's value at `slice` (0x45CFC0 → 0x45A350, 0x459AC3…0x459B3B; `1 − t` and
+    /// each sum stored as floats first), the byte of that, `0xFF` on top. *(Until 2026-09-26 the
+    /// port used the record's top colour alone, which on `Autobahn` — and `alps`' records 1 and 2 —
+    /// is the tool's pure-red placeholder behind a set `gradient` flag: the sky showed red through
+    /// the trees. Until 2026-09-27 it read group A for the mirror too — the notes had the bit
+    /// "never set" — and scaled the byte by 1/254 where the colour is the byte over 255.)*
+    pub fn background_at(&self, detail: usize, group: usize, slice: i32, lap_slices: i32) -> Option<[f32; 3]> {
         let c = self.colours.get(self.colour_index(detail)).and_then(|c| *c)?;
-        if c.gradient[0] {
+        let g = group.min(1);
+        if c.gradient[g] {
             return Some(self.track_b_colour(slice, lap_slices));
         }
         let t = self.sample_track_a(slice, lap_slices).unwrap_or(0.0);
-        let [top, bot] = c.rgb[0];
-        let ch = |k: usize| (((1.0 - t) * top[k] * 254.0 + t * bot[k] * 254.0).round() / 254.0).clamp(0.0, 1.0);
+        let s = 1.0 - t;
+        let [top, bot] = c.raw[g];
+        let ch = |k: usize| ((((s as f64 * top[k] as f64 + t as f64 * bot[k] as f64) as f32).round_ties_even() as i32 & 0xFF) as f32) / 255.0;
         Some([ch(0), ch(1), ch(2)])
     }
 }
@@ -900,9 +913,9 @@ mod bin_tests {
         put(&mut d, SkyBin::TRACK_B_AT + 96, u32::MAX);
         put(&mut d, SkyBin::TRACK_C_AT, u32::MAX);
         let bin = SkyBin::parse(&d).unwrap();
-        let c0 = bin.background_at(0, 0, 400).unwrap();
+        let c0 = bin.background_at(0, 0, 0, 400).unwrap();
         assert!((c0[0] - 0x41 as f32 / 255.0).abs() < 1e-6 && (c0[2] - 0x6F as f32 / 255.0).abs() < 1e-6, "key 0's colour, not the red: {c0:?}");
-        let c50 = bin.background_at(0, 50, 400).unwrap();
+        let c50 = bin.background_at(0, 0, 50, 400).unwrap();
         assert!((c50[0] - (0x41 / 2) as f32 / 255.0).abs() < 1.5 / 255.0, "half way to black: {c50:?}");
     }
 
