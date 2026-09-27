@@ -395,8 +395,19 @@ const WORD_UNIT: u16 = 0x1000;
 /// * the volume `(int)lvl · f0 · g` stored as an f32, `fistp`, then `min(·, 0x7F)` and `≤ 0 → 0`
 ///   (0x4AA807…0x4AA82B).
 ///
-/// APPROXIMATION: the x87's 64-bit intermediate precision is taken as f64 (the f32 stores, which
-/// round far coarser, are kept).
+/// APPROXIMATION: the x87's intermediate precision is taken as f64 (the f32 stores, which round far
+/// coarser, are kept). Narrowed 2026-09-28 (`career.md` §11.4a, `RE/tools/fpucw.py`): every real
+/// `fldcw`/`fnstcw` in `.text` was surveyed (59 sites; ~680 more are IAT/global address bytes
+/// mis-decoded, not instructions) and none is in this file's own code, `sfx.rs`'s callers, or the
+/// audio library 0x596B60…0x59D350 at all — nothing here ever sets or restores precision itself.
+/// What remains open is only the ambient word the process starts under and what DirectX 7's own
+/// runtime (not in the shipped files) leaves it at, unchanged since before this survey.
+///
+/// **Measured 2026-09-28** (`career.md` §11.4c): nine `gdb`-attach samples of the live process
+/// on a Debian test machine, under both `dx7z.dll` and the repack's default `opengl3` driver,
+/// all read control word `0x027F` — PC = 53-bit (double), matching the `f64` reading above. Not
+/// promoted to matched: wine's own driver stack, not Microsoft's DX7 on Windows, and no sample
+/// was inside a live tick (the front end could not be driven to a race in the time available).
 pub fn turbo_terms(boost: f32, throttle: u8, rpm: f32, redline: f32, lvl: i32, pitch_base: i32) -> (i32, i32) {
     let (b, r, dbs) = (boost as f64, redline as f64, rpm as f64);
     let f0 = throttle as f64 * b * (1.0f32 / 127.5) as f64;
@@ -681,7 +692,7 @@ impl CollisionSfx {
         self.gate = (level as i32) >> 4;
         let vol = self.atten.clamp(0, 127);
         if let Some(clip) = self.clip(slot) {
-            let id = out.play_panned_sel_untabled(clip, self.one_shot_volume(slot, vol), 1.0, self.one_shot_pan, false, level as i32 as u8);
+            let id = out.play_word_sel_untabled(clip, self.one_shot_volume(slot, vol), crate::resample::PITCH_UNIT, 0x40, self.one_shot_pan, false, level as i32 as u8);
             // the aux byte is taken only for slots from 0x30 (0x4A9A56 `jl`), which every
             // collision group is
             if slot >= 0x30 {
@@ -797,7 +808,7 @@ impl CollisionSfx {
     /// `Voice_play` call, so not in the pause's table (`AudioOutput::silence_voices`).
     pub fn trigger_chime(&mut self, out: &AudioOutput) {
         if let Some(clip) = self.clip(2) {
-            out.play_untabled(clip, self.sfx_volume(0x7F), 1.0, false);
+            out.play_word_untabled(clip, self.sfx_volume(0x7F), crate::resample::PITCH_UNIT, 0x40, 0, false);
         }
     }
 
@@ -805,7 +816,7 @@ impl CollisionSfx {
     /// direct `Bank_playOneShot` path as [`trigger_chime`](Self::trigger_chime), not in the table.
     pub fn wrong_way_cue(&mut self, out: &AudioOutput) {
         if let Some(clip) = self.clip(1) {
-            out.play_untabled(clip, self.sfx_volume(0x28), 1.0, false);
+            out.play_word_untabled(clip, self.sfx_volume(0x28), crate::resample::PITCH_UNIT, 0x40, 0, false);
         }
     }
 
@@ -856,7 +867,7 @@ impl CollisionSfx {
     /// `Bank_playOneShot` path as [`trigger_chime`](Self::trigger_chime): not in the pause's table.
     pub fn pylon_hit(&mut self, out: &AudioOutput) {
         if let Some(clip) = self.clip(0) {
-            out.play_untabled(clip, self.sfx_volume(0x7F), 1.0, false);
+            out.play_word_untabled(clip, self.sfx_volume(0x7F), crate::resample::PITCH_UNIT, 0x40, 0, false);
         }
     }
 
@@ -1076,6 +1087,10 @@ impl CollisionSfx {
     /// volume 0, and its pitch was the float `(2.5 · rpm/redline + 0.5) · doppler` rounded to the
     /// word — where the original rounds the f32 to an int (`fistp`) before the `>> 4`.)*
     /// APPROXIMATION: a zero redline (x87: an infinite or indefinite result) releases the voice.
+    /// (2026-09-28, `career.md` §11.4c: the nine measured control words all have every exception
+    /// mask bit set — IM DM ZM OM UM PM — so a divide-by-zero here would not trap in the
+    /// original either, it would produce ±infinity; consistent with, but not full evidence for,
+    /// this function's own explicit `redline <= 0.0` guard standing in for that.)
     #[allow(clippy::too_many_arguments)]
     pub fn turbo(&mut self, out: &AudioOutput, boost: f32, throttle: u8, rpm: f32, redline: f32, base: i32, gain: i32, pitch_base: i32, pan: u16) {
         let master = (self.engine_level, self.spl.turbo());

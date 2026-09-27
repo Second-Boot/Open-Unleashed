@@ -66,7 +66,7 @@ impl FeSfx {
         }
         let v = level(self.trim, sfx_level);
         if let Some(c) = self.clip(slot) {
-            out.play_untabled(c, v as f32 / 127.0, 1.0, false);
+            out.play_word_untabled(c, v as f32 / 127.0, crate::resample::PITCH_UNIT, 0x40, 0, false);
         }
     }
 }

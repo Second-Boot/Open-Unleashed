@@ -2360,6 +2360,11 @@ pub struct Police {
     /// order ([`crate::race_order::RaceOrder`]); shorter than `others` (the unit tests) and the lane
     /// pass sorts the cars itself instead.
     pub other_places: Vec<usize>,
+    /// World positions of each car the caller passes as `others`, in the same order — `0x40E860`'s
+    /// fine step needs `a+0x330`/`b+0x330` (`traffic.md` §34.6), which a `LaneCar` does not carry.
+    /// Shorter than `others` (the unit tests) falls back to the slice-only gap for the missing tail,
+    /// same as [`crate::traffic::TrafficSet::other_positions`].
+    pub other_positions: Vec<Vec3>,
     /// `0x5E8B88[]` restricted to the racers: ascending by `car+0xAF8 − car+0xB20`, stable across
     /// ticks (`0x417710`'s first sort). The purgatory dtor 0x40DFB0 walks it from the top.
     race_order: Vec<usize>,
@@ -2378,7 +2383,7 @@ pub struct Police {
 
 impl Police {
     pub fn new(file: CopFile, cars: Vec<CopCar>, skill: u8, one_way: bool) -> Self {
-        Self { manager: CopManager::new(file), cars, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: CopPhysics::default(), violation: Violation::None, route_dir: 1.0, skill, one_way, wanted: false, weather: false, racers: Vec::new(), other_places: Vec::new(), race_order: Vec::new(), spawn_order: Vec::new(), budget: duty_budget(1, false), slot_base: 0, roster: [None; 7] }
+        Self { manager: CopManager::new(file), cars, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: CopPhysics::default(), violation: Violation::None, route_dir: 1.0, skill, one_way, wanted: false, weather: false, racers: Vec::new(), other_places: Vec::new(), other_positions: Vec::new(), race_order: Vec::new(), spawn_order: Vec::new(), budget: duty_budget(1, false), slot_base: 0, roster: [None; 7] }
     }
 
     /// This tick's racers, and `0x417710` (called at 0x4179BF at the end of the per-tick car pass):
@@ -3517,7 +3522,19 @@ impl Police {
         };
         let mut sc = LaneScratch::default();
         let mut scan = c.scan;
-        sc.find_blockers_placed(table, &me, &cars, &PERSONALITIES[0], None, placed.then_some((c.place, places.as_slice())));
+        // world positions in the order of `cars` for 0x40E860's fine step (`traffic.md` §34.6): an
+        // `others` entry the caller gave no position for falls back to the slice gap (NaN is never
+        // within ±12 m of anything the fine step would accept, so it is filtered out below), same as
+        // `TrafficSet::ai`'s `positions`. *(Until now `police.rs` called `find_blockers_placed` with
+        // `None`, i.e. every lane-blocker gap was the coarse 6 m-per-slice one, §34.6's gap left for
+        // this module.)*
+        let positions: Vec<Vec3> = (0..others.len())
+            .map(|k| self.other_positions.get(k).copied().unwrap_or(Vec3::NAN))
+            .chain(self.cars.iter().enumerate().filter(|(j, o)| *j != i && o.active).map(|(_, o)| o.position))
+            .collect();
+        let fine_ok = positions.iter().all(|p| p.is_finite());
+        let me_pos = c.position;
+        sc.find_blockers_placed(table, &me, &cars, &PERSONALITIES[0], fine_ok.then_some((me_pos, positions.as_slice())), placed.then_some((c.place, places.as_slice())));
         sc.score_own_side(&me, self.one_way, true);
         // §27.10 `0x40DA00`: +15 to whichever side the target is on (`0x401380` × 3), but only when
         // the lane corridor between the two cars is broken at the target's slice and whole at the

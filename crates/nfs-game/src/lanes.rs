@@ -238,14 +238,27 @@ impl LaneScratch {
         self.gap = [0.0; 3];
         let masks = [lane_bit(me.lane - 1), lane_bit(me.lane), lane_bit(me.lane + 1)];
         let lanes = [me.lane - 1, me.lane, me.lane + 1];
-        // the race-order array without this car, sorted stably by the lap place of the slice; this
-        // car sits before the others on its own slice (which the slice gap alone skips: gap 0).
-        // With positions (the traffic's pass) the cars of one slice are ordered by how far along
-        // the slice they are: their keys are equal there, and the stable sort keeps the order they
-        // came in — a car further along its slice entered it earlier, travelling either way, and a
-        // car entering from below bubbles up only to the bottom of the equal run, one from above
-        // down only to its top. APPROXIMATION of that history: two cars that pass each other inside
-        // a slice swap here and not in the original (audit 2026-09-26, `traffic.md` §34.11).
+        // Read 2026-09-27 (`traffic.md` §34.11): **the real
+        // walk already carries the original's within-slice history and this branch is not it.**
+        // `places` — [`crate::race_order::RaceOrder`], the previous even tick's `0x5E8B88` as
+        // `0x417710`'s stable bubble sort (equal keys keep the order the last change of lead left
+        // them in) — is what `0x401FA2` reads, and the `Some(places)` arm below sorts on it alone;
+        // `positions` never enters that arm's order (only `gap_fine`'s distance does). So whenever
+        // `places` is supplied — every tick once the race has run its first even-tick resort, both
+        // `traffic.rs` and `police.rs`'s real callers — the walk already is `0x5E8B88`'s history,
+        // swaps and all; a unit test pins it
+        // (`with_places_the_within_slice_order_is_the_race_orders_history_not_the_current_position`).
+        //
+        // What follows (the race-order array *without* this car, sorted stably by the lap place of
+        // the slice; this car sits before the others on its own slice, which the slice gap alone
+        // skips: gap 0) is the `None`-`places` **fallback** only — used before that first resort
+        // and by the unit tests below, not by a running race. There, with positions, the cars of
+        // one slice are ordered by how far along it they are: their keys are equal, and the stable
+        // sort keeps the order they came in — a car further along its slice entered it earlier,
+        // travelling either way, and a car entering from below bubbles up only to the bottom of the
+        // equal run, one from above down only to its top. This fallback does not carry that
+        // history: two cars that pass each other inside a slice swap its own order here, where the
+        // original's `0x5E8B88` would not — a real, narrow gap, but not one the running race meets.
         let along = |slice: usize, p: glam::Vec3| {
             let sl = &table.slices[slice];
             (p - sl.centre).dot(sl.forward.normalize_or_zero())
@@ -778,6 +791,35 @@ mod tests {
         assert_eq!(gap_fine(&t, 13, 10, Some((other, mine))), 18.0);
         // slice 12's axis is turned 1.8° from slice 10's on this ring
         assert!((gap_fine(&t, 12, 10, Some((sl.centre + f * 11.0, mine))) - 11.0).abs() < 1e-2);
+    }
+
+    /// The real walk (0x401FA2) reads `car+0x528`, the previous even tick's `0x417710` sort —
+    /// [`crate::race_order::RaceOrder`], which keeps each car's history (a stable sort: equal keys
+    /// keep the order the last change of lead left them in, `race_order.rs`). Two cars sharing a
+    /// slice are met in **that** order, not by their position along the slice right now: the
+    /// `along`-projection tie-break at `find_blockers_placed`'s top (the doc above this function)
+    /// is the `None`-`places` fallback only — used before the first even-tick resort (or the unit
+    /// tests), never once `places` is supplied. So a pass inside a slice does not swap the walk
+    /// order when the real array is given, matching the original; `traffic.md` §34.11's remaining
+    /// APPROXIMATION note is for that fallback alone.
+    #[test]
+    fn with_places_the_within_slice_order_is_the_race_orders_history_not_the_current_position() {
+        let t = ring(400, 2, 2);
+        let fwd = me(8, 6.0);
+        let sl = t.slices[15];
+        let f = sl.forward.normalize();
+        let a = LaneCar { slice: 15, lane: 8, lane_mask: lane_bit(8), speed: 4.0, speed_est: 4.0, half_len: 2.1, lateral: 6.0, half_span: 0.9, is_human: false, is_racer: false };
+        let b = LaneCar { slice: 15, ..a };
+        // by position alone `a` sits closer to the slice's start than `b`: walking forward, the
+        // sorted-by-`along` fallback (no places) meets `a` first
+        let ps = [sl.centre + f * 1.0, sl.centre + f * 4.0];
+        let mut s = LaneScratch::default();
+        s.find_blockers_at(&t, &fwd, &[a, b], &PERSONALITIES[0], Some((t.slices[8].centre, &ps)));
+        assert_eq!(s.blocker[1], Some(0), "without places: position order, a (closer along) met first");
+        // with places giving `b` the earlier place — the race order's history — it is met first
+        // instead, although `a` is still the one closer along by position this tick
+        s.find_blockers_placed(&t, &fwd, &[a, b], &PERSONALITIES[0], Some((t.slices[8].centre, &ps)), Some((0, &[2, 1])));
+        assert_eq!(s.blocker[1], Some(1), "with places: the race order's history wins over position");
     }
 
     #[test]

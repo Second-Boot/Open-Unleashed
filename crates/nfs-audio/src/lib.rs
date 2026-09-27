@@ -20,7 +20,7 @@ pub mod sfx;
 pub mod slots;
 pub mod speech;
 
-pub use mixer::{AudioOutput, VoiceId};
+pub use mixer::{AudioOutput, StopHandle, VoiceId};
 
 /// The distance attenuations every audio pass builds the same way: the listener distance in 16.16
 /// (`ftol(|p − 0x655E50| · 65536)`, 0x5A0F98 truncating), `fixdiv(num, d16 + add)` 0x4A6160 — a

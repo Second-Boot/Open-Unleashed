@@ -36,6 +36,21 @@ pub enum CrpKind {
     Other([u8; 4]),
 }
 
+/// The `W*Bundle` that consumes an article out of the shared `Arti` pool `WTrack::load` (`0x4879D0`)
+/// builds — see [`Crp::bundle_of`]. `WSceneBundle` and `WLineBundle` are not partition members
+/// (see that method's doc comment) so are not variants here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleKind {
+    /// `WInstanceBundle::Load` (`0x4781A0`).
+    Instance,
+    /// `WAnimBundle::Load` (`0x4777F0`).
+    Anim,
+    /// `WMidGroundBundle::Load` (`0x47CCE0`).
+    MidGround,
+    /// `WStaticBundle::Load` (`0x483690`), the catch-all.
+    Static,
+}
+
 /// One 16-byte table entry, with its own table index (needed to resolve relative offsets).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CrpEntry {
@@ -315,6 +330,82 @@ impl Crp {
     /// Embedded SHPI blobs (`sf` entries), cars only.
     pub fn embedded_texture_files<'a>(&self, data: &'a [u8]) -> Result<Vec<&'a [u8]>, FormatError> {
         self.material_entries.iter().filter(|e| e.is_part(b"sf")).map(|e| self.entry_data(data, e)).collect()
+    }
+
+    /// Which `W*Bundle` claims (and, for every variant here, **consumes**) this article when
+    /// `WTrack::load`'s single builder (`0x4879D0`, one caller `0x487884`) constructs the six
+    /// bundles over the shared `Arti` array, in their fixed order (`RE/RENDERING.md` "Bundle
+    /// order, read 2026-09-28"): `WSceneBundle` (`0x482970`) → `WInstanceBundle` (`0x4781A0`) →
+    /// `WAnimBundle` (`0x4777F0`) → `WMidGroundBundle` (`0x47CCE0`) → `WStaticBundle` (`0x483690`)
+    /// → `WLineBundle` (no-op, not article-sourced — `RE/notes/loaders.md` §2.4). Membership is
+    /// order-sensitive: every bundle below zeroes the shared slot it claims before the next one
+    /// runs, so each article is claimed by exactly one.
+    ///
+    /// - **`WInstanceBundle::Load`** (`0x4781A0`): claims (and **consumes** — correcting
+    ///   `RE/notes/loaders.md`'s "`WSceneBundle` and `WInstanceBundle` do not [consume]", read
+    ///   2026-09-28) every article with a `'tr'#0` part: `call 0x59F220` at `0x47820c` (count
+    ///   phase) / `0x478422` (fill phase), `test eax, eax` skips when absent. This is
+    ///   unconditional — `Base.flags & 0x8000` (`Base::is_library`) only decides which of
+    ///   `WInstanceBundle`'s own *two* internal arrays a survivor is copied into (its generic
+    ///   `+0x18`/`+0x1c` pair when clear, its auxiliary `+0x34` table when set); **both** branches
+    ///   fall through to the same zeroing write, `0x478598`'s `mov dword ptr [eax], 0` at
+    ///   `0x47859e`. So this predicate alone decides consumption; equivalent to
+    ///   `art.find(b"tr", 0).is_some()`.
+    /// - **`WAnimBundle::Load`** (`0x4777F0`): of what `WInstanceBundle` left behind (so, in
+    ///   practice, never an article with `'tr'#0`), claims one with an `'Anqt'` level part:
+    ///   `call 0x59F7C0` at `0x47781b`, compared against the article's own part-run end sentinel
+    ///   (`Entry_base` `0x59F870`) at `0x47783e`/`0x477840`. Equivalent to
+    ///   `art.level(b"Anqt").is_some()`. Consumes.
+    /// - **`WMidGroundBundle::Load`** (`0x47CCE0`): of what's left (no `'tr'#0`, no `'Anqt'`),
+    ///   claims an article whose `Base` record's flags dword (`Base::flags`, `Base+0`) has bit
+    ///   `0x2000` or `0x4000` set — `test ch, 0x60` at `0x47cd67` (count) / `0x47ce37` (fill),
+    ///   `ch` being the byte at `Base+1` so `0x60` there is `0x6000` in the dword. This **corrects**
+    ///   `RE/notes/loaders.md`'s MEDIUM guess of "`+0x44/+0x45/+0x46` type/subtype/flag" — that
+    ///   trio is a different, unrelated field (`R3DCarLOD::draw`'s own sort key). Consumes; the bit
+    ///   that matched also tags the render-tree ref's flags word (`0x2000` → `0x400000`, `0x4000`
+    ///   → `0x20`, `0x47ce72`…`0x47ce8e`) — already documented in RENDERING.md's "The flags"
+    ///   paragraph, now traced to this exact test.
+    /// - **`WStaticBundle::Load`** (`0x483690`): the catch-all. Claims every remaining non-null
+    ///   slot with **no field test at all** — `0x4836ac`: `cmp dword ptr [eax], esi(0)`, nothing
+    ///   else gates it. Consumes.
+    ///
+    /// **Not a partition member: `WSceneBundle`.** Its own claim gate (`'tr'#0` present *and*
+    /// `Base.is_library()`, `0x4829dc`/`0x482a0c`) does not consume — so an article can be both
+    /// `WSceneBundle`-tagged and `Instance`-consumed at once, which is why `Scene` is not a
+    /// variant of [`BundleKind`]. See [`Crp::is_scene_member`] for that gate. Deeper GAP found this
+    /// session, not resolved: `WSceneBundle`'s own generic `+0x18`/`+0x1c` pair — what `0x4750B0`'s
+    /// tree-fill walk actually reads per bundle — is populated at `0x482c73` from a capped (`≤64`)
+    /// table sized by a global count (`0x46d9c0`), not from matched articles at all. So
+    /// `WSceneBundle`'s real render-tree contribution isn't expressible as a per-article predicate
+    /// with what's read so far; `is_scene_member`'s gate governs its separate `+0x34` auxiliary
+    /// transform table only. `WLineBundle` remains out of scope (not article-sourced, zero items).
+    pub fn bundle_of(&self, data: &[u8], art: &Article) -> Result<BundleKind, FormatError> {
+        if art.find(b"tr", 0).is_some() {
+            return Ok(BundleKind::Instance);
+        }
+        if art.level(b"Anqt").is_some() {
+            return Ok(BundleKind::Anim);
+        }
+        let midground = match art.level(b"Base") {
+            Some(e) => Base::parse(self.entry_data(data, e)?, e.data_offset())?.flags & 0x6000 != 0,
+            None => false,
+        };
+        Ok(if midground { BundleKind::MidGround } else { BundleKind::Static })
+    }
+
+    /// `WSceneBundle::Load`'s (`0x482970`) own claim gate: `'tr'#0` present (`call 0x59F220` at
+    /// `0x4829dc`, `test eax, eax`) **and** `Base.is_library()` (`Base.flags & 0x8000`, `test
+    /// ch, 0x80` at `0x482a0c`). This bundle does not consume, so it is orthogonal to
+    /// [`Crp::bundle_of`]'s partition — see that method's doc comment for the gap this predicate
+    /// does and does not cover.
+    pub fn is_scene_member(&self, data: &[u8], art: &Article) -> Result<bool, FormatError> {
+        if art.find(b"tr", 0).is_none() {
+            return Ok(false);
+        }
+        Ok(match art.level(b"Base") {
+            Some(e) => Base::parse(self.entry_data(data, e)?, e.data_offset())?.flags & 0x8000 != 0,
+            None => false,
+        })
     }
 
     /// An article's `Anim` / `Anqt` animation track, if it has one (`RE/notes/crp-geometry.md` §7).

@@ -6,6 +6,8 @@
 //! 0x49AEC0 over `[obj+0x38]` — so this module does its own segment lookup over the same `.edg`
 //! data the game caches.
 
+use crate::quadtree::Entry;
+use crate::track_tree::{TrackTree, TreeItem};
 use glam::{Vec2, Vec3};
 
 #[derive(Debug, Clone, Copy)]
@@ -28,6 +30,26 @@ pub struct Wall {
     /// Wall material class 0..5 = metal, wood, snow, ice, earth, rock (`WallImpulse` 0x494000
     /// byte tables 0x49442C / 0x4943BC over the `.edg` word 0x10..0x60; other words → rock).
     pub class: u8,
+}
+
+/// The quadtree accept test's two vtable calls (`0x484320`, `RE/RENDERING.md` "The accept test,
+/// read 2026-09-28") for a `.edg` edge object (`WTreeElem_Edge`, vtable `0x5B484C`), read to the
+/// instruction 2026-09-28: slot 1 (`0x4852B0`) is `0.5·(p1 + p2)` per axis, and slot 2 (`0x485340`)
+/// is the componentwise xz min/max of the same two endpoints — both functions read only offsets
+/// `+0` (x) and `+8` (z) of each 16-byte-stride endpoint, `y` (`+4`) untouched, exactly like the
+/// patch getters (`crate::collision`) and the accept test itself. [`Wall::a`]/[`Wall::b`] are
+/// already the edge's two xz endpoints (the original's `p1`/`p2`), so no new field is needed.
+impl Entry for Wall {
+    fn centroid(&self) -> (f32, f32) {
+        let m = (self.a + self.b) * 0.5;
+        (m.x, m.y)
+    }
+
+    fn extent(&self) -> ((f32, f32), (f32, f32)) {
+        let min = self.a.min(self.b);
+        let max = self.a.max(self.b);
+        ((min.x, min.y), (max.x, max.y))
+    }
 }
 
 /// `.edg` wall word → material class (tables 0x49442C / 0x4943BC, CONFIRMED from the bytes;
@@ -106,6 +128,12 @@ impl WallSet {
         self.walls.is_empty()
     }
 
+    /// The `.edg` segments in file order (`insertAll(A)`'s own order, plus any `extra_walls` the
+    /// caller appended after) — what `nfs_game::world` hands to [`crate::track_tree::TrackTree`].
+    pub fn walls(&self) -> &[Wall] {
+        &self.walls
+    }
+
     /// Nearest wall within `radius` of point `p` (xz) whose height span contains `y`.
     /// Returns (penetration normal pointing away from the wall, penetration depth).
     pub fn nearest(&self, p: Vec3, radius: f32) -> Option<(Vec2, f32)> {
@@ -149,49 +177,50 @@ impl WallSet {
     /// both parameters in `[0, 1]`), the one whose endpoint-mid height is nearest the segment's mid
     /// height `(p0.y + p1.y)/2` (0x474185…0x4741BF). Returns (edge normal `normalize(−d.z, 0, d.x)`,
     /// projection of `p1` onto the edge line (0x489F10), material class).
-    pub fn segment_hit(&self, p0: Vec3, p1: Vec3) -> Option<(Vec2, Vec2, u8)> {
+    ///
+    /// `candidates` is the caller's own edge order — [`crate::vehicle::Vehicle::collide_walls`]
+    /// hands it the [`TrackTree`]'s `query_segment(p0, p1)`, filtered to [`TreeItem::Wall`]
+    /// indices, exactly the order `0x4848B0`'s descent visits them in. A tie in height (equal
+    /// `key`, the `<` below is strict) now goes to whichever candidate came **first in that
+    /// order** — `0x474191…0x47419D`'s own `fcomp`/`test ah,1`, matching the original instead of
+    /// this port's former `t`-along-the-segment tie-break (an unread guess, corrected
+    /// 2026-09-28 — see `RE/RENDERING.md` "The tree, built").
+    pub fn segment_hit(&self, p0: Vec3, p1: Vec3, candidates: impl IntoIterator<Item = usize>) -> Option<(Vec2, Vec2, u8)> {
         if self.walls.is_empty() {
             return None;
         }
         let (a, b) = (Vec2::new(p0.x, p0.z), Vec2::new(p1.x, p1.z));
-        let idx = |v: Vec2| ((((v.x - self.min.x) / self.cell).floor().max(0.0) as usize).min(self.nx - 1), (((v.y - self.min.y) / self.cell).floor().max(0.0) as usize).min(self.nz - 1));
-        let (x0, z0) = idx(a.min(b));
-        let (x1, z1) = idx(a.max(b));
-        let mut best: Option<(f32, f32, Vec2, Vec2, u8)> = None;
-        for z in z0..=z1 {
-            for x in x0..=x1 {
-                for &wi in &self.cells[z * self.nx + x] {
-                    let w = &self.walls[wi as usize];
-                    let d = w.b - w.a;
-                    let r = b - a;
-                    let denom = r.x * d.y - r.y * d.x;
-                    if denom.abs() < 1e-8 {
-                        continue;
-                    }
-                    let s = a - w.a;
-                    let t = (s.y * d.x - s.x * d.y) / denom; // along the motion segment
-                    let u = (s.y * r.x - s.x * r.y) / denom; // along the wall
-                    if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
-                        // 0x4740D0 keeps the crossed edge nearest **in height** to the segment's
-                        // middle (0x474191…0x47419D; `p1.y` alone until 2026-09-26); ties go to
-                        // the one crossed first (APPROXIMATION: the original keeps the first in
-                        // its quadtree order, `fcom`/`test ah,1` a strict `<`)
-                        let key = ((w.y_mid - (p0.y + p1.y) * 0.5).abs(), t);
-                        if best.map(|b| key < (b.0, b.1)).unwrap_or(true) {
-                            let n = Vec2::new(-d.y, d.x).normalize_or_zero();
-                            // 0x489F10 projects onto the edge's infinite **line** — `t = (p − e0)·d /
-                            // d·d` with no clamp (0x489F43…0x489F84) — so near a joint the push stays
-                            // perpendicular to the wall. The port clamped `t` to the segment until
-                            // 2026-09-26, which there turned the push along the wall and let a car
-                            // scraping it at speed work through the wall line (monaco5, skidpad)
-                            let proj = w.a + d * ((b - w.a).dot(d) / d.length_squared());
-                            best = Some((key.0, t, n, proj, w.class));
-                        }
-                    }
+        let mut best: Option<(f32, Vec2, Vec2, u8)> = None;
+        for wi in candidates {
+            let w = &self.walls[wi];
+            let d = w.b - w.a;
+            let r = b - a;
+            let denom = r.x * d.y - r.y * d.x;
+            if denom.abs() < 1e-8 {
+                continue;
+            }
+            let s = a - w.a;
+            let t = (s.y * d.x - s.x * d.y) / denom; // along the motion segment
+            let u = (s.y * r.x - s.x * r.y) / denom; // along the wall
+            if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
+                // 0x4740D0 keeps the crossed edge nearest **in height** to the segment's middle
+                // (0x474191…0x47419D; `p1.y` alone until 2026-09-26); a tie now goes to the first
+                // candidate in `candidates`' own order (the strict `<` below never replaces an
+                // equal-key `best`).
+                let key = (w.y_mid - (p0.y + p1.y) * 0.5).abs();
+                if best.as_ref().map(|b| key < b.0).unwrap_or(true) {
+                    let n = Vec2::new(-d.y, d.x).normalize_or_zero();
+                    // 0x489F10 projects onto the edge's infinite **line** — `t = (p − e0)·d /
+                    // d·d` with no clamp (0x489F43…0x489F84) — so near a joint the push stays
+                    // perpendicular to the wall. The port clamped `t` to the segment until
+                    // 2026-09-26, which there turned the push along the wall and let a car
+                    // scraping it at speed work through the wall line (monaco5, skidpad)
+                    let proj = w.a + d * ((b - w.a).dot(d) / d.length_squared());
+                    best = Some((key, n, proj, w.class));
                 }
             }
         }
-        best.map(|(_, _, n, q, c)| (n, q, c))
+        best.map(|(_, n, q, c)| (n, q, c))
     }
 }
 
@@ -217,9 +246,16 @@ impl WallSet {
     /// crossing plus `n`, its height `y₀` (0x46494A…0x464951). This keeps the eye off a wall it is
     /// already standing beside. Returns whether either pass moved the eye.
     ///
-    /// APPROXIMATION: the original walks the edges in its quadtree's cell order and lists an edge
-    /// once per leaf it lies in; the port walks its own grid, each edge once.
-    pub fn camera_push(&self, eye: &mut Vec3, car: Vec3, ground: f32, any_height: bool) -> bool {
+    /// Wired to the real tree 2026-09-28 (`RE/RENDERING.md` "The tree, built"): `tree` is the
+    /// track's own [`TrackTree`], `insertAll(C)`-then-`insertAll(A)`-ordered; both passes below
+    /// take their candidate edges from `tree.query_segment(...)`, in the query's own leaf-then-
+    /// insertion order (`0x4848B0`), each list taken **once**, before either pass's loop starts —
+    /// same as the original: an edge lying in more than one leaf the segment's box touches is
+    /// listed once per leaf (`0x473E00`/`0x473BA0`), so it can move the eye more than once, which
+    /// this port used to avoid with its own deduplicating grid (`RE/RENDERING.md`'s APPROXIMATION,
+    /// now settled — the two passes' own doc above already describes what happens when a wall
+    /// moves the eye more than once, and it happens in the original too).
+    pub fn camera_push(&self, eye: &mut Vec3, car: Vec3, ground: f32, any_height: bool, tree: &TrackTree) -> bool {
         if self.walls.is_empty() {
             return false;
         }
@@ -244,9 +280,14 @@ impl WallSet {
             let e = e / e.length();
             Vec3::new(-e.z, 0.0, e.x)
         };
+        let wall_items = |it: TreeItem| match it {
+            TreeItem::Wall(i) => Some(i),
+            _ => None,
+        };
         let mut moved = false;
-        for wi in self.cells_over(Vec2::new(eye.x, eye.z), Vec2::new(car.x, car.z)) {
-            let w = &self.walls[wi as usize];
+        let segment_edges: Vec<usize> = tree.query_segment((eye.x, eye.z), (car.x, car.z)).filter_map(wall_items).collect();
+        for wi in segment_edges {
+            let w = &self.walls[wi];
             let Some(u) = cross(*eye, car, w) else { continue };
             if gated(w) {
                 continue;
@@ -261,13 +302,13 @@ impl WallSet {
         }
         // the second pass: 0x473BA0(eye, 1.0), the list taken once at the eye on entry
         let q = Vec2::new(eye.x, eye.z);
-        let near: Vec<u32> = self
-            .cells_over(q - Vec2::ONE, q + Vec2::ONE)
-            .into_iter()
-            .filter(|&wi| circle_cross(&self.walls[wi as usize], q, 1.0))
+        let near: Vec<usize> = tree
+            .query_segment((q.x - 1.0, q.y - 1.0), (q.x + 1.0, q.y + 1.0))
+            .filter_map(wall_items)
+            .filter(|&wi| circle_cross(&self.walls[wi], q, 1.0))
             .collect();
         for wi in near {
-            let w = &self.walls[wi as usize];
+            let w = &self.walls[wi];
             let n = normal(w);
             let Some(u) = cross(*eye, *eye - n, w) else { continue };
             if gated(w) {
@@ -278,26 +319,6 @@ impl WallSet {
             moved = true;
         }
         moved
-    }
-
-    /// The edges listed in the grid cells covering the xz box of `p` and `q`, each once, in the
-    /// grid's order.
-    fn cells_over(&self, p: Vec2, q: Vec2) -> Vec<u32> {
-        let idx = |v: Vec2| ((((v.x - self.min.x) / self.cell).floor().max(0.0) as usize).min(self.nx - 1), (((v.y - self.min.y) / self.cell).floor().max(0.0) as usize).min(self.nz - 1));
-        let (x0, z0) = idx(p.min(q));
-        let (x1, z1) = idx(p.max(q));
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        for z in z0..=z1 {
-            for x in x0..=x1 {
-                for &wi in &self.cells[z * self.nx + x] {
-                    if seen.insert(wi) {
-                        out.push(wi);
-                    }
-                }
-            }
-        }
-        out
     }
 }
 
@@ -322,18 +343,26 @@ fn circle_cross(w: &Wall, p: Vec2, r: f32) -> bool {
 mod camera_push_tests {
     use super::*;
 
+    /// A `TrackTree` over exactly `set`'s own walls, in file order — a test fixture stand-in for
+    /// `nfs_game::world`'s real `insertAll(C)`-then-`insertAll(A)` order (no patches/props here).
+    fn tree_for(set: &WallSet) -> TrackTree {
+        let order: Vec<TreeItem> = (0..set.len()).map(TreeItem::Wall).collect();
+        TrackTree::build(&[], &[], set.walls(), &order)
+    }
+
     #[test]
     fn a_wall_between_the_car_and_the_eye_pulls_the_eye_in_front_of_it() {
         // a wall along x at z = 5, drawn left to right; the car at z = 10, the eye behind the wall
         let set = WallSet::build([([-10.0, 0.0, 5.0], [10.0, 0.0, 5.0], 0x60)].into_iter(), 30.0);
+        let tree = tree_for(&set);
         let mut eye = Vec3::new(0.0, 3.0, 0.0);
-        assert!(set.camera_push(&mut eye, Vec3::new(0.0, 1.0, 10.0), 0.0, false));
+        assert!(set.camera_push(&mut eye, Vec3::new(0.0, 1.0, 10.0), 0.0, false, &tree));
         // crossing at z = 5 (y = 2 there), plus the left normal (0, 0, 1): z = 6; y = 2·3 − 2 = 4
         assert!((eye - Vec3::new(0.0, 4.0, 6.0)).length() < 1e-5, "{eye}");
         // an edge far below the car's ground is passed over, except on Castle
         let mut eye = Vec3::new(0.0, 3.0, 0.0);
-        assert!(!set.camera_push(&mut eye, Vec3::new(0.0, 1.0, 10.0), 10.0, false));
-        assert!(set.camera_push(&mut eye, Vec3::new(0.0, 1.0, 10.0), 10.0, true));
+        assert!(!set.camera_push(&mut eye, Vec3::new(0.0, 1.0, 10.0), 10.0, false, &tree));
+        assert!(set.camera_push(&mut eye, Vec3::new(0.0, 1.0, 10.0), 10.0, true, &tree));
     }
 
     #[test]
@@ -341,25 +370,28 @@ mod camera_push_tests {
         // the same wall, its left normal n = (0, 0, 1); an eye 0.5 on the normal's side of the
         // wall line, the car beside it (the first pass finds no crossing)
         let set = WallSet::build([([-10.0, 0.0, 5.0], [10.0, 0.0, 5.0], 0x60)].into_iter(), 30.0);
+        let tree = tree_for(&set);
         let mut eye = Vec3::new(0.0, 3.0, 5.5);
         // the probe eye → eye − n = (0, 3, 4.5) reaches the wall at z = 5; the eye becomes z = 6
-        assert!(set.camera_push(&mut eye, Vec3::new(3.0, 1.0, 8.0), 0.0, false));
+        assert!(set.camera_push(&mut eye, Vec3::new(3.0, 1.0, 8.0), 0.0, false, &tree));
         assert!((eye - Vec3::new(0.0, 3.0, 6.0)).length() < 1e-5, "{eye}");
         // an eye on the other side is not moved: its probe points away from the wall
         let mut eye = Vec3::new(0.0, 3.0, 4.5);
-        assert!(!set.camera_push(&mut eye, Vec3::new(3.0, 1.0, 4.0), 0.0, false));
+        assert!(!set.camera_push(&mut eye, Vec3::new(3.0, 1.0, 4.0), 0.0, false, &tree));
         // a short edge wholly inside the 1.0 circle is not listed (0x489DF0)
         let set = WallSet::build([([-0.2, 0.0, 5.0], [0.2, 0.0, 5.0], 0x60)].into_iter(), 30.0);
+        let tree = tree_for(&set);
         let mut eye = Vec3::new(0.0, 3.0, 5.5);
-        assert!(!set.camera_push(&mut eye, Vec3::new(3.0, 1.0, 8.0), 0.0, false));
+        assert!(!set.camera_push(&mut eye, Vec3::new(3.0, 1.0, 8.0), 0.0, false, &tree));
     }
 
     #[test]
     fn a_sloped_edge_gives_a_shorter_normal() {
         // e = normalize(20, 20, 0): n = (0, 0, 0.7071); crossing at (0, 2, 5) → eye z = 5.7071
         let set = WallSet::build([([-10.0, -10.0, 5.0], [10.0, 10.0, 5.0], 0x60)].into_iter(), 30.0);
+        let tree = tree_for(&set);
         let mut eye = Vec3::new(0.0, 3.0, 0.0);
-        assert!(set.camera_push(&mut eye, Vec3::new(0.0, 1.0, 10.0), 0.0, true));
+        assert!(set.camera_push(&mut eye, Vec3::new(0.0, 1.0, 10.0), 0.0, true, &tree));
         assert!((eye.z - (5.0 + std::f32::consts::FRAC_1_SQRT_2)).abs() < 1e-5, "{eye}");
     }
 }

@@ -55,12 +55,13 @@ fn vehicle_wall_response_synthetic() {
     let specs = CarSpecs::from_sim(&sim, false);
     // wall along z at x = 2 (edge direction +z ⇒ normal (−1, 0, 0) points toward −x, the car's side)
     let walls = WallSet::build(std::iter::once(([2.0, 0.0, -20.0], [2.0, 0.0, 20.0], 0x10)), 30.0);
+    let tree = nfs_physics::track_tree::TrackTree::build(&[], &[], walls.walls(), &[nfs_physics::track_tree::TreeItem::Wall(0)]);
     // the sweep runs after integration: the +x corners (x ≈ pos.x + 0.9) have just passed the edge
     let mut v = Vehicle::new(Vec3::new(1.5, 0.3, 0.0), glam::Mat3::IDENTITY, &specs, 0.75, 0.3);
     v.velocity = Vec3::new(64.0, 0.0, 0.0); // 2 m per tick
     // road (a drivable patch at y = 0) up to the wall line: the centre is on it, the +x corners
     // are not (0x495020 tests a corner off the road with the segment centre → corner)
-    let hit = v.collide_walls(&walls, &|p| (p.x <= 2.0).then_some(0.0), 0.0, 0.0, 0.0);
+    let hit = v.collide_walls(&walls, &tree, &|p| (p.x <= 2.0).then_some(0.0), 0.0, 0.0, 0.0);
     eprintln!("hit={hit} pos={:?} vel={:?}", v.position, v.velocity);
     assert!(hit);
     assert!(v.velocity.x < 0.0 && v.velocity.x > -10.0, "restitution 0.1 expected, got {:?}", v.velocity);

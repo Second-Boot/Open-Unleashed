@@ -109,9 +109,41 @@ pub struct MaterialDesc {
     /// `RCustomLayers::LayerFalseSort1` / `2` (0x449AA0 / 0x449AF0, the `FakeSort` method's ops
     /// 0x800F / 0x8010): at `SPECIALFX` 2 or 3 the material is drawn twice, first with depth
     /// writes off (Thrash 0x39 ← 0), then on (← 1) — blended both times. Below 2 (`Renderer::
-    /// set_fakesort_single`), 0x44EC80's other arm draws it once, `MAG`/`MINFILTER` forced
-    /// `POINT` for that draw (`RE/notes/thrash.md` §6d.4).
+    /// set_fakesort_mode`), 0x44EC80's other arm draws it once, `MAG`/`MINFILTER` forced
+    /// `POINT` for that draw (`RE/notes/thrash.md` §6d.4). Which of the two happens at `SPECIALFX`
+    /// 2 is a runtime pick, [`FakeSortMode`].
     pub false_sort: bool,
+}
+
+/// `0x44EC80`'s per-frame pick for a `false_sort` material, read to the instruction 2026-09-27
+/// (`RE/notes/thrash.md` §6d.4). The jump table (0x44ECF4) on `SPECIALFX` `[0x657D6C]`: 0 and 1 →
+/// always [`Single`](Self::Single) (0x44EC91); 3 → always [`Double`](Self::Double) (0x44ECE7); 2 →
+/// two independent tests, **not** one falling through to the other:
+///
+/// * `[0x657424]` (`REPLAY`) **≥ 2** (playing back or exhausted) picks between `Double` (the
+///   smoothed value `[0x627ED8]` under 37.5) and [`PerItem`](Self::PerItem) (0x44ECAA…0x44ECDC) —
+///   the player-speed test below is *not* reached on this path;
+/// * `REPLAY` **< 2** picks between `Single` (the player car's `+0x35C` ≥ 15.0) and `PerItem`
+///   (0x44ECC4…0x44ECDC) — the frame-rate test is *not* reached on this path.
+///
+/// *(Corrects `thrash.md`'s 2026-09-27 summary, which read the two tests as one chain with the
+/// speed check as the frame-rate check's "else": the disassembly shows `REPLAY < 2` jumping clear
+/// over the frame-rate block, so a replay's frame rate never falls back to the speed test and a
+/// live race's speed never falls back to the frame-rate test.)*
+///
+/// `PerItem` is `LayerFalseSort1`/`2`'s own fold (0x449AA0/0x449AF0, `mode == 1`): per drawn
+/// article, `[0x61975C]` (an integer, `cmp …, 0x2710` **unsigned** — `DrawItem::fakesort_near`)
+/// under 10000 draws it like `Double`, else like `Single`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FakeSortMode {
+    /// `LayerFalseSort1`'s point-filter arm: one draw, `MAG`/`MINFILTER` forced `POINT`.
+    Single,
+    /// The depth-toggled pair: blended both times, first with depth writes off.
+    #[default]
+    Double,
+    /// `mode 1`: `Double` while the drawn item's own `[0x61975C]` equivalent
+    /// ([`DrawItem::fakesort_near`]) is set, `Single` otherwise.
+    PerItem,
 }
 
 impl MaterialDesc {
@@ -178,11 +210,20 @@ pub struct DrawItem {
     /// Drawn in the sky pass (0x45D4F0): fogged with [`Scene::sky_fog`] over that pass's planes
     /// 0.15 / 700 rather than with [`Scene::fog`].
     pub sky_pass: bool,
+    /// [`FakeSortMode::PerItem`]'s own test (`[0x61975C]` under 10000, `LayerFalseSort1`/`2`'s
+    /// `mode 1` fold, `RE/notes/thrash.md` §6d.4): set by whichever drawer queued this item from
+    /// its own `round(d²)` sort key (`RE/RENDERING.md` "The view's lists") being under 10000 —
+    /// the same squared-distance-from-the-eye value the static/mid-ground drawer already sorts
+    /// the track's view lists by. APPROXIMATION: the original's exact source field for
+    /// `[0x61975C]` was read to the instruction only for the breakable-piece drawer (0x4500BE,
+    /// `[item+0xC]`); reusing the view-list key for every drawer is the port's own choice, not
+    /// itself traced. Unused outside a `false_sort` material.
+    pub fakesort_near: bool,
 }
 
 impl DrawItem {
     pub fn new(mesh: MeshId, material: MaterialId, transform: Mat4) -> Self {
-        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, alpha_ref: 10, sky: None, main_view_only: false, sky_pass: false }
+        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, alpha_ref: 10, sky: None, main_view_only: false, sky_pass: false, fakesort_near: false }
     }
 }
 

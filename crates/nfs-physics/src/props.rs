@@ -2,6 +2,7 @@
 //! loader 0x4750B0 builds for it (`RE/notes/suspension-collision.md` §9): a `WTreeElem_CylinderObject`
 //! for an article whose `animdefs.txt` definition says `kCylinder`, a `WTreeElem_BoxObject` for
 //! `kBox`. The cars collide with them after their walls, in the collision pass.
+use crate::quadtree::Entry;
 use glam::Vec3;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,6 +30,10 @@ pub struct Prop {
     /// 0x4752D9 through the base constructor 0x486340): without an animation instance slot 8
     /// answers `2 + (+0x24 != 0)` (0x4872CD…0x4872D7) — 3, a drive-through scrape, for `BUSH`
     pub drive_through: bool,
+    /// The `.crp` article this object came from (`0x4750B0`'s own item index) — what
+    /// `nfs_game::world::track_tree_order` groups by to rebuild `WTrack+0x24`'s bundle-native
+    /// insertion order (`RE/RENDERING.md` "The tree, built"); not read by anything else.
+    pub article: usize,
 }
 
 /// A prop whose `animdefs.txt` definition has pieces (`BBOX`, the crate stacks): the answer of
@@ -92,6 +97,29 @@ impl Prop {
     /// 0x486510(pos, 5.0): the AABB meets `pos ± r` on x and z.
     pub fn near(&self, pos: Vec3, r: f32) -> bool {
         pos.x + r >= self.aabb_min.x && pos.x - r <= self.aabb_max.x && pos.z + r >= self.aabb_min.z && pos.z - r <= self.aabb_max.z
+    }
+}
+
+/// The quadtree accept test's two vtable calls (`0x484320`, `RE/RENDERING.md` "The accept test,
+/// read 2026-09-28") for a `WTreeElem_CylinderObject`/`WTreeElem_BoxObject`: both classes share
+/// the base object's slot 1 and slot 2 (`WTreeElem_CylinderObject`'s vtable 0x5B490C and
+/// `WTreeElem_BoxObject`'s 0x5B4938 both point their `+4`/`+8` entries at the identical
+/// `0x486490`/`0x486560`, read to the instruction 2026-09-28) — data already at hand on [`Prop`],
+/// no new field needed:
+///
+/// * slot 1 (`0x486490`) is exactly [`Prop::centre`]: `0.5·(min + max)` per axis.
+/// * slot 2 (`0x486560`) is a plain field copy — `out_min = this+8..+0x10`, `out_max =
+///   this+0x14..+0x1C` — i.e. [`Prop::aabb_min`]/[`Prop::aabb_max`] verbatim, all three
+///   components (unlike the patch/edge extent getters, this one does write `y` — the accept test
+///   just never reads it back).
+impl Entry for Prop {
+    fn centroid(&self) -> (f32, f32) {
+        let c = self.centre();
+        (c.x, c.z)
+    }
+
+    fn extent(&self) -> ((f32, f32), (f32, f32)) {
+        ((self.aabb_min.x, self.aabb_min.z), (self.aabb_max.x, self.aabb_max.z))
     }
 }
 
@@ -250,7 +278,7 @@ mod tests {
     /// 0x487290 without an animation instance: 2 (solid), or 3 for a `drivethru` object.
     #[test]
     fn a_bush_is_driven_through() {
-        let p = |drive_through| Prop { shape: PropShape::Cylinder { radius: 0.25 }, aabb_min: Vec3::ZERO, aabb_max: Vec3::ONE, class: 1, breakable: None, drive_through };
+        let p = |drive_through| Prop { shape: PropShape::Cylinder { radius: 0.25 }, aabb_min: Vec3::ZERO, aabb_max: Vec3::ONE, class: 1, breakable: None, drive_through, article: 0 };
         assert_eq!(p(false).answer(0, Vec3::X), 2);
         assert_eq!(p(true).answer(0, Vec3::X), 3);
     }

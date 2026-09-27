@@ -5,6 +5,23 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VoiceId(pub u32);
 
+/// A `Send + Sync` handle to the mixer's shared state, without the output stream itself — see
+/// [`AudioOutput::stop_handle`].
+#[derive(Clone)]
+pub struct StopHandle(Arc<Mutex<Shared>>);
+
+impl StopHandle {
+    pub fn stop(&self, id: VoiceId) {
+        Self::stop_shared(&self.0, id);
+    }
+
+    fn stop_shared(shared: &Arc<Mutex<Shared>>, id: VoiceId) {
+        let mut g = shared.lock().unwrap();
+        g.voices.retain(|(i, _)| *i != id);
+        g.streams.retain(|(i, _)| *i != id);
+    }
+}
+
 /// A decoded mono/stereo clip at its native rate.
 #[derive(Debug, Clone)]
 pub struct Clip {
@@ -281,7 +298,11 @@ struct Voice {
     cur: Cursor,
     /// the channel gains and their ramp (0x598700 / 0x5980C0)
     gains: Gains,
-    pitch: f32,
+    /// `voice+0x6C`, the caller's pitch word: 4096 is 1.0, unchanged ([`resample::PITCH_UNIT`]) —
+    /// every start/update call hands it directly ([`AudioOutput::play_word`] / `set_word`, audio
+    /// port 8; there is no float pitch left in the port, matching the original, which never took
+    /// one either).
+    word: u16,
     /// `voice+0x2C`, the caller's volume in 16.16 (`setVolume`'s int `<< 16`, 0x5662E3; the
     /// request's `+8 << 16` at the start, 0x59055D) — the level byte takes `>> 16`
     vol16: i32,
@@ -532,13 +553,13 @@ pub fn cents_word(cents: i32) -> u16 {
 }
 
 impl Voice {
-    fn new(clip: Arc<Clip>, pitch: f32, volume: f32, looping: bool, stamp: u32) -> Self {
+    fn new(clip: Arc<Clip>, word: u16, volume: f32, looping: bool, stamp: u32) -> Self {
         let (patch_pan, level) = (clip.pan, (clip.gain * 127.0).round() as i8);
         let env = match (clip.records.first(), clip.tables.first()) {
             (Some(r), Some(t)) => Envelope::start(r.env_level, r.env_segments, &t.envelope),
             _ => Envelope::start(0x7F, 1, &nfs_formats::bnk::DEFAULT_ENVELOPE),
         };
-        Voice { clip, cur: Cursor::default(), gains: Gains::default(), pitch, vol16: volume_16(volume), ramp: Ramp::default(), pan: 0x40, looping, finished: false, fx_scale: 0x7F, stamp, patch_pan, level, cents: 0, env, volume_phase: 0, pitch_phase: 0, pulled: false, anchor: false, held: false, bend: 0x40, lowpass: None, table: true }
+        Voice { clip, cur: Cursor::default(), gains: Gains::default(), word, vol16: volume_16(volume), ramp: Ramp::default(), pan: 0x40, looping, finished: false, fx_scale: 0x7F, stamp, patch_pan, level, cents: 0, env, volume_phase: 0, pitch_phase: 0, pulled: false, anchor: false, held: false, bend: 0x40, lowpass: None, table: true }
     }
 
     /// **`Voice_setVolume` 0x566340 → 0x5662B0** on one voice: the int `<< 16` into `voice+0x2C`
@@ -589,12 +610,12 @@ impl Voice {
     /// **0x589F40**'s pitch word `voice+0x6E`: the cents `voice+0x68` plus, with a pitch table,
     /// `((i8)table[voice+0x4B] − 0x40) · (i16)depth >> 6` (0x589F92…0x589FAF, `sar`), through
     /// 0x589E80 ([`cents_word`]) into `voice+0x6A`, then `voice+0x6C · voice+0x6A >> 12` (0x589FBE…
-    /// 0x589FD0) — `voice+0x6C` the caller's pitch word ([`resample::pitch_word`] of the float
-    /// callers' factor, exact for the callers that hand a word, [`AudioOutput::play_word`]). The
-    /// bend term (0x589F60…0x589F90): `((i8)voice+0x3F − 0x40) · (i16)voice+0x66 >> 6` (`sar`)
-    /// when `+0x66` is not 0; through code 0x17's curve `+0x58` when set — no shipped bank has it.
-    /// *(Until 2026-09-27 the bend was the caller's float factor `Clip::bend`, multiplied into the
-    /// pitch — an octave's cents through `exp2` rather than the table 0x589E80 walks.)*
+    /// 0x589FD0) — `voice+0x6C` is [`Voice::word`], the caller's own pitch word, no longer a float
+    /// (audio port 8). The bend term (0x589F60…0x589F90): `((i8)voice+0x3F − 0x40) · (i16)voice+0x66
+    /// >> 6` (`sar`) when `+0x66` is not 0; through code 0x17's curve `+0x58` when set — no shipped
+    /// bank has it. *(Until 2026-09-27 the bend was the caller's float factor `Clip::bend`,
+    /// multiplied into the pitch — an octave's cents through `exp2` rather than the table 0x589E80
+    /// walks.)*
     fn pitch_word(&self) -> u16 {
         let mut cents = self.cents as i32;
         if self.clip.bend_cents != 0 {
@@ -605,7 +626,7 @@ impl Voice {
             cents += ((e - 0x40) * r.pitch_depth as i32) >> 6;
         }
         let word = cents_word(cents) as i32;
-        ((resample::pitch_word(self.pitch) as i32).wrapping_mul(word) >> 12) as u16
+        ((self.word as i32).wrapping_mul(word) >> 12) as u16
     }
 
     /// The looped range the stream repeats, `(lo, hi)` in frames.
@@ -1202,17 +1223,17 @@ impl Shared {
         }
     }
 
-    /// [`AudioOutput::play_sel`]'s start (0x5907B0). `tabled` is `false` only for the callers
+    /// [`AudioOutput::play_word`]'s start (0x5907B0). `tabled` is `false` only for the callers
     /// listed on the `table` field of [`Voice`] — a bare `Voice_start` 0x565E70 in the original,
     /// never `Voice_play` 0x4A9C10's voice-numbered table.
-    fn start_patch(&mut self, clip: Arc<Clip>, volume: f32, pitch: f32, looping: bool, sel: u8, tabled: bool) -> VoiceId {
+    fn start_patch(&mut self, clip: Arc<Clip>, volume: f32, word: u16, looping: bool, sel: u8, tabled: bool) -> VoiceId {
         let g = self;
         let id = VoiceId(g.next_id);
         g.next_id += 1;
         if clip.records.is_empty() {
             // not a bank patch: one voice, no draw, the clip's own values scaled by `sel`
             if g.allocate(clip.channels.max(1) as usize, clip.priority, Some(id)) {
-                let mut v = Voice::new(clip.clone(), pitch, volume, looping, g.service_tick);
+                let mut v = Voice::new(clip.clone(), word, volume, looping, g.service_tick);
                 v.level = ((clip.gain * 127.0).round() as i32 * sel as i8 as i32 / 127) as i8;
                 v.table = tabled;
                 g.voices.push((id, v));
@@ -1234,7 +1255,7 @@ impl Shared {
                 return id;
             }
             let d = crate::librand::record_draws(&mut g.rand, r, sel as i8, patch_cents, pan);
-            let mut v = Voice::new(layer, pitch, volume, looping, g.service_tick);
+            let mut v = Voice::new(layer, word, volume, looping, g.service_tick);
             v.patch_pan = d.pan;
             v.level = d.level as i8;
             v.cents = base_cents(r).wrapping_add(d.cents as i16);
@@ -1420,49 +1441,6 @@ impl AudioOutput {
         Ok(Self { _stream: stream, shared, rate })
     }
 
-    /// Start a voice of a bank patch (`Voice_start` 0x565E70 → 0x5907B0 → 0x590420): it takes
-    /// `clip.channels` voices of the budget through the allocator ([`pick_victims`]). A refused
-    /// start still returns a handle, one that names no voice — the library's −9, on which every
-    /// later call fails ([`is_playing`](Self::is_playing) is false).
-    pub fn play(&self, clip: Arc<Clip>, volume: f32, pitch: f32, looping: bool) -> VoiceId {
-        self.play_sel(clip, volume, pitch, looping, 0x7F)
-    }
-
-    /// [`play`](Self::play) with the request's byte `+6`, `sel`: `Voice_play`'s seventh argument
-    /// (0x4A9B89…0x4A9B90), 0x7F (0x561960's default) for every start but the collision
-    /// one-shot's. The start (0x5907B0) tests each record's codes 0x01 / 0x02 against it and
-    /// multiplies the patch volume by `sel / 127` (0x5905D0), and draws from the library's
-    /// generator ([`crate::librand::patch_start`]) in the original's order.
-    ///
-    /// Every record whose ranges hold the request's bytes starts as a voice of its own, with its
-    /// own sample ([`Clip::layers`]), its own allocation (0x590420 → 0x5898F0 with the record's
-    /// channel count and priority) and its own draws, in record order (0x590841…0x590992). A
-    /// refused allocation stops the records already started and the start fails (0x5909A6).
-    /// Two or more started make a **group** (0x5909DB…0x590A5C): one id (`voice+0x1E` from
-    /// 0x5903D0), the last started the anchor (`+0x1B`), and the start answers the anchor's
-    /// handle (`[esp+0x14]`, 0x590420's last answer). Every later call on the handle walks the
-    /// group (0x590340: stop 0x565D60, volume, pitch, pan), which here is every voice with the
-    /// returned [`VoiceId`]. *(Until 2026-09-27 the port played one merged sample per patch, the
-    /// last record's, with the last record's draws — an APPROXIMATION.)*
-    pub fn play_sel(&self, clip: Arc<Clip>, volume: f32, pitch: f32, looping: bool, sel: u8) -> VoiceId {
-        self.shared.lock().unwrap().start_patch(clip, volume, pitch, looping, sel, true)
-    }
-
-    /// [`play`](Self::play) for a start the original makes with a bare `Voice_start` 0x565E70,
-    /// never `Voice_play` 0x4A9C10: the HUD's `fe_sound` (0x4AADB0), the front end's `fesfx`, the
-    /// checkpoint chime, the wrong-way cue and the pylon-hit cue (straight to `Bank_playOneShot`
-    /// 0x4A98E0, no voice number at all). Not walked by [`silence_voices`](Self::silence_voices).
-    pub fn play_untabled(&self, clip: Arc<Clip>, volume: f32, pitch: f32, looping: bool) -> VoiceId {
-        self.shared.lock().unwrap().start_patch(clip, volume, pitch, looping, 0x7F, false)
-    }
-
-    /// [`play_untabled`](Self::play_untabled) with the request's byte `+6` ([`play_sel`](Self::play_sel)):
-    /// the collision one-shot's own path, voice 0x33 — `Voice_play` takes it to `Bank_playOneShot`
-    /// (0x4a9cd4…0x4a9d0b) but never writes the table for it (see the `table` field of [`Voice`]).
-    pub fn play_sel_untabled(&self, clip: Arc<Clip>, volume: f32, pitch: f32, looping: bool, sel: u8) -> VoiceId {
-        self.shared.lock().unwrap().start_patch(clip, volume, pitch, looping, sel, false)
-    }
-
     /// What 0x4A66B0 configures for `AUDIOQUALITY` when the sound opens (both start-ups 0x4A6840 /
     /// 0x4A6A00; the latter reopens on a quality change): the software voice count
     /// ([`voice_budget`]) and the mix rate ([`mix_rate`]). Voices already playing are left alone;
@@ -1488,26 +1466,6 @@ impl AudioOutput {
             g.tail = None;
             tracing::info!(mix_rate = rate, device_rate = self.rate, audio_quality, "mix rate");
         }
-    }
-
-    /// `play` with the caller's 16-bit pan angle ([`pan_angle`]) — `Voice_play` folds it into the
-    /// request's pan byte ([`pan_byte`]) before the start.
-    pub fn play_panned(&self, clip: Arc<Clip>, volume: f32, pitch: f32, pan: u16, looping: bool) -> VoiceId {
-        self.play_panned_sel(clip, volume, pitch, pan, looping, 0x7F)
-    }
-
-    /// [`play_panned`](Self::play_panned) with the request's byte `+6` ([`play_sel`](Self::play_sel)).
-    pub fn play_panned_sel(&self, clip: Arc<Clip>, volume: f32, pitch: f32, pan: u16, looping: bool, sel: u8) -> VoiceId {
-        let id = self.play_sel(clip, volume, pitch, looping, sel);
-        self.set_pan(id, pan);
-        id
-    }
-
-    /// [`play_panned_sel`](Self::play_panned_sel) over [`play_sel_untabled`](Self::play_sel_untabled).
-    pub fn play_panned_sel_untabled(&self, clip: Arc<Clip>, volume: f32, pitch: f32, pan: u16, looping: bool, sel: u8) -> VoiceId {
-        let id = self.play_sel_untabled(clip, volume, pitch, looping, sel);
-        self.set_pan(id, pan);
-        id
     }
 
     /// The aux byte of `Voice_play` for a collision one-shot: `voice+0x45 = 0x7F − aux`
@@ -1610,25 +1568,59 @@ impl AudioOutput {
         Self::status_voice(&g, id).map(|v| if v.held { 0 } else { played_ms(v.position() as u64, v.clip.rate) })
     }
 
-    /// `Voice_play` 0x4A9C10's start in the library's own units (0x4A98E0 → 0x561960's request):
-    /// the pitch **word** `+0xC` (4096 = the sample's root, `pitch16_16 >> 4`, 0x4A9AC5), the
-    /// **bend byte** `+9` (`voice+0x3F`) and the pan byte `+7` ([`pan_byte`] of the angle), taken
-    /// together — no float in between. The word is carried as `word / 4096`, which
-    /// [`resample::pitch_word`] gives back exactly.
+    /// **`Voice_play` 0x4A9C10's start** (`Voice_start` 0x565E70 → 0x5907B0 → 0x590420): the
+    /// library units, no float in between — the pitch **word** `+0xC` ([`resample::PITCH_UNIT`] =
+    /// 4096 the sample's root, `pitch16_16 >> 4`, 0x4A9AC5), the **bend byte** `+9` (`voice+0x3F`)
+    /// and the pan byte `+7` ([`pan_byte`] of the angle `pan`), taken together. `sel` (0x7F here,
+    /// the request's default) is `Voice_play`'s seventh argument (0x4A9B89…0x4A9B90): the start
+    /// (0x5907B0) tests each record's codes 0x01 / 0x02 against it and multiplies the patch volume
+    /// by `sel / 127` (0x5905D0), and draws from the library's generator
+    /// ([`crate::librand::patch_start`]) in the original's order. `clip.channels` voices of the
+    /// budget go through the allocator ([`pick_victims`]); a refused start still returns a handle,
+    /// one that names no voice — the library's −9, on which every later call fails
+    /// ([`is_playing`](Self::is_playing) is false).
+    ///
+    /// Every record whose ranges hold `sel` starts as a voice of its own, with its own sample
+    /// ([`Clip::layers`]), its own allocation (0x590420 → 0x5898F0 with the record's channel count
+    /// and priority) and its own draws, in record order (0x590841…0x590992). A refused allocation
+    /// stops the records already started and the start fails (0x5909A6). Two or more started make
+    /// a **group** (0x5909DB…0x590A5C): one id (`voice+0x1E` from 0x5903D0), the last started the
+    /// anchor (`+0x1B`), and the start answers the anchor's handle (`[esp+0x14]`, 0x590420's last
+    /// answer). Every later call on the handle walks the group (0x590340: stop 0x565D60, volume,
+    /// pitch, pan), which here is every voice with the returned [`VoiceId`]. *(Until 2026-09-27 the
+    /// port played one merged sample per patch, the last record's, with the last record's draws —
+    /// an APPROXIMATION; until 2026-09-27, later, audio port 8, every caller gave a float pitch
+    /// factor here instead of the word, [`resample::PITCH_UNIT`]'s own doc.)*
     pub fn play_word(&self, clip: Arc<Clip>, volume: f32, word: u16, bend: u8, pan: u16, looping: bool) -> VoiceId {
-        self.play_word_tabled(clip, volume, word, bend, pan, looping, true)
+        self.play_word_sel(clip, volume, word, bend, pan, looping, 0x7F)
     }
 
-    /// [`play_word`](Self::play_word) for the cop siren's start (0x4AAE90): straight to
-    /// `Bank_playOneShot` 0x4A98E0 with no `Voice_play` voice number, so never in the table (see
-    /// the `table` field of [`Voice`]).
+    /// [`play_word`](Self::play_word) with the request's byte `+6`, `sel` — the collision one-shot's
+    /// own aux/gate byte, the only shipped caller of a `sel` other than 0x7F.
+    pub fn play_word_sel(&self, clip: Arc<Clip>, volume: f32, word: u16, bend: u8, pan: u16, looping: bool, sel: u8) -> VoiceId {
+        self.play_word_tabled(clip, volume, word, bend, pan, looping, sel, true)
+    }
+
+    /// [`play_word`](Self::play_word) for a start the original makes with a bare `Voice_start`
+    /// 0x565E70, never `Voice_play` 0x4A9C10: the HUD's `fe_sound` (0x4AADB0), the front end's
+    /// `fesfx`, the checkpoint chime, the wrong-way cue and the pylon-hit cue (straight to
+    /// `Bank_playOneShot` 0x4A98E0, no voice number at all). Not walked by
+    /// [`silence_voices`](Self::silence_voices).
     pub fn play_word_untabled(&self, clip: Arc<Clip>, volume: f32, word: u16, bend: u8, pan: u16, looping: bool) -> VoiceId {
-        self.play_word_tabled(clip, volume, word, bend, pan, looping, false)
+        self.play_word_tabled(clip, volume, word, bend, pan, looping, 0x7F, false)
     }
 
-    fn play_word_tabled(&self, clip: Arc<Clip>, volume: f32, word: u16, bend: u8, pan: u16, looping: bool, tabled: bool) -> VoiceId {
+    /// [`play_word_untabled`](Self::play_word_untabled) with the request's byte `+6`
+    /// ([`play_word_sel`](Self::play_word_sel)): the collision one-shot's own path, voice 0x33 —
+    /// `Voice_play` takes it to `Bank_playOneShot` (0x4a9cd4…0x4a9d0b) but never writes the table
+    /// for it (see the `table` field of [`Voice`]).
+    pub fn play_word_sel_untabled(&self, clip: Arc<Clip>, volume: f32, word: u16, bend: u8, pan: u16, looping: bool, sel: u8) -> VoiceId {
+        self.play_word_tabled(clip, volume, word, bend, pan, looping, sel, false)
+    }
+
+    fn play_word_tabled(&self, clip: Arc<Clip>, volume: f32, word: u16, bend: u8, pan: u16, looping: bool, sel: u8, tabled: bool) -> VoiceId {
         let mut g = self.shared.lock().unwrap();
-        let id = g.start_patch(clip, volume, word as f32 / 4096.0, looping, 0x7F, tabled);
+        let id = g.start_patch(clip, volume, word, looping, sel, tabled);
         for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
             v.bend = bend as i8;
             v.pan = pan_byte(pan);
@@ -1643,16 +1635,8 @@ impl AudioOutput {
         let mut g = self.shared.lock().unwrap();
         for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
             v.set_volume(volume);
-            v.pitch = word as f32 / 4096.0;
+            v.word = word;
             v.bend = bend as i8;
-        }
-    }
-
-    pub fn set(&self, id: VoiceId, volume: f32, pitch: f32) {
-        let mut g = self.shared.lock().unwrap();
-        for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
-            v.set_volume(volume);
-            v.pitch = pitch.max(0.05);
         }
     }
 
@@ -1692,9 +1676,17 @@ impl AudioOutput {
     }
 
     pub fn stop(&self, id: VoiceId) {
-        let mut g = self.shared.lock().unwrap();
-        g.voices.retain(|(i, _)| *i != id);
-        g.streams.retain(|(i, _)| *i != id);
+        StopHandle::stop_shared(&self.shared, id);
+    }
+
+    /// A cheap, cloneable handle that can [`Self::stop`] a voice without keeping the whole
+    /// `AudioOutput` (its `cpal::Stream`) alive — `FEMovie`'s own audio track (`mad.md` §14) needs
+    /// to stop itself well after the code that started it has moved on: at a loop restart
+    /// (0x4E2380's `0x567690`) and whenever its widget is torn down (the destructor was not traced;
+    /// this is the port's own equivalent, so no voice a widget started is ever left playing once
+    /// the widget is gone).
+    pub fn stop_handle(&self) -> StopHandle {
+        StopHandle(self.shared.clone())
     }
 
     /// `0x565CD0(id, level)`: bit 0x20 of the id sets the bus `[0x6B4A0C]`, bit 0x80
@@ -2060,6 +2052,7 @@ mod budget_tests {
 #[cfg(test)]
 mod rate_tests {
     use super::{mix_rate, Bridge, Shared};
+    use crate::resample;
 
     fn ramp(sign: f32) -> impl FnMut(usize) -> Vec<[f32; 2]> {
         let mut next = 0.0f32;
@@ -2133,7 +2126,7 @@ mod rate_tests {
         let clip = std::sync::Arc::new(super::Clip { rate: 22050, channels: 1, samples: vec![100; 1000], loop_range: None, gain: 1.0, bend_cents: 0, fx_send: 0, priority: 0, pan: 64, pan_scale: 1, records: Vec::new(), layers: Vec::new(), tables: Vec::new() });
         let mut s = Shared::default();
         s.interp = Interp::Linear;
-        s.voices.push((super::VoiceId(0), super::Voice::new(clip.clone(), 1.0, 1.0, false, 0)));
+        s.voices.push((super::VoiceId(0), super::Voice::new(clip.clone(), resample::PITCH_UNIT, 1.0, false, 0)));
         // blocks: the ticks 208, 224, 224, 224, 208; before the fifth the position is 880:
         // 880 + 2 < 1000, so the fifth block (to 1088) pulls and mixes the tail and the zeros
         s.render(208 + 224 * 3 + 208, 22050);
@@ -2144,7 +2137,7 @@ mod rate_tests {
         assert!(s.voices.is_empty());
         // a looped voice never fails
         let mut s = Shared::default();
-        s.voices.push((super::VoiceId(0), super::Voice::new(clip, 1.0, 1.0, true, 0)));
+        s.voices.push((super::VoiceId(0), super::Voice::new(clip, resample::PITCH_UNIT, 1.0, true, 0)));
         s.render(5000, 22050);
         assert_eq!(s.voices.len(), 1);
     }
@@ -2193,7 +2186,7 @@ mod rate_tests {
         // a 22050 Hz sample mixed at 16000 (quality 2): 22050/16000 sample frames a mix frame
         let clip = std::sync::Arc::new(super::Clip { rate: 22050, channels: 1, samples: vec![0; 100_000], loop_range: None, gain: 1.0, bend_cents: 0, fx_send: 0, priority: 0, pan: 64, pan_scale: 1, records: Vec::new(), layers: Vec::new(), tables: Vec::new() });
         let mut s = Shared::default();
-        s.voices.push((super::VoiceId(0), super::Voice::new(clip, 1.0, 1.0, false, 0)));
+        s.voices.push((super::VoiceId(0), super::Voice::new(clip, resample::PITCH_UNIT, 1.0, false, 0)));
         s.render(16000, 16000);
         // the step 22050·16/16000 = 22.05 (an f32) · 4096 → 90316 (truncated): 16000 of them
         let want = 90316u64 * 16000;
@@ -2211,7 +2204,7 @@ mod rate_tests {
         for interp in [Interp::Cubic, Interp::Linear] {
             let mut s = Shared::default();
             s.interp = interp;
-            s.voices.push((super::VoiceId(0), super::Voice::new(clip.clone(), 1.0, 1.0, false, 0)));
+            s.voices.push((super::VoiceId(0), super::Voice::new(clip.clone(), resample::PITCH_UNIT, 1.0, false, 0)));
             let out = s.render(12, 22050);
             for (k, frame) in out.iter().enumerate() {
                 let (p, frac) = ((k / 2) as i64, if k % 2 == 1 { 0x8000 } else { 0 });
@@ -2243,6 +2236,7 @@ mod rate_tests {
 #[cfg(test)]
 mod group_tests {
     use super::{Clip, Shared, Voice, VoiceId};
+    use crate::resample;
     use nfs_formats::bnk::PatchRecord;
     use std::sync::Arc;
 
@@ -2259,7 +2253,7 @@ mod group_tests {
     }
 
     fn start(s: &mut Shared, clip: &Arc<Clip>, sel: u8) -> VoiceId {
-        s.start_patch(clip.clone(), 1.0, 1.0, false, sel, true)
+        s.start_patch(clip.clone(), 1.0, resample::PITCH_UNIT, false, sel, true)
     }
 
     #[test]
@@ -2337,7 +2331,7 @@ mod group_tests {
         // record 2 finds nothing it may steal — refused, and record 0 is stopped again
         let mut s = Shared::default();
         s.budget = Some(2);
-        s.voices.push((VoiceId(900), Voice::new(layer(10, 0x65), 1.0, 1.0, true, 0)));
+        s.voices.push((VoiceId(900), Voice::new(layer(10, 0x65), resample::PITCH_UNIT, 1.0, true, 0)));
         let unstealable = Arc::new(Clip { layers: clip.layers.iter().map(|l| Arc::new(Clip { priority: 0x65, ..(**l).clone() })).collect(), ..(*clip).clone() });
         let id = start(&mut s, &unstealable, 75);
         // record 0 took the free voice, record 2 was refused: record 0 is stopped again
@@ -2364,6 +2358,7 @@ mod group_tests {
 #[cfg(test)]
 mod service_tests {
     use super::{cents_word, div_127, div_127_cubed, Clip, Envelope, Shared, Voice, VoiceId};
+    use crate::resample;
     use nfs_formats::bnk::{PatchRecord, RecordTables};
     use std::sync::Arc;
 
@@ -2389,7 +2384,7 @@ mod service_tests {
         // the start adds the draws to it (a record without spreads draws nothing)
         let mut s = Shared::default();
         let c = Arc::new(Clip { records: vec![rec(&[(0x07, 48), (0x10, 25)])], tables: vec![tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())], ..(*clip(PatchRecord::from_codes(&[]), RecordTables::default())).clone() });
-        s.start_patch(c, 1.0, 1.0, false, 0x7F, true);
+        s.start_patch(c, 1.0, resample::PITCH_UNIT, false, 0x7F, true);
         assert_eq!(s.voices[0].1.cents, 1225);
         assert_eq!(s.voices[0].1.pitch_word(), cents_word(1225));
     }
@@ -2405,13 +2400,12 @@ mod service_tests {
         let spl = nfs_formats::spl::Spl::default();
         let word = spl.pitch_word(nfs_formats::spl::rpm_frac_16(3000.0, 6000.0), 0x10000);
         assert_eq!(word, 3583);
-        assert_eq!(resample::pitch_word(word as f32 / 4096.0), 3583);
         let r = PatchRecord::from_codes(&[(0x07, 61), (0x10, -43)]);
         assert_eq!(base_cents(&r), -143);
         assert_eq!(cents_word(-143), 3776);
         let mut s = Shared::default();
         let c = Arc::new(Clip { rate: 44100, records: vec![r], tables: vec![tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())], ..(*clip(PatchRecord::from_codes(&[]), RecordTables::default())).clone() });
-        s.start_patch(c, 1.0, word as f32 / 4096.0, true, 0x7F, true);
+        s.start_patch(c, 1.0, word, true, 0x7F, true);
         assert_eq!(s.voices[0].1.pitch_word(), 3303);
         assert_eq!(resample::step_16_16(3303, 44100, 32000), 72831);
     }
@@ -2432,7 +2426,7 @@ mod service_tests {
         assert_eq!(cents_word(-56), 3968);
         let mut s = Shared::default();
         let c = Arc::new(Clip { rate: 16000, bend_cents: 700, records: vec![r], tables: vec![tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())], ..(*clip(PatchRecord::from_codes(&[]), RecordTables::default())).clone() });
-        s.start_patch(c, 1.0, word as f32 / 4096.0, true, 0x7F, true);
+        s.start_patch(c, 1.0, word, true, 0x7F, true);
         assert_eq!(s.voices[0].1.bend, 0x40);
         assert_eq!(s.voices[0].1.pitch_word(), 3471);
         assert_eq!(resample::step_16_16(3471, 16000, 32000), 27768);
@@ -2446,7 +2440,7 @@ mod service_tests {
         let r = PatchRecord::from_codes(&[(0x07, 57)]);
         let mut s = Shared::default();
         let c = Arc::new(Clip { bend_cents: 1200, records: vec![r], tables: vec![tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())], ..(*clip(PatchRecord::from_codes(&[]), RecordTables::default())).clone() });
-        s.start_patch(c, 1.0, 1.0, true, 0x7F, true);
+        s.start_patch(c, 1.0, resample::PITCH_UNIT, true, 0x7F, true);
         assert_eq!(s.voices[0].1.pitch_word(), cents_word(300), "0x40 is no bend");
         s.voices[0].1.bend = 127;
         assert_eq!(s.voices[0].1.pitch_word(), 9632);
@@ -2510,7 +2504,7 @@ mod service_tests {
     fn the_level_byte_takes_the_envelope_the_table_and_the_curve() {
         let r = PatchRecord { env_level: 0x7F, env_segments: 1, volume_table_len: 3, ..PatchRecord::from_codes(&[]) };
         let t = RecordTables { volume: Some(vec![127, 64, -10]), ..tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec()) };
-        let mut v = Voice::new(clip(r, t.clone()), 1.0, 100.0 / 127.0, false, 0);
+        let mut v = Voice::new(clip(r, t.clone()), resample::PITCH_UNIT, 100.0 / 127.0, false, 0);
         v.level = 99;
         // 127 · 100 · 99 · 127 / 127³ = 77.95 → 77, then · 127 / 127
         assert_eq!(v.level_byte(), 77);
@@ -2522,7 +2516,7 @@ mod service_tests {
         let mut curve = vec![0u8; 256];
         curve[128 + 77] = 120;
         let t = RecordTables { volume: None, curve: Some(curve), ..t };
-        let mut v = Voice::new(clip(r, t), 1.0, 100.0 / 127.0, false, 0);
+        let mut v = Voice::new(clip(r, t), resample::PITCH_UNIT, 100.0 / 127.0, false, 0);
         v.level = 99;
         assert_eq!(v.level_byte(), 120);
     }
@@ -2533,7 +2527,7 @@ mod service_tests {
         let r = PatchRecord { env_level: 0x7F, env_segments: 1, volume_table_len: 2, pitch_table_len: 3, pitch_depth: 128, ..PatchRecord::from_codes(&[]) };
         let t = RecordTables { volume: Some(vec![127, 0]), pitch: Some(vec![0x40, 0x40 + 50, 0x40 - 50]), ..tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec()) };
         let mut s = Shared::default();
-        s.voices.push((VoiceId(0), Voice::new(clip(r, t), 1.0, 1.0, false, 0)));
+        s.voices.push((VoiceId(0), Voice::new(clip(r, t), resample::PITCH_UNIT, 1.0, false, 0)));
         let phases = |s: &Shared| (s.voices[0].1.volume_phase, s.voices[0].1.pitch_phase);
         assert_eq!(phases(&s), (0, 0));
         // the first render runs the service before its first frame
@@ -2553,8 +2547,8 @@ mod service_tests {
     fn a_run_out_envelope_stops_the_group() {
         let r = PatchRecord { env_level: 0x7F, env_segments: 1, ..PatchRecord::from_codes(&[]) };
         let mut s = Shared::default();
-        s.voices.push((VoiceId(3), Voice::new(clip(r, tables(vec![(1, 127)])), 1.0, 1.0, true, 0)));
-        s.voices.push((VoiceId(3), Voice::new(clip(r, tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())), 1.0, 1.0, true, 0)));
+        s.voices.push((VoiceId(3), Voice::new(clip(r, tables(vec![(1, 127)])), resample::PITCH_UNIT, 1.0, true, 0)));
+        s.voices.push((VoiceId(3), Voice::new(clip(r, tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())), resample::PITCH_UNIT, 1.0, true, 0)));
         // tick 1: one tick left → 0; tick 2: past the only segment → 0x565D60 on the handle
         s.render(1, 22050);
         assert_eq!(s.voices.len(), 2);
@@ -2595,8 +2589,8 @@ mod service_tests {
     fn a_released_voice_holds_its_budget_until_the_ramp_stops_it() {
         let r = PatchRecord { env_level: 0x7F, env_segments: 1, ..PatchRecord::from_codes(&[]) };
         let mut s = Shared::default();
-        s.voices.push((VoiceId(4), Voice::new(clip(r, tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())), 1.0, 1.0, true, 0)));
-        s.voices.push((VoiceId(5), Voice::new(clip(r, tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())), 1.0, 1.0, true, 0)));
+        s.voices.push((VoiceId(4), Voice::new(clip(r, tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())), resample::PITCH_UNIT, 1.0, true, 0)));
+        s.voices.push((VoiceId(5), Voice::new(clip(r, tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())), resample::PITCH_UNIT, 1.0, true, 0)));
         s.ramp(VoiceId(4), super::RELEASE_TICKS, super::RELEASE_TARGET);
         // ticks 1…4 fade it; the fifth (0x589611) stops the handle
         s.render(1, 22050);
@@ -2625,7 +2619,7 @@ mod service_tests {
         let r = PatchRecord { env_level: 0x7F, env_segments: 1, ..PatchRecord::from_codes(&[]) };
         let mut s = Shared::default();
         for id in 1..=3 {
-            s.voices.push((VoiceId(id), Voice::new(clip(r, tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())), 1.0, 1.0, true, 0)));
+            s.voices.push((VoiceId(id), Voice::new(clip(r, tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())), resample::PITCH_UNIT, 1.0, true, 0)));
         }
         s.ramp(VoiceId(1), super::RELEASE_TICKS, super::RELEASE_TARGET);
         // an upward ramp (a stream's fade-in shape) is a table voice's: cancelled
@@ -2651,9 +2645,9 @@ mod service_tests {
         // (`RE/notes/sfx.md` "Audit 2026-09-27, audio port 11")
         let r = PatchRecord { env_level: 0x7F, env_segments: 1, ..PatchRecord::from_codes(&[]) };
         let mut s = Shared::default();
-        s.voices.push((VoiceId(1), Voice::new(clip(r, tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())), 1.0, 1.0, true, 0)));
+        s.voices.push((VoiceId(1), Voice::new(clip(r, tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())), resample::PITCH_UNIT, 1.0, true, 0)));
         s.voices[0].1.table = false;
-        s.voices.push((VoiceId(2), Voice::new(clip(r, tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())), 1.0, 1.0, true, 0)));
+        s.voices.push((VoiceId(2), Voice::new(clip(r, tables(nfs_formats::bnk::DEFAULT_ENVELOPE.to_vec())), resample::PITCH_UNIT, 1.0, true, 0)));
         s.silence();
         assert_eq!(s.voices[0].1.vol16, 127 << 16, "not in the table: untouched");
         assert_eq!(s.voices[1].1.vol16, 0, "in the table: silenced");
@@ -2695,7 +2689,7 @@ mod service_tests {
         let peak = |filter: bool| {
             let mut s = Shared::default();
             s.interp = crate::resample::Interp::Linear;
-            let mut v = Voice::new(alt.clone(), 1.0, 1.0, true, 0);
+            let mut v = Voice::new(alt.clone(), resample::PITCH_UNIT, 1.0, true, 0);
             if filter {
                 LowPass::set(&mut v.lowpass, 0xBB8, 22050);
             }

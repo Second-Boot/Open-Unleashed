@@ -16,8 +16,29 @@
 //! not read. *(The SSE cubic 0x59D350 squares its `t²` again and weights the cubic term by `t⁴`;
 //! the game's settings keep it off.)*
 //!
-//! APPROXIMATION left: the x87 intermediates are carried in f64 (the precision the thread's FPU
-//! control word gives them is not read); every f32 store of the original is an f32 rounding here.
+//! APPROXIMATION left: the x87 intermediates are carried in f64; every f32 store of the original is
+//! an f32 rounding here. Narrowed 2026-09-28 (`career.md` §11.4a, `RE/tools/fpucw.py`): every real
+//! `fldcw`/`fnstcw` in the whole `.exe` was surveyed (59 confirmed sites out of ~680 raw opcode
+//! hits, almost all of which turned out to be IAT/global address bytes mis-decoded as instructions,
+//! not real ones) — none of them is in this library's own code, 0x596B60…0x59D350; the resampler,
+//! decoder and mixer never touch the control word themselves. `_ftol` (716 call sites across
+//! `.text`, this library's `fistp`s included) only ever changes rounding control and restores
+//! exactly what it found, so it cannot be the source of a precision difference either. What is
+//! still not read: the *ambient* control word — nothing in `nfs5.exe` sets precision to begin with
+//! (no init-time `fldcw`/`_control87` call exists in the shipped files at all), so whatever the
+//! OS/CRT thread default is stays in effect through the whole audio path, and what DirectX 7's own
+//! runtime (`ddraw.dll`, not part of the shipped files) does to it around a draw call is likewise
+//! not something a read of `nfs5.exe`/`dx7z.dll` can settle.
+//!
+//! **Measured 2026-09-28** (`career.md` §11.4c): nine `gdb -p <pid>; p/x $fctrl` samples of the
+//! running process on a Debian x86_64 test machine, under both the shipped `dx7z.dll` driver
+//! and the repack's default `opengl3` one, at idle and mid-movie — all nine read `0x027F`: PC =
+//! 53-bit (double) precision, RC = round-to-nearest, all exceptions masked. This is the first
+//! direct evidence for the `f64`-intermediate reading below (matches it) but does not retire the
+//! APPROXIMATION: it is wine 5.12's own `ddraw`/`d3d` on Linux, not Microsoft's DX7 runtime on
+//! Windows, and no sample was taken inside a live audio/physics tick (career-mode profile
+//! creation could not be driven to completion through this build's front end in the time
+//! available — `RE/notes/REFERENCE-2026-09-28.md`).
 
 /// 0x599830: the step is capped at 4.0 (`cmp ebx, 0x40000 ; jle`, signed).
 pub const STEP_MAX: u32 = 0x40000;
@@ -37,13 +58,16 @@ pub fn step_16_16(pitch_word: u16, rate: u32, mix_rate: u32) -> u32 {
     step.min(STEP_MAX as i32).max(0) as u32
 }
 
-/// The caller's pitch word `voice+0x6C` for the port's pitch factor: 4096 is 1.0. APPROXIMATION:
-/// the port's callers give a float factor, rounded here to the word. The library's word
-/// `voice+0x6E = voice+0x6C · voice+0x6A >> 12` (0x589FC0), `voice+0x6A` the voice's cents
-/// through 0x589E80, is `mixer`'s (`Voice::pitch_word`, `mixer::cents_word`).
-pub fn pitch_word(pitch: f32) -> u16 {
-    (pitch as f64 * 4096.0).round().clamp(0.0, 65535.0) as u16
-}
+/// The caller's pitch word `voice+0x6C`: 4096 is 1.0, unchanged — every start/update call in the
+/// original hands this word directly (`Voice_play`'s `pitch16_16 >> 4`, `Voice_setPitch`'s low 16
+/// bits, 0x4A9AC5 / 0x565FEB), never a float. *(Until 2026-09-27 (audio port 8, this pass) every
+/// `mixer`/`AudioOutput` caller gave a float factor here, rounded to this word by a port-only
+/// `resample::pitch_word(f32) -> u16` with no counterpart in the original — every caller now hands
+/// the word itself, [`crate::mixer::AudioOutput::play_word`] / `set_word`, so that bridge function
+/// is gone.)* The library's word `voice+0x6E = voice+0x6C · voice+0x6A >> 12` (0x589FC0),
+/// `voice+0x6A` the voice's cents through 0x589E80, is `mixer`'s (`Voice::pitch_word`,
+/// `mixer::cents_word`).
+pub const PITCH_UNIT: u16 = 4096;
 
 /// Which interpolator 0x599830 gives the resampler: `[0x6B48E5]` (config `+0x25`) `>= 50` → the
 /// 4-tap cubic, else the 2-tap linear one (`cmp dl, 0x32 ; sbb eax, eax ; inc eax` into 0x59C080's
@@ -238,8 +262,7 @@ mod tests {
         assert_eq!(step_16_16(4096, 11025, 32000), 22579);
         // capped at 4.0
         assert_eq!(step_16_16(0xFFFF, 44100, 11025), STEP_MAX);
-        assert_eq!(pitch_word(1.0), 4096);
-        assert_eq!(pitch_word(0.5), 2048);
+        assert_eq!(PITCH_UNIT, 4096);
     }
 
     #[test]

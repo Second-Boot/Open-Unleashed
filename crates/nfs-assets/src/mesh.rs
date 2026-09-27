@@ -6,6 +6,7 @@
 //! little-endian A,B,G,R → we read bytes as R,G,B,A which matches white 0xFFFFFFFF either way).
 
 use nfs_formats::crp::{ArticleGeometry, Primitive};
+use nfs_physics::collision::PatchKind;
 use nfs_renderer::{MeshData, Vertex};
 use std::collections::BTreeMap;
 
@@ -21,6 +22,16 @@ pub struct MaterialMesh {
     /// The `pr` record's sphere centre (`+8`), in the article's frame — the point whose square
     /// distance from the eye keys the part in those lists (0x450EF8…0x450F25).
     pub centre: [f32; 3],
+    /// Which patch ctor the original builds this primitive's shapes with (`0x4853C0` quad /
+    /// `0x485C50` triangle — [`PatchKind`]) — only [`article_parts`] (one `MaterialMesh` per `pr`
+    /// primitive) sets this meaningfully, from `p.prim_type` (`4` = quad list, else triangle);
+    /// [`article_meshes`] merges several primitives, possibly of different kinds, into one mesh
+    /// per material, so its `patch_kind`/`prim_index` are not meaningful and are not read by
+    /// anything (see the quad identity tests in `track.rs`).
+    pub patch_kind: PatchKind,
+    /// This primitive's own position in [`ArticleGeometry::primitives`] — set by [`article_parts`]
+    /// only (see [`Self::patch_kind`]); `usize::MAX` from [`article_meshes`].
+    pub prim_index: usize,
 }
 
 /// Convert one article's primitives at the given LOD into per-material meshes.
@@ -35,7 +46,14 @@ pub fn article_meshes(art: &ArticleGeometry, lod: u8, skipped: &mut usize) -> Ve
     let mut by_mat: BTreeMap<u16, MaterialMesh> = BTreeMap::new();
     for p in art.primitives.iter().filter(|p| p.lod == lod) {
         let Some(corners) = primitive_corners(p, skipped) else { continue };
-        let mm = by_mat.entry(p.material).or_insert_with(|| MaterialMesh { material: p.material, mesh: MeshData::default(), flags: p.flags, centre: [p.sphere[0], p.sphere[1], p.sphere[2]] });
+        let mm = by_mat.entry(p.material).or_insert_with(|| MaterialMesh {
+            material: p.material,
+            mesh: MeshData::default(),
+            flags: p.flags,
+            centre: [p.sphere[0], p.sphere[1], p.sphere[2]],
+            patch_kind: PatchKind::Triangle,
+            prim_index: usize::MAX,
+        });
         append_primitive(&mut mm.mesh, p, &corners);
     }
     by_mat.into_values().collect()
@@ -46,11 +64,17 @@ pub fn article_meshes(art: &ArticleGeometry, lod: u8, skipped: &mut usize) -> Ve
 /// sphere (0x450EDB…0x450FCF). The primitive types are [`article_meshes`]'s.
 pub fn article_parts(art: &ArticleGeometry, lod: u8, skipped: &mut usize) -> Vec<MaterialMesh> {
     let mut out = Vec::new();
-    for p in art.primitives.iter().filter(|p| p.lod == lod) {
+    for (i, p) in art.primitives.iter().enumerate().filter(|(_, p)| p.lod == lod) {
         let Some(corners) = primitive_corners(p, skipped) else { continue };
         let mut mesh = MeshData::default();
         append_primitive(&mut mesh, p, &corners);
-        out.push(MaterialMesh { material: p.material, mesh, flags: p.flags, centre: [p.sphere[0], p.sphere[1], p.sphere[2]] });
+        // 0x4750B0 builds one patch per quad or triangle *shape*, not per raw `pr` record — a
+        // `prim_type == 4` record can hold several quads ("sequential quads", `crp-geometry.md`
+        // §4); `TrackGeometry::collision_grid` pairs this mesh's triangles back into quads two at
+        // a time (`nfs_physics::collision::TriangleGrid::patches`), so one `patch_kind` per
+        // primitive is enough — every quad in a quad-list record shares it.
+        let patch_kind = if p.prim_type == 4 { PatchKind::Quad } else { PatchKind::Triangle };
+        out.push(MaterialMesh { material: p.material, mesh, flags: p.flags, centre: [p.sphere[0], p.sphere[1], p.sphere[2]], patch_kind, prim_index: i });
     }
     out
 }

@@ -62,7 +62,13 @@ impl LayoutScreen {
             .and_then(|p| std::fs::read(&p).ok())
             .and_then(|d| nfs_formats::fnt::Font::parse(&d).ok())
             .map(|f| BitmapFont::upload(r, f));
-        let movie = MoviePlayer::open(r, paths, "Movies", eoe::MOVIES[show.movie.min(2)]);
+        // 0x4FEC8E: `(0, 0, 416, 348, audio 1)` — the show's own movie carries a sound flag, so
+        // no catch-up clamp, and (`mad.md` §14) its own `SC**` track, decoded here but not
+        // started: `LayoutScreen::advance_movies`'s own end-of-era branch only ticks this movie
+        // once the show reaches its own trigger (0x4FF76F, `movie_started()`), well after this
+        // constructor runs, and `MoviePlayer::advance` starts a not-yet-started track on its own
+        // first call — so the track starts exactly when the video does, not seconds early.
+        let movie = MoviePlayer::open(r, paths, "Movies", eoe::MOVIES[show.movie.min(2)], true);
         self.end_of_era = Some(EndOfEraScreen { show: std::cell::RefCell::new(show), art, font, movie });
     }
 

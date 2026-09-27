@@ -1,6 +1,15 @@
 //! Regression tests against the original game data. Skipped (with a message) when the
 //! installation is not present; see GAME_PATH.md.
-use nfs_formats::{bigf::Bigf, crp::Crp, fsh::Fsh, ini::Ini, refpack, scn::{ElementKind, Scene}, sim::CarSim};
+use nfs_formats::{
+    bigf::Bigf,
+    crp::Crp,
+    fsh::Fsh,
+    ini::Ini,
+    refpack,
+    sav::{AccessorValue, SaveFile},
+    scn::{ElementKind, Scene},
+    sim::CarSim,
+};
 use std::path::PathBuf;
 
 fn game_root() -> Option<PathBuf> {
@@ -805,4 +814,138 @@ fn mad_audio_track_decodes() {
         assert_eq!((pcm.channels, pcm.rate), (2, 22050), "{name}");
         assert_eq!(pcm.samples.len() / 2, frames, "{name}");
     }
+}
+
+/// `Crp::bundle_of`'s order-sensitive partition (`RE/RENDERING.md` "Bundle order"), measured on
+/// alps (1752 articles): `WInstanceBundle` consumes every `'tr'#0` article first (181), then
+/// `WAnimBundle` only ever sees the 3 of alps' 32 `Anqt`-bearing articles that have *no* `'tr'#0`
+/// (the other 29 were already swept up by Instance — order-sensitivity is real, not a rounding
+/// error: `track_animation_tracks_decode` above independently counts "alps has 32 animated
+/// articles" via `Anim`+`Anqt`, and 32 − 29 = 3 matches). `WMidGroundBundle` then takes 151 by the
+/// `Base.flags & 0x6000` test, and `WStaticBundle`'s catch-all takes the remaining 1417.
+///
+/// `RE/notes/loaders.md`'s "1569 of alps' 1752 articles" figure for the `WStaticBundle` catch-all
+/// does **not** hold — corrected here: that note (and the STATUS/RENDERING.md rows built on it)
+/// assumed `WInstanceBundle` does not consume, so didn't account for it removing 181 `'tr'#0`
+/// articles (which also cost `WAnimBundle` 29 of its 32 candidates) before `WMidGroundBundle` and
+/// `WStaticBundle` ever see the pool. The four counts below are the actual split, read to the
+/// instruction (`0x47820c`/`0x478422`/`0x47859e` for Instance's consuming `'tr'#0` gate,
+/// `0x47781b`/`0x47783e` for Anim's `'Anqt'` gate, `0x47cd67`/`0x47ce37` for MidGround's
+/// `Base.flags & 0x6000` gate, `0x4836ac` for Static's unconditional catch-all).
+#[test]
+fn bundle_of_counts() {
+    let r = need_game!();
+    let p = r.join("GameData").join("Track").join("alps.crp");
+    let Ok(raw) = std::fs::read(&p) else {
+        eprintln!("skipping: no alps.crp");
+        return;
+    };
+    let data = nfs_formats::refpack::maybe_decompress(&raw).unwrap().into_owned();
+    let crp = nfs_formats::crp::Crp::parse(&data).unwrap();
+    let arts = crp.articles(&data).unwrap();
+    assert_eq!(arts.len(), 1752, "alps' Arti count (RE/notes/loaders.md §2.3/§2.4)");
+
+    let mut counts = std::collections::HashMap::<&str, u32>::new();
+    for a in &arts {
+        use nfs_formats::crp::BundleKind::*;
+        let k = match crp.bundle_of(&data, a).unwrap() {
+            Instance => "instance",
+            Anim => "anim",
+            MidGround => "midground",
+            Static => "static",
+        };
+        *counts.entry(k).or_default() += 1;
+    }
+    assert_eq!(counts[&"instance"], 181);
+    assert_eq!(counts[&"anim"], 3);
+    assert_eq!(counts[&"midground"], 151);
+    assert_eq!(counts[&"static"], 1417);
+    // membership is a true partition of the shared pool: every article lands in exactly one bundle.
+    assert_eq!(counts.values().sum::<u32>() as usize, arts.len());
+
+    // WSceneBundle's own (non-consuming) gate: `'tr'#0` and `Base.is_library()`. Every one of
+    // these 70 is also `Instance`-consumed (the two are not mutually exclusive — see
+    // `Crp::bundle_of`'s doc comment).
+    let scene_members = arts.iter().filter(|a| crp.is_scene_member(&data, a).unwrap()).count();
+    assert_eq!(scene_members, 70);
+}
+
+/// `RE/reference/2026-09-28/native_TEST.sav`: a **genuine** `.sav` written by the original
+/// `nfs5.exe` itself (`создать игрока` -> `createplayer.lay` -> `TEST`, picture 0; the game wrote
+/// `SaveData/0TEST.sav`, savegame.md §2.1). Never observed on this machine until 2026-09-28 (§9's
+/// "Genuinely UNKNOWN" note); this test is the byte-for-byte proof the format notes were right,
+/// and pins the three accessor-classification bugs the read found (`savegame.md` "Genuine save
+/// 2026-09-28").
+#[test]
+fn native_test_sav_round_trips_byte_for_byte() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../RE/reference/2026-09-28/native_TEST.sav");
+    let Ok(data) = std::fs::read(&path) else {
+        eprintln!("skipping: {} not present", path.display());
+        return;
+    };
+    assert_eq!(data.len(), 147_726, "the genuine file's own size — corrects an earlier, stale 148798 in the notes");
+
+    let save = SaveFile::parse(&data).expect("a genuine .sav must parse to the end without error");
+    assert_eq!(
+        save.order,
+        ["Missions", "PartsMarket", "Tournament", "PlayerInfo", "TrackRecords", "UsedCarMarket", "Personalities", "Knockout", "CDPlayer", "accessor"],
+        "on-disk module order, SaveInfo's own §3.1 traversal"
+    );
+
+    let player = save.player.as_ref().expect("PlayerInfo");
+    assert_eq!(player.cars.len(), 0, "a brand-new profile owns no car yet (bought later, at the dealership)");
+    assert_eq!(player.money, 11_000, "the fresh-career amount, 0x50140A");
+    assert_eq!(player.picture, 0, "the picture the create screen had selected");
+    // §5.1/§2.2: CREATEPLAYERDONE (0x4DE5B0) loads "XXDefXX" (whose LoadInfo sets playerName to the
+    // *whole* stem, "XXDefXX" itself, §2.2's "except for XXDefXX") and never updates [0x691DC8]
+    // before the SaveInfo that becomes this very file — so the freshly-created file's own
+    // `player_name` field is the stale template name, not "TEST". Confirmed by this real file;
+    // the display name everywhere else is always the file stem (`stem + 1`), never this field, so
+    // it is harmless — and the port's own `career_from_sav` never reads `player_name` either.
+    assert_eq!(player.player_name, "XXDefXX", "harmless leftover from the XXDefXX template load, not a bug — see savegame.md");
+    assert_eq!(player.driver_name, "TEST");
+    assert_eq!(player.seen_evolution_intro, 0);
+    assert_eq!(player.seen_factory_welcome, 0);
+    assert_eq!(player.seen_first_mission, 0);
+    assert_eq!(player.colours, [0; 8]);
+
+    let t = save.tournament.as_ref().expect("Tournament");
+    assert_eq!((t.year, t.era_type, t.current_event, t.current_tournament, t.club_mode), (1950, 521, -1, -1, 0));
+    assert_eq!(t.table.len(), 35 * 0xD40, "the whole nfs5.trn image");
+
+    assert!(save.track_records, "the TrackRecords module name is present, contributing no bytes");
+    let used = save.used_cars.as_ref().expect("UsedCarMarket");
+    assert_eq!((used.year, used.cars.len()), (1950, 0));
+    assert!(save.personalities.as_ref().unwrap().is_empty());
+    assert_eq!(save.knockout.as_ref().unwrap().len(), 0x84);
+    assert_eq!(save.knockout.as_ref().unwrap(), &vec![0u8; 0x84], "an unstarted knockout series");
+
+    // The accessor block: three real classification bugs surfaced only by these genuine bytes
+    // (2026-09-28), each fixed in `sav::ACCESSORS` — this test is their regression guard.
+    let acc = save.accessors.as_ref().expect("accessor block");
+    let get = |name: &str| acc.entries.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone());
+    // 1) `CDPlayer.Title` was missing from the 220-name table entirely (ctor 0x4BED90 ->
+    //    0x4BC1F0, FEPositionableAccessor, plain dword) — the table is 223 names now.
+    assert_eq!(get("CDPlayer.Title"), Some(AccessorValue::Dword(0)));
+    // 2) `DealerCar.Colour` and `GenericCar.Colour` were classed as the dword-only
+    //    FEGenericCarAccessor; they are actually FEColourAccessor (ctor 0x4B91F0, vtable
+    //    0x5B4E60, Save/Load 0x4B9520/0x4B9550) — 8 bytes (selection + rgba), not 4. Getting
+    //    this wrong desyncs every accessor after it.
+    assert_eq!(get("DealerCar.Colour"), Some(AccessorValue::Colour { selection: 0, rgba: 0xFFF3FFCC }));
+    assert_eq!(get("GenericCar.Colour"), Some(AccessorValue::Colour { selection: 0, rgba: 0xFFF3FFCC }));
+    assert_eq!(get("DealerCar.Car"), Some(AccessorValue::Dword(0)), "DealerCar.Car really is FEGenericCarAccessor/dword");
+    // 3) `Parts.RepairShoppingList` (FEPartsDamageRepairShoppingList, ctor 0x516FE0) and
+    //    `Parts.ShoppingList` (FEPartsShoppingBasket, ctor 0x515DF0) were missing entirely —
+    //    both a plain dword (vtables 0x5BA434/0x5BA2E0, Save/Load 0x4BC460/0x4BC480).
+    assert_eq!(get("Parts.RepairShoppingList"), Some(AccessorValue::Dword(0)));
+    assert_eq!(get("Parts.ShoppingList"), Some(AccessorValue::Dword(0)));
+    // the per-widget dynamic accessor this save happens to carry
+    assert_eq!(get("ID_USERSELECTBOX.Sliderbar"), Some(AccessorValue::Dword(0)));
+    assert_eq!(acc.entries.len(), 224, "223 static + 1 dynamic slider");
+
+    // The whole point: with the three fixes above, parsing this genuine file and writing it back
+    // reproduces it byte for byte — no header, no checksum, nothing left unaccounted for.
+    let out = save.write();
+    assert_eq!(out.len(), data.len());
+    assert_eq!(out, data, "SaveFile::write() must reproduce the genuine file exactly");
 }

@@ -153,18 +153,23 @@ impl TrackGeometry {
     /// `surface_of(material)` = the CRP `mt` flags word (surface type = `& 0xF`, 0 = not drivable —
     /// CONFIRMED, RE/notes/suspension-collision.md §7); the material index is kept in the upper bits.
     pub fn collision_grid(&self, cell_size: f32, surface_of: &dyn Fn(u16) -> u32) -> nfs_physics::collision::TriangleGrid {
-        use nfs_physics::collision::{Triangle, TriangleGrid};
+        use nfs_physics::collision::{PatchSource, Triangle, TriangleGrid};
         let mut tris = Vec::new();
         let mut push = |art: &ArticleMeshes, m: glam::Mat4| {
             for mm in &art.meshes {
                 let v = &mm.mesh.vertices;
                 let surface = (surface_of(mm.material) & 0xFFFF) | ((mm.material as u32) << 16);
+                // Primitive identity (quadtree prerequisite 1, `RE/RENDERING.md` "What the tree
+                // holds"): tag every triangle with the `pr` primitive and patch ctor it came from
+                // so `TriangleGrid::patches` can recount a quad's two triangles as the one entry
+                // the original's `0x4853C0` builds — this changes no triangle geometry/order.
+                let source = Some(PatchSource { article: art.index, primitive: mm.prim_index, kind: mm.patch_kind });
                 for idx in mm.mesh.indices.chunks_exact(3) {
                     let p = |i: u32| m.transform_point3(glam::Vec3::from(v[i as usize].position));
                     // the vertex colours ride along: the original lights a car from the patch it
                     // stands on (0x474700, `RE/notes/lighting.md`)
                     let c = |i: u32| v[i as usize].color.map(|x| (x.clamp(0.0, 1.0) * 255.0) as u8);
-                    tris.push(Triangle { a: p(idx[0]), b: p(idx[1]), c: p(idx[2]), surface, colors: [c(idx[0]), c(idx[1]), c(idx[2])] });
+                    tris.push(Triangle { a: p(idx[0]), b: p(idx[1]), c: p(idx[2]), surface, colors: [c(idx[0]), c(idx[1]), c(idx[2])], source });
                 }
             }
         };
@@ -525,5 +530,59 @@ mod headlight_tests {
             }
         }
         assert!(own > 0);
+    }
+}
+
+#[cfg(test)]
+mod quad_identity_tests {
+    //! Quadtree prerequisite 1 (quad identity, `RE/RENDERING.md` "What
+    //! the tree holds"): synthetic geometry, no game data needed, exercised through the real
+    //! `article_parts` → `collision_grid` → `TriangleGrid::patches` path.
+    use super::*;
+    use nfs_formats::crp::{ArticleGeometry, Primitive};
+
+    fn primitive(prim_type: u16, positions: Vec<[f32; 3]>) -> Primitive {
+        Primitive { lod: 0, prim_type, flags: 0, material: 0, sphere: [0.0; 4], positions, normals: vec![], uvs: vec![], colors: vec![], vertex_indices: vec![], uv_indices: vec![], vt_first: 0 }
+    }
+
+    /// One `prim_type == 4` quad and one `prim_type == 3` triangle in the same article: through
+    /// `article_parts` and `collision_grid`, the quad's two triangles must come back as ONE patch
+    /// (the original's `0x4853C0` builds one entry per quad, `RE/notes/
+    /// suspension-collision.md` §1.2), the triangle as one patch of one triangle, and each must
+    /// carry the article's own index — not lost by expanding the quad at parse time.
+    #[test]
+    fn a_quad_and_a_triangle_survive_collision_grid_as_two_patches() {
+        let quad = primitive(4, vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 0.0, 1.0]]);
+        let tri = primitive(3, vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 0.0, 2.0]]);
+        let geometry = ArticleGeometry { name: "test".into(), base: None, transform: None, transforms: vec![], primitives: vec![quad, tri] };
+        let mut skipped = 0;
+        let meshes = article_parts(&geometry, 0, &mut skipped);
+        assert_eq!(skipped, 0);
+        assert_eq!(meshes.len(), 2);
+        assert_eq!(meshes[0].patch_kind, nfs_physics::collision::PatchKind::Quad);
+        assert_eq!(meshes[0].prim_index, 0);
+        assert_eq!(meshes[1].patch_kind, nfs_physics::collision::PatchKind::Triangle);
+        assert_eq!(meshes[1].prim_index, 1);
+
+        let article = ArticleMeshes { name: "test".into(), meshes, lods: vec![], transform: glam::Mat4::IDENTITY, tag: 0, animation: None, index: 5 };
+        let geometry = TrackGeometry { world: vec![article], library: vec![], instances: vec![], skipped_primitives: 0 };
+        let grid = geometry.collision_grid(20.0, &|_| 1);
+        let patches = grid.patches();
+        assert_eq!(patches.len(), 2, "the quad's pair collapses to one patch, not two");
+
+        let quad_patch = &patches[0];
+        assert_eq!(quad_patch.kind, nfs_physics::collision::PatchKind::Quad);
+        assert_eq!(quad_patch.article, 5, "the article's own index, not lost");
+        assert_eq!(quad_patch.primitive, 0);
+        assert_eq!(quad_patch.tris.len(), 2, "one patch, its two triangle indices");
+        // ¼·Σ of the quad's four corners (0x4855C0), not a mean over both triangles' six corners
+        assert!((quad_patch.centroid - glam::Vec3::new(0.5, 0.0, 0.5)).length() < 1e-6);
+
+        let tri_patch = &patches[1];
+        assert_eq!(tri_patch.kind, nfs_physics::collision::PatchKind::Triangle);
+        assert_eq!(tri_patch.article, 5);
+        assert_eq!(tri_patch.primitive, 1);
+        assert_eq!(tri_patch.tris.len(), 1);
+        assert!((tri_patch.centroid - glam::Vec3::new(2.0 / 3.0, 0.0, 2.0 / 3.0)).length() < 1e-6);
     }
 }

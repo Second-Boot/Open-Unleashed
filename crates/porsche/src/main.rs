@@ -2946,9 +2946,14 @@ impl App {
     ///
     /// The port's accessors keep their own indices, so the setter is reached as the difference
     /// from the current row through `set_accessor`, whose wrap or clamp lands exactly on `row`
-    /// for any `row` inside the list. GAP: `zMergedList.Car`'s list-A half (the garage cars) —
-    /// the port's merged selection is the catalogue's index alone (`combo_rows`), so a garage row
-    /// is not committed.
+    /// for any `row` inside the list. **`zMergedList.Car`'s list-A half (the garage cars),
+    /// settled 2026-09-27**: a row below list A's count is `A->slot11(row)`, which is
+    /// `FEOwnedCarAccessor`'s own **0x4F5BF0** — the exact function `OwnedCars.Car`'s own combo
+    /// reaches, so `row` lands on the same owned car it would standalone (`garage_rows`'s own
+    /// numbering, headings and all) — reached here through `set_accessor("OwnedCars.Car", …)`,
+    /// the difference from that accessor's own current row. `car_garage` then records list A as
+    /// current, matching 0x4F0A30's own `[+0x18] = row` on the merged accessor itself.
+    /// *(Until 2026-09-27 a garage row closed the list and committed nothing.)*
     fn combo_select(&mut self, name: &str, row: usize) {
         let base = name.split_once('(').map_or(name, |(b, _)| b.trim());
         if COLOUR_ACCESSORS.contains(&base) {
@@ -2965,8 +2970,16 @@ impl App {
         if base == "zMergedList.Car" {
             let a = rows.len().saturating_sub(self.fe.menu.as_ref().map_or(0, |m| m.cars.len()));
             if row < a {
-                tracing::debug!(row, "zMergedList.Car: a garage row is not committed (GAP)");
+                let cur_a = self.combo_rows("OwnedCars.Car").and_then(|(_, at)| at).unwrap_or(0);
+                self.set_accessor("OwnedCars.Car", row as i32 - cur_a as i32);
+                if let Some(m) = self.fe.menu.as_mut() {
+                    m.car_garage = true;
+                }
                 return;
+            }
+            // list B: the merged accessor's own index moves into the catalogue half too
+            if let Some(m) = self.fe.menu.as_mut() {
+                m.car_garage = false;
             }
         }
         let cur = cur.unwrap_or(0);
@@ -3093,9 +3106,16 @@ impl App {
                 rows.extend(m.cars.iter().map(|c| {
                     ListRow::Text(if short { c.family.to_string() } else { c.display_name.to_string() })
                 }));
-                // the port's selection is an index into the catalogue (list B), so it sits at
-                // `A.count + car_idx` in the merged numbering
-                Some((rows, Some(a + m.car_idx)))
+                // **the current row, either half.** `slot10()`'s own field is `car_garage`
+                // (0x4F4DF0, above): below `A.count` it is the garage's own row — `garage_rows`
+                // over the same `select` finds it — otherwise `A.count + car_idx` into the
+                // catalogue (list B).
+                let cur = if m.car_garage {
+                    self.garage_rows(&mut Vec::new(), short, self.career.as_ref().map_or(usize::MAX, |c| c.car_sel))
+                } else {
+                    Some(a + m.car_idx)
+                };
+                Some((rows, cur))
             }
             // the car tables — `(SHORT)` is the family name, the plain form the display name,
             // exactly as the caption resolves them
@@ -3308,6 +3328,40 @@ impl App {
         match self.choice_index("Graphics.SpecialFX").map(|(i, _)| i) {
             Some(i) if i < 3 => i,
             _ => 3,
+        }
+    }
+
+    /// `0x44EC80`'s `LayerFalseSort1`/`2` pick, read to the instruction (`RE/notes/thrash.md`
+    /// §6d.4, [`nfs_renderer::FakeSortMode`]'s doc): 0/1 always `Single`, 3 always `Double`; 2
+    /// picks by `REPLAY [0x657424] ≥ 2` (`self.replay.stream`'s mode `Playing`/`Exhausted`) — the
+    /// two tests are mutually exclusive, not one falling through to the other:
+    ///
+    /// * `REPLAY ≥ 2`: `Double` while the smoothed frame time `[0x627ED8]` is under 37.5 ms, else
+    ///   `PerItem` — APPROXIMATION: the port has no smoothed-frame-time counter to port, so this
+    ///   reads the last real frame's own `self.frame_dt` instead of a low-pass-filtered one;
+    /// * `REPLAY < 2`: `Single` while the player car's speed (`+0x35C`, `Vehicle::speed_est`) is
+    ///   15 m/s or more, else `PerItem`.
+    ///
+    /// `level` is `None` off the race (`special_fx_level` not called): kept at the construction
+    /// default, `Double` — the front end draws no `FakeSort` track material, so this never shows.
+    fn fakesort_mode(&self, level: Option<usize>) -> nfs_renderer::FakeSortMode {
+        use nfs_renderer::FakeSortMode::{Double, PerItem, Single};
+        let Some(level) = level else { return Double };
+        if level < 2 {
+            return Single;
+        }
+        if level >= 3 {
+            return Double;
+        }
+        let replaying = matches!(
+            self.replay.stream.as_ref().map(|r| r.mode),
+            Some(nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted)
+        );
+        if replaying {
+            if self.frame_dt * 1000.0 < 37.5 { Double } else { PerItem }
+        } else {
+            let speed = self.vehicle.as_ref().map(|v| v.speed_est).unwrap_or(0.0);
+            if speed >= 15.0 { Single } else { PerItem }
         }
     }
 
@@ -3744,6 +3798,15 @@ struct Menu {
     cars: Vec<nfs_formats::fedata::CarCatalogEntry>,
     track_idx: usize,
     car_idx: usize,
+    /// **`zMergedList.Car`'s own current index, which half it is in.** `FEMergedCarListAccessor`
+    /// keeps one index (`[this+0x18]`, its base's own `[+0x18]`); 0x4F4DF0 (`bind_mergedlist_panel`,
+    /// `fe_carsetup_blocked`) tests it against list A's count (`[esi+0x28]->slot9()`) with
+    /// `cur = acc->slot10()` — `setl`, `cur < n` — to tell "an owned car" from "one you do not
+    /// own". The commit, **0x4F49F0** (§4.171.7 corrected below), sets this the same way it routes:
+    /// `true` after a row **below** list A's count (the garage, `OwnedCars.Car`, whose own index is
+    /// `Career::car_sel`), `false` after one at or past it (the catalogue, `GenericCar.Car`,
+    /// `car_idx` above). *(Until 2026-09-27 the merged selection was always the catalogue's.)*
+    car_garage: bool,
     /// `locationsetup.lay`'s table of knockout rounds: one row per opponent, each with its own
     /// track, laps, direction and traffic. `Knockout.TrackNumber`'s accessor (0x4BA760) asks
     /// `Game.NumKOOpponents` for the row count and answers the empty string for a row past it
@@ -4845,6 +4908,16 @@ struct FrontEnd {
     layout_name: Option<String>,
     /// selected button on the previewed screen, and the screens we came from
     layout_sel: usize,
+    /// whether `layout_sel` has actually been moved by an Up/Down press on this screen —
+    /// gates the "selected" state (§4.111: `[widget+0x10C] & 8`, set only by the chronicle's
+    /// five model-group buttons, 0x5077D0) so the port's own keyboard cursor — an APPROXIMATION
+    /// the original has no counterpart for (`controls.md` §4.170.2, the FE is pointer-only,
+    /// §4.38) — is never painted before the player has actually used it. Before any Up/Down,
+    /// `layout_sel` still names the control ENTER would activate (index 0, as the original's own
+    /// tab order would put the first control), but nothing highlights it — matching the
+    /// original's idle screens, where no widget is ever `selected` by default. Reset to `false`
+    /// wherever `layout_sel` resets to 0 (a fresh screen); set on `MenuKey::Up` / `MenuKey::Down`.
+    layout_nav_used: bool,
     /// the combo whose list is open, by the flattened index `combo_sliders` uses
     layout_open_combo: Option<usize>,
     /// a list whose scrollbar knob is being dragged: which list, where the grab was, and the
@@ -5914,6 +5987,13 @@ impl App {
             // `0x4F4360(0x5048D0(0x504800()))`, the prize car `+0x10C` of the completed era's
             // finale record (`App::prize_car`)
             "PrizeCars.Car" if self.career.is_some() => self.prize_car(),
+            // **`zMergedList.Car` while the merged index is in the garage half** — `car_garage`
+            // (0x4F4DF0, above): the same record `OwnedCars.Car` answers.
+            "zMergedList.Car" if self.fe.menu.as_ref().is_some_and(|m| m.car_garage) => {
+                let c = self.career.as_ref()?;
+                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
+                c.tables.car(c.career.garage.get(idx)?.car_id)
+            }
             // the same list the port's other car accessors answer from
             "zMergedList.Car" | "OpponentCar.Car" | "PrizeCars.Car"
             | "DealerCar.Car" | "GenericCar.Car" | "CARSETTINGS.CAR" => {
@@ -6848,9 +6928,10 @@ impl App {
     /// its paint". Five screens carry the pair, at the same `pos` in each: `QuickRace`,
     /// `creategame`, `joingame`, `knockout` and `quickknockout`. §4.115.
     ///
-    /// This port's merged list is the catalogue, one row per record, so it cannot compare indices
-    /// the way 0x4F4DF0 does; it asks the same question of the selection instead — is a car with
-    /// this record's id in the garage. Recorded as the one difference.
+    /// *(Correction, 2026-09-27: the port's merged list now keeps this same index — `car_garage`
+    /// — so `owned` below is 0x4F4DF0's own `cur < n` directly, not the id-match this used to
+    /// stand in with; the two can differ when the player owns a car of the same model as the
+    /// catalogue row they currently have picked.)*
     fn bind_mergedlist_panel(&mut self) {
         let Some(l) = self.fe.layout_preview.as_ref() else { return };
         let names = ["ID_MERGEDLISTCARSETUP", "ID_MERGEDLISTCOLOR"];
@@ -6858,12 +6939,7 @@ impl App {
         if want.is_empty() {
             return;
         }
-        let owned = self
-            .fe.menu
-            .as_ref()
-            .and_then(|m| m.cars.get(m.car_idx))
-            .zip(self.career.as_ref())
-            .is_some_and(|(car, c)| c.career.garage.iter().any(|g| g.car_id == car.id));
+        let owned = self.fe.menu.as_ref().is_some_and(|m| m.car_garage);
         if let Some(l) = self.fe.layout_preview.as_mut() {
             for (index, which) in want {
                 l.set_hidden_flag(index, if which == 0 { !owned } else { owned });
@@ -7132,11 +7208,10 @@ impl App {
         if want.is_empty() {
             return;
         }
-        // and the timeline's own five columns, which the same screen carries (§4.122)
-        let cols: Vec<(u32, usize)> = match self.chronicle_column() {
-            Some(c) => self.chronicle_columns().into_iter().skip_while(|x| *x != c).take(5).collect(),
-            None => Vec::new(),
-        };
+        // and the timeline's own five columns, which the same screen carries (§4.122). The walk
+        // always starts at the opening column (0x507E20 never rewrites it, §4.121) — a click only
+        // picks a column to open a sub-screen from (§4.120), it does not move the timeline itself.
+        let cols: Vec<(u32, usize)> = self.chronicle_columns();
         // the icons of the ten cells: `0x507340(year, row, variant, hot)` for rows 0 and 1
         // (0x507DDB loops `ebx < 2`), each answering the resting frame and the hovered one
         const PACKS: [&str; 5] = ["iconsrace", "icons911", "icons356", "icons924", "icons914"];
@@ -7291,27 +7366,66 @@ impl App {
 
     /// 0x5074A0's list for the screen the port is on: `<kind><group><yy><i><variant>.fsh` for
     /// `i` = 1…4, stopping at the first one that is not on disk.
-    /// The timeline's columns: the index's distinct **(year, variant)** pairs, which is what
-    /// 0x507B4F's walk settles on — it asks 0x507340 for all three kinds and moves to the next
-    /// year only when the variant it is on has none of them (0x507B93). §4.120.
+    ///
+    /// **The timeline's five columns — re-read 2026-09-28, correcting the paragraph this replaces.**
+    /// The old reading ("the index's distinct (year, variant) pairs") was wrong: it collapsed
+    /// every year with *no* data at all, so the timeline only ever showed years the pack has
+    /// something for, back to back. Disassembling 0x507B4F itself (not just its neighbours) shows
+    /// that is not what the original does.
+    ///
+    /// The loop that builds one column, **0x507B59…0x507B93**:
+    ///
+    /// ```text
+    /// 0x507B59  for kind in 0..3: 0x507340(year, kind, variant, hot=0)
+    /// 0x507B70    art != 0            -> skip the counter (this kind has something)
+    /// 0x507B78    variant <= 0        -> skip the counter (variant 0 is never rolled over)
+    /// 0x507B7A    else                -> miss += 1
+    /// 0x507B8C  miss == 3 (all three kinds empty, and variant was > 0)
+    /// 0x507B93    -> year += 1, variant = 0
+    /// 0x507BA0  write (year, variant) as this column, regardless of whether anything is there
+    /// ```
+    ///
+    /// So the roll-over test **never fires at variant 0** — `jle 0x507B78` skips the `miss`
+    /// increment outright — which means a year with nothing in it is still shown, blank, as long
+    /// as the walk reaches it at variant 0. The only years the walk ever skips are *extra*
+    /// variants (1, 2, …) of a year that turns out to have nothing beyond variant 0.
+    ///
+    /// The outer per-column step, **0x507DE8…0x507E0E** (the loop back to 0x507B4B): `variant`
+    /// is incremented **unconditionally** for the next column — there is no search for "the next
+    /// column with data" anywhere in this function. Read together, the walk is: start at
+    /// `(chronicle_year(), 0)`; for each of the five columns, roll `(year, variant)` over to
+    /// `(year + 1, 0)` only when `variant > 0` and none of the three kinds has anything there;
+    /// emit the (possibly rolled) `(year, variant)`; then bump `variant` by one for the next
+    /// column. On this installation's 356 pack that gives `1948, 1949, 1950, 1951, 1952` —
+    /// consecutive years, most of them with nothing in the `фото`/`постер` rows because 1949,
+    /// 1951 and 1952 have no chronicle files at all — which is the original's own on-screen
+    /// behaviour, not a career gate: 0x506FE0 (§4.118, re-read the same day) never touches a
+    /// career global, and rendering this port's own `chronicle` golden from a completely empty
+    /// `NFS5_SAVE_DIR` byte-for-byte matches the pristine-career render, confirming the screen is
+    /// state-independent end to end.
     fn chronicle_columns(&self) -> Vec<(u32, usize)> {
-        let mut v: Vec<(u32, usize)> = self.chronicle_index().into_iter().map(|(y, _, var)| (y, var)).collect();
-        v.sort();
-        v.dedup();
-        v
+        let entries = self.chronicle_entries();
+        let has = |yy: u32, variant: usize| entries.iter().any(|(y, _, v, _)| *y == yy && *v == variant);
+        let start = ((self.chronicle_year() - 1900) % 100) as u32;
+        let (mut yy, mut variant) = (start, 0usize);
+        let mut out = Vec::with_capacity(5);
+        for _ in 0..5 {
+            if variant > 0 && !has(yy, variant) {
+                yy += 1;
+                variant = 0;
+            }
+            out.push((yy, variant));
+            variant += 1;
+        }
+        out
     }
 
-    /// The (year, variant) the chronicle is on: the column a click has picked, else the one the
-    /// timeline opens at — **0x507999** asks the `Chronicle.Year` accessor the bind 0x507E65 put
-    /// in `[this+0x148]`, takes 0x76C (1900) off it and keeps the remainder mod 100 (0x5079AF),
-    /// and 0x507B4F's walk starts there at variant 0 and only ever moves forward. §4.121.
+    /// The (year, variant) the chronicle is on: the column a click has picked (0x5080C0's row
+    /// handler reads it off `[this+0x160/0x174 + 4*col]`, the very table 0x507B4F fills), else the
+    /// timeline's own opening column, index 0 of [`Self::chronicle_columns`]. §4.120, §4.121.
     fn chronicle_column(&self) -> Option<(u32, usize)> {
         let cols = self.chronicle_columns();
-        if let Some(c) = self.fe.chronicle_col.and_then(|c| cols.get(c).copied()) {
-            return Some(c);
-        }
-        let start = ((self.chronicle_year() - 1900) % 100) as u32;
-        cols.iter().copied().find(|(y, _)| *y >= start).or_else(|| cols.first().copied())
+        self.fe.chronicle_col.and_then(|c| cols.get(c).copied()).or_else(|| cols.first().copied())
     }
 
     fn chronicle_media(&self) -> Vec<String> {
@@ -7645,13 +7759,17 @@ impl App {
         //
         // The port plays the first clip and does not rotate: what advances `[this+0x1B8]` is the
         // player's own end-of-clip, which this port's loop does not signal.
-        let movies: Vec<(usize, String)> = l
+        // `data.audio` (default 1, `MovieBox.ctr` / `MovieCircle.ctr`) is `FEMovie`'s own
+        // `[+0x75]` — whether the shared tick 0x4E25A0 (`frontend-3d.md` §11) may skip frames to
+        // catch up after a stall (`MoviePlayer::catchup`).
+        let movies: Vec<(usize, String, bool)> = l
             .numbered_widgets("NFS5.MOVIEBOX")
             .into_iter()
             .filter_map(|(i, _)| {
                 const CHRONICLE_MOVIE: [&str; 5] = ["ch5", "Ch3", "Ch1", "Ch2", "Ch4"];
                 let src = l.layout.elements[i].get("othersource")?;
-                src.eq_ignore_ascii_case("chroniclemain").then(|| (i, format!("{}.mad", CHRONICLE_MOVIE[self.fe.chronicle_group.min(4)])))
+                let audio = l.layout.elements[i].get("audio") != Some("0");
+                src.eq_ignore_ascii_case("chroniclemain").then(|| (i, format!("{}.mad", CHRONICLE_MOVIE[self.fe.chronicle_group.min(4)]), audio))
             })
             .chain(l.numbered_widgets("NFS5.MOVIECIRCLE").into_iter().filter_map(|(i, _)| {
                 let file = match l.layout.elements[i].get("othersource")? {
@@ -7659,7 +7777,8 @@ impl App {
                     s if s.eq_ignore_ascii_case("careerfirst") => "er1pc-av.mad",
                     _ => return None,
                 };
-                Some((i, file.to_string()))
+                let audio = l.layout.elements[i].get("audio") != Some("0");
+                Some((i, file.to_string(), audio))
             }))
             .collect();
         let huds = l.numbered_widgets("NFS5.HUD");
@@ -7670,8 +7789,8 @@ impl App {
         for (index, entry) in faces {
             l.set_pack_picture(r, &self.paths, "Art", index, "FactoryPeople.fsh", entry);
         }
-        for (index, file) in movies {
-            l.set_movie(r, &self.paths, index, "Movies", &file);
+        for (index, file, audio) in movies {
+            l.set_movie(r, &self.paths, index, "Movies", &file, audio);
         }
         // `NFS5.HUD`'s own art: 0x4CB65D builds `<Art>hud.fsh` and 0x4CB685 keeps all **fifteen**
         // of its entries at `widget + 0x178 + 4i`. Entry 0 is `disp`, 240×180 — the size
@@ -7812,7 +7931,8 @@ impl App {
     /// (`nfs_game::career::knockout_start`).
     fn knockout_start(&mut self) {
         let Some(m) = self.fe.menu.as_ref() else { return };
-        let Some(car_id) = m.car().map(|c| c.id) else { return };
+        // `zMergedList.Car`'s own car — the garage half's own record while `car_garage` holds
+        let Some(car_id) = self.logo_car(Some("zMergedList.Car"), None).map(|c| c.id) else { return };
         let (opp_choice, n) = (m.opp_car as u32, m.ko_opponents as i32);
         let catalog = self.fe_car_catalog();
         let selected = catalog.iter().position(|c| c.id == car_id).unwrap_or(0);
@@ -7952,6 +8072,9 @@ impl App {
         };
         self.save_replay();
         self.replay_session_end();
+        // 0x501340 + `LoadInfo` (0x4D3B52), before this race's own filing — same rule as
+        // `file_track_record`'s own reload, applied to the career
+        self.reload_career_at_fe_entry();
         self.settle_mission();
         if self.career.as_ref().is_some_and(|c| c.pending.is_some()) {
             let (order, times) = self.finishing_order();
@@ -8039,6 +8162,9 @@ impl App {
         // 0x4D5207: neither the race end 0x4EDD00 nor the series test 0x4D3F0A runs for it
         let playback = self.fe.after_replay;
         let zones = self.result_damage();
+        // 0x501340 + `LoadInfo` (0x4D3B52): every return to the front end reloads the profile,
+        // aborted or a replay alike, before the abort arm of 0x4EDD00 runs
+        self.reload_career_at_fe_entry();
         if let Some(c) = self.career.as_mut().filter(|_| !playback) {
             // an aborted tournament race still runs the race end 0x4EDD00: the damage goes back
             // on the car, the market ticks, the current event is reset and nothing is filed
@@ -8258,10 +8384,46 @@ impl App {
         self.fe.remaining_sel = 0;
     }
 
+    /// **0x501340 + 0x4D3B52's `LoadInfo`** — the FE-entry reset and reload, `controls.md` §4.172:
+    /// on *every* front-end entry (start-up; the return from a race, a replay or a Factory Driver
+    /// skill test — all of them re-enter `FEApplication::run` 0x4D3420), the preamble zeroes the
+    /// live `PlayerInfo` block (0x501340: money `[0x691D90]` = 11000, the garage
+    /// `[0x691DF8]`/owned-list `[0x691DFC]` vectors, the flags `0x691D90…0x691DFC`, picture
+    /// `[0x5DB748]` = 8) and then unconditionally reloads the current profile from disk
+    /// (`LoadInfo` 0x4DF3C0 + 0x4DE9B0), which overwrites every one of those fields with the
+    /// `.sav`'s own values. Net effect, since nothing else in the original writes a field the
+    /// reload does not also set: **discard whatever the live career holds and read the profile
+    /// back off disk** — the same operation `CareerUi::switch_profile` already does for an
+    /// explicit profile switch, just aimed at the *current* profile rather than a different one.
+    /// Called before this race's own result is filed (`park`/`finish`/`finish_mission`), exactly
+    /// where 0x4D3B52 sits relative to the race-end dispatch table 0x4D3EB2's own 0x4EDD00 — the
+    /// same ordering rule already applied to `LoadTrackRecords` 0x4FAE20 in
+    /// [`Self::file_track_record`]'s own doc. Decided 2026-09-28: port this
+    /// as the original — an unsaved purchase, sale, repair or flag change vanishes at the next FE
+    /// entry unless a race was launched, `LOADGAMEBUTTON` was pressed or the profile was created
+    /// in between (`RE/notes/savegame.md`, "Save timing, ported 2026-09-28"). No-op when there is
+    /// no career (a non-career session) or the profile file does not parse yet (first-ever entry,
+    /// before any of the three save sites has run) — `fe_profile_loadable`'s own check below
+    /// still decides whether the screen stack can be rebuilt at all.
+    fn reload_career_at_fe_entry(&mut self) {
+        if let Some(c) = self.career.as_mut() {
+            let p = c.profile.clone();
+            let money_before = c.career.money;
+            if c.switch_profile(&p) {
+                tracing::debug!(profile = %p.name, money = c.career.money, money_before, "front end: profile reloaded from disk (0x501340 + 0x4D3B52)");
+            } else {
+                tracing::debug!("front end: profile reload at FE entry found nothing on disk yet (0x4D3B52) — keeping the live career");
+            }
+        }
+    }
+
     /// **0x4DF3C0(0)** then **0x4DE9B0**(name, 0) as 0x4D3B52 calls them: `player.lst` in the
     /// save directory names the profile (at most 100 bytes, 0x4DF3F6) and `LoadInfo` must read
-    /// its `.sav`. The port's test is that the file parses (`CareerUi::switch_profile`'s);
-    /// the reload itself is not repeated — the port's career is already the saved one.
+    /// its `.sav`. The port's test is that the file parses (`CareerUi::switch_profile`'s); the
+    /// actual reload is [`Self::reload_career_at_fe_entry`], called by every caller of this check
+    /// before the race's own result is filed. *(Until 2026-09-28 the reload was not repeated —
+    /// `savegame.md`'s "when the profile is saved" question, answered "as the
+    /// original".)*
     fn fe_profile_loadable(&self) -> bool {
         let dir = nfs_game::save::save_dir();
         nfs_game::save::read_player_lst(&dir)
@@ -9011,6 +9173,13 @@ impl App {
                     if let Some(tr) = &self.road.traffic {
                         others.extend(tr.cars.iter().filter(|c| c.active).map(|c| c.as_lane_car(t)));
                     }
+                    // world positions in `others`' own order — the player, the opponents, the
+                    // traffic — for `Police::lane_pass`'s `0x40E860` fine step (`traffic.md` §34.6);
+                    // `TrafficSet::ai`'s `other_positions` is the same idea for a traffic car's pass.
+                    pol.other_positions = std::iter::once(v.position)
+                        .chain(self.road.opponents.iter().map(|o| o.vehicle.position))
+                        .chain(self.road.traffic.iter().flat_map(|tr| tr.cars.iter().filter(|c| c.active).map(|c| c.position)))
+                        .collect();
                     // the AI pass's gate phase: the cops' slots follow the human's and the
                     // opponents' (0x4ECF00, `edi = nP + nOpp`)
                     pol.slot_base = 1 + self.road.opponents.len();
@@ -9394,12 +9563,12 @@ impl App {
             // 0x4980D0's rounds collide each car's walls again between them (0x495020)
             let tick = self.tick as u32;
             let mut racer_walls = |c: &mut nfs_physics::vehicle::Vehicle| {
-                c.collide_walls(&w.walls, &patch_height, 0.0, 0.0, 0.0);
+                c.collide_walls(&w.walls, &w.tree, &patch_height, 0.0, 0.0, 0.0);
                 c.collide_props(&w.props, tick);
             };
             // the human's pass: its walls and props (no earlier car to pair with)
             v.impact = 0.0;
-            if v.collide_walls(&w.walls, &patch_height, 0.0, 0.0, 0.0) {
+            if v.collide_walls(&w.walls, &w.tree, &patch_height, 0.0, 0.0, 0.0) {
                 ground_event = None;
                 player_spark = Some(v.last_wall_effect);
                 self.wall_hits += 1;
@@ -9425,7 +9594,7 @@ impl App {
                 let o = &mut rest[0];
                 // the impact `car+0x430` 0x40F740 turns into the opponent's queued one-shot
                 o.vehicle.impact = 0.0;
-                if o.vehicle.collide_walls(&w.walls, &patch_height, 0.0, 0.0, 0.0) {
+                if o.vehicle.collide_walls(&w.walls, &w.tree, &patch_height, 0.0, 0.0, 0.0) {
                     o.wall_hits += 1;
                     ai_hits.push((AudioCar::Opponent(oi), wall_sfx(&o.vehicle)));
                 }
@@ -9473,7 +9642,7 @@ impl App {
                     c.body.rally = self.cheat_bits & 1 != 0;
                     c.sync_body_in();
                     c.body.impact = 0.0;
-                    if c.body.collide_walls(&w.walls, &patch_height, 0.0, 0.0, 0.0) {
+                    if c.body.collide_walls(&w.walls, &w.tree, &patch_height, 0.0, 0.0, 0.0) {
                         ai_hits.push((AudioCar::Police(i), wall_sfx(&c.body)));
                     }
                     if let Some((impact, event)) = c.body.collide_props(&w.props, tick) {
@@ -9531,7 +9700,7 @@ impl App {
                     let (c, b) = (&mut rest_cars[0], &mut rest_bodies[0]);
                     // its own walls and props first (0x495020 / 0x498DE0 behind `car+0x7C`)
                     b.impact = 0.0;
-                    if b.collide_walls(&w.walls, &patch_height, 0.0, 0.0, 0.0) {
+                    if b.collide_walls(&w.walls, &w.tree, &patch_height, 0.0, 0.0, 0.0) {
                         ai_hits.push((AudioCar::Traffic(i), wall_sfx(b)));
                     }
                     if let Some((impact, event)) = b.collide_props(&w.props, tick) {
@@ -9649,7 +9818,7 @@ impl App {
                     }
                 }
                 let mut walls = |c: &mut nfs_physics::vehicle::Vehicle| {
-                    c.collide_walls(&w.walls, &patch_height, 0.0, 0.0, 0.0);
+                    c.collide_walls(&w.walls, &w.tree, &patch_height, 0.0, 0.0, 0.0);
                     c.collide_props(&w.props, tick);
                 };
                 let hits = self.smackables.step(w, self.slices.as_ref(), self.tick, n_cars, racers, &mut cars, &mut walls);
@@ -11287,6 +11456,10 @@ impl App {
         let base = accessor.map(|a| a.split_once('(').map_or(a, |(b, _)| b));
         match base {
             Some("OwnedCars.Car") => self.garage_car().map(|(_, o)| o.trim.decal),
+            // `zMergedList.Car`'s garage half — the same owned record (`car_garage`, above)
+            Some("zMergedList.Car") if self.fe.menu.as_ref().is_some_and(|m| m.car_garage) => {
+                self.garage_car().map(|(_, o)| o.trim.decal)
+            }
             Some("UsedCar.Car") => self.used_car().map(|o| o.trim.decal),
             _ => None,
         }
@@ -11296,6 +11469,17 @@ impl App {
     fn fe_car_paint(&self, accessor: Option<&str>, car: &nfs_formats::fedata::CarCatalogEntry) -> Paint {
         let base = accessor.map(|a| a.split_once('(').map_or(a, |(b, _)| b));
         if base == Some("OwnedCars.Car")
+            && let Some((_, o)) = self.garage_car()
+            && !car.paint_sets.is_empty()
+        {
+            return Self::paint_of(car, o);
+        }
+        // `zMergedList.Car`'s garage half wears the owned car's own paint too — 0x4F49F0 routes
+        // the tail's car-object slots to list A while `car_garage` (0x4F4DF0) holds, and A's own
+        // tail (`FEOwnedCarAccessor`'s slots 29…34, §4.145) reads the FE car's own `+0x674…+0x688`,
+        // the same fields `paint_of` builds from.
+        if base == Some("zMergedList.Car")
+            && self.fe.menu.as_ref().is_some_and(|m| m.car_garage)
             && let Some((_, o)) = self.garage_car()
             && !car.paint_sets.is_empty()
         {
@@ -11333,6 +11517,11 @@ impl App {
         let base = accessor.map(|a| a.split_once('(').map_or(a, |(b, _)| b));
         let ids: Vec<i16> = match base {
             Some("OwnedCars.Car") => cu.career.garage.get(cu.car_sel).map(|o| o.parts.clone()).unwrap_or_default(),
+            // `zMergedList.Car`'s garage half — the owned record's own installed parts, not the
+            // catalogue's stock ones (`car_garage`, above)
+            Some("zMergedList.Car") if self.fe.menu.as_ref().is_some_and(|m| m.car_garage) => {
+                cu.career.garage.get(cu.car_sel).map(|o| o.parts.clone()).unwrap_or_default()
+            }
             Some("UsedCar.Car") => self.used_car().map(|o| o.parts.clone()).unwrap_or_default(),
             _ => car.stock_parts.clone(),
         };
@@ -11485,7 +11674,6 @@ impl App {
                     } else {
                         c.career.decline_offer(i);
                     }
-                    c.save();
                 }
                 // 0x502190 plays front-end sound 10 once the money is in (0x502224 `push 0xA /
                 // call 0x4AADB0`)
@@ -11499,7 +11687,6 @@ impl App {
                     && let Some(t) = c.current().cloned()
                 {
                     c.career.forfeit(t.id);
-                    c.save();
                 }
                 self.fe_back(0, event_loop);
                 false
@@ -11532,7 +11719,6 @@ impl App {
                         c.career.reprice_market(&c.tables);
                         c.career.refresh_market(&c.tables, &mut rand);
                     }
-                    c.save();
                 }
                 self.bind_lists();
                 false
@@ -11547,7 +11733,6 @@ impl App {
                     if let Some(o) = c.career.garage.get_mut(sel) {
                         o.trim.decal = n.clamp(-1, 99) as i8;
                     }
-                    c.save();
                 }
                 false
             }
@@ -11820,10 +12005,10 @@ impl App {
     /// **0x502420** — `carsetup`'s gate (§4.169.6), true when the car may not leave: on
     /// `ID_CARSETUP` its back 0x4F1CE0, `QUIT` 0x4F1D00, `OPTIONS` 0x4F1D20 and `TESTDRIVECHECK`
     /// 0x4F1A90 all run it first. `Game.GameType` 0…3 takes `zMergedList.Car`'s car while it is
-    /// in the list's owned half (0x4F4DF0 — the port asks whether the garage holds the selected
-    /// record, as `bind_mergedlist_panel` does), 4 `OwnedCars.Car`, anything else passes. The
-    /// car's stock parts without an installed part in their slot (0x4F0220, `parts_shop::
-    /// missing_parts`) raise the one-button **650** with their names (0x5135B0, 0x4F03CC).
+    /// in the list's owned half (0x4F4DF0 — `car_garage`, `bind_mergedlist_panel`'s own test),
+    /// 4 `OwnedCars.Car`, anything else passes. The car's stock parts without an installed part
+    /// in their slot (0x4F0220, `parts_shop::missing_parts`) raise the one-button **650** with
+    /// their names (0x5135B0, 0x4F03CC).
     fn fe_carsetup_blocked(&mut self) -> bool {
         let on_carsetup = self.fe.layout_preview.as_ref().is_some_and(|l| Self::fe_list_of(l) == "ID_CARSETUP");
         if !on_carsetup {
@@ -11831,7 +12016,7 @@ impl App {
         }
         let Some(c) = self.career.as_ref() else { return false };
         let car = match self.fe.game_type {
-            0..=3 => self.fe.menu.as_ref().and_then(|m| m.cars.get(m.car_idx)).and_then(|r| c.career.garage.iter().position(|g| g.car_id == r.id)),
+            0..=3 => self.fe.menu.as_ref().filter(|m| m.car_garage).map(|_| c.car_sel.min(c.career.garage.len().saturating_sub(1))),
             4 => (!c.career.garage.is_empty()).then(|| c.car_sel.min(c.career.garage.len() - 1)),
             _ => None,
         };
@@ -12681,9 +12866,19 @@ impl App {
             Some(l) => {
                 let aspect = self.renderer.as_ref().map(|r| r.aspect()).unwrap_or(1.6);
                 let controls = l.controls();
+                // `state_for`'s `selected` parameter stands in for `[widget+0x10C] & 8`
+                // (controls.md §4.109/§4.111), which the original sets only on the chronicle's
+                // five model-group buttons (0x5077D0) — never from a keyboard cursor, since the
+                // FE is pointer-only (§4.38). The port's own Up/Down stepping needs some index to
+                // paint, but painting it before it has ever been used invents a highlight no
+                // original screen shows at rest (2026-09-28: `selectname.lay`'s `создать игрока`
+                // showed permanently selected/gold this way). `layout_nav_used` gates it to
+                // "after the first Up/Down on this screen" — `layout_sel` itself still names
+                // whichever control Enter would activate.
                 let sel = controls
                     .get(self.fe.layout_sel.min(controls.len().saturating_sub(1)))
-                    .map(|c| c.index);
+                    .map(|c| c.index)
+                    .filter(|_| self.fe.layout_nav_used);
                 let mut v = l.letterbox_bars(aspect);
                 // 0x4DA890 before the frame's 2D: the kit's depth back to 0.99998 over a cleared
                 // depth buffer, the alpha test as the last frame's room left it — every depth mask
@@ -15247,15 +15442,15 @@ impl App {
             // it (0x532330 at 0x464AE5: car − entry eye); only the output is written per cut. So a
             // prop listed twice (the tree keeps it in every cell it covers) pushes to the same place
             // twice, and of several props that cut, the last one listed wins — the tree's cell
-            // order there, this port's prop order here (APPROXIMATION when two boxes cut). The
-            // query also keeps only cell entries whose object byte `+4` is 0 (0x473A95; the
-            // constructor 0x486340 writes 0 at 0x486389, no other writer traced).
+            // order there, this port's now-real tree query order here (wired 2026-09-28,
+            // `RE/RENDERING.md` "The tree, built"). The query also keeps only cell entries whose
+            // object byte `+4` is 0 (0x473A95; the constructor 0x486340 writes 0 at 0x486389, no
+            // other writer traced) — every `Prop` this port builds qualifies (nothing else writes
+            // that byte here either), so no extra filter is needed.
             let e0 = eye;
-            let (lo, hi) = (e0.min(v.position), e0.max(v.position));
-            for p in &w.props {
-                if p.aabb_max.x < lo.x || p.aabb_min.x > hi.x || p.aabb_max.z < lo.z || p.aabb_min.z > hi.z {
-                    continue;
-                }
+            for item in w.tree.query_segment((e0.x, e0.z), (v.position.x, v.position.z)) {
+                let nfs_physics::track_tree::TreeItem::Prop(pi) = item else { continue };
+                let p = &w.props[pi];
                 let nfs_physics::props::PropShape::Box { corners, radius } = &p.shape else { continue };
                 if *radius < 2.0 || p.answer(self.tick as u32, v.velocity) == 3 {
                     continue;
@@ -15269,7 +15464,7 @@ impl App {
                 eye.z = point.z + d.z;
             }
             let castle = self.track.name.eq_ignore_ascii_case("castle");
-            if w.walls.camera_push(&mut eye, v.position, v.ground_h, castle) {
+            if w.walls.camera_push(&mut eye, v.position, v.ground_h, castle, &w.tree) {
                 eye.y = v.position.y + ceiling(w, eye, eye.y - v.position.y);
                 // the target stays where the view put it: the aim 0x464BF0 looks from the moved eye
             }
@@ -15554,6 +15749,17 @@ impl App {
         // of it drawn.)* APPROXIMATION: the mirror reuses the main view's picks, where the original
         // asks again for its own view.
         let detail = self.choice_index("Graphics.CarDetail").map_or(0, |(i, _)| i as u8);
+        // diagnostic: `NFS_DAMAGE=<per cent>` (`update_damage_decals`'s own forcing of the
+        // player's and the opponents' zones) also puts that much damage on every traffic and cop
+        // car drawn below, for a screenshot check of their per-car decals/crush. Port-only
+        // extension, `car-model.md` §13.1: a comma list, `NFS_DAMAGE=<a>,<b>,…`, is cycled by each
+        // traffic/cop car's own draw position, so two cars sharing one catalogue model can be
+        // told apart — a screenshot check that the shared-model aliasing fix actually holds.
+        let forced_damage: Vec<f32> = std::env::var("NFS_DAMAGE")
+            .ok()
+            .map(|v| v.split(',').filter_map(|s| s.trim().parse::<f32>().ok()).collect())
+            .unwrap_or_default();
+        let forced_damage_at = |i: usize| -> Option<f32> { (!forced_damage.is_empty()).then(|| forced_damage[i % forced_damage.len()]) };
         let replaying = self.replay_view().is_some();
         let lod_view = self.renderer.as_ref().map(|r| {
             let (w, h) = r.size();
@@ -15617,6 +15823,20 @@ impl App {
                 // a kinematic car has no wheel state: the wheels are rolled from the distance driven
                 let spin = self.road.traffic_spin.get(i).copied().unwrap_or(0.0);
                 let block = self.world.as_ref().map(|w| w.car_light(p));
+                // `R3DCar` slot 7 (0x4383CC/0x438273) recomputes a car's decals and crush from
+                // *its own* raw zone damage every frame it is drawn, with no car-kind gate — the
+                // traffic and the cops share one upload per type, so this instance's own damage
+                // (`Vehicle::damage`, `TrafficSet::post_impact`) is baked into that shared model
+                // right before this car's own `draw_items` below, the same way `update_travel`
+                // already is: two cars of one type drawn in the same frame each get their own
+                // decals/crush because the model is mutated-then-drawn once per car, in order —
+                // and, when they are simultaneously visible, each into its own instantiated copy
+                // of the shared model's mesh/texture/material ids (`car-model.md` §13.1's residual
+                // gap), so this port's batched `render()` does not alias one onto the other.
+                let dmg = forced_damage_at(i).map_or_else(|| tr.bodies.get(i).map_or([0.0; 10], |b| b.damage), |d| [d; 10]);
+                if let (Some(m), Some(rr)) = (self.road.traffic_models.get_mut(c.model), self.renderer.as_mut()) {
+                    m.update_damage(rr, &dmg, false, detail);
+                }
                 let model = &self.road.traffic_models[c.model];
                 let state = &mut self.road.traffic_lods[i];
                 let Some(passes) = pick(model, state, p, r, c.half_extents, nfs_game::world::CarKind::Traffic, tr.bodies.get(i).map_or([0.0; 4], compression)) else {
@@ -15670,6 +15890,11 @@ impl App {
                 let m = Mat4::from_rotation_translation(r, p);
                 let spin = c.speed.abs() * self.tick as f32 / 64.0 / 0.32;
                 let block = self.world.as_ref().map(|w| w.car_light(p));
+                // as the traffic's above: this cop's own damage baked into its own instantiated
+                // copy of the shared per-type model right before its own draw
+                if let (Some(m), Some(rr)) = (self.road.police_models.get_mut(c.model), self.renderer.as_mut()) {
+                    m.update_damage(rr, &forced_damage_at(i).map_or(c.body.damage, |d| [d; 10]), false, detail);
+                }
                 let model = &self.road.police_models[c.model];
                 // a cop is `car+0x52C & 0x20`, neither the opponent nor the traffic bit
                 let state = &mut self.road.police_lods[i];
@@ -16614,6 +16839,7 @@ impl App {
                     cars: m.cars.clone(),
                     track_idx: m.track_idx,
                     car_idx: m.car_idx,
+                    car_garage: m.car_garage,
                     car2_idx: m.car2_idx,
                     ko: m.ko.clone(),
                     ko_sel: m.ko_sel,
@@ -16669,6 +16895,7 @@ impl App {
                     cars: m.cars.clone(),
                     track_idx: m.track_idx,
                     car_idx: m.car_idx,
+                    car_garage: m.car_garage,
                     car2_idx: m.car2_idx,
                     ko: m.ko.clone(),
                     ko_sel: m.ko_sel,
@@ -16754,6 +16981,7 @@ impl App {
                     cars: m.cars.clone(),
                     track_idx: m.track_idx,
                     car_idx: m.car_idx,
+                    car_garage: m.car_garage,
                     car2_idx: m.car2_idx,
                     ko: m.ko.clone(),
                     ko_sel: m.ko_sel,
@@ -16868,8 +17096,14 @@ impl App {
         }
         let sel = self.fe.layout_sel.min(controls.len() - 1);
         match key {
-            MenuKey::Up => self.fe.layout_sel = (sel + controls.len() - 1) % controls.len(),
-            MenuKey::Down => self.fe.layout_sel = (sel + 1) % controls.len(),
+            MenuKey::Up => {
+                self.fe.layout_sel = (sel + controls.len() - 1) % controls.len();
+                self.fe.layout_nav_used = true;
+            }
+            MenuKey::Down => {
+                self.fe.layout_sel = (sel + 1) % controls.len();
+                self.fe.layout_nav_used = true;
+            }
             // a combo slider edits the accessor it names. APPROXIMATION — the port's own keys
             // (§4.171.8): no key or pad button steps a combo in the original. A key is a type-2
             // event; 0x5289B0 hands it to the capture or the widget under the pointer, whose
@@ -16953,7 +17187,6 @@ impl App {
                             };
                             let _ = cu.career.repair(&cu.tables, sel, fix);
                         }
-                        cu.save();
                         self.fe.repair_ticks.clear();
                     }
                     self.bind_checks();
@@ -16977,7 +17210,6 @@ impl App {
                             _ => o.setup = nfs_game::career::CAR_SETUP_DEFAULT,
                         }
                     }
-                    cu.save();
                     self.bind_indicator_bars();
                     return;
                 }
@@ -17041,7 +17273,6 @@ impl App {
                         self.fe_open("careerfirst", 0, false);
                         if let Some(cu) = self.career.as_mut() {
                             cu.career.seen_evolution_intro = true;
-                            cu.save();
                         }
                     }
                     return;
@@ -17092,7 +17323,6 @@ impl App {
                         if let Some(car) = cu.career.accept_promotion(&cu.tables) {
                             tracing::info!(car, "factory prize car accepted");
                         }
-                        cu.save();
                     }
                     self.fe_back(0, event_loop);
                     return;
@@ -17168,7 +17398,6 @@ impl App {
                         if let Some(cu) = self.career.as_mut() {
                             let sel = cu.car_sel.min(cu.career.garage.len().saturating_sub(1));
                             cu.career.withdraw_from_sale(sel);
-                            cu.save();
                         }
                         self.bind_lists();
                         return;
@@ -18012,7 +18241,7 @@ impl App {
         }
         // and the movies on it, which need the renderer to put each frame in its texture
         if let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) {
-            l.advance_movies(r, dt_ms);
+            l.advance_movies(r, dt_ms, self.snd.audio.as_ref(), self.snd.audio_settings.music_level);
         }
         // the front end's own pointer (`controls.md` §4.152), and where the turntable stands,
         // which is what a hovered `NFS5.3DCAR` picks its cursor by (§4.153)
@@ -18043,13 +18272,10 @@ impl App {
         // only (0x44EDD1 clears, 0x44EF04 sets), the front end's 0x44F020 clears it (0x44F080)
         let fx_level = self.race.is_some().then(|| self.special_fx_level());
         let trilinear = fx_level.is_some_and(|l| l >= 3);
-        // `LayerFalseSort1`/`2`'s other arm (0x44EC80's jump table, 0/1 unconditionally; 2 only
-        // when the runtime picks it, kept as the double-draw arm here — APPROXIMATION,
-        // `nfs-renderer` `fakesort_single`'s doc)
-        let fakesort_single = fx_level.is_some_and(|l| l < 2);
+        let fakesort_mode = self.fakesort_mode(fx_level);
         if let Some(r) = self.renderer.as_mut() {
             r.set_trilinear(trilinear);
-            r.set_fakesort_single(fakesort_single);
+            r.set_fakesort_mode(fakesort_mode);
         }
         self.render_mirror();
         if let Some(r) = self.renderer.as_mut()
@@ -18422,7 +18648,8 @@ impl App {
             return;
         }
         let Some(m) = self.fe.menu.as_ref() else { return };
-        let Some(car) = m.car().cloned() else { return };
+        // `zMergedList.Car`'s own car — the garage half's own record while `car_garage` holds
+        let Some(car) = self.logo_car(Some("zMergedList.Car"), None).cloned() else { return };
         // **0x4ED5D0 by `Game.GameType`** (`modes.md` §1, §2): 2 the knockout series' round, 1 the
         // Quick Knockout, anything else the single race. *(Until 2026-09-26 every layout launch
         // was a single race, so `knockout.lay` and `quickknockout.lay` raced as `QuickRace.lay`.)*
@@ -18825,6 +19052,7 @@ impl App {
                 let replaced = self.fe.layout_preview.replace(l);
                 self.fe.layout_name = Some(name.to_string());
                 self.fe.layout_sel = 0;
+                self.fe.layout_nav_used = false;
                 self.fe.layout_open_combo = None;
                 // a freshly opened screen needs the device list before its first draw, not after
                 let (pads, dz) = (self.fe_pads(), Self::fe_deadzone());
@@ -19018,6 +19246,7 @@ impl App {
         }
         self.fe.layout_name = Some(n.clone());
         self.fe.layout_sel = 0;
+        self.fe.layout_nav_used = false;
         self.fe.layout_open_combo = None;
         self.fe_bind_screen(&n);
         self.fe_apply_music();
@@ -20377,6 +20606,7 @@ impl App {
                 // the frames run, for the room object's own transition (`fe_room_tick`), which
                 // runs alongside the screen's
                 let mut ran = 0;
+                let mut tab_clicked = false;
                 if let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) {
                     // a movie starts on a black frame and runs at fifteen a second, so a screen
                     // with one gets the same half second the fade does, whether or not the fade
@@ -20387,7 +20617,7 @@ impl App {
                     // through the screen's transition
                     let frames: Option<usize> = std::env::var("NFS_FE_FRAMES").ok().and_then(|v| v.parse().ok());
                     for i in 0..frames.unwrap_or(120) {
-                        l.advance_movies(r, 16);
+                        l.advance_movies(r, 16, self.snd.audio.as_ref(), self.snd.audio_settings.music_level);
                         ran += 1;
                         // every layer's screen, as 0x4D2570 does (0x4D25EB)
                         for (_, u) in self.fe.layout_under.iter_mut() {
@@ -20403,6 +20633,7 @@ impl App {
                         && let Some(hit) = l.flat_index_of(&name)
                     {
                         l.tab_click(r, &self.paths, hit);
+                        tab_clicked = true;
                         for _ in 0..n {
                             l.advance_transition(16);
                             ran += 1;
@@ -20411,6 +20642,12 @@ impl App {
                 }
                 for _ in 0..ran {
                     self.fe_room_tick(16);
+                }
+                // same re-bind `tab_click`'s real-click handler does above — the diagnostic path
+                // loads a new panel too, and a picture-from-code widget in it (the HUD preview
+                // among them) needs `bind_player_pictures` run again now that the panel exists
+                if tab_clicked {
+                    self.bind_player_pictures();
                 }
                 // and a room that is still changing — the last screen's going out, then this one's
                 // coming in (`fe_room_tick`) — is let settle too, the screen's clock running with it
@@ -20777,9 +21014,27 @@ impl App {
         window: Arc<Window>,
         event_loop: &ActiveEventLoop,
     ) {
+        // `Replay_startRace` 0x413EA0 + `0x414EB0`: rewind the stream and seed the shared RNG from
+        // the race's seed, which is what makes a replay re-simulate the same race (replay.md §11).
+        let playing = self
+            .replay.stream
+            .as_ref()
+            .is_some_and(|r| r.mode == nfs_game::replay::Mode::Playing);
         // the player's typed name is the car's `carinfo+0x17C`, which the specs' tail compares
         // with the two cheat names (0x49D6E7…0x49D875), in the gear loop beside the manual ×1.05
-        if let Some(name) = self.career.as_ref().map(|c| c.profile.name.clone()) {
+        let name = if playing && !self.replay.setup.driver_name.is_empty() {
+            // `Replay_begin` 0x413CF0's bulk `memcpy(0x6573E8, 0x5E9A20, …)` restores the whole
+            // recorded car-slot block on playback, `.DRIVERNAME` (+0x17C, `replay.md` §16.2)
+            // among it, before the race is built — so a playback of an original `.rpl` (or the
+            // port's own `.prpl`, once it carries the field) shows the recording's driver, not
+            // the profile up now. *(Until 2026-09-28 the port's reader dropped the field, so
+            // playback kept whatever `self.player_name` already was — the live profile's, or the
+            // start-up one for a CLI `--replay` with no career.)*
+            Some(self.replay.setup.driver_name.clone())
+        } else {
+            self.career.as_ref().map(|c| c.profile.name.clone())
+        };
+        if let Some(name) = name {
             let automatic = self.player_automatic();
             self.specs.apply_driver_name(&name, automatic);
             // …and the same field is `.DRIVERNAME` 0x13B, which every name the race shows reads:
@@ -20787,21 +21042,17 @@ impl App {
             // `hud.md` §5) and the plate (`.LICENSE`, the same argument). The launch's per-car
             // set-up 0x4EEDA0 writes it (0x4EEDF1) from its fourth argument, the profile name
             // 0x501270 `[0x691DC8]` for the player (0x4EBA2E) — the profile up **now**, not the one
-            // `player.lst` named when the program started. *(Until 2026-09-27 `player_name` was
-            // read once at start-up, so a career created at `CREATEPLAYERDONE` (or a profile
-            // loaded) raced as the start-up profile — "DRIVER" on a fresh install.)*
+            // `player.lst` named when the program started (or, on a playback, the snapshot's,
+            // above). *(Until 2026-09-27 `player_name` was read once at start-up, so a career
+            // created at `CREATEPLAYERDONE` (or a profile loaded) raced as the start-up profile
+            // — "DRIVER" on a fresh install.)*
             self.player_name = name;
         }
-        // `Replay_startRace` 0x413EA0 + `0x414EB0`: rewind the stream and seed the shared RNG from
-        // the race's seed, which is what makes a replay re-simulate the same race (replay.md §11).
-        let playing = self
-            .replay.stream
-            .as_ref()
-            .is_some_and(|r| r.mode == nfs_game::replay::Mode::Playing);
         if let Some(r) = self.replay.stream.as_mut() {
             r.start_race();
         }
         if playing {
+            tracing::info!(driver = %self.player_name, from_snapshot = !self.replay.setup.driver_name.is_empty(), "playback: .DRIVERNAME resolved");
             // `Replay_startRace` 0x413EA0 opens playback on the **first** entry of the cycle
             // table, `DirectorsCam` (0x14) — "whichever track-side camera the viewed car is
             // currently passing", the classic NFS director's cut. Playback does not cycle the
@@ -20880,6 +21131,9 @@ impl App {
                 mirror: self.mirror,
                 seed: self.traffic_seed,
                 skill: self.race_skill,
+                // the name this race is recorded under (§16.2 / §18.11): a later playback of this
+                // same setup (the automatic replay-in-place, or a saved `.prpl`) shows it back
+                driver_name: self.player_name.clone(),
             };
         }
         self.replay.setup.seed = self.traffic_seed;
@@ -21394,7 +21648,9 @@ impl App {
                             .unwrap_or_default(),
                     };
                     let mut plan: Vec<TrafficSpec> = Vec::new();
-                    let mut by_id: Vec<u16> = Vec::new();
+                    // id -> the *first* car's slot of that catalogue id (the template every repeat
+                    // instantiates its own damage resources from, `car-model.md` §13.1)
+                    let mut template_slot: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
                     // per model slot: half the LOD-1 box 0x445090 takes for traffic, and the
                     // `BndP` body points `RCar::load` builds (`car_body`) for its `RigidBody`
                     let mut boxes: Vec<Vec3> = Vec::new();
@@ -21408,8 +21664,17 @@ impl App {
                         };
                         let bus = entry.sound_set.eq_ignore_ascii_case("sbus")
                             || entry.sound_set.eq_ignore_ascii_case("tbus");
-                        let slot: usize = match by_id.iter().position(|x| *x == id) {
-                            Some(i) => i,
+                        let slot: usize = match template_slot.get(&id) {
+                            // a repeat of a shared catalogue model: this car's own crush meshes
+                            // and decal-page materials, a cheap clone of the template's GPU ids —
+                            // everything else (body/wheel/light geometry) stays shared with it
+                            Some(&t) => {
+                                let inst = self.road.traffic_models[t].instantiate(&mut renderer);
+                                self.road.traffic_models.push(inst);
+                                boxes.push(boxes[t]);
+                                points.push(points[t].clone());
+                                self.road.traffic_models.len() - 1
+                            }
                             None => {
                                 let assets = match CarAssets::load(&self.paths, &entry.model) {
                                     Ok(a) => a,
@@ -21445,8 +21710,9 @@ impl App {
                                 let (lo, hi) = nfs_game::world::car_model_box(&assets, 1);
                                 boxes.push((hi - lo) * 0.5);
                                 points.push(nfs_game::world::car_body(&assets, self.cheat_bits & (1 << 1) != 0).0);
-                                by_id.push(id);
-                                self.road.traffic_models.len() - 1
+                                let slot = self.road.traffic_models.len() - 1;
+                                template_slot.insert(id, slot);
+                                slot
                             }
                         };
                         // the collision box is half the model's LOD-1 box (`traffic.md` §21.4,
@@ -21556,7 +21822,10 @@ impl App {
                         && !ids.is_empty()
                     {
                         let mut cars = Vec::new();
-                        let mut by_id: Vec<(u16, u32)> = Vec::new();
+                        // (id, driver) -> the *first* cop's slot of that combination (the
+                        // template every repeat instantiates its own damage resources from,
+                        // `car-model.md` §13.1)
+                        let mut template_slot: std::collections::HashMap<(u16, u32), usize> = std::collections::HashMap::new();
                         // per model slot: half the LOD-5 box 0x445090 takes for a cop
                         let mut boxes: Vec<Vec3> = Vec::new();
                         let mut probe_sets: Vec<Vec<Vec3>> = Vec::new();
@@ -21574,8 +21843,16 @@ impl App {
                             };
                             let entry_993 = self.cheat_993(entry.clone());
                             let entry = &entry_993;
-                            let slot = match by_id.iter().position(|x| *x == (id, driver)) {
-                                Some(i) => i,
+                            let slot = match template_slot.get(&(id, driver)) {
+                                // a repeat (id, driver): this cop's own crush meshes and
+                                // decal-page materials, a cheap clone of the template's GPU ids
+                                Some(&t) => {
+                                    let inst = self.road.police_models[t].instantiate(&mut renderer);
+                                    self.road.police_models.push(inst);
+                                    boxes.push(boxes[t]);
+                                    probe_sets.push(probe_sets[t].clone());
+                                    self.road.police_models.len() - 1
+                                }
                                 None => {
                                     let Ok(assets) = CarAssets::load(&self.paths, &entry.model)
                                     else {
@@ -21610,8 +21887,9 @@ impl App {
                                     // the body points, the first four being `Susp_update`'s
                                     // wheel probes (0x499AD4, `CopCar::probes`)
                                     probe_sets.push(points);
-                                    by_id.push((id, driver));
-                                    self.road.police_models.len() - 1
+                                    let slot = self.road.police_models.len() - 1;
+                                    template_slot.insert((id, driver), slot);
+                                    slot
                                 }
                             };
                             // `car+0x3A8…`: also how far the body origin sits above the model's
@@ -22326,6 +22604,8 @@ impl App {
             self.file_track_record();
             self.rebuild_scene();
             self.update_damage_decals();
+            // 0x501340 + `LoadInfo` (0x4D3B52), same as the interactive `end_finished_race` path
+            self.reload_career_at_fe_entry();
             self.settle_mission();
             if self.career.as_ref().is_some_and(|c| c.pending.is_some()) {
                 let (order, times) = self.finishing_order();
@@ -22384,14 +22664,15 @@ impl App {
                 }
             }
             // The scripted loop never calls `draw_frame`, which is otherwise the only place that
-            // sets `set_trilinear` / `set_fakesort_single` (both `SPECIALFX`-driven) each frame —
-            // so a `--screenshot` run kept the renderer's construction-time defaults (both off)
-            // whatever `Graphics.SpecialFX` said. Set them here too, or `NFS_CHOICE=Graphics.
+            // sets `set_trilinear` / `set_fakesort_mode` (both `SPECIALFX`-driven) each frame —
+            // so a `--screenshot` run kept the renderer's construction-time defaults whatever
+            // `Graphics.SpecialFX` said. Set them here too, or `NFS_CHOICE=Graphics.
             // SpecialFX=…` cannot show either one in a still.
             let fx_level = self.race.is_some().then(|| self.special_fx_level());
+            let fakesort_mode = self.fakesort_mode(fx_level);
             if let Some(r) = self.renderer.as_mut() {
                 r.set_trilinear(fx_level.is_some_and(|l| l >= 3));
-                r.set_fakesort_single(fx_level.is_some_and(|l| l < 2));
+                r.set_fakesort_mode(fakesort_mode);
             }
             let rgba = self
                 .renderer
@@ -22870,7 +23151,12 @@ impl ApplicationHandler for App {
                     self.fe.last_hover = now;
                     if let (Some(i), Some(l)) = (now, self.fe.layout_preview.as_ref()) {
                         let controls = l.controls();
-                        let sel = controls.get(self.fe.layout_sel.min(controls.len().saturating_sub(1))).map(|c| c.index);
+                        // same gate as `fe_sprites`'s `sel`: the keyboard cursor is not the
+                        // original's `selected` flag until Up/Down has actually moved it
+                        let sel = controls
+                            .get(self.fe.layout_sel.min(controls.len().saturating_sub(1)))
+                            .map(|c| c.index)
+                            .filter(|_| self.fe.layout_nav_used);
                         if l.state_name(i, sel).as_deref() == Some("hover") && !l.widget_disabled(i) {
                             self.fe_sound(6);
                         }
@@ -23273,6 +23559,16 @@ impl ApplicationHandler for App {
                             if let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) {
                                 l.tab_click(r, &self.paths, hit);
                             }
+                            // `set_panel` (0x4CEA90, called from `tab_click`) loads the new panel's
+                            // widgets — `display.lay`'s `NFS5.HUD` among them, one of `Options`'s
+                            // five tab panels — after `bind_player_pictures` already ran once
+                            // for the screen the tab strip opened on, so a picture-from-code widget
+                            // in a panel reached only by a tab switch (the HUD preview, a player
+                            // picture/badge/factory face on some other panel) never got its
+                            // `set_pack_picture`/`set_movie` call. Re-bind now that the panel exists,
+                            // the same way `SHOWPLAYLISTPANEL`/`HIDEPLAYLISTPANEL` re-bind their
+                            // lists after `set_panel` above.
+                            self.bind_player_pictures();
                             self.fe_sound(5);
                         }
                         // `NFS5.3DCAR`'s slot 9, 0x4C0EB0: a click opens or closes the part under
@@ -24039,6 +24335,7 @@ fn main() -> Result<()> {
             cars,
             track_idx: 0,
             car_idx,
+            car_garage: false,
             car2_idx: 0,
             ko: Vec::new(),
             ko_sel: 0,
@@ -24219,6 +24516,7 @@ fn main() -> Result<()> {
                 .and_then(|i| args.get(i + 1).cloned())
                 .or(fe_start),
             layout_sel: 0,
+            layout_nav_used: false,
             layout_open_combo: None,
             list_drag: None,
             list_repeat: None,
@@ -24334,6 +24632,9 @@ fn main() -> Result<()> {
                     mirror: args.iter().any(|a| a == "--mirror"),
                     seed: 0,
                     skill: fe.skill,
+                    // overwritten by `start_race`'s own rebuild before this is read for a fresh
+                    // (non-replay) race; this placeholder only shows if that never runs
+                    driver_name: String::new(),
                 }),
             path: nfs_game::save::save_dir().join("replay.prpl"),
             saved: false,

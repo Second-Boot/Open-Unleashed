@@ -1,4 +1,4 @@
-use crate::{Camera, MaterialDesc, MeshData, Scene, Sprite, SpriteCompare, TextureData, Vertex};
+use crate::{Camera, FakeSortMode, MaterialDesc, MeshData, Scene, Sprite, SpriteCompare, TextureData, Vertex};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -141,18 +141,14 @@ pub struct Renderer {
     /// point_mip << 2`
     samplers: [wgpu::Sampler; 8],
     /// the `FakeSort` single-draw arm's samplers (Thrash 7 ← 0, `MAG`/`MINFILTER` `POINT`), by
-    /// address mode alone — index `clamp_u | clamp_v << 1` — used only while `fakesort_single`
+    /// address mode alone — index `clamp_u | clamp_v << 1` — used only for a single-draw item
     point_samplers: [wgpu::Sampler; 4],
     /// the mip filter's `POINT` → `LINEAR` promotion, `[0x69DD1D]` (`set_trilinear`); clear at start, as the image has it
     trilinear: bool,
-    /// `SPECIALFX` `[0x657D6C]` 0 or 1 (0x44EC80's jump table entries 0/1 both go to 0x44EC91):
-    /// `LayerFalseSort1`/`2`'s other arm — one draw, `MAG`/`MINFILTER` forced `POINT` for it,
-    /// depth writes untouched (`RE/notes/thrash.md` §6d.4) — instead of the double blended draw
-    /// with depth writes off then on. At `SPECIALFX` 2 the original picks either arm at runtime,
-    /// by the smoothed frame rate against 37.5 and the article's draw distance against 10000
-    /// (0x44EC9C…0x44ECE6, `[0x657424]`/`[0x627ED8]`/`[0x61975C]`, none read further); the port
-    /// keeps the double-draw arm there, as at 3 — APPROXIMATION.
-    fakesort_single: bool,
+    /// `LayerFalseSort1`/`2`'s per-frame pick, [`FakeSortMode`] — `main.rs` sets it from
+    /// `SPECIALFX` and, at level 2, the runtime globals 0x44EC80 reads to the instruction
+    /// (`RE/notes/thrash.md` §6d.4).
+    fakesort_mode: FakeSortMode,
     sprite_sampler: wgpu::Sampler,
     object_buf: wgpu::Buffer,
     object_bg: wgpu::BindGroup,
@@ -514,7 +510,7 @@ impl Renderer {
         // `LayerFalseSort1`/`2`'s other arm sets Thrash 7 ← 0 for the one draw (`MAG`/`MINFILTER`
         // `POINT`) and never touches state 0x0B, so the mip filter here follows the same `POINT`
         // default as every other sampler below `SPECIALFX` 3 (`trilinear` is false whenever
-        // `fakesort_single` can be true — the two are set from the same level, `main.rs`)
+        // `fakesort_mode` can pick `Single`/`PerItem` — both are set from the same level, `main.rs`)
         let point_samplers = std::array::from_fn(|i| make_sampler(i & 1 != 0, i & 2 != 0, wgpu::FilterMode::Nearest, wgpu::FilterMode::Nearest));
 
         // The 2D pass needs its own sampler. The 3D one once asked for `anisotropy_clamp: 8` and
@@ -605,7 +601,7 @@ impl Renderer {
             samplers,
             point_samplers,
             trilinear: false,
-            fakesort_single: false,
+            fakesort_mode: FakeSortMode::default(),
             sprite_sampler,
             object_buf,
             object_bg,
@@ -794,6 +790,49 @@ impl Renderer {
         MaterialId(self.materials.len() as u32 - 1)
     }
 
+    /// The diffuse texture `id` samples, if it exists — used to find which materials of a shared
+    /// model reference a damage-decal page when giving a traffic/cop car instance its own copy of
+    /// it (`RE/notes/car-model.md` §13.1).
+    pub fn material_texture(&self, id: MaterialId) -> Option<TextureId> {
+        self.materials.get(id.0 as usize).map(|m| m.texture)
+    }
+
+    /// A new material identical to `id` but sampling `texture` in its place — same blend/cull/lod
+    /// state and specular map, a fresh bind group. Used to give one traffic/cop car instance its
+    /// own decal-page material when `nfs_game::world::CarModel::instantiate` clones the shared
+    /// model's damage resources so two differently-damaged instances in one frame no longer alias
+    /// (`RE/notes/car-model.md` §13.1: this renderer batches every frame's `DrawItem`s and reads
+    /// each `MeshId`/`TextureId`/`MaterialId` once at `render()`, unlike the original's per-car
+    /// synchronous blit 0x572B40).
+    pub fn duplicate_material_texture(&mut self, id: MaterialId, texture: TextureId) -> MaterialId {
+        let Some(m) = self.materials.get(id.0 as usize) else { return id };
+        let (sampler, env, false_sort) = (m.sampler, m.env, m.false_sort);
+        let (alpha_blend, blend_pair, device_states, lod_bias, cull_back, view_cull, depth_bias, depth_test, env_mix, env_variant, sky_map) =
+            (m.alpha_blend, m.blend_pair, m.device_states, m.lod_bias, m.cull_back, m.view_cull, m.depth_bias, m.depth_test, m.env_mix, m.env_variant, m.sky_map);
+        let bind_group = self.material_bind_group(texture, sampler, env);
+        let bind_group_point = false_sort.then(|| self.material_bind_group_point(texture, sampler, env));
+        self.materials.push(GpuMaterial {
+            bind_group,
+            bind_group_point,
+            alpha_blend,
+            blend_pair,
+            device_states,
+            sampler,
+            lod_bias,
+            cull_back,
+            view_cull,
+            depth_bias,
+            false_sort,
+            depth_test,
+            env_mix,
+            env_variant,
+            sky_map,
+            texture,
+            env,
+        });
+        MaterialId(self.materials.len() as u32 - 1)
+    }
+
     /// Point every reflective material at another environment map — the original re-binds the car's
     /// environment layers whenever the `.map` section under it changes (`RE/notes/lighting.md` §3).
     /// `night.psh`'s `nght` bitmap, 128 × 128 bytes, for the headlight projector.
@@ -901,9 +940,9 @@ impl Renderer {
         self.rebuild_globals_bg();
     }
 
-    /// `SPECIALFX` below 2 (`LayerFalseSort1`/`2`'s other arm, see `fakesort_single`'s doc).
-    pub fn set_fakesort_single(&mut self, on: bool) {
-        self.fakesort_single = on;
+    /// `LayerFalseSort1`/`2`'s per-frame pick (`main.rs`'s `App::fakesort_mode`, [`FakeSortMode`]).
+    pub fn set_fakesort_mode(&mut self, mode: FakeSortMode) {
+        self.fakesort_mode = mode;
     }
 
     pub fn render(&mut self, scene: &Scene, camera: &Camera) -> Result<()> {
@@ -1163,11 +1202,19 @@ impl Renderer {
                     pass.set_bind_group(3, &self.sky_bgs[&sky.0], &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-                    // `LayerFalseSort1` / `2`: at `SPECIALFX` 2 or 3, the same draw first with depth
-                    // writes off, then on (0x449ADB / 0x449B2A, `RE/notes/thrash.md` §6d.4). Below
-                    // 2, the other arm never draws twice: one draw, `MAG`/`MINFILTER` forced
-                    // `POINT` for it (0x449ABE, `fakesort_single`), depth writes untouched.
-                    if mat.false_sort && mat.alpha_blend && self.fakesort_single {
+                    // `LayerFalseSort1` / `2`: at `SPECIALFX` 3, always, and at 2 by the runtime
+                    // pick (`FakeSortMode`, `RE/notes/thrash.md` §6d.4), the same draw first with
+                    // depth writes off, then on (0x449ADB / 0x449B2A). Otherwise (below 2, or 2's
+                    // `Single` pick) the other arm never draws twice: one draw, `MAG`/`MINFILTER`
+                    // forced `POINT` for it (0x449ABE), depth writes untouched.
+                    let fakesort_single = match self.fakesort_mode {
+                        FakeSortMode::Single => true,
+                        FakeSortMode::Double => false,
+                        // `LayerFalseSort1`/`2`'s own fold, per drawn item (0x449AB2, `[0x61975C]
+                        // < 10000` unsigned)
+                        FakeSortMode::PerItem => !item.fakesort_near,
+                    };
+                    if mat.false_sort && mat.alpha_blend && fakesort_single {
                         if let Some(bgp) = &mat.bind_group_point {
                             pass.set_bind_group(2, bgp, &[]);
                         }

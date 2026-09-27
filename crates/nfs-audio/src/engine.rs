@@ -407,7 +407,7 @@ impl EngineSound {
     pub fn play_shift(&self, out: &AudioOutput, sfx_level: u8) {
         if let Some(c) = &self.shift_click {
             let vol = (sfx_level as i32 * 0x7F).min(0x7F);
-            out.play(c.clone(), vol as f32 / 127.0, 1.0, false);
+            out.play_word(c.clone(), vol as f32 / 127.0, crate::resample::PITCH_UNIT, 0x40, 0, false);
         }
     }
 
@@ -438,7 +438,7 @@ impl EngineSound {
         // bend byte 0x40: no bend
         let amp = mixed as f32 / 127.0;
         if let Some(c) = &self.horn_clips[slot - 3] {
-            self.horn_voice = Some((out.play_panned(c.clone(), amp, 1.0, pan, true), slot));
+            self.horn_voice = Some((out.play_word(c.clone(), amp, crate::resample::PITCH_UNIT, 0x40, pan, true), slot));
         }
     }
 
@@ -526,15 +526,17 @@ impl EngineSound {
         // The word goes unchanged to the voice's `+0x6C` (the start's request `+0xC`, 0x4AC545;
         // `setPitch` 0x565F80 at 0x4AC608 / 0x4AC6F9) — relative to the sample's root: 0x590420
         // starts every layer at `(0x3C − root)·100 + fine` cents (`mixer::base_cents`) and 0x589F40
-        // makes `+0x6E = +0x6C · cents_word >> 12`. `word / 4096` is exact in an f32, so the
-        // mixer's `resample::pitch_word` gives the word back. *(Until 2026-09-27 the port took the
-        // float `spl[8]·(rpm/redline + 0.2)·doppler/64`, a word off at the rounding — 3584 for
-        // 3583 at half the redline — and floored it at 0.05, which has no source.)*
+        // makes `+0x6E = +0x6C · cents_word >> 12`. *(Until 2026-09-27 the port took the float
+        // `spl[8]·(rpm/redline + 0.2)·doppler/64`, a word off at the rounding — 3584 for 3583 at
+        // half the redline — and floored it at 0.05, which has no source; until 2026-09-27, later,
+        // audio port 8, the word above was still turned back into a float for `set`/`play_panned`
+        // and rounded again by the mixer — lossless in an f32 either way, but not what the original
+        // hands `Voice_play`/`Voice_setPitch`, so `set_word`/`play_word` take `pitch_word` itself
+        // now.)*
         let rpm_frac = nfs_formats::spl::rpm_frac_16(inp.rpm, inp.redline);
         let bin = self.spl.bin(rpm_frac);
         let blend = self.spl.blend(inp.mode, inp.cos);
         let pitch_word = self.spl.pitch_word(rpm_frac, (inp.doppler as f64 * 65536.0) as i32);
-        let pitch = pitch_word as f32 / 4096.0;
         let spread = if inp.mode < 2 { (inp.crowding as i32 * 0x3FFF) >> 7 } else { 0 };
         let pan = if inp.mode < 2 { 0 } else { inp.pan };
 
@@ -579,7 +581,7 @@ impl EngineSound {
                         *slot = None;
                     }
                     (LayerStep::Update, Some(v)) => {
-                        out.set(v, vol, pitch);
+                        out.set_word(v, vol, pitch_word, 0x40);
                         out.set_pan(v, pan_x);
                         if k == 0 {
                             self.kept[i] = (pan_x, lvl_x);
@@ -587,7 +589,7 @@ impl EngineSound {
                     }
                     (LayerStep::Start, _) => {
                         if let Some(c) = &self.clips[i] {
-                            *slot = Some(out.play_panned(c.clone(), vol, pitch, pan_x, true));
+                            *slot = Some(out.play_word(c.clone(), vol, pitch_word, 0x40, pan_x, true));
                             // 0x4AC57E / 0x4AC581: the start keeps its level and pan
                             if k == 0 {
                                 self.kept[i] = (pan_x, lvl_x);
@@ -626,7 +628,7 @@ impl EngineSound {
             match self.start_voice {
                 None => {
                     match &self.start_clips[class] {
-                        Some(c) => self.start_voice = Some(out.play_panned(c.clone(), level, 1.0, pan, false)),
+                        Some(c) => self.start_voice = Some(out.play_word(c.clone(), level, crate::resample::PITCH_UNIT, 0x40, pan, false)),
                         // a start that fails leaves an error handle, whose status (0x566380) ends
                         // it on the next update at 0x200 — the same as `started` now
                         None => self.started = true,
@@ -634,7 +636,7 @@ impl EngineSound {
                     start_duck(true, false, None)
                 }
                 Some(v) if out.is_playing(v) => {
-                    out.set(v, level, 1.0);
+                    out.set_word(v, level, crate::resample::PITCH_UNIT, 0x40);
                     out.set_pan(v, pan);
                     start_duck(true, false, Some(Some(out.progress(v).unwrap_or(1.0))))
                 }
@@ -652,13 +654,13 @@ impl EngineSound {
             if self.started {
                 match self.stop_voice {
                     None => match &self.stop_clips[class] {
-                        Some(c) => self.stop_voice = Some(out.play_panned(c.clone(), level, 1.0, pan, false)),
+                        Some(c) => self.stop_voice = Some(out.play_word(c.clone(), level, crate::resample::PITCH_UNIT, 0x40, pan, false)),
                         // the failed start's error handle ends it on the next update; every update
                         // answers 0 either way
                         None => self.started = false,
                     },
                     Some(v) if out.is_playing(v) => {
-                        out.set(v, level, 1.0);
+                        out.set_word(v, level, crate::resample::PITCH_UNIT, 0x40);
                         out.set_pan(v, pan);
                     }
                     Some(_) => {

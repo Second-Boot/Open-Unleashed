@@ -399,7 +399,10 @@ pub fn playback_over(mode: Mode, tick: u64) -> bool {
 
 /// Magic of the port's own replay file.
 pub const FILE_MAGIC: &[u8; 8] = b"NFS5PRPL";
-pub const FILE_VERSION: u32 = 1;
+/// 2 carries `ReplaySetup::driver_name` (§16.2 / §18.11's gap) — a clean break: the format is the
+/// port's own working file, not a distributed one, and a version-1 file fails [`ReplayFile::parse`]
+/// rather than silently reading in an unset name.
+pub const FILE_VERSION: u32 = 2;
 
 /// Everything the port needs to set the race up again, plus the stream. The original stores the
 /// whole `0x6573E8` registry region instead (§6.1); these are the same knobs the port's race setup
@@ -428,6 +431,12 @@ pub struct ReplaySetup {
     /// The seed the traffic/AI RNG was started from (`RAND_SEED`'s role in §11).
     pub seed: u32,
     pub skill: u8,
+    /// `.DRIVERNAME` (id 0x13B, car slot `+0x17C`, §16.2): `Replay_begin` 0x413CF0's bulk
+    /// `memcpy(0x6573E8, 0x5E9A20, …)` restores the whole recorded car-slot block on playback,
+    /// this field among it, before the race is built — so an original `.rpl` shows the recording's
+    /// driver, not the profile up now (§18.11's gap, closed here). Empty when the file carries
+    /// none (the port's own `.prpl` before this field existed).
+    pub driver_name: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -444,7 +453,7 @@ impl ReplayFile {
         o.extend_from_slice(FILE_MAGIC);
         o.extend_from_slice(&FILE_VERSION.to_le_bytes());
         let s = &self.setup;
-        for t in [&s.track, &s.car, &s.sim] {
+        for t in [&s.track, &s.car, &s.sim, &s.driver_name] {
             o.extend_from_slice(&(t.len() as u32).to_le_bytes());
             o.extend_from_slice(t.as_bytes());
         }
@@ -483,7 +492,7 @@ impl ReplayFile {
             *p += n;
             Some(s)
         };
-        let (track, car, sim) = (text(&mut p)?, text(&mut p)?, text(&mut p)?);
+        let (track, car, sim, driver_name) = (text(&mut p)?, text(&mut p)?, text(&mut p)?, text(&mut p)?);
         let paint = [*d.get(p)?, *d.get(p + 1)?, *d.get(p + 2)?];
         let skill = *d.get(p + 3)?;
         let car_id = u16::from_le_bytes(d.get(p + 4..p + 6)?.try_into().ok()?);
@@ -499,7 +508,7 @@ impl ReplayFile {
         p += 8;
         let len = u32at(&mut p)? as usize;
         let stream = d.get(p..p + len)?.to_vec();
-        Some(Self { setup: ReplaySetup { track, car, sim, car_id, paint, laps, opponents, traffic, cops, damage, backwards, mirror, seed, skill }, final_tick, stream })
+        Some(Self { setup: ReplaySetup { track, car, sim, car_id, paint, laps, opponents, traffic, cops, damage, backwards, mirror, seed, skill, driver_name }, final_tick, stream })
     }
 }
 
@@ -549,6 +558,10 @@ pub mod snapshot {
     pub const CAR_RAMPS: usize = 0x0014;
     pub const CAR_RAMPG: usize = 0x0018;
     pub const CAR_RAMPB: usize = 0x001C;
+    /// `.DRIVERNAME` (id 0x13B, §16.2): a NUL-terminated name; the next registered field,
+    /// `.LICENSE` at +0x1C0, bounds it to 0x44 bytes.
+    pub const CAR_DRIVERNAME: usize = 0x017C;
+    pub const CAR_DRIVERNAME_LEN: usize = 0x44;
 }
 
 /// A `.rpl` in the original's own format: the setup snapshot, the final game tick and the stream
@@ -593,6 +606,11 @@ pub fn original_rpl(setup: &ReplaySetup, final_tick: u64, stream: &[u8], ramp: R
     put(&mut out, f::CARS + f::CAR_RAMPS, u32::from(ramp.steer));
     put(&mut out, f::CARS + f::CAR_RAMPG, u32::from(ramp.gas));
     put(&mut out, f::CARS + f::CAR_RAMPB, u32::from(ramp.brake));
+    // `.DRIVERNAME` (+0x17C, §16.2): `Replay_begin`'s bulk restore hands it back on playback, so
+    // an original `.rpl` this port writes carries the recording driver's name too (§18.11)
+    let dn = setup.driver_name.as_bytes();
+    let n = dn.len().min(f::CAR_DRIVERNAME_LEN - 1);
+    out[f::CARS + f::CAR_DRIVERNAME..f::CARS + f::CAR_DRIVERNAME + n].copy_from_slice(&dn[..n]);
     out[SNAPSHOT_LEN..SNAPSHOT_LEN + 4].copy_from_slice(&(final_tick as u32).to_le_bytes());
     let n = stream.len().min(STREAM_LEN);
     out[SNAPSHOT_LEN + 4..SNAPSHOT_LEN + 4 + n].copy_from_slice(&stream[..n]);
@@ -610,6 +628,11 @@ pub fn parse_original_rpl(data: &[u8]) -> Option<(ReplaySetup, u64, Vec<u8>)> {
     let u32at = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
     let end = data[f::TRACK_NAME..f::FE_PLAYER_FILENAME].iter().position(|b| *b == 0).unwrap_or(0);
     let track: String = data[f::TRACK_NAME..f::TRACK_NAME + end].iter().map(|&b| b as char).collect();
+    // `.DRIVERNAME` (+0x17C, §16.2), restored by `Replay_begin`'s bulk `memcpy` on playback —
+    // the same field the standings / summary / plate read (§18.11's gap, closed here)
+    let dn_start = f::CARS + f::CAR_DRIVERNAME;
+    let dn_end = data[dn_start..dn_start + f::CAR_DRIVERNAME_LEN].iter().position(|b| *b == 0).unwrap_or(0);
+    let driver_name: String = data[dn_start..dn_start + dn_end].iter().map(|&b| b as char).collect();
     let setup = ReplaySetup {
         track,
         car: String::new(),
@@ -625,6 +648,7 @@ pub fn parse_original_rpl(data: &[u8]) -> Option<(ReplaySetup, u64, Vec<u8>)> {
         mirror: u32at(f::MIRROR) != 0,
         seed: u32at(f::RAND_SEED),
         skill: u32at(f::SKILL) as u8,
+        driver_name,
     };
     let final_tick = u32at(SNAPSHOT_LEN) as u64;
     let stream = data[SNAPSHOT_LEN + 4..].to_vec();
@@ -1185,7 +1209,7 @@ mod tests {
     #[test]
     fn the_port_file_round_trips() {
         let f = ReplayFile {
-            setup: ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993turbo".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, damage: true, backwards: true, mirror: false, seed: 12345, skill: 1 },
+            setup: ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993turbo".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, damage: true, backwards: true, mirror: false, seed: 12345, skill: 1, driver_name: "Kostya".into() },
             final_tick: 40_000,
             stream: (0..500).map(|i| (i % 251 + 1) as u8).collect(),
         };
@@ -1199,7 +1223,7 @@ mod tests {
     #[test]
     fn the_original_rpl_has_the_documented_shape() {
         // §6.1: 0x3E24 of setup, the final tick, 0x19000 of stream — 118 312 bytes, always
-        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993coupe36".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, damage: false, backwards: true, mirror: false, seed: 4321, skill: 2 };
+        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993coupe36".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, damage: false, backwards: true, mirror: false, seed: 4321, skill: 2, driver_name: "Kostya".into() };
         let stream: Vec<u8> = (0..1000).map(|i| (i % 251 + 1) as u8).collect();
         let f = original_rpl(&setup, 12_345, &stream, Ramp { steer: true, gas: false, brake: true }, 11);
         assert_eq!(f.len(), RPL_LEN);
@@ -1225,12 +1249,16 @@ mod tests {
         assert_eq!(&f[snapshot::TRACK_NAME..snapshot::TRACK_NAME + 8], b"coastal\0");
         assert_eq!(at(SNAPSHOT_LEN), 12_345, "the final game tick sits between the block and the stream");
         assert_eq!(&f[SNAPSHOT_LEN + 4..SNAPSHOT_LEN + 4 + 1000], &stream[..]);
+        // `.DRIVERNAME` (+0x17C, §16.2): the recording driver's name sits in the same slot 0 the
+        // car's `.TYPE` does, so `Replay_begin`'s bulk restore hands both back together (§18.11)
+        assert_eq!(&f[snapshot::CARS + snapshot::CAR_DRIVERNAME..snapshot::CARS + snapshot::CAR_DRIVERNAME + 7], b"Kostya\0");
         // and the port reads its own file back
         let (back, tick, s2) = parse_original_rpl(&f).expect("parse");
         assert_eq!(tick, 12_345);
         assert_eq!(back.track, "coastal");
         assert_eq!(back.car_id, 154, "the car's nfs5.car id comes back from the slot's .TYPE");
         assert_eq!((back.laps, back.opponents, back.traffic, back.cops, back.backwards, back.seed, back.skill), (3, 5, 2, true, true, 4321, 2));
+        assert_eq!(back.driver_name, "Kostya");
         assert_eq!(&s2[..1000], &stream[..]);
         assert_eq!(parse_original_rpl(&f[..100]), None);
     }

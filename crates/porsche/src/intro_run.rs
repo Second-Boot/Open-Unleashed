@@ -118,7 +118,7 @@ impl IntroRun {
                 *voice = audio.and_then(|a| {
                     let pcm = nfs_formats::schl::decode_all(&nfs_formats::mad::audio_track(data)).ok()?;
                     let clip = nfs_audio::mixer::Clip { rate: pcm.rate, channels: pcm.channels, samples: pcm.samples, loop_range: None, gain: 1.0, bend_cents: 0, fx_send: pcm.fx_send, priority: nfs_audio::mixer::STREAM_PRIORITY, pan: pcm.pan, pan_scale: pcm.pan_scale, records: Vec::new(), layers: Vec::new(), tables: Vec::new() };
-                    Some(a.play(Arc::new(clip), 1.0, 1.0, false))
+                    Some(a.play_word(Arc::new(clip), 1.0, nfs_audio::resample::PITCH_UNIT, 0x40, 0, false))
                 });
                 player.start(self.t0.elapsed().as_millis() as i32, voice.is_some());
             }

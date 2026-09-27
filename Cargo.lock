@@ -1280,6 +1280,7 @@ dependencies = [
  "anyhow",
  "glam",
  "nfs-assets",
+ "nfs-audio",
  "nfs-formats",
  "nfs-physics",
  "nfs-renderer",

@@ -1,6 +1,29 @@
 //! Uniform-grid triangle soup for ground-height and ray queries.
 
+use crate::quadtree::Entry;
 use glam::Vec3;
+
+/// Which patch ctor the original builds a `pr` primitive's shapes with (`RE/notes/
+/// suspension-collision.md` §1.2, `RE/STRUCTURES.md` §2): quad `0x4853C0` (4 vertex pointers —
+/// **one quad, two triangles, is one tree entry**) or triangle `0x485C50` (3 vertex pointers, one
+/// triangle is one entry). The quadtree's split threshold (`RE/RENDERING.md` "What the tree
+/// holds", `crate::quadtree::SPLIT_THRESHOLD`) counts entries of this kind, not triangles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchKind {
+    Quad,
+    Triangle,
+}
+
+/// Where a collision [`Triangle`] came from in the original's own terms — which `.crp` article
+/// and which `pr` primitive within it (`nfs_assets::mesh::MaterialMesh::prim_index`) built it, and
+/// by which patch ctor ([`PatchKind`]). Set by `nfs_assets::track::TrackGeometry::collision_grid`;
+/// `None` on a triangle built by [`Triangle::new`] (test/scenario grids with no such origin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PatchSource {
+    pub article: usize,
+    pub primitive: usize,
+    pub kind: PatchKind,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Triangle {
@@ -13,12 +36,16 @@ pub struct Triangle {
     /// vertex colours at the car's position to light the car (0x474700, `lighting.md`); a hit
     /// returns the same value interpolated over the triangle.
     pub colors: [[u8; 4]; 3],
+    /// The original patch this triangle is (half of, for a quad) — see [`PatchSource`] and
+    /// [`TriangleGrid::patches`]. `None` for a triangle with no known origin.
+    pub source: Option<PatchSource>,
 }
 
 impl Triangle {
-    /// A triangle with white vertices (for callers that have no colours).
+    /// A triangle with white vertices (for callers that have no colours) and no known patch
+    /// origin.
     pub fn new(a: Vec3, b: Vec3, c: Vec3, surface: u32) -> Self {
-        Self { a, b, c, surface, colors: [[255; 4]; 3] }
+        Self { a, b, c, surface, colors: [[255; 4]; 3], source: None }
     }
 
     /// The patch's `contains(pt)` (vtable +0xC): the point's plan inside the triangle's, edges
@@ -189,6 +216,45 @@ fn patch_centre_y(t: &Triangle) -> f32 {
     (t.a.y + t.b.y + t.c.y) * (1.0 / 3.0)
 }
 
+/// One original patch — a quadtree leaf entry (`RE/RENDERING.md` "What the tree holds") —
+/// reconstructed from a [`TriangleGrid`]'s own triangles by [`TriangleGrid::patches`]. See that
+/// method for the centroid formula and the extent gap.
+#[derive(Debug, Clone)]
+pub struct Patch {
+    /// The `.crp` article this patch's `pr` primitive belongs to (`ArticleMeshes::index`).
+    pub article: usize,
+    /// The primitive's own position in that article's `ArticleGeometry::primitives`
+    /// (`nfs_assets::mesh::MaterialMesh::prim_index`).
+    pub primitive: usize,
+    pub kind: PatchKind,
+    /// Indices into [`TriangleGrid::triangles`]: one entry for [`PatchKind::Triangle`], two (in
+    /// the grid's own emission order) for [`PatchKind::Quad`].
+    pub tris: Vec<u32>,
+    /// The patch centre (`RE/notes/suspension-collision.md` §1.2) — [`TriangleGrid::patches`]'s
+    /// doc has the formula and its addresses.
+    pub centroid: Vec3,
+    /// The quadtree insert test's other half (`0x484320`'s vtable slot 2, `RE/RENDERING.md` "The
+    /// accept test, read 2026-09-28"): the componentwise xz min/max of the patch's own *distinct*
+    /// corners — 4 of them for a quad (`0x485630`), 3 for a triangle (`0x485EA0`); `y` is never
+    /// read by either function, matching the accept test itself. `((min_x, min_z), (max_x,
+    /// max_z))`.
+    pub extent: ((f32, f32), (f32, f32)),
+}
+
+impl Entry for Patch {
+    /// Vtable slot 1's xz components — [`Self::centroid`] already carries the CONFIRMED formula
+    /// (`suspension-collision.md` §1.2); `y` is not part of the accept test (`0x484320` never
+    /// reads it).
+    fn centroid(&self) -> (f32, f32) {
+        (self.centroid.x, self.centroid.z)
+    }
+
+    /// Vtable slot 2 (`0x485630`/`0x485EA0`) — [`Self::extent`].
+    fn extent(&self) -> ((f32, f32), (f32, f32)) {
+        self.extent
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Hit {
     pub point: Vec3,
@@ -238,6 +304,85 @@ impl TriangleGrid {
             }
         }
         Self { tris, cells, min, max, cell_size, nx, nz }
+    }
+
+    /// The grid's own triangles, in the order [`Self::build`] received them (article, then
+    /// primitive, then within-primitive order — `nfs_assets::track::TrackGeometry::collision_grid`).
+    pub fn triangles(&self) -> &[Triangle] {
+        &self.tris
+    }
+
+    /// One entry per original patch (`0x4750B0`'s per-primitive walk, `RE/RENDERING.md` "What the
+    /// tree holds") — quadtree prerequisite 1. Walks [`Self::triangles`] in order, using each
+    /// triangle's [`PatchSource`]: a [`PatchKind::Triangle`] source is taken as one patch of one
+    /// triangle; a [`PatchKind::Quad`] source is paired with the very next triangle (the two
+    /// halves `nfs_assets::mesh::append_primitive` always emits back to back for one quad) into
+    /// one patch of two triangles — reproducing the original's one-entry-per-quad counting instead
+    /// of counting both halves separately. A triangle with `source: None` (built by
+    /// [`Triangle::new`] — every test/scenario grid) is not a patch and is skipped.
+    ///
+    /// `centroid` is the address-confirmed patch-centre formula (`RE/notes/
+    /// suspension-collision.md` §1.2: triangle `(a+b+c)/3`, `0x485E40`; quad `¼·Σ` of its four
+    /// corners, `0x4855C0`) — what `Tracker::findPatch` 0x473240 and the quadtree insert test
+    /// `0x484320`'s vtable slot 1 both read (the same out-param, used as a height key by one caller
+    /// and an xz centroid by the other). For a quad, the four *distinct* corners are triangle 0's
+    /// `a`/`b`/`c` plus triangle 1's `b` — `mesh.rs`'s corner order makes triangle 1's `a` and `c`
+    /// the shared diagonal (triangle 0's `a` and `b`), proved by the unit test below against the
+    /// real pipeline, not just asserted here.
+    ///
+    /// Closed 2026-09-28: the insert test's other half — a patch's own *extent* (vtable slot 2,
+    /// `0x484320`'s `+8` call) — is now read (`RE/RENDERING.md` "The accept test, read
+    /// 2026-09-28"): `0x485630` (quad) and `0x485EA0` (triangle) both fold the same *distinct*
+    /// corners [`Self::patches`] already uses for the centroid into a componentwise xz min/max
+    /// (`y`, offset `+4` of each vertex, is never read by either function — matching the accept
+    /// test, which also never reads a centroid's or extent's `y`). [`Patch::extent`] carries it;
+    /// [`Patch`] now implements [`crate::quadtree::Entry`].
+    pub fn patches(&self) -> Vec<Patch> {
+        fn xz_extent(pts: &[Vec3]) -> ((f32, f32), (f32, f32)) {
+            let (mut min_x, mut min_z) = (f32::MAX, f32::MAX);
+            let (mut max_x, mut max_z) = (f32::MIN, f32::MIN);
+            for p in pts {
+                min_x = min_x.min(p.x);
+                min_z = min_z.min(p.z);
+                max_x = max_x.max(p.x);
+                max_z = max_z.max(p.z);
+            }
+            ((min_x, min_z), (max_x, max_z))
+        }
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < self.tris.len() {
+            let Some(src) = self.tris[i].source else {
+                i += 1;
+                continue;
+            };
+            match src.kind {
+                PatchKind::Triangle => {
+                    let t = &self.tris[i];
+                    let extent = xz_extent(&[t.a, t.b, t.c]);
+                    out.push(Patch { article: src.article, primitive: src.primitive, kind: src.kind, tris: vec![i as u32], centroid: (t.a + t.b + t.c) / 3.0, extent });
+                    i += 1;
+                }
+                PatchKind::Quad => {
+                    if i + 1 < self.tris.len() && self.tris[i + 1].source == Some(src) {
+                        let (t0, t1) = (&self.tris[i], &self.tris[i + 1]);
+                        let centroid = (t0.a + t0.b + t0.c + t1.b) / 4.0;
+                        let extent = xz_extent(&[t0.a, t0.b, t0.c, t1.b]);
+                        out.push(Patch { article: src.article, primitive: src.primitive, kind: src.kind, tris: vec![i as u32, (i + 1) as u32], centroid, extent });
+                        i += 2;
+                    } else {
+                        // A lone quad-kind triangle with no partner — not reachable through
+                        // `nfs_assets::mesh::article_parts` (a quad always emits its pair
+                        // together), kept as a one-triangle patch rather than panicking.
+                        let t = &self.tris[i];
+                        let extent = xz_extent(&[t.a, t.b, t.c]);
+                        out.push(Patch { article: src.article, primitive: src.primitive, kind: src.kind, tris: vec![i as u32], centroid: (t.a + t.b + t.c) / 3.0, extent });
+                        i += 1;
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// The box every triangle lies in (zero for an empty grid).
@@ -525,5 +670,77 @@ mod tests {
         assert!(t.changed && t.word == 0);
         assert_eq!(t.plane_point, Vec3::new(0.0, 1.5, -5.0));
         assert!((t.plane_height(30.0, 30.0) - 1.5).abs() < 1e-6);
+    }
+
+    /// Quadtree prerequisite 1 (quad identity): a quad's two triangles,
+    /// tagged with the same [`PatchSource`] by `nfs_assets::track::TrackGeometry::collision_grid`,
+    /// come back as ONE [`Patch`] of two triangles — not two — matching the original's `0x4853C0`
+    /// counting a quad as one tree entry; the patch centre is the confirmed `¼·Σ` of its four
+    /// distinct corners, not a mean of all six triangle corners (which would double-count the
+    /// shared diagonal).
+    #[test]
+    fn a_quads_two_triangles_are_one_patch() {
+        // the four corners of a unit square in the xz plane, and the two triangles
+        // `nfs_assets::mesh::append_primitive` emits for one quad (0, 2, 1) then (0, 3, 2) — see
+        // that function's corner-order derivation in `TriangleGrid::patches`'s doc.
+        let (v0, v1, v2, v3) = (Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 1.0), Vec3::new(0.0, 0.0, 1.0));
+        let quad_src = PatchSource { article: 3, primitive: 1, kind: PatchKind::Quad };
+        let tri_src = PatchSource { article: 3, primitive: 2, kind: PatchKind::Triangle };
+        let tris = vec![
+            Triangle { a: v0, b: v2, c: v1, surface: 1, colors: [[255; 4]; 3], source: Some(quad_src) },
+            Triangle { a: v0, b: v3, c: v2, surface: 1, colors: [[255; 4]; 3], source: Some(quad_src) },
+            Triangle { a: Vec3::new(5.0, 0.0, 5.0), b: Vec3::new(6.0, 0.0, 5.0), c: Vec3::new(5.0, 0.0, 6.0), surface: 2, colors: [[255; 4]; 3], source: Some(tri_src) },
+            Triangle::new(Vec3::ZERO, Vec3::X, Vec3::Z, 3), // no source: not a patch, must be skipped
+        ];
+        let g = TriangleGrid::build(tris, 20.0);
+        let patches = g.patches();
+        assert_eq!(patches.len(), 2, "the quad's pair collapses to one patch, the untagged triangle is skipped");
+
+        let quad_patch = &patches[0];
+        assert_eq!(quad_patch.kind, PatchKind::Quad);
+        assert_eq!((quad_patch.article, quad_patch.primitive), (3, 1));
+        assert_eq!(quad_patch.tris, vec![0, 1], "both triangle indices, in emission order");
+        let expected_centroid = (v0 + v1 + v2 + v3) / 4.0;
+        assert!((quad_patch.centroid - expected_centroid).length() < 1e-6, "¼·Σ of the four distinct corners, 0x4855C0");
+        assert_eq!(quad_patch.extent, ((0.0, 0.0), (1.0, 1.0)), "xz min/max of the four distinct corners, 0x485630");
+        assert_eq!(Entry::centroid(quad_patch), (0.5, 0.5));
+        assert_eq!(Entry::extent(quad_patch), ((0.0, 0.0), (1.0, 1.0)));
+
+        let tri_patch = &patches[1];
+        assert_eq!(tri_patch.kind, PatchKind::Triangle);
+        assert_eq!((tri_patch.article, tri_patch.primitive), (3, 2));
+        assert_eq!(tri_patch.tris, vec![2]);
+        assert_eq!(tri_patch.extent, ((5.0, 5.0), (6.0, 6.0)), "xz min/max of the triangle's three corners, 0x485EA0");
+    }
+
+    /// The quadtree accept test's extent half (`0x484320`'s vtable slot 2), read 2026-09-28: a
+    /// synthetic quad whose corners are NOT axis-aligned with the naive per-triangle bounding box,
+    /// to pin that [`Patch::extent`] is the *quad's own* four distinct corners (`0x485630`), not
+    /// some other fold — and that `y` is ignored exactly like the centroid and the accept test
+    /// itself never read it (`0x485630`'s min/max loops only ever touch offsets `+0` and `+8` of
+    /// each vertex).
+    #[test]
+    fn patch_extent_is_the_quads_own_corners_xz_only() {
+        // a non-square quad: (0,-3)(4,7)(9,2)(2,y=100,-1) with wildly different heights per
+        // corner, so a bug that folded `y` into the extent, or used only one triangle's three
+        // corners instead of all four distinct ones, would show up immediately.
+        let v0 = Vec3::new(0.0, 1.0, -3.0);
+        let v1 = Vec3::new(4.0, 50.0, 7.0);
+        let v2 = Vec3::new(9.0, -20.0, 2.0);
+        let v3 = Vec3::new(2.0, 100.0, -1.0);
+        let quad_src = PatchSource { article: 0, primitive: 0, kind: PatchKind::Quad };
+        // emission order (0, 2, 1) then (0, 3, 2) — `TriangleGrid::patches`'s corner-order doc —
+        // so the four distinct corners are t0.a, t0.b, t0.c, t1.b = v0, v2, v1, v3.
+        let tris = vec![
+            Triangle { a: v0, b: v2, c: v1, surface: 1, colors: [[255; 4]; 3], source: Some(quad_src) },
+            Triangle { a: v0, b: v3, c: v2, surface: 1, colors: [[255; 4]; 3], source: Some(quad_src) },
+        ];
+        let g = TriangleGrid::build(tris, 20.0);
+        let patches = g.patches();
+        assert_eq!(patches.len(), 1);
+        let p = &patches[0];
+        // x: min(0,4,9,2)=0, max=9 — z: min(-3,7,2,-1)=-3, max=7 — y (1,50,-20,100) never enters.
+        assert_eq!(p.extent, ((0.0, -3.0), (9.0, 7.0)));
+        assert_eq!(Entry::extent(p), ((0.0, -3.0), (9.0, 7.0)));
     }
 }

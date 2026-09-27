@@ -471,7 +471,7 @@ impl Ambience {
         };
         match self.pool[slot].voice {
             Some(v) if out.is_playing(v) => {
-                out.set(v, vol, 1.0);
+                out.set_word(v, vol, crate::resample::PITCH_UNIT, 0x40);
                 out.set_pan(v, pan);
                 // 0x4AEED6 is `Voice_play` on voice `slot + 0x39` (bank kind 5)
                 out.voice_play_filter(v, self.filter);
@@ -480,7 +480,7 @@ impl Ambience {
                 if let Some(c) = self.clip(e.patch as u16) {
                     let looping = c.loop_range.is_some();
                     tracing::debug!(patch = e.patch, label = e.label, d = d as i32, level, looping, "ambience voice");
-                    self.pool[slot].voice = Some(out.play_panned(c, vol, 1.0, pan, looping));
+                    self.pool[slot].voice = Some(out.play_word(c, vol, crate::resample::PITCH_UNIT, 0x40, pan, looping));
                 } else {
                     self.release(out, i);
                 }
@@ -534,7 +534,7 @@ impl Ambience {
                 match self.clip(patch as u16) {
                     Some(c) => {
                         let looping = c.loop_range.is_some();
-                        let id = out.play_panned(c, vol, 1.0, pan as u16, looping);
+                        let id = out.play_word(c, vol, crate::resample::PITCH_UNIT, 0x40, pan as u16, looping);
                         tracing::info!(patch, pan, vol, playing = out.is_playing(id), "thunder");
                     }
                     None => tracing::info!(patch, "thunder: patch missing from track.viv"),

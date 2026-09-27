@@ -322,7 +322,6 @@ impl CareerUi {
                         .map(|c| c.display_name.to_string())
                         .unwrap_or_default()
                 );
-                self.save();
             }
             return None;
         }
@@ -474,7 +473,6 @@ impl CareerUi {
             msg += &format!("   STAGE {stage} COMPLETE: PROMOTION!");
         }
         self.message = msg;
-        self.save();
     }
 
     fn factory_sprites(&self, f: &BitmapFont, active: Option<u8>, out: &mut Vec<Sprite>) {
@@ -679,7 +677,6 @@ impl CareerUi {
         match self.career.repair(&self.tables, i, nfs_game::career::QuickFix::Overall) {
             Ok(paid) => {
                 self.message = format!("REPAIRED FOR ${paid}");
-                self.save();
             }
             Err(e) => self.message = e.to_string().to_uppercase(),
         }
@@ -743,7 +740,6 @@ impl CareerUi {
                 "INSTALLED {bought} PART{}  (${spent})",
                 if bought == 1 { "" } else { "S" }
             );
-            self.save();
         }
     }
 
@@ -776,21 +772,18 @@ impl CareerUi {
                     Ok(v) => {
                         self.message = format!("SOLD {name} FOR ${v}");
                         self.car_sel = 0;
-                        self.save();
                     }
                     Err(e) => self.message = e.to_string().to_uppercase(),
                 }
             } else if car.asking_price.is_some() {
                 self.career.withdraw_from_sale(i);
                 self.message = format!("{name} TAKEN OFF THE MARKET");
-                self.save();
             } else {
                 let ask = self.career.car_value(&self.tables, i).unwrap_or(0).max(0) as u32;
                 match self.career.list_for_sale(i, ask) {
                     Ok(()) => {
                         self.message =
                             format!("{name} LISTED AT ${ask}   (OFFERS COME IN AFTER A RACE)");
-                        self.save();
                     }
                     // 0x50FCF1: `push 0x2BE` (the "ok" label, 702) / `push 0x3C` (the text, 60)
                     Err(nfs_game::career::CareerError::LastCar) => self.dialog = Some((60, false)),
@@ -952,7 +945,6 @@ impl CareerUi {
         if let Some(t) = self.current().cloned() {
             self.career.reset_partial_except(&self.tables, t.id);
             self.reset_confirmed = true;
-            self.save();
         }
     }
 
@@ -1004,7 +996,6 @@ impl CareerUi {
                             .iter()
                             .position(|c| matches!(c, CarChoice::Owned(_, cid) if *cid == id))
                             .unwrap_or(0);
-                        self.save();
                     }
                     // 0x501D41 / 0x501F86: not enough credits for the car -> one-button 802
                     Err(nfs_game::career::CareerError::NoMoney { .. }) => self.dialog = Some((802, false)),
@@ -1371,7 +1362,6 @@ impl CareerUi {
         self.race_flags.era_changed = false;
         // 0x503A50 at 0x4EDF1A: the running pair back to −1
         (self.side.tournament.current_event, self.side.tournament.current_tournament) = (-1, -1);
-        self.save();
         true
     }
 
@@ -1396,7 +1386,6 @@ impl CareerUi {
                 Some((false, _)) => "FINALE LOST".into(),
                 None => String::new(),
             };
-            self.save();
             self.t_idx = 0;
             self.car_sel = 0;
             return;
@@ -1444,7 +1433,6 @@ impl CareerUi {
         self.race_flags.era_changed = o.era_advanced;
         // …and 0x4D476F then lands on `[E, VictoryRoom] endofera` (text menu: the finale offer)
         self.victory_room = o.era_advanced;
-        self.save();
         // **The selected tournament `[0x691E6C]` moves only when one is completed** (rank ≤ 3 in
         // an era tournament): 0x503C76…0x503CA8 walks the records of the career's era, now the
         // next one when this closed it, and takes the first visible one not completed yet, else
@@ -1953,6 +1941,17 @@ mod tests {
         assert_eq!(ui.career.garage[0].mileage, 3000);
         assert!(ui.career.money > 0);
         assert!(ui.message.starts_with("RESULT: P1"));
+        // **Ported as the original, 2026-09-28** (`savegame.md` "Save timing, ported
+        // 2026-09-28"): the original writes the profile only at a race launch, `LOADGAMEBUTTON`
+        // or profile creation — a race's own result (`finish`) stays in memory. The disk file
+        // still carries what `activate()`'s own launch (0x4D52EA) saved: the fee paid and the
+        // parts installed, but no mileage/win/prize from the race just run.
+        let on_disk = Career::load(&tmp).unwrap();
+        assert_ne!(on_disk, ui.career, "the race's own result is not saved yet");
+        assert_eq!(on_disk.garage[0].mileage, 0, "disk still holds the pre-race launch save");
+        assert_eq!(on_disk.money, 100_000 - price, "disk still holds the launch-time money, not the prize");
+        // `LOADGAMEBUTTON` (0x510AF0) is the plain "save now": it catches the result up
+        ui.save();
         assert_eq!(Career::load(&tmp).unwrap(), ui.career);
         let _ = std::fs::remove_file(tmp);
     }

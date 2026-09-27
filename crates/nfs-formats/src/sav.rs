@@ -10,7 +10,7 @@
 //! Nine modules contribute bytes; `TrackRecords` contributes none (its save fn writes
 //! `SaveData\nfs5.trk` as a side effect and its load fn is `mov al,1; ret`). The optional trailing
 //! `"accessor\0" u32 len` block holds the front-end accessors — options, selections, the chronicle
-//! year — in `std::map` (byte-wise `strcmp`) order. All 220 statically registered names and the class that
+//! year — in `std::map` (byte-wise `strcmp`) order. All 223 statically registered names and the class that
 //! serialises each one are in [`ACCESSORS`] (`savegame.md` §6.2a), so the block is fully typed
 //! here: [`AccessorBlock`] parses and writes it, and a *subset* is legal because the original looks
 //! every name up in its own registry and anything absent keeps its default (§9.6).
@@ -530,7 +530,7 @@ pub enum AccessorKind {
 /// ascending order the `std::map` at `[0x65B3A8]` keeps them in, which is the order the block must
 /// be written in. Extracted from the image: each name's push site names its constructor, the
 /// constructor's vtable store names the class through its RTTI descriptor (`savegame.md` §6.2a).
-pub const ACCESSORS: [(&str, AccessorKind); 220] = [
+pub const ACCESSORS: [(&str, AccessorKind); 223] = [
     ("ABOOL", AccessorKind::Dword), // FEBoolAccessor
     ("ANINTEGER", AccessorKind::Dword), // FEIntAccessor
     ("ANOTHER", AccessorKind::Text), // FEStringAccessor
@@ -546,6 +546,7 @@ pub const ACCESSORS: [(&str, AccessorKind); 220] = [
     ("CDPlayer.AvailableList", AccessorKind::Dword), // FEAvailableSongsAccessor
     ("CDPlayer.Options", AccessorKind::Dword), // FELocalizedTextAccessor
     ("CDPlayer.SelectedList", AccessorKind::Dword), // FESelectedSongsAccessor
+    ("CDPlayer.Title", AccessorKind::Dword), // FEPositionableAccessor (2026-09-28: found missing in a genuine save, see savegame.md "Genuine save 2026-09-28")
     ("CDPlayer.View", AccessorKind::Dword), // FELocalizedTextAccessor
     ("COMMS.ACCOUNTID", AccessorKind::Text), // FEStringAccessor
     ("COMMS.PASSWORD", AccessorKind::Text), // FEStringAccessor
@@ -598,7 +599,7 @@ pub const ACCESSORS: [(&str, AccessorKind); 220] = [
     ("Controller.SteerLeft", AccessorKind::ControllerInput), // FEControllerInputAccessor
     ("Controller.SteerRight", AccessorKind::ControllerInput), // FEControllerInputAccessor
     ("DealerCar.Car", AccessorKind::Dword), // FEGenericCarAccessor
-    ("DealerCar.Colour", AccessorKind::Dword), // FEGenericCarAccessor
+    ("DealerCar.Colour", AccessorKind::Colour), // FEColourAccessor (2026-09-28: corrected from FEGenericCarAccessor/Dword — its ctor 0x4B91F0 stores vtable 0x5B4E60, whose +0x1C/+0x20 are 0x4B9520/0x4B9550, the FEColourAccessor Save/Load; found via a genuine save, savegame.md "Genuine save 2026-09-28")
     ("DealerCar.IntColour", AccessorKind::Colour), // FEColourAccessor
     ("Display.Damage", AccessorKind::Dword), // FELocalizedTextAccessor
     ("Display.DispCols", AccessorKind::Dword), // FELocalizedTextAccessor
@@ -641,7 +642,7 @@ pub const ACCESSORS: [(&str, AccessorKind); 220] = [
     ("Gear6", AccessorKind::Dword), // FEFloatAccessor
     ("Gear7", AccessorKind::Dword), // FEFloatAccessor
     ("GenericCar.Car", AccessorKind::Dword), // FEGenericCarAccessor
-    ("GenericCar.Colour", AccessorKind::Dword), // FEGenericCarAccessor
+    ("GenericCar.Colour", AccessorKind::Colour), // FEColourAccessor (2026-09-28: corrected the same way as DealerCar.Colour — ctor 0x4B91F0, vtable 0x5B4E60)
     ("GenericCar2.Car", AccessorKind::Dword), // FEGenericCarAccessor
     ("Graphics.CarChrome", AccessorKind::Dword), // FELocalizedTextAccessor
     ("Graphics.CarDetail", AccessorKind::Dword), // FELocalizedTextAccessor
@@ -676,6 +677,8 @@ pub const ACCESSORS: [(&str, AccessorKind); 220] = [
     ("Parts.AllParts", AccessorKind::Dword), // FEPartsAllPartsAccessor
     ("Parts.InstallList", AccessorKind::Dword), // FEPartsCarSetupInventoryAccessor
     ("Parts.OwnedDamageRepairList", AccessorKind::Dword), // FEPartsDamageRepairAccessor
+    ("Parts.RepairShoppingList", AccessorKind::Dword), // FEPartsDamageRepairShoppingList (2026-09-28: found missing in a genuine save — ctor 0x516FE0, vtable 0x5BA434, RTTI ".?AVFEPartsDamageRepairShoppingList@@", Save/Load 0x4BC460/0x4BC480)
+    ("Parts.ShoppingList", AccessorKind::Dword), // FEPartsShoppingBasket (2026-09-28: found missing in a genuine save — ctor 0x515DF0, vtable 0x5BA2E0, RTTI ".?AVFEPartsShoppingBasket@@", Save/Load 0x4BC460/0x4BC480)
     ("Parts.UsedDamageList", AccessorKind::Dword), // FEPartsDamageRepairAccessor
     ("PrizeCars.Car", AccessorKind::Dword), // FEPrizeCarAccessor
     ("QUICKFIX.BODYWORK", AccessorKind::Dword), // FEBoolAccessor
@@ -985,9 +988,9 @@ mod tests {
 
     #[test]
     fn the_accessor_table_matches_the_registry() {
-        // 220 names, byte-wise ascending — the order the original's std::map keeps and the writer
+        // 223 names, byte-wise ascending — the order the original's std::map keeps and the writer
         // has to reproduce.
-        assert_eq!(ACCESSORS.len(), 220);
+        assert_eq!(ACCESSORS.len(), 223);
         assert_eq!(accessor_kind("UVWj"), None, "0x4FD0FF pushes a callback, not a name");
         for w in ACCESSORS.windows(2) {
             assert!(w[0].0.as_bytes() < w[1].0.as_bytes(), "{} !< {}", w[0].0, w[1].0);

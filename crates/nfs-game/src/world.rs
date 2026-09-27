@@ -24,7 +24,16 @@ pub struct TrackWorld {
     /// The collision props the loader 0x4750B0 builds from the track's tagged articles
     /// ([`track_props`]) — `Car_propPass` 0x498DE0's objects.
     pub props: Vec<nfs_physics::props::Prop>,
+    /// [`Self::collision`]'s own patches, one per original quad/triangle
+    /// ([`nfs_physics::collision::TriangleGrid::patches`]) — kept alongside the grid because
+    /// [`Self::tree`]'s slots index into this list by kind ([`nfs_physics::track_tree::TreeItem`]).
+    pub patches: Vec<nfs_physics::collision::Patch>,
     pub walls: nfs_physics::walls::WallSet,
+    /// `WTrack+0x24`, wired 2026-09-28: one [`nfs_physics::track_tree::TrackTree`] over
+    /// [`Self::patches`], [`Self::props`] and [`Self::walls`], built in the original's own
+    /// `insertAll(C)`-then-`insertAll(A)` order ([`track_tree_order`], `RE/RENDERING.md` "The
+    /// tree, built" / "Bundle order, read 2026-09-28").
+    pub tree: nfs_physics::track_tree::TrackTree,
     pub start: Vec3,
     /// The `.map` `ambient`'s mean, clamped 0.2…0.9 — the port's scene ambient for an item that
     /// has no light of its own. APPROXIMATION: not the original's; the track's own items no longer
@@ -197,6 +206,10 @@ fn part_list(flags: u16) -> Option<ViewList> {
         None
     }
 }
+
+/// `LayerFalseSort1`/`2`'s `mode 1` threshold, `[0x61975C]` against `0x2710` (0x449AB2, unsigned):
+/// `nfs_renderer::FakeSortMode::PerItem`'s per-item fold.
+const FAKESORT_NEAR_KEY: u32 = 10_000;
 
 /// One `Vis ` segment as 0x487330 keeps it: `raised = a.y ≠ 0`, the start and the delta in xz,
 /// `len²` and `1/len²`.
@@ -1043,13 +1056,13 @@ impl TrackWorld {
                 // `S_UVAnimate` ground shadows (castle, coastal, farmland, forest, canyon), 0 else
                 let depth_bias = rs.map_or(0, |rs| rs[4]);
                 // `FakeSort`'s `LayerFalseSort1` / `2` (0x800F / 0x8010): drawn twice, depth writes
-                // off and then on, at `SPECIALFX` 2 or 3; below 2 (0x44EC80's jump table, 0 and 1
-                // unconditionally) one draw, texture filter `POINT` instead — `Renderer::
-                // set_fakesort_single`, gated on `special_fx_level()` in `porsche/main.rs`
-                // (`thrash.md` §6d.4, read to the instruction 2026-09-27). APPROXIMATION: at
-                // `SPECIALFX` 2 the original picks either arm at runtime (frame rate and the
-                // drawn article's distance, not traced further); the port keeps the double-draw
-                // arm there, as at 3
+                // off and then on, at `SPECIALFX` 3 always and at 2 by the runtime pick; below 2
+                // (0x44EC80's jump table, 0 and 1 unconditionally) one draw, texture filter
+                // `POINT` instead — `Renderer::set_fakesort_mode` (`FakeSortMode`), gated on
+                // `App::fakesort_mode` in `porsche/main.rs` (`thrash.md` §6d.4, read to the
+                // instruction 2026-09-27). This flag only says the material *carries* the
+                // `FakeSort` method; which of the two arms (or the runtime per-item fold,
+                // `DrawItem::fakesort_near` set below) draws it is decided per frame/per item.
                 let false_sort = m.and_then(|m| methods.iter().find(|r| r.name == m.render_method).map(|r| r.built_ops(0, m.op_mask).any(|o| o.class == 0x800F))).unwrap_or(false);
                 // the material's address modes, states 0x41 / 0x42 (`thrash.md` §7): 0 clamps
                 let clamp = m.map_or([false; 2], |m| m.address.map(|a| a == 0));
@@ -1062,7 +1075,16 @@ impl TrackWorld {
         // *(Until 2026-09-26 the lowest LODs were merged per material — a few hundred meshes clipped
         // by the far plane alone; the original's mid-ground reaches 600 / 700 m past the draw
         // distance and the near articles switch LOD.)*
-        let props = track_props(track);
+        // `WSceneBundle`'s own tree contribution (`scene_props`'s doc: `0x46D1D0` over `[0x628168]`)
+        // is appended after the crp-article props so every index a `Breakable`/`SmackableSpawn`
+        // stored before this point (keyed by `.crp` article, not by position in `props`) stays
+        // valid; the caller (`track_tree_order`, below) is told the appended range so it can
+        // still put the scene bundle *first* in the tree's own insertion order, matching the
+        // original (`0x487abd` runs before any other bundle's `Load`).
+        let mut props = track_props(track);
+        let scene_start = props.len();
+        props.extend(scene_props(track, &geometry));
+        let scene_indices: Vec<usize> = (scene_start..props.len()).collect();
         // a breakable's own article is drawn on its own so that its pieces can replace it
         let breakable_articles: std::collections::HashSet<usize> = props.iter().filter_map(|p| p.breakable.as_ref().map(|b| b.article)).collect();
         // the track's smackables (0x4772F0 over the instance bundle), after the mission scene's in
@@ -1144,15 +1166,21 @@ impl TrackWorld {
         let arts = track.crp.articles(&track.crp_data).unwrap_or_default();
         let mut item_element = vec![None; items.len()];
         let mut missing_tags = std::collections::HashSet::new();
-        // `ENDW` barrier boxes of a skill test (`animdefs.txt` collideType=kBox): their footprint
-        // edges join the wall set so the course is closed for the physics too
-        let mut extra_walls: Vec<([f32; 3], [f32; 3], u32)> = Vec::new();
         let mut animated: Vec<AnimatedProp> = Vec::new();
         let mut smackables: Vec<SmackableSpawn> = Vec::new();
         let mut instance_flares: Vec<(usize, TrackFlare)> = Vec::new();
         for inst in &geometry.instances {
-            if let Some(lods) = lib_gpu.get(&inst.tag) {
-                let art = geometry.library.iter().find(|a| a.tag == inst.tag);
+            // `0x478640`'s search over the bundle's template records: on no match, `0x482EA0`
+            // falls back to template index 0 (`0x482ebe`…`0x482ec0`'s `jge`/`xor eax,eax`), never
+            // a skip — the first `'tr'∧library` article in `.crp` order (`geometry.library`'s own
+            // build order, `TrackGeometry::build_geometry`'s `library.push`, matching `0x482970`'s
+            // gate order). On every shipped track that first entry is `DFLT`
+            // (`animdefs.txt`: `collideType=kCylinder`) — read 2026-09-28. Unreachable on shipped
+            // data (every scene tag on every shipped track names one of the 70 shared articles,
+            // swept below and in [`scene_props`]'s own doc), but no longer an invented skip.
+            let tag = if lib_gpu.contains_key(&inst.tag) { Some(inst.tag) } else { geometry.library.first().map(|a| a.tag) };
+            if let Some((tag, lods)) = tag.and_then(|t| lib_gpu.get(&t).map(|l| (t, l))) {
+                let art = geometry.library.iter().find(|a| a.tag == tag);
                 // the scene record's matrix (slot 5, 0x4828A0 → 0x539CD0): the element's position
                 // and its 3×3 scaled by the per-cent values (0x482EA0, 0x46B020) — and nothing of the
                 // library article's own `tr`: the template's record is the identity (0x482BF1), and
@@ -1161,10 +1189,12 @@ impl TrackWorld {
                 // and scene items"). *(Until 2026-09-26 the port applied the `tr` too — the cones
                 // at 0.585 of their size.)*
                 let world_tr = inst.transform * Mat4::from_scale(inst.scale);
-                // a looping `animdefs.txt` piece makes this prop play its own track
+                // a looping `animdefs.txt` piece makes this prop play its own track (the matched
+                // template's own tag, `tag` above — the fourcc-miss fallback's substitution
+                // applies here too, not just to the mesh)
                 let loop_piece = track
                     .animdefs
-                    .by_fourcc(inst.tag)
+                    .by_fourcc(tag)
                     .and_then(|d| d.resting_pieces().find(|p| p.flags.looping).cloned());
                 // the scene bundle's slot (0x482EA0): the walk answers it through 0x4786A0 with the
                 // library article's `Base` and picks the LOD from its records (0x450010).
@@ -1199,25 +1229,13 @@ impl TrackWorld {
                 if let Some(sp) = art.and_then(|a| smackable_spawn(track, a, inst)) {
                     smackables.push(sp);
                 }
-                if inst.source == 1 && inst.tag == u32::from_le_bytes(*b"ENDW") && let Some(a) = art {
-                    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-                    for mm in &a.meshes {
-                        for v in &mm.mesh.vertices {
-                            let p = Vec3::from(v.position);
-                            lo = lo.min(p);
-                            hi = hi.max(p);
-                        }
-                    }
-                    if lo.x <= hi.x {
-                        let local = Mat4::from_scale(inst.scale);
-                        let corners = [Vec3::new(lo.x, lo.y, lo.z), Vec3::new(hi.x, lo.y, lo.z), Vec3::new(hi.x, lo.y, hi.z), Vec3::new(lo.x, lo.y, hi.z)]
-                            .map(|c| inst.transform.transform_point3(local.transform_point3(c)));
-                        for k in 0..4 {
-                            extra_walls.push((corners[k].to_array(), corners[(k + 1) % 4].to_array(), 0x60));
-                        }
-                    }
-                }
+                // an `ENDW` (or any other `kBox`/`kCylinder`) scene element's own collision prop is
+                // built once, by [`scene_props`] into the tree (`WSceneBundle`'s own contribution,
+                // real source, not the wall-set edges this used to invent here before 2026-09-28 —
+                // `RE/RENDERING.md` "The tree, wired"'s skill-test paragraph).
             } else if inst.source == 1 {
+                // unreachable on shipped data: `geometry.library` is never empty (every track
+                // carries the 70 shared articles, so `tag` above is always `Some`)
                 missing_tags.insert(inst.tag);
             }
         }
@@ -1251,11 +1269,21 @@ impl TrackWorld {
             });
         let flags: Vec<u32> = materials.iter().map(|m| m.flags).collect();
         let collision = geometry.collision_grid(20.0, &|mat| flags.get(mat as usize).copied().unwrap_or(0));
-        let n_extra = extra_walls.len();
-        let walls = nfs_physics::walls::WallSet::build(track.edges.iter().flat_map(|e| e.segments.iter().map(|s| s.loaded())).chain(extra_walls), 30.0);
-        if n_extra > 0 {
-            tracing::info!(segments = n_extra, "barrier boxes added to the wall set");
-        }
+        // *(Until 2026-09-28 a skill test's `ENDW` barriers also joined this wall set as
+        // synthesized footprint-edge segments — a pre-2026-09-28 port addition, not `.edg` data,
+        // invented before `WSceneBundle`'s own tree contribution ([`scene_props`]) was read. That
+        // duplicated the barrier: one course-closing box per `ENDW` element in the wall set *and*
+        // one `kBox` [`nfs_physics::props::Prop`] in the tree for the same element. Removed —
+        // `scene_props`'s tree entry is now the barrier's only collision object, matching the
+        // original's one-object-per-spawned-element rule (`0x4750B0`'s per-article dispatch).)*
+        let walls = nfs_physics::walls::WallSet::build(track.edges.iter().flat_map(|e| e.segments.iter().map(|s| s.loaded())), 30.0);
+        // `WTrack+0x24`, wired: `insertAll(C)` (patches + `kCylinder`/`kBox` props, bundle by
+        // bundle, `RE/RENDERING.md` "Bundle order, read 2026-09-28") then `insertAll(A)` (every
+        // `.edg` wall in file order, `WallSet::build`'s own input order above).
+        let patches = collision.patches();
+        let mut tree_order = track_tree_order(&track.crp, &track.crp_data, &arts, &geometry.world, &patches, &props, &scene_indices);
+        tree_order.extend((0..walls.walls().len()).map(nfs_physics::track_tree::TreeItem::Wall));
+        let tree = nfs_physics::track_tree::TrackTree::build(&patches, &props, walls.walls(), &tree_order);
         let start = track
             .start_forward
             .as_ref()
@@ -1309,7 +1337,9 @@ impl TrackWorld {
             env_map,
             collision,
             props,
+            patches,
             walls,
+            tree,
             start,
             ambient,
             map_light,
@@ -1425,13 +1455,25 @@ impl TrackWorld {
                     let parts = a.parts.get(k).map(|p| p.as_slice()).unwrap_or(&[]);
                     for (i, item) in a.lods[k].1.iter().enumerate() {
                         let (flags, centre) = parts.get(i).copied().unwrap_or((2, Vec3::ZERO));
+                        // `FakeSortMode::PerItem`'s fold (0x449AB2, `[0x61975C] < 0x2710`
+                        // unsigned): the port reuses this same `round(d²)` view-list key as the
+                        // item's own distance test — see `DrawItem::fakesort_near`'s doc
                         match c.drawer {
                             ArticleDrawer::Static | ArticleDrawer::MidGround { .. } => match part_list(flags) {
-                                Some(ViewList::Near) => near.push((key(centre), *item)),
-                                Some(ViewList::Far) => far.push((key(centre), *item)),
+                                Some(ViewList::Near) => {
+                                    let k = key(centre);
+                                    near.push((k, DrawItem { fakesort_near: k < FAKESORT_NEAR_KEY, ..*item }));
+                                }
+                                Some(ViewList::Far) => {
+                                    let k = key(centre);
+                                    far.push((k, DrawItem { fakesort_near: k < FAKESORT_NEAR_KEY, ..*item }));
+                                }
                                 None => {}
                             },
-                            ArticleDrawer::Instance | ArticleDrawer::Anim => far.push((d.value as u32, *item)),
+                            ArticleDrawer::Instance | ArticleDrawer::Anim => {
+                                let k = d.value as u32;
+                                far.push((k, DrawItem { fakesort_near: k < FAKESORT_NEAR_KEY, ..*item }));
+                            }
                         }
                     }
                 }
@@ -1662,7 +1704,13 @@ pub fn smackable_spawn(track: &TrackAssets, art: &nfs_assets::track::ArticleMesh
     if inst.source != 1 {
         return None;
     }
-    let def = track.animdefs.lookup(inst.tag).filter(|d| d.collide_type == "kSmackable")?;
+    // the matched **template's** own tag (`art.tag`), not the element's unmatched fourcc — same
+    // fourcc-miss fallback substitution as the draw loop's `loop_piece` and `scene_props`
+    // (0x482ebe…0x482ec0, e517d04f), missed here until now: `art` is already the caller's
+    // fallback-resolved article ([`TrackWorld::upload`]'s own `art` at the `smackable_spawn` call
+    // site), so this lookup must follow it too. Unreached on shipped data (every mission-scene tag
+    // matches one of the 70 shared library articles), same as the other two.
+    let def = track.animdefs.lookup(art.tag).filter(|d| d.collide_type == "kSmackable")?;
     let local = Mat4::from_scale(inst.scale);
     let verts: Vec<Vec3> = art.meshes.iter().flat_map(|mm| mm.mesh.vertices.iter().map(|v| local.transform_point3(Vec3::from(v.position)))).collect();
     let (_, rot, pos) = inst.transform.to_scale_rotation_translation();
@@ -1863,6 +1911,11 @@ fn sample_piece(track: &nfs_formats::crp::AnimTrack, seconds_per_frame: f32, fla
 /// GPU-resident car model at one LOD, split into body parts (with their pivots applied) and
 /// wheels (kept separate so they can spin/steer). Model space (RE/notes/car-model.md §3) is
 /// +Y up, −Z front, +X left; `MODEL_TO_BODY` rotates it into the physics body frame (+Z forward).
+///
+/// `Clone` is cheap: every field but the GPU ids (`MeshId`/`MaterialId`/`TextureId`, plain indices)
+/// is small metadata or a `Vec` of them — no GPU memory is duplicated by cloning alone. Used by
+/// [`Self::instantiate`].
+#[derive(Clone)]
 pub struct CarModel {
     /// The model's scale in its render matrix: 1, or **0.4** for a `.TINYCAR` (`[0x5B37C8]`, the
     /// scale 0x4433D2 builds into the car's matrix through 0x539B30)
@@ -1969,9 +2022,14 @@ pub struct CarModel {
 
 /// One mesh of a crushable part (0x43E390): its undamaged vertices (`vt#lod`), each vertex's crush
 /// vector (`vt#(0x8000|lod)`, `w` 0) and its damage zone (the `dz#lod` list it is in; 255 none).
+#[derive(Clone)]
 struct DeformPart {
     mesh: MeshId,
     base: Vec<Vertex>,
+    /// its mesh's triangle list — kept so [`CarModel::instantiate`] can re-upload a pristine copy
+    /// of this part for a traffic/cop car instance without reading the (possibly already crushed)
+    /// GPU buffer back
+    indices: Vec<u32>,
     delta: Vec<[f32; 3]>,
     zone: Vec<u8>,
 }
@@ -2155,6 +2213,7 @@ fn tpg_f32(tpg: &nfs_formats::ini::Ini, key: &str) -> f32 {
     tpg.section("header").and_then(|h| h.get_f32_list(key)).and_then(|v| v.first().copied()).unwrap_or(0.0)
 }
 
+#[derive(Clone)]
 pub struct CarWheelModel {
     pub pivot: Vec3,
     pub is_front: bool,
@@ -2824,6 +2883,7 @@ impl CarModel {
                         deform.push(DeformPart {
                             mesh: id,
                             base: mesh.vertices.clone(),
+                            indices: mesh.indices.clone(),
                             delta: d.mesh.vertices.iter().map(|v| v.position).collect(),
                             zone: z.mesh.vertices.iter().map(|v| v.position[0] as u8).collect(),
                         });
@@ -2927,6 +2987,80 @@ impl CarModel {
             damage_shown: [0.0; 10],
             deform,
         })
+    }
+
+    /// A private copy of this model's damage-mutable GPU resources, for one traffic/cop car
+    /// instance of a shared catalogue model (`RE/notes/car-model.md` §13.1's residual gap).
+    ///
+    /// The original shares one upload per catalogue type too (`R3DCar` slot 7, 0x4383C0), but
+    /// recomputes a drawn car's decals/crush from *its own* raw damage and draws it — synchronously,
+    /// through the software blitter 0x572B40 — before the next car (0x4383CC/0x4383D3, no
+    /// car-kind gate), so two cars of one model always show correctly despite sharing the upload.
+    /// This port's renderer instead records a frame's `DrawItem`s and reads each `MeshId`/
+    /// `TextureId`/`MaterialId` once at `render()`; without this, two *simultaneously visible*,
+    /// differently damaged instances of one shared model would alias to whichever instance called
+    /// [`Self::update_damage`] last that frame.
+    ///
+    /// Cost: a fresh vertex+index buffer per crushable part ([`DeformPart`], `self.deform.len()`
+    /// of them — a handful of body panels, not the whole model) and a fresh texture plus a fresh
+    /// material per damage-decal page actually referenced by [`nfs_assets::car::DamagePatch`]
+    /// (typically one or two pages) — once per car at grid setup, not per frame. Everything else
+    /// (LOD/wheel/light geometry, the environment/specular textures, every non-decal material) is
+    /// `self.clone()`d as plain ids — cheap, no GPU allocation — and stays shared with the
+    /// template this was instantiated from.
+    pub fn instantiate(&self, r: &mut Renderer) -> Self {
+        let mut c = self.clone();
+        // the crushable parts: a fresh buffer holding the pristine (undamaged) positions —
+        // `update_damage` overwrites it once this instance takes zone damage. Re-uploaded from
+        // `base`/`indices`, not copied GPU-side, so a template already crushed by another
+        // instance is not what this instance starts from.
+        for p in &mut c.deform {
+            p.mesh = r.upload_mesh(&MeshData { vertices: p.base.clone(), indices: p.indices.clone() });
+        }
+        // the decal pages any zone can touch: a fresh texture (pristine pixels) plus a fresh
+        // material for every existing material that samples it, so its bind group is not shared
+        // with the template's or another instance's
+        let mut touched: Vec<usize> = c.damage_patches.iter().map(|p| p.page).collect();
+        touched.sort_unstable();
+        touched.dedup();
+        if !touched.is_empty() {
+            let mut tex_remap: HashMap<nfs_renderer::TextureId, nfs_renderer::TextureId> = HashMap::new();
+            for page_index in touched {
+                let (Some(base), Some(&old_tex)) = (c.damage_pages.get(page_index), c.page_textures.get(page_index)) else { continue };
+                let new_tex = r.upload_texture(&TextureData::single(base.width, base.height, base.rgba.clone()));
+                c.page_textures[page_index] = new_tex;
+                tex_remap.insert(old_tex, new_tex);
+            }
+            let mut mat_remap: HashMap<MaterialId, MaterialId> = HashMap::new();
+            let mut remap = |mid: &mut MaterialId, material_light: &mut HashMap<MaterialId, nfs_formats::crp::LayerLight>, shadowed: &mut std::collections::HashSet<MaterialId>| {
+                if let Some(&nid) = mat_remap.get(mid) {
+                    *mid = nid;
+                    return;
+                }
+                let Some(&new_tex) = r.material_texture(*mid).as_ref().and_then(|t| tex_remap.get(t)) else { return };
+                let nid = r.duplicate_material_texture(*mid, new_tex);
+                if let Some(l) = material_light.get(mid).copied() {
+                    material_light.insert(nid, l);
+                }
+                if shadowed.contains(mid) {
+                    shadowed.insert(nid);
+                }
+                mat_remap.insert(*mid, nid);
+                *mid = nid;
+            };
+            for (_, mid, _) in &mut c.body {
+                remap(mid, &mut c.material_light, &mut c.shadowed);
+            }
+            for w in &mut c.wheels {
+                for (_, mid, _) in &mut w.parts {
+                    remap(mid, &mut c.material_light, &mut c.shadowed);
+                }
+            }
+        }
+        // this instance starts with no damage shown yet, matching a just-uploaded model — the
+        // next `update_damage` call (before this instance's own `draw_items`) fills it in
+        c.damage_shown = [0.0; 10];
+        c
     }
 
     /// **0x438230(0)**, which `R3DCar` slot 7 runs every frame (0x4383CC): when any of the ten
@@ -3530,6 +3664,7 @@ impl CarModel {
 }
 
 /// One mesh of a morphing article: its frame-0 vertices and every frame's positions.
+#[derive(Clone)]
 struct MorphPart {
     mesh: MeshId,
     base: Vec<Vertex>,
@@ -3727,11 +3862,34 @@ pub fn track_smackable_articles(track: &TrackAssets) -> Vec<usize> {
 }
 
 /// The AABB fold 0x486340 (and 0x47B660) run: eight corners of a local box, each carried through
-/// a placement matrix, min/maxed per axis — no other source (a stored box slot, a different
-/// vertex set) was found feeding it. `local` is the same lowest-LOD vertex set [`track_props`]
-/// already collects for the box footprint, so its own min/max stands in for that local box.
-fn rotated_local_box_aabb(local: &[Vec3], tr: Mat4) -> (Vec3, Vec3) {
-    let (lo, hi) = local.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
+/// a placement matrix, min/maxed per axis. **Read 2026-09-27 (this pass): the source is resolved.**
+/// `0x44FE70` builds an 8-byte `{ptr, byte=1, word}` handle whose `ptr` is not per-article (it is
+/// the 2nd stack argument of the loader `0x4750B0` itself, read straight off `0x4750B0`'s own
+/// frame at both use sites 0x4751F2/0x4752E9 — the same object for every article of the track);
+/// the per-article piece is the `word` (the instance id, `esi+0x2e`). `0x486340`'s
+/// `call [[handle.ptr]+8]` (0x48639A) — traced to **`0x4893A0`** (found by scanning `.rdata` for
+/// the vtable holding `handle.ptr`'s class: `getBBox` sits at that vtable's slot 4, byte +0x10
+/// (`0x477F40`; `crp-geometry.md` §2.2's "getTransform slot3 / getBBox slot4" — `0x477DB0` is
+/// slot3), so slot 2, byte +8, is a *different* entry, one table row over: `0x4893A0`) — takes the
+/// `this`/id and calls `getBBox` on itself (`call [eax+0x10]` at 0x4893BB, i.e. the vtable's own
+/// slot 4) to fill two local `f32[3]`s, then combines their six components (x/y/z of each) into
+/// the eight corners of the axis-aligned box **those two vectors already are** — no rotation, no
+/// scale, in `0x4893A0` itself. `getBBox` (`0x477F40`) in turn reads `Base+0x14` / `Base+0x20` —
+/// the article's own **stored** `bbox_min`/`bbox_max` fields (`crp-geometry.md` §2.2, CONFIRMED
+/// equal to the LOD0 `vt` min/max for every article of two tracks tested there) — not a vertex
+/// walk. So **the article's local box is `Base.bbox_min`/`Base.bbox_max`**, read once per article,
+/// not folded from any mesh; the previous pass's "lowest-LOD vertex extent" stand-in was numerically
+/// exact (by that same CONFIRMED equality) but attributed to the wrong field. `0x486340`'s own fold
+/// (0x486404…0x486478) does not itself carry a rotation matrix — no `fmul`/`fadd` against `tr`
+/// appears in it, only `fcomp`/conditional-store — so whatever rotation the placed instance gets is
+/// applied by the *caller* of the constructor chain (the `kBox` branch's own footprint transform at
+/// 0x475241…0x4752BE calls `0x474CB0` before `0x486C20`, confirming the transform-then-store pattern
+/// there; the cylinder/AABB path's own transform site was not pinned further, so the port keeps
+/// applying `tr` to the box's eight corners here, matching the general "rotated corners" rule
+/// `main.rs`/f8198d01 already settled for the car/world-grid sibling **0x47B660**, and matching this
+/// pass's own sweep — see `track_props` below — which found the choice makes no numeric difference
+/// for any shipped rotated prop).
+fn rotated_local_box_aabb(lo: Vec3, hi: Vec3, tr: Mat4) -> (Vec3, Vec3) {
     let corners = [
         Vec3::new(lo.x, lo.y, lo.z),
         Vec3::new(lo.x, lo.y, hi.z),
@@ -3758,11 +3916,11 @@ fn rotated_local_box_aabb(local: &[Vec3], tr: Mat4) -> (Vec3, Vec3) {
 /// * `kBox` → a box on 0x474CB0's footprint of the article's vertices, through its `tr`, class 0
 ///   (0x475241…0x475302), radius `|(max.x − c.x, 0, max.z − c.z)| × 1.05`.
 ///
-/// The AABB is the axis-aligned box of the article's **local** lowest-LOD vertex box's eight
-/// corners, each carried through the instance's placement `tr` (rotation and translation) — not
-/// the AABB of the individually-transformed mesh vertices (which under-bounds a rotated article,
-/// since a rotated point's extreme coordinate need not come from a vertex the local box itself
-/// reaches). Read 2026-09-27: both object constructors call the shared base ctor 0x486340 first
+/// The AABB is the axis-aligned box of the article's **local** box's eight corners, each carried
+/// through the instance's placement `tr` (rotation and translation) — not the AABB of the
+/// individually-transformed mesh vertices (which under-bounds a rotated article, since a rotated
+/// point's extreme coordinate need not come from a vertex the local box itself reaches). Read
+/// 2026-09-27: both object constructors call the shared base ctor 0x486340 first
 /// (`WTreeElem_CylinderObject` 0x486690 at 0x4866AE, `WTreeElem_BoxObject` 0x486C20 at 0x486C42),
 /// which calls a vtable+8 slot (0x48639A) that fills an 8×0x10-byte-stride buffer, then folds it
 /// into a running per-axis min/max over exactly 8 iterations (0x486404…0x486478) — the identical
@@ -3771,6 +3929,14 @@ fn rotated_local_box_aabb(local: &[Vec3], tr: Mat4) -> (Vec3, Vec3) {
 /// XZ footprint corners (0x474CB0, [`box_footprint`]) are a separate field the loader builds and
 /// transforms the same way (0x475241…0x4752BE) — stored at `+0x34…+0x58`, not fed back into the
 /// AABB; only the box's *radius* (`|(max−c).xz| × 1.05`, 0x486C91) reads the AABB `mn`/`mx`.
+///
+/// **Read 2026-09-27, later (this pass): the local box's own source is resolved** — see
+/// [`rotated_local_box_aabb`]'s doc. It is `Base.bbox_min`/`Base.bbox_max` (`getBBox`, 0x477F40,
+/// itself called by the vtable+8 function 0x4893A0 above), not `local`'s vertex fold; `local` is
+/// kept only for `box_footprint` below, an unrelated field. No shipped prop's `mn`/`mx` changes:
+/// swept `coastal` (42 box/cylinder props), `alps` (293) and `monaco1` (64) — every one is
+/// bit-identical to the old vertex-derived value (`crp-geometry.md` §2.2's own CONFIRMED equality
+/// of `bbox_min`/`bbox_max` to the LOD0 `vt` extent already predicted this).
 pub fn track_props(track: &TrackAssets) -> Vec<nfs_physics::props::Prop> {
     use nfs_physics::props::{Breakable, Prop, PropShape, box_footprint};
     let mut out = Vec::new();
@@ -3793,7 +3959,10 @@ pub fn track_props(track: &TrackAssets) -> Vec<nfs_physics::props::Prop> {
         if local.is_empty() {
             continue;
         }
-        let (mn, mx) = rotated_local_box_aabb(&local, tr);
+        // The AABB's own source is `Base.bbox_min`/`Base.bbox_max` (getBBox, 0x477F40, reading
+        // Base+0x14/+0x20 — `rotated_local_box_aabb`'s doc above), not the lowest-LOD vertex fold
+        // this pass replaces; `local` still feeds `box_footprint` below, a separate field.
+        let (mn, mx) = rotated_local_box_aabb(Vec3::from(b.bbox_min), Vec3::from(b.bbox_max), tr);
         // 0x476380 finds each piece's `QuatGroup` among the instances by tag (0x478640 / 0x478670)
         // and gives up at one whose `Anim` part is missing or has both words 0 (0x476501…0x47651F)
         let breakable = (!def.pieces.is_empty()).then(|| Breakable {
@@ -3818,9 +3987,210 @@ pub fn track_props(track: &TrackAssets) -> Vec<nfs_physics::props::Prop> {
             _ => continue,
         };
         let class = if matches!(shape, PropShape::Cylinder { .. }) { def.radius as i32 as u32 } else { 0 };
-        out.push(Prop { shape, aabb_min: mn, aabb_max: mx, class, breakable, drive_through: def.drive_through });
+        out.push(Prop { shape, aabb_min: mn, aabb_max: mx, class, breakable, drive_through: def.drive_through, article: index });
     }
     out
+}
+
+/// `WSceneBundle`'s own tree contribution — corrects `RE/RENDERING.md`'s former "no parsed source
+/// for *which* library articles a track's scene places" (`ac7b3e6c`): this port
+/// *does* have that source, `nfs_formats::scn` + [`TrackGeometry::instances`] (read this session,
+/// disassembler addresses below).
+///
+/// **The read.** `0x46D1D0` (called once, at `0x487abd`, right after `WSceneBundle::Load`'s own
+/// call `0x487a87` and before any other bundle's ctor/`Load`/`insertAll(C)` — unchanged from
+/// "`WSceneBundle`'s own timing, settled") walks `[0x628168]` — the combined element vector
+/// `Scene_parseFile` 0x46C220 fills, `RE/notes/race-logic.md` §3.1: the track's *generic* `.scn`
+/// files (never any `GEOM_ELEMENT`s — swept all 78 shipped `.scn` files, zero exceptions) **then**
+/// the one loaded start/skill-test file's elements — dynamic-casts each to `CGeomElem` (RTTI
+/// `0x5CFA48`, the cast helper `0x5A134B` at `0x46D212`; `0x46D9C0` counts the same way and is
+/// what decides `WSceneBundle::Load`'s own live-slot count, `min(that count, 64)`, `0x482c81`…
+/// `0x482c97`), and for each survivor calls `0x483260` → **0x482EA0**(this=bundle, fourcc, pos,
+/// 3×3): `0x478640`(this, fourcc) searches the bundle's own template-record array (one per
+/// `'tr'∧library` article, `0x482970`'s gate) for a record whose stored tag equals the element's
+/// own fourcc (`CGeomElem+0x7C`, `0x46AF50`) — **on no match it falls back to template index 0**
+/// (`0x482ebe`…`0x482ec0`: `jge` keeps a `>= 0` index, else `xor eax,eax`), never a skip and never
+/// a parked `DFLT` slot — then, only once the live cursor is still `< 0x40` (`0x482ec2`, the 64
+/// cap; past it the spawn is silently dropped, no slot written, no cursor increment), copies the
+/// matched template's `{tag, Article*}` pair and overwrites the record with the **element's own**
+/// position and 3×3 (scaled by its per-cent values, `0x46B020`) — never the article's own `tr`
+/// (`0x482BF1`: the template's stored record is the identity/zero, matching "The scene bundle's
+/// items"). `0x46D9C0()`'s own count is exactly this same dynamic-cast tally, so on every shipped
+/// track `N` (the live-slot table's size) equals `M` (the number of elements that pass the cast)
+/// exactly whenever there is at least one template (always true — all 70 shared library articles
+/// carry `'tr'∧library`) — **zero parked `DFLT` fillers survive spawning on any shipped race**,
+/// correcting the former "plus `N−M` `DFLT` filler entries" framing (that framing was the honest
+/// worst case before this session's read of `0x482c73`'s own `N`-formula; it is not what the
+/// numbers give once `0x46D9C0()` is read).
+///
+/// Once spawned, the *same* `0x4750B0` walk every other bundle goes through (`RE/RENDERING.md`
+/// "Bundle order, read 2026-09-28") decides the tree contribution by the matched **template
+/// article's** `animdefs.txt` `collideType` — `kCylinder`/`kBox` build one [`Prop`], anything else
+/// (every shipped scene tag surveyed: `FNSH`/`ARW1`-`ARW4` = `collideType=0`, `CONE` =
+/// `kSmackable`) contributes nothing, same as a non-`kCylinder`/`kBox` article anywhere else in
+/// the tree. A `kBox`/`kCylinder` scene prop's placement is the **element's** transform
+/// (`inst.transform * Mat4::from_scale(inst.scale)`, [`crate::world::TrackGeometry::instances`]'s
+/// own field, matching "The scene bundle's items"' `0x4828A0` → `0x539CD0` draw matrix), never the
+/// library article's own `tr` — [`rotated_local_box_aabb`]/[`box_footprint`] take it in place of
+/// `g.transform`.
+///
+/// **Real data (surveyed, all `*_fstart.scn`/`*_bstart.scn`, every shipped track): 2–5
+/// `GEOM_ELEMENT`s per file, tags `FNSH`/`CONE`/`ARW1`-`ARW4` only** (`ENDW`, the one shared
+/// article with `collideType=kBox`, appears only in a skill test's `_ST<N>.scn`, which
+/// [`TrackAssets::build_geometry`] loads instead of the start file, never alongside it) — **none**
+/// of `FNSH`/`CONE`/`ARW1`-`4` is `kCylinder`/`kBox`, so this returns an **empty** `Vec` for every
+/// shipped, non-skill-test race: a measured fact
+/// (`scene_props_are_empty_on_a_shipped_race`, below), not an assumption that lets the tree wiring
+/// skip calling this. The former "the port parses no source" claim is corrected, not merely
+/// softened: the source is [`TrackGeometry::instances`] plus [`AnimDefs::lookup`], already wired
+/// for drawing; only the *tree*-facing use (this function, and its caller's insertion order) was
+/// missing.
+///
+/// **The fourcc-miss fallback, implemented 2026-09-28** (was a documented, unreachable-on-real-
+/// data divergence): a fourcc absent from the bundle's template records takes template index 0
+/// (`0x482ebe`…`0x482ec0`, above) — the first `'tr'∧library` article in `.crp` order, i.e.
+/// `geometry.library.first()` ([`TrackGeometry::build_geometry`]'s own `library.push` order
+/// matches `0x482970`'s gate order). On every shipped track that first article is `DFLT`
+/// (`animdefs.txt`: `collideType=kCylinder`), so the fallback is itself collidable — not a
+/// no-op. Still unreachable on shipped data (every scene tag on every shipped track's start file
+/// or skill test names one of the 70 shared articles), but no longer skipped: `art` below never
+/// silently drops an unmatched element the way the pre-2026-09-28 code did.
+/// The 64-slot cap is applied (`.take(64)`) though also unreachable (5 is the largest count found).
+pub fn scene_props(track: &TrackAssets, geometry: &nfs_assets::track::TrackGeometry) -> Vec<nfs_physics::props::Prop> {
+    use nfs_physics::props::{Breakable, Prop, PropShape, box_footprint};
+    let mut out = Vec::new();
+    let Ok(arts) = track.crp.articles(&track.crp_data) else { return out };
+    let tags = article_tags(track, &arts);
+    for inst in geometry.instances.iter().take(64) {
+        let Some(art) = geometry.library.iter().find(|a| a.tag == inst.tag).or_else(|| geometry.library.first()) else { continue };
+        let Some(a) = arts.get(art.index) else { continue };
+        let Ok(g) = track.crp.article_geometry(&track.crp_data, a) else { continue };
+        let Some(b) = g.base.as_ref() else { continue };
+        if b.flags & 0x40 != 0 || b.tag_u32() == 0 {
+            continue;
+        }
+        // the matched **template's** own tag (`art.tag`), not the element's unmatched fourcc — the
+        // fallback substitutes the whole `{tag, Article*}` pair (0x482EA0's own copy), so collision
+        // behaviour follows the template that was actually spawned.
+        let Some(def) = track.animdefs.lookup(art.tag) else { continue };
+        let Some(lod) = g.primitives.iter().map(|p| p.lod).min() else { continue };
+        // the element's own placement, never the library article's `tr` ("The scene bundle's
+        // items": `0x482BF1` stores the template record as identity/zero).
+        let tr = inst.transform * Mat4::from_scale(inst.scale);
+        let mut skipped = 0;
+        let local: Vec<Vec3> = article_meshes(&g, lod, &mut skipped)
+            .iter()
+            .flat_map(|m| m.mesh.vertices.iter().map(|v| Vec3::from(v.position)))
+            .collect();
+        if local.is_empty() {
+            continue;
+        }
+        let (mn, mx) = rotated_local_box_aabb(Vec3::from(b.bbox_min), Vec3::from(b.bbox_max), tr);
+        let breakable = (!def.pieces.is_empty()).then(|| Breakable {
+            bands: def.bands.clone(),
+            band_pieces: def.band_pieces.clone(),
+            resolved: def
+                .pieces
+                .iter()
+                .map(|(_, p)| first_by_tag(&tags, group_tag(&p.quat_group)).and_then(|k| tags[k].1).is_some_and(|w| w != [0, 0]))
+                .collect(),
+            started: std::cell::Cell::new(None),
+            article: art.index,
+        });
+        let shape = match def.collide_type.as_str() {
+            "kCylinder" => PropShape::Cylinder { radius: 0.25 },
+            "kBox" => {
+                let corners = box_footprint(&local).map(|c| tr.transform_point3(c));
+                let c = (mn + mx) * 0.5;
+                let radius = Vec3::new(mx.x - c.x, 0.0, mx.z - c.z).length() * 1.05;
+                PropShape::Box { corners, radius }
+            }
+            _ => continue,
+        };
+        let class = if matches!(shape, PropShape::Cylinder { .. }) { def.radius as i32 as u32 } else { 0 };
+        out.push(Prop { shape, aabb_min: mn, aabb_max: mx, class, breakable, drive_through: def.drive_through, article: art.index });
+    }
+    out
+}
+
+/// The `insertAll(C)` half of `WTrack+0x24`'s real insertion order (`RE/RENDERING.md` "The tree,
+/// built" / "Bundle order, read 2026-09-28"): `0x4750B0` is called once per bundle, in the fixed
+/// order `WInstanceBundle → WAnimBundle → WMidGroundBundle → WStaticBundle` (`Crp::bundle_of`'s
+/// four variants — a true partition of every *non-library* article; `WSceneBundle` and
+/// `WLineBundle` are not walked here, below), each bundle's claimed articles in `.crp` file order,
+/// and within one article either its patches (`0x4751BD`'s `type == 2` path, `TriangleGrid::
+/// patches`' own primitive order — one [`nfs_physics::track_tree::TreeItem::Patch`] per patch) or
+/// its one `kCylinder`/`kBox` object (`type == 1`, one [`nfs_physics::track_tree::TreeItem::Prop`])
+/// — never both, in the original (`0x4751BD`/`0x475238`, read 2026-09-28).
+///
+/// **Library articles are excluded**, not merely reordered: `WInstanceBundle::Load` (`0x4781A0`)
+/// copies a library survivor into its *auxiliary* `+0x34` table, not the generic `+0x18`/`+0x1c`
+/// pair `0x4750B0`'s tree-fill walk actually reads (`RE/RENDERING.md` "Bundle order, read
+/// 2026-09-28") — so a library article never reaches the tree through `WInstanceBundle` at all.
+/// `world` (`TrackGeometry::world`, already the non-library split `TrackAssets::build_geometry`
+/// makes) is exactly this port's stand-in for "every article the generic array can hold" — its own
+/// `index` is the `.crp` article index [`nfs_physics::collision::Patch::article`] and
+/// [`nfs_physics::props::Prop::article`] carry too.
+///
+/// **`WSceneBundle` is walked separately, first** (corrected 2026-09-28, `scene_props` above):
+/// unlike the four bundles this function's own loop covers, its `[+0x1c]` live-slot array is not
+/// keyed by `.crp` article file order at all — it is keyed by the *spawn order* of the track's
+/// `.scn` `GEOM_ELEMENT`s (`0x46D1D0` over `[0x628168]`, `scene_props`'s own doc has the full
+/// address trace), so this function cannot reproduce it from `arts`/`world` the way it does for
+/// `Instance`/`Anim`/`MidGround`/`Static`. The caller instead computes [`scene_props`]' own output
+/// once, up front, and passes this function the flat `props` indices it landed at (`scene`,
+/// below) — this function only has to put them first, matching `0x487abd`'s own call to
+/// `0x46D1D0` running before any of the other five bundles' ctor/`Load`/`insertAll(C)` calls
+/// (`RE/RENDERING.md` "Bundle order, read 2026-09-28"'s "`WSceneBundle`'s own timing, settled").
+/// `WLineBundle` contributes zero items regardless (established, unchanged).
+pub fn track_tree_order(
+    crp: &nfs_formats::crp::Crp,
+    crp_data: &[u8],
+    arts: &[nfs_formats::crp::Article],
+    world: &[nfs_assets::track::ArticleMeshes],
+    patches: &[nfs_physics::collision::Patch],
+    props: &[nfs_physics::props::Prop],
+    scene: &[usize],
+) -> Vec<nfs_physics::track_tree::TreeItem> {
+    use nfs_formats::crp::BundleKind;
+    use nfs_physics::track_tree::TreeItem;
+    let world_indices: std::collections::HashSet<usize> = world.iter().map(|a| a.index).collect();
+    let mut patches_by_article: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for (i, p) in patches.iter().enumerate() {
+        patches_by_article.entry(p.article).or_default().push(i);
+    }
+    let mut prop_by_article: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (i, p) in props.iter().enumerate() {
+        prop_by_article.insert(p.article, i);
+    }
+    // `WSceneBundle` first (`0x487abd` runs before any of the other five bundles' `Load`, "Bundle
+    // order, read 2026-09-28"'s "`WSceneBundle`'s own timing, settled") — the caller's own spawn
+    // order, `scene_props`'s doc.
+    let mut order: Vec<TreeItem> = scene.iter().copied().map(TreeItem::Prop).collect();
+    for rank in [BundleKind::Instance, BundleKind::Anim, BundleKind::MidGround, BundleKind::Static] {
+        for (index, art) in arts.iter().enumerate() {
+            if !world_indices.contains(&index) {
+                continue; // a library article: not in the generic array `0x4750B0` walks
+            }
+            if crp.bundle_of(crp_data, art).ok() != Some(rank) {
+                continue;
+            }
+            // GAP, not invented (see this function's own doc): the original's per-article type
+            // dispatch (`0x4751BD`) never gives one article both a patch run and a prop, but this
+            // port's `collision_grid` takes every `world` article's mesh into the triangle grid
+            // regardless of its `animdefs.txt` collide type, so an article that is both a
+            // `pr`-patch source and a `kCylinder`/`kBox` prop in this port's own data (the
+            // original has no such article) contributes both here, patches first. No shipped
+            // track's race goldens moved from this.
+            if let Some(idxs) = patches_by_article.get(&index) {
+                order.extend(idxs.iter().map(|&i| TreeItem::Patch(i)));
+            }
+            if let Some(&i) = prop_by_article.get(&index) {
+                order.push(TreeItem::Prop(i));
+            }
+        }
+    }
+    order
 }
 
 /// Every article's `Base+0x44` tag and its `Anim` part's first two words (the frame count and the
@@ -4017,9 +4387,9 @@ mod prop_box_tests {
     /// only moves the box, it does not enlarge it).
     #[test]
     fn unrotated_box_matches_vertex_aabb() {
-        let local = [Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 3.0, 2.0)];
+        let (lo, hi) = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 3.0, 2.0));
         let tr = Mat4::from_translation(Vec3::new(10.0, 0.0, -5.0));
-        let (mn, mx) = rotated_local_box_aabb(&local, tr);
+        let (mn, mx) = rotated_local_box_aabb(lo, hi, tr);
         assert!((mn - Vec3::new(9.0, 0.0, -7.0)).length() < 1e-5, "{mn:?}");
         assert!((mx - Vec3::new(11.0, 3.0, -3.0)).length() < 1e-5, "{mx:?}");
     }
@@ -4036,7 +4406,8 @@ mod prop_box_tests {
         // but the box built from their extents (lo=(-2,0,-0.5), hi=(2,1,0.5)) does
         let local = [Vec3::new(-2.0, 0.0, 0.0), Vec3::new(2.0, 0.0, 0.0), Vec3::new(0.0, 0.0, -0.5), Vec3::new(0.0, 1.0, 0.5)];
         let tr = Mat4::from_rotation_y(std::f32::consts::FRAC_PI_4);
-        let (mn, mx) = rotated_local_box_aabb(&local, tr);
+        let (lo, hi) = local.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
+        let (mn, mx) = rotated_local_box_aabb(lo, hi, tr);
         let want = (2.0f32 + 0.5) / std::f32::consts::SQRT_2;
         let old = local.iter().map(|p| tr.transform_point3(*p)).fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(p), b.max(p)));
         assert!((mx.x - want).abs() < 1e-4, "{mx:?} want {want}");

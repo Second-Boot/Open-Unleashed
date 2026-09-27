@@ -263,13 +263,13 @@ impl Speech {
         if let Some((name, countdown)) = next && let Some(c) = self.clip(&name) {
             // the volume is built when the phrase starts (0x4B04E0)
             let volume = Self::volume(self.level.load(Ordering::Relaxed), self.trims[countdown as usize]);
-            // `out.play` (tabled) even though the original starts a phrase with a bare
+            // `out.play_word` (tabled) even though the original starts a phrase with a bare
             // `Voice_start` 0x565E70, outside the 0x656180 table too: the race pause silences the
             // phrase's own voices `[0x6573A8]`/`[0x6573AC]` by a separate, dedicated call
             // (0x4AF900(0, 0)) the port has no counterpart for, so the phrase is tagged `table` to
             // reach the same voice through the one silencing walk the port has
             // (`AudioOutput::silence_voices`, `RE/notes/sfx.md` "Audit 2026-09-27, audio port 11").
-            *cur = Some(out.play(c, volume, 1.0, false));
+            *cur = Some(out.play_word(c, volume, crate::resample::PITCH_UNIT, 0x40, 0, false));
         }
     }
 }

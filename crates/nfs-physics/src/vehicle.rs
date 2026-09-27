@@ -2706,11 +2706,13 @@ impl Vehicle {
     /// the tracker holds no patch after that (`[ecx+0x28] == 0`, 0x4740D0…0x4740DC) — so a car
     /// whose start point is off every drivable patch meets no wall. Among the crossed edges it keeps
     /// the one whose endpoint-mid height is nearest the **segment's** mid height
-    /// (`(from.y + to.y)/2`, 0x474185…0x4741BF). *(Until 2026-09-26 the port swept each corner
-    /// from `corner − vel/32` to the corner, which misses a corner that a yawing car swings across
-    /// the line, and a car turned so that the sweep ran along the wall; the original has no
-    /// per-corner sweep at all.)*
-    pub fn collide_walls(&mut self, walls: &crate::walls::WallSet, patch_height: &dyn Fn(Vec3) -> Option<f32>, _unused: f32, _b: f32, _f: f32) -> bool {
+    /// (`(from.y + to.y)/2`, 0x474185…0x4741BF), a tie going to the first candidate in `tree`'s
+    /// own query order for this segment (`0x4848B0`, wired 2026-09-28 — `RE/RENDERING.md` "The
+    /// tree, built"; `tree` is the track's `TrackTree`, `insertAll(C)`-then-`insertAll(A)`-ordered).
+    /// *(Until 2026-09-26 the port swept each corner from `corner − vel/32` to the corner, which
+    /// misses a corner that a yawing car swings across the line, and a car turned so that the
+    /// sweep ran along the wall; the original has no per-corner sweep at all.)*
+    pub fn collide_walls(&mut self, walls: &crate::walls::WallSet, tree: &crate::track_tree::TrackTree, patch_height: &dyn Fn(Vec3) -> Option<f32>, _unused: f32, _b: f32, _f: f32) -> bool {
         let m = self.orientation;
         let (hw, hh, hl) = (self.half_extents.x, self.half_extents.y, self.half_extents.z);
         let (bx, by, bz) = (m.row(0), m.row(1), m.row(2));
@@ -2743,7 +2745,14 @@ impl Vehicle {
                 }
                 back
             };
-            let Some((n2, q, class)) = walls.segment_hit(from, p) else { continue };
+            // the candidate edges, in `0x4848B0`'s own leaf-then-insertion order for this exact
+            // segment (`RE/RENDERING.md` "The tree, built") — `segment_hit`'s tie-break is "first
+            // in this order", matching `0x474191…0x47419D`'s own `fcomp`/`test ah,1`
+            let candidates = tree.query_segment((from.x, from.z), (p.x, p.z)).filter_map(|it| match it {
+                crate::track_tree::TreeItem::Wall(i) => Some(i),
+                _ => None,
+            });
+            let Some((n2, q, class)) = walls.segment_hit(from, p, candidates) else { continue };
             self.last_wall_class = class;
             // 0x495506: `car+0x440 = p`, the corner, after `WallImpulse` whatever it answered
             self.last_contact = p;
@@ -3271,6 +3280,7 @@ mod tests {
             class: 1,
             breakable: None,
             drive_through: false,
+            article: 0,
         };
         assert!(v.collide_props(&[pole], 0).is_some());
         assert!(v.velocity.y.abs() <= 1.1, "no vertical push: {:?}", v.velocity);

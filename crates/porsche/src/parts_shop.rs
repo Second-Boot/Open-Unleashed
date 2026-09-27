@@ -293,7 +293,6 @@ impl PartsShop {
                     return Some(Outcome::NoMoney);
                 }
                 self.basket_sel = None;
-                c.save();
             }
             // 0x519160 / 0x519190: the part `Parts.OwnedDamageRepairList` is on (0x516F50) into
             // the repair basket (0x5172B0 with 0 / 1), then that list loses its current row
@@ -330,7 +329,6 @@ impl PartsShop {
                     return Some(Outcome::NoMoney);
                 }
                 self.repair_sel = None;
-                c.save();
             }
             // 0x4F1C90: the part `Parts.InstallList` is on (slot 27) through 0x518510, then the
             // list's refresh 0x5166E0, which drops the current row. The screen's tick hides the
@@ -339,7 +337,6 @@ impl PartsShop {
                 let car = car?;
                 if let Some(InstallRow::Spare(i)) = self.install_pick(c, strings) {
                     c.career.install_spare(&c.tables, car, i);
-                    c.save();
                 }
                 self.install_sel = None;
             }
@@ -348,7 +345,6 @@ impl PartsShop {
                 let car = car?;
                 if let Some(InstallRow::Fitted(id)) = self.install_pick(c, strings) {
                     c.career.uninstall_part(&c.tables, car, id);
-                    c.save();
                 }
                 self.install_sel = None;
             }

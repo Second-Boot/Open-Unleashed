@@ -281,13 +281,50 @@ impl LayoutScreen {
         // through 0x4D9AF0, whenever the widget is not hidden (0x4C5818: 0x4C7ED0) — at
         // 0x4C5DB4 on the `nolabel == 4` path and 0x4C62BA on the other. So the part is
         // fixed, whatever the state (every non-hidden state of `ComboBox.ctr` /
-        // `ColorBox.ctr` lists it anyway). GAP: that code places it itself — 0x4C629E:
-        // `x + backrect.width − entry.width − 3` (the template says −4), `y` at
-        // `(backrect.height − entry.height)/2 + 1` over a base not traced; 0x4C5DA1 centres
-        // it on `data.width` — and the port keeps the template's `pos`.
+        // `ColorBox.ctr` lists it anyway).
+        //
+        // **X, read to the instruction, 0x4C6260…0x4C629E (`nolabel != 4` only —
+        // 0x4C5DA1's other arm still centres on `data.width`, untouched):** `ecx = [esi+0x19c]`
+        // ("arrowbutton"'s own field), `0x4d87d0(0,0,ebx)` picks its current-state frame index,
+        // `0x4e6a90(part, state)` answers that frame's entry (`edi -= [eax+0x14]`, the frame's
+        // own **width** — the same `aw` this loop already reads off `self.shapes`), `0x4e2b90`
+        // on `[esi+0x17c]` (`backrect`) gives `edi`'s starting value — **`backrect.width`**
+        // (the same object the stems above measure) — and `lea ecx,[edi+eax-3]` is the sum:
+        // `backrect.width − entry.width − 3`. The template's own `pos` (`ComboBox.ctr` /
+        // `ColorBox.ctr`, `data.width−arrowbutton.size.width−4,4`) is one pixel short — the
+        // 1-px shift every combo's golden shows, now closed.
+        //
+        // **Y, read the same range, `base` settled 2026-09-28 (mechanical stack simulator,
+        // `RE/notes/layouts.md` "Combo arrow `y` base, settled"):** `H = 0x4e2ba0` on the same
+        // `backrect` (its **height**, `h` below — `ComboBox.ctr`'s `backrect.size =
+        // data.width,data.height`, and `h` is that same `data.height`), `eh = [ebp+0x18]` (the
+        // same frame's **height**, `ah` below), `(H−eh)` halved by the `cdq`/`sub`/`sar`
+        // rounding-toward-zero idiom (Rust's `i32` `/` truncates the same way), `+ base + 1`.
+        // `base` is `[esp+0x2c]` at 0x4C6274 — a spill slot this draw function (0x4C5810…)
+        // reuses for several unrelated locals (the stem-height floats at 0x4C610D/0x4C611B,
+        // among others) across ~250 intervening instructions with no `ret`, so the *literal*
+        // text `[esp+0x2c]` names a different physical slot every time a `push`/`call` in
+        // between shifts the true offset — resolved with a real stack simulator
+        // (`.scratch_re/esp_walk.py`, a CFG-and-esp-delta walk, not a hand trace): the write
+        // that survives to 0x4C6274 is 0x4C5916 (`mov [esp+0x24], ebp`, at its own delta),
+        // `ebp = 0x4e2b50(backrect, &offset)` (`backrect.pos.y` (0, `ComboBox.ctr`'s
+        // `backrect.pos.value=0,0`) `+ offset.y`, `offset` = **0x4C8670(this)'s own box** —
+        // the same fully-resolved box `widgets.rs`'s scrollbar code above cites, so
+        // `offset.y = box.top` — **the widget's own on-screen `y`, task 1's settled chain**)
+        // `+ L2`, `L2 = 0x4C8760(this)`'s vertical output seeded with this widget's own
+        // `0x525310` **y** and nudged only while `0x4E3640`'s scroll-drag flag bits 8/0x10 are
+        // set — a transient per-frame input state, 0 at rest (every scripted still is
+        // non-dragging) — so `base = box.top = y` at rest, exactly the widget's own already-
+        // resolved on-screen `y`. Ported: the fixed template `y` (`…,4`) is replaced by the
+        // real formula on the `nolabel != 4` path (the scroll-drag nudge is not modelled — no
+        // shipped still has a combo mid-drag).
         let arrow_at = out.len();
         for (px, py, file, index, flip) in self.shape_parts_in(e, &["arrowbutton".to_string()], None) {
             let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
+            // the template's own `x` is `data.width − arrowbutton.size.width − 4`; 0x4C629E's
+            // is one pixel further right (`nolabel == 4`'s own centring, 0x4C5DA1, is untouched)
+            let px = if self.attr_num(e, "nolabel") != Some(4.0) { w - aw - 3.0 } else { px };
+            let py = if self.attr_num(e, "nolabel") != Some(4.0) { 1.0 + ((h as i32 - ah as i32) / 2) as f32 } else { py };
             let (pos, size) = self.place(aspect, x + px, y + py, aw, ah);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
@@ -2121,20 +2158,62 @@ impl LayoutScreen {
         //
         // It lives in the sixteen pixels the panel gave up: 0x4C5421 takes exactly
         // 0x4DB030's **16** off the selection box's width and leaves its x alone, so
-        // the strip freed is the one to its right. That the bar is drawn at the strip's
-        // left edge is this port's reading of that, not a traced placement —
-        // APPROXIMATION, kept 2026-09-28. The constructor that plants the four boxes,
-        // 0x4DAF10 (§4.75), is a clean 3-arg `(x, y, h)` `ret 0xC` — `trough.x = x`
-        // unmodified, `trough.y = y`, no width argument at all (0x10 is a constant) — so
-        // *if* the x/y refreshRows (0x4C5460…0x4C57E1) hands it is the selection box's own
-        // shrunk-width origin, this port's placement is exactly right. But that x/y is
-        // built through a chain of single-thiscall-arg getters (0x4E2B50, 0x4E2B30, each
-        // `ret 4`) that leave values staged on the stack across calls rather than in named
-        // locals, and unwinding that staging by hand did not settle cleanly this pass —
-        // the case for "the strip's left edge" stands on the freed-strip argument above,
-        // not on a read of refreshRows' own arithmetic. The knob's index is the port's own
-        // scroll position now (§4.45), which is what `[this+0x1BC]->slot10()` is in the
-        // original.
+        // the strip freed is the one to its right. The bar is drawn at the strip's
+        // left edge — **settled 2026-09-28** (was APPROXIMATION), below. The constructor
+        // that plants the four boxes, 0x4DAF10 (§4.75), is a clean 3-arg `(x, y, h)`
+        // `ret 0xC` — `trough.x = x` unmodified, `trough.y = y`, no width argument at all
+        // (0x10 is a constant).
+        //
+        // **`x = parent.+0x38 + self0.+0x38 + rect.x`, `y = self0.+0x3c + rect.y`** —
+        // refreshRows' tail (0x4C5796…0x4C57C9), unwound arg-by-arg 2026-09-27: `self0 =
+        // *[esi+0x178]` (the selection-box rect object), `parent = *(self0+4)`, and `rect`
+        // is the one stack argument both single-thiscall-arg getters (0x4E2B50, then
+        // 0x4E2B30, `y` before `x`, each `ret 4`) take — **0x4C8670's own return**.
+        //
+        // **0x4C8670 read to its `ret 4`, 2026-09-27, and settled 2026-09-28** (the
+        // "unread virtual call plus two string-keyed helpers" this marker used to carry):
+        // `[this+0x34]` is the widget's **own** box, `{left, top, right, bottom}` — a
+        // virtual call, no name lookup. `0x5A134B` is **not** a named lookup either — its
+        // signature `(ptr, vfDelta, srcType, targetType, isRef)`, its SEH prologue and its
+        // type-descriptor-flag dispatch to 0x5A14CD/0x5A1527/0x5A1620 are the compiler's own
+        // `__RTDynamicCast`, the exact same helper `layouts.md`'s Tabs entry already names
+        // (`[[this+0xD0]+0xD0]` cast to `FERadioGroup`) — so this call is
+        // `dynamic_cast<T*>([this+0xD0])`, and `[this+0xD0]` is the widget's own
+        // **parent/owner** pointer (`controls.md` lines 406/407/430, the same field).
+        // **`T` settled 2026-09-28** by dumping the call's own pushed immediates
+        // (0x4c868f/0x4c8697) and reading them as `TypeDescriptor`s (`vfptr`/`spare`/mangled
+        // `name`, straight out of `.data`, exactly like the already-committed `FERadioGroup`
+        // one at 0x5D9030) rather than the "lazy-bound cache cell / bootstrap thunk" this
+        // marker guessed: `0x5D75E8` (`TargetType`) is `".?AVControl@FERT@@"` = **`T =
+        // FERT::Control`**, `0x5D75C8` (`SrcType`) is `".?AVTarget@FERT@@"` = `FERT::Target`
+        // (`owner`'s own static type) — `Control@FERT` is this codebase's already-documented
+        // "FERT part/control root" (`RE/drafts/round2/fe-widgets.md` §1.2, vtable 0x5BAFD4),
+        // the common base of every widget and every screen, so the cast asks "is my owner a
+        // widget/window" (true for an ordinary widget's screen or panel). `0x525310` is
+        // **not** a lookup either: read to its own `ret 4`, `*(this+0xE0)`'s own `+0x38`/
+        // `+0x3c` (a pointer indirection, `mov ecx,[ecx+0xE0]` then `[ecx+0x38]`/`[ecx+0x3c]`)
+        // — the **same** position pair `self0`/`parent` are read through above, called here on
+        // **`owner`**, not the widget itself: `point = owner`'s own on-screen position. So
+        // `0x4C8670` hands back the widget's own box **translated** by its owner's position:
+        // `rect.x = box.left + point.x`, `rect.y = box.top + point.y` (0x4C86BF…0x4C86E2,
+        // both edges of each axis shifted the same amount).
+        //
+        // **`point`, and hence the whole formula, needs no separate port code**: of the
+        // shipped `.lay` files that reach here, a scrollbar's widget is either on a plain
+        // top-level screen (`point` = (0, 0), the screen's own rest position) or inside a
+        // `NFS5.PANEL` sub-layout (`audioreal`/`cdplayer` under `Audio.lay`,
+        // `deadzone`/`gamectrl` under `Controllers.lay`, `display`/`graphicsettings`/
+        // `advgraphics` under `Options.lay`/`graphics.lay`) — and for those, `owner` is the
+        // sub-layout's own screen, whose position `0x4CECE0` sets to the panel's own
+        // placement (`controls.md` §4.1) — i.e. `point` is the panel's placement. `layout.rs`'s
+        // `embedded()` (the panel draw) already applies exactly that translation, once, to a
+        // sub-layout's whole finished sprite list rather than once per `0x4C8670` call, so this
+        // port's `px, py` (from `x, y` — already the widget's fully-resolved on-screen position,
+        // panel offset included where it applies) **is** `rect` above for every shipped case.
+        // `X = parent.x + self0.x + rect.x` settles to what `px, py` already compute — "the
+        // strip's left edge" is the formula's own answer, not an untraced inference. The knob's
+        // index is the port's own scroll position now (§4.45), which is what
+        // `[this+0x1BC]->slot10()` is in the original.
         if scrolls {
             let sx = px + panel_w;
             let art = |n: usize| self.shapes.get(&("weeicons.fsh".to_string(), n)).copied();

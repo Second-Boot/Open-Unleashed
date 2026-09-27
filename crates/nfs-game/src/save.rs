@@ -18,7 +18,7 @@
 //! the three modules that carry the career (§9.4) — from the port's own career state, embedding
 //! the same record images the original does (`nfs5.trn`, `nfs5.fac`, the FE car object built on
 //! the `nfs5.car` record), plus an `accessor` block holding the values the port actually has
-//! (§6.2a gives the class, and so the payload shape, of all 220 statically registered names). A subset is
+//! (§6.2a gives the class, and so the payload shape, of all 223 statically registered names). A subset is
 //! legal: the original looks every name up in its own registry and anything absent keeps its
 //! default (§9.6). Because a few port-side bookkeeping fields still have no home in the format
 //! (see [`career_from_sav`]), the port's own JSON career remains the live save and the `.sav` is
