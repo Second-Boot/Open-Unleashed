@@ -85,6 +85,35 @@ pub fn ambient_colours(crp: &Crp, data: &[u8]) -> std::collections::HashMap<u16,
         .collect()
 }
 
+/// `RCustomLayers::LayerUVAnimate`'s own parameters for a material whose render method builds it
+/// — class **0x8001** (`RE/drafts/round1/render-core.md` §4.4, CONFIRMED). Mode 0 scrolls the V
+/// texture coordinate: `t = TIMER_getTicks() · rate · 1e-4`, `v += t − floor(t)` — a steady wrap,
+/// water. Mode 2 wobbles U sinusoidally: `th = (TIMER_getTicks() + phase) · rate · 2e-4` turns,
+/// `u += sin(th) · 0.06` — flags/banners, `phase` a per-article offset (the source UV pointer's
+/// low 12 bits, 0x448E12) so identical articles do not wobble in step; the port cannot recover
+/// that raw address and uses `phase = 0` for every article (APPROXIMATION — every flag using one
+/// material wobbles in lockstep, where the original staggers them by whatever their allocator
+/// happened to place their UV data at). The layer's own data block `[this+4]` is
+/// `{u32 mode, i32 rate, …}` (0x448CE9); the port reads only those two dwords.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UvAnimate {
+    pub mode: u32,
+    pub rate: i32,
+}
+
+/// [`UvAnimate`]'s parameters for one material, from its render method's block (or the material's
+/// own override block, the same `[mat+0x10]`-first rule [`render_states`] documents).
+pub fn uv_animate(methods: &[nfs_formats::crp::RenderMethod], m: &Material) -> Option<UvAnimate> {
+    let method = methods.iter().find(|r| r.name == m.render_method)?;
+    let op = method.built_ops(0, m.op_mask).find(|o| o.class == 0x8001)?;
+    let own = m.blocks.iter().find(|(k, _)| method.resolve(*k) == Some(op.key)).map(|(_, b)| b.as_slice());
+    let b = own.or_else(|| method.block(op.key))?;
+    if b.len() < 8 {
+        return None;
+    }
+    Some(UvAnimate { mode: u32::from_le_bytes(b[0..4].try_into().ok()?), rate: i32::from_le_bytes(b[4..8].try_into().ok()?) })
+}
+
 /// The `Rs` block a material's first pass applies — Thrash states **6, 0x0A, 0x38, 2, 0x18** and a
 /// closing −1 (`LayerState` 0x53F780 → 0x540660, `RE/notes/thrash.md` §6) — when its render
 /// method carries one: the first `LayerState` (class 8) op the material builds, and the block its

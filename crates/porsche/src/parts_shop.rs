@@ -267,12 +267,40 @@ impl PartsShop {
         self.install_sel.and_then(|r| rows.get(r).copied())
     }
 
+    /// Whether row `row` of `Parts.OwnedDamageRepairList` may become the current row —
+    /// `FEPartsDamageRepairAccessor`'s own **setCurrent**, `0x516CA0`: fetches the installed-parts
+    /// vector (slot 35 on `[this+0x24]`, then the shared vector getter `0x4F0480`), and if the
+    /// part at `row` carries damage (`+0x164`) exactly **0.0** (`0x516CDF` `fcomp` against
+    /// `0x5B23F8`, `jne` past the "select" call `0x4BC240` when equal), the row never becomes
+    /// current — the click lands on the widget but nothing changes. The identical test
+    /// `nfs_game::shop::repair_add`'s own ADD-refusal already makes (`shop.rs:348`, same field,
+    /// same original address family). A second branch this function has, `[this+0x28]` — an
+    /// optional second list a candidate part is also checked against before it may become current
+    /// — is a real, still-open gap (COVERAGE §14.17.2/§14.22): what that list is was not settled,
+    /// so it is not ported here.
+    fn owned_selectable(c: &CareerUi, strings: &Strings, row: usize) -> bool {
+        let Some(car) = car_of(c) else { return false };
+        let (_, ids) = Self::owned_rows(c, strings);
+        let Some(id) = ids.get(row).copied() else { return false };
+        let Some(p) = c.tables.parts.iter().find(|p| p.id == id) else { return false };
+        c.career.part_damage(car, p) != 0.0
+    }
+
     /// The list a click landed on, by its accessor, moves that list's current row (the list box's
-    /// slot 9 → the accessor's slot 11). `true` when the click was one of these three lists'.
-    pub fn click(&mut self, accessor: &str, row: usize) -> bool {
+    /// slot 9 → the accessor's slot 11). `true` when the click was one of these four lists'
+    /// (still `true`, the click consumed, even when `Parts.OwnedDamageRepairList` refuses the row
+    /// — [`Self::owned_selectable`]). `c` is `None` only when this is somehow reached outside a
+    /// career (should not happen — these accessors only appear on `parts`/`advancedrepair`/
+    /// `carsetup.lay`, all career-gated, `on_parts_shop`); then the row is accepted rather than
+    /// silently dropped.
+    pub fn click(&mut self, c: Option<&CareerUi>, strings: &Strings, accessor: &str, row: usize) -> bool {
         match accessor {
             "Parts.ShoppingList" => self.basket_sel = Some(row),
-            "Parts.OwnedDamageRepairList" => self.owned_sel = Some(row),
+            "Parts.OwnedDamageRepairList" => {
+                if c.is_none_or(|c| Self::owned_selectable(c, strings, row)) {
+                    self.owned_sel = Some(row);
+                }
+            }
             "Parts.RepairShoppingList" => self.repair_sel = Some(row),
             "Parts.InstallList" => self.install_sel = Some(row),
             _ => return false,
@@ -561,5 +589,43 @@ mod tests {
         assert_eq!(PartsShop::all_parts_pick(&kinds, 4), None);
         assert_eq!(PartsShop::all_parts_pick(&kinds, 5), Some(ShopItem::Sell(2)));
         assert_eq!(PartsShop::all_parts_pick(&kinds, 9), None);
+    }
+
+    /// `0x516CA0` (`FEPartsDamageRepairAccessor::setCurrent`): a click on an installed part with
+    /// **zero** damage never becomes the current row — the same `+0x164 == 0.0` refusal
+    /// `nfs_game::shop::repair_add` already makes for its own ADD-to-basket. A click on a damaged
+    /// part still selects it.
+    #[test]
+    fn a_zero_damage_row_is_not_selectable_on_the_repair_list() {
+        use nfs_game::career::{Career, CareerTables, OwnedCar};
+        let Ok(paths) = nfs_assets::GamePaths::locate() else {
+            eprintln!("skipping: original game data not found");
+            return;
+        };
+        let parts = vec![
+            Part { state: 0, ..part(1, 4, "Springs") },
+            Part { state: 12, ..part(2, 2, "Brakes") },
+        ];
+        let mut rec = vec![0u8; nfs_formats::fedata::CAR_RECORD_SIZE];
+        rec[0..2].copy_from_slice(&76u16.to_le_bytes());
+        rec[0x3BC..0x3BE].copy_from_slice(&2i16.to_le_bytes());
+        rec[0x3BE..0x3C0].copy_from_slice(&1i16.to_le_bytes());
+        rec[0x3C0..0x3C2].copy_from_slice(&2i16.to_le_bytes());
+        let catalog = nfs_formats::fedata::parse_car_catalog(&rec).unwrap();
+        let tables = CareerTables { raw: Default::default(), tracks: vec![], tournaments: vec![], parts, personalities: vec![], missions: vec![], strings: Default::default(), catalog, package_count: 0 };
+        let mut career = Career::default();
+        career.garage.push(OwnedCar::construct(&tables, 76, 0, 0));
+        let mut ui = crate::career_ui::CareerUi::load(&paths).unwrap();
+        ui.tables = tables;
+        ui.career = career;
+        let strings = Strings::default();
+        let (_, ids) = PartsShop::owned_rows(&ui, &strings);
+        let zero_row = ids.iter().position(|id| *id == 1).unwrap();
+        let damaged_row = ids.iter().position(|id| *id == 2).unwrap();
+        let mut shop = PartsShop::default();
+        assert!(shop.click(Some(&ui), &strings, "Parts.OwnedDamageRepairList", zero_row));
+        assert_eq!(shop.owned_sel, None, "a zero-damage row never becomes current");
+        assert!(shop.click(Some(&ui), &strings, "Parts.OwnedDamageRepairList", damaged_row));
+        assert_eq!(shop.owned_sel, Some(damaged_row), "a damaged row does");
     }
 }

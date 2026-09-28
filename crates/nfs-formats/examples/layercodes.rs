@@ -1,6 +1,7 @@
-//! Diagnostic: which render-layer class codes (0x8001…0x8016, `RE/notes/lighting.md`) a CRP's
-//! render methods use — the `Headlights::*` ones (0x8002, 0x8003, 0x8011) are what turns the
-//! game's night flag on.
+//! Diagnostic: which render-layer class codes (0x8001…0x8016 and 0x8100…0x8105, `RE/notes/
+//! lighting.md`) a CRP's render methods use — the `Headlights::*` ones (0x8002, 0x8003, 0x8011)
+//! are what turns the game's night flag on; 0x8105 is `R3DSpecularLayer` (0x449F4F → 0x44A130,
+//! vtable 0x5B3C6C).
 use nfs_formats::refpack;
 
 fn main() {
@@ -17,7 +18,7 @@ fn main() {
             let Some(bytes) = data.get(off..off + len) else { continue };
             for w in bytes.chunks_exact(4) {
                 let v = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
-                if (0x8001..=0x8016).contains(&v) {
+                if (0x8001..=0x8016).contains(&v) || (0x8100..=0x8105).contains(&v) {
                     *counts.entry(v).or_insert(0usize) += 1;
                 }
             }

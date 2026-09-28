@@ -108,6 +108,10 @@ pub struct TrackWorld {
     /// runs them (0x450883 → 0x451940) under the matrix it pushed for the item (0x450465…0x450477),
     /// within the LOD's part range — [`Self::running_flares`].
     instance_flares: Vec<(usize, TrackFlare)>,
+    /// Materials whose render method builds `RCustomLayers::LayerUVAnimate` (class 0x8001) —
+    /// water and flags/banners ([`Self::animate_uv`], `nfs_assets::track::uv_animate`,
+    /// `RE/drafts/round1/render-core.md` §4.4).
+    uv_animate: HashMap<MaterialId, nfs_assets::track::UvAnimate>,
 }
 
 /// An item of the instance drawer 0x5B3CB8 the port keeps apart from the `.crp` placement: its
@@ -1323,6 +1327,12 @@ impl TrackWorld {
             it.headlit = lit.contains(&it.material);
             it.uv_lit = uv.contains(&it.material);
         }
+        // materials whose render method builds `RCustomLayers::LayerUVAnimate` (0x8001) — water
+        // and flags/banners (`RE/drafts/round1/render-core.md` §4.4)
+        let uv_animate: HashMap<MaterialId, nfs_assets::track::UvAnimate> = mat_ids
+            .iter()
+            .filter_map(|(id, mid)| materials.get(*id as usize).and_then(|m| nfs_assets::track::uv_animate(&methods, m)).map(|a| (*mid, a)))
+            .collect();
         tracing::info!(props = props.len(), breakable = props.iter().filter(|p| p.breakable.is_some()).count(), "track props");
         let projectors = track_projectors(track);
         let projector_texture = projectors.first().and_then(|p| tex_ids.get(&p.texture)).map(|t| t.0);
@@ -1362,6 +1372,7 @@ impl TrackWorld {
             instance_culls,
             instance_flares,
             item_cull,
+            uv_animate,
         })
     }
 
@@ -1388,6 +1399,39 @@ impl TrackWorld {
             if let Some(item) = self.items.get_mut(a.item) {
                 item.transform = a.base * local;
             }
+        }
+    }
+
+    /// `RCustomLayers::LayerUVAnimate` (0x448CC0, `RE/drafts/round1/render-core.md` §4.4):
+    /// `ticks128` is `TIMER_getTicks()`, the OS multimedia timer's 128 Hz counter — the port's own
+    /// 64 Hz race tick doubled, the same reading the police beacon's rotation already uses
+    /// (`App::rebuild_scene`, "The 128 Hz TIMER is two of this port's 64 Hz game ticks"). Mode 0
+    /// (water) scrolls V by `t − ⌊t⌋`, `t = ticks · rate · 1e-4`; mode 2 (flags/banners) wobbles U
+    /// by `sin(th · τ) · 0.06`, `th = ticks · rate · 2e-4` turns. Neither mode's bit 0x200 interlock
+    /// (`+0x117E4`, "someone already owns the UVs") applies here — nothing else in the port writes
+    /// a track item's UVs. APPROXIMATION: the original phase-offsets mode 2 by the layer's own UV
+    /// source pointer's low 12 bits (0x448E12) so identical articles do not wobble in step; the
+    /// port has no such pointer and uses phase 0 for every one — every flag on one material wobbles
+    /// in lockstep.
+    pub fn animate_uv(&mut self, ticks128: u32) {
+        if self.uv_animate.is_empty() {
+            return;
+        }
+        let ticks = ticks128 as f32;
+        for it in self.items.iter_mut().chain(self.track_lods.iter_mut().flat_map(|a| a.lods.iter_mut().flat_map(|(_, v)| v.iter_mut()))) {
+            let Some(a) = self.uv_animate.get(&it.material) else { continue };
+            it.uv_offset = match a.mode {
+                0 => {
+                    let t = ticks * a.rate as f32 * 1e-4;
+                    [0.0, t - t.floor()]
+                }
+                2 => {
+                    let th = ticks * a.rate as f32 * 2e-4;
+                    [(th * std::f32::consts::TAU).sin() * 0.06, 0.0]
+                }
+                // not read (render-core.md §4.4): no shipped material uses another mode
+                _ => [0.0, 0.0],
+            };
         }
     }
 

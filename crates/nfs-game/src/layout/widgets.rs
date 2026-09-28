@@ -896,7 +896,11 @@ impl LayoutScreen {
     // widget's tint (0x528C90, opaque white on both screens) with the transition's fade
     // (0x4C8840) folded in by 0x4D87F0 at 0x508361.
     pub(super) fn draw_chronicle_or_showcase_picture(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
-        let WidgetDraw { i, e, x, y, w, h, talpha, aspect, hovered, .. } = d;
+        // `talpha` (the transition fade) is not read directly by this function: both arms below
+        // fold it in exactly once, through `layout.rs`'s generic per-widget post-multiply alone
+        // (see the two comments below citing 0x4C8840/0x4D87F0) — an explicit second fold here
+        // would double it, per this pass's fix.
+        let WidgetDraw { i, e, x, y, w, h, aspect, hovered, .. } = d;
         let Some(key) = self.logos.get(&i) else { return };
         if e.class == "NFS5.ChroniclePicture" {
             let Some(&(tex, _, _)) = self.shapes.get(key) else { return };
@@ -911,13 +915,29 @@ impl LayoutScreen {
                 return;
             }
             let (pos, size) = self.place(aspect, x0, y0, x1 - x0, y1 - y0);
+            // Fade, corrected 2026-09-30 ("possible defect", 367b9d46):
+            // `NFS5.ChroniclePicture`'s own draw (vtable "draw" slot,
+            // **0x508310**, 816 B — `COVERAGE-2026-09-26.md` §4.30's class table) re-disassembled
+            // to the instruction confirms the comment two lines above this function: at
+            // 0x508351…0x508366 it calls the tint getter (0x528C90), then the transition fade
+            // (0x4C8840), then folds them with 0x4D87F0 at 0x508361 — byte-for-byte the same
+            // `tint × fade` idiom `0x508DB0` (`NFS5.ShowcasePicture`'s own draw,
+            // 367b9d46) uses, and the composed colour feeds the clipped blit `0x4D9E70` as its
+            // `colour` argument (the comment above this function). That is the *same* per-widget
+            // transition fade `layout.rs`'s generic post-multiply (~7692, its own comment citing
+            // the identical `0x4C8840`) already applies to every sprite each widget's draw
+            // produces — so a literal `talpha` here folds it in **twice** (talpha²), fading the
+            // picture out faster than every other sprite on the same widget/screen during a
+            // transition. `NFS5.ShowcasePicture`'s arm below already uses the literal `1.0` for
+            // exactly this reason; this arm did not and is now brought into line with it.
+            let color = [1.0, 1.0, 1.0, 1.0];
             out.push(Sprite {
                 texture: tex,
                 pos,
                 size,
                 uv_min: [(x0 - l) / pw, (y0 - t) / ph],
                 uv_max: [(x1 - l) / pw, (y1 - t) / ph],
-                color: [1.0, 1.0, 1.0, talpha],
+                color,
                 rotation: 0.0,
                 pivot: [0.5, 0.5],
                 tri: None,
@@ -938,6 +958,15 @@ impl LayoutScreen {
         let Some(&(tex, aw, ah)) = self.shapes.get(key) else { return };
         let (dw, dh) = (if w > 0.0 { w } else { aw }, if h > 0.0 { h } else { ah });
         let (pos, size) = self.place(aspect, x, y, dw, dh);
+        // `NFS5.ShowcasePicture`'s own draw, **0x508DB0** (
+        // re-read in full this pass): reads the widget's tint (0x528C90, opaque white on both
+        // screens) and folds in the transition's fade via `0x4C8840` (the alpha-multiply idiom
+        // at 0x508E08…0x508E2C, `a = base_a * fade / 255`) when not in the software-render
+        // fallback (`![0x657E58]`, the branch the port always takes). This is exactly the same
+        // "every sprite this widget produced fades with it (0x4C8840)" fold the caller already
+        // applies generically to every widget's whole sprite batch, `talpha < 1.0` below — so the
+        // literal `1.0` here is correct as written: doubling it in would fold the transition
+        // fade in twice (talpha²). Confirmed PORTED_ALREADY, not a gap.
         out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
         // `NFS5.ChroniclePictureIcon`'s draw ends with the bevel over **the art's own
         // size** — 0x508906 and 0x508910 read `[entry+0x18]` and `[entry+0x14]`, the
@@ -977,6 +1006,20 @@ impl LayoutScreen {
             2 => x - (aw + bw),
             _ => x,
         };
+        // **The box this centres against is not the `.lay`'s `size=100,60`.** `CarLogo.ctr`
+        // sets `autosize.value=1` and is not one of §4.62's eight `autosize=0` exceptions, so
+        // `Control::computeBox` 0x5253C0 always takes the parts-union branch (0x52540a…0x525516:
+        // `[[this+0xF0]+0x38]` nonzero) and never reads `[this+0xE4]`'s literal `size` — from
+        // *any* source, the `.lay` block's own `size=100,60` included. `CarLogo.ctr`'s
+        // `[state.normal]` draws only `area` (`RECT pos=0,0 size=1,20`), so the true box is 20
+        // tall, not 60. Centring on the old, too-tall 60px box put the pair's vertical middle at
+        // `426+30=456` — design `y=456`, exactly `bottombar.lay` §7's own top edge — so any art
+        // over 0px tall had its lower half painted (then covered by the bar drawn after,
+        // `App::fe_sprites`) regardless of the art's real height; the default car's own badge
+        // (`Finallogos2.fsh` pair 19, both halves 66×36/67×36, dumped directly) lost its whole
+        // `SUPER` line this way (33d21f13). **`box_of` now takes the union unconditionally**
+        // (§4.62/§4.64, `layout.rs::box_of`, 2026-09-30) — `h` above is already this widget's
+        // true 20px box, so this no longer needs its own `parts_union` call.
         let top = y + ((h - ah) * 0.5).trunc();
         // **A depth mask** (0x4C1BCB 0x4DAA10 … 0x4C1CE0 0x4DAAC0 … 0x4C1D6B / 0x4C1DB2 0x4DAB00):
         // the two logo entries are the stencil — drawn in `0x4D87D0(fade)`, white at the
@@ -1428,7 +1471,7 @@ impl LayoutScreen {
     // which its bind reads at 0x4CDA61 — to the screen offset, and hands the box to
     // the player at `[this+0x1C4]`. `RE/notes/controls.md` §4.33.
     pub(super) fn draw_movie(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
-        let WidgetDraw { i, e, x, y, w, h, talpha, aspect, .. } = d;
+        let WidgetDraw { i, e, x, y, talpha, aspect, .. } = d;
         // **`NFS5.MOVIECIRCLE`'s draw 0x4CDAE0 is a depth mask** (`RE/notes/layouts.md` "Clip = a
         // depth mask"): 0x4DAA10 steps the kit's depth `[0x65B954]` nearer and the nine
         // `stencilshape` parts are painted there (vtable +0x14, 0x4CDB2C…0x4CDB57), writing depth
@@ -1453,9 +1496,16 @@ impl LayoutScreen {
         let start = out.len();
         if let Some(m) = self.movies.get(&i) {
             // the box is the widget's `size` (0x4CD034…0x4CD05E into `[+0x14C]`, `[+0x150]`,
-            // handed to the player's constructor 0x4E1EB0 as its `[+4]`, `[+8]`); a widget with
-            // no size falls back on the clip's own (the port's; no shipped widget lacks one)
-            let (dw, dh) = (if w > 0.0 { w } else { m.size.0 }, if h > 0.0 { h } else { m.size.1 });
+            // handed to the player's constructor 0x4E1EB0 as its `[+4]`, `[+8]`) — the **size
+            // attribute**, read directly at bind time, not `Control::computeBox`'s box: both
+            // classes autosize (`MovieBox.ctr`/`MovieCircle.ctr`), so `w`/`h` here (`box_of` at
+            // depth 0, §4.62) are the union of the parts the current state draws, which is not
+            // what 0x4CD034 reads. `box_of(e, 1)` is the attribute (§4.64's recursion-guarded
+            // fallback for a nested `control.size.*`, the same one the wrap classes need above).
+            // A widget with no size falls back on the clip's own (the port's; no shipped widget
+            // lacks one).
+            let (bw, bh) = self.box_of(e, 1);
+            let (dw, dh) = (if bw > 0.0 { bw } else { m.size.0 }, if bh > 0.0 { bh } else { m.size.1 });
             let v_max = movie_blit_v(dw, dh, m.size);
             let (pos, size) = self.place(aspect, x, y, dw, dh);
             // **`data.tint`** is the widget base's own colour, `[this+0x120]`, bound at
@@ -1707,22 +1757,15 @@ impl LayoutScreen {
     // units wider than the `.lay`'s declared 50 — enough for a 7-character comma-formatted sum at
     // this fixed pitch (57 units) to clear the `ID_ACCOUNTTHINGY` label (`pos=191,464`,
     // right-aligned at `align=2`, ending at `x=191`) with room to spare, which is why the
-    // original never overlaps it. `d.w` here is the **generic** `box_of` answer, which only takes
-    // the parts union when the `.lay` block itself carries no `size=` key
-    // (`layout.rs::box_of`'s `e.pair("size").is_none()` guard) — `ID_CASHBKGD` is the one shipped
-    // widget of this class and it *does* carry one, so the generic path falls through to the
-    // literal 50 instead. The same shape of bug, and the same fix (bypass the box the generic
-    // path hands the draw and take the union directly), already landed for
-    // `NFS5.AnimatingPicture`'s crest (`draw_animating_picture` above, `controls.md`
-    // "chronicle" 2026-09-29) — `box_of`'s guard itself is left alone here, matching that
-    // precedent, since changing it would touch every autosizing widget on all 98 screens instead
-    // of the one that needs it.
+    // original never overlaps it. **`box_of` now takes the union unconditionally** (§4.62/§4.64,
+    // `layout.rs::box_of`, 2026-09-30) — `d.w` below is already this widget's true 91px box, so
+    // this no longer needs its own `parts_union` call the way it did when `box_of` still guarded
+    // the union on the `.lay` block carrying no `size=` of its own.
     pub(super) fn draw_account_thing(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
         let WidgetDraw { i, e, x, y, w, talpha, aspect, strings, selected, hovered, accessor, .. } = d;
         self.template_widget(out, aspect, e, self.state_for(e, i, selected, hovered), x, y, strings);
         let Some(f) = self.fonts.get("univers7b.ffn").or_else(|| self.font_for(e)) else { return };
         let Some(v) = accessor("Tournament.Data(CASH)") else { return };
-        let w = self.parts_union(e).map(|(uw, _)| uw).unwrap_or(w);
         let mut cx = x + w - 1.0;
         for ch in v.chars().rev() {
             self.text(out, aspect, f, &ch.to_string(), cx, y + 3.0, 0.0, 2, [1.0, 1.0, 1.0, talpha]);
@@ -2680,7 +2723,26 @@ impl LayoutScreen {
         };
         // a widget with no box of its own anchors on its own text (align 0 then works
         // out to the position in the file, which is what the button classes carry)
-        let box_w = if w > 0.0 { w } else { 0.0 };
+        //
+        // **The wrap classes are the one exception**, and they need to source their width
+        // differently even after `box_of`'s autosize fix (`layout.rs::box_of`, §4.62/§4.64):
+        // `WordWrapControl.ctr`/`WordWrapAccessorWatch.ctr` both autosize, and their `area`
+        // `RECT` part's `size.value=control.size.width,control.size.height` — the widget's own
+        // **size attribute**, not its box (§4.64) — is exactly what the wrap engine itself
+        // measures to lay out lines (bind 0x522860 → `0x4E2B90` on that part). `box_of`'s
+        // depth-0 answer for these two classes is the **union of the parts**, which includes
+        // the unwrapped `label` part at its raw single-line width — the whole paragraph, not
+        // the box — so reading `w` here after the fix would hand `wrapped_text` a width that
+        // never wraps. `box_of(e, 1)` is the attribute (the same recursion-guarded fallback
+        // §4.64 already uses for a nested `control.size.*` term), matching what the original
+        // measures.
+        let box_w = if e.class.to_ascii_lowercase().contains("wordwrap") {
+            self.box_of(e, 1).0
+        } else if w > 0.0 {
+            w
+        } else {
+            0.0
+        };
         // The text sits at the widget's own `pos`, not centred in its box. The files
         // say so: on `tournament.lay` every value and its label share a `y` — the
         // `REAL.LABEL` at 299,114 and the `NFS5.AccessorWatch` at 302,114, and so on

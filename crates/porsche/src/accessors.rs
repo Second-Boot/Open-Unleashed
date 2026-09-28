@@ -293,7 +293,14 @@ impl App {
             // chat is carried by a message the port has not traced, so the box stays empty
             "Comms.ChatInput" => String::new(),
             "Chronicle.Year" => self.chronicle_year().to_string(),
-            "Graphics.Resolutions" => "640 x 480 x 16".to_string(),
+            // the combo's own closed caption is its current row's text — `choice_rows`'
+            // real-mode list ([`App::resolution_list`]), not a hardcoded fake row (COVERAGE
+            // §14.6.3)
+            "Graphics.Resolutions" => {
+                let modes = self.resolution_list();
+                let sel = self.fe.resolution_sel.min(modes.len().saturating_sub(1));
+                modes.get(sel).map_or_else(String::new, |(w, h, d)| format!("{w} x {h} x {d}"))
+            }
             "Controller.AllControllers" | "Controller.AllPads" => {
                 let pads_only = name == "Controller.AllPads";
                 let v: Vec<String> =

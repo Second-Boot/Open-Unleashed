@@ -505,6 +505,15 @@ impl MoviePlayer {
     }
 }
 
+/// `FEStringAccessor::insert` **0x4BCA90**'s own forbidden set, active only on the one shipped
+/// instance whose ctor argument enables it (`UserList.NameInput`, `LayoutScreen::type_char`'s own
+/// doc) — nine bytes byte-for-byte the set Windows refuses in a file name: `\ / : * ? " < > |`.
+/// The shared key handler's own `%` refusal (0x4CCC20, `type_char`'s doc) is unconditional and
+/// already checked separately; this is the *second*, per-instance layer 0x4BCA90 adds on top.
+fn filename_illegal_char(code: u32) -> bool {
+    matches!(code, 0x5c | 0x2f | 0x3a | 0x2a | 0x3f | 0x22 | 0x3c | 0x3e | 0x7c)
+}
+
 /// The tick's own frame count, 0x4E25A0: with `catchup` (`data.audio` set) as many periods as
 /// `clock_q16` covers. Without it, **only a genuine backlog — more than one frame due — is
 /// clamped** to one, dropping the rest (0x4E261D…0x4E2631 resets the accumulator to exactly the
@@ -2640,24 +2649,59 @@ impl LayoutScreen {
         }
     }
 
-    /// The widget's box. The `.lay` block's `size` wins; failing that the class template's own
-    /// `size.value`, which for most classes is an expression over the block's keys
-    /// (`data.width,data.height` for a button, `data.width,data.selectionboxmaxheight` for a list).
+    /// The widget's box. `Control::computeBox` 0x5253C0, re-read to the instruction 2026-09-30:
+    /// `eax = [this+0xF0]` (the class template's bound `autosize` attribute object) then
+    /// `ecx = [eax+0x38]` (its `value`, `[[this+0xF0]+0x38]`) — when that is nonzero
+    /// (0x52540a…0x525516) the box is **unconditionally** the union of the parts the current
+    /// state draws (0x5253E9…0x5254FF, zeroed then grown from the origin, exactly
+    /// [`parts_union`](Self::parts_union)); the `.lay` block's own `size=`, if it carries one,
+    /// is never read on that branch — not `[this+0xE4]` (the size attribute) nor anything
+    /// derived from it. Only when autosize is **0** (0x525501: eight of the seventy-two
+    /// templates that declare the key, §4.62) does the box come from `[this+0xE4]`'s pair —
+    /// the `.lay`'s `size=` if it gives one, else the template's own `size.value` expression
+    /// (`data.width,data.height` for a button, `data.width,data.selectionboxmaxheight` for a
+    /// list, …).
+    ///
+    /// **Until 2026-09-30 this only took the union when the `.lay` block carried no `size=` of
+    /// its own** — an extra guard the disassembly does not have, added when `parts_union` was
+    /// first ported and never audited against every autosizing class. `NFS_BOX_SWEEP=1`
+    /// measured the guard's effect over all 98 screens once it was lifted (`box_disagreements`,
+    /// below, now audits every autosizing widget rather than only the no-`size=` subset): 875
+    /// widget-instances across 16 classes differ from the guarded answer, `NFS5.PICTURE` (512)
+    /// and `NFS5.AccessorWatch` (277) by far the largest groups. Two shapes turned up:
+    ///
+    /// * **The box changes and nothing reads it.** `NFS5.PICTURE`/`NFS5.NonLocalizedLabel`/
+    ///   `NFS5.ExtraCircle` (`draw_template_classes`) and a matched `NFS5.AccessorWatch`
+    ///   (`draw_default`'s `watch_pos`, `NFS5.POPUPCIRCLE`'s and `NFS5.PLAYERDRIVERPICTURE`'s
+    ///   picture-only arms) draw every part at that part's **own** `pos`/`size`, never the
+    ///   widget's outer box — `box_of` only matters to these for hit-testing, which
+    ///   [`box_hit`](Self::box_hit) already implemented the *un*guarded rule for independently
+    ///   (§4.62), so lifting the guard here changes nothing they draw.
+    /// * **The box changes and something did read it, wrongly** — `NFS5.CarLogo`
+    ///   (`draw_car_logo`) and `NFS5.ACCOUNTTHING` (`draw_account_thing`) both centred/sized
+    ///   against the guarded box and were patched locally (33d21f13, 2c864da4) rather than here,
+    ///   for exactly the reason this comment used to give: touching `box_of` looked like it would
+    ///   touch every other autosizing class too. Both local patches are redundant now and are
+    ///   removed — they read `d.w`/`d.h`, which is this function's own answer.
+    ///
+    /// **One more shape, not in the 875**: `NFS5.WORDWRAPCONTROL`/`NFS5.WORDWRAPACCESSORWATCH`
+    /// (wrap width, `draw_default`) and `NFS5.MOVIEBOX`/`NFS5.MOVIECIRCLE` (movie blit size,
+    /// `draw_movie`) also autosize, but their own draws were **already** reading something other
+    /// than `box_of`'s depth-0 answer for their size — the wrap engine measures the `area` part
+    /// (`size.value=control.size.width,control.size.height`, the attribute, §4.64) and the movie
+    /// player's box is read straight off the widget's own `size` attribute at bind time
+    /// (0x4CD034). Both keep reading the attribute (`box_of(e, 1)`, depth > 0) rather than this
+    /// function's union, which is right for them but would have been very wrong for a long
+    /// paragraph's `label` part (measured unwrapped, hundreds of pixels wide) had they read `w`.
+    ///
+    /// **Only at depth 0**, which is to say only for the widget's own box and never for a
+    /// `control.size.*` term inside a part's expression. §4.64: those two are not the same
+    /// thing in the original either — 31 of the templates that reference `control.size.width`
+    /// autosize, and if that term went through the box the union would re-enter itself before
+    /// `computeBox` sets its valid flag (0x525516) and never come back. The term is the `size`
+    /// attribute; the box is the union.
     fn box_of(&self, e: &nfs_formats::lay::Element, depth: u32) -> (f32, f32) {
-        // an autosizing class is as big as what it draws (§4.62), and `NFS_BOX_SWEEP=1` measured
-        // where that differs from the template's `size.value`: 411 headers and labels whose
-        // expression this port cannot evaluate and so answered (0, 0), 82 car-setting buttons
-        // whose art is 15 wide where the template says 13, and four camera pictures the block
-        // calls 15x13 and whose parts cover 105x78.
-        //
-        // **Only at depth 0**, which is to say only for the widget's own box and never for a
-        // `control.size.*` term inside a part's expression. §4.64: those two are not the same
-        // thing in the original either — 31 of the templates that reference `control.size.width`
-        // autosize, and if that term went through the box the union would re-enter itself before
-        // `computeBox` sets its valid flag (0x525516) and never come back. The term is the `size`
-        // attribute; the box is the union.
         if depth == 0
-            && e.pair("size").is_none()
             && self.controls.get(&e.class).and_then(|c| c.value("autosize")).map(|v| v.trim() != "0").unwrap_or(false)
             && let Some(u) = self.parts_union(e)
         {
@@ -2690,15 +2734,16 @@ impl LayoutScreen {
         self.box_sized(e, 0, live)
     }
 
-    /// Every widget whose two boxes disagree: what the template's `size.value` says and what the
-    /// union of its parts says. For an autosizing class the original uses the union (§4.62), and
-    /// this port's *drawing* still uses `size.value` — so this is the list of places where that
-    /// choice could show. `NFS_BOX_SWEEP=1` prints it.
+    /// Every **autosizing** widget whose box disagrees with the union of its own parts —
+    /// `box_of` now returns that union unconditionally at depth 0 (§4.62's rule, re-read
+    /// 2026-09-30), so since this walks every autosizing widget rather than only the ones a
+    /// `.lay` block leaves `size=`-less, it should always come back empty; a non-empty result
+    /// means `box_of` and `parts_union` have drifted apart again. `NFS_BOX_SWEEP=1` prints it.
     pub fn box_disagreements(&self) -> Vec<(String, (f32, f32), (f32, f32))> {
         let mut out = Vec::new();
         for e in self.layout.elements.iter().skip(1) {
             let autosizes = self.controls.get(&e.class).and_then(|c| c.value("autosize")).map(|v| v.trim() != "0").unwrap_or(false);
-            if !autosizes || e.pair("size").is_some() {
+            if !autosizes {
                 continue;
             }
             let Some(u) = self.parts_union(e) else { continue };
@@ -5120,8 +5165,17 @@ impl LayoutScreen {
         }
     }
 
-    /// The scrollbar geometry of the open drop-down `i` — `(x, y, height, rows, first)`, the four
-    /// numbers `combo_scrollbar` draws from. `None` when the list is short enough not to scroll.
+    /// The scrollbar geometry of the open drop-down `i` — `(x, y, height, positions, first)`, the
+    /// four numbers `combo_scrollbar` draws from. `None` when the list is short enough not to
+    /// scroll.
+    ///
+    /// `positions` is **not** the row count. `FeComboBox`'s slot 1 (0x4C5460) is the same shared
+    /// tick §4.45/§4.59 read for the list box: it walks up from the last row while the heights
+    /// fit and hands the scrollbar model `rowsWalkedUp + 2` (0x4C550A) — one first-row position
+    /// past the last full page — and that `+2` count is what `slot9`/`slot24` (§4.59) answer back
+    /// as the knob's travel divisor, for a combo exactly as for a list box. Until this fix the
+    /// combo's own geometry passed the plain row count instead, which is why the combo scrollbar's
+    /// knob height, travel and hit-test disagreed with the list box's for the same shape of list.
     fn combo_scroll_geom(&self, i: usize) -> Option<(f32, f32, f32, usize, usize)> {
         let e = self.layout.elements.get(i)?;
         let (rows, _) = self.lists.get(&i)?;
@@ -5140,7 +5194,8 @@ impl LayoutScreen {
         let left = self.attr_num(e, "selectionboxslidedirection").unwrap_or(0.0) as i32 == -1;
         let (x, y) = self.position_of(e);
         let px = if left { x - grow } else { x };
-        Some((px + width + grow - LIST_SCROLLBAR_W, y + height, max_h, rows.len(), self.scroll.get(&i).copied().unwrap_or(0)))
+        let positions = self.last_first_row(i, rows) + 2;
+        Some((px + width + grow - LIST_SCROLLBAR_W, y + height, max_h, positions, self.scroll.get(&i).copied().unwrap_or(0)))
     }
 
     /// `FeListScrollBar::hitTest` 0x4DB2F0 — which of the bar's four rectangles the pointer is in.
@@ -5158,13 +5213,98 @@ impl LayoutScreen {
     /// The knob is tested **before** the trough, so a press on the knob never counts as the track
     /// — which is what lets arm 3 (drag) and arm 4 (page) of the press handler 0x4DB040 differ.
     /// The four rectangles are the ones the constructor 0x4DAF10 laid out (§4.90).
+    ///
+    /// A drop-down open inside an embedded screen (a tab panel) is held by that screen alone —
+    /// `set_open_combo` keeps only indices of this screen's own elements in `open_combo` — so with
+    /// none open here, ask each embedded screen at the panel's own offset, the same routing
+    /// `combo_row_at` uses (2026-09-29's nested-panel fix). *(Until this fix a nested panel's
+    /// combo's scrollbar never hit-tested at all — its arrows and knob were unreachable, on top of
+    /// this file's own knob-drag gap.)*
     pub fn combo_scroll_at(&self, px: f32, py: f32) -> Option<(usize, u32)> {
-        let i = self.open_combo?;
-        let (x, y, h, rows, first) = self.combo_scroll_geom(i)?;
-        match scrollbar_region(x, y, h, rows, first, px, py) {
-            0 => None,
-            n => Some((i, n)),
+        if let Some(i) = self.open_combo {
+            let (x, y, h, rows, first) = self.combo_scroll_geom(i)?;
+            return match scrollbar_region(x, y, h, rows, first, px, py) {
+                0 => None,
+                n => Some((i, n)),
+            };
         }
+        let mut keys: Vec<usize> = self.groups.keys().copied().collect();
+        keys.sort_unstable();
+        let mut base = self.layout.elements.len();
+        for k in keys {
+            let g = &self.groups[&k];
+            if !self.closed.contains(&k)
+                && let Some(e) = self.layout.elements.get(k)
+            {
+                let (gx, gy) = self.position_of(e);
+                if let Some((j, r)) = g.combo_scroll_at(px - gx, py - gy) {
+                    return Some((base + j, r));
+                }
+            }
+            base += g.span();
+        }
+        None
+    }
+
+    /// A press on the open combo's scrollbar **knob** (region 3) or **track** (region 4) —
+    /// `FeListScrollBar::onPress` 0x4DB040's other two arms (§4.46, §4.101). Returns
+    /// `(index, grabY, grabPosition)`, the drag anchor `combo_scroll_track` steps from on every
+    /// move — `[this+0x104]` and `[this+0x108]` in the original (0x4D0973 for the knob, 0x4D09D6 /
+    /// 0x4D09E3 / 0x4D09F6 for the track).
+    ///
+    /// Region 3 anchors to the **pointer's own** y, exactly where it was pressed. Region 4 anchors
+    /// to the **knob's own current top** instead (0x4D09D6 reads the knob's rect, not the
+    /// pointer) — the press does not move the model, only the drawn knob (which the original
+    /// visually snaps to the pointer immediately; this port leaves that one cosmetic jump out, the
+    /// same approximation §4.46 already states for the list box's own track click). Either way the
+    /// grabbed position is the model's own current one, `[this+0x108]`.
+    pub fn combo_scroll_grab(&self, index: usize, region: u32, py: f32) -> Option<(usize, f32, usize)> {
+        if let Some((k, j)) = self.route(index) {
+            let (_, gy) = self.position_of(self.layout.elements.get(k)?);
+            let (_, y, at) = self.groups.get(&k)?.combo_scroll_grab(j, region, py - gy)?;
+            return Some((index, y + gy, at));
+        }
+        let (x, y, h, positions, first) = self.combo_scroll_geom(index)?;
+        let _ = x;
+        let grab_y = if region == 4 {
+            const ARROW_H: f32 = COMBO_ARROW_H;
+            let knob_h = (h - 2.0 * ARROW_H - positions as f32).max(16.0);
+            let travel = (h - 2.0 * ARROW_H - knob_h).max(0.0);
+            let steps = positions.saturating_sub(1).max(1) as f32;
+            y + ARROW_H + travel * (first as f32 / steps).min(1.0)
+        } else {
+            py
+        };
+        Some((index, grab_y, first))
+    }
+
+    /// The open combo scrollbar's travel and position count — the same numbers `combo_scrollbar`
+    /// and `scrollbar_region` compute for the knob's height and its placement, needed again by the
+    /// drag (0x4D0F20, §4.46): `model->slot11(grabPosition + (y - grabY) * (positions - 1) / span)`.
+    pub fn combo_scroll_track(&self, index: usize) -> Option<(f32, usize)> {
+        if let Some((k, j)) = self.route(index) {
+            return self.groups.get(&k)?.combo_scroll_track(j);
+        }
+        let (_, _, h, positions, _) = self.combo_scroll_geom(index)?;
+        const ARROW_H: f32 = COMBO_ARROW_H;
+        let knob_h = (h - 2.0 * ARROW_H - positions as f32).max(16.0);
+        let span = (h - 2.0 * ARROW_H - knob_h).max(0.0);
+        Some((span, positions))
+    }
+
+    /// Put the open combo's first-drawn row at an absolute position, clamped — what the
+    /// scrollbar's knob drag does (0x4D0F20's inverse of the placement, §4.46), mirroring
+    /// `set_list_scroll`.
+    pub fn set_combo_scroll_pos(&mut self, index: usize, at: i32) {
+        if let Some((k, j)) = self.route(index) {
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.set_combo_scroll_pos(j, at);
+            }
+            return;
+        }
+        let Some((rows, _)) = self.lists.get(&index) else { return };
+        let positions = self.last_first_row(index, rows) as i32 + 2;
+        self.scroll.insert(index, at.clamp(0, positions - 1) as usize);
     }
 
     /// Which combo has its drop-down open, if any.
@@ -5187,7 +5327,31 @@ impl LayoutScreen {
     /// an **absolute** row, which the commit hands to the accessor's slot 11 as it is (0x4C6D82).
     /// `(combo, row)`.
     pub fn combo_row_at(&self, px: f32, py: f32) -> Option<(usize, usize)> {
-        let i = self.open_combo?;
+        // A drop-down open inside an embedded screen (a tab panel — `Options` → `graphics.lay` →
+        // `graphicsettings.lay`'s six combos) is held by that screen alone: `set_open_combo`
+        // keeps only indices of this screen's own elements in `open_combo`. So with none open
+        // here, ask each embedded screen at the panel's own offset and hand its answer back in
+        // the flattened index space. *(Until 2026-09-29 this returned at once, so a row of a
+        // nested drop-down never committed — the release fell through to whatever widget lay
+        // under the list, typically the next combo, which it opened instead. User report.)*
+        let Some(i) = self.open_combo else {
+            let mut keys: Vec<usize> = self.groups.keys().copied().collect();
+            keys.sort_unstable();
+            let mut base = self.layout.elements.len();
+            for k in keys {
+                let g = &self.groups[&k];
+                if !self.closed.contains(&k)
+                    && let Some(e) = self.layout.elements.get(k)
+                {
+                    let (gx, gy) = self.position_of(e);
+                    if let Some((j, r)) = g.combo_row_at(px - gx, py - gy) {
+                        return Some((base + j, r));
+                    }
+                }
+                base += g.span();
+            }
+            return None;
+        };
         if let Some((k, j)) = self.route(i) {
             let (gx, gy) = self.position_of(self.layout.elements.get(k)?);
             return self.groups.get(&k)?.combo_row_at(px - gx, py - gy).filter(|(g, _)| *g == j).map(|(_, r)| (i, r));
@@ -5414,7 +5578,7 @@ impl LayoutScreen {
         self.chronicle_captions = captions;
     }
 
-    /// `FEChroniclePictureControl`'s three mouse slots — the class `NFS5.ChroniclePicture`
+    /// `FEChroniclePictureControl`'s four mouse slots — the class `NFS5.ChroniclePicture`
     /// instantiates, vtable **0x5B8C74**:
     ///
     /// ```text
@@ -5423,11 +5587,25 @@ impl LayoutScreen {
     /// 0x5082A0  slot 8  while [+0x140]:
     ///                     [+0x14C] = [+0x154] - ev.x + [+0x144]
     ///                     [+0x150] = [+0x158] - ev.y + [+0x148]
+    /// 0x5082F0  slot 7  the base leave 0x4C7C50 (clears the hover flag), then [+0x140] = 0
     /// 0x508290  slot 9  [+0x140] = 0
     /// ```
     ///
     /// so the offset moves **against** the pointer, the way a document scrolls under a hand, and
     /// the bind 0x508220 starts all five at zero. §4.119.
+    ///
+    /// **Slot 7 (0x5082F0), COVERAGE §14.15's one honest gap in this class, now ported.** The
+    /// window's own move handler (`Window::handleEvent`'s move arm, 0x5289D9, §4.56) recomputes
+    /// the hit test on every device move and, whenever the hit widget changes away from the one
+    /// that had been hovered, sends it a type-6 **leave** event before the move event itself is
+    /// dispatched — regardless of capture, which this class's slot 5 never takes (unlike
+    /// `NFS5.DEADZONE`'s press, §4.40, it does not call `setFocused`, so §4.57's capture-on-focus
+    /// never applies to a chronicle-picture drag). So as soon as the pointer's box test
+    /// (`Control::containsPoint` 0x525A90, both edges inclusive, §4.56) fails for this widget, the
+    /// leave event's slot 7 clears `[+0x140]` — and slot 6 ("enter", 0x4C7B90, not overridden by
+    /// this class) never sets it back, so the drag stays stopped for the rest of the press even if
+    /// the pointer wanders back over the picture while the button is still held. `picture_drag_to`
+    /// below checks the same box before applying the pan, for the identical outcome.
     pub fn picture_press(&mut self, index: usize, x: f32, y: f32) {
         if let Some((k, j)) = self.route(index) {
             if let Some(g) = self.groups.get_mut(&k) {
@@ -5457,10 +5635,24 @@ impl LayoutScreen {
         Some((rx.min(pw - bw).max(0.0), ry.min(ph - bh).max(0.0), pw, ph))
     }
 
-    /// Slot 8, 0x5082A0 — the pan follows the pointer while the button is held.
+    /// Slot 8, 0x5082A0 — the pan follows the pointer while the button is held, unless slot 7,
+    /// 0x5082F0, has just ended it: the pointer leaving this widget's own hit box (the box
+    /// `hovered_scan` tests it against, both edges inclusive — `Control::containsPoint` 0x525A90,
+    /// §4.56) stands in for the window's leave event, and once it fires the drag does not resume
+    /// even if the pointer comes back while the button is still held (slot 6, "enter", is not
+    /// overridden by this class, so nothing sets `[+0x140]` back to 1 — see `picture_press`'s doc).
     pub fn picture_drag_to(&mut self, x: f32, y: f32) {
         if let Some((i, gx, gy, ox, oy)) = self.picture_drag {
-            self.picture_pan.insert(i, (ox - x + gx, oy - y + gy));
+            let inside = self.layout.elements.get(i).is_some_and(|e| {
+                let (bx, by) = self.position_of(e);
+                let (bw, bh) = self.box_hit(e);
+                bw >= 1.0 && bh >= 1.0 && x >= bx && x <= bx + bw && y >= by && y <= by + bh
+            });
+            if inside {
+                self.picture_pan.insert(i, (ox - x + gx, oy - y + gy));
+            } else {
+                self.picture_drag = None;
+            }
         }
         for g in self.groups.values_mut() {
             g.picture_drag_to(x, y);
@@ -5473,6 +5665,17 @@ impl LayoutScreen {
         for g in self.groups.values_mut() {
             g.picture_release();
         }
+    }
+
+    /// Tooling only (`NFS_FE_CLICKS=drag:…`): the flattened index and current pan of whichever
+    /// `NFS5.ChroniclePicture` a drag is still active for — `None` once slot 7 (0x5082F0) has
+    /// cleared it, which is exactly the observation the diagnostic checks for a drag that left
+    /// the widget's box.
+    pub fn dragging_picture(&self) -> Option<(usize, f32, f32)> {
+        if let Some((i, ..)) = self.picture_drag {
+            return self.picture_pan.get(&i).map(|&(px, py)| (i, px, py));
+        }
+        self.groups.values().find_map(|g| g.dragging_picture())
     }
 
     /// Enable or disable a widget, as the by-name helper **0x50D880** does: 0x50D8DB reads the
@@ -5595,19 +5798,40 @@ impl LayoutScreen {
     ///           otherwise accessor->vt[0x30](c)
     /// ```
     ///
-    /// `'%'` is the only printable character a box turns down, and the reason is visible in what
-    /// the strings are for: every front-end string reaching 0x5A0FBF is a `printf` format, so a
-    /// typed `%` would be read as a conversion. Returns whether the character was taken — the
-    /// caller plays front-end sound 9 on a yes, which is what 0x4AADB0(9) does on every accepted
-    /// path.
+    /// `'%'` is the only printable character a box turns down **at this shared layer**, and the
+    /// reason is visible in what the strings are for: every front-end string reaching 0x5A0FBF is
+    /// a `printf` format, so a typed `%` would be read as a conversion.
+    ///
+    /// **A second, per-instance filter, found this pass and not previously ported.** `vt[0x30]`
+    /// (slot 12, `FEStringAccessor::append` **0x4BC950**, §4.139) does not insert the character
+    /// itself — it calls slot 11, **0x4BCA90**, which insists on `[this+0x1C]` before it filters
+    /// at all: a byte the ctor **0x4BC8B0** takes as its 5th argument, `false` for most of the
+    /// class's registrations (e.g. `"ANOTHER"`, 0x4E6016) but **`true` for `UserList.NameInput`**
+    /// (0x4E5D9E, confirmed by disassembling that one call site's own pushed args — the same site
+    /// §4.139's `maxLen` table already cites for its `8`). When it is set, 0x4BCA90 rejects nine
+    /// more characters no other box turns down — `\ / : * ? " < > |`, byte for byte the set
+    /// Windows refuses in a file name — while still consuming the keystroke (a rejected character
+    /// plays no different sound; it is simply never inserted). The profile name typed here is
+    /// exactly what a save file is later named (`career_ui.rs`, `TEMPLATE_STEM`/`create_profile`),
+    /// so the filter is not cosmetic: a name that reached this port's own save path unfiltered
+    /// (`8Kate/Kate.sav`, say) would build an invalid or wrong path the original never lets a
+    /// player type. Not read for `COMMS.PASSWORD` (0x50B9C1, unconfirmed — out of scope, network
+    /// play carries no filesystem write this port makes).
     pub fn type_char(&mut self, index: usize, c: char) -> bool {
         let code = c as u32;
         if !(0x20..0xFF).contains(&code) || code == 0x25 {
             return false;
         }
-        let max = self.layout.elements.get(index)
-            .and_then(|e| e.get("accessor"))
-            .and_then(Self::input_max_len);
+        let accessor = self.layout.elements.get(index).and_then(|e| e.get("accessor"));
+        // 0x4BCA90's own filename-illegal set, active only where the ctor's 5th argument was
+        // `true` — checked directly against every one of `input_max_len`'s own four named
+        // registrations by disassembling each one's own pushed args this pass: `true` only for
+        // `UserList.NameInput` (0x4E5D9E); `"ANOTHER"` (0x4E6016), `COMMS.PASSWORD` (0x50B9C1)
+        // and `Comms.ChatInput` (0x50BA95) all push `false`.
+        if accessor == Some("UserList.NameInput") && filename_illegal_char(code) {
+            return false;
+        }
+        let max = accessor.and_then(Self::input_max_len);
         let buf = self.edits.entry(index).or_default();
         if max.is_some_and(|m| buf.chars().count() >= m) {
             return false;
@@ -5722,20 +5946,27 @@ impl LayoutScreen {
 
     /// A press on the open drop-down's scrollbar, as `FeListScrollBar::onPress` 0x4DB040 handles
     /// it: arm 1 steps the list back one row (`[this+0xDC] = -1` at 0x4DB080), arm 2 forward one
-    /// (`+1` at 0x4DB096), both after the click 0x4AADB0(8). Arms 3 and 4 start a drag, which this
-    /// port's drop-down does through `park_knob`, so they are left alone here.
-    pub fn combo_scroll_press(&mut self, region: u32) -> bool {
-        let Some(i) = self.open_combo else { return false };
-        let Some((_, _, _, rows, first)) = self.combo_scroll_geom(i) else { return false };
+    /// (`+1` at 0x4DB096), both after the click 0x4AADB0(8). Arms 3 and 4 (the knob and the track)
+    /// start a drag instead — `combo_scroll_grab` / `combo_scroll_track` / `set_combo_scroll_pos`,
+    /// called from `App::fe_left_button` the way `list_drag` already does for the list box's own
+    /// scrollbar. `index` is the combo's flattened index (`combo_scroll_at`'s own), routed into an
+    /// embedded screen the same way every other combo method is — *(until this fix, a plain
+    /// `self.open_combo` here meant a nested panel's combo scrollbar never stepped at all; user
+    /// report's knob-drag gap was one symptom of the same missing routing)*.
+    pub fn combo_scroll_press(&mut self, index: usize, region: u32) -> bool {
+        if let Some((k, j)) = self.route(index) {
+            return self.groups.get_mut(&k).is_some_and(|g| g.combo_scroll_press(j, region));
+        }
+        let Some((_, _, _, positions, first)) = self.combo_scroll_geom(index) else { return false };
         let next = match region {
             1 => first.saturating_sub(1),
-            2 => (first + 1).min(rows.saturating_sub(1)),
+            2 => (first + 1).min(positions.saturating_sub(1)),
             _ => return false,
         };
         if next == first {
             return false;
         }
-        self.scroll.insert(i, next);
+        self.scroll.insert(index, next);
         true
     }
 
@@ -5806,9 +6037,11 @@ impl LayoutScreen {
         );
         let inside = out.len();
         let black = tint([0, 0, 0, 255]);
-        // the sixteen pixels the panel gave up carry the drop-down's own scrollbar (§4.90)
+        // the sixteen pixels the panel gave up carry the drop-down's own scrollbar (§4.90). Its
+        // knob travel is the scrollbar model's own **count** (§4.59's `+2`), not the row total —
+        // `combo_scroll_geom`'s doc comment has the read.
         if scrolls {
-            self.combo_scrollbar(out, aspect, px + rect_w, py, max_h, rows.len(), self.scroll.get(&i).copied().unwrap_or(0), &tint);
+            self.combo_scrollbar(out, aspect, px + rect_w, py, max_h, self.last_first_row(i, rows) + 2, self.scroll.get(&i).copied().unwrap_or(0), &tint);
         }
         for (bx, by, bw, bh) in [(px, py, rect_w, 1.0), (px, py + rows_h - 1.0, rect_w, 1.0), (px, py, 1.0, rows_h), (px + rect_w - 1.0, py, 1.0, rows_h)] {
             out.push(self.quad(aspect, bx, by, bw.max(1.0), bh.max(1.0), black));
@@ -5835,7 +6068,28 @@ impl LayoutScreen {
                 ListRow::Text(t) => self.text(out, aspect, f, t, px + 3.0, ry + 2.0, 0.0, 0, fg),
                 // 0x4C688F hands the row draw an inset of 3.0 (§4.171)
                 ListRow::Swatch(_) | ListRow::CustomColour(_) => self.colour_row(out, aspect, f, row, px, ry, 3.0, &tint),
-                _ => {}
+                // A grouped car list's heading (`garage_rows`/`catalog_rows`, §4.144): the same
+                // two-black-rule-plus-bevel shape `draw_list_box`'s own `Header`/`GroupHeading`
+                // arms already draw for `Parts.AllParts`/the garage list — this match had no arm
+                // for either variant at all, so a combo's own drop-down (`FeComboBox`/
+                // `FeListBox` share one row loop, §4.42/§4.43, but not this one — `draw_combo`
+                // reaches `drop_down`, not `draw_list_box`) drew the heading's reserved height as
+                // **blank space**: the row total came out right (`OwnedCars.Car`'s 42/28/14
+                // already matched) but the era/class text and its two rules never appeared. Found
+                // porting `GenericCar.Car`/`DealerCar.Car`/`GenericCar2.Car`'s own grouping
+                // (`catalog_rows`) and fixed for both — the garage combo drew this same blank gap
+                // before now, uncaught because no screenshot check had looked inside an *open*
+                // grouped combo specifically.
+                ListRow::Header(t, _) | ListRow::GroupHeading(t) => {
+                    let black = tint([0, 0, 0, 0xFF]);
+                    out.push(self.quad(aspect, px, ry, rect_w, 1.0, black));
+                    out.push(self.quad(aspect, px, ry + PART_HEADER_H, rect_w, 1.0, black));
+                    self.text(out, aspect, f, t, px, ry + 2.0, rect_w, 1, tint(text_c));
+                    let bevel_y = if matches!(row, ListRow::GroupHeading(_)) { ry + 1.0 } else { ry };
+                    let bevel_h = if matches!(row, ListRow::GroupHeading(_)) { 12.0 } else { PART_HEADER_H };
+                    self.bevel_heading(out, aspect, px, bevel_y, rect_w, bevel_h, 2.0);
+                }
+                ListRow::Columns(_) => {}
             }
             ry += row.height();
         }
@@ -6282,6 +6536,13 @@ impl LayoutScreen {
     /// bit **0x04** of `[widget+0x10C]`, set by the base vtable's slot 6 (0x4C7B90) and cleared by
     /// slot 7 (0x4C7C50), each of which then re-runs `updateState` (0x4C82A0) to turn the flags
     /// into the state name the widget draws.
+    /// Tooling: move the pointer for a scripted click (`NFS_FE_CLICKS`), even while
+    /// `NFS_FE_CURSOR` parks the live one.
+    pub fn script_cursor(&mut self, at: Option<(f32, f32)>) {
+        self.pointer = None;
+        self.place_cursor(at);
+    }
+
     pub fn set_cursor(&mut self, at: Option<(f32, f32)>) {
         // a still parked its own pointer with `NFS_FE_CURSOR`; the live one must not clobber it
         if std::env::var("NFS_FE_CURSOR").is_ok() {
@@ -6377,7 +6638,71 @@ impl LayoutScreen {
     }
 
     /// The widget the pointer is over — the **first** section whose box contains it and whose
-    /// class can hover.
+    /// class can hover, **unless** an open combo has the window's capture, in which case only the
+    /// combo itself can ever hover.
+    ///
+    /// `Window::handleEvent`'s move arm **0x5289D9** (§4.56) is the enter/leave machine, and it is
+    /// capture-aware in a way this file had not read until it was reported: after the raw hit
+    /// test (`0x528C00`) it does not always send the **enter** (type 5) to what it found —
+    ///
+    /// ```text
+    /// 0x528a3a  [this+0x110] = hit                       ; tracked regardless, for the next leave
+    /// 0x528a38  if (captured == 0)                 -> send enter to hit
+    /// 0x528a46      al = captured->slot18()             ; "accepts mouse input" (§4.38)
+    /// 0x528a49      if (!al)                       -> send enter to hit
+    /// 0x528a4d      if (captured == hit)           -> send enter to hit (to itself)
+    /// 0x528a4f      else                           -> **no enter sent at all**
+    /// ```
+    ///
+    /// (read directly from the image, `fn.py --asm 0x5289d9`, since the prose notes stopped short
+    /// of the exact branch). `[window+0x120]` is the **captured** widget — the one holding focus,
+    /// which a widget takes and keeps for as long as it is focused (§4.57's `setCapture` /
+    /// `releaseCapture`) — and **slot 18** is *accepts mouse input*: the base answers false
+    /// (0x50DD60), `NFS5.DEADZONE` and `NFS5.ComboBoxSlider`/`NFS5.ColorBox` answer true (0x510E90,
+    /// §4.38). A combo's list is open exactly while it holds focus (§4.43), so **while any combo
+    /// is open, it holds the window's capture and its slot 18 is true — and no other widget's
+    /// hover flag is ever set**, anywhere on the screen, until it closes. The combo's own internal
+    /// row highlight (§4.42, `combo_row_at`) is unrelated machinery and keeps working underneath
+    /// this — only the *window-level* `[state.hover]` this function drives is gated.
+    ///
+    /// *(User report, 2026-09-30 (c): hovering a row of an open drop-down also hovered whatever was
+    /// underneath it, including through a tab panel's own drop-down — the raw scan below is
+    /// unchanged and still finds that widget, so the fix is the capture filter `hovered` applies
+    /// to its answer.)*
+    pub fn hovered(&self) -> Option<usize> {
+        let hit = self.hovered_scan();
+        match self.any_open_combo() {
+            // the combo itself is exempt (0x528a4d: captured == hit still sends the enter) —
+            // harmless either way, since ComboBox.ctr's `[state.hover]` draws exactly what
+            // `[state.normal]` does (§4.4, item (d) below)
+            Some(oc) => hit.filter(|h| *h == oc),
+            None => hit,
+        }
+    }
+
+    /// The combo whose drop-down is open, here or in a visible embedded screen, by its flattened
+    /// index — `None` while nothing is open. The same routing `combo_row_at` and
+    /// `combo_scroll_at` use for a nested panel's own combo.
+    fn any_open_combo(&self) -> Option<usize> {
+        if let Some(i) = self.open_combo {
+            return Some(i);
+        }
+        let mut keys: Vec<usize> = self.groups.keys().copied().collect();
+        keys.sort_unstable();
+        let mut base = self.layout.elements.len();
+        for k in keys {
+            if !self.closed.contains(&k)
+                && let Some(j) = self.groups[&k].any_open_combo()
+            {
+                return Some(base + j);
+            }
+            base += self.groups[&k].span();
+        }
+        None
+    }
+
+    /// `hovered`'s own raw scan, before the capture filter above — the **first** section whose box
+    /// contains it and whose class can hover.
     ///
     /// `Window::hitTest` **0x528C00** walks the child vector forwards and returns the **first**
     /// child that contains the point, and that vector is in section order (§4.67) with the draw
@@ -6386,7 +6711,7 @@ impl LayoutScreen {
     /// The box is the widget's own, the same `0x4C8670` gives the original. A widget with no size
     /// of its own has a box of (0, 0) here (§4.37) and so can never be hit; those are the 27
     /// bottom-bar buttons and graphic tabs, whose classes carry no hover state anyway.
-    pub fn hovered(&self) -> Option<usize> {
+    fn hovered_scan(&self) -> Option<usize> {
         let (cx, cy) = self.cursor?;
         // the bases the flattened index space gives each embedded screen, by the element the
         // panel sits at, so a sub-layout is tested exactly where the draw reaches it
@@ -7526,6 +7851,21 @@ impl LayoutScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `FEStringAccessor::insert` 0x4BCA90's own forbidden set — the nine bytes Windows refuses
+    /// in a file name, `\ / : * ? " < > |` — found on `UserList.NameInput`'s profile-name box,
+    /// the port's own save filename source (`layout.rs::type_char`'s doc).
+    #[test]
+    fn the_nine_filename_illegal_bytes_and_nothing_else() {
+        for c in ['\\', '/', ':', '*', '?', '"', '<', '>', '|'] {
+            assert!(filename_illegal_char(c as u32), "{c:?} is Windows-illegal in a file name");
+        }
+        // every ordinary letter/digit, the space, and '%' (already refused one layer up by the
+        // shared key handler, so this layer does not need to name it too) all pass this filter
+        for c in ['a', 'Z', '5', ' ', '%', '\'', '-', '_', '.', ',', '!'] {
+            assert!(!filename_illegal_char(c as u32), "{c:?} is not one of the nine");
+        }
+    }
 
     /// 0x4E25A0: a silent movie (no `data.audio`) only clamps a genuine backlog — more than one
     /// frame due — to one and drops the rest; the ordinary one-frame case carries its true
