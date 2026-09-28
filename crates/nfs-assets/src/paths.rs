@@ -14,7 +14,8 @@ pub struct GameNotFound {
 }
 
 impl GamePaths {
-    /// Resolve the game root: `$NFS5_GAME_PATH`, then the documented default locations.
+    /// Resolve the game root: `$NFS5_GAME_PATH`, then an app bundle's own `Resources/game`, then the
+    /// documented default locations.
     pub fn locate() -> Result<Self, GameNotFound> {
         let mut tried = Vec::new();
         if let Ok(p) = std::env::var("NFS5_GAME_PATH") {
@@ -23,6 +24,16 @@ impl GamePaths {
                 return Ok(Self { root: p });
             }
             tried.push(p);
+        }
+        // A self-contained app bundle (`packaging/make_app.sh --with-data`) carries the data in
+        // `Contents/Resources/game`, beside `Contents/MacOS/<binary>`.
+        if let Some(p) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|d| d.join("../Resources/game")))
+        {
+            if Self::looks_like_root(&p) {
+                return Ok(Self { root: p.canonicalize().unwrap_or(p) });
+            }
         }
         if let Some(home) = std::env::var_os("HOME") {
             let home = PathBuf::from(home);

@@ -386,8 +386,8 @@ impl MoviePlayer {
     /// off (`self.snd.audio.is_none()` in the port) — checked again every `advance`.
     fn open(r: &mut Renderer, paths: &GamePaths, dir: &str, file: &str, audio: bool) -> Option<Self> {
         let path = GamePaths::find_file(&paths.fe_data().join(dir), file)?;
-        let (Ok(exe), Ok(data)) = (std::fs::read(paths.root.join("nfs5.exe")), std::fs::read(&path)) else { return None };
-        let tables = nfs_formats::mad::MadTables::from_exe(&exe).ok()?;
+        let Ok(data) = std::fs::read(&path) else { return None };
+        let tables = nfs_formats::mad::MadTables::load(&paths.root).ok()?;
         let chunks: Vec<(usize, usize)> = {
             let mut at = 0usize;
             let mut out = Vec::new();
@@ -758,8 +758,31 @@ pub struct LayoutScreen {
     /// The timeline's icon pack, and the entry each (column, row) cell shows in its two states —
     /// `0x507340(year, row, variant, hot)`'s two slots (§4.118, §4.123).
     chronicle_icons: (String, std::collections::BTreeMap<(usize, usize), (usize, usize)>),
+    /// One caption per timeline column — the `фото`-row (kind 0) entry's own `0x6F` text
+    /// attachment (`nfs_formats::fsh::Fsh::entry_caption`), always the **resting** frame's
+    /// (0x507340's fourth argument, `hot`, is a hardcoded `0` at the caption's own call site,
+    /// 0x507C3B — §4.173), `None` when there is no picture-kind entry for the column or its name
+    /// is empty (0x507CB9's `je`).
+    chronicle_captions: Vec<Option<String>>,
     /// the six `WeeIcons.fsh` entries the combo scrollbar's two arrows cycle (§4.90, §4.101)
     combo_arrows: Option<[usize; 6]>,
+    /// `Parts.AllParts`'s own collapsible-header icon — the ctor **0x515160** builds
+    /// `"%sWeeIcons.fsh"` (0x5151C0: string 0x5D976C) and caches four entries by index —
+    /// `pls1`(3)→`[this+0xA4]`, `min4`(0xB)→`[this+0xA8]`, `pls2`(4)→`[this+0xAC]`,
+    /// `pls3`(5)→`[this+0xB0]` — plus a fifth, `BarD`(0xE)→`[this+0xB4]`, for the list's own
+    /// scrollbar (already the generic `NFS5.ListBox` art above). The row draw **0x515620**
+    /// picks one of the first four by `(al = [this+0x2C]`/`[this+0x2D]`, this section's own
+    /// **open** flag) and a second flag at `[esp+0xcc]`, read to the instruction 2026-09-29: the
+    /// row loop, `0x4C64FE`, calls the accessor's own vtable slot 15 (`call [eax+0x3C]` at
+    /// `0x4C68F5`) with exactly 8 stack args (`0x515620` itself ends `ret 0x20`); the first-
+    /// pushed (`[esp+0xcc]`, the 8th/last arg) is `ebx`, **0** by default (`0x4C672E`) and
+    /// overwritten only when this row is the list's **selected-and-focused** row (`0x4C674C`'s
+    /// `cmp edi,[this+0x1A8]` gated by the byte at `[this+0x1A4]`) or the row the accessor's own
+    /// hover query (its vtable slot 10, called at `0x4C678E`) reports — the same two conditions
+    /// this port already computes as `hover_row`/`current` for the row's highlight bar. The flag
+    /// is that bar's own presence: `pls1` closed/`min4` open when neither holds, `pls2`
+    /// closed/`pls3` open when either does. `[pls1, min4, pls2, pls3]`.
+    parts_glyphs: Option<[usize; 4]>,
     /// a list's scrollbar knob parked at the pointer by a press on the **track**, until the first
     /// move puts the model somewhere — `RE/notes/controls.md` §4.46, the tail of 0x4D0995
     knob_at: Option<(usize, f32)>,
@@ -1162,8 +1185,12 @@ pub enum ListRow {
     Text(String),
     Columns(Vec<ListCell>),
     /// A parts list's category heading: a black rule above and below and the name centred between
-    /// them (`drawPartsHeading` 0x518DE0), 13 px tall.
-    Header(String),
+    /// them (`drawPartsHeading` 0x518DE0), 13 px tall. The `bool` is whether the section this
+    /// heading opens is expanded — meaningless here (category headings are not collapsible), but
+    /// `Parts.AllParts`'s **own** two section headers reuse this variant and do read it, to pick
+    /// the `+`/`−` icon (`LayoutScreen::parts_glyphs`'s own doc, ctor 0x515160 / row draw
+    /// 0x515620).
+    Header(String, bool),
     /// The garage list's own grouping heading — two rules **13 px** apart with the name between
     /// them, drawn by `FEOwnedCarAccessor`'s row painter 0x4F5D54…0x4F5DB3 and costing **14** px
     /// of row height. Its height comes out of slot 26 (0x4F60F0): a row whose era differs from
@@ -1189,7 +1216,7 @@ impl ListRow {
         match self {
             ListRow::Text(_) => LIST_ROW_H,
             ListRow::Columns(_) => LIST_ROW_H,
-            ListRow::Header(_) => PART_HEADER_H,
+            ListRow::Header(..) => PART_HEADER_H,
             ListRow::GroupHeading(_) => LIST_ROW_H,
             // `FEColourAccessor` keeps the base slot 26, 0x4BC700
             ListRow::Swatch(_) | ListRow::CustomColour(_) => LIST_ROW_H,
@@ -1718,6 +1745,20 @@ impl LayoutScreen {
             wanted.push(("weeicons.fsh".to_string(), n));
             Some(n)
         }).flatten();
+        // `Parts.AllParts`'s two section headers (`КУПИТЬ ЗАПЧАСТИ ДЛЯ …`/`ПРОДАТЬ ЗАПЧАСТИ`) draw
+        // a `+`/`−` collapse icon from the same `weeicons.fsh` the ctor **0x515160** caches by
+        // index (`pls1`=3, `min4`=0xB, `pls2`=4, `pls3`=5 — see the field doc above)
+        let parts_glyphs = layout.elements.iter().any(|e| e.get("accessor").is_some_and(|a| a.starts_with("Parts.AllParts"))).then(|| {
+            let p = GamePaths::find_file(&art, "weeicons.fsh")?;
+            let d = std::fs::read(p).ok()?;
+            let pack = nfs_formats::fsh::Fsh::parse(&d).ok()?;
+            let at = |tag: &str| pack.entries.iter().position(|e| e.name.trim_end_matches('\0').eq_ignore_ascii_case(tag));
+            let four = [at("pls1")?, at("min4")?, at("pls2")?, at("pls3")?];
+            for n in four {
+                wanted.push(("weeicons.fsh".to_string(), n));
+            }
+            Some(four)
+        }).flatten();
         let arcs = layout.elements.iter().any(|e| e.class == "NFS5.CONTROLLERSETUP").then(|| {
             let p = GamePaths::find_file(&art, "weeicons.fsh")?;
             let d = std::fs::read(p).ok()?;
@@ -1802,6 +1843,14 @@ impl LayoutScreen {
             want.push(BADGE_NAME_FONT.to_string());
             want.push(BADGE_RANK_FONT.to_string());
         }
+        // The timeline's caption is smaller than its year header — `Univers7b.ffn` against the
+        // year's own `Univers8b.ffn` — read off `FEChronicleMainBoxControl`'s bind, 0x507F10:
+        // `[this+0x158]` ("Univers8b") and `[this+0x15c]` ("Univers7b") are two distinct fonts,
+        // not one reused (§4.173). Nothing in the `.lay`/`.ctr` files names the caption's font, so
+        // without this rule it is never loaded and the caption never draws.
+        if layout.elements.iter().any(|e| e.class == "NFS5.ChronicleMainBoxControl") {
+            want.push(PICKER_TITLE_FONT.to_string());
+        }
         // and `NFS5.ColorBox`'s picker builds two of its own: 0x4C3A3A loads `Universc11b.ffn`
         // into `[this+0x294]` for the buttons and 0x4C3A76 `Univers7b.ffn` into `[+0x298]` for the
         // title (`RE/notes/controls.md` §4.48)
@@ -1851,7 +1900,7 @@ impl LayoutScreen {
         let screen = Self { layout, background: None, shapes, fonts, white, cursor_ms: 0, cursor_shape_at: std::cell::Cell::new((usize::MAX, 0)), cursor_btn_at: std::cell::Cell::new((false, 0)), cursor_btn: false, car_spin: 0.0, car_parts: HashMap::new(), car_roof: Default::default(), covered: false, combo_hover: std::cell::Cell::new(None), overlay_mask: std::cell::Cell::new(None), unrendered, logos: HashMap::new(), checks: HashMap::new(), knobs: HashMap::new(), closed: std::collections::HashSet::new(), groups: HashMap::new(), bars: HashMap::new(), lists: HashMap::new(), swatches: HashMap::new(), car_views: HashMap::new(), track_maps: HashMap::new(), movies: HashMap::new(), ko_strip: HashMap::new(), badges: HashMap::new(),
             // `NFS_FE_CLOCK` preloads the screen clock in milliseconds, so a still can be taken
             // part way through an animation the front end would otherwise only show in motion
-            clock_ms: std::env::var("NFS_FE_CLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0), glint, colb, arcs,
+            clock_ms: std::env::var("NFS_FE_CLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0), glint, colb, arcs, parts_glyphs,
             movie_overlays: Default::default(),
             credits_roll: Default::default(),
             wrap_watch: Default::default(),
@@ -1899,6 +1948,7 @@ impl LayoutScreen {
             picture_drag: None,
             chronicle_columns: Vec::new(),
             chronicle_icons: (String::new(), Default::default()),
+            chronicle_captions: Vec::new(),
             combo_arrows,
             knob_at: None,
             scroll: HashMap::new(),
@@ -3862,23 +3912,41 @@ impl LayoutScreen {
         None
     }
 
-    /// The flat index (the one [`Self::tab_click`] takes) of the widget named `name`, here or in
-    /// an embedded layout — for the `NFS_FE_TAB` diagnostic.
-    pub fn flat_index_of(&self, name: &str) -> Option<usize> {
-        if let Some(i) = self.layout.elements.iter().position(|e| e.name.eq_ignore_ascii_case(name)) {
-            return Some(i);
+    /// The flat index (the one [`Self::tab_click`] takes) of the `nth` (0-based, in file order,
+    /// depth-first) widget named `name`, here or in an embedded layout — for the `NFS_FE_TAB`
+    /// diagnostic. `nth` exists because several shipped tab strips give every button in the
+    /// strip the same `name` — `controllertabs.lay`'s five buttons are all `ID_TABBUTTON`,
+    /// `graphicstabs.lay`'s two are too — where only `showcasetabs.lay` and `optiontabs.lay`
+    /// name each of their buttons uniquely. The original never needs to pick one by name; its
+    /// own click is a screen coordinate, so a name collision is invisible to it.
+    pub fn flat_index_of(&self, name: &str, nth: usize) -> Option<usize> {
+        self.flat_index_of_skip(name, nth).1
+    }
+
+    /// `flat_index_of`'s recursion: the index found, or how many more matches were skipped over
+    /// without yet reaching `nth`, so the caller above can keep counting into the next group.
+    fn flat_index_of_skip(&self, name: &str, mut skip: usize) -> (usize, Option<usize>) {
+        for (i, e) in self.layout.elements.iter().enumerate() {
+            if e.name.eq_ignore_ascii_case(name) {
+                if skip == 0 {
+                    return (0, Some(i));
+                }
+                skip -= 1;
+            }
         }
         let mut keys: Vec<usize> = self.groups.keys().copied().collect();
         keys.sort_unstable();
         let mut base = self.layout.elements.len();
         for k in keys {
             let g = &self.groups[&k];
-            if let Some(j) = g.flat_index_of(name) {
-                return Some(base + j);
+            let (rem, found) = g.flat_index_of_skip(name, skip);
+            if let Some(j) = found {
+                return (0, Some(base + j));
             }
+            skip = rem;
             base += g.span();
         }
-        None
+        (skip, None)
     }
 
     pub fn indicator_bars(&self) -> Vec<(usize, String, bool)> {
@@ -5339,6 +5407,11 @@ impl LayoutScreen {
     /// The pack and the per-cell entries the timeline's icons come from (§4.123).
     pub fn set_chronicle_icons(&mut self, pack: String, cells: std::collections::BTreeMap<(usize, usize), (usize, usize)>) {
         self.chronicle_icons = (pack, cells);
+    }
+
+    /// One caption per timeline column, the `фото`-row entry's own `0x6F` text (§4.173).
+    pub fn set_chronicle_captions(&mut self, captions: Vec<Option<String>>) {
+        self.chronicle_captions = captions;
     }
 
     /// `FEChroniclePictureControl`'s three mouse slots — the class `NFS5.ChroniclePicture`

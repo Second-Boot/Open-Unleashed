@@ -21,8 +21,10 @@ copy individual files elsewhere first.
 Runtime code and tools resolve the game root in this order:
 
 1. `NFS5_GAME_PATH` environment variable, if set.
-2. `~/Games/NFS-Porsche-Unleashed/game_info/data`.
-3. `~/Games/NFS-Porsche-Unleashed` (if it directly contains `GameData/`).
+2. `<binary dir>/../Resources/game` — the data a self-contained app bundle carries
+   (`packaging/make_app.sh --with-data`; for personal use only, the assets are EA's).
+3. `~/Games/NFS-Porsche-Unleashed/game_info/data`.
+4. `~/Games/NFS-Porsche-Unleashed` (if it directly contains `GameData/`).
 
 See `crates/nfs-assets/src/paths.rs`.
 

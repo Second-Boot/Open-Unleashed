@@ -341,6 +341,56 @@ impl MadTables {
 
         Ok(Self { flat, quant, prescale, scan })
     }
+
+    /// The name of the small table file a self-contained app bundle carries instead of the whole
+    /// executable (`packaging/make_app.sh --with-data`, written by the `extract_mad_tables` example).
+    pub const FILE: &'static str = "madtables.bin";
+    const MAGIC: &'static [u8; 8] = b"NFSMADT1";
+
+    /// These tables as the [`Self::FILE`] blob: the magic, then `flat`, `quant`, `prescale` and
+    /// `scan` as little-endian dwords. Only derived data — what [`Self::from_exe`] built — so a
+    /// bundle can drop `nfs5.exe`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + 4 * (tbl::LEN + 3 * 64));
+        out.extend_from_slice(Self::MAGIC);
+        out.extend(self.flat.iter().flat_map(|v| v.to_le_bytes()));
+        out.extend(self.quant.iter().flat_map(|v| v.to_le_bytes()));
+        out.extend(self.prescale.iter().flat_map(|v| v.to_le_bytes()));
+        out.extend(self.scan.iter().flat_map(|v| (*v as u32).to_le_bytes()));
+        out
+    }
+
+    /// The inverse of [`Self::to_bytes`].
+    pub fn from_bytes(d: &[u8]) -> Result<Self, FormatError> {
+        let what = Self::FILE;
+        let need = 8 + 4 * (tbl::LEN + 3 * 64);
+        if d.len() != need {
+            return Err(FormatError::Truncated { what, offset: 0, needed: need });
+        }
+        if &d[..8] != Self::MAGIC {
+            return Err(FormatError::UnknownMagic { what, offset: 0, expected: Self::MAGIC.to_vec(), found: d[..8].to_vec() });
+        }
+        let mut words = d[8..].chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        let flat: Vec<u32> = words.by_ref().take(tbl::LEN).collect();
+        let mut quant = [0i32; 64];
+        let mut prescale = [0i32; 64];
+        let mut scan = [0usize; 64];
+        quant.iter_mut().for_each(|q| *q = words.next().unwrap_or(0) as i32);
+        prescale.iter_mut().for_each(|p| *p = words.next().unwrap_or(0) as i32);
+        scan.iter_mut().for_each(|s| *s = words.next().unwrap_or(0) as usize);
+        Ok(Self { flat, quant, prescale, scan })
+    }
+
+    /// The tables for the game at `root`: [`Self::FILE`] when a bundle carries it, otherwise read
+    /// out of the installation's own `nfs5.exe`.
+    pub fn load(root: &std::path::Path) -> Result<Self, FormatError> {
+        if let Ok(d) = std::fs::read(root.join(Self::FILE)) {
+            return Self::from_bytes(&d);
+        }
+        let exe = std::fs::read(root.join("nfs5.exe"))
+            .map_err(|_| FormatError::Truncated { what: "nfs5.exe", offset: 0, needed: 1 })?;
+        Self::from_exe(&exe)
+    }
 }
 
 // -------------------------------------------------------------------------------------------

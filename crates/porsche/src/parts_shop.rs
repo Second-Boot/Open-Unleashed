@@ -90,11 +90,39 @@ fn car_of(c: &CareerUi) -> Option<usize> {
 
 /// Rows grouped the way every parts list draws them: a category heading over a row whose category
 /// **string** (0x518D60) differs from the row above's (0x516FBA…0x516FCC, 0x5170D9…0x5170F8) — so
-/// categories 6 and 7, which share one, share a heading. The row's left cell is `"%s %s"` of the
-/// part's localised name and its type name at `x + 3` — the right one is the caller's. Returns
-/// the rows and, per row, the index of the item it belongs to (a heading belongs to the part
-/// under it).
-pub fn grouped<'a>(items: impl IntoIterator<Item = (&'a Part, ListCell)>, strings: &Strings) -> (Vec<ListRow>, Vec<usize>) {
+/// categories 6 and 7, which share one, share a heading. The right cell is the caller's; the left
+/// one is `"%s %s"` (format string `0x5da738`), corrected 2026-09-29:
+///
+/// Disassembling the four row draws that carry that format string —
+/// `Parts.AllParts` 0x515620 (`0x515b1b…0x515b2b`), `Parts.ShoppingList` 0x515F50
+/// (`0x515ffe…0x516012`), `Parts.InstallList` 0x516960 (`0x516a0a…0x516a27`) and
+/// `Parts.RepairShoppingList` 0x5170B0 (`0x517182…0x5171a2`) — each pushes the same two pointers in
+/// the same order: the localised name (`0x4E06D0(record+4)`, the string id) pushed **first** (so it
+/// is the **second** vararg after the `"%s %s"` format, cdecl pushes right-to-left) and
+/// `record+8` — a 28-byte fixed field, pushed **second** (the **first** vararg) — right before the
+/// call. `record+8` is this table's `family` (`nfs_formats::career::Part::family`, `nfs5.prt +8`,
+/// a car-family code like `"356"`, never empty — confirmed by dumping the shipped `nfs5.prt`,
+/// 683/683 records). So the row is **`family` + `" "` + the localised name**, e.g.
+/// `"356 Стандартный Маховик"` — not the name followed by anything. The port's own
+/// `crates/nfs-game/src/career.rs::part_family` already reads this exact field for matching; this
+/// is its first use for *display*.
+///
+/// `Parts.OwnedDamageRepairList`/`Parts.UsedDamageList`'s row draw, 0x516D70, is different: its
+/// disassembly carries no `"%s %s"` at all and no call to `0x4E06D0` either — it draws the name
+/// plain (through a vtable-dispatched getter and `0x4DA350`, not `0x4DA530`'s format path), no
+/// family prefix. That is `owned_rows` below, which does not call this with `family_prefix`.
+///
+/// `record+0x28` — `Part::kind_name` (`nfs5.prt +0x28`, the internal English label:
+/// `"Flywheel"`/`"Carbs"`/`"Air Intake"`/`"Exhaust"`/`"Gear Box"`/…) — is a different field
+/// entirely and **never appears in any of these five row draws**; it is `career.md`'s own
+/// `+0x28` "type name" the install/uninstall/replace logic (`0x4F873F`, `0x518510`, `0x4F8A1E`)
+/// `strcmp`s two *installed* parts' records by, never formatted into a string. The previous
+/// reading here (`format!("{name} {}", p.kind_name)`) had the right shape — a second field
+/// appended to the localised name — but the wrong field and the wrong side.
+///
+/// Returns the rows and, per row, the index of the item it belongs to (a heading belongs to the
+/// part under it).
+pub fn grouped<'a>(items: impl IntoIterator<Item = (&'a Part, ListCell)>, strings: &Strings, family_prefix: bool) -> (Vec<ListRow>, Vec<usize>) {
     let mut rows = Vec::new();
     let mut owner = Vec::new();
     let mut group = None;
@@ -102,11 +130,12 @@ pub fn grouped<'a>(items: impl IntoIterator<Item = (&'a Part, ListCell)>, string
         let cat = part_category_string(p.kind);
         if k == 0 || group != cat {
             group = cat;
-            rows.push(ListRow::Header(cat.and_then(|id| strings.get(id)).unwrap_or("").to_string()));
+            rows.push(ListRow::Header(cat.and_then(|id| strings.get(id)).unwrap_or("").to_string(), false));
             owner.push(k);
         }
         let name = strings.get(p.name_string_id).unwrap_or("").to_string();
-        rows.push(ListRow::Columns(vec![ListCell { fade: 0xFF, anchor: String::new(), dx: 3.0, text: format!("{name} {}", p.kind_name) }, right]));
+        let text = if family_prefix { format!("{} {name}", p.family) } else { name };
+        rows.push(ListRow::Columns(vec![ListCell { fade: 0xFF, anchor: String::new(), dx: 3.0, text }, right]));
         owner.push(k);
     }
     (rows, owner)
@@ -145,21 +174,21 @@ impl PartsShop {
         let idx = car_of(c)?;
         let car = c.tables.car(c.career.garage[idx].car_id)?;
         let title = car.display_name.to_string();
-        let mut rows = vec![ListRow::Header(strings.get(2550).unwrap_or_default().replacen("%s", &title, 1))];
+        let mut rows = vec![ListRow::Header(strings.get(2550).unwrap_or_default().replacen("%s", &title, 1), open[0])];
         let mut kinds = vec![AllPartsRow::Header];
         if open[0] {
             let parts = c.career.parts_for(&c.tables, car);
-            let (r, owner) = grouped(parts.iter().map(|p| (*p, at("ID_PRICEPOS", -4.0, c.career.part_buy_price(p)))), strings);
-            kinds.extend(r.iter().zip(&owner).map(|(row, k)| if matches!(row, ListRow::Header(_)) { AllPartsRow::Heading } else { AllPartsRow::Buy(parts[*k].id) }));
+            let (r, owner) = grouped(parts.iter().map(|p| (*p, at("ID_PRICEPOS", -4.0, c.career.part_buy_price(p)))), strings, true);
+            kinds.extend(r.iter().zip(&owner).map(|(row, k)| if matches!(row, ListRow::Header(..)) { AllPartsRow::Heading } else { AllPartsRow::Buy(parts[*k].id) }));
             rows.extend(r);
         }
-        rows.push(ListRow::Header(strings.get(2551).unwrap_or_default().to_string()));
+        rows.push(ListRow::Header(strings.get(2551).unwrap_or_default().to_string(), open[1]));
         kinds.push(AllPartsRow::Header);
         if open[1] {
             let view = c.career.spare_view(&c.tables);
             let items: Vec<(usize, &Part, f32)> = view.iter().filter_map(|&i| c.career.spare_part(&c.tables, i).map(|(p, s)| (i, p, s))).collect();
-            let (r, owner) = grouped(items.iter().map(|(_, p, s)| (*p, at("ID_PRICEPOS", -4.0, c.career.part_sell_price(p, *s)))), strings);
-            kinds.extend(r.iter().zip(&owner).map(|(row, k)| if matches!(row, ListRow::Header(_)) { AllPartsRow::Heading } else { AllPartsRow::Sell(items[*k].0) }));
+            let (r, owner) = grouped(items.iter().map(|(_, p, s)| (*p, at("ID_PRICEPOS", -4.0, c.career.part_sell_price(p, *s)))), strings, true);
+            kinds.extend(r.iter().zip(&owner).map(|(row, k)| if matches!(row, ListRow::Header(..)) { AllPartsRow::Heading } else { AllPartsRow::Sell(items[*k].0) }));
             rows.extend(r);
         }
         Some((rows, kinds))
@@ -180,7 +209,7 @@ impl PartsShop {
     /// **negative**, its aged price negated (0x516032), a sale its resale (0x51603F).
     pub fn basket_rows(&self, c: &CareerUi, strings: &Strings) -> (Vec<ListRow>, Vec<usize>) {
         let items: Vec<(&Part, i64)> = self.basket.iter().filter_map(|i| Some((c.career.shop_item_part(&c.tables, *i)?.0, c.career.shop_item_value(&c.tables, *i)))).collect();
-        grouped(items.iter().map(|(p, v)| (*p, at("ID_PRICEPOS", -0.0, *v))), strings)
+        grouped(items.iter().map(|(p, v)| (*p, at("ID_PRICEPOS", -0.0, *v))), strings, true)
     }
 
     /// `Parts.RepairShoppingList` — each entry's part with its cost at `ID_COSTPOS` (0x5171C5 /
@@ -192,17 +221,20 @@ impl PartsShop {
             .iter()
             .filter_map(|i| Some((c.tables.parts.iter().find(|p| p.id == i.part)?, c.career.repair_item_cost(&c.tables, car, *i))))
             .collect();
-        grouped(items.iter().map(|(p, v)| (*p, at("ID_COSTPOS", -0.0, *v))), strings)
+        grouped(items.iter().map(|(p, v)| (*p, at("ID_COSTPOS", -0.0, *v))), strings, true)
     }
 
     /// `Parts.OwnedDamageRepairList` — every installed part (0x516C60 counts `car+0x758`) with
-    /// its damage as `"%d %"` at `ID_DAMAGEPOS + 3` (0x516EF6).
+    /// its damage as `"%d %"` at `ID_DAMAGEPOS + 3` (0x516EF6). Its row draw, 0x516D70, is the one
+    /// of the five that carries no `"%s %s"` at all (`grouped()`'s doc comment above) — no family
+    /// prefix here, unlike the other four.
     pub fn owned_rows(c: &CareerUi, strings: &Strings) -> (Vec<ListRow>, Vec<i16>) {
         let Some(car) = car_of(c) else { return (Vec::new(), Vec::new()) };
         let parts = c.career.installed_parts(&c.tables, car);
         let (rows, owner) = grouped(
             parts.iter().map(|p| (*p, ListCell { fade: 0xFF, anchor: "ID_DAMAGEPOS".into(), dx: 3.0, text: format!("{} %", c.career.part_damage(car, p) as i64) })),
             strings,
+            false,
         );
         (rows, owner.iter().map(|k| parts[*k].id).collect())
     }
@@ -224,6 +256,7 @@ impl PartsShop {
         let (rows, owner) = grouped(
             items.iter().map(|(p, id)| (*p, ListCell { fade: if *id == 2565 { 0x80 } else { 0xFF }, anchor: "ID_INSTALLYPOS".into(), dx: 3.0, text: strings.get(*id).unwrap_or_default().to_string() })),
             strings,
+            true,
         );
         (rows, owner.iter().map(|k| list[*k]).collect())
     }

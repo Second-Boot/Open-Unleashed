@@ -924,13 +924,31 @@ impl CareerUi {
     /// [`Self::create_profile`] with `XXDefXX`'s modules and accessors — the front end's start-up
     /// state 0x4DE880 saved (0x4D3B76) and 0x4DE5B0 loads before it saves the new profile — so the
     /// new file carries those options, not the ones of the profile that was up.
+    ///
+    /// **`PlayerInfo.player_name` quirk (`savegame.md` "Genuine save 2026-09-28"):** this,
+    /// specifically, is the *only* save this quirk touches — `career_to_sav_with`'s general
+    /// `player_name: profile.name.clone()` stays right for every later save (`Self::save`),
+    /// because in the original only the very first `SaveInfo` under the new stem happens before
+    /// `[0x691DC8]` is ever set to the typed name: `CREATEPLAYERDONE` (0x4DE5B0) calls
+    /// `LoadInfo("XXDefXX", true)` first, which sets `[0x691DC8]` to the whole template stem
+    /// `"XXDefXX"` (§2.2's "except for `XXDefXX`" rule), and nothing between that and the
+    /// `SaveInfo(name, picture)` that becomes this file updates it — `0x5012B0` sets only the
+    /// *driver* name. Only the immediately following `LoadInfo(stem, true)` (re-reading the file
+    /// just written) sets `[0x691DC8]` to the real name in memory, so every save from then on is
+    /// correct. Overwritten here, after the general builder, rather than threaded through
+    /// `career_to_sav_with` as a parameter, since no other caller needs it and the field is
+    /// write-only in both games (neither `career_from_sav` nor the original's own display ever
+    /// reads `player_name` back — it always re-derives the shown name from the file stem).
     pub fn create_profile_from(&mut self, name: &str, picture: u8, template: &nfs_game::save::SaveSide) -> bool {
         if (0..=9).any(|d| self.save_dir.join(format!("{d}{name}.sav")).exists()) {
             return false;
         }
         let old = (std::mem::take(&mut self.career), self.profile.clone());
         self.profile = Profile::new(name, picture);
-        let sav = nfs_game::save::career_to_sav_with(&self.career, &self.tables, &self.profile, template);
+        let mut sav = nfs_game::save::career_to_sav_with(&self.career, &self.tables, &self.profile, template);
+        if let Some(p) = sav.player.as_mut() {
+            p.player_name = nfs_game::save::TEMPLATE_STEM.to_string();
+        }
         if nfs_game::save::write_profile(&self.save_dir, &self.profile, &sav).is_err() {
             (self.career, self.profile) = old;
             return false;
@@ -1796,10 +1814,22 @@ mod tests {
         assert!(file.exists());
         let sav = nfs_formats::sav::SaveFile::parse(&std::fs::read(&file).unwrap()).unwrap();
         assert_eq!(sav.player.as_ref().map(|p| p.picture), Some(5));
+        // `savegame.md` "Genuine save 2026-09-28": the creation save is the one `SaveInfo` the
+        // original makes before `[0x691DC8]` (`player_name`) is ever set to the typed name — the
+        // preceding `LoadInfo("XXDefXX", true)` leaves it as the whole template stem, and only the
+        // *next* load (this port's `switch_profile`, below) corrects it in memory. `driver_name`
+        // is unaffected (0x5012B0 sets it directly) — genuine file and port agree on it already.
+        assert_eq!(sav.player.as_ref().map(|p| p.player_name.as_str()), Some(nfs_game::save::TEMPLATE_STEM), "the creation save's player_name quirk");
+        assert_eq!(sav.player.as_ref().map(|p| p.driver_name.as_str()), Some("Greta"));
         let listed = nfs_game::save::list_profiles(&dir);
         assert_eq!(listed, vec![Profile::new("Greta", 5)]);
         assert!(ui.switch_profile(&listed[0]));
         assert_eq!(ui.profile.picture, 5);
+        // the normal save path is unchanged: once the profile is loaded, a later save carries the
+        // real name again, exactly as the original's own next `LoadInfo` does in memory
+        ui.save();
+        let sav2 = nfs_formats::sav::SaveFile::parse(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(sav2.player.as_ref().map(|p| p.player_name.as_str()), Some("Greta"), "every later save is correct");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

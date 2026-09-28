@@ -53,6 +53,14 @@ use winit::window::{Window, WindowId};
 /// Set by `main` for a scripted run: the window must not take the focus (`NFS_NO_FOCUS`).
 static NO_FOCUS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Set by `main` from `NFS_PLAY_INTRO`: a scripted run (`--autotest`/`--screenshot`/
+/// `--layout-sweep`/`--record`/`NFS_NO_FOCUS`) otherwise never plays the start-up movies (`main`'s
+/// own `scripted` gate on `resume_inner`'s intro branch), so no scripted check ever walked the
+/// intro → front-end handoff — the class of hang the release app hit after the movies (548aa02b).
+/// This flag keeps the intro for a scripted run too, and `intro_event` auto-taps Esc every frame
+/// (the same key path a player's skip takes) so the walk does not sit through the whole movie.
+static PLAY_INTRO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// In-race HUD (`RE/notes/hud.md`, CONFIRMED): dial faces and needles from `nfs5.car` dial
 /// records (`speedK/tach.fsh` entry = style, `needle2/needle.fsh` entry = needle style), 128 px
 /// dials bottom-right, needle sweep `φ = start + v·deg` calibrated clockwise-from-12 as `φ − 90°`
@@ -2570,9 +2578,34 @@ impl App {
     /// beside (30) and 12706 "wheel base" beside (32) — and the '96 993 Carrera's own entries 11 to
     /// 15 are "1390Kg", "4260 mm", "1735 mm", "1315 mm", "2272 mm", in that order. Five rows, five
     /// matches. CONFIRMED.
+    ///
+    /// **Which car, fixed 2026-09-29 (pass 10 CONFIRMED PORT DEFECT).** `general.lay`'s and
+    /// `chassis.lay`'s watches carry a bare `accessor=Showcase.Text(n)` — `FEShowcaseTextAccessor`
+    /// (vtable `0x5B8D64`), a class of its own, not `zMergedList.Car`'s. Its string getter
+    /// (`0x508E80`, called by `FEAccessorWatch::tick`'s modified-text path, `controls.md` §4.10)
+    /// parses the index and hands it to **`0x508CB0`**: `mov eax,[0x699D58]; …; call 0x536DA0` —
+    /// the index into whatever `.loc` file object sits at the **global** `[0x699D58]`, not a
+    /// live per-frame car lookup. What loads that global is **`0x508B70`**, which every
+    /// `SHOWCASE.*`-family click handler calls in the same breath as `0x50E6A0` (the `[0x699FE0]`
+    /// setter `fn compare_cars`'s own `CarCompare1` already reads): it frees the previous `.loc`
+    /// object, builds `<car+0xE3>.fsh` for the picture pack (falling back to `993tCo96.fsh` at
+    /// `0x59DC30` if the car's own pack is missing on disk — the exact numbers this doc comment
+    /// used to cite before the bug was found), builds `<car+0x4D>.loc` and loads *that* into
+    /// `[0x699D58]`, then sets its language (`0x4B73F0`, `0x508C78`). The two shipped triggers —
+    /// `dealership.lay`'s `показ`/`carcompare` buttons (`callback=SHOWCASE.DEALERCAR`) and
+    /// `QuickRace.lay`/`knockout.lay`/`quickknockout.lay`'s (`callback=CARCOMPARE.MERGEDCAR`) —
+    /// are the *same two* the port already tracks as `self.fe.compare_dealer` (`:17585`); the
+    /// registration table at `0x50C257…` (walked with `RE/tools/fn.py`/a raw capstone scan, since
+    /// `SHOWCASE.DEALERCAR` turned out to be a per-screen vtable-slot-54 thunk at **0x50E5C0**, not
+    /// the flat `0x50DB20` this doc comment used to cite — that address is really registered under
+    /// the name `SHOWCASE.GENERICCAR`, and `CARCOMPARE.MERGEDCAR` is **0x50DC40**, not `0x50DCC0`
+    /// — `0x50DCC0` is `CHEATALLCARS`) confirms these are the only two names any shipped `.lay`
+    /// invokes. So `Showcase.Text`'s own car is the same one `self.fe.compare_dealer` already
+    /// picks, and the fix is to read it through the same routing `compare_cars`/`CarCompare1`
+    /// already implements, not `zMergedList.Car` unconditionally.
     fn showcase_text(&self, index: usize) -> Option<String> {
         let index = (index / 2).checked_sub(1)?;
-        let key = self.logo_car(Some("zMergedList.Car"), None)?.locale_key.clone();
+        let key = self.logo_car(Some("CarCompare1"), None)?.locale_key.clone();
         if key.is_empty() {
             return None;
         }
@@ -2692,14 +2725,7 @@ impl App {
     fn dealer_cars(&self) -> Option<Vec<&nfs_formats::fedata::CarCatalogEntry>> {
         let c = self.career.as_ref()?;
         let mut v: Vec<&nfs_formats::fedata::CarCatalogEntry> = c.tables.catalog.iter().filter(|e| c.career.dealer_lists(e)).collect();
-        let key = |e: &nfs_formats::fedata::CarCatalogEntry| (e.era_string_id as i32, e.class_string_id as i32, e.year as i16);
-        for i in 0..v.len() {
-            for j in i + 1..v.len() {
-                if key(v[j]) < key(v[i]) {
-                    v.swap(i, j);
-                }
-            }
-        }
+        era_class_year_sort(&mut v, |e| era_class_year_key(e));
         Some(v)
     }
 
@@ -2926,6 +2952,8 @@ impl App {
         self.bind_repair_bars();
         self.bind_usedcars_panels();
         self.bind_garage();
+        self.bind_carsetup_gearratio();
+        self.bind_laps_selector();
         self.bind_player_buttons();
         self.bind_parts_buttons();
         self.bind_mergedlist_panel();
@@ -3169,7 +3197,7 @@ impl App {
                 Some((vec![ListRow::Text(if modifier == "SHORT" { car.family.to_string() } else { car.display_name.to_string() })], Some(0)))
             }
             "PrizeCars.Car"
-            | "DealerCar.Car" | "GenericCar.Car" | "CARSETTINGS.CAR" | "GenericCar2.Car" => {
+            | "DealerCar.Car" | "GenericCar.Car" | "CARSETTINGS.CAR" => {
                 let rows = m
                     .cars
                     .iter()
@@ -3177,8 +3205,19 @@ impl App {
                         ListRow::Text(if modifier == "SHORT" { c.family.to_string() } else { c.display_name.to_string() })
                     })
                     .collect();
-                let cur = if base == "GenericCar2.Car" { m.car2_idx } else { m.car_idx };
-                Some((rows, Some(cur)))
+                Some((rows, Some(m.car_idx)))
+            }
+            // `GenericCar2.Car`'s own list `cars2` — `[0x6919F4]`, separate from `cars` above
+            // (`Menu::cars2`'s field doc)
+            "GenericCar2.Car" => {
+                let rows = m
+                    .cars2
+                    .iter()
+                    .map(|c| {
+                        ListRow::Text(if modifier == "SHORT" { c.family.to_string() } else { c.display_name.to_string() })
+                    })
+                    .collect();
+                Some((rows, Some(m.car2_idx)))
             }
             // `LoopedTrack.Track` is its own accessor over the circuits `[0x691D08]`, and
             // `Knockout.Track` forwards to the selected row's `Track<n>.Track` (0x4B8580)
@@ -3563,6 +3602,34 @@ const LAPS_MAX: u32 = 8;
 const COLOUR_ACCESSORS: [&str; 7] =
     ["OwnedCar.ExtColour", "OwnedCar.IntColour", "OwnedCar.S1Colour", "OwnedCar.S2Colour", "GenericCar.Colour", "DealerCar.Colour", "DealerCar.IntColour"];
 
+/// **0x4F0F50**'s comparator key: `(era_string_id, class_string_id, year)` at `+0x1B0`/`+0x1AC`/
+/// `+0x1F8`, `year` the signed 16-bit word the comparator's own `cmp ax, word ptr […]` /
+/// `setl` reads (0x4F1D75…0x4F1D86) — not the full record, so a tie on all three fields never
+/// compares (0x4F1D8E `xor al, al`, matching [`era_class_year_sort`]'s `!(a<b) && !(b<a)` no-swap).
+fn era_class_year_key(c: &nfs_formats::fedata::CarCatalogEntry) -> (u32, u32, i16) {
+    (c.era_string_id, c.class_string_id, c.year as i16)
+}
+
+/// **The original's own exchange sort, byte for byte.** `0x4F0F50` (outer index `i` 0..n, inner
+/// index `j` i+1..n) calls comparator **0x4F1D40** as `cmp(v[j], v[i])` and swaps `v[i]`/`v[j]`
+/// the instant it answers true — not a min-tracking selection sort, and not stable: several `j`s
+/// can each overwrite `v[i]` in turn, so a run of equal-keyed records lands in whatever order this
+/// exact instruction-for-instruction walk produces, not their original file order (`Vec::sort*`,
+/// stable or not, is not proven to reproduce it and is not used here). `dealer_cars` (`career.md`
+/// §10.9 "Dealer / garage order", matched) and the `GenericCar.Car`/`GenericCar2.Car` catalogue
+/// lists (`0x4F3E40`'s six lists, all six sorted with this same call at 0x4F42A1…0x4F42DC) all go
+/// through this one routine. Generic over the element so the same walk serves both an owned
+/// `Vec<CarCatalogEntry>` (the catalogue lists) and a `Vec<&CarCatalogEntry>` (`dealer_cars`).
+fn era_class_year_sort<T>(v: &mut [T], key: impl Fn(&T) -> (u32, u32, i16)) {
+    for i in 0..v.len() {
+        for j in i + 1..v.len() {
+            if key(&v[j]) < key(&v[i]) {
+                v.swap(i, j);
+            }
+        }
+    }
+}
+
 /// The row a colour list's arrow asks slot 11 for (see `App::colour_step`): `cur` the row it is
 /// on, `n` the colour count, `size` the list's rows. Forward, slot 21 0x4BC690: the last row wraps
 /// to 0, else 0x4B95A0(+1). Back, slot 20 0x4BC660: row 0 wraps to the last, else 0x4B95A0(−1).
@@ -3795,7 +3862,22 @@ struct Menu {
     looped: Vec<String>,
     /// the chronicle year the two lists were last built for (see `App::sync_track_lists`)
     tracks_year: i32,
+    /// `GenericCar.Car`'s list `[0x6919EC]` — kind-0 (racing) catalogue records, 0x4F0F50-sorted.
+    /// The catalogue half of `zMergedList.Car`, `CARSETTINGS.CAR` and the `DealerCar.Car`/
+    /// `PrizeCars.Car` fallback arms all read this one (`career.md` "0x4F3E40" audit below).
     cars: Vec<nfs_formats::fedata::CarCatalogEntry>,
+    /// `GenericCar2.Car`'s own list `[0x6919F4]` — **a separate rebuild from `cars`, not the same
+    /// vector.** 0x4F3E40's per-record loop (`GameType == 4`, the Evolution/career context every
+    /// `carcompare.lay` visit is reached through, `career.md` "SETTYPECAREERMODE: type 4") appends
+    /// a kind-0 record here whenever the chronicle year has reached its first model year
+    /// (0x4F4126…0x4F4156: `chronicle_year >= record+0x1F8`, no class/era/dealer-flag test at all),
+    /// then sorts it with the same 0x4F0F50/0x4F1D40 exchange sort as `cars` (0x4F42B3…0x4F42B9).
+    /// Rebuilt alongside the track lists (`App::rebuild_track_lists`) since both are the same
+    /// 0x4F3E40 call in the original. **Gap:** `cars`' own filter (`+0x204` dealer-availability
+    /// flag) is GameType-dependent in the original (0x4F4093…0x4F41B7) and not fully resolved —
+    /// the port keeps every kind-0 record in `cars` regardless, an APPROXIMATION already accepted
+    /// before this pass and not widened or narrowed here.
+    cars2: Vec<nfs_formats::fedata::CarCatalogEntry>,
     track_idx: usize,
     car_idx: usize,
     /// **`zMergedList.Car`'s own current index, which half it is in.** `FEMergedCarListAccessor`
@@ -3890,6 +3972,20 @@ impl Menu {
     fn car(&self) -> Option<&nfs_formats::fedata::CarCatalogEntry> {
         let i = if self.car_idx < self.cars.len() { self.car_idx } else { 0 };
         self.cars.get(i)
+    }
+
+    /// `GenericCar2.Car`'s own selected car, `cars2[car2_idx]` with the same out-of-range rule.
+    fn car2(&self) -> Option<&nfs_formats::fedata::CarCatalogEntry> {
+        let i = if self.car2_idx < self.cars2.len() { self.car2_idx } else { 0 };
+        self.cars2.get(i)
+    }
+
+    /// Rebuild `cars2` (`[0x6919F4]`, see the field doc) from the full `catalog` for the chronicle
+    /// `year`: kind-0 records released by `year` (`record.year <= year`), 0x4F0F50-sorted.
+    fn set_cars2(&mut self, catalog: &[nfs_formats::fedata::CarCatalogEntry], year: i32) {
+        let mut v: Vec<_> = catalog.iter().filter(|c| c.kind == 0 && c.year as i32 <= year).cloned().collect();
+        era_class_year_sort(&mut v, era_class_year_key);
+        self.cars2 = v;
     }
 
     /// Keep the seven `Track1..7` rows. The selected row `Knockout.TrackNumber` is **not**
@@ -4733,6 +4829,9 @@ struct RoadCars {
     traffic_sets: Vec<String>,
     /// paint colour per opponent, for the HUD map blips
     opponent_paints: Vec<[u8; 3]>,
+    /// each opponent's `nfs5.car +0x34` family (`spec+0x534`, the short car label the results
+    /// boards print — `modes.md` §7.1, 0x42C368…0x42C3BA), pushed beside `opponent_paints`
+    opponent_families: Vec<String>,
     /// paint colour per traffic car, same use
     traffic_paints: Vec<[u8; 3]>,
     /// police: the spawn manager, the cop cars and their models (`traffic.md` §17, §25, §27)
@@ -4840,7 +4939,21 @@ struct FrontEnd {
     /// once) and whether `Graphics.CarChrome` builds the `CarExtEnv` passes (0x44F020 makes the word
     /// as the race's 0x44ED10 does) — the chrome flag is part of the reload key
     cars_env: Option<nfs_game::world::CarEnv>,
-    /// milliseconds the front end has been up, for the turntable
+    /// milliseconds the front end has been up, for the turntable. Matches `FE3DRoom::draw`
+    /// 0x4E9FF0's own `YRot` build (0x4EA09B…0x4EA0CF, `frontend-3d.md` §3 and the 2026-09-29
+    /// dated paragraph): every draw reads `now = TIMER_getTicks()` (0x53C2E0 → `[0x6B7C7C]`,
+    /// `timing.md`) — the OS multimedia timer's own 128 Hz counter, ticking on its own thread
+    /// since `TIMER_init` at process start, not a per-frame delta — and sets
+    /// `YRot = now / (TIMER_FREQ(=128,\u{a0}[0x5DEB48]) · Spin)` outright; there is no
+    /// accumulator to drift. This field is the port's stand-in for that absolute clock: it is
+    /// seeded from `NFS_FE_CLOCK` (the same preload `LayoutScreen::clock_ms` takes, so a still
+    /// can be pinned the same way) and from there accumulates real elapsed frame time
+    /// (`draw_frame`'s `dt_ms`) the way a live session approximates the original's free-running
+    /// timer. A `--screenshot` capture never calls `draw_frame` (`resume_inner`'s own loop steps
+    /// transitions and room fades by a fixed `dt_ms`, not this clock), so with `NFS_FE_CLOCK` set
+    /// the turntable is pinned exactly, with no residual real-time noise regardless of machine
+    /// load — verified 2026-09-29 (3× under a concurrent `cargo build`, 5× under a 10-way CPU
+    /// stress loop, all byte-identical).
     ms: u64,
     /// `FEDealership3DRoom`'s slide state (`nfs_game::room::DealerRow`), while the screen's room
     /// is `ID_DEALER`
@@ -4948,7 +5061,9 @@ struct FrontEnd {
     /// list (`fn dealer_cars`), not the quick race's catalogue index.
     dealer: DealerSel,
     /// `[0x699FE0]` is `DealerCar.Car` — the showcase / compare screen was opened by
-    /// `SHOWCASE.DEALERCAR` (0x50DB20) rather than `CARCOMPARE.MERGEDCAR` (0x50DCC0)
+    /// `SHOWCASE.DEALERCAR` (a per-screen vtable-slot-54 thunk, `0x50E5C0`) rather than
+    /// `CARCOMPARE.MERGEDCAR` (`0x50DC40`) — corrected 2026-09-29, see `App::showcase_text`'s doc
+    /// comment for the registration-table trail
     compare_dealer: bool,
     /// `Tournament.RemainingTracks`' row (its accessor's own index; `TOURNREMAININC` / `DEC`)
     remaining_sel: usize,
@@ -5584,10 +5699,19 @@ impl App {
     /// **0x4FBC10**: rebuild `[0x691D04]` / `[0x691D08]` for the chronicle year and
     /// `Game.GameType` ([`nfs_game::track_list`]). The selections stay the indices they were; a
     /// read past a shorter list's end takes row 0 ([`Menu::track`], 0x4FA690).
+    ///
+    /// **Also rebuilds `cars2`** (`GenericCar2.Car`'s `[0x6919F4]`, `Menu::set_cars2`) — the
+    /// original's 0x4F3E40 is one function that rebuilds both the track lists (via its own
+    /// 0x4FBC10 call, 0x4F3EA8) and all six car lists for the same chronicle year in one pass, so
+    /// this port hook, already every one of 0x4F3E40's own triggers by proxy (`modes.md`'s
+    /// "0x4F3E40's seventeen call sites": start-up, `apply_saved_profile`, every `SETTYPE*`, race
+    /// end), is where `cars2` is kept in step too.
     fn rebuild_track_lists(&mut self) {
         let year = self.career_year();
+        let catalog = self.career.as_ref().map(|c| c.tables.catalog.clone()).unwrap_or_else(|| self.fe_car_catalog());
         if let Some(m) = self.fe.menu.as_mut().or(self.fe.menu_template.as_mut()) {
             m.set_track_lists(&self.fe.track_tables, year, self.fe.game_type);
+            m.set_cars2(&catalog, year);
         }
     }
 
@@ -5692,7 +5816,7 @@ impl App {
         let m = self.fe.menu.as_ref()?;
         // opened from the dealership, the left car is `DealerCar.Car`'s — in a career its own list
         let left = if self.fe.compare_dealer { self.dealer_car().or(m.cars.get(m.car_idx))? } else { m.cars.get(m.car_idx)? };
-        Some((left, m.cars.get(m.car2_idx)?))
+        Some((left, m.car2()?))
     }
 
     /// One bar or number of the car-compare screen. The source name is `<n>CarCompareCar<m>`:
@@ -5949,11 +6073,16 @@ impl App {
             }
             // `0x50E6B0` hands back `[0x699FE0]`, the accessor the button that opened the compare
             // screen set through 0x50E6A0: the callbacks `CARCOMPARE.*` / `SHOWCASE.*` (registered
-            // at 0x50C23F…0x50C4D3; `SHOWCASE.DEALERCAR` is 0x50DB20, `CARCOMPARE.MERGEDCAR`
-            // 0x50DCC0). The shipped layouts use only `CARCOMPARE.MERGEDCAR` (QuickRace, knockout,
-            // quickknockout) and `SHOWCASE.DEALERCAR` (dealership) — `zMergedList.Car` and
-            // `DealerCar.Car`, both the front end's selected car here — so the logo is the
-            // compare column's own left car. (Until 2026-09-25 the garage car stood in.)
+            // in a run of near-identical blocks read from raw disassembly at 0x50C257…0x50C6xx —
+            // corrected 2026-09-29: `SHOWCASE.DEALERCAR` is **not** the flat function at 0x50DB20
+            // — that address registers as `SHOWCASE.GENERICCAR` — it is a per-screen vtable-slot-54
+            // (`+0xD8`) thunk at **0x50E5C0**; `CARCOMPARE.MERGEDCAR` is **0x50DC40**, not 0x50DCC0
+            // (`CHEATALLCARS`)). The shipped layouts use only `CARCOMPARE.MERGEDCAR` (QuickRace,
+            // knockout, quickknockout) and `SHOWCASE.DEALERCAR` (dealership) — `zMergedList.Car`
+            // and `DealerCar.Car`, both the front end's selected car here — so the logo is the
+            // compare column's own left car. (Until 2026-09-25 the garage car stood in.) Also the
+            // source `Showcase.Text`/`NFS5.ShowcasePicture` read — see `showcase_text`'s own doc
+            // comment (fixed 2026-09-29, pass 10 CONFIRMED PORT DEFECT).
             Some("CarCompare1") => return self.compare_cars().map(|(a, _)| a),
             // handled by `bind_car_logos`, which loads a whole picture out of `FEData/Chron`
             Some("Chron") => return None,
@@ -6232,10 +6361,15 @@ impl App {
     }
 
     /// One `Parts.*` row per part, grouped under the category headings every one of the five
-    /// lists carries (`partCategoryString` 0x518D60, `drawPartsHeading` 0x518DE0). The left cell
-    /// is `"%s %s"` of the part's localised name and its type name — the same string the
-    /// accessors' own `slot 12` builds (0x515D3C, 0x516B7E) — and the right one is the price, or
-    /// the damage for the two damage lists.
+    /// lists carries (`partCategoryString` 0x518D60, `drawPartsHeading` 0x518DE0). The right cell
+    /// is the price, or the damage for the two damage lists. **The only live caller of this
+    /// function passes `damage_list=true`** (`Parts.UsedDamageList`, the one `base` this file's
+    /// match above does not already return early for) — and `Parts.UsedDamageList` shares its row
+    /// draw, 0x516D70, with `Parts.OwnedDamageRepairList` (`controls.md`'s `NFS5.ListBox` note,
+    /// the `Parts.*` row-draw table: both list `0x516C20`/`0x516D70`/`0x516F80`), which
+    /// `grouped()`'s doc comment traces as the one row draw with **no** `"%s %s"`/family prefix at
+    /// all. So this always passes `family_prefix = !damage_list` — `false` on `UsedDamageList`'s
+    /// live path, matching that.
     fn parts_rows(
         c: &career_ui::CareerUi,
         idx: usize,
@@ -6258,7 +6392,7 @@ impl App {
             };
             (p, right)
         });
-        parts_shop::grouped(cells, fe_strings).0
+        parts_shop::grouped(cells, fe_strings, !damage_list).0
     }
 
     /// Fill every `NFS5.ListBox` on the previewed screen from its accessor.
@@ -6545,6 +6679,8 @@ impl App {
             self.bind_repair_bars();
             self.bind_usedcars_panels();
             self.bind_garage();
+            self.bind_carsetup_gearratio();
+            self.bind_laps_selector();
             self.bind_player_buttons();
             self.bind_parts_buttons();
             self.bind_mergedlist_panel();
@@ -7150,6 +7286,80 @@ impl App {
         }
     }
 
+    /// `carsetup.lay`'s gear-ratio adjuster (`ID_GEARRATIOPANEL`, embedding `gearratio.lay`'s
+    /// eight `Gear0`…`Gear7` `−`/`+`/digit rows) is **race-class cars only**. The screen's tick,
+    /// **0x4F1AC0** (`career.md` §11.2c/§9's own citation for this function), reaches this gate
+    /// at 0x4F1B80 right after the install/uninstall button state at its head:
+    ///
+    /// ```text
+    /// 0x4F1B80  ecx = this->car                        ; [this+0x284]
+    /// 0x4F1B86  eax = 0x529FD0(ecx)                     ; the car's `nfs5.car` catalogue record
+    /// 0x4F1B8B  cmp dword ptr [eax+0x1AC], 0x1F8        ; record.class_string_id == 504
+    /// 0x4F1B95  jne 0x4F1BF3                            ; not RACE CLASS -> leave unloaded
+    /// 0x4F1B97  if [this+0x294] (cached panel) != 0: skip (already loaded)
+    /// 0x4F1BA1  push "ID_GEARRATIOPANEL"; 0x4D1A60 / 0x528B80 resolve it, dynamic_cast to
+    ///           NFS5.PANEL (0x528FE0/0x5A134B), cache at [this+0x294]
+    /// 0x4F1BE5  call [panel_vtable+0x6C]                ; panel->open() (0x4CEA90)
+    /// 0x4F1BEE  call 0x4CEC60(panel)                    ; panel->show()
+    /// ```
+    ///
+    /// `+0x1AC` is `CarCatalogEntry::class_string_id` (`nfs-formats/src/fedata.rs`'s own
+    /// confirmed offset: 501 CLASS 3, 502 CLASS 2, 503 CLASS 1, **504 RACE CLASS**). A panel with
+    /// `filename=` never draws before this open+show runs — `draw_panel`'s own comment notes
+    /// `[panel+0x14C]` stays null until then — so for every car in classes 501/502/503 (every
+    /// dealer/garage car in the shipped `nfs5.car`, 88 of 93 racing records; only the five
+    /// factory race cars — `'56 550 A Spyder`, `'78 935/78 "Moby Dick"`, `'98 911 GT1`, `'97 911
+    /// GT2`, `'98 911 GT3 Cup` — carry 504) the panel is simply never populated: `carsetup.lay`'s
+    /// eight `ID_OUTLINERECTANGLE` boxes behind it (§20…§27) are all that ever draws for
+    /// "ПЕРЕДАТОЧНЫЕ ЧИСЛА" — a bare box, no `−`/`+`, no digit — exactly `cmp_carsetup.jpg`'s
+    /// original side for the reference `'50 356 1100 Cabriolet` (class 501). The port always
+    /// loaded and drew `gearratio.lay`'s content regardless of the car's class, so a 356's stock
+    /// gearbox showed a live `0.00` slider on every row where the original leaves the row bare.
+    /// `carsetup.lay` in fact carries **two** `ID_GEARRATIOPANEL`s (§19 `state=normal` 70×110,
+    /// §77 `state=hidden` 244×110) — the port's generic `state=hidden` handling already
+    /// suppresses §77 on its own; this gate is what was missing for §19.
+    fn bind_carsetup_gearratio(&mut self) {
+        if self.fe.layout_name.as_deref() != Some("carsetup") {
+            return;
+        }
+        let race_class = self.garage_car().is_some_and(|(e, _)| e.class_string_id == 504);
+        let Some(l) = self.fe.layout_preview.as_mut() else { return };
+        for (index, _) in l.widgets_named(&["ID_GEARRATIOPANEL"]) {
+            l.set_hidden_flag(index, !race_class);
+        }
+    }
+
+    /// `location.lay`/`locationsetup.lay`'s `круги` row, `ID_LAPSSELECTOR`, is **disabled** on a
+    /// point-to-point track (there is no lap count to choose — `fe_laps` already forces `NUM_LAPS`
+    /// to 1 for one). The shared screen-refresh helper **0x50CC30** (also `carsetup.lay`'s own
+    /// tick, 0x4F1AC0, calls it — 12 direct callers in all) ends:
+    ///
+    /// ```text
+    /// 0x50cd45  edi = Game.GameType's own current selection (0 single race, 2 knockout, …)
+    /// 0x50ce36  cmp edi, 2 ; jne 0x50ce64            ; not Knockout — idx stays 0 (xor eax,eax)
+    /// 0x50ce3b  …          idx = Knockout.TrackNumber's current selection (Knockout only)
+    /// 0x50ce64  push eax(idx) ; push edi(mode) ; call 0x4FBF70   ; Mode_isCircuit(mode, idx)
+    /// 0x50ce7b  push 0x5dc3c8("ID_LAPSSELECTOR") ; call 0x50D880(name, circuit, 0)  ; the same
+    ///           enable/disable setter `bind_garage`/`bind_usedcars_panels` already call
+    /// ```
+    ///
+    /// `Mode_isCircuit(mode, idx)` reads `Track1` for mode 0 (`location.lay`'s own row) and
+    /// `Track<idx+1>` for mode 2 (`locationsetup.lay`'s currently highlighted round) — modes 1/3
+    /// never reach here with the widget present (`locationQK.lay` carries no `ID_LAPSSELECTOR` at
+    /// all, confirmed live on both sides, pass 10). Ported keyed on the same `game_type`/`ko_sel`
+    /// rows `fe_laps`/`accessors.rs`'s `Knockout.TrackNumber(nTRACKLAPS)` arm already use for
+    /// `NUM_LAPS` and the round table's own laps cell.
+    fn bind_laps_selector(&mut self) {
+        let Some(l) = self.fe.layout_preview.as_ref() else { return };
+        let Some((index, _)) = l.widgets_named(&["ID_LAPSSELECTOR"]).into_iter().next() else { return };
+        let Some(m) = self.fe.menu.as_ref() else { return };
+        let idx = if self.fe.game_type == 2 { m.ko_sel } else { 0 };
+        let track = m.ko_track(idx).to_string();
+        let circuit = self.records.track(&track).is_some_and(|t| t.circuit);
+        let Some(l) = self.fe.layout_preview.as_mut() else { return };
+        l.set_disabled_flag(index, !circuit);
+    }
+
     /// `repair.lay`'s ten damage bars are **hidden** when their category has nothing in it.
     ///
     /// 0x50F4AD…0x50F609 is ten copies of one block:
@@ -7217,6 +7427,9 @@ impl App {
         const PACKS: [&str; 5] = ["iconsrace", "icons911", "icons356", "icons924", "icons914"];
         let pack = format!("{}.fsh", PACKS[self.fe.chronicle_group.min(4)]);
         let entries = self.chronicle_entries();
+        // the caption above the `фото` row, one per column — computed before the mutable borrow
+        // below, like `cols`/`entries` (§4.173)
+        let captions = self.chronicle_captions();
         let mut cells: std::collections::BTreeMap<(usize, usize), (usize, usize)> = Default::default();
         for (col, (year, var)) in cols.iter().enumerate() {
             for row in 0..2 {
@@ -7234,6 +7447,7 @@ impl App {
         if let Some(l) = self.fe.layout_preview.as_mut() {
             l.set_chronicle_icons(pack, cells);
             l.set_chronicle_columns(cols);
+            l.set_chronicle_captions(captions);
         }
         let group = self.fe.chronicle_group;
         if let Some(l) = self.fe.layout_preview.as_mut() {
@@ -7314,6 +7528,41 @@ impl App {
         }
         out.sort();
         out
+    }
+
+    /// One caption per timeline column — the `фото`-row (kind 0) entry's own name, the FSH pack's
+    /// `0x6F` text attachment (`nfs_formats::fsh::Fsh::entry_caption`) — always the **resting**
+    /// frame's, `[0]` of `chronicle_entries`' pair: 0x507340's fourth argument, `hot`, is a
+    /// hardcoded literal `0` at the caption's own call site (0x507C3B), never the hovered frame,
+    /// `[1]`.
+    ///
+    /// **A dead special case, read and not ported.** The disassembly (0x507C51…0x507C66) compares
+    /// that name against the exact literal `"356 Roadster No1"` (mixed case, `strcmp` 0x5AE3C0 —
+    /// case-sensitive) and, on a match, draws a small badge icon (`"356R"` of `weeicons.fsh`) in
+    /// place of the text instead. Because the lookup's `hot` is always `0`, this can only ever see
+    /// a **resting**-frame name, and every shipped resting-frame name is upper-case
+    /// (`"356 ROADSTER NO1"`, `"356"`, `"356A"`, `"356B"`, `"COUPE"`, `"CABRIO"`, …, confirmed by
+    /// reading every text attachment of all five `FEData/Chron/icons*.fsh` packs) — the mixed-case
+    /// literal is only the *hover*-frame name of `icons356.fsh`'s 1948 entry, which this lookup
+    /// never reaches. So the badge branch cannot fire for any shipped pack; §4.173.
+    fn chronicle_captions(&self) -> Vec<Option<String>> {
+        const PACKS: [&str; 5] = ["iconsrace", "icons911", "icons356", "icons924", "icons914"];
+        let cols = self.chronicle_columns();
+        let dir = self.paths.fe_data().join("Chron");
+        let Some(path) = GamePaths::find_file(&dir, &format!("{}.fsh", PACKS[self.fe.chronicle_group.min(4)])) else {
+            return vec![None; cols.len()];
+        };
+        let Some(data) = std::fs::read(&path).ok() else { return vec![None; cols.len()] };
+        let Some(pack) = nfs_formats::fsh::Fsh::parse(&data).ok() else { return vec![None; cols.len()] };
+        let entries = self.chronicle_entries();
+        cols.iter()
+            .map(|(year, variant)| {
+                entries
+                    .iter()
+                    .find(|(y, k, v, _)| y == year && *k == 0 && v == variant)
+                    .and_then(|(_, _, _, f)| pack.entry_caption(&data, f[0]))
+            })
+            .collect()
     }
 
     /// `Chronicle.Year` on the chronicle screen. The accessor is a range one of its own (0x508A24:
@@ -7481,6 +7730,34 @@ impl App {
     /// record's +0xE3 string (86 of the 87 racing records name a pack that is on disk). The match
     /// is exact: `general.lay` and `glancestats.lay` give `number` 0…7, and each widget's `size`
     /// is entry `number`'s own width and height. CONFIRMED.
+    ///
+    /// **Which car, fixed 2026-09-29 (pass 10 CONFIRMED PORT DEFECT, same root cause as
+    /// [`App::showcase_text`]).** `0x508B70` — the routine every `SHOWCASE.*`-family click handler
+    /// calls in the same breath as the `[0x699FE0]` setter `fn compare_cars`/`CarCompare1` already
+    /// reads (`0x50E6A0`) — builds this same `<car+0xE3>.fsh` pack path (falling back to
+    /// `993tCo96.fsh` if the car's own pack is missing on disk, `0x59DC30`) for the **same** car
+    /// `Showcase.Text`'s own `.loc` load uses. So the pack is the compare-column car's, not
+    /// `zMergedList.Car` unconditionally — see `showcase_text`'s own doc comment for the address
+    /// trail (`0x508B70`/`0x50E5C0`/`0x50DC40`).
+    ///
+    /// **`glancestats.lay`'s empty photo box, fixed 2026-09-29.** Not a data
+    /// or car-routing bug: `356-14.fsh`'s eight entries all decode (dumped with `asset-inspector`
+    /// — `356-14_000_Laye.png`…`356-14_007_Laye.png` are all valid photo quadrants). The bug is
+    /// that this function was never called again after the widget existed. `showcase.lay` embeds
+    /// a `NFS5.RADIOGROUP` (`showcasetabs.lay`) and four `NFS5.PANEL`s (`ID_general_panel`
+    /// `filename=general`, `ID_glancestats_panel` `filename=glancestats`, plus `chassis`/
+    /// `performance`); only `showcasetabs.lay`'s `ID_general_button` ships `state=selected`
+    /// (§7), so `LayoutScreen::load_children` (this file's own doc on it) loads only
+    /// `general.lay`'s group up front — `general.lay`'s `NFS5.ShowcasePicture`s (`number` 4…7)
+    /// get their `set_pack_picture` from the screen-open call below (`fe_bind_screen`).
+    /// `glancestats.lay`'s group (`number` 0…3) is loaded lazily, by `LayoutScreen::set_panel`,
+    /// the first time `ID_glancestats_button` is clicked (`tab_click`) — and the click handler
+    /// re-ran `bind_player_pictures` for exactly this reason (a panel reached only by a tab
+    /// switch needs its picture-from-code widgets re-bound) but not this function, so
+    /// `glancestats`' widgets never got a `set_pack_picture` call at all. Added the call beside
+    /// `bind_player_pictures` at both re-bind sites — the real `NFS5.TABBUTTON`/
+    /// `NFS5.GRAPHICTABBUTTON` click handler and the `NFS_FE_TAB` screenshot diagnostic that
+    /// mirrors it.
     fn bind_showcase_pictures(&mut self) {
         // `NFS5.CAMERAPICTURE`'s `shp` part is in no state list, so nothing preloads it (§4.129)
         let cams: Vec<i64> = self
@@ -7510,7 +7787,7 @@ impl App {
             return;
         }
         let pack = self
-            .logo_car(Some("zMergedList.Car"), None)
+            .logo_car(Some("CarCompare1"), None)
             .map(|c| format!("{}.fsh", c.showcase))
             .unwrap_or_default();
         let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) else { return };
@@ -8130,6 +8407,32 @@ impl App {
     /// 0-tick row this session's *previous* race entered now reads back correctly as `"n/a"` /
     /// `59:59.99` on this entry too, exactly as 0x4FAE20 would leave it. *(Corrected
     /// 2026-09-27: `Records::load` at start-up only, §7a's recorded gap.)*
+    /// The player's short car label for a result record — `nfs5.car +0x34`'s **family** string
+    /// (e.g. `911 Turbo`, `911 S`, `944`), not `CarSpecs::name` (the `.sim` file's own descriptive
+    /// name, e.g. `1994 993 cabrio 3`). Traced 2026-09-29 (`modes.md` §6.3/§7.1, dated paragraph):
+    /// at sim shutdown (0x4B68F0) `car+0xBB8` is `strcpy`'d from the FE car/race-slot record's
+    /// `spec+0x534` (`[car+0x558]+0x534`, `spec+0x17C` next to it being the *driver* name), then
+    /// bulk-copied (0x4B69BC…0x4B69E6, 0x96 dwords from `car+0xAD4`) into the per-racer result
+    /// record `0x5E75A0 + i·0x258`, whose own `+0xE4` is that same string (modes.md §7.1's record
+    /// layout). Both consumers read that `+0xE4` slot, not `spec+0x17C`/`CarSpecs::name`:
+    /// `HTrackRecords::insertPlayer` 0x433A20 (the results board's `Рекорд круга`/Lap Record АВТО
+    /// cell) and the persistent `nfs5.trk` "car" field (`Race_finalize`'s 0x4EDF00 →
+    /// `Records_insert` 0x4FAFC0/0x4FB100, pushing the fixed global `0x5E7684` = `0x5E75A0+0xE4`,
+    /// slot 0 = player — confirmed algebraically and by `bscan.py 0x5E7644 0x5E7684` finding both
+    /// only at that one call site). `HRaceSummary`'s CAR column (0x42C368…0x42C3BA) reads the same
+    /// `spec+0x534` directly, capped to 15 chars — independent corroboration that it is a short
+    /// field, not the full name. The shipped ghost rows in `nfs5.trk`/`records.json` are already
+    /// this short form (byte-identical to the original, pass 9); only the player's own row used
+    /// `CarSpecs::name` until this fix.
+    fn player_car_family(&self) -> String {
+        let family = |t: &nfs_game::career::CareerTables| t.car(self.car_id).map(|c| c.family.clone());
+        match self.career.as_ref() {
+            Some(c) => family(&c.tables),
+            None => nfs_game::career::CareerTables::load(&self.paths).ok().and_then(|t| family(&t)),
+        }
+        .unwrap_or_else(|| self.specs.name.clone())
+    }
+
     fn file_track_record(&mut self) {
         self.records = Records::load(&self.paths, &self.records_path);
         tracing::debug!(path = %self.records_path.display(), "track records reloaded (0x4FAE20, before this race's own filing)");
@@ -8139,7 +8442,7 @@ impl App {
         let Some(me) = self.results.as_ref().and_then(|r| r.racers.first()) else { return };
         let circuit = self.records.track(&self.track.name).map(|t| t.circuit).unwrap_or(false);
         let time = if circuit { me.best_lap } else { me.time } as u32;
-        let (driver, car_name) = (self.player_name.clone(), self.specs.name.clone());
+        let (driver, car_name) = (self.player_name.clone(), self.player_car_family());
         if let Some(rank) = self.records.insert(&self.track.name, &driver, &car_name, time) {
             tracing::info!(rank, time = format_ticks(time as u64), circuit, "track record entered (0x4EDF00)");
             if let Err(e) = self.records.save(&self.records_path) {
@@ -12445,8 +12748,8 @@ impl App {
             let now = self.fe.ms;
             if self.fe.victory_movie.is_none()
                 && let Some(path) = nfs_assets::GamePaths::find_file(&self.paths.fe_data().join("Movies"), nfs_game::room::VICTORY_MOVIE)
-                && let (Ok(exe), Ok(data)) = (std::fs::read(self.paths.root.join("nfs5.exe")), std::fs::read(&path))
-                && let Ok(tables) = nfs_formats::mad::MadTables::from_exe(&exe)
+                && let Ok(data) = std::fs::read(&path)
+                && let Ok(tables) = nfs_formats::mad::MadTables::load(&self.paths.root)
                 && let Some(m) = nfs_game::room::VictoryMovie::open(tables, data)
             {
                 tracing::debug!(w = m.width, h = m.height, "victory room movie opened");
@@ -14404,12 +14707,17 @@ impl App {
                 // (0x42C41C), the BEST LAP cell prints whatever `+0xCFC` holds (0x42C410) —
                 // `Race_finalize` 0x416AC0 made it 0 for a player with no lap, 99999 for an
                 // opponent with none
+                // the CAR cell is `spec+0x534` — the car's `nfs5.car +0x34` family — capped to
+                // 15 characters (0x42C368…0x42C3BA: `lea edx,[eax+0x534]`, `cmp ecx,0xf`),
+                // `modes.md` §7.1; not `CarSpecs::name`
+                let family_cell = |s: &str| s.chars().take(15).collect::<String>();
                 let row = |d: usize| -> SummaryRow {
                     let (name, car, colour) = if d == 0 {
-                        (self.player_name.clone(), self.specs.name.clone(), paint(self.paint))
+                        (self.player_name.clone(), family_cell(&self.player_car_family()), paint(self.paint))
                     } else {
                         let o = &self.road.opponents[d - 1];
-                        (o.name.clone(), o.specs.name.clone(), paint(self.road.opponent_paints.get(d - 1).copied().unwrap_or([0x20, 0x40, 0xC0])))
+                        let fam = self.road.opponent_families.get(d - 1).cloned().unwrap_or_else(|| o.specs.name.clone());
+                        (o.name.clone(), family_cell(&fam), paint(self.road.opponent_paints.get(d - 1).copied().unwrap_or([0x20, 0x40, 0xC0])))
                     };
                     let rec = res.racers.get(d).cloned().unwrap_or_default();
                     SummaryRow { name, car, colour, best: Some(rec.best_lap), total: (rec.time != 0).then_some(rec.time) }
@@ -14633,6 +14941,18 @@ impl App {
                     // `SPLITTIMES [0x657DD8]` is the `Display.SplitTimes` choice (0 off, which
                     // the gate below already returned on); this port had it start at 1 and cycled
                     // it on its own T key, which the original has no binding for
+                    //
+                    // **Reference comparison, not a bug (2026-09-29, `hud.md`'s
+                    // HMultiTime entry):** the reference capture showed `59:59.99` here before the
+                    // first lap, against this port's `00:00.00` / "лучший". `fe.txt` ships
+                    // `splittimes=2` (the default, matching this port and this arm), and the
+                    // zero-lap short-circuit above is real (0x42A299…0x42A2A8) — `0x42A2B4`'s
+                    // `esi = 0x57E3F` (= 359999, the `NO_RECORD_TIME` "n/a" sentinel) is only the
+                    // min-loop's seed and is never reached before the zero test. `monaco3`'s own
+                    // `nfs5.trk` row is not empty (a real 5870-tick record), so the sentinel cannot
+                    // legitimately show here for this track under the shipped default; the capture
+                    // most likely reflects a different `SplitTimes` choice or stale session state in
+                    // that one wine run, not a difference in this port's zero/sentinel handling.
                     match split_times {
                         2 => Some((23, laps.iter().copied().min().unwrap_or(0))),
                         3 => Some((24, laps.last().copied().unwrap_or(0))),
@@ -16837,6 +17157,7 @@ impl App {
                     looped: m.looped.clone(),
                     tracks_year: m.tracks_year,
                     cars: m.cars.clone(),
+                    cars2: m.cars2.clone(),
                     track_idx: m.track_idx,
                     car_idx: m.car_idx,
                     car_garage: m.car_garage,
@@ -16893,6 +17214,7 @@ impl App {
                     looped: m.looped.clone(),
                     tracks_year: m.tracks_year,
                     cars: m.cars.clone(),
+                    cars2: m.cars2.clone(),
                     track_idx: m.track_idx,
                     car_idx: m.car_idx,
                     car_garage: m.car_garage,
@@ -16979,6 +17301,7 @@ impl App {
                     looped: m.looped.clone(),
                     tracks_year: m.tracks_year,
                     cars: m.cars.clone(),
+                    cars2: m.cars2.clone(),
                     track_idx: m.track_idx,
                     car_idx: m.car_idx,
                     car_garage: m.car_garage,
@@ -17385,8 +17708,10 @@ impl App {
                 if let Some((acc, delta)) = arrow {
                     self.fe.track_turn_back = delta < 0;
                     self.set_accessor(acc, delta);
-                    self.bind_lists();
-                    self.bind_car_logos();
+                    // was a hand-picked `bind_lists`+`bind_car_logos` pair; every other
+                    // `set_accessor` site runs the full `bind_after_accessor()` (the
+                    // audit of the `NFS5.CARSETTINGBUTTON` gap)
+                    self.bind_after_accessor();
                     return;
                 }
                 // the garage's `SELLCAR` (0x50FCB0): fewer than two cars left once the listed ones
@@ -17442,8 +17767,9 @@ impl App {
                     && let Some(cb @ ("DEALERCARDEC" | "DEALERCARINC")) = c.callback.as_deref()
                 {
                     self.set_accessor("DealerCar.Car", if cb == "DEALERCARDEC" { -1 } else { 1 });
-                    self.bind_car_logos();
-                    self.bind_indicator_bars();
+                    // was a hand-picked `bind_car_logos`+`bind_indicator_bars` pair; same fix as
+                    // the track arrows above and `NFS5.CARSETTINGBUTTON`
+                    self.bind_after_accessor();
                     return;
                 }
                 if on_dealer && c.callback.as_deref() == Some("BUYCAR") {
@@ -18111,6 +18437,10 @@ impl App {
         // the garage screen's tick re-decides its buttons every frame (0x50F970), and the player
         // screens' tick theirs (0x510210)
         self.bind_garage();
+        // carsetup's own tick, 0x4F1AC0, re-decides the gear-ratio panel every frame too
+        self.bind_carsetup_gearratio();
+        // the same 0x50CC30 helper decides `ID_LAPSSELECTOR`'s disabled state every frame too
+        self.bind_laps_selector();
         self.bind_player_buttons();
         // and the bottom bar's tick (0x4D8250) with its refresh (0x4D81C0) — the button states
         self.bind_bottom_bar();
@@ -18224,7 +18554,10 @@ impl App {
                 l.scroll_list(index, delta * steps as i32);
             }
         }
-        // and so does a held car-setting arrow, off the very same timer (0x4C1F55, 0x4C1F80)
+        // and so does a held car-setting arrow, off the very same timer (0x4C1F55, 0x4C1F80).
+        // Same fix as the press (above): re-bind the full
+        // `bind_after_accessor()` set, not a hand-picked subset of it — this used to be an even
+        // smaller four than the press's six, so a held arrow refreshed even less than a tap did.
         if let Some((name, step, acc)) = self.fe.setting_repeat.take() {
             let acc = acc + dt_ms;
             let steps = acc / SCROLL_REPEAT_MS;
@@ -18233,10 +18566,7 @@ impl App {
                 self.set_accessor(&name, step);
             }
             if steps > 0 {
-                self.bind_car_logos();
-                self.bind_indicator_bars();
-                self.bind_lists();
-                self.bind_checks();
+                self.bind_after_accessor();
             }
         }
         // and the movies on it, which need the renderer to put each frame in its texture
@@ -18990,7 +19320,7 @@ impl App {
                 m.paint_custom = None;
             }
             // the compare screen's own combo box moves only the right-hand car
-            "GenericCar2.Car" => m.car2_idx = step(m.car2_idx, m.cars.len()),
+            "GenericCar2.Car" => m.car2_idx = step(m.car2_idx, m.cars2.len()),
             // two accessors, two ranges (0x4E5539 and 0x4E556C): 0…7 for the race, **1**…7 for
             // the knockout table, both starting at 4
             // 0x4BC240 clamps the new index to `count - 1` and then to 0, so the two rows wrap
@@ -19184,6 +19514,31 @@ impl App {
                 .ok(),
             false => None,
         };
+        self.bind_screen_widgets();
+    }
+
+    /// Every widget's content that comes from code, not the `.lay` file alone — pictures, lists,
+    /// bars/knobs, panels, checks, maps. A screen open runs it (`fe_bind_screen`, above); so must
+    /// a tab click that loads an `NFS5.PANEL` for the first time (`tab_click`'s two call sites —
+    /// the real `NFS5.TABBUTTON`/`NFS5.GRAPHICTABBUTTON` handler and the `NFS_FE_TAB` screenshot
+    /// diagnostic that mirrors it): `set_panel`'s load (0x4CEA90) and show (0x4CEC60) are not
+    /// gated on which tab was already open, so the original re-evaluates a newly-shown panel's
+    /// widgets the same way it does a freshly opened screen's (`layout.rs`'s `tab_click` doc,
+    /// `career.md` §11.2c). One central hook here, not a hand-picked pair per call site — the
+    /// glancestats miss (2026-09-29: `bind_showcase_pictures` was
+    /// missing beside `bind_player_pictures`) showed a hand-picked pair only ever catches the one
+    /// widget class someone happened to look for. Auditing the other RADIOGROUP+PANEL screens
+    /// (`Controllers.lay`'s six panels, `Options.lay`'s five, `graphics.lay`'s two) this pass
+    /// found the same gap for `NFS5.GouraudIndicatorBar` (`bind_indicator_bars`, set by
+    /// `set_bar`/`set_knob` from an accessor — `forcefeedback.lay`'s meter, `advgraphics.lay`'s,
+    /// `gamectrl.lay`'s `NFS5.CarSettingSlider` knob) which neither call site ever re-ran, so it
+    /// stayed at whatever it last held (typically nothing, the widget's own default) until some
+    /// unrelated accessor change elsewhere ran `bind_after_accessor`. `NFS5.AccessorWatch` and
+    /// `NFS5.CAMERASELECT`/`NFS5.CAMERAPICTURE`'s own live state are not in this set — they read
+    /// their accessor at **draw** time (`layout/widgets.rs`'s `AccessorWatch` case, `layout.rs`'s
+    /// `camera_select_of`), so a newly-loaded panel already shows them correctly with no bind at
+    /// all, same as the original's per-tick `FEAccessorWatch::tick` (0x4BD230) needing no gate.
+    fn bind_screen_widgets(&mut self) {
         self.bind_car_logos();
         self.bind_lists();
         self.bind_checks();
@@ -19193,6 +19548,8 @@ impl App {
         self.bind_repair_bars();
         self.bind_usedcars_panels();
         self.bind_garage();
+        self.bind_carsetup_gearratio();
+        self.bind_laps_selector();
         self.bind_player_buttons();
         self.bind_parts_buttons();
         self.bind_mergedlist_panel();
@@ -20275,8 +20632,21 @@ impl App {
                 let attrs = Window::default_attributes()
                     .with_title("Porsche Unleashed (native)")
                     .with_inner_size(winit::dpi::LogicalSize::new(1280, 800))
-                    // a scripted run's window is shown but never made the key window (see `main`)
-                    .with_active(!scripted);
+                    // a scripted run's window is never made the key window (see `main`)...
+                    .with_active(!scripted)
+                    // ...and, tooling only (not a game rule): never shown on screen at all. The
+                    // window still exists and keeps its real 1280x800 inner size (the goldens
+                    // depend on that resolution), so `Renderer::new` still creates a real Metal
+                    // surface of the same size and every draw still presents to it exactly as
+                    // before — an invisible NSWindow's CAMetalLayer still takes drawables and
+                    // presents, it is just never composited to the display. `--screenshot`
+                    // doesn't even read that surface: it renders into its own offscreen texture
+                    // (`render_to_image`, `gpu.rs`), fully decoupled from what the window shows.
+                    // `--record`'s CSV comes from simulation state, not pixels. So hiding the
+                    // window changes nothing any golden or CSV can see; it only stops a scripted
+                    // run's window from popping up in front of the user (a report of
+                    // 2026-09-29: the `NFS_PLAY_INTRO=1` walk left one up ~10s).
+                    .with_visible(!scripted);
                 let window = Arc::new(event_loop.create_window(attrs).expect("window"));
                 let renderer = Renderer::new(window.clone()).expect("renderer");
                 (window, renderer)
@@ -20286,10 +20656,12 @@ impl App {
         // end): `NOINTROMOVIES` `[0x65743C]` — `fe.txt`'s `nointromovies`, 0 in the shipped file —
         // is the original's own skip, and it skips the loading mosaic with them. A scripted run
         // (`--autotest`, `--screenshot`, `--layout-sweep`, `--record`, `NFS_NO_FOCUS`) never plays
-        // them, nor does the port's text menu, which has no front end to enter.
+        // them, nor does the port's text menu, which has no front end to enter — unless
+        // `NFS_PLAY_INTRO=1` asks to keep them anyway, so a scripted check can walk the intro →
+        // front-end handoff a real interactive launch takes (`PLAY_INTRO`).
         // `RE/notes/mad.md` §12.
         if !played
-            && !scripted
+            && (!scripted || PLAY_INTRO.load(std::sync::atomic::Ordering::Relaxed))
             && self.fe.menu.is_some()
             && self.fe.layout_name.is_some()
             && !self.registry.bool("nointromovies", false)
@@ -20345,6 +20717,31 @@ impl App {
                         // the entry screen on the fresh manager's one layer, recorded
                         // (0x4D4035: `0x4D5DF0(vec[0], E, 1)`) — so BACK starts disabled
                         self.fe.nav = nfs_game::layout::nav::Nav::with_screen(&name);
+                        // **`selectname` is never its own base layer in the original — it is
+                        // always `gamesetup` (the entry screen) with `selectname` pushed as a
+                        // *second* layer over it** (`0x4D3E1D`: "the entry screen recorded, then
+                        // `selectname` on a second layer", the same shape `fe_select_name`
+                        // (`main.rs:8452`) gives a real "no loadable profile" entry or
+                        // `--fe=gamesetup`'s own start-up path). A bare `--fe=selectname` used to
+                        // start with *nothing* under it, so `CREATEPLAYERDONE`'s `0x4D23F0(−1)`
+                        // (`fe_back(-1, …)`, already correct — `Nav::back`'s own test proves an
+                        // emptied layer reveals the one under it) had no layer to reveal and
+                        // closed the front end instead — the only thing keeping a scripted
+                        // `NFS_FE_KEYS=cb:CREATEPLAYERENTER,type:UserList.NameInput=…,
+                        // cb:CREATEPLAYERDONE` run from chaining a further key onto the profile it
+                        // just made. Loading `gamesetup` underneath and re-opening `selectname` as
+                        // its own layer over it, the one shape `selectname` can ever have, fixes
+                        // the scripted path without touching the manager itself.
+                        if name.eq_ignore_ascii_case("selectname")
+                            && let Ok(mut under) = nfs_game::layout::LayoutScreen::load(&mut renderer, &self.paths, FE_ENTRY)
+                        {
+                            under.cheat_bits = self.cheat_bits;
+                            under.set_covered(true);
+                            under.set_cursor(None);
+                            self.fe.layout_under.push((FE_ENTRY.to_string(), under));
+                            self.fe.nav = nfs_game::layout::nav::Nav::with_screen(FE_ENTRY);
+                            self.fe.nav.open("selectname", 1, true);
+                        }
                         // the same as `open_layout`: the device list before the first draw
                         let (pads, dz) = (self.fe_pads(), Self::fe_deadzone());
                         if let Some(l) = self.fe.layout_preview.as_mut() {
@@ -20383,6 +20780,8 @@ impl App {
             self.bind_repair_bars();
             self.bind_usedcars_panels();
             self.bind_garage();
+            self.bind_carsetup_gearratio();
+            self.bind_laps_selector();
             self.bind_player_buttons();
             self.bind_parts_buttons();
             self.bind_mergedlist_panel();
@@ -20490,7 +20889,11 @@ impl App {
                         self.set_accessor(name.trim(), d);
                     }
                 }
-                self.bind_lists();
+                // was `bind_lists()` alone; a combo slider's own arrows run the full
+                // `bind_after_accessor()` (this diagnostic's own doc comment above says it steps
+                // "as a combo slider's arrows do") — same audit as the CARSETTINGBUTTON/track-
+                // arrow/dealer-arrow fixes
+                self.bind_after_accessor();
             }
             // diagnostic: `NFS_FE_PLAYGAME=<Game.GameType>` sets the type and presses `PLAYGAME` on
             // start-up — with `--autotest N` the race runs headless and the log shows where the
@@ -20627,10 +21030,16 @@ impl App {
                             break;
                         }
                     }
-                    // diagnostic: `NFS_FE_TAB=<widget name>:<n>` clicks that tab button once the
-                    // screen has settled and takes the still n frames later
-                    if let Some((name, n)) = std::env::var("NFS_FE_TAB").ok().and_then(|v| v.split_once(':').map(|(a, b)| (a.to_string(), b.parse::<usize>().unwrap_or(0))))
-                        && let Some(hit) = l.flat_index_of(&name)
+                    // diagnostic: `NFS_FE_TAB=<widget name>[@nth]:<n>` clicks that tab button
+                    // once the screen has settled and takes the still n frames later. `@nth`
+                    // (0-based) picks which widget of that name when a tab strip reuses one name
+                    // for every button (`controllertabs.lay`, `graphicstabs.lay` — see
+                    // `flat_index_of`); omitted, it is the first (`@0`), which is enough for the
+                    // strips that name each button uniquely (`showcasetabs.lay`,
+                    // `optiontabs.lay`).
+                    if let Some((spec, n)) = std::env::var("NFS_FE_TAB").ok().and_then(|v| v.split_once(':').map(|(a, b)| (a.to_string(), b.parse::<usize>().unwrap_or(0))))
+                        && let (name, nth) = spec.split_once('@').map_or((spec.as_str(), 0), |(a, b)| (a, b.parse::<usize>().unwrap_or(0)))
+                        && let Some(hit) = l.flat_index_of(name, nth)
                     {
                         l.tab_click(r, &self.paths, hit);
                         tab_clicked = true;
@@ -20644,10 +21053,13 @@ impl App {
                     self.fe_room_tick(16);
                 }
                 // same re-bind `tab_click`'s real-click handler does above — the diagnostic path
-                // loads a new panel too, and a picture-from-code widget in it (the HUD preview
-                // among them) needs `bind_player_pictures` run again now that the panel exists
+                // loads a new panel too, and every picture-from-code / accessor-bound widget
+                // class that can sit in one (the HUD preview, `showcase.lay`'s
+                // `glancestats`/`chassis`/`performance` panels' own `NFS5.ShowcasePicture`s, a
+                // `Controllers.lay`/`graphics.lay` panel's `NFS5.GouraudIndicatorBar`…) needs
+                // `bind_screen_widgets()` run again now that the panel exists
                 if tab_clicked {
-                    self.bind_player_pictures();
+                    self.bind_screen_widgets();
                 }
                 // and a room that is still changing — the last screen's going out, then this one's
                 // coming in (`fe_room_tick`) — is let settle too, the screen's clock running with it
@@ -20930,7 +21342,7 @@ impl App {
             && let Some(t) = self.records.track(&self.track.name)
         {
             let circuit = t.circuit;
-            self.hud_records = Some(nfs_game::records::hud_records(&t.entries, !circuit, &self.player_name, &self.specs.name, total, best));
+            self.hud_records = Some(nfs_game::records::hud_records(&t.entries, !circuit, &self.player_name, &self.player_car_family(), total, best));
             self.records_spoken = false;
         }
         // `HCongrats` heads the queue for game types 0…4 that draw it; the finales, the mission and
@@ -21422,6 +21834,7 @@ impl App {
                 self.road.opponent_models.clear();
                 self.road.opponent_sets.clear();
                 self.road.opponent_paints.clear();
+                self.road.opponent_families.clear();
                 // `specs.rs:49`: an opponent's installed-part list is its stock parts (0x4EE9A0,
                 // `FECar::init`, unconditional) unless a career opponent brings its own
                 let parts_table = self.fe_parts_table();
@@ -21578,6 +21991,7 @@ impl App {
                     };
                     self.road.opponent_sets.push(entry.sound_set.clone());
                     self.road.opponent_paints.push(paint.exterior);
+                    self.road.opponent_families.push(entry.family.clone());
                     self.road.opponents.push(RaceCar {
                         name: name.clone(),
                         vehicle,
@@ -22718,10 +23132,21 @@ impl App {
                 run.button(i, state == ElementState::Pressed);
             }
             WindowEvent::RedrawRequested => {
+                // `NFS_PLAY_INTRO` on a scripted run: hold Esc down the way an impatient player
+                // would, through the same key path (`run.key`), so the walk reaches the front end
+                // without sitting through the whole movie.
+                if NO_FOCUS.load(std::sync::atomic::Ordering::Relaxed) && PLAY_INTRO.load(std::sync::atomic::Ordering::Relaxed) {
+                    run.key(true);
+                }
                 if run.frame(self.snd.audio.as_ref(), &self.camera) {
                     let run = self.intro.take().expect("intro");
                     self.intro_done = Some((run.window, run.renderer));
                     self.resume_inner(event_loop);
+                    // the window outlives the movies, so winit sends no first redraw of its own
+                    // for the front end — without this request the loading still stays forever
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
                 }
             }
             _ => {}
@@ -22731,7 +23156,12 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
+        // `self.window` stays `None` for as long as the intro plays (`resume_inner`'s intro branch
+        // returns before setting it) — a second `resumed` (winit's own contract allows more than
+        // one on a suspend/resume platform) during the movies would otherwise fall through to
+        // `resume_inner`'s `None` arm and build a second window under the first's nose. Tooling
+        // hardening only, not a game rule: the original has no such lifecycle to diverge from.
+        if self.window.is_some() || self.intro.is_some() {
             return;
         }
         self.resume_inner(event_loop);
@@ -23561,14 +23991,30 @@ impl ApplicationHandler for App {
                             }
                             // `set_panel` (0x4CEA90, called from `tab_click`) loads the new panel's
                             // widgets — `display.lay`'s `NFS5.HUD` among them, one of `Options`'s
-                            // five tab panels — after `bind_player_pictures` already ran once
-                            // for the screen the tab strip opened on, so a picture-from-code widget
-                            // in a panel reached only by a tab switch (the HUD preview, a player
-                            // picture/badge/factory face on some other panel) never got its
-                            // `set_pack_picture`/`set_movie` call. Re-bind now that the panel exists,
-                            // the same way `SHOWPLAYLISTPANEL`/`HIDEPLAYLISTPANEL` re-bind their
-                            // lists after `set_panel` above.
-                            self.bind_player_pictures();
+                            // five tab panels — after the screen's own open-time bind already ran
+                            // once, so a widget in a panel reached only by a tab switch never got
+                            // its content. Re-bind now that the panel exists, the same way
+                            // `SHOWPLAYLISTPANEL`/`HIDEPLAYLISTPANEL` re-bind their lists after
+                            // `set_panel` above.
+                            //
+                            // Audited every shipped RADIOGROUP+PANEL screen for the same shape of
+                            // gap (2026-09-29): `showcase.lay`'s four
+                            // panels (`ID_general_panel`/`ID_glancestats_panel`/`ID_chassis_panel`/
+                            // `ID_performance_panel`) were the first found, fixed with a
+                            // `bind_player_pictures`+`bind_showcase_pictures` pair; that pair missed
+                            // `Controllers.lay`'s `forcefeedback`/`gamectrl` panels and
+                            // `graphics.lay`'s `advgraphics` panel, whose `NFS5.GouraudIndicatorBar`
+                            // meters and `NFS5.CarSettingSlider` knobs (`bind_indicator_bars`, set
+                            // by `set_bar`/`set_knob` from an accessor — never re-run by either tab
+                            // re-bind site) stayed blank on first click. A hand-picked pair only
+                            // ever catches the one widget class someone happened to look for, so
+                            // this now runs `bind_screen_widgets()` — the same full set
+                            // `fe_bind_screen` runs on screen open — instead: every bind in it fires
+                            // the same way regardless of which panel a widget lives in, so the
+                            // original's own re-evaluation is never gated on which tab was already
+                            // open, and there is no cheaper subset that is provably still complete
+                            // the next time a `.lay` grows a new tab panel.
+                            self.bind_screen_widgets();
                             self.fe_sound(5);
                         }
                         // `NFS5.3DCAR`'s slot 9, 0x4C0EB0: a click opens or closes the part under
@@ -23703,13 +24149,19 @@ impl ApplicationHandler for App {
                             let step = controls[n].step;
                             self.fe.setting_repeat = Some((a.clone(), step, 0));
                             self.set_accessor(&a, step);
-                            self.bind_car_logos();
-                            self.bind_indicator_bars();
-                            self.bind_chronicle_icons();
-                            self.bind_showcase_pictures();
-                            self.bind_lists();
-                            self.bind_checks();
-                            self.bind_mergedlist_panel();
+                            // Every other `set_accessor` call runs the full `bind_after_accessor()`
+                            // (`combo_commit`, `combo_strip_release`, `layout_key`'s Left/Right) —
+                            // this arm used to re-bind a hand-picked six of its seventeen instead,
+                            // missing `bind_carsetup_gearratio` among others (this button's own
+                            // screen, `carsetup.lay`, is the *only* shipped `.lay` carrying
+                            // `NFS5.CARSETTINGBUTTON`). The 34 shipped buttons'
+                            // screen has no `NFS5.CarLogo`/chronicle/showcase/track-map/player-
+                            // picture widgets at all, so those binds in the full set are a cheap
+                            // widget-list scan away from a no-op here; every texture-backed one
+                            // (`set_car_logo`/`set_pack_picture`) is already gated on the resolved
+                            // file+entry actually changing, so the 150 ms repeat below never
+                            // re-decodes or re-uploads anything already current.
+                            self.bind_after_accessor();
                             return;
                         }
                         if !down && !combos.iter().any(|c| c.index == hit) {
@@ -24200,6 +24652,24 @@ fn main() -> Result<()> {
     let scripted = ["--autotest", "--screenshot", "--layout-sweep", "--record"].iter().any(|f| args.iter().any(|a| a == f))
         || std::env::var_os("NFS_NO_FOCUS").is_some();
     NO_FOCUS.store(scripted, std::sync::atomic::Ordering::Relaxed);
+    // diagnostic: `NFS_PLAY_INTRO=1` keeps the start-up movies for a scripted run (see `PLAY_INTRO`)
+    PLAY_INTRO.store(std::env::var_os("NFS_PLAY_INTRO").is_some(), std::sync::atomic::Ordering::Relaxed);
+    // Tooling only, not a game rule: a scripted capture (`--screenshot`, or any other scripted
+    // run, which is always `NFS_NO_FOCUS=1` too — the flag `scripted` is set from above) must not
+    // let wherever the operator's real mouse happens to rest change a hover state — the golden
+    // must come out the same regardless (a row/header hover state was seen to differ this way on
+    // `parts.png`). `NFS_FE_CURSOR=x,y` already parks the pointer for a still taken by hand (to
+    // look at one hover state) and `LayoutScreen::set_cursor`/`set_pointer`
+    // (`crates/nfs-game/src/layout.rs`) already ignore every real `CursorMoved` event once it is
+    // set. Default it — the same way `layout_sweep` below defaults `NFS_FE_CLOCK` — to a design
+    // pixel outside the 640×480 layout, so a scripted run never reads a real pointer position
+    // unless the operator explicitly asks for one with their own `NFS_FE_CURSOR`. The original's
+    // own front end has no notion of "no pointer"; this is a capture-determinism device only,
+    // the same class as `NFS_FE_DZ` standing in for a dragged bar.
+    if scripted && std::env::var("NFS_FE_CURSOR").is_err() {
+        // SAFETY: single-threaded start-up, before any screen is loaded
+        unsafe { std::env::set_var("NFS_FE_CURSOR", "-1000,-1000") };
+    }
     let mut builder = EventLoop::builder();
     #[cfg(target_os = "macos")]
     if scripted {
@@ -24309,18 +24779,44 @@ fn main() -> Result<()> {
     let track_tables = nfs_game::track_list::TrackListTables::load(&paths);
     let (track_all, track_looped) = track_tables.build(nfs_game::track_list::START_YEAR, 0);
     let menu = if use_menu {
-        let mut cars = catalog
-            .iter()
-            .filter(|c| !c.sim.is_empty())
-            .cloned()
-            .collect::<Vec<_>>();
-        cars.sort_by_key(|c| c.year);
-        // `NFS_FE_CAR=<display name substring>` preselects a car, for stills of the showroom — the
-        // same kind of diagnostic as `NFS_MENU_MODE`
+        // `GenericCar.Car`'s own list, `[0x6919EC]`, is rebuilt by `0x4F3E40` (kind-0 records only
+        // — `record+0x1F4 == 0`, 0x4F400E…0x4F4087, `nfs-formats/src/fedata.rs`'s own `kind` field,
+        // "only kind 0 may be listed or raced") and then sorted by **0x4F0F50** with the
+        // comparator **0x4F1D40**: era `+0x1B0` first, then class `+0x1AC`, then first year
+        // `+0x1F8` (signed word), all three ascending, swapping the instant a later record compares
+        // less — not a stable sort (`era_class_year_sort`, above, is the same exchange walk
+        // instruction for instruction; `career.md` §10.9's "Dealer / garage order" cites the same
+        // two addresses for the dealer/garage list, `App::dealer_cars`, which now shares this same
+        // routine). *(Until this pass: `!c.sim.is_empty()` for the filter — 6 of the 93 sim-bearing
+        // records are kind-2 cop cars with a drivable model (`Cop 930`/`930 German`/`Cop 356B`/
+        // `356B German`/`Cop 993 Turbo`, `+/German` pairs plus one more), wrongly admitted; and
+        // `cars.sort_by_key(|c| c.year)`, which reaches the same row 0 — the classic era's
+        // lowest-class, earliest-year `'50 356 1100 Cabriolet` — but is not the original's order
+        // past it.)*
+        let mut cars: Vec<_> = catalog.iter().filter(|c| c.kind == 0).cloned().collect();
+        era_class_year_sort(&mut cars, era_class_year_key);
+        // `GenericCar2.Car`'s own list `[0x6919F4]` is a **separate** rebuild, not `cars` again —
+        // see `Menu::cars2`'s field doc and `Menu::set_cars2`. Built here for the same chronicle
+        // year `tracks_year` below starts at (`nfs_game::track_list::START_YEAR`).
+        let mut cars2: Vec<_> = catalog.iter().filter(|c| c.kind == 0 && c.year as i32 <= nfs_game::track_list::START_YEAR).cloned().collect();
+        era_class_year_sort(&mut cars2, era_class_year_key);
+        // **`0x4FC730`** ("reset track list") zeroes `zMergedList.Car`'s catalogue-half index —
+        // among the seven `Track<i>` rows, `Knockout.TrackNumber` and `LoopedTrack.Track` it also
+        // resets — and `modes.md` §2 confirms it runs **both** at accessor registration (i.e. from
+        // the very first frame, before any profile) and again on every `SETTYPEQUICKRACE`/
+        // `SETTYPEKNOCKOUT`/`SETTYPEQUICKKNOCKOUT` (`Menu::reset_track_rows`, ported). So the
+        // catalogue always starts on row 0 — the sorted list's first, era-1950 entry — unless the
+        // player has picked something else. `NFS_FE_CAR=<display name substring>` still overrides
+        // it, for stills of the showroom (the same kind of diagnostic as `NFS_MENU_MODE`).
+        // *(Until 2026-09-29 the no-override default hunted the list for a modern 993 coupe
+        // instead — a leftover convenience from the menu's very first cut, never RE-grounded,
+        // which left every screen reached before a `SETTYPE*` reset — including this port's own
+        // `--fe=QuickRace`/`quickknockout`/`knockout` scripted goldens — opening on a `911
+        // Carrera` where the original opens on the catalogue's first car, `REFERENCE-2026-09-28.md`
+        // "Pass 10", `QuickRace`(a).)*
         let car_idx = std::env::var("NFS_FE_CAR")
             .ok()
             .and_then(|want| cars.iter().position(|c| c.display_name.contains(want.as_str())))
-            .or_else(|| cars.iter().position(|c| c.model.eq_ignore_ascii_case("993") && c.sim.contains("coupe")))
             .unwrap_or(0);
         let mut menu0 = Menu {
             mode: std::env::var("NFS_MENU_MODE")
@@ -24333,6 +24829,7 @@ fn main() -> Result<()> {
             looped: track_looped,
             tracks_year: nfs_game::track_list::START_YEAR,
             cars,
+            cars2,
             track_idx: 0,
             car_idx,
             car_garage: false,
@@ -24419,7 +24916,7 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    let audio_settings = nfs_audio::music::Settings::load(&paths.root);
+    let mut audio_settings = nfs_audio::music::Settings::load(&paths.root);
     // `FEStrings.loc` / `hud.loc` in the current language (0x4E04F0, 0x41E170)
     let fe_strings = nfs_game::layout::load_strings(&paths);
     // `Replay_begin` 0x413CF0 copies the whole saved block back over `0x6573E8` (0x413DCF) and
@@ -24428,6 +24925,21 @@ fn main() -> Result<()> {
     let race_skill = replay_setup.as_ref().map_or(fe.skill, |r| r.skill);
     let music_names = nfs_audio::music::song_titles(&paths.game_data().join("Music")).unwrap_or_default();
     let music_lengths = nfs_audio::music::song_lengths_ms(&paths.game_data().join("Music")).unwrap_or_default();
+    // The CD player's own list `[0x65B62C]`, not `fe.txt`'s `PLAYLIST=`/`NUMPLAYLISTSONGS=`
+    // (`[0x657CB8]`/`[0x657CBC]`, the *race* pick `AudioLoadTrack` 0x4A88A0 reads directly and
+    // `Settings::load` above already carries): `0x4BE3D0`, the CD player's song-list rescan, is
+    // called exactly once — from the front-end manager's own init (`0x4D36D2`, no other caller,
+    // `calls.py 0x4BE3D0`) — and it unconditionally replaces `[0x65B62C]` with a fresh vector,
+    // then walks every record of the freshly rescanned `game*` table (`0x4ADE20("game*", 0)`) and
+    // appends each one's stream index (disassembly at `0x4BE3D0`: the `mov dword ptr [0x65b62c],
+    // eax`/`ebp` reset at `+0x1F`/`+0x26`, then the per-record `game` prefix compare at `+0xB7..
+    // +0xD9` gating the same append call `0x46dae0` that `ADDSONG`'s `0x4BE670` uses). So every
+    // launch starts the CD player's own selection at *every* `game*` track, independent of the
+    // registry — which is exactly `native_TEST.sav`'s `CDPlayer` module on a brand-new profile
+    // (14 tracks, `0..13`, `savegame.md` "Genuine save 2026-09-28"). A profile load overrides
+    // this from its own `.sav` `CDPlayer` module (`apply_saved_profile`, `set_cd_playlist`); a
+    // brand-new profile has none, so this start-up default is what a fresh save carries.
+    audio_settings.playlist = music_names.iter().enumerate().filter(|(_, n)| nfs_audio::music::pattern_match(n, "game*")).map(|(i, _)| i).collect();
     // a `--career` race in a garage car wears the car's own appearance — its colours (a saved
     // custom one included, `OwnedCar::custom`) and race number — as the front end's start of the
     // same event does (`start_tournament_from_layout`)
@@ -24489,7 +25001,10 @@ fn main() -> Result<()> {
             cars: Vec::new(),
             cars_key: Vec::new(),
             cars_env: None,
-            ms: 0,
+            // `NFS_FE_CLOCK` preloads this the same way it preloads `LayoutScreen::clock_ms`
+            // (layout.rs), so the turntable (`room.spin_turns`, `frontend-3d.md` §3) can be
+            // pinned for a still — the room's clock was previously never seeded from it at all
+            ms: std::env::var("NFS_FE_CLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             dealer_row: None,
             dealer_prev: None,
             room_car_half: None,
@@ -24784,6 +25299,7 @@ fn main() -> Result<()> {
             opponent_sets: Vec::new(),
             traffic_sets: Vec::new(),
             opponent_paints: Vec::new(),
+            opponent_families: Vec::new(),
             traffic_paints: Vec::new(),
             police: None,
             police_models: Vec::new(),
@@ -24988,6 +25504,48 @@ mod quickfix_tests {
         for (name, kinds) in QUICKFIX_NAMES.iter().zip(want) {
             assert_eq!(quickfix_kinds(name), Some(kinds), "{name}");
         }
+    }
+}
+
+/// **0x4F0F50/0x4F1D40 against the shipped `nfs5.car`**, pinning the exchange sort's exact,
+/// non-stable output — not merely "row 0 matches" (`b5f1896e`'s own weaker check). Computed
+/// independently in Python from the same file (era/class/year at `+0x1B0`/`+0x1AC`/`+0x1F8`, the
+/// same instruction-for-instruction exchange walk) and cross-checked against `career.md` §10.9's
+/// already-`matched` dealer-list comparator citation. Rows 10…14 (the big 1956 356 A cluster) are
+/// the load-bearing ones: a plain `Vec::sort_by_key` on the same three-tuple key would leave that
+/// cluster in file order, which is not what this walk produces.
+#[cfg(test)]
+mod catalogue_order_tests {
+    use super::{era_class_year_key, era_class_year_sort};
+    use nfs_assets::GamePaths;
+
+    #[test]
+    fn the_exchange_sort_matches_the_original_instruction_for_instruction() {
+        let Ok(paths) = GamePaths::locate() else { return };
+        let Ok(bytes) = std::fs::read(paths.fe_data().join("Data").join("nfs5.car")) else { return };
+        let Ok(catalog) = nfs_formats::fedata::parse_car_catalog(&bytes) else { return };
+        let mut cars: Vec<_> = catalog.into_iter().filter(|c| c.kind == 0).collect();
+        era_class_year_sort(&mut cars, era_class_year_key);
+        assert_eq!(cars.len(), 87, "the shipped file has 87 kind-0 racing records");
+        let want = [
+            "'50 356 1100 Cabriolet",
+            "'50 356 1100 Coupé Ferdinand",
+            "'51 356 1300 Cabriolet",
+            "'51 356 1300 Coupé",
+            "'52 356 1500 Cabriolet",
+            "'52 356 1500 Coupé",
+            "'53 356 1500 Super Cabriolet",
+            "'53 356 1500 Super Coupé",
+            "'54 356 1300 Super Cabriolet",
+            "'54 356 1300 Super Coupé",
+            "'56 356 A 1300 Super Cabriolet",
+            "'56 356 A 1300 Super Coupé",
+            "'56 356 A 1600 Cabriolet",
+            "'56 356 A 1600 Coupé",
+            "'56 356 A 1600 Super Cabriolet",
+        ];
+        let got: Vec<&str> = cars.iter().take(want.len()).map(|c| c.display_name.as_str()).collect();
+        assert_eq!(got, want);
     }
 }
 

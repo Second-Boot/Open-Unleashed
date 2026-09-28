@@ -50,11 +50,9 @@ impl IntroRun {
     pub fn new(window: Arc<Window>, renderer: Renderer, paths: &GamePaths) -> Self {
         let dir = paths.fe_data().join("Movies");
         let files = MOVIES.iter().filter_map(|n| GamePaths::find_file(&dir, n)).collect();
-        let tables = std::fs::read(paths.root.join("nfs5.exe"))
-            .ok()
-            .and_then(|d| MadTables::from_exe(&d).ok());
+        let tables = MadTables::load(&paths.root).ok();
         if tables.is_none() {
-            tracing::warn!("start-up movies: the decoder's tables could not be read from nfs5.exe");
+            tracing::warn!("start-up movies: the decoder's tables could not be read (madtables.bin / nfs5.exe)");
         }
         window.request_redraw();
         Self { window, renderer, files, tables, movie: None, blank: 0, tex: None, keys: VecDeque::new(), buttons: [false; 4], t0: Instant::now() }
@@ -98,11 +96,17 @@ impl IntroRun {
             };
             self.movie = self.open(&path);
             if self.movie.is_none() {
-                tracing::warn!(?path, "start-up movie unreadable");
-                return false;
+                // "a missing one is passed over" (0x59DC30 at 0x4DD65F / 0x4DD507, the doc comment
+                // above `MOVIES`) — an unreadable file drops out of the queue and the next redraw
+                // tries the next one. Returning early here without the `request_redraw` below used
+                // to leave the window on a blank frame forever the moment either movie could not be
+                // decoded (a missing `nfs5.exe` table set, or a corrupt/short movie file) — the same
+                // stalled-loading-still class 548aa02b fixed for the front end past the intro.
+                tracing::warn!(?path, "start-up movie unreadable, skipped");
+            } else {
+                self.blank = BLANK_FLIPS;
+                self.tex = None;
             }
-            self.blank = BLANK_FLIPS;
-            self.tex = None;
         }
         if self.blank > 0 {
             self.blank -= 1;

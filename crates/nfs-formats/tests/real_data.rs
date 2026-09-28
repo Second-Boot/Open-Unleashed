@@ -69,6 +69,26 @@ fn fsh_car_and_track() {
     assert_eq!((img.width, img.height), (256, 256));
 }
 
+/// `FullOval.fsh`'s 45 `0x7B`/`0x29` tiles are the shared `screenfulloval`/`ScreenFullOval.lay`
+/// background used by 23 shipped `ID_FULLOVAL` screens (`RE/notes/layouts.md` "carcompare, read
+/// 2026-09-29"). The `0x29` palette-to-RGBA conversion is CONFIRMED against the original's
+/// converter `0x570820` (`RE/notes/car-model.md` ~589): RGB565 bit-replication
+/// (`r << 3 | r >> 2` etc.), alpha 255 unless the raw `u16` is the fixed colour-key `0x0000`.
+#[test]
+fn fsh_fulloval_0x29_palette_matches_0x570820() {
+    let r = need_game!();
+    let d = std::fs::read(r.join("FEData/Art/FullOval.fsh")).unwrap();
+    let f = Fsh::parse(&d).unwrap();
+    assert_eq!(f.entries[0].name, "fbr0");
+    let img0 = f.decode(&d, 0).unwrap();
+    // Entry 0 is a flat 32x32 tile, every pixel palette index 0, raw word 0x0001.
+    assert_eq!(&img0.rgba[0..4], &[0, 0, 8, 255]);
+    assert_eq!(f.entries[40].name, "fb40");
+    let img40 = f.decode(&d, 40).unwrap();
+    // Entry 40's first pixel is palette index 63, raw word 0x63f0.
+    assert_eq!(&img40.rgba[0..4], &[99, 125, 132, 255]);
+}
+
 #[test]
 fn crp_articles() {
     let r = need_game!();
@@ -948,4 +968,24 @@ fn native_test_sav_round_trips_byte_for_byte() {
     let out = save.write();
     assert_eq!(out.len(), data.len());
     assert_eq!(out, data, "SaveFile::write() must reproduce the genuine file exactly");
+}
+
+/// `madtables.bin` (what `make_app.sh --with-data` bundles instead of `nfs5.exe`) round-trips the
+/// tables read out of the executable exactly.
+#[test]
+fn mad_tables_blob_round_trips() {
+    let root = need_game!();
+    let Ok(exe) = std::fs::read(root.join("nfs5.exe")) else {
+        eprintln!("skipping: nfs5.exe not found");
+        return;
+    };
+    let t = nfs_formats::mad::MadTables::from_exe(&exe).expect("tables");
+    let blob = t.to_bytes();
+    let back = nfs_formats::mad::MadTables::from_bytes(&blob).expect("blob");
+    assert_eq!(back.to_bytes(), blob);
+    assert_eq!(back.flat, t.flat);
+    assert_eq!(back.quant, t.quant);
+    assert_eq!(back.prescale, t.prescale);
+    assert_eq!(back.scan, t.scan);
+    assert!(nfs_formats::mad::MadTables::from_bytes(&blob[..blob.len() - 1]).is_err());
 }

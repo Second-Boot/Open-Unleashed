@@ -62,7 +62,31 @@ impl App {
                 let c = self.career.as_ref()?;
                 let t = c.current()?;
                 match modifier {
-                    "SHORT" | "" => self.fe.strings.get(t.name_string_id)?.to_string(),
+                    // `FEAccessorWatch::tick` 0x4BD230 does not send the bare (no-`()`) case
+                    // through this modifier dispatch at all: it compares the widget's own
+                    // modifier string against empty **before** calling the accessor, and takes a
+                    // *different* vtable slot for each — `+0x10` ("plain text") with none,
+                    // `+0x14` (this match, `FETournyAccessor::0x506600`) with one. `tournament.lay`
+                    // section 14 (the gold title bar, `pos=320,175`) carries a bare
+                    // `accessor=Tournament.Tournament`, so it never reaches 0x506600 in the
+                    // original; the `+0x10` slot is `0x4BC4E0` (inherited from the accessor base),
+                    // which hands the accessor's own row index `[this+0x18]` (0 — its ctor
+                    // 0x4BC224's own initialiser, never written by a shipped layout, so always the
+                    // *current* tournament, row 0) to the row-text getter, `FETournyAccessor`'s
+                    // own vtable slot 12 (`0x506560`): record `[this+0x18]`, `+0x24` — `title_string_id` —
+                    // through `FEStrings` (`0x4E06D0`). So the bare accessor's own answer is
+                    // `title_string_id`, not `name_string_id`; only an *explicit* `(SHORT)`
+                    // modifier reaches 0x506600's own string-compare chain and its `"SHORT"` arm
+                    // (`+0x20` = `name_string_id`). Confirmed by disassembling 0x506600 in full:
+                    // its chain is DESCRIPTION/ENTRYFEE/CARRESTRICTION/PRIZEMONEY/DIFFICULTY/
+                    // RECORDTIME/TIMESCOMPLETED/LOCATION/SHORT, and the *default* arm (an empty
+                    // modifier would fall into, if 0x506600 were ever reached with one) is not
+                    // `title_string_id` at all — it is the fixed literal string `"This is a bug"`
+                    // (0x5D79A0), a debug guard never hit by any shipped layout. Until this fix the
+                    // port conflated `""` with `"SHORT"`, so `tournament.lay`'s title bar read
+                    // `356` instead of `356 Турнир` — pass 10, `REFERENCE-2026-09-28.md`.
+                    "" => self.fe.strings.get(t.title_string_id)?.to_string(),
+                    "SHORT" => self.fe.strings.get(t.name_string_id)?.to_string(),
                     "DESCRIPTION" => self.fe.strings.get(t.description_string_id)?.to_string(),
                     "CARRESTRICTION" => self.fe.strings.get(t.restriction_string_id)?.to_string(),
                     // 0x50666D and 0x506749: both are `sprintf("%s", 0x4DBF80(value))` — the
@@ -432,7 +456,18 @@ impl App {
                     // 0x4BA881: the row accessor's slot 0x6C on its selection, 0x4FA5E0 —
                     // `FEStrings[trk+4 + 0x3C]`, the short capitalised name
                     "TRACKNAME" => self.fe.strings.get(rec?.name_string_id + 0x3C)?.to_string(),
-                    "TRACKLAPS" => slot.laps.to_string(),
+                    // **0x4BAA86 gates this on the row's own track being a circuit** —
+                    // `push 2; push ebp(row); call 0x4FBF70` (`Mode_isCircuit(2, row)`), and on
+                    // `al == 0` it takes the same empty-string arm every other field takes past
+                    // the opponent count (`je 0x4baa65`), *before* it ever reads the row's
+                    // `Track<n>.Laps`. So a point-to-point round's cell answers nothing — the
+                    // widget draws no 4th number — exactly the test `ID_LAPSSELECTOR`'s own
+                    // disable gate uses (`App::bind_laps_selector`), just keyed on this row
+                    // instead of `Knockout.TrackNumber`'s current selection. *(Until 2026-09-29
+                    // this printed the laps count unconditionally, drawing a stray number on
+                    // every row of a point-to-point knockout — `КОТ Д'АЗУР ВПР ПУСТО 2`.)*
+                    "TRACKLAPS" if self.records.track(&name).is_some_and(|t| t.circuit) => slot.laps.to_string(),
+                    "TRACKLAPS" => return None,
                     // **the short, capitalised forms.** 0x4BAA3B adds **0x23** to the traffic
                     // accessor's own string id and 0x4BAA03 adds **0x14** to the direction's —
                     // `FEStrings` 435…438 (`HEAVY`, `MED`, `LIGHT`, `NONE`) and 430…433 (`FWD`,
@@ -578,10 +613,12 @@ impl App {
                 format!("{}", at + 1)
             }
             // the compare screen's right-hand car, the one `GenericCar2.Car` steps with `car2_idx`
+            // over its own list `cars2` — `[0x6919F4]`, separate from `GenericCar.Car`'s `cars`
+            // (`Menu::cars2`'s field doc)
             "GenericCar2.Car" => match menu {
                 _ if !matches!(modifier, "" | "SHORT") => return None,
-                Some(m) if modifier == "SHORT" => m.cars.get(m.car2_idx)?.family.to_string(),
-                Some(m) => m.cars.get(m.car2_idx)?.display_name.to_string(),
+                Some(m) if modifier == "SHORT" => m.cars2.get(m.car2_idx)?.family.to_string(),
+                Some(m) => m.cars2.get(m.car2_idx)?.display_name.to_string(),
                 None => return None,
             },
             // an integer accessor, not a caption: 0x4E55B0 registers it with 0x4BA310 (range 0…0xC,
@@ -666,6 +703,12 @@ impl App {
             "Audio.EngineLevel" => self.snd.audio_settings.engine_level.to_string(),
             "Audio.SpeechLevel" => self.snd.audio_settings.speech_level.to_string(),
             "Audio.AmbientLevel" => self.snd.audio_settings.ambient_level.to_string(),
+            // Not a `.lay`-carried accessor name — no shipped block names it. `layout/
+            // widgets.rs`'s `draw_default` calls it directly for `NFS5.WORDWRAPCONTROL`,
+            // standing in for `FEWordWrapControl::bind`'s own unconditional `%s`
+            // substitution (0x522860 → 0x501270 → `[0x691DC8]`), the same global
+            // `used_cars`'s doc and `mission_text_lines` already read.
+            "Player.Name" => self.player_name.clone(),
             // A list accessor with no arm of its own still answers: 0x4BC4E0, the caption getter,
             // is nothing but `rowText([this+0x18])`, so the caption is the row the list is on, and
             // the empty string when the list is empty — which is what a `Comms.*` list shows

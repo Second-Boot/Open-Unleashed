@@ -24,23 +24,27 @@ pub fn song_titles(music_dir: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 /// Each song's length in milliseconds, which is what the original keeps at `track + 0x20` and what
-/// `CDPlayer.SelectedList(TOTALPLAY)` sums (0x4BED16). It comes from the stream's own `SCHl`
-/// header: the sample count (code 0x85) over the sample rate (code 0x84). A track whose header
-/// does not declare a count contributes 0, as an empty slot would.
+/// `CDPlayer.SelectedList(TOTALPLAY)` sums (0x4BED16), `Title(TRACKPLAY)`/`Title(SONGTIMEREMAIN)`
+/// read singly (0x4BED1F, 0x4BEF6E). *Corrected 2026-09-29 (35:52 vs the original's 35:46):* this is
+/// **not** the stream's decoded duration (samples over rate) — the record's own builder,
+/// `0x4ADE20` (§4.159's rescan), sets it from the resolved file's raw **byte size**, not from the
+/// `SCHl` header, via the classic signed-division-by-constant idiom at `0x4adee6..0x4adefc`
+/// (`lea ecx,[eax+eax*4]; shl ecx,1` = size×10, `imul` by the magic constant `0x2f149903`,
+/// `sar edx,6` + sign fix-up = ⌊size×10 / 348⌋ for a non-negative size — i.e. a fixed assumed byte
+/// rate of 34800 B/s applied to the `.viv` entry's compressed size, whatever the actual codec
+/// bitrate). Confirmed by rebuilding all 14 `game*` entries' real `zzzymus.viv` sizes through this
+/// exact integer formula: total 2 146 556 ms = **35:46**, matching `pass6_options_audio.jpg`'s
+/// genuine capture exactly (the ms→`mm:ss` split itself, `0x4bed1f`'s magic `/1000` then a plain
+/// `idiv 60`, was already right — only the per-track ms was wrong). The port had summed the
+/// decode-accurate `sample_count/sample_rate` value instead (total 2 152 000 ms = 35:52, off by
+/// ~0.4 s/track — real, but not what the original's own list shows, since it never decodes a
+/// track just to list it). `0x5666f0`'s own out-parameter (the value this divides) was not traced
+/// past this point — its identity as "the resolved entry's byte size" rests on the exact numeric
+/// match above, not a read to the instruction of where that size is fetched.
 pub fn song_lengths_ms(music_dir: &Path) -> anyhow::Result<Vec<u32>> {
     let data = std::fs::read(music_dir.join("zzzymus.viv"))?;
     let viv = Bigf::parse(&data)?;
-    Ok(viv
-        .entries
-        .iter()
-        .map(|e| {
-            let body = data.get(e.offset as usize..e.offset as usize + e.size as usize)?;
-            let h = nfs_formats::schl::SchlStream::parse(body).ok()?.header;
-            let n = h.sample_count?;
-            Some(((n as u64 * 1000) / h.sample_rate.max(1) as u64) as u32)
-        })
-        .map(|v| v.unwrap_or(0))
-        .collect())
+    Ok(viv.entries.iter().map(|e| ((e.size as u64 * 10) / 348) as u32).collect())
 }
 
 /// `game13-Activator-Morphadron` → (`Activator`, `Morphadron`) — `0x4AD950` splits on `-`.
@@ -614,5 +618,36 @@ mod toggle_tests {
         assert_eq!(MusicPlayer::toggle_step(false, 1, 7), Some(0));
         // the sum is taken as a signed int and its magnitude divided: −7 → 7 % 5
         assert_eq!(MusicPlayer::toggle_step(false, 5, (-7i32) as u32), Some(2));
+    }
+}
+
+#[cfg(test)]
+mod real_data {
+    use super::*;
+
+    fn game_root() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var("NFS5_GAME_PATH") {
+            return Some(PathBuf::from(p));
+        }
+        let home = PathBuf::from(std::env::var_os("HOME")?);
+        let p = home.join("Games/NFS-Porsche-Unleashed/game_info/data");
+        p.join("GameData").is_dir().then_some(p)
+    }
+
+    /// The "все треки" total, against the genuine capture (`pass6_options_audio.jpg`, 35:46) —
+    /// guards the 2026-09-29 fix (35:52 vs 35:46): the port had been summing the
+    /// decode-accurate `sample_count/sample_rate` length (35:52) instead of the original's own
+    /// byte-size estimate (`⌊size×10/348⌋` per track, `0x4adee6..0x4adefc`).
+    #[test]
+    fn playlist_total_matches_the_genuine_capture() {
+        let Some(root) = game_root() else {
+            eprintln!("skipping: original game data not found");
+            return;
+        };
+        let lens = song_lengths_ms(&root.join("GameData/Music")).unwrap();
+        let names = song_titles(&root.join("GameData/Music")).unwrap();
+        let total_ms: u64 = names.iter().zip(&lens).filter(|(n, _)| pattern_match(n, "game*")).map(|(_, &ms)| ms as u64).sum();
+        let secs = total_ms / 1000;
+        assert_eq!((secs / 60, secs % 60), (35, 46), "total {total_ms} ms, pass6_options_audio.jpg shows 35:46");
     }
 }

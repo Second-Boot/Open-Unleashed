@@ -442,7 +442,12 @@ impl LayoutScreen {
                     .or_else(|| small.then(|| SMALL_FONT.to_string()))
                     .and_then(|f| self.fonts.get(&f))
                     .unwrap_or(f);
-                self.text(out, aspect, cf, &v, x + 5.0, y + 2.0, 0.0, 0, colour);
+                // disabled-gated the same way as the ordinary value draw below (0x4C606B
+                // `call 0x4C7E40`, `FEStrings` 299 "Н/Д" at 0x4C60BC) — none of the fourteen
+                // shipped `nolabel=1` sliders are ever disabled in this port yet, so this had
+                // no live case to miss until the ordinary arm's own gap (below) was found.
+                let shown = if state == "disabled" { strings.get(299).unwrap_or_default() } else { v.as_str() };
+                self.text(out, aspect, cf, shown, x + 5.0, y + 2.0, 0.0, 0, colour);
                 return;
             }
             if self.attr_num(e, "nolabel") == Some(4.0) && gscw >= 1.0 {
@@ -500,8 +505,18 @@ impl LayoutScreen {
             // `modem.lay`'s `Comms.PhoneList`; a closed one reads as its caption alone.
             // *(Until 2026-09-27 the port right-aligned the value against the arrow, and
             // "осталось времени трека" / "играть последовательно" ran out of the box.)*
+            // **The ordinary (`nolabel != 1/2/4`) value draw is disabled-gated too**, just
+            // past the `nolabel == 2` skip: 0x4C61A1 `call 0x4C7E40` (isDisabled) runs before
+            // 0x4C61B6 reads the cached value string — disabled takes 0x4C61F1 instead,
+            // `FEStrings` **0x12B = 299** ("Н/Д") in the same place, through the same
+            // 0x4DA350 call at 0x4C6237. The `nolabel == 4` arm already had this (§4.125);
+            // `ID_LAPSSELECTOR`'s own `круги` row (`nolabel=0`) is the first to exercise the
+            // ordinary one, disabled by `App::bind_laps_selector` on a point-to-point track.
+            // *(Until 2026-09-29 this drew the raw value on a disabled row too, since nothing
+            // had ever set `disabled_flags` on an ordinary combo box before.)*
             if self.attr_num(e, "nolabel") != Some(2.0) {
-                self.text(out, aspect, f, &v, x + w - 12.0, y, 0.0, 2, colour);
+                let shown = if state == "disabled" { strings.get(299).unwrap_or_default() } else { v.as_str() };
+                self.text(out, aspect, f, shown, x + w - 12.0, y, 0.0, 2, colour);
             }
         }
         // and last of all, over everything it has just drawn — the label included —
@@ -1068,6 +1083,9 @@ impl LayoutScreen {
         // 20.0 and 0x507C1A 90.0). §4.122.
         if let Some(f) = self.font_for(e) {
             let hot = self.cursor.and_then(|(px, py)| chronicle_cell(px, py, x, y));
+            // The caption's own font, `Univers7b.ffn` — distinct from the year's `Univers8b.ffn`
+            // (`f` above) — 0x507F10's bind, §4.173.
+            let cf = self.fonts.get("univers7b.ffn");
             for (col, (year, _)) in self.chronicle_columns.iter().take(5).enumerate() {
                 let cx = x + col as f32 * 91.0;
                 // the year, centred in its column, and the 90x20 cell 0x10 under it
@@ -1075,6 +1093,19 @@ impl LayoutScreen {
                 self.text(out, aspect, f, &format!("{}", 1900 + year), cx + 45.0, y + 2.0, 0.0, 1, black);
                 for (bx, by, bw, bh) in [(cx, y + 16.0, 90.0, 1.0), (cx, y + 35.0, 90.0, 1.0), (cx, y + 16.0, 1.0, 20.0), (cx + 89.0, y + 16.0, 1.0, 20.0)] {
                     out.push(self.quad(aspect, bx, by, bw, bh, black));
+                }
+                // The caption — "356 ROADSTER NO.1" at 1948, "356" at 1950, and so on — the
+                // `фото`-row (kind 0) entry's own name, one column's worth of the FSH pack's
+                // `0x6F` text attachment (`nfs_formats::fsh::entry_caption`). Read in full at
+                // 0x507C37…0x507D08: centred one pixel right of the year (`+0x2E` against the
+                // year's `+0x2D`) and 17px (`0x11`) above the icon row directly under it — the
+                // very `y + 38.0` the photo/media rows start at, two lines below — in white
+                // tinted by the screen's own fade (0x4D87D0, the same helper the photo icon uses,
+                // not the year/box's black 0x4D87E0). §4.173.
+                if let Some(cf) = cf
+                    && let Some(cap) = self.chronicle_captions.get(col).and_then(|c| c.as_deref())
+                {
+                    self.text(out, aspect, cf, cap, cx + 46.0, y + 21.0, 0.0, 1, [1.0, 1.0, 1.0, talpha]);
                 }
                 // and **two** icon cells of 90 x 60, 0x3E apart (0x507DD8), which is
                 // where the two 454x60 bars are; the icon goes in at (+1, +1)
@@ -1112,9 +1143,28 @@ impl LayoutScreen {
     // — two seconds at 128 Hz — with `mindelay` and `maxdelay` both 0, so there is no
     // wait at all and the run simply repeats. That is what the port draws, and it is
     // the whole of the class's shipped use.
+    //
+    // **Position and size, corrected 2026-09-29**: this used to hand-roll its own sprite from
+    // the widget's own `.lay` `size=` (`w,h` here) — but `AnimatingPicture.ctr`'s `picture` part
+    // carries `size.flags=HIDDEN|READONLY` with no `size.value` at all (a `SHAPE` part with no
+    // size override is always drawn at its **art's** size, `controls.md` §4.53/`shape_parts_in`'s
+    // own comment) and `pos.value=-(picture.size.x/2),-(picture.size.y/2)` — centred on the
+    // widget's own `pos`, not anchored at its top-left. All five shipped ones carry an explicit
+    // `size=50,150` in the `.lay` block anyway (`chronicle`/`chroniclepicture`/`chroniclemedia`/
+    // `chroniclemovie`/`chroniclemoviemain`, all `ID_ANIMATINGPICTURE` at `pos=590,27`), and the
+    // control being `autosize=1` means the original ignores that `size=` outright — `box_of`'s own
+    // comment on `Control::getSize` 0x525360 / `computeBox` 0x5253C0: "when \[autosize\] is set the
+    // box is the union of the parts... only seven of the seventy shipped templates set it to 0...
+    // and only those seven have a `size.value` the original ever evaluates" — `AnimatingPicture`
+    // is not one of the seven. Stretching `logoAn.fsh`'s 100×75 frames into the declared 50×150
+    // box (this function's old `if w>0.0 {w} else {aw}`) squashed the Porsche crest into a
+    // near-invisible vertical sliver — confirmed by screenshot, `RE/reference/2026-09-28/
+    // cmp_chronicle.jpg` top right vs. the port's `chronicle.png` before this fix. The general
+    // `shape_parts_at`/`template_widget_at` machinery (already used for `NFS5.BOTTOMBARBUTTON`'s
+    // own frame-cycling picture parts) already gets both of these right, so this now goes through
+    // it with the frame this clock picked, instead of building the sprite by hand.
     pub(super) fn draw_animating_picture(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
-        let WidgetDraw { i, e, x, y, w, h, aspect, .. } = d;
-        let Some(file) = e.get("shapePathName").filter(|f| !f.is_empty()) else { return };
+        let WidgetDraw { i, e, x, y, aspect, strings, selected, hovered, .. } = d;
         let a = e.int("start_frame").unwrap_or(0).max(0) as usize;
         let b = e.int("end_frame").unwrap_or(0).max(0) as usize;
         // the widget's own clock (`glints::Anim`, bind 0x4BD8BE, tick 0x4BD8F0): its wait
@@ -1134,11 +1184,8 @@ impl LayoutScreen {
             },
         )
         .max(0) as usize;
-        if let Some(&(tex, aw, ah)) = self.shapes.get(&(file.to_string(), frame)) {
-            let (dw, dh) = (if w > 0.0 { w } else { aw }, if h > 0.0 { h } else { ah });
-            let (pos, size) = self.place(aspect, x, y, dw, dh);
-            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: tint([255, 255, 255, 255]), rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
-        }
+        let state = self.drawn_state(e, i, selected, hovered);
+        self.template_widget_at(out, aspect, e, &state, x, y, strings, Some(frame));
     }
 
     // **None of these four is a registered class.** The only `*Rectangle*` string in
@@ -1643,11 +1690,39 @@ impl LayoutScreen {
     //
     // so it is a fixed pitch of **9** a glyph and **3** a comma, in white at the
     // widget's own fade. §4.128.
+    //
+    // **`box.right`, corrected 2026-09-29**: `AccountThing.ctr`'s `[control]` block carries
+    // `autosize.value=1` (`Controls/AccountThing.ctr` line 30) and is *not* one of the eight
+    // templates §4.62 found with `autosize=0` (`BottomBarButton`, `ColorBox`, `ComboBox`,
+    // `GoToButton`, `Graphic Tab Button`, `MultiAccessor`, `OvalThing`, `Radio Group`) — so
+    // `Control::computeBox` 0x5253C0 takes the branch that unions the state's parts and never
+    // reads the `size` attribute at all, from *any* source: not the template's own
+    // `size.value=50,150`, and not `bottombar.lay` §1's own literal `size=50,150` override
+    // either (0x4BD603's `0x4C8670` call is exactly that `computeBox`). `state.normal`'s two
+    // parts are `data` (the attribute block, skipped — §4.62's trap, it is not a rect) and
+    // `picture` — a `SHAPE` part, `pos.value=0,0`, pointed at `weeicons.fsh` shape index 17
+    // (`AccountThing.ctr` lines 68–76), which is the file's 18th directory entry, name `acco`,
+    // **91×16** (dumped with `asset-inspector … weeicons.fsh`, cross-checked against the .lay's
+    // own `ID_CASHBKGD` `pos=195,459`). So the true box is `(195, 459)–(286, 475)`, 41 design
+    // units wider than the `.lay`'s declared 50 — enough for a 7-character comma-formatted sum at
+    // this fixed pitch (57 units) to clear the `ID_ACCOUNTTHINGY` label (`pos=191,464`,
+    // right-aligned at `align=2`, ending at `x=191`) with room to spare, which is why the
+    // original never overlaps it. `d.w` here is the **generic** `box_of` answer, which only takes
+    // the parts union when the `.lay` block itself carries no `size=` key
+    // (`layout.rs::box_of`'s `e.pair("size").is_none()` guard) — `ID_CASHBKGD` is the one shipped
+    // widget of this class and it *does* carry one, so the generic path falls through to the
+    // literal 50 instead. The same shape of bug, and the same fix (bypass the box the generic
+    // path hands the draw and take the union directly), already landed for
+    // `NFS5.AnimatingPicture`'s crest (`draw_animating_picture` above, `controls.md`
+    // "chronicle" 2026-09-29) — `box_of`'s guard itself is left alone here, matching that
+    // precedent, since changing it would touch every autosizing widget on all 98 screens instead
+    // of the one that needs it.
     pub(super) fn draw_account_thing(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
         let WidgetDraw { i, e, x, y, w, talpha, aspect, strings, selected, hovered, accessor, .. } = d;
         self.template_widget(out, aspect, e, self.state_for(e, i, selected, hovered), x, y, strings);
         let Some(f) = self.fonts.get("univers7b.ffn").or_else(|| self.font_for(e)) else { return };
         let Some(v) = accessor("Tournament.Data(CASH)") else { return };
+        let w = self.parts_union(e).map(|(uw, _)| uw).unwrap_or(w);
         let mut cx = x + w - 1.0;
         for ch in v.chars().rev() {
             self.text(out, aspect, f, &ch.to_string(), cx, y + 3.0, 0.0, 2, [1.0, 1.0, 1.0, talpha]);
@@ -2347,15 +2422,55 @@ impl LayoutScreen {
                     }
                 }
                 // `drawPartsHeading` 0x518DE0: a black rule at the top and another 13
-                // pixels down, with the name centred two pixels below the first
-                ListRow::Header(t) => {
+                // pixels down, with the name centred two pixels below the first — **unless**
+                // this is `Parts.AllParts`'s own row draw (0x515620), which does not call
+                // `drawPartsHeading` at all: its two section headers (`parts.lay` only) take
+                // the same dark-red 0xBC0000 bar + bevel every other row of that accessor gets
+                // (0x5156DE/0x5156FE/0x515746, the `parts_glass` arms above), plus a `+`/`−`
+                // icon from `weeicons.fsh` at the row's left edge (0x5151D9…0x515214's cache,
+                // 0x5157DE…0x51582B's pick — `parts_glyphs`'s own doc has the addresses) and
+                // left-aligned text after it, not centred.
+                //
+                // The pick's second flag, traced 2026-09-29 (§4.124's own list closed): the row
+                // draw is called from the base list box's row loop, 0x4C64FE, through the
+                // accessor's own vtable slot 15 (`call dword ptr [eax+0x3C]` at 0x4C68F5) — a
+                // thiscall of exactly 8 stack args (`0x515620` itself ends `ret 0x20`, 0x20 = 8
+                // dwords, confirming the count). The **first**-pushed (= 8th, `[esp+0xCC]`) arg
+                // is `ebx`, set at 0x4C672E (`xor ebx,ebx`, the default **0**) and overwritten
+                // in exactly the two cases this port already tracks for a row's highlight bar:
+                // selected-and-focused (0x4C674C `cmp edi,[esi+0x1A8]` + 0x4C6754 `[esi+0x1A4]`,
+                // `ebx` <- a blended colour, 0x4C6770) or hovered (0x4C678E, the accessor's own
+                // *vtable slot 10* hover-row query, `cmp eax,edi`; `ebx` <- `[esi+0x1EC]` ORed
+                // with the fade). `0x515620` then only ever tests this value against zero
+                // (0x5156D3 for the bar's own colour, 0x515703 for the bevel-vs-glass tail,
+                // 0x5157DE…0x51580D for this glyph pick) — never its actual colour bits — so the
+                // port's own `bar.is_some()` (computed above from the same two conditions,
+                // `hover_row == Some(n)` with a `highlightcolorhover` and `*current == Some(n)`)
+                // is exactly this flag: `pls1`/`min4` (closed/open) when neither holds, `pls2`/
+                // `pls3` when either does.
+                ListRow::Header(t, open) => {
                     headers += 1;
-                    let black = [0.0, 0.0, 0.0, 1.0];
-                    out.push(self.quad(aspect, px, ry, panel_w, 1.0, black));
-                    out.push(self.quad(aspect, px, ry + PART_HEADER_H, panel_w, 1.0, black));
-                    self.text(out, aspect, f, t, px, ry + 2.0, panel_w, 1, tint(text_c));
-                    // and over it 0x521400's bevel, `(x, y, w, 13.0, fade, 2)` (0x518E7F…)
-                    self.bevel_heading(out, aspect, px, ry, panel_w, PART_HEADER_H, 2.0);
+                    if parts_glass {
+                        out.push(self.quad(aspect, px, ry, panel_w, PART_HEADER_H, tint([0xBC, 0, 0, 0xFF])));
+                        self.glass(out, aspect, px, ry, panel_w, PART_HEADER_H, &tint);
+                        let mut tx = px;
+                        let pair = if bar.is_some() { 2 } else { 0 };
+                        if let Some(idx) = self.parts_glyphs.map(|g| g[pair + if *open { 1 } else { 0 }])
+                            && let Some(&(tex, sw, sh)) = self.shapes.get(&("weeicons.fsh".to_string(), idx))
+                        {
+                            let (pos, size) = self.place(aspect, px, ry, sw, sh);
+                            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
+                            tx += sw + 3.0;
+                        }
+                        self.text(out, aspect, f, t, tx, ry + 2.0, panel_w, 0, tint([0xFF, 0xFF, 0xFF, 0xFF]));
+                    } else {
+                        let black = [0.0, 0.0, 0.0, 1.0];
+                        out.push(self.quad(aspect, px, ry, panel_w, 1.0, black));
+                        out.push(self.quad(aspect, px, ry + PART_HEADER_H, panel_w, 1.0, black));
+                        self.text(out, aspect, f, t, px, ry + 2.0, panel_w, 1, tint(text_c));
+                        // and over it 0x521400's bevel, `(x, y, w, 13.0, fade, 2)` (0x518E7F…)
+                        self.bevel_heading(out, aspect, px, ry, panel_w, PART_HEADER_H, 2.0);
+                    }
                 }
                 // the garage list's grouping heading (§4.144): the same two rules 13
                 // apart, but drawn by the row painter itself — 0x4F5D67 puts a bar at
@@ -2532,6 +2647,23 @@ impl LayoutScreen {
                 }
                 None => return closed,
             }
+        };
+        // `FEWordWrapControl::bind` **0x522860** sprintfs the widget's own `stringID`
+        // text against the player's own name unconditionally, on every instance of the
+        // class — not through an `accessor=` attribute a `.lay` block carries (none of
+        // the four shipped `NFS5.WORDWRAPCONTROL` blocks has one): 0x5228ff calls
+        // **0x501270**, which answers `[0x691DC8]` — the same global the race-plate
+        // driver name (main.rs, `used_cars`'s doc) and the mission-result `%s` line
+        // (`App::mission_text_lines`'s `.replacen("%s", &self.player_name, 1)`) already
+        // read. `factfirst.lay`'s own block (`stringID=3000`, "Привет, %s, добро
+        // пожаловать...") is the only shipped one whose text actually carries a `%s`;
+        // the other three (`accountlogin`/`factdone`/`factwelcome`) have none, so the
+        // substitution is a silent no-op there — matching a `sprintf` with no format
+        // specifier left to fill.
+        let text = if e.class.eq_ignore_ascii_case("NFS5.WORDWRAPCONTROL") && text.contains("%s") {
+            text.replacen("%s", &accessor("Player.Name").unwrap_or_default(), 1)
+        } else {
+            text
         };
         // the highlighted button uses its own `hovercolor`, as the original does
         let color = if selected == Some(i) {

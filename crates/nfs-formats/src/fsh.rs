@@ -12,8 +12,35 @@
 //!   **after** the base (0x8000 for 256², 0x7000 for 128²: the chain runs down to 1×1, and the
 //!   pixel block is the base plus that many quarter-size levels, padded to 16 — `mipchain`
 //!   example; the game's own reader 0x44D710 sums the levels the same way and decrements the
-//!   nibble when it drops the top level. *Corrected 2026-09-26: this said "including the base".*) Palette attachments: `0x2A` 32-bit, `0x29`/`0x2D` 16-bit (HYPOTHESIS on
-//!   channel order). `0x6F` = text comment, `0x7C` = hot-spot table.
+//!   nibble when it drops the top level. *Corrected 2026-09-26: this said "including the base".*) Palette attachments: `0x2A` 32-bit, `0x29`/`0x2D` 16-bit. `0x6F` = text comment, `0x7C` = hot-spot
+//!   table.
+//! - Palette attachment `0x29` = RGB565, `0x2D` = ARGB1555: **CONFIRMED 2026-09-29** by reading the
+//!   blitter's palette-converter dispatch `0x5346D0` (`RE/notes/car-model.md` ~589) and its two
+//!   16-bit targets: `0x29 → 0x570820`, `0x2D → 0x570780` (`0x24`'s sibling, `0x571160`, uses an
+//!   unrelated `imul`-based 6-bit→8-bit rounding expansion — contrast, not this format). Both
+//!   0x570820 and 0x570780 read each raw `u16` little-endian and, unless it equals the colour-key
+//!   word at `[0x6A6420]` (never written anywhere in `.text`/`PACODE` in the shipped exe, so a
+//!   fixed **0** — this is what makes the check equivalent to "raw value is exactly 0x0000"),
+//!   expand it with the exact shift/OR bit-replication `rgb565`/`argb1555` below already used
+//!   (`r << 3 | r >> 2` etc. — no gamma, no LUT) and set alpha 255 (opaque); on a match they write
+//!   an all-zero dword (fully transparent). For `0x2D` (ARGB1555) this colour-key check changes
+//!   nothing already-correct — `0x0000` already has its own alpha bit (bit 15) clear, which
+//!   `argb1555` already treats as transparent — but for `0x29` (RGB565, which has no alpha bit of
+//!   its own) it is the *only* source of transparency, and matters a lot: scanning every shipped
+//!   `FEData/Art/*.fsh`'s `0x29` palettes, most entries used by name-indexed pictures (e.g.
+//!   `ScreenFullOval.lay`'s 45 `FullOval.fsh` tiles, `shapeIndex` 0..44) carry 60-255 of their 256
+//!   slots as raw `0x0000` — a tiled-oval mask needs most of each square tile transparent outside
+//!   the oval curve. The port previously had no such rule (every `0x29` entry decoded opaque),
+//!   which is now fixed below.
+//! - **Investigated and NOT ported (2026-09-29):** a hypothesised 32→16-bit truncation on the FE
+//!   picture builder's "hardware DEFAULT" texture format (`[0x5DE65C]`/`[0x5DE65D]`, set by
+//!   `nfs5.exe`'s `0x534360` via a real driver `THRASH_lockwindow` probe, classified by `0x556880`)
+//!   was traced end to end across both driver DLLs on disk (`dx7z.dll`, `opengl3z.dll`) — see
+//!   `RE/notes/thrash.md` §11 / `RE/notes/layouts.md` "16-bit texture-format lead, closed". On
+//!   both drivers' actual shipped configuration it resolves to 32-bit/no-truncation, not
+//!   4444/1555/565, so no truncate-then-re-expand step was added here; the `carcompare`/
+//!   `chronicle` background brightness gap that motivated the search remains open, root cause
+//!   elsewhere.
 //!
 //! ```text
 //! +0   "SHPI"
@@ -166,6 +193,32 @@ impl Fsh {
         next - e.offset as usize
     }
 
+    /// The `0x6F` "text comment" attachment trailing an entry's image/palette blocks, if it has
+    /// one — the chronicle timeline's caption above a picture cell, `RE/notes/controls.md`
+    /// §4.118/§4.126/§4.173. Confirmed 2026-09-29 by hand-parsing `FEData/Chron/icons356.fsh`'s
+    /// directory byte for byte: `pE001a`/`pE003a`'s two `"48p "`/`"50p "` entries carry the
+    /// literal ASCII `"356 ROADSTER NO1"` / `"356 Roadster No1"` and `"356"` right after their
+    /// `0x7B` image and `0x29` palette blocks, matching `chronicle.lay`'s on-screen caption at
+    /// 1948/1950 (`cmp_chronicle.jpg`) exactly.
+    ///
+    /// A `0x6F` block does **not** follow the ordinary 16-byte `code + size(u24) + width(u16) +
+    /// height(u16) + misc(4×u16)` header that every image/palette block uses: the 3-byte `size`
+    /// field is always zero (which is why the generic block walk in [`parse_blocks`] correctly
+    /// treats it as the entry's last block — it always is, in every shipped file), and the field
+    /// at `+4` that an image block would read as `width` is instead the **text length**, with
+    /// that many bytes — null-padded — starting at `+8` (`FshBlock::offset + 8`). This reads that
+    /// length back out of the already-parsed [`FshBlock::width`] rather than reparsing anything.
+    pub fn entry_caption(&self, data: &[u8], idx: usize) -> Option<String> {
+        let e = self.entries.get(idx)?;
+        let b = e.blocks.iter().find(|b| b.code == 0x6F)?;
+        let len = b.width as usize;
+        let start = b.offset + 8;
+        let raw = data.get(start..start + len)?;
+        let text: String = raw.iter().take_while(|&&c| c != 0).map(|&c| crate::locale::cp1252(c)).collect();
+        let text = text.trim().to_string();
+        (!text.is_empty()).then_some(text)
+    }
+
     /// Decode the base mip level of entry `idx` to RGBA8.
     pub fn decode(&self, data: &[u8], idx: usize) -> Result<DecodedImage, FormatError> {
         self.decode_mip(data, idx, 0)
@@ -239,8 +292,15 @@ impl Fsh {
                     match pal.code {
                         // Stored as B,G,R,A (little-endian ARGB). CONFIRMED visually on car textures.
                         0x2A => [c[2], c[1], c[0], c[3]],
-                        // HYPOTHESIS: 0x29 = RGB565, 0x2D = ARGB1555.
-                        0x29 => rgb565(u16::from_le_bytes([c[0], c[1]])),
+                        // CONFIRMED (0x570820, see the module doc above): RGB565, transparent
+                        // (0,0,0,0) when the raw u16 is the fixed colour-key 0x0000.
+                        0x29 => {
+                            let raw = u16::from_le_bytes([c[0], c[1]]);
+                            if raw == PALETTE_565_COLORKEY { [0, 0, 0, 0] } else { rgb565(raw) }
+                        }
+                        // CONFIRMED (0x570780): ARGB1555; its own colour-key check against the
+                        // same fixed 0x0000 changes nothing here since alpha's own bit (15) is
+                        // already clear on 0x0000.
                         _ => argb1555(u16::from_le_bytes([c[0], c[1]])),
                     }
                 };
@@ -285,6 +345,10 @@ impl Fsh {
     }
 }
 
+/// The 16-bit palette converters' (0x570820/0x570780) fixed colour-key word, read once from
+/// `[0x6A6420]` and never written anywhere in `.text`/`PACODE` in the shipped exe — CONFIRMED 0.
+const PALETTE_565_COLORKEY: u16 = 0x0000;
+
 fn rgb565(v: u16) -> [u8; 4] {
     let r = ((v >> 11) & 0x1F) as u8;
     let g = ((v >> 5) & 0x3F) as u8;
@@ -321,4 +385,67 @@ fn parse_blocks(data: &[u8], mut off: usize) -> Result<Vec<FshBlock>, FormatErro
         off += size as usize;
     }
     Ok(blocks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal synthetic SHPI: one `0x7B` (8-bit indexed) 2×1 image over a `0x29` (RGB565)
+    /// palette whose entry 0 is the fixed colour-key `0x0000` and entry 1 is `0x63f0` — the exact
+    /// value at `FullOval.fsh`'s `fb40` palette slot 63 (`RE/notes/car-model.md`, converter
+    /// `0x570820`). No shipped `FEData/Art/*.fsh` pixel data actually indexes a `0x0000` palette
+    /// slot (scanned exhaustively 2026-09-29 — every such slot in every shipped file is unused
+    /// filler), so this is the only way to exercise the colour-key branch on real numbers.
+    fn synthetic_indexed_565() -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(b"SHPI");
+        d.extend_from_slice(&0u32.to_le_bytes()); // declared size, unused by parse/decode
+        d.extend_from_slice(&1u32.to_le_bytes()); // entry count
+        d.extend_from_slice(b"GIMX");
+        d.extend_from_slice(b"test"); // directory: name
+        d.extend_from_slice(&24u32.to_le_bytes()); // directory: entry offset
+        assert_eq!(d.len(), 24);
+        // Image block: code 0x7B, size 18 (16-byte header + 2 pixel bytes), 2x1, misc zero.
+        d.push(0x7B);
+        d.extend_from_slice(&18u32.to_le_bytes()[..3]);
+        d.extend_from_slice(&2u16.to_le_bytes());
+        d.extend_from_slice(&1u16.to_le_bytes());
+        d.extend_from_slice(&[0u8; 8]);
+        d.push(0); // pixel 0 -> palette index 0 (colour-key, transparent)
+        d.push(1); // pixel 1 -> palette index 1 (opaque RGB565)
+        assert_eq!(d.len(), 24 + 18);
+        // Palette block: code 0x29, size 0 (last block), 2x1 entries, misc zero.
+        d.push(0x29);
+        d.extend_from_slice(&[0u8; 3]);
+        d.extend_from_slice(&2u16.to_le_bytes());
+        d.extend_from_slice(&1u16.to_le_bytes());
+        d.extend_from_slice(&[0u8; 8]);
+        d.extend_from_slice(&0x0000u16.to_le_bytes());
+        d.extend_from_slice(&0x63f0u16.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn palette_0x29_colorkey_zero_is_transparent() {
+        let d = synthetic_indexed_565();
+        let f = Fsh::parse(&d).unwrap();
+        let img = f.decode(&d, 0).unwrap();
+        assert_eq!(&img.rgba[0..4], &[0, 0, 0, 0], "raw palette word 0x0000 must decode fully transparent (0x570820)");
+        assert_eq!(&img.rgba[4..8], &[99, 125, 132, 255], "0x63f0 -> (r<<3|r>>2, g<<2|g>>4, b<<3|b>>2, 255)");
+    }
+
+    #[test]
+    fn rgb565_bit_replication_matches_0x570820() {
+        // A few hand-picked words, checked against the 0x570820 read (car-model.md ~589,
+        // `RE/notes/layouts.md` "carcompare, read 2026-09-29"): shift-and-OR replication, no
+        // gamma, no LUT.
+        assert_eq!(rgb565(0x0000), [0, 0, 0, 255]);
+        assert_eq!(rgb565(0xFFFF), [255, 255, 255, 255]);
+        assert_eq!(rgb565(0xF800), [255, 0, 0, 255]); // R5=31, G6=0, B5=0
+        assert_eq!(rgb565(0x07E0), [0, 255, 0, 255]); // G6=63
+        assert_eq!(rgb565(0x001F), [0, 0, 255, 255]); // B5=31
+        assert_eq!(rgb565(0x63f0), [99, 125, 132, 255]); // FullOval.fsh fb40 palette slot 63
+        assert_eq!(rgb565(0x0001), [0, 0, 8, 255]); // FullOval.fsh fbr0 palette slot 0
+    }
 }

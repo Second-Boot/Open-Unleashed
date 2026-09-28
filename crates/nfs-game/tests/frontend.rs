@@ -196,7 +196,7 @@ fn part_categories_map_to_their_headings() {
 
     // a heading is 13 px and so is a row, which is why a parts list's rows are not all the same
     assert_eq!(nfs_game::layout::PART_HEADER_H, 13.0);
-    assert_eq!(nfs_game::layout::ListRow::Header("ENGINE".into()).height(), 13.0);
+    assert_eq!(nfs_game::layout::ListRow::Header("ENGINE".into(), false).height(), 13.0);
     assert_eq!(nfs_game::layout::ListRow::Text("ALPS".into()).height(), nfs_game::layout::LIST_ROW_H);
 }
 
