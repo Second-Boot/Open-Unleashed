@@ -142,9 +142,111 @@ pub fn player_in(id: i32, name: &[u8]) -> Vec<u8> {
     encode(kind::JOIN, Some(id), None, Some(name))
 }
 
+/// The lobby's ping exchange, `0xC3` (`network.md` §11.11).
+///
+/// **0x48D9F0** sends `0x48C870(0xC3, player id, net+0x148, null)` on the link to the host: the
+/// head's value is the id of the player whose ping is wanted, the word is *our own* last measured
+/// round trip (`net+0x148`, ms). The host's case 195 (**0x491661…0x4916CE**) stores that word on the
+/// sender's peer record (`peer+0xB0`, initially −1: 0x48A570) and answers the sender with
+/// `0xC3(asked id, that player's peer+0xB0)`; the asker's handler (**0x48F527…0x48F574**) finds
+/// the player with that id and calls **0x490600**: `net+0x148 = GetTickCount() − player+0x44`,
+/// `player+0x54 = word`, `player+0x58 = 0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ping {
+    /// the player whose ping is asked / answered
+    pub id: i32,
+    /// request: the sender's own last round trip; answer: the asked player's, or −1
+    pub word: i32,
+}
+
+impl Ping {
+    pub fn encode(&self) -> Vec<u8> {
+        encode(kind::PING, Some(self.id), Some(self.word as u32), None)
+    }
+
+    pub fn parse(m: &[u8]) -> Option<Self> {
+        (m.first() == Some(&kind::PING)).then_some(())?;
+        let w = m.get(4..8)?;
+        Some(Self { id: head(m)?, word: i32::from_be_bytes([w[0], w[1], w[2], w[3]]) })
+    }
+}
+
 /// `0xB1` — **0x492501**: `0x48C870(0xB1, id, OMIT, null)`, the head alone.
+/// `0xB3` from the host to every link — **0x48BF10**: `0x48C870(0xB3, 0, clock)`, the head's value
+/// 0 and the word the host's game clock (`0x48A9A0()`).
+pub fn race_start(clock: u32) -> Vec<u8> {
+    encode(kind::START, Some(0), Some(clock), None)
+}
+
 pub fn player_out(id: i32) -> Vec<u8> {
     encode(kind::LEAVE, Some(id), None, None)
+}
+
+/// `0xB3` **request**, player to room — **0x48D370**: `0x48C870(0xB3, OMIT, OMIT, null)`, the type
+/// byte alone, on the link to the host (`[net+0xC]`). PLAYGAME's 0x50CE90 sends it on every machine
+/// (0x50CF73); the room's answer is [`Room::start_request`].
+pub fn start_request() -> Vec<u8> {
+    encode(kind::START, None, None, None)
+}
+
+/// `0xC5` **request**, player to room — **0x48D3A0**: `0x48C870(0xC5, OMIT, OMIT, null)`. The race
+/// frame's set-up 0x4152E0 sends it (0x4153AE) once its barrier is passed and `net+0xC5` is clear.
+pub fn go_request() -> Vec<u8> {
+    encode(kind::GO, None, None, None)
+}
+
+/// `0xC5` from the room to every link — **0x48BFB0**: `0x48C870(0xC5, 0, clock, null)`, the first
+/// request's answer (the room's `+0xCC4` latch keeps it to one).
+pub fn go(clock: u32) -> Vec<u8> {
+    encode(kind::GO, Some(0), Some(clock), None)
+}
+
+/// `0xB7` from a player to the room — **0x48DA60** `(a, b)`: `0x48C870(0xB7, a, b, null, 0)`, so the
+/// 24-bit head is `a` and the word `b`. A finished race sends `(time, best lap)` (0x4168A9:
+/// `[0x606AC4] − 0x1C0` and the smallest of the car's lap times), a player leaving the game `(−1,
+/// −1)` (0x48DAD0) and one returning to the front end `(−2, −1)` (0x48DA60's callers pass −2, −1).
+pub fn race_time_request(a: i32, b: i32) -> Vec<u8> {
+    encode(kind::RACE_TIME, Some(a), Some(b as u32), None)
+}
+
+/// `0xB7` from the room to every link — **0x48C220** (0x48C245): `0x48C870(0xB7, sender's id,
+/// a, null, 0)`: the head is the sender's player id, the word what the sender put in the head.
+pub fn race_time(id: i32, a: i32) -> Vec<u8> {
+    encode(kind::RACE_TIME, Some(id), Some(a as u32), None)
+}
+
+/// The values `[net+0x24]` takes and 0x509550 switches on (`network.md` §11.10), with the site that
+/// writes each: `0xC6` carries the state the host wants us in (0x48F352 `mov [ebp+0x24], edi`),
+/// the link's own events write 4 (0x48F0C4, 0x48FBB6) and the connect calls 3 (0x48E24A,
+/// 0x48E4B4, 0x48E68E); creating a session writes 2 (0x48DF69).
+pub mod comm_state {
+    /// 0x48DF69: the session this machine hosts
+    pub const HOSTING: u32 = 2;
+    /// 0x48E24A: a connect is under way — 0x509550 keeps `IDS_MPCONNECTING` (817) up
+    pub const CONNECTING: u32 = 3;
+    /// 0x48F0C4 / 0x48FBB6: the link dropped — 830
+    pub const LOST: u32 = 4;
+    /// 831 `IDS_COULDNOTCONNECT`
+    pub const COULD_NOT_CONNECT: u32 = 6;
+    /// 819
+    pub const BAD_LOGIN: u32 = 7;
+    /// 0x509550's input dialog 821 `IDS_PERSONATAKEN`
+    pub const NAME_TAKEN: u32 = 8;
+    /// `0xC6 (9)` from 0x491746 "Ejected by host" — 818 `IDS_MPEJECTED`
+    pub const EJECTED: u32 = 9;
+    /// `0xC6 (0xA)` from 0x491578 / 0x49161D — 822 `IDS_WRONGVERSION`
+    pub const WRONG_VERSION: u32 = 10;
+    /// `0xC6 (0xB)` from 0x49159E / 0x491642 — 820 `IDS_GAMEFULL`
+    pub const FULL: u32 = 11;
+    /// 830 again
+    pub const LOST_2: u32 = 12;
+    /// `0xC6 (0xE)` (0x491AAA, 0x49157A path, 0x491C1B): admitted — `[net+0xBE] = 1` (0x48F357)
+    pub const CONNECTED: u32 = 14;
+}
+
+/// `0xC6` — **0x48C870(0xC6, state, OMIT, null)**: what the host tells a connection about itself.
+pub fn state(v: u32) -> Vec<u8> {
+    encode(kind::EJECT, Some(v as i32), None, None)
 }
 
 /// One piece of a player's file: `0xBF` for the first, `0xC0` for the rest (0x48CCF3…0x48CD07).
@@ -220,6 +322,13 @@ pub struct Player {
     pub id: i32,
     pub name: Vec<u8>,
     pub files: Vec<Packet>,
+    /// `+0x50` — the player's finish time in ticks, −1 until its `0xB7` came (0x48F5D1; 0x48C840
+    /// starts it at −1). `0x48D770` answers it.
+    pub time: i32,
+    /// `+0x48` — written with `+0x50` by the same `0xB7` (0x48F5D4), and by the paused `0xBE`
+    /// variant (0x48F699) which the port neither sends nor hears; −1 until then. 0x48D770 only
+    /// compares it (`network.md` §11.15).
+    pub progress: i32,
 }
 
 /// Where the host sends something: every link (`0x48C870` with a null destination, 0x48C921) or
@@ -238,6 +347,23 @@ pub enum Heard {
     Chat(ChatLine),
     /// a player's file has come in whole
     File { from: i32, kind: u16 },
+    /// `0xB3` — the host is starting the race; the word is its game clock (0x48F82F)
+    Start { clock: u32 },
+    /// `0xBC` — option records for the option table (0x48F998 → 0x4B4B80)
+    Options(Vec<Vec<u32>>),
+    /// `0xC6` — the host's word on our connection, which 0x48F352 stores as the comm state
+    /// `[net+0x24]` (see [`comm_state`])
+    State(i32),
+    /// `0xB7` — a player's finish time: `+0x50 = +0x48 = value` on the player with that id
+    /// (0x48F5D1 / 0x48F5D4); −1 ("leaving game") lands the same way
+    RaceTime { id: i32, value: i32 },
+    /// `0xB7` with the value −2 — the player is back in the front end: its bit leaves `net+0xE5`
+    /// (0x48F5B9…0x48F5CF)
+    Returned(i32),
+    /// `0xC5` (0x48F8D2): with `net+0xC4` set it is the room's go — `+0xC4 = 0`, `+0x15C` = the
+    /// word; with it clear the player's bit joins `net+0xE5` (0x48F911…0x48F91F). The caller
+    /// keeps `+0xC4`, so it decides which
+    Go { id: i32, clock: u32 },
 }
 
 /// The room as one player sees it — `net+0x260` (the players), `net+0x264` (our own files still
@@ -253,11 +379,21 @@ pub struct Room {
     outgoing: VecDeque<Packet>,
     /// `net+0x1C`, in `GetTickCount() << 5` units; `None` until the first tick
     clock: Option<u32>,
+    /// **The host's room object, 0x48BF10 / 0x48BFB0 / 0x48C220** — `+0xCC2`: the players who are in
+    /// the lobby group (bit = id). All eight at the room's construction (0x48BA39), a bit is set at a
+    /// player's admission (0x48BB9A…0x48BBAC) and again by its `0xB7 (−2)` (0x48C24F…0x48C25D),
+    /// cleared by its `0xB3` request (0x48BF21…0x48BF2B). The `0xBC` relay 0x48C050 hands a record
+    /// only to the players whose bit equals the sender's.
+    lobby: u8,
+    /// `+0xCC3` — a race is running (0x48BF51 sets it, 0x48BA40 and 0x48C273 clear it)
+    running: bool,
+    /// `+0xCC4` — the room's `0xC5` has gone out for this race (0x48BFEF sets it, 0x48BF58 clears)
+    go_sent: bool,
 }
 
 impl Room {
     pub fn new(me: i32) -> Self {
-        Self { me, ..Self::default() }
+        Self { me, lobby: 0xFF, ..Self::default() }
     }
 
     pub fn player(&self, id: i32) -> Option<&Player> {
@@ -272,7 +408,7 @@ impl Room {
                 let id = head(m)?;
                 let mut name = c_str(m, 4);
                 name.truncate(NAME_MAX);
-                self.players.push(Player { id, name, files: Vec::new() });
+                self.players.push(Player { id, name, files: Vec::new(), time: -1, progress: -1 });
                 Some(Heard::Joined(id))
             }
             // 0x48F46F: every record with that id goes
@@ -282,6 +418,38 @@ impl Room {
                 Some(Heard::Left(id))
             }
             kind::CHAT => ChatLine::parse(m).map(Heard::Chat),
+            // 0x48F82F: the word at `+4` is read byte by byte (0x48F8A2…0x48F8C2) and handed to
+            // 0x48A9B0; the rest of the handler resets the room's ready state, which the port
+            // keeps no copy of
+            kind::START => {
+                let w = m.get(4..8)?;
+                Some(Heard::Start { clock: u32::from_be_bytes([w[0], w[1], w[2], w[3]]) })
+            }
+            kind::OPTIONS => Some(Heard::Options(crate::options::decode(m))),
+            // 0x48F579: the player whose `+0x40` is the head; the word at `+4` is `−2` — its bit
+            // leaves `net+0xE5` — or a time, which goes to `+0x50` and `+0x48` (0x48F5D1 / 0x48F5D4)
+            kind::RACE_TIME => {
+                let id = head(m)?;
+                let w = m.get(4..8)?;
+                let value = i32::from_be_bytes([w[0], w[1], w[2], w[3]]);
+                if value == -2 {
+                    return Some(Heard::Returned(id));
+                }
+                if let Some(p) = self.players.iter_mut().find(|p| p.id == id) {
+                    p.time = value;
+                    p.progress = value;
+                }
+                Some(Heard::RaceTime { id, value })
+            }
+            // 0x48F8D2: the word at `+4` is the clock (read before the `+0xC4` test only in the
+            // branch that stores it)
+            kind::GO => {
+                let id = head(m)?;
+                let clock = m.get(4..8).map_or(0, |w| u32::from_be_bytes([w[0], w[1], w[2], w[3]]));
+                Some(Heard::Go { id, clock })
+            }
+            // 0x48F34F: the value is the state
+            kind::EJECT => Some(Heard::State(head(m)?)),
             kind::DATA_FIRST | kind::DATA_MORE => {
                 let c = Chunk::parse(m)?;
                 // 0x48F6AD: the sender is looked up by the byte, `player+0x40 == id`
@@ -369,19 +537,29 @@ impl Room {
     }
 
     /// **The host's room, 0x48BB50** — a player comes in. The newcomer is told of everyone already
-    /// there, one `0xB0` each (0x48BC2C…0x48BC8F), and then everyone, the newcomer included, is
-    /// told of the newcomer (0x48BCC1…0x48BCD8). Returns nothing once the room holds eight.
+    /// there, one `0xB0` each (0x48BC2C…0x48BC8F) — and, right after it, **`0xC5 (id)`** (0x48BC71…
+    /// 0x48BC80: `0x48C870(0xC5, id, OMIT, null, newcomer)`) for each player whose bit is **clear**
+    /// in `+0xCC2` (0x48BC53…0x48BC6A `test al, dl ; jne`) — a player already in the race, which the
+    /// newcomer's `+0xC4 == 0` handler (0x48F911…0x48F91F) puts into `net+0xE5`; then everyone, the
+    /// newcomer included, is told of the newcomer (0x48BCC1…0x48BCD8). Returns nothing once the room
+    /// holds eight.
     ///
     /// Not carried from the same function: the `0xB2` that hands the newcomer its id and the game's
-    /// name (this port's id comes with the session's `'a'`), and the `0xC5` sent for each player
-    /// whose ready bit is set, since `READY` is not ported.
+    /// name (this port's id comes with the session's `'a'`).
     pub fn admit(&self, id: i32, name: &[u8]) -> Vec<(To, Vec<u8>)> {
         if self.players.len() >= MAX_PLAYERS {
             return Vec::new();
         }
-        let mut out: Vec<(To, Vec<u8>)> =
-            self.players.iter().map(|p| (To::Player(id), player_in(p.id, &p.name))).collect();
+        let mut out: Vec<(To, Vec<u8>)> = Vec::new();
+        for p in &self.players {
+            out.push((To::Player(id), player_in(p.id, &p.name)));
+            if !self.in_lobby_group(p.id) {
+                out.push((To::Player(id), encode(kind::GO, Some(p.id), None, None)));
+            }
+        }
         out.push((To::All, player_in(id, name)));
+        // 0x491AAA / 0x491C1B: once the room has the player, `0xC6 (0xE)` tells its link it is in
+        out.push((To::Player(id), state(comm_state::CONNECTED)));
         out
     }
 
@@ -401,6 +579,81 @@ impl Room {
             out.push((To::Player(from), line));
         }
         out
+    }
+}
+
+impl Room {
+    /// **The room's `0xB3` case, 0x4917C0 → 0x48BF10** — a player asks for the race. Its bit leaves
+    /// the lobby group (0x48BF21…0x48BF2B); when no race is running yet (0x48BF38 `+0xCC3`, `jne
+    /// 0x48BFA4`) the room starts one — `+0xCC3 = 1` (0x48BF51), `+0xCC4 = 0` (0x48BF58) — and tells
+    /// every link `0xB3 (0, clock)` (0x48BF96…0x48BF9E); a request during a running race only moves
+    /// the bit. (0x48BF10's other
+    /// stores — the input-exchange buffers at `+0xB0`, `+0xCB0`, `+0xCB4`, `+0xCC1` — belong to the
+    /// input-exchange mode; 0x4917E8…0x49184C, which registers the race with a session list and a
+    /// reference count, has no port counterpart.)
+    pub fn start_request(&mut self, from: i32, clock: u32) -> Vec<(To, Vec<u8>)> {
+        if (0..8).contains(&from) {
+            self.lobby &= !(1u8 << from);
+        }
+        if self.running {
+            return Vec::new();
+        }
+        self.running = true;
+        self.go_sent = false;
+        vec![(To::All, race_start(clock))]
+    }
+
+    /// **The room's `0xC5` case, 0x49185B → 0x48BFB0**: the first request of a race is answered with
+    /// `0xC5 (0, clock)` to every link (0x48BFE1…0x48BFEA) and latched in `+0xCC4` (0x48BFEF, tested
+    /// at 0x48BFB3); later ones change nothing.
+    pub fn go_request(&mut self, clock: u32) -> Vec<(To, Vec<u8>)> {
+        if self.go_sent {
+            return Vec::new();
+        }
+        self.go_sent = true;
+        vec![(To::All, go(clock))]
+    }
+
+    /// **The room's `0xB7` case, 0x4918BD → 0x4929B0 → 0x48C220**: the sender's head is a finish
+    /// time, −1 ("Leaving game") or −2 ("Returning to frontend"); every link is sent `0xB7 (sender,
+    /// head)` (0x48C245). For −2 the sender's bit joins the lobby group again (0x48C24F…0x48C25D)
+    /// and when every player of the room is in it (`+0xCC0 & +0xCC2 == +0xCC0`, `+0xCC0` being the
+    /// room's players) the race is over: `+0xCC3 = 0` (0x48C26B…0x48C273).
+    pub fn race_time_request(&mut self, from: i32, head: i32) -> Vec<(To, Vec<u8>)> {
+        if head == -2 && (0..8).contains(&from) {
+            self.lobby |= 1u8 << from;
+            let room = self.players.iter().fold(0u8, |m, p| m | 1u8.checked_shl(p.id as u32).unwrap_or(0));
+            if room & self.lobby == room {
+                self.running = false;
+            }
+        }
+        vec![(To::All, race_time(from, head))]
+    }
+
+    /// Whether a race is running in the room (`+0xCC3`).
+    pub fn race_running(&self) -> bool {
+        self.running
+    }
+
+    /// **The room's relay of `0xBC`, 0x48C050** (the server dispatch's case, 0x49187F): the sender's
+    /// lobby-group bit (`+0xCC2`, 0x48C062…0x48C079) is compared with every room player's
+    /// (0x48C097…0x48C0A4), and only those with **the same** bit are sent the record. The original's
+    /// list includes the sender, which hears its own record back; the port has applied it already, so
+    /// the sender is left out. (When the sender is in the lobby group the original also files the
+    /// record on its player, 0x48A2F0, which the port has no use for: 0x48BB50 replays nothing of the
+    /// sort to a newcomer, `network.md` §11.9.)
+    pub fn relay_options(&self, from: i32, m: &[u8]) -> Vec<(To, Vec<u8>)> {
+        let group = self.in_lobby_group(from);
+        self.players
+            .iter()
+            .filter(|p| p.id != from && self.in_lobby_group(p.id) == group)
+            .map(|p| (To::Player(p.id), m.to_vec()))
+            .collect()
+    }
+
+    /// Whether `id` is in the lobby group (`+0xCC2`).
+    pub fn in_lobby_group(&self, id: i32) -> bool {
+        (0..8).contains(&id) && self.lobby & (1u8 << id) != 0
     }
 }
 
@@ -432,6 +685,17 @@ pub fn format(f: &str, args: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0x48BF10 sends `0xB3` with the head's value 0 and the host's clock as the word; 0x48F82F
+    /// reads that word back byte by byte.
+    #[test]
+    fn the_race_start_carries_the_hosts_clock() {
+        let m = race_start(0x0102_0304);
+        assert_eq!(m, vec![0xB3, 0, 0, 0, 1, 2, 3, 4]);
+        let mut r = Room::new(1);
+        assert_eq!(r.hear(&m), Some(Heard::Start { clock: 0x0102_0304 }));
+        assert_eq!(r.hear(&m[..6]), None, "a short one is not a start");
+    }
 
     #[test]
     fn the_two_chat_shapes_differ_by_the_omitted_word() {
@@ -485,8 +749,44 @@ mod tests {
         assert_eq!(out[0], (To::Player(2), player_in(0, b"host")));
         assert_eq!(out[1], (To::Player(2), player_in(1, b"anna")));
         assert_eq!(out[2], (To::All, player_in(2, b"ben")));
+        // and then the room tells the newcomer's link it is in (0x491AAA)
+        assert_eq!(out[3], (To::Player(2), state(comm_state::CONNECTED)));
+        assert_eq!(r.hear(&out[3].1), Some(Heard::State(14)));
         assert_eq!(r.hear(&player_out(1)), Some(Heard::Left(1)));
         assert_eq!(r.players.iter().map(|p| p.id).collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[test]
+    fn a_lobby_record_reaches_only_the_senders_group() {
+        // 0x48C050: `sender bit == player bit` — anna has asked for the race and left the lobby group
+        let mut r = Room::new(0);
+        for (id, n) in [(0, &b"host"[..]), (1, b"anna"), (2, b"ben")] {
+            r.hear(&player_in(id, n));
+        }
+        let m = vec![0xBC, 0, 0, 1];
+        let all: Vec<i32> = r.relay_options(2, &m).iter().map(|(t, _)| if let To::Player(i) = t { *i } else { -1 }).collect();
+        assert_eq!(all, vec![0, 1], "everybody is in the lobby group: the others hear it");
+        r.start_request(1, 100);
+        let lobby: Vec<i32> = r.relay_options(2, &m).iter().map(|(t, _)| if let To::Player(i) = t { *i } else { -1 }).collect();
+        assert_eq!(lobby, vec![0], "anna is in the race now: a lobby record does not reach her");
+        let racing: Vec<i32> = r.relay_options(1, &m).iter().map(|(t, _)| if let To::Player(i) = t { *i } else { -1 }).collect();
+        assert!(racing.is_empty(), "and hers reaches nobody in the lobby");
+    }
+
+    #[test]
+    fn a_newcomer_is_told_which_players_are_already_in_the_race() {
+        // 0x48BC53…0x48BC80: after each `0xB0`, `0xC5 (id)` for a player whose `+0xCC2` bit is clear
+        let mut r = Room::new(0);
+        r.hear(&player_in(0, b"host"));
+        r.hear(&player_in(1, b"anna"));
+        r.start_request(1, 500); // anna asks for the race: her bit leaves the lobby group
+        let out = r.admit(2, b"ben");
+        assert_eq!(out[0], (To::Player(2), player_in(0, b"host")));
+        assert_eq!(out[1], (To::Player(2), player_in(1, b"anna")));
+        assert_eq!(out[2], (To::Player(2), encode(kind::GO, Some(1), None, None)));
+        assert_eq!(out[3], (To::All, player_in(2, b"ben")));
+        // the newcomer's `+0xC4 == 0` handler puts her bit into `net+0xE5` (0x48F91F)
+        assert_eq!(r.hear(&out[2].1), Some(Heard::Go { id: 1, clock: 0 }));
     }
 
     #[test]

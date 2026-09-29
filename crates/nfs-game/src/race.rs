@@ -654,6 +654,39 @@ pub struct GridRule {
     pub derby_cars: Option<u32>,
 }
 
+/// What `Race_updateProgress` 0x416310's `DERBY` arm (0x416407…0x41646A, game type 3 only) does with one
+/// racer still racing (`car+0xB50 == 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerbyOutcome {
+    /// nothing: the car races on
+    Racing,
+    /// all eight ring zones past the limit: `car+0xB50 = 3`, `car+0xB14 = tick`, `car+0xB24 = 0`
+    /// (0x416447…0x416460), then `0x48DA60(tick − 0x1C0, tick)`
+    Out,
+    /// every racer but this one is out: `car+0xB50 = 2`, `car+0xB14 = tick` (0x4164A8…0x4164B8), then
+    /// the same `0xB24 = 0` and report (0x416458…0x41646A)
+    Wins,
+}
+
+/// `[0x5B2408]`, the zone limit the knockout compares `car+0x4E4 + 4k` (k = 0…7) against.
+pub const DERBY_ZONE_LIMIT: f32 = 30.0;
+
+/// The `DERBY` arm for one racer (`network.md` §11.18, `suspension-collision.md` §6): `zones` are the ten
+/// damage zones `car+0x4E4…` (the first eight are the ring, 0x41641F…0x416440: `fcomp [0x5B2408] ;
+/// test ah, 0x41 ; jne` counts a zone only when it is **above** the limit); `out` is how many of the
+/// `racers` (`[0x658084]`, the racer array `0x5E8C00[]`) are already in state 3 (0x416477…0x416499);
+/// the last one not out wins (`out < racers − 1` leaves the car racing, 0x41649F…0x4164A2).
+pub fn derby_outcome(zones: &[f32], out: usize, racers: usize) -> DerbyOutcome {
+    let over = zones.iter().take(8).filter(|z| **z > DERBY_ZONE_LIMIT).count();
+    if over == 8 {
+        DerbyOutcome::Out
+    } else if out + 1 < racers {
+        DerbyOutcome::Racing
+    } else {
+        DerbyOutcome::Wins
+    }
+}
+
 /// `Car_raceInit`'s start slice (0x410896…0x410924): the slice the tracker puts the scene's type-2
 /// trigger on (0x46D290(2, 0), `setSlice(1)` then 0x474440 at its position); with no such
 /// trigger, a point-to-point track whose lap has at least 100 slices starts at **50**, every other
@@ -777,6 +810,20 @@ mod tests {
         // the smash-up spacing: (n − g − 1)·(0xEA / NUMCARS) + 1
         let derby = GridRule { linear: true, derby_cars: Some(8) };
         assert_eq!(grid_slot(&t, 10, 0, 4, &derby).0, 10 + 2 * 29 + 1);
+    }
+
+    /// The network draw's `.STARTINGPOS` values are 0…n−1 (0x4B4FD0's pool is 0-based) and `Grid_slot`
+    /// takes them as `g` itself: the 0 (`grid_pos` `u32::MAX`, i.e. `g − 1`) sits **one row ahead
+    /// of the pole** (`g = 1`), on the even side.
+    #[test]
+    fn a_drawn_startingpos_of_zero_stands_one_row_ahead_of_the_pole() {
+        let t = ring(100);
+        let rule = GridRule::default();
+        let pole = grid_slot(&t, 10, 0, 4, &rule);
+        let zero = grid_slot(&t, 10, u32::MAX, 4, &rule);
+        assert_eq!(pole.0, 10 + 10);
+        assert_eq!(zero.0, 10 + 3 * 4 + 1, "k = 3·(n − 0) + 1");
+        assert_eq!(zero.1, Vec3::new(-2.5, 0.5, 0.0), "g & 1 == 0: the other side");
     }
 
     /// Backwards: the original flips the side (`car+0xEAC · [0x5E753C] == −1`) in its own frame
@@ -1230,7 +1277,7 @@ mod projection_tests {
 
 #[cfg(test)]
 mod ranking_tests {
-    use super::ranking;
+    use super::{derby_outcome, ranking, DerbyOutcome};
 
     #[test]
     fn the_ranking_table_is_progress_then_the_earlier_tick() {
@@ -1240,5 +1287,26 @@ mod ranking_tests {
         assert_eq!(ranking(&cars), vec![2, 0, 3, 1]);
         // equal progress: the earlier `car+0xB14` first; a full tie keeps the update order
         assert_eq!(ranking(&[(1.5, 20), (1.5, 10), (1.5, 10)]), vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn the_smash_up_knocks_a_car_out_at_eight_zones_over_thirty_and_the_last_one_wins() {
+        // 0x41641F…0x416440: the ring zones 0…7 strictly above 30 — the roof (8) and the underside (9)
+        // do not count, and 30 itself is not over
+        let mut z = [31.0f32; 10];
+        assert_eq!(derby_outcome(&z, 0, 3), DerbyOutcome::Out);
+        z[7] = 30.0;
+        assert_eq!(derby_outcome(&z, 0, 3), DerbyOutcome::Racing, "seven over is not out");
+        z[7] = 31.0;
+        z[8] = 0.0;
+        z[9] = 0.0;
+        assert_eq!(derby_outcome(&z, 0, 3), DerbyOutcome::Out, "the roof and the floor are not in the count");
+        // 0x416477…0x4164A2: `out < racers − 1` races on; the last one not out wins
+        let fresh = [0.0f32; 10];
+        assert_eq!(derby_outcome(&fresh, 1, 3), DerbyOutcome::Racing);
+        assert_eq!(derby_outcome(&fresh, 2, 3), DerbyOutcome::Wins);
+        assert_eq!(derby_outcome(&fresh, 0, 1), DerbyOutcome::Wins, "a lone racer wins at once (0 < 0 fails)");
+        // a car whose own eight zones are over is out before the count is looked at
+        assert_eq!(derby_outcome(&z, 2, 3), DerbyOutcome::Out);
     }
 }

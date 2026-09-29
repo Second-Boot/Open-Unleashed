@@ -29,6 +29,14 @@ pub struct RaceCar {
     pub eliminated: bool,
     /// diagnostic only: was the car off every drivable patch last tick (`NFS_OFFROAD_LOG`)
     pub off_surface: bool,
+    /// `car+0xD87`, the lamp byte: bit 0 | 1 the headlights, 2 the high beams, 3 (8) / 4 (0x10) the
+    /// indicators. `Car_init` 0x410C74 starts it as the night flag; only the commands of a human car's
+    /// controller sample change it (`lamp_command`, 0x49933E's switch in 0x4991E0) — the racers'
+    /// draw reads it (0x439627 for the headlights, 0x439408 for the indicators).
+    pub lamp_bits: u8,
+    /// the car's own `.TINYCAR` (`carinfo+0x518`, per-car record id 0x24F): the Gulliver cheat's bit on the machine
+    /// the car belongs to — a network player's car carries what its own machine sent (0x4EF467…0x4EF4A0)
+    pub tiny: bool,
 }
 
 impl RaceCar {

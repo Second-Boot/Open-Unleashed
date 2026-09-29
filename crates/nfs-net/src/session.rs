@@ -88,6 +88,16 @@ pub struct Net {
     pub limit: u32,
     /// `session+0x50`.
     pub mask: u32,
+    /// `session+0x74 … +0x77`, what a `'d'` puts at `+0x48` — the game's descriptor bytes
+    /// `desc+0x20 … +0x23` ([`crate::comm::desc`]).
+    pub desc_bytes: [u8; 4],
+    /// `session+0x78` / `+0x7A`, `'d'` `+0x4C` / `+0x4E` — `desc+0x24` / `+0x26`.
+    pub desc_words: [u16; 2],
+    /// The address record a `'d'` carries at `+0x04` (`conn+0x24`). `None` sends the socket's own
+    /// (0.0.0.0 while bound to every interface). **Platform glue:** a host sets its machine's
+    /// address here so that the answers to one probe that reach a browser over several of its
+    /// interfaces name one session (the browser merges on it), as one broadcast would have.
+    pub advertise: Option<Addr>,
     pub peers: Vec<Option<Peer>>,
     /// our own 16-byte name, which the host refuses if it equals its own (0x588E7E)
     pub my_name: [u8; 16],
@@ -95,20 +105,25 @@ pub struct Net {
     pub host: Option<SocketAddr>,
     /// the slot an `'a'` gave us
     pub slot: Option<u32>,
-    /// Host only. The original does not relay: `0x5894C0` hands the transport a **null** address,
-    /// which the sender thread turns into a subnet broadcast (0x5872C0), so on a LAN every peer
-    /// hears every other peer directly. That only works when all of them sit on the one well-known
-    /// port 1106, which two copies on one machine cannot do. With this set the host passes each
-    /// peer's `'<'` on to the others, which puts the same bytes in front of the same players — it
-    /// is a **substitute for the broadcast**, not something the original does. Clear it and use
-    /// [`Net::broadcast_game`] for the literal behaviour.
+    /// Host only: the **room's relay** — the server dispatch 0x49120C hands a player's `0xBC` to
+    /// 0x48C050 (lobby-group gated), `0xBD` / `0xBF` … `0xC2` to 0x48C0F0 and `0xBE` to 0x48C170, each of which
+    /// sends the message on to the room's other players (`network.md` §11.18; earlier notes took the
+    /// original for a broadcast, `0x5894C0`, which nothing calls). Clear it to make a bare session
+    /// that only receives.
     pub relay: bool,
-    /// `conn+0x5A` — the data layer's own sequence, which `0x5952EF` starts at 1.
-    pub data_seq: u16,
-    /// `conn+0x5E` per peer — the sequence we next expect from that peer, which every frame we
-    /// send it carries as its acknowledgement. The original keeps one connection per peer with its
-    /// own counter, so this is the same thing keyed by address.
-    pub data_ack: std::collections::HashMap<SocketAddr, u16>,
+    /// The data layer's connection object per peer (`conn` of 0x5951A0: its own sequence
+    /// `+0x5A`, ack `+0x5E`, sent list, timers — [`crate::reliable`], `network.md` §11.18), keyed by
+    /// address. Made when the first game frame goes to or comes from a peer.
+    pub conns: std::collections::HashMap<SocketAddr, crate::reliable::Conn>,
+    /// The origin of the 128 Hz tick clock the connections' timers run on (glue: the original's
+    /// `[0x6B7C7C]` is the multimedia timer's counter).
+    epoch: std::time::Instant,
+    /// Host only: the game's gate on a joiner, which the original runs as the callback `conn[0x1C]+0x4C`
+    /// (0x588EBF…0x588ED3, refusing with `-3`) — the room's version and game-name checks (0x48A700,
+    /// 0x49151E…0x491569): `(game, version)` this host answers to. A joiner whose identity string
+    /// ([`comm::identity`], the `'j'` record's tail) names another version or another game is
+    /// refused. `None` (a test's bare session) lets everyone in.
+    pub identity_gate: Option<(String, String)>,
     /// `conn+0xA8`
     alive: u32,
     /// `conn+0xAC`
@@ -126,13 +141,17 @@ impl Net {
             key,
             limit,
             mask: 0,
+            desc_bytes: [0; 4],
+            desc_words: [0; 2],
+            advertise: None,
             peers: vec![None; limit.max(1) as usize],
             my_name: [0; 16],
             host: None,
             slot: None,
             relay: true,
-            data_seq: 1,
-            data_ack: std::collections::HashMap::new(),
+            identity_gate: None,
+            conns: std::collections::HashMap::new(),
+            epoch: std::time::Instant::now(),
             alive: comm::ALIVE_TICKS,
             ping: comm::PING_TICKS,
         }
@@ -148,13 +167,17 @@ impl Net {
             key,
             limit: DEFAULT_LIMIT,
             mask: 0,
+            desc_bytes: [0; 4],
+            desc_words: [0; 2],
+            advertise: None,
             peers: vec![None; DEFAULT_LIMIT as usize],
             my_name,
             host: None,
             slot: None,
             relay: false,
-            data_seq: 1,
-            data_ack: std::collections::HashMap::new(),
+            identity_gate: None,
+            conns: std::collections::HashMap::new(),
+            epoch: std::time::Instant::now(),
             alive: comm::ALIVE_TICKS,
             ping: comm::PING_TICKS,
         }
@@ -179,6 +202,17 @@ impl Net {
     /// `'w'` — shout the session key and see who answers with a `'d'` (0x588AB8).
     pub fn probe(&self, port: u16) -> io::Result<()> {
         self.sock.broadcast(port, tag::W, &self.key).map(|_| ())
+    }
+
+    /// The `'w'` to every place [`crate::socket::probe_targets`] names — the original's own
+    /// broadcast, and the platform glue around it — with what each send answered, so a caller can
+    /// say when the OS refuses one (macOS answers `EHOSTUNREACH`/`EPERM` to a send while the Local
+    /// Network permission is not granted).
+    pub fn probe_all(&self, port: u16) -> Vec<(crate::socket::ProbeKind, SocketAddr, io::Result<usize>)> {
+        crate::socket::probe_targets(port)
+            .into_iter()
+            .map(|(k, a)| (k, a, self.sock.send_to(a, tag::W, &self.key)))
+            .collect()
     }
 
     /// The same probe at one address, for a host the user typed in.
@@ -236,25 +270,84 @@ impl Net {
         self.send_game_to(&to, bytes)
     }
 
+    /// The data layer's clock: 128 Hz ticks since the session was made (glue for `[0x6B7C7C]`).
+    fn ticks(&self) -> i64 {
+        (self.epoch.elapsed().as_micros() as i64 * crate::reliable::TICK_HZ) / 1_000_000
+    }
+
+    /// Which of the game's messages ride the reliable half of the data layer. `network.md` §11.17:
+    /// the input sample (a player's three bytes, 0x55D4D0), the `0xBE` state and the room's `0xC4`
+    /// heartbeat (0x55C2B0) go **unreliably**; the room's frames, `0xB3`, `0xC5`, the reports and
+    /// every other message of the room's links go through 0x55C270 -> 0x595C40 reliably.
+    ///
+    /// A message a client sends the host that the host does not act on itself
+    /// ([`msg_for_the_host`]) is relayed by the **room**: `0xBC` by 0x48C050 (only to the players in
+    /// the sender's lobby group, see [`crate::room::Room::relay_options`]), `0xBD` / `0xBF` … `0xC2` by
+    /// 0x48C0F0 (to every player, the sender excluded for the file chunks), `0xBE` by 0x48C170 — to
+    /// every player but the sender through **0x55C2B0, the unreliable send**, where the others go
+    /// through the slot-0 sender of the room's channel like every other room message
+    /// (`network.md` §11.18). [`Net::relay`] does the relaying (the group gate for `0xBC` is the
+    /// caller's); the client's own send and the relay both go reliably except the `0xBE` state.
+    fn is_reliable(&self, body: &[u8]) -> bool {
+        use crate::msg::kind;
+        match body.first() {
+            None => false,
+            Some(&kind::CAR_STATE) | Some(&0xC4) => false,
+            // below 0xB0: a frame from the room (reliable), a sample from a player (not)
+            Some(&t) if t < 0xB0 => self.role == Role::Host,
+            Some(_) => true,
+        }
+    }
+
     /// [`Net::send_game`] to the addresses named — what the host's room object does when 0x48C980
-    /// finds one player's link for it (`crate::room::To::Player`).
+    /// finds one player's link for it (`crate::room::To::Player`). Reliable or not by
+    /// [`Net::is_reliable`], through the peer's own connection ([`crate::reliable::Conn`]).
     pub fn send_game_to(&mut self, addrs: &[SocketAddr], bytes: &[u8]) -> io::Result<()> {
-        let seq = self.data_seq;
-        self.data_seq = crate::data::Frame::next_seq(seq);
+        let reliable = self.is_reliable(bytes);
+        let now = self.ticks();
         for &to in addrs {
-            let f = crate::data::Frame {
-                // what we next expect from *this* peer, which is what the original's per-peer
-                // connection carries at `conn+0x5E`
-                ack: self.data_ack.get(&to).copied().unwrap_or(1),
-                seq,
-                // `conn+0x58` is set to 0 when the layer opens and never to anything else
-                flags: 0,
-                pieces: vec![crate::data::Piece { seq, body: bytes.to_vec() }],
-            };
-            let framed = f.encode().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            self.sock.send_to(to, crate::data::TAG, &framed)?;
+            let conn = self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now));
+            let frame = if reliable { conn.send_queued(bytes, now) } else { Some(conn.send_unreliable(bytes, now)) };
+            if let Some(f) = frame {
+                self.sock.send_to(to, crate::data::TAG, &f)?;
+            }
         }
         Ok(())
+    }
+
+    /// 0x55C270 -> 0x595C40 as the room's frame sender sees it: would the link take a reliable
+    /// message now (a packet free, 0x595C58)? A peer with no connection yet always can.
+    pub fn can_send_reliable(&self, to: SocketAddr) -> bool {
+        self.reliable_room(to) > 0
+    }
+
+    /// How many reliable messages the link to `to` would take right now (the pool, 0x595C58).
+    pub fn reliable_room(&self, to: SocketAddr) -> usize {
+        self.conns.get(&to).map_or(crate::reliable::POOL, |c| c.room())
+    }
+
+    /// A line per connection — in flight, held back, acks, counters — for a log.
+    pub fn report(&self) -> String {
+        self.conns
+            .iter()
+            .map(|(a, c)| format!("{a}: flight {} queued {} ack {} {:?}", c.in_flight(), c.queued(), c.ack(), c.stats))
+            .collect::<Vec<_>>()
+            .join("; ")
+            + &format!("; the test glue dropped {} data frames", self.sock.dropped())
+    }
+
+    /// The data layer's poll (0x595F70) for every connection: what is due goes out.
+    fn pump(&mut self) {
+        let now = self.ticks();
+        let mut out = Vec::new();
+        for (&to, c) in self.conns.iter_mut() {
+            for f in c.poll(now) {
+                out.push((to, f));
+            }
+        }
+        for (to, f) in out {
+            let _ = self.sock.send_to(to, crate::data::TAG, &f);
+        }
     }
 
     /// `0x5894C0` literally: tag `'<'`, no header, and a null address, which 0x5872C0 turns into
@@ -270,6 +363,7 @@ impl Net {
         while let Ok(Some((from, d))) = self.sock.recv() {
             self.handle(from, d.tag, &d.payload, &mut out);
         }
+        self.pump();
         out
     }
 
@@ -364,19 +458,24 @@ impl Net {
             }
             tag::ALIVE => {
                 let slot = if self.role == Role::Host { self.refresh(from) } else { None };
-                if self.relay && !for_the_host(p) {
-                    for to in self.everyone() {
-                        if to != from {
-                            let _ = self.sock.send_to(to, crate::data::TAG, p);
+                let now = self.ticks();
+                let conn = self.conns.entry(from).or_insert_with(|| crate::reliable::Conn::new(now));
+                for body in conn.receive(p, now) {
+                    // the room's relay (0x48C0F0 / 0x48C170): what the host does not act on itself
+                    // goes on to the others, as a fresh frame on each link
+                    // (`0xBC` is the room's own relay with the lobby-group gate, 0x48C050: the caller's)
+                    if self.relay && !msg_for_the_host(&body) && body.first() != Some(&crate::msg::kind::OPTIONS) {
+                        let reliable = self.is_reliable(&body);
+                        let others: Vec<SocketAddr> = self.everyone().into_iter().filter(|&a| a != from).collect();
+                        for to in others {
+                            let c = self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now));
+                            let f = if reliable { c.send_queued(&body, now) } else { Some(c.send_unreliable(&body, now)) };
+                            if let Some(f) = f {
+                                let _ = self.sock.send_to(to, crate::data::TAG, &f);
+                            }
                         }
                     }
-                }
-                if let Ok(f) = crate::data::Frame::decode(p) {
-                    // the peer's sequence is now delivered, so the next one is what we expect
-                    self.data_ack.insert(from, crate::data::Frame::next_seq(f.seq));
-                    for piece in f.pieces {
-                        out.push(Event::Data { from, slot, bytes: piece.body });
-                    }
+                    out.push(Event::Data { from, slot, bytes: body });
                 }
             }
             tag::STAR => {
@@ -443,13 +542,16 @@ impl Net {
     fn describe(&self, to: SocketAddr, request: u32) -> io::Result<()> {
         let d = Describe {
             request,
-            from: self.record()?,
+            from: match self.advertise {
+                Some(a) => a,
+                None => self.record()?,
+            },
             conn_dword: 0,
             conn_words: [0, 0],
             conn_raw: [0, 0],
             name: self.name,
-            bytes: [0; 4],
-            words: [0, 0],
+            bytes: self.desc_bytes,
+            words: self.desc_words,
             dwords: [0, 0],
             player_limit: self.limit,
             slot_mask: self.mask,
@@ -464,12 +566,20 @@ impl Net {
         if let Some(i) = self.slot_of(from) {
             return JoinReply { status: JoinStatus::Joined(i), ..echo };
         }
-        if j.name == self.my_name && self.my_name != [0; 16] {
-            return JoinReply { status: JoinStatus::NameTaken, ..echo };
-        }
+        // 0x588E4F…0x588E67: the full test comes first (`popcount(mask) >= limit − 1`, −2), then the
+        // name (0x588E7E, −1), then the slot (0x589440) and the game's callback (−3)
         let Some(slot) = comm::free_slot(self.mask, self.limit) else {
             return JoinReply { status: JoinStatus::Full, ..echo };
         };
+        if j.name == self.my_name && self.my_name != [0; 16] {
+            return JoinReply { status: JoinStatus::NameTaken, ..echo };
+        }
+        if let Some((game, version)) = &self.identity_gate {
+            let (_, v, g) = comm::identity::parse(&j.record);
+            if &v != version || &g != game {
+                return JoinReply { status: JoinStatus::Refused, ..echo };
+            }
+        }
         let mut record = [0u8; RECORD_SIZE];
         let addr = record_of(from).unwrap_or(j.from);
         record[..20].copy_from_slice(&addr.0);
@@ -486,8 +596,17 @@ impl Net {
         JoinReply { status: JoinStatus::Joined(slot), ..echo }
     }
 
+    /// Host: free a player's slot (0x4925A0, which the eject 0x491755 and the leave paths call).
+    /// Answers whether the slot was in use.
+    pub fn remove_peer(&mut self, i: u32) -> bool {
+        let mut out = Vec::new();
+        self.drop_slot(i, &mut out);
+        !out.is_empty()
+    }
+
     fn drop_slot(&mut self, i: u32, out: &mut Vec<Event>) {
-        if self.peers[i as usize].take().is_some() {
+        if let Some(p) = self.peers[i as usize].take() {
+            self.conns.remove(&p.sock);
             self.mask &= !(1 << i);
             out.push(Event::PeerLeft { slot: i });
         }
@@ -541,13 +660,20 @@ impl Net {
     }
 }
 
-/// Whether a data frame carries a message a player sends on its link to the host (`[net+0xC]`)
-/// rather than on the broadcast channel (`[net+8]`) — which the relay, a stand-in for the
-/// broadcast, must then leave alone. The chat request 0x48D9B0 is one (`crate::room`): the host
-/// rewrites it before anyone else sees it (0x491324). The other `[net+0xC]` senders — 0x48D38B,
-/// 0x48D3BB, 0x48D97B, 0x48DA22, 0x48DAA4 … — are not ported, so they are not listed.
-fn for_the_host(p: &[u8]) -> bool {
-    crate::data::Frame::decode(p).is_ok_and(|f| f.pieces.iter().any(|x| x.body.first() == Some(&crate::msg::kind::CHAT)))
+/// Whether the room acts on a player's message itself, where the others' messages it only passes on
+/// (0x49120C's jump table, `network.md` §11.18): the chat request 0x48D9B0 is rewritten before anyone
+/// else sees it (0x491324); the ping request `0xC3` (0x48D9F0) is answered to its sender alone
+/// (0x4916B7); the exchange's samples (a type below `0xB0`, 0x49120C → 0x48A2C0), `0xB3`, `0xC5` and
+/// `0xB7` are the room's own cases. What is left — `0xBC`, `0xBD`, `0xBE`, `0xBF` … `0xC2` — the room
+/// relays (0x48C050, 0x48C0F0, 0x48C170).
+fn msg_for_the_host(body: &[u8]) -> bool {
+    match body.first() {
+        Some(&crate::msg::kind::CHAT | &crate::msg::kind::PING) => true,
+        // the input exchange's messages to the room: a player's three input bytes (any type below
+        // `0xB0`, 0x49120C -> 0x48A2C0), its `0xB3` request, `0xC5` (start) and `0xB7` (report)
+        Some(&t) => t < 0xB0 || matches!(t, crate::msg::kind::START | 0xB7 | 0xC5),
+        None => false,
+    }
 }
 
 /// A `'d'` answers either an `'r'` (echoing its request number) or a `'w'` (echoing 0, because a

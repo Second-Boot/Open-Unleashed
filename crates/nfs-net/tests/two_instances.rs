@@ -89,7 +89,7 @@ fn a_client_discovers_the_host_joins_it_and_the_car_state_flows_both_ways() {
         brake: 9,
         buttons: 1,
         tick: 4096,
-        spin_x: 0.125,
+        yaw_rate: 0.125,
         orientation: [100, -200, 300, 16384],
         velocity: [12.5, -0.25, 40.0],
         position: [1234.5, 6.25, -987.75],
@@ -164,6 +164,37 @@ fn a_name_the_host_already_uses_is_refused() {
     });
     assert_eq!(st, JoinStatus::NameTaken);
     assert_eq!(h.mask, 0);
+}
+
+/// The joiner's identity string `name~version~game` (0x48A700) is what the host's gate reads: another
+/// version or another game is the callback's refusal (0x588EBF…0x588ED3 → `-3`), and the slot the
+/// allocator handed out is given back.
+#[test]
+fn the_identity_gate_refuses_another_version_or_another_game_and_lets_the_right_one_in() {
+    use nfs_net::comm::identity;
+    let join_with = |h: &mut Net, name: &str, id: &[u8]| {
+        let mut c = client(name);
+        c.join(h.local_addr().unwrap(), id).unwrap();
+        pump(h, &mut c, |_, ec| {
+            ec.iter().find_map(|e| match e {
+                Event::Refused { status } => Some(*status),
+                Event::Joined { slot } => Some(JoinStatus::Joined(*slot)),
+                _ => None,
+            })
+        })
+    };
+    let mut h = host(8);
+    h.identity_gate = Some(("Zone".to_string(), "3.5".to_string()));
+    assert_eq!(join_with(&mut h, "old", &identity::encode("old", "3.4", "Zone")), JoinStatus::Refused, "version");
+    assert_eq!(join_with(&mut h, "lost", &identity::encode("lost", "3.5", "Elsewhere")), JoinStatus::Refused, "game");
+    assert_eq!(join_with(&mut h, "bare", &[]), JoinStatus::Refused, "no identity at all");
+    assert_eq!(h.mask, 0, "a refused joiner keeps no slot");
+    assert_eq!(join_with(&mut h, "right", &identity::encode("right", "3.5", "Zone")), JoinStatus::Joined(0));
+    // a full host answers -2 before it looks at the name or the identity (0x588E4F…0x588E67 first)
+    let mut full = host(2);
+    full.identity_gate = Some(("Zone".to_string(), "3.5".to_string()));
+    assert_eq!(join_with(&mut full, "a", &identity::encode("a", "3.5", "Zone")), JoinStatus::Joined(0));
+    assert_eq!(join_with(&mut full, "host", &identity::encode("host", "9.9", "Nowhere")), JoinStatus::Full);
 }
 
 #[test]
@@ -275,14 +306,28 @@ fn an_in_race_datagram_is_the_original_shape_on_the_wire() {
     let f = nfs_net::data::Frame::decode(&d.payload).unwrap();
     assert_eq!(f.pieces.len(), 1);
     assert_eq!(f.flags, 0);
-    // the ack is what this side next expects from the peer; nothing has arrived yet, so it is the
-    // peer's own starting sequence
-    assert_eq!(f.ack, 1);
+    // the ack is `conn+0x5E`, the last sequence delivered in order (0x595B50); nothing has arrived
+    // yet, so it is the connection's start value, 0 (0x5951A0)
+    assert_eq!(f.ack, 0);
     assert_eq!(f.pieces[0].body.len(), nfs_net::state::PACKET_SIZE);
     assert_eq!(f.pieces[0].body[0], kind::CAR_STATE);
-    // the sequence starts at 1, the way 0x5952EF starts conn+0x5A
-    assert_eq!(f.seq, 1);
+    // the `0xBE` state goes unreliably (0x55D4D0's `len | 0x80000000`): sequence 0xFFFE (0x595D7C)
+    assert_eq!(f.seq, nfs_net::data::UNRELIABLE_SEQ);
     assert_eq!(CarState::from_packet(&f.pieces[0].body, 9).unwrap().1.position, [1.0, 2.0, 3.0]);
+
+    // a reliable message (the room's `0xB1`) takes the counter, which starts at 1 (0x5951A0)
+    h.send_game(&[0xB1, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+    let d = loop {
+        if let Some((_, d)) = c.sock.recv().unwrap() {
+            if d.tag == nfs_net::data::TAG && d.payload.len() > 6 && d.payload[6] == 0xB1 {
+                break d;
+            }
+            continue;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    };
+    let f = nfs_net::data::Frame::decode(&d.payload).unwrap();
+    assert_eq!(f.seq, 1);
 }
 
 /// Read the host's answer straight off a bare socket, so the test sees the bytes rather than an
@@ -301,4 +346,74 @@ fn raw_reply(h: &mut Net, c: &mut Net, host_at: SocketAddr) -> Datagram {
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     panic!("no answer to 'g'");
+}
+
+/// Both sides joined, loopback, a chosen share of the data frames dropped on each side's sends.
+fn joined_pair(loss: u32) -> (Net, Net) {
+    let mut h = host(8);
+    let host_at = h.local_addr().unwrap();
+    let mut c = client("racer");
+    c.join(host_at, &[]).unwrap();
+    pump(&mut h, &mut c, |_, ec| find(ec, |e| matches!(e, Event::Joined { .. })).cloned());
+    h.sock.set_drop(loss, 7);
+    c.sock.set_drop(loss, 11);
+    (h, c)
+}
+
+/// Run both sides for `ms` milliseconds, gathering the game messages each hears.
+fn run_for(h: &mut Net, c: &mut Net, ms: u64, mut on_tick: impl FnMut(&mut Net, &mut Net)) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let (mut got_h, mut got_c) = (Vec::new(), Vec::new());
+    let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    while std::time::Instant::now() < end {
+        on_tick(h, c);
+        for e in h.poll() {
+            if let Event::Data { bytes, .. } = e {
+                got_h.push(bytes);
+            }
+        }
+        for e in c.poll() {
+            if let Event::Data { bytes, .. } = e {
+                got_c.push(bytes);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    (got_h, got_c)
+}
+
+#[test]
+fn a_burst_of_room_messages_beyond_the_pool_arrives_whole_and_in_order() {
+    // the launch stream sends dozens of records at once (network.md §11.18: the pool holds seven)
+    let (mut h, mut c) = joined_pair(0);
+    for i in 0..80u8 {
+        // long records (option strings run to a couple of hundred bytes): two of them never fit
+        // beside a third in one datagram, which the frame's size check has to see
+        let mut m = vec![0xBC, i];
+        m.resize(if i % 3 == 0 { 8 } else { 170 }, 0);
+        h.send_game(&m).unwrap();
+    }
+    let (_, got) = run_for(&mut h, &mut c, 6000, |_, _| {});
+    let seen: Vec<u8> = got.iter().filter(|m| m[0] == 0xBC).map(|m| m[1]).collect();
+    assert_eq!(seen, (0..80).collect::<Vec<u8>>());
+}
+
+#[test]
+fn reliable_messages_both_ways_survive_a_lossy_link_in_order() {
+    let (mut h, mut c) = joined_pair(10);
+    let mut n = 0u8;
+    let (got_h, got_c) = run_for(&mut h, &mut c, 12000, |h, c| {
+        // the room's messages go down (reliable), a player's `0xB7` reports go up (reliable), the
+        // input samples (unreliable) go up too and carry the acks
+        if n < 100 {
+            h.send_game(&[0xC5, n, 0, 0, 0, 0, 0, 0]).unwrap();
+            c.send_game(&[0xB7, n, 0, 0, 0, 0, 0, 0]).unwrap();
+            c.send_game(&[1, 2, 3]).unwrap();
+            n += 1;
+        }
+    });
+    let down: Vec<u8> = got_c.iter().filter(|m| m[0] == 0xC5).map(|m| m[1]).collect();
+    let up: Vec<u8> = got_h.iter().filter(|m| m[0] == 0xB7).map(|m| m[1]).collect();
+    assert_eq!(down, (0..100).collect::<Vec<u8>>(), "the room's messages: lost, doubled or reordered");
+    assert_eq!(up, (0..100).collect::<Vec<u8>>(), "the reports: lost, doubled or reordered");
+    assert!(h.sock.dropped() + c.sock.dropped() > 20, "the glue dropped nothing");
 }

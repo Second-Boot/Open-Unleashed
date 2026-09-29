@@ -135,7 +135,7 @@ pub fn grouped<'a>(items: impl IntoIterator<Item = (&'a Part, ListCell)>, string
         }
         let name = strings.get(p.name_string_id).unwrap_or("").to_string();
         let text = if family_prefix { format!("{} {name}", p.family) } else { name };
-        rows.push(ListRow::Columns(vec![ListCell { fade: 0xFF, anchor: String::new(), dx: 3.0, text }, right]));
+        rows.push(ListRow::Columns(vec![ListCell { align: None, fade: 0xFF, anchor: String::new(), dx: 3.0, text }, right]));
         owner.push(k);
     }
     (rows, owner)
@@ -144,7 +144,7 @@ pub fn grouped<'a>(items: impl IntoIterator<Item = (&'a Part, ListCell)>, string
 /// `"%d"` right-aligned (align 2) at a named widget's x plus `dx` — `-0.0` for the widget's x
 /// itself (0x516051, 0x5171EE), which a `ListCell` reads as right-aligned by its sign.
 fn at(anchor: &str, dx: f32, v: i64) -> ListCell {
-    ListCell { fade: 0xFF, anchor: anchor.into(), dx, text: format!("{v}") }
+    ListCell { align: None, fade: 0xFF, anchor: anchor.into(), dx, text: format!("{v}") }
 }
 
 impl PartsShop {
@@ -232,7 +232,7 @@ impl PartsShop {
         let Some(car) = car_of(c) else { return (Vec::new(), Vec::new()) };
         let parts = c.career.installed_parts(&c.tables, car);
         let (rows, owner) = grouped(
-            parts.iter().map(|p| (*p, ListCell { fade: 0xFF, anchor: "ID_DAMAGEPOS".into(), dx: 3.0, text: format!("{} %", c.career.part_damage(car, p) as i64) })),
+            parts.iter().map(|p| (*p, ListCell { align: None, fade: 0xFF, anchor: "ID_DAMAGEPOS".into(), dx: 3.0, text: format!("{} %", c.career.part_damage(car, p) as i64) })),
             strings,
             false,
         );
@@ -254,7 +254,7 @@ impl PartsShop {
             })
             .collect();
         let (rows, owner) = grouped(
-            items.iter().map(|(p, id)| (*p, ListCell { fade: if *id == 2565 { 0x80 } else { 0xFF }, anchor: "ID_INSTALLYPOS".into(), dx: 3.0, text: strings.get(*id).unwrap_or_default().to_string() })),
+            items.iter().map(|(p, id)| (*p, ListCell { align: None, fade: if *id == 2565 { 0x80 } else { 0xFF }, anchor: "ID_INSTALLYPOS".into(), dx: 3.0, text: strings.get(*id).unwrap_or_default().to_string() })),
             strings,
             true,
         );

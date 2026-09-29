@@ -227,8 +227,9 @@ impl App {
             // * anything else: the literal **"NOT FOUND"** (0x5D73BC, 0x50C031)
             //
             // *(Until 2026-09-27 the port drew English "ON"/"OFF", "FORWARD"/"REVERSE", the track's
-            // file name and the bare lap count here.)* Which message carries the host's race to a
-            // joiner has not been traced, so the track fields show this machine's own settings.
+            // file name and the bare lap count here.)* The host's race reaches a joiner as `0xBC`
+            // option records (`network.md` §11.6), which `App::net_sync_options` writes into the
+            // menu these fields read, so a joiner shows the host's track once it has been told.
             "Comms.Data" => {
                 // once a session is open the lobby screens read from it, not from the browser
                 let session = self.net.session.as_ref();
@@ -239,7 +240,8 @@ impl App {
                             None => self.net.lobby.as_ref()?.game_name(),
                         });
                     }
-                    // `[desc+0x44]` copies the socket's own record out of `sock+0x08` (0x5878F0)
+                    // the room's string `[0x628C74]+0x50` (0x50BF09): this machine's address as
+                    // 0x583899…0x5838C6 builds it (`nfs_net::socket::my_ip_string`)
                     "MYIPADDRESS" => {
                         return Some(match session {
                             Some(n) => n.my_address(),

@@ -158,7 +158,7 @@ fn load_entries(r: &mut Renderer, dir: &std::path::Path, name: &str) -> Vec<Entr
 }
 
 /// What 0x4A4A70 reads besides its step.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RaceLoadingInputs {
     /// `Game.GameType` `[0x6573E8]`
     pub game_type: u8,
@@ -175,6 +175,20 @@ pub struct RaceLoadingInputs {
     pub network: bool,
     /// `LANGUAGE` `[0x657C84]`
     pub language: u32,
+    /// 0x4A5149…0x4A5353: one entry per slot of the race — the other players' rows
+    pub rows: Vec<LoadingRow>,
+}
+
+/// One slot's row on the network loading screen (0x4A51C0 loop; `network.md` §11.15).
+#[derive(Clone, Debug, PartialEq)]
+pub enum LoadingRow {
+    /// 0x4A52FC: a 54 × 64 black box at `(x, 364)` — no racing player owns the slot
+    Absent { x: f32 },
+    /// 0x4A5206…0x4A52FA: the player's picture at `(x, 364)` (0x4A5241 `0x562810(pic, x, 0x16C, w, h)`),
+    /// and under it the two bars of its progress `p` (0…10, 54 px per ten): amber `0xFFFFBB00`
+    /// `(x, 436)` `ceil(W)` wide, then `0xFF312000` from `x + W` `ceil(54 − W)` wide, both 6 high,
+    /// `W = p · 54 / 10` in integers (0x4A524C…0x4A525E, the `0x66666667` divide)
+    Player { x: f32, picture: TextureId, w: f32, h: f32, progress: u32 },
 }
 
 /// One blit into the loading surface: texture, x, y, w, h, mirrored.
@@ -214,6 +228,8 @@ pub struct RaceLoading {
     surface: Vec<Blit>,
     /// the bar's width, drawn last
     bar: Option<f32>,
+    /// the other players' rows, redrawn on every call (0x4A5149: `step` any, the screen up)
+    rows: Vec<LoadingRow>,
 }
 
 /// `[0x5B4AC0]`, 0x4A4A70's pixels per step.
@@ -222,7 +238,7 @@ pub const RACE_BAR_PER_STEP: f32 = 12.4;
 impl RaceLoading {
     pub fn new(r: &mut Renderer) -> Self {
         let white = r.upload_texture(&TextureData::single(1, 1, vec![255, 255, 255, 255]));
-        Self { white, packs: Default::default(), active: false, surface: Vec::new(), bar: None }
+        Self { white, packs: Default::default(), active: false, surface: Vec::new(), bar: None, rows: Vec::new() }
     }
 
     fn pack(&mut self, r: &mut Renderer, dir: &std::path::Path, name: &str) -> Vec<Entry> {
@@ -288,6 +304,7 @@ impl RaceLoading {
             // `_ftol` truncates
             self.bar = Some((step as f32 * RACE_BAR_PER_STEP) as i32 as f32);
         }
+        self.rows = input.rows.clone();
         true
     }
 
@@ -298,6 +315,18 @@ impl RaceLoading {
         let mut out: Vec<Sprite> = self.surface.iter().map(|&(t, x, y, w, h, f)| design_sprite(aspect, t, x, y, w, h, [1.0; 4], f)).collect();
         if let Some(w) = self.bar {
             out.push(design_sprite(aspect, self.white, 302.0, 467.0, w, 6.0, [1.0, 0xBB as f32 / 255.0, 0.0, 1.0], false));
+        }
+        for row in &self.rows {
+            match *row {
+                LoadingRow::Absent { x } => out.push(design_sprite(aspect, self.white, x, 364.0, 54.0, 64.0, [0.0, 0.0, 0.0, 1.0], false)),
+                LoadingRow::Player { x, picture, w, h, progress } => {
+                    out.push(design_sprite(aspect, picture, x, 364.0, w, h, [1.0; 4], false));
+                    let done = (progress * 54 / 10) as f32;
+                    // 0xFF312000 for what is left, 0xFFFFBB00 for what is done (0x4A5299, 0x4A52E7)
+                    out.push(design_sprite(aspect, self.white, x + done, 436.0, 54.0 - done, 6.0, [0x31 as f32 / 255.0, 0x20 as f32 / 255.0, 0.0, 1.0], false));
+                    out.push(design_sprite(aspect, self.white, x, 436.0, done, 6.0, [1.0, 0xBB as f32 / 255.0, 0.0, 1.0], false));
+                }
+            }
         }
         out
     }

@@ -165,6 +165,18 @@ pub struct Replay {
     /// car-info `+0x14/+0x18/+0x1C` hold at the save: 0x4143F0 reads them from there and 0x4144B0
     /// writes them there (0x414546…0x4145A3).
     pub ramp: Ramp,
+    /// The other human players' own state (`0x606880 + p·0x20`, `[0x5E9A00 + p·4]`), players
+    /// `1 …` — the stream is shared, the block and the slot are per player (`replay.md` §4, §18.15):
+    /// an input-exchange race has one human car per player and records every one.
+    others: Vec<Lane>,
+}
+
+/// One player's part of the recorder: the 32-byte block being filled or read, the slot in it, the flags.
+#[derive(Debug, Clone, Default)]
+struct Lane {
+    block: [u8; 4 * BLOCK_SAMPLES],
+    slot: usize,
+    ramp: Ramp,
 }
 
 impl Default for Replay {
@@ -175,7 +187,7 @@ impl Default for Replay {
 
 impl Replay {
     pub fn new() -> Self {
-        Self { mode: Mode::Recording, stream: vec![0; STREAM_LEN], write: 0, read: 0, block: [0; 32], slot: 0, final_tick: 0, ramp: Ramp::default() }
+        Self { mode: Mode::Recording, stream: vec![0; STREAM_LEN], write: 0, read: 0, block: [0; 32], slot: 0, final_tick: 0, ramp: Ramp::default(), others: Vec::new() }
     }
 
     /// A replay loaded for playback. The loaded bytes count as written, so [`Replay::stream`]
@@ -185,7 +197,7 @@ impl Replay {
         let mut s = stream;
         let write = s.len().min(STREAM_LEN);
         s.resize(STREAM_LEN, 0);
-        Self { mode: Mode::Playing, stream: s, write, read: 0, block: [0; 32], slot: 0, final_tick, ramp: Ramp::default() }
+        Self { mode: Mode::Playing, stream: s, write, read: 0, block: [0; 32], slot: 0, final_tick, ramp: Ramp::default(), others: Vec::new() }
     }
 
     /// `Replay_startRace` 0x413EA0: while recording, clear the buffer and both cursors; while
@@ -202,6 +214,7 @@ impl Replay {
         self.read = 0;
         self.slot = 0;
         self.block = [0; 32];
+        self.others.iter_mut().for_each(|l| *l = Lane::default());
     }
 
     /// The session loop's turn to the automatic replay (0x4B6EF4…0x4B6F18): `REPLAY = 2`,
@@ -230,6 +243,45 @@ impl Replay {
             }
             Mode::Playing | Mode::Exhausted => self.playback().to_controls(),
         }
+    }
+
+    /// Player `p`'s lane made the current one (or put back): the per-player block, slot and flags
+    /// swap with the ones the single-player methods work on. Player 0 is the current lane already.
+    fn swap_lane(&mut self, p: usize) {
+        if p == 0 {
+            return;
+        }
+        while self.others.len() < p {
+            self.others.push(Lane::default());
+        }
+        let l = &mut self.others[p - 1];
+        std::mem::swap(&mut self.block, &mut l.block);
+        std::mem::swap(&mut self.slot, &mut l.slot);
+        std::mem::swap(&mut self.ramp, &mut l.ramp);
+    }
+
+    /// **`Replay_recordInput` 0x4143F0 for player `p`** (`car+0x524`): every human car's hook records into
+    /// its own block of the shared stream (the packet sits at `0x606880 + p·0x20`, its slot at
+    /// `[0x5E9A00 + p·4]`); a block is flushed when the player's slot reaches 8, so the players' blocks
+    /// interleave in the order the cars' hooks run.
+    pub fn record_player(&mut self, p: usize, packet: Packet, ramp: Ramp, tick: u64) {
+        self.swap_lane(p);
+        self.record(packet, ramp, tick);
+        self.swap_lane(p);
+    }
+
+    /// **`Replay_playbackInput` 0x4144B0 for player `p`**: the block is read when the player's slot is 0,
+    /// from wherever the shared stream's cursor stands.
+    pub fn playback_player(&mut self, p: usize) -> Packet {
+        self.swap_lane(p);
+        let out = self.playback();
+        self.swap_lane(p);
+        out
+    }
+
+    /// The `.RAMP*` flags of player `p`'s last sample.
+    pub fn player_ramp(&self, p: usize) -> Ramp {
+        if p == 0 { self.ramp } else { self.others.get(p - 1).map_or_else(Ramp::default, |l| l.ramp) }
     }
 
     /// `Replay_recordInput` 0x4143F0.
@@ -401,8 +453,9 @@ pub fn playback_over(mode: Mode, tick: u64) -> bool {
 pub const FILE_MAGIC: &[u8; 8] = b"NFS5PRPL";
 /// 2 carries `ReplaySetup::driver_name` (§16.2 / §18.11's gap) — a clean break: the format is the
 /// port's own working file, not a distributed one, and a version-1 file fails [`ReplayFile::parse`]
-/// rather than silently reading in an unset name.
-pub const FILE_VERSION: u32 = 2;
+/// rather than silently reading in an unset name. 3 adds the network race's own section
+/// ([`NetSetup`], `replay.md` §18.15) after the stream.
+pub const FILE_VERSION: u32 = 3;
 
 /// Everything the port needs to set the race up again, plus the stream. The original stores the
 /// whole `0x6573E8` registry region instead (§6.1); these are the same knobs the port's race setup
@@ -437,6 +490,202 @@ pub struct ReplaySetup {
     /// driver, not the profile up now (§18.11's gap, closed here). Empty when the file carries
     /// none (the port's own `.prpl` before this field existed).
     pub driver_name: String,
+    /// The race was an input-exchange network race: what the launch settled about the other humans
+    /// and the road they share (`replay.md` §18.15). `None` for every other race.
+    pub net: Option<NetSetup>,
+}
+
+/// An input-exchange race's setup beyond [`ReplaySetup`]'s single car: the original's snapshot block
+/// (`0x6573E8`) holds nine car-info records (`+0xCA4`, stride 0x580) and the launch's per-slot table;
+/// the port keeps what its own race build reads of them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NetSetup {
+    /// this machine's own race index (`[0x65741C]`) — the car [`ReplaySetup`]'s car / paint / name are
+    pub local_index: u32,
+    /// `.STARTINGPOS` of the local car as the port's `grid_pos` (`g − 1`, `u32::MAX` for `g = 0`)
+    pub grid: Option<u32>,
+    /// every other human, in room order (the port's seat order)
+    pub seats: Vec<NetSeat>,
+    /// the traffic cars' records (the host's `.FILENAME`, `.FEMULTIPLAYERCARNAME`, `.COLOUR`)
+    pub traffic: Vec<NetTraffic>,
+    /// `.CAMERA` of race index 0 (`car[0].camera`, `network.md` §11.12c)
+    pub camera0: Option<Vec<u32>>,
+    /// the local car's own launch record (its per-slot words at `local_index`), for the original-format `.rpl`'s
+    /// nine car-info records (`replay.md` §18.15); empty in a file written before the field existed
+    pub own_words: Vec<(u32, Vec<u32>)>,
+    /// the host's `fe.txt` options the stream carried that the race reads and the setup has no field for:
+    /// `("weather" | "time" | "fog", value)` — `TIME` picks the sky, and the original's snapshot holds all three
+    /// (`WEATHER` +0x63C, `FOG` +0x640, `TIME` +0x648)
+    pub fe_txt: Vec<(String, u32)>,
+}
+
+/// One other human of a network race.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NetSeat {
+    pub race_index: u32,
+    /// the room's name for the player (the plate when the record carries no licence)
+    pub name: String,
+    pub grid: Option<u32>,
+    /// its per-slot car record: `(option id, the words after the slot)` (`launchcar::CarSlot`)
+    pub words: Vec<(u32, Vec<u32>)>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NetTraffic {
+    pub model: String,
+    pub name: Vec<u8>,
+    pub colour: u32,
+}
+
+impl NetSetup {
+    fn write(&self, o: &mut Vec<u8>) {
+        let u32w = |o: &mut Vec<u8>, v: u32| o.extend_from_slice(&v.to_le_bytes());
+        let opt = |o: &mut Vec<u8>, v: Option<u32>| match v {
+            Some(v) => {
+                o.push(1);
+                o.extend_from_slice(&v.to_le_bytes());
+            }
+            None => o.push(0),
+        };
+        let text = |o: &mut Vec<u8>, t: &[u8]| {
+            o.extend_from_slice(&(t.len() as u32).to_le_bytes());
+            o.extend_from_slice(t);
+        };
+        u32w(o, self.local_index);
+        opt(o, self.grid);
+        u32w(o, self.seats.len() as u32);
+        for s in &self.seats {
+            u32w(o, s.race_index);
+            text(o, s.name.as_bytes());
+            opt(o, s.grid);
+            u32w(o, s.words.len() as u32);
+            for (id, w) in &s.words {
+                u32w(o, *id);
+                u32w(o, w.len() as u32);
+                for x in w {
+                    u32w(o, *x);
+                }
+            }
+        }
+        u32w(o, self.traffic.len() as u32);
+        for t in &self.traffic {
+            text(o, t.model.as_bytes());
+            text(o, &t.name);
+            u32w(o, t.colour);
+        }
+        match &self.camera0 {
+            Some(c) => {
+                o.push(1);
+                u32w(o, c.len() as u32);
+                for x in c {
+                    u32w(o, *x);
+                }
+            }
+            None => o.push(0),
+        }
+        // a trailing section: the local car's own record (absent in a file written before it existed)
+        u32w(o, self.own_words.len() as u32);
+        for (id, w) in &self.own_words {
+            u32w(o, *id);
+            u32w(o, w.len() as u32);
+            for x in w {
+                u32w(o, *x);
+            }
+        }
+        u32w(o, self.fe_txt.len() as u32);
+        for (k, v) in &self.fe_txt {
+            text(o, k.as_bytes());
+            u32w(o, *v);
+        }
+    }
+
+    fn parse(d: &[u8], p: &mut usize) -> Option<Self> {
+        let u32r = |p: &mut usize| -> Option<u32> {
+            let v = u32::from_le_bytes(d.get(*p..*p + 4)?.try_into().ok()?);
+            *p += 4;
+            Some(v)
+        };
+        let opt = |p: &mut usize| -> Option<Option<u32>> {
+            let f = *d.get(*p)?;
+            *p += 1;
+            if f == 0 {
+                return Some(None);
+            }
+            let v = u32::from_le_bytes(d.get(*p..*p + 4)?.try_into().ok()?);
+            *p += 4;
+            Some(Some(v))
+        };
+        let text = |p: &mut usize| -> Option<Vec<u8>> {
+            let n = u32::from_le_bytes(d.get(*p..*p + 4)?.try_into().ok()?) as usize;
+            *p += 4;
+            let t = d.get(*p..*p + n)?.to_vec();
+            *p += n;
+            Some(t)
+        };
+        let local_index = u32r(p)?;
+        let grid = opt(p)?;
+        let n = u32r(p)? as usize;
+        let mut seats = Vec::new();
+        for _ in 0..n {
+            let race_index = u32r(p)?;
+            let name = String::from_utf8_lossy(&text(p)?).to_string();
+            let grid = opt(p)?;
+            let m = u32r(p)? as usize;
+            let mut words = Vec::new();
+            for _ in 0..m {
+                let id = u32r(p)?;
+                let k = u32r(p)? as usize;
+                let mut w = Vec::new();
+                for _ in 0..k {
+                    w.push(u32r(p)?);
+                }
+                words.push((id, w));
+            }
+            seats.push(NetSeat { race_index, name, grid, words });
+        }
+        let t = u32r(p)? as usize;
+        let mut traffic = Vec::new();
+        for _ in 0..t {
+            let model = String::from_utf8_lossy(&text(p)?).to_string();
+            let name = text(p)?;
+            let colour = u32r(p)?;
+            traffic.push(NetTraffic { model, name, colour });
+        }
+        let camera0 = if *d.get(*p)? == 0 {
+            *p += 1;
+            None
+        } else {
+            *p += 1;
+            let n = u32r(p)? as usize;
+            let mut c = Vec::new();
+            for _ in 0..n {
+                c.push(u32r(p)?);
+            }
+            Some(c)
+        };
+        let mut own_words = Vec::new();
+        if *p < d.len() {
+            let m = u32r(p)? as usize;
+            for _ in 0..m {
+                let id = u32r(p)?;
+                let k = u32r(p)? as usize;
+                let mut w = Vec::new();
+                for _ in 0..k {
+                    w.push(u32r(p)?);
+                }
+                own_words.push((id, w));
+            }
+        }
+        let mut fe_txt = Vec::new();
+        if *p < d.len() {
+            let m = u32r(p)? as usize;
+            for _ in 0..m {
+                let k = String::from_utf8_lossy(&text(p)?).to_string();
+                fe_txt.push((k, u32r(p)?));
+            }
+        }
+        Some(Self { local_index, grid, seats, traffic, camera0, own_words, fe_txt })
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -472,6 +721,13 @@ impl ReplayFile {
         o.extend_from_slice(&self.final_tick.to_le_bytes());
         o.extend_from_slice(&(self.stream.len() as u32).to_le_bytes());
         o.extend_from_slice(&self.stream);
+        match &s.net {
+            Some(n) => {
+                o.push(1);
+                n.write(&mut o);
+            }
+            None => o.push(0),
+        }
         o
     }
 
@@ -508,7 +764,14 @@ impl ReplayFile {
         p += 8;
         let len = u32at(&mut p)? as usize;
         let stream = d.get(p..p + len)?.to_vec();
-        Some(Self { setup: ReplaySetup { track, car, sim, car_id, paint, laps, opponents, traffic, cops, damage, backwards, mirror, seed, skill, driver_name }, final_tick, stream })
+        p += len;
+        let net = if *d.get(p)? == 0 {
+            None
+        } else {
+            p += 1;
+            Some(NetSetup::parse(d, &mut p)?)
+        };
+        Some(Self { setup: ReplaySetup { track, car, sim, car_id, paint, laps, opponents, traffic, cops, damage, backwards, mirror, seed, skill, driver_name, net }, final_tick, stream })
     }
 }
 
@@ -562,6 +825,110 @@ pub mod snapshot {
     /// `.LICENSE` at +0x1C0, bounds it to 0x44 bytes.
     pub const CAR_DRIVERNAME: usize = 0x017C;
     pub const CAR_DRIVERNAME_LEN: usize = 0x44;
+    /// `[0x65741C]` — this machine's own race index, at `LOCAL_CAR` (+0x34, above) — and the launch's two network
+    /// words `COMM_MODE` (`[0x657404]`, +0x1C) and `COMMSPOSITIONAL` (`[0x657408]`, +0x20)
+    pub const COMM_MODE: usize = 0x001C;
+    pub const COMMSPOSITIONAL: usize = 0x0020;
+    /// `FEGAME_TYPE` of a network race
+    pub const GAME_TYPE_NETWORK: u32 = 3;
+    /// The per-slot car-info record's registered fields, `(offset, option id)` (`replay.md` §16.2): what
+    /// 0x4B4B80 writes a launch record's words into (`slot·0x580 + 0x65808C + offset`).
+    pub const CAR_FIELDS: &[(usize, u32)] = &[
+    (0x0000, 0x21f),
+    (0x0008, 0x220),
+    (0x000C, 0x221),
+    (0x0010, 0x225),
+    (0x0014, 0x222),
+    (0x0018, 0x223),
+    (0x001C, 0x224),
+    (0x0020, 0x23b),
+    (0x0024, 0x23a),
+    (0x0028, 0x14b),
+    (0x0078, 0x14c),
+    (0x00C8, 0x14d),
+    (0x00F0, 0x227),
+    (0x00F4, 0x22e),
+    (0x00FC, 0x228),
+    (0x0100, 0x229),
+    (0x0104, 0x22a),
+    (0x0108, 0x22b),
+    (0x010C, 0x22c),
+    (0x0110, 0x22d),
+    (0x0114, 0x22f),
+    (0x0118, 0x230),
+    (0x011C, 0x231),
+    (0x0120, 0x232),
+    (0x0124, 0x234),
+    (0x0128, 0x235),
+    (0x0130, 0x233),
+    (0x0134, 0x236),
+    (0x013C, 0x237),
+    (0x0140, 0x238),
+    (0x0144, 0x239),
+    (0x0148, 0x23c),
+    (0x014C, 0x23e),
+    (0x0150, 0x23d),
+    (0x0154, 0x23f),
+    (0x0158, 0x240),
+    (0x015C, 0x241),
+    (0x0160, 0x242),
+    (0x0164, 0x243),
+    (0x0168, 0x244),
+    (0x016C, 0x245),
+    (0x0170, 0x246),
+    (0x0174, 0x247),
+    (0x017C, 0x13b),
+    (0x01C0, 0x13c),
+    (0x0200, 0x248),
+    (0x0204, 0x249),
+    (0x0208, 0x148),
+    (0x0218, 0x149),
+    (0x0228, 0x13d),
+    (0x0268, 0x13e),
+    (0x02A8, 0x13f),
+    (0x02E8, 0x140),
+    (0x0328, 0x24a),
+    (0x032C, 0x14a),
+    (0x050C, 0x24b),
+    (0x0510, 0x24d),
+    (0x0514, 0x24e),
+    (0x0518, 0x24f),
+    (0x051C, 0x250),
+    (0x0520, 0x24c),
+    (0x0524, 0x251),
+    (0x0528, 0x252),
+    (0x052C, 0x253),
+    (0x0530, 0x254),
+    (0x0534, 0x141),
+    (0x0574, 0x226),
+    (0x0578, 0x255),
+    ];
+    /// The field an option id lands in: its offset and the bytes up to the next registered field (the record ends at
+    /// `CAR_STRIDE`) — the most a record's words can fill.
+    pub fn car_field(id: u32) -> Option<(usize, usize)> {
+        let k = CAR_FIELDS.iter().position(|f| f.1 == id)?;
+        let next = CAR_FIELDS.get(k + 1).map_or(CAR_STRIDE, |f| f.0);
+        Some((CAR_FIELDS[k].0, next - CAR_FIELDS[k].0))
+    }
+}
+
+/// Write launch records — `(option id, the words after the slot)` — into car slot `slot` of the snapshot `out` the way
+/// 0x4B4B80 fills the per-slot table: each id at its field, the words little-endian, cut at the field's end.
+fn put_car_words(out: &mut [u8], slot: usize, words: &[(u32, Vec<u32>)]) {
+    use snapshot as f;
+    if slot >= 9 {
+        return;
+    }
+    for (id, w) in words {
+        let Some((off, cap)) = f::car_field(*id) else { continue };
+        let at = f::CARS + slot * f::CAR_STRIDE + off;
+        for (k, x) in w.iter().enumerate() {
+            if k * 4 + 4 > cap {
+                break;
+            }
+            out[at + k * 4..at + k * 4 + 4].copy_from_slice(&x.to_le_bytes());
+        }
+    }
 }
 
 /// A `.rpl` in the original's own format: the setup snapshot, the final game tick and the stream
@@ -599,18 +966,56 @@ pub fn original_rpl(setup: &ReplaySetup, final_tick: u64, stream: &[u8], ramp: R
     // over the start of `FE_PLAYER_FILENAME` (until the audit of 2026-09-26)
     let n = name.len().min(f::FE_PLAYER_FILENAME - f::TRACK_NAME - 1);
     out[f::TRACK_NAME..f::TRACK_NAME + n].copy_from_slice(&name[..n]);
-    // slot 0 is the human's car; the port drives everything else off its own setup
-    put(&mut out, f::CARS + f::CAR_TYPE, setup.car_id as u32);
+    // slot 0 is the human's car — a network race's is its own race index; the port drives everything else off
+    // its own setup
+    let me = setup.net.as_ref().map_or(0, |n| (n.local_index as usize).min(8));
+    let base = f::CARS + me * f::CAR_STRIDE;
+    if let Some(net) = &setup.net {
+        // **A network race's snapshot** (`replay.md` §18.15): `FEGAME_TYPE` 3, the launch's `COMM_MODE` 4 and
+        // `COMMSPOSITIONAL` 0 (an input-exchange race), `[0x65741C]` the recorded machine's own race index, the
+        // humans as the players — and **one car-info record per human**, each the launch record 0x4B4B80 wrote
+        // into its slot, then the host's traffic cars' after them (`.TYPE` 0xB, `.CLASS` 4)
+        put(&mut out, f::FEGAME_TYPE, f::GAME_TYPE_NETWORK);
+        put(&mut out, f::COMM_MODE, 4);
+        put(&mut out, f::COMMSPOSITIONAL, 0);
+        put(&mut out, f::LOCAL_CAR, net.local_index);
+        put(&mut out, f::NUMPLAYERRACECARS, 1 + net.seats.len() as u32);
+        put(&mut out, f::NUMOPPONENTRACECARS, 0);
+        for (k, v) in &net.fe_txt {
+            match k.as_str() {
+                "weather" => put(&mut out, f::WEATHER, *v),
+                "fog" => put(&mut out, f::FOG, *v),
+                "time" => put(&mut out, f::TIME, *v),
+                _ => {}
+            }
+        }
+        put_car_words(&mut out, me, &net.own_words);
+        for s in &net.seats {
+            put_car_words(&mut out, s.race_index as usize, &s.words);
+        }
+        let players = 1 + net.seats.len();
+        for (k, t) in net.traffic.iter().enumerate() {
+            let text = |b: &[u8]| -> Vec<u32> { b.chunks(4).map(|c| u32::from_le_bytes(std::array::from_fn(|i| c.get(i).copied().unwrap_or(0)))).collect() };
+            put_car_words(
+                &mut out,
+                players + k,
+                &[(0x13D, text(t.model.as_bytes())), (0x141, text(&t.name)), (0x225, vec![t.colour]), (0x21F, vec![0xB]), (0x220, vec![4])],
+            );
+        }
+    }
+    if setup.net.as_ref().is_none_or(|n| n.own_words.is_empty()) {
+        put(&mut out, base + f::CAR_TYPE, setup.car_id as u32);
+    }
     // the three flags as the car-info holds them — the port wrote `.RAMPS = 1` and nothing else
     // (until the audit of 2026-09-26)
-    put(&mut out, f::CARS + f::CAR_RAMPS, u32::from(ramp.steer));
-    put(&mut out, f::CARS + f::CAR_RAMPG, u32::from(ramp.gas));
-    put(&mut out, f::CARS + f::CAR_RAMPB, u32::from(ramp.brake));
+    put(&mut out, base + f::CAR_RAMPS, u32::from(ramp.steer));
+    put(&mut out, base + f::CAR_RAMPG, u32::from(ramp.gas));
+    put(&mut out, base + f::CAR_RAMPB, u32::from(ramp.brake));
     // `.DRIVERNAME` (+0x17C, §16.2): `Replay_begin`'s bulk restore hands it back on playback, so
     // an original `.rpl` this port writes carries the recording driver's name too (§18.11)
     let dn = setup.driver_name.as_bytes();
     let n = dn.len().min(f::CAR_DRIVERNAME_LEN - 1);
-    out[f::CARS + f::CAR_DRIVERNAME..f::CARS + f::CAR_DRIVERNAME + n].copy_from_slice(&dn[..n]);
+    out[base + f::CAR_DRIVERNAME..base + f::CAR_DRIVERNAME + n].copy_from_slice(&dn[..n]);
     out[SNAPSHOT_LEN..SNAPSHOT_LEN + 4].copy_from_slice(&(final_tick as u32).to_le_bytes());
     let n = stream.len().min(STREAM_LEN);
     out[SNAPSHOT_LEN + 4..SNAPSHOT_LEN + 4 + n].copy_from_slice(&stream[..n]);
@@ -649,6 +1054,7 @@ pub fn parse_original_rpl(data: &[u8]) -> Option<(ReplaySetup, u64, Vec<u8>)> {
         seed: u32at(f::RAND_SEED),
         skill: u32at(f::SKILL) as u8,
         driver_name,
+        net: None,
     };
     let final_tick = u32at(SNAPSHOT_LEN) as u64;
     let stream = data[SNAPSHOT_LEN + 4..].to_vec();
@@ -797,6 +1203,13 @@ impl BarEvent {
 /// and its six twins: `x < cx` or `x > cx + 21` misses (`jl` / `jg`), the same for `y` with 18.
 /// The cells are 30 apart, so at most one matches. The draw 0x42D4C0 lights a cell's outline by
 /// the same test (0x42D6B0…0x42D6D3).
+/// The cells the network bar (`+0x198`, built for `FEGAME_TYPE 3`, 0x424F7B) neither draws (0x42D3CD…0x42D3D5 jumps over
+/// their draws to 0x42D476) nor tests (0x42D880's `+0x198` tests, 0x42D97A / 0x42DA1A / 0x42DAFC…): quit, speed and save
+/// — so their hover counts stay at the constructor's 0 and no tooltip comes for them.
+pub fn is_cell_off_in_network(cell: usize) -> bool {
+    matches!(cell, 3 | 4 | 6)
+}
+
 pub fn bar_cell_at(cells: &[(f32, f32); 7], x: i32, y: i32) -> Option<usize> {
     cells.iter().position(|&(cx, cy)| {
         let (cx, cy) = (cx as i32, cy as i32);
@@ -910,13 +1323,13 @@ impl BarState {
     /// Slot 9's counting (0x42D892…0x42D8BB and 0x42D8C1…0x42DCE2), run once per frame with the
     /// pointer in whole pixels, or `None` when the port has none (the pointer off the window —
     /// counted as off the bar). The cells' latches are [`bar_cell_at`]'s caller's.
-    pub fn count(&mut self, cells: &[(f32, f32); 7], frame: (f32, f32), pointer: Option<(i32, i32)>) {
+    pub fn count(&mut self, cells: &[(f32, f32); 7], frame: (f32, f32), pointer: Option<(i32, i32)>, network: bool) {
         let inside = pointer.is_some_and(|(x, y)| {
             let (fx, fy) = (frame.0 as i32, frame.1 as i32);
             x >= fx && x <= fx + BAR_FRAME.0 as i32 && y >= fy && y <= fy + BAR_FRAME.1 as i32
         });
         self.away = if inside { 0 } else { (self.away + 1).min(0x28) };
-        let over = pointer.and_then(|(x, y)| bar_cell_at(cells, x, y));
+        let over = pointer.and_then(|(x, y)| bar_cell_at(cells, x, y)).filter(|&i| !(network && is_cell_off_in_network(i)));
         for (i, h) in self.hover.iter_mut().enumerate() {
             *h = if over == Some(i) { (*h + 1).min(0x28) } else { 0 };
         }
@@ -964,10 +1377,15 @@ impl BarState {
 /// The tooltips 0x42DD10 (drawn at the end of the bar's draw, 0x42D478): the FE string of each
 /// cell (`hud.loc` through 0x41E160 → 0x536DA0), `+0x17C…+0x194` rebuilt every draw — cell 2 is
 /// 18149 (0x46E5) while `+0x199` is clear and 18173 (0x46FD) while it is set.
-pub fn bar_tooltip(cell: usize, paused: bool) -> u32 {
+///
+/// **The network bar** (`+0x198`, 0x42DD3A…0x42DD80): cell 1 reads 18163 (0x46F3) in place of 18148 and cell 2 reads 18164
+/// (0x46F4) whatever `+0x199` says — «previous / next car»'s strings.
+pub fn bar_tooltip(cell: usize, paused: bool, network: bool) -> u32 {
     match cell {
         0 => 18147,
+        1 if network => 18163,
         1 => 18148,
+        2 if network => 18164,
         2 if paused => 18173,
         2 => 18149,
         3 => 18194,
@@ -981,6 +1399,24 @@ pub fn bar_tooltip(cell: usize, paused: bool) -> u32 {
 mod tests {
     use super::*;
 
+    /// The network bar (`+0x198`) neither draws nor tests quit / speed / save, so their hover counts never rise and no
+    /// tooltip comes for them; cells 1 and 2 read 18163 / 18164 (0x42DD3A…0x42DD80).
+    #[test]
+    fn the_network_bar_counts_no_hover_on_quit_speed_and_save_and_has_its_own_tooltips() {
+        let (cells, frame) = control_bar(640.0, 480.0);
+        for (cell, counts) in [(1usize, true), (2, true), (3, false), (4, false), (6, false), (5, true)] {
+            let mut b = BarState::new();
+            let (cx, cy) = (cells[cell].0 as i32 + 2, cells[cell].1 as i32 + 2);
+            for _ in 0..0x30 {
+                b.count(&cells, frame, Some((cx, cy)), true);
+            }
+            assert_eq!(b.hover[cell] >= 0x28, counts, "cell {cell}");
+        }
+        assert_eq!((bar_tooltip(1, false, true), bar_tooltip(2, false, true), bar_tooltip(2, true, true)), (18163, 18164, 18164));
+        assert_eq!((bar_tooltip(1, false, false), bar_tooltip(2, false, false), bar_tooltip(2, true, false)), (18148, 18149, 18173));
+        assert!([3, 4, 6].iter().all(|&i| is_cell_off_in_network(i)) && ![0, 1, 2, 5].iter().any(|&i| is_cell_off_in_network(i)));
+    }
+
     /// The bar's own state: the speed step, the auto-hide count, the pin and the fade (0x42D880,
     /// 0x42D22F, 0x425CF5, 0x4349F0).
     #[test]
@@ -991,7 +1427,7 @@ mod tests {
         let seen: Vec<Speed> = (0..4).map(|_| b.press_speed()).collect();
         assert_eq!(seen, [Speed::Double, Speed::Quarter, Speed::Half, Speed::Normal]);
         // the first frame opens it (state 0, away 0) and it fades in over 48 ticks
-        b.count(&cells, frame, None);
+        b.count(&cells, frame, None, false);
         b.transition(100);
         assert_eq!((b.state, b.stamp), (1, 100));
         assert_eq!(b.pct(100), Some(0));
@@ -1000,11 +1436,11 @@ mod tests {
         // forty frames off the bar (the first counted above) close it; it never reaches state 3
         // or 0 again
         for _ in 0..0x26 {
-            b.count(&cells, frame, None);
+            b.count(&cells, frame, None, false);
             b.transition(300);
         }
         assert_eq!(b.state, 1);
-        b.count(&cells, frame, None);
+        b.count(&cells, frame, None, false);
         b.transition(300);
         assert_eq!((b.state, b.away), (2, 0x28));
         assert_eq!(b.pct(300 + 48), Some(0));
@@ -1016,14 +1452,14 @@ mod tests {
         b.pin(false);
         assert_eq!((b.pinned, b.away), (false, 0));
         // the pointer back on the frame (edges inside) zeroes the count, a cell counts its hover
-        b.count(&cells, frame, Some((frame.0 as i32 + 333, frame.1 as i32 + 24)));
+        b.count(&cells, frame, Some((frame.0 as i32 + 333, frame.1 as i32 + 24)), false);
         assert_eq!(b.away, 0);
         let (cx, cy) = (cells[4].0 as i32 + 3, cells[4].1 as i32 + 3);
         for _ in 0..50 {
-            b.count(&cells, frame, Some((cx, cy)));
+            b.count(&cells, frame, Some((cx, cy)), false);
         }
         assert_eq!(b.hover, [0, 0, 0, 0, 0x28, 0, 0]);
-        b.count(&cells, frame, Some((frame.0 as i32 + 334, frame.1 as i32)));
+        b.count(&cells, frame, Some((frame.0 as i32 + 334, frame.1 as i32)), false);
         assert_eq!((b.away, b.hover[4]), (1, 0));
     }
 
@@ -1209,7 +1645,7 @@ mod tests {
     #[test]
     fn the_port_file_round_trips() {
         let f = ReplayFile {
-            setup: ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993turbo".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, damage: true, backwards: true, mirror: false, seed: 12345, skill: 1, driver_name: "Kostya".into() },
+            setup: ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993turbo".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, damage: true, backwards: true, mirror: false, seed: 12345, skill: 1, driver_name: "Kostya".into(), net: None },
             final_tick: 40_000,
             stream: (0..500).map(|i| (i % 251 + 1) as u8).collect(),
         };
@@ -1223,7 +1659,7 @@ mod tests {
     #[test]
     fn the_original_rpl_has_the_documented_shape() {
         // §6.1: 0x3E24 of setup, the final tick, 0x19000 of stream — 118 312 bytes, always
-        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993coupe36".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, damage: false, backwards: true, mirror: false, seed: 4321, skill: 2, driver_name: "Kostya".into() };
+        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993coupe36".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, damage: false, backwards: true, mirror: false, seed: 4321, skill: 2, driver_name: "Kostya".into(), net: None };
         let stream: Vec<u8> = (0..1000).map(|i| (i % 251 + 1) as u8).collect();
         let f = original_rpl(&setup, 12_345, &stream, Ramp { steer: true, gas: false, brake: true }, 11);
         assert_eq!(f.len(), RPL_LEN);
@@ -1298,4 +1734,81 @@ mod tests {
         assert_eq!((BAR[1].box_w, BAR[1].box_h), (11.0, 9.0));
     }
 
+
+    #[test]
+    fn every_human_records_its_own_block_and_the_blocks_interleave_in_hook_order() {
+        // 0x4143F0 per player: two humans (race indices 1 and 3), 24 samples each. A block is flushed
+        // when the player's own slot reaches 8, so the stream is p1 b0, p3 b0, p1 b1, p3 b1, ...
+        let sample = |p: u8, n: u8| Packet { buttons: p, steer: n as i8, throttle: 0x10 + n, brake: p + n };
+        let mut rec = Replay::new();
+        for n in 0..24u8 {
+            rec.record_player(1, sample(1, n), Ramp::default(), n as u64);
+            rec.record_player(3, sample(3, n), Ramp { steer: n % 2 == 0, ..Ramp::default() }, n as u64);
+        }
+        let mut play = Replay::playing(rec.stream().to_vec(), 24);
+        for n in 0..24u8 {
+            assert_eq!(play.playback_player(1), sample(1, n), "player 1, sample {n}");
+            assert_eq!(play.playback_player(3), sample(3, n), "player 3, sample {n}");
+            assert_eq!(play.player_ramp(3).steer, n % 2 == 0, "the flags travel per player");
+        }
+        // and past the end both coast (0x4144B0's mode 3)
+        assert_eq!(play.playback_player(1), Packet::default());
+        assert_eq!(play.playback_player(3), Packet::default());
+    }
+
+    #[test]
+    fn a_network_race_carries_its_seats_and_its_traffic_through_the_file() {
+        let net = NetSetup {
+            local_index: 1,
+            grid: Some(u32::MAX),
+            seats: vec![
+                NetSeat { race_index: 0, name: "HOST".into(), grid: Some(2), words: vec![(0x13D, vec![0x3939_3339, 0]), (0x225, vec![0xFF11_2233])] },
+                NetSeat { race_index: 2, name: "THIRD".into(), grid: None, words: vec![] },
+            ],
+            traffic: vec![NetTraffic { model: "EAS10".into(), name: b"Bus".to_vec(), colour: 0xFF8C_8C90 }],
+            camera0: Some(vec![0, 1, 2, 3]),
+            own_words: vec![(0x13D, vec![0x3132_3334, 0]), (0x24F, vec![1])],
+            fe_txt: vec![("time".into(), 1), ("weather".into(), 0)],
+        };
+        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993turbo".into(), car_id: 154, paint: [1, 2, 3], laps: 1, opponents: 2, traffic: 1, cops: false, damage: true, backwards: false, mirror: false, seed: 8165, skill: 1, driver_name: "ANNA".into(), net: Some(net.clone()) };
+        let f = ReplayFile { setup, final_tick: 640, stream: vec![0x41; 40] };
+        let back = ReplayFile::parse(&f.write()).unwrap();
+        assert_eq!(back, f);
+        assert_eq!(back.setup.net.unwrap(), net);
+    }
+
+    /// The original-format `.rpl` of a network race holds one car-info record per human — each launch record at its
+    /// field of `slot·0x580 + 0xCA4` (§16.2) — the host's traffic after them, `FEGAME_TYPE` 3 and the recorded
+    /// machine's own race index at `[0x65741C]`.
+    #[test]
+    fn the_original_rpl_of_a_network_race_has_a_car_info_record_per_human() {
+        let net = NetSetup {
+            local_index: 1,
+            grid: None,
+            seats: vec![NetSeat { race_index: 0, name: "HOST".into(), grid: None, words: vec![(0x13D, vec![0x3939_3339, 0]), (0x225, vec![0xFF11_2233]), (0x24F, vec![1])] }],
+            traffic: vec![NetTraffic { model: "sbus".into(), name: b"Bus".to_vec(), colour: 0xFF8C_8C90 }],
+            camera0: None,
+            own_words: vec![(0x13D, vec![0x3132_3334, 0]), (0x24A, vec![2])],
+            fe_txt: vec![("time".into(), 1)],
+        };
+        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993".into(), car_id: 154, paint: [0; 3], laps: 1, opponents: 1, traffic: 1, cops: false, damage: true, backwards: false, mirror: false, seed: 1, skill: 1, driver_name: "ANNA".into(), net: Some(net) };
+        let f = original_rpl(&setup, 10, &[], Ramp::default(), 3);
+        let u = |at: usize| u32::from_le_bytes(f[at..at + 4].try_into().unwrap());
+        let slot = |i: usize| snapshot::CARS + i * snapshot::CAR_STRIDE;
+        assert_eq!((u(snapshot::FEGAME_TYPE), u(snapshot::LOCAL_CAR), u(snapshot::NUMPLAYERRACECARS), u(snapshot::NUMCARS)), (3, 1, 2, 3));
+        assert_eq!((u(snapshot::COMM_MODE), u(snapshot::COMMSPOSITIONAL)), (4, 0));
+        assert_eq!(u(snapshot::TIME), 1);
+        // the host at race index 0: `.FILENAME` +0x228 ("9339"), `.COLOUR` +0x10, `.TINYCAR` +0x518
+        assert_eq!(&f[slot(0) + 0x228..slot(0) + 0x22C], b"9399");
+        assert_eq!((u(slot(0) + 0x10), u(slot(0) + 0x518)), (0xFF11_2233, 1));
+        // the recorded machine's own car at index 1: its record, then the driver's name
+        assert_eq!(&f[slot(1) + 0x228..slot(1) + 0x22C], b"4321");
+        assert_eq!(u(slot(1) + 0x328), 2);
+        assert_eq!(&f[slot(1) + 0x17C..slot(1) + 0x180], b"ANNA");
+        // the traffic car after the two humans: `.TYPE` 0xB, `.CLASS` 4, `.FILENAME`, `.COLOUR`
+        assert_eq!((u(slot(2)), u(slot(2) + 8), u(slot(2) + 0x10)), (0xB, 4, 0xFF8C_8C90));
+        assert_eq!(&f[slot(2) + 0x228..slot(2) + 0x22C], b"sbus");
+        // nothing lands in the slots past the traffic
+        assert!(f[slot(3)..slot(9)].iter().all(|b| *b == 0));
+    }
 }

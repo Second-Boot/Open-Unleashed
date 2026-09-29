@@ -2446,7 +2446,7 @@ impl LayoutScreen {
                 // a columned row draws no bar of its own — `Track.Records` reduces the
                 // colour it is handed to its alpha alone (0x4FB328) and places each
                 // column at another widget's x, at the row's own y (no +2)
-                ListRow::Columns(cells) => {
+                ListRow::Columns(cells) | ListRow::Racer(cells, _) => {
                     if let Some(c) = bar {
                         out.push(self.quad(aspect, px, ry, panel_w, row.height(), tint(c)));
                     } else if parts_glass && headers >= 2 {
@@ -2456,12 +2456,22 @@ impl LayoutScreen {
                     for cell in cells {
                         // a cell with no anchor of its own sits at the panel's left edge
                         let ax = if cell.anchor.is_empty() { px } else { self.anchor_x(&cell.anchor).unwrap_or(px) };
-                        let align = if cell.dx.is_sign_negative() { 2 } else { 0 };
+                        let align = cell.align.map_or(if cell.dx.is_sign_negative() { 2 } else { 0 }, i64::from);
                         let mut c = text_c;
                         if cell.fade != 0xFF {
                             c[3] = ((c[3] as u32 * cell.fade as u32) / 255) as u8;
                         }
                         self.text(out, aspect, f, &cell.text, ax + cell.dx, ry, 0.0, align, tint(c));
+                    }
+                    // the car colour's swatch (0x4BC0C8…0x4BC116): 15 × 10 at the row's own y, a
+                    // black one-pixel outline over it
+                    if let ListRow::Racer(_, Some((anchor, dx, rgba))) = row {
+                        let sx = self.anchor_x(anchor).unwrap_or(px) + dx;
+                        let (sw, sh) = (15.0, 10.0);
+                        out.push(self.quad(aspect, sx, ry, sw, sh, tint(*rgba)));
+                        for (bx, by, bw, bh) in [(sx, ry, sw, 1.0), (sx, ry + sh - 1.0, sw, 1.0), (sx, ry, 1.0, sh), (sx + sw - 1.0, ry, 1.0, sh)] {
+                            out.push(self.quad(aspect, bx, by, bw, bh, tint([0, 0, 0, 0xFF])));
+                        }
                     }
                 }
                 // `drawPartsHeading` 0x518DE0: a black rule at the top and another 13

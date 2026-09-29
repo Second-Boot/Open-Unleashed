@@ -29,6 +29,9 @@ use crate::specs::{CarSpecs, CIRCLE_SOFTNESS, GRAVITY, GRIP_DRY, GRIP_WET, SURFA
 use glam::{Mat3, Vec3};
 use std::f32::consts::TAU;
 
+mod netcar;
+pub use netcar::Block as NetBlock;
+
 /// A front wheel's angle in 1/256 turn from its steering value: `max_steer · steer / 17`.
 /// `set_wheel_steer` scales the lock to 17 (`y · 17 / max_steer`), so this undoes it. One function
 /// for the tyre and the renderer.
@@ -389,6 +392,11 @@ pub struct Vehicle {
     /// ([`Self::step32`]); `Car_ground`'s tilted arm, the 8 m ceiling rule and `Susp_update`'s
     /// no-patch fallback read it.
     pub tracker: PatchTracker,
+    /// `car+0xDAC == 1`: a network block has come for this car (0x4A0DF0 sets it on the first one),
+    /// i.e. it is a **remote** car in a positional race. `Susp_update` skips the compression block
+    /// (`[0x657408]` and `+0xDAC`, 0x499D22…0x499D34) and `WheelRotation` 0x4A2790 turns the wheels by
+    /// `car+0x35C / circumference` whatever the drive (0x4A2799). `vehicle/netcar.rs`.
+    pub net_car: bool,
     /// LCG state (the original's `0x5D1028 × 0x5D102C`) for road roughness and the engine's noise.
     rng: u32,
 }
@@ -499,6 +507,7 @@ impl Vehicle {
             last_contact: Vec3::ZERO,
             last_wall_effect: 0.0,
             tracker: PatchTracker::new(Vec3::new(position.x, position.y - wheel_radius, position.z)),
+            net_car: false,
             rng: 0x3ADE_68B1,
         }
     }
@@ -2200,9 +2209,9 @@ impl Vehicle {
             let mut stiff = 1.0;
             // 0x499D15: before game tick 2 (`[0x606AC4] < 2`) the block is skipped — the
             // compression `wheel+0x68` and the render angle `wheel+0x70` are zeroed (0x499EE4…
-            // 0x499EE9) and the stiffness stays 1.0. Not carried: the same skip for a network
-            // car (`[0x657408]` and `car+0xDAC`, 0x499D22…0x499D34).
-            if self.game_tick < 2 {
+            // 0x499EE9) and the stiffness stays 1.0 — and so for a network car (`[0x657408]` and
+            // `car+0xDAC`, 0x499D22…0x499D34: `net_car`, a remote car in a positional race).
+            if self.game_tick < 2 || self.net_car {
                 w.compression = 0.0;
             } else if c > 0.0 {
                 let cmax = if i < 2 { 0.9 } else { 0.75 } * (specs.bump_travel - specs.probe_offset);
@@ -2280,7 +2289,10 @@ impl Vehicle {
             // and takes 0.125 either way (0x49A4D6…0x49A51A); `.TINYCAR` the gain unfiltered;
             // anyone else 0.125 accelerating, 0.175 braking (0x49A540…0x49A57F), plus 0.8 of the
             // old value (0x49A585). *(Corrected 2026-09-26: the port had no police arm.)*
-            self.dive = if police {
+            // a network car (`car+0xDAC`, 0x49A4AB…0x49A4C8) holds `car+0xDC4` at 0 and skips the filter
+            self.dive = if self.net_car {
+                0.0
+            } else if police {
                 a_l.clamp(-10.0, 10.0) * specs.dive_gain * 0.125 + self.dive * 0.8
             } else if self.tiny {
                 specs.dive_gain * a_l
@@ -2650,18 +2662,22 @@ impl Vehicle {
         // `rpm / (ratio'[gear]·circ)`, a locked wheel skipped, `·1/64`. The original wraps only
         // above 1 turn and by `ang − round(ang)` (`fistp`, 0x4A2839…0x4A2858), `rem_euclid` here —
         // the same angle modulo a turn, which is all the drawing reads. APPROXIMATION: the
-        // `ratio != 0` test is the port's guard; not carried: the network car's `car+0x35C / circ`.
+        // `ratio != 0` test is the port's guard.
         let vz = self.v_local.z;
         for (i, wh) in self.wheels.iter_mut().enumerate() {
             let driven = if i < 2 { specs.front_drive >= 0.01 } else { specs.front_drive <= 0.99 };
             // in the binary's order: `rpm / (ratio'·circ)` (0x4A281F…0x4A2829 `fdivr`) or
             // `vL.z / circ` (0x4A280E), then `· [0x5B2828]` = 1/64
-            let turns = if driven && self.gear != 1 && specs.ratio_rpm_per_mps[self.gear] != 0.0 {
+            // 0x4A2799 (`car+0xDAC == 1`): a remote car's wheels turn by `car+0x35C / circumference`,
+            // the locked flag not consulted
+            let turns = if self.net_car {
+                self.speed_est / specs.circumference
+            } else if driven && self.gear != 1 && specs.ratio_rpm_per_mps[self.gear] != 0.0 {
                 self.rpm / (specs.ratio_rpm_per_mps[self.gear] * specs.circumference)
             } else {
                 vz / specs.circumference
             };
-            if !wh.locked {
+            if self.net_car || !wh.locked {
                 wh.rotation = (turns * (1.0 / 64.0) + wh.rotation).rem_euclid(1.0);
             }
         }
@@ -4004,7 +4020,10 @@ fn pair_impulse(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, pt: 
         }
     }
     {
-        let jj = j * 0.5;
+        // 0x496A35…0x496A66: `[0x657408]` and either car's `car+0xDAC` — a car of a positional race that
+        // has a remote car in the pair — scale the impulse by `[0x5B2694]` = 0.2 (a remote car's own
+        // position comes from its owner's packet, so a bump is only felt a fifth)
+        let jj = j * 0.5 * if a.net_car || b.net_car { f32::from_bits(0x3E4C_CCCD) } else { 1.0 };
         let imp = ni * jj;
         // impact magnitude 0x430: `min(4·|Δv|, |vclose·(mA+mB)|/m)`, floored at 9 when the other body
         // is lighter than 0.65 mass units; a smackable under 3.0 has its own rule

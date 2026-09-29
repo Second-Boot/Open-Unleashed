@@ -101,7 +101,7 @@ fn main() {
                 brake: 0,
                 buttons: 0,
                 tick: tick as u32,
-                spin_x: 0.0,
+                yaw_rate: 0.0,
                 orientation: [0, 0, 0, 16384],
                 velocity: [30.0 + id as f32, 0.0, 0.0],
                 position: [t * 30.0, 0.5, id as f32 * 4.0],

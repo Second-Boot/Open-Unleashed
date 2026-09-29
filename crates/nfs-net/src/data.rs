@@ -20,8 +20,10 @@
 //! ```
 //!
 //! `conn+0x5E` is **not** an id: the receive path advances it as each frame is delivered in order
-//! (0x595BAE and 0x595BEB, with the same 0xFFFB wrap), so it is the sequence this side next expects
-//! from the peer — an acknowledgement riding on every frame. `conn+0x58` is written **once**, to 0
+//! (0x595BAE and 0x595BEB, with the same 0xFFFB wrap), so it is the **last** sequence this side
+//! delivered from the peer (0 before any: 0x5951A0 stores 0 there and starts the counter at 1) — a
+//! cumulative acknowledgement riding on every frame. (An earlier reading here called it the sequence
+//! next expected; the receive path 0x595B50 compares `seq == conn+0x5E + 1` and stores `seq`.) `conn+0x58` is written **once**, to 0
 //! when the layer opens (0x5952B7), and read only to be copied here and into an ack-only frame, so
 //! in this build the flags byte is always zero.
 //!
@@ -108,7 +110,7 @@ pub struct Piece {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
-    /// `+0x00` — the sequence this side next expects from the peer (`conn+0x5E`).
+    /// `+0x00` — the last sequence this side delivered from the peer (`conn+0x5E`).
     pub ack: u16,
     /// `+0x02` — the frame's sequence.
     pub seq: u16,
@@ -148,7 +150,7 @@ impl Frame {
         out.extend_from_slice(&first.body);
         for p in &self.pieces[1..] {
             out.push(p.body.len() as u8);
-            out.push(self.seq.wrapping_sub(p.seq) as u8);
+            out.push(((self.seq as u32 + SEQ_WRAP as u32 + 1 - p.seq as u32) % (SEQ_WRAP as u32 + 1)) as u8);
             out.extend_from_slice(&p.body);
         }
         Ok(out)
@@ -177,7 +179,10 @@ impl Frame {
             if b.len() < to {
                 return Err(DataError::Truncated { want: n, have: b.len() - from });
             }
-            pieces.push(Piece { seq: seq.wrapping_sub(delta), body: b[from..to].to_vec() });
+            // 0x59586B: `seq − delta`, and a result past 0xFFFB has 0xFFFC added (modulo 0xFFFC)
+            let m = SEQ_WRAP as u32 + 1;
+            let s = (seq as u32 + m - (delta as u32 % m)) % m;
+            pieces.push(Piece { seq: s as u16, body: b[from..to].to_vec() });
             at = to;
         }
         Ok(Self { ack: u16::from_be_bytes([b[0], b[1]]), seq, flags: b[4], pieces })

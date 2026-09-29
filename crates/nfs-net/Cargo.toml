@@ -7,3 +7,7 @@ description = "The network protocol of Need for Speed: Porsche Unleashed (see RE
 
 [dependencies]
 thiserror.workspace = true
+
+# platform glue only: `getifaddrs` for the per-interface broadcast addresses (`socket::lan_broadcasts`)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

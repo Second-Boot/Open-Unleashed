@@ -19,6 +19,7 @@ mod accessors;
 mod career_ui;
 mod intro_run;
 mod parts_shop;
+mod netlobby;
 mod netplay;
 
 use anyhow::Result;
@@ -134,6 +135,9 @@ struct Hud {
     /// `HTrackMap`'s blip `+0xE4` (0x432122…0x432143): `radar.fsh` entry 0, "Car" (26 × 63), a white
     /// top-down car the blip loop tints with each car's paint.
     radar_car: Option<TextureId>,
+    /// `HPosition`'s link badge `+0x250` (ctor 0x42AC8B…0x42ACCC): `DashHud/pingmeter.fsh` entry 0 `dot`,
+    /// 5 × 5 (`[0x5B2D88]`, `[0x5B2D8C]`), tinted by 0x490140's answer (0x5B2D90) in a network race.
+    ping_dot: Option<TextureId>,
     /// `TRANSLUCENCY == 0` — the shipped default, which the options screen labels "on" (the accessor
     /// lists 1501, 1500). 0x425298 / 0x4267A0 call 0x41E540 for 0, which puts `[0x5CCB34]` = 0x80 into
     /// the top byte of the layout record's flags `cfg1+0x14`, and 0x41E590 otherwise, which clears it;
@@ -167,6 +171,16 @@ struct Hud {
     congrats: CongratsTex,
     /// `HMissionSummary`'s portraits: `factorypeople.fsh`, 54×64, one per narrator (0x428A19)
     portraits: [Option<TextureId>; 6],
+}
+
+/// What `HPosition` adds to a row in a network race (FEGAME_TYPE 3): the badge tint and, for a
+/// racer in state 3, the "DNF" text (`network.md` §11.13).
+#[derive(Debug, Clone)]
+struct LinkBadge {
+    /// 0x5B2D90[0x490140(race index)] as RGBA
+    colour: [f32; 4],
+    /// FE 18191 when the racer's state is 3 (0x42B279)
+    dnf: Option<String>,
 }
 
 /// The textures `HCongrats`' constructor loads (0x41CB84…0x41CED8), in its own field order.
@@ -467,6 +481,7 @@ impl Hud {
         // nothing, and drew no rings at all until 2026-09-23.
         let dial_ring = load_idx(r, "circletach.fsh", Some(0), None).map(|t| t.0);
         let radar_car = load_idx(r, "radar.fsh", Some(0), None).map(|t| t.0);
+        let ping_dot = load_idx(r, "pingmeter.fsh", Some(0), None).map(|t| t.0);
         let rings = load_idx(r, "circlefull.fsh", Some(0), None)
             .zip(load_idx(r, "circleoutline.fsh", Some(0), None))
             .map(|(a, b)| (a.0, b.0));
@@ -520,6 +535,7 @@ impl Hud {
             display: std::cell::Cell::new(Hud::display_colour(0)),
             dial_ring,
             radar_car,
+            ping_dot,
             boxes: std::cell::Cell::new(true),
             trays_in: std::cell::Cell::new(true),
             map: None,
@@ -1502,7 +1518,7 @@ impl Hud {
     /// playback starts, 0x413ECB / 0x426A89). The cells answer the pointer in
     /// `App::replay_bar_apply_press`, once per frame (`App::replay_bar_frame`).
     #[allow(clippy::too_many_arguments)]
-    fn replay_bar(&self, out: &mut Vec<Sprite>, aspect: f32, frozen: bool, bar: &nfs_game::replay::BarState, pct: i32, cursor: Option<(f32, f32)>, tips: &[String; 7]) {
+    fn replay_bar(&self, out: &mut Vec<Sprite>, aspect: f32, frozen: bool, network: bool, bar: &nfs_game::replay::BarState, pct: i32, cursor: Option<(f32, f32)>, tips: &[String; 7]) {
         use nfs_game::replay::{bar_cell_at, cell_glyph_origin, control_bar, BAR, BAR_CELL, BAR_FRAME, BAR_PLAY};
         let (cells, frame) = control_bar(HUD_REF_W, HUD_REF_H);
         let (fw, fh) = BAR_FRAME;
@@ -1523,15 +1539,22 @@ impl Hud {
             }
         }
         // the pointer is whole pixels (0x5372A0(6) `+4` / `+8`)
-        let over = cursor.and_then(|(x, y)| bar_cell_at(&cells, x.floor() as i32, y.floor() as i32));
+        let over = cursor.and_then(|(x, y)| bar_cell_at(&cells, x.floor() as i32, y.floor() as i32)).filter(|&i| !(network && nfs_game::replay::is_cell_off_in_network(i)));
         // `(pct·255 / 100) << 24 | 0xFAB400` for the glyphs and the lit outline, `pct·76 / 100` for
         // the others (0x42D2D2…0x42D2EF, 0x42D53C…0x42D5FC; unsigned `mul` by 0x51EB851F, `>> 5`)
         let orange = |a: i32| [HUD_ORANGE[0], HUD_ORANGE[1], HUD_ORANGE[2], a as f32 / 255.0];
         let (lit, dim) = (orange(pct * 255 / 100), orange(pct * 76 / 100));
         for (i, cell) in cells.iter().enumerate() {
+            // the network bar draws neither quit, speed nor save (0x42D3CD: `+0x198` jumps to 0x42D476)
+            if network && nfs_game::replay::is_cell_off_in_network(i) {
+                continue;
+            }
             let c = BAR[i];
+            // cell 2's `+0xC8` widget is glyph 1 (`paus`) — or, built with the network byte, glyph 10 (`next`,
+            // 0x42CAC2); `play` (`+0xCC`) while `+0x199` is set (0x42D31E)
             let glyph = match i {
                 2 if frozen => BAR_PLAY,
+                2 if network => nfs_game::replay::BAR_NEXT,
                 4 => bar.glyph(),
                 _ => c.glyph,
             };
@@ -1950,6 +1973,7 @@ impl Hud {
         aspect: f32,
         pos: (f32, f32),
         rows: &[(usize, [f32; 4], String, String)],
+        links: &[Option<LinkBadge>],
         place: usize,
         label: &str,
         derby: bool,
@@ -1960,7 +1984,7 @@ impl Hud {
         self.tray(out, aspect, x, y, w, h);
         // the rule over the footer row: `pad + rows·row` (0x42A83A…0x42A84D)
         self.tray_rule(out, aspect, x, y, w, 2.0 + rh * rows.len() as f32);
-        for (row, colour, name, value) in rows {
+        for (k, (row, colour, name, value)) in rows.iter().enumerate() {
             let ry = y + 2.0 + rh * *row as f32;
             let swatch = (y + 2.0 + EXT_MAIN * 0.5 - 4.0).trunc() + rh * *row as f32;
             out.push(self.quad(aspect, x + 5.0, swatch, 8.0, 8.0, *colour));
@@ -1971,8 +1995,25 @@ impl Hud {
                 name.pop();
             }
             self.text(out, aspect, &name, x + 18.0, ry, FONT_SMALL, HUD_GREY);
-            let vw = self.text_width(value, FONT_ITALIC);
-            self.text(out, aspect, value, (x + w - 13.0 - vw).trunc(), ry, FONT_ITALIC, self.display());
+            let link = links.get(k).and_then(|l| l.as_ref());
+            if let Some(LinkBadge { dnf: Some(dnf), .. }) = link {
+                // game type 3, state 3 or 1 (0x42B279…0x42B2D0): FE 18191 in the display colour and
+                // `UniversC12b` (`+0x118`, ctor 0x42AC05…0x42AC48: alignment 0), moved to the gap
+                // visual's own position (0x42B29D…0x42B2AA) — the anchor `x + w − 13` the gap
+                // draws right-aligned to, so this one runs **left** from it
+                self.text(out, aspect, dnf, x + w - 13.0, ry, FONT_MAIN, self.display());
+            } else {
+                let vw = self.text_width(value, FONT_ITALIC);
+                self.text(out, aspect, value, (x + w - 13.0 - vw).trunc(), ry, FONT_ITALIC, self.display());
+            }
+            // the link badge (0x42B4D1…0x42B536, game type 3 only): the 5 × 5 `pingmeter` dot tinted
+            // 0x5B2D90[0x490140(race index)] on all four corners (0x423D70), at the gap visual's
+            // position `+ (6, 4)` (0x42B50F…0x42B529: `[vtable + 8]` is its getter 0x4367A0)
+            if let (Some(LinkBadge { colour, .. }), Some(dot)) = (link, self.ping_dot) {
+                let mut sp = self.image(aspect, dot, x + w - 13.0 + 6.0, ry + 4.0, 5.0, 5.0);
+                sp.color = *colour;
+                out.push(sp);
+            }
         }
         // the footer (0x42B569…0x42B639): FE 17 `+0x10C` in grey `UniversC12b`, `itoa(position)` + "/"
         // `+0x110` in the display colour and **`UniversC12b` too**, the count `+0x114` in grey
@@ -3166,6 +3207,12 @@ impl App {
         // knows no choice accessor — every `Graphics.*` / `Game.*` / … drop-down row released
         // onto nothing and the setting stayed put. User report: the graphics options could not
         // be changed with the mouse.)*
+        // `Comms.IPList`'s drop-down (`PeerToPeerIP.lay`): the list accessor's selection, and the
+        // input box beside it follows it (0x4C2310)
+        if base == "Comms.IPList" {
+            self.pick_ip_row(row);
+            return;
+        }
         let Some((rows, cur)) = self.choice_rows(name).or_else(|| self.combo_rows(name)) else { return };
         if rows.is_empty() {
             return;
@@ -4031,6 +4078,11 @@ fn owned_colour_slot(base: &str) -> usize {
 
 /// A colour accessor's dword — the record's bytes byte-swapped, `b0<<24 | b1<<16 | b2<<8 | b3` —
 /// as `[r, g, b, a]`: `b1 b2 b3` the colour, `b0` the alpha (0xFF in every shipped entry).
+/// The `.STARTINGPOS` a `grid_pos` (`g − 1`, `u32::MAX` for the network draw's 0) stands for, for logs.
+fn g_log(grid_pos: Option<u32>) -> String {
+    grid_pos.map_or_else(|| "-".to_string(), |g| (g as i32 + 1).to_string())
+}
+
 fn colour_rgba(c: u32) -> [u8; 4] {
     [(c >> 16) as u8, (c >> 8) as u8, c as u8, (c >> 24) as u8]
 }
@@ -4801,6 +4853,8 @@ struct App {
     /// 0x415721) rather than its continue (0x415701) — `NFS_HUD_KEYS`'s `pauserestart` key, for the
     /// restart's audio pick count (`replay.md` §18.12)
     scripted_restart: bool,
+    /// diagnostic: a scripted pause press in a network race asked to leave (`net_pause_press`)
+    scripted_net_leave: bool,
     /// `0x5E8B88[]` — the race-order array every car is registered in (the human, the opponents,
     /// the cops, the traffic), re-sorted at the end of every even tick (`nfs_game::race_order`)
     race_order: nfs_game::race_order::RaceOrder,
@@ -4825,6 +4879,49 @@ struct App {
     /// end) — set by `knockout_round`, taken by the race's end
     knockout_round: bool,
     player_grid_override: Option<u32>,
+    /// The `fe.txt` half of a network launch as the host sent it (`rand_seed`, `time`, `weather`,
+    /// `fog`): the option-table values a player's race reads in place of its own file's
+    /// (`network.md` §11.7). Empty outside a network race — every session re-reads `fe.txt`
+    /// (0x4B6C1C).
+    net_fe_txt: std::collections::HashMap<&'static str, u32>,
+    /// `[0x657408] != 0 && [0x65740C] != 0` — `COMMSPOSITIONAL` and `NOCOLLISION` both set: the
+    /// collision pass 0x498FF0 then skips the car–car half (`network.md` §11.7). Set by a network
+    /// launch, clear for every other.
+    net_nocollision: bool,
+    /// a network race's other players' grid places (`g − 1`), in room order
+    net_seat_grids: Vec<Option<u32>>,
+    /// a network race's other players' car records (0x4EEDA0's, at their race indices), in room
+    /// order — the seat's car, colour, names, set-up, roof and options
+    net_seat_cars: Vec<nfs_net::launchcar::CarSlot>,
+    /// the local car's own launch record (`NetRace::own_words`) — what the replay's `.rpl` writes at its slot
+    net_own_words: Vec<(u32, Vec<u32>)>,
+    /// The input-exchange race's controller samples for this tick — what the frame driver latched
+    /// (0x415EF0) at an even tick: this car's, and each network seat's with its race index
+    /// (`network.md` §11.17). `None` outside an exchange race and on an odd tick.
+    exchange_in: Option<ExchangeIn>,
+    /// A network race played back from a file (`replay.md` §18.15): who the humans are and which lane of
+    /// the stream is whose. `None` for every other race.
+    replay_net: Option<ReplayNetRun>,
+    /// `DERBY [0x657400]` of a network race the stream settled (`net_race_apply`): 0x416310's knockout arm
+    net_derby: bool,
+    /// **The launch's cheat flags of a network race** `(RALLY [0x6573F8], HEAVY [0x6573FC], DERBY [0x657400])` as
+    /// the host's stream carried them (0x4ED5D0's `0x19` / `0x1A` / `0x1B` records, 0x4B4B80 on every machine):
+    /// `None` outside a network race, where the flags are this machine's own cheat bits (0 / 8 / 7)
+    net_flags: Option<(bool, bool, bool)>,
+    /// a network race's replay: which human car the camera follows, an index into the humans by race
+    /// index (`[0x606858]`, the bar's previous / next car cells)
+    replay_view: usize,
+    /// the traffic cars' records of the network race settled (`net_race_apply`), for the replay file
+    net_traffic: Vec<nfs_net::options::TrafficCar>,
+    /// **The C runtime's `rand()` state** (`_getptd()+0x14`, 0x5A17C9: `s = s·0x343FD + 0x269EC3`,
+    /// `(s >> 16) & 0x7FFF`). The thread starts on 1 (`_initptd`, 0x5A5454) and the one `srand`
+    /// (0x5A17BC, called at 0x418100 by `HMissionSummary`'s constructor, i.e. every race load)
+    /// seeds it from `time(0)`. Only the network launch's draws use it here (`network.md` §11.7):
+    /// the grid draw 0x4B5008 and the `.DRIVER` draws 0x4EEDAC before it. **APPROXIMATION**
+    /// (direction: the original's state also moves with every other `rand()` of the program — the
+    /// front end's screens 0x4BD8C7…0x4CB098, the opponents' draws — which this port keeps on
+    /// generators of their own).
+    crt_rand: nfs_game::movie_overlay::CRand,
     /// Drive the track backwards (`REVERSE`): `_bstart` scene, reversed slice route, `<track>1.lsp`.
     backwards: bool,
     /// `MIRROR`: world drawn x-flipped, steering negated (modes.md §2.1, MEDIUM on the consumers).
@@ -4832,6 +4929,9 @@ struct App {
     /// Quick Knockout (`RACE_TYPE 3`): laps = opponents, the last car is out on every lap.
     quick_knockout: bool,
     player_eliminated: bool,
+    /// the player's `0xB7` finish time has been sent for this race (0x4168A9, once: the state-2
+    /// arm of 0x416310 runs on one tick)
+    net_time_sent: bool,
     records: Records,
     /// recording and playback of the controller stream — see [`Playback`]
     replay: Playback,
@@ -5082,6 +5182,20 @@ struct App {
     wrong_way_blink: (u64, u64, bool),
     /// `--record path`: per-32Hz-tick CSV of controls and vehicle state (regression fixtures)
     record: Option<std::io::BufWriter<std::fs::File>>,
+    /// **Test glue** (`NFS_NET_DUMP=<file>`): every human car's state after every tick of an
+    /// input-exchange race, one line per car in race-index order, the floats as their bit patterns —
+    /// what two machines' runs are diffed on (`network.md` §11.17)
+    net_dump: Option<std::io::BufWriter<std::fs::File>>,
+    /// when the last tick of an input-exchange race ran (the render's interpolation clock)
+    exchange_tick_at: Instant,
+    /// **`HInfo`'s in-race box** `[0x60C9C0]` (0x4251D5) — the `hud.loc` text it shows, if it is up
+    /// (`net_race_notice`)
+    net_notice: Option<u32>,
+    /// the box up is `[0x60C9FC]` (Spacebar byte 1, 0x4250BF) — the pause action's 18190 — not
+    /// `[0x60C9C0]` (byte 0, 0x4251D5): Space closes it (0x42A3D0) and its hints show both keys
+    net_notice_space: bool,
+    /// `[0x60CA08]` — the box up is the lag notice 18193, which closes itself
+    net_lag_box: bool,
     num_laps: u32,
     /// autotest: steer toward the centreline (pure pursuit) instead of scripted input
     follow_road: bool,
@@ -5277,6 +5391,9 @@ struct RoadCars {
     /// car ids to build the traffic from instead of the track's list (a tournament's own
     /// `trn+0x382`, `career_ui::StartRequest::traffic_ids`)
     traffic_ids: Option<Vec<u16>>,
+    /// per traffic car, the colour the host's per-slot record (`.COLOUR` 0x225, 0x4EEDA0) named
+    /// when it differs from the model's first paint set (a network race only)
+    traffic_colours: Vec<Option<[u8; 3]>>,
 }
 
 /// Replay, split out of [`App`] on 2026-09-21. The fields dropped their redundant `replay_`
@@ -5306,12 +5423,203 @@ struct Playback {
 }
 
 /// Network play, split out of [`App`] on 2026-09-21: the running session and the front end's
+/// **`HInfo`'s lag arm** (0x427C7E…0x427EDF, `net_race_notice`): what one look at `lag = 2·net+0xF0 −
+/// [0x6559F8] + 1` does. `Lost`: under −0x100 with the link up (0x427CD3: `cmp ecx, 0xffffff00; jge`, then
+/// the connection test again) — 18182 and the teardown; else under −0x20 (0x427E1A): with no box up
+/// (`[0x60CA08]`) `Show` — 18193 and the tick ends; with it up `Hold` (0x427EC2 → 0x427DAA: nothing else
+/// runs); at or above −0x20 with the box up (0x427EBA → 0x427EC2): above −0x10 `Close` (vtable `+0x14`, 2,
+/// the flag cleared) and on to the states, else `Hold`; with no box up `States` (0x427DB7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LagStep {
+    Lost,
+    Show,
+    Hold,
+    Close,
+    States,
+}
+
+fn lag_step(lag: i32, connected: bool, box_up: bool) -> LagStep {
+    if lag < -0x100 && connected {
+        return LagStep::Lost;
+    }
+    if lag < -0x20 {
+        return if box_up { LagStep::Hold } else { LagStep::Show };
+    }
+    match (box_up, lag > -0x10) {
+        (false, _) => LagStep::States,
+        (true, true) => LagStep::Close,
+        (true, false) => LagStep::Hold,
+    }
+}
+
+/// The controller samples an input-exchange race's frame driver latched for one tick (0x415EF0 →
+/// 0x413870, then `Car_applyInput` 0x4991E0 reads them per car): as the cars read them, the steering
+/// negated under `MIRROR` (0x4992D6).
+struct ExchangeIn {
+    /// this machine's own car (`[0x65741C]`)
+    local: Controls,
+    /// its race index
+    local_index: u32,
+    /// every network seat: `(seat, race index, sample)`
+    seats: Vec<(usize, u32, Controls)>,
+    /// the latched sample's horn bit (`b0` bit 1 = `car+0xD86`, 0x4991E0) of this machine's car and of
+    /// each entry of `seats`, in the same order
+    local_horn: bool,
+    seat_horns: Vec<bool>,
+    /// the samples as the ring holds them (`[b0, b1, b2, b3]`): what the replay records per human
+    local_raw: nfs_net::exchange::Sample,
+    seat_raw: Vec<nfs_net::exchange::Sample>,
+}
+
+/// What the simulation reads of a human car in an input-exchange race, taken the same way for the local car
+/// and for a seat (`network.md` §11.18).
+struct ExchHuman {
+    #[allow(dead_code)]
+    car: HumanCar,
+    position: Vec3,
+    slice: usize,
+    laps: u32,
+    #[allow(dead_code)]
+    progress: f32,
+    /// `car+0xEC0`: the speed along the car's own heading
+    vl: f32,
+    /// `car+0xEB0`
+    dir: f32,
+    speed: f32,
+    hw: f32,
+    hl: f32,
+    /// `car+0xD86`
+    horn: bool,
+}
+
+/// 0x417800's `car+0xEB0`: −1 below −3 m/s, +1 from 0 up, otherwise the heading's sign against the slice.
+fn exch_dir(t: &SliceTable, vl: f32, fwd: Vec3, s: usize) -> f32 {
+    if vl <= -3.0 {
+        -1.0
+    } else if vl >= 0.0 {
+        1.0
+    } else {
+        fwd.dot(t.slices[s].forward).signum()
+    }
+}
+
+/// A network race played back (`replay.md` §18.15): the input-exchange race without the network. The
+/// stream carries one lane per human car (the original's `0x606880 + 0x20·p`, `p` the race index); the
+/// simulation reads each car's packet from its lane where a live race takes it from the room's frames.
+struct ReplayNetRun {
+    /// the local car's race index (`[0x65741C]`, the car the setup's car / paint / name are)
+    local_index: u32,
+    /// each seat's race index, in seat order (`u32::MAX`: a seat the launch gave no index)
+    seats: Vec<u32>,
+    /// the room's names of the seats
+    names: Vec<String>,
+}
+
+/// A human car of an input-exchange race, by where it lives on this machine: the local player's
+/// car (`self.vehicle`) or a network seat (`self.road.opponents[k]`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HumanCar {
+    Local,
+    Seat(usize),
+}
+
+impl ExchangeIn {
+    /// The human cars in **registration order** (`Car_register` 0x40F189 fills `0x5E8B34[]` /
+    /// `0x5E8E2C[]` in the order `Race_setCars` 0x4ECF00 creates the cars, i.e. by race index, the
+    /// same on every machine — `network.md` §11.18). The port keeps the local car first and the
+    /// seats after it, which is a different order on each machine; every list the simulation walks
+    /// is built from this instead. A seat the launch left without a race index (parked) follows the
+    /// humans.
+    fn humans(&self, n_seats: usize) -> Vec<HumanCar> {
+        let mut order: Vec<(u32, HumanCar)> = vec![(self.local_index, HumanCar::Local)];
+        order.extend(self.seats.iter().map(|e| (e.1, HumanCar::Seat(e.0))));
+        order.sort_by_key(|e| e.0);
+        let mut order: Vec<HumanCar> = order.into_iter().map(|e| e.1).collect();
+        for k in 0..n_seats {
+            if !order.contains(&HumanCar::Seat(k)) {
+                order.push(HumanCar::Seat(k));
+            }
+        }
+        order
+    }
+
+    /// The horn of a human car (`car+0xD86`).
+    fn horn(&self, h: HumanCar) -> bool {
+        match h {
+            HumanCar::Local => self.local_horn,
+            HumanCar::Seat(k) => self.seats.iter().position(|e| e.0 == k).and_then(|i| self.seat_horns.get(i).copied()).unwrap_or(false),
+        }
+    }
+}
+
 /// lobby. `self.net` became `self.net.session`; `self.lobby` became `self.net.lobby`.
 struct Network {
     /// `--net host[:PORT]` / `--net join:HOST[:PORT]` — network play (`netplay`, `network.md` §7).
     session: Option<netplay::NetPlay>,
     /// The front end's side of it, alive while one of the four network layouts is open.
     lobby: Option<netplay::Lobby>,
+    /// the host's `0xB3` came in on a lobby screen: launch the race once the frame is drawn
+    start_due: bool,
+    /// the join outcome has been put in front of the player already (one notice per session)
+    join_notified: bool,
+    /// the lobby screen has sent our slot records (`[this+0x285]`, 0x509290 / 0x50A4F0)
+    lobby_sent: bool,
+    /// the car (`id`, name) those records last carried, to see a new selection
+    lobby_car: Option<(i32, Vec<u8>)>,
+    /// what the launch stream settled for the race about to start (`network.md` §11.7)
+    race: Option<NetRace>,
+    /// `PeerToPeerIP`'s `[this+0x288]` — set by CONNECT (0x50B150, its first instruction): the screen's tick
+    /// opens `joingame` once the link is up (0x50B270)
+    connect_pending: bool,
+    /// `[this+0x289]`: that `joingame` has been opened (once)
+    connect_opened: bool,
+}
+
+/// The race a network launch settled - the host's own choices, or what a player heard in the
+/// host's `0xBC` stream - resolved the way the launch reads the option table (`network.md` §11.7).
+#[derive(Debug, Clone)]
+struct NetRace {
+    track: Option<String>,
+    laps: u32,
+    backwards: bool,
+    mirror: bool,
+    damage: bool,
+    skill: u8,
+    /// traffic cars after 0x4ECF00's clamp to nine cars (`NUMCARS - 8`)
+    traffic_cars: u32,
+    positional: bool,
+    nocollision: bool,
+    /// `DERBY`: the stream said the race is a Smash Up (0x416407's knockout arm runs)
+    derby: bool,
+    /// `RALLY` `[0x6573F8]` / `HEAVY` `[0x6573FC]`: the host's cheats 0 and 8 as the stream carried them
+    /// (`network.md` §11.20) — every machine's cars run on these, whatever cheat bits it has of its own
+    rally: bool,
+    heavy: bool,
+    /// the players in the race (`ebx` of 0x4B4DA0: the players `net+0xE5` marks)
+    players: u32,
+    /// `NUMOPPONENTRACECARS` `[0x658088]` as the stream settled it: 0 for a network launch (0x4ECF00;
+    /// the stream's `(0x28, 0)`, `options.rs`); the fix-up 0x4B5081 numbers that many opponent slots
+    /// after the players, and the port has no AI opponent in a network race
+    opponents: u32,
+    /// `.STARTINGPOS` of this machine's own race index, as the host drew it, as the port's
+    /// `grid_pos` (`g − 1`)
+    grid: Option<u32>,
+    /// the same for each other player, in room order — the seat's parking place until its
+    /// packets arrive
+    seat_grids: Vec<Option<u32>>,
+    playlist: Option<Vec<u32>>,
+    /// `fe.txt`'s `RAND_SEED` / `TIME` / `WEATHER` / `FOG` as the host's stream carried them
+    fe_txt: Vec<(&'static str, u32)>,
+    /// the traffic cars' per-slot records, in slot order (the host's own for the host)
+    traffic: Vec<nfs_net::options::TrafficCar>,
+    /// each other player's per-slot car record at its race index, in room order (the seat order)
+    /// — what 0x4EEDA0 built on the owner's machine (`network.md` §11.12)
+    seat_cars: Vec<nfs_net::launchcar::CarSlot>,
+    /// `.CAMERA` 0x148 of **race index 0** — `car[0].camera`, the only list this machine's camera
+    /// reads (`network.md` §11.12c): the first player of the race's, whoever that is
+    camera0: Option<Vec<u32>>,
+    /// this machine's own car record at its race index (`launch.cars[me]`), for the replay's `.rpl`
+    own_words: Vec<(u32, Vec<u32>)>,
 }
 
 /// The front end's half of [`App`]: the menu and the layout screens it shows, the 3D room and
@@ -5569,10 +5877,26 @@ struct FrontEnd {
     comms_game_mode: u32,
     /// `Camera.Current` — the type-4 accessor 0x4E4D40 registers (0x4E4D6A) and sets to 0
     /// (0x4E4D7C), whose selection `NFS5.CAMERASELECT`'s slot 9 0x4BF5F0 writes and whose value its
-    /// draw 0x4BF410 highlights. Only those widgets read it: the launch 0x4EF010 takes
+    /// draw 0x4BF410 highlights. Only those widgets read it: the launch 0x4EEDA0 takes
     /// `Camera.1`…`Camera.4` for the car's list and never `Camera.Current`, so it chooses nothing
-    /// in the race.
+    /// in the race — it only says which of the four `camera_list` entries `NFS5.CAMERAPICTURE`'s
+    /// release (0x4BF920) writes.
     camera_current: usize,
+    /// `Camera.1 … Camera.4` — the view ids of the car's camera list, registered by 0x4E4D40 as
+    /// 0, 1, 2, 3 (`push` 0x4E4DB4, 0x4E4DF0, 0x4E4E2C, 0x4E4E64 before the `SetSelection` calls
+    /// 0x4E4DB8 / 0x4E4DF4 / 0x4E4E30 / 0x4E4E68) and written by
+    /// `NFS5.CAMERAPICTURE`'s slot 9 0x4BF920. The launch's per-car routine 0x4EEDA0 sends them
+    /// as `.CAMERA` 0x148 for the player's slot (0x4EF02A…0x4EF0F5) — after `fe.txt`'s own
+    /// `car[0].camera` in the launch list, so they are what `car[0].camera` holds in a race the
+    /// front end started (`network.md` §11.12c). They persist for the run: 0x4E5D00 runs the data
+    /// area's slot 0 (0x4E4D40) at every front-end entry, but the accessor constructor's
+    /// registration 0x4B7B30 renames a second `Camera.1` (appends `"%d"`, 0x4B7C93) rather than
+    /// replacing the first, and every reader looks the accessor up by name.
+    camera_list: [i32; 4],
+    /// When each `NFS5.CAMERAPICTURE` last took a release that assigned (`[this+0x140]`, stored at
+    /// 0x4BF9EE): a release within `[0x5DEB48] / 2` (half a second) of the last is not one
+    /// (0x4BF969…0x4BF984), and clears it (0x4BF99B)
+    camera_pic_click: std::collections::HashMap<usize, Instant>,
     /// `Game.GameType` of the race running when the layout front end started it — what 0x4D3420
     /// keys the screen stack it rebuilds on once the race is over (`fe_after_race`). `None` for a
     /// race from the text menu or the command line, which go back to the text menu.
@@ -5607,6 +5931,18 @@ enum DialogFor {
     /// "yes" with a price lists the selected car at it (0x4F91C0) and runs the market tick
     /// 0x4F7DB0 (the garage tick 0x50FB32…0x50FC9F)
     SellPrice,
+    /// a join the host turned down for a name clash: the input dialog 821 (0x5097C2) asks for
+    /// another; "yes" joins again under it, anything else goes back
+    NetName,
+    /// `CREATE` on a games screen -> the input dialog 601 (0x509E40): "yes" sets `Comms.GameName`
+    /// (15 characters at most) and creates the session (0x50A050 -> 0x509A00), then opens
+    /// `creategame`; "no" only takes the dialog down
+    NetGameName,
+    /// a join that failed (820 full, 831 could not connect…): one button, then back
+    NetFail,
+    /// 817 `IDS_MPCONNECTING`, kept up while the comm state is 3 (0x5095A5); its button cancels
+    /// (0x5095C0…: teardown 0x48E9C0) and the screen goes back
+    NetConnecting,
     /// the paint shop's `CHANGEDECAL` → the input dialog 251 (0x5111B0): "yes" gives the garage
     /// car the typed number, or −1 when nothing was typed (0x5112ED…0x51146F)
     Decal,
@@ -5847,6 +6183,25 @@ fn callback_list_of(l: &nfs_game::layout::LayoutScreen) -> String {
 /// the career era tabs (0x4D8461).
 fn slot_ac(list: &str) -> bool {
     matches!(list, "ID_VICTORYSCREEN" | "ID_CHRONICLE" | "ID_CREDITS" | "ID_MAINSCREEN" | "ID_OPTIONSSCREEN" | "ID_FDVICTORYSCREEN")
+}
+
+/// **TEST GLUE** (`NFS_REMOTE_DUMP=<file>`): one CSV line per tick for every remote seat after the dead
+/// reckoning — tick, seat, position, speed estimate, the last block's tick, the lag book's `+0x68` /
+/// `+0x5C` and the stale flag — what the smooth-motion proof reads (`network.md` 8.4).
+fn remote_dump(tick: u64, seat: usize, v: &Vehicle, n: &netplay::NetPlay) {
+    use std::io::Write;
+    static OUT: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
+    let out = OUT.get_or_init(|| {
+        let path = std::env::var_os("NFS_REMOTE_DUMP")?;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path).ok()?);
+        let _ = writeln!(f, "tick,seat,x,y,z,speed_est,block_tick,lag,lag_avg,stale");
+        Some(std::sync::Mutex::new(f))
+    });
+    let (Some(out), Some(r)) = (out.as_ref(), n.remotes.values().find(|r| r.seat == seat)) else { return };
+    if let Ok(mut f) = out.lock() {
+        let _ = writeln!(f, "{tick},{seat},{:.4},{:.4},{:.4},{:.3},{},{},{},{}", v.position.x, v.position.y, v.position.z, v.speed_est, r.state.tick, r.lag, r.lag_avg, r.stale as u8);
+        let _ = f.flush();
+    }
 }
 
 impl App {
@@ -6588,32 +6943,113 @@ impl App {
             .unwrap_or(accessor);
         match base {
             // the four network layouts, filled from the `'d'` answers a `'w'` probe collects
-            "Comms.ServerList" | "Comms.GamesList" => {
+            // `Comms.ServerList`'s row draw is 0x4B9780 (`network.md` §9): the row number
+            // right-aligned 4 left of `ID_SEVERPOS` with the name 4 right of it, the players
+            // (`[+0x48]`) at `ID_PLAYERPOS` and the ping (`min(ping, 9999)`, blank when negative)
+            // at `ID_PINGPOS`; `ID_GAMEPOS`'s `[+0x3C] >> 16` is not something a `'d'` carries.
+            "Comms.ServerList" => {
                 let l = self.net.lobby.as_ref()?;
-                Some((
-                    l.games().into_iter().map(ListRow::Text).collect(),
-                    Some(l.sel),
-                ))
+                let cell = |anchor: &str, dx: f32, text: String| ListCell { align: None, anchor: anchor.into(), dx, text, fade: 0xFF };
+                let rows = l
+                    .rows()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let mut cells = vec![cell("ID_SEVERPOS", -4.0, format!("{}", i + 1)), cell("ID_SEVERPOS", 4.0, r.name), cell("ID_PLAYERPOS", 0.0, format!("{}", r.players))];
+                        if let Some(p) = r.ping {
+                            cells.push(cell("ID_PINGPOS", 0.0, format!("{p}")));
+                        }
+                        ListRow::Columns(cells)
+                    })
+                    .collect();
+                Some((rows, Some(l.sel)))
+            }
+            // `Comms.GamesList` (`udpip` / `local`) — **the row draw is 0x4BA030** (`network.md`
+            // §11.5), the columns by the layout's tags through 0x4D63E0 (`(tag, align, alpha, fmt,
+            // value)` answers the tag's x, and the text goes at x − 4 right-aligned (align 2) or x
+            // + 4 left-aligned (align 0)):
+            //
+            // | tag | text | source |
+            // |---|---|---|
+            // | `ID_GAMEPOS` | the row number `%d` right, then the name `%s` left | row + 1 (0x4BA11E); `[+0x4C]` (0x4BA14C) |
+            // | `ID_PLAYERSPOS` | `%d` right, **`Comms.GameMode` = 1 only** (`local`) | `[+0x48]`, the room's player count (0x4BA1B7) |
+            // | `ID_TRACKPOS` | with mode ≠ 1 (`udpip`) the player count `%d` right (0x4BA20C); with mode 1 the ping `%d` right when 0x48C6E0 is ≥ 0 (0x4BA1F5) | |
+            // | `ID_TRACKPOS` | the track `%s` left | `FEStrings[desc word +0x26 + 0x28]` (0x4BA22D…0x4BA251) |
+            // | `ID_MODEPOS` | `%s` left | `FEStrings[0x5B9674[desc byte +0x21]]` = 281 / 282 (0x4BA26A…0x4BA292) |
+            // | `ID_VERPOS` | `%s` left | `[+0x8C]`, what follows the `~` of the name (0x4BA2AE) |
+            //
+            // The entry's fields are the `'d'`'s descriptor (`nfs_net::comm::desc`); a text id the
+            // table lacks reads "Not Found" (0x4E073D → 0x5D9B38).
+            "Comms.GamesList" => {
+                let l = self.net.lobby.as_ref()?;
+                let local = self.fe.comms_game_mode == 1;
+                let text = |id: u32| self.fe.strings.get(id).map_or_else(|| "Not Found".to_string(), str::to_string);
+                let cell = |anchor: &str, dx: f32, text: String| ListCell { align: None, anchor: anchor.into(), dx, text, fade: 0xFF };
+                let rows = l
+                    .rows()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let mut cells = vec![cell("ID_GAMEPOS", -4.0, format!("{}", i + 1)), cell("ID_GAMEPOS", 4.0, r.name)];
+                        if local {
+                            cells.push(cell("ID_PLAYERSPOS", -4.0, format!("{}", r.players)));
+                            if let Some(p) = r.ping {
+                                cells.push(cell("ID_TRACKPOS", -4.0, format!("{p}")));
+                            }
+                        } else {
+                            cells.push(cell("ID_TRACKPOS", -4.0, format!("{}", r.players)));
+                        }
+                        cells.push(cell("ID_TRACKPOS", 4.0, text(u32::from(r.track_id) + 0x28)));
+                        // the table 0x5B9674 has two ids and then a 0 (0x4E06D7: id 0 is ""); a byte
+                        // past that reads whatever follows in the image, which the port does not have
+                        let mode = POSITIONAL_OPTIONS.get(usize::from(r.mode)).map_or_else(String::new, |id| text(*id));
+                        cells.push(cell("ID_MODEPOS", 4.0, mode));
+                        cells.push(cell("ID_VERPOS", 4.0, r.version));
+                        ListRow::Columns(cells)
+                    })
+                    .collect();
+                Some((rows, Some(l.sel)))
             }
             "Comms.IPList" => {
                 let l = self.net.lobby.as_ref()?;
                 Some((
                     l.addresses().into_iter().map(ListRow::Text).collect(),
-                    Some(l.sel),
+                    Some(l.ip_sel),
                 ))
             }
             "Comms.LobbyPlayerList" => {
-                Some((self.net.lobby.as_ref()?.players().into_iter().map(ListRow::Text).collect(), None))
+                // 0x4BAD40 (the refill) lists `net+0x260` — the players of the connected NfsNet, only
+                // while `net+8` is set and `+0xBF` clear (0x4BAD8A…0x4BADA1) — and nothing else feeds
+                // it: no session, no rows (`network.md` §11.14). 0x4BAEF0 draws each row: the number
+                // right at `ID_SMALLPLAYERNAMETHINGPOS − 4`, the name left at `+4`, the ping (when
+                // ≥ 0, at most 9999) right at `ID_SMALLPINGTHINGPOS − 4`
+                let cell = |anchor: &str, dx: f32, text: String| ListCell { anchor: anchor.into(), dx, text, fade: 0xFF, align: None };
+                let rows = self
+                    .net
+                    .session
+                    .as_ref()
+                    .filter(|n| n.link_up())
+                    .map(|n| {
+                        n.room
+                            .players
+                            .iter()
+                            .enumerate()
+                            .map(|(i, p)| {
+                                let name: String = p.name.iter().map(|&b| nfs_formats::locale::cp1252(b)).collect();
+                                let mut cells = vec![cell("ID_SMALLPLAYERNAMETHINGPOS", -4.0, format!("{}", i + 1)), cell("ID_SMALLPLAYERNAMETHINGPOS", 4.0, name)];
+                                if let Some(ping) = n.ping_shown(p.id) {
+                                    cells.push(cell("ID_SMALLPINGTHINGPOS", -4.0, format!("{ping}")));
+                                }
+                                ListRow::Columns(cells)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some((rows, None))
             }
             // 0x4BBBD0: the room's players and "empty" (FE 287) to eight — eight "empty" rows
             // with no room (0x4BBDE8)
-            "Comms.PlayerList" => {
-                let empty = self.fe.strings.get(287).unwrap_or_default().to_string();
-                Some(match self.net.session.as_ref() {
-                    Some(n) => (n.players(&empty).into_iter().map(|p| ListRow::Text(p.0)).collect(), n.player_sel),
-                    None => (vec![ListRow::Text(empty); nfs_net::room::MAX_PLAYERS], None),
-                })
-            }
+            "Comms.PlayerList" => self.net_player_rows(),
             "Comms.Positional" => {
                 // with no session yet the answer is the accessor's own starting index, 1
                 let on = match self.net.session.as_ref() {
@@ -6665,25 +7101,25 @@ impl App {
                     .enumerate()
                     .map(|(i, r)| {
                         ListRow::Columns(vec![
-                            ListCell {
+                            ListCell { align: None,
                                 fade: 0xFF,
                                 anchor: "ID_RECORDPLAYERPOS".into(),
                                 dx: -10.0,
                                 text: format!("{}", i + 1),
                             },
-                            ListCell {
+                            ListCell { align: None,
                                 fade: 0xFF,
                                 anchor: "ID_RECORDPLAYERPOS".into(),
                                 dx: 4.0,
                                 text: r.driver.clone(),
                             },
-                            ListCell {
+                            ListCell { align: None,
                                 fade: 0xFF,
                                 anchor: "ID_RECORDCARPOS".into(),
                                 dx: 4.0,
                                 text: r.car.clone(),
                             },
-                            ListCell {
+                            ListCell { align: None,
                                 fade: 0xFF,
                                 anchor: "ID_RECORDTIMEPOS".into(),
                                 dx: 4.0,
@@ -6818,7 +7254,7 @@ impl App {
         // the headings go by category **string**, so 6 and 7 share one (`parts_shop::grouped`)
         let cells = parts.into_iter().map(|p| {
             let right = if damage_list {
-                ListCell {
+                ListCell { align: None,
                     fade: 0xFF,
                     anchor: "ID_DAMAGEPOS".into(),
                     dx: 3.0,
@@ -6826,7 +7262,7 @@ impl App {
                 }
             } else {
                 // 0x51590A: a part to buy is listed at `0x5181C0`, its aged price
-                ListCell { fade: 0xFF, anchor: "ID_PRICEPOS".into(), dx: -4.0, text: format!("{}", c.career.part_buy_price(p)) }
+                ListCell { align: None, fade: 0xFF, anchor: "ID_PRICEPOS".into(), dx: -4.0, text: format!("{}", c.career.part_buy_price(p)) }
             };
             (p, right)
         });
@@ -7089,8 +7525,9 @@ impl App {
                 && let Some(lobby) = self.net.lobby.as_mut()
                 && lobby.found.is_empty()
             {
-                let mut name = [0u8; 32];
-                name[..8].copy_from_slice(b"HANS'S \0");
+                // a game as 0x509B00 / 0x48DD97 describe it: `HANS'S ~3.5`, positional (index 1),
+                // forward (410) and the first track (300)
+                let name = nfs_net::comm::desc::name_field("HANS'S ", "3.5");
                 lobby.found.push((
                     std::net::SocketAddr::from(([127, 0, 0, 1], 1106)),
                     nfs_net::comm::Describe {
@@ -7100,8 +7537,8 @@ impl App {
                         conn_words: [0, 0],
                         conn_raw: [0, 0],
                         name,
-                        bytes: [0; 4],
-                        words: [0, 0],
+                        bytes: [0, 1, 0, 0],
+                        words: [410, 300],
                         dwords: [0, 0],
                         player_limit: 2,
                         slot_mask: 1,
@@ -8894,6 +9331,12 @@ impl App {
     /// Abandon the running race and go back to the menu; `false` when there is no menu to go back
     /// to (the app was started straight into a race).
     fn leave_race(&mut self) -> bool {
+        self.leave_race_as(true)
+    }
+
+    /// [`Self::leave_race`] with the front end's `[0x657E34]` (aborted) chosen by the caller: the pause
+    /// menu's quit sets it (0x426182), the network race's Esc leave (0x41523A) does not.
+    fn leave_race_as(&mut self, aborted: bool) -> bool {
         let Some(menu) = self.fe.menu_template.take() else {
             return false;
         };
@@ -8935,7 +9378,7 @@ impl App {
         self.fe.menu = Some(menu);
         self.sim_shutdown();
         // left from the pause menu: `[0x657E34]` is set
-        self.fe_after_race(true);
+        self.fe_after_race(aborted);
         true
     }
 
@@ -8958,6 +9401,14 @@ impl App {
     /// 0x45DD10 among it —, 0x414F80 the race's init, 0x471C40 deletes the camera manager) and the
     /// HUD torn down (0x425330 at 0x4B6A23).
     fn sim_shutdown(&mut self) {
+        // an input-exchange race's player reports `0xB7 (−2, −1)` to the room as it leaves (0x48DA60)
+        if let Some(n) = self.net.session.as_mut() {
+            n.exchange_leave();
+        }
+        self.net_dump = None;
+        self.net_notice = None;
+        self.net_notice_space = false;
+        self.net_lag_box = false;
         self.vehicle = None;
         self.race = None;
         self.world = None;
@@ -9000,6 +9451,12 @@ impl App {
     /// 0x51B020 `current_mission` none left).
     fn fe_after_race(&mut self, aborted: bool) {
         let replay = std::mem::take(&mut self.fe.after_replay);
+        // 0x4B6F34…0x4B6F60: the session loop's exit after the race — `0x48DAD0`, `0xB7 (−1, −1)` when
+        // no time was sent, then `0xB7 (−2, −1)`; every machine's `net+0xE5` bit for us goes. (Glue:
+        // only after a race a launch numbered, `in_race != 0`.)
+        if let Some(n) = self.net.session.as_mut().filter(|n| n.in_race != 0) {
+            n.leave_race();
+        }
         self.fe.test_drive = None;
         let Some(game_type) = self.fe.race_game_type.take() else { return };
         // 0x4D36BE: `LoadTrackRecords` runs on every entry, aborted or not. A non-aborted race
@@ -9219,22 +9676,35 @@ impl App {
             reverse: self.backwards,
             network: self.net.session.is_some(),
             language: u32::from(self.language),
+            rows: Vec::new(),
         }
     }
 
     /// One call of **0x4A4A70(`step`)** into the surface `RaceLoading` keeps.
     fn race_loading_step(&mut self, r: &mut Renderer, step: i32) -> bool {
-        let input = self.race_loading_inputs();
+        let mut input = self.race_loading_inputs();
+        // 0x4A4AD4…0x4A4B4F: the progress record, while the screen is up (`[0x655A28]`, set by step
+        // 0 and cleared by step 10), and 0x4A5149…0x4A5353: every player's row, on every call
+        let active = step == 0 || (step != 10 && self.fe.race_loading.as_ref().is_some_and(|l| l.active));
+        if active && let Some(n) = self.net.session.as_mut().filter(|n| n.in_race != 0) {
+            n.send_loading_step(step);
+            input.rows = n.loading_rows(r);
+        }
         let rl = self.fe.race_loading.get_or_insert_with(|| nfs_game::layout::loading::RaceLoading::new(r));
         rl.step(r, &self.paths, step, &input)
     }
 
     /// **0x4A4A70(`step`)**, drawn and presented at once — the loading screen between the front
     /// end and the race (`controls.md` §4.167). The port's race load is `start_race`, whose
-    /// stages are not 0x4B67B0's: step 0 is drawn as it starts (main's 0x4B6CCA), 5 once the
-    /// track is up (0x4B682E follows the track load 0x468FB0), 9 and 10 as it ends (0x414E74,
-    /// 0x4B68CB) — APPROXIMATION: 1…4 and 6…8 are not drawn.
+    /// stages are not 0x4B67B0's, so each step is drawn where the port's work of the original's
+    /// step has finished, in the original's order (NM, 2026-09-30): 0 as it starts (main's 0x4B6CCA),
+    /// 1 and 2 after the picture post (0x427A60), 3 after `TrackWorld::upload` (0x469065, the track
+    /// data), 4 and 5 after the sky (the end of 0x468FB0), 6 after the camera data (0x471B70, moved up
+    /// for the order), 7 after the collision sounds (0x4A8CD0), 8 before and 9 after the cars
+    /// (0x414E63, 0x414E74), 10 after the barrier (0x4B68CB). APPROXIMATION: the *work* between two
+    /// steps is the port's, not 0x4B67B0's — the bar moves when the port's equivalent finishes.
     fn race_loading_frame(&mut self, r: &mut Renderer, step: i32) {
+        tracing::debug!(target: "loading", step, "0x4A4A70");
         if !self.race_loading_step(r, step) {
             return;
         }
@@ -9242,6 +9712,98 @@ impl App {
         let scene = Scene { sprites, clear_color: [0.0, 0.0, 0.0, 1.0], ..Scene::default() };
         if let Err(e) = r.render(&scene, &self.camera) {
             tracing::error!(error = %e, "race loading screen render failed");
+        }
+        // **TEST GLUE** (not in the original): `NFS_LOADING_SHOT=<path>` writes the loading screen of
+        // step 9 as a still after `NFS_LOADING_WAIT` ms (default 3000) of draining the session — the
+        // other machine's `0x256` records and its picture arrive meanwhile — redrawn with step −1
+        // (0x4A4A70 with −1 draws the rows again and leaves the bar as it was)
+        if step == 9
+            && let Ok(path) = std::env::var("NFS_LOADING_SHOT")
+        {
+            let wait = std::env::var("NFS_LOADING_WAIT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(3000);
+            let until = Instant::now() + Duration::from_millis(wait);
+            while Instant::now() < until {
+                if let Some(n) = self.net.session.as_mut() {
+                    let _ = n.poll_lobby();
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            self.race_loading_step(r, -1);
+            let sprites = self.fe.race_loading.as_ref().map(|l| l.sprites(r.aspect())).unwrap_or_default();
+            let scene = Scene { sprites, clear_color: [0.0, 0.0, 0.0, 1.0], ..Scene::default() };
+            match r.render_to_image(&scene, &self.camera, 1280, 800) {
+                Ok(rgba) => {
+                    let _ = image::save_buffer(&path, &rgba, 1280, 800, image::ColorType::Rgba8);
+                    tracing::info!(path, "loading screen still written (NFS_LOADING_SHOT)");
+                }
+                Err(e) => tracing::error!(error = %e, "loading still failed"),
+            }
+        }
+    }
+
+    /// **A network race played back**: the same samples the live race latched, read from each human's lane of
+    /// the stream (0x4144B0 for every human car, in race-index order), at the same even ticks
+    /// (`replay.md` §18.15). No session runs, so this is what stands in for the exchange's latch.
+    fn replay_net_step(&mut self) {
+        let tick = self.tick;
+        self.exchange_in = None;
+        if self.exchange_in.is_none()
+            && tick % 2 == 0
+            && let Some(rn) = self.replay_net.as_ref()
+            && self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted))
+        {
+            let local_index = rn.local_index;
+            let seat_idx: Vec<(usize, u32)> = rn.seats.iter().enumerate().filter(|(_, i)| **i != u32::MAX).map(|(k, i)| (k, *i)).collect();
+            let mut order: Vec<u32> = seat_idx.iter().map(|e| e.1).chain(std::iter::once(local_index)).collect();
+            order.sort_unstable();
+            let mirror = self.mirror;
+            let controls = |s: nfs_net::exchange::Sample| {
+                let mut c = nfs_game::replay::Packet { buttons: s[0], steer: s[1] as i8, throttle: s[2], brake: s[3] }.to_controls();
+                if mirror {
+                    c.steer = -c.steer;
+                }
+                c
+            };
+            let mut samples: std::collections::HashMap<u32, nfs_net::exchange::Sample> = std::collections::HashMap::new();
+            if let Some(r) = self.replay.stream.as_mut() {
+                for &i in &order {
+                    let p = r.playback_player(i as usize);
+                    samples.insert(i, [p.buttons, p.steer as u8, p.throttle, p.brake]);
+                }
+            }
+            let sample = |i: u32| samples.get(&i).copied().unwrap_or([0; 4]);
+            if tick % 64 == 0 {
+                tracing::debug!(target: "netplay", tick, samples = ?order.iter().map(|i| (*i, sample(*i))).collect::<Vec<_>>(), "network replay: this tick's samples");
+            }
+            self.exchange_in = Some(ExchangeIn {
+                local: controls(sample(local_index)),
+                local_index,
+                seats: seat_idx.iter().map(|&(k, i)| (k, i, controls(sample(i)))).collect(),
+                local_horn: sample(local_index)[0] & 2 != 0,
+                seat_horns: seat_idx.iter().map(|&(_, i)| sample(i)[0] & 2 != 0).collect(),
+                local_raw: sample(local_index),
+                seat_raw: seat_idx.iter().map(|&(_, i)| sample(i)).collect(),
+            });
+            // 0x4163B0: a racer whose sample carries command 1 has left — state 3
+            for &(k, i) in &seat_idx {
+                if sample(i)[0] >> 3 == nfs_net::exchange::CMD_LEFT
+                    && let Some(o) = self.road.opponents.get_mut(k)
+                    && !o.eliminated
+                    && !o.progress.finished
+                {
+                    o.eliminated = true;
+                    o.progress.finished = true;
+                    o.progress.tick = tick;
+                }
+            }
+            if sample(local_index)[0] >> 3 == nfs_net::exchange::CMD_LEFT
+                && let Some(r) = self.race.as_mut()
+                && !r.finished
+            {
+                self.player_eliminated = true;
+                r.finished = true;
+                r.tick = tick;
+            }
         }
     }
 
@@ -9260,39 +9822,118 @@ impl App {
     /// arrived, exactly as the original's receiver drives it (`network.md` §5.2).
     fn net_step(&mut self) -> Vec<usize> {
         if self.net.session.is_none() {
+            // (a network race played back has no session: its lanes stand in for the exchange)
+            if self.replay_net.is_some() {
+                self.replay_net_step();
+                // every seat is a human car fed from its lane: the AI pass leaves them alone, as it leaves the
+                // seats the network owns
+                return (0..self.road.opponents.len()).collect();
+            }
             return Vec::new();
         }
-        let poses: Vec<(Vec3, Quat)> = self
-            .road.opponents
-            .iter()
-            .map(|o| {
-                (
-                    o.vehicle.position,
-                    Quat::from_mat3(&o.vehicle.orientation.transpose()).normalize(),
-                )
-            })
-            .collect();
         let tick = self.tick;
         // taken out for the duration so the seats and the player's car can be borrowed too
         let mut net = self.net.session.take();
         let seats = {
             let n = net.as_mut().expect("checked");
-            for line in n.poll(tick, |s| {
-                poses
-                    .get(s)
-                    .copied()
-                    .unwrap_or((Vec3::ZERO, Quat::IDENTITY))
-            }) {
+            for line in n.poll(tick) {
                 tracing::info!(target: "netplay", "{line}");
             }
-            n.remotes.values().map(|r| r.seat).collect::<Vec<_>>()
+            n.owned_seats()
         };
-        if let Some(n) = net.as_ref() {
-            for &s in &seats {
-                if let Some(o) = self.road.opponents.get_mut(s) {
-                    let specs = o.specs.clone();
-                    n.drive(s, &mut o.vehicle, &specs, tick);
+        // **The input exchange**: at an even tick the frame driver latches ring entry `t / 2` for every
+        // car (0x415BD4 → 0x415EF0) and `Car_applyInput` reads each car's packet from it; the tick
+        // clock is this port's `self.tick` (the value the tick runs under, `t`)
+        self.exchange_in = None;
+        if let Some(n) = net.as_mut()
+            && n.exchanging()
+            && tick % 2 == 0
+            && let Some(local_index) = n.local_race_index()
+        {
+            n.exchange_latch((tick / 2) as u32);
+            if tick % 64 == 0 {
+                tracing::debug!(target: "netplay", tick, received = n.exch.received, wall = n.exch.timer.wall, pending = n.exch.ring.pending(0), "input exchange: the tick clock");
+            }
+            let mirror = self.mirror;
+            let controls = |s: nfs_net::exchange::Sample| {
+                let mut c = nfs_game::replay::Packet { buttons: s[0], steer: s[1] as i8, throttle: s[2], brake: s[3] }.to_controls();
+                // 0x4992D6: `car+0xD90 = ±(steer << 1)`, negated when `MIRROR`
+                if mirror {
+                    c.steer = -c.steer;
                 }
+                c
+            };
+            let seat_idx: Vec<(usize, u32)> = (0..self.road.opponents.len()).filter_map(|k| n.seat_race_index(k).map(|i| (k, i))).collect();
+            self.exchange_in = Some(ExchangeIn {
+                local: controls(n.latched(local_index as usize)),
+                local_index,
+                seats: seat_idx.iter().map(|&(k, i)| (k, i, controls(n.latched(i as usize)))).collect(),
+                // `b0` bit 1 is the horn, which the sample carries whole (0x48EC1C, 0x48F20A)
+                local_horn: n.latched(local_index as usize)[0] & 2 != 0,
+                seat_horns: seat_idx.iter().map(|&(_, i)| n.latched(i as usize)[0] & 2 != 0).collect(),
+                local_raw: n.latched(local_index as usize),
+                seat_raw: seat_idx.iter().map(|&(_, i)| n.latched(i as usize)).collect(),
+            });
+        }
+        if let Some(n) = net.as_mut() {
+            // **The remote cars' dead reckoning** (`NetPlay::apply`, `Vehicle::net_dead_reckon`) runs after
+            // the tick's 64 Hz integration, where 0x49B8E0 calls it; what the drain leaves here is the
+            // store's own snap 0x4A03D0 (`snap_due`), which the original runs inside the receiver
+            if !n.exchanging()
+                && let Some(w) = self.world.as_ref()
+            {
+                n.store_snaps(|seat, b| {
+                    if let Some(o) = self.road.opponents.get_mut(seat) {
+                        o.vehicle.net_store_snap(b.velocity, &b.matrix, &w.collision);
+                    }
+                });
+            }
+            // 0x416310 (0x41637D…0x4163F5, game type 3, state 0): a racer whose link is gone goes to
+            // state 3 — `+0xB14 = tick`, `+0xB24 = 0`, no other change to the progress. It is the
+            // Quick Knockout's "out" state (`eliminated` + `finished` here), which HPosition shows as
+            // FE 18191 "DNF" (0x42B279…0x42B2C1) and `Race_finalize` ranks last with no time.
+            for s in 0..self.road.opponents.len() {
+                let Some(i) = n.seat_race_index(s) else { continue };
+                if let Some(o) = self.road.opponents.get_mut(s)
+                    && !o.eliminated
+                    && !o.progress.finished
+                    && n.retired(i, tick as u32)
+                {
+                    o.eliminated = true;
+                    o.progress.finished = true;
+                    o.progress.tick = tick;
+                    tracing::info!(target: "netplay", seat = s, race_index = i, "network racer's link gone: state 3 (0x416310)");
+                }
+            }
+            if let Some(i) = n.local_race_index()
+                && let Some(r) = self.race.as_mut()
+                && !r.finished
+                && n.retired(i, tick as u32)
+            {
+                self.player_eliminated = true;
+                r.finished = true;
+                r.tick = tick;
+                tracing::info!(target: "netplay", race_index = i, "own link gone: state 3 (0x416310)");
+            }
+            // 0x416310 (0x4166F0…0x4168A9): the local car reaches `NUM_LAPS` → state 2, and with the
+            // connection up (`net+8`, `+0xBF == 0`) `0x48DA60(tick − 0x1C0, best of its lap times)` sends
+            // `0xB7`: the finish time (`car+0xB24` after its `−= 0x1C0`, 0x416840) and the smallest of
+            // `car+0xB28 …` over the race's laps (0x416883…0x41689F). Not for a car retired to state 3.
+            if !self.net_time_sent
+                && !self.net_derby
+                && !self.player_eliminated
+                && let Some(r) = self.race.as_ref()
+                && r.finished
+            {
+                self.net_time_sent = true;
+                // `[0x606AC4] − 0x1C0` (0x4168A1 `add ebx, -0x1C0`: the finish tick less the 448-tick
+                // countdown — `car+0xB24`, which 0x416840 has just taken the same amount off) and the
+                // smallest of the first `NUM_LAPS` lap times (`FinalizeIn::from_progress` keeps the same
+                // `tick − 448`)
+                let finish = r.tick.saturating_sub(0x1C0);
+                let best = r.lap_times.iter().take(self.num_laps as usize).copied().min().unwrap_or(0);
+                tracing::info!(target: "netplay", tick = r.tick, finish, best, "own finish: 0xB7 (0x4168A9)");
+                n.send_race_time(finish as i32, best as i32);
             }
         }
         // `NfsNet_tick` 0x48EDF0 hangs off the **64 Hz** world tick and its gate is
@@ -9305,8 +9946,513 @@ impl App {
         seats
     }
 
+
+    /// **One 32 Hz sample of the controller**, the packer 0x412E70's output as the car reads it
+    /// (`replay.md` §2, `Car_applyInput` 0x4991E0): the steering (negated under `MIRROR`, 0x4992D6), the
+    /// throttle and brake bytes doubled, the handbrake, and the command code the packer fires on a
+    /// press (0x41312F…0x4131E9). `exchange` adds the reset key as command **5** (`C1_RESET`), which in
+    /// an input-exchange race travels in the sample like every other command — 0x40F7EB reads it back
+    /// from `car+0xD8B` for every human car — where a live race takes the key straight from the input.
+    /// The scripted drive (`follow_road`, autotest only, not the original's) steers the car itself.
+    fn controller_sample(
+        input: &mut InputState,
+        mirror: bool,
+        follow_road: bool,
+        slices: Option<&SliceTable>,
+        race: Option<&RaceProgress>,
+        v: &Vehicle,
+        exchange: bool,
+    ) -> Controls {
+        // right = +x in the body frame; rounded, so a pad's packet byte (a multiple of 2/126)
+        // comes back whole
+        let mut steer = (input.steer() * 126.0).round() as i32;
+        if mirror {
+            steer = -steer;
+        }
+        if follow_road && let (Some(t), Some(r)) = (slices, race) {
+            // pure pursuit on the slice ahead (autotest only; not the original AI)
+            let ahead = t.add(r.slice, 4);
+            let target = t.slices[ahead].centre;
+            let to = v.orientation * (target - v.position); // body-frame vector (rows = axes)
+            let angle = to.x.atan2(to.z.max(0.1));
+            steer = ((angle / 0.4).clamp(-1.0, 1.0) * 126.0) as i32;
+            // crude speed limit for the scripted drive: ease off above 110 km/h or in sharp bends
+            let limit = if angle.abs() > 0.15 { 60.0 } else { 110.0 };
+            if v.speed() * 3.6 > limit {
+                input.release(Action::Throttle);
+                input.press(Action::Brake);
+            } else {
+                input.release(Action::Brake);
+            }
+        }
+        let mut throttle = input.throttle();
+        if follow_road {
+            // autotest: ease off above 130 km/h and when steering hard
+            if v.speed() > 36.0 || steer.abs() > 80 {
+                throttle = throttle.min(0.35);
+            }
+        }
+        // The shape the original's controller packet has (`replay.md` §2): every axis is at
+        // most 0x7E and the car doubles it (0x4992CF), so the values the physics sees are even
+        // and never exceed 252 / ±126.
+        Controls {
+            throttle: ((throttle * 126.0) as u8).min(0x7E) * 2,
+            brake: ((input.brake() * 126.0) as u8).min(0x7E) * 2,
+            steer: (steer / 2).clamp(-63, 63) * 2,
+            handbrake: input.held(Action::Handbrake),
+            // the packer's plain group fires a command on its press (0x41312F…0x4131E9): code 2
+            // `C1_SHIFTUP`, 3 `C1_SHIFTDOWN`, 4 `C1_ABORT`, 6 `C1_AIDRIVE`, 10 / 11 the turn
+            // signals, 12 `C1_SIREN` (the hazards), 13 `C1_LIGHTSON`; it walks them in code
+            // order and each one pressed overwrites the code (0x413178), so the highest wins.
+            // Code 5 `C1_RESET` is still taken straight from the input (the reset below) — except
+            // in an input-exchange race, where it is one of the codes.
+            command: [
+                (Action::ShiftUp, 2u8),
+                (Action::ShiftDown, 3),
+                (Action::Abort, 4),
+                (Action::Reset, 5),
+                (Action::AiDrive, 6),
+                (Action::SignalLeft, 10),
+                (Action::SignalRight, 11),
+                (Action::Hazards, 12),
+                (Action::Lights, 13),
+            ]
+            .into_iter()
+            .filter(|(a, _)| exchange || *a != Action::Reset)
+            .fold(0, |code, (a, c)| if input.take_pressed(a) { c } else { code }),
+        }
+    }
+
+
+
+    /// **`HInfo`'s tick 0x427C70** for a network race (`[0x6573E8] == 3`; the HUD tick 0x425950 calls it at
+    /// 0x425E0B, once per **rendered frame** — the port calls it from each frame of the windowed loop and from
+    /// each turn of the scripted one and its waits, since it is exactly while ticks stall that it matters).
+    /// Two things, in this order:
+    ///
+    /// 1. **the input exchange's lag** (`[0x657408] == 0`, 0x427C7E…0x427EDF): `lag = 2·net+0xF0 −
+    ///    [0x6559F8] + 1` (0 for `net+0xF0` without a full connection) — how far the frames received are
+    ///    behind the tick clock, in ticks. Under **−0x100** (4 s) with the link up: **18182 «Связь
+    ///    утеряна.»** and the session is torn down (0x48E9C0). Under **−0x20** (0.5 s) and no box up:
+    ///    **18193 «Связь...»**, `[0x60CA08] = 1`, and the tick ends. With the box up, above **−0x10** it
+    ///    closes (vtable `+0x14`, 2) and the flag clears. While the flag is set nothing below runs (0x427DAA);
+    /// 2. **the comm state** `[net+0x24]` (0x48CA40): 4 and 12 → 18182, 6 → 18183, 7 → 18186, 8 → 18188,
+    ///    9 → 18185, 10 → 18189, 11 → 18187, 5 nothing (jump table 0x428274, states 4…12); the session is
+    ///    torn down for 4, 6, 7, 8, 12 always and for 9, 10, 11 only while `net+0xC6` is clear (0x427FDD…0x428267;
+    ///    the host's `+0xC6` is set, 0x48DF5A).
+    ///
+    /// **APPROXIMATIONS:** the box is drawn as a plain overlay (`Hud::notice_sprites`, hints: Esc only —
+    /// the in-race `HInfo` is built with its Spacebar byte 0, 0x4251D5) that stays up for the rest of the race
+    /// and does not take the keys the original's modal box does (the pause menu opens over it); the port's
+    /// teardown is the session dropped after its `'K'`.
+    fn net_race_notice(&mut self) {
+        let Some(n) = self.net.session.as_ref() else { return };
+        if self.vehicle.is_none() || n.in_race == 0 {
+            return;
+        }
+        let state = n.comm_state();
+        let host = n.is_host();
+        let mut teardown = false;
+        // 0x427C7E: only an input-exchange race has the lag arm
+        let mut to_states = true;
+        if !n.positional {
+            let connected = n.established();
+            let f0 = if connected { n.exch.received as i32 } else { 0 };
+            let lag = 2 * f0 - n.exch.timer.wall as i32 + 1;
+            match lag_step(lag, connected, self.net_lag_box) {
+                LagStep::Lost => {
+                    self.net_notice = Some(18182);
+                    self.net_notice_space = false;
+                    teardown = true;
+                    // (0x427DAA, after the teardown 0x427DA5: with the lag box up nothing else runs; the
+                    // state read at the top, 0x427C77, is what the switch below still sees)
+                    to_states = !self.net_lag_box;
+                }
+                LagStep::Show => {
+                    tracing::info!(target: "netplay", lag, "HInfo (0x427C70): the frames are late — «Связь...» (18193)");
+                    self.net_notice = Some(18193);
+                    self.net_notice_space = false;
+                    self.net_lag_box = true;
+                    return;
+                }
+                LagStep::Hold => to_states = false,
+                LagStep::Close => {
+                    tracing::info!(target: "netplay", lag, "HInfo (0x427C70): the frames are back — the notice closes");
+                    self.net_notice = None;
+                    self.net_notice_space = false;
+                    self.net_lag_box = false;
+                }
+                LagStep::States => {}
+            }
+        }
+        if to_states && !self.net_lag_box {
+            let text = match state {
+                4 | 12 => Some(18182),
+                6 => Some(18183),
+                7 => Some(18186),
+                8 => Some(18188),
+                9 => Some(18185),
+                10 => Some(18189),
+                11 => Some(18187),
+                _ => None,
+            };
+            if let Some(t) = text {
+                self.net_notice = Some(t);
+                    self.net_notice_space = false;
+                // 0x427FDD…0x428267: 9, 10, 11 keep the session while `net+0xC6` is set (a host's)
+                teardown |= !(matches!(state, 9..=11) && host);
+            }
+        }
+        if teardown {
+            tracing::info!(target: "netplay", state, notice = ?self.net_notice, "HInfo (0x427C70): the network is gone — the session is torn down (0x48E9C0)");
+            self.fe_session_leave();
+        }
+    }
+
+    /// **0x415110, the pause action (Esc / P / Start), in a network race** (`[0x6573E8] == 3`; read to
+    /// the instruction, `hud.md` "Keys"). `live` is the link test `[0x628C70]`, `+8`, `+0xBF == 0`,
+    /// `+0xBE != 0`, `+0xDC >= 0` ([`netplay::NetPlay::established`]); `queue` is the HUD dialog queue
+    /// `[0x60C9C4]` being non-empty (0x426A60): the pause menu, a page, an `HInfo` notice.
+    ///
+    /// * **with a live link** (0x415110's second arm) and the queue empty, 0x426800's game-type-3 arm
+    ///   (0x42695A…0x4269FF) queues `HInfo` `[0x60C9FC]` with hud.loc **18190**, opens it and clears its
+    ///   timeout (0x41B130(0)): nothing pauses, the race keeps running, Space closes the notice;
+    /// * with a notice (or any page) up, the press falls to 0x41523A: 0x4AB270, 0x4120F0, `[0x606A90] = 0`,
+    ///   and — `[0x5E99F4]` below 2 — `[0x657424] = 3`, **0x416AC0(1) = leave the race**;
+    /// * **with no live link** the first arm (0x41513E…) pauses (`[0x606A90] = 1`, 0x4AB150 …), runs
+    ///   0x461740 and 0x426800 — the same 18190 notice, still no pause menu — and then, in type 3,
+    ///   falls into the same leave: the press queues the notice and leaves in one call.
+    ///
+    /// Answers whether the press leaves the race. The leave is the front end coming back **not aborted** (`[0x657E34]` stays clear once the tick is
+    /// past 0x20, 0x415120's other arm), i.e. to the lobby screen (`after_race_screens`' network arm).
+    /// **APPROXIMATION:** 0x416AC0(1)'s finalize (the result records the race end 0x4EDD00 files) is not
+    /// run — the port has no filing for a network race; direction: the race's
+    /// records are neither read nor written after the press, which the return to the lobby does not show.
+    fn net_pause_press(&mut self) -> bool {
+        let live = self.net.session.as_ref().is_some_and(|n| n.established());
+        let page_up = self.results.is_some() && self.result_pages().get(self.results_page as usize).is_some();
+        // the first arm: `[0x5E99F4] < 2`, `[0x606A88] == 0`, `[0x606AC4] > 0x20` and no live link
+        let first_arm = !live && self.tick > 0x20;
+        let queue = self.paused || self.net_notice.is_some() || page_up;
+        if !queue {
+            // 0x426800, type 3
+            self.net_notice = Some(18190);
+            self.net_notice_space = true;
+            self.orbit = Orbit::default();
+            tracing::info!(target: "netplay", live, "pause action (0x415110): HInfo 18190 queued (0x426800, game type 3)");
+            if !first_arm {
+                return false;
+            }
+        }
+        tracing::info!(target: "netplay", live, "pause action (0x415110): 0x41523A - leave the race (0x416AC0(1))");
+        self.paused = false;
+        self.net_notice = None;
+        self.net_notice_space = false;
+        true
+    }
+
+    /// The press, then the leave it asks for (0x41523A → the session loop's front-end return).
+    fn net_pause_action(&mut self, event_loop: &ActiveEventLoop) {
+        if self.net_pause_press() && !self.leave_race_as(false) {
+            event_loop.exit();
+        }
+    }
+
+    /// **The input exchange's network seats' `Car_simulate`** (0x49FD30, Sc32 priority 0x1E): each seat
+    /// in `seats` (race-index order) is a human car — the same step the player's car takes, from the
+    /// controller sample the room's frame gave it. `local` is the player's car, which the draft sees
+    /// with the other seats (live); `wet` is `LoadTransfer`'s wet test (0x4A191D…0x4A194D).
+    #[allow(clippy::too_many_arguments)]
+    fn exchange_seats_step(
+        opponents: &mut [RaceCar],
+        seats: &[(usize, u32, Controls)],
+        local: Vec3,
+        tick: u64,
+        flags: (bool, bool),
+        wet: &dyn Fn(Vec3) -> bool,
+        grid: &nfs_physics::collision::TriangleGrid,
+    ) {
+        for &(oi, _, c) in seats {
+            let others: Vec<Vec3> = std::iter::once(local)
+                .chain(opponents.iter().enumerate().filter(|(k, _)| *k != oi).map(|(_, q)| q.vehicle.position))
+                .collect();
+            let Some(o) = opponents.get_mut(oi) else { continue };
+            o.vehicle.race_started = tick >= RACE_START_TICK;
+            o.vehicle.game_tick = tick;
+            // the launch's `RALLY` / `DERBY` (`launch_flags`); `.TINYCAR` is the seat's own record's (`RaceCar::tiny`)
+            o.vehicle.rally = flags.0;
+            o.vehicle.tiny = o.tiny;
+            o.vehicle.derby = flags.1;
+            o.vehicle.race_state = if o.eliminated {
+                3
+            } else if o.progress.finished {
+                2
+            } else {
+                0
+            };
+            o.vehicle.draft = nfs_physics::vehicle::draft_factor(o.vehicle.position, o.vehicle.forward(), o.vehicle.v_long(), &others);
+            o.vehicle.misfire_roll = nfs_game::rng::rand01();
+            o.vehicle.wet_track = wet(o.vehicle.position);
+            o.vehicle.step32(&c, &o.specs, grid);
+        }
+    }
+
+
+    /// **The input-exchange race after the race frame's `0xC5` round** (`net_race_go`, NetPlay::exchange_race_frame
+    /// set the ring up before it): the seats become human cars — no AI flag, no AI traction control
+    /// (`car+0x52C & 4`, `car+0xDA8` clear) — the in-race notice is cleared and the run's state dump
+    /// (`NFS_NET_DUMP`) opens.
+    fn net_exchange_begin(&mut self) {
+        self.net_notice = None;
+        self.net_lag_box = false;
+        let Some(n) = self.net.session.as_mut() else { return };
+        if n.exchanging() {
+            for (k, o) in self.road.opponents.iter_mut().enumerate() {
+                if n.seat_race_index(k).is_some() {
+                    o.vehicle.ai_driven = false;
+                    o.vehicle.traction_control = false;
+                }
+            }
+            if let Ok(path) = std::env::var("NFS_NET_DUMP")
+                && let Ok(f) = std::fs::File::create(&path)
+            {
+                self.net_dump = Some(std::io::BufWriter::new(f));
+                // the cars as the race starts, by race index: the specs and the vehicle, in `Debug`
+                // text, so two machines' copies of a car can be told apart at the first field that differs
+                use std::io::Write;
+                if let Ok(mut sf) = std::fs::File::create(format!("{path}.cars")) {
+                    let mut cars: Vec<(u32, String)> = Vec::new();
+                    if let (Some(i), Some(v)) = (n.local_race_index(), self.vehicle.as_ref()) {
+                        cars.push((i, format!("{:#?}\n{:#?}", self.specs, v)));
+                    }
+                    for (k, o) in self.road.opponents.iter().enumerate() {
+                        if let Some(i) = n.seat_race_index(k) {
+                            cars.push((i, format!("{:#?}\n{:#?}", o.specs, o.vehicle)));
+                        }
+                    }
+                    cars.sort_by_key(|c| c.0);
+                    for (i, t) in cars {
+                        let _ = writeln!(sf, "=== car {i}\n{t}");
+                    }
+                }
+                // the specs alone, for a diff against a replay's (`replay.md` §18.15)
+                if let Ok(mut sf) = std::fs::File::create(format!("{path}.specs")) {
+                    let mut cars: Vec<(u32, String)> = Vec::new();
+                    if let Some(i) = n.local_race_index() {
+                        cars.push((i, format!("{:#?}", self.specs)));
+                    }
+                    for (k, o) in self.road.opponents.iter().enumerate() {
+                        if let Some(i) = n.seat_race_index(k) {
+                            cars.push((i, format!("{:#?}", o.specs)));
+                        }
+                    }
+                    cars.sort_by_key(|c| c.0);
+                    for (i, t) in cars {
+                        let _ = writeln!(sf, "=== car {i}\n{t}");
+                    }
+                }
+            }
+            tracing::info!(local = ?n.local_race_index(), seats = self.road.opponents.len(), "input exchange: the race runs on the room's frames (0x4152E0)");
+        }
+    }
+
+    /// One turn of the network machinery the original runs beside its frame loop — the events, the
+    /// room's tick, the 128 Hz timer's callbacks — and the 32 Hz controller samples they call for
+    /// (0x4A46CC: `0x412E70`, `0x413800`). Answers whether a tick may run now: the **frame driver's
+    /// gate** (0x415455…0x415495), `ticks done <= min(0x6559F8, 2·F0 + 1) − 1`.
+    fn net_exchange_gate(&mut self) -> bool {
+        let paused = self.paused;
+        let samples = self.net.session.as_mut().map_or(0, |n| n.exchange_pump(paused));
+        for _ in 0..samples {
+            if let Some(s) = self.exchange_sample_bytes()
+                && let Some(n) = self.net.session.as_mut()
+            {
+                n.exchange_sample(s);
+            }
+        }
+        let next = self.tick + 1;
+        self.net.session.as_ref().is_some_and(|n| next < n.exchange_ticks_allowed())
+    }
+
+    /// The scripted run's blocking form of the gate: waits for a tick to be allowed, and gives up when
+    /// the link is lost, the ring overflowed or (**glue**) [`netplay::BARRIER_LIMIT`] has passed.
+    fn net_exchange_wait(&mut self) -> bool {
+        let end = Instant::now() + netplay::BARRIER_LIMIT;
+        loop {
+            if self.net_exchange_gate() {
+                return true;
+            }
+            // (the frames drawn while the game waits: `HInfo`'s tick, 0x427C70)
+            self.net_race_notice();
+            let Some(n) = self.net.session.as_ref() else { return true };
+            if !n.established() || n.exch.stopped || Instant::now() > end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_micros(500));
+        }
+    }
+
+    /// **The network race's part of the replay file** (`replay.md` §18.15): what the launch settled that
+    /// the single-car setup does not say — each other human's race index, name, car record and grid
+    /// place, the traffic cars' records, the camera list. `None` unless this is an input-exchange race
+    /// (the others' cars are not simulated in a positional one, so nothing could play them back).
+    fn replay_net_snapshot(&self) -> Option<nfs_game::replay::NetSetup> {
+        let n = self.net.session.as_ref().filter(|n| !n.positional && n.in_race != 0)?;
+        let local_index = n.local_race_index()?;
+        let names: Vec<String> = n.remote_players().into_iter().map(|p| p.1).collect();
+        let seats = (0..(self.num_opponents as usize).max(self.net_seat_cars.len()))
+            .map(|k| nfs_game::replay::NetSeat {
+                race_index: n.seat_race_index(k).unwrap_or(u32::MAX),
+                name: names.get(k).cloned().unwrap_or_default(),
+                grid: self.net_seat_grids.get(k).copied().flatten(),
+                words: self.net_seat_cars.get(k).map(|c| c.words.iter().map(|(i, w)| (*i, w.clone())).collect()).unwrap_or_default(),
+            })
+            .collect();
+        Some(nfs_game::replay::NetSetup {
+            local_index,
+            grid: self.player_grid_override,
+            seats,
+            traffic: self.net_traffic.iter().map(|t| nfs_game::replay::NetTraffic { model: t.model.clone(), name: t.name.clone(), colour: t.colour }).collect(),
+            camera0: (!self.camera_cycle.is_empty()).then(|| self.camera_cycle.iter().map(|&c| u32::from(c)).collect()),
+            own_words: self.net_own_words.clone(),
+            fe_txt: ["weather", "time", "fog"].into_iter().filter_map(|k| self.net_fe_txt.get(k).map(|v| (k.to_string(), *v))).collect(),
+        })
+    }
+
+    /// A replay file's network section put back where a launch would have put it (`net_race_apply`): the
+    /// seats' car records and grid places, the traffic, the camera list, and the run's lanes. Nothing when
+    /// the setup carries none — and then nothing of an earlier network race stays.
+    fn apply_replay_net(&mut self) {
+        self.replay_net = None;
+        self.net_seat_cars.clear();
+        self.net_own_words.clear();
+        self.net_fe_txt.clear();
+        self.net_seat_grids.clear();
+        self.net_traffic.clear();
+        self.player_grid_override = None;
+        let Some(net) = self.replay.setup.net.clone() else { return };
+        self.net_own_words = net.own_words.clone();
+        // the host's `TIME` / `WEATHER` / `FOG` the recorded race ran on (the snapshot's own words)
+        self.net_fe_txt = net.fe_txt.iter().filter_map(|(k, v)| Some((["weather", "time", "fog"].into_iter().find(|n| *n == k)?, *v))).collect();
+        self.net_seat_cars = net
+            .seats
+            .iter()
+            .map(|s| nfs_net::launchcar::CarSlot { words: s.words.iter().cloned().collect() })
+            .collect();
+        self.net_seat_grids = net.seats.iter().map(|s| s.grid).collect();
+        self.player_grid_override = net.grid;
+        self.num_opponents = net.seats.len() as u32;
+        self.net_traffic = net
+            .traffic
+            .iter()
+            .map(|t| nfs_net::options::TrafficCar { model: t.model.clone(), name: t.name.clone(), colour: t.colour })
+            .collect();
+        // the traffic cars' models and colours, as `net_race_apply` resolves the records
+        self.road.traffic_ids = None;
+        self.road.traffic_colours.clear();
+        if !self.net_traffic.is_empty() {
+            let catalog = self.fe_car_catalog();
+            let (mut ids, mut colours) = (Vec::new(), Vec::new());
+            for c in &self.net_traffic {
+                let Some(e) = catalog.iter().find(|e| e.model.eq_ignore_ascii_case(&c.model)) else { continue };
+                let own = e.paint_sets.first().map(|p| p.colours[0]).unwrap_or([0x8C, 0x8C, 0x90]);
+                let got = [(c.colour >> 16) as u8, (c.colour >> 8) as u8, c.colour as u8];
+                ids.push(e.id);
+                colours.push((got != own).then_some(got));
+            }
+            if !ids.is_empty() {
+                self.road.traffic_ids = Some(ids);
+                self.road.traffic_colours = colours;
+            }
+        }
+        self.road.traffic_count = self.net_traffic.len() as u32;
+        if let Some(list) = net.camera0.as_ref().filter(|l| !l.is_empty()) {
+            self.camera_cycle = list.iter().map(|&v| v as u16).collect();
+        }
+        self.replay_net = Some(ReplayNetRun {
+            local_index: net.local_index,
+            seats: net.seats.iter().map(|s| s.race_index).collect(),
+            names: net.seats.iter().map(|s| s.name.clone()).collect(),
+        });
+        // `[0x606858] = [0x65741C]` (0x413CF0): the camera starts on the recorded machine's own car
+        let mut humans: Vec<u32> = net.seats.iter().map(|s| s.race_index).filter(|i| *i != u32::MAX).chain(std::iter::once(net.local_index)).collect();
+        humans.sort_unstable();
+        self.replay_view = humans.iter().position(|i| *i == net.local_index).unwrap_or(0);
+        tracing::info!(local = net.local_index, seats = net.seats.len(), traffic = net.traffic.len(), "network replay: the race's humans and traffic from the file");
+    }
+
+    /// The human cars of an input-exchange race in registration order (race index), from the session —
+    /// empty outside one. [`ExchangeIn::humans`] is the same list at an even tick; the audio update
+    /// (odd ticks) has no latched samples, only the session.
+    fn exch_human_order(&self) -> Vec<HumanCar> {
+        let Some(n) = self.net.session.as_ref().filter(|n| n.exchanging()) else { return Vec::new() };
+        let Some(local_index) = n.local_race_index() else { return Vec::new() };
+        let mut order: Vec<(u32, HumanCar)> = vec![(local_index, HumanCar::Local)];
+        order.extend((0..self.road.opponents.len()).filter_map(|k| n.seat_race_index(k).map(|i| (i, HumanCar::Seat(k)))));
+        order.sort_by_key(|e| e.0);
+        let mut order: Vec<HumanCar> = order.into_iter().map(|e| e.1).collect();
+        for k in 0..self.road.opponents.len() {
+            if !order.contains(&HumanCar::Seat(k)) {
+                order.push(HumanCar::Seat(k));
+            }
+        }
+        order
+    }
+
+    /// **Test glue** (`NFS_NET_DUMP`): every human car of an input-exchange race after the tick, one line
+    /// each in race-index order — `tick,index,` then the position, velocity, orientation, spin, rpm and
+    /// steer as `f32` bit patterns, and the gear.
+    fn net_dump_tick(out: &mut std::io::BufWriter<std::fs::File>, local: Option<u32>, seat_index: &[Option<u32>], v: &Vehicle, opponents: &[RaceCar], tick: u64) {
+        use std::io::Write;
+        let mut cars: Vec<(u32, &Vehicle)> = Vec::new();
+        if let Some(i) = local {
+            cars.push((i, v));
+        }
+        for (k, o) in opponents.iter().enumerate() {
+            if let Some(i) = seat_index.get(k).copied().flatten() {
+                cars.push((i, &o.vehicle));
+            }
+        }
+        cars.sort_by_key(|c| c.0);
+        for (i, c) in cars {
+            let mut f: Vec<f32> = Vec::new();
+            f.extend(c.position.to_array());
+            f.extend(c.velocity.to_array());
+            f.extend(c.orientation.to_cols_array());
+            f.extend(c.angular_velocity.to_array());
+            f.push(c.rpm);
+            f.push(c.steer as f32);
+            let bits: Vec<String> = f.iter().map(|x| format!("{:08x}", x.to_bits())).collect();
+            let _ = writeln!(out, "{},{},{},{}", tick, i, bits.join(","), c.gear);
+        }
+    }
+
+    /// One 32 Hz sample of this machine's controller for the input exchange (0x412E70 →
+    /// 0x413800): the [`App::controller_sample`] bytes as the ring holds them — the steering **raw**
+    /// (the car negates it under `MIRROR` when it reads the packet, 0x4992D6, so the sample undoes
+    /// the mirroring [`App::controller_sample`] applied on the way in).
+    fn exchange_sample_bytes(&mut self) -> Option<nfs_net::exchange::Sample> {
+        let v = self.vehicle.as_ref()?;
+        let mut c = Self::controller_sample(&mut self.input, self.mirror, self.follow_road, self.slices.as_ref(), self.race.as_ref(), v, true);
+        if self.mirror {
+            c.steer = -c.steer;
+        }
+        let p = nfs_game::replay::Packet::from_controls(&c);
+        // bit 1 is the horn, the second held button (`car+0xD86`, `controls.md`)
+        let horn = u8::from(self.input.held(Action::Horn)) << 1;
+        Some([p.buttons | horn, p.steer as u8, p.throttle, p.brake])
+    }
+
+    /// **The cars' cheat flags** `(RALLY [0x6573F8], HEAVY [0x6573FC], DERBY [0x657400])`: in a network race
+    /// the host's, as its stream carried them (`net_flags`; 0x4B4B80 writes the three globals on every
+    /// machine and nothing else does), otherwise this machine's own cheat bits 0, 8 and 7.
+    fn launch_flags(&self) -> (bool, bool, bool) {
+        self.net_flags.unwrap_or((self.cheat_bits & 1 != 0, self.cheat_bits & (1 << 8) != 0, self.cheat_bits & (1 << 7) != 0))
+    }
+
     fn simulate(&mut self) {
         self.tick += 1;
+        let (rally_on, heavy_on, derby_on) = self.launch_flags();
         // diagnostic: `NFS_HUD_KEYS` — a scripted HUD toggle press on its tick
         while let Some(&(t, a)) = self.hud_key_script.first()
             && t <= self.tick
@@ -9314,6 +10460,12 @@ impl App {
             self.hud_key_script.remove(0);
             if self.vehicle.is_some() && !self.paused {
                 match a {
+                    // a network race (`[0x6573E8] == 3`): 0x415110's rules — the notice, the second press leaves
+                    ScriptedHudKey::Pause if self.fe.race_game_type == Some(3) => {
+                        if self.net_pause_press() {
+                            self.scripted_net_leave = true;
+                        }
+                    }
                     ScriptedHudKey::Pause | ScriptedHudKey::PauseRestart => {
                         // the pause key's own arm (the keyboard handler's), with no dialog up
                         if self.results.is_none() {
@@ -9349,7 +10501,7 @@ impl App {
         }
         if self.results.is_some()
             && let Some(page) = self.result_pages().get(self.results_page as usize).copied()
-            && let (Some(limit), Some(t0)) = (Self::page_timeout(page), self.page_open_tick)
+            && let (Some(limit), Some(t0)) = (Self::page_timeout(page, self.fe.race_game_type == Some(3)), self.page_open_tick)
             && self.page_seen == Some(self.results_page)
             && self.tick.saturating_sub(t0) > limit
         {
@@ -9420,6 +10572,25 @@ impl App {
             })
             .collect();
         let net_seats = self.net_step();
+        // the input exchange's samples for this tick (`net_step` latched them at an even tick)
+        let exchange_in = self.exchange_in.take();
+        // **Input exchange: registration order** (`network.md` §11.18). The port keeps the local car
+        // first and the seats after it; the original's arrays (`0x5E8B34[]`, `0x5E8E2C[]`, `0x5E8B88[]`
+        // …) are in the order the cars were created, by race index, the same on every machine. Empty
+        // outside an exchange race, where `reg_of` is the identity.
+        let exch_order: Vec<HumanCar> = exchange_in.as_ref().map(|x| x.humans(self.road.opponents.len())).unwrap_or_default();
+        let n_seat_cars = self.road.opponents.len();
+        // the same list from the session, for the odd tick's audio update (no latched samples then)
+        let exch_humans_now: Vec<HumanCar> = self.exch_human_order();
+        // the registration index of a car by the port's storage index (0 = the local car, `1 + k` = seat
+        // `k`, the rest — cops, traffic — after the racers, unchanged)
+        let reg_of = |s: usize| -> usize {
+            if exch_order.is_empty() || s > n_seat_cars {
+                return s;
+            }
+            let want = if s == 0 { HumanCar::Local } else { HumanCar::Seat(s - 1) };
+            exch_order.iter().position(|h| *h == want).unwrap_or(s)
+        };
         let view = self.camera_view();
         // whether the camera key steps the replay's own nine ids (`replay.md` §8) — taken before
         // the car is borrowed
@@ -9458,50 +10629,102 @@ impl App {
             v.velocity = to * 12.0;
             tracing::info!(k, ?pos, "NFS_CONE_DRIVE: the car set at the cone");
         }
+        // **Test glue** (`NFS_NET_RAM=<race index>@<tick>[,…]`, set on every machine, an even tick): in an
+        // input-exchange race that human car is set down 6 m behind the traffic car nearest to it, on that
+        // car's heading, closing at 15 m/s over its speed — a contact with the traffic car the two-instance
+        // runs would not otherwise reach (`network.md` §11.20). Every machine does it to the same car on
+        // the same tick from the same (shared) traffic state, so the runs' dumps stay comparable.
+        if self.tick % 2 == 0
+            && let Some(x) = exchange_in.as_ref()
+            && let Ok(list) = std::env::var("NFS_NET_RAM")
+            && let Some(t) = self.road.traffic.as_ref()
+        {
+            for (idx, at) in list.split(',').filter_map(|e| e.split_once('@').and_then(|(i, t)| Some((i.trim().parse::<u32>().ok()?, t.trim().parse::<u64>().ok()?)))) {
+                if at != self.tick {
+                    continue;
+                }
+                let (from, seat) = if idx == x.local_index {
+                    (v.position, None)
+                } else if let Some(e) = x.seats.iter().find(|e| e.1 == idx) {
+                    (self.road.opponents.get(e.0).map_or(v.position, |o| o.vehicle.position), Some(e.0))
+                } else {
+                    continue;
+                };
+                let Some(c) = t.cars.iter().filter(|c| c.active).min_by(|a, b| a.position.distance(from).total_cmp(&b.position.distance(from))) else { continue };
+                let dir = Vec3::new(c.velocity.x, 0.0, c.velocity.z).try_normalize().unwrap_or_else(|| Vec3::new(c.orientation.z_axis.x, 0.0, c.orientation.z_axis.z).normalize_or(Vec3::Z));
+                let at_pos = c.position - dir * 6.0 + Vec3::Y * 0.5;
+                let speed = c.velocity.length() + 15.0;
+                match seat {
+                    None => {
+                        v.place_at_trigger(&w.collision, &self.specs, at_pos, dir);
+                        v.velocity = dir * speed;
+                    }
+                    Some(k) => {
+                        if let Some(o) = self.road.opponents.get_mut(k) {
+                            o.vehicle.place_at_trigger(&w.collision, &o.specs, at_pos, dir);
+                            o.vehicle.velocity = dir * speed;
+                        }
+                    }
+                }
+                tracing::info!(target: "netplay", race_index = idx, tick = self.tick, traffic_at = ?c.position, "NFS_NET_RAM: the human car set behind the traffic car");
+            }
+        }
+        // **Test glue** (`NFS_NET_RAM_PROP=<race index>@<tick>:<k>[,…]`, every machine, an even tick): the same
+        // for the track's k-th smackable — that human car set down 6 m short of it, heading at it at 12 m/s
+        // (`NFS_SMACK_DRIVE`'s placement, for any car of an exchange race), so that two cars can reach one
+        // prop on one tick and the smackables' walk order (0x4A17F0, race-index order) shows
+        if self.tick % 2 == 0
+            && let Some(x) = exchange_in.as_ref()
+            && let Ok(list) = std::env::var("NFS_NET_RAM_PROP")
+        {
+            for (idx, at, k) in list.split(',').filter_map(|e| {
+                let (i, rest) = e.split_once('@')?;
+                let (t, k) = rest.split_once(':')?;
+                Some((i.trim().parse::<u32>().ok()?, t.trim().parse::<u64>().ok()?, k.trim().parse::<usize>().ok()?))
+            }) {
+                let Some((article, pos, _)) = w.track_smackable(k) else { continue };
+                if at != self.tick {
+                    continue;
+                }
+                let seat = if idx == x.local_index { None } else if let Some(e) = x.seats.iter().find(|e| e.1 == idx) { Some(e.0) } else { continue };
+                let from = seat.and_then(|k| self.road.opponents.get(k)).map_or(v.position, |o| o.vehicle.position);
+                let to = Vec3::new(pos.x - from.x, 0.0, pos.z - from.z).normalize_or(Vec3::Z);
+                match seat {
+                    None => {
+                        v.place_at_trigger(&w.collision, &self.specs, pos - to * 6.0 + Vec3::Y * 0.5, to);
+                        v.velocity = to * 12.0;
+                    }
+                    Some(k) => {
+                        if let Some(o) = self.road.opponents.get_mut(k) {
+                            o.vehicle.place_at_trigger(&w.collision, &o.specs, pos - to * 6.0 + Vec3::Y * 0.5, to);
+                            o.vehicle.velocity = to * 12.0;
+                        }
+                    }
+                }
+                tracing::info!(target: "netplay", race_index = idx, tick = self.tick, article, ?pos, "NFS_NET_RAM_PROP: the human car set at the smackable");
+            }
+        }
         if self.tick % 2 == 0 {
             // the non-player cars' collision events of this tick, in the order they happen, for
             // their sound queues (`car+0x1110`, 0x40F740) — committed after the collision pass
             let mut ai_hits: Vec<(AudioCar, nfs_audio::sfx::QueuedSfx)> = Vec::new();
             // 32 Hz: latch controller, run the force step (Sc32)
-            // right = +x in the body frame; rounded, so a pad's packet byte (a multiple of 2/126)
-            // comes back whole
-            let mut steer = (self.input.steer() * 126.0).round() as i32;
-            if self.mirror {
-                steer = -steer;
-            }
-            if self.follow_road
-                && let (Some(t), Some(r)) = (&self.slices, &self.race)
-            {
-                // pure pursuit on the slice ahead (autotest only; not the original AI)
-                let ahead = t.add(r.slice, 4);
-                let target = t.slices[ahead].centre;
-                let to = v.orientation * (target - v.position); // body-frame vector (rows = axes)
-                let angle = to.x.atan2(to.z.max(0.1));
-                steer = ((angle / 0.4).clamp(-1.0, 1.0) * 126.0) as i32;
-                // crude speed limit for the scripted drive: ease off above 110 km/h or in sharp bends
-                let limit = if angle.abs() > 0.15 { 60.0 } else { 110.0 };
-                if v.speed() * 3.6 > limit {
-                    self.input.release(Action::Throttle);
-                    self.input.press(Action::Brake);
-                } else {
-                    self.input.release(Action::Brake);
-                }
-            }
-            let mut throttle = self.input.throttle();
-            if self.follow_road {
-                // autotest: ease off above 130 km/h and when steering hard
-                if v.speed() > 36.0 || steer.abs() > 80 {
-                    throttle = throttle.min(0.35);
-                }
-            }
             // before the start tick the original forces full brake and no throttle (0x49DD20)
             v.race_started = self.tick >= RACE_START_TICK;
             v.game_tick = self.tick;
-            v.rally = self.cheat_bits & 1 != 0;
+            v.rally = rally_on;
             v.tiny = self.cheat_bits & (1 << 1) != 0;
             // `DERBY` `[0x657400]`, which only the Smash Up code sets (cheat bit 7): `Damage` takes ×1.5, not ×0.5 (0x49452F)
-            v.derby = self.cheat_bits & (1 << 7) != 0;
-            v.race_state = if self.race.as_ref().is_some_and(|r| r.finished) { 2 } else { 0 };
+            // (a network race's `DERBY` is the launch's, the same on every machine: a joiner has no cheat of its own)
+            v.derby = derby_on;
+            v.race_state = if exchange_in.is_some() && self.player_eliminated {
+                // `car+0xB50 = 3` (0x416310, `retired`), which every machine's copy of this car carries
+                3
+            } else if self.race.as_ref().is_some_and(|r| r.finished) {
+                2
+            } else {
+                0
+            };
             // countdown speech (Phrase_kCountdown: SOR-a-3/2/1/Go at ticks 256/320/384/448)
             let phase = COUNTDOWN_TICKS
                 .iter()
@@ -9518,35 +10741,39 @@ impl App {
                         [(phase - 1) as usize],
                 );
             }
-            // The shape the original's controller packet has (`replay.md` §2): every axis is at
-            // most 0x7E and the car doubles it (0x4992CF), so the values the physics sees are even
-            // and never exceed 252 / ±126.
-            let controls = Controls {
-                throttle: ((throttle * 126.0) as u8).min(0x7E) * 2,
-                brake: ((self.input.brake() * 126.0) as u8).min(0x7E) * 2,
-                steer: (steer / 2).clamp(-63, 63) * 2,
-                handbrake: self.input.held(Action::Handbrake),
-                // the packer's plain group fires a command on its press (0x41312F…0x4131E9): code 2
-                // `C1_SHIFTUP`, 3 `C1_SHIFTDOWN`, 4 `C1_ABORT`, 6 `C1_AIDRIVE`, 10 / 11 the turn
-                // signals, 12 `C1_SIREN` (the hazards), 13 `C1_LIGHTSON`; it walks them in code
-                // order and each one pressed overwrites the code (0x413178), so the highest wins.
-                // Code 5 `C1_RESET` is still taken straight from the input (the reset below).
-                command: [
-                    (Action::ShiftUp, 2u8),
-                    (Action::ShiftDown, 3),
-                    (Action::Abort, 4),
-                    (Action::AiDrive, 6),
-                    (Action::SignalLeft, 10),
-                    (Action::SignalRight, 11),
-                    (Action::Hazards, 12),
-                    (Action::Lights, 13),
-                ]
-                .into_iter()
-                .fold(0, |code, (a, c)| if self.input.take_pressed(a) { c } else { code }),
+            // The controller as the car reads it: this machine's own sample (0x412E70's packer, the
+            // helper below) — or, in an input-exchange race, what the frame driver latched for this car
+            // from the room's frame (0x415EF0 → 0x413870 → 0x4992CF), which is the same sample sixteen
+            // times a second, averaged in pairs and quantised, `network.md` §11.17
+            let controls = match exchange_in.as_ref() {
+                Some(x) => x.local,
+                None => Self::controller_sample(&mut self.input, self.mirror, self.follow_road, self.slices.as_ref(), self.race.as_ref(), v, false),
             };
             // replay.md §4: the hook sits inside the 32 Hz input step, before the car reads the
             // packet, so recording and playback are in phase with the simulation by construction
             let controls = match self.replay.stream.as_mut() {
+                // **An input-exchange race records every human car** (`0x4143F0` per car, `car+0x524` =
+                // the race index): the raw sample each car reads, into its own lane, in race-index
+                // order — the local car is one of them, not lane 0 (`replay.md` §18.15). A network
+                // replay's samples came from the lanes already (`net_step`), nothing to hook.
+                Some(r) if exchange_in.is_some() => {
+                    if let Some(x) = exchange_in.as_ref()
+                        && matches!(r.mode, nfs_game::replay::Mode::Recording | nfs_game::replay::Mode::Full)
+                    {
+                        let (steer, gas, brake) = self.input.ramps();
+                        for h in &exch_order {
+                            let (idx, raw, ramp) = match *h {
+                                HumanCar::Local => (x.local_index, x.local_raw, nfs_game::replay::Ramp { steer, gas, brake }),
+                                HumanCar::Seat(k) => match x.seats.iter().position(|e| e.0 == k) {
+                                    Some(j) => (x.seats[j].1, x.seat_raw[j], nfs_game::replay::Ramp::default()),
+                                    None => continue,
+                                },
+                            };
+                            r.record_player(idx as usize, nfs_game::replay::Packet { buttons: raw[0], steer: raw[1] as i8, throttle: raw[2], brake: raw[3] }, ramp, self.tick);
+                        }
+                    }
+                    controls
+                }
                 // `.RAMPS` / `.RAMPG` / `.RAMPB` are `kind != 1` of the `C1_RIGHT`, `C1_GAS` and
                 // `C1_BRAKE` bindings (0x51CF54…0x51CFFC) — set for keys, clear for an axis
                 Some(r) => r.step(
@@ -9562,6 +10789,26 @@ impl App {
             // `Car_applyInput` switches on the packet's code for the lamps (0x49933E, jump table
             // 0x499480) — the recorded code too, so a replay blinks as the race did
             self.lamp_bits = lamp_command(self.lamp_bits, controls.command);
+            // **The other human cars' lamp bytes.** An input-exchange seat runs `Car_applyInput` on its own
+            // latched sample, so its own command switches its lamps; a remote car of a positional race
+            // takes the switch too, but 0x4991E0's remote arm leaves `car+0xD8B` at `[0x5E9664] >> 3`
+            // (0x499336, the **local** pad's command) — so the local player's lamp keys switch the remote
+            // cars' lamps as well (not carried: the same command's shift and reset codes on those cars)
+            if let Some(x) = exchange_in.as_ref() {
+                for &(oi, _, c) in &x.seats {
+                    if let Some(o) = self.road.opponents.get_mut(oi) {
+                        o.lamp_bits = lamp_command(o.lamp_bits, c.command);
+                    }
+                }
+            } else if let Some(n) = self.net.session.as_ref() {
+                for &oi in &net_seats {
+                    if n.remote_controls(oi).is_some()
+                        && let Some(o) = self.road.opponents.get_mut(oi)
+                    {
+                        o.lamp_bits = lamp_command(o.lamp_bits, controls.command);
+                    }
+                }
+            }
             // `Car_wallCollide` 0x495020's corner skip: the drivable patch that contains the
             // corner in plan and its height, which the collider compares with the car's own y
             // (§6.1). It used to be a downward ray with a 6 m window, which is not the rule.
@@ -9591,6 +10838,8 @@ impl App {
             //
             // AI pass: opponents (parked controller until the AI rules land)
             let mut ko_laps: Vec<(usize, u32)> = Vec::new();
+            // the remote cars of a positional race whose `Car_simulate` runs this tick on the wire's controls
+            let mut remote_steps: Vec<(usize, u32, Controls)> = Vec::new();
             if let Some(t) = &self.slices {
                 // race order for the avoidance rule: `0x5E8B88`, sorted ascending by
                 // `car+0xAF8 − car+0xB20` (0x417710) — the progress **into the lap**, laps timed
@@ -9647,7 +10896,7 @@ impl App {
                             .map(|(j, c)| (1 + n_opp + n_cops + j, None, (c.position, c.slice, c.speed * c.dir, c.half_extents.x, false))),
                     );
                 }
-                order.sort_by_key(|e| self.race_order.place(e.0));
+                order.sort_by_key(|e| self.race_order.place(reg_of(e.0)));
                 // catch-up band (`ai.md` §5.2 rule 1): the human's progress and average pace
                 let (player_progress, player_pace) = match &self.race {
                     Some(r) => (
@@ -9683,21 +10932,39 @@ impl App {
                         0
                     };
                     o.vehicle.game_tick = self.tick;
-                    o.vehicle.rally = self.cheat_bits & 1 != 0;
-                    o.vehicle.tiny = self.cheat_bits & (1 << 1) != 0;
+                    o.vehicle.rally = rally_on;
+                    o.vehicle.tiny = o.tiny;
                     // `DERBY` `[0x657400]`, which only the Smash Up code sets (cheat bit 7): `Damage` takes ×1.5, not ×0.5 (0x49452F)
-                    o.vehicle.derby = self.cheat_bits & (1 << 7) != 0;
+                    o.vehicle.derby = derby_on;
                     if net_seats.contains(&oi) {
-                        // a remote player: the pose is already set, so only the lap tracker runs
-                        o.progress.update_tracked(
-                            t,
-                            o.vehicle.position,
-                            o.vehicle.forward(),
-                            self.tick,
-                            self.num_laps,
-                            None,
-                        );
-                        continue;
+                        // an input-exchange seat is a human car: it steps beside the player's own
+                        // (below) and its tracker runs with the player's, after the tick's physics
+                        if exchange_in.is_some() {
+                            continue;
+                        }
+                        // **A remote car of a positional race** (`car+0xDAC`). 0x4991E0's controller copy
+                        // reads its block instead of the local pads (0x499285…0x4992CD): the steering
+                        // `car+0xD90 = +0x38`, the brake `car+0xD7D = +0x3A`, `car+0xD85` / `+0xD86` the
+                        // bits of `+0x3B`, and `car+0xDA8 = 0` — a human car; the tick's 64 Hz apply
+                        // (`NetPlay::apply`) puts it back on the packet's track. While the car is stale
+                        // (`car+0x70`) the apply sets `car+0xDA8 = 1` and the AI arm of the same copy
+                        // (0x40B650 / 0x40BFE0) drives it, which is the ordinary opponent code below.
+                        if let Some(c) = self.net.session.as_ref().and_then(|n| n.remote_controls(oi)) {
+                            o.vehicle.ai_driven = false;
+                            o.vehicle.traction_control = false;
+                            remote_steps.push((oi, 0, c));
+                            o.progress.update_tracked(
+                                t,
+                                o.vehicle.position,
+                                o.vehicle.forward(),
+                                self.tick,
+                                self.num_laps,
+                                None,
+                            );
+                            continue;
+                        }
+                        o.vehicle.ai_driven = true;
+                        o.vehicle.traction_control = true;
                     }
                     if let Controller::Ai(d) = &mut o.controller {
                         d.set_catchup(self.race_skill, player_progress, player_pace);
@@ -9805,7 +11072,7 @@ impl App {
                         c.place = self.race_order.place(1 + n_opp + i);
                     }
                     pol.other_places = (0..=n_opp)
-                        .map(|k| self.race_order.place(k))
+                        .map(|k| self.race_order.place(reg_of(k)))
                         .chain(
                             self.road
                                 .traffic
@@ -9947,7 +11214,7 @@ impl App {
                     v.forward().dot(t.slices[slice].forward).signum()
                 };
                 let laps = self.race.as_ref().map(|r| r.laps).unwrap_or(0);
-                let reference = Reference {
+                let mut reference = Reference {
                     position: v.position,
                     slice,
                     laps,
@@ -9957,6 +11224,61 @@ impl App {
                     // (`physics.md` §8) — the same button the horn sound reads
                     honking: self.input.held(Action::Horn),
                 };
+                // **Input exchange** (`network.md` §11.18): every list the traffic reads is built from
+                // the human cars in registration order (race index — the same on every machine), each
+                // human's numbers taken the same way whichever machine's car it is; the local car first
+                // and the seats after it is a per-machine order. Empty outside an exchange race, where
+                // the single-player lists below stand unchanged.
+                let hum: Vec<ExchHuman> = match exchange_in.as_ref() {
+                    Some(x) => exch_order
+                        .iter()
+                        .copied()
+                        .map(|h| match h {
+                            HumanCar::Local => {
+                                let r = self.race.as_ref();
+                                let s = r.map_or(slice, |r| r.slice);
+                                let vl = v.v_long();
+                                ExchHuman {
+                                    car: h,
+                                    position: v.position,
+                                    slice: s,
+                                    laps: r.map_or(0, |r| r.laps),
+                                    progress: r.map_or(0.0, |r| r.progress),
+                                    vl,
+                                    dir: exch_dir(t, vl, v.forward(), s),
+                                    speed: v.speed(),
+                                    hw: v.half_extents.x,
+                                    hl: v.half_extents.z,
+                                    horn: x.horn(h),
+                                }
+                            }
+                            HumanCar::Seat(k) => {
+                                let o = &self.road.opponents[k];
+                                let s = o.progress.slice;
+                                let vl = o.vehicle.v_long();
+                                ExchHuman {
+                                    car: h,
+                                    position: o.vehicle.position,
+                                    slice: s,
+                                    laps: o.progress.laps,
+                                    progress: o.progress.progress,
+                                    vl,
+                                    dir: exch_dir(t, vl, o.vehicle.forward(), s),
+                                    speed: o.vehicle.speed(),
+                                    hw: o.vehicle.half_extents.x,
+                                    hl: o.vehicle.half_extents.z,
+                                    horn: x.horn(h),
+                                }
+                            }
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
+                if let Some(h0) = hum.first() {
+                    // `0x5E8B34[0]`, the first human registered: what the spawn gate's tunnel window,
+                    // the early-race boost and the purgatory constructor read (`traffic.md` §34.5)
+                    reference = Reference { position: h0.position, slice: h0.slice, laps: h0.laps, speed: h0.vl, dir: h0.dir, honking: h0.horn };
+                }
                 // the cars the lane scorers must see besides the traffic set itself
                 let lane_car = |pos_slice: usize,
                                 lateral_of: f32,
@@ -10006,6 +11328,10 @@ impl App {
                         false,
                     )
                 }));
+                if !hum.is_empty() {
+                    // every human in registration order, each a human (`car+0x52C & 4`) of the lane pass
+                    others = hum.iter().map(|h| lane_car(h.slice, lateral_on(h.position, h.slice), h.hw, h.hl, h.vl, h.speed, true)).collect();
+                }
                 // …and the cops. The lane scorers walk every car in the world: `0x401F20` (the
                 // blockers) `0x5E8B88[0 … [0x5E8B58])` from 0x401FD3, `0x4026B0` `0x5E8B34[]` from
                 // 0x4026E4 — the lists `Car_register` 0x40F189 fills with every car that is not a
@@ -10031,14 +11357,20 @@ impl App {
                     .chain(self.road.opponents.iter().map(|o| o.vehicle.position))
                     .chain(self.road.police.iter().flat_map(|p| p.cars.iter().filter(|c| c.active).map(|c| c.position)))
                     .collect();
+                tr.human_views = hum.iter().map(|h| nfs_game::traffic::HumanView { laps: h.laps, honking: h.horn }).collect();
+                if !hum.is_empty() {
+                    tr.other_positions = hum.iter().map(|h| h.position).collect();
+                }
                 debug_assert_eq!(tr.other_positions.len(), others.len());
                 // `car+0x528` of each of `others` and of every traffic car — the previous even tick's
                 // `0x5E8B88[]` places, which 0x401FA2's walk starts from (`nfs_game::race_order`)
                 {
                     let n_opp = self.road.opponents.len();
                     let n_cops = self.road.police.as_ref().map_or(0, |p| p.cars.len());
+                    // (in an exchange race `race_order` is indexed by registration index, `reg_of`,
+                    // and `others` is the humans in that order: place `r` is the `r`-th human's)
                     tr.other_places = (0..=n_opp)
-                        .map(|k| self.race_order.place(k))
+                        .map(|k| self.race_order.place(reg_of(k)))
                         .chain(
                             self.road
                                 .police
@@ -10047,6 +11379,9 @@ impl App {
                                 .map(|k| self.race_order.place(k)),
                         )
                         .collect();
+                    if !hum.is_empty() {
+                        tr.other_places = (0..hum.len()).map(|r| self.race_order.place(r)).collect();
+                    }
                     debug_assert_eq!(tr.other_places.len(), others.len());
                     for (j, c) in tr.cars.iter_mut().enumerate() {
                         c.place = self.race_order.place(1 + n_opp + n_cops + j);
@@ -10076,9 +11411,9 @@ impl App {
                     slice,
                     speed: vl,
                     dir,
-                    place: self.race_order.place(0),
+                    place: self.race_order.place(reg_of(0)),
                 })
-                .chain(self.road.opponents.iter().enumerate().filter(|_| self.road.police.is_some()).map(|(k, o)| {
+                .chain(self.road.opponents.iter().enumerate().filter(|_| self.road.police.is_some() && hum.is_empty()).map(|(k, o)| {
                     let s = o.progress.slice;
                     let ovl = o.vehicle.velocity.dot(t.slices[s].forward.normalize_or_zero());
                     nfs_game::traffic::ChaseTarget {
@@ -10090,17 +11425,41 @@ impl App {
                     }
                 }))
                 .collect();
+                if !hum.is_empty() {
+                    // every human is appended to `0x5E8B10[]` unconditionally (0x40F299), in
+                    // registration order
+                    tr.chase_targets = hum
+                        .iter()
+                        .enumerate()
+                        .map(|(r, h)| nfs_game::traffic::ChaseTarget { position: h.position, slice: h.slice, speed: h.vl, dir: h.dir, place: self.race_order.place(r) })
+                        .collect();
+                }
                 tr.ai_on(t, self.tick, reference, &others, self.world.as_ref().map(|w| &w.collision));
                 traffic_reference = Some(reference);
                 // Sc32 priority 6, the trackers 0x49AF70 → 0x417190: each traffic car's `car+0x78`,
                 // its distance to the nearest racer (the human, then the opponents, `0x5E8E2C[]`),
                 // which the next AI pass's gate reads
-                let racers: Vec<Vec3> = std::iter::once(v.position).chain(self.road.opponents.iter().map(|o| o.vehicle.position)).collect();
+                let racers: Vec<Vec3> = if hum.is_empty() {
+                    std::iter::once(v.position).chain(self.road.opponents.iter().map(|o| o.vehicle.position)).collect()
+                } else {
+                    hum.iter().map(|h| h.position).collect()
+                };
                 tr.track_racers(&racers);
             }
             // Sc32, priority 0x1E, slot 0: the player's `Car_simulate` 0x49FD30 and `Car_ground`
             // 0x49BD40, after the whole AI pass; its walls and props run in the collision pass
             // below (0x495020 / 0x498DE0, priority 0x28), as of 2026-09-26.
+            // **Input exchange: the human cars step in race-index order** (Sc32 priority 0x1E, the slot
+            // order of `Cars_create`), whichever of them is this machine's — so a car sees the ones
+            // before it where they have just moved to and the ones after it where the tick began
+            // (`DraftFactor` reads them live, the misfire draw is the shared stream's next), and
+            // every machine gets the same numbers. The seats with a lower index first…
+            let autobahn = self.track.name.eq_ignore_ascii_case("autobahn");
+            if let Some(x) = exchange_in.as_ref() {
+                let mut lower: Vec<(usize, u32, Controls)> = x.seats.iter().filter(|e| e.1 < x.local_index).copied().collect();
+                lower.sort_by_key(|e| e.1);
+                Self::exchange_seats_step(&mut self.road.opponents, &lower, v.position, self.tick, (rally_on, derby_on), &|p| autobahn && w.overhead_flags(p) == 0, &w.collision);
+            }
             // `DraftFactor` 0x49D9B0: the racer array only — traffic and police do not draft
             let racers: Vec<Vec3> = self.road.opponents.iter().map(|o| o.vehicle.position).collect();
             v.draft =
@@ -10110,6 +11469,18 @@ impl App {
             // `LoadTransfer`'s wet test, 0x4A191D…0x4A194D: `[0x606AE0]` and nothing overhead
             v.wet_track = self.track.name.eq_ignore_ascii_case("autobahn") && w.overhead_flags(v.position) == 0;
             v.step32(&controls, &self.specs, &w.collision);
+            // the remote cars' `Car_simulate` (a positional race), in seat order after the player's — the
+            // original's order is the slot list's (`Cars_create`) — APPROXIMATION: the draft and the
+            // misfire draw see the cars in this order, not the slots'
+            if !remote_steps.is_empty() {
+                Self::exchange_seats_step(&mut self.road.opponents, &remote_steps, v.position, self.tick, (rally_on, derby_on), &|p| autobahn && w.overhead_flags(p) == 0, &w.collision);
+            }
+            // …and the seats after it
+            if let Some(x) = exchange_in.as_ref() {
+                let mut higher: Vec<(usize, u32, Controls)> = x.seats.iter().filter(|e| e.1 > x.local_index).copied().collect();
+                higher.sort_by_key(|e| e.1);
+                Self::exchange_seats_step(&mut self.road.opponents, &higher, v.position, self.tick, (rally_on, derby_on), &|p| autobahn && w.overhead_flags(p) == 0, &w.collision);
+            }
             if let Some(rec) = self.record.as_mut() {
                 use std::io::Write;
                 let _ = writeln!(
@@ -10294,69 +11665,174 @@ impl App {
             // *(Until 2026-09-26 the port collided the human's and the opponents' walls in their own
             // steps, ran the opponent pairs after the cops' and the traffic's, gave the traffic no
             // walls and no pairs among themselves — the "APPROXIMATION of the pass itself".)*
-            let no_carcol = std::env::var_os("NFS_NO_CARCOL").is_some();
+            // **`if ([0x657408] == 0 || [0x65740C] == 0)` (0x498FF0)** guards the pair loop and the
+            // car's entry into the list `0x628CDC[]`: with `COMMSPOSITIONAL && NOCOLLISION` no car
+            // meets another (each car's walls 0x495020 and props 0x498DE0 run before the gate);
+            // `NFS_NO_CARCOL` is the port's own diagnostic switch for the same skip
+            let no_carcol = self.net_nocollision || std::env::var_os("NFS_NO_CARCOL").is_some();
             // `car+0x354`, the collision mass: `HEAVY` `[0x6573FC]` (the fetherw8 code, cheat bit 8)
             // multiplies a human car's by 12 (0x49B5FB…0x49B613, `[0x5B240C]`)
             // …and otherwise `.TINYCAR` divides any car's by 12 (0x49B615…0x49B62F, `[0x5B49B0]`) —
             // every car but traffic carries it under the Gulliver code
             let tiny_k = if self.cheat_bits & (1 << 1) != 0 { 1.0 / 12.0 } else { 1.0 };
-            let player_mass = self.specs.mass * if self.cheat_bits & (1 << 8) != 0 { 12.0 } else { tiny_k };
+            let player_mass = self.specs.mass * if heavy_on { 12.0 } else { tiny_k };
+            // every opponent's collision-mass factor (0x49B5FB…0x49B62F): a human car — a network seat —
+            // takes `HEAVY`'s ×12 when the launch has it, else the car's own `.TINYCAR` /12
+            // (`RaceCar::tiny`: this machine's bit for an AI opponent, the record's for a seat)
+            let opp_k: Vec<f32> = self
+                .road
+                .opponents
+                .iter()
+                .enumerate()
+                .map(|(oi, o)| if heavy_on && net_seats.contains(&oi) { 12.0 } else if o.tiny { 1.0 / 12.0 } else { 1.0 })
+                .collect();
             // 0x4980D0's rounds collide each car's walls again between them (0x495020)
             let tick = self.tick as u32;
             let mut racer_walls = |c: &mut nfs_physics::vehicle::Vehicle| {
                 c.collide_walls(&w.walls, &w.tree, &patch_height, 0.0, 0.0, 0.0);
                 c.collide_props(&w.props, tick);
             };
-            // the human's pass: its walls and props (no earlier car to pair with)
-            v.impact = 0.0;
-            if v.collide_walls(&w.walls, &w.tree, &patch_height, 0.0, 0.0, 0.0) {
-                ground_event = None;
-                player_spark = Some(v.last_wall_effect);
-                self.wall_hits += 1;
-                self.snd.player_loops.push_impact(wall_sfx(v));
+            // **Input exchange: the cars in race-index order.** Every machine runs the same pass over the
+            // same cars — each car's walls and props, then its pairs with the cars already done, the
+            // earlier of a pair being A — whichever of them is this machine's own (`v`), so the two
+            // sides of a contact are the same numbers everywhere (`network.md` §11.17). The seats a
+            // player's launch left without a race index (parked) follow the humans.
+            if let Some(x) = exchange_in.as_ref() {
+                #[derive(Clone, Copy, PartialEq)]
+                enum H {
+                    Local,
+                    Seat(usize),
+                }
+                let mut order: Vec<(u32, H)> = vec![(x.local_index, H::Local)];
+                order.extend(x.seats.iter().map(|e| (e.1, H::Seat(e.0))));
+                order.sort_by_key(|e| e.0);
+                let mut order: Vec<H> = order.into_iter().map(|e| e.1).collect();
+                for oi in 0..self.road.opponents.len() {
+                    if !order.contains(&H::Seat(oi)) {
+                        order.push(H::Seat(oi));
+                    }
+                }
+                let mut done: Vec<H> = Vec::new();
+                for who in order.iter().copied() {
+                    // this car's own walls and props (0x495020 / 0x498DE0)
+                    match who {
+                        H::Local => {
+                            v.impact = 0.0;
+                            if v.collide_walls(&w.walls, &w.tree, &patch_height, 0.0, 0.0, 0.0) {
+                                ground_event = None;
+                                player_spark = Some(v.last_wall_effect);
+                                self.wall_hits += 1;
+                                self.snd.player_loops.push_impact(wall_sfx(v));
+                                v.impact = 0.0;
+                            }
+                            let prop_hit = v.collide_props(&w.props, self.tick as u32);
+                            if prop_hit.is_some() {
+                                ground_event = None;
+                                player_spark = None;
+                            }
+                            if let Some((impact, event)) = prop_hit {
+                                self.snd.player_loops.push_impact(prop_sfx(impact, event));
+                            }
+                        }
+                        H::Seat(oi) => {
+                            let o = &mut self.road.opponents[oi];
+                            o.vehicle.impact = 0.0;
+                            if o.vehicle.collide_walls(&w.walls, &w.tree, &patch_height, 0.0, 0.0, 0.0) {
+                                o.wall_hits += 1;
+                                ai_hits.push((AudioCar::Opponent(oi), wall_sfx(&o.vehicle)));
+                            }
+                            if let Some((impact, event)) = o.vehicle.collide_props(&w.props, tick) {
+                                ai_hits.push((AudioCar::Opponent(oi), prop_sfx(impact, event)));
+                            }
+                        }
+                    }
+                    if !no_carcol {
+                        for d in done.iter().copied() {
+                            // A = the car done earlier (`d`), B = this one (`who`)
+                            let mass_of = |h: H, opp: &[RaceCar]| match h {
+                                H::Local => player_mass,
+                                H::Seat(k) => opp[k].specs.mass * opp_k[k],
+                            };
+                            let (ma, mb) = (mass_of(d, &self.road.opponents), mass_of(who, &self.road.opponents));
+                            let hit = match (d, who) {
+                                (H::Local, H::Seat(b)) => nfs_physics::vehicle::collide_pair(v, ma, &mut self.road.opponents[b].vehicle, mb, &mut racer_walls),
+                                (H::Seat(a), H::Local) => nfs_physics::vehicle::collide_pair(&mut self.road.opponents[a].vehicle, ma, v, mb, &mut racer_walls),
+                                (H::Seat(a), H::Seat(b)) => {
+                                    let (lo, hi) = (a.min(b), a.max(b));
+                                    let (head, tail) = self.road.opponents.split_at_mut(hi);
+                                    let (ca, cb) = if a < b { (&mut head[lo].vehicle, &mut tail[0].vehicle) } else { (&mut tail[0].vehicle, &mut head[lo].vehicle) };
+                                    nfs_physics::vehicle::collide_pair(ca, ma, cb, mb, &mut racer_walls)
+                                }
+                                (H::Local, H::Local) => None,
+                            };
+                            if let Some((ea, eb)) = hit {
+                                for (h, effect) in [(d, ea), (who, eb)] {
+                                    match h {
+                                        H::Local => {
+                                            ground_event = None;
+                                            player_spark = None;
+                                            self.snd.player_loops.push_impact(nfs_audio::sfx::QueuedSfx::CarCar { effect });
+                                        }
+                                        H::Seat(k) => ai_hits.push((AudioCar::Opponent(k), nfs_audio::sfx::QueuedSfx::CarCar { effect })),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    done.push(who);
+                }
+            } else {
+                // the human's pass: its walls and props (no earlier car to pair with)
                 v.impact = 0.0;
-            }
-            let prop_hit = v.collide_props(&w.props, self.tick as u32);
-            if prop_hit.is_some() {
-                ground_event = None;
-                player_spark = None;
-            }
-            if let Some((impact, event)) = prop_hit {
-                self.snd.player_loops.push_impact(prop_sfx(impact, event));
-            }
-            // each opponent's pass: its walls and props, then the human and the opponents before it.
-            // Each body's own impact (`collide_pair`, the one `collide_cars_with` takes the larger
-            // of) goes to its own queue: the player's plays, the other car's is queued. 0x40F740
-            // reads each car's own `car+0x430`, which 0x496860 stores per body (A 0x496B42…0x496B91,
-            // B 0x496BEF…0x496C3E) — the player is always A here, so its one-shot takes `ea`
-            // (until 2026-09-26 it took the larger of the two)
-            for oi in 0..self.road.opponents.len() {
-                let (done, rest) = self.road.opponents.split_at_mut(oi);
-                let o = &mut rest[0];
-                // the impact `car+0x430` 0x40F740 turns into the opponent's queued one-shot
-                o.vehicle.impact = 0.0;
-                if o.vehicle.collide_walls(&w.walls, &w.tree, &patch_height, 0.0, 0.0, 0.0) {
-                    o.wall_hits += 1;
-                    ai_hits.push((AudioCar::Opponent(oi), wall_sfx(&o.vehicle)));
+                if v.collide_walls(&w.walls, &w.tree, &patch_height, 0.0, 0.0, 0.0) {
+                    ground_event = None;
+                    player_spark = Some(v.last_wall_effect);
+                    self.wall_hits += 1;
+                    self.snd.player_loops.push_impact(wall_sfx(v));
+                    v.impact = 0.0;
                 }
-                if let Some((impact, event)) = o.vehicle.collide_props(&w.props, tick) {
-                    ai_hits.push((AudioCar::Opponent(oi), prop_sfx(impact, event)));
-                }
-                if no_carcol {
-                    continue;
-                }
-                let o_mass = o.specs.mass * tiny_k;
-                if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair(v, player_mass, &mut o.vehicle, o_mass, &mut racer_walls) {
-                    ai_hits.push((AudioCar::Opponent(oi), nfs_audio::sfx::QueuedSfx::CarCar { effect: eb }));
+                let prop_hit = v.collide_props(&w.props, self.tick as u32);
+                if prop_hit.is_some() {
                     ground_event = None;
                     player_spark = None;
-                    // the player's own `car+0x430` (A)
-                    self.snd.player_loops.push_impact(nfs_audio::sfx::QueuedSfx::CarCar { effect: ea });
                 }
-                for (di, d) in done.iter_mut().enumerate() {
-                    if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair(&mut d.vehicle, d.specs.mass * tiny_k, &mut o.vehicle, o_mass, &mut racer_walls) {
-                        ai_hits.push((AudioCar::Opponent(di), nfs_audio::sfx::QueuedSfx::CarCar { effect: ea }));
+                if let Some((impact, event)) = prop_hit {
+                    self.snd.player_loops.push_impact(prop_sfx(impact, event));
+                }
+                // each opponent's pass: its walls and props, then the human and the opponents before it.
+                // Each body's own impact (`collide_pair`, the one `collide_cars_with` takes the larger
+                // of) goes to its own queue: the player's plays, the other car's is queued. 0x40F740
+                // reads each car's own `car+0x430`, which 0x496860 stores per body (A 0x496B42…0x496B91,
+                // B 0x496BEF…0x496C3E) — the player is always A here, so its one-shot takes `ea`
+                // (until 2026-09-26 it took the larger of the two)
+                for oi in 0..self.road.opponents.len() {
+                    let (done, rest) = self.road.opponents.split_at_mut(oi);
+                    let o = &mut rest[0];
+                    // the impact `car+0x430` 0x40F740 turns into the opponent's queued one-shot
+                    o.vehicle.impact = 0.0;
+                    if o.vehicle.collide_walls(&w.walls, &w.tree, &patch_height, 0.0, 0.0, 0.0) {
+                        o.wall_hits += 1;
+                        ai_hits.push((AudioCar::Opponent(oi), wall_sfx(&o.vehicle)));
+                    }
+                    if let Some((impact, event)) = o.vehicle.collide_props(&w.props, tick) {
+                        ai_hits.push((AudioCar::Opponent(oi), prop_sfx(impact, event)));
+                    }
+                    if no_carcol {
+                        continue;
+                    }
+                    let o_mass = o.specs.mass * opp_k[oi];
+                    if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair(v, player_mass, &mut o.vehicle, o_mass, &mut racer_walls) {
                         ai_hits.push((AudioCar::Opponent(oi), nfs_audio::sfx::QueuedSfx::CarCar { effect: eb }));
+                        ground_event = None;
+                        player_spark = None;
+                        // the player's own `car+0x430` (A)
+                        self.snd.player_loops.push_impact(nfs_audio::sfx::QueuedSfx::CarCar { effect: ea });
+                    }
+                    for (di, d) in done.iter_mut().enumerate() {
+                        if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair(&mut d.vehicle, d.specs.mass * opp_k[di], &mut o.vehicle, o_mass, &mut racer_walls) {
+                            ai_hits.push((AudioCar::Opponent(di), nfs_audio::sfx::QueuedSfx::CarCar { effect: ea }));
+                            ai_hits.push((AudioCar::Opponent(oi), nfs_audio::sfx::QueuedSfx::CarCar { effect: eb }));
+                        }
                     }
                 }
             }
@@ -10379,8 +11855,8 @@ impl App {
                     let c = &mut rest[0];
                     c.body.tiny = self.cheat_bits & (1 << 1) != 0;
                     // `DERBY` `[0x657400]`, which only the Smash Up code sets (cheat bit 7): `Damage` takes ×1.5, not ×0.5 (0x49452F)
-                    c.body.derby = self.cheat_bits & (1 << 7) != 0;
-                    c.body.rally = self.cheat_bits & 1 != 0;
+                    c.body.derby = derby_on;
+                    c.body.rally = rally_on;
                     c.sync_body_in();
                     c.body.impact = 0.0;
                     if c.body.collide_walls(&w.walls, &w.tree, &patch_height, 0.0, 0.0, 0.0) {
@@ -10402,7 +11878,7 @@ impl App {
                             self.snd.player_loops.push_impact(nfs_audio::sfx::QueuedSfx::CarCar { effect: ea });
                         }
                         for (oi, o) in self.road.opponents.iter_mut().enumerate() {
-                            if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair(&mut o.vehicle, o.specs.mass * tiny_k, &mut c.body, cop_mass, &mut racer_walls) {
+                            if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair(&mut o.vehicle, o.specs.mass * opp_k[oi], &mut c.body, cop_mass, &mut racer_walls) {
                                 ai_hits.push((AudioCar::Opponent(oi), nfs_audio::sfx::QueuedSfx::CarCar { effect: ea }));
                                 ai_hits.push((AudioCar::Police(i), nfs_audio::sfx::QueuedSfx::CarCar { effect: eb }));
                             }
@@ -10447,45 +11923,70 @@ impl App {
                     if let Some((impact, event)) = b.collide_props(&w.props, tick) {
                         ai_hits.push((AudioCar::Traffic(i), prop_sfx(impact, event)));
                     }
-                    if let Some((ea, eb)) =
-                        nfs_physics::vehicle::collide_pair(v, player_mass, b, c.mass, &mut racer_walls)
-                    {
-                        ai_hits.push((AudioCar::Traffic(i), nfs_audio::sfx::QueuedSfx::CarCar { effect: eb }));
-                        ground_event = None;
-                        player_spark = None;
-                        // the collision script trigger (§12.9 trigger 0)
-                        c.hit_by_human_tick = self.tick;
-                        // `car+0x418`, the counter that disables the "on its roof" exit (§21.7)
-                        c.collisions += 1;
-                        tracing::debug!(
-                            car = i,
-                            ea,
-                            eb,
-                            mass = c.mass,
-                            speed = v.speed(),
-                            "player hit traffic"
-                        );
-                        // the player's own `car+0x430` (A)
-                        self.snd.player_loops.push_impact(nfs_audio::sfx::QueuedSfx::CarCar { effect: ea });
-                    }
-                    for (oi, o) in self.road.opponents.iter_mut().enumerate() {
-                        if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair(
-                            &mut o.vehicle,
-                            o.specs.mass * tiny_k,
-                            b,
-                            c.mass,
-                            &mut racer_walls,
-                        ) {
-                            let effect = ea.max(eb);
-                            ai_hits.push((AudioCar::Opponent(oi), nfs_audio::sfx::QueuedSfx::CarCar { effect: ea }));
-                            ai_hits.push((AudioCar::Traffic(i), nfs_audio::sfx::QueuedSfx::CarCar { effect: eb }));
-                            c.collisions += 1;
-                            tracing::debug!(
-                                car = i,
-                                opponent = o.name,
-                                effect,
-                                "opponent hit traffic"
-                            );
+                    // the human cars meet it in registration order (an exchange race: by race index, the
+                    // same on every machine; otherwise the local car, then the opponents)
+                    let human_pass: Vec<HumanCar> = if exch_order.is_empty() {
+                        std::iter::once(HumanCar::Local).chain((0..self.road.opponents.len()).map(HumanCar::Seat)).collect()
+                    } else {
+                        exch_order.clone()
+                    };
+                    for who in human_pass {
+                        match who {
+                            HumanCar::Local => {
+                                if let Some((ea, eb)) =
+                                    nfs_physics::vehicle::collide_pair(v, player_mass, b, c.mass, &mut racer_walls)
+                                {
+                                    ai_hits.push((AudioCar::Traffic(i), nfs_audio::sfx::QueuedSfx::CarCar { effect: eb }));
+                                    ground_event = None;
+                                    player_spark = None;
+                                    // the collision script trigger (§12.9 trigger 0)
+                                    c.hit_by_human_tick = self.tick;
+                                    // `car+0x418`, the counter that disables the "on its roof" exit (§21.7)
+                                    c.collisions += 1;
+                                    tracing::debug!(
+                                        car = i,
+                                        ea,
+                                        eb,
+                                        mass = c.mass,
+                                        speed = v.speed(),
+                                        "player hit traffic"
+                                    );
+                                    if !exch_order.is_empty() {
+                                        tracing::info!(target: "netplay", tick = self.tick, traffic = i, ea, eb, "an input-exchange race: the local car hit the traffic car");
+                                    }
+                                    // the player's own `car+0x430` (A)
+                                    self.snd.player_loops.push_impact(nfs_audio::sfx::QueuedSfx::CarCar { effect: ea });
+                                }
+                            }
+                            HumanCar::Seat(oi) => {
+                                let o = &mut self.road.opponents[oi];
+                                if let Some((ea, eb)) = nfs_physics::vehicle::collide_pair(
+                                    &mut o.vehicle,
+                                    o.specs.mass * opp_k[oi],
+                                    b,
+                                    c.mass,
+                                    &mut racer_walls,
+                                ) {
+                                    let effect = ea.max(eb);
+                                    ai_hits.push((AudioCar::Opponent(oi), nfs_audio::sfx::QueuedSfx::CarCar { effect: ea }));
+                                    ai_hits.push((AudioCar::Traffic(i), nfs_audio::sfx::QueuedSfx::CarCar { effect: eb }));
+                                    c.collisions += 1;
+                                    // a seat is a human in an exchange race (`car+0x52C & 4`): the script
+                                    // trigger 0 sees its hit as it sees the local car's
+                                    if !exch_order.is_empty() {
+                                        c.hit_by_human_tick = self.tick;
+                                    }
+                                    tracing::debug!(
+                                        car = i,
+                                        opponent = o.name,
+                                        effect,
+                                        "opponent hit traffic"
+                                    );
+                                    if !exch_order.is_empty() {
+                                        tracing::info!(target: "netplay", tick = self.tick, traffic = i, seat = oi, ea, eb, "an input-exchange race: a seat's car hit the traffic car");
+                                    }
+                                }
+                            }
                         }
                     }
                     // …and the cops, whose passes ran before this traffic car's (their slots
@@ -10540,8 +12041,20 @@ impl App {
                 let mut keys: Vec<Option<AudioCar>> = vec![None];
                 keys.extend((0..self.road.opponents.len()).map(|i| Some(AudioCar::Opponent(i))));
                 let mut cars: Vec<(&mut nfs_physics::vehicle::Vehicle, f32)> = std::iter::once((&mut *v, player_mass / 128.0))
-                    .chain(self.road.opponents.iter_mut().map(|o| (&mut o.vehicle, o.specs.mass * tiny_k / 128.0)))
+                    .chain(self.road.opponents.iter_mut().enumerate().map(|(oi, o)| (&mut o.vehicle, o.specs.mass * opp_k[oi] / 128.0)))
                     .collect();
+                // an exchange race: the human cars in registration order, so that a prop two of them hit on
+                // one tick goes to the same one on every machine (`0x5E8B34[]`, 0x4A17F0's walk)
+                if !exch_order.is_empty() {
+                    let mut by_storage: Vec<Option<(&mut nfs_physics::vehicle::Vehicle, f32)>> = cars.drain(..).map(Some).collect();
+                    let old_keys = std::mem::take(&mut keys);
+                    let mut order: Vec<usize> = (0..by_storage.len()).collect();
+                    order.sort_by_key(|&s| reg_of(s));
+                    for s in order {
+                        cars.push(by_storage[s].take().expect("each car once"));
+                        keys.push(old_keys[s]);
+                    }
+                }
                 if let Some(pol) = self.road.police.as_mut() {
                     for (i, c) in pol.cars.iter_mut().enumerate().filter(|(_, c)| c.active) {
                         keys.push(Some(AudioCar::Police(i)));
@@ -10725,7 +12238,13 @@ impl App {
             // 0x40F7EB: a reset request (the player's key, or the bot's stand-in for it) goes through
             // `Vehicle::reset_request`'s gates; 0x40F540 itself does nothing in a skill test on the
             // skidpad (`[0x6573EC] == 4` and the track "skidpad", 0x40F540…0x40F565)
-            let asked = self.input.take_pressed(Action::Reset) || bot_stuck;
+            // in an input-exchange race the request is the latched sample's command 5 (`car+0xD8B`, 0x40F7EB)
+            // — every machine's copy of the car reads the same one — and the scripted bot's own reset
+            // (a stand-in for a key) is off, since it would reset this machine's copy alone
+            let asked = match exchange_in.as_ref() {
+                Some(x) => x.local.command == nfs_net::exchange::CMD_RESET,
+                None => self.input.take_pressed(Action::Reset) || bot_stuck,
+            };
             let requested = v.reset_request(asked, self.tick);
             let exempt = self.skill.is_some() && self.track.name.eq_ignore_ascii_case("skidpad");
             // a car behind its start on a point-to-point track goes back to its start slice
@@ -10782,8 +12301,11 @@ impl App {
                         Controller::Ai(ai) => (ai.reset_why, ai.dbg_facing),
                         _ => (None, 0.0),
                     };
-                    let stuck = match &mut o.controller {
-                        Controller::Ai(ai) => ai.wants_reset(),
+                    // an input-exchange seat is a human car: its request is its sample's command 5
+                    let exchange_seat = exchange_in.as_ref().and_then(|x| x.seats.iter().find(|e| e.0 == oi));
+                    let stuck = match (&mut o.controller, exchange_seat) {
+                        (_, Some(e)) => e.2.command == nfs_net::exchange::CMD_RESET,
+                        (Controller::Ai(ai), None) => ai.wants_reset(),
                         _ => false,
                     };
                     // diagnostic: `NFS_SLOW_LOG=1` prints every opponent that is barely moving,
@@ -10851,12 +12373,24 @@ impl App {
                             .as_ref()
                             .and_then(|l| l.points.get(slice))
                             .map_or(Vec3::ZERO, |p| Vec3::new(p[0], sl.centre.y, p[1]));
+                        if exchange_seat.is_some() {
+                            // a human's reset (0x40F6DE: offset zero, `car+0x52C & 8` clear), the player's own block
+                            o.vehicle.place_at_slice(&w.collision, &o.specs, sl.centre, sl.forward, Vec3::ZERO, false, false);
+                            o.vehicle.velocity = Vec3::ZERO;
+                            o.vehicle.angular_velocity = Vec3::ZERO;
+                            o.vehicle.airborne_count = 0;
+                            o.vehicle.rpm = 0.0;
+                            o.vehicle.gear = 2;
+                            o.vehicle.rearm_after_reset();
+                            o.vehicle.reset_countdown = 0;
+                        } else {
                         o.vehicle.reset_to(o.vehicle.position, o.vehicle.orientation);
                         o.vehicle.place_at_slice(&w.collision, &o.specs, sl.centre, sl.forward, line, true, false);
                         // 0x40F711…0x40F724: the velocity, then 0x40F400 the spin and `+0x418`
                         o.vehicle.velocity = Vec3::ZERO;
                         o.vehicle.angular_velocity = Vec3::ZERO;
                         o.vehicle.airborne_count = 0;
+                        }
                         // 0x49E421 / 0x4A03A3 / 0x4A047F: a reset clears the branch latch
                         // (`car+0xE94 = 0`) and the tracker's preferred section (`car+0xC = -1`)
                         if let Controller::Ai(d) = &mut o.controller {
@@ -10909,6 +12443,15 @@ impl App {
                     .chain(cops.iter().copied())
                     .chain(tr.cars.iter().map(|c| c.progress))
                     .collect();
+                let keys = if exch_order.is_empty() {
+                    keys
+                } else {
+                    let mut k2 = keys.clone();
+                    for s in 0..=n_seat_cars {
+                        k2[reg_of(s)] = keys[s];
+                    }
+                    k2
+                };
                 tr.overtakes(&keys, self.tick, 1 + self.road.opponents.len() + cops.len());
             }
             // `0x417710`'s first sort, the same call (0x4179BF): `0x5E8B88[]` ascending by
@@ -10922,6 +12465,16 @@ impl App {
                     .chain(self.road.police.iter().flat_map(|p| p.cars.iter().map(|c| if c.active { c.progress } else { 0.0 })))
                     .chain(self.road.traffic.iter().flat_map(|tr| tr.cars.iter().map(|c| if c.active { c.progress } else { 0.0 })))
                     .collect();
+                // in an exchange race the array is indexed by registration index (`reg_of`)
+                let keys = if exch_order.is_empty() {
+                    keys
+                } else {
+                    let mut k2 = keys.clone();
+                    for s in 0..=n_seat_cars {
+                        k2[reg_of(s)] = keys[s];
+                    }
+                    k2
+                };
                 self.race_order.resort(&keys);
             }
             // Quick Knockout cut for opponents that completed a lap this tick (modes.md §4)
@@ -10970,6 +12523,108 @@ impl App {
                             }
                         }
                     }
+                }
+            }
+            // **`DERBY`'s knockout** (`Race_updateProgress` 0x416310's game-type-3 arm, 0x416407…0x41646A —
+            // `nfs_game::race::derby_outcome`): for each racer still racing, in registration order (the racer
+            // array `0x5E8C00[]`), state 3 when all eight ring zones are past 30, else state 2 when every
+            // other racer is out; and each machine's `0x48DA60(tick − 0x1C0, tick)` says so to the room —
+            // for every racer that ends, whichever machine's car it is (`network.md` §11.18). A race by
+            // laps is not run: this arm ends every path of the function before the lap code (0x4164C0).
+            //
+            // **A positional race** (`Comms.Positional` 1) runs the same loop over the same racers, on this
+            // machine's own copy of each: the local car's ten zones are real, a remote car's are whatever
+            // this machine's own contacts with it did (its `0xBE` state carries no damage — 0x4A0DF0's block
+            // has no zone), so each machine finds *its own* car out and the rest by the "last one wins" count
+            // — `network.md` §11.20. The order is by race index (`0x5E8C00[]`, the same on every machine).
+            let derby_order: Vec<HumanCar> = if !self.net_derby {
+                Vec::new()
+            } else if !exch_order.is_empty() {
+                exch_order.clone()
+            } else if let Some(n) = self.net.session.as_ref().filter(|n| n.in_race != 0) {
+                let mut o: Vec<(u32, HumanCar)> = n.local_race_index().map(|i| (i, HumanCar::Local)).into_iter().collect();
+                o.extend((0..self.road.opponents.len()).filter_map(|k| n.seat_race_index(k).map(|i| (i, HumanCar::Seat(k)))));
+                o.sort_by_key(|e| e.0);
+                o.into_iter().map(|e| e.1).collect()
+            } else {
+                Vec::new()
+            };
+            if !derby_order.is_empty() {
+                let tick = self.tick;
+                let racers = derby_order.len();
+                // **Test glue** (`NFS_DERBY_SMASH=<race index>:<tick>`, set on every machine): that car's ten
+                // damage zones are set to 31 at that tick — a smash-up the two-instance runs would not
+                // otherwise reach in a few seconds
+                if let Some((idx, at)) = std::env::var("NFS_DERBY_SMASH")
+                    .ok()
+                    .and_then(|v| v.split_once(':').and_then(|(i, t)| Some((i.parse::<u32>().ok()?, t.parse::<u64>().ok()?))))
+                    && tick == at
+                {
+                    // (in a positional race the car's own machine alone has its zones)
+                    let local_index = exchange_in.as_ref().map(|x| x.local_index).or_else(|| self.net.session.as_ref().and_then(|n| n.local_race_index()));
+                    if Some(idx) == local_index {
+                        v.damage = [31.0; 10];
+                    } else if let Some(x) = exchange_in.as_ref()
+                        && let Some(e) = x.seats.iter().find(|e| e.1 == idx)
+                        && let Some(o) = self.road.opponents.get_mut(e.0)
+                    {
+                        o.vehicle.damage = [31.0; 10];
+                    }
+                }
+                let mut out = derby_order
+                    .iter()
+                    .filter(|h| match **h {
+                        HumanCar::Local => self.player_eliminated,
+                        HumanCar::Seat(k) => self.road.opponents.get(k).is_some_and(|o| o.eliminated),
+                    })
+                    .count();
+                for h in derby_order.iter().copied() {
+                    let (racing, zones): (bool, [f32; 10]) = match h {
+                        HumanCar::Local => (self.race.as_ref().is_some_and(|r| !r.finished), v.damage),
+                        HumanCar::Seat(k) => match self.road.opponents.get(k) {
+                            Some(o) => (!o.progress.finished, o.vehicle.damage),
+                            None => continue,
+                        },
+                    };
+                    if !racing {
+                        continue;
+                    }
+                    let outcome = nfs_game::race::derby_outcome(&zones, out, racers);
+                    if outcome == nfs_game::race::DerbyOutcome::Racing {
+                        continue;
+                    }
+                    let out_now = outcome == nfs_game::race::DerbyOutcome::Out;
+                    match h {
+                        HumanCar::Local => {
+                            if let Some(r) = self.race.as_mut() {
+                                r.finished = true;
+                                r.tick = tick;
+                            }
+                            self.player_eliminated = out_now;
+                        }
+                        HumanCar::Seat(k) => {
+                            if let Some(o) = self.road.opponents.get_mut(k) {
+                                o.progress.finished = true;
+                                o.progress.tick = tick;
+                                o.eliminated = out_now;
+                            }
+                        }
+                    }
+                    if out_now {
+                        out += 1;
+                    }
+                    tracing::info!(target: "netplay", ?h, tick, out = out_now, "DERBY: a racer ends its race (0x416407…0x41646A)");
+                    if let Some(n) = self.net.session.as_mut() {
+                        n.send_race_time((tick as i32).wrapping_sub(0x1C0), tick as i32);
+                    }
+                }
+            }
+            // the input-exchange seats' lap trackers, beside the player's (which follows): every machine's
+            // copy of a car is tracked at the same point of the tick
+            if let (Some(x), Some(t)) = (exchange_in.as_ref(), &self.slices) {
+                for e in &x.seats {
+                    let o = &mut self.road.opponents[e.0];
+                    o.progress.update_tracked(t, o.vehicle.position, o.vehicle.forward(), self.tick, self.num_laps, None);
                 }
             }
             if let (Some(t), Some(r)) = (&self.slices, self.race.as_mut()) {
@@ -11216,8 +12871,22 @@ impl App {
             }
         }
         v.step64(&self.specs);
-        for o in self.road.opponents.iter_mut() {
+        let exchanging = self.net.session.as_ref().is_some_and(|n| n.exchanging());
+        for (oi, o) in self.road.opponents.iter_mut().enumerate() {
             o.vehicle.step64(&o.specs);
+            // **0x49B8E0's network hook** (0x49B9AB…0x49B9EC), after the orientation step: a remote
+            // car of a positional race, whose class 0x490140 is at most 2 (a player who has left keeps
+            // its car where it stopped) — `NetPlay::apply` holds the other gates (`car+0xDAC`, `+0x70`)
+            if net_seats.contains(&oi)
+                && !exchanging
+                && let (Some(n), Some(w)) = (self.net.session.as_mut(), self.world.as_ref())
+                && !n.seat_race_index(oi).is_some_and(|i| n.link_quality(i, self.tick as u32).gone())
+            {
+                // the retrack's walk goes toward the car's slice centre (the tracker's slice, `slice + 4`)
+                let centre = self.slices.as_ref().and_then(|t| t.slices.get(o.progress.slice)).map(|sl| sl.centre);
+                n.apply(oi, &mut o.vehicle, &o.specs, &w.collision, centre, self.tick);
+                remote_dump(self.tick, oi, &o.vehicle, n);
+            }
             if self.tick % 32 == 0 {
                 o.vehicle.renormalise();
             }
@@ -11285,6 +12954,97 @@ impl App {
         }
         self.car_pos = v.draw_origin();
         self.car_rot = Quat::from_mat3(&v.orientation.transpose()).normalize();
+        // a network replay's viewed car (`[0x606858]`): the camera follows that human's car, not the recorded
+        // machine's own. **APPROXIMATION:** only the camera's target moves; the HUD's gauges keep reading the
+        // recorded machine's car.
+        if let Some(rn) = self.replay_net.as_ref() {
+            let mut order: Vec<u32> = rn.seats.iter().copied().filter(|i| *i != u32::MAX).chain(std::iter::once(rn.local_index)).collect();
+            order.sort_unstable();
+            if let Some(&target) = order.get(self.replay_view % order.len().max(1))
+                && target != rn.local_index
+                && let Some(k) = rn.seats.iter().position(|i| *i == target)
+                && let Some(o) = self.road.opponents.get(k)
+            {
+                self.car_pos = o.vehicle.draw_origin();
+                self.car_rot = Quat::from_mat3(&o.vehicle.orientation.transpose()).normalize();
+            }
+        }
+        // (a network race played back from a file dumps the same rows, its lanes' race indices standing for
+        // the session's: `NFS_NET_DUMP` proves the playback against the live race)
+        if self.net_dump.is_none()
+            && self.replay_net.is_some()
+            && let Ok(path) = std::env::var("NFS_NET_DUMP")
+            && let Ok(f) = std::fs::File::create(&path)
+        {
+            self.net_dump = Some(std::io::BufWriter::new(f));
+            use std::io::Write;
+            if let Ok(mut sf) = std::fs::File::create(format!("{path}.specs"))
+                && let Some(rn) = self.replay_net.as_ref()
+            {
+                let mut cars: Vec<(u32, String)> = vec![(rn.local_index, format!("{:#?}", self.specs))];
+                for (k, o) in self.road.opponents.iter().enumerate() {
+                    if let Some(&i) = rn.seats.get(k).filter(|i| **i != u32::MAX) {
+                        cars.push((i, format!("{:#?}", o.specs)));
+                    }
+                }
+                cars.sort_by_key(|c| c.0);
+                for (i, t) in cars {
+                    let _ = writeln!(sf, "=== car {i}\n{t}");
+                }
+            }
+        }
+        let dump_index: Option<(Option<u32>, Vec<Option<u32>>)> = match (self.net.session.as_ref(), self.replay_net.as_ref()) {
+            (Some(n), _) => Some((n.local_race_index(), (0..self.road.opponents.len()).map(|k| n.seat_race_index(k)).collect())),
+            (None, Some(r)) => Some((Some(r.local_index), r.seats.iter().map(|&i| (i != u32::MAX).then_some(i)).collect())),
+            (None, None) => None,
+        };
+        // (test glue: every car's whole `Vehicle` after the first tick, to diff two machines' or a replay's)
+        if self.tick == 1
+            && self.net_dump.is_some()
+            && let Some((local, seat_index)) = dump_index.as_ref()
+            && let Ok(path) = std::env::var("NFS_NET_DUMP")
+            && let Ok(mut f) = std::fs::File::create(format!("{path}.t1"))
+        {
+            use std::io::Write;
+            let mut cars: Vec<(u32, String)> = Vec::new();
+            if let Some(i) = local {
+                cars.push((*i, format!("{v:#?}")));
+            }
+            for (k, o) in self.road.opponents.iter().enumerate() {
+                if let Some(i) = seat_index.get(k).copied().flatten() {
+                    cars.push((i, format!("{:#?}", o.vehicle)));
+                }
+            }
+            cars.sort_by_key(|c| c.0);
+            for (i, t) in cars {
+                let _ = writeln!(f, "=== car {i}\n{t}");
+            }
+        }
+        if let Some(out) = self.net_dump.as_mut()
+            && let Some((local, seat_index)) = dump_index
+        {
+            Self::net_dump_tick(out, local, &seat_index, v, &self.road.opponents, self.tick);
+            // **Test glue:** the traffic cars (rows `100 + i`, the body's state) and the shared LCG's
+            // state (row 900), so two machines' agreement covers what the traffic AI drew
+            if let Some(tr) = self.road.traffic.as_ref() {
+                use std::io::Write;
+                for (i, (c, b)) in tr.cars.iter().zip(tr.bodies.iter()).enumerate() {
+                    let mut f: Vec<f32> = Vec::new();
+                    f.extend(b.position.to_array());
+                    f.extend(b.velocity.to_array());
+                    f.extend(b.orientation.to_cols_array());
+                    f.extend(b.angular_velocity.to_array());
+                    f.push(b.rpm);
+                    f.push(if c.active { 1.0 } else { 0.0 });
+                    let bits: Vec<String> = f.iter().map(|x| format!("{:08x}", x.to_bits())).collect();
+                    let _ = writeln!(out, "{},{},{},{}", self.tick, 100 + i, bits.join(","), c.slice);
+                }
+            }
+            {
+                use std::io::Write;
+                let _ = writeln!(out, "{},900,{:08x},0", self.tick, nfs_game::rng::state());
+            }
+        }
         // **The audio update `0x4A8120` runs on the odd tick only** — `GameTick` 0x414FF0 calls it
         // at 0x4150E3 behind `test byte [gGameTick], 1 ; je` (0x4150D5), after the even tick's
         // physics and AI (`timing.md` §7): 32 Hz. Everything below is that update — the slot table
@@ -11437,6 +13197,7 @@ impl App {
                     // 0x408F20), not `car+0xEC0`.
                     AudioCar::Traffic(i) => {
                         let (Some(tr), Some(specs)) = (&self.road.traffic, &self.road.traffic_specs) else { continue };
+                        let specs = tr.car_specs.get(i).unwrap_or(specs);
                         let Some(c) = tr.cars.get(i) else { continue };
                         let set = self.road.traffic_sets.get(i).cloned().unwrap_or_default();
                         if set.is_empty() {
@@ -11575,7 +13336,34 @@ impl App {
             let autobahn = self.track.name.eq_ignore_ascii_case("autobahn");
             let wet = |p: Vec3| autobahn && w.overhead_flags(p) == 0;
             let q = &mut self.snd.ai_sfx;
-            for (i, o) in self.road.opponents.iter().enumerate() {
+            // **Input exchange:** every human car's producer runs in registration order — the local car
+            // among the seats, where the port runs it after them (below) — so that the draws on the shared
+            // stream fall to the same car on every machine (`Car_postImpact` 0x410280 walks the cars in
+            // slot order, `network.md` §11.18)
+            let exch_humans = exch_humans_now.clone();
+            let racer_order: Vec<HumanCar> = if exch_humans.is_empty() {
+                (0..self.road.opponents.len()).map(HumanCar::Seat).collect()
+            } else {
+                exch_humans
+            };
+            for h in racer_order {
+                let HumanCar::Seat(i) = h else {
+                    let input = nfs_audio::sfx::LoopInput {
+                        cos_tilt: v.cos_tilt,
+                        body_height: v.body_height,
+                        speed_est: v.horizontal_speed(),
+                        front_slip: v.wheels[0].slip + v.wheels[1].slip,
+                        rear_slip: v.wheels[2].slip + v.wheels[3].slip,
+                        racer_distance: 0.0,
+                        tyre_class: self.specs.class.min(2),
+                        surface_nibble: v.surface_nibble(),
+                        wet: wet(v.position),
+                        human: true,
+                    };
+                    self.snd.player_loops.produce_loops(&input, nfs_game::rng::rand16);
+                    continue;
+                };
+                let o = &self.road.opponents[i];
                 let b = &o.vehicle;
                 let input = nfs_audio::sfx::LoopInput {
                     cos_tilt: b.cos_tilt,
@@ -11857,7 +13645,10 @@ impl App {
                 wet: self.track.name.eq_ignore_ascii_case("autobahn") && w.overhead_flags(v.position) == 0,
                 human: true,
             };
-            self.snd.player_loops.produce_loops(&input, nfs_game::rng::rand16);
+            // (an exchange race produced it above, in registration order)
+            if !self.net.session.as_ref().is_some_and(|n| n.exchanging()) {
+                self.snd.player_loops.produce_loops(&input, nfs_game::rng::rand16);
+            }
             // the queue's one-shots — pushed during the tick's physics, above — take the angle to
             // `car+0x440` as it stands now, read ONCE at this drain (0x4A7BB1…0x4A7C3B), after the
             // whole tick's collisions: every one-shot of the tick takes the same, final contact,
@@ -12002,6 +13793,8 @@ impl App {
         let cops = if self.road.cops_enabled { self.road.cop_count } else { 0 };
         let traffic = self.road.traffic_count.min(9u32.saturating_sub(1 + self.num_opponents + cops));
         let num_cars = cops + 1 + self.num_opponents + traffic;
+        // a network race's (`NetSetup` in the setup): the humans and the host's traffic cars kept
+        let num_cars = if let Some(n) = file.setup.net.as_ref() { 1 + n.seats.len() as u32 + n.traffic.len() as u32 } else { num_cars };
         let rpl = nfs_game::replay::original_rpl(&file.setup, file.final_tick, &file.stream, r.ramp, num_cars);
         if let Err(e) = std::fs::write(path.with_extension("rpl"), rpl) {
             tracing::debug!(error = %e, "writing the original-format .rpl failed");
@@ -12369,7 +14162,13 @@ impl App {
         let Some(name) = names.get(self.fe.replay_sel.min(names.len().saturating_sub(1))).cloned() else { return };
         let Some(dir) = self.replay.path.parent().map(|d| d.to_path_buf()) else { return };
         let path = dir.join(format!("{name}.rpl"));
-        let Some(f) = std::fs::read(&path).ok().and_then(|d| read_replay_file(&d)) else {
+        // the port's own file beside the listed `.rpl` is read first (`replay.md` §17): it names the car's
+        // body style and carries a network race's humans (§18.15), which the single-car `.rpl` cannot
+        let Some(f) = std::fs::read(path.with_extension("prpl"))
+            .ok()
+            .and_then(|d| nfs_game::replay::ReplayFile::parse(&d))
+            .or_else(|| std::fs::read(&path).ok().and_then(|d| read_replay_file(&d)))
+        else {
             tracing::warn!(path = %path.display(), "not a replay file");
             return;
         };
@@ -12389,8 +14188,24 @@ impl App {
         if self.cheat_bits & (1 << 1) != 0 {
             self.specs.apply_tinycar();
         }
+        // 0x49CB50 folds the car's stock parts (0x4EE9A0) and the neutral sliders (0x4EED2D) — the
+        // replay file carries neither a part list nor sliders of its own here, so the car is a fresh
+        // catalogue car (`fold_fresh_car`)
+        let entry = std::fs::read(self.paths.fe_data().join("Data").join("nfs5.car"))
+            .ok()
+            .and_then(|d| nfs_formats::fedata::parse_car_catalog(&d).ok())
+            .and_then(|cat| cat.into_iter().find(|c| (setup.car_id != 0 && c.id == setup.car_id) || (!setup.sim.is_empty() && c.sim.eq_ignore_ascii_case(&setup.sim))));
+        if let Some(e) = &entry {
+            let table = self.fe_parts_table();
+            let automatic = self.player_automatic();
+            nfs_game::career::fold_fresh_car(&mut self.specs, &e.stock_parts, &table, &e.sim_family, automatic);
+        }
         self.track = track;
-        self.car = car.0;
+        // the catalogue record's body style and roof, as the live race's car had them
+        self.car = match &entry {
+            Some(e) => car.0.with_style(e.variant).with_cabrio(e.cabrio),
+            None => car.0,
+        };
         self.sim_name = setup.sim.clone();
         self.num_opponents = setup.opponents;
         self.num_laps = setup.laps.max(1);
@@ -12411,6 +14226,7 @@ impl App {
         self.career_opponents = None;
         self.replay.stream = Some(nfs_game::replay::Replay::playing(f.stream, f.final_tick));
         self.replay.setup = setup;
+        self.apply_replay_net();
         // the menu comes back when the playback ends (`leave_race`)
         self.fe.menu_template = self.fe.menu.take();
         self.fe.after_replay = true;
@@ -12523,6 +14339,36 @@ impl App {
                     }
                 }
                 self.bind_lists();
+                false
+            }
+            // 0x5097C2's input dialog: another name, and the join goes again under it
+            Some((true, DialogFor::NetName)) => {
+                let typed = self.fe.dialog_input.take().unwrap_or_default();
+                let host = self.net.session.as_ref().and_then(|n| n.host_addr());
+                if let (Some(host), false) = (host, typed.trim().is_empty()) {
+                    self.fe_session_leave();
+                    let r = netplay::NetPlay::start(&format!("join:{host}"), typed.trim());
+                    self.open_network_session("CONNECT", r);
+                } else {
+                    self.fe_back_callback(event_loop);
+                }
+                false
+            }
+            Some((true, DialogFor::NetGameName)) => {
+                let typed = self.fe.dialog_input.take().unwrap_or_default();
+                let name: String = typed.chars().take(netplay::GAME_NAME_MAX).collect();
+                if let Err(e) = std::fs::write(netplay::game_name_path(), &name) {
+                    tracing::debug!(error = %e, "Comms.GameName not kept");
+                }
+                let opened = self.net.lobby.as_ref().map(|l| l.create(&name));
+                if let Some(r) = opened {
+                    self.open_network_session("CREATE", r);
+                }
+                false
+            }
+            Some((false, DialogFor::NetGameName)) => false,
+            Some((_, DialogFor::NetName | DialogFor::NetFail | DialogFor::NetConnecting)) => {
+                self.fe_back_callback(event_loop);
                 false
             }
             // 0x5112ED…0x51146F: the typed text, parsed (0x524220), goes to `OwnedCar.DecalNum`
@@ -12716,8 +14562,7 @@ impl App {
     /// Inputs as the port has them: `[+0x178]` (the race's options entry) is never set — nor in
     /// the original (§4.169.1); the lock `[+0x17C]` is `fe_back_lock`'s (§4.169.2). 0x5091B0 needs the session linked, not ejected,
     /// `+0xBE` set and an id (as §4.163's four tests), every player's `[0x658604 + id·0x580]` set
-    /// and our ready bit `+0xE5` clear — APPROXIMATION: "a session is open", the per-player
-    /// table and the ready bit having no port.
+    /// and `net+0xE5` clear — `App::net_can_start` (`network.md` §11.9).
     fn bind_bottom_bar(&mut self) {
         const NAMES: [&str; 5] = ["ID_BACKBUTTON", "ID_OPTIONSBUTTON", "ID_PLAYGAMEBUTTON", "ID_CASHBKGD", "ID_ACCOUNTTHINGY"];
         let Some(l) = self.fe.layout_preview.as_ref() else { return };
@@ -12732,7 +14577,7 @@ impl App {
             _ => match list.as_str() {
                 "ID_FDVICTORYSCREEN" => false,
                 "ID_TOURNYSCREEN" => !self.owned_list().is_empty(),
-                "ID_COMMSCREATESCREEN" => self.net.session.is_some(),
+                "ID_COMMSCREATESCREEN" => self.net_can_start(),
                 _ => true,
             },
         };
@@ -12778,7 +14623,7 @@ impl App {
             Some("GOBACK") => self.fe_back_callback(event_loop),
             Some("PLAYGAME") => {
                 if self.fe.layout_preview.as_ref().is_some_and(|l| l.can_play()) {
-                    self.start_from_layout(event_loop);
+                    self.fe_start_game(event_loop);
                 }
             }
             Some("OPTIONS") => self.fe_options(),
@@ -12954,6 +14799,8 @@ impl App {
     fn fe_session_leave(&mut self) {
         if let Some(mut n) = self.net.session.take() {
             tracing::info!("front end: session left (0x48E6F0 / 0x48E9C0)");
+            self.net.connect_pending = false;
+            n.exchange_leave();
             n.leave();
         }
     }
@@ -13869,7 +15716,7 @@ impl App {
             for o in &self.road.opponents {
                 let Some(m) = self.road.opponent_models.get_mut(o.model) else { continue };
                 let v = &o.vehicle;
-                m.update_animation(r, 16, v.speed(), night, tiny, v.gear == 0);
+                m.update_animation(r, 16, v.speed(), night, o.tiny, v.gear == 0);
                 m.update_driver(
                     r,
                     16,
@@ -14738,6 +16585,8 @@ impl App {
                 let metres = |d: usize| self.hud_metres.get(d).copied().unwrap_or(0);
                 let p_speed = v.horizontal_speed();
                 let mut rows = Vec::new();
+                let mut links: Vec<(usize, Option<LinkBadge>)> = Vec::new();
+                let game_tick = self.tick as u32;
                 for &d in &order {
                     let (progress, eliminated, name, paint, speed) = if d == 0 {
                         (r, self.player_eliminated, self.player_name.clone(), self.paint, p_speed)
@@ -14752,6 +16601,28 @@ impl App {
                         continue;
                     }
                     let gap = metres(d) - metres(0);
+                    // FEGAME_TYPE 3 (a network race): the racer's race index, which 0x48D7F0 / 0x48D770
+                    // (0x42B366…0x42B38E) and 0x490140 (0x42B4DE) take as `i`
+                    let net_index = self.net.session.as_ref().and_then(|n| if d == 0 { n.local_race_index() } else { n.seat_race_index(d - 1) });
+                    // the other columns, 0x42B393…0x42B4AE: "position" (the gap in metres, "-----"
+                    // when level) and "time" (the gap over the faster-ish of the two speeds)
+                    let mode_column = || -> String {
+                        if opp_mode == 1 {
+                            // "position": the gap in metres, "-----" when level (0x42B39D…0x42B3E4)
+                            if gap != 0 { gap.to_string() } else { "-----".to_string() }
+                        } else {
+                            // "time": the gap over the faster-ish of the two speeds — the leader's own,
+                            // or half the other's (0x42B420…0x42B458), signed; "-----" when level or
+                            // while the player is at 13.39 m/s or less (0x42B45B)
+                            let vv = if gap > 0 { p_speed.max(0.5 * speed) } else { speed.max(0.5 * p_speed) };
+                            if p_speed > 13.39 && gap != 0 {
+                                let t = ((gap * 64) as f32 / vv).round_ties_even() as i64;
+                                format!("{}{}", if t >= 0 { "+" } else { "-" }, format_ticks(t.unsigned_abs()))
+                            } else {
+                                "-----".to_string()
+                            }
+                        }
+                    };
                     let value = if derby {
                         // `DERBY [0x657400] == 1` (0x42B2D5, ahead of every other column; the
                         // game type 3 "DNF" before it is the network race's): the ten zones
@@ -14760,25 +16631,37 @@ impl App {
                         // 0x42B321) and `_itoa(…, 10)` (0x5A19AC) — no "%"
                         let zones = if d == 0 { &v.damage } else { &self.road.opponents[d - 1].vehicle.damage };
                         derby_damage_total(zones).to_string()
-                    } else if progress.finished && !eliminated {
-                        // state 2: the car's race time (0x42B33A…0x42B34C)
-                        format_ticks(progress.lap_times.iter().sum())
-                    } else if opp_mode == 1 {
-                        // "position": the gap in metres, "-----" when level (0x42B39D…0x42B3E4)
-                        if gap != 0 { gap.to_string() } else { "-----".to_string() }
-                    } else {
-                        // "time": the gap over the faster-ish of the two speeds — the leader's own,
-                        // or half the other's (0x42B420…0x42B458), signed; "-----" when level or
-                        // while the player is at 13.39 m/s or less (0x42B45B)
-                        let vv = if gap > 0 { p_speed.max(0.5 * speed) } else { speed.max(0.5 * p_speed) };
-                        if p_speed > 13.39 && gap != 0 {
-                            let t = ((gap * 64) as f32 / vv).round_ties_even() as i64;
-                            format!("{}{}", if t >= 0 { "+" } else { "-" }, format_ticks(t.unsigned_abs()))
-                        } else {
-                            "-----".to_string()
+                    } else if let Some(i) = net_index {
+                        // game type 3 (0x42B335 `cmp edx, 3`, `je 0x42B366`) — **ahead of the state-2
+                        // arm, which it skips**: `0x48D7F0(i) > 0` (0x42B36A…0x42B374) prints the time
+                        // 0x48D770(i) (0x42B37A) through `Time_format` 0x4356E0 with its sign flag 0
+                        // (0x42B386): the finish time the racer's own `0xB7` carried. A racer with no
+                        // time yet (`jle 0x42B393`) takes the "position" / "time" columns.
+                        match self.net.session.as_ref().filter(|n| n.race_rank(i) > 0).map(|n| n.race_time(i)) {
+                            Some(t) => format_ticks(t.max(0) as u64),
+                            None => mode_column(),
                         }
+                    } else if progress.finished && !eliminated {
+                        // state 2: the car's race time `car+0xB24` (0x42B33A…0x42B34C) — the finish tick
+                        // less 448 (0x416840…0x41684C, `FinalizeIn::from_progress`), which the port had
+                        // printed as the lap times' sum: 448 ticks (7 s) longer, the countdown included
+                        format_ticks(progress.tick.saturating_sub(0x1C0))
+                    } else {
+                        mode_column()
                     };
                     let colour = [paint[0] as f32 / 255.0, paint[1] as f32 / 255.0, paint[2] as f32 / 255.0, 1.0];
+                    // FEGAME_TYPE 3 (a network race): 0x490140 of the racer's race index → the badge,
+                    // and FE 18191 in place of the gap for a racer in state 3 (0x42B25E…0x42B27C)
+                    let link = self.net.session.as_mut().and_then(|n| {
+                        let i = if d == 0 { n.local_race_index() } else { n.seat_race_index(d - 1) }?;
+                        let c = n.link_quality(i, game_tick).colour();
+                        let f = |sh: u32| ((c >> sh) & 0xFF) as f32 / 255.0;
+                        Some(LinkBadge {
+                            colour: [f(16), f(8), f(0), f(24)],
+                            dnf: eliminated.then(|| self.fe.strings.hud(18191).unwrap_or_default().to_string()),
+                        })
+                    });
+                    links.push((d, link));
                     rows.push((d, colour, name, value));
                 }
                 // rows are laid out by live position among the cars still listed
@@ -14788,7 +16671,7 @@ impl App {
                     .map(|(k, (d, c, n, val))| (d, (k, c, n, val)))
                     .collect();
                 let place = listed.iter().position(|(d, _)| *d == 0).map_or(0, |k| k + 1);
-                Some((listed.into_iter().map(|(_, r)| r).collect::<Vec<_>>(), place))
+                Some((listed.into_iter().map(|(_, r)| r).collect::<Vec<_>>(), place, links.into_iter().map(|(_, l)| l).collect::<Vec<_>>()))
             } else {
                 None
             };
@@ -15030,11 +16913,11 @@ impl App {
                 Hud::slide(&mut m, 0, hud_aspect, (lx, ly, 59.0, 85.0), tray4);
                 self.scene.sprites.extend(m);
             }
-            if let Some((rows, place)) = &opp_list {
+            if let Some((rows, place, links)) = &opp_list {
                 let (px, py) = layout.position;
                 let mut list = Vec::new();
                 let label = self.fe.strings.hud(17).unwrap_or_default().to_string();
-                h.opponent_list_sprites(&mut list, hud_aspect, (px, py), rows, *place, &label, self.cheat_bits & (1 << 7) != 0);
+                h.opponent_list_sprites(&mut list, hud_aspect, (px, py), rows, links, *place, &label, self.cheat_bits & (1 << 7) != 0);
                 Hud::slide(&mut list, 0, hud_aspect, (px, py, 138.0, (rows.len() as f32 + 1.0) * 15.0 + 4.0), tray4);
                 self.scene.sprites.extend(list);
             }
@@ -15048,8 +16931,8 @@ impl App {
                 // not drawn in state 0 (0x42D28E), faded by the state's per cent otherwise
                 if let Some(pct) = self.replay_bar.pct(clock) {
                     let mut bar = Vec::new();
-                    let tips: [String; 7] = std::array::from_fn(|i| self.fe.strings.hud(nfs_game::replay::bar_tooltip(i, self.replay.frozen)).unwrap_or_default().to_string());
-                    h.replay_bar(&mut bar, hud_aspect, self.replay.frozen, &self.replay_bar, pct, self.fe.cursor, &tips);
+                    let tips: [String; 7] = std::array::from_fn(|i| self.fe.strings.hud(nfs_game::replay::bar_tooltip(i, self.replay.frozen, self.replay_net.is_some())).unwrap_or_default().to_string());
+                    h.replay_bar(&mut bar, hud_aspect, self.replay.frozen, self.replay_net.is_some(), &self.replay_bar, pct, self.fe.cursor, &tips);
                     self.scene.sprites.extend(bar);
                 }
             }
@@ -15680,6 +17563,22 @@ impl App {
                     self.scene.sprites.extend(dlg);
                 }
             }
+        }
+        // `HInfo`'s in-race box (0x4282F0; `net_race_notice`)
+        if !self.paused
+            && let Some(id) = self.net_notice
+            && let Some(h) = &self.hud
+            && h.font.is_some()
+        {
+            let fe = |id: u32| self.fe.strings.hud(id).unwrap_or_default().to_string();
+            let aspect = self.renderer.as_ref().map(|r| r.aspect()).unwrap_or(HUD_REF_W / HUD_REF_H);
+            let mut dlg = Vec::new();
+            h.billboard_h.set(BILLBOARD.3);
+            // 0x428328: "" left, 18157 right, the Esc hint alone (Spacebar byte 0)
+            let space = self.net_notice_space.then(|| fe(18101));
+            let bb = Billboard { left: "", right: &fe(18157), hints: Some((&fe(18100), space.as_deref())) };
+            h.notice_sprites(&mut dlg, aspect, &bb, &fe(id));
+            self.scene.sprites.extend(dlg);
         }
         if self.hud_hidden {
             self.scene.sprites.truncate(hud_sprites_from);
@@ -16815,7 +18714,9 @@ impl App {
             model.apply_sky(&mut items, self.sky_map_for(p + (o.vehicle.position - o.vehicle.draw_origin()), o.progress.slice));
             car_items.extend(items);
             let out = o.vehicle.race_state == 3;
-            let slots = Self::lamp_slots(self.track.is_night(), if model.has_headlight_extent() { fade } else { 1.0 }, o.vehicle.brake_lamp(), o.vehicle.gear == 0, (out, out, (self.tick / 32) % 2 == 1), Some(&o.vehicle.damage));
+            // the car's own lamp byte (`car+0xD87`, the night flag at `Car_init`): the indicators too
+            let bits = o.lamp_bits;
+            let slots = Self::lamp_slots(bits & 1 != 0, if model.has_headlight_extent() { fade } else { 1.0 }, o.vehicle.brake_lamp(), o.vehicle.gear == 0, (out || bits & 8 != 0, out || bits & 0x10 != 0, (self.tick / 32) % 2 == 1), Some(&o.vehicle.damage));
             let draws = self.lamp_draws(model, p, r, o.vehicle.ground_h, slots);
             Self::push_lamp_draws(&mut car_items, self.renderer.as_mut(), &self.lamp_pools, &mut lamp_used, draws);
             self.blended_dyn_items.extend(car_items.into_iter().map(|it| (key, it)));
@@ -17810,9 +19711,11 @@ impl App {
                         if self.cheat_bits & (1 << 1) != 0 {
                             self.specs.apply_tinycar();
                         }
-                        // the installed-part list `car+0x768`: no career state here, so the
-                        // record's own stock parts (`specs.rs:49`, 0x4EE9A0's unconditional fit)
-                        self.specs.parts = nfs_physics::specs::stock_parts(&car.stock_parts, &self.fe_parts_table());
+                        // a freshly built catalogue car: its stock parts (0x4EE9A0) and the constructor's
+                        // neutral sliders (0x4EED2D) go through 0x49CB50 like any car's
+                        let table = self.fe_parts_table();
+                        let automatic = self.player_automatic();
+                    nfs_game::career::fold_fresh_car(&mut self.specs, &car.stock_parts, &table, &car.sim_family, automatic);
                         self.snd.sound_set = car.sound_set.clone();
                         self.sim_name = car.sim.clone();
                         self.dials = Some((car.dial_kmh, car.dial_mph, car.dial_tach));
@@ -17921,9 +19824,11 @@ impl App {
                         if self.cheat_bits & (1 << 1) != 0 {
                             self.specs.apply_tinycar();
                         }
-                        // the installed-part list `car+0x768`: no career state here, so the
-                        // record's own stock parts (`specs.rs:49`, 0x4EE9A0's unconditional fit)
-                        self.specs.parts = nfs_physics::specs::stock_parts(&car.stock_parts, &self.fe_parts_table());
+                        // a freshly built catalogue car: its stock parts (0x4EE9A0) and the constructor's
+                        // neutral sliders (0x4EED2D) go through 0x49CB50 like any car's
+                        let table = self.fe_parts_table();
+                        let automatic = self.player_automatic();
+                    nfs_game::career::fold_fresh_car(&mut self.specs, &car.stock_parts, &table, &car.sim_family, automatic);
                         self.snd.sound_set = car.sound_set.clone();
                         self.sim_name = car.sim.clone();
                         self.dials = Some((car.dial_kmh, car.dial_mph, car.dial_tach));
@@ -17963,35 +19868,55 @@ impl App {
                 self.fe.layout_sel = (sel + 1) % controls.len();
                 self.fe.layout_nav_used = true;
             }
-            // a combo slider edits the accessor it names. APPROXIMATION — the port's own keys
-            // (§4.171.8): no key or pad button steps a combo in the original. A key is a type-2
+            // A key reaches **no combo** (`controls.md` §4.171.8, CONFIRMED). A key is a type-2
             // event; 0x5289B0 hands it to the capture or the widget under the pointer, whose
-            // slot 3 0x525F80 sends type 2 to slot 4, and `FeComboBox`'s / `NFS5.ColorBox`'s
-            // slot 4 is 0x4D1B40 (`xor al, al; ret 4`); the front end's own slot 4 0x4D2970
-            // knows ESC, `b` and `=` alone, and no pad reaches the front end (§4.169.5). The
-            // wrapping pair 0x4BC660 / 0x4BC690 is reached by the caption-strip release
-            // (slot 21 only) and by `NFS5.AccessorIterator`'s two buttons (0x4BCE00, no
-            // shipped widget); Left / Right here step by `set_accessor(∓1)`.
-            MenuKey::Left | MenuKey::Right => {
-                let delta = if key == MenuKey::Left { -1 } else { 1 };
-                if let Some(a) = controls[sel].accessor.clone() {
-                    self.set_accessor(&a, delta);
-                    self.bind_after_accessor();
-                }
-            }
+            // slot 3 0x525F80 sends type 2 to slot 4, and `FeComboBox`'s (0x5B5C24 + 0x10) and
+            // `NFS5.ColorBox`'s (0x5B5BA8 + 0x10) slot 4 is 0x4D1B40 (`xor al, al; ret 4`); the
+            // front end's own slot 4 0x4D2970 knows ESC, `b` and `=` alone, and no pad reaches the
+            // front end (§4.169.5). The wrapping pair 0x4BC660 / 0x4BC690 is reached by the
+            // caption-strip release (slot 21 only, `combo_strip_release`) and by
+            // `NFS5.AccessorIterator`'s two buttons (0x4BCE00, no shipped widget). The port's
+            // earlier Left / Right stepping of a combo through `set_accessor(∓1)` was its own
+            // invention and is **removed** (NH, 2026-10-02): a combo ignores both keys.
+            //
+            // **And no other class steps its accessor by a key either** (NM, read 2026-09-30,
+            // `controls.md` §4.171.8): the slot 4 (vtable `+0x10`) of every accessor-bearing class in the
+            // shipped layouts is 0x4D1B40, the same `xor al, al; ret 4` — `NFS5.AccessorWatch`,
+            // `WORDWRAPACCESSORWATCH`, `CARSETTINGBUTTON`, `CarSettingSlider`, `GouraudIndicatorBar`,
+            // `ListBox`, `CarLogo`, `3DCAR`, `CHATDISPLAYBOX`, `CHRONICLESLIDER` — except the four that
+            // take **characters**: `NFS5.INPUTBOX` / `CHARVECTACCESSORINPUTBOX` (0x4CCC20, 0x4C2120,
+            // 0x525A90), `CHATINPUTBOX` (0x4C3310: Enter, else 0x4CCC20) and `CONTROLLERSETUP`
+            // (0x51C610: the pressed key becomes the binding). None of them reads a Left / Right as a
+            // step. So the two arrows do nothing on a layout screen; the accessors move through the
+            // widgets' own mouse slots (`combo_strip_release`, the drop-down, the list's rows, the sliders'
+            // drags) and the front end's key slot 4 0x4D2970 knows ESC, `b` and `=` alone.
+            MenuKey::Left | MenuKey::Right => {}
             MenuKey::Enter => {
                 let c = controls[sel].clone();
                 // the network screens' own callbacks. What the original's handlers behind
                 // `ID_COMMSSERVERSCREEN` and friends do has not been read; these do what the
                 // protocol of `network.md` §7 allows and nothing more.
-                if self.net.lobby.is_some()
+                // (`READY` and `EJECTPLAYER` belong to the lobby screens, where the browsing lobby
+                // is gone and the session is what is open)
+                // `accountlogin.lay`'s three (`FEMainScreen`, registered 0x510034 / 0x50C5B1 / 0x510045)
+                if let Some(cb) = c.callback.as_deref()
+                    && matches!(cb, "SIGNON" | "CLEARACCOUNTINFO" | "REGISTERUSER")
+                    && self.fe.layout_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("accountlogin"))
+                {
+                    self.account_callback(cb, event_loop);
+                    return;
+                }
+                if (self.net.lobby.is_some() || self.net.session.is_some())
                     && let Some(cb) = c.callback.as_deref()
                     && matches!(
                         cb,
                         "CREATE" | "JOIN" | "CONNECT" | "DIAL" | "ENTER" | "EJECTPLAYER" | "READY"
                     )
                 {
-                    self.network_callback(cb, event_loop);
+                    // a button the screen's tick has disabled (0x50D880) takes no press
+                    if !l.widget_disabled(c.index) {
+                        self.network_callback(cb, event_loop);
+                    }
                     return;
                 }
                 // `parts.lay`'s and `advancedrepair.lay`'s five each, unless the button is off
@@ -18481,7 +20406,7 @@ impl App {
                         self.start_tournament_from_layout(event_loop);
                         return;
                     }
-                    self.start_from_layout(event_loop);
+                    self.fe_start_game(event_loop);
                     return;
                 }
                 let Some(dest) = c.destination else { return };
@@ -18891,6 +20816,14 @@ impl App {
     /// 0x4B8B50, is `begin == end`). `ID_CONTINUEBUTTON`'s is gated on a local the slot-0x6C call
     /// never writes — it returns with a plain `ret` over the argument pushed for it — so what it
     /// sees is left to a running original (AUDIT.md §E) and the button is left as it stands.
+    /// One printable key into input box `i`: the key as the byte `WM_CHAR` would have delivered
+    /// (`nfs_formats::locale::typed_char`), then the box's own filter (0x4CCC20 / 0x4BCA90,
+    /// `LayoutScreen::type_char`). Shared by the real keyboard path and `NFS_FE_KEYS=keys:…`.
+    fn fe_input_key(&mut self, i: usize, c: char) -> bool {
+        let Some(c) = nfs_formats::locale::typed_char(c) else { return false };
+        self.fe.layout_preview.as_mut().is_some_and(|l| l.type_char(i, c))
+    }
+
     fn bind_player_buttons(&mut self) {
         let Some(l) = self.fe.layout_preview.as_mut() else { return };
         let named = l.widgets_named(&["ID_CREATEPLAYEROKBUTTON", "ID_REMOVEBUTTON"]);
@@ -18918,55 +20851,214 @@ impl App {
     /// since what the original's server list connects *to* is the lobby service of §1.
     fn network_callback(&mut self, cb: &str, _event_loop: &ActiveEventLoop) {
         let opened = match cb {
-            "CREATE" => self.net.lobby.as_ref().map(|l| l.create()),
-            "JOIN" | "CONNECT" => self.net.lobby.as_ref().map(|l| l.connect()),
+            // `CREATE` on the games screens (0x509E40, registered at 0x509D53 for `local` and
+            // `udpip`) raises the game-name dialog; on the peer-to-peer screen (0x50B140) it goes
+            // straight to 0x509A00 with `Comms.GameName`'s text as it stands
+            "CREATE" if self.fe.layout_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("modem")) => {
+                // 0x50AFA0: `0x48E1A0(net, 2, 0, 0)`, `[this+0x294] = 0`, then 0x509A00(ModemList's index) — a game
+                // over the modem; unreachable without a modem (`ID_MODEMCREATEGAME` is disabled, `net_browse_step`)
+                tracing::info!("CREATE on the modem screen (0x50AFA0): no modem transport in this port");
+                return;
+            }
+            "CREATE" => {
+                let p2p = self.fe.layout_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("peertopeerip"));
+                let stored = std::fs::read_to_string(netplay::game_name_path()).unwrap_or_default().trim().to_string();
+                if p2p {
+                    self.net.lobby.as_ref().map(|l| l.create(&stored))
+                } else {
+                    // 0x509E80…0x509F4F: an empty accessor text becomes `sprintf(FEStrings[602], name)`;
+                    // 0x514AB0 copies it into the field (at most 0x19 bytes) and the dialog goes up
+                    // **without** emptying the field (`raise` with 0, 0x514880)
+                    let who = self.player_name.to_string();
+                    let text = if stored.is_empty() {
+                        self.fe.strings.get(602).unwrap_or_default().replacen("%s", &who, 1)
+                    } else {
+                        stored
+                    };
+                    let now = self.fe.layout_preview.as_ref().or(self.fe.layout_bottom.as_ref()).map(|l| l.ticks()).unwrap_or(0);
+                    let prompt = self.fe.strings.get(601).unwrap_or_default().to_string();
+                    let mut d = nfs_game::dialog::Dialog::input(prompt, false, netplay::GAME_NAME_DIALOG_MAX);
+                    d.raise(now);
+                    if let Some(f) = d.field.as_mut() {
+                        f.text = text.chars().take(netplay::GAME_NAME_DIALOG_MAX).collect();
+                    }
+                    self.fe.dialog = Some((d, DialogFor::NetGameName));
+                    return;
+                }
+            }
+            // `JOIN` (`udpip` / `local`): the row of `Comms.GamesList` under the cursor
+            // 0x50B6A0 / 0x50AA80: the row's version (`[entry+0x8C]`) against ours (`net+0x2C`)
+            // first — 822 `IDS_WRONGVERSION` (0x4B9E80) — then its player count against 8 — 286
+            // "the game is full" (0x4B9DA0); only then the connect and the `joingame` screen
+            "JOIN" => {
+                let row = self.net.lobby.as_ref().and_then(|l| l.rows().into_iter().nth(l.sel));
+                if let Some(r) = row.as_ref().filter(|r| r.version != netplay::game_version()) {
+                    tracing::info!(version = %r.version, "JOIN refused: wrong version (0x4B9E80)");
+                    self.fe_raise_dialog(nfs_game::dialog::DialogKind::One, 822, [0, 0], DialogFor::Notice);
+                    return;
+                }
+                if row.as_ref().is_some_and(|r| r.players >= 8) {
+                    tracing::info!("JOIN refused: the game is full (0x4B9DA0)");
+                    self.fe_raise_dialog(nfs_game::dialog::DialogKind::One, 286, [0, 0], DialogFor::Notice);
+                    return;
+                }
+                self.net.lobby.as_ref().and_then(|l| l.join_target().map(|a| l.connect(a)))
+            }
+            // `CONNECT` (0x50B150): the current row of `Comms.IPList`; with the list empty 0x50B1D9
+            // raises `IDS_MUSTHAVEPEERTOPEERADDRESS` (816) and goes nowhere
+            "CONNECT" => {
+                // **APPROXIMATION** (direction: the original's own click handling): the box's
+                // release 0x4C2220 commits a *focused* box's text into the list first, and the
+                // capture rule (§4.57) sends the CONNECT click to the focused box, not to the
+                // button — where the focus latch `[+0x148]` clears was not traced. A player who
+                // typed an address and clicked CONNECT expects it to be used, so the typed text is
+                // committed here exactly as that release would commit it.
+                let typed = self.fe.layout_preview.as_ref().map(|l| l.input_text("Comms.IP")).unwrap_or_default();
+                if let Some(l) = self.net.lobby.as_mut()
+                    && !typed.trim().is_empty()
+                    && l.history.get(l.ip_sel).map(|t| t.as_str()) != Some(typed.trim())
+                {
+                    l.commit_ip(&typed);
+                    self.bind_lists();
+                }
+                match self.net.lobby.as_ref().map(|l| l.connect_target()) {
+                    Some(Some(a)) => self.net.lobby.as_ref().map(|l| l.connect(a)),
+                    Some(None) => {
+                        self.fe_raise_dialog(nfs_game::dialog::DialogKind::One, 816, [0, 0], DialogFor::Notice);
+                        return;
+                    }
+                    None => None,
+                }
+            }
+            // `DIAL` (0x50ADC0): `[this+0x294] = 1`; the number `Comms.PhoneNumber`'s text (slot 4) equal to the
+            // shared empty string 0x5E8E50 → `0x513440(0x337)` = 823 and stop. Otherwise the name and the
+            // modem go to `0x48E1A0(net, 2, ModemList index, number)`: **no transport in this port** (the button
+            // is disabled while `Comms.ModemList` is empty, `net_browse_step`, which it always is here)
             "DIAL" => {
-                tracing::info!("the modem screen has nothing behind it in this port");
+                let number = self.fe.layout_preview.as_ref().map(|l| l.input_text("Comms.PhoneNumber")).unwrap_or_default();
+                if number.is_empty() {
+                    self.fe_raise_dialog(nfs_game::dialog::DialogKind::One, 823, [0, 0], DialogFor::Notice);
+                } else {
+                    tracing::info!(number, "DIAL (0x50ADC0): the modem transport (0x48E1A0 kind 2) has no equivalent in this port");
+                }
                 return;
             }
             // `EJECTPLAYER` is message 0xC6, which only a host can mean — and only once a session
             // is actually running, since the lobby's socket has no peers of its own
             "EJECTPLAYER" => {
-                let slot = self.net.lobby.as_ref().map(|l| l.sel).unwrap_or(0) as u8;
-                match self.net.session.as_mut() {
-                    Some(n) if n.is_host() => {
-                        n.eject(slot + 1);
-                        tracing::info!(slot, "eject sent");
-                    }
-                    _ => tracing::info!("nobody to eject: no session is running here"),
+                // 0x509110: the `Comms.PlayerList` selection's row id (0x4BBB40) goes to 0x48D8A0,
+                // and the selection is cleared (slot 16)
+                let id = self.net.session.as_ref().and_then(|n| {
+                    let empty = String::new();
+                    n.player_sel.and_then(|r| n.players(&empty).get(r).map(|p| p.1))
+                });
+                if let (Some(id), Some(n)) = (id, self.net.session.as_mut()) {
+                    let sent = n.eject(id);
+                    n.player_sel = None;
+                    tracing::info!(id, sent, "eject (0x509110)");
+                    self.bind_lists();
                 }
                 return;
             }
-            // what the original's READY does has not been read
+            // 0x50A300 (`netlobby`)
             "READY" => {
-                tracing::info!("READY has no traced handler");
+                self.net_ready_callback();
                 return;
             }
             _ => {
-                // ENTER on the server list: take the row under the cursor as the address to use
-                if let Some(l) = self.net.lobby.as_mut() {
-                    l.ip = l.target().map(|a| a.to_string()).unwrap_or_default();
+                // ENTER on the server list (`serverlist.lay`): the original connects to the lobby
+                // service (§1), which is not reproduced. **APPROXIMATION** (direction: what the
+                // list is *for*): the port's server list shows the LAN sessions, so ENTER joins
+                // the row under the cursor, as `JOIN` does on the games screen.
+                let joined = self.net.lobby.as_ref().and_then(|l| l.join_target().map(|a| l.connect(a)));
+                if let Some(r) = joined {
+                    self.open_network_session("ENTER", r);
                 }
-                self.bind_lists();
-            self.bind_checks();
                 return;
             }
         };
-        match opened {
-            Some(Ok(mut n)) => {
+        if let Some(r) = opened {
+            self.open_network_session(cb, r);
+        }
+    }
+
+    /// A session opened by `CREATE` / `JOIN` / `CONNECT`: keep it and open the lobby screen.
+    fn open_network_session(&mut self, cb: &str, r: anyhow::Result<netplay::NetPlay>) {
+        match r {
+            Ok(mut n) => {
                 let host = n.is_host();
                 tracing::info!(cb, host, "network session open");
                 n.positional = self.net.lobby.as_ref().is_none_or(|l| l.positional);
                 self.net.session = Some(n);
+                self.net.join_notified = false;
+                self.net.lobby_sent = false;
+                self.net.lobby_car = None;
                 // one seat per player the session can hold, minus ourselves
                 if self.num_opponents == 0 {
                     self.num_opponents = 1;
                 }
+                // **CONNECT** (0x50B150) does not leave the screen: it sets `[this+0x288]` and the peer-to-peer
+                // screen's tick 0x50B270 opens `joingame` once the link is up (`net_browse_step`); 817 «Connecting…»
+                // (0x509550, state 3) stays up meanwhile
+                if cb == "CONNECT" {
+                    self.net.connect_pending = true;
+                    self.net.connect_opened = false;
+                    return;
+                }
                 // 0x50A0DB / 0x50AB31: the lobby screen, not the race — `0x4D2100(name, 0, 1)`
                 self.fe_open(if host { "creategame" } else { "joingame" }, 0, true);
             }
-            Some(Err(e)) => tracing::warn!(cb, error = %e, "cannot open the network session"),
-            None => {}
+            Err(e) => tracing::warn!(cb, error = %e, "cannot open the network session"),
+        }
+    }
+
+    /// `NFS5.CHARVECTACCESSORINPUTBOX`'s Return (see the key handler): commit the box and, for
+    /// `Comms.IP`, put its text at the front of `Comms.IPList`.
+    fn fe_charvect_return(&mut self, i: usize) {
+        if let Some((name, text)) = self.fe.layout_preview.as_mut().and_then(|l| l.commit_input(i)) {
+            if name == "Comms.IP"
+                && !text.is_empty()
+                && let Some(lobby) = self.net.lobby.as_mut()
+            {
+                lobby.commit_ip(&text);
+            }
+            tracing::info!(accessor = %name, value = %text, "list input box committed");
+            self.bind_lists();
+        }
+    }
+
+    /// `Comms.IPList`'s selection moves to `row`; the string box beside it takes the row's text
+    /// (0x4C2310: while the box is not focused and its string differs from the list's, it is
+    /// cleared and set to the list's).
+    fn pick_ip_row(&mut self, row: usize) {
+        let Some(text) = self.net.lobby.as_mut().and_then(|l| l.pick_ip(row)) else { return };
+        if let Some(l) = self.fe.layout_preview.as_mut() {
+            l.clear_input("Comms.IP");
+            l.type_into("Comms.IP", &text);
+        }
+        self.bind_lists();
+    }
+
+    /// One scripted left click at design point `(x, y)` (tooling: `NFS_FE_CLICKS`, and the
+    /// `click:x,y` token of `NFS_FE_KEYS`, which runs in order with the `keys:` around it).
+    fn fe_scripted_click(&mut self, x: f32, y: f32, event_loop: &ActiveEventLoop) {
+        self.fe.cursor = Some((x, y));
+        if let Some(l) = self.fe.layout_preview.as_mut() {
+            l.script_cursor(Some((x, y)));
+            // let any transition finish and the hover settle, as a player's pointer would have
+            for _ in 0..60 {
+                l.advance_transition(16);
+            }
+        }
+        let before = self.fe.layout_preview.as_ref().map(|l| (l.hovered(), l.open_combo(), l.combo_row_at(x, y)));
+        self.fe_left_button(event_loop, true);
+        self.fe_left_button(event_loop, false);
+        let after = self.fe.layout_preview.as_ref().map(|l| (l.hovered(), l.open_combo()));
+        tracing::info!(x, y, ?before, ?after, open = ?self.fe.layout_open_combo, "NFS_FE_CLICKS click");
+        for _ in 0..4 {
+            if let Some(l) = self.fe.layout_preview.as_mut() {
+                l.advance_transition(16);
+            }
         }
     }
 
@@ -19079,6 +21171,7 @@ impl App {
         let pads = self.fe_pads();
         // `Camera.Current` — the slot `NFS5.CAMERASELECT` highlights (§4.89)
         let cam_cur = self.fe.camera_current;
+        let cam_list = self.fe.camera_list;
         self.fe_room_tick(dt_ms);
         // 0x4D2570 advances **every** layer's screen (+0x80, 0x4D25EB, bottom first), not only
         // the top one: a covered screen still finishes its fade — and the bar and the layers
@@ -19098,6 +21191,7 @@ impl App {
             }
             l.set_pads(pads, self.fe.pads_sel);
             l.set_camera_current(cam_cur);
+            l.set_camera_list(cam_list);
         }
         // the bottom bar is a screen of its own (0x4D39D3) and its four buttons hover and animate
         // like any other (§4.53), so it needs the clock and the pointer too. Its transition moves
@@ -19169,6 +21263,21 @@ impl App {
         // `net_step` being idle — the room's players and chat arrive this way
         if self.vehicle.is_none() && self.net.session.as_mut().is_some_and(|n| n.poll_lobby()) {
             self.bind_lists();
+        }
+        self.net_lobby_step();
+        if self.vehicle.is_none() && self.race.is_none() {
+            self.net_sync_options();
+        }
+        // the comm state machine's notices (0x509550), from the screens' ticks
+        self.comm_tick();
+        // and each comms screen's own tick rules (0x50AB40, 0x50B760, 0x50B4E0, 0x50B270, 0x50AEF0)
+        self.net_browse_step();
+        // the host's `0xB3` (0x48F82F) came in on a lobby screen: 0x48F853 clears `[net+0xBC]`, and
+        // the screen's tick then calls its slot 53 — PLAYGAME's own handler 0x50CE90 — when that
+        // byte is 0 (0x50A8C3…0x50A8E1 on the join screen, the same tail on the others). The launch
+        // itself needs the event loop, so it waits for the caller below.
+        if self.vehicle.is_none() && self.race.is_none() && self.net.session.as_mut().is_some_and(|n| n.take_start()) {
+            self.net.start_due = true;
         }
         // a network screen probes once a second and refills its lists from the answers
         if self.net.lobby.is_some() {
@@ -19367,9 +21476,11 @@ impl App {
                     self.specs.parts = nfs_game::career::installed_parts(&parts, Some(o));
                     self.specs.apply_setup(&o.setup, self.player_automatic());
                 } else {
-                    // no owned/career state: the record's own stock parts (`specs.rs:49`,
-                    // 0x4EE9A0's unconditional fit, same as any other non-career race)
-                    self.specs.parts = nfs_physics::specs::stock_parts(&car.stock_parts, &self.fe_parts_table());
+                    // no owned/career state: a freshly built catalogue car — its stock parts
+                    // (0x4EE9A0) and the constructor's neutral sliders (0x4EED2D) through 0x49CB50
+                    let table = self.fe_parts_table();
+                    let automatic = self.player_automatic();
+                    nfs_game::career::fold_fresh_car(&mut self.specs, &car.stock_parts, &table, &car.sim_family, automatic);
                 }
                 self.snd.sound_set = car.sound_set.clone();
                 self.sim_name = car.sim.clone();
@@ -19460,11 +21571,22 @@ impl App {
                 }
                 // the purchased parts, then the setup sliders — the order 0x49CB50 runs
                 // them in, and both of them before anything reads the block
-                let grip_ratio = self
-                    .specs
-                    .apply_parts(&req.parts.iter().collect::<Vec<_>>(), &car.sim_family);
+                // A car with no garage record behind it and no parts of its own (the era finale's
+                // loaned prize car) is a freshly built `FECar`: its stock parts (0x4EE9A0) and the
+                // neutral sliders (0x4EED2D) go through 0x49CB50 — `fold_fresh_car`.
+                let fresh_stock = req.parts.is_empty()
+                    && self.career.as_ref().is_some_and(|cu| cu.pending.as_ref().is_none_or(|p| p.garage_idx.is_none()));
+                let grip_ratio = if fresh_stock {
+                    0.0
+                } else {
+                    self.specs.apply_parts(&req.parts.iter().collect::<Vec<_>>(), &car.sim_family)
+                };
                 tracing::debug!(parts = req.parts.len(), grip_ratio, "parts applied");
-                if let Some(cu) = &self.career {
+                if fresh_stock {
+                    let table = self.fe_parts_table();
+                    let automatic = self.player_automatic();
+                    nfs_game::career::fold_fresh_car(&mut self.specs, &car.stock_parts, &table, &car.sim_family, automatic);
+                } else if let Some(cu) = &self.career {
                     // the installed-part list `car+0x768` the damage getters walk, each part
                     // with its own zone mask and the damage it carries from earlier races
                     let owned = cu
@@ -19476,12 +21598,11 @@ impl App {
                         &req.parts.iter().collect::<Vec<_>>(),
                         owned,
                     );
-                    if let Some(owned) = owned {
-                        // …and the car-setup screen's seventeen sliders reach the block
-                        // here, as 0x49D290 folds them in out of the per-player record.
-                        // `automatic` is `carinfo+0xC`, the manual ×1.05 of 0x49D733
-                        self.specs.apply_setup(&owned.setup, self.player_automatic());
-                    }
+                    // …and the car-setup screen's seventeen sliders reach the block
+                    // here, as 0x49D290 folds them in out of the per-player record — the owned
+                    // car's own, else the constructor's neutral ones (a mission's car is a fresh
+                    // `FECar`, 0x4EED2D). `automatic` is `carinfo+0xC`, the manual ×1.05 of 0x49D733
+                    self.specs.apply_setup(owned.map_or(&nfs_game::career::CAR_SETUP_DEFAULT, |o| &o.setup), self.player_automatic());
                 }
                 self.snd.sound_set = car.sound_set.clone();
                 self.sim_name = car.sim.clone();
@@ -19554,6 +21675,369 @@ impl App {
         true
     }
 
+    /// The four `Track1.*` accessors as the option table names them (`network.md` §11.6):
+    /// `TRACKLOCALEID0` 0xC (the track record's `+4` name id), `TRACKDIRECTION0` 0xD (the direction
+    /// row, `REVERSE + 2·MIRROR`), `TRACKTRAFFIC0` 0xE (the traffic row) and `TRACKLAPS0` 0xF (the
+    /// laps row, laps − 1), with whether the track is a circuit (`trk+0x6E`, which 0x509B00 asks
+    /// before it reads the laps row).
+    fn net_track_options(&self) -> Option<([(u32, u32); 4], bool)> {
+        let m = self.fe.menu.as_ref()?;
+        let t = self.fe.track_tables.tracks.iter().find(|r| r.file.eq_ignore_ascii_case(m.track()))?;
+        let dir = usize::from(m.backwards) | (usize::from(m.mirror) << 1);
+        Some((
+            [
+                (0xC, t.name_string_id),
+                (0xD, dir as u32),
+                (0xE, m.traffic.min(3)),
+                (0xF, m.laps.clamp(1, LAPS_MAX) - 1),
+            ],
+            t.circuit,
+        ))
+    }
+
+    /// The front end's half of the option records, once per tick on a lobby screen
+    /// (`network.md` §11.6).
+    ///
+    /// **Host.** `Track1.Track`, `.Direction` and `.Laps` are mode-2 accessors: a selection change
+    /// sends `(id, value)` as a `0xBC` (0x4BC240 → 0x4B7F70 → slot 1 → 0x48D550); the
+    /// port sends when the value differs from what was last sent (the first look only records it,
+    /// the original's accessors are set up before any session exists). `Track1.Traffic` is mode 0
+    /// and goes with the launch only. The session's own descriptor (what a browser's `'d'` shows,
+    /// 0x509B00) follows the same accessors.
+    ///
+    /// **Player.** The records that came (0x48F998 → 0x4B4B80 writes the option table) are what
+    /// the launch reads: `TRACKLOCALEID0` selects the track record whose `+4` is that id — the
+    /// first when none is (0x4FBF70's rule for a machine that does not host, `hud.md`) —, the rest
+    /// are the direction / traffic / laps rows.
+    fn net_sync_options(&mut self) {
+        let Some(host) = self.net.session.as_ref().map(|n| n.is_host()) else { return };
+        if host {
+            let Some((opts, circuit)) = self.net_track_options() else { return };
+            let positional = self.net.session.as_ref().is_some_and(|n| n.positional);
+            let Some(n) = self.net.session.as_mut() else { return };
+            for (id, v) in [opts[0], opts[1], opts[3]] {
+                n.sync_option(id, v);
+            }
+            // 0x509B00: laps' row only on a circuit, the direction's slot 27 (`0x5B963C[row]`), the
+            // track's name id
+            n.set_descriptor(
+                u8::from(positional),
+                if circuit { opts[3].1 as u8 } else { 0 },
+                DIRECTION_OPTIONS[opts[1].1 as usize & 3] as u16,
+                opts[0].1 as u16,
+            );
+            return;
+        }
+        let Some(got) = self.net.session.as_mut().map(|n| n.take_options()).filter(|g| !g.is_empty()) else { return };
+        let Some(m) = self.fe.menu.as_mut() else { return };
+        for (id, v) in got {
+            match id {
+                0xC => {
+                    let at = self.fe.track_tables.tracks.iter().position(|r| r.name_string_id == v);
+                    let file = at.map(|i| self.fe.track_tables.tracks[i].file.clone());
+                    m.track_idx = file
+                        .and_then(|f| m.tracks.iter().position(|t| t.eq_ignore_ascii_case(&f)))
+                        .unwrap_or(0);
+                }
+                0xD => {
+                    m.backwards = v & 1 != 0;
+                    m.mirror = v & 2 != 0;
+                }
+                0xE => m.traffic = v.min(3),
+                0xF => m.laps = (v + 1).min(LAPS_MAX),
+                _ => {}
+            }
+        }
+        self.bind_lists();
+        self.bind_checks();
+    }
+
+    /// `PLAYGAME` from the front end: in a hosted network game the host's room announces the start
+    /// to the players first (0x48BF10, `0xB3`), then the launch goes on as any other, with 0x4B4DA0's
+    /// network half (`net_launch_sync`) in front of it. **The order is the original's**: `0xB3`, then
+    /// the stream (`0xBC`), then the barrier (`0xBD`).
+    fn fe_start_game(&mut self, event_loop: &ActiveEventLoop) {
+        // the original's order (`network.md` §11.7): the room's `0xB3` (0x48BF10) first, then each
+        // machine's launch - 0x4B4DA0 sends the stream and runs the barrier 0x48D6A0
+        if !self.net_playgame() {
+            return;
+        }
+        self.net_launch_sync();
+        self.start_from_layout(event_loop);
+    }
+
+    /// The host's launch settings as 0x4ED5D0's chain would build them for a network game.
+    fn net_launch_settings(&self) -> Option<nfs_net::options::LaunchSettings> {
+        let m = self.fe.menu.as_ref()?;
+        let t = self.fe.track_tables.tracks.iter().find(|r| r.file.eq_ignore_ascii_case(m.track()))?;
+        let positional = self.net.session.as_ref().is_some_and(|n| n.positional);
+        // `Comms.Collision`'s row 0 is "off" (FEStrings 1500)
+        let collision = self.choices.get("Comms.Collision").copied().unwrap_or(0);
+        let players = self.net.session.as_ref().map_or(1, |n| n.room_len().max(1)) as u32;
+        let mut s = nfs_net::options::LaunchSettings {
+            players,
+            traffic: Vec::new(),
+            positional: u32::from(positional),
+            direction_row: (usize::from(m.backwards) | (usize::from(m.mirror) << 1)) as u32,
+            laps_row: m.laps.clamp(1, LAPS_MAX) - 1,
+            track_name_id: t.name_string_id,
+            traffic_row: m.traffic.min(3),
+            playlist: self.current_playlist(),
+            skill: u32::from(m.difficulty.min(2)),
+            damage: u32::from(m.damage),
+            track: m.track().to_string(),
+            linear: !t.circuit,
+            laps: fe_laps(&m.circuits, m.track(), m.laps),
+            traffic_cars: TRAFFIC_COUNT[m.traffic.min(3) as usize],
+            nocollision: positional && collision == 0,
+            derby: false,
+            // 0x4ED5D0: `0x4D8790(0)` → `RALLY` 0x19, `0x4D8790(8)` → `HEAVY` 0x1A, each `1` and only when set
+            rally: self.cheat_bits & 1 != 0,
+            heavy: self.cheat_bits & (1 << 8) != 0,
+            own_car: Vec::new(),
+        };
+        // the "Smash Up" cheat (cheat bit 7): 0x4ED7D9…0x4ED841 sets `DERBY`, the skid pad, damage on,
+        // `NOCOLLISION` off and `LINEAR_TRACK` 0 after the mode's own options — so the stream the host's
+        // launch sends says so (`derby_track`, `network.md` §11.18)
+        if self.cheat_bits & (1 << 7) != 0 {
+            s.derby = true;
+            s.track = "skidpad".to_string();
+            s.linear = false;
+            s.damage = 1;
+            s.nocollision = false;
+        }
+        s.traffic = self.net_traffic_cars(&s.track, s.traffic_kept());
+        Some(s)
+    }
+
+    /// The traffic cars 0x4ECF00 builds for a network game, as their per-slot records
+    /// (0x4ED4E0…0x4ED56E → 0x4EEDA0, kind 4): car `k` is the track record's `trk+0x7C[k % 7]`
+    /// (`.FILENAME`, `.FEMULTIPLAYERCARNAME`), painted with the model's first paint set (the
+    /// colour the port's traffic wears — the original draws four colour bytes from 0x538040 per
+    /// car, `car-model.md` "Race_setCars"; **APPROXIMATION**, the port has never drawn them).
+    fn net_traffic_cars(&self, track: &str, count: u32) -> Vec<nfs_net::options::TrafficCar> {
+        let trk = std::fs::read(self.paths.fe_data().join("Data").join("nfs5.trk"))
+            .ok()
+            .and_then(|d| nfs_formats::career::parse_track_table(&d).ok())
+            .unwrap_or_default();
+        let ids: Vec<u16> = trk
+            .iter()
+            .find(|r| r.file.eq_ignore_ascii_case(track))
+            .map(|r| r.traffic_cars.iter().copied().filter(|i| *i != 0).collect())
+            .unwrap_or_default();
+        let catalog = self.fe_car_catalog();
+        (0..count as usize)
+            .filter_map(|k| {
+                let e = catalog.iter().find(|c| Some(&c.id) == ids.get(k % ids.len().max(1)))?;
+                let [r, g, b] = e.paint_sets.first().map(|p| p.colours[0]).unwrap_or([0x8C, 0x8C, 0x90]);
+                Some(nfs_net::options::TrafficCar {
+                    model: e.model.clone(),
+                    name: e.display_name.chars().map(|c| if (c as u32) < 256 { c as u8 } else { b'?' }).collect(),
+                    colour: 0xFF00_0000 | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b),
+                })
+            })
+            .collect()
+    }
+
+    /// **0x4B4DA0's network half**, run by every machine once the front end has handed over: the
+    /// host sends the launch stream (0x48D490 / 0x48D440) and draws the grid (0x4B4FD0), then all
+    /// run the barrier 0x48D6A0, after which a player's table holds the host's records. What the
+    /// launch settled goes to `net.race`, which `start_from_layout` reads.
+    fn net_launch_sync(&mut self) {
+        let host = self.net.session.as_ref().is_some_and(|n| n.is_host());
+        let mut settings = if host { self.net_launch_settings() } else { None };
+        // 0x4EEDA0's record for the player (kind 1) — every machine builds it and the walk sends it
+        let own_car = self.net_own_launch_car();
+        let Some(n) = self.net.session.as_mut() else { return };
+        // 0x4B4E28 — 0x48D3D0: the barrier, then every player's finish time and race index back to −1
+        n.launch_begin();
+        // `n` (`ebx` of 0x4B4DA0, the players loop 0x4B4EA7…0x4B4ED9): the players `net+0xE5` marks,
+        // not the room's count — 0x4B5079 stores it as NUMPLAYERRACECARS
+        let players = n.race_indices().len().max(1) as u32;
+        // the own-slot arm of the walk (0x4B4F25…0x4B4F66): the slot rewritten to the race index
+        let own_recs = own_car.as_ref().map(|c| n.own_launch_records(c)).unwrap_or_default();
+        if let Some(s) = settings.as_mut() {
+            s.own_car = own_recs.clone();
+        } else {
+            // a player's walk sends only its own slot's records (the host's broadcast bands are not its)
+            n.send_launch(&own_recs);
+        }
+        let settings = settings;
+        if let Some(s) = settings.as_ref() {
+            // 0x4B6660 builds the list from `fe.txt` and the launch chain appends after it; 0x4B6560
+            // keeps the last record of an id (`nfs_net::options::broadcast_stream`)
+            let fe_text = std::fs::read_to_string(self.paths.root.join("fe.txt")).unwrap_or_default();
+            let fe_recs = nfs_net::options::fe_txt_records(&fe_text);
+            let mut stream = nfs_net::options::broadcast_stream(&fe_recs, &s.stream());
+            // the launch chain's own `rand()` draws come first: 0x4EEDA0 starts every car's record
+            // with one (0x4EEDAC) — the player's (0x4EBA4D) and each kept traffic car's
+            // (0x4ED56E), none for opponents or cops in a network game
+            for _ in 0..1 + s.traffic_kept() {
+                self.crt_rand.next();
+            }
+            // 0x4B4FD0…0x4B5043: `rand() % left` out of what is left of `0…n−1`, on the C runtime's
+            // own generator (`App::crt_rand`)
+            let crt = &mut self.crt_rand;
+            let grid = nfs_net::options::grid_draw(players, || crt.next() as u32);
+            n.note_grid(&grid);
+            stream.extend(grid);
+            n.send_launch(&stream);
+        }
+        use nfs_net::options::id as opt;
+        let passed = n.launch_barrier();
+        // the records' slot is the **race index** — `player+0x4C`, the player's place in the room's
+        // list among those in the race (0x4B4EBC, 0x4B4ED2) — not the player id
+        let index = n.race_indices();
+        // `player+0x4C` / `[0x65741C]`, which 0x490140 (the link classification) and the seats read
+        n.note_race_indices(&index);
+        let me = index.iter().find(|(id, _)| *id == n.my_player_id()).map_or(0, |(_, i)| *i);
+        let got = n.launch.clone();
+        let own = settings.as_ref();
+        // the host's values are its own settings; a player's are the records it heard (the
+        // barrier has run, so the host's stream is in), falling back on its own menu
+        let m = self.fe.menu.as_ref();
+        let race = NetRace {
+            track: got.track.clone().or_else(|| own.map(|s| s.track.clone())),
+            laps: got.laps.or(own.map(|s| s.laps)).unwrap_or_else(|| m.map_or(1, |m| m.laps)),
+            backwards: got.reverse.or(own.map(|s| s.direction_row & 1)).map_or(m.is_some_and(|m| m.backwards), |v| v != 0),
+            mirror: got.mirror.or(own.map(|s| (s.direction_row >> 1) & 1)).map_or(m.is_some_and(|m| m.mirror), |v| v != 0),
+            damage: got.damage.or(own.map(|s| s.damage)).map_or(m.is_none_or(|m| m.damage), |v| v != 0),
+            skill: got.skill.or(own.map(|s| s.skill)).unwrap_or(1).min(2) as u8,
+            traffic_cars: got.num_cars.map_or_else(|| own.map_or(0, |s| s.traffic_kept()), |c| c.saturating_sub(nfs_net::options::PLAYER_SLOTS)),
+            positional: got.positional.or(own.map(|s| s.positional)).is_none_or(|v| v != 0),
+            nocollision: got.nocollision.or(own.map(|s| u32::from(s.nocollision))).is_some_and(|v| v != 0),
+            derby: got.derby.or(own.map(|s| u32::from(s.derby))).is_some_and(|v| v != 0),
+            rally: got.rally.or(own.map(|s| u32::from(s.rally))).is_some_and(|v| v != 0),
+            heavy: got.heavy.or(own.map(|s| u32::from(s.heavy))).is_some_and(|v| v != 0),
+            players,
+            opponents: got.num_opponent_cars.or(own.map(|_| 0)).unwrap_or(0),
+            // `Grid_slot` 0x410580 takes the drawn value as `g` itself (0-based here, so the value 0
+            // sits one row ahead of the pole `g = 1`); `grid_pos` is `g − 1`, the 0 as `u32::MAX`
+            grid: got.grid.get(&me).map(|g| g.wrapping_sub(1)),
+            seat_grids: index
+                .iter()
+                .filter(|(id, _)| *id != n.my_player_id())
+                .map(|(_, i)| got.grid.get(i).map(|g| g.wrapping_sub(1)))
+                .collect(),
+            playlist: got.playlist.clone(),
+            seat_cars: n.remote_cars().into_iter().map(|(_, _, _, c)| c).collect(),
+            // this machine's own record is in `launch.cars[me]` too (`own_launch_records`), so index
+            // 0 is whoever holds it — the record the walk's relay delivered, or our own
+            camera0: got.cars.get(&0).and_then(|c| c.array(nfs_net::launchcar::id::CAMERA)),
+            own_words: got.cars.get(&me).map(|c| c.words.iter().map(|(i, w)| (*i, w.clone())).collect()).unwrap_or_default(),
+            traffic: if host { own.map(|s| s.traffic.clone()).unwrap_or_default() } else { got.traffic.values().cloned().collect() },
+            fe_txt: [("rand_seed", opt::RAND_SEED), ("time", opt::TIME), ("weather", opt::WEATHER), ("fog", opt::FOG)]
+                .into_iter()
+                .filter_map(|(k, id)| got.number(id).map(|v| (k, v)))
+                .collect(),
+        };
+        tracing::info!(target: "netplay", host, passed, ?race, "network launch settled (0x4B4DA0)");
+        self.net.race = Some(race);
+    }
+
+    /// The settled network race onto the launch's own set-up (`start_from_layout`'s arms have just
+    /// read the menu): the same fields the original's `0x4B4B80` writes from the stream. Returns
+    /// the track to load.
+    fn net_race_apply(&mut self, track: String) -> String {
+        // a live race is not a replay of one
+        self.replay_net = None;
+        let Some(r) = self.net.race.take() else {
+            // every session re-reads `fe.txt` (0x4B6C1C): nothing a network launch wrote stays
+            self.net_traffic.clear();
+            self.net_derby = false;
+            self.net_flags = None;
+            self.net_fe_txt.clear();
+            self.net_nocollision = false;
+            self.net_seat_grids.clear();
+            self.net_seat_cars.clear();
+            self.net_own_words.clear();
+            return track;
+        };
+        self.backwards = r.backwards;
+        self.mirror = r.mirror;
+        self.num_laps = r.laps.max(1);
+        // a Smash Up has no laps: the knockout arm ends every path of 0x416310 before the lap code
+        // (0x4164C0). **APPROXIMATION:** the port's lap counter is kept out of the way by a count no
+        // race reaches, where the original never runs it.
+        if r.derby {
+            self.num_laps = 99;
+        }
+        self.road.damage_on = r.damage;
+        self.race_skill = r.skill;
+        // 0x4ECF00: no cops, `nOpp` 0 in a network game; the humans are the room's players
+        // (0x4B5079's `NUMPLAYERRACECARS = ebx`), one of which is this machine
+        self.road.cops_race = false;
+        self.road.cops_enabled = false;
+        self.road.traffic_count = r.traffic_cars;
+        self.road.traffic_ids = None;
+        self.road.traffic_colours.clear();
+        // **the traffic cars' records** (0x4B4B80 wrote the host's `.FILENAME` / `.COLOUR` per
+        // slot): the model each is, by file name, and the colour where it is not the model's own
+        if !r.traffic.is_empty() {
+            let catalog = self.fe_car_catalog();
+            let (mut ids, mut colours) = (Vec::new(), Vec::new());
+            for c in &r.traffic {
+                let Some(e) = catalog.iter().find(|e| e.model.eq_ignore_ascii_case(&c.model)) else {
+                    tracing::warn!(model = c.model, "network traffic car: no such model in this install");
+                    continue;
+                };
+                let own = e.paint_sets.first().map(|p| p.colours[0]).unwrap_or([0x8C, 0x8C, 0x90]);
+                let got = [(c.colour >> 16) as u8, (c.colour >> 8) as u8, c.colour as u8];
+                ids.push(e.id);
+                colours.push((got != own).then_some(got));
+            }
+            let own: Vec<String> = self.net_traffic_cars(r.track.as_deref().unwrap_or(&track), r.traffic.len() as u32).into_iter().map(|c| c.model).collect();
+            tracing::info!(target: "netplay", traffic = ?r.traffic.iter().map(|c| (c.model.as_str(), format!("{:08X}", c.colour))).collect::<Vec<_>>(), own_table_says = ?own, "network race: the traffic cars of the host's records");
+            if !ids.is_empty() {
+                self.road.traffic_ids = Some(ids);
+                self.road.traffic_colours = colours;
+            }
+        }
+        if r.opponents != 0 {
+            tracing::warn!(target: "netplay", opponents = r.opponents, "the stream carries NUMOPPONENTRACECARS != 0: the original numbers opponent slots after the players (0x4B5081); this port has no AI opponent in a network race");
+        }
+        self.num_opponents = r.players.saturating_sub(1);
+        // the camera reads `car[0].camera` (`[0x658294]`, slot 0 — 0x465A60 is called with 0 by
+        // 0x415AF2, 0x462F30 / 0x465790 with the camera slot): in a network race the table is by
+        // **race index**, so that is the list of whoever holds index 0 — the host, in list order —
+        // on every machine, and the other players' lists are stored and never read. Nothing else
+        // reads `.CAMERA` (a scan of `.text` for 0x658294: 0x463226, 0x46582A, 0x465B72, 0x465B93).
+        if let Some(list) = r.camera0.as_ref().filter(|l| !l.is_empty()) {
+            self.camera_cycle = list.iter().map(|&v| v as u16).collect();
+        }
+        // the drawn `.STARTINGPOS` is `Grid_slot`'s `g` as it stands (the values are 0…n−1, so the
+        // 0 sits one row ahead of the pole `g = 1`, the original's own arithmetic); `grid_pos` is
+        // `g − 1` (`u32::MAX` for 0, which `grid_slot` reads back as `g = 0`)
+        self.player_grid_override = r.grid;
+        self.net_seat_grids = r.seat_grids.clone();
+        self.net_seat_cars = r.seat_cars.clone();
+        self.net_own_words = r.own_words.clone();
+        self.net_traffic = r.traffic.clone();
+        self.net_derby = r.derby;
+        self.net_flags = Some((r.rally, r.heavy, r.derby));
+        if let Some(n) = self.net.session.as_mut() {
+            n.positional = r.positional;
+        }
+        if let Some(list) = r.playlist.as_ref()
+            && !self.net.session.as_ref().is_some_and(|n| n.is_host())
+        {
+            self.set_cd_playlist(list.iter().map(|i| *i as usize).collect());
+        }
+        // 0x4B4B80 wrote the host's `fe.txt` records into the option table: what this machine's own
+        // file said is replaced for the ids the stream carried (a host's own values are its file's)
+        self.net_fe_txt = r.fe_txt.iter().copied().collect();
+        self.net_nocollision = r.positional && r.nocollision;
+        // NOCOLLISION (0x65740C) and COMMSPOSITIONAL (0x657408): 0x498FF0's car-car half is skipped
+        // while both are set (`net_nocollision`, read by the collision pass)
+        tracing::info!(
+            track = r.track.as_deref().unwrap_or(&track), laps = self.num_laps, reverse = self.backwards, mirror = self.mirror,
+            damage = self.road.damage_on, skill = self.race_skill, traffic = self.road.traffic_count, opponents = self.num_opponents,
+            startingpos = g_log(self.player_grid_override), positional = r.positional, nocollision = r.nocollision,
+            "network race start: settings applied"
+        );
+        r.track.filter(|t| !t.is_empty()).unwrap_or(track)
+    }
+
     fn start_from_layout(&mut self, event_loop: &ActiveEventLoop) {
         // `Game.GameType` 10 — `VictoryRoom`'s `PLAYGAME` — is the era finale (0x4D5730's type-10
         // arm to the launch, `CareerUi::start_finale`). *(Until 2026-09-27 the port ran the quick
@@ -19565,6 +22049,13 @@ impl App {
         let Some(m) = self.fe.menu.as_ref() else { return };
         // `zMergedList.Car`'s own car — the garage half's own record while `car_garage` holds
         let Some(car) = self.logo_car(Some("zMergedList.Car"), None).cloned() else { return };
+        // **the car's camera list** — the launch chain's first per-car routine (0x4EB710 → 0x4EEDA0,
+        // 0x4EBA4D) appends `.CAMERA` 0x148 for slot 0 from `Camera.1 … Camera.4` (0x4EF02A…0x4EF0F5),
+        // after `fe.txt`'s `car[0].camera`, and 0x4B6560 keeps the last record of an id, so the list
+        // the race's camera reads — `car[slot].camera[0…3]` at `[0x658294 + slot·0x580]`, slot 0:
+        // 0x462F30 (0x46321B), 0x465790 (0x465827), 0x465A60 (0x465B72, `0x415AF2` passes 0) —
+        // is the four accessors, not the file's four names. `network.md` §11.12c.
+        self.camera_cycle = self.fe.camera_list.iter().map(|&v| v as u16).collect();
         // **0x4ED5D0 by `Game.GameType`** (`modes.md` §1, §2): 2 the knockout series' round, 1 the
         // Quick Knockout, anything else the single race. *(Until 2026-09-26 every layout launch
         // was a single race, so `knockout.lay` and `quickknockout.lay` raced as `QuickRace.lay`.)*
@@ -19619,6 +22110,7 @@ impl App {
                 }
             }
         };
+        let track_name = self.net_race_apply(track_name);
         // **0x4D52DE…0x4D52EA: the launch saves the profile** — `SaveInfo(getPlayerName(),
         // picture)` after the knockout start and before the front end hands over, so the file
         // carries the running series (and a tournament's running event, 0x503940)
@@ -19639,10 +22131,26 @@ impl App {
         }
         self.quick_knockout = false;
         let car = self.cheat_993(car);
+        // **A garage car in a layout race** (`Game.GameType` 0, 1, 2, 3): 0x4EB710 takes the owned
+        // `FECar` itself for `zMergedList.Car`'s garage half (0x4F4DF0 true → slot 0x8C), not a
+        // fresh one built from the catalogue record (0x4EE3B0), and 0x4EEDA0 kind 1 streams its
+        // set-up `+0x6D0…` (0x4EF179…0x4EF32F) and its installed parts `+0x758` (`.PARTINDEX`,
+        // 0x4EF3F3) exactly as for a career race — `.PARTDAMAGE` / `.DAMAGEZONES` are 0 for these
+        // types (0x4EF3E6…0x4EF445). A catalogue car keeps what it had.
+        let garage = if self.fe.menu.as_ref().is_some_and(|m| m.car_garage) {
+            self.garage_car().zip(self.career.as_ref()).map(|((_, o), cu)| {
+                let parts: Vec<nfs_formats::career::Part> = o.parts.iter().take(20).filter_map(|id| cu.tables.parts.iter().find(|p| p.id == *id)).cloned().collect();
+                (parts, o.setup)
+            })
+        } else {
+            None
+        }
+        .filter(|(parts, _)| !parts.is_empty());
+        let swaps: Vec<[i16; 3]> = garage.iter().flat_map(|(parts, _)| parts.iter().flat_map(|p| p.geometry_swaps.iter().copied())).collect();
         tracing::info!(track = track_name, car = car.model, "front end: start race");
         match (
             { let derby = self.derby_track(&track_name); TrackAssets::load(&self.paths, &derby) },
-            CarAssets::load(&self.paths, &car.model).map(|c| c.with_style(car.variant).with_cabrio(car.cabrio)),
+            CarAssets::load(&self.paths, &car.model).map(|c| c.with_style(car.variant).with_cabrio(car.cabrio).with_style_overlay(swaps.clone())),
             CarAssets::load_sim(
                 &self.paths,
                 if car.sim.is_empty() {
@@ -19662,16 +22170,88 @@ impl App {
                 if self.cheat_bits & (1 << 1) != 0 {
                     self.specs.apply_tinycar();
                 }
+                // the garage car's parts, then its sliders — 0x49CB50's order (`loaders.md` §1.3,
+                // `physics.md` §3a), both before anything reads the block
+                if let Some((parts, setup)) = &garage {
+                    let refs: Vec<&nfs_formats::career::Part> = parts.iter().collect();
+                    let before = (self.specs.top_speed, self.specs.final_drive, self.specs.grip, self.specs.gear_ratio[2]);
+                    let grip_ratio = self.specs.apply_parts(&refs, &car.sim_family);
+                    self.specs.parts = nfs_game::career::layout_race_parts(&refs);
+                    self.specs.apply_setup(setup, self.player_automatic());
+                    tracing::info!(
+                        parts = ?parts.iter().map(|p| p.id).collect::<Vec<_>>(), grip_ratio,
+                        setup = ?setup.map(|v| (v * 100.0).round() / 100.0),
+                        top_speed_before = before.0, final_drive_before = before.1, grip_before = before.2, first_gear_before = before.3,
+                        top_speed = self.specs.top_speed, final_drive = self.specs.final_drive, grip = self.specs.grip,
+                        first_gear = self.specs.gear_ratio[2],
+                        "layout race: the garage car's installed parts and set-up applied (0x4EEDA0 kind 1, 0x49CB50)"
+                    );
+                }
+                // **A network race's own catalogue car goes through the fold every other machine puts its
+                // copy through.** 0x49CB50 folds the car's parts and its `carinfo` set-up into the block for
+                // every car of the race, the player's included; the seat build in `start_race` does it from the
+                // record the owner sent, and this is that build for the owner's own copy — from the record it
+                // sent (`launch.cars` at its own index). Two machines then race one set of numbers per car,
+                // which the input exchange needs (`network.md` §11.17). A single-player race's catalogue car takes
+                // the same fold from the neutral record (the `else if` below, §11.12c); a garage car took its own above.
+                if garage.is_none()
+                    && let Some(n) = self.net.session.as_ref()
+                    && n.in_race != 0
+                    && let Some(idx) = n.local_race_index()
+                    && let Some(rec) = n.launch.cars.get(&idx).cloned()
+                {
+                    use nfs_net::launchcar::id as cid;
+                    let parts_table = self.fe_parts_table();
+                    let before = (self.specs.grip, self.specs.transfer_div, self.specs.roll_gain);
+                    self.specs.apply_parts(&[], &car.sim_family);
+                    self.specs.parts = nfs_physics::specs::stock_parts(&car.stock_parts, &parts_table);
+                    let ids: Vec<i16> = rec.parts().into_iter().map(|p| p as i16).collect();
+                    if !ids.is_empty() && ids != car.stock_parts {
+                        let owned: Vec<&nfs_formats::career::Part> = ids.iter().filter_map(|id| parts_table.iter().find(|p| p.id == *id)).collect();
+                        self.specs.apply_parts(&owned, &car.sim_family);
+                        self.specs.parts = nfs_game::career::installed_parts(&owned, None);
+                    }
+                    let automatic = rec.num(cid::TRANSMISSION).is_none_or(|v| v == 1);
+                    if let Some(setup) = rec.setup() {
+                        self.specs.apply_setup(&setup, automatic);
+                    }
+                    tracing::info!(
+                        target: "netplay", grip_before = before.0, grip = self.specs.grip, transfer_div_before = before.1, transfer_div = self.specs.transfer_div,
+                        roll_gain_before = before.2, roll_gain = self.specs.roll_gain,
+                        "network race: the player's own car folded from its own record, as its copies on the other machines are (0x49CB50)"
+                    );
+                } else if garage.is_none() {
+                    // **A single-player layout race's catalogue car** (QuickRace, Knockout, a series'
+                    // round): 0x4EB710's default arm builds a fresh `FECar` from the record (0x4EE3B0),
+                    // so it carries the stock parts (0x4EE9A0) and the neutral sliders (0x4EED2D),
+                    // and 0x49CB50 folds both — `network.md` §11.12b.
+                    let table = self.fe_parts_table();
+                    let before = (self.specs.grip, self.specs.transfer_div, self.specs.roll_gain);
+                    let automatic = self.player_automatic();
+                    nfs_game::career::fold_fresh_car(&mut self.specs, &car.stock_parts, &table, &car.sim_family, automatic);
+                    tracing::info!(
+                        grip_before = before.0, grip = self.specs.grip, transfer_div_before = before.1, transfer_div = self.specs.transfer_div,
+                        roll_gain_before = before.2, roll_gain = self.specs.roll_gain,
+                        "layout race: the catalogue car's stock parts and neutral set-up folded (0x4EE9A0, 0x4EED2D, 0x49CB50)"
+                    );
+                }
                 self.snd.sound_set = car.sound_set.clone();
                 self.sim_name = car.sim.clone();
                 self.dials = Some((car.dial_kmh, car.dial_mph, car.dial_tach));
+                // the join screen's destructor 0x50A260 runs as the race takes over
+                if self.fe.layout_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("joingame")) {
+                    self.net_join_screen_gone();
+                }
                 self.fe.layout_preview = None;
                 self.fe.layout_name = None;
                 // kept for the way back, as the other launches keep it: without it neither the
                 // pause menu's quit (`leave_race`) nor the last results page had a front end to
                 // return to, and the quit closed the program
                 self.fe.menu_template = self.fe.menu.take();
-                self.fe.race_game_type = Some(self.fe.game_type);
+                // a network race is `FEGAME_TYPE [0x6573E8] == 3` (`SETTYPEMULTIPLAYER` writes it on the
+                // way in); a direct `--fe=peertopeerip` / `--fe=udpip` entry never passed that button
+                // (test glue), so the race says 3 itself
+                self.fe.race_game_type = Some(3);
                 let (renderer, window) =
                     (self.renderer.take().unwrap(), self.window.take().unwrap());
                 self.tick = 0;
@@ -19770,11 +22350,13 @@ impl App {
                     l.positional = !l.positional;
                     return;
                 }
-                "Comms.ServerList"
-                | "Comms.GamesList"
-                | "Comms.IPList"
-                | "Comms.LobbyPlayerList"
-                | "Comms.PlayerList" => {
+                "Comms.IPList" => {
+                    let n = l.history.len().max(1);
+                    let row = ((l.ip_sel as i32 + delta).rem_euclid(n as i32)) as usize;
+                    self.pick_ip_row(row);
+                    return;
+                }
+                "Comms.ServerList" | "Comms.GamesList" | "Comms.LobbyPlayerList" | "Comms.PlayerList" => {
                     let n = l.found.len().max(1);
                     l.sel = ((l.sel as i32 + delta).rem_euclid(n as i32)) as usize;
                     return;
@@ -19981,6 +22563,18 @@ impl App {
                 l.driver_picture = self.fe.driver_picture;
                 let replaced = self.fe.layout_preview.replace(l);
                 self.fe.layout_name = Some(name.to_string());
+                // **the lobby's entry ritual is per screen instance** (0x509290 / 0x50A4F0 guard
+                // `[this+0x285]`, which the constructor clears): a lobby screen built again — after a
+                // race, `fe_after_race` — sends its records once more
+                if name.eq_ignore_ascii_case("creategame") || name.eq_ignore_ascii_case("joingame") {
+                    self.net.lobby_sent = false;
+                    self.net.lobby_car = None;
+                }
+                // the peer-to-peer screen's own latches `[this+0x288]` / `[this+0x289]` (the constructor clears them)
+                if name.eq_ignore_ascii_case("peertopeerip") {
+                    self.net.connect_pending = false;
+                    self.net.connect_opened = false;
+                }
                 self.fe.layout_sel = 0;
                 self.fe.layout_nav_used = false;
                 self.fe.layout_open_combo = None;
@@ -20087,6 +22681,9 @@ impl App {
     /// destructors, **0x506C30** and **0x51A690**, lift the lock (**0x4D5BC0**: 0x4D8240 clears
     /// the BACK button's bit 0x10, `[fe+0x17C]` = 0) — whichever screen set it.
     fn fe_screen_gone(&mut self, l: &nfs_game::layout::LayoutScreen) {
+        if Self::fe_list_of(l) == "ID_COMMSJOINSCREEN" {
+            self.net_join_screen_gone();
+        }
         if matches!(Self::fe_list_of(l).as_str(), "ID_VICTORYSCREEN" | "ID_FDVICTORYSCREEN") {
             self.fe_back_lock(false);
         }
@@ -20114,6 +22711,14 @@ impl App {
                 .ok(),
             false => None,
         };
+        // **`Comms.Positional`'s default row is the games screen's** (`network.md` §11.17): the base
+        // constructor 0x509CE0 sets row 0 (0x509D96, slot 0x2C on `Comms.Positional`, named at 0x5DA6E8) and the
+        // derived ones set theirs after it — `local` (0x50A950) keeps **0**, "input exchange"; `udpip`
+        // (0x50B5F0) and `serverlist` (0x50B320) put it on 1; `PeerToPeerIP` does not touch it (the
+        // accessor's own start, 1, 0x50BB1C). A session created from the screen carries it.
+        if let Some(l) = self.net.lobby.as_mut() {
+            l.positional = !name.eq_ignore_ascii_case("local");
+        }
         self.bind_screen_widgets();
     }
 
@@ -20487,6 +23092,7 @@ impl App {
 
     fn hud_dialog_up(&self) -> bool {
         self.paused
+            || self.net_notice.is_some()
             || self.replay_save.up
             || self.billboard_key != 0
             || (self.results.is_some() && self.result_pages().get(self.results_page as usize).is_some())
@@ -20494,6 +23100,11 @@ impl App {
 
     /// The post-race pages this race queues, in order.
     fn result_pages(&self) -> Vec<ResultPage> {
+        // `DERBY` (the Smash Up cheat): the queue is `HCongrats` alone — 0x426DB7 jumps to 0x427345 with
+        // nothing else queued: no summary, no records, no tournament chain (`hud.md`, the DERBY readers 0x4266A0 / 0x426D07 / 0x426DB7)
+        if self.cheat_bits & (1 << 7) != 0 {
+            return Vec::new();
+        }
         if self.mission.is_some() {
             return vec![ResultPage::MissionSummary];
         }
@@ -20514,7 +23125,9 @@ impl App {
                 pages.push(ResultPage::Notice(18160));
             }
         }
-        if self.hud_records.is_some() {
+        // game type 3 skips the records page (0x4272F7 `cmp [0x6573E8], ebp; je 0x427345`, `ebp = 3` from
+        // 0x426CCF): the queue goes on to the summary's timeout and nothing else
+        if self.hud_records.is_some() && self.fe.race_game_type != Some(3) {
             pages.push(ResultPage::Records);
         }
         pages
@@ -20599,8 +23212,11 @@ impl App {
     /// pass 1 as the constructor's seventh argument (calls 0x42BD08, 0x431897, 0x433874, 0x428328); the
     /// mission summary and the pause menu pass 0. The tournament `HCongrats` closes itself past
     /// 0xC0 ticks (0x41DD40).
-    fn page_timeout(page: ResultPage) -> Option<u64> {
+    fn page_timeout(page: ResultPage, net: bool) -> Option<u64> {
         match page {
+            // game type 3 clears the summary's timeout with 0x41B130(0) (0x4272BF `cmp [0x6573E8], ebp`,
+            // 0x4272C9): it stays until Space; every other type passes 1 (0x4272E5)
+            ResultPage::Summary if net => None,
             ResultPage::Summary | ResultPage::Standings | ResultPage::Records | ResultPage::Notice(_) => Some(0x280),
             ResultPage::TournamentPlace(_) => Some(0xC0),
             ResultPage::MissionSummary | ResultPage::Closed => None,
@@ -20741,7 +23357,8 @@ impl App {
         }
         let (cells, _) = control_bar(HUD_REF_W, HUD_REF_H);
         let Some(cell) = bar_cell_at(&cells, cx.floor() as i32, cy.floor() as i32) else { return false };
-        let Some(ev) = bar_event(cell, &mut self.replay_bar, false) else { return false };
+        // `+0x198`, built for `FEGAME_TYPE 3` only (0x424F7B): a network race's replay has the network bar
+        let Some(ev) = bar_event(cell, &mut self.replay_bar, self.replay_net.is_some()) else { return false };
         tracing::info!(tick = self.tick, cell, event = ev.code(), "replay bar (0x42D880)");
         match ev {
             BarEvent::Camera => {
@@ -20770,8 +23387,11 @@ impl App {
                 self.replay_save.up = false;
                 self.replay_save.overwrite = false;
                 // the gates `[0x657E34]` (aborted — such a race is left, never replayed here),
-                // `[0x60C9B4]` and `DERBY` (neither exists in this port) all pass
-                if let Some(r) = self.results.as_mut() {
+                // `[0x60C9B4]` (not in this port) and `DERBY` (0x4266A0: `[0x657400] == 0`) — the Smash Up
+                // cheat closes the dialogs and queues nothing
+                if self.cheat_bits & (1 << 7) == 0
+                    && let Some(r) = self.results.as_mut()
+                {
                     // `0x426C90(1)`: the queue from its start, no `HCongrats`
                     r.congrats = false;
                     self.results_page = 0;
@@ -20782,7 +23402,15 @@ impl App {
                 }
             }
             BarEvent::Save => self.open_replay_save(),
-            BarEvent::NextCar | BarEvent::PrevCar => {}
+            // 0x42D8FC…: `[0x606858]` steps (wrapping in `[0, [0x5E8BFC])`) and the camera is applied to
+            // the new viewed car — a network replay's humans, by race index
+            BarEvent::NextCar | BarEvent::PrevCar => {
+                if let Some(rn) = self.replay_net.as_ref() {
+                    let n = rn.seats.iter().filter(|i| **i != u32::MAX).count() + 1;
+                    self.replay_view = if ev == BarEvent::NextCar { (self.replay_view + 1) % n } else { (self.replay_view + n - 1) % n };
+                    tracing::info!(view = self.replay_view, "network replay bar: the viewed car (0x42D8FC)");
+                }
+            }
         }
         true
     }
@@ -20805,7 +23433,7 @@ impl App {
         }
         let (cells, frame) = nfs_game::replay::control_bar(HUD_REF_W, HUD_REF_H);
         let pointer = self.fe.cursor.map(|(x, y)| (x.floor() as i32, y.floor() as i32));
-        self.replay_bar.count(&cells, frame, pointer);
+        self.replay_bar.count(&cells, frame, pointer, self.replay_net.is_some());
         let clock = self.hud_clock();
         self.replay_bar.transition(clock);
         let page_up = self.results.is_some() && usize::from(self.results_page) < self.result_pages().len();
@@ -21160,6 +23788,75 @@ impl App {
         (order, by_driver)
     }
 
+    /// **The network race's end pages** — what `RaceFrame` 0x4152E0 does at its loop's tail for `FEGAME_TYPE 3`
+    /// (0x415CE8…0x415D17) and the summary's own update:
+    ///
+    /// * once the local car's rank `0x48D7F0([0x65741C])` is above 0 — its finish time has come back through
+    ///   the room (`0xB7`) — and the pages are not built (`arg_13h`), **0x426A80(1)** builds them (0x415D08):
+    ///   `[0x60CA6C] = 0x48D7F0(local)` (0x426B50: the place is the room's, not `car+0xCD4`), the pages
+    ///   ([`Self::open_result_pages`]: `HCongrats`' speech and jingle, the records copy) — the summary with
+    ///   no timeout and no records page for type 3 ([`Self::result_pages`], [`Self::page_timeout`]);
+    /// * **`HRaceSummary`'s update 0x42C080** (and its set-up 0x42C110): for every racer `k` whose rank
+    ///   `0x48D7F0(k)` is above 0 and whose row (`[this+0x128 + 4k]`) is not yet filled, its row goes in at row
+    ///   `rank − 1` with the time `0x48D770(k)` and **best lap 0** (`0x42C210(k, time, 0, rank − 1)`) — the best
+    ///   lap `0xB7` carries goes no further than the room's log; the local player's row is the highlighted one
+    ///   (`0x48D7F0(local)`, 0x42C1B5).
+    ///
+    /// A racer is a *race index* (`player+0x4C`): the player's own, or a seat's (`NetPlay::seat_race_index`).
+    /// **APPROXIMATION:** `RacerResult::state` is 2 for a ranked racer and 0 for the others (the fields the
+    /// row reads are `place`, `time`, `best_lap`).
+    fn net_results_check(&mut self) {
+        let Some(n) = self.net.session.as_mut().filter(|n| n.in_race != 0) else { return };
+        let Some(local) = n.local_race_index() else { return };
+        let drivers = 1 + self.road.opponents.len();
+        let mut racers = vec![nfs_game::race::RacerResult::default(); drivers];
+        for (d, r) in racers.iter_mut().enumerate() {
+            let index = if d == 0 { Some(local) } else { n.seat_race_index(d - 1) };
+            if let Some(i) = index {
+                let rank = n.race_rank(i);
+                if rank > 0 {
+                    r.place = rank as u32;
+                    r.time = n.race_time(i).max(0) as u64;
+                    r.state = 2;
+                }
+            }
+        }
+        let order_of = |racers: &[nfs_game::race::RacerResult]| -> Vec<usize> {
+            let mut o: Vec<usize> = (0..racers.len()).collect();
+            o.sort_by_key(|&d| (racers[d].place == 0, racers[d].place, d));
+            o
+        };
+        match self.results.as_mut() {
+            None => {
+                // 0x415D00: `jle` — no rank for the local car yet
+                if racers[0].place == 0 {
+                    return;
+                }
+                let order = order_of(&racers);
+                tracing::info!(target: "netplay", places = ?racers.iter().map(|r| r.place).collect::<Vec<_>>(), times = ?racers.iter().map(|r| r.time).collect::<Vec<_>>(), "network race: the local car has a rank — 0x426A80(1) builds the pages (0x415D08)");
+                self.results = Some(RaceResults { racers, order, clean: [true; 8], mission: None, opened: self.tick, congrats: true });
+                self.results_page = 0;
+                self.page_seen = None;
+                self.page_open_tick = None;
+                self.page_closing = None;
+                self.open_result_pages();
+            }
+            Some(res) => {
+                // 0x42C080: rows fill as the ranks come in
+                let mut changed = false;
+                for (row, new) in res.racers.iter_mut().zip(racers) {
+                    if row.place == 0 && new.place > 0 {
+                        *row = new;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    res.order = order_of(&res.racers);
+                }
+            }
+        }
+    }
+
     /// **Race over** — `0x417010`, first in `GameTick`'s odd-tick group (0x4150D9): once every
     /// human car is in state ≥ 2 and the tick is past its `+0xB14` by more than **0x140** (0x4170DC…
     /// 0x4170F3, `jle` — strictly more), `[0x606A8C] = 1` and `Race_finalize(2)` 0x416AC0 fill the
@@ -21178,6 +23875,12 @@ impl App {
     /// (0x4B08F2…0x4B09A3) — the original waits **0x280** ticks instead (0x4170F5…0x417116);
     /// `nfs_audio::speech::Speech::busy` answers that (a phrase queued or one playing).
     fn race_over_check(&mut self) {
+        // a network race (`FEGAME_TYPE 3`): 0x417010 never runs (0x417128 tests the game type, not the link — a
+        // race whose session was torn down is still no single-player race); the pages come from the room's times
+        if self.fe.race_game_type == Some(3) {
+            self.net_results_check();
+            return;
+        }
         let playback = self.replay.stream.as_ref().is_some_and(|s| matches!(s.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted));
         if self.net.session.is_some() || self.replay.race_over || (!playback && (self.results.is_some() || self.auto_replay_due)) {
             return;
@@ -21366,6 +24069,10 @@ impl App {
                 self.net.lobby = netplay::Lobby::open(&self.player_name)
                     .map_err(|e| tracing::warn!(error = %e, "cannot open a browsing socket"))
                     .ok();
+                // `Comms.Positional`'s default row is the games screen's (`fe_bind_screen`)
+                if let Some(l) = self.net.lobby.as_mut() {
+                    l.positional = !name.eq_ignore_ascii_case("local");
+                }
             }
             // 0x505570 at 0x4D5267 (the start-up's own entry), before the lists are bound
             if self.fe.layout_preview.is_some() {
@@ -21456,6 +24163,17 @@ impl App {
                                     l.set_open_combo(Some(i));
                                 }
                                 self.combo_commit(i, row);
+                            } else if let Some((acc, row)) = k.strip_prefix("combo:").and_then(|r| r.rsplit_once(':')).and_then(|(a, r)| {
+                                // the row, or for a track combo a track's file name (`alps`)
+                                let row = r.parse::<usize>().ok().or_else(|| {
+                                    self.fe.menu.as_ref()?.tracks.iter().position(|t| t.eq_ignore_ascii_case(r))
+                                })?;
+                                Some((a.to_string(), row))
+                            }) {
+                                // `combo:<accessor>:<row>` — the same selection a drop-down commit
+                                // makes (`combo_select`), by the accessor's name (`Track1.Track(SHORT)`)
+                                self.combo_select(&acc, row);
+                                self.bind_after_accessor();
                             } else if let Some(i) = k.strip_prefix("strip:").and_then(|i| i.parse::<usize>().ok()) {
                                 // `strip:<widget>` — a release in that closed combo's caption strip
                                 self.combo_strip_release(i);
@@ -21466,6 +24184,105 @@ impl App {
                                     self.fe.layout_sel = i;
                                     self.layout_key(MenuKey::Enter, event_loop);
                                 }
+                            } else if let Some((x, y)) = k.strip_prefix("click:").and_then(|r| r.split_once(':')).and_then(|(a, b)| Some((a.trim().parse::<f32>().ok()?, b.trim().parse::<f32>().ok()?))) {
+                                // `click:<x>:<y>` — a left click at that design point, in order
+                                // with the `keys:` tokens around it
+                                self.fe_scripted_click(x, y, event_loop);
+                            } else if let Some(n) = k.strip_prefix("waitgames:").and_then(|n| n.parse::<usize>().ok()) {
+                                // `waitgames:<n>` (tooling) — run the browsing socket as the frame
+                                // tick does until `n` sessions have answered, 20 s at most
+                                let until = Instant::now() + Duration::from_secs(20);
+                                while Instant::now() < until && self.net.lobby.as_ref().is_some_and(|l| l.found.len() < n) {
+                                    if let Some(l) = self.net.lobby.as_mut() {
+                                        l.poll();
+                                    }
+                                    std::thread::sleep(Duration::from_millis(20));
+                                }
+                                self.bind_lists();
+                            } else if let Some(ms) = k.strip_prefix("wait:").and_then(|n| n.parse::<u64>().ok()) {
+                                // `wait:<ms>` (tooling) — the lobby's tick for that long: the
+                                // session drains and the option records go out / come in
+                                let until = Instant::now() + Duration::from_millis(ms);
+                                while Instant::now() < until {
+                                    if let Some(s) = self.net.session.as_mut() {
+                                        s.poll_lobby();
+                                    }
+                                    self.net_sync_options();
+                                    self.net_lobby_step();
+                                    self.comm_tick();
+                                    self.net_browse_step();
+                                    std::thread::sleep(Duration::from_millis(20));
+                                }
+                                self.bind_lists();
+                            } else if let Some((acc, d)) = k.strip_prefix("step:").and_then(|r| r.rsplit_once(':')).and_then(|(a, d)| Some((a.to_string(), d.parse::<i32>().ok()?))) {
+                                // `step:<accessor>:<delta>` (tooling) — a combo's arrow (`set_accessor`),
+                                // in order with the keys around it (`Comms.PlayerList`'s selection)
+                                self.set_accessor(&acc, d);
+                                self.bind_lists();
+                            } else if let Some(n) = k.strip_prefix("waitplayers:").and_then(|n| n.parse::<usize>().ok()) {
+                                // `waitplayers:<n>` (tooling) — run the session as the lobby's tick
+                                // does until the room holds `n` players, 60 s at most
+                                let until = Instant::now() + Duration::from_secs(60);
+                                while Instant::now() < until && self.net.session.as_ref().is_some_and(|s| s.room_len() < n) {
+                                    if let Some(s) = self.net.session.as_mut() {
+                                        s.poll_lobby();
+                                    }
+                                    self.net_sync_options();
+                                    self.net_lobby_step();
+                                    std::thread::sleep(Duration::from_millis(20));
+                                }
+                                self.net_sync_options();
+                                self.bind_lists();
+                            } else if let Some(n) = k.strip_prefix("waitready:").and_then(|n| n.parse::<usize>().ok()) {
+                                // `waitready:<n>` (tooling) — the lobby's tick until the room holds
+                                // `n` players and PLAYGAME's gate 0x5091B0 holds, 60 s at most
+                                let until = Instant::now() + Duration::from_secs(60);
+                                while Instant::now() < until && !self.net.session.as_ref().is_some_and(|s| s.room_len() >= n && s.everyone_ready()) {
+                                    if let Some(s) = self.net.session.as_mut() {
+                                        s.poll_lobby();
+                                    }
+                                    self.net_sync_options();
+                                    self.net_lobby_step();
+                                    std::thread::sleep(Duration::from_millis(20));
+                                }
+                                self.bind_lists();
+                            } else if let Some(text) = k.strip_prefix("dialog:") {
+                                // `dialog:<text>` (tooling) - type `text` after what an input
+                                // dialog holds and answer it "yes", as Return would once its tick
+                                // has read the latch (the launch has no frame tick to wait for)
+                                if let Some((mut d, purpose)) = self.fe.dialog.take() {
+                                    text.chars().for_each(|c| {
+                                        d.type_char(c);
+                                    });
+                                    self.fe.dialog_input = d.field.as_ref().map(|f| f.text.clone());
+                                    self.fe.dialog_answer = Some((true, purpose));
+                                    self.fe_dialog_answer(event_loop);
+                                }
+                            } else if k == "enter" {
+                                // `enter` — Return on the focused input box, through the key
+                                // path's own commit (the chat box's send, the list box's commit)
+                                if let Some(i) = self.fe.layout_preview.as_ref().and_then(|l| l.focused_input()) {
+                                    if let Some(text) = self.fe.layout_preview.as_mut().and_then(|l| l.take_chat(i)) {
+                                        let empty = self.fe.strings.get(287).unwrap_or_default().to_string();
+                                        if let Some(n) = self.net.session.as_mut() {
+                                            n.say(&text, &empty);
+                                        }
+                                    } else if self.fe.layout_preview.as_ref().and_then(|l| l.class_of(i)).as_deref() == Some("NFS5.CHARVECTACCESSORINPUTBOX") {
+                                        self.fe_charvect_return(i);
+                                    } else if let Some(l) = self.fe.layout_preview.as_mut() {
+                                        l.commit_input(i);
+                                    }
+                                }
+                            } else if let Some(text) = k.strip_prefix("keys:") {
+                                // `keys:<text>` — each char as a real key press reaches the
+                                // focused input box (the keyboard path's own `focused_input` +
+                                // `fe_input_key`, no accessor named — unlike `type:`)
+                                for c in text.chars() {
+                                    if let Some(i) = self.fe.layout_preview.as_ref().and_then(|l| l.focused_input()) {
+                                        self.fe_input_key(i, c);
+                                    }
+                                }
+                                self.bind_player_buttons();
                             } else if let Some((acc, text)) = k.strip_prefix("type:").and_then(|r| r.split_once('=')) {
                                 // `type:<accessor>=<text>` — the text typed into the input box
                                 // bound to that accessor, through the box's own filter (0x4CCC20)
@@ -21505,7 +24322,7 @@ impl App {
                 let started = if t == 4 && self.career.is_some() {
                     self.start_tournament_from_layout(event_loop)
                 } else {
-                    self.start_from_layout(event_loop);
+                    self.fe_start_game(event_loop);
                     self.race.is_some()
                 };
                 if started {
@@ -21602,7 +24419,11 @@ impl App {
                 event_loop.exit();
                 return;
             }
-            if let Some(path) = self.screenshot.take() {
+            // (tooling: `NFS_SHOT_IN_RACE=1` leaves the still for the race that follows, so a
+            // network joiner — which the host's `0xB3` starts — can be photographed in its race)
+            if std::env::var_os("NFS_SHOT_IN_RACE").is_none()
+                && let Some(path) = self.screenshot.take()
+            {
                 // a screen fades in over half a second (`RE/notes/controls.md` §6), so a shot taken
                 // on the first frame catches every faded widget at alpha 0 and looks empty. Let the
                 // transition finish first.
@@ -21721,25 +24542,7 @@ impl App {
                             continue;
                         }
                         let Some((x, y)) = p.split_once(',').and_then(|(a, b)| Some((a.trim().parse::<f32>().ok()?, b.trim().parse::<f32>().ok()?))) else { continue };
-                        self.fe.cursor = Some((x, y));
-                        if let Some(l) = self.fe.layout_preview.as_mut() {
-                            l.script_cursor(Some((x, y)));
-                            // let any transition finish and the hover settle, as a player's
-                            // pointer would have
-                            for _ in 0..60 {
-                                l.advance_transition(16);
-                            }
-                        }
-                        let before = self.fe.layout_preview.as_ref().map(|l| (l.hovered(), l.open_combo(), l.combo_row_at(x, y)));
-                        self.fe_left_button(event_loop, true);
-                        self.fe_left_button(event_loop, false);
-                        let after = self.fe.layout_preview.as_ref().map(|l| (l.hovered(), l.open_combo()));
-                        tracing::info!(x, y, ?before, ?after, open = ?self.fe.layout_open_combo, "NFS_FE_CLICKS click");
-                        for _ in 0..4 {
-                            if let Some(l) = self.fe.layout_preview.as_mut() {
-                                l.advance_transition(16);
-                            }
-                        }
+                        self.fe_scripted_click(x, y, event_loop);
                     }
                 }
                 // and a room that is still changing — the last screen's going out, then this one's
@@ -21773,7 +24576,8 @@ impl App {
                 }
                 // `NFS_FE_DIALOG` raises its dialog in the dialog step, which a still otherwise
                 // never reaches
-                if std::env::var("NFS_FE_DIALOG").is_ok() {
+                // (and a dialog a scripted network run raised: `comm_tick`'s notices)
+                if std::env::var("NFS_FE_DIALOG").is_ok() || self.fe.dialog.is_some() {
                     self.fe_dialog_step();
                 }
                 // the same scene the front end draws every frame, so a screenshot shows the 3D room too
@@ -22014,6 +24818,9 @@ impl App {
         let Some(res) = self.results.as_ref() else { return };
         let Some(me) = res.racers.first() else { return };
         let (place, total, best) = (me.place, me.time as u32, me.best_lap as u32);
+        // 0x426D07: under `DERBY` `HCongrats` takes the place `car+0xB50 == 3 ? 8 : 1` of `[0x65741C]`'s car —
+        // knocked out, or the winner — and not the ranking's
+        let place = if self.cheat_bits & (1 << 7) != 0 { if self.player_eliminated { 8 } else { 1 } } else { place };
         if place == 0 && self.mission.is_none() {
             return;
         }
@@ -22205,12 +25012,14 @@ impl App {
             self.traffic_seed = std::env::var("NFS_TRAFFIC_SEED")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or_else(|| self.registry.u32("rand_seed", 0));
+                .unwrap_or_else(|| self.net_fe_txt.get("rand_seed").copied().unwrap_or_else(|| self.registry.u32("rand_seed", 0)));
             self.replay.setup = nfs_game::replay::ReplaySetup {
                 track: self.track.name.clone(),
                 car: self.car.model.clone(),
                 sim: self.sim_name.clone(),
-                car_id: self.car_id,
+                // the catalogue record the race's car is (`start_from_layout`'s `player_car_id`), which a
+                // replay resolves the model's body style and roof from; the start-up default otherwise
+                car_id: self.player_car_id.unwrap_or(self.car_id),
                 paint: self.paint,
                 laps: self.num_laps,
                 opponents: self.num_opponents,
@@ -22227,21 +25036,41 @@ impl App {
                 // the name this race is recorded under (§16.2 / §18.11): a later playback of this
                 // same setup (the automatic replay-in-place, or a saved `.prpl`) shows it back
                 driver_name: self.player_name.clone(),
+                net: self.replay_net_snapshot(),
             };
         }
         self.replay.setup.seed = self.traffic_seed;
+        // **`srand(time(0))`** (0x418100, `HMissionSummary`'s constructor — a race load): the C
+        // runtime's state for everything up to the next race load
+        self.crt_rand = nfs_game::movie_overlay::CRand::new(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_secs() as u32));
+        if self.net.session.is_some() {
+            let time = self.net_fe_txt.get("time").copied().unwrap_or_else(|| self.registry.u32("time", 0));
+            tracing::info!(target: "netplay", rand_seed = self.traffic_seed, time, weather = 0, car_car_pass_skipped = self.net_nocollision, "network race: the option values in force (0x414EE9 RAND_SEED, TIME; WEATHER is stored 0 by 0x414DF9; 0x498FF0's car-car half skipped when COMMSPOSITIONAL && NOCOLLISION)");
+        }
         self.replay.saved = false;
         self.replay.loop_count = 0;
         nfs_game::rng::seed(self.traffic_seed);
         // 0x4A4A70(0) as the front end hands over (main 0x4B6CCA)
         self.race_loading_frame(&mut renderer, 0);
+        // 0x427A60, the race load 0x4B67B0's first call (before its steps 1 and 2): `pic16.fsh` from
+        // the HUD folder posted as file type 0, for the others' `HLeader` and their loading screen's
+        // rows (the port posted it with the seats, after step 5)
+        if let Some(n) = self.net.session.as_mut()
+            && let Some(b) = GamePaths::find_file(&self.paths.game_data().join("DashHud"), "pic16.fsh").and_then(|p| std::fs::read(p).ok())
+        {
+            n.post_picture(&b);
+        }
+        // 0x4B67D8 / 0x4B67DF: steps 1 and 2 straight after 0x427A60, with nothing between them
+        self.race_loading_frame(&mut renderer, 1);
+        self.race_loading_frame(&mut renderer, 2);
         // the start scene the race loads (0x46D600) decides whose GEOM elements stand
         self.track.reverse = self.backwards;
         let mut world = TrackWorld::upload(&mut renderer, &self.track).expect("track");
+        // 0x469065: step 3 inside the track load 0x468FB0, right after `RdrKeys` (0x44FAE0) — the track's
+        // data and keys are in; the sky and the weather (0x45DBD0, 0x458B80) still follow there
+        self.race_loading_frame(&mut renderer, 3);
         // 0x4A17F0 / `Cars_resetAll` at every race's start: the smackables' car records afresh
         self.smackables = Default::default();
-        // 0x4A4A70(5) once the track is up (0x4B682E, after 0x468FB0): the track picture
-        self.race_loading_frame(&mut renderer, 5);
         // Each `RMth` pass carries an option mask (`+8` of its sixteen-byte record from `+0x1C`),
         // and 0x44BF70 builds a pass only when that mask is 0 or meets the render flags
         // `[0x6197F8]` (0x44C185). `Graphics.Headlights` = Projected (1) is what sets bit 8 of
@@ -22321,6 +25150,10 @@ impl App {
             self.fe_rng = nfs_game::opponents::FeRng::new(t);
         }
         self.sky = Sky::upload(&mut renderer, &self.track, sky_level, &mut self.fe_rng);
+        // 0x4B6827 / 0x4B682E: steps 4 and 5 straight after the whole track load 0x468FB0 (the sky and
+        // the weather were its last parts), the track picture drawn at 5
+        self.race_loading_frame(&mut renderer, 4);
+        self.race_loading_frame(&mut renderer, 5);
         // a night track switches the dials to their `*N` faces and needles (`hud.md` §3.2)
         let night = self.track.is_night();
         if night {
@@ -22338,6 +25171,17 @@ impl App {
                 &if self.backwards { t.reversed() } else { t },
             );
         }
+        // **The camera manager 0x471B70** (`WTrack::load`): moved ahead of the audio load so that its step 6
+        // (0x4B683F) comes before step 7 (0x4B6855) as in 0x4B67B0 — the data depends on the track alone.
+        // the trackside cameras and their triggers travel with the track (`race-logic.md` §3.3)
+        self.track_cameras = self
+            .track
+            .cameras
+            .as_ref()
+            .map(nfs_game::cameras::TrackCameras::from_scene);
+        // the `CmAn` camera paths (0x471850 from `WTrack::load`, 0x48779C)
+        self.cam_anims = nfs_game::camera::anim_cam::load(&self.track.crp, &self.track.crp_data);
+        self.race_loading_frame(&mut renderer, 6);
         if self.snd.audio.is_none() {
             self.snd.audio = nfs_audio::AudioOutput::new()
                 .map_err(|e| tracing::warn!(error = %e, "audio disabled"))
@@ -22454,6 +25298,10 @@ impl App {
                 }
             }
         }
+        // 0x4B6855: step 7 after `SND_coll` 0x4A8CD0 (the collision sounds, `CollisionSfx` above)
+        self.race_loading_frame(&mut renderer, 7);
+        // 0x414E63: step 8 in the race init 0x414DB0, before `Cars_create` 0x411130 (0x414E68) makes the cars
+        self.race_loading_frame(&mut renderer, 8);
         // start pose from the slice-based grid rule (pole position, single racer)
         // `<track>.jnc` carries the branch weights the AI's junction choice reads (`race-logic.md` §10)
         let table = SliceTable::from_crp(&self.track.crp, &self.track.crp_data).ok().map(|mut t| {
@@ -22474,6 +25322,7 @@ impl App {
             self.track.start_forward.as_ref()
         };
         self.player_eliminated = false;
+        self.net_time_sent = false;
         // the port's own counters for the autotest log (the opponents' start at 0 with their cars)
         // and the autotest bot's stuck count
         self.wall_hits = 0;
@@ -22490,15 +25339,24 @@ impl App {
         // 0x426B20…0x426B3B: `[0x60CA04] = 0`, `HTime` reset (0x431850), `HMissionSummary+0x140 = 0`
         self.hud_cones = Default::default();
         self.cone_flash = 0;
+        // network play: the others are the seats (0x4B4DA0 gives every player of the race an index,
+        // `player+0x4C`, and the launch's `NUMOPPONENTRACECARS` is 0 — 0x4ECF00 for `FEGAME_TYPE` 3, the
+        // stream's `(0x28, 0)` — so the fix-up loop 0x4B5081…0x4B50AB that numbers opponent slots after
+        // the players never runs). `net_race_apply` set `num_opponents = players − 1` from the launch.
+        // **Glue:** a `--net` run that never launched (`net+0xE5 == 0`) has no launch to say so, and
+        // gets one seat per other player of the room
+        if let Some(n) = self.net.session.as_ref().filter(|n| n.in_race == 0) {
+            self.num_opponents = self.num_opponents.max(n.remote_players().len() as u32);
+        }
         let n_cars = self.num_opponents + 1;
         // grid order: `.STARTINGPOS` (`[0x658200 + slot·0x580]`, 1 = pole) — 0x4ECF00 gives slot
         // `i` `(nPlayers + nOpp) − i` outside the knockout and the tournament (`modes.md` §1), so
         // the player (slot 0) starts last; the port keeps `STARTINGPOS − 1`
         self.player_grid = self.player_grid_override.unwrap_or(n_cars - 1);
         // `Grid_slot` 0x410580's globals: `LINEAR_TRACK`, and the network smash-up's spacing
-        // (`FEGAME_TYPE == 3 && DERBY`) — not wired: the port's network race keeps no
-        // `FEGAME_TYPE` 3 / `NUMCARS` of its own
-        let grid_rule = nfs_game::race::GridRule { linear: self.linear_track(), derby_cars: None };
+        // (`FEGAME_TYPE == 3 && DERBY`, the stream's `DERBY`)
+        // (`NUMCARS` at the grid is the players and the kept traffic, 0x4B5079's fix-up on the launch's 8 + traffic)
+        let grid_rule = nfs_game::race::GridRule { linear: self.linear_track(), derby_cars: self.net_derby.then(|| n_cars + self.road.traffic_count) };
         // the player's `Grid_slot` slice and pose, for `Car_placeAtSlice` below
         let mut grid_place: Option<(usize, Vec3)> = None;
         let rot = match &table {
@@ -22514,7 +25372,7 @@ impl App {
                 tracing::info!(
                     slice,
                     lap_slices = t.lap_len,
-                    grid = self.player_grid,
+                    startingpos = g_log(Some(self.player_grid)),
                     cars = n_cars,
                     "grid pose"
                 );
@@ -22583,6 +25441,70 @@ impl App {
                             .collect()
                     }
                 };
+                // **Each remote player races the car its own machine built** (0x4EEDA0, kind 1): the
+                // launch's per-slot records at the players' race indices (`network.md` §11.12) fill
+                // the opponent seats in the room's order — the seat of a player is its index among
+                // the others, which is how 0x4B4DA0 numbers `player+0x4C`. `.FILENAME` / `.SPECNAME` /
+                // `.BODYSTYLE` name the car, `.COLORCONFIG` / `.STRIPEPACKAGE` its paint, `.LICENSE`
+                // the plate, `.RACENUMBER` the number, `.DRIVER` the driver; a seat whose owner sent
+                // no car (or one this install lacks) keeps the seat's own.
+                let mut plan = plan;
+                let mut seat_recs: Vec<Option<nfs_net::launchcar::CarSlot>> = vec![None; plan.len()];
+                // (a network race played back from a file has no session: the names come from the file)
+                let net_names: Option<Vec<String>> = match (self.net.session.as_ref(), self.replay_net.as_ref()) {
+                    (Some(n), _) => Some(n.remote_players().into_iter().map(|p| p.1).collect()),
+                    (None, Some(r)) => Some(r.names.clone()),
+                    (None, None) => None,
+                };
+                if let Some(room_names) = net_names {
+                    use nfs_net::launchcar::id as cid;
+                    for (k, rec) in self.net_seat_cars.iter().enumerate() {
+                        let Some(p) = plan.get_mut(k) else { break };
+                        let text = |i: u32| rec.text(i).map(|b| b.iter().map(|&c| nfs_formats::locale::cp1252(c)).collect::<String>());
+                        let Some(file) = text(cid::FILENAME).filter(|f| !f.is_empty()) else {
+                            tracing::warn!(seat = k, "network opponent sent no car record: the seat keeps its own car");
+                            continue;
+                        };
+                        let (spec, body) = (text(cid::SPECNAME).unwrap_or_default(), rec.num(cid::BODYSTYLE).map(|v| v as i16));
+                        let same_file = |c: &&nfs_formats::fedata::CarCatalogEntry| c.model.eq_ignore_ascii_case(&file);
+                        let Some(mut e) = catalog
+                            .iter()
+                            .filter(same_file)
+                            .find(|c| c.sim.eq_ignore_ascii_case(&spec) && Some(c.variant) == body)
+                            .or_else(|| catalog.iter().filter(same_file).find(|c| c.sim.eq_ignore_ascii_case(&spec)))
+                            .or_else(|| catalog.iter().find(same_file))
+                            .cloned()
+                        else {
+                            tracing::warn!(seat = k, file, "network opponent's car is not in this install: the seat keeps its own");
+                            continue;
+                        };
+                        // the record's own spec names (the `evenstvn` code sends "993coupe36" / "993")
+                        if !spec.is_empty() {
+                            e.sim = spec.clone();
+                        }
+                        if let Some(a) = text(cid::AISPECNAME).filter(|a| !a.is_empty()) {
+                            e.sim_family = a;
+                        }
+                        // `.COLORCONFIG` = exterior, stripe 1, stripe 2, interior (0x4EF100…0x4EF13C)
+                        let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+                        let colour = rec.num(cid::COLOUR).map_or(p.1, rgb);
+                        p.0 = e.clone();
+                        p.1 = colour;
+                        p.2 = text(cid::LICENSE).filter(|l| !l.is_empty()).or_else(|| room_names.get(k).cloned()).unwrap_or_default();
+                        if let Some(g) = self.net_seat_grids.get(k).copied().flatten() {
+                            p.4 = Some(g);
+                        }
+                        if let Some(r) = rec.num(cid::RACENUMBER) {
+                            p.5 = r as i32;
+                        }
+                        tracing::info!(
+                            seat = k, car = %e.display_name, model = %e.model, sim = %e.sim, colour = format_args!("{:02X}{:02X}{:02X}", colour[0], colour[1], colour[2]),
+                            plate = %p.2, grid = g_log(self.net_seat_grids.get(k).copied().flatten()),
+                            "network opponent's car (0x4EEDA0 record: .FILENAME / .SPECNAME / .COLOUR / .LICENSE)"
+                        );
+                        seat_recs[k] = Some(rec.clone());
+                    }
+                }
                 for (g, (entry, paint, name, skill, grid, decal)) in plan.iter().enumerate() {
                     // the opponent record's parts (0x4ED880), for a career opponent
                     let parts: Vec<nfs_formats::career::Part> = self.career_opponents.as_ref().and_then(|l| l.get(g)).map(|o| o.parts.clone()).unwrap_or_default();
@@ -22591,22 +25513,39 @@ impl App {
                     // career set one (knockout 0x4DE150, tournament ranks 0x503660)
                     let slot = g;
                     let g = grid.unwrap_or((n_cars - 1).saturating_sub(g as u32 + 1));
-                    let entry_993 = self.cheat_993(entry.clone());
+                    // a remote player's car is what its own machine sent (`.SPECNAME` already holds the
+                    // sender's `evenstvn` code): this machine's cheat bits are not applied to it
+                    let seat_rec = seat_recs.get(slot).and_then(|r| r.as_ref());
+                    let entry_993 = if seat_rec.is_some() { entry.clone() } else { self.cheat_993(entry.clone()) };
                     let entry = &entry_993;
+                    // `.TINYCAR` 0x24F is per car: a remote player's car is tiny when *its* record says so (its own
+                    // machine's Gulliver code, sent only when set), every other car by this machine's own bit
+                    let car_tiny = seat_rec.map_or(self.cheat_bits & (1 << 1) != 0, |r| r.num(nfs_net::launchcar::id::TINYCAR).is_some_and(|v| v != 0));
                     let (Ok(assets), Ok(sim)) = (
                         CarAssets::load(&self.paths, &entry.model).map(|c| {
                             let mut c = c.with_style(entry.variant).with_cabrio(entry.cabrio).with_style_overlay(swaps);
-                            c.tiny = self.cheat_bits & (1 << 1) != 0;
+                            c.tiny = car_tiny;
                             c
                         }),
                         CarAssets::load_sim(&self.paths, &entry.sim),
                     ) else {
                         continue;
                     };
-                    let paint = Paint::matching(entry, *paint);
+                    let mut paint = Paint::matching(entry, *paint);
+                    // `.COLORCONFIG` (exterior, stripe 1, stripe 2, interior) and `.STRIPEPACKAGE`
+                    if let Some(rec) = seat_rec
+                        && let Some(cc) = rec.array(nfs_net::launchcar::id::COLORCONFIG).filter(|a| a.len() == 4)
+                    {
+                        let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+                        paint = Paint { exterior: rgb(cc[0]), stripe1: rgb(cc[1]), stripe2: rgb(cc[2]), interior: rgb(cc[3]), package: rec.num(nfs_net::launchcar::id::STRIPEPACKAGE).unwrap_or(0) };
+                    }
                     let mut assets = assets;
                     assets.page_text = Some(self.page_text(slot + 1, name, Some(*decal)));
-                    assets.driver = nfs_assets::car::DriverSeat { driver: (driver_rand.next() & 7) as u32, no_driver: false, factory_driver };
+                    // the draw stays (the seat order of the shared generator is the same), a remote
+                    // player's own `.DRIVER` (its profile picture, 0x4EEDBD) replaces the value
+                    let drawn = (driver_rand.next() & 7) as u32;
+                    let driver = seat_rec.and_then(|r| r.num(nfs_net::launchcar::id::DRIVER)).unwrap_or(drawn);
+                    assets.driver = nfs_assets::car::DriverSeat { driver, no_driver: false, factory_driver };
                     let Ok(model) = CarModel::upload_with_env(
                         &mut renderer,
                         &assets,
@@ -22615,7 +25554,9 @@ impl App {
                         paint,
                         car_env,
                         self.track.is_night(),
-                        Some(0),
+                        // `.CABRIODOWN` 0x24B: 0 for every car but a player's (0x4EEF0C), whose own
+                        // machine sent `Car.Roof` through 0x4F1E40's predicate
+                        Some(seat_rec.and_then(|r| r.num(nfs_net::launchcar::id::CABRIODOWN)).unwrap_or(0)),
                         self.skidpad_rule(),
                     ) else {
                         continue;
@@ -22624,29 +25565,78 @@ impl App {
                         &sim,
                         entry.sim.to_lowercase().starts_with("gt") || entry.sim.starts_with("935"),
                     );
-                    if self.cheat_bits & (1 << 1) != 0 {
+                    if car_tiny {
                         specs.apply_tinycar();
                     }
-                    // `CarSim_applyParts` on the opponent's parts, whose grip ratio the `.ais`
-                    // loader then reads (0x49CAD7, `ai.md` §2.1)
-                    let grip_ratio = specs.apply_parts(&parts.iter().collect::<Vec<_>>(), &entry.sim_family);
-                    // the installed-part list `car+0x768`: a career opponent's own parts (its
-                    // ids, at their carried state) when it has any, else the record's stock parts
-                    // (`specs.rs:49`, `stock_parts`) — every FE car, career or not, is
-                    // `FECar::init`'s unconditional 0x4EE9A0 stock-fit at construction
-                    specs.parts = if parts.is_empty() {
-                        nfs_physics::specs::stock_parts(&entry.stock_parts, &parts_table)
-                    } else {
-                        nfs_game::career::installed_parts(&parts.iter().collect::<Vec<_>>(), None)
+                    // `CarSim_applyParts` 0x49CB50 on the opponent's installed list, whose grip ratio the
+                    // `.ais` loader then reads (0x49CAD7, `ai.md` §2.1). Which list: a remote player's
+                    // record (0x4EEDA0, kind 1) sends `.PARTINDEX` — its installed parts, used when they
+                    // are not the car's stock ones; a career opponent brings its own parts (`opp+0x04`);
+                    // every other FE car is `FECar::init`'s unconditional 0x4EE9A0 stock fit
+                    // (0x4EED28) — the record's stock parts, **folded** here since 0x49CB50 walks
+                    // `car+0x768` for every car of the race, whoever it belongs to.
+                    let seat_parts: Option<Vec<&nfs_formats::career::Part>> = seat_rec.and_then(|rec| {
+                        let ids: Vec<i16> = rec.parts().into_iter().map(|p| p as i16).collect();
+                        (!ids.is_empty() && ids != entry.stock_parts).then(|| ids.iter().filter_map(|id| parts_table.iter().find(|p| p.id == *id)).collect())
+                    });
+                    let fold_list: Vec<&nfs_formats::career::Part> = match (&seat_parts, parts.is_empty()) {
+                        (Some(o), _) => o.clone(),
+                        (None, false) => parts.iter().collect(),
+                        (None, true) => entry.stock_parts.iter().filter_map(|id| parts_table.iter().find(|p| p.id == *id)).collect(),
                     };
+                    let block_before = (specs.grip, specs.transfer_div, specs.roll_gain, specs.top_speed);
+                    let grip_ratio = specs.apply_parts(&fold_list, &entry.sim_family);
+                    // the installed-part list `car+0x768`: the list just folded, at its carried state
+                    // (a career opponent's ids, else the record's stock ones — `specs.rs:49`, `stock_parts`)
+                    specs.parts = match (&seat_parts, parts.is_empty()) {
+                        (Some(o), _) => nfs_game::career::installed_parts(o, None),
+                        (None, false) => nfs_game::career::installed_parts(&parts.iter().collect::<Vec<_>>(), None),
+                        (None, true) => nfs_physics::specs::stock_parts(&entry.stock_parts, &parts_table),
+                    };
+                    // then the seventeen car-setup sliders (0x49CB50 folds them in after the parts,
+                    // 0x49D290): a remote player's own (`.CARSETUP` records), else the constructor's
+                    // neutral ones (0x4EED2D — every FECar carries them and 0x4EEDA0 streams them for
+                    // every kind, 0x4EF179…0x4EF32F). `carinfo+0xC` is `.TRANSMISSION` 0x221: the
+                    // record's, else the gearbox option (0x4EEDA0 writes it for every kind whose
+                    // `param_7` is 0 — the opponents' callers 0x4EBCBF / 0x4EBF06 / 0x4EC3FF and 0x4DE213 pass 0)
+                    let mut seat_setup = None;
+                    let automatic = seat_rec
+                        .and_then(|rec| rec.num(nfs_net::launchcar::id::TRANSMISSION))
+                        .map_or_else(|| self.player_automatic(), |v| v == 1);
+                    let setup = seat_rec.and_then(|rec| rec.setup());
+                    if let Some(setup) = setup {
+                        seat_setup = Some(setup);
+                    }
+                    specs.apply_setup(&setup.unwrap_or(nfs_game::career::CAR_SETUP_DEFAULT), automatic);
+                    tracing::info!(
+                        seat = slot, model = entry.model, parts = fold_list.len(), grip_ratio,
+                        grip_before = block_before.0, grip = specs.grip, transfer_div_before = block_before.1, transfer_div = specs.transfer_div,
+                        roll_gain_before = block_before.2, roll_gain = specs.roll_gain, top_speed_before = block_before.3, top_speed = specs.top_speed,
+                        "opponent's stock parts / own parts and set-up folded (0x49CB50)"
+                    );
                     let (p, r, sl) = grid_pose(t, start_scene, g, n_cars, &grid_rule);
                     let (linear, finish) = (self.linear_track(), nfs_game::race::finish_slice(t, start_scene));
                     let mut vehicle = Vehicle::new(p, r, &specs, model.half_track, model.wheel_radius);
                     vehicle.race_started = false;
                     vehicle.traction_control = true; // AI cars never spin their wheels (Tyre 0x4A20D0)
                     vehicle.ai_driven = true;
+                    // the remote car's `carinfo` options: `.TRACTION` 0x23B → `carinfo+0x20` (`Vehicle::tcs`),
+                    // `.TRANSMISSION` 0x221 → `+0xC`, `.ABS` 0x23A → `+0x24` (no field of the port's
+                    // vehicle: the ABS arm 0x4A2308 / 0x4A23CC is not ported, `physics.md` §5.4)
+                    if let Some(rec) = seat_rec {
+                        use nfs_net::launchcar::id as cid;
+                        vehicle.tcs = rec.num(cid::TRACTION).is_some_and(|v| v != 0);
+                        vehicle.automatic = rec.num(cid::TRANSMISSION).is_none_or(|v| v == 1);
+                        tracing::info!(
+                            seat = slot, abs = rec.num(cid::ABS), traction = rec.num(cid::TRACTION), roof = rec.num(cid::CABRIODOWN),
+                            transmission = rec.num(cid::TRANSMISSION), driver = rec.num(cid::DRIVER), body_style = rec.num(cid::BODYSTYLE),
+                            package = rec.num(cid::STRIPEPACKAGE), race_number = rec.num(cid::RACENUMBER).map(|v| v as i32),
+                            parts = ?rec.parts(), setup = ?seat_setup.map(|s| s.map(|v| (v * 100.0).round() / 100.0)),
+                            "network race setup: the remote car carries its owner's carinfo (0x4EEDA0 kind 1)"
+                        );
+                    }
                     // the body `RCar::load` builds: 0x445090's model box, `BndP` less `car+0x3AC`
-                    let (pts, half) = nfs_game::world::car_body(&assets, self.cheat_bits & (1 << 1) != 0);
+                    let (pts, half) = nfs_game::world::car_body(&assets, car_tiny);
                     vehicle.set_car_body(pts, half);
                     // `Car_raceInit` 0x410730: `Grid_slot` 0x410580's slice and offset into
                     // `Car_placeAtSlice` 0x49B090 (0x41095C), dir +1 — the port's reversed table
@@ -22656,11 +25646,17 @@ impl App {
                     let s = &t.slices[sl];
                     vehicle.place_at_slice(&world.collision, &specs, s.centre, s.forward, grid_offset(s, p), true, false);
                     let mut model = model;
-                    if self.cheat_bits & (1 << 1) != 0 {
+                    if car_tiny {
                         model.scale = 0.4;
                     }
                     // its dash needles' calibration (0x4EF331…0x4EF37B, per car)
-                    model.set_dash(entry.dash[0], entry.dash[1], entry.dash[2], entry.dash[3]);
+                    let dash = seat_rec
+                        .and_then(|r| {
+                            use nfs_net::launchcar::id as cid;
+                            Some([r.num(cid::TACH0RPM)?, r.num(cid::TACH1000RPM)?, r.num(cid::SPEEDO0KM)?, r.num(cid::SPEEDO100KM)?].map(f32::from_bits))
+                        })
+                        .unwrap_or(entry.dash);
+                    model.set_dash(dash[0], dash[1], dash[2], dash[3]);
                     self.road.opponent_models.push(model);
                     let controller = match CarAssets::load_ais(&self.paths, &entry.model) {
                         Ok(ais) => {
@@ -22699,6 +25695,9 @@ impl App {
                         resets: 0,
                         eliminated: false,
                         off_surface: false,
+                        // `Car_init` 0x410C74: the night flag
+                        lamp_bits: if self.track.is_night() { 3 } else { 0 },
+                        tiny: car_tiny,
                     });
                 }
                 // network play: every opponent seat belongs to a remote player. Their cars sit on
@@ -22706,10 +25705,6 @@ impl App {
                 // controllers never run.
                 if let Some(n) = self.net.session.as_mut() {
                     n.reserve((0..self.road.opponents.len()).collect());
-                    // 0x427A60: `pic16.fsh` from the HUD folder, for the others' `HLeader`
-                    if let Some(b) = GamePaths::find_file(&self.paths.game_data().join("DashHud"), "pic16.fsh").and_then(|p| std::fs::read(p).ok()) {
-                        n.post_picture(&b);
-                    }
                     for o in self.road.opponents.iter_mut() {
                         o.controller = Controller::Parked;
                     }
@@ -22718,6 +25713,18 @@ impl App {
                         host = n.is_host(),
                         "network seats reserved"
                     );
+                } else if self.replay_net.is_some() {
+                    // a network race played back: every human car is fed from its lane of the stream, and is
+                    // a human car as `net_exchange_begin` made it — no AI flag, no AI traction control
+                    let seat_index: Vec<u32> = self.replay_net.as_ref().map(|r| r.seats.clone()).unwrap_or_default();
+                    for (k, o) in self.road.opponents.iter_mut().enumerate() {
+                        o.controller = Controller::Parked;
+                        if seat_index.get(k).is_some_and(|i| *i != u32::MAX) {
+                            o.vehicle.ai_driven = false;
+                            o.vehicle.traction_control = false;
+                        }
+                    }
+                    tracing::info!(seats = self.road.opponents.len(), "network replay: the seats' cars are fed from the stream");
                 }
                 // traffic (`traffic.md` §1, §8, §9): the track's seven traffic car ids are
                 // `nfs5.trk +0x7C`; their `nfs5.car` records carry only a display name, a model and a
@@ -22725,6 +25732,8 @@ impl App {
                 // Which of the race's car slots take which id is not in the notes (§8, UNKNOWN), so
                 // the ids are handed out in table order and cycled when more cars than ids are asked
                 // for (the heavy career setting wants eight).
+                // the host's per-slot colours are for this launch only (set by `net_race_apply`)
+                let net_colours = std::mem::take(&mut self.road.traffic_colours);
                 self.road.traffic = None;
                 self.road.traffic_models.clear();
                 self.road.traffic_sets.clear();
@@ -22758,6 +25767,14 @@ impl App {
                     // `BndP` body points `RCar::load` builds (`car_body`) for its `RigidBody`
                     let mut boxes: Vec<Vec3> = Vec::new();
                     let mut points: Vec<Vec<Vec3>> = Vec::new();
+                    // each traffic car's own block: `default.sim` (its sim name is empty, §21.1) with
+                    // its record's stock parts (0x4EE9A0) and the neutral sliders (0x4EED2D) folded in
+                    // by 0x49CB50 — a traffic car is a racer slot below `NUMCARS`, so 0x411130 builds
+                    // its parts (0x49C4C0) and 0x410D60 its block (0x49C6C0 → 0x49CB50) like any car's
+                    let traffic_parts_table = self.fe_parts_table();
+                    let traffic_automatic = self.player_automatic();
+                    let traffic_sim = CarAssets::load_sim(&self.paths, "default").ok();
+                    let mut traffic_car_specs: Vec<CarSpecs> = Vec::new();
                     for k in 0..traffic_count as usize {
                         let Some(id) = ids.get(k % ids.len().max(1)).copied() else {
                             break;
@@ -22786,7 +25803,12 @@ impl App {
                                         continue;
                                     }
                                 };
-                                let paint = if entry.paint_sets.is_empty() { Paint::from([0x8C, 0x8C, 0x90]) } else { Paint::from_catalogue(entry, 0) };
+                                let paint = match net_colours.get(k).copied().flatten() {
+                                    // the host's `.COLOUR` for this slot, where it differs (network race)
+                                    Some(c) => Paint::from(c),
+                                    None if entry.paint_sets.is_empty() => Paint::from([0x8C, 0x8C, 0x90]),
+                                    None => Paint::from_catalogue(entry, 0),
+                                };
                                 // a traffic car (`car+0x52C & 0x10`) has no driver: slot 9 = 0 (0x43AED4)
                                 let mut assets = assets;
                                 assets.driver = nfs_assets::car::DriverSeat { driver: 0, no_driver: true, factory_driver };
@@ -22822,23 +25844,27 @@ impl App {
                         // `car-model.md` §12) — `car+0x3AC` is also how far the body origin sits
                         // above the model's ground (`TrafficCar::draw_origin`)
                         self.road.traffic_sets.push(entry.sound_set.clone());
-                        self.road.traffic_paints.push(
-                            entry
-                                .paint_sets
-                                .first()
-                                .map(|p| p.colours[0])
-                                .unwrap_or([0x8C, 0x8C, 0x90]),
-                        );
+                        self.road.traffic_paints.push(net_colours.get(k).copied().flatten().unwrap_or_else(|| {
+                            entry.paint_sets.first().map(|p| p.colours[0]).unwrap_or([0x8C, 0x8C, 0x90])
+                        }));
                         plan.push(TrafficSpec {
                             model: slot,
                             bus,
                             half_extents: boxes[slot],
                         });
+                        if let Some(sim) = &traffic_sim {
+                            // (`.TINYCAR` is on every car but traffic — `CarSpecs::apply_tinycar`)
+                            let mut cs = CarSpecs::from_sim(sim, false);
+                            nfs_game::career::fold_fresh_car(&mut cs, &entry.stock_parts, &traffic_parts_table, &entry.sim_family, traffic_automatic);
+                            traffic_car_specs.push(cs);
+                        }
                     }
                     if self.road.traffic_specs.is_none() {
-                        self.road.traffic_specs = CarAssets::load_sim(&self.paths, "default")
-                            .ok()
-                            .map(|sim| CarSpecs::from_sim(&sim, false));
+                        self.road.traffic_specs = traffic_sim.as_ref().map(|sim| {
+                            let mut cs = CarSpecs::from_sim(sim, false);
+                            nfs_game::career::fold_fresh_car(&mut cs, &[], &traffic_parts_table, "", traffic_automatic);
+                            cs
+                        });
                     }
                     if !plan.is_empty() {
                         // the table is already reversed for a backwards race, so the route direction
@@ -22853,7 +25879,7 @@ impl App {
                         let mut set = TrafficSet::new(&plan, t, 1.0, linear, seed);
                         // `RigidBody_init` 0x49B510 for each car with `default.sim` (§21.1)
                         let specs = self.road.traffic_specs.clone().unwrap_or_else(|| self.specs.clone());
-                        set.set_bodies(&specs, &points);
+                        set.set_bodies_each(&traffic_car_specs, &specs, &points);
                         set.cops_race = self.road.cops_race;
                         // `TRACK_NAME` for the spawn gate's canyon / industrial windows (0x40E0AD)
                         set.set_track(&self.track.name);
@@ -22870,7 +25896,7 @@ impl App {
                         // §33.3) gates the human-honk trigger (0x40172E). Only `fe.txt` sets it —
                         // no race-setup message carries id 0x21 and the track spec `Tr00.bin` that
                         // 0x475C80 would overwrite it from is not shipped
-                        set.time_mode = self.registry.u32("time", 0) != 0;
+                        set.time_mode = self.net_fe_txt.get("time").copied().unwrap_or_else(|| self.registry.u32("time", 0)) != 0;
                         // `scripts.bin` drives the reactions of `traffic.md` §12.3 / §12.9 / §30
                         if let Some(p) = GamePaths::find_file(
                             &self.paths.game_data().join("Simulation").join("AI"),
@@ -22999,9 +26025,18 @@ impl App {
                             // ground (`CopCar::draw_origin`)
                             let half = boxes[slot];
                             // a cop car has a real `.sim` (§17.1), so its mass is the sim's
+                            // …folded by 0x49CB50 like every racer's: the record's stock parts (0x4EE9A0) and
+                            // the neutral sliders (0x4EED2D), `.TRANSMISSION` the gearbox option (0x4ED174's
+                            // `param_7` is 0)
+                            let cop_automatic = self.player_automatic();
+                            let cop_parts_table = self.fe_parts_table();
                             let specs = CarAssets::load_sim(&self.paths, &entry.sim)
                                 .ok()
-                                .map(|s| CarSpecs::from_sim(&s, false))
+                                .map(|s| {
+                                    let mut cs = CarSpecs::from_sim(&s, false);
+                                    nfs_game::career::fold_fresh_car(&mut cs, &entry.stock_parts, &cop_parts_table, &entry.sim_family, cop_automatic);
+                                    cs
+                                })
                                 .unwrap_or_else(|| self.specs.clone());
                             self.road.police_sets.push(entry.sound_set.clone());
                             self.road.police_specs.push(specs.clone());
@@ -23173,6 +26208,9 @@ impl App {
         self.head_ramp = HeadRamp::default();
         self.hud_hidden = false;
         tracing::info!(pos = ?self.car_pos, "car placed");
+        // 0x414E74: step 9 right after `Cars_create`; the HUD factory 0x424460 and the rest of the race
+        // set-up (0x4690D0, 0x434A90, 0x415DC0, 0x4121B0) follow it in 0x4B67B0, as here
+        self.race_loading_frame(&mut renderer, 9);
         // 0x426A80(0): every racer's damage total as it lines up, garage damage included
         self.start_damage = [0; 8];
         if let Some(v) = &self.vehicle {
@@ -23468,14 +26506,6 @@ impl App {
         // doc, `RE/notes/particles.md` §10.1) — the same items the collision grid above turns
         // into triangles
         self.skid = nfs_game::skidmarks::SkidMarks::for_world_items(&world.skid_items, lo, hi);
-        // the trackside cameras and their triggers travel with the track (`race-logic.md` §3.3)
-        self.track_cameras = self
-            .track
-            .cameras
-            .as_ref()
-            .map(nfs_game::cameras::TrackCameras::from_scene);
-        // the `CmAn` camera paths (0x471850 from `WTrack::load`, 0x48779C)
-        self.cam_anims = nfs_game::camera::anim_cam::load(&self.track.crp, &self.track.crp_data);
         // a replay about to play opens on the track's flagged camera: `Replay_startRace` 0x413EA0
         // (`[0x5E99F4] >= 2`, camera elements present) sets every car's `+0x10E4` to 0x46D890()
         // and switches to it (0x413F08…0x413F37) — except in a factory-driver replay
@@ -23561,12 +26591,17 @@ impl App {
         for sm in &mut self.smackables.props {
             sm.body.damage_enabled = damage_on;
         }
-        // 0x4A4A70(9) at the end of the load (0x414E74) and 10, the screen down (0x4B68CB)
-        self.race_loading_frame(&mut renderer, 9);
+        // 0x4A4A70(10), the screen down (0x4B68CB), after the barrier
+        // 0x4B68C4: the barrier between them, the loading screen redrawn while it waits
+        self.net_load_barrier(&mut renderer);
         self.race_loading_frame(&mut renderer, 10);
         self.renderer = Some(renderer);
         self.window = Some(window);
         self.rebuild_scene();
+        // the session loop's barriers and the race frame's `0xC5` round (`net_race_go`)
+        self.net_race_go();
+        // …and the exchange's own race-frame step (`net_exchange_begin`: the seats are human cars, the state dump)
+        self.net_exchange_begin();
         self.last_frame = Instant::now();
         self.fps_timer = Instant::now();
         if let Some(secs) = self.autotest.take() {
@@ -23578,7 +26613,32 @@ impl App {
             // `nfs_game::car_effects`) run as in a windowed race
             let smack_frames = std::env::var_os("NFS_SMACK_DRIVE").is_some() || std::env::var_os("NFS_CONE_DRIVE").is_some() || std::env::var_os("NFS_FX_FRAMES").is_some();
             let mut pause_hold = 0;
+            // **TEST GLUE** (not in the original): `NFS_NET_PACE=1` holds a scripted network race to
+            // the game's own 64 Hz, so the two machines' tick counters stay comparable — the link
+            // classification (0x490140) measures a packet's age against the game tick, and an unpaced
+            // headless run lets one machine's tick run far ahead of the other's
+            let exchange_run = self.net.session.as_ref().is_some_and(|n| n.exchanging());
+            let pace = (std::env::var_os("NFS_NET_PACE").is_some() && self.net.session.is_some() && !exchange_run).then(Instant::now);
             for t in 0..ticks {
+                self.net_race_notice();
+                // an input-exchange race runs a tick when the frames and the host's clock allow it
+                if exchange_run && !self.net_exchange_wait() {
+                    tracing::warn!(tick = self.tick, "the input exchange stopped: the scripted run ends");
+                    break;
+                }
+                if let Some(t0) = pace
+                    && let Some(wait) = (t0 + Duration::from_micros(u64::from(t) * 15_625)).checked_duration_since(Instant::now())
+                {
+                    std::thread::sleep(wait);
+                }
+                // diagnostic `NFS_HUD_KEYS=tick:pause` in a network race: the press has asked to leave
+                if std::mem::take(&mut self.scripted_net_leave) {
+                    if !self.leave_race_as(false) {
+                        tracing::info!("network race left by a scripted pause press: no front end to return to");
+                    }
+                    event_loop.exit();
+                    return;
+                }
                 // diagnostic `NFS_HUD_KEYS=tick:pause`: the headless run holds the pause for 64 of
                 // its iterations (no tick runs), the audio paused and resumed as a frame would
                 if self.scripted_pause {
@@ -24244,6 +27304,34 @@ impl App {
                 if let Some(n) = self.fe.layout_preview.as_ref().and_then(|l| l.camera_select_of(hit)) {
                     self.fe.camera_current = n as usize;
                 }
+                // `NFS5.CAMERAPICTURE`'s slot 9, **0x4BF920**: not focused (0x4BF923 `0x4C7DD0`,
+                // `[+0x10C] & 0x40` — set only by 0x4C7D70 for a widget whose `[+0x110]` has 0x40,
+                // which the base ctor 0x4C7480 clears and the base bind 0x4C7530 never sets), and
+                // `[0x5DEB48] / 2` — half a second — since the widget's last release (0x4BF969…
+                // 0x4BF984: the game timer 0x53C2E0 less `[this+0x140]`, `jge 0x4BF9CA`): the time
+                // is taken (0x4BF9E3…0x4BF9EE) and `Camera.<Camera.Current + 1>` (the accessor at
+                // `[this + 0x154 + 4·Camera.Current]`, 0x4BF9E8…0x4BF9F9) gets
+                // `SetSelection(data.picturenum)` (slot 0x2C, 0x4BFA0B). A quicker second release
+                // only clears the time (0x4BF99B `[this+0x140] = 0`), redraws (0x4C8AC0), plays 0x528850
+                // (a sound call, not read) and puts the number in `[0x5D7A20]`, a cell only this
+                // widget's draw and release read; no accessor is written.
+                if let Some(pic) = self.fe.layout_preview.as_ref().and_then(|l| l.camera_picture_of(hit)) {
+                    let now = Instant::now();
+                    if self.fe.camera_pic_click.get(&hit).is_none_or(|t| now.duration_since(*t) >= Duration::from_millis(500)) {
+                        self.fe.camera_pic_click.insert(hit, now);
+                        if let Some(slot) = self.fe.camera_list.get_mut(self.fe.camera_current) {
+                            *slot = pic;
+                        }
+                    } else {
+                        self.fe.camera_pic_click.remove(&hit);
+                    }
+                }
+                // the accessors' new values reach the screen's draw at once, as the next frame's
+                // read of them would (the frame hook does the same on every tick)
+                if let Some(l) = self.fe.layout_preview.as_mut() {
+                    l.set_camera_current(self.fe.camera_current);
+                    l.set_camera_list(self.fe.camera_list);
+                }
                 // `NFS5.KNOCKOUTTRACKLIST`'s slot 9, **0x4FA470**: the row under the
                 // pointer becomes `Knockout.TrackNumber`'s selection when it is below the
                 // opponent count
@@ -24583,17 +27671,7 @@ impl ApplicationHandler for App {
                         Key::Named(NamedKey::Enter)
                             if self.fe.layout_preview.as_ref().and_then(|l| l.class_of(i)).as_deref() == Some("NFS5.CHARVECTACCESSORINPUTBOX") =>
                         {
-                            if let Some((name, text)) = self.fe.layout_preview.as_mut().and_then(|l| l.commit_input(i)) {
-                                if name == "Comms.IP"
-                                    && !text.is_empty()
-                                    && let Some(lobby) = self.net.lobby.as_mut()
-                                {
-                                    lobby.ip = text.clone();
-                                    lobby.sel = 0;
-                                }
-                                tracing::info!(accessor = %name, value = %text, "list input box committed");
-                                self.bind_lists();
-                            }
+                            self.fe_charvect_return(i);
                             return;
                         }
                         Key::Named(NamedKey::Enter) => {
@@ -24608,10 +27686,8 @@ impl ApplicationHandler for App {
                             took = self.fe.layout_preview.as_mut().is_some_and(|l| l.backspace(i));
                         }
                         Key::Character(t) => {
-                            if let Some(c) = t.chars().next()
-                                && let Some(l) = self.fe.layout_preview.as_mut()
-                            {
-                                took = l.type_char(i, c);
+                            if let Some(c) = t.chars().next() {
+                                took = self.fe_input_key(i, c);
                             }
                         }
                         Key::Named(NamedKey::Space) => {
@@ -24622,6 +27698,8 @@ impl ApplicationHandler for App {
                     // Every accepted path in 0x4CCC20 ends at `0x4AADB0(9)`.
                     if took {
                         self.fe_sound(9);
+                        // the name field's text gates `ID_CREATEPLAYEROKBUTTON`
+                        self.bind_player_buttons();
                         return;
                     }
                 }
@@ -24673,7 +27751,12 @@ impl ApplicationHandler for App {
                 // question or resumed — an APPROXIMATION of a key the original does not have.)*
                 // Once the pages have closed it opens the menu, whose quit leaves
                 let dialog_up = self.paused || (self.results.is_some() && self.result_pages().get(self.results_page as usize).is_some());
-                if dialog_up {
+                if self.vehicle.is_some() && self.fe.race_game_type == Some(3) {
+                    // a network race (`[0x6573E8] == 3`): 0x415110's own rules, not the single-player pause
+                    if self.input.take_pressed(Action::Pause) {
+                        self.net_pause_action(event_loop);
+                    }
+                } else if dialog_up {
                     let _ = self.input.take_pressed(Action::Pause);
                 } else if self.input.take_pressed(Action::Pause) {
                     if self.vehicle.is_some() {
@@ -24792,6 +27875,19 @@ impl ApplicationHandler for App {
                     && self.mission_result.is_some_and(|(passed, _)| !passed)
                 {
                     self.restart_race(event_loop);
+                    self.input.end_tick();
+                    return;
+                }
+                // Space on the pause action's `HInfo` 18190 (`[0x60C9FC]`, Spacebar byte 1): the billboard's
+                // slot 9 answers 0x19 and the notice slides out (0x42A3D0, 0x4261ED)
+                if event.state == winit::event::ElementState::Pressed
+                    && event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Space)
+                    && self.vehicle.is_some()
+                    && self.net_notice.is_some()
+                    && self.net_notice_space
+                {
+                    self.net_notice = None;
+                    self.net_notice_space = false;
                     self.input.end_tick();
                     return;
                 }
@@ -25007,6 +28103,10 @@ impl ApplicationHandler for App {
                 self.frame_dt = (now - self.last_frame).as_secs_f32();
                 self.last_frame = now;
                 self.draw_frame();
+                if std::mem::take(&mut self.net.start_due) && self.net_playgame() {
+                    self.net_launch_sync();
+                    self.start_from_layout(event_loop);
+                }
             }
             // the program is ending (a playback's end with no front end, `replay_exit_check`):
             // no more race frames
@@ -25070,14 +28170,29 @@ impl ApplicationHandler for App {
                 if halted {
                     self.accumulator = Duration::ZERO;
                 }
-                while self.accumulator >= GAME_TICK {
+                // **An input-exchange race's frame driver** (0x415455…0x415495, 0x415BD4): the ticks that
+                // run are the ones the frames received and the host-synchronised clock allow, not the
+                // local time's
+                // the HUD tick's `HInfo` (0x425E0B): the network notices, once a frame
+                self.net_race_notice();
+                let exchange = self.net.session.as_ref().is_some_and(|n| n.exchanging());
+                if exchange && halted {
+                    let _ = self.net_exchange_gate();
+                }
+                let mut ran = 0;
+                while if exchange { !halted && ran < 16 && self.net_exchange_gate() } else { self.accumulator >= GAME_TICK } {
+                    ran += 1;
                     // a scripted pause (`NFS_HUD_KEYS`) taken inside a tick ends the frame's ticks,
                     // as the pause key between two frames does
                     if self.scripted_pause {
                         self.accumulator = Duration::ZERO;
                         break;
                     }
-                    self.accumulator -= GAME_TICK;
+                    if exchange {
+                        self.exchange_tick_at = Instant::now();
+                    } else {
+                        self.accumulator -= GAME_TICK;
+                    }
                     // replay.md §5.1: playback speed is tick *decimation* inside the catch-up
                     // loop — never a `dt` scale. Every iteration still renders.
                     let n = match &self.replay.stream {
@@ -25096,6 +28211,10 @@ impl ApplicationHandler for App {
                             break;
                         }
                     }
+                }
+                if exchange {
+                    // the render's interpolation runs on the time since the last tick
+                    self.accumulator = now.saturating_duration_since(self.exchange_tick_at).min(GAME_TICK);
                 }
                 // 0x415CB3: the played-back stream's end, after the catch-up loop
                 if self.replay_exit_check(event_loop) {
@@ -25279,7 +28398,7 @@ fn main() -> Result<()> {
     let mission_flag = args.iter().any(|a| a == "--mission");
     // (`NFS_FE_PLAYGAME` keeps the front end for a scripted run: the race starts from it)
     let use_menu = positional.is_empty()
-        && (!args.iter().any(|a| a == "--autotest") || std::env::var_os("NFS_FE_PLAYGAME").is_some())
+        && (!args.iter().any(|a| a == "--autotest") || std::env::var_os("NFS_FE_PLAYGAME").is_some() || std::env::var_os("NFS_FE_KEYS").is_some())
         && career_id.is_none()
         && !mission_flag
         && replay_file.is_none();
@@ -25348,6 +28467,14 @@ fn main() -> Result<()> {
     let catalog = nfs_formats::fedata::parse_car_catalog(&std::fs::read(
         paths.fe_data().join("Data").join("nfs5.car"),
     )?)?;
+    // a replay's car is the catalogue record it names (`car_id`): its body style and roof — the
+    // model's box, wheels and heights the physics builds the car from — as the live race's car had
+    // them (`start_from_layout`'s `with_style(variant).with_cabrio(cabrio)`); found by the network
+    // replay's bit-exact comparison (`replay.md` §18.15)
+    let car = match replay_setup.as_ref().filter(|r| r.car_id != 0).and_then(|r| catalog.iter().find(|e| e.id == r.car_id)) {
+        Some(e) => car.with_style(e.variant).with_cabrio(e.cabrio),
+        None => car,
+    };
     let sim_name = replay_setup
         .as_ref()
         .map(|r| r.sim.clone())
@@ -25386,12 +28513,22 @@ fn main() -> Result<()> {
             .find(|c| c.sim.eq_ignore_ascii_case(&sim_name))
             .map(|c| c.sim_family.clone())
             .unwrap_or_default();
-        specs.apply_parts(&r.parts.iter().collect::<Vec<_>>(), &family);
-        // the installed-part list `car+0x768` with the garage car's carried states, as the
-        // front end's start of the same event builds it (`start_career_event`)
         let owned = career.as_ref().and_then(|cu| cu.pending.as_ref().and_then(|p| p.garage_idx).and_then(|i| cu.career.garage.get(i)));
-        if owned.is_some() {
-            specs.parts = nfs_game::career::installed_parts(&r.parts.iter().collect::<Vec<_>>(), owned);
+        if r.parts.is_empty() && owned.is_none() {
+            // no garage record and no parts of its own: a fresh `FECar` (0x4EE9A0 stock parts, 0x4EED2D
+            // neutral sliders) — same as `load_career_race`'s
+            let stock_ids: Vec<i16> = catalog.iter().find(|c| c.sim.eq_ignore_ascii_case(&sim_name)).map(|c| c.stock_parts.clone()).unwrap_or_default();
+            let table = nfs_formats::career::parse_parts(&std::fs::read(paths.fe_data().join("Data").join("nfs5.prt")).unwrap_or_default()).unwrap_or_default();
+            nfs_game::career::fold_fresh_car(&mut specs, &stock_ids, &table, &family, true);
+        } else {
+            specs.apply_parts(&r.parts.iter().collect::<Vec<_>>(), &family);
+            // the installed-part list `car+0x768` with the garage car's carried states, as the
+            // front end's start of the same event builds it (`start_career_event`)
+            if owned.is_some() {
+                specs.parts = nfs_game::career::installed_parts(&r.parts.iter().collect::<Vec<_>>(), owned);
+            }
+            // …then the sliders (0x49D290): the owned car's own, else the constructor's neutral ones
+            specs.apply_setup(owned.map_or(&nfs_game::career::CAR_SETUP_DEFAULT, |o| &o.setup), true);
         }
     } else {
         // no career request: this CLI/replay invocation's car races on its stock parts
@@ -25402,13 +28539,26 @@ fn main() -> Result<()> {
             .map(|c| c.stock_parts.as_slice())
             .unwrap_or_default();
         let parts_table = nfs_formats::career::parse_parts(&std::fs::read(paths.fe_data().join("Data").join("nfs5.prt")).unwrap_or_default()).unwrap_or_default();
-        specs.parts = nfs_physics::specs::stock_parts(stock_ids, &parts_table);
+        let family = catalog.iter().find(|c| c.sim.eq_ignore_ascii_case(&sim_name)).map(|c| c.sim_family.clone()).unwrap_or_default();
+        // the stock parts (0x4EE9A0) and the constructor's neutral sliders (0x4EED2D) through 0x49CB50;
+        // `.TRANSMISSION` is the gearbox option (`Car.Transmission`), automatic unless it says otherwise
+        let before = (specs.top_speed, specs.final_drive, specs.grip, specs.transfer_div, specs.roll_gain, specs.front_weight);
+        nfs_game::career::fold_fresh_car(&mut specs, stock_ids, &parts_table, &family, true);
+        tracing::info!(
+            stock = ?stock_ids, top_speed_before = before.0, top_speed = specs.top_speed, final_drive_before = before.1, final_drive = specs.final_drive,
+            grip_before = before.2, grip = specs.grip, transfer_div_before = before.3, transfer_div = specs.transfer_div,
+            roll_gain_before = before.4, roll_gain = specs.roll_gain, front_weight_before = before.5, front_weight = specs.front_weight,
+            "the catalogue car's stock parts and neutral set-up folded (0x4EE9A0, 0x4EED2D, 0x49CB50)"
+        );
     }
     let specs = specs;
     tracing::info!(
         sim = sim_name,
         name = specs.name,
         top_speed_mps = specs.top_speed,
+        grip = specs.grip,
+        transfer_div = specs.transfer_div,
+        roll_gain = specs.roll_gain,
         "car specs"
     );
     tracing::info!(
@@ -25667,10 +28817,10 @@ fn main() -> Result<()> {
             lobby.poll();
             std::thread::sleep(Duration::from_millis(20));
         }
-        let games = lobby.games();
+        let games = lobby.rows();
         println!("{} session(s):", games.len());
         for g in &games {
-            println!("  {g}");
+            println!("  {}   {}/{}   {}   ping {}", g.name, g.players, g.limit, g.addr, g.ping.map_or("-".to_string(), |p| p.to_string()));
         }
         return Ok(());
     }
@@ -25768,8 +28918,13 @@ fn main() -> Result<()> {
             after_replay: false,
             test_drive: None,
             game_type: 0,
-            comms_game_mode: 0,
+            // **Diagnostic glue**: `--fe=local` skips the `SETMODELAN` button that leads to that
+            // screen (0x510E00 writes `Comms.GameMode` 1), and the games list's row draw
+            // (0x4BA030) is laid out by that mode, so the direct entry starts in it
+            comms_game_mode: u32::from(fe_start.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("local"))),
             camera_current: 0,
+            camera_list: [0, 1, 2, 3],
+            camera_pic_click: Default::default(),
             race_game_type: None,
             xxdefxx: None,
             track_tables,
@@ -25828,7 +28983,7 @@ fn main() -> Result<()> {
         language: paths.language(),
         choices: std::collections::HashMap::new(),
         paths,
-        net: Network { session: net, lobby: None },
+        net: Network { session: net, lobby: None, start_due: false, join_notified: false, lobby_sent: false, lobby_car: None, race: None, connect_pending: false, connect_opened: false },
         career,
         career_opponents: career_request.map(|r| r.opponents),
         // diagnostic: `NFS_OPPCAR=0..4` picks `OpponentCar.Car` without going through the menu
@@ -25883,6 +29038,7 @@ fn main() -> Result<()> {
         audio_paused: false,
         scripted_pause: false,
         scripted_restart: false,
+        scripted_net_leave: false,
         results_billboard: None,
         billboard_key: 0,
         paused: false,
@@ -25890,6 +29046,18 @@ fn main() -> Result<()> {
         opp_cars: Vec::new(),
         knockout_round: false,
         player_grid_override: None,
+        net_fe_txt: Default::default(),
+        net_nocollision: false,
+        net_seat_grids: Vec::new(),
+        net_seat_cars: Vec::new(),
+        net_own_words: Vec::new(),
+        exchange_in: None,
+        replay_net: None,
+        replay_view: 0,
+        net_derby: false,
+        net_flags: None,
+        net_traffic: Vec::new(),
+        crt_rand: nfs_game::movie_overlay::CRand::new(1),
         backwards,
         mirror: replay_setup
             .as_ref()
@@ -25897,6 +29065,7 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| args.iter().any(|a| a == "--mirror")),
         quick_knockout: args.iter().any(|a| a == "--quick-knockout"),
         player_eliminated: false,
+        net_time_sent: false,
         records,
         replay: Playback {
             stream: Some(match &replay_file {
@@ -25935,6 +29104,7 @@ fn main() -> Result<()> {
                     // overwritten by `start_race`'s own rebuild before this is read for a fresh
                     // (non-replay) race; this placeholder only shows if that never runs
                     driver_name: String::new(),
+                    net: None,
                 }),
             path: nfs_game::save::save_dir().join("replay.prpl"),
             saved: false,
@@ -25944,7 +29114,8 @@ fn main() -> Result<()> {
         },
         // the original seeds the race RNG from the registry's RAND_SEED (replay.md §11); a replay
         // carries the seed so playback re-simulates the same traffic, police and AI
-        cheat_bits: 0,
+        // (**test glue**: `NFS_CHEAT_BITS` sets the cheat bits a name-box code would, for the scripted runs)
+        cheat_bits: std::env::var("NFS_CHEAT_BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         traffic_seed: match (
             &replay_setup,
             std::env::var("NFS_TRAFFIC_SEED")
@@ -26104,6 +29275,7 @@ fn main() -> Result<()> {
             traffic_lods: Vec::new(),
             // the registry's `traffic_density`, or `NFS_TRAFFIC=0..3` for the menu-less --autotest start
             traffic_ids: None,
+            traffic_colours: Vec::new(),
             damage_on: replay_setup.as_ref().is_none_or(|r| r.damage),
             traffic_count: TRAFFIC_COUNT[replay_setup
                 .as_ref()
@@ -26124,6 +29296,11 @@ fn main() -> Result<()> {
         mirror_tex: None,
         wrong_way_blink: (0, 0, true),
         record,
+        net_dump: None,
+        exchange_tick_at: Instant::now(),
+        net_notice: None,
+        net_notice_space: false,
+        net_lag_box: false,
         num_laps,
         follow_road,
         car_half_width: 0.9,
@@ -26197,6 +29374,8 @@ fn main() -> Result<()> {
     app.fe.xxdefxx = Some(app.startup_side());
     // …and the profile's own, when it has saved any — with the rest of what `LoadInfo` restores
     app.apply_saved_profile();
+    // a network race's replay file: its humans, their cars and the traffic (`replay.md` §18.15)
+    app.apply_replay_net();
     // every `<Axis>.Min` / `.Max` starts at 0 / 0x80 (0x51E546, 0x51E550)
     app.input.axis_bands = [[0, 0x80]; 8];
     event_loop.run_app(&mut app)?;
@@ -26462,6 +29641,21 @@ mod look_tests {
 }
 
 #[cfg(test)]
+mod net_page_tests {
+    use super::*;
+
+    /// 0x4272BF / 0x4272C9: game type 3 clears the summary's timeout (`0x41B130(0)`) — it stays until Space;
+    /// every other type passes 1 and the page closes after 0x280 ticks. The other pages are unchanged.
+    #[test]
+    fn a_network_summary_has_no_timeout() {
+        assert_eq!(App::page_timeout(ResultPage::Summary, true), None);
+        assert_eq!(App::page_timeout(ResultPage::Summary, false), Some(0x280));
+        assert_eq!(App::page_timeout(ResultPage::Records, true), Some(0x280));
+        assert_eq!(App::page_timeout(ResultPage::TournamentPlace(1), true), Some(0xC0));
+    }
+}
+
+#[cfg(test)]
 mod congrats_tests {
     use super::congrats_layout;
 
@@ -26722,5 +29916,23 @@ mod after_race_tests {
         let n = build(AfterRace { game_type: 0, aborted: true, ..Default::default() });
         assert_eq!(n.current(), Some("gamesetup"));
         assert!(!n.back_enabled());
+    }
+
+    /// `HInfo`'s lag arm (0x427C7E…0x427EDF): the thresholds are the original's — 0x100 ticks (4 s) behind is a
+    /// lost link, 0x20 (0.5 s) shows «Связь...», and the box closes above −0x10.
+    #[test]
+    fn the_lag_notice_opens_at_half_a_second_and_closes_at_a_quarter_of_that_above() {
+        use super::{lag_step, LagStep};
+        assert_eq!(lag_step(-0x101, true, false), LagStep::Lost);
+        assert_eq!(lag_step(-0x101, false, false), LagStep::Show, "not connected: the second look, 0x427E15");
+        assert_eq!(lag_step(-0x100, true, false), LagStep::Show);
+        assert_eq!(lag_step(-0x21, true, false), LagStep::Show);
+        assert_eq!(lag_step(-0x20, true, false), LagStep::States);
+        assert_eq!(lag_step(0, true, false), LagStep::States);
+        // with the box up it holds until the lag is back above −0x10
+        assert_eq!(lag_step(-0x21, true, true), LagStep::Hold);
+        assert_eq!(lag_step(-0x20, true, true), LagStep::Hold);
+        assert_eq!(lag_step(-0x10, true, true), LagStep::Hold);
+        assert_eq!(lag_step(-0x0F, true, true), LagStep::Close);
     }
 }

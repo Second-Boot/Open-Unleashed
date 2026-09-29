@@ -188,6 +188,60 @@ pub struct Describe {
     pub slot_mask: u32,
 }
 
+/// The game's own session descriptor as it rides in a `'d'` (`network.md` §11.5): the 0x34 bytes
+/// 0x509B00 builds and the comm layer keeps at `session+0x54…0x87`, which the `'d'` puts at
+/// `+0x28…+0x5B`, so that `desc + k` is `'d'` payload `+0x28 + k`:
+///
+/// | desc | `'d'` | what (0x509B00) |
+/// |---|---|---|
+/// | `+0x00` | `+0x28` | `Comms.GameName`'s text (≤ 0x20), to which 0x48DD97 appends `~` and the version string `NfsNet+0x2C` (0x48DDC2…0x48DDF8) |
+/// | `+0x21` | `+0x49` | `Comms.Positional`'s index (0x509C1D) |
+/// | `+0x22` | `+0x4A` | `Track1.Laps`' index when the track is a circuit, else 0 (0x509BE9 / 0x509BEE) |
+/// | `+0x24` | `+0x4C` | `Track1.Direction`'s slot 27 = `0x5B963C[index]`, the direction's string id (0x509BAE, 0x4BB790) |
+/// | `+0x26` | `+0x4E` | `Track1.Track`'s slot 28, the track record's name id = `TRACKLOCALEID0` (0x509B8E) |
+/// | `+0x30` | `+0x58` | the player limit, 8 (0x509B49) |
+///
+/// The games list's row draw (0x4BA030) reads the track from `+0x26`, the mode from `+0x21` and
+/// the version from what follows the `~` (0x48C3D0: `sscanf("%[^~]~%s")`).
+pub mod desc {
+    /// `desc+0x21` — `Comms.Positional`'s index.
+    pub const POSITIONAL: usize = 1;
+    /// `desc+0x22` — `Track1.Laps`' index on a circuit.
+    pub const LAPS: usize = 2;
+    /// `desc+0x24` — `Track1.Direction`'s string id.
+    pub const DIRECTION: usize = 0;
+    /// `desc+0x26` — the track's name id.
+    pub const TRACK: usize = 1;
+    /// `'d'` carries the descriptor's first 0x20 bytes as the name.
+    pub const NAME_LEN: usize = 32;
+
+    /// 0x48DD97…0x48DDF8: `name` + `~` + `version`, cut to the descriptor's 0x20 bytes (the last
+    /// stays a NUL). The name is what 0x509B00 copied (`strncpy` 0x20), so it is cut first.
+    pub fn name_field(name: &str, version: &str) -> [u8; NAME_LEN] {
+        let mut out = [0u8; NAME_LEN];
+        // one byte per character: the game's strings are single-byte text (the port keeps them
+        // as chars below U+0100), and the wire carries those bytes
+        let mut s: Vec<u8> = name.chars().map(|c| u8::try_from(u32::from(c)).unwrap_or(b'?')).take(NAME_LEN - 1).collect();
+        s.push(b'~');
+        s.extend(version.bytes());
+        for (o, b) in out.iter_mut().zip(s.iter().take(NAME_LEN - 1)) {
+            *o = *b;
+        }
+        out
+    }
+
+    /// 0x48C3D0's `sscanf(desc, "%[^~]~%s", name, version)`: everything before the first `~`, then
+    /// the first word after it. No `~` leaves the version unwritten — empty here.
+    pub fn split_name(field: &[u8]) -> (String, String) {
+        let end = field.iter().position(|&c| c == 0).unwrap_or(field.len());
+        let s: String = field[..end].iter().map(|&b| char::from(b)).collect();
+        match s.split_once('~') {
+            Some((n, v)) => (n.to_string(), v.split_whitespace().next().unwrap_or("").to_string()),
+            None => (s, String::new()),
+        }
+    }
+}
+
 impl Describe {
     /// What 0x58941B passes to the transport.
     pub const SIZE: usize = 0xAC;
@@ -349,6 +403,37 @@ impl JoinReply {
     }
 }
 
+/// A peer's identity, the string 0x48A700 parses: **`name~version~game`** — `sscanf(s,
+/// "%[^~]~%[^~]~%s")` (0x5D0618) into the peer record's `+0x24` (the name), `+0x64` (the version)
+/// and `+0x84` (the game); the version is then compared with `"3.5"` (0x5D06FC) and the game with
+/// the room's name (0x49151E…0x491569, 0x4915C6…0x491610).
+pub mod identity {
+    /// What a peer sends: `name~version~game`.
+    pub fn encode(name: &str, version: &str, game: &str) -> Vec<u8> {
+        // one byte per character, like every string of the game's own protocol
+        let b = |s: &str| s.chars().map(|c| u8::try_from(u32::from(c)).unwrap_or(b'?')).collect::<Vec<u8>>();
+        let mut v = b(name);
+        v.push(b'~');
+        v.extend(b(version));
+        v.push(b'~');
+        v.extend(b(game));
+        v.push(0);
+        v
+    }
+
+    /// 0x48A700's `sscanf`: `%[^~]` (at least one character), `~`, `%[^~]`, `~`, `%s` (a word).
+    /// Fields the string does not reach stay empty, as the record's buffers do.
+    pub fn parse(bytes: &[u8]) -> (String, String, String) {
+        let end = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
+        let s: String = bytes[..end].iter().map(|&b| char::from(b)).collect();
+        let mut it = s.splitn(3, '~');
+        let name = it.next().unwrap_or("").to_string();
+        let version = it.next().unwrap_or("").to_string();
+        let game = it.next().and_then(|g| g.split_whitespace().next()).unwrap_or("").to_string();
+        (name, version, game)
+    }
+}
+
 /// Which slot 0x589440 hands out: the first clear bit of `mask` below `limit - 1`, or `None`.
 pub fn free_slot(mask: u32, limit: u32) -> Option<u32> {
     (0..limit.saturating_sub(1)).find(|i| mask & (1 << i) == 0)
@@ -356,6 +441,31 @@ pub fn free_slot(mask: u32, limit: u32) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_peers_identity_is_name_tilde_version_tilde_game() {
+        let b = identity::encode("RACERB", "3.5", "DRIVER's");
+        assert_eq!(b, b"RACERB~3.5~DRIVER's\0".to_vec());
+        assert_eq!(identity::parse(&b), ("RACERB".to_string(), "3.5".to_string(), "DRIVER's".to_string()));
+        // `%s` stops at white space; a string that runs out leaves the rest empty
+        assert_eq!(identity::parse(b"A~3.4~my race\0junk"), ("A".to_string(), "3.4".to_string(), "my".to_string()));
+        assert_eq!(identity::parse(b"A\0"), ("A".to_string(), String::new(), String::new()));
+        assert_eq!(identity::parse(b""), (String::new(), String::new(), String::new()));
+    }
+
+    #[test]
+    fn the_session_name_is_name_tilde_version_and_reads_back_the_way_0x48c3d0_scans_it() {
+        let f = desc::name_field("DRIVER's race", "3.5");
+        assert_eq!(&f[..17], b"DRIVER's race~3.5");
+        assert!(f[17..].iter().all(|&c| c == 0));
+        assert_eq!(desc::split_name(&f), ("DRIVER's race".to_string(), "3.5".to_string()));
+        // no `~`: the version is not written
+        assert_eq!(desc::split_name(b"plain\0\0"), ("plain".to_string(), String::new()));
+        // a long name is cut to the descriptor's 0x20 bytes and keeps its NUL
+        let long = desc::name_field(&"N".repeat(40), "3.5");
+        assert_eq!(long[31], 0);
+        assert_eq!(desc::split_name(&long).0.len(), 31);
+    }
+
     use super::*;
 
     #[test]

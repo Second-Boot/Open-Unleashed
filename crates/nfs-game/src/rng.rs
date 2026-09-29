@@ -21,6 +21,12 @@ pub fn seed(seed: u32) {
     *STATE.lock().unwrap() = s;
 }
 
+/// The stream's current state (the LCG word) — **test glue**: a dump's view of where the shared
+/// stream stands; reading it draws nothing.
+pub fn state() -> u32 {
+    *STATE.lock().unwrap()
+}
+
 /// One 16-bit draw.
 pub fn rand16() -> u32 {
     let mut g = STATE.lock().unwrap();

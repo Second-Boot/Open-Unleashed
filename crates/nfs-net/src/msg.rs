@@ -38,6 +38,22 @@ pub mod kind {
     pub const DATA_MORE: u8 = 0xC0;
     /// 0x48EDF0 / 0x48F5E8 — the per-tick car state of [`crate::state`].
     pub const CAR_STATE: u8 = 0xBE;
+    /// 0x48F82F — the race is starting. Sent by the host's room object when it starts (0x48BF10:
+    /// `0x48C870(0xB3, 0, clock)` to every link, after it has set the room's "started" byte
+    /// `+0xCC3`); the word is the host's game clock, which the receiver turns into its own offset
+    /// (0x48F8C8 → 0x48A9B0: `[clock] = word − GetTickCount()`).
+    pub const START: u8 = 0xB3;
+    /// 0x48F998 — a block of option records for the option table (`crate::options`); sent by
+    /// 0x48D440 / 0x48D550 from the host's front end and launch (`network.md` §11.6).
+    pub const OPTIONS: u8 = 0xBC;
+    /// 0x48F579 (player) / the room's 0x4918BD → 0x4929B0 → 0x48C220 — a player's finish time, or
+    /// −1 (leaving the game) / −2 (back in the front end) in the head (`crate::room::race_time`).
+    pub const RACE_TIME: u8 = 0xB7;
+    /// 0x48F8D2 (player) / the room's 0x49185B → 0x48BFB0 — the room's "go", answering the first
+    /// `0xC5` request of a race (`crate::room::go`).
+    pub const GO: u8 = 0xC5;
+    /// 0x48F527 (player) / 0x491661 (host) — the lobby's ping exchange (`crate::room::Ping`).
+    pub const PING: u8 = 0xC3;
     /// 0x48F34F — eject / shut down (`push 0xC6` at 0x491748, under "Ejected by host").
     pub const EJECT: u8 = 0xC6;
 }

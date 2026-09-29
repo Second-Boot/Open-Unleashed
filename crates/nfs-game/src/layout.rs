@@ -727,6 +727,10 @@ pub struct LayoutScreen {
     dz_hover: Option<(usize, u32)>,
     /// `Camera.Current` — which of the four camera slots is on, for `NFS5.CAMERASELECT` (§4.89)
     camera_current: usize,
+    /// `Camera.1 … Camera.4` — the view each of the four camera slots holds (0x4E4D40 registers
+    /// them as 0, 1, 2, 3), which `NFS5.CAMERAPICTURE`'s draw 0x4BF870 compares with its own
+    /// `data.picturenum`
+    camera_list: [i32; 4],
     /// which of an open drop-down's scrollbar regions the pointer is on, and whether it is
     /// held — 1 up arrow, 2 down, 3 knob, 4 trough, the numbers 0x4DB2F0 writes (§4.101)
     combo_scroll: Option<(usize, u32, bool)>,
@@ -1236,6 +1240,10 @@ pub struct ListCell {
     /// `0x80808081` divide by 255 at 0x4D8812…) — 0xFF for the colour as it is (0x4D87F4 returns
     /// it untouched)
     pub fade: u8,
+    /// An explicit alignment (0 left, 1 centre, 2 right) where the offset's sign is not what the
+    /// row draw passes — `Comms.PlayerList`'s row number is drawn with align 1 at `x − 4`
+    /// (0x4BBF7B…0x4BBF91).
+    pub align: Option<u8>,
 }
 
 /// The height of a parts list's category heading (0x518EA0) and of one of its rows (0x515FD4).
@@ -1272,6 +1280,11 @@ pub enum ListRow {
     /// The row **at** the colour count — `FEStrings` **0x263** (`custom...`) at `(x + 3, y + 2)`,
     /// align 0, in **black** whatever the row's own text colour (0x4B945C…0x4B949F).
     CustomColour(String),
+    /// `Comms.PlayerList`'s row (`FEPlayerListAccessor` 0x4BBEB0): columns like [`ListRow::Columns`]
+    /// plus the player's car colour as a 15 × 10 swatch with a black outline at `(anchor x + dx,
+    /// row y)` — `0x4D9280(x + 4, y, 15, 10, 0x4D87F0(colour, alpha))` then the outline
+    /// `0x4D9200` of `0x4D87E0(alpha)` (0x4BC0C8…0x4BC116). The swatch is `(anchor, dx, rgba)`.
+    Racer(Vec<ListCell>, Option<(String, f32, [u8; 4])>),
 }
 
 impl ListRow {
@@ -1280,7 +1293,7 @@ impl ListRow {
     pub fn height(&self) -> f32 {
         match self {
             ListRow::Text(_) => LIST_ROW_H,
-            ListRow::Columns(_) => LIST_ROW_H,
+            ListRow::Columns(_) | ListRow::Racer(..) => LIST_ROW_H,
             ListRow::Header(..) => PART_HEADER_H,
             ListRow::GroupHeading(_) => LIST_ROW_H,
             // `FEColourAccessor` keeps the base slot 26, 0x4BC700
@@ -2002,6 +2015,7 @@ impl LayoutScreen {
             dz_grab: None,
             dz_hover: None,
             camera_current: 0,
+            camera_list: [0, 1, 2, 3],
             combo_scroll: None,
             focused: Default::default(),
             edits: HashMap::new(),
@@ -2452,6 +2466,15 @@ impl LayoutScreen {
         self.camera_current = n;
         for g in self.groups.values_mut() {
             g.set_camera_current(n);
+        }
+    }
+
+    /// Tell the screen the four `Camera.1 … Camera.4` values — what `NFS5.CAMERAPICTURE`'s draw
+    /// 0x4BF870 tests each picture against (§4.89).
+    pub fn set_camera_list(&mut self, list: [i32; 4]) {
+        self.camera_list = list;
+        for g in self.groups.values_mut() {
+            g.set_camera_list(list);
         }
     }
 
@@ -5497,6 +5520,17 @@ impl LayoutScreen {
         (e.class == "NFS5.CAMERASELECT").then(|| self.attr_num(e, "accessornum").unwrap_or(0.0) as i32)
     }
 
+    /// `NFS5.CAMERAPICTURE`'s `data.picturenum` (`[this+0x144]`, bound at 0x4BF730) — what its slot 9
+    /// **0x4BF920** hands `Camera.<Camera.Current + 1>`'s `SetSelection` when the release is the
+    /// first of its widget for half a second. The number, for any other widget `None`.
+    pub fn camera_picture_of(&self, index: usize) -> Option<i32> {
+        if let Some((k, j)) = self.route(index) {
+            return self.groups.get(&k)?.camera_picture_of(j);
+        }
+        let e = self.layout.elements.get(index)?;
+        (e.class == "NFS5.CAMERAPICTURE").then(|| self.attr_num(e, "picturenum").unwrap_or(0.0) as i32)
+    }
+
     /// An activate on an input box takes focus, as `FeInputBox`'s slot 9 does:
     ///
     /// ```text
@@ -5827,11 +5861,19 @@ impl LayoutScreen {
         }
     }
 
-    /// Which input box has focus, if any.
+    /// Which input box has focus, if any. A box with `data.alwaysfocused` counts from the moment
+    /// it is built: its bind **0x4CC430** calls `setFocused` outright (0x4CC56E…0x4CC570, §4.41),
+    /// so the keyboard reaches it with no click. Until 2026-10-01 the port only *drew* such a box
+    /// focused, and `createplayer`'s name field took no keys at all.
     pub fn focused_input(&self) -> Option<usize> {
-        self.focused.iter().copied().find(|i| {
-            self.layout.elements.get(*i).is_some_and(|e| {
+        let is_input = |i: usize| {
+            self.layout.elements.get(i).is_some_and(|e| {
                 matches!(e.class.as_str(), "NFS5.INPUTBOX" | "NFS5.CHATINPUTBOX" | "NFS5.CHARVECTACCESSORINPUTBOX")
+            })
+        };
+        self.focused.iter().copied().find(|&i| is_input(i)).or_else(|| {
+            (0..self.layout.elements.len()).find(|&i| {
+                is_input(i) && !self.is_hidden(i) && self.attr_num(&self.layout.elements[i], "alwaysfocused").unwrap_or(0.0) != 0.0
             })
         })
     }
@@ -6162,7 +6204,7 @@ impl LayoutScreen {
                     let bevel_h = if matches!(row, ListRow::GroupHeading(_)) { 12.0 } else { PART_HEADER_H };
                     self.bevel_heading(out, aspect, px, bevel_y, rect_w, bevel_h, 2.0);
                 }
-                ListRow::Columns(_) => {}
+                ListRow::Columns(_) | ListRow::Racer(..) => {}
             }
             ry += row.height();
         }
@@ -6521,6 +6563,19 @@ impl LayoutScreen {
         {
             return "highlighty";
         }
+        // **`NFS5.CAMERAPICTURE`'s draw 0x4BF870**: `[this+0x144]` (`data.picturenum`) is compared
+        // with each of `Camera.1 … Camera.4` (the loop 0x4BF883…0x4BF89D over `[this+0x154 … 0x160]`,
+        // slot 10) and, when any one holds it and the widget is not focused (0x4BF8A5 `0x4C7DD0`,
+        // `[+0x10C] & 0x40` — set only by 0x4C7D70 for a widget whose `[+0x110]` has 0x40, which
+        // the base ctor 0x4C7480 clears and the base bind 0x4C7530 never sets), the state is
+        // `highlighty` (0x4BF8AE, `0x4C7970` at 0x4BF8B5); otherwise the ordinary one (0x4BF8BE
+        // `0x4C7B70`, 0x4BF8C9 `0x4C7A00`)
+        if e.class == "NFS5.CAMERAPICTURE"
+            && self.camera_list.iter().any(|&v| f64::from(v) == self.attr_num(e, "picturenum").unwrap_or(-1.0))
+            && self.controls.get(&e.class).is_some_and(|c| c.has_state("highlighty"))
+        {
+            return "highlighty";
+        }
         if hot && self.pressed && self.can_press(&e.class) {
             if self.controls.get(&e.class).is_some_and(|c| c.has_state("focusedhover")) {
                 return "focusedhover";
@@ -6810,7 +6865,15 @@ impl LayoutScreen {
                 }
                 continue;
             }
-            if !self.can_hover(&e.class) || self.state_draws_nothing(e) {
+            // The window's hit test (0x528C00) asks every child's containsPoint (0x525A90) and
+            // knows nothing of a hover state; `can_hover` stands in for "a widget that reacts to
+            // the pointer" and is right for the buttons. The three text-entry classes react to a
+            // click without ever having a `[state.hover]` (their `.ctr` states are `normal,
+            // hidden, focused[, disabled]`): the release goes to their slot 9 (0x4CCB70,
+            // 0x4C2220) which takes the focus. Without them here a click on `Comms.IP` (or the
+            // chat line) never reached the box and nothing could be typed into it.
+            let takes_click = matches!(e.class.as_str(), "NFS5.INPUTBOX" | "NFS5.CHATINPUTBOX" | "NFS5.CHARVECTACCESSORINPUTBOX");
+            if !(self.can_hover(&e.class) || takes_click) || self.state_draws_nothing(e) {
                 continue;
             }
             let (x, y) = self.position_of(e);

@@ -33,8 +33,11 @@ pub struct CarState {
     pub buttons: u8,
     /// +0x04 — the sender's `gGameTick`
     pub tick: u32,
-    /// +0x08 — `car+0x38C`, the angular velocity's x, quantised ×1000
-    pub spin_x: f32,
+    /// +0x08 — `car+0x38C`, quantised ×1000. That is the angular velocity's **second** component:
+    /// 0x49B8E0 takes `car+0x388 / +0x38C / +0x390` as X, Y, Z (its Ry gets `+0x38C`) and the
+    /// receiver's snap 0x4A04A0 writes `(0, ω, 0)` there — the **yaw** rate in turns/s. (`network.md`
+    /// §5.2 called it `ω.x`, and the port sent its `angular_velocity.x` until NM 2026-09-30.)
+    pub yaw_rate: f32,
     /// +0x0A — the orientation, as the four 16.16 quaternion components `0x49FE60` packs
     pub orientation: [i16; 4],
     /// +0x12/+0x14/+0x16 — `car+0x33C/+0x340/+0x344`, the velocity, quantised ×100
@@ -42,6 +45,11 @@ pub struct CarState {
     /// +0x18 — `car+0x330…+0x338`, the position, at full precision
     pub position: [f32; 3],
 }
+
+/// `[0x5B3060]` — 0x3A83126F, the yaw rate's scale (0x4A0ACA).
+pub const F_MILLI: f32 = f32::from_bits(0x3A83_126F);
+/// `[0x5B3CA0]` — 0x3C23D70A, the velocity's scale (0x4A0A7A).
+pub const F_CENTI: f32 = f32::from_bits(0x3C23_D70A);
 
 /// Round half **away from zero**, which is what the original's `fadd ±0.5` then `ftol` does
 /// (0x4A01C0…0x4A01E0 and the three velocity sites).
@@ -61,7 +69,7 @@ impl CarState {
         b[2] = self.brake;
         b[3] = self.buttons;
         b[4..8].copy_from_slice(&self.tick.to_le_bytes());
-        b[8..10].copy_from_slice(&(round_away(self.spin_x * 1000.0) as i16).to_le_bytes());
+        b[8..10].copy_from_slice(&(round_away(self.yaw_rate * 1000.0) as i16).to_le_bytes());
         for (i, q) in self.orientation.iter().enumerate() {
             b[0x0A + i * 2..0x0C + i * 2].copy_from_slice(&q.to_le_bytes());
         }
@@ -86,9 +94,11 @@ impl CarState {
             brake: b[2],
             buttons: b[3],
             tick: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
-            spin_x: i16_at(8) as f32 / 1000.0,
+            // 0x4A0ACA: `fild` x `[0x5B3060]` = 0.001f - the float constant, not a division
+            yaw_rate: i16_at(8) as f32 * F_MILLI,
             orientation: [i16_at(0x0A), i16_at(0x0C), i16_at(0x0E), i16_at(0x10)],
-            velocity: [i16_at(0x12) as f32 / 100.0, i16_at(0x14) as f32 / 100.0, i16_at(0x16) as f32 / 100.0],
+            // 0x4A0A7A...: `fild` x `[0x5B3CA0]` = 0.01f
+            velocity: [i16_at(0x12) as f32 * F_CENTI, i16_at(0x14) as f32 * F_CENTI, i16_at(0x16) as f32 * F_CENTI],
             position: [f32_at(0x18), f32_at(0x1C), f32_at(0x20)],
         })
     }
@@ -135,6 +145,40 @@ pub fn pack_orientation(m: [[f32; 3]; 3]) -> [i16; 4] {
 /// unit — which is `(q·2¹⁴)²·2`, so a stored component is the quaternion times 16384.
 pub const QUAT_SCALE: f32 = 16384.0;
 
+/// **0x4A0020(q, out)** — the block's quaternion as the nine integers of a 3×3 matrix scaled by
+/// 2¹⁶, in `car+0x364`'s row-major order (`out[3·row + col]`), exactly the integer arithmetic of
+/// the original (`q = (x, y, z, w)` are the four `i16`s; `0x10000000` is the unit; the products
+/// are 32-bit and shifted `>> 12`). The receiver multiplies each by `[0x5B253C]` = 2⁻¹⁶
+/// (0x4A0AE8) — [`matrix_of`] — and does **not** normalise: the quantised quaternion's error stays.
+pub fn decode_matrix(q: [i16; 4]) -> [i32; 9] {
+    let (x, y, z, w) = (q[0] as i32, q[1] as i32, q[2] as i32, q[3] as i32);
+    let z2 = z * 2;
+    let w_x = w * x * 2;
+    let w_y = w * y * 2;
+    let xx = x * x * 2;
+    let yy = y * y * 2;
+    let xy = x * y * 2;
+    let base = 0x1000_0000 - z * z2;
+    [
+        (base - yy) >> 12,
+        (xy + w * z2) >> 12,
+        (x * z2 - w_y) >> 12,
+        (xy - w * z2) >> 12,
+        (base - xx) >> 12,
+        (y * z2 + w_x) >> 12,
+        (x * z2 + w_y) >> 12,
+        (y * z2 - w_x) >> 12,
+        ((0x1000_0000 - yy) - xx) >> 12,
+    ]
+}
+
+/// [`decode_matrix`] as floats (`x 2^-16`, `[0x5B253C]`), rows in `car+0x364`'s order — the rows of
+/// the car's orientation (body x, up, forward).
+pub fn matrix_of(q: [i16; 4]) -> [[f32; 3]; 3] {
+    let m = decode_matrix(q).map(|v| v as f32 * f32::from_bits(0x3780_0000));
+    [[m[0], m[1], m[2]], [m[3], m[4], m[5]], [m[6], m[7], m[8]]]
+}
+
 /// The inverse of [`pack_orientation`].
 pub fn unpack_orientation(q: [i16; 4]) -> [f32; 4] {
     q.map(|v| v as f32 / QUAT_SCALE)
@@ -173,7 +217,7 @@ mod tests {
             brake: 0x22,
             buttons: 0x33,
             tick: 0x0001_2345,
-            spin_x: -1.234,
+            yaw_rate: -1.234,
             orientation: [100, -200, 300, 16383],
             velocity: [12.34, -5.0, 40.0],
             position: [123.5, -4.25, 6789.0],
@@ -190,7 +234,7 @@ mod tests {
         assert_eq!(back.position, s.position);
         assert_eq!(back.orientation, s.orientation);
         assert_eq!((back.steer, back.brake, back.buttons, back.airborne, back.tick), (0x11, 0x22, 0x33, true, 0x0001_2345));
-        assert!((back.spin_x - s.spin_x).abs() <= 0.001);
+        assert!((back.yaw_rate - s.yaw_rate).abs() <= 0.001);
         for i in 0..3 {
             assert!((back.velocity[i] - s.velocity[i]).abs() <= 0.01, "{i}");
         }
@@ -200,7 +244,7 @@ mod tests {
     fn the_quantisation_is_the_originals() {
         // ×1000 for the spin and ×100 for the velocity, rounded away from zero
         let mut s = sample();
-        s.spin_x = 0.0015;
+        s.yaw_rate = 0.0015;
         s.velocity = [0.005, -0.005, 0.0];
         let b = s.encode();
         assert_eq!(i16::from_le_bytes([b[8], b[9]]), 2, "0.0015 x1000 rounds to 2");
@@ -218,6 +262,23 @@ mod tests {
         let (id, back) = CarState::from_packet(&p, 9).unwrap();
         assert_eq!(id, 3);
         assert_eq!(back.position, s.position);
+    }
+
+    /// 0x4A0020: the identity quaternion (w = 2^14) gives the identity matrix; a quarter turn about Y
+    /// gives the rows `pack_orientation` was given, to the 14-bit quantisation.
+    #[test]
+    fn the_decoder_is_the_originals_integer_matrix() {
+        let id = matrix_of([0, 0, 0, 16384]);
+        assert_eq!(id, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        let m = [[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]];
+        let back = matrix_of(pack_orientation(m));
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!((back[i][j] - m[i][j]).abs() < 2e-3, "{i}{j}: {back:?}");
+            }
+        }
+        // the integers, not a normalised quaternion: 2^16 is the unit
+        assert_eq!(decode_matrix([0, 0, 0, 16384])[0], 0x10000);
     }
 
     #[test]

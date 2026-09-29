@@ -56,6 +56,31 @@ pub fn to_cp1252(ch: char) -> Option<u8> {
     (0x80u8..0xA0).find(|&b| cp1252(b) == ch)
 }
 
+/// A key the player typed → the char the game's own byte strings hold for it, or `None`.
+///
+/// The original takes typed text as `WM_CHAR` in the system's ANSI code page — one byte per key
+/// (0x4CCC20's `0x20..0xFF` test runs on that byte) — and draws it with fonts keyed by bytes. The
+/// shipped Russian text and fonts are Windows-1251 bytes, so on the Russian Windows this build
+/// targets a Cyrillic key arrives as its 1251 byte. The port stores strings as the byte decoded
+/// through [`cp1252`], so a Latin/Windows-1252 char maps to itself and a Cyrillic letter to
+/// `cp1252(its Windows-1251 byte)`, which the byte-keyed font then draws as that letter.
+/// APPROXIMATION: the original's mapping is whatever ANSI code page the Windows install has; this
+/// assumes the Russian one (1251) for Cyrillic keys — on another code page the original would
+/// accept fewer letters (it errs toward accepting Cyrillic the original would take only on a
+/// Russian system).
+pub fn typed_char(ch: char) -> Option<char> {
+    if let Some(b) = to_cp1252(ch) {
+        return Some(cp1252(b));
+    }
+    let b = match ch as u32 {
+        c @ 0x0410..=0x044F => (c - 0x0410 + 0xC0) as u8,
+        0x0401 => 0xA8,
+        0x0451 => 0xB8,
+        _ => return None,
+    };
+    Some(cp1252(b))
+}
+
 impl Strings {
     /// Parse the CSV, keeping the column `lang` (0 = English, 1 = French, 2 = German, …).
     pub fn parse(data: &[u8], lang: usize) -> Strings {

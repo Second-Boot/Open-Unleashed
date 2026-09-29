@@ -635,6 +635,49 @@ pub fn installed_parts(parts: &[&Part], owned: Option<&OwnedCar>) -> Vec<nfs_phy
         .collect()
 }
 
+/// The installed-part list a **layout race** (`Game.GameType` 0, 1, 2, 3 — the single race, the
+/// Quick Knockout, the series' round, the network race) starts with for a garage car: the ids of
+/// `feCar+0x758` go out as `.PARTINDEX` for every game type (0x4EF3F3: `aiStack_e0[k] = **part`
+/// precedes the type test), but `.PARTDAMAGE` is each part's `+0x164` only for a type **other**
+/// than 0, 1, 2, 3, 9 (`param_5` tests at 0x4EF3E6…0x4EF40C in 0x4EEDA0) — so `Car_raceInit`'s copy
+/// into `part+0x164` (0x41085F…0x410886) brings **0** for every part and the owned car's saved wear
+/// stays in the garage. `.DAMAGEZONES` is 0 for the same types (0x4EF420…0x4EF445).
+pub fn layout_race_parts(parts: &[&Part]) -> Vec<nfs_physics::specs::InstalledPart> {
+    if parts.is_empty() {
+        return nfs_physics::specs::fallback_parts();
+    }
+    parts.iter().map(|p| nfs_physics::specs::InstalledPart::new(p.kind, p.zone_mask.map(|b| b != 0), p.condition, 0.0)).collect()
+}
+
+/// **A freshly built `FECar` raced as it is** — what 0x49CB50 folds into the `carSpecs` block of
+/// every car of a race that has no garage record behind it: a catalogue car of the single player's
+/// launches (career prize car, test drive, QuickRace / Knockout / series round, the command line),
+/// every AI opponent, a cop, a traffic car. CONFIRMED (`RE/notes/loaders.md` §1.3, network.md
+/// §11.12b):
+///
+/// * `FECar::init` 0x4EEBA0 ends **unconditionally** in 0x4EE9A0 (call at 0x4EED28), which fills
+///   the installed list `+0x758` with a copy of every part on the record's stock list `+0x75C`
+///   (the `nfs5.car` record's `+0x3C0` count, `+0x3C2[i]` ids); 0x4EEDA0 streams those ids as
+///   `.PARTINDEX` (0x14B, for every kind) and 0x49C4C0 rebuilds `car+0x768` from them, so
+///   0x49CB50's parts loop (0x49CC4C…0x49D1E8) walks the **stock** parts — [`CarSpecs::apply_parts`];
+/// * the same constructor writes the neutral sliders (0x4EED2D…0x4EED8D: 50, 50, 50, 0, 0, 0, 1.0,
+///   30, 30, zeros — [`CAR_SETUP_DEFAULT`]) which 0x4EEDA0 streams for **every** kind (0x4EF179…
+///   0x4EF32F carry no kind test), and 0x49CB50 folds them (0x49D290…0x49D62C) — [`CarSpecs::apply_setup`],
+///   which is not the identity: a `.sim` whose `+0x11C` is 0.8 comes out with 0.8·(1+2)/3 and
+///   `grip ×(0.8+9)·0.1`;
+/// * `automatic` is `.TRANSMISSION` 0x221 → `carinfo+0xC`: 0x4EEDA0 writes the gearbox option for
+///   every car whose `param_7` is 0, and all its callers (0x4ED174 cop, 0x4ED460 traffic, 0x4EBCBF /
+///   0x4EBF06 / 0x4EC3FF opponent, 0x4EBA4D player) pass 0 in that slot.
+///
+/// The order is 0x49CB50's: parts, then sliders. [`CarSpecs::parts`] gets the stock list at its
+/// carried state (the table's own).
+pub fn fold_fresh_car(specs: &mut nfs_physics::specs::CarSpecs, stock_ids: &[i16], table: &[Part], family: &str, automatic: bool) {
+    let stock: Vec<&Part> = stock_ids.iter().filter_map(|id| table.iter().find(|p| p.id == *id)).collect();
+    specs.apply_parts(&stock, family);
+    specs.parts = nfs_physics::specs::stock_parts(stock_ids, table);
+    specs.apply_setup(&CAR_SETUP_DEFAULT, automatic);
+}
+
 /// [`installed_parts`] for an owned car: its parts looked up in the table.
 pub fn installed_parts_for(tables: &CareerTables, owned: &OwnedCar) -> Vec<nfs_physics::specs::InstalledPart> {
     let parts: Vec<&Part> = owned.parts.iter().filter_map(|id| tables.parts.iter().find(|p| p.id == *id)).collect();
@@ -2402,6 +2445,20 @@ mod tests {
             torque_curve: [0.0; 21],
             state: 0,
         }
+    }
+
+    /// A layout race brings no part wear (`.PARTDAMAGE` 0 for `Game.GameType` 0…3, 0x4EF3E6…), the
+    /// career's own `installed_parts` carries the owned car's saved state.
+    #[test]
+    fn a_layout_race_starts_every_garage_part_at_zero_wear() {
+        let mut p = stock_part(52, 1, "Engine", 100);
+        p.state = 5;
+        let mut owned = OwnedCar::construct(&stock_tables(vec![p.clone()], &[52], &[]), 76, 0, 0);
+        owned.part_state = vec![(52, 7.5)];
+        let parts = [&p];
+        assert_eq!(installed_parts(&parts, Some(&owned))[0].carried, 7.5);
+        let l = layout_race_parts(&parts);
+        assert_eq!((l.len(), l[0].kind, l[0].carried, l[0].state), (1, 1, 0.0, 0.0));
     }
 
     /// A one-car catalogue (id 76, price 10 000, the value curve flat at 100 %) whose record lists

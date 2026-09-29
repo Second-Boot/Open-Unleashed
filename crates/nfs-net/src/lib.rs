@@ -10,10 +10,15 @@
 
 pub mod comm;
 pub mod data;
+pub mod exchange;
 pub mod frame;
+pub mod launchcar;
 pub mod msg;
+pub mod options;
+pub mod reliable;
 pub mod room;
 pub mod session;
+pub mod slots;
 pub mod socket;
 pub mod state;
 pub mod tcp;

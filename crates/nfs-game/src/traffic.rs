@@ -212,6 +212,17 @@ pub struct Reference {
     pub honking: bool,
 }
 
+/// What the script triggers of 0x401580 read of one human, when there is more than one (an
+/// input-exchange race, `network.md` §11.18): its own lap count and horn. [`TrafficSet::human_views`]
+/// is empty in a single-player race, where the one human is the [`Reference`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HumanView {
+    /// the human's `car+0xAF8` laps part (0x40E9E0's argument)
+    pub laps: u32,
+    /// `human+0xD86`
+    pub honking: bool,
+}
+
 /// What `0x405ED0` reads of one police car (`0x5E8AC4[0 … [0x5E8ABC])`, registration order).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CopView {
@@ -619,6 +630,10 @@ pub struct TrafficSet {
     /// `default.sim` — what `Car_loadSim` 0x49C6C0 falls back to for a car with no sim name
     /// (§21.1): the suspension constants `Car_ground` reads (`specs[0x114…0x138]`).
     pub specs: Option<nfs_physics::specs::CarSpecs>,
+    /// Each car's own block: `default.sim` (§21.1) with **that car's** stock parts (0x4EE9A0 → 0x49C4C0)
+    /// and the neutral sliders (0x4EED2D) folded in by 0x49CB50 — `career::fold_fresh_car`. Empty (the
+    /// unit tests) or short: [`Self::specs`] stands in.
+    pub car_specs: Vec<nfs_physics::specs::CarSpecs>,
     /// The police cars as `0x405ED0` sees them this AI pass (the caller fills it before
     /// [`Self::ai_on`]; the cops' own AI runs earlier in the same even tick, §17.5e). Empty — no
     /// `COPS` — and no traffic car ever stops.
@@ -643,6 +658,9 @@ pub struct TrafficSet {
     pub swap_tick: Vec<Option<u64>>,
     /// where this set's car 0 sits in that list
     pub overtake_base: usize,
+    /// the humans of the caller's `others` list, in the same order (empty: the [`Reference`] is the one
+    /// human) — 0x401580's triggers read `0x40E9E0(human)` and `human+0xD86` of **each** human it walks
+    pub human_views: Vec<HumanView>,
 }
 
 /// The spawn gate `0x40E060`'s track windows (0x40E0AD…0x40E134): `TRACK_NAME [0x657444]`'s first
@@ -684,7 +702,7 @@ impl TrafficSet {
                 c
             })
             .collect();
-        Self { cars, opponents: 0, cops_race: false, weather: false, scripts: nfs_formats::scripts::Scripts::default(), rng, one_way, race_dir, linear, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: TrafficPhysics::default(), slot_base: 0, no_spawn: &[], time_mode: false, bodies: Vec::new(), specs: None, cops: Vec::new(), chase_targets: Vec::new(), other_positions: Vec::new(), other_places: Vec::new(), overtake_order: Vec::new(), swap_partner: Vec::new(), swap_tick: Vec::new(), overtake_base: 0 }
+        Self { cars, opponents: 0, cops_race: false, weather: false, scripts: nfs_formats::scripts::Scripts::default(), rng, one_way, race_dir, linear, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: TrafficPhysics::default(), slot_base: 0, no_spawn: &[], time_mode: false, bodies: Vec::new(), specs: None, car_specs: Vec::new(), cops: Vec::new(), chase_targets: Vec::new(), other_positions: Vec::new(), other_places: Vec::new(), overtake_order: Vec::new(), swap_partner: Vec::new(), swap_tick: Vec::new(), overtake_base: 0, human_views: Vec::new() }
     }
 
     /// The cars' bodies: `RigidBody_init` 0x49B510 for each traffic car, with `default.sim`'s
@@ -693,10 +711,19 @@ impl TrafficSet {
     /// `car+0x52C` bit 4 (`is_traffic`) is what `Damage_byNormal` checks before the roof zone; an
     /// AI car's human-only arms are off.
     pub fn set_bodies(&mut self, specs: &nfs_physics::specs::CarSpecs, points: &[Vec<Vec3>]) {
+        self.set_bodies_each(&[], specs, points);
+    }
+
+    /// [`Self::set_bodies`] with a block per car (`per_car[i]`, else `specs`): 0x49CB50 folds each
+    /// traffic car's own stock parts and the neutral sliders into its own block.
+    pub fn set_bodies_each(&mut self, per_car: &[nfs_physics::specs::CarSpecs], specs: &nfs_physics::specs::CarSpecs, points: &[Vec<Vec3>]) {
+        self.car_specs = per_car.to_vec();
         self.bodies = self
             .cars
             .iter()
-            .map(|c| {
+            .enumerate()
+            .map(|(i, c)| {
+                let specs = per_car.get(i).unwrap_or(specs);
                 let mut v = nfs_physics::vehicle::Vehicle::new(Vec3::ZERO, Mat3::IDENTITY, specs, c.half_extents.x, RIDE_HEIGHT);
                 v.ai_driven = true;
                 v.is_traffic = true;
@@ -756,8 +783,9 @@ impl TrafficSet {
     /// phase). With no bodies (the unit tests) nothing runs; [`Self::integrate_on`] then holds the
     /// slice's height.
     pub fn ground(&mut self, grid: &nfs_physics::collision::TriangleGrid, tick: u64) {
-        let Some(specs) = self.specs.clone() else { return };
+        let Some(default_specs) = self.specs.clone() else { return };
         for i in 0..self.cars.len().min(self.bodies.len()) {
+            let specs = self.car_specs.get(i).unwrap_or(&default_specs).clone();
             if !self.cars[i].active {
                 continue;
             }
@@ -931,7 +959,6 @@ impl TrafficSet {
             {
                 let travelled = me.travelled;
                 // `0x40E9E0(human)`: the player's `+0xAF8` counts its laps
-                let human_m = metres(table, reference.laps as f32 + table.frac(reference.slice));
                 let (my_lane, my_dir, my_speed, my_slice) = (me.lane, me.dir, me.speed, me.slice);
                 let time_mode = self.time_mode;
                 let mut requests: Vec<(i32, Trigger)> = Vec::new();
@@ -940,6 +967,13 @@ impl TrafficSet {
                         requests.push((0, Trigger::Collision));
                     }
                     for (hi, h) in cars.iter().enumerate().filter(|(_, h)| h.is_human) {
+                        // `0x40E9E0(human)` and the horn of *this* human (the reference alone when the caller
+                        // gave no views: a single-player race has one human)
+                        let (h_laps, h_slice, h_honk) = match self.human_views.get(hi) {
+                            Some(v) => (v.laps, h.slice, v.honking),
+                            None => (reference.laps, reference.slice, reference.honking),
+                        };
+                        let human_m = metres(table, h_laps as f32 + table.frac(h_slice));
                         let d = crate::lanes::gap_between(table, h.slice, my_slice).abs();
                         // a much slower human close ahead
                         if my_dir * h.speed + 40.0 < my_dir * my_speed && d < 12.0 {
@@ -958,7 +992,7 @@ impl TrafficSet {
                         // tick until the audit of 2026-09-26. 4 when `0x40E9E0(human) <
                         // 0x40E9E0(car)`, else 5 (0x4016D2…0x4016FB)
                         let me_flat = self.overtake_base + i;
-                        let swapped = self.swap_partner.first().copied().flatten() == Some(me_flat)
+                        let swapped = self.swap_partner.get(hi).copied().flatten() == Some(me_flat)
                             && self.swap_tick.get(me_flat).copied().flatten().is_some_and(|t| tick.saturating_sub(t) < 15);
                         if swapped {
                             requests.push((hi as i32, if human_m < travelled { Trigger::OpponentPassesHuman } else { Trigger::HumanPassesOpponent }));
@@ -966,7 +1000,7 @@ impl TrafficSet {
                         // trigger 6, `human honk` (0x401713…0x40174E): the slice distance under
                         // 30 m (`[0x5B2408]`), the human's horn byte `human+0xD86` set, and the
                         // `TIME` option `[0x657A30]` clear. The port has one human, the reference.
-                        if d < 30.0 && reference.honking && !time_mode {
+                        if d < 30.0 && h_honk && !time_mode {
                             requests.push((hi as i32, Trigger::HumanHonks));
                         }
                     }
@@ -1403,7 +1437,7 @@ impl TrafficSet {
         let (fwd, _, up) = axes(&sl, dir);
         let rest = self.cars[i].rest_height();
         self.cars[i].slice = s;
-        match (grid, self.specs.clone()) {
+        match (grid, self.car_specs.get(i).cloned().or_else(|| self.specs.clone())) {
             (Some(g), Some(specs)) if i < self.bodies.len() => {
                 // 0x49E220 (re-arms `car+0xDB0`, the drivetrain and the AI's forces), then
                 // `Car_placeAtSlice` 0x49B090 with the zero offset and `car+0xEAC`
@@ -1661,7 +1695,7 @@ impl TrafficSet {
         c.speed = target * dir; // `car+0xEC0 = car+0xEB8` — a traffic car spawns already at speed
         c.accel_local = Vec3::ZERO;
         c.accel_world = Vec3::ZERO;
-        match (grid, self.specs.clone()) {
+        match (grid, self.car_specs.get(i).cloned().or_else(|| self.specs.clone())) {
             (Some(g), Some(specs)) if i < self.bodies.len() => {
                 // 0x407690 (§9.6): `Car_placeAtSlice` 0x49B090 (car, slice, {car+0xEB4, 1.0, 0},
                 // car+0xEB0) — the slice-local offset in the frame the tracker's patch normal
