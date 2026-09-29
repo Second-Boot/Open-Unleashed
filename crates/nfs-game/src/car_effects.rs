@@ -1,8 +1,10 @@
 //! Each car's own particle effects — the eleven `carpart.dat` systems of `RE/notes/particles.md`
 //! §11: the set **0x43EE10** builds per `R3DCar` (0x437920 → 0x437A1E, `[car+0x704]`), the
 //! per-frame drive **0x43EF80** the car's draw runs (`R3DCar` slot 7 0x4383C0 → 0x438416, from
-//! the draw 0x4430A0 at 0x443239 — a car that is drawn), the update **0x43F660** on `GameTick`'s
-//! odd tick (0x4150F2) and the draw **0x43F6E0** after the track's systems (0x468B6F).
+//! the draw 0x4430A0 at 0x443239 — a car that is drawn — and, ungated, `R3DCar` slot 8 0x438420
+//! from the walk of every car **0x443640** on `GameTick`'s odd tick, 0x4150ED), the update
+//! **0x43F660** on the same odd tick right after it (0x4150F2) and the draw **0x43F6E0** after the
+//! track's systems (0x468B6F).
 //!
 //! The systems are the track's `RGenericParticleSystem` (`crate::track_particles`), each on a
 //! 0x30-byte slot record that stands for the track part: the point `+0`, the two directions
@@ -116,7 +118,7 @@ impl CarEffects {
             let systems = std::array::from_fn(|k| {
                 let tag = SLOT_TAGS[k];
                 let di = self.defs.iter().position(|d| d.tag == tag)?;
-                let e = Emitter { article: 0, part: k as u16, position: Vec3::ZERO, dir_a: Vec3::X, dir_b: Vec3::Y, tag };
+                let e = Emitter { article: 0, part: k as u16, position: Vec3::ZERO, local: Vec3::ZERO, dir_a: Vec3::X, dir_b: Vec3::Y, tag };
                 let mut s = System::new(&self.defs, di, e, self.budget);
                 s.emitting = false;
                 // the sparks: `+0x2E |= 1 | 4` and `+0x4C = car + 0x330` (0x43EEEA…0x43EF03) —
@@ -388,7 +390,7 @@ mod tests {
     fn the_retag_keeps_the_particles_of_an_equal_count() {
         // 0x454B62: `RDDT` → `WTSP` (35 each) keeps them, → `RDGR` (43) frees them
         let defs = surface_defs();
-        let e = Emitter { article: 0, part: 7, position: Vec3::ZERO, dir_a: Vec3::X, dir_b: Vec3::Y, tag: RDDT };
+        let e = Emitter { article: 0, part: 7, position: Vec3::ZERO, local: Vec3::ZERO, dir_a: Vec3::X, dir_b: Vec3::Y, tag: RDDT };
         let mut s = System::new(&defs, 1, e, 200);
         let mut rng = ParticleRng::new(3);
         for _ in 0..10 {

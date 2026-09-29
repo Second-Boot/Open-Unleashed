@@ -231,7 +231,9 @@ pub const VIEW_DRIVER: usize = 1;
 /// in the bumper and driver views (0x4383FD: when `carInfo+0x520` is the car the camera follows and
 /// the view id is 0 or 1, `[car+0x704] → 0x43EF80(1)` is skipped; `nfs_game::car_effects`).
 /// CONFIRMED. *(Corrected 2026-09-26/27: this was read as "the car is not drawn"; 0x43EF80 is the
-/// cars' `carpart.dat` effects, not the body — `car-model.md` §13, `particles.md` §11.)*
+/// cars' `carpart.dat` effects, not the body — `car-model.md` §13, `particles.md` §11.)* The gate
+/// is slot 7's only: the odd tick's walk 0x443640 drives the same car through slot 8 (0x438420)
+/// with no view test, so the own car's effects still run at 32 Hz in these views.
 pub fn draws_own_car(view: u16) -> bool {
     view > 1
 }

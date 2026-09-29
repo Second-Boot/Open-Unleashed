@@ -610,6 +610,12 @@ pub struct SaveSide {
     /// `OpponentCar.Car` (`FEOpponentCarAccessor`, §6.1): its selection and its seven cars
     /// (`opponent_car_image` / `opponent_car_of`). `None` leaves the accessor out of the block.
     pub opponent_cars: Option<(u32, Vec<SavedCar>)>,
+    /// `OwnedCars.Car`'s selection (`FEOwnedCarAccessor`, §6.1): its Save 0x4F5B30 writes the
+    /// count (`(end − begin) / 4` of the vector `[this+0x2C]()`) and then the index `vtbl[+0x28]()`;
+    /// its Load 0x4F5B70 hands the count to `setCount` (slot 24, 0x4BC310) and the index to
+    /// 0x4F0A30 → `SetSelection` 0x4BC240, clamped into the garage. *(Until 2026-09-30 the port
+    /// wrote 0 and read nothing back — a reload always stood on the first car.)*
+    pub owned_car_selection: u32,
 }
 
 /// The four dwords of the `Tournament` module (§4.3) that belong to the front end, not to the
@@ -784,7 +790,7 @@ pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, 
         // does not know. *(Until 2026-09-26 the port wrote `evolution_complete` as 0/1 here — the
         // club flag `[0x691E54]`, already in the `Tournament` module — so a finished Evolution put
         // the original into quick knockout on load.)*
-        ("OwnedCars.Car".into(), AccessorValue::OwnedCarSel { cars: c.garage.len() as u32, selection: 0 }),
+        ("OwnedCars.Car".into(), AccessorValue::OwnedCarSel { cars: c.garage.len() as u32, selection: side.owned_car_selection }),
         ("UserList.NameInput".into(), AccessorValue::Text(profile.name.clone())),
         ("Tournament.Data".into(), AccessorValue::Empty),
         ("Factory.Data".into(), AccessorValue::Empty),
@@ -962,6 +968,7 @@ pub fn side_from_sav(s: &SaveFile) -> SaveSide {
         // 0x5029F0 stores the four back as they are
         tournament: s.tournament.as_ref().map_or_else(TournamentFe::default, |t| TournamentFe { selected: t.selected, next_event: t.remaining_tracks, current_event: t.current_event, current_tournament: t.current_tournament }),
         opponent_cars: None,
+        owned_car_selection: 0,
     };
     let mut opponent_cars = None;
     let st = &mut side.settings;
@@ -987,6 +994,9 @@ pub fn side_from_sav(s: &SaveFile) -> SaveSide {
             }
             // 0x4F56F0: the selection through 0x4BC480, then seven cars through 0x4EE6A0
             (_, AccessorValue::OpponentCars { selection, cars }) => opponent_cars = Some((*selection, cars.clone())),
+            // 0x4F5B70: the index as saved; the clamp into the garage is the caller's (0x4BC240
+            // against the live count, `vtbl[+0x24]`)
+            (n, AccessorValue::OwnedCarSel { selection, .. }) if n == "OwnedCars.Car" => side.owned_car_selection = *selection,
             (_, AccessorValue::DeadZone { values, .. }) => {
                 if let Some((axis, k)) = name.split_once('.').and_then(|(a, m)| Some((DEADZONE_AXES.iter().position(|x| *x == a)?, ["Min", "Max"].iter().position(|x| *x == m)?))) {
                     st.deadzone[axis][k] = values[0];

@@ -566,6 +566,7 @@ fn the_front_end_modules_and_options_come_back() {
         settings: SavedSettings { laps: 5, opponents: 6, traffic: 2, ko_opponents: 7, music: 90, options: vec![("Display.SpeedUnits".into(), 1), ("Graphics.CarDetail".into(), 2)], ..SavedSettings::default() },
         tournament: nfs_game::save::TournamentFe { selected: 4, next_event: 2, current_event: 1, current_tournament: 4 },
         opponent_cars: None,
+        owned_car_selection: 1,
     };
     // `OpponentCar.Car`'s seven (0x4F56C0 / 0x4F56F0): a record with paint sets and interiors
     let with_paint = t.catalog.iter().find(|c| c.paint_sets.len() > 2 && c.interior_colours.len() > 1).expect("a painted car");
@@ -597,6 +598,9 @@ fn the_front_end_modules_and_options_come_back() {
     assert_eq!(k.last_pos, side.knockout.as_ref().unwrap().last_pos);
     assert_eq!(back.personalities, side.personalities);
     assert_eq!(back.playlist, side.playlist);
+    // `OwnedCars.Car`: 0x4F5B30 writes the index, 0x4F5B70 reads it back
+    assert!(matches!(dword("OwnedCars.Car"), Some(nfs_formats::sav::AccessorValue::OwnedCarSel { selection: 1, .. })));
+    assert_eq!(back.owned_car_selection, 1);
     // `Tournament`'s four front-end dwords, in the writer's order 0x502AE0 and back through 0x5029F0
     let tm = parsed.tournament.as_ref().unwrap();
     assert_eq!((tm.remaining_tracks, tm.selected, tm.current_event, tm.current_tournament), (2, 4, 1, 4));

@@ -19,9 +19,14 @@ pub struct Emitter {
     /// system by the part's address
     pub article: usize,
     pub part: u16,
-    /// `+0…+8`
+    /// `+0…+8` in the world: the point the system emits from once it is running — the part's own
+    /// `+0…+8` through its article's `tr` (for a `tr`-less article, the same numbers)
     pub position: Vec3,
-    /// `+0x10…+0x18`, `+0x1C…+0x24`
+    /// `+0…+8` as the part stores it, untransformed: where the constructor's prime updates birth
+    /// (see [`TrackParticles::draw`], 0x455030)
+    pub local: Vec3,
+    /// `+0x10…+0x18`, `+0x1C…+0x24` as the part stores them — neither creator transforms them
+    /// (0x455000 hands the constructor the part itself, 0x455030 copies it, 0x455069)
     pub dir_a: Vec3,
     pub dir_b: Vec3,
     /// `+0x28`
@@ -315,16 +320,33 @@ impl TrackParticles {
     /// they already fade by the value against the draw distance `draw` — and only **after** them
     /// flag 2 clears `+0x2C` (0x4543DF…0x4543E4): a once-only system primes emitting.
     /// *(Until 2026-09-26 the port primed at the full rate, and a flag-2 system not emitting.)*
+    ///
+    /// **Where the prime births (0x455030, read 2026-09-30).** Both creators prime at the part's
+    /// point as the part stores it, [`Emitter::local`]: the static one hands the constructor the
+    /// part itself (`+0x28 = part`, 0x4542BC); the movable one 0x455030 — the creator 0x450980
+    /// uses for a `tr` article's kind-3 parts (`[esp+0x70] = 0x5B3CD8` at 0x450AE0, whose slot 0
+    /// is 0x455030) — calls the constructor with prime **0** (0x45504E), copies the part's 48
+    /// bytes to its own `+0x58` and points `+0x28` / `+0x4C` there (0x455059…0x455071), and runs
+    /// the prime updates itself (0x45508A…0x45509F) before 0x450980 re-seats the point through
+    /// slot 4 (0x4550B0, see [`Self::draw`]). So a `tr` article's prime is born at its
+    /// untransformed point, near the world's origin, not at the prop — of the shipped kind-3
+    /// definitions only `BPST` (the breakaway pipes, prime 10) and `HEXH` (prime 14, on `tr`-less
+    /// articles, where the two points are one) prime at all. The point is restored to
+    /// [`Emitter::position`] after the prime.
     fn make(&mut self, k: usize, value: f32, draw: f32) {
         let d = &self.defs[self.systems[k].def];
         let (emitting, prime) = (d.flags & 2 == 0, d.prime);
         let s = &mut self.systems[k];
         (s.tick, s.spawned, s.accumulated, s.emitting, s.live, s.sqd) = (0, 0.0, 0.0, true, true, value);
         s.particles.clear();
+        let world = s.emitter.position;
+        s.emitter.position = s.emitter.local;
         for _ in 0..prime {
             self.systems[k].update(&self.defs, &mut self.rng, draw);
         }
-        self.systems[k].emitting = emitting;
+        let s = &mut self.systems[k];
+        s.emitter.position = world;
+        s.emitting = emitting;
     }
 
     pub fn systems(&self) -> usize {
@@ -345,7 +367,17 @@ impl TrackParticles {
     /// **0x454420**: `+0x2C = 1` (emitting) and `+0xC = 0` (the period's tick) — what 0x450980 does
     /// every drawn frame of a struck item (its record's `+4` is 1, 0x450B25…0x450B2F), so a
     /// once-only system (flag 2: `BEXP`, `BEXO`, `TRSH`) keeps going. The matrix 0x450980 hands
-    /// slot 4 goes nowhere (0x50BBE0 is `ret 4`): a system stays where it was made.
+    /// slot 4 is the item's placement: 0x450010 asks 0x4769E0 for the lead's sample with its
+    /// last argument 1, which swaps the sample for the identity (0x476A24…0x476A3E, `[0x5BC660]`)
+    /// before the product with the instance's matrix (0x539CD0 / 0x559230) — so the point
+    /// 0x53A330 makes of the part's (0x450B0D…0x450B14) is the part through the placement, every
+    /// drawn frame the same. *(Corrected 2026-09-30: the system 0x450980 makes is the movable
+    /// one, vtable 0x5B3E24, whose slot 4 is 0x4550B0 — it copies that point, 16 bytes, to the
+    /// system's `+0x58` — not the static one's `ret 4` 0x50BBE0. The outcome is the same place:
+    /// [`Emitter::position`], which is `tr` × the part's point — MEDIUM that the anim-world
+    /// record's instance matrix `world+0x40 + 56·id` is the article's `tr`, as the port's own
+    /// draw of the article at rest takes it. What does differ is the prime, [`Self::make`], and
+    /// the directions, which stay the part's own: [`Emitter::dir_a`].)*
     /// `draw` is the scaled draw distance `[0x6197CC]` the constructor's prime updates fade by.
     pub fn draw(&mut self, draw: f32, drawn: impl Fn(&Emitter) -> Option<(f32, bool)>) {
         for k in 0..self.systems.len() {
@@ -458,7 +490,7 @@ mod tests {
     #[test]
     fn a_system_lives_while_its_article_is_drawn() {
         // 0x455150 makes it on the first draw; 0x4551E0 drops it 100 updates after the last
-        let e = Emitter { article: 0, part: 0, position: Vec3::ZERO, dir_a: Vec3::X, dir_b: Vec3::Y, tag: 1 };
+        let e = Emitter { article: 0, part: 0, position: Vec3::ZERO, local: Vec3::ZERO, dir_a: Vec3::X, dir_b: Vec3::Y, tag: 1 };
         let mut p = TrackParticles::new(vec![def()], &[e], 0, 256);
         p.step(1000.0);
         assert!(!p.systems[0].live);
@@ -471,6 +503,27 @@ mod tests {
         assert!(p.systems[0].live);
         p.step(1000.0);
         assert!(!p.systems[0].live && p.sprites().is_empty());
+    }
+
+    #[test]
+    fn the_prime_births_at_the_parts_own_point_and_the_run_at_the_placed_one() {
+        // 0x455030: prime 0 to the constructor (0x45504E), the prime updates on the part's
+        // copy (0x45508A…), then 0x450980's slot 4 (0x4550B0) re-seats it at the placed point
+        let placed = Vec3::new(1000.0, 0.0, 0.0);
+        let e = Emitter { article: 0, part: 0, position: placed, local: Vec3::ZERO, dir_a: Vec3::X, dir_b: Vec3::Y, tag: 1 };
+        let mut d = def();
+        d.prime = 20;
+        let mut p = TrackParticles::new(vec![d], &[e], 0, 256);
+        p.draw(1000.0, |_| Some((0.0, true)));
+        let primed = p.sprites();
+        assert!(!primed.is_empty());
+        assert!(primed.iter().all(|s| s.position.length() < 10.0));
+        assert_eq!(p.systems[0].emitter.position, placed);
+        for _ in 0..20 {
+            p.draw(1000.0, |_| Some((0.0, true)));
+            p.step(1000.0);
+        }
+        assert!(p.sprites().iter().any(|s| (s.position - placed).length() < 10.0));
     }
 
     #[test]
@@ -515,7 +568,7 @@ mod tests {
 
     #[test]
     fn rate_emission_and_death() {
-        let e = Emitter { article: 0, part: 0, position: Vec3::ZERO, dir_a: Vec3::X, dir_b: Vec3::Y, tag: 1 };
+        let e = Emitter { article: 0, part: 0, position: Vec3::ZERO, local: Vec3::ZERO, dir_a: Vec3::X, dir_b: Vec3::Y, tag: 1 };
         let mut p = TrackParticles::new(vec![def()], &[e], 0, 256);
         assert_eq!(p.systems(), 1);
         // 20 over a 100-tick life: 0.2 a tick, the first one born once 1.2 has accumulated
@@ -561,7 +614,7 @@ mod tests {
     fn the_prime_emits_and_fades_by_the_value() {
         // 0x454250: `+0x2C = 1` before the prime loop, flag 2 clears it only after; `+0x10` is
         // the value 0x455000 hands it, so the prime's emission fades past `volume · D`
-        let e = Emitter { article: 0, part: 0, position: Vec3::ZERO, dir_a: Vec3::X, dir_b: Vec3::Y, tag: 1 };
+        let e = Emitter { article: 0, part: 0, position: Vec3::ZERO, local: Vec3::ZERO, dir_a: Vec3::X, dir_b: Vec3::Y, tag: 1 };
         let mut d = def();
         (d.flags, d.prime, d.volume) = (2, 50, 0.5);
         let mut p = TrackParticles::new(vec![d.clone()], &[e.clone()], 0, 256);
@@ -578,7 +631,7 @@ mod tests {
 
     #[test]
     fn budget_and_once_only() {
-        let e = Emitter { article: 0, part: 0, position: Vec3::ZERO, dir_a: Vec3::X, dir_b: Vec3::Y, tag: 1 };
+        let e = Emitter { article: 0, part: 0, position: Vec3::ZERO, local: Vec3::ZERO, dir_a: Vec3::X, dir_b: Vec3::Y, tag: 1 };
         let none = TrackParticles::new(vec![def()], &[e.clone()], 0, 0);
         assert_eq!(none.systems(), 0);
         let mut d = def();

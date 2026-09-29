@@ -824,10 +824,7 @@ pub struct FePad {
 /// `test ah, 0x41`. Returns the number 0x4DB2F0 writes to `[this+0xF0]`, 0 for a miss.
 pub fn scrollbar_region(x: f32, y: f32, h: f32, rows: usize, first: usize, px: f32, py: f32) -> u32 {
     const ARROW_H: f32 = 13.0;
-    let knob_h = (h - 2.0 * ARROW_H - rows as f32).max(16.0);
-    let travel = (h - 2.0 * ARROW_H - knob_h).max(0.0);
-    let steps = rows.saturating_sub(1).max(1) as f32;
-    let ky = y + ARROW_H + travel * (first as f32 / steps).min(1.0);
+    let (ky, knob_h, _) = combo_knob(y, h, rows, first);
     for (n, (rx, ry, rw, rh)) in [
         (x, y, LIST_SCROLLBAR_W, ARROW_H),
         (x, y + h - ARROW_H, LIST_SCROLLBAR_W, ARROW_H),
@@ -844,6 +841,65 @@ pub fn scrollbar_region(x: f32, y: f32, h: f32, rows: usize, first: usize, px: f
     0
 }
 
+/// `FeListScrollBar`'s knob — `(top, height, travel)` for a bar at `y`, `h` tall, whose model
+/// answers `count` positions (slot 9) and sits on `first` (slot 10). The constructor 0x4DAF10 and
+/// the re-place slot 11, **0x4DB220**, compute it in integers:
+///
+/// ```text
+/// 0x4DB26A  knobH  = max(16, [+0x118] − 2·[+0x128] − count)   ; h − 2·13 − count
+/// 0x4DB2B0  travel = [+0x118] − 2·[+0x128] − knobH
+/// 0x4DB2CE  top    = [+0xF4] + (count ? first·travel / count : 0)   ; idiv, truncating
+/// ```
+///
+/// with `[+0xF4]` the knob's resting top, `y + 13` (0x4DAF30 / 0x4DB016). The divisor is the
+/// **count**, not `count − 1` — this is not `NFS5.VerticalSlider`'s placement (0x4D0BBE, §4.46),
+/// so the knob never quite reaches the down arrow. The drag, 0x4DB9B0, is its exact inverse
+/// (`App::fe_apply_combo_drag`). *(Until 2026-09-30 the port placed this knob with the list box's
+/// `count − 1` in floats.)*
+pub fn combo_knob(y: f32, h: f32, count: usize, first: usize) -> (f32, f32, i32) {
+    const ARROW_H: i32 = COMBO_ARROW_H as i32;
+    let (h, count) = (h as i32, count as i32);
+    let knob_h = (h - 2 * ARROW_H - count).max(16);
+    let travel = h - 2 * ARROW_H - knob_h;
+    let dy = if count == 0 { 0 } else { first as i32 * travel / count };
+    (y + ARROW_H as f32 + dy as f32, knob_h as f32, travel)
+}
+
+/// The drag step of `FeListScrollBar`'s mouse-move slot 8, **0x4DB9B0** — the position the model
+/// is set to (before its own clamp, slot 11 = 0x4BC240) when the pointer is at `py` and the grab
+/// was taken at `grab_y` on position `grab_at`:
+///
+/// ```text
+/// 0x4DBA03  travel = [+0x118] − 2·[+0x128] − [+0x108]          ; h − 2·13 − knobH
+/// 0x4DBA18  dy     = ev.y − [+0xE4]                            ; the grab's y
+/// 0x4DBA24  pos    = [+0xE8] + dy · model->slot9() / travel    ; imul, idiv — truncating
+/// 0x4DBA29  model->slot11(pos)
+/// ```
+///
+/// The event's y is an integer, so both ends are taken to the design pixel first — the port's
+/// cursor is sub-pixel (APPROXIMATION of the original's integer mouse position). `None` when the
+/// travel is zero (the original would divide by zero there; it cannot arise, since the knob is at
+/// most `h − 26` tall only when the bar has no travel and then nothing scrolls).
+pub fn combo_drag_pos(py: f32, grab_y: f32, grab_at: usize, count: usize, travel: i32) -> Option<i32> {
+    if travel == 0 {
+        return None;
+    }
+    let dy = py.floor() as i32 - grab_y.floor() as i32;
+    Some(grab_at as i32 + dy * count as i32 / travel)
+}
+
+/// The 150 ms auto-repeat's own arithmetic — `0x529220(this, 0x96, 1)`'s tick. Every held
+/// scrollbar arrow shares one shape: `NFS5.VerticalSlider`'s own bar (0x4D0A97/0x4D0B40),
+/// `NFS5.CARSETTINGBUTTON` (0x4C1F40/0x4C1F80) and the open combo's own `FeListScrollBar`
+/// (`0x4DB040`/`0x4DB1D0`, §4.101) all arm the identical repeating timer on press and step once
+/// per firing — `porsche::App`'s `list_repeat` / `setting_repeat` / `combo_arrow_repeat` bank the
+/// frame's `dt_ms` against the time already carried and take out whole 150 ms periods, exactly
+/// the way the timer's own callback would fire once per elapsed period rather than at most once
+/// per game tick. Returns `(steps, new accumulator)`.
+pub fn repeat_steps(acc_ms: u32, dt_ms: u32, period_ms: u32) -> (u32, u32) {
+    let acc = acc_ms + dt_ms;
+    (acc / period_ms, acc % period_ms)
+}
 
 /// Where `NFS5.DEADZONE`'s live marker sits, relative to the box's left edge — 0x51B7FF…0x51B84B:
 ///
@@ -5108,11 +5164,8 @@ impl LayoutScreen {
                 out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
             }
         }
-        // the knob: its height is 0x4DAFC5's, and its travel the port's own first row
-        let knob_h = (h - 2.0 * ARROW_H - rows as f32).max(16.0);
-        let travel = (h - 2.0 * ARROW_H - knob_h).max(0.0);
-        let steps = rows.saturating_sub(1).max(1) as f32;
-        let ky = y + ARROW_H + travel * (first as f32 / steps).min(1.0);
+        // the knob: its height is 0x4DAFC5's, and its top 0x4DB220's from the first row
+        let (ky, knob_h, _) = combo_knob(y, h, rows, first);
         let n = knob_h.round().max(1.0) as usize;
         for d in 0..n {
             let t = (d as f32 + 0.5) / n as f32;
@@ -5248,48 +5301,42 @@ impl LayoutScreen {
 
     /// A press on the open combo's scrollbar **knob** (region 3) or **track** (region 4) —
     /// `FeListScrollBar::onPress` 0x4DB040's other two arms (§4.46, §4.101). Returns
-    /// `(index, grabY, grabPosition)`, the drag anchor `combo_scroll_track` steps from on every
-    /// move — `[this+0x104]` and `[this+0x108]` in the original (0x4D0973 for the knob, 0x4D09D6 /
-    /// 0x4D09E3 / 0x4D09F6 for the track).
+    /// `(index, grabY, grabPosition)`, the drag anchor 0x4DB9B0 steps from on every move —
+    /// `[this+0xE4]` and `[this+0xE8]`:
     ///
-    /// Region 3 anchors to the **pointer's own** y, exactly where it was pressed. Region 4 anchors
-    /// to the **knob's own current top** instead (0x4D09D6 reads the knob's rect, not the
-    /// pointer) — the press does not move the model, only the drawn knob (which the original
-    /// visually snaps to the pointer immediately; this port leaves that one cosmetic jump out, the
-    /// same approximation §4.46 already states for the list box's own track click). Either way the
-    /// grabbed position is the model's own current one, `[this+0x108]`.
+    /// ```text
+    /// arm 3  0x4DB0B0  [+0xE0], [+0xE4] = ev.x, ev.y          ; the pointer
+    ///        0x4DB0C1  [+0xE8] = model->slot10()              ; the position it is on
+    /// arm 4  0x4DB0D5  [+0xE0], [+0xE4] = [+0xFC], [+0x100]   ; the knob's own top-left
+    ///        0x4DB0F0  [+0xE8] = model->slot10()
+    ///        0x4DB0F6  [+0x100] = ev.y, then the hit test again -> region 3
+    /// ```
+    ///
+    /// Region 3 anchors to the **pointer's own** y; region 4 to the **knob's current top**. Arm 4
+    /// then asks for a synthetic move (`bl = 1` at 0x4DB101 → 0x4D6140 at 0x4DB119, a type-7
+    /// `MouseMoveEvent` at the current position, controls.md §4.40), which reaches the drag slot
+    /// 0x4DB9B0 at once — so a press on the trough moves the list by `(pointer − knobTop)`
+    /// straight away; `App::fe_left_button` runs that first step right after the grab.
     pub fn combo_scroll_grab(&self, index: usize, region: u32, py: f32) -> Option<(usize, f32, usize)> {
         if let Some((k, j)) = self.route(index) {
             let (_, gy) = self.position_of(self.layout.elements.get(k)?);
             let (_, y, at) = self.groups.get(&k)?.combo_scroll_grab(j, region, py - gy)?;
             return Some((index, y + gy, at));
         }
-        let (x, y, h, positions, first) = self.combo_scroll_geom(index)?;
-        let _ = x;
-        let grab_y = if region == 4 {
-            const ARROW_H: f32 = COMBO_ARROW_H;
-            let knob_h = (h - 2.0 * ARROW_H - positions as f32).max(16.0);
-            let travel = (h - 2.0 * ARROW_H - knob_h).max(0.0);
-            let steps = positions.saturating_sub(1).max(1) as f32;
-            y + ARROW_H + travel * (first as f32 / steps).min(1.0)
-        } else {
-            py
-        };
+        let (_, y, h, positions, first) = self.combo_scroll_geom(index)?;
+        let grab_y = if region == 4 { combo_knob(y, h, positions, first).0 } else { py };
         Some((index, grab_y, first))
     }
 
-    /// The open combo scrollbar's travel and position count — the same numbers `combo_scrollbar`
-    /// and `scrollbar_region` compute for the knob's height and its placement, needed again by the
-    /// drag (0x4D0F20, §4.46): `model->slot11(grabPosition + (y - grabY) * (positions - 1) / span)`.
-    pub fn combo_scroll_track(&self, index: usize) -> Option<(f32, usize)> {
+    /// The open combo scrollbar's knob travel (in whole design pixels) and position count — the
+    /// numbers `combo_knob` (0x4DB220) places the knob with, which the drag 0x4DB9B0 divides by:
+    /// `model->slot11([+0xE8] + (y − [+0xE4]) · count / travel)` (`combo_drag_pos`).
+    pub fn combo_scroll_track(&self, index: usize) -> Option<(i32, usize)> {
         if let Some((k, j)) = self.route(index) {
             return self.groups.get(&k)?.combo_scroll_track(j);
         }
-        let (_, _, h, positions, _) = self.combo_scroll_geom(index)?;
-        const ARROW_H: f32 = COMBO_ARROW_H;
-        let knob_h = (h - 2.0 * ARROW_H - positions as f32).max(16.0);
-        let span = (h - 2.0 * ARROW_H - knob_h).max(0.0);
-        Some((span, positions))
+        let (_, y, h, positions, first) = self.combo_scroll_geom(index)?;
+        Some((combo_knob(y, h, positions, first).2, positions))
     }
 
     /// Put the open combo's first-drawn row at an absolute position, clamped — what the
@@ -5971,7 +6018,7 @@ impl LayoutScreen {
     }
 
     fn drop_down(&self, out: &mut Vec<Sprite>, aspect: f32, e: &nfs_formats::lay::Element, i: usize, x: f32, y: f32, tint: impl Fn([u8; 4]) -> [f32; 4]) {
-        let Some((rows, current)) = self.lists.get(&i) else { return };
+        let Some((rows, _)) = self.lists.get(&i) else { return };
         if rows.is_empty() {
             return;
         }
@@ -6047,11 +6094,30 @@ impl LayoutScreen {
             out.push(self.quad(aspect, bx, by, bw.max(1.0), bh.max(1.0), black));
         }
         let text_c = self.attr(e, "textcolor").and_then(parse_color).map(|c| [c[0], c[1], c[2], 255]).unwrap_or([0, 0, 0, 255]);
-        let sel_c = self.attr(e, "highlightcolorselected").and_then(parse_color).map(|c| [c[0], c[1], c[2], 255]).unwrap_or([0, 0, 0, 255]);
         // the same foot-of-loop test as the list box's (0x4C6915): the last row is drawn and the
         // mask cuts it at the panel's foot (it "overhangs" until 2026-09-27); the
         // first row drawn is the scrollbar's position `[+0x1BC]->slot10()` (0x4C66F8, §4.44) —
         // *until 2026-09-27 the port drew from row 0 whatever the bar said*
+        // `FEOpponentCarAccessor`'s own row draw, `0x4F58A0` (vtable `0x5B77D8` slot 15 —
+        // `controls.md` §4.140; it shares the row-draw shape and call site (`0x4C68F5`)
+        // `FEColourAccessor`'s `0x4B9390` does, confirmed by both taking the exact same
+        // `(row, font, x, y, w, inset=3.0, text, bar)` args off `0x4C687D`'s branch). Read to
+        // the instruction: the shared bar/text colour block just above that branch
+        // (`0x4C675E`…`0x4C67AE`) leaves `bar` (`ebx`) at **0** — transparent — for every row
+        // except the one currently under the pointer, which takes `data.highlightcolorhover`
+        // (`[+0x1E8]`) through `0x4D8830`; `ID_OPPONENTCARBOX`'s own `ComboBoxSlider.ctr` sets
+        // no such key (`QuickRace.lay`), so it keeps the code default `0x4D87B0(0xFF)` —
+        // opaque **`0xBC0000`**, dark red. `0x4F58A0` always draws that bar (`0x4D9280`, its
+        // own literal `14.0`, matching `LIST_ROW_H`) before its row text, unconditionally for
+        // its five rows — the generic loop's own `sel_c` bar just below, gated on `current`
+        // rather than the pointer, is `FeListBox`'s "selected row" arm (`[+0x1DD]`, §4.42),
+        // which never fires for a `ComboBoxSlider` (`[+0x1DD]==0`) and so never reaches these
+        // rows in the original either way. COVERAGE §14.31.
+        let opponent_car_hover = self
+            .attr(e, "accessor")
+            .is_some_and(|a| a.starts_with("OpponentCar.Car"))
+            .then(|| self.pointer.unwrap_or(self.cursor))
+            .flatten();
         let mut acc = 0.0f32;
         let mut ry = py;
         let first = self.scroll.get(&i).copied().unwrap_or(0);
@@ -6060,10 +6126,17 @@ impl LayoutScreen {
                 break;
             }
             acc += row.height();
-            if *current == Some(n) {
-                out.push(self.quad(aspect, px, ry, rect_w, row.height(), tint(sel_c)));
+            if opponent_car_hover.is_some_and(|(cx, cy)| self.combo_row_at(cx, cy) == Some((i, n))) {
+                out.push(self.quad(aspect, px, ry, rect_w, row.height(), tint([0xBC, 0x00, 0x00, 0xFF])));
             }
-            let fg = if *current == Some(n) { [1.0, 1.0, 1.0, 1.0] } else { tint(text_c) };
+            // No "selected row" bar and no white text here: that arm of the shared row draw
+            // (0x4C677C, §4.42) is gated on `[this+0x1DD]`, which `FeComboBox::FeComboBox`
+            // (0x4C4CF0) sets to 1 only for `NFS5.ListBox` (0x4CCE5A) and to 0 for
+            // `NFS5.ComboBoxSlider` (0x4C4CA7) and `NFS5.ColorBox` (0x4C38A3) — the only widgets
+            // whose open list comes through here (`draw_combo`). A list box's own selected row
+            // is `draw_list_box`'s. COVERAGE §14.34 (until 2026-09-30 the port drew the combo's
+            // current row black with white text).
+            let fg = tint(text_c);
             match row {
                 ListRow::Text(t) => self.text(out, aspect, f, t, px + 3.0, ry + 2.0, 0.0, 0, fg),
                 // 0x4C688F hands the row draw an inset of 3.0 (§4.171)
@@ -7851,6 +7924,60 @@ impl LayoutScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `FeListScrollBar`'s knob placement (0x4DB220) and its drag (0x4DB9B0) are exact inverses,
+    /// both dividing by the position **count**, not `count − 1` — verified 2026-09-30 against the
+    /// live game's own `paintshop` exterior-colour list (`count` 4, `travel` 4 design px there,
+    /// too small a range for a screenshot to show the fix — `combo_drag_layout.diff`'s own
+    /// before/after screenshots of that list are visually identical for exactly this reason). A
+    /// wider list makes the bug concrete: with `count = 4` (as in that live list) the old,
+    /// wrong `count − 1 = 3` divisor gives a knob position one whole design pixel further down
+    /// than the original at `first = 3` — small, but the same off-by-a-row error compounds on a
+    /// list with dozens of rows (a settings/profile list), where `count − 1` drifts the knob and
+    /// the drag noticeably short of the original's own placement.
+    #[test]
+    fn the_combo_knob_and_its_drag_divide_by_count_not_count_minus_one() {
+        // 0x4DB220 on a wide list: h=200, count=50, first=25 — knobH=max(16,200-26-50)=124,
+        // travel=200-26-124=50, top=y+13+25*50/50=y+13+25
+        let (top, knob_h, travel) = combo_knob(100.0, 200.0, 50, 25);
+        assert_eq!(knob_h, 124.0);
+        assert_eq!(travel, 50);
+        assert_eq!(top, 100.0 + 13.0 + 25.0);
+        // 0x4DB9B0, its exact inverse: pos = grab_at + (py-grab_y)*count/travel
+        assert_eq!(combo_drag_pos(150.0, 100.0, 25, 50, travel), Some(25 + 50 * 50 / 50));
+
+        // the live `paintshop` ExtColour list's own numbers: h=160, count=4 — knobH=max(16,160-
+        // 26-4)=130, travel=160-26-130=4, so a whole drop-down's worth of scroll is 4 design px
+        let (_, knob_h, travel) = combo_knob(0.0, 160.0, 4, 0);
+        assert_eq!((knob_h, travel), (130.0, 4));
+        // at first=3 (the last position) the correct divisor (4) gives 3*4/4=3; the bug this
+        // fix replaced (dividing by count-1=3) gave 3*4/3=4 — one design px further down than
+        // the original, and forced full-value clamps to look identical between the two, exactly
+        // what the screenshots on this same list show
+        assert_eq!(3 * travel / 4, 3);
+        assert_eq!(3 * travel / 3, 4);
+    }
+
+    /// `0x529220(this, 0x96, 1)`'s own rule — a 150 ms period, one step per period elapsed, not
+    /// per game tick — read at the combo drop-down's own scrollbar arrow (`FeListScrollBar`
+    /// `0x4DB040`/`0x4DB1D0`, §4.101), the same shape `NFS5.VerticalSlider`'s bar and
+    /// `NFS5.CARSETTINGBUTTON` already use for their own held arrows.
+    #[test]
+    fn the_scrollbar_arrow_repeats_every_150_ms_not_once_per_tick() {
+        // under one period: no step yet, and the whole elapsed time is banked
+        assert_eq!(repeat_steps(0, 149, 150), (0, 149));
+        // exactly one period: one step, nothing left over
+        assert_eq!(repeat_steps(0, 150, 150), (1, 0));
+        // several periods in one long frame (a stall, or a coarse tick): one step per period
+        // completed, not one step per call — the timer would have fired three times
+        assert_eq!(repeat_steps(0, 449, 150), (2, 149));
+        // the accumulator carries a partial period across frames, exactly like the already-
+        // ported `list_repeat`/`setting_repeat` — two 100 ms frames (200 ms banked) step once
+        // and carry 50 ms, not zero
+        let (steps, acc) = repeat_steps(0, 100, 150);
+        assert_eq!((steps, acc), (0, 100));
+        assert_eq!(repeat_steps(acc, 100, 150), (1, 50));
+    }
 
     /// `FEStringAccessor::insert` 0x4BCA90's own forbidden set — the nine bytes Windows refuses
     /// in a file name, `\ / : * ? " < > |` — found on `UserList.NameInput`'s profile-name box,

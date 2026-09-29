@@ -21,6 +21,10 @@ pub struct TrackWorld {
     /// outside a section; `RE/notes/lighting.md` §3.1, §3.2.)*
     pub env_map: Option<nfs_renderer::TextureId>,
     pub collision: nfs_physics::collision::TriangleGrid,
+    /// Item centres for `nfs_game::skidmarks::SkidMarks::for_world_items` — the same population
+    /// [`Self::collision`] turns into triangles ([`nfs_assets::track::TrackGeometry::item_centres`],
+    /// `RE/notes/particles.md` §10.1).
+    pub skid_items: Vec<(f32, f32)>,
     /// The collision props the loader 0x4750B0 builds from the track's tagged articles
     /// ([`track_props`]) — `Car_propPass` 0x498DE0's objects.
     pub props: Vec<nfs_physics::props::Prop>,
@@ -65,12 +69,18 @@ pub struct TrackWorld {
     /// `.map` sections, and every `.env` entry by its SHPI name (`RE/notes/lighting.md` §3).
     pub map_sections: Vec<MapSection>,
     env_by_id: HashMap<u32, nfs_renderer::TextureId>,
-    /// Props whose article carries an `Anim` / `Anqt` track and whose `animdefs.txt` definition
-    /// loops it (`RE/notes/crp-geometry.md` §7). The shipped file loops exactly two — the two
-    /// dockers — every other animation there is played on impact: the breakables below. (The
-    /// smackables are car records whose player only follows the body, 0x471180 — none of their
-    /// definitions has pieces.)
+    /// Props playing their own looping animation: an `.scn`-instanced library piece whose
+    /// `animdefs.txt` definition loops it (`RE/notes/crp-geometry.md` §7 — the shipped file loops
+    /// exactly two, the two dockers; every other `PIECE` animation there is played on impact, the
+    /// breakables below), plus — since 2026-09-30 — the one world article whose own `Anqt` track
+    /// is not gated by `animdefs.txt` at all: autobahn's `"Locomotive"` (`sound_articles`,
+    /// [`TrackWorld::upload`]). (The smackables are car records whose player only follows the
+    /// body, 0x471180 — none of their definitions has pieces.)
     animated: Vec<AnimatedProp>,
+    /// The Locomotive's own path, for the game's audio update to sample every tick
+    /// (`AnimatedSound::eval_pair`) and feed the ambient train sound's doppler. `None` on every
+    /// track but Autobahn (`COVERAGE-2026-09-26.md` §14.38).
+    pub animated_sound: Option<AnimatedSound>,
     /// The breakable props drawn in the world, with their pieces once a car has started them.
     broken: Vec<BrokenProp>,
     /// The kind-2 `ef` parts of the track's own articles — the flares 0x451940 draws
@@ -88,6 +98,17 @@ pub struct TrackWorld {
     /// By `.crp` article index, the track walk's view of every placed article ([`CullArticle`],
     /// `RE/RENDERING.md` "The track draw's culling").
     pub cull_articles: Vec<Option<CullArticle>>,
+    /// Per [`Self::cull_articles`] entry: every fitted-cull-tree node `0x47BDC0`/`0x489930`'s
+    /// budgeted footprint spread registers it into, each a fixed circle `(cx, cz, r)`, or an empty
+    /// list for a `None` article — the node pass `RE/RENDERING.md` "The node pass 0x47F400 and the
+    /// fitted tree's split 0x47BE30" describes (an article would survive when *any* of its nodes
+    /// does — `0x47F400`'s own tree walk visits a node iff every ancestor's fixed circle also
+    /// passes, proven equivalent to a per-node independent check here since a child's circumscribed
+    /// circle is always inscribed in its parent's, `COVERAGE` §14.36). Built (from the articles'
+    /// own footprint boxes, [`build_article_nodes`]) and kept correct, but the pass itself is not
+    /// switched on ([`NODE_PRUNE`]'s own doc has the reason). Census:
+    /// `nfs-game/examples/cull_tree_node_prune_census.rs`.
+    article_nodes: Vec<Vec<(f32, f32, f32)>>,
     /// The track's own geometry, one entry per placed article (the breakables' apart), each LOD's
     /// draw items uploaded — what the walk's draw picks from per frame ([`Self::visible_items`]).
     /// *(Until 2026-09-26 every article's lowest LOD was merged per material into a few hundred
@@ -169,6 +190,16 @@ pub struct CullArticle {
     pub drawer: ArticleDrawer,
     pub centre: Vec3,
     pub radius: f32,
+    /// The registration's own footprint box (world xz), [`build_article_nodes`]'s input:
+    /// `0x489701`'s "eight box corners" via `getBounds` (vtable slot 2, `0x4893A0`, shared by
+    /// every bundle class but `MidGround`) calling `getBBox` (slot 4, `0x477F40`) — `Base`'s own
+    /// `bbox_min`/`bbox_max` (`crp.rs`'s `Base::bbox_min`/`bbox_max`, the same `Base+20…+44` the
+    /// draw-time sphere sits next to but is not derived from). `MidGround` overrides slot 2 with
+    /// `0x47D010`: the same box scaled `×2.25` (`[0x5B4774]`) about its own centre — **not**
+    /// `Self::radius`'s `max(2.25·r, 200)` draw-time inflation (`0x47CF00`), a different, per-frame
+    /// occlusion/distance quantity RENDERING.md keeps apart from this box.
+    pub footprint_min: Vec3,
+    pub footprint_max: Vec3,
     pub lods: Vec<CullLod>,
 }
 
@@ -381,9 +412,14 @@ impl TrackWorld {
     /// the first record with `trunc(v) < distance²` (0x450E36; the instance drawer's `v` comes
     /// rounded through the queue), none = not drawn.
     ///
-    /// APPROXIMATION: the node pass 0x47F400 is not carried (the fitted tree is not built); it only
-    /// takes out items whose nodes all lie outside the ground wedge or the far circle, so this set is
-    /// the original's or more (`RE/RENDERING.md` "The track draw's culling").
+    /// The node pass 0x47F400/0x47F310 over [`Self::cull_articles`] ([`Self::article_nodes`],
+    /// [`node_wholly_pruned`], gated by [`NODE_PRUNE`]) would skip an article whose *every*
+    /// registered node ([`build_article_nodes`], `0x47BDC0`'s starting node plus `0x489930`'s
+    /// budgeted footprint spread — both now read to the instruction) is wholly outside the ground
+    /// wedge or the far circle, before the per-item test runs. The registration itself is ported;
+    /// the *switch* stays off — see [`NODE_PRUNE`]'s own doc for the real, disassembly-confirmed
+    /// coverage gap that keeps it off. Not built for [`Self::instance_culls`] below either way
+    /// (its footprint-hull registration was not measured).
     ///
     /// After the `.crp` articles come the instance drawer's items the port keeps apart, at
     /// `cull_articles.len() + k` in [`Self::instance_culls`] order: the `.scn` GEOM instances
@@ -393,8 +429,11 @@ impl TrackWorld {
     pub fn article_draws(&self, v: &CullView) -> Vec<Option<ArticleDraw>> {
         let (fc, fr2) = v.footprint();
         let near: Vec<&Occluder> = self.occluders.iter().filter(|o| !o.far_from(fc, fr2)).collect();
-        let articles = self.cull_articles.iter().map(|a| {
+        let articles = self.cull_articles.iter().zip(self.article_nodes.iter()).map(|(a, nodes)| {
             let a = a.as_ref()?;
+            if NODE_PRUNE && !nodes.is_empty() && nodes.iter().all(|&(ncx, ncz, nr)| node_wholly_pruned(v, ncx, ncz, nr)) {
+                return None;
+            }
             walk_item(v, &near, a.drawer, a.centre, a.radius, &a.lods)
         });
         let instances = self.instance_culls.iter().map(|ic| {
@@ -609,18 +648,292 @@ pub fn cull_articles(track: &TrackAssets) -> Vec<Option<CullArticle>> {
                 return None;
             }
             let (centre, r, lods) = article_base(track, a)?;
-            let (drawer, centre, radius) = if let Some(t) = g.transform.as_ref().map(Mat4::from_cols_array) {
-                (ArticleDrawer::Instance, t.transform_point3(centre), t.transform_vector3(Vec3::splat(r)).max_element())
+            let (bbox_min, bbox_max) = (Vec3::from(base.bbox_min), Vec3::from(base.bbox_max));
+            let (drawer, centre, radius, footprint_min, footprint_max) = if let Some(t) = g.transform.as_ref().map(Mat4::from_cols_array) {
+                let tr = t.transform_vector3(Vec3::splat(r)).max_element();
+                // APPROXIMATION: the original's shared `getBounds` (`0x4893A0`) reads `Base`'s
+                // `bbox_min`/`bbox_max` with no transform applied at all (read to the instruction:
+                // no matrix multiply anywhere in `0x4893A0`'s body) — every other drawer's `Base`
+                // data is already in placed/world coordinates so that is correct there, but an
+                // `Instance` article's `Base` box is in the *same* pre-`tr` frame its centre/radius
+                // are (`cull_articles`'s own `t.transform_point3(centre)` above), so registering it
+                // untransformed would misplace it. The port transforms the box's 8 corners through
+                // `t` and takes their axis-aligned min/max instead — direction: this can only ever
+                // place the registration box *closer* to the article's true (transformed) position
+                // than the original's untransformed one would, so if anything this APPROXIMATION
+                // registers into nodes nearer the truth, not further from it; not resolved further
+                // (`OBJ1037R`-sized items in practice — `nfs-game/examples/cull_tree_node_prune_census.rs`).
+                let corners = [
+                    Vec3::new(bbox_min.x, bbox_min.y, bbox_min.z),
+                    Vec3::new(bbox_max.x, bbox_min.y, bbox_min.z),
+                    Vec3::new(bbox_min.x, bbox_max.y, bbox_min.z),
+                    Vec3::new(bbox_max.x, bbox_max.y, bbox_min.z),
+                    Vec3::new(bbox_min.x, bbox_min.y, bbox_max.z),
+                    Vec3::new(bbox_max.x, bbox_min.y, bbox_max.z),
+                    Vec3::new(bbox_min.x, bbox_max.y, bbox_max.z),
+                    Vec3::new(bbox_max.x, bbox_max.y, bbox_max.z),
+                ]
+                .map(|c| t.transform_point3(c));
+                let (mut fmin, mut fmax) = (corners[0], corners[0]);
+                for &c in &corners[1..] {
+                    fmin = fmin.min(c);
+                    fmax = fmax.max(c);
+                }
+                (ArticleDrawer::Instance, t.transform_point3(centre), tr, fmin, fmax)
             } else if a.level(b"Anqt").is_some() {
-                (ArticleDrawer::Anim, centre, r)
+                (ArticleDrawer::Anim, centre, r, bbox_min, bbox_max)
             } else if base.flags & 0x6000 != 0 {
-                (ArticleDrawer::MidGround { band: if base.flags & 0x2000 != 0 { 600.0 } else { 700.0 } }, centre, (2.25 * r).max(200.0))
+                // `0x47D010`: the box scaled ×2.25 about its own centre — `RE/RENDERING.md`
+                // "The static items' registration" / `COVERAGE-2026-09-26.md` §14.36.
+                let mid = (bbox_min + bbox_max) * 0.5;
+                (
+                    ArticleDrawer::MidGround { band: if base.flags & 0x2000 != 0 { 600.0 } else { 700.0 } },
+                    centre,
+                    (2.25 * r).max(200.0),
+                    mid + (bbox_min - mid) * 2.25,
+                    mid + (bbox_max - mid) * 2.25,
+                )
             } else {
-                (ArticleDrawer::Static, centre, r)
+                (ArticleDrawer::Static, centre, r, bbox_min, bbox_max)
             };
-            Some(CullArticle { name: g.name.clone(), drawer, centre, radius, lods })
+            Some(CullArticle { name: g.name.clone(), drawer, centre, radius, footprint_min, footprint_max, lods })
         })
         .collect()
+}
+
+/// One node of the fitted cull tree's own split, `0x47BE30`'s rule (`RE/RENDERING.md` "The node
+/// pass 0x47F400 and the fitted tree's split 0x47BE30", re-confirmed `COVERAGE-2026-09-26.md`
+/// §14.32.1): a quadrant `q = (x >= cx) + 2*(z >= cz)` gets a child only when the node's level is
+/// under 13 and (level <= 1, unconditionally, or the quadrant holds 32 or more item centres).
+struct CullNode {
+    children: [Option<Box<CullNode>>; 4],
+}
+
+fn cull_quadrant_of(min: (f32, f32), max: (f32, f32), q: usize) -> ((f32, f32), (f32, f32)) {
+    let (cx, cz) = ((min.0 + max.0) * 0.5, (min.1 + max.1) * 0.5);
+    match q {
+        0 => (min, (cx, cz)),
+        1 => ((cx, min.1), (max.0, cz)),
+        2 => ((min.0, cz), (cx, max.1)),
+        _ => ((cx, cz), max),
+    }
+}
+
+fn cull_tree_build(min: (f32, f32), max: (f32, f32), level: u32, items: &[(f32, f32)]) -> CullNode {
+    let (cx, cz) = ((min.0 + max.0) * 0.5, (min.1 + max.1) * 0.5);
+    let mut quad: [Vec<(f32, f32)>; 4] = Default::default();
+    for &p in items {
+        let q = (p.0 >= cx) as usize + 2 * ((p.1 >= cz) as usize);
+        quad[q].push(p);
+    }
+    let mut children: [Option<Box<CullNode>>; 4] = [None, None, None, None];
+    for (q, ch) in children.iter_mut().enumerate() {
+        let split = level < 13 && (level <= 1 || quad[q].len() >= 32);
+        if split {
+            let (qmin, qmax) = cull_quadrant_of(min, max, q);
+            *ch = Some(Box::new(cull_tree_build(qmin, qmax, level + 1, &quad[q])));
+        }
+    }
+    CullNode { children }
+}
+
+/// `0x47BDC0`: the smallest node's own **fixed** box that still fully holds the footprint box
+/// `fmin..fmax`, descending from the root while the node is internal and *exactly one* child fully
+/// contains it (`0x47C490`'s inclusive corner test, stopping the count at two): counts the
+/// children whose box contains every corner, stops at 2, steps into the child only when the count
+/// is exactly 1. A box fully contained by one quadrant of an axis-aligned split cannot also be
+/// fully contained by a disjoint sibling, so picking the single candidate quadrant by the
+/// footprint's own centre point and checking *that one* for full containment (rather than testing
+/// all four, as `0x47BDC0` does) reaches the same node. Read to the instruction (`0x47BDC0`,
+/// `0x47C490`'s `flag=1` inclusive branch, `0047bde3…0047be21`); the starting point
+/// [`spread_nodes`] spreads out from.
+fn cull_tree_locate(node: &CullNode, min: (f32, f32), max: (f32, f32), level: u32, fmin: (f32, f32), fmax: (f32, f32)) -> (&CullNode, (f32, f32), (f32, f32), u32) {
+    let (cx, cz) = ((min.0 + max.0) * 0.5, (min.1 + max.1) * 0.5);
+    let (fcx, fcz) = ((fmin.0 + fmax.0) * 0.5, (fmin.1 + fmax.1) * 0.5);
+    let q = (fcx >= cx) as usize + 2 * ((fcz >= cz) as usize);
+    if let Some(ch) = &node.children[q] {
+        let (qmin, qmax) = cull_quadrant_of(min, max, q);
+        if fmin.0 >= qmin.0 && fmax.0 <= qmax.0 && fmin.1 >= qmin.1 && fmax.1 <= qmax.1 {
+            return cull_tree_locate(ch, qmin, qmax, level + 1, fmin, fmax);
+        }
+    }
+    (node, min, max, level)
+}
+
+/// Whether the footprint box `fmin..fmax` overlaps a node's fixed box — `0x5A0790`'s
+/// polygon-rectangle SAT test, reduced to a plain AABB overlap for the port's own axis-aligned
+/// footprint (see [`spread_nodes`]'s own doc for the APPROXIMATION this stands in for).
+fn footprint_overlaps(fmin: (f32, f32), fmax: (f32, f32), min: (f32, f32), max: (f32, f32)) -> bool {
+    fmax.0 >= min.0 && fmin.0 <= max.0 && fmax.1 >= min.1 && fmin.1 <= max.1
+}
+
+/// `0x489930`: the budgeted footprint spread from `0x47BDC0`'s starting node (`node`/`min`/`max`/
+/// `level`), read to the instruction (`00489930`…`00489b97`, jump table `0489b9c`). At an internal
+/// node, count the children (of the up to four) the footprint *overlaps* (`n`, `0x5A0790` via
+/// [`footprint_overlaps`]) and, by `n` (the jump table `0x489B9C`):
+/// * `n = 0` (or a leaf, or an internal node none of whose children overlap) — push this node's own
+///   box into the item's list and stop.
+/// * `n = 1` — always recurse into the one overlapping child.
+/// * `n = 2` or `3` — recurse into every overlapping child only while `weight + spent < 8`
+///   (`0047c4b0/9899f8`'s `n-1` jump-table cases 1/2, `0x489B9C+4`/`+8`), else push this node.
+/// * `n = 4` — recurse only while this node's own level (`+8`'s top nibble, `0x4899cb…0x4899da`) is
+///   under 2, else push this node.
+///
+/// Each recursion passes `weight + 1` and, for `n >= 2`, `spent + n * weight` (`n = 1` spends
+/// nothing, `0x4899dd/0x4899f1`, `0x489a2e…0x489a31`) — the exact weight/`spent` budget the
+/// starting point's earlier single-node stand-in never reproduced (
+/// `COVERAGE-2026-09-26.md` §14.36).
+///
+/// The footprint box is `CullArticle::footprint_min`/`footprint_max` — `Base`'s own `bbox_min`/
+/// `bbox_max` (`0x477F40`, world xz already for every drawer but `Instance`), the `MidGround`
+/// `×2.25` scale folded in by [`cull_articles`] (`0x47D010`), matching `0x489701`'s "eight box
+/// corners" directly rather than standing in for them with a sphere-derived square.
+///
+/// APPROXIMATION, `Instance` drawer only: the original's shared `getBounds` (`0x4893A0`) applies no
+/// transform to `Base`'s box at all, but an `Instance` article's `Base` box is in the same pre-`tr`
+/// frame as its centre/radius, so the port transforms the box's 8 corners through `tr` and takes
+/// their axis-aligned min/max instead of using it raw ([`cull_articles`]'s own doc on
+/// `footprint_min`/`footprint_max` has the full reasoning and direction). Every other drawer's box
+/// is `Base`'s own field, unapproximated.
+fn spread_nodes(node: &CullNode, min: (f32, f32), max: (f32, f32), level: u32, weight: u32, spent: u32, fmin: (f32, f32), fmax: (f32, f32), out: &mut Vec<((f32, f32), (f32, f32))>) {
+    let is_internal = node.children.iter().any(Option::is_some);
+    if !is_internal {
+        out.push((min, max));
+        return;
+    }
+    let mut overlaps = [false; 4];
+    let mut n: u32 = 0;
+    for (q, ov) in overlaps.iter_mut().enumerate() {
+        if node.children[q].is_some() {
+            let (qmin, qmax) = cull_quadrant_of(min, max, q);
+            if footprint_overlaps(fmin, fmax, qmin, qmax) {
+                *ov = true;
+                n += 1;
+            }
+        }
+    }
+    let recurse = match n {
+        0 => false,
+        1 => true,
+        2 | 3 => weight + spent < 8,
+        _ => level < 2, // n == 4
+    };
+    if !recurse {
+        out.push((min, max));
+        return;
+    }
+    let new_spent = if n == 1 { spent } else { spent + n * weight };
+    for (q, &ov) in overlaps.iter().enumerate() {
+        if ov {
+            let (qmin, qmax) = cull_quadrant_of(min, max, q);
+            spread_nodes(node.children[q].as_ref().unwrap(), qmin, qmax, level + 1, weight + 1, new_spent, fmin, fmax, out);
+        }
+    }
+}
+
+/// The node pass (`0x47F400`/`0x47F310`) over the fitted tree, with the exact `0x47BDC0`/`0x489930`
+/// registration ([`spread_nodes`]). On since 2026-09-30: the alps tick-900 loss
+/// that kept it off (verge and mountain vanishing beside the car) was the port's own side-plane
+/// test running on a non-unit normal (fixed in [`node_wholly_pruned`], COVERAGE §14.37); with the
+/// fix the off/on frames on alps 900, coastal 300, monaco1 900 and autobahn 1400 match
+/// pixel-for-pixel in scenery (monaco1 differs only in opponent paint, run-to-run RNG). The
+/// census's remaining divergences are the original's own registration gap (un-split quadrants
+/// skipped by `0x489930`, COVERAGE §14.36) — the original drops those too.
+const NODE_PRUNE: bool = true;
+/// Per [`cull_articles`] entry, every node `0x47BDC0`/`0x489930`'s starting-node search plus
+/// budgeted spread ([`cull_tree_locate`], [`spread_nodes`]) registers it into, each node's own
+/// fixed circle `(cx, cz, r)` (`0x47C2C0`: the node's square box, centre and `0.7071 * width`) —
+/// built once, from the articles' own centres and radii, over the same population the original
+/// registers into the real tree.
+fn build_article_nodes(articles: &[Option<CullArticle>]) -> Vec<Vec<(f32, f32, f32)>> {
+    let centres_xz: Vec<(f32, f32)> = articles.iter().flatten().map(|a| (a.centre.x, a.centre.z)).collect();
+    if centres_xz.is_empty() {
+        return articles.iter().map(|_| Vec::new()).collect();
+    }
+    let (mut min, mut max) = ((f32::INFINITY, f32::INFINITY), (f32::NEG_INFINITY, f32::NEG_INFINITY));
+    for &(x, z) in &centres_xz {
+        min = (min.0.min(x), min.1.min(z));
+        max = (max.0.max(x), max.1.max(z));
+    }
+    let (dx, dz) = (max.0 - min.0, max.1 - min.1);
+    let l = dx.max(dz).max(1.0);
+    let root_min = (min.0 - (l - dx) * 0.5, min.1 - (l - dz) * 0.5);
+    let root_max = (root_min.0 + l, root_min.1 + l);
+    let tree = cull_tree_build(root_min, root_max, 0, &centres_xz);
+    articles
+        .iter()
+        .map(|a| {
+            let Some(a) = a.as_ref() else { return Vec::new() };
+            let fmin = (a.footprint_min.x, a.footprint_min.z);
+            let fmax = (a.footprint_max.x, a.footprint_max.z);
+            let (start, smin, smax, slevel) = cull_tree_locate(&tree, root_min, root_max, 0, fmin, fmax);
+            let mut boxes = Vec::new();
+            spread_nodes(start, smin, smax, slevel, 1, 0, fmin, fmax, &mut boxes);
+            boxes.into_iter().map(|(nmin, nmax)| ((nmin.0 + nmax.0) * 0.5, (nmin.1 + nmax.1) * 0.5, 0.7071 * (nmax.0 - nmin.0))).collect()
+        })
+        .collect()
+}
+
+/// `0x47F310`: is a node's fixed circle `(ncx, ncz, nr)` **wholly outside** the ground wedge or the
+/// far circle — pruned before any per-item test runs? `far`/the half-angle are the same
+/// `v.draw`/`v.tan_h` the port's own per-item test already uses (`RE/RENDERING.md` "The footprint —
+/// 0x47F550/0x47F210": both this test's and the frustum's angle and far distance are literally
+/// `cam+0x130`/`cam+0x124` = `[0x6197CC]`, one and the same camera quantity). The steep-look
+/// special case is carried too: `|forward.y| > 0.8` (`[0x5B37B8]`, 0x47F76B) sets `far = 50` and
+/// skips the side test entirely (`this+0xA8 = 1`).
+fn node_wholly_pruned(v: &CullView, ncx: f32, ncz: f32, nr: f32) -> bool {
+    let (dx, dz) = (ncx - v.eye.x, ncz - v.eye.z);
+    let steep = v.forward.y.abs() > 0.8;
+    let far = if steep { 50.0 } else { v.draw };
+    let d = (dx * dx + dz * dz).sqrt();
+    if d - far > 0.0 && d - far > nr {
+        return true;
+    }
+    if steep {
+        return false;
+    }
+    for side in [1.0f32, -1.0] {
+        let ex = v.forward.x + side * v.tan_h * v.right.x;
+        let ez = v.forward.z + side * v.tan_h * v.right.z;
+        let (nx, nz) = (-ez * side, ex * side);
+        // `forward + tan_h·right` has length `sec h`; 0x47F310's side normal is unit length
+        // (the xz forward renormalised by 0x5328D0, then rotated by the real angle h through
+        // 0x539BD0/0x53A330), so the distance is divided back down — as `sphere_visible`
+        // does with its `cos`. Without it the side test overshot by `sec h` (≈1.36 at
+        // tan h≈0.92) and pruned visible nodes (alps tick 900, COVERAGE §14.37).
+        let s = (nx * dx + nz * dz) / (nx * nx + nz * nz).sqrt();
+        if s > 0.0 && s > nr {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod cull_tree_tests {
+    use super::*;
+
+    /// Locked against `cull_tree_node_prune_census.rs`'s own `sanity_check` (same formula,
+    /// independently re-derived here to catch a sign regression in either copy).
+    #[test]
+    fn node_prune_sides_and_far() {
+        // `right`/`up` follow `main.rs`'s own construction: `right = forward.cross(up)`, so
+        // `forward = +Z, up = +Y` gives `right = -X` (not `+X` — the wedge's side normals below
+        // must use the *same* handedness `CullView.right` already carries everywhere else).
+        let base = CullView { eye: Vec3::ZERO, forward: Vec3::Z, right: Vec3::NEG_X, up: Vec3::Y, tan_h: 1.0, tan_v: 1.0, near: 1.0, draw: 300.0 };
+        // dead ahead at 100 m, within far and the wedge: never pruned.
+        assert!(!node_wholly_pruned(&base, 0.0, 100.0, 1.0));
+        // 90 degrees to the side, same distance: wholly outside a 45 degree (tan_h = 1) wedge.
+        assert!(node_wholly_pruned(&base, 100.0, 0.0, 1.0));
+        // dead ahead, past far by more than its own radius: wholly outside the far circle.
+        assert!(node_wholly_pruned(&base, 0.0, 350.0, 1.0));
+        // dead ahead, past far, but its own radius reaches back inside: not pruned.
+        assert!(!node_wholly_pruned(&base, 0.0, 320.0, 30.0));
+        // steep look-down: far collapses to 50 m and the side test is skipped.
+        let steep = CullView { forward: Vec3::new(0.0, -0.9, 0.436), ..base };
+        assert!(node_wholly_pruned(&steep, 100.0, 0.0, 1.0)); // would fail the wedge if it ran, but far=50 alone prunes it
+        assert!(!node_wholly_pruned(&steep, 0.0, 40.0, 1.0));
+    }
 }
 
 /// An article's `Base` sphere in its own frame — `Base+0x2C…` and `Base+0x3C` — and its LOD
@@ -754,12 +1067,19 @@ pub fn track_emitters(track: &TrackAssets) -> Vec<crate::track_particles::Emitte
                 continue;
             }
             let f = |o: usize| f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+            // the point through `tr` is where the running system emits (0x450980 → slot 4
+            // 0x4550B0 with the placement's point, 0x450B0D…0x450B22); the prime's point and the
+            // two directions are the part's own — 0x455030 copies the part's 48 bytes and
+            // re-seats only the first 16 (0x455069, 0x4550B0), and the static creator hands the
+            // constructor the part itself. On `tr`-less articles the two are the same numbers.
+            let local = Vec3::new(f(8), f(0xC), f(0x10));
             out.push(crate::track_particles::Emitter {
                 article,
                 part: p.part_index(),
-                position: tr.transform_point3(Vec3::new(f(8), f(0xC), f(0x10))),
-                dir_a: tr.transform_vector3(Vec3::new(f(0x18), f(0x1C), f(0x20))),
-                dir_b: tr.transform_vector3(Vec3::new(f(0x24), f(0x28), f(0x2C))),
+                position: tr.transform_point3(local),
+                local,
+                dir_a: Vec3::new(f(0x18), f(0x1C), f(0x20)),
+                dir_b: Vec3::new(f(0x24), f(0x28), f(0x2C)),
                 tag: u32::from_le_bytes([d[0x30], d[0x31], d[0x32], d[0x33]]),
             });
         }
@@ -1112,9 +1432,23 @@ impl TrackWorld {
                 SmackableOwner::Element(_) => None,
             })
             .collect();
+        // The one world article whose `Base` tag carries an `animdefs.txt` `SECTION:Audio`
+        // `SoundDef` (`engine-audio.md` §7.3/§7.4, `COVERAGE-2026-09-26.md` §14.38): on every
+        // shipped track this is at most one article — autobahn's `"Locomotive"`, `tag=TRAN`. It
+        // owns its own `Anqt` track (not an `animdefs.txt SECTION:ANIM`/`PIECE` — `TRAN` has none —
+        // so it is *not* one of the two looping dockers this struct's `animated` field doc
+        // describes; that doc predates this finding) and is drawn through the same
+        // [`AnimatedProp`]/[`TrackWorld::animate`] machinery as those, not through `track_lods`'
+        // fixed-transform path, so it is excluded from the static loop below.
+        let sound_articles: std::collections::HashSet<usize> = geometry
+            .world
+            .iter()
+            .filter(|a| a.animation.is_some() && track.animdefs.sound_by_fourcc(a.tag).is_some())
+            .map(|a| a.index)
+            .collect();
         let mut track_lods: Vec<TrackArticleGpu> = Vec::new();
         for art in &geometry.world {
-            if breakable_articles.contains(&art.index) || smackable_articles.contains(&art.index) {
+            if breakable_articles.contains(&art.index) || smackable_articles.contains(&art.index) || sound_articles.contains(&art.index) {
                 continue;
             }
             let lods = art
@@ -1157,6 +1491,76 @@ impl TrackWorld {
                 smack_anims.push(SmackAnim { article: k, slot, home: sp.position, position: sp.position, state: 0, armed: false });
             }
         }
+        // The `sound_articles` object above ("Locomotive"/`tag=TRAN`), drawn through
+        // [`AnimatedProp`]/[`TrackWorld::animate`] like a looping library piece, but with its own
+        // `Anqt` track directly (`base = IDENTITY`: the track's frames are already world-space —
+        // `frame 0`/`frame 250` land on the same point, a closed loop) and no `.scn` instance.
+        // CONFIRMED (2026-10-01, `COVERAGE-2026-09-26.md` §14.42 — settles the
+        // `572752fc`'s open APPROXIMATION): the *default* `secondsPerFrame`/loop rule a
+        // `WAnimBundle` article gets when it has no `animdefs.txt SECTION:ANIM` piece of its own.
+        // `WAnimBundle::Load` 0x4777F0, at 0x4779DF..0x4779F7, constructs one player per claimed
+        // article with `0x471490(this, frames, AnqtPtr, vertexFlag=0, flags=[0x5B45A4], 0.1f,
+        // heading=0)` — `frames`/`AnqtPtr` from the article's own `Anqt` *part* record's `b`
+        // (element count) and (flag-adjusted) `rel_offset` fields (`crp-geometry.md` §2, not a
+        // separate `Anim` part — `WAnimBundle::Load` never searches for one), the literal float
+        // `0x3DCCCCCD` (**0.1 s/frame, 10 fps** — not `0.1/playbackrate`: there is no piece to read
+        // a `playbackrate` from) and the *global constant* read from `[0x5B45A4]` — read directly
+        // off the shipped `.exe`'s `.rdata`, **= 1** — as the flags word `AnimPlayer::sample`
+        // 0x470E90 tests bit 0 of for its loop flag: **always looping**, unconditionally, not a
+        // per-article choice (unlike the two dockers below, whose loop bit and rate come from a
+        // real `animdefs.txt SECTION:PIECE`'s `properties=LOOP` / `playbackrate`).
+        // *(An earlier pass, `COVERAGE-2026-09-26.md` §14.40, read `0x471490` as the ctor of the
+        // already-`CONFIRMED`-inert `SmackAnim` pose cache (`crp-geometry.md` §7.0b) and left the
+        // rate/loop an APPROXIMATION on that basis. That was a misidentification, corrected this
+        // pass: `0x471490` sets `[this] = 0x5B460C` — the *player* vtable `suspension-collision.md`
+        // already names for the breakable-piece players (`RENDERING.md` "the player vtable
+        // 0x5B460C's slot 8 is 0x471150 `fld 0.0`" — matches slot 8 of `0x5B460C` exactly), the
+        // same class `AnimPlayer::sample` 0x470E90/0x470F70 already fully specifies
+        // (`crp-geometry.md` §7) — not `SmackAnim`'s distinct vtable `0x5B45E4`.)*
+        // The player is *started* once, immediately after construction, by `WAnimBundle::Load`
+        // itself calling the player's slot 5 (`0x4716E0`, `start()`: `state=1`,
+        // `start_tick=gGameTick`) at 0x477A0E — at **track load** (`main`'s per-session
+        // `0x468FB0`, `replay.md` §10.1), which runs once and *before* every race "pass"'s own
+        // `0x414EB0` zeroes `gGameTick` (`[0x606AC4]`). Since the player's per-draw sample
+        // (`WAnimBundle`'s own slot 5, `getInstanceTransform` 0x4777B0 → the player's slot 1
+        // 0x4715A0 → `AnimPlayer::sample` 0x470E90) clamps `ticks = max(0, gGameTick −
+        // start_tick)` to ≥0, every race begins with `ticks = 0` regardless of `start_tick`'s
+        // stale value — **phase 0 at every race start** — exactly what the port's own `self.tick =
+        // 0` at race start (`porsche/src/main.rs`) already gives `animate(self.tick as f32 /
+        // 64.0)`/`eval_pair(self.tick)` below. `0x4777B0` is called once per **draw** of the
+        // article (no separate per-tick "advance" step exists for it), so its value only changes
+        // once every simulation tick (`[0x628938]+8` = the 64 Hz `globalStep`, `1/64`) — driven by
+        // the **global race clock**, not a draw-count or a wall clock.
+        let mut animated: Vec<AnimatedProp> = Vec::new();
+        let mut animated_sound: Option<AnimatedSound> = None;
+        for art in geometry.world.iter().filter(|a| sound_articles.contains(&a.index)) {
+            let Some(def) = track.animdefs.sound_by_fourcc(art.tag) else { continue };
+            let Some(anim) = art.animation.clone() else { continue };
+            let drawn = &art.lods[..art.lods.len().min(1)];
+            for (_, meshes) in drawn {
+                for mm in meshes {
+                    items.push(DrawItem::new(r.upload_mesh(&mm.mesh), material_for(r, mm.material), Mat4::IDENTITY));
+                    item_cull.push(None);
+                    animated.push(AnimatedProp {
+                        item: items.len() - 1,
+                        base: Mat4::IDENTITY,
+                        track: anim.clone(),
+                        seconds_per_frame: WANIM_BUNDLE_DEFAULT_SECONDS_PER_FRAME,
+                        looping: WANIM_BUNDLE_DEFAULT_LOOPING,
+                    });
+                }
+            }
+            if animated_sound.is_none() {
+                animated_sound = Some(AnimatedSound {
+                    def: *def,
+                    label: art.name.clone(),
+                    track: anim,
+                    seconds_per_frame: WANIM_BUNDLE_DEFAULT_SECONDS_PER_FRAME,
+                    looping: WANIM_BUNDLE_DEFAULT_LOOPING,
+                    ambience_index: None,
+                });
+            }
+        }
         // every LOD of each library article, by tag (the first article with it, as 0x478640 finds
         // the template); every shipped one has a single LOD
         let mut lib_gpu: HashMap<u32, Vec<(u8, Vec<(MeshId, MaterialId)>)>> = HashMap::new();
@@ -1170,7 +1574,6 @@ impl TrackWorld {
         let arts = track.crp.articles(&track.crp_data).unwrap_or_default();
         let mut item_element = vec![None; items.len()];
         let mut missing_tags = std::collections::HashSet::new();
-        let mut animated: Vec<AnimatedProp> = Vec::new();
         let mut smackables: Vec<SmackableSpawn> = Vec::new();
         let mut instance_flares: Vec<(usize, TrackFlare)> = Vec::new();
         for inst in &geometry.instances {
@@ -1273,6 +1676,10 @@ impl TrackWorld {
             });
         let flags: Vec<u32> = materials.iter().map(|m| m.flags).collect();
         let collision = geometry.collision_grid(20.0, &|mat| flags.get(mat as usize).copied().unwrap_or(0));
+        // the skid marks' fitted cell tree's own item population (`nfs_game::skidmarks`'s module
+        // doc, `RE/notes/particles.md` §10.1) — the same items `collision` above turns into
+        // triangles, kept here as centres for `SkidMarks::for_world_items`
+        let skid_items = geometry.item_centres();
         // *(Until 2026-09-28 a skill test's `ENDW` barriers also joined this wall set as
         // synthesized footprint-edge segments — a pre-2026-09-28 port addition, not `.edg` data,
         // invented before `WSceneBundle`'s own tree contribution ([`scene_props`]) was read. That
@@ -1338,6 +1745,7 @@ impl TrackWorld {
         let projector_texture = projectors.first().and_then(|p| tex_ids.get(&p.texture)).map(|t| t.0);
         let projector_registered = vec![false; projectors.len()];
         let cull_articles = cull_articles(track);
+        let article_nodes = build_article_nodes(&cull_articles);
         let occluders = track_occluders(track);
         tracing::info!(articles = cull_articles.iter().flatten().count(), drawn = track_lods.len(), lods = track_lods.iter().map(|a| a.lods.len()).sum::<usize>(), occluders = occluders.len(), instances = instance_culls.len(), "track culling");
         Ok(Self {
@@ -1346,6 +1754,7 @@ impl TrackWorld {
             hidden: std::collections::HashSet::new(),
             env_map,
             collision,
+            skid_items,
             props,
             patches,
             walls,
@@ -1360,6 +1769,7 @@ impl TrackWorld {
             moved,
             smack_anims,
             animated,
+            animated_sound,
             broken,
             flares: track_flares(track),
             emitters: track_emitters(track),
@@ -1367,6 +1777,7 @@ impl TrackWorld {
             projector_texture,
             projector_registered,
             cull_articles,
+            article_nodes,
             track_lods,
             occluders,
             instance_culls,
@@ -1828,6 +2239,17 @@ pub fn body_pose(position: Vec3, orientation: glam::Mat3) -> Mat4 {
     Mat4::from_translation(position) * Mat4::from_mat3(orientation.transpose())
 }
 
+/// The default `secondsPerFrame`/loop rule `WAnimBundle::Load` 0x4777F0 gives a `WAnimBundle`
+/// article's `AnimPlayer` (`0x471490`, vtable `0x5B460C`) when the article has no
+/// `animdefs.txt SECTION:ANIM` piece of its own — the literal `0x3DCCCCCD` and the global constant
+/// at `[0x5B45A4]` (`= 1`, its bit 0 the loop flag `AnimPlayer::sample` 0x470E90 tests) passed at
+/// 0x4779DF..0x4779F7. CONFIRMED by direct disassembly, `COVERAGE-2026-09-26.md` §14.42 — see
+/// [`TrackWorld::upload`]'s own note at the construction sites below for the full address trail
+/// and the correction of an earlier pass's `SmackAnim` misidentification.
+const WANIM_BUNDLE_DEFAULT_SECONDS_PER_FRAME: f32 = 0.1;
+/// See [`WANIM_BUNDLE_DEFAULT_SECONDS_PER_FRAME`].
+const WANIM_BUNDLE_DEFAULT_LOOPING: bool = true;
+
 /// One prop playing its own looping animation.
 struct AnimatedProp {
     item: usize,
@@ -1836,6 +2258,36 @@ struct AnimatedProp {
     track: nfs_formats::crp::AnimTrack,
     seconds_per_frame: f32,
     looping: bool,
+}
+
+/// The `sound_articles` object's own `Anqt` track and `SoundDef`, kept alongside `TrackWorld` so
+/// its caller (the game's audio update) can sample the *same* path every tick and feed
+/// `nfs_audio::ambience::Ambience::sync_animated` — `engine-audio.md` §7.4's `p1 = obj.EvalPos(tick)`,
+/// `p2 = obj.EvalPos(tick + 0x20)`. `ambience_index` is `None` until the caller has registered it
+/// with `Ambience::add_animated` (track load and ambience load are two separate steps in the port).
+pub struct AnimatedSound {
+    pub def: nfs_formats::animdefs::SoundDef,
+    pub label: String,
+    pub track: nfs_formats::crp::AnimTrack,
+    /// CONFIRMED, [`WANIM_BUNDLE_DEFAULT_SECONDS_PER_FRAME`] for a `WAnimBundle` article without
+    /// its own `animdefs.txt` piece — the *same clock* [`TrackWorld::animate`] draws this article
+    /// with, so the visible motion and the ambient sound's doppler never drift apart.
+    pub seconds_per_frame: f32,
+    pub looping: bool,
+    pub ambience_index: Option<usize>,
+}
+
+impl AnimatedSound {
+    /// `p1 = EvalPos(tick)`, `p2 = EvalPos(tick + 0x20)` (§7.4) on this object's own path, in
+    /// world units of ticks at the game's 64 Hz.
+    pub fn eval_pair(&self, tick: u64) -> ([f32; 3], [f32; 3]) {
+        let eval = |t: u64| {
+            let (i, j, w) = self.track.sample(t as f32 / 64.0, self.seconds_per_frame, self.looping);
+            let (f0, f1) = (&self.track.frames[i], &self.track.frames[j]);
+            Vec3::from(f0.position).lerp(Vec3::from(f1.position), w)
+        };
+        (eval(tick).into(), eval(tick.wrapping_add(0x20)).into())
+    }
 }
 
 /// A breakable prop drawn in the world (`TrackWorld::break_props`).
@@ -4338,6 +4790,29 @@ mod driver_tests {
         let (m, playing) = sample_piece(&track, 0.1 / 5.0, flags, 0.0, Vec3::ZERO, 38);
         assert!(!playing && (m.w_axis.y - 30.0).abs() < 1e-6);
         assert!(sample_piece(&track, 0.1 / 5.0, flags, 0.0, Vec3::ZERO, 37).1);
+    }
+
+    /// `AnimatedSound::eval_pair` (`engine-audio.md` §7.4's `p1`/`p2`, the autobahn train's own
+    /// ambient-sound path source): a straight-line 5-frame stand-in track, the real
+    /// `WANIM_BUNDLE_DEFAULT_*` rate/loop rule — `p2` is one 0x20-tick (0.5 s) sample ahead of `p1`.
+    #[test]
+    fn animated_sound_samples_p1_and_p2_a_half_second_apart() {
+        let frames = (0..5).map(|k| nfs_formats::crp::AnimFrame { rotation: [0.0, 0.0, 0.0, 1.0], position: [k as f32 * 10.0, 0.0, 0.0], scale: [1.0; 3] }).collect();
+        let sound = AnimatedSound {
+            def: nfs_formats::animdefs::SoundDef { patch_id: 833, range: 300.0, fade_in: 17.0, trigger: 0, fade_out: 0, min_repeat: 0, random_repeat: 0, volume: 100 },
+            label: "Locomotive".to_string(),
+            track: nfs_formats::crp::AnimTrack { frames },
+            seconds_per_frame: WANIM_BUNDLE_DEFAULT_SECONDS_PER_FRAME,
+            looping: WANIM_BUNDLE_DEFAULT_LOOPING,
+            ambience_index: None,
+        };
+        // tick 0: p1 at t=0 (frame 0, x=0), p2 at t=0x20/64=0.5 s = 5 frames in, wraps `% (5-2)=%3`
+        let (p1, p2) = sound.eval_pair(0);
+        assert_eq!(p1, [0.0, 0.0, 0.0]);
+        assert_ne!(p1, p2, "p2 is a genuinely later sample, not a repeat of p1");
+        // a full tick later, both samples have advanced
+        let (p1b, _p2b) = sound.eval_pair(64);
+        assert_ne!(p1, p1b);
     }
 
     /// 0x438B73…0x438C30: a player walks its table over the duration — frame, next and the

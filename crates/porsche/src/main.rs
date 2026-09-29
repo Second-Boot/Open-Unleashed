@@ -5451,6 +5451,14 @@ struct FrontEnd {
     combo_drag: Option<(usize, f32, usize)>,
     /// a held scrollbar arrow: which list, which way, and how long since the last step
     list_repeat: Option<(usize, i32, u32)>,
+    /// a held **combo drop-down's own** scrollbar arrow — `FeListScrollBar::onPress` 0x4DB040
+    /// (vtable 0x5B6A64, §4.101; a distinct class from `list_repeat`'s `NFS5.VerticalSlider`).
+    /// Arm 1/2 sets `[this+0xDC] = ∓1`, starts `0x529220(this, 0x96, 1)` — the same 150 ms
+    /// repeating timer `list_repeat`/`setting_repeat` use — stores the handle at `[+0xD8]` and
+    /// steps once immediately (slot 19, the direction). Every firing whose `[ev+8]` matches that
+    /// handle and whose `[+0xEC] == [+0xF0]` (0x4DB1D0) steps again; the release 0x4DB180 kills
+    /// the timer with 0x5292D0 and clears `[+0xD8]`/`[+0xDC]`. `(index, region, ms since last step)`.
+    combo_arrow_repeat: Option<(usize, u32, u32)>,
     /// the screen manager's layers and their histories, `[fe+0xD8]` (`nfs_game::layout::nav`,
     /// `controls.md` §4.166)
     nav: nfs_game::layout::nav::Nav,
@@ -5867,6 +5875,9 @@ impl App {
             }
             c.side.playlist = playlist;
             c.side.settings = settings;
+            // `OwnedCars.Car`'s index as its Save 0x4F5B30 reads it (`vtbl[+0x28]`, always
+            // within the garage: 0x4BC240 keeps it so)
+            c.side.owned_car_selection = nfs_game::save::clamp_index(c.car_sel as u32, c.career.garage.len() as u32);
         }
         // `[0x691E7C]`, the event `Tournament.RemainingTracks` stands on (0x504F00)
         let next = self.career.as_ref().and_then(|c| {
@@ -5892,6 +5903,7 @@ impl App {
             settings: self.current_settings(),
             tournament: nfs_game::save::TournamentFe::default(),
             opponent_cars: None,
+            owned_car_selection: 0,
         }
     }
 
@@ -6063,6 +6075,9 @@ impl App {
         // the port dropped it: it saved neither `OpponentCar.Car` nor `Track1..7.*`.)*
         self.knockout = side.knockout.as_ref().map(|k| KnockoutSeries { state: k.to_state(), message: String::new() });
         if let Some(c) = self.career.as_mut() {
+            // `OwnedCars.Car` (0x4F5B70 → 0x4F0A30 → 0x4BC240): the saved index, clamped
+            // against the garage's count
+            c.car_sel = clamp_index(side.owned_car_selection, c.career.garage.len() as u32) as usize;
             c.side = side;
         }
         // 0x4DED10, the loader's last step but the gamma: 0x4FBC10 for the loaded profile's year —
@@ -11640,10 +11655,57 @@ impl App {
             // (0x4A7A4E…0x4A7AAC)
             let pan_base = nfs_audio::mixer::pan_angle(v.forward().dot(side), v.forward().dot(fwd));
             amb.update(a, self.tick, cam.into(), side.into(), fwd.into(), pan_base);
+            // The autobahn train's ambient emitter (`engine-audio.md` §7.4's second, unconditional
+            // loop — not phased like the `.scn` elements above): `sound.ambience_index` is only
+            // `Some` on the one track that has it. `p1`/`p2` come from the object's own path
+            // (`AnimatedSound::eval_pair`, `0x4AEF30`'s `EvalPos(tick)`/`EvalPos(tick+0x20)`).
+            if let Some(sound) = self.world.as_ref().and_then(|w| w.animated_sound.as_ref())
+                && let Some(idx) = sound.ambience_index
+            {
+                let (p1, p2) = sound.eval_pair(self.tick);
+                amb.sync_animated(idx, p1, p2);
+            }
+            amb.update_animated(a, self.tick, cam.into(), side.into(), fwd.into(), pan_base);
+        }
+        // **0x443640** (`GameTick` 0x4150ED, the odd tick, right before the update below): the
+        // walk of every `R3DObject` on `[0x6115F0]` calling its **slot 8** — for an `R3DCar`,
+        // 0x438420: `0x43EF80([this+0x704], 1)` unless the front end is up (`[0x65B928]`), with
+        // neither the draw nor slot 7's camera gate (0x4383D8…0x43840C) in front of it. So every
+        // car's effects are driven at 32 Hz whether it is drawn or not, the camera's own car in
+        // the bumper and driver views too; the draw's drive (slot 7, `draw_cars`) comes on top.
+        // *(Read 2026-09-30 (DDD); until then the port drove a car's effects only when it drew
+        // it.)* The list's order (traffic, cops, opponents, each last slot first, the player
+        // last — `particles.md` "The order between cars") is kept, though the drive consumes no
+        // random numbers and so no order shows. MEDIUM: the traffic the port simulates are its
+        // active cars; an inactive slot's `R3DCar` is driven too in the original, from a sim car
+        // the port does not keep (0x43EF80 lights nothing at zero slip and zero speed).
+        // the drive's `wet`, the sky's field 5 at the eye's slice (`weather_strengths`, spelled
+        // out: `v` holds `self` here)
+        let lap = self.slices.as_ref().map_or(0, |t| t.slices.len() as i32);
+        let wet = self.track.sky_bin.as_ref().map_or(0.0, |b| b.sample_track_b(5, self.cam_slice.unwrap_or(0) as i32, lap)) > 0.1;
+        let eye = self.camera.position;
+        if let Some(fx) = self.car_effects.as_mut() {
+            let n_opp = self.road.opponents.len();
+            let n_pol = self.road.police.as_ref().map_or(0, |p| p.cars.len());
+            use nfs_game::car_effects::CarInput;
+            if let Some(tr) = &self.road.traffic {
+                for (i, b) in tr.cars.iter().zip(tr.bodies.iter()).enumerate().rev().filter(|(_, (c, _))| c.active).map(|(i, (_, b))| (i, b)) {
+                    fx.drive(1 + n_opp + n_pol + i, &CarInput::from_vehicle(b), eye, wet, true);
+                }
+            }
+            if let Some(pol) = &self.road.police {
+                for (i, c) in pol.cars.iter().enumerate().rev() {
+                    fx.drive(1 + n_opp + i, &CarInput::from_vehicle(&c.body), eye, wet, true);
+                }
+            }
+            for (i, o) in self.road.opponents.iter().enumerate().rev() {
+                fx.drive(1 + i, &CarInput::from_vehicle(&o.vehicle), eye, wet, true);
+            }
+            fx.drive(0, &CarInput::from_vehicle(v), eye, wet, true);
         }
         // the cars' effects, 0x43F660 (`GameTick` 0x4150F2, the odd tick, before the trigger
-        // sweep): each car drawn since the last one runs its eleven systems once, and the draw set
-        // is emptied (`nfs_game::car_effects`)
+        // sweep): each car driven since the last one runs its eleven systems once, and the draw
+        // set is emptied (`nfs_game::car_effects`)
         if let (Some(fx), Some(p)) = (self.car_effects.as_mut(), self.track_particles.as_mut()) {
             fx.update(p.rng_mut(), self.draw_distance);
         }
@@ -16410,8 +16472,20 @@ impl App {
             self.camera.target = e.position;
             self.camera.position = e.position + e.dir_a * 6.0 + Vec3::Y * 1.5;
         }
+        // diagnostic: `NFS_ANIM_VIEW=<metres>` puts the camera that far off the track's
+        // SoundDef-animated object (autobahn's Locomotive, `world.animated_sound`), 8 m up,
+        // looking at where its own path puts it this tick
+        if let Some(d) = std::env::var("NFS_ANIM_VIEW").ok().and_then(|v| v.parse::<f32>().ok())
+            && let Some(s) = self.world.as_ref().and_then(|w| w.animated_sound.as_ref())
+        {
+            let (p1, _) = s.eval_pair(self.tick);
+            let p = Vec3::from(p1);
+            self.camera.target = p;
+            self.camera.position = p + Vec3::new(d, 8.0, d * 0.5);
+        }
         // diagnostic: `NFS_SMACK_VIEW=k` puts the camera 8 m off the track's k-th smackable's
-        // place, looking at it (its burst stays there: 0x450980's slot 4 is `ret 4`)
+        // place, looking at it (its burst stays there: 0x450980 re-seats its system at the
+        // placement every drawn frame, slot 4 0x4550B0)
         if let Some(k) = std::env::var("NFS_SMACK_VIEW").ok().and_then(|v| v.parse::<usize>().ok())
             && let Some((_, home, _)) = self.world.as_ref().and_then(|w| w.track_smackable(k))
         {
@@ -19050,6 +19124,21 @@ impl App {
                 l.scroll_list(index, delta * steps as i32);
             }
         }
+        // and so does a held open combo's **own** scrollbar arrow — `FeListScrollBar` slot 19
+        // fires again each time `0x4DB1D0`'s `[+0xEC] == [+0xF0]` (the same 150 ms timer), off
+        // the direction the press already latched (`[+0xDC]`); the release (0x4DB180) is
+        // `combo_arrow_repeat = None` below, at the button-up handler that already clears
+        // `list_repeat`/`combo_drag`. `combo_scroll_press` itself is the one-step body (§4.101),
+        // reused here exactly as the press already calls it once immediately.
+        if let Some((index, region, ref mut acc)) = self.fe.combo_arrow_repeat {
+            let (steps, new_acc) = nfs_game::layout::repeat_steps(*acc, dt_ms, SCROLL_REPEAT_MS);
+            *acc = new_acc;
+            if let Some(l) = self.fe.layout_preview.as_mut() {
+                for _ in 0..steps {
+                    l.combo_scroll_press(index, region);
+                }
+            }
+        }
         // and so does a held car-setting arrow, off the very same timer (0x4C1F55, 0x4C1F80).
         // Same fix as the press (above): re-bind the full
         // `bind_after_accessor()` set, not a hand-picked subset of it — this used to be an even
@@ -21541,22 +21630,33 @@ impl App {
                             break;
                         }
                     }
-                    // diagnostic: `NFS_FE_TAB=<widget name>[@nth]:<n>` clicks that tab button
-                    // once the screen has settled and takes the still n frames later. `@nth`
+                    // diagnostic: `NFS_FE_TAB=<widget name>[@nth]:<n>[,<widget name>[@nth]:<n>…]` clicks that
+                    // tab button once the screen has settled and takes the still n frames later. `@nth`
                     // (0-based) picks which widget of that name when a tab strip reuses one name
                     // for every button (`controllertabs.lay`, `graphicstabs.lay` — see
                     // `flat_index_of`); omitted, it is the first (`@0`), which is enough for the
                     // strips that name each button uniquely (`showcasetabs.lay`,
                     // `optiontabs.lay`).
-                    if let Some((spec, n)) = std::env::var("NFS_FE_TAB").ok().and_then(|v| v.split_once(':').map(|(a, b)| (a.to_string(), b.parse::<usize>().unwrap_or(0))))
-                        && let (name, nth) = spec.split_once('@').map_or((spec.as_str(), 0), |(a, b)| (a, b.parse::<usize>().unwrap_or(0)))
-                        && let Some(hit) = l.flat_index_of(name, nth)
-                    {
-                        l.tab_click(r, &self.paths, hit);
-                        tab_clicked = true;
-                        for _ in 0..n {
-                            l.advance_transition(16);
-                            ran += 1;
+                    // A chain `A:60,B:60` clicks tab A, runs 60 frames, then clicks tab B (looked
+                    // up in the layout as it is *then*, so a tab strip that only exists inside the
+                    // panel A loaded — Options' "controllers" panel embeds `Controllers.lay` with its
+                    // own strip — is reached through its real parent), and so on; the single form
+                    // `A:60` is a chain of one. A step whose widget is not found ends the chain.
+                    if let Ok(chain) = std::env::var("NFS_FE_TAB") {
+                        for step in chain.split(',') {
+                            let Some((spec, n)) = step.split_once(':').map(|(a, b)| (a, b.parse::<usize>().unwrap_or(0))) else {
+                                break;
+                            };
+                            let (name, nth) = spec.split_once('@').map_or((spec, 0), |(a, b)| (a, b.parse::<usize>().unwrap_or(0)));
+                            let Some(hit) = l.flat_index_of(name, nth) else {
+                                break;
+                            };
+                            l.tab_click(r, &self.paths, hit);
+                            tab_clicked = true;
+                            for _ in 0..n {
+                                l.advance_transition(16);
+                                ran += 1;
+                            }
                         }
                     }
                 }
@@ -22296,6 +22396,14 @@ impl App {
             )
             .map_err(|e| tracing::warn!(error = %e, "ambience unavailable"))
             .ok();
+            // The autobahn train's ambient sound (`animdefs.txt SECTION:Audio{tag=TRAN}`,
+            // `engine-audio.md` §7.4, `COVERAGE-2026-09-26.md` §14.38): `world.animated_sound` is
+            // `Some` only on the one track that carries it. Registered once here; the per-tick
+            // position/velocity sync is at the ambience update call site below.
+            if let (Some(amb), Some(sound)) = (self.snd.ambience.as_mut(), world.animated_sound.as_mut()) {
+                sound.ambience_index = Some(amb.add_animated(&sound.def, sound.label.clone()));
+                tracing::info!(label = sound.label, patch = sound.def.patch_id, "autobahn train ambience registered");
+            }
             if self.snd.ai_engines.is_none() {
                 self.snd.ai_engines =
                     nfs_audio::ai_engine::AiEngines::load(&self.paths.game_data().join("Sounds"))
@@ -23356,7 +23464,10 @@ impl App {
         // world.rs question, but both should end up building the same eight-corners-then-AABB box
         // this read now settles the shape of.
         let (lo, hi) = world.collision.bounds();
-        self.skid = nfs_game::skidmarks::SkidMarks::for_world(lo, hi);
+        // the fitted cell tree's own item population (`0x47BE30`, `nfs_game::skidmarks`'s module
+        // doc, `RE/notes/particles.md` §10.1) — the same items the collision grid above turns
+        // into triangles
+        self.skid = nfs_game::skidmarks::SkidMarks::for_world_items(&world.skid_items, lo, hi);
         // the trackside cameras and their triggers travel with the track (`race-logic.md` §3.3)
         self.track_cameras = self
             .track
@@ -23736,21 +23847,34 @@ impl App {
 }
 
 impl App {
-    /// The open combo's own scrollbar drag, one step — `FeListScrollBar`'s slot 8, 0x4D0F20
-    /// (§4.46, §4.101): with the knob grabbed, `model->slot11(grabPosition + (y - grabY) *
-    /// (positions - 1) / span)`. Called from the real `CursorMoved` handler and from the
-    /// `NFS_FE_CLICKS=drag:…` diagnostic below, so a scripted drag steps the model exactly the
-    /// way a real one does.
+    /// The open combo's own scrollbar drag, one step — `FeListScrollBar`'s mouse-move slot 8,
+    /// **0x4DB9B0** (vtable 0x5B6A64, §4.101), not `NFS5.VerticalSlider`'s 0x4D0F20:
+    ///
+    /// ```text
+    /// 0x4DB9C2  0x4DB2F0(ev.x, ev.y)                       ; hit test -> [+0xF0]
+    /// 0x4DB9C7  [+0xEC] == 3 (the press latched the knob)  ; else return 0
+    /// 0x4DB9D6  [+0xF0] == 3 || [+0xF0] == 4               ; the pointer on the knob or trough
+    /// 0x4DBA24  pos = [+0xE8] + (ev.y − [+0xE4]) · count / travel
+    /// 0x4DBA29  model->slot11(pos); 0x4DBA30 this->slot11()   ; set, then re-place the knob
+    /// ```
+    ///
+    /// so the step divides by the count (`combo_drag_pos`, the inverse of 0x4DB220's placement)
+    /// and **does nothing while the pointer is off the bar or over an arrow** — the drag stays
+    /// latched (`[+0xEC]` is cleared only by the release, 0x4DB1B8) and resumes when the pointer
+    /// comes back. Called from the real `CursorMoved` handler, from the press on the trough (arm
+    /// 4's reposted move, 0x4DB119) and from the `NFS_FE_CLICKS=drag:…` diagnostic below, so a
+    /// scripted drag steps the model exactly the way a real one does.
     fn fe_apply_combo_drag(&mut self) {
-        if let (Some((index, gy, at)), Some((_, cy))) = (self.fe.combo_drag, self.fe.cursor) {
-            let track = self.fe.layout_preview.as_ref().and_then(|l| l.combo_scroll_track(index));
-            if let Some((span, positions)) = track
-                && span > 0.0
-                && positions > 1
+        if let (Some((index, gy, at)), Some((cx, cy))) = (self.fe.combo_drag, self.fe.cursor) {
+            let Some(l) = self.fe.layout_preview.as_ref() else { return };
+            if !matches!(l.combo_scroll_at(cx, cy), Some((i, 3 | 4)) if i == index) {
+                return;
+            }
+            if let Some((travel, positions)) = l.combo_scroll_track(index)
+                && let Some(pos) = nfs_game::layout::combo_drag_pos(cy, gy, at, positions, travel)
                 && let Some(l) = self.fe.layout_preview.as_mut()
             {
-                let moved = ((cy - gy) * (positions - 1) as f32 / span).round() as i32;
-                l.set_combo_scroll_pos(index, at as i32 + moved);
+                l.set_combo_scroll_pos(index, pos);
             }
         }
     }
@@ -23806,6 +23930,10 @@ impl App {
         if !down {
             // 0x4C1FB0: the release hands `[this+0x14C]` to 0x5292D0 and zeroes it
             self.fe.setting_repeat = None;
+            // 0x4DB180: same shape, for the combo drop-down's own scrollbar arrow — unconditional
+            // like `list_repeat`/`setting_repeat` above, so a release with the pointer carried
+            // off the arrow entirely (where `combo_scroll_at` below finds nothing) still stops it.
+            self.fe.combo_arrow_repeat = None;
         }
         // A scrollbar drag holds the combo's own focus and, with it, the window's capture
         // (§4.57) — every event until the release is the scrollbar's, not whatever the pointer
@@ -23846,6 +23974,17 @@ impl App {
                         _ => {}
                     }
                 }
+            }
+            // an arrow (1 or 2) auto-repeats every 150 ms while held — `FeListScrollBar::onPress`
+            // 0x4DB040 arms `0x529220(this, 0x96, 1)` right after the immediate step above; the
+            // unconditional release clear above (`!down`) kills it the way 0x4DB180 does.
+            if down && matches!(region, 1 | 2) {
+                self.fe.combo_arrow_repeat = Some((i, region, 0));
+            }
+            // arm 4 reposts a move (0x4DB101 `bl = 1` → 0x4D6140 at 0x4DB119), which the drag
+            // slot 0x4DB9B0 takes at once: the list jumps by the pointer's distance from the knob
+            if down && region == 4 {
+                self.fe_apply_combo_drag();
             }
             return;
         }
@@ -25680,6 +25819,7 @@ fn main() -> Result<()> {
             list_drag: None,
             combo_drag: None,
             list_repeat: None,
+            combo_arrow_repeat: None,
             nav: nfs_game::layout::nav::Nav::new(),
             layout_under: Vec::new(),
         },

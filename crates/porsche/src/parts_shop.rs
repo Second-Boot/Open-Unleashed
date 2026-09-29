@@ -269,21 +269,30 @@ impl PartsShop {
 
     /// Whether row `row` of `Parts.OwnedDamageRepairList` may become the current row —
     /// `FEPartsDamageRepairAccessor`'s own **setCurrent**, `0x516CA0`: fetches the installed-parts
-    /// vector (slot 35 on `[this+0x24]`, then the shared vector getter `0x4F0480`), and if the
-    /// part at `row` carries damage (`+0x164`) exactly **0.0** (`0x516CDF` `fcomp` against
-    /// `0x5B23F8`, `jne` past the "select" call `0x4BC240` when equal), the row never becomes
-    /// current — the click lands on the widget but nothing changes. The identical test
-    /// `nfs_game::shop::repair_add`'s own ADD-refusal already makes (`shop.rs:348`, same field,
-    /// same original address family). A second branch this function has, `[this+0x28]` — an
-    /// optional second list a candidate part is also checked against before it may become current
-    /// — is a real, still-open gap (COVERAGE §14.17.2/§14.22): what that list is was not settled,
-    /// so it is not ported here.
-    fn owned_selectable(c: &CareerUi, strings: &Strings, row: usize) -> bool {
+    /// vector (slot 35 on `[this+0x24]`, then the shared vector getter `0x4F0480`), and refuses
+    /// the row (the click lands on the widget but nothing changes) on **either** of two tests:
+    ///
+    /// 1. the part at `row` carries damage (`+0x164`) exactly **0.0** (`0x516CDF` `fcomp` against
+    ///    `0x5B23F8`, `jne` past the "select" call `0x4BC240` when equal) — the identical test
+    ///    `nfs_game::shop::repair_add`'s own ADD-refusal already makes (`shop.rs:348`, same
+    ///    field, same original address family);
+    /// 2. `[this+0x28]` — settled COVERAGE §14.29.5, read to the instruction: the third argument
+    ///    of the ctor `0x516C20`, which on this screen (`Parts.OwnedDamageRepairList`, ctor call
+    ///    site `0x4F2344`) is `[esi+0x60]`, the just-built `Parts.RepairShoppingList` accessor
+    ///    (ctor `0x516FE0`) — i.e. the repair basket itself. `0x516CF2`…`0x516D1E` walks that
+    ///    basket's raw `Entry*` vector (`[[this+0x28]+0x24]`, 4-byte stride) and refuses on
+    ///    `cmp [entryPtr], candidate_part; je` — a part already queued in the basket is not
+    ///    selectable a second time. `[this+0x28]==0` (the sibling `Parts.UsedDamageList`, ctor
+    ///    call site `0x4F22EE`, passes literal 0 — a used car has no basket of its own) skips this
+    ///    test entirely, matching `owned_selectable`'s `c.is_none_or` caller contract below only
+    ///    loosely: here it is `self.repair` that stands in for `[this+0x28]`, always present on
+    ///    this screen's own `PartsShop`, so the test always applies when `self` exists.
+    fn owned_selectable(&self, c: &CareerUi, strings: &Strings, row: usize) -> bool {
         let Some(car) = car_of(c) else { return false };
         let (_, ids) = Self::owned_rows(c, strings);
         let Some(id) = ids.get(row).copied() else { return false };
         let Some(p) = c.tables.parts.iter().find(|p| p.id == id) else { return false };
-        c.career.part_damage(car, p) != 0.0
+        c.career.part_damage(car, p) != 0.0 && !self.repair.iter().any(|e| e.part == id)
     }
 
     /// The list a click landed on, by its accessor, moves that list's current row (the list box's
@@ -297,7 +306,7 @@ impl PartsShop {
         match accessor {
             "Parts.ShoppingList" => self.basket_sel = Some(row),
             "Parts.OwnedDamageRepairList" => {
-                if c.is_none_or(|c| Self::owned_selectable(c, strings, row)) {
+                if c.is_none_or(|c| self.owned_selectable(c, strings, row)) {
                     self.owned_sel = Some(row);
                 }
             }
@@ -627,5 +636,52 @@ mod tests {
         assert_eq!(shop.owned_sel, None, "a zero-damage row never becomes current");
         assert!(shop.click(Some(&ui), &strings, "Parts.OwnedDamageRepairList", damaged_row));
         assert_eq!(shop.owned_sel, Some(damaged_row), "a damaged row does");
+    }
+
+    /// `0x516CA0`'s second refusal branch (COVERAGE §14.29.5): `[this+0x28]` on
+    /// `Parts.OwnedDamageRepairList` is `Parts.RepairShoppingList` (the ctor's 3rd argument,
+    /// call site `0x4F2344`) — walking `[[this+0x28]+0x24]`'s `Entry*` vector and refusing a row
+    /// whose part matches one already queued there (`0x516CF2`…`0x516D1E`, `cmp [entryPtr],
+    /// candidate_part`). A part already in the repair basket is not selectable on
+    /// `Parts.OwnedDamageRepairList`; a different damaged part still is; once the basket entry is
+    /// removed (`removeitem`, 0x517440) the row is selectable again.
+    #[test]
+    fn a_part_already_in_the_repair_basket_is_not_selectable_on_the_repair_list() {
+        use nfs_game::career::{Career, CareerTables, OwnedCar};
+        let Ok(paths) = nfs_assets::GamePaths::locate() else {
+            eprintln!("skipping: original game data not found");
+            return;
+        };
+        let parts = vec![
+            Part { state: 12, ..part(1, 4, "Springs") },
+            Part { state: 30, ..part(2, 2, "Brakes") },
+        ];
+        let mut rec = vec![0u8; nfs_formats::fedata::CAR_RECORD_SIZE];
+        rec[0..2].copy_from_slice(&76u16.to_le_bytes());
+        rec[0x3BC..0x3BE].copy_from_slice(&2i16.to_le_bytes());
+        rec[0x3BE..0x3C0].copy_from_slice(&1i16.to_le_bytes());
+        rec[0x3C0..0x3C2].copy_from_slice(&2i16.to_le_bytes());
+        let catalog = nfs_formats::fedata::parse_car_catalog(&rec).unwrap();
+        let tables = CareerTables { raw: Default::default(), tracks: vec![], tournaments: vec![], parts, personalities: vec![], missions: vec![], strings: Default::default(), catalog, package_count: 0 };
+        let mut career = Career::default();
+        career.garage.push(OwnedCar::construct(&tables, 76, 0, 0));
+        let mut ui = crate::career_ui::CareerUi::load(&paths).unwrap();
+        ui.tables = tables;
+        ui.career = career;
+        let strings = Strings::default();
+        let (_, ids) = PartsShop::owned_rows(&ui, &strings);
+        let basketed_row = ids.iter().position(|id| *id == 1).unwrap();
+        let other_row = ids.iter().position(|id| *id == 2).unwrap();
+        let mut shop = PartsShop::default();
+        // queue part 1 into the repair basket, exactly as `fixpart` (0x519160) would via 0x5172B0
+        shop.repair.push(RepairItem { part: 1, replace: false });
+        assert!(shop.click(Some(&ui), &strings, "Parts.OwnedDamageRepairList", basketed_row));
+        assert_eq!(shop.owned_sel, None, "a part already in the repair basket is not selectable");
+        assert!(shop.click(Some(&ui), &strings, "Parts.OwnedDamageRepairList", other_row));
+        assert_eq!(shop.owned_sel, Some(other_row), "a different damaged part still is");
+        // `removeitem` (0x517440) frees the entry — the row becomes selectable again
+        shop.repair.clear();
+        assert!(shop.click(Some(&ui), &strings, "Parts.OwnedDamageRepairList", basketed_row));
+        assert_eq!(shop.owned_sel, Some(basketed_row), "freed from the basket, selectable again");
     }
 }

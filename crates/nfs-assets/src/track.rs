@@ -216,6 +216,44 @@ impl TrackGeometry {
         }
         TriangleGrid::build(tris, cell_size)
     }
+
+    /// Item centres for `WLineBundle`/`WTrack`'s fitted spatial tree (`0x47BE30`'s "a vector of
+    /// pointers to the items' centres", `RE/RENDERING.md` "The node pass 0x47F400 and the fitted
+    /// tree's split 0x47BE30"): one per placed world article and one per resolved `.scn`
+    /// instance — the same population [`Self::collision_grid`] turns into triangles
+    /// (`RE/notes/particles.md` §0/§10.1's own APPROXIMATION: "the world's box is the port's
+    /// collision triangles' box... the same items `0x47B660` walks, only their vertices"). Each
+    /// item's centre here is its own transformed mesh AABB's centre in the xz plane (the original
+    /// takes the item's rotated eight box corners — `main.rs`'s "Read 2026-09-27" note on the skid
+    /// grid's own box — an axis-aligned AABB centre is the same point for an unrotated article and
+    /// only an APPROXIMATION for a rotated one).
+    pub fn item_centres(&self) -> Vec<(f32, f32)> {
+        let mut out = Vec::new();
+        let mut bounds = |art: &ArticleMeshes, m: glam::Mat4| {
+            let (mut min, mut max) = (glam::Vec3::splat(f32::INFINITY), glam::Vec3::splat(f32::NEG_INFINITY));
+            let mut any = false;
+            for mm in &art.meshes {
+                for v in &mm.mesh.vertices {
+                    let p = m.transform_point3(glam::Vec3::from(v.position));
+                    min = min.min(p);
+                    max = max.max(p);
+                    any = true;
+                }
+            }
+            if any {
+                out.push(((min.x + max.x) * 0.5, (min.z + max.z) * 0.5));
+            }
+        };
+        for art in &self.world {
+            bounds(art, art.transform);
+        }
+        for inst in &self.instances {
+            if let Some(art) = self.library.iter().find(|a| a.tag == inst.tag) {
+                bounds(art, inst.transform * glam::Mat4::from_scale(inst.scale));
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Default)]

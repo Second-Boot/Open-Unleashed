@@ -44,6 +44,30 @@ impl Piece {
     }
 }
 
+/// `SECTION:Audio { tag=…; SECTION:Sound { … } }` — the animated-object ambient-sound emitter
+/// record (`RE/notes/engine-audio.md` §7.3/§7.4, `COVERAGE-2026-09-26.md` §14.38). Parser
+/// `0x47D6B0` (`AnimDefs_parseAudioSection`, the `tag=` line) and `0x47D980`
+/// (`AnimDefs_parseSound`, the eight fields below, each read inline except the last two, which go
+/// through the shared field-match-and-parse helper `0x47D3F0`). All eight offsets are exact —
+/// read directly off `0x47D980`'s disassembly (2026-09-30): `PatchID`→word `[ebp+0]`,
+/// `Range`→float `[ebp+4]`, `FadeIn`→float `[ebp+8]`, `Trigger`→word `[ebp+0xC]`,
+/// `FadeOut`→word `[ebp+0xE]`, `MinRepeat`→word `[ebp+0x10]` (all four inline, `0x47D9FE…0x47DC41`),
+/// `RandomRepeat`→word `[ebp+0x12]` and `Volume`→word `[ebp+0x14]` (both via `0x47D3F0`,
+/// `0x47DC46…0x47DC78`) — the exact `SoundDef` layout `engine-audio.md` §7.3 already gives. The
+/// shipped file has exactly one block, `tag=TRAN` → `PatchID 833` (`train1_833.bnk`), `Range 300`,
+/// `FadeIn 17`, `Volume 100`, every other field 0.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SoundDef {
+    pub patch_id: u16,
+    pub range: f32,
+    pub fade_in: f32,
+    pub trigger: u16,
+    pub fade_out: u16,
+    pub min_repeat: u16,
+    pub random_repeat: u16,
+    pub volume: u16,
+}
+
 /// One `SECTION:ANIM`. The parser is **0x47DCF0**, and the record it fills is
 /// `+0x00 mass, +0x08 radius, +0x0C audioType, +0x10 collideType, +0x14 drivethru,
 /// +0x15 triggerable, +0x16 dynamicLight, +0x18 piece count, +0x80 velocityFactor,
@@ -151,6 +175,11 @@ pub fn band_group(bands: &[f32], band_pieces: &[usize], speed: f32) -> std::ops:
 #[derive(Debug, Clone, Default)]
 pub struct AnimDefs {
     defs: Vec<AnimDef>,
+    /// `SECTION:Audio` blocks, by their `tag=`, in file order (`0x47ED4C`'s own, separate vector —
+    /// `RE/notes/crp-geometry.md` §7.1's "`SECTION:Audio` goes to a second vector"). Not merged
+    /// into `defs`: an `Audio` tag need not have a matching `ANIM` definition (the shipped `TRAN`
+    /// has none), so this is looked up on its own by [`AnimDefs::sound_by_tag`]/[`AnimDefs::sound`].
+    sounds: Vec<(String, SoundDef)>,
 }
 
 impl AnimDefs {
@@ -187,12 +216,37 @@ impl AnimDefs {
         self.defs.iter()
     }
 
+    /// The first `SECTION:Audio`'s `SoundDef` with this tag, `0x47ED4C`'s own linear search
+    /// (unlike `defs`'/`0x47ED90`'s "unknown tag → the file's first" fallback, an unmatched Audio
+    /// tag has no fallback in the original — no code path there needs one, since only a scene
+    /// object whose own `Base` tag is looked up gets here at all).
+    pub fn sound_by_tag(&self, tag: &str) -> Option<&SoundDef> {
+        self.sounds.iter().find(|(t, _)| t.eq_ignore_ascii_case(tag)).map(|(_, s)| s)
+    }
+
+    /// By the FourCC an article's `Base` record carries, little-endian — the same decoding
+    /// [`AnimDefs::by_fourcc`] uses for `ANIM` definitions.
+    pub fn sound_by_fourcc(&self, tag: u32) -> Option<&SoundDef> {
+        let b = tag.to_le_bytes();
+        let s: String = b.iter().take_while(|c| **c != 0).map(|c| *c as char).collect();
+        self.sound_by_tag(s.trim())
+    }
+
+    /// Every `SECTION:Audio` block, in file order.
+    pub fn sounds(&self) -> impl Iterator<Item = (&str, &SoundDef)> {
+        self.sounds.iter().map(|(t, s)| (t.as_str(), s))
+    }
+
     pub fn parse(text: &str) -> AnimDefs {
         let mut out = AnimDefs::default();
         let mut def: Option<AnimDef> = None;
         let mut piece: Option<Piece> = None;
+        // `SECTION:Audio`'s own two-level nest (0x47D6B0/0x47D980): `audio_tag` is set while inside
+        // the outer `Audio{}` (its own `tag=` line), `sound` while inside the nested `Sound{}`.
+        let mut audio_tag: Option<String> = None;
+        let mut sound: Option<SoundDef> = None;
         let mut speed = 0.0f32;
-        // depth 1 = inside the section's braces, 2 = inside a piece's
+        // depth 1 = inside the section's braces, 2 = inside a piece's/sound's
         let mut depth = 0usize;
         let mut pending: Option<&'static str> = None;
         for raw in text.lines() {
@@ -205,6 +259,8 @@ impl AnimDefs {
                 pending = match kind.as_str() {
                     "ANIM" => Some("anim"),
                     "PIECE" => Some("piece"),
+                    "AUDIO" => Some("audio"),
+                    "SOUND" => Some("sound"),
                     _ => Some("other"),
                 };
                 continue;
@@ -214,6 +270,8 @@ impl AnimDefs {
                 match pending.take() {
                     Some("anim") => def = Some(AnimDef::default()),
                     Some("piece") => piece = Some(Piece { playback_rate: 1.0, ..Piece::default() }),
+                    Some("audio") => audio_tag = Some(String::new()),
+                    Some("sound") => sound = Some(SoundDef::default()),
                     _ => {}
                 }
                 continue;
@@ -233,11 +291,41 @@ impl AnimDefs {
                     && !d.tag.is_empty()
                 {
                     out.defs.push(d);
+                } else if let Some(s) = sound.take() {
+                    // closing `Sound{}`: file it under the enclosing `Audio{}`'s tag
+                    if let Some(tag) = audio_tag.clone()
+                        && !tag.is_empty()
+                    {
+                        out.sounds.push((tag, s));
+                    }
+                } else {
+                    // closing the outer `Audio{}` itself (or any other unhandled section)
+                    audio_tag = None;
                 }
                 continue;
             }
             let Some((k, v)) = line.trim_end_matches(';').split_once('=') else { continue };
             let (k, v) = (k.trim().to_ascii_lowercase(), v.trim().trim_end_matches(';').trim());
+            if let Some(s) = sound.as_mut() {
+                match k.as_str() {
+                    "patchid" => s.patch_id = v.parse().unwrap_or(0),
+                    "range" => s.range = v.parse().unwrap_or(0.0),
+                    "fadein" => s.fade_in = v.parse().unwrap_or(0.0),
+                    "trigger" => s.trigger = v.parse().unwrap_or(0),
+                    "fadeout" => s.fade_out = v.parse().unwrap_or(0),
+                    "minrepeat" => s.min_repeat = v.parse().unwrap_or(0),
+                    "randomrepeat" => s.random_repeat = v.parse().unwrap_or(0),
+                    "volume" => s.volume = v.parse().unwrap_or(0),
+                    _ => {}
+                }
+                continue;
+            }
+            if audio_tag.is_some() {
+                if k == "tag" {
+                    audio_tag = Some(v.to_string());
+                }
+                continue;
+            }
             if let Some(p) = piece.as_mut() {
                 match k.as_str() {
                     "quatgroup" => p.quat_group = Some(v.to_string()),
@@ -408,5 +496,53 @@ SECTION:ANIM
         assert_eq!(d.by_fourcc(u32::from_le_bytes(*b"CONE")).map(|x| x.tag.as_str()), Some("CONE"));
         assert_eq!(d.by_fourcc(u32::from_le_bytes(*b"DOC2")).map(|x| x.tag.as_str()), Some("DOC2"));
         assert!(d.by_fourcc(0).is_none());
+    }
+
+    /// `SECTION:Audio{tag=TRAN;SECTION:Sound{...}}` — the exact bytes of the shipped
+    /// `GameData/Track/animdefs.txt`'s only `SECTION:Sound` block (verified against the installed
+    /// file 2026-09-30). `0x47D980`/`0x47D3F0` field-by-field, `COVERAGE-2026-09-26.md` §14.38.
+    const AUDIO_SAMPLE: &str = "\
+SECTION:Audio\n\
+{\n\
+\ttag=TRAN;\n\
+\tSECTION:Sound\n\
+\t{\n\
+\t\tPatchID=833;\n\
+\t\tRange=300;\n\
+\t\tFadeIn=17;\n\
+\t\tTrigger=0;\n\
+\t\tFadeOut=0;\n\
+\t\tMinRepeat=0;\n\
+\t\tRandomRepeat=0;\n\
+\t\tVolume=100;\t\t\t\t// Percent\n\
+\t}\n\
+}\n\
+\n\
+SECTION:ANIM\n\
+{\n\
+\ttag=ENDW;\n\
+\tcollideType=kBox;\n\
+}\n";
+
+    #[test]
+    fn the_one_shipped_sound_def() {
+        let d = AnimDefs::parse(AUDIO_SAMPLE);
+        // the `Audio` block does not become an `ANIM` definition — `TRAN` has no `ANIM` of its own
+        assert!(d.get("TRAN").is_none());
+        assert_eq!(d.get("ENDW").map(|x| x.tag.as_str()), Some("ENDW"));
+        let s = d.sound_by_tag("TRAN").expect("the shipped TRAN SoundDef");
+        assert_eq!(s.patch_id, 833);
+        assert_eq!(s.range, 300.0);
+        assert_eq!(s.fade_in, 17.0);
+        assert_eq!(s.trigger, 0);
+        assert_eq!(s.fade_out, 0);
+        assert_eq!(s.min_repeat, 0);
+        assert_eq!(s.random_repeat, 0);
+        assert_eq!(s.volume, 100);
+        assert_eq!(d.sound_by_fourcc(u32::from_le_bytes(*b"TRAN")).map(|s| s.patch_id), Some(833));
+        assert!(d.sound_by_tag("NOPE").is_none());
+        assert_eq!(d.sounds().count(), 1);
+        // case-insensitive, matching `ANIM`'s own tag lookup
+        assert_eq!(d.sound_by_tag("tran").map(|s| s.patch_id), Some(833));
     }
 }

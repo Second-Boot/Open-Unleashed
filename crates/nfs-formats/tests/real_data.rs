@@ -391,6 +391,20 @@ fn animdefs_parses_the_shipped_file() {
     // the barrier boxes the port already puts in the wall set
     assert_eq!(defs.get("ENDW").map(|d| d.collide_type.as_str()), Some("kBox"));
 
+    // the one shipped `SECTION:Audio` (`COVERAGE-2026-09-26.md` §14.13.1/§14.38): the Autobahn
+    // train's ambient sound, `tag=TRAN` with no `ANIM` definition of its own
+    assert_eq!(defs.sounds().count(), 1);
+    assert!(defs.get("TRAN").is_none(), "TRAN has an Audio section but no ANIM of its own");
+    let tran = defs.sound_by_tag("TRAN").expect("the shipped TRAN SoundDef");
+    assert_eq!(tran.patch_id, 833);
+    assert_eq!(tran.range, 300.0);
+    assert_eq!(tran.fade_in, 17.0);
+    assert_eq!(tran.trigger, 0);
+    assert_eq!(tran.fade_out, 0);
+    assert_eq!(tran.min_repeat, 0);
+    assert_eq!(tran.random_repeat, 0);
+    assert_eq!(tran.volume, 100);
+
     // the animated props: a docker loops at the default rate, the sign has two speed groups
     let doc = defs.get("DOC2").expect("DOC2");
     let p = doc.resting_pieces().next().expect("a resting piece");
