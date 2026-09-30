@@ -99,7 +99,7 @@ impl LoadingScreen {
         };
         let sprite = |tex: TextureId, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]| {
             let (pos, size) = place(x, y, w, h);
-            Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None }
+            Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None }
         };
         let mut out = Vec::new();
         for (first, count, size, y) in ROWS {
@@ -135,7 +135,27 @@ fn design_sprite(aspect: f32, tex: TextureId, x: f32, y: f32, w: f32, h: f32, co
         color,
         rotation: 0.0,
         pivot: [0.5, 0.5],
-        tri: None,
+        tri: None, corner_colors: None,
+        depth: None,
+    }
+}
+
+/// A rectangle of the 640×480 picture on a `width × height` target, in pixels, the picture at
+/// `((W − 640) / 2, (H − 480) / 2)` (0x53D570). `flip` mirrors the art left to right (0x563320).
+#[allow(clippy::too_many_arguments)]
+fn centred_sprite(width: f32, height: f32, tex: TextureId, x: f32, y: f32, w: f32, h: f32, color: [f32; 4], flip: bool) -> Sprite {
+    let (ox, oy) = (((width as i32) / 2) as f32 - 320.0, ((height as i32) / 2) as f32 - 240.0);
+    let (u0, u1) = if flip { (1.0, 0.0) } else { (0.0, 1.0) };
+    Sprite {
+        texture: tex,
+        pos: [(x + ox) / width, (y + oy) / height],
+        size: [w / height, h / height],
+        uv_min: [u0, 0.0],
+        uv_max: [u1, 1.0],
+        color,
+        rotation: 0.0,
+        pivot: [0.5, 0.5],
+        tri: None, corner_colors: None,
         depth: None,
     }
 }
@@ -308,23 +328,25 @@ impl RaceLoading {
         true
     }
 
-    /// The surface and the bar as sprites, in the 640×480 design letterboxed into `aspect` —
-    /// APPROXIMATION: the original copies the surface unscaled to the middle of the screen
-    /// (0x53D570 at ((W − 640) / 2, (H − 480) / 2)); the port scales it as it does the front end.
-    pub fn sprites(&self, aspect: f32) -> Vec<Sprite> {
-        let mut out: Vec<Sprite> = self.surface.iter().map(|&(t, x, y, w, h, f)| design_sprite(aspect, t, x, y, w, h, [1.0; 4], f)).collect();
+    /// The surface and the bar as sprites on a `width × height` render target, **unscaled**: the
+    /// 640×480 picture is copied to `((W − 640) / 2, (H − 480) / 2)` (0x53D570, integer halves) with
+    /// black round it, and the bar and the players' rows sit at their design offsets inside it
+    /// (the port's HiDPI mapping, 2026-10-01). `width` / `height` are the HUD's logical resolution, the window's
+    /// physical size over its scale factor (the port's HiDPI mapping, not a game rule).
+    pub fn sprites(&self, width: f32, height: f32) -> Vec<Sprite> {
+        let mut out: Vec<Sprite> = self.surface.iter().map(|&(t, x, y, w, h, f)| centred_sprite(width, height, t, x, y, w, h, [1.0; 4], f)).collect();
         if let Some(w) = self.bar {
-            out.push(design_sprite(aspect, self.white, 302.0, 467.0, w, 6.0, [1.0, 0xBB as f32 / 255.0, 0.0, 1.0], false));
+            out.push(centred_sprite(width, height, self.white, 302.0, 467.0, w, 6.0, [1.0, 0xBB as f32 / 255.0, 0.0, 1.0], false));
         }
         for row in &self.rows {
             match *row {
-                LoadingRow::Absent { x } => out.push(design_sprite(aspect, self.white, x, 364.0, 54.0, 64.0, [0.0, 0.0, 0.0, 1.0], false)),
+                LoadingRow::Absent { x } => out.push(centred_sprite(width, height, self.white, x, 364.0, 54.0, 64.0, [0.0, 0.0, 0.0, 1.0], false)),
                 LoadingRow::Player { x, picture, w, h, progress } => {
-                    out.push(design_sprite(aspect, picture, x, 364.0, w, h, [1.0; 4], false));
+                    out.push(centred_sprite(width, height, picture, x, 364.0, w, h, [1.0; 4], false));
                     let done = (progress * 54 / 10) as f32;
                     // 0xFF312000 for what is left, 0xFFFFBB00 for what is done (0x4A5299, 0x4A52E7)
-                    out.push(design_sprite(aspect, self.white, x + done, 436.0, 54.0 - done, 6.0, [0x31 as f32 / 255.0, 0x20 as f32 / 255.0, 0.0, 1.0], false));
-                    out.push(design_sprite(aspect, self.white, x, 436.0, done, 6.0, [1.0, 0xBB as f32 / 255.0, 0.0, 1.0], false));
+                    out.push(centred_sprite(width, height, self.white, x + done, 436.0, 54.0 - done, 6.0, [0x31 as f32 / 255.0, 0x20 as f32 / 255.0, 0.0, 1.0], false));
+                    out.push(centred_sprite(width, height, self.white, x, 436.0, done, 6.0, [1.0, 0xBB as f32 / 255.0, 0.0, 1.0], false));
                 }
             }
         }

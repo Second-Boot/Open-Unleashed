@@ -35,6 +35,50 @@ pub fn format_ticks(ticks: u64) -> String {
     if m > 60 { "59:59.99".to_string() } else { format!("{m:02}:{sec:02}.{hh:02}") }
 }
 
+/// `Time_format` 0x4356E0 over a signed dword, the way the original runs it (`sign` is its third
+/// argument, the flag at 0x4356F5): with the flag a `"+"` (0x5CD200, time ≥ 0) or `"-"` (0x5CD1FC)
+/// opens the string; the magnitude is `|t|` (0x43572E…0x435738, `neg` for a time ≤ 0), split with
+/// the truncating `fild · 1/64 · _ftol` (0x43573C…0x435746) and `idiv 60` into minutes / seconds,
+/// the hundredths from `(|t| & 0x8000003F)` fixed up as a signed remainder, · 100 / 64 (0x435776…
+/// 0x435797). More than 60 minutes appends `"59:59.99"` (0x4358E7) — after the sign. Every field
+/// below ten gets a `"0"` first and is written with the C `itoa` (so the one absurd input,
+/// `0x80000000`, whose `neg` stays negative, prints its negative fields as the original does).
+/// The race-result printers pass no flag (`push 0` at 0x42B348 — the in-race table's finished
+/// car's `+0xB24` —, 0x42B382, 0x42C401 / 0x42C428 — `HRaceSummary`'s BEST LAP and TIME cells —,
+/// 0x42A315, 0x431796; only 0x42B488, a `fistp` difference, pushes 1): a negative time is drawn as
+/// its absolute value there. CONFIRMED (2026-09-30).
+pub fn format_time_dword(t: i32, sign: bool) -> String {
+    let mut out = String::new();
+    if sign {
+        out.push(if t < 0 { '-' } else { '+' });
+    }
+    let v = if t > 0 { t } else { t.wrapping_neg() };
+    let secs = v / 64;
+    let (m, sec) = (secs / 60, secs % 60);
+    // 0x435776: `and eax, 0x8000003F`; a negative result is fixed up to the signed remainder
+    let mut low = (v as u32 & 0x8000_003F) as i32;
+    if low < 0 {
+        low = (low.wrapping_sub(1) | !0x3F).wrapping_add(1);
+    }
+    let hh = (low * 100) / 64;
+    if m > 60 {
+        out.push_str("59:59.99");
+        return out;
+    }
+    let field = |out: &mut String, n: i32| {
+        if n < 10 {
+            out.push('0');
+        }
+        out.push_str(&n.to_string());
+    };
+    field(&mut out, m);
+    out.push(':');
+    field(&mut out, sec);
+    out.push('.');
+    field(&mut out, hh);
+    out
+}
+
 /// The `nfs5.trk` array plus the per-track metadata needed to address it by track file name.
 #[derive(Debug, Clone)]
 pub struct Records {
@@ -173,6 +217,25 @@ pub fn hud_records(before: &[TrackRecord], linear: bool, driver: &str, car: &str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn time_format_takes_a_signed_dword_like_0x4356e0() {
+        use super::format_time_dword as f;
+        // a positive time prints as `format_ticks` does
+        for t in [0u64, 1, 63, 64, 3839, 3840, 123_456, 3_840 * 60] {
+            assert_eq!(f(t as i32, false), super::format_ticks(t), "{t}");
+        }
+        // no flag: the absolute value, no sign; the flag adds "+" / "-" (0x5CD200 / 0x5CD1FC)
+        assert_eq!(f(-580, false), "00:09.06");
+        assert_eq!(f(580, true), "+00:09.06");
+        assert_eq!(f(-580, true), "-00:09.06");
+        assert_eq!(f(0, true), "+00:00.00");
+        // more than an hour clamps, after the sign
+        assert_eq!(f(-(3_840 * 61), true), "-59:59.99");
+        // `0x80000000`: `neg` leaves it negative, so the minutes and seconds are negative and the
+        // hundredths come out 0 (0x435776…0x435785)
+        assert_eq!(f(i32::MIN, false), "0-559240:0-32.00");
+    }
+
     use super::*;
 
     #[test]

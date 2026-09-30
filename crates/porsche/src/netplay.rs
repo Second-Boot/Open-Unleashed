@@ -31,18 +31,29 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 /// `NfsNet+0x2C`, the version string the session name carries after its `~` (0x48DDC2…0x48DDF8).
-/// 0x48DBE0 reads the install's `version.txt` (`push 0x5D0790`, at most 5 bytes: 0x48DC77…0x48DC7C)
-/// into it. **APPROXIMATION** for a missing / empty file: the executable's own `"3.5"` (0x5D06FC,
-/// the literal 0x48A700 compares a peer's version with) — the original would keep what the
-/// configuration read before it (0x4B7240(7), not traced).
+/// 0x48DBE0 first fills it with the first 4 bytes (`strncpy`, `[+0x31] = 0`) of the registry
+/// string 0x4B7240(7) reads — the value **`Client Version`** of the game's key, whose table row
+/// (0x5D6F28 + 7·12) gives the default `"0.0"` (0x5D07A0) when the registry has none — then reads
+/// the install's `version.txt` (`push 0x5D0790`, at most 5 bytes: 0x48DC77…0x48DC7C, taken as they
+/// are, no trimming) over it when the file opens and is not empty (0x533DE0 ≠ 0).
+/// CONFIRMED 2026-09-30: a missing or empty file leaves the registry's `Client Version`
+/// (this install's `reg.reg`: `"0.0"`). Until this date the port answered `"3.5"`, the literal
+/// 0x48A700 compares a peer's version with, which is not what the constructor keeps, and trimmed
+/// the file's text.
 pub fn game_version() -> String {
-    nfs_assets::paths::GamePaths::locate()
-        .ok()
+    let paths = nfs_assets::paths::GamePaths::locate().ok();
+    let file = paths
+        .as_ref()
         .and_then(|p| std::fs::read(p.root.join("version.txt")).ok())
         .map(|b| b.into_iter().take(5).take_while(|&c| c != 0).map(|c| c as char).collect::<String>())
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "3.5".to_string())
+        .filter(|v| !v.is_empty());
+    file.unwrap_or_else(|| {
+        let reg = paths.map(|p| p.registry());
+        match reg.as_ref().and_then(|r| r.value(nfs_formats::regfile::GAME_KEY, "Client Version")) {
+            Some(nfs_formats::regfile::RegValue::Sz(v)) => v.chars().take(4).collect(),
+            _ => "0.0".to_string(),
+        }
+    })
 }
 
 /// The address record a host's `'d'` carries at `+0x04` — its machine's own address as 0x583899
@@ -429,8 +440,10 @@ pub enum JoinState {
 /// deadline `[0x5DEB48] << 4` (0x48AC90: `0x55D370(conman, addr, [0x5DEB48] * 16, 0)`), the command
 /// loop re-tries every `[0x5DEB48] * 5` (0x55C7D2, 0x55C86D) and each attempt's handshake waits 5000 ms
 /// (0x55CA15: `0x1388`) — `[0x5DEB48]` is the timer module's ticks per second (written by 0x564F3D…,
-/// zeroed by 0x565336), so the deadline is 16 s. **APPROXIMATION:** the unit is inferred from those
-/// two constants, the timer's own value was not read. When it runs out the conman reports event 5
+/// zeroed by 0x565336), so the deadline is 16 s. **CONFIRMED on the running original (2026-10-01 SV, Wine, gdb):**
+/// `[0x5DEB48]` reads 128 (0x80) — `TIMER_FREQ`, 128 ticks a second, `timing.md` §2 — and 0x5822B0, the
+/// conman's ms → ticks converter (`ticks_now + ms · [0x5DEB48] / 1000`, the 0x10624DD3 multiply), turns the
+/// handshake's 5000 ms into 640 ticks the same way, so `[0x5DEB48] << 4` = 2048 ticks = 16 s. When it runs out the conman reports event 5
 /// (0x55C9CF), and the game's callback makes it state **4** (0x48FBB6, `net+0xDC = −1`) — not 6.
 pub const JOIN_TIMEOUT: Duration = Duration::from_secs(16);
 
@@ -960,10 +973,11 @@ impl NetPlay {
         self.net.desc_words = [direction, track];
     }
 
-    /// The room's word for "now": `0x48A9A0()`, `GetTickCount()` plus an offset a host keeps at zero,
-    /// so the milliseconds since this session opened — **APPROXIMATION** of the origin of the tick
-    /// counter only; a player uses the word for nothing here (the original sets its own clock offset
-    /// from `0xB3`'s, 0x48A9B0, which the port has no counterpart of).
+    /// The room's word for "now": `0x48A9A0()` is a bare `jmp [GetTickCount]` (no offset), so the host's word is
+    /// the machine's tick counter; a player sets its clock offset from the word (`[clock] = word −
+    /// GetTickCount()`, 0x48A9B0 at 0x48F8C8, [`nfs_net::exchange::Clock::set`]) and reads its own word
+    /// through 0x48AA00 (`GetTickCount() + offset`). Only the difference of two clocks is ever used, so the
+    /// counter's origin (the port's is the session's start, [`NetPlay::now`]) cannot be seen — settled, AC 2026-09-30.
     fn room_clock(&self) -> u32 {
         // the same scale as the exchange room's heartbeat and frame clocks ([`NetPlay::now`]), which the
         // players' synchronised clock is set from (0x48F8C8) and the go's word is read against
@@ -1409,11 +1423,19 @@ impl NetPlay {
         // the room's files go out a chunk at a time on their own clock (0x48EFB5…0x48F02E), on
         // the broadcast channel `[net+8]` — which is `send_game` here, relayed by the host
         let ms = self.started.elapsed().as_millis() as u32;
-        for m in self.room.tick(ms) {
-            if let Err(e) = self.net.send_game(&m) {
-                tracing::debug!(error = %e, "file chunk not sent");
+        struct Link<'a>(&'a mut nfs_net::session::Net);
+        impl room::ChunkLink for Link<'_> {
+            fn pump(&mut self) -> bool {
+                // 0x48AE30 — the client's send queue (a host has none: its room sends on each link itself)
+                self.0.pump_outbox()
+            }
+            fn send(&mut self, msg: &[u8]) {
+                if let Err(e) = self.0.send_game(msg) {
+                    tracing::debug!(error = %e, "file chunk not sent");
+                }
             }
         }
+        self.room.tick_with(ms, &mut Link(&mut self.net));
         // the exchange's room tick 0x48B6B0 (the original runs it from the 128 Hz timer)
         if self.is_host() {
             log.extend(self.server_tick());
@@ -2046,8 +2068,10 @@ impl NetPlay {
 
     /// **`HLeader`'s** picture (draw 0x4286F0): the car in first place is `seat` (`None` for our
     /// own), its player is the one whose car it is (0x48D720 matches `player+0x4C` against
-    /// `car+0x524`; here a seat is a remote id's through [`Remote::seat`] — **APPROXIMATION**, as
-    /// what writes `player+0x4C` has not been read), and its picture is file type 0 once whole
+    /// `car+0x524`; `player+0x4C` is written by the launch's players loop 0x4B4EA7…0x4B4ED9, `mov [edx+0x4C], ebx`
+    /// at 0x4B4EBC: the running number over the players whose bit is set in `net+0xE5`, in list order, −1 for
+    /// the others — the race index of [`NetPlay::seat_race_index`] — so a seat's car is the remote id's whose
+    /// race index it holds, [`Remote::seat`]; settled, AC 2026-09-30), and its picture is file type 0 once whole
     /// (0x4903F0, 0x428772). The upload takes the file's first image, the record `[file+0x14]`
     /// points at (0x42878E) — an FSH's first directory entry.
     pub fn leader_picture(&mut self, r: &mut Renderer, seat: Option<usize>) -> Option<TextureId> {
@@ -2306,7 +2330,7 @@ pub struct Lobby {
     who: String,
     /// a send error has been reported already (once per screen is enough)
     warned: bool,
-    /// whether [`Self::commit_ip`] writes [`history_path`] (off in the tests)
+    /// whether the list is written through to [`comms_ip_list`] (off in the tests)
     persist: bool,
 }
 
@@ -2336,10 +2360,26 @@ fn merge_key(d: &nfs_net::comm::Describe) -> Option<nfs_net::wire::Addr> {
 /// How long a listed session may stay silent before it leaves the list — see [`Lobby::seen`].
 const SESSION_TTL: Duration = Duration::from_secs(4);
 
-/// The file the port keeps `Comms.IPList` in. **APPROXIMATION** of where: the original writes the
-/// list into the profile's option block (`savegame.md` §6: `FECharVectAccessor` saves `u32 n`, the
-/// `n` strings and the selection); the port's profile save carries no such block, so the list is
-/// a line-per-address file beside the saves.
+/// `Comms.IPList`, the accessor's contents: the address strings (newest first) and the selected
+/// row. It lives in the profile's option block (`FECharVectAccessor`, ctor 0x50B8BE, Save 0x4B8D70 /
+/// Load 0x4B8E00 write `u32 n`, `n` strings, `u32 selection`, `savegame.md` §6.1) — the process
+/// holds it the way the original's accessor map `[0x65B3A8]` does, [`comms_ip_list`] /
+/// [`set_comms_ip_list`] are the profile's save and load, and [`Lobby`] is the peer-to-peer screen's
+/// view of it.
+static COMMS_IPLIST: std::sync::Mutex<(Vec<String>, u32)> = std::sync::Mutex::new((Vec::new(), 0));
+
+/// The accessor as the profile save writes it.
+pub fn comms_ip_list() -> (Vec<String>, u32) {
+    COMMS_IPLIST.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// The accessor as the profile load (0x4B8E00) sets it.
+pub fn set_comms_ip_list(items: Vec<String>, selection: u32) {
+    if let Ok(mut g) = COMMS_IPLIST.lock() {
+        *g = (items, selection);
+    }
+}
+
 /// `Comms.GameName`'s capacity - `0x4BC8B0("Comms.GameName", 0, 0xF, 0)` (0x50B953…0x50B961).
 pub const GAME_NAME_MAX: usize = 15;
 
@@ -2350,16 +2390,6 @@ pub const GAME_NAME_DIALOG_MAX: usize = 0x19;
 /// profile's accessor block (`savegame.md` §6); the port keeps a text file like the IP list's.
 pub fn game_name_path() -> std::path::PathBuf {
     nfs_game::save::save_dir().join("comms_gamename.txt")
-}
-
-pub fn history_path() -> std::path::PathBuf {
-    nfs_game::save::save_dir().join("comms_iplist.txt")
-}
-
-fn load_history() -> Vec<String> {
-    std::fs::read_to_string(history_path())
-        .map(|t| t.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
-        .unwrap_or_default()
 }
 
 impl Lobby {
@@ -2373,8 +2403,8 @@ impl Lobby {
             seen: HashMap::new(),
             ping: HashMap::new(),
             ip: String::new(),
-            history: load_history(),
-            ip_sel: 0,
+            history: comms_ip_list().0,
+            ip_sel: comms_ip_list().1 as usize,
             sel: 0,
             positional: true,
             last_probe: Instant::now() - Duration::from_secs(9),
@@ -2395,15 +2425,14 @@ impl Lobby {
         self.history.insert(0, text.to_string());
         self.ip_sel = 0;
         self.ip = text.to_string();
-        if !self.persist {
-            return;
-        }
-        let path = history_path();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Err(e) = std::fs::write(&path, self.history.join("\n") + "\n") {
-            tracing::warn!(error = %e, path = %path.display(), "cannot keep Comms.IPList");
+        self.keep();
+    }
+
+    /// Writes the list and its selection through to the accessor (the profile save reads it there);
+    /// off in the tests.
+    fn keep(&self) {
+        if self.persist {
+            set_comms_ip_list(self.history.clone(), self.ip_sel as u32);
         }
     }
 
@@ -2414,6 +2443,7 @@ impl Lobby {
         let t = self.history.get(row)?.clone();
         self.ip_sel = row;
         self.ip = t.clone();
+        self.keep();
         Some(t)
     }
 

@@ -673,7 +673,14 @@ impl Ambience {
     /// ([`crate::mixer::pan_byte`], 0x4A9B4B…0x4A9B84), no bend, the patch as the bank has it.
     /// APPROXIMATION: the original plays only if the streamed patch has loaded during the
     /// countdown (0x4A8570 answers −1 until then, and 0x4A9BC7 then plays nothing); the port's
-    /// banks are in memory, so it always plays.
+    /// banks are in memory, so it always plays. **Observed on the original (2026-10-01 SV, Wine, industrial
+    /// with `skyrendering = 2`, gdb at 0x4A8340 / 0x4A98E0 / 0x4A9BC7, two separate races):** a strike's
+    /// call 0x4A8340 (mode 0x50), the countdown 0x4A8380 running 55 → 1, `playOneShot` 0x4A98E0 with the
+    /// thunder patch (995 / 998) and the bank −2, and then 0x4A9BC7 — the streamed patch had NOT loaded, so
+    /// both first thunders were **silent**. The game runs at well under one frame a second under the
+    /// breakpoints, so the disk / streaming race is far slower than on a real machine: whether a real
+    /// first thunder is silent depends on streaming speed. The port's "always plays" stays an
+    /// APPROXIMATION of a timing-dependent rule.
     pub fn thunder_update(&mut self, out: &AudioOutput) {
         match self.thunder.step() {
             ThunderStep::Idle => {}

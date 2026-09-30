@@ -235,8 +235,11 @@ impl CarEffects {
     /// = `normalize(c × v)` (0x5328A0 twice); then slot 3 (0x454420: emitting, the tick 0), `+8
     /// = 100`, `+0x10 = d²`. `CSPK` is once-only (flag 2) with a period of 1 on, 2 off: two
     /// updates of emission at 4.29 an update (40 / ((28 / 3) · 1)), then it stops itself.
-    /// APPROXIMATION: a velocity of exactly zero gives the original a NaN axis (1 / 0 in
-    /// 0x5328D0); here a zero one.
+    /// A velocity of exactly zero would give the original a NaN axis (`1 / 0` in 0x5328D0, read
+    /// 2026-09-30, `[0x5B24A8] / |c|`, then `· c`), here a zero one — but the event cannot
+    /// carry one: both callers need `car+0x430` over 1.5, which is `|vel·n|` for a ground contact
+    /// (`suspension-collision.md` line 607) and an impulse of that velocity for a wall (`j > 20`),
+    /// both nonzero only for a moving car. Unreachable; the NaN arm is not ported.
     pub fn sparks(&mut self, car: usize, point: Vec3, v: Vec3, car_pos: Vec3, eye: Vec3) {
         if self.budget == 0 {
             return;
@@ -271,11 +274,21 @@ impl CarEffects {
         }
     }
 
+    /// Whether 0x43F6E0's draw reaches a system holding a particle (0x454430's `+0x20` gate) —
+    /// the draw sets Thrash 0x24 to 1 for it, sprites or not.
+    pub fn any_particles(&self) -> bool {
+        self.sets.iter().filter(|s| s.drawn).any(|set| set.systems.iter().flatten().any(|s| s.holds_particles()))
+    }
+
     /// **0x43F6E0**, in the render frame after the track's systems (0x468B64 → 0x455260, then
     /// 0x468B6F): every set of the draw set, its eleven systems' draw (slot 1, 0x454430) in slot
     /// order. `car_position` answers a car's `car+0x330`, which a relative system's draw adds.
     /// APPROXIMATION: the draw set is a `std::set` of the sets' addresses, so the cars' order is
-    /// their heap order; here it is the car index.
+    /// their heap order; here it is the car index. **Observed on the original (2026-10-01 SV, Wine
+    /// heap, gdb at 0x43F392 / 0x43F6F0):** in a 4-car race the four sets were inserted in car-draw
+    /// order at 0x28c2880, 0x28c0b18, 0x28bedb0, 0x28ba3e8 (falling addresses) and the walk visited
+    /// them 0x28ba3e8 … 0x28c2880, i.e. the REVERSE of the draw order — a property of that heap's
+    /// free lists, not of the game's code, so the order is allocator-dependent and the car index stays.
     pub fn draw(&self, car_position: impl Fn(usize) -> Vec3) -> (Vec<Sprite>, Vec<Streak>) {
         let (mut sprites, mut streaks) = (Vec::new(), Vec::new());
         for (car, set) in self.sets.iter().enumerate().filter(|(_, s)| s.drawn) {

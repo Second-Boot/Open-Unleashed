@@ -124,7 +124,7 @@ impl LayoutScreen {
             let (pos, size) = self.place(aspect, x as f32, y as f32, big_w as f32, big_h as f32);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
-            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None });
         }
         out
     }

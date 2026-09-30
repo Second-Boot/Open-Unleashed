@@ -76,6 +76,10 @@ impl Host {
 fn pump(h: &mut Host, c: &mut Net, room: &mut Room, heard: &mut Vec<Heard>, until: impl Fn(&Host, &[Heard]) -> bool) {
     for _ in 0..500 {
         h.poll();
+        // the client's send queue and the host's peer queues are pumped by the room's 32 Hz loop
+        // (0x48EE90, 0x48B4F0); a test has none
+        h.net.pump_outbox();
+        c.pump_outbox();
         for e in c.poll() {
             if let Event::Data { bytes, .. } = e
                 && let Some(x) = room.hear(&bytes)

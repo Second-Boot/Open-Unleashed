@@ -406,7 +406,13 @@ impl PartsShop {
             "INSTALLPART" => {
                 let car = car?;
                 if let Some(InstallRow::Spare(i)) = self.install_pick(c, strings) {
-                    c.career.install_spare(&c.tables, car, i);
+                    let moved = c.career.spares.get(i).copied();
+                    if c.career.install_spare(&c.tables, car, i)
+                        && let Some(moved) = moved
+                    {
+                        // the basket holds pointers: the spare's entries keep their record (0x518510)
+                        nfs_game::career::Career::shop_spare_installed(&mut self.basket, i, moved);
+                    }
                 }
                 self.install_sel = None;
             }

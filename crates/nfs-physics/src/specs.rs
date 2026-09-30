@@ -45,13 +45,13 @@ impl InstalledPart {
     }
 }
 
-/// The part list a car races with when nothing better fills [`CarSpecs::parts`] and
-/// [`stock_parts`] cannot resolve any real record (no `nfs5.prt` table loaded, or no id matched —
-/// a cop or a traffic car, whose construction 0x4EE9A0 is not traced to apply to). These are one
-/// part per getter with the masks of the standard parts of a rear-engined 911 in `nfs5.prt`
-/// (brakes / suspension / tyres on the four corners, engine and gearbox at the rear, aero front
-/// and rear), `scale` 1.5 and no carried state — what the port's one-mask-per-group model
-/// (`ZoneMasks` / `PartWear`, until 2026-09-26) used, kept as the last-resort default.
+/// The part list [`CarSpecs::from_sim`] starts from — **not** the original's (its list is the
+/// twenty zeroed records 0x49C4C0 fills from `.PARTINDEX`, so a car with no parts has none). Every
+/// racing path of the port overwrites it (`fold_fresh_car`, `installed_parts`,
+/// `layout_race_parts`; an empty result stays empty since 2026-09-30) and only the physics
+/// tests and a bare `from_sim` see it: one part per getter with the masks of the standard
+/// parts of a rear-engined 911 in `nfs5.prt` (brakes / suspension / tyres on the four corners,
+/// engine and gearbox at the rear, aero front and rear), `scale` 1.5 and no carried state.
 pub fn fallback_parts() -> Vec<InstalledPart> {
     let corners = [true, false, true, false, true, false, true, false, false, false];
     let rear = [false, false, false, false, true, true, true, false, false, false];
@@ -79,14 +79,12 @@ pub fn fallback_parts() -> Vec<InstalledPart> {
 /// resolved by id; an id the table has no record for (or an empty/unavailable table) is skipped.
 /// Not carried: `+0x758`'s exchange sort (0x49C350) — order does not change any getter's mean over
 /// a mask, and at most one part occupies a given type+category slot in a shipped stock list, so no
-/// getter's answer depends on it. Falls back to [`fallback_parts`] if nothing resolved.
+/// getter's answer depends on it. Nothing resolved is an empty list (0x49C4C0's zeroed records match no getter kind).
 pub fn stock_parts(ids: &[i16], table: &[nfs_formats::career::Part]) -> Vec<InstalledPart> {
-    let resolved: Vec<InstalledPart> = ids
-        .iter()
+    ids.iter()
         .filter_map(|id| table.iter().find(|p| p.id == *id))
         .map(|p| InstalledPart::new(p.kind, p.zone_mask.map(|b| b != 0), p.condition, p.state as f32))
-        .collect();
-    if resolved.is_empty() { fallback_parts() } else { resolved }
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,8 +93,7 @@ pub struct CarSpecs {
     pub mass: f32,
     /// The installed-part list `car+0x768` the part-damage getters walk ([`InstalledPart`]):
     /// [`stock_parts`] for a racer with no career state (a quick race, a non-career opponent), the
-    /// career's own installed parts when it has them, else [`fallback_parts`] (no `nfs5.prt` table
-    /// at hand, or no record matched — a cop, the traffic).
+    /// career's own installed parts when it has them (an empty result is an empty list).
     pub parts: Vec<InstalledPart>,
     /// wheelbase in metres (+0x44 ×0.001)
     pub wheelbase: f32,
@@ -669,11 +666,11 @@ mod stock_parts_tests {
         assert_eq!(got[0].carried, 5.0);
     }
 
-    /// No id resolves (an empty table — a cop or traffic car, or no `nfs5.prt` at hand) ->
-    /// [`fallback_parts`], not an empty list.
+    /// No id resolves (a traffic car's empty stock list): an empty list, as 0x49C4C0's twenty
+    /// zeroed records match no getter kind.
     #[test]
-    fn falls_back_when_nothing_resolves() {
-        let got = stock_parts(&[1, 2, 3], &[]);
-        assert_eq!(got, fallback_parts());
+    fn stays_empty_when_nothing_resolves() {
+        assert!(stock_parts(&[1, 2, 3], &[]).is_empty());
+        assert!(stock_parts(&[], &[]).is_empty());
     }
 }

@@ -152,7 +152,7 @@ impl BitmapFont {
                 color,
                 rotation: 0.0,
                 pivot: [0.0, 0.0],
-                tri: None,
+                tri: None, corner_colors: None,
                 depth: None,
             })
             .collect()

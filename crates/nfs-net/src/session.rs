@@ -60,6 +60,8 @@ pub struct Peer {
     pub countdown: u32,
     /// the rest of the 0x5C-byte record a `'p'` sends back
     pub record: [u8; RECORD_SIZE],
+    /// the host's send queue of this peer's record (0x48A3D0 / 0x48A4E0, [`crate::outbox::PeerQueue`])
+    pub queue: crate::outbox::PeerQueue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +128,9 @@ pub struct Net {
     /// service (case 182 of 0x491010) and is not run for a LAN / direct join (`network.md` §11.28).
     /// `None` (a test's bare session) lets everyone in.
     pub identity_gate: Option<String>,
+    /// The send queue in front of the pool, a client's only road for reliable game messages
+    /// ([`crate::outbox`], 0x48AD70 / 0x48AE30). A host's room sends on each link itself.
+    pub outbox: crate::outbox::Outbox,
     /// `conn+0xA8`
     alive: u32,
     /// `conn+0xAC`
@@ -153,6 +158,7 @@ impl Net {
             relay: true,
             identity_gate: None,
             conns: std::collections::HashMap::new(),
+            outbox: crate::outbox::Outbox::new(),
             epoch: std::time::Instant::now(),
             alive: comm::ALIVE_TICKS,
             ping: comm::PING_TICKS,
@@ -179,6 +185,7 @@ impl Net {
             relay: false,
             identity_gate: None,
             conns: std::collections::HashMap::new(),
+            outbox: crate::outbox::Outbox::new(),
             epoch: std::time::Instant::now(),
             alive: comm::ALIVE_TICKS,
             ping: comm::PING_TICKS,
@@ -306,8 +313,19 @@ impl Net {
     /// [`Net::is_reliable`], through the peer's own connection ([`crate::reliable::Conn`]).
     pub fn send_game_to(&mut self, addrs: &[SocketAddr], bytes: &[u8]) -> io::Result<()> {
         let reliable = self.is_reliable(bytes);
+        if reliable && self.role == Role::Client {
+            // the builder 0x48C870 → slot 0 of the queue, 0x48AD70 (`crate::outbox`): registered, and sent
+            // only while the queue is idle; the pump sends the rest
+            let mut ob = std::mem::take(&mut self.outbox);
+            ob.register(bytes, &mut |b| self.link_send(b));
+            self.outbox = ob;
+            return Ok(());
+        }
         let now = self.ticks();
         for &to in addrs {
+            if reliable && self.host_register(to, bytes) {
+                continue;
+            }
             let conn = self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now));
             let frame = if reliable { conn.send_queued(bytes, now) } else { Some(conn.send_unreliable(bytes, now)) };
             if let Some(f) = frame {
@@ -315,6 +333,84 @@ impl Net {
             }
         }
         Ok(())
+    }
+
+    /// The host's room sender for one peer — the room's send slot 0 (0x48B340) into the peer record's queue,
+    /// **0x48A3D0** ([`crate::outbox::PeerQueue::register`]): `true` when `to` is a peer of this host's slot
+    /// table (the message is registered and sent only while the record is idle), `false` for any other address
+    /// (a joiner the table does not hold yet — the caller keeps the port's backlog for it).
+    fn host_register(&mut self, to: SocketAddr, body: &[u8]) -> bool {
+        if self.role != Role::Host {
+            return false;
+        }
+        let Some(i) = self.slot_of(to) else { return false };
+        let mut q = std::mem::take(&mut self.peers[i as usize].as_mut().expect("slot_of found it").queue);
+        q.register(body, &mut |b| self.peer_send(to, b));
+        if let Some(p) = self.peers[i as usize].as_mut() {
+            p.queue = q;
+        }
+        true
+    }
+
+    /// 0x55C270 -> 0x595C40 on the link to the peer at `to`: `false` when no packet is free (the original's
+    /// answer 0).
+    fn peer_send(&mut self, to: SocketAddr, body: &[u8]) -> bool {
+        let now = self.ticks();
+        let conn = self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now));
+        match conn.send(body, now) {
+            Some(f) => {
+                let _ = self.sock.send_to(to, crate::data::TAG, &f);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// **0x48A4E0** for every peer record, once per turn of the room's 32 Hz loop (0x48B4F0 at 0x48B54D walks
+    /// the records the registrations listed; one that is idle and empty does nothing, so walking all of them is
+    /// the same). `+0xBA` ("in") is a slot of the table here — APPROXIMATION: the original sets it in the
+    /// arrival handlers (0x490913 / 0x490927) and the `0xB3` / `0xC6` ones (0x491991 / 0x491A9E / 0x491C25).
+    pub fn pump_peers(&mut self) {
+        for i in 0..self.peers.len() {
+            let Some(p) = self.peers[i].as_mut() else { continue };
+            let to = p.sock;
+            let mut q = std::mem::take(&mut p.queue);
+            q.pump(true, &mut |b| self.peer_send(to, b));
+            if let Some(p) = self.peers[i].as_mut() {
+                p.queue = q;
+            }
+        }
+    }
+
+    /// **0x55D4A0** for the queue: the layer's reliable send (0x560420 → 0x595C40) on the link to the host —
+    /// nothing unless the link is connected (`conn+0x2C8 & 1`: the host has taken us, [`Net::slot`]); `false`
+    /// when there is no packet free.
+    fn link_send(&mut self, body: &[u8]) -> bool {
+        let (Some(to), Some(_)) = (self.host, self.slot) else { return false };
+        let now = self.ticks();
+        let conn = self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now));
+        match conn.send(body, now) {
+            Some(f) => {
+                let _ = self.sock.send_to(to, crate::data::TAG, &f);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// **0x48AE30**, the queue's pump — the caller runs it 32 times a second (0x48EE90). `true`: it sent (or tried
+    /// to send) the head; `false`: the queue is empty or not enabled (0x48EE90 then sends a file chunk).
+    pub fn pump_outbox(&mut self) -> bool {
+        if self.role == Role::Host {
+            // the room's tick 0x48B4F0: its own queue (none here) and every listed peer record
+            // (0x48A4E0); a host has no client queue, so the answer is 0 and a file chunk may go
+            self.pump_peers();
+            return false;
+        }
+        let mut ob = std::mem::take(&mut self.outbox);
+        let r = ob.pump(&mut |b| self.link_send(b));
+        self.outbox = ob;
+        r
     }
 
     /// 0x55C270 -> 0x595C40 as the room's frame sender sees it: would the link take a reliable
@@ -335,6 +431,13 @@ impl Net {
             .map(|(a, c)| format!("{a}: flight {} queued {} ack {} {:?}", c.in_flight(), c.queued(), c.ack(), c.stats))
             .collect::<Vec<_>>()
             .join("; ")
+            + &format!("; outbox {:?}, {} waiting", self.outbox.stats, self.outbox.len())
+            + &self
+                .peers
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| p.as_ref().map(|p| format!("; peer {i} queue {:?}, {} waiting", p.queue.stats, p.queue.len())))
+                .collect::<String>()
             + &format!("; the test glue dropped {} data frames", self.sock.dropped())
     }
 
@@ -444,6 +547,8 @@ impl Net {
                             JoinStatus::Joined(slot) => {
                                 self.slot = Some(slot);
                                 self.host = Some(from);
+                                // the transport's "connected" event (4, 0x48FBB0) enables the queue's pump
+                                self.outbox.enable();
                                 out.push(Event::Joined { slot });
                             }
                             other => out.push(Event::Refused { status: other }),
@@ -470,6 +575,9 @@ impl Net {
                         let reliable = self.is_reliable(&body);
                         let others: Vec<SocketAddr> = self.everyone().into_iter().filter(|&a| a != from).collect();
                         for to in others {
+                            if reliable && self.host_register(to, &body) {
+                                continue;
+                            }
                             let c = self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now));
                             let f = if reliable { c.send_queued(&body, now) } else { Some(c.send_unreliable(&body, now)) };
                             if let Some(f) = f {
@@ -497,6 +605,8 @@ impl Net {
                 } else if self.host == Some(from) {
                     self.host = None;
                     self.slot = None;
+                    // the link is gone: the queue is freed with it (0x48AED0)
+                    self.outbox.clear();
                 }
             }
             tag::Q => {
@@ -593,6 +703,7 @@ impl Net {
             name: j.name,
             countdown: comm::PING_TICKS,
             record,
+            queue: crate::outbox::PeerQueue::new(),
         });
         self.mask |= 1 << slot;
         JoinReply { status: JoinStatus::Joined(slot), ..echo }

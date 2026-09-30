@@ -19,12 +19,20 @@
 //! room — each of the 98 layouts names a `room=`, and a room model is a car model drawn by that class
 //! every frame (`frontend-3d.md` §9), after the frame's 2D (the view's list, 0x4D3190) — and a list
 //! box's drop-down switches the test **off** for its stencil (0x4C6683, value 0) and leaves **1**
-//! (0x4C6696) for the rest of that frame. The device starts at 0 (`dx7z.dll` 0x6000A51C), and
-//! 0x4DA890's own 0 / 1 (0x4DA910…0x4DA923) is on the arm without a depth buffer, which `dx7z` never
+//! (0x4C6696) for the rest of that frame. 0x4DA890's own 0 / 1 (0x4DA910…0x4DA923) is on the arm without a depth buffer, which `dx7z` never
 //! takes. So a frame's 2D starts at 10 — the room of the frame before set it — and a list box turns
-//! it to 1 for everything after it: [`begin_frame`] and [`set_alpha_test`]. APPROXIMATION: the
-//! first front-end frame after the device is made, or after a race (whose last car draw also leaves
-//! 10, `thrash.md` §6d.4), is taken as a steady one.
+//! it to 1 for everything after it: [`begin_frame`] and [`set_alpha_test`]. After a race the state is
+//! the steady 10 (the race's last car draw is the same `R3DCarLOD::draw`, `thrash.md` §6d.4 —
+//! CONFIRMED 2026-09-30). **The first frame after the device is made, observed on the
+//! original (Wine, `Drivers/dx7z.dll`, gdb on `_THRASH_setstate` 0x60003AC0, 2026-09-30 SV):** the
+//! device does not start at 0 — dx7z's own init (0x6000A6BF…0x6000A6D7) reads its `ALPHATEST`
+//! config key (default 0x10) and calls `setstate(0x24, 16)`, so the movies' 2D draws run at 16;
+//! the capability probe (0x44E8B3) writes 0x80 and puts the old 16 back (0x44E8C7). The first
+//! setter after that in the trace is the view flush's own 10 (0x466673, then 160 and 10 again,
+//! 0x4666BC / 0x466709) and `R3DCarLOD::draw`'s (0x43C87C), all **before** the first hit of
+//! 0x4DA890 — so the first front-end frame's 2D already sees 10, which is what [`begin_frame`]
+//! takes. The row is closed: 10 is right; the device's own start is 16, not the 0 this note used to say
+//! (`dx7z.dll` 0x6000A51C is another state's code).
 
 use nfs_renderer::{Sprite, SpriteCompare, SpriteDepth};
 use std::cell::Cell;

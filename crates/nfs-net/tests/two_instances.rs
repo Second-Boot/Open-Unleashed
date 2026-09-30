@@ -367,8 +367,16 @@ fn joined_pair(loss: u32) -> (Net, Net) {
 fn run_for(h: &mut Net, c: &mut Net, ms: u64, mut on_tick: impl FnMut(&mut Net, &mut Net)) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let (mut got_h, mut got_c) = (Vec::new(), Vec::new());
     let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    // the client's send queue and the host's peer queues are pumped 32 times a second by the room's
+    // loop (0x48EE90, 0x48B4F0); a test has none
+    let mut next_pump = std::time::Instant::now();
     while std::time::Instant::now() < end {
         on_tick(h, c);
+        if std::time::Instant::now() >= next_pump {
+            h.pump_outbox();
+            c.pump_outbox();
+            next_pump += std::time::Duration::from_micros(31_250);
+        }
         for e in h.poll() {
             if let Event::Data { bytes, .. } = e {
                 got_h.push(bytes);

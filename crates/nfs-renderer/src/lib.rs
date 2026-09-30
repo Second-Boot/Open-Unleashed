@@ -121,7 +121,8 @@ pub struct MaterialDesc {
 /// two independent tests, **not** one falling through to the other:
 ///
 /// * `[0x657424]` (`REPLAY`) **≥ 2** (playing back or exhausted) picks between `Double` (the
-///   smoothed value `[0x627ED8]` under 37.5) and [`PerItem`](Self::PerItem) (0x44ECAA…0x44ECDC) —
+///   view slot 0's half-angle `[0x627ED8]` in degrees — the trackside camera's zoom, not a frame
+///   time (corrected 2026-09-30) — under 37.5) and [`PerItem`](Self::PerItem) (0x44ECAA…0x44ECDC) —
 ///   the player-speed test below is *not* reached on this path;
 /// * `REPLAY` **< 2** picks between `Single` (the player car's `+0x35C` ≥ 15.0) and `PerItem`
 ///   (0x44ECC4…0x44ECDC) — the frame-rate test is *not* reached on this path.
@@ -210,20 +211,27 @@ pub struct DrawItem {
     /// Drawn in the sky pass (0x45D4F0): fogged with [`Scene::sky_fog`] over that pass's planes
     /// 0.15 / 700 rather than with [`Scene::fog`].
     pub sky_pass: bool,
+    /// The W the fog reads for this item, in metres, when it is not the geometric view depth: the
+    /// sun's screen quad (0x451710, `rhw` 1) has W = 1 whatever the plane it is laid in — the port
+    /// lays it at twice the mirror's near plane, the mirror's projection keeping near 1 where the
+    /// sky pass's own is 0.15 (0x45D51D). 0 = the geometric depth.
+    pub fog_w: f32,
     /// [`FakeSortMode::PerItem`]'s own test (`[0x61975C]` under 10000, `LayerFalseSort1`/`2`'s
-    /// `mode 1` fold, `RE/notes/thrash.md` §6d.4): set by whichever drawer queued this item from
-    /// its own `round(d²)` sort key (`RE/RENDERING.md` "The view's lists") being under 10000 —
-    /// the same squared-distance-from-the-eye value the static/mid-ground drawer already sorts
-    /// the track's view lists by. APPROXIMATION: the original's exact source field for
-    /// `[0x61975C]` was read to the instruction only for the breakable-piece drawer (0x4500BE,
-    /// `[item+0xC]`); reusing the view-list key for every drawer is the port's own choice, not
-    /// itself traced. Unused outside a `false_sort` material.
+    /// `mode 1` fold, `RE/notes/thrash.md` §6d.4): the value is the queued entry's own `+0xC` key
+    /// (`round(d²)` / `round(v)`, `RE/RENDERING.md` "The view's lists"). Read to the instruction
+    /// (2026-09-30, `xrefs 0x61975C`): the global has exactly two writers — `RDrawAnimArticleBundle`'s
+    /// draw 0x450010 (`mov [0x61975C], eax` at 0x4500BE, `eax = [item+0xC]`) and
+    /// `RDrawArticleBundle`'s draw 0x450CA0 (0x450CE2, `edx = [ebx+0xC]`) — and two readers, the
+    /// `LayerFalseSort` fold 0x449AB2 / 0x449B02. The only materials with the fold are the track's
+    /// (`world.rs`'s `false_sort`), whose every draw comes through one of the two writers just before
+    /// it, so the item's own queue key is exactly what the fold reads. Unused outside a
+    /// `false_sort` material.
     pub fakesort_near: bool,
 }
 
 impl DrawItem {
     pub fn new(mesh: MeshId, material: MaterialId, transform: Mat4) -> Self {
-        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, alpha_ref: 10, sky: None, main_view_only: false, sky_pass: false, fakesort_near: false }
+        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, alpha_ref: 10, sky: None, main_view_only: false, sky_pass: false, fog_w: 0.0, fakesort_near: false }
     }
 }
 
@@ -325,6 +333,10 @@ pub struct Sprite {
     /// its own colour (`pos` / `size` / `rotation` / `color` are then unused) — for the HUD's
     /// untextured polygons such as H321Go's sweep (0x466100) and the billboard's mitred frame.
     pub tri: Option<([[f32; 2]; 3], [[f32; 4]; 3])>,
+    /// One colour per corner of the quad — upper-left, upper-right, lower-right, lower-left, the
+    /// order of `HGraphicVisual`'s vertex slots `+0x5C…+0x68` (0x423D70) — instead of the single
+    /// `color`, interpolated across the textured, rotated quad (the map's cop blips, 0x433110).
+    pub corner_colors: Option<[[f32; 4]; 4]>,
     /// `None`: the port's plain 2D draw — no depth test, no depth write, no alpha test, which is
     /// the original's pixel for every sprite not drawn under a depth mask. `Some`: the front end's
     /// own depth state for this draw ([`SpriteDepth`]).
@@ -397,6 +409,13 @@ pub struct Scene {
 /// the runtime fogs on that W or on the screen z `sz` (the game never hands the device a projection
 /// matrix — no Thrash 0x1A7 in the image). On `sz`, which runs 0…1 over the view, the shipped
 /// densities (at most 0.28³ ≈ 0.02) would fog nothing visibly; on W they are the tracks' haze.
+/// **Observed on the running original (2026-10-01 SV, Wine d3d7 under `Drivers/dx7z.dll`, gdb on
+/// `_THRASH_setstate` 0x60003AC0, alps with `skyrendering = 2`):** the device reports WFOG
+/// (`[0x60033F6C]` = 1), the game sets 0x15 ← 4, 0x0E ← 0.003171 and 0.001409 (the cubed weather
+/// densities), 0x0F ← 0x8A6656, 0x15 ← 1, and the countdown frame shows the blue-grey haze over the far
+/// hills that density gives on W (`exp(−0.0032 · 100 m)` = 0.73); on the screen z the same density
+/// would be 0.997 — invisible. So the runtime fogs on the W, as the port does. Still Wine's
+/// d3d7 (`fog_coord` / W), not a 2000-era card's driver: the row is closed on that reading.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Fog {
     pub colour: [f32; 3],

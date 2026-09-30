@@ -359,20 +359,17 @@ impl CareerUi {
         // car (`0x4EC1A0` read 2026-09-27: `call 0x4f4360` for the record, then the identical paint
         // set / interior / package / decal draw as `0x4F82C0` — `nfs_game::career::used_car_trim`,
         // `career.md` §10.5a). 0x4EC1A0 draws the paint set and interior from the front end's
-        // 0x538040 and the package/decal rolls from the CRT `rand()` 0x5A17C9; the port draws all
-        // four (plus the two `%100` tests) from the one generator it is handed, in that order —
-        // `used_car_trim`'s own APPROXIMATION, not invented here.
-        let mut seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u32).unwrap_or(1) | 1;
-        let mut rand = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 17;
-            seed ^= seed << 5;
-            seed >> 8
-        };
+        // 0x538040 (`FeRng`) and the package/decal rolls from the CRT `rand()` 0x5A17C9
+        // (`glints::crt_rand`), each from its own stream as here. Both are clock-seeded in the
+        // original (0x4E3182 / 0x418100), so the values are unobservable; the streams are a fresh
+        // clock-seeded `FeRng` per call and the layout's shared CRT state.
+        let mut fe_rng = nfs_game::opponents::FeRng::from_clock();
+        let mut rand = move || fe_rng.next_u32();
+        let mut crt_draw = || nfs_game::layout::glints::crt_rand() as u32;
         let opponents: Vec<CareerOpponent> = m
             .opponents
             .iter()
-            .filter_map(|(per, car_id)| self.mission_opponent(*per, *car_id, &mut rand))
+            .filter_map(|(per, car_id)| self.mission_opponent(*per, *car_id, &mut rand, &mut crt_draw))
             .collect();
         let scene_suffix = m
             .scene_file(&track.file)
@@ -418,11 +415,10 @@ impl CareerUi {
 
     /// One mission opponent's car — `0x4EC1A0` (read 2026-09-27): the record from `0x4f4360`, then
     /// the same paint set / interior / package / decal draw as a used-car-market car (`0x4F82C0`,
-    /// `nfs_game::career::used_car_trim`, `career.md` §10.5a), in that order. `rand` is the one
-    /// generator the caller hands every draw through (the port's APPROXIMATION of the original's
-    /// two — the front end's `0x538040` for the paint set and interior, the CRT `rand()` 0x5A17C9
-    /// for the package and decal rolls, `career.md` §10.5a).
-    fn mission_opponent(&self, per: i16, car_id: i16, rand: &mut impl FnMut() -> u32) -> Option<CareerOpponent> {
+    /// `nfs_game::career::used_car_trim`, `career.md` §10.5a), in that order. `rand` is the front
+    /// end's `0x538040` (the paint set and interior), `crt` the C runtime's `rand()` 0x5A17C9 (the
+    /// package and decal rolls) — the original's two generators (0x4F82EA…0x4F8452).
+    fn mission_opponent(&self, per: i16, car_id: i16, rand: &mut impl FnMut() -> u32, crt: &mut impl FnMut() -> u32) -> Option<CareerOpponent> {
         let car = self.tables.car(car_id as u16)?.clone();
         if car.sim.is_empty() {
             return None;
@@ -434,7 +430,7 @@ impl CareerUi {
             .find(|p| p.id == per)
             .map(|p| p.skill)
             .unwrap_or([[1.0, 0.0]; 4]);
-        let (paint_set, trim) = nfs_game::career::used_car_trim(car.paint_sets.len(), car.interior_colours.len(), self.tables.package_count, rand);
+        let (paint_set, trim) = nfs_game::career::used_car_trim(car.paint_sets.len(), car.interior_colours.len(), self.tables.package_count, rand, crt);
         let paint = car.paint_sets.get(paint_set as usize).map(|p| p.colours[0]).unwrap_or([0x20, 0x40, 0xC0]);
         Some(CareerOpponent {
             car,
@@ -1366,16 +1362,12 @@ impl CareerUi {
             self.career.record_damage(&self.tables, i, z);
         }
         // 0x4F7DB0 seeds the front end's generator from the clock (0x5A17EB → 0x538110)
-        let mut seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u32).unwrap_or(1) | 1;
-        let mut rand = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 17;
-            seed ^= seed << 5;
-            seed >> 8
-        };
+        let mut fe_rng = nfs_game::opponents::FeRng::from_clock();
+        let mut rand = move || fe_rng.next_u32();
+        let mut crt_draw = || nfs_game::layout::glints::crt_rand() as u32;
         self.career.generate_offers(&self.tables, &mut rand);
         self.career.reprice_market(&self.tables);
-        self.career.refresh_market(&self.tables, &mut rand);
+        self.career.refresh_market(&self.tables, &mut rand, &mut crt_draw);
         // 0x503AD0 clears the era-changed byte `[0x691E81]` (0x503B01) and files nothing
         self.race_flags.era_changed = false;
         // 0x503A50 at 0x4EDF1A: the running pair back to −1
@@ -1383,7 +1375,7 @@ impl CareerUi {
         true
     }
 
-    pub fn finish(&mut self, order: &[usize], times: &[u64; 8], clean: &[bool; 8]) {
+    pub fn finish(&mut self, order: &[usize], times: &[i32; 8], clean: &[bool; 8]) {
         let Some(p) = self.pending.take() else { return };
         if p.mission.is_some() {
             // missions are settled through `finish_mission`
@@ -1426,12 +1418,13 @@ impl CareerUi {
             seed ^= seed << 5;
             seed >> 8
         };
+        let mut crt_draw = || nfs_game::layout::glints::crt_rand() as u32;
         self.career.generate_offers(&self.tables, &mut rand);
         // 0x4F7DB0 then re-prices every market car at its current value (0x4F7E63) and calls
         // 0x4F80C0 to top the market up — so the used-car lot fills after the first career race,
         // not when the career is created
         self.career.reprice_market(&self.tables);
-        self.career.refresh_market(&self.tables, &mut rand);
+        self.career.refresh_market(&self.tables, &mut rand, &mut crt_draw);
         let mut msg = format!("RESULT: P{}  PRIZE ${}", o.result.position, o.result.prize);
         if o.result.bonus > 0 {
             msg += &format!("  BONUS ${}", o.result.bonus);
@@ -2033,6 +2026,13 @@ mod tests {
             seed ^= seed << 5;
             seed >> 8
         };
+        let mut crt_seed = 5u32;
+        let mut crt = move || {
+            crt_seed ^= crt_seed << 13;
+            crt_seed ^= crt_seed >> 17;
+            crt_seed ^= crt_seed << 5;
+            crt_seed >> 8
+        };
         let mut saw_plate = false;
         let mut expect = seed;
         let mut expect_rand = move || {
@@ -2041,10 +2041,17 @@ mod tests {
             expect ^= expect << 5;
             expect >> 8
         };
+        let mut expect_crt_seed = 5u32;
+        let mut expect_crt = move || {
+            expect_crt_seed ^= expect_crt_seed << 13;
+            expect_crt_seed ^= expect_crt_seed >> 17;
+            expect_crt_seed ^= expect_crt_seed << 5;
+            expect_crt_seed >> 8
+        };
         for (per, car_id) in &m.opponents {
             let car = ui.tables.car(*car_id as u16).unwrap();
-            let (want_set, want_trim) = nfs_game::career::used_car_trim(car.paint_sets.len(), car.interior_colours.len(), ui.tables.package_count, &mut expect_rand);
-            let o = ui.mission_opponent(*per, *car_id, &mut rand).expect("every listed opponent car resolves");
+            let (want_set, want_trim) = nfs_game::career::used_car_trim(car.paint_sets.len(), car.interior_colours.len(), ui.tables.package_count, &mut expect_rand, &mut expect_crt);
+            let o = ui.mission_opponent(*per, *car_id, &mut rand, &mut crt).expect("every listed opponent car resolves");
             assert_eq!(o.paint, car.paint_sets.get(want_set as usize).map(|p| p.colours[0]).unwrap());
             assert_eq!(o.decal, want_trim.decal as i32, "same generator, same draw");
             if o.decal != -1 {

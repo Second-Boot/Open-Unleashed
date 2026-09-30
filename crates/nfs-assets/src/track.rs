@@ -25,6 +25,15 @@ pub struct ArticleMeshes {
     pub animation: Option<nfs_formats::crp::AnimTrack>,
     /// The article's position in the `.crp`'s article list.
     pub index: usize,
+    /// Whether the article's bundle owns a `PCollideArticleBundle` (`[bundle+0xC]`): `0x488090`
+    /// (`insertAll(C)`, at 0x488364…0x48839F) `dynamic_cast`s that pointer per bundle and calls
+    /// `0x4750B0` only when it is non-null, and the three constructor call sites of the
+    /// `PCollideArticleBundle` (0x474B90) are the ends of `WInstanceBundle::Load` (0x47860F),
+    /// `WStaticBundle::Load` (0x483796) and `WSceneBundle`'s spawn (0x4830A2). `WAnimBundle`
+    /// (`Anqt` articles) and `WMidGroundBundle` (`Base & 0x6000`) keep the `0` `0x489160` writes
+    /// (0x48916D), so they contribute **no** collision patch and no `kCylinder`/`kBox` object
+    /// (`RE/notes/COVERAGE-2026-09-26.md` §14.80).
+    pub collides: bool,
 }
 
 /// One placement of a library article requested by a `.scn` GEOM element.
@@ -93,7 +102,12 @@ pub fn ambient_colours(crp: &Crp, data: &[u8]) -> std::collections::HashMap<u16,
 /// low 12 bits, 0x448E12) so identical articles do not wobble in step; the port cannot recover
 /// that raw address and uses `phase = 0` for every article (APPROXIMATION — every flag using one
 /// material wobbles in lockstep, where the original staggers them by whatever their allocator
-/// happened to place their UV data at). The layer's own data block `[this+4]` is
+/// happened to place their UV data at). **Observed on the original (2026-10-01 SV, Wine, canyon — the
+/// only shipped track with a mode-2 material, `S_UVAnimate`; gdb at 0x448DF7, `esi & 0xFFF`):** one
+/// layer object served every flag and the phase differed per article — 20 distinct values in 47 calls
+/// (0x280 … 0xFC0, all multiples of 16: 0xFB0, 0x610, 0xCE0, 0x960, 0x600, 0x480, …), i.e. the stagger is
+/// real and large (up to 4095 ticks = 32 s of wobble), but the values are heap addresses the port
+/// cannot reproduce. Kept at 0 rather than invent a spread. The layer's own data block `[this+4]` is
 /// `{u32 mode, i32 rate, …}` (0x448CE9); the port reads only those two dwords.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UvAnimate {
@@ -202,7 +216,7 @@ impl TrackGeometry {
                 }
             }
         };
-        for art in &self.world {
+        for art in self.world.iter().filter(|a| a.collides) {
             push(art, art.transform);
         }
         for inst in &self.instances {
@@ -215,44 +229,6 @@ impl TrackGeometry {
             }
         }
         TriangleGrid::build(tris, cell_size)
-    }
-
-    /// Item centres for `WLineBundle`/`WTrack`'s fitted spatial tree (`0x47BE30`'s "a vector of
-    /// pointers to the items' centres", `RE/RENDERING.md` "The node pass 0x47F400 and the fitted
-    /// tree's split 0x47BE30"): one per placed world article and one per resolved `.scn`
-    /// instance — the same population [`Self::collision_grid`] turns into triangles
-    /// (`RE/notes/particles.md` §0/§10.1's own APPROXIMATION: "the world's box is the port's
-    /// collision triangles' box... the same items `0x47B660` walks, only their vertices"). Each
-    /// item's centre here is its own transformed mesh AABB's centre in the xz plane (the original
-    /// takes the item's rotated eight box corners — `main.rs`'s "Read 2026-09-27" note on the skid
-    /// grid's own box — an axis-aligned AABB centre is the same point for an unrotated article and
-    /// only an APPROXIMATION for a rotated one).
-    pub fn item_centres(&self) -> Vec<(f32, f32)> {
-        let mut out = Vec::new();
-        let mut bounds = |art: &ArticleMeshes, m: glam::Mat4| {
-            let (mut min, mut max) = (glam::Vec3::splat(f32::INFINITY), glam::Vec3::splat(f32::NEG_INFINITY));
-            let mut any = false;
-            for mm in &art.meshes {
-                for v in &mm.mesh.vertices {
-                    let p = m.transform_point3(glam::Vec3::from(v.position));
-                    min = min.min(p);
-                    max = max.max(p);
-                    any = true;
-                }
-            }
-            if any {
-                out.push(((min.x + max.x) * 0.5, (min.z + max.z) * 0.5));
-            }
-        };
-        for art in &self.world {
-            bounds(art, art.transform);
-        }
-        for inst in &self.instances {
-            if let Some(art) = self.library.iter().find(|a| a.tag == inst.tag) {
-                bounds(art, inst.transform * glam::Mat4::from_scale(inst.scale));
-            }
-        }
-        out
     }
 }
 
@@ -471,7 +447,8 @@ impl TrackAssets {
             let transform = g.transform.as_ref().map(tr_to_mat4).unwrap_or(glam::Mat4::IDENTITY);
             let (is_lib, tag) = g.base.as_ref().map(|b| (b.is_library(), b.tag_u32())).unwrap_or((false, 0));
             let animation = self.crp.article_animation(&self.crp_data, a);
-            let item = ArticleMeshes { name: g.name.clone(), meshes, lods, transform, tag, animation, index };
+            let collides = !matches!(self.crp.bundle_of(&self.crp_data, a), Ok(nfs_formats::crp::BundleKind::Anim | nfs_formats::crp::BundleKind::MidGround));
+            let item = ArticleMeshes { name: g.name.clone(), meshes, lods, transform, tag, animation, index, collides };
             if is_lib { library.push(item) } else { world.push(item) }
         }
         let mut instances = Vec::new();
@@ -631,7 +608,7 @@ mod quad_identity_tests {
         assert_eq!(meshes[1].patch_kind, nfs_physics::collision::PatchKind::Triangle);
         assert_eq!(meshes[1].prim_index, 1);
 
-        let article = ArticleMeshes { name: "test".into(), meshes, lods: vec![], transform: glam::Mat4::IDENTITY, tag: 0, animation: None, index: 5 };
+        let article = ArticleMeshes { name: "test".into(), meshes, lods: vec![], transform: glam::Mat4::IDENTITY, tag: 0, animation: None, index: 5, collides: true };
         let geometry = TrackGeometry { world: vec![article], library: vec![], instances: vec![], skipped_primitives: 0 };
         let grid = geometry.collision_grid(20.0, &|_| 1);
         let patches = grid.patches();

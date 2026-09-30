@@ -37,123 +37,19 @@
 //! quadrant per `0x47C2C0`) is wholly pruned (`wholly_pruned`, `0x47F310`'s far-circle-and-wedge
 //! rule) by the *same* eye/forward/`h`/`far`?
 //!
-//! **2026-09-30 update (`COVERAGE-2026-09-26.md`
-//! §14.36):** this now runs the *real* multi-node registration — `0x47BDC0`'s starting-node search
-//! plus `0x489930`'s budgeted footprint spread (`locate`/`spread`, mirroring
-//! `nfs_game::world::cull_tree_locate`/`spread_nodes`) fed the article's *real* footprint box
-//! (`nfs_game::world::CullArticle::footprint_min`/`footprint_max` — `Base`'s own `bbox_min`/
-//! `bbox_max`, `0x477F40`, the `MidGround` `×2.25` scale folded in, `0x47D010`; **not** a
-//! sphere-derived square any more) instead of the single centre-node stand-in the previous pass
-//! used, and an article is pruned only when *every* one of its registered nodes is wholly pruned.
-//! Reproducing `NNN`'s own `alps 993 --autotest 900` regression with this — the real spread, the
-//! real box — still loses the same road-side scenery: the coverage gap is not the footprint-shape
-//! approximation, it is `0x489930`'s own recursion silently skipping a geometrically-overlapping
-//! sibling quadrant that has no child (never split, `0x47BE30`'s 32-item threshold) — see
-//! `nfs_game::world::NODE_PRUNE`'s own doc for the full, to-the-instruction account. The switch
-//! stays off. `h` is swept over a band around the documented default half-angle (`race-logic.md`
-//! §11, `SetSlotView`'s 37.5°/aspect) since its exact value was not traced to the instruction.
+//! **2026-09-30:** the registration is the original's, now in
+//! `nfs_game::fitted_tree` / `nfs_game::world::build_article_nodes` — the tree is built from the
+//! placed articles' first-LOD `vt` vertices over the box-corner root (`tree_population`), the
+//! static and mid-ground articles are spread by their hull through 0x5A0790's polygon-rectangle
+//! test (0x47BDC0 / 0x489930), and the instance and anim articles sit in the one node 0x47BC20
+//! answers for their sphere. The node pass runs in the game (`world::NODE_PRUNE`, on); this census
+//! only measures whether a node the article is registered in ever drops it while its own sphere
+//! passes the per-item test. `h` is swept over a band around the documented default half-angle
+//! (`race-logic.md` §11, `SetSlotView`'s 37.5°/aspect).
 
 use glam::Vec3;
 use nfs_assets::{track::TrackAssets, GamePaths};
 use nfs_game::world::cull_articles;
-
-#[derive(Clone, Copy, Debug)]
-struct Box2 {
-    min: (f32, f32),
-    max: (f32, f32),
-}
-
-fn quadrant_of(b: Box2, q: usize) -> Box2 {
-    let (cx, cz) = ((b.min.0 + b.max.0) * 0.5, (b.min.1 + b.max.1) * 0.5);
-    match q {
-        0 => Box2 { min: b.min, max: (cx, cz) },
-        1 => Box2 { min: (cx, b.min.1), max: (b.max.0, cz) },
-        2 => Box2 { min: (b.min.0, cz), max: (cx, b.max.1) },
-        _ => Box2 { min: (cx, cz), max: b.max },
-    }
-}
-
-/// `0x47BE30`'s split rule verbatim (`skid_tree_census.rs`, `RE/RENDERING.md`,
-/// `COVERAGE-2026-09-26.md` §14.32.1): a quadrant gets a child only when the node's level is under
-/// 13 and (level <= 1, unconditionally, or the quadrant holds 32 or more item centres).
-struct Node {
-    children: [Option<Box<Node>>; 4],
-}
-
-fn build(b: Box2, level: u32, items: &[(f32, f32)]) -> Node {
-    let (cx, cz) = ((b.min.0 + b.max.0) * 0.5, (b.min.1 + b.max.1) * 0.5);
-    let mut quad: [Vec<(f32, f32)>; 4] = Default::default();
-    for &p in items {
-        let q = (p.0 >= cx) as usize + 2 * ((p.1 >= cz) as usize);
-        quad[q].push(p);
-    }
-    let mut children: [Option<Box<Node>>; 4] = [None, None, None, None];
-    for (q, ch) in children.iter_mut().enumerate() {
-        let split = level < 13 && (level <= 1 || quad[q].len() >= 32);
-        if split {
-            *ch = Some(Box::new(build(quadrant_of(b, q), level + 1, &quad[q])));
-        }
-    }
-    Node { children }
-}
-
-/// `0x47BDC0`: the smallest node's own fixed box that still fully holds the footprint box `f`,
-/// descending while the node is internal and exactly one child fully contains it (mirrors
-/// `nfs_game::world::cull_tree_locate`).
-fn locate(node: &Node, b: Box2, level: u32, f: Box2) -> (&Node, Box2, u32) {
-    let (cx, cz) = ((b.min.0 + b.max.0) * 0.5, (b.min.1 + b.max.1) * 0.5);
-    let (fcx, fcz) = ((f.min.0 + f.max.0) * 0.5, (f.min.1 + f.max.1) * 0.5);
-    let q = (fcx >= cx) as usize + 2 * ((fcz >= cz) as usize);
-    if let Some(ch) = &node.children[q] {
-        let qb = quadrant_of(b, q);
-        if f.min.0 >= qb.min.0 && f.max.0 <= qb.max.0 && f.min.1 >= qb.min.1 && f.max.1 <= qb.max.1 {
-            return locate(ch, qb, level + 1, f);
-        }
-    }
-    (node, b, level)
-}
-
-fn footprint_overlaps(f: Box2, b: Box2) -> bool {
-    f.max.0 >= b.min.0 && f.min.0 <= b.max.0 && f.max.1 >= b.min.1 && f.min.1 <= b.max.1
-}
-
-/// `0x489930`: the budgeted footprint spread from `0x47BDC0`'s starting node (mirrors
-/// `nfs_game::world::spread_nodes` — see that function's doc for the exact `n`/weight/`spent`
-/// rule read to the instruction).
-fn spread(node: &Node, b: Box2, level: u32, weight: u32, spent: u32, f: Box2, out: &mut Vec<Box2>) {
-    let is_internal = node.children.iter().any(Option::is_some);
-    if !is_internal {
-        out.push(b);
-        return;
-    }
-    let mut overlaps = [false; 4];
-    let mut n: u32 = 0;
-    for (q, ov) in overlaps.iter_mut().enumerate() {
-        if node.children[q].is_some() {
-            let qb = quadrant_of(b, q);
-            if footprint_overlaps(f, qb) {
-                *ov = true;
-                n += 1;
-            }
-        }
-    }
-    let recurse = match n {
-        0 => false,
-        1 => true,
-        2 | 3 => weight + spent < 8,
-        _ => level < 2,
-    };
-    if !recurse {
-        out.push(b);
-        return;
-    }
-    let new_spent = if n == 1 { spent } else { spent + n * weight };
-    for (q, &ov) in overlaps.iter().enumerate() {
-        if ov {
-            spread(node.children[q].as_ref().unwrap(), quadrant_of(b, q), level + 1, weight + 1, new_spent, f, out);
-        }
-    }
-}
 
 /// `0x47F310`: is the circle `(centre, r)` **wholly outside** the far circle (radius `far`, from
 /// `eye`) or wholly behind one side of the `±h`-degree ground wedge around `forward` (both xz-only,
@@ -240,11 +136,7 @@ fn main() {
     for t in &tracks {
         let Ok(track) = TrackAssets::load(&paths, t) else { continue };
         let arts = cull_articles(&track);
-        let items: Vec<(Vec3, f32, Box2)> = arts
-            .iter()
-            .flatten()
-            .map(|a| (a.centre, a.radius, Box2 { min: (a.footprint_min.x, a.footprint_min.z), max: (a.footprint_max.x, a.footprint_max.z) }))
-            .collect();
+        let items: Vec<(Vec3, f32)> = arts.iter().flatten().map(|a| (a.centre, a.radius)).collect();
         if items.is_empty() {
             println!("{t}: no articles");
             continue;
@@ -256,32 +148,18 @@ fn main() {
         if line.points.is_empty() {
             continue;
         }
-
-        let centres_xz: Vec<(f32, f32)> = items.iter().map(|(c, _, _)| (c.x, c.z)).collect();
-        let (mut min, mut max) = ((f32::INFINITY, f32::INFINITY), (f32::NEG_INFINITY, f32::NEG_INFINITY));
-        for &(x, z) in &centres_xz {
-            min = (min.0.min(x), min.1.min(z));
-            max = (max.0.max(x), max.1.max(z));
-        }
-        let (dx, dz) = (max.0 - min.0, max.1 - min.1);
-        let l = dx.max(dz).max(1.0);
-        let root = Box2 { min: (min.0 - (l - dx) * 0.5, min.1 - (l - dz) * 0.5), max: (0.0, 0.0) };
-        let root = Box2 { min: root.min, max: (root.min.0 + l, root.min.1 + l) };
-        let tree = build(root, 0, &centres_xz);
+        let population = nfs_game::world::tree_population(&track, &arts);
+        let tree = nfs_game::fitted_tree::FittedTree::new(population.min, population.max, &population.points);
+        let (registered, _) = nfs_game::world::build_article_nodes(&tree, &arts);
+        let registered: Vec<&Vec<nfs_game::world::RegisteredNode>> = arts.iter().zip(&registered).filter(|(a, _)| a.is_some()).map(|(_, r)| r).collect();
 
         let mut track_checks = 0u64;
         let mut track_divergences = 0u64;
         let mut examples: Vec<String> = Vec::new();
         let n_pts = line.points.len();
 
-        for (item_idx, (centre, radius, fbox)) in items.iter().enumerate() {
-            let (start, sbox, slevel) = locate(&tree, root, 0, *fbox);
-            let mut boxes = Vec::new();
-            spread(start, sbox, slevel, 1, 0, *fbox, &mut boxes);
-            let node_circles: Vec<((f32, f32), f32)> = boxes
-                .iter()
-                .map(|b| (((b.min.0 + b.max.0) * 0.5, (b.min.1 + b.max.1) * 0.5), 0.7071 * (b.max.0 - b.min.0)))
-                .collect();
+        for (item_idx, (centre, radius)) in items.iter().enumerate() {
+            let node_circles: Vec<((f32, f32), f32)> = registered[item_idx].iter().map(|&(_, cx, cz, r)| ((cx, cz), r)).collect();
 
             // Sample eye positions along the real racing line (every 3rd point keeps this fast).
             for (pi, p) in line.points.iter().enumerate().step_by(3) {

@@ -1410,6 +1410,11 @@ const ROLL_FONTS: [&str; 2] = ["univers11b.ffn", "univers8b.ffn"];
 
 /// The tag the chronicle's picture tiles carry, which the control's own name repeats at 0x5DBBFE.
 const CHRONICLE_PICTURE_TAG: &str = "1111";
+/// The shape-cache entry a chronicle picture's composed mosaic lives under. Entry 0 of the same
+/// pack is the thumbnail's `bi` icon (`set_pack_picture` keeps it under `(file, 0)`): sharing the
+/// key made a picture opened after its own thumbnail draw the 64×36 icon instead of the mosaic
+/// (found when the thumbnails could first select a file, 0x5089C0).
+const CHRONICLE_MOSAIC_ENTRY: usize = usize::MAX;
 
 /// The two fonts `NFS5.BADGE` loads for itself (0x4CF25C, 0x4CF2A0).
 const BADGE_NAME_FONT: &str = "univers14b.ffn";
@@ -2175,7 +2180,7 @@ impl LayoutScreen {
     /// fallback. Names are matched without regard to case; the original's dictionary is
     /// case-sensitive (`std::map` over `memcmp`, 0x4242C0), and every reference in the 72
     /// shipped templates matches its definition exactly, so the two agree on the data.
-    fn reference(&self, e: &nfs_formats::lay::Element, name: &str, depth: u32, measure: bool) -> nfs_formats::ctr::Macro {
+    fn reference(&self, e: &nfs_formats::lay::Element, name: &str, depth: u32) -> nfs_formats::ctr::Macro {
         use nfs_formats::ctr::Macro;
         let name = name.to_lowercase();
         // every identifier of the text comes here, `x1f` of a `0x1f` included
@@ -2234,7 +2239,7 @@ impl LayoutScreen {
             // publishes it (`Part::slot3`, 0x5257CD) before the parts are evaluated again — which
             // is why every tick that changes a watch's text runs the update **twice** (0x4BD349,
             // 0x4BD350), and the input box's bind too (0x4CC577 / 0x4CC57E)
-            (Some(f), true) if text_part && key == "size" => match (measure && depth <= 4).then(|| self.part_extent(e, part)).flatten() {
+            (Some(f), true) if text_part && key == "size" => match (depth <= 4).then(|| self.part_extent(e, part, depth)).flatten() {
                 Some((w, h)) => point(key, f, &format!("{},{}", w as i32, h as i32)),
                 None => Macro::Unanswerable,
             },
@@ -2250,7 +2255,7 @@ impl LayoutScreen {
                 // `size.value` is `label.size.width*2,…`, and letting that resolve would give
                 // every label a box twice its text and move it, because this port implements the
                 // alignment rule as an anchor in the box (`layouts.md` §2.1).
-                None if key == "size" && measure && depth <= 4 => match self.part_extent(e, part) {
+                None if key == "size" && depth <= 4 => match self.part_extent(e, part, depth) {
                     Some((w, h)) => point(key, f, &format!("{},{}", w as i32, h as i32)),
                     None => Macro::Unanswerable,
                 },
@@ -2277,7 +2282,7 @@ impl LayoutScreen {
                 for key in ["pos", "size"] {
                     // a value with no comma is never evaluated (0x527B80), so it cannot fail
                     let Some(v) = self.part_attr(e, p, key).filter(|v| v.contains(',')) else { continue };
-                    if nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)).is_none() {
+                    if nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)).is_none() {
                         out.push((e.class.clone(), name.clone(), key.to_string(), v.to_string()));
                     }
                 }
@@ -2609,7 +2614,7 @@ impl LayoutScreen {
 
     /// What one part of a widget actually covers: a `SHAPE`'s `.fsh` entry at its own pixel size,
     /// or a `TEXT`/`LOCALIZEDTEXT`'s string measured in the font that part draws it in.
-    fn part_extent(&self, e: &nfs_formats::lay::Element, p: &nfs_formats::ctr::Part) -> Option<(f64, f64)> {
+    fn part_extent(&self, e: &nfs_formats::lay::Element, p: &nfs_formats::ctr::Part, depth: u32) -> Option<(f64, f64)> {
         match p.kind() {
             nfs_formats::ctr::PartKind::Shape => {
                 // the same resolution `shape_parts` uses — the part attribute's screen key against
@@ -2619,7 +2624,7 @@ impl LayoutScreen {
                 // tabs could not measure the art they centre their captions over.
                 let file = self.part_attr(e, p, "shapePathName").filter(|v| !v.is_empty())?;
                 let index = match self.part_attr(e, p, "shapeIndex") {
-                    Some(v) => nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0, true)).filter(|n| *n >= 0)? as usize,
+                    Some(v) => nfs_formats::ctr::eval(v, &|n| self.reference(e, n, depth + 1)).filter(|n| *n >= 0)? as usize,
                     None => 0,
                 };
                 let &(_, w, h) = self.shapes.get(&(file.to_string(), index))?;
@@ -2633,7 +2638,7 @@ impl LayoutScreen {
                 // 0x4E7285), both **truncated** (`_ftol` 0x5A0F98) and written over the part's
                 // own `size` with the `"%d,%d"` setter 0x5276E0 (0x4E72A0). Whatever the template
                 // says, a text part's `size` is the measure of the string it holds.
-                let text = self.part_text(e, p, 0)?;
+                let text = self.part_text(e, p, depth)?;
                 let named = e
                     .get("fontPathName")
                     .filter(|f| !f.is_empty())
@@ -2691,7 +2696,7 @@ impl LayoutScreen {
                 }
                 let Some(b) = s[a + 2..].find('%').map(|k| k + a + 2) else { break };
                 let name = s[a + 1..b].to_string();
-                let x = nfs_formats::expr::expand(&name, &|n| self.reference(e, n, depth + 1, true));
+                let x = nfs_formats::expr::expand(&name, &|n| self.reference(e, n, depth + 1));
                 if x.contains(nfs_formats::expr::UNKNOWN) {
                     return None;
                 }
@@ -2786,7 +2791,7 @@ impl LayoutScreen {
         {
             return u;
         }
-        self.box_sized(e, depth, false)
+        self.box_sized(e, depth)
     }
 
     /// The box a widget is **hit-tested** against, which is the template's `size.value` with the
@@ -2810,7 +2815,7 @@ impl LayoutScreen {
         if !live && let Some(p) = self.parts_union(e) {
             return p;
         }
-        self.box_sized(e, 0, live)
+        self.box_sized(e, 0)
     }
 
     /// Every **autosizing** widget whose box disagrees with the union of its own parts —
@@ -2871,13 +2876,13 @@ impl LayoutScreen {
             ) {
                 continue;
             }
-            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)));
+            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)));
             let (px, py) = at("pos").unwrap_or((0, 0));
             // a text part's size is its text's measure whatever the template says (0x4E72A0)
             let text_part = matches!(p.kind(), nfs_formats::ctr::PartKind::Text | nfs_formats::ctr::PartKind::LocalizedText);
             let (pw, ph) = match at("size").filter(|_| !text_part) {
                 Some((w, h)) => (w as f64, h as f64),
-                None => self.part_extent(e, p).unwrap_or((0.0, 0.0)),
+                None => self.part_extent(e, p, 0).unwrap_or((0.0, 0.0)),
             };
             l = l.min(px as f32);
             t = t.min(py as f32);
@@ -2888,7 +2893,7 @@ impl LayoutScreen {
         (any && r - l >= 1.0 && b - t >= 1.0).then_some((r - l, b - t))
     }
 
-    fn box_sized(&self, e: &nfs_formats::lay::Element, depth: u32, measure: bool) -> (f32, f32) {
+    fn box_sized(&self, e: &nfs_formats::lay::Element, depth: u32) -> (f32, f32) {
         if let Some(p) = e.pair("size") {
             return p;
         }
@@ -2899,41 +2904,46 @@ impl LayoutScreen {
         // there: `Rectangle.ctr`'s `size.value=50,50`. §4.116.
         let given = e.parts_of("size");
         if given.len() == 1 {
-            let h = self.box_template(e, depth, measure).map(|(_, h)| h).unwrap_or(0.0);
+            let h = self.box_template(e, depth).map(|(_, h)| h).unwrap_or(0.0);
             return (given[0], h);
         }
         // **A `size=` key present but carrying no token at all is (0, 0), not the template's
         // default.** The one shipped instance is `carcompare.lay` §14, a stray duplicate of
         // §11/12's hairline divider (same `pos=322,~370`, same `color=0x80184258`) whose `size=`
         // line was left blank — the only blank `size=` in any of the 98 shipped `.lay` files
-        // (checked by grep over all of them). The pair parser the `.lay` block's own `pos`/`size`
-        // goes through (`layouts.md`'s note on `pair()`, 0x527BC0…0x527C8B) splits on the comma
-        // and hands **both** halves to the expression evaluator 0x52DC40 unconditionally — there
-        // is no "skip an empty token" guard the way the plain attribute tokenizer at 0x4B5936 has
-        // (that one only ever fires on `size=150,`-style single-comma values, §4.116 above); an
-        // empty half still reaches 0x52DC40. APPROXIMATION: 0x52DC40's own answer for an empty
-        // expression was not traced past its allocator/cache preamble (0x52E5C0, 0x52DF40), so the
-        // **0** here is read off this screen's own evidence, not off that call: the reference
-        // capture (`RE/reference/2026-09-28/pass6_carcompare.jpg`) shows no rectangle at all behind
-        // the "PORSCHE" name graphic, where this port drew a 50×50 teal-grey box before this fix
-        // (`crop_carcompare_badge_port.png`). `layouts.md` "carcompare, read 2026-09-29".
+        // (checked by grep over all of them). **Why (0, 0), read 2026-09-30 (the note of
+        // 2026-09-29 that put this on an "unconditional" pair parser 0x527BC0 was wrong):** the
+        // pair parser is `PointAttribute::slot4` **0x527B80** (vtable 0x5BB0AC + 0x10) and it
+        // cuts the value at its first comma (`strchr` 0x527BA9) — **no comma, nothing is
+        // evaluated** (`je 0x527CAD` at 0x527BB7), so a blank `size=` leaves the attribute what
+        // its constructor **0x527590** made it: the two dwords `[+0x38]`, `[+0x3C]` copied from the
+        // default the control's constructor 0x5246E0 passes for `size` (0x5247FB), a point whose
+        // every stack cell that constructor zeroes (0x5247AF…0x5247E1) — (0, 0). The template's
+        // own `size.value` is never evaluated in its place, because the attribute's string is the
+        // `.lay` value (0x52C000) and that is the empty one. This agrees with the reference
+        // capture (`RE/reference/2026-09-28/pass6_carcompare.jpg`: no rectangle behind the
+        // "PORSCHE" name graphic, where this port drew a 50×50 teal-grey box before this fix,
+        // `crop_carcompare_badge_port.png`). The *evaluator's* answer for an empty half of a
+        // comma pair (`size=150,`) is a different path and also 0: 0x52F84A…0x52F880 → the operand
+        // reader 0x5309E0 → 0x530F0A → 0x530F2F, which only reports error 5 (0x531C30) and returns
+        // `xor eax, eax` (0x530F41). CONFIRMED. `layouts.md` "carcompare, read 2026-09-29".
         if given.is_empty() && e.get("size").is_some_and(|v| v.trim().is_empty()) {
             return (0.0, 0.0);
         }
-        if let Some(p) = self.box_template(e, depth, measure) {
+        if let Some(p) = self.box_template(e, depth) {
             return p;
         }
         (e.float("width").unwrap_or(0.0), e.float("height").unwrap_or(0.0))
     }
 
     /// The class template's own `size.value`, evaluated.
-    fn box_template(&self, e: &nfs_formats::lay::Element, depth: u32, measure: bool) -> Option<(f32, f32)> {
+    fn box_template(&self, e: &nfs_formats::lay::Element, depth: u32) -> Option<(f32, f32)> {
         if depth > 4 {
             return None;
         }
         let c = self.controls.get(&e.class)?;
         let v = c.value("size")?;
-        nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, depth + 1, measure)).map(|(w, h)| (w as f32, h as f32))
+        nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, depth + 1)).map(|(w, h)| (w as f32, h as f32))
     }
 
     /// The widget's position: the block's own `pos`, or the class template's `[control] pos.value`
@@ -2944,7 +2954,7 @@ impl LayoutScreen {
         }
         if let Some(c) = self.controls.get(&e.class)
             && let Some(v) = c.value("pos")
-            && let Some((x, y)) = nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true))
+            && let Some((x, y)) = nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0))
         {
             return (x as f32, y as f32);
         }
@@ -3028,7 +3038,7 @@ impl LayoutScreen {
             if p.kind() != nfs_formats::ctr::PartKind::Rect {
                 continue;
             }
-            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)));
+            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)));
             let Some((x, y)) = at("pos") else { continue };
             let Some((w, h)) = at("size") else { continue };
             // a colour may be a literal or a reference to one of the `data` attributes
@@ -3050,7 +3060,7 @@ impl LayoutScreen {
             return Some(c);
         }
         // a 32-bit pattern: `0xffffffff` is −1 to the evaluator and every bit of it the colour
-        let n = nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0, true))? as u32;
+        let n = nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0))? as u32;
         Some([((n >> 16) & 0xFF) as u8, ((n >> 8) & 0xFF) as u8, (n & 0xFF) as u8, (n >> 24) as u8])
     }
 
@@ -3065,7 +3075,7 @@ impl LayoutScreen {
             if p.kind() != nfs_formats::ctr::PartKind::Rect {
                 continue;
             }
-            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)));
+            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)));
             let (Some((px, py)), Some((pw, ph))) = (at("pos"), at("size")) else { continue };
             let Some(col) = self.part_colour(e, p, "color").filter(|c| c[3] != 0) else { continue };
             out.push((px as f32, py as f32, pw as f32, ph as f32, col));
@@ -3113,7 +3123,7 @@ impl LayoutScreen {
             let (pos, size) = self.place(aspect, x + px, y + py, aw, ah);
             let (u0, u1) = if flip & 1 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
-            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None });
         }
         let Some(c) = self.controls.get(&e.class) else { return };
         for p in c.state_parts(state).iter().filter_map(|n| c.part(n)) {
@@ -3134,7 +3144,7 @@ impl LayoutScreen {
             let Some(col) = self.part_colour(e, p, "foreColor").filter(|c| c[3] != 0) else { continue };
             let (px, py) = self
                 .part_attr(e, p, "pos")
-                .and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)))
+                .and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)))
                 .unwrap_or((0, 0));
             let Some(f) = self
                 .part_attr(e, p, "fontPathName")
@@ -3238,14 +3248,14 @@ impl LayoutScreen {
             let index = match frame.filter(|_| name == "picture") {
                 Some(n) => n,
                 None => match self.part_attr(e, p, "shapeIndex") {
-                    Some(v) => match nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0, true)) {
+                    Some(v) => match nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0)) {
                         Some(n) if n >= 0 => n as usize,
                         _ => continue,
                     },
                     None => 0,
                 },
             };
-            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)));
+            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)));
             let (px, py) = at("pos").unwrap_or((0, 0));
             let (px, py) = (px as f64, py as f64);
             // No size: a `SHAPE` part is always drawn at its **art's** size. `FEShapePart`'s load
@@ -3271,7 +3281,7 @@ impl LayoutScreen {
             // `flip.value=data.flipit`, so the widget's `flipit` mirrors the tab's art
             let flip = self
                 .part_attr(e, p, "flip")
-                .and_then(|v| nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0, true)))
+                .and_then(|v| nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0)))
                 .filter(|n| *n >= 0)
                 .map(|n| n as i64)
                 .unwrap_or_else(|| e.int("flip").unwrap_or(0).max(0));
@@ -3306,7 +3316,7 @@ impl LayoutScreen {
             color: [0.0, 0.0, 0.0, 1.0],
             rotation: 0.0,
             pivot: [0.5, 0.5],
-            tri: None,
+            tri: None, corner_colors: None,
             depth: None,
         };
         vec![bar(0.0), bar(1.0 - w)]
@@ -3733,8 +3743,11 @@ impl LayoutScreen {
     /// null when either is missing) followed by the cast 0x5A134B to `FERT::IntAttribute`
     /// (0x5D7868) answers. The attributes a widget carries are its template's `DATA` part, so
     /// the test is the `.ctr`'s `<key>.type=INT`, whatever value it or the `.lay` holds.
-    /// APPROXIMATION: a key the `.lay` sets that the template does not declare is taken as absent
-    /// (no shipped widget has one).
+    /// A key the `.lay` sets that the template does not declare is taken as absent — UNREACHABLE
+    /// for the one key ever asked (2026-09-30): the only caller asks `disablesound`, and
+    /// all 18 `disablesound=` lines of the 98 shipped `.lay` files (15 layouts; 3 378 elements
+    /// scanned) sit on `NFS5.ListBox` elements, whose `ListBox.ctr` declares `disablesound.type=INT`
+    /// (the only `.ctr` of 75 that names it). No `.lay` sets it on a class that does not declare it.
     pub fn has_int_attr(&self, index: usize, key: &str) -> bool {
         if let Some((k, j)) = self.route(index) {
             return self.groups.get(&k).is_some_and(|g| g.has_int_attr(j, key));
@@ -3811,7 +3824,7 @@ impl LayoutScreen {
         let (x, y) = self.position_of(e);
         let width = self.attr_num(e, "width").unwrap_or(0.0) as f32;
         let (px, py) = match self.controls.get(&e.class).and_then(|c| c.part("selectionbox")).and_then(|p| p.value("pos")) {
-            Some(v) => nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)).map(|(a, b)| (x + a as f32, y + b as f32)).unwrap_or((x, y)),
+            Some(v) => nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)).map(|(a, b)| (x + a as f32, y + b as f32)).unwrap_or((x, y)),
             None => (x, y),
         };
         let sx = px + width - LIST_SCROLLBAR_W;
@@ -3879,7 +3892,7 @@ impl LayoutScreen {
         let panel_w = if full >= max_h { width - LIST_SCROLLBAR_W } else { width };
         let (wx, wy) = self.position_of(e);
         let (px, py) = match self.controls.get(&e.class).and_then(|c| c.part("selectionbox")).and_then(|p| p.value("pos")) {
-            Some(v) => nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0, true)).map(|(a, b)| (wx + a as f32, wy + b as f32)).unwrap_or((wx, wy)),
+            Some(v) => nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)).map(|(a, b)| (wx + a as f32, wy + b as f32)).unwrap_or((wx, wy)),
             None => (wx, wy),
         };
         if !(x >= px && x < px + panel_w && y >= py && y < py + max_h) {
@@ -4523,7 +4536,7 @@ impl LayoutScreen {
         // retires §4.152's last approximation. The port used to offset `x` alone.
         let o = cursor_hot_spot(shape);
         let (pos, size) = self.place(aspect, cx + o, cy + o, w, h);
-        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
+        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None });
     }
 
     /// True once any movie on this screen has played through (0x4E2960).
@@ -4651,10 +4664,10 @@ impl LayoutScreen {
             self.logos.remove(&index);
             return;
         }
-        if self.logos.get(&index).is_some_and(|(f, b)| f == file && *b == 0) {
+        if self.logos.get(&index).is_some_and(|(f, b)| f == file && *b == CHRONICLE_MOSAIC_ENTRY) {
             return;
         }
-        if !self.shapes.contains_key(&(file.to_string(), 0)) {
+        if !self.shapes.contains_key(&(file.to_string(), CHRONICLE_MOSAIC_ENTRY)) {
             let dir = paths.fe_data().join("Chron");
             let entries = GamePaths::find_file(&dir, file)
                 .and_then(|p| std::fs::read(&p).ok().map(|d| (p, d)))
@@ -4712,9 +4725,9 @@ impl LayoutScreen {
                 y0 += tiles[r * cols].height;
             }
             let id = r.upload_texture(&TextureData::single(w, h, rgba));
-            self.shapes.insert((file.to_string(), 0), (id, w as f32, h as f32));
+            self.shapes.insert((file.to_string(), CHRONICLE_MOSAIC_ENTRY), (id, w as f32, h as f32));
         }
-        self.logos.insert(index, (file.to_string(), 0));
+        self.logos.insert(index, (file.to_string(), CHRONICLE_MOSAIC_ENTRY));
     }
 
     /// Point a `NFS5.CarLogo` at a car's logo: `pack` is the car record's +0x147 (`finallogos1`)
@@ -4826,7 +4839,7 @@ impl LayoutScreen {
 
     fn quad(&self, aspect: f32, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) -> Sprite {
         let (pos, size) = self.place(aspect, x, y, w, h);
-        Sprite { texture: self.white, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None }
+        Sprite { texture: self.white, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color, rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None }
     }
 
     /// One gouraud quad of the front end's own primitive **0x4D98D0**, whose four `(x, y, colour)`
@@ -4871,7 +4884,7 @@ impl LayoutScreen {
             color: [1.0; 4],
             rotation: 0.0,
             pivot: [0.5, 0.5],
-            tri: Some(([at(a), at(b), at(d)], [c[a], c[b], c[d]])),
+            tri: Some(([at(a), at(b), at(d)], [c[a], c[b], c[d]])), corner_colors: None,
             depth: None,
         };
         // UL 0, UR 1, BL 2, BR 3 — 0x4D98D0's node stores them BR, BL, TL, UR (swapping the
@@ -5184,7 +5197,7 @@ impl LayoutScreen {
             for (n, ay) in [(frame(0, 1), y), (frame(3, 2), y + h - ARROW_H)] {
                 let Some(&(tex, aw, ah)) = self.shapes.get(&("weeicons.fsh".to_string(), n)) else { continue };
                 let (pos, size) = self.place(aspect, x, ay, aw, ah);
-                out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
+                out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None });
             }
         }
         // the knob: its height is 0x4DAFC5's, and its top 0x4DB220's from the first row
@@ -5630,7 +5643,106 @@ pub fn chronicle_cell(px: f32, py: f32, x: f32, y: f32) -> Option<(usize, usize)
     (col < 5 && row < 3).then_some((col, row))
 }
 
+/// The chronicle slider's geometry, the numbers `FEHorizontalSlider`'s helper works with
+/// (0x4D0B90, 0x4D0CC0, 0x4D0F20): the track (`size=342,21`, the `track` RECT part) and the knob
+/// (`weeicons.fsh` 38, its own size), both at the widget's position — the knob's base offset is the
+/// template's `knob.pos.value` 0,0 (`[helper+0x114]`, 0x4D08BA).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChronicleSliderGeom {
+    /// the widget's index in the layout
+    pub index: usize,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub knob_w: f32,
+    pub knob_h: f32,
+}
+
+impl ChronicleSliderGeom {
+    /// The knob's left edge for accessor index `idx` of `count` — 0x4D0C0C…0x4D0C68:
+    /// `idx * (track - knob) / (count - 1)`, integer, `0` for a single entry.
+    pub fn knob_left(&self, idx: i32, count: i32) -> f32 {
+        let dx = if count > 1 { idx * (self.w - self.knob_w).max(0.0) as i32 / (count - 1) } else { 0 };
+        self.x + dx as f32
+    }
+
+    /// Whether `(px, py)` is on the knob part's rectangle (0x4E2970: left/top inclusive,
+    /// right/bottom exclusive).
+    pub fn on_knob(&self, px: f32, py: f32, idx: i32, count: i32) -> bool {
+        let kx = self.knob_left(idx, count);
+        px >= kx && px < kx + self.knob_w && py >= self.y && py < self.y + self.knob_h
+    }
+
+    /// Whether `(px, py)` is on the `track` part's rectangle.
+    pub fn on_track(&self, px: f32, py: f32) -> bool {
+        px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
+    }
+
+    /// The accessor index a drag has reached — 0x4D0F20: `(mx - anchor) * (count - 1) / (track -
+    /// knob) + start`, `idiv` truncating, before the accessor's setter (0x4BC240) clamps it.
+    pub fn dragged_index(&self, mx: f32, anchor: i32, start: i32, count: i32) -> i32 {
+        let span = (self.w - self.knob_w) as i32;
+        if span == 0 {
+            return start;
+        }
+        (mx as i32 - anchor) * (count - 1) / span + start
+    }
+}
+
+#[cfg(test)]
+mod chronicle_slider_tests {
+    use super::ChronicleSliderGeom;
+
+    fn geom() -> ChronicleSliderGeom {
+        // chronicle.lay: pos 150,350 size 342,21; the knob is `weeicons.fsh` 38, 45 wide, 11 high
+        ChronicleSliderGeom { index: 0, x: 150.0, y: 350.0, w: 342.0, h: 21.0, knob_w: 45.0, knob_h: 11.0 }
+    }
+
+    #[test]
+    fn the_knob_sits_at_index_times_travel_over_count() {
+        let g = geom();
+        // 0x4D0C0C…0x4D0C68: idx * (342 - 45) / (count - 1), integer
+        assert_eq!(g.knob_left(0, 49), 150.0);
+        assert_eq!(g.knob_left(48, 49), 150.0 + 297.0);
+        assert_eq!(g.knob_left(12, 49), 150.0 + (12 * 297 / 48) as f32);
+        assert_eq!(g.knob_left(5, 1), 150.0);
+    }
+
+    #[test]
+    fn a_drag_is_the_inverse_and_truncates_toward_zero() {
+        let g = geom();
+        // 0x4D0F20: (x - anchor) * (count - 1) / (track - knob) + start
+        assert_eq!(g.dragged_index(232.0, 172, 0, 49), 60 * 48 / 297);
+        assert_eq!(g.dragged_index(172.0, 232, 9, 49), (-60 * 48 / 297) + 9);
+        assert_eq!(g.dragged_index(200.0, 200, 7, 49), 7);
+    }
+
+    #[test]
+    fn regions_are_the_knob_and_the_track() {
+        let g = geom();
+        assert!(g.on_knob(150.0, 350.0, 0, 49));
+        assert!(!g.on_knob(195.0, 350.0, 0, 49), "right edge exclusive");
+        assert!(!g.on_knob(160.0, 361.0, 0, 49), "below the knob's 11 rows");
+        assert!(g.on_track(160.0, 361.0));
+        assert!(!g.on_track(160.0, 371.0));
+    }
+}
+
 impl LayoutScreen {
+    /// This screen's `NFS5.CHRONICLESLIDER`, if it has one.
+    pub fn chronicle_slider(&self) -> Option<ChronicleSliderGeom> {
+        let index = self.layout.elements.iter().position(|e| e.class == "NFS5.CHRONICLESLIDER")?;
+        let e = &self.layout.elements[index];
+        let (x, y) = self.position_of(e);
+        let (w, h) = e.pair("size")?;
+        let (knob_w, knob_h) = self
+            .shape_parts_at(e, "normal", None)
+            .into_iter()
+            .find_map(|(_, _, file, i, _)| self.shapes.get(&(file, i)).map(|&(_, dw, dh)| (dw, dh)))?;
+        Some(ChronicleSliderGeom { index, x, y, w, h, knob_w, knob_h })
+    }
+
     /// Which timeline cell the pointer is on, against this screen's own
     /// `NFS5.ChronicleMainBoxControl` (§4.120).
     pub fn chronicle_cell_at(&self, px: f32, py: f32) -> Option<(usize, usize)> {
@@ -6311,7 +6423,7 @@ impl LayoutScreen {
             && let Some(&(tex, sw, sh)) = self.shapes.get(&("weeicons.fsh".to_string(), n))
         {
             let (pos, size) = self.place(aspect, cx0, cy0, sw, sh);
-            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: white, rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
+            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: white, rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None });
         }
         outline(out, cx0 - 1.0, cy0 - 1.0, (cx1 - cx0) + 2.0, (cy1 - cy0) + 2.0, black);
         // 6 — the eight wells, and the selected one in white
@@ -6876,6 +6988,15 @@ impl LayoutScreen {
             if !(self.can_hover(&e.class) || takes_click) || self.state_draws_nothing(e) {
                 continue;
             }
+            // **A hidden widget contributes no box** (`[this+0x10C] & 0x20`, the bit 0x50D910's helper
+            // sets through 0x4C7E80): slot 13 (0x4C86F0) writes four zeros for it, and 0x525A90 fails on
+            // an empty box (`left == right`, 0x525AAF). So the garage button `ID_MERGEDLISTCARSETUP`
+            // hidden under the paint box `ID_MERGEDLISTCOLOR` (same `pos`, and the earlier section, so
+            // the first the hit test tries) takes no pointer — until 2026-09-30 a click on the colour box
+            // fell through to it and opened `garage`.
+            if self.hidden_flags.contains(&i) {
+                continue;
+            }
             let (x, y) = self.position_of(e);
             let (w, h) = self.box_hit(e);
             // `Control::containsPoint` 0x525A90 takes the widget's box (slot 13 → 0x4C8670) and
@@ -6949,7 +7070,7 @@ impl LayoutScreen {
         let Some(n) = self.glint else { return };
         let Some(&(tex, aw, ah)) = self.shapes.get(&("weeicons.fsh".to_string(), n)) else { return };
         let (pos, size) = self.place(aspect, elapsed as f32, y, aw, ah);
-        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, alpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: None });
+        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, alpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None });
     }
 
 }
@@ -7738,7 +7859,7 @@ impl LayoutScreen {
         fe_depth::apply(&mut out[stencil..], mask.stencil);
         let (tex, gw, gh) = g;
         let (pos, size) = self.place(aspect, cx - 18.0, y, gw, gh);
-        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, a8 as f32 / 255.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, depth: Some(mask.inside) });
+        out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, a8 as f32 / 255.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: Some(mask.inside) });
     }
 
     fn text(&self, out: &mut Vec<Sprite>, aspect: f32, f: &BitmapFont, s: &str, x: f32, y: f32, w: f32, align: i64, color: [f32; 4]) {
@@ -7779,13 +7900,13 @@ impl LayoutScreen {
             // `NFS_TEXT_BIG=1` draws the quads four times the size
             let size = if std::env::var("NFS_TEXT_BIG").is_ok() { [size[0] * 4.0, size[1] * 4.0] } else { size };
             let tex = if solid { self.white } else { f.texture() };
-            out.push(Sprite { texture: tex, pos, size, uv_min: uv0, uv_max: uv1, color, rotation: 0.0, pivot: [0.0, 0.0], tri: None, depth: None });
+            out.push(Sprite { texture: tex, pos, size, uv_min: uv0, uv_max: uv1, color, rotation: 0.0, pivot: [0.0, 0.0], tri: None, corner_colors: None, depth: None });
             // `NFS_TEXT_AB=1` repeats each glyph one line lower **in red**, same texture, same UV
             // window, same size — so one image carries the widget's text twice and the only
             // difference between the two is `color.rgb`. The red copy draws and the black original
             // does not (`AUDIT.md` F2).
             if std::env::var("NFS_TEXT_AB").is_ok() {
-                out.push(Sprite { texture: f.texture(), pos: [pos[0], pos[1] + size[1] * 1.2], size, uv_min: uv0, uv_max: uv1, color: [1.0, 0.0, 0.0, 1.0], rotation: 0.0, pivot: [0.0, 0.0], tri: None, depth: None });
+                out.push(Sprite { texture: f.texture(), pos: [pos[0], pos[1] + size[1] * 1.2], size, uv_min: uv0, uv_max: uv1, color: [1.0, 0.0, 0.0, 1.0], rotation: 0.0, pivot: [0.0, 0.0], tri: None, corner_colors: None, depth: None });
             }
         }
     }
@@ -7906,7 +8027,8 @@ impl LayoutScreen {
                     closed = self.draw_template_classes(d, &mut out);
                 }
                 "NFS5.CheckBox" => self.draw_check_box(d, &mut out),
-                "NFS5.CarSettingSlider" => self.draw_car_setting_slider(d, &mut out),
+                // `NFS5.CHRONICLESLIDER` is the same helper (0x4D0B90, `[helper+0x130] == 0`)
+                "NFS5.CarSettingSlider" | "NFS5.CHRONICLESLIDER" => self.draw_car_setting_slider(d, &mut out),
                 "NFS5.ComboBoxSlider" | "NFS5.ColorBox" => self.draw_combo(d, &mut out, &mut overlay),
                 "NFS5.GOTOBUTTON" => self.draw_goto_button(d, &mut out),
                 "NFS5.BOTTOMBARBUTTON" | "NFS5.GRAPHICTABBUTTON" => self.draw_bar_or_graphic_tab(d, &mut out),

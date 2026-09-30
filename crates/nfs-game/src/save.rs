@@ -404,7 +404,7 @@ fn tournaments_from_table(tables: &CareerTables, table: &[u8]) -> std::collectio
             let mut r = EventResult { position: 1, prize: get_u32(table, ev + trn::PRIZE), bonus: get_u32(table, ev + trn::BONUS), points: [0; 8], earned: [0; 8], times: [0; 8], event: Some(e as u8) };
             for d in 0..8 {
                 r.points[d] = get_i16(table, ev + trn::POINTS + d * 2).clamp(0, 9) as u8;
-                r.times[d] = get_u32(table, ev + trn::TIMES + d * 4) as u64;
+                r.times[d] = get_u32(table, ev + trn::TIMES + d * 4) as i32;
                 r.earned[d] = get_u32(table, ev + trn::PRIZE + d * 4) + get_u32(table, ev + trn::BONUS + d * 4);
             }
             // Position is not stored; it is `9 − points` for the player (0x503960).
@@ -684,6 +684,11 @@ pub struct SavedSettings {
     /// less its minimum (0x4BA342 hands `SetSelection` `default − min`, the getter 0x4BA370 adds
     /// `[this+0x24]` = min back). A name the fixed fields above already carry is not written twice.
     pub options: Vec<(String, u32)>,
+    /// `Comms.IPList` (`FECharVectAccessor`, ctor 0x50B8BE with `+0x34 = 0`, so Save 0x4B8D70 writes
+    /// `u32 n`, `n` strings, `u32 selection`, `savegame.md` §6.1): the addresses the peer-to-peer
+    /// screen has collected, newest first (0x4B8B70 inserts at 0), and the selected row. `None`
+    /// leaves the accessor out of the block.
+    pub ip_list: Option<(Vec<String>, u32)>,
 }
 
 /// `Track1.Laps` is a list accessor over the rows "1".."8" (`FEStrings` 420…427, 0x4F9A76) and
@@ -734,6 +739,7 @@ impl Default for SavedSettings {
             deadzone: [[0, 0x80]; 8],
             controls: [None; CONTROL_ROWS],
             options: Vec::new(),
+            ip_list: None,
         }
     }
 }
@@ -828,6 +834,9 @@ pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, 
         if !entries.iter().any(|(n, _)| n == name) {
             entries.push((name.clone(), AccessorValue::Dword(*index)));
         }
+    }
+    if let Some((items, selection)) = &settings.ip_list {
+        entries.push(("Comms.IPList".into(), AccessorValue::CharVect { items: Some(items.clone()), selection: *selection }));
     }
     if let Some((selection, cars)) = &side.opponent_cars {
         entries.push(("OpponentCar.Car".into(), AccessorValue::OpponentCars { selection: *selection, cars: cars.clone() }));
@@ -992,6 +1001,8 @@ pub fn side_from_sav(s: &SaveFile) -> SaveSide {
                 }
                 st.options.push((name.clone(), d));
             }
+            // 0x4B8E00 with `+0x34 == 0`: the strings and the selection as saved
+            (_, AccessorValue::CharVect { items: Some(items), selection }) if name == "Comms.IPList" => st.ip_list = Some((items.clone(), *selection)),
             // 0x4F56F0: the selection through 0x4BC480, then seven cars through 0x4EE6A0
             (_, AccessorValue::OpponentCars { selection, cars }) => opponent_cars = Some((*selection, cars.clone())),
             // 0x4F5B70: the index as saved; the clamp into the garage is the caller's (0x4BC240
@@ -1059,6 +1070,18 @@ mod tests {
         };
         let back = SaveFile::parse(&s.write()).unwrap();
         assert_eq!(saved_controls(&back), vec![("Controller.SteerLeft".to_string(), fields)]);
+    }
+
+    /// `Comms.IPList` rides in the option block as `u32 n`, the strings, `u32 selection` (0x4B8D70)
+    /// and comes back through `side_from_sav`.
+    #[test]
+    fn the_ip_list_round_trips_through_the_accessor_block() {
+        let s = SaveFile {
+            accessors: Some(AccessorBlock { entries: vec![("Comms.IPList".into(), AccessorValue::CharVect { items: Some(vec!["10.0.0.7".into(), "192.168.0.5:1200".into()]), selection: 1 })] }),
+            ..SaveFile::default()
+        };
+        let back = side_from_sav(&SaveFile::parse(&s.write()).unwrap());
+        assert_eq!(back.settings.ip_list, Some((vec!["10.0.0.7".to_string(), "192.168.0.5:1200".to_string()], 1)));
     }
 
     #[test]

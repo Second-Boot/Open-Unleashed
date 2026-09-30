@@ -820,9 +820,13 @@ impl Sky {
         let file = nfs_formats::sky::SkyFile::parse(&track.sky_params.join("\n")).ok();
         // the blocks of the `SKYRENDERING` level (0x45D8F0 → 0x45FB80, `SkyFile::for_level`) — none
         // at level 0 on any shipped track. The port read the `HIGH` block whatever the option said.
-        // APPROXIMATION of an unreachable case: the original builds a level for **every** matching
-        // block; only `default.txt`'s two `LOW` blocks are ever more than one, and every shipped
-        // track has its own file, so the port builds the first
+        // NOT PORTED, unreachable on shipped data (`nfs-formats/examples/sky_blocks.rs`, 2026-09-30):
+        // the original builds a level for **every** matching block (0x45D8F0 loops 0x45FB80's
+        // count) and falls back to `Sky/default.txt` when `<track>.txt` is missing (0x45FBAF…
+        // 0x45FBFA); all 15 shipped tracks have their own file, and each has at most one matching
+        // block at every level (`[0, 1, 1, 0]` at LOW / MEDIUM / HIGH / AMAZING — the only file with
+        // two matching blocks is `default.txt`'s two `LOW`, which no track reaches). The port builds
+        // the first block.
         let block = file.as_ref().and_then(|f| f.for_level(level).first().copied());
         let mut grids = Vec::new();
         // no UV object without a block: nothing drawn from the generator (0x45F3C0 runs as one is
@@ -861,7 +865,9 @@ impl Sky {
             };
             let stages = clouds.iter().filter(|c| c.is_some()).count();
             // a sky map is read in place as 16 × 16 dwords (0x45E640(16, …)); every shipped one is
-            // a 16 × 16 `0x7D`. APPROXIMATION of an unreachable case: any other entry is dropped.
+            // a 16 × 16 `0x7D` (`nfs-game/examples/skymaps.rs`, 2026-09-30: 82 map names over the 15
+            // tracks' blocks of every level, none other). Any other entry would be read in place by
+            // the original whatever its size; the port drops it — not ported, unreachable.
             let map = |n: Option<&str>| n.and_then(find).filter(|t| t.width == 16 && t.height == 16 && t.code == 0x7D).and_then(|t| t.mips.first().cloned());
             for (i, (layer, cloud)) in region.layers.iter().zip(&clouds).take(stages).enumerate() {
                 // unreachable with the shipped files, which list their stages' maps and clouds

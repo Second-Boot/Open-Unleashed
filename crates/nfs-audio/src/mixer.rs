@@ -317,6 +317,10 @@ struct Voice {
     /// fills every request with 0x7F (0x56199F) and 0x4A9A5F writes `0x7F − aux` for the
     /// collision one-shots (slots from 0x30). 0x5906D7 copies it into the voice.
     fx_scale: u8,
+    /// the channel's reverb send `+4` (0x599800; `None` until the voice's start has set it) and
+    /// its wet gain `+8` (0x5980A0)
+    send: Option<f32>,
+    wet: f32,
     /// `voice+0x20` at the start (0x589B54): [`Shared::service_tick`] `[0x6B49A8]` as it stood at
     /// the start — the library service's own tick count, not a start order. *(Until 2026-09-27
     /// this was the port's `VoiceId`, its own start order — see [`pick_victims`].)*
@@ -559,7 +563,7 @@ impl Voice {
             (Some(r), Some(t)) => Envelope::start(r.env_level, r.env_segments, &t.envelope),
             _ => Envelope::start(0x7F, 1, &nfs_formats::bnk::DEFAULT_ENVELOPE),
         };
-        Voice { clip, cur: Cursor::default(), gains: Gains::default(), word, vol16: volume_16(volume), ramp: Ramp::default(), pan: 0x40, looping, finished: false, fx_scale: 0x7F, stamp, patch_pan, level, cents: 0, env, volume_phase: 0, pitch_phase: 0, pulled: false, anchor: false, held: false, bend: 0x40, lowpass: None, table: true }
+        Voice { clip, cur: Cursor::default(), gains: Gains::default(), word, vol16: volume_16(volume), ramp: Ramp::default(), pan: 0x40, looping, finished: false, fx_scale: 0x7F, send: None, wet: 0.0, stamp, patch_pan, level, cents: 0, env, volume_phase: 0, pitch_phase: 0, pulled: false, anchor: false, held: false, bend: 0x40, lowpass: None, table: true }
     }
 
     /// **`Voice_setVolume` 0x566340 → 0x5662B0** on one voice: the int `<< 16` into `voice+0x2C`
@@ -703,19 +707,23 @@ fn fx_send(fx_scale: u8, patch: u8, bus: i8) -> i32 {
     (fx_scale as i8 as i32 * patch as i8 as i32) * bus as i32 / 16129
 }
 
-/// The software path's reverb input for a voice (`[drv+0xD8]` = 0x596A10 when the voice start's
-/// flag 0x10 is clear, 0x58A455…0x58A468): `voice+0x46 / 127` per channel (0x599800), which
-/// 0x5980A0 turns into the channel's wet gain `volume · send · 1.5`. The DirectSound path (flag
-/// 0x10, 0x596400) sends `voice+0x47 / 127` — the `0x80` bus — as the EAX buffer reverb mix
-/// (property set {4A4E6FC0-C341-11D1-B73A-444553540000}) instead. The game never takes that path:
-/// its only voice type is 0x24 (see `pan_gains`).
+/// The software path's reverb send for a voice (`[drv+0xD8]` = 0x596A10 when the voice start's
+/// flag 0x10 is clear, 0x58A455…0x58A468): the byte `voice+0x46` as an int times `[0x5C1788]`
+/// (an f32 1/127, `fild ; fmul ; fstp`, 0x596A1F…0x596A2E), which 0x599800 stores as the channel's
+/// `+4` (0x596A3B). The DirectSound path (flag 0x10, 0x596400) sends `voice+0x47 / 127` — the
+/// `0x80` bus — as the EAX buffer reverb mix (property set {4A4E6FC0-C341-11D1-B73A-
+/// 444553540000}) instead. The game never takes that path: its only voice type is 0x24 (see
+/// `pan_gains`).
 fn reverb_input(fx_scale: u8, patch: u8, bus_c: i8) -> f32 {
-    fx_send(fx_scale, patch, bus_c) as f32 / 127.0 * 1.5
+    (fx_send(fx_scale, patch, bus_c) as f64 * (1.0f32 / 127.0) as f64) as f32
 }
 
-/// The port's return level from its own reverb unit — APPROXIMATION: the library's reverb
-/// (0x6B17D0's channels) is not reproduced, only what goes into it.
-const REVERB_RETURN: f32 = 0.5;
+/// The channel's wet gain `+8` (0x5980A0): `volume · send · 1.5` (`[0x5B246C]`), the volume being
+/// the channel's *current* `+0xC` — recomputed at every send change (0x599800) and, while a gain
+/// ramp runs, at every sample (0x5981CA).
+fn wet_gain(vol_cur: f32, send: f32) -> f32 {
+    (vol_cur as f64 * send as f64 * 1.5) as f32
+}
 
 /// The software mixer's stereo law (`RE/notes/engine-audio.md`, "The pan law"): 0x58E0E0 builds a
 /// 256-step table over the voice's angle (`[0x6B1820 + 4·(angle >> 8)]`, 0x58E290) with channel 0
@@ -965,7 +973,7 @@ impl Shared {
     /// tick. Every voice is resampled to the mix rate by the library's kernel ([`resample`]: the
     /// 16.16 step of 0x596B60 / 0x596A50, the cubic or linear interpolator of `[0x6B48E5]`), mixed
     /// at its channel gains with their ramp (0x598760 / 0x5980C0) into floats of 16-bit scale,
-    /// then the streams, the reverb and the 16-bit store (0x59A350). [`Bridge`] takes these frames
+    /// then the reverb, the streams and the 16-bit store (0x59A350). [`Bridge`] takes these frames
     /// on to the device's rate.
     ///
     /// 0x58FBC0 is handed one part of the driver thread's write, and a block ends where that part
@@ -973,9 +981,6 @@ impl Shared {
     /// a block ended where the device callback's request did.)*
     fn render(&mut self, n: usize, mix_rate: u32) -> Vec<[f32; 2]> {
         let mut out = vec![[0.0f32; 2]; n];
-        // the reverb's input: each voice's output times its effect send (0x589D70) — the
-        // bus the environment level drives (`[0x6B4A0C]`, 0x565CD0), not the whole mix
-        let mut send = vec![0.0f32; n];
         let mut at = 0;
         while at < n {
             if self.clock.left == 0 {
@@ -986,18 +991,9 @@ impl Shared {
                 continue;
             }
             let len = (n - at).min(self.clock.left as usize).min(BLOCK);
-            self.mix_block(&mut out[at..at + len], &mut send[at..at + len], mix_rate);
+            self.mix_block(&mut out[at..at + len], mix_rate);
             self.clock.left -= len as u32;
             at += len;
-        }
-        if self.bus_c != 0 {
-            let rv = self.tail.get_or_insert_with(|| Reverb::new(mix_rate));
-            for (frame, dry) in out.iter_mut().zip(send.iter()) {
-                let w = rv.tick(*dry);
-                for o in frame.iter_mut() {
-                    *o += w * REVERB_RETURN * 32768.0;
-                }
-            }
         }
         // the 16-bit store of the mix (0x59A350), back to the port's float scale
         for frame in out.iter_mut() {
@@ -1087,7 +1083,7 @@ impl Shared {
     /// One block of 0x598760 (≤ [`BLOCK`] frames): each voice pulls its chain once — a one-shot
     /// whose decoder has nothing left fails the pull and is freed before it mixes anything
     /// ([`Voice::pull_fails`], 0x5987DC → 0x598670 → 0x589C00) — then the streams.
-    fn mix_block(&mut self, out: &mut [[f32; 2]], send: &mut [f32], mix_rate: u32) {
+    fn mix_block(&mut self, out: &mut [[f32; 2]], mix_rate: u32) {
         let n = out.len();
         let bus_c = self.bus_c;
         let interp = self.interp;
@@ -1108,9 +1104,20 @@ impl Shared {
             // the level byte (0x589DF0) · `[0x5C1788]` (f32 1/127) as an f32 (0x59697A)
             let vol = (v.level_byte() as f64 * (1.0f32 / 127.0) as f64) as f32;
             let pg = pan_gains(voice_pan(v.pan, v.patch_pan, c.pan_scale));
+            v.gains.set_vol(vol);
             v.gains.set([resample::channel_gain(vol, pg[0]), resample::channel_gain(vol, pg[1])]);
+            // the send (0x599800, at the voice start and at every bus change: 0x596A10) and the
+            // wet gain from the volume as it is now. APPROXIMATION (sub-ulp): 0x598700 raises the
+            // ramp flag on every call, so the original also re-runs the volume ramp — and the wet
+            // gain from it — for a set that changed nothing; the port ramps only on a change, so
+            // there the wet gain keeps the last ramp's f32 accumulation instead of the exact
+            // target's product (a few ulps of a gain of at most 1.5)
+            let send = reverb_input(v.fx_scale, c.fx_send, bus_c);
+            if v.send != Some(send) {
+                v.send = Some(send);
+                v.wet = wet_gain(v.gains.vol[0], send);
+            }
             let ramp = v.gains.ramp(n);
-            let fx = reverb_input(v.fx_scale, c.fx_send, bus_c);
             for (fi, frame) in out.iter_mut().enumerate() {
                 let at = |sc: usize| {
                     resample::interpolate(interp, v.cur.frac, v.cur.pos as i64, |k| {
@@ -1134,9 +1141,16 @@ impl Shared {
                         None => v.gains.cur[ch],
                     };
                     *o = resample::mix_into(*o, xs[ch], g);
-                    if fx != 0.0 {
-                        send[fi] += xs[ch] * g / 32768.0 * fx * 0.5;
-                    }
+                }
+                // the reverb send: the voice's pulled buffer (`[0x6B1758]`, the one every channel
+                // mixes from) at the wet gain into the reverb's input (0x598A90); in the ramp the
+                // volume steps first, in the last channel's pass (0x5981BF…0x5981CF)
+                if let Some(r) = ramping {
+                    let vc = v.gains.ramp_vol_next(&r);
+                    v.wet = wet_gain(vc, send);
+                }
+                if v.wet != 0.0 {
+                    self.tail.get_or_insert_with(|| Reverb::new(mix_rate)).send(fi, xs[0], v.wet);
                 }
                 if ramp.is_some_and(|r| fi + 1 == r.len) {
                     v.gains.ramp_done();
@@ -1149,6 +1163,10 @@ impl Shared {
             self.free(k);
         }
         self.voices.retain(|(_, v)| !v.finished);
+        // the reverb (0x598760 → [0x6B16B8] = 0x598AE0), after the voices and before the streams
+        if let Some(rv) = self.tail.as_mut() {
+            rv.process(out);
+        }
         // streamed sources: a stream is a voice of the library too (0x5612A0 → 0x5898F0), so it
         // takes the same resampler, at the pitch word 4096: 0x5612A0 sets `voice+0x68` (cents)
         // from the descriptor's word `+0`, which 0x561900 clears and the stream header parser
@@ -1349,48 +1367,137 @@ impl Shared {
     }
 }
 
-/// A small Schroeder reverb — four combs into two all-passes, per channel.
-///
-/// APPROXIMATION: the original hands a level to the sound driver's environment
-/// (`Mixer_setEnvParam(0x80, level/2)` and `(0x20, level)`, `engine-audio.md` §4.7) and the driver
-/// owns the DSP, which is not in the data. What is reproduced from the game is *when* the reverb
-/// runs and how loud (`Reverb` in `lib.rs`); the filter itself is ours.
+/// The reverb entries of the driver's default table (0x5E25B0, the only one the game selects:
+/// 0x4AB470 → 0x565C70 with mode 0x28 → 0x5901B0 takes `0x5E25B0` for any mode but 0 and 1, and
+/// mode 1's table `[0x6B4A10]` is never given): the three group counts `+4…+6` are 4 / 0 / 0, so
+/// the network is four all-pass filters in series on one buffer (0x598AE0's group 0; the groups 1
+/// and 2 with their extra buffers are empty), the gain byte `+7` is 0xFA, and the entries from `+8`
+/// are `(delay word BE, coefficient c, damping d)`, delay in ms.
+const REVERB_ENTRIES: [(i32, i32, i32); 4] = [(100, 0x40, 0), (70, 0x40, 95), (49, 0x4C, 0), (34, 0x4C, 95)];
+const REVERB_GAIN_BYTE: i32 = 0xFA;
+
+/// The smallest prime not below `n` — 0x598CD0's search (the smallest divisor ≥ 2 of `n` equals
+/// `n`, else `n + 1`, and again).
+fn next_prime(mut n: i64) -> i64 {
+    loop {
+        let mut d = 2;
+        if n >= 2 {
+            while d <= n && n % d != 0 {
+                d += 1;
+            }
+        }
+        if d == n {
+            return n;
+        }
+        n += 1;
+    }
+}
+
+/// One all-pass with a damped feedback, 0x598D10's state (0x24 bytes) and 0x59BD20's loop.
+struct AllPass {
+    buf: Vec<f32>,
+    /// `+8`, the delay in samples
+    len: usize,
+    /// `+0` and `+4`, the write and the read counter, both counting down through the buffer: they
+    /// start at 0 and `len` and the first pass resets the write one to `+8` (0x598B1E), so they
+    /// stay equal — one counter
+    left: usize,
+    /// `+0x10` / `+0x14`, `c` and `−c`
+    c: f32,
+    nc: f32,
+    /// `+0x1C` / `+0x20`, the feedback's damping and its complement
+    g1: f32,
+    g2: f32,
+    /// `+0x18`, the damping's state
+    state: f32,
+}
+
+impl AllPass {
+    /// 0x598D10 for one entry. The x87 intermediates are f64 (`career.md` §11.4c: the control word
+    /// read 0x027F, 53-bit precision).
+    fn new(rate: u32, (ms, c, d): (i32, i32, i32)) -> Self {
+        // 0x598D62…0x598DBB: `d · [0x5B4A78]` (an f32 1/127) stored, `1 − ` it (the unrounded
+        // product), each times `(byte+7 + 100)` and `[0x5B73F4]` (an f32 1/350), stored
+        let x = d as f64 * (1.0f32 / 127.0) as f64;
+        let g1t = x as f32;
+        let g2t = (1.0 - x) as f32;
+        let k = f32::from_bits(0x3B3B_3EE7) as f64;
+        let g1 = ((REVERB_GAIN_BYTE + 100) as f64 * g1t as f64 * k) as f32;
+        let g2 = ((REVERB_GAIN_BYTE + 100) as f64 * g2t as f64 * k) as f32;
+        let cf = (c as f64 * (1.0f32 / 127.0) as f64) as f32;
+        // 0x598DD3…0x598DED: the delay word `· [0x5B3060]` (an f32 0.001) stored, `rate ·` it
+        // truncated (0x5A0F98), then the next prime (0x598CD0)
+        let secs = (ms as f64 * f32::from_bits(0x3A83_126F) as f64) as f32;
+        let len = next_prime((rate as f64 * secs as f64).trunc() as i64) as usize;
+        Self { buf: vec![0.0; len], len, left: 0, c: cf, nc: -cf, g1, g2, state: 0.0 }
+    }
+
+    /// 0x598AE0's chunk loop over `x`, in place, and 0x59BD20's per-sample body.
+    fn run(&mut self, x: &mut [f32]) {
+        let mut i = 0;
+        while i < x.len() {
+            if self.left < 1 {
+                self.left = self.len;
+            }
+            let m = (x.len() - i).min(self.left);
+            for j in 0..m {
+                let p = self.left - 1 - j;
+                let xin = x[i + j] as f64;
+                let a = xin * self.nc as f64;
+                let b = self.state as f64 * self.g1 as f64;
+                let y = a + self.buf[p] as f64;
+                x[i + j] = y as f32;
+                let z = y * self.c as f64 + xin;
+                let w = (z * self.g2 as f64 + b) as f32;
+                self.buf[p] = w;
+                self.state = w;
+            }
+            self.left -= m;
+            i += m;
+        }
+    }
+}
+
+/// The library's software reverb — the DSP the driver runs itself (0x5901B0 → 0x598D10 sets it up,
+/// 0x598A90 takes each voice's send, 0x598AE0 runs it after the voices of a block). Every voice's
+/// pulled block times its wet gain is summed into one input buffer (`0x6B0A80`, 0x598A90); once a
+/// block, the four all-passes run over it in place, and the result is added — gain 1.0, the same
+/// mono signal — to both output channels (0x598B9B…0x598BC8). It runs for the 2000 blocks after
+/// the last send (`[0x6B1680]`, set to 2000 at the setup 0x598A70, reset to 0 by a send, +1 per
+/// block before the test, 0x598AE5 / 0x598AF2), so the tail rings out however the buses move.
 struct Reverb {
-    combs: [(Vec<f32>, usize, f32); 4],
-    aps: [(Vec<f32>, usize); 2],
+    aps: [AllPass; 4],
+    input: [f32; BLOCK],
+    quiet: u32,
 }
 
 impl Reverb {
     fn new(rate: u32) -> Self {
-        let d = |ms: f32| ((rate as f32 * ms / 1000.0) as usize).max(1);
-        Self {
-            combs: [
-                (vec![0.0; d(29.7)], 0, 0.805),
-                (vec![0.0; d(37.1)], 0, 0.827),
-                (vec![0.0; d(41.1)], 0, 0.783),
-                (vec![0.0; d(43.7)], 0, 0.764),
-            ],
-            aps: [(vec![0.0; d(5.0)], 0), (vec![0.0; d(1.7)], 0)],
-        }
+        Self { aps: REVERB_ENTRIES.map(|e| AllPass::new(rate, e)), input: [0.0; BLOCK], quiet: 2000 }
     }
 
-    fn tick(&mut self, x: f32) -> f32 {
-        let mut y = 0.0;
-        for (buf, i, g) in self.combs.iter_mut() {
-            let v = buf[*i];
-            buf[*i] = x + v * *g;
-            *i = (*i + 1) % buf.len();
-            y += v;
+    /// 0x598A90 for one frame of a voice: `input[at] += x · wet`.
+    fn send(&mut self, at: usize, x: f32, wet: f32) {
+        self.input[at] = resample::mix_into(self.input[at], x, wet);
+        self.quiet = 0;
+    }
+
+    /// 0x598AE0 for a block of `out.len()` frames.
+    fn process(&mut self, out: &mut [[f32; 2]]) {
+        let n = out.len();
+        self.quiet += 1;
+        if self.quiet >= 2000 {
+            return;
         }
-        y *= 0.25;
-        for (buf, i) in self.aps.iter_mut() {
-            let v = buf[*i];
-            let out = v - y * 0.7;
-            buf[*i] = y + v * 0.7;
-            *i = (*i + 1) % buf.len();
-            y = out;
+        for ap in self.aps.iter_mut() {
+            ap.run(&mut self.input[..n]);
         }
-        y
+        for (frame, r) in out.iter_mut().zip(self.input.iter()) {
+            for o in frame.iter_mut() {
+                *o = resample::mix_into(*o, *r, 1.0);
+            }
+        }
+        self.input[..n].fill(0.0);
     }
 }
 
@@ -1697,9 +1804,6 @@ impl AudioOutput {
         let mut g = self.shared.lock().unwrap();
         g.bus_c = p20 as i8;
         g.bus_d = p80 as i8;
-        if g.bus_c == 0 {
-            g.tail = None;
-        }
     }
 
     /// The two buses as `set_env` left them.
@@ -1862,8 +1966,64 @@ mod fx_tests {
         // toward zero, not rounded: 61·127·68 / 16129 = 32.66 → 32; the 0x80 bus 34 → 16.33 → 16
         assert_eq!(super::fx_send(0x7F - 66, 127, 68), 32);
         assert_eq!(super::fx_send(0x7F - 66, 127, 34), 16);
-        // the software path's wet gain: `send / 127 · 1.5` (0x596A10, 0x5980A0)
-        assert!((super::reverb_input(0x7F, 127, 100) - 100.0 / 127.0 * 1.5).abs() < 1e-6);
+        // the software path's send `send · (1/127 f32)` (0x596A10) and the wet gain
+        // `volume · send · 1.5` (0x5980A0)
+        assert!((super::reverb_input(0x7F, 127, 100) - 100.0 / 127.0).abs() < 1e-6);
+        assert!((super::wet_gain(1.0, super::reverb_input(0x7F, 127, 100)) - 100.0 / 127.0 * 1.5).abs() < 1e-6);
+        assert_eq!(super::wet_gain(0.5, 0.0), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod reverb_tests {
+    use super::{next_prime, AllPass, Reverb, BLOCK, REVERB_ENTRIES};
+
+    #[test]
+    fn the_delay_is_the_next_prime_of_the_truncated_frame_count() {
+        assert_eq!(next_prime(0), 2);
+        assert_eq!(next_prime(1), 2);
+        assert_eq!(next_prime(13), 13);
+        assert_eq!(next_prime(14), 17);
+        // 100 / 70 / 49 / 34 ms at 22050 Hz: 2205 → 2207, 1543.5 → 1543, 1080.45 → 1087, 749.7 → 751
+        let l: Vec<usize> = REVERB_ENTRIES.iter().map(|&e| AllPass::new(22050, e).len).collect();
+        assert_eq!(l, [2207, 1543, 1087, 751]);
+    }
+
+    #[test]
+    fn an_all_pass_returns_the_input_at_once_and_its_feedback_one_delay_later() {
+        // entry 0: c = 64/127, no damping (g1 = 0, g2 = 1)
+        let mut ap = AllPass::new(1000, REVERB_ENTRIES[0]);
+        let len = ap.len;
+        assert_eq!(len, 101);
+        let c = ap.c;
+        let mut x = vec![0.0f32; len + 1];
+        x[0] = 1.0;
+        ap.run(&mut x);
+        // y = −c·x + (the empty line) on the way in, then the stored `x + c·y` comes back
+        assert!((x[0] + c).abs() < 1e-6);
+        assert!((x[len] - (1.0 - c * c)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn the_reverb_rings_for_two_thousand_blocks_after_the_last_send() {
+        let mut r = Reverb::new(22050);
+        let mut out = vec![[0.0f32; 2]; BLOCK];
+        // nothing sent: silent, and the input is never touched
+        r.process(&mut out);
+        assert!(out.iter().all(|f| *f == [0.0, 0.0]));
+        r.send(0, 1000.0, 1.0);
+        r.process(&mut out);
+        assert!(out[0][0] != 0.0 && out[0][0] == out[0][1]);
+        for _ in 0..1997 {
+            r.process(&mut out);
+        }
+        assert_eq!(r.quiet, 1998);
+        r.process(&mut out);
+        r.process(&mut out);
+        assert_eq!(r.quiet, 2000);
+        let mut quiet = vec![[0.0f32; 2]; BLOCK];
+        r.process(&mut quiet);
+        assert!(quiet.iter().all(|f| *f == [0.0, 0.0]));
     }
 }
 

@@ -1146,7 +1146,7 @@ impl Renderer {
                 sky_u: item.sky.map_or([0.0; 4], |s| s.u),
                 sky_v: item.sky.map_or([0.0; 4], |s| s.v),
                 // .y the item is drawn in the sky pass (its fog is the sky's)
-                sky_on: [sky_tex(self, item).is_some() as u32 as f32, item.sky_pass as u32 as f32, 0.0, 0.0],
+                sky_on: [sky_tex(self, item).is_some() as u32 as f32, item.sky_pass as u32 as f32, item.fog_w, 0.0],
             };
             let off = i * self.object_stride as usize;
             staging[off..off + std::mem::size_of::<ObjectUniform>()].copy_from_slice(bytemuck::bytes_of(&o));
@@ -1320,7 +1320,12 @@ fn sprite_quad(sp: &Sprite, aspect: f32) -> [SpriteVertex; 6] {
         SpriteVertex {
             pos: [x * 2.0 - 1.0, 1.0 - y * 2.0, z],
             uv: [sp.uv_min[0] + (sp.uv_max[0] - sp.uv_min[0]) * u, sp.uv_min[1] + (sp.uv_max[1] - sp.uv_min[1]) * v],
-            color: sp.color,
+            color: sp.corner_colors.map_or(sp.color, |k| match (u > 0.5, v > 0.5) {
+                (false, false) => k[0],
+                (true, false) => k[1],
+                (true, true) => k[2],
+                (false, true) => k[3],
+            }),
             alpha_ref,
         }
     };

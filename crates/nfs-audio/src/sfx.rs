@@ -408,6 +408,13 @@ const WORD_UNIT: u16 = 0x1000;
 /// all read control word `0x027F` — PC = 53-bit (double), matching the `f64` reading above. Not
 /// promoted to matched: wine's own driver stack, not Microsoft's DX7 on Windows, and no sample
 /// was inside a live tick (the front end could not be driven to a race in the time available).
+///
+/// **In-tick samples, 2026-10-01 (SV, `fe = 0` direct launches, gdb breakpoints inside the live race
+/// loop — the tyre code 0x4A1F25 in the physics tick, once per wheel per tick, ~400 000 hits; the
+/// engine-audio block allocation 0x4ACC6E):** every sample reads `0x027F` (PC = 53-bit double,
+/// rounding nearest), six of them inside live race ticks on coastal, alps and canyon — the `f64`
+/// reading above is what the running original uses under Wine. Still Wine's stack, not Microsoft's
+/// DX7; the row stays on that one reservation.
 pub fn turbo_terms(boost: f32, throttle: u8, rpm: f32, redline: f32, lvl: i32, pitch_base: i32) -> (i32, i32) {
     let (b, r, dbs) = (boost as f64, redline as f64, rpm as f64);
     let f0 = throttle as f64 * b * (1.0f32 / 127.5) as f64;
@@ -1086,11 +1093,14 @@ impl CollisionSfx {
     /// 0x4AA847): the word `pitch >> 4`, no bend. *(Until 2026-09-27 the port stopped the voice at
     /// volume 0, and its pitch was the float `(2.5 · rpm/redline + 0.5) · doppler` rounded to the
     /// word — where the original rounds the f32 to an int (`fistp`) before the `>> 4`.)*
-    /// APPROXIMATION: a zero redline (x87: an infinite or indefinite result) releases the voice.
+    /// A zero redline (`specs[0x94]`, the `.sim`'s `+0x94`, 0x4AA7E5's `fdiv`) is **unreachable in the
+    /// shipped data**: all 86 `.sim` files under the game directory hold a redline of 5500 or more
+    /// (scanned 2026-09-30), and the same field is every gear-change and rpm rule's divisor
+    /// (`ai.md` §8, 0x49DAF3…), so a car with 0 would not run at all. The guard below is only for a
+    /// hand-made file; the original would there take the x87's infinity (every exception masked,
+    /// `career.md` §11.4c) through `fistp` (0x80000000, `>> 4`) — not reproduced, not reachable.
     /// (2026-09-28, `career.md` §11.4c: the nine measured control words all have every exception
-    /// mask bit set — IM DM ZM OM UM PM — so a divide-by-zero here would not trap in the
-    /// original either, it would produce ±infinity; consistent with, but not full evidence for,
-    /// this function's own explicit `redline <= 0.0` guard standing in for that.)
+    /// mask bit set — IM DM ZM OM UM PM.)
     #[allow(clippy::too_many_arguments)]
     pub fn turbo(&mut self, out: &AudioOutput, boost: f32, throttle: u8, rpm: f32, redline: f32, base: i32, gain: i32, pitch_base: i32, pan: u16) {
         let master = (self.engine_level, self.spl.turbo());

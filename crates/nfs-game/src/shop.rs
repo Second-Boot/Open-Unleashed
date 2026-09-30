@@ -13,11 +13,14 @@
 //!   [`RepairItem`] here, naming the installed part by its id (a car carries at most one part of
 //!   an id: installing replaces the same category and type name, 0x518510).
 //!
-//! **APPROXIMATION** (identity only): the original's basket entries are pointers, so an entry whose
-//! part has moved (a spare installed from `carsetup.lay` while it sits in the shop basket) is
-//! simply not found at purchase time. Here a sell entry is the spare's position in the inventory;
-//! purchasing skips one that no longer exists, but a position that now holds another spare would
-//! sell that one.
+//! The original's basket entries are pointers into that inventory's records (0x5155DD / 0x5155FC),
+//! and a record moves between vectors by its pointer (0x518510 erases the pointer from `[0x69A0EC]`
+//! and pushes the same record on the car, 0x518638…0x518708). So a sell entry keeps its part when
+//! the spare is installed from `carsetup.lay`: it still counts in `TOTAL` and its row (0x516500 reads
+//! the record) but the purchase finds nothing in the inventory (0x5182D7…0x5182E5, `return`) and
+//! pays nothing. Here [`ShopItem::Sell`] is a position and [`Career::install_spare`]'s caller turns
+//! the entries of the moved spare into [`ShopItem::Moved`] (and shifts the later positions down by
+//! the erased one) via [`Career::shop_spare_installed`] — the same identity the pointers give.
 
 use crate::career::{Career, CareerError, CareerTables, OwnedCar, car_damage_pct, is_body_part, part_aged_price, part_less, part_repair_cost, part_resale};
 use nfs_formats::career::Part;
@@ -38,6 +41,9 @@ pub enum ShopItem {
     Buy(i16),
     /// an index into [`Career::spares`] — the second section hands out inventory parts (0x5155FC)
     Sell(usize),
+    /// a `Sell` entry whose spare has since been installed (`id`, the record's damage as `f32`
+    /// bits): the pointer's record lives on, on the car — priced by `TOTAL`, never found by 0x5182C0
+    Moved(i16, u32),
 }
 
 /// A `Parts.RepairShoppingList` entry: one installed part and whether it is to be **replaced**
@@ -149,9 +155,9 @@ impl Career {
     ///
     /// So the part it replaces goes to the inventory **first**, and goes even when the new part
     /// then turns out not to be there. The replaced part keeps its damage; so does the new one.
-    pub fn install_spare(&mut self, tables: &CareerTables, car: usize, spare: usize) {
-        let Some(new) = self.spares.get(spare).and_then(|s| tables.parts.iter().find(|p| p.id == s.id)) else { return };
-        let Some(owned) = self.garage.get(car) else { return };
+    pub fn install_spare(&mut self, tables: &CareerTables, car: usize, spare: usize) -> bool {
+        let Some(new) = self.spares.get(spare).and_then(|s| tables.parts.iter().find(|p| p.id == s.id)) else { return false };
+        let Some(owned) = self.garage.get(car) else { return false };
         let old = owned
             .parts
             .iter()
@@ -169,6 +175,23 @@ impl Career {
         owned.parts.push(s.id);
         set_state(owned, s.id, s.state);
         owned.damage_pct = car_damage_pct(tables, owned);
+        true
+    }
+
+    /// The basket after spare `spare` left the inventory for a car (the caller's
+    /// [`Career::install_spare`] returned `true`, `moved` being that spare read beforehand): the
+    /// entries naming it keep their record ([`ShopItem::Moved`]) and the later positions shift down
+    /// by the erased one — what a basket of pointers does by itself.
+    pub fn shop_spare_installed(basket: &mut [ShopItem], spare: usize, moved: SparePart) {
+        for item in basket.iter_mut() {
+            if let ShopItem::Sell(j) = *item {
+                if j == spare {
+                    *item = ShopItem::Moved(moved.id, moved.state.to_bits());
+                } else if j > spare {
+                    *item = ShopItem::Sell(j - 1);
+                }
+            }
+        }
     }
 
     /// **0x518740(part, car)** — `UNINSTALLPART` (0x4F1C40): if the part is on the car
@@ -232,6 +255,7 @@ impl Career {
         match item {
             ShopItem::Buy(id) => tables.parts.iter().find(|p| p.id == id).map(|p| (p, p.state as f32)),
             ShopItem::Sell(i) => self.spare_part(tables, i),
+            ShopItem::Moved(id, bits) => tables.parts.iter().find(|p| p.id == id).map(|p| (p, f32::from_bits(bits))),
         }
     }
 
@@ -242,7 +266,7 @@ impl Career {
         let Some((p, state)) = self.shop_item_part(tables, item) else { return 0 };
         match item {
             ShopItem::Buy(_) => -part_aged_price(p, self.year),
-            ShopItem::Sell(_) => self.part_sell_price(p, state),
+            ShopItem::Sell(_) | ShopItem::Moved(..) => self.part_sell_price(p, state),
         }
     }
 
@@ -301,6 +325,8 @@ impl Career {
                 ShopItem::Buy(id) => {
                     let _ = self.buy_spare(tables, id);
                 }
+                // the record is on a car, not in `[0x69A0EC]` (0x5182D7): nothing to sell
+                ShopItem::Moved(..) => {}
                 ShopItem::Sell(i) => {
                     // 0x5182D7: a part no longer in the inventory is not found and pays nothing
                     if i < self.spares.len() && !sold.contains(&i) {
@@ -508,6 +534,31 @@ mod tests {
         assert_eq!(c.money, -400);
         assert!(b.is_empty());
         assert_eq!(c.spares, vec![SparePart { id: 5, state: 0.0 }, SparePart { id: 1, state: 0.0 }]);
+    }
+
+    /// The basket holds pointers (0x5155FC): a spare installed from `carsetup.lay` keeps its entry
+    /// — still priced by `TOTAL`, never found by 0x5182C0 — and the entries behind it stay on
+    /// their own parts.
+    #[test]
+    fn an_installed_spare_leaves_its_basket_entry_on_the_record() {
+        let (t, mut c) = shop();
+        c.garage[0].parts = vec![2, 1];
+        c.spares = vec![SparePart { id: 5, state: 0.0 }, SparePart { id: 2, state: 10.0 }, SparePart { id: 3, state: 0.0 }];
+        let mut b = Vec::new();
+        c.shop_add(&t, &mut b, ShopItem::Sell(0));
+        c.shop_add(&t, &mut b, ShopItem::Sell(1));
+        c.shop_add(&t, &mut b, ShopItem::Sell(2));
+        let total = c.shop_total(&t, &b);
+        let moved = c.spares[1];
+        assert!(c.install_spare(&t, 0, 1));
+        Career::shop_spare_installed(&mut b, 1, moved);
+        assert_eq!(b.iter().filter(|i| matches!(i, ShopItem::Moved(2, _))).count(), 1);
+        // the total is unchanged: the record lives on, on the car (the replaced part joined the
+        // inventory behind, so nothing before it moved)
+        assert_eq!(c.shop_total(&t, &b), total);
+        c.shop_purchase(&t, &mut b).unwrap();
+        // the two spares still in the inventory (ids 5 and 3) were sold, the moved one was not
+        assert!(!c.spares.iter().any(|s| s.id == 5 || s.id == 3), "{:?}", c.spares);
     }
 
     /// 0x518510 / 0x518740: installing swaps the same category and type name into the inventory,

@@ -33,6 +33,14 @@ pub const TO_ALL: i32 = -1;
 /// A chat line nobody shows: 0x48F3B9 drops `to == -2`. The only sender is the `CTRL-ALT!` report
 /// at 0x48EEF4 (§10.2).
 pub const TO_NOBODY: i32 = -2;
+/// What the room's 32 Hz loop (0x48EE90) needs of the link under it.
+pub trait ChunkLink {
+    /// 0x48AE30, once per turn: `true` when the send queue took the turn.
+    fn pump(&mut self) -> bool;
+    /// 0x48C870 with the chunk.
+    fn send(&mut self, msg: &[u8]);
+}
+
 /// `0x48CD43  mov [esp+0x10], 0xE8` — the largest piece of a file one chunk carries.
 pub const CHUNK: usize = 0xE8;
 /// The chunk header: tag, player, type, word (0x48CD36…0x48CD4B, 0x48CD81 `add edi, 8`).
@@ -498,42 +506,59 @@ impl Room {
     }
 
     /// **0x48EFB5…0x48F02E** with **0x48CCC0** inside it: the clock is `now_ms << 5`, and while it
-    /// is ahead of `net+0x1C` one chunk of the file at the head of `net+0x264` goes and `net+0x1C`
-    /// moves on by 1000. The first call only sets the clock, as 0x48E0EE does when the session opens.
+    /// is ahead of `net+0x1C` one turn runs and `net+0x1C` moves on by 1000. The first call only sets the
+    /// clock, as 0x48E0EE does when the session opens.
     ///
-    /// The loop also asks the link whether it is busy (0x48AE30) and skips the send when it is;
-    /// this port's link never is, so that test is not carried.
-    pub fn tick(&mut self, now_ms: u32) -> Vec<Vec<u8>> {
+    /// A turn is the queue's pump 0x48AE30 (`link.pump()`); only when it answers 0 — the send queue is
+    /// empty, or not enabled yet — does one chunk of the file at the head of `net+0x264` go, through the
+    /// message builder (`link.send`, which registers it in that same queue). A host has no such queue
+    /// (`Room::tick`'s link is never busy).
+    pub fn tick_with(&mut self, now_ms: u32, link: &mut dyn ChunkLink) {
         let now = now_ms.wrapping_shl(5);
         let Some(clock) = self.clock.as_mut() else {
             self.clock = Some(now);
-            return Vec::new();
+            return;
         };
-        let mut out = Vec::new();
         while (now.wrapping_sub(*clock) as i32) > 0 {
-            if let Some(f) = self.outgoing.front_mut()
+            let busy = link.pump();
+            if !busy
+                && let Some(f) = self.outgoing.front_mut()
                 && self.me >= 0
             {
                 let first = f.done == 0;
                 let n = (f.total - f.done).min(CHUNK);
-                out.push(
-                    Chunk {
-                        first,
-                        from: self.me as u8,
-                        kind: f.kind,
-                        word: if first { f.total as u32 } else { f.done as u32 },
-                        bytes: f.bytes[f.done..f.done + n].to_vec(),
-                    }
-                    .encode(),
-                );
+                let msg = Chunk {
+                    first,
+                    from: self.me as u8,
+                    kind: f.kind,
+                    word: if first { f.total as u32 } else { f.done as u32 },
+                    bytes: f.bytes[f.done..f.done + n].to_vec(),
+                }
+                .encode();
                 f.done += n;
                 if f.done >= f.total {
                     self.outgoing.pop_front();
                 }
+                link.send(&msg);
             }
             *clock = clock.wrapping_add(CHUNK_COST);
         }
-        out
+    }
+
+    /// [`Room::tick_with`] over a link that is never busy: the chunks that go out.
+    pub fn tick(&mut self, now_ms: u32) -> Vec<Vec<u8>> {
+        struct Free(Vec<Vec<u8>>);
+        impl ChunkLink for Free {
+            fn pump(&mut self) -> bool {
+                false
+            }
+            fn send(&mut self, msg: &[u8]) {
+                self.0.push(msg.to_vec());
+            }
+        }
+        let mut link = Free(Vec::new());
+        self.tick_with(now_ms, &mut link);
+        link.0
     }
 
     /// **The host's room, 0x48BB50** — a player comes in. The newcomer is told of everyone already

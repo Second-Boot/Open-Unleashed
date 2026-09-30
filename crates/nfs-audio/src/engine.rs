@@ -170,6 +170,12 @@ pub struct EngineSound {
     /// or name only under flags 0x200 / 0x100) — and the init loop 0x4ACCB5…0x4ACCE1 writes the
     /// record's handle (`+0x45C`, −1) but not these two. APPROXIMATION of that undefined start:
     /// (0, 0), the plain arm of [`layer_pan_level`] (no silent pass on the first rise).
+    /// **Observed on the original (2026-10-01 SV, Wine heap, gdb at 0x4ACC6E, coastal / alps, one
+    /// fresh start each):** the block is NOT zero — the 32 layers' `+0x454` / `+0x458` words held heap
+    /// leftovers (pointers and small integers, e.g. `0x00cb3900` / `0x028aae68`), none with a low word
+    /// 0x8000, so the gate `kept.0 == 0x8000 && kept.1 as i8 > 0` was false on every layer, exactly as
+    /// with (0, 0). The words are the allocator's leftovers and differ per heap; the restart case was not
+    /// observed.
     kept: Vec<(u16, i32)>,
     /// `[0x6563C8 + 4·idx]` — the smoothed pedal value
     pedal: i32,

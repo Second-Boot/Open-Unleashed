@@ -61,8 +61,16 @@ fn alps_tree_order_follows_the_bundle_partition() {
     // alps genuinely has articles in at least three of the four bundles (measured 2026-09-28:
     // 181 Instance / 3 Anim / 151 MidGround / 1417 Static, RE/RENDERING.md "Bundle order"), so a
     // real track exercises the ordering, not a vacuous single-bundle case.
+    // `WAnimBundle` has no `PCollideArticleBundle` (`[bundle+0xC] = 0`, `0x488090`'s
+    // `dynamic_cast` at 0x48838B skips it) — no patch and no prop of an `Anqt` article
+    // and neither has `WMidGroundBundle` (its ctor 0x47CC80 goes through 0x489160 too; the three
+    // `PCollideArticleBundle` constructions are the Instance, Static and Scene bundles')
+    assert!(!ranks.contains(&1) && !ranks.contains(&2), "an Anim/MidGround-bundle article reached the collision tree");
+    assert!(
+        !patches.iter().any(|p| matches!(rank_of(p.article), 1 | 2)) && !props.iter().any(|p| matches!(rank_of(p.article), 1 | 2)),
+        "an Anim/MidGround-bundle article's patch or prop exists"
+    );
     assert!(ranks.contains(&0), "no Instance-bundle entries");
-    assert!(ranks.contains(&2), "no MidGround-bundle entries");
     assert!(ranks.contains(&3), "no Static-bundle entries");
 }
 

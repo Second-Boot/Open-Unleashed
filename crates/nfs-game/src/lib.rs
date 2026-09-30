@@ -11,6 +11,7 @@ pub mod carparts;
 pub mod cheats;
 pub mod dialog;
 pub mod end_of_era;
+pub mod fitted_tree;
 pub mod intro;
 pub mod junctions;
 pub mod keyname;

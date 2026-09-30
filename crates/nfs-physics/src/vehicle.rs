@@ -369,6 +369,17 @@ pub struct Vehicle {
     /// 0x40F740 takes `idB = word & 0xFF` (0x40FA38) — CarBody × CarBody, or CarBody × the
     /// smackable's material (a cone: 0x10 Pylon). Output only; 0 until a pair contact.
     pub pair_event: u32,
+    /// `car+0x430`, the event magnitude 0x40F740 reads at the tick's end, **as the tick's writers
+    /// leave it** (batch A6): `GroundImpulse` / `BodyGroundCollide` assign it (0x4960E6,
+    /// 0x496844), the props and the car–car solver assign it (0x4984B8, 0x498575, 0x498EF6,
+    /// 0x496B42…0x496C3E), and the wall pass 0x495020 keeps the **larger** of it and the pass's
+    /// own largest `3·|mag|` (0x49557D…0x495594, on every call, hit or not). Output only.
+    /// 0x40F740 clears it: the app does, after the sparks ([`Self::take_contact`]).
+    pub contact_mag: f32,
+    /// `car+0x438 & 0xEFFF0000`, the kind of the last writer: `0x30000` the body on the ground
+    /// (0x496104), `0x40000` a wall (0x49411E…), `0x50000` a prop or a car (0x498A44, 0x498DB6,
+    /// 0x496CB5…), `0x60000` a bush (0x498F00). 0 when nothing wrote it this tick.
+    pub contact_kind: u32,
     /// `car+0x440…+0x448`, the **last contact point** in world space — read 2026-09-26, CONFIRMED.
     /// The byte scan of `+0x440` / `+0x444` / `+0x448` finds seven writers, all in the collision
     /// code: the wall pass 0x495506 (the car's own **corner** that crossed the edge, the point it
@@ -506,6 +517,8 @@ impl Vehicle {
             pair_event: 0,
             last_contact: Vec3::ZERO,
             last_wall_effect: 0.0,
+            contact_mag: 0.0,
+            contact_kind: 0,
             tracker: PatchTracker::new(Vec3::new(position.x, position.y - wheel_radius, position.z)),
             net_car: false,
             rng: 0x3ADE_68B1,
@@ -1683,8 +1696,20 @@ impl Vehicle {
         let spin = (w.longitudinal.abs() > limit && throttle_byte > 0x80) || (!front && rear_spin);
         let k = if !front && spin { 4.0 } else { k_class };
         // 0x4A1F25 tests `comb > LIM` alone. APPROXIMATION: `comb > 0` is the port's own guard.
-        // With a limit driven below zero (`LoadTransfer` has no floor) and no force at all, the
-        // original divides 0 by 0 here (0x4A1F95 / 0x4A2007) and gets a NaN.
+        // With a limit driven below zero (`LoadTransfer` has no floor) and no force at all
+        // (`comb` exactly 0: needs `d = 0` and a front `v == 0.0` or `u == 0.0`), the original
+        // divides by 0 here (0x4A1F95 / 0x4A2007) and gets ±inf / NaN in both arms — `lateral` and
+        // `longitudinal` are `0 · inf`. Triaged 2026-09-30 (batch A6): STILL OPEN, B-runtime. A
+        // limit `μ·share·g_eff/2 − dz` is negative only when the transfer `dz` outgrows the static
+        // load; the debug counters put into this branch (removed again) saw **no negative limit** in the three
+        // race goldens (8 s each) and a 60 s alps race with three opponents (1921 ticks, all four
+        // wheels each): the case was never reached, so nothing shows what the original's NaN would
+        // do to the car (it would poison every later tick). **Re-observed on the original
+        // (2026-10-01 SV, Wine, `fe = 0` alps race with three opponents, the car idling at the grid, gdb at
+        // 0x4A1F25 printing `limit` = `[esp+0x18]` and `comb` = `[esp+0x14]`): 402 000 evaluations (all
+        // wheels) over ~10 min of race time, minimum limit 0.0, none below it and no `comb == 0 && limit <=
+        // 0` — the case is not reached by a car sitting or rolling gently; a hard landing / roll was not
+        // produced (the original ran at well under 1 frame a second under the breakpoint). STILL OPEN.
         if comb > limit && comb > 0.0 {
             let hard = (tcs && !front && slip_tangent.abs() < 0.15) || (ai && (w.zone > 1 || class == 2));
             if hard {
@@ -2003,6 +2028,8 @@ impl Vehicle {
             // 0x496104) and `BodyGroundCollide` the magnitude `car+0x430 = 4·|vel·n|` (0x496844)
             if let Some(effect) = self.body_ground_collide_mass(mass, n, q, k) {
                 self.ground_sound = Some((effect, self.surface_nibble()));
+                self.contact_mag = effect;
+                self.contact_kind = 0x30000;
             }
             // 0x49C005…0x49C01B: left upside down by the contact, the car is dead
             if self.cos_tilt < 0.0 {
@@ -2534,8 +2561,14 @@ impl Vehicle {
             // `(1 − specs[0x5C])·L3·a` in that operand order. Since `LoadTransfer` no longer floors
             // the limits (b9141f7) a sum can be negative, and the original divides by it.
             // *(Corrected: the port took `max(sum, 1e-6)`, which turned a negative sum into a
-            // divisor of 1e-6.)* APPROXIMATION: an exactly zero sum gives the axle no drive share
-            // here; the original's x87 divide makes ±inf / NaN of it.
+            // divisor of 1e-6.)* An exactly zero sum gives the axle no drive share here, where the
+            // original's x87 divide makes ±inf / NaN of it — **unreachable** (settled 2026-09-30,
+            // batch A6): a sum is `2·μ·share·g_eff/2 ± dz` with `μ ≥ 0.5` in both grip tables
+            // (0x5D0D50 / 0x5D0E4C), `share` the front weight 0.44…0.485 of all 86 shipped
+            // `.sim`s (or its complement), `grip ≥ 1.1`, so zero needs `g_eff = up.y·grip·g` to be
+            // exactly 0 (a car on its side to the last bit) or an exact cancellation with `dz`; a
+            // zero or negative-sum tick was not seen in 84 s of races (the three goldens and a 60 s
+            // alps race) either.
             let share = |x: f32, s: f32| if s == 0.0 { 0.0 } else { x / s };
             let (fs, rs) = (l0 + l1, l2 + l3);
             self.wheels[0].demand = share(a_drive * f * l0, fs) + 0.5 * a_bf;
@@ -2661,8 +2694,12 @@ impl Vehicle {
         // `specs[0x5C] >= 0.01` / rear `<= 0.99`, neutral or undriven `vL.z / circ`, else
         // `rpm / (ratio'[gear]·circ)`, a locked wheel skipped, `·1/64`. The original wraps only
         // above 1 turn and by `ang − round(ang)` (`fistp`, 0x4A2839…0x4A2858), `rem_euclid` here —
-        // the same angle modulo a turn, which is all the drawing reads. APPROXIMATION: the
-        // `ratio != 0` test is the port's guard.
+        // the same angle modulo a turn, which is all the drawing reads. The `ratio != 0` test is the
+        // port's guard and never fires (settled 2026-09-30, batch A6): a driven wheel outside
+        // neutral (`gear != 1`, 0x4A2799…) divides by `ratio'[gear]·circ`, `ratio' = final_drive ·
+        // gear_ratio · 60 / circ` (`specs.rs`), and all 86 shipped `.sim`s have a non-zero final
+        // drive, reverse ratio and ratio in every gear up to `gear_count`, the only zero ratios being
+        // the unused slots of a shorter box, which no gear selects.
         let vz = self.v_local.z;
         for (i, wh) in self.wheels.iter_mut().enumerate() {
             let driven = if i < 2 { specs.front_drive >= 0.01 } else { specs.front_drive <= 0.99 };
@@ -2700,6 +2737,12 @@ impl Vehicle {
             }
         }
         self.orientation = orientation_step(self.orientation, self.angular_velocity * DT64);
+    }
+
+    /// 0x40F740's end of tick for the contact word: the magnitude and the kind, cleared
+    /// (`car+0x430 = car+0x434 = car+0x438 = 0`, 0x40FAFB…0x40FB0D).
+    pub fn take_contact(&mut self) -> (f32, u32) {
+        (std::mem::take(&mut self.contact_mag), std::mem::take(&mut self.contact_kind))
     }
 
     /// `Car_wallCollide` 0x495020 + `WallImpulse` 0x494000 (CONFIRMED): each of the 8 body corners
@@ -2816,6 +2859,12 @@ impl Vehicle {
         }
         self.impact = self.impact.max(max_j);
         self.last_wall_effect = max_effect;
+        // 0x49557D…0x495594: `car+0x430 = max(car+0x430, the pass's largest)`, whether or not a
+        // corner hit; the word (0x49411E…0x4941DE) is written by a hit only
+        self.contact_mag = self.contact_mag.max(max_effect);
+        if hit {
+            self.contact_kind = 0x40000;
+        }
         hit
     }
 
@@ -2849,6 +2898,9 @@ impl Vehicle {
                 2 => {}
                 1 => {
                     self.impact = self.impact.max(15.0);
+                    // 0x498F43: `car+0x430 = 15`, the word `0x50000 | car+0x44C`
+                    self.contact_mag = 15.0;
+                    self.contact_kind = 0x50000;
                     // 0x498F33: `car+0x440 = car+0x330`
                     self.last_contact = self.position;
                     hit = Some((15.0, PropEvent::Prop(0)));
@@ -2859,6 +2911,9 @@ impl Vehicle {
                 3 => {
                     if self.horizontal_speed() > 2.0 {
                         self.impact = self.impact.max(15.0);
+                        // 0x498EF6: `car+0x430 = 15`, the word `0x6000F`
+                        self.contact_mag = 15.0;
+                        self.contact_kind = 0x60000;
                         // 0x498EF0: `car+0x440 = car+0x330`
                         self.last_contact = self.position;
                         hit = Some((15.0, PropEvent::Bush));
@@ -2875,6 +2930,9 @@ impl Vehicle {
             };
             if touched {
                 hit = Some((self.impact, PropEvent::Prop(p.class)));
+                // 0x4984B8 / 0x498575 (the box), 0x498A44 / 0x498DB6 (the word's `0x50000 | class`)
+                self.contact_mag = self.impact;
+                self.contact_kind = 0x50000;
             }
             self.impact = self.impact.max(before);
         }
@@ -4071,6 +4129,11 @@ fn pair_impulse(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, pt: 
         b.pair_event = if a.smackable { 0x50000 | a.material_class } else { 0x50003 };
         a.impact = a.impact.max(eff_a);
         b.impact = b.impact.max(eff_b);
+        // `car+0x430` is assigned (0x496B42…0x496C3E), the word's kind is 5
+        a.contact_mag = eff_a;
+        b.contact_mag = eff_b;
+        a.contact_kind = 0x50000;
+        b.contact_kind = 0x50000;
         // The damage normal is not the contact normal (read 2026-09-26): the local 0x496F38 hands
         // 0x494DF0 is `A.pos − B.pos` (0x496CC3…0x496CF5), normalised in place (0x5328D0 at
         // 0x496D4D) — or `(0, 1, 0)` when the contact normal is exactly zero (0x496CF9…0x496D39),

@@ -80,6 +80,13 @@ impl CrpEntry {
             CrpEntry::Level { c, .. } | CrpEntry::Part { c, .. } => *c,
         }
     }
+    /// The entry's second word, `[record + 8]` in the image — for an `Anqt` level the frame count
+    /// `WAnimBundle::Load` hands the player (0x4777F0 → 0x471490, `iVar4 + 8`).
+    pub fn b(&self) -> u32 {
+        match self {
+            CrpEntry::Level { b, .. } | CrpEntry::Part { b, .. } => *b,
+        }
+    }
     /// Byte length of the referenced data (`a >> 8`).
     pub fn data_len(&self) -> usize {
         (self.a() >> 8) as usize
@@ -412,13 +419,12 @@ impl Crp {
     /// `Anim`'s first dword is the frame count and `Anqt` is exactly 52 bytes a frame: a unit
     /// quaternion, a position with a trailing 1.0, a scale and two words the sampler does not read.
     pub fn article_animation(&self, data: &[u8], art: &Article) -> Option<AnimTrack> {
-        let anim = art.level(b"Anim")?;
+        // `WAnimBundle::Load` (0x4777F0) never looks for an `Anim` part: the player's frame count
+        // is the `Anqt` record's own second word (`[part + 8]`, 0x4779E0…0x4779F4) and its data the
+        // record's offset — an `Anqt` article without an `Anim` part plays like any other
+        // (every shipped one has both, and the same count: `animscale` example)
         let anqt = art.level(b"Anqt")?;
-        let (ao, al) = (anim.data_offset(), anim.data_len());
-        if al < 4 || ao + al > data.len() {
-            return None;
-        }
-        let count = u32::from_le_bytes([data[ao], data[ao + 1], data[ao + 2], data[ao + 3]]) as usize;
+        let count = anqt.b() as usize;
         let (qo, ql) = (anqt.data_offset(), anqt.data_len());
         if count == 0 || ql < count * 52 || qo + ql > data.len() {
             return None;

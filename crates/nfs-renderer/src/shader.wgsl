@@ -275,7 +275,11 @@ fn fogged(in: VsOut, c: vec4<f32>) -> vec4<f32> {
     if fog.w <= 0.0 {
         return c;
     }
-    let d = max(-(globals.view * vec4<f32>(in.world, 1.0)).z, 0.0);
+    var d = max(-(globals.view * vec4<f32>(in.world, 1.0)).z, 0.0);
+    // .z of `sky_on`: an item whose W is its own (the sun's screen quad, `DrawItem::fog_w`)
+    if object.sky_on.z > 0.0 {
+        d = object.sky_on.z;
+    }
     let f = exp(-fog.w * d);
     return vec4<f32>(mix(fog.rgb, c.rgb, f), c.a);
 }

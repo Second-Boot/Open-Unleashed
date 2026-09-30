@@ -468,19 +468,94 @@ pub const SENT_NAMES: &[(u32, &str)] = &[
     (0x145, "SPEECHENDSLICE"),
 ];
 
-/// **0x4B5250** for the values a shipped `fe.txt` writes in the sent bands: an optional `-`, decimal
-/// digits, or `0x` and hex digits. **APPROXIMATION** (direction: the original accepts more): the
-/// symbolic names of its table at 0x5D63A0 (`human`, `ai`, …) and the comma-packed colours are not
-/// read — no id in the sent bands takes them in the shipped file — and such a value reads as 0.
+/// The name table at **0x5D63A0** (143 entries, `{char *name; int value}`, ended by a null name
+/// whose value is 0 — read from the image 2026-09-30): the symbolic values 0x4B5250 accepts for a
+/// number, matched case-insensitively (`_stricmp` 0x5AE3C0) against the **rest of the text from
+/// the letter on**.
+const SYMBOLS: [(&str, u32); 143] = [
+    ("SingleRace", 0x0), ("Pursuit", 0x1), ("Tournament", 0x2), ("KnockOut", 0x3),
+    ("SkillsTest", 0x4), ("GameSetup_kNoComm", 0x0), ("GameSetup_kSplitScreen", 0x1),
+    ("Network", 0x4), ("numCars", 0x9), ("Human", 0x1), ("AI", 0x2), ("Traffic", 0x4),
+    ("Cop", 0x8), ("SuperCop", 0x10), ("Smackable", 0x80), ("HumanCop", 0x41), ("manual", 0x0),
+    ("auto", 0x1), ("Fly", 0x1), ("English", 0x0), ("German", 0x1), ("French", 0x2),
+    ("Spanish", 0x3), ("Italian", 0x4), ("Swedish", 0x5), ("British", 0x6), ("BumperCam", 0x0),
+    ("BumperCam2", 0x1), ("TailCam0", 0x2), ("TailCam1", 0x3), ("TailCam2", 0x4),
+    ("HeliCam0", 0x5), ("HeliCam1", 0x6), ("HeliCam2", 0x7), ("ShotgunCam2", 0x8),
+    ("ShotgunCam3", 0x9), ("CircleCam", 0xA), ("SplineCam", 0xB), ("TVCam", 0xC),
+    ("BlimpCam", 0xD), ("AnimCam", 0xE), ("ReverseCam1", 0xF), ("CopCam1", 0x11),
+    ("CopCam2", 0x12), ("CopCam3", 0x13), ("DirectorsCam", 0x14), ("LastCam", 0x15), ("UP", 0x10),
+    ("RIGHT", 0x20), ("DOWN", 0x40), ("LEFT", 0x80), ("TRIANGLE", 0x1000), ("CIRCLE", 0x2000),
+    ("CROSS", 0x4000), ("SQUARE", 0x8000), ("START", 0x8), ("SELECT", 0x1), ("LEFTSHIFT1", 0x400),
+    ("LEFTSHIFT2", 0x100), ("RIGHTSHIFT1", 0x800), ("RIGHTSHIFT2", 0x200), ("SC_ESC", 0x1),
+    ("SC_1", 0x2), ("SC_2", 0x3), ("SC_3", 0x4), ("SC_4", 0x5), ("SC_5", 0x6), ("SC_6", 0x7),
+    ("SC_7", 0x8), ("SC_8", 0x9), ("SC_9", 0xA), ("SC_0", 0xB), ("SC_MINUS", 0xC),
+    ("SC_EQUAL", 0xD), ("SC_BS", 0xE), ("SC_TAB", 0xF), ("SC_Q", 0x10), ("SC_W", 0x11),
+    ("SC_E", 0x12), ("SC_R", 0x13), ("SC_T", 0x14), ("SC_Y", 0x15), ("SC_U", 0x16), ("SC_I", 0x17),
+    ("SC_O", 0x18), ("SC_P", 0x19), ("SC_LBRACKET", 0x1A), ("SC_RBRACKET", 0x1B),
+    ("SC_ENTER", 0x1C), ("SC_CTRL", 0x1D), ("SC_A", 0x1E), ("SC_S", 0x1F), ("SC_D", 0x20),
+    ("SC_F", 0x21), ("SC_G", 0x22), ("SC_H", 0x23), ("SC_J", 0x24), ("SC_K", 0x25), ("SC_L", 0x26),
+    ("SC_COLON", 0x27), ("SC_QUOTE", 0x28), ("SC_BQUOTE", 0x29), ("SC_LSHIFT", 0x2A),
+    ("SC_Z", 0x2C), ("SC_X", 0x2D), ("SC_C", 0x2E), ("SC_V", 0x2F), ("SC_B", 0x30), ("SC_N", 0x31),
+    ("SC_M", 0x32), ("SC_COMMA", 0x33), ("SC_PERIOD", 0x34), ("SC_QUESTION", 0x35),
+    ("SC_RSHIFT", 0x36), ("SC_PRTSRC", 0x37), ("SC_ALT", 0x38), ("SC_SPACE", 0x39),
+    ("SC_CAPLOCK", 0x3A), ("SC_F1", 0x3B), ("SC_F2", 0x3C), ("SC_F3", 0x3D), ("SC_F4", 0x3E),
+    ("SC_F5", 0x3F), ("SC_F6", 0x40), ("SC_F7", 0x41), ("SC_F8", 0x42), ("SC_F9", 0x43),
+    ("SC_F10", 0x44), ("SC_NUMLOCK", 0x45), ("SC_SCROLLLOCK", 0x46), ("SC_HOME", 0x47),
+    ("SC_UP", 0x48), ("SC_PGUP", 0x49), ("SC_NPMINUS", 0x4A), ("SC_CENTER", 0x4C),
+    ("SC_PLUS", 0x4E), ("SC_END", 0x4F), ("SC_DOWN", 0x50), ("SC_PGDN", 0x51), ("SC_INS", 0x52),
+    ("SC_DEL", 0x53), ("SC_LEFT", 0x4B), ("SC_RIGHT", 0x4D),
+];
+
+/// **0x4B5250**, the number reader of `fe.txt`'s values, byte for byte (read 2026-09-30). One pass
+/// over the text with a value `v`, a sign `s` (1), a radix (10) and a count of commas:
+///
+/// * `' '` (0x20) — `v = 0`, `s = 1`; `','` — the colour packer, then the same reset: with fewer
+///   than two commas before it `pack = ((v << 12) | pack) << 4`, else `pack |= v << 8`, and the
+///   radix goes back to 10 (0x4B5298…0x4B52D6); `'-'` — `s = -1` (0x4B52DB), which then multiplies
+///   **every digit that follows**; `'x'` / `'X'` — radix 16 when `v` is still 0 (0x4B52E3);
+/// * a digit — `v = digit·s + radix·v` (0x4B5300…0x4B530F, wrapping 32 bits); in radix 16 a letter
+///   `A`–`F` / `a`–`f` — `v = (v << 4) + (letter − 0x37 / 0x57)·s` (0x4B531D…0x4B5345);
+/// * any other letter while `v` is 0 — a **name**: the table [`SYMBOLS`] is searched with
+///   `_stricmp` against the text from that letter on, the value becomes the entry's (0 when none
+///   matches: the terminator's value), and the scan jumps to the last byte (0x4B535B…0x4B5392);
+/// * every other byte is skipped — so `1.5` reads 15 and `10abc` reads 10.
+///
+/// The result is `pack + v` (0x4B53A9); an empty text is 0 (0x4B5276).
 pub fn parse_number(text: &str) -> u32 {
-    let t = text.trim();
-    let (neg, t) = t.strip_prefix('-').map_or((false, t), |r| (true, r));
-    let v = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        u32::from_str_radix(h.split(|c: char| !c.is_ascii_hexdigit()).next().unwrap_or(""), 16).unwrap_or(0)
-    } else {
-        t.split(|c: char| !c.is_ascii_digit()).next().unwrap_or("").parse::<u32>().unwrap_or(0)
-    };
-    if neg { v.wrapping_neg() } else { v }
+    let b = text.as_bytes();
+    let (mut v, mut s, mut radix, mut commas, mut pack) = (0i32, 1i32, 10i32, 0u32, 0i32);
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b' ' => (v, s) = (0, 1),
+            b',' => {
+                pack = if commas < 2 { (v.wrapping_shl(12) | pack).wrapping_shl(4) } else { pack | v.wrapping_shl(8) };
+                radix = 10;
+                commas += 1;
+                (v, s) = (0, 1);
+            }
+            b'-' => s = -1,
+            b'x' | b'X' => {
+                if v == 0 {
+                    radix = 16;
+                }
+            }
+            b'0'..=b'9' => v = ((c - b'0') as i32).wrapping_mul(s).wrapping_add(radix.wrapping_mul(v)),
+            _ if radix == 16 && matches!(c, b'A'..=b'F' | b'a'..=b'f') => {
+                let d = if c <= b'F' { c - 0x37 } else { c - 0x57 };
+                v = v.wrapping_shl(4).wrapping_add((d as i32).wrapping_mul(s));
+            }
+            _ if v == 0 && c.is_ascii_alphabetic() => {
+                let rest = &b[i..];
+                v = SYMBOLS.iter().find(|(n, _)| n.as_bytes().eq_ignore_ascii_case(rest)).map_or(0, |&(_, x)| x as i32);
+                i = b.len() - 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    pack.wrapping_add(v) as u32
 }
 
 /// **0x4B5EE0 / 0x4B5470 over `fe.txt`** — the records the file adds to the launch's argument list,
@@ -874,6 +949,21 @@ mod tests {
         assert_eq!((got.number(id::RAND_SEED), got.number(id::TIME), got.number(id::WEATHER), got.number(id::FOG)), (Some(8165), Some(1), Some(2), Some(3)));
         assert_eq!(parse_number("-1"), u32::MAX);
         assert_eq!(parse_number("0x1F"), 31);
+        // 0x4B5250's own readings, worked by hand from the disassembly
+        assert_eq!(parse_number(""), 0);
+        assert_eq!(parse_number("8165"), 8165);
+        assert_eq!(parse_number("-0x10"), (-16i32) as u32); // the sign multiplies every hex digit
+        assert_eq!(parse_number("1.5"), 15); // a byte that is nothing is skipped
+        assert_eq!(parse_number("10abc"), 10); // a letter after a digit is nothing
+        assert_eq!(parse_number("human"), 1); // a name from 0x5D63A0, any case
+        assert_eq!(parse_number("SC_ESC"), 1);
+        assert_eq!(parse_number("KnockOut"), 3);
+        assert_eq!(parse_number("nosuchname"), 0); // the terminator entry's 0
+        assert_eq!(parse_number("English"), 0);
+        assert_eq!(parse_number("Spanish"), 3);
+        // the colour packer: one comma is `(v << 12) << 4`, the value after the last comma is added
+        assert_eq!(parse_number("1,2"), 0x1_0002);
+        assert_eq!(parse_number("1,2,3"), 0x12_0003);
     }
 
     #[test]

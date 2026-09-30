@@ -42,7 +42,7 @@
 //! (0x596080, sequence `0xFFFD`, the ack `conn+0x5E`) when it has run out, and it is rearmed to
 //! `TIMER_FREQ` — a bare ack every second for the life of the connection.
 //!
-//! What the port adds, and says so, is in [`Conn::send_queued`] (the backlog).
+//! What the port adds, and says so, is in [`Conn::send_queued`] (the host's backlog); a client's queue is [`crate::outbox`].
 
 use crate::data::SEQ_WRAP;
 use std::collections::{BTreeMap, VecDeque};
@@ -58,12 +58,12 @@ pub const ACK_ONLY: u16 = 0xFFFD;
 /// The counter runs 0 … 0xFFFB.
 const MOD: u32 = SEQ_WRAP as u32 + 1;
 /// `conn+0x0C`, the frame size the appends are checked against (0x595E1D: `conn+0xC <
-/// frame_len + len + 2` stops the loop). Where it comes from (the `param_3` of 0x5951A0, raised to
-/// `[link+0x1E]`) was not traced: **APPROXIMATION** — the largest payload a datagram carries after
-/// its tag byte, 281 (`0x11A − 1`, `crate::wire::MAX_PAYLOAD`), since a frame longer than that
-/// could not be sent at all. (A first version took 0x200: a frame with two long option records
-/// appended was refused by the socket and never left — found by the two-instance run.)
-pub const MTU: usize = crate::wire::MAX_PAYLOAD;
+/// frame_len + len + 2` stops the loop). 0x5951A0 sets it to `max(6, param_3, byte [param_2+0x1E])`;
+/// the layer is opened by 0x588910 -> 0x5601D0 with `param_3 = 0xFA` (`push 0xFA` at 0x55C8D6 and
+/// 0x55C97E, the two CONMAN connect calls of 0x582750) and `param_2 = 0x5E1AD8`, whose byte at
+/// +0x1E is `0xAD` (173), so the size is **250**. (An earlier version took the datagram's 281 and
+/// a still earlier one 0x200; the original never builds a frame past 250.)
+pub const MTU: usize = 250;
 
 /// `(to − from) mod 0xFFFC`.
 fn dist(from: u16, to: u16) -> u32 {
@@ -222,13 +222,13 @@ impl Conn {
         frame
     }
 
-    /// **PORT GLUE (APPROXIMATION).** A reliable send for a caller that has no way to react to the
-    /// original's "returned 0": with the pool empty, or messages already waiting, the message is
-    /// held (in order) and goes out from [`Conn::poll`] as the pool frees. The original's callers
-    /// either check the return (the room's frames, 0x48B961 — those use [`Conn::can_send`] and
-    /// never come here) or were not traced (the bursts of the launch stream); a queue keeps their
-    /// messages where the original's pool would have dropped some. Direction: nothing is lost that
-    /// the original delivers; a burst of more than seven is delivered late, not lost.
+    /// **PORT GLUE (APPROXIMATION, host only since AK 2026-09-30).** A reliable send for a caller that has no way
+    /// to react to "returned 0": with the pool empty, or messages already waiting, the message is held (in
+    /// order) and goes out from [`Conn::poll`] as the pool frees. The original's client does this with the send
+    /// queue in front of the pool, [`crate::outbox`] (0x48AD70 / 0x48AE30, stop-and-wait), which
+    /// [`crate::session::Net::send_game_to`] now runs for a client. A host's messages go through the room's per-link
+    /// sender (0x48A3D0 / 0x48A4E0 → 0x55C270), whose callers test the return (0x48B961) or drop on a refusal; the
+    /// port's room calls have no such handling, so the host's sends keep this backlog.
     pub fn send_queued(&mut self, body: &[u8], now: i64) -> Option<Vec<u8>> {
         if self.free == 0 || !self.backlog.is_empty() {
             self.backlog.push_back(body.to_vec());
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn an_append_that_would_pass_the_frame_size_is_left_off() {
-        // 0x595E1D: `conn+0xC < frame_len + len + 2` ends the loop — a datagram holds 281 bytes
+        // 0x595E1D: `conn+0xC < frame_len + len + 2` ends the loop — conn+0xC is 250 (0x55C8D6 push 0xFA)
         let mut a = Conn::new(0);
         let big = vec![7u8; 200];
         let _ = a.send(&big, 0).unwrap();

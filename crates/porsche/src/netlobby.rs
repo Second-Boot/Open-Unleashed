@@ -42,11 +42,12 @@ impl App {
     /// would use, the accessors the dump reads (`Car.ABS`, `Car.Traction`, `Car.Roof`,
     /// `Car.Transmission`) and the cheat bits (`network.md` §11.12).
     ///
-    /// **APPROXIMATIONS** (direction: each value is the accessor's own where the port has one):
-    /// `Camera.1 … Camera.4` are sent at the constructor's values 0…3 (0x4E4DB4…0x4E4E68) — the
-    /// port keeps no camera-list choice; `Car.ABS` and `Car.Traction` are read without their
-    /// predicates 0x4F1DA0 / 0x4F1DF0 (a car without the capability would read 0), which the
-    /// walk's later `.ABS` / `.TRACTION` overwrite anyway.
+    /// `Camera.1 … Camera.4` are the port's camera list (`fe.camera_list`, `controls.md` §4.89a; the
+    /// constructor's 0…3, 0x4E4DB4…0x4E4E68, until the screen changes them). `Car.ABS` and
+    /// `Car.Traction` go through their predicates: 0x4F1DA0 / 0x4F1DF0 force the value to 0 when the
+    /// byte `car+0x2E2` / `+0x2E3` of the car `CARSETTINGS.CAR` names is clear (the same read the roof's
+    /// 0x4F1E40 does with `+0x1BF`); the walk's later `.ABS` / `.TRACTION` (0x4EEFCD…0x4EEFF1) still
+    /// overwrite them at the receiver, so this is what the dump's record carries on the wire.
     pub(crate) fn net_own_launch_car(&self) -> Option<nfs_net::launchcar::OwnCar> {
         let m = self.fe.menu.as_ref()?;
         let entry = self.logo_car(Some("zMergedList.Car"), None)?;
@@ -89,8 +90,8 @@ impl App {
             parts,
             tiny: self.cheat_bits & (1 << 1) != 0,
             glass: self.cheat_bits & (1 << 2) != 0,
-            abs_accessor: index("Car.ABS"),
-            traction_accessor: index("Car.Traction"),
+            abs_accessor: if entry.abs { index("Car.ABS") } else { 0 },
+            traction_accessor: if entry.traction { index("Car.Traction") } else { 0 },
             // 0x4F1E40 forces `Car.Roof` to 0 on a car without the convertible flag
             roof_accessor: if entry.cabrio { index("Car.Roof") } else { 0 },
         })
@@ -126,19 +127,23 @@ impl App {
     ///   `[this+0x285]`: the host sets its own `.READY` to 1 (0x509342…) and sends the car's records
     ///   and `(0x255, id, 1)`; the joiner sends `(0x255, id, 0)` and then the car's records.
     /// * **Afterwards** — a new selection of `zMergedList.Car` sends its records again (0x4BC240 while
-    ///   0x4B7F70 holds: mode 1 and a live connection). The original sends on every call; the port
-    ///   compares the car with what it last sent (**APPROXIMATION**: the repeats of an unchanged
-    ///   value are not sent).
+    ///   0x4B7F70 holds: mode 1 and a live connection). The original sends on **every call** of the
+    ///   setter, the value changed or not (0x4BC240: `SetSelection` stores, calls the change hook,
+    ///   and 0x4B7F70 -> slot 1 -> 0x48D550, no comparison), so each step of the list
+    ///   (`Network::lobby_setsel`) sends; a change of the car by another road (the garage
+    ///   toggle) is still seen by comparing the car with what was last sent.
     /// * The joiner's tick 0x50A6A8…0x50A7A3: a player whose car this install lacks, while we are
     ///   ready — notice 814, `.READY` back to 0, `(0x255, id, 0)`.
     pub(crate) fn net_lobby_step(&mut self) {
+        // a call of the setter while 0x4B7F70 does not hold (no live connection, another screen) sends nothing
+        let setsel = std::mem::take(&mut self.net.lobby_setsel);
         if !self.on_lobby_screen() {
             return;
         }
         let Some((me, host)) = self.net.session.as_ref().filter(|n| n.established()).and_then(|n| Some((n.my_slot()?, n.is_host()))) else { return };
         let car = self.net_own_car();
         let first = !self.net.lobby_sent;
-        let changed = !first && car.as_ref().map(|c| (c.0, c.1.clone())) != self.net.lobby_car;
+        let changed = !first && (setsel || car.as_ref().map(|c| (c.0, c.1.clone())) != self.net.lobby_car);
         if first || changed {
             let mut recs: Vec<Vec<u32>> = Vec::new();
             if first && !host {
@@ -452,9 +457,12 @@ impl App {
     /// * `SIGNON` 0x5109B0: `net+0x58 = 99`, the two texts into `net+0x59` / `+0x98`, the profile name into `+0xA8`
     ///   and **`0x48E1A0(net, 1, 0, host)`** with the registry's `Primary Address` (0x5099A0, default
     ///   `porsche-entry.earacing.com`); `[this+0x294] = 1`. The connect goes into comm state 3 — the base tick shows
-    ///   817 «Connecting…» — and, the host being unreachable, ends in state 4 → 830 (`comm_tick`). **APPROXIMATION:**
-    ///   the original's answer for an *unresolvable* host (whether the enumerate 0x5803E0 fails at once or runs into
-    ///   the connect's 16 s deadline) is not traced; the port waits the deadline, like an unanswered address;
+    ///   817 «Connecting…» — and, the host being unreachable, ends in state 4 → 830 (`comm_tick`). Settled (AC 2026-09-30):
+    ///   an *unresolvable* host takes the deadline, like an unanswered address: 0x48AC90 finds fewer than four
+    ///   numbers in the name, calls the resolver 0x55D5E0 -> the provider slot `+0x38` 0x560660 (`inet_addr`, then
+    ///   `gethostbyname` NULL -> returns 0 with a zeroed `AF_INET` record) and **ignores its answer**, then queues
+    ///   the connect 0x55D370 with `[0x5DEB48] << 4` = 16 s; the worker's probes go through the enumerate 0x5803E0
+    ///   -> 0x588030, which waits for an answer, so nothing ends it before the deadline (`network.md` 11.21 item 7);
     /// * `REGISTERUSER` 0x510990: `[0x655A4C] = 1` and `0x4D56E0(front end, 0)` — `[fe+0xF4] = 1`, `MusicStop(1500)`
     ///   (0x4AE3C0): the same exit the update question's yes (0x4A5960) and `QUIT` (0x50CC30) take — and the loop's
     ///   end, 0x4D2F1A → **0x4A5EA0**, `ShellExecute("open", RegUrl)` (`http://login.earacing.com` when the registry

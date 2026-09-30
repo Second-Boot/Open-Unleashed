@@ -100,7 +100,12 @@ impl Paint {
     /// `CarModel/packages.ini` as 0x443A60 reads them — `[package<n+1>] band0…band17`, default 0,
     /// `band14` / `band15` default 3 — and the colours exterior, stripe 1, stripe 2, interior.
     /// A package past the file's `count` leaves the table as it was (0x443DD5); the port then
-    /// paints every slot the exterior (APPROXIMATION of an unwritten table).
+    /// paints every slot the exterior. **Unreachable in shipped content** (settled 2026-09-30):
+    /// `packages.ini` says `count=8` and the `package` word of every `nfs5.car` paint set
+    /// is 0 (`CarCatalogEntry`'s doc), so 0x443DB0's `param_1 < [0x6115F8]` test always passes and
+    /// the fill (0x443DB0…0x443DD1) always runs. What the table holds before its first fill (the
+    /// car object's constructor) was not read: the exterior fallback is the port's own and never
+    /// taken.
     pub fn tint_table(&self, paths: &GamePaths) -> [[u8; 3]; 18] {
         let colours = [self.exterior, self.stripe1, self.stripe2, self.interior];
         let ini = GamePaths::find_file(&paths.car_model_dir(), "packages.ini").and_then(|p| std::fs::read_to_string(p).ok()).map(|t| Ini::parse(&t));
@@ -1123,9 +1128,21 @@ fn page_key(p: &DamagePatch) -> u32 {
 /// **integer**, `fistp(float(damage · 3.5))` (round to nearest even), above 255 taken as 255
 /// (0x44816E…0x44818A, `cmp edx, 0xFF; jbe`), which 0x5400B0 puts in the modulate colour's alpha
 /// `[0x5DFB7C]` (0x540152…0x54016B). *(Until 2026-09-26 the port used the unrounded product.)*
-/// APPROXIMATION: the blend itself — `page·(1 − a) + patch·a` with `a` = texel alpha × level / 255,
-/// rounded, on the page's 8-bit copy — is not the traced software blitter 0x572B40 on the 16-bit
-/// surface 0x448010 makes (0x448056, format 0x10).
+/// APPROXIMATION (C-platform, read 2026-09-30): the blend itself — `page·(1 − a) + patch·a`
+/// with `a` = texel alpha × level / 255, rounded, on the page's 8-bit copy. 0x572B40 is **not** the
+/// software blitter (the earlier label was wrong): 0x5400B0 takes one of two paths. With the level
+/// under 255 and the target's mode `[0x5DE630]` neither 0 nor 0xFF and `[0x5DE64C] == 0`
+/// (0x5400C9…0x5400EA, 0x5401A6…0x5401B0) it tiles the patch into 64×64 textures (the cache
+/// `[0x6A6450]`, 0x572A90) and 0x572B40 draws them as quads through the Thrash function table
+/// (`[0x6BD940]`, `[0x6BD954]`, `[0x6BD9A8]`) into the render target 0x534480 bound to the page's
+/// surface, under the modulate colour `[0x5DFB7C] = level << 24 | 0xFFFFFF` (0x540152…0x54016B) —
+/// the driver's alpha blend. Otherwise (a level of 255, which the threshold decals use, or a
+/// target without that mode) 0x5401B6…0x54026D converts the patch (an 8-bit source on a 16-bit
+/// target: 0x5346D0 + 0x5402B0 per palette entry, else 0x540280) and calls the CPU blitter 0x571630
+/// with the alpha in `[0x5DED08]`. Which path runs and the pixel format of the page surface
+/// (0x448010 → 0x5345A0) depend on the driver's target (`dx7z.dll`: the display's; `opengl3z.dll`:
+/// 32-bit, `thrash.md` §11), so the per-channel rounding and any 16-bit quantisation are not readable
+/// from `nfs5.exe` alone; 0x571630's own arithmetic was not read.
 pub fn blend_patch(page: &mut TexturePage, patch: &DamagePatch, damage: f32) {
     if patch.threshold > 0.0 {
         if damage <= patch.threshold {

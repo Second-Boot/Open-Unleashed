@@ -56,6 +56,12 @@ pub struct CarCatalogEntry {
     /// car `CARSETTINGS.CAR` names and forces the roof to 0 when it is clear. 1 on every Cabriolet,
     /// Speedster, Roadster, Convertible D and the 964 / 993 cabriolets, 0 on the coupés and Targas.
     pub cabrio: bool,
+    /// `+0x2E2` u8 / `+0x2E3` u8 — the car has ABS / traction control: `Car.ABS`'s predicate 0x4F1DA0
+    /// and `Car.Traction`'s 0x4F1DF0 read them off the car `CARSETTINGS.CAR` names and force the
+    /// accessor's value to 0 when the byte is clear (1 / 0 on the 993s, 1 / 1 on the 996s, 0 / 0 on
+    /// the 356s, `physics.md` §5.4).
+    pub abs: bool,
+    pub traction: bool,
     /// `+0x3BC` i16 count, `+0x3BE` i16 ids: the record's stock parts, which the 3D car widget
     /// walks for a car that is not a garage record (0x4C036A…0x4C0405) to build its style overlay.
     pub stock_parts: Vec<i16>,
@@ -239,6 +245,8 @@ pub fn parse_car_catalog(data: &[u8]) -> Result<Vec<CarCatalogEntry>, FormatErro
             id: u16_le(r, 0, "nfs5.car id")?,
             variant: u16_le(r, 0x1C0, "nfs5.car +0x1C0")? as i16,
             cabrio: r[0x1BF] != 0,
+            abs: r[0x2E2] != 0,
+            traction: r[0x2E3] != 0,
             stock_parts: {
                 let n = (u16_le(r, 0x3BC, "nfs5.car +0x3BC")? as i16).clamp(0, 40) as usize;
                 (0..n).filter_map(|k| u16_le(r, 0x3BE + 2 * k, "nfs5.car +0x3BE").ok().map(|v| v as i16)).collect()

@@ -264,6 +264,8 @@ mod tests {
             compare: [0; 5],
             variant: 0,
             cabrio: false,
+            abs: false,
+            traction: false,
             stock_parts: Vec::new(),
             compatible_parts: Vec::new(),
             display_name: String::new(),

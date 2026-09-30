@@ -306,14 +306,16 @@ impl SkillTest {
     /// `car+0xCD8 = car+0xB24` (99 999 after a DNF or with no finish taken). Returns (pass, the
     /// time the summary compared, penalty included).
     /// `cones` is the summary's `+0x140` ([`HudCones::changes`]).
-    pub fn evaluate(&self, mission: &Mission, position: usize, cones: u64, zones: &[f32; 10]) -> (bool, u64) {
-        evaluate_mission(mission, position, self.time_ticks.unwrap_or(99_999), cones, zones)
+    pub fn evaluate(&self, mission: &Mission, position: usize, cones: u64, zones: &[f32; 10]) -> (bool, i64) {
+        evaluate_mission(mission, position, self.time_ticks.unwrap_or(99_999) as i64, cones, zones)
     }
 }
 
 /// `HMissionSummary::evaluate` 0x4293F0, read to the instruction 2026-09-26. `position` is the
 /// player's `car+0xCD4`, `time` its `car+0xCD8` in ticks, `cones` the summary's `+0x140`,
-/// `zones` the ten damage zones. Returns (pass, the time compared with the limit).
+/// `zones` the ten damage zones. Returns (pass, the time compared with the limit). `time` is the
+/// signed dword `+0xCD8` (0x4294DE `mov eax,[car+0xCD8]`, compared as `fild` floats at 0x42951A: a
+/// negative projected time never fails the limit).
 ///
 /// ```text
 /// pass = 1
@@ -330,7 +332,7 @@ impl SkillTest {
 /// lands past both, and the failing `jmp 0x429564` only clears the flag. *(Until 2026-09-26 the
 /// port ran the damage test for every mission and the cone limit after a rank test too; a time
 /// of 0 was compared like any other.)*
-pub fn evaluate_mission(mission: &Mission, position: usize, time: u64, cones: u64, zones: &[f32; 10]) -> (bool, u64) {
+pub fn evaluate_mission(mission: &Mission, position: usize, time: i64, cones: u64, zones: &[f32; 10]) -> (bool, i64) {
     if let Some(rank) = mission.min_rank {
         return (position <= rank as usize, time);
     }
@@ -340,11 +342,11 @@ pub fn evaluate_mission(mission: &Mission, position: usize, time: u64, cones: u6
         && t != 0
     {
         if let Some(ConeRule::PenaltySeconds(s)) = mission.cone_rule {
-            t += s as u64 * cones * 64;
+            t += s as i64 * cones as i64 * 64;
         }
         // `fild t; fild limit; fmul 64; fcompp; test ah, 1` (0x42951A…0x429531): fails only
         // when `limit·64 < t` — a time exactly on the limit passes
-        if t > limit as u64 * 64 {
+        if t > limit as i64 * 64 {
             pass = false;
         }
     }

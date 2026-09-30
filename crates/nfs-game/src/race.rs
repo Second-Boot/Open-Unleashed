@@ -1103,8 +1103,10 @@ pub struct FinalizeIn {
     pub finish: f32,
     pub tick: u64,
     pub state: u8,
-    pub time: u64,
-    pub lap_times: Vec<u64>,
+    /// `+0xB24`, a signed dword
+    pub time: i32,
+    /// `+0xB28[]`, signed dwords
+    pub lap_times: Vec<i32>,
     pub position: u32,
     pub damage: [f32; 10],
 }
@@ -1124,8 +1126,8 @@ impl FinalizeIn {
         // 448 (0x416840…0x41684C) — the race time from the green light. *(The port used the lap
         // times' sum, which counts the first lap from tick 0 — `RaceProgress::lap_start_tick`'s
         // start, the countdown included — and so came out 448 ticks longer.)*
-        let time = if state == STATE_FINISHED { p.tick.saturating_sub(0x1C0) } else { 0 };
-        Self { progress: p.progress, start, finish, tick: p.tick, state, time, lap_times: p.lap_times.clone(), position, damage }
+        let time = if state == STATE_FINISHED { (p.tick as i32).wrapping_sub(0x1C0) } else { 0 };
+        Self { progress: p.progress, start, finish, tick: p.tick, state, time, lap_times: p.lap_times.iter().map(|&l| l as i32).collect(), position, damage }
     }
 }
 
@@ -1138,26 +1140,31 @@ impl FinalizeIn {
 pub struct RacerResult {
     /// `+0xCD4`: 1 + the car's row in the ranking table 0x608B38, 0 when it is not in it
     pub place: u32,
-    /// `+0xCD8`: the total time in ticks, 0 for none (the summary prints dashes, 0x42C41C)
-    pub time: u64,
+    /// `+0xCD8`: the total time in ticks as the signed dword the original keeps, 0 for none (the
+    /// summary prints dashes, 0x42C41C); negative for a projected time (see [`fistp_time`])
+    pub time: i32,
     /// `+0xCD0`: the finish state as finalised
     pub state: u8,
-    /// `+0xCFC`: the best lap
-    pub best_lap: u64,
+    /// `+0xCFC`: the best lap (signed dword; the compares at 0x416D7E / 0x416FD0 are `jge`)
+    pub best_lap: i32,
     /// `+0xCDC[NUM_LAPS]`: the lap times
-    pub laps: Vec<u64>,
+    pub laps: Vec<i32>,
     /// `+0xC98[10]`: the damage zones at the race's end (0x416B47 / 0x416D39 / 0x416F4D copy
     /// `car + eax − 0x7B8`, i.e. `+0x4E4…`)
     pub damage: [f32; 10],
 }
 
 /// `fistp` of a value `fstp`ped to a dword first (0x416BF9…0x416C03): round to nearest, even on
-/// a tie. A negative or unrepresentable result (a car whose `+0xB14` is before 448, a circuit car
-/// with no progress, whose division gives ∞ and so the integer indefinite) is no time; the port
-/// stores 0 there (APPROXIMATION of a case the race does not reach).
-fn fistp_time(v: f32) -> u64 {
+/// a tie, into the **signed** dword the original stores at `[car+0xB24]` (0x416C0B, 0x416EC7): a
+/// negative time (`(+0xB14 − 448)·laps/ratio` with `+0xB14 < 448`, a car ahead of the human's
+/// start by ≥ 0.5 % whose last slice change is still before the race start 0x1C0) is kept as it
+/// is, and only ∞ / NaN / an overflow (≥ 2³¹) give the integer indefinite 0x80000000. The time
+/// formatter 0x4356E0 prints the absolute value (with a sign only when its flag is set, which
+/// none of the race-result printers sets — [`nfs_game::records::format_time_dword`]).
+/// *(Until 2026-09-30 the port folded a negative or indefinite result into 0, "no time".)*
+fn fistp_time(v: f32) -> i32 {
     let r = v.round_ties_even();
-    if r.is_finite() && r >= 0.0 && r <= i32::MAX as f32 { r as u64 } else { 0 }
+    if r.is_finite() && r >= -2_147_483_648.0 && r < 2_147_483_648.0 { r as i32 } else { i32::MIN }
 }
 
 /// The projected total of a car still racing, the "ratio" arm (the human's 0x416B96…0x416C03, the
@@ -1174,7 +1181,7 @@ fn fistp_time(v: f32) -> u64 {
 /// `NUM_LAPS · 250000` ticks, not at a scaled-up ratio. *(Until 2026-09-26 the port had
 /// `ratio *= 250000` and then `elapsed / ratio`, measured `elapsed` to the current tick rather than
 /// to `+0xB14`, took the finish fraction as 1.0 and truncated.)*
-pub fn projected_ratio(progress: f32, start: f32, finish: f32, tick: u64, num_laps: u32) -> u64 {
+pub fn projected_ratio(progress: f32, start: f32, finish: f32, tick: u64, num_laps: u32) -> i32 {
     let mut num = progress as f64 - start as f64;
     if num <= 0.001f32 as f64 {
         num = 0.001f32 as f64;
@@ -1187,7 +1194,7 @@ pub fn projected_ratio(progress: f32, start: f32, finish: f32, tick: u64, num_la
 
 /// The opponent's circuit arm 0x416E9A…0x416EC2: `(+0xB14 − 448) / (progress / NUM_LAPS)`, no
 /// clamp.
-pub fn projected_circuit(progress: f32, tick: u64, num_laps: u32) -> u64 {
+pub fn projected_circuit(progress: f32, tick: u64, num_laps: u32) -> i32 {
     let elapsed = (tick as i64 - 0x1C0) as f64;
     fistp_time((elapsed / (progress as f64 / num_laps as f64)) as f32)
 }
@@ -1208,7 +1215,7 @@ pub fn race_finalize(cars: &mut [FinalizeIn], humans: usize, order: &[usize], nu
     let place = |i: usize| order.iter().position(|&k| k == i).map_or(0, |r| r as u32 + 1);
     let n = num_laps as usize;
     let human_start = cars.first().map_or(0.0, |c| c.start);
-    let lap_copy = |c: &FinalizeIn| -> Vec<u64> { (0..n).map(|j| c.lap_times.get(j).copied().unwrap_or(0)).collect() };
+    let lap_copy = |c: &FinalizeIn| -> Vec<i32> { (0..n).map(|j| c.lap_times.get(j).copied().unwrap_or(0)).collect() };
     let mut out = Vec::with_capacity(cars.len());
     for (i, c) in cars.iter_mut().enumerate() {
         let mut best;
@@ -1268,6 +1275,33 @@ mod projection_tests {
         assert!((projected_ratio(0.6, 0.2, 0.98, 448 + 40 * 64, 1) as i64 - 78 * 64).abs() <= 1);
         // a car that has hardly moved: the x87 stack gives NUM_LAPS · 250000 (0x416BE5…0x416BF7)
         assert_eq!(projected_ratio(0.0, 0.0, 1.0, 5000, 3), 750_000);
+    }
+
+    #[test]
+    fn a_projection_before_the_race_start_is_a_negative_dword() {
+        // a car ahead of the human's start by more than 0.5 % whose last slice change
+        // (`+0xB14`) is still before 448: `(100 − 448) · 1 / 0.6` = −580, kept signed (0x416C0B)
+        assert_eq!(projected_ratio(0.6, 0.0, 1.0, 100, 1), -580);
+        // the circuit arm: `(100 − 448) / (1.0 / 1)` = −348
+        assert_eq!(projected_circuit(1.0, 100, 1), -348);
+        // a circuit car with no progress divides by 0: ∞ → the integer indefinite 0x80000000
+        assert_eq!(projected_circuit(0.0, 1000, 1), i32::MIN);
+        // 10⁷ ticks · laps overflows the dword too
+        assert_eq!(projected_circuit(1.0, 3_000_000_000, 1), i32::MIN);
+    }
+
+    #[test]
+    fn a_still_racing_car_finalised_with_a_negative_time() {
+        let mut cars = vec![
+            FinalizeIn { progress: 1.0, finish: 1.0, tick: 900, state: STATE_OUT, position: 2, ..Default::default() },
+            FinalizeIn { progress: 0.6, finish: 1.0, tick: 100, state: STATE_RACING, position: 1, ..Default::default() },
+        ];
+        let r = race_finalize(&mut cars, 1, &[1, 0], 1, 1300, true, false);
+        // point-to-point: measured from the first human's start 0.0, (100 − 448) / 0.6 = −580
+        assert_eq!((r[1].time, r[1].state), (-580, STATE_FINISHED));
+        // the empty first lap takes the projection (0x416EE5) and, `jge` at 0x416FD0, a negative
+        // lap is below the 99999 and not 0: it becomes the best lap
+        assert_eq!((r[1].laps.clone(), r[1].best_lap), (vec![-580], -580));
     }
 
     #[test]

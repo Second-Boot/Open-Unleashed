@@ -176,6 +176,10 @@ pub struct MusicPlayer {
     /// stream names in `zzzymus.viv` directory order
     pub names: Vec<String>,
     playlist: Vec<usize>,
+    /// `MusicGlobals+0xC` (`pos`) is `>= 0`: a song is chosen. `MusicStop` (0x4AE3C0) sets it to
+    /// −1 and does nothing at all while it is −1; the next `MusicPlay`'s "any entry but the
+    /// current one" then counts from −1 (0x4AE7xx `(r % (n − 1) + 1 + [+0xC]) % n`)
+    cur_set: bool,
     /// the list the pattern modes restore (`MusicGlobals+0xE8` before the rebuild)
     saved: Vec<usize>,
     pos: usize,
@@ -212,6 +216,7 @@ impl MusicPlayer {
             // length `+8` (0x4ADFA5): nothing is listed until the race start's `MusicSetPlaylist`
             // or a front-end pattern fills it
             playlist: Vec::new(),
+            cur_set: false,
             pos: 0,
             shuffle: settings.shuffle,
             front_end: false,
@@ -264,8 +269,8 @@ impl MusicPlayer {
         if n == 0 {
             return;
         }
-        self.pos = if n == 1 { 0 } else { (self.rand() % (n - 1) + self.pos + 1) % n };
-        self.play_current(out);
+        let pos = Self::next_pos(n, self.cur(), self.rand());
+        self.request(out, pos);
     }
 
     /// **`MusicPlay(NULL, 0)`** 0x4AE4D0 alone, over the list as it stands — what the race pause's
@@ -281,14 +286,43 @@ impl MusicPlayer {
             tracing::info!(listed = n, "MusicPlay(NULL, 0): no playlist or no volume, nothing plays");
             return false;
         }
-        self.pos = Self::next_pos(n, self.pos, self.rand());
-        self.play_current(out);
+        let pos = Self::next_pos(n, self.cur(), self.rand());
+        self.request(out, pos);
         true
     }
 
     /// `MusicPlay`'s mode 0 with no pattern (§8.3): 0 for one song, else `(r % (n − 1) + cur + 1) % n`.
-    fn next_pos(n: usize, cur: usize, r: usize) -> usize {
-        if n == 1 { 0 } else { (r % (n - 1) + cur + 1) % n }
+    fn next_pos(n: usize, cur: i64, r: usize) -> usize {
+        if n == 1 { 0 } else { ((r % (n - 1)) as i64 + cur + 1).rem_euclid(n as i64) as usize }
+    }
+
+    /// `MusicGlobals+0xC` as the picks read it: −1 while no song is chosen.
+    fn cur(&self) -> i64 {
+        if self.cur_set { self.pos as i64 } else { -1 }
+    }
+
+    /// The common tail of `MusicPlay` 0x4AE4D0 (0x4AE7xx…0x4AE898), given the song it chose:
+    /// while the player idles (`+0x14 == 0`) with a song chosen (`+0xC >= 0`) the playing stream
+    /// is faded out over 500 ms (`0x566AE0(+0x70, 500, 0)`) and the choice waits as a swap (state
+    /// 1) until [`Self::update`] finds the stream silent; with no song chosen it starts at once
+    /// (state 2's start-up, which the port has no separate state for); while a stop or a swap is
+    /// already running (`+0x14` −1 or 1) only the choice is replaced, the fade running on.
+    /// *(Until batch A6 every `MusicPlay` cut the song and started the next at once.)*
+    fn request(&mut self, out: &AudioOutput, pos: usize) {
+        if self.pending.is_none() && !self.cur_set {
+            self.pos = pos;
+            self.cur_set = true;
+            self.play_current(out);
+            return;
+        }
+        if self.pending.is_none()
+            && let Some(m) = &self.current
+        {
+            out.fade(m.voice, 500, 0);
+        }
+        self.pos = pos;
+        self.cur_set = true;
+        self.pending = Some(Some(pos));
     }
 
     /// `MusicPlay(pattern, mode)`: rebuild the playlist from a name pattern. Mode 1 appends the pick to
@@ -322,7 +356,8 @@ impl MusicPlayer {
                 self.pos = if n == 1 { 0 } else { self.rand() % n };
             }
         }
-        self.play_current(out);
+        let pos = self.pos;
+        self.request(out, pos);
     }
 
     /// `game.spl[0]` again, after the race audio init swapped the block (`nfs_formats::spl::select_mix`).
@@ -341,9 +376,10 @@ impl MusicPlayer {
                 return;
             }
             self.pending = None;
-            self.stop(out);
+            self.end_stream(out);
             if let Some(pos) = next {
                 self.pos = pos;
+                self.cur_set = true;
                 self.play_current(out);
             }
             return;
@@ -398,6 +434,15 @@ impl MusicPlayer {
         let next = Self::toggle_step(self.advanced, self.playlist.len(), draw);
         // 0x4AD835 / 0x4AD853: `+0x10` cleared for the off, set for the swap
         self.advanced = next.is_some();
+        // the press writes the state and the position together (−1 / −1 for the off, 1 / the
+        // pick for the swap)
+        match next {
+            Some(pos) => {
+                self.pos = pos;
+                self.cur_set = true;
+            }
+            None => self.cur_set = false,
+        }
         self.pending = Some(next);
     }
 
@@ -415,8 +460,46 @@ impl MusicPlayer {
         }
     }
 
+    /// **`MusicStop(0)`** 0x4AE3C0: with a song chosen (`+0xC >= 0`; otherwise nothing at all, a
+    /// fade already running included) the stream is stopped at once (0x567740) and the player is
+    /// idle again with no song chosen.
     pub fn stop(&mut self, out: &AudioOutput) {
+        if !self.cur_set {
+            return;
+        }
         self.pending = None;
+        self.cur_set = false;
+        self.end_stream(out);
+    }
+
+    /// **`MusicStop(ms)`**, `ms > 0` (0x4AE3C0): with a song chosen and the player idle the stream
+    /// fades to 0 over `ms` (`0x566AE0(+0x70, ms, 0)`); the state becomes −1 ("off") and no song
+    /// is chosen, and [`Self::update`] stops the stream once its level has reached 0. Called
+    /// with 1500 by the race start (0x4A88AB), the front end's screens (0x4D1DBD), the front end's
+    /// hand-off to the game (0x4D529A, 0x4D56ED — the same stop the race start makes), the options
+    /// screen's constructor (0x511611), 150 for a `NONE` screen (0x4D1E55), 200 by the main
+    /// screen's minute tick (0x51023A), 1 by the loading screen (0x4DDA16) and the Audio data
+    /// area's initialiser (0x4E4B7E / 0x4E4BBC / 0x4E4BE1); `MusicStop(0)` is [`Self::stop`]
+    /// (`RE/notes/engine-audio.md`).
+    /// *(Until batch A6 every stop was immediate.)*
+    pub fn stop_fade(&mut self, out: &AudioOutput, ms: u32) {
+        if ms == 0 {
+            return self.stop(out);
+        }
+        if !self.cur_set {
+            return;
+        }
+        if self.pending.is_none()
+            && let Some(m) = &self.current
+        {
+            out.fade(m.voice, ms as i32, 0);
+        }
+        self.pending = Some(None);
+        self.cur_set = false;
+    }
+
+    /// 0x567740 alone: the stream stops.
+    fn end_stream(&mut self, out: &AudioOutput) {
         if let Some(m) = self.current.take() {
             out.stop(m.voice);
         }
@@ -492,6 +575,7 @@ mod tests {
             names: vec!["a".into(), "b".into()],
             playlist,
             saved,
+            cur_set: false,
             pos: 0,
             shuffle: false,
             front_end: false,
@@ -502,6 +586,35 @@ mod tests {
             advanced: false,
             pending: None,
         }
+    }
+
+    #[test]
+    fn musicstop_fades_and_the_next_play_waits_for_it() {
+        // 0x4AE3C0 / 0x4AE4D0's tail, on the state alone (no stream is playing, so no fade runs)
+        let Ok(out) = AudioOutput::new() else { return }; // no audio device on this host
+        let mut m = bare(vec![0, 1], vec![0, 1]);
+        // no song chosen (`+0xC == -1`): MusicStop does nothing at all
+        m.stop_fade(&out, 1500);
+        assert!(m.pending.is_none());
+        m.stop(&out);
+        assert!(m.pending.is_none() && !m.cur_set);
+        // a song chosen and the player idle: the stop asks for "off" and forgets the song
+        m.cur_set = true;
+        m.pos = 1;
+        m.stop_fade(&out, 1500);
+        assert_eq!(m.pending, Some(None));
+        assert!(!m.cur_set);
+        // MusicStop(0) with no song chosen leaves the running fade alone
+        m.stop(&out);
+        assert_eq!(m.pending, Some(None));
+        // the next MusicPlay only replaces the choice: the swap starts when the fade is done
+        m.request(&out, 0);
+        assert_eq!(m.pending, Some(Some(0)));
+        assert!(m.cur_set);
+        // and the pick that follows a stop counts from −1: `(r % (n − 1) + 1 − 1) % n`
+        assert_eq!(MusicPlayer::next_pos(3, -1, 5), 5 % 2);
+        assert_eq!(MusicPlayer::next_pos(3, 2, 5), (5 % 2 + 3) % 3);
+        assert_eq!(MusicPlayer::next_pos(1, -1, 9), 0);
     }
 
     #[test]
@@ -579,7 +692,7 @@ mod tests {
 
     #[test]
     fn jingles_are_louder_than_the_race_playlist() {
-        let p = MusicPlayer { dir: PathBuf::new(), names: Vec::new(), playlist: Vec::new(), saved: Vec::new(), pos: 0, shuffle: false, front_end: false, level: 127, trim: 52, current: None, rng: 1, advanced: false, pending: None };
+        let p = MusicPlayer { dir: PathBuf::new(), names: Vec::new(), playlist: Vec::new(), saved: Vec::new(), cur_set: false, pos: 0, shuffle: false, front_end: false, level: 127, trim: 52, current: None, rng: 1, advanced: false, pending: None };
         // the shipped game.spl[0] = 52: 52 · 127 >> 7 = 51 of 127 for a race track, the raw 127 for a jingle
         assert!((p.volume_for("game13-Activator-Morphadron") - 51.0 / 127.0).abs() < 1e-6);
         assert_eq!(p.volume_for("win04-Victory-Cypher"), 1.0);

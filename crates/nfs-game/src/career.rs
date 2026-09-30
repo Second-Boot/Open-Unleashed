@@ -619,13 +619,16 @@ fn default_setup() -> [f32; 17] {
 /// its **own** zone mask `part+0x48[10]`, its condition `+0x60` and the damage it carries,
 /// `+0x164` — the owned car's saved state when it has one, else the table's (`Car_raceInit`
 /// 0x41085F copies `carInfo+0x78 … +0xC4` into each part's `+0x164`; the save keeps the same
-/// field). An empty list keeps `fallback_parts` (APPROXIMATION, see there). *(Until 2026-09-26
+/// field). An empty list stays empty: 0x49C4C0 rebuilds `car+0x768` as twenty **zeroed** 0x168-byte
+/// records and copies a table record only for each non-zero `.PARTINDEX` id (`loaders.md` §1.3), and a
+/// zeroed record has type `+0x26` = 0, which none of the getters' kinds 1…10 matches — so a car
+/// with no parts (a traffic car: 16 of the 109 `nfs5.car` records — Eden 1…5 and EAS1…11 — carry no
+/// stock list; an owned car always keeps its body part, which the install list does not offer to
+/// remove, 0x516751) contributes nothing to the wear sums. *(Until 2026-09-30 the empty list took
+/// `nfs_physics::specs::fallback_parts`, six invented parts.)* *(Until 2026-09-26
 /// this was `zone_masks_for` — one mask per group, the family's first part of the type, whether
 /// installed or not — and `part_wear_for`, one summed scale and offset per group.)*
 pub fn installed_parts(parts: &[&Part], owned: Option<&OwnedCar>) -> Vec<nfs_physics::specs::InstalledPart> {
-    if parts.is_empty() {
-        return nfs_physics::specs::fallback_parts();
-    }
     parts
         .iter()
         .map(|p| {
@@ -643,9 +646,6 @@ pub fn installed_parts(parts: &[&Part], owned: Option<&OwnedCar>) -> Vec<nfs_phy
 /// into `part+0x164` (0x41085F…0x410886) brings **0** for every part and the owned car's saved wear
 /// stays in the garage. `.DAMAGEZONES` is 0 for the same types (0x4EF420…0x4EF445).
 pub fn layout_race_parts(parts: &[&Part]) -> Vec<nfs_physics::specs::InstalledPart> {
-    if parts.is_empty() {
-        return nfs_physics::specs::fallback_parts();
-    }
     parts.iter().map(|p| nfs_physics::specs::InstalledPart::new(p.kind, p.zone_mask.map(|b| b != 0), p.condition, 0.0)).collect()
 }
 
@@ -728,7 +728,7 @@ pub struct EventResult {
     pub earned: [u32; 8],
     /// Finishing time per driver in 64 Hz ticks (0 = did not finish).
     #[serde(default)]
-    pub times: [u64; 8],
+    pub times: [i32; 8],
     /// The event record this result fills (`trn + 0x3A0 + event·0xA4`). The events need not be
     /// raced in file order — `Tournament.RemainingTracks`' setter 0x504F00 picks any undone one —
     /// so the slot is kept with the result. `None` (a save written before 2026-09-25) is the
@@ -1081,7 +1081,7 @@ impl Career {
     /// The comparison is `jb`, so the table entry is the chance of **not** being offered, in
     /// sixtieths: a seven-to-ten-year-old Porsche (70, 80, 80, 70) never reaches the market and
     /// anything sixteen years old or more (5) nearly always does.
-    pub fn refresh_market(&mut self, tables: &CareerTables, rand: &mut impl FnMut() -> u32) {
+    pub fn refresh_market(&mut self, tables: &CareerTables, rand: &mut impl FnMut() -> u32, crt: &mut impl FnMut() -> u32) {
         for record in &tables.catalog {
             // `[0x6919F0]` is not the raw table: 0x4F3E40 builds it from the records whose
             // `+0x1F4` is **0** — the playable cars, as against the 1 and 2 that go to
@@ -1098,7 +1098,7 @@ impl Career {
             if rand() % 60 < USED_CAR_RARITY[age] {
                 continue;
             }
-            let car = self.generate_used_car(tables, record, rand);
+            let car = self.generate_used_car(tables, record, rand, crt);
             // 0x4F8165…0x4F8174: the count is the **whole** list `[0x691B88]` — the market's own
             // cars and the player's listings, which 0x4F91C0 appends to the same vector — against
             // 25 (`cmp ecx, 0x19 / jb`). At 25 or more, 0x4F817A walks for the first entry whose
@@ -1139,8 +1139,8 @@ impl Career {
     /// Nothing here damages the car: the generator never touches the body zones, and every
     /// `nfs5.prt` record ships `+0x164 = 0`, so a market car's parts are undamaged and its
     /// condition bars read 100. Its price is discounted by mileage alone.
-    pub fn generate_used_car(&self, tables: &CareerTables, record: &CarCatalogEntry, rand: &mut impl FnMut() -> u32) -> OwnedCar {
-        let (paint_set, trim) = used_car_trim(record.paint_sets.len(), record.interior_colours.len(), tables.package_count, rand);
+    pub fn generate_used_car(&self, tables: &CareerTables, record: &CarCatalogEntry, rand: &mut impl FnMut() -> u32, crt: &mut impl FnMut() -> u32) -> OwnedCar {
+        let (paint_set, trim) = used_car_trim(record.paint_sets.len(), record.interior_colours.len(), tables.package_count, rand, crt);
         // 0x4F82C0 builds the car through the constructor 0x4EEBA0, so its stock list is there
         // (0x4EE9A0) before 0x4F8590 clears the installed one
         let mut car = OwnedCar::construct(tables, record.id, paint_set, 0);
@@ -1706,7 +1706,7 @@ impl Career {
     #[allow(clippy::too_many_arguments)]
     /// `0x503960` for every racer of one event: points `9 − pos`, prize by position, and the
     /// bonus for a clean top three. Returns the record the event is stored as.
-    fn event_result(t: &Tournament, event: usize, order: &[usize], times: &[u64; 8], clean: &[bool; 8]) -> EventResult {
+    fn event_result(t: &Tournament, event: usize, order: &[usize], times: &[i32; 8], clean: &[bool; 8]) -> EventResult {
         let ev = &t.events[event];
         let mut points = [0u8; 8];
         let mut earned = [0u32; 8];
@@ -1761,7 +1761,7 @@ impl Career {
 
     /// The standings as they will stand once this event is recorded — what `HTournamentStandings`
     /// shows at the end of the race, before the front end files the result.
-    pub fn standings_after(&self, t: &Tournament, event: usize, order: &[usize], times: &[u64; 8], clean: &[bool; 8]) -> Vec<(usize, u32, u32, u64)> {
+    pub fn standings_after(&self, t: &Tournament, event: usize, order: &[usize], times: &[i32; 8], clean: &[bool; 8]) -> Vec<(usize, u32, u32, i32)> {
         let mut events = self.state(t.id).events.clone();
         events.push(Self::event_result(t, event, order, times, clean));
         standings_of(&events, t.time_ranked())
@@ -1777,7 +1777,7 @@ impl Career {
     /// (0x431BF9…0x431C16) — the column the WINNINGS cells print (0x431DF4). The order is the
     /// one before the prize.
     #[allow(clippy::too_many_arguments)]
-    pub fn standings_page(&self, t: &Tournament, event: usize, order: &[usize], times: &[u64; 8], clean: &[bool; 8], racers: usize, last: bool) -> Vec<(usize, u32, u32, u64)> {
+    pub fn standings_page(&self, t: &Tournament, event: usize, order: &[usize], times: &[i32; 8], clean: &[bool; 8], racers: usize, last: bool) -> Vec<(usize, u32, u32, i32)> {
         let mut rows: Vec<_> = self.standings_after(t, event, order, times, clean).into_iter().filter(|(d, ..)| *d < racers.max(1)).collect();
         if last {
             for (k, row) in rows.iter_mut().enumerate() {
@@ -1791,7 +1791,7 @@ impl Career {
     /// in: the race options it reads, as the front end sets them at launch (0x4EC93F…0x4ECAC5) and
     /// the race end then updates (0x427660, 0x431B80). See [`Winnings`].
     #[allow(clippy::too_many_arguments)]
-    pub fn winnings_after(&self, t: &Tournament, event: usize, order: &[usize], times: &[u64; 8], clean: &[bool; 8], racers: usize, last: bool) -> Winnings {
+    pub fn winnings_after(&self, t: &Tournament, event: usize, order: &[usize], times: &[i32; 8], clean: &[bool; 8], racers: usize, last: bool) -> Winnings {
         let st = self.state(t.id);
         // each result in its own event record's slot, this race's in `event`'s
         let mut slots: Vec<(usize, EventResult)> = st.done_events().into_iter().zip(st.events.iter().cloned()).filter(|(k, _)| *k != event).collect();
@@ -1808,7 +1808,7 @@ impl Career {
         }
     }
 
-    pub fn record_event(&mut self, tables: &CareerTables, t: &Tournament, event: usize, order: &[usize], times: &[u64; 8], clean: &[bool; 8], garage_idx: Option<usize>) -> EventOutcome {
+    pub fn record_event(&mut self, tables: &CareerTables, t: &Tournament, event: usize, order: &[usize], times: &[i32; 8], clean: &[bool; 8], garage_idx: Option<usize>) -> EventOutcome {
         let result = Self::event_result(t, event, order, times, clean);
         let (prize, bonus) = (result.prize, result.bonus);
         // 0x4EE040…0x4EE051: the event prize and the bonus, each its own 0x5012E0 call — the
@@ -1958,7 +1958,7 @@ impl Career {
     }
 
     /// Points standings for `t`: `(driver index, points, money, time)` sorted best first.
-    pub fn standings(&self, t: &Tournament) -> Vec<(usize, u32, u32, u64)> {
+    pub fn standings(&self, t: &Tournament) -> Vec<(usize, u32, u32, i32)> {
         standings_of(&self.state(t.id).events, t.time_ranked())
     }
 }
@@ -2065,15 +2065,16 @@ pub const USED_WINS: [Band; 4] = [(0, 5, 0, 0), (6, 20, 1, 2), (21, 80, 3, 10), 
 /// or no interiors would keep `0xFFFF0000` / `0xFFFFFFFF` colours (0x4F82CA, 0x4F82DC), which rows
 /// cannot say; every `nfs5.car` record has at least one of each, so the port gives row 0.
 ///
-/// **Two generators.** `k` and `j` come from the front end's 0x538040 (`opponents::FeRng`), the
-/// four rolls from the CRT's `rand()` 0x5A17C9 (`opponents::CRand`). The port draws all six from
-/// the one `rand`, in the original's order (APPROXIMATION of the streams, not of the rules).
-pub fn used_car_trim(paint_sets: usize, interiors: usize, package_count: u32, rand: &mut impl FnMut() -> u32) -> (u8, Trim) {
+/// **Two generators** (0x4F82EA / 0x4F83B8 call 0x538040, 0x4F840D / 0x4F8429 / 0x4F8440 / 0x4F8452
+/// call 0x5A17C9 — read to the instruction): `k` and `j` come from the front end's 0x538040
+/// (`rand`, `opponents::FeRng`), the four rolls from the CRT's `rand()` 0x5A17C9 (`crt`, the C
+/// runtime's shared state, `layout::glints::crt_rand`).
+pub fn used_car_trim(paint_sets: usize, interiors: usize, package_count: u32, rand: &mut impl FnMut() -> u32, crt: &mut impl FnMut() -> u32) -> (u8, Trim) {
     let set = if paint_sets > 0 { (rand() as usize % paint_sets) as u8 } else { 0 };
     let interior = if interiors > 0 { (rand() as usize % interiors) as u8 } else { 0 };
     // 0x4F8429 divides by `[0x6115F8]` unguarded; a missing `packages.ini` leaves it 0
-    let package = if rand() % 100 > 50 { rand().checked_rem(package_count).unwrap_or(0) as u8 } else { 0 };
-    let decal = if rand() % 100 > 80 { (rand() % 100) as i8 - 1 } else { -1 };
+    let package = if crt() % 100 > 50 { crt().checked_rem(package_count).unwrap_or(0) as u8 } else { 0 };
+    let decal = if crt() % 100 > 80 { (crt() % 100) as i8 - 1 } else { -1 };
     (set, Trim { interior, stripe1: set, stripe2: set, package, decal })
 }
 
@@ -2243,13 +2244,14 @@ pub fn clean_race(start: i32, finish: &[f32; 10]) -> bool {
 /// `{points, Σtime, Σmoney, idx}` that swaps only on a strict compare (0x50290F…0x50291E for points,
 /// 0x5028C4…0x5028D0 for time), so it is stable, and it has **no special case for a zero time**:
 /// every racer arrives with one, because 0x416AC0 projects a time for any car still racing.
-fn standings_of(events: &[EventResult], time_ranked: bool) -> Vec<(usize, u32, u32, u64)> {
-    let mut rows: Vec<(usize, u32, u32, u64)> = (0..8).map(|d| (d, 0u32, 0u32, 0u64)).collect();
+fn standings_of(events: &[EventResult], time_ranked: bool) -> Vec<(usize, u32, u32, i32)> {
+    let mut rows: Vec<(usize, u32, u32, i32)> = (0..8).map(|d| (d, 0u32, 0u32, 0i32)).collect();
     for e in events {
         for d in 0..8 {
             rows[d].1 += e.points[d] as u32;
             rows[d].2 += e.earned[d];
-            rows[d].3 += e.times[d];
+            // the totals are signed dwords (the sort's `jl` / `jg`, 0x5028C6 / 0x50290F)
+            rows[d].3 = rows[d].3.wrapping_add(e.times[d]);
         }
     }
     if time_ranked {
@@ -2884,7 +2886,7 @@ mod tests {
             }
         };
         fill(&mut c);
-        c.refresh_market(&t, &mut r);
+        c.refresh_market(&t, &mut r, &mut || 0);
         assert_eq!(c.market.len(), 25, "24 on the list: the new car is appended");
         assert_eq!(c.market[0].mileage, 0);
         // one listing makes the list 25 long: the first generated car goes, the new one comes
@@ -2892,7 +2894,7 @@ mod tests {
         c.garage.push(OwnedCar::new(76, 0, 0));
         c.garage.push(OwnedCar::new(76, 0, 0));
         c.list_for_sale(0, 5_000).unwrap();
-        c.refresh_market(&t, &mut r);
+        c.refresh_market(&t, &mut r, &mut || 0);
         assert_eq!(c.market.len(), 24);
         assert_eq!(c.market[0].mileage, 1);
         // a list of 25 listings has no generated car to drop (0x4F818B runs off the end): the
@@ -2905,7 +2907,7 @@ mod tests {
             c.list_for_sale(i, 5_000).unwrap();
         }
         assert_eq!(c.garage.iter().filter(|g| g.asking_price.is_some()).count(), 25);
-        c.refresh_market(&t, &mut r);
+        c.refresh_market(&t, &mut r, &mut || 0);
         assert_eq!(c.market.len(), 1);
     }
 
@@ -2996,26 +2998,32 @@ mod tests {
     /// own draw, then the package roll (> 50) and the decal roll (> 80), each with its second draw.
     #[test]
     fn used_car_trim_draws_like_0x4f82c0() {
-        // set 5 % 3, interior 7 % 2, package roll 51 → 13 % 8, decal roll 81 → 42 % 100 − 1
-        let (mut r, used) = script(&[5, 7, 51, 13, 81, 42]);
-        let (set, t) = used_car_trim(3, 2, 8, &mut r);
+        // set 5 % 3, interior 7 % 2 from the front end's generator; package roll 51 → 13 % 8,
+        // decal roll 81 → 42 % 100 − 1 from the CRT's
+        let (mut fe, fe_used) = script(&[5, 7]);
+        let (mut crt, crt_used) = script(&[51, 13, 81, 42]);
+        let (set, t) = used_car_trim(3, 2, 8, &mut fe, &mut crt);
         assert_eq!(set, 2);
         assert_eq!(t, Trim { interior: 1, stripe1: 2, stripe2: 2, package: 5, decal: 41 });
-        assert_eq!(used.get(), 6);
+        assert_eq!((fe_used.get(), crt_used.get()), (2, 4));
         // 50 and 80 fail the rolls (`jle`): package 0, decal −1, and no second draws
-        let (mut r, used) = script(&[0, 0, 50, 80]);
-        assert_eq!(used_car_trim(3, 2, 8, &mut r).1, Trim { interior: 0, stripe1: 0, stripe2: 0, package: 0, decal: -1 });
-        assert_eq!(used.get(), 4);
+        let (mut fe, _) = script(&[0, 0]);
+        let (mut crt, used) = script(&[50, 80]);
+        assert_eq!(used_car_trim(3, 2, 8, &mut fe, &mut crt).1, Trim { interior: 0, stripe1: 0, stripe2: 0, package: 0, decal: -1 });
+        assert_eq!(used.get(), 2);
         // the decal's own draw spans −1…98
-        let (mut r, _) = script(&[0, 0, 151, 7, 181, 199]);
-        let t = used_car_trim(1, 1, 8, &mut r).1;
+        let (mut fe, _) = script(&[0, 0]);
+        let (mut crt, _) = script(&[151, 7, 181, 199]);
+        let t = used_car_trim(1, 1, 8, &mut fe, &mut crt).1;
         assert_eq!((t.package, t.decal), (7, 98));
-        let (mut r, _) = script(&[0, 0, 0, 181, 100]);
-        assert_eq!(used_car_trim(1, 1, 8, &mut r).1.decal, -1);
+        let (mut fe, _) = script(&[0, 0]);
+        let (mut crt, _) = script(&[0, 181, 100]);
+        assert_eq!(used_car_trim(1, 1, 8, &mut fe, &mut crt).1.decal, -1);
         // no packages.ini: the draw is still taken, the package stays 0
-        let (mut r, used) = script(&[0, 0, 99, 5, 0]);
-        assert_eq!(used_car_trim(1, 1, 0, &mut r).1.package, 0);
-        assert_eq!(used.get(), 5);
+        let (mut fe, _) = script(&[0, 0]);
+        let (mut crt, used) = script(&[99, 5, 0]);
+        assert_eq!(used_car_trim(1, 1, 0, &mut fe, &mut crt).1.package, 0);
+        assert_eq!(used.get(), 3);
     }
 
     /// 0x4F82C0's draws after the appearance: the mileage band, then the parts' share (taken even
@@ -3026,12 +3034,13 @@ mod tests {
         let c = Career { year: 1975, ..Career::default() };
         let tables = tables(vec![]);
         let rec = nfs_formats::fedata::parse_car_catalog(&vec![0u8; nfs_formats::fedata::CAR_RECORD_SIZE]).unwrap().remove(0);
-        // no paint sets / interiors: the appearance takes the two rolls only (both failing);
+        // no paint sets / interiors: the appearance takes the two CRT rolls only (both failing);
         // mileage 10 → band 6…20, 1000 % 13000; share 0 → band 0…5, no second draw; wins 90 →
-        // band 81…100, 7 % 39
-        let (mut r, used) = script(&[0, 0, 10, 1000, 0, 90, 7]);
-        let car = c.generate_used_car(&tables, &rec, &mut r);
-        assert_eq!(used.get(), 7);
+        // band 81…100, 7 % 39 — all the front end's generator
+        let (mut r, used) = script(&[10, 1000, 0, 90, 7]);
+        let (mut crt, crt_used) = script(&[0, 0]);
+        let car = c.generate_used_car(&tables, &rec, &mut r, &mut crt);
+        assert_eq!((used.get(), crt_used.get()), (5, 2));
         assert_eq!((car.mileage, car.wins), (3000, 18));
         assert!(car.parts.is_empty());
         assert_eq!(car.trim, Trim::default());

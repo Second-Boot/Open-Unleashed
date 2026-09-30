@@ -122,6 +122,11 @@ pub(crate) fn rate_of(n: u32, d: &ParticleDef) -> f32 {
 }
 
 impl System {
+    /// 0x455260's gate: `[sys+8] == 100`.
+    fn drawn_now(&self) -> bool {
+        self.live && self.countdown == 100
+    }
+
     /// 0x454250 `(value, part, 1)` with no prime run: the definition `di`, `max = count × budget
     /// >> 8`, the rate, the axis, emitting (`+0x2C = 1`) unless flag 2.
     pub(crate) fn new(defs: &[ParticleDef], di: usize, emitter: Emitter, budget: u32) -> Self {
@@ -227,6 +232,11 @@ impl System {
             p.age += 1.0;
             p.age <= life
         });
+    }
+
+    /// 0x454430's `[this+0x20] != 0` gate: the system holds a particle.
+    pub(crate) fn holds_particles(&self) -> bool {
+        !self.particles.is_empty()
     }
 
     /// **0x454430**'s per-particle records: a billboard each unless `+0x2E & 2` (0x454781), and a
@@ -414,10 +424,32 @@ impl TrackParticles {
         }
     }
 
-    /// 0x454430's billboards for every particle.
+    /// 0x454430's own gate (0x45443E: `cmp [ecx+0x20], 0`): a system holding any particle, whether
+    /// or not it puts a billboard or a streak on the list (a `+0x2E & 2` system without the
+    /// streak flag draws neither) — the draw sets Thrash 0x24 to 1 for it all the same.
+    pub fn any_particles(&self) -> bool {
+        self.systems.iter().filter(|s| s.drawn_now()).any(|s| s.holds_particles())
+    }
+
+    /// Diagnostic (`NFS_SKID_STATS`): the billboards of the live systems 0x455260 does **not** draw
+    /// in this frame — what the port drew before that change.
+    pub fn undrawn_sprites(&self) -> usize {
+        let (mut out, mut streaks) = (Vec::new(), Vec::new());
+        for s in self.systems.iter().filter(|s| s.live && s.countdown != 100) {
+            s.draw_into(&self.defs, Vec3::ZERO, &mut out, &mut streaks);
+        }
+        out.len()
+    }
+
+    /// 0x454430's billboards for every particle of the systems 0x455260 draws: it walks the draw
+    /// set and calls slot 1 only for a system whose `+8` is exactly 100 (0x455281, `cmp [ecx+8],
+    /// 0x64`) — one a walk refreshed (0x455150) since the last 0x4551E0 step took it to 99…1. A
+    /// system whose article left the walk keeps updating for 99 more steps ([`Self::step`]) but
+    /// is not drawn in any frame that did not refresh it; the mirror's pass, running
+    /// after the main pass's draw, sees the main walk's refreshes as well as its own.
     pub fn sprites(&self) -> Vec<Sprite> {
         let (mut out, mut streaks) = (Vec::new(), Vec::new());
-        for s in self.systems.iter().filter(|s| s.live) {
+        for s in self.systems.iter().filter(|s| s.drawn_now()) {
             s.draw_into(&self.defs, Vec3::ZERO, &mut out, &mut streaks);
         }
         out
@@ -523,7 +555,31 @@ mod tests {
             p.draw(1000.0, |_| Some((0.0, true)));
             p.step(1000.0);
         }
+        // the frame's own draw refreshes the system before 0x455260 draws it
+        p.draw(1000.0, |_| Some((0.0, true)));
         assert!(p.sprites().iter().any(|s| (s.position - placed).length() < 10.0));
+    }
+
+    #[test]
+    fn only_a_system_refreshed_since_the_last_step_is_drawn() {
+        // 0x455260 draws a system only at `[sys+8] == 100` (0x455281): the walk's refresh sets it
+        // (0x455150), the next 0x4551E0 step takes it to 99 — it keeps updating, undrawn
+        let e = Emitter { article: 0, part: 0, position: Vec3::ZERO, local: Vec3::ZERO, dir_a: Vec3::X, dir_b: Vec3::Y, tag: 1 };
+        let mut p = TrackParticles::new(vec![def()], &[e], 0, 256);
+        for _ in 0..30 {
+            p.draw(1000.0, |_| Some((0.0, false)));
+            p.step(1000.0);
+        }
+        assert!(p.sprites().is_empty() && !p.any_particles(), "stepped since the refresh");
+        p.draw(1000.0, |_| Some((0.0, false)));
+        assert!(!p.sprites().is_empty() && p.any_particles(), "refreshed");
+        p.step(1000.0);
+        assert!(p.sprites().is_empty());
+        // the article left the walk: the system runs on for 99 steps without being drawn
+        for _ in 0..50 {
+            p.step(1000.0);
+        }
+        assert!(p.systems[0].live && p.sprites().is_empty());
     }
 
     #[test]
@@ -579,12 +635,15 @@ mod tests {
         for _ in 0..5 {
             tick(&mut p);
         }
+        p.draw(1000.0, |_| Some((0.0, false)));
         assert_eq!(p.sprites().len(), 0);
         tick(&mut p);
+        p.draw(1000.0, |_| Some((0.0, false)));
         assert_eq!(p.sprites().len(), 1);
         for _ in 0..200 {
             tick(&mut p);
         }
+        p.draw(1000.0, |_| Some((0.0, false)));
         // the population settles at what 100 ticks of life hold
         let n = p.sprites().len();
         assert!((19..=21).contains(&n), "{n}");
@@ -641,12 +700,14 @@ mod tests {
             p.draw(1000.0, |_| Some((0.0, false)));
             p.step(1000.0);
         }
+        p.draw(1000.0, |_| Some((0.0, false)));
         assert!(p.sprites().is_empty(), "flag 2 waits for a trigger");
         // 0x450980's slot 3 (0x454420) on every drawn frame of a struck item starts it and keeps it
         for _ in 0..50 {
             p.draw(1000.0, |_| Some((0.0, true)));
             p.step(1000.0);
         }
+        p.draw(1000.0, |_| Some((0.0, true)));
         assert!(!p.sprites().is_empty(), "triggered");
     }
 }

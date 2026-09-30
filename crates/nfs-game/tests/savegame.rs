@@ -218,7 +218,7 @@ fn the_used_car_market_fills_and_caps() {
         seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
         (seed >> 16) & 0x7FFF
     };
-    c.refresh_market(&t, &mut rand);
+    c.refresh_market(&t, &mut rand, &mut || 1);
     assert!(!c.market.is_empty(), "a 1975 market should hold something");
     assert!(c.market.len() <= nfs_game::career::USED_CAR_MARKET_MAX);
     for car in &c.market {
@@ -253,7 +253,7 @@ fn the_used_car_market_fills_and_caps() {
     }
     // refreshing again keeps the cap
     for _ in 0..4 {
-        c.refresh_market(&t, &mut rand);
+        c.refresh_market(&t, &mut rand, &mut || 1);
     }
     assert_eq!(c.market.len(), nfs_game::career::USED_CAR_MARKET_MAX);
     // buying takes the money and moves the car across untouched
@@ -288,7 +288,7 @@ fn the_saved_cars_instance_dword_is_zero() {
         seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
         (seed >> 16) & 0x7FFF
     };
-    c.refresh_market(&t, &mut rand);
+    c.refresh_market(&t, &mut rand, &mut || 1);
     assert!(!c.market.is_empty(), "a 1975 market should hold something");
     let profile = Profile { name: "X".into(), picture: 0 };
     let sav = career_to_sav(&c, &t, &profile);
@@ -512,7 +512,7 @@ fn the_used_car_market_rides_in_its_module() {
         seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
         seed >> 8
     };
-    c.refresh_market(&t, &mut rand);
+    c.refresh_market(&t, &mut rand, &mut || 1);
     assert!(!c.market.is_empty());
     let sav = career_to_sav(&c, &t, &Profile::new("Hans", 0));
     let bytes = sav.write();

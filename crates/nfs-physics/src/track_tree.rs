@@ -7,8 +7,10 @@
 //! itself (which bundle an article sits in, its file position, its patch/prop choice) is the
 //! caller's job (`nfs_game::world::track_tree_order`, which has `Crp::bundle_of` and the article
 //! list; this crate does not parse `.crp` files). See `RE/RENDERING.md` "The tree, built" and
-//! "Bundle order, read 2026-09-28" for the full trace: `insertAll(C)` (`0x4883BC`) walks
-//! `WInstanceBundle → WAnimBundle → WMidGroundBundle → WStaticBundle`, each bundle's claimed
+//! "Bundle order, read 2026-09-28" for the full trace: `insertAll(C)` (`0x4883BC`) walks the
+//! bundles that own a `PCollideArticleBundle` — `WInstanceBundle → WStaticBundle` (*corrected
+//! 2026-09-30, `WAnimBundle` and `WMidGroundBundle` have none, `[bundle+0xC] = 0`, and
+//! `0x488090` skips them, 0x48838B*), each bundle's claimed
 //! articles in `.crp` file order, each article's own patches (in primitive order) or its one
 //! `kCylinder`/`kBox` object (`0x4750B0`'s per-article type dispatch, `0x4751BD`/`0x475238` —
 //! never both for one article in the original); then `insertAll(A)` (`0x4883F5`), every `.edg`

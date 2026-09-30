@@ -25,10 +25,16 @@
 //! prints; the one error that changes a result is a syntax error in `0x52F830` itself, which
 //! returns **0 for the whole expression** (0x52FE6C…0x52FE95).
 //!
-//! **The port's one addition** (APPROXIMATION, labelled): a name the *port* cannot answer — a text
-//! part's width whose string comes from an accessor it has not got — is carried as an unknown
-//! value instead of a number, so a caller can keep its own fallback. The original has no such
-//! state; for every name the port does answer, the result is the original's.
+//! **The port's one addition** (APPROXIMATION, labelled, kept OPEN 2026-09-30): a name
+//! the *port* cannot answer is carried as an unknown value instead of a number, so a caller can
+//! keep its own fallback. The original has no such state (it always measures the real string);
+//! for every name the port does answer, the result is the original's. Measured over all 98 shipped
+//! `.lay` files (`--layout-sweep`, 59 461 evaluations): no part expression of the sweep fails
+//! (`expr_failures` = 0), and the 54 evaluations that end unknown are all `box_template` with
+//! `measure = false` (51: `BottomBarButton.ctr`'s `size.value`
+//! `(label.size.width+picture.size.width+data.space),data.height`, a text/shape part's extent that
+//! pass does not take) and `draw_gouraud_box` (3) — the box pass that must not measure the parts
+//! whose extent depends on the box (the port's own recursion guard, not a rule of the original).
 
 /// What a name in an expression stands for — the answer of the macro dictionary `[0x69CAF8]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,7 +125,13 @@ pub fn eval(text: &str, lookup: &dyn Fn(&str) -> Macro) -> Option<i32> {
 /// `0x52DF40` + `0x52F830` — evaluate text that has already been expanded.
 pub fn evaluate(text: &str) -> Option<i32> {
     // the 0x200-byte buffer of 0x52DF4A: `strncpy` with 0x200, so a longer value has no
-    // terminator in the original and runs on into the stack. APPROXIMATION: cut at 0x1FF.
+    // terminator in the original (0x52DF4A `lea edx,[esp]`, 0x52DF53 `push 0x200`, 0x52DF5A
+    // `call 0x5A28A0` = `strncpy`, a 0x200-byte frame `sub esp,0x200` at 0x52DF44) and the scan of
+    // 0x52DF6E…0x52DF7C then runs on into the stack. UNREACHABLE (2026-09-30): cut at
+    // 0x1FF here. No shipped text is that long — 48 428 `key=value` lines of the 98 `.lay` and 75
+    // `.ctr` files have a longest value of 407 bytes (a list of attribute names, never evaluated),
+    // and of the 59 461 expanded texts the evaluator got over all 98 layouts (`--layout-sweep`)
+    // the longest is 44 bytes.
     let mut s: Vec<u8> = text.bytes().take(0x1FF).map(|c| if c == b'.' { b'X' } else { c }).collect();
     s.extend_from_slice(&[0; 4]);
     let v = Evaluator::new().run(&s);
@@ -395,8 +407,14 @@ impl Evaluator {
                         i += 1;
                         t
                     }
-                    // APPROXIMATION: a byte above 0x7F indexes the table with a negative
-                    // (`movsx`) offset, before the context; taken here as no operator
+                    // UNREACHABLE (2026-09-30): a byte above 0x7F indexes the tables with
+                    // a negative offset (`movsx edx, byte [edi]` 0x52F84A, `[edx+esi+0x100]`
+                    // 0x52F850, `[edx+esi]` 0x52F85F) — the heap before the context object.
+                    // Taken here as no operator. No shipped expression holds such a byte: all 98
+                    // `.lay` and 75 `.ctr` files are pure ASCII (checked byte by byte), and none
+                    // of the 59 461 texts of the layout sweep has one; the only non-ASCII files
+                    // of the front end are the `Locale` strings, which are spliced (`%name%`,
+                    // 0x526B60) and never evaluated.
                     None if e > 0x7F => 0,
                     None => e,
                 }
@@ -670,8 +688,13 @@ impl Evaluator {
     }
 
     /// `0x530DB8` — a name. `^A`…`^Z` are 1…26; the symbol table is always empty in the game, so
-    /// every other name is 0 — `narg` included, which reads a dword the evaluator never writes
-    /// (`[[ctx+0x220]]`, the top of its operator buffer), APPROXIMATION: 0.
+    /// every other name is 0 — `narg` included (0x530ECE: `_stricmp(name, "narg")`, then
+    /// `eax = [[arg1+0x220]]`, −1 → 0, 0x530EE0…0x530EEF), which reads the dword at the end of the
+    /// operator buffer, `[ctx+0x220]` being the buffer's end (0x52F899, the first operator cell sits
+    /// at `end − 8`, 0x52F8CD): a dword past the buffer that the evaluator never writes (heap
+    /// contents), taken as 0. UNREACHABLE (2026-09-30): the name `narg` (any case) occurs
+    /// in none of the 98 `.lay` / 75 `.ctr` files (48 428 values) and in none of the 59 461
+    /// evaluated texts of the layout sweep.
     fn symbol(&mut self, t: &[u8]) -> Value {
         let n = t.iter().position(|&c| c == 0).unwrap_or(t.len());
         let t = &t[..n];
@@ -704,8 +727,11 @@ impl Evaluator {
 /// `0x530FB0` — the body of a quoted token and whether it was closed by its quote. `'…'` takes
 /// bytes as they are with `''` for a quote; `"…"` knows `\n \t \b \r \f \\ \< \' \"` and three
 /// octal digits, `""` for a quote, and `<expr>` for an expression's value in decimal (`%ld`,
-/// 0x5311E6). APPROXIMATION: the original evaluates `<expr>` on the same context and so resets the
-/// stacks of any parse it sits inside; this evaluates it on its own.
+/// 0x5311E6). The original evaluates `<expr>` on the same context (0x5311B9 `call 0x52F830` with
+/// the parse's own `esi`) and so resets the stacks of any parse it sits inside (0x52F893…0x52F8D3
+/// rewrite `[ctx+0x208…0x21C]`); this evaluates it on its own. UNREACHABLE (2026-09-30): a
+/// quoted token needs a `'` or `"`, and none of the 48 428 values of the 98 `.lay` / 75 `.ctr`
+/// files holds either (0 hits), nor does any of the 59 461 evaluated texts of the layout sweep.
 fn parse_quoted(t: &[u8]) -> (Vec<u8>, bool) {
     let at = |i: usize| t.get(i).copied().unwrap_or(0);
     let mut out = Vec::new();

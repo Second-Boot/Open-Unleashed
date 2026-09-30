@@ -11,35 +11,40 @@
 //! the old head; a full strip continues into a new one the same way. Strips come out of a ring
 //! that frees the oldest in-use strip when it runs out (0x478C10).
 //!
-//! Strips live **per cell** of the world's fitted quadtree (`0x47B660` roots it: the square
-//! `L = max(Δx, Δz)` of the world's box, centred on it; `0x47BE30` — the same split rule
-//! `WTrack`'s own culling tree uses, `RE/notes/particles.md` §10.1 / `RE/notes/COVERAGE-2026-09-26.md`
-//! §14.32.1/§14.32.2 — recurses it: a quadrant becomes a child only when its level is under 13 and
-//! (level ≤ 1, unconditionally, or the quadrant holds **32 or more** item centres); a quadrant that
-//! fails gets nothing at all, not even a leaf, so its positions are represented only by the
-//! parent. `0x479810`'s read-side cell walk descends into a node's matching quadrant only while
-//! the node is below the *chosen* level (the smallest level whose cell would still be 100 or more,
-//! 0x479972…0x4799D0) **and** has all four children — so a locally sparse quadrant coarsens the
-//! query cell for all three of its siblings too, and cells are several sizes, not one fixed
-//! `L/2^k`. Measured on real track data (`crates/nfs-game/examples/skid_tree_census.rs`): every
-//! shipped track but `skidpad` has this coarsening somewhere, often well below the chosen level
-//! (e.g. `alps`, chosen level 5, coarsens as early as level 2). 20 strips to a cell, and a wheel
-//! that leaves its cell opens a new strip in the next (0x4793AE…0x479452). A strip holds 192
-//! points on a world under 1200 across, else 12 (0x47993F…0x47995C).
+//! Strips live **per cell** of the world's fitted tree ([`crate::fitted_tree`], `WTrack+0x10`; the
+//! bundle's constructor 0x479900 takes it). The cells are cut by 0x479810 from the root down: a
+//! node with all four children and a level under the **chosen level** — the last level whose cell
+//! is still `[0x5B242C]` 100 or more (0x479972…0x4799D0) — hands its four children on; any other
+//! node (at the chosen level, or a leaf) becomes a cell, its record
+//! (0x478D90) keeping the node's key, the node's centre `(cx, cz)` and the sphere
+//! `(cx, 0, cz)` of radius `√(2·(max.x − cx)²)` that slot 3 (0x479FC0) answers. A position finds
+//! its cell in two steps (0x479190 / 0x478F30): 0x47BAD0 descends the tree from the root while the
+//! node is internal and fewer steps than the chosen level were taken, stopping at an empty child
+//! slot, and 0x47A300 — a `lower_bound` — takes the first cell record whose key is not below the
+//! node's; the cell records are sorted by the nodes' *addresses*, which is the order 0x479810
+//! creates them in (nodes come from the pool 0x47C180, handed out in the order 0x47BE30 allocates
+//! them — see [`crate::fitted_tree`]). Every internal node has all four children (0x47BF69 compares the
+//! node's own list with 32), so the node found is itself a cell whenever it lies at or above the
+//! chosen level; the `lower_bound` stays as the original's own step. 20 strips to a cell, and a wheel that leaves its cell
+//! opens a new strip in the next (0x4793AE…0x479452). A strip holds 192 points on a world under
+//! 1200 across, else 12 (0x47993F…0x47995C).
 //!
-//! The tree's items are the port's collision triangles' items — one per placed world article and
-//! one per `.scn` instance ([`nfs_assets::track::TrackGeometry::item_centres`]), the same
-//! population `TrackGeometry::collision_grid` turns into triangles. The original's own items are
-//! its bundles' eight box corners (0x47B6C6…0x47B89C, possibly rotated — `main.rs`'s "Read
-//! 2026-09-27" note on this box); the port takes an axis-aligned AABB centre of the same mesh
-//! instead — exact for an unrotated article, an APPROXIMATION for a rotated one. Checked
-//! 2026-09-24: the box of every drawn article and instance comes out the same as the original's
-//! bundle box (skidpad 750 m, monaco1 1818 m across), so the chosen level and the 192/12 capacity
-//! agree. APPROXIMATION left: the original finds a cell's record with a `lower_bound` over the
-//! cells that hold geometry (0x47A300), the port keys a cell by the tree node's build-order index.
+//! The tree's items are the vertices of the placed articles' first-LOD `vt` parts, its root the
+//! union of their box corners (`crate::world::tree_population`, 0x47B660). **Observed on the
+//! original (2026-10-01 SV, Wine, gdb at 0x47A300 and at the pool 0x47C180):** the cell table IS sorted
+//! ascending by the key at `+0x34` (457 of 457 records on industrial, the whole table each call; 193
+//! on alps), but the keys are two size classes of pool blocks (the 0x20 nodes of 0x47BF7E and the 0x10
+//! list items of 0x47BFCD) and the pool hands them out in DEscending address order (LIFO free lists:
+//! over the ascending keys the allocation index falls on 200 of 205 adjacent pairs), so "ascending
+//! addresses from the pool" was wrong. It changes nothing the port draws: 0x479810 creates a record
+//! for every node down to the chosen level, so every lookup of 0x479190 / 0x478F30 is an exact hit and
+//! the `lower_bound` never lands on a neighbour; the order the port keys the cells in is immaterial and
+//! is kept as the node id.
 
+use crate::fitted_tree::{FittedTree, Node};
 use crate::particles::SURFACE_ARGB;
 use glam::Vec3;
+use std::sync::Arc;
 
 /// Strips to a cell (0x479780 builds 20; 0x478C10 wraps at 0x14).
 pub const PER_CELL: usize = 20;
@@ -85,94 +90,95 @@ struct Emitter {
     state: u8,
 }
 
-/// One node of the fitted spatial tree — `0x47BE30`'s split rule (module doc above,
-/// `RE/notes/particles.md` §10.1): a quadrant becomes a child only when the node's level is under
-/// 13 and (level ≤ 1, unconditionally, or the quadrant holds 32 or more item centres). A quadrant
-/// that fails gets nothing at all, not even a leaf — its positions stay represented by this node.
+/// One cell record of `WLineBundle` (0x50 bytes): the tree node it is cut at (the key the
+/// original's `lower_bound` compares, 0x47A300) and the sphere 0x478D90 keeps at `+0x24`:
+/// `(cx, 0, cz)` of the node's centre and `√(2·(max.x − cx)²)` (0x478DE6…0x478E13), which the
+/// bundle's slot 3 (0x479FC0) hands the track walk.
 #[derive(Debug, Clone)]
-struct TreeNode {
-    /// this node's cell key — the port's own build-order index, replacing the original's
-    /// `lower_bound` over its sorted cell table (0x47A300, module doc above's APPROXIMATION)
-    id: u32,
-    min: (f32, f32),
-    max: (f32, f32),
-    children: [Option<Box<TreeNode>>; 4],
+struct Cell {
+    node: u32,
+    cx: f32,
+    /// the sphere's `y` (`+0x28`): 0 from 0x478D90, set to the height of the first mark a cell
+    /// takes (0x479190 at 0x47963A…0x47965D: while `|y| < 0.001`, `y = point.y`)
+    cy: f32,
+    cz: f32,
+    r: f32,
+    /// the nodes the cell record is registered into: the bundle's getBounds 0x47A000 is
+    /// the cube `(cx, ·, cz) ± 0.1` (`[0x5B2604]`), through 0x4893A0's eight corners, the hull
+    /// 0x5A0480, 0x47BDC0 and the budgeted spread 0x489930 like any `+5`-clear bundle's item
+    /// (0x489530); the record `+0x24` centre is the node's own centre, so the cube straddles its
+    /// four children and the spread goes down the four corners toward the centre
+    nodes: Vec<crate::world::RegisteredNode>,
 }
 
-/// A node's own quadrant subdivision — `q = (x ≥ cx) + 2·(z ≥ cz)` (`0x47BE30`/`0x479810`'s
-/// centre-relative test), the box halved on both axes.
-fn quadrant_of(min: (f32, f32), max: (f32, f32), q: usize) -> ((f32, f32), (f32, f32)) {
-    let (cx, cz) = ((min.0 + max.0) * 0.5, (min.1 + max.1) * 0.5);
-    match q {
-        0 => (min, (cx, cz)),
-        1 => ((cx, min.1), (max.0, cz)),
-        2 => ((min.0, cz), (cx, max.1)),
-        _ => ((cx, cz), max),
-    }
-}
-
-impl TreeNode {
-    /// `0x47BE30`, read to the instruction (`RE/RENDERING.md` "The node pass 0x47F400 and the
-    /// fitted tree's split 0x47BE30"): `items` a node's own undivided set; a quadrant's items are
-    /// gathered by the centre test above, and it becomes a child (recursed into) only when
-    /// `level < 13` and (`level <= 1` or that quadrant holds `>= 32` centres).
-    fn build(min: (f32, f32), max: (f32, f32), level: u32, items: &[(f32, f32)], next_id: &mut u32) -> Self {
-        let id = *next_id;
-        *next_id += 1;
-        let (cx, cz) = ((min.0 + max.0) * 0.5, (min.1 + max.1) * 0.5);
-        let mut quad: [Vec<(f32, f32)>; 4] = Default::default();
-        for &p in items {
-            quad[(p.0 >= cx) as usize + 2 * ((p.1 >= cz) as usize)].push(p);
-        }
-        let mut children: [Option<Box<TreeNode>>; 4] = [None, None, None, None];
-        for (q, ch) in children.iter_mut().enumerate() {
-            if level < 13 && (level <= 1 || quad[q].len() >= 32) {
-                let (qmin, qmax) = quadrant_of(min, max, q);
-                *ch = Some(Box::new(Self::build(qmin, qmax, level + 1, &quad[q], next_id)));
-            }
-        }
-        Self { id, min, max, children }
-    }
-
-    /// `0x479810`, corrected by `particles.md` §10.1: descend into the matching quadrant only
-    /// while this node's level is under the chosen level **and** it has all four children;
-    /// otherwise this node is the position's cell.
-    fn cell_of(&self, p: (f32, f32), chosen_level: u32, level: u32) -> u32 {
-        if level >= chosen_level || self.children.iter().any(|c| c.is_none()) {
-            return self.id;
-        }
-        let (cx, cz) = ((self.min.0 + self.max.0) * 0.5, (self.min.1 + self.max.1) * 0.5);
-        let q = (p.0 >= cx) as usize + 2 * ((p.1 >= cz) as usize);
-        match &self.children[q] {
-            Some(c) => c.cell_of(p, chosen_level, level + 1),
-            None => self.id,
-        }
-    }
-}
-
-/// The marks' cells: the fitted tree's root and the chosen level `0x479810`'s walk is capped at.
+/// The marks' cells: the fitted tree, the chosen level and the cell table 0x479810 cuts from it,
+/// in node-allocation order.
 #[derive(Debug, Clone)]
 struct Grid {
-    root: TreeNode,
+    tree: Arc<FittedTree>,
     chosen_level: u32,
+    cells: Vec<Cell>,
 }
 
 impl Grid {
+    /// 0x479972…0x4799D0 and 0x479810 over `tree`.
+    fn new(tree: Arc<FittedTree>) -> Self {
+        // the last level whose cell is 100 or more: step up while `cell[level] ≥ 100`, then one back
+        let mut level = 0u32;
+        while level < 13 && tree.cell(level) >= 100.0 {
+            level += 1;
+        }
+        let chosen_level = level.saturating_sub(1);
+        let mut cells = Vec::new();
+        Self::cut(&tree, tree.root(), chosen_level, &mut cells);
+        Self { tree, chosen_level, cells }
+    }
+
+    /// 0x479810: a node with all four children and a level under the chosen level recurses into
+    /// them in slot order; any other node is a cell.
+    fn cut(tree: &FittedTree, node: &Node, chosen: u32, out: &mut Vec<Cell>) {
+        let children = node.children.iter().flatten().count();
+        if node.level < chosen && children == 4 {
+            for c in node.children.iter().flatten() {
+                Self::cut(tree, c, chosen, out);
+            }
+            return;
+        }
+        let ((_, _), (max_x, _)) = tree.bounds(node);
+        let (cx, cz) = tree.centre(node);
+        let d = (max_x as f64 - cx as f64) as f32;
+        let r = ((2.0 * d as f64 * d as f64) as f32 as f64).sqrt() as f32;
+        // 0x47A000 (`fsub` / `fadd` of 0x3DCCCCCD to the record's centre, stored as floats), the
+        // corner order of 0x4893A0 as `world::build_article_nodes` has it
+        let (lo, hi) = ((cx - 0.1, cz - 0.1), (cx + 0.1, cz + 0.1));
+        let corners = [(lo.0, lo.1), (hi.0, lo.1), (hi.0, lo.1), (lo.0, lo.1), (lo.0, hi.1), (hi.0, hi.1), (hi.0, hi.1), (lo.0, hi.1)];
+        let hull = crate::fitted_tree::convex_hull(&corners);
+        let start = tree.locate(&corners);
+        let nodes = tree
+            .spread(start, &hull)
+            .into_iter()
+            .map(|n| {
+                let (ncx, ncz, nr) = tree.circle(n);
+                (n.id, ncx, ncz, nr)
+            })
+            .collect();
+        out.push(Cell { node: node.id, cx, cy: 0.0, cz, r, nodes });
+    }
+
+    /// 0x47BAD0 then 0x47A300: the index of the cell record for a position. A position outside the
+    /// tree's box answers a null node (key 0), which finds the first record. When no record's key
+    /// reaches the node's (a node past the last cell in allocation order) the original indexes
+    /// past its table; the last cell stands in (APPROXIMATION).
     fn cell_of(&self, p: Vec3) -> u32 {
-        self.root.cell_of((p.x, p.z), self.chosen_level, 0)
+        let key = self.tree.descend(p.x, p.y, p.z, self.chosen_level).map_or(0, |n| n.id);
+        let i = self.cells.partition_point(|c| c.node < key);
+        i.min(self.cells.len().saturating_sub(1)) as u32
     }
 }
 
-/// One cell's record (0x50 bytes in the original): its strips, `+0x3C` the strips set free and not
-/// yet handed out, `+0x4C` the ring's cursor. The original hands one of these out by a `lower_bound`
-/// over a sorted table keyed by cell id (`0x47A300`) and then indexes into the found record's own
-/// strip array with `0x479FC0` (a 4-dword record-by-index getter into `[cell+0x30]`,
-/// `COVERAGE-2026-09-26.md` §14.33.2 — `PORTED`); the port's `HashMap<u32, Ring>` keyed by
-/// [`TreeNode::id`] plays the same role in one step, the same build-order-index APPROXIMATION §0's
-/// module doc already records. `0x47A000` (a ±0.1-unit AABB built around a cell record's own
-/// stored point, used to tolerance-match a float position against that sorted table during the
-/// `lower_bound` search) has no equivalent here — the port's tree descent is exact and
-/// deterministic, so there is no float-tolerance gap for it to fill (`REPLACED`, same section).
+/// One cell's ring of strips (`+0x38` of its record): its strips, `+0x3C` the strips set free and
+/// not yet handed out, `+0x4C` the ring's cursor. `HashMap` key: the cell's index in the table
+/// ([`Grid::cell_of`]'s answer, the original's `(record − table) / 0x50`).
 #[derive(Debug, Clone)]
 struct Ring {
     strips: Vec<Strip>,
@@ -225,35 +231,26 @@ impl SkidMarks {
         Self::for_world_items(&[], Vec3::ZERO, Vec3::ZERO)
     }
 
-    /// 0x479900 over the world's box, with no item population — the chosen level and capacity
-    /// (below) but a tree that only ever carries its two mandatory levels ([`TreeNode::build`]'s
-    /// `level <= 1` rule), so every real cell coarsens to `L/4`. Kept for callers with no track
-    /// geometry to hand (tests, tools); [`Self::for_world_items`] is the one `App`'s race load
-    /// uses (`nfs_assets::track::TrackGeometry::item_centres`).
+    /// 0x479900 over the world's box with no item population — the chosen level and capacity
+    /// (below) but a tree that only ever carries its two mandatory levels (0x47BE30's `level <= 1`
+    /// rule), so every real cell coarsens to `L/4`. Kept for callers with no track geometry to hand
+    /// (tests, tools); [`Self::for_tree`] is the one `App`'s race load uses.
     pub fn for_world(min: Vec3, max: Vec3) -> Self {
         Self::for_world_items(&[], min, max)
     }
 
-    /// 0x479900 over the world's box: the fitted tree's root square and the chosen level
-    /// (0x47B8A2…0x47B94F, 0x479972…0x4799D0 — the last level whose cell would still be
-    /// `[0x5B242C]` 100 or more, at most the 13 the tree keeps), built from `items` by `0x47BE30`
-    /// ([`TreeNode::build`]), and the strips' capacity (0x47993F…0x47995C).
-    pub fn for_world_items(items: &[(f32, f32)], min: Vec3, max: Vec3) -> Self {
-        let (dx, dz) = (max.x - min.x, max.z - min.z);
-        let l = dx.max(dz);
-        let mut level: u32 = 0;
-        while level < 13 && l / (1u32 << level) as f32 >= 100.0 {
-            level += 1;
-        }
-        let chosen_level = level.saturating_sub(1);
-        let (x0, z0) = (min.x - (l - dx) * 0.5, min.z - (l - dz) * 0.5);
-        // a world of no size (no track yet) has a degenerate (zero-area) root box; the chosen
-        // level is then 0, so `Grid::cell_of` returns the root immediately regardless — one cell
-        let mut next_id = 0u32;
-        let root = TreeNode::build((x0, z0), (x0 + l, z0 + l), 0, items, &mut next_id);
-        let grid = Grid { root, chosen_level };
-        let capacity = if l < 1200.0 { MAX_CAPACITY } else { 12 };
-        Self { grid, capacity, rings: Default::default(), emitters: Vec::new() }
+    /// [`Self::for_tree`] over a tree built from the world box `min..max` and `points` (each
+    /// vertex's `(x, z)`, [`FittedTree::new`]).
+    pub fn for_world_items(points: &[(f32, f32)], min: Vec3, max: Vec3) -> Self {
+        Self::for_tree(Arc::new(FittedTree::new(min.to_array(), max.to_array(), points)))
+    }
+
+    /// 0x479900 over the world's fitted tree: the cells 0x479810 cuts at the chosen level, and the
+    /// strips' capacity (0x47993F…0x47995C: 192 while the root's side is under
+    /// `[0x5B4748]` 1200, else 12).
+    pub fn for_tree(tree: Arc<FittedTree>) -> Self {
+        let capacity = if tree.size < 1200.0 { MAX_CAPACITY } else { 12 };
+        Self { grid: Grid::new(tree), capacity, rings: Default::default(), emitters: Vec::new() }
     }
 
     pub fn capacity(&self) -> usize {
@@ -267,6 +264,53 @@ impl SkidMarks {
 
     pub fn strips(&self) -> impl Iterator<Item = &Strip> {
         self.rings.values().flat_map(|r| r.strips.iter()).filter(|s| s.visible())
+    }
+
+    /// The drawn strips by cell, in cell-table order and each cell's strips in array order — the
+    /// order the bundle's draw 0x47A060 walks them (`+0x38` array, 0x14 bytes a strip, 20 of them),
+    /// with the cell's own queue key ([`Self::cell_key`]).
+    pub fn cells<'a>(&'a self, eye: Vec3) -> impl Iterator<Item = (u32, Vec<&'a Strip>)> + 'a {
+        let mut ids: Vec<u32> = self.rings.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter().map(move |id| (self.cell_key(id, eye), self.rings[&id].strips.iter().filter(|s| s.visible()).collect()))
+    }
+
+    /// The cell record a position finds (0x47BAD0 + 0x47A300) — the sphere and the registered nodes
+    /// the walk sees (a census hook: `nfs-game/examples/skidwalk.rs`).
+    pub fn cell_at(&self, p: Vec3) -> Option<(f32, f32, f32, f32, &[crate::world::RegisteredNode])> {
+        let c = self.grid.cells.get(self.grid.cell_of(p) as usize)?;
+        Some((c.cx, c.cy, c.cz, c.r, &c.nodes))
+    }
+
+    /// [`Self::cells`] through the track walk's gates (0x47F890 for an item of
+    /// `WLineBundle`): `visit(cx, cz, r, registered nodes)` answers the value the walk hands the
+    /// drawer's queue, or `None` for a cell the walk drops (`crate::world::CellWalk::visit`); the
+    /// cells the walk keeps come in table order with their strips.
+    pub fn cells_walked<'a>(&'a self, visit: impl Fn(f32, f32, f32, f32, &[crate::world::RegisteredNode]) -> Option<u32>) -> Vec<(u32, Vec<&'a Strip>)> {
+        let mut ids: Vec<u32> = self.rings.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter()
+            .filter_map(|id| {
+                let strips: Vec<&Strip> = self.rings[&id].strips.iter().filter(|s| s.visible()).collect();
+                if strips.is_empty() {
+                    return None;
+                }
+                let c = self.grid.cells.get(id as usize)?;
+                Some((visit(c.cx, c.cy, c.cz, c.r, &c.nodes)?, strips))
+            })
+            .collect()
+    }
+
+    /// The `+0xC` key the walk hands the drawer's queue (0x44FFC0: `round(v)`) for a cell: the
+    /// non-`bl` item's value of 0x47F890 (`RE/RENDERING.md` "The walk"), `s²` with
+    /// `s = max(√d² − r, 0)` (the bit-trick root, [`crate::world::bit_root`]), `d²` the 3-D square
+    /// distance from the eye to the cell's sphere `(cx, cy, cz)` of radius `r` (0x479FC0), rounded to
+    /// even. The walk's own gates for a cell are [`Self::cells_walked`]'s.
+    pub fn cell_key(&self, cell: u32, eye: Vec3) -> u32 {
+        let Some(c) = self.grid.cells.get(cell as usize) else { return 0 };
+        let d2 = (c.cx - eye.x).powi(2) + (c.cy - eye.y).powi(2) + (c.cz - eye.z).powi(2);
+        let s = (crate::world::bit_root(d2) - c.r).max(0.0);
+        (s * s).round_ties_even() as u32
     }
 
     /// Car_init's emitter per wheel (0x410FCD → 0x478EA0), `id` the port's own numbering.
@@ -375,6 +419,14 @@ impl SkidMarks {
     /// 0x479190.
     fn append(&mut self, id: usize, p: Vec3, dir: Vec3, strength: f32) {
         let e = self.emitters[id];
+        // 0x479625…0x47965D: the cell's sphere `y` (`+0x28`, 0 from the constructor) takes the
+        // height of the point while it is still 0 (`0.001 > y > −0.001`)
+        if let Some(c) = e.cell.and_then(|c| self.grid.cells.get_mut(c as usize))
+            && c.cy < 0.001
+            && c.cy > -0.001
+        {
+            c.cy = p.y;
+        }
         let cap = self.capacity;
         let skip_commit = e.counter & COMMIT_MASK != 0;
         let w = e.half;
@@ -497,8 +549,8 @@ mod tests {
         // points a strip; the root is the 5000 m square centred on the box
         let m = SkidMarks::for_world(Vec3::new(0.0, 0.0, 0.0), Vec3::new(5000.0, 50.0, 3000.0));
         assert_eq!((m.grid.chosen_level, m.capacity), (5, 12));
-        assert_eq!(m.grid.root.min, (0.0, -1000.0));
-        assert_eq!(m.grid.root.max, (5000.0, 4000.0));
+        assert_eq!((m.grid.tree.min[0], m.grid.tree.min[2]), (0.0, -1000.0));
+        assert_eq!((m.grid.tree.min[0] + m.grid.tree.size, m.grid.tree.min[2] + m.grid.tree.size), (5000.0, 4000.0));
         // a small one keeps 192
         assert_eq!(SkidMarks::for_world(Vec3::ZERO, Vec3::new(800.0, 0.0, 600.0)).capacity, 192);
     }

@@ -180,12 +180,26 @@ pub const RAMP_SAMPLES: usize = 32;
 pub struct Gains {
     pub cur: [f32; 2],
     pub target: [f32; 2],
+    /// the channel's volume scalar, `+0xC` (the current) and `+0x10` (the target, 0x598700's
+    /// argument): the reverb send's wet gain `+8` is taken from it (0x5980A0)
+    pub vol: [f32; 2],
     /// set by a new target, cleared when a block has ramped to it
     pub pending: bool,
     started: bool,
 }
 
 impl Gains {
+    /// 0x598700's volume argument (`+0x10`), called before [`Gains::set`]: the voice's first one is
+    /// the current volume too (0x598630 copies `+0x10` to `+0xC`), a change of it is a pending ramp.
+    pub fn set_vol(&mut self, v: f32) {
+        if !self.started {
+            self.vol = [v, v];
+        } else if v != self.vol[1] {
+            self.vol[1] = v;
+            self.pending = true;
+        }
+    }
+
     /// 0x598700 with the new target. The voice's first one is taken at once — the start 0x598630
     /// copies the targets to the current gains with the flag clear (0x598652…0x598661).
     pub fn set(&mut self, target: [f32; 2]) {
@@ -212,7 +226,16 @@ impl Gains {
         self.pending = false;
         let len = n.min(RAMP_SAMPLES);
         let step = [0, 1].map(|c| ((self.target[c] as f64 - self.cur[c] as f64) / len as f32 as f64) as f32);
-        Some(Ramp { len, step })
+        // the volume's step, 0x598146: `(+0x10 − +0xC) / n` as an f32
+        let vol_step = ((self.vol[1] as f64 - self.vol[0] as f64) / len as f32 as f64) as f32;
+        Some(Ramp { len, step, vol_step })
+    }
+
+    /// The volume scalar `+0xC` after the ramp's next sample (0x5981BF…0x5981C7, in the last
+    /// channel's pass): `+0xC = step + +0xC`, an f32.
+    pub fn ramp_vol_next(&mut self, r: &Ramp) -> f32 {
+        self.vol[0] = (r.vol_step as f64 + self.vol[0] as f64) as f32;
+        self.vol[0]
     }
 
     /// The gain of channel `c` for the ramp's next sample.
@@ -224,6 +247,8 @@ impl Gains {
     /// The ramp's end: the current gains are the targets.
     pub fn ramp_done(&mut self) {
         self.cur = self.target;
+        // 0x59821B's tail: `+0xC = +0x10`
+        self.vol[0] = self.vol[1];
     }
 }
 
@@ -231,6 +256,7 @@ impl Gains {
 pub struct Ramp {
     pub len: usize,
     pub step: [f32; 2],
+    pub vol_step: f32,
 }
 
 /// **0x59A350**, the store of the float mix as 16 bits: `x + 12582912.0` (`[0x5C1800]`, 1.5·2²³)
