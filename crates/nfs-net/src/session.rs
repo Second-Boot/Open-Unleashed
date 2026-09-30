@@ -119,11 +119,13 @@ pub struct Net {
     /// `[0x6B7C7C]` is the multimedia timer's counter).
     epoch: std::time::Instant,
     /// Host only: the game's gate on a joiner, which the original runs as the callback `conn[0x1C]+0x4C`
-    /// (0x588EBF…0x588ED3, refusing with `-3`) — the room's version and game-name checks (0x48A700,
-    /// 0x49151E…0x491569): `(game, version)` this host answers to. A joiner whose identity string
-    /// ([`comm::identity`], the `'j'` record's tail) names another version or another game is
-    /// refused. `None` (a test's bare session) lets everyone in.
-    pub identity_gate: Option<(String, String)>,
+    /// (0x588EBF…0x588ED3, refusing with `-3`) — 0x48A700's version check (the identity's second
+    /// field against `"3.5"`, 0x5D06FC): the version this host answers to. A joiner whose identity
+    /// string ([`comm::identity`], the `'j'` record's tail) names another version is refused. The
+    /// room's game-name test (0x49151E…0x491569) belongs to the `0xB6` room request of the lobby
+    /// service (case 182 of 0x491010) and is not run for a LAN / direct join (`network.md` §11.28).
+    /// `None` (a test's bare session) lets everyone in.
+    pub identity_gate: Option<String>,
     /// `conn+0xA8`
     alive: u32,
     /// `conn+0xAC`
@@ -574,9 +576,9 @@ impl Net {
         if j.name == self.my_name && self.my_name != [0; 16] {
             return JoinReply { status: JoinStatus::NameTaken, ..echo };
         }
-        if let Some((game, version)) = &self.identity_gate {
-            let (_, v, g) = comm::identity::parse(&j.record);
-            if &v != version || &g != game {
+        if let Some(version) = &self.identity_gate {
+            let (_, v, _) = comm::identity::parse(&j.record);
+            if &v != version {
                 return JoinReply { status: JoinStatus::Refused, ..echo };
             }
         }

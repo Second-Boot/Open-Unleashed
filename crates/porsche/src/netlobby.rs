@@ -12,6 +12,9 @@ use nfs_net::slots;
 
 /// The `Comms.PlayerList` row's tags: 0x5D7524, 0x5D7518, 0x5D7508.
 const NAMEPOS: &str = "ID_NAMEPOS";
+/// APPROXIMATION (instant): how many ticks the update thread 0x4A5750 is still seen running (state 2) after
+/// `SETMODENET`; the original's duration is the DLL's connect to `trans.ea.com:80`, which the port never makes.
+pub(crate) const UPDATE_THREAD_TICKS: u32 = 1;
 const CARPOS: &str = "ID_CARPOS";
 const STATUSPOS: &str = "ID_STATUSPOS";
 
@@ -545,5 +548,60 @@ impl App {
         tracing::info!(state = st, notice, "comm state notice (0x509550)");
         self.net.join_notified = true;
         self.fe_raise_dialog(nfs_game::dialog::DialogKind::One, notice, [0, 0], DialogFor::NetFail);
+    }
+
+    /// **`SETMODENET`'s update check** (0x510D80 → 0x4A56E0 on the object at 0x655A30; `network.md` §11.22).
+    ///
+    /// The handler builds the one-button dialog `0x512F70(0x4E, 0)` = **78** «Checking for updates…» into
+    /// `[+0x29C]`, raises it (slot 0x34), sets `[+0x296] = 1`, and 0x4A56E0 — `fe.txt`'s `castanet=1` — sets the
+    /// thread state `[obj+0x2F4] = 2` and starts the thread 0x4A5750 (`mrbupd.dll`: `mrbInitUpdate`, prepare /
+    /// repair / update-available checks, then state 0 / 1 / 3). The button destination (`accountlogin`) opens as
+    /// usual, the dialog over it.
+    ///
+    /// The thread's answer on this install (`.castanet\properties.txt` + `index.mrb`, no `undo.mrb` /
+    /// `holding.mrb`) is **state 0** whatever the transmitter does (§11.21 item 6); the port never contacts
+    /// `trans.ea.com`. **APPROXIMATION (instant):** the thread's duration — in the original the DLL's connect to
+    /// `trans.ea.com:80` (a black hole, OS-dependent: seconds) — is here the case of a machine whose connect is
+    /// refused at once: the thread is done before the second tick after the click (`UPDATE_THREAD_TICKS` = 1 tick
+    /// still seen as running: the thread starts in the click's frame, and its file checks and the refused connect
+    /// take more than the rest of that frame). `NFS_UPDATE_CHECK_TICKS=<n>` (test glue) runs it `n` ticks longer.
+    /// **`SETMODENET`'s update check** (`network.md` §11.22). The handler 0x510D80 (inline in `layout_key`'s
+    /// `SETMODENET` arm) builds the one-button dialog `0x512F70(0x4E, 0)` = **78** «Checking for updates…» into
+    /// `[+0x29C]`, raises it (slot 0x34), sets `[+0x296] = 1`, and 0x4A56E0 — `fe.txt`'s `castanet=1` — sets the
+    /// thread state `[obj+0x2F4] = 2` and starts the thread 0x4A5750 (`mrbupd.dll`); the button's destination
+    /// (`accountlogin`) opens as usual, the dialog over it. The thread's answer on this install
+    /// (`.castanet\properties.txt` + `index.mrb`, no `undo.mrb` / `holding.mrb`) is **state 0** whatever the
+    /// transmitter does (§11.21 item 6); the port never contacts `trans.ea.com`.
+    ///
+    /// **APPROXIMATION (instant):** the thread's duration — in the original the DLL's connect to `trans.ea.com:80`
+    /// (a black hole, OS-dependent: seconds) — is here the case of a machine whose connect is refused at once: the
+    /// thread is still running at the click frame's own tick and done at the next ([`UPDATE_THREAD_TICKS`] = 1).
+    /// `NFS_UPDATE_CHECK_TICKS=<n>` (test glue) runs it `n` ticks instead.
+    ///
+    /// **`FEMainScreen`'s tick 0x5103F0, the update half** (0x510461…0x510493): `0x4A5930` reads the thread's
+    /// state; while it is **2** the dialog stays (its button: [`DialogFor::UpdateCheck`]); any other state deletes
+    /// it at once (`[+0x29C] = 0`) — and state 0, this install's answer, does nothing more (state 3 would raise
+    /// the 0x2BE dialog, state 1 the question 0x32C: neither is reachable here, `network.md` §11.22).
+    pub(crate) fn update_check_tick(&mut self) {
+        let Some((left, restamp)) = self.fe.update_check else { return };
+        if self.vehicle.is_some() || self.fe.layout_preview.is_none() {
+            return;
+        }
+        if restamp {
+            // the screen's clock restarted when `accountlogin` opened; the dialog's fade counts from now
+            let now = self.fe.layout_preview.as_ref().map(|l| l.ticks()).unwrap_or(0);
+            if let Some((d, DialogFor::UpdateCheck)) = self.fe.dialog.as_mut() {
+                d.raise(now);
+            }
+        }
+        if left > 0 {
+            self.fe.update_check = Some((left - 1, false));
+            return;
+        }
+        // state 0
+        self.fe.update_check = None;
+        if matches!(self.fe.dialog, Some((_, DialogFor::UpdateCheck))) {
+            self.fe.dialog = None;
+        }
     }
 }

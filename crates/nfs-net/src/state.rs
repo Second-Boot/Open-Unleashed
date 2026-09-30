@@ -28,8 +28,10 @@ pub struct CarState {
     /// +0x03 — `car+0xD8A`, the **packed controller buttons** `[0x5E9664]`, copied into the car
     /// each frame at 0x499216 and unpacked at 0x499316: bit 0 → `car+0xD85`, bit 1 → `car+0xD86`,
     /// and `>> 3` → `car+0xD8B`, the command byte whose 7…15 range 0x49934A switches on (5 is the
-    /// AI's reset request). What bits 0 and 1 drive is **UNKNOWN**, so a port that has no
-    /// equivalent state sends zero rather than guessing.
+    /// AI's reset request). Bit 0 is the handbrake and bit 1 the horn (`replay.md` §2, the packer 0x412E70;
+    /// `network.md` §11.21): the receiver's remote arm (0x4992B3…0x4992BF) takes exactly those two into
+    /// `car+0xD85` / `car+0xD86`; its command bits are not read from the block (the remote car's `car+0xD8B` is the
+    /// receiver's own pad's command, 0x499336).
     pub buttons: u8,
     /// +0x04 — the sender's `gGameTick`
     pub tick: u32,

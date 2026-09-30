@@ -308,7 +308,7 @@ impl CullView {
     /// 0x539480 for a perspective camera: the centre in view space (looking down −z), then the
     /// near / far pair and the two side pairs, each pair taken by the sign of its first form.
     /// The tangents and cosines `[+0xF8…+0x104]` are the port's own frustum's (MEDIUM).
-    fn sphere_visible(&self, c: Vec3, r: f32) -> bool {
+    pub fn sphere_visible(&self, c: Vec3, r: f32) -> bool {
         let rel = c - self.eye;
         let depth = rel.dot(self.forward);
         let a = self.near - depth;
@@ -2830,6 +2830,9 @@ pub struct LodView {
     pub view_projection: Mat4,
     pub width: f32,
     pub height: f32,
+    /// the render width `[0x657A48]` the reference 640 is taken over (0x43A2D7): the window's
+    /// width, whichever view's viewport `width` / `height` are
+    pub ref_width: f32,
 }
 
 /// The car's collision body points `car+0x8C` (`BndP`, `RE/notes/car-model.md` §12): the records
@@ -4123,7 +4126,7 @@ impl CarModel {
         let d1 = (s1 - s0).length_squared();
         let d2 = (s2 - s0).length_squared();
         // x87: the two roots summed and scaled on the stack, `fst` to a float for the root below
-        let size = (bit_root(d1) as f64 + bit_root(d2) as f64) * (640.0 / view.width as f64);
+        let size = (bit_root(d1) as f64 + bit_root(d2) as f64) * (640.0 / view.ref_width as f64);
         if size <= 3.0 {
             return None;
         }

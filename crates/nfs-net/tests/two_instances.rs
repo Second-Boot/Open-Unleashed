@@ -167,10 +167,11 @@ fn a_name_the_host_already_uses_is_refused() {
 }
 
 /// The joiner's identity string `name~version~game` (0x48A700) is what the host's gate reads: another
-/// version or another game is the callback's refusal (0x588EBF…0x588ED3 → `-3`), and the slot the
-/// allocator handed out is given back.
+/// version is the callback's refusal (0x588EBF…0x588ED3 → `-3`), and the slot the allocator handed
+/// out is given back. The game field is not a LAN / direct join's business (the room-name test is the
+/// lobby's `0xB6` request only; the game sends it empty, 0x5E8E50) — a game name with a space joins.
 #[test]
-fn the_identity_gate_refuses_another_version_or_another_game_and_lets_the_right_one_in() {
+fn the_identity_gate_refuses_another_version_and_lets_any_game_name_in() {
     use nfs_net::comm::identity;
     let join_with = |h: &mut Net, name: &str, id: &[u8]| {
         let mut c = client(name);
@@ -184,15 +185,17 @@ fn the_identity_gate_refuses_another_version_or_another_game_and_lets_the_right_
         })
     };
     let mut h = host(8);
-    h.identity_gate = Some(("Zone".to_string(), "3.5".to_string()));
+    h.identity_gate = Some("3.5".to_string());
     assert_eq!(join_with(&mut h, "old", &identity::encode("old", "3.4", "Zone")), JoinStatus::Refused, "version");
-    assert_eq!(join_with(&mut h, "lost", &identity::encode("lost", "3.5", "Elsewhere")), JoinStatus::Refused, "game");
     assert_eq!(join_with(&mut h, "bare", &[]), JoinStatus::Refused, "no identity at all");
     assert_eq!(h.mask, 0, "a refused joiner keeps no slot");
-    assert_eq!(join_with(&mut h, "right", &identity::encode("right", "3.5", "Zone")), JoinStatus::Joined(0));
+    assert_eq!(join_with(&mut h, "right", &identity::encode("right", "3.5", "")), JoinStatus::Joined(0));
+    // the game field is not compared: a joiner of a room named with a space (the CREATE dialog's
+    // default `Игра DRIVER`) or naming anything else still gets in
+    assert_eq!(join_with(&mut h, "other", &identity::encode("other", "3.5", "Elsewhere")), JoinStatus::Joined(1));
     // a full host answers -2 before it looks at the name or the identity (0x588E4F…0x588E67 first)
     let mut full = host(2);
-    full.identity_gate = Some(("Zone".to_string(), "3.5".to_string()));
+    full.identity_gate = Some("3.5".to_string());
     assert_eq!(join_with(&mut full, "a", &identity::encode("a", "3.5", "Zone")), JoinStatus::Joined(0));
     assert_eq!(join_with(&mut full, "host", &identity::encode("host", "9.9", "Nowhere")), JoinStatus::Full);
 }

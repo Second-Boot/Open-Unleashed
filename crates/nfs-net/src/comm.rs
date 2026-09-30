@@ -405,8 +405,10 @@ impl JoinReply {
 
 /// A peer's identity, the string 0x48A700 parses: **`name~version~game`** — `sscanf(s,
 /// "%[^~]~%[^~]~%s")` (0x5D0618) into the peer record's `+0x24` (the name), `+0x64` (the version)
-/// and `+0x84` (the game); the version is then compared with `"3.5"` (0x5D06FC) and the game with
-/// the room's name (0x49151E…0x491569, 0x4915C6…0x491610).
+/// and `+0x84` (the game); the version is then compared with `"3.5"` (0x5D06FC). The game field is
+/// the empty string 0x5E8E50 in every identity the game builds (0x48AA10's callers 0x48E070,
+/// 0x48E296, 0x48E60F); only the lobby's `0xB6` room request compares it with a room's `+0x40`
+/// (0x49151E…0x491569, 0x4915C6…0x491610) — `network.md` §11.28.
 pub mod identity {
     /// What a peer sends: `name~version~game`.
     pub fn encode(name: &str, version: &str, game: &str) -> Vec<u8> {

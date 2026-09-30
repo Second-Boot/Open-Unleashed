@@ -17,6 +17,7 @@ pub mod keyname;
 pub mod lanes;
 pub mod layout;
 pub mod movie_overlay;
+pub mod netcar;
 pub mod opponents;
 pub mod particles;
 pub mod police;

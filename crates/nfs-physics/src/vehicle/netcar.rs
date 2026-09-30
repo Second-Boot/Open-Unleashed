@@ -175,7 +175,7 @@ impl Vehicle {
     /// normal `car+0x3E8`, the other rows rebuilt from it (`row0 = up × fwd`, `fwd = row0 × up`,
     /// 0x532880 twice), 0x4A4810, the speed estimate, the `Susp_update` re-seat, then
     /// `car+0xC = −1` (the tracker forgets its patch) and 0x49AE30.
-    fn net_snap_tail(&mut self, grid: &TriangleGrid, specs: &CarSpecs) {
+    pub fn net_snap_tail(&mut self, grid: &TriangleGrid, specs: &CarSpecs) {
         self.tracker.track(grid, self.position);
         let up = self.tracker.plane_normal;
         let fwd = self.orientation.row(2);
@@ -200,6 +200,22 @@ impl Vehicle {
             w.compression = 0.0;
             w.airborne = false;
         }
+    }
+
+    /// **The two snap arms of 0x4A0680** (0x4A0803…0x4A086B and 0x4A0930…0x4A0994): the stale remote
+    /// car is put on the slice the road walk chose — `car+0x388 / +0x38C / +0x390 = 0`, the velocity
+    /// `0x532360(1, slice+0x1C, along, car+0x33C)` = the slice's forward times the block's speed along it,
+    /// the forward row `car+0x37C` = the slice's forward, the position `car+0x330` = the block's `P` (`+0x50`)
+    /// — and then 0x4A02A0 ([`Self::net_snap_tail`]).
+    pub fn net_stale_place(&mut self, p: Vec3, forward: Vec3, along: f32, grid: &TriangleGrid, specs: &CarSpecs) {
+        self.net_car = true;
+        self.angular_velocity = Vec3::ZERO;
+        self.velocity = forward * along;
+        let mut r = rows(self.orientation);
+        r[2] = forward.to_array();
+        self.orientation = from_rows(r);
+        self.position = p;
+        self.net_snap_tail(grid, specs);
     }
 
     /// **0x4A03D0**, the store's snap when the lag has run past its limits (`car+0x70` was clear): the

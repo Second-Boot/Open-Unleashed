@@ -210,6 +210,30 @@ impl Remote {
     }
 }
 
+/// Which of 0x4991E0's controller arms a remote car of a positional race takes this tick
+/// ([`NetPlay::seat_arm`]).
+#[derive(Debug, Clone, Copy)]
+pub enum SeatArm {
+    /// no block yet (`car+0xDA8 == 0`, `car+0xDAC == 0`): the local pad
+    Pad,
+    /// the last block's controls (`+0x38`, `+0x3A`, `+0x3B`)
+    Block { brake: u8, steer: i32, handbrake: bool, horn: bool },
+    /// stale (`car+0xDA8 == 1`): the AI arm; `stale` is `car+0x70`, the gate of 0x4A0680
+    Ai { block: nfs_physics::vehicle::NetBlock, stale: bool },
+}
+
+impl SeatArm {
+    /// The seat's `car+0xD86` for the horn's audio: the block's bit 1, the local pad's horn before the first
+    /// block, 0 for the AI arm (0x499279: `car+0xD86 = 0`).
+    pub fn horn(&self, local_horn: bool) -> bool {
+        match *self {
+            SeatArm::Pad => local_horn,
+            SeatArm::Block { horn, .. } => horn,
+            SeatArm::Ai { .. } => false,
+        }
+    }
+}
+
 pub struct NetPlay {
     pub net: Net,
     /// Our own player id: the host is 0, a client is its slot + 1.
@@ -459,8 +483,9 @@ impl NetPlay {
                 let mut n = Net::host(sock, name, KEY, limit);
                 n.advertise = advertised_record();
                 n.my_name = name16(who);
-                // 0x588EBF…0x588ED3 → the room's checks (0x48A700, 0x49151E…): the version and the game
-                n.identity_gate = Some((game_name.to_string(), game_version()));
+                // 0x588EBF…0x588ED3 → 0x48A700: the version (the game-name test 0x49151E… is the
+                // lobby's `0xB6` room request only, never a LAN / direct join — `network.md` §11.28)
+                n.identity_gate = Some(game_version());
                 tracing::info!(addr = %n.local_addr()?, "hosting");
                 n
             }
@@ -1203,15 +1228,22 @@ impl NetPlay {
         self.exchange = false;
     }
 
-    /// The seats the network owns this tick: every one a remote player has driven, present or gone.
-    /// In an input-exchange race that is every seat with a player behind it (the launch's numbering,
-    /// `player+0x4C`): each is a car the same simulation runs on the frames' inputs, from the first tick.
+    /// The seats the network owns this tick. In an input-exchange race that is every seat with a player
+    /// behind it (the launch's numbering, `player+0x4C`): each is a car the same simulation runs on the
+    /// frames' inputs, from the first tick. In a positional race **every reserved seat**: the cars of the
+    /// other players are human cars from the start (`car+0xDA8 == 0`), and one whose player has not sent a
+    /// block yet (`car+0xDAC == 0`) is driven by the local pad (0x4991E0, [`SeatArm::Pad`]) — a seat is not
+    /// the network's only once a block has come, as it was until that change.
     pub fn owned_seats(&self) -> Vec<usize> {
         if self.exchanging() {
             return (0..self.seats.len()).filter(|k| self.seat_race_index(*k).is_some()).collect();
         }
-        let mut v = self.driven.clone();
-        v.extend(self.remotes.values().map(|r| r.seat).filter(|s| !self.driven.contains(s)));
+        let mut v = self.seats.clone();
+        for s in self.driven.iter().copied().chain(self.remotes.values().map(|r| r.seat)) {
+            if !v.contains(&s) {
+                v.push(s);
+            }
+        }
         v
     }
 
@@ -1274,11 +1306,12 @@ impl NetPlay {
                         .to_string();
                     log.push(format!("found \"{n}\" at {from}"));
                     // the host has answered the probe: the handshake follows, carrying the identity
-                    // string `name~version~game` (0x55CED0; the game is the answer's name, the
-                    // version this install's own — 0x48DDC2's `NfsNet+0x2C`)
+                    // string `name~version~game` (0x55CED0; the version this install's own — 0x48DDC2's
+                    // `NfsNet+0x2C`). The game field is **empty**: every 0x48AA10 the game makes pushes
+                    // the shared empty string 0x5E8E50 there (the join / connect 0x48E296, 0x48E60F, the
+                    // host 0x48E070); only the lobby service's rooms fill it (`network.md` §11.28)
                     if let Some((host, who, _)) = self.join_wait.take() {
-                        let game = nfs_net::comm::desc::split_name(&describe.name).0;
-                        let id = nfs_net::comm::identity::encode(&who, &game_version(), &game);
+                        let id = nfs_net::comm::identity::encode(&who, &game_version(), "");
                         log.push(format!("join sent, identity {:?}", String::from_utf8_lossy(&id[..id.len() - 1])));
                         if let Err(e) = self.net.join(host, &id) {
                             log.push(format!("join not sent: {e}"));
@@ -1518,6 +1551,11 @@ impl NetPlay {
     /// port (`remote_players`, 0x4B4DA0 numbering the list in order).
     pub fn seat_race_index(&self, k: usize) -> Option<u32> {
         self.index_table().iter().filter(|(id, _)| *id != self.id as i32).nth(k).map(|(_, i)| *i)
+    }
+
+    /// `net+0xBD`: a `0xB7` has gone out since the race started (this machine's car has finished or left).
+    pub fn finish_sent(&self) -> bool {
+        self.sent_time
     }
 
     /// `net+8 != 0 && +0xBF == 0`: the session exists and its link has not dropped (0x48F0C4 sets
@@ -1811,20 +1849,36 @@ impl NetPlay {
         }
     }
 
-    /// **0x4991E0's remote arm** (0x499285…0x4992CD), which a car with `car+0xDA8 == 0` and `car+0xDAC` set
-    /// takes: the controller is the last block — the steering `car+0xD90 = (i8) +0x38`, the brake
-    /// `car+0xD7D = +0x3A`, `car+0xD85` the low bit of `+0x3B` (the handbrake bit of the packed buttons).
-    /// The throttle `car+0xD7C` is not written from the wire and the gear is forced neutral by the apply,
-    /// so it is 0 here. `None` before the first block or while the car is stale (`+0x70`: the AI drives).
-    pub fn remote_controls(&self, seat: usize) -> Option<nfs_physics::vehicle::Controls> {
-        let r = self.remotes.values().find(|r| r.seat == seat).filter(|r| r.got && !r.held && !r.stale)?;
-        Some(nfs_physics::vehicle::Controls {
-            throttle: 0,
-            brake: r.state.brake,
-            steer: r.state.steer as i32,
-            handbrake: r.state.buttons & 1 != 0,
-            command: 0,
-        })
+    /// **0x4991E0's three arms for a remote car of a positional race** (0x4991F5…0x499330), by `car+0xDA8`
+    /// (`Remote::held`, written by the 64 Hz gate 0x49B9D5 / 0x49B9F1) and `car+0xDAC` (`Remote::got`, the
+    /// first block):
+    ///
+    /// * **`DA8 == 0`, `DAC == 0` — before the first block**: the controller copy reads the **local pad**
+    ///   ([`SeatArm::Pad`]): the throttle, brake, steering, handbrake and horn bit of `[0x5E9664…67]`, as the
+    ///   local car does (0x4992CF…0x499330). A car a remote player has not yet sent a block for is driven by
+    ///   this machine's own controller;
+    /// * **`DA8 == 0`, `DAC != 0`** ([`SeatArm::Block`], 0x499285…0x4992CD): the last block — the steering
+    ///   `car+0xD90 = (i8) +0x38`, the brake `car+0xD7D = +0x3A`, `car+0xD85` the low bit of `+0x3B` (the
+    ///   handbrake bit of the packed buttons), `car+0xD86` its bit 1 (the horn). **The throttle `car+0xD7C` is not
+    ///   written by this arm** (0x499285…0x4992CD store `+0xD90`, `+0xD7D`, `+0xD85`, `+0xD86` only): it keeps the
+    ///   byte the arm before left — the local pad's before the first block, the AI's after a stale spell — and the
+    ///   apply forces the gear neutral (0x4A0D47), so it only revs the engine;
+    /// * **`DA8 != 0`** ([`SeatArm::Ai`]): the car is stale (`car+0x70`) — 0x40B650 / 0x40BFE0 drive it, then
+    ///   0x4A0680 (`nfs_game::netcar::stale_place`) while `+0x70` is still set; `car+0xD86 = 0`.
+    ///
+    /// In every arm `car+0xD8B` is then the **local** pad's command (`[0x5E9664] >> 3`, 0x499336), which the
+    /// caller sets.
+    pub fn seat_arm(&self, seat: usize) -> SeatArm {
+        match self.remotes.values().find(|r| r.seat == seat) {
+            Some(r) if r.got && r.held => SeatArm::Ai { block: r.block(), stale: r.stale },
+            Some(r) if r.got => SeatArm::Block {
+                brake: r.state.brake,
+                steer: r.state.steer as i32,
+                handbrake: r.state.buttons & 1 != 0,
+                horn: r.state.buttons & 2 != 0,
+            },
+            _ => SeatArm::Pad,
+        }
     }
 
     /// **0x49B9AB…0x49B9EC** — the gate in `Car_integrateOrient` 0x49B8E0, then the apply 0x4A0A40
@@ -1860,8 +1914,11 @@ impl NetPlay {
         true
     }
 
-    /// The send gate of 0x48EE20 — once every eight ticks, the 40-byte `0xBE` packet.
-    pub fn send(&mut self, tick: u64, v: &Vehicle) {
+    /// The send gate of 0x48EE20 — once every eight ticks, the 40-byte `0xBE` packet. `buttons` is the block's
+    /// `+0x03`, `car+0xD8A`: the packed controller byte `[0x5E9664]` the local car's controller copy 0x4991E0
+    /// took at its last 32 Hz run (0x499211…0x499216) — bit 0 the handbrake, bit 1 the horn, bits 3…7 the
+    /// command code (`nfs_game::replay::Packet`).
+    pub fn send(&mut self, tick: u64, v: &Vehicle, buttons: u8) {
         if tick & TICK_MASK != TICK_MASK || self.id == u8::MAX || !self.positional {
             return;
         }
@@ -1872,9 +1929,9 @@ impl NetPlay {
             steer: v.steer.clamp(-126, 126) as i8,
             airborne: v.height_marker >= 0.5,
             brake: (v.brake * 252.0).clamp(0.0, 252.0) as u8,
-            // the packed controller buttons of [0x5E9664]; bits 0 and 1 are UNKNOWN and the
-            // command nibble has no equivalent here, so nothing is invented
-            buttons: 0,
+            // `car+0xD8A`, the packed controller buttons `[0x5E9664]` (0x499216) — read back by the receiver's
+            // 0x4991E0 remote arm as `car+0xD85` (bit 0, the handbrake) and `car+0xD86` (bit 1, the horn)
+            buttons,
             tick: tick as u32,
             // `car+0x38C`, the second component of the angular velocity — the yaw rate
             yaw_rate: v.angular_velocity.y,
@@ -3063,5 +3120,35 @@ mod tests {
         assert!(!host.retired(1, 0) && !p.retired(0, 0));
         host.commands[1] = nfs_net::exchange::CMD_LEFT;
         assert!(host.retired(1, 0));
+    }
+
+    /// 0x4991E0's three arms for a remote car of a positional race: the local pad before the first block
+    /// (`car+0xDA8 == 0`, `car+0xDAC == 0`), the block's steering / brake / handbrake / horn after it, the AI
+    /// arm once the 64 Hz gate has held the car (`car+0xDA8 == 1`); and every reserved seat is the network's
+    /// from the first tick (a seat is not owned only once a block has come).
+    #[test]
+    fn a_remote_seat_is_driven_by_the_local_pad_until_its_first_block_then_by_the_block_then_by_the_ai() {
+        let mut host = NetPlay::start("host:0", "HOSTY").unwrap();
+        host.reserve(vec![0, 1]);
+        assert_eq!(host.owned_seats(), vec![0, 1], "every reserved seat, blocks or not");
+        assert!(matches!(host.seat_arm(0), SeatArm::Pad));
+        assert!(SeatArm::Pad.horn(true) && !SeatArm::Pad.horn(false), "the local pad's horn");
+        let st = |tick, buttons| CarState { steer: -40, airborne: false, brake: 90, buttons, tick, yaw_rate: 0.0, orientation: [0; 4], velocity: [0.0; 3], position: [0.0; 3] };
+        let mut r = Remote::new(0);
+        r.store(st(100, 0b11), 100);
+        assert!(r.got);
+        host.remotes.insert(1, r);
+        match host.seat_arm(0) {
+            SeatArm::Block { brake, steer, handbrake, horn } => assert_eq!((brake, steer, handbrake, horn), (90, -40, true, true)),
+            other => panic!("{other:?}"),
+        }
+        assert!(host.seat_arm(0).horn(false), "the block's bit 1");
+        // the apply held the car (`car+0xDA8 = 1`): the AI arm, the horn byte cleared (0x499279)
+        host.remotes.get_mut(&1).unwrap().held = true;
+        host.remotes.get_mut(&1).unwrap().stale = true;
+        assert!(matches!(host.seat_arm(0), SeatArm::Ai { stale: true, .. }));
+        assert!(!host.seat_arm(0).horn(true));
+        // the other seat has no block yet
+        assert!(matches!(host.seat_arm(1), SeatArm::Pad));
     }
 }

@@ -1009,7 +1009,7 @@ impl TrafficSet {
                 // its script on the car's next AI update
                 let c = &mut self.cars[i];
                 for (target, trigger) in requests {
-                    tracing::debug!(car = i, ?trigger, "traffic script trigger");
+                    tracing::debug!(car = i, target, ?trigger, "traffic script trigger");
                     c.script.request(target, trigger, tick as i64);
                 }
             }
@@ -1660,6 +1660,7 @@ impl TrafficSet {
             r = o;
         }
         self.cars[i].reference = r;
+        tracing::debug!(car = i, reference = r, of = targets.len(), "traffic car's reference (0x4072B1)");
         let reference = targets[r];
         // step 4: the car's own direction of travel — an independent coin flip, **always** drawn
         // (0x407499…0x4074F3), then overridden on a one-way road (0x4074F5…0x40750A)
@@ -2365,5 +2366,40 @@ mod tests {
         set3.ai(&t, 1030, far, &[human(194)]);
         set3.ai(&t, 1038, far, &[human(194)]);
         assert!(set3.cars[0].script.query(nfs_formats::scripts::mask::HONK_HORN).is_none());
+    }
+
+    #[test]
+    fn a_remote_humans_horn_asks_for_script_6_too() {
+        // a positional race's lists carry every human, `human_views[hi]` the horn of *that* human;
+        // the local car (the reference) is silent and far, the second human honks within 24 m
+        let t = ring(600);
+        let mut set = TrafficSet::new(&models(1), &t, 1.0, false, 3);
+        set.scripts.table[6 * 8] = nfs_formats::scripts::action::HONK_HORN;
+        set.scripts.table[6 * 8 + 4] = 2;
+        placed(&mut set, &t, 200);
+        set.cars[0].progress = t.frac(200);
+        let human = |slice: usize| {
+            let sl = &t.slices[slice];
+            LaneCar { slice, lane: lane_of(sl, 2.0), lane_mask: lane_span(sl, 2.0, 0.9), speed: 10.0, speed_est: 10.0, half_len: 2.1, lateral: 2.0, half_span: 0.9, is_human: true, is_racer: true }
+        };
+        let r = Reference { position: t.slices[185].centre, slice: 185, laps: 0, speed: 10.0, dir: 1.0, honking: false };
+        set.cars[0].racer_distance = 24.0;
+        let humans = [human(185), human(196)];
+        set.human_views = vec![HumanView { laps: 0, honking: false }, HumanView { laps: 0, honking: true }];
+        set.ai(&t, 1030, r, &humans);
+        set.ai(&t, 1038, r, &humans);
+        set.ai(&t, 1046, r, &humans);
+        assert!(set.cars[0].script.query(nfs_formats::scripts::mask::HONK_HORN).is_some(), "the remote human's horn is read");
+        // silent remote: nothing
+        let mut quiet = TrafficSet::new(&models(1), &t, 1.0, false, 3);
+        quiet.scripts = set.scripts.clone();
+        placed(&mut quiet, &t, 200);
+        quiet.cars[0].progress = t.frac(200);
+        quiet.cars[0].racer_distance = 24.0;
+        quiet.human_views = vec![HumanView { laps: 0, honking: false }, HumanView { laps: 0, honking: false }];
+        quiet.ai(&t, 1030, r, &humans);
+        quiet.ai(&t, 1038, r, &humans);
+        quiet.ai(&t, 1046, r, &humans);
+        assert!(quiet.cars[0].script.query(nfs_formats::scripts::mask::HONK_HORN).is_none());
     }
 }

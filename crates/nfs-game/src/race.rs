@@ -51,6 +51,9 @@ pub struct SliceTable {
     /// true when this table is the reversed view of the track, so a step along the lap route is a step
     /// **backwards** through the junction graph
     pub backwards: bool,
+    /// `LINEAR_TRACK [0x657494]`: a point-to-point track. Only [`Self::frac`]'s backwards arm reads it
+    /// (0x4162E4: the `1.0 → 0.0` wrap is for a circuit). The caller sets it after `from_crp`.
+    pub linear: bool,
 }
 
 /// Maximum gap between a section's last slice (advanced one spacing) and the next section's first.
@@ -154,7 +157,7 @@ impl SliceTable {
                 route_pos[s] = best.1;
             }
         }
-        Self { slices, sections, route, route_pos, lap_len, junctions, backwards: false }
+        Self { slices, sections, route, route_pos, lap_len, junctions, backwards: false, linear: false }
     }
 
     /// The same track driven backwards: the lap route runs the other way and every slice's
@@ -364,8 +367,23 @@ impl SliceTable {
     }
 
     /// Lap fraction of a slice (0x416290); branch slices use their nearest lap slice.
+    ///
+    /// Forward: `p / N` on the route position. **Backwards** the original never reverses its table:
+    /// it takes the raw fraction `raw / N` and returns `1 − raw / N` (0x4162E4…0x4162E9, `[0x657430]`),
+    /// and on a circuit (`[0x657494] == 0`) a result of exactly 1.0 becomes 0.0 (0x4162F3…0x416302).
+    /// This table's route runs the other way (`p = N − 1 − raw`), so the fraction is rebuilt from the
+    /// raw slice — `(N − 1 − p) / N` (the earlier reading) sat one slice, 6 m, from the original's and
+    /// put the lap line between the wrong pair of slices (`race-logic.md` §1.5a).
     pub fn frac(&self, slice: usize) -> f32 {
-        self.route_pos.get(slice).copied().unwrap_or(0) as f32 / self.lap_len as f32
+        let p = self.route_pos.get(slice).copied().unwrap_or(0);
+        if self.backwards {
+            let raw = (self.lap_len as u32).saturating_sub(1).saturating_sub(p);
+            if raw == 0 && !self.linear {
+                return 0.0;
+            }
+            return 1.0 - raw as f32 / self.lap_len as f32;
+        }
+        p as f32 / self.lap_len as f32
     }
 
     /// Slice arithmetic along the main lap (wrapping), following the section chain (0x4817D0 for
@@ -881,7 +899,7 @@ fn two_branch_table() -> SliceTable {
         for (i, s) in route.iter().enumerate() {
             route_pos[*s] = i;
         }
-        SliceTable { slices, sections, lap_len: 20, route, route_pos: route_pos.iter().map(|v| *v as u32).collect(), junctions: crate::junctions::Junctions::default(), backwards: false }
+        SliceTable { slices, sections, lap_len: 20, route, route_pos: route_pos.iter().map(|v| *v as u32).collect(), junctions: crate::junctions::Junctions::default(), backwards: false, linear: false }
     }
 
     fn slice_at(centre: Vec3) -> Slice {
@@ -911,18 +929,29 @@ fn two_branch_table() -> SliceTable {
         assert_eq!(r.route[0], t.route[99]);
         assert_eq!(r.add(t.route[99], 1), t.route[98]);
         assert!((r.slices[10].forward + t.slices[10].forward).length() < 1e-6);
-        assert!((r.frac(t.route[99]) - 0.0).abs() < 1e-6);
+        // 0x416290 backwards: 1 − raw/N on the RAW slice (raw 99 → 0.01), and raw 0 → 1.0 → 0.0 on a circuit
+        assert!((r.frac(t.route[99]) - 0.01).abs() < 1e-6);
+        assert_eq!(r.frac(t.route[0]), 0.0);
+        assert!((r.frac(t.route[1]) - 0.99).abs() < 1e-6);
+        let mut lin = r.clone();
+        lin.linear = true;
+        assert_eq!(lin.frac(t.route[0]), 1.0);
         assert_eq!(r.find_slice(t.slices[57].centre, 60), 57);
         // driving along the reversed route counts laps forward
         let mut p = RaceProgress::new(r.route[0], &r);
         let mut laps = 0;
+        let mut lap_steps = Vec::new();
         for step in 1..=200usize {
             let s = r.route[step % 100];
             if p.update(&r, r.slices[s].centre, r.slices[s].forward, step as u64, 3) {
                 laps += 1;
+                lap_steps.push(s);
             }
         }
         assert_eq!(laps, 2);
+        // 0x416290 on the raw table: the lap line is crossed on entering RAW slice 0 (1 − 1/N →
+        // 0.0), not one slice later on entering raw N−1 as the reversed-table fraction had it
+        assert_eq!(lap_steps, vec![t.route[0], t.route[0]]);
         assert_eq!(p.wrong_way_ticks, 0);
     }
 
