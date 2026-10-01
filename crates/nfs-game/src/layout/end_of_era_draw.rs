@@ -27,7 +27,7 @@ impl LayoutScreen {
     pub fn set_end_of_era(&mut self, r: &mut Renderer, paths: &GamePaths, mut show: EndOfEra) {
         // `NFS_EOE_STEPS=n` runs the show n steps ahead before the first frame — a still of the
         // middle of it, the way `NFS_FE_CLOCK` parks the other clocks
-        if let Some(n) = std::env::var("NFS_EOE_STEPS").ok().and_then(|v| v.parse::<i64>().ok()) {
+        if let Some(n) = crate::config::cfg().nfs_eoe_steps.var().ok().and_then(|v| v.parse::<i64>().ok()) {
             let base = self.end_of_era_now() - n * eoe::STEP_TICKS - 1;
             for k in 0..=n {
                 show.frame(base + k * eoe::STEP_TICKS);

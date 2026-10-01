@@ -1518,7 +1518,8 @@ impl TrafficSet {
                 // yaw about the world up, the angular velocity being in turns per second
                 let yaw = c.angular_velocity.y * dt * std::f32::consts::TAU;
                 if yaw != 0.0 {
-                    c.orientation = (Mat3::from_rotation_y(yaw) * c.orientation.transpose()).transpose();
+                    // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable rotation, not glam/std; original RotY 0x532600 (x87).
+                    c.orientation = (nfs_math::portable::mat3_rotation_y(yaw) * c.orientation.transpose()).transpose();
                 }
             }
             c.slice = table.find_slice(c.position, c.slice);

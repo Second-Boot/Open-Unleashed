@@ -1282,6 +1282,7 @@ dependencies = [
  "nfs-assets",
  "nfs-audio",
  "nfs-formats",
+ "nfs-math",
  "nfs-physics",
  "nfs-renderer",
  "serde",
@@ -1304,6 +1305,7 @@ name = "nfs-math"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "libm",
 ]
 
 [[package]]
@@ -1320,6 +1322,7 @@ version = "0.1.0"
 dependencies = [
  "glam",
  "nfs-formats",
+ "nfs-math",
 ]
 
 [[package]]
@@ -1840,10 +1843,12 @@ dependencies = [
  "nfs-formats",
  "nfs-game",
  "nfs-input",
+ "nfs-math",
  "nfs-net",
  "nfs-physics",
  "nfs-renderer",
  "pollster",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
  "wgpu",

@@ -1,24 +1,20 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::resample::{self, Cursor, Gains, Interp};
+use crate::rt::{self, Consumer, Producer, SampleRing};
+use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VoiceId(pub u32);
 
-/// A `Send + Sync` handle to the mixer's shared state, without the output stream itself — see
-/// [`AudioOutput::stop_handle`].
+/// A `Send + Sync` handle to the game thread's side of the mixer, without the output stream
+/// itself — see [`AudioOutput::stop_handle`].
 #[derive(Clone)]
-pub struct StopHandle(Arc<Mutex<Shared>>);
+pub struct StopHandle(Arc<Tx>);
 
 impl StopHandle {
     pub fn stop(&self, id: VoiceId) {
-        Self::stop_shared(&self.0, id);
-    }
-
-    fn stop_shared(shared: &Arc<Mutex<Shared>>, id: VoiceId) {
-        let mut g = shared.lock().unwrap();
-        g.voices.retain(|(i, _)| *i != id);
-        g.streams.retain(|(i, _)| *i != id);
+        self.0.stop(id);
     }
 }
 
@@ -211,22 +207,32 @@ pub const STEAL_BELOW: u8 = 0x65;
 /// free-list history, which decides which physical slot a voice starts in — is unmodeled and,
 /// short of tracking the 128-slot table itself, unmodelable from the port's `Vec<Voice>`.)*
 pub fn pick_victims(live: &[(u8, u16, u32)], budget: usize, need: usize) -> Option<Vec<usize>> {
+    let (mut order, mut victims) = (Vec::new(), Vec::new());
+    pick_victims_into(live, budget, need, &mut order, &mut victims).then_some(victims)
+}
+
+/// [`pick_victims`] into the caller's buffers (the callback's allocator allocates nothing): `true`
+/// for a start that is served, with the victims in `victims`. The stable sort of the original
+/// order is the unstable one with the index as the last key — the same total order, no scratch
+/// allocation.
+pub fn pick_victims_into(live: &[(u8, u16, u32)], budget: usize, need: usize, order: &mut Vec<usize>, victims: &mut Vec<usize>) -> bool {
+    victims.clear();
     let used: usize = live.iter().map(|&(_, ch, _)| ch.max(1) as usize).sum();
     let mut free = budget.saturating_sub(used);
     if free >= need {
-        return Some(Vec::new());
+        return true;
     }
-    let mut order: Vec<usize> = (0..live.len()).filter(|&i| live[i].0 < STEAL_BELOW).collect();
-    order.sort_by_key(|&i| (live[i].0, live[i].2));
-    let mut victims = Vec::new();
-    for i in order {
+    order.clear();
+    order.extend((0..live.len()).filter(|&i| live[i].0 < STEAL_BELOW));
+    order.sort_unstable_by_key(|&i| (live[i].0, live[i].2, i));
+    for &i in order.iter() {
         victims.push(i);
         free += live[i].1.max(1) as usize;
         if free >= need {
-            return Some(victims);
+            return true;
         }
     }
-    None
+    false
 }
 
 /// The port's `byte / 127` volume back to the library's 16.16 `voice+0x2C`: `round(volume ·
@@ -768,15 +774,13 @@ fn pan_gains(p: u8) -> [f32; 2] {
 struct Shared {
     voices: Vec<(VoiceId, Voice)>,
     streams: Vec<(VoiceId, StreamVoice)>,
+    #[cfg(test)]
     next_id: u32,
     /// the environment buses of record 0, `[0x6B4A0C]` (`Mixer_setEnvParam(0x20, ·)`, the tunnel
     /// reverb's level) and `[0x6B4A0D]` (`(0x80, ·)`, half of it) — `engine-audio.md` §4.7
     bus_c: i8,
     bus_d: i8,
-    tail: Option<Reverb>,
-    /// what the last callback left queued for the device, in output frames (its delay to the
-    /// playback of the buffer plus the buffer), and when it ran — for [`AudioOutput::latency_ms`]
-    queued: Option<(u64, std::time::Instant)>,
+    tail: Option<Box<Reverb>>,
     /// the software voice count `[0x6B48DD]` ([`voice_budget`]); `None` until the quality is
     /// given — the library's default 24 (0x58A5B5)
     budget: Option<usize>,
@@ -809,6 +813,25 @@ struct Shared {
     /// every start between two service calls reads the same value, so two voices started in the
     /// same tick tie on it, as the original's do.
     service_tick: u32,
+    /// the callback's reusable buffers (PERF F5: nothing in the device callback allocates)
+    scratch: Scratch,
+}
+
+/// Buffers the mixer reuses from one call to the next instead of allocating each time; made
+/// once ([`Shared::reserve_rt`]), emptied and refilled.
+#[derive(Default)]
+struct Scratch {
+    /// the frames [`Shared::render_into`] mixes a driver pass in
+    mix: Vec<[f32; 2]>,
+    stopped: Vec<VoiceId>,
+    stop: Vec<VoiceId>,
+    failed: Vec<usize>,
+    live: Vec<(u8, u16, u32)>,
+    live_ids: Vec<VoiceId>,
+    live_held: Vec<bool>,
+    live_at: Vec<usize>,
+    order: Vec<usize>,
+    victims: Vec<usize>,
 }
 
 /// The most frames 0x598940 mixes at once (`cmp edi, 0x100`, 0x598979): a block, the unit every
@@ -931,10 +954,10 @@ impl Bridge {
     /// The next device frame. `step` is the mix rate over the device rate; `left` the device
     /// frames still wanted in this callback, which `render` is offered (the stream's renders one
     /// driver pass whatever it is offered, [`Shared::pump`]).
-    fn next(&mut self, step: f64, left: usize, mut render: impl FnMut(usize) -> Vec<[f32; 2]>) -> [f32; 2] {
+    fn next(&mut self, step: f64, left: usize, mut render: impl FnMut(usize, &mut std::collections::VecDeque<[f32; 2]>)) -> [f32; 2] {
         while self.pending.len() < 2 {
             let want = (left as f64 * step).ceil() as usize + 2;
-            self.pending.extend(render(want));
+            render(want, &mut self.pending);
         }
         let (a, b, t) = (self.pending[0], self.pending[1], self.t as f32);
         self.t += step;
@@ -955,15 +978,25 @@ impl Shared {
 
     /// One pass of the driver thread ([`Pump`]): its one or two parts, each rendered as 0x58FBC0
     /// renders it.
+    #[cfg(test)]
     fn pump(&mut self, mix_rate: u32) -> Vec<[f32; 2]> {
+        let mut out = std::collections::VecDeque::new();
+        self.pump_to(mix_rate, &mut out);
+        out.into()
+    }
+
+    /// [`Shared::pump`] appending to `dst` (the [`Bridge`]'s queue) — no allocation once the
+    /// buffers have their size.
+    fn pump_to(&mut self, mix_rate: u32, dst: &mut std::collections::VecDeque<[f32; 2]>) {
         let sleep = self.sleep_ms.unwrap_or(pump_sleep_ms(3));
-        let mut out = Vec::new();
+        let mut buf = std::mem::take(&mut self.scratch.mix);
         for part in self.pump.next_write(mix_rate, sleep) {
             if part > 0 {
-                out.extend(self.render(part as usize, mix_rate));
+                self.render_into(&mut buf, part as usize, mix_rate);
+                dst.extend(buf.iter().copied());
             }
         }
-        out
+        self.scratch.mix = buf;
     }
 
     /// The software mixer's output for `n` stereo frames at `mix_rate`, as **0x58FBC0** drives it:
@@ -979,8 +1012,17 @@ impl Shared {
     /// 0x58FBC0 is handed one part of the driver thread's write, and a block ends where that part
     /// ends too: the port renders the same parts ([`Pump`], [`Shared::pump`]). *(Until 2026-09-27
     /// a block ended where the device callback's request did.)*
+    #[cfg(test)]
     fn render(&mut self, n: usize, mix_rate: u32) -> Vec<[f32; 2]> {
-        let mut out = vec![[0.0f32; 2]; n];
+        let mut out = Vec::new();
+        self.render_into(&mut out, n, mix_rate);
+        out
+    }
+
+    /// [`Shared::render`] into `out`, which is cleared and sized to `n` frames.
+    fn render_into(&mut self, out: &mut Vec<[f32; 2]>, n: usize, mix_rate: u32) {
+        out.clear();
+        out.resize(n, [0.0f32; 2]);
         let mut at = 0;
         while at < n {
             if self.clock.left == 0 {
@@ -1001,7 +1043,6 @@ impl Shared {
                 *s = resample::to_i16(*s) as f32 / 32768.0;
             }
         }
-        out
     }
 
     /// **0x589520**, the library service, once a tick of mixed frames ([`ServiceClock`]), over
@@ -1024,7 +1065,8 @@ impl Shared {
     fn service(&mut self) {
         // 0x589531…0x589538, the very first thing the service does: `[0x6B49A8] += 1`
         self.service_tick = self.service_tick.wrapping_add(1);
-        let mut stopped: Vec<VoiceId> = Vec::new();
+        let mut stopped = std::mem::take(&mut self.scratch.stopped);
+        stopped.clear();
         for (id, sv) in self.streams.iter_mut() {
             if let Some(f) = sv.fade.as_mut() {
                 if f.tick() {
@@ -1037,7 +1079,9 @@ impl Shared {
             }
         }
         self.streams.retain(|(i, _)| !stopped.contains(i));
-        let mut stop: Vec<VoiceId> = Vec::new();
+        self.scratch.stopped = stopped;
+        let mut stop = std::mem::take(&mut self.scratch.stop);
+        stop.clear();
         for (id, v) in self.voices.iter_mut() {
             // a voice whose group a stop earlier in this pass took is not in state 1 any more
             if v.finished || v.held || stop.contains(id) {
@@ -1070,14 +1114,14 @@ impl Shared {
                 continue;
             }
             let Some(t) = tables else { continue };
-            let segments = t.envelope.clone();
-            if v.env.tick(&segments) {
+            if v.env.tick(&t.envelope) {
                 stop.push(*id);
             }
         }
         if !stop.is_empty() {
             self.voices.retain(|(i, _)| !stop.contains(i));
         }
+        self.scratch.stop = stop;
     }
 
     /// One block of 0x598760 (≤ [`BLOCK`] frames): each voice pulls its chain once — a one-shot
@@ -1087,12 +1131,15 @@ impl Shared {
         let n = out.len();
         let bus_c = self.bus_c;
         let interp = self.interp;
-        let mut failed = Vec::new();
+        let mut failed = std::mem::take(&mut self.scratch.failed);
+        failed.clear();
         for (k, (_, v)) in self.voices.iter_mut().enumerate() {
             if v.finished || v.held {
                 continue;
             }
-            let c = Arc::clone(&v.clip);
+            // the clip is only read here: a borrow of the voice's own `Arc`, no clone per voice
+            // per block
+            let c: &Clip = &v.clip;
             let cc = c.channels.max(1) as usize;
             // the 16.16 step, 0x596B60 → 0x596A50 → 0x599830
             let step = resample::step_16_16(v.pitch_word(), c.rate, mix_rate);
@@ -1150,7 +1197,7 @@ impl Shared {
                     v.wet = wet_gain(vc, send);
                 }
                 if v.wet != 0.0 {
-                    self.tail.get_or_insert_with(|| Reverb::new(mix_rate)).send(fi, xs[0], v.wet);
+                    self.tail.get_or_insert_with(|| Box::new(Reverb::new(mix_rate))).send(fi, xs[0], v.wet);
                 }
                 if ramp.is_some_and(|r| fi + 1 == r.len) {
                     v.gains.ramp_done();
@@ -1162,6 +1209,7 @@ impl Shared {
         for &k in &failed {
             self.free(k);
         }
+        self.scratch.failed = failed;
         self.voices.retain(|(_, v)| !v.finished);
         // the reverb (0x598760 → [0x6B16B8] = 0x598AE0), after the voices and before the streams
         if let Some(rv) = self.tail.as_mut() {
@@ -1180,22 +1228,13 @@ impl Shared {
         for (_, sv) in self.streams.iter_mut() {
             let cc = sv.src.channels.max(1) as usize;
             let step = resample::step_16_16(4096, sv.src.rate, mix_rate);
-            let mut q = sv.src.queue.lock().unwrap();
+            let q = &sv.src.queue;
             // the next source frame, zeros when the feeder is behind
-            let pop = |q: &mut std::collections::VecDeque<i16>| -> [f32; 2] {
-                if q.len() >= cc {
-                    let l = q[0] as f32;
-                    let r = if cc > 1 { q[1] as f32 } else { l };
-                    q.drain(..cc);
-                    [l, r]
-                } else {
-                    [0.0, 0.0]
-                }
-            };
+            let pop = |q: &SampleRing| -> [f32; 2] { q.pop_frame(cc).unwrap_or([0.0, 0.0]) };
             if !sv.primed {
                 sv.primed = true;
                 for j in 1..4 {
-                    let f = pop(&mut q);
+                    let f = pop(q);
                     for c in 0..2 {
                         sv.window[c][j] = f[c];
                     }
@@ -1210,7 +1249,7 @@ impl Shared {
                 let f = sv.frac + step;
                 sv.frac = f & 0xFFFF;
                 for _ in 0..(f >> 16) {
-                    let nf = pop(&mut q);
+                    let nf = pop(q);
                     for c in 0..2 {
                         sv.window[c].rotate_left(1);
                         sv.window[c][3] = nf[c];
@@ -1244,10 +1283,19 @@ impl Shared {
     /// [`AudioOutput::play_word`]'s start (0x5907B0). `tabled` is `false` only for the callers
     /// listed on the `table` field of [`Voice`] — a bare `Voice_start` 0x565E70 in the original,
     /// never `Voice_play` 0x4A9C10's voice-numbered table.
+    #[cfg(test)]
     fn start_patch(&mut self, clip: Arc<Clip>, volume: f32, word: u16, looping: bool, sel: u8, tabled: bool) -> VoiceId {
+        let id = VoiceId(self.next_id);
+        self.next_id += 1;
+        self.start_patch_as(id, clip, volume, word, looping, sel, tabled);
+        id
+    }
+
+    /// [`Shared::start_patch`] with the handle the game thread gave the start ([`AudioOutput`]
+    /// numbers them in call order and queues the start, [`Cmd::Start`]).
+    #[allow(clippy::too_many_arguments)]
+    fn start_patch_as(&mut self, id: VoiceId, clip: Arc<Clip>, volume: f32, word: u16, looping: bool, sel: u8, tabled: bool) -> VoiceId {
         let g = self;
-        let id = VoiceId(g.next_id);
-        g.next_id += 1;
         if clip.records.is_empty() {
             // not a bank patch: one voice, no draw, the clip's own values scaled by `sel`
             if g.allocate(clip.channels.max(1) as usize, clip.priority, Some(id)) {
@@ -1306,11 +1354,13 @@ impl Shared {
     /// in the budget, until every record's sample has ended. Marks the freed voices `finished`.
     fn free(&mut self, k: usize) {
         let id = self.voices[k].0;
-        let members: Vec<usize> = (0..self.voices.len()).filter(|&j| self.voices[j].0 == id && !self.voices[j].1.finished).collect();
-        let anchor = members.iter().copied().find(|&j| self.voices[j].1.anchor);
+        // the group's live members: their count and the first anchor among them
+        let live = |j: &usize| self.voices[*j].0 == id && !self.voices[*j].1.finished;
+        let members = (0..self.voices.len()).filter(live).count();
+        let anchor = (0..self.voices.len()).filter(live).find(|&j| self.voices[j].1.anchor);
         match anchor {
-            Some(a) if members.len() > 1 => {
-                if self.voices[a].1.held && a != k && members.len() == 2 {
+            Some(a) if members > 1 => {
+                if self.voices[a].1.held && a != k && members == 2 {
                     self.voices[k].1.finished = true;
                     self.voices[a].1.finished = true;
                 } else if !self.voices[a].1.held && a == k {
@@ -1329,41 +1379,58 @@ impl Shared {
     /// (0x589B09 `cmp cl, 1 ; jne`), and so is a voice of the start in progress, whose group is not
     /// made yet (`voice+0x1E` is set after every record has started, 0x590A04).
     fn allocate(&mut self, need: usize, priority: u8, starting: Option<VoiceId>) -> bool {
-        let live_ids: Vec<VoiceId> = self.voices.iter().filter(|(_, v)| !v.finished).map(|(i, _)| *i).collect();
-        let live_held: Vec<bool> = self.voices.iter().filter(|(_, v)| !v.finished).map(|(_, v)| v.held).collect();
-        let live: Vec<(u8, u16, u32)> = self
-            .voices
-            .iter()
-            .filter(|(_, v)| !v.finished)
-            .map(|(_, v)| (v.clip.priority, v.clip.channels, v.stamp))
-            .chain(self.streams.iter().map(|(id, sv)| (STREAM_PRIORITY, sv.src.channels, id.0)))
-            .collect();
-        let Some(victims) = pick_victims(&live, self.budget(), need) else {
-            tracing::debug!(need, priority, budget = self.budget(), "voice start refused: no voice free or below 0x65");
-            return false;
+        // the lists are the callback's reusable buffers ([`Scratch`])
+        let sc = &mut self.scratch;
+        let (mut live_ids, mut live_held, mut live, mut live_at) =
+            (std::mem::take(&mut sc.live_ids), std::mem::take(&mut sc.live_held), std::mem::take(&mut sc.live), std::mem::take(&mut sc.live_at));
+        let (mut order, mut victims) = (std::mem::take(&mut sc.order), std::mem::take(&mut sc.victims));
+        live_ids.clear();
+        live_held.clear();
+        live.clear();
+        live_at.clear();
+        for (j, (i, v)) in self.voices.iter().enumerate().filter(|(_, (_, v))| !v.finished) {
+            live_ids.push(*i);
+            live_held.push(v.held);
+            live.push((v.clip.priority, v.clip.channels, v.stamp));
+            live_at.push(j);
+        }
+        live.extend(self.streams.iter().map(|(id, sv)| (STREAM_PRIORITY, sv.src.channels, id.0)));
+        let served = pick_victims_into(&live, self.budget(), need, &mut order, &mut victims);
+        let ok = served && {
+            if !victims.is_empty() {
+                // streams sit after the voices in `live` and are never victims; `live` lists the
+                // voices in order, so a victim's index is its place among the unfinished voices
+                self.steal(&victims, &live_ids, &live_held, &live_at, need, priority, starting);
+            }
+            let ch = |k: usize| live[k].1.max(1) as usize;
+            let in_use = (0..live.len()).map(ch).sum::<usize>() - victims.iter().map(|&k| ch(k)).sum::<usize>() + need;
+            if in_use > self.peak {
+                self.peak = in_use;
+                tracing::debug!(voices = in_use, budget = self.budget(), "voices in use: a new peak");
+            }
+            true
         };
-        if !victims.is_empty() {
-            // streams sit after the voices in `live` and are never victims; `live` lists the
-            // voices in order, so a victim's index is its place among the unfinished voices
-            let live_at: Vec<usize> = (0..self.voices.len()).filter(|&j| !self.voices[j].1.finished).collect();
-            tracing::debug!(need, priority, stolen = victims.len(), "voice budget full: the lowest priority, oldest voice stolen");
-            for &k in &victims {
-                let one = live_held[k] || Some(live_ids[k]) == starting;
-                for j in 0..self.voices.len() {
-                    if (one && j == live_at[k]) || (!one && self.voices[j].0 == live_ids[k]) {
-                        self.voices[j].1.finished = true;
-                    }
+        if !served {
+            tracing::debug!(need, priority, budget = self.budget(), "voice start refused: no voice free or below 0x65");
+        }
+        let sc = &mut self.scratch;
+        (sc.live_ids, sc.live_held, sc.live, sc.live_at, sc.order, sc.victims) = (live_ids, live_held, live, live_at, order, victims);
+        ok
+    }
+
+    /// The victims of [`Shared::allocate`] stopped (0x589B26): see there.
+    #[allow(clippy::too_many_arguments)]
+    fn steal(&mut self, victims: &[usize], live_ids: &[VoiceId], live_held: &[bool], live_at: &[usize], need: usize, priority: u8, starting: Option<VoiceId>) {
+        tracing::debug!(need, priority, stolen = victims.len(), "voice budget full: the lowest priority, oldest voice stolen");
+        for &k in victims {
+            let one = live_held[k] || Some(live_ids[k]) == starting;
+            for j in 0..self.voices.len() {
+                if (one && j == live_at[k]) || (!one && self.voices[j].0 == live_ids[k]) {
+                    self.voices[j].1.finished = true;
                 }
             }
-            self.voices.retain(|(_, v)| !v.finished);
         }
-        let ch = |k: usize| live[k].1.max(1) as usize;
-        let in_use = (0..live.len()).map(ch).sum::<usize>() - victims.iter().map(|&k| ch(k)).sum::<usize>() + need;
-        if in_use > self.peak {
-            self.peak = in_use;
-            tracing::debug!(voices = in_use, budget = self.budget(), "voices in use: a new peak");
-        }
-        true
+        self.voices.retain(|(_, v)| !v.finished);
     }
 }
 
@@ -1501,51 +1568,480 @@ impl Reverb {
     }
 }
 
+/// What the game thread asks of the mixer — one command per [`AudioOutput`] call that changes
+/// something, queued ([`rt::channel`]) and applied by the device callback ([`Core::drain`]) at the
+/// top of its next run, in call order. That is where the mutex used to put them: a call took the
+/// lock between two callbacks, so it counted from the next one's first block — and the library's
+/// generator ([`Shared::rand`]) is still drawn by the start, on the callback's side, in call order.
+enum Cmd {
+    Quality { budget: usize, rate: u32, interp: Interp, sleep: u32, reverb: Option<Box<Reverb>> },
+    FxAux { id: VoiceId, aux: u8 },
+    Silence,
+    Pan { id: VoiceId, pan: u16 },
+    Start { id: VoiceId, clip: Arc<Clip>, volume: f32, word: u16, bend: u8, pan: u16, looping: bool, sel: u8, tabled: bool },
+    SetWord { id: VoiceId, volume: f32, word: u16, bend: u8 },
+    Ramp { id: VoiceId, ticks: i32, target: i32 },
+    Filter { id: VoiceId, value: i32 },
+    Stop(VoiceId),
+    Env { p20: i32, p80: i32 },
+    Fade { id: VoiceId, ms: i32, target: i32 },
+    Stream { id: VoiceId, src: Arc<StreamSource>, volume: f32 },
+}
+
+/// A command queued and not yet seen applied (its sequence number is above the snapshot's
+/// `applied`): what a status call on the game thread must already know of it.
+#[derive(Clone, Copy)]
+enum Pend {
+    Start(VoiceId),
+    Stream(VoiceId, f32),
+    Stop(VoiceId),
+}
+
+impl Pend {
+    fn id(self) -> VoiceId {
+        match self {
+            Pend::Start(i) | Pend::Stream(i, _) | Pend::Stop(i) => i,
+        }
+    }
+}
+
+/// One voice as the status calls read it ([`AudioOutput::progress`], [`AudioOutput::is_playing`]).
+#[derive(Clone, Copy)]
+struct VoiceStat {
+    id: VoiceId,
+    anchor: bool,
+    held: bool,
+    finished: bool,
+    /// [`Voice::position`]
+    position: f64,
+    /// the clip's frames
+    frames: usize,
+    rate: u32,
+}
+
+/// The mixer's state as the callback last published it ([`Core::publish`]) — what the game
+/// thread's status calls read instead of the voices themselves.
+#[derive(Default)]
+struct Snapshot {
+    /// the commands applied when it was taken
+    applied: u64,
+    voices: Vec<VoiceStat>,
+    /// `(handle, volume)` of the playing streams
+    streams: Vec<(VoiceId, f32)>,
+}
+
+impl Snapshot {
+    /// The voice a status call answers for — **settled 2026-09-27** (read to the instruction:
+    /// 0x566910 whole, 0x590e20, 0x566d60): the call takes a handle and, via 0x590e20, searches
+    /// the group's own small array for the entry whose *own* handle matches — never a sibling's —
+    /// answering "ended" (state 3, `mov [ebp], 3` at 0x566a1e) only once that entry is gone from
+    /// the array. The game only ever holds the handle 0x590420 answered for a start — the anchor's
+    /// (or the one voice of a solo patch) — so the call always reads the **anchor's own** entry
+    /// while the group has any; there is no reading "the first playing member" or "the lowest
+    /// slot" instead, whatever this note's own preliminary framing said. Found, the entry's own
+    /// remaining-frames field decides 0x566986's `jge`: negative — the held anchor, its sample
+    /// already having run out while the array keeps its bookkeeping ([`Voice::held`], the group
+    /// note) — answers **state 0** with every field left the zero the call started with
+    /// (0x566921…0x56692a): position 0, not the anchor's real (finished) cursor; non-negative
+    /// answers state 1 or 2 (0x566999's `[handle] == the found entry`, an array-index test with no
+    /// bearing on which data is read) from the anchor's own fields either way. The port's `held`
+    /// on the anchor already matches "kept, not freed, no strip" ([`Shared::free`]); this settles
+    /// what a status call answers for it: 0, not a sibling's position and not `None`.
+    fn status_voice(&self, id: VoiceId) -> Option<&VoiceStat> {
+        let mut group = self.voices.iter().filter(|v| v.id == id);
+        let first = group.clone().next();
+        let v = group.find(|v| v.anchor).or(first)?;
+        (!v.finished).then_some(v)
+    }
+}
+
+/// What the last callback left queued for the device, in output frames (its delay to the playback
+/// of the buffer plus the buffer), and when it ran (ns since `epoch`, plus 1; 0 before the first
+/// callback) — for [`AudioOutput::latency_ms`].
+struct Latency {
+    epoch: std::time::Instant,
+    frames: AtomicU64,
+    at: AtomicU64,
+}
+
+/// The game thread's side: the command queue's producer and the bookkeeping the calls need
+/// without asking the callback.
+struct TxState {
+    prod: Producer<Cmd>,
+    /// what the callback gave back to be freed here (the reverb a rate change replaced)
+    gc: Consumer<Box<Reverb>>,
+    /// the next handle ([`VoiceId`]), numbered in call order as the library's start does
+    next_id: u32,
+    /// the commands queued so far
+    seq: u64,
+    /// the mix rate the queued commands leave the mixer at ([`Shared::mix_rate`]'s mirror)
+    cfg_rate: Option<u32>,
+    pending: Vec<(u64, Pend)>,
+}
+
+struct Tx {
+    state: Mutex<TxState>,
+    snap: Arc<Mutex<Snapshot>>,
+    lat: Arc<Latency>,
+    /// the buses `set_env` left, `[0x6B4A0C]` / `[0x6B4A0D]`
+    bus: [AtomicI8; 2],
+    /// TEST GLUE: `NFS_AUDIO_DUMP` — no device, the mixer runs on the calling thread
+    offline: Option<Mutex<Offline>>,
+}
+
+/// The device callback's side: the mixer itself, which nothing else touches.
+struct Core {
+    shared: Shared,
+    rx: Consumer<Cmd>,
+    gc: Producer<Box<Reverb>>,
+    applied: u64,
+    snap: Arc<Mutex<Snapshot>>,
+    lat: Arc<Latency>,
+    device_rate: u32,
+}
+
+/// The command queue's size, in commands: a game frame sends a few dozen.
+const QUEUE: usize = 4096;
+/// What a push waits for a full queue (a callback that has stopped) before the command is dropped.
+const PUSH_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+/// The callback's buffers, made before it runs ([`Shared::reserve_rt`]).
+const RT_VOICES: usize = 512;
+const RT_FRAMES: usize = 1 << 15;
+
+impl Shared {
+    /// The state the status calls read, into `s` (whose buffers are reused).
+    fn snapshot_into(&self, s: &mut Snapshot) {
+        s.voices.clear();
+        s.voices.extend(self.voices.iter().map(|(id, v)| VoiceStat {
+            id: *id,
+            anchor: v.anchor,
+            held: v.held,
+            finished: v.finished,
+            position: v.position(),
+            frames: v.clip.samples.len() / v.clip.channels.max(1) as usize,
+            rate: v.clip.rate,
+        }));
+        s.streams.clear();
+        s.streams.extend(self.streams.iter().map(|(id, sv)| (*id, sv.volume)));
+    }
+
+    /// Make the buffers the callback uses, so that it allocates nothing.
+    fn reserve_rt(&mut self) {
+        self.voices.reserve(RT_VOICES);
+        self.streams.reserve(32);
+        self.bridge.pending.reserve(RT_FRAMES);
+        let sc = &mut self.scratch;
+        sc.mix.reserve(RT_FRAMES);
+        sc.stopped.reserve(32);
+        sc.stop.reserve(RT_VOICES);
+        sc.failed.reserve(RT_VOICES);
+        sc.live.reserve(RT_VOICES + 32);
+        sc.live_ids.reserve(RT_VOICES);
+        sc.live_held.reserve(RT_VOICES);
+        sc.live_at.reserve(RT_VOICES);
+        sc.order.reserve(RT_VOICES);
+        sc.victims.reserve(RT_VOICES);
+        // the reverb the first send would make (at the default mix rate, before any quality is
+        // given): a fresh one holds nothing and only runs once something is sent to it
+        let rate = self.mix_rate();
+        self.tail = Some(Box::new(Reverb::new(rate)));
+    }
+}
+
+impl Core {
+    fn apply(&mut self, cmd: Cmd) {
+        let g = &mut self.shared;
+        match cmd {
+            Cmd::Quality { budget, rate, interp, sleep, reverb } => {
+                g.sleep_ms = Some(sleep);
+                if g.interp != interp {
+                    g.interp = interp;
+                    tracing::info!(?interp, "mix interpolator");
+                }
+                if g.budget != Some(budget) {
+                    g.budget = Some(budget);
+                    tracing::info!(budget, "voice budget");
+                }
+                if g.mix_rate != Some(rate) {
+                    g.mix_rate = Some(rate);
+                    // the reverb's delay lines are sized in frames of the mix rate
+                    if let Some(old) = std::mem::replace(&mut g.tail, reverb) {
+                        // freed on the game thread; a full return queue frees it here
+                        let _ = self.gc.push(old);
+                    }
+                    tracing::info!(mix_rate = rate, device_rate = self.device_rate, "mix rate");
+                }
+            }
+            Cmd::FxAux { id, aux } => {
+                for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
+                    v.fx_scale = 0x7F - aux.min(0x7F);
+                }
+            }
+            Cmd::Silence => g.silence(),
+            Cmd::Pan { id, pan } => {
+                for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
+                    v.pan = pan_byte(pan);
+                }
+            }
+            Cmd::Start { id, clip, volume, word, bend, pan, looping, sel, tabled } => {
+                g.start_patch_as(id, clip, volume, word, looping, sel, tabled);
+                for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
+                    v.bend = bend as i8;
+                    v.pan = pan_byte(pan);
+                }
+            }
+            Cmd::SetWord { id, volume, word, bend } => {
+                for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
+                    v.set_volume(volume);
+                    v.word = word;
+                    v.bend = bend as i8;
+                }
+            }
+            Cmd::Ramp { id, ticks, target } => g.ramp(id, ticks, target),
+            Cmd::Filter { id, value } => {
+                let rate = g.mix_rate();
+                for (_, v) in g.voices.iter_mut().filter(|(i, v)| *i == id && !v.finished && !v.held) {
+                    LowPass::set(&mut v.lowpass, value, rate);
+                }
+            }
+            Cmd::Stop(id) => {
+                g.voices.retain(|(i, _)| *i != id);
+                g.streams.retain(|(i, _)| *i != id);
+            }
+            Cmd::Env { p20, p80 } => {
+                g.bus_c = p20 as i8;
+                g.bus_d = p80 as i8;
+            }
+            Cmd::Fade { id, ms, target } => {
+                if let Some((_, sv)) = g.streams.iter_mut().find(|(i, _)| *i == id) {
+                    sv.fade = Some(Fade::new(sv.volume, ms, target));
+                }
+            }
+            Cmd::Stream { id, src, volume } => {
+                if g.allocate(src.channels.max(1) as usize, STREAM_PRIORITY, None) {
+                    g.streams.push((id, StreamVoice { src, volume, frac: 0, window: [[0.0; 4]; 2], primed: false, fade: None }));
+                }
+            }
+        }
+        self.applied += 1;
+    }
+
+    /// Everything queued so far, in order.
+    fn drain(&mut self) {
+        while let Some(cmd) = self.rx.pop() {
+            self.apply(cmd);
+        }
+    }
+
+    /// Hand the game thread the state its status calls read. Never waits: if the game thread is
+    /// reading the last one at this instant, this one is skipped and the next callback's goes.
+    fn publish(&mut self) {
+        let Ok(mut s) = self.snap.try_lock() else { return };
+        s.applied = self.applied;
+        self.shared.snapshot_into(&mut s);
+    }
+
+    /// The device callback's run for `out` (interleaved, `channels` wide) at `out_rate`: the mix at
+    /// the library's rate `[0x6B48DA]` into a buffer of that rate, and from there to the device's
+    /// ([`Bridge`]).
+    fn fill(&mut self, out: &mut [f32], channels: usize, out_rate: f64) {
+        let g = &mut self.shared;
+        let mix_rate = g.mix_rate();
+        let step = mix_rate as f64 / out_rate;
+        let n = out.len() / channels.max(1);
+        let mut bridge = std::mem::take(&mut g.bridge);
+        for (k, frame) in out.chunks_exact_mut(channels.max(1)).enumerate() {
+            let lr = bridge.next(step, n - k, |_, pending| g.pump_to(mix_rate, pending));
+            // a mono device takes the left channel, a third and later one the right
+            for (ch, o) in frame.iter_mut().enumerate() {
+                *o = lr[ch.min(1)];
+            }
+        }
+        g.bridge = bridge;
+    }
+}
+
+/// TEST GLUE (`NFS_AUDIO_DUMP=<file>`): no device. The mixer runs on the calling thread: every
+/// call that changes something is applied at once, and every 4th renders 441 frames at 44100 Hz
+/// stereo, appended as f32 LE to the file — a deterministic function of the game's calls, to
+/// compare the mix of one build against another (`RE/notes/PERF.md`, F5).
+struct Offline {
+    core: Core,
+    n: u32,
+}
+
+static DUMP: std::sync::OnceLock<Mutex<std::fs::File>> = std::sync::OnceLock::new();
+
+impl Offline {
+    fn step(&mut self) {
+        self.core.drain();
+        self.n += 1;
+        if self.n.is_multiple_of(4) {
+            let mut buf = vec![0.0f32; 441 * 2];
+            self.core.fill(&mut buf, 2, 44100.0);
+            let bytes: Vec<u8> = buf.iter().flat_map(|x| x.to_le_bytes()).collect();
+            use std::io::Write;
+            DUMP.get().unwrap().lock().unwrap().write_all(&bytes).unwrap();
+        }
+        self.core.publish();
+    }
+}
+
+impl Tx {
+    /// The two halves of a mixer. With `offline` the callback's half is the glue's, and none is
+    /// handed back.
+    fn new(device_rate: u32, offline: bool) -> (Arc<Tx>, Option<Core>) {
+        let (prod, rx) = rt::channel::<Cmd>(QUEUE);
+        let (gc_tx, gc) = rt::channel::<Box<Reverb>>(8);
+        let snap = Arc::new(Mutex::new(Snapshot { applied: 0, voices: Vec::with_capacity(RT_VOICES), streams: Vec::with_capacity(32) }));
+        let lat = Arc::new(Latency { epoch: std::time::Instant::now(), frames: AtomicU64::new(0), at: AtomicU64::new(0) });
+        let mut shared = Shared::default();
+        shared.reserve_rt();
+        let core = Core { shared, rx, gc: gc_tx, applied: 0, snap: snap.clone(), lat: lat.clone(), device_rate };
+        let state = Mutex::new(TxState { prod, gc, next_id: 0, seq: 0, cfg_rate: None, pending: Vec::with_capacity(256) });
+        let mut tx = Tx { state, snap, lat, bus: [AtomicI8::new(0), AtomicI8::new(0)], offline: None };
+        if offline {
+            tx.offline = Some(Mutex::new(Offline { core, n: 0 }));
+            return (Arc::new(tx), None);
+        }
+        (Arc::new(tx), Some(core))
+    }
+
+    /// Queue `cmd` (and what a status call must know of it until it is applied).
+    fn push(&self, st: &mut TxState, cmd: Cmd, pend: Option<Pend>) {
+        // what the callback gave back is freed here, off its thread
+        while let Some(old) = st.gc.pop() {
+            drop(old);
+        }
+        let mut cmd = cmd;
+        let t0 = std::time::Instant::now();
+        loop {
+            match st.prod.push(cmd) {
+                Ok(()) => break,
+                Err(c) => {
+                    if t0.elapsed() > PUSH_WAIT {
+                        tracing::warn!("audio command queue full: command dropped");
+                        return;
+                    }
+                    cmd = c;
+                    std::thread::yield_now();
+                }
+            }
+        }
+        st.seq += 1;
+        if let Some(p) = pend {
+            if st.pending.len() >= QUEUE {
+                st.pending.remove(0);
+            }
+            st.pending.push((st.seq, p));
+        }
+        if let Some(o) = &self.offline {
+            o.lock().unwrap().step();
+        }
+    }
+
+    /// Queue `cmd` for a call that has no handle to give back.
+    fn send(&self, cmd: Cmd) {
+        let mut st = self.state.lock().unwrap();
+        self.push(&mut st, cmd, None);
+    }
+
+    fn stop(&self, id: VoiceId) {
+        let mut st = self.state.lock().unwrap();
+        self.push(&mut st, Cmd::Stop(id), Some(Pend::Stop(id)));
+    }
+
+    /// The last queued, not yet applied command about `id`, if any — it is newer than the
+    /// snapshot, which is returned locked with it.
+    fn overlay(&self, id: VoiceId) -> (Option<Pend>, std::sync::MutexGuard<'_, Snapshot>) {
+        let mut st = self.state.lock().unwrap();
+        let snap = self.snap.lock().unwrap();
+        st.pending.retain(|(seq, _)| *seq > snap.applied);
+        let last = st.pending.iter().rev().map(|(_, p)| *p).find(|p| p.id() == id);
+        (last, snap)
+    }
+}
+
+/// The device buffer the stream asks for, in frames: `NFS_AUDIO_BUFFER` (0 = the device's own
+/// default), else 256 on macOS (CoreAudio's default is 512), clamped to what the device supports;
+/// other systems keep their default buffer.
+// PORT-DEVIATION D2 (RE/notes/PORT-DEVIATIONS.md): a fixed 256-frame device buffer on macOS; the original's sound layer opens at 0x4A66B0 with 0x565720([0x655D44], 0x40000, 3).
+fn device_buffer_frames(supported: &cpal::SupportedStreamConfig) -> Option<u32> {
+    let asked = std::env::var("NFS_AUDIO_BUFFER").ok().and_then(|v| v.parse::<u32>().ok());
+    let n = asked.unwrap_or(if cfg!(target_os = "macos") { 256 } else { 0 });
+    match (n, supported.buffer_size()) {
+        (0, _) => None,
+        (n, cpal::SupportedBufferSize::Range { min, max }) => Some(n.clamp(*min, *max)),
+        (_, cpal::SupportedBufferSize::Unknown) => None,
+    }
+}
+
 pub struct AudioOutput {
-    _stream: cpal::Stream,
-    shared: Arc<Mutex<Shared>>,
+    _stream: Option<cpal::Stream>,
+    tx: Arc<Tx>,
     pub rate: u32,
 }
 
 impl AudioOutput {
     pub fn new() -> anyhow::Result<Self> {
+        if let Ok(path) = std::env::var("NFS_AUDIO_DUMP") {
+            DUMP.get_or_init(|| Mutex::new(std::fs::File::create(&path).expect("NFS_AUDIO_DUMP")));
+            let (tx, _) = Tx::new(44100, true);
+            tracing::warn!(path, "audio: offline dump (NFS_AUDIO_DUMP), no device");
+            return Ok(Self { _stream: None, tx, rate: 44100 });
+        }
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or_else(|| anyhow::anyhow!("no audio output device"))?;
-        let config = device.default_output_config()?;
-        let rate = config.sample_rate().0;
-        let channels = config.channels() as usize;
-        let shared = Arc::new(Mutex::new(Shared::default()));
-        let sh = shared.clone();
-        let out_rate = rate as f64;
-        let stream = device.build_output_stream(
-            &config.into(),
+        let supported = device.default_output_config()?;
+        let rate = supported.sample_rate().0;
+        let channels = supported.channels() as usize;
+        // a smaller device buffer lowers the output latency and changes nothing in the mix: the
+        // driver passes ([`Pump`]) and the bridge's queue run on the stream's own clock, whatever
+        // size the callback asks for (`the_mix_does_not_depend_on_the_callback_size`)
+        let mut config: cpal::StreamConfig = supported.config();
+        let mut attempts = vec![cpal::BufferSize::Default];
+        if let Some(n) = device_buffer_frames(&supported) {
+            attempts.insert(0, cpal::BufferSize::Fixed(n));
+        }
+        let mut last = None;
+        for size in attempts {
+            config.buffer_size = size;
+            let (tx, core) = Tx::new(rate, false);
+            let core = core.expect("a device mixer has its callback half");
+            match Self::open(&device, &config, channels, core) {
+                Ok(stream) => {
+                    stream.play()?;
+                    tracing::info!(rate, channels, buffer = ?config.buffer_size, "audio output started");
+                    return Ok(Self { _stream: Some(stream), tx, rate });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, buffer = ?config.buffer_size, "audio stream refused");
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last.expect("an attempt was made").into())
+    }
+
+    /// The output stream whose callback is `core`'s: what the game thread queued since the last
+    /// run, then the mix — nothing here takes a lock or allocates.
+    fn open(device: &cpal::Device, config: &cpal::StreamConfig, channels: usize, mut core: Core) -> Result<cpal::Stream, cpal::BuildStreamError> {
+        let out_rate = config.sample_rate.0 as f64;
+        device.build_output_stream(
+            config,
             move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
-                let mut g = sh.lock().unwrap();
+                core.drain();
                 let ts = info.timestamp();
                 let delay = ts.playback.duration_since(&ts.callback).unwrap_or_default();
                 let frames = (out.len() / channels.max(1)) as u64 + (delay.as_secs_f64() * out_rate).round() as u64;
-                g.queued = Some((frames, std::time::Instant::now()));
-                // the library mixes at `[0x6B48DA]` into a buffer of that rate; the device's own
-                // rate is reached from there ([`Bridge`])
-                let mix_rate = g.mix_rate();
-                let step = mix_rate as f64 / out_rate;
-                let n = out.len() / channels.max(1);
-                let mut bridge = std::mem::take(&mut g.bridge);
-                for (k, frame) in out.chunks_exact_mut(channels).enumerate() {
-                    let lr = bridge.next(step, n - k, |_| g.pump(mix_rate));
-                    // a mono device takes the left channel, a third and later one the right
-                    for (ch, o) in frame.iter_mut().enumerate() {
-                        *o = lr[ch.min(1)];
-                    }
-                }
-                g.bridge = bridge;
+                core.lat.frames.store(frames, Ordering::Relaxed);
+                core.lat.at.store(core.lat.epoch.elapsed().as_nanos() as u64 + 1, Ordering::Release);
+                core.fill(out, channels, out_rate);
+                core.publish();
             },
             |e| tracing::error!(error = %e, "audio stream"),
             None,
-        )?;
-        stream.play()?;
-        tracing::info!(rate, channels, "audio output started");
-        Ok(Self { _stream: stream, shared, rate })
+        )
     }
 
     /// What 0x4A66B0 configures for `AUDIOQUALITY` when the sound opens (both start-ups 0x4A6840 /
@@ -1557,31 +2053,18 @@ impl AudioOutput {
         let rate = mix_rate(audio_quality);
         let interp = Interp::for_quality(audio_quality);
         let sleep = pump_sleep_ms(audio_quality);
-        let mut g = self.shared.lock().unwrap();
-        g.sleep_ms = Some(sleep);
-        if g.interp != interp {
-            g.interp = interp;
-            tracing::info!(?interp, audio_quality, "mix interpolator");
-        }
-        if g.budget != Some(budget) {
-            g.budget = Some(budget);
-            tracing::info!(budget, audio_quality, "voice budget");
-        }
-        if g.mix_rate != Some(rate) {
-            g.mix_rate = Some(rate);
-            // the reverb's delay lines are sized in frames of the mix rate
-            g.tail = None;
-            tracing::info!(mix_rate = rate, device_rate = self.rate, audio_quality, "mix rate");
-        }
+        let mut st = self.tx.state.lock().unwrap();
+        // a new mix rate drops the reverb (its delay lines are sized in frames of the mix rate)
+        // and the next send makes a fresh one — made here, off the callback, and handed over
+        let reverb = (st.cfg_rate != Some(rate)).then(|| Box::new(Reverb::new(rate)));
+        st.cfg_rate = Some(rate);
+        self.tx.push(&mut st, Cmd::Quality { budget, rate, interp, sleep, reverb }, None);
     }
 
     /// The aux byte of `Voice_play` for a collision one-shot: `voice+0x45 = 0x7F − aux`
     /// (0x4A9A5F…0x4A9A6C → 0x5906D7), so a loud hit sends less to the reverb.
     pub fn set_fx_aux(&self, id: VoiceId, aux: u8) {
-        let mut g = self.shared.lock().unwrap();
-        for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
-            v.fx_scale = 0x7F - aux.min(0x7F);
-        }
+        self.tx.send(Cmd::FxAux { id, aux });
     }
 
     /// `Voice_setVolume(h, 0)` **0x566340** over the voice table `0x656180…0x6563C8` (stride 8)
@@ -1618,52 +2101,32 @@ impl AudioOutput {
     /// not, was silenced — a collision one-shot, a checkpoint chime or a front-end button click
     /// still ringing at the instant of the pause fell silent when it should not have.)*
     pub fn silence_voices(&self) {
-        self.shared.lock().unwrap().silence();
+        self.tx.send(Cmd::Silence);
     }
 
     /// A playing voice's pan from the caller's 16-bit angle: the pan byte ([`pan_byte`]) to
     /// `Voice_setPan8` 0x566100, which stores it in `voice+0x1F` (and does nothing when it is the
     /// same, 0x56616D).
     pub fn set_pan(&self, id: VoiceId, pan: u16) {
-        let mut g = self.shared.lock().unwrap();
-        for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
-            v.pan = pan_byte(pan);
-        }
-    }
-
-    /// The voice a status call answers for — **settled 2026-09-27** (read to the instruction:
-    /// 0x566910 whole, 0x590e20, 0x566d60): the call takes a handle and, via 0x590e20, searches
-    /// the group's own small array for the entry whose *own* handle matches — never a sibling's —
-    /// answering "ended" (state 3, `mov [ebp], 3` at 0x566a1e) only once that entry is gone from
-    /// the array. The game only ever holds the handle 0x590420 answered for a start — the anchor's
-    /// (or the one voice of a solo patch) — so the call always reads the **anchor's own** entry
-    /// while the group has any; there is no reading "the first playing member" or "the lowest
-    /// slot" instead, whatever this note's own preliminary framing said. Found, the entry's own
-    /// remaining-frames field decides 0x566986's `jge`: negative — the held anchor, its sample
-    /// already having run out while the array keeps its bookkeeping ([`Voice::held`], the group
-    /// note) — answers **state 0** with every field left the zero the call started with
-    /// (0x566921…0x56692a): position 0, not the anchor's real (finished) cursor; non-negative
-    /// answers state 1 or 2 (0x566999's `[handle] == the found entry`, an array-index test with no
-    /// bearing on which data is read) from the anchor's own fields either way. The port's `held`
-    /// on the anchor already matches "kept, not freed, no strip" ([`Shared::free`]); this settles
-    /// what a status call answers for it: 0, not a sibling's position and not `None`.
-    fn status_voice(g: &Shared, id: VoiceId) -> Option<&Voice> {
-        let group: Vec<&Voice> = g.voices.iter().filter(|(i, _)| *i == id).map(|(_, v)| v).collect();
-        let v = group.iter().copied().find(|v| v.anchor).or_else(|| group.first().copied())?;
-        (!v.finished).then_some(v)
+        self.tx.send(Cmd::Pan { id, pan });
     }
 
     /// Fraction of the clip already played (0..1), or None when the voice is gone; 0 for a held
     /// anchor ([`status_voice`](Self::status_voice)).
     pub fn progress(&self, id: VoiceId) -> Option<f32> {
-        let g = self.shared.lock().unwrap();
-        Self::status_voice(&g, id).map(|v| {
-            if v.held {
-                return 0.0;
-            }
-            let n = (v.clip.samples.len() / v.clip.channels.max(1) as usize).max(1) as f64;
-            (v.position() / n).clamp(0.0, 1.0) as f32
-        })
+        let (pend, snap) = self.tx.overlay(id);
+        match pend {
+            // started, not yet in the mix: at its beginning
+            Some(Pend::Start(_)) => Some(0.0),
+            Some(_) => None,
+            None => snap.status_voice(id).map(|v| {
+                if v.held {
+                    return 0.0;
+                }
+                let n = v.frames.max(1) as f64;
+                (v.position / n).clamp(0.0, 1.0) as f32
+            }),
+        }
     }
 
     /// The voice's position in ms — what the sound library's status call 0x566910 answers at `+4`:
@@ -1671,8 +2134,12 @@ impl AudioOutput {
     /// a held anchor ([`status_voice`](Self::status_voice)), or `None` once the voice has ended
     /// (its state 3, 0x566A1E).
     pub fn position_ms(&self, id: VoiceId) -> Option<i32> {
-        let g = self.shared.lock().unwrap();
-        Self::status_voice(&g, id).map(|v| if v.held { 0 } else { played_ms(v.position() as u64, v.clip.rate) })
+        let (pend, snap) = self.tx.overlay(id);
+        match pend {
+            Some(Pend::Start(_)) => Some(0),
+            Some(_) => None,
+            None => snap.status_voice(id).map(|v| if v.held { 0 } else { played_ms(v.position as u64, v.rate) }),
+        }
     }
 
     /// **`Voice_play` 0x4A9C10's start** (`Voice_start` 0x565E70 → 0x5907B0 → 0x590420): the
@@ -1726,12 +2193,10 @@ impl AudioOutput {
     }
 
     fn play_word_tabled(&self, clip: Arc<Clip>, volume: f32, word: u16, bend: u8, pan: u16, looping: bool, sel: u8, tabled: bool) -> VoiceId {
-        let mut g = self.shared.lock().unwrap();
-        let id = g.start_patch(clip, volume, word, looping, sel, tabled);
-        for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
-            v.bend = bend as i8;
-            v.pan = pan_byte(pan);
-        }
+        let mut st = self.tx.state.lock().unwrap();
+        let id = VoiceId(st.next_id);
+        st.next_id += 1;
+        self.tx.push(&mut st, Cmd::Start { id, clip, volume, word, bend, pan, looping, sel, tabled }, Some(Pend::Start(id)));
         id
     }
 
@@ -1739,28 +2204,19 @@ impl AudioOutput {
     /// 0x5660C0 with the byte, `Voice_setPitch` 0x565F80 with the word (`pitch16_16 >> 4`, the low
     /// 16 bits into `voice+0x6C`, 0x565FEB) — the pan is [`set_pan`](Self::set_pan).
     pub fn set_word(&self, id: VoiceId, volume: f32, word: u16, bend: u8) {
-        let mut g = self.shared.lock().unwrap();
-        for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
-            v.set_volume(volume);
-            v.word = word;
-            v.bend = bend as i8;
-        }
+        self.tx.send(Cmd::SetWord { id, volume, word, bend });
     }
 
     /// **0x565DD0(handle, ticks, target)** on every playing voice of the handle's group
     /// ([`Ramp`]); a held anchor (state 2) is not walked (0x590340 takes state 1 only).
     pub fn ramp(&self, id: VoiceId, ticks: i32, target: i32) {
-        self.shared.lock().unwrap().ramp(id, ticks, target);
+        self.tx.send(Cmd::Ramp { id, ticks, target });
     }
 
     /// **0x565F00(handle, value)**, the strip hook `+0xE0` on every playing voice of the group
     /// ([`LowPass`]); `value` from [`voice_play_filter`].
     pub fn set_filter(&self, id: VoiceId, value: i32) {
-        let mut g = self.shared.lock().unwrap();
-        let rate = g.mix_rate();
-        for (_, v) in g.voices.iter_mut().filter(|(i, v)| *i == id && !v.finished && !v.held) {
-            LowPass::set(&mut v.lowpass, value, rate);
-        }
+        self.tx.send(Cmd::Filter { id, value });
     }
 
     /// `Voice_play`'s update tail (0x4A9FA8…0x4AA03B): [`set_filter`](Self::set_filter) with
@@ -1783,7 +2239,7 @@ impl AudioOutput {
     }
 
     pub fn stop(&self, id: VoiceId) {
-        StopHandle::stop_shared(&self.shared, id);
+        self.tx.stop(id);
     }
 
     /// A cheap, cloneable handle that can [`Self::stop`] a voice without keeping the whole
@@ -1793,7 +2249,7 @@ impl AudioOutput {
     /// this is the port's own equivalent, so no voice a widget started is ever left playing once
     /// the widget is gone).
     pub fn stop_handle(&self) -> StopHandle {
-        StopHandle(self.shared.clone())
+        StopHandle(self.tx.clone())
     }
 
     /// `0x565CD0(id, level)`: bit 0x20 of the id sets the bus `[0x6B4A0C]`, bit 0x80
@@ -1801,15 +2257,14 @@ impl AudioOutput {
     /// voices' sends follow at once (0x565D28…0x565D51 → 0x5902A0). `p20` / `p80` are the tunnel
     /// reverb's two parameters (`reverb::EnvParams`).
     pub fn set_env(&self, p20: i32, p80: i32) {
-        let mut g = self.shared.lock().unwrap();
-        g.bus_c = p20 as i8;
-        g.bus_d = p80 as i8;
+        self.tx.bus[0].store(p20 as i8, Ordering::Relaxed);
+        self.tx.bus[1].store(p80 as i8, Ordering::Relaxed);
+        self.tx.send(Cmd::Env { p20, p80 });
     }
 
     /// The two buses as `set_env` left them.
     pub fn env(&self) -> (i8, i8) {
-        let g = self.shared.lock().unwrap();
-        (g.bus_c, g.bus_d)
+        (self.tx.bus[0].load(Ordering::Relaxed), self.tx.bus[1].load(Ordering::Relaxed))
     }
 
     /// **0x56AFA0** → 0x592E40 → 0x58F5D0, the driver's latency in ms: the software mixer's write
@@ -1818,37 +2273,51 @@ impl AudioOutput {
     /// `idiv`) — what has been mixed and not yet heard; 0 with no buffer or on a failed call. Here:
     /// what the last callback queued ([`latency_ms`]) less the time since.
     pub fn latency_ms(&self) -> i32 {
-        let g = self.shared.lock().unwrap();
-        match g.queued {
-            Some((frames, at)) => latency_ms(frames, at.elapsed(), self.rate),
-            None => 0,
+        let l = &self.tx.lat;
+        let at = l.at.load(Ordering::Acquire);
+        if at == 0 {
+            return 0;
         }
+        let since = l.epoch.elapsed().saturating_sub(std::time::Duration::from_nanos(at - 1));
+        latency_ms(l.frames.load(Ordering::Relaxed), since, self.rate)
     }
 
     /// Is a one-shot / loop voice still playing?
     pub fn is_playing(&self, id: VoiceId) -> bool {
-        let g = self.shared.lock().unwrap();
-        g.voices.iter().any(|(i, v)| *i == id && !v.finished) || g.streams.iter().any(|(i, _)| *i == id)
+        let (pend, snap) = self.tx.overlay(id);
+        match pend {
+            Some(Pend::Start(_) | Pend::Stream(..)) => true,
+            Some(Pend::Stop(_)) => false,
+            None => snap.voices.iter().any(|v| v.id == id && !v.finished) || snap.streams.iter().any(|(i, _)| *i == id),
+        }
     }
 }
+
+/// The samples a stream's ring holds (1 Mi: ~12 s of 44.1 kHz stereo).
+const STREAM_QUEUE: usize = 1 << 20;
 
 /// Streamed stereo/mono source fed from another thread (music).
 pub struct StreamSource {
     pub rate: u32,
     pub channels: u16,
-    queue: Mutex<std::collections::VecDeque<i16>>,
+    queue: SampleRing,
     pub finished: std::sync::atomic::AtomicBool,
 }
 
 impl StreamSource {
     pub fn new(rate: u32, channels: u16) -> Arc<Self> {
-        Arc::new(Self { rate, channels, queue: Mutex::new(std::collections::VecDeque::new()), finished: std::sync::atomic::AtomicBool::new(false) })
+        Arc::new(Self { rate, channels, queue: SampleRing::new(STREAM_QUEUE), finished: std::sync::atomic::AtomicBool::new(false) })
     }
+    /// Queue decoded samples (the feeder thread). The queue is a lock-free ring the callback reads
+    /// without waiting; the feeder keeps itself ~2 s ahead, far below its size.
     pub fn push(&self, samples: &[i16]) {
-        self.queue.lock().unwrap().extend(samples.iter().copied());
+        let n = self.queue.push(samples);
+        if n < samples.len() {
+            tracing::warn!(dropped = samples.len() - n, "music stream queue full");
+        }
     }
     pub fn queued_frames(&self) -> usize {
-        self.queue.lock().unwrap().len() / self.channels.max(1) as usize
+        self.queue.len() / self.channels.max(1) as usize
     }
 }
 
@@ -1856,30 +2325,28 @@ impl AudioOutput {
     /// `0x566AE0(stream, ms, target)`: ramp a stream's volume to the byte `target` over `ms`
     /// ([`Fade`]).
     pub fn fade(&self, id: VoiceId, ms: i32, target: i32) {
-        let mut g = self.shared.lock().unwrap();
-        if let Some((_, sv)) = g.streams.iter_mut().find(|(i, _)| *i == id) {
-            sv.fade = Some(Fade::new(sv.volume, ms, target));
-        }
+        self.tx.send(Cmd::Fade { id, ms, target });
     }
 
     /// A stream's volume now (0x567850 answers the voice's current level, 0x591320), `None` when
     /// it is not playing.
     pub fn stream_volume(&self, id: VoiceId) -> Option<f32> {
-        let g = self.shared.lock().unwrap();
-        g.streams.iter().find(|(i, _)| *i == id).map(|(_, sv)| sv.volume)
+        let (pend, snap) = self.tx.overlay(id);
+        match pend {
+            Some(Pend::Stream(_, v)) => Some(v),
+            Some(_) => None,
+            None => snap.streams.iter().find(|(i, _)| *i == id).map(|(_, v)| *v),
+        }
     }
 
     /// Play a streamed source at its native rate (the voices' resampler, [`resample`]), returns a stop
     /// handle. Its channels take voices of the budget at [`STREAM_PRIORITY`] (0x5612A0), so it is
     /// never stolen; a refused start (the budget full of unstealable voices) returns a dead handle.
     pub fn play_stream(&self, src: Arc<StreamSource>, volume: f32) -> VoiceId {
-        let mut g = self.shared.lock().unwrap();
-        let id = VoiceId(g.next_id);
-        g.next_id += 1;
-        if !g.allocate(src.channels.max(1) as usize, STREAM_PRIORITY, None) {
-            return id;
-        }
-        g.streams.push((id, StreamVoice { src, volume, frac: 0, window: [[0.0; 4]; 2], primed: false, fade: None }));
+        let mut st = self.tx.state.lock().unwrap();
+        let id = VoiceId(st.next_id);
+        st.next_id += 1;
+        self.tx.push(&mut st, Cmd::Stream { id, src, volume }, Some(Pend::Stream(id, volume)));
         id
     }
 }
@@ -2330,7 +2797,7 @@ mod rate_tests {
         // a ramp mixed at 16000 heard at 48000: three device frames per mix frame
         let mut r = ramp(-1.0);
         let mut b = Bridge::default();
-        let got: Vec<f32> = (0..7).map(|k| b.next(16000.0 / 48000.0, 7 - k, &mut r)[0]).collect();
+        let got: Vec<f32> = (0..7).map(|k| b.next(16000.0 / 48000.0, 7 - k, |n, p| p.extend(r(n)))[0]).collect();
         let want = [1.0, 4.0 / 3.0, 5.0 / 3.0, 2.0, 7.0 / 3.0, 8.0 / 3.0, 3.0];
         for (g, w) in got.iter().zip(want) {
             assert!((g - w).abs() < 1e-5, "{got:?}");
@@ -2338,7 +2805,7 @@ mod rate_tests {
         // at the same rate the mix passes through unchanged
         let mut r = ramp(1.0);
         let mut b = Bridge::default();
-        assert_eq!((0..4).map(|k| b.next(1.0, 4 - k, &mut r)[1]).collect::<Vec<_>>(), [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!((0..4).map(|k| b.next(1.0, 4 - k, |n, p| p.extend(r(n)))[1]).collect::<Vec<_>>(), [1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
@@ -2470,11 +2937,16 @@ mod group_tests {
         let id = start(&mut s, &clip, 75);
         s.render(1000, 22050);
         assert!(s.voices[1].1.held && s.voices[1].1.anchor && !s.voices[0].1.held);
-        let v = super::AudioOutput::status_voice(&s, id).expect("the group is still alive");
+        let status = |s: &Shared| {
+            let mut snap = super::Snapshot::default();
+            s.snapshot_into(&mut snap);
+            (snap.status_voice(id).copied(), snap)
+        };
+        let v = status(&s).0.expect("the group is still alive");
         assert!(v.held, "answers the held anchor, not the still-playing sibling at voices[0]");
         s.render(2000, 22050);
         assert!(s.voices.is_empty());
-        assert!(super::AudioOutput::status_voice(&s, id).is_none(), "state 3: gone");
+        assert!(status(&s).0.is_none(), "state 3: gone");
     }
 
     #[test]
@@ -2861,3 +3333,6 @@ mod service_tests {
         assert!(closed < open * 0.25, "{closed} vs {open}");
     }
 }
+
+#[cfg(test)]
+mod rt_tests;

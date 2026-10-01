@@ -121,13 +121,41 @@ impl App {
     /// round, else 0 — APPROXIMATION for those port-only launches: a text-menu career event (the
     /// original's 4) answers 0, which picks the same summary title.
     pub(crate) fn race_fegame_type(&self) -> u8 {
-        self.fe.race_game_type.unwrap_or(if self.quick_knockout {
+        self.block_game_type().unwrap_or(if self.quick_knockout {
             1
         } else if self.knockout_round {
             2
         } else {
             0
         })
+    }
+
+    /// `FEGAME_TYPE [0x6573E8]` as the race running reads it. A live race's is the launch's
+    /// `Game.GameType` (`race_game_type`); a **playback**'s is the recording's: `Replay_begin`
+    /// 0x413CF0 copies the whole recorded block over `0x6573E8` (0x413DC0...), the front end's own
+    /// `Game.GameType` `[0x690AAC]` untouched. A setup that carries none (a file from before the
+    /// field) answers the current one (APPROXIMATION, `replay.md` 2026-10-01).
+    pub(crate) fn block_game_type(&self) -> Option<u8> {
+        let playback = self.replay.stream.as_ref().is_some_and(|s| matches!(s.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted));
+        self.replay.setup.fegame_type.filter(|_| playback).or(self.fe.race_game_type)
+    }
+
+    /// `RACE_TYPE [0x6573EC]` of the race being set up, as 0x4EB470 derives it (table 0x4EB6C0, the
+    /// jump at 0x4EB4F6): the lap knockout 3 (Quick Knockout 0x4EB511, and the derby cheat's skid pad
+    /// 0x4ED7D9...), the series 2 (types 2 and 4: 0x4EB515), the skill test 4 (a mission with no
+    /// opponent: 0x4EB53A...0x4EB541), the cops race 1 (type 0 with cheat 5: 0x4EB4FD...0x4EB50D), else 0.
+    pub(crate) fn launch_race_type(&self) -> u8 {
+        if self.quick_knockout {
+            3
+        } else if self.knockout_round || self.race_fegame_type() == 4 {
+            2
+        } else if self.skill.is_some() {
+            4
+        } else if self.road.cops_race {
+            1
+        } else {
+            0
+        }
     }
 
     /// `HRaceSummary`'s title by `FEGAME_TYPE`, chosen by its creator **0x424BD2…0x424BEF**: 1 →
@@ -153,7 +181,7 @@ impl App {
         // diagnostic: `NFS_KO_PLACE=<p>` files the player at place `p` (1-based) of the order —
         // a scripted series (`NFS_FE_KO_SERIES`) cannot drive past anyone, so this is how a still
         // reaches the rounds after the first and `knockoutraceinfo`
-        if let Some(p) = std::env::var("NFS_KO_PLACE").ok().and_then(|v| v.trim().parse::<usize>().ok())
+        if let Some(p) = nfs_game::config::cfg().nfs_ko_place.var().ok().and_then(|v| v.trim().parse::<usize>().ok())
             && let Some(at) = order.iter().position(|d| *d == 0)
         {
             let d = order.remove(at);
@@ -395,13 +423,32 @@ impl App {
     /// vector `[0x610A80]` freed (0x434F00). Nothing it zeroes is read before the next race's HUD
     /// init (the elements built afresh from 0x4244A4 on, the shared resources re-acquired by 0x41E170 at 0x42449A), so what it means for the port is that
     /// the next race starts with the elements' own state at its constructor values; the port keeps
-    /// that state on `App` and resets it in [`App::start_race`] (0x426B20…), save for the two
+    /// that state on `App` and resets it in [`App::start_race`] (0x426B20…), save for the
     /// fields only the elements' construction clears: `HButtonVisual +0x100`, the button under the
     /// pointer ([`App::hud_hover`] — a race left by the keyboard kept it), and the page billboard's
-    /// shrink (`HBillBoard` state 2, [`App::page_closing`]).
+    /// shrink (`HBillBoard` state 2, [`App::page_closing`]) — and the dialog queue itself.
+    ///
+    /// **The dialog queue `[0x60C9C4]`** is emptied (its end put back to its start, 0x42567B…
+    /// 0x4256BC), freed (0x425722) and its pointer zeroed (0x42572A); `[0x60C9F4]`, the other vector,
+    /// likewise (0x4255CA…0x425610, freed 0x425673, zeroed 0x425681). 0x426A60 — "a dialog is up",
+    /// read by the camera dispatcher's pause orbit (0x463C66) and the orbit keys (0x415855), among
+    /// its eight callers (also 0x41518C, 0x415231, 0x418514, 0x4569F1, 0x45715E, 0x459029) —
+    /// answers false for a null or empty `[0x60C9C4]` (0x426A60…0x426A7C), so
+    /// the next race starts with no dialog up. The port's stand-ins for that queue's billboards are
+    /// [`App::results_billboard`] (the result page open last frame, which only a frame with
+    /// result records rewrites) and [`App::billboard_key`] (what [`App::hud_dialog_up`] reads):
+    /// both go. *(Until 2026-10-01 they did not: a race left from an open result page — Space on
+    /// the last page, the automatic replay running out, the bar's quit — kept `Some(page)` / `10 +
+    /// page`, so every later race of the run had a dialog "up" from its first frame: the pause
+    /// orbit took over every view but 0, 1 and 0x0E, its offset frozen at the first such view's
+    /// first eye — the chase cameras glued to the driver's head, looking up past the car — and the
+    /// HUD trays never slid in. Only a restart of the program cleared it. User report, CAM2.)*
+    /// Being deleted, not closed, the billboard plays no sound 4 (0x41ADD0 is not called).
     fn hud_teardown(&mut self) {
         self.hud_hover = None;
         self.page_closing = None;
+        self.results_billboard = None;
+        self.billboard_key = 0;
     }
 
     /// **The front end coming back from a race — 0x4D3420 at 0x4D3EB2…0x4D5202**, the screen
@@ -576,7 +623,7 @@ impl App {
             let p = c.profile.clone();
             let money_before = c.career.money;
             if c.switch_profile(&p) {
-                tracing::debug!(profile = %p.name, money = c.career.money, money_before, "front end: profile reloaded from disk (0x501340 + 0x4D3B52)");
+                tracing::debug!(profile = %p.name, money = c.career.money, money_before, state = %c.summary(), "front end: profile reloaded from disk (0x501340 + 0x4D3B52)");
             } else {
                 tracing::debug!("front end: profile reload at FE entry found nothing on disk yet (0x4D3B52) — keeping the live career");
             }
@@ -684,11 +731,14 @@ impl App {
     pub(crate) fn race_over_check(&mut self) {
         // a network race (`FEGAME_TYPE 3`): 0x417010 never runs (0x417128 tests the game type, not the link — a
         // race whose session was torn down is still no single-player race); the pages come from the room's times
-        if self.fe.race_game_type == Some(3) {
-            self.net_results_check();
+        let playback = self.replay.stream.as_ref().is_some_and(|s| matches!(s.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted));
+        if self.block_game_type() == Some(3) {
+            // (a playback of a network race: 0x417010 does not run either, the stream's end leaves)
+            if !playback {
+                self.net_results_check();
+            }
             return;
         }
-        let playback = self.replay.stream.as_ref().is_some_and(|s| matches!(s.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted));
         if self.net.session.is_some() || self.replay.race_over || (!playback && (self.results.is_some() || self.auto_replay_due)) {
             return;
         }
@@ -746,6 +796,43 @@ impl App {
             times[i] = r.time;
         }
         (order, times)
+    }
+
+    /// **`finishing_order().0`, for the HUD's per-frame lists** (performance work PG, 2026-10-01):
+    /// the same order without `Race_finalize`'s records. The order is the ranking table 0x608B38
+    /// (`finalize_race`: `race::ranking` over each car's `+0xAF8` progress and `+0xB14` tick, nothing
+    /// of the records' times or states enters it), so only that is computed — and kept under its
+    /// inputs, the `(progress, tick)` pairs, so a frame whose cars have not moved on repeats the
+    /// last answer. The results (a finished race's `order`) and the `NFS_RACE_PLACE` diagnostic,
+    /// which moves the player after the ranking, go the long way.
+    pub(crate) fn live_order(&self) -> Vec<usize> {
+        if self.results.is_some() || race_place_diagnostic().is_some() {
+            return self.finishing_order().0;
+        }
+        let mut key = std::mem::take(&mut *self.order_key.borrow_mut());
+        key.clear();
+        let mut keys: Vec<(f32, u64)> = Vec::with_capacity(self.road.opponents.len() + 1);
+        if let Some(r) = &self.race {
+            keys.push((r.progress, r.tick));
+        }
+        keys.extend(self.road.opponents.iter().map(|o| (o.progress.progress, o.progress.tick)));
+        key.extend(keys.iter().flat_map(|&(p, t)| [u64::from(p.to_bits()), t]));
+        key.push(u64::from(self.race.is_some()));
+        let cached = self.order_cache.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, o)| o.clone());
+        if let Some(order) = cached {
+            *self.order_key.borrow_mut() = key;
+            // debug builds (the goldens' binary) compare every frame's answer with the full path
+            debug_assert_eq!(order, self.finishing_order().0, "live_order: a stale cached order");
+            return order;
+        }
+        // the drivers' order is the player (if any), then the opponents by slot: a driver's index
+        // is its position in `keys` plus one when there is no player
+        let first = usize::from(self.race.is_none());
+        let order: Vec<usize> = nfs_game::race::ranking(&keys).into_iter().map(|k| k + first).collect();
+        debug_assert_eq!(order, self.finishing_order().0, "live_order: the ranking alone differs from finalize_race's order");
+        let old = self.order_cache.replace(Some((key, order.clone())));
+        *self.order_key.borrow_mut() = old.map(|(k, _)| k).unwrap_or_default();
+        order
     }
 }
 

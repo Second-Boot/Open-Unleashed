@@ -166,6 +166,7 @@ impl Net {
             identity_gate: None,
             conns: std::collections::HashMap::new(),
             outbox: crate::outbox::Outbox::new(),
+            // det-allow: transport timeouts, not simulation state
             epoch: std::time::Instant::now(),
             alive: comm::ALIVE_TICKS,
             ping: comm::PING_TICKS,
@@ -193,6 +194,7 @@ impl Net {
             identity_gate: None,
             conns: std::collections::HashMap::new(),
             outbox: crate::outbox::Outbox::new(),
+            // det-allow: transport timeouts, not simulation state
             epoch: std::time::Instant::now(),
             alive: comm::ALIVE_TICKS,
             ping: comm::PING_TICKS,

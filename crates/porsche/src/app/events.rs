@@ -646,6 +646,7 @@ impl ApplicationHandler for App {
                 }
                 // the front end draws from `rebuild_scene` like everything else, so it keeps
                 // animating between key presses
+                self.pace_frame();
                 let now = Instant::now();
                 self.frame_dt = (now - self.last_frame).as_secs_f32();
                 self.last_frame = now;
@@ -660,6 +661,7 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested if event_loop.exiting() => {}
             WindowEvent::RedrawRequested => {
                 self.gamepads.poll(&mut self.input);
+                self.pace_frame();
                 let now = Instant::now();
                 self.frame_dt = (now - self.last_frame).as_secs_f32();
                 // the replay pause freezes the frame as the pause menu does: `[0x606A98]` makes
@@ -699,16 +701,7 @@ impl ApplicationHandler for App {
                 // the one-shots and the phrase then came back — and the pause key hard-stopped the
                 // SFX loops.)*
                 self.sync_audio_pause();
-                // a billboard opening or closing plays sound 4 (0x41ADD0)
-                let key = if self.paused {
-                    if self.pause_confirm.is_some() { 2 } else { 1 }
-                } else {
-                    self.results_billboard.map_or(0, |p| 10 + p)
-                };
-                if key != self.billboard_key {
-                    self.billboard_key = key;
-                    self.fe_sound(4);
-                }
+                self.billboard_key_frame();
                 self.accumulator += now - self.last_frame;
                 self.last_frame = now;
                 if self.accumulator > Duration::from_millis(250) {
@@ -773,7 +766,7 @@ impl ApplicationHandler for App {
                 // diagnostic: `NFS_REPLAY_TYPE`, as the scripted-run loop does
                 if !bar_save_was_up
                     && self.replay_save.up
-                    && let Ok(name) = std::env::var("NFS_REPLAY_TYPE")
+                    && let Ok(name) = nfs_game::config::cfg().nfs_replay_type.var()
                 {
                     for c in name.chars() {
                         self.replay_save.type_char(c);

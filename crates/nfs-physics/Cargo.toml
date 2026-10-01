@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 glam.workspace = true
+nfs-math.workspace = true
 nfs-formats.workspace = true

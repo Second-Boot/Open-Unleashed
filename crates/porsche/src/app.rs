@@ -16,6 +16,7 @@ mod net;
 mod race_end;
 mod opponents;
 mod results;
+mod race_stages;
 mod race_start;
 mod loading;
 mod simulate;
@@ -24,6 +25,7 @@ mod replay;
 mod render_scene;
 mod car_lights;
 mod mirror;
+mod scratch;
 mod effects;
 mod camera;
 mod fe_room;
@@ -34,6 +36,8 @@ mod input;
 mod frame;
 mod events;
 mod scripted;
+mod fe_seq;
+mod idle;
 mod quickfix;
 pub(crate) use quickfix::*;
 pub(crate) use scripted::*;
@@ -87,6 +91,10 @@ pub(crate) struct App {
     pub(crate) local_prev: Option<(Vec3, Quat)>,
     /// Seconds since the previous frame (camera low-pass time constants).
     pub(crate) frame_dt: f32,
+    /// The sub-millisecond rest of the front end's clock step (`frame.rs`): the original's clock is
+    /// the free-running 128 Hz `TIMER_getTicks` (0x53C2E0), not a per-frame count, so the port's
+    /// whole-millisecond step must not lose the fraction (120 fps rounds 8.33 ms to 8, 4 % slow).
+    pub(crate) fe_ms_carry: f32,
     pub(crate) paused: bool,
     /// 64 Hz ticks of wall time since the pause began. `[0x606AC8]` — the counter the HUD and the
     /// dialogs animate on — is advanced by one per pass of the frame driver's tick loop until it
@@ -131,6 +139,11 @@ pub(crate) struct App {
     /// `pauserestart`) — the HUD toggle keys pressed on those game ticks (`hud_key`), for a
     /// `--screenshot` of their effect
     pub(crate) hud_key_script: Vec<(u64, ScriptedHudKey)>,
+    /// **TEST GLUE**: the races of a scripted session (`NFS_AUTOTEST_RACES`) begun after the first
+    pub(crate) scripted_race_no: u32,
+    /// **TEST GLUE**: the pause `hud_key_script`'s hold ends in the pause menu's quit (`NFS_HUD_KEYS`'s
+    /// `pausequit`) — the race left for the front end as `leave_race` does
+    pub(crate) scripted_quit: bool,
     /// diagnostic: a pause `hud_key_script` opened, left after 64 pause ticks
     pub(crate) scripted_pause: bool,
     /// diagnostic: the pause `hud_key_script`'s hold ends in the pause menu's restart (command 3,
@@ -465,6 +478,12 @@ pub(crate) struct App {
     /// this frame's cars' and skid marks' own `+0xC` entries (`round(d²)`-keyed, `RE/RENDERING.md`
     /// "The view's lists"), the main pass's
     pub(crate) blended_dyn_items: Vec<(u32, nfs_renderer::DrawItem)>,
+    /// the scene build's reusable buffers (`scratch.rs`)
+    pub(crate) scratch: scratch::SceneScratch,
+    /// `live_order`'s last answer under the `(progress, tick)` pairs it was ranked from, and the
+    /// buffer the next key is built in (`race_end.rs`)
+    pub(crate) order_cache: std::cell::RefCell<Option<(Vec<u64>, Vec<usize>)>>,
+    pub(crate) order_key: std::cell::RefCell<Vec<u64>>,
     /// the far plane of the view whose pass is being built (700, the mirror's 65000), for the
     /// depth-bias pulls of the shadows, the lamps and the skid marks (`cam[+0xC]`)
     pub(crate) view_far: f32,
@@ -609,6 +628,10 @@ pub(crate) struct App {
     /// `SKILL [0x6573F4]` 0..2: `fe.txt skill` for a command-line race, `Game.Difficutly` (`Menu::difficulty`) for a layout launch (0x4EB470), the event's in career
     pub(crate) race_skill: u8,
     pub(crate) last_frame: Instant,
+    /// what the window last showed, for the front end's idle redraw (`idle.rs`)
+    pub(crate) presented: Option<idle::Presented>,
+    /// the image of the last front-end frame rendered, kept under `NFS_FE_IDLE_VERIFY`
+    pub(crate) idle_check: Option<Vec<u8>>,
     pub(crate) accumulator: Duration,
     pub(crate) tick: u64,
     /// The track map's cop blips, `[0x5CD158 + 4·i]` (colour, 0xC00000FF in `.data`) and

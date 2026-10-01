@@ -15,7 +15,7 @@ impl LayoutScreen {
                 // tabs could not measure the art they centre their captions over.
                 let file = self.part_attr(e, p, "shapePathName").filter(|v| !v.is_empty())?;
                 let index = match self.part_attr(e, p, "shapeIndex") {
-                    Some(v) => nfs_formats::ctr::eval(v, &|n| self.reference(e, n, depth + 1)).filter(|n| *n >= 0)? as usize,
+                    Some(v) => self.ev(e, v, depth + 1).filter(|n| *n >= 0)? as usize,
                     None => 0,
                 };
                 let &(_, w, h) = self.shapes.get(&(file.to_string(), index))?;
@@ -268,7 +268,7 @@ impl LayoutScreen {
             ) {
                 continue;
             }
-            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)));
+            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| self.ev_pair(e, v, 0));
             let (px, py) = at("pos").unwrap_or((0, 0));
             // a text part's size is its text's measure whatever the template says (0x4E72A0)
             let text_part = matches!(p.kind(), nfs_formats::ctr::PartKind::Text | nfs_formats::ctr::PartKind::LocalizedText);
@@ -335,7 +335,7 @@ impl LayoutScreen {
         }
         let c = self.controls.get(&e.class)?;
         let v = c.value("size")?;
-        nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, depth + 1)).map(|(w, h)| (w as f32, h as f32))
+        self.ev_pair(e, v, depth + 1).map(|(w, h)| (w as f32, h as f32))
     }
 
     /// The widget's position: the block's own `pos`, or the class template's `[control] pos.value`
@@ -346,7 +346,7 @@ impl LayoutScreen {
         }
         if let Some(c) = self.controls.get(&e.class)
             && let Some(v) = c.value("pos")
-            && let Some((x, y)) = nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0))
+            && let Some((x, y)) = self.ev_pair(e, v, 0)
         {
             return (x as f32, y as f32);
         }
@@ -430,7 +430,7 @@ impl LayoutScreen {
             if p.kind() != nfs_formats::ctr::PartKind::Rect {
                 continue;
             }
-            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)));
+            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| self.ev_pair(e, v, 0));
             let Some((x, y)) = at("pos") else { continue };
             let Some((w, h)) = at("size") else { continue };
             // a colour may be a literal or a reference to one of the `data` attributes
@@ -452,7 +452,7 @@ impl LayoutScreen {
             return Some(c);
         }
         // a 32-bit pattern: `0xffffffff` is −1 to the evaluator and every bit of it the colour
-        let n = nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0))? as u32;
+        let n = self.ev(e, v, 0)? as u32;
         Some([((n >> 16) & 0xFF) as u8, ((n >> 8) & 0xFF) as u8, (n & 0xFF) as u8, (n >> 24) as u8])
     }
 
@@ -467,7 +467,7 @@ impl LayoutScreen {
             if p.kind() != nfs_formats::ctr::PartKind::Rect {
                 continue;
             }
-            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)));
+            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| self.ev_pair(e, v, 0));
             let (Some((px, py)), Some((pw, ph))) = (at("pos"), at("size")) else { continue };
             let Some(col) = self.part_colour(e, p, "color").filter(|c| c[3] != 0) else { continue };
             out.push((px as f32, py as f32, pw as f32, ph as f32, col));
@@ -536,7 +536,7 @@ impl LayoutScreen {
             let Some(col) = self.part_colour(e, p, "foreColor").filter(|c| c[3] != 0) else { continue };
             let (px, py) = self
                 .part_attr(e, p, "pos")
-                .and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)))
+                .and_then(|v| self.ev_pair(e, v, 0))
                 .unwrap_or((0, 0));
             let Some(f) = self
                 .part_attr(e, p, "fontPathName")
@@ -640,14 +640,14 @@ impl LayoutScreen {
             let index = match frame.filter(|_| name == "picture") {
                 Some(n) => n,
                 None => match self.part_attr(e, p, "shapeIndex") {
-                    Some(v) => match nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0)) {
+                    Some(v) => match self.ev(e, v, 0) {
                         Some(n) if n >= 0 => n as usize,
                         _ => continue,
                     },
                     None => 0,
                 },
             };
-            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)));
+            let at = |key: &str| self.part_attr(e, p, key).and_then(|v| self.ev_pair(e, v, 0));
             let (px, py) = at("pos").unwrap_or((0, 0));
             let (px, py) = (px as f64, py as f64);
             // No size: a `SHAPE` part is always drawn at its **art's** size. `FEShapePart`'s load
@@ -673,7 +673,7 @@ impl LayoutScreen {
             // `flip.value=data.flipit`, so the widget's `flipit` mirrors the tab's art
             let flip = self
                 .part_attr(e, p, "flip")
-                .and_then(|v| nfs_formats::ctr::eval(v, &|n| self.reference(e, n, 0)))
+                .and_then(|v| self.ev(e, v, 0))
                 .filter(|n| *n >= 0)
                 .map(|n| n as i64)
                 .unwrap_or_else(|| e.int("flip").unwrap_or(0).max(0));

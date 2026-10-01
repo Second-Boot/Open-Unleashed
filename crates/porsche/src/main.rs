@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! porsche                                  # menu: choose track and car, Enter to race
-//! porsche [track] [car] [sim] [--fe[=layout]] [--screenshot out.png] [--autotest N [--follow]] [--opponents N] [--record run.csv]
+//! porsche [track] [car] [sim] [--fe[=layout]] [--debug-menu] [--screenshot out.png] [--autotest N [--follow]] [--opponents N] [--record run.csv]
 //!        [--net host[:PORT] | --net join:HOST[:PORT] [--net-name NAME]]
 //! keys: arrows = steer/throttle/brake, space = handbrake, C = camera, R = reset to track, Esc = quit
 //! ```
@@ -346,10 +346,25 @@ fn main() -> Result<()> {
         // SAFETY: single-threaded start-up, before any screen is loaded
         unsafe { std::env::set_var("NFS_FE_CLOCK", "5000") };
     }
+    // the `NFS_*` switches are read once from here on (`nfs_game::config`, F4): pin the snapshot after the two `set_var`s above
+    nfs_game::config::init();
     let fe_start = if layout_sweep { fe_start.or_else(|| Some("QuickRace".to_string())) } else { fe_start };
+    // A plain launch is the original's: main 0x4B6A50 plays the intro movies (0x4DD600, unless
+    // NOINTROMOVIES) and enters the front end on `"gamesetup"` (0x4B6C52, `FE_ENTRY`), with the
+    // profile prompt of the first entry. The port's text menu is a developer tool and opens only
+    // with `--debug-menu`; a `--layout <name>` start keeps its own screen.
+    let debug_menu = args.iter().any(|a| a == "--debug-menu");
+    let fe_start = if use_menu && fe_start.is_none() && !debug_menu && !args.iter().any(|a| a == "--layout") {
+        Some(app::FE_ENTRY.to_string())
+    } else {
+        fe_start
+    };
     // the views the player cycles through come from the registry, like everything else in `fe.txt`
-    let camera_cycle =
-        nfs_game::camera::cycle_from_registry(&nfs_formats::fetxt::Registry::load(&paths.root), 0);
+    // a `--replay`'s own list when the file carries one (`Replay_begin` 0x413CF0 restores the block's `.CAMERA`)
+    let camera_cycle = match replay_setup.as_ref().and_then(|r| r.camera.as_ref()).filter(|c| !c.is_empty()) {
+        Some(c) => c.iter().map(|&v| v as u16).collect(),
+        None => nfs_game::camera::cycle_from_registry(&nfs_formats::fetxt::Registry::load(&paths.root), 0),
+    };
     tracing::info!(cycle = ?camera_cycle, "camera cycle");
     // diagnostic: `NFS_CAMERA=<index into the cycle>` starts on that view instead of the first
     let camera_mode = std::env::var("NFS_CAMERA")
@@ -739,6 +754,7 @@ fn main() -> Result<()> {
         local_pose: (Vec3::ZERO, Quat::IDENTITY),
         local_prev: None,
         frame_dt: 1.0 / 60.0,
+        fe_ms_carry: 0.0,
         pause_ticks: 0.0,
         pause_offset: 0.0,
         hud_clock_base: 0.0,
@@ -749,39 +765,14 @@ fn main() -> Result<()> {
         hud_keys: HudKeys::new(1, false, true),
         replay_bar: nfs_game::replay::BarState::new(),
         bar_press: None,
-        hud_key_script: std::env::var("NFS_HUD_KEYS")
-            .map(|s| {
-                s.split(',')
-                    .filter_map(|e| {
-                        let (t, k) = e.trim().split_once(':')?;
-                        let a = match k.trim() {
-                            "F5" | "f5" => ScriptedHudKey::Toggle(nfs_input::Action::ToggleHud),
-                            "F6" | "f6" => ScriptedHudKey::Toggle(nfs_input::Action::ToggleRearView),
-                            "F7" | "f7" => ScriptedHudKey::Toggle(nfs_input::Action::ToggleMap),
-                            "F8" | "f8" => ScriptedHudKey::Toggle(nfs_input::Action::HudTransparency),
-                            "2" => ScriptedHudKey::Toggle(nfs_input::Action::CycleMap),
-                            // port diagnostic: the pause key, the menu left through its continue
-                            // after 64 pause ticks (`App::scripted_pause`)
-                            "pause" | "P" => ScriptedHudKey::Pause,
-                            // port diagnostic: the pause key, the menu left through its restart
-                            // (command 3, 0x415721) instead — `replay.md` §18.12
-                            "pauserestart" => ScriptedHudKey::PauseRestart,
-                            // network test glue: the horn button held from that tick / released
-                            "horn" => ScriptedHudKey::Pad(nfs_input::Action::Horn, true),
-                            "hornoff" => ScriptedHudKey::Pad(nfs_input::Action::Horn, false),
-                            "reset" => ScriptedHudKey::Pad(nfs_input::Action::Reset, true),
-                            _ => return None,
-                        };
-                        Some((t.trim().parse().ok()?, a))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        hud_key_script: std::env::var("NFS_HUD_KEYS_1").or_else(|_| std::env::var("NFS_HUD_KEYS")).map(|s| parse_hud_keys(&s)).unwrap_or_default(),
+        scripted_race_no: 0,
         race_order: Default::default(),
         audio_paused: false,
         scripted_pause: false,
         scripted_restart: false,
         scripted_net_leave: false,
+        scripted_quit: false,
         results_billboard: None,
         billboard_key: 0,
         paused: false,
@@ -806,7 +797,11 @@ fn main() -> Result<()> {
             .as_ref()
             .map(|r| r.mirror)
             .unwrap_or_else(|| args.iter().any(|a| a == "--mirror")),
-        quick_knockout: args.iter().any(|a| a == "--quick-knockout"),
+        // a recording's `RACE_TYPE` 3 (`Replay_begin` 0x413CF0's restore); no such word: the command line's
+        quick_knockout: match replay_setup.as_ref().and_then(|r| r.race_type) {
+            Some(t) => t == 3,
+            None => args.iter().any(|a| a == "--quick-knockout"),
+        },
         player_eliminated: false,
         net_time_sent: false,
         net_pad_buttons: 0,
@@ -849,6 +844,9 @@ fn main() -> Result<()> {
                     // (non-replay) race; this placeholder only shows if that never runs
                     driver_name: String::new(),
                     net: None,
+                    race_type: None,
+                    fegame_type: None,
+                    camera: None,
                 }),
             path: nfs_game::save::save_dir().join("replay.prpl"),
             saved: false,
@@ -990,6 +988,9 @@ fn main() -> Result<()> {
         track_item_range: (0, 0),
         effect_item_range: (0, 0),
         blended_dyn_items: Vec::new(),
+        scratch: Default::default(),
+        order_cache: Default::default(),
+        order_key: Default::default(),
         view_far: 700.0,
         pool_used: PoolUse::default(),
         dyn_pose: None,
@@ -1015,8 +1016,9 @@ fn main() -> Result<()> {
             police_sets: Vec::new(),
             police_specs: Vec::new(),
             police_prev: Vec::new(),
-            cops_race: false,
-            cop_count: 4,
+            // the recording's `RACE_TYPE` 1 (the cops race) / `FEGAME_TYPE` 9 (a mission's two cops)
+            cops_race: replay_setup.as_ref().is_some_and(|r| r.race_type == Some(1)),
+            cop_count: if replay_setup.as_ref().is_some_and(|r| r.fegame_type == Some(9)) { 2 } else { 4 },
             cops_enabled: replay_setup.as_ref().map(|r| r.cops).unwrap_or_else(|| {
                 std::env::var("NFS_COPS").map(|v| v != "0").unwrap_or(fe.cops)
             }),
@@ -1111,6 +1113,8 @@ fn main() -> Result<()> {
         sim_name: sim_name.clone(),
         race_skill,
         last_frame: Instant::now(),
+        presented: None,
+        idle_check: None,
         accumulator: Duration::ZERO,
         tick: 0,
         cop_blips: Vec::new(),

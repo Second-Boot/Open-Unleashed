@@ -38,6 +38,7 @@ pub const DEFAULT_HALF_ANGLE: f32 = 37.5;
 /// `m00 = cot h`, `m11 = m00 · 640/480`), so the full-screen view is `2·atan(tan h · 0.75)` high —
 /// 59.8° for the default. (`[0x657D5C]`'s ×1.2 is [`half_angle`]'s, with [`fov_y_window`] for its band.)
 pub fn fov_y(half_angle_deg: f32) -> f32 {
+    // det-allow: camera shake offset, drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
     2.0 * (half_angle_deg.to_radians().tan() * 0.75).atan()
 }
 
@@ -57,6 +58,7 @@ pub fn half_angle(base: f32, widescreen: bool, view: u16) -> f32 {
 /// band: the viewport is `WIDESCREEN_BAND` of the height, so the whole window spans `1/0.7` of it.
 pub fn fov_y_window(half_angle_deg: f32, widescreen: bool) -> f32 {
     let band = if widescreen { WIDESCREEN_BAND } else { 1.0 };
+    // det-allow: camera shake offset, drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
     2.0 * (half_angle_deg.to_radians().tan() * 0.75 / band).atan()
 }
 
@@ -71,6 +73,7 @@ pub const VIEW_HALF_ANGLE: f32 = 45.0;
 /// `w` × `h_px` in 640 × 480 units — 0x466F30's aspect (0x466FD7…0x466FF8) into 0x5391B0's
 /// `m11 = cot h · aspect`.
 pub fn fov_y_viewport(half_angle_deg: f32, w: f32, h_px: f32) -> f32 {
+    // det-allow: camera shake offset, drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
     2.0 * (half_angle_deg.to_radians().tan() * h_px / w).atan()
 }
 
@@ -146,6 +149,7 @@ impl CircleCam {
             }
         }
         let c = self.count as i32;
+        // det-allow: camera shake offset, drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
         let (s, co) = (c as f32 * (1.0 / 1024.0) * std::f32::consts::TAU).sin_cos();
         // `idiv 3` is a signed remainder; `+0xC4` would need 2^15 steps (2^24 updates) to go
         // negative, so the euclidean one is the same here

@@ -75,8 +75,9 @@ pub fn aim_direction(table: &SliceTable, cfg: &TrafficConfig, car: &AiCarState) 
 /// right of where it wants to go.
 pub fn heading_error(car: &AiCarState, aim: Vec3) -> f32 {
     let fwd = car.orientation.row(2);
-    let a = if car.sense >= 0.0 { fwd.x.atan2(fwd.z) } else { (-fwd.x).atan2(-fwd.z) } / std::f32::consts::TAU;
-    let b = aim.x.atan2(aim.z) / std::f32::consts::TAU;
+    // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable atan2, not std; original heading error 0x408F20.
+    let a = if car.sense >= 0.0 { nfs_math::portable::atan2f(fwd.x, fwd.z) } else { nfs_math::portable::atan2f(-fwd.x, -fwd.z) } / std::f32::consts::TAU;
+    let b = nfs_math::portable::atan2f(aim.x, aim.z) / std::f32::consts::TAU;
     let mut e = a - b;
     if e < -0.5 {
         e += 1.0;

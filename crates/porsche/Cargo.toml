@@ -23,5 +23,9 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 glam.workspace = true
+nfs-math.workspace = true
 image.workspace = true
 nfs-audio.workspace = true
+
+[dev-dependencies]
+serde_json = "1"

@@ -30,7 +30,8 @@ impl App {
             let ahead = t.add(r.slice, 4);
             let target = t.slices[ahead].centre;
             let to = v.orientation * (target - v.position); // body-frame vector (rows = axes)
-            let angle = to.x.atan2(to.z.max(0.1));
+            // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable atan2 for the scripted drive (test glue, no original counterpart).
+            let angle = nfs_math::portable::atan2f(to.x, to.z.max(0.1));
             steer = ((angle / 0.4).clamp(-1.0, 1.0) * 126.0) as i32;
             // crude speed limit for the scripted drive: ease off above 110 km/h or in sharp bends
             let limit = if angle.abs() > 0.15 { 60.0 } else { 110.0 };
@@ -102,7 +103,7 @@ impl App {
                             self.scripted_net_leave = true;
                         }
                     }
-                    ScriptedHudKey::Pause | ScriptedHudKey::PauseRestart => {
+                    ScriptedHudKey::Pause | ScriptedHudKey::PauseRestart | ScriptedHudKey::PauseQuit => {
                         // the pause key's own arm (the keyboard handler's), with no dialog up
                         if self.results.is_none() {
                             self.paused = true;
@@ -111,9 +112,14 @@ impl App {
                             self.pause_confirm = None;
                             self.scripted_pause = true;
                             self.scripted_restart = a == ScriptedHudKey::PauseRestart;
+                            self.scripted_quit = a == ScriptedHudKey::PauseQuit;
                         }
                     }
                     ScriptedHudKey::Toggle(k) => self.hud_key(k),
+                    ScriptedHudKey::Tap(k) => {
+                        self.input.press(k);
+                        self.input.release(k);
+                    }
                     ScriptedHudKey::Pad(k, true) => self.input.press(k),
                     ScriptedHudKey::Pad(k, false) => self.input.release(k),
                 }
@@ -139,7 +145,7 @@ impl App {
         }
         if self.results.is_some()
             && let Some(page) = self.result_pages().get(self.results_page as usize).copied()
-            && let (Some(limit), Some(t0)) = (Self::page_timeout(page, self.fe.race_game_type == Some(3)), self.page_open_tick)
+            && let (Some(limit), Some(t0)) = (Self::page_timeout(page, self.block_game_type() == Some(3)), self.page_open_tick)
             && self.page_seen == Some(self.results_page)
             && self.tick.saturating_sub(t0) > limit
         {
@@ -184,7 +190,7 @@ impl App {
             self.track_particles = Some(p);
             // diagnostic: `NFS_EMITTER_VIEW=k` runs the systems 300 updates ahead so a still of
             // emitter k (see `rebuild_scene`) shows them going
-            if std::env::var("NFS_EMITTER_VIEW").is_ok()
+            if nfs_game::config::cfg().nfs_emitter_view.var().is_ok()
                 && let Some(p) = self.track_particles.as_mut()
             {
                 for _ in 0..300 {
@@ -257,7 +263,7 @@ impl App {
         // game tick 600, heading at it at 12 m/s — to see a hit, its player's start and its burst
         // (`RUST_LOG=nfs_game=debug`); with `NFS_SMACK_VIEW=k` the camera watches the prop
         if self.tick == 600
-            && let Some(k) = std::env::var("NFS_SMACK_DRIVE").ok().and_then(|v| v.parse::<usize>().ok())
+            && let Some(k) = nfs_game::config::cfg().nfs_smack_drive.var().ok().and_then(|v| v.parse::<usize>().ok())
             && let Some((article, pos, _)) = w.track_smackable(k)
         {
             let to = Vec3::new(pos.x - v.position.x, 0.0, pos.z - v.position.z).normalize_or(Vec3::Z);
@@ -268,7 +274,7 @@ impl App {
         // diagnostic: `NFS_PHANTOM_DRIVE=x,y,z,hx,hz[@t]` sets the player's car down 8 m short of the
         // world point (x, y, z), heading (hx, hz) at 12 m/s on game tick `t` (default 600) — to drive
         // into a place whose collision geometry is in question (the `--record` csv shows a stop)
-        if let Some((p, t)) = std::env::var("NFS_PHANTOM_DRIVE").ok().and_then(|s| {
+        if let Some((p, t)) = nfs_game::config::cfg().nfs_phantom_drive.var().ok().and_then(|s| {
             let (list, t) = match s.split_once('@') {
                 Some((l, t)) => (l.to_string(), t.trim().parse::<u64>().ok()?),
                 None => (s.clone(), 600),
@@ -286,7 +292,7 @@ impl App {
         // diagnostic: `NFS_CONE_DRIVE=k` does the same with the mission scene's k-th cone, to see
         // the HUD's cone count move (the scripted run then draws a frame every other tick);
         // `k@t` on game tick `t` instead of 600
-        let cone_drive = std::env::var("NFS_CONE_DRIVE").ok().and_then(|v| match v.split_once('@') {
+        let cone_drive = nfs_game::config::cfg().nfs_cone_drive.var().ok().and_then(|v| match v.split_once('@') {
             Some((k, t)) => Some((k.trim().parse::<usize>().ok()?, t.trim().parse::<u64>().ok()?)),
             None => Some((v.trim().parse::<usize>().ok()?, 600)),
         });
@@ -306,7 +312,7 @@ impl App {
         // the same tick from the same (shared) traffic state, so the runs' dumps stay comparable.
         if self.tick % 2 == 0
             && let Some(x) = exchange_in.as_ref()
-            && let Ok(list) = std::env::var("NFS_NET_RAM")
+            && let Ok(list) = nfs_game::config::cfg().nfs_net_ram.var()
             && let Some(t) = self.road.traffic.as_ref()
         {
             for (idx, at) in list.split(',').filter_map(|e| e.split_once('@').and_then(|(i, t)| Some((i.trim().parse::<u32>().ok()?, t.trim().parse::<u64>().ok()?)))) {
@@ -345,7 +351,7 @@ impl App {
         // prop on one tick and the smackables' walk order (0x4A17F0, race-index order) shows
         if self.tick % 2 == 0
             && let Some(x) = exchange_in.as_ref()
-            && let Ok(list) = std::env::var("NFS_NET_RAM_PROP")
+            && let Ok(list) = nfs_game::config::cfg().nfs_net_ram_prop.var()
         {
             for (idx, at, k) in list.split(',').filter_map(|e| {
                 let (i, rest) = e.split_once('@')?;
@@ -422,7 +428,7 @@ impl App {
             // **TEST GLUE** (not in the original): `NFS_SKID_SCRIPT=<from_s>:<for_s>:<steer −1…1>` holds the
             // handbrake with full throttle and that steering from `from_s` for `for_s` seconds of the
             // race clock (`tick / 64`), so a scripted drive leaves real skid marks for stills
-            let controls = match std::env::var("NFS_SKID_SCRIPT").ok().and_then(|v| {
+            let controls = match nfs_game::config::cfg().nfs_skid_script.var().ok().and_then(|v| {
                 let f: Vec<f32> = v.split(':').filter_map(|x| x.parse().ok()).collect();
                 (f.len() == 3).then(|| (f[0], f[1], f[2]))
             }) {
@@ -735,7 +741,7 @@ impl App {
                     o.vehicle.step32(&c, &o.specs, &w.collision);
                     live[oi] = (o.vehicle.position, o.vehicle.v_long());
                     o.off_surface = w.collision.find_patch(o.vehicle.position) & 0xF == 0;
-                    if o.off_surface != off_before && std::env::var_os("NFS_OFFROAD_LOG").is_some() {
+                    if o.off_surface != off_before && nfs_game::config::cfg().nfs_offroad_log.var_os().is_some() {
                         tracing::info!(
                             t = self.tick,
                             opponent = oi,
@@ -1302,7 +1308,7 @@ impl App {
             // view (0x413BFA). The `NFS_VIEW` diagnostic runs it live, so a TV view held on a
             // live race still follows the triggers. 0x0C counts as the TV choice, as it does for
             // the camera update's `tv_mode`.
-            if replay_camera || std::env::var_os("NFS_VIEW").is_some() {
+            if replay_camera || nfs_game::config::cfg().nfs_view.var_os().is_some() {
                 let probe = nfs_game::skill::TriggerCar {
                     position: v.position,
                     wheels: std::array::from_fn(|i| v.wheels[i].world_pos - Vec3::Y * v.ride_height),
@@ -1423,7 +1429,7 @@ impl App {
             // car's entry into the list `0x628CDC[]`: with `COMMSPOSITIONAL && NOCOLLISION` no car
             // meets another (each car's walls 0x495020 and props 0x498DE0 run before the gate);
             // `NFS_NO_CARCOL` is the port's own diagnostic switch for the same skip
-            let no_carcol = self.net_nocollision || std::env::var_os("NFS_NO_CARCOL").is_some();
+            let no_carcol = self.net_nocollision || nfs_game::config::cfg().nfs_no_carcol.var_os().is_some();
             // `car+0x354`, the collision mass: `HEAVY` `[0x6573FC]` (the fetherw8 code, cheat bit 8)
             // multiplies a human car's by 12 (0x49B5FB…0x49B613, `[0x5B240C]`)
             // …and otherwise `.TINYCAR` divides any car's by 12 (0x49B615…0x49B62F, `[0x5B49B0]`) —
@@ -1968,7 +1974,7 @@ impl App {
             // `find_patch` answers. The placement is 0x40F540's: `Car_placeAtSlice` 0x49B090.
             // diagnostic: `NFS_ESCAPE_LOG=x0,x1` prints the player's state while its x is in that
             // band, for chasing a car that gets past the wall line
-            if let Ok(band) = std::env::var("NFS_ESCAPE_LOG") {
+            if let Ok(band) = nfs_game::config::cfg().nfs_escape_log.var() {
                 let mut it = band.split(',').filter_map(|v| v.parse::<f32>().ok());
                 if let (Some(a), Some(b)) = (it.next(), it.next())
                     && v.position.x >= a.min(b)
@@ -2075,7 +2081,7 @@ impl App {
                     // which is how a car that cannot get going is told from one that is merely slow
                     if self.tick % 32 == 0
                         && o.vehicle.speed() < 3.0
-                        && std::env::var_os("NFS_SLOW_LOG").is_some()
+                        && nfs_game::config::cfg().nfs_slow_log.var_os().is_some()
                     {
                         let surf: Vec<u32> = o.vehicle.wheels.iter().map(|wh| w.collision.find_patch(wh.world_pos) & 0xF).collect();
                         tracing::info!(
@@ -2318,7 +2324,7 @@ impl App {
                 // **Test glue** (`NFS_DERBY_SMASH=<race index>:<tick>`, set on every machine): that car's ten
                 // damage zones are set to 31 at that tick — a smash-up the two-instance runs would not
                 // otherwise reach in a few seconds
-                if let Some((idx, at)) = std::env::var("NFS_DERBY_SMASH")
+                if let Some((idx, at)) = nfs_game::config::cfg().nfs_derby_smash.var()
                     .ok()
                     .and_then(|v| v.split_once(':').and_then(|(i, t)| Some((i.parse::<u32>().ok()?, t.parse::<u64>().ok()?))))
                     && tick == at
@@ -2756,7 +2762,7 @@ impl App {
         // the session's: `NFS_NET_DUMP` proves the playback against the live race)
         if self.net_dump.is_none()
             && self.replay_net.is_some()
-            && let Ok(path) = std::env::var("NFS_NET_DUMP")
+            && let Ok(path) = nfs_game::config::cfg().nfs_net_dump.var()
             && let Ok(f) = std::fs::File::create(&path)
         {
             self.net_dump = Some(std::io::BufWriter::new(f));
@@ -2785,7 +2791,7 @@ impl App {
         if self.tick == 1
             && self.net_dump.is_some()
             && let Some((local, seat_index)) = dump_index.as_ref()
-            && let Ok(path) = std::env::var("NFS_NET_DUMP")
+            && let Ok(path) = nfs_game::config::cfg().nfs_net_dump.var()
             && let Ok(mut f) = std::fs::File::create(format!("{path}.t1"))
         {
             use std::io::Write;

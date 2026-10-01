@@ -48,6 +48,11 @@ wgpu = "27"
 pollster = "0.4"
 gilrs = "0.11"
 cpal = "0.16"
+libm = "0.2"
 
 [profile.release]
 debug = 1
+# perf: whole-program optimisation (PA, RE/notes/PERF.md); Rust does no fast-math / FMA contraction,
+# so the floating-point results are unchanged
+lto = "fat"
+codegen-units = 1

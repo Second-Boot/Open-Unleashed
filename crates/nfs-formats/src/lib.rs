@@ -6,6 +6,7 @@
 //! values; nothing is silently skipped.
 
 pub mod ais;
+pub mod lc;
 pub mod animdefs;
 pub mod bigf;
 pub mod bnk;

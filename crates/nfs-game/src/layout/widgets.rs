@@ -29,6 +29,24 @@ pub(super) struct WidgetDraw<'a> {
     pub(super) accessor: &'a dyn Fn(&str) -> Option<String>,
 }
 
+/// The `FETrackSmall2dSpline::update` cycle (0x4FCB40…0x4FCBA9): `elapsed` is
+/// `TIMER_getTicks() − [+0xD6C]` in 128 Hz ticks; the shown event is `elapsed / 256` (restarting
+/// at 0 past the count, 0x4FCBC9) and the fade is `m*8` for `m = elapsed % 256 < 0x20`,
+/// `0x7FF − m*8` for `m > 0xE0`, else the previous value, which holds 0xF8 (the ramp's value at
+/// `m = 0x1F`). Returns (event index, fade 0..=0xFF).
+pub(super) fn track_cycle(ticks: u32, count: usize) -> (usize, u32) {
+    let cur = (ticks / 256) as usize % count.max(1);
+    let m = ticks % 256;
+    let ramp = if m < 0x20 {
+        m * 8
+    } else if m > 0xE0 {
+        0x7FF - m * 8
+    } else {
+        0xF8
+    };
+    (cur, ramp)
+}
+
 impl LayoutScreen {
     // `FEGouraudIndicatorBar::draw` (0x4CA690) asks its source for a number, then at
     // 0x4CA71A picks the span it paints: with `goingleft` clear it is `0 ..= value`,
@@ -338,7 +356,7 @@ impl LayoutScreen {
         {
             let (px, py) = self
                 .part_attr(e, p, "pos")
-                .and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)))
+                .and_then(|v| self.ev_pair(e, v, 0))
                 .unwrap_or((0, 0));
             // **`data.usesmallfont`** puts both strings in `univers8b.ffn`. The class
             // keeps two hard-coded fonts — `[this+0x184]` is `univers8b.ffn`
@@ -1125,7 +1143,7 @@ impl LayoutScreen {
         // outline goes 0x10 below it through 0x4D9200 (0x507C09, 0x507C15 pushes
         // 20.0 and 0x507C1A 90.0). §4.122.
         if let Some(f) = self.font_for(e) {
-            let hot = self.cursor.and_then(|(px, py)| chronicle_cell(px, py, x, y));
+            let hot = self.cursor.filter(|_| !self.denied).and_then(|(px, py)| chronicle_cell(px, py, x, y));
             // The caption's own font, `Univers7b.ffn` — distinct from the year's `Univers8b.ffn`
             // (`f` above) — 0x507F10's bind, §4.173.
             let cf = self.fonts.get("univers7b.ffn");
@@ -1361,8 +1379,9 @@ impl LayoutScreen {
     }
 
     // `FETrackSmall2dSpline::draw` (0x4FCD80). The widget cycles through the events of
-    // the tournament its accessor names: `update` (0x4FCB50) divides the milliseconds
-    // since the list was built by 256 for the index and restarts when that reaches the
+    // the tournament its accessor names: `update` (0x4FCB50) divides the **128 Hz ticks**
+    // (`TIMER_getTicks` 0x53C2E0 minus `[+0xD6C]`, set to the same clock by the constructor
+    // at 0x4FCA67 — 256 ticks = 2 s per event, not 256 ms) since the list was built by 256 for the index and restarts when that reaches the
     // count, and keeps a second counter for the fade — `m = elapsed % 256`, `m*8` while
     // `m < 0x20`, `0x7FF - m*8` while `m > 0xE0`, untouched in between, so it holds at
     // 0xF8 for the middle of each step (0x4FCB5D…0x4FCB91).
@@ -1376,15 +1395,7 @@ impl LayoutScreen {
     pub(super) fn draw_track_small_spline(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
         let WidgetDraw { i, e, talpha, aspect, .. } = d;
         let Some(evs) = self.track_maps.get(&i).filter(|e| !e.is_empty()) else { return };
-        let cur = (self.clock_ms / 256) as usize % evs.len();
-        let m = self.clock_ms % 256;
-        let ramp = if m < 0x20 {
-            m * 8
-        } else if m > 0xE0 {
-            0x7FF - m * 8
-        } else {
-            0xF8
-        };
+        let (cur, ramp) = track_cycle(self.ticks(), evs.len());
         let ev = &evs[cur];
         let picture = |out: &mut Vec<Sprite>, art: Option<(TextureId, f32, f32, f32, f32)>, color: [f32; 4]| {
             let Some((tex, aw, ah, ax, ay)) = art else { return };
@@ -1548,7 +1559,7 @@ impl LayoutScreen {
                 if p.kind() != nfs_formats::ctr::PartKind::Rect {
                     continue;
                 }
-                let at = |key: &str| self.part_attr(e, p, key).and_then(|v| nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)));
+                let at = |key: &str| self.part_attr(e, p, key).and_then(|v| self.ev_pair(e, v, 0));
                 let (Some((px, py)), Some((pw, ph)), Some(col)) = (at("pos"), at("size"), self.part_colour(e, p, "color")) else { continue };
                 out.push(self.quad(aspect, x + px as f32, y + py as f32, pw as f32, ph as f32, tint(col)));
             }
@@ -2243,7 +2254,7 @@ impl LayoutScreen {
             panel_w -= LIST_SCROLLBAR_W;
         }
         let (px, py) = match self.controls.get(&e.class).and_then(|c| c.part("selectionbox")).and_then(|p| p.value("pos")) {
-            Some(v) => nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)).map(|(a, b)| (x + a as f32, y + b as f32)).unwrap_or((x, y)),
+            Some(v) => self.ev_pair(e, v, 0).map(|(a, b)| (x + a as f32, y + b as f32)).unwrap_or((x, y)),
             None => (x, y),
         };
         // 0x4C6617…0x4C667B: `0x4D9280(x, y, width + 16 when it scrolls, height,
@@ -2786,7 +2797,9 @@ impl LayoutScreen {
             .and_then(|c| c.state_parts(e.get("state").unwrap_or("normal")).iter().filter_map(|n| c.part(n)).find(|p| p.kind() == nfs_formats::ctr::PartKind::Text))
             .and_then(|p| {
                 // the tick's write (0x4BD32C) is what the part measures from now on (0x4E7160)
-                self.watch_text.borrow_mut().insert(i, text.clone());
+                if self.watch_text.borrow_mut().insert(i, text.clone()).as_ref() != Some(&text) {
+                    self.eval_memo_clear();
+                }
                 // 0x536970's width, truncated (`_ftol` at 0x4E7280) — not the pen's advance
                 let tw = f.measure(&text).0.trunc();
                 let v = p.value("pos")?;
@@ -2860,5 +2873,22 @@ mod movie_blit_tests {
         assert_eq!(super::movie_blit_v(454.0, 46.0, (192.0, 144.0)), 46.0 / 144.0);
         // shorter but not wider: 0x4E28A9's `jle` takes the stretch
         assert_eq!(super::movie_blit_v(192.0, 46.0, (192.0, 144.0)), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod track_cycle_tests {
+    use super::track_cycle;
+
+    /// 0x4FCB5B..0x4FCBA9: one event per 256 ticks of the 128 Hz clock = 2 s, wrapping at the count.
+    #[test]
+    fn one_event_per_256_ticks() {
+        assert_eq!(track_cycle(0, 3), (0, 0));
+        assert_eq!(track_cycle(255, 3).0, 0);
+        assert_eq!(track_cycle(256, 3).0, 1);
+        assert_eq!(track_cycle(3 * 256, 3).0, 0);
+        assert_eq!(track_cycle(0x10, 3).1, 0x80);
+        assert_eq!(track_cycle(0x80, 3).1, 0xF8);
+        assert_eq!(track_cycle(0xE8, 3).1, 0x7FF - 0xE8 * 8);
     }
 }

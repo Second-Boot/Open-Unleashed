@@ -469,7 +469,8 @@ impl Vehicle {
                         // the original's constant is 6.28318, not TAU
                         #[allow(clippy::approx_constant)]
                         let arg = (0.5 * i as f32 + self.wheels[i].rotation) * 6.283_18;
-                        h += self.suspension_wear(specs) * arg.sin() * (1.0 / 1500.0);
+                        // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable sin, not std; original inline x87 `fsin` at 0x499CB3.
+                        h += self.suspension_wear(specs) * nfs_math::portable::sinf(arg) * (1.0 / 1500.0);
                     }
                     h
                 }
@@ -618,7 +619,8 @@ impl Vehicle {
             let right_air = self.wheels[1].airborne || self.wheels[3].airborne;
             if n_air > 0 && !(left_air && right_air) {
                 let a = wr * 6.283_184_5;
-                let mut v = Vec3::new(-2.0 * a.sin() * self.half_extents.x, -2.0 * a.cos() * self.half_extents.y, 0.0);
+                // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable sin/cos, not std; original 0x5327E0 / 0x5327F0 (x87) at 0x49A7AB / 0x49A7C7.
+                let mut v = Vec3::new(-2.0 * nfs_math::portable::sinf(a) * self.half_extents.x, -2.0 * nfs_math::portable::cosf(a) * self.half_extents.y, 0.0);
                 if (left_air && wr < 0.0) || (right_air && wr > 0.0) {
                     v.y = -v.y;
                 }

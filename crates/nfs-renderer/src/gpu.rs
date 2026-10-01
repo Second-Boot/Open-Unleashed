@@ -1,3 +1,4 @@
+use crate::front::{Cmd, CmdList};
 use crate::{Camera, FakeSortMode, MaterialDesc, MeshData, Scene, Sprite, SpriteCompare, TextureData, Vertex};
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -5,11 +6,11 @@ use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct MeshId(u32);
+pub struct MeshId(pub(crate) u32);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct TextureId(u32);
+pub struct TextureId(pub(crate) u32);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct MaterialId(u32);
+pub struct MaterialId(pub(crate) u32);
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -57,11 +58,38 @@ struct ObjectUniform {
     sky_on: [f32; 4],
 }
 
+/// A mesh's vertices and indices: a byte range of a vertex buffer and of an index buffer. A static
+/// mesh ([`Core::upload_mesh`]) is carved out of a shared arena buffer — a Metal buffer is a
+/// page-aligned allocation of its own and a track has thousands of meshes — a dynamic one has its
+/// own buffers (offset 0).
 struct GpuMesh {
     vertex_buf: wgpu::Buffer,
+    vertex_offset: u64,
+    vertex_len: u64,
     index_buf: wgpu::Buffer,
+    index_offset: u64,
+    index_len: u64,
     index_count: u32,
+    /// How many vertex writes this mesh has had since its upload (every `write_mesh_vertices` /
+    /// `update_mesh_vertices` that queued bytes): lets a caller that keeps the last vertices it
+    /// wrote tell whether anyone else wrote the mesh since ([`Core::mesh_writes`]).
+    writes: u32,
 }
+
+/// The arena the static meshes are carved from: a vertex and an index buffer, filled front to back.
+// PORT-DEVIATION D6 (RE/notes/PORT-DEVIATIONS.md): static meshes in shared arenas and instanced draws from one object storage buffer; draw order and state as before, a polygon seam can land one pixel differently (not D3D7-exact, never was).
+struct MeshArena {
+    vertex_buf: wgpu::Buffer,
+    vertex_used: u64,
+    index_buf: wgpu::Buffer,
+    index_used: u64,
+    /// Created mapped, so a mesh is a plain copy into it; unmapped ([`Core::seal_arena`]) before
+    /// the first frame that can draw from it, after which a mesh is a queued write.
+    mapped: bool,
+}
+
+/// One arena's size for each of the two buffers; a larger mesh gets an arena of its own size.
+const ARENA_CHUNK: u64 = 4 << 20;
 
 struct GpuTexture {
     _texture: wgpu::Texture,
@@ -112,7 +140,7 @@ struct GpuMaterial {
     env: TextureId,
 }
 
-pub struct Renderer {
+pub(crate) struct Core {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -133,7 +161,7 @@ pub struct Renderer {
     material_layout: wgpu::BindGroupLayout,
     /// the car's section map for `R3DSkyMapTextureLayer`, one bind group per texture (group 3)
     sky_layout: wgpu::BindGroupLayout,
-    sky_bgs: std::collections::HashMap<u32, wgpu::BindGroup>,
+    sky_bgs: Vec<Option<wgpu::BindGroup>>,
     /// `[0x6115CC]+0x190`: set while the view being drawn is the rear-view mirror's (type 1,
     /// 0x43AD39…0x43AD4E), when the specular and sky-map layers take no texture and skip their passes
     no_reflections: bool,
@@ -152,8 +180,8 @@ pub struct Renderer {
     sprite_sampler: wgpu::Sampler,
     object_buf: wgpu::Buffer,
     object_bg: wgpu::BindGroup,
-    object_stride: u64,
     meshes: Vec<GpuMesh>,
+    arena: Option<MeshArena>,
     textures: Vec<GpuTexture>,
     materials: Vec<GpuMaterial>,
     white: TextureId,
@@ -161,10 +189,79 @@ pub struct Renderer {
     /// The front end's depth-state sprites (`Sprite::depth`): depth writes on, the alpha test, the
     /// compare `LESSEQUAL` \[0\] / `GREATEREQUAL` \[1\].
     sprite_depth_pipelines: [wgpu::RenderPipeline; 2],
-    /// offscreen render targets handed out by [`Renderer::render_offscreen`], by texture index
+    /// offscreen render targets handed out by [`Core::render_offscreen`], by texture index
     offscreen: std::collections::HashMap<u32, (u32, u32)>,
     sprite_layout: wgpu::BindGroupLayout,
     sprite_buf: wgpu::Buffer,
+    /// the per-frame upload path: every buffer write of a frame (globals, objects, sprites, the
+    /// dynamic meshes' vertices) is a copy out of a recycled mapped chunk, recorded into the
+    /// frame's own encoder — `Queue::write_buffer` makes a fresh staging buffer per call
+    belt: wgpu::util::StagingBelt,
+    /// `write_mesh_vertices` / `update_mesh_vertices` calls waiting for the next frame's encoder,
+    /// in call order (the last write to a mesh wins, as with `write_buffer`)
+    pending_writes: Vec<PendingWrite>,
+    pending_bytes: Vec<u8>,
+    /// `update_texture` calls waiting for the next frame's encoder, in call order, their rows padded
+    /// to the copy's 256-byte alignment (`Queue::write_texture` makes a fresh staging buffer per call)
+    pending_textures: Vec<PendingTextureWrite>,
+    pending_texture_bytes: Vec<u8>,
+    /// depth targets by size, shared by every offscreen pass of that size (each pass clears it)
+    depth_cache: std::collections::HashMap<(u32, u32), wgpu::TextureView>,
+    /// the pass's item indices by stage (sky, opaque, blended), kept between frames
+    buckets: [Vec<u32>; 3],
+    /// `NFS_SPRITE_LOG`, read once
+    sprite_log: bool,
+}
+
+/// One deferred vertex write: `len` bytes at `pending_bytes[start..]` into mesh `mesh`'s buffer.
+struct PendingWrite {
+    mesh: u32,
+    start: usize,
+    len: usize,
+}
+
+/// One deferred texture write: one mip level, `height` rows of `bytes_per_row` bytes at
+/// `pending_texture_bytes[start..]`, of which each row's first `4 · width` are pixels.
+struct PendingTextureWrite {
+    texture: u32,
+    level: u32,
+    width: u32,
+    height: u32,
+    bytes_per_row: u32,
+    start: usize,
+}
+
+/// What the render pass has bound, so a draw sets only what changed.
+struct DrawState {
+    pipeline: usize,
+    material: u32,
+    sky: u32,
+    mesh: u32,
+}
+
+impl DrawState {
+    const NONE: Self = Self { pipeline: usize::MAX, material: u32::MAX, sky: u32::MAX, mesh: u32::MAX };
+}
+
+/// A run of consecutive items drawn as one instanced draw: same mesh, pipeline and bind groups,
+/// object indices `first..first + count`.
+struct Run {
+    first: u32,
+    count: u32,
+    pipeline: usize,
+    /// `material * 2 + point-filtered bind group`
+    material: u32,
+    sky: u32,
+    mesh: u32,
+}
+
+/// The section map an item's sky-map pass samples, by its material's bucket.
+fn sky_tex_of(materials: &[GpuMaterial], no_reflections: bool, item: &crate::DrawItem) -> Option<TextureId> {
+    let m = materials.get(item.material.0 as usize)?;
+    if !m.sky_map || no_reflections {
+        return None;
+    }
+    item.sky.and_then(|s| s.textures[m.env_variant])
 }
 
 /// The front-end screens draw a few thousand quads (every gouraud box is a grid of them).
@@ -172,12 +269,14 @@ const MAX_SPRITES: u64 = 8192;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const MAX_OBJECTS: u64 = 8192;
+/// The staging belt's chunk: larger than the biggest single frame upload of an ordinary scene.
+const BELT_CHUNK: u64 = 1 << 22;
 /// The main view's far plane — the camera object's `+8`, 700.0 (0x4677FC) — over which the screen
 /// z the depth bias moves is linear (`RE/notes/thrash.md` §6). An offscreen pass names its own
 /// (`render_offscreen`'s `depth_far`).
 pub const VIEW_FAR: f32 = 700.0;
 
-impl Renderer {
+impl Core {
     pub fn new(window: Arc<Window>) -> Result<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -270,9 +369,10 @@ impl Renderer {
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                // every object of a pass in one buffer, indexed by `instance_index`
                 ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
                     min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<ObjectUniform>() as u64),
                 },
                 count: None,
@@ -391,12 +491,22 @@ impl Renderer {
         // groups: 0 blend off, 1 the plain alpha pair, 2…4 the other pairs, 5…8 every pair again
         // with depth writes on (`device_states`)
         const CULLS: [Option<wgpu::Face>; 3] = [Some(wgpu::Face::Back), None, Some(wgpu::Face::Front)];
-        let mut pipelines = Vec::with_capacity(54);
+        // (the 54 pipelines compile independently: built on worker threads, kept in the same order)
+        let mut specs = Vec::with_capacity(54);
         for (blend, pair, zwrite) in [(false, 0, false), (true, 0, false), (true, 1, false), (true, 2, false), (true, 3, false), (true, 0, true), (true, 1, true), (true, 2, true), (true, 3, true)] {
             for i in 0..6 {
-                pipelines.push(make_pipeline(blend, pair, CULLS[i / 2], i % 2 == 0, zwrite));
+                specs.push((blend, pair, CULLS[i / 2], i % 2 == 0, zwrite));
             }
         }
+        let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8);
+        let pipelines: Vec<wgpu::RenderPipeline> = std::thread::scope(|sc| {
+            let make_pipeline = &make_pipeline;
+            let handles: Vec<_> = specs
+                .chunks(specs.len().div_ceil(workers))
+                .map(|c| sc.spawn(move || c.iter().map(|&(blend, pair, cull, depth, zwrite)| make_pipeline(blend, pair, cull, depth, zwrite)).collect::<Vec<_>>()))
+                .collect();
+            handles.into_iter().flat_map(|h| h.join().expect("pipeline worker")).collect()
+        });
 
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
@@ -462,12 +572,10 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&proj_default_view) },
             ],
         });
-        let align = device.limits().min_uniform_buffer_offset_alignment as u64;
-        let object_stride = (std::mem::size_of::<ObjectUniform>() as u64).div_ceil(align) * align;
         let object_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("objects"),
-            size: object_stride * MAX_OBJECTS,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            size: std::mem::size_of::<ObjectUniform>() as u64 * MAX_OBJECTS,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let object_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -478,7 +586,7 @@ impl Renderer {
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                     buffer: &object_buf,
                     offset: 0,
-                    size: wgpu::BufferSize::new(std::mem::size_of::<ObjectUniform>() as u64),
+                    size: None,
                 }),
             }],
         });
@@ -596,7 +704,7 @@ impl Renderer {
             object_layout,
             material_layout,
             sky_layout,
-            sky_bgs: std::collections::HashMap::new(),
+            sky_bgs: Vec::new(),
             no_reflections: false,
             samplers,
             point_samplers,
@@ -605,8 +713,8 @@ impl Renderer {
             sprite_sampler,
             object_buf,
             object_bg,
-            object_stride,
             meshes: Vec::new(),
+            arena: None,
             textures: Vec::new(),
             materials: Vec::new(),
             white: TextureId(0),
@@ -615,6 +723,14 @@ impl Renderer {
             offscreen: std::collections::HashMap::new(),
             sprite_layout,
             sprite_buf,
+            belt: wgpu::util::StagingBelt::new(BELT_CHUNK),
+            pending_writes: Vec::new(),
+            pending_bytes: Vec::new(),
+            pending_textures: Vec::new(),
+            pending_texture_bytes: Vec::new(),
+            depth_cache: std::collections::HashMap::new(),
+            buckets: [Vec::new(), Vec::new(), Vec::new()],
+            sprite_log: std::env::var("NFS_SPRITE_LOG").is_ok(),
         };
         let _ = &r.object_layout;
         r.white = r.upload_texture(&TextureData::single(1, 1, vec![255, 255, 255, 255]));
@@ -622,10 +738,14 @@ impl Renderer {
     }
 
     fn make_depth(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
+        Self::make_depth_sized(device, config.width, config.height)
+    }
+
+    fn make_depth_sized(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
         device
             .create_texture(&wgpu::TextureDescriptor {
                 label: Some("depth"),
-                size: wgpu::Extent3d { width: config.width, height: config.height, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -634,6 +754,62 @@ impl Renderer {
                 view_formats: &[],
             })
             .create_view(&Default::default())
+    }
+
+    /// Execute a frame's command list (`front::CmdList`) in call order — the start of the frame's
+    /// encode: every mutation the scene build made since the last one. A queued vertex / texture write
+    /// lands in the next encoder (`flush_mesh_writes` / `flush_texture_writes`), as it did when the
+    /// callers wrote to the renderer directly; an offscreen pass encodes and submits here, in its place
+    /// in the order, so the writes before it are in its encoder and those after it are not.
+    pub(crate) fn apply(&mut self, list: &mut CmdList) {
+        let CmdList { cmds, bytes, .. } = list;
+        for c in cmds.drain(..) {
+            match c {
+                Cmd::WriteMesh { mesh, start, len } => self.defer_mesh_write(MeshId(mesh), &bytes[start..start + len]),
+                Cmd::UpdateTextureLevel { texture, level, width, height, start, len } => self.queue_texture_level(TextureId(texture), level, width, height, &bytes[start..start + len]),
+                Cmd::HeadlightMap(map) => self.set_headlight_map(&map),
+                Cmd::Projector(t) => self.set_projector_texture(t),
+                Cmd::HeadlightTexture(t) => self.set_headlight_texture(t),
+                Cmd::MirrorView(on) => self.set_mirror_view(on),
+                Cmd::Trilinear(on) => self.set_trilinear(on),
+                Cmd::FakeSort(m) => self.set_fakesort_mode(m),
+                Cmd::Resize(w, h) => self.resize(w, h),
+                Cmd::CreateMaterial(d) => {
+                    self.create_material(d);
+                }
+                Cmd::DuplicateMaterial { id, texture } => {
+                    self.duplicate_material_texture(id, texture);
+                }
+                Cmd::DynamicMesh(m) => {
+                    self.upload_dynamic_mesh(&m);
+                }
+                Cmd::Offscreen(j) => {
+                    let id = self.render_offscreen(&j.scene, &j.camera, j.width, j.height, j.reuse, j.clear, j.depth_far);
+                    debug_assert_eq!(id, j.id, "offscreen id allocated on the front differs from the core's");
+                }
+            }
+        }
+        bytes.clear();
+    }
+
+    pub(crate) fn white(&self) -> TextureId {
+        self.white
+    }
+    pub(crate) fn texture_count(&self) -> u32 {
+        self.textures.len() as u32
+    }
+    /// `(vertex bytes, writes)` per mesh, for the front's mirror.
+    pub(crate) fn mesh_infos(&self) -> Vec<(u64, u32)> {
+        self.meshes.iter().map(|m| (m.vertex_len, m.writes)).collect()
+    }
+    pub(crate) fn mesh_vertex_len(&self, id: MeshId) -> u64 {
+        self.meshes[id.0 as usize].vertex_len
+    }
+    pub(crate) fn material_textures(&self) -> Vec<TextureId> {
+        self.materials.iter().map(|m| m.texture).collect()
+    }
+    pub(crate) fn offscreen_sizes(&self) -> std::collections::HashMap<u32, (u32, u32)> {
+        self.offscreen.clone()
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -668,50 +844,130 @@ impl Renderer {
             contents: bytemuck::cast_slice(&mesh.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
-        self.meshes.push(GpuMesh { vertex_buf, index_buf, index_count: mesh.indices.len() as u32 });
+        let (vertex_len, index_len) = (vertex_buf.size(), index_buf.size());
+        self.meshes.push(GpuMesh { vertex_buf, vertex_offset: 0, vertex_len, index_buf, index_offset: 0, index_len, index_count: mesh.indices.len() as u32, writes: 0 });
         MeshId(self.meshes.len() as u32 - 1)
     }
 
-    /// Rewrite a dynamic mesh's vertices. The slice must be no longer than the one it was uploaded
-    /// with; anything else is ignored.
-    pub fn write_mesh_vertices(&mut self, id: MeshId, vertices: &[Vertex]) {
-        let Some(m) = self.meshes.get(id.0 as usize) else { return };
-        let bytes: &[u8] = bytemuck::cast_slice(vertices);
-        if bytes.len() as u64 > m.vertex_buf.size() {
+    /// Queue a vertex write for the next frame's encoder (`flush_mesh_writes`); empty writes are
+    /// dropped as `write_buffer` drops them.
+    pub(crate) fn defer_mesh_write(&mut self, id: MeshId, bytes: &[u8]) {
+        if bytes.is_empty() {
             return;
         }
-        self.queue.write_buffer(&m.vertex_buf, 0, bytes);
+        self.meshes[id.0 as usize].writes = self.meshes[id.0 as usize].writes.wrapping_add(1);
+        self.pending_writes.push(PendingWrite { mesh: id.0, start: self.pending_bytes.len(), len: bytes.len() });
+        self.pending_bytes.extend_from_slice(bytes);
+    }
+
+    /// Record the queued vertex writes into `encoder`, from the staging belt, in call order.
+    fn flush_mesh_writes(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        for w in &self.pending_writes {
+            let size = wgpu::BufferSize::new(w.len as u64).expect("non-empty write");
+            let m = &self.meshes[w.mesh as usize];
+            self.belt.write_buffer(encoder, &m.vertex_buf, m.vertex_offset, size, &self.device).copy_from_slice(&self.pending_bytes[w.start..w.start + w.len]);
+        }
+        self.pending_writes.clear();
+        self.pending_bytes.clear();
     }
 
     pub fn upload_mesh(&mut self, mesh: &MeshData) -> MeshId {
-        let vertex_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh vb"),
-            contents: bytemuck::cast_slice(&mesh.vertices),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        });
-        let index_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh ib"),
-            contents: bytemuck::cast_slice(&mesh.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        self.meshes.push(GpuMesh { vertex_buf, index_buf, index_count: mesh.indices.len() as u32 });
+        let vbytes: &[u8] = bytemuck::cast_slice(&mesh.vertices);
+        let ibytes: &[u8] = bytemuck::cast_slice(&mesh.indices);
+        let (vlen, ilen) = (vbytes.len() as u64, ibytes.len() as u64);
+        // every range is rounded to 8 bytes (a mapped range starts on a multiple of 8, a slice on 4;
+        // and an empty one still reserves 8, so it can be sliced)
+        let (vreserve, ireserve) = (vlen.next_multiple_of(8).max(8), ilen.next_multiple_of(8).max(8));
+        let fits = self.arena.as_ref().is_some_and(|a| a.vertex_used + vreserve <= a.vertex_buf.size() && a.index_used + ireserve <= a.index_buf.size());
+        if !fits {
+            // a full arena goes to the queue now, so the host copies of a whole track's meshes do not pile up
+            if self.arena.as_ref().is_some_and(|a| a.mapped) {
+                self.seal_arena();
+                self.queue.submit(std::iter::empty());
+            }
+            let make = |label: &'static str, usage: wgpu::BufferUsages, need: u64| {
+                self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: ARENA_CHUNK.max(need), usage: usage | wgpu::BufferUsages::COPY_DST, mapped_at_creation: true })
+            };
+            self.arena = Some(MeshArena {
+                vertex_buf: make("mesh arena vb", wgpu::BufferUsages::VERTEX, vreserve),
+                vertex_used: 0,
+                index_buf: make("mesh arena ib", wgpu::BufferUsages::INDEX, ireserve),
+                index_used: 0,
+                mapped: true,
+            });
+        }
+        let a = self.arena.as_mut().expect("arena made");
+        let (vertex_offset, index_offset) = (a.vertex_used, a.index_used);
+        if a.mapped {
+            if !vbytes.is_empty() {
+                a.vertex_buf.slice(vertex_offset..vertex_offset + vlen).get_mapped_range_mut().copy_from_slice(vbytes);
+            }
+            if !ibytes.is_empty() {
+                a.index_buf.slice(index_offset..index_offset + ilen).get_mapped_range_mut().copy_from_slice(ibytes);
+            }
+        } else {
+            if !vbytes.is_empty() {
+                self.queue.write_buffer(&a.vertex_buf, vertex_offset, vbytes);
+            }
+            if !ibytes.is_empty() {
+                self.queue.write_buffer(&a.index_buf, index_offset, ibytes);
+            }
+        }
+        a.vertex_used += vreserve;
+        a.index_used += ireserve;
+        self.meshes.push(GpuMesh { vertex_buf: a.vertex_buf.clone(), vertex_offset, vertex_len: vlen, index_buf: a.index_buf.clone(), index_offset, index_len: ilen, index_count: mesh.indices.len() as u32, writes: 0 });
         MeshId(self.meshes.len() as u32 - 1)
     }
 
-    /// New vertices for a mesh already uploaded, the same count — the morphing parts of a car
-    /// (its roof) rewrite theirs when the animation moves.
-    pub fn update_mesh_vertices(&mut self, id: MeshId, vertices: &[crate::Vertex]) {
-        if let Some(m) = self.meshes.get(id.0 as usize)
-            && std::mem::size_of_val(vertices) as u64 == m.vertex_buf.size()
-        {
-            self.queue.write_buffer(&m.vertex_buf, 0, bytemuck::cast_slice(vertices));
+    /// Unmap the mesh arena so the GPU can read it: what [`Self::upload_mesh`] copied into the mapped
+    /// buffers becomes visible to the next frame. A later mesh that still fits goes in as a queued write.
+    fn seal_arena(&mut self) {
+        if let Some(a) = self.arena.as_mut().filter(|a| a.mapped) {
+            a.vertex_buf.unmap();
+            a.index_buf.unmap();
+            a.mapped = false;
         }
     }
 
     pub fn upload_texture(&mut self, tex: &TextureData) -> TextureId {
-        let size = wgpu::Extent3d { width: tex.width, height: tex.height, depth_or_array_layers: 1 };
-        let mip_level_count = tex.mips.len().max(1) as u32;
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+        self.upload_texture_mips(tex.width, tex.height, &tex.mips)
+    }
+
+    /// [`Self::upload_texture`] over borrowed levels, so a caller that keeps its pixels does not
+    /// clone a whole mip chain just to hand it over.
+    pub fn upload_texture_mips(&mut self, width: u32, height: u32, mips: &[Vec<u8>]) -> TextureId {
+        let t = Self::make_texture(&self.device, &self.queue, &self.sprite_layout, &self.sprite_sampler, width, height, mips);
+        self.textures.push(t);
+        TextureId(self.textures.len() as u32 - 1)
+    }
+
+    /// Several textures at once, the ids in the order given (the next free ones, as the same
+    /// number of [`Self::upload_texture_mips`] calls would hand them). The device and the queue
+    /// are thread-safe, so the textures are built on worker threads and pushed in order.
+    pub fn upload_textures(&mut self, items: &[(u32, u32, &[Vec<u8>])]) -> Vec<TextureId> {
+        let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8).min(items.len());
+        let built: Vec<GpuTexture> = if workers <= 1 {
+            items.iter().map(|&(w, h, m)| Self::make_texture(&self.device, &self.queue, &self.sprite_layout, &self.sprite_sampler, w, h, m)).collect()
+        } else {
+            let (device, queue, layout, sampler) = (&self.device, &self.queue, &self.sprite_layout, &self.sprite_sampler);
+            let chunk = items.len().div_ceil(workers);
+            std::thread::scope(|s| {
+                let handles: Vec<_> = items
+                    .chunks(chunk)
+                    .map(|c| s.spawn(move || c.iter().map(|&(w, h, m)| Self::make_texture(device, queue, layout, sampler, w, h, m)).collect::<Vec<_>>()))
+                    .collect();
+                handles.into_iter().flat_map(|h| h.join().expect("texture worker")).collect()
+            })
+        };
+        let first = self.textures.len() as u32;
+        self.textures.extend(built);
+        (first..self.textures.len() as u32).map(TextureId).collect()
+    }
+
+    fn make_texture(device: &wgpu::Device, queue: &wgpu::Queue, sprite_layout: &wgpu::BindGroupLayout, sprite_sampler: &wgpu::Sampler, width: u32, height: u32, mips: &[Vec<u8>]) -> GpuTexture {
+        let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+        let mip_level_count = mips.len().max(1) as u32;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("texture"),
             size,
             mip_level_count,
@@ -721,9 +977,9 @@ impl Renderer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let (mut w, mut h) = (tex.width, tex.height);
-        for (level, data) in tex.mips.iter().enumerate() {
-            self.queue.write_texture(
+        let (mut w, mut h) = (width, height);
+        for (level, data) in mips.iter().enumerate() {
+            queue.write_texture(
                 wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: level as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
                 data,
                 wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
@@ -733,33 +989,57 @@ impl Renderer {
             h = (h / 2).max(1);
         }
         let view = texture.create_view(&Default::default());
-        let sprite_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let sprite_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sprite tex"),
-            layout: &self.sprite_layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sprite_sampler) }],
+            layout: sprite_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sprite_sampler) }],
         }));
-        tracing::info!(id = self.textures.len(), w = tex.width, h = tex.height, "texture uploaded");
-        self.textures.push(GpuTexture { _texture: texture, view, sprite_bg });
-        TextureId(self.textures.len() as u32 - 1)
+        tracing::debug!(w = width, h = height, "texture uploaded");
+        GpuTexture { _texture: texture, view, sprite_bg }
     }
 
-    /// Overwrite an existing texture's pixels, keeping its id and every bind group that points at
-    /// it. The new data must have the same dimensions and mip count as the original. Used for the
-    /// car's texture pages, which are recomposed when the damage decals change
-    /// (`RE/notes/car-model.md` §11).
-    pub fn update_texture(&mut self, id: TextureId, tex: &TextureData) {
-        let Some(gpu) = self.textures.get(id.0 as usize) else { return };
-        let (mut w, mut h) = (tex.width, tex.height);
-        for (level, data) in tex.mips.iter().enumerate() {
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo { texture: &gpu._texture, mip_level: level as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                data,
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
-                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            );
-            w = (w / 2).max(1);
-            h = (h / 2).max(1);
+
+    /// One mip level of `Renderer::update_texture`: `data` holds `h` rows of `4 · w` bytes (or more; the
+    /// rest is ignored; less and the level is skipped).
+    pub(crate) fn queue_texture_level(&mut self, id: TextureId, level: u32, w: u32, h: u32, data: &[u8]) {
+        if self.textures.get(id.0 as usize).is_none() {
+            return;
         }
+        // queued for the next frame's encoder (`flush_texture_writes`), where `write_texture` would
+        // have executed it (before that submit's commands); the rows are padded to 256 bytes
+        let row = 4 * w as usize;
+        let padded = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize);
+        if data.len() >= row * h as usize {
+            // a queued write of the same whole level is overwritten in place (the last wins, as the
+            // later `write_texture` would), so frames that are not rendered do not pile writes up
+            let same = self.pending_textures.iter().find(|q| q.texture == id.0 && q.level == level && q.width == w && q.height == h).map(|q| q.start);
+            let start = same.unwrap_or(self.pending_texture_bytes.len());
+            if same.is_none() {
+                self.pending_texture_bytes.resize(start + padded * h as usize, 0);
+                self.pending_textures.push(PendingTextureWrite { texture: id.0, level, width: w, height: h, bytes_per_row: padded as u32, start });
+            }
+            for y in 0..h as usize {
+                self.pending_texture_bytes[start + y * padded..start + y * padded + row].copy_from_slice(&data[y * row..(y + 1) * row]);
+            }
+        }
+    }
+
+    /// Record the queued texture writes into `encoder`, from the staging belt, in call order.
+    fn flush_texture_writes(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        for w in &self.pending_textures {
+            let Some(gpu) = self.textures.get(w.texture as usize) else { continue };
+            let len = w.bytes_per_row as usize * w.height as usize;
+            let size = wgpu::BufferSize::new(len as u64).expect("non-empty write");
+            let slice = self.belt.allocate(size, wgpu::BufferSize::new(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64).unwrap(), &self.device);
+            slice.get_mapped_range_mut().copy_from_slice(&self.pending_texture_bytes[w.start..w.start + len]);
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo { buffer: slice.buffer(), layout: wgpu::TexelCopyBufferLayout { offset: slice.offset(), bytes_per_row: Some(w.bytes_per_row), rows_per_image: Some(w.height) } },
+                wgpu::TexelCopyTextureInfo { texture: &gpu._texture, mip_level: w.level, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::Extent3d { width: w.width, height: w.height, depth_or_array_layers: 1 },
+            );
+        }
+        self.pending_textures.clear();
+        self.pending_texture_bytes.clear();
     }
 
     pub fn create_material(&mut self, desc: MaterialDesc) -> MaterialId {
@@ -789,14 +1069,6 @@ impl Renderer {
         });
         MaterialId(self.materials.len() as u32 - 1)
     }
-
-    /// The diffuse texture `id` samples, if it exists — used to find which materials of a shared
-    /// model reference a damage-decal page when giving a traffic/cop car instance its own copy of
-    /// it (`RE/notes/car-model.md` §13.1).
-    pub fn material_texture(&self, id: MaterialId) -> Option<TextureId> {
-        self.materials.get(id.0 as usize).map(|m| m.texture)
-    }
-
     /// A new material identical to `id` but sampling `texture` in its place — same blend/cull/lod
     /// state and specular map, a fresh bind group. Used to give one traffic/cop car instance its
     /// own decal-page material when `nfs_game::world::CarModel::instantiate` clones the shared
@@ -886,7 +1158,8 @@ impl Renderer {
 
     /// The bind group for a section map, made the first time a car binds it.
     fn sky_bind_group(&mut self, tex: TextureId) {
-        if self.sky_bgs.contains_key(&tex.0) {
+        let i = tex.0 as usize;
+        if self.sky_bgs.get(i).is_some_and(|b| b.is_some()) {
             return;
         }
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -894,7 +1167,10 @@ impl Renderer {
             layout: &self.sky_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.textures[tex.0 as usize].view) }],
         });
-        self.sky_bgs.insert(tex.0, bg);
+        if self.sky_bgs.len() <= i {
+            self.sky_bgs.resize_with(i + 1, || None);
+        }
+        self.sky_bgs[i] = Some(bg);
     }
 
     /// A material's bind group: its texture, the sampler for its address modes under the current
@@ -956,9 +1232,17 @@ impl Renderer {
         };
         let view = frame.texture.create_view(&Default::default());
         let aspect = self.aspect();
-        self.encode_frame(scene, camera, &view, &self.depth_view.clone(), aspect, VIEW_FAR);
+        let depth = self.depth_view.clone();
+        self.encode_frame(scene, scene.clear_color, true, camera, &view, &depth, aspect, VIEW_FAR);
         frame.present();
         Ok(())
+    }
+
+    /// The depth target for a pass of this size: one per size, kept (every pass clears it first,
+    /// so sharing it between offscreen passes is the same as a fresh texture each).
+    fn depth_for(&mut self, width: u32, height: u32) -> wgpu::TextureView {
+        let device = &self.device;
+        self.depth_cache.entry((width, height)).or_insert_with(|| Self::make_depth_sized(device, width, height)).clone()
     }
 
     /// Render one frame into an offscreen RGBA8 image (for screenshots and automated checks).
@@ -996,15 +1280,10 @@ impl Renderer {
                 id
             }
         };
-        let mut cfg = self.config.clone();
-        cfg.width = width;
-        cfg.height = height;
-        let depth = Self::make_depth(&self.device, &cfg);
+        let depth = self.depth_for(width, height);
         let view = self.textures[id.0 as usize].view.clone();
-        let mut clear = scene.clone();
-        clear.clear_color = clear_colour.unwrap_or([0.0, 0.0, 0.0, 0.0]);
-        clear.sprites.clear();
-        self.encode_frame(&clear, camera, &view, &depth, width as f32 / height as f32, depth_far.unwrap_or(VIEW_FAR));
+        // the scene's items and lights as they are, its own clear colour replaced and no sprites
+        self.encode_frame(scene, clear_colour.unwrap_or([0.0, 0.0, 0.0, 0.0]), false, camera, &view, &depth, width as f32 / height as f32, depth_far.unwrap_or(VIEW_FAR));
         id
     }
 
@@ -1020,11 +1299,8 @@ impl Renderer {
             view_formats: &[],
         });
         let view = target.create_view(&Default::default());
-        let mut cfg = self.config.clone();
-        cfg.width = width;
-        cfg.height = height;
-        let depth = Self::make_depth(&self.device, &cfg);
-        self.encode_frame(scene, camera, &view, &depth, width as f32 / height as f32, VIEW_FAR);
+        let depth = self.depth_for(width, height);
+        self.encode_frame(scene, scene.clear_color, true, camera, &view, &depth, width as f32 / height as f32, VIEW_FAR);
         self.readback(&target, width, height)
     }
 
@@ -1071,93 +1347,153 @@ impl Renderer {
         Ok(out)
     }
 
-    fn encode_frame(&mut self, scene: &Scene, camera: &Camera, view: &wgpu::TextureView, depth_view: &wgpu::TextureView, aspect: f32, depth_far: f32) {
+    /// Set what a run needs that the pass does not already hold, then draw it: one instanced draw
+    /// of `r.count` consecutive objects (`first_instance` = the first object's index).
+    fn draw_run(&self, pass: &mut wgpu::RenderPass<'_>, st: &mut DrawState, r: &Run) {
+        if st.pipeline != r.pipeline {
+            pass.set_pipeline(&self.pipelines[r.pipeline]);
+            st.pipeline = r.pipeline;
+        }
+        if st.material != r.material {
+            let m = &self.materials[(r.material >> 1) as usize];
+            let bg = if r.material & 1 == 1 { m.bind_group_point.as_ref().unwrap_or(&m.bind_group) } else { &m.bind_group };
+            pass.set_bind_group(2, bg, &[]);
+            st.material = r.material;
+        }
+        if st.sky != r.sky {
+            pass.set_bind_group(3, self.sky_bgs[r.sky as usize].as_ref().expect("sky bind group made"), &[]);
+            st.sky = r.sky;
+        }
+        let mesh = &self.meshes[r.mesh as usize];
+        if st.mesh != r.mesh {
+            pass.set_vertex_buffer(0, mesh.vertex_buf.slice(mesh.vertex_offset..mesh.vertex_offset + mesh.vertex_len.max(4)));
+            pass.set_index_buffer(mesh.index_buf.slice(mesh.index_offset..mesh.index_offset + mesh.index_len.max(4)), wgpu::IndexFormat::Uint32);
+            st.mesh = r.mesh;
+        }
+        pass.draw_indexed(0..mesh.index_count, 0, r.first..r.first + r.count);
+    }
 
-        let vp = camera.view_projection_mirrored(aspect, scene.mirror);
-        self.queue.write_buffer(
-            &self.globals_buf,
-            0,
-            bytemuck::bytes_of(&GlobalsUniform {
-                view_proj: vp.to_cols_array_2d(),
-                view: camera.view().to_cols_array_2d(),
-                sun_dir: scene.sun_direction.extend(0.0).to_array(),
-                // .y the view's near plane: a depth-bias pull past it stops there (the original's
-                // screen z goes to 0 or below — in front of everything, `RE/notes/thrash.md` §6)
-                // .z 1 in the rear-view mirror's view: no specular or sky-map pass (`[0x6115CC]+0x190`)
-                ambient: [scene.ambient, camera.near, self.no_reflections as u32 as f32, 0.0],
-                cam_pos: camera.position.extend(1.0).to_array(),
-                headlight: scene.headlight.unwrap_or(glam::Mat4::IDENTITY).to_cols_array_2d(),
-                headlight_on: [scene.headlight.is_some() as u32 as f32, (scene.headlight.is_some() && scene.headlight_decal) as u32 as f32, 0.0, 0.0],
-                beacon: scene.beacon.unwrap_or(glam::Mat4::IDENTITY).to_cols_array_2d(),
-                beacon_on: [scene.beacon.is_some() as u32 as f32, 0.0, 0.0, 0.0],
-                fog: scene.fog.map_or([0.0; 4], |f| [f.colour[0], f.colour[1], f.colour[2], f.density]),
-                sky_fog: scene.sky_fog.map_or([0.0; 4], |f| [f.colour[0], f.colour[1], f.colour[2], f.density]),
-            }),
-        );
+    /// Draw `scene` into `view` / `depth_view`: the 3-D items (sky, opaque, blended), then — when
+    /// `with_sprites` — the 2D sprites. Every buffer write of the frame goes through the staging
+    /// belt into this frame's encoder, so nothing allocates a staging buffer per call. Neither
+    /// pass stores its depth: nothing reads it afterwards (the sprite pass clears it to 1.0).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_frame(&mut self, scene: &Scene, clear_color: [f64; 4], with_sprites: bool, camera: &Camera, view: &wgpu::TextureView, depth_view: &wgpu::TextureView, aspect: f32, depth_far: f32) {
         let n = scene.items.len().min(MAX_OBJECTS as usize);
-        // the section map each item's sky-map pass samples, by its material's bucket
-        let sky_tex = |this: &Self, item: &crate::DrawItem| -> Option<TextureId> {
-            let m = this.materials.get(item.material.0 as usize)?;
-            if !m.sky_map || this.no_reflections {
-                return None;
-            }
-            item.sky.and_then(|s| s.textures[m.env_variant])
-        };
         let white = self.white;
         self.sky_bind_group(white);
-        for item in scene.items.iter().take(n) {
-            if let Some(t) = sky_tex(self, item) {
+        // one walk over the items: each goes into its stage's list, in submission order — no-depth
+        // (sky) first, then opaque, then blended; an `early` blended item goes with the opaque
+        // ones (`DrawItem::early`) — and the section maps its sky-map pass samples get their bind
+        // groups
+        let mut buckets = std::mem::take(&mut self.buckets);
+        for b in &mut buckets {
+            b.clear();
+        }
+        for (i, item) in scene.items.iter().take(n).enumerate() {
+            let (stage, skip) = {
+                let mat = &self.materials[item.material.0 as usize];
+                (if !mat.depth_test { 0 } else if mat.alpha_blend && !item.early { 2 } else { 1 }, item.main_view_only && self.no_reflections)
+            };
+            if let Some(t) = sky_tex_of(&self.materials, self.no_reflections, item) {
                 self.sky_bind_group(t);
             }
-        }
-        let mut staging = vec![0u8; self.object_stride as usize * n];
-        for (i, item) in scene.items.iter().take(n).enumerate() {
-            let env_mix = self.materials.get(item.material.0 as usize).map(|m| m.env_mix).unwrap_or(0.0);
-            let lod_bias = self.materials.get(item.material.0 as usize).map(|m| m.lod_bias).unwrap_or(0.0);
-            // the alpha test: the material's race states, or the draw's own Thrash 0x24 ← 10
-            let alpha_test = self.materials.get(item.material.0 as usize).is_some_and(|m| m.device_states) || item.alpha_test;
-            // `.w` below: 0 no test, else the reference + ½ — a texel alpha under it (≤ the
-            // reference in bytes) fails `GREATER`
-            let alpha_ref = if alpha_test { item.alpha_ref as f32 + 0.5 } else { 0.0 };
-            // state 0x18 as a pull toward the eye in view depth: `−b · (far − near) / 32768` over
-            // the pass's own planes — the view's near and far, which 0x466F30 hands the projection
-            // 0x5391B0 (`cam+0xCC` / `+0xD0`) and 0x540870 loads as the screen z's range: the main
-            // view's near and the camera object's far 700 (0x4677FC), the rear view's 1 / 65000
-            // (0x4691D0; `RE/notes/thrash.md` §6) — `b` the material's block plus the draw's own
-            // (the lamp glare's, `DrawItem::depth_bias`). The rear view's far is not the port's
-            // clip far there (its cull distance), hence `depth_far` apart from `camera.far`.
-            let pull = self.materials.get(item.material.0 as usize).map_or(0.0, |m| -((m.depth_bias + item.depth_bias) as f32) * (depth_far - camera.near) / 32768.0);
-            let o = ObjectUniform {
-                model: item.transform.to_cols_array_2d(),
-                // .x is the environment-map mix, .zw a uv offset (the sky layers scroll with it)
-                // .y flags an item the headlight projector lights
-                env_mix: [env_mix, item.headlit as u32 as f32, item.uv_offset[0], item.uv_offset[1]],
-                light: [item.light[0], item.light[1], item.light[2], item.alpha],
-                lit_a: item.layer_light.map_or([0.0; 4], |l| [l.ambient[0], l.ambient[1], l.ambient[2], 1.0]),
-                lit_d: item.layer_light.map_or([0.0; 4], |l| [l.diffuse[0], l.diffuse[1], l.diffuse[2], 0.0]),
-                // .w the depth bias's pull, in view depth
-                lit_dir: item.layer_light.map_or([0.0, 0.0, 0.0, pull], |l| [l.direction[0], l.direction[1], l.direction[2], pull]),
-                shadow_u: item.shadow.map_or([0.0; 4], |s| s.0),
-                shadow_v: item.shadow.map_or([0.0; 4], |s| s.1),
-                // .y flags the item `Headlights::LayerUVLight` lays the `HEAD` decal over
-                // .w the alpha test (a material with `device_states`, or the draw's own): its
-                // reference + ½ in bytes, 0 for none
-                shadow_on: [item.shadow.is_some() as u32 as f32, item.uv_lit as u32 as f32, lod_bias, alpha_ref],
-                sky_u: item.sky.map_or([0.0; 4], |s| s.u),
-                sky_v: item.sky.map_or([0.0; 4], |s| s.v),
-                // .y the item is drawn in the sky pass (its fog is the sky's)
-                sky_on: [sky_tex(self, item).is_some() as u32 as f32, item.sky_pass as u32 as f32, item.fog_w, 0.0],
-            };
-            let off = i * self.object_stride as usize;
-            staging[off..off + std::mem::size_of::<ObjectUniform>()].copy_from_slice(bytemuck::bytes_of(&o));
-        }
-        if n > 0 {
-            self.queue.write_buffer(&self.object_buf, 0, &staging);
+            if !skip {
+                buckets[stage].push(i as u32);
+            }
         }
 
+        self.seal_arena();
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+        self.flush_texture_writes(&mut encoder);
+        self.flush_mesh_writes(&mut encoder);
+        let vp = camera.view_projection_mirrored(aspect, scene.mirror);
+        let globals = GlobalsUniform {
+            view_proj: vp.to_cols_array_2d(),
+            view: camera.view().to_cols_array_2d(),
+            sun_dir: scene.sun_direction.extend(0.0).to_array(),
+            // .y the view's near plane: a depth-bias pull past it stops there (the original's
+            // screen z goes to 0 or below — in front of everything, `RE/notes/thrash.md` §6)
+            // .z 1 in the rear-view mirror's view: no specular or sky-map pass (`[0x6115CC]+0x190`)
+            ambient: [scene.ambient, camera.near, self.no_reflections as u32 as f32, 0.0],
+            cam_pos: camera.position.extend(1.0).to_array(),
+            headlight: scene.headlight.unwrap_or(glam::Mat4::IDENTITY).to_cols_array_2d(),
+            headlight_on: [scene.headlight.is_some() as u32 as f32, (scene.headlight.is_some() && scene.headlight_decal) as u32 as f32, 0.0, 0.0],
+            beacon: scene.beacon.unwrap_or(glam::Mat4::IDENTITY).to_cols_array_2d(),
+            beacon_on: [scene.beacon.is_some() as u32 as f32, 0.0, 0.0, 0.0],
+            fog: scene.fog.map_or([0.0; 4], |f| [f.colour[0], f.colour[1], f.colour[2], f.density]),
+            sky_fog: scene.sky_fog.map_or([0.0; 4], |f| [f.colour[0], f.colour[1], f.colour[2], f.density]),
+        };
+        let size = wgpu::BufferSize::new(std::mem::size_of::<GlobalsUniform>() as u64).expect("globals size");
+        self.belt.write_buffer(&mut encoder, &self.globals_buf, 0, size, &self.device).copy_from_slice(bytemuck::bytes_of(&globals));
+        if n > 0 {
+            let size = wgpu::BufferSize::new((n * std::mem::size_of::<ObjectUniform>()) as u64).expect("objects size");
+            let mut view = self.belt.write_buffer(&mut encoder, &self.object_buf, 0, size, &self.device);
+            let objects: &mut [ObjectUniform] = bytemuck::cast_slice_mut(&mut view);
+            for (o, item) in objects.iter_mut().zip(scene.items.iter().take(n)) {
+                let mat = self.materials.get(item.material.0 as usize);
+                let env_mix = mat.map_or(0.0, |m| m.env_mix);
+                let lod_bias = mat.map_or(0.0, |m| m.lod_bias);
+                // the alpha test: the material's race states, or the draw's own Thrash 0x24 ← 10
+                let alpha_test = mat.is_some_and(|m| m.device_states) || item.alpha_test;
+                // `.w` below: 0 no test, else the reference + ½ — a texel alpha under it (≤ the
+                // reference in bytes) fails `GREATER`
+                let alpha_ref = if alpha_test { item.alpha_ref as f32 + 0.5 } else { 0.0 };
+                // state 0x18 as a pull toward the eye in view depth: `−b · (far − near) / 32768` over
+                // the pass's own planes — the view's near and far, which 0x466F30 hands the projection
+                // 0x5391B0 (`cam+0xCC` / `+0xD0`) and 0x540870 loads as the screen z's range: the main
+                // view's near and the camera object's far 700 (0x4677FC), the rear view's 1 / 65000
+                // (0x4691D0; `RE/notes/thrash.md` §6) — `b` the material's block plus the draw's own
+                // (the lamp glare's, `DrawItem::depth_bias`). The rear view's far is not the port's
+                // clip far there (its cull distance), hence `depth_far` apart from `camera.far`.
+                let pull = mat.map_or(0.0, |m| -((m.depth_bias + item.depth_bias) as f32) * (depth_far - camera.near) / 32768.0);
+                *o = ObjectUniform {
+                    model: item.transform.to_cols_array_2d(),
+                    // .x is the environment-map mix, .zw a uv offset (the sky layers scroll with it)
+                    // .y flags an item the headlight projector lights
+                    env_mix: [env_mix, item.headlit as u32 as f32, item.uv_offset[0], item.uv_offset[1]],
+                    light: [item.light[0], item.light[1], item.light[2], item.alpha],
+                    lit_a: item.layer_light.map_or([0.0; 4], |l| [l.ambient[0], l.ambient[1], l.ambient[2], 1.0]),
+                    lit_d: item.layer_light.map_or([0.0; 4], |l| [l.diffuse[0], l.diffuse[1], l.diffuse[2], 0.0]),
+                    // .w the depth bias's pull, in view depth
+                    lit_dir: item.layer_light.map_or([0.0, 0.0, 0.0, pull], |l| [l.direction[0], l.direction[1], l.direction[2], pull]),
+                    shadow_u: item.shadow.map_or([0.0; 4], |s| s.0),
+                    shadow_v: item.shadow.map_or([0.0; 4], |s| s.1),
+                    // .y flags the item `Headlights::LayerUVLight` lays the `HEAD` decal over
+                    // .w the alpha test (a material with `device_states`, or the draw's own): its
+                    // reference + ½ in bytes, 0 for none
+                    shadow_on: [item.shadow.is_some() as u32 as f32, item.uv_lit as u32 as f32, lod_bias, alpha_ref],
+                    sky_u: item.sky.map_or([0.0; 4], |s| s.u),
+                    sky_v: item.sky.map_or([0.0; 4], |s| s.v),
+                    // .y the item is drawn in the sky pass (its fog is the sky's)
+                    sky_on: [sky_tex_of(&self.materials, self.no_reflections, item).is_some() as u32 as f32, item.sky_pass as u32 as f32, item.fog_w, 0.0],
+                };
+            }
+        }
+
+        // the 2D pass's vertices go into the belt before any pass opens (a copy cannot be
+        // recorded inside one)
+        let n_sprites = if with_sprites { scene.sprites.len().min(MAX_SPRITES as usize) } else { 0 };
+        if with_sprites && scene.sprites.len() > MAX_SPRITES as usize {
+            tracing::warn!(have = scene.sprites.len(), cap = MAX_SPRITES, "sprite budget exceeded — the rest of the frame is dropped");
+            tracing::warn!(wanted = scene.sprites.len(), drawn = n_sprites, "sprite buffer full");
+        }
+        if n_sprites > 0 {
+            let size = wgpu::BufferSize::new((n_sprites * 6 * std::mem::size_of::<SpriteVertex>()) as u64).expect("sprites size");
+            let mut view = self.belt.write_buffer(&mut encoder, &self.sprite_buf, 0, size, &self.device);
+            let verts: &mut [SpriteVertex] = bytemuck::cast_slice_mut(&mut view);
+            for (i, sp) in scene.sprites.iter().take(n_sprites).enumerate() {
+                verts[i * 6..i * 6 + 6].copy_from_slice(&sprite_quad(sp, aspect));
+                if self.sprite_log {
+                    let v = &verts[i * 6];
+                    let w = &verts[i * 6 + 1];
+                    tracing::info!(i, tex = sp.texture.0, bound = self.textures[sp.texture.0 as usize].sprite_bg.is_some(), x0 = v.pos[0], y0 = v.pos[1], x1 = w.pos[0], uv0 = ?v.uv, color = ?v.color, "sprite");
+                }
+            }
+        }
+
         {
-            let c = scene.clear_color;
+            let c = clear_color;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1168,23 +1504,21 @@ impl Renderer {
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: depth_view,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
             pass.set_bind_group(0, &self.globals_bg, &[]);
-            // no-depth (sky) first, then opaque, then blended — an `early` blended item goes with
-            // the opaque ones, in submission order (`DrawItem::early`)
-            for stage in 0..3u8 {
-                for (i, item) in scene.items.iter().take(n).enumerate() {
+            pass.set_bind_group(1, &self.object_bg, &[]);
+            let mut st = DrawState::NONE;
+            for bucket in &buckets {
+                // consecutive items of one mesh under one state are one instanced draw
+                let mut run: Option<Run> = None;
+                for &idx in bucket {
+                    let item = &scene.items[idx as usize];
                     let mat = &self.materials[item.material.0 as usize];
-                    let item_stage = if !mat.depth_test { 0 } else if mat.alpha_blend && !item.early { 2 } else { 1 };
-                    if item_stage != stage || (item.main_view_only && self.no_reflections) {
-                        continue;
-                    }
-                    let mesh = &self.meshes[item.mesh.0 as usize];
                     // mirrored world: the winding flips, so a material whose cull is the view's culls
                     // the other one (0x468C45); any other draws both faces rather than the wrong one
                     let cull = match (mat.cull_back, scene.mirror, mat.view_cull) {
@@ -1196,12 +1530,7 @@ impl Renderer {
                     // the blend group without depth writes, and with them (`device_states`)
                     let plain = if mat.alpha_blend && mat.blend_pair > 0 { 1 + mat.blend_pair as usize } else { mat.alpha_blend as usize };
                     let group = if mat.alpha_blend && mat.device_states { 5 + mat.blend_pair as usize } else { plain };
-                    pass.set_bind_group(1, &self.object_bg, &[(i as u64 * self.object_stride) as u32]);
-                    pass.set_bind_group(2, &mat.bind_group, &[]);
-                    let sky = sky_tex(self, item).unwrap_or(white);
-                    pass.set_bind_group(3, &self.sky_bgs[&sky.0], &[]);
-                    pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-                    pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    let sky = sky_tex_of(&self.materials, self.no_reflections, item).unwrap_or(white).0;
                     // `LayerFalseSort1` / `2`: at `SPECIALFX` 3, always, and at 2 by the runtime
                     // pick (`FakeSortMode`, `RE/notes/thrash.md` §6d.4), the same draw first with
                     // depth writes off, then on (0x449ADB / 0x449B2A). Otherwise (below 2, or 2's
@@ -1214,30 +1543,43 @@ impl Renderer {
                         // < 10000` unsigned)
                         FakeSortMode::PerItem => !item.fakesort_near,
                     };
-                    if mat.false_sort && mat.alpha_blend && fakesort_single {
-                        if let Some(bgp) = &mat.bind_group_point {
-                            pass.set_bind_group(2, bgp, &[]);
+                    let material = item.material.0 * 2;
+                    if mat.false_sort && mat.alpha_blend && !fakesort_single {
+                        // two pipelines in turn on one item: never merged, and the run before it
+                        // is drawn first
+                        if let Some(r) = run.take() {
+                            self.draw_run(&mut pass, &mut st, &r);
                         }
-                        pass.set_pipeline(&self.pipelines[group * 6 + sub]);
-                        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-                    } else {
-                        if mat.false_sort && mat.alpha_blend {
-                            pass.set_pipeline(&self.pipelines[plain * 6 + sub]);
-                            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                        let mut r = Run { first: idx, count: 1, pipeline: plain * 6 + sub, material, sky, mesh: item.mesh.0 };
+                        self.draw_run(&mut pass, &mut st, &r);
+                        r.pipeline = group * 6 + sub;
+                        self.draw_run(&mut pass, &mut st, &r);
+                        continue;
+                    }
+                    let material = if mat.false_sort && mat.alpha_blend && mat.bind_group_point.is_some() { material | 1 } else { material };
+                    let next = Run { first: idx, count: 1, pipeline: group * 6 + sub, material, sky, mesh: item.mesh.0 };
+                    match &mut run {
+                        Some(r) if r.first + r.count == idx && r.pipeline == next.pipeline && r.material == next.material && r.sky == next.sky && r.mesh == next.mesh => r.count += 1,
+                        _ => {
+                            if let Some(r) = run.replace(next) {
+                                self.draw_run(&mut pass, &mut st, &r);
+                            }
                         }
-                        pass.set_pipeline(&self.pipelines[group * 6 + sub]);
-                        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
                     }
                 }
+                if let Some(r) = run.take() {
+                    self.draw_run(&mut pass, &mut st, &r);
+                }
             }
-            drop(pass);
-            // The 2D pass, over the 3-D one. Its depth starts at 1.0: the front end clears the
-            // depth window before its 2D draws (0x4DA890 at 0x4D30AC / 0x4D3182: `THRASH_window(3)`
-            // then `THRASH_clearwindow`, which on `dx7z.dll` clears the depth buffer alone —
-            // 0x60001230 → 0x60008380, `D3DCLEAR_ZBUFFER` without the target when the depth window
-            // is current — to the view's `+0x34`, 1.0 (0x537741, Thrash 0x43, 0x60004C90)). Only a
-            // sprite with a depth state (`Sprite::depth`) tests or writes it; every other draws
-            // as before.
+        }
+        // The 2D pass, over the 3-D one. Its depth starts at 1.0: the front end clears the
+        // depth window before its 2D draws (0x4DA890 at 0x4D30AC / 0x4D3182: `THRASH_window(3)`
+        // then `THRASH_clearwindow`, which on `dx7z.dll` clears the depth buffer alone —
+        // 0x60001230 → 0x60008380, `D3DCLEAR_ZBUFFER` without the target when the depth window
+        // is current — to the view's `+0x34`, 1.0 (0x537741, Thrash 0x43, 0x60004C90)). Only a
+        // sprite with a depth state (`Sprite::depth`) tests or writes it; every other draws
+        // as before. With no sprite the pass would draw nothing, so it is not opened.
+        if n_sprites > 0 {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("sprite pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1248,53 +1590,57 @@ impl Renderer {
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: depth_view,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            // HUD sprites
-            let n_sprites = scene.sprites.len().min(MAX_SPRITES as usize);
-            if scene.sprites.len() > MAX_SPRITES as usize {
-                tracing::warn!(have = scene.sprites.len(), cap = MAX_SPRITES, "sprite budget exceeded — the rest of the frame is dropped");
-            }
-            if scene.sprites.len() > n_sprites {
-                tracing::warn!(wanted = scene.sprites.len(), drawn = n_sprites, "sprite buffer full");
-            }
-            if n_sprites > 0 {
-                let mut verts: Vec<SpriteVertex> = Vec::with_capacity(n_sprites * 6);
-                for sp in scene.sprites.iter().take(n_sprites) {
-                    verts.extend_from_slice(&sprite_quad(sp, aspect));
+            // HUD sprites; consecutive ones on one texture and one pipeline are one draw (their
+            // vertices are contiguous in the buffer, in order)
+            pass.set_vertex_buffer(0, self.sprite_buf.slice(..));
+            let mut bound_pipeline: Option<Option<SpriteCompare>> = None;
+            let mut bound_tex = u32::MAX;
+            let mut run: Option<(usize, usize, u32, Option<SpriteCompare>)> = None;
+            let mut flush = |pass: &mut wgpu::RenderPass<'_>, r: (usize, usize, u32, Option<SpriteCompare>)| {
+                let (first, end, tex, pipeline) = r;
+                let Some(bg) = self.textures[tex as usize].sprite_bg.as_ref() else { return };
+                if bound_pipeline != Some(pipeline) {
+                    pass.set_pipeline(match pipeline {
+                        None => &self.sprite_pipeline,
+                        Some(SpriteCompare::LessEqual) => &self.sprite_depth_pipelines[0],
+                        Some(SpriteCompare::GreaterEqual) => &self.sprite_depth_pipelines[1],
+                    });
+                    bound_pipeline = Some(pipeline);
                 }
-                self.queue.write_buffer(&self.sprite_buf, 0, bytemuck::cast_slice(&verts));
-                pass.set_vertex_buffer(0, self.sprite_buf.slice(..));
-                let mut bound = None;
-                let log = std::env::var("NFS_SPRITE_LOG").is_ok();
-                for (i, sp) in scene.sprites.iter().take(n_sprites).enumerate() {
-                    let bg = self.textures[sp.texture.0 as usize].sprite_bg.as_ref();
-                    if log {
-                        let v = &verts[i * 6];
-                        let w = &verts[i * 6 + 1];
-                        tracing::info!(i, tex = sp.texture.0, bound = bg.is_some(), x0 = v.pos[0], y0 = v.pos[1], x1 = w.pos[0], uv0 = ?v.uv, color = ?v.color, "sprite");
-                    }
-                    if let Some(bg) = bg {
-                        let pipeline = sp.depth.map(|d| d.compare);
-                        if bound != Some(pipeline) {
-                            pass.set_pipeline(match pipeline {
-                                None => &self.sprite_pipeline,
-                                Some(SpriteCompare::LessEqual) => &self.sprite_depth_pipelines[0],
-                                Some(SpriteCompare::GreaterEqual) => &self.sprite_depth_pipelines[1],
-                            });
-                            bound = Some(pipeline);
+                if bound_tex != tex {
+                    pass.set_bind_group(0, bg, &[]);
+                    bound_tex = tex;
+                }
+                pass.draw((first * 6) as u32..(end * 6) as u32, 0..1);
+            };
+            for (i, sp) in scene.sprites.iter().take(n_sprites).enumerate() {
+                if self.textures[sp.texture.0 as usize].sprite_bg.is_none() {
+                    continue;
+                }
+                let pipeline = sp.depth.map(|d| d.compare);
+                match &mut run {
+                    Some((_, end, tex, pl)) if *end == i && *tex == sp.texture.0 && *pl == pipeline => *end += 1,
+                    _ => {
+                        if let Some(r) = run.replace((i, i + 1, sp.texture.0, pipeline)) {
+                            flush(&mut pass, r);
                         }
-                        pass.set_bind_group(0, bg, &[]);
-                        pass.draw((i * 6) as u32..(i * 6 + 6) as u32, 0..1);
                     }
                 }
+            }
+            if let Some(r) = run.take() {
+                flush(&mut pass, r);
             }
         }
+        self.buckets = buckets;
+        self.belt.finish();
         self.queue.submit(Some(encoder.finish()));
+        self.belt.recall();
     }
 }
 

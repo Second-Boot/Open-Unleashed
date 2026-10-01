@@ -732,7 +732,8 @@ impl Vehicle {
         let (mut u, mut v) = (w.slip_vel[0], w.slip_vel[2]);
         if ang != 0.0 {
             let a = ang / 256.0 * TAU;
-            let (sn, cs) = a.sin_cos();
+            // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable sin/cos, not std; original 0x5327E0 / 0x5327F0 (x87) at 0x4A2159 / 0x4A2163.
+            let (sn, cs) = nfs_math::portable::sin_cosf(a);
             let (x, z) = (u, v);
             u = x * cs - z * sn;
             v = x * sn + z * cs;
@@ -800,7 +801,8 @@ impl Vehicle {
         let lat = if v == 0.0 {
             0.0
         } else {
-            let a = u.atan2(-0.5 * v) / TAU; // turns
+            // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable atan2, not std; original x87 atan2 in the slip block 0x4A1D96…0x4A1DAA.
+            let a = nfs_math::portable::atan2f(u, -0.5 * v) / TAU; // turns
             256.0 * if v < 0.0 { a } else if u > 0.0 { 0.5 - a } else if u < 0.0 { -0.5 - a } else { a }
         };
         // 0x4A24E8 branches on `wheel+0xC0`, which is **not** a sliding flag: 0x410BB2 (car init)
@@ -869,7 +871,8 @@ impl Vehicle {
         w.sliding = w.slip > 0.5;
         if ang != 0.0 {
             let a = -ang / 256.0 * TAU;
-            let (sn, cs) = a.sin_cos();
+            // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable sin/cos, not std; original 0x5327E0 / 0x5327F0 (x87) at 0x4A2159 / 0x4A2163.
+            let (sn, cs) = nfs_math::portable::sin_cosf(a);
             let (x, z) = (w.lateral, w.longitudinal);
             w.lateral = x * cs - z * sn;
             w.longitudinal = x * sn + z * cs;
@@ -1459,7 +1462,8 @@ mod tests;
 /// which agrees to first order in ω/64 and drifts in the second.
 pub fn orientation_step(orientation: Mat3, w_turns: Vec3) -> Mat3 {
     let w = w_turns;
-    let rot = Mat3::from_rotation_z(w.z * TAU) * Mat3::from_rotation_y(w.y * TAU) * Mat3::from_rotation_x(w.x * TAU);
+    // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable rotations, not glam/std; original RotY/RotX/RotZ 0x532600 / 0x5325A0 / 0x532660 (x87) at 0x49B880…0x49B977.
+    let rot = nfs_math::portable::mat3_rotation_z(w.z * TAU) * nfs_math::portable::mat3_rotation_y(w.y * TAU) * nfs_math::portable::mat3_rotation_x(w.x * TAU);
     // rows are body axes in world space: rotate each row
     let m = orientation;
     Mat3::from_cols(rot * m.row(0), rot * m.row(1), rot * m.row(2)).transpose()

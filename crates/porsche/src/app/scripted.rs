@@ -61,7 +61,7 @@ impl App {
         // blank only because nothing had been bought, damaged or listed — a parity loop reading
         // that number chases widgets that are already ported. `NFS_SWEEP_STATE=0` restores the
         // bare-career count for anyone who wants to see it.
-        if std::env::var("NFS_SWEEP_STATE").as_deref() != Ok("0")
+        if nfs_game::config::cfg().nfs_sweep_state.var().as_deref() != Ok("0")
             && let Some(c) = self.career.as_mut()
         {
             let parts: Vec<(i16, f32)> = {
@@ -127,7 +127,7 @@ impl App {
             // the same probe fills the browser with one session, so the four `Comms.*` lists and
             // the watches beside them can be measured too. The record is what a `'d'` answer
             // carries (`nfs_net::comm::Describe`), filled as a two-player game would fill it.
-            if std::env::var("NFS_SWEEP_STATE").as_deref() != Ok("0")
+            if nfs_game::config::cfg().nfs_sweep_state.var().as_deref() != Ok("0")
                 && let Some(lobby) = self.net.lobby.as_mut()
                 && lobby.found.is_empty()
             {
@@ -172,7 +172,7 @@ impl App {
             // and `NFS_SWEEP_DUMP=*` every screen's. The blank count cannot see a widget that draws
             // the **wrong** thing — `UsedCar.Car` answered every modifier with the car's name for a
             // long time and counted as drawn — so this is the other half of the measurement.
-            if std::env::var("NFS_SWEEP_DUMP").as_deref().is_ok_and(|v| v == "*" || v == name.as_str())
+            if nfs_game::config::cfg().nfs_sweep_dump.var().as_deref().is_ok_and(|v| v == "*" || v == name.as_str())
                 && let Some(l) = self.fe.layout_preview.as_ref()
             {
                 for e in &l.layout.elements {
@@ -197,14 +197,14 @@ impl App {
             // Every part expression the port cannot evaluate. `reference` answers `None` for a
             // name it does not know and every caller falls back silently, so a template rule the
             // port misses leaves no trace in the blank count.
-            if std::env::var("NFS_EXPR_SWEEP").is_ok()
+            if nfs_game::config::cfg().nfs_expr_sweep.var().is_ok()
                 && let Some(l) = self.fe.layout_preview.as_ref()
             {
                 for (class, part, key, expr) in l.expr_failures() {
                     *expr_fail.entry((class, part, key, expr)).or_insert(0usize) += 1;
                 }
             }
-            if std::env::var("NFS_BOX_SWEEP").is_ok()
+            if nfs_game::config::cfg().nfs_box_sweep.var().is_ok()
                 && let Some(l) = self.fe.layout_preview.as_ref()
             {
                 for (class, b, u) in l.box_disagreements() {
@@ -359,7 +359,7 @@ impl App {
         // A list of gaps that names things already done is the same failure as the blank count
         // reading an empty career, and it hid a real one underneath: `state_hidden_or_disabled`
         // was reading only the `.lay` attribute, so a widget hidden at run time stayed pressable.
-        if std::env::var("NFS_SWEEP_STATES").is_ok() {
+        if nfs_game::config::cfg().nfs_sweep_states.var().is_ok() {
             const KNOWN: [&str; 9] =
                 ["normal", "hover", "focused", "focusedhover", "selected", "selectedhover", "highlighty", "hidden", "disabled"];
             let mut miss: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = Default::default();
@@ -392,7 +392,7 @@ impl App {
                 println!("  {class:<32} {}", states.iter().cloned().collect::<Vec<_>>().join(", "));
             }
         }
-        if std::env::var("NFS_SWEEP_WHERE").is_ok() {
+        if nfs_game::config::cfg().nfs_sweep_where.var().is_ok() {
             println!("blank widgets by screen:");
             let mut ks: Vec<&String> = where_of.keys().collect();
             ks.sort();
@@ -485,7 +485,7 @@ impl App {
     /// what this port has on a machine with no pad. `NFS_FE_PAD=1` stands one in, all eight axes
     /// present and each a tenth of the way along, so `deadzone.lay` can be looked at without one.
     pub(crate) fn fe_pads(&self) -> Vec<nfs_game::layout::FePad> {
-        if std::env::var("NFS_FE_PAD").is_ok() {
+        if nfs_game::config::cfg().nfs_fe_pad.var().is_ok() {
             return vec![nfs_game::layout::FePad { analogue: true, axes: 0xFF, values: [32767; 8] }];
         }
         // `NFS_FE_DZ=<min>,<max>` puts the sixteen values somewhere other than the factory's
@@ -500,7 +500,7 @@ impl App {
     /// `NFS_FE_DZ=<min>,<max>` — the sixteen dead-zone values for a still, in the accessors' own
     /// 0…0x80. Without it they are the factory's 0 and 0x80 (0x51E546, 0x51E550).
     pub(crate) fn fe_deadzone() -> Option<[[i32; 2]; 8]> {
-        let v = std::env::var("NFS_FE_DZ").ok()?;
+        let v = nfs_game::config::cfg().nfs_fe_dz.var().ok()?;
         let (a, b) = v.split_once(',')?;
         let (a, b) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
         Some([[a, b]; 8])
@@ -556,7 +556,7 @@ pub(crate) static PLAY_INTRO: std::sync::atomic::AtomicBool = std::sync::atomic:
 /// (default 1280x800, the goldens' size) and `NFS_SHOT_SCALE=<s>` (default 1, the HiDPI factor the
 /// HUD's logical resolution is taken with, see [`App::hud_geometry`]).
 pub(crate) fn shot_geometry() -> (u32, u32, f32) {
-    let (w, h) = std::env::var("NFS_SHOT_SIZE")
+    let (w, h) = nfs_game::config::cfg().nfs_shot_size.var()
         .ok()
         .and_then(|v| {
             let (a, b) = v.split_once('x')?;
@@ -564,14 +564,14 @@ pub(crate) fn shot_geometry() -> (u32, u32, f32) {
         })
         .filter(|&(w, h)| w > 0 && h > 0)
         .unwrap_or((1280, 800));
-    let s = std::env::var("NFS_SHOT_SCALE").ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|s| *s >= 1.0).unwrap_or(1.0);
+    let s = nfs_game::config::cfg().nfs_shot_scale.var().ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|s| *s >= 1.0).unwrap_or(1.0);
     (w, h, s)
 }
 
 /// diagnostic: `NFS_CONE_LIMIT=n` gives the mission a cone **limit** of `n` (rule kind 0, which no
 /// shipped mission uses) — so `CONEPENALTY` is −1 and `HTime`'s sum can go below 0
 pub(crate) fn cone_limit_diagnostic(mut ms: career_ui::MissionStart) -> career_ui::MissionStart {
-    if let Some(n) = std::env::var("NFS_CONE_LIMIT").ok().and_then(|v| v.trim().parse::<u16>().ok()) {
+    if let Some(n) = nfs_game::config::cfg().nfs_cone_limit.var().ok().and_then(|v| v.trim().parse::<u16>().ok()) {
         ms.mission.cone_rule = Some(nfs_formats::career::ConeRule::Limit(n));
     }
     ms
@@ -594,7 +594,7 @@ pub(crate) fn race_finish_diagnostic() -> Option<u64> {
 fn race_place_spec() -> (Option<usize>, Option<u64>) {
     static SPEC: std::sync::OnceLock<(Option<usize>, Option<u64>)> = std::sync::OnceLock::new();
     *SPEC.get_or_init(|| {
-        let Ok(v) = std::env::var("NFS_RACE_PLACE") else { return (None, None) };
+        let Ok(v) = nfs_game::config::cfg().nfs_race_place.var() else { return (None, None) };
         let (p, t) = v.split_once(':').map_or((v.as_str(), None), |(p, t)| (p, Some(t)));
         let place = p.trim().parse::<usize>().ok().filter(|p| *p >= 1);
         (place, place.and(t.and_then(|t| t.trim().parse::<u64>().ok())))
@@ -628,7 +628,67 @@ pub(crate) enum ScriptedHudKey {
     Toggle(nfs_input::Action),
     Pause,
     PauseRestart,
+    /// **TEST GLUE** (`pausequit`): the pause, left through the pause menu's quit (`leave_race`)
+    PauseQuit,
+    /// **TEST GLUE** (`cam`): a key pressed and released on that tick, as one keystroke
+    Tap(nfs_input::Action),
     /// test glue for the network pad bytes (`NFS_HUD_KEYS`'s `horn` / `hornoff` / `reset`): a button pressed /
     /// released on that tick
     Pad(nfs_input::Action, bool),
+}
+
+impl App {
+    /// **TEST GLUE** `NFS_SHOT_TICKS=<prefix>@t1,t2,…` (with `NFS_FX_FRAMES`, whose drawn frames it
+    /// takes): the frame drawn at each of those game ticks of the **last** race of a scripted run —
+    /// not its replay — written as `<prefix>.t<tick>.png`, so a session's later race can be
+    /// compared still by still with a first race in a fresh process.
+    pub(crate) fn shot_at_tick(&mut self) {
+        let Ok(spec) = std::env::var("NFS_SHOT_TICKS") else { return };
+        let Some((path, ticks)) = spec.rsplit_once('@') else { return };
+        let replaying = self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted));
+        if self.session_races > 1 || replaying || !ticks.split(',').any(|t| t.trim().parse::<u64>().ok() == Some(self.tick)) {
+            return;
+        }
+        let out = format!("{path}.t{}.png", self.tick);
+        let (w, h, _) = shot_geometry();
+        if let Some(r) = self.renderer.as_mut()
+            && let Ok(rgba) = r.render_to_image(&self.scene, &self.camera, w, h)
+        {
+            image::save_buffer(&out, &rgba, w, h, image::ColorType::Rgba8).expect("write png");
+            tracing::info!(path = out, tick = self.tick, "NFS_SHOT_TICKS: still written");
+        }
+    }
+}
+
+/// The `NFS_HUD_KEYS` script, `tick:key,…` (moved here from `main`'s constructor so that a
+/// scripted session, `NFS_AUTOTEST_RACES`, can arm it again for every race: `App::rearm_hud_keys`).
+pub(crate) fn parse_hud_keys(s: &str) -> Vec<(u64, ScriptedHudKey)> {
+    s.split(',')
+        .filter_map(|e| {
+            let (t, k) = e.trim().split_once(':')?;
+            let a = match k.trim() {
+                "F5" | "f5" => ScriptedHudKey::Toggle(nfs_input::Action::ToggleHud),
+                "F6" | "f6" => ScriptedHudKey::Toggle(nfs_input::Action::ToggleRearView),
+                "F7" | "f7" => ScriptedHudKey::Toggle(nfs_input::Action::ToggleMap),
+                "F8" | "f8" => ScriptedHudKey::Toggle(nfs_input::Action::HudTransparency),
+                "2" => ScriptedHudKey::Toggle(nfs_input::Action::CycleMap),
+                // port diagnostic: the pause key, the menu left through its continue
+                // after 64 pause ticks (`App::scripted_pause`)
+                "pause" | "P" => ScriptedHudKey::Pause,
+                // port diagnostic: the pause key, the menu left through its restart
+                // (command 3, 0x415721) instead — `replay.md` §18.12
+                "pauserestart" => ScriptedHudKey::PauseRestart,
+                // test glue: the pause key, the menu left through its quit (`leave_race`)
+                "pausequit" => ScriptedHudKey::PauseQuit,
+                // test glue: one press of the camera key (`I_CYCLECAMERA`)
+                "cam" => ScriptedHudKey::Tap(nfs_input::Action::CameraNext),
+                // network test glue: the horn button held from that tick / released
+                "horn" => ScriptedHudKey::Pad(nfs_input::Action::Horn, true),
+                "hornoff" => ScriptedHudKey::Pad(nfs_input::Action::Horn, false),
+                "reset" => ScriptedHudKey::Pad(nfs_input::Action::Reset, true),
+                _ => return None,
+            };
+            Some((t.trim().parse().ok()?, a))
+        })
+        .collect()
 }

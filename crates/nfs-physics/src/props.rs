@@ -245,7 +245,8 @@ pub fn box_footprint(points: &[Vec3]) -> [Vec3; 4] {
     let local: Vec<Vec3> = points.iter().map(|p| *p - c).collect();
     // `glam`'s y rotation by the angle in degrees, as 0x539BD0 builds it; the same one turns the
     // corners back, so its sense does not matter
-    let rot = |deg: f32, v: Vec3| glam::Quat::from_rotation_y(deg.to_radians()) * v;
+    // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable rotation, not glam/std; original rotation builder 0x539BD0.
+    let rot = |deg: f32, v: Vec3| nfs_math::portable::quat_rotation_y(deg.to_radians()) * v;
     let mut angle = 0.0f32;
     let (mut best_area, mut best_angle, mut lo, mut hi) = (1.0e10f32, 0.0f32, Vec3::ZERO, Vec3::ZERO);
     while angle < 90.0 {

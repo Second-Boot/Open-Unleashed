@@ -77,10 +77,12 @@ pub fn decode_pack_mipped(path: &Path, data: &[u8]) -> Result<Vec<TextureImage>,
     decode_pack_levels(path, data, |file, width| file.min(build_levels(width)))
 }
 
-fn decode_pack_levels(path: &Path, data: &[u8], pick: impl Fn(u32, u32) -> u32) -> Result<Vec<TextureImage>, AssetError> {
+fn decode_pack_levels(path: &Path, data: &[u8], pick: impl Fn(u32, u32) -> u32 + Sync) -> Result<Vec<TextureImage>, AssetError> {
     let fsh = Fsh::parse(data).map_err(fmt_err(path))?;
-    let mut out = Vec::with_capacity(fsh.entries.len());
-    for (i, e) in fsh.entries.iter().enumerate() {
+    // every entry decodes on its own: a big pack (a track's 450 textures, mips and all) is cut
+    // into runs over worker threads and joined in file order
+    let decode_entry = |i: usize| -> Result<TextureImage, AssetError> {
+        let e = &fsh.entries[i];
         let levels = pick(e.blocks[0].mip_levels(), e.blocks[0].width as u32).max(1);
         let mut mips = Vec::with_capacity(levels as usize);
         let mut width = 0;
@@ -96,7 +98,7 @@ fn decode_pack_levels(path: &Path, data: &[u8], pick: impl Fn(u32, u32) -> u32) 
             mips.push(img.rgba);
         }
         let b = &e.blocks[0];
-        out.push(TextureImage {
+        Ok(TextureImage {
             name: e.name.clone(),
             width,
             height,
@@ -112,7 +114,25 @@ fn decode_pack_levels(path: &Path, data: &[u8], pick: impl Fn(u32, u32) -> u32) 
                 let end = data[start..].iter().position(|c| *c == 0).map(|n| start + n)?;
                 std::str::from_utf8(&data[start..end]).ok().map(str::to_string)
             }),
-        });
+        })
+    };
+    let n = fsh.entries.len();
+    let workers = if n < 32 { 1 } else { std::thread::available_parallelism().map_or(1, |w| w.get()).min(8) };
+    if workers <= 1 {
+        return (0..n).map(decode_entry).collect();
     }
-    Ok(out)
+    let chunk = n.div_ceil(workers);
+    let decode_entry = &decode_entry;
+    // PORT-DEVIATION D7 (RE/notes/PORT-DEVIATIONS.md): a big pack decodes on worker threads, joined in file order; the original loads sequentially (load steps 0x4A4A70).
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..n)
+            .step_by(chunk)
+            .map(|lo| s.spawn(move || (lo..(lo + chunk).min(n)).map(decode_entry).collect::<Result<Vec<_>, _>>()))
+            .collect();
+        let mut out = Vec::with_capacity(n);
+        for h in handles {
+            out.extend(h.join().expect("texture decode worker")?);
+        }
+        Ok(out)
+    })
 }

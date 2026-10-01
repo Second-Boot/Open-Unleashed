@@ -10,6 +10,7 @@ nfs-assets.workspace = true
 nfs-physics.workspace = true
 nfs-audio.workspace = true
 glam.workspace = true
+nfs-math.workspace = true
 nfs-renderer.workspace = true
 tracing.workspace = true
 anyhow.workspace = true

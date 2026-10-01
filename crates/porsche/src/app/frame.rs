@@ -6,10 +6,23 @@ impl App {
     /// Advance the screens, rebuild the scene and present it. **Both** redraw arms end here: the
     /// menu arm used to handle its keys and then ask for another redraw without ever drawing, which
     /// left the window blank for the whole front end.
+    // PORT-DEVIATION D5 (RE/notes/PORT-DEVIATIONS.md): NFS_RENDER_THREAD=1 moves encode/submit/present to a thread, off by default; the original renders through dx7z.dll on its main thread.
     pub(crate) fn draw_frame(&mut self) {
+        // the encode / submit / present of each frame on a render thread of its own (`nfs-renderer`'s
+        // `front.rs`), from the first live frame on: `NFS_RENDER_THREAD=1` on (default off: on a
+        // 120 Hz vsync-bound machine it adds frame-time jitter and gains nothing, `RE/notes/PERF.md` PH)
+        if let Some(r) = self.renderer.as_mut()
+            && !r.render_thread()
+            && nfs_game::config::cfg().nfs_render_thread.var().is_ok_and(|v| v.trim() != "0")
+        {
+            r.enable_render_thread();
+        }
         self.sync_save_side_state();
         // the front end's screens slide and fade in over half a second (`RE/notes/controls.md` §6)
-        let dt_ms = (self.frame_dt * 1000.0).round().clamp(0.0, 250.0) as u32;
+        // whole milliseconds, the fraction carried to the next frame so the clock's rate does not
+        // depend on the display's frame rate (the original reads a free-running timer, 0x53C2E0)
+        let (dt_ms, carry) = fe_step_ms(self.frame_dt, self.fe_ms_carry);
+        self.fe_ms_carry = carry;
         self.fe.ms += dt_ms as u64;
         // the garage screen's tick re-decides its buttons every frame (0x50F970), and the player
         // screens' tick theirs (0x510210)
@@ -220,7 +233,14 @@ impl App {
             r.set_fakesort_mode(fakesort_mode);
         }
         self.render_mirror();
-        if let Some(r) = self.renderer.as_mut()
+        // the front end's idle redraw (`idle.rs`): the frame the window already shows is not
+        // rendered or presented again
+        let idle = self.fe_frame_unchanged();
+        if nfs_game::config::cfg().nfs_fe_idle_verify.var_os().is_some() {
+            self.fe_idle_verify(idle);
+        }
+        if !idle
+            && let Some(r) = self.renderer.as_mut()
             && let Err(e) = r.render(&self.scene, &self.camera)
         {
             tracing::error!(error = %e, "render failed");
@@ -233,8 +253,39 @@ impl App {
             self.frames = 0;
             self.fps_timer = Instant::now();
         }
+        if idle {
+            self.idle_wait();
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
+        }
+    }
+}
+
+/// One frame's front-end clock step in whole milliseconds, with the fraction carried over:
+/// `(step, new carry)`. The step is capped at 250 ms as before.
+pub(crate) fn fe_step_ms(frame_dt: f32, carry: f32) -> (u32, f32) {
+    let want = frame_dt * 1000.0 + carry;
+    let ms = want.floor().clamp(0.0, 250.0) as u32;
+    (ms, (want - ms as f32).clamp(0.0, 1.0))
+}
+
+#[cfg(test)]
+mod fe_step_tests {
+    use super::fe_step_ms;
+
+    /// One second of wall time advances the front end's clock by 1000 ms at any frame rate
+    /// (the original's clock is the free-running 128 Hz timer, 0x53C2E0).
+    #[test]
+    fn clock_rate_is_frame_rate_independent() {
+        for fps in [30.0f32, 60.0, 75.0, 120.0, 144.0, 240.0] {
+            let (mut total, mut carry) = (0u32, 0.0f32);
+            for _ in 0..(fps as u32 * 10) {
+                let (ms, c) = fe_step_ms(1.0 / fps, carry);
+                total += ms;
+                carry = c;
+            }
+            assert!((9_995..=10_005).contains(&total), "{fps} fps: {total} ms in 10 s");
         }
     }
 }

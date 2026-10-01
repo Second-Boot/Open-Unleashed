@@ -9,7 +9,8 @@ pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
-/// The port's own data directory, the parent of `SaveData` and `career.json`.
+/// The port's own data directory, the parent of `SaveData` (and of the retired `career.json`,
+/// read once by the migration `nfs_game::save::migrate_legacy_json`).
 ///
 /// * macOS: `~/Library/Application Support/PorscheUnleashed`
 /// * Windows: `%APPDATA%\PorscheUnleashed`

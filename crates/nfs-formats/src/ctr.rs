@@ -55,29 +55,36 @@ pub struct Part {
 
 impl Part {
     pub fn kind(&self) -> PartKind {
-        match self.id.trim().to_ascii_uppercase().as_str() {
-            "DATA" => PartKind::Data,
-            "RECT" => PartKind::Rect,
-            "SHAPE" => PartKind::Shape,
-            "LOCALIZEDTEXT" => PartKind::LocalizedText,
-            "TEXT" => PartKind::Text,
-            _ => PartKind::Control,
+        let id = self.id.trim();
+        let is = |n: &str| id.eq_ignore_ascii_case(n);
+        if is("DATA") {
+            PartKind::Data
+        } else if is("RECT") {
+            PartKind::Rect
+        } else if is("SHAPE") {
+            PartKind::Shape
+        } else if is("LOCALIZEDTEXT") {
+            PartKind::LocalizedText
+        } else if is("TEXT") {
+            PartKind::Text
+        } else {
+            PartKind::Control
         }
     }
 
     /// `<key>.value` — the default for that key.
     pub fn value(&self, key: &str) -> Option<&str> {
-        self.fields.get(&format!("{}.value", key.to_lowercase())).map(|s| s.as_str())
+        crate::lc::with_lower(key, ".value", |k| self.fields.get(k).map(|s| s.as_str()))
     }
 
     /// `<key>.type` — `INT`, `STRING`, `COLOR`, …
     pub fn ty(&self, key: &str) -> Option<&str> {
-        self.fields.get(&format!("{}.type", key.to_lowercase())).map(|s| s.as_str())
+        crate::lc::with_lower(key, ".type", |k| self.fields.get(k).map(|s| s.as_str()))
     }
 
     /// `<key>.flags` — `HIDDEN`, `READONLY` or both.
     pub fn flags(&self, key: &str) -> Option<&str> {
-        self.fields.get(&format!("{}.flags", key.to_lowercase())).map(|s| s.as_str())
+        crate::lc::with_lower(key, ".flags", |k| self.fields.get(k).map(|s| s.as_str()))
     }
 
     /// The `.lay` key that overrides this attribute, and whether it may be overridden at all.
@@ -97,7 +104,7 @@ impl Part {
         if self.flags(key).is_some_and(|f| f.to_ascii_uppercase().contains("HIDDEN")) {
             return None;
         }
-        Some(match self.fields.get(&format!("{}.screenkey", key.to_lowercase())) {
+        Some(match crate::lc::with_lower(key, ".screenkey", |k| self.fields.get(k)) {
             Some(k) if !k.trim().is_empty() => k.trim().to_string(),
             _ => key.to_string(),
         })
@@ -120,11 +127,11 @@ pub struct Control {
 
 impl Control {
     pub fn value(&self, key: &str) -> Option<&str> {
-        self.fields.get(&format!("{}.value", key.to_lowercase())).map(|s| s.as_str())
+        crate::lc::with_lower(key, ".value", |k| self.fields.get(k).map(|s| s.as_str()))
     }
 
     pub fn part(&self, name: &str) -> Option<&Part> {
-        self.parts.get(&name.to_lowercase())
+        crate::lc::with_lower(name, "", |k| self.parts.get(k))
     }
 
     /// The `DATA` part — the one that holds the attributes a `.lay` block sets.
@@ -137,11 +144,11 @@ impl Control {
     /// Whether the file carries a `[state.<name>]` section for this state. A name it does not
     /// carry never reaches 0x525580, so the widget keeps the ctor's own full part list.
     pub fn has_state(&self, state: &str) -> bool {
-        self.states.contains_key(&state.to_lowercase())
+        crate::lc::with_lower(state, "", |k| self.states.contains_key(k))
     }
 
     pub fn state_parts(&self, state: &str) -> &[String] {
-        self.states.get(&state.to_lowercase()).map(|v| v.as_slice()).unwrap_or(&self.parts_order)
+        crate::lc::with_lower(state, "", |k| self.states.get(k)).map(|v| v.as_slice()).unwrap_or(&self.parts_order)
     }
 
     /// The default of a `DATA` attribute, e.g. `width` → `100`.
@@ -234,7 +241,7 @@ impl ControlLibrary {
     }
 
     pub fn get(&self, class: &str) -> Option<&Control> {
-        self.controls.get(&class.to_lowercase())
+        crate::lc::with_lower(class, "", |k| self.controls.get(k))
     }
 
     pub fn len(&self) -> usize {

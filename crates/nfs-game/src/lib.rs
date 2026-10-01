@@ -8,6 +8,7 @@ pub mod cameras;
 pub mod career;
 pub mod car_effects;
 pub mod carparts;
+pub mod config;
 pub mod cheats;
 pub mod dialog;
 pub mod end_of_era;

@@ -109,10 +109,10 @@ impl App {
     /// 0x600049E9 `FOGENABLE` off), and no depth writes. Neither has an `Am` op: the helper's
     /// layers are coords, colours, uv, texture, state and the draw (0x59F0A3…0x59F186), so
     /// `Headlights::LayerVertexLight_Ambient` is not on this path.
-    pub(crate) fn lamp_draws(&self, model: &CarModel, pos: Vec3, rot: Quat, ground: f32, slots: [(bool, f32); 14]) -> Vec<LampDraw> {
-        let mut out = Vec::new();
+    pub(crate) fn lamp_draws(&self, model: &CarModel, pos: Vec3, rot: Quat, ground: f32, slots: [(bool, f32); 14], out: &mut Vec<LampDraw>) {
+        out.clear();
         let Some((mesh, material)) = self.glare_draw else {
-            return out;
+            return;
         };
         let view = (self.camera.target - self.camera.position).normalize_or_zero();
         // the reflection's inputs, once per car: the sky manager's track B field 5 at the camera's
@@ -218,7 +218,6 @@ impl App {
                 out.push(LampDraw::Beam(v));
             }
         }
-        out
     }
 
     /// **0x451D60**, the lamp's reflection on the road (read 2026-09-26), gated by `[0x6197AA]` (the
@@ -269,10 +268,10 @@ impl App {
         renderer: Option<&mut Renderer>,
         pools: &LampPools,
         used: &mut [usize; 2],
-        draws: Vec<LampDraw>,
+        draws: &mut Vec<LampDraw>,
     ) {
         let mut renderer = renderer;
-        for d in draws {
+        for d in draws.drain(..) {
             match d {
                 LampDraw::Glare(item) => items.push(item),
                 LampDraw::Reflection(v, depth_bias) => {
@@ -333,7 +332,7 @@ impl App {
     /// toward the eye along its own ray, so it stays put on screen. *(Until 2026-09-26 the port
     /// lifted the quad 0.04 m instead and compared the ground at the vertex with the car's
     /// plane.)*
-    pub(crate) fn shadow_quad(&self, pos: Vec3, rot: Quat, half: Vec3) -> Option<(usize, Vec<nfs_renderer::Vertex>)> {
+    pub(crate) fn shadow_quad(&self, pos: Vec3, rot: Quat, half: Vec3, out: &mut Vec<nfs_renderer::Vertex>) -> Option<usize> {
         let w = self.world.as_ref()?;
         let body = [
             Vec3::new(-half.x, 0.0, -half.z),
@@ -343,7 +342,7 @@ impl App {
         ];
         // the corner table 0x611570 holds the body corners in their own order (stride 0x10); the
         // 3, 2, 0, 1 of 0x5CD5E8 is only the order slot 22 draws them in
-        let c: Vec<Vec3> = body.iter().map(|&b| pos + rot * b).collect();
+        let c: [Vec3; 4] = body.map(|b| pos + rot * b);
         let d2 = (pos - self.camera.position).length_squared();
         // 0x43B8DC…0x43B8EB: `fstp` to a float, then `fistp` — round to nearest even
         let k = ((d2 * 0.01).round_ties_even() as i64).min(6);
@@ -385,7 +384,8 @@ impl App {
         // precision), `fstp` to a float, `fistp` — round to nearest even
         let bias = ((-20000.0 * (far * z_near / (far - z_near)) as f64 / d2.max(1e-6) as f64) as f32).round_ties_even();
         let pull = -bias * (far - z_near) / 32768.0;
-        let (n_f, mut out) = (n as f32, Vec::with_capacity((n + 1) * (n + 1)));
+        let n_f = n as f32;
+        out.clear();
         // steps (entry 1 − entry 0) / n and (entry 3 − entry 0) / n (0x43B619…0x43B665); with n == 1
         // the grid is slot 22's four corners
         let (a, b) = (c[1] - c[0], c[3] - c[0]);
@@ -409,7 +409,7 @@ impl App {
                 out.push(nfs_renderer::Vertex { position: q.into(), normal: [0.0, 1.0, 0.0], uv: [j as f32 / n_f, i as f32 / n_f], color: [1.0; 4] });
             }
         }
-        Some((n, out))
+        Some(n)
     }
 
     /// Lays one car's shadow patch (`shadow_quad`) into the scene: each patch takes a dynamic mesh
@@ -423,13 +423,13 @@ impl App {
         pools: &mut [Vec<nfs_renderer::MeshId>; 7],
         used: &mut [usize; 7],
         material: nfs_renderer::MaterialId,
-        (n, verts): (usize, Vec<nfs_renderer::Vertex>),
+        (n, verts): (usize, &[nfs_renderer::Vertex]),
     ) {
         let Some(r) = renderer else { return };
         let pool = &mut pools[n];
         if pool.len() <= used[n] {
             let mut m = nfs_renderer::MeshData::default();
-            m.vertices = verts.clone();
+            m.vertices = verts.to_vec();
             let row = (n + 1) as u32;
             for i in 0..n as u32 {
                 for j in 0..n as u32 {
@@ -441,7 +441,7 @@ impl App {
         }
         let mesh = pool[used[n]];
         used[n] += 1;
-        r.write_mesh_vertices(mesh, &verts);
+        r.write_mesh_vertices(mesh, verts);
         // 0x43B820 builds its own primitive-helper `EAGL::Material` (0x59F070, vtable 0x5B3C94 —
         // the glares' and beams' helper, `particles.md` §4) with the default state object
         // `{1, 2, 0, 0, 0, −1}` from 0x5379F0 (gouraud, blending on) and a per-sprite depth bias at

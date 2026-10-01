@@ -187,6 +187,21 @@ impl App {
         tracing::info!(?a, keys = ?self.hud_keys, "HUD key");
     }
 
+    /// Which billboard is up this race frame (`billboard_key`): the pause menu (1), its quit
+    /// question (2), the results page open last frame (10 + page) or none; a billboard opening or
+    /// closing plays sound 4 (0x41ADD0).
+    pub(crate) fn billboard_key_frame(&mut self) {
+        let key = if self.paused {
+            if self.pause_confirm.is_some() { 2 } else { 1 }
+        } else {
+            self.results_billboard.map_or(0, |p| 10 + p)
+        };
+        if key != self.billboard_key {
+            self.billboard_key = key;
+            self.fe_sound(4);
+        }
+    }
+
     pub(crate) fn hud_dialog_up(&self) -> bool {
         self.paused
             || self.net_notice.is_some()
@@ -224,7 +239,7 @@ impl App {
         }
         // game type 3 skips the records page (0x4272F7 `cmp [0x6573E8], ebp; je 0x427345`, `ebp = 3` from
         // 0x426CCF): the queue goes on to the summary's timeout and nothing else
-        if self.hud_records.is_some() && self.fe.race_game_type != Some(3) {
+        if self.hud_records.is_some() && self.block_game_type() != Some(3) {
             pages.push(ResultPage::Records);
         }
         pages
@@ -455,7 +470,7 @@ impl App {
         }
         // `HCongrats` heads the queue for game types 0…4 that draw it; the finales, the mission and
         // the test drives have none
-        let game_type = self.fe.race_game_type.unwrap_or(0);
+        let game_type = self.block_game_type().unwrap_or(0);
         let finale = self.career.as_ref().and_then(|c| c.pending.as_ref()).is_some_and(|p| p.finale);
         let n_cars = self.road.opponents.len() + 1;
         let congrats = game_type <= 4 && self.mission.is_none() && !finale && self.fe.test_drive.is_none();

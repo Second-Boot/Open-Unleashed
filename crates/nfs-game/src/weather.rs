@@ -170,6 +170,7 @@ impl Emitter {
     pub fn new(params: Params, fe: &mut FeRng) -> Self {
         let mut sin = [0.0; 128];
         for (i, s) in sin.iter_mut().enumerate() {
+            // det-allow: rain flutter table, drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
             *s = (std::f32::consts::TAU * (i as f32 * 0.0078125)).sin();
         }
         let mut me = Self {

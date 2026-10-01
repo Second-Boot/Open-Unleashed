@@ -235,7 +235,8 @@ impl Vehicle {
             roll -= d;
         }
         if flag != 2 {
-            let (sr, cr) = (roll * std::f32::consts::TAU).sin_cos();
+            // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable sin/cos, not std; original x87 in the roll block 0x49488C…0x4948D5.
+            let (sr, cr) = nfs_math::portable::sin_cosf(roll * std::f32::consts::TAU);
             let u = Vec3::new(-sr * self.half_extents.x, -cr * self.half_extents.y, 0.0);
             self.position.y += (u.x * o.row(0).y + u.y * o.row(1).y) * 0.031_25;
         }

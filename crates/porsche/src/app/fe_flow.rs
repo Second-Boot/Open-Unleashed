@@ -220,7 +220,7 @@ impl App {
         // a still — the way `NFS_FE_PARTS` opens the car's parts
         if self.fe.dialog.is_none()
             && !self.fe.dialog_forced
-            && let Some(id) = std::env::var("NFS_FE_DIALOG").ok().and_then(|v| v.parse::<u32>().ok())
+            && let Some(id) = nfs_game::config::cfg().nfs_fe_dialog.var().ok().and_then(|v| v.parse::<u32>().ok())
         {
             self.fe.dialog_forced = true;
             let text = self.fe.strings.get(id).unwrap_or_default().to_string();
@@ -231,7 +231,7 @@ impl App {
         // `NFS_FE_DIALOG=input:<FEStrings id>:<typed>` — the input dialog with that text typed
         if self.fe.dialog.is_none()
             && !self.fe.dialog_forced
-            && let Some(spec) = std::env::var("NFS_FE_DIALOG").ok().and_then(|v| v.strip_prefix("input:").map(str::to_string))
+            && let Some(spec) = nfs_game::config::cfg().nfs_fe_dialog.var().ok().and_then(|v| v.strip_prefix("input:").map(str::to_string))
         {
             self.fe.dialog_forced = true;
             let (id, typed) = spec.split_once(':').unwrap_or((&spec, ""));

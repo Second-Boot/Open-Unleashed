@@ -112,6 +112,7 @@ impl FeRng {
 
     /// Seeded from the wall clock, the way the front end does it.
     pub fn from_clock() -> Self {
+        // det-allow: the original seeds the FE RNG from the clock; FE picks, not the race simulation
         let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0);
         Self::new(t)
     }

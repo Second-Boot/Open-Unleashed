@@ -37,12 +37,11 @@ fn career_round_trips_through_the_original_format() {
             completed: true,
             completions: 2,
             events: vec![EventResult { position: 1, prize: 5000, bonus: 2500, points: [8, 7, 6, 5, 4, 3, 2, 1], earned: [7500, 3000, 2000, 1500, 1000, 800, 600, 400], times: [10_000, 10_500, 11_000, 0, 0, 0, 0, 0], event: Some(1) }],
-            final_rank: Some(1),
-            prize: 20_000,
-            failed_attempts: 0,
         },
     );
     c.missions = t.missions.iter().enumerate().map(|(i, _)| if i == 3 { 1 } else { 0 }).collect();
+    // record 3's promotion taken: `fac+0xC = −1` (0x51AF80)
+    c.prize_taken = t.missions.iter().enumerate().map(|(i, _)| i == 3).collect();
 
     let p = Profile::new("Hans", 3);
     let sav = career_to_sav(&c, &t, &p);
@@ -107,6 +106,11 @@ fn career_round_trips_through_the_original_format() {
     assert_eq!(back.garage[0].asking_price, owned.asking_price);
     assert_eq!(back.garage[0].offer, owned.offer);
     assert_eq!(back.missions, c.missions);
+    assert_eq!(back.prize_taken, c.prize_taken, "the taken promotion rides in the Missions image");
+    let fac = parsed.missions.as_ref().unwrap();
+    let rec = nfs_formats::career::MISSION_RECORD_SIZE;
+    assert_eq!(&fac[3 * rec + 0xC..3 * rec + 0x10], &[0xFF; 4]);
+    assert_eq!(&fac[2 * rec + 0xC..2 * rec + 0x10], &t.raw.fac[2 * rec + 0xC..2 * rec + 0x10], "the others keep their text id");
     assert!(!back.seen_evolution_intro);
     let mut seen = parsed.clone();
     seen.player.as_mut().unwrap().seen_evolution_intro = 1;
@@ -148,6 +152,8 @@ fn the_embedded_tables_are_the_shipped_images() {
     assert_eq!(sav.tournament.as_ref().unwrap().table.len(), t.raw.trn.len());
     // A default career writes no results, so both images come back unchanged.
     assert_eq!(sav.missions.as_deref(), Some(t.raw.fac.as_slice()));
+    // …and no shipped record reads as a taken promotion (every `+0xC` is a text id)
+    assert!(career_from_sav(&sav, &t).prize_taken.iter().all(|x| !x));
     assert_eq!(sav.tournament.as_ref().unwrap().table, t.raw.trn);
     assert_eq!(sav.tournament.as_ref().unwrap().year, 1950);
     assert_eq!(sav.tournament.as_ref().unwrap().era_type, 521);
@@ -669,4 +675,169 @@ fn the_first_time_flags_and_custom_colours_come_back() {
     let back = career_from_sav(&parsed, &t);
     assert!(back.seen_factory_welcome && back.seen_first_mission && !back.seen_evolution_intro);
     assert_eq!(back.custom_colours, c.custom_colours);
+}
+
+/// The ten body-damage zones a garage car was parked with live at `FECar+0x6A8` (the park
+/// 0x4EDD40 stores them, 0x4EDD83; the launch reads them for option 0x14D, 0x4EF420…0x4EF459) and
+/// travel with the flat image Save 0x4EE8D0 / Load 0x4EE6A0 copy — so a front-end entry's reload
+/// (0x4D3B52) keeps the dents. *(Until 2026-10-01 the port wrote and read 0 there — EV1 audit.)*
+#[test]
+fn the_parked_zones_ride_in_the_car_image() {
+    let Some(t) = tables() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let car_id = t.catalog.iter().find(|c| !c.sim.is_empty() && !c.paint_sets.is_empty()).unwrap().id;
+    let mut c = Career::default();
+    let mut owned = OwnedCar::new(car_id, 0, 0);
+    owned.damage = [18.05, 17.5, 16.9, 10.4, 3.87, 7.74, 3.87, 10.96, 0.0, 0.25];
+    c.garage.push(owned.clone());
+    let parsed = SaveFile::parse(&career_to_sav(&c, &t, &Profile::new("Hans", 0)).write()).unwrap();
+    let img = &parsed.player.as_ref().unwrap().cars[0];
+    let f = |o: usize| f32::from_le_bytes([img.image[o], img.image[o + 1], img.image[o + 2], img.image[o + 3]]);
+    assert_eq!(f(car::ZONE_DAMAGE), 18.05);
+    assert_eq!(f(car::ZONE_DAMAGE + 9 * 4), 0.25);
+    assert_eq!(car::ZONE_DAMAGE + 40, car::SETUP, "the ten zones end where the setup floats begin");
+    assert_eq!(career_from_sav(&parsed, &t).garage[0].damage, owned.damage);
+}
+
+/// Stage 1's records passed one by one: the race that finishes the stage is the one 0x51AF90
+/// offers the promotion after (`[0x69C8F0]` = that record, the first unpassed record now of
+/// stage 2), and only that one.
+fn finish_stage_one(c: &mut Career, t: &CareerTables) -> usize {
+    let stage1: Vec<usize> = t.missions.iter().enumerate().filter(|(_, m)| m.stage == t.missions[0].stage).map(|(i, _)| i).collect();
+    for (k, &i) in stage1.iter().enumerate() {
+        let due = c.record_mission(t, i, true);
+        assert_eq!(due.is_some(), k + 1 == stage1.len(), "offered after the stage's last record only (record {i})");
+    }
+    *stage1.last().unwrap()
+}
+
+/// An accepted Factory Driver promotion is `fac+0xC = −1` on the record whose race
+/// finished the stage (0x51AF80 from `ACCEPTPRIZECAR` 0x51A6D0), saved and loaded with the whole
+/// `nfs5.fac` image (`Missions`, 0x51A870 / 0x51A760); the offer test 0x51AF90 keys on the record
+/// the last mission race filed, so after a profile reload (every front-end entry, 0x4D3B52) the
+/// next mission race offers nothing — accepted or declined. *(Until 2026-10-01 the port kept the
+/// accepted stages in its JSON only and offered stage 1's car again after the next race.)*
+#[test]
+fn a_promotion_is_offered_once_and_its_acceptance_rides_in_the_save() {
+    let Some(t) = tables() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    for accept in [true, false] {
+        let mut c = Career::default();
+        let last = finish_stage_one(&mut c, &t);
+        let due = c.promotion_due(&t).expect("due after the stage's last race");
+        assert_eq!(due.prize_car, t.missions[last].prize_car, "R's own `+0x10` (0x51B050)");
+        let cars = c.garage.len();
+        if accept {
+            let car = c.accept_promotion(&t).expect("accepted");
+            assert_eq!(car as i16, t.missions[last].prize_car);
+            assert_eq!(c.garage.len(), cars + 1);
+            assert!(c.promotion_due(&t).is_none(), "`+0xC = −1` answers no (0x51AFFA)");
+        }
+        // the launch save, then the next front-end entry's reload
+        let sav = SaveFile::parse(&career_to_sav(&c, &t, &Profile::new("Hans", 0)).write()).unwrap();
+        let mut back = career_from_sav(&sav, &t);
+        assert_eq!(back.prize_taken.get(last).copied().unwrap_or(false), accept);
+        assert_eq!(back.last_mission, None, "`[0x69C8F0]` is not in the save");
+        assert!(back.promotion_due(&t).is_none(), "nothing raced since the load");
+        // the next mission race: stage 2's first record
+        let next = back.current_mission(&t).unwrap();
+        assert_ne!(t.missions[next].stage, t.missions[last].stage);
+        back.record_mission(&t, next, true);
+        assert!(back.promotion_due(&t).is_none(), "stage 1's promotion is not offered again (accept = {accept})");
+        back.record_mission(&t, next, false);
+        assert!(back.promotion_due(&t).is_none(), "nor after a failed race");
+    }
+}
+
+/// The original's own corner, ported as it is: with every record passed, 0x51AE80 relaunches
+/// record 0 and 0x51AEF0 files it as R; with no unpassed record left 0x51AF90 answers yes unless
+/// record 0's `+0xC` is −1 — so a passed replay of record 0 offers record 0's prize car once.
+#[test]
+fn every_mission_passed_replays_record_zero_with_its_own_offer() {
+    let Some(t) = tables() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let mut c = Career::default();
+    for i in 0..t.missions.len() {
+        c.record_mission(&t, i, true);
+    }
+    assert!(c.current_mission(&t).is_none());
+    c.record_mission(&t, 0, true);
+    let due = c.promotion_due(&t).expect("record 0's +0xC is a text id");
+    assert_eq!(due.prize_car, t.missions[0].prize_car);
+    c.accept_promotion(&t);
+    c.record_mission(&t, 0, true);
+    assert!(c.promotion_due(&t).is_none(), "taken once");
+}
+
+fn legacy_json(c: &Career, stages: &[i16]) -> Vec<u8> {
+    let mut v = serde_json::to_value(c).unwrap();
+    v["promotions_accepted"] = serde_json::json!(stages);
+    v["eras_completed"] = serde_json::json!([]);
+    v["finale"] = serde_json::Value::Null;
+    serde_json::to_vec(&v).unwrap()
+}
+
+/// The one-time migration of the retired `career.json` (`save::migrate_legacy_json`): the accepted
+/// stages fold into the profile's `.sav` as `fac+0xC = −1` on each stage's last record, every
+/// other byte of the file stays, the JSON is set aside, and a second start finds nothing to do; a
+/// JSON of another career is not folded; a profile without a `.sav` gets one from the JSON.
+#[test]
+fn the_legacy_json_is_folded_into_the_sav_once() {
+    use nfs_game::save::{migrate_legacy_json, read_profile, write_profile, Migration};
+    let Some(t) = tables() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("nfs-migrate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = Profile::new("Hans", 8);
+    let json = dir.join("career.json");
+    let mut c = Career::default();
+    let last = finish_stage_one(&mut c, &t);
+    c.last_mission = None;
+    c.money = 54_321;
+    // the profile as the launch saved it, the JSON beside it with the accepted stage
+    write_profile(&dir, &p, &career_to_sav(&c, &t, &p)).unwrap();
+    let before = std::fs::read(p.path(&dir)).unwrap();
+    std::fs::write(&json, legacy_json(&c, &[t.missions[last].stage])).unwrap();
+    assert_eq!(migrate_legacy_json(&json, &dir, &p, &t), Migration::Folded { marks: 1 });
+    assert!(!json.exists() && dir.join("career.json.migrated").exists(), "set aside, kept");
+    let after = std::fs::read(p.path(&dir)).unwrap();
+    assert_eq!(after.len(), before.len());
+    let rec = nfs_formats::career::MISSION_RECORD_SIZE;
+    // `Missions` is the first module: its name, a u32 size, then the image
+    let fac_at = b"Missions\0".len() + 4;
+    let differ: Vec<usize> = (0..after.len()).filter(|&i| after[i] != before[i]).collect();
+    assert!(!differ.is_empty() && differ.iter().all(|&i| (fac_at + last * rec + 0xC..fac_at + last * rec + 0x10).contains(&i)), "only R's +0xC moved: {differ:?}");
+    let back = career_from_sav(&read_profile(&dir, &p).unwrap(), &t);
+    assert!(back.prize_taken[last]);
+    assert_eq!(back.money, 54_321);
+    assert_eq!(migrate_legacy_json(&json, &dir, &p, &t), Migration::None, "one time");
+
+    // another career's JSON (different Factory Driver results) is not folded
+    std::fs::write(&json, legacy_json(&Career::default(), &[1, 2])).unwrap();
+    let q = Profile::new("Greta", 3);
+    write_profile(&dir, &q, &career_to_sav(&c, &t, &q)).unwrap();
+    assert_eq!(migrate_legacy_json(&json, &dir, &q, &t), Migration::Mismatch);
+    assert!(career_from_sav(&read_profile(&dir, &q).unwrap(), &t).prize_taken.iter().all(|x| !x));
+
+    // no `.sav` yet: built from the JSON
+    std::fs::write(&json, legacy_json(&c, &[t.missions[last].stage])).unwrap();
+    let r = Profile::new("Otto", 1);
+    assert_eq!(migrate_legacy_json(&json, &dir, &r, &t), Migration::Created);
+    let made = career_from_sav(&read_profile(&dir, &r).unwrap(), &t);
+    assert_eq!((made.money, made.missions.clone(), made.prize_taken[last]), (54_321, c.missions.clone(), true));
+
+    // an unreadable JSON is set aside unread
+    std::fs::write(&json, b"{ not json").unwrap();
+    assert_eq!(migrate_legacy_json(&json, &dir, &r, &t), Migration::Unreadable);
+    assert!(!json.exists());
+    let _ = std::fs::remove_dir_all(&dir);
 }

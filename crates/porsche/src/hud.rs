@@ -37,6 +37,18 @@ pub(crate) struct HudText {
     pub(crate) tach_scale: f32,
 }
 
+/// One string's layout in its font ([`Hud::text_run`]): the glyph quads in font texels
+/// (`BitmapFont::place`) and the measured width (`BitmapFont::measure`'s `.0`).
+pub(crate) struct TextRun {
+    /// 0 `UniversC12b`, 1 `unviers9b`, 2 `unviers9bi`
+    pub(crate) font: u8,
+    /// the height the run is drawn at when the size class fixes it (the small and italic fonts'
+    /// own line heights, the italic's fallback `FONT_SMALL`); `None`: the caller's `h`
+    pub(crate) fixed_h: Option<f32>,
+    pub(crate) glyphs: Vec<nfs_game::text::PlacedGlyph>,
+    pub(crate) width: f32,
+}
+
 pub(crate) struct Hud {
     /// `HTray`'s fill: a 1 × 2 texture, black at alpha 63 over black at 255, sampled between the
     /// texel centres so the quad runs top to bottom from one to the other (see [`Hud::tray`])
@@ -106,6 +118,24 @@ pub(crate) struct Hud {
     /// the route the map draws, and the transform of the last frame (`[cx, cz, scale, fx, fz]`)
     pub(crate) map_route: Vec<(f32, f32)>,
     pub(crate) map_frame: std::cell::Cell<[f32; 5]>,
+    /// The route's pixel endpoints the map texture was last drawn from, so [`Hud::map_update`]
+    /// redraws and re-uploads only when one of them moved (performance work A9, 2026-10-01). The
+    /// picture is a pure function of them (and the constant grid), so equal endpoints are the same
+    /// pixels already in the texture. Reset by `set_map`.
+    pub(crate) map_drawn: std::cell::RefCell<Option<Vec<(i32, i32)>>>,
+    /// the buffer the next frame's endpoints are computed into
+    pub(crate) map_scratch: std::cell::RefCell<Vec<(i32, i32)>>,
+    /// The laid-out glyph runs of the strings the HUD draws, per size class (`FONT_SMALL`,
+    /// `FONT_ITALIC`, any other height), so a string drawn again is not laid out or measured again
+    /// (performance work PG, 2026-10-01; see [`Hud::text_run`]).
+    pub(crate) text_runs: std::cell::RefCell<[std::collections::HashMap<String, std::rc::Rc<TextRun>>; 3]>,
+    /// The grid layer of the map picture (it never changes): built once, copied into each redraw.
+    pub(crate) map_grid: std::cell::OnceCell<Vec<u8>>,
+    /// the picture last uploaded, kept only under `NFS_MAP_VERIFY` (see `map_update`)
+    pub(crate) map_check: std::cell::RefCell<Option<Vec<u8>>>,
+    /// the picture's buffer, kept between redraws (`map_update` draws into it in place; the upload
+    /// copies it into the renderer's staging bytes)
+    pub(crate) map_tex: std::cell::RefCell<Option<TextureData>>,
     /// `HReplay`'s twelve glyphs from `DashHud/replay.fsh`, by the file's own index
     /// (`RE/notes/hud.md` §5.2): 0 cam, 1 paus, 2 quit, 3 rest, 4 Irac, 5…8 the speed steps,
     /// 9 save, 10 next, 11 play.
@@ -465,7 +495,7 @@ pub(crate) fn step_slide((mut st, mut stamp): (u8, u64), clock: u64, before_star
     }
     // diagnostic: `NFS_TRAYS_IN=1` puts the trays in place at once — `--screenshot` renders too
     // few frames to watch a slide finish
-    if st == 1 && std::env::var("NFS_TRAYS_IN").is_ok() {
+    if st == 1 && nfs_game::config::cfg().nfs_trays_in.var().is_ok() {
         stamp = clock.saturating_sub(11);
     }
     if clock.saturating_sub(stamp) >= 11 {

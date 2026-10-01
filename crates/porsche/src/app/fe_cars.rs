@@ -196,8 +196,12 @@ impl App {
         let name = match othersource {
             Some("FactoryDriver") => "FactoryDriver.Car",
             Some("EndOfEra") => "PrizeCars.Car",
-            // `0x51B050` reads the current factory record's `+0x10`, the prize car of the stage the
-            // player has just finished, and 0x4F4360 looks it up in the master list.
+            // `0x51B050` reads `+0x10` of `[0x69C8F0]` — the record the last mission race filed
+            // (`Career::last_mission`), whose race finished the stage — and 0x4F4360 looks it up
+            // in the master list. Before any mission race that pointer is 0 (the original would
+            // read address 0x10); the port shows the current mission's record instead
+            // (APPROXIMATION, unreachable from the shipped screens: the prize screen opens only
+            // after a mission race).
             //
             // `FactoryVictory.lay`'s `NFS5.3DCAR` asks for the same thing under an accessor name —
             // `FDPrizeCars.Car`, which 0x4F2053 registers and 0x51A3E0 builds as a car accessor of
@@ -206,11 +210,7 @@ impl App {
             // an inference from the screen it is on and the name it carries. **MEDIUM.**
             Some("FactoryDriverPrize") => {
                 let c = self.career.as_ref()?;
-                let m = c.career.promotion_due(&c.tables).or_else(|| {
-                    c.career
-                        .current_mission(&c.tables)
-                        .map(|i| &c.tables.missions[i])
-                })?;
+                let m = c.career.last_mission.or_else(|| c.career.current_mission(&c.tables)).and_then(|i| c.tables.missions.get(i))?;
                 return c.tables.car(m.prize_car as u16);
             }
             // `0x50E6B0` hands back `[0x699FE0]`, the accessor the button that opened the compare

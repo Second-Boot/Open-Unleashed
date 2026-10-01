@@ -15,6 +15,7 @@ pub mod librand;
 pub mod mixer;
 pub mod music;
 pub mod resample;
+mod rt;
 pub mod reverb;
 pub mod sfx;
 pub mod slots;

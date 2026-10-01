@@ -183,7 +183,8 @@ const SIGN_HALF_DEPTH: f32 = 0.15;
 /// vertices are the port's article meshes (the original reads the `vt` of the LOD record
 /// `Base+0x64 + 12·Base[+4]`, 0x476BA6…0x476C1E).
 pub fn sign_point_cloud(vertices: &[Vec3], axis_lengths: Vec3) -> Vec<Vec3> {
-    let turn = glam::Quat::from_rotation_x(90f32.to_radians());
+    // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable rotation, not glam/std; original smackable set-up 0x476BA6…0x476E72.
+    let turn = nfs_math::portable::quat_rotation_x(90f32.to_radians());
     let turned: Vec<Vec3> = vertices.iter().map(|v| turn * (*v * axis_lengths)).collect();
     let hull = hull_xz_points(&turned);
     let back = turn.inverse();

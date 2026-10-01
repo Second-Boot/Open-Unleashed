@@ -20,9 +20,12 @@
 //! the `nfs5.car` record), plus an `accessor` block holding the values the port actually has
 //! (§6.2a gives the class, and so the payload shape, of all 223 statically registered names). A subset is
 //! legal: the original looks every name up in its own registry and anything absent keeps its
-//! default (§9.6). Because a few port-side bookkeeping fields still have no home in the format
-//! (see [`career_from_sav`]), the port's own JSON career remains the live save and the `.sav` is
-//! written beside it.
+//! default (§9.6).
+//!
+//! **The `.sav` is the only career save** (2026-10-01): start-up and every front-end entry
+//! read the career from it ([`load_profile_career`]), as the original's `LoadInfo` does. The port's
+//! own JSON career of before (`career.json`) is folded in once by [`migrate_legacy_json`] and
+//! renamed; nothing writes it any more.
 
 use crate::career::{Career, CareerTables, EventResult, OwnedCar, TournamentState};
 use nfs_formats::career::{Era, MISSION_RECORD_SIZE, PART_RECORD_SIZE, TOURNAMENT_RECORD_SIZE};
@@ -174,6 +177,12 @@ pub mod car {
     /// 1 = the player's car, 0 = a used-car-market car.
     pub const OWNED: usize = 0x6A0;
     pub const PURCHASE_PRICE: usize = 0x6A4;
+    /// The ten body-damage zones the car was parked with (f32): the park 0x4EDD40 stores the
+    /// race's result record `+0x1C4…` here (0x4EDD74…0x4EDD89, `[FECar + 0x4E4 + 0x1C4 + 4k]`),
+    /// the launch hands them to the race as option 0x14D (0x4EF420…0x4EF459, zero for game types
+    /// 0…3 and 9), and Save 0x4EE8D0 / Load 0x4EE6A0 move them with the rest of the flat 0x758-byte
+    /// image (`rep movsd`, 0x1D6 dwords, 0x4EE8E4 / 0x4EE76A). Ends where `SETUP` begins.
+    pub const ZONE_DAMAGE: usize = 0x6A8;
     /// The 17 setup floats and the backup the setup screen restores from (`career.md` §12); the two
     /// blocks end exactly at the 0x758-byte image.
     pub const SETUP: usize = 0x6D0;
@@ -226,6 +235,11 @@ fn car_image(tables: &CareerTables, c: &OwnedCar, players: bool) -> SavedCar {
     // only those
     car.set_field_u8(car::OWNED, u8::from(players));
     car.set_field_u32(car::PURCHASE_PRICE, c.purchase_price);
+    // the zones the car was parked with (`car::ZONE_DAMAGE`); until 2026-10-01 the port left them
+    // 0, so every front-end entry's reload (0x4D3B52) undented the garage car — EV1 audit
+    for (i, z) in c.damage.iter().enumerate() {
+        car.set_field_u32(car::ZONE_DAMAGE + i * 4, z.to_bits());
+    }
     // the setup and the copy the screen's "cancel" restores from (0x4EF4C0/0x4EF4E0)
     for (i, v) in c.setup.iter().enumerate() {
         car.set_field_u32(car::SETUP + i * 4, v.to_bits());
@@ -291,9 +305,10 @@ fn owned_from_image(tables: &CareerTables, car: &SavedCar) -> OwnedCar {
         stock: car.removed.iter().filter(known).map(|p| (p.id as i16, p.state)).collect(),
         mileage: car.field_u32(car::MILEAGE),
         wins: car.field_u32(car::WINS),
-        // the container carries the damage a car has taken as the state of each of its parts
+        // the damage figure is rebuilt from the parts' states below (0x4EF960)
         damage_pct: 0.0,
-        damage: [0.0; 10],
+        // the parked zones, `car::ZONE_DAMAGE` (0x4EE6A0's flat copy)
+        damage: std::array::from_fn(|i| f32::from_bits(car.field_u32(car::ZONE_DAMAGE + i * 4))),
         part_state: car.installed.iter().filter(known).map(|p| (p.id as i16, p.state)).collect(),
         setup: std::array::from_fn(|i| f32::from_bits(car.field_u32(car::SETUP + i * 4))),
         setup_backup: std::array::from_fn(|i| f32::from_bits(car.field_u32(car::SETUP_BACKUP + i * 4))),
@@ -410,19 +425,31 @@ fn tournaments_from_table(tables: &CareerTables, table: &[u8]) -> std::collectio
             events.push(r);
         }
         if completed || !events.is_empty() {
-            out.insert(tour.id, TournamentState { entered: !events.is_empty(), events, completed, completions, final_rank: None, prize: 0, failed_attempts: 0 });
+            out.insert(tour.id, TournamentState { entered: !events.is_empty(), events, completed, completions });
         }
     }
     out
 }
 
-/// The `nfs5.fac` image with the per-mission result marker at `fac+0xE8` patched in.
+/// `fac+0xC`, the record's promotion text id; −1 once its prize was taken (0x51AF80).
+const FAC_PROMOTION: usize = 0x0C;
+/// `fac+0xE8`, the result of the record's last attempt (0x51AF45).
+const FAC_RESULT: usize = 0xE8;
+
+/// The `nfs5.fac` image with the per-mission result marker at `fac+0xE8` and the taken-promotion
+/// mark `fac+0xC = −1` (0x51AF80, [`Career::prize_taken`]) patched in.
 fn mission_table(tables: &CareerTables, c: &Career) -> Vec<u8> {
     let mut f = tables.raw.fac.clone();
     for (i, r) in c.missions.iter().enumerate() {
-        let at = i * MISSION_RECORD_SIZE + 0xE8;
+        let at = i * MISSION_RECORD_SIZE + FAC_RESULT;
         if at + 2 <= f.len() {
             put_i16(&mut f, at, *r);
+        }
+    }
+    for (i, _) in c.prize_taken.iter().enumerate().filter(|(_, t)| **t) {
+        let at = i * MISSION_RECORD_SIZE + FAC_PROMOTION;
+        if at + 4 <= f.len() {
+            put_u32(&mut f, at, u32::MAX);
         }
     }
     f
@@ -889,11 +916,12 @@ fn spare_records(tables: &CareerTables, c: &Career) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Read back what the original's format can hold. Port-side bookkeeping the format has no field
-/// for is lost and left at its default: a car's ten zone damages (the damage figure is rebuilt
-/// from its parts, 0x4EF960), a tournament's
-/// `final_rank` / `prize` / `failed_attempts` and
-/// `promotions_accepted`. That is why the port's JSON career, not this file, is the live save.
+/// Read the career back the way `LoadInfo` 0x4DE9B0 hands the modules to their loaders:
+/// `PlayerInfo` 0x501610, `UsedCarMarket` 0x4F7750, `Tournament` 0x5029F0, `PartsMarket` 0x517810,
+/// `Missions` 0x51A760 and the accessor block 0x4B7FD0. Every field of [`Career`] has its home
+/// here (2026-10-01, the last port-only ones were either found — the taken promotion is
+/// `fac+0xC` — or removed as no field of the original); `TournamentState::entered` and
+/// `OwnedCar::damage_pct` are derived.
 pub fn career_from_sav(s: &SaveFile, tables: &CareerTables) -> Career {
     let mut c = Career::default();
     if let Some(p) = &s.player {
@@ -945,10 +973,114 @@ pub fn career_from_sav(s: &SaveFile, tables: &CareerTables) -> Career {
             .map(|r| crate::shop::SparePart { id: get_i16(r, 0), state: f32::from_le_bytes([r[0x164], r[0x165], r[0x166], r[0x167]]) })
             .collect();
     }
+    // 0x51A760 copies the whole table back over `[0x69C8E8]`: the results `+0xE8` and the
+    // promotion marks `+0xC` with it
     if let Some(m) = &s.missions {
-        c.missions = (0..m.len() / MISSION_RECORD_SIZE).map(|i| get_i16(m, i * MISSION_RECORD_SIZE + 0xE8)).collect();
+        let n = m.len() / MISSION_RECORD_SIZE;
+        c.missions = (0..n).map(|i| get_i16(m, i * MISSION_RECORD_SIZE + FAC_RESULT)).collect();
+        c.prize_taken = (0..n).map(|i| get_u32(m, i * MISSION_RECORD_SIZE + FAC_PROMOTION) == u32::MAX).collect();
     }
     c
+}
+
+/// `SaveData\<stem>.sav` parsed, or `None` when it is missing or does not parse (`LoadInfo`'s
+/// false, 0x4DE9B0).
+pub fn read_profile(dir: &Path, profile: &Profile) -> Option<SaveFile> {
+    std::fs::read(profile.path(dir)).ok().and_then(|d| SaveFile::parse(&d).ok())
+}
+
+/// **The one career load** — start-up and every front-end entry (0x4D3B52) alike: the profile's
+/// `.sav` through [`career_from_sav`]. `None` when there is no file to load.
+pub fn load_profile_career(dir: &Path, profile: &Profile, tables: &CareerTables) -> Option<(Career, SaveFile)> {
+    let s = read_profile(dir, profile)?;
+    Some((career_from_sav(&s, tables), s))
+}
+
+/// What [`migrate_legacy_json`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Migration {
+    /// No `career.json`: nothing to do (every start after the first).
+    None,
+    /// The profile's `.sav` was kept; `marks` promotion marks (`fac+0xC = −1`) were folded into it.
+    Folded { marks: usize },
+    /// The JSON belongs to another career than the profile's `.sav` (their Factory Driver results
+    /// differ): the `.sav` was kept as it is.
+    Mismatch,
+    /// The profile had no `.sav`: one was written from the JSON career.
+    Created,
+    /// The JSON did not parse; it was set aside unread.
+    Unreadable,
+}
+
+/// **Port-only, one-time migration** of the retired JSON career (`career.json`, the port's live
+/// save until 2026-10-01) into the profile's `.sav`, which is now the only career save:
+///
+/// * the JSON was written at the same three save sites as the `.sav` (the launch 0x4D52EA,
+///   `LOADGAMEBUTTON`, the profile creation) and by every profile load, so where the profile has
+///   a `.sav` it is never older than the JSON; the only JSON content it lacks is the accepted
+///   promotion stages, folded in as `fac+0xC = −1` on each stage's last record
+///   ([`Career::fold_accepted_stages`]) — only when both carry the same Factory Driver results, the
+///   sign that they are the same career. The `.sav` is patched in place (its `Missions` blob
+///   alone) and rewritten; every other byte stays;
+/// * a profile without a `.sav` (a port career older than the `.sav` writer) gets one built from
+///   the JSON ([`career_to_sav`]), the career upgraded first ([`Career::upgrade`]);
+/// * the dropped fields — a tournament's `final_rank` / `prize` / `failed_attempts` and the older
+///   `eras_completed` / `finale` — are no field of the original and are not carried.
+///
+/// The JSON is then renamed to `career.json.migrated` (kept for the user, never read again), so
+/// this runs once.
+pub fn migrate_legacy_json(json: &Path, dir: &Path, profile: &Profile, tables: &CareerTables) -> Migration {
+    if !json.exists() {
+        return Migration::None;
+    }
+    let set_aside = || {
+        let mut to = json.as_os_str().to_owned();
+        to.push(".migrated");
+        if let Err(e) = std::fs::rename(json, &to) {
+            tracing::warn!(error = %e, path = %json.display(), "career.json could not be set aside");
+        }
+    };
+    let (mut legacy, stages) = match Career::read_legacy_json(json) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "career.json unreadable; set aside without migrating");
+            set_aside();
+            return Migration::Unreadable;
+        }
+    };
+    let out = match read_profile(dir, profile) {
+        Some(mut s) => {
+            let mut c = career_from_sav(&s, tables);
+            let same = {
+                let n = tables.missions.len();
+                let pad = |v: &[i16]| (0..n).map(|i| v.get(i).copied().unwrap_or(0)).collect::<Vec<_>>();
+                pad(&legacy.missions) == pad(&c.missions)
+            };
+            if !same {
+                Migration::Mismatch
+            } else if c.fold_accepted_stages(tables, &stages) {
+                let marks = c.prize_taken.iter().filter(|t| **t).count();
+                s.missions = Some(mission_table(tables, &c));
+                if let Err(e) = write_profile(dir, profile, &s) {
+                    tracing::warn!(error = %e, "migration: writing the .sav failed");
+                }
+                Migration::Folded { marks }
+            } else {
+                Migration::Folded { marks: 0 }
+            }
+        }
+        None => {
+            legacy.upgrade(tables);
+            legacy.fold_accepted_stages(tables, &stages);
+            if let Err(e) = write_profile(dir, profile, &career_to_sav(&legacy, tables, profile)) {
+                tracing::warn!(error = %e, "migration: writing the .sav failed");
+            }
+            Migration::Created
+        }
+    };
+    tracing::info!(json = %json.display(), profile = %profile.stem(), result = ?out, "career.json migrated into the profile's .sav (one-time)");
+    set_aside();
+    out
 }
 
 /// Read back the modules and accessors that are not the career's (`LoadInfo` 0x4DE9B0 hands each

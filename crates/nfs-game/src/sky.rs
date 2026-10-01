@@ -42,7 +42,7 @@
 
 use glam::Vec3;
 use nfs_assets::track::TrackAssets;
-use nfs_renderer::{DrawItem, MaterialDesc, MaterialId, MeshData, MeshId, Renderer, TextureData, Vertex};
+use nfs_renderer::{DrawItem, MaterialDesc, MaterialId, MeshData, MeshId, Renderer, Vertex};
 
 pub struct Sky {
     /// mesh, material, how the layer's UVs move, and whether the part draws after the sun
@@ -102,6 +102,7 @@ impl SkyView {
         let v = Vec3::new(f.x, if keep_y { f.y } else { 0.0 }, f.z);
         let len = (v.x as f64 * v.x as f64 + v.y as f64 * v.y as f64 + v.z as f64 * v.z as f64).sqrt();
         let nz = (v.z as f64 * (1.0 / len)) as f32;
+        // det-allow: sky drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
         let a = ((nz as f64).acos() * f32::from_bits(0x3E22_F984) as f64) as f32;
         if f.x < 0.0 { 1.0 - a } else { a }
     }
@@ -297,6 +298,7 @@ impl StageParams {
         let th = (-l.wind_direction / 360.0) as f64 * 6.28318452835083;
         let k = l.wind_speed * 0.00025;
         let inv = |x: f32| if x != 0.0 { 1.0 / x } else { 0.0 };
+        // det-allow: sky drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
         Self { step: [inv(l.scale[0]), inv(l.scale[1])], wind: [th.sin() as f32 * k, th.cos() as f32 * k], inv_ratio: inv(move_ratio) }
     }
 
@@ -631,6 +633,7 @@ impl Lightning {
         let d = ((rand01(fe) * [0.2f32, 0.1, 0.1][self.mode] + [0.4f32, 0.3, 0.2][self.mode]) * half) as f64;
         let turn = rand01(fe);
         let a = turn as f64 * 6.28318452835083;
+        // det-allow: sky drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
         let (s, c) = ((a.sin() * d) as f32, (a.cos() * d) as f32);
         // 0x45CE29…0x45CE38: `fstp` the f32 `turn · 65535`, then `fistp` (to nearest)
         let pan = (turn * 65535.0f32).round_ties_even() as i32;
@@ -721,12 +724,12 @@ fn is_flat(name: &str) -> bool {
 /// 1 medium, 2 high) whatever the option says — the shipped option is 0, where no track has a
 /// block, so the layers are otherwise never seen.
 pub fn forced_level() -> Option<usize> {
-    std::env::var("NFS_SKY_LEVEL").ok()?.parse().ok()
+    crate::config::cfg().nfs_sky_level.var().ok()?.parse().ok()
 }
 
 /// `NFS_LIGHTNING=1`: a port diagnostic that drives the lightning's field value to 1 (mode 2).
 pub fn forced_lightning() -> bool {
-    std::env::var_os("NFS_LIGHTNING").is_some()
+    crate::config::cfg().nfs_lightning.var_os().is_some()
 }
 
 /// The 16 × 16 layer grid of 0x460EC0(15, …) / 0x460F40 in metres around the eye, with the base UVs of 0x45EC40 (`j/a`, `i/b`) and the colour stream `colours` (vertex
@@ -737,6 +740,7 @@ fn layer_grid(ring: &nfs_formats::sky::SkyRing, scale: f32, a: f32, b: f32, colo
     let side = ring.radius;
     let cell = side / N as f32;
     let t = (ring.angle_turns as f64 * 6.28318452835083) as f32;
+    // det-allow: sky drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
     let (c, sn) = (t.cos(), t.sin());
     for i in 0..=N {
         let u = -0.5 * N as f32 * cell + i as f32 * cell;
@@ -793,6 +797,7 @@ fn horizon_ring_quad(bin: &nfs_formats::sky::SkyBin, q: usize, y0: f32, y1: f32,
     let top_right = if q >= 16 { (k + 1) % 16 } else { c[1] };
     let p = |j: usize| {
         let az = ((bin.ring_turn + (k + j) as f32 * 0.0625) as f64 * 6.28318452835083) as f32;
+        // det-allow: sky drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
         (az.sin() * RING_RADIUS, az.cos() * RING_RADIUS)
     };
     let (x0, z0) = p(0);
@@ -812,7 +817,7 @@ impl Sky {
     pub fn upload(r: &mut Renderer, track: &TrackAssets, level: usize, fe: &mut crate::opponents::FeRng) -> Option<Self> {
         let find = |n: &str| track.sky_textures.iter().find(|t| t.name.trim() == n);
         fn tex(r: &mut Renderer, t: &nfs_assets::texture::TextureImage) -> nfs_renderer::TextureId {
-            r.upload_texture(&TextureData { width: t.width, height: t.height, mips: t.mips.clone() })
+            r.upload_texture_mips(t.width, t.height, &t.mips)
         }
         let mut parts = Vec::new();
         let sky_mat = |r: &mut Renderer, texture, blend, blend_pair| r.create_material(MaterialDesc { texture, alpha_blend: blend, cull_back: false, depth_test: false, env_texture: None, env_mix: 0.0, env_variant: 0, sky_map: false, blend_pair, clamp: [false; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false });
@@ -1018,6 +1023,7 @@ impl Sky {
             } else if g.parallax_on {
                 // the camera turned by minus the grid's angle (0x45D086…0x45D12A)
                 let a = -(g.angle as f64 * 6.28318452835083) as f32;
+                // det-allow: sky drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
                 let (c, s) = (a.cos(), a.sin());
                 let x = c * camera_pos.x + s * camera_pos.z;
                 let z = c * camera_pos.z - s * camera_pos.x;

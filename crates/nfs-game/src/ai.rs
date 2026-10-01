@@ -399,7 +399,8 @@ impl AiDriver {
             let sl = &table.slices[s];
             // `acos(dot) · [0x5B2688]` (0x40B9F0…0x40B9F5), and that double is **57.29**, not
             // 180/π = 57.2958 — the original's own truncated constant
-            let a = ((sl.forward.dot(fwd0).clamp(-1.0, 1.0) as f64).acos() * f64::from_bits(0x404C_A51E_C000_0000)) as f32;
+            // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable acos, not std; original CRT acos 0x5A1060 called at 0x40B9F0.
+            let a = (nfs_math::portable::acos(sl.forward.dot(fwd0).clamp(-1.0, 1.0) as f64) * f64::from_bits(0x404C_A51E_C000_0000)) as f32;
             if sl.lateral.dot(fwd0) < 0.0 {
                 max_r = max_r.max(a);
             } else {
@@ -503,7 +504,7 @@ impl AiDriver {
         target *= 0.25;
         // avoidance (§10.2, CONFIRMED): racing cars stand off `t` metres from the centre of a car
         // beside or shortly ahead; the car two ahead is processed first, the car directly ahead last
-        let no_avoid = std::env::var_os("NFS_AI_NOAVOID").is_some();
+        let no_avoid = crate::config::cfg().nfs_ai_noavoid.var_os().is_some();
         for &(opos, _oslice, ovlong, ohalf, _human) in ahead.iter().take(if no_avoid { 0 } else { 2 }).rev() {
             let dir = (target - v.position).normalize_or_zero();
             let d1 = opos - v.position;
@@ -540,7 +541,7 @@ impl AiDriver {
             let sl = &table.slices[ts];
             self.dbg_offset = (target - sl.centre).dot(sl.lateral);
         }
-        let steer = if std::env::var_os("NFS_AI_FLIP").is_some() { -steer } else { steer };
+        let steer = if crate::config::cfg().nfs_ai_flip.var_os().is_some() { -steer } else { steer };
         // the stuck counter `car+0xEA4` (0x40C934): one tick per control tick under 2 m/s once the
         // race has started, cleared otherwise — and cleared for a racing car (`car+0x52C & 1`,
         // every opponent) that has finished or is out, `car+0xB50 >= 2` (0x40C922…0x40C932).
@@ -636,7 +637,7 @@ impl AiDriver {
     }
 
     pub fn wants_reset(&mut self) -> bool {
-        if std::env::var_os("NFS_NO_AIRESET").is_some() {
+        if crate::config::cfg().nfs_no_aireset.var_os().is_some() {
             self.stuck_ticks = 0;
             self.wrong_way = false;
             return false;

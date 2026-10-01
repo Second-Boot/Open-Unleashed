@@ -22,7 +22,7 @@ pub struct Element {
 
 impl Element {
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.fields.get(&key.to_lowercase()).map(|s| s.as_str())
+        crate::lc::with_lower(key, "", |k| self.fields.get(k).map(|s| s.as_str()))
     }
 
     /// A `x,y` pair (`pos`, `size`).

@@ -35,7 +35,7 @@ impl App {
     pub(crate) fn camera_view(&self) -> u16 {
         // diagnostic: `NFS_VIEW=<id>` (decimal: 10 CircleCam, 11 SplineCam, 20 DirectorsCam …) holds
         // the slot on that view, for screenshots of views outside the car's cycle
-        if let Some(v) = std::env::var("NFS_VIEW").ok().and_then(|v| v.parse::<u16>().ok()) {
+        if let Some(v) = nfs_game::config::cfg().nfs_view.var().ok().and_then(|v| v.parse::<u16>().ok()) {
             return v;
         }
         if let Some(v) = self.replay_view() {
@@ -133,7 +133,7 @@ impl App {
     /// one runs out (0x462F58 with `+0x0C` cleared at 0x463244), as the original's slot would if
     /// nothing moved it off 0x0E.
     pub(crate) fn camera_anim_step(&mut self, tick: u64, car_pos: Vec3, car_rot: Quat) -> Option<(Vec3, glam::Mat3)> {
-        let held = std::env::var("NFS_VIEW").ok().and_then(|v| v.parse::<u16>().ok()) == Some(0x0E);
+        let held = nfs_game::config::cfg().nfs_view.var().ok().and_then(|v| v.parse::<u16>().ok()) == Some(0x0E);
         if held && self.anim_cam == AnimCamSlot::Off {
             self.anim_cam = AnimCamSlot::Start;
         }
@@ -174,7 +174,7 @@ impl App {
     }
 
     pub(crate) fn camera_slot_reset(&mut self) {
-        let forced = std::env::var("NFS_CAMERA").ok().and_then(|v| v.parse::<u8>().ok());
+        let forced = nfs_game::config::cfg().nfs_camera.var().ok().and_then(|v| v.parse::<u8>().ok());
         self.camera_mode = forced.unwrap_or(0);
         self.anim_cam = if forced.is_some() { AnimCamSlot::Off } else { AnimCamSlot::Start };
         self.chase_offset = None;

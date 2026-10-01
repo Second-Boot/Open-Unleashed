@@ -394,7 +394,7 @@ impl App {
         // `NFS_FE_PARTS=1,3` clicks those zones of every 3D car at tick 0, once, so a still taken
         // with `NFS_FE_CLOCK` shows them open — the way `NFS_FE_DZ` stands in for a dragged bar
         if !self.fe.parts_forced
-            && let Ok(v) = std::env::var("NFS_FE_PARTS")
+            && let Ok(v) = nfs_game::config::cfg().nfs_fe_parts.var()
         {
             self.fe.parts_forced = true;
             let widgets: Vec<usize> = self.fe.layout_preview.as_ref().map(|l| l.car_3d().iter().map(|w| w.index).collect()).unwrap_or_default();
@@ -597,7 +597,7 @@ impl App {
                 && let Ok(images) = nfs_assets::texture::decode_pack(&path, &data)
                 && let Some(img) = images.iter().find(|t| t.name.trim() == "FESH")
             {
-                self.fe.garage_shadow_tex = Some(r.upload_texture(&nfs_renderer::TextureData { width: img.width, height: img.height, mips: img.mips.clone() }));
+                self.fe.garage_shadow_tex = Some(r.upload_texture_mips(img.width, img.height, &img.mips));
             }
             let shadow = (room.id == "ID_GARAGE")
                 .then(|| {
@@ -1042,7 +1042,7 @@ impl App {
                 // the port's own key-hint line, a diagnostic the original has no counterpart
                 // to: drawn only under `NFS_FE_HINTS` (decided 2026-09-27 — until
                 // then it was always on, and the credits roll drew over it in the oval)
-                if let Some(f) = self.fe.menu.as_ref().and_then(|m| m.font.as_ref()).filter(|_| std::env::var_os("NFS_FE_HINTS").is_some()) {
+                if let Some(f) = self.fe.menu.as_ref().and_then(|m| m.font.as_ref()).filter(|_| nfs_game::config::cfg().nfs_fe_hints.var_os().is_some()) {
                     let name = self.fe.layout_name.clone().unwrap_or_default();
                     let hint = if l.can_play() {
                         "UP/DOWN SELECT   LEFT/RIGHT CHANGE   ENTER RACE   B BACK   ESC EXIT"

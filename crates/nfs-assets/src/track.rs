@@ -279,8 +279,12 @@ pub struct TrackAssets {
     /// Decompressed `.crp` bytes (parts are resolved lazily against this buffer).
     pub crp_data: Vec<u8>,
     pub crp: Crp,
+    /// The track's `.fsh` and `.env` pixels (RGBA8, with their mip chains). Only the GPU upload reads
+    /// them: [`Self::release_textures`] drops them once it is done (some 25-35 MB of a track) and
+    /// [`Self::ensure_textures`] reads them again for the next upload (a restart, a replay pass).
     pub textures: Vec<TextureImage>,
     pub env_textures: Vec<TextureImage>,
+    textures_released: bool,
     pub map: Ini,
     pub start_forward: Option<Scene>,
     pub start_backward: Option<Scene>,
@@ -328,14 +332,7 @@ impl TrackAssets {
         let crp_data = refpack::maybe_decompress(&read(&crp_path)?).map_err(fmt_err(&crp_path))?.into_owned();
         let crp = Crp::parse(&crp_data).map_err(fmt_err(&crp_path))?;
 
-        let fsh_path = file(".fsh")?;
-        let fsh_data = refpack::maybe_decompress(&read(&fsh_path)?).map_err(fmt_err(&fsh_path))?.into_owned();
-        // pack key 0, the one with a mip chain (0x4877BD; `texture::decode_pack_mipped`)
-        let textures = decode_pack_mipped(&fsh_path, &fsh_data)?;
-
-        let env_path = file(".env")?;
-        let env_data = refpack::maybe_decompress(&read(&env_path)?).map_err(fmt_err(&env_path))?.into_owned();
-        let env_textures = decode_pack(&env_path, &env_data)?;
+        let (textures, env_textures) = Self::decode_textures(&dir, name)?;
 
         let map_path = file(".map")?;
         let map = Ini::parse(&String::from_utf8_lossy(&read(&map_path)?));
@@ -385,6 +382,7 @@ impl TrackAssets {
             crp,
             textures,
             env_textures,
+            textures_released: false,
             map,
             start_forward: scene("_fstart.scn")?,
             start_backward: scene("_bstart.scn")?,
@@ -399,6 +397,41 @@ impl TrackAssets {
             sky_params,
             sky_bin,
         })
+    }
+
+    /// The track's `.fsh` (pack key 0, the one with a mip chain: 0x4877BD, `texture::decode_pack_mipped`)
+    /// and `.env` pixels.
+    fn decode_textures(dir: &std::path::Path, name: &str) -> Result<(Vec<TextureImage>, Vec<TextureImage>), AssetError> {
+        let file = |suffix: &str| -> Result<PathBuf, AssetError> {
+            let n = format!("{name}{suffix}");
+            GamePaths::find_file(dir, &n).ok_or_else(|| AssetError::MissingFile { dir: dir.to_path_buf(), name: n })
+        };
+        let fsh_path = file(".fsh")?;
+        let fsh_data = refpack::maybe_decompress(&read(&fsh_path)?).map_err(fmt_err(&fsh_path))?.into_owned();
+        let textures = decode_pack_mipped(&fsh_path, &fsh_data)?;
+        let env_path = file(".env")?;
+        let env_data = refpack::maybe_decompress(&read(&env_path)?).map_err(fmt_err(&env_path))?.into_owned();
+        let env_textures = decode_pack(&env_path, &env_data)?;
+        Ok((textures, env_textures))
+    }
+
+    /// Drop the texture pixels after the GPU upload (nothing else reads them).
+    // PORT-DEVIATION D7 (RE/notes/PORT-DEVIATIONS.md): the CPU copies are dropped after upload and re-read by ensure_textures before a re-upload; host memory only, nothing drawn or simulated changes; the original loads sequentially (load steps 0x4A4A70).
+    pub fn release_textures(&mut self) {
+        self.textures = Vec::new();
+        self.env_textures = Vec::new();
+        self.textures_released = true;
+    }
+
+    /// Read the texture pixels again if [`Self::release_textures`] dropped them, for the next upload.
+    pub fn ensure_textures(&mut self) -> Result<(), AssetError> {
+        if self.textures_released {
+            let (textures, env_textures) = Self::decode_textures(&self.dir, &self.name)?;
+            self.textures = textures;
+            self.env_textures = env_textures;
+            self.textures_released = false;
+        }
+        Ok(())
     }
 
     /// Load `Track/<track><suffix>` (e.g. `_st1.scn`) as a scene.

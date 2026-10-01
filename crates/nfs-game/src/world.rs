@@ -146,6 +146,8 @@ pub struct TrackWorld {
     /// water and flags/banners ([`Self::animate_uv`], `nfs_assets::track::uv_animate`,
     /// `RE/drafts/round1/render-core.md` §4.4).
     uv_animate: HashMap<MaterialId, nfs_assets::track::UvAnimate>,
+    /// [`Self::animate_uv`]'s own bookkeeping: the animated items found once, and the reading last applied.
+    uv_plan: UvPlan,
     /// The `WAnimBundle` articles the port moves ([`Self::animate_articles`]).
     anim_articles: Vec<AnimArticle>,
     /// The next registration number a moved ref takes.
@@ -244,6 +246,34 @@ pub struct TrackArticleGpu {
     /// per entry of [`Self::lods`], per draw item: its part's flag word and sphere centre in the
     /// world — what the static drawer queues it by ([`TrackWorld::visible_items`])
     pub parts: Vec<Vec<(u16, Vec3)>>,
+}
+
+/// Where [`TrackWorld::animate_uv`] writes: an item of [`TrackWorld::items`] or one of a track
+/// article's LOD items.
+#[derive(Clone, Copy)]
+enum UvTarget {
+    Item(usize),
+    Lod(usize, usize, usize),
+}
+
+/// The animated items of [`TrackWorld::animate_uv`], found on its first call, and the last reading.
+#[derive(Default)]
+struct UvPlan {
+    shape: Option<(usize, usize)>,
+    targets: Vec<(UvTarget, u32, i32)>,
+    applied: Option<u32>,
+}
+
+/// The buffers [`TrackWorld::track_draw_lists_into`] fills, kept between frames.
+#[derive(Default)]
+pub struct TrackLists {
+    /// list `+4`, unsorted: `(key, item)`
+    pub near: Vec<(u32, DrawItem)>,
+    /// the `+0xC` list's track-side entries, unsorted
+    pub far: Vec<(u32, DrawItem)>,
+    /// the port's no-`Base` fallback
+    pub rest: Vec<DrawItem>,
+    lods: Vec<(Option<(u32, u32)>, usize)>,
 }
 
 /// The view's draw lists `[cam+0x54]` (built by 0x466380) that the track's drawers file into,
@@ -518,6 +548,13 @@ impl TrackWorld {
     /// rule) and the breakables (`WInstanceBundle`'s), their spheres from this frame's matrices
     /// ([`Self::instance_sphere`]; `RE/RENDERING.md` "The instance and scene items").
     pub fn article_draws(&self, v: &CullView) -> Vec<Option<ArticleDraw>> {
+        let mut out = Vec::new();
+        self.article_draws_into(v, &mut out);
+        out
+    }
+
+    /// [`Self::article_draws`] into a reusable buffer (cleared first).
+    pub fn article_draws_into(&self, v: &CullView, out: &mut Vec<Option<ArticleDraw>>) {
         let (fc, fr2) = v.footprint();
         let near: Vec<&Occluder> = self.occluders.iter().filter(|o| !o.far_from(fc, fr2)).collect();
         let articles = self.cull_articles.iter().zip(self.article_nodes.iter()).zip(self.article_seq.iter()).map(|((a, nodes), &seq)| {
@@ -540,7 +577,8 @@ impl TrackWorld {
             d.order = (id, reg.seq);
             Some(d)
         });
-        articles.chain(instances).collect()
+        out.clear();
+        out.extend(articles.chain(instances));
     }
 
     /// The registration of the instance and scene items: 0x487D72's loop over the
@@ -1425,7 +1463,7 @@ pub fn car_specular_maps(r: &mut Renderer, paths: &nfs_assets::GamePaths, front_
     names.map(|name| {
         pack.iter()
             .find(|t| t.name.trim() == name)
-            .map(|t| r.upload_texture(&TextureData { width: t.width, height: t.height, mips: t.mips.clone() }))
+            .map(|t| r.upload_texture_mips(t.width, t.height, &t.mips))
     })
 }
 
@@ -1509,8 +1547,10 @@ impl TrackWorld {
         let geometry = track.build_geometry()?;
         let materials = track.materials()?;
         let mut tex_ids = HashMap::new();
-        for tex in &track.textures {
-            let id = r.upload_texture(&TextureData { width: tex.width, height: tex.height, mips: tex.mips.clone() });
+        // every track texture in one go: the pixels are written from worker threads, the ids are
+        // the same consecutive ones, in file order
+        let items: Vec<(u32, u32, &[Vec<u8>])> = track.textures.iter().map(|t| (t.width, t.height, t.mips.as_slice())).collect();
+        for (tex, id) in track.textures.iter().zip(r.upload_textures(&items)) {
             tex_ids.insert(tex.name.clone(), (id, tex.has_alpha));
         }
         let methods = track.crp.render_methods(&track.crp_data).unwrap_or_default();
@@ -1802,8 +1842,9 @@ impl TrackWorld {
         }
         // every `.env` entry, keyed by its SHPI name as the `.map` sections spell it
         let mut env_by_id = HashMap::new();
-        for t in &track.env_textures {
-            let id = r.upload_texture(&TextureData { width: t.width, height: t.height, mips: t.mips.clone() });
+        let env_items: Vec<(u32, u32, &[Vec<u8>])> = track.env_textures.iter().map(|t| (t.width, t.height, t.mips.as_slice())).collect();
+        let env_ids = r.upload_textures(&env_items);
+        for (t, id) in track.env_textures.iter().zip(env_ids) {
             let mut name = [b' '; 4];
             for (i, c) in t.name.bytes().take(4).enumerate() {
                 name[i] = c;
@@ -1954,6 +1995,7 @@ impl TrackWorld {
             instance_flares,
             item_cull,
             uv_animate,
+            uv_plan: UvPlan::default(),
             anim_articles,
             next_seq,
         };
@@ -2067,22 +2109,53 @@ impl TrackWorld {
         if self.uv_animate.is_empty() {
             return;
         }
+        // the offsets are a function of the reading alone and nothing else writes them: the same
+        // reading again (several frames within one game tick) rewrites what is already there
+        if self.uv_plan.applied == Some(ticks128) {
+            return;
+        }
+        // the items the animation touches, found once (the lists are not changed after the build):
+        // the walk over every item of every LOD of the track and a map lookup each was the cost
+        let shape = (self.items.len(), self.track_lods.len());
+        if self.uv_plan.shape != Some(shape) {
+            let mut targets = Vec::new();
+            for (k, it) in self.items.iter().enumerate() {
+                if let Some(a) = self.uv_animate.get(&it.material) {
+                    targets.push((UvTarget::Item(k), a.mode, a.rate));
+                }
+            }
+            for (g, a) in self.track_lods.iter().enumerate() {
+                for (l, (_, v)) in a.lods.iter().enumerate() {
+                    for (k, it) in v.iter().enumerate() {
+                        if let Some(a) = self.uv_animate.get(&it.material) {
+                            targets.push((UvTarget::Lod(g, l, k), a.mode, a.rate));
+                        }
+                    }
+                }
+            }
+            self.uv_plan = UvPlan { shape: Some(shape), targets, applied: None };
+        }
         let ticks = ticks128 as f32;
-        for it in self.items.iter_mut().chain(self.track_lods.iter_mut().flat_map(|a| a.lods.iter_mut().flat_map(|(_, v)| v.iter_mut()))) {
-            let Some(a) = self.uv_animate.get(&it.material) else { continue };
-            it.uv_offset = match a.mode {
+        for &(target, mode, rate) in &self.uv_plan.targets {
+            let it = match target {
+                UvTarget::Item(k) => &mut self.items[k],
+                UvTarget::Lod(g, l, k) => &mut self.track_lods[g].lods[l].1[k],
+            };
+            it.uv_offset = match mode {
                 0 => {
-                    let t = ticks * a.rate as f32 * 1e-4;
+                    let t = ticks * rate as f32 * 1e-4;
                     [0.0, t - t.floor()]
                 }
                 2 => {
-                    let th = ticks * a.rate as f32 * 2e-4;
+                    let th = ticks * rate as f32 * 2e-4;
+                    // det-allow: UV scroll, drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
                     [(th * std::f32::consts::TAU).sin() * 0.06, 0.0]
                 }
                 // not read (render-core.md §4.4): no shipped material uses another mode
                 _ => [0.0, 0.0],
             };
         }
+        self.uv_plan.applied = Some(ticks128);
     }
 
     /// Draw items with the hidden mission elements filtered out.
@@ -2138,19 +2211,37 @@ impl TrackWorld {
     /// `rest` (the port's no-`Base` fallback) are returned too, for [`Self::visible_items`]'s own
     /// use and for the mirror's independent walk ([`App::render_mirror`]).
     pub fn track_draw_lists(&self, draws: &[Option<ArticleDraw>], eye: Vec3) -> (Vec<(u32, DrawItem)>, Vec<(u32, DrawItem)>, Vec<DrawItem>) {
+        let mut lists = TrackLists::default();
+        self.track_draw_lists_into(draws, eye, &mut lists);
+        (lists.near, lists.far, lists.rest)
+    }
+
+    /// [`Self::track_draw_lists`] into reusable buffers (cleared first): the per-frame callers keep one
+    /// [`TrackLists`] so the lists do not allocate again every frame.
+    pub fn track_draw_lists_into(&self, draws: &[Option<ArticleDraw>], eye: Vec3, lists: &mut TrackLists) {
         let key = |c: Vec3| (c - eye).length_squared().round_ties_even() as u32;
-        let mut near: Vec<(u32, DrawItem)> = Vec::new();
-        let mut far: Vec<(u32, DrawItem)> = Vec::new();
-        let mut rest: Vec<DrawItem> = Vec::new();
+        let TrackLists { near, far, rest, lods } = lists;
+        near.clear();
+        far.clear();
+        rest.clear();
+        lods.clear();
         // the walk's draw of the track geometry: each drawn article at the LOD its drawer picked
         // (0x450DE0 / 0x450010 — the record's `pr` range is the parts of that LOD number); an
         // article the walk has no record of (no `Base`) is drawn at its lowest LOD (port fallback)
         // equal keys draw in the order the node pass queued them: articles by the first visible node
         // they are registered into (tree order), then by their place in the node's ref list
         // ([`ArticleDraw::order`]); the sorts that follow keep queueing order among equal keys
-        let mut lods: Vec<&TrackArticleGpu> = self.track_lods.iter().collect();
-        lods.sort_by_key(|a| draws.get(a.article).copied().flatten().map(|d| d.order));
-        for a in lods {
+        // (only the articles the loop below can act on are sorted: one the walk did not draw
+        // `continue`s there, and a stable sort of the subset keeps the relative order the full
+        // stable sort gave it — the sort over every article of the track was most of this call)
+        lods.extend(self.track_lods.iter().enumerate().filter_map(|(g, a)| {
+            let order = draws.get(a.article).copied().flatten().map(|d| d.order);
+            let culled = matches!(self.cull_articles.get(a.article).map(|c| c.as_ref()), Some(Some(_)));
+            (!culled || order.is_some()).then_some((order, g))
+        }));
+        lods.sort_by_key(|(o, _)| *o);
+        for &(_, g) in lods.iter() {
+            let a = &self.track_lods[g];
             match self.cull_articles.get(a.article).map(|c| c.as_ref()) {
                 Some(Some(c)) => {
                     let Some(d) = draws.get(a.article).copied().flatten() else { continue };
@@ -2218,7 +2309,6 @@ impl TrackWorld {
                 None => rest.extend(b.pieces.iter().copied()),
             }
         }
-        (near, far, rest)
     }
 
     /// The breakable props of the world (`BBOX`, the crate stacks): each world article whose prop
@@ -2321,7 +2411,8 @@ impl TrackWorld {
                 // (0x532A00 transposes its rotation, 0x532A40 applies it), its heading
                 // `atan2(x, z)` in turns (0x532860) and the piece's drift `v·velocityFactor`
                 let local = b.instance.inverse().transform_vector3(velocity);
-                let heading = local.x.atan2(local.z);
+                // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable atan2, not std; original 0x532860 (atan2 → turns, x87).
+                let heading = nfs_math::portable::atan2f(local.x, local.z);
                 for i in group {
                     if !br.resolved.get(i).copied().unwrap_or(false) {
                         break;
@@ -2697,10 +2788,11 @@ fn sample_piece(track: &nfs_formats::crp::AnimTrack, seconds_per_frame: f32, fla
     let scale = Vec3::from(a.scale).lerp(Vec3::from(b.scale), frac);
     let mut m = Mat4::from_translation(pos) * Mat4::from_mat3(glam::Mat3::from_quat(q)) * Mat4::from_scale(scale);
     if flags.directed {
-        m = Mat4::from_rotation_y(heading) * m;
+        // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable rotation, not glam/std; original rotation builder 0x539BD0 at 0x4710AC / 0x47111D.
+        m = nfs_math::portable::mat4_rotation_y(heading) * m;
     }
     if flags.landflat {
-        m *= Mat4::from_rotation_y(-heading * (1.0 - (i as f32 + frac) / n as f32));
+        m *= nfs_math::portable::mat4_rotation_y(-heading * (1.0 - (i as f32 + frac) / n as f32));
     }
     let off = drift * ticks as f32 * rate;
     m.w_axis += off.extend(0.0);

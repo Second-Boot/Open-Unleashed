@@ -10,7 +10,7 @@ use nfs_game::career::{Availability, Career, CareerError, CareerTables};
 use nfs_game::save::Profile;
 use nfs_game::text::BitmapFont;
 use nfs_renderer::Sprite;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// One opponent of a career event, resolved from the tournament record.
 #[derive(Debug, Clone)]
@@ -125,7 +125,6 @@ pub enum CarChoice {
 pub struct CareerUi {
     pub tables: CareerTables,
     pub career: Career,
-    pub save_path: PathBuf,
     pub t_idx: usize,
     pub car_sel: usize,
     /// Parts picked in the shop but not paid for yet — the original's `Parts.ShoppingList`, whose
@@ -167,47 +166,85 @@ pub struct CareerUi {
 }
 
 impl CareerUi {
+    /// One line of the career state a load leaves — money, year, era, the garage, each
+    /// tournament's done events / completions, the finished era 0x504800, the passed and the
+    /// promotion-taken mission records. Diagnostic only (the scripted checks of that change compare the
+    /// state after start-up, after a front-end entry and after a restart by it).
+    pub fn summary(&self) -> String {
+        let c = &self.career;
+        let tours: Vec<String> = c.tournaments.iter().filter(|(_, st)| !st.events.is_empty() || st.completions > 0).map(|(id, st)| format!("{id}:{}ev/{}x", st.events.len(), st.completions)).collect();
+        let cars: Vec<String> = c.garage.iter().map(|g| format!("{}@{}km", g.car_id, g.mileage)).collect();
+        let passed = c.missions.iter().filter(|m| **m != 0).count();
+        let taken: Vec<usize> = c.prize_taken.iter().enumerate().filter(|(_, t)| **t).map(|(i, _)| i).collect();
+        format!(
+            "money={} year={} era={:?} evolution_complete={} completed_era={:?} cars=[{}] tournaments=[{}] missions_passed={passed} prize_taken={taken:?}",
+            c.money,
+            c.year,
+            c.era,
+            c.evolution_complete,
+            c.completed_era(&self.tables),
+            cars.join(" "),
+            tours.join(" ")
+        )
+    }
+
+    /// The career of the profile `player.lst` names, from the save directory
+    /// ([`nfs_game::save::save_dir`]), after the one-time migration of the retired JSON. Unit
+    /// tests load from an empty scratch directory instead and migrate nothing, so no test reads
+    /// or moves anything in the player's own save directory.
     pub fn load(paths: &GamePaths) -> Result<Self, CareerError> {
+        #[cfg(not(test))]
+        let (dir, json) = (nfs_game::save::save_dir(), Some(Career::legacy_json_path()));
+        #[cfg(test)]
+        let (dir, json): (PathBuf, Option<PathBuf>) = {
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (std::env::temp_dir().join(format!("nfs-careerui-empty-{}-{n}", std::process::id())), None)
+        };
+        Self::load_from(paths, dir, json.as_deref())
+    }
+
+    /// [`Self::load`] from `dir`, folding the retired JSON at `json` in first when there is one.
+    pub fn load_from(paths: &GamePaths, dir: PathBuf, json: Option<&Path>) -> Result<Self, CareerError> {
         let tables = CareerTables::load(paths)?;
-        let save_path = std::env::var_os("NFS5_CAREER_SAVE")
-            .map(PathBuf::from)
-            .unwrap_or_else(Career::default_save_path);
         // The profile is the one `player.lst` last selected, as `RebuildUserList` 0x4DEF60 does.
-        let dir = nfs_game::save::save_dir();
         let profile = std::env::var("NFS5_PROFILE")
             .ok()
             .map(|n| Profile::new(n, nfs_game::save::DEFAULT_PICTURE))
             .or_else(|| nfs_game::save::read_player_lst(&dir).and_then(|s| Profile::from_stem(&s)))
             .or_else(|| nfs_game::save::list_profiles(&dir).into_iter().next())
             .unwrap_or_else(|| Profile::new("DRIVER", nfs_game::save::DEFAULT_PICTURE));
-        let career = match Career::load(&save_path) {
-            Ok(mut c) => {
-                // an older port career keeps its cars' stock parts implicit (`Career::upgrade`)
-                c.upgrade(&tables);
-                tracing::info!(path = %save_path.display(), era = ?c.era, money = c.money, cars = c.garage.len(), "career loaded");
+        // the port's JSON career of before 2026-10-01, folded into the profile's `.sav` once
+        // (port-only, `save::migrate_legacy_json`)
+        if let Some(json) = json {
+            nfs_game::save::migrate_legacy_json(json, &dir, &profile, &tables);
+        }
+        // **One load path**: the career is the profile's `.sav` read through
+        // `career_from_sav`, the same `LoadInfo` 0x4DE9B0 every front-end entry repeats
+        // (0x4D3B52, `App::reload_career_at_fe_entry`) and the profile chooser's continue makes
+        // (`SETNAMETHENBACK` 0x5106D0). Without a file, the blank career 0x501340 leaves (money
+        // 11000, nothing owned) over the shipped tables. *(Until 2026-10-01 start-up read the
+        // port's JSON, whose installed-part order was not the loader's sort 0x4EE853…0x4EE8AE and
+        // whose port-only fields every front-end entry then dropped.)* The original's first entry
+        // skips the load (0x4D3B4A) and asks for the profile instead; the profile it then loads is
+        // this one when the player keeps `player.lst`'s row — APPROXIMATION of the moment only:
+        // the career before the chooser is answered is the profile's here, 0x501340's blank there.
+        let career = match nfs_game::save::load_profile_career(&dir, &profile, &tables) {
+            Some((c, _)) => {
+                tracing::info!(path = %profile.path(&dir).display(), era = ?c.era, money = c.money, cars = c.garage.len(), "career loaded from the profile");
                 c
             }
-            // No JSON yet: fall back to the original-format save for this profile if one exists.
-            Err(CareerError::Io { .. }) => match std::fs::read(profile.path(&dir))
-                .ok()
-                .and_then(|d| nfs_formats::sav::SaveFile::parse(&d).ok())
-            {
-                Some(s) => {
-                    let c = nfs_game::save::career_from_sav(&s, &tables);
-                    tracing::info!(path = %profile.path(&dir).display(), money = c.money, cars = c.garage.len(), "career imported from the original .sav");
-                    c
-                }
-                None => Career::default(),
-            },
-            Err(e) => {
-                tracing::warn!(error = %e, "career save unreadable, starting a new one");
-                Career::default()
-            }
+            None => Career::default(),
         };
-        Ok(Self {
+        let ui = Self::new(tables, career, dir, profile);
+        tracing::debug!(state = %ui.summary(), "career at start-up");
+        Ok(ui)
+    }
+
+    fn new(tables: CareerTables, career: Career, dir: PathBuf, profile: Profile) -> Self {
+        Self {
             tables,
             career,
-            save_path,
             save_dir: dir,
             profile,
             side: nfs_game::save::SaveSide::default(),
@@ -224,7 +261,7 @@ impl CareerUi {
             pending: None,
             race_flags: TournamentRaceFlags::default(),
             victory_room: false,
-        })
+        }
     }
 
     pub fn tournaments(&self) -> Vec<&Tournament> {
@@ -325,13 +362,25 @@ impl CareerUi {
             }
             return None;
         }
-        // `NFS_MISSION=<idx>` overrides the current mission (smoke runs)
+        // every mission done: none — unless `NFS_MISSION` names one (`mission_request`)
+        let idx = match self.career.current_mission(&self.tables) {
+            Some(i) => i,
+            None if std::env::var("NFS_MISSION").is_ok() => 0,
+            None => return None,
+        };
+        self.mission_request(idx)
+    }
+
+    /// Mission `idx`'s race as the type-9 launch builds it (0x4EB470 / 0x4ECDF0 / 0x4EC040 /
+    /// 0x4ECF00 over the record 0x51AE80 returns), marked pending. `NFS_MISSION=<idx>` overrides the
+    /// mission (smoke runs).
+    pub fn mission_request(&mut self, idx: usize) -> Option<StartRequest> {
         let idx = std::env::var("NFS_MISSION")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|i| *i < self.tables.missions.len())
-            .or_else(|| self.career.current_mission(&self.tables))?;
-        let m = self.tables.missions[idx].clone();
+            .unwrap_or(idx);
+        let m = self.tables.missions.get(idx)?.clone();
         let car = self.tables.car(m.car_id as u16)?.clone();
         if car.sim.is_empty() {
             self.message = "MISSION CAR HAS NO SIMULATION DATA".into();
@@ -488,7 +537,7 @@ impl CareerUi {
             "CHIEF TEST DRIVER",
             "ACE TEST DRIVER",
         ];
-        let rank = self.career.promotions_accepted.len().min(3);
+        let rank = self.career.prize_taken.iter().filter(|t| **t).count().min(3);
         out.extend(f.sprites(
             &format!(
                 "FACTORY DRIVER   {}   {}/{} MISSIONS",
@@ -830,10 +879,6 @@ impl CareerUi {
     }
 
     pub fn save(&mut self) {
-        if let Err(e) = self.career.save(&self.save_path) {
-            tracing::error!(error = %e, "career save failed");
-            self.message = format!("SAVE FAILED: {e}");
-        }
         // `Tournament`'s front-end dwords (`save::TournamentFe`): the selected tournament
         // `[0x691E6C]` is the record's index in the table, and the running pair `[0x5DB768]` /
         // `[0x5DB76C]` is set only by the tournament launch 0x503940 (0x4D5B4A) — so a mission or a
@@ -854,8 +899,8 @@ impl CareerUi {
         if let Some(r) = self.pending.as_ref().filter(|p| p.mission.is_none() && !p.finale).and_then(|p| Some((p.event as i32, index_of(p.tournament)? as i32))) {
             (self.side.tournament.current_event, self.side.tournament.current_tournament) = r;
         }
-        // …and the same career in the original's format, so `SaveData/` matches what the game
-        // itself would leave behind (`RE/notes/savegame.md` §3).
+        // `SaveInfo` 0x4DEDA0: the career in the original's format, the only save
+        // (`RE/notes/savegame.md` §3)
         let sav = nfs_game::save::career_to_sav_with(
             &self.career,
             &self.tables,
@@ -863,7 +908,8 @@ impl CareerUi {
             &self.side,
         );
         if let Err(e) = nfs_game::save::write_profile(&self.save_dir, &self.profile, &sav) {
-            tracing::warn!(error = %e, "writing the .sav profile failed");
+            tracing::error!(error = %e, "writing the .sav profile failed");
+            self.message = format!("SAVE FAILED: {e}");
         }
     }
 
@@ -884,16 +930,17 @@ impl CareerUi {
     /// False when the file is missing or does not parse — the callers' 806.
     ///
     /// The autosave arm never fires from the player screens: it tests `<i><stem>.sav` for a stem
-    /// that already carries its digit, which no file matches. The port's JSON career is rewritten
-    /// with the loaded one so the next start agrees with `player.lst`.
+    /// that already carries its digit, which no file matches.
+    ///
+    /// `[0x69C8F0]` (`Career::last_mission`) is a global no load touches (written only by 0x51AEF0
+    /// and 0x51B060): it is carried over the new career.
     pub fn switch_profile(&mut self, p: &Profile) -> bool {
-        let Some(s) = std::fs::read(p.path(&self.save_dir))
-            .ok()
-            .and_then(|d| nfs_formats::sav::SaveFile::parse(&d).ok())
-        else {
+        let Some((career, s)) = nfs_game::save::load_profile_career(&self.save_dir, p, &self.tables) else {
             return false;
         };
-        self.career = nfs_game::save::career_from_sav(&s, &self.tables);
+        let last_mission = self.career.last_mission;
+        self.career = career;
+        self.career.last_mission = last_mission;
         self.victory_room = false;
         self.profile = p.clone();
         // the modules `LoadInfo` hands their own loaders — `Knockout` 0x4DDD60, `Personalities`
@@ -901,9 +948,6 @@ impl CareerUi {
         self.side = nfs_game::save::side_from_sav(&s);
         if nfs_game::save::write_player_lst(&self.save_dir, &p.stem()).is_err() {
             return false;
-        }
-        if let Err(e) = self.career.save(&self.save_path) {
-            tracing::warn!(error = %e, "career save failed");
         }
         true
     }
@@ -1543,7 +1587,9 @@ impl CareerUi {
         };
         let st = self.career.state(t.id);
         let status = match self.career.availability(&self.tables, t) {
-            Availability::Completed => format!("DONE  RANK {}", st.final_rank.unwrap_or(0)),
+            // `Tournament.Tournament(TIMESCOMPLETED)`, `trn+0xD3C` (0x506929): the original keeps
+            // no final rank (0x503AD0 / 0x503E40)
+            Availability::Completed => format!("DONE  {}X", st.completions),
             Availability::Locked => "LOCKED".to_string(),
             Availability::Open if st.entered => {
                 format!("EVENT {}/{}", st.events.len() + 1, t.events.len())
@@ -1724,6 +1770,53 @@ impl CareerUi {
 mod tests {
     use super::*;
 
+    /// **one load path**: start-up (`load_from`) and every front-end entry's reload
+    /// (`switch_profile`, 0x4D3B52) give the same career from the same `.sav` — the installed parts
+    /// in the loader's sort (0x4EE853…0x4EE8AE) both times — and a retired `career.json` beside it
+    /// is folded in once and set aside.
+    #[test]
+    fn start_up_and_a_front_end_entry_load_the_same_career() {
+        let Ok(paths) = GamePaths::locate() else {
+            eprintln!("skipping: original game data not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("nfs-onepath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tables = CareerTables::load(&paths).unwrap();
+        let car_id = tables.catalog.iter().find(|c| !c.sim.is_empty() && !c.paint_sets.is_empty()).unwrap().id;
+        let mut c = Career::default();
+        let mut owned = nfs_game::career::OwnedCar::construct(&tables, car_id, 0, 11_000);
+        owned.parts.reverse();
+        c.garage.push(owned.clone());
+        c.money = 77_777;
+        let stage = tables.missions[0].stage;
+        for i in (0..tables.missions.len()).filter(|i| tables.missions[*i].stage == stage) {
+            c.record_mission(&tables, i, true);
+        }
+        let p = Profile::new("Hans", 4);
+        nfs_game::save::write_profile(&dir, &p, &nfs_game::save::career_to_sav(&c, &tables, &p)).unwrap();
+        // the retired JSON, with the accepted stage the `.sav` of before had no field for
+        let mut v = serde_json::to_value(&c).unwrap();
+        v["promotions_accepted"] = serde_json::json!([stage]);
+        let json = dir.join("career.json");
+        std::fs::write(&json, serde_json::to_vec(&v).unwrap()).unwrap();
+
+        let mut ui = CareerUi::load_from(&paths, dir.clone(), Some(&json)).unwrap();
+        assert_eq!(ui.profile, p, "player.lst's profile");
+        assert!(!json.exists(), "migrated once");
+        let started = ui.career.clone();
+        assert_eq!(started.money, 77_777);
+        assert_ne!(started.garage[0].parts, owned.parts, "the reversed list comes back sorted");
+        let last = tables.missions.iter().rposition(|m| m.stage == stage).unwrap();
+        assert!(started.prize_taken[last], "the JSON's accepted stage, now `fac+0xC = −1`");
+        assert!(ui.switch_profile(&p));
+        assert_eq!(ui.career, started, "the front-end entry's reload is the start-up load");
+        let again = CareerUi::load_from(&paths, dir.clone(), Some(&json)).unwrap();
+        assert_eq!(again.career, started, "a restart too");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `CREATEPLAYERDONE` / `SETNAMETHENBACK` / `REMOVEPLAYER` over their three helpers:
     /// 0x4DE5B0 refuses a taken name, `LoadInfo` reads the file back, 0x4DE8A0 deletes it.
     #[test]
@@ -1736,7 +1829,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut ui = CareerUi::load(&paths).unwrap();
         ui.save_dir = dir.clone();
-        ui.save_path = dir.join("career.json");
         ui.career.money = 1;
         assert!(ui.create_profile("Hans", 8));
         assert!(dir.join("8Hans.sav").exists());
@@ -1801,7 +1893,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut ui = CareerUi::load(&paths).unwrap();
         ui.save_dir = dir.clone();
-        ui.save_path = dir.join("career.json");
         assert!(ui.create_profile("Greta", 5));
         let file = dir.join("5Greta.sav");
         assert!(file.exists());
@@ -1840,7 +1931,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut ui = CareerUi::load(&paths).unwrap();
         ui.save_dir = dir.clone();
-        ui.save_path = dir.join("career.json");
         ui.career = Career::default();
         assert!(ui.tournaments().len() >= 2, "the classic era lists several tournaments");
         ui.t_idx = 1;
@@ -1876,14 +1966,11 @@ mod tests {
             eprintln!("skipping: original game data not found");
             return;
         };
-        let tmp = std::env::temp_dir().join(format!("nfs-career-ui-{}.json", std::process::id()));
-        unsafe { std::env::set_var("NFS5_CAREER_SAVE", &tmp) };
         let mut ui = CareerUi::load(&paths).unwrap();
         // the profile's `.sav` and `player.lst` go to a scratch dir, never the real save dir
         let dir = std::env::temp_dir().join(format!("nfs-career-ui-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         ui.save_dir = dir.clone();
-        ui.save_path = tmp.clone();
         ui.career = Career::default();
         assert_eq!(ui.career.money, 11_000);
         let list = ui.tournaments();
@@ -1969,14 +2056,16 @@ mod tests {
         // or profile creation — a race's own result (`finish`) stays in memory. The disk file
         // still carries what `activate()`'s own launch (0x4D52EA) saved: the fee paid and the
         // parts installed, but no mileage/win/prize from the race just run.
-        let on_disk = Career::load(&tmp).unwrap();
+        let load = |ui: &CareerUi| nfs_game::save::load_profile_career(&dir, &ui.profile, &ui.tables).expect("the launch saved the profile").0;
+        let on_disk = load(&ui);
         assert_ne!(on_disk, ui.career, "the race's own result is not saved yet");
         assert_eq!(on_disk.garage[0].mileage, 0, "disk still holds the pre-race launch save");
         assert_eq!(on_disk.money, 100_000 - price, "disk still holds the launch-time money, not the prize");
         // `LOADGAMEBUTTON` (0x510AF0) is the plain "save now": it catches the result up
         ui.save();
-        assert_eq!(Career::load(&tmp).unwrap(), ui.career);
-        let _ = std::fs::remove_file(tmp);
+        let caught_up = load(&ui);
+        assert_eq!((caught_up.money, caught_up.garage[0].mileage, caught_up.state(1).events.len()), (ui.career.money, 3000, 1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `0x4EBDA0` reads a tournament/finale opponent's `.RACENUMBER` straight out of the table

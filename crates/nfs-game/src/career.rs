@@ -16,7 +16,8 @@
 //!   (0x4F8E50, HIGH); selling pays the value (the original's offer loop is simplified — MEDIUM).
 //! * Career races add 3000 km and one win to the owned car.
 //!
-//! The save file is this port's own JSON (the original `.sav` accessor section is still open).
+//! The save file is the profile's `.sav` (`crate::save`), as in the original; the port's own JSON
+//! career of before 2026-10-01 is read once by the migration `crate::save::migrate_legacy_json`.
 
 use nfs_assets::GamePaths;
 use nfs_formats::career::{self, Era, Mission, Part, Personality, Tournament, TournamentKind, TrackInfo};
@@ -756,11 +757,15 @@ pub struct TournamentState {
     /// `Tournament.Tournament(TIMESCOMPLETED)` prints (0x506929).
     #[serde(default)]
     pub completions: u32,
-    pub final_rank: Option<u8>,
-    pub prize: u32,
-    /// Attempts that ended with rank > 3 (tournament reset).
-    #[serde(default)]
-    pub failed_attempts: u32,
+    // *(Until 2026-10-01 the port also kept `final_rank`, `prize` and `failed_attempts` here. None
+    // is a field of the original: the filing 0x503AD0 takes the rank from 0x503660 (0x503B9A) only
+    // to choose between completion and reset (`cmp eax, 3` at 0x503BA2 → 0x503CB3), the prize goes
+    // straight into the money (0x4EE06E), and the event records are zeroed — done byte, points,
+    // times, bonus, prize — by 0x503E40 on both era arms (0x503CB8) and inline on the club arm
+    // (0x503D74…0x503DD8) — so after the last event nothing in
+    // `nfs5.trn` or anywhere else holds the rank, the prize or a count of failed attempts; what
+    // stays is `+0xD3C` ([`Self::completions`]). They were lost at every front-end entry's reload
+    // (0x4D3B52); an older port JSON's three keys are ignored.)*
 }
 
 /// What one of `repair.lay`'s ten `QUICKFIX` boxes repairs — the fix function 0x50F110 calls for
@@ -798,9 +803,23 @@ pub struct Career {
     /// Factory Driver: result per mission (`fac+0xE8`, 1 = passed), indexed like `nfs5.fac`.
     #[serde(default)]
     pub missions: Vec<i16>,
-    /// Stages whose promotion prize car was accepted (`fac+0xC = −1`).
+    /// Per `nfs5.fac` record: its promotion was taken — the record's `+0xC` (the promotion text id,
+    /// 3191 / 3342 / 3495 in the shipped table) overwritten with −1 by **0x51AF80**, which
+    /// `ACCEPTPRIZECAR` 0x51A6D0 calls on the record the last mission race filed (`[0x69C8F0]`,
+    /// [`Self::last_mission`]). The `Missions` module saves and loads the whole table
+    /// (0x51A870 / 0x51A760), so the mark rides in the `.sav`. *(Until 2026-10-01 the port kept a
+    /// list of accepted stages, `promotions_accepted`, which no `.sav` field held: every front-end
+    /// entry's reload (0x4D3B52) dropped it and the next mission race offered the stage's prize car
+    /// again.)*
     #[serde(default)]
-    pub promotions_accepted: Vec<i16>,
+    pub prize_taken: Vec<bool>,
+    /// **`[0x69C8F0]`** — the `nfs5.fac` record the last mission race filed: 0x51AEF0 (from the
+    /// race end 0x4EDF00 at 0x4EE16F) points it at the first record whose `+0xE8` is 0, record 0
+    /// when none is (0x51AF09…0x51AF26), and stores the result there. Read only by the promotion
+    /// test 0x51AF90, the prize car 0x51B050 and its consumer 0x51AF80. A global, not saved and
+    /// never cleared: 0 (no record) until the process races its first mission.
+    #[serde(skip)]
+    pub last_mission: Option<usize>,
     /// The used-car market — the vector at `[0x691B88]`, which the original saves as its
     /// `UsedCarMarket` module (`savegame.md` §4.4). The player's own listings stay in the garage
     /// with an `asking_price`; these are the cars the game generates.
@@ -842,7 +861,7 @@ fn default_year() -> u16 {
 
 impl Default for Career {
     fn default() -> Self {
-        Self { version: SAVE_VERSION, era: Era::Classic, year: 1950, money: STARTING_MONEY, garage: Vec::new(), tournaments: BTreeMap::new(), evolution_complete: false, missions: Vec::new(), promotions_accepted: Vec::new(), market: Vec::new(), spares: Vec::new(), seen_evolution_intro: false, seen_factory_welcome: false, seen_first_mission: false, custom_colours: [0; 8] }
+        Self { version: SAVE_VERSION, era: Era::Classic, year: 1950, money: STARTING_MONEY, garage: Vec::new(), tournaments: BTreeMap::new(), evolution_complete: false, missions: Vec::new(), prize_taken: Vec::new(), last_mission: None, market: Vec::new(), spares: Vec::new(), seen_evolution_intro: false, seen_factory_welcome: false, seen_first_mission: false, custom_colours: [0; 8] }
     }
 }
 
@@ -868,32 +887,51 @@ pub struct EventOutcome {
 }
 
 impl Career {
-    /// Where the career lives. `NFS5_SAVE_DIR` moves it, the same way it moves `SaveData`
-    /// ([`crate::save::save_dir`]) — without that, a headless sweep or a test run writes into the
-    /// player's own career, and since the front end's bottom bar shows the money on every screen,
-    /// that silently moves all 97 screenshot goldens (found 2026-09-23 by doing exactly that).
-    pub fn default_save_path() -> PathBuf {
+    /// Where the port's retired JSON career (`career.json`) lived until 2026-10-01: beside the
+    /// profiles when `NFS5_SAVE_DIR` is set, else in the port's data directory. Read once by the
+    /// migration ([`crate::save::migrate_legacy_json`]) and never written again — the career is
+    /// the profile's `.sav`, as in the original.
+    pub fn legacy_json_path() -> PathBuf {
         if std::env::var_os("NFS5_SAVE_DIR").is_some() {
             return crate::save::save_dir().join("career.json");
         }
         nfs_assets::platform::data_dir().join("career.json")
     }
 
-    pub fn load(path: &Path) -> Result<Self, CareerError> {
+    /// Read a retired port JSON career: the career itself and the one key the `.sav` stores in
+    /// another shape, the accepted promotion stages (`promotions_accepted`, now
+    /// [`Self::prize_taken`]). Keys of fields that are gone (`final_rank`, `prize`,
+    /// `failed_attempts`, `eras_completed`, `finale`) are ignored.
+    pub fn read_legacy_json(path: &Path) -> Result<(Self, Vec<i16>), CareerError> {
+        #[derive(Deserialize)]
+        struct Promotions {
+            #[serde(default)]
+            promotions_accepted: Vec<i16>,
+        }
         let data = std::fs::read(path).map_err(|source| CareerError::Io { path: path.to_path_buf(), source })?;
         let c: Career = serde_json::from_slice(&data).map_err(|source| CareerError::Json { path: path.to_path_buf(), source })?;
         if c.version > SAVE_VERSION {
             return Err(CareerError::SaveVersion { found: c.version, supported: SAVE_VERSION });
         }
-        Ok(c)
+        let p: Promotions = serde_json::from_slice(&data).map_err(|source| CareerError::Json { path: path.to_path_buf(), source })?;
+        Ok((c, p.promotions_accepted))
     }
 
-    pub fn save(&self, path: &Path) -> Result<(), CareerError> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|source| CareerError::Io { path: dir.to_path_buf(), source })?;
+    /// An accepted stage of the retired JSON as the record mark the original keeps
+    /// ([`Self::prize_taken`]): the record whose race finished the stage — 0x51AE80 / 0x51AEF0
+    /// race the records in table order (the first whose `+0xE8` is 0), so that is the stage's
+    /// last record. Port-only (migration). True when a mark was added.
+    pub fn fold_accepted_stages(&mut self, tables: &CareerTables, stages: &[i16]) -> bool {
+        let mut changed = false;
+        for &stage in stages {
+            let Some(r) = tables.missions.iter().rposition(|m| m.stage == stage) else { continue };
+            if self.prize_taken.len() < tables.missions.len() {
+                self.prize_taken.resize(tables.missions.len(), false);
+            }
+            changed |= !self.prize_taken[r];
+            self.prize_taken[r] = true;
         }
-        let data = serde_json::to_vec_pretty(self).map_err(|source| CareerError::Json { path: path.to_path_buf(), source })?;
-        std::fs::write(path, data).map_err(|source| CareerError::Io { path: path.to_path_buf(), source })
+        changed
     }
 
     /// Bring a career loaded from an older port save up to [`SAVE_VERSION`]: a version-1 career's
@@ -1837,8 +1875,6 @@ impl Career {
         let standings = standings_of(&st.events, t.time_ranked());
         let rank = standings.iter().position(|(d, ..)| *d == 0).unwrap_or(7) as u8 + 1;
         let tprize = t.prize[rank as usize - 1];
-        st.final_rank = Some(rank);
-        st.prize = tprize;
         outcome.final_rank = Some(rank);
         outcome.tournament_prize = tprize;
         // 0x4EE06E: 0x5012E0(tournament prize) — the amount clamped, then added (`st` still
@@ -1854,7 +1890,6 @@ impl Career {
         if rank > 3 {
             st.events.clear();
             st.entered = false;
-            st.failed_attempts += 1;
             outcome.reset = true;
             return outcome;
         }
@@ -1918,41 +1953,52 @@ impl Career {
         (0..tables.missions.len()).find(|i| self.missions.get(*i).copied().unwrap_or(0) != 1)
     }
 
-    /// Store the result of mission `idx` (a failed mission stays current). Returns the stage whose
-    /// promotion is now due, if the pass completed a stage.
+    /// Store the result of mission `idx` (a failed mission stays current) — **0x51AEF0**, from the
+    /// race end 0x4EDF00 (0x4EE16F): the record becomes `[0x69C8F0]` ([`Self::last_mission`]) and
+    /// takes the result `[0x657834]` at `+0xE8` (0x51AF45). Returns the record's stage when the
+    /// promotion test 0x51AF90 now answers yes ([`Self::promotion_due`]).
     pub fn record_mission(&mut self, tables: &CareerTables, idx: usize, passed: bool) -> Option<i16> {
         if self.missions.len() < tables.missions.len() {
             self.missions.resize(tables.missions.len(), 0);
         }
         self.missions[idx] = passed as i16;
-        if !passed {
+        self.last_mission = Some(idx);
+        self.promotion_due(tables).map(|m| m.stage)
+    }
+
+    /// **0x51AF90** — the promotion test the front end's way back from a type-9 race makes
+    /// (0x4D4CA6): with `R = [0x69C8F0]`, the record the race filed (none → no, 0x51AF9B), find
+    /// the first record whose `+0xE8` is 0 (0x51AFBC…0x51AFCB); when there is one and its stage
+    /// `+8` equals R's (0x51AFF4) — the stage is not finished — no; otherwise (a stage just
+    /// finished, or every record passed) yes unless R's `+0xC` is −1 (0x51AFCD / 0x51AFFA), the mark
+    /// 0x51AF80 leaves once R's prize was taken. So the offer belongs to the race that finished the
+    /// stage and to no later one; the record answers with its own promotion text `+0xC` and prize
+    /// car `+0x10` (0x51B050). *(Until 2026-10-01 the port offered every finished stage whose
+    /// prize it had not seen accepted, from a list a profile reload dropped, so the next mission
+    /// race after any reload offered the first stage's car again.)*
+    pub fn promotion_due<'a>(&self, tables: &'a CareerTables) -> Option<&'a Mission> {
+        let r = self.last_mission?;
+        let rec = tables.missions.get(r)?;
+        let undone = (0..tables.missions.len()).find(|i| self.missions.get(*i).copied().unwrap_or(0) == 0);
+        if undone.is_some_and(|u| tables.missions[u].stage == rec.stage) {
             return None;
         }
-        let stage = tables.missions[idx].stage;
-        let stage_done = tables.missions.iter().enumerate().filter(|(_, m)| m.stage == stage).all(|(i, _)| self.missions[i] == 1);
-        (stage_done && !self.promotions_accepted.contains(&stage)).then_some(stage)
+        (!self.prize_taken.get(r).copied().unwrap_or(false)).then_some(rec)
     }
 
-    /// Promotion due: a completed stage whose prize was not accepted yet.
-    pub fn promotion_due<'a>(&self, tables: &'a CareerTables) -> Option<&'a Mission> {
-        for stage in 1..=3i16 {
-            let ms: Vec<(usize, &Mission)> = tables.missions.iter().enumerate().filter(|(_, m)| m.stage == stage).collect();
-            if ms.is_empty() || self.promotions_accepted.contains(&stage) {
-                continue;
-            }
-            if ms.iter().all(|(i, _)| self.missions.get(*i).copied().unwrap_or(0) == 1) {
-                return ms.first().map(|(_, m)| *m);
-            }
-        }
-        None
-    }
-
-    /// `ACCEPTPRIZECAR`: add the stage's prize car to the garage (purchase price 0).
+    /// **`ACCEPTPRIZECAR` 0x51A6D0**: R's prize car (0x51B050 = `R+0x10`) joins the garage through
+    /// AddOwnedCar 0x502270 (purchase price 0), then 0x51AF80 sets `R+0xC` to −1. The handler tests
+    /// nothing — only the `factoryvictory` screen, which the promotion test opens, carries it; the
+    /// port's text menu calls it after [`Self::promotion_due`]. `None` when no mission was raced
+    /// in this process (`[0x69C8F0]` still 0).
     pub fn accept_promotion(&mut self, tables: &CareerTables) -> Option<u16> {
-        let m = self.promotion_due(tables)?;
-        let (stage, car) = (m.stage, m.prize_car as u16);
-        self.promotions_accepted.push(stage);
+        let r = self.last_mission?;
+        let car = tables.missions.get(r)?.prize_car as u16;
         self.garage.push(OwnedCar::construct(tables, car, 0, 0));
+        if self.prize_taken.len() < tables.missions.len() {
+            self.prize_taken.resize(tables.missions.len(), false);
+        }
+        self.prize_taken[r] = true;
         Some(car)
     }
 
@@ -2789,7 +2835,7 @@ mod tests {
         assert!(o.reset && o.final_rank == Some(5));
         assert_eq!(o.tournament_prize, 1000, "tournament prize paid for any rank");
         let st = c.state(1);
-        assert!(!st.completed && st.events.is_empty() && st.failed_attempts == 1);
+        assert!(!st.completed && st.events.is_empty() && st.completions == 0);
         assert_eq!(c.era, Era::Classic);
         // re-entering pays the fee again
         let m = c.money;
@@ -3078,15 +3124,27 @@ mod tests {
         assert_eq!(mileage_score(35, 25_000), -1);
     }
 
+    /// The retired JSON (`career.json`, written until 2026-10-01) reads back with its accepted
+    /// stages; the keys of the fields that are gone are ignored.
     #[test]
-    fn save_roundtrip() {
+    fn a_legacy_json_career_reads_back() {
         let mut c = Career::default();
         c.garage.push(OwnedCar { car_id: 76, paint_set: 2, trim: Trim::default(), custom: [None; 4], parts: vec![13], stock: vec![], mileage: 3000, wins: 1, damage_pct: 0.0, damage: [0.0; 10], part_state: Vec::new(), setup: CAR_SETUP_DEFAULT, setup_backup: CAR_SETUP_DEFAULT, purchase_price: 11_000, asking_price: Some(9_000), offer: None });
         c.tournaments.insert(9, TournamentState { entered: true, ..Default::default() });
+        let mut v = serde_json::to_value(&c).unwrap();
+        v["promotions_accepted"] = serde_json::json!([1, 2]);
+        v["eras_completed"] = serde_json::json!([]);
+        v["finale"] = serde_json::Value::Null;
+        v["tournaments"]["9"]["final_rank"] = serde_json::json!(2);
+        v["tournaments"]["9"]["prize"] = serde_json::json!(5000);
+        v["tournaments"]["9"]["failed_attempts"] = serde_json::json!(1);
         let dir = std::env::temp_dir().join(format!("nfs-career-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("career.json");
-        c.save(&path).unwrap();
-        assert_eq!(Career::load(&path).unwrap(), c);
+        std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        let (back, stages) = Career::read_legacy_json(&path).unwrap();
+        assert_eq!(back, c);
+        assert_eq!(stages, vec![1, 2]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

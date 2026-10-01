@@ -178,6 +178,15 @@ impl App {
             let automatic = self.player_automatic();
             nfs_game::career::fold_fresh_car(&mut self.specs, &e.stock_parts, &table, &e.sim_family, automatic);
         }
+        // the car slot is the recording's (`Replay_begin` 0x413CF0 copies the whole recorded block
+        // over `0x6573E8`, `.TYPE` among it): its record's engine sound set, dials and `nfs5.car`
+        // id — until 2026-10-01 a playback kept the last race's three (EV1 audit)
+        self.player_car_id = entry.as_ref().map(|e| e.id);
+        if let Some(e) = &entry {
+            self.snd.sound_set = e.sound_set.clone();
+            self.dials = Some((e.dial_kmh, e.dial_mph, e.dial_tach));
+        }
+        self.apply_replay_launch_block(&setup);
         self.track = track;
         // the catalogue record's body style and roof, as the live race's car had them
         self.car = match &entry {
@@ -196,8 +205,6 @@ impl App {
         self.road.traffic_ids = None;
         self.road.cops_enabled = setup.cops;
         self.road.damage_on = setup.damage;
-        self.road.cop_count = 4;
-        self.road.cops_race = false;
         // `SKILL` travels in the block as well (0x413DCF)
         self.race_skill = setup.skill;
         self.traffic_seed = setup.seed;
@@ -214,6 +221,27 @@ impl App {
         let (Some(renderer), Some(window)) = (self.renderer.take(), self.window.take()) else { return };
         self.tick = 0;
         self.start_race(renderer, window, event_loop);
+    }
+
+    /// The launch-block words of a recording a playback takes from it (`Replay_begin` 0x413CF0's bulk
+    /// restore over `0x6573E8`; replay.md 2026-10-01): `RACE_TYPE` 0x10 (+0x04) decides the lap
+    /// knockout (3, the race's `quick_knockout`), the cops race (1: `cops_race`, four cops, 0x4ED0BC...
+    /// 0x4ED282) and the rest of what the race reads of it; `FEGAME_TYPE` 0x30 (+0x00) is read by
+    /// [`App::block_game_type`] (and a mission's two cops, 0x4ED0A5...0x4ED0E7); `.CAMERA` 0x148 is
+    /// slot 0's list (+0xCA4 +0x208), the four views the race's camera cycles. A field the file does
+    /// not carry (a `.prpl` from before them) falls back and says so: single race (not a lap knockout),
+    /// the front end's current `Game.GameType`, the last launch's camera list (APPROXIMATION).
+    pub(crate) fn apply_replay_launch_block(&mut self, setup: &nfs_game::replay::ReplaySetup) {
+        self.quick_knockout = setup.race_type == Some(3);
+        self.road.cops_race = setup.race_type == Some(1);
+        self.road.cop_count = if setup.fegame_type == Some(9) { 2 } else { 4 };
+        match setup.camera.as_ref().filter(|c| !c.is_empty()) {
+            Some(c) => self.camera_cycle = c.iter().map(|&v| v as u16).collect(),
+            None => tracing::info!(cycle = ?self.camera_cycle, "replay: no camera list in the setup, the last launch's stays (APPROXIMATION)"),
+        }
+        if setup.race_type.is_none() || setup.fegame_type.is_none() {
+            tracing::info!(race_type = ?setup.race_type, fegame_type = ?setup.fegame_type, "replay: no RACE_TYPE / FEGAME_TYPE in the setup, a single race under the current Game.GameType (APPROXIMATION)");
+        }
     }
 
     /// **0x50D3C0**, the "yes" to 808: `"%s%s.rpl"` over the replay directory and `Replay.List`'s

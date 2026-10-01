@@ -208,7 +208,7 @@ impl App {
                     o.vehicle.traction_control = false;
                 }
             }
-            if let Ok(path) = std::env::var("NFS_NET_DUMP")
+            if let Ok(path) = nfs_game::config::cfg().nfs_net_dump.var()
                 && let Ok(f) = std::fs::File::create(&path)
             {
                 self.net_dump = Some(std::io::BufWriter::new(f));
@@ -591,7 +591,7 @@ impl App {
     /// port (a replay is a file), so the `Some` arm runs only under the test glue `NFS_FOLLOW_VIEWED`.
     pub(crate) fn followed_seat(&self) -> Option<usize> {
         let viewed = Self::viewed_seat_of(self.replay_net.as_ref(), self.replay_view)?;
-        let live = self.net.session.as_ref().is_some_and(|n| n.link_up() && n.finish_sent()) || std::env::var_os("NFS_FOLLOW_VIEWED").is_some();
+        let live = self.net.session.as_ref().is_some_and(|n| n.link_up() && n.finish_sent()) || nfs_game::config::cfg().nfs_follow_viewed.var_os().is_some();
         live.then_some(viewed)
     }
 
@@ -1552,7 +1552,7 @@ pub(crate) fn remote_dump(tick: u64, seat: usize, v: &Vehicle, n: &netplay::NetP
     use std::io::Write;
     static OUT: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
     let out = OUT.get_or_init(|| {
-        let path = std::env::var_os("NFS_REMOTE_DUMP")?;
+        let path = nfs_game::config::cfg().nfs_remote_dump.var_os()?;
         let mut f = std::io::BufWriter::new(std::fs::File::create(path).ok()?);
         let _ = writeln!(f, "tick,seat,x,y,z,speed_est,block_tick,lag,lag_avg,stale");
         Some(std::sync::Mutex::new(f))

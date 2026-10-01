@@ -625,7 +625,7 @@ impl CarModel {
         let pages = car.build_pages(paths, paint, &style)?;
         let page_tex: Vec<(nfs_renderer::TextureId, bool)> = pages
             .iter()
-            .map(|p| (r.upload_texture(&TextureData::single(p.width, p.height, p.rgba.clone())), p.is_window || p.is_alpha))
+            .map(|p| (r.upload_texture_mips(p.width, p.height, std::slice::from_ref(&p.rgba)), p.is_window || p.is_alpha))
             .collect();
         // the damage decals, `L` for a paint brighter than 0x50, `D` otherwise
         let damage_patches = nfs_assets::car::damage_patches(paths, &car.model, light_paint).unwrap_or_default();
@@ -970,7 +970,7 @@ impl CarModel {
                                 _ => break,
                             }
                         }
-                        morph[anim].push(MorphPart { mesh: id, base: mesh.vertices.clone(), frames: positions });
+                        morph[anim].push(MorphPart { mesh: id, scratch: mesh.vertices.clone(), seen: 0, frames: positions });
                     }
                     if let Some((dm, zm)) = &crush
                         && let (Some(d), Some(z)) = (dm.get(k), zm.get(k))
@@ -1088,7 +1088,21 @@ impl CarModel {
             wheel_radius,
             half_track,
             lights,
-            damage_pages: pages,
+            // a race car's pixel pages are read only for the pages a damage patch lands on
+            // ([`Self::update_damage`], [`Self::instantiate`]); `blit_page` is the front-end rooms'
+            // — so the other pages' pixels (on the GPU already) are not kept, in the model or in
+            // every instance cloned from it
+            damage_pages: if race_roof.is_some() {
+                let touched: std::collections::HashSet<usize> = damage_patches.iter().map(|p| p.page).collect();
+                pages.into_iter().enumerate().map(|(i, mut p)| {
+                    if !touched.contains(&i) {
+                        p.rgba = Vec::new();
+                    }
+                    p
+                }).collect()
+            } else {
+                pages
+            },
             damage_patches,
             page_textures,
             damage_shown: [0.0; 10],
@@ -1134,7 +1148,7 @@ impl CarModel {
             let mut tex_remap: HashMap<nfs_renderer::TextureId, nfs_renderer::TextureId> = HashMap::new();
             for page_index in touched {
                 let (Some(base), Some(&old_tex)) = (c.damage_pages.get(page_index), c.page_textures.get(page_index)) else { continue };
-                let new_tex = r.upload_texture(&TextureData::single(base.width, base.height, base.rgba.clone()));
+                let new_tex = r.upload_texture_mips(base.width, base.height, std::slice::from_ref(&base.rgba));
                 c.page_textures[page_index] = new_tex;
                 tex_remap.insert(old_tex, new_tex);
             }
@@ -1622,8 +1636,14 @@ impl CarModel {
         // `.y` (0x43E6E1…0x43E6F1), so a lift along the model's (and the body's) up
         let lift = |m: i8| usize::try_from(m).ok().and_then(|m| travel.get(m).copied()).map_or(Mat4::IDENTITY, |y| Mat4::from_translation(Vec3::new(0.0, y, 0.0)));
         let mut out = Vec::with_capacity(self.body.len() / 4 + 4 * 8);
+        // (the same products every part makes, taken once: `(car_to_world · MODEL_TO_BODY) · m` is how
+        // the expression below associates, and the inverse is of a constant)
+        let to_body = car_to_world * MODEL_TO_BODY;
+        let body_to_model = MODEL_TO_BODY.inverse();
+        let mut items: Vec<(u32, DrawItem)> = Vec::with_capacity(self.body.len() / 4 + 4 * 8);
+        let mut order: Vec<(u32, u32)> = Vec::with_capacity(items.capacity());
         for pass in passes {
-            let mut items: Vec<(u32, DrawItem)> = Vec::new();
+            items.clear();
             for (i, (mesh, material, local)) in self.body.iter().enumerate() {
                 let Some(info) = self.body_info.get(i).filter(|info| info.in_pass(pass)) else { continue };
                 // A part bound to a rotation channel turns about **its own origin**: 0x43CA19…
@@ -1644,7 +1664,7 @@ impl CarModel {
                     5 => *local * Mat4::from_rotation_z((steer[0] + steer[1]).clamp(-4.5 / 23.0, 4.5 / 23.0) * std::f32::consts::TAU),
                     n => *local * self.channel_matrix(n),
                 };
-                items.push((self.body_order.get(i).copied().unwrap_or(u32::MAX), DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * m)));
+                items.push((self.body_order.get(i).copied().unwrap_or(u32::MAX), DrawItem::new(*mesh, *material, to_body * m)));
             }
             for w in self.wheels.iter().filter(|w| w.info.in_pass(pass)) {
                 let idx = match (w.is_front, w.is_left) {
@@ -1676,8 +1696,8 @@ impl CarModel {
                     // local has translation = pivot (every wheel `tr` is a pure translation); rotate
                     // about the pivot in model space, the lift before it: `tr · T · R`
                     let pivot = local.w_axis.truncate();
-                    let m = lift(w.info.move_channel) * Mat4::from_translation(pivot) * MODEL_TO_BODY * st * spin * MODEL_TO_BODY.inverse() * Mat4::from_translation(-pivot) * *local;
-                    items.push((w.order, DrawItem::new(*mesh, *material, car_to_world * MODEL_TO_BODY * m)));
+                    let m = lift(w.info.move_channel) * Mat4::from_translation(pivot) * MODEL_TO_BODY * st * spin * body_to_model * Mat4::from_translation(-pivot) * *local;
+                    items.push((w.order, DrawItem::new(*mesh, *material, to_body * m)));
                 }
             }
             // the parts in the order 0x43C1B0's sort left the LOD's list (`body_order`, read
@@ -1685,8 +1705,12 @@ impl CarModel {
             // which 0x43C830 walks skipping the parts not in the pass (0x43C8AC…0x43C8E9) — so
             // the pass's parts keep their places in the sorted whole list. One article's meshes
             // share a place and keep their own order (the stable sort).
-            items.sort_by_key(|(k, _)| *k);
-            out.extend(items.into_iter().map(|(_, it)| it));
+            // (sorted as `(key, index)` pairs, the index breaking ties: a stable order, without moving the
+            // fat items)
+            order.clear();
+            order.extend(items.iter().enumerate().map(|(i, (k, _))| (*k, i as u32)));
+            order.sort_unstable();
+            out.extend(order.iter().map(|&(_, i)| items[i as usize].1));
         }
         out
     }
@@ -1774,7 +1798,12 @@ impl CarModel {
 #[derive(Clone)]
 struct MorphPart {
     mesh: MeshId,
-    base: Vec<Vertex>,
+    /// The vertices last blended and queued for the mesh (the frame-0 vertices at first, which is
+    /// what the upload holds): the next blend rewrites only the positions, in place.
+    scratch: Vec<Vertex>,
+    /// `Renderer::mesh_writes` of the mesh right after this part's last write (0 at the upload):
+    /// the mesh still holds `scratch` while the count is the same.
+    seen: u32,
     frames: Vec<Vec<[f32; 3]>>,
 }
 
@@ -1835,24 +1864,36 @@ impl CarModel {
         self.blend(r, n, frame as usize, next as usize, frac);
     }
 
+    /// The draw's blend of animation `n`'s parts (0x43E2FD…0x43E35B). Each part keeps the vertices it
+    /// last queued: the positions are blended in place (the same `A + (B − A)·frac` per vertex, the
+    /// other fields are the frame-0 ones, which nothing rewrites) and the mesh is rewritten only when
+    /// a position changed bit for bit or someone else (the crush, another instance sharing the mesh)
+    /// has written it since — a write of the bytes the mesh already holds is not made.
     fn blend(&mut self, r: &mut Renderer, n: usize, frame: usize, next: usize, frac: f32) {
         if self.blended[n] == Some((frame, next, frac)) {
             return;
         }
         self.blended[n] = Some((frame, next, frac));
-        for p in &self.morph[n] {
+        for p in &mut self.morph[n] {
             let Some(a) = p.frames.get(frame.min(p.frames.len() - 1)) else { continue };
             let b = p.frames.get(next);
             let frac = if frame >= p.frames.len() { 0.0 } else { frac };
-            let mut v = p.base.clone();
-            for (i, out) in v.iter_mut().enumerate() {
+            let mut changed = p.seen != r.mesh_writes(p.mesh);
+            for (i, out) in p.scratch.iter_mut().enumerate() {
                 let pa = Vec3::from(a[i]);
-                out.position = match b {
+                let position = match b {
                     Some(b) => (pa + (Vec3::from(b[i]) - pa) * frac).to_array(),
                     None => a[i],
                 };
+                if position.map(f32::to_bits) != out.position.map(f32::to_bits) {
+                    out.position = position;
+                    changed = true;
+                }
             }
-            r.update_mesh_vertices(p.mesh, &v);
+            if changed {
+                r.update_mesh_vertices(p.mesh, &p.scratch);
+                p.seen = r.mesh_writes(p.mesh);
+            }
         }
     }
 }

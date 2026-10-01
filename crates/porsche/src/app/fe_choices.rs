@@ -564,7 +564,7 @@ impl App {
         };
         // diagnostic: `NFS_CHOICE=Graphics.CarChrome=2,Display.RearView=1` overrides a choice for
         // a `--screenshot` run, where no front end sets it
-        if let Ok(over) = std::env::var("NFS_CHOICE")
+        if let Ok(over) = nfs_game::config::cfg().nfs_choice.var()
             && let Some(v) = over.split(',').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == name).and_then(|(_, v)| v.trim().parse::<usize>().ok())
         {
             return Some((v.min(options.len() - 1), options));

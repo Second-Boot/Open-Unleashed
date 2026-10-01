@@ -493,6 +493,19 @@ pub struct ReplaySetup {
     /// The race was an input-exchange network race: what the launch settled about the other humans
     /// and the road they share (`replay.md` §18.15). `None` for every other race.
     pub net: Option<NetSetup>,
+    /// `RACE_TYPE` (`[0x6573EC]`, registry id 0x10 at +0x04): `Replay_begin` 0x413CF0's bulk
+    /// restore hands the recording's back, so a playback of a Quick Knockout (3) runs the lap
+    /// knockout, of the cops race (1) the cops race, and so on (0 normal, 1 cops, 2 series,
+    /// 3 lap knockout, 4 skill test: `modes.md` section 1, 0x4EB470). `None` for a file written before
+    /// the field existed: the playback then runs as a single race (APPROXIMATION, logged).
+    pub race_type: Option<u8>,
+    /// `FEGAME_TYPE` (`[0x6573E8]`, id 0x30 at +0x00): the launch's `Game.GameType`, also the
+    /// recording's after the same restore (0x4EB4DE...0x4EB4E2 writes it). `None` as above: the
+    /// playback then answers the front end's current `Game.GameType`.
+    pub fegame_type: Option<u8>,
+    /// `.CAMERA` (id 0x148, car slot 0 `+0x208`, four dwords, `Camera.1...4`: 0x4EF02A...0x4EF0F5):
+    /// the recording's list, `None` for a file that carries none (the last launch's stays).
+    pub camera: Option<Vec<u32>>,
 }
 
 /// An input-exchange race's setup beyond [`ReplaySetup`]'s single car: the original's snapshot block
@@ -728,6 +741,22 @@ impl ReplayFile {
             }
             None => o.push(0),
         }
+        // the launch block's words (`RACE_TYPE`, `FEGAME_TYPE`, `.CAMERA`): a trailing section after the
+        // network one, so a file written before it still parses (its fields read `None`)
+        if s.race_type.is_some() || s.fegame_type.is_some() || s.camera.is_some() {
+            o.push(1);
+            o.push(s.race_type.unwrap_or(0xFF));
+            o.push(s.fegame_type.unwrap_or(0xFF));
+            match &s.camera {
+                Some(c) => {
+                    o.push(c.len().min(4) as u8 + 1);
+                    for v in c.iter().take(4) {
+                        o.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                None => o.push(0),
+            }
+        }
         o
     }
 
@@ -766,12 +795,29 @@ impl ReplayFile {
         let stream = d.get(p..p + len)?.to_vec();
         p += len;
         let net = if *d.get(p)? == 0 {
+            p += 1;
             None
         } else {
             p += 1;
             Some(NetSetup::parse(d, &mut p)?)
         };
-        Some(Self { setup: ReplaySetup { track, car, sim, car_id, paint, laps, opponents, traffic, cops, damage, backwards, mirror, seed, skill, driver_name, net }, final_tick, stream })
+        // the launch block's trailing section; a file written before it ends here (the fallbacks are the caller's)
+        let (mut race_type, mut fegame_type, mut camera) = (None, None, None);
+        if d.get(p) == Some(&1) {
+            let some = |b: u8| (b != 0xFF).then_some(b);
+            race_type = d.get(p + 1).copied().and_then(some);
+            fegame_type = d.get(p + 2).copied().and_then(some);
+            let n = *d.get(p + 3)? as usize;
+            if n > 0 {
+                let mut list = Vec::new();
+                for k in 0..n - 1 {
+                    let at = p + 4 + k * 4;
+                    list.push(u32::from_le_bytes(d.get(at..at + 4)?.try_into().ok()?));
+                }
+                camera = Some(list);
+            }
+        }
+        Some(Self { setup: ReplaySetup { track, car, sim, car_id, paint, laps, opponents, traffic, cops, damage, backwards, mirror, seed, skill, driver_name, net, race_type, fegame_type, camera }, final_tick, stream })
     }
 }
 
@@ -824,6 +870,9 @@ pub mod snapshot {
     /// `.DRIVERNAME` (id 0x13B, §16.2): a NUL-terminated name; the next registered field,
     /// `.LICENSE` at +0x1C0, bounds it to 0x44 bytes.
     pub const CAR_DRIVERNAME: usize = 0x017C;
+    /// `.CAMERA` (id 0x148, replay.md 16.2): four dwords up to `.COLORCONFIG` at +0x218
+    pub const CAR_CAMERA: usize = 0x0208;
+    pub const CAR_CAMERA_LEN: usize = 4;
     pub const CAR_DRIVERNAME_LEN: usize = 0x44;
     /// `[0x65741C]` — this machine's own race index, at `LOCAL_CAR` (+0x34, above) — and the launch's two network
     /// words `COMM_MODE` (`[0x657404]`, +0x1C) and `COMMSPOSITIONAL` (`[0x657408]`, +0x20)
@@ -947,7 +996,10 @@ pub fn original_rpl(setup: &ReplaySetup, final_tick: u64, stream: &[u8], ramp: R
     use snapshot as f;
     let mut out = vec![0u8; RPL_LEN];
     let put = |o: &mut Vec<u8>, at: usize, v: u32| o[at..at + 4].copy_from_slice(&v.to_le_bytes());
-    put(&mut out, f::RACE_TYPE, 0);
+    // `RACE_TYPE` / `FEGAME_TYPE` as the launch's 0x4EB470 wrote them (0x4EB54C, 0x4EB4E2); a setup that
+    // carries none keeps the port's earlier file: both 0
+    put(&mut out, f::RACE_TYPE, u32::from(setup.race_type.unwrap_or(0)));
+    put(&mut out, f::FEGAME_TYPE, u32::from(setup.fegame_type.unwrap_or(0)));
     put(&mut out, f::NUM_LAPS, setup.laps);
     put(&mut out, f::SKILL, setup.skill as u32);
     put(&mut out, f::COPS, u32::from(setup.cops));
@@ -970,6 +1022,13 @@ pub fn original_rpl(setup: &ReplaySetup, final_tick: u64, stream: &[u8], ramp: R
     // its own setup
     let me = setup.net.as_ref().map_or(0, |n| (n.local_index as usize).min(8));
     let base = f::CARS + me * f::CAR_STRIDE;
+    // `.CAMERA` of the car slot, written first: a network race's own launch record (below) is the
+    // same field and wins
+    if let Some(c) = &setup.camera {
+        for (k, v) in c.iter().take(f::CAR_CAMERA_LEN).enumerate() {
+            put(&mut out, base + f::CAR_CAMERA + k * 4, *v);
+        }
+    }
     if let Some(net) = &setup.net {
         // **A network race's snapshot** (`replay.md` §18.15): `FEGAME_TYPE` 3, the launch's `COMM_MODE` 4 and
         // `COMMSPOSITIONAL` 0 (an input-exchange race), `[0x65741C]` the recorded machine's own race index, the
@@ -1055,6 +1114,11 @@ pub fn parse_original_rpl(data: &[u8]) -> Option<(ReplaySetup, u64, Vec<u8>)> {
         skill: u32at(f::SKILL) as u8,
         driver_name,
         net: None,
+        // the three words of the launch block `Replay_begin` restores: read as they stand (the file has
+        // no way to say "absent": a port-written file from before them holds 0 / 0 / zeros)
+        race_type: Some(u32at(f::RACE_TYPE) as u8),
+        fegame_type: Some(u32at(f::FEGAME_TYPE) as u8),
+        camera: Some((0..f::CAR_CAMERA_LEN).map(|k| u32at(f::CARS + f::CAR_CAMERA + k * 4)).collect()),
     };
     let final_tick = u32at(SNAPSHOT_LEN) as u64;
     let stream = data[SNAPSHOT_LEN + 4..].to_vec();
@@ -1645,7 +1709,7 @@ mod tests {
     #[test]
     fn the_port_file_round_trips() {
         let f = ReplayFile {
-            setup: ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993turbo".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, damage: true, backwards: true, mirror: false, seed: 12345, skill: 1, driver_name: "Kostya".into(), net: None },
+            setup: ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993turbo".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, damage: true, backwards: true, mirror: false, seed: 12345, skill: 1, driver_name: "Kostya".into(), net: None, race_type: None, fegame_type: None, camera: None },
             final_tick: 40_000,
             stream: (0..500).map(|i| (i % 251 + 1) as u8).collect(),
         };
@@ -1657,9 +1721,36 @@ mod tests {
     }
 
     #[test]
+    fn the_launch_block_words_round_trip_and_an_old_file_reads_none() {
+        let mut setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, ..Default::default() };
+        // a file written before the trailing section: no race type, game type or camera
+        let old = ReplayFile { setup: setup.clone(), final_tick: 9, stream: vec![1, 2, 3] };
+        let d = old.write();
+        let back = ReplayFile::parse(&d).unwrap();
+        assert_eq!((back.setup.race_type, back.setup.fegame_type, back.setup.camera), (None, None, None));
+        // with the section (Quick Knockout, a career event's camera list)
+        setup.race_type = Some(3);
+        setup.fegame_type = Some(1);
+        setup.camera = Some(vec![1, 0, 2, 7]);
+        let f = ReplayFile { setup: setup.clone(), final_tick: 9, stream: vec![1, 2, 3] };
+        let d = f.write();
+        assert_eq!(ReplayFile::parse(&d), Some(f));
+        // a reader of the old layout stops after the network byte: the new section only appends
+        assert_eq!(d.len(), old.write().len() + 1 + 2 + 1 + 16);
+        // the original's block: RACE_TYPE +0x04, FEGAME_TYPE +0x00, `.CAMERA` slot 0 +0xCA4 +0x208
+        let rpl = original_rpl(&setup, 9, &[1, 2, 3], Ramp::default(), 7);
+        let at = |o: usize| u32::from_le_bytes(rpl[o..o + 4].try_into().unwrap());
+        assert_eq!((at(0x04), at(0x00)), (3, 1));
+        assert_eq!([at(0xCA4 + 0x208), at(0xCA4 + 0x20C), at(0xCA4 + 0x210), at(0xCA4 + 0x214)], [1, 0, 2, 7]);
+        assert_eq!(at(0xCA4 + 0x218), 0, "the next field (`.COLORCONFIG`) is untouched");
+        let (p, _, _) = parse_original_rpl(&rpl).unwrap();
+        assert_eq!((p.race_type, p.fegame_type, p.camera), (Some(3), Some(1), Some(vec![1, 0, 2, 7])));
+    }
+
+    #[test]
     fn the_original_rpl_has_the_documented_shape() {
         // §6.1: 0x3E24 of setup, the final tick, 0x19000 of stream — 118 312 bytes, always
-        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993coupe36".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, damage: false, backwards: true, mirror: false, seed: 4321, skill: 2, driver_name: "Kostya".into(), net: None };
+        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993coupe36".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, damage: false, backwards: true, mirror: false, seed: 4321, skill: 2, driver_name: "Kostya".into(), net: None, race_type: None, fegame_type: None, camera: None };
         let stream: Vec<u8> = (0..1000).map(|i| (i % 251 + 1) as u8).collect();
         let f = original_rpl(&setup, 12_345, &stream, Ramp { steer: true, gas: false, brake: true }, 11);
         assert_eq!(f.len(), RPL_LEN);
@@ -1770,7 +1861,7 @@ mod tests {
             own_words: vec![(0x13D, vec![0x3132_3334, 0]), (0x24F, vec![1])],
             fe_txt: vec![("time".into(), 1), ("weather".into(), 0)],
         };
-        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993turbo".into(), car_id: 154, paint: [1, 2, 3], laps: 1, opponents: 2, traffic: 1, cops: false, damage: true, backwards: false, mirror: false, seed: 8165, skill: 1, driver_name: "ANNA".into(), net: Some(net.clone()) };
+        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993turbo".into(), car_id: 154, paint: [1, 2, 3], laps: 1, opponents: 2, traffic: 1, cops: false, damage: true, backwards: false, mirror: false, seed: 8165, skill: 1, driver_name: "ANNA".into(), net: Some(net.clone()), race_type: None, fegame_type: None, camera: None };
         let f = ReplayFile { setup, final_tick: 640, stream: vec![0x41; 40] };
         let back = ReplayFile::parse(&f.write()).unwrap();
         assert_eq!(back, f);
@@ -1791,7 +1882,7 @@ mod tests {
             own_words: vec![(0x13D, vec![0x3132_3334, 0]), (0x24A, vec![2])],
             fe_txt: vec![("time".into(), 1)],
         };
-        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993".into(), car_id: 154, paint: [0; 3], laps: 1, opponents: 1, traffic: 1, cops: false, damage: true, backwards: false, mirror: false, seed: 1, skill: 1, driver_name: "ANNA".into(), net: Some(net) };
+        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993".into(), car_id: 154, paint: [0; 3], laps: 1, opponents: 1, traffic: 1, cops: false, damage: true, backwards: false, mirror: false, seed: 1, skill: 1, driver_name: "ANNA".into(), net: Some(net), race_type: None, fegame_type: None, camera: None };
         let f = original_rpl(&setup, 10, &[], Ramp::default(), 3);
         let u = |at: usize| u32::from_le_bytes(f[at..at + 4].try_into().unwrap());
         let slot = |i: usize| snapshot::CARS + i * snapshot::CAR_STRIDE;

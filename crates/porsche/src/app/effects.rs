@@ -17,9 +17,9 @@ impl App {
     /// pool with what the main pass wrote and only the entries' bias differs.
     /// `main` also sets the alpha-test state the weather draw inherits (`particles_left_ref_one`)
     /// — the weather draw is the main view's alone.
-    pub(crate) fn effect_items(&mut self, fwd: Vec3, right: Vec3, up: Vec3, draws: &[Option<nfs_game::world::ArticleDraw>], main: bool) -> Vec<nfs_renderer::DrawItem> {
-        let mut out = Vec::new();
-        self.flare_items(&mut out, fwd, right, up, draws);
+    pub(crate) fn effect_items(&mut self, fwd: Vec3, right: Vec3, up: Vec3, draws: &[Option<nfs_game::world::ArticleDraw>], main: bool, out: &mut Vec<nfs_renderer::DrawItem>) {
+        out.clear();
+        self.flare_items(out, fwd, right, up, draws);
         if let Some(p) = self.track_particles.as_ref() {
             // 0x454430 → 0x44F6E0: a camera-facing billboard per particle, turned about the
             // view axis, under the definition's blend (`+0x28` → Thrash 0x38, above) and
@@ -31,7 +31,7 @@ impl App {
             // Then the cars' sets (0x43F6E0 at 0x468B6F, after 0x455260): the same draw, `d²`
             // the car's from its last drive
             let mut sprites = p.sprites();
-            if main && std::env::var_os("NFS_SKID_STATS").is_some() {
+            if main && nfs_game::config::cfg().nfs_skid_stats.var_os().is_some() {
                 tracing::info!(drawn = sprites.len(), undrawn = p.undrawn_sprites(), "track particle sprites");
             }
             let mut streaks = Vec::new();
@@ -48,7 +48,7 @@ impl App {
             if main {
                 self.particles_left_ref_one = p.any_particles() || self.car_effects.as_ref().is_some_and(|fx| fx.any_particles());
             }
-            self.streak_items(&mut out, &streaks);
+            self.streak_items(out, &streaks);
             let z_near = self.camera.near;
             let far = self.view_far;
             for sp in sprites {
@@ -79,7 +79,6 @@ impl App {
                 });
             }
         }
-        out
     }
 
     /// The streaks of 0x454EC0 (flag 4: the cars' sparks, `nfs_game::car_effects`): per particle
@@ -98,7 +97,9 @@ impl App {
                 let Some(&mesh) = pool.get(used) else { return };
                 used += 1;
                 let first = part[0].head;
-                let mut verts = vec![nfs_renderer::Vertex { position: first.into(), normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: [0.0; 4] }; STREAK_CAP * 3];
+                let verts = &mut self.scratch.streak_verts;
+                verts.clear();
+                verts.resize(STREAK_CAP * 3, nfs_renderer::Vertex { position: first.into(), normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: [0.0; 4] });
                 for (tri, st) in verts.chunks_mut(3).zip(part) {
                     let c = |sh: u32| ((st.argb >> sh) & 0xFF) as f32 / 255.0;
                     let color = [c(16), c(8), c(0), c(24)];
@@ -107,7 +108,7 @@ impl App {
                         v.color = color;
                     }
                 }
-                r.write_mesh_vertices(mesh, &verts);
+                r.write_mesh_vertices(mesh, verts);
                 let s = &part[0];
                 let bias = ((s.zbias as f64 * (far * z_near / (far - z_near)) as f64 / s.sqd.max(1e-6) as f64) as f32).round_ties_even();
                 // under the system's own `GREATER 1` (0x454456, set before 0x454844 calls this)
@@ -140,10 +141,10 @@ impl App {
         let view = nfs_game::weather::View::new(self.camera.position, fwd, self.camera.up);
         let tick = self.tick as u32;
         let (Some(w), Some(p)) = (self.weather.as_mut(), self.track_particles.as_mut()) else { return };
-        if std::env::var("NFS_WEATHER_VIEW").is_ok() {
+        if nfs_game::config::cfg().nfs_weather_view.var().is_ok() {
             // `NFS_WEATHER_STEPS=<n>` (diagnostic) runs n one-tick frames instead of 40; a
             // `NFS_WEATHER_VIEW` that is not a slice number leaves the camera where it is
-            let steps = std::env::var("NFS_WEATHER_STEPS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(40);
+            let steps = nfs_game::config::cfg().nfs_weather_steps.var().ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(40);
             for j in 0..steps {
                 w.frame(tick.wrapping_add(j), snow, rain, view, false, p.rng_mut(), &mut self.fe_rng);
             }

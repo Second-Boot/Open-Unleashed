@@ -4,6 +4,18 @@ use crate::*;
 
 impl App {
     /// Menu navigation shared by the keyboard and the gamepad.
+    ///
+    /// **The port-only developer text menu (`--debug-menu`) is TEST GLUE / a developer tool: the
+    /// original has no counterpart, so nothing here is RE.** What it launches (modes 0, 4 and 5 —
+    /// the career modes go through `load_career_race`, which hands back to the layout front end)
+    /// must not depend on a race before it in the same process (menu → race → menu → race; the
+    /// text menu cannot reach the layout front end). Each launch arm therefore writes every field
+    /// the race reads that an earlier arm of this menu writes: track, laps, direction, traffic,
+    /// damage, cops, opponents, the car's id / paint / sound set / dials, `quick_knockout`, the grid
+    /// and the career opponents. `race_skill` and `camera_cycle` have no writer in this menu (no
+    /// row edits them), so they keep the start-up values (`fe.txt` / the command line) in every
+    /// launch. *(2026-10-01: the knockout arm did not write `player_car_id`, so a
+    /// Knockout round after a Single Race recorded the Single Race's car id in its replay setup.)*
     pub(crate) fn menu_key(&mut self, key: MenuKey, event_loop: &ActiveEventLoop) {
         // `--layout` browse mode: the screens navigate each other through their own `destination` fields
         if self.fe.layout_preview.is_some() {
@@ -228,6 +240,7 @@ impl App {
                     row: m.row,
                     font: m.font.take(),
                 };
+                self.player_car_id = Some(car.id);
                 self.owned_paint = None;
                 self.owned_decal = None;
                 self.paint = car
@@ -651,7 +664,7 @@ impl App {
                     self.fe.comms_game_mode = mode;
                     if mode == 0 {
                         // (`update_check_tick`; set by fields: `l` borrows the screen)
-                        let ticks = std::env::var("NFS_UPDATE_CHECK_TICKS").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(netlobby::UPDATE_THREAD_TICKS);
+                        let ticks = nfs_game::config::cfg().nfs_update_check_ticks.var().ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(netlobby::UPDATE_THREAD_TICKS);
                         if self.fe.update_check.is_none() {
                             self.fe.update_check = Some((ticks, true));
                         }
@@ -968,11 +981,8 @@ impl App {
                     self.fe_back_callback(event_loop);
                 }
                 if (c.callback.as_deref() == Some("PLAYGAME") || c.destination.is_none()) && can_play {
-                    // `Game.GameType` 4 races the selected tournament's event (0x4D5730, 0x4ED5D0)
-                    if self.fe.game_type == 4 && self.career.is_some() {
-                        self.start_tournament_from_layout(event_loop);
-                        return;
-                    }
+                    // the start check 0x4D5730 by `Game.GameType` (4 the selected tournament's
+                    // event, 9 the mission, 10 the finale) is `start_from_layout`'s own
                     self.fe_start_game(event_loop);
                     return;
                 }

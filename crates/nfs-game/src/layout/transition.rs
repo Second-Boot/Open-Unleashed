@@ -91,6 +91,7 @@ impl LayoutScreen {
         self.clock_ms = self.clock_ms.wrapping_add(dt_ms);
         // `[widget+0x12C]` is stamped with the tick whenever the widget is *not* hovered
         // (0x4C824D), so the count restarts the moment the pointer moves on (§4.52)
+        self.claim_pointer();
         let on = self.hovered();
         if on == self.hover_of {
             self.hover_ms = self.hover_ms.saturating_add(dt_ms);

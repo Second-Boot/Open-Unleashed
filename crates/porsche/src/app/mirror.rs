@@ -40,7 +40,9 @@ impl App {
         // the cars' and skid marks' entries for the mirror's own eye: the same draw 0x4430A0 in its
         // pass (`dyn_items`) — the camera's own car is not queued, the others are culled and picked
         // by the mirror's view, their shadows and skid marks pulled toward its eye with its far 65000
-        let mirror_dyn: Vec<(u32, nfs_renderer::DrawItem)> = match self.dyn_pose {
+        let mut mirror_dyn = std::mem::take(&mut self.scratch.mirror_dyn);
+        mirror_dyn.clear();
+        match self.dyn_pose {
             Some(pose) if self.vehicle.is_some() => {
                 let forward = (cam.target - cam.position).normalize_or_zero();
                 let right = forward.cross(cam.up).normalize_or_zero();
@@ -50,12 +52,11 @@ impl App {
                 let p = DynPose { mirror_pass: true, cull: Some(cull), lod: (w.max(1) as f32, h.max(1) as f32), ref_width: render_w, ..pose };
                 let (saved_cam, saved_far) = (std::mem::replace(&mut self.camera, cam), std::mem::replace(&mut self.view_far, 65000.0));
                 let mut pools = self.pool_used;
-                let items = self.dyn_items(&p, &mut pools);
+                self.dyn_items(&p, &mut pools, &mut mirror_dyn);
                 (self.camera, self.view_far) = (saved_cam, saved_far);
-                items
             }
-            _ => Vec::new(),
-        };
+            _ => {}
+        }
         // the pass 0x468CA0 draws the scene through the generic 0x468AE0 with the view's own
         // walk 0x47FB40: the footprint and the distance rule out to `+0x124` = `max(D/3, 50)`
         // (0x468D3B…0x468D82), the eye and axes the rear build gives
@@ -76,56 +77,97 @@ impl App {
             {
                 w.reregister_articles();
             }
-            let draws = self.world.as_ref().map(|w| w.article_draws(&view)).unwrap_or_default();
+            let mut draws = std::mem::take(&mut self.scratch.mirror_draws);
+            draws.clear();
+            if let Some(w) = self.world.as_ref() {
+                w.article_draws_into(&view, &mut draws);
+            }
             if let (Some(w), Some(p)) = (self.world.as_ref(), self.track_particles.as_mut()) {
                 p.draw(self.draw_distance, |e| w.effect_run(&draws, e.article, e.part, 3));
             }
             let (saved_cam, saved_far) = (std::mem::replace(&mut self.camera, cam), std::mem::replace(&mut self.view_far, 65000.0));
-            let effects = self.effect_items(forward, right, up, &draws, false);
+            let mut effects = std::mem::take(&mut self.scratch.effects);
+            self.effect_items(forward, right, up, &draws, false, &mut effects);
             (self.camera, self.view_far) = (saved_cam, saved_far);
             Some((view, draws, effects))
         } else {
             None
         };
-        let scene = if let (Some(w), Some((_view, draws, effects))) = (&self.world, mirror_fx) {
-            let (a, b) = self.track_item_range;
-            // the same merge the main pass makes (`Self::rebuild_scene`, `RE/RENDERING.md` "The
-            // view's lists"): the mirror's own near/far/rest list, freshly culled from its own
-            // eye, with the cars' and the skid marks' `+0xC` entries of the mirror's own pass
-            // (`mirror_dyn`, `Self::dyn_items`)
-            let (mut near, far, rest) = w.track_draw_lists(&draws, cam.position);
-            near.sort_by_key(|(k, _)| *k);
-            let mut blended: Vec<(u32, nfs_renderer::DrawItem)> = far.into_iter().map(|(k, i)| (k, nfs_renderer::DrawItem { layer_light: Some(nfs_game::world::TRACK_LIGHT), ..i })).collect();
-            blended.extend(mirror_dyn);
-            let merged: Vec<nfs_renderer::DrawItem> = near
-                .into_iter()
-                .map(|(_, i)| nfs_renderer::DrawItem { early: true, layer_light: Some(nfs_game::world::TRACK_LIGHT), ..i })
-                .chain(nfs_renderer::farthest_first(blended))
-                .chain(rest.into_iter().map(|i| nfs_renderer::DrawItem { layer_light: Some(nfs_game::world::TRACK_LIGHT), ..i }))
-                .collect();
-            let mut scene = self.scene.clone();
-            // the main pass's flares / particles / streaks (after the track's range) give way to the
-            // mirror's own first, so the track's range is still where the main pass left it
-            let (ea, eb) = self.effect_item_range;
-            scene.items.splice(ea.min(scene.items.len())..eb.min(scene.items.len()), effects);
-            scene.items.splice(a.min(scene.items.len())..b.min(scene.items.len()), merged);
-            scene
-        } else {
-            self.scene.clone()
-        };
-        // the mirror's view runs the sky pass too (0x468AE0 → 0x45D7D0 while `+0x12C` is set): its
-        // own eye and heading for the ring, and the sun between the two level runs (0x45D6F6)
-        // through the mirror's view (`sun_items`). The range lies before the track's, which is
-        // replaced first.
-        let mut scene = scene;
-        if let Some(s) = &self.sky {
-            let (a, b) = self.sky_item_range;
+        // the mirror's sky pass: its own eye and heading for the ring, and the sun between the two level
+        // runs (0x45D6F6) through the mirror's view (`sun_items`). Its range lies before the track's.
+        let sky_items: Option<Vec<nfs_renderer::DrawItem>> = self.sky.as_ref().map(|s| {
             let forward = (cam.target - cam.position).normalize_or_zero();
             let view = nfs_game::sky::SkyView { eye: cam.position, forward, up: cam.up, main: false };
             let sun = self.sun_items(&cam, w.max(1) as f32 / h.max(1) as f32, SUN_VIEW_MIRROR);
-            let items: Vec<_> = s.draw_items(&view, false).chain(sun).chain(s.draw_items(&view, true)).collect();
-            scene.items.splice(a.min(scene.items.len())..b.min(scene.items.len()), items);
+            s.draw_items(&view, false).chain(sun).chain(s.draw_items(&view, true)).collect()
+        });
+        // The mirror's scene is the main pass's, with the ranges the mirror builds for its own eye
+        // replaced: the sky's (`sky_item_range`), the track's merge of near / far / rest with the cars' and
+        // skid marks' `+0xC` entries of the mirror's pass (`mirror_dyn`, `Self::dyn_items`, `RE/RENDERING.md`
+        // "The view's lists", as `Self::rebuild_scene` makes it), and the flares / particles / streaks
+        // (`effect_item_range`; the main pass's give way to the mirror's own). The ranges lie in this order
+        // in `scene.items` (sky, track, effects, the rest), so the scene is laid out once from slices of the
+        // main one instead of a copy of the main items with three splices into it.
+        let mut items = std::mem::take(&mut self.scratch.mirror_items);
+        items.clear();
+        let mut effects = Vec::new();
+        let mut merged_len = 0;
+        if let (Some(world), Some((_view, draws, fx))) = (&self.world, mirror_fx) {
+            let sc = &mut self.scratch;
+            // the same merge the main pass makes: the mirror's own near/far/rest list, freshly culled from its
+            // own eye
+            world.track_draw_lists_into(&draws, cam.position, &mut sc.mirror_lists);
+            nfs_renderer::sort_order(&sc.mirror_lists.near, false, &mut sc.order);
+            sc.mirror_merged.clear();
+            let near = &sc.mirror_lists.near;
+            sc.mirror_merged.extend(sc.order.iter().map(|&(_, i)| nfs_renderer::DrawItem { early: true, layer_light: Some(nfs_game::world::TRACK_LIGHT), ..near[i as usize].1 }));
+            sc.blended.clear();
+            sc.blended.extend(sc.mirror_lists.far.iter().map(|&(k, i)| (k, nfs_renderer::DrawItem { layer_light: Some(nfs_game::world::TRACK_LIGHT), ..i })));
+            sc.blended.extend(mirror_dyn.iter().copied());
+            nfs_renderer::farthest_first_into(&sc.blended, &mut sc.order, &mut sc.mirror_merged);
+            sc.mirror_merged.extend(sc.mirror_lists.rest.iter().map(|&i| nfs_renderer::DrawItem { layer_light: Some(nfs_game::world::TRACK_LIGHT), ..i }));
+            merged_len = sc.mirror_merged.len();
+            effects = fx;
+            sc.mirror_draws = draws;
         }
+        let main = &self.scene.items;
+        let n = main.len();
+        let (ta, tb) = self.track_item_range;
+        let (ea, eb) = self.effect_item_range;
+        let (sa, sb) = self.sky_item_range;
+        let track = merged_len != 0 || self.world.is_some();
+        let in_order = (!track || (ta <= tb && ea <= eb && tb <= ea && eb <= n)) && sky_items.as_ref().is_none_or(|_| sa <= sb && sb <= if track { ta } else { n });
+        if in_order {
+            let mut at = 0;
+            if let Some(sky) = &sky_items {
+                items.extend_from_slice(&main[..sa]);
+                items.extend_from_slice(sky);
+                at = sb;
+            }
+            if track {
+                items.extend_from_slice(&main[at..ta]);
+                items.extend_from_slice(&self.scratch.mirror_merged);
+                items.extend_from_slice(&main[tb..ea]);
+                items.extend_from_slice(&effects);
+                at = eb;
+            }
+            items.extend_from_slice(&main[at..]);
+        } else {
+            // ranges out of order (never in a built frame): the splices one after another, as ever
+            items.extend_from_slice(main);
+            if track {
+                items.splice(ea.min(items.len())..eb.min(items.len()), effects.iter().copied());
+                items.splice(ta.min(items.len())..tb.min(items.len()), self.scratch.mirror_merged.iter().copied());
+            }
+            if let Some(sky) = &sky_items {
+                items.splice(sa.min(items.len())..sb.min(items.len()), sky.iter().copied());
+            }
+        }
+        // (kept for the next frame: the effects' buffer; the mirror's own cars' and skid marks' entries)
+        effects.clear();
+        self.scratch.effects = effects;
+        self.scratch.mirror_dyn = mirror_dyn;
+        let mut scene = self.scene.clone_header(items);
         // the clear: 0x459A70 at 0x468DE8, before the mirror's sky pass (so at the slice the main
         // pass saved), with `[0x627F43] & 0x10` set for the pass (0x468DA8…0x468E1F) — the colour
         // record's group B (`SkyBin::background_at`); the view's constructor colour 0xFF77BBFF
@@ -152,6 +194,7 @@ impl App {
             self.mirror_tex = Some(r.render_offscreen(&scene, &cam, w, h, self.mirror_tex, Some(sky), Some(65000.0)));
             r.set_mirror_view(false);
         }
+        self.scratch.mirror_items = scene.items;
     }
 
     /// 0x459020 again in the mirror's pass: it is the last call of the scene draw 0x468AE0

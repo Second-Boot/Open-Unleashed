@@ -4,10 +4,12 @@
 //! [`MeshData`] / [`TextureData`] and this crate uploads and draws them.
 
 mod camera;
+mod front;
 mod gpu;
 
 pub use camera::Camera;
-pub use gpu::{MaterialId, MeshId, Renderer, TextureId, VIEW_FAR};
+pub use front::Renderer;
+pub use gpu::{MaterialId, MeshId, TextureId, VIEW_FAR};
 
 use glam::{Mat4, Vec3};
 
@@ -249,6 +251,24 @@ pub fn farthest_first(mut items: Vec<(u32, DrawItem)>) -> Vec<DrawItem> {
     items.into_iter().map(|(_, i)| i).collect()
 }
 
+/// The entries of `items` in the order [`farthest_first`] (`descending`) or an ascending stable sort
+/// by key gives, as `(key, index)` pairs in `order` (cleared first) — the fat items are not moved.
+/// The index breaks every tie, so equal keys keep the order they were given in, as a stable sort
+/// does (`sort_unstable` on the pairs is therefore the same order); a descending key is sorted as
+/// its bitwise complement.
+pub fn sort_order(items: &[(u32, DrawItem)], descending: bool, order: &mut Vec<(u32, u32)>) {
+    order.clear();
+    order.extend(items.iter().enumerate().map(|(i, (k, _))| (if descending { !*k } else { *k }, i as u32)));
+    order.sort_unstable();
+}
+
+/// [`farthest_first`] without consuming or moving the items: `items` stays as it was, the run is
+/// appended to `out`, and `order` is the scratch the sort uses.
+pub fn farthest_first_into(items: &[(u32, DrawItem)], order: &mut Vec<(u32, u32)>, out: &mut Vec<DrawItem>) {
+    sort_order(items, true, order);
+    out.extend(order.iter().map(|&(_, i)| items[i as usize].1));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +287,29 @@ mod tests {
 
     /// Equal keys keep the order they were given in — the original's tree insert goes right on
     /// an equal key, so it never reorders same-key entries (`RE/RENDERING.md` "The view's lists").
+    /// The index-sorted run is the stable sort's, whatever the keys and ties.
+    #[test]
+    fn farthest_first_into_matches_farthest_first() {
+        let mut seed = 12345u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed >> 16
+        };
+        for n in [0usize, 1, 2, 7, 64, 300] {
+            let items: Vec<(u32, DrawItem)> = (0..n).map(|i| (if next() % 5 == 0 { u32::MAX - next() % 3 } else { next() % 17 }, item(i as u32))).collect();
+            let mut order = Vec::new();
+            let mut out = Vec::new();
+            farthest_first_into(&items, &mut order, &mut out);
+            let expect = farthest_first(items.clone());
+            assert_eq!(out.iter().map(|i| i.depth_bias).collect::<Vec<_>>(), expect.iter().map(|i| i.depth_bias).collect::<Vec<_>>());
+            // the ascending order is the stable ascending sort
+            sort_order(&items, false, &mut order);
+            let mut asc = items.clone();
+            asc.sort_by_key(|(k, _)| *k);
+            assert_eq!(order.iter().map(|&(_, i)| items[i as usize].1.depth_bias).collect::<Vec<_>>(), asc.iter().map(|(_, i)| i.depth_bias).collect::<Vec<_>>());
+        }
+    }
+
     #[test]
     fn farthest_first_is_stable_on_equal_keys() {
         let out = farthest_first(vec![(10, item(1)), (10, item(2)), (10, item(3)), (20, item(4))]);
@@ -420,6 +463,30 @@ pub struct Scene {
 pub struct Fog {
     pub colour: [f32; 3],
     pub density: f32,
+}
+
+impl Scene {
+    /// A copy with the same items and view state but no sprites — what an offscreen 3-D pass
+    /// (`Renderer::render_offscreen`, which draws none) needs, without cloning the 2-D list.
+    /// Copy this scene into `dst`, keeping `dst`'s allocations (the render thread's hand-off).
+    pub fn copy_into(&self, dst: &mut Scene) {
+        let (mut items, mut sprites) = (std::mem::take(&mut dst.items), std::mem::take(&mut dst.sprites));
+        items.clear();
+        items.extend_from_slice(&self.items);
+        sprites.clear();
+        sprites.extend_from_slice(&self.sprites);
+        *dst = Self { items, sprites, ..*self };
+    }
+
+    pub fn clone_without_sprites(&self) -> Self {
+        Self { items: self.items.clone(), sprites: Vec::new(), ..*self }
+    }
+
+    /// This scene's view state with `items` as its items and no sprites: [`Self::clone_without_sprites`]
+    /// without copying the items, for a caller that lays the offscreen pass's items out itself.
+    pub fn clone_header(&self, items: Vec<DrawItem>) -> Self {
+        Self { items, sprites: Vec::new(), ..*self }
+    }
 }
 
 impl Default for Scene {

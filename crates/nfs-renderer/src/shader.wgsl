@@ -135,7 +135,12 @@ struct Object {
     sky_v: vec4<f32>,
     sky_on: vec4<f32>,
 };
-@group(1) @binding(0) var<uniform> object: Object;
+// every object of the pass sits in one read-only storage buffer, bound once per pass; a draw names
+// its object by `first_instance` (`instance_index`), which the vertex stage hands to the fragment
+// stage as a flat varying. `object` is a private copy loaded at the head of each entry point, so
+// the maths below reads the same values as it did from the per-draw dynamic-offset uniform.
+@group(1) @binding(0) var<storage, read> objects: array<Object>;
+var<private> object: Object;
 
 @group(2) @binding(0) var t_diffuse: texture_2d<f32>;
 @group(2) @binding(1) var s_diffuse: sampler;
@@ -193,11 +198,15 @@ struct VsOut {
     @location(5) sky_uv: vec2<f32>,
     /// `Headlights::LayerUVLight`'s `(u·w, v·w, w)`, divided per fragment (0x453EE1)
     @location(6) head_uvw: vec3<f32>,
+    /// the draw's object, `instance_index` (index into `objects`)
+    @location(7) @interpolate(flat) obj: u32,
 };
 
 @vertex
-fn vs_main(in: VsIn) -> VsOut {
+fn vs_main(in: VsIn, @builtin(instance_index) inst: u32) -> VsOut {
+    object = objects[inst];
     var out: VsOut;
+    out.obj = inst;
     let world = object.model * vec4<f32>(in.position, 1.0);
     out.clip = globals.view_proj * world;
     // Thrash state 0x18, the depth bias (`lit_dir.w`, a pull in view depth): `dx7z.dll` adds it to
@@ -286,6 +295,7 @@ fn fogged(in: VsOut, c: vec4<f32>) -> vec4<f32> {
 
 @fragment
 fn fs_opaque(in: VsOut) -> @location(0) vec4<f32> {
+    object = objects[in.obj];
     let c = shade(in);
     if object.shadow_on.w > 0.0 && c.a * 255.0 < object.shadow_on.w {
         discard;
@@ -295,6 +305,7 @@ fn fs_opaque(in: VsOut) -> @location(0) vec4<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    object = objects[in.obj];
     let c = shade(in);
     if object.shadow_on.w > 0.0 && c.a * 255.0 < object.shadow_on.w {
         discard;

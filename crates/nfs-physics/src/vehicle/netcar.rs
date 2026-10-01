@@ -33,7 +33,8 @@ const TURN: f64 = f64::from_bits(0x4019_21FB_2000_0000);
 /// 0x5327E0 / 0x5327F0 — `(sin, cos)` of an angle in turns, in double precision as the x87 does.
 fn sin_cos(turns: f32) -> (f64, f64) {
     let x = turns as f64 * TURN;
-    (x.sin(), x.cos())
+    // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable f64 sin/cos, not std; original 0x5327E0 / 0x5327F0 (x87, double).
+    nfs_math::portable::sin_cos(x)
 }
 
 fn rows(m: Mat3) -> [[f32; 3]; 3] {

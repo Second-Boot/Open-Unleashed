@@ -105,7 +105,7 @@ impl LayoutScreen {
     /// list box** (0x4C53B1 asks 0x4C7DD0, 0x4C53BA asks the constructor's `[this+0x1DD]`), and
     /// **0** otherwise — so a combo that is not focused draws no list at all.
     pub fn set_open_combo(&mut self, index: Option<usize>) {
-        if std::env::var("NFS_FE_OPEN").is_ok() {
+        if crate::config::cfg().nfs_fe_open.var().is_ok() {
             return;
         }
         let open = index.filter(|i| *i < self.layout.elements.len());
@@ -263,7 +263,7 @@ impl LayoutScreen {
         let (x, y) = self.position_of(e);
         let width = self.attr_num(e, "width").unwrap_or(0.0) as f32;
         let (px, py) = match self.controls.get(&e.class).and_then(|c| c.part("selectionbox")).and_then(|p| p.value("pos")) {
-            Some(v) => nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)).map(|(a, b)| (x + a as f32, y + b as f32)).unwrap_or((x, y)),
+            Some(v) => self.ev_pair(e, v, 0).map(|(a, b)| (x + a as f32, y + b as f32)).unwrap_or((x, y)),
             None => (x, y),
         };
         let sx = px + width - LIST_SCROLLBAR_W;
@@ -331,7 +331,7 @@ impl LayoutScreen {
         let panel_w = if full >= max_h { width - LIST_SCROLLBAR_W } else { width };
         let (wx, wy) = self.position_of(e);
         let (px, py) = match self.controls.get(&e.class).and_then(|c| c.part("selectionbox")).and_then(|p| p.value("pos")) {
-            Some(v) => nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)).map(|(a, b)| (wx + a as f32, wy + b as f32)).unwrap_or((wx, wy)),
+            Some(v) => self.ev_pair(e, v, 0).map(|(a, b)| (wx + a as f32, wy + b as f32)).unwrap_or((wx, wy)),
             None => (wx, wy),
         };
         if !(x >= px && x < px + panel_w && y >= py && y < py + max_h) {

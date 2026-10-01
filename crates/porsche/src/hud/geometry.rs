@@ -155,6 +155,12 @@ impl Hud {
             map: None,
             map_route: Vec::new(),
             map_frame: std::cell::Cell::new([0.0, 0.0, 1.0, 0.0, 1.0]),
+            map_drawn: std::cell::RefCell::new(None),
+            map_scratch: std::cell::RefCell::new(Vec::new()),
+            text_runs: Default::default(),
+            map_grid: std::cell::OnceCell::new(),
+            map_check: std::cell::RefCell::new(None),
+            map_tex: std::cell::RefCell::new(None),
             replay_glyphs: std::array::from_fn(|i| load_idx(r, "replay.fsh", Some(i), None)),
             congrats: CongratsTex {
                 solid: [
@@ -210,6 +216,8 @@ impl Hud {
         let tex = r.upload_texture(&TextureData::single(MAP_PX, MAP_PX, vec![0u8; (MAP_PX * MAP_PX * 4) as usize]));
         self.map = Some((tex, [cx, cz, half]));
         self.map_route = pts;
+        // a new texture (zero-filled) and a new route: nothing drawn into it yet
+        *self.map_drawn.borrow_mut() = None;
     }
 
     /// Redraw the map for this frame. `heading` is the player car's forward `(x, z)` when the map
@@ -255,22 +263,70 @@ impl Hud {
             _ => (0.0, 1.0),
         };
         self.map_frame.set([cx, cz, scale, fx, fz]);
-        let to_px = |(x, z): (f32, f32)| Self::map_px([cx, cz, scale, fx, fz], x, z);
-        let mut img = vec![0u8; (MAP_PX * MAP_PX * 4) as usize];
+        // The picture is a pure function of the route's **pixel endpoints** (`map_px` truncated to
+        // the 120 px target) and the constant grid, so a frame whose endpoints all land on the
+        // same pixels as the picture the texture already holds would redraw the same pixels: the
+        // CPU raster and the upload are skipped (performance work A9, 2026-10-01).
+        let pts: &[(f32, f32)] = if route { &self.map_route } else { &[] };
+        let mut now = std::mem::take(&mut *self.map_scratch.borrow_mut());
+        now.clear();
+        now.extend(pts.iter().map(|&(x, z)| {
+            let a = Self::map_px([cx, cz, scale, fx, fz], x, z);
+            (a.0 as i32, a.1 as i32)
+        }));
+        if self.map_drawn.borrow().as_ref() == Some(&now) {
+            // **TEST GLUE** `NFS_MAP_VERIFY=1`: the skipped redraw must equal what the texture holds
+            if nfs_game::config::cfg().nfs_map_verify.var_os().is_some() {
+                assert!(self.map_check.borrow().as_deref() == Some(self.map_image(&now).as_slice()), "map redraw skipped but its picture changed");
+            }
+            *self.map_scratch.borrow_mut() = now;
+            return;
+        }
+        // the picture is drawn into the kept buffer (the grid copied over it, then the route), not a
+        // new allocation per redraw
+        let mut td = self.map_tex.borrow_mut().take().unwrap_or_else(|| TextureData::single(MAP_PX, MAP_PX, Vec::new()));
+        self.map_image_into(&now, &mut td.mips[0]);
+        if nfs_game::config::cfg().nfs_map_verify.var_os().is_some() {
+            *self.map_check.borrow_mut() = Some(td.mips[0].clone());
+        }
+        r.update_texture(tex, &td);
+        *self.map_tex.borrow_mut() = Some(td);
+        // what was drawn becomes the key; the old key's buffer is the next frame's scratch
+        let old = self.map_drawn.replace(Some(now));
+        *self.map_scratch.borrow_mut() = old.unwrap_or_default();
+    }
+
+    /// The map picture for the route's pixel endpoints `px` (empty when the route is not drawn):
+    /// the grid (0x432C5F…0x432D7D), then the route line. A pure function of `px` and the grid —
+    /// which is what lets [`Hud::map_update`] skip an unchanged redraw.
+    fn map_image(&self, px: &[(i32, i32)]) -> Vec<u8> {
+        let mut img = Vec::new();
+        self.map_image_into(px, &mut img);
+        img
+    }
+
+    /// [`Hud::map_image`] into `img` (its old contents are replaced; its capacity is kept).
+    fn map_image_into(&self, px: &[(i32, i32)], img: &mut Vec<u8>) {
         // the grid, before the route (0x432C5F…0x432D7D, every mode and zoom): `w / 20` cells
         // (`w` = cfg1 `+0xE4` = 120, 20 = cfg1 `+0x10C` through 0x420470), so five lines each way,
         // a line every `20 · target / w` of the render target (= every 20 px of the 120 px tray)
         // through 0x466050 in the colour `[this+0xCC]` = 0x420450 = cfg1 `+0x30`, the map tint
         // 0x4CFFFFFF (`hud.md` §5): white at alpha 0x4C. Nothing of it was drawn before (HM).
-        for i in 1..(MAP_PX / 20) {
-            let k = (i * 20) as usize;
-            for j in 0..MAP_PX as usize {
-                for (x, y) in [(k, j), (j, k)] {
-                    let o = (y * MAP_PX as usize + x) * 4;
-                    img[o..o + 4].copy_from_slice(&[255, 255, 255, 0x4C]);
+        let grid = self.map_grid.get_or_init(|| {
+            let mut img = vec![0u8; (MAP_PX * MAP_PX * 4) as usize];
+            for i in 1..(MAP_PX / 20) {
+                let k = (i * 20) as usize;
+                for j in 0..MAP_PX as usize {
+                    for (x, y) in [(k, j), (j, k)] {
+                        let o = (y * MAP_PX as usize + x) * 4;
+                        img[o..o + 4].copy_from_slice(&[255, 255, 255, 0x4C]);
+                    }
                 }
             }
-        }
+            img
+        });
+        img.clear();
+        img.extend_from_slice(grid);
         let mut plot = |x: i32, y: i32| {
             if x >= 0 && y >= 0 && (x as u32) < MAP_PX && (y as u32) < MAP_PX {
                 let o = ((y as u32 * MAP_PX + x as u32) * 4) as usize;
@@ -278,14 +334,11 @@ impl Hud {
             }
         };
         // radar mode draws no route line (0x4336CC skips it)
-        let pts: &[(f32, f32)] = if route { &self.map_route } else { &[] };
-        if pts.len() < 2 {
-            r.update_texture(tex, &TextureData::single(MAP_PX, MAP_PX, img));
+        if px.len() < 2 {
             return;
         }
-        for w in pts.windows(2).chain(std::iter::once(&[pts[pts.len() - 1], pts[0]][..])) {
-            let (a, b) = (to_px(w[0]), to_px(w[1]));
-            let (ax, ay, bx, by) = (a.0 as i32, a.1 as i32, b.0 as i32, b.1 as i32);
+        for w in px.windows(2).chain(std::iter::once(&[px[px.len() - 1], px[0]][..])) {
+            let ((ax, ay), (bx, by)) = (w[0], w[1]);
             if (ax - bx).abs() > MAP_PX as i32 / 2 || (ay - by).abs() > MAP_PX as i32 / 2 {
                 continue; // point-to-point tracks: no closing line
             }
@@ -294,7 +347,6 @@ impl Hud {
                 plot(ax + (bx - ax) * t / steps, ay + (by - ay) * t / steps);
             }
         }
-        r.update_texture(tex, &TextureData::single(MAP_PX, MAP_PX, img));
     }
 
     /// World `(x, z)` → map pixels for the frame transform `[cx, cz, scale, fx, fz]`: `u = x·fz −
@@ -533,12 +585,13 @@ impl Hud {
         h: f32,
         color: [f32; 4],
     ) {
-        let Some((f, h)) = self.font_for(s, h) else { return };
+        let Some((run, h)) = self.text_run(s, h) else { return };
+        let f = self.run_font(&run);
         let scale = h / f.line_px();
-        let (glyphs, _) = f.place(s);
+        let glyphs = &run.glyphs;
         let n0 = out.len();
         let mut first: Option<[f32; 2]> = None;
-        for g in &glyphs {
+        for g in glyphs {
             let (pos, size) = Self::place(
                 aspect,
                 x + g.x * scale,
@@ -596,7 +649,46 @@ impl Hud {
     /// had used the pen's advance, which differs where a glyph's quad starts right of the pen or
     /// ends past it.
     pub(crate) fn text_width(&self, s: &str, h: f32) -> f32 {
-        self.font_for(s, h).map_or(0.0, |(f, h)| f.measure(s).0 * h / f.line_px())
+        self.text_run(s, h).map_or(0.0, |(run, h)| run.width * h / self.run_font(&run).line_px())
+    }
+
+    /// The layout of `s` for a size `h` ([`Hud::font_for`]'s font), from [`Hud::text_runs`] or made
+    /// and kept: the same glyphs and width `BitmapFont::place` / `measure` give, and the height the
+    /// run is scaled to. The cache is dropped whole past 4096 strings (the clock texts vary).
+    fn text_run(&self, s: &str, h: f32) -> Option<(std::rc::Rc<TextRun>, f32)> {
+        let class = if h == FONT_SMALL { 0 } else if h == FONT_ITALIC { 1 } else { 2 };
+        if let Some(run) = self.text_runs.borrow()[class].get(s) {
+            #[cfg(debug_assertions)]
+            {
+                // debug builds check every hit against a fresh layout
+                let (f, eff) = self.font_for(s, h).expect("a cached string has its font");
+                debug_assert!(f.place(s).0 == run.glyphs && f.measure(s).0 == run.width && eff == run.fixed_h.unwrap_or(h), "stale text run for {s:?}");
+            }
+            return Some((run.clone(), run.fixed_h.unwrap_or(h)));
+        }
+        let (f, eff) = self.font_for(s, h)?;
+        let font = [Some(&self.font), Some(&self.font_small), Some(&self.font_italic)]
+            .iter()
+            .position(|o| o.is_some_and(|o| o.as_ref().is_some_and(|x| std::ptr::eq(x, f))))
+            .unwrap_or(0) as u8;
+        let fixed_h = (class != 2).then_some(eff);
+        let run = std::rc::Rc::new(TextRun { font, fixed_h, glyphs: f.place(s).0, width: f.measure(s).0 });
+        let mut cache = self.text_runs.borrow_mut();
+        if cache.iter().map(|m| m.len()).sum::<usize>() > 4096 {
+            cache.iter_mut().for_each(|m| m.clear());
+        }
+        cache[class].insert(s.to_string(), run.clone());
+        Some((run, fixed_h.unwrap_or(h)))
+    }
+
+    /// The font a [`TextRun`] was laid out in.
+    fn run_font(&self, run: &TextRun) -> &BitmapFont {
+        let f = match run.font {
+            1 => &self.font_small,
+            2 => &self.font_italic,
+            _ => &self.font,
+        };
+        f.as_ref().expect("a cached run's font is loaded")
     }
 
     /// Move the sprites an element pushed since `n0` by its slide (hud.md, "The slide", 0x434630 /
@@ -622,7 +714,7 @@ impl Hud {
         // **TEST GLUE** (not in the original): `NFS_HUD_BOXES=1` prints each anchored element's
         // pixel box (logical pixels) — the measurement of `hud.md` §2.2's rule at a resolution
         static BOXES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *BOXES.get_or_init(|| std::env::var_os("NFS_HUD_BOXES").is_some()) {
+        if *BOXES.get_or_init(|| nfs_game::config::cfg().nfs_hud_boxes.var_os().is_some()) {
             eprintln!("HUDBOX design=({x},{y},{w},{h}) screen={sw}x{sh} box=({xi},{yi},{wi},{hi})");
         }
         let (right, bottom) = (xi >= sw / 2, yi >= sh / 2);
