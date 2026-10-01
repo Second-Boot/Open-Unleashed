@@ -1,0 +1,634 @@
+//! TEST GLUE: the scripted-run helpers and diagnostics (`NFS_*` environment variables); none of it is in the original.
+
+use crate::*;
+
+impl App {
+    /// Why a widget the sweep found blank is blank in the original as well, in the state the
+    /// sweep runs in — or `None` when it is a gap of the port's. `icons` is how many of the
+    /// screen's `NFS5.ChroniclePictureIcon`s still stand past the media list.
+    fn sweep_blank_in_original(&self, class: &str, src: &str, icons: &mut usize) -> Option<&'static str> {
+        let acc = src.strip_prefix("accessor=").unwrap_or("");
+        match class {
+            // 0x51AE00 answers −1 while mission 0 is unpassed; 0x4CF3ED / 0x4CF61D stop the draw
+            "NFS5.BADGE" | "NFS5.MINIBADGE" if self.badge_stage().is_none() => Some("licence badge, no mission passed (0x51AE00 = -1, 0x4CF3ED / 0x4CF61D)"),
+            // the bind 0x5087CF stops at `number >= [0x699D00]`, the media list's count
+            "NFS5.ChroniclePictureIcon" if *icons > 0 => {
+                *icons -= 1;
+                Some("chronicle icon past the media list (0x5087CF)")
+            }
+            // `[0x699C98]` is written only for kind 2 (0x507642) and both callers pass 0 or 1
+            // (0x5080F8, 0x508137); `chroniclemovie.lay` is named by no destination and no string
+            "NFS5.MOVIEBOX" if src == "othersource=chronicle" => Some("chronicle clip [0x699C98] never built (0x507642; callers 0x5080F8 / 0x508137)"),
+            // an empty lot: the logo's car is null (0x4F5980), ASKINGPRICE is the empty string
+            // (0x4F61C6), and a bar at slot 6's 0 (0x4F6EC2) paints nothing (0x521F26 / 0x521F65 /
+            // 0x521FB9)
+            "NFS5.CarLogo" | "NFS5.GouraudIndicatorBar" | "NFS5.AccessorWatch"
+                if acc.starts_with("UsedCar.Car")
+                    && self.used_car().is_none()
+                    && (class != "NFS5.AccessorWatch" || acc == "UsedCar.Car(ASKINGPRICE)") =>
+            {
+                Some("used-car lot empty (0x4F5980, 0x4F61C6, 0x4F6EC2 -> 0x521CB0)")
+            }
+            // an empty list: 0x4C53A0 clamps the panel to `count x 14` = 0 and the row loop
+            // 0x4C670B stops at the count
+            "NFS5.ListBox"
+                if matches!(acc, "Parts.ShoppingList" | "Parts.RepairShoppingList" | "CDPlayer.SelectedList")
+                    && self.list_rows(acc).is_some_and(|(r, _)| r.is_empty()) =>
+            {
+                Some("empty basket / play list (0x4C53A0, 0x4C670B)")
+            }
+            // row 0 is a section header whose arms leave the description's out-parameter unset
+            // (0x5152EE, 0x515346): the original prints an uninitialised stack slot (0x515DCA)
+            "NFS5.WORDWRAPACCESSORWATCH" if acc == "Parts.AllParts(DESC)" => Some("undefined in the original: uninitialised stack (0x515DCA)"),
+            _ => None,
+        }
+    }
+
+    /// `--layout-sweep`: load every shipped `.lay`, draw it once with the port's real accessors and
+    /// print every widget class that produced no sprite at all, with the source it names. A widget
+    /// lands here when the original places its content from code and the file carries neither a
+    /// shape nor a string for it — which is exactly the list of front-end things still to port.
+    pub(crate) fn run_layout_sweep(&mut self) {
+        // The career is put into the states the blank count is otherwise waiting on — a car with
+        // damage on every part, and a used-car market — so the widgets that need them are
+        // measured instead of assumed. It only ever touches the in-memory career of this one
+        // diagnostic run, never the save.
+        //
+        // This is **on by default** since 2026-09-21, and the reason is the same one that made
+        // `coverage.py`'s phantom functions worth recording: a diagnostic that answers with the
+        // starting state of a synthetic career is measuring the harness, not the port. With it
+        // off the headline was 61, of which 42 were `UsedCar.Car` and damage widgets that are
+        // blank only because nothing had been bought, damaged or listed — a parity loop reading
+        // that number chases widgets that are already ported. `NFS_SWEEP_STATE=0` restores the
+        // bare-career count for anyone who wants to see it.
+        if std::env::var("NFS_SWEEP_STATE").as_deref() != Ok("0")
+            && let Some(c) = self.career.as_mut()
+        {
+            let parts: Vec<(i16, f32)> = {
+                let car = c.career.garage.first().map(|o| o.car_id);
+                let family = car.and_then(|id| c.tables.car(id)).and_then(nfs_game::career::part_family).map(str::to_string);
+                c.tables
+                    .parts
+                    .iter()
+                    .filter(|p| Some(p.family.as_str()) == family.as_deref())
+                    .map(|p| (p.id, 40.0))
+                    .collect()
+            };
+            if let Some(o) = c.career.garage.first_mut() {
+                o.damage_pct = 37.0;
+                o.damage = [37.0; 10];
+                o.parts = parts.iter().map(|(id, _)| *id).collect();
+                o.part_state = parts;
+                o.mileage = 12_345;
+                o.asking_price = Some(9_500);
+            }
+            // …and a used-car market, which the original only has after the first career race
+            // (0x4F7DB0 → 0x4F80C0). Without it the used-car screens have nothing to read.
+            if c.career.market.is_empty() {
+                let mut seed = 0x1234_5678u32;
+                let mut rand = move || {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    seed >> 8
+                };
+                let CareerUi { career, tables, .. } = c;
+                career.refresh_market(tables, &mut rand, &mut || nfs_game::layout::glints::crt_rand() as u32);
+            }
+        }
+        let dir = self.paths.fe_data().join("Layouts");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.strip_suffix(".lay").or_else(|| n.strip_suffix(".LAY")).map(str::to_string)
+            })
+            .collect();
+        names.sort();
+        let mut total: std::collections::BTreeMap<(String, String), usize> = Default::default();
+        let mut where_of: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        let mut expr_fail: std::collections::BTreeMap<(String, String, String, String), usize> = Default::default();
+        let mut empty_combos: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut mute_combos: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut mute_bars: std::collections::BTreeMap<String, usize> = Default::default();
+        // `NFS5.3DCAR`s, counted out of the blank total and reported on their own
+        let mut cars3d = 0usize;
+        let mut ko_past = 0usize;
+        let mut explained: std::collections::BTreeMap<&'static str, usize> = Default::default();
+        let mut screens = 0usize;
+        for name in &names {
+            self.open_layout(name);
+            if self.fe.layout_preview.is_none() {
+                continue;
+            }
+            screens += 1;
+            // the same probe fills the browser with one session, so the four `Comms.*` lists and
+            // the watches beside them can be measured too. The record is what a `'d'` answer
+            // carries (`nfs_net::comm::Describe`), filled as a two-player game would fill it.
+            if std::env::var("NFS_SWEEP_STATE").as_deref() != Ok("0")
+                && let Some(lobby) = self.net.lobby.as_mut()
+                && lobby.found.is_empty()
+            {
+                // a game as 0x509B00 / 0x48DD97 describe it: `HANS'S ~3.5`, positional (index 1),
+                // forward (410) and the first track (300)
+                let name = nfs_net::comm::desc::name_field("HANS'S ", "3.5");
+                lobby.found.push((
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 1106)),
+                    nfs_net::comm::Describe {
+                        request: 0,
+                        from: nfs_net::wire::Addr::ip([127, 0, 0, 1], 1106),
+                        conn_dword: 0,
+                        conn_words: [0, 0],
+                        conn_raw: [0, 0],
+                        name,
+                        bytes: [0, 1, 0, 0],
+                        words: [410, 300],
+                        dwords: [0, 0],
+                        player_limit: 2,
+                        slot_mask: 1,
+                    },
+                ));
+            }
+            self.bind_car_logos();
+            self.bind_lists();
+            self.bind_checks();
+            self.bind_indicator_bars();
+            self.bind_chronicle_icons();
+            self.bind_chronicle_group();
+            self.bind_repair_bars();
+            self.bind_usedcars_panels();
+            self.bind_garage();
+            self.bind_carsetup_gearratio();
+            self.bind_laps_selector();
+            self.bind_player_buttons();
+            self.bind_parts_buttons();
+            self.bind_mergedlist_panel();
+            self.bind_showcase_pictures();
+            self.bind_track_maps();
+            self.bind_player_pictures();
+            // `NFS_SWEEP_DUMP=<layout>` prints what every accessor of that one screen resolves to,
+            // and `NFS_SWEEP_DUMP=*` every screen's. The blank count cannot see a widget that draws
+            // the **wrong** thing — `UsedCar.Car` answered every modifier with the car's name for a
+            // long time and counted as drawn — so this is the other half of the measurement.
+            if std::env::var("NFS_SWEEP_DUMP").as_deref().is_ok_and(|v| v == "*" || v == name.as_str())
+                && let Some(l) = self.fe.layout_preview.as_ref()
+            {
+                for e in &l.layout.elements {
+                    if let Some(a) = e.get("accessor").filter(|a| !a.is_empty()) {
+                        println!("  {name:<20} {:<26} {a:<30} -> {:?}", e.class, self.accessor_value(a));
+                    }
+                }
+                // the lists too: a row that says the wrong thing is as invisible to the blank
+                // count as an accessor that does
+                for w in l.list_boxes() {
+                    let Some(a) = w.accessor.as_deref() else { continue };
+                    let rows = self.list_rows(a).map(|(r, cur)| (r.len(), cur, r.into_iter().take(3).map(|r| format!("{r:?}")).collect::<Vec<_>>()));
+                    println!("  {name:<20} {:<26} {a:<30} => {rows:?}", "list");
+                }
+                // and the 3D cars: the sweep has no 3D pass, so they always count as blank. What
+                // can be measured here is whether the port would have a model to put in each one.
+                for w in l.car_3d() {
+                    let model = self.logo_car(w.accessor.as_deref(), w.othersource.as_deref()).map(|c| c.model.clone());
+                    println!("  {name:<20} {:<26} {:<30} ~> {model:?}", "3dcar", w.accessor.clone().unwrap_or_default());
+                }
+            }
+            // Every part expression the port cannot evaluate. `reference` answers `None` for a
+            // name it does not know and every caller falls back silently, so a template rule the
+            // port misses leaves no trace in the blank count.
+            if std::env::var("NFS_EXPR_SWEEP").is_ok()
+                && let Some(l) = self.fe.layout_preview.as_ref()
+            {
+                for (class, part, key, expr) in l.expr_failures() {
+                    *expr_fail.entry((class, part, key, expr)).or_insert(0usize) += 1;
+                }
+            }
+            if std::env::var("NFS_BOX_SWEEP").is_ok()
+                && let Some(l) = self.fe.layout_preview.as_ref()
+            {
+                for (class, b, u) in l.box_disagreements() {
+                    println!("  box {name:<20} {class:<28} size.value=({:.0}x{:.0}) parts=({:.0}x{:.0})", b.0, b.1, u.0, u.1);
+                }
+            }
+            if let Some(l) = self.fe.layout_preview.as_ref() {
+                cars3d += l.car_3d().len();
+            }
+            // **The blank count cannot see an empty drop-down.** A combo always draws its own
+            // box, so however empty its list is it never counts as a widget that drew nothing —
+            // which is how 61 of the 97 went unnoticed until §4.91. Counted here as its own axis.
+            if let Some(l) = self.fe.layout_preview.as_ref() {
+                for w in l.combo_sliders() {
+                    let a = w.accessor.clone().unwrap_or_default();
+                    let n = self
+                        .choice_rows(&a)
+                        .or_else(|| self.combo_rows(&a))
+                        .or_else(|| self.list_rows(&a))
+                        .map(|(r, _)| r.len())
+                        .unwrap_or(0);
+                    if n == 0 {
+                        *empty_combos.entry(a.split('(').next().unwrap_or("").trim().to_string()).or_insert(0usize) += 1;
+                    }
+                    // and the caption is blind in the same way: a combo whose accessor answers
+                    // nothing still draws its box, so the blank count never sees it either
+                    if self.accessor_value(&a).is_none() {
+                        *mute_combos.entry(a.split('(').next().unwrap_or("").trim().to_string()).or_insert(0usize) += 1;
+                    }
+                }
+                // the same blindness, one class along: a `NFS5.GouraudIndicatorBar` paints its two
+                // bands whatever its accessor says, so a bar the port cannot answer sits at zero
+                // and the blank count never sees it (§4.94)
+                for (_, src, is_other) in l.indicator_bars() {
+                    let v = if is_other {
+                        self.compare_rating(&src)
+                    } else {
+                        let name = src.split_once('(').map_or(src.as_str(), |(b, _)| b.trim());
+                        // the bind's own order (`bind_indicator_bars`): slot 6's integer first —
+                        // the damage family answers it where its text is "n/a" (0x4F6B50)
+                        match (self.accessor_number(&src), self.range_value(name)) {
+                            (Some(v), _) => Some(v),
+                            (None, Some((_, lo, hi))) if hi > lo => Some(0),
+                            _ => self
+                                .accessor_value(&src)
+                                .and_then(|t| t.trim().trim_end_matches('%').trim().parse::<f32>().ok())
+                                .map(|v| v as i32),
+                        }
+                    };
+                    if v.is_none() {
+                        *mute_bars.entry(src.split('(').next().unwrap_or("").trim().to_string()).or_insert(0usize) += 1;
+                    }
+                }
+            }
+            let Some(l) = self.fe.layout_preview.as_ref() else { continue };
+            // how many `NFS5.ChroniclePictureIcon`s of this screen stand past the media list
+            let mut icons = {
+                let media = self.chronicle_media().len() as i64;
+                l.numbered_widgets("NFS5.ChroniclePictureIcon").into_iter().filter(|(_, n)| *n >= media).count()
+            };
+            for (class, src) in l.blank_widgets(nfs_game::layout::DESIGN.0 / nfs_game::layout::DESIGN.1, &self.fe.strings, &|a| self.accessor_value(a)) {
+                // **A knockout row past the opponent count draws nothing in the original too.**
+                // `locationsetup.lay` carries seven fixed rows of watches, rows 0…6, but
+                // `FEKnockoutTrackNumberAccessor`'s getter reads `Game.NumKOOpponents`
+                // (0x4BA786) and, at 0x4BA7CF, `cmp ebp, [esp+0x44]; jl …` — a row at or past
+                // that count falls straight through to `mov eax, 0x5E8E50`, the shared empty
+                // string. With the default count of 4 that is rows 4, 5 and 6, five fields
+                // each. They are not blanks the port owes anyone; counting them made the sweep
+                // chase its own harness, the same way `NFS5.3DCAR` did.
+                if let Some(row) = ko_row_of(&src)
+                    && row >= self.fe.menu.as_ref().map(|m| m.ko_opponents).unwrap_or(4)
+                {
+                    ko_past += 1;
+                    continue;
+                }
+                // **Blank in the original too, in this state** — each with the address that makes
+                // it so, `RE/notes/layouts.md` "The sweep's blanks, row by row" (2026-09-26). The
+                // rest of the list is what the port still owes.
+                if let Some(why) = self.sweep_blank_in_original(&class, &src, &mut icons) {
+                    *explained.entry(why).or_default() += 1;
+                    continue;
+                }
+                where_of.entry(class.clone()).or_default().push(name.clone());
+                *total.entry((class, src)).or_default() += 1;
+            }
+        }
+        if !expr_fail.is_empty() {
+            // Each of these was decomposed on 2026-09-21 (`RE/AUDIT.md` §J) and every one is
+            // either a fault in the shipped data — a name no template declares — or a place the
+            // port follows the **code** rather than the template expression, with the addresses
+            // in the note. They are separated from anything new so this axis reports a small
+            // number the way the others do; a row that is not on this list is the interesting
+            // one. The key is `(class, part.key)`, not the expression, so a template edit cannot
+            // slip past it unnoticed.
+            //
+            // Since the text part's load 0x4E7160 is ported (2026-09-26: a text part's `size` is
+            // its text's truncated 0x536970 measure, `LayoutScreen::part_text`) none of the rows
+            // below fails any more — the sweep counts 0 — and they stay listed only so that a
+            // regression is recognised. They were all a text part's width the port could not
+            // measure at that point. The
+            // three faults in the shipped data that used to be here — `BottomBarButton.ctr`'s
+            // `data.area`, `ChatDisplayBox.ctr`'s `backrect`, the `size=150,` of three
+            // rectangles — resolve now, the way the original resolves them: a name nothing
+            // defines reads 0 (0x530F0A) and an empty half of a pair is 0 (`RE/notes/layouts.md`,
+            // the evaluator section of 2026-09-26).
+            const EXPLAINED: [(&str, &str); 7] = [
+                // the port sets alignment as an anchor in the box, not as this part offset
+                ("NFS5.AccessorWatch", "label.pos"),
+                ("REAL.LABEL", "label.pos"),
+                // the caption runs from 0x4C6054 / 0x4C6237, not from the template (§4.14)
+                ("NFS5.ComboBoxSlider", "label.pos"),
+                // the text comes from an accessor and is drawn from the code path
+                ("NFS5.INPUTBOX", "untext.pos"),
+                ("NFS5.CHARVECTACCESSORINPUTBOX", "untext.pos"),
+                // a button whose own string is empty — AUDIT §F's five
+                ("NFS5.GOTOBUTTON", "mediumlabel.pos"),
+                ("NFS5.GOTOBUTTON", "smalllabel.pos"),
+            ];
+            let mut ks: Vec<_> = expr_fail.iter().collect();
+            ks.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+            let mut news = 0usize;
+            let mut known = 0usize;
+            for ((class, part, key, expr), n) in &ks {
+                let site = format!("{part}.{key}");
+                if EXPLAINED.iter().any(|(c, s)| c == class && *s == site) {
+                    known += **n;
+                    continue;
+                }
+                if news == 0 {
+                    println!("part expressions that do not resolve and are NOT accounted for:");
+                }
+                news += **n;
+                println!("  {n:5}  {class:<28} {site} = {expr}");
+            }
+            println!("part expressions that do not resolve: {news} unaccounted, {known} decomposed in AUDIT.md §J");
+        }
+        // which screen each blank is on — `NFS_SWEEP_WHERE=1` prints it. A count by class says
+        // what is missing, not where to look for it, and every blank that turned out to be a real
+        // gap was found by opening the screen it is on.
+        // **A state a template declares and this port never returns is a look the original has
+        // and the port does not** — and no blank count can see it, because the widget draws its
+        // other states perfectly well. `NFS_SWEEP_STATES=1` lists them. The set the port can
+        // return is `state_for`'s own: the `.lay`'s `state=`, `normal`, `hover`, `focused`,
+        // `focusedhover`, `selected`, `selectedhover` and `NFS5.CAMERASELECT`'s `highlighty`.
+        // §4.112.
+        //
+        // **`hidden` and `disabled` belong in that set and were missing from it until
+        // 2026-09-21**, which made this axis report 58 classes "never hidden" and 11 "never
+        // disabled" — 69 phantom gaps. The port does both: a hidden widget is skipped at the
+        // draw (`layout.rs`'s `hidden_flags`, set by name the way 0x50D910 does at its fifty-one
+        // call sites) and `state_for`'s **first** arm returns `disabled` off `disabled_flags`.
+        // A list of gaps that names things already done is the same failure as the blank count
+        // reading an empty career, and it hid a real one underneath: `state_hidden_or_disabled`
+        // was reading only the `.lay` attribute, so a widget hidden at run time stayed pressable.
+        if std::env::var("NFS_SWEEP_STATES").is_ok() {
+            const KNOWN: [&str; 9] =
+                ["normal", "hover", "focused", "focusedhover", "selected", "selectedhover", "highlighty", "hidden", "disabled"];
+            let mut miss: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = Default::default();
+            for name in &names {
+                self.open_layout(name);
+                let Some(l) = self.fe.layout_preview.as_ref() else { continue };
+                for (class, states) in l.declared_states() {
+                    for st in states {
+                        if !KNOWN.contains(&st.as_str()) {
+                            miss.entry(class.clone()).or_default().insert(st);
+                        }
+                    }
+                }
+            }
+            // and the parts no state lists — only a class's own draw can reach one (§4.130)
+            let mut unlisted: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+            for name in &names {
+                self.open_layout(name);
+                if let Some(l) = self.fe.layout_preview.as_ref() {
+                    unlisted.extend(l.unlisted_parts());
+                }
+            }
+            println!("template parts no state lists:");
+            for (class, parts) in &unlisted {
+                println!("  {class:<32} {}", parts.join(", "));
+            }
+            println!("the chronicle index for group {} (§4.118): {:?}", self.fe.chronicle_group, self.chronicle_index());
+            println!("template states this port never returns:");
+            for (class, states) in &miss {
+                println!("  {class:<32} {}", states.iter().cloned().collect::<Vec<_>>().join(", "));
+            }
+        }
+        if std::env::var("NFS_SWEEP_WHERE").is_ok() {
+            println!("blank widgets by screen:");
+            let mut ks: Vec<&String> = where_of.keys().collect();
+            ks.sort();
+            for c in ks {
+                let mut per: std::collections::BTreeMap<&str, usize> = Default::default();
+                for s in &where_of[c] {
+                    *per.entry(s.as_str()).or_default() += 1;
+                }
+                let list: Vec<String> = per.iter().map(|(s, n)| if *n > 1 { format!("{s} x{n}") } else { (*s).to_string() }).collect();
+                println!("  {c:<32} {}", list.join(", "));
+            }
+        }
+        let mut by_class: std::collections::BTreeMap<String, usize> = Default::default();
+        for ((c, _), n) in &total {
+            *by_class.entry(c.clone()).or_default() += n;
+        }
+        let mut rows: Vec<(usize, String)> = by_class.into_iter().map(|(c, n)| (n, c)).collect();
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        println!("layouts swept: {screens} of {}", names.len());
+        println!("widgets that drew nothing, by class:");
+        for (n, c) in &rows {
+            let srcs: Vec<String> = total.iter().filter(|((k, _), _)| k == c).map(|((_, s), n)| format!("{s} x{n}")).take(4).collect();
+            println!("  {n:5}  {c:<32} {}", srcs.join(", "));
+        }
+        println!("total: {}", rows.iter().map(|(n, _)| n).sum::<usize>());
+        // the second axis: containers the blank count is blind to (§4.92)
+        let ec: usize = empty_combos.values().sum();
+        println!("\ncombos with an empty drop-down: {ec}");
+        let mut ecs: Vec<(usize, String)> = empty_combos.into_iter().map(|(a, n)| (n, a)).collect();
+        ecs.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (n, a) in &ecs {
+            println!("  {n:4}  {a}");
+        }
+        let mc: usize = mute_combos.values().sum();
+        println!("\ncombos whose caption answers nothing: {mc}");
+        let mut mcs: Vec<(usize, String)> = mute_combos.into_iter().map(|(a, n)| (n, a)).collect();
+        mcs.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (n, a) in &mcs {
+            println!("  {n:4}  {a}");
+        }
+        // `NFS5.3DCAR` is not in the blank count — it is never a 2D sprite in either build
+        // (`FECar3DControl`'s draw 0x4C0990 calls no painter at all) — so it is reported here
+        // instead of going missing.
+        println!("\n3D car widgets (never a sprite, drawn by the 3D pass — 0x4C0990): {cars3d}");
+        println!("knockout rows past Game.NumKOOpponents (empty in the original — 0x4BA7CF): {ko_past}");
+        println!("blank in the original too, in this state: {}", explained.values().sum::<usize>());
+        for (why, n) in &explained {
+            println!("  {n:4}  {why}");
+        }
+        let mb: usize = mute_bars.values().sum();
+        println!("\nindicator bars whose accessor answers nothing: {mb}");
+        let mut mbs: Vec<(usize, String)> = mute_bars.into_iter().map(|(a, n)| (n, a)).collect();
+        mbs.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (n, a) in &mbs {
+            println!("  {n:4}  {a}");
+        }
+        println!("\nby source:");
+        let mut srcs: Vec<(usize, String, String)> = total.iter().map(|((c, s), n)| (*n, c.clone(), s.clone())).collect();
+        srcs.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(&b.2)));
+        for (n, c, s) in &srcs {
+            println!("  {n:4}  {c:<30} {s}");
+        }
+    }
+
+    /// One scripted left click at design point `(x, y)` (tooling: `NFS_FE_CLICKS`, and the
+    /// `click:x,y` token of `NFS_FE_KEYS`, which runs in order with the `keys:` around it).
+    pub(crate) fn fe_scripted_click(&mut self, x: f32, y: f32, event_loop: &ActiveEventLoop) {
+        self.fe.cursor = Some((x, y));
+        if let Some(l) = self.fe.layout_preview.as_mut() {
+            l.script_cursor(Some((x, y)));
+            // let any transition finish and the hover settle, as a player's pointer would have
+            for _ in 0..60 {
+                l.advance_transition(16);
+            }
+        }
+        let before = self.fe.layout_preview.as_ref().map(|l| (l.hovered(), l.open_combo(), l.combo_row_at(x, y)));
+        self.fe_left_button(event_loop, true);
+        self.fe_left_button(event_loop, false);
+        let after = self.fe.layout_preview.as_ref().map(|l| (l.hovered(), l.open_combo()));
+        tracing::info!(x, y, ?before, ?after, open = ?self.fe.layout_open_combo, "NFS_FE_CLICKS click");
+        for _ in 0..4 {
+            if let Some(l) = self.fe.layout_preview.as_mut() {
+                l.advance_transition(16);
+            }
+        }
+    }
+
+    /// The analogue devices the front end can see. `NFS5.DEADZONE`'s draw returns before painting
+    /// anything when there is none (0x51B60D), which is what an empty list gives — and that is
+    /// what this port has on a machine with no pad. `NFS_FE_PAD=1` stands one in, all eight axes
+    /// present and each a tenth of the way along, so `deadzone.lay` can be looked at without one.
+    pub(crate) fn fe_pads(&self) -> Vec<nfs_game::layout::FePad> {
+        if std::env::var("NFS_FE_PAD").is_ok() {
+            return vec![nfs_game::layout::FePad { analogue: true, axes: 0xFF, values: [32767; 8] }];
+        }
+        // `NFS_FE_DZ=<min>,<max>` puts the sixteen values somewhere other than the factory's
+        // 0 / 0x80, so a still shows what a trimmed bar looks like
+        self.gamepads
+            .axis_sets()
+            .into_iter()
+            .map(|a| nfs_game::layout::FePad { analogue: a.mask != 0, axes: a.mask, values: a.values })
+            .collect()
+    }
+
+    /// `NFS_FE_DZ=<min>,<max>` — the sixteen dead-zone values for a still, in the accessors' own
+    /// 0…0x80. Without it they are the factory's 0 and 0x80 (0x51E546, 0x51E550).
+    pub(crate) fn fe_deadzone() -> Option<[[i32; 2]; 8]> {
+        let v = std::env::var("NFS_FE_DZ").ok()?;
+        let (a, b) = v.split_once(',')?;
+        let (a, b) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
+        Some([[a, b]; 8])
+    }
+
+    /// diagnostic: a scripted press on the replay bar (`NFS_REPLAY_PRESS`), the pointer put in the
+    /// cell's middle; 7 / 8 click `HReplaySave`'s buttons and 9 / 10 the overwrite question's. A
+    /// cell of the bar's own only latches the press (`App::replay_bar_latch`), same as a real
+    /// click — its caller runs `replay_bar_frame` right after, in the same tick, which answers it;
+    /// `NFS_REPLAY_TYPE` is typed into the name once that opens `HReplaySave` (the caller's check).
+    pub(crate) fn run_bar_script(&mut self) {
+        if let Some(&(t, cell)) = self.hover_script.first()
+            && self.tick >= t
+            && self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted))
+        {
+            self.hover_script.remove(0);
+            let (cells, _) = Hud::bar_geometry();
+            self.fe.cursor = Some(cell.and_then(|c| cells.get(c)).map_or((0.0, 0.0), |&(x, y)| (x + 10.0, y + 9.0)));
+            tracing::info!(tick = self.tick, cell = ?cell, "diagnostic: the pointer on the replay bar (NFS_REPLAY_HOVER)");
+        }
+        if let Some(&(t, cell)) = self.bar_script.first()
+            && self.tick >= t
+            && self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted))
+        {
+            self.bar_script.remove(0);
+            let (cells, _) = Hud::bar_geometry();
+            match cell {
+                7 | 8 => self.replay_save_click(cell - 7),
+                9 | 10 => self.replay_overwrite_click(cell - 9),
+                _ => {
+                    if let Some(&(x, y)) = cells.get(cell) {
+                        self.fe.cursor = Some((x + 10.0, y + 9.0));
+                        self.replay_bar_latch();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Set by `main` for a scripted run: the window must not take the focus (`NFS_NO_FOCUS`).
+pub(crate) static NO_FOCUS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set by `main` from `NFS_PLAY_INTRO`: a scripted run (`--autotest`/`--screenshot`/
+/// `--layout-sweep`/`--record`/`NFS_NO_FOCUS`) otherwise never plays the start-up movies (`main`'s
+/// own `scripted` gate on `resume_inner`'s intro branch), so no scripted check ever walked the
+/// intro → front-end handoff — the class of hang the release app hit after the movies (548aa02b).
+/// This flag keeps the intro for a scripted run too, and `intro_event` auto-taps Esc every frame
+/// (the same key path a player's skip takes) so the walk does not sit through the whole movie.
+pub(crate) static PLAY_INTRO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// **TEST GLUE** (not in the original): the still's geometry — `NFS_SHOT_SIZE=WxH` physical pixels
+/// (default 1280x800, the goldens' size) and `NFS_SHOT_SCALE=<s>` (default 1, the HiDPI factor the
+/// HUD's logical resolution is taken with, see [`App::hud_geometry`]).
+pub(crate) fn shot_geometry() -> (u32, u32, f32) {
+    let (w, h) = std::env::var("NFS_SHOT_SIZE")
+        .ok()
+        .and_then(|v| {
+            let (a, b) = v.split_once('x')?;
+            Some((a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?))
+        })
+        .filter(|&(w, h)| w > 0 && h > 0)
+        .unwrap_or((1280, 800));
+    let s = std::env::var("NFS_SHOT_SCALE").ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|s| *s >= 1.0).unwrap_or(1.0);
+    (w, h, s)
+}
+
+/// diagnostic: `NFS_CONE_LIMIT=n` gives the mission a cone **limit** of `n` (rule kind 0, which no
+/// shipped mission uses) — so `CONEPENALTY` is −1 and `HTime`'s sum can go below 0
+pub(crate) fn cone_limit_diagnostic(mut ms: career_ui::MissionStart) -> career_ui::MissionStart {
+    if let Some(n) = std::env::var("NFS_CONE_LIMIT").ok().and_then(|v| v.trim().parse::<u16>().ok()) {
+        ms.mission.cone_rule = Some(nfs_formats::career::ConeRule::Limit(n));
+    }
+    ms
+}
+
+/// diagnostic (port-only): `NFS_RACE_PLACE=<p>` — the place (1-based) the player finishes at, in
+/// any race. A scripted race's bot cannot drive past anyone, so this is how a scripted career race
+/// reaches the winnings of a better place, a tournament won and the era's advance.
+/// `NFS_RACE_PLACE=<p>:<tick>` also flags the player's car finished at race tick `tick`
+/// ([`race_finish_diagnostic`]), so race over and the result pages come. Unset (the goldens,
+/// every normal run) it does nothing; read once.
+pub(crate) fn race_place_diagnostic() -> Option<usize> {
+    race_place_spec().0
+}
+
+pub(crate) fn race_finish_diagnostic() -> Option<u64> {
+    race_place_spec().1
+}
+
+fn race_place_spec() -> (Option<usize>, Option<u64>) {
+    static SPEC: std::sync::OnceLock<(Option<usize>, Option<u64>)> = std::sync::OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let Ok(v) = std::env::var("NFS_RACE_PLACE") else { return (None, None) };
+        let (p, t) = v.split_once(':').map_or((v.as_str(), None), |(p, t)| (p, Some(t)));
+        let place = p.trim().parse::<usize>().ok().filter(|p| *p >= 1);
+        (place, place.and(t.and_then(|t| t.trim().parse::<u64>().ok())))
+    })
+}
+
+/// `NFS_RACE_PLACE`'s edit of `Race_finalize`'s output: the player (driver 0) moved to place `p`
+/// of `order`, every racer's `+0xCD4` renumbered to its row, and the times dealt out again in the
+/// new order — the timed racers' totals sorted ascending go to the timed rows first, so a
+/// time-ranked club event ranks the same way (the lap times and the best lap stay each car's own).
+pub(crate) fn place_player(order: &mut Vec<usize>, racers: &mut [nfs_game::race::RacerResult], p: usize) {
+    let Some(at) = order.iter().position(|d| *d == 0) else { return };
+    let d = order.remove(at);
+    order.insert(p.clamp(1, order.len() + 1) - 1, d);
+    let mut times: Vec<i32> = order.iter().filter_map(|d| racers.get(*d)).map(|r| r.time).collect();
+    // no time (0) sorts last
+    times.sort_by_key(|t| if *t == 0 { i32::MAX } else { *t });
+    for (row, d) in order.iter().enumerate() {
+        if let Some(r) = racers.get_mut(*d) {
+            r.place = row as u32 + 1;
+            r.time = times[row];
+        }
+    }
+}
+
+/// A `NFS_HUD_KEYS` script entry: an ordinary HUD toggle key, the pause (left through its
+/// continue), or the pause left through the pause menu's restart instead — the port diagnostic
+/// added for `replay.md` §18.12's restart audio-pick count.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum ScriptedHudKey {
+    Toggle(nfs_input::Action),
+    Pause,
+    PauseRestart,
+    /// test glue for the network pad bytes (`NFS_HUD_KEYS`'s `horn` / `hornoff` / `reset`): a button pressed /
+    /// released on that tick
+    Pad(nfs_input::Action, bool),
+}

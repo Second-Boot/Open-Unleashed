@@ -44,6 +44,9 @@ pub struct IntroRun {
     /// the mouse device's four buttons, 0x5372A0(6) `+0x10…+0x13`
     buttons: [bool; 4],
     t0: Instant,
+    /// 0x4DC140's tail: after the movie the call waits until no mouse button is down (and the key
+    /// ring is empty) — the front end's idle re-roll; the start-up's 0x4DD600 has no such wait
+    wait_release: bool,
 }
 
 impl IntroRun {
@@ -55,7 +58,16 @@ impl IntroRun {
             tracing::warn!("start-up movies: the decoder's tables could not be read (madtables.bin / nfs5.exe)");
         }
         window.request_redraw();
-        Self { window, renderer, files, tables, movie: None, blank: 0, tex: None, keys: VecDeque::new(), buttons: [false; 4], t0: Instant::now() }
+        Self { window, renderer, files, tables, movie: None, blank: 0, tex: None, keys: VecDeque::new(), buttons: [false; 4], t0: Instant::now(), wait_release: false }
+    }
+
+    /// **0x4DC140** — `FEMainScreen`'s idle re-roll (0x510210): 0x4DD4A0's `inPC-av.mad` alone (a
+    /// missing file is passed over, 0x59DC30), then the wait until no mouse button is down.
+    pub fn new_idle(window: Arc<Window>, renderer: Renderer, paths: &GamePaths) -> Self {
+        let mut run = Self::new(window, renderer, paths);
+        run.files.retain(|p| p.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("inPC-av.mad")));
+        run.wait_release = true;
+        run
     }
 
     pub fn key(&mut self, esc: bool) {
@@ -92,6 +104,13 @@ impl IntroRun {
     pub fn frame(&mut self, audio: Option<&nfs_audio::AudioOutput>, camera: &Camera) -> bool {
         if self.movie.is_none() && self.blank == 0 {
             let Some(path) = self.files.pop_front() else {
+                // 0x4DC140 (0x4DC146…0x4DC16E): the loop runs while any of the mouse's four buttons is down
+                // or the key ring still gave a key; the ring is drained here, a button decides
+                self.keys.clear();
+                if self.wait_release && self.buttons.iter().any(|b| *b) {
+                    self.window.request_redraw();
+                    return false;
+                }
                 return true;
             };
             self.movie = self.open(&path);

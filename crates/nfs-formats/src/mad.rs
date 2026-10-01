@@ -701,7 +701,7 @@ impl MadDecoder {
                 let pix = parity + k;
                 let at = base + r as i32 * self.row_dwords as i32 + (pix / 2) as i32;
                 let d = usize::try_from(at).ok().and_then(|i| prev.get(i).copied()).unwrap_or(0);
-                let y = if pix % 2 == 0 { d >> 24 } else { d >> 16 } as u8;
+                let y = if pix.is_multiple_of(2) { d >> 24 } else { d >> 16 } as u8;
                 self.luma[buf_at + r * 16 + k] = (y.wrapping_add(dc as u8) as i32) << 16;
             }
         }

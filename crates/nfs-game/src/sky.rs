@@ -939,7 +939,7 @@ impl Sky {
                     // the ring is the list's last level, flags 0x80 (0x459B53 → 0x45AAA0, 0x45DADF):
                     // no 0x400, so it draws after the sun
                     for q in 0..32 {
-                        parts.push((r.upload_mesh(&horizon_ring_quad(bin, q, y0, y1, &colour)), m, Motion::Ring(q as i32), true));
+                        parts.push((r.upload_mesh(&horizon_ring_quad(bin, q, y0, y1, colour)), m, Motion::Ring(q as i32), true));
                     }
                 }
                 // no usable `.bin` (a broken install, see the layers above): no ring. *(The port

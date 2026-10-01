@@ -226,7 +226,7 @@ impl Replay {
     }
 
     pub fn stream(&self) -> &[u8] {
-        &self.stream[..self.write.max(0)]
+        &self.stream[..self.write]
     }
     pub fn written(&self) -> usize {
         self.write
@@ -391,8 +391,8 @@ impl Speed {
     /// How many game ticks this loop iteration runs at tick counter `t` (0 = render only).
     pub fn ticks_at(self, t: u64) -> u32 {
         match self {
-            Speed::Half => u32::from(t % 2 == 0),
-            Speed::Quarter => u32::from(t % 4 == 0),
+            Speed::Half => u32::from(t.is_multiple_of(2)),
+            Speed::Quarter => u32::from(t.is_multiple_of(4)),
             Speed::Normal => 1,
             Speed::Double => 2,
         }

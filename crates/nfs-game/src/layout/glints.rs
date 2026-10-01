@@ -28,9 +28,9 @@ thread_local! {
 /// `rand()`, 0x5A17C9: `s = s·0x343FD + 0x269EC3`, `(s >> 16) & 0x7FFF`, on the shared state.
 pub fn crt_rand() -> i32 {
     HOLDRAND.with(|h| {
-        let s = h.get().wrapping_mul(0x343FD).wrapping_add(0x269EC3);
+        let s = crate::rng::crt_step(h.get());
         h.set(s);
-        ((s >> 16) & 0x7FFF) as i32
+        crate::rng::crt_out(s)
     })
 }
 

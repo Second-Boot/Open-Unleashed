@@ -1311,8 +1311,8 @@ impl LayoutScreen {
                     _ => None,
                 },
             );
-            if let Some((along, width, dir)) = run {
-                if width >= 1
+            if let Some((along, width, dir)) = run
+                && width >= 1
                     && let Some((s, l, c0, c1)) = glint_sweep(len, along as f32, width as f32, dir == 1)
                 {
                     let (a, b) = (tint(c0), tint(c1));
@@ -1321,7 +1321,6 @@ impl LayoutScreen {
                     let cols = if horizontal { [a, b, a, b] } else { [a, a, b, b] };
                     self.gouraud(out, aspect, pts, cols);
                 }
-            }
         }
         // `NFS5.BEVELEDOPTIONBOX` is the one class whose draw is the vtable's own
         // 0x520E50: the template's parts (0x4C8260 at 0x520E5E) and then the shared

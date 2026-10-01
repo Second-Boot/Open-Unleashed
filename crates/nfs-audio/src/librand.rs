@@ -272,6 +272,7 @@ mod tests {
         let mut g = LibRand::default();
         let (d, _) = patch_start(&mut g, &[r], 0x7F, |_| true);
         let mut h = LibRand::default();
+        #[allow(clippy::modulo_one)] // the draw is taken `% 1` like the original's call site
         let a = h.next() % 1;
         let b = h.next() % 100;
         assert_eq!((d[0].1.volume_phase, d[0].1.pitch_phase), (a as u8, b as u8));

@@ -82,7 +82,7 @@ pub fn string_record(id: u32, slot: u32, text: &[u8]) -> Vec<u32> {
     let mut v = vec![id, slot];
     let mut bytes = text.clone();
     bytes.push(0);
-    while bytes.len() % 4 != 0 {
+    while !bytes.len().is_multiple_of(4) {
         bytes.push(0);
     }
     v.extend(bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])));

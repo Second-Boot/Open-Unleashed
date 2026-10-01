@@ -160,20 +160,7 @@ impl FeRng {
 
 /// The C runtime's `rand()` (0x5A17C9), which the two percentage rolls use. The default seed of a
 /// C program is 1; nothing in the image was found calling `srand`.
-pub struct CRand(u32);
-
-impl Default for CRand {
-    fn default() -> Self {
-        Self(1)
-    }
-}
-
-impl CRand {
-    pub fn next(&mut self) -> i32 {
-        self.0 = self.0.wrapping_mul(0x343F_D).wrapping_add(0x26_9EC3);
-        ((self.0 >> 16) & 0x7FFF) as i32
-    }
-}
+pub use crate::rng::CRand;
 
 /// One opponent's car and appearance, as `FECar::init` 0x4EEBA0 receives it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

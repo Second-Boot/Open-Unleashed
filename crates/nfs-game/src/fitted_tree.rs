@@ -165,6 +165,7 @@ impl FittedTree {
 
     /// The circle the node pass tests (0x47F400: the centre of the node's square, radius
     /// `width · 0.7071`).
+    #[allow(clippy::approx_constant)] // the original's constant is 0.7071, not FRAC_1_SQRT_2
     pub fn circle(&self, n: &Node) -> (f32, f32, f32) {
         let (min, max) = self.bounds(n);
         ((min.0 + max.0) * 0.5, (min.1 + max.1) * 0.5, 0.7071 * (max.0 - min.0))

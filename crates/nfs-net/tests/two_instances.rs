@@ -358,6 +358,8 @@ fn joined_pair(loss: u32) -> (Net, Net) {
     let mut c = client("racer");
     c.join(host_at, &[]).unwrap();
     pump(&mut h, &mut c, |_, ec| find(ec, |e| matches!(e, Event::Joined { .. })).cloned());
+    // the room's arrival handler (0x491AB4 / 0x491C25) has answered the joiner: `+0xBA` is set, the pump sends
+    h.peer_in(0);
     h.sock.set_drop(loss, 7);
     c.sock.set_drop(loss, 11);
     (h, c)

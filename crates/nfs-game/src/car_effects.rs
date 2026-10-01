@@ -207,7 +207,10 @@ impl CarEffects {
                     // 0x43F262…0x43F293: `min(speed − 7.5, 15) / 15` — `15` is `7.5 + 7.5`
                     let over = c.speed - SPRAY_SPEED;
                     let top = SPRAY_SPEED + SPRAY_SPEED;
-                    s.strength = if over > top { top / top } else { over / top };
+                    #[allow(clippy::eq_op)] // the original's `min` is spelled `top / top`
+                    {
+                        s.strength = if over > top { top / top } else { over / top };
+                    }
                     // 0x43F2B1…0x43F2E1: the contact less `1.14·f` (`[0x5B37A8]`) across
                     let back = |p: f32, f: f32| (p as f64 - f as f64 * 1.14f32 as f64) as f32;
                     s.emitter.position = Vec3::new(back(wheel.contact.x, c.forward.x), wheel.contact.y, back(wheel.contact.z, c.forward.z));

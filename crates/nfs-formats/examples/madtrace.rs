@@ -12,7 +12,7 @@ fn main() {
     println!("q[0]={} q[1]={} q[2]={}", q[0], q[1], q[2]);
     let mut br = nfs_formats::mad::BitReader::new(&mad[nfs_formats::mad::MAD_HEADER_SIZE..]);
     let mut c = [0i32; 64];
-    let mbs = ((h.width as usize + 15) / 16) * ((h.height as usize + 15) / 16);
+    let mbs = (h.width as usize).div_ceil(16) * (h.height as usize).div_ceil(16);
     let mut hist = std::collections::BTreeMap::new();
     let mut dcs = std::collections::BTreeMap::new();
     for b in 0..mbs * 6 {

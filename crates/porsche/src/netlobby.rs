@@ -490,9 +490,13 @@ impl App {
             _ => {
                 let url = "http://login.earacing.com";
                 tracing::info!(url, "REGISTERUSER (0x510990): the front end exits and the registration page is opened (0x4A5EA0)");
-                #[cfg(target_os = "macos")]
                 if !NO_FOCUS.load(std::sync::atomic::Ordering::Relaxed) {
+                    #[cfg(target_os = "macos")]
                     let _ = std::process::Command::new("open").arg(url).spawn();
+                    #[cfg(windows)]
+                    let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+                    #[cfg(not(any(target_os = "macos", windows)))]
+                    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
                 }
                 event_loop.exit();
             }

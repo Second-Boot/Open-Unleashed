@@ -948,7 +948,7 @@ impl TrafficSet {
             // `add_slices` runs along the race route; ±2·slot slices keep the parity either way.)
             {
                 let s = self.add_slices(table, self.cars[i].slice, 2 * (self.slot_base + i) as i32);
-                if s % 2 == 0 && self.rng.below(PERSONALITIES[0].reroll) == 1 {
+                if s.is_multiple_of(2) && self.rng.below(PERSONALITIES[0].reroll) == 1 {
                     let _offset = PERSONALITIES[0].lane_offsets[(self.rng.rand16() & 3) as usize];
                 }
             }

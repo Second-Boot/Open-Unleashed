@@ -109,7 +109,7 @@ impl RaceSmackables {
         for p in self.props.iter_mut() {
             p.post_impact();
         }
-        if tick % 32 == 0 {
+        if tick.is_multiple_of(32) {
             for (k, p) in self.props.iter().enumerate().filter(|(_, p)| !p.asleep) {
                 tracing::trace!(prop = k, owner = ?self.owners.get(k), pos = ?p.body.position, vel = ?p.body.velocity, spin = ?p.body.angular_velocity, h = p.body.body_height, "smackable awake");
             }
@@ -122,7 +122,7 @@ impl RaceSmackables {
     pub fn integrate(&mut self, tick: u64) {
         for p in self.props.iter_mut() {
             p.integrate();
-            if tick % 32 == 0 {
+            if tick.is_multiple_of(32) {
                 p.body.renormalise();
             }
         }

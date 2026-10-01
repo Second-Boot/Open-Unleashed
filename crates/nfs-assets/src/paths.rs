@@ -14,8 +14,8 @@ pub struct GameNotFound {
 }
 
 impl GamePaths {
-    /// Resolve the game root: `$NFS5_GAME_PATH`, then an app bundle's own `Resources/game`, then the
-    /// documented default locations.
+    /// Resolve the game root: `$NFS5_GAME_PATH`, then `game/` beside the executable, an app bundle's own
+    /// `Resources/game`, then the documented default locations ([`crate::platform::game_data_candidates`]).
     pub fn locate() -> Result<Self, GameNotFound> {
         let mut tried = Vec::new();
         if let Ok(p) = std::env::var("NFS5_GAME_PATH") {
@@ -25,25 +25,13 @@ impl GamePaths {
             }
             tried.push(p);
         }
-        // A self-contained app bundle (`packaging/make_app.sh --with-data`) carries the data in
-        // `Contents/Resources/game`, beside `Contents/MacOS/<binary>`.
-        if let Some(p) = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|d| d.join("../Resources/game")))
-        {
+        // `game/` beside the executable (Windows / Linux packages), a macOS bundle's
+        // `Contents/Resources/game`, then the developer's home fallbacks.
+        for p in crate::platform::game_data_candidates() {
             if Self::looks_like_root(&p) {
                 return Ok(Self { root: p.canonicalize().unwrap_or(p) });
             }
-        }
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = PathBuf::from(home);
-            for rel in ["Games/NFS-Porsche-Unleashed/game_info/data", "Games/NFS-Porsche-Unleashed"] {
-                let p = home.join(rel);
-                if Self::looks_like_root(&p) {
-                    return Ok(Self { root: p });
-                }
-                tried.push(p);
-            }
+            tried.push(p);
         }
         Err(GameNotFound { tried })
     }
@@ -106,14 +94,7 @@ impl GamePaths {
     /// Case-insensitive lookup of a file inside `dir` (the original data mixes cases, and macOS
     /// default volumes are case-insensitive but we do not rely on that).
     pub fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
-        let direct = dir.join(name);
-        if direct.is_file() {
-            return Some(direct);
-        }
-        let rd = std::fs::read_dir(dir).ok()?;
-        rd.flatten().map(|e| e.path()).find(|p| {
-            p.file_name().and_then(|n| n.to_str()).map(|n| n.eq_ignore_ascii_case(name)).unwrap_or(false)
-        })
+        nfs_formats::ci_file::find_file(dir, name)
     }
 }
 

@@ -209,7 +209,7 @@ pub mod id {
 pub fn string_record(id: u32, text: &str) -> Vec<u32> {
     let mut bytes = text.as_bytes().to_vec();
     bytes.push(0);
-    while bytes.len() % 4 != 0 {
+    while !bytes.len().is_multiple_of(4) {
         bytes.push(0);
     }
     let mut r = vec![id];

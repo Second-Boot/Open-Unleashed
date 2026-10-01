@@ -181,7 +181,7 @@ impl SkillTest {
         // the two lookups the skill tests use, 0x46D290 (by type) and 0x46D2E0 (by
         // sequence id), read that vector. Type 6 is a trackside camera and type 4 an
         // audio trigger; neither is ever a checkpoint. — race-logic.md §3.2.
-        if !matches!(kind, 0 | 1 | 2) {
+        if !matches!(kind, 0..=2) {
             return None;
         }
         let shape = *p.get(1)? as u8;
@@ -474,7 +474,7 @@ mod tests {
         let clean = [0.0f32; 10];
         assert_eq!(st.evaluate(&m, 1, 1, &clean), (true, 26 * 64));
         m.cone_rule = Some(ConeRule::PenaltySeconds(3));
-        assert_eq!(st.evaluate(&m, 1, 1, &clean).0, false, "25 + 3 s > 27 s");
+        assert!(!st.evaluate(&m, 1, 1, &clean).0, "25 + 3 s > 27 s");
         // 0x42952E: a time exactly on the limit passes
         m.cone_rule = Some(ConeRule::PenaltySeconds(2));
         assert_eq!(st.evaluate(&m, 1, 1, &clean), (true, 27 * 64));

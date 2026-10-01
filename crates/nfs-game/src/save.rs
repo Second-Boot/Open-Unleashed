@@ -4,7 +4,7 @@
 //! **Where the files go.** The original keeps everything in `<gamedir>\SaveData\`, created at
 //! start-up by 0x4B6AA0, and uses no other location. This port treats the installation as
 //! read-only reference material, so the same directory tree lives under
-//! `~/Library/Application Support/PorscheUnleashed/SaveData/` (override with `NFS5_SAVE_DIR`).
+//! `PorscheUnleashed/SaveData/` under the per-OS data dir ([`nfs_assets::platform::data_dir`]) (override with `NFS5_SAVE_DIR`).
 //! Everything *inside* it — file names, `player.lst`, `nfs5.trk`, the `.sav` byte layout — is the
 //! original's.
 //!
@@ -40,8 +40,7 @@ pub fn save_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("NFS5_SAVE_DIR") {
         return PathBuf::from(d);
     }
-    let base = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    base.join("Library").join("Application Support").join("PorscheUnleashed").join("SaveData")
+    nfs_assets::platform::data_dir().join("SaveData")
 }
 
 /// One profile: the file `SaveData\<picture><name>.sav`.
@@ -307,11 +306,10 @@ fn owned_from_image(tables: &CareerTables, car: &SavedCar) -> OwnedCar {
     let rec = |id: i16| tables.parts.iter().find(|p| p.id == id);
     for i in 0..owned.parts.len() {
         for j in i + 1..owned.parts.len() {
-            if let (Some(a), Some(b)) = (rec(owned.parts[j]), rec(owned.parts[i])) {
-                if crate::career::part_less(a, b) {
+            if let (Some(a), Some(b)) = (rec(owned.parts[j]), rec(owned.parts[i]))
+                && crate::career::part_less(a, b) {
                     owned.parts.swap(i, j);
                 }
-            }
         }
     }
     // a `.sav` the port wrote before 2026-09-25 has no stock list (`n1 = 0`) and only the bought

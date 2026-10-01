@@ -49,9 +49,7 @@ pub struct ParticleDef {
     pub colours: [u32; 4],
 }
 
-fn dword(r: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes([r[o], r[o + 1], r[o + 2], r[o + 3]])
-}
+use crate::dword;
 
 fn float(r: &[u8], o: usize) -> f32 {
     f32::from_bits(dword(r, o))

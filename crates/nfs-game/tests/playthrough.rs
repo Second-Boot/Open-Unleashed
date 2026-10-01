@@ -59,11 +59,10 @@ impl Run {
             return;
         };
         let (model, sim) = (rec.model.clone(), rec.sim.clone());
-        if self.seen.insert(format!("car:{model}")) {
-            if let Err(e) = CarAssets::load(&self.paths, &model) {
+        if self.seen.insert(format!("car:{model}"))
+            && let Err(e) = CarAssets::load(&self.paths, &model) {
                 self.blockers.push(format!("{what}: car model {model}: {e}"));
             }
-        }
         if self.seen.insert(format!("sim:{sim}")) {
             if sim.is_empty() {
                 self.blockers.push(format!("{what}: car {model} has no simulation variant"));

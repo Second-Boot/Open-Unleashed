@@ -2,7 +2,7 @@
 //! screen's painters (`RE/notes/controls.md` §4.150a). The show itself is
 //! `crate::end_of_era::EndOfEra`; this loads its art and turns its draws into sprites.
 
-use super::{tint, LayoutScreen, MoviePlayer};
+use super::{argb, LayoutScreen, MoviePlayer};
 use crate::end_of_era::{self as eoe, Draw, EndOfEra};
 use crate::text::BitmapFont;
 use nfs_assets::{texture::decode_pack, GamePaths};
@@ -18,10 +18,6 @@ pub(super) struct EndOfEraScreen {
     art: HashMap<&'static str, Vec<Art>>,
     font: Option<BitmapFont>,
     pub(super) movie: Option<MoviePlayer>,
-}
-
-fn argb(c: u32) -> [f32; 4] {
-    tint([(c >> 16) as u8, (c >> 8) as u8, c as u8, (c >> 24) as u8])
 }
 
 impl LayoutScreen {

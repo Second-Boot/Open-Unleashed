@@ -62,6 +62,13 @@ pub struct Peer {
     pub record: [u8; RECORD_SIZE],
     /// the host's send queue of this peer's record (0x48A3D0 / 0x48A4E0, [`crate::outbox::PeerQueue`])
     pub queue: crate::outbox::PeerQueue,
+    /// `+0xBA`, "in" (0x48A570 starts it 0): set by the host's arrival handler once it has answered the
+    /// peer's identity message — 0x491991 / 0x491A9E / 0x491C25 inside `case 7` of 0x491010, each right after
+    /// the `0xB8` / `0xC6` it sends (the room's `admit`: the `0xB0`s, then `0xC6 (0xE)`), and 0x490913 /
+    /// 0x490927 in the 0x4907C0 pass for a record whose version is decided. Never cleared (no instruction
+    /// writes 0 to it: a scan of nfs5.exe's `c6 8x ba 00 00 00 imm` finds those five stores only). The pump
+    /// 0x48A4E0 sends nothing for a record that is not in. [`Net::peer_in`].
+    pub in_room: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,16 +373,26 @@ impl Net {
         }
     }
 
+    /// The host's arrival handler is through with the peer in `slot`: `+0xBA = 1` (0x491AB4 / 0x491C25, after the
+    /// `0xC6` the handler sent — see [`Peer::in_room`]). The caller runs it right after dispatching the room's
+    /// `admit` output (the `0xB0`s and `0xC6 (0xE)`), which were registered while the record was not in: the
+    /// first of them went at once, the rest wait for the pump.
+    pub fn peer_in(&mut self, slot: u32) {
+        if let Some(Some(p)) = self.peers.get_mut(slot as usize) {
+            p.in_room = true;
+        }
+    }
+
     /// **0x48A4E0** for every peer record, once per turn of the room's 32 Hz loop (0x48B4F0 at 0x48B54D walks
     /// the records the registrations listed; one that is idle and empty does nothing, so walking all of them is
-    /// the same). `+0xBA` ("in") is a slot of the table here — APPROXIMATION: the original sets it in the
-    /// arrival handlers (0x490913 / 0x490927) and the `0xB3` / `0xC6` ones (0x491991 / 0x491A9E / 0x491C25).
+    /// the same). `+0xBA` ("in") is [`Peer::in_room`]: false until the arrival handler has answered
+    /// ([`Net::peer_in`]), and a record that is not in sends nothing.
     pub fn pump_peers(&mut self) {
         for i in 0..self.peers.len() {
             let Some(p) = self.peers[i].as_mut() else { continue };
-            let to = p.sock;
+            let (to, in_room) = (p.sock, p.in_room);
             let mut q = std::mem::take(&mut p.queue);
-            q.pump(true, &mut |b| self.peer_send(to, b));
+            q.pump(in_room, &mut |b| self.peer_send(to, b));
             if let Some(p) = self.peers[i].as_mut() {
                 p.queue = q;
             }
@@ -704,6 +721,7 @@ impl Net {
             countdown: comm::PING_TICKS,
             record,
             queue: crate::outbox::PeerQueue::new(),
+            in_room: false,
         });
         self.mask |= 1 << slot;
         JoinReply { status: JoinStatus::Joined(slot), ..echo }

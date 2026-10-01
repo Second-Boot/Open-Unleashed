@@ -748,7 +748,7 @@ fn wet_gain(vol_cur: f32, send: f32) -> f32 {
 /// rounded onto the grid, instead of the pan byte.)
 fn pan_gains(p: u8) -> [f32; 2] {
     // the table's step and the angle it stands for
-    let x = (((p as i32 - 0x40) & 0xFF) << 8) as i32;
+    let x = ((p as i32 - 0x40) & 0xFF) << 8;
     let (s0, s1) = (0x4000, 0xC000);
     // (distance to channel 0, distance to channel 1) along the arc between them (0x58E137…0x58E24C)
     let (d0, d1) = if x <= s0 {

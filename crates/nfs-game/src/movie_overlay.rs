@@ -7,19 +7,7 @@
 //! with the whole program, so no two runs agree; this one has a generator of its own with a fixed
 //! seed, which makes a still reproducible.
 
-/// The C runtime's `rand`, 0x5A17C9: `s = s·0x343FD + 0x269EC3`, `(s >> 16) & 0x7FFF`.
-#[derive(Debug, Clone)]
-pub struct CRand(u32);
-
-impl CRand {
-    pub fn new(seed: u32) -> Self {
-        Self(seed)
-    }
-    pub fn next(&mut self) -> i32 {
-        self.0 = self.0.wrapping_mul(0x343FD).wrapping_add(0x269EC3);
-        ((self.0 >> 16) & 0x7FFF) as i32
-    }
-}
+pub use crate::rng::CRand;
 
 /// The overlay's box: `{left, top, right, bottom}` (0x4CDC9A…0x4CDCE8).
 #[derive(Debug, Clone, Copy, PartialEq)]

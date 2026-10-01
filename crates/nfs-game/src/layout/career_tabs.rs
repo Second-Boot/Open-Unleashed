@@ -3,7 +3,7 @@
 //! after the background screen `[fe+0xE4]` and before the bottom layer's screen
 //! (`RE/notes/career.md` §12). What it draws with is loaded by the bar's slot 21, **0x4D7FD0**.
 
-use super::{tint, LayoutScreen, TRANS_FULL};
+use super::{argb, LayoutScreen, TRANS_FULL};
 use crate::text::BitmapFont;
 use nfs_assets::{texture::decode_pack, GamePaths};
 use nfs_formats::locale::Strings;
@@ -53,10 +53,6 @@ pub fn fade(c: u32, level: u32) -> u32 {
 /// its own transition progress and the front screen's (0x4D6300).
 pub fn level(progress: i32) -> u32 {
     (255 - progress * 255 / TRANS_FULL).clamp(0, 255) as u32
-}
-
-fn argb(c: u32) -> [f32; 4] {
-    tint([(c >> 16) as u8, (c >> 8) as u8, c as u8, (c >> 24) as u8])
 }
 
 impl LayoutScreen {

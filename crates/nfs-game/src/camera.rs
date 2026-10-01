@@ -506,37 +506,7 @@ pub mod anim_cam {
     /// four passes of `D = MᵀM − I`, `S = I − D/8 + 3D²/32 − 5D³/64`, `M ← M·S` — the same
     /// routine `nfs_physics::vehicle::Vehicle::renormalise` ports for the car, on a plain matrix.
     pub fn renormalise(m: Mat3) -> Mat3 {
-        type M3 = [[f32; 3]; 3];
-        fn mul(a: &M3, b: &M3) -> M3 {
-            let mut d = [[0.0; 3]; 3];
-            for i in 0..3 {
-                for j in 0..3 {
-                    d[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
-                }
-            }
-            d
-        }
-        const I: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        const C: [f32; 3] = [-0.125, 0.093_75, -0.078_125];
-        let mut a: M3 = [m.row(0).to_array(), m.row(1).to_array(), m.row(2).to_array()];
-        for _ in 0..4 {
-            let t: M3 = std::array::from_fn(|i| std::array::from_fn(|j| a[j][i]));
-            let mut d = mul(&t, &a);
-            for (i, row) in d.iter_mut().enumerate() {
-                row[i] -= 1.0;
-            }
-            let (mut r, mut s) = (I, I);
-            for c in C {
-                r = mul(&r, &d);
-                for i in 0..3 {
-                    for j in 0..3 {
-                        s[i][j] += r[i][j] * c;
-                    }
-                }
-            }
-            a = mul(&a, &s);
-        }
-        Mat3::from_cols(Vec3::from(a[0]), Vec3::from(a[1]), Vec3::from(a[2])).transpose()
+        nfs_physics::vehicle::renormalise_matrix(m)
     }
 
     /// **0x462F30's pose** from a sample `(A, t)` and the car's matrix `C` (`car+0x364`, row-major

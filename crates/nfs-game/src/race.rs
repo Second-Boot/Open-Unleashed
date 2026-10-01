@@ -1164,7 +1164,7 @@ pub struct RacerResult {
 /// *(Until 2026-09-30 the port folded a negative or indefinite result into 0, "no time".)*
 fn fistp_time(v: f32) -> i32 {
     let r = v.round_ties_even();
-    if r.is_finite() && r >= -2_147_483_648.0 && r < 2_147_483_648.0 { r as i32 } else { i32::MIN }
+    if r.is_finite() && (-2_147_483_648.0..2_147_483_648.0).contains(&r) { r as i32 } else { i32::MIN }
 }
 
 /// The projected total of a car still racing, the "ratio" arm (the human's 0x416B96…0x416C03, the

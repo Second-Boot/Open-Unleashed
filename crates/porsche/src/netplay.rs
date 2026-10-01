@@ -121,7 +121,24 @@ fn os_escape_down() -> bool {
     unsafe { key_state(0, 0x35) }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows: `GetAsyncKeyState(VK_ESCAPE)`, the high bit = key currently down (user32, always linked
+/// by winit).
+#[cfg(windows)]
+fn os_escape_down() -> bool {
+    unsafe extern "system" {
+        fn GetAsyncKeyState(v_key: i32) -> i16;
+    }
+    if crate::NO_FOCUS.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    // VK_ESCAPE = 0x1B
+    unsafe { GetAsyncKeyState(0x1B) < 0 }
+}
+
+/// Linux and the rest: no global key state is readable without the window system (X11 / Wayland
+/// give no portable poll); the Esc that reaches the window is handled by the event loop, and the
+/// `NFS_NET_ESC_MS` test glue works everywhere. So `false`.
+#[cfg(not(any(target_os = "macos", windows)))]
 fn os_escape_down() -> bool {
     false
 }
@@ -1296,6 +1313,8 @@ impl NetPlay {
                     let name = name.split(|&c| c == 0).next().unwrap_or_default().to_vec();
                     let out = self.room.admit(slot as i32 + 1, &name);
                     self.dispatch(out);
+                    // 0x491AB4 / 0x491C25: the handler's last store, `+0xBA = 1`, after the `0xC6`
+                    self.net.peer_in(slot);
                     // 0x48BB66: the newcomer's bit in the exchange room's `+0xCC0` and `+0xCC2`
                     self.server.join(slot as usize + 1);
                     // A newcomer hears **no** earlier record: 0x48BB50 / 0x4924D0 send the `0xB0`s and the

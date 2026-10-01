@@ -524,7 +524,7 @@ impl Ambience {
         let e = self.list_ref(list)[i].clone();
         // 0x4AEAE1…0x4AEB28: `d > Range + 100` (`test ah, 0x41`), a PatchID out of the index or
         // negative, or an empty bank
-        if d > e.range + 100.0 || e.patch < 0 || !self.index.get(&(e.patch as u16)).is_some_and(|&(_, l)| l != 0) {
+        if d > e.range + 100.0 || e.patch < 0 || self.index.get(&(e.patch as u16)).is_none_or(|&(_, l)| l == 0) {
             self.release(out, list, i);
             return;
         }

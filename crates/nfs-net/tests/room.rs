@@ -56,6 +56,7 @@ impl Host {
                     let name = name.split(|&c| c == 0).next().unwrap().to_vec();
                     let out = self.room.admit(slot as i32 + 1, &name);
                     self.send(out);
+                    self.net.peer_in(slot);
                 }
                 Event::Data { slot: Some(s), bytes, .. } if bytes.first() == Some(&kind::CHAT) => {
                     let r = ChatRequest::parse(&bytes).unwrap();

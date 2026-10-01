@@ -286,7 +286,7 @@ impl SkidMarks {
     /// `WLineBundle`): `visit(cx, cz, r, registered nodes)` answers the value the walk hands the
     /// drawer's queue, or `None` for a cell the walk drops (`crate::world::CellWalk::visit`); the
     /// cells the walk keeps come in table order with their strips.
-    pub fn cells_walked<'a>(&'a self, visit: impl Fn(f32, f32, f32, f32, &[crate::world::RegisteredNode]) -> Option<u32>) -> Vec<(u32, Vec<&'a Strip>)> {
+    pub fn cells_walked(&self, visit: impl Fn(f32, f32, f32, f32, &[crate::world::RegisteredNode]) -> Option<u32>) -> Vec<(u32, Vec<&Strip>)> {
         let mut ids: Vec<u32> = self.rings.keys().copied().collect();
         ids.sort_unstable();
         ids.into_iter()

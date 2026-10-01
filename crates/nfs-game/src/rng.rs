@@ -45,6 +45,38 @@ pub fn below(n: u32) -> u32 {
     (rand16() * n) >> 16
 }
 
+/// The C runtime's `rand`, 0x5A17C9: `s = s·0x343FD + 0x269EC3`, `(s >> 16) & 0x7FFF`. One step of
+/// the state word — shared by [`CRand`] and the front end's thread-local `holdrand`
+/// (`layout::glints::crt_rand`).
+pub const fn crt_step(s: u32) -> u32 {
+    s.wrapping_mul(0x343FD).wrapping_add(0x269EC3)
+}
+
+/// The draw the C runtime's `rand` takes from a stepped state word (`(s >> 16) & 0x7FFF`).
+pub const fn crt_out(s: u32) -> i32 {
+    ((s >> 16) & 0x7FFF) as i32
+}
+
+/// The C runtime's `rand`, 0x5A17C9, as a generator of its own. The default seed of a C program is 1.
+#[derive(Debug, Clone)]
+pub struct CRand(u32);
+
+impl Default for CRand {
+    fn default() -> Self {
+        Self(1)
+    }
+}
+
+impl CRand {
+    pub fn new(seed: u32) -> Self {
+        Self(seed)
+    }
+    pub fn next(&mut self) -> i32 {
+        self.0 = crt_step(self.0);
+        crt_out(self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,6 +9,7 @@ pub mod ais;
 pub mod animdefs;
 pub mod bigf;
 pub mod bnk;
+pub mod ci_file;
 pub mod career;
 pub mod cop;
 pub mod crdl;
@@ -48,6 +49,11 @@ pub(crate) fn u32_le(data: &[u8], off: usize, what: &'static str) -> Result<u32,
     data.get(off..off + 4)
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .ok_or(FormatError::Truncated { offset: off, needed: 4, what })
+}
+
+/// A little-endian `u32` at `o` of a record the caller has already length-checked (panics past the end).
+pub(crate) fn dword(r: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([r[o], r[o + 1], r[o + 2], r[o + 3]])
 }
 
 pub(crate) fn u16_le(data: &[u8], off: usize, what: &'static str) -> Result<u16, FormatError> {

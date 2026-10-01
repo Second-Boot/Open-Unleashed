@@ -876,8 +876,7 @@ impl Career {
         if std::env::var_os("NFS5_SAVE_DIR").is_some() {
             return crate::save::save_dir().join("career.json");
         }
-        let base = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-        base.join("Library").join("Application Support").join("PorscheUnleashed").join("career.json")
+        nfs_assets::platform::data_dir().join("career.json")
     }
 
     pub fn load(path: &Path) -> Result<Self, CareerError> {

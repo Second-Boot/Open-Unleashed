@@ -286,7 +286,7 @@ impl EngineSound {
     /// per-car parameters. `sounds_dir` is `GameData/Sounds`.
     pub fn load(out: &AudioOutput, sounds_dir: &Path, set: &str, sim: &str) -> anyhow::Result<Self> {
         let _ = out;
-        let viv_path = sounds_dir.join(format!("{set}.viv"));
+        let viv_path = nfs_formats::ci_file::find_file(sounds_dir, &format!("{set}.viv")).unwrap_or_else(|| sounds_dir.join(format!("{set}.viv")));
         let data = std::fs::read(&viv_path).map_err(|e| anyhow::anyhow!("{}: {e}", viv_path.display()))?;
         let viv = Bigf::parse(&data)?;
         let bank_bytes = viv.get(&data, &format!("{set}.bnk")).ok_or_else(|| anyhow::anyhow!("{set}.bnk missing in {}", viv_path.display()))?;
@@ -334,7 +334,7 @@ impl EngineSound {
             })
             .collect();
 
-        let spl = std::fs::read(sounds_dir.join(format!("{sim}.spl"))).ok().and_then(|d| Spl::parse(&d).ok()).unwrap_or_default();
+        let spl = nfs_formats::ci_file::find_file(sounds_dir, &format!("{sim}.spl")).and_then(|p| std::fs::read(p).ok()).and_then(|d| Spl::parse(&d).ok()).unwrap_or_default();
         // `game.spl[6]` = the engine trim of the global settings block (16 shipped)
         let game_trim = nfs_formats::spl::GameSpl::load(sounds_dir).engine();
         let start_clips = [decode(6), decode(7), decode(8)];

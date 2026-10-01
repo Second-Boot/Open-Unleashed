@@ -4,6 +4,8 @@
 //! sphere passes the frustum and whose near edge is within `near` metres — because every node it
 //! was registered into is wholly outside the ground wedge or the far circle? Those are the holes
 //! the original's registration would leave beside the road.
+#![allow(clippy::approx_constant)] // the original's constant is 0.7071
+
 use glam::Vec3;
 use nfs_assets::{track::TrackAssets, GamePaths};
 use nfs_game::world::{build_article_nodes, cull_articles, node_wholly_pruned, tree_population, CullView};
@@ -37,7 +39,7 @@ fn old_build(min: (f32, f32), max: (f32, f32), level: u32, items: &[(f32, f32)])
     }
     OldNode { children }
 }
-fn old_locate<'a>(n: &'a OldNode, min: (f32, f32), max: (f32, f32), level: u32, fmin: (f32, f32), fmax: (f32, f32)) -> (&'a OldNode, (f32, f32), (f32, f32), u32) {
+fn old_locate(n: &OldNode, min: (f32, f32), max: (f32, f32), level: u32, fmin: (f32, f32), fmax: (f32, f32)) -> (&OldNode, (f32, f32), (f32, f32), u32) {
     let (cx, cz) = ((min.0 + max.0) * 0.5, (min.1 + max.1) * 0.5);
     let q = (((fmin.0 + fmax.0) * 0.5) >= cx) as usize + 2 * ((((fmin.1 + fmax.1) * 0.5) >= cz) as usize);
     if let Some(ch) = &n.children[q] {

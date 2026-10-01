@@ -156,7 +156,7 @@ fn scn_all_track_files_parse() {
     let txt = std::fs::read_to_string(r.join("GameData/Track/alps_fstart.scn")).unwrap();
     let s = Scene::parse(&txt).unwrap();
     let t = s.of_kind(&ElementKind::Trigger).next().unwrap();
-    assert_eq!(t.position, [-143.124573, 0.340156, 235.736008]);
+    assert_eq!(t.position, [-143.124_57, 0.340156, 235.736_01]);
 }
 
 #[test]
@@ -413,7 +413,7 @@ fn animdefs_parses_the_shipped_file() {
     assert_eq!(doc.ticks_per_vert_frame, Some(3));
 
     let rates: Vec<f32> = defs.iter().flat_map(|d| d.pieces.iter().map(|(_, p)| p.playback_rate)).collect();
-    assert!(rates.iter().any(|r| *r == 3.0) && rates.iter().any(|r| *r == 5.0) && rates.iter().any(|r| *r == 8.0));
+    assert!(rates.contains(&3.0) && rates.contains(&5.0) && rates.contains(&8.0));
     assert!(rates.iter().all(|r| *r > 0.0), "every piece has a usable rate");
 
     // every piece names the article whose track it plays

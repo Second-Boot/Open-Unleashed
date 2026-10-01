@@ -1754,7 +1754,8 @@ fn the_part_relative_sizes() {
     };
     assert_eq!(read("BottomBarButton.ctr").value("size"), Some("(label.size.width+picture.size.width+data.space),data.height"));
     assert_eq!(read("Graphic Tab Button.ctr").value("size"), Some("hoverbg.size.width,hoverbg.size.height"));
-    // and the label's, which is why `box_of` must *not* measure: twice its own text
+    // and the label's: twice its own text — an autosizing class, whose box is the union of its parts
+    // (0x5253C0), so only a `control.size.*` term ever reads this expression
     assert_eq!(read("Label.ctr").value("size"), Some("label.size.width*2,label.size.height"));
 
     let p = GamePaths::find_file(&paths.fe_data().join("Art"), "tabs.fsh").expect("tabs.fsh");

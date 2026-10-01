@@ -702,7 +702,7 @@ impl Renderer {
     /// (its roof) rewrite theirs when the animation moves.
     pub fn update_mesh_vertices(&mut self, id: MeshId, vertices: &[crate::Vertex]) {
         if let Some(m) = self.meshes.get(id.0 as usize)
-            && (vertices.len() * std::mem::size_of::<crate::Vertex>()) as u64 == m.vertex_buf.size()
+            && std::mem::size_of_val(vertices) as u64 == m.vertex_buf.size()
         {
             self.queue.write_buffer(&m.vertex_buf, 0, bytemuck::cast_slice(vertices));
         }
@@ -1041,7 +1041,7 @@ impl Renderer {
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("readback"), size: (bytes_per_row * height) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
         let mut enc = self.device.create_command_encoder(&Default::default());
         enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture: &target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo { texture: target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bytes_per_row), rows_per_image: Some(height) } },
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );

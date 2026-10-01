@@ -6,6 +6,7 @@
 pub mod car;
 pub mod mesh;
 pub mod paths;
+pub mod platform;
 pub mod texture;
 pub mod track;
 

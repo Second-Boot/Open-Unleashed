@@ -284,6 +284,29 @@ mod tests {
     }
 
     #[test]
+    fn a_record_that_is_not_in_sends_nothing_from_the_pump() {
+        // 0x48A4E0 needs `+0xBA`: the first message of a burst goes at once (0x48A3D0 does not look at it),
+        // the rest wait for the record to be in
+        let mut q = PeerQueue::new();
+        let mut wire = Vec::new();
+        for i in 0..3u8 {
+            q.register(&[i], &mut |b| {
+                wire.push(b[0]);
+                true
+            });
+        }
+        q.pump(false, &mut |_| unreachable!("not in"));
+        q.pump(false, &mut |_| unreachable!("not in"));
+        assert_eq!(wire, vec![0]);
+        assert_eq!(q.len(), 2);
+        q.pump(true, &mut |b| {
+            wire.push(b[0]);
+            true
+        });
+        assert_eq!(wire, vec![0, 1]);
+    }
+
+    #[test]
     fn a_hosts_peer_queue_sends_one_message_per_tick_and_retries_a_refusal() {
         let mut q = PeerQueue::new();
         let mut wire = Vec::new();

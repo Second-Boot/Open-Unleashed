@@ -24,9 +24,7 @@ pub struct FlareDef {
     pub off: i32,
 }
 
-fn dword(r: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes([r[o], r[o + 1], r[o + 2], r[o + 3]])
-}
+use crate::dword;
 
 /// Every whole record of the file, in file order.
 pub fn parse(data: &[u8]) -> Vec<FlareDef> {

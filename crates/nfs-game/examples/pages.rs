@@ -9,9 +9,9 @@ fn main() {
     let c = CarAssets::load(&paths, &name).unwrap();
     let mats = c.crp.materials(&c.crp_data).unwrap();
     // model space: +X is the car's left (`car-model.md` §3 — the model frame mirrors the world in X and Z)
-    let mut sum = vec![(0.0f64, 0usize); 8];
+    let mut sum = [(0.0f64, 0usize); 8];
     // count only vertices clearly off the centreline, where the side is unambiguous
-    let mut sides = vec![(0usize, 0usize); 8];
+    let mut sides = [(0usize, 0usize); 8];
     for art in c.crp.articles(&c.crp_data).unwrap() {
         let Ok(g) = c.crp.article_geometry(&c.crp_data, &art) else { continue };
         for p in g.primitives.iter().filter(|p| p.lod == 1) {

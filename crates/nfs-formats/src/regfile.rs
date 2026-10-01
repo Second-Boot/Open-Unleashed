@@ -64,7 +64,7 @@ impl RegFile {
             .flat_map(|(_, v)| v.iter())
             .filter(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, v)| v)
-            .last()
+            .next_back()
     }
 }
 

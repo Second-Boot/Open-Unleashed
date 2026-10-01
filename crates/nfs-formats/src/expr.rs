@@ -30,11 +30,11 @@
 //! keep its own fallback. The original has no such state (it always measures the real string);
 //! for every name the port does answer, the result is the original's. Measured over all 98 shipped
 //! `.lay` files (`--layout-sweep`, 59 461 evaluations): no part expression of the sweep fails
-//! (`expr_failures` = 0), and the 54 evaluations that end unknown are all `box_template` with
-//! `measure = false` (51: `BottomBarButton.ctr`'s `size.value`
-//! `(label.size.width+picture.size.width+data.space),data.height`, a text/shape part's extent that
-//! pass does not take) and `draw_gouraud_box` (3) — the box pass that must not measure the parts
-//! whose extent depends on the box (the port's own recursion guard, not a rule of the original).
+//! (`expr_failures` = 0). Until 2026-09-30 54 evaluations ended unknown — `box_template`
+//! with `measure = false` (`BottomBarButton.ctr`'s `size.value`, `Graphic Tab Button.ctr`'s and
+//! `Label.ctr`'s, the box pass that did not take a text/shape part's extent); that pass now
+//! measures like the original (`layout.rs` `reference`), so the only remaining unknowns are a
+//! name the port has no answer for and the depth guard of a cycle no shipped template has.
 
 /// What a name in an expression stands for — the answer of the macro dictionary `[0x69CAF8]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,7 +212,7 @@ fn ctype(c: i32) -> i32 {
 /// `_ftol` 0x5A0F98: `fistp` of a 64-bit integer under a truncating control word, returning the
 /// low 32 bits — so a NaN (the "integer indefinite") gives 0.
 fn ftol(x: f64) -> i32 {
-    if x.is_nan() || x.abs() >= 9.223_372_036_854_775_807e18 { 0 } else { x.trunc() as i64 as i32 }
+    if x.is_nan() || x.abs() >= 9.223_372_036_854_776e18 { 0 } else { x.trunc() as i64 as i32 }
 }
 
 #[derive(Debug, Clone, Copy)]

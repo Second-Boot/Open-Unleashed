@@ -288,7 +288,7 @@ impl Emitter {
                     self.park(i);
                 }
             }
-            while self.count > 0 && self.count - 1 >= target && !self.alive[self.count - 1] {
+            while self.count > 0 && self.count > target && !self.alive[self.count - 1] {
                 self.count -= 1;
             }
         }

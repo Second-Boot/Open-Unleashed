@@ -331,7 +331,7 @@ impl CarSpecs {
                             }
                         }
                     }
-                    2 => self.brake_decel = (c0 + 3.0) * 0.25 * self.brake_decel,
+                    2 => self.brake_decel *= (c0 + 3.0) * 0.25,
                     3 => {
                         if p.kind_name == "Gear Box" {
                             self.shift_ticks = p.gearbox_param as u32;
@@ -376,7 +376,7 @@ impl CarSpecs {
             }
         }
         let peak_after = self.torque.iter().copied().fold(0.0, f32::max);
-        self.top_speed = (peak_after / peak_before + 3.0) * 0.25 * self.top_speed;
+        self.top_speed *= (peak_after / peak_before + 3.0) * 0.25;
         self.rebuild_tables(true);
         self.grip / grip_before
     }
@@ -436,14 +436,14 @@ impl CarSpecs {
         // 0x49D3F3 — shock rate, read three times
         let shock = fixed16(setup[6]);
         self.transfer_div = (shock + 2.0) * self.transfer_div * (1.0 / 3.0);
-        self.grip = (self.transfer_div + 9.0) * 0.1 * self.grip;
+        self.grip *= (self.transfer_div + 9.0) * 0.1;
         self.pitch_ret += (1.0 - shock) * 0.2;
         self.roll_ret += (1.0 - shock) * 0.2;
         self.roll_gain /= (self.transfer_div + 1.0) * 0.5;
         // 0x49D4CB — suspension travel, also read three times
         let travel = fixed16(setup[4]) * 0.001;
         self.bump_travel += travel;
-        self.grip = (travel + 1.0) * self.grip;
+        self.grip *= travel + 1.0;
         self.roll_gain /= travel + 1.0;
         // 0x49D555 — ride height, an overwrite
         self.probe_offset = fixed16(setup[3]) * 0.001;

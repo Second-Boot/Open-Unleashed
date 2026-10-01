@@ -6,14 +6,10 @@
 //! whole and the alpha of what it pushed is then scaled by `fade / 255`, the same thing to within
 //! a rounding of the original's per-colour blend.
 
-use super::{tint, LayoutScreen, DIALOG_BUTTON_FONT, DIALOG_TEXT_FONT};
+use super::{argb, tint, LayoutScreen, DIALOG_BUTTON_FONT, DIALOG_TEXT_FONT};
 use crate::dialog::Dialog;
 use nfs_formats::locale::Strings;
 use nfs_renderer::Sprite;
-
-fn argb(c: u32) -> [f32; 4] {
-    tint([(c >> 16) as u8, (c >> 8) as u8, c as u8, (c >> 24) as u8])
-}
 
 impl LayoutScreen {
     /// The height of a dialog's text block — 0x523250's `[+4]`, which the wrap 0x523600 builds as

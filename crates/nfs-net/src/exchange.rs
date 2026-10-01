@@ -903,14 +903,14 @@ mod tests {
         assert_eq!(c.sender.stamp[1], 100);
         // the frame carries bit 2 in our block: it matches, the latency is now − stamp
         let f = frame_of(&[(1, [4, 0, 0])]);
-        c.receive(&f, 1, |k| Some(k), 180);
+        c.receive(&f, 1, Some, 180);
         assert_eq!(c.sender.latency[1], 80);
         assert!(c.sender.armed);
         // a later frame changes nothing: the bit we sent (always 1) no longer equals the toggled one
         c.sender.sample([0; 4], 1, 300);
         c.sender.sample([0; 4], 1, 300);
         assert!(!c.sender.bits[1]);
-        c.receive(&f, 1, |k| Some(k), 400);
+        c.receive(&f, 1, Some, 400);
         assert_eq!(c.sender.latency[1], 80);
     }
 
