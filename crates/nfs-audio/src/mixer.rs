@@ -2042,7 +2042,7 @@ impl AudioOutput {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or_else(|| anyhow::anyhow!("no audio output device"))?;
         let supported = device.default_output_config()?;
-        let rate = supported.sample_rate().0;
+        let rate = supported.sample_rate();
         let channels = supported.channels() as usize;
         // a smaller device buffer lowers the output latency and changes nothing in the mix: the
         // driver passes ([`Pump`]) and the bridge's queue run on the stream's own clock, whatever
@@ -2074,14 +2074,15 @@ impl AudioOutput {
 
     /// The output stream whose callback is `core`'s: what the game thread queued since the last
     /// run, then the mix — nothing here takes a lock or allocates.
-    fn open(device: &cpal::Device, config: &cpal::StreamConfig, channels: usize, mut core: Core) -> Result<cpal::Stream, cpal::BuildStreamError> {
-        let out_rate = config.sample_rate.0 as f64;
+    fn open(device: &cpal::Device, config: &cpal::StreamConfig, channels: usize, mut core: Core) -> Result<cpal::Stream, cpal::Error> {
+        let out_rate = config.sample_rate as f64;
         device.build_output_stream(
-            config,
+            config.clone(),
             move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
                 core.drain();
                 let ts = info.timestamp();
-                let delay = ts.playback.duration_since(&ts.callback).unwrap_or_default();
+                // saturating to zero when the playback instant is not after the callback's (cpal 0.18)
+                let delay = ts.playback.duration_since(ts.callback);
                 let frames = (out.len() / channels.max(1)) as u64 + (delay.as_secs_f64() * out_rate).round() as u64;
                 core.lat.frames.store(frames, Ordering::Relaxed);
                 core.lat.at.store(core.lat.epoch.elapsed().as_nanos() as u64 + 1, Ordering::Release);

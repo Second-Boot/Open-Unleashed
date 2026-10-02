@@ -53,6 +53,36 @@ impl App {
         }
     }
 
+    /// One step of `zMergedList.Car` over the garage half and then the catalogue half (see the
+    /// call in `set_accessor`). With an empty garage this is the catalogue step it always was.
+    fn step_merged_car(&mut self, delta: i32) {
+        self.net.lobby_setsel = true;
+        let owned = self.owned_list();
+        let car_sel = self.career.as_ref().map_or(0, |c| c.car_sel);
+        let Some(m) = self.fe.menu.as_mut() else { return };
+        let garage_now = m.car_garage;
+        let a = owned.len();
+        m.merged_at_zero = false;
+        let cur = if garage_now && a > 0 { owned.iter().position(|i| *i == car_sel).unwrap_or(0) } else { a + m.car_idx };
+        let n = (a + m.cars.len()).max(1);
+        let new = (cur as i32 + delta).rem_euclid(n as i32) as usize;
+        if new < a {
+            m.car_garage = true;
+            if let Some(c) = self.career.as_mut() {
+                c.car_sel = owned[new];
+            }
+        } else {
+            m.car_garage = false;
+            let before = m.car_idx;
+            m.car_idx = new - a;
+            // the changed catalogue row shows its own row 0 (see the `GenericCar.Car` arm below)
+            if m.car_idx != before || garage_now {
+                m.paint_idx = 0;
+                m.paint_custom = None;
+            }
+        }
+    }
+
     pub(crate) fn set_accessor(&mut self, name: &str, delta: i32) {
         let base = name.split_once('(').map(|(b, _)| b.trim()).unwrap_or(name);
         // the seven colour lists step through the colour accessor's own slots (§4.171.5)
@@ -230,6 +260,13 @@ impl App {
             self.apply_resolution();
             return;
         }
+        // `zMergedList.Car`'s step over both lists (0x4BC690 wraps over `A.count + B.count`, the
+        // setter 0x4F49F0 routes the new index to list A's `slot11` — the garage car, `car_sel` —
+        // or B's — the catalogue row)
+        if base == "zMergedList.Car" {
+            self.step_merged_car(delta);
+            return;
+        }
         // computed off `self.paths` (disjoint from `self.fe`, borrowed mutably below) for the
         // `zMergedList.Car`/`OwnedCars.Car`/`DealerCar.Car`/`GenericCar.Car`/`CARSETTINGS.CAR` arm
         let default_colour = default_paint_colour(&nfs_formats::fedata::parse_car_catalog(&std::fs::read(self.paths.fe_data().join("Data").join("nfs5.car")).unwrap_or_default()).unwrap_or_default());
@@ -280,8 +317,7 @@ impl App {
             // picked colour; observed on the original's QuickRace (SC 2026-10-01: 356 → 356 B
             // grey = row 0, red picked, → 356 A Convertible blue = row 0, not red and not the
             // fixed cream dword). A same-row call changes nothing.
-            "zMergedList.Car" | "GenericCar.Car" => {
-                self.net.lobby_setsel |= base == "zMergedList.Car";
+            "GenericCar.Car" => {
                 let before = m.car_idx;
                 m.car_idx = step(m.car_idx, m.cars.len());
                 if m.car_idx != before {
@@ -401,12 +437,15 @@ impl App {
                     l.transition_in();
                 }
                 // the screen's music (0x4D1BD0 at 0x4D23DA)
-                self.fe_apply_music();
+                let list_swapped = self.fe_apply_music();
                 // and the bottom bar's buttons (0x4D81C0 at 0x4D25DC)
                 self.bind_bottom_bar();
-                // the new screen's constructor ran as 0x4D5DF0 made it (0x4E0F90); the one it
-                // replaces is destroyed after — at the tick that swaps them (0x4D2570)
-                let deferred = self.fe_screen_built();
+                // the callback-list object's constructor runs when the object is made — i.e. when
+                // the **bottom** layer's screen names another list (0x4D1BD0 sends the old one out,
+                // 0x4D2570 0x4D27E7…0x4D280B makes the new one); a screen with the same list, or
+                // an overlay over a screen, makes none
+                let deferred = if list_swapped { self.fe_screen_built() } else { None };
+                // the screen it replaces is destroyed — at the tick that swaps them (0x4D2570)
                 if let Some(old) = replaced {
                     self.fe_screen_gone(&old);
                 }
@@ -439,7 +478,8 @@ impl App {
     /// gets the disabled bit 0x10 when its template has the state (0x4C7E10); 0x4D6320 reads the
     /// byte, so `bind_bottom_bar` carries both.
     pub(crate) fn fe_screen_built(&mut self) -> Option<(&'static str, i32)> {
-        let list = self.fe.layout_preview.as_ref().map(Self::fe_list_of)?;
+        // the list object `[fe+0xE0]` is the bottom layer's
+        let list = self.fe_base_layout().map(Self::fe_list_of)?;
         match list.as_str() {
             "ID_VICTORYSCREEN" => {
                 self.fe.game_type = 10;
@@ -481,18 +521,35 @@ impl App {
     /// A screen destroyed — replaced, or its layer closed (0x4D2570). The two victory lists'
     /// destructors, **0x506C30** and **0x51A690**, lift the lock (**0x4D5BC0**: 0x4D8240 clears
     /// the BACK button's bit 0x10, `[fe+0x17C]` = 0) — whichever screen set it.
+    ///
+    /// This is the **screen's** half. The callback-list object's destructors (the join screen's
+    /// 0x50A260, the victory lists' 0x506C30 / 0x51A690) run when the object is deleted — the
+    /// bottom layer's screen named another list ([`Self::fe_list_gone`]) — not when
+    /// a screen goes.
     pub(crate) fn fe_screen_gone(&mut self, l: &nfs_game::layout::LayoutScreen) {
-        if Self::fe_list_of(l) == "ID_COMMSJOINSCREEN" {
-            self.net_join_screen_gone();
-        }
         // the options screen holds the Display screen's HUD widget: its `NOTINUSE` stores the
         // Display options (slot 22 0x4CB820, N02)
         if Self::fe_list_of(l) == "ID_OPTIONSSCREEN" {
             self.hud_cfg_apply();
         }
-        if matches!(Self::fe_list_of(l).as_str(), "ID_VICTORYSCREEN" | "ID_FDVICTORYSCREEN") {
-            self.fe_back_lock(false);
+    }
+
+    /// The callback-list object `[fe+0xE0]` deleted (0x4D2570 0x4D2763…0x4D2794, after 0x4D1BD0
+    /// sent it out because the bottom layer's screen names another list): the destructors of the
+    /// join screen's list (**0x50A260**, [`Self::net_join_screen_gone`]) and of the two victory
+    /// lists (**0x506C30** / **0x51A690**: the back lock is lifted).
+    pub(crate) fn fe_list_gone(&mut self, list: &str) {
+        match list {
+            "ID_COMMSJOINSCREEN" => self.net_join_screen_gone(),
+            "ID_VICTORYSCREEN" | "ID_FDVICTORYSCREEN" => self.fe_back_lock(false),
+            _ => {}
         }
+    }
+
+    /// The callback list `[fe+0xE0]` now in force: the **bottom layer's** screen's
+    /// `data.callbacklist` (0x4D1BD0 / 0x4D2570, [`Self::fe_base_layout`]), `ID_NONE` for none.
+    pub(crate) fn fe_list_now(&self) -> String {
+        self.fe_base_layout().map(callback_list_of).unwrap_or_else(|| "ID_NONE".into())
     }
 
     /// **0x4D5BA0** (`true`) / **0x4D5BC0** (`false`): the back lock `[fe+0x17C]` and the bottom

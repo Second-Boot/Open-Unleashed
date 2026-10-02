@@ -25,8 +25,10 @@ impl App {
             // view axis, under the definition's blend (`+0x28` → Thrash 0x38, above) and
             // depth bias: `round(zbias · cam[+0xC] / d²)` (0x45445C…0x454491), `d²` the
             // system's `+0x10` — its article's square distance to the camera, here the
-            // emitter's — as Thrash state 0x18, `b / 32768` of the linear screen z over
-            // near…far (`thrash.md` §6, the view's own): a positive bias moves the sprite away along the view.
+            // emitter's — as Thrash state 0x18, `b · 2^-15` on the game's screen z `far/(far −
+            // near) · (1 − near / Z)` (0x540CE0, `thrash.md` §6d.3, the view's own planes), carried
+            // as `DrawItem::depth_bias`: with `cam[+0xC]` that z's slope, `zbias / 32768` metres of
+            // view depth at the emitter — a positive bias moves the sprite away.
             // The `d²` is the system's `+0x10`, the value its article was last drawn with.
             // Then the cars' sets (0x43F6E0 at 0x468B6F, after 0x455260): the same draw, `d²`
             // the car's from its last drive
@@ -59,13 +61,7 @@ impl App {
                 // 0x45446B…0x454480: `fild`, `fmul`, `fdiv` on the x87 stack, `fstp` to a
                 // float, `fistp` — round to nearest even
                 let bias = ((sp.zbias as f64 * (far * z_near / (far - z_near)) as f64 / d2 as f64) as f32).round_ties_even();
-                let shift = bias * (far - z_near) / 32768.0;
-                let depth = (sp.position - self.camera.position).dot(fwd);
-                // along the eye's ray and scaled with it, so only the depth changes, not the
-                // sprite's place or size on screen
-                let f = if depth > 0.0 && depth + shift > 0.0 { (depth + shift) / depth } else { 1.0 };
-                let pos = self.camera.position + (sp.position - self.camera.position) * f;
-                let size = sp.size * f;
+                let (pos, size) = (sp.position, sp.size);
                 let m = Mat4::from_cols((r * size).extend(0.0), (u * size).extend(0.0), right.cross(up).extend(0.0), pos.extend(1.0));
                 let a = sp.argb;
                 let tint = [((a >> 16) & 0xFF) as f32 / 255.0, ((a >> 8) & 0xFF) as f32 / 255.0, (a & 0xFF) as f32 / 255.0];
@@ -75,6 +71,7 @@ impl App {
                     layer_light: Some(unlit(tint)),
                     alpha_test: true,
                     alpha_ref: 1,
+                    depth_bias: bias as i32,
                     ..nfs_renderer::DrawItem::new(mesh, material, m)
                 });
             }
@@ -281,8 +278,8 @@ impl App {
     /// 0x460306) and is drawn when it lands on the screen, `0 ≤ x < width`, `0 ≤ y < height`, with
     /// its screen z under 1 — in front of the far plane 700, not behind the eye (0x46030B…0x460367).
     /// Then **0x451710**, the flare record drawn flat on the screen: nothing while its blink is off
-    /// (`FlareDef::lit`, no part phase); per layer with a texture a quad of `±size · 0.1 · width /
-    /// 640` by `±size · 0.1 · height / 480` pixels about the point, turned — flag 4 — by `(x + y) /
+    /// (`FlareDef::lit`, no part phase); per layer with a texture a quad of `±size · 0.1 · W /
+    /// virtW` by `±size · 0.1 · H / virtH` pixels (nfs5.dll's virtual screen, 640 × 480 up to 4:3) about the point, turned — flag 4 — by `(x + y) /
     /// 1440` of a turn of its screen position (0x45175C…0x451768, 0x45187E…0x4518DE: `x' = x cos +
     /// y sin`, `y' = y cos − x sin`, screen y down), UVs (0, 0) (1, 0) (1, 1) (0, 1) from the top
     /// left (`[0x61BC78]`, 0x4514F5…), the layer's ARGB on all four corners (alpha × 1.0, 0x460398),
@@ -338,28 +335,40 @@ impl App {
     }
 
     /// 0x460290's projection of the sun point `+0x11C` (0x539700 at 0x460306) and its on-screen test
-    /// (0x460310…0x460367, the byte `+0x18D` the lens flare reads): the point in the view's
+    /// (0x460310…0x460367, the byte `+0x18D` the sun's own draw reads): the point in the view's
     /// 640 × 480 frame, `None` when it is behind the eye or the far plane or off the **window**.
     pub(crate) fn sun_point(&self, cam: &Camera, aspect: f32, view: [f32; 4]) -> Option<SunPoint> {
+        let pt = self.sun_point_any(cam, aspect, view)?;
+        // screen z under 1: in front of the eye and of the far plane 700
+        if pt.depth <= 0.0 || pt.depth >= nfs_renderer::VIEW_FAR {
+            return None;
+        }
+        if !(0.0..640.0).contains(&pt.px) || !(0.0..480.0).contains(&pt.py) {
+            return None;
+        }
+        Some(pt)
+    }
+
+    /// The same projection **without** the on-screen test: what 0x539700 leaves in `+0x12C` / `+0x130`
+    /// (0x460306) whether or not the point is in the window — the lens flare 0x460460 reads it with
+    /// `nfs5.dll` having removed its `+0x18D` gate (0x46049A, `RE/notes/nfs5-dll.md` §2.4). Behind the
+    /// eye the divide by the negative depth flips the point, as the original's `rhw` does; `None`
+    /// only when there is no sun or the depth is exactly 0 (the original's divide gives infinity).
+    pub(crate) fn sun_point_any(&self, cam: &Camera, aspect: f32, view: [f32; 4]) -> Option<SunPoint> {
         let bin = self.track.sky_bin.as_ref().filter(|b| b.sun_active())?;
         self.sun_def()?;
         let [vx, vy, vw, vh] = view;
         let (fwd, right, up) = self.flare_basis(cam);
         let rel = Vec3::from(bin.sun_position());
         let depth = rel.dot(fwd);
-        // screen z under 1: in front of the eye and of the far plane 700
-        if depth <= 0.0 || depth >= nfs_renderer::VIEW_FAR {
+        if depth == 0.0 {
             return None;
         }
         let tan_y = (cam.fov_y_radians * 0.5).tan();
         let tan_x = tan_y * aspect;
         // the point in the view's 0…1 square, y down, then in the window's 640 × 480 frame
         let (sx, sy) = ((rel.dot(right) / (depth * tan_x) + 1.0) * 0.5, (1.0 - rel.dot(up) / (depth * tan_y)) * 0.5);
-        let (px, py) = (vx + sx * vw, vy + sy * vh);
-        if !(0.0..640.0).contains(&px) || !(0.0..480.0).contains(&py) {
-            return None;
-        }
-        Some(SunPoint { px, py, rel, depth })
+        Some(SunPoint { px: vx + sx * vw, py: vy + sy * vh, rel, depth })
     }
 
     /// 0x451710 for one `flare.dat` record drawn flat on the screen at `(px, py)` (the view's
@@ -405,6 +414,7 @@ impl App {
             let s = r.size();
             (s.0 as f32, s.1 as f32)
         });
+        let (virt_w, virt_h) = nfs_game::world::virtual_screen(w, h);
         let turns = if def.flags & 4 != 0 { ((px / 640.0 * w + py / 480.0 * h) as f64 * 0.000_694_444_444_444_444_5) as f32 } else { 0.0 };
         let a = (turns as f64 * 6.28318452835083) as f32;
         let (sn, cs) = a.sin_cos();
@@ -413,10 +423,12 @@ impl App {
         for k in 0..2 {
             let Some(name) = def.textures[k].as_ref() else { continue };
             let Some(&(mesh, material)) = sprites.get(name) else { continue };
-            // `size · 0.1 · width / 640` pixels each side is `size · 0.1 / (vw / 2)` of the view's
-            // half-width (1/320 in the main view), `tan_x` of a metre at one metre ahead
+            // `size · 0.1 · W / virtW` by `size · 0.1 · H / virtH` pixels each side (0x451710's
+            // `fdiv virtW` / `fdiv virtH` at 0x451824 / 0x451834, nfs5.dll): in the 640 × 480
+            // frame `size · 0.1 · 640 / virtW` (1 at 4:3), of the view's half-width `vw / 2`
+            // (1/320 in the main view), `tan_x` of a metre at one metre ahead
             let size = def.sizes[k] * 0.1;
-            let (half_x, half_y) = (size / (vw * 0.5) * tan_x * ahead, size / (vh * 0.5) * tan_y * ahead);
+            let (half_x, half_y) = (size * (640.0 / virt_w) / (vw * 0.5) * tan_x * ahead, size * (480.0 / virt_h) / (vh * 0.5) * tan_y * ahead);
             let argb = def.colours[k];
             let m = Mat4::from_cols((r * (2.0 * half_x)).extend(0.0), (u * (2.0 * half_y)).extend(0.0), fwd.extend(0.0), centre.extend(1.0));
             let tint = [((argb >> 16) & 0xFF) as f32 / 255.0, ((argb >> 8) & 0xFF) as f32 / 255.0, (argb & 0xFF) as f32 / 255.0];
@@ -472,23 +484,19 @@ impl App {
             let (s, c) = angle.sin_cos();
             let (r, u) = (right * c + up * s, up * c - right * s);
             // the depth bias (0x451AD2…0x451B21): `round(−250000 · cam[+0xC] / d²)`, `d²` the
-            // eye-to-flare square distance, unclamped, as Thrash state 0x18 — `b / 32768` of the
-            // linear near…700 screen z (`thrash.md` §6, near the view's own). The quad moves that much view depth
-            // toward the eye along its ray, scaled with it so it stays put on screen.
-            // APPROXIMATION at the near end: where the pull would pass the near plane the original's
-            // screen z goes below 0, which the driver's clipping (not read) decides; here the quad
-            // stops at the near plane.
+            // eye-to-flare square distance, unclamped, as Thrash state 0x18 — `b · 2^-15` on the
+            // game's screen z `far/(far − near) · (1 − near / Z)` (0x540CE0, `thrash.md` §6d.3, the
+            // view's own planes), carried as `DrawItem::depth_bias`: some 7.6 m of view depth toward
+            // the eye (`cam[+0xC] / d²` is that z's slope). Where it passes the near plane the shader
+            // holds the screen z at 0 (its APPROXIMATION: the device's handling of `sz < 0` is not read).
             let z_near = self.camera.near;
             let far = self.view_far;
             let bias = (-250000.0 * (far * z_near / (far - z_near)) / d2.max(1e-6)).round();
-            let depth = (f.position - cam).dot(fwd);
-            let target = (depth + bias * (far - z_near) / 32768.0).max(z_near);
-            let scale = if depth > z_near { target / depth } else { 1.0 };
-            let pos = cam + (f.position - cam) * scale;
+            let pos = f.position;
             for k in 0..2 {
                 let Some(name) = def.textures[k].as_ref() else { continue };
                 let Some(&(mesh, material)) = self.flare_sprites.get(name) else { continue };
-                let size = def.sizes[k] * 0.1 * scale;
+                let size = def.sizes[k] * 0.1;
                 let argb = def.colours[k];
                 let m = Mat4::from_cols((r * size).extend(0.0), (u * size).extend(0.0), right.cross(up).extend(0.0), pos.extend(1.0));
                 let tint = [((argb >> 16) & 0xFF) as f32 / 255.0, ((argb >> 8) & 0xFF) as f32 / 255.0, (argb & 0xFF) as f32 / 255.0];
@@ -496,6 +504,7 @@ impl App {
                     light: tint,
                     alpha: (argb >> 24) as f32 / 255.0,
                     layer_light: Some(unlit(tint)),
+                    depth_bias: bias as i32,
                     ..nfs_renderer::DrawItem::new(mesh, material, m)
                 });
             }

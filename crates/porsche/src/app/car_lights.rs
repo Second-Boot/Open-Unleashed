@@ -90,8 +90,9 @@ impl App {
     /// primitive helper's (0x59F070: the state object 0x5379F0's gouraud, blending on, cull 0,
     /// bias 0) with the blend pair **1**, additive (0x43CF5B), and the **depth bias**
     /// `fistp(b · [0x5B36EC] −20000 · cam[+0xC] / |centre − eye|²)` (0x43D419…0x43D45C → 0x537A60,
-    /// Thrash 0x18): a pull toward the eye of `b · 20000 · K / d²` units of `1/32768` of the
-    /// linear screen z — metres within 10 m, past the near plane within 8 (`thrash.md` §6). The
+    /// Thrash 0x18): `b · 20000 · K / d²` units of `2^-15` toward the eye on the game's screen z
+    /// `far/(far − near) · (1 − near / Z)` (0x540CE0, `thrash.md` §6d.3), whose slope is `K / Z²` —
+    /// so about `b · 0.61` m of view depth at the lamp, whatever its distance. The
     /// alpha test is the pass's `GREATER 10` on texel × `b`. Then the third draw, the
     /// lamp's reflection on the road 0x451D60 (0x43D486…0x43D4BE; `lamp_reflection`).
     ///
@@ -326,13 +327,15 @@ impl App {
     /// is looked up afresh at its position rather than read from its tracker.
     ///
     /// **The depth bias** (0x43B865…0x43B8BD): `fistp(−20000 · cam[+0xC] / d²)`, `d²` the car's
-    /// square distance from the eye (all three axes), to Thrash state 0x18 — `b / 32768` of the
-    /// linear near…700 screen z (`thrash.md` §6), `cam[+0xC]` = `far · near / (far − near)` of the
-    /// view's planes. Carried as the skid marks are: each vertex moves that much view depth
-    /// toward the eye along its own ray, so it stays put on screen. *(Until 2026-09-26 the port
-    /// lifted the quad 0.04 m instead and compared the ground at the vertex with the car's
-    /// plane.)*
-    pub(crate) fn shadow_quad(&self, pos: Vec3, rot: Quat, half: Vec3, out: &mut Vec<nfs_renderer::Vertex>) -> Option<usize> {
+    /// square distance from the eye (all three axes), to Thrash state 0x18 — `b · 2^-15` on the
+    /// game's screen z `far/(far − near) · (1 − near / Z)` (0x540CE0, `thrash.md` §6d.3),
+    /// `cam[+0xC]` = `far · near / (far − near)` of the view's planes, that z's slope: some
+    /// `20000 / 32768` ≈ 0.61 m of view depth toward the eye at the car. Returned with `n` and
+    /// carried as `DrawItem::depth_bias` (`push_shadow`), as the skid marks' is. *(Until
+    /// 2026-09-26 the port lifted the quad 0.04 m instead and compared the ground at the vertex
+    /// with the car's plane; until 2026-10-02 (BIAS2) each vertex was pulled `b · (far − near) /
+    /// 32768` of view depth, the linear reading of the screen z.)*
+    pub(crate) fn shadow_quad(&self, pos: Vec3, rot: Quat, half: Vec3, out: &mut Vec<nfs_renderer::Vertex>) -> Option<(usize, i32)> {
         let w = self.world.as_ref()?;
         let body = [
             Vec3::new(-half.x, 0.0, -half.z),
@@ -375,15 +378,12 @@ impl App {
         // the car's own plane: its patch's reference point and normal, else its position under
         // `(0, 1, 0)` (0x43B5E1…0x43B6C5)
         let (car_p0, car_n) = patch_at(pos).unwrap_or((pos, Vec3::Y));
-        // the depth bias, a pull toward the eye along each vertex's ray
+        // the depth bias
         let z_near = self.camera.near;
         let far = self.view_far;
-        let cam = self.camera.position;
-        let fwd = (self.camera.target - cam).normalize_or_zero();
         // 0x43B89E…0x43B8B0: `cam[+0xC] · −20000 / d²` on the x87 stack (f64 stands for the extended
         // precision), `fstp` to a float, `fistp` — round to nearest even
         let bias = ((-20000.0 * (far * z_near / (far - z_near)) as f64 / d2.max(1e-6) as f64) as f32).round_ties_even();
-        let pull = -bias * (far - z_near) / 32768.0;
         let n_f = n as f32;
         out.clear();
         // steps (entry 1 − entry 0) / n and (entry 3 − entry 0) / n (0x43B619…0x43B665); with n == 1
@@ -398,18 +398,10 @@ impl App {
                     _ => plane_y(p.x, p.z, car_p0, car_n),
                 };
                 let q = Vec3::new(p.x, y, p.z);
-                let depth = (q - cam).dot(fwd);
-                // APPROXIMATION at the near end, as the flares': where the pull would pass the near
-                // plane the original's screen z goes below 0 (the vertex keeps its screen place,
-                // dx7z adds the bias to `sz` only), which the driver's clipping decides; here the
-                // vertex stops just inside the near plane. *(Until 2026-09-30 a vertex whose depth
-                // was just over the pull landed on the eye itself — w ≈ 0 — and the chase view drew
-                // a dark triangle across the screen, a new one every frame.)*
-                let q = if depth > z_near { cam + (q - cam) * ((depth - pull).max(z_near * 1.001) / depth) } else { q };
                 out.push(nfs_renderer::Vertex { position: q.into(), normal: [0.0, 1.0, 0.0], uv: [j as f32 / n_f, i as f32 / n_f], color: [1.0; 4] });
             }
         }
-        Some(n)
+        Some((n, bias as i32))
     }
 
     /// Lays one car's shadow patch (`shadow_quad`) into the scene: each patch takes a dynamic mesh
@@ -423,7 +415,7 @@ impl App {
         pools: &mut [Vec<nfs_renderer::MeshId>; 7],
         used: &mut [usize; 7],
         material: nfs_renderer::MaterialId,
-        (n, verts): (usize, &[nfs_renderer::Vertex]),
+        ((n, depth_bias), verts): ((usize, i32), &[nfs_renderer::Vertex]),
     ) {
         let Some(r) = renderer else { return };
         let pool = &mut pools[n];
@@ -454,6 +446,7 @@ impl App {
             layer_light: Some(nfs_game::world::TRACK_LIGHT),
             alpha: 0.9,
             early: true,
+            depth_bias,
             ..nfs_renderer::DrawItem::new(mesh, material, Mat4::IDENTITY)
         });
     }

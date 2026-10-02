@@ -671,7 +671,7 @@ impl Ambience {
     /// kind-5 arm: the level `([0x5D1750] AmbientLevel · [0x5D14BC] game.spl[3] · 0x7F · 85) >> 21`
     /// (0x4A9969…0x4A9A30, the ambience's own [`Self::voice_volume`]), the pan byte of the angle
     /// ([`crate::mixer::pan_byte`], 0x4A9B4B…0x4A9B84), no bend, the patch as the bank has it.
-    /// APPROXIMATION: the original plays only if the streamed patch has loaded during the
+    /// (Was an APPROXIMATION, settled below:) the original plays only if the streamed patch has loaded during the
     /// countdown (0x4A8570 answers −1 until then, and 0x4A9BC7 then plays nothing); the port's
     /// banks are in memory, so it always plays. **Observed on the original (2026-10-01 SV, Wine, industrial
     /// with `skyrendering = 2`, gdb at 0x4A8340 / 0x4A98E0 / 0x4A9BC7, two separate races):** a strike's
@@ -679,8 +679,10 @@ impl Ambience {
     /// thunder patch (995 / 998) and the bank −2, and then 0x4A9BC7 — the streamed patch had NOT loaded, so
     /// both first thunders were **silent**. The game runs at well under one frame a second under the
     /// breakpoints, so the disk / streaming race is far slower than on a real machine: whether a real
-    /// first thunder is silent depends on streaming speed. The port's "always plays" stays an
-    /// APPROXIMATION of a timing-dependent rule.
+    /// first thunder is silent depends on streaming speed. **MEASURED at real speed 2026-10-02 (SRV-B,
+    /// `RE/notes/REFERENCE-2026-10-02-SRVB.md` §6): non-stopping logging breakpoints, industrial, 3 races, 5 strikes — 0x4A8570 answered
+    /// handles 0x18…0x1A (never 0xFF) and every first thunder was started.** The port's "always plays" is
+    /// the original's behaviour at real speed; SV's silence was the debugger's slowdown.
     pub fn thunder_update(&mut self, out: &AudioOutput) {
         match self.thunder.step() {
             ThunderStep::Idle => {}

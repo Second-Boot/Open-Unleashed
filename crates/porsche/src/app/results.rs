@@ -97,8 +97,10 @@ impl App {
         let pass = self.mission_result.map_or(pass, |r| r.0);
         let text = self.mission_result.and_then(|r| r.1);
         let driver = self.player_name.clone();
+        // the record's `+0xC98` ten zones, which 0x4EE12A…0x4EE14E sum for `+0xEC`
+        let zones = self.result_damage().unwrap_or([0.0; 10]);
         if let Some(c) = self.career.as_mut() {
-            c.finish_mission(ms.index, pass, t, cones, text, &driver);
+            c.finish_mission(ms.index, pass, t, cones, &zones, text, &driver);
             tracing::info!(
                 mission = ms.mission.code,
                 pass,

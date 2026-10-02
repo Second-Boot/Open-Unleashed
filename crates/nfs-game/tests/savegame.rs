@@ -42,6 +42,8 @@ fn career_round_trips_through_the_original_format() {
     c.missions = t.missions.iter().enumerate().map(|(i, _)| if i == 3 { 1 } else { 0 }).collect();
     // record 3's promotion taken: `fac+0xC = −1` (0x51AF80)
     c.prize_taken = t.missions.iter().enumerate().map(|(i, _)| i == 3).collect();
+    // record 3's last attempt: time, average damage, smackables (0x51AF2B…0x51AF3E)
+    c.set_mission_stats(&t, 3, Career::mission_stats_of(70_000, &[12.9, 7.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 30.0], 5));
 
     let p = Profile::new("Hans", 3);
     let sav = career_to_sav(&c, &t, &p);
@@ -107,6 +109,10 @@ fn career_round_trips_through_the_original_format() {
     assert_eq!(back.garage[0].offer, owned.offer);
     assert_eq!(back.missions, c.missions);
     assert_eq!(back.prize_taken, c.prize_taken, "the taken promotion rides in the Missions image");
+    // 70 000 & 0xFFFF; 49 / 10 (partial sums 12, 19, 49) with each partial sum truncated (0x4EE137…0x4EE14C); 5
+    assert_eq!(c.mission_stats[3], [4464, 4, 5]);
+    assert_eq!(back.mission_stats[3], c.mission_stats[3], "+0xEA / +0xEC / +0xEE ride in the Missions image");
+    assert_eq!(back.mission_stats[0], [0; 3]);
     let fac = parsed.missions.as_ref().unwrap();
     let rec = nfs_formats::career::MISSION_RECORD_SIZE;
     assert_eq!(&fac[3 * rec + 0xC..3 * rec + 0x10], &[0xFF; 4]);

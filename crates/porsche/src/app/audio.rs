@@ -151,11 +151,8 @@ impl App {
             return;
         }
         self.fe.cd_current = id as i32;
-        let cd_screen = self
-            .fe.layout_preview
-            .as_ref()
-            .and_then(|l| l.layout.elements.first().and_then(|e| e.get("callbacklist")).map(|c| c.eq_ignore_ascii_case("ID_OPTIONSSCREEN")))
-            .unwrap_or(false);
+        // `[[0x65B928]+0xE0]`, the bottom layer's list
+        let cd_screen = self.fe_list_now() == "ID_OPTIONSSCREEN";
         if cd_screen {
             self.fe_music(|m, a| {
                 m.stop(a);
@@ -193,8 +190,20 @@ impl App {
     /// The other half of 0x4D1BD0 (the screen / callback-list / room objects `[+0xE4]`, `[+0xE0]`,
     /// `[+0xE8]` swapped when the new screen names others, 0x4D1BED…0x4D1CF4) is the port's
     /// `open_layout` itself.
-    pub(crate) fn fe_apply_music(&mut self) {
-        let Some(l) = self.fe.layout_preview.as_ref() else { return };
+    ///
+    /// **Both halves read the bottom layer's screen**: 0x4D1BDA…0x4D1BEB takes
+    /// `[[[fe+0xD8]]]`'s pending-else-current screen once and asks it for the background (slot
+    /// 0x84), the callback list (0x88), the room (0x8C) and the music pattern (0x94, 0x4D1CFC). A
+    /// layer pushed over a screen never changes them — `settings` / `repair` / `selectname` /
+    /// `missionbrief` over their parent leave the parent's song and list in place; only a screen
+    /// that replaces the bottom one (offset 0) or comes back from another list does.
+    ///
+    /// Returns whether the callback-list object was **replaced** (a new class made, the old one
+    /// destroyed: its destructor ran — [`Self::fe_list_gone`] — and the new one's constructor is
+    /// due, [`Self::fe_screen_built`]), which the callers use to run the constructor once.
+    pub(crate) fn fe_apply_music(&mut self) -> bool {
+        let mut swapped = false;
+        let Some(l) = self.fe_base_layout() else { return false };
         // 0x4D1BD0's first half — before its music half — swaps `[fe+0xE0]` for the class the new
         // layout's `callbacklist=` names, when it differs (the name compare 0x4D1C1D…0x4D1C3E, the
         // object's slot 0x7C): the new object's constructor runs. `ID_OPTIONSSCREEN`'s, 0x511600,
@@ -203,22 +212,26 @@ impl App {
         // leaves its `+0x290` stamp unwritten (see `main_music_stamp`).
         let list = callback_list_of(l);
         if list != self.fe.list_current {
+            swapped = true;
+            // the old object's destructor (0x4D2570 0x4D2763…0x4D2794, `delete` slot 0)
+            let old = std::mem::take(&mut self.fe.list_current);
+            self.fe_list_gone(&old);
             match list.as_str() {
                 "ID_OPTIONSSCREEN" => {
                     self.fe_music(|m, a| m.stop_fade(a, 1500));
                     // 0x51175D: `0x4BEAC0(-1)` — `CDPlayer.Current` `[0x5D7938]` back to −1
                     self.fe.cd_current = -1;
                 }
-                // APPROXIMATION (2026-10-01): the original's `+0x290` is the new
-                // object's uninitialised heap content (no writer, 0x50FED0 → 0x59EF90); the port
-                // starts it at the entry's clock, so the minute counts from entering the main screen
-                // (a 0 here re-rolled — and played the 140 s movie — at once on every return)
+                // the constructor stamps `[+0x290]` with `TIMER_getTicks()` (0x510175, found by a
+                // hardware watch on the running original, REFERENCE-2026-10-02-SRVB.md §2 — the earlier
+                // byte scan missed it and took the word for heap leftovers); every front-end event then
+                // re-stamps it (0x510EA0, `window_event`)
                 "ID_MAINSCREEN" => self.fe.main_music_stamp = self.fe_timer_ticks(),
                 _ => {}
             }
             self.fe.list_current = list;
         }
-        let Some(l) = self.fe.layout_preview.as_ref() else { return };
+        let Some(l) = self.fe_base_layout() else { return swapped };
         let pattern = l.music_pattern().unwrap_or("menu*").to_string();
         if pattern != self.fe.music_current {
             let play = pattern != "NONE";
@@ -236,6 +249,7 @@ impl App {
         if pattern == "NONE" {
             self.fe_music(|m, a| m.stop_fade(a, 150));
         }
+        swapped
     }
 
     /// **`FEMainScreen`'s tick 0x510210** (vtable 0x5B9D64 slot 1, the class `ID_MAINSCREEN` builds),
@@ -247,12 +261,13 @@ impl App {
     /// four buttons is down (`start_idle_movie`, `intro_run::IntroRun::new_idle`) — then
     /// `MusicPlay("Menu*", 0)` (0x510246…0x510251), and the stamp is set to now (0x510254…0x510259,
     /// read after the movie). So a main-screen stay longer than a minute plays the movie and swaps
-    /// the song. `[+0x290]` is written by no constructor and the object is `new`ed (0x50FED0, 680
-    /// bytes, 0x59EF90 → the heap 0x531CA0, which does not clear the block): its first value is
-    /// whatever the block held — **APPROXIMATION**, 0 here, so the first tick after the process clock
-    /// (`TIMER_getTicks`, `TIMER_init` 0x565030 from main 0x4B6A9B) passes 60 s fires.
+    /// the song. `[+0x290]` is stamped with `TIMER_getTicks()` by the constructor (0x510175) and again
+    /// by every front-end event (0x510EA0, the list's slot 3 from the dispatch 0x4D2868): the movie
+    /// comes after a minute **without input** on the main screen (measured on the original,
+    /// REFERENCE-2026-10-02-SRVB.md §2; until 2026-10-02 the port counted from the entry).
     pub(crate) fn fe_main_screen_music_tick(&mut self) {
-        if self.vehicle.is_some() || !self.fe.layout_preview.as_ref().is_some_and(|l| callback_list_of(l) == "ID_MAINSCREEN") {
+        // a tick of the callback list object `[fe+0xE0]`, the bottom layer's
+        if self.vehicle.is_some() || self.fe_list_now() != "ID_MAINSCREEN" {
             return;
         }
         if self.idle_movie_due || self.idle_movie_running {

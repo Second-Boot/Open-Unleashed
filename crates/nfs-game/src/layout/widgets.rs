@@ -1448,6 +1448,17 @@ impl LayoutScreen {
         let (dw, dh) = if stretch && w > 0.0 && h > 0.0 { (w, h) } else { (aw, ah) };
         let (pos, size) = self.place(aspect, x, y, dw, dh);
         out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None });
+        // `NFS5.HUD`'s pieces, 0x4CBC27…0x4CC312: each one `0x4D9E70(piece, ox + fx·240, oy + fy·180,
+        // piece.w · 640/W, piece.h · 480/H)` on the schematic's origin, in the order the draw tests
+        // the options (the application hands them over in that order)
+        if e.class == "NFS5.HUD" {
+            let (pieces, kx, ky) = &self.hud_preview;
+            for &(entry, fx, fy) in pieces {
+                let Some(&(t, pw, ph)) = self.shapes.get(&("hud.fsh".to_string(), entry)) else { continue };
+                let (pos, size) = self.place(aspect, x + fx, y + fy, pw * kx, ph * ky);
+                out.push(Sprite { texture: t, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, talpha], rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None });
+            }
+        }
         let Some((name, rank, colour)) = self.badges.get(&i) else { return };
         // the shadow: entry 0 at x+244 and entry 1 at y+131 (0x4CF499, 0x4CF4C4). The
         // original also gates it on the machine (0x4E35D0: at least 0x2100000 bytes of
@@ -2160,7 +2171,30 @@ impl LayoutScreen {
             Some(c) => tint(c),
             None => [1.0, 1.0, 1.0, 1.0],
         };
-        self.text(out, aspect, f, &v, x, y, w, e.int("align").unwrap_or(0), ink);
+        // **The text is the template's own `untext` / `hitext` part, placed by the template**
+        // (COVERAGE 14.93: the running original centres `Comms.IP`'s text in the box).
+        // 0x4CC950 draws nothing of the text itself — its first call 0x4C8260 draws the state's
+        // parts, and `[state.normal]` lists `untext`, `[state.focused]` `hitext` (both TEXT parts
+        // with the string `%hitext.text%`, the accessor's value, in univers8b.ffn). Their `pos` is
+        // `(data.width - <part>.size.width)/2,2` in `InputBox.ctr` and `CharVectInputBox.ctr`
+        // (centred, two pixels down) and `4,2` in `ChatInputBox.ctr` (left, two down); the part's
+        // own `size.width` is the width of the string it shows. None of the eight shipped boxes
+        // carries an `align` (this arm used to read one, default 0 = left at the box's top edge).
+        let text_name = if state == "focused" { "hitext" } else { "untext" };
+        let tw = f.place(&v).1;
+        let (tx, ty) = self
+            .controls
+            .get(&e.class)
+            .and_then(|c| c.part(text_name))
+            .and_then(|p| p.value("pos"))
+            .and_then(|expr| {
+                nfs_formats::ctr::eval_pair(expr, &|n: &str| match n {
+                    "hitext.size.width" | "untext.size.width" => nfs_formats::ctr::Macro::Text((tw as i32).to_string()),
+                    _ => self.reference(e, n, 0),
+                })
+            })
+            .map_or((0.0, 0.0), |(a, b)| (a as f32, b as f32));
+        self.text(out, aspect, f, &v, x + tx, y + ty, 0.0, 0, ink);
         // The caret, 0x4CC9D7: while the box has focus (0x4C7DD0) and
         // `TIMER_getTicks() & 0x3F < 0x20` — half of a 64-tick period at the front
         // end's 128 Hz, so 1 Hz on, 1 Hz off — the draw calls the part the bind
@@ -2192,7 +2226,6 @@ impl LayoutScreen {
         // shape, the colour, the size and the `y` — is read out of the part.
         if state == "focused" && (self.clock_ms * 128 / 1000) & 0x3F < 0x20 {
             let Some(p) = self.controls.get(&e.class).and_then(|c| c.part("cursor")).cloned() else { return };
-            let tw = f.place(&v).1;
             // `hitext.size.width` is the width of the string just drawn, not the
             // template's `"Text Here"` placeholder, so it is answered here; every
             // other name goes to the normal resolver.
@@ -2202,13 +2235,9 @@ impl LayoutScreen {
                     _ => self.reference(e, n, 0),
                 })
             };
-            let align = e.int("align").unwrap_or(0);
-            let left = match align {
-                1 => x + w * 0.5 - tw * 0.5,
-                2 => x + w - tw,
-                _ => x,
-            }
-            .round();
+            // the caret sits one pixel past the end of the string drawn above (`left` is the
+            // text's own x, `text` rounds it the same way)
+            let left = (x + tx).round();
             let cx = left + tw + 1.0;
             let cy = y + p.value("pos").and_then(&at).map(|(_, b)| b as f32).unwrap_or(3.0);
             match p.kind() {
@@ -2732,7 +2761,7 @@ impl LayoutScreen {
         // the highlighted button uses its own `hovercolor`, as the original does
         let color = if selected == Some(i) {
             // a widget with no `hovercolor` of its own is highlighted anyway, so the
-            // player can see where the selection is — APPROXIMATION
+            // player can see where the selection is — PORT-DEVIATION D10 (PORT-DEVIATIONS.md) [0x5077D0]
             e.color("hovercolor").or_else(|| e.color("maincolor")).map(tint).unwrap_or([1.0, 0.85, 0.2, 1.0])
         } else {
             e.color("foreColor")

@@ -201,7 +201,27 @@ pub struct MusicPlayer {
     /// that position) — the update waits for the stream's fade to reach 0 (0x4ADC88…0x4ADC9E,
     /// 0x567850) before it stops it (0x567740) and, for a swap, opens the next song (0x4ADCCD…)
     pending: Option<Option<usize>>,
+    /// **`MusicUpdate`'s state 2** (`MusicGlobals+0x14 == 2`, 0x4AD9C0): the stream is open at
+    /// volume 0 (0x4ADDE4 `0x567810(+0x70, 0)` before the open) and the update waits until the
+    /// mixer reports it running (`+0x8C`, filled each call by 0x566A40 from the stream's flag
+    /// `+0x16`), then ramps to this byte level in **5 ms** (0x4ADC6F `0x566AE0(+0x70, 5, level)`)
+    /// and returns to state 0. `Some(level)` = in state 2 with that target.
+    starting: Option<u8>,
 }
+
+/// One `MusicUpdate` call in state 2 (0x4ADBB9…0x4ADC87): until the stream runs (`+0x8C == 0`,
+/// 0x4ADBBF, a return) nothing; once it does, the ramp `0x566AE0(handle, 5, level)` and state 0.
+/// Returns `(still starting, ramp target)`.
+pub(crate) fn state2_step(starting: Option<u8>, running: bool) -> (Option<u8>, Option<u8>) {
+    match starting {
+        Some(level) if running => (None, Some(level)),
+        other => (other, None),
+    }
+}
+
+/// The ramp's length in milliseconds, the literal 5 pushed at 0x4ADC5A / 0x4ADC6A (a ramp of
+/// `5 / 10`, at least one service tick: `0x565DFF…0x565E03`).
+pub(crate) const START_RAMP_MS: i32 = 5;
 
 impl MusicPlayer {
     /// `sounds_dir` is `GameData/Sounds`, for `game.spl`; a missing file leaves the compiled-in trim.
@@ -226,6 +246,7 @@ impl MusicPlayer {
             rng: 0x2545_F491,
             advanced: false,
             pending: None,
+            starting: None,
         })
     }
 
@@ -261,9 +282,15 @@ impl MusicPlayer {
     /// `game.spl[0] · MusicLevel >> 7` (0x4A82F0), or the raw level for a `win`/`lose`/`vic` jingle
     /// (§8.3). The trim is 52 in the shipped `game.spl`, so music sits well below the other categories.
     fn volume_for(&self, name: &str) -> f32 {
+        self.level_byte_for(name) as f32 / 127.0
+    }
+
+    /// The byte level state 2 ramps to (0x4ADC4F…0x4ADC6F): the live `MUSICLEVEL` `[0x5D1740]` for a
+    /// `lose*` / `win*` / `vic*` name (the three `strnicmp`s at 0x4ADC09 / 0x4ADC26 / 0x4ADC43), else
+    /// `MusicGlobals[0]` = `game.spl[0] · MusicLevel >> 7` (0x4A82F0).
+    fn level_byte_for(&self, name: &str) -> u32 {
         let n = name.to_lowercase();
-        let v = if n.starts_with("win") || n.starts_with("lose") || n.starts_with("vic") { self.level as u32 } else { (self.trim * self.level as u32) >> 7 };
-        v as f32 / 127.0
+        if n.starts_with("win") || n.starts_with("lose") || n.starts_with("vic") { self.level as u32 } else { (self.trim * self.level as u32) >> 7 }
     }
 
     /// `MusicPlay(NULL, 0)` — the race-start pick: any entry of the saved playlist other than the
@@ -373,6 +400,16 @@ impl MusicPlayer {
     /// End-of-stream advance (0x4ADD6D): sequential, or "any other entry" when shuffling. After
     /// an `I_MUSIC` press, the off or the swap it asked for once the fade has run out.
     pub fn update(&mut self, out: &AudioOutput) {
+        // state 2 (0x4ADBB9…): the open stream waits for the mixer, then ramps to its level
+        if self.starting.is_some() {
+            let running = self.current.as_ref().is_some_and(|m| m.src.queued_frames() > 0 && out.is_playing(m.voice));
+            let (left, ramp) = state2_step(self.starting, running);
+            self.starting = left;
+            if let (Some(level), Some(m)) = (ramp, &self.current) {
+                out.fade(m.voice, START_RAMP_MS, level as i32);
+            }
+            return;
+        }
         if let Some(next) = self.pending {
             // 0x4ADC88: with the stream playing (`+0x8C`) wait while 0x567850 answers a level
             if let Some(m) = &self.current
@@ -473,6 +510,7 @@ impl MusicPlayer {
             return;
         }
         self.pending = None;
+        self.starting = None;
         self.cur_set = false;
         self.end_stream(out);
     }
@@ -499,6 +537,7 @@ impl MusicPlayer {
         {
             out.fade(m.voice, ms as i32, 0);
         }
+        self.starting = None;
         self.pending = Some(None);
         self.cur_set = false;
     }
@@ -518,14 +557,18 @@ impl MusicPlayer {
         let Some(&idx) = self.playlist.get(self.pos) else { return };
         let Some(name) = self.names.get(idx).cloned() else { return };
         let vol = self.volume_for(&name);
+        let target = self.level_byte_for(&name) as u8;
         if let Some(m) = self.current.take() {
             out.stop(m.voice);
         }
-        match Music::play(out, &self.dir, idx, vol) {
+        self.starting = None;
+        // the stream opens silent (0x567810(+0x70, 0), 0x4ADDE4) and state 2 ramps it up
+        match Music::play(out, &self.dir, idx, 0.0) {
             Ok(m) => {
                 let (title, artist) = split_title(&m.title);
                 tracing::info!(title, artist, index = idx, volume = vol, "music");
                 self.current = Some(m);
+                self.starting = Some(target);
             }
             Err(e) => tracing::warn!(index = idx, error = %e, "music stream failed"),
         }
@@ -590,7 +633,24 @@ mod tests {
             rng: 1,
             advanced: false,
             pending: None,
+            starting: None,
         }
+    }
+
+    #[test]
+    fn state_2_waits_for_the_running_stream_then_ramps_in_five_ms() {
+        // 0x4ADBB9: `+0x8C == 0` returns; once the mixer reports the stream running the ramp
+        // 0x566AE0(handle, 5, level) runs once and the state is 0 again
+        assert_eq!(state2_step(Some(52), false), (Some(52), None));
+        assert_eq!(state2_step(Some(52), true), (None, Some(52)));
+        assert_eq!(state2_step(None, true), (None, None));
+        assert_eq!(START_RAMP_MS, 5);
+        // the level: a jingle's name takes the live MUSICLEVEL, a song `game.spl[0] * level >> 7`
+        let m = bare(vec![0], vec![0]);
+        assert_eq!(m.level_byte_for("win-fanfare"), 127);
+        assert_eq!(m.level_byte_for("lose1"), 127);
+        assert_eq!(m.level_byte_for("vic2"), 127);
+        assert_eq!(m.level_byte_for("game3-Song-Artist"), (52 * 127) >> 7);
     }
 
     #[test]
@@ -697,7 +757,7 @@ mod tests {
 
     #[test]
     fn jingles_are_louder_than_the_race_playlist() {
-        let p = MusicPlayer { dir: PathBuf::new(), names: Vec::new(), playlist: Vec::new(), saved: Vec::new(), cur_set: false, pos: 0, shuffle: false, front_end: false, level: 127, trim: 52, current: None, rng: 1, advanced: false, pending: None };
+        let p = MusicPlayer { dir: PathBuf::new(), names: Vec::new(), playlist: Vec::new(), saved: Vec::new(), cur_set: false, pos: 0, shuffle: false, front_end: false, level: 127, trim: 52, current: None, rng: 1, advanced: false, pending: None, starting: None };
         // the shipped game.spl[0] = 52: 52 · 127 >> 7 = 51 of 127 for a race track, the raw 127 for a jingle
         assert!((p.volume_for("game13-Activator-Morphadron") - 51.0 / 127.0).abs() < 1e-6);
         assert_eq!(p.volume_for("win04-Victory-Cypher"), 1.0);

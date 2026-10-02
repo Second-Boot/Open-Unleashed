@@ -9,6 +9,8 @@
 
 pub mod bindings;
 pub mod ff;
+#[cfg(target_os = "macos")]
+mod ff_macos;
 pub mod gamepad;
 
 use std::collections::HashSet;

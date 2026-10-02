@@ -26,6 +26,10 @@ pub mod kind {
     /// 0x48F3D2 — a player is in the room; the body is its name, which `0x48C840` copies into a
     /// new record (`crate::room`).
     pub const JOIN: u8 = 0xB0;
+    /// 0x48BC1B (host) / 0x48F799 (player) — "your id is" and the room's name, to a newcomer.
+    pub const YOUR_ID: u8 = 0xB2;
+    /// 0x48BAA0 / 0x48BD10 — the room's 0x50-byte description, sent to a newcomer (0x48F9D2 reads it).
+    pub const DESCRIPTION: u8 = 0xB4;
     /// 0x48F46F — a player has gone; the handler removes it from the list at `net+0x260`.
     pub const LEAVE: u8 = 0xB1;
     /// 0x48F38B — a chat line (`crate::room::ChatLine`). *(This was named `JOIN_ALT`, "the second

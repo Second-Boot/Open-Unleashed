@@ -10,10 +10,33 @@ impl App {
         self.fe.room_obj.map(|(r, _)| r)
     }
 
-    /// The room the previewed screen names in its `room=` (its slot 0x8C).
+    /// The room the **bottom layer's** screen names in its `room=` (its slot 0x8C).
+    ///
+    /// **Not the top screen's (read 2026-10-02).** Both places that compare or make the
+    /// room take the screen from the **first** element of the layer vector `[fe+0xD8]`, the
+    /// bottom layer — the tick 0x4D2570 at 0x4D26E7…0x4D26F8 (`[[[fe+0xD8]]]`: the layer record's
+    /// pending screen `[+4]`, else its screen `[+0]`) and 0x4D1BD0 (run on every open, 0x4D23DA) at
+    /// 0x4D1BDA…0x4D1BEB, which sends the room / background / callback list out (slot 0x7C) only
+    /// when *that* screen names another one — while the input dispatch 0x4D2850 and the
+    /// pop at 0x4D26A3 take the **last** element as the top. So a layer pushed over a screen
+    /// (`offset > 0`: `settings` over `garage` / `QuickRace`, `repair`, `selectname`, …) never
+    /// changes the room: the covered screen's room stays lit behind the overlay (the running
+    /// original shows the garage's walls, floor and car behind `settings`' oval, COVERAGE 14.93),
+    /// where the port used to swap in the top screen's `ID_NONE` (`FEEmpty3DRoom`, "just the car").
     pub(crate) fn fe_screen_room(&self) -> Option<&'static nfs_game::room::Room> {
-        let l = self.fe.layout_preview.as_ref()?;
+        let l = self.fe_base_layout()?;
         nfs_game::room::room(l.layout.screen().and_then(|s| s.get("room")).unwrap_or(""))
+    }
+
+    /// The **bottom layer's** screen — the first element of the layer vector `[fe+0xD8]`
+    /// (`[[[fe+0xD8]]]`, pending else current: 0x4D2570 0x4D26E7…0x4D26F8, 0x4D1BD0
+    /// 0x4D1BDA…0x4D1BEB) — which names the front end's background `[fe+0xE4]` (slot 0x84), callback
+    /// list `[fe+0xE0]` (slot 0x88), room `[fe+0xE8]` (slot 0x8C) and music (slot 0x94) objects.
+    /// The port keeps the covered layers in `layout_under` (bottom first)
+    /// and the top one in `layout_preview`, so with no layer under it the screen on show is the
+    /// bottom one.
+    pub(crate) fn fe_base_layout(&self) -> Option<&nfs_game::layout::LayoutScreen> {
+        self.fe.layout_under.first().map(|(_, u)| u).or(self.fe.layout_preview.as_ref())
     }
 
     /// The room object's part of the front end's tick 0x4D2570: advance its transition (+0x80,
@@ -585,7 +608,11 @@ impl App {
             // carries `R3DShadowMapTextureLayer` receive it (`CarIntShd` in `garage.crp`).
             //
             // The place and `YRot` are the **previous frame's**: 0x4E9FF0, called after, is what
-            // moves the car (0x4EA06A) and turns the room (0x4EA0CF). APPROXIMATION (// kept): on the room's first draw the original's previous place is the constructor's
+            // moves the car (0x4EA06A) and turns the room (0x4EA0CF). **MEASURED 2026-10-02 (SRV-B,
+            // `RE/notes/REFERENCE-2026-10-02-SRVB.md` §4): no observable effect** — the room's first draw has no car (`[+0x26C]` 0, and
+            // the shadow arm needs one), the car's place stays `(0, -1.1, 4.8)` with `[+0x2E8]` 0 in all
+            // 3 426 frames watched, so "previous" = current but for `YRot` (~0.003 rad a frame). The note it
+            // replaces: on the room's first draw the original's previous place is the constructor's
             // (0x4E9B30 / 0x4EA240: `(0, -1.1, 4.8)`, `YRot` 0 from 0x4E76C0), this port takes the
             // current one. Taking the constructor's turn instead was tried and reverted: a still
             // builds the room once, so that single draw is the picture and the shadow left the car.
@@ -985,8 +1012,8 @@ impl App {
                 // depth buffer, the alpha test as the last frame's room left it — every depth mask
                 // of the frame (the background, the screens, the bar, a dialog) steps from here
                 nfs_game::layout::fe_depth::begin_frame();
-                // 0x4D2F30, the front end's draw: the one background `[fe+0xE4]` (the top
-                // screen's `data.screen`, 0x4D30E7), the bottom bar's career era tabs (slot 41,
+                // 0x4D2F30, the front end's draw: the one background `[fe+0xE4]` (the bottom
+                // layer's `data.screen`, 0x4D30E7; see the draw below), the bottom bar's career era tabs (slot 41,
                 // 0x4D30F2), then the screens bottom first — the covered ones under the one on
                 // show. (the earlier premise below is WITHDRAWN (ed2b895d): 0x4D3040 reaches widget slot 26 = the stub 0x5258A0, nothing is drawn there; the covered car is the room-car feed above. Former text:) a covered screen's own 3D car
                 // views are not rendered (the port renders the top screen's only). The original runs
@@ -1009,7 +1036,11 @@ impl App {
                 if let Some(b) = &self.fe.layout_bottom {
                     b.take_front_transition(front);
                 }
-                v.extend(l.background_sprites(aspect, &self.fe.strings, &|a| self.accessor_value(a)));
+                // the background object `[fe+0xE4]` is made from the **bottom** layer's `data.screen`
+                // (0x4D2570 0x4D27B0…0x4D27D8 reads slot 0x84 of `[[[fe+0xD8]]]`; 0x4D1BD0 swaps it
+                // only when that name differs), so an overlay keeps the covered screen's
+                let base = self.fe.layout_under.first().map_or(l, |(_, u)| u);
+                v.extend(base.background_sprites(aspect, &self.fe.strings, &|a| self.accessor_value(a)));
                 v.extend(self.fe_career_tabs(aspect));
                 // the first layer's screen (0x4D30F8…0x4D3114), then the bottom bar (slot 0x3C,
                 // 0x4D3166, the bar made at 0x4D39D3), then the layers 1… (0x4D323E skips index
@@ -1086,7 +1117,8 @@ impl App {
     /// by one, so no era is lit and no tab drawn. The front screen's progress is 0x4D6300's
     /// `0x4E0D90(0)` on the bottom layer's screen.
     fn fe_career_tabs(&self, aspect: f32) -> Vec<Sprite> {
-        let (Some(l), Some(b)) = (self.fe.layout_preview.as_ref(), self.fe.layout_bottom.as_ref()) else { return Vec::new() };
+        // slot 0xAC of `[[0x65B928]+0xE0]` (0x4D8461) — the callback list, the bottom layer's
+        let (Some(l), Some(b)) = (self.fe_base_layout(), self.fe.layout_bottom.as_ref()) else { return Vec::new() };
         if self.fe.game_type != 4 || slot_ac(&callback_list_of(l)) {
             return Vec::new();
         }

@@ -361,43 +361,62 @@ pub struct CarPass {
 /// **0x20** from LOD 1 — no 0x80 call, so no driver.
 pub const FRONT_END_PASSES: [CarPass; 2] = [CarPass { lod: 1, mask: 0x50, flag: false }, CarPass { lod: 1, mask: 0x20, flag: false }];
 
-/// `0x5CDB28[class]`: the driver call's LOD object, class 0…3 only (0x444E5E…0x444E83)
-const DRIVER_LOD: [u8; 7] = [0, 0, 0, 1, 1, 2, 3];
-/// `0x5CDB44[7·CARDETAIL + class]`: the wheels' LOD object (0x444EF5…0x444F22)
-const WHEEL_LOD: [[u8; 7]; 3] = [[0, 0, 1, 1, 1, 5, 6], [0, 0, 0, 0, 1, 5, 6], [0, 0, 0, 0, 1, 5, 6]];
-/// `0x5CDB98[class]`: a traffic car's wheels (0x444EC0…0x444EF2)
-const TRAFFIC_WHEEL_LOD: [u8; 7] = [0, 0, 1, 2, 2, 2, 2];
-/// `0x5CD5B8[CARDETAIL]`: the class a racer or cop starts from (0x43A083)
-const CLASS_BIAS: [i32; 4] = [3, 3, 2, 2];
-/// `0x5CDB1C[CARDETAIL]`: the hands' LOD object in the driver view (0x444F9B)
-const HANDS_LOD: [u8; 3] = [1, 0, 0];
+// **The car draw is `nfs5.dll`'s, not the file's.** The Verok patch's runtime patcher jumps the first
+// five bytes of 0x444E00 into its own `R3DCar` draw (dll VA 0x100012C0 → 0x10001090, `RE/notes/nfs5-dll.md`
+// §2.1) and rewrites the car detail to five tiers (0 … 4, the `Graphics.CarDetail` list 0x5B6D5C), so
+// every table below is the dll's own (`.rdata` 0x10005094 … 0x100051A0 and `.data` 0x1000600C), not the
+// exe's 0x5CDB1C … 0x5CDBA8 / 0x5CD5B8, which the shipped game never reads for the car.
+/// dll `0x10005094[eff]`: the driver call's LOD object, effective class 0…3 only (0x100011E7)
+const DRIVER_LOD: [u8; 4] = [0, 0, 1, 2];
+/// dll `0x100050E0[7·CARDETAIL + class]`: the effective class the body and the driver are drawn from
+/// (0x100011C7…0x100011D9); tiers 0 … 2 are the class itself, 3 and 4 draw finer LODs
+const EFFECTIVE_CLASS: [[u8; 7]; 5] = [
+    [0, 1, 2, 3, 4, 5, 6],
+    [0, 1, 2, 3, 4, 5, 6],
+    [0, 1, 2, 3, 4, 5, 6],
+    [0, 1, 1, 2, 3, 4, 5],
+    [0, 0, 0, 1, 1, 2, 3],
+];
+/// dll `0x1000516C[class]`: the wheels' LOD object (0x1000128D) — by the raw class, not the tier
+const WHEEL_LOD: [u8; 7] = [0, 0, 0, 1, 1, 2, 4];
+/// dll `0x10005188[class]`: a traffic car's wheels (0x10001268)
+const TRAFFIC_WHEEL_LOD: [u8; 7] = [0, 0, 0, 0, 1, 2, 3];
+/// dll `0x1000600C[CARDETAIL]` (written into the push operand 0x43A086, dll 0x100013C8): the class a
+/// racer or cop starts from
+const CLASS_BIAS: [i32; 5] = [5, 4, 3, 2, 1];
+/// dll `0x100050AC[CARDETAIL]`: the LOD object of the driver view's shell and cabin pass (0x100010EE)
+const CABIN_LOD: [u8; 5] = [1, 1, 1, 0, 0];
+/// dll `0x100050C0[CARDETAIL]`: the hands' LOD object in the driver view (0x10001161), tiers 2 and up
+const HANDS_LOD: [u8; 5] = [1, 1, 1, 0, 0];
 
-/// The race's calls of 0x444E00 outside the driver view, for LOD class `class`: mask **0x80** (the
-/// driver) from `0x5CDB28[class]` while `class < 4`, **0x50** (the body, its interior, the steering
-/// wheel) from the class's own LOD, **0x20** (the wheels) from `0x5CDB44[7·CARDETAIL + class]`, or
-/// for traffic (`car+0x52C & 0x10`) from `0x5CDB98[class]` — all without the flag, so a part with
-/// `Base+82` (the hands) is left out.
+/// The race's calls of the car draw (dll 0x10001090), for LOD class `class`: mask **0x80** (the
+/// driver) from `DRIVER_LOD[eff]` while `eff < 4`, **0x50** (the body, its interior, the steering
+/// wheel) from LOD `eff`, **0x20** (the wheels) from `WHEEL_LOD[class]`, or for traffic (`car+0x52C & 0x10`)
+/// from `TRAFFIC_WHEEL_LOD[class]` — all without the flag, so a part with `Base+82` (the hands) is
+/// left out. `eff` is `EFFECTIVE_CLASS[CARDETAIL][class]`.
 pub fn race_passes(class: u8, detail: u8, traffic: bool) -> Vec<CarPass> {
     let c = (class as usize).min(6);
+    let eff = EFFECTIVE_CLASS[(detail as usize).min(4)][c] as usize;
     let mut v = Vec::with_capacity(3);
-    if c < 4 {
-        v.push(CarPass { lod: DRIVER_LOD[c] + 1, mask: 0x80, flag: false });
+    if eff < 4 {
+        v.push(CarPass { lod: DRIVER_LOD[eff] + 1, mask: 0x80, flag: false });
     }
-    v.push(CarPass { lod: c as u8 + 1, mask: 0x50, flag: false });
-    let w = if traffic { TRAFFIC_WHEEL_LOD[c] } else { WHEEL_LOD[(detail as usize).min(2)][c] };
+    v.push(CarPass { lod: eff as u8 + 1, mask: 0x50, flag: false });
+    let w = if traffic { TRAFFIC_WHEEL_LOD[c] } else { WHEEL_LOD[c] };
     v.push(CarPass { lod: w + 1, mask: 0x20, flag: false });
     v
 }
 
-/// 0x444F4E…0x444FB5: the camera's own car in views 0 and 1 (`[0x627F43] & 8`) — mask **0x10**
-/// with the flag from LOD **2** (the shell and the cabin, the parts with `Base+81`), **0x40** with
-/// the flag from LOD 1 (the steering wheel), and, at `CARDETAIL` above 0 and with none of the look
-/// inputs 0x13 / 0x14 / 0x15 held (`[0x5E99B0]`, `[0x5E99B4]`, `[0x5E99AC]`), **0x80** with the
-/// flag from `0x5CDB1C[CARDETAIL]` (LOD 1: the hands and a passenger).
-pub fn in_car_passes(detail: u8, looking: bool) -> Vec<CarPass> {
-    let mut v = vec![CarPass { lod: 2, mask: 0x10, flag: true }, CarPass { lod: 1, mask: 0x40, flag: true }];
-    if detail > 0 && !looking {
-        v.push(CarPass { lod: HANDS_LOD[(detail as usize).min(2)] + 1, mask: 0x80, flag: true });
+/// dll 0x100010DB…0x10001186: the camera's own car in views 0 and 1 (`[0x627F43] & 8`) — mask **0x10**
+/// from LOD `CABIN_LOD[CARDETAIL]` with the flag `class > 1` (the stale class the pick left, 0x100010DB…0x100010E6; the file's 0x444F5A pushed 1 and LOD 2), **0x40** with the flag from LOD 1 (the
+/// steering wheel), and, at `CARDETAIL` above 1 and with none of the look inputs 0x13 / 0x14 / 0x15
+/// held (`[0x5E99B0]`, `[0x5E99B4]`, `[0x5E99AC]`), **0x80** with the flag from `HANDS_LOD[CARDETAIL]`
+/// (the hands and a passenger; the file's 0x444F92 test was `CARDETAIL > 0`).
+pub fn in_car_passes(class: u8, detail: u8, looking: bool) -> Vec<CarPass> {
+    let d = (detail as usize).min(4);
+    let mut v = vec![CarPass { lod: CABIN_LOD[d] + 1, mask: 0x10, flag: class > 1 }, CarPass { lod: 1, mask: 0x40, flag: true }];
+    if detail > 1 && !looking {
+        v.push(CarPass { lod: HANDS_LOD[d] + 1, mask: 0x80, flag: true });
     }
     v
 }
@@ -431,6 +450,26 @@ pub struct LodView {
     /// the render width `[0x657A48]` the reference 640 is taken over (0x43A2D7): the window's
     /// width, whichever view's viewport `width` / `height` are
     pub ref_width: f32,
+    /// the 2-D screen's virtual width `nfs5.dll` keeps for the mode (dll 0x10006134, computed at
+    /// 0x10003840): 640 up to 4:3, `480 · W / H` wider — what replaces the literal 640 at 0x43A2DD
+    /// (the operand is rewritten at dll 0x10003D94)
+    pub virtual_width: f32,
+}
+
+/// `nfs5.dll`'s virtual 2-D screen `(width, height)` for a mode `w × h` pixels (dll 0x10003840…
+/// 0x100038BE, run on every SetMode): with `r = w / h`, `r` above 4/3 (the double at dll 0x10005600)
+/// → `(480 · r, 480)`; `r` 4/3 or less → `(640, 640 / r)`. Cells dll 0x10006134 (width) /
+/// 0x10006130 (height), read by the LOD pick (0x43A2DF) and the quad draw 0x451710
+/// (0x451824 / 0x451834).
+pub fn virtual_screen(w: f32, h: f32) -> (f32, f32) {
+    let ratio = w / h;
+    if 4.0_f32 / 3.0 < ratio { (480.0 * ratio, 480.0) } else { (640.0, 640.0 / ratio) }
+}
+
+/// The virtual screen's width (dll 0x10006134): 640 when `w / h` is 4/3 or less, `480 · w / h`
+/// above it.
+pub fn virtual_width(w: f32, h: f32) -> f32 {
+    virtual_screen(w, h).0
 }
 
 /// The car's collision body points `car+0x8C` (`BndP`, `RE/notes/car-model.md` §12): the records
@@ -677,9 +716,11 @@ impl CarModel {
             };
             // Thrash 0x18 from the same block, `rs[4]` (`LayerState` 0x53F780 → 0x540660 hands the
             // driver states 6, 0x0A, 0x38, 2 and 0x18, the last through 0x540500): over the shipped
-            // cars −10, −3, −2, −1, 0, 1, 3 and 5 (`nfs-formats/examples/rsblock.rs`) — a pull of
-            // `−b · (far − near) / 32768` in view depth, 2.1 cm a unit in the race's main view and
-            // ~2 m in the rear view (far 65000). *(Until 2026-09-26 the cars took 0.)*
+            // cars −10, −3, −2, −1, 0, 1, 3 and 5 (`nfs-formats/examples/rsblock.rs`) — `b · 2^-15`
+            // on the game's screen z `far/(far − near) · (1 − near / Z)` (0x540CE0, `RE/notes/
+            // thrash.md` §6d.3): ≈ `b · 2^-15 · Z² / near` of view depth, 0.05 mm a unit at 0.5 m in
+            // the driver view (near 0.15), 0.5 m at 50 m. *(Until 2026-09-26 the cars took 0; until
+            // 2026-10-02 the port read the screen z as linear, 2.1 cm a unit at every distance.)*
             let depth_bias = if env.rs_bias { m.and_then(|m| m.rs).map_or(0, |rs| rs[4]) } else { 0 };
             let mid = r.create_material(MaterialDesc { texture: page.map(|p| p.0), alpha_blend: blend, cull_back: cull, depth_test: true, env_texture: spec, env_mix: 1.0, env_variant: variant, sky_map: reflective, blend_pair, clamp: m.map_or([false; 2], |m| m.address.map(|a| a == 0)), lod_bias: m.map_or(0.0, |m| m.lod_bias), device_states: true, view_cull: false, depth_bias, false_sort: false });
             if let Some(l) = m.and_then(|m| m.light) {
@@ -1725,23 +1766,24 @@ impl CarModel {
     /// class `+0x2C0`, or `None` when the car covers 3 pixels or less and is not drawn (0x43A2E8,
     /// the caller 0x443192).
     ///
-    /// The class starts from `0x5CD5B8[CARDETAIL]` = 3, 3, 2 (and 1 more on a machine under 40 MB,
-    /// `GlobalMemoryStatus` 0x53C3D0 — never here); a replay (`[0x657424] >= 2`) with `CARDETAIL`
-    /// above 0 takes 1 off, an opponent (`car+0x52C & 8`) at `CARDETAIL` 0 adds 1, and a traffic car
+    /// The class starts from `CLASS_BIAS[CARDETAIL]` = 5, 4, 3, 2, 1 (the dll's table, written into
+    /// the push operand 0x43A086; the file's 0x5CD5B8 was 3, 3, 2, 2) and 1 more on a machine under
+    /// 40 MB (`GlobalMemoryStatus` 0x53C3D0 — never here). **The dll cuts the replay test out** (its jump at 0x43A08A
+    /// goes to 0x43A099, past the file's `cmp [0x657424], 2` / `jl`): `CARDETAIL` above 0 takes 1 off in
+    /// a race and a replay alike, an opponent (`car+0x52C & 8`) at `CARDETAIL` 0 adds 1, and a traffic car
     /// (`& 0x10`) starts from 0. The car's box — `car+0x3A8` as `(x, y, z)`, `(−2x, y, z)` and
     /// `(x, y, −z)` about the draw origin, through the car's rows (0x43A18D…0x43A206) — is projected
     /// (0x539700), and `size` = the bit-trick roots of the two edges' squared screen lengths from
-    /// the first point, × 640 / screen width (0x43A26A…0x43A2E5). Then `t = max(1 − rsqrt₁₂₀ · √size,
+    /// the first point, × the virtual width (640 at 4:3, `virtual_width`) / screen width (0x43A26A…0x43A2E5). Then `t = max(1 − rsqrt₁₂₀ · √size,
     /// 0) · (N − bias − 1)` with the bit-trick `rsqrt(120)` (0x5F400000 − bits/2) and `N`
     /// [`Self::lod_span`]; `t · (t + 1) / 2` for all but traffic; the class is `bias + fistp(t −
     /// 0.5)`, within `0 … 7 − (CARDETAIL > 1 ? 2 : 1)` (0x43A305…0x43A3B0).
-    #[allow(clippy::too_many_arguments)]
-    pub fn lod_class(&self, view: &LodView, origin: Vec3, rotation: glam::Quat, half: Vec3, detail: u8, kind: CarKind, replay: bool) -> Option<u8> {
+    pub fn lod_class(&self, view: &LodView, origin: Vec3, rotation: glam::Quat, half: Vec3, detail: u8, kind: CarKind) -> Option<u8> {
         let cd = detail as i32;
-        let mut bias = CLASS_BIAS[(cd as usize).min(3)];
-        if replay && cd > 0 {
+        let mut bias = CLASS_BIAS[(cd as usize).min(4)];
+        if cd > 0 {
             bias -= 1;
-        } else if cd == 0 && kind == CarKind::Opponent {
+        } else if kind == CarKind::Opponent {
             bias += 1;
         }
         if kind == CarKind::Traffic {
@@ -1758,7 +1800,7 @@ impl CarModel {
         let d1 = (s1 - s0).length_squared();
         let d2 = (s2 - s0).length_squared();
         // x87: the two roots summed and scaled on the stack, `fst` to a float for the root below
-        let size = (bit_root(d1) as f64 + bit_root(d2) as f64) * (640.0 / view.ref_width as f64);
+        let size = (bit_root(d1) as f64 + bit_root(d2) as f64) * (view.virtual_width as f64 / view.ref_width as f64);
         if size <= 3.0 {
             return None;
         }
@@ -1781,10 +1823,12 @@ impl CarModel {
     /// (0x43A3B6…0x43A3F8; the driver view jumps there with the class it had), each writing channel
     /// `m`'s `.y` from wheel `[0x5B36F0 + 4m]`'s `+0x68` — `(0, 1, 2, 3)`, or `(1, 0, 3, 2)` in a
     /// mirrored race (`[0x65742C]`, 0x43E6B1…0x43E6C2) — while its gate says one of the LOD's parts
-    /// rides it. So a car at class 0 keeps what it had: none of its LODs is walked.
+    /// rides it. **The dll walks at least LOD 0**: its jump at 0x43A3B6 (dll 0x10001070) loads the class
+    /// as 1 when it is 0 before the loop's entry test (0x43A3C4) while the loop's own bound re-reads
+    /// the real class (0x43A3EC), so a car at class 0 walks LOD 0 once — the file's loop walked none.
     pub fn update_travel(&self, state: &mut CarLodState, compression: [f32; 4], mirror: bool) {
         let map = if mirror { [1, 0, 3, 2] } else { [0, 1, 2, 3] };
-        for moves in self.lod_moves.iter().take(state.class as usize) {
+        for moves in self.lod_moves.iter().take((state.class as usize).max(1)) {
             for m in 0..4 {
                 if moves[m] {
                     state.travel[m] = compression[map[m]];

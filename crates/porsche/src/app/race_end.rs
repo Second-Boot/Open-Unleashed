@@ -118,13 +118,17 @@ impl App {
     /// `FEGAME_TYPE [0x6573E8]` of the race running (option 0x30, written by 0x4EB470 from the
     /// launch's `Game.GameType`): the layout front end's type when it started the race; for the
     /// text menu and the command line, 1 for a Quick Knockout (`RACE_TYPE` 3), 2 for a knockout
-    /// round, else 0 — APPROXIMATION for those port-only launches: a text-menu career event (the
+    /// round, 9 for a mission, else 0 — APPROXIMATION for those port-only launches: a text-menu career event (the
     /// original's 4) answers 0, which picks the same summary title.
     pub(crate) fn race_fegame_type(&self) -> u8 {
         self.block_game_type().unwrap_or(if self.quick_knockout {
             1
         } else if self.knockout_round {
             2
+        } else if self.mission.is_some() {
+            // a Factory Driver mission is `Game.GameType` 9 (`modes.md` 1): the command line's `--mission`
+            // and the text menu's mission have no layout launch to say so
+            9
         } else {
             0
         })
@@ -294,7 +298,12 @@ impl App {
     /// this short form (byte-identical to the original, pass 9); only the player's own row used
     /// `CarSpecs::name` until this fix.
     pub(crate) fn player_car_family(&self) -> String {
-        let family = |t: &nfs_game::career::CareerTables| t.car(self.car_id).map(|c| c.family.clone());
+        // the car this race is driven in — a front-end / career / replay launch sets
+        // `player_car_id`; `car_id` is only the start-up (command-line) car. *(Until 2026-10-02 this
+        // read `car_id`, so every front-end race filed and showed the start-up car's family —
+        // "911 Carrera" for the default 993 — whatever was driven. User report.)*
+        let id = self.player_car_id.unwrap_or(self.car_id);
+        let family = |t: &nfs_game::career::CareerTables| t.car(id).map(|c| c.family.clone());
         match self.career.as_ref() {
             Some(c) => family(&c.tables),
             None => nfs_game::career::CareerTables::load(&self.paths).ok().and_then(|t| family(&t)),
@@ -313,7 +322,7 @@ impl App {
         let time = if circuit { me.best_lap } else { me.time } as u32;
         let (driver, car_name) = (self.player_name.clone(), self.player_car_family());
         if let Some(rank) = self.records.insert(&self.track.name, &driver, &car_name, time) {
-            tracing::info!(rank, time = format_ticks(time as u64), circuit, "track record entered (0x4EDF00)");
+            tracing::info!(rank, time = format_ticks(time as u64), circuit, car = %car_name, "track record entered (0x4EDF00)");
             if let Err(e) = self.records.save(&self.records_path) {
                 tracing::warn!(error = %e, "records save failed");
             }
@@ -369,6 +378,10 @@ impl App {
         self.career_opponents = None;
         self.skill = None;
         self.mission = None;
+        // the playback's `DERBY` word is the recording's; the session's own cheat bits come back
+        if let Some(live) = self.cheat_bits_live.take() {
+            self.cheat_bits = live;
+        }
         self.stop_race_audio();
         self.fe.menu = Some(menu);
         self.sim_shutdown();

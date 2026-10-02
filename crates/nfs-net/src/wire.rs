@@ -163,7 +163,7 @@ mod tests {
         assert_eq!(a.family(), 2);
         assert_eq!(a.port(), crate::PORT);
         assert_eq!(a.ipv4(), Some([192, 168, 0, 7]));
-        assert_eq!(&a.0[0..8], &[2, 0, 0x04, 0x52, 192, 168, 0, 7]);
+        assert_eq!(&a.0[0..8], &[2, 0, 0x24, 0xE2, 192, 168, 0, 7]);
     }
 
     #[test]

@@ -69,6 +69,9 @@ impl App {
         // 0x4BC240's clamp
         let row = row.min(rows.len() - 1);
         if base == "zMergedList.Car" {
+            if let Some(m) = self.fe.menu.as_mut() {
+                m.merged_at_zero = false; // 0x4F49F0 records the picked index
+            }
             let a = rows.len().saturating_sub(self.fe.menu.as_ref().map_or(0, |m| m.cars.len()));
             if row < a {
                 let Some((grows, gat)) = self.combo_rows("OwnedCars.Car") else { return };
@@ -493,7 +496,7 @@ impl App {
     /// `main.rs`'s `choice_rows` used to hardcode one fake row, `"640 x 480 x 16"`, so the
     /// dropdown could never offer a real choice.
     ///
-    /// **APPROXIMATION**: this lists the distinct sizes of the **current monitor's** own video
+    /// **PORT-DEVIATION D11 (PORT-DEVIATIONS.md)** [0x4BC710, 0x44E720, 0x44E780]: this lists the distinct sizes of the **current monitor's** own video
     /// modes (`winit::monitor::MonitorHandle::video_modes`, the modes the OS itself reports as
     /// running the display at) — the modes this port can actually ask the window to become, not
     /// the original's Direct3D device-mode list, which depended on the graphics driver and has no
@@ -503,7 +506,7 @@ impl App {
     /// yet (should not happen once one is created at start-up) or no monitor reachable (a
     /// sandboxed / headless test run), it falls back to one row at the window's own current inner
     /// size, `"{w} x {h} x 32"` — the same "no hardware device: one mode" shape 0x44E72A's arm
-    /// takes, APPROXIMATION on the depth (the original's own fallback is `0x10`, 16-bit, a
+    /// takes, PORT-DEVIATION D11 on the depth (0x44E73D) (the original's own fallback is `0x10`, 16-bit, a
     /// DirectDraw-era default this port has no equivalent reason to pick).
     pub(crate) fn resolution_list(&self) -> Vec<(u32, u32, u32)> {
         let Some(window) = self.window.as_ref() else { return vec![(640, 480, 32)] };
@@ -596,11 +599,12 @@ impl App {
             // with no later Options visit, so its accessor block is untouched by any later
             // in-game edit — settles the exact index for all four: `Graphics.LensFlare=1`
             // (`on`), `Graphics.SkyRendering=2` (`1504` "high"), `Graphics.CarChrome=2` and
-            // `Graphics.CarDetail=2` (`1504` "high", the last entry of their own 3-item list).
+            // `Graphics.CarDetail=2` (`1504` "high" in the file's own 3-item list — but the RUN-TIME list is
+            // `nfs5.dll`'s five items 0x5B6D5C, where index 2 is `401` «обычно», which is what the Wine
+            // fresh profile's screen shows, `RE/notes/nfs5-dll.md` §2.1).
             // `DRIVER`'s long-played profile (pass 12/13) independently agrees on `SkyRendering`
-            // and `CarChrome` (`высоко` both); its own `CarDetail` (`обычно`, index 1) is the
-            // one value this doesn't match, kept as `2` here since `native_TEST.sav` is the
-            // cleaner "never touched after creation" ground truth of the two.
+            // and `CarChrome` (`высоко` both); its own `CarDetail` read «обычно» — the same index 2
+            // under the five-item list (it was read as index 1 against the three-item one).
             //
             // Three more `Graphics.*` accessors — `TextureDetail`, `SpecialFX`, `ViewDistance`
             // ("детализация текстур"/"окружающая среда"/"дистанция обзора") — are **not** in
@@ -625,6 +629,26 @@ impl App {
             // numbers from genuine save data (APPROXIMATION for the exact tier, not for the
             // "never off/never lowest" direction, which is CONFIRMED).
             //
+            // **Where the four-tier probe results land (PROBE 2026-10-02, read on nfs5.exe, the
+            // file's 0x44E370…0x44E670 are `jmp`s into the runtime DLL under Wine, so the rules are
+            // SRVC §2's gdb-read ones):** the options container's constructor 0x4E5760 builds the
+            // accessors through 0x4BB680 (CarChrome 0x4E57DF, CarDetail 0x4E5816, both with the list
+            // 0x5B6D94 = 1502 / 1503 / 1504 = IDS_LOW «низко» / IDS_OP_MEDIUM «обычно» / IDS_HIGH «высоко»,
+            // festrings.h) and ends (0x4E5B14…0x4E5B8E) by calling SetSelection (vtable +0x2C = 0x4BB6E0 →
+            // 0x4BC240, clamped to count-1, then the commit callback 0x4E5710 / 0x4E56D0 writes
+            // `[0x657D60]` / `[0x657D68]`) with the probe's tier: CarChrome ← 0x44E5F0 (0x4E5B51),
+            // CarDetail ← the same 0x44E5F0 (0x4E5B62), sky ← 0x44E410, texture ← 0x44E370, SpecialFX ←
+            // 0x44E480, ViewDistance ← 0x44E670, WideScreen ← 0, TripleBuffer ← 1. 0x44E5F0 reads
+            // texture memory, RAM and the CPU benchmark only — NOT the colour depth — so the 16-bit
+            // «D < 32 → 2» rule of 0x44DFB0 (which maps `[0x657D88]` → `[0x619770]` for textures only,
+            // called from 0x4B67BD) does not touch car detail. gdb on the Wine run saw 0x44E5F0 return 2
+            // for both accessors. Hence a modern machine (T ≥ 6 MB, R ≥ 64 MB, C ≥ 302) starts with
+            // CarChrome = CarDetail = 2 («высоко»): the port's 2 / 2 is right for the 32-bit case.
+            // **Settled (NFS5DLL, 2026-10-02):** the Wine fresh profile's Graphics screen read car detail
+            // «обычно» because the run-time list is `nfs5.dll`'s 0x5B6D5C (1506 / 1502 / 401 / 1504 / 1507),
+            // not the file's 0x5B6D94: the constructor's 2 is that list's index 2 = 401 «обычно»; nothing
+            // lowers it. CarChrome keeps the three-item list (the dll leaves 0x4E57DF alone).
+            //
             // **Read from the running original's memory (2026-10-01 SV, Wine, dx7z, gdb, an empty
             // `savedata`, the first front-end frame, before any profile):** `[0x657D60]` CarChrome = 2,
             // `[0x657D68]` CarDetail = 2, `[0x657D7C]` LensFlare = 0, `[0x657D9C]` SkyRendering = 0 (and
@@ -643,7 +667,12 @@ impl App {
             // shipped `nfs5-2.hud`'s record for the layout — and it, not `fe.txt`, is where a
             // profile that never changed a Display option has them (HM, [`hud_cfg2_default`])
             None => {
+                // a `fe = 0` launch (`App::fe0`) has no dump, the block is cleared and holds only the keys
+                // `fe.txt` / the command line name (`modes.md` §1.2, the SV run's `skyrendering = 2` line): the four
+                // accessors the shipped file has no key for read 0 there — the dump's selection exists only when the
+                // front end launched the race. `NFS_CHOICE` still overrides (above).
                 let hw_default = match name {
+                    _ if self.fe0 => 0,
                     "Graphics.LensFlare" => 1,
                     "Graphics.SkyRendering" | "Graphics.CarChrome" | "Graphics.CarDetail" => 2,
                     _ if *key == "gear" => 1,
@@ -718,6 +747,91 @@ impl App {
         let (layout, w, h) = self.hud_cfg_key();
         let cache = self.hud_cfg.borrow();
         cache.cfg.as_ref()?.accessor_value(layout, w, h, slot).map(|v| v as usize)
+    }
+
+    /// **`NFS5.HUD`'s pieces** (OPTS, the draw 0x4CB970, read 2026-10-03; decompiled and checked
+    /// against the disassembly): over the `disp` schematic the draw lays one `hud.fsh` piece for
+    /// each option that shows an element, at the element's stored position — the getter's `f32`
+    /// pair times 240 / 180 (0x5B6030 / 0x5B6034) from the schematic's origin — and at the piece's
+    /// own size times `640 / W`, `480 / H` (0x4CBBEA…0x4CBC13; `W` / `H` are the `Graphics.Resolutions`
+    /// row's, `0x4BAAF0` / `0x4BC840` — the first `%d` of 0x4BC710's `"%d x %d x %d"` is the
+    /// `+0x38` array that 0x4BAAF0 indexes, so it is the width; `hud.md` had them the other way).
+    /// The order is the draw's: Damage (1 → `dam3` entry 3, 2 → `dam1` entry 1 — both at 0x420D00,
+    /// cfg1 `+0x1A0`; 3 → `dam2` entry 2 at 0x420D40, `+0x1B0`), Map (1, 2 → `lapG` entry 4,
+    /// 3 → `Rada` entry 5, at the track map 0x420DC0), OppList ≠ 0 → `pos` 6 (0x420D60), RearView ≠ 0
+    /// → `mir` 7 (0x420DE0), SplitTimes ≠ 0 → `mtme` 10 (0x420CE0, cfg2 `+0x0C`), Gear ≠ 0 → `gear`
+    /// 11 (0x420CA0), Tach (1 → digital `spee` 12 at 0x420D20, 2 → `tach` 14 at 0x420D80), Speedometer
+    /// (1 → `spee` 12 at 0x420CC0, 2 → `spee` 13 at 0x420DA0). `Units`, `MapScale`, `DispCols`,
+    /// `Translucency` and `RecordTime` choose no piece (0x4CB970 reads none of them). The positions are
+    /// the record's (the one 0x41E170 made current for the layout and resolution, [`Self::hud_cfg_key`]);
+    /// none (no `.hud` file at all) → no pieces.
+    pub(crate) fn hud_preview_pieces(&self) -> (Vec<(usize, f32, f32)>, f32, f32) {
+        self.hud_cfg_ensure();
+        let (layout, w, h) = self.hud_cfg_key();
+        // the options first: `choice_index` borrows the cache itself
+        let opt = |name: &str| self.choice_index(name).map_or(0, |(i, _)| i);
+        let (damage, map, opp, rear, split, gear, tach, speedo) = (
+            opt("Display.Damage"),
+            opt("Display.Map"),
+            opt("Display.OppList"),
+            opt("Display.RearView"),
+            opt("Display.SplitTimes"),
+            opt("Display.Gear"),
+            opt("Display.Tach"),
+            opt("Display.Speedometer"),
+        );
+        let cache = self.hud_cfg.borrow();
+        let Some(pos) = cache.cfg.as_ref().and_then(|c| c.find(layout, w, h).map(|i| c.stored_positions(i))) else {
+            return (Vec::new(), 1.0, 1.0);
+        };
+        // indices into `stored_positions`
+        const GEAR: usize = 0;
+        const SPEED: usize = 1;
+        const TACH_DIGITAL: usize = 3;
+        const TACH: usize = 4;
+        const SPEEDOMETER: usize = 5;
+        const POSITION: usize = 6;
+        const TRACK_MAP: usize = 7;
+        const REARVIEW: usize = 9;
+        const MULTI_TIME: usize = 10;
+        const TEXT_DAMAGE: usize = 11;
+        const GRAPHIC_DAMAGE: usize = 12;
+        let mut out = Vec::new();
+        let mut put = |entry: usize, at: usize| out.push((entry, pos[at].0 * 240.0, pos[at].1 * 180.0));
+        match damage {
+            1 => put(3, TEXT_DAMAGE),
+            2 => put(1, TEXT_DAMAGE),
+            3 => put(2, GRAPHIC_DAMAGE),
+            _ => {}
+        }
+        match map {
+            1 | 2 => put(4, TRACK_MAP),
+            3 => put(5, TRACK_MAP),
+            _ => {}
+        }
+        if opp != 0 {
+            put(6, POSITION);
+        }
+        if rear != 0 {
+            put(7, REARVIEW);
+        }
+        if split != 0 {
+            put(10, MULTI_TIME);
+        }
+        if gear != 0 {
+            put(11, GEAR);
+        }
+        match tach {
+            1 => put(12, TACH_DIGITAL),
+            2 => put(14, TACH),
+            _ => {}
+        }
+        match speedo {
+            1 => put(12, SPEED),
+            2 => put(13, SPEEDOMETER),
+            _ => {}
+        }
+        (out, 640.0 / w as f32, 480.0 / h as f32)
     }
 
     /// A Display accessor's setter: the accessor holds the value (`staged`) and nothing is written
@@ -918,7 +1032,10 @@ pub(crate) const CHOICE_ACCESSORS: &[(&str, &str, &[u32])] = &[
     ("Display.Tach", "tachometer", &[1500, 1801, 1802]),
     ("Display.Translucency", "translucency", &[1501, 1500]),
     ("Graphics.CarChrome", "carchrome", &[1502, 1503, 1504]),
-    ("Graphics.CarDetail", "cardetail", &[1502, 1503, 1504]),
+    // the RUN-TIME list, not the file's: `nfs5.dll` (the Verok patch's runtime patcher) rewrites the push operand
+    // 0x4E5817 from 0x5B6D94 (1502 / 1503 / 1504) to 0x5B6D5C (dll 0x10001320, `RE/notes/nfs5-dll.md` §2.1) — the
+    // same five items as `TextureDetail`'s; index 2 is 401 «обычно», the tier the constructor's probe stores (0x4E5B62)
+    ("Graphics.CarDetail", "cardetail", &[1506, 1502, 401, 1504, 1507]),
     ("Graphics.DetailedShadows", "detailedshadows", &[1500, 1501]),
     ("Graphics.Headlights", "headlights", &[1508, 1505]),
     ("Graphics.LensFlare", "lensflare", &[1500, 1501]),

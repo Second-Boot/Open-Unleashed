@@ -966,8 +966,9 @@ pub fn tree_population(track: &TrackAssets, articles: &[Option<CullArticle>]) ->
 /// library article at the record's matrix (`(crp article, world matrix)`) — are in the tree's
 /// box and vertex population like any bundle's. *(§14.76 read the count as 0 there: 0x482970
 /// zeroes `[+0x18]` at 0x482987 and sets it at 0x482C76 / 0x482C97.)* APPROXIMATION: a scene
-/// with no element leaves 64 slots parked as `DFLT` at y 9999 in the original (`[+0x44]`,
-/// 0x482C76), which the port does not add; every shipped race has at least the start file's two.
+/// with no element keeps 64 slots live, parked as `DFLT` at y 9999 in the original (`[+0x44]`,
+/// 0x482C76): the caller ([`TrackWorld::upload`]) passes them in `scene` — the five Monaco tracks
+/// and the skidpad have no start scene, so that is every race there.
 pub fn tree_population_with_scene(track: &TrackAssets, articles: &[Option<CullArticle>], scene: &[(usize, Mat4)]) -> TreePopulation {
     let Ok(arts) = track.crp.articles(&track.crp_data) else { return TreePopulation::default() };
     let (mut min, mut max) = ([1.0e9f32; 3], [-1.0e9f32; 3]);
@@ -1011,6 +1012,17 @@ pub fn tree_population_with_scene(track: &TrackAssets, articles: &[Option<CullAr
         return TreePopulation::default();
     }
     TreePopulation { points, min, max }
+}
+
+/// The `WSceneBundle`'s parked slots (0x482970 at 0x482C76, 0x482D3A…0x482D87, with `[+0x44]` set at
+/// 0x487A51…0x487A5E): none while the scene has a GEOM element, else all 64 — a `DFLT` item at
+/// (0, 9999.0, 0) (`0x461C3C00`) with the identity matrix (0x5BB2D0).
+pub fn parked_scene_slots(geom_elements: usize) -> Vec<nfs_assets::track::PropInstance> {
+    if geom_elements != 0 {
+        return Vec::new();
+    }
+    let slot = nfs_assets::track::PropInstance { source: 0, element: 0, scale: Vec3::ONE, tag: u32::from_le_bytes(*b"DFLT"), transform: Mat4::from_translation(Vec3::new(0.0, 9999.0, 0.0)) };
+    vec![slot; 64]
 }
 
 /// A node an article is registered into: its allocation number and its circle `(cx, cz, r)`.
@@ -1770,7 +1782,18 @@ impl TrackWorld {
         let mut instance_flares: Vec<(usize, TrackFlare)> = Vec::new();
         // the `WSceneBundle`'s items for the fitted tree's population: (article, world matrix)
         let mut scene_items: Vec<(usize, Mat4)> = Vec::new();
-        for inst in &geometry.instances {
+        // A scene with no GEOM element at all keeps the bundle's 64 parked slots live
+        // (`[bundle+0x44] = (0x46D9C0() == 0)`, 0x487A51…0x487A5E; 0x482970 then leaves the count
+        // `[+0x18]` at 64, 0x482C76, instead of `min(0x46D9C0(), 64)`, 0x482C81…0x482C97): every
+        // slot is a `DFLT` item at (0, 9999.0, 0) with the identity matrix (0x482D3A…0x482D87:
+        // `0x461C3C00`, 0x5BB2D0), registered and counted in the tree's box and vertex population
+        // like a real element. **Reachable**: the five Monaco tracks and the skidpad ship no
+        // `_fstart` / `_bstart` scene (and 0x46D330 loads none for a skill test's scene 0 on a
+        // circuit), so every race there has no GEOM element (the earlier "every shipped
+        // start file has 2–5" counted the thirteen files that exist). Local to the render walk —
+        // `geometry.instances` (the ground triangles, `scene_props`' collision props) is untouched.
+        let parked = parked_scene_slots(geometry.instances.len());
+        for inst in geometry.instances.iter().chain(parked.iter()) {
             // `0x478640`'s search over the bundle's template records: on no match, `0x482EA0`
             // falls back to template index 0 (`0x482ebe`…`0x482ec0`'s `jge`/`xor eax,eax`), never
             // a skip — the first `'tr'∧library` article in `.crp` order (`geometry.library`'s own
@@ -3242,20 +3265,50 @@ fn group_tag(name: &Option<String>) -> u32 {
 mod driver_tests {
     use super::*;
 
-    /// 0x444E00's calls: the driver from `0x5CDB28` below class 4, the body from the class's LOD,
-    /// the wheels from `0x5CDB44` (or the traffic's `0x5CDB98`), none with the flag.
+    /// The car draw's calls (the dll's 0x10001090): the driver from the dll's `0x10005094` below
+    /// effective class 4, the body from LOD `eff` (`0x100050E0[7·detail + class]`), the wheels from
+    /// `0x1000516C[class]` (or the traffic's `0x10005188`), none with the flag.
     #[test]
     fn race_passes_follow_the_tables() {
         let p = |lod, mask| CarPass { lod, mask, flag: false };
-        assert_eq!(race_passes(2, 2, false), vec![p(1, 0x80), p(3, 0x50), p(1, 0x20)]);
-        assert_eq!(race_passes(3, 0, false), vec![p(2, 0x80), p(4, 0x50), p(2, 0x20)]);
-        assert_eq!(race_passes(5, 1, false), vec![p(6, 0x50), p(6, 0x20)]);
-        assert_eq!(race_passes(3, 2, true), vec![p(2, 0x80), p(4, 0x50), p(3, 0x20)]);
-        // the driver view: the cabin of LOD 2, the steering wheel, the hands at CARDETAIL > 0
+        assert_eq!(race_passes(2, 2, false), vec![p(2, 0x80), p(3, 0x50), p(1, 0x20)]);
+        assert_eq!(race_passes(3, 0, false), vec![p(3, 0x80), p(4, 0x50), p(2, 0x20)]);
+        assert_eq!(race_passes(5, 1, false), vec![p(6, 0x50), p(3, 0x20)]);
+        assert_eq!(race_passes(3, 2, true), vec![p(3, 0x80), p(4, 0x50), p(1, 0x20)]);
+        // the finer tiers draw a lower LOD for the same class: effective class 2 at tier 3, 1 at tier 4
+        assert_eq!(race_passes(3, 3, false), vec![p(2, 0x80), p(3, 0x50), p(2, 0x20)]);
+        assert_eq!(race_passes(3, 4, false), vec![p(1, 0x80), p(2, 0x50), p(2, 0x20)]);
+        // the driver view: the cabin pass from LOD 2 (tiers 0 … 2) with the flag at class 2 and up,
+        // the steering wheel, the hands from tier 2 up
         let f = |lod, mask| CarPass { lod, mask, flag: true };
-        assert_eq!(in_car_passes(0, false), vec![f(2, 0x10), f(1, 0x40)]);
-        assert_eq!(in_car_passes(2, false), vec![f(2, 0x10), f(1, 0x40), f(1, 0x80)]);
-        assert_eq!(in_car_passes(2, true), vec![f(2, 0x10), f(1, 0x40)]);
+        let c = |lod, flag| CarPass { lod, mask: 0x10, flag };
+        assert_eq!(in_car_passes(0, 0, false), vec![c(2, false), f(1, 0x40)]);
+        assert_eq!(in_car_passes(0, 1, false), vec![c(2, false), f(1, 0x40)]);
+        assert_eq!(in_car_passes(3, 2, false), vec![c(2, true), f(1, 0x40), f(2, 0x80)]);
+        assert_eq!(in_car_passes(3, 2, true), vec![c(2, true), f(1, 0x40)]);
+        assert_eq!(in_car_passes(1, 4, false), vec![c(1, false), f(1, 0x40), f(1, 0x80)]);
+    }
+
+    /// `nfs5.dll`'s virtual 2-D screen (dll 0x10003840): (640, 480) at 4:3, (480 · r, 480) above,
+    /// (640, 640 / r) below.
+    #[test]
+    fn virtual_screen_follows_the_aspect() {
+        assert_eq!(virtual_screen(640.0, 480.0), (640.0, 480.0));
+        assert_eq!(virtual_screen(1024.0, 768.0), (640.0, 480.0));
+        let (w, h) = virtual_screen(1280.0, 800.0);
+        assert!((w - 768.0).abs() < 1e-3 && h == 480.0);
+        let (w, h) = virtual_screen(1280.0, 1024.0);
+        assert!(w == 640.0 && (h - 512.0).abs() < 1e-3);
+    }
+
+    /// `nfs5.dll`'s virtual 2-D width (dll 0x10003840): 640 up to 4:3, `480 · w / h` above.
+    #[test]
+    fn virtual_width_follows_the_aspect() {
+        assert_eq!(virtual_width(640.0, 480.0), 640.0);
+        assert_eq!(virtual_width(1024.0, 768.0), 640.0);
+        assert_eq!(virtual_width(800.0, 800.0), 640.0);
+        assert!((virtual_width(1280.0, 800.0) - 768.0).abs() < 1e-3);
+        assert!((virtual_width(1920.0, 1080.0) - 853.3333).abs() < 1e-2);
     }
 
     /// 0x43C8AC…0x43C8E9: the LOD, `Base+78 & mask & 0xF0`, and the two flag bytes — the hands
@@ -3500,5 +3553,20 @@ mod anim_article_tests {
         let m = anim_matrix(&t, 0.05, 0.1, true);
         // lerp: q = (0, 0, 0.35355, 0.85355) → x row length < 1 (the slerp's would be 1)
         assert!(m.x_axis.truncate().length() < 0.99, "{}", m.x_axis.truncate().length());
+    }
+}
+
+#[cfg(test)]
+mod parked_slot_tests {
+    use super::*;
+
+    /// 0x482970: a scene with a GEOM element keeps `min(count, 64)` live slots and no parked ones;
+    /// one without keeps all 64, each a `DFLT` at (0, 9999, 0) (0x482D3A…0x482D87).
+    #[test]
+    fn a_scene_without_geom_elements_parks_64_dflt_slots() {
+        assert!(parked_scene_slots(1).is_empty() && parked_scene_slots(5).is_empty());
+        let p = parked_scene_slots(0);
+        assert_eq!(p.len(), 64);
+        assert!(p.iter().all(|s| s.tag == u32::from_le_bytes(*b"DFLT") && s.transform.w_axis.truncate() == Vec3::new(0.0, 9999.0, 0.0) && s.scale == Vec3::ONE));
     }
 }

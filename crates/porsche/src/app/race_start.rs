@@ -195,6 +195,26 @@ impl App {
         }
     }
 
+    /// The player's car-info record as the launch left it (`.TYPE`, the paint, the installed parts and their wear, the
+    /// seventeen sliders): what [`CarSpecs::apply_parts`] / [`CarSpecs::apply_setup`] were last given for this
+    /// race's car and `Car_raceInit`'s copy of `.PARTDAMAGE` (0x41085F). `None` for a network race (its own
+    /// launch words ride in [`nfs_game::replay::NetSetup`]) and for a car no launch path folded.
+    pub(crate) fn launch_player_record(&self) -> Option<nfs_game::replay::CarRecord> {
+        if self.net.session.is_some() || self.replay_net.is_some() || (self.specs.applied_setup.is_none() && self.specs.applied_part_ids.is_empty()) {
+            return None;
+        }
+        Some(nfs_game::replay::CarRecord {
+            car_id: self.player_car_id.unwrap_or(self.car_id),
+            paint: self.paint,
+            name: self.player_name.clone(),
+            decal: -1,
+            parts: Some(self.specs.applied_part_ids.clone()),
+            part_damage: self.specs.parts.iter().map(|p| p.carried).collect(),
+            setup: self.specs.applied_setup,
+            ..Default::default()
+        })
+    }
+
     /// A career race's setup from its [`career_ui::StartRequest`] — a tournament event, a
     /// finale or a Factory Driver mission — up to the point the race starts: the options 0x4ED5D0
     /// sends (laps, direction, traffic, grid, skill, the opponents), then the track, the car with
@@ -850,6 +870,19 @@ impl App {
                 race_type: Some(self.launch_race_type()),
                 fegame_type: Some(self.race_fegame_type()),
                 camera: Some(self.camera_cycle.iter().take(4).map(|&c| u32::from(c)).collect()),
+                // the car-info records (`Replay_begin` restores slot 0 ... 8): the player's here (its start damage is
+                // filled in where the car is built), the opponents' where the plan is made (`race_stage_grid`)
+                player: self.launch_player_record(),
+                opponent_cars: None,
+                // `SCENENUMBER` 0x1C (`fac+0x24`, 0 outside a skill test), `DERBY` 0x1B, `NOCOLLISION` 0x29
+                scene: Some(self.mission.as_ref().map_or(0, |m| m.mission.scene)),
+                derby: Some(self.cheat_bits & (1 << 7) != 0 || self.net_derby),
+                nocollision: Some(self.net_nocollision),
+                // `.TRANSMISSION` 0x221 (`carinfo+0xC`), the word the car is built with: a playback restores it
+                transmission: Some(self.player_automatic()),
+                opponent_transmission: Some(self.option_automatic()),
+                // the mission's launch words (0x4EC040), the block's copy a playback runs the HUD from
+                mission: self.mission.as_ref().map(|m| nfs_game::replay::mission_words(&m.mission)),
             };
         }
         self.replay.setup.seed = self.traffic_seed;
@@ -955,6 +988,20 @@ impl App {
             .map(|c| Paint::matching(c, self.paint))
             .unwrap_or(self.paint.into());
         let player_paint = self.owned_paint.filter(|p| p.exterior == self.paint).unwrap_or(player_paint);
+        // A launch with no front end (`fe = 0`) never runs 0x4EEDA0, so the car's four colours are
+        // the registry's own `car[0].colorconfig` (`.COLORCONFIG` 0x149 → `carinfo+0x218`, the
+        // registry triple 0x4B2FD7…0x4B3013): exterior, stripe 1, stripe 2, **interior** (`+0x224`),
+        // each `0xAARRGGBB` as a signed decimal, and `.STRIPEPACKAGE` (absent: 0). The shipped
+        // fe.txt's `-65536 ×3, -3757195` is a red paint with the interior 0xC6AB75 — the grey-beige
+        // cabin of the original's own frames (`REFERENCE-2026-10-02-SRVF.md`), not the catalogue's
+        // first set's interior the port took (brown).
+        let player_paint = match self.registry.get("car[0].colorconfig").map(|v| v.split(',').filter_map(|x| x.trim().parse::<i64>().ok()).collect::<Vec<_>>()) {
+            Some(cc) if self.fe0 && cc.len() >= 4 => {
+                let rgb = |c: i64| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+                Paint { exterior: rgb(cc[0]), stripe1: rgb(cc[1]), stripe2: rgb(cc[2]), interior: rgb(cc[3]), package: self.registry.u32("car[0].stripepackage", 0) }
+            }
+            _ => player_paint,
+        };
         let mut text = self.page_text(0, &self.player_name, None);
         // a garage car brings its own race number (the front end's 0x4D1800 from `DecalNum`)
         if let (Some(n), true) = (self.owned_decal, self.owned_paint.is_some_and(|p| p.exterior == self.paint)) {
@@ -976,7 +1023,15 @@ impl App {
         let mut driver_rand = nfs_game::movie_overlay::CRand::new(self.traffic_seed);
         let factory_driver = self.mission.is_some();
         let _player_draw = driver_rand.next();
-        let picture = self.career.as_ref().map_or(nfs_game::save::DEFAULT_PICTURE, |c| c.profile.picture);
+        // A launch with no front end (`fe = 0`) never reaches 0x4EEDA0 either: `carinfo+0x150` keeps
+        // what the registry's `car[0].driver` says, and the shipped fe.txt has no such key, so the
+        // `.data` zero of 0x6581DC stays — `.DRIVER` 0, the arm and hand variants 2 / 1 of slot 19's
+        // `.DRIVER < 8` arm (0x43AF51), which the original's own cockpit frames show (hands on the wheel).
+        let picture = if self.fe0 {
+            self.registry.u32("car[0].driver", 0) as u8
+        } else {
+            self.career.as_ref().map_or(nfs_game::save::DEFAULT_PICTURE, |c| c.profile.picture)
+        };
         self.car.driver = nfs_assets::car::DriverSeat { driver: picture as u32, no_driver: false, factory_driver };
         let car = CarModel::upload_with_env(
             &mut renderer,
@@ -1109,7 +1164,11 @@ impl App {
         // twenty more from `carInfo+0x78 … +0xC4` into each installed part's `+0x164`. The port had
         // the second half — `installed_parts` puts those states into `CarSpecs::parts` — and started
         // every race with an undented body whatever the garage said.
-        if let Some(owned) = self
+        // a playback starts from the recording's own `.DAMAGEZONES` (`Replay_begin` 0x413CF0 restores slot 0's record)
+        let recorded_damage = if self.playback_running() { self.replay.setup.player.as_ref().map(|c| c.damage) } else { None };
+        if let Some(z) = recorded_damage {
+            vehicle.damage = z;
+        } else if let Some(owned) = self
             .career
             .as_ref()
             .and_then(|cu| cu.pending.as_ref().and_then(|p| p.garage_idx).and_then(|i| cu.career.garage.get(i)))
@@ -1117,6 +1176,12 @@ impl App {
         {
             vehicle.damage = owned.damage;
             tracing::info!(damage = ?owned.damage, "body damage carried into the race");
+        }
+        // …and the launch record keeps what the car came in with (`.DAMAGEZONES` 0x14D)
+        if !self.playback_running()
+            && let Some(c) = self.replay.setup.player.as_mut()
+        {
+            c.damage = vehicle.damage;
         }
         // …and then **0x493CF0(car, 1)** (0x41088B): each part of type 1…10 takes back the fold
         // of the zones it came in with — the saved `+0x164` already holds it — so the getters
@@ -1320,6 +1385,11 @@ impl App {
                 if std::mem::take(&mut self.scripted_net_leave) {
                     if !self.leave_race_as(false) {
                         tracing::info!("network race left by a scripted pause press: no front end to return to");
+                    } else if self.fe_sequence_in("NFS_NET_LEAVE_SEQ", event_loop) {
+                        // **TEST GLUE** `NFS_NET_LEAVE_SEQ=<dir>`: the lobby after the return stays up
+                        // and is drawn (`NFS_FE_SEQ_SCRIPT` tokens, e.g. `wait:` to tick the room);
+                        // the sequence ends the run
+                        return;
                     }
                     event_loop.exit();
                     return;
@@ -1383,7 +1453,9 @@ impl App {
                 let phase = t as f32 / ticks as f32;
                 if t % 2 == 0 {
                     self.input.press(Action::Throttle);
-                    if !self.follow_road && phase > 0.66 {
+                    // **TEST GLUE** (not in the original): `NFS_NO_STEER=1` keeps the scripted run's
+                    // last third straight, for a still of the wheel and the hands at rest
+                    if !self.follow_road && phase > 0.66 && nfs_game::config::cfg().nfs_no_steer.var_os().is_none() {
                         self.input.press(Action::SteerRight);
                     }
                 }

@@ -5,7 +5,7 @@ use super::*;
 impl LayoutScreen {
     /// The black bars that keep the 4:3 design area square in a wider window. The 2D screen is
     /// letterboxed by [`place`], but a 3D room behind it fills the whole window, so the bars have to
-    /// be drawn over it. APPROXIMATION — the original's front end is always 4:3.
+    /// be drawn over it. PORT-DEVIATION D14 (PORT-DEVIATIONS.md) [the original draws into its own D3D mode, 0x44E720] — the original's front end is always 4:3.
     pub fn letterbox_bars(&self, aspect: f32) -> Vec<Sprite> {
         let design = DESIGN.0 / DESIGN.1;
         if aspect <= design + 1e-3 {

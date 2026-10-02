@@ -209,23 +209,22 @@ fn vs_main(in: VsIn, @builtin(instance_index) inst: u32) -> VsOut {
     out.obj = inst;
     let world = object.model * vec4<f32>(in.position, 1.0);
     out.clip = globals.view_proj * world;
-    // Thrash state 0x18, the depth bias (`lit_dir.w`, a pull in view depth): `dx7z.dll` adds it to
-    // the screen z alone, so the vertex slides toward the eye along its own ray and stays where it
-    // is on screen (`RE/notes/thrash.md` §6d.3). The driver adds the bias to the screen z as it
-    // is, so a pull past the near plane leaves the original's vertex at z ≤ 0 — in front of
-    // everything (the lamp glare's `−20000 · b · K / d²` within some 8 m); here it stops just
-    // inside the plane (`globals.ambient.y`), where it is not clipped and still passes any depth
-    // A positive `b` (some car materials' 1, 3, 5) pushes the vertex away the same way.
-    let pull = object.lit_dir.w;
-    if pull != 0.0 {
-        let depth = -(globals.view * world).z;
-        if depth > 0.0 {
-            let pulled = max(depth - pull, globals.ambient.y * 1.001);
-            if pulled != depth {
-                let eye = globals.cam_pos.xyz;
-                out.clip = globals.view_proj * vec4<f32>(eye + (world.xyz - eye) * (pulled / depth), 1.0);
-            }
-        }
+    // Thrash state 0x18, the depth bias (`lit_dir.w`, an offset of the screen z): with the DX7
+    // driver the game keeps it itself (0x540500 / 0x5404A0 store `b · 2^-15` at `ctx+0x1180C` once
+    // 0x5492DC has seen "DX7" in `THRASH_about`) and adds it to the screen z of its own
+    // pre-transformed vertex, `sz = (Z · far/(far − near) − near·far/(far − near)) · (1/Z) + bias`
+    // (0x540CE0, 0x541B0B…0x541B45; `RE/notes/thrash.md` §6d.3) — the Direct3D depth that this
+    // pass's projection makes too, so the offset is `bias · w` on the clip z: the vertex keeps its
+    // place on screen and its `w`, and the depth buffer compares exactly `sz + bias`. A vertex the
+    // original clips (outside near…far, tested on the unbiased Z by 0x5B0660) is left to the
+    // clipper here as well.
+    // APPROXIMATION: the original hands the device `sz + bias` unclamped; what Direct3D does with
+    // a screen z outside [0, 1] is not read — here it is held at the near / far plane, so the
+    // vertex is neither clipped nor wrapped (a negative bias at the near end leaves it in front of
+    // everything, as the earlier pull did).
+    let dz = object.lit_dir.w;
+    if dz != 0.0 && out.clip.w > 0.0 && out.clip.z >= 0.0 && out.clip.z <= out.clip.w {
+        out.clip.z = clamp(out.clip.z + dz * out.clip.w, 0.0, out.clip.w);
     }
     out.normal = normalize((object.model * vec4<f32>(in.normal, 0.0)).xyz);
     // env_mix.zw carries a per-object uv offset (the sky layers scroll with it)

@@ -371,7 +371,8 @@ impl Vehicle {
             self.boost = (self.boost - 0.1).max(0.0);
             return -a_drag;
         }
-        if self.automatic {
+        // 0x49E87E…0x49E88D: `carinfo+0xC == 1` **or** an AI-driven car (`car+0xDA8 != 0`) runs AutoShift
+        if self.automatic || self.ai_driven {
             self.auto_shift(specs);
         }
         let gear = self.gear;

@@ -25,7 +25,7 @@
 //! is the device-wide `DIPROP_FFGAIN` (0x5333A0, clamped to 0…100, ×100) and a gate (a jolt and the
 //! driver both return when it is 0). **The binding of the accessors to these globals is the
 //! one link not read** (no static writer of `0x657BC8…0x657C68` exists; they sit in the
-//! option-global block next to `[0x657C84]` LANGUAGE) — MEDIUM, by order and by role.
+//! option-global block next to `[0x657C84]` LANGUAGE) — CONFIRMED 2026-10-02: the static key table at 0x4B1A04 pairs each global with its key name (`FFTOTALVOLUME0` ↔ 0x657BC8 …), and the registry block base 0x6573E8 + the slot offsets of replay.md reproduce all five.
 
 use glam::Vec3;
 

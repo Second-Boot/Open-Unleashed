@@ -130,6 +130,8 @@ fn the_default_car_setup_changes_nothing() {
     let Some(base) = specs_993() else { return };
     let mut tuned = base.clone();
     tuned.apply_setup(&SETUP_DEFAULT, true);
+    // (the block is compared: the call's remembered input is replay bookkeeping, not part of the car)
+    tuned.applied_setup = None;
     assert_eq!(base, tuned);
 }
 

@@ -3,9 +3,13 @@
 //! mirror's pass never runs it, 0x468B7B…0x468B87) after the world and the cars are drawn.
 //!
 //! **Gate** (0x460471…0x4604BE): the sun object is on (`+0x140`, [`SkyBin::sun_active`]), its
-//! state `+0x144` is 1 (0 = the reference not taken yet, 2 = off for good), the sun is on the
-//! screen (`+0x18D`, the sky pass's projection, `sun_point`), `LENSFLARE` `[0x657D7C]` is set, and
-//! the sky's `+0xDD8` ([`SkyBin::sun_readback`]) is not 0.
+//! state `+0x144` is 1 (0 = the reference not taken yet; 2 = off for good, which the shipped game
+//! never reaches, below), `LENSFLARE` `[0x657D7C]` is set, and the sky's `+0xDD8`
+//! ([`SkyBin::sun_readback`]) is not 0. **The file's fifth test, the sun on the screen (`+0x18D`,
+//! the sky pass's projection), is gone in the shipped game:** `nfs5.dll` writes six NOPs over the
+//! `je` at 0x46049A (dll 0x10002606…, `RE/notes/nfs5-dll.md` §2.4), so the test and the draw run
+//! with the sun's point wherever 0x539700 left it, off the window or behind the eye
+//! (`sun_point_any`).
 //!
 //! **Who sets `[0x657D7C]`.** Nothing writes it by address but the whole-block snapshot copy
 //! 0x413CF0. `Graphics.LensFlare` is an FE accessor with record id 0x4C = `LENSFLARE` (0x4E5921,
@@ -20,8 +24,8 @@
 //! front-end frame and after a profile load, which only touch the accessor objects). A race with
 //! no front end (`fe = 0`) has no dump and `[0x657D7C]` = 0.
 //!
-//! **The test** (0x4604C4…0x46063F). Every 200 ms of `GetTickCount` (`+0x194`, set at the object's
-//! creation) the 4 × 4 block of the frame at `(round(+0x12C) − 2, round(+0x130) − 2)` is read
+//! **The test** (0x4604C4…0x46063F). **Every frame** — the file's 200 ms throttle (`GetTickCount`,
+//! `+0x194` + 0xC8, the `jge` at 0x4604D9) is six NOPs under `nfs5.dll` — the 4 × 4 block of the frame at `(round(+0x12C) − 2, round(+0x130) − 2)` is read
 //! (`THRASH_readrect`, 0x460525; on `dx7z.dll` 0x60003990 a lock of the back buffer and a row copy)
 //! and compared texel by texel with the block stored at `+0x148`; each equal texel adds 1.0 to
 //! `+0x190`; more than 0.1 sets the visible byte `+0x18C` (which nothing else reads). **The stored
@@ -31,10 +35,11 @@
 //! Thrash state 0x1C3, 0x44EB98) set; it stores the block, sets `+0x144` = 1 and the pixel size
 //! (`+0x188` = 2, or 4 when `+0x184`), else `+0x144` = 2 for good. So "equal to the stored block"
 //! means *nothing was drawn over the sun's pixels after the sky pass* — the sun is not hidden by
-//! the mountains, a car or the weather. **The cost cut-off** (0x460533…0x4605D0): `+0x198` counts
-//! the reads, `+0x19C` adds their milliseconds; past 10 reads and under 300, an average above
-//! 5 ms (`[0x5B241C]` = 10.0, `[0x5B2524]` = 300.0, `[0x5B2400]` = 5.0) sets `+0x144` = 2 and
-//! returns; above 300 both restart.
+//! the mountains, a car or the weather. **The cost cut-off** (0x460533…0x4605D0), which counted the
+//! reads in `+0x198` and their milliseconds in `+0x19C` and, past 10 reads under 300 with an average
+//! above 5 ms, set `+0x144` = 2 (off for good), **is switched off by `nfs5.dll`**: it turns the `jne`
+//! at 0x46059E into a `jmp` (dll 0x100035BC), so the state is never set to 2 there. The port's
+//! bookkeeping of it is gone with it.
 //!
 //! **The draw** (0x460646…0x460765), every frame the gate holds, whatever the test said: the 2D
 //! projection (0x467030), then for the thirteen records `bnus`…`nnus` (the dwords at 0x5CF530; the
@@ -46,6 +51,10 @@
 //! (`[0x5B26A4]`), which 0x451710 turns into skipped layers under 0.05 and an alpha byte
 //! `trunc(alpha · scale)` under 1 (`effects.rs` `flare_quads`).
 //!
+//! **The read's rectangle** is clamped by the dll's 0x10003320 (it replaces the `call [0x6bd96c]` at
+//! 0x4603FF / 0x460525): `x` and `y` not below 0, and `x + 4`, `y + 4` below the mode's width / height,
+//! else `W − 5` / `H − 5` (`gpu.rs` `lens_copy`).
+//!
 //! **PORT-DEVIATION D9 (PORT-DEVIATIONS.md) [0x460460, `THRASH_readrect` dx7z 0x60003990]: the frame read-back's latency.** The original's read is a blocking
 //! lock of the back buffer inside the frame; the port copies the block into a staging buffer
 //! (`nfs_renderer::LensProbe`) and gets the pixels a frame or two later (more with the render
@@ -55,8 +64,8 @@
 //! original's 16-bit one (`+0x188` = 2 on a 16-bit mode). The cost cut-off times what collecting
 //! a read costs the CPU, not a blocking stall, so it stays dormant.
 //!
-//! **APPROXIMATION.** `THRASH_readrect` does no clipping; a block that would leave the frame
-//! (the sun within two pixels of an edge) is moved inside it here.
+//! The test is asked again once the last one has come back (or after [`ASK_LAPSES`]), so "every frame"
+//! is every frame the read-back's latency allows.
 
 use crate::*;
 use std::time::{Duration, Instant};
@@ -76,9 +85,6 @@ const ELEMENTS: [u32; 13] = {
 /// the rest of the 56 bytes zero).
 const DEFAULT_POSITIONS: [f32; 14] = [1.0, 0.75, -0.75, 0.5, -0.5, 0.25, -0.25, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
-/// The test's cadence, `+0x194 + 0xC8` (0x4604D1).
-const TEST_EVERY: Duration = Duration::from_millis(200);
-
 /// How long a read-back asked for may take to come back before it is asked for again.
 const ASK_LAPSES: Duration = Duration::from_millis(500);
 
@@ -90,8 +96,6 @@ pub(crate) enum LensMode {
     Waiting,
     /// 1
     Active,
-    /// 2: off for good
-    Off,
 }
 
 /// The sun object's lens-flare fields (0x460780's constructor), per race.
@@ -107,39 +111,23 @@ pub(crate) struct LensState {
     reference_asked: Option<Instant>,
     /// likewise a test
     test_asked: Option<Instant>,
-    /// `+0x194`
-    last_test: Instant,
     /// `+0x190`: how many of the sixteen texels still equal the stored ones
     pub matches: u32,
-    /// `+0x198`, `+0x19C`
-    reads: f32,
-    cost_ms: f32,
     /// `+0xB8`
     positions: [f32; 14],
 }
 
 impl Default for LensState {
     fn default() -> Self {
-        Self { enabled: false, mode: LensMode::Waiting, reference: None, reference_asked: None, test_asked: None, last_test: Instant::now(), matches: 0, reads: 0.0, cost_ms: 0.0, positions: DEFAULT_POSITIONS }
+        Self { enabled: false, mode: LensMode::Waiting, reference: None, reference_asked: None, test_asked: None, matches: 0, positions: DEFAULT_POSITIONS }
     }
 }
 
 impl LensState {
-    /// 0x460533…0x460632 for one finished test read of `cost_ms` milliseconds: the cost
-    /// bookkeeping and its cut-off, then the texel count.
-    pub(crate) fn apply_test(&mut self, cost_ms: u32, pixels: &[u32; 16]) {
+    /// 0x4605D0…0x46062F for one finished test read: the texel count (the cost bookkeeping and its
+    /// cut-off 0x460533…0x4605A0 are not run in the shipped game, `nfs5.dll` 0x46059E).
+    pub(crate) fn apply_test(&mut self, pixels: &[u32; 16]) {
         let Some(reference) = self.reference else { return };
-        self.matches = 0;
-        self.reads += 1.0;
-        self.cost_ms += cost_ms as f32;
-        if self.reads > 10.0 && self.reads < 300.0 && self.cost_ms / self.reads > 5.0 {
-            self.mode = LensMode::Off;
-            return;
-        }
-        if self.reads > 300.0 {
-            self.reads = 0.0;
-            self.cost_ms = 0.0;
-        }
         self.matches = reference.iter().zip(pixels).filter(|(a, b)| a == b).count() as u32;
     }
 
@@ -174,13 +162,12 @@ impl App {
                 if l.mode == LensMode::Waiting {
                     l.reference = Some(read.pixels);
                     l.mode = LensMode::Active;
-                    l.last_test = Instant::now();
                     tracing::debug!(texels = ?read.pixels, "lens flare: the sun's block stored");
                 }
             } else {
                 l.test_asked = None;
                 if l.mode == LensMode::Active {
-                    l.apply_test(read.cost_ms, &read.pixels);
+                    l.apply_test(&read.pixels);
                     tracing::debug!(matches = l.matches, mode = ?l.mode, "lens flare: test");
                 }
             }
@@ -199,16 +186,21 @@ impl App {
         let Some(bin) = self.track.sky_bin.as_ref().filter(|b| b.sun_active()) else { return };
         let readback = bin.sun_readback;
         let Some(r) = self.renderer.as_ref() else { return };
-        let (aspect, (w, h)) = (r.aspect(), r.size());
+        let aspect = r.aspect();
         let cam = self.camera;
-        // `+0x18D`: the sky pass's projection of the sun on the window
-        let pt = self.sun_point(&cam, aspect, SUN_VIEW_MAIN);
-        let Some(pt) = pt else { return };
-        let (x, y) = ((pt.px / 640.0 * w as f32).round_ties_even() as i32 - 2, (pt.py / 480.0 * h as f32).round_ties_even() as i32 - 2);
-        let mut probe = nfs_renderer::LensProbe { x, y, reference: false, test: false };
+        // the sky pass's projection of the sun (0x460306): the lens flare runs on it wherever it fell —
+        // `nfs5.dll` removed the file's `+0x18D` (on the window) gate, 0x46049A
+        let Some(pt) = self.sun_point_any(&cam, aspect, SUN_VIEW_MAIN) else { return };
+        // 0x460290's own on-screen test still gates the stored block: the sun's draw (the reference) happens
+        // only with the sun on the window
+        let sun_on_screen = self.sun_point(&cam, aspect, SUN_VIEW_MAIN).is_some();
+        // the point, not the pixel: the target's size is the renderer's to apply (a still's image is
+        // not the window's surface). *(Until 2026-10-02 the pixel was taken against the window here,
+        // so on a Retina window a still's probe read the wrong place and the test failed.)*
+        let mut probe = nfs_renderer::LensProbe { x: pt.px, y: pt.py, reference: false, test: false };
         let now = Instant::now();
         // 0x460290: the block right after the sun is drawn, once
-        if self.lens.mode == LensMode::Waiting && !self.lens.reference_asked.is_some_and(|t| now.duration_since(t) < ASK_LAPSES) {
+        if self.lens.mode == LensMode::Waiting && sun_on_screen && !self.lens.reference_asked.is_some_and(|t| now.duration_since(t) < ASK_LAPSES) {
             probe.reference = true;
             self.lens.reference_asked = Some(now);
         }
@@ -216,9 +208,8 @@ impl App {
             self.scene.lens_probe = (probe.reference).then_some(probe);
             return;
         }
-        // 0x4604C4…0x4604D9: every 200 ms, `+0x194 + 200 < now`
-        if now.duration_since(self.lens.last_test) > TEST_EVERY && !self.lens.test_asked.is_some_and(|t| now.duration_since(t) < ASK_LAPSES) {
-            self.lens.last_test = now;
+        // 0x4604C4…0x4604D9: every frame (the file's `+0x194 + 200 < now` throttle is NOPed by `nfs5.dll`)
+        if !self.lens.test_asked.is_some_and(|t| now.duration_since(t) < ASK_LAPSES) {
             self.lens.test_asked = Some(now);
             probe.test = true;
         }
@@ -262,36 +253,23 @@ mod tests {
         let mut px = [7u32; 16];
         px[3] = 1;
         px[9] = 2;
-        l.apply_test(0, &px);
+        l.apply_test(&px);
         assert_eq!(l.matches, 14);
         assert!((l.scale() - 0.875).abs() < 1e-6);
-        l.apply_test(0, &[0; 16]);
+        l.apply_test(&[0; 16]);
         assert_eq!(l.matches, 0);
     }
 
-    /// 0x46055B…0x4605A0: past 10 reads and under 300 an average above 5 ms switches it off for good.
+    /// The cost cut-off 0x46055B…0x4605A0 never fires in the shipped game (`nfs5.dll` 0x46059E): however
+    /// slow the reads were, the state stays on.
     #[test]
-    fn slow_reads_switch_it_off() {
+    fn there_is_no_cost_cut_off() {
         let mut l = active([0; 16]);
-        for _ in 0..10 {
-            l.apply_test(6, &[0; 16]);
-            assert_eq!(l.mode, LensMode::Active, "the first ten reads are not judged");
+        for _ in 0..400 {
+            l.apply_test(&[0; 16]);
+            assert_eq!(l.mode, LensMode::Active);
         }
-        l.apply_test(6, &[0; 16]);
-        assert_eq!(l.mode, LensMode::Off);
-        assert_eq!(l.matches, 0);
-    }
-
-    #[test]
-    fn fast_reads_restart_after_three_hundred() {
-        let mut l = active([0; 16]);
-        for _ in 0..300 {
-            l.apply_test(5, &[0; 16]);
-        }
-        assert_eq!(l.mode, LensMode::Active, "an average of exactly 5 ms passes");
-        l.apply_test(5, &[0; 16]);
-        assert_eq!(l.mode, LensMode::Active);
-        assert_eq!((l.reads, l.cost_ms), (0.0, 0.0), "the 301st read restarts the window");
+        assert_eq!(l.matches, 16);
     }
 
     #[test]

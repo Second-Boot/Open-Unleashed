@@ -101,6 +101,7 @@ impl App {
         // `Camera.Current` — the slot `NFS5.CAMERASELECT` highlights (§4.89)
         let cam_cur = self.fe.camera_current;
         let cam_list = self.fe.camera_list;
+        let hud_preview = self.hud_preview_pieces();
         self.fe_room_tick(dt_ms);
         // 0x4D2570 advances **every** layer's screen (+0x80, 0x4D25EB, bottom first), not only
         // the top one: a covered screen still finishes its fade — and the bar and the layers
@@ -121,6 +122,7 @@ impl App {
             l.set_pads(pads, self.fe.pads_sel);
             l.set_camera_current(cam_cur);
             l.set_camera_list(cam_list);
+            l.set_hud_preview(hud_preview.0, hud_preview.1, hud_preview.2);
         }
         // the bottom bar is a screen of its own (0x4D39D3) and its four buttons hover and animate
         // like any other (§4.53), so it needs the clock and the pointer too. Its transition moves

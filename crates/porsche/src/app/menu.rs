@@ -43,6 +43,14 @@ pub(crate) struct Menu {
     /// `Career::car_sel`), `false` after one at or past it (the catalogue, `GenericCar.Car`,
     /// `car_idx` above). *(Until 2026-09-27 the merged selection was always the catalogue's.)*
     pub(crate) car_garage: bool,
+    /// **`zMergedList.Car`'s index is still the initial 0.** The accessor's base ctor 0x4BC1F0
+    /// stores `[this+0x18] = 0` (0x4BC224) and `0x4FC730` (the `SETTYPE*` reset, `reset_track_rows`)
+    /// puts it back to row 0; index 0 is **below list A's count whenever the player owns a car**,
+    /// so 0x4F4DF0 (`cur < n`) says "owned" there and the screens show `гараж...` with the garage
+    /// car, not the catalogue's `цвет` row, until a row is picked (SC 2026-10-01, the
+    /// original's QuickRace opens on the owned `356`; the joiner lobby the same).
+    /// While set, `App::sync_merged_zero` keeps `car_garage` equal to "list A is not empty".
+    pub(crate) merged_at_zero: bool,
     /// `locationsetup.lay`'s table of knockout rounds: one row per opponent, each with its own
     /// track, laps, direction and traffic. `Knockout.TrackNumber`'s accessor (0x4BA760) asks
     /// `Game.NumKOOpponents` for the row count and answers the empty string for a row past it
@@ -241,6 +249,7 @@ impl Menu {
         self.fit_ko();
         self.looped_idx = 0;
         self.car_idx = 0;
+        self.merged_at_zero = true;
         self.paint_idx = self.cars.first().map(|c| default_paint_row(default_colour, &c.paint_sets)).unwrap_or(0);
         self.paint_custom = None;
     }

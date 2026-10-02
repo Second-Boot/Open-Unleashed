@@ -378,7 +378,7 @@ impl Hud {
     /// 0x419F50 and the outline strokes 0x419E90 in 0xFF000000 (`[0x5B28F8]`). The original picks
     /// with the mouse only, and so does this port (`App::hud_click`); the arrow keys and Enter it
     /// also takes on the pause menu and the quit question are its own, and the button they select
-    /// wears the hover look (APPROXIMATION — the original has no keyboard selection there); the
+    /// wears the hover look (PORT-DEVIATION D10 (PORT-DEVIATIONS.md) [0x41B3BA…0x41B3CE, 0x419F50] — the original has no keyboard selection there); the
     /// `+0x103` dressing (0x436130 / 0x435DA0 / 0x435F80) is drawn below.
     /// A two-texel gradient texture stretched over a rectangle, sampled texel centre to texel
     /// centre, top to bottom (`vertical`) or left to right.

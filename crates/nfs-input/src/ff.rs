@@ -4,16 +4,23 @@
 //! gilrs can drive exactly one kind of effect: a **constant strong or weak motor magnitude** with an
 //! envelope and a schedule, on Linux (evdev `FF_RUMBLE`) and Windows (XInput / Windows.Gaming.Input
 //! rumble). On macOS `Gamepad::is_ff_supported()` is `false` and `Device::set_ff_state` is an empty
-//! function (gilrs-core 0.6.8 `platform/macos/ff.rs`), so there the backend finds no device and
-//! does nothing. Its time base is a 50 ms tick (`Ticks`), so no periodic waveform of the
+//! function (gilrs-core 0.6.8 `platform/macos/ff.rs`), so on macOS this backend is **not used**:
+//! `crate::ff_macos` (GameController + CoreHaptics) provides the same `Rumbler` interface, selected
+//! with `cfg(target_os = "macos")`; everything below the `Motor` enum is compiled on the other
+//! platforms only. This backend's time base is a 50 ms tick (`Ticks`), so no periodic waveform of the
 //! original's 6…35 Hz can be shaped, and a DirectInput constant force, spring or condition has no
 //! counterpart at all. The mapping onto this is therefore an **APPROXIMATION** and lives with the
 //! caller (`porsche::app::force_feedback`), which labels each choice; this module only provides the
 //! mechanism: two sustained motor effects whose level is changed through `Effect::set_gain`, and
 //! one-shot pulses.
 
+#[cfg(not(target_os = "macos"))]
 use gilrs::ff::{BaseEffect, BaseEffectType, Effect, EffectBuilder, Repeat, Replay, Ticks};
+#[cfg(not(target_os = "macos"))]
 use gilrs::{GamepadId, Gilrs};
+
+#[cfg(target_os = "macos")]
+pub use crate::ff_macos::Rumbler;
 
 /// A sustained rumble: one effect per motor, played until it is stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +31,7 @@ pub enum Motor {
     Weak,
 }
 
+#[cfg(not(target_os = "macos"))]
 #[derive(Default)]
 struct Sustained {
     effect: Option<Effect>,
@@ -31,6 +39,7 @@ struct Sustained {
 }
 
 /// The rumble state on one pad.
+#[cfg(not(target_os = "macos"))]
 #[derive(Default)]
 pub struct Rumbler {
     pad: Option<GamepadId>,
@@ -38,6 +47,7 @@ pub struct Rumbler {
     weak: Sustained,
 }
 
+#[cfg(not(target_os = "macos"))]
 impl Rumbler {
     /// The first connected pad that reports force-feedback support, if any. `false` on macOS.
     pub fn find_pad(gilrs: &Gilrs) -> Option<GamepadId> {
@@ -130,5 +140,13 @@ impl Rumbler {
     /// Whether a pad that can rumble is connected.
     pub fn supported(&self, gilrs: &Gilrs) -> bool {
         Self::find_pad(gilrs).is_some()
+    }
+
+    /// One line for the log: which backend this is and which pad it drives.
+    pub fn describe(&self, gilrs: &Gilrs) -> String {
+        match Self::find_pad(gilrs).and_then(|id| gilrs.connected_gamepad(id)) {
+            Some(g) => format!("gilrs rumble (strong / weak motor), pad \"{}\"", g.name()),
+            None => "gilrs rumble (strong / weak motor), no pad that supports it".to_string(),
+        }
     }
 }

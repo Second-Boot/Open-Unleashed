@@ -927,7 +927,9 @@ fn indexed_texels(fsh: &Fsh, data: &[u8], idx: usize) -> Option<Vec<u8>> {
 }
 
 /// What 0x444130's palette entry 255 holds when a texel of index 255 reaches the page — see
-/// `palette_path_texels`. APPROXIMATION: a zero dword.
+/// `palette_path_texels`. A zero dword — **measured 2026-10-02 (SRV-B, `RE/notes/REFERENCE-2026-10-02-SRVB.md` §3):** the entry is
+/// deterministic stack content (identical over two runs: 0x9 / 0xA, 0x005CD714, 0x00523ADD by copy) whose
+/// **alpha byte is always 0**, so on the 1555 pages every index-255 texel takes it is transparent, as here.
 const PALETTE_ENTRY_255: [u8; 4] = [0, 0, 0, 0];
 
 /// 0x444130's palette path, texel by texel: the palette is copied to a stack buffer through the
@@ -1175,7 +1177,8 @@ fn page_key(p: &DamagePatch) -> u32 {
 /// 8-bit source takes the other arm, 0x5401D6…0x540240: the palette converted once by 0x5346D0 and scaled with
 /// 0x5402B0 — the same `c · level >> 8` per byte — then 0x540300 → 0x573F2A per pixel: 565 again.)* Every
 /// shipped damage patch lands on a 1555 page (`nfs-assets/examples/dmgscan.rs`: all 2 571 of the `D` / `L` packs).
-/// APPROXIMATION left (no shipped patch reaches it): a **4444** page has depth 16 in 0x5DE890, so the original runs
+/// Not reachable (`examples/dmgbpp.rs`, 2026-10-02: of the 44 shipped cars' 367 pages 64 are 4444, but all 2 571 damage
+/// patches land on 1555 (2 485) or 32-bit (86, the glass pages) ones — none on a 4444 page): a **4444** page has depth 16 in 0x5DE890, so the original runs
 /// the 565 routine on it and writes 565-packed words into a 4444 surface — a state this 8-bit copy cannot hold; the
 /// page takes the old per-channel blend instead.
 ///

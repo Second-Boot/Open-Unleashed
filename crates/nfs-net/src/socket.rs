@@ -20,6 +20,11 @@ pub struct CommSocket {
     drop_percent: u32,
     drop_state: std::cell::Cell<u32>,
     dropped: std::cell::Cell<u32>,
+    /// **TEST GLUE, not in the original.** `NFS_NET_DUMP=<file>` appends every datagram this socket
+    /// sends (`S`) or receives (`R`) as `<seconds> <S|R> <own port> <peer> <hex>` — the port's side of
+    /// a wire comparison against a tcpdump of the original (`network.md` §7.19; no tcpdump without
+    /// root on the Mac).
+    dump: Option<std::cell::RefCell<std::fs::File>>,
 }
 
 impl CommSocket {
@@ -42,7 +47,21 @@ impl CommSocket {
             drop_percent,
             drop_state: std::cell::Cell::new(seed.wrapping_mul(2654435761).max(1)),
             dropped: std::cell::Cell::new(0),
+            dump: std::env::var("NFS_NET_DUMP")
+                .ok()
+                .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok())
+                .map(std::cell::RefCell::new),
         })
+    }
+
+    fn dump_line(&self, dir: char, peer: SocketAddr, bytes: &[u8]) {
+        use std::io::Write;
+        if let Some(f) = &self.dump {
+            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            let port = self.sock.local_addr().map(|a| a.port()).unwrap_or(0);
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let _ = writeln!(f.borrow_mut(), "{t:.6} {dir} {port} {peer} {hex}");
+        }
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -73,6 +92,7 @@ impl CommSocket {
             }
         }
         let d = Datagram::encode(tag, payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        self.dump_line('S', to, &d);
         self.sock.send_to(&d, to)
     }
 
@@ -87,7 +107,10 @@ impl CommSocket {
     pub fn recv(&mut self) -> io::Result<Option<(SocketAddr, Datagram)>> {
         loop {
             match self.sock.recv_from(&mut self.buf) {
-                Ok((n, from)) => match Datagram::decode(&self.buf[..n]) {
+                Ok((n, from)) => match {
+                    self.dump_line('R', from, &self.buf[..n]);
+                    Datagram::decode(&self.buf[..n])
+                } {
                     Ok(d) => return Ok(Some((from, d))),
                     Err(_) => continue, // empty or oversized: not ours
                 },
@@ -319,9 +342,9 @@ mod tests {
 
     #[test]
     fn the_probe_always_includes_the_originals_own_broadcast_first() {
-        let t = probe_targets(1106);
-        assert_eq!(t[0], (ProbeKind::Original, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, 1106))));
-        assert!(t.iter().all(|(_, a)| a.port() == 1106));
+        let t = probe_targets(crate::PORT);
+        assert_eq!(t[0], (ProbeKind::Original, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, crate::PORT))));
+        assert!(t.iter().all(|(_, a)| a.port() == crate::PORT));
     }
 
     fn wait(s: &mut CommSocket) -> (SocketAddr, Datagram) {

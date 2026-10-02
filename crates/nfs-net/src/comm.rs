@@ -216,8 +216,11 @@ pub mod desc {
     pub const NAME_LEN: usize = 32;
 
     /// 0x48DD97…0x48DDF8: `name` + `~` + `version`, cut to the descriptor's 0x20 bytes (the last
-    /// stays a NUL). The name is what 0x509B00 copied (`strncpy` 0x20), so it is cut first.
+    /// stays a NUL). The name is what 0x509B00 copied (`strncpy` 0x20), so it is cut first. **An empty name becomes
+    /// `"Game"`** (0x48DD67 `jne` over 0x48DD69…0x48DD8B, which copies the string at 0x5D07A4) — the original's host that typed
+    /// nothing announces `Game~3.5` (captured).
     pub fn name_field(name: &str, version: &str) -> [u8; NAME_LEN] {
+        let name = if name.is_empty() { "Game" } else { name };
         let mut out = [0u8; NAME_LEN];
         // one byte per character: the game's strings are single-byte text (the port keeps them
         // as chars below U+0100), and the wire carries those bytes
@@ -297,18 +300,101 @@ impl Describe {
 pub struct Join {
     /// `+0x00` — the request number (see [`Header::request`]).
     pub request: u32,
-    /// `+0x04`, the joiner's own transport address.
+    /// `+0x04` — the address the joiner **typed**, i.e. the host's (0x588030's argument 2); the host
+    /// echoes it in its `'a'` and the `'a'` handler copies it to `conn+0x24`.
     pub from: Addr,
-    /// `+0x18`, 16 bytes; the host refuses the join when this equals its own `session+0x3C`.
+    /// `+0x18`, 16 bytes; the host refuses the join when this equals its own `session+0x3C`. The
+    /// original's connect path leaves it zero.
     pub name: [u8; 16],
     /// `+0x28` onwards — the player record 0x589440 copies into the slot. Not decoded, so it
     /// travels as it arrived.
     pub record: Vec<u8>,
 }
 
+/// The application's own GUID, `0x5B4980` (`{5CD46B81-ECE4-11D3-9B6A-00902724AB1E}`), which 0x48AC27
+/// hands the CONMAN constructor. Its text form is the session key (`eagame_key`) and its fields
+/// ride in a `'d'` at `+0x18…+0x27`.
+pub const APP_GUID: [u8; 16] = [0x81, 0x6B, 0xD4, 0x5C, 0xE4, 0xEC, 0xD3, 0x11, 0x9B, 0x6A, 0x00, 0x90, 0x27, 0x24, 0xAB, 0x1E];
+
+/// **0x587F90**: `sprintf(out, "EAGAME:%08x.%04x%04x.%02x%02x%02x%02x.%02x%02x%02x%02x", u32@0, u16@4,
+/// u16@6, b@8, b@9, b@10, b@11, b@12, b@13, b@14, b@15)` (the format string is 0x5C15F8; callers 0x587EE6,
+/// 0x58836A, 0x588466). `'w'` compares the first 0x20 bytes of this text (0x588AD9) and the browse
+/// (0x560620) sends `strlen + 1` bytes of it.
+pub fn eagame_key(g: &[u8; 16]) -> String {
+    format!(
+        "EAGAME:{:08x}.{:04x}{:04x}.{:02x}{:02x}{:02x}{:02x}.{:02x}{:02x}{:02x}{:02x}",
+        u32::from_le_bytes([g[0], g[1], g[2], g[3]]),
+        u16::from_le_bytes([g[4], g[5]]),
+        u16::from_le_bytes([g[6], g[7]]),
+        g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]
+    )
+}
+
+/// What the `'w'` probe carries: the key text and its NUL (`strlen + 1`, 0x560620 / 0x56062C…0x560630).
+pub fn probe_payload(g: &[u8; 16]) -> Vec<u8> {
+    let mut v = eagame_key(g).into_bytes();
+    v.push(0);
+    v
+}
+
+/// The 32 bytes a host compares a probe against (`session+0x0C`, 0x588AD9): the key text cut to 0x20.
+pub fn key32(g: &[u8; 16]) -> [u8; 32] {
+    let mut k = [0u8; 32];
+    for (o, b) in k.iter_mut().zip(eagame_key(g).bytes()) {
+        *o = b;
+    }
+    k
+}
+
+/// What the `'j'` builder 0x588030 puts in the 0x88-byte payload: `+0x00` the request (0x588130),
+/// `+0x04` the **host's** address record (its argument 2, the typed address, also stored at `conn+0x24`),
+/// `+0x18` 16 bytes (its argument 3, a name — null from the connect path, so the bytes are zero), `+0x28`
+/// the session's own 0x5C-byte record (`session+0x38`, 0x17 dwords) and `+0x84` four bytes the builder
+/// never writes. Offsets inside the record (`RE/notes/REFERENCE-2026-10-02-SRVE.md` §2, measured):
+pub mod record {
+    /// `rec+0x00` — the sender's own sockaddr (20 bytes). The host overwrites it with the datagram's
+    /// source address before it keeps the record (0x588E11: 5 dwords from `param_2`).
+    pub const ADDR: usize = 0;
+    /// `rec+0x14` — `"Player"`, a 16-byte field (payload `+0x3C`), the same for every profile.
+    pub const PLAYER: usize = 0x14;
+    /// `rec+0x48` — `<profile>~<version>~<version>`, 20 bytes incl. the NUL (payload `+0x70`); 0x48A700
+    /// reads it as `[[this]+0x48]` with `"%[^~]~%[^~]~%s"`.
+    pub const IDENTITY: usize = 0x48;
+    pub const IDENTITY_LEN: usize = 0x14;
+    /// the 0x17 dwords 0x589440 keeps
+    pub const SIZE: usize = 0x5C;
+    /// the field's text, constant in the capture of both profiles
+    pub const PLAYER_TEXT: &[u8] = b"Player";
+}
+
 impl Join {
     /// Everything before the record.
     pub const HEAD: usize = 0x28;
+    /// `push 0x88` at 0x588107: the payload's length.
+    pub const SIZE: usize = 0x88;
+
+    /// The `'j'` an original joiner sends (0x588030 + 0x588130), field by field. `to` is the host's
+    /// address as typed, `own` the joiner's own socket record, `identity` the `name~version~game` text.
+    /// **APPROXIMATION:** the four bytes at `+0x84` are stack leftovers in the original (`e0 0a 37 00` in
+    /// both captured sessions); a host never reads them (0x589440 copies 0x5C bytes), so they are zero.
+    pub fn original(request: u32, to: Addr, own: Addr, identity: &[u8]) -> Self {
+        let mut rec = vec![0u8; record::SIZE + 4];
+        rec[..20].copy_from_slice(&own.0);
+        rec[record::PLAYER..record::PLAYER + record::PLAYER_TEXT.len()].copy_from_slice(record::PLAYER_TEXT);
+        // the field is 20 bytes with its NUL
+        let t = identity.iter().take_while(|&&c| c != 0).take(record::IDENTITY_LEN - 1);
+        for (o, b) in rec[record::IDENTITY..record::IDENTITY + record::IDENTITY_LEN].iter_mut().zip(t) {
+            *o = *b;
+        }
+        Self { request, from: to, name: [0; 16], record: rec }
+    }
+
+    /// The identity text of a record (`rec+0x48`, up to its NUL).
+    pub fn identity(&self) -> &[u8] {
+        let f = self.record.get(record::IDENTITY..).unwrap_or(&[]);
+        let f = &f[..f.len().min(record::IDENTITY_LEN)];
+        &f[..f.iter().position(|&c| c == 0).unwrap_or(f.len())]
+    }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(Self::HEAD + self.record.len());
@@ -408,7 +494,8 @@ impl JoinReply {
 /// and `+0x84` (the game); the version is then compared with `"3.5"` (0x5D06FC). The game field is
 /// the empty string 0x5E8E50 in every identity the game builds (0x48AA10's callers 0x48E070,
 /// 0x48E296, 0x48E60F); only the lobby's `0xB6` room request compares it with a room's `+0x40`
-/// (0x49151E…0x491569, 0x4915C6…0x491610) — `network.md` §11.28.
+/// (0x49151E…0x491569, 0x4915C6…0x491610) — `network.md` §11.28. **The `'j'` of a real original carries the
+/// version there** (`TEST~3.5~3.5`, `REFERENCE-2026-10-02-SRVE.md`), at `rec+0x48` of the player record.
 pub mod identity {
     /// What a peer sends: `name~version~game`.
     pub fn encode(name: &str, version: &str, game: &str) -> Vec<u8> {
@@ -456,6 +543,8 @@ mod tests {
 
     #[test]
     fn the_session_name_is_name_tilde_version_and_reads_back_the_way_0x48c3d0_scans_it() {
+        // 0x48DD67…0x48DD8B: an empty name becomes "Game" (the original host that typed nothing: `Game~3.5`, captured)
+        assert_eq!(&desc::name_field("", "3.5")[..9], b"Game~3.5\0");
         let f = desc::name_field("DRIVER's race", "3.5");
         assert_eq!(&f[..17], b"DRIVER's race~3.5");
         assert!(f[17..].iter().all(|&c| c == 0));

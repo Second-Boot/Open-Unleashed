@@ -175,6 +175,12 @@ pub struct CarSpecs {
     pub roll_clamp: f32,
     /// a driver-name cheat already folded in (`apply_driver_name`)
     pub driver_cheat: bool,
+    /// The inputs of the last [`Self::apply_parts`] (the `nfs5.prt` ids, in order) and
+    /// [`Self::apply_setup`] (the seventeen sliders): what the original keeps in the car's
+    /// `carinfo` record (`.PARTINDEX`, the sliders) and a replay's block carries back. Port
+    /// bookkeeping — no read of it changes the car.
+    pub applied_part_ids: Vec<i16>,
+    pub applied_setup: Option<[f32; 17]>,
 }
 
 impl CarSpecs {
@@ -246,6 +252,8 @@ impl CarSpecs {
             pitch_clamp: t[17],
             roll_clamp: t[18],
             driver_cheat: false,
+            applied_part_ids: Vec::new(),
+            applied_setup: None,
         };
         // 0x49CB50's tail, which the loader always runs: the three gear tables, the drag term, the
         // yaw lever and 1/grip. `automatic` = `carinfo+0xC != 0`, which the `.sim` does not carry —
@@ -303,6 +311,7 @@ impl CarSpecs {
     /// Not modelled: `specs[0x14C] = 1/redline` (0x49CC1A), which nothing reads back; and an engine
     /// part's `+0xC0`, which holds a redline (5500…7300 in the file) that this arm never consumes.
     pub fn apply_parts(&mut self, parts: &[&nfs_formats::career::Part], family: &str) -> f32 {
+        self.applied_part_ids = parts.iter().map(|p| p.id).collect();
         let peak_before = self.torque.iter().copied().fold(0.0, f32::max);
         let grip_before = self.grip;
         if family == "959" {
@@ -415,6 +424,7 @@ impl CarSpecs {
     /// because this port has no typed driver name to trigger them. They are **not** exclusive with
     /// the manual-gearbox 1.05 — the SILSPD arm falls through into it.
     pub fn apply_setup(&mut self, setup: &[f32; 17], automatic: bool) {
+        self.applied_setup = Some(*setup);
         // 0x49D290
         let pf = (fixed16(setup[0]) * 0.02 + 1.0) * 0.5;
         let pr = (fixed16(setup[1]) * 0.02 + 1.0) * 0.5;

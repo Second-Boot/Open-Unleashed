@@ -52,6 +52,7 @@ pub struct Gamepads {
     /// `XAxis.Min` / `XAxis.Max`, the accessors' own 0…0x80
     x_band: (i32, i32),
     rumbler: crate::ff::Rumbler,
+    rumble_test: Option<RumbleTest>,
 }
 
 /// `Analog`'s reader **0x411B80**: raw axis `v` (0…65535) against the descriptor's `lo`/`hi`
@@ -95,6 +96,68 @@ pub fn stick_steer(x: f32, min: i32, max: i32) -> i32 {
     (analog_read(v, rl, rh) - analog_read(v, ll, lh)) / 4
 }
 
+#[derive(Clone, Copy)]
+enum TestAction {
+    Sustain(crate::ff::Motor, f32),
+    Pulse,
+    Silence,
+}
+
+struct TestStep {
+    index: usize,
+    label: &'static str,
+    action: TestAction,
+}
+
+/// The `NFS_FF_TEST` sequence's clock (see [`Gamepads::rumble_test_tick`]).
+struct RumbleTest {
+    start: std::time::Instant,
+    current: Option<usize>,
+    /// the step just entered this call (log it, fire its pulse)
+    entered: bool,
+}
+
+impl Default for RumbleTest {
+    fn default() -> Self {
+        Self { start: std::time::Instant::now(), current: None, entered: false }
+    }
+}
+
+impl RumbleTest {
+    /// (label, action, seconds)
+    const STEPS: [(&'static str, TestAction, f32); 9] = [
+        ("Strong 0.3", TestAction::Sustain(crate::ff::Motor::Strong, 0.3), 1.0),
+        ("Strong 1.0", TestAction::Sustain(crate::ff::Motor::Strong, 1.0), 1.0),
+        ("Weak 0.3", TestAction::Sustain(crate::ff::Motor::Weak, 0.3), 1.0),
+        ("Weak 1.0", TestAction::Sustain(crate::ff::Motor::Weak, 1.0), 1.0),
+        ("pause", TestAction::Silence, 0.5),
+        ("Strong pulse 1.0 for 300 ms (1 of 3)", TestAction::Pulse, 1.0),
+        ("Strong pulse 1.0 for 300 ms (2 of 3)", TestAction::Pulse, 1.0),
+        ("Strong pulse 1.0 for 300 ms (3 of 3)", TestAction::Pulse, 1.0),
+        ("end of the test", TestAction::Silence, f32::INFINITY),
+    ];
+
+    fn advance(&mut self) -> Option<TestStep> {
+        let t = self.start.elapsed().as_secs_f32();
+        let mut at = 0.0;
+        let mut idx = Self::STEPS.len() - 1;
+        for (i, (_, _, d)) in Self::STEPS.iter().enumerate() {
+            if t < at + d {
+                idx = i;
+                break;
+            }
+            at += d;
+        }
+        if self.current == Some(idx) && idx == Self::STEPS.len() - 1 {
+            return None;
+        }
+        self.entered = self.current != Some(idx);
+        self.current = Some(idx);
+        let (label, action, _) = Self::STEPS[idx];
+        Some(TestStep { index: idx, label, action })
+    }
+}
+
 impl Gamepads {
     pub fn new() -> Self {
         let gilrs = match Gilrs::new() {
@@ -111,7 +174,7 @@ impl Gamepads {
         };
         // `XAxis.Min` / `.Max` default to 0 and 0x80 (0x51E546, 0x51E550) — no dead zone, and
         // full lock at the stick's end
-        Self { gilrs, axes: PadAxes::default(), x_band: (0, 0x80), rumbler: Default::default() }
+        Self { gilrs, axes: PadAxes::default(), x_band: (0, 0x80), rumbler: Default::default(), rumble_test: None }
     }
 
     /// The steering band, `XAxis.Min` and `XAxis.Max` of the accessors' own 0…0x80. The original
@@ -121,7 +184,7 @@ impl Gamepads {
         self.x_band = (x_axis_min.clamp(0, 0x80), x_axis_max.clamp(0, 0x80));
     }
 
-    /// Whether a pad that can rumble is connected — never on macOS (`crate::ff`).
+    /// Whether a pad that can rumble is connected (on macOS through GameController, `crate::ff_macos`).
     pub fn rumble_supported(&self) -> bool {
         self.gilrs.as_ref().is_some_and(|g| self.rumbler.supported(g))
     }
@@ -143,6 +206,39 @@ impl Gamepads {
     /// Stop the sustained motors.
     pub fn rumble_stop_all(&mut self) {
         self.rumbler.stop_all();
+    }
+
+    /// One line for the log: the rumble backend in use and the pad it drives.
+    pub fn rumble_describe(&self) -> String {
+        match self.gilrs.as_ref() {
+            Some(g) => self.rumbler.describe(g),
+            None => "no gamepad support".to_string(),
+        }
+    }
+
+    /// **TEST GLUE** (`NFS_FF_TEST`, not in the original): a by-hand check of the rumble
+    /// backend. Call once per frame; the first call starts a fixed sequence — Strong 0.3 for 1 s,
+    /// Strong 1.0 for 1 s, Weak 0.3 for 1 s, Weak 1.0 for 1 s, then three Strong pulses (1.0, 300 ms,
+    /// 0.5 s apart) — and every step is logged with the backend's description. It runs once.
+    pub fn rumble_test_tick(&mut self) {
+        let test = self.rumble_test.get_or_insert_with(RumbleTest::default);
+        let Some(step) = test.advance() else { return };
+        let log = test.entered;
+        if log {
+            tracing::info!("NFS_FF_TEST step {}: {} — backend: {}", step.index, step.label, self.rumble_describe());
+        }
+        match step.action {
+            TestAction::Sustain(motor, level) => {
+                self.rumble_sustain(motor, level);
+                self.rumble_sustain(if motor == crate::ff::Motor::Strong { crate::ff::Motor::Weak } else { crate::ff::Motor::Strong }, 0.0);
+            }
+            TestAction::Pulse => {
+                if log {
+                    self.rumble_pulse(1.0, 300);
+                }
+            }
+            TestAction::Silence => self.rumble_stop_all(),
+        }
     }
 
     /// Drain gamepad events into the logical input state. Call once per frame.

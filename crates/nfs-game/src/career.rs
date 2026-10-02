@@ -813,6 +813,15 @@ pub struct Career {
     /// again.)*
     #[serde(default)]
     pub prize_taken: Vec<bool>,
+    /// Per `nfs5.fac` record: the last attempt's `+0xEA` time (race time `car+0xCD8`, 64 Hz ticks
+    /// truncated to 16 bits), `+0xEC` average damage (the ten zone floats summed through 0x5A0F98
+    /// and divided by ten) and `+0xEE` smackables hit (`car+0xB60`), stored by 0x51AEF0
+    /// (0x51AF2B…0x51AF3E) and zeroed by 0x51B060. The `Missions` module saves and loads the table
+    /// with them, **no code reads them** (every `+0xEA / +0xEC / +0xEE` word access of the image was
+    /// scanned, 2026-10-02: only 0x51AEF0 / 0x51B060 write them), so they exist for the `.sav`'s
+    /// bytes alone. Empty / short = the shipped table's zeros.
+    #[serde(default)]
+    pub mission_stats: Vec<[i16; 3]>,
     /// **`[0x69C8F0]`** — the `nfs5.fac` record the last mission race filed: 0x51AEF0 (from the
     /// race end 0x4EDF00 at 0x4EE16F) points it at the first record whose `+0xE8` is 0, record 0
     /// when none is (0x51AF09…0x51AF26), and stores the result there. Read only by the promotion
@@ -861,7 +870,7 @@ fn default_year() -> u16 {
 
 impl Default for Career {
     fn default() -> Self {
-        Self { version: SAVE_VERSION, era: Era::Classic, year: 1950, money: STARTING_MONEY, garage: Vec::new(), tournaments: BTreeMap::new(), evolution_complete: false, missions: Vec::new(), prize_taken: Vec::new(), last_mission: None, market: Vec::new(), spares: Vec::new(), seen_evolution_intro: false, seen_factory_welcome: false, seen_first_mission: false, custom_colours: [0; 8] }
+        Self { version: SAVE_VERSION, era: Era::Classic, year: 1950, money: STARTING_MONEY, garage: Vec::new(), tournaments: BTreeMap::new(), evolution_complete: false, missions: Vec::new(), prize_taken: Vec::new(), mission_stats: Vec::new(), last_mission: None, market: Vec::new(), spares: Vec::new(), seen_evolution_intro: false, seen_factory_welcome: false, seen_first_mission: false, custom_colours: [0; 8] }
     }
 }
 
@@ -1964,6 +1973,30 @@ impl Career {
         self.missions[idx] = passed as i16;
         self.last_mission = Some(idx);
         self.promotion_due(tables).map(|m| m.stage)
+    }
+
+    /// **0x51AEF0**'s three stores into the record it filed (0x51AF2B…0x51AF3E): `+0xEA` time,
+    /// `+0xEC` average damage, `+0xEE` smackables. Nothing reads them back (see
+    /// [`Self::mission_stats`]); they ride in the `.sav`'s `Missions` image.
+    pub fn set_mission_stats(&mut self, tables: &CareerTables, idx: usize, stats: [i16; 3]) {
+        if self.mission_stats.len() < tables.missions.len() {
+            self.mission_stats.resize(tables.missions.len(), [0; 3]);
+        }
+        if let Some(s) = self.mission_stats.get_mut(idx) {
+            *s = stats;
+        }
+    }
+
+    /// The race-end values 0x4EE12A…0x4EE16F hand 0x51AEF0 as `(+0xEA, +0xEC, +0xEE)`: the time's low
+    /// 16 bits, the damage zones accumulated one by one through the float-to-int conversion 0x5A0F98
+    /// (`acc = ftol(acc + zone)`, truncating) and divided by ten with the signed `imul 0x66666667`
+    /// quotient (truncating toward zero), and the smackable count's low 16 bits.
+    pub fn mission_stats_of(time_ticks: u64, zones: &[f32; 10], smackables: usize) -> [i16; 3] {
+        let mut acc: i32 = 0;
+        for z in zones {
+            acc = (acc as f32 + z) as i32;
+        }
+        [time_ticks as u16 as i16, (acc / 10) as i16, smackables as u16 as i16]
     }
 
     /// **0x51AF90** — the promotion test the front end's way back from a type-9 race makes

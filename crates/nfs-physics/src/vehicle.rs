@@ -831,7 +831,9 @@ impl Vehicle {
         let comb = lat_a.max(lon_w) + 0.25 * lat_a.min(lon_w);
         let spin = (w.longitudinal.abs() > limit && throttle_byte > 0x80) || (!front && rear_spin);
         let k = if !front && spin { 4.0 } else { k_class };
-        // 0x4A1F25 tests `comb > LIM` alone. APPROXIMATION: `comb > 0` is the port's own guard.
+        // 0x4A1F25 tests `comb > LIM` alone; `comb > 0` is the port's own guard, for a case **never observed**
+        // (2026-10-02 SRV-B, `RE/notes/REFERENCE-2026-10-02-SRVB.md` §5: 4 races, ≥ 350 000 tyre evaluations, a roll onto the roof —
+        // `comb == 0` and `LIM < 0` never once; min LIM 0.21, min comb 0.33). Kept as a NaN guard.
         // With a limit driven below zero (`LoadTransfer` has no floor) and no force at all
         // (`comb` exactly 0: needs `d = 0` and a front `v == 0.0` or `u == 0.0`), the original
         // divides by 0 here (0x4A1F95 / 0x4A2007) and gets ±inf / NaN in both arms — `lateral` and

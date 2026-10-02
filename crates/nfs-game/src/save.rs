@@ -435,6 +435,8 @@ fn tournaments_from_table(tables: &CareerTables, table: &[u8]) -> std::collectio
 const FAC_PROMOTION: usize = 0x0C;
 /// `fac+0xE8`, the result of the record's last attempt (0x51AF45).
 const FAC_RESULT: usize = 0xE8;
+/// `fac+0xEA / +0xEC / +0xEE`, the last attempt's time, average damage and smackables (0x51AF2B).
+const FAC_STATS: usize = 0xEA;
 
 /// The `nfs5.fac` image with the per-mission result marker at `fac+0xE8` and the taken-promotion
 /// mark `fac+0xC = −1` (0x51AF80, [`Career::prize_taken`]) patched in.
@@ -444,6 +446,14 @@ fn mission_table(tables: &CareerTables, c: &Career) -> Vec<u8> {
         let at = i * MISSION_RECORD_SIZE + FAC_RESULT;
         if at + 2 <= f.len() {
             put_i16(&mut f, at, *r);
+        }
+    }
+    for (i, st) in c.mission_stats.iter().enumerate() {
+        for (k, v) in st.iter().enumerate() {
+            let at = i * MISSION_RECORD_SIZE + FAC_STATS + 2 * k;
+            if at + 2 <= f.len() {
+                put_i16(&mut f, at, *v);
+            }
         }
     }
     for (i, _) in c.prize_taken.iter().enumerate().filter(|(_, t)| **t) {
@@ -979,6 +989,8 @@ pub fn career_from_sav(s: &SaveFile, tables: &CareerTables) -> Career {
         let n = m.len() / MISSION_RECORD_SIZE;
         c.missions = (0..n).map(|i| get_i16(m, i * MISSION_RECORD_SIZE + FAC_RESULT)).collect();
         c.prize_taken = (0..n).map(|i| get_u32(m, i * MISSION_RECORD_SIZE + FAC_PROMOTION) == u32::MAX).collect();
+        // …and the last attempt's three words (0x51AF2B…0x51AF3E), kept so a re-save writes the bytes back
+        c.mission_stats = (0..n).map(|i| std::array::from_fn(|k| get_i16(m, i * MISSION_RECORD_SIZE + FAC_STATS + 2 * k))).collect();
     }
     c
 }

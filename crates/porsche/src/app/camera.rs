@@ -23,7 +23,13 @@ impl App {
     /// `testdrive` must equal `[0x6573E8] == 9` — `Game.GameType` 9 is a Factory Driver mission —
     /// and elsewhere `testdrive = 1` rules it out. `Some(mission)` on `skidpad`, `None` elsewhere.
     pub(crate) fn skidpad_rule(&self) -> Option<bool> {
-        self.track.name.eq_ignore_ascii_case("skidpad").then_some(self.mission.is_some())
+        // `[0x6573E8]` is the block's `FEGAME_TYPE`: a playback's is the recording's (`Replay_begin` 0x413CF0),
+        // a live race's the launch's — the port's mission standing for type 9
+        let factory_mission = match self.replay.setup.fegame_type.filter(|_| self.playback_running()) {
+            Some(t) => t == 9,
+            None => self.mission.is_some(),
+        };
+        self.track.name.eq_ignore_ascii_case("skidpad").then_some(factory_mission)
     }
 
     /// The view the camera is on, by the original's ids (`nfs_game::camera`).

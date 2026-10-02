@@ -16,6 +16,15 @@ impl App {
         match k {
             "b" => self.fe_key_code(0x62, event_loop),
             "esc" => self.fe_key_code(0x1B, event_loop),
+            // **TEST GLUE** `save` — `SaveInfo` as the launch runs it (0x4D52EA): the live settings into
+            // the profile's `.sav`, so a scripted sequence of real clicks can be checked against a
+            // restart (OPTS) without starting a race in the same process
+            "save" => {
+                self.sync_save_side_state();
+                if let Some(c) = self.career.as_mut() {
+                    c.save();
+                }
+            }
             // `playgame` — the bottom bar's `ID_PLAYGAMEBUTTON` released (`fe_bottom_click`'s
             // `PLAYGAME` arm): the only `PLAYGAME` button the shipped layouts carry
             // (`bottombar.lay`), shown by the top screen's `canplaygame`
@@ -176,7 +185,14 @@ impl App {
 
     /// `NFS_FE_SEQ`: run the scripted sequence and write its frames. `true` when it ran.
     pub(crate) fn fe_sequence(&mut self, event_loop: &ActiveEventLoop) -> bool {
-        let Ok(dir) = std::env::var("NFS_FE_SEQ") else { return false };
+        self.fe_sequence_in("NFS_FE_SEQ", event_loop)
+    }
+
+    /// [`Self::fe_sequence`] with the output directory read from `var`: `NFS_NET_LEAVE_SEQ` (**TEST
+    /// GLUE**) runs the same script in the front end a scripted network race has just left, so the
+    /// lobby after the return can be watched and drawn while the room's session lives on.
+    pub(crate) fn fe_sequence_in(&mut self, var: &str, event_loop: &ActiveEventLoop) -> bool {
+        let Ok(dir) = std::env::var(var) else { return false };
         let frames: usize = std::env::var("NFS_FE_SEQ_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
         let script = std::env::var("NFS_FE_SEQ_SCRIPT").unwrap_or_default();
         let events: Vec<(usize, String)> = script

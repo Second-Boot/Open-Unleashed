@@ -714,7 +714,10 @@ impl App {
             let Some((opts, circuit)) = self.net_track_options() else { return };
             let positional = self.net.session.as_ref().is_some_and(|n| n.positional);
             let Some(n) = self.net.session.as_mut() else { return };
-            for (id, v) in [opts[0], opts[1], opts[3]] {
+            // the create screen's order in the original's capture: COMMSPOSITIONAL 0x14, then 0xD, 0xF, 0xC — the order the
+            // host's own message list holds and a newcomer is replayed (0x48A390)
+            n.sync_option(0x14, u32::from(positional));
+            for (id, v) in [opts[1], opts[3], opts[0]] {
                 n.sync_option(id, v);
             }
             // 0x509B00: laps' row only on a circuit, the direction's slot 27 (`0x5B963C[row]`), the

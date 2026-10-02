@@ -147,6 +147,11 @@ fn append_primitive(mesh: &mut MeshData, p: &Primitive, corner_at: &[usize]) {
             let normal = p.normals.get(vi).copied().unwrap_or(face_n.to_array());
             let uv = p.uvs.get(ui).copied().unwrap_or([0.0, 0.0]);
             let c = p.colors.get(corner_at[k]).copied().unwrap_or(0xFFFF_FFFF).to_le_bytes();
+            // the `df` word is a D3D `0xAARRGGBB` (file bytes B, G, R, A): channel 0 is the third byte. Read the
+            // other way round (RGBA, until 2026-10-02) the baked road light came out warm where the original's
+            // is cool: the alps road and the 993's cabin against the server's frames (`REFERENCE-2026-10-02-SRVF.md`,
+            // COCKPIT2), the cabin 62/53/56 against 62/53/53. The car light's `g` (0x4746A0) takes the same colours.
+            let c = [c[2], c[1], c[0], c[3]];
             let base = mesh.vertices.len() as u32;
             mesh.vertices.push(Vertex {
                 position: p.positions[vi],

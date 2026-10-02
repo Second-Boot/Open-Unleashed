@@ -602,6 +602,12 @@ impl App {
             "PrizeCars.Car" if let Some(car) = self.prize_car() => {
                 if modifier == "SHORT" { car.family.to_string() } else { car.display_name.to_string() }
             }
+            // the merged index in list A (0x4F4DF0 true): the slot-12 text of the garage car, the
+            // same record `OwnedCars.Car` answers (`logo_car`'s garage arm)
+            "zMergedList.Car" if menu.is_some_and(|m| m.car_garage) && matches!(modifier, "" | "SHORT") => {
+                let car = self.logo_car(Some("zMergedList.Car"), None)?;
+                if modifier == "SHORT" { car.family.to_string() } else { car.display_name.to_string() }
+            }
             "zMergedList.Car" | "PrizeCars.Car" => match menu {
                 _ if !matches!(modifier, "" | "SHORT") => return None,
                 // `(SHORT)` asks for the short form, which for a car is its family name

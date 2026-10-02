@@ -110,6 +110,13 @@ impl App {
             .filter(|(n, ..)| *n != "OwnedCar.PackageNum")
             .filter_map(|(n, ..)| self.choice_index(n).map(|(i, _)| (n.to_string(), i as u32)))
             .collect();
+        // `Camera.1 … Camera.4` and `Camera.Current` (`FEPositionableAccessor`, 0x4BC460): the car's
+        // camera list and the slot the Options screen has selected — `savegame.md` §9 had them
+        // "deliberately not ported" until the list took effect in a race (§4.89a)
+        for (i, v) in self.fe.camera_list.iter().enumerate() {
+            out.push((format!("Camera.{}", i + 1), *v as u32));
+        }
+        out.push(("Camera.Current".into(), self.fe.camera_current as u32));
         out.extend(RANGE_ACCESSORS.iter().filter_map(|(n, ..)| self.range_value(n).map(|(v, lo, _)| (n.to_string(), (v - lo) as u32))));
         // the knockout table `Track1..7.*` (0x4F9790), each its list index: `Laps` 0…7 (the count
         // less one, 0x4FC1BC), `Direction` 0…3, `Traffic` 0…3 — `Track1.Laps` / `.Traffic` are
@@ -164,6 +171,14 @@ impl App {
                 } else {
                     self.choices.insert(Self::choice_slot(name, key).to_string(), v);
                 }
+            } else if let Some(slot) = name.strip_prefix("Camera.").and_then(|n| n.parse::<usize>().ok()).filter(|n| (1..=4).contains(n)) {
+                // `Camera.1 … Camera.4` (`FEPositionableAccessor`, Save / Load 0x4BC460 / 0x4BC480): the
+                // car's camera list as the Options screen left it (`controls.md` §4.89a). The original
+                // loads the plain dword through `SetSelection`; nothing clamps a positionable accessor.
+                self.fe.camera_list[slot - 1] = *d as i32;
+            } else if name == "Camera.Current" {
+                // the slot `NFS5.CAMERASELECT` last chose; the port indexes its four slots with it
+                self.fe.camera_current = (*d as usize).min(3);
             } else if let Some((_, key, _, lo, hi)) = RANGE_ACCESSORS.iter().find(|(n, ..)| *n == name) {
                 let v = clamp_index(*d, (hi - lo + 1) as u32) as i32 + lo;
                 let a = &mut self.snd.audio_settings;

@@ -224,6 +224,33 @@ impl App {
                 .unwrap_or_default();
                 // (catalogue entry, paint, name, bend-speed factor, grid slot, `.RACENUMBER` decal)
                 // per grid slot — the decal is 0x4F4FA0's (`car-model.md` §5.3, `CareerOpponent::decal`)
+                // **A playback's opponents** (`Replay_begin` 0x413CF0 copies the recorded block, the car-info records
+                // of slots 1...8 with it): the recorded plan and parts, each car resolved by its `.TYPE`; a record
+                // that does not resolve (another install) sends the whole race back to the draw
+                let replaying = self.playback_running();
+                let rec_resolved: Option<Vec<(nfs_formats::fedata::CarCatalogEntry, &nfs_game::replay::CarRecord)>> =
+                    if replaying && self.replay_net.is_none() {
+                        self.replay.setup.opponent_cars.as_ref().filter(|l| l.len() == self.num_opponents as usize).and_then(|l| {
+                            l.iter().map(|r| catalog.iter().find(|c| c.id == r.car_id).map(|c| (c.clone(), r))).collect()
+                        })
+                    } else {
+                        None
+                    };
+                if replaying && rec_resolved.is_none() && self.replay_net.is_none() && self.num_opponents > 0 {
+                    tracing::info!("replay: no opponent records in the setup, the opponents are drawn again (APPROXIMATION)");
+                }
+                let rec_plan: Option<Vec<(
+                    nfs_formats::fedata::CarCatalogEntry,
+                    [u8; 3],
+                    String,
+                    Option<(f32, [[f32; 2]; 4])>,
+                    Option<u32>,
+                    i32,
+                )>> = rec_resolved.as_ref().map(|l| l.iter().map(|(e, r)| (e.clone(), r.paint, r.name.clone(), r.skill.map(|k| (r.difficulty, k)), r.grid, r.decal)).collect());
+                let rec_parts: Option<Vec<Vec<nfs_formats::career::Part>>> = rec_resolved.as_ref().map(|l| {
+                    l.iter().map(|(_, r)| r.parts.as_ref().map(|ids| ids.iter().filter_map(|id| parts_table.iter().find(|p| p.id == *id).cloned()).collect()).unwrap_or_default()).collect()
+                });
+                let mut plan_pers: Vec<i16> = self.career_opponents.as_ref().map(|l| l.iter().map(|o| o.personality).collect()).unwrap_or_default();
                 let plan: Vec<(
                     nfs_formats::fedata::CarCatalogEntry,
                     [u8; 3],
@@ -231,8 +258,11 @@ impl App {
                     Option<(f32, [[f32; 2]; 4])>,
                     Option<u32>,
                     i32,
-                )> = match &self.career_opponents {
-                    Some(list) => list
+                )> = match (&rec_plan, &self.career_opponents) {
+                    // a playback of a recording that carries the opponents' records: the cars the race ran
+                    // with (`Replay_begin` 0x413CF0 restores the nine car-info records), no new draw
+                    (Some(p), _) => p.clone(),
+                    (None, Some(list)) => list
                         .iter()
                         .map(|o| {
                             (
@@ -248,7 +278,7 @@ impl App {
                     // quick race: `FEOpponentCarAccessor` 0x4F4FA0 (`modes.md` §1.1a). The candidate
                     // list is every racing-car record with a model on disk (0x4F3E40), the choice is
                     // the menu's `OpponentCar.Car`, and each opponent draws its own paint set.
-                    None => {
+                    (None, None) => {
                         let selected = self
                             .player_car_id
                             .and_then(|id| catalog.iter().position(|c| c.id == id))
@@ -268,6 +298,7 @@ impl App {
                         if let Some(c) = self.career.as_mut() {
                             c.side.personalities = Some(drawn.iter().map(|p| *p as u16).collect());
                         }
+                        plan_pers = list.iter().map(|o| o.personality).collect();
                         list.into_iter()
                             .map(|o| (o.car, o.paint, o.name, (o.personality != 0).then_some((o.difficulty, o.skill)), None, o.decal))
                             .collect()
@@ -337,9 +368,32 @@ impl App {
                         seat_recs[k] = Some(rec.clone());
                     }
                 }
+                // the opponents' car-info records, kept in the setup for a playback (`Replay_begin` restores them)
+                if !replaying && self.net.session.is_none() && self.replay_net.is_none() && self.replay.setup.net.is_none() {
+                    self.replay.setup.opponent_cars = Some(
+                        plan.iter()
+                            .enumerate()
+                            .map(|(g, (entry, paint, name, skill, grid, decal))| nfs_game::replay::CarRecord {
+                                car_id: entry.id,
+                                paint: *paint,
+                                name: name.clone(),
+                                grid: *grid,
+                                decal: *decal,
+                                personality: plan_pers.get(g).copied().unwrap_or(0),
+                                difficulty: skill.map_or(0.0, |k| k.0),
+                                skill: skill.map(|k| k.1),
+                                parts: self.career_opponents.as_ref().and_then(|l| l.get(g)).map(|o| o.parts.iter().map(|p| p.id).collect()),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    );
+                }
                 for (g, (entry, paint, name, skill, grid, decal)) in plan.iter().enumerate() {
                     // the opponent record's parts (0x4ED880), for a career opponent
-                    let parts: Vec<nfs_formats::career::Part> = self.career_opponents.as_ref().and_then(|l| l.get(g)).map(|o| o.parts.clone()).unwrap_or_default();
+                    let parts: Vec<nfs_formats::career::Part> = match &rec_parts {
+                        Some(l) => l.get(g).cloned().unwrap_or_default(),
+                        None => self.career_opponents.as_ref().and_then(|l| l.get(g)).map(|o| o.parts.clone()).unwrap_or_default(),
+                    };
                     let swaps: Vec<[i16; 3]> = parts.iter().flat_map(|p| p.geometry_swaps.iter().copied()).collect();
                     // opponent slot `g + 1` → `STARTINGPOS = n − (g + 1)` (0x4ECF00) unless the
                     // career set one (knockout 0x4DE150, tournament ranks 0x503660)
@@ -434,7 +488,7 @@ impl App {
                     let mut seat_setup = None;
                     let automatic = seat_rec
                         .and_then(|rec| rec.num(nfs_net::launchcar::id::TRANSMISSION))
-                        .map_or_else(|| self.player_automatic(), |v| v == 1);
+                        .map_or_else(|| self.option_automatic(), |v| v == 1);
                     let setup = seat_rec.and_then(|rec| rec.setup());
                     if let Some(setup) = setup {
                         seat_setup = Some(setup);
@@ -452,6 +506,9 @@ impl App {
                     vehicle.race_started = false;
                     vehicle.traction_control = true; // AI cars never spin their wheels (Tyre 0x4A20D0)
                     vehicle.ai_driven = true;
+                    // its own `carinfo+0xC` (0x4EEDA0's `.TRANSMISSION`: `Car.Transmission` — the opponents' callers pass 0
+                    // for the mission flag): the reset gear 0x49E228; AutoShift runs for an AI car either way (0x49E885)
+                    vehicle.automatic = automatic;
                     // the remote car's `carinfo` options: `.TRACTION` 0x23B → `carinfo+0x20` (`Vehicle::tcs`),
                     // `.TRANSMISSION` 0x221 → `+0xC`, `.ABS` 0x23A → `+0x24` (no field of the port's
                     // vehicle: the ABS arm 0x4A2308 / 0x4A23CC is not ported, `physics.md` §5.4)
@@ -608,7 +665,7 @@ impl App {
                     // by 0x49CB50 — a traffic car is a racer slot below `NUMCARS`, so 0x411130 builds
                     // its parts (0x49C4C0) and 0x410D60 its block (0x49C6C0 → 0x49CB50) like any car's
                     let traffic_parts_table = self.fe_parts_table();
-                    let traffic_automatic = self.player_automatic();
+                    let traffic_automatic = self.option_automatic();
                     let traffic_sim = CarAssets::load_sim(&self.paths, "default").ok();
                     let mut traffic_car_specs: Vec<CarSpecs> = Vec::new();
                     for k in 0..traffic_count as usize {
@@ -716,6 +773,9 @@ impl App {
                         // `RigidBody_init` 0x49B510 for each car with `default.sim` (§21.1)
                         let specs = self.road.traffic_specs.clone().unwrap_or_else(|| self.specs.clone());
                         set.set_bodies_each(&traffic_car_specs, &specs, &points);
+                        for b in &mut set.bodies {
+                            b.automatic = traffic_automatic; // its own `carinfo+0xC` (0x4ED460 / 0x4ED56E pass 0)
+                        }
                         set.cops_race = self.road.cops_race;
                         // `TRACK_NAME` for the spawn gate's canyon / industrial windows (0x40E0AD)
                         set.set_track(&self.track.name);
@@ -864,7 +924,7 @@ impl App {
                             // …folded by 0x49CB50 like every racer's: the record's stock parts (0x4EE9A0) and
                             // the neutral sliders (0x4EED2D), `.TRANSMISSION` the gearbox option (0x4ED174's
                             // `param_7` is 0)
-                            let cop_automatic = self.player_automatic();
+                            let cop_automatic = self.option_automatic();
                             let cop_parts_table = self.fe_parts_table();
                             let specs = CarAssets::load_sim(&self.paths, &entry.sim)
                                 .ok()
@@ -889,6 +949,7 @@ impl App {
                             if let Some(p) = probe_sets.get(slot).filter(|p| p.len() >= 4) {
                                 cop.set_body(p.clone(), half);
                             }
+                            cop.body.automatic = cop_automatic; // its own `carinfo+0xC` (0x4ED174 / 0x4ED25E pass 0)
                             cop.body.tiny = self.cheat_bits & (1 << 1) != 0;
                             // `DERBY` `[0x657400]`, which only the Smash Up code sets (cheat bit 7): `Damage` takes ×1.5, not ×0.5 (0x49452F)
                             cop.body.derby = self.cheat_bits & (1 << 7) != 0;

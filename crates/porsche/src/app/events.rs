@@ -94,6 +94,18 @@ impl ApplicationHandler for App {
             self.intro_event(event_loop, event);
             return;
         }
+        // `FEApplication`'s event dispatch 0x4D2850 hands every front-end event to the callback list
+        // `[fe+0xE0]` first (slot 3, 0x4D2868) — `FEMainScreen`'s is 0x510EA0, which stamps `[+0x290]`
+        // with `TIMER_getTicks()` and lets the event go on (returns 0) — so the main screen's minute
+        // (0x510210) counts from the last key, button or pointer move, not from the screen's entry
+        // (REFERENCE-2026-10-02-SRVB.md §2)
+        if matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::MouseInput { .. } | WindowEvent::CursorMoved { .. })
+            && self.fe.menu.is_some()
+            && self.vehicle.is_none()
+            && self.fe_list_now() == "ID_MAINSCREEN"
+        {
+            self.fe.main_music_stamp = self.fe_timer_ticks();
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. } => {
@@ -259,6 +271,7 @@ impl ApplicationHandler for App {
                         return;
                     }
                 }
+                // PORT-DEVIATION D10 (PORT-DEVIATIONS.md) [the FE key slot 0x4D2970 knows ESC, `b`, `=` alone]: arrows / Enter drive the menus
                 if self.fe.menu.is_some() && event.state == winit::event::ElementState::Pressed {
                     use winit::keyboard::{KeyCode, PhysicalKey};
                     let key = match event.physical_key {
@@ -368,6 +381,7 @@ impl ApplicationHandler for App {
                 // answers 3 — command 3, the in-place restart 0x415721 — and quit (0x46BE) answers
                 // 0x1A, the "Are you sure you want to exit?" question (0x46FB); its yes sets
                 // `[0x657E34] = 1` (aborted, 0x426182) and issues command 4, the exit
+                // PORT-DEVIATION D10 (PORT-DEVIATIONS.md) [HButtonVisual picks by the cursor only, 0x41B3BA…0x41B3CE]: the arrows and Enter pick and answer the pause menu's buttons
                 if self.paused && event.state == winit::event::ElementState::Pressed {
                     use winit::keyboard::{KeyCode, PhysicalKey};
                     match event.physical_key {
@@ -404,7 +418,7 @@ impl ApplicationHandler for App {
                 // event 3 — the pause menu's restart — but **only when the mission failed**
                 // (`[0x657834] == 0`, 0x4293BB); otherwise it falls through to the billboard's Space.
                 // The click is `hud_click`; Enter does the same here, a key of this port's
-                // (APPROXIMATION, as the pause menu's keys are)
+                // (PORT-DEVIATION D10 (PORT-DEVIATIONS.md) [0x429390, 0x4293BB], as the pause menu's keys are)
                 if event.state == winit::event::ElementState::Pressed
                     && event.physical_key
                         == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Enter)
@@ -592,8 +606,12 @@ impl ApplicationHandler for App {
                 self.fe_left_button(event_loop, state == ElementState::Pressed);
             }
             WindowEvent::RedrawRequested if self.fe.menu.is_some() => {
-                // gamepad: d-pad / left stick moves, South (A / cross) selects
+                // gamepad: d-pad / left stick moves, South (A / cross) selects — PORT-DEVIATION D10
+                // (PORT-DEVIATIONS.md) [the FE reads no pad, event pump 0x529700]
                 self.gamepads.poll(&mut self.input);
+                if nfs_game::config::cfg().nfs_ff_test.var_os().is_some() {
+                    self.gamepads.rumble_test_tick();
+                }
                 let stick = self.input.pad.map(|p| p.steer).unwrap_or(0.0);
                 let mut keys = Vec::new();
                 if self.input.take_pressed(Action::SteerLeft) {
@@ -667,6 +685,9 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested if event_loop.exiting() => {}
             WindowEvent::RedrawRequested => {
                 self.gamepads.poll(&mut self.input);
+                if nfs_game::config::cfg().nfs_ff_test.var_os().is_some() {
+                    self.gamepads.rumble_test_tick();
+                }
                 self.pace_frame();
                 let now = Instant::now();
                 self.frame_dt = (now - self.last_frame).as_secs_f32();

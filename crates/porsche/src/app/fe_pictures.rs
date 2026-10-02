@@ -346,6 +346,8 @@ impl App {
             }))
             .collect();
         let huds = l.numbered_widgets("NFS5.HUD");
+        // the preview's pieces for the options as they stand (the frame hook keeps them current)
+        let hud_preview = if huds.is_empty() { None } else { Some(self.hud_preview_pieces()) };
         let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) else { return };
         for index in pictures {
             l.set_pack_picture(r, &self.paths, "Art", index, "ALLdrivr.fsh", picture);
@@ -359,8 +361,16 @@ impl App {
         // `NFS5.HUD`'s own art: 0x4CB65D builds `<Art>hud.fsh` and 0x4CB685 keeps all **fifteen**
         // of its entries at `widget + 0x178 + 4i`. Entry 0 is `disp`, 240×180 — the size
         // `display.lay` gives the widget — and the draw blits it first (0x4CBB93).
+        let any_hud = !huds.is_empty();
         for (index, _) in huds {
             l.set_pack_picture(r, &self.paths, "Art", index, "hud.fsh", 0);
+        }
+        // …and the fourteen pieces the draw lays over it (OPTS, `hud_preview_pieces`)
+        if any_hud {
+            l.load_hud_preview_art(r, &self.paths);
+        }
+        if let Some((pieces, kx, ky)) = hud_preview {
+            l.set_hud_preview(pieces, kx, ky);
         }
         if let Some(pack) = pack {
             for index in badges {

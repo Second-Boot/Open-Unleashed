@@ -1,5 +1,5 @@
 use crate::front::{Cmd, CmdList};
-use crate::{Camera, FakeSortMode, LensProbe, LensRead, MaterialDesc, MeshData, Scene, Sprite, SpriteCompare, TextureData, Vertex};
+use crate::{depth_bias_offset, Camera, FakeSortMode, LensProbe, LensRead, MaterialDesc, MeshData, Scene, Sprite, SpriteCompare, TextureData, Vertex};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -300,23 +300,24 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const MAX_OBJECTS: u64 = 8192;
 /// The staging belt's chunk: larger than the biggest single frame upload of an ordinary scene.
 const BELT_CHUNK: u64 = 1 << 22;
-/// The main view's far plane — the camera object's `+8`, 700.0 (0x4677FC) — over which the screen
-/// z the depth bias moves is linear (`RE/notes/thrash.md` §6). An offscreen pass names its own
+/// The main view's far plane — the camera object's `+8`, 700.0 (0x4677FC) — of the screen z the
+/// depth bias offsets (`RE/notes/thrash.md` §6d.3). An offscreen pass names its own
 /// (`render_offscreen`'s `depth_far`).
 pub const VIEW_FAR: f32 = 700.0;
 
 impl Core {
     pub fn new(window: Arc<Window>) -> Result<Self> {
         let size = window.inner_size();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::METAL | wgpu::Backends::PRIMARY,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let surface = instance.create_surface(window.clone()).context("create surface")?;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .context("no suitable GPU adapter")?;
         tracing::info!(adapter = ?adapter.get_info().name, backend = ?adapter.get_info().backend, "gpu adapter");
@@ -347,6 +348,8 @@ impl Core {
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
+            // the byte pipeline's surface (`RENDERING.md` "Colour space"): no colour-space conversion
+            color_space: Default::default(),
         };
         surface.configure(&device, &config);
         let depth_view = Self::make_depth(&device, &config);
@@ -449,8 +452,8 @@ impl Core {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh pipeline layout"),
-            bind_group_layouts: &[&globals_layout, &object_layout, &material_layout, &sky_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&globals_layout), Some(&object_layout), Some(&material_layout), Some(&sky_layout)],
+            immediate_size: 0,
         });
         // Thrash state 0x38's pairs (`dx7z.dll` 0x600046BB): 1 `SRCALPHA`/`ONE` (the general arm;
         // two device kinds take `ONE`/`ONE`), 2 `ZERO`/`INVSRCALPHA`, 3 `DESTCOLOR`/`ZERO`
@@ -473,11 +476,11 @@ impl Core {
                     module: &shader,
                     entry_point: Some("vs_main"),
                     compilation_options: Default::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
+                    buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<Vertex>() as u64,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4],
-                    }],
+                    })],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
@@ -498,7 +501,7 @@ impl Core {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
-                    depth_write_enabled: depth && (!blend || zwrite),
+                    depth_write_enabled: Some(depth && (!blend || zwrite)),
                     // `ZFUNC` `LESSEQUAL`: `dx7z.dll` makes the device with it (0x6000A545) and the
                     // game sets it again through the view (Thrash 0x28 ← 3: the race pass
                     // 0x468B54, the front end's 3D pass 0x4D301D). The front-end rooms' layers —
@@ -507,12 +510,12 @@ impl Core {
                     // (`RE/notes/frontend-3d.md` §9). *(The port kept `LESS` until 2026-09-25,
                     // for a fight that was the rooms' own states — file order, no pair — not the
                     // depth test.)*
-                    depth_compare: if depth { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Always },
+                    depth_compare: Some(if depth { wgpu::CompareFunction::LessEqual } else { wgpu::CompareFunction::Always }),
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
                 multisample: Default::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             })
         };
@@ -560,7 +563,7 @@ impl Core {
         // loads with no state block (0x44D270 → 0x44D2E9 pushes 0), so `HEAD` keeps the
         // constructor's default 0x5379D0 — `CLAMP` / `CLAMP`, `LINEAR`, mip `NONE`
         // (`RE/notes/lighting.md` §5.2).
-        let make_proj_sampler = |mip: wgpu::FilterMode| {
+        let make_proj_sampler = |mip: wgpu::MipmapFilterMode| {
             device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("projector clamp"),
                 address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -572,7 +575,7 @@ impl Core {
                 ..Default::default()
             })
         };
-        let proj_samplers = [make_proj_sampler(wgpu::FilterMode::Linear), make_proj_sampler(wgpu::FilterMode::Nearest)];
+        let proj_samplers = [make_proj_sampler(wgpu::MipmapFilterMode::Linear), make_proj_sampler(wgpu::MipmapFilterMode::Nearest)];
         let proj_default = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("projector default"),
             size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
@@ -627,7 +630,7 @@ impl Core {
         // anisotropy at 8, the port's own). The promotion to `LINEAR` is `[0x69DD1D]`, which
         // 0x44ED10 clears and sets again only at `SPECIALFX` 3 (0x44EDD1, 0x44EF04) and the front
         // end's 0x44F020 clears (0x44F080) — `set_trilinear`; below it the mip filter is `POINT`.
-        let make_sampler = |clamp_u: bool, clamp_v: bool, mag_min: wgpu::FilterMode, mip: wgpu::FilterMode| {
+        let make_sampler = |clamp_u: bool, clamp_v: bool, mag_min: wgpu::FilterMode, mip: wgpu::MipmapFilterMode| {
             let mode = |c: bool| if c { wgpu::AddressMode::ClampToEdge } else { wgpu::AddressMode::Repeat };
             device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("scene"),
@@ -641,14 +644,14 @@ impl Core {
             })
         };
         let samplers = std::array::from_fn(|i| {
-            let mip = if i & 4 == 0 { wgpu::FilterMode::Linear } else { wgpu::FilterMode::Nearest };
+            let mip = if i & 4 == 0 { wgpu::MipmapFilterMode::Linear } else { wgpu::MipmapFilterMode::Nearest };
             make_sampler(i & 1 != 0, i & 2 != 0, wgpu::FilterMode::Linear, mip)
         });
         // `LayerFalseSort1`/`2`'s other arm sets Thrash 7 ← 0 for the one draw (`MAG`/`MINFILTER`
         // `POINT`) and never touches state 0x0B, so the mip filter here follows the same `POINT`
         // default as every other sampler below `SPECIALFX` 3 (`trilinear` is false whenever
         // `fakesort_mode` can pick `Single`/`PerItem` — both are set from the same level, `main.rs`)
-        let point_samplers = std::array::from_fn(|i| make_sampler(i & 1 != 0, i & 2 != 0, wgpu::FilterMode::Nearest, wgpu::FilterMode::Nearest));
+        let point_samplers = std::array::from_fn(|i| make_sampler(i & 1 != 0, i & 2 != 0, wgpu::FilterMode::Nearest, wgpu::MipmapFilterMode::Nearest));
 
         // The 2D pass needs its own sampler. The 3D one once asked for `anisotropy_clamp: 8` and
         // `mipmap_filter: Linear`, which on a single-level texture — every sprite atlas is one —
@@ -662,7 +665,7 @@ impl Core {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             lod_max_clamp: 0.0,
             ..Default::default()
         });
@@ -689,8 +692,8 @@ impl Core {
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
             ],
         });
-        let sprite_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("sprite"), bind_group_layouts: &[&sprite_layout], push_constant_ranges: &[] });
-        let sprite_vertex = [wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<SpriteVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x4, 3 => Float32] }];
+        let sprite_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("sprite"), bind_group_layouts: &[Some(&sprite_layout)], immediate_size: 0 });
+        let sprite_vertex = [Some(wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<SpriteVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x4, 3 => Float32] })];
         let make_sprite_pipeline = |label: &str, fs: &str, depth: wgpu::DepthStencilState| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
@@ -700,19 +703,20 @@ impl Core {
                 primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
                 depth_stencil: Some(depth),
                 multisample: Default::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             })
         };
-        let sprite_pipeline = make_sprite_pipeline("sprite", "fs_main", wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: false, depth_compare: wgpu::CompareFunction::Always, stencil: Default::default(), bias: Default::default() });
+        let sprite_pipeline = make_sprite_pipeline("sprite", "fs_main", wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(false), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() });
         // A front-end sprite under the kit's depth state (`crate::SpriteDepth`): Thrash 0x39 ← 1
         // (0x4D30BE) and the compare Thrash 0x28 sets — 3 `LESSEQUAL` (0x4D30C9), 6 `GREATEREQUAL`
         // inside a mask (0x4DAAC0 → 0x537830) — with the device's alpha test in the shader.
-        let depth_state = |compare| wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: true, depth_compare: compare, stencil: Default::default(), bias: Default::default() };
+        let depth_state = |compare| wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(true), depth_compare: Some(compare), stencil: Default::default(), bias: Default::default() };
         let sprite_depth_pipelines = [
             make_sprite_pipeline("sprite lessequal", "fs_alpha_test", depth_state(wgpu::CompareFunction::LessEqual)),
             make_sprite_pipeline("sprite greaterequal", "fs_alpha_test", depth_state(wgpu::CompareFunction::GreaterEqual)),
         ];
+        let belt = wgpu::util::StagingBelt::new(device.clone(), BELT_CHUNK);
         let sprite_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("sprites"), size: MAX_SPRITES * 6 * std::mem::size_of::<SpriteVertex>() as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let mut r = Self {
             surface,
@@ -754,7 +758,7 @@ impl Core {
             offscreen: std::collections::HashMap::new(),
             sprite_layout,
             sprite_buf,
-            belt: wgpu::util::StagingBelt::new(BELT_CHUNK),
+            belt,
             pending_writes: Vec::new(),
             pending_bytes: Vec::new(),
             pending_textures: Vec::new(),
@@ -877,7 +881,7 @@ impl Core {
                 Ok(Ok(())) => {
                     let mut pixels = [0u32; 16];
                     {
-                        let data = p.buf.slice(..).get_mapped_range();
+                        let data = p.buf.slice(..).get_mapped_range().expect("mapped range");
                         for (row, chunk) in pixels.chunks_exact_mut(4).enumerate() {
                             for (i, px) in chunk.iter_mut().enumerate() {
                                 let o = row * LENS_ROW as usize + i * 4;
@@ -907,15 +911,22 @@ impl Core {
 
     /// PORT-DEVIATION D9 (PORT-DEVIATIONS.md) [0x460460 / dx7z 0x60003990, a blocking lock in the frame]:
     /// Copy the 4 × 4 block at the probe's pixel from `target` into a fresh staging buffer and map
-    /// it; [`Self::collect_lens`] picks it up when the copy has run. The block is moved inside the
-    /// target when the sun's point is within two pixels of an edge (`THRASH_readrect` reads
-    /// whatever lies at the offsets, `dx7z.dll` 0x60003990 does no clipping).
+    /// it; [`Self::collect_lens`] picks it up when the copy has run. The block's corner is clamped as
+    /// `nfs5.dll`'s 0x10003320 does for every `THRASH_readrect` (the call at 0x4603FF / 0x460525 is
+    /// routed through it): not below 0, and `corner + 4` below the width / height — else `W − 5`
+    /// / `H − 5` (`dx7z.dll` 0x60003990 itself does no clipping).
     fn lens_copy(&mut self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::Texture, probe: LensProbe, reference: bool) {
         let (w, h) = (target.width() as i32, target.height() as i32);
-        if w < 4 || h < 4 {
+        if w < 5 || h < 5 {
             return;
         }
-        let (x, y) = (probe.x.clamp(0, w - 4), probe.y.clamp(0, h - 4));
+        let (px, py) = ((probe.x / 640.0 * w as f32).round_ties_even() as i32 - 2, (probe.y / 480.0 * h as f32).round_ties_even() as i32 - 2);
+        // 0x10003320: `max(v, 0)`, then `v + 4 >= size` → `size − 5`
+        let clamp = |v: i32, size: i32| {
+            let v = v.max(0);
+            if v + 4 >= size { size - 5 } else { v }
+        };
+        let (x, y) = (clamp(px, w), clamp(py, h));
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("lens read-back"), size: LENS_ROW * 4, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo { texture: target, mip_level: 0, origin: wgpu::Origin3d { x: x as u32, y: y as u32, z: 0 }, aspect: wgpu::TextureAspect::All },
@@ -990,7 +1001,7 @@ impl Core {
         for w in &self.pending_writes {
             let size = wgpu::BufferSize::new(w.len as u64).expect("non-empty write");
             let m = &self.meshes[w.mesh as usize];
-            self.belt.write_buffer(encoder, &m.vertex_buf, m.vertex_offset, size, &self.device).copy_from_slice(&self.pending_bytes[w.start..w.start + w.len]);
+            self.belt.write_buffer(encoder, &m.vertex_buf, m.vertex_offset, size).copy_from_slice(&self.pending_bytes[w.start..w.start + w.len]);
         }
         self.pending_writes.clear();
         self.pending_bytes.clear();
@@ -1025,10 +1036,10 @@ impl Core {
         let (vertex_offset, index_offset) = (a.vertex_used, a.index_used);
         if a.mapped {
             if !vbytes.is_empty() {
-                a.vertex_buf.slice(vertex_offset..vertex_offset + vlen).get_mapped_range_mut().copy_from_slice(vbytes);
+                a.vertex_buf.slice(vertex_offset..vertex_offset + vlen).get_mapped_range_mut().expect("mapped arena").copy_from_slice(vbytes);
             }
             if !ibytes.is_empty() {
-                a.index_buf.slice(index_offset..index_offset + ilen).get_mapped_range_mut().copy_from_slice(ibytes);
+                a.index_buf.slice(index_offset..index_offset + ilen).get_mapped_range_mut().expect("mapped arena").copy_from_slice(ibytes);
             }
         } else {
             if !vbytes.is_empty() {
@@ -1155,8 +1166,8 @@ impl Core {
             let Some(gpu) = self.textures.get(w.texture as usize) else { continue };
             let len = w.bytes_per_row as usize * w.height as usize;
             let size = wgpu::BufferSize::new(len as u64).expect("non-empty write");
-            let slice = self.belt.allocate(size, wgpu::BufferSize::new(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64).unwrap(), &self.device);
-            slice.get_mapped_range_mut().copy_from_slice(&self.pending_texture_bytes[w.start..w.start + len]);
+            let slice = self.belt.allocate(size, wgpu::BufferSize::new(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64).unwrap());
+            slice.get_mapped_range_mut().expect("belt slice").copy_from_slice(&self.pending_texture_bytes[w.start..w.start + len]);
             encoder.copy_buffer_to_texture(
                 wgpu::TexelCopyBufferInfo { buffer: slice.buffer(), layout: wgpu::TexelCopyBufferLayout { offset: slice.offset(), bytes_per_row: Some(w.bytes_per_row), rows_per_image: Some(w.height) } },
                 wgpu::TexelCopyTextureInfo { texture: &gpu._texture, mip_level: w.level, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
@@ -1375,12 +1386,14 @@ impl Core {
 
     pub fn render(&mut self, scene: &Scene, camera: &Camera) -> Result<()> {
         let frame = match self.surface.get_current_texture() {
-            Ok(f) => f,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
                 return Ok(());
             }
-            Err(e) => return Err(e.into()),
+            // a timeout or an occluded window: skip the frame (wgpu 30)
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
+            other => anyhow::bail!("surface texture: {other:?}"),
         };
         let view = frame.texture.create_view(&Default::default());
         let aspect = self.aspect();
@@ -1388,7 +1401,7 @@ impl Core {
         let (w, h) = (frame.texture.width(), frame.texture.height());
         let can_copy = self.lens_enabled;
         self.encode_with_gamma(scene, camera, &view, &frame.texture, can_copy, &depth, w, h, aspect);
-        frame.present();
+        self.queue.present(frame);
         self.collect_lens();
         Ok(())
     }
@@ -1488,7 +1501,7 @@ impl Core {
         });
         self.device.poll(wgpu::PollType::wait_indefinitely())?;
         rx.recv()??;
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("mapped range");
         let mut out = Vec::with_capacity((width * height * 4) as usize);
         let bgra = matches!(self.config.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
         for row in 0..height {
@@ -1645,11 +1658,12 @@ impl Core {
             sky_fog: scene.sky_fog.map_or([0.0; 4], |f| [f.colour[0], f.colour[1], f.colour[2], f.density]),
         };
         let size = wgpu::BufferSize::new(std::mem::size_of::<GlobalsUniform>() as u64).expect("globals size");
-        self.belt.write_buffer(&mut encoder, &self.globals_buf, 0, size, &self.device).copy_from_slice(bytemuck::bytes_of(&globals));
+        self.belt.write_buffer(&mut encoder, &self.globals_buf, 0, size).copy_from_slice(bytemuck::bytes_of(&globals));
         if n > 0 {
             let size = wgpu::BufferSize::new((n * std::mem::size_of::<ObjectUniform>()) as u64).expect("objects size");
-            let mut view = self.belt.write_buffer(&mut encoder, &self.object_buf, 0, size, &self.device);
-            let objects: &mut [ObjectUniform] = bytemuck::cast_slice_mut(&mut view);
+            // built on the CPU and copied in once: wgpu 30's mapped views are write-only
+            // (`WriteOnly`), not a `&mut [u8]` to cast in place
+            let mut objects: Vec<ObjectUniform> = vec![bytemuck::Zeroable::zeroed(); n];
             for (o, item) in objects.iter_mut().zip(scene.items.iter().take(n)) {
                 let mat = self.materials.get(item.material.0 as usize);
                 let env_mix = mat.map_or(0.0, |m| m.env_mix);
@@ -1659,14 +1673,19 @@ impl Core {
                 // `.w` below: 0 no test, else the reference + ½ — a texel alpha under it (≤ the
                 // reference in bytes) fails `GREATER`
                 let alpha_ref = if alpha_test { item.alpha_ref as f32 + 0.5 } else { 0.0 };
-                // state 0x18 as a pull toward the eye in view depth: `−b · (far − near) / 32768` over
-                // the pass's own planes — the view's near and far, which 0x466F30 hands the projection
-                // 0x5391B0 (`cam+0xCC` / `+0xD0`) and 0x540870 loads as the screen z's range: the main
-                // view's near and the camera object's far 700 (0x4677FC), the rear view's 1 / 65000
-                // (0x4691D0; `RE/notes/thrash.md` §6) — `b` the material's block plus the draw's own
-                // (the lamp glare's, `DrawItem::depth_bias`). The rear view's far is not the port's
-                // clip far there (its cull distance), hence `depth_far` apart from `camera.far`.
-                let pull = mat.map_or(0.0, |m| -((m.depth_bias + item.depth_bias) as f32) * (depth_far - camera.near) / 32768.0);
+                // state 0x18 as an offset of the screen z: `b · 2^-15` (0x540500's `× [0x5B3E10]`)
+                // added to the game's `sz = far/(far − near) · (1 − near / Z)` (0x540CE0) — `b` the
+                // material's block plus the draw's own (`DrawItem::depth_bias`) — with near / far the
+                // pass's own planes, which 0x466F30 hands the projection 0x5391B0 (`cam+0xCC` /
+                // `+0xD0`, folded into `cam+0xDC` / `+0xE0`): the main view's near and the camera
+                // object's far 700 (0x4677FC), the rear view's 1 / 65000 (0x4691D0;
+                // `RE/notes/thrash.md` §6d.3). The shader adds it to the port's own clip z, so it is
+                // scaled by the ratio of the two `far / (far − near)` — exactly 1 where the port's
+                // planes are the pass's (the race's main view and its mirror), and keeping the same
+                // view-depth step `≈ b · 2^-15 · Z² / (near · A)` where they are not.
+                let a_game = depth_far / (depth_far - camera.near);
+                let a_port = camera.far / (camera.far - camera.near);
+                let pull = mat.map_or(0.0, |m| depth_bias_offset(m.depth_bias.saturating_add(item.depth_bias)) * (a_port / a_game));
                 *o = ObjectUniform {
                     model: item.transform.to_cols_array_2d(),
                     // .x is the environment-map mix, .zw a uv offset (the sky layers scroll with it)
@@ -1689,6 +1708,7 @@ impl Core {
                     sky_on: [sky_tex_of(&self.materials, self.no_reflections, item).is_some() as u32 as f32, item.sky_pass as u32 as f32, item.fog_w, 0.0],
                 };
             }
+            self.belt.write_buffer(&mut encoder, &self.object_buf, 0, size).copy_from_slice(bytemuck::cast_slice(&objects));
         }
 
         // the 2D pass's vertices go into the belt before any pass opens (a copy cannot be
@@ -1700,8 +1720,7 @@ impl Core {
         }
         if n_sprites > 0 {
             let size = wgpu::BufferSize::new((n_sprites * 6 * std::mem::size_of::<SpriteVertex>()) as u64).expect("sprites size");
-            let mut view = self.belt.write_buffer(&mut encoder, &self.sprite_buf, 0, size, &self.device);
-            let verts: &mut [SpriteVertex] = bytemuck::cast_slice_mut(&mut view);
+            let mut verts: Vec<SpriteVertex> = vec![bytemuck::Zeroable::zeroed(); n_sprites * 6];
             for (i, sp) in scene.sprites.iter().take(n_sprites).enumerate() {
                 verts[i * 6..i * 6 + 6].copy_from_slice(&sprite_quad(sp, aspect));
                 if self.sprite_log {
@@ -1710,6 +1729,7 @@ impl Core {
                     tracing::info!(i, tex = sp.texture.0, bound = self.textures[sp.texture.0 as usize].sprite_bg.is_some(), x0 = v.pos[0], y0 = v.pos[1], x1 = w.pos[0], uv0 = ?v.uv, color = ?v.color, "sprite");
                 }
             }
+            self.belt.write_buffer(&mut encoder, &self.sprite_buf, 0, size).copy_from_slice(bytemuck::cast_slice(&verts));
         }
 
         let c = clear_color;
@@ -1734,6 +1754,7 @@ impl Core {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+            multiview_mask: None,
             });
             pass.set_bind_group(0, &self.globals_bg, &[]);
             pass.set_bind_group(1, &self.object_bg, &[]);
@@ -1758,6 +1779,7 @@ impl Core {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+            multiview_mask: None,
             });
             pass.set_bind_group(0, &self.globals_bg, &[]);
             pass.set_bind_group(1, &self.object_bg, &[]);
@@ -1784,6 +1806,7 @@ impl Core {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+            multiview_mask: None,
             });
             pass.set_bind_group(0, &self.globals_bg, &[]);
             pass.set_bind_group(1, &self.object_bg, &[]);
@@ -1813,6 +1836,7 @@ impl Core {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+            multiview_mask: None,
             });
             // HUD sprites; consecutive ones on one texture and one pipeline are one draw (their
             // vertices are contiguous in the buffer, in order)
@@ -1946,7 +1970,7 @@ impl GammaPass {
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("gamma"), source: wgpu::ShaderSource::Wgsl(GAMMA_WGSL.into()) });
-        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("gamma"), bind_group_layouts: &[&layout], push_constant_ranges: &[] });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("gamma"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("gamma"),
             layout: Some(&pl),
@@ -1955,7 +1979,7 @@ impl GammaPass {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor { label: Some("gamma"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -1997,6 +2021,7 @@ impl GammaPass {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+            multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, bg, &[]);

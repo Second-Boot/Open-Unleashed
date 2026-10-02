@@ -82,6 +82,22 @@ pub struct MissionStart {
     pub scene_suffix: Option<String>,
 }
 
+impl MissionStart {
+    /// **The mission a playback runs** (`Replay_begin` 0x413CF0 restores the recorded block, the twelve launch words
+    /// 0x4EC040 wrote into it among them; the HUD and `HMissionSummary` read those words, no race code calls the
+    /// profile's current mission 0x51AE80 — `replay.md` §18.18). The port keeps the mission as its `nfs5.fac`
+    /// record, so the record whose launch words (`nfs_game::replay::mission_words`) and scene equal the recorded
+    /// ones is the mission the block described. `None` when no record matches (another install's file).
+    pub fn from_replay_words(paths: &GamePaths, words: &[i32; 12], scene: Option<i16>) -> Option<Self> {
+        let data = std::fs::read(paths.fe_data().join("Data").join("nfs5.fac")).ok()?;
+        let missions = nfs_formats::career::parse_missions(&data).ok()?;
+        let index = missions.iter().position(|m| nfs_game::replay::mission_words(m) == *words && scene.is_none_or(|s| s == m.scene))?;
+        let mission = missions[index].clone();
+        let scene_suffix = mission.scene_file("");
+        Some(Self { index, mission, scene_suffix })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingEvent {
     pub tournament: i16,
@@ -500,11 +516,13 @@ impl CareerUi {
     /// Mission over: `passed` from `SkillTest::evaluate` / the race position.
     /// `text` is the result line the race's `HMissionSummary` chose (0x4293F0), and `driver` the
     /// name its `%s` takes.
-    pub fn finish_mission(&mut self, idx: usize, passed: bool, time_ticks: u64, cones: usize, text: Option<u32>, driver: &str) {
+    pub fn finish_mission(&mut self, idx: usize, passed: bool, time_ticks: u64, cones: usize, zones: &[f32; 10], text: Option<u32>, driver: &str) {
         self.pending = None;
         let m = self.tables.missions[idx].clone();
         let pick = text;
         let promotion = self.career.record_mission(&self.tables, idx, passed);
+        // 0x51AEF0's other three stores (0x51AF2B…0x51AF3E): time, average damage, smackables
+        self.career.set_mission_stats(&self.tables, idx, Career::mission_stats_of(time_ticks, zones, cones));
         let secs = time_ticks as f32 / 64.0;
         let mut msg = format!(
             "{}: {}  ({}:{:05.2}, {} CONES)  ",

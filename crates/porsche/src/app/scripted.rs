@@ -209,6 +209,13 @@ impl App {
                     println!("  box {name:<20} {class:<28} size.value=({:.0}x{:.0}) parts=({:.0}x{:.0})", b.0, b.1, u.0, u.1);
                 }
             }
+            if nfs_game::config::cfg().nfs_hit_sweep.var().is_ok()
+                && let Some(l) = self.fe.layout_preview.as_mut()
+            {
+                for line in l.hit_sweep() {
+                    println!("  hit {name:<20} {line}");
+                }
+            }
             if let Some(l) = self.fe.layout_preview.as_ref() {
                 cars3d += l.car_3d().len();
             }

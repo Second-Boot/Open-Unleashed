@@ -37,17 +37,17 @@ nfs-game = { path = "crates/nfs-game" }
 
 thiserror = "2"
 anyhow = "1"
-glam = "0.30"
+glam = "0.33"
 bytemuck = { version = "1", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 winit = "0.30"
-wgpu = "27"
-pollster = "0.4"
+wgpu = "30"
+pollster = "1"
 gilrs = "0.11"
-cpal = "0.16"
+cpal = "0.18"
 libm = "0.2"
 
 [profile.release]

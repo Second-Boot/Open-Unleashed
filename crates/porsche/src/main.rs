@@ -185,6 +185,17 @@ fn main() -> Result<()> {
             track.extra_scenes.push(scene);
         }
     }
+    // a recording's `SCENENUMBER` 0x1C: the skill test's scene the race ran in (0x4ECDF0)
+    if let Some(n) = replay_setup.as_ref().and_then(|r| r.scene).filter(|n| *n > 0) {
+        match track.load_scene(&format!("_st{n}.scn"))? {
+            Some(scene) => {
+                // the scene's triggers are the test (start pose 0x410430, arrows, cones, finish): `SkillTest`
+                skill = Some(SkillTest::from_scene(&scene, &track.name));
+                track.extra_scenes.push(scene);
+            }
+            None => tracing::error!(scene = n, "replay: the recorded skill-test scene is missing"),
+        }
+    }
     let car = CarAssets::load(&paths, car_name)?;
     // simulation variant: catalogue entry whose model matches, else "<car>coupe36"-style guess
     let catalog = nfs_formats::fedata::parse_car_catalog(&std::fs::read(
@@ -230,6 +241,18 @@ fn main() -> Result<()> {
         .unwrap_or([0xD4, 0x10, 0x10]);
     let race_class = sim_name.to_lowercase().starts_with("gt") || sim_name.starts_with("935");
     let mut specs = CarSpecs::from_sim(&sim, race_class);
+    // `.TRANSMISSION` (`carinfo+0xC`) of the player's car: `Car.Transmission`'s index, 1 = automatic (0x4EEF9F), the
+    // same word `App::player_automatic` reads — here the command line has no front end, so the option is the
+    // `NFS_CHOICE` override or the registry's `car[0].transmission` (default 0, as `choice_index`'s); and 0 whatever
+    // the option says in Factory Driver mission 0x1D (the player's 0x4EEDA0 call alone, 0x4EB9C6…0x4EEF8D). A
+    // recording's own word is read below. GB: the folds took `true` whatever the option said.
+    let cli_automatic = {
+        let over = nfs_game::config::cfg().nfs_choice.var().ok().and_then(|o| {
+            o.split(',').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == "Car.Transmission").and_then(|(_, v)| v.trim().parse::<usize>().ok())
+        });
+        let option = over.unwrap_or_else(|| nfs_formats::fetxt::Registry::load(&paths.root).u32("car[0].transmission", 0) as usize);
+        option >= 1 && !career_request.as_ref().and_then(|r| r.mission.as_ref()).is_some_and(|m| m.index == 0x1D)
+    };
     if let Some(r) = &career_request {
         let family = catalog
             .iter()
@@ -242,7 +265,7 @@ fn main() -> Result<()> {
             // neutral sliders) — same as `load_career_race`'s
             let stock_ids: Vec<i16> = catalog.iter().find(|c| c.sim.eq_ignore_ascii_case(&sim_name)).map(|c| c.stock_parts.clone()).unwrap_or_default();
             let table = nfs_formats::career::parse_parts(&std::fs::read(paths.fe_data().join("Data").join("nfs5.prt")).unwrap_or_default()).unwrap_or_default();
-            nfs_game::career::fold_fresh_car(&mut specs, &stock_ids, &table, &family, true);
+            nfs_game::career::fold_fresh_car(&mut specs, &stock_ids, &table, &family, cli_automatic);
         } else {
             specs.apply_parts(&r.parts.iter().collect::<Vec<_>>(), &family);
             // the installed-part list `car+0x768` with the garage car's carried states, as the
@@ -251,7 +274,7 @@ fn main() -> Result<()> {
                 specs.parts = nfs_game::career::installed_parts(&r.parts.iter().collect::<Vec<_>>(), owned);
             }
             // …then the sliders (0x49D290): the owned car's own, else the constructor's neutral ones
-            specs.apply_setup(owned.map_or(&nfs_game::career::CAR_SETUP_DEFAULT, |o| &o.setup), true);
+            specs.apply_setup(owned.map_or(&nfs_game::career::CAR_SETUP_DEFAULT, |o| &o.setup), cli_automatic);
         }
     } else {
         // no career request: this CLI/replay invocation's car races on its stock parts
@@ -266,7 +289,27 @@ fn main() -> Result<()> {
         // the stock parts (0x4EE9A0) and the constructor's neutral sliders (0x4EED2D) through 0x49CB50;
         // `.TRANSMISSION` is the gearbox option (`Car.Transmission`), automatic unless it says otherwise
         let before = (specs.top_speed, specs.final_drive, specs.grip, specs.transfer_div, specs.roll_gain, specs.front_weight);
-        nfs_game::career::fold_fresh_car(&mut specs, stock_ids, &parts_table, &family, true);
+        // a recording's car-info record of slot 0 (`Replay_begin` 0x413CF0's restore): its parts, their wear and
+        // its sliders, parts first (0x49CB50 / 0x49D290); a file with none races the fresh catalogue car
+        let recorded = replay_setup.as_ref().and_then(|r| r.player.as_ref()).and_then(|c| c.parts.as_ref().map(|ids| (c, ids)));
+        if let Some((c, ids)) = recorded {
+            let parts: Vec<&nfs_formats::career::Part> = ids.iter().filter_map(|id| parts_table.iter().find(|p| p.id == *id)).collect();
+            specs.apply_parts(&parts, &family);
+            specs.parts = parts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| nfs_physics::specs::InstalledPart::new(p.kind, p.zone_mask.map(|b| b != 0), p.condition, c.part_damage.get(i).copied().unwrap_or(p.state as f32)))
+                .collect();
+            // `.TRANSMISSION` of the recorded block (`carinfo+0xC`); a file from before the field: automatic, the
+            // session's option (APPROXIMATION)
+            let automatic = replay_setup.as_ref().and_then(|r| r.transmission).unwrap_or(cli_automatic);
+            specs.apply_setup(&c.setup.unwrap_or(nfs_game::career::CAR_SETUP_DEFAULT), automatic);
+        } else {
+            if replay_setup.is_some() {
+                tracing::info!("replay: no car record in the setup, the car is a fresh catalogue car (APPROXIMATION)");
+            }
+            nfs_game::career::fold_fresh_car(&mut specs, stock_ids, &parts_table, &family, cli_automatic);
+        }
         tracing::info!(
             stock = ?stock_ids, top_speed_before = before.0, top_speed = specs.top_speed, final_drive_before = before.1, final_drive = specs.final_drive,
             grip_before = before.2, grip = specs.grip, transfer_div_before = before.3, transfer_div = specs.transfer_div,
@@ -506,6 +549,7 @@ fn main() -> Result<()> {
             track_idx: 0,
             car_idx,
             car_garage: false,
+            merged_at_zero: true,
             car2_idx: 0,
             ko: Vec::new(),
             ko_sel: 0,
@@ -543,7 +587,15 @@ fn main() -> Result<()> {
     if let (Some(m), Some(c)) = (&menu, career.as_mut()) {
         c.set_mode(m.mode);
     }
-    let mission_start = career_request.as_ref().and_then(|r| r.mission.clone()).map(cone_limit_diagnostic);
+    let mission_start = career_request.as_ref().and_then(|r| r.mission.clone()).map(cone_limit_diagnostic).or_else(|| {
+        // a recorded mission's launch words (`Replay_begin` restores the block the HUD reads): the mission they describe
+        let rs = replay_setup.as_ref()?;
+        let m = career_ui::MissionStart::from_replay_words(&paths, rs.mission.as_ref()?, rs.scene);
+        if m.is_none() {
+            tracing::info!("replay: the recorded mission matches no nfs5.fac record, no mission HUD (APPROXIMATION)");
+        }
+        m
+    });
 
     // `--net-browse N`: probe for N seconds and print the sessions that answer, then exit. The
     // same `'w'` / `'d'` exchange the network screens run, without a window.
@@ -739,6 +791,7 @@ fn main() -> Result<()> {
         net: Network { session: net, leaving: Vec::new(), lobby: None, start_due: false, join_notified: false, lobby_sent: false, lobby_car: None, lobby_setsel: false, race: None, connect_pending: false, connect_opened: false },
         career,
         career_opponents: career_request.map(|r| r.opponents),
+        cheat_bits_live: None,
         // diagnostic: `NFS_OPPCAR=0..4` picks `OpponentCar.Car` without going through the menu
         opp_choice: std::env::var("NFS_OPPCAR")
             .ok()
@@ -848,6 +901,7 @@ fn main() -> Result<()> {
                     race_type: None,
                     fegame_type: None,
                     camera: None,
+                    ..Default::default()
                 }),
             path: nfs_game::save::save_dir().join("replay.prpl"),
             saved: false,
@@ -858,7 +912,15 @@ fn main() -> Result<()> {
         // the original seeds the race RNG from the registry's RAND_SEED (replay.md §11); a replay
         // carries the seed so playback re-simulates the same traffic, police and AI
         // (**test glue**: `NFS_CHEAT_BITS` sets the cheat bits a name-box code would, for the scripted runs)
-        cheat_bits: std::env::var("NFS_CHEAT_BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+        cheat_bits: {
+            let bits: u32 = std::env::var("NFS_CHEAT_BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            // a recording's `DERBY` word (0x1B, the block `Replay_begin` restores)
+            match replay_setup.as_ref().and_then(|r| r.derby) {
+                Some(true) => bits | (1 << 7),
+                Some(false) => bits & !(1 << 7),
+                None => bits,
+            }
+        },
         traffic_seed: match (
             &replay_setup,
             std::env::var("NFS_TRAFFIC_SEED")
@@ -1070,6 +1132,9 @@ fn main() -> Result<()> {
         chase_offset: None,
         chase_settle: 0,
         slot_view: None,
+        slot_key_enters: 0,
+        fe0: !use_menu && career_id.is_none() && !mission_flag && replay_file.is_none(),
+        slot_seen: (0, 0),
         look_yaw: None,
         look_held: [false; 3],
         lamp_bits: 0,

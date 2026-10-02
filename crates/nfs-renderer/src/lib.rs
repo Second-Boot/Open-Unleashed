@@ -104,9 +104,9 @@ pub struct MaterialDesc {
     /// car, whose own flips 0x443385 / 0x44347F are not carried).
     pub view_cull: bool,
     /// Thrash state 0x18, the depth bias the `Rs` block hands the driver (0x540500 adds the view's
-    /// own, `[[[0x69ED0C]]+4]+0x30`, which stays 0): `dx7z.dll` adds `b / 32768` to the vertex's
-    /// linear screen z `(z − near) / (far − near)`, so a vertex moves `−b · (far − near) / 32768`
-    /// of view depth toward the eye along its own ray (`RE/notes/thrash.md` §6d.3).
+    /// own, `[[[0x69ED0C]]+4]+0x30`, which stays 0): `b · 2^-15` added to the screen z of the
+    /// game's own pre-transformed vertex, `far/(far − near) · (1 − near / Z)` ([`depth_bias_offset`],
+    /// 0x540CE0; `RE/notes/thrash.md` §6d.3).
     pub depth_bias: i32,
     /// `RCustomLayers::LayerFalseSort1` / `2` (0x449AA0 / 0x449AF0, the `FakeSort` method's ops
     /// 0x800F / 0x8010): at `SPECIALFX` 2 or 3 the material is drawn twice, first with depth
@@ -193,8 +193,8 @@ pub struct DrawItem {
     pub early: bool,
     /// The draw's own Thrash state 0x18 — a state object's `+0x10` (0x537A60) set per draw, as the
     /// lamp glare's `fistp(b · −20000 · cam[+0xC] / d²)` (0x43D419…0x43D45C) — added to the
-    /// material's `depth_bias`: `dx7z.dll` adds `b / 32768` to the vertex's linear screen z, so
-    /// the vertex slides toward the eye along its own ray (`RE/notes/thrash.md` §6, §6d.3).
+    /// material's `depth_bias` and offset the screen z the same way ([`depth_bias_offset`],
+    /// `RE/notes/thrash.md` §6d.3).
     pub depth_bias: i32,
     /// The alpha test `GREATER 10` for this draw alone — Thrash 0x24 ← 10 at the start of the
     /// car's effect pass (0x43D83E), which the lamp glare 0x43CDD0 draws under (its texel alpha
@@ -240,6 +240,32 @@ impl DrawItem {
     pub fn new(mesh: MeshId, material: MaterialId, transform: Mat4) -> Self {
         Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, alpha_ref: 10, sky: None, main_view_only: false, sky_pass: false, fog_w: 0.0, fakesort_near: false, overlay: false }
     }
+}
+
+/// Thrash state 0x18's `b` as the offset it makes in the screen z: `b · 2^-15` (0x540500 /
+/// 0x5404A0: `fild`, `× [0x5B3E10]` = 2^-15, into `ctx+0x1180C`; the DX7 driver's own copy
+/// 0x60005177 scales by the same `[0x60015450]`). With the DX7 driver the game adds it to the
+/// screen z of the vertex it hands the driver (0x540CE0), `sz = far/(far − near) · (1 − near / Z)`
+/// — the Direct3D depth of a perspective projection with the view's planes (0x5391B0 folds them
+/// into `cam+0xDC` = `far / (far − near)` and `cam+0xE0` = `−near · far / (far − near)`; 0x540820
+/// loads those as `ctx+0x34` / `+0x40`, and the kernel 0x5B0730 gives `rhw = 1 / Z`). A positive
+/// `b` pushes away, a negative one pulls toward the eye; `RE/notes/thrash.md` §6d.3.
+pub fn depth_bias_offset(b: i32) -> f32 {
+    b as f32 / 32768.0
+}
+
+/// The view depth whose screen z is that of `z` with the bias `b` added — what the offset of
+/// [`depth_bias_offset`] amounts to in metres for the view's `near` / `far`:
+/// `sz(z') = sz(z) + b · 2^-15` with `sz(z) = far/(far − near) · (1 − near / z)`, so
+/// `1/z' = 1/z − b · 2^-15 · (far − near) / (far · near)`. `None` where the biased screen z reaches
+/// `far / (far − near)` (no finite depth has it) or falls to 0 or below (in front of the near plane).
+pub fn biased_view_depth(z: f64, b: i32, near: f64, far: f64) -> Option<f64> {
+    let a = far / (far - near);
+    let sz = a * (1.0 - near / z) + b as f64 / 32768.0;
+    if sz <= 0.0 || sz >= a {
+        return None;
+    }
+    Some(near / (1.0 - sz / a))
 }
 
 /// The `+0xC` list's flush, farthest first (`0x466660`'s walk of the tree the original builds with
@@ -333,6 +359,48 @@ mod tests {
         merged.extend(car);
         let out = farthest_first(merged);
         assert_eq!(out.iter().map(|i| i.depth_bias).collect::<Vec<_>>(), vec![1, 3, 2, 4]);
+    }
+
+    /// State 0x18 in metres: the original's `sz + b · 2^-15` (0x540CE0) against the first-order
+    /// step `b · 2^-15 · z² · (far − near) / (far · near)` and the old linear reading
+    /// `b · (far − near) / 32768`; then the shader's arithmetic — the port's projection's clip z
+    /// plus `b · 2^-15 · w` — read back as a view depth, which must be the original's.
+    /// `cargo test -p nfs-renderer depth_bias_metres -- --nocapture` prints the table.
+    #[test]
+    fn depth_bias_metres() {
+        for &(near, far) in &[(0.15f64, 700.0f64), (0.5, 700.0)] {
+            println!("near {near} far {far}");
+            println!("{:>6} {:>4} {:>14} {:>14} {:>12}", "z", "b", "dz original", "dz 1st order", "dz linear");
+            for &z in &[0.5f64, 5.0, 50.0, 500.0] {
+                for &b in &[1i32, 3, -1, -10] {
+                    let dz = biased_view_depth(z, b, near, far).map(|z2| z2 - z);
+                    let first = b as f64 / 32768.0 * z * z * (far - near) / (far * near);
+                    let linear = b as f64 * (far - near) / 32768.0;
+                    println!("{z:>6} {b:>4} {:>14} {first:>14.6} {linear:>12.4}", dz.map_or("past ∞ / near".to_string(), |d| format!("{d:.6}")));
+                    // near the eye the step is the first-order one (within 2 %: the second-order term is 1 % at 5 m, b = −10)
+                    if let (Some(d), true) = (dz, z <= 5.0) {
+                        assert!((d - first).abs() <= 0.02 * first.abs(), "z {z} b {b}: {d} vs {first}");
+                    }
+                    // the shader: clip = P · view, clip.z += b · 2^-15 · clip.w, then back to a depth
+                    let cam = Camera { position: glam::Vec3::ZERO, target: glam::Vec3::new(0.0, 0.0, -1.0), up: glam::Vec3::Y, fov_y_radians: 1.0, near: near as f32, far: far as f32 };
+                    let clip = cam.projection(1.0) * glam::Vec4::new(0.0, 0.0, -z as f32, 1.0);
+                    let ndc = ((clip.z + depth_bias_offset(b) * clip.w) / clip.w) as f64;
+                    let a = far / (far - near);
+                    if let Some(z2) = dz.map(|d| z + d) {
+                        if ndc > 0.0 && ndc < 1.0 {
+                            let back = near / (1.0 - ndc / a);
+                            // f32 depth: compare as screen z, not metres (500 m is past f32's step)
+                            let sz2 = a * (1.0 - near / z2);
+                            assert!((ndc - sz2).abs() < 2e-6, "z {z} b {b}: port {ndc} original {sz2} ({back} m vs {z2} m)");
+                        }
+                    }
+                }
+            }
+        }
+        // the old linear pull is the original's step (to first order) only at z = sqrt(far · near): 0.15 / 700 → 10.2 m
+        let z = (700.0f64 * 0.15).sqrt();
+        let d = biased_view_depth(z, 1, 0.15, 700.0).unwrap() - z;
+        assert!((d - 699.85 / 32768.0).abs() < 0.01 * d, "{d}");
     }
 }
 
@@ -452,15 +520,18 @@ pub struct Scene {
 
 /// The sun's lens flare reads a 4 × 4 block of the frame at the sun's screen point
 /// (`THRASH_readrect`, 0x460525 and 0x4603FF; `RE/notes/lighting.md` §7): once right after the sky
-/// pass has drawn the sun (the reference texels, `+0x148`), then every 200 ms from the finished
-/// 3-D pass (the test). The renderer copies the block into a staging buffer and hands the pixels
+/// pass has drawn the sun (the reference texels, `+0x148`), then every frame (200 ms in the file,
+/// `nfs5.dll` NOPs the throttle) from the finished 3-D pass (the test). The renderer copies the block into a staging buffer and hands the pixels
 /// back a frame or two later ([`gpu::Renderer::lens_results`]) — **a latency the original does
 /// not have** (its read is a blocking lock of the back buffer), the port's own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LensProbe {
-    /// the block's top-left pixel in the render target (the sun's `round(x) − 2`, `round(y) − 2`)
-    pub x: i32,
-    pub y: i32,
+    /// the sun's point on the 640 × 480 frame (`+0x12C`, `+0x130`); the renderer takes the block's
+    /// top-left pixel as `round(x · W / 640) − 2`, `round(y · H / 480) − 2` of the target it draws
+    /// into — the window's surface, or a still's own image, which can differ in size (a Retina
+    /// window is twice a 1280 × 800 still)
+    pub x: f32,
+    pub y: f32,
     /// read the block after the no-depth (sky) stage alone — the reference
     pub reference: bool,
     /// read the block from the finished 3-D pass, before the overlay items — the test

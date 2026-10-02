@@ -8,4 +8,4 @@ OpenGL driver (mesa-vulkan-drivers / the vendor driver; libvulkan1), and an X11 
 Built against glibc 2.36 (Debian 12); newer systems work.
 
 Saves and settings: $XDG_DATA_HOME/PorscheUnleashed, else ~/.local/share/PorscheUnleashed
-(NFS5_SAVE_DIR overrides). Network games use UDP port 1106 (open it in the firewall).
+(NFS5_SAVE_DIR overrides). Network games over IP use UDP port 9442 (open it in the firewall).

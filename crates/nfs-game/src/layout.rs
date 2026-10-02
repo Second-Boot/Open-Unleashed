@@ -481,6 +481,8 @@ pub struct LayoutScreen {
     /// set by [`claim_pointer`](Self::claim_pointer) while a sibling panel holds the window's hit
     /// (EV3): this screen then sees no pointer, though it keeps the one it was handed
     denied: bool,
+    /// diagnostic (`hit_sweep`): the scan counts every class, as 0x528C00 does
+    wide_hit: bool,
     /// The pointer the **cursor sprite** is drawn at, when it is not `cursor`. The cursor draw
     /// 0x4E1C90 takes the device's position straight from 0x5372A0(6) (0x4D32D9…0x4D32EF), not
     /// from an event, so the pointer moves while the input dispatch 0x4D2850 is dropping the
@@ -527,6 +529,11 @@ pub struct LayoutScreen {
     /// them as 0, 1, 2, 3), which `NFS5.CAMERAPICTURE`'s draw 0x4BF870 compares with its own
     /// `data.picturenum`
     camera_list: [i32; 4],
+    /// The pieces `NFS5.HUD`'s draw 0x4CB970 lays over the `disp` schematic (OPTS, `hud.md` "the
+    /// preview"): `(hud.fsh entry, x, y)` in the box's own pixels — the element's stored fraction
+    /// times 240 / 180 — and the size factors `640 / W`, `480 / H` (0x4CBBF0, 0x4CBC09) the pieces'
+    /// own sizes are multiplied by. The application decides which pieces the options choose.
+    hud_preview: (Vec<(usize, f32, f32)>, f32, f32),
     /// which of an open drop-down's scrollbar regions the pointer is on, and whether it is
     /// held — 1 up arrow, 2 down, 3 knob, 4 trough, the numbers 0x4DB2F0 writes (§4.101)
     combo_scroll: Option<(usize, u32, bool)>,
@@ -1101,6 +1108,7 @@ impl LayoutScreen {
                     Ok(mut g) => {
                         g.set_overlay(true);
                         Self::load_children(r, paths, &mut g, 1);
+                        g.hud_preview = self.hud_preview.clone();
                         self.groups.insert(i, Box::new(g));
                     }
                     Err(e) => {
@@ -1137,6 +1145,7 @@ impl LayoutScreen {
                 Ok(mut g) => {
                     g.set_overlay(true);
                     Self::load_children(r, paths, &mut g, depth + 1);
+                    g.hud_preview = screen.hud_preview.clone();
                     screen.groups.insert(*i, Box::new(g));
                 }
                 Err(e) => tracing::debug!(file, error = %e, "tab strip unavailable"),
@@ -1181,6 +1190,7 @@ impl LayoutScreen {
                 Ok(mut g) => {
                     g.set_overlay(true);
                     Self::load_children(r, paths, &mut g, depth + 1);
+                    g.hud_preview = screen.hud_preview.clone();
                     screen.groups.insert(*i, Box::new(g));
                 }
                 // A panel whose file will not load draws **nothing, correctly**: 0x4CEA90 hands
@@ -1534,6 +1544,7 @@ impl LayoutScreen {
                 Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
             }),
             denied: false,
+            wide_hit: false,
             pointer: None,
             // `NFS_FE_PRESS=1` holds the button down for a still, the pair of `NFS_FE_CURSOR`
             pressed: crate::config::cfg().nfs_fe_press.var().ok().is_some_and(|v| v != "0"),
@@ -1550,6 +1561,7 @@ impl LayoutScreen {
             dz_hover: None,
             camera_current: 0,
             camera_list: [0, 1, 2, 3],
+            hud_preview: (Vec::new(), 1.0, 1.0),
             combo_scroll: None,
             focused: Default::default(),
             edits: HashMap::new(),
@@ -3576,6 +3588,55 @@ impl LayoutScreen {
         }
     }
 
+    /// Diagnostic for over a grid of design-space points, where the first-hit widget
+    /// changes when the scan counts **every** class (0x4CEE70 / 0x528C00 do), as `class -> class`
+    /// pairs with a count and one sample point.
+    pub fn hit_sweep(&mut self) -> Vec<String> {
+        fn set_wide(s: &mut LayoutScreen, w: bool) {
+            s.wide_hit = w;
+            for g in s.groups.values_mut() {
+                set_wide(g, w);
+            }
+        }
+        fn class_at(s: &LayoutScreen, i: usize) -> String {
+            if i < s.layout.elements.len() {
+                return s.layout.elements[i].class.clone();
+            }
+            let mut keys: Vec<usize> = s.groups.keys().copied().collect();
+            keys.sort_unstable();
+            let mut base = s.layout.elements.len();
+            for k in keys {
+                let span = s.groups[&k].span();
+                if i < base + span {
+                    return class_at(&s.groups[&k], i - base);
+                }
+                base += span;
+            }
+            "?".into()
+        }
+        let mut seen: std::collections::BTreeMap<String, (usize, (i32, i32))> = Default::default();
+        let mut y = 0;
+        while y <= 480 {
+            let mut x = 0;
+            while x <= 640 {
+                self.place_cursor(Some((x as f32, y as f32)));
+                set_wide(self, false);
+                let a = self.hovered_scan_owner().map(|(i, _)| i);
+                set_wide(self, true);
+                let b = self.hovered_scan_owner().map(|(i, _)| i);
+                set_wide(self, false);
+                if a != b {
+                    let ca = a.map_or("-".to_string(), |i| class_at(self, i));
+                    let cb = b.map_or("-".to_string(), |i| class_at(self, i));
+                    seen.entry(format!("{ca} -> {cb}")).or_insert((0, (x, y))).0 += 1;
+                }
+                x += 2;
+            }
+            y += 2;
+        }
+        seen.into_iter().map(|(k, (n, (x, y)))| format!("{k}  x{n} e.g. ({x},{y})")).collect()
+    }
+
     /// Lift every panel's denial, nested ones included.
     fn clear_denied(&mut self) {
         for g in self.groups.values_mut() {
@@ -3752,6 +3813,18 @@ impl LayoutScreen {
                 }
                 continue;
             }
+            // **APPROXIMATION (measured 2026-10-02, not widened).** 0x528C00 and a panel's
+            // 0x4CEE70 test the box of **every** child, whatever its class (all of them share
+            // 0x525A90 on the box 0x4C86F0 = computeBox 0x5253C0, the parts' union). The filter below
+            // is narrower. `--layout-sweep` with `NFS_HIT_SWEEP=1` (`hit_sweep`, `wide_hit`) counts, on
+            // a 2-px grid, where the first hit would change if it counted every class: on many
+            // shipped screens (the `Options` panels over the tab wedges, `advancedrepair`'s four
+            // `GlintyRectangle` frames over its `ListBox`, `QuickRace` / `FactoryVictory`'s
+            // `ExtraCircle` over the `3DCAR`, …) — and a few of those cannot be the shipped
+            // behaviour taken literally (a frame eating every click on the list it frames), so the
+            // box of a decoration is not known to be what the original's is. Left narrow until one
+            // such click is observed on the running original (RE/notes/controls.md 2026-10-02).
+            //
             // The window's hit test (0x528C00) asks every child's containsPoint (0x525A90) and
             // knows nothing of a hover state; `can_hover` stands in for "a widget that reacts to
             // the pointer" and is right for the buttons. The three text-entry classes react to a
@@ -3760,7 +3833,7 @@ impl LayoutScreen {
             // 0x4C2220) which takes the focus. Without them here a click on `Comms.IP` (or the
             // chat line) never reached the box and nothing could be typed into it.
             let takes_click = matches!(e.class.as_str(), "NFS5.INPUTBOX" | "NFS5.CHATINPUTBOX" | "NFS5.CHARVECTACCESSORINPUTBOX");
-            if !(self.can_hover(&e.class) || takes_click) || self.state_draws_nothing(e) {
+            if !(self.wide_hit || self.can_hover(&e.class) || takes_click) || self.state_draws_nothing(e) {
                 continue;
             }
             // **A hidden widget contributes no box** (`[this+0x10C] & 0x20`, the bit 0x50D910's helper

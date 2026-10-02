@@ -2609,6 +2609,9 @@ impl App {
                 let n = self.camera_cycle.len().max(1) as u8;
                 let driver = nfs_game::camera::VIEW_DRIVER as u16;
                 let has_driver = self.driver_cam.is_some();
+                // 0x465A60 re-runs the slot's reset (settle count 0x32, 0x465BB1; the offset seed 0x465B1A when the old
+                // view is outside 2…7) whatever view the list lands on
+                self.slot_key_enters = self.slot_key_enters.wrapping_add(1);
                 self.camera_mode = (self.camera_mode + 1) % n;
                 if !has_driver && self.camera_cycle.get(self.camera_mode as usize) == Some(&driver)
                 {

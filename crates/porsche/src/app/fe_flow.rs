@@ -183,11 +183,8 @@ impl App {
     /// (0x5B8798), the class `callbacklist=ID_TOURNYSCREEN` builds — `prerace.lay` **and**
     /// `tournament.lay` (until 2026-09-24 the port asked for `prerace` alone).
     pub(crate) fn fe_offer_check(&mut self) {
-        let tourny_screen = self
-            .fe.layout_preview
-            .as_ref()
-            .and_then(|l| l.layout.elements.first().and_then(|e| e.get("callbacklist")).map(|c| c.eq_ignore_ascii_case("ID_TOURNYSCREEN")))
-            .unwrap_or(false);
+        // the tick of `[fe+0xE0]`, the bottom layer's list
+        let tourny_screen = self.fe_list_now() == "ID_TOURNYSCREEN";
         let on_career = tourny_screen || self.fe.menu.as_ref().is_some_and(|m| (1..=3).contains(&m.mode));
         if !on_career || self.fe.dialog.is_some() {
             return;
@@ -314,7 +311,9 @@ impl App {
         const NAMES: [&str; 5] = ["ID_BACKBUTTON", "ID_OPTIONSBUTTON", "ID_PLAYGAMEBUTTON", "ID_CASHBKGD", "ID_ACCOUNTTHINGY"];
         let Some(l) = self.fe.layout_preview.as_ref() else { return };
         // `data.callbacklist`, "" read as `ID_NONE` (0x4E0B30)
-        let list = callback_list_of(l);
+        // — slots 0xA8 / 0xA4 / 0xAC of `[fe+0xE0]` (0x4D81F3, 0x4D82BB, 0x4D8324), the object the
+        // **bottom** layer's screen names (0x4D1BD0 / 0x4D2570), not the top's
+        let list = self.fe_list_now();
         // 0x4D6320 and 0x4D63A0 over the manager's layers (`nfs_game::layout::nav`)
         let back = self.fe.nav.back_enabled();
         let options = list != "ID_OPTIONSSCREEN" && self.fe.nav.one_layer();
@@ -404,7 +403,8 @@ impl App {
     /// in their slot (0x4F0220, `parts_shop::missing_parts`) raise the one-button **650** with
     /// their names (0x5135B0, 0x4F03CC).
     pub(crate) fn fe_carsetup_blocked(&mut self) -> bool {
-        let on_carsetup = self.fe.layout_preview.as_ref().is_some_and(|l| Self::fe_list_of(l) == "ID_CARSETUP");
+        // the callback list `[fe+0xE0]` is the bottom layer's
+        let on_carsetup = self.fe_list_now() == "ID_CARSETUP";
         if !on_carsetup {
             return false;
         }
@@ -513,12 +513,11 @@ impl App {
     ///   is left (`fe_session_leave`, §4.169.4), then the back;
     /// * the LAN / modem / web lists' 0x506CB0 is `jmp 0x50CBF0`.
     pub(crate) fn fe_back_callback(&mut self, event_loop: &ActiveEventLoop) {
-        let list = self
-            .fe
-            .layout_preview
-            .as_ref()
-            .and_then(|l| l.layout.elements.first().and_then(|e| e.get("callbacklist")).map(|c| c.to_ascii_uppercase()))
-            .unwrap_or_default();
+        // slot 0xB4 of `[fe+0xE0]` (the `b` key 0x4D2A6B, `GOBACK` 0x50E5A0): the bottom layer's
+        // list, so a back pressed on an overlay runs the covered screen's list's
+        // override — `settings` over `carsetup` asks 0x502420 first, over a comms screen leaves the
+        // session
+        let list = self.fe_list_now();
         match list.as_str() {
             "ID_VICTORYSCREEN" | "ID_FDVICTORYSCREEN" => return,
             // 0x4F1CE0
@@ -584,9 +583,35 @@ impl App {
     /// A Factory Driver mission overrides it: 0x4EB9B7…0x4EB9D7 set the per-car routine's seventh
     /// argument when the current mission (0x51AEC0, the first not yet passed) is index **0x1D**,
     /// and 0x4EEF8D then sends `.TRANSMISSION` 0 — a manual gearbox — whatever the screen says.
+    ///
+    /// **A playback** reads the word from the recording: `Replay_begin` 0x413CF0 copies the whole recorded block
+    /// over `0x6573E8` (0xF89 dwords, `rep movsd`), the car-info records with it, and the machine-local words it
+    /// puts back (`0x657C84…`, `0x657A48…`, `0x657D5C…`) do not reach `+0xCA4…`; the race's own 0x411130 hands
+    /// 0x49CB50 / 0x49D290 / the shift logic that record's `+0xC`, not `Car.Transmission` (RP, replay.md §18.18).
+    /// The player's slot only: the opponents', cops' and traffic cars' words are [`Self::option_automatic`] (the
+    /// recording's slot-1 word in a playback), so mission 0x1D's manual gearbox is the player's alone (GB).
     pub(crate) fn player_automatic(&self) -> bool {
+        if self.playback_running()
+            && let Some(a) = self.replay.setup.transmission
+        {
+            return a;
+        }
         if self.mission.as_ref().is_some_and(|m| m.index == 0x1D) {
             return false;
+        }
+        self.option_automatic()
+    }
+
+    /// `carinfo+0xC` of every car but the player's: 0x4EEDA0's `.TRANSMISSION` is `Car.Transmission` whenever its
+    /// seventh argument is 0 (0x4EEF8D / 0x4EEF95 → 0x4EEF9F), and only the player's call 0x4EBA4D passes mission
+    /// 0x1D's flag (0x4EB9C6…0x4EB9CB → `[esp+0xC]`, pushed as the seventh argument); the opponents' callers (0x4EBCBF /
+    /// 0x4EBF06 / 0x4EC3FF / 0x4DE213), the cops' and the traffic's pass 0. A playback answers the recording's
+    /// opponent word (slot 1 `+0xC`), else the player's.
+    pub(crate) fn option_automatic(&self) -> bool {
+        if self.playback_running()
+            && let Some(a) = self.replay.setup.opponent_transmission.or(self.replay.setup.transmission)
+        {
+            return a;
         }
         self.choice_index("Car.Transmission").is_none_or(|(i, _)| i == 1)
     }

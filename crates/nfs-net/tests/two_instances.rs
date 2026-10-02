@@ -68,7 +68,7 @@ fn a_client_discovers_the_host_joins_it_and_the_car_state_flows_both_ways() {
     assert_eq!(describe.slot_mask, 0);
 
     // 'j' -> 'a'
-    c.join(host_at, b"a car record").unwrap();
+    c.join(host_at, b"racer~3.5~3.5").unwrap();
     let (slot, peer_slot) = pump(&mut h, &mut c, |eh, ec| {
         let j = find(ec, |e| matches!(e, Event::Joined { .. }))?;
         let p = find(eh, |e| matches!(e, Event::PeerJoined { .. }))?;
@@ -154,7 +154,11 @@ fn a_name_the_host_already_uses_is_refused() {
     let mut h = host(8);
     let host_at = h.local_addr().unwrap();
     let mut c = client("host");
-    c.join(host_at, &[]).unwrap();
+    // 0x588E7E compares the 16 bytes at `+0x18` of the `'j'` with the host's own; the original's connect path
+    // leaves them zero (`Net::join` does), so a joiner that names the host's name is built by hand
+    c.pending = 1;
+    let j = nfs_net::comm::Join { request: 1, from: nfs_net::wire::Addr::default(), name: name16("host"), record: Vec::new() };
+    c.sock.send_to(host_at, tag::JOIN, &j.encode()).unwrap();
     let st = pump(&mut h, &mut c, |_, ec| {
         ec.iter().find_map(|e| match e {
             Event::Refused { status } => Some(*status),

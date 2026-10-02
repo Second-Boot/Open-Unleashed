@@ -499,6 +499,7 @@ impl App {
     /// stand in with; the two can differ when the player owns a car of the same model as the
     /// catalogue row they currently have picked.)*
     pub(crate) fn bind_mergedlist_panel(&mut self) {
+        self.sync_merged_zero();
         let Some(l) = self.fe.layout_preview.as_ref() else { return };
         let names = ["ID_MERGEDLISTCARSETUP", "ID_MERGEDLISTCOLOR"];
         let want = l.widgets_named(&names);
@@ -510,6 +511,21 @@ impl App {
             for (index, which) in want {
                 l.set_hidden_flag(index, if which == 0 { !owned } else { owned });
             }
+        }
+    }
+
+    /// **`zMergedList.Car` at its initial index 0** (`Menu::merged_at_zero`): 0x4F4DF0's `cur < n`
+    /// with `cur = 0` is true exactly when list A (`OwnedCars.Car`'s list, 0x4F4DF9 `slot9`) is not
+    /// empty, so with a garage the merged list is on the owned car (`гараж...`, no colour row) and
+    /// without one on catalogue row 0. Re-evaluated every frame like the original's test (the
+    /// profile load, the game type's list rebuild and the chronicle year change A's count).
+    pub(crate) fn sync_merged_zero(&mut self) {
+        if !self.fe.menu.as_ref().is_some_and(|m| m.merged_at_zero) {
+            return;
+        }
+        let owned = !self.owned_list().is_empty();
+        if let Some(m) = self.fe.menu.as_mut() {
+            m.car_garage = owned;
         }
     }
 

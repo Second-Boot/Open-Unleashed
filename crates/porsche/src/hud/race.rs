@@ -219,9 +219,14 @@ impl Hud {
             // the car's forward in map pixels (right, down), measured clockwise from "up"
             let (tx, ty) = Self::map_px(frame, p.x + fwd.x, p.z + fwd.z);
             let turns = (tx - mx).atan2(-(ty - my)) / std::f32::consts::TAU;
-            // the `radar.fsh` "Car" sprite tinted with the colours (MEDIUM: the base quad 0x423C00 maps
-            // the matrix onto is taken as ±1, i.e. the full `2·half` footprint); the four are the
-            // vertex slots' (UL, UR, LR, LL), one colour for a racer, `(c, other, other, c)` for a cop
+            // the `radar.fsh` "Car" sprite tinted with the colours. The footprint is exactly `2·half`
+            // (read 2026-10-02): 0x433110 builds the four corners itself — the car's position
+            // `car+0x330` ± its right row `car+0x364` × `k·car+0x3A8` ± its forward row `car+0x37C` ×
+            // `k·car+0x3B0` (0x433174…0x4332E0, 0x532360 scale / 0x532300 add / 0x532330 subtract) —
+            // and 0x423C00 only copies those four points (x, y, z, 1.0) into the quad (0x423C04…0x423C5A);
+            // nothing is mapped onto ±1. A different blip size on a frame is a different car's CRP box
+            // (`car+0x3A8…0x3B0`, 0x445090), not a rule; the four are the vertex slots' (UL, UR, LR, LL),
+            // one colour for a racer, `(c, other, other, c)` for a cop
             let mut q = match self.radar_car {
                 Some(tex) => {
                     let mut i = self.image(aspect, tex, mx - w * 0.5, 358.0 + my - l * 0.5, w, l);

@@ -215,6 +215,30 @@ impl LayoutScreen {
         }
     }
 
+    /// Load the fourteen pieces (`hud.fsh` entries 1…14, 0x4CB685 keeps all fifteen) into every
+    /// screen of this tree that holds an `NFS5.HUD`.
+    pub fn load_hud_preview_art(&mut self, r: &mut Renderer, paths: &GamePaths) {
+        let keys: Vec<usize> = self.groups.keys().copied().collect();
+        for k in keys {
+            if let Some(g) = self.groups.get_mut(&k) {
+                g.load_hud_preview_art(r, paths);
+            }
+        }
+        if self.layout.elements.iter().any(|e| e.class == "NFS5.HUD") {
+            for entry in 1..=14 {
+                self.load_pack_entry(r, paths, "Art", "hud.fsh", entry);
+            }
+        }
+    }
+
+    /// The pieces of `NFS5.HUD`'s preview (see the `hud_preview` field).
+    pub fn set_hud_preview(&mut self, pieces: Vec<(usize, f32, f32)>, kx: f32, ky: f32) {
+        for g in self.groups.values_mut() {
+            g.set_hud_preview(pieces.clone(), kx, ky);
+        }
+        self.hud_preview = (pieces, kx, ky);
+    }
+
     /// The sixteen dead-zone values for the selected pad, `[min, max]` per axis.
     pub fn deadzone_values(&self) -> [[i32; 2]; 8] {
         self.deadzone.get(self.pad_sel).copied().unwrap_or(DEADZONE_DEFAULT)

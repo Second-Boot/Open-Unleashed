@@ -16,6 +16,7 @@ use crate::socket::{addr_of, record_of, CommSocket};
 use crate::wire::Addr;
 use std::io;
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 /// `add ebx, 0x64` at 0x588D8 and 0x587DBD — one player record is 100 bytes.
 pub const PLAYER_STRIDE: usize = 0x64;
@@ -26,9 +27,22 @@ pub const COUNTDOWN_AT: usize = 0x5C;
 /// What a `'p'` carries and what a record's head is worth.
 pub const RECORD_SIZE: usize = comm::RECORD_SIZE;
 
-/// `0x589440` walks bits `0 … session[0x84] - 2`, so a limit of 8 hands out seven slots and the
-/// host keeps the eighth.
-pub const DEFAULT_LIMIT: u32 = 8;
+/// `0x589440` walks bits `0 … session[0x84] - 2`. The original's host answers `'d'` with `+0x58 = 9`
+/// (captured, `REFERENCE-2026-10-02-SRVE.md` §4, both sessions) — eight joiner slots. **The `+1` (a gdb
+/// watch on the original host's descriptor copy):** the CONMAN create 0x55AAA0 copies the game's 0x34-byte descriptor
+/// (`desc+0x30` = 8, 0x509B49) to `conman+0x1D4` (`rep movsd`, 0x55AB34), reads that word (`conman+0x204`, 0x55AB73),
+/// `inc ebx` (0x55AB86) and stores it back (0x55AB8D) — the host's own player makes nine; the provider's create 0x5882A0
+/// copies the 0x34 bytes on to `session+0x54` (`rep movsd`, 0x58830B): that is `session+0x84` = 9.
+pub const DEFAULT_LIMIT: u32 = 9;
+
+/// **Port-only guard (read, network.md §7.22):** the room's masks are *bytes* in the original too —
+/// `room+0xCC0 … +0xCC4` (0x48C2B0's `1 << slot`, the lobby / started / running groups) and the input
+/// frame ring's 24-byte frames hold `3 · slot` for **eight** players (0x48C2B0: `room + 0xB0 + 24·head +
+/// 3·slot`) — so the original's session admits up to eight joiners (`'d'` limit 9) but a ninth id (slot 8)
+/// has no place in the room's masks or frames: what the original does with it was not run (it needs nine
+/// connections). The port keeps the host's slots to ids 1…7, i.e. seven joiners, so the host + 7 = 8 cars
+/// of a race (`car[0..7]`); an eighth joiner is refused (`Full`) where the original would take it.
+pub const MAX_JOINER_SLOTS: u32 = 7;
 
 /// What a poll produced. The names are the original's behaviour, not new concepts.
 #[derive(Debug, Clone, PartialEq)]
@@ -54,7 +68,7 @@ pub struct Peer {
     /// `record+0x00` — the 20 bytes 0x587DA9 hands to the transport as the `'*'` destination.
     pub addr: Addr,
     pub sock: SocketAddr,
-    /// the 16 bytes a `'j'` carries at `+0x18`
+    /// the player's name: the first field of the identity at `rec+0x48` (0x48A700's `%[^~]`), cut to 15 bytes
     pub name: [u8; 16],
     /// `record+0x5C`
     pub countdown: u32,
@@ -69,7 +83,19 @@ pub struct Peer {
     /// writes 0 to it: a scan of nfs5.exe's `c6 8x ba 00 00 00 imm` finds those five stores only). The pump
     /// 0x48A4E0 sends nothing for a record that is not in. [`Net::peer_in`].
     pub in_room: bool,
+    /// **The advertised `session+0x50` bit's lifetime**: when this slot's bit leaves the mask a `'d'` carries.
+    /// 0x589440 sets the bit and `record+0x5C = 450` at the admission; 0x587CE0 (the provider's periodic callback)
+    /// spends the count and, at its end, clears the bit (0x587D8B...0x587D92) - no leave, no `'K'`: the player stays in
+    /// the room. [`ADVERTISED_BIT_LIFE`].
+    pub adv_until: Instant,
 }
+
+/// How long a slot's bit stays in the mask a `'d'` advertises (`session+0x50`), with nothing refreshing it. **APPROXIMATION
+/// of the period only**: the count is 450 spends of 0x587CE0 (0x5E1A04 -> 0x587D82), which the original ran live on its
+/// `nfs5-third` host as 3.52 s (admission 0x589486 -> clearing 0x587D92, gdb, runs of 3.52 / 3.54 / 3.54 s; the callback
+/// was entered 900 times, two registrations per round); the timer that calls it (0x580DC0's registry, driven from
+/// 0x53C0F0) was not read, so the cadence is the measured one.
+pub const ADVERTISED_BIT_LIFE: Duration = Duration::from_millis(3530);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -93,6 +119,14 @@ pub struct Net {
     /// per-session secret: a probe with the wrong key gets no answer at all. Where the original
     /// fills `session+0x0C` from has not been read (§7.13), so a port picks its own and says so.
     pub key: [u8; 32],
+    /// What a `'w'` probe carries: the key text and its NUL (`strlen + 1`, 0x560620), 43 bytes for the
+    /// application's own key; defaults to `key` for a session that made its own.
+    pub probe_payload: Vec<u8>,
+    /// The request number an outstanding `'j'` keeps while it is repeated (0x588130 sends one buffer
+    /// again and again until the reply or the deadline).
+    join_req: Option<u32>,
+    /// the peers the data layer has already sent its connect `'q'` to ([`Net::send_frame`])
+    q_sent: std::collections::HashSet<SocketAddr>,
     /// `session+0x84`.
     pub limit: u32,
     /// `session+0x50`.
@@ -153,6 +187,9 @@ impl Net {
             pending: 0,
             name,
             key,
+            probe_payload: key.to_vec(),
+            join_req: None,
+            q_sent: std::collections::HashSet::new(),
             limit,
             mask: 0,
             desc_bytes: [0; 4],
@@ -181,6 +218,9 @@ impl Net {
             pending: 0,
             name: [0; 32],
             key,
+            probe_payload: key.to_vec(),
+            join_req: None,
+            q_sent: std::collections::HashSet::new(),
             limit: DEFAULT_LIMIT,
             mask: 0,
             desc_bytes: [0; 4],
@@ -201,6 +241,18 @@ impl Net {
         }
     }
 
+    /// **0x582700**: the data layer's send. When the link is not connected yet (`link+0x4C < 0`) an empty
+    /// `'q'` goes first, then the frame under `'='` (0x582711 / 0x58273D). Captured: one `'q'` per side, 1 ms
+    /// before the first `'='` (the ack-only frame), none after (`REFERENCE-2026-10-02-SRVE.md` §2).
+    /// **APPROXIMATION:** where the original's `link+0x4C` turns non-negative was not traced; this sends the
+    /// `'q'` once per peer, before the first frame to it, which is what both captured sessions show.
+    fn send_frame(&mut self, to: SocketAddr, frame: &[u8]) -> io::Result<usize> {
+        if self.q_sent.insert(to) {
+            let _ = self.sock.send_to(to, crate::data::CONNECT_TAG, &[]);
+        }
+        self.sock.send_to(to, crate::data::TAG, frame)
+    }
+
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.sock.local_addr()
     }
@@ -219,7 +271,7 @@ impl Net {
 
     /// `'w'` — shout the session key and see who answers with a `'d'` (0x588AB8).
     pub fn probe(&self, port: u16) -> io::Result<()> {
-        self.sock.broadcast(port, tag::W, &self.key).map(|_| ())
+        self.sock.broadcast(port, tag::W, &self.probe_payload).map(|_| ())
     }
 
     /// The `'w'` to every place [`crate::socket::probe_targets`] names — the original's own
@@ -229,13 +281,13 @@ impl Net {
     pub fn probe_all(&self, port: u16) -> Vec<(crate::socket::ProbeKind, SocketAddr, io::Result<usize>)> {
         crate::socket::probe_targets(port)
             .into_iter()
-            .map(|(k, a)| (k, a, self.sock.send_to(a, tag::W, &self.key)))
+            .map(|(k, a)| (k, a, self.sock.send_to(a, tag::W, &self.probe_payload)))
             .collect()
     }
 
     /// The same probe at one address, for a host the user typed in.
     pub fn probe_at(&self, to: SocketAddr) -> io::Result<()> {
-        self.sock.send_to(to, tag::W, &self.key).map(|_| ())
+        self.sock.send_to(to, tag::W, &self.probe_payload).map(|_| ())
     }
 
     /// `'r'` — ask a host to describe itself (0x588B06). The four bytes are the request number.
@@ -252,10 +304,22 @@ impl Net {
         self.sock.send_to(to, tag::QUERY, &p).map(|_| ())
     }
 
-    /// `'j'` — ask for a slot. `record` is the tail from `+0x28` that 0x589440 keeps.
-    pub fn join(&mut self, host: SocketAddr, record: &[u8]) -> io::Result<()> {
+    /// `'j'` — ask for a slot, as the original's 0x588030 builds it ([`Join::original`]): the host's
+    /// address at `+0x04`, 16 zeros at `+0x18`, our own record from `+0x28` with `identity` (the
+    /// `name~version~game` text) at `rec+0x48`. Repeating the call while no `'a'` has come repeats the
+    /// same request number, as 0x588130's loop does.
+    pub fn join(&mut self, host: SocketAddr, identity: &[u8]) -> io::Result<()> {
         self.host = Some(host);
-        let j = Join { request: self.open_request(), from: self.record()?, name: self.my_name, record: record.to_vec() };
+        let request = match self.join_req {
+            Some(r) => r,
+            None => {
+                let r = self.open_request();
+                self.join_req = Some(r);
+                r
+            }
+        };
+        let to = record_of(host).unwrap_or_default();
+        let j = Join::original(request, to, self.record()?, identity);
         self.sock.send_to(host, tag::JOIN, &j.encode()).map(|_| ())
     }
 
@@ -342,7 +406,7 @@ impl Net {
             }
             let conn = self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now));
             let f = conn.send_unreliable(bytes, now);
-            self.sock.send_to(to, crate::data::TAG, &f)?;
+            self.send_frame(to, &f)?;
         }
         Ok(())
     }
@@ -371,7 +435,7 @@ impl Net {
         let conn = self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now));
         match conn.send(body, now) {
             Some(f) => {
-                let _ = self.sock.send_to(to, crate::data::TAG, &f);
+                let _ = self.send_frame(to, &f);
                 true
             }
             None => false,
@@ -413,7 +477,7 @@ impl Net {
         let conn = self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now));
         match conn.send(body, now) {
             Some(f) => {
-                let _ = self.sock.send_to(to, crate::data::TAG, &f);
+                let _ = self.send_frame(to, &f);
                 true
             }
             None => false,
@@ -473,13 +537,13 @@ impl Net {
             }
         }
         for (to, f) in out {
-            let _ = self.sock.send_to(to, crate::data::TAG, &f);
+            let _ = self.send_frame(to, &f);
         }
     }
 
     /// `0x5894C0` literally: tag `'<'`, no header, and a null address, which 0x5872C0 turns into
     /// the subnet broadcast on the socket's own port. Every peer must be bound to `port` for this
-    /// to reach them, which is why the original uses the fixed 1106.
+    /// to reach them, which is why the original uses a fixed port.
     pub fn broadcast_game(&self, port: u16, bytes: &[u8]) -> io::Result<()> {
         self.sock.broadcast(port, tag::USER, bytes).map(|_| ())
     }
@@ -563,6 +627,7 @@ impl Net {
                 if let Ok(a) = JoinReply::decode(p)
                     && a.request == self.pending
                     {
+                        self.join_req = None;
                         self.ping = comm::PING_TICKS;
                         self.alive = comm::ALIVE_TICKS;
                         match a.status {
@@ -580,6 +645,7 @@ impl Net {
             // 0x5890ED's keep-alive carries nothing; 0x582700's data frame carries a frame.
             tag::ALIVE if p.is_empty() => {
                 if self.role == Role::Host {
+                    self.refresh_advertised(from);
                     self.refresh(from);
                 } else if self.host == Some(from) {
                     self.alive = comm::ALIVE_TICKS;
@@ -587,6 +653,16 @@ impl Net {
             }
             tag::ALIVE => {
                 let slot = if self.role == Role::Host { self.refresh(from) } else { None };
+                // (live, the original hosting): the original host's `'*'` ping rounds stop ~3 s after admission (two originals' capture:
+                // `'*'` at 0.78 / 1.56 / 2.34 / 3.12 s and none after), what keeps the link alive afterwards is its data layer's frames.
+                // read the original's own test (network.md 7.21): **there is none** — `conn+0xAC` is decremented by 0x587D10 and read
+                // only by 0x588220 (the connect's "already connected" compare) and 0x58908A (the `'*'` rearm); events 9 / 10 of 0x48F0C4 come
+                // only from the CONMAN's command 7 (0x55CB75), which the two disconnect members (`[link+0x84]` = 0x55B480, `[conman+0x270]` =
+                // 0x55CDE0) queue, and nothing in the image calls either member. So the original never declares a silent host lost; this is a
+                // **PORT-ONLY GUARD** (PORT-DEVIATIONS.md), not an approximation of a test: any datagram from the host counts as life.
+                if self.role == Role::Client && self.host == Some(from) {
+                    self.ping = comm::PING_TICKS;
+                }
                 let now = self.ticks();
                 let conn = self.conns.entry(from).or_insert_with(|| crate::reliable::Conn::new(now));
                 for body in conn.receive(p, now) {
@@ -595,7 +671,10 @@ impl Net {
                     // (`0xBC` is the room's own relay with the lobby-group gate, 0x48C050: the caller's)
                     if self.relay && !msg_for_the_host(&body) && body.first() != Some(&crate::msg::kind::OPTIONS) {
                         let reliable = self.is_reliable(&body);
-                        let others: Vec<SocketAddr> = self.everyone().into_iter().filter(|&a| a != from).collect();
+                        // 0x48C0F0 skips the sender for `0xBF` … `0xC2` and **not for `0xBD`**: the barrier's bit comes back to the joiner that
+                        // sent it (captured, REFERENCE-2026-10-02-SRVX: the original host answers a joiner's `0xBD 1` with `0xBD 1`)
+                        let echo = body.first() == Some(&0xBD);
+                        let others: Vec<SocketAddr> = self.everyone().into_iter().filter(|&a| echo || a != from).collect();
                         for to in others {
                             if reliable && self.host_register(to, &body) {
                                 continue;
@@ -605,7 +684,7 @@ impl Net {
                             }
                             let c = self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now));
                             let f = c.send_unreliable(&body, now);
-                            let _ = self.sock.send_to(to, crate::data::TAG, &f);
+                            let _ = self.send_frame(to, &f);
                         }
                     }
                     out.push(Event::Data { from, slot, bytes: body });
@@ -613,6 +692,7 @@ impl Net {
             }
             tag::STAR => {
                 if self.role == Role::Host {
+                    self.refresh_advertised(from);
                     self.refresh(from);
                 } else if self.host == Some(from) {
                     // 0x5890C3: a client answers the ping with another '*' and rearms 0xAC
@@ -632,15 +712,10 @@ impl Net {
                     self.outbox.clear();
                 }
             }
-            tag::Q => {
-                let _ = self.sock.send_to(from, tag::QUIT_ACK, &[]);
-                out.push(Event::Quit { from });
-                if self.role == Role::Host
-                    && let Some(i) = self.slot_of(from)
-                {
-                    self.drop_slot(i, out);
-                }
-            }
+            // 0x589029: `if (conn+0x14 != NULL && conn+0x14(...) == 0) send '!'`. The game's session has no such
+            // callback — captured: the host never answered the data layer's connect `'q'` (0x582711) with a
+            // `'!'`, and a `'q'` takes nothing away (the room's players leave by `'K'`/`'b'` or the countdown)
+            tag::Q => {}
             tag::USER => {
                 let slot = if self.role == Role::Host { self.refresh(from) } else { None };
                 if self.relay {
@@ -673,23 +748,47 @@ impl Net {
         self.peers.get(i)?.as_ref().map(|p| p.record)
     }
 
+    /// `session+0x50` as a `'d'` carries it: the admitted slots whose bit has not yet run out ([`Peer::adv_until`]).
+    pub fn advertised_mask(&self) -> u32 {
+        let now = Instant::now();
+        self.peers.iter().enumerate().filter(|(_, p)| p.as_ref().is_some_and(|p| p.adv_until > now)).fold(0, |m, (i, _)| m | 1 << i)
+    }
+
+    /// 0x588890 for the two keep-alive tags (`'='` with no body, `'*'`): it walks only the slots whose bit is still set,
+    /// so a bit that has run out is not brought back; a refresh gives the slot 450 spends again.
+    fn refresh_advertised(&mut self, from: SocketAddr) {
+        let now = Instant::now();
+        if let Some(i) = self.slot_of(from)
+            && let Some(p) = self.peers[i as usize].as_mut()
+            && p.adv_until > now
+        {
+            p.adv_until = now + ADVERTISED_BIT_LIFE;
+        }
+    }
+
     /// 0x5892A0, with the fields this port knows about; the rest are zero and §7.10 says so.
     fn describe(&self, to: SocketAddr, request: u32) -> io::Result<()> {
+        let g = &comm::APP_GUID;
         let d = Describe {
             request,
             from: match self.advertise {
                 Some(a) => a,
                 None => self.record()?,
             },
-            conn_dword: 0,
-            conn_words: [0, 0],
-            conn_raw: [0, 0],
+            // +0x18…+0x27 = the application's GUID in the text order of 0x587F90 (captured:
+            // `5cd46b81 ece4 11d3 | 9b6a0090 2724ab1e`): u32be, u16be, u16be, two plain dwords
+            conn_dword: u32::from_le_bytes([g[0], g[1], g[2], g[3]]),
+            conn_words: [u16::from_le_bytes([g[4], g[5]]), u16::from_le_bytes([g[6], g[7]])],
+            conn_raw: [u32::from_le_bytes([g[8], g[9], g[10], g[11]]), u32::from_le_bytes([g[12], g[13], g[14], g[15]])],
             name: self.name,
             bytes: self.desc_bytes,
             words: self.desc_words,
             dwords: [0, 0],
             player_limit: self.limit,
-            slot_mask: self.mask,
+            // `session+0x50` (0x589386 -> payload +0x6C): the bit 0x589440 sets at an admission, cleared by 0x587D92 once
+            // the slot's 450 spends are gone (gdb on the original host: set 0x589486, cleared 3.52 s later; the
+            // steady state is 0 with a player in the room, `REFERENCE-2026-10-02-SRVE.md` §4)
+            slot_mask: self.advertised_mask(),
         };
         self.sock.send_to(to, tag::DESCRIBE, &d.encode()).map(|_| ())
     }
@@ -703,31 +802,40 @@ impl Net {
         }
         // 0x588E4F…0x588E67: the full test comes first (`popcount(mask) >= limit − 1`, −2), then the
         // name (0x588E7E, −1), then the slot (0x589440) and the game's callback (−3)
-        let Some(slot) = comm::free_slot(self.mask, self.limit) else {
+        let Some(slot) = comm::free_slot(self.mask, self.limit.min(MAX_JOINER_SLOTS + 1)) else {
             return JoinReply { status: JoinStatus::Full, ..echo };
         };
         if j.name == self.my_name && self.my_name != [0; 16] {
             return JoinReply { status: JoinStatus::NameTaken, ..echo };
         }
         if let Some(version) = &self.identity_gate {
-            let (_, v, _) = comm::identity::parse(&j.record);
+            let (_, v, _) = comm::identity::parse(j.identity());
             if &v != version {
                 return JoinReply { status: JoinStatus::Refused, ..echo };
             }
         }
+        // 0x589440 keeps the 0x5C bytes at `+0x28`; 0x588E11 then writes the datagram's source address
+        // over the first five dwords
         let mut record = [0u8; RECORD_SIZE];
+        let have = j.record.len().min(RECORD_SIZE);
+        record[..have].copy_from_slice(&j.record[..have]);
         let addr = record_of(from).unwrap_or(j.from);
         record[..20].copy_from_slice(&addr.0);
-        let tail = j.record.len().min(RECORD_SIZE - 20);
-        record[20..20 + tail].copy_from_slice(&j.record[..tail]);
+        // the game reads the name out of the identity (0x48A700's first `%[^~]`)
+        let (id_name, _, _) = comm::identity::parse(j.identity());
+        let mut name = [0u8; 16];
+        for (o, c) in name.iter_mut().take(15).zip(id_name.chars()) {
+            *o = u8::try_from(u32::from(c)).unwrap_or(b'?');
+        }
         self.peers[slot as usize] = Some(Peer {
             addr,
             sock: from,
-            name: j.name,
+            name,
             countdown: comm::PING_TICKS,
             record,
             queue: crate::outbox::PeerQueue::new(),
             in_room: false,
+            adv_until: Instant::now() + ADVERTISED_BIT_LIFE,
         });
         self.mask |= 1 << slot;
         JoinReply { status: JoinStatus::Joined(slot), ..echo }
@@ -744,6 +852,7 @@ impl Net {
     fn drop_slot(&mut self, i: u32, out: &mut Vec<Event>) {
         if let Some(p) = self.peers[i as usize].take() {
             self.conns.remove(&p.sock);
+            self.q_sent.remove(&p.sock);
             self.mask &= !(1 << i);
             out.push(Event::PeerLeft { slot: i });
         }
@@ -770,6 +879,9 @@ impl Net {
                 continue;
             }
             let Some(p) = self.peers[i as usize].as_mut() else { continue };
+            // PORT-DEVIATION D16: the slot is held while the joiner talks (`refresh` on its datagrams) and dropped after
+            // PING_TICKS of silence at the port's 64 Hz (~7 s). The original's refresh never matches on UDP/IP (0x560790
+            // compares the record's self-reported 0.0.0.0 with the source), so its slot frees itself ~3.5 s after admission.
             if p.countdown == 0 {
                 self.drop_slot(i, &mut out);
                 continue;
@@ -805,7 +917,8 @@ impl Net {
 /// relays (0x48C050, 0x48C0F0, 0x48C170).
 fn msg_for_the_host(body: &[u8]) -> bool {
     match body.first() {
-        Some(&crate::msg::kind::CHAT | &crate::msg::kind::PING) => true,
+        // `0xFF` is the CONMAN's hello (0x55CED0 / 0x560420): the host's link layer answers it, nobody else gets it
+        Some(&crate::msg::kind::CHAT | &crate::msg::kind::PING | &0xFF) => true,
         // the input exchange's messages to the room: a player's three input bytes (any type below
         // `0xB0`, 0x49120C -> 0x48A2C0), its `0xB3` request, `0xC5` (start) and `0xB7` (report)
         Some(&t) => t < 0xB0 || matches!(t, crate::msg::kind::START | 0xB7 | 0xC5),

@@ -506,6 +506,207 @@ pub struct ReplaySetup {
     /// `.CAMERA` (id 0x148, car slot 0 `+0x208`, four dwords, `Camera.1...4`: 0x4EF02A...0x4EF0F5):
     /// the recording's list, `None` for a file that carries none (the last launch's stays).
     pub camera: Option<Vec<u32>>,
+    /// The player's car-info record (slot 0): the installed parts, their wear, the seventeen sliders and the
+    /// damage the car starts with (`.PARTINDEX` 0x14B, `.PARTDAMAGE` 0x14C, the sliders, `.DAMAGEZONES` 0x14D) -
+    /// what the launch's 0x4EEDA0 wrote and 0x49C4C0 / 0x49CB50 / 0x49D290 build the car from. `None` for a file
+    /// that carries none: the playback's car is then a fresh catalogue car (APPROXIMATION, logged).
+    pub player: Option<CarRecord>,
+    /// The opponents' car-info records (slots 1...8, the plan the race built them from: the draw or the career's
+    /// own list). `None` = the file carries none: the playback draws them again (APPROXIMATION, logged).
+    pub opponent_cars: Option<Vec<CarRecord>>,
+    /// `SCENENUMBER` (id 0x1C): the `_ST<N>` skill-test scene, 0 = none. `None` = the file carries none.
+    pub scene: Option<i16>,
+    /// `DERBY` (id 0x1B): the smash-up cheat the race ran under; `None` = the file carries none.
+    pub derby: Option<bool>,
+    /// `NOCOLLISION` (id 0x29, +0x24): a positional network race's car-car pass skipped.
+    pub nocollision: Option<bool>,
+    /// `.TRANSMISSION` (id 0x221, `carinfo+0xC`, +0xC of every car slot): the gearbox word the launch wrote
+    /// (`Car.Transmission`'s index, 1 = automatic; 0 for the Factory Driver mission 0x1D's own car) — the word
+    /// 0x49D290's manual ×1.05 and the shift logic read, from the block `Replay_begin` restores, **not** the
+    /// session's option. `None` = the file carries none: the playback takes the option (APPROXIMATION, logged).
+    pub transmission: Option<bool>,
+    /// `.TRANSMISSION` of the opponents' slots (+0xC of slot 1…): the option, while the player's own word is 0 in
+    /// Factory Driver mission 0x1D (only the player's 0x4EEDA0 call passes that flag, 0x4EBA4D). `None` = the file
+    /// carries none: the opponents take the player's word (what the one word served before GB).
+    pub opponent_transmission: Option<bool>,
+    /// The Factory Driver mission's words the launch wrote into the block (0x4EC040: `FACTORYDRIVERPASSID1..3`
+    /// 0xF4…, `FAILID1..3`, `TIMELIMIT`, `DAMAGELIMIT`, `CONEIMIT`, `TCONEPENALTY`, `CHARACTER`, `MINRANK`;
+    /// [`MISSION_WORDS`] at their block offsets, [`mission_words`] makes them): the rules the HUD and the summary
+    /// read in the playback — **from the block** `Replay_begin` restores, not from the profile's current mission
+    /// 0x51AE80 (which no race code calls, `replay.md` §18.18). `None` = not a mission (or a file from before it).
+    pub mission: Option<[i32; 12]>,
+}
+
+/// The block offsets of the twelve mission words, in [`mission_words`]'s order: `0x65780C…0x657820` (the pass and
+/// fail text ids), `0x657824` time limit, `0x657828` damage limit, `0x65782C` cone limit, `0x657830` cone
+/// penalty, `0x657838` narrator, `0x65783C` minimum rank (`skill-tests.md` §3), less the block base `0x6573E8`.
+/// `0x657834` between them is the verdict `HMissionSummary::evaluate` writes, never a launch word.
+pub const MISSION_WORDS: [usize; 12] = [0x424, 0x428, 0x42C, 0x430, 0x434, 0x438, 0x43C, 0x440, 0x444, 0x448, 0x450, 0x454];
+
+/// What 0x4EC040 sends for a mission record (`skill-tests.md` §3): the ids `+0x58…` / `+0x64…`; the limits as
+/// `+0xC2` / `+0xC6` / `+0xCC` / `+0xCE` or −1 when their flag (`+0xC1` / `+0xC4` / `+0xC8` with the kind `+0xCA`)
+/// is clear; the narrator `+0x1E`; the minimum rank `+0xD2` or 0.
+pub fn mission_words(m: &nfs_formats::career::Mission) -> [i32; 12] {
+    use nfs_formats::career::ConeRule;
+    let mut w = [0i32; 12];
+    for k in 0..3 {
+        w[k] = m.success_string_ids[k] as i32;
+        w[3 + k] = m.failure_string_ids[k] as i32;
+    }
+    w[6] = m.time_limit_s.map_or(-1, i32::from);
+    w[7] = m.damage_limit_pct.map_or(-1, i32::from);
+    w[8] = match m.cone_rule {
+        Some(ConeRule::Limit(n)) => i32::from(n),
+        _ => -1,
+    };
+    w[9] = match m.cone_rule {
+        Some(ConeRule::PenaltySeconds(n)) => i32::from(n),
+        _ => -1,
+    };
+    w[10] = i32::from(m.narrator);
+    w[11] = m.min_rank.map_or(0, i32::from);
+    w
+}
+
+/// One car's launch record: the fields of the per-slot car-info record (`replay.md` 16.2) the port's race
+/// build reads of a car.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CarRecord {
+    /// `.TYPE` 0x21F: the `nfs5.car` record id
+    pub car_id: u16,
+    /// `.COLOUR` 0x225 (exterior)
+    pub paint: [u8; 3],
+    /// `.DRIVERNAME` 0x13B
+    pub name: String,
+    /// `.STARTINGPOS` 0x247 as the port's `grid_pos` (`g - 1`); `None` = the sequential slot
+    pub grid: Option<u32>,
+    /// `.RACENUMBER` 0x24D (-1 = none)
+    pub decal: i32,
+    /// `.PERSONALITY` 0x23E
+    pub personality: i16,
+    /// the event difficulty `d` (`.SKILL* = d x per.mean`, `career.md` 10.6)
+    pub difficulty: f32,
+    /// `(mean, range)` of the four bend classes slow / medium / fast / default (`.SKILL*` 0x23F-0x242,
+    /// `.SKILLRANGE*` 0x243-0x246); `None` = no personality: the AI keeps its defaults
+    pub skill: Option<[[f32; 2]; 4]>,
+    /// `.PARTINDEX` 0x14B (at most 20 ids); `None` = the car's stock list
+    pub parts: Option<Vec<i16>>,
+    /// `.PARTDAMAGE` 0x14C, one per listed part (empty = the table's own state)
+    pub part_damage: Vec<f32>,
+    /// `.DAMAGEZONES` 0x14D
+    pub damage: [f32; 10],
+    /// the seventeen sliders (`.FRONTDOWNFORCE` ... `.FINALRATIO`); `None` = the constructor's neutral ones
+    pub setup: Option<[f32; 17]>,
+}
+
+impl CarRecord {
+    fn write(&self, o: &mut Vec<u8>) {
+        o.extend_from_slice(&self.car_id.to_le_bytes());
+        o.extend_from_slice(&self.paint);
+        o.extend_from_slice(&(self.name.len() as u32).to_le_bytes());
+        o.extend_from_slice(self.name.as_bytes());
+        match self.grid {
+            Some(g) => {
+                o.push(1);
+                o.extend_from_slice(&g.to_le_bytes());
+            }
+            None => o.push(0),
+        }
+        o.extend_from_slice(&self.decal.to_le_bytes());
+        o.extend_from_slice(&self.personality.to_le_bytes());
+        o.extend_from_slice(&self.difficulty.to_le_bytes());
+        match &self.skill {
+            Some(s) => {
+                o.push(1);
+                for pair in s {
+                    o.extend_from_slice(&pair[0].to_le_bytes());
+                    o.extend_from_slice(&pair[1].to_le_bytes());
+                }
+            }
+            None => o.push(0),
+        }
+        match &self.parts {
+            Some(p) => {
+                o.push(1);
+                o.extend_from_slice(&(p.len() as u32).to_le_bytes());
+                for id in p {
+                    o.extend_from_slice(&id.to_le_bytes());
+                }
+            }
+            None => o.push(0),
+        }
+        o.extend_from_slice(&(self.part_damage.len() as u32).to_le_bytes());
+        for d in &self.part_damage {
+            o.extend_from_slice(&d.to_le_bytes());
+        }
+        for d in &self.damage {
+            o.extend_from_slice(&d.to_le_bytes());
+        }
+        match &self.setup {
+            Some(s) => {
+                o.push(1);
+                for v in s {
+                    o.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            None => o.push(0),
+        }
+    }
+
+    fn parse(d: &[u8], p: &mut usize) -> Option<Self> {
+        let take = |p: &mut usize, n: usize| -> Option<&[u8]> {
+            let s = d.get(*p..*p + n)?;
+            *p += n;
+            Some(s)
+        };
+        let f32r = |p: &mut usize| -> Option<f32> { Some(f32::from_le_bytes(take(p, 4)?.try_into().ok()?)) };
+        let car_id = u16::from_le_bytes(take(p, 2)?.try_into().ok()?);
+        let paint = [take(p, 1)?[0], take(p, 1)?[0], take(p, 1)?[0]];
+        let n = u32::from_le_bytes(take(p, 4)?.try_into().ok()?) as usize;
+        let name = String::from_utf8_lossy(take(p, n)?).to_string();
+        let grid = if take(p, 1)?[0] != 0 { Some(u32::from_le_bytes(take(p, 4)?.try_into().ok()?)) } else { None };
+        let decal = i32::from_le_bytes(take(p, 4)?.try_into().ok()?);
+        let personality = i16::from_le_bytes(take(p, 2)?.try_into().ok()?);
+        let difficulty = f32r(p)?;
+        let skill = if take(p, 1)?[0] != 0 {
+            let mut s = [[0f32; 2]; 4];
+            for pair in s.iter_mut() {
+                *pair = [f32r(p)?, f32r(p)?];
+            }
+            Some(s)
+        } else {
+            None
+        };
+        let parts = if take(p, 1)?[0] != 0 {
+            let n = u32::from_le_bytes(take(p, 4)?.try_into().ok()?) as usize;
+            let mut v = Vec::new();
+            for _ in 0..n.min(64) {
+                v.push(i16::from_le_bytes(take(p, 2)?.try_into().ok()?));
+            }
+            Some(v)
+        } else {
+            None
+        };
+        let n = u32::from_le_bytes(take(p, 4)?.try_into().ok()?) as usize;
+        let mut part_damage = Vec::new();
+        for _ in 0..n.min(64) {
+            part_damage.push(f32r(p)?);
+        }
+        let mut damage = [0f32; 10];
+        for v in damage.iter_mut() {
+            *v = f32r(p)?;
+        }
+        let setup = if take(p, 1)?[0] != 0 {
+            let mut s = [0f32; 17];
+            for v in s.iter_mut() {
+                *v = f32r(p)?;
+            }
+            Some(s)
+        } else {
+            None
+        };
+        Some(Self { car_id, paint, name, grid, decal, personality, difficulty, skill, parts, part_damage, damage, setup })
+    }
 }
 
 /// An input-exchange race's setup beyond [`ReplaySetup`]'s single car: the original's snapshot block
@@ -757,6 +958,55 @@ impl ReplayFile {
                 None => o.push(0),
             }
         }
+        // the car-info records and the rest of the block: a second trailing section, marker 2
+        if s.player.is_some() || s.opponent_cars.is_some() || s.scene.is_some() || s.derby.is_some() || s.nocollision.is_some() || s.transmission.is_some() || s.opponent_transmission.is_some() || s.mission.is_some() {
+            if s.race_type.is_none() && s.fegame_type.is_none() && s.camera.is_none() {
+                // the first trailing section is the reader's way in: an empty one (all three absent)
+                o.extend_from_slice(&[1, 0xFF, 0xFF, 0]);
+            }
+            o.push(2);
+            match &s.player {
+                Some(c) => {
+                    o.push(1);
+                    c.write(&mut o);
+                }
+                None => o.push(0),
+            }
+            match &s.opponent_cars {
+                Some(list) => {
+                    o.push(1);
+                    o.extend_from_slice(&(list.len() as u32).to_le_bytes());
+                    for c in list {
+                        c.write(&mut o);
+                    }
+                }
+                None => o.push(0),
+            }
+            match s.scene {
+                Some(n) => {
+                    o.push(1);
+                    o.extend_from_slice(&n.to_le_bytes());
+                }
+                None => o.push(0),
+            }
+            let tri = |v: Option<bool>| v.map_or(0xFF, u8::from);
+            o.push(tri(s.derby));
+            o.push(tri(s.nocollision));
+            // RP: the gearbox word, a third byte of the section (a file without it ends here: `None`)
+            o.push(tri(s.transmission));
+            // RP: the mission's words (a flag byte, then twelve little-endian words)
+            match &s.mission {
+                Some(w) => {
+                    o.push(1);
+                    for v in w {
+                        o.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                None => o.push(0),
+            }
+            // GB: the opponents' gearbox word, after the mission's words
+            o.push(tri(s.opponent_transmission));
+        }
         o
     }
 
@@ -816,8 +1066,52 @@ impl ReplayFile {
                 }
                 camera = Some(list);
             }
+            p += 4 + n.saturating_sub(1) * 4;
         }
-        Some(Self { setup: ReplaySetup { track, car, sim, car_id, paint, laps, opponents, traffic, cops, damage, backwards, mirror, seed, skill, driver_name, net, race_type, fegame_type, camera }, final_tick, stream })
+        let (mut player, mut opponent_cars, mut scene, mut derby, mut nocollision, mut transmission) = (None, None, None, None, None, None);
+        let mut opponent_transmission = None;
+        let mut mission = None;
+        if d.get(p) == Some(&2) {
+            p += 1;
+            if *d.get(p)? != 0 {
+                p += 1;
+                player = Some(CarRecord::parse(d, &mut p)?);
+            } else {
+                p += 1;
+            }
+            if *d.get(p)? != 0 {
+                let n = u32::from_le_bytes(d.get(p + 1..p + 5)?.try_into().ok()?) as usize;
+                p += 5;
+                let mut list = Vec::new();
+                for _ in 0..n.min(16) {
+                    list.push(CarRecord::parse(d, &mut p)?);
+                }
+                opponent_cars = Some(list);
+            } else {
+                p += 1;
+            }
+            if *d.get(p)? != 0 {
+                scene = Some(i16::from_le_bytes(d.get(p + 1..p + 3)?.try_into().ok()?));
+                p += 3;
+            } else {
+                p += 1;
+            }
+            let tri = |b: u8| (b != 0xFF).then_some(b != 0);
+            derby = tri(*d.get(p)?);
+            nocollision = tri(*d.get(p + 1)?);
+            transmission = d.get(p + 2).and_then(|b| tri(*b));
+            if d.get(p + 3) == Some(&1) {
+                let mut w = [0i32; 12];
+                for (k, v) in w.iter_mut().enumerate() {
+                    *v = i32::from_le_bytes(d.get(p + 4 + k * 4..p + 8 + k * 4)?.try_into().ok()?);
+                }
+                mission = Some(w);
+            }
+            // the byte after the mission's words (a file from before GB ends there: `None`)
+            let after = if d.get(p + 3) == Some(&1) { p + 52 } else { p + 4 };
+            opponent_transmission = d.get(after).and_then(|b| tri(*b));
+        }
+        Some(Self { setup: ReplaySetup { track, car, sim, car_id, paint, laps, opponents, traffic, cops, damage, backwards, mirror, seed, skill, driver_name, net, race_type, fegame_type, camera, player, opponent_cars, scene, derby, nocollision, transmission, opponent_transmission, mission }, final_tick, stream })
     }
 }
 
@@ -836,6 +1130,10 @@ pub mod snapshot {
     pub const NUM_LAPS: usize = 0x0008;
     pub const SKILL: usize = 0x000C;
     pub const NOCOLLISION: usize = 0x0024;
+    /// `DERBY` (id 0x1B, +0x18)
+    pub const DERBY: usize = 0x0018;
+    /// `SCENENUMBER` (id 0x1C, +0x898)
+    pub const SCENENUMBER: usize = 0x0898;
     pub const COPS: usize = 0x002C;
     pub const TRAFFIC_DENSITY: usize = 0x0030;
     pub const LOCAL_CAR: usize = 0x0034;
@@ -961,6 +1259,92 @@ pub mod snapshot {
     }
 }
 
+
+/// The seventeen car-setup sliders' ids in `FECar +0x6D0` order (0x4EF188...0x4EF32F), what `CarSpecs::apply_setup` takes
+/// its array in (`nfs_net::launchcar::SETUP_IDS`).
+const SETUP_IDS: [u32; 17] = [0x22F, 0x230, 0x231, 0x232, 0x234, 0x235, 0x236, 0x237, 0x238, 0x22E, 0x228, 0x229, 0x22A, 0x22B, 0x22C, 0x22D, 0x227];
+
+/// A [`CarRecord`] into car slot `slot` of the snapshot: `.TYPE`, `.COLOUR`, `.DRIVERNAME`, `.STARTINGPOS`,
+/// `.RACENUMBER`, `.PERSONALITY`, the eight `.SKILL*` floats (`d x mean`, `range`), `.PARTINDEX`, `.PARTDAMAGE`,
+/// `.DAMAGEZONES` and the sliders (`trunc(v x 65536)`, 0x4A5400).
+fn put_car_record(out: &mut [u8], slot: usize, c: &CarRecord, n_cars: u32) {
+    use snapshot as f;
+    if slot >= 9 {
+        return;
+    }
+    let base = f::CARS + slot * f::CAR_STRIDE;
+    let put = |o: &mut [u8], at: usize, v: u32| o[base + at..base + at + 4].copy_from_slice(&v.to_le_bytes());
+    put(out, f::CAR_TYPE, c.car_id as u32);
+    put(out, f::CAR_COLOUR, (c.paint[0] as u32) << 16 | (c.paint[1] as u32) << 8 | c.paint[2] as u32);
+    let dn = c.name.as_bytes();
+    let n = dn.len().min(f::CAR_DRIVERNAME_LEN - 1);
+    out[base + f::CAR_DRIVERNAME..base + f::CAR_DRIVERNAME + n].copy_from_slice(&dn[..n]);
+    // `.STARTINGPOS` 1 = pole: `grid + 1`, or the sequential slot 0x4ECF00 gives (`n_cars - slot`)
+    put(out, 0x174, c.grid.map_or(n_cars.saturating_sub(slot as u32), |g| g + 1));
+    put(out, 0x510, c.decal as u32);
+    put(out, 0x14C, c.personality as i32 as u32);
+    if let Some(sk) = &c.skill {
+        for (k, pair) in sk.iter().enumerate() {
+            put(out, 0x154 + 4 * k, (c.difficulty * pair[0]).to_bits());
+            put(out, 0x164 + 4 * k, pair[1].to_bits());
+        }
+    }
+    if let Some(parts) = &c.parts {
+        for (k, id) in parts.iter().take(20).enumerate() {
+            put(out, 0x28 + 4 * k, *id as i32 as u32);
+        }
+    }
+    for (k, d) in c.part_damage.iter().take(20).enumerate() {
+        put(out, 0x78 + 4 * k, d.to_bits());
+    }
+    for (k, d) in c.damage.iter().enumerate() {
+        put(out, 0xC8 + 4 * k, d.to_bits());
+    }
+    if let Some(setup) = &c.setup {
+        for (id, v) in SETUP_IDS.iter().zip(setup) {
+            if let Some((off, _)) = f::car_field(*id) {
+                put(out, off, (*v * 65536.0) as i32 as u32);
+            }
+        }
+    }
+}
+
+/// The inverse of [`put_car_record`] for slot `slot` of a snapshot; `None` when the slot holds no car (`.TYPE` 0).
+fn get_car_record(data: &[u8], slot: usize) -> Option<CarRecord> {
+    use snapshot as f;
+    let base = f::CARS + slot * f::CAR_STRIDE;
+    let u32at = |at: usize| u32::from_le_bytes(data[base + at..base + at + 4].try_into().unwrap());
+    let f32at = |at: usize| f32::from_bits(u32at(at));
+    let car_id = u32at(f::CAR_TYPE) as u16;
+    if car_id == 0 {
+        return None;
+    }
+    let colour = u32at(f::CAR_COLOUR);
+    let dn = &data[base + f::CAR_DRIVERNAME..base + f::CAR_DRIVERNAME + f::CAR_DRIVERNAME_LEN];
+    let name: String = dn[..dn.iter().position(|b| *b == 0).unwrap_or(dn.len())].iter().map(|&b| b as char).collect();
+    let pos = u32at(0x174);
+    let personality = u32at(0x14C) as i32 as i16;
+    let skill = (personality != 0).then(|| std::array::from_fn(|k| [f32at(0x154 + 4 * k), f32at(0x164 + 4 * k)]));
+    let ids: Vec<i16> = (0..20).map(|k| u32at(0x28 + 4 * k) as i32 as i16).filter(|id| *id != 0).collect();
+    let part_damage: Vec<f32> = if ids.is_empty() { Vec::new() } else { (0..ids.len()).map(|k| f32at(0x78 + 4 * k)).collect() };
+    let words: Vec<u32> = SETUP_IDS.iter().map(|id| f::car_field(*id).map_or(0, |(off, _)| u32at(off))).collect();
+    let setup = words.iter().any(|w| *w != 0).then(|| std::array::from_fn(|k| words[k] as i32 as f32 / 65536.0));
+    Some(CarRecord {
+        car_id,
+        paint: [(colour >> 16) as u8, (colour >> 8) as u8, colour as u8],
+        name,
+        grid: (pos != 0).then(|| pos - 1),
+        decal: u32at(0x510) as i32,
+        personality,
+        difficulty: 1.0,
+        skill,
+        parts: (!ids.is_empty()).then_some(ids),
+        part_damage,
+        damage: std::array::from_fn(|k| f32at(0xC8 + 4 * k)),
+        setup,
+    })
+}
+
 /// Write launch records — `(option id, the words after the slot)` — into car slot `slot` of the snapshot `out` the way
 /// 0x4B4B80 fills the per-slot table: each id at its field, the words little-endian, cut at the field's end.
 fn put_car_words(out: &mut [u8], slot: usize, words: &[(u32, Vec<u32>)]) {
@@ -1027,6 +1411,33 @@ pub fn original_rpl(setup: &ReplaySetup, final_tick: u64, stream: &[u8], ramp: R
     if let Some(c) = &setup.camera {
         for (k, v) in c.iter().take(f::CAR_CAMERA_LEN).enumerate() {
             put(&mut out, base + f::CAR_CAMERA + k * 4, *v);
+        }
+    }
+    // the block's other launch words and the car-info records: `DERBY`, `NOCOLLISION`, `SCENENUMBER`, the
+    // player's record in slot 0 and the opponents' in slots 1...
+    put(&mut out, f::DERBY, u32::from(setup.derby.unwrap_or(false)));
+    put(&mut out, f::NOCOLLISION, u32::from(setup.nocollision.unwrap_or(false)));
+    put(&mut out, f::SCENENUMBER, setup.scene.unwrap_or(0) as i32 as u32);
+    if setup.net.is_none() {
+        // `.TRANSMISSION` +0xC of every racer slot (the launch sends the one gearbox option to each car, 0x4EEDA0)
+        // (GB: slot 0 the player's word, slots 1... the opponents' — they differ in mission 0x1D)
+        if let Some(a) = setup.transmission {
+            for slot in 0..=(setup.opponents as usize).min(8) {
+                let w = if slot == 0 { a } else { setup.opponent_transmission.unwrap_or(a) };
+                put(&mut out, f::CARS + slot * f::CAR_STRIDE + f::CAR_TRANSMISSION, u32::from(w));
+            }
+        }
+        // the mission's words at their block offsets (0x4EC040's options 0xF4…0xFF)
+        if let Some(w) = &setup.mission {
+            for (at, v) in MISSION_WORDS.iter().zip(w) {
+                put(&mut out, *at, *v as u32);
+            }
+        }
+        if let Some(c) = &setup.player {
+            put_car_record(&mut out, 0, c, num_cars);
+        }
+        for (k, c) in setup.opponent_cars.iter().flatten().enumerate() {
+            put_car_record(&mut out, k + 1, c, num_cars);
         }
     }
     if let Some(net) = &setup.net {
@@ -1119,6 +1530,24 @@ pub fn parse_original_rpl(data: &[u8]) -> Option<(ReplaySetup, u64, Vec<u8>)> {
         race_type: Some(u32at(f::RACE_TYPE) as u8),
         fegame_type: Some(u32at(f::FEGAME_TYPE) as u8),
         camera: Some((0..f::CAR_CAMERA_LEN).map(|k| u32at(f::CARS + f::CAR_CAMERA + k * 4)).collect()),
+        // the car-info records: slot 0 the player's, slots 1... the opponents'; a file the port wrote before
+        // them holds zeros there (no `.TYPE`): `None`
+        player: get_car_record(data, 0).filter(|c| c.parts.is_some()),
+        opponent_cars: {
+            let n = (u32at(f::NUMOPPONENTRACECARS) as usize).min(8);
+            let list: Vec<CarRecord> = (1..=n).map_while(|k| get_car_record(data, k)).collect();
+            (n > 0 && list.len() == n).then_some(list)
+        },
+        scene: Some(u32at(f::SCENENUMBER) as i32 as i16),
+        derby: Some(u32at(f::DERBY) != 0),
+        nocollision: Some(u32at(f::NOCOLLISION) != 0),
+        // slot 0's gearbox word (an `.rpl` with no car-info record is older than the field: none)
+        // the mission's words, only for a Factory Driver launch (`FEGAME_TYPE` 9)
+        mission: (u32at(f::FEGAME_TYPE) == 9).then(|| std::array::from_fn(|k| u32at(MISSION_WORDS[k]) as i32)),
+        transmission: get_car_record(data, 0).filter(|c| c.parts.is_some()).map(|_| u32at(f::CARS + f::CAR_TRANSMISSION) == 1),
+        // slot 1's word, when the file has an opponent's record
+        opponent_transmission: get_car_record(data, 1).filter(|c| c.parts.is_some()).map(|_| u32at(f::CARS + f::CAR_STRIDE + f::CAR_TRANSMISSION) == 1),
+        ..Default::default()
     };
     let final_tick = u32at(SNAPSHOT_LEN) as u64;
     let stream = data[SNAPSHOT_LEN + 4..].to_vec();
@@ -1709,7 +2138,7 @@ mod tests {
     #[test]
     fn the_port_file_round_trips() {
         let f = ReplayFile {
-            setup: ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993turbo".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, damage: true, backwards: true, mirror: false, seed: 12345, skill: 1, driver_name: "Kostya".into(), net: None, race_type: None, fegame_type: None, camera: None },
+            setup: ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993turbo".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, damage: true, backwards: true, mirror: false, seed: 12345, skill: 1, driver_name: "Kostya".into(), net: None, race_type: None, fegame_type: None, camera: None, ..Default::default() },
             final_tick: 40_000,
             stream: (0..500).map(|i| (i % 251 + 1) as u8).collect(),
         };
@@ -1748,9 +2177,86 @@ mod tests {
     }
 
     #[test]
+    fn the_car_info_records_round_trip_through_both_files() {
+        // slot 0's parts / wear / sliders / start damage, the opponents' records, `SCENENUMBER`, `DERBY`
+        let player = CarRecord {
+            car_id: 107,
+            paint: [9, 8, 7],
+            name: "ANNA".into(),
+            decal: -1,
+            parts: Some(vec![52, 629, 42]),
+            part_damage: vec![7.5, 0.0, 1.25],
+            damage: [18.0, 17.5, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0],
+            setup: Some([50.0, 50.0, 50.0, 0.0, 0.0, 0.0, 1.0, 30.0, 30.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0]),
+            ..Default::default()
+        };
+        let opp = |id: u16, grid: Option<u32>, skill: bool| CarRecord {
+            car_id: id,
+            paint: [1, 2, 3],
+            name: format!("opp{id}"),
+            grid,
+            decal: 12,
+            personality: if skill { 4 } else { 0 },
+            difficulty: 1.0,
+            skill: skill.then_some([[0.5, 0.1], [0.6, 0.2], [0.7, 0.3], [0.8, 0.4]]),
+            parts: skill.then(|| vec![11, 12]),
+            ..Default::default()
+        };
+        let setup = ReplaySetup {
+            track: "monaco1".into(),
+            car: "356".into(),
+            car_id: 107,
+            laps: 2,
+            opponents: 2,
+            player: Some(player.clone()),
+            opponent_cars: Some(vec![opp(30, Some(3), true), opp(31, None, false)]),
+            scene: Some(3),
+            derby: Some(true),
+            nocollision: Some(false),
+            transmission: Some(false),
+            opponent_transmission: Some(true),
+            mission: Some([3011, 0, 0, 3012, 3013, 0, 90, -1, -1, 5, 2, 0]),
+            fegame_type: Some(9),
+            ..Default::default()
+        };
+        // the port's own file: a file without the section reads none, with it everything comes back
+        let old = ReplayFile { setup: ReplaySetup { player: None, opponent_cars: None, scene: None, derby: None, nocollision: None, transmission: None, opponent_transmission: None, mission: None, ..setup.clone() }, final_tick: 5, stream: vec![1] };
+        assert_eq!(ReplayFile::parse(&old.write()).unwrap().setup.player, None);
+        let f = ReplayFile { setup: setup.clone(), final_tick: 5, stream: vec![1, 2] };
+        assert_eq!(ReplayFile::parse(&f.write()), Some(f));
+        // the original's `.rpl`: the car-info records at slot 0 and 1...
+        let rpl = original_rpl(&setup, 5, &[1], Ramp::default(), 3);
+        let (back, _, _) = parse_original_rpl(&rpl).unwrap();
+        assert_eq!(back.scene, Some(3));
+        assert_eq!(back.derby, Some(true));
+        assert_eq!(back.mission, setup.mission, "the twelve mission words at their block offsets");
+        assert_eq!(u32::from_le_bytes(rpl[0x43C..0x440].try_into().unwrap()), 90);
+        assert_eq!(back.transmission, Some(false), "a manual gearbox's word 0 at slot 0 +0xC");
+        assert_eq!(u32::from_le_bytes(rpl[0xCA4 + 0xC..0xCA4 + 0x10].try_into().unwrap()), 0);
+        assert_eq!(back.opponent_transmission, Some(true), "the opponents' word 1 at slot 1 +0xC");
+        let p = back.player.unwrap();
+        assert_eq!((p.car_id, p.parts.clone(), p.part_damage.clone(), p.damage, p.setup), (107, player.parts.clone(), player.part_damage.clone(), player.damage, player.setup));
+        let o = back.opponent_cars.unwrap();
+        assert_eq!(o.len(), 2);
+        assert_eq!((o[0].car_id, o[0].grid, o[0].decal, o[0].personality, o[0].paint, o[0].name.as_str()), (30, Some(3), 12, 4, [1, 2, 3], "opp30"));
+        assert_eq!(o[0].skill, setup.opponent_cars.as_ref().unwrap()[0].skill);
+        assert_eq!(o[0].parts, Some(vec![11, 12]));
+        // a car with no recorded grid takes the sequential slot 0x4ECF00 gives (`n_cars - slot`): 3 - 2 = 1 (pole = 1)
+        assert_eq!((o[1].car_id, o[1].grid, o[1].skill.is_none()), (31, Some(0), true));
+        // the words sit where `replay.md` 16.2 puts them: `.PARTINDEX` +0x28, `.PARTDAMAGE` +0x78, `.DAMAGEZONES` +0xC8,
+        // `.SCENENUMBER` +0x898, `DERBY` +0x18
+        let at = |o: usize| u32::from_le_bytes(rpl[o..o + 4].try_into().unwrap());
+        assert_eq!((at(0xCA4 + 0x28), at(0xCA4 + 0x2C), f32::from_bits(at(0xCA4 + 0x78))), (52, 629, 7.5));
+        assert_eq!(f32::from_bits(at(0xCA4 + 0xC8)), 18.0);
+        assert_eq!((at(0x898), at(0x18)), (3, 1));
+        // the first slider is `.FRONTDOWNFORCE` 0x22F at +0x114, `trunc(v * 65536)` (0x4A5400)
+        assert_eq!(at(0xCA4 + 0x114), 50 * 65536);
+    }
+
+    #[test]
     fn the_original_rpl_has_the_documented_shape() {
         // §6.1: 0x3E24 of setup, the final tick, 0x19000 of stream — 118 312 bytes, always
-        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993coupe36".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, damage: false, backwards: true, mirror: false, seed: 4321, skill: 2, driver_name: "Kostya".into(), net: None, race_type: None, fegame_type: None, camera: None };
+        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993coupe36".into(), car_id: 154, paint: [1, 2, 3], laps: 3, opponents: 5, traffic: 2, cops: true, damage: false, backwards: true, mirror: false, seed: 4321, skill: 2, driver_name: "Kostya".into(), net: None, race_type: None, fegame_type: None, camera: None, ..Default::default() };
         let stream: Vec<u8> = (0..1000).map(|i| (i % 251 + 1) as u8).collect();
         let f = original_rpl(&setup, 12_345, &stream, Ramp { steer: true, gas: false, brake: true }, 11);
         assert_eq!(f.len(), RPL_LEN);
@@ -1861,7 +2367,7 @@ mod tests {
             own_words: vec![(0x13D, vec![0x3132_3334, 0]), (0x24F, vec![1])],
             fe_txt: vec![("time".into(), 1), ("weather".into(), 0)],
         };
-        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993turbo".into(), car_id: 154, paint: [1, 2, 3], laps: 1, opponents: 2, traffic: 1, cops: false, damage: true, backwards: false, mirror: false, seed: 8165, skill: 1, driver_name: "ANNA".into(), net: Some(net.clone()), race_type: None, fegame_type: None, camera: None };
+        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993turbo".into(), car_id: 154, paint: [1, 2, 3], laps: 1, opponents: 2, traffic: 1, cops: false, damage: true, backwards: false, mirror: false, seed: 8165, skill: 1, driver_name: "ANNA".into(), net: Some(net.clone()), race_type: None, fegame_type: None, camera: None, ..Default::default() };
         let f = ReplayFile { setup, final_tick: 640, stream: vec![0x41; 40] };
         let back = ReplayFile::parse(&f.write()).unwrap();
         assert_eq!(back, f);
@@ -1882,7 +2388,7 @@ mod tests {
             own_words: vec![(0x13D, vec![0x3132_3334, 0]), (0x24A, vec![2])],
             fe_txt: vec![("time".into(), 1)],
         };
-        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993".into(), car_id: 154, paint: [0; 3], laps: 1, opponents: 1, traffic: 1, cops: false, damage: true, backwards: false, mirror: false, seed: 1, skill: 1, driver_name: "ANNA".into(), net: Some(net), race_type: None, fegame_type: None, camera: None };
+        let setup = ReplaySetup { track: "coastal".into(), car: "993".into(), sim: "993".into(), car_id: 154, paint: [0; 3], laps: 1, opponents: 1, traffic: 1, cops: false, damage: true, backwards: false, mirror: false, seed: 1, skill: 1, driver_name: "ANNA".into(), net: Some(net), race_type: None, fegame_type: None, camera: None, ..Default::default() };
         let f = original_rpl(&setup, 10, &[], Ramp::default(), 3);
         let u = |at: usize| u32::from_le_bytes(f[at..at + 4].try_into().unwrap());
         let slot = |i: usize| snapshot::CARS + i * snapshot::CAR_STRIDE;

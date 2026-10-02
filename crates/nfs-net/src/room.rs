@@ -150,6 +150,32 @@ pub fn player_in(id: i32, name: &[u8]) -> Vec<u8> {
     encode(kind::JOIN, Some(id), None, Some(name))
 }
 
+/// `0xB4` — the room's description, 0x50 bytes (0x48BAA0 builds it from `room+0x74`, 0x48BD10 / 0x48BD80 send it; **captured**
+/// twice per newcomer, REFERENCE-2026-10-02-SRVX): the head's value, then the 0x4C-byte record the games list is made of —
+/// 0x14 zeros, the 0x34 bytes at `room+0x74` (the name field `Game~3.5` padded to 32, the four descriptor bytes, the two descriptor
+/// words **little-endian** (raw memory, not the `'d'`'s network order), 8 zeros, **8** = the room's player limit), and last
+/// `+0x48` = the number of players in the room. `value` is the newcomer's id in both captured sends (APPROXIMATION: the capture only
+/// ever has id 1; a 24-bit value at 0x48BAA0 was not traced).
+pub fn description(value: i32, name: &[u8; 32], bytes: [u8; 4], words: [u16; 2], count: u32) -> Vec<u8> {
+    let mut m = vec![kind::DESCRIPTION];
+    m.extend_from_slice(&[(value >> 16) as u8, (value >> 8) as u8, value as u8]);
+    m.extend_from_slice(&[0u8; 0x14]);
+    m.extend_from_slice(name);
+    m.extend_from_slice(&bytes);
+    m.extend_from_slice(&words[0].to_le_bytes());
+    m.extend_from_slice(&words[1].to_le_bytes());
+    m.extend_from_slice(&[0u8; 8]);
+    m.extend_from_slice(&(MAX_PLAYERS as u32).to_le_bytes());
+    m.extend_from_slice(&count.to_le_bytes());
+    m
+}
+
+/// `0xB2` — 0x48BC1B: `0x48C870(0xB2, id, OMIT, the room's name)`, "your id is" — captured `b2 000001 "Game\0"` (the name without the
+/// `~version` of the name field).
+pub fn your_id(id: i32, room_name: &[u8]) -> Vec<u8> {
+    encode(kind::YOUR_ID, Some(id), None, Some(room_name))
+}
+
 /// The lobby's ping exchange, `0xC3` (`network.md` §11.11).
 ///
 /// **0x48D9F0** sends `0x48C870(0xC3, player id, net+0x148, null)` on the link to the host: the
@@ -397,6 +423,11 @@ pub struct Room {
     running: bool,
     /// `+0xCC4` — the room's `0xC5` has gone out for this race (0x48BFEF sets it, 0x48BF58 clears)
     go_sent: bool,
+    /// **The players' message lists, `player+0xC8`** (0x48A2F0 files into the sender's, 0x48A390 replays one): the `0xBC`
+    /// messages a player sent while it was in the lobby group, **one per key** — a new one drops every older node whose
+    /// dword at `+4` (the first record's id) is the same, then is appended (0x48A316…0x48A332), so the list is the player's
+    /// lobby state in the order of its last writes. It is **not** drained (the send queue is the other list, `+0xC4`).
+    filed: std::collections::BTreeMap<i32, Vec<Vec<u8>>>,
 }
 
 impl Room {
@@ -423,6 +454,7 @@ impl Room {
             kind::LEAVE => {
                 let id = head(m)?;
                 self.players.retain(|p| p.id != id);
+                self.filed.remove(&id);
                 Some(Heard::Left(id))
             }
             kind::CHAT => ChatLine::parse(m).map(Heard::Chat),
@@ -652,7 +684,12 @@ impl Room {
                 self.running = false;
             }
         }
-        vec![(To::All, race_time(from, head))]
+        let mut out = vec![(To::All, race_time(from, head))];
+        if head == -2 {
+            // 0x48C27A…0x48C2A0: after the bit joined the lobby group every player's list is replayed to the sender
+            out.extend(self.replay_all().into_iter().map(|m| (To::Player(from), m)));
+        }
+        out
     }
 
     /// Whether a race is running in the room (`+0xCC3`).
@@ -674,6 +711,24 @@ impl Room {
             .filter(|p| p.id != from && self.in_lobby_group(p.id) == group)
             .map(|p| (To::Player(p.id), m.to_vec()))
             .collect()
+    }
+
+    /// **0x48A2F0, called by 0x48C050 when the sender is in the lobby group** (`+0xCC2` bit set, 0x48C0C9): the message goes
+    /// on the sender's own list, after every node whose dword at `+4` equals the message's (0x48A316…0x48A332). A sender
+    /// already in the race files nothing. The host's own sends come through here too (its loopback link, id 0).
+    pub fn file_options(&mut self, from: i32, m: &[u8]) {
+        if !self.in_lobby_group(from) || m.len() < 8 {
+            return;
+        }
+        let list = self.filed.entry(from).or_default();
+        list.retain(|n| n.get(4..8) != m.get(4..8));
+        list.push(m.to_vec());
+    }
+
+    /// **0x48A390 for every player already in the room** (0x48BBEE…0x48BBFC, the newcomer's admission): each player's list in
+    /// the order of the room's list, host first, every node as it was sent.
+    pub fn replay_all(&self) -> Vec<Vec<u8>> {
+        self.players.iter().flat_map(|p| self.filed.get(&p.id).into_iter().flatten().cloned()).collect()
     }
 
     /// Whether `id` is in the lobby group (`+0xCC2`).
@@ -779,6 +834,33 @@ mod tests {
         assert_eq!(r.hear(&out[3].1), Some(Heard::State(14)));
         assert_eq!(r.hear(&player_out(1)), Some(Heard::Left(1)));
         assert_eq!(r.players.iter().map(|p| p.id).collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[test]
+    fn a_players_message_list_is_the_lobby_state_one_node_per_key() {
+        // 0x48A2F0 (from 0x48C050): the sender's list drops every node with the same dword at +4, then appends; 0x48A390 replays the
+        // lists host first (0x48BBEE…0x48BBFC); a sender that left the lobby group (0xB3, bit cleared) files nothing
+        let rec = |k: u16, v: u8| vec![0xBC, 0, 0, 0, k as u8, (k >> 8) as u8, 0, 0, v, 0, 0, 0];
+        let mut r = Room::new(0);
+        r.hear(&player_in(0, b"host"));
+        r.hear(&player_in(1, b"anna"));
+        for m in [rec(0x14, 1), rec(0xD, 0), rec(0xF, 1), rec(0xC, 7), rec(0xD, 2)] {
+            r.file_options(0, &m);
+        }
+        r.file_options(1, &rec(0x255, 0));
+        r.file_options(1, &rec(0x255, 1));
+        // the second 0xD replaced the first and sits last; anna's list holds her last READY only
+        assert_eq!(r.replay_all(), vec![rec(0x14, 1), rec(0xF, 1), rec(0xC, 7), rec(0xD, 2), rec(0x255, 1)]);
+        r.start_request(1, 100);
+        r.file_options(1, &rec(0x256, 1));
+        assert_eq!(r.replay_all().len(), 5, "anna is in the race: nothing more is filed");
+        // 0xB7 (−2): her bit returns and every list goes to her (0x48C27A…0x48C2A0)
+        let out = r.race_time_request(1, -2);
+        assert_eq!(out.len(), 1 + 5);
+        assert!(out[1..].iter().all(|(t, _)| *t == To::Player(1)));
+        // a player that leaves takes its list
+        r.hear(&player_out(1));
+        assert_eq!(r.replay_all().len(), 4);
     }
 
     #[test]

@@ -8,3 +8,11 @@ license.workspace = true
 winit.workspace = true
 gilrs.workspace = true
 tracing.workspace = true
+
+# macOS rumble backend (`ff_macos.rs`): GameController + CoreHaptics
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-game-controller = "0.3"
+objc2-core-haptics = "0.3"
+block2 = "0.6"

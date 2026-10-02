@@ -130,6 +130,11 @@ impl App {
         names
     }
 
+    /// A playback is running (`REPLAY == 2`, [`nfs_game::replay::Mode::Playing`] or the exhausted frames after it).
+    pub(crate) fn playback_running(&self) -> bool {
+        self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted))
+    }
+
     /// **`STARTREPLAY`** (slot 51, 0x50D390): `[0x699FC9] = 1` — "this is a replay playback" —
     /// then `PLAYGAME`. The launch (0x4D5372…0x4D5425) sends option 0x97 = 2 and 0x110 =
     /// `"%s.rpl"` over `Replay.List`'s current name, and the start check 0x4D5730 skips the
@@ -152,7 +157,7 @@ impl App {
         };
         let mut setup = f.setup.clone();
         resolve_replay_car(&self.paths, &mut setup);
-        let (track, car) = match (TrackAssets::load(&self.paths, &setup.track), CarAssets::load(&self.paths, &setup.car), CarAssets::load_sim(&self.paths, if setup.sim.is_empty() { "default" } else { &setup.sim })) {
+        let (mut track, car) = match (TrackAssets::load(&self.paths, &setup.track), CarAssets::load(&self.paths, &setup.car), CarAssets::load_sim(&self.paths, if setup.sim.is_empty() { "default" } else { &setup.sim })) {
             (Ok(t), Ok(c), Ok(sim)) => (t, (c, sim)),
             (t, c, s) => {
                 tracing::error!(track = ?t.err(), car = ?c.err(), sim = ?s.err(), "replay load failed");
@@ -175,8 +180,44 @@ impl App {
             .and_then(|cat| cat.into_iter().find(|c| (setup.car_id != 0 && c.id == setup.car_id) || (!setup.sim.is_empty() && c.sim.eq_ignore_ascii_case(&setup.sim))));
         if let Some(e) = &entry {
             let table = self.fe_parts_table();
-            let automatic = self.player_automatic();
-            nfs_game::career::fold_fresh_car(&mut self.specs, &e.stock_parts, &table, &e.sim_family, automatic);
+            // `.TRANSMISSION` is the recording's (`carinfo+0xC` of the restored block, `player_automatic`); a file
+            // from before the field takes the session's option (APPROXIMATION, logged below)
+            let automatic = setup.transmission.unwrap_or_else(|| {
+                tracing::info!("replay: no .TRANSMISSION in the setup, the session's Car.Transmission option is used (APPROXIMATION)");
+                self.player_automatic()
+            });
+            // the car-info record of slot 0 `Replay_begin` 0x413CF0 restored: `.PARTINDEX`, `.PARTDAMAGE`, the
+            // sliders (0x49C4C0 builds `car+0x768` from them, 0x49CB50 / 0x49D290 fold them in, parts first)
+            match setup.player.as_ref().and_then(|c| c.parts.as_ref().map(|ids| (c, ids))) {
+                Some((c, ids)) => {
+                    let parts: Vec<&nfs_formats::career::Part> = ids.iter().filter_map(|id| table.iter().find(|p| p.id == *id)).collect();
+                    self.specs.apply_parts(&parts, &e.sim_family);
+                    self.specs.parts = parts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| nfs_physics::specs::InstalledPart::new(p.kind, p.zone_mask.map(|b| b != 0), p.condition, c.part_damage.get(i).copied().unwrap_or(p.state as f32)))
+                        .collect();
+                    self.specs.apply_setup(&c.setup.unwrap_or(nfs_game::career::CAR_SETUP_DEFAULT), automatic);
+                }
+                None => {
+                    tracing::info!("replay: no car record in the setup, the car is a fresh catalogue car (APPROXIMATION)");
+                    nfs_game::career::fold_fresh_car(&mut self.specs, &e.stock_parts, &table, &e.sim_family, automatic);
+                }
+            }
+        }
+        // `SCENENUMBER` 0x1C (`fac+0x24`): the skill test's scene the recorded race ran in (its cones and smackables
+        // are bodies the car met), loaded with the track as the launch does (0x4ECDF0)
+        self.skill = None;
+        if let Some(n) = setup.scene.filter(|n| *n > 0) {
+            let suffix = format!("_st{n}.scn");
+            match track.load_scene(&suffix) {
+                Ok(Some(scene)) => {
+                    // the scene's triggers are the test (start pose 0x410430, arrows, cones, finish): `SkillTest`
+                    self.skill = Some(SkillTest::from_scene(&scene, &track.name));
+                    track.extra_scenes.push(scene);
+                }
+                other => tracing::error!(suffix, result = ?other.err(), "replay: the recorded skill-test scene is missing"),
+            }
         }
         // the car slot is the recording's (`Replay_begin` 0x413CF0 copies the whole recorded block
         // over `0x6573E8`, `.TYPE` among it): its record's engine sound set, dials and `nfs5.car`
@@ -187,6 +228,16 @@ impl App {
             self.dials = Some((e.dial_kmh, e.dial_mph, e.dial_tach));
         }
         self.apply_replay_launch_block(&setup);
+        // the mission the recorded block describes (its launch words): the HUD's time trays and the rest of the
+        // mission arms run as in the recorded race; none for a plain race (a mission left over from the last race
+        // is not the recording's)
+        self.mission = setup.mission.as_ref().and_then(|w| {
+            let m = career_ui::MissionStart::from_replay_words(&self.paths, w, setup.scene);
+            if m.is_none() {
+                tracing::info!("replay: the recorded mission matches no nfs5.fac record, no mission HUD (APPROXIMATION)");
+            }
+            m
+        });
         self.track = track;
         // the catalogue record's body style and roof, as the live race's car had them
         self.car = match &entry {
@@ -238,6 +289,16 @@ impl App {
         match setup.camera.as_ref().filter(|c| !c.is_empty()) {
             Some(c) => self.camera_cycle = c.iter().map(|&v| v as u16).collect(),
             None => tracing::info!(cycle = ?self.camera_cycle, "replay: no camera list in the setup, the last launch's stays (APPROXIMATION)"),
+        }
+        // `DERBY` 0x1B and `NOCOLLISION` 0x29 are block words too: the smash-up cheat the race ran under (the
+        // session's own bit comes back when the playback is left) and a positional network race's car-car pass
+        if let Some(d) = setup.derby {
+            let live = *self.cheat_bits_live.get_or_insert(self.cheat_bits);
+            self.cheat_bits = if d { live | (1 << 7) } else { live & !(1 << 7) };
+            self.net_derby = d && setup.net.is_some();
+        }
+        if let Some(nc) = setup.nocollision {
+            self.net_nocollision = nc && setup.net.is_some();
         }
         if setup.race_type.is_none() || setup.fegame_type.is_none() {
             tracing::info!(race_type = ?setup.race_type, fegame_type = ?setup.fegame_type, "replay: no RACE_TYPE / FEGAME_TYPE in the setup, a single race under the current Game.GameType (APPROXIMATION)");

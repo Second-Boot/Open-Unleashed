@@ -178,12 +178,13 @@ impl App {
             self.bind_player_pictures();
             self.bind_end_of_era();
             // the front end's start-up ends in 0x4D1BD0 (0x4D5209): the first screen's music
-            self.fe_apply_music();
+            let list_swapped = self.fe_apply_music();
             // and 0x4D6130 → 0x4D81C0 (0x4D5210): the bottom bar's buttons
             self.bind_bottom_bar();
             // the first screen was constructed like any other (0x4E0F90): its callback list's
             // constructor (`fe_screen_built`, §4.169.2)
             if self.fe.layout_preview.is_some()
+                && list_swapped
                 && let Some((name, offset)) = self.fe_screen_built()
             {
                 self.fe_open(name, offset, true);

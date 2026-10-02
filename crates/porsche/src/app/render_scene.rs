@@ -140,10 +140,10 @@ impl App {
         let lamp_ms = (self.tick as f64 + self.pause_offset + self.pause_ticks) * 1000.0 / 64.0;
         let fade = (lamp_ms / 1000.0).min(1.0) as f32;
         // The LOD pick, `R3DCar` slot 13 0x439F90, which the car's draw 0x4430A0 asks first
-        // (0x443192): each car's class from its box on the screen `[0x657A48]` wide, `CARDETAIL`
-        // (`[0x6197C4]`, the `Graphics.CarDetail` choice) and a replay's playback
-        // (`[0x657424] >= 2`); `None` — 3 pixels or less — draws nothing of it, lamps included
-        // (`CarModel::lod_class`). Then the car draw 0x444E00 makes its passes from the class
+        // (0x443192): each car's class from its box on the screen `[0x657A48]` wide and `CARDETAIL`
+        // (`[0x6197C4]`, the `Graphics.CarDetail` choice, five tiers under `nfs5.dll`, which also
+        // cuts the replay test out of the pick, 0x43A08A); `None` — 3 pixels or less — draws nothing of it, lamps included
+        // (`CarModel::lod_class`). Then the car draw (0x444E00, the dll's 0x10001090) makes its passes from the class
         // (`race_passes`). *(Until 2026-09-26 every car was LOD 1 at every distance, every part
         // of it drawn.)* The mirror's pass asks again for its own view (`Self::render_mirror`).
         let detail = self.choice_index("Graphics.CarDetail").map_or(0, |(i, _)| i as u8);
@@ -160,10 +160,13 @@ impl App {
         let forced_damage_at = |i: usize| -> Option<f32> { (!forced_damage.is_empty()).then(|| forced_damage[i % forced_damage.len()]) };
         let replaying = self.replay_view().is_some();
         // the pick's screen: the view's own viewport (the mirror's tray, 0x539700 through its
-        // camera), the size scaled to the 640-wide reference by the render width `[0x657A48]`
-        let lod_view = self.renderer.as_ref().map(|_| {
+        // camera), the size scaled to the virtual reference width (640 at 4:3) by the render width `[0x657A48]`
+        let lod_view = self.renderer.as_ref().map(|r| {
             let (w, h) = p.lod;
-            nfs_game::world::LodView { view_projection: self.camera.view_projection(w / h), width: w, height: h, ref_width: p.ref_width }
+            // `nfs5.dll` replaces the 640 of 0x43A2DD with its virtual 2-D width for the mode (window)
+            let (win_w, win_h) = r.size();
+            let virtual_width = nfs_game::world::virtual_width(win_w.max(1) as f32, win_h.max(1) as f32);
+            nfs_game::world::LodView { view_projection: self.camera.view_projection(w / h), width: w, height: h, ref_width: p.ref_width, virtual_width }
         });
         let mirror = self.mirror;
         // **0x465D80(0)**: the car the model's "followed car" arms follow (`None` = the local car)
@@ -176,7 +179,7 @@ impl App {
         }
         // 0x43A3B0 stores the class, then 0x43E670 lifts the wheels from the LODs below it
         let pick = |model: &CarModel, state: &mut nfs_game::world::CarLodState, p: Vec3, r: Quat, half: Vec3, kind: nfs_game::world::CarKind, compression: [f32; 4]| -> Option<Vec<nfs_game::world::CarPass>> {
-            let class = model.lod_class(lod_view.as_ref()?, p, r, half, detail, kind, replaying)?;
+            let class = model.lod_class(lod_view.as_ref()?, p, r, half, detail, kind)?;
             state.class = class;
             model.update_travel(state, compression, mirror);
             Some(nfs_game::world::race_passes(class, detail, kind == nfs_game::world::CarKind::Traffic))
@@ -381,7 +384,7 @@ impl App {
                 // the driver view: the pick is skipped and the draw takes its cabin passes (0x43A020, 0x444E18)
                 (true, 1) => {
                     model.update_travel(state, compression(&o.vehicle), mirror);
-                    Some(nfs_game::world::in_car_passes(detail, looking))
+                    Some(nfs_game::world::in_car_passes(state.class, detail, looking))
                 }
                 _ => pick(model, state, p, r, o.vehicle.half_extents, nfs_game::world::CarKind::Opponent, compression(&o.vehicle)),
             };
@@ -454,7 +457,7 @@ impl App {
             (_, 0) => None,
             (Some(c), 1) => {
                 c.update_travel(&mut self.car_lod, self.vehicle.as_ref().map_or([0.0; 4], compression), mirror);
-                Some(nfs_game::world::in_car_passes(detail, looking))
+                Some(nfs_game::world::in_car_passes(self.car_lod.class, detail, looking))
             }
             (Some(c), _) => {
                 let half = self.vehicle.as_ref().map_or(Vec3::ZERO, |v| v.half_extents);
@@ -527,16 +530,16 @@ impl App {
             // (1,0) (0,1) (1,1)` over and over (0x478930) — its colours and `SKDP`, unlit.
             // The depth bias (0x478B51…0x478BA2): `−80000 · cam[+0xC] / d²` with `d²` the nearer
             // end's horizontal square distance, rounded by `fistp` and clamped to −10…−1, handed to
-            // Thrash state 0x18, which `dx7z.dll` adds as `b / 32768` to the vertex's screen z —
-            // and that z is `(z − near) / (far − near)` (`RE/notes/thrash.md` §6). `cam[+0xC]` is
-            // `far · near / (far − near)` (0x467247…0x467261) of the view's planes — near the slot's
-            // `+0x5C` (`camera::near_plane`: 0.5, 0.15 in the driver view), far 700. So each
-            // vertex moves toward the eye by `b · (far − near) / 32768` of view depth, along its own
-            // ray so it stays where it is on screen. The render states of 0x468240 are not read
+            // Thrash state 0x18 (0x537A60), `b · 2^-15` on the game's screen z `far/(far − near) ·
+            // (1 − near / Z)` (0x540CE0, `RE/notes/thrash.md` §6d.3) — `DrawItem::depth_bias`, which
+            // the shader adds to the clip z. `cam[+0xC]` is `far · near / (far − near)`
+            // (0x467247…0x467261) of the view's planes — near the slot's `+0x5C`
+            // (`camera::near_plane`: 0.5, 0.15 in the driver view), far 700 — the slope of that z,
+            // so the bias is a near-constant `80000 / 32768` ≈ 2.4 m of view depth toward the eye
+            // until the clamp (−10…−1) holds it. The render states of 0x468240 are not read
             // (alpha blended)
             if let (Some((_, material)), Some(r)) = (self.particle_draw, self.renderer.as_mut()) {
                 let cam = self.camera.position;
-                let fwd = (self.camera.target - cam).normalize_or_zero();
                 let near = |p: Vec3| (p.x - cam.x).powi(2) + (p.z - cam.z).powi(2) <= nfs_game::skidmarks::DRAW_DISTANCE.powi(2);
                 const UV: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
                 let mut used = pools.skid;
@@ -583,19 +586,12 @@ impl App {
                     // 0x478B57…0x478B84: the quotient on the x87 stack, `fstp` to a float, then
                     // `fistp` — round to nearest even (f64 stands for the extended precision)
                     let bias = (((-80000.0 * k as f64 / d2(first).min(d2(last)) as f64) as f32).round_ties_even() as i32).clamp(-10, -1);
-                    let pull = -(bias as f32) * (far - z_near) / 32768.0;
                     skid_verts.clear();
                     skid_verts.resize(nfs_game::skidmarks::MAX_CAPACITY, nfs_renderer::Vertex { position: [0.0; 3], normal: [0.0, 1.0, 0.0], uv: [0.0; 2], color: [0.0; 4] });
                     for (k, v) in skid_verts.iter_mut().enumerate() {
                         // past the strip's end every vertex sits on its last point: no area
                         let i = k.min(strip.points.len() - 1);
-                        let q = strip.points[i];
-                        let depth = (q - cam).dot(fwd);
-                        // APPROXIMATION at the near end, as the shadow's and the flares': the pull stops just
-                        // inside the near plane (the original adds the bias to `sz` only; below 0 the driver's
-                        // clipping decides). *(Until 2026-09-30 a point whose depth was just over the pull
-                        // landed on the eye itself — w ≈ 0 — and drew a dark triangle across the screen.)*
-                        let p = if depth > z_near { cam + (q - cam) * ((depth - pull).max(z_near * 1.001) / depth) } else { q };
+                        let p = strip.points[i];
                         let c = strip.colours[i];
                         v.position = p.into();
                         v.uv = UV[k % 4];
@@ -623,7 +619,7 @@ impl App {
                     // the original by the node pass and the registration order of the cell records (the table sorted by
                     // the node addresses, `RE/notes/particles.md` §9 — the pool's runtime order); the port
                     // queues the cells in its table order, after the track's far list.
-                    queue.push((key, nfs_renderer::DrawItem { layer_light: Some(unlit([1.0; 3])), alpha_test: true, alpha_ref: 10, ..nfs_renderer::DrawItem::new(mesh, material, Mat4::IDENTITY) }));
+                    queue.push((key, nfs_renderer::DrawItem { layer_light: Some(unlit([1.0; 3])), alpha_test: true, alpha_ref: 10, depth_bias: bias, ..nfs_renderer::DrawItem::new(mesh, material, Mat4::IDENTITY) }));
                 }
                 pools.skid = used;
                 self.scratch.skid_verts = skid_verts;
@@ -732,6 +728,11 @@ impl App {
             let room = !self.fe.room.is_empty() || !self.fe.cars.is_empty();
             if let Some(l) = self.fe.layout_preview.as_mut() {
                 l.set_overlay(room);
+            }
+            // the background drawn is the bottom layer's (`fe_sprites`), so its fill
+            // gives way to the room the same way
+            if let Some((_, u)) = self.fe.layout_under.first_mut() {
+                u.set_overlay(room);
             }
             self.scene.sprites = self.fe_sprites();
             if let Some(step) = self.fe.loading_still {
@@ -2252,7 +2253,14 @@ impl App {
         // (0, 1, 8…0x0F, 0x10…) leave it at the seed, which a view whose update never writes it (CircleCam,
         // SplineCam, TVCam, BlimpCam, 0x10 / 0x11 / 0x12 / 0x13) then keeps for the pause orbit (0x461850) to turn.
         // The switch is seen here as a change of the view since the last pass.
-        if self.slot_view.is_none_or(|old| old != view && !(0x02..=0x07).contains(&old)) {
+        // SetSlotView re-entered on the SAME view (the cycle key landing on it, 0x465A60; an enabled
+        // trackside switch to an element of the same view, 0x4139DD) runs the same reset — the settle count back
+        // to 0x32 (0x465848) and, when the old view is outside 2…7, the offset seed — which a view-tag compare
+        // cannot see
+        let entered_now = (self.slot_key_enters, self.track_cameras.as_ref().map_or(0, |t| t.tv.switches));
+        let slot_entered = self.slot_view.is_some() && entered_now != self.slot_seen;
+        self.slot_seen = entered_now;
+        if self.slot_view.is_none_or(|old| (old != view || slot_entered) && !(0x02..=0x07).contains(&old)) {
             self.chase_offset = Some((car_rot * Vec3::Z * -4.0, u16::MAX));
         }
         self.slot_view = Some(view);
@@ -2518,7 +2526,7 @@ impl App {
                 // SetSlotView (0x465848…0x46588C) resets the settle count but not the offset `+0x08`, so a
                 // new view starts from where the last one left the eye and glides in at 0.1 for 0x32 updates
                 let mut cur = match self.chase_offset {
-                    Some((o, v0)) if v0 == view => o,
+                    Some((o, v0)) if v0 == view && !slot_entered => o,
                     Some((o, _)) => {
                         self.chase_settle = 0x32;
                         o
@@ -2953,7 +2961,7 @@ impl App {
                 (0x14, None) => 3,
                 (v, _) => v,
             };
-            let key = (self.camera_view(), word, self.track_cameras.as_ref().map_or(0, |t| t.tv.switches));
+            let key = (self.camera_view(), word, self.track_cameras.as_ref().map_or(0, |t| t.tv.switches).wrapping_add(self.slot_key_enters));
             if self.replay_wander.1 != key {
                 self.replay_wander = (nfs_game::camera::ReplayWander::default(), key);
             }

@@ -470,7 +470,12 @@ impl TrackAssets {
                 // an `Am` material's colour is its method's block, not its `df` stream
                 for mm in &mut meshes {
                     if let Some(c) = flat.get(&mm.material) {
-                        let c = c.to_le_bytes().map(|b| b as f32 / 255.0);
+                        // 0x448C83 / 0x448C97: `LayerAmbient` stores the block's first dword **verbatim** over every
+                        // vertex's colour slot — the same slot the `df` stream's dwords fill (0x540E1D), a D3D
+                        // `0xAARRGGBB` (file bytes B, G, R, A; `mesh::append_primitive`). So the red channel is
+                        // the third byte. *(Until 2026-10-02 read RGBA; unseen, every shipped block is 0xFFFFFFFF.)*
+                        let [b, g, r, a] = c.to_le_bytes();
+                        let c = [r, g, b, a].map(|x| x as f32 / 255.0);
                         mm.mesh.vertices.iter_mut().for_each(|v| v.color = c);
                     }
                 }

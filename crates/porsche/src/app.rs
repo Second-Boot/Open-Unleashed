@@ -68,6 +68,9 @@ pub(crate) struct App {
     pub(crate) career: Option<CareerUi>,
     /// opponents of the current career event (None = quick-race opponents)
     pub(crate) career_opponents: Option<Vec<CareerOpponent>>,
+    /// The session's cheat bits while a playback runs with the recording's `DERBY` word (`Replay_begin` 0x413CF0
+    /// restores the block, `DERBY` among it): put back when the playback is left
+    pub(crate) cheat_bits_live: Option<u32>,
     /// `OpponentCar.Car`'s selection for the race being set up (`modes.md` §1.1a)
     pub(crate) opp_choice: u32,
     /// the `nfs5.car` id of the car the player picked, so the opponent rule can match era/class
@@ -113,7 +116,8 @@ pub(crate) struct App {
     /// 0x4A4760 removes it at the session's end) and runs on through every pass, and both the pass
     /// setup (0x414F2B…0x414F3B) and `RaceFrame`'s entry (0x4152EB / 0x415312) set `[0x606AC8]` to
     /// it. So a restart or the automatic replay goes on from the clock the last pass reached
-    /// (`+= tick` there), and a new session starts it at 0 (`= −pause_offset`). APPROXIMATION: the
+    /// (`+= tick` there), and a new session starts it at 0 (`= −pause_offset`). PORT-DEVIATION D13
+    /// (PORT-DEVIATIONS.md) [`[0x5E99B8]` installed at 0x4A4752, before the load 0x468FB0]: the
     /// timer also counts the wall time the original spends loading the session's track (installed
     /// before 0x468FB0) and setting a pass up, which this port does not model — its own loading is
     /// not the original's.
@@ -566,6 +570,16 @@ pub(crate) struct App {
     /// The view slot 0 was on at the last camera pass: a change is a SetSlotView, whose seed 0x465CF0 of the
     /// offset `+0x08` (`chase_offset`) the pass applies. `None` until the first pass (the race's init).
     pub(crate) slot_view: Option<u16>,
+    /// the SetSlotView entries the pass cannot see as a change of the view — the cycle key 0x465A60
+    /// (its inline copy of the reset, 0x465848 / 0x465BB1) pressed on a list that lands on the same view, counted
+    /// by the key handler; the pass compares it (and the TV slot's `switches`, 0x4139DD) with `slot_seen`.
+    pub(crate) slot_key_enters: u32,
+    /// a race launched with no front end (`fe = 0`, the command line's `porsche <track> <car>` /
+    /// `--autotest`): the original runs no accessor dump (0x4ED653), so the option block `0x6573E8…` holds only
+    /// what `fe.txt` / the command line assigned by name (`modes.md` §1.2) and an accessor the file has no key for
+    /// reads 0 — see `choice_index`.
+    pub(crate) fe0: bool,
+    pub(crate) slot_seen: (u32, u32),
     /// The bumper / driver slot's look-around yaw `+0xC6` in degrees (0x4611C0,
     /// `camera::look_step`) and the view it belongs to; a view switch starts it again at 0
     /// (SetSlotView 0x4658B2).
@@ -753,8 +767,8 @@ pub(crate) struct FrontEnd {
     /// (`callback_list_of`). Empty from the front end's constructor, like `music_current`.
     pub(crate) list_current: String,
     /// `[this+0x290]` of the `ID_MAINSCREEN` object: the `TIMER_getTicks()` (128 Hz) of its last
-    /// music re-roll (0x510210, 0x510259). Never written by the constructors 0x50FF40 / 0x5094f0,
-    /// so it starts as whatever the heap held — APPROXIMATION: 0.
+    /// music re-roll (0x510210, 0x510259), of the screen's construction (0x510175) or of the last
+    /// front-end event (0x510EA0) — measured, REFERENCE-2026-10-02-SRVB.md §2.
     pub(crate) main_music_stamp: i64,
     /// The process clock the 128 Hz `TIMER_getTicks()` counts from (`TIMER_init` at process start,
     /// `frontend-3d.md` §3): this port's App construction stands in for it.
@@ -786,8 +800,8 @@ pub(crate) struct FrontEnd {
     pub(crate) layout_sel: usize,
     /// whether `layout_sel` has actually been moved by an Up/Down press on this screen —
     /// gates the "selected" state (§4.111: `[widget+0x10C] & 8`, set only by the chronicle's
-    /// five model-group buttons, 0x5077D0) so the port's own keyboard cursor — an APPROXIMATION
-    /// the original has no counterpart for (`controls.md` §4.170.2, the FE is pointer-only,
+    /// five model-group buttons, 0x5077D0) so the port's own keyboard cursor — PORT-DEVIATION D10 (PORT-DEVIATIONS.md)
+    /// [the original has no counterpart for it, `0x4D2970` knows ESC, `b`, `=` alone] (`controls.md` §4.170.2, the FE is pointer-only,
     /// §4.38) — is never painted before the player has actually used it. Before any Up/Down,
     /// `layout_sel` still names the control ENTER would activate (index 0, as the original's own
     /// tab order would put the first control), but nothing highlights it — matching the
@@ -890,8 +904,8 @@ pub(crate) struct FrontEnd {
     /// every Direct3D device mode, `"%d x %d x %d"` (0x4BC710, width/height/depth from
     /// `0x44E720(i, &out)` over `0x44E780(i)`'s modes) — this port has no such enumeration and no
     /// exclusive-fullscreen concept, so [`App::resolution_list`] lists the **current monitor's**
-    /// distinct video-mode sizes instead (`winit::monitor::MonitorHandle::video_modes`), an
-    /// APPROXIMATION of "the modes this machine can actually run in" rather than the original's
+    /// distinct video-mode sizes instead (`winit::monitor::MonitorHandle::video_modes`), a
+    /// PORT-DEVIATION D11 (PORT-DEVIATIONS.md) [0x4BC710, 0x44E720, 0x44E780] of "the modes this machine can actually run in" rather than the original's
     /// own device-mode list, which this port cannot reproduce.
     pub(crate) resolution_sel: usize,
     /// `OwnedCars.Car`'s list as [`App::fe_owned_select`] last saw it
