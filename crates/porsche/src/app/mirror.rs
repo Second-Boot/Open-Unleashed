@@ -95,7 +95,8 @@ impl App {
         };
         // the mirror's sky pass: its own eye and heading for the ring, and the sun between the two level
         // runs (0x45D6F6) through the mirror's view (`sun_items`). Its range lies before the track's.
-        let sky_items: Option<Vec<nfs_renderer::DrawItem>> = self.sky.as_ref().map(|s| {
+        // (`[0x657DB4]` SKYOFF skips it, 0x468AF9, as in the main view)
+        let sky_items: Option<Vec<nfs_renderer::DrawItem>> = self.sky.as_ref().filter(|_| !self.sky_off()).map(|s| {
             let forward = (cam.target - cam.position).normalize_or_zero();
             let view = nfs_game::sky::SkyView { eye: cam.position, forward, up: cam.up, main: false };
             let sun = self.sun_items(&cam, w.max(1) as f32 / h.max(1) as f32, SUN_VIEW_MIRROR);

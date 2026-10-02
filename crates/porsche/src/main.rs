@@ -631,6 +631,7 @@ fn main() -> Result<()> {
             chronicle_year_idx: None,
             chronicle_slider_drag: None,
             picker_prev: None,
+            generic_colour_row: None,
             usedcars_showparts: false,
             usedcar_sel: 0,
             dealer: DealerSel::default(),
@@ -952,6 +953,8 @@ fn main() -> Result<()> {
         camera: Camera::default(),
         input: InputState::default(),
         gamepads: Gamepads::new(),
+        ff: None,
+        ff_levels: nfs_physics::force_feedback::FfLevels { total: 50, road: 50, engine: 50, collision: 50, grip: 50 },
         car_pos: Vec3::ZERO,
         car_rot: Quat::IDENTITY,
         specs,
@@ -973,6 +976,8 @@ fn main() -> Result<()> {
         flare_defs: Vec::new(),
         flare_sprites: std::collections::HashMap::new(),
         sun_sprites: std::collections::HashMap::new(),
+        lens_sprites: std::collections::HashMap::new(),
+        lens: Default::default(),
         track_particles: None,
         walk_calls: 0,
         track_particle_defs: Vec::new(),
@@ -1004,6 +1009,8 @@ fn main() -> Result<()> {
             opponents: Vec::new(),
             opponent_models: Vec::new(),
             opp_prev: Vec::new(),
+            opp_steer_prev: Vec::new(),
+            player_steer_prev: None,
             traffic: None,
             traffic_models: Vec::new(),
             opponent_sets: Vec::new(),
@@ -1062,6 +1069,7 @@ fn main() -> Result<()> {
         car_half_width: 0.9,
         chase_offset: None,
         chase_settle: 0,
+        slot_view: None,
         look_yaw: None,
         look_held: [false; 3],
         lamp_bits: 0,
@@ -1132,8 +1140,15 @@ fn main() -> Result<()> {
     app.input.default_controls(first_pad, |n| accessors::controller_action(n).and_then(nfs_input::binding_id));
     // 0x4DE880 at 0x4D3B76: `XXDefXX` is the state before any profile is applied
     app.fe.xxdefxx = Some(app.startup_side());
-    // …and the profile's own, when it has saved any — with the rest of what `LoadInfo` restores
-    app.apply_saved_profile();
+    // …and the profile's own, when it has saved any — with the rest of what `LoadInfo` restores.
+    // **N03a:** not on the first entry to the front end (`FE_ENTRY`, the plain launch): 0x4D3B50
+    // jumps over `LoadInfo` there (`[0x5D9158]` set) and the accessors keep their start-up values
+    // until the profile chooser's `SETNAMETHENBACK` / `CREATEPLAYERDONE` loads one
+    // (`fe_callbacks.rs`, both call `apply_saved_profile`). `--fe=<screen>`, `--layout`,
+    // `--career`, `--mission` and every race start never meet the chooser and keep the profile.
+    if !(app.fe.menu.is_some() && app.fe.layout_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(app::FE_ENTRY))) {
+        app.apply_saved_profile();
+    }
     // a network race's replay file: its humans, their cars and the traffic (`replay.md` §18.15)
     app.apply_replay_net();
     // every `<Axis>.Min` / `.Max` starts at 0 / 0x80 (0x51E546, 0x51E550)

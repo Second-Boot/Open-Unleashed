@@ -181,7 +181,7 @@ impl LayoutScreen {
     // class draws the value from code (`FeComboBox`, the class `NFS5.ListBox` shares)
     // and the part is the editor's preview. Where the code puts it is read further down —
     // 0x4C6054 for the caption and 0x4C6237 for the value — and the port follows that.
-    // *(This said "the port keeps its own right-aligned draw … APPROXIMATION, as before"
+    // *(This said "the port keeps its own right-aligned draw … approximation, as before"
     // until 2026-09-21, eighty lines above the reading that retired it; the two only came
     // to sit in one function when this arm was moved out of the class match.)*
     /// The caption's font `[+0x190]`: 0x4C555E picks `univers8b.ffn` (`[+0x184]`) under
@@ -2288,7 +2288,7 @@ impl LayoutScreen {
         // It lives in the sixteen pixels the panel gave up: 0x4C5421 takes exactly
         // 0x4DB030's **16** off the selection box's width and leaves its x alone, so
         // the strip freed is the one to its right. The bar is drawn at the strip's
-        // left edge — **settled 2026-09-28** (was APPROXIMATION), below. The constructor
+        // left edge — **settled 2026-09-28** (was approximation), below. The constructor
         // that plants the four boxes, 0x4DAF10 (§4.75), is a clean 3-arg `(x, y, h)`
         // `ret 0xC` — `trough.x = x` unmodified, `trough.y = y`, no width argument at all
         // (0x10 is a constant).
@@ -2580,7 +2580,7 @@ impl LayoutScreen {
         // canplaygame`. `color` is not among them, so the `0xff0000ff` and
         // `0xff004080` three of the 98 shipped `[section.0]` blocks carry are editor
         // leftovers that nothing reads. CONFIRMED, where this used to be an
-        // APPROXIMATION argued from the files looking the same.
+        // approximation argued from the files looking the same.
         //
         // Only the bottom-most screen fills, and only when there is nothing behind it:
         // a screen with a 3D room behind it (`RE/notes/frontend-3d.md`) would

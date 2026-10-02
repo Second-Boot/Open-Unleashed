@@ -84,7 +84,7 @@
 //! second, differently-wrong approximation, so this module is not wired to real track data yet.
 //! It stands as the verified structure and the split/query rules, tested against the facts
 //! above; `crates/nfs-physics/src/walls.rs:177`/`:220` and `crates/porsche/src/main.rs`'s prop-push
-//! comment keep their APPROXIMATION markers and now point
+//! comment keep their approximation markers and now point
 //! here for what would need to change upstream first.
 
 /// vtable slots 1 and 2 (`insert`'s accept test, `0x484320`): the element's centroid in the xz

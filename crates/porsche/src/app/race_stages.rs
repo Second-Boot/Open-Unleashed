@@ -113,7 +113,12 @@ impl App {
                     .map_err(|e| tracing::warn!(error = %e, "music unavailable"))
                     .ok();
                 }
+                // the shuffle flag of a race is `RANDOMPLAYLIST` `[0x657A5C]` (0x4AE639),
+                // which the launch's accessor dump sets from `CDPlayer.Options`' selection (id 0x43;
+                // rows 1856 "continuous" = 0, 1855 "random order" = 1), not the file's value
+                let shuffle = self.choice_index("CDPlayer.Options").is_some_and(|(i, _)| i != 0);
                 if let Some(m) = self.snd.music.as_mut() {
+                    m.set_shuffle(shuffle);
                     m.set_front_end(false);
                     m.stop_fade(a, 1500);
                     if !playing {
@@ -1015,6 +1020,20 @@ impl App {
         self.flare_defs = std::fs::read(self.paths.render_dir().join("flare.dat")).map(|d| nfs_formats::flare::parse(&d)).unwrap_or_default();
         self.flare_sprites.clear();
         self.sun_sprites.clear();
+        self.lens_sprites.clear();
+        // the lens flare's per-race object (0x4601F0 → 0x460780): its element positions
+        // `flarepos.dat`, the `LENSFLARE` option, and the surface copy its read-back needs
+        self.lens_reset();
+        // the launch's accessor dump (0x4ED653 → 0x4B7F10 → 0x4BC3D0) leaves
+        // `ADJUSTABLEVIEWDISTANCE` `[0x657D70]` = `Graphics.ViewDistance`'s selection, and 0x44F1A0
+        // scales the `.key` draw distance by `{0.5, 0.67, 0.83, 1.0}[0x657D70]` (0x5CE90C). The
+        // port took 1.0 (`NFS_DETAIL` stays the diagnostic override).
+        if std::env::var("NFS_DETAIL").is_err()
+            && let Some((i, _)) = self.choice_index("Graphics.ViewDistance")
+        {
+            self.detail = [0.5f32, 0.67, 0.83, 1.0][i.min(3)];
+        }
+        renderer.set_lens_probe(self.lens.enabled);
         if let Some(images) = common.as_ref() {
             let mut names: Vec<String> = self.flare_defs.iter().flat_map(|d| d.textures.iter().flatten().cloned()).collect();
             names.sort();
@@ -1036,17 +1055,21 @@ impl App {
                 });
                 // the sun draws its layers inside the sky pass (0x460290), under that pass's
                 // `ZFUNC` `ALWAYS` and no depth writes, with its own state object — 0x5379F0's
-                // defaults with the pair set to 1, additive (0x46088E / 0x46089D)
+                // defaults with the pair set to 1, additive (0x46088E / 0x46089D). The lens flare's
+                // thirteen elements (0x460460) are drawn by the same 0x451710 through state objects
+                // made the same way (the loop 0x46087E…0x4608ED builds fourteen pairs alike), so
+                // every flare texture gets the material, whichever record uses it.
+                let sun = renderer.create_material(nfs_renderer::MaterialDesc {
+                    alpha_blend: true,
+                    cull_back: false,
+                    depth_test: false,
+                    blend_pair: 1,
+                    ..nfs_renderer::MaterialDesc::textured(tex)
+                });
                 if self.flare_defs.iter().any(|d| d.id == SUN_FLARE && d.textures.iter().flatten().any(|t| *t == name)) {
-                    let sun = renderer.create_material(nfs_renderer::MaterialDesc {
-                        alpha_blend: true,
-                        cull_back: false,
-                        depth_test: false,
-                        blend_pair: 1,
-                        ..nfs_renderer::MaterialDesc::textured(tex)
-                    });
                     self.sun_sprites.insert(name.clone(), (mesh, sun));
                 }
+                self.lens_sprites.insert(name.clone(), (mesh, sun));
                 self.flare_sprites.insert(name, (mesh, material));
             }
         }

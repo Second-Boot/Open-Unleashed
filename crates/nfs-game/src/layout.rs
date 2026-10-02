@@ -87,7 +87,7 @@ use movie::movie_advance_frames;
 /// registry exports (`GamePaths::language`, `game_info/regs/*.reg`), with the original's default.
 /// The same index is what the original copies into the `LANGUAGE` option (id 0x32, `[0x657C84]`,
 /// 0x4E0750 → 0x4D53A9 / 0x4ED6CB) that the loading screen's `loadtext.fsh` reads.
-/// *(Until 2026-09-27 the port took `fe.txt`'s `language` instead — an APPROXIMATION.)*
+/// *(Until 2026-09-27 the port took `fe.txt`'s `language` instead — an approximation.)*
 ///
 /// **Fallback (the port's, not the original's):** without `FEStrings.loc` the port reads that
 /// language's column of `FEStrings.csv` (English first; the original has no CSV reader and would
@@ -316,7 +316,7 @@ struct TrackMapArt {
 #[derive(Default)]
 struct EvalMemo {
     pair: HashMap<(usize, u32), HashMap<String, Option<(i32, i32)>>>,
-    one: HashMap<(usize, u32), HashMap<String, Option<i32>>>,
+    one: HashMap<(usize, u32), HashMap<String, i32>>,
 }
 
 pub struct LayoutScreen {
@@ -439,6 +439,12 @@ pub struct LayoutScreen {
     /// change ([`eval_memo_clear`](Self::eval_memo_clear)), so a hit returns exactly what the
     /// evaluator would compute now.
     eval_memo: std::cell::RefCell<EvalMemo>,
+    /// How often the **cycle guard** (a chain of part references deeper than five) answered.
+    /// UNREACHABLE by the shipped data — `--layout-sweep` reports it, 0 over all 98 layouts
+    /// (2026-10-02): the original has no recursion at all, its attributes hold the
+    /// values of the last update, so this port's evaluation-by-recursion needs a stop for a
+    /// template that loops, and no shipped template does.
+    guard_hits: std::cell::Cell<u32>,
     /// each `NFS5.AccessorWatch`'s `label.text` as its tick last wrote it (0x4BD32C, 0x526980) —
     /// what the part measures its `size` over (0x4E7160); before the first draw, the template's
     watch_text: std::cell::RefCell<HashMap<usize, String>>,
@@ -1514,7 +1520,7 @@ impl LayoutScreen {
             inherited: std::cell::Cell::new((false, 0)),
             glints: Default::default(),
             preload_ticks: crate::config::cfg().nfs_fe_clock.var().ok().and_then(|v| v.parse::<u64>().ok()).map_or(0, |ms| (ms * 128 / 1000) as i64),
-            watch_text: Default::default(), eval_memo: Default::default(),
+            watch_text: Default::default(), eval_memo: Default::default(), guard_hits: Default::default(),
             last_drawn_state: Default::default(),
             end_of_era: None,
             career_tabs: None,
@@ -1707,7 +1713,7 @@ impl LayoutScreen {
     }
 
     /// `nfs_formats::ctr::eval(v, &|n| self.reference(e, n, depth))`, memoised like [`ev_pair`](Self::ev_pair).
-    pub(super) fn ev(&self, e: &nfs_formats::lay::Element, v: &str, depth: u32) -> Option<i32> {
+    pub(super) fn ev(&self, e: &nfs_formats::lay::Element, v: &str, depth: u32) -> i32 {
         let Some(i) = self.element_index(e) else {
             return nfs_formats::ctr::eval(v, &|n| self.reference(e, n, depth));
         };
@@ -1742,20 +1748,25 @@ impl LayoutScreen {
     /// reads 0: `BottomBarButton.ctr`'s `data.area`, `ChatDisplayBox.ctr`'s `backrect.*`,
     /// `Tab Button.ctr`'s `data.height`.
     ///
-    /// Three answers are the port's own, as before: `control.size.*` is the widget's box as this
+    /// Two answers are the port's own, as before: `control.size.*` is the widget's box as this
     /// port computes it (which prefix the original gives the control's own attributes was not
-    /// traced); a `SHAPE` part's `size` the template leaves empty is its art's (the pack loader's
-    /// 0x5276E0 at 0x4E6EE2) — and a **text** part's `size` is always its text's truncated measure,
-    /// which its load 0x4E7160 writes over the attribute and the next update publishes
+    /// traced — no shipped expression names any other `control.` attribute, so every other one is
+    /// `Undefined`); and a `SHAPE` part's `size` the template leaves empty is its art's (the pack
+    /// loader's 0x5276E0 at 0x4E6EE2) — and a **text** part's `size` is always its text's truncated
+    /// measure, which its load 0x4E7160 writes over the attribute and the next update publishes
     /// (`part_extent`, `part_text`; CONFIRMED 2026-09-26, correcting "no code publishes a
-    /// measured size"); and a name the port
-    /// cannot answer — that extent when it cannot measure (a chain deeper than five: the
-    /// **APPROXIMATION** that breaks the cycle a `control.size.*` → `size.value` → part extent →
-    /// part text → `control.size.*` walk would make — no shipped template has one; the original
-    /// has no recursion, its attributes hold the values of the last update), a part attribute the template leaves
-    /// empty whose constructor default the port does not keep, a chain deeper than five — is
-    /// [`Macro::Unanswerable`](nfs_formats::ctr::Macro::Unanswerable), so the caller keeps its
-    /// fallback. Names are matched without regard to case; the original's dictionary is
+    /// measured size").
+    ///
+    /// **There is no unanswerable name** (closed 2026-10-02: the evaluator's port-only
+    /// value is gone, `nfs_formats::expr`). Every name has the answer the original gives: a part
+    /// attribute with no value anywhere is the attribute's constructor string (`"0"` for an `INT`,
+    /// empty otherwise, as `data.<attr>` below), a point with no text defines nothing (`Undefined`,
+    /// 0x5277F0), a drawable part with nothing to measure keeps its empty `size`. The one stop the
+    /// port still has is the **cycle guard**: the original has no recursion (its attributes hold
+    /// the values of the last update), this port evaluates by recursion and stops a chain deeper
+    /// than five with the value an attribute has before any update published it — `"0"`. No shipped
+    /// template reaches it (`guard_hits` is 0 over all 98 layouts). Names are
+    /// matched without regard to case; the original's dictionary is
     /// case-sensitive (`std::map` over `memcmp`, 0x4242C0), and every reference in the 72
     /// shipped templates matches its definition exactly, so the two agree on the data.
     fn reference(&self, e: &nfs_formats::lay::Element, name: &str, depth: u32) -> nfs_formats::ctr::Macro {
@@ -1771,16 +1782,17 @@ impl LayoutScreen {
         let Some((head, rest)) = name.split_once('.') else { return Macro::Undefined };
         if head == "control" {
             if depth > 4 {
-                return Macro::Unanswerable;
+                self.guard_hits.set(self.guard_hits.get() + 1);
+                return Macro::Text("0".into());
             }
             let (bw, bh) = self.box_of(e, depth + 1);
             return match rest {
                 "size.width" => Macro::Text((bw as i32).to_string()),
                 "size.height" => Macro::Text((bh as i32).to_string()),
-                _ => Macro::Unanswerable,
+                _ => Macro::Undefined,
             };
         }
-        let Some(c) = self.controls.get(&e.class) else { return Macro::Unanswerable };
+        let Some(c) = self.controls.get(&e.class) else { return Macro::Undefined };
         let Some(part) = c.part(head) else { return Macro::Undefined };
         let point = |key: &str, field: &str, text: &str| -> Macro {
             let Some((x, y)) = text.split_once(',') else { return Macro::Undefined };
@@ -1817,17 +1829,22 @@ impl LayoutScreen {
             // a text part's `text` is what it holds — for `LOCALIZEDTEXT` the string its load
             // wrote from `stringID` (0x4E66E0 → `[+0x170]`, the string `Attribute::slot3`
             // publishes)
-            (None, false) if text_part && key == "text" => self.part_text(e, part, depth + 1).map_or(Macro::Unanswerable, Macro::Text),
+            (None, false) if text_part && key == "text" => Macro::Text(self.part_text(e, part, depth + 1)),
             // …and its `size` is always that text's truncated measure: 0x4E7160 writes it over
             // whatever the template or the block gave (0x4E72A0), and the update 0x5256F0
             // publishes it (`Part::slot3`, 0x5257CD) before the parts are evaluated again — which
             // is why every tick that changes a watch's text runs the update **twice** (0x4BD349,
             // 0x4BD350), and the input box's bind too (0x4CC577 / 0x4CC57E)
-            (Some(f), true) if text_part && key == "size" => match (depth <= 4).then(|| self.part_extent(e, part, depth)).flatten() {
+            (Some(f), true) if text_part && key == "size" => match self.measured(e, part, depth) {
                 Some((w, h)) => point(key, f, &format!("{},{}", w as i32, h as i32)),
-                None => Macro::Unanswerable,
+                None => Macro::Undefined,
             },
-            (None, false) => self.part_attr(e, part, key).map_or(Macro::Unanswerable, |t| Macro::Text(t.to_string())),
+            // an attribute with no value anywhere is its constructor string, as for `data.` above
+            (None, false) => match self.part_attr(e, part, key) {
+                Some(t) => Macro::Text(t.to_string()),
+                None if part.ty(key).is_some_and(|t| t.trim().eq_ignore_ascii_case("INT")) => Macro::Text("0".into()),
+                None => Macro::Text(String::new()),
+            },
             (Some(f), true) => match self.part_attr(e, part, key) {
                 Some(t) => point(key, f, t),
                 // A drawable part's `size` is the extent of **what it draws** when the template
@@ -1839,23 +1856,30 @@ impl LayoutScreen {
                 // `size.value` is `label.size.width*2,…`, and letting that resolve would give
                 // every label a box twice its text and move it, because this port implements the
                 // alignment rule as an anchor in the box (`layouts.md` §2.1).
-                None if key == "size" && depth <= 4 => match self.part_extent(e, part, depth) {
+                None if key == "size" => match self.measured(e, part, depth) {
                     Some((w, h)) => point(key, f, &format!("{},{}", w as i32, h as i32)),
-                    None => Macro::Unanswerable,
+                    None => Macro::Undefined,
                 },
-                None => Macro::Unanswerable,
+                // a point with no text defines nothing (0x5277F0)
+                None => Macro::Undefined,
             },
             _ => Macro::Undefined,
         }
     }
 
-    /// Every part expression on this screen that does **not** resolve, as
-    /// `(class, part, key, expression)`.
-    ///
-    /// `reference` answers `Unanswerable` for a name the port cannot resolve and every caller
-    /// falls back to a zero or to the widget's box, so a template the port cannot evaluate is
-    /// silent. (A name the original does not define is not one of these: it reads 0.) This is the
-    /// measurement of that: `--layout-sweep` with `NFS_EXPR_SWEEP=1` runs it over all 98 layouts.
+    /// A part's extent for a `size` reference, behind the cycle guard.
+    fn measured(&self, e: &nfs_formats::lay::Element, part: &nfs_formats::ctr::Part, depth: u32) -> Option<(f64, f64)> {
+        if depth > 4 {
+            self.guard_hits.set(self.guard_hits.get() + 1);
+            return None;
+        }
+        self.part_extent(e, part, depth)
+    }
+
+    /// Every part expression on this screen whose evaluation reached the **cycle guard**
+    /// (`guard_hits`), as `(class, part, key, expression)` — empty over all
+    /// 98 layouts. (Until 2026-10-02 this listed the names the port could not answer; there are
+    /// none now.) `--layout-sweep` with `NFS_EXPR_SWEEP=1` runs it.
     pub fn expr_failures(&self) -> Vec<(String, String, String, String)> {
         let mut out = Vec::new();
         for e in self.layout.elements.iter() {
@@ -1866,7 +1890,10 @@ impl LayoutScreen {
                 for key in ["pos", "size"] {
                     // a value with no comma is never evaluated (0x527B80), so it cannot fail
                     let Some(v) = self.part_attr(e, p, key).filter(|v| v.contains(',')) else { continue };
-                    if nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0)).is_none() {
+                    self.eval_memo_clear();
+                    let before = self.guard_hits.get();
+                    let _ = nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, 0));
+                    if self.guard_hits.get() != before {
                         out.push((e.class.clone(), name.clone(), key.to_string(), v.to_string()));
                     }
                 }
@@ -3399,7 +3426,7 @@ impl LayoutScreen {
     /// once the old button is no longer selected and the panel's screen is neither going out
     /// (0x4E0E00 ≠ 3) nor closed (0x4E0E10) — `tick_panels`. So the old panel goes out and only
     /// then does the new one come in. *(Until 2026-09-26 the switch was made at once, an
-    /// APPROXIMATION.)* A button's `panel` names a `NFS5.PANEL` of the screen that holds the strip
+    /// approximation.)* A button's `panel` names a `NFS5.PANEL` of the screen that holds the strip
     /// (0x4D01F0 looks it up three windows up).
     pub fn tab_click(&mut self, r: &mut Renderer, paths: &GamePaths, index: usize) -> bool {
         let Some((k, j)) = self.route(index) else { return false };
@@ -3525,10 +3552,20 @@ impl LayoutScreen {
         // `NFS5.DEADZONE`) keeps receiving the move: 0x528AB3 sends it to the captured widget
         // first (`[this+0x120]`, §4.57).
         //
-        // APPROXIMATION: the original's leave (type 6) to the former hit is not forwarded into
-        // that panel's own children by anything read (the default arm of 0x5289B0 goes to the base
-        // 0x525F80), so a hover flag would stay set there; the port drops it with the pointer
-        // (`denied`: the panel keeps the pointer it was handed but hovers nothing).
+        // **The leave (type 6) to the former hit IS forwarded** (N04, read 2026-10-02, replaces
+        // the APPROXIMATION that said it was not): 0x5289B0's move arm sends type 6 to the old
+        // `[window+0x110]` through its slot 3 (0x528A16…0x528A2D); for a panel that is
+        // `FEPanel::handleEvent` **0x4CEB30** — types 5 and 6 (0x4CEB51…0x4CEB59) take the
+        // sub-window's stored pointer `[sub+0x114]` (0x529030), hit-test it (0x528C00, the first
+        // child whose slot 19 contains it) and hand the event to **that child** (0x4CEB80), which
+        // is the child that hovered (the pointer was stored by the same move that set it); a child
+        // that is itself a panel does the same one level down, and with no child there it goes to
+        // the base 0x525F80 (0x4CEB8E). 0x525F80's type-6 arm calls slot 7 (0x4C7C50, +0x1C),
+        // the hover clear. So the former hit's children lose their hover — which is what `denied`
+        // does (the panel keeps the pointer it was handed but hovers nothing, nested panels
+        // included, `hovered_scan_owner`). The one thing the original leaves behind is the
+        // sub-window's own `[+0x110]`, which only suppresses an enter to the same child on the
+        // next move; the panel's own enter (type 5, same forward) re-sets it, so no draw differs.
         if self.cursor.is_some() {
             // the scan must see every panel's own answer, not last frame's denial of it
             self.clear_denied();

@@ -273,7 +273,16 @@ pub struct TrackLists {
     pub far: Vec<(u32, DrawItem)>,
     /// the port's no-`Base` fallback
     pub rest: Vec<DrawItem>,
-    lods: Vec<(Option<(u32, u32)>, usize)>,
+    units: Vec<(Option<(u32, u32)>, QueueUnit)>,
+}
+
+/// One thing the walk queues, at its place in the node pass: a `.crp` article (`track_lods` index), a `.scn`
+/// instance item (`items` index) or a breakable (`broken` index).
+#[derive(Debug, Clone, Copy)]
+enum QueueUnit {
+    Lod(usize),
+    Item(usize),
+    Broken(usize),
 }
 
 /// The view's draw lists `[cam+0x54]` (built by 0x466380) that the track's drawers file into,
@@ -1693,7 +1702,7 @@ impl TrackWorld {
         // article's vertices are in its own frame). The rate and loop notes that follow are the
         // rule of all of them:
         // CONFIRMED (2026-10-01, `COVERAGE-2026-09-26.md` §14.42 — settles the
-        // `572752fc`'s open APPROXIMATION): the *default* `secondsPerFrame`/loop rule a
+        // `572752fc`'s open approximation): the *default* `secondsPerFrame`/loop rule a
         // `WAnimBundle` article gets when it has no `animdefs.txt SECTION:ANIM` piece of its own.
         // `WAnimBundle::Load` 0x4777F0, at 0x4779DF..0x4779F7, constructs one player per claimed
         // article with `0x471490(this, frames, AnqtPtr, vertexFlag=0, flags=[0x5B45A4], 0.1f,
@@ -1708,7 +1717,7 @@ impl TrackWorld {
         // real `animdefs.txt SECTION:PIECE`'s `properties=LOOP` / `playbackrate`).
         // *(An earlier pass, `COVERAGE-2026-09-26.md` §14.40, read `0x471490` as the ctor of the
         // already-`CONFIRMED`-inert `SmackAnim` pose cache (`crp-geometry.md` §7.0b) and left the
-        // rate/loop an APPROXIMATION on that basis. That was a misidentification, corrected this
+        // rate/loop an approximation on that basis. That was a misidentification, corrected this
         // pass: `0x471490` sets `[this] = 0x5B460C` — the *player* vtable `suspension-collision.md`
         // already names for the breakable-piece players (`RENDERING.md` "the player vtable
         // 0x5B460C's slot 8 is 0x471150 `fld 0.0`" — matches slot 8 of `0x5B460C` exactly), the
@@ -2026,6 +2035,11 @@ impl TrackWorld {
     /// `refresh` is the walk prep's every-eighth-call answer (0x488CC0's `[0x628C4C] & 7 == 0`,
     /// the caller's process-wide counter): the moving refs are re-registered
     /// ([`Self::reregister_articles`]).
+    ///
+    /// PORT-DEVIATION D8 (PORT-DEVIATIONS.md) [the original draws the last tick, 0x483590 / 0x470E90]: the original passes the race tick's own time; the
+    /// port's caller passes a fractional tick between the previous tick and this one for a
+    /// display faster than 64 Hz (at `alpha` 1 the same value, [`Self::animate`]'s `seconds` =
+    /// tick / 64). Drawing only: nothing here is read by the simulation.
     pub fn animate(&mut self, seconds: f32, refresh: bool) {
         for a in &self.animated {
             let local = anim_matrix(&a.track, seconds, a.seconds_per_frame, a.looping);
@@ -2184,10 +2198,12 @@ impl TrackWorld {
     /// Equal keys keep the node pass's queueing order ([`ArticleDraw::order`]): the walk lists the
     /// visible tree nodes in pre-order (0x47F400) and an item is queued at its first ref
     /// (0x47F939…0x47F942, once per frame), refs sitting in a node's list in registration order. An
-    /// item with no `Base` (port fallback) goes last. APPROXIMATION: the refs of the dynamic
-    /// bundles (instances, anims, `.scn` items) are re-registered when their sphere moves
-    /// (0x489530's compare against the item's stored centre) and then sit at the end of their new
-    /// node's list — not followed here (the `.scn` instances and breakables go after every article).
+    /// item with no `Base` (port fallback) goes last. The refs of the dynamic bundles (instances, anims,
+    /// `.scn` items) are re-registered when their sphere moves (0x489530's compare against the item's stored
+    /// centre, 0x4895B4…0x4895E5, then 0x47BC20's node; a different node takes the ref at the end of its list,
+    /// 0x489850 / 0x47C640) — [`Self::reregister_articles`] does that every eighth walk, and the `.scn`
+    /// instances and the breakables are queued at their own place among the articles
+    /// ([`ArticleDraw::order`], `QueueUnit`), not after all of them (CLOSED 2026-10-02, WP-R).
     pub fn visible_items(&self, draws: &[Option<ArticleDraw>], eye: Vec3) -> Vec<DrawItem> {
         let (mut near, mut far, rest) = self.track_draw_lists(draws, eye);
         near.sort_by_key(|(k, _)| *k);
@@ -2220,11 +2236,11 @@ impl TrackWorld {
     /// [`TrackLists`] so the lists do not allocate again every frame.
     pub fn track_draw_lists_into(&self, draws: &[Option<ArticleDraw>], eye: Vec3, lists: &mut TrackLists) {
         let key = |c: Vec3| (c - eye).length_squared().round_ties_even() as u32;
-        let TrackLists { near, far, rest, lods } = lists;
+        let TrackLists { near, far, rest, units } = lists;
         near.clear();
         far.clear();
         rest.clear();
-        lods.clear();
+        units.clear();
         // the walk's draw of the track geometry: each drawn article at the LOD its drawer picked
         // (0x450DE0 / 0x450010 — the record's `pr` range is the parts of that LOD number); an
         // article the walk has no record of (no `Base`) is drawn at its lowest LOD (port fallback)
@@ -2234,79 +2250,106 @@ impl TrackWorld {
         // (only the articles the loop below can act on are sorted: one the walk did not draw
         // `continue`s there, and a stable sort of the subset keeps the relative order the full
         // stable sort gave it — the sort over every article of the track was most of this call)
-        lods.extend(self.track_lods.iter().enumerate().filter_map(|(g, a)| {
+        units.extend(self.track_lods.iter().enumerate().filter_map(|(g, a)| {
             let order = draws.get(a.article).copied().flatten().map(|d| d.order);
             let culled = matches!(self.cull_articles.get(a.article).map(|c| c.as_ref()), Some(Some(_)));
-            (!culled || order.is_some()).then_some((order, g))
+            (!culled || order.is_some()).then_some((order, QueueUnit::Lod(g)))
         }));
-        lods.sort_by_key(|(o, _)| *o);
-        for &(_, g) in lods.iter() {
-            let a = &self.track_lods[g];
-            match self.cull_articles.get(a.article).map(|c| c.as_ref()) {
-                Some(Some(c)) => {
-                    let Some(d) = draws.get(a.article).copied().flatten() else { continue };
-                    let Some(lod) = c.lods.get(d.lod).map(|l| l.lod) else { continue };
-                    let Some(k) = a.lods.iter().position(|(n, _)| *n == lod) else { continue };
-                    let parts = a.parts.get(k).map(|p| p.as_slice()).unwrap_or(&[]);
-                    for (i, item) in a.lods[k].1.iter().enumerate() {
-                        let (flags, centre) = parts.get(i).copied().unwrap_or((2, Vec3::ZERO));
-                        // `FakeSortMode::PerItem`'s fold (0x449AB2, `[0x61975C] < 0x2710`
-                        // unsigned): the drawer writes the queued entry's own `+0xC` — this same
-                        // `round(d²)` view-list key — to the global just before each draw
-                        // (0x450CE2) — see `DrawItem::fakesort_near`'s doc
-                        match c.drawer {
-                            ArticleDrawer::Static | ArticleDrawer::MidGround { .. } => match part_list(flags) {
-                                Some(ViewList::Near) => {
-                                    let k = key(centre);
-                                    near.push((k, DrawItem { fakesort_near: k < FAKESORT_NEAR_KEY, ..*item }));
-                                }
-                                Some(ViewList::Far) => {
-                                    let k = key(centre);
-                                    far.push((k, DrawItem { fakesort_near: k < FAKESORT_NEAR_KEY, ..*item }));
-                                }
-                                None => {}
-                            },
-                            ArticleDrawer::Instance | ArticleDrawer::Anim => {
-                                let k = d.value as u32;
-                                far.push((k, DrawItem { fakesort_near: k < FAKESORT_NEAR_KEY, ..*item }));
-                            }
-                        }
-                    }
-                }
-                _ => rest.extend(a.lods.first().map(|(_, v)| v.as_slice()).unwrap_or(&[]).iter().copied()),
-            }
-        }
-        // the instance drawer's own items (the `.scn` GEOM instances): each at the LOD the walk
-        // answered its entry with, none when it did not ([`Self::article_draws`]), queued with the
-        // walk's value
+        // the instance drawer's own items (the `.scn` GEOM instances) and the breakables are refs of the same
+        // tree (0x489530's `+5` path, one node each — [`Self::register_instances`] / [`Self::reregister_instances`]),
+        // so the node pass queues them at their place among the articles: by the node and the registration
+        // number of the ref ([`ArticleDraw::order`]), not after every article (WP-R)
         let n = self.cull_articles.len();
-        for (k, (item, e)) in self.items.iter().zip(self.item_element.iter()).enumerate() {
+        for (k, (_, e)) in self.items.iter().zip(self.item_element.iter()).enumerate() {
             if e.is_some_and(|e| self.hidden.contains(&e)) || self.broken.iter().any(|b| b.hides(k)) {
                 continue;
             }
             match self.item_cull.get(k).copied().flatten() {
-                Some((slot, lod)) => {
-                    let Some(d) = draws.get(n + slot).copied().flatten() else { continue };
-                    if self.instance_culls.get(slot).and_then(|ic| ic.lods.get(d.lod)).is_some_and(|l| l.lod == lod) {
-                        // 0x450010 writes `[0x61975C]` from the entry's own `+0xC` before it draws
-                        // (0x4500BE) — the same key the entry was queued with
-                        let k = d.value as u32;
-                        far.push((k, DrawItem { fakesort_near: k < FAKESORT_NEAR_KEY, ..*item }));
+                Some((slot, _)) => {
+                    if let Some(d) = draws.get(n + slot).copied().flatten() {
+                        units.push((Some(d.order), QueueUnit::Item(k)));
                     }
                 }
-                None => rest.push(*item),
+                None => units.push((None, QueueUnit::Item(k))),
             }
         }
-        // a breakable's pieces are the entries 0x450010 draws when the walk answers the item
-        for b in &self.broken {
+        for (bi, b) in self.broken.iter().enumerate() {
             match b.slot {
                 Some(k) => {
                     if let Some(d) = draws.get(n + k).copied().flatten() {
-                        let k = d.value as u32;
-                        far.extend(b.pieces.iter().map(|i| (k, DrawItem { fakesort_near: k < FAKESORT_NEAR_KEY, ..*i })));
+                        units.push((Some(d.order), QueueUnit::Broken(bi)));
                     }
                 }
-                None => rest.extend(b.pieces.iter().copied()),
+                None => units.push((None, QueueUnit::Broken(bi))),
+            }
+        }
+        units.sort_by_key(|(o, _)| *o);
+        for &(_, u) in units.iter() {
+            match u {
+                QueueUnit::Lod(g) => {
+                    let a = &self.track_lods[g];
+                    match self.cull_articles.get(a.article).map(|c| c.as_ref()) {
+                        Some(Some(c)) => {
+                            let Some(d) = draws.get(a.article).copied().flatten() else { continue };
+                            let Some(lod) = c.lods.get(d.lod).map(|l| l.lod) else { continue };
+                            let Some(k) = a.lods.iter().position(|(n, _)| *n == lod) else { continue };
+                            let parts = a.parts.get(k).map(|p| p.as_slice()).unwrap_or(&[]);
+                            for (i, item) in a.lods[k].1.iter().enumerate() {
+                                let (flags, centre) = parts.get(i).copied().unwrap_or((2, Vec3::ZERO));
+                                // `FakeSortMode::PerItem`'s fold (0x449AB2, `[0x61975C] < 0x2710`
+                                // unsigned): the drawer writes the queued entry's own `+0xC` — this same
+                                // `round(d²)` view-list key — to the global just before each draw
+                                // (0x450CE2) — see `DrawItem::fakesort_near`'s doc
+                                match c.drawer {
+                                    ArticleDrawer::Static | ArticleDrawer::MidGround { .. } => match part_list(flags) {
+                                        Some(ViewList::Near) => {
+                                            let k = key(centre);
+                                            near.push((k, DrawItem { fakesort_near: k < FAKESORT_NEAR_KEY, ..*item }));
+                                        }
+                                        Some(ViewList::Far) => {
+                                            let k = key(centre);
+                                            far.push((k, DrawItem { fakesort_near: k < FAKESORT_NEAR_KEY, ..*item }));
+                                        }
+                                        None => {}
+                                    },
+                                    ArticleDrawer::Instance | ArticleDrawer::Anim => {
+                                        let k = d.value as u32;
+                                        far.push((k, DrawItem { fakesort_near: k < FAKESORT_NEAR_KEY, ..*item }));
+                                    }
+                                }
+                            }
+                        }
+                        _ => rest.extend(a.lods.first().map(|(_, v)| v.as_slice()).unwrap_or(&[]).iter().copied()),
+                    }
+                }
+                QueueUnit::Item(k) => {
+                    let item = &self.items[k];
+                    match self.item_cull.get(k).copied().flatten() {
+                        Some((slot, lod)) => {
+                            let Some(d) = draws.get(n + slot).copied().flatten() else { continue };
+                            if self.instance_culls.get(slot).and_then(|ic| ic.lods.get(d.lod)).is_some_and(|l| l.lod == lod) {
+                                // 0x450010 writes `[0x61975C]` from the entry's own `+0xC` before it draws
+                                // (0x4500BE) — the same key the entry was queued with
+                                let k = d.value as u32;
+                                far.push((k, DrawItem { fakesort_near: k < FAKESORT_NEAR_KEY, ..*item }));
+                            }
+                        }
+                        None => rest.push(*item),
+                    }
+                }
+                QueueUnit::Broken(bi) => {
+                    let b = &self.broken[bi];
+                    // a breakable's pieces are the entries 0x450010 draws when the walk answers the item
+                    match b.slot {
+                        Some(k) => {
+                            if let Some(d) = draws.get(n + k).copied().flatten() {
+                                let k = d.value as u32;
+                                far.extend(b.pieces.iter().map(|i| (k, DrawItem { fakesort_near: k < FAKESORT_NEAR_KEY, ..*i })));
+                            }
+                        }
+                        None => rest.extend(b.pieces.iter().copied()),
+                    }
+                }
             }
         }
     }

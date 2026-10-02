@@ -623,3 +623,21 @@ fn rally_steers_eighteen_a_tick() {
         assert_eq!(v.steer, want);
     }
 }
+
+/// `car+0x55C…0x564` (0x49F4F6…0x49F5DB): written every step from the front slip fractions; a car
+/// at speed on the flat has a grip word of `(1 − t)·speed·200` (≤ 10000) and a slip word of `t·2000`.
+#[test]
+fn force_feedback_words_follow_the_front_slip() {
+    let Some(specs) = specs_993() else { return };
+    let grid = flat();
+    let mut v = Vehicle::new(Vec3::new(0.0, 0.3, 0.0), Mat3::IDENTITY, &specs, 0.75, 0.3);
+    run(&mut v, &specs, &grid, Controls { brake: 254, ..Default::default() }, 1.5);
+    run(&mut v, &specs, &grid, Controls { throttle: 254, ..Default::default() }, 6.0);
+    let w = v.ff_words;
+    assert!(w[0] > 0.0 && w[0] <= 10000.0, "{w:?}");
+    assert!(w[2] >= 0.0 && w[2] <= 1600.0 + 200.0 * 3.0, "{w:?}");
+    // the producers read it: a straight run at speed on the flat gives a road rumble and a spring
+    let car = nfs_physics::force_feedback::FfCar::from_vehicle(&v, &specs);
+    assert_eq!(car.words, w);
+    assert!(car.speed > 10.0 && car.air_count == 0);
+}

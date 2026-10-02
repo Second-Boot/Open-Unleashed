@@ -70,32 +70,65 @@ impl App {
     /// a change of car — the swatch is the car's colour and the row is whatever the accessor last
     /// selected (0 from the constructor): the drop-down's highlight and the arrows' step start from
     /// that row, not from the row the car's colour would be. The accessors are built once at
-    /// 0x4F1EE0 (no caller: a table entry), so the row survives screens and loads. A list that
-    /// shrinks to the row resets it to 0 (0x4BC310, the recount slot 2 0x4B9350); the port applies
-    /// that when the row is read — **APPROXIMATION** (when the original's recount runs is not read).
+    /// 0x4F1EE0 (no caller: a table entry), so the row survives screens and loads. Slot 10 is
+    /// 0x4BC4B0: `[+0x1D]` ? -1 : `[+0x18]` — a plain read, it recounts nothing; the recount is
+    /// [`Self::colour_recount`].
     ///
     /// Any other colour accessor (`DealerCar.*`, `GenericCar.Colour`): the row derived from the
     /// port's state — its row, or for a saved custom colour the row `count + 1 + rank` (slot 27
-    /// 0x4B9320's `count + 0x501A40(slot) + 1`, see [`Self::picker_tell_accessor`]). **APPROXIMATION**
-    /// (what is left): the dealership's sync of those accessors is not read, so their row is
-    /// taken as the car's colour's; two equal saved colours read as the first one's row, and a colour
-    /// no saved slot holds reads as row 0.
+    /// 0x4B9320's `count + 0x501A40(slot) + 1`, see [`Self::picker_tell_accessor`]).
+    /// `GenericCar.Colour` (closed 2026-10-02 — settled by c9990e47: a changed car
+    /// row sends the accessor to `slot 11(0)`): while the colour is a saved custom one, its row is
+    /// the row slot 11 was given (`FeState::generic_colour_row`, 0x4BC240), so two equal saved colours
+    /// keep their own rows. The dealership's two boxes have `allowcustom=0` (dealership.lay): only a
+    /// colour's row is ever stored there, the derived row is the stored one. Not kept: the initial
+    /// by-value start (the ctor's `[+0x18]` = 0 while the lit row follows JJ's capture).
     pub(crate) fn colour_row_of(&self, base: &str) -> Option<usize> {
         let (cols, at, custom) = self.colour_state(base)?;
         if base.starts_with("OwnedCar.") && self.garage_car().is_some() {
-            let n = cols.len();
-            let allow = self.fe.layout_preview.as_ref().is_none_or(|l| l.colour_allows_custom(base));
-            let size = if allow { n + self.saved_colours().len() + 1 } else { n };
-            let cell = &self.colour_idx[owned_colour_slot(base)];
-            if cell.get() >= size {
-                cell.set(0);
-            }
-            return Some(cell.get());
+            return Some(self.colour_idx[owned_colour_slot(base)].get());
         }
         Some(match custom {
+            // `GenericCar.Colour`: the row slot 11 was given for the saved colour
+            // (`[+0x18]`, 0x4BC240), while it is still that colour; a row past the list is the
+            // recount's 0 (0x4BC31C)
+            Some(_) if self.generic_colour_has_row(base) => {
+                let row = self.fe.generic_colour_row.map_or(0, |(_, r)| r);
+                if row >= cols.len() + self.saved_colours().len() + 1 { 0 } else { row }
+            }
             Some(c) => self.saved_colours().iter().position(|s| *s == c).map_or(0, |r| cols.len() + 1 + r),
             None => at,
         })
+    }
+
+    /// `GenericCar.Colour` holds a saved custom colour together with the row slot 11 gave it.
+    pub(crate) fn generic_colour_has_row(&self, base: &str) -> bool {
+        base == "GenericCar.Colour"
+            && matches!((self.fe.generic_colour_row, self.fe.menu.as_ref().and_then(|m| m.paint_custom)), (Some((c, _)), Some(m)) if c == m)
+    }
+
+    /// `FEColourAccessor`'s slot 2, **0x4B9350** → 0x4BC310(`size`): the recount — `size` is
+    /// `slot24(0xFF)` + (with `[+0x30]`) `0x5019D0() + 1`, stored in `[+0x14]`, and a row `[+0x18]`
+    /// at or past it becomes 0 (0x4BC31C `jl`). Its callers (enumerated 2026-10-02 from the
+    /// vtable: slot 2 is `call [x+8]`): the constructor's own tail (0x4B9268, row 0 anyway) and the
+    /// head of every tick of a widget holding the accessor — `FEAccessorWatch::tick` 0x4BD230 (call
+    /// 0x4BD24A), which `FeComboBox::tick` 0x4C5460 runs first (0x4C5469), and `refreshRows`
+    /// 0x4C53A0 (0x4C53AC). Base slot 2 is `0x514990`, a bare `ret`. Nothing else asks: the arrows
+    /// 0x4B95A0 and slot 11 read `[+0x18]` / `[+0x14]` as they are. The port runs it where it
+    /// builds a colour box's rows (`combo_rows`, from `bind_lists`, the widgets' tick), for `OwnedCar.*`
+    /// (the other accessors keep no row of their own, see [`Self::colour_row_of`]).
+    pub(crate) fn colour_recount(&self, base: &str) {
+        if !base.starts_with("OwnedCar.") || self.garage_car().is_none() {
+            return;
+        }
+        let Some((cols, _, _)) = self.colour_state(base) else { return };
+        let n = cols.len();
+        let allow = self.fe.layout_preview.as_ref().is_none_or(|l| l.colour_allows_custom(base));
+        let size = if allow { n + self.saved_colours().len() + 1 } else { n };
+        let cell = &self.colour_idx[owned_colour_slot(base)];
+        if cell.get() >= size {
+            cell.set(0);
+        }
     }
 
     /// `FEColourAccessor`'s slot 11, **0x4B92B0**(`row`), on the port's state: a row at or past
@@ -118,6 +151,11 @@ impl App {
             self.colour_idx[owned_colour_slot(base)].set(row);
         }
         let pick = if row < n { Ok(row) } else { Err(saved.get(row - n - 1).copied().unwrap_or(0)) };
+        // 0x4BC240 stores the row in `[+0x18]` for `GenericCar.Colour` too: kept with the
+        // saved colour it came with; a list row is its own row (`paint_idx`)
+        if base == "GenericCar.Colour" {
+            self.fe.generic_colour_row = pick.err().map(|c| (c, row));
+        }
         self.colour_assign(base, pick);
     }
 

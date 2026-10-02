@@ -8,6 +8,7 @@
 //! physics'.
 
 pub mod bindings;
+pub mod ff;
 pub mod gamepad;
 
 use std::collections::HashSet;

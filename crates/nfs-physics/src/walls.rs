@@ -252,7 +252,7 @@ impl WallSet {
     /// insertion order (`0x4848B0`), each list taken **once**, before either pass's loop starts —
     /// same as the original: an edge lying in more than one leaf the segment's box touches is
     /// listed once per leaf (`0x473E00`/`0x473BA0`), so it can move the eye more than once, which
-    /// this port used to avoid with its own deduplicating grid (`RE/RENDERING.md`'s APPROXIMATION,
+    /// this port used to avoid with its own deduplicating grid (`RE/RENDERING.md`'s approximation,
     /// now settled — the two passes' own doc above already describes what happens when a wall
     /// moves the eye more than once, and it happens in the original too).
     pub fn camera_push(&self, eye: &mut Vec3, car: Vec3, ground: f32, any_height: bool, tree: &TrackTree) -> bool {

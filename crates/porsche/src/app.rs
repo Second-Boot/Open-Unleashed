@@ -27,6 +27,8 @@ mod car_lights;
 mod mirror;
 mod scratch;
 mod effects;
+mod force_feedback;
+mod lens_flare;
 mod camera;
 mod fe_room;
 mod fe_flow;
@@ -392,6 +394,11 @@ pub(crate) struct App {
     pub(crate) camera: Camera,
     pub(crate) input: InputState,
     pub(crate) gamepads: Gamepads,
+    /// The force-feedback state (`0x5E94xx`, `RE/notes/force-feedback.md`), made at a race's start
+    /// (`ff_arm`); output only.
+    pub(crate) ff: Option<nfs_physics::force_feedback::ForceFeedback>,
+    /// The five `FF.*` levels, refreshed each tick.
+    pub(crate) ff_levels: nfs_physics::force_feedback::FfLevels,
     pub(crate) car_pos: Vec3,
     pub(crate) car_rot: Quat,
     pub(crate) specs: CarSpecs,
@@ -434,6 +441,11 @@ pub(crate) struct App {
     /// the sun's flare textures (`SUN_FLARE`'s two layers) as sky-pass sprites: additive, no depth
     /// test (`sun_items`)
     pub(crate) sun_sprites: std::collections::HashMap<String, (nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
+    /// every flare texture as the same additive, no-depth sprite, for the lens flare's elements
+    /// (`lens_flare.rs`)
+    pub(crate) lens_sprites: std::collections::HashMap<String, (nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
+    /// the sun object's lens-flare state (0x460460), per race
+    pub(crate) lens: lens_flare::LensState,
     /// the track's particle systems (`nfs_game::track_particles`) and their textures out of
     /// `Render/particle.fsh`
     pub(crate) track_particles: Option<nfs_game::track_particles::TrackParticles>,
@@ -551,6 +563,9 @@ pub(crate) struct App {
     /// was built for, and the `+0xC1` settle count SetSlotView starts at 0x32 (0x465848).
     pub(crate) chase_offset: Option<(Vec3, u16)>,
     pub(crate) chase_settle: u8,
+    /// The view slot 0 was on at the last camera pass: a change is a SetSlotView, whose seed 0x465CF0 of the
+    /// offset `+0x08` (`chase_offset`) the pass applies. `None` until the first pass (the race's init).
+    pub(crate) slot_view: Option<u16>,
     /// The bumper / driver slot's look-around yaw `+0xC6` in degrees (0x4611C0,
     /// `camera::look_step`) and the view it belongs to; a view switch starts it again at 0
     /// (SetSlotView 0x4658B2).
@@ -601,7 +616,7 @@ pub(crate) struct App {
     /// by `[0x627F3C] == 10`, a word change), 0x4659E0 from 0x413EA0 (a replay's start) and 0x414850
     /// (a race's start: `camera_slot_reset`), and 0x462F30's two (`AnimCam`, view 0x0E, ending in
     /// SetSlotView(0x0A): the view word changes). So every SetSlotView either starts a pass or
-    /// changes one of the three — CONFIRMED, no APPROXIMATION left.
+    /// changes one of the three — CONFIRMED, no approximation left.
     pub(crate) replay_wander: (nfs_game::camera::ReplayWander, (u16, u16, u32)),
     /// CircleCam's slot words (`camera::CircleCam`), the view they belong to and the trackside
     /// switch count they were started under: SetSlotView resets the count on a view change and on
@@ -826,6 +841,11 @@ pub(crate) struct FrontEnd {
     /// slot 0x28, 0x4C3CC5), which cancel hands back through slot 11 (0x4C4A0E): a list row, or
     /// the custom colour the car carried.
     pub(crate) picker_prev: Option<Result<usize, u32>>,
+    /// `GenericCar.Colour`'s `[+0x18]` while its `[+0x2C]` is a saved custom colour: the colour
+    /// and the row slot 11 (0x4B92B0 → 0x4BC240) was given for it. Read only while
+    /// `Menu::paint_custom` is still that colour, so every reset of the menu's colour (a changed
+    /// car row, 0x4F3060) retires it without touching the reset sites.
+    pub(crate) generic_colour_row: Option<(u32, usize)>,
     /// `[FEUsedCarsScreen + 0x290]` — whether `usedcars.lay` is on the parts panel rather than
     /// the damage one. The constructor leaves it clear (§4.113).
     pub(crate) usedcars_showparts: bool,

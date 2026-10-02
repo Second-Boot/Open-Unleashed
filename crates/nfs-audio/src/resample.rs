@@ -16,30 +16,24 @@
 //! not read. *(The SSE cubic 0x59D350 squares its `t²` again and weights the cubic term by `t⁴`;
 //! the game's settings keep it off.)*
 //!
-//! APPROXIMATION left: the x87 intermediates are carried in f64; every f32 store of the original is
-//! an f32 rounding here. Narrowed 2026-09-28 (`career.md` §11.4a, `RE/tools/fpucw.py`): every real
-//! `fldcw`/`fnstcw` in the whole `.exe` was surveyed (59 confirmed sites out of ~680 raw opcode
-//! hits, almost all of which turned out to be IAT/global address bytes mis-decoded as instructions,
-//! not real ones) — none of them is in this library's own code, 0x596B60…0x59D350; the resampler,
-//! decoder and mixer never touch the control word themselves. `_ftol` (716 call sites across
-//! `.text`, this library's `fistp`s included) only ever changes rounding control and restores
-//! exactly what it found, so it cannot be the source of a precision difference either. What is
-//! still not read: the *ambient* control word — nothing in `nfs5.exe` sets precision to begin with
-//! (no init-time `fldcw`/`_control87` call exists in the shipped files at all), so whatever the
-//! OS/CRT thread default is stays in effect through the whole audio path, and what DirectX 7's own
-//! runtime (`ddraw.dll`, not part of the shipped files) does to it around a draw call is likewise
-//! not something a read of `nfs5.exe`/`dx7z.dll` can settle.
+//! **x87 width: matched (2026-10-02, WP-AN).** The x87 intermediates are carried in f64; every f32
+//! store of the original is an f32 rounding here. The library's mix/resample/low-pass code runs on
+//! its **own worker thread**: `0x58E4A0` `CreateThread`s `0x58F880` (0x58E4BF; priority 15 =
+//! TIME_CRITICAL, 0x58E4C8), whose loop `0x58F890…0x58F8BC` calls `0x58F8E0` → `0x58F8F0` →
+//! `0x58FBC0` → the block mix `0x598940` (0x58FC65) → `0x598760`. The x87 control word is per
+//! thread and a new Windows thread starts with the process default, 0x027F (53-bit) — no `fldcw`
+//! in the whole `.exe` outside the 59 surveyed sites, none in this library (`career.md` §11.4a,
+//! `RE/tools/fpucw.py`). `dx7z.dll` (the DirectX 7 driver) calls `SetCooperativeLevel`
+//! (`[ddraw+0x50]`, 0x6000226F / 0x60003165) with `[0x60018684]`, which every path in the DLL
+//! builds as `(x & ~0x11) | 0x408` (windowed: NORMAL | MULTITHREADED) or `| 0x411` (full screen:
+//! FULLSCREEN | EXCLUSIVE | MULTITHREADED) — never `DDSCL_FPUPRESERVE` 0x1000 or `FPUSETUP` 0x800
+//! (0x600030CE…0x600030EA, 0x600034F0…0x60003523). So on Microsoft's runtime DirectX narrows the
+//! thread that creates the device (the game's main thread) to single precision (documented
+//! default, ddraw.dll is not in the shipped files) — but that is a different thread from the one
+//! mixing, so this file's 53-bit reading holds on Windows as it measured on Wine
+//! (`career.md` §11.4c: 0x027F). What the main thread's width does to code that runs *there*
+//! (the turbo of `sfx.rs`, the simulation) is a separate question, see `sfx.rs`.
 //!
-//! **Measured 2026-09-28** (`career.md` §11.4c): nine `gdb -p <pid>; p/x $fctrl` samples of the
-//! running process on a Debian x86_64 test machine, under both the shipped `dx7z.dll` driver
-//! and the repack's default `opengl3` one, at idle and mid-movie — all nine read `0x027F`: PC =
-//! 53-bit (double) precision, RC = round-to-nearest, all exceptions masked. This is the first
-//! direct evidence for the `f64`-intermediate reading below (matches it) but does not retire the
-//! APPROXIMATION: it is wine 5.12's own `ddraw`/`d3d` on Linux, not Microsoft's DX7 runtime on
-//! Windows, and no sample was taken inside a live audio/physics tick (career-mode profile
-//! creation could not be driven to completion through this build's front end in the time
-//! available — `RE/notes/REFERENCE-2026-09-28.md`).
-
 /// 0x599830: the step is capped at 4.0 (`cmp ebx, 0x40000 ; jle`, signed).
 pub const STEP_MAX: u32 = 0x40000;
 
@@ -189,6 +183,15 @@ pub struct Gains {
 }
 
 impl Gains {
+    /// A call of 0x598700 that changes nothing still raises the ramp flag (`mov byte [eax+1], 1`,
+    /// 0x598721, before any compare): the next block runs the ramp. Not before the voice's first
+    /// call, which 0x598630 takes at once with the flag clear.
+    pub fn touch(&mut self) {
+        if self.started {
+            self.pending = true;
+        }
+    }
+
     /// 0x598700's volume argument (`+0x10`), called before [`Gains::set`]: the voice's first one is
     /// the current volume too (0x598630 copies `+0x10` to `+0xC`), a change of it is a pending ramp.
     pub fn set_vol(&mut self, v: f32) {

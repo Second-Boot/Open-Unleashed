@@ -195,6 +195,11 @@ impl App {
             // `"gamesetup"` (0x4B6C52), so a start on that screen is the original's; any other
             // `--fe` screen is a diagnostic start in the middle of the front end.
             if self.fe.layout_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(FE_ENTRY)) {
+                // …and the career is 0x501340's blank until it is answered (0x4D3B4A skips the
+                // `LoadInfo`, N03): the chooser's continue loads the profile
+                if let Some(c) = self.career.as_mut() {
+                    c.blank_before_chooser();
+                }
                 self.fe_select_name();
             }
             // diagnostic: `NFS_FE_AFTER_RACE=<Game.GameType>[:aborted]` runs the front end's way
@@ -528,6 +533,7 @@ impl App {
                     scene.sprites.truncate(n);
                 }
                 let scene = scene;
+                self.sync_gamma();
                 let rgba = self
                     .renderer
                     .as_mut()

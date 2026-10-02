@@ -51,6 +51,7 @@ pub struct Gamepads {
     axes: PadAxes,
     /// `XAxis.Min` / `XAxis.Max`, the accessors' own 0…0x80
     x_band: (i32, i32),
+    rumbler: crate::ff::Rumbler,
 }
 
 /// `Analog`'s reader **0x411B80**: raw axis `v` (0…65535) against the descriptor's `lo`/`hi`
@@ -110,7 +111,7 @@ impl Gamepads {
         };
         // `XAxis.Min` / `.Max` default to 0 and 0x80 (0x51E546, 0x51E550) — no dead zone, and
         // full lock at the stick's end
-        Self { gilrs, axes: PadAxes::default(), x_band: (0, 0x80) }
+        Self { gilrs, axes: PadAxes::default(), x_band: (0, 0x80), rumbler: Default::default() }
     }
 
     /// The steering band, `XAxis.Min` and `XAxis.Max` of the accessors' own 0…0x80. The original
@@ -118,6 +119,30 @@ impl Gamepads {
     /// module comment).
     pub fn set_axis_band(&mut self, x_axis_min: i32, x_axis_max: i32) {
         self.x_band = (x_axis_min.clamp(0, 0x80), x_axis_max.clamp(0, 0x80));
+    }
+
+    /// Whether a pad that can rumble is connected — never on macOS (`crate::ff`).
+    pub fn rumble_supported(&self) -> bool {
+        self.gilrs.as_ref().is_some_and(|g| self.rumbler.supported(g))
+    }
+
+    /// A motor's sustained level, 0…1; 0 stops it.
+    pub fn rumble_sustain(&mut self, motor: crate::ff::Motor, level: f32) {
+        if let Some(g) = self.gilrs.as_mut() {
+            self.rumbler.sustain(g, motor, level);
+        }
+    }
+
+    /// A one-shot strong pulse.
+    pub fn rumble_pulse(&mut self, level: f32, ms: u32) {
+        if let Some(g) = self.gilrs.as_mut() {
+            self.rumbler.pulse(g, level, ms);
+        }
+    }
+
+    /// Stop the sustained motors.
+    pub fn rumble_stop_all(&mut self) {
+        self.rumbler.stop_all();
     }
 
     /// Drain gamepad events into the logical input state. Call once per frame.

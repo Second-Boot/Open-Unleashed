@@ -15,7 +15,13 @@ impl LayoutScreen {
                 // tabs could not measure the art they centre their captions over.
                 let file = self.part_attr(e, p, "shapePathName").filter(|v| !v.is_empty())?;
                 let index = match self.part_attr(e, p, "shapeIndex") {
-                    Some(v) => self.ev(e, v, depth + 1).filter(|n| *n >= 0)? as usize,
+                    Some(v) => {
+                        let n = self.ev(e, v, depth + 1);
+                        if n < 0 {
+                            return None;
+                        }
+                        n as usize
+                    },
                     None => 0,
                 };
                 let &(_, w, h) = self.shapes.get(&(file.to_string(), index))?;
@@ -29,7 +35,7 @@ impl LayoutScreen {
                 // 0x4E7285), both **truncated** (`_ftol` 0x5A0F98) and written over the part's
                 // own `size` with the `"%d,%d"` setter 0x5276E0 (0x4E72A0). Whatever the template
                 // says, a text part's `size` is the measure of the string it holds.
-                let text = self.part_text(e, p, depth)?;
+                let text = self.part_text(e, p, depth);
                 let named = e
                     .get("fontPathName")
                     .filter(|f| !f.is_empty())
@@ -46,7 +52,7 @@ impl LayoutScreen {
     /// The string a `TEXT` / `LOCALIZEDTEXT` part holds, `[part+0x19C]`: the `text` attribute's
     /// value after `StringAttribute::slot4` **0x526B60** has spliced each `%name%` with that
     /// macro's text (0x52DCE0; a name the dictionary does not hold stays as written). `None` when
-    /// a name in it is one the port cannot answer.
+    /// the chain is deeper than five (the cycle guard).
     ///
     /// * `LOCALIZEDTEXT`'s load **0x4E66E0** first writes the text from its `stringID`: `atoi`
     ///   (0x5A1F4A) of the attribute's value, then **0x4E06D0** — id 0 is the empty string
@@ -57,10 +63,12 @@ impl LayoutScreen {
     ///   the template's `WATCH`.
     /// * a `TEXT` part whose template gives no text keeps its constructor's `"Hello, World!"`
     ///   (0x5DDB84, pushed at 0x52B036).
-    pub(super) fn part_text(&self, e: &nfs_formats::lay::Element, p: &nfs_formats::ctr::Part, depth: u32) -> Option<String> {
+    pub(super) fn part_text(&self, e: &nfs_formats::lay::Element, p: &nfs_formats::ctr::Part, depth: u32) -> String {
         use nfs_formats::ctr::PartKind;
         if depth > 4 {
-            return None;
+            // the cycle guard (`guard_hits`): a text no update has published yet is empty
+            self.guard_hits.set(self.guard_hits.get() + 1);
+            return String::new();
         }
         // 0x526B60's loop, read to the instruction 2026-09-26: the pair finder 0x526DF0 takes the
         // **first** `%` of the whole string at `a` and gives up — ending the loop — when `a + 2`
@@ -78,7 +86,7 @@ impl LayoutScreen {
                 s.replace_range(k..k + pat.len(), with);
             }
         };
-        let splice = |v: &str| -> Option<String> {
+        let splice = |v: &str| -> String {
             let mut s = v.to_string();
             for _ in 0..256 {
                 let Some(a) = s.find('%') else { break };
@@ -88,16 +96,13 @@ impl LayoutScreen {
                 let Some(b) = s[a + 2..].find('%').map(|k| k + a + 2) else { break };
                 let name = s[a + 1..b].to_string();
                 let x = nfs_formats::expr::expand(&name, &|n| self.reference(e, n, depth + 1));
-                if x.contains(nfs_formats::expr::UNKNOWN) {
-                    return None;
-                }
                 replace_all(&mut s, &format!("%{name}%"), &x);
             }
             replace_all(&mut s, "%%", "%");
-            Some(s)
+            s
         };
         if p.kind() == PartKind::LocalizedText {
-            let raw = splice(self.part_attr(e, p, "stringID").unwrap_or(""))?;
+            let raw = splice(self.part_attr(e, p, "stringID").unwrap_or(""));
             // `atoi`: leading white space, a sign, then the digits
             let t = raw.trim_start();
             let (neg, t) = match t.as_bytes().first() {
@@ -108,19 +113,19 @@ impl LayoutScreen {
             let n = t.bytes().take_while(u8::is_ascii_digit).fold(0i32, |a, c| a.wrapping_mul(10).wrapping_add((c - b'0') as i32));
             let id = if neg { n.wrapping_neg() } else { n };
             if id == 0 {
-                return Some(String::new());
+                return String::new();
             }
-            return Some(self.fe_strings.get(id as u32).unwrap_or("Not Found").to_string());
+            return self.fe_strings.get(id as u32).unwrap_or("Not Found").to_string();
         }
         if e.class.eq_ignore_ascii_case("NFS5.AccessorWatch")
             && let Some(i) = self.layout.elements.iter().position(|x| std::ptr::eq(x, e))
             && let Some(t) = self.watch_text.borrow().get(&i)
         {
-            return Some(t.clone());
+            return t.clone();
         }
         match self.part_attr(e, p, "text") {
             Some(v) => splice(v),
-            None => Some("Hello, World!".to_string()),
+            None => "Hello, World!".to_string(),
         }
     }
 
@@ -331,6 +336,7 @@ impl LayoutScreen {
     /// The class template's own `size.value`, evaluated.
     fn box_template(&self, e: &nfs_formats::lay::Element, depth: u32) -> Option<(f32, f32)> {
         if depth > 4 {
+            self.guard_hits.set(self.guard_hits.get() + 1);
             return None;
         }
         let c = self.controls.get(&e.class)?;
@@ -452,7 +458,7 @@ impl LayoutScreen {
             return Some(c);
         }
         // a 32-bit pattern: `0xffffffff` is −1 to the evaluator and every bit of it the colour
-        let n = self.ev(e, v, 0)? as u32;
+        let n = self.ev(e, v, 0) as u32;
         Some([((n >> 16) & 0xFF) as u8, ((n >> 8) & 0xFF) as u8, (n & 0xFF) as u8, (n >> 24) as u8])
     }
 
@@ -641,7 +647,7 @@ impl LayoutScreen {
                 Some(n) => n,
                 None => match self.part_attr(e, p, "shapeIndex") {
                     Some(v) => match self.ev(e, v, 0) {
-                        Some(n) if n >= 0 => n as usize,
+                        n if n >= 0 => n as usize,
                         _ => continue,
                     },
                     None => 0,
@@ -673,7 +679,7 @@ impl LayoutScreen {
             // `flip.value=data.flipit`, so the widget's `flipit` mirrors the tab's art
             let flip = self
                 .part_attr(e, p, "flip")
-                .and_then(|v| self.ev(e, v, 0))
+                .map(|v| self.ev(e, v, 0))
                 .filter(|n| *n >= 0)
                 .map(|n| n as i64)
                 .unwrap_or_else(|| e.int("flip").unwrap_or(0).max(0));

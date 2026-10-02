@@ -152,6 +152,26 @@ impl LayoutScreen {
             let name = e.get("accessor").or_else(|| e.get("othersource")).filter(|v| !v.is_empty())?;
             return Some((i, name.to_string(), (px - x) / w));
         }
+        // a bar inside an open panel (`advgraphics.lay`'s gamma under `graphics.lay`'s strip,
+        // `audioreal.lay`'s levels, `forcefeedback.lay`'s five): the same test in the panel's own
+        // frame, its answer in the flattened index space, as `combo_row_at` does. *(Until
+        // 2026-10-02 only the screen's own elements were tested, so none of the eleven bars —
+        // every one sits in a panel — took the pointer. User report.)*
+        let mut keys: Vec<usize> = self.groups.keys().copied().collect();
+        keys.sort_unstable();
+        let mut base = self.layout.elements.len();
+        for k in keys {
+            let g = &self.groups[&k];
+            if !self.closed.contains(&k)
+                && let Some(e) = self.layout.elements.get(k)
+            {
+                let (gx, gy) = self.position_of(e);
+                if let Some((j, name, f)) = g.bar_at(px - gx, py - gy) {
+                    return Some((base + j, name, f));
+                }
+            }
+            base += g.span();
+        }
         None
     }
 

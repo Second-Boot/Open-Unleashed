@@ -25,16 +25,10 @@
 //! prints; the one error that changes a result is a syntax error in `0x52F830` itself, which
 //! returns **0 for the whole expression** (0x52FE6C…0x52FE95).
 //!
-//! **The port's one addition** (APPROXIMATION, labelled, kept OPEN 2026-09-30): a name
-//! the *port* cannot answer is carried as an unknown value instead of a number, so a caller can
-//! keep its own fallback. The original has no such state (it always measures the real string);
-//! for every name the port does answer, the result is the original's. Measured over all 98 shipped
-//! `.lay` files (`--layout-sweep`, 59 461 evaluations): no part expression of the sweep fails
-//! (`expr_failures` = 0). Until 2026-09-30 54 evaluations ended unknown — `box_template`
-//! with `measure = false` (`BottomBarButton.ctr`'s `size.value`, `Graphic Tab Button.ctr`'s and
-//! `Label.ctr`'s, the box pass that did not take a text/shape part's extent); that pass now
-//! measures like the original (`layout.rs` `reference`), so the only remaining unknowns are a
-//! name the port has no answer for and the depth guard of a cycle no shipped template has.
+//! **No port-only state** (closed 2026-10-02): the evaluator has no "unanswerable" value —
+//! the original always yields a number, an unknown name reads 0 (0x530F0A), and the dictionary's
+//! answers are the caller's (`layout.rs` `reference`, which always measures the real string like
+//! 0x4E7160 and answers a cycle's attribute with its never-published value, 0).
 
 /// What a name in an expression stands for — the answer of the macro dictionary `[0x69CAF8]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,13 +37,7 @@ pub enum Macro {
     Text(String),
     /// No such macro: the name stays as written and the evaluator reads it as **0** (0x530F0A).
     Undefined,
-    /// The port cannot answer this name. Not a state of the original — see the module note.
-    Unanswerable,
 }
-
-/// What stands in the expanded text for an [`Macro::Unanswerable`] name. It starts with a
-/// backquote, a byte no shipped expression contains, so it cannot collide with a real name.
-pub const UNKNOWN: &str = "`unanswerable`";
 
 /// The sentinel `?` leaves when its condition is false and `:` looks for (0x530831 / 0x530842).
 const NOT_TAKEN: i32 = 0x7FFF_FFFB;
@@ -91,7 +79,6 @@ fn expand_into(text: &str, lookup: &dyn Fn(&str) -> Macro, active: &mut Vec<Stri
                     out.push_str(&x);
                 }
                 Macro::Undefined => out.push_str(name),
-                Macro::Unanswerable => out.push_str(UNKNOWN),
             }
         } else {
             // 0x52E380 with flag 1: a run that does not start an identifier, up to the next byte
@@ -116,14 +103,13 @@ pub fn expand(text: &str, lookup: &dyn Fn(&str) -> Macro) -> String {
     expand_into(text, lookup, &mut Vec::new()).unwrap_or_default()
 }
 
-/// `0x52DC40` — expand, then evaluate. `None` only when a name the port cannot answer decides the
-/// result (the module note); the original always yields a number.
-pub fn eval(text: &str, lookup: &dyn Fn(&str) -> Macro) -> Option<i32> {
+/// `0x52DC40` — expand, then evaluate. The original always yields a number.
+pub fn eval(text: &str, lookup: &dyn Fn(&str) -> Macro) -> i32 {
     evaluate(&expand(text, lookup))
 }
 
 /// `0x52DF40` + `0x52F830` — evaluate text that has already been expanded.
-pub fn evaluate(text: &str) -> Option<i32> {
+pub fn evaluate(text: &str) -> i32 {
     // the 0x200-byte buffer of 0x52DF4A: `strncpy` with 0x200, so a longer value has no
     // terminator in the original (0x52DF4A `lea edx,[esp]`, 0x52DF53 `push 0x200`, 0x52DF5A
     // `call 0x5A28A0` = `strncpy`, a 0x200-byte frame `sub esp,0x200` at 0x52DF44) and the scan of
@@ -134,8 +120,7 @@ pub fn evaluate(text: &str) -> Option<i32> {
     // the longest is 44 bytes.
     let mut s: Vec<u8> = text.bytes().take(0x1FF).map(|c| if c == b'.' { b'X' } else { c }).collect();
     s.extend_from_slice(&[0; 4]);
-    let v = Evaluator::new().run(&s);
-    v.known.then_some(v.v)
+    Evaluator::new().run(&s).v
 }
 
 /// `0x527B80`, a point attribute's evaluation: the value is cut at its **first** comma (`strchr`,
@@ -145,7 +130,7 @@ pub fn evaluate(text: &str) -> Option<i32> {
 pub fn eval_pair(text: &str, lookup: &dyn Fn(&str) -> Macro) -> Option<(i32, i32)> {
     let text: String = text.chars().take(0x1FF).collect();
     let (a, b) = text.split_once(',')?;
-    Some((eval(a, lookup)?, eval(b, lookup)?))
+    Some((eval(a, lookup), eval(b, lookup)))
 }
 
 /// `prec[c]`, the binary-operator table `0x52F540` builds at `ctx+0`. The two-byte operators get
@@ -218,13 +203,11 @@ fn ftol(x: f64) -> i32 {
 #[derive(Debug, Clone, Copy)]
 struct Value {
     v: i32,
-    /// false only for the port's unanswerable names (the module note)
-    known: bool,
 }
 
 impl Value {
     fn num(v: i32) -> Value {
-        Value { v, known: true }
+        Value { v }
     }
 }
 
@@ -239,7 +222,7 @@ struct Evaluator {
 }
 
 /// A syntax error in `0x52F830`: the whole expression is 0 (0x52FE6C…0x52FE95).
-const SYNTAX_ERROR: Value = Value { v: 0, known: true };
+const SYNTAX_ERROR: Value = Value { v: 0 };
 
 impl Evaluator {
     fn new() -> Evaluator {
@@ -447,7 +430,7 @@ impl Evaluator {
             }
             if op >= 0x8C {
                 let a = self.vals.pop().unwrap_or(Value::num(0));
-                self.vals.push(Value { v: Self::unary_op(op, a.v), known: a.known });
+                self.vals.push(Value { v: Self::unary_op(op, a.v) });
             } else {
                 let b = self.vals.pop().unwrap_or(Value::num(0));
                 let a = self.vals.pop().unwrap_or(Value::num(0));
@@ -496,7 +479,6 @@ impl Evaluator {
     /// The binary arms of the table at 0x530890. Every one writes the left slot; an operator with
     /// no arm (a bracket pushed by the odd path of 0x52FB00) is error 7 and leaves it alone.
     fn binary_op(op: u8, a: Value, b: Value) -> Value {
-        let known = a.known && b.known;
         let (x, y) = (a.v, b.v);
         let v = match op {
             b'*' => x.wrapping_mul(y),
@@ -523,20 +505,14 @@ impl Evaluator {
             // the sentinel. Both sides are always evaluated, and the two group to the left at the
             // same priority, so `c1?a:c2?b:d` is `((c1?a):c2)?b:d` (0x53081F / 0x53083A)
             b'?' | 0x89 => {
-                if !a.known {
-                    return Value { v: 0, known: false };
-                }
                 return if x != 0 { b } else { Value::num(NOT_TAKEN) };
             }
             b':' | 0x8A => {
-                if !a.known {
-                    return Value { v: 0, known: false };
-                }
                 return if x == NOT_TAKEN { b } else { a };
             }
             _ => x,
         };
-        Value { v, known }
+        Value { v }
     }
 
     /// `0x5309E0` — one operand token.
@@ -707,9 +683,6 @@ impl Evaluator {
                 return Value::num(k as i32);
             }
         }
-        if t.windows(UNKNOWN.len()).any(|w| w == UNKNOWN.as_bytes()) {
-            return Value { v: 0, known: false };
-        }
         Value::num(0)
     }
 
@@ -808,7 +781,7 @@ fn parse_quoted(t: &[u8]) -> (Vec<u8>, bool) {
                 if at(p) == b'>' {
                     p += 1;
                 }
-                let v = evaluate(&inner).unwrap_or(0);
+                let v = evaluate(&inner);
                 out.extend_from_slice(v.to_string().as_bytes());
             }
             b'"' => {
@@ -833,7 +806,7 @@ mod tests {
     }
 
     fn e(s: &str) -> i32 {
-        eval(s, &none).unwrap()
+        eval(s, &none)
     }
 
     #[test]
@@ -944,24 +917,18 @@ mod tests {
             "data.align" => Macro::Text("1".into()),
             "a" => Macro::Text("b".into()),
             "b" => Macro::Text("a".into()),
-            "w" => Macro::Unanswerable,
             _ => Macro::Undefined,
         };
         // the macro's text is spliced in, not its value: `440+8/2` is 444
-        assert_eq!(eval("data.width/2", &r), Some(444));
-        assert_eq!(eval("(data.width-label.size.width)/2", &r), Some(204));
-        assert_eq!(eval("(0-label.size.width)/2*data.align", &r), Some(-20));
+        assert_eq!(eval("data.width/2", &r), 444);
+        assert_eq!(eval("(data.width-label.size.width)/2", &r), 204);
+        assert_eq!(eval("(0-label.size.width)/2*data.align", &r), -20);
         // a macro met again inside itself empties the whole expansion: 0
         assert_eq!(expand("a+1", &r), "");
-        assert_eq!(eval("a+1", &r), Some(0));
+        assert_eq!(eval("a+1", &r), 0);
         // a run that is exactly `##` is dropped; one with anything else in it is not
         assert_eq!(expand("x##y", &r), "xy");
         assert_eq!(expand("1##2", &r), "1##2");
-        // an unanswerable name has no value — unless it sits in the branch not taken
-        assert_eq!(eval("w+1", &r), None);
-        assert_eq!(eval("0?w:5", &r), Some(5));
-        assert_eq!(eval("1?5:w", &r), Some(5));
-        assert_eq!(eval("w?5:6", &r), None);
     }
 
     #[test]

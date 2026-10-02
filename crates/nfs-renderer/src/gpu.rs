@@ -1,5 +1,5 @@
 use crate::front::{Cmd, CmdList};
-use crate::{Camera, FakeSortMode, MaterialDesc, MeshData, Scene, Sprite, SpriteCompare, TextureData, Vertex};
+use crate::{Camera, FakeSortMode, LensProbe, LensRead, MaterialDesc, MeshData, Scene, Sprite, SpriteCompare, TextureData, Vertex};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -177,6 +177,15 @@ pub(crate) struct Core {
     /// `SPECIALFX` and, at level 2, the runtime globals 0x44EC80 reads to the instruction
     /// (`RE/notes/thrash.md` §6d.4).
     fakesort_mode: FakeSortMode,
+    /// The display gamma, state **0x2E** (`setstatef`, `[0x6BD918]`, with the value
+    /// `max(0.25, Graphics.GammaCorrection · 0.01)`, 0x44ED10 / 0x4DED10 / 0x4E5A70 / 0x511900).
+    /// `dx7z.dll`'s handler 0x600051D4 clamps it to `0…4` and multiplies the primary surface's
+    /// gamma ramp — the one it read at the mode set (0x600032B5, `GetGammaRamp`) — by it, each
+    /// word truncated (0x6000CB74) and capped at 0xFFFF, then `SetGammaRamp` (vtable `+0x10`). So it
+    /// is a scale of every displayed channel after the whole frame is drawn: [`Self::set_gamma`],
+    /// applied by [`GammaPass`]. 1.0 (the default 100) draws straight into the target as before.
+    gamma: f32,
+    gamma_pass: Option<GammaPass>,
     sprite_sampler: wgpu::Sampler,
     object_buf: wgpu::Buffer,
     object_bg: wgpu::BindGroup,
@@ -207,11 +216,31 @@ pub(crate) struct Core {
     pending_texture_bytes: Vec<u8>,
     /// depth targets by size, shared by every offscreen pass of that size (each pass clears it)
     depth_cache: std::collections::HashMap<(u32, u32), wgpu::TextureView>,
-    /// the pass's item indices by stage (sky, opaque, blended), kept between frames
-    buckets: [Vec<u32>; 3],
+    /// the pass's item indices by stage (sky, opaque, blended, overlay), kept between frames
+    buckets: [Vec<u32>; 4],
+    /// the surface carries `COPY_SRC`, so the lens flare's frame read-back can copy from it
+    /// ([`Self::set_lens_enabled`])
+    lens_enabled: bool,
+    /// read-backs issued and not yet collected, oldest first
+    lens_pending: Vec<LensPending>,
+    /// read-backs collected, for the front to hand to the game
+    lens_done: Vec<LensRead>,
+    /// blocks copied into the frame being encoded, mapped after its submit
+    lens_staged: Vec<(wgpu::Buffer, bool)>,
     /// `NFS_SPRITE_LOG`, read once
     sprite_log: bool,
 }
+
+/// One lens-flare read-back in flight: the 4 × 4 block copied into `buf` (rows `LENS_ROW` bytes
+/// apart), mapped once the copy has run.
+struct LensPending {
+    buf: wgpu::Buffer,
+    reference: bool,
+    rx: std::sync::mpsc::Receiver<std::result::Result<(), wgpu::BufferAsyncError>>,
+}
+
+/// The copy's row pitch: `COPY_BYTES_PER_ROW_ALIGNMENT`.
+const LENS_ROW: u64 = 256;
 
 /// One deferred vertex write: `len` bytes at `pending_bytes[start..]` into mesh `mesh`'s buffer.
 struct PendingWrite {
@@ -526,7 +555,7 @@ impl Core {
         // material's block is `{…, bias −1, 0, 0}` on every one — `ADDRESSU` / `ADDRESSV` `CLAMP`
         // (`RE/notes/thrash.md` §7) — and `sh80` has 7 mips, so the mip filter is the loader's
         // `POINT`, `LINEAR` at `SPECIALFX` 3 (0x44D571, 0x535A60); the bias is the shader's. (Until
-        // 2026-09-25 this sampler clamped as an APPROXIMATION and read the top level only.) The
+        // 2026-09-25 this sampler clamped as an approximation and read the top level only.) The
         // `HEAD` decal samples its top level explicitly through the same sampler: `common.fsh`
         // loads with no state block (0x44D270 → 0x44D2E9 pushes 0), so `HEAD` keeps the
         // constructor's default 0x5379D0 — `CLAMP` / `CLAMP`, `LINEAR`, mip `NONE`
@@ -710,6 +739,8 @@ impl Core {
             point_samplers,
             trilinear: false,
             fakesort_mode: FakeSortMode::default(),
+            gamma: 1.0,
+            gamma_pass: None,
             sprite_sampler,
             object_buf,
             object_bg,
@@ -729,7 +760,11 @@ impl Core {
             pending_textures: Vec::new(),
             pending_texture_bytes: Vec::new(),
             depth_cache: std::collections::HashMap::new(),
-            buckets: [Vec::new(), Vec::new(), Vec::new()],
+            buckets: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            lens_enabled: false,
+            lens_pending: Vec::new(),
+            lens_done: Vec::new(),
+            lens_staged: Vec::new(),
             sprite_log: std::env::var("NFS_SPRITE_LOG").is_ok(),
         };
         let _ = &r.object_layout;
@@ -773,7 +808,9 @@ impl Core {
                 Cmd::MirrorView(on) => self.set_mirror_view(on),
                 Cmd::Trilinear(on) => self.set_trilinear(on),
                 Cmd::FakeSort(m) => self.set_fakesort_mode(m),
+                Cmd::Gamma(g) => self.set_gamma(g),
                 Cmd::Resize(w, h) => self.resize(w, h),
+                Cmd::LensProbe(on) => self.set_lens_enabled(on),
                 Cmd::CreateMaterial(d) => {
                     self.create_material(d);
                 }
@@ -810,6 +847,94 @@ impl Core {
     }
     pub(crate) fn offscreen_sizes(&self) -> std::collections::HashMap<u32, (u32, u32)> {
         self.offscreen.clone()
+    }
+
+    /// Let the surface be copied from, for the lens flare's frame read-back. Off (the default) the
+    /// surface is a render attachment alone.
+    pub fn set_lens_enabled(&mut self, on: bool) {
+        if self.lens_enabled == on {
+            return;
+        }
+        self.lens_enabled = on;
+        self.config.usage = if on { wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC } else { wgpu::TextureUsages::RENDER_ATTACHMENT };
+        self.surface.configure(&self.device, &self.config);
+        if !on {
+            self.lens_pending.clear();
+        }
+    }
+
+    /// Collect the lens-flare read-backs that have finished (their copies ran and their buffers are
+    /// mapped) into [`Self::lens_done`]; the cost of each is what this takes, in whole milliseconds.
+    fn collect_lens(&mut self) {
+        if self.lens_pending.is_empty() {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        let mut keep = Vec::new();
+        for p in std::mem::take(&mut self.lens_pending) {
+            match p.rx.try_recv() {
+                Ok(Ok(())) => {
+                    let mut pixels = [0u32; 16];
+                    {
+                        let data = p.buf.slice(..).get_mapped_range();
+                        for (row, chunk) in pixels.chunks_exact_mut(4).enumerate() {
+                            for (i, px) in chunk.iter_mut().enumerate() {
+                                let o = row * LENS_ROW as usize + i * 4;
+                                *px = u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+                            }
+                        }
+                    }
+                    p.buf.unmap();
+                    self.lens_done.push(LensRead { reference: p.reference, pixels, cost_ms: t0.elapsed().as_millis() as u32 });
+                }
+                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => keep.push(p),
+            }
+        }
+        // a read-back that never completes does not pile up
+        let n = keep.len();
+        if n > 8 {
+            keep.drain(..n - 8);
+        }
+        self.lens_pending = keep;
+    }
+
+    /// The finished read-backs, taken.
+    pub(crate) fn take_lens(&mut self) -> Vec<LensRead> {
+        std::mem::take(&mut self.lens_done)
+    }
+
+    /// PORT-DEVIATION D9 (PORT-DEVIATIONS.md) [0x460460 / dx7z 0x60003990, a blocking lock in the frame]:
+    /// Copy the 4 × 4 block at the probe's pixel from `target` into a fresh staging buffer and map
+    /// it; [`Self::collect_lens`] picks it up when the copy has run. The block is moved inside the
+    /// target when the sun's point is within two pixels of an edge (`THRASH_readrect` reads
+    /// whatever lies at the offsets, `dx7z.dll` 0x60003990 does no clipping).
+    fn lens_copy(&mut self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::Texture, probe: LensProbe, reference: bool) {
+        let (w, h) = (target.width() as i32, target.height() as i32);
+        if w < 4 || h < 4 {
+            return;
+        }
+        let (x, y) = (probe.x.clamp(0, w - 4), probe.y.clamp(0, h - 4));
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("lens read-back"), size: LENS_ROW * 4, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: target, mip_level: 0, origin: wgpu::Origin3d { x: x as u32, y: y as u32, z: 0 }, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(LENS_ROW as u32), rows_per_image: Some(4) } },
+            wgpu::Extent3d { width: 4, height: 4, depth_or_array_layers: 1 },
+        );
+        // mapped after the frame's submit ([`Self::lens_map_staged`])
+        self.lens_staged.push((buf, reference));
+    }
+
+    /// Ask for the mapping of every block copied this frame; call after the submit.
+    fn lens_map_staged(&mut self) {
+        for (buf, reference) in std::mem::take(&mut self.lens_staged) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            self.lens_pending.push(LensPending { buf, reference, rx });
+        }
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -1221,6 +1346,33 @@ impl Core {
         self.fakesort_mode = mode;
     }
 
+    /// State 0x2E's value as the game passes it; `dx7z.dll` 0x600051EE…0x6000522E: `≤ 0` → 0,
+    /// not `< 4` → 4.
+    pub fn set_gamma(&mut self, g: f32) {
+        self.gamma = if g <= 0.0 { 0.0 } else if g < 4.0 { g } else { 4.0 };
+    }
+
+    /// Draw a frame into `target` (`width × height`, the surface's format): straight in at gamma
+    /// 1, otherwise into the gamma pass's own image and then through the ramp into `target`.
+    #[allow(clippy::too_many_arguments)]
+    /// `can_copy`: `target_tex` (or the gamma pass's own image) may be copied from — the lens
+    /// flare's blocks read the frame **before** the ramp, as `THRASH_readrect` reads the back
+    /// buffer and the ramp is the display's.
+    fn encode_with_gamma(&mut self, scene: &Scene, camera: &Camera, target: &wgpu::TextureView, target_tex: &wgpu::Texture, can_copy: bool, depth: &wgpu::TextureView, width: u32, height: u32, aspect: f32) {
+        if self.gamma == 1.0 {
+            self.encode_frame(scene, scene.clear_color, true, camera, target, target_tex, can_copy, depth, aspect, VIEW_FAR);
+            return;
+        }
+        let mut pass = match self.gamma_pass.take() {
+            Some(p) => p,
+            None => GammaPass::new(&self.device, self.config.format),
+        };
+        let (src_tex, src) = pass.source(&self.device, self.config.format, width, height);
+        self.encode_frame(scene, scene.clear_color, true, camera, &src, &src_tex, true, depth, aspect, VIEW_FAR);
+        pass.resolve(&self.device, &self.queue, target, self.gamma);
+        self.gamma_pass = Some(pass);
+    }
+
     pub fn render(&mut self, scene: &Scene, camera: &Camera) -> Result<()> {
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
@@ -1233,8 +1385,11 @@ impl Core {
         let view = frame.texture.create_view(&Default::default());
         let aspect = self.aspect();
         let depth = self.depth_view.clone();
-        self.encode_frame(scene, scene.clear_color, true, camera, &view, &depth, aspect, VIEW_FAR);
+        let (w, h) = (frame.texture.width(), frame.texture.height());
+        let can_copy = self.lens_enabled;
+        self.encode_with_gamma(scene, camera, &view, &frame.texture, can_copy, &depth, w, h, aspect);
         frame.present();
+        self.collect_lens();
         Ok(())
     }
 
@@ -1283,7 +1438,8 @@ impl Core {
         let depth = self.depth_for(width, height);
         let view = self.textures[id.0 as usize].view.clone();
         // the scene's items and lights as they are, its own clear colour replaced and no sprites
-        self.encode_frame(scene, clear_colour.unwrap_or([0.0, 0.0, 0.0, 0.0]), false, camera, &view, &depth, width as f32 / height as f32, depth_far.unwrap_or(VIEW_FAR));
+        let target = self.textures[id.0 as usize]._texture.clone();
+        self.encode_frame(scene, clear_colour.unwrap_or([0.0, 0.0, 0.0, 0.0]), false, camera, &view, &target, false, &depth, width as f32 / height as f32, depth_far.unwrap_or(VIEW_FAR));
         id
     }
 
@@ -1300,8 +1456,11 @@ impl Core {
         });
         let view = target.create_view(&Default::default());
         let depth = self.depth_for(width, height);
-        self.encode_frame(scene, scene.clear_color, true, camera, &view, &depth, width as f32 / height as f32, VIEW_FAR);
-        self.readback(&target, width, height)
+        self.encode_with_gamma(scene, camera, &view, &target, true, &depth, width, height, width as f32 / height as f32);
+        let px = self.readback(&target, width, height);
+        // the read-back above waited for the device, so the frame's lens blocks are mapped
+        self.collect_lens();
+        px
     }
 
     /// An offscreen texture's pixels as RGBA8 rows (diagnostics: `NFS_MIRROR_DUMP`).
@@ -1347,6 +1506,67 @@ impl Core {
         Ok(out)
     }
 
+    /// Draw one stage's items into `pass`, in order: consecutive items of one mesh under one state
+    /// are one instanced draw. `st` is what the pass already has bound.
+    fn draw_bucket(&self, pass: &mut wgpu::RenderPass<'_>, scene: &Scene, bucket: &[u32], st: &mut DrawState, white: TextureId) {
+        // consecutive items of one mesh under one state are one instanced draw
+        let mut run: Option<Run> = None;
+        for &idx in bucket {
+            let item = &scene.items[idx as usize];
+            let mat = &self.materials[item.material.0 as usize];
+            // mirrored world: the winding flips, so a material whose cull is the view's culls
+            // the other one (0x468C45); any other draws both faces rather than the wrong one
+            let cull = match (mat.cull_back, scene.mirror, mat.view_cull) {
+                (false, _, _) | (true, true, false) => 1,
+                (true, false, _) => 0,
+                (true, true, true) => 2,
+            };
+            let sub = cull * 2 + (!mat.depth_test as usize);
+            // the blend group without depth writes, and with them (`device_states`)
+            let plain = if mat.alpha_blend && mat.blend_pair > 0 { 1 + mat.blend_pair as usize } else { mat.alpha_blend as usize };
+            let group = if mat.alpha_blend && mat.device_states { 5 + mat.blend_pair as usize } else { plain };
+            let sky = sky_tex_of(&self.materials, self.no_reflections, item).unwrap_or(white).0;
+            // `LayerFalseSort1` / `2`: at `SPECIALFX` 3, always, and at 2 by the runtime
+            // pick (`FakeSortMode`, `RE/notes/thrash.md` §6d.4), the same draw first with
+            // depth writes off, then on (0x449ADB / 0x449B2A). Otherwise (below 2, or 2's
+            // `Single` pick) the other arm never draws twice: one draw, `MAG`/`MINFILTER`
+            // forced `POINT` for it (0x449ABE), depth writes untouched.
+            let fakesort_single = match self.fakesort_mode {
+                FakeSortMode::Single => true,
+                FakeSortMode::Double => false,
+                // `LayerFalseSort1`/`2`'s own fold, per drawn item (0x449AB2, `[0x61975C]
+                // < 10000` unsigned)
+                FakeSortMode::PerItem => !item.fakesort_near,
+            };
+            let material = item.material.0 * 2;
+            if mat.false_sort && mat.alpha_blend && !fakesort_single {
+                // two pipelines in turn on one item: never merged, and the run before it
+                // is drawn first
+                if let Some(r) = run.take() {
+                    self.draw_run(pass, st, &r);
+                }
+                let mut r = Run { first: idx, count: 1, pipeline: plain * 6 + sub, material, sky, mesh: item.mesh.0 };
+                self.draw_run(pass, st, &r);
+                r.pipeline = group * 6 + sub;
+                self.draw_run(pass, st, &r);
+                continue;
+            }
+            let material = if mat.false_sort && mat.alpha_blend && mat.bind_group_point.is_some() { material | 1 } else { material };
+            let next = Run { first: idx, count: 1, pipeline: group * 6 + sub, material, sky, mesh: item.mesh.0 };
+            match &mut run {
+                Some(r) if r.first + r.count == idx && r.pipeline == next.pipeline && r.material == next.material && r.sky == next.sky && r.mesh == next.mesh => r.count += 1,
+                _ => {
+                    if let Some(r) = run.replace(next) {
+                        self.draw_run(pass, st, &r);
+                    }
+                }
+            }
+        }
+        if let Some(r) = run.take() {
+            self.draw_run(pass, st, &r);
+        }
+    }
+
     /// Set what a run needs that the pass does not already hold, then draw it: one instanced draw
     /// of `r.count` consecutive objects (`first_instance` = the first object's index).
     fn draw_run(&self, pass: &mut wgpu::RenderPass<'_>, st: &mut DrawState, r: &Run) {
@@ -1378,7 +1598,7 @@ impl Core {
     /// belt into this frame's encoder, so nothing allocates a staging buffer per call. Neither
     /// pass stores its depth: nothing reads it afterwards (the sprite pass clears it to 1.0).
     #[allow(clippy::too_many_arguments)]
-    fn encode_frame(&mut self, scene: &Scene, clear_color: [f64; 4], with_sprites: bool, camera: &Camera, view: &wgpu::TextureView, depth_view: &wgpu::TextureView, aspect: f32, depth_far: f32) {
+    fn encode_frame(&mut self, scene: &Scene, clear_color: [f64; 4], with_sprites: bool, camera: &Camera, view: &wgpu::TextureView, target: &wgpu::Texture, can_copy: bool, depth_view: &wgpu::TextureView, aspect: f32, depth_far: f32) {
         let n = scene.items.len().min(MAX_OBJECTS as usize);
         let white = self.white;
         self.sky_bind_group(white);
@@ -1393,7 +1613,7 @@ impl Core {
         for (i, item) in scene.items.iter().take(n).enumerate() {
             let (stage, skip) = {
                 let mat = &self.materials[item.material.0 as usize];
-                (if !mat.depth_test { 0 } else if mat.alpha_blend && !item.early { 2 } else { 1 }, item.main_view_only && self.no_reflections)
+                (if item.overlay { 3 } else if !mat.depth_test { 0 } else if mat.alpha_blend && !item.early { 2 } else { 1 }, item.main_view_only && self.no_reflections)
             };
             if let Some(t) = sky_tex_of(&self.materials, self.no_reflections, item) {
                 self.sky_bind_group(t);
@@ -1492,10 +1712,15 @@ impl Core {
             }
         }
 
-        {
-            let c = clear_color;
+        let c = clear_color;
+        let probe = scene.lens_probe.filter(|_| can_copy);
+        let overlay = !buckets[3].is_empty();
+        // The lens flare's reference (0x460290 at 0x4603FF): the block as the sky pass leaves it with
+        // the sun drawn — the stage with no depth test (the sky layers and the sun) alone, drawn
+        // ahead of the frame proper into the same target, which the main pass then clears.
+        if let Some(p) = probe.filter(|p| p.reference) {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("main pass"),
+                label: Some("lens reference pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
@@ -1513,64 +1738,57 @@ impl Core {
             pass.set_bind_group(0, &self.globals_bg, &[]);
             pass.set_bind_group(1, &self.object_bg, &[]);
             let mut st = DrawState::NONE;
-            for bucket in &buckets {
-                // consecutive items of one mesh under one state are one instanced draw
-                let mut run: Option<Run> = None;
-                for &idx in bucket {
-                    let item = &scene.items[idx as usize];
-                    let mat = &self.materials[item.material.0 as usize];
-                    // mirrored world: the winding flips, so a material whose cull is the view's culls
-                    // the other one (0x468C45); any other draws both faces rather than the wrong one
-                    let cull = match (mat.cull_back, scene.mirror, mat.view_cull) {
-                        (false, _, _) | (true, true, false) => 1,
-                        (true, false, _) => 0,
-                        (true, true, true) => 2,
-                    };
-                    let sub = cull * 2 + (!mat.depth_test as usize);
-                    // the blend group without depth writes, and with them (`device_states`)
-                    let plain = if mat.alpha_blend && mat.blend_pair > 0 { 1 + mat.blend_pair as usize } else { mat.alpha_blend as usize };
-                    let group = if mat.alpha_blend && mat.device_states { 5 + mat.blend_pair as usize } else { plain };
-                    let sky = sky_tex_of(&self.materials, self.no_reflections, item).unwrap_or(white).0;
-                    // `LayerFalseSort1` / `2`: at `SPECIALFX` 3, always, and at 2 by the runtime
-                    // pick (`FakeSortMode`, `RE/notes/thrash.md` §6d.4), the same draw first with
-                    // depth writes off, then on (0x449ADB / 0x449B2A). Otherwise (below 2, or 2's
-                    // `Single` pick) the other arm never draws twice: one draw, `MAG`/`MINFILTER`
-                    // forced `POINT` for it (0x449ABE), depth writes untouched.
-                    let fakesort_single = match self.fakesort_mode {
-                        FakeSortMode::Single => true,
-                        FakeSortMode::Double => false,
-                        // `LayerFalseSort1`/`2`'s own fold, per drawn item (0x449AB2, `[0x61975C]
-                        // < 10000` unsigned)
-                        FakeSortMode::PerItem => !item.fakesort_near,
-                    };
-                    let material = item.material.0 * 2;
-                    if mat.false_sort && mat.alpha_blend && !fakesort_single {
-                        // two pipelines in turn on one item: never merged, and the run before it
-                        // is drawn first
-                        if let Some(r) = run.take() {
-                            self.draw_run(&mut pass, &mut st, &r);
-                        }
-                        let mut r = Run { first: idx, count: 1, pipeline: plain * 6 + sub, material, sky, mesh: item.mesh.0 };
-                        self.draw_run(&mut pass, &mut st, &r);
-                        r.pipeline = group * 6 + sub;
-                        self.draw_run(&mut pass, &mut st, &r);
-                        continue;
-                    }
-                    let material = if mat.false_sort && mat.alpha_blend && mat.bind_group_point.is_some() { material | 1 } else { material };
-                    let next = Run { first: idx, count: 1, pipeline: group * 6 + sub, material, sky, mesh: item.mesh.0 };
-                    match &mut run {
-                        Some(r) if r.first + r.count == idx && r.pipeline == next.pipeline && r.material == next.material && r.sky == next.sky && r.mesh == next.mesh => r.count += 1,
-                        _ => {
-                            if let Some(r) = run.replace(next) {
-                                self.draw_run(&mut pass, &mut st, &r);
-                            }
-                        }
-                    }
-                }
-                if let Some(r) = run.take() {
-                    self.draw_run(&mut pass, &mut st, &r);
-                }
+            self.draw_bucket(&mut pass, scene, &buckets[0], &mut st, white);
+            drop(pass);
+            self.lens_copy(&mut encoder, target, p, true);
+        }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("main pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: c[0], g: c[1], b: c[2], a: c[3] }), store: wgpu::StoreOp::Store },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: if overlay { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_bind_group(0, &self.globals_bg, &[]);
+            pass.set_bind_group(1, &self.object_bg, &[]);
+            let mut st = DrawState::NONE;
+            for bucket in &buckets[..3] {
+                self.draw_bucket(&mut pass, scene, bucket, &mut st, white);
             }
+        }
+        // The lens flare's test (0x460525): the block of the finished 3-D pass, before the flare's
+        // own elements are laid over it
+        if let Some(p) = probe.filter(|p| p.test) {
+            self.lens_copy(&mut encoder, target, p, false);
+        }
+        // the lens flare's elements (0x460460 → 0x451710): flat on the screen over the finished
+        // frame, under no depth test
+        if overlay {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("overlay pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }, depth_slice: None })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Discard }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_bind_group(0, &self.globals_bg, &[]);
+            pass.set_bind_group(1, &self.object_bg, &[]);
+            let mut st = DrawState::NONE;
+            self.draw_bucket(&mut pass, scene, &buckets[3], &mut st, white);
         }
         // The 2D pass, over the 3-D one. Its depth starts at 1.0: the front end clears the
         // depth window before its 2D draws (0x4DA890 at 0x4D30AC / 0x4D3182: `THRASH_window(3)`
@@ -1641,6 +1859,7 @@ impl Core {
         self.belt.finish();
         self.queue.submit(Some(encoder.finish()));
         self.belt.recall();
+        self.lens_map_staged();
     }
 }
 
@@ -1677,4 +1896,112 @@ fn sprite_quad(sp: &Sprite, aspect: f32) -> [SpriteVertex; 6] {
     };
     let (a, b, c, d) = (corner(0.0, 0.0), corner(1.0, 0.0), corner(1.0, 1.0), corner(0.0, 1.0));
     [a, b, c, a, c, d]
+}
+
+/// The display ramp of state 0x2E as a last full-screen pass: `ramp[i] = min(0xFFFF, trunc(i ·
+/// 257 · g))` — `dx7z.dll` scales the ramp it read at the mode set, which is the identity `i · 257`
+/// on a primary surface nobody has touched — shown as `ramp / 0xFFFF` of full scale. The original
+/// needs `DDCAPS2_PRIMARYGAMMA` (`[0x60033FA0]`, caps bit 0x20000, 0x60009115…0x60009123) and
+/// otherwise ignores the state; the port, windowed, always applies it.
+struct GammaPass {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    uniform: wgpu::Buffer,
+    /// the frame's own image, kept while the size holds
+    target: Option<(u32, u32, wgpu::Texture, wgpu::TextureView, wgpu::BindGroup)>,
+}
+
+const GAMMA_WGSL: &str = r#"
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var<uniform> g: vec4<f32>;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let c = textureLoad(src, vec2<i32>(pos.xy), 0);
+    let i = round(c.rgb * 255.0);
+    let w = min(floor(i * 257.0 * g.x), vec3<f32>(65535.0));
+    return vec4<f32>(w / 65535.0, c.a);
+}
+"#;
+
+impl GammaPass {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gamma"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+            ],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("gamma"), source: wgpu::ShaderSource::Wgsl(GAMMA_WGSL.into()) });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("gamma"), bind_group_layouts: &[&layout], push_constant_ranges: &[] });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("gamma"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor { label: Some("gamma"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        Self { pipeline, layout, uniform, target: None }
+    }
+
+    /// The image the frame is drawn into before the ramp, `width × height`.
+    fn source(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+        if !self.target.as_ref().is_some_and(|(w, h, ..)| *w == width && *h == height) {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("gamma source"),
+                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("gamma"),
+                layout: &self.layout,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: self.uniform.as_entire_binding() }],
+            });
+            self.target = Some((width, height, texture, view, bg));
+        }
+        self.target.as_ref().map(|(_, _, t, v, _)| (t.clone(), v.clone())).expect("gamma source")
+    }
+
+    fn resolve(&self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::TextureView, g: f32) {
+        let Some((_, _, _, _, bg)) = self.target.as_ref() else { return };
+        queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&[g, 0.0f32, 0.0, 0.0]));
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("gamma"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: target, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        queue.submit(Some(enc.finish()));
+    }
 }

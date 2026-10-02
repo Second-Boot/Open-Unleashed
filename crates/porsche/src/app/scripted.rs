@@ -194,9 +194,7 @@ impl App {
                     println!("  {name:<20} {:<26} {:<30} ~> {model:?}", "3dcar", w.accessor.clone().unwrap_or_default());
                 }
             }
-            // Every part expression the port cannot evaluate. `reference` answers `None` for a
-            // name it does not know and every caller falls back silently, so a template rule the
-            // port misses leaves no trace in the blank count.
+            // Every part expression whose evaluation reached the cycle guard (`guard_hits`; // there is no unanswerable name any more) — none over the 98 shipped layouts.
             if nfs_game::config::cfg().nfs_expr_sweep.var().is_ok()
                 && let Some(l) = self.fe.layout_preview.as_ref()
             {

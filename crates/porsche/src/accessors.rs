@@ -615,7 +615,7 @@ impl App {
             // `paint_set` and `trim`, which the paint shop's setters 0x4F6F90…0x4F7020 step), the
             // dealership its chosen paint and interior (`[this+0x30]` / `[this+0x34]`, 0x501DB4).
             // *(Until 2026-09-26 this read the quick race's paint for all seven, "one colour per
-            // owned car" — an APPROXIMATION left over from before the port kept the trims.)*
+            // owned car" — an approximation left over from before the port kept the trims.)*
             "OwnedCar.ExtColour" | "OwnedCar.IntColour" | "OwnedCar.S1Colour" | "OwnedCar.S2Colour"
             | "GenericCar.Colour" | "DealerCar.Colour" | "DealerCar.IntColour" => {
                 let at = self.combo_rows(base).and_then(|(_, at)| at).unwrap_or_else(|| menu.map_or(0, |m| m.paint_idx));

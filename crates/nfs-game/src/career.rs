@@ -2225,7 +2225,7 @@ fn part_resale_from(aged: i64, state: f32) -> i64 {
 /// The value is what `0x4F8E50` and `0x4F7E90` truncate into their damage bands.
 /// The result is the x87 value (53-bit, MSVC's precision control) that the callers hand straight
 /// to `_ftol` — an `f64` here, never rounded to `f32` on the way. *(Until 2026-09-26 it was stored
-/// as `f32`, an APPROXIMATION that could round a total just under an integer up to it.)*
+/// as `f32`, an approximation that could round a total just under an integer up to it.)*
 pub fn car_damage_pct(tables: &CareerTables, owned: &OwnedCar) -> f64 {
     let parts: Vec<(u16, f32)> = owned
         .parts

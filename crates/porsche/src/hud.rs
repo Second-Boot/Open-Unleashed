@@ -347,6 +347,12 @@ thread_local! {
     pub(crate) static HUD_PX: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((640, 480)) };
 }
 
+thread_local! {
+    /// The stored positions of the record in use (N01a), see [`Hud::set_stored`]: `(design x, design y,
+    /// width, stored (fx, fy))` per element; empty when the size has no record (the derivation runs).
+    pub(crate) static HUD_STORED: std::cell::RefCell<Vec<(f32, f32, f32, (f32, f32))>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 pub(crate) const HUD_REF_W: f32 = 640.0;
 
 pub(crate) const HUD_ORANGE: [f32; 4] = [0.98, 0.706, 0.0, 1.0];
@@ -574,6 +580,34 @@ mod anchor_tests {
         Hud::set_screen(640, 480);
     }
 
+    /// N01a: with a stored record the positions are `ftol(frac · W)` of its fields, not the derivation —
+    /// the shipped "Config 2" @ 1600×1200 (`nfs5-2.hud` record 5): HTach y 1033 (the derivation 1023),
+    /// HLeader x 129 (125), the others equal; no record: the derivation.
+    #[test]
+    fn a_stored_record_is_used_as_stored() {
+        let l = &crate::hud::SCREEN_LAYOUTS[1];
+        let mut s = [(0.0f32, 0.0f32); 13];
+        s[4] = (0.92, 0.860_833_35);
+        s[8] = (0.081_249_997, 0.0);
+        s[9] = (0.425_000_01, 0.0);
+        Hud::set_screen(1600, 1200);
+        let (ox, oy) = Hud::origin();
+        let at = |r: (f32, f32, f32, f32)| {
+            let (x, y) = Hud::anchor_passes(r.0, r.1, r.2, r.3, 1);
+            (x + ox, y + oy)
+        };
+        let (tach, leader, rear) = ((l.tach.0, l.tach.1, 128.0, 128.0), (l.leader.0, l.leader.1, 59.0, 85.0), (l.rearview.0, l.rearview.1, 240.0, 84.0));
+        assert_eq!(at(tach), (1472.0, 1023.0), "derived");
+        assert_eq!(at(leader), (125.0, 0.0));
+        Hud::set_stored(1, Some(s));
+        assert_eq!(at(tach), (1472.0, 1033.0), "stored");
+        assert_eq!(at(leader), (129.0, 0.0));
+        assert_eq!(at(rear), (680.0, 0.0));
+        Hud::set_stored(1, None);
+        assert_eq!(at(tach), (1472.0, 1023.0));
+        Hud::set_screen(640, 480);
+    }
+
     /// The pen of every HUD text after Thrash's float round trip (0x536A60, `Hud::snap_pen`), against the
     /// original's frames at four resolutions (P1): every static label's pen x and y (6 labels x 4 resolutions).
     #[test]
@@ -589,5 +623,20 @@ mod anchor_tests {
         assert_eq!(snap(1071.0, 16.0, 1280.0, 720.0), (1071.0, 15.0));
         assert_eq!(snap(1146.0, 62.0, 1280.0, 720.0), (1146.0, 61.0));
         assert_eq!(snap(5.0, 60.0, 1280.0, 720.0), (5.0, 60.0));
+    }
+}
+
+impl App {
+    /// N01a: tell the HUD which record's stored positions to use for the logical size `(w, h)` —
+    /// 0x41F7A0 finds the record of `Display.ScreenLayout` at the screen's size and the HUD uses its
+    /// fields as stored; none (0x41EBF0 would make it, 0x41EFF0 anchoring its copy): cleared, and
+    /// `Hud::anchor_passes` derives the same thing at draw time.
+    pub(crate) fn hud_stored_sync(&self, w: u32, h: u32) {
+        self.hud_cfg_ensure();
+        // the layout the draw picks (`SCREEN_LAYOUTS`, `Display.ScreenLayout`)
+        let layout = self.choice_index("Display.ScreenLayout").map_or(0, |(i, _)| i.min(3));
+        let cache = self.hud_cfg.borrow();
+        let stored = cache.cfg.as_ref().and_then(|c| c.find(layout, w, h).map(|i| c.stored_positions(i)));
+        Hud::set_stored(layout, stored);
     }
 }

@@ -504,7 +504,7 @@ fn a_goto_button_is_a_pill() {
             .filter(|n| {
                 let v = c.part(n).unwrap().value("foreColor").unwrap();
                 let r = |x: &str| if x == "data.medium" { nfs_formats::ctr::Macro::Text(medium.to_string()) } else { nfs_formats::ctr::Macro::Undefined };
-                nfs_formats::ctr::eval(v, &r).is_some_and(|n| (n as u32) >> 24 != 0)
+                (nfs_formats::ctr::eval(v, &r) as u32) >> 24 != 0
             })
             .collect()
     };

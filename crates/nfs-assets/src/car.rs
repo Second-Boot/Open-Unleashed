@@ -381,7 +381,7 @@ pub struct CarAssets {
     /// writes, the `Rs` cull, the `Base+70` order. The one thing the flag changes in the port is
     /// the `Rs` block's blending: a room's materials take its blend flag and pair (pair 1,
     /// `SRCALPHA` / `ONE`, for the light pools and cones), where the cars keep the port's rule.
-    /// *(Until 2026-09-25 this was an APPROXIMATION that kept the rooms off the car's states, with
+    /// *(Until 2026-09-25 this was an approximation that kept the rooms off the car's states, with
     /// their page formats and draw class not read.)*
     pub front_end_room: bool,
     /// `carinfo+0x32C`, the style overlay a race car's installed parts write: `{group, slot,
@@ -600,7 +600,7 @@ impl CarAssets {
                 // the result copied row by row (the mode's per-depth routine, 0x571847…0x571871).
                 // So it is the 32-bit rule on an opaque texel, which is what `blit` does with the
                 // decoded image (alpha 255) — CONFIRMED, `car-model.md` §5.4. *(Until 2026-09-25
-                // this was an APPROXIMATION, the second stage unread.)*
+                // this was an approximation, the second stage unread.)*
                 let page_bpp = self.tpg.section(&format!("tpage{page_no}.details")).and_then(|d| d.get_i64("bpp")).unwrap_or(1555);
                 let file_tint = det.get_i64("tint").unwrap_or(1) != 0;
                 let bl = self.tpg.section(&format!("file{file_no}.{}", ename.to_lowercase())).and_then(|s| s.get_i64("tint")).map_or(file_tint, |t| t != 0);
@@ -781,6 +781,15 @@ fn font_write(page: &mut TexturePage, px: usize, s: u32) {
         d.copy_from_slice(&[(out >> 16) as u8, (out >> 8) as u8, out as u8, (out >> 24) as u8]);
         return;
     }
+    blend_1555(d, s);
+}
+
+/// 0x573FAF: one premultiplied `A R G B` dword onto a 1555 texel (kept as 8-bit channels, read and written at
+/// 5 bits; the written texel's alpha bit is always set, `0x8000`, 0x574030).
+/// Under `0x1000_0000` (alpha under 16) nothing is written (0x573FBA), from `0xFC00_0000` (alpha 252 and up) the
+/// source replaces the texel (0x573FC2), between them the page's channels are scaled by `255 − alpha` in the
+/// packed form and the source added (0x573FCA…0x574010).
+fn blend_1555(d: &mut [u8], s: u32) {
     if s < 0x1000_0000 {
         return;
     }
@@ -795,6 +804,31 @@ fn font_write(page: &mut TexturePage, px: usize, s: u32) {
     let x5 = |v: u32| ((v << 3) | (v >> 2)) as u8;
     let (r, g, b) = ((e & 0xF8_0000) >> 19, (e & 0xF800) >> 11, (e >> 3) & 0x1F);
     d.copy_from_slice(&[x5(r), x5(g), x5(b), 0xFF]);
+}
+
+/// 0x573F2A: the same on a 565 texel (the 16-bit row routine, mode `+8` of 0x5DED08): the packed form is
+/// `r5 << 27 | g6 << 13 | b5` (0x573F54…0x573F65), the texel written back as `r5 g6 b5` (0x573F85…0x573FA5).
+fn blend_565(d: &mut [u8], s: u32) {
+    if s < 0x1000_0000 {
+        return;
+    }
+    let mut e = s;
+    if s < 0xFC00_0000 {
+        let (r5, g6, b5) = ((d[0] >> 3) as u32, (d[1] >> 2) as u32, (d[2] >> 3) as u32);
+        let packed = (r5 << 27).wrapping_add(g6 << 13).wrapping_add(b5);
+        let prod = packed as u64 * (0xFF ^ (s >> 24)) as u64;
+        let (hi, lo) = ((prod >> 32) as u32, prod as u32);
+        e = e.wrapping_add(hi << 16).wrapping_add((lo >> 5) & 0xFF).wrapping_add((lo >> 11) & 0xFF00);
+    }
+    d.copy_from_slice(&[expand(((e & 0xF8_0000) >> 19) as u8, 5), expand(((e & 0xFC00) >> 10) as u8, 6), expand(((e >> 3) & 0x1F) as u8, 5), 0xFF]);
+}
+
+/// 0x540030: the 32-bit row routine — no thresholds: every channel `(c · (255 − a)) >> 8` plus the premultiplied
+/// source's (a byte add, 0x540070…0x54008E), alpha forced to 0xFF (0x540069).
+fn blend_32(d: &mut [u8], s: u32) {
+    let k = 0xFF - (s >> 24) as u8 as u32;
+    let ch = |dc: u8, sh: u32| (((dc as u32 * k) >> 8) as u8).wrapping_add((s >> sh) as u8);
+    d.copy_from_slice(&[ch(d[0], 16), ch(d[1], 8), ch(d[2], 0), 0xFF]);
 }
 
 /// 0x53D9C0 into a page: `text` in `font` (a `CarModel` `.ffn`), centred in the entry's `rect`
@@ -1123,35 +1157,44 @@ fn page_key(p: &DamagePatch) -> u32 {
     p.image.place[0] as u32
 }
 
-/// Blend one damage patch onto a page, as 0x448110 does: skipped while the zone is undamaged,
-/// otherwise drawn with a constant alpha on top of the patch's own per-pixel alpha — an
-/// **integer**, `fistp(float(damage · 3.5))` (round to nearest even), above 255 taken as 255
-/// (0x44816E…0x44818A, `cmp edx, 0xFF; jbe`), which 0x5400B0 puts in the modulate colour's alpha
-/// `[0x5DFB7C]` (0x540152…0x54016B). *(Until 2026-09-26 the port used the unrounded product.)*
-/// APPROXIMATION (C-platform, read 2026-09-30): the blend itself — `page·(1 − a) + patch·a`
-/// with `a` = texel alpha × level / 255, rounded, on the page's 8-bit copy. 0x572B40 is **not** the
-/// software blitter (the earlier label was wrong): 0x5400B0 takes one of two paths. With the level
-/// under 255 and the target's mode `[0x5DE630]` neither 0 nor 0xFF and `[0x5DE64C] == 0`
-/// (0x5400C9…0x5400EA, 0x5401A6…0x5401B0) it tiles the patch into 64×64 textures (the cache
-/// `[0x6A6450]`, 0x572A90) and 0x572B40 draws them as quads through the Thrash function table
-/// (`[0x6BD940]`, `[0x6BD954]`, `[0x6BD9A8]`) into the render target 0x534480 bound to the page's
-/// surface, under the modulate colour `[0x5DFB7C] = level << 24 | 0xFFFFFF` (0x540152…0x54016B) —
-/// the driver's alpha blend. Otherwise (a level of 255, which the threshold decals use, or a
-/// target without that mode) 0x5401B6…0x54026D converts the patch (an 8-bit source on a 16-bit
-/// target: 0x5346D0 + 0x5402B0 per palette entry, else 0x540280) and calls the CPU blitter 0x571630
-/// with the alpha in `[0x5DED08]`. Which path runs and the pixel format of the page surface
-/// (0x448010 → 0x5345A0) depend on the driver's target (`dx7z.dll`: the display's; `opengl3z.dll`:
-/// 32-bit, `thrash.md` §11), so the per-channel rounding and any 16-bit quantisation are not readable
-/// from `nfs5.exe` alone; 0x571630's own arithmetic was not read.
+/// Blend one damage patch onto a page, as 0x448110 does: skipped while the zone is undamaged, otherwise drawn with
+/// a constant alpha on top of the patch's own per-pixel alpha — an **integer**, `fistp(float(damage · 3.5))`
+/// (round to nearest even), above 255 taken as 255 (0x44816E…0x44818A, `cmp edx, 0xFF; jbe`) — passed to 0x5400B0.
+///
+/// **The blend itself, read to the instruction (2026-10-02, CONFIRMED).** The page is a software surface:
+/// 0x448010 binds the window 0x5345A0 made (`+0x10` = 0, 0x5358E2, so `[0x5DE630]` = 0 after the bind 0x534480),
+/// and 0x5400B0 takes the branch of that byte `== 0` → 0x5401B6 — the CPU blitter 0x571630 — whatever the driver
+/// is: the tile-quad path through Thrash (0x572B40) needs a target mode other than 0 and 0xFF and is never taken
+/// here. 0x5401B6…0x540268: the source is read as 8888 whatever its format (`[0x5DED24] = 0x7D`, so 0x534B90 asks
+/// for the 8-bit → 8888 row routine 0x570750, a plain dword copy out of the 0x2A palette), the level goes to
+/// 0x540280's table `lut[c] = (c · level) >> 8` (0x540292…0x54029F) and 0x571630 runs the page depth's row routine
+/// of the mode block 0x5DED08 (0x57182B…0x571871: 15 → `+4` 0x53FF30, 16 → `+8` 0x53FF70, 32 → `+0x10` 0x540030).
+/// Each one scales **all four bytes** of the source dword by that table (0x53FEF0 — the alpha too, so the texel is
+/// premultiplied by `level / 256`, 255 giving 254) and hands it to the blend of the page format: 1555 0x573FAF
+/// ([`blend_1555`]), 565 0x573F2A ([`blend_565`]), 32-bit 0x540030 ([`blend_32`]). *(Only a 16-bit target with an
+/// 8-bit source takes the other arm, 0x5401D6…0x540240: the palette converted once by 0x5346D0 and scaled with
+/// 0x5402B0 — the same `c · level >> 8` per byte — then 0x540300 → 0x573F2A per pixel: 565 again.)* Every
+/// shipped damage patch lands on a 1555 page (`nfs-assets/examples/dmgscan.rs`: all 2 571 of the `D` / `L` packs).
+/// APPROXIMATION left (no shipped patch reaches it): a **4444** page has depth 16 in 0x5DE890, so the original runs
+/// the 565 routine on it and writes 565-packed words into a 4444 surface — a state this 8-bit copy cannot hold; the
+/// page takes the old per-channel blend instead.
+///
+/// **A patch with a threshold above 0** (0x448110 at 0x448135: the zone's damage is above it) goes through
+/// 0x53D570 — the target mode 0 again, so the plain table 0x5DECDC row copy of 0x571630 (mode `[0x5DEB1C]`,
+/// `[0x5DEB18]` = 0: the first block, `+0x14` 0 / `+0x18` 2 / `+0x1C` 0) after the source's conversion to the page's
+/// format: **no alpha blend** — the texel replaces the page's ([`blitter_texel`]: 1555 any non-zero dword opaque, the
+/// zero dword stays zero, 0x570370). 86 shipped patches (zone 8, threshold 30 — the glass pages of the GT / Boxster
+/// models) take it. *(Until 2026-10-02 the port blended them like the rest, and called them "none shipped".)*
 pub fn blend_patch(page: &mut TexturePage, patch: &DamagePatch, damage: f32) {
-    if patch.threshold > 0.0 {
+    let opaque = patch.threshold > 0.0;
+    if opaque {
         if damage <= patch.threshold {
             return;
         }
     } else if damage <= 0.0 {
         return;
     }
-    let level = if patch.threshold > 0.0 { 255.0 } else { ((damage * 3.5).round_ties_even() as i64).min(255) as f32 };
+    let level = ((damage * 3.5).round_ties_even() as i64).min(255) as u32;
     let src = &patch.image.mips[0];
     for row in 0..patch.image.height {
         let dy = patch.y + row;
@@ -1164,16 +1207,90 @@ pub fn blend_patch(page: &mut TexturePage, patch: &DamagePatch, damage: f32) {
                 break;
             }
             let s = ((row * patch.image.width + col) * 4) as usize;
-            let a = src[s + 3] as f32 / 255.0 * (level / 255.0);
-            if a <= 0.0 {
+            let d = ((dy * page.width + dx) * 4) as usize;
+            if opaque {
+                let t = blitter_texel(page.bpp, [src[s], src[s + 1], src[s + 2], src[s + 3]]);
+                page.rgba[d..d + 4].copy_from_slice(&t);
                 continue;
             }
-            let d = ((dy * page.width + dx) * 4) as usize;
-            for k in 0..3 {
-                let out = page.rgba[d + k] as f32 * (1.0 - a) + src[s + k] as f32 * a;
-                page.rgba[d + k] = out.round().clamp(0.0, 255.0) as u8;
+            // 0x53FEF0: the source dword (`A R G B`, the 0x2A palette's order) scaled byte by byte
+            let lut = |c: u8| ((c as u32 * level) >> 8) as u32;
+            let px = lut(src[s + 3]) << 24 | lut(src[s]) << 16 | lut(src[s + 1]) << 8 | lut(src[s + 2]);
+            match page.bpp {
+                1555 => blend_1555(&mut page.rgba[d..d + 4], px),
+                565 => blend_565(&mut page.rgba[d..d + 4], px),
+                32 => blend_32(&mut page.rgba[d..d + 4], px),
+                _ => {
+                    // APPROXIMATION (4444 page, see above)
+                    let a = src[s + 3] as f32 / 255.0 * (level as f32 / 255.0);
+                    if a <= 0.0 {
+                        continue;
+                    }
+                    for k in 0..3 {
+                        let out = page.rgba[d + k] as f32 * (1.0 - a) + src[s + k] as f32 * a;
+                        page.rgba[d + k] = out.round().clamp(0.0, 255.0) as u8;
+                    }
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod damage_blend_tests {
+    use super::*;
+
+    fn page(bpp: i64, px: [u8; 4]) -> TexturePage {
+        TexturePage { width: 1, height: 1, rgba: px.to_vec(), is_window: false, is_alpha: false, bpp }
+    }
+
+    fn patch(threshold: f32, px: [u8; 4]) -> DamagePatch {
+        DamagePatch {
+            zone: 0,
+            page: 0,
+            x: 0,
+            y: 0,
+            threshold,
+            image: TextureImage { name: String::new(), width: 1, height: 1, mips: vec![px.to_vec()], has_alpha: true, code: 0, page: 0, x: 0, y: 0, place: [0, 0], text: None },
+        }
+    }
+
+    /// 0x573FAF's three arms on a 1555 page, damage 60 (level 210 → `lut` of 200 is 164, of 255 is 209).
+    #[test]
+    fn blend_1555_arms() {
+        // alpha 4 · 210 >> 8 = 3 < 16: nothing is written
+        let mut p = page(1555, [8, 16, 24, 0]);
+        blend_patch(&mut p, &patch(0.0, [255, 255, 255, 4]), 60.0);
+        assert_eq!(p.rgba, [8, 16, 24, 0]);
+        // alpha 255 · 210 >> 8 = 209 (0xD1): between the thresholds, scaled by 255 − 209 = 46
+        let mut p = page(1555, [255, 255, 255, 255]);
+        blend_patch(&mut p, &patch(0.0, [0, 0, 0, 255]), 60.0);
+        // 31 · 46 = 1426 → the packed products: each channel 1426 >> 5 = 44 → 0x2C → 5 bits after the add of 0
+        let x5 = |v: u32| ((v << 3) | (v >> 2)) as u8;
+        assert_eq!(p.rgba, [x5(1426 >> 8), x5(1426 >> 8), x5(1426 >> 8), 0xFF]);
+    }
+
+    /// A threshold patch replaces the texel (0x53D570's row copy), alpha 0 and all; the zero dword stays zero.
+    #[test]
+    fn threshold_patch_is_a_copy() {
+        let mut p = page(1555, [255, 255, 255, 255]);
+        blend_patch(&mut p, &patch(30.0, [0x80, 0, 0, 0]), 40.0);
+        assert_eq!(p.rgba, [0x84, 0, 0, 0xFF]);
+        let mut p = page(1555, [255, 255, 255, 255]);
+        blend_patch(&mut p, &patch(30.0, [0, 0, 0, 0]), 40.0);
+        assert_eq!(p.rgba, [0; 4]);
+        // below the threshold nothing happens
+        let mut p = page(1555, [1, 2, 3, 4]);
+        blend_patch(&mut p, &patch(30.0, [9, 9, 9, 9]), 30.0);
+        assert_eq!(p.rgba, [1, 2, 3, 4]);
+    }
+
+    /// 0x540030: no thresholds, the byte add, alpha forced.
+    #[test]
+    fn blend_32_formula() {
+        let mut d = [100u8, 200, 50, 7];
+        blend_32(&mut d, 0x00_00_00_00);
+        assert_eq!(d, [(100 * 255 >> 8) as u8, (200 * 255 >> 8) as u8, (50 * 255 >> 8) as u8, 0xFF]);
     }
 }
 

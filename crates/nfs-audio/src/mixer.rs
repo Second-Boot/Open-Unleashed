@@ -304,6 +304,11 @@ struct Voice {
     cur: Cursor,
     /// the channel gains and their ramp (0x598700 / 0x5980C0)
     gains: Gains,
+    /// a call of the strip's volume or pan hook (0x5969C0 / 0x596890 → 0x598700) since the last
+    /// block: 0x598700 raises the ramp flag `[node+1]` on **every** call, changed value or not
+    /// (0x598721), so the block's pull runs the ramp ([`Gains::touch`]). Raised by the service tick
+    /// (0x589699), `setVolume` on a changed volume (0x56631C) and the pan call (0x5661F0 → 0x590CC0).
+    hook: bool,
     /// `voice+0x6C`, the caller's pitch word: 4096 is 1.0, unchanged ([`resample::PITCH_UNIT`]) —
     /// every start/update call hands it directly ([`AudioOutput::play_word`] / `set_word`, audio
     /// port 8; there is no float pitch left in the port, matching the original, which never took
@@ -388,9 +393,12 @@ struct Voice {
 /// the channel gain) and sets `+0x14 = f`, `+0x10 = 1 − f` (0x59A150); `f ≥ 1` takes the node out
 /// and frees it (0x596D10, the state gone). The node's pull (0x59A0F0 → 0x59C170) runs, per sample
 /// of the resampled block, `y = y · (1 − f) + f · x` and hands `y` on — a **one-pole low-pass**
-/// with its corner at `value` Hz. APPROXIMATION: 0x59C170 keeps `y` on the FPU stack through a
-/// block (its precision is the control word's) and stores it as an f32 between blocks; the port
-/// keeps an f32 throughout.
+/// with its corner at `value` Hz. Read to the instruction (0x59C170, 2026-10-02): `fld [edi]` loads
+/// `y` (f32) once, each sample is `fmul [edi+4]` · `fld [edi+8]` `fmul [x]` · `faddp`, `fst dword`
+/// stores the sample (the f32 handed on) and `y` itself stays on the FPU stack, only `fstp [edi]`
+/// at the block's end rounds it to f32. So `y` runs in the x87's precision inside a block (53-bit,
+/// the f64 reading of the audio path, see `resample.rs`) and is an f32 between blocks:
+/// [`LowPass::begin_block`] / [`LowPass::end_block`] bracket a block, `acc` is the register.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LowPass {
     /// `+0x10`, `1 − f`
@@ -399,9 +407,22 @@ pub struct LowPass {
     pub b: f32,
     /// `+0xC` per channel
     pub y: [f32; 2],
+    /// the FPU register of 0x59C170 inside a block (loaded at `begin_block`, stored f32 at
+    /// `end_block`)
+    acc: [f64; 2],
 }
 
 impl LowPass {
+    /// 0x59C170's `fld dword [edi]`: the stored f32 into the register.
+    pub fn begin_block(&mut self) {
+        self.acc = [self.y[0] as f64, self.y[1] as f64];
+    }
+
+    /// 0x59C170's `fstp dword [edi]`: the register rounded to f32 at the block's end.
+    pub fn end_block(&mut self) {
+        self.y = [self.acc[0] as f32, self.acc[1] as f32];
+    }
+
     /// `f = value / (rate · 0.5)` as 0x596AC0 makes it; `None` for `f ≥ 1` (0x5998E9 `fcomp` 1.0,
     /// `test ah, 1`).
     pub fn coefficient(value: i32, mix_rate: u32) -> Option<f32> {
@@ -413,7 +434,7 @@ impl LowPass {
     pub fn set(node: &mut Option<LowPass>, value: i32, mix_rate: u32) {
         match Self::coefficient(value, mix_rate) {
             Some(f) => {
-                let n = node.get_or_insert(LowPass { a: 0.0, b: 0.0, y: [0.0; 2] });
+                let n = node.get_or_insert(LowPass { a: 0.0, b: 0.0, y: [0.0; 2], acc: [0.0; 2] });
                 n.b = f;
                 n.a = (1.0f64 - f as f64) as f32;
             }
@@ -422,9 +443,10 @@ impl LowPass {
     }
 
     /// 0x59C170 on one sample of channel `ch`.
+    /// `fmul`/`faddp` in the register's precision, `fst dword` the f32 handed on.
     pub fn run(&mut self, ch: usize, x: f32) -> f32 {
-        self.y[ch] = self.y[ch] * self.a + self.b * x;
-        self.y[ch]
+        self.acc[ch] = self.acc[ch] * self.a as f64 + self.b as f64 * x as f64;
+        self.acc[ch] as f32
     }
 }
 
@@ -569,7 +591,7 @@ impl Voice {
             (Some(r), Some(t)) => Envelope::start(r.env_level, r.env_segments, &t.envelope),
             _ => Envelope::start(0x7F, 1, &nfs_formats::bnk::DEFAULT_ENVELOPE),
         };
-        Voice { clip, cur: Cursor::default(), gains: Gains::default(), word, vol16: volume_16(volume), ramp: Ramp::default(), pan: 0x40, looping, finished: false, fx_scale: 0x7F, send: None, wet: 0.0, stamp, patch_pan, level, cents: 0, env, volume_phase: 0, pitch_phase: 0, pulled: false, anchor: false, held: false, bend: 0x40, lowpass: None, table: true }
+        Voice { clip, cur: Cursor::default(), gains: Gains::default(), hook: false, word, vol16: volume_16(volume), ramp: Ramp::default(), pan: 0x40, looping, finished: false, fx_scale: 0x7F, send: None, wet: 0.0, stamp, patch_pan, level, cents: 0, env, volume_phase: 0, pitch_phase: 0, pulled: false, anchor: false, held: false, bend: 0x40, lowpass: None, table: true }
     }
 
     /// **`Voice_setVolume` 0x566340 → 0x5662B0** on one voice: the int `<< 16` into `voice+0x2C`
@@ -582,6 +604,8 @@ impl Voice {
         if self.vol16 != v {
             self.vol16 = v;
             self.ramp.step = 0;
+            // 0x56631C: `0x590D10` → the volume hook → 0x598700 per channel
+            self.hook = true;
         }
     }
 
@@ -748,7 +772,7 @@ fn wet_gain(vol_cur: f32, send: f32) -> f32 {
 /// clear that just before the call (0x4A684C, 0x4A6A61) — so 0x58A7C4…0x58A7D6 drops every 3D
 /// type and the one voice type left is the configuration's 0x24 (0x4A670B), never flag 0x10. A
 /// hardware-3D voice would be positioned with `SetPosition` (0x596370) instead. *(Until
-/// 2026-09-27 this was an APPROXIMATION "for a card without DirectSound3D buffers".)*
+/// 2026-09-27 this was an approximation "for a card without DirectSound3D buffers".)*
 /// (Until 2026-09-25 this was an equal-power cos / sin law of the port's own.)
 /// (Until 2026-09-27 the port fed this law the sine of the angle, taken back to an angle and
 /// rounded onto the grid, instead of the pan byte.)
@@ -1089,11 +1113,19 @@ impl Shared {
             }
             let Some(r) = v.clip.records.first().copied() else {
                 // not a bank patch: no tables, no envelope — the ramp only
+                let ramping = v.ramp.step != 0;
                 if v.ramp.tick(&mut v.vol16) {
                     stop.push(*id);
+                } else {
+                    v.hook |= ramping;
                 }
                 continue;
             };
+            // 0x589598…0x58962D: the tick recomputes the level byte and runs the volume hook
+            // 0x590D10 (0x589699) when `edi` was raised — a volume table (`+0x5C`, 0x5895C8), a
+            // release ramp under way (`+0x24 ≠ 0`, 0x5895EB) or an envelope step `+0x30 ≠ 0`
+            // (0x589628, tested before the segment is reloaded) — whether or not the byte changed
+            let edi = v.clip.tables.first().is_some_and(|t| t.volume.is_some()) || v.ramp.step != 0 || v.env.step != 0;
             let tables = v.clip.tables.first();
             if tables.is_some_and(|t| t.pitch.is_some()) {
                 v.pitch_phase = v.pitch_phase.wrapping_add(1);
@@ -1113,9 +1145,14 @@ impl Shared {
                 stop.push(*id);
                 continue;
             }
-            let Some(t) = tables else { continue };
+            let Some(t) = tables else {
+                v.hook |= edi;
+                continue;
+            };
             if v.env.tick(&t.envelope) {
                 stop.push(*id);
+            } else {
+                v.hook |= edi;
             }
         }
         if !stop.is_empty() {
@@ -1151,20 +1188,26 @@ impl Shared {
             // the level byte (0x589DF0) · `[0x5C1788]` (f32 1/127) as an f32 (0x59697A)
             let vol = (v.level_byte() as f64 * (1.0f32 / 127.0) as f64) as f32;
             let pg = pan_gains(voice_pan(v.pan, v.patch_pan, c.pan_scale));
+            // N10 (0x598721): a hook call since the last block raised the ramp flag, changed or not
+            if std::mem::take(&mut v.hook) {
+                v.gains.touch();
+            }
             v.gains.set_vol(vol);
             v.gains.set([resample::channel_gain(vol, pg[0]), resample::channel_gain(vol, pg[1])]);
             // the send (0x599800, at the voice start and at every bus change: 0x596A10) and the
-            // wet gain from the volume as it is now. APPROXIMATION (sub-ulp): 0x598700 raises the
-            // ramp flag on every call, so the original also re-runs the volume ramp — and the wet
-            // gain from it — for a set that changed nothing; the port ramps only on a change, so
-            // there the wet gain keeps the last ramp's f32 accumulation instead of the exact
-            // target's product (a few ulps of a gain of at most 1.5)
+            // wet gain from the volume as it is now. 0x598700 raises the ramp flag on every call —
+            // the hooks' calls are tracked in `v.hook` (service tick, setVolume, pan), so the ramp
+            // (and the wet gain from it) also runs for a call that changed nothing
             let send = reverb_input(v.fx_scale, c.fx_send, bus_c);
             if v.send != Some(send) {
                 v.send = Some(send);
                 v.wet = wet_gain(v.gains.vol[0], send);
             }
             let ramp = v.gains.ramp(n);
+            // 0x59C170's `fld dword [edi]` for the block
+            if let Some(lp) = v.lowpass.as_mut() {
+                lp.begin_block();
+            }
             for (fi, frame) in out.iter_mut().enumerate() {
                 let at = |sc: usize| {
                     resample::interpolate(interp, v.cur.frac, v.cur.pos as i64, |k| {
@@ -1204,6 +1247,10 @@ impl Shared {
                 }
                 v.cur.advance(step);
             }
+            // 0x59C170's `fstp dword [edi]`
+            if let Some(lp) = v.lowpass.as_mut() {
+                lp.end_block();
+            }
         }
         // 0x598760 frees each failing strip as it comes to it (0x598670 → 0x589C00)
         for &k in &failed {
@@ -1223,7 +1270,7 @@ impl Shared {
         // there), and the bend `+0x3F` from the request's 0x40 (0x561429…0x561458 → 0x589F40);
         // the library's `setPitch` 0x565F80 is called only by `Voice_play`'s update (0x4A9FA3) and
         // the engine mixer (0x4AC608, 0x4AC6F9), never on a stream. *(Until 2026-09-27 an
-        // APPROXIMATION "the stream player's own pitch call is not read".)* `window` holds
+        // approximation "the stream player's own pitch call is not read".)* `window` holds
         // `s[P−1] … s[P+2]` of each channel
         for (_, sv) in self.streams.iter_mut() {
             let cc = sv.src.channels.max(1) as usize;
@@ -1781,6 +1828,8 @@ impl Core {
             Cmd::Pan { id, pan } => {
                 for (_, v) in g.voices.iter_mut().filter(|(i, _)| *i == id) {
                     v.pan = pan_byte(pan);
+                    // 0x5661F0 stores the angle and calls 0x590CC0 unconditionally (no compare)
+                    v.hook = true;
                 }
             }
             Cmd::Start { id, clip, volume, word, bend, pan, looping, sel, tabled } => {
@@ -2163,7 +2212,7 @@ impl AudioOutput {
     /// answer). Every later call on the handle walks the group (0x590340: stop 0x565D60, volume,
     /// pitch, pan), which here is every voice with the returned [`VoiceId`]. *(Until 2026-09-27 the
     /// port played one merged sample per patch, the last record's, with the last record's draws —
-    /// an APPROXIMATION; until 2026-09-27, later, audio port 8, every caller gave a float pitch
+    /// an approximation; until 2026-09-27, later, audio port 8, every caller gave a float pitch
     /// factor here instead of the word, [`resample::PITCH_UNIT`]'s own doc.)*
     pub fn play_word(&self, clip: Arc<Clip>, volume: f32, word: u16, bend: u8, pan: u16, looping: bool) -> VoiceId {
         self.play_word_sel(clip, volume, word, bend, pan, looping, 0x7F)
@@ -3298,8 +3347,10 @@ mod service_tests {
         LowPass::set(&mut n, 0xBB8, 32000);
         let lp = n.as_mut().unwrap();
         assert_eq!((lp.a, lp.b), (0.8125, 0.1875));
+        lp.begin_block();
         assert_eq!(lp.run(0, 1000.0), 187.5);
         assert_eq!(lp.run(0, 1000.0), 187.5 * 0.8125 + 187.5);
+        lp.end_block();
         assert_eq!(lp.y[1], 0.0);
         // a new value keeps the state; 0xFFFF takes the node away (0x596D10)
         LowPass::set(&mut n, 0xBB8, 22050);
@@ -3311,6 +3362,51 @@ mod service_tests {
         assert_eq!(voice_play_filter(false, 2, true), None);
         assert_eq!(voice_play_filter(false, 1, true), Some(0xBB8));
         assert_eq!(voice_play_filter(false, 0, false), Some(0xFFFF));
+    }
+
+    #[test]
+    fn the_low_pass_keeps_y_in_the_fpu_register_inside_a_block() {
+        use super::LowPass;
+        // 0x59C170: `y` is loaded once (`fld dword [edi]`), every sample is computed in the
+        // register's 53-bit precision (only the handed-on sample is an f32, `fst dword`), and
+        // `fstp dword [edi]` rounds `y` to f32 at the block's end
+        let mut n = None;
+        LowPass::set(&mut n, 1234, 22050);
+        let lp = n.as_mut().unwrap();
+        let (a, b) = (lp.a as f64, lp.b as f64);
+        let xs = [1000.37f32, -733.91, 12345.6, 0.001, 77.7];
+        let mut y = 0.0f64;
+        lp.begin_block();
+        for &x in &xs {
+            y = y * a + b * x as f64;
+            assert_eq!(lp.run(0, x), y as f32);
+        }
+        lp.end_block();
+        assert_eq!(lp.y[0], y as f32);
+        // the next block starts from the f32, not from the register
+        lp.begin_block();
+        let y2 = (y as f32 as f64) * a + b * 5.0f64;
+        assert_eq!(lp.run(0, 5.0), y2 as f32);
+    }
+
+    #[test]
+    fn a_hook_call_raises_the_ramp_flag_even_for_an_unchanged_value() {
+        use crate::resample::Gains;
+        // 0x598721: `mov byte [eax+1], 1` before any compare
+        let mut g = Gains::default();
+        g.touch();
+        assert!(!g.pending, "the voice's first set is taken at once, flag clear (0x598630)");
+        g.set_vol(0.5);
+        g.set([0.25, 0.25]);
+        assert!(g.ramp(256).is_none());
+        g.set_vol(0.5);
+        g.set([0.25, 0.25]);
+        assert!(g.ramp(256).is_none(), "no event, no ramp");
+        g.touch();
+        g.set_vol(0.5);
+        g.set([0.25, 0.25]);
+        let r = g.ramp(256).expect("a hook call ramps");
+        assert_eq!((r.len, r.step, r.vol_step), (32, [0.0, 0.0], 0.0));
     }
 
     #[test]

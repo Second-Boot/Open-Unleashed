@@ -1287,6 +1287,9 @@ impl App {
         {
             self.fe.bar_grab = Some(name.clone());
             self.set_accessor_fraction(&name, f);
+            // the bar's draw reads its accessor every frame (0x4CA724); the port's fill is set
+            // at bind time, so set it again
+            self.bind_indicator_bars();
             return;
         }
         // The colour editor eats the button while it is up: its slots 5 and 9 return
@@ -1319,7 +1322,7 @@ impl App {
                     && let Some(prev) = self.fe.picker_prev.take()
                 {
                     match prev {
-                        Ok(row) if base.starts_with("OwnedCar.") && self.garage_car().is_some() => self.colour_select(&base, row),
+                        Ok(row) if (base.starts_with("OwnedCar.") && self.garage_car().is_some()) || self.generic_colour_has_row(&base) => self.colour_select(&base, row),
                         _ => self.colour_assign(&base, prev),
                     }
                 } else {

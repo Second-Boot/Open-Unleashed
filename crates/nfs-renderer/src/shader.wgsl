@@ -94,7 +94,7 @@ fn headlit(world: vec3<f32>, c: vec4<f32>) -> vec4<f32> {
 // touches the block: 0x453D4D only stores the texture pointer in the slot, and unlike the
 // specular binder 0x440940 there is no 0x537A70 / 0x536470 call; the draw's stage binder 0x536240
 // applies the texture's own block. So the pools do not tile — the projector sampler `s_proj`
-// (`ClampToEdge`, `Linear`, level 0) carries it. *(Until 2026-09-26 this was an APPROXIMATION
+// (`ClampToEdge`, `Linear`, level 0) carries it. *(Until 2026-09-26 this was an approximation
 // clamping the coordinates in the shader.)*
 fn uvlight_vertex(world: vec3<f32>) -> vec3<f32> {
     let p = globals.headlight * vec4<f32>(world, 1.0);

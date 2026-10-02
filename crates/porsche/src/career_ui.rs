@@ -227,8 +227,11 @@ impl CareerUi {
         // port's JSON, whose installed-part order was not the loader's sort 0x4EE853…0x4EE8AE and
         // whose port-only fields every front-end entry then dropped.)* The original's first entry
         // skips the load (0x4D3B4A) and asks for the profile instead; the profile it then loads is
-        // this one when the player keeps `player.lst`'s row — APPROXIMATION of the moment only:
-        // the career before the chooser is answered is the profile's here, 0x501340's blank there.
+        // this one when the player keeps `player.lst`'s row. That moment is
+        // [`Self::blank_before_chooser`]: the front end's first entry makes the career blank when it
+        // opens the chooser (the `FE_ENTRY` branch of the start-up in `app/session.rs`), so a start-up that goes through
+        // the chooser has the profile only after the answer, as the original; the `--fe=<screen>`,
+        // `--career` and `--mission` starts never meet the chooser and keep the profile loaded here.
         let career = match nfs_game::save::load_profile_career(&dir, &profile, &tables) {
             Some((c, _)) => {
                 tracing::info!(path = %profile.path(&dir).display(), era = ?c.era, money = c.money, cars = c.garage.len(), "career loaded from the profile");
@@ -923,6 +926,25 @@ impl CareerUi {
         self.t_idx = row;
         let t = self.current()?;
         self.career.undone_events(t).iter().position(|e| *e == fe.next_event as usize)
+    }
+
+    /// **The career of the first front-end entry before the chooser is answered** (N03, read
+    /// 2026-10-02). 0x4D3420 runs 0x501340 first (the blank `PlayerInfo`: money 11000, empty
+    /// garage / owned lists, picture 8) and then, at 0x4D3B4A, tests `[0x5D9158]` (1 in the image,
+    /// cleared only at 0x4D3E12 / 0x4D3EA7 on this very path): set → the `LoadInfo` of 0x4D3B52
+    /// (0x4DF3C0 → 0x4DE9B0) is skipped, 0x4D3B76 saves `XXDefXX` (0x4DE880) and 0x4D3E1D opens
+    /// `selectname` over the entry screen. So until the chooser is answered (`SETNAMETHENBACK`
+    /// 0x5106D0 → `LoadInfo`, [`Self::switch_profile`]) the live career is the blank one and the
+    /// modules / accessor block are the start-up state; the profile of `player.lst` is not read.
+    /// The profile identity (`self.profile`, the name a save would go under) is the one the port
+    /// picked at start-up and stays: nothing saves before the answer (the three save sites,
+    /// ported as the original, 2026-09-28).
+    pub fn blank_before_chooser(&mut self) {
+        let last_mission = self.career.last_mission;
+        self.career = Career::default();
+        self.career.last_mission = last_mission;
+        self.side = nfs_game::save::SaveSide::default();
+        self.victory_room = false;
     }
 
     /// `LoadInfo` 0x4DE9B0 with `autosave = 0` (`RE/notes/savegame.md` §2.4, §3): read
@@ -1841,6 +1863,32 @@ mod tests {
         assert_eq!(nfs_game::save::read_player_lst(&dir).as_deref(), Some("8Hans"));
         nfs_game::save::delete_profile(&dir, &p).unwrap();
         assert!(!ui.switch_profile(&p), "806: nothing to load");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// N03 / 0x4D3B4A: the first entry skips the profile load, so until the chooser is answered the
+    /// career is 0x501340's blank (money 11000, nothing owned); the answer's `LoadInfo` brings the
+    /// profile back.
+    #[test]
+    fn the_first_entry_career_is_blank_until_the_chooser_answers() {
+        let Ok(paths) = GamePaths::locate() else {
+            eprintln!("skipping: original game data not found");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("nfs-firstentry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ui = CareerUi::load(&paths).unwrap();
+        ui.save_dir = dir.clone();
+        assert!(ui.create_profile("Hans", 8));
+        ui.career.money = 42_000;
+        let p = Profile::new("Hans", 8);
+        ui.profile = p.clone();
+        nfs_game::save::write_profile(&dir, &p, &nfs_game::save::career_to_sav(&ui.career, &ui.tables, &p)).unwrap();
+        ui.blank_before_chooser();
+        assert_eq!(ui.career.money, 11_000, "0x501340's blank");
+        assert!(ui.career.garage.is_empty());
+        assert!(ui.switch_profile(&p), "continue");
+        assert_eq!(ui.career.money, 42_000, "the profile after the answer");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -267,6 +267,10 @@ pub struct Vehicle {
     pub damage_enabled: bool,
     /// Steering pull from uneven front damage plus suspension-damage noise (`0x49F160`).
     pub damage_pull: f32,
+    /// `car+0x55C / +0x560 / +0x564`, the force-feedback words `Car_physicsStep` writes at
+    /// 0x49F4F6…0x49F5DB ([`crate::force_feedback::ff_words`]). **Output only** — nothing in the
+    /// simulation reads them; the driver 0x4123E0 does.
+    pub ff_words: [f32; 3],
     /// Material class of the last wall touched (`[0x628C88]` word → class, see `walls::wall_class`).
     pub last_wall_class: u8,
     /// `Damage` 0x494500: a corner / roof zone crossed 30 this tick → play the crash one-shot
@@ -484,6 +488,7 @@ impl Vehicle {
             damage: [0.0; 10],
             damage_enabled: true,
             damage_pull: 0.0,
+            ff_words: [0.0; 3],
             last_wall_class: 5,
             crash_sound: false,
             airborne_count: 0,
@@ -985,6 +990,7 @@ impl Vehicle {
         // the port also recomputed this speed from the velocity instead of reading `speed`,
         // i.e. [`Self::speed_est`] — see the note at the top of this function.)*
         let mut pull = self.damage[2] * 0.25 - self.damage[0] * 0.25;
+        let mut noise_term = 0.0f32; // `[ebp+8]`, left 0 on a tick that is not a multiple of 4 (0x49F430)
         if self.game_tick.is_multiple_of(4) {
             let r = self.rand16();
             let mut noise = self.suspension_wear(specs) * (r as f32 * 1.525_878_9e-5 - 0.5) * 0.5;
@@ -992,9 +998,13 @@ impl Vehicle {
             if hs < 15.0 {
                 noise = noise * hs * 0.066_666_67;
             }
+            noise_term = noise;
             pull += noise;
         }
         self.damage_pull = pull;
+        // 0x49F4F6…0x49F5DB: the force-feedback words, from the front wheels' slip fractions as the
+        // previous `Tyre` left them (this runs before it). Output only.
+        self.ff_words = crate::force_feedback::ff_words(front_contact, self.wheels[0].slip + self.wheels[1].slip, specs.grip, noise_term, pull, g_off, speed);
         self.set_wheel_steer(specs, (self.steer + fistp(pull) + g_off).clamp(-127, 127) as f32, speed, vl.z);
         let a_drive = self.engine_update(specs, rear_contact);
         if !front_contact && !rear_contact {
@@ -1278,7 +1288,7 @@ impl Vehicle {
     /// `Slice` as `centre`/the offset/racing-line point came from (traced 2026-09-27: `main.rs`
     /// 9831, 9933, 21185, 21668; `police.rs` 2762, 3660; `traffic.rs` 1420, 1676 all index one
     /// `Slice` for both). So for this port's calling convention the two are never out of step —
-    /// **NOT A BUG**, `vehicle.rs:3065`'s "port takes the slice it was given" APPROXIMATION note
+    /// **NOT A BUG**, `vehicle.rs:3065`'s "port takes the slice it was given" approximation note
     /// closed without a behaviour change. The one residual gap is the original's `max(1, ·)` clamp,
     /// which only bites a caller that resolves slice index 0 — this API takes `Vec3`s, not an
     /// index, so a caller would have to special-case it; no current caller ever targets slice 0.)*

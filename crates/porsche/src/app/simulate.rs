@@ -208,6 +208,11 @@ impl App {
         }
         self.render_prev = Some((self.car_pos, self.car_rot));
         self.local_prev = Some(self.local_pose);
+        // PORT-DEVIATION D8 (PORT-DEVIATIONS.md) [the original draws the last tick, 0x483590 / 0x470E90]: the smackables' previous pose, render state only
+        self.smackables.snapshot_prev();
+        let steer4 = |v: &nfs_physics::vehicle::Vehicle| [v.wheels[0].steer, v.wheels[1].steer, v.steer_smoothed[0], v.steer_smoothed[1]];
+        self.road.player_steer_prev = self.vehicle.as_ref().map(steer4);
+        self.road.opp_steer_prev = self.road.opponents.iter().map(|o| steer4(&o.vehicle)).collect();
         self.road.opp_prev = self
             .road.opponents
             .iter()
@@ -254,6 +259,9 @@ impl App {
         // the car is borrowed
         let replay_camera = self.replay_view().is_some();
         let fx_marks = self.choice_index("Graphics.SpecialFX").is_none_or(|(i, _)| i >= 2);
+        // force feedback (output only, `RE/notes/force-feedback.md`): the five levels, read before the car is borrowed
+        self.ff_levels = self.ff_levels();
+        let ff_replay = self.replay.stream.as_ref().is_some_and(|s| matches!(s.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted));
         let Some(v) = self.vehicle.as_mut() else {
             return;
         };
@@ -1232,6 +1240,9 @@ impl App {
             v.misfire_roll = nfs_game::rng::rand01();
             // `LoadTransfer`'s wet test, 0x4A191D…0x4A194D: `[0x606AE0]` and nothing overhead
             v.wet_track = self.track.name.eq_ignore_ascii_case("autobahn") && w.overhead_flags(v.position) == 0;
+            // 0x4123E0, the force-feedback driver: Sc32 priority 10, before the car's step (priority
+            // 0x1E) — it reads what the last tick left
+            super::force_feedback::ff_drive(&mut self.ff, &mut self.gamepads, self.ff_levels, ff_replay, self.tick, &nfs_physics::force_feedback::FfCar::from_vehicle(v, &self.specs));
             v.step32(&controls, &self.specs, &w.collision);
             // the remote cars' `Car_simulate` (a positional race) with an index above this machine's
             // own, after the player's, in race-index order (above)
@@ -1424,7 +1435,7 @@ impl App {
             // per pair — `nfs_physics::vehicle::collide_pair`), then the car joins the list.
             // *(Until 2026-09-26 the port collided the human's and the opponents' walls in their own
             // steps, ran the opponent pairs after the cops' and the traffic's, gave the traffic no
-            // walls and no pairs among themselves — the "APPROXIMATION of the pass itself".)*
+            // walls and no pairs among themselves — the "approximation of the pass itself".)*
             // **`if ([0x657408] == 0 || [0x65740C] == 0)` (0x498FF0)** guards the pair loop and the
             // car's entry into the list `0x628CDC[]`: with `COMMSPOSITIONAL && NOCOLLISION` no car
             // meets another (each car's walls 0x495020 and props 0x498DE0 run before the gate);
@@ -1872,6 +1883,12 @@ impl App {
             // included; 0x40F740 clears them (`take_contact`). *(Until batch A6 the port took the
             // last event's own magnitude and let the pair rounds' wall hits raise none.)*
             let (contact_mag, contact_kind) = v.take_contact();
+            // 0x40F740 → 0x412230: the force-feedback jolt, on the same words (the car's body frame is
+            // `R·(point − position)`, 0x4122A8…0x4122CB)
+            if contact_mag > 0.0 {
+                let body_point = v.orientation * (v.last_contact - v.position);
+                super::force_feedback::ff_collision(&mut self.ff, &mut self.gamepads, self.ff_levels, ff_replay, self.tick, &nfs_physics::force_feedback::FfCar::from_vehicle(v, &self.specs), contact_kind, body_point, contact_mag);
+            }
             if matches!(contact_kind, 0x30000 | 0x40000)
                 && contact_mag > 1.5
                 && let Some(fx) = self.car_effects.as_mut()
@@ -3138,7 +3155,7 @@ impl App {
         // are 0 and it only ever produces the roof scrape, whose draw is the game's LCG
         // `[0x5D1028] · [0x5D102C]` (0x4100F8…0x41011E) — `nfs_game::rng::rand16`, the stream the
         // AI draws from, as the player's. *(Until 2026-09-26 both took the collision bank's own
-        // generator, an APPROXIMATION.)*
+        // generator, an approximation.)*
         // not gated on the sound device: the draws belong to the game stream
         {
             // 0x40FBC8…0x40FC0D: `[0x606AE0]` (the track is `autobahn`, 0x414DFF…0x414E11) and
@@ -3462,7 +3479,7 @@ impl App {
             // the queue's one-shots — pushed during the tick's physics, above — take the angle to
             // `car+0x440` as it stands now, read ONCE at this drain (0x4A7BB1…0x4A7C3B), after the
             // whole tick's collisions: every one-shot of the tick takes the same, final contact,
-            // not each one's own moment (`CollisionSfx::drain_player`; APPROXIMATION withdrawn
+            // not each one's own moment (`CollisionSfx::drain_player`; approximation withdrawn
             // 2026-09-27, `sfx.md` "The drain's distance and pan")
             let one_shot_pan = listener_pan(self.camera.position, self.camera.target, self.mirror, v.last_contact);
             s.drain_player(a, &self.snd.player_loops, one_shot_pan);
@@ -3515,6 +3532,12 @@ pub(crate) struct RoadCars {
     pub(crate) opponent_models: Vec<CarModel>,
     /// opponent poses before the last physics tick, as `App::render_prev` is for the player
     pub(crate) opp_prev: Vec<(Vec3, Quat)>,
+    /// PORT-DEVIATION D8 (PORT-DEVIATIONS.md) [the original draws the last tick, 0x438478…0x4384B5]:
+    /// each opponent's front-wheel angles before the last tick — `wheels[0..2].steer` and, for a
+    /// replay, `steer_smoothed` — as `opp_prev` is for the pose; render state only
+    pub(crate) opp_steer_prev: Vec<[f32; 4]>,
+    /// the same for the player's car
+    pub(crate) player_steer_prev: Option<[f32; 4]>,
     /// kinematic traffic (`nfs_game::traffic`), rebuilt with the scene
     pub(crate) traffic: Option<TrafficSet>,
     pub(crate) traffic_models: Vec<CarModel>,

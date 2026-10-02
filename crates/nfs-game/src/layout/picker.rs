@@ -311,7 +311,7 @@ impl LayoutScreen {
     /// for the index it calls custom (`0x4B94B0`: `row == accessor->[+0x24]()`, the colour count —
     /// a function-pointer member, not a vtable slot) and opens the editor when the row just chosen
     /// **is** that one, the `custom...` row of the list (§4.171). *(Until 2026-09-27 the port
-    /// opened the editor on the click that opens the list — an APPROXIMATION retired here.)*
+    /// opened the editor on the click that opens the list — an approximation retired here.)*
     /// **`data.allowcustom` decides whether there is a custom colour to open at all.** The bind
     /// 0x4C3BF0 hands it to the colour accessor at `[this+0x220]` through 0x4B9590, which is one
     /// instruction — `[accessor+0x30] = flag` — and the accessor's own count reads that byte

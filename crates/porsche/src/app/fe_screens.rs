@@ -35,6 +35,24 @@ impl App {
         }
     }
 
+    /// State 0x2E for the frame about to be drawn: `max(0.25, Graphics.GammaCorrection · 0.01)` —
+    /// `fild`, `fmul dword [0x5B3CA0]` (0.01f), `fstp` to a float, the 0.25 of `[0x5B2468]` when
+    /// that is not below it — then `[0x6BD918](0x2E, g)`. The original sets it at the mode set and
+    /// the race's (0x44ED10, from `[0x657D80]` = `GAMMACORRECTION`), after a profile loads
+    /// (0x4DED10), when the Graphics screen is built (0x4E5A70) and on every tick of the options
+    /// screen whose value moved (0x511900, cached in `[0x69A058]`) — each time from the same
+    /// setting, so setting it per frame from that setting shows the same thing.
+    pub(crate) fn sync_gamma(&mut self) {
+        let v = self.range_value("Graphics.GammaCorrection").map_or(100, |(v, ..)| v);
+        let g = ((v as f64 * f64::from(0.01f32)) as f32).max(0.25);
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_gamma(g);
+        }
+        if let Some(run) = self.intro.as_mut() {
+            run.renderer.set_gamma(g);
+        }
+    }
+
     pub(crate) fn set_accessor(&mut self, name: &str, delta: i32) {
         let base = name.split_once('(').map(|(b, _)| b.trim()).unwrap_or(name);
         // the seven colour lists step through the colour accessor's own slots (§4.171.5)
@@ -72,6 +90,10 @@ impl App {
             if let Some(slot) = Self::hud_cfg2_slot(key) {
                 self.hud_cfg_set(slot, next);
                 return;
+            }
+            // the Display screen stores the old layout's options when its combo changes (0x4CB9A0)
+            if base == "Display.ScreenLayout" {
+                self.hud_cfg_layout_changed();
             }
             self.choices.insert(Self::choice_slot(base, key).to_string(), next);
             return;
@@ -463,6 +485,11 @@ impl App {
         if Self::fe_list_of(l) == "ID_COMMSJOINSCREEN" {
             self.net_join_screen_gone();
         }
+        // the options screen holds the Display screen's HUD widget: its `NOTINUSE` stores the
+        // Display options (slot 22 0x4CB820, N02)
+        if Self::fe_list_of(l) == "ID_OPTIONSSCREEN" {
+            self.hud_cfg_apply();
+        }
         if matches!(Self::fe_list_of(l).as_str(), "ID_VICTORYSCREEN" | "ID_FDVICTORYSCREEN") {
             self.fe_back_lock(false);
         }
@@ -481,6 +508,11 @@ impl App {
     /// Everything a screen on show is bound to: the network lobby for the comms screens and the
     /// widgets' data. Run after an open, and when a closed layer uncovers the screen under it.
     fn fe_bind_screen(&mut self, name: &str) {
+        // the screen becomes the one in use: `INUSE` reaches the HUD widget of `display.lay`'s
+        // panel (slot 21 0x4CB650, N02)
+        if name.eq_ignore_ascii_case("options") || name.eq_ignore_ascii_case("display") {
+            self.hud_cfg_in_use();
+        }
         // the four screens whose `callbacklist=` is a comms one need a browsing socket
         // a browsing socket is only wanted while looking for a game; once a session is
         // open the lobby screens read from it instead

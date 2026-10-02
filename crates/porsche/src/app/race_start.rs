@@ -1153,6 +1153,7 @@ impl App {
             self.prev_car_pos = self.car_pos;
         }
         self.vehicle = Some(vehicle);
+        self.ff_arm();
         // `Car_init` 0x410C74: the lamp byte `car+0xD87` starts at 3 (the headlights) on a night
         // track, else 0; the headlights' ramp starts clear (`HeadRamp`)
         self.lamp_bits = if self.track.is_night() { 3 } else { 0 };
@@ -1547,6 +1548,20 @@ impl App {
                 r.set_trilinear(fx_level.is_some_and(|l| l >= 3));
                 r.set_fakesort_mode(fakesort_mode);
             }
+            // **TEST GLUE** (not in the original): `NFS_LENS_WARMUP=<n>` — the sun's lens flare runs over
+            // frames and wall-clock (its stored block is taken on the first frame the sun is on
+            // screen, its test every 200 ms, and the read-backs come back a frame later), and a
+            // scripted run draws no frame; so the still is preceded by n frames drawn 210 ms apart
+            // (`render_to_image`, discarded), the scene rebuilt for each as a frame does
+            if let Some(n) = nfs_game::config::cfg().nfs_lens_warmup.var().ok().and_then(|v| v.parse::<u32>().ok()) {
+                for _ in 0..n {
+                    self.rebuild_scene();
+                    let _ = self.renderer.as_mut().unwrap().render_to_image(&self.scene, &self.camera, shot_geometry().0, shot_geometry().1);
+                    std::thread::sleep(Duration::from_millis(210));
+                }
+                self.rebuild_scene();
+            }
+            self.sync_gamma();
             let rgba = self
                 .renderer
                 .as_mut()

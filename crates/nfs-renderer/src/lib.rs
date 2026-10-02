@@ -229,11 +229,16 @@ pub struct DrawItem {
     /// it, so the item's own queue key is exactly what the fold reads. Unused outside a
     /// `false_sort` material.
     pub fakesort_near: bool,
+    /// Drawn after the whole 3-D pass and the frame read-back ([`LensProbe`]), under no depth test:
+    /// the lens flare's elements, which 0x460460 lays flat on the screen (screen z 0, 0x451710)
+    /// after reading the finished frame's pixels at the sun (`RE/notes/lighting.md` §7). The
+    /// item's material must have no depth test.
+    pub overlay: bool,
 }
 
 impl DrawItem {
     pub fn new(mesh: MeshId, material: MaterialId, transform: Mat4) -> Self {
-        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, alpha_ref: 10, sky: None, main_view_only: false, sky_pass: false, fog_w: 0.0, fakesort_near: false }
+        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, alpha_ref: 10, sky: None, main_view_only: false, sky_pass: false, fog_w: 0.0, fakesort_near: false, overlay: false }
     }
 }
 
@@ -441,6 +446,35 @@ pub struct Scene {
     pub fog: Option<Fog>,
     /// The sky pass's own fog (0x45D2E0), over the items marked [`DrawItem::sky_pass`].
     pub sky_fog: Option<Fog>,
+    /// The lens flare's frame read-backs for this frame ([`LensProbe`]), if any.
+    pub lens_probe: Option<LensProbe>,
+}
+
+/// The sun's lens flare reads a 4 × 4 block of the frame at the sun's screen point
+/// (`THRASH_readrect`, 0x460525 and 0x4603FF; `RE/notes/lighting.md` §7): once right after the sky
+/// pass has drawn the sun (the reference texels, `+0x148`), then every 200 ms from the finished
+/// 3-D pass (the test). The renderer copies the block into a staging buffer and hands the pixels
+/// back a frame or two later ([`gpu::Renderer::lens_results`]) — **a latency the original does
+/// not have** (its read is a blocking lock of the back buffer), the port's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LensProbe {
+    /// the block's top-left pixel in the render target (the sun's `round(x) − 2`, `round(y) − 2`)
+    pub x: i32,
+    pub y: i32,
+    /// read the block after the no-depth (sky) stage alone — the reference
+    pub reference: bool,
+    /// read the block from the finished 3-D pass, before the overlay items — the test
+    pub test: bool,
+}
+
+/// One finished lens-flare read-back: the block's sixteen pixels as the target stores them
+/// (row-major, 4 bytes each, little-endian), and what collecting it cost the CPU, in whole
+/// milliseconds (the original times its blocking read with `GetTickCount`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LensRead {
+    pub reference: bool,
+    pub pixels: [u32; 16],
+    pub cost_ms: u32,
 }
 
 /// Direct3D 7 table fog as `dx7z.dll` sets it for Thrash 0x15 = 4 (`FOGTABLEMODE` `EXP`, 0x600048B7):
@@ -448,7 +482,7 @@ pub struct Scene {
 /// turns table fog on only on a card with `D3DPRASTERCAPS_WFOG` (`[0x60033F6C]`, bit 0x100000 of the
 /// triangle raster caps, 0x60008E4C) — without it the state fails and nothing is fogged — so `d` is
 /// the **W** of the game's pre-transformed vertices, `1 / rhw` = the view depth in metres
-/// (0x5B12AE…, `rhw = 1 / z`). APPROXIMATION of a device behaviour the image cannot settle: whether
+/// (0x5B12AE…, `rhw = 1 / z`). approximation (CLOSED on the running original, 2026-10-01 SV, below) of a device behaviour the image cannot settle: whether
 /// the runtime fogs on that W or on the screen z `sz` (the game never hands the device a projection
 /// matrix — no Thrash 0x1A7 in the image). On `sz`, which runs 0…1 over the view, the shipped
 /// densities (at most 0.28³ ≈ 0.02) would fog nothing visibly; on W they are the tracks' haze.
@@ -491,7 +525,7 @@ impl Scene {
 
 impl Default for Scene {
     fn default() -> Self {
-        Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35, mirror: false, headlight: None, headlight_decal: false, beacon: None, fog: None, sky_fog: None }
+        Self { items: Vec::new(), sprites: Vec::new(), clear_color: [0.35, 0.55, 0.85, 1.0], sun_direction: Vec3::new(0.4, 1.0, 0.3).normalize(), ambient: 0.35, mirror: false, headlight: None, headlight_decal: false, beacon: None, fog: None, sky_fog: None, lens_probe: None }
     }
 }
 

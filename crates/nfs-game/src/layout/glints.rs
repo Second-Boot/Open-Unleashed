@@ -12,7 +12,7 @@
 //!
 //! The header's timer only moves while the screen's fade is 0 (0x4CB01C tests 0x4C8820's answer);
 //! the car logo's, the line's and the picture's always do. *(Until 2026-09-26 the port took the
-//! middle of every random range and ran every widget of a screen together — the APPROXIMATION the
+//! middle of every random range and ran every widget of a screen together — the approximation the
 //! five glint markers carried — and it had the car logo's wait as the header's `+ 128`.)*
 
 use std::cell::Cell;

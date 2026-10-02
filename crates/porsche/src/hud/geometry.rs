@@ -470,6 +470,13 @@ impl Hud {
     pub(crate) fn anchor_passes(x: f32, y: f32, w: f32, h: f32, passes: u8) -> (f32, f32) {
         let (sw, sh) = HUD_PX.with(|c| c.get());
         let (sw, sh) = (sw as i32, sh as i32);
+        // N01a: a record that exists is used as stored (0x41F7A0 / 0x41FB40: `ftol(frac · W)`) —
+        // 0x41EFF0's anchoring ran when the record was made, not now
+        if let Some((fx, fy)) = HUD_STORED.with(|t| t.borrow().iter().find(|e| e.0 == x && e.1 == y && e.2 == w).map(|e| e.3)) {
+            let (px, py) = ((fx as f64 * sw as f64) as i32, (fy as f64 * sh as f64) as i32);
+            let (ox, oy) = Self::origin();
+            return (px as f32 - ox, py as f32 - oy);
+        }
         let (wi, hi) = (w as i32, h as i32);
         let (mut ax, mut ay) = Self::anchor_rule(sw, sh, x as i32, y as i32, wi, hi);
         let store = |n: i32, d: i32| (n as f64 / d as f64) as f32;
@@ -482,6 +489,34 @@ impl Hud {
         let (px, py) = ((fx as f64 * sw as f64) as i32, (fy as f64 * sh as f64) as i32);
         let (ox, oy) = Self::origin();
         (px as f32 - ox, py as f32 - oy)
+    }
+
+    /// The stored positions of the record in use ([`HudCfg::stored_positions`] order), keyed by the
+    /// element's 640×480 design rectangle in `SCREEN_LAYOUTS[layout]` (the draw code hands
+    /// [`Hud::anchor_passes`] only that rectangle; the width disambiguates the elements that share a
+    /// position). `None`: the size has no record, [`Hud::anchor_passes`] derives.
+    pub(crate) fn set_stored(layout: usize, stored: Option<[(f32, f32); 13]>) {
+        let l = &SCREEN_LAYOUTS[layout.min(3)];
+        HUD_STORED.with(|t| {
+            let mut t = t.borrow_mut();
+            t.clear();
+            let Some(s) = stored else { return };
+            let map = MAP_PX as f32;
+            let at = [
+                (l.gear, 85.0), (l.speed, 73.0), (l.time, 73.0), (l.tach_digital, 73.0), (l.tach, 128.0), (l.speedometer, 128.0),
+                (l.position, 138.0), (l.track_map, map), (l.leader, 59.0), (l.rearview, 240.0), (l.multi_time, 73.0),
+                ((0.0, 0.0), 127.0), ((0.0, 0.0), 124.0),
+            ];
+            for (k, ((x, y), w)) in at.into_iter().enumerate() {
+                // the damage trays: 127 wide is HGraphicDamage (+0x1B0), 124 wide HTextDamage (+0x1A0)
+                let f = match k {
+                    11 => s[12],
+                    12 => s[11],
+                    _ => s[k],
+                };
+                t.push((x, y, w, f));
+            }
+        });
     }
 
     pub(crate) fn anchor(_aspect: f32, x: f32, y: f32, w: f32, h: f32) -> (f32, f32) {

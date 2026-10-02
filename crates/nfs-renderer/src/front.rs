@@ -18,7 +18,7 @@
 //! the core in hand, so they first take it back (waiting for the frame in flight) and run the list.
 
 use crate::gpu::{Core, MaterialId, MeshId, TextureId};
-use crate::{Camera, FakeSortMode, MaterialDesc, MeshData, Scene, TextureData, Vertex};
+use crate::{Camera, FakeSortMode, LensRead, MaterialDesc, MeshData, Scene, TextureData, Vertex};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,7 +37,9 @@ pub(crate) enum Cmd {
     MirrorView(bool),
     Trilinear(bool),
     FakeSort(FakeSortMode),
+    Gamma(f32),
     Resize(u32, u32),
+    LensProbe(bool),
     CreateMaterial(MaterialDesc),
     DuplicateMaterial { id: MaterialId, texture: TextureId },
     DynamicMesh(Box<MeshData>),
@@ -79,6 +81,8 @@ struct Done {
     list: CmdList,
     scene: Scene,
     result: Result<()>,
+    /// the lens-flare read-backs the core had finished by the end of the frame
+    lens: Vec<LensRead>,
 }
 
 /// The render thread: owns the core while a frame is in flight.
@@ -105,6 +109,8 @@ pub struct Renderer {
     spare_scene: Option<Scene>,
     /// the error of the last frame the thread drew, reported by the next [`Self::render`]
     pending_err: Option<anyhow::Error>,
+    /// lens-flare read-backs the render thread handed back, not yet taken
+    lens_done: Vec<LensRead>,
     // the mirror of the core's tables
     size: (u32, u32),
     meshes: Vec<MeshMirror>,
@@ -112,6 +118,8 @@ pub struct Renderer {
     white: TextureId,
     material_tex: Vec<TextureId>,
     offscreen: HashMap<u32, (u32, u32)>,
+    /// the last [`Self::set_gamma`] value, so an unchanged one records nothing
+    gamma: f32,
 }
 
 impl Renderer {
@@ -124,6 +132,7 @@ impl Renderer {
             white: core.white(),
             material_tex: core.material_textures(),
             offscreen: core.offscreen_sizes(),
+            gamma: 1.0,
             meshes,
             size,
             core: Some(Box::new(core)),
@@ -132,6 +141,7 @@ impl Renderer {
             spare_list: None,
             spare_scene: None,
             pending_err: None,
+            lens_done: Vec::new(),
         })
     }
 
@@ -149,7 +159,8 @@ impl Renderer {
                 while let Ok(Job { mut core, mut list, scene, camera }) = jobs.recv() {
                     core.apply(&mut list);
                     let result = core.render(&scene, &camera);
-                    if done_tx.send(Done { core, list, scene, result }).is_err() {
+                    let lens = core.take_lens();
+                    if done_tx.send(Done { core, list, scene, result, lens }).is_err() {
                         break;
                     }
                 }
@@ -170,6 +181,7 @@ impl Renderer {
         self.core = Some(d.core);
         self.spare_list = Some(d.list);
         self.spare_scene = Some(d.scene);
+        self.lens_done.extend(d.lens);
         if let Err(e) = d.result {
             self.pending_err = Some(e);
         }
@@ -402,9 +414,33 @@ impl Renderer {
         self.list.cmds.push(Cmd::Trilinear(on));
     }
 
+    /// Let the window surface be copied from, which the lens flare's frame read-back needs
+    /// ([`crate::LensProbe`]); off, the surface is a render attachment alone.
+    pub fn set_lens_probe(&mut self, on: bool) {
+        self.list.cmds.push(Cmd::LensProbe(on));
+    }
+
+    /// The lens-flare read-backs finished since the last call (a frame or two after the frame whose
+    /// [`crate::Scene::lens_probe`] asked for them); never waits for the render thread.
+    pub fn lens_results(&mut self) -> Vec<LensRead> {
+        let mut out = std::mem::take(&mut self.lens_done);
+        if let Some(core) = self.core.as_mut() {
+            out.extend(core.take_lens());
+        }
+        out
+    }
+
     /// `LayerFalseSort1`/`2`'s per-frame pick (`main.rs`'s `App::fakesort_mode`, [`FakeSortMode`]).
     pub fn set_fakesort_mode(&mut self, mode: FakeSortMode) {
         self.list.cmds.push(Cmd::FakeSort(mode));
+    }
+
+    /// State 0x2E, the display gamma (`Core::set_gamma`); only a change is recorded.
+    pub fn set_gamma(&mut self, g: f32) {
+        if self.gamma != g {
+            self.gamma = g;
+            self.list.cmds.push(Cmd::Gamma(g));
+        }
     }
 
     /// Render a scene's meshes into an offscreen texture that the sprite pass can then draw, so a

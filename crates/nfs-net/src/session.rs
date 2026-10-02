@@ -335,11 +335,14 @@ impl Net {
             if reliable && self.host_register(to, bytes) {
                 continue;
             }
-            let conn = self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now));
-            let frame = if reliable { conn.send_queued(bytes, now) } else { Some(conn.send_unreliable(bytes, now)) };
-            if let Some(f) = frame {
-                self.sock.send_to(to, crate::data::TAG, &f)?;
+            if reliable {
+                // the original's room sends reliably only through a peer record's queue
+                // (0x48B340 → 0x48A3D0); an address without a record has no sender, nothing goes
+                continue;
             }
+            let conn = self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now));
+            let f = conn.send_unreliable(bytes, now);
+            self.sock.send_to(to, crate::data::TAG, &f)?;
         }
         Ok(())
     }
@@ -347,7 +350,7 @@ impl Net {
     /// The host's room sender for one peer — the room's send slot 0 (0x48B340) into the peer record's queue,
     /// **0x48A3D0** ([`crate::outbox::PeerQueue::register`]): `true` when `to` is a peer of this host's slot
     /// table (the message is registered and sent only while the record is idle), `false` for any other address
-    /// (a joiner the table does not hold yet — the caller keeps the port's backlog for it).
+    /// (an address the table does not hold: no record, no reliable sender — [`Net::send_game_to`] sends nothing).
     fn host_register(&mut self, to: SocketAddr, body: &[u8]) -> bool {
         if self.role != Role::Host {
             return false;
@@ -447,7 +450,7 @@ impl Net {
     pub fn report(&self) -> String {
         self.conns
             .iter()
-            .map(|(a, c)| format!("{a}: flight {} queued {} ack {} {:?}", c.in_flight(), c.queued(), c.ack(), c.stats))
+            .map(|(a, c)| format!("{a}: flight {} ack {} {:?}", c.in_flight(), c.ack(), c.stats))
             .collect::<Vec<_>>()
             .join("; ")
             + &format!("; outbox {:?}, {} waiting", self.outbox.stats, self.outbox.len())
@@ -597,11 +600,12 @@ impl Net {
                             if reliable && self.host_register(to, &body) {
                                 continue;
                             }
-                            let c = self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now));
-                            let f = if reliable { c.send_queued(&body, now) } else { Some(c.send_unreliable(&body, now)) };
-                            if let Some(f) = f {
-                                let _ = self.sock.send_to(to, crate::data::TAG, &f);
+                            if reliable {
+                                continue; // no peer record, no reliable sender
                             }
+                            let c = self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now));
+                            let f = c.send_unreliable(&body, now);
+                            let _ = self.sock.send_to(to, crate::data::TAG, &f);
                         }
                     }
                     out.push(Event::Data { from, slot, bytes: body });

@@ -178,6 +178,7 @@ impl App {
         self.camera_mode = forced.unwrap_or(0);
         self.anim_cam = if forced.is_some() { AnimCamSlot::Off } else { AnimCamSlot::Start };
         self.chase_offset = None;
+        self.slot_view = None;
         self.chase_settle = 0;
         self.look_yaw = None;
         self.orbit = Orbit::default();

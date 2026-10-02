@@ -71,7 +71,7 @@ impl App {
         // layers — only `carcompare` and `usedcardamage` have such widgets and nothing is ever
         // pushed over either, so covered views of that kind are not carried: APPROXIMATION, no
         // shipped case.)
-        // **APPROXIMATION (MEDIUM)**: not read — that a covered screen's tick 0x80 reaches its
+        // (formerly approximation, MEDIUM — CLOSED 329adc1a, confirmed on the Wine original: the covered garage car shows behind the oval) was not read: that a covered screen's tick 0x80 reaches its
         // widgets' tick 0x4C0520 with no cover test, and that `FEEmpty3DRoom`'s slot 41 stores the car.
         // A dx7 capture of `settings` over `garage` decides it (a faint car behind the oval or none).
         if !widgets.iter().any(|w| w.position().is_none())
@@ -815,7 +815,7 @@ impl App {
     /// is its `+0x20` — the first record `[[0x691D00]]` when none is — reversed when `+0x28 == 2`,
     /// never mirrored. The finale arms (10 / 11, 0x4FC5BF…0x4FC690): the finale's event 0x504990
     /// (`0x504800()`), `evt+0x3A4` / `+0x3A5`, its track id 0x504930 looked up the same way.
-    /// *(Until 2026-09-26 these took `Track1.Track`, an APPROXIMATION — no track room shows during
+    /// *(Until 2026-09-26 these took `Track1.Track`, an approximation — no track room shows during
     /// them, so nothing on screen changes.)*
     fn fe_room_track(&mut self) -> Option<(nfs_formats::career::TrackInfo, bool, bool)> {
         if matches!(self.fe.game_type, 4 | 5)
@@ -882,7 +882,7 @@ impl App {
     ///
     /// The fly-in starts when the room's transition is settled (0x4E0E20, `[+0x12C] == 2`) — the
     /// room object's own (`fe_room_tick`). *(Until 2026-09-26 the port took the screen's, an
-    /// APPROXIMATION.)* The x of the place is mirrored into this port's camera,
+    /// approximation.)* The x of the place is mirrored into this port's camera,
     /// and so is the turn about y, as for the other rooms; `XRot` is applied after `YRot`, as
     /// 0x4D1620 multiplies it on the right of the matrix 0x4D1600 made (0x532470).
     fn fe_track_items(&mut self, room_light: &nfs_game::world::LightBlock) -> Option<Vec<nfs_renderer::DrawItem>> {
@@ -988,7 +988,7 @@ impl App {
                 // 0x4D2F30, the front end's draw: the one background `[fe+0xE4]` (the top
                 // screen's `data.screen`, 0x4D30E7), the bottom bar's career era tabs (slot 41,
                 // 0x4D30F2), then the screens bottom first — the covered ones under the one on
-                // show. APPROXIMATION (OPEN, read 2026-09-30): a covered screen's own 3D car
+                // show. (the earlier premise below is WITHDRAWN (ed2b895d): 0x4D3040 reaches widget slot 26 = the stub 0x5258A0, nothing is drawn there; the covered car is the room-car feed above. Former text:) a covered screen's own 3D car
                 // views are not rendered (the port renders the top screen's only). The original runs
                 // **every** layer's screen's slot 0xA0 each frame (0x4D3040…0x4D3079, a loop over the
                 // layer vector `[fe+0xD8]` with no cover test), so a car view under an overlay still

@@ -100,7 +100,7 @@ impl Element {
 
 /// One component of a `.lay` value as a number: a plain decimal as it is, anything else through
 /// the evaluator (`crate::expr`). A `.lay` value has no macro dictionary to draw on at this level,
-/// so every name is left unanswered, and an **empty** component is no number at all — the port's
+/// so every name is `Undefined` (reads 0, 0x530F0A), and an **empty** component is no number at all — the port's
 /// reading of the tokeniser 0x4B58E9, which skips an empty token (§4.116), not of the evaluator,
 /// which would read it as 0.
 fn number(t: &str) -> Option<f64> {
@@ -108,7 +108,7 @@ fn number(t: &str) -> Option<f64> {
     if t.is_empty() {
         return None;
     }
-    t.parse::<f64>().ok().or_else(|| crate::expr::eval(t, &|_| crate::expr::Macro::Unanswerable).map(f64::from))
+    t.parse::<f64>().ok().or_else(|| Some(f64::from(crate::expr::eval(t, &|_| crate::expr::Macro::Undefined))))
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]

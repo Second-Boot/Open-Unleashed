@@ -244,6 +244,11 @@ impl MusicPlayer {
         self.saved = list;
     }
 
+    /// `RANDOMPLAYLIST` `[0x657A5C]` as the race launch left it (the `CDPlayer.Options` selection).
+    pub fn set_shuffle(&mut self, on: bool) {
+        self.shuffle = on;
+    }
+
     /// Whether the front end is running (`[0x65B928]`), which forces the shuffle on.
     pub fn set_front_end(&mut self, on: bool) {
         self.front_end = on;

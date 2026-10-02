@@ -194,7 +194,8 @@ impl Hud {
         if self.boxes.get() {
             // untextured: one pixel right and down of its vertices on the original's frames, like the
             // tray fill (`Hud::tray`) — measured at 640×480 / 800×600 / 1024×768 / 1280×720 (top edge
-            // 359 / 479 / 646 / 599 for the model's 358 / 478 / 645 / 598). APPROXIMATION, empirical.
+            // 359 / 479 / 646 / 599 for the model's 358 / 478 / 645 / 598). APPROXIMATION, empirical;
+            // class C since 2026-10-02 (N07): dx7z.dll is not the cause, see `Hud::tray`.
             out.push(self.quad(aspect, mx + 1.0, my + 1.0, m, m, [0.0, 0.0, 0.0, 0x3F as f32 / 255.0]));
         }
         out.push(self.image(aspect, tex, mx, my, m, m));
@@ -251,9 +252,19 @@ impl Hud {
         // the fill quad of 0x419F90 (untextured, vertex colours) lands one pixel right and down of its
         // vertices on the original's frames — the tray's rule (0x419E90's line), its texts and the
         // textured quads stay on theirs. Measured at 640×480 / 800×600 / 1024×768 / 1280×720 (time,
-        // position, gear, damage, map trays: every fill edge +1, the size unchanged); the cause is in the
-        // renderer layer, not in nfs5.exe's vertices (0x434310 writes `x`, `x + w`, `y`, `y + h`).
-        // APPROXIMATION of the renderer, empirical.
+        // position, gear, damage, map trays: every fill edge +1, the size unchanged). Not in nfs5.exe's
+        // vertices (0x434310 writes `x`, `x + w`, `y`, `y + h`) and — read 2026-10-02 (N07) — **not in
+        // dx7z.dll either**: its flush 0x60006F20 copies each pre-transformed vertex untouched except
+        // `sz += [0x6001885C]` (state 0x18's bias, 0x60007022…0x6000707F) and hands the batch to
+        // 0x6000D580, which subtracts **0.5 from every `sx` and `sy`** (`fsub` of the constant 0.5 at
+        // 0x6001544C, 0x6000D58E…0x6000D59F; the other two callers 0x600082CA / 0x600087EE do the same
+        // for the point and line paths) before `DrawIndexedPrimitive` (0x60006F77). That is Direct3D 7's
+        // half-pixel compensation (pixel centres at integer coordinates, so a pixel-boundary quad is
+        // pulled by half a pixel) and is **the same for the textured quads** (0x423A10 → 0x59F1D0), which
+        // sit exactly on their integers in the Wine frames; both go through the one flush, so dx7z
+        // cannot make only the untextured fills +1. The +1 is therefore the Direct3D → OpenGL layer of
+        // the Wine capture (class C, platform): whether real Windows shows it is not known.
+        // APPROXIMATION, empirical (matches the Wine reference frames).
         let (pos, size) = Self::place(aspect, x + 1.0, y + 1.0, w, h);
         out.push(Sprite {
             texture: self.tray_fill,
@@ -449,14 +460,17 @@ impl Hud {
     /// dead — the loop stops at 3 (0x430855). In a mission over its damage limit the title turns
     /// 0xCCFF0000 (0x4302DE…). Text heights are the draw sizes, as elsewhere in this HUD; a figure over
     /// 100 gives the rest a reversed quad (its right edge left of its left one), which the port draws
-    /// over the same span. APPROXIMATION, kept OPEN 2026-09-30 — and *reachable*, not a
-    /// case the race cannot produce: each figure is a sum of `(1.5 − 0.005·condition)·mean + state`
-    /// over parts (0x4938A0 family, `Vehicle::part_sum`), so a worn part (`condition` < 100, scale up
-    /// to 1.5) over zones at their 100 cap (`Damage` 0x494500 clamps a zone at 100) reads above 100;
-    /// stock parts (condition 100, scale 1.0) do not. The quad itself is appended by 0x419F50 →
-    /// 0x419F90 in vertex order with no orientation test, so whether the reversed one shows depends
-    /// on the cull mode of the HUD's flush, which no note traces (needs: `CULLMODE` at the HUD's
-    /// draw — 0x41A330 …, thrash.md §6d.2 — and the polarity of the quad's winding).
+    /// over the same span — and **the original draws it too** (closed 2026-10-02): the figure is
+    /// *reachable* (each is a sum of `(1.5 − 0.005·condition)·mean + state` over parts, 0x4938A0 family,
+    /// `Vehicle::part_sum`, so a worn part over zones at their 100 cap reads above 100), the quad is
+    /// appended by 0x419F50 → 0x419F90 in vertex order with no orientation test, and the flush
+    /// 0x41A330 draws it through the HUD's `EAGL::Material` (made by 0x419D50 → 0x59F070), whose own
+    /// default render-state block (0x5379F0: `{1, 2, 0, cull 0, bias 0, −1}`, `[material+0x48]`
+    /// = block, slot `+0x44`) is applied by the layer 0x53F780 → 0x540660 before every draw; its
+    /// cull setter 0x540590 gives `setstate(2, 0)`, which dx7z (0x60003E24) turns into "no cull":
+    /// `[0x60058E1C] = 1`, and `_THRASH_drawquadmesh` (0x60007650) skips its signed-area test when
+    /// that is 1 (0x600076E9). The view's own cull (`CW` in the race) reaches the device only while the
+    /// block's cull is 1 (0x537890's `[0x5DED4C] == 1`), which the HUD's block never is.
     pub(crate) fn text_damage_sprites(
         &self,
         out: &mut Vec<Sprite>,

@@ -471,6 +471,11 @@ impl App {
         match shown {
             Shown::Nothing => {}
             Shown::Ended => {
+                // the last layer closes: its screen gets `NOTINUSE` (0x4D5610), which stores the
+                // Display options when that screen is the Options one (N02)
+                if self.fe.layout_preview.as_ref().is_some_and(|l| Self::fe_list_of(l) == "ID_OPTIONSSCREEN") {
+                    self.hud_cfg_apply();
+                }
                 self.fe_sound(4);
                 event_loop.exit();
             }

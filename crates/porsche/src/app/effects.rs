@@ -300,30 +300,56 @@ impl App {
     /// just outside the mirror's rectangle still draws what of its quad the viewport keeps. `view`
     /// is the pass's viewport in the 640 × 480 frame: [`SUN_VIEW_MAIN`], [`SUN_VIEW_MIRROR`] (the
     /// tray's rectangle 0x4691D0 is handed, `RE/AUDIT.md` §O). The two passes share the object's
-    /// `+0x12C` / `+0x18D` (the point, on screen), which only the lens flare 0x460460 reads — off
-    /// as shipped.
+    /// `+0x12C` / `+0x18D` (the point, on screen), which only the lens flare 0x460460 reads — the
+    /// main view's own (`lens_flare.rs`; the mirror's pass does not run it, 0x468B7B).
     pub(crate) fn sun_items(&self, cam: &Camera, aspect: f32, view: [f32; 4]) -> Vec<nfs_renderer::DrawItem> {
         let mut out = Vec::new();
-        let Some(bin) = self.track.sky_bin.as_ref().filter(|b| b.sun_active()) else { return out };
-        let Some(def) = self.flare_defs.iter().find(|d| d.id == SUN_FLARE && d.textures.iter().any(|t| t.is_some())) else { return out };
+        let Some(def) = self.sun_def() else { return out };
         if !def.lit(0, self.tick as u32) {
             return out;
         }
-        let [vx, vy, vw, vh] = view;
-        let main = view == SUN_VIEW_MAIN;
+        let Some(pt) = self.sun_point(cam, aspect, view) else { return out };
+        // one metre ahead — but the port's mirror camera keeps the view's near plane 1 (0x4691D0),
+        // where the original's sky pass has put 0.15 / 700 on the view (0x45D51D) and the screen
+        // quad needs no plane at all: there the quad goes to twice the near plane, and the fog
+        // reads the W the original's quad has, 1 (`rhw` 1, 0x451710), from `DrawItem::fog_w`
+        // *(until 2026-09-30 it read the quad's 2 m, ≤ 2 % of the fog mix)*.
+        let ahead = if cam.near < 1.0 { 1.0 } else { cam.near * 2.0 };
+        let centre = cam.position + pt.rel * (ahead / pt.depth);
+        self.flare_quads(&mut out, cam, aspect, view, def, (pt.px, pt.py), centre, ahead, 1.0, &self.sun_sprites, false);
+        out
+    }
+
+    /// The sun's `flare.dat` record `anus` (0x460290 at 0x4602B9) when the sun object is on and the
+    /// record has a texture.
+    fn sun_def(&self) -> Option<&nfs_formats::flare::FlareDef> {
+        self.track.sky_bin.as_ref().filter(|b| b.sun_active())?;
+        self.flare_defs.iter().find(|d| d.id == SUN_FLARE && d.textures.iter().any(|t| t.is_some()))
+    }
+
+    /// The view's basis as the flare quads lay it: forward, right (the data's frame is left-handed:
+    /// `forward × up` points to the screen's **left**, the renderer flips clip x, `RE/notes/
+    /// RENDERING.md` "Coordinate system"; under `MIRROR` it does not) and up.
+    pub(crate) fn flare_basis(&self, cam: &Camera) -> (Vec3, Vec3, Vec3) {
         let fwd = (cam.target - cam.position).normalize_or_zero();
-        // in the data's left-handed frame `forward × up` points to the screen's **left** (the
-        // renderer flips clip x, `RE/RENDERING.md` "Coordinate system"; under `MIRROR` it does
-        // not). *(Until 2026-09-27 this took it for the right: the point's x — which the turn
-        // reads — was mirrored, and the quad with it.)*
         let left = fwd.cross(cam.up).normalize_or_zero();
         let up = left.cross(fwd);
-        let right = if self.scene.mirror { left } else { -left };
+        (fwd, if self.scene.mirror { left } else { -left }, up)
+    }
+
+    /// 0x460290's projection of the sun point `+0x11C` (0x539700 at 0x460306) and its on-screen test
+    /// (0x460310…0x460367, the byte `+0x18D` the lens flare reads): the point in the view's
+    /// 640 × 480 frame, `None` when it is behind the eye or the far plane or off the **window**.
+    pub(crate) fn sun_point(&self, cam: &Camera, aspect: f32, view: [f32; 4]) -> Option<SunPoint> {
+        let bin = self.track.sky_bin.as_ref().filter(|b| b.sun_active())?;
+        self.sun_def()?;
+        let [vx, vy, vw, vh] = view;
+        let (fwd, right, up) = self.flare_basis(cam);
         let rel = Vec3::from(bin.sun_position());
         let depth = rel.dot(fwd);
         // screen z under 1: in front of the eye and of the far plane 700
         if depth <= 0.0 || depth >= nfs_renderer::VIEW_FAR {
-            return out;
+            return None;
         }
         let tan_y = (cam.fov_y_radians * 0.5).tan();
         let tan_x = tan_y * aspect;
@@ -331,8 +357,48 @@ impl App {
         let (sx, sy) = ((rel.dot(right) / (depth * tan_x) + 1.0) * 0.5, (1.0 - rel.dot(up) / (depth * tan_y)) * 0.5);
         let (px, py) = (vx + sx * vw, vy + sy * vh);
         if !(0.0..640.0).contains(&px) || !(0.0..480.0).contains(&py) {
-            return out;
+            return None;
         }
+        Some(SunPoint { px, py, rel, depth })
+    }
+
+    /// 0x451710 for one `flare.dat` record drawn flat on the screen at `(px, py)` (the view's
+    /// 640 × 480 frame; `centre` is that point laid in the view plane `ahead` metres from the eye):
+    /// per layer with a texture a quad of `±size · 0.1 · width / 640` by `±size · 0.1 · height /
+    /// 480` pixels about the point, turned — flag 4 — by `(x + y) / 1440` of a turn of its screen
+    /// position (0x45175C…0x451768, 0x45187E…0x4518DE: `x' = x cos + y sin`, `y' = y cos − x sin`,
+    /// screen y down), UVs (0, 0) (1, 0) (1, 1) (0, 1) from the top left (`[0x61BC78]`,
+    /// 0x4514F5…), the layer's ARGB on all four corners, screen z 0 and `rhw` 1, additive.
+    ///
+    /// `scale` is the call's third argument: **under 0.05** (`[0x5B26A0]`, 0x4517AF) the layer is
+    /// not drawn; **under 1** (`[0x5B24A8]`, 0x4517C9) the colour's alpha byte becomes
+    /// `trunc(alpha · scale)` (0x4517DF…0x4517F5). The sun passes 1.0 (0x460398), the lens flare's
+    /// elements `matches / 16`. `overlay` draws the quad after the finished frame under no depth
+    /// test ([`nfs_renderer::DrawItem::overlay`], the lens flare — drawn by 0x45D1A0 after the
+    /// world, 0x45D25C) instead of in the sky pass.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn flare_quads(
+        &self,
+        out: &mut Vec<nfs_renderer::DrawItem>,
+        cam: &Camera,
+        aspect: f32,
+        view: [f32; 4],
+        def: &nfs_formats::flare::FlareDef,
+        (px, py): (f32, f32),
+        centre: Vec3,
+        ahead: f32,
+        scale: f32,
+        sprites: &std::collections::HashMap<String, (nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
+        overlay: bool,
+    ) {
+        if scale < 0.05 {
+            return;
+        }
+        let [_, _, vw, vh] = view;
+        let main = view == SUN_VIEW_MAIN;
+        let (fwd, right, up) = self.flare_basis(cam);
+        let tan_y = (cam.fov_y_radians * 0.5).tan();
+        let tan_x = tan_y * aspect;
         // flag 4: `(x + y) · (1/1440)` turns of the pixel position, on the original's 640 × 480
         // screen (its `[0x619784]` / `[0x619788]`); here the window's own size stands for it
         let (w, h) = self.renderer.as_ref().map_or((640.0, 480.0), |r| {
@@ -344,16 +410,9 @@ impl App {
         let (sn, cs) = a.sin_cos();
         // `x' = x cos + y sin` with y down turns the quad's axes by the angle counter-clockwise
         let (r, u) = (right * cs + up * sn, up * cs - right * sn);
-        // one metre ahead — but the port's mirror camera keeps the view's near plane 1 (0x4691D0),
-        // where the original's sky pass has put 0.15 / 700 on the view (0x45D51D) and the screen
-        // quad needs no plane at all: there the quad goes to twice the near plane, and the fog
-        // reads the W the original's quad has, 1 (`rhw` 1, 0x451710), from `DrawItem::fog_w`
-        // *(until 2026-09-30 it read the quad's 2 m, ≤ 2 % of the fog mix)*.
-        let ahead = if cam.near < 1.0 { 1.0 } else { cam.near * 2.0 };
-        let centre = cam.position + rel * (ahead / depth);
         for k in 0..2 {
             let Some(name) = def.textures[k].as_ref() else { continue };
-            let Some(&(mesh, material)) = self.sun_sprites.get(name) else { continue };
+            let Some(&(mesh, material)) = sprites.get(name) else { continue };
             // `size · 0.1 · width / 640` pixels each side is `size · 0.1 / (vw / 2)` of the view's
             // half-width (1/320 in the main view), `tan_x` of a metre at one metre ahead
             let size = def.sizes[k] * 0.1;
@@ -361,17 +420,22 @@ impl App {
             let argb = def.colours[k];
             let m = Mat4::from_cols((r * (2.0 * half_x)).extend(0.0), (u * (2.0 * half_y)).extend(0.0), fwd.extend(0.0), centre.extend(1.0));
             let tint = [((argb >> 16) & 0xFF) as f32 / 255.0, ((argb >> 8) & 0xFF) as f32 / 255.0, (argb & 0xFF) as f32 / 255.0];
+            let alpha_byte = if scale < 1.0 { (((argb >> 24) & 0xFF) as f64 * scale as f64) as u32 } else { argb >> 24 };
             out.push(nfs_renderer::DrawItem {
                 light: tint,
-                alpha: (argb >> 24) as f32 / 255.0,
+                alpha: alpha_byte as f32 / 255.0,
                 layer_light: Some(unlit(tint)),
-                sky_pass: true,
+                sky_pass: !overlay,
                 main_view_only: main,
                 fog_w: if ahead == 1.0 { 0.0 } else { 1.0 },
+                overlay,
+                // 0x45D245: Thrash 0x24 ← 10 before 0x460460 (the sun's pass runs under the sky
+                // pass's own states)
+                alpha_test: overlay,
+                alpha_ref: 10,
                 ..nfs_renderer::DrawItem::new(mesh, material, m)
             });
         }
-        out
     }
 
     /// The track's flares, `RDrawArticleBundle`'s slot 3 for kind 2 (0x451940,
@@ -534,6 +598,16 @@ impl App {
 /// port's sun-and-ambient term shaded each quad by its own orientation.
 /// The sun's `flare.dat` record: the FourCC `anus` as stored (0x460289 pushes `[0x5CF52C]` =
 /// 0x73756E61 to 0x452260), its layers `SUNA` and `BLUR`.
+/// The sun's screen point (0x460290): `(px, py)` in the view's 640 × 480 frame, the sun's offset
+/// from the eye `rel` and its depth along the view axis.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SunPoint {
+    pub px: f32,
+    pub py: f32,
+    pub rel: Vec3,
+    pub depth: f32,
+}
+
 pub(crate) const SUN_FLARE: u32 = 0x7375_6E61;
 
 /// The sky pass's viewport in the 640 × 480 frame (`App::sun_items`): the main view's whole screen.

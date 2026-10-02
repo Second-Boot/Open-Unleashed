@@ -47,7 +47,7 @@ impl LayoutScreen {
     /// The stamps are the widget's own ([`Typing`]): the typing counts from the tick of the first
     /// draw that finds the wait over, and holds while the screen is in a transition (0x4C8820).
     /// *(Until 2026-09-26 this counted from tick 152 exactly and ignored the transition, an
-    /// APPROXIMATION "one frame wide".)* The activation is the screen's open, tick 0 of its clock.
+    /// approximation "one frame wide".)* The activation is the screen's open, tick 0 of its clock.
     /// `NFS_FE_CLOCK` preloads that clock with no frames behind it, so a widget first drawn past
     /// the wait takes the wait as having ended on its last tick (152) — the diagnostic's stand-in
     /// for the frames it skipped, which the game never meets (its first draw is at tick 0…2).

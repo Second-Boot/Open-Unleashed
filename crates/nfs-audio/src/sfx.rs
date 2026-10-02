@@ -150,7 +150,7 @@ pub struct LoopInput {
 /// tick and drains on the odd one that follows (the audio update 0x4A8120, `timing.md` §7), and
 /// so does the port since its audio block runs on the odd tick only (2026-09-26). *(Until then
 /// it drained in the 64 Hz block of the same even tick, and this said so; earlier still it said
-/// "APPROXIMATION: the port drains once per frame" — wrong, the drain sits inside the tick loop.)*
+/// "approximation: the port drains once per frame" — wrong, the drain sits inside the tick loop.)*
 #[derive(Debug, Clone, Default)]
 pub struct SfxQueue {
     entries: Vec<QueuedSfx>,
@@ -395,7 +395,14 @@ const WORD_UNIT: u16 = 0x1000;
 /// * the volume `(int)lvl · f0 · g` stored as an f32, `fistp`, then `min(·, 0x7F)` and `≤ 0 → 0`
 ///   (0x4AA807…0x4AA82B).
 ///
-/// APPROXIMATION: the x87's intermediate precision is taken as f64 (the f32 stores, which round far
+/// APPROXIMATION (narrowed 2026-10-02, WP-AN): this code runs on the game's **main thread**, the one
+/// that creates the DirectX 7 device. `dx7z.dll` passes `SetCooperativeLevel` flags 0x408 / 0x411
+/// only (0x600030CE…0x600030EA, 0x600034F0…0x60003523 → the calls 0x6000226F / 0x60003165), never
+/// `DDSCL_FPUPRESERVE` 0x1000 / `FPUSETUP` 0x800, so on Microsoft's DirectX 7 the runtime's default
+/// applies — single precision for that thread (ddraw.dll's documented behaviour; it is not in the
+/// shipped files, so not verifiable here) — while Wine keeps 0x027F (measured below). The mixer
+/// side (`resample.rs`) is on its own worker thread and is settled at 53-bit. Here the x87's
+/// intermediate precision is taken as f64 (the f32 stores, which round far
 /// coarser, are kept). Narrowed 2026-09-28 (`career.md` §11.4a, `RE/tools/fpucw.py`): every real
 /// `fldcw`/`fnstcw` in `.text` was surveyed (59 sites; ~680 more are IAT/global address bytes
 /// mis-decoded, not instructions) and none is in this file's own code, `sfx.rs`'s callers, or the
@@ -623,7 +630,7 @@ impl CollisionSfx {
     /// 0x4A93C0 is attenuated by the distance of the **car that owns the queue**, `|car+0x330 −
     /// listener 0x655E50|` in 16.16 (0x4A78E8…0x4A7909 → `[esp+0x18]` → 0x4A93C0's fifth argument
     /// at 0x4A7C4B / 0x4A7C68), through `512/(d+2)` (view 0x0C: `4 · 2048/(d+1)`, 0x4A93D0…0x4A9420).
-    /// So the earlier "APPROXIMATION: the queue measures to each event's own point" was wrong and
+    /// So the earlier "approximation: the queue measures to each event's own point" was wrong and
     /// is withdrawn: `distance` here is exactly the original's. What differs per event is the
     /// **pan** (the sixth argument): a loop (`chan ≥ 0`) takes the car's own pan angle (`ebp`,
     /// from `car+0x330`, 0x4A7862…0x4A78E5; 0x4A7C61), a one-shot (`chan < 0`) the angle to the
@@ -632,7 +639,7 @@ impl CollisionSfx {
     /// Both reach the voice (0x4A94D5…0x4A94EA, 0x4A983A…0x4A9854). This port had neither pan.
     /// `pan` here is the loops'; the one-shots' comes from [`Self::set_one_shot_pan`], called once
     /// by [`Self::drain_player`].
-    /// *(2026-09-26: the "APPROXIMATION: every one-shot takes the car's pan" that stood here is
+    /// *(2026-09-26: the "approximation: every one-shot takes the car's pan" that stood here is
     /// withdrawn — `nfs_physics::vehicle::Vehicle::last_contact` now carries `car+0x440`.)*
     pub fn set_levels(&mut self, sfx_level: u8, engine_level: u8, reverb: i32, distance: f32, view_0c: bool, pan: u16) {
         self.sfx_level = sfx_level;
@@ -650,7 +657,7 @@ impl CollisionSfx {
     /// Called once by [`Self::drain_player`], with `car+0x440` as it stands at the drain (after
     /// the whole tick's physics) — not per event: see that method. *(Until 2026-09-27 this was
     /// called once per one-shot, as its event happened, each against `car+0x440`'s value at that
-    /// moment — an APPROXIMATION now withdrawn: `main.rs`'s collision block queues the one-shots
+    /// moment — an approximation now withdrawn: `main.rs`'s collision block queues the one-shots
     /// instead of playing them, so they all reach this the same way the loops do.)*
     pub fn set_one_shot_pan(&mut self, pan: u16) {
         self.one_shot_pan = pan;
@@ -1050,7 +1057,7 @@ impl CollisionSfx {
     /// (`−1 − (r & 7)` at the top, `ebx` −1 on every path in, 0x4AA436 / 0x4AA449 / 0x4AA4AA;
     /// `(r & 7) + 1` at the bottom) and then at most one for the pitch (`−20 − r % 80` at the top,
     /// `r % 50 + 10` at the bottom; `div`, unsigned), in that order, only on the updates that hit a
-    /// bound. *(Until 2026-09-27 an APPROXIMATION took them from this bank's own LCG.)*
+    /// bound. *(Until 2026-09-27 an approximation took them from this bank's own LCG.)*
     pub fn wind(&mut self, out: &AudioOutput, active: bool, speed_est: f32, road_speed: f32, nibble: usize, draw: &mut impl FnMut() -> u32) {
         let master = (self.sfx_level, self.spl.sfx());
         let s = (speed_est.abs() * 5.0) as i32;

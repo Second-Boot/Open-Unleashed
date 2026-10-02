@@ -91,7 +91,7 @@ impl App {
         let (w, h, s) = self.hud_geometry();
         // the front end has no `SPECIALFX` level: no mip promotion, the fake-sort mode of level `None`
         let target = (w, h, s.to_bits(), false, self.fakesort_mode(None));
-        let Scene { items: _, sprites, clear_color, sun_direction, ambient, mirror, headlight, headlight_decal, beacon, fog, sky_fog } = &self.scene;
+        let Scene { items: _, sprites, clear_color, sun_direction, ambient, mirror, headlight, headlight_decal, beacon, fog, sky_fog, lens_probe: _ } = &self.scene;
         let plain = !mirror && headlight.is_none() && !headlight_decal && beacon.is_none();
         if plain
             && let Some(p) = &self.presented
@@ -120,6 +120,7 @@ impl App {
             return;
         }
         let (w, h, _) = self.hud_geometry();
+        self.sync_gamma();
         let Some(r) = self.renderer.as_mut() else { return };
         let img = r.render_to_image(&self.scene, &self.camera, w, h).expect("verify render");
         if idle {

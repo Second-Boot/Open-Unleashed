@@ -117,7 +117,7 @@ impl App {
     /// car list (0x443610): in the mirror's, slot 0's flag bit 4 is set (0x468DA8…0x468E1F) and the
     /// camera's own car (`carInfo+0x520 == 0x465D80(0)`) returns at 0x4430EC — nothing of it is queued,
     /// no shadow, body or lamps; the others go through the frustum test 0x539480 (`car+0x330`, radius
-    /// `car+0x3B4`) and the LOD pick of the mirror's view. APPROXIMATION: the draw's last act, the
+    /// `car+0x3B4`) and the LOD pick of the mirror's view. Difference (not an approximation, see below): the draw's last act, the
     /// effect drive (slot 7, 0x443239), runs in the mirror's pass too in the original, with that
     /// pass's eye; the port drives the effects once a frame, from the main pass. **Settled
     /// 2026-09-30: equivalent.** 0x43EF80 measures `d²` from the slot's eye
@@ -208,12 +208,7 @@ impl App {
                 // its draw position `p` below): collected here and merged with the track's far list
                 // and the skid marks farthest-first (`Self::blended_dyn_items`)
                 car_items.clear();
-                if let Some(mat) = shadow_material
-                    && let Some(q) = self.shadow_quad(c.position, Quat::from_mat3(&c.orientation.transpose()).normalize(), c.half_extents, &mut shadow_verts)
-                {
-                    Self::push_shadow(&mut car_items, self.renderer.as_mut(), &mut self.shadow_meshes, &mut shadow_used, mat, (q, shadow_verts.as_slice()));
-                }
-                // the model at `car+0x330 − M[1]·car+0x3AC` (0x43A410), LOD 1's box
+                // PORT-DEVIATION D8 (PORT-DEVIATIONS.md) [the original draws the last tick, 0x483590 / 0x470E90]: the draw pose is the previous tick's blended toward this one by `alpha`; the shadow follows it
                 let (p1, r1) = (
                     c.draw_origin(),
                     Quat::from_mat3(&c.orientation.transpose()).normalize(),
@@ -224,6 +219,12 @@ impl App {
                     }
                     _ => (p1, r1),
                 };
+                if let Some(mat) = shadow_material
+                    && let Some(q) = self.shadow_quad(p + (c.position - c.draw_origin()), r, c.half_extents, &mut shadow_verts)
+                {
+                    Self::push_shadow(&mut car_items, self.renderer.as_mut(), &mut self.shadow_meshes, &mut shadow_used, mat, (q, shadow_verts.as_slice()));
+                }
+                // the model at `car+0x330 − M[1]·car+0x3AC` (0x43A410), LOD 1's box
                 let key = (p - fx_eye).length_squared().round_ties_even() as u32;
                 let m = Mat4::from_rotation_translation(r, p);
                 // a kinematic car has no wheel state: the wheels are rolled from the distance driven
@@ -279,12 +280,7 @@ impl App {
                     continue;
                 }
                 car_items.clear();
-                if let Some(mat) = shadow_material
-                    && let Some(q) = self.shadow_quad(c.position, Quat::from_mat3(&c.orientation.transpose()).normalize(), c.half_extents, &mut shadow_verts)
-                {
-                    Self::push_shadow(&mut car_items, self.renderer.as_mut(), &mut self.shadow_meshes, &mut shadow_used, mat, (q, shadow_verts.as_slice()));
-                }
-                // the model at `car+0x330 − M[1]·car+0x3AC` (0x43A410), LOD 5's box like a racer's
+                // PORT-DEVIATION D8 (PORT-DEVIATIONS.md) [the original draws the last tick, 0x483590 / 0x470E90]: the draw pose is the previous tick's blended toward this one by `alpha`; the shadow follows it
                 let (p1, r1) = (
                     c.draw_origin(),
                     Quat::from_mat3(&c.orientation.transpose()).normalize(),
@@ -295,6 +291,12 @@ impl App {
                     }
                     _ => (p1, r1),
                 };
+                if let Some(mat) = shadow_material
+                    && let Some(q) = self.shadow_quad(p + (c.position - c.draw_origin()), r, c.half_extents, &mut shadow_verts)
+                {
+                    Self::push_shadow(&mut car_items, self.renderer.as_mut(), &mut self.shadow_meshes, &mut shadow_used, mat, (q, shadow_verts.as_slice()));
+                }
+                // the model at `car+0x330 − M[1]·car+0x3AC` (0x43A410), LOD 5's box like a racer's
                 let key = (p - fx_eye).length_squared().round_ties_even() as u32;
                 let m = Mat4::from_rotation_translation(r, p);
                 let spin = c.speed.abs() * self.tick as f32 / 64.0 / 0.32;
@@ -338,12 +340,7 @@ impl App {
             if mirror_pass && followed_here || !(followed_here && own_view <= 1 || seen(o.vehicle.position, o.vehicle.half_extents)) {
                 continue;
             }
-            if let Some(mat) = shadow_material
-                && !(followed_here && own_view <= 1)
-                && let Some(q) = self.shadow_quad(o.vehicle.position, Quat::from_mat3(&o.vehicle.orientation.transpose()).normalize(), o.vehicle.half_extents, &mut shadow_verts)
-            {
-                Self::push_shadow(&mut car_items, self.renderer.as_mut(), &mut self.shadow_meshes, &mut shadow_used, mat, (q, shadow_verts.as_slice()));
-            }
+            // PORT-DEVIATION D8 (PORT-DEVIATIONS.md) [the original draws the last tick, 0x483590 / 0x470E90]: the draw pose is the previous tick's blended toward this one by `alpha`; the shadow follows it
             let (p1, r1) = (
                 o.vehicle.draw_origin(),
                 Quat::from_mat3(&o.vehicle.orientation.transpose()).normalize(),
@@ -354,6 +351,12 @@ impl App {
                 }
                 _ => (p1, r1),
             };
+            if let Some(mat) = shadow_material
+                && !(followed_here && own_view <= 1)
+                && let Some(q) = self.shadow_quad(p + (o.vehicle.position - o.vehicle.draw_origin()), r, o.vehicle.half_extents, &mut shadow_verts)
+            {
+                Self::push_shadow(&mut car_items, self.renderer.as_mut(), &mut self.shadow_meshes, &mut shadow_used, mat, (q, shadow_verts.as_slice()));
+            }
             let key = (p - fx_eye).length_squared().round_ties_even() as u32;
             let m = Mat4::from_rotation_translation(r, p);
             let w = &o.vehicle.wheels;
@@ -361,6 +364,14 @@ impl App {
             // the front wheels' `+0xB4` over 216 (slot 9's channels 1 and 2), in a replay the
             // smoothed `car+0xAC8` / `+0xACC` (0x438478…0x4384B5)
             let st = if replaying { o.vehicle.steer_smoothed } else { [w[0].steer, w[1].steer] };
+            // PORT-DEVIATION D8 (PORT-DEVIATIONS.md) [the original draws the last tick, 0x438478…0x4384B5]: the angles lerped from the previous tick's, as the body is
+            let st = match self.road.opp_steer_prev.get(i) {
+                Some(q) => {
+                    let q = if replaying { [q[2], q[3]] } else { [q[0], q[1]] };
+                    [q[0] + (st[0] - q[0]) * alpha, q[1] + (st[1] - q[1]) * alpha]
+                }
+                None => st,
+            };
             let (spin, steer) = ([w[0].rotation, w[1].rotation, w[2].rotation, w[3].rotation], [st[0] / 216.0, st[1] / 216.0]);
             let model = &self.road.opponent_models[o.model];
             let state = &mut self.road.opponent_lods[i];
@@ -465,7 +476,18 @@ impl App {
                         v.wheels[3].rotation,
                     ],
                     // in a replay the smoothed `car+0xAC8` / `+0xACC` (0x438478…0x4384B5)
-                    if replaying { [v.steer_smoothed[0] / 216.0, v.steer_smoothed[1] / 216.0] } else { [v.wheels[0].steer / 216.0, v.wheels[1].steer / 216.0] },
+                    {
+                        let st = if replaying { v.steer_smoothed } else { [v.wheels[0].steer, v.wheels[1].steer] };
+                        // PORT-DEVIATION D8 (PORT-DEVIATIONS.md) [the original draws the last tick, 0x438478…0x4384B5]: lerped from the previous tick's angles, as the body is
+                        let st = match self.road.player_steer_prev {
+                            Some(q) => {
+                                let q = if replaying { [q[2], q[3]] } else { [q[0], q[1]] };
+                                [q[0] + (st[0] - q[0]) * alpha, q[1] + (st[1] - q[1]) * alpha]
+                            }
+                            None => st,
+                        };
+                        [st[0] / 216.0, st[1] / 216.0]
+                    },
                 ),
                 None => ([0.0; 4], [0.0; 2]),
             };
@@ -589,9 +611,18 @@ impl App {
                     // after its 0x24 ← 10 (0x466703), not under the particles' 1, which come later in
                     // the pass. Merged with the track's far list and the cars' own `+0xC` entries,
                     // farthest first (`Self::blended_dyn_items`). *(Until 2026-09-30 the key was the
-                    // strip's own midpoint square distance to the eye.)* APPROXIMATION left: the walk's
-                    // gates for a cell (node pass, frustum, `Vis ` occlusion, `s² < far²`) are the
-                    // walk's own since 2026-09-30 (`TrackWorld::cell_walk`).
+                    // strip's own midpoint square distance to the eye.)* **Closed 2026-10-02, the chain read
+                    // to the instruction:** 0x44FFC0 `fistp`s the walk's float (round to nearest even, the x87 default,
+                    // 0x44FFC9), packs the item (0x44FE70: `[+0]` the bundle, `[+4]` 1, `[+6]` the ref's index),
+                    // copies it through 0x443250 / 0x443270 with the key as the entry's last dword `+0xC`, takes the
+                    // view `[0x628130]` (0x44FE90) and its list pointer `+0x54` (0x4432A0) and calls 0x466A90, whose tree
+                    // insert compares that dword against each node's `+0x1C` **unsigned** (`jbe` / `ja`, 0x466AD3) and
+                    // goes right for greater, left for equal-or-less — the key is exactly `round(s²)`. The walk's gates
+                    // are the port's (`TrackWorld::cell_walk`). Residual, class B (no longer an unread call):
+                    // a tie between two cells' keys (every cell whose sphere holds the eye has `s² = 0`) is ordered in
+                    // the original by the node pass and the registration order of the cell records (the table sorted by
+                    // the node addresses, `RE/notes/particles.md` §9 — the pool's runtime order); the port
+                    // queues the cells in its table order, after the track's far list.
                     queue.push((key, nfs_renderer::DrawItem { layer_light: Some(unlit([1.0; 3])), alpha_test: true, alpha_ref: 10, ..nfs_renderer::DrawItem::new(mesh, material, Mat4::IDENTITY) }));
                 }
                 pools.skid = used;
@@ -637,6 +668,7 @@ impl App {
     pub(crate) fn rebuild_scene(&mut self) {
         let (lw, lh) = self.hud_logical();
         Hud::set_screen(lw, lh);
+        self.hud_stored_sync(lw, lh); // N01a: an existing HUD record is used as stored
         self.fix_mission_result();
         // the port's own overlays lay their text out in screen units, so the fonts need to know
         // what shape the window is (the HUD and the front end place glyphs in 640×480 themselves)
@@ -661,6 +693,7 @@ impl App {
             }
         }
         self.scene.items.clear();
+        self.scene.lens_probe = None;
         self.scene.sprites.clear();
         self.scene.mirror = self.mirror && self.vehicle.is_some();
         // the sky's own colour, from the track's `Sky/<Track>.bin` (`RE/RENDERING.md`): black on the
@@ -733,6 +766,9 @@ impl App {
         if let Some(a) = self.test_alpha.or_else(|| nfs_game::config::cfg().nfs_alpha.var().ok().and_then(|v| v.parse::<f32>().ok())) {
             alpha = a.clamp(0.0, 1.0);
         }
+        // PORT-DEVIATION D8 (PORT-DEVIATIONS.md) [the original draws the last tick, 0x483590 / 0x470E90]: every moving thing is drawn at `lerp(previous
+        // tick, this tick, alpha)` (cars, camera, shadows, smackables, `WAnimBundle` articles); the
+        // original draws this tick's pose (alpha 1) — see `RE/notes/PORT-DEVIATIONS.md` D8
         let (car_pos, car_rot) = match self.render_prev {
             Some((p0, r0)) if p0.distance(self.car_pos) < 5.0 => (
                 p0.lerp(self.car_pos, alpha),
@@ -984,15 +1020,24 @@ impl App {
         self.camera.near = nfs_game::camera::near_plane(slot_near, view);
         self.draw_distance = keys.far_distance(cam_slice, self.detail);
         self.camera.far = if self.vehicle.is_some() { nfs_renderer::VIEW_FAR } else { 20000.0 };
+        self.sun_view_diagnostic();
         self.main_sky_items(cam_slice);
         self.camera_diagnostics();
-        self.track_walk();
+        self.track_walk(alpha);
         self.track_and_car_items(alpha, local_draw, local_pos, local_rot);
     }
 
     /// The sky manager's update 0x45D030 for the main view and its draw items (the sky, the sun,
     /// the ring): the first range of `scene.items` (`sky_item_range`).
     fn main_sky_items(&mut self, cam_slice: usize) {
+        // `[0x657DB4]` SKYOFF (the config row `SKYOFF`, id 0x5A, 0x4B14C4 — `fe.txt`'s `skyoff`, absent
+        // in the shipped one): 0x468AF9 skips the whole sky pass 0x45D7D0, update and draw, for every
+        // view; `[0x619799]`, the third gate there, is only ever written 0 (0x44E89D)
+        if self.sky_off() {
+            let n = self.scene.items.len();
+            self.sky_item_range = (n, n);
+            return;
+        }
         // the sky manager's update (0x45D030): the camera's eye and slice drive the layers
         if let (Some(s), Some(r)) = (self.sky.as_mut(), self.renderer.as_mut()) {
             let lap = self.slices.as_ref().map_or(0, |t| t.slices.len() as i32);
@@ -1010,6 +1055,31 @@ impl App {
             self.scene.items.extend(sun);
             self.scene.items.extend(s.draw_items(&view, true));
             self.sky_item_range = (start, self.scene.items.len());
+        }
+    }
+
+    /// `[0x657DB4]`, `SKYOFF`: set from the config (`fe.txt`), 0 as shipped.
+    pub(crate) fn sky_off(&self) -> bool {
+        self.registry.u32("skyoff", 0) != 0
+    }
+
+    /// The port's `NFS_SUN_VIEW` camera diagnostic (no original counterpart), run before the sky's
+    /// items are laid out so that the sun is placed for the turned camera.
+    fn sun_view_diagnostic(&mut self) {
+        // diagnostic: `NFS_SUN_VIEW=down,yaw` (degrees, the yaw optional) turns the camera, where it
+        // stands, to the sun (`SkyBin::sun_position`, around the eye) lowered by `down` and turned
+        // about the vertical by `yaw`, so a still has the sun in front of it — and the lens flare,
+        // whose elements lie on the line from the screen's centre through the sun, off the centre
+        if let Some((deg, yaw)) = nfs_game::config::cfg().nfs_sun_view.var().ok().and_then(|v| {
+            let mut it = v.split(',').map(|x| x.trim().parse::<f32>().ok());
+            Some((it.next()??, it.next().flatten().unwrap_or(0.0)))
+        }) && let Some(bin) = self.track.sky_bin.as_ref()
+        {
+            let d = Vec3::from(bin.sun_position()).normalize_or_zero();
+            let aim = Quat::from_rotation_y(yaw.to_radians()) * (d - Vec3::Y * deg.to_radians().tan()).normalize_or_zero();
+            if aim != Vec3::ZERO {
+                self.camera.target = self.camera.position + aim * 10.0;
+            }
         }
     }
 
@@ -1077,10 +1147,12 @@ impl App {
 
     /// The main view's track walk 0x47F890 and what the walk's draws feed (smackables, projectors,
     /// the kind-3 emitters): `article_draws` for this frame.
-    fn track_walk(&mut self) {
+    fn track_walk(&mut self, alpha: f32) {
         if let Some(w) = self.world.as_mut() {
             // each smackable's article is drawn at its body's pose (0x483590, `skill-tests.md` §5.3)
-            for (owner, pose) in self.smackables.poses() {
+            // PORT-DEVIATION D8 (PORT-DEVIATIONS.md) [the original draws the last tick, 0x483590 / 0x470E90]: at the pose blended by `alpha` between the
+            // previous tick and this one, like every car (the original draws this tick's, alpha 1)
+            for (owner, pose) in self.smackables.poses_blended(alpha) {
                 w.place_smackable(owner, pose);
             }
             // the track draw's prep 0x488CC0 → 0x476810: a smackable a draw found pushed gets its
@@ -1091,7 +1163,10 @@ impl App {
             // eighth call re-registers the moving refs; the main view's walk is one
             // count, the mirror's (`render_mirror`) the next
             self.walk_calls = self.walk_calls.wrapping_add(1);
-            w.animate(self.tick as f32 / 64.0, self.walk_calls & 7 == 0);
+            // PORT-DEVIATION D8 (PORT-DEVIATIONS.md) [the original draws the last tick, 0x483590 / 0x470E90]: the race time of the drawn pose — this tick's
+            // `tick / 64` at `alpha` 1 (all the original draws), a fraction of a tick earlier
+            // for a frame between two ticks, as the cars are blended; this tick's time at tick 0
+            w.animate((self.tick as f32 - 1.0 + alpha).max(0.0).min(self.tick as f32) / 64.0, self.walk_calls & 7 == 0);
             // water/flag UV scroll (`RCustomLayers::LayerUVAnimate`, the EAGL
             // layers): `TIMER_getTicks()` is two of this 64 Hz race tick, as the beacon uses below
             w.animate_uv((self.tick * 2) as u32);
@@ -1222,6 +1297,11 @@ impl App {
             self.scene.items.extend(sc.effects.drain(..));
             self.effect_item_range = (effects_start, self.scene.items.len());
             self.weather_items();
+            // the sun's lens flare (0x45D25C): last, after the world and the cars, as 0x468B89 runs it;
+            // SKYOFF skips that pass too (0x468B80)
+            if !self.sky_off() {
+                self.lens_flare_items();
+            }
         }
         self.scratch = sc;
     }
@@ -2164,6 +2244,18 @@ impl App {
             (0x0C | 0x14, Some(v)) if v != 0x0C && v <= 0x13 => v,
             (v, _) => v,
         };
+        // **The slot's offset `+0x08` seed 0x465CF0**: `-4.0 · car+0x37C` (the matrix's third row — the
+        // car's forward axis), called with the slot's mask at the race's init 0x4640B0 (0x464247), by SetSlotView
+        // 0x465790 (0x465805) and by the cycle key 0x465A60 (0x465B1A) — the last two only when the slot's OLD
+        // view is outside 2…7 (`cmp ax, 2 ; jl` / `cmp ax, 7 ; jle`, 0x4657EF…0x4657FF, 0x465B0A…0x465B14),
+        // before the new view is stored. The views 2…7 keep their own offset across a switch; the others
+        // (0, 1, 8…0x0F, 0x10…) leave it at the seed, which a view whose update never writes it (CircleCam,
+        // SplineCam, TVCam, BlimpCam, 0x10 / 0x11 / 0x12 / 0x13) then keeps for the pause orbit (0x461850) to turn.
+        // The switch is seen here as a change of the view since the last pass.
+        if self.slot_view.is_none_or(|old| old != view && !(0x02..=0x07).contains(&old)) {
+            self.chase_offset = Some((car_rot * Vec3::Z * -4.0, u16::MAX));
+        }
+        self.slot_view = Some(view);
         let ws = self.widescreen();
         let fov_of = |h: f32| nfs_game::camera::fov_y_window(nfs_game::camera::half_angle(h, ws, view), ws);
         self.camera.fov_y_radians = fov_of(nfs_game::camera::DEFAULT_HALF_ANGLE);
@@ -2754,13 +2846,15 @@ impl App {
         // eye that the view updates keep — 0x461590 (chase) writes `[+0x24] = car+0x330 + [+0x08]`
         // (0x4616D3…0x461708); the sibling view updates 0x461A30 / 0x461E80 / 0x4623D0 take its address
         // too, and SetSlotView's 0x465CF0 seeds it — so the eye minus the car before the build's pushes
-        // is that offset (CONFIRMED 2026-09-30, for the chase-type views). APPROXIMATION,
-        // narrowed: a view whose update does not write it (the trackside ones) keeps another view's
-        // value in the original; the port takes its own eye's offset there (not traced).
+        // is that offset (CONFIRMED 2026-09-30, for the chase-type views). A view whose update does not
+        // write it (CircleCam, SplineCam, TVCam, BlimpCam, 0x10…0x13) leaves in the slot what the last writer or
+        // the seed put there: `chase_offset`, which the seed 0x465CF0 (see the SetSlotView note above) fills with
+        // `-4 · car forward` on leaving a view outside 2…7 (CLOSED 2026-10-02, WP-R) — the orbit turns that, not the
+        // eye's own offset.
         // (`cmp [0x5E99F4], 2 ; jge`, 0x463C75: a stream run out is a replay too)
         let replaying = self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted));
         if self.vehicle.is_some() && self.hud_dialog_up() && !replaying && !matches!(view, 0x00 | 0x01 | 0x0E) {
-            let base = *self.orbit.base.get_or_insert(self.camera.position - car_pos);
+            let base = *self.orbit.base.get_or_insert(self.chase_offset.map_or(self.camera.position - car_pos, |(o, _)| o));
             self.orbit.yaw = self.orbit.yaw.wrapping_add(self.orbit.step);
             let turn = Quat::from_rotation_y(self.orbit.yaw as f32 / 1024.0 * std::f32::consts::TAU);
             let eye = car_pos + turn * base;

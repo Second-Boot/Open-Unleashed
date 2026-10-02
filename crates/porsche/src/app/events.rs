@@ -87,6 +87,9 @@ impl ApplicationHandler for App {
         if self.idle_movie_due && self.intro.is_none() {
             self.start_idle_movie();
         }
+        if matches!(event, WindowEvent::RedrawRequested) {
+            self.sync_gamma();
+        }
         if self.intro.is_some() {
             self.intro_event(event_loop, event);
             return;
@@ -283,7 +286,7 @@ impl ApplicationHandler for App {
                 // its quit question or a post-race page is up: the menu is left through its own
                 // buttons (0x42A6A0), and leaving the race through quit and its question, as
                 // 0x426154 does. *(Until 2026-09-26 the port's pause key backed out of the
-                // question or resumed — an APPROXIMATION of a key the original does not have.)*
+                // question or resumed — an approximation of a key the original does not have.)*
                 // Once the pages have closed it opens the menu, whose quit leaves
                 let dialog_up = self.paused || (self.results.is_some() && self.result_pages().get(self.results_page as usize).is_some());
                 if self.vehicle.is_some() && self.fe.race_game_type == Some(3) {
@@ -574,6 +577,9 @@ impl ApplicationHandler for App {
                     && let Some((_, name, f)) = self.fe.layout_preview.as_ref().and_then(|l| l.bar_at(cx, cy))
                 {
                     self.set_accessor_fraction(&name, f);
+                    // the bar's draw reads its accessor every frame (0x4CA724); the port's fill is set
+                    // at bind time, so set it again
+                    self.bind_indicator_bars();
                 }
             }
             WindowEvent::CursorLeft { .. } => self.fe.cursor = None,
@@ -709,6 +715,7 @@ impl ApplicationHandler for App {
                 }
                 if halted {
                     self.accumulator = Duration::ZERO;
+                    self.ff_stop_all();
                 }
                 // **An input-exchange race's frame driver** (0x415455…0x415495, 0x415BD4): the ticks that
                 // run are the ones the frames received and the host-synchronised clock allow, not the

@@ -42,7 +42,11 @@
 //! (0x596080, sequence `0xFFFD`, the ack `conn+0x5E`) when it has run out, and it is rearmed to
 //! `TIMER_FREQ` — a bare ack every second for the life of the connection.
 //!
-//! What the port adds, and says so, is in [`Conn::send_queued`] (the host's backlog); a client's queue is [`crate::outbox`].
+//! The layer has **no queue of its own** (closed 2026-10-02): 0x595C40 answers 0 when the pool of seven is
+//! empty (0x595C58) and what sits in front of it is the original's own send queue — the client's
+//! [`crate::outbox`] (0x48AD70 / 0x48AE30) and the host's per-peer [`crate::outbox::PeerQueue`] (0x48A3D0 / 0x48A4E0),
+//! both stop-and-wait, a refused head kept and retried on the next 32 Hz turn; the room's frame sender 0x48B6B0 tests
+//! the return (0x48B961) and holds the frame.
 
 use crate::data::SEQ_WRAP;
 use std::collections::{BTreeMap, VecDeque};
@@ -123,8 +127,6 @@ pub struct Conn {
     ack_due: i64,
     /// `conn+0xB8`
     buffered: BTreeMap<u16, Vec<u8>>,
-    /// Port glue, see [`Conn::send_queued`].
-    backlog: VecDeque<Vec<u8>>,
     pub stats: Stats,
 }
 
@@ -144,29 +146,23 @@ impl Conn {
             // `conn+0x2C` starts at −1: the first poll sends an ack
             ack_due: now,
             buffered: BTreeMap::new(),
-            backlog: VecDeque::new(),
             stats: Stats::default(),
         }
     }
 
     /// Would 0x595C40 take a reliable message now — is a packet free (0x595C58)?
     pub fn can_send(&self) -> bool {
-        self.free > 0 && self.backlog.is_empty()
+        self.free > 0
     }
 
-    /// Packets free on the pool (`conn+0x60`), less the messages held back.
+    /// Packets free on the pool (`conn+0x60`).
     pub fn room(&self) -> usize {
-        if self.backlog.is_empty() { self.free } else { 0 }
+        self.free
     }
 
     /// Reliable messages sent and not acknowledged yet.
     pub fn in_flight(&self) -> usize {
         self.sent.len()
-    }
-
-    /// Messages the port is holding back (glue).
-    pub fn queued(&self) -> usize {
-        self.backlog.len()
     }
 
     /// `conn+0x5E` — the last sequence delivered in order, which every frame carries.
@@ -220,21 +216,6 @@ impl Conn {
         frame.extend_from_slice(body);
         self.stamp(now);
         frame
-    }
-
-    /// **PORT GLUE (APPROXIMATION, host only since AK 2026-09-30).** A reliable send for a caller that has no way
-    /// to react to "returned 0": with the pool empty, or messages already waiting, the message is held (in
-    /// order) and goes out from [`Conn::poll`] as the pool frees. The original's client does this with the send
-    /// queue in front of the pool, [`crate::outbox`] (0x48AD70 / 0x48AE30, stop-and-wait), which
-    /// [`crate::session::Net::send_game_to`] now runs for a client. A host's messages go through the room's per-link
-    /// sender (0x48A3D0 / 0x48A4E0 → 0x55C270), whose callers test the return (0x48B961) or drop on a refusal; the
-    /// port's room calls have no such handling, so the host's sends keep this backlog.
-    pub fn send_queued(&mut self, body: &[u8], now: i64) -> Option<Vec<u8>> {
-        if self.free == 0 || !self.backlog.is_empty() {
-            self.backlog.push_back(body.to_vec());
-            return None;
-        }
-        self.send(body, now)
     }
 
     /// **0x595740 / 0x595950 / 0x595B50.** One frame in; the messages it delivers, in order.
@@ -380,12 +361,6 @@ impl Conn {
             self.ack_due = now + TICK_HZ;
             out.push(f);
         }
-        while self.free > 0 {
-            let Some(b) = self.backlog.pop_front() else { break };
-            if let Some(f) = self.send(&b, now) {
-                out.push(f);
-            }
-        }
         out
     }
 }
@@ -444,7 +419,7 @@ mod tests {
         for tick in 0..20_000 {
             // 16 messages a second one way, an unreliable sample the other (which carries the acks)
             if tick % 8 == 0 && sent < 400 {
-                if let Some(f) = p.a.send_queued(&sent.to_be_bytes(), p.now) {
+                if let Some(f) = p.a.send(&sent.to_be_bytes(), p.now) {
                     p.to_b(f, 10);
                 }
                 sent += 1;
@@ -461,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn the_eighth_unacknowledged_message_is_refused_and_the_queue_holds_it() {
+    fn the_eighth_unacknowledged_message_is_refused() {
         let mut c = Conn::new(0);
         for i in 0..POOL as u8 {
             assert!(c.send(&[i], 0).is_some());
@@ -469,8 +444,6 @@ mod tests {
         assert!(!c.can_send());
         assert!(c.send(&[9], 0).is_none());
         assert_eq!(c.stats.refused, 1);
-        assert!(c.send_queued(&[9], 0).is_none());
-        assert_eq!(c.queued(), 1);
     }
 
     #[test]

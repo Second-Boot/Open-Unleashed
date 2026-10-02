@@ -180,7 +180,7 @@ impl App {
             // `[this+0x29C]` is the accessor's row (slot 0x28 = `[+0x18]`), and cancel hands that
             // row back to slot 11 (0x4C4A08) — for an `OwnedCar.*` accessor the row it kept, not the
             // row of the car's colour
-            self.fe.picker_prev = if base.starts_with("OwnedCar.") && self.garage_car().is_some() {
+            self.fe.picker_prev = if (base.starts_with("OwnedCar.") && self.garage_car().is_some()) || self.generic_colour_has_row(base) {
                 self.colour_row_of(base).map(Ok)
             } else {
                 self.colour_state(base).map(|(_, at, custom)| custom.map_or(Ok(at), Err))
@@ -373,6 +373,10 @@ impl App {
             "OwnedCar.ExtColour" | "OwnedCar.IntColour" | "OwnedCar.S1Colour" | "OwnedCar.S2Colour"
             | "GenericCar.Colour" | "DealerCar.Colour" | "DealerCar.IntColour" => {
                 let (cols, _, _) = self.colour_state(base)?;
+                // this build is the colour box's tick (`bind_lists`), whose head runs the
+                // accessor's slot 2 — the recount 0x4B9350 (0x4C5460 → 0x4BD230) — before
+                // the row is read
+                self.colour_recount(base);
                 let (rows, _) = self.colour_rows(cols, 0);
                 Some((rows, self.colour_row_of(base)))
             }
@@ -629,7 +633,11 @@ impl App {
             // words are 2 = the port's 2 from the start, while the lens flare and the sky are 0 in the
             // globals where the port's accessor default is 1 / 2: the accessors' own state (what the
             // Graphics screen shows, `DRIVER` pass 12/13: lens on, sky high) is not the same thing as these
-            // globals until something commits it. The Graphics screen of a truly fresh profile could not be
+            // globals until something commits it. *(2026-10-02, what commits it is the race
+            // launch — 0x4ED5D0 → 0x4ED653 → 0x4B7F10 dumps every accessor with a registry id into
+            // the option stream through slot 1 = 0x4BC3D0, and 0x4B4DA0 / 0x4B4B80 store it into the
+            // cleared block, so a race started from the front end has `[0x657D7C]` = this accessor's
+            // selection; `RE/notes/lighting.md` §7. `lens_flare.rs` reads it at race load.)* The Graphics screen of a truly fresh profile could not be
             // reached (mouse buttons never reached the game on the server), so the defaults stay the port's.
             // the race HUD's option block `cfg2` is the profile's `XXhud2XX.hud` — a copy of the
             // shipped `nfs5-2.hud`'s record for the layout — and it, not `fe.txt`, is where a
@@ -702,27 +710,49 @@ impl App {
         (layout, w, h)
     }
 
-    /// Display option `slot` (cfg2 `+0x30 + 4·slot`) of the current record — the layout's own 640×480
-    /// record's value while the (layout, resolution) record has not been made (0x41EBF0 copies it).
+    /// Display option `slot` (cfg2 `+0x30 + 4·slot`) as the Display screen's accessor holds it: the
+    /// value changed since `INUSE` filled it (0x4CB650), else the current record's — the layout's own
+    /// 640×480 record's while the (layout, resolution) record has not been made (0x41EBF0 copies it).
     fn hud_cfg_get(&self, slot: usize) -> Option<usize> {
         self.hud_cfg_ensure();
         let (layout, w, h) = self.hud_cfg_key();
         let cache = self.hud_cfg.borrow();
-        cache.cfg.as_ref()?.opts_for(layout, w, h).map(|o| o[slot] as usize)
+        cache.cfg.as_ref()?.accessor_value(layout, w, h, slot).map(|v| v as usize)
     }
 
-    /// 0x4CB860's setter for Display option `slot` on the current record (made first when missing,
-    /// 0x41EBF0), then 0x41EA50: both files rewritten. **Timing APPROXIMATION:** the original writes at
-    /// the Display screen's apply (slot 9 0x4CB820) and when its layout combo changes (0x4CB9A0); the
-    /// port writes at each change — the same bytes, sooner.
+    /// A Display accessor's setter: the accessor holds the value (`staged`) and nothing is written
+    /// (N02, read 2026-10-02). The record and both files are written by 0x4CB860 → 0x41EA50 at
+    /// exactly two moments: the HUD widget's `NOTINUSE` ([`Self::hud_cfg_apply`], slot 22 0x4CB820)
+    /// and a change of the layout combo ([`Self::hud_cfg_layout_changed`], 0x4CB9A0). A change that
+    /// arrives with the widget not yet told `INUSE` arms it, so it is never lost.
     pub(crate) fn hud_cfg_set(&mut self, slot: usize, v: usize) {
+        self.hud_cfg_ensure();
+        let mut cache = self.hud_cfg.borrow_mut();
+        let Some(cfg) = cache.cfg.as_mut() else { return };
+        cfg.armed = true;
+        cfg.staged[slot] = Some(v as u32);
+    }
+
+    /// The HUD widget's `INUSE` (slot 21 0x4CB650, the screen shown or uncovered): flag armed, the
+    /// accessors refilled from the current record — what they held is dropped.
+    ///
+    /// `INUSE` also runs **HUD_init** (0x4CB6E4 → 0x41E170, the first of a session: `[0x60C978]` 0):
+    /// 0x41F7A0 searches the tables for the (layout, resolution) record and, when there is none,
+    /// 0x41EBF0 appends the copy and **writes both files** at once (the two 0x59E130 calls at the tail of 0x41EBF0) — so
+    /// the first Options visit at a resolution the profile has no record for creates
+    /// `<Name>1.hud` / `<Name>2.hud` even when nothing is changed (N02a). At 640×480 the shipped
+    /// tables (the `XXhud?XX` fallback) hold all four layouts' records: nothing is created.
+    pub(crate) fn hud_cfg_in_use(&mut self) {
         self.hud_cfg_ensure();
         let (layout, w, h) = self.hud_cfg_key();
         let mut cache = self.hud_cfg.borrow_mut();
         let who = cache.who.clone();
         let Some(cfg) = cache.cfg.as_mut() else { return };
-        let i = cfg.record(layout, w, h);
-        cfg.set_opt(i, slot, v as u32);
+        cfg.in_use();
+        if cfg.count() == 0 || cfg.find(layout, w, h).is_some() {
+            return;
+        }
+        cfg.record(layout, w, h);
         cache.from_profile = true;
         if let Some((dir, name)) = who
             && let Some(cfg) = cache.cfg.as_ref()
@@ -730,6 +760,45 @@ impl App {
         {
             tracing::warn!(error = %e, "could not write the profile's HUD option files");
         }
+    }
+
+    /// 0x4CB860 on the current record, then 0x41EA50: both files written. `disarm` is the widget's
+    /// `NOTINUSE` (0x4CB820 tests `[this+0x218]` and clears it); the layout change (0x4CB9A0) stores
+    /// whatever the screen shows and stays armed.
+    fn hud_cfg_store(&mut self, disarm: bool) {
+        self.hud_cfg_ensure();
+        let (layout, w, h) = self.hud_cfg_key();
+        let mut cache = self.hud_cfg.borrow_mut();
+        let who = cache.who.clone();
+        let Some(cfg) = cache.cfg.as_mut() else { return };
+        if disarm {
+            if !cfg.armed {
+                return;
+            }
+            cfg.armed = false;
+        }
+        cfg.commit(layout, w, h);
+        cache.from_profile = true;
+        if let Some((dir, name)) = who
+            && let Some(cfg) = cache.cfg.as_ref()
+            && let Err(e) = hud_cfg::save(cfg, &dir, &name)
+        {
+            tracing::warn!(error = %e, "could not write the profile's HUD option files");
+        }
+    }
+
+    /// Slot 22 0x4CB820 — the Options screen (which holds `display.lay`'s `NFS5.HUD`) is destroyed
+    /// or its layer closed (`NOTINUSE`, the broadcast of 0x4D2570's swap and 0x4D5610): the options
+    /// are stored when the widget was told `INUSE`.
+    pub(crate) fn hud_cfg_apply(&mut self) {
+        self.hud_cfg_store(true);
+    }
+
+    /// 0x4CB9A0: the layout combo's value differs from the one the widget last drew (`[this+0x21C]`):
+    /// the options are stored on the record of the layout that was current — call this **before**
+    /// `Display.ScreenLayout` takes its new value — and the accessors then read the new layout's.
+    pub(crate) fn hud_cfg_layout_changed(&mut self) {
+        self.hud_cfg_store(false);
     }
 
     /// **Port-only migration:** a profile whose `.sav` carries Display values but which has no
