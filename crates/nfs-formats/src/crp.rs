@@ -568,7 +568,7 @@ impl Crp {
                     });
                 }
             }
-            primitives.push(Primitive { lod, prim_type: rec.prim_type, flags: rec.flags, material: rec.material, sphere: rec.sphere, positions, normals, uvs, colors, vertex_indices, uv_indices, vt_first });
+            primitives.push(Primitive { lod, prim_type: rec.prim_type, flags: rec.flags, material: rec.material, key_hi: rec.key_hi, sphere: rec.sphere, positions, normals, uvs, colors, vertex_indices, uv_indices, vt_first });
         }
         Ok(ArticleGeometry { name, base, transform, transforms, primitives })
     }
@@ -935,6 +935,12 @@ pub struct PrimitiveRecord {
     pub prim_type: u16,
     pub flags: u16,
     pub material: u16,
+    /// The word `+6`: the high half of the view-list key. The static drawer 0x450DE0 queues a flag-2
+    /// part into the ascending list `+4` under `([pr+4] & 0xFFFF0000) + round(d²)` (0x450F37…0x450F44)
+    /// — 0x8000 on most parts, 0x8001 / 0x8002 on layered foliage (autobahn, farmland, foothills,
+    /// forest, castle: `nfs-game/examples/fringe_w6.rs`), which so draws after every 0x8000 part
+    /// (`RE/notes/thrash.md` §6e).
+    pub key_hi: u16,
     pub sphere: [f32; 4],
     pub streams: Vec<StreamDesc>,
     /// (tag, byte offset in index area)
@@ -982,6 +988,7 @@ impl PrimitiveRecord {
             prim_type: u16_le(b, 0, "pr type")?,
             flags: u16_le(b, 2, "pr flags")?,
             material: u16_le(b, 4, "pr material")?,
+            key_hi: u16_le(b, 6, "pr key word")?,
             sphere: [f32_le(b, 8, "pr")?, f32_le(b, 12, "pr")?, f32_le(b, 16, "pr")?, f32_le(b, 20, "pr")?],
             streams,
             index_arrays,
@@ -1011,6 +1018,8 @@ pub struct Primitive {
     pub prim_type: u16,
     pub flags: u16,
     pub material: u16,
+    /// [`PrimitiveRecord::key_hi`]: the record's word `+6`, the high half of its view-list key.
+    pub key_hi: u16,
     /// The record's bounding sphere, centre and radius (`+8`).
     pub sphere: [f32; 4],
     pub positions: Vec<[f32; 3]>,

@@ -624,7 +624,7 @@ mod quad_identity_tests {
     use nfs_formats::crp::{ArticleGeometry, Primitive};
 
     fn primitive(prim_type: u16, positions: Vec<[f32; 3]>) -> Primitive {
-        Primitive { lod: 0, prim_type, flags: 0, material: 0, sphere: [0.0; 4], positions, normals: vec![], uvs: vec![], colors: vec![], vertex_indices: vec![], uv_indices: vec![], vt_first: 0 }
+        Primitive { lod: 0, prim_type, flags: 0, material: 0, key_hi: 0x8000, sphere: [0.0; 4], positions, normals: vec![], uvs: vec![], colors: vec![], vertex_indices: vec![], uv_indices: vec![], vt_first: 0 }
     }
 
     /// One `prim_type == 4` quad and one `prim_type == 3` triangle in the same article: through

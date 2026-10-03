@@ -243,9 +243,10 @@ pub struct TrackArticleGpu {
     /// the `.crp` article index — [`TrackWorld::cull_articles`]'s
     pub article: usize,
     pub lods: Vec<(u8, Vec<DrawItem>)>,
-    /// per entry of [`Self::lods`], per draw item: its part's flag word and sphere centre in the
-    /// world — what the static drawer queues it by ([`TrackWorld::visible_items`])
-    pub parts: Vec<Vec<(u16, Vec3)>>,
+    /// per entry of [`Self::lods`], per draw item: its part's flag word, its key word (`pr+6`, the
+    /// high half of the list-`+4` key) and its sphere centre in the world — what the static drawer
+    /// queues it by ([`TrackWorld::visible_items`])
+    pub parts: Vec<Vec<(u16, u16, Vec3)>>,
 }
 
 /// Where [`TrackWorld::animate_uv`] writes: an item of [`TrackWorld::items`] or one of a track
@@ -289,8 +290,10 @@ enum QueueUnit {
 /// in the order the flush 0x466660 draws them (`RE/RENDERING.md` "The view's lists").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ViewList {
-    /// `+4` (0x4668F0): ascending by key, under the alpha test `GREATER 10` (0x46666D) — the parts
-    /// with `pr` flag 2
+    /// `+4` (0x4668F0): ascending by key (the insert goes left on `key < node`, 0x466931 `cmp / jae`;
+    /// the flush starts at the header's leftmost `+8`, 0x50E2C0, and steps in order, 0x423840), under
+    /// the alpha test `GREATER 10` (0x46666D) — the parts with `pr` flag 2, keyed
+    /// `(pr word +6 << 16) + round(d²)`
     Near,
     /// `+0xC` (0x466A90): descending by key, `GREATER 10` again (0x466703) — the parts with flag 1
     /// (and flag 4 while `[0x6197E6]`), the instance drawer's whole items (0x44FFC0) and the cars
@@ -1673,7 +1676,7 @@ impl TrackWorld {
                     (*lod, meshes.iter().map(|mm| DrawItem::new(r.upload_mesh(&mm.mesh), material_for(r, mm.material), art.transform)).collect())
                 })
                 .collect();
-            let parts = art.lods.iter().map(|(_, meshes)| meshes.iter().map(|mm| (mm.flags, art.transform.transform_point3(Vec3::from(mm.centre)))).collect()).collect();
+            let parts = art.lods.iter().map(|(_, meshes)| meshes.iter().map(|mm| (mm.flags, mm.key_hi, art.transform.transform_point3(Vec3::from(mm.centre)))).collect()).collect();
             track_lods.push(TrackArticleGpu { article: art.index, lods, parts });
         }
         let mut items = Vec::new();
@@ -2258,7 +2261,13 @@ impl TrackWorld {
     /// [`Self::track_draw_lists`] into reusable buffers (cleared first): the per-frame callers keep one
     /// [`TrackLists`] so the lists do not allocate again every frame.
     pub fn track_draw_lists_into(&self, draws: &[Option<ArticleDraw>], eye: Vec3, lists: &mut TrackLists) {
-        let key = |c: Vec3| (c - eye).length_squared().round_ties_even() as u32;
+        // 0x450EF8…0x450F25: `fistp` of the square distance from the eye to the part's centre
+        // (round to nearest even; out of the i32 range the x87 stores the integer indefinite
+        // 0x80000000)
+        let key = |c: Vec3| {
+            let d2 = (c - eye).length_squared().round_ties_even();
+            if d2 < 2_147_483_648.0 { d2 as i32 as u32 } else { 0x8000_0000 }
+        };
         let TrackLists { near, far, rest, units } = lists;
         near.clear();
         far.clear();
@@ -2318,16 +2327,22 @@ impl TrackWorld {
                             let Some(k) = a.lods.iter().position(|(n, _)| *n == lod) else { continue };
                             let parts = a.parts.get(k).map(|p| p.as_slice()).unwrap_or(&[]);
                             for (i, item) in a.lods[k].1.iter().enumerate() {
-                                let (flags, centre) = parts.get(i).copied().unwrap_or((2, Vec3::ZERO));
+                                let (flags, key_hi, centre) = parts.get(i).copied().unwrap_or((2, 0x8000, Vec3::ZERO));
                                 // `FakeSortMode::PerItem`'s fold (0x449AB2, `[0x61975C] < 0x2710`
                                 // unsigned): the drawer writes the queued entry's own `+0xC` — this same
-                                // `round(d²)` view-list key — to the global just before each draw
-                                // (0x450CE2) — see `DrawItem::fakesort_near`'s doc
+                                // view-list key — to the global just before each draw (0x450CE2, `edx =
+                                // [item+0xC]`) — see `DrawItem::fakesort_near`'s doc
                                 match c.drawer {
                                     ArticleDrawer::Static | ArticleDrawer::MidGround { .. } => match part_list(flags) {
                                         Some(ViewList::Near) => {
-                                            let k = key(centre);
-                                            near.push((k, DrawItem { fakesort_near: k < FAKESORT_NEAR_KEY, ..*item }));
+                                            // list `+4` only: the part's word `+6` is the key's high half,
+                                            // `([pr+4] & 0xFFFF0000) + round(d²)` (0x450F37…0x450F44, 32-bit
+                                            // wrap) — 0x8000 on most parts, so a near entry's key is never
+                                            // under 0x2710 for the fold; 0x8001 / 0x8002 (layered foliage)
+                                            // draw after every 0x8000 part. Read live 2026-10-03 (gdb at
+                                            // 0x450F4C / 0x46668D, autobahn: the flush walks the keys
+                                            // ascending, the 0x8001 / 0x8002 parts after the rest; `thrash.md` §6e)
+                                            let k = ((key_hi as u32) << 16).wrapping_add(key(centre));                                            near.push((k, DrawItem { fakesort_near: k < FAKESORT_NEAR_KEY, ..*item }));
                                         }
                                         Some(ViewList::Far) => {
                                             let k = key(centre);

@@ -19,6 +19,10 @@ pub struct MaterialMesh {
     /// static drawer 0x450DE0 files a part into the view's lists by it (0x450F30…0x450F9B,
     /// `RE/RENDERING.md` "The view's lists").
     pub flags: u16,
+    /// The `pr` record's word `+6` — the high half of its key in the ascending list `+4`
+    /// (`([pr+4] & 0xFFFF0000) + round(d²)`, 0x450F37…0x450F44) — of the group's first part in
+    /// [`article_meshes`].
+    pub key_hi: u16,
     /// The `pr` record's sphere centre (`+8`), in the article's frame — the point whose square
     /// distance from the eye keys the part in those lists (0x450EF8…0x450F25).
     pub centre: [f32; 3],
@@ -50,6 +54,7 @@ pub fn article_meshes(art: &ArticleGeometry, lod: u8, skipped: &mut usize) -> Ve
             material: p.material,
             mesh: MeshData::default(),
             flags: p.flags,
+            key_hi: p.key_hi,
             centre: [p.sphere[0], p.sphere[1], p.sphere[2]],
             patch_kind: PatchKind::Triangle,
             prim_index: usize::MAX,
@@ -74,7 +79,7 @@ pub fn article_parts(art: &ArticleGeometry, lod: u8, skipped: &mut usize) -> Vec
         // a time (`nfs_physics::collision::TriangleGrid::patches`), so one `patch_kind` per
         // primitive is enough — every quad in a quad-list record shares it.
         let patch_kind = if p.prim_type == 4 { PatchKind::Quad } else { PatchKind::Triangle };
-        out.push(MaterialMesh { material: p.material, mesh, flags: p.flags, centre: [p.sphere[0], p.sphere[1], p.sphere[2]], patch_kind, prim_index: i });
+        out.push(MaterialMesh { material: p.material, mesh, flags: p.flags, key_hi: p.key_hi, centre: [p.sphere[0], p.sphere[1], p.sphere[2]], patch_kind, prim_index: i });
     }
     out
 }
