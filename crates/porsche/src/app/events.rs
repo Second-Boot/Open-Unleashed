@@ -108,6 +108,9 @@ impl ApplicationHandler for App {
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            // PORT-DEVIATION D17 (FOCUS-INPUT): key / modifier releases that happen while another window has the
+            // focus never reach this one (macOS Cmd+Shift+5), so a focus change forgets every held key
+            WindowEvent::Focused(_) => self.input.release_all(),
             WindowEvent::KeyboardInput { event, .. } => {
                 self.input.key_event(&event);
                 // 0x4D2850: the callback list sees the key, then a screen or the background in

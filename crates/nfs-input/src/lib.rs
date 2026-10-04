@@ -452,6 +452,15 @@ impl InputState {
         let k = self.held(Action::Brake) as i32 as f32;
         self.pad.map(|p| p.brake.max(k)).unwrap_or(k)
     }
+    /// The window lost or regained the keyboard focus (FOCUS-INPUT): forget every held key, action and
+    /// pending press. PORT-DEVIATION D17 (PORT-DEVIATIONS.md): the release events of keys / modifiers
+    /// held at that moment never arrive (macOS: Cmd+Shift+5 leaves Cmd / Shift "down").
+    pub fn release_all(&mut self) {
+        self.held.clear();
+        self.pressed.clear();
+        self.keys_down.clear();
+        self.mouse_delta = (0.0, 0.0);
+    }
     /// Call at the end of each tick.
     pub fn end_tick(&mut self) {
         self.pressed.clear();
@@ -462,6 +471,22 @@ impl InputState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FOCUS-INPUT: a focus change forgets the held keys, actions and pending presses.
+    #[test]
+    fn focus_change_releases_everything() {
+        let mut st = InputState::default();
+        st.press(Action::Throttle);
+        st.keys_down.insert(0x2A);
+        st.keys_down.insert(0x1D);
+        st.mouse_delta = (3.0, 4.0);
+        assert!(st.held(Action::Throttle) && !st.keys_down.is_empty());
+        st.release_all();
+        assert!(!st.held(Action::Throttle));
+        assert!(!st.take_pressed(Action::Throttle));
+        assert!(st.keys_down.is_empty());
+        assert_eq!(st.mouse_delta, (0.0, 0.0));
+    }
 
     /// The shipped `fe.txt`'s binding lines (lines 397…436) and 0x51D1D0's keyboard rows give
     /// every action a key, and it is the one [`default_binding`] names.
