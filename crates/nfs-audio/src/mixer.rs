@@ -1930,7 +1930,10 @@ impl Offline {
             self.core.fill(&mut buf, 2, 44100.0);
             let bytes: Vec<u8> = buf.iter().flat_map(|x| x.to_le_bytes()).collect();
             use std::io::Write;
-            DUMP.get().unwrap().lock().unwrap().write_all(&bytes).unwrap();
+            // TEST GLUE: a muted run (`AudioOutput::new`, no `NFS_AUDIO_DUMP`) mixes the same way and writes nothing
+            if let Some(dump) = DUMP.get() {
+                dump.lock().unwrap().write_all(&bytes).unwrap();
+            }
         }
         self.core.publish();
     }
@@ -2037,6 +2040,16 @@ impl AudioOutput {
             DUMP.get_or_init(|| Mutex::new(std::fs::File::create(&path).expect("NFS_AUDIO_DUMP")));
             let (tx, _) = Tx::new(44100, true);
             tracing::warn!(path, "audio: offline dump (NFS_AUDIO_DUMP), no device");
+            return Ok(Self { _stream: None, tx, rate: 44100 });
+        }
+        // TEST GLUE: scripted / test runs are silent — `NFS_MUTE=1`, or any `NFS_NO_FOCUS` run (the scripted
+        // runs' marker) unless `NFS_SOUND=1` asks for the device (the audio tasks). No device is opened: the
+        // mixer runs offline on the calling thread exactly as under `NFS_AUDIO_DUMP`, only nothing is written,
+        // so the game's calls into the mixer are the same as with a device.
+        let var = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty() && v != "0");
+        if !var("NFS_SOUND") && (var("NFS_MUTE") || var("NFS_NO_FOCUS")) {
+            let (tx, _) = Tx::new(44100, true);
+            tracing::info!("audio: muted test run (NFS_MUTE / NFS_NO_FOCUS; NFS_SOUND=1 for the device), no device");
             return Ok(Self { _stream: None, tx, rate: 44100 });
         }
         let host = cpal::default_host();

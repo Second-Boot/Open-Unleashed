@@ -97,3 +97,15 @@ fn a_racers_body_origin_is_half_the_model_box_up() {
         assert!((th - half * 0.4).length() < 1e-5 && (tp[0].y + th.y).abs() < 0.01, "{model}: tiny");
     }
 }
+
+/// A traffic car's `BndP` quad is lowered by its **LOD-1** box's `car+0x3AC` (0x445090 slot `[0]`,
+/// 0x4421BE) — the traffic models have no LOD 5, which once lowered them by 0 and stood every
+/// traffic car `half.y` too low (the model is drawn `half.y` below the origin).
+#[test]
+fn traffic_quad_is_lowered_by_the_lod1_half_height() {
+    let Ok(paths) = GamePaths::locate() else { return };
+    let Ok(car) = CarAssets::load(&paths, "eden1") else { return };
+    let (pts, half) = nfs_game::world::traffic_body(&car);
+    assert!(half.y > 0.5, "{half:?}");
+    assert!(pts[..4].iter().all(|p| (p.y + half.y).abs() < 0.01), "{:?}", &pts[..4]);
+}

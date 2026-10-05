@@ -580,6 +580,22 @@ pub fn car_body(car: &CarAssets, tiny: bool) -> (Vec<Vec3>, Vec3) {
     (pts, half)
 }
 
+/// A **traffic** car's collision body as `RCar::load` leaves it: the same `BndP` points as
+/// [`car_body`], but lowered by `car+0x3AC` of **its own** box — 0x445090 takes a traffic car's box
+/// (`car+0x52C & 0x10`, 0x4450CC) from `[this+0xB0][0]`, LOD **1** ([`car_model_box`]`(.., 1)`), and
+/// the loader's `y −= car+0x3AC` (0x4421BE) reads that, not LOD 5's (the traffic models have no LOD 5
+/// at all, so [`car_body`] lowered them by 0). `half` is LOD 1's half box, never `× 0.4`
+/// (`.TINYCAR` is off for traffic).
+pub fn traffic_body(car: &CarAssets) -> (Vec<Vec3>, Vec3) {
+    let (lo, hi) = car_model_box(car, 1);
+    let half = (hi - lo) * 0.5;
+    let mut pts = car_body_points(car);
+    for p in &mut pts {
+        p.y -= half.y;
+    }
+    (pts, half)
+}
+
 /// What a car's reflection passes draw with, set per race.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CarEnv {
@@ -631,15 +647,17 @@ impl CarModel {
         // branch only (0x43AEA5…0x43AF6B; the front end's, 0x43B003, jumps past them), keyed on
         // the car's `.DRIVER` pick (`CarAssets::driver`).
         //
-        // The other two things that block writes (`car-model.md`) are **left to the style**, and
-        // deliberately: slot 42 (`SpoilerDown` / `SpoilerUp`) is zeroed by 0x43AEB2, which hides
-        // both halves of the pop-up spoiler until the animation channel picks one, and the port
-        // does not run that channel — so zeroing it would leave a hole in the engine lid where
-        // the style's own `42 = 1`, the retracted spoiler, belongs. Slot 41 is recomputed from
-        // the roof option in a race (0x43AE7A).
+        // The other things that block writes (`car-model.md`): slot 41 is recomputed from the roof option
+        // in a race (0x43AE7A), and **slot 42 (`SpoilerDown` / `SpoilerUp`) is zeroed by 0x43AEB2
+        // (`mov [esi+0x614], ebx`, ebx = 0), so neither half of the pop-up spoiler is drawn in a race**
+        // (the wing itself is the `SpoilerW` morph, animation 2, which the port runs: `update_animation`).
+        // *(Until 2026-10-05 this was left to the style's own `42 = 1` "because the port does not run the
+        // channel" — a mistake: `SpoilerDown` then sat coincident with the closed `SpoilerW` lid (z-fighting
+        // flicker on a damaged car) and, with the wing raised, showed as the black stair-step cavity under it.)*
         match race_roof {
             Some(v) => {
                 style.apply_race_roof(v);
+                style.geometry.insert(42, 0); // 0x43AEB2
                 style.apply_driver_detail(car.driver.driver, car.driver.no_driver, car.driver.factory_driver);
             }
             // slot 19's front-end branch, 0x43B003: slot 41 and slot 6 to 0

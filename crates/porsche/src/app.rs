@@ -122,6 +122,9 @@ pub(crate) struct App {
     /// before 0x468FB0) and setting a pass up, which this port does not model — its own loading is
     /// not the original's.
     pub(crate) hud_clock_base: f64,
+    /// the window's last seen scale factor ([`App::hud_geometry`]): `start_race` takes the renderer AND the window
+    /// out of the `App` for the whole load, and the loading screen drawn meanwhile needs both (LOADSEAM)
+    pub(crate) hud_scale: std::cell::Cell<f32>,
     /// the race HUD trays' slide: state and the `[0x606AC8]` stamp of its last transition
     pub(crate) tray_slide: (u8, u64),
     /// `HTime`'s and `HMultiTime`'s own state in a mission's playback (0x425A87…0x425ADA); outside

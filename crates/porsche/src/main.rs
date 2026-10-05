@@ -812,6 +812,7 @@ fn main() -> Result<()> {
         pause_ticks: 0.0,
         pause_offset: 0.0,
         hud_clock_base: 0.0,
+        hud_scale: std::cell::Cell::new(1.0),
         tray_slide: (0, 0),
         time_trays: (0, 0),
         map_slide: (0, 0),

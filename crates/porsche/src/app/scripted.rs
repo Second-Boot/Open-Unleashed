@@ -655,6 +655,15 @@ impl App {
             return;
         }
         let out = format!("{path}.t{}.png", self.tick);
+        // **TEST GLUE** `NFS_TEST_SPOILER=1`: the player's pop-up wing (animation 2, 993 `SpoilerW`) at its last frame for the
+        // still. A scripted run draws no frames between its shots, so the wing's 2000 ms easer (one step per drawn frame,
+        // `CarModel::update_animation`, gate 22.222 m/s) never runs; this writes the end of its travel directly. Unset = the
+        // original's path; the simulation is not touched.
+        if std::env::var_os("NFS_TEST_SPOILER").is_some()
+            && let (Some(c), Some(r)) = (self.car_model.as_mut(), self.renderer.as_mut())
+        {
+            c.set_anim(r, 2, c.anim_length(2) as f32);
+        }
         let (w, h, _) = shot_geometry();
         if let Some(r) = self.renderer.as_mut()
             && let Ok(rgba) = r.render_to_image(&self.scene, &self.camera, w, h)

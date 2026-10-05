@@ -650,8 +650,27 @@ impl App {
             return t;
         }
         let (w, h) = self.renderer.as_ref().map_or((640, 480), |r| r.size());
-        let s = self.window.as_ref().map_or(1.0, |w| w.scale_factor() as f32).max(1.0);
-        (w, h, s)
+        (w, h, self.window_scale())
+    }
+
+    /// The window's scale factor; while `start_race` has the window taken out of the `App` the last one seen
+    /// (the loading screen of a race start, LOADSEAM: it fell back to 1 and 640x480 and drew the picture
+    /// stretched over the real target with black gaps between the tiles).
+    fn window_scale(&self) -> f32 {
+        if let Some(w) = self.window.as_ref() {
+            self.hud_scale.set(w.scale_factor() as f32);
+        }
+        self.hud_scale.get().max(1.0)
+    }
+
+    /// [`App::hud_geometry`] for a renderer that is not in `self.renderer` (the one `start_race` holds locally
+    /// through the whole load): that renderer's surface, the window's scale.
+    pub(crate) fn hud_logical_on(&self, r: &Renderer) -> (u32, u32) {
+        let (w, h, s) = self.shot_target.unwrap_or_else(|| {
+            let (w, h) = r.size();
+            (w, h, self.window_scale())
+        });
+        (((w as f32 / s).round() as u32).max(1), ((h as f32 / s).round() as u32).max(1))
     }
 
     /// The HUD's logical resolution in pixels, `W = physical W / scale`, `H = physical H / scale`
@@ -1134,6 +1153,18 @@ impl App {
         {
             self.camera.target = home + Vec3::Y * 1.0;
             self.camera.position = home + Vec3::new(6.0, 2.5, 5.0);
+        }
+        // **TEST GLUE** (not in the original) `NFS_TRAFFIC_VIEW=k[,d]`: the camera `d` m (default 7) off the k-th active
+        // traffic car's body, looking at it — close stills of the traffic's ride height
+        if let Ok(v) = std::env::var("NFS_TRAFFIC_VIEW") {
+            let n: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            let k = n.first().copied().unwrap_or(0.0) as usize;
+            let d = n.get(1).copied().unwrap_or(7.0);
+            if let Some(c) = self.road.traffic.as_ref().and_then(|t| t.cars.iter().filter(|c| c.active).nth(k)) {
+                let o = c.draw_origin();
+                self.camera.target = o + Vec3::Y * 0.5;
+                self.camera.position = o + c.orientation.row(0) * d + Vec3::Y * 1.0;
+            }
         }
         // diagnostic: `NFS_FLARE_VIEW=k` puts the camera 8 m off the k-th `.scn` instance flare,
         // looking at it

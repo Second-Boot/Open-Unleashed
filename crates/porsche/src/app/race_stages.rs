@@ -725,9 +725,12 @@ impl App {
                                 self.road.traffic_models.push(model);
                                 // 0x445090: a traffic car (`car+0x52C & 0x10`, 0x4450CC) takes the
                                 // box of `[this+0xB0][0]`, LOD 1, origin included (0x43DE90)
-                                let (lo, hi) = nfs_game::world::car_model_box(&assets, 1);
-                                boxes.push((hi - lo) * 0.5);
-                                points.push(nfs_game::world::car_body(&assets, self.cheat_bits & (1 << 1) != 0).0);
+                                // the `BndP` points are lowered by that same `car+0x3AC` (0x4421BE,
+                                // `traffic_body`) — not by LOD 5's, which a traffic model lacks: they
+                                // sat at the origin's own height and the car stood `half.y` too low
+                                let (pts, half) = nfs_game::world::traffic_body(&assets);
+                                boxes.push(half);
+                                points.push(pts);
                                 let slot = self.road.traffic_models.len() - 1;
                                 template_slot.insert(id, slot);
                                 slot

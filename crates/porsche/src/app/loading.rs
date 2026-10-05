@@ -70,7 +70,7 @@ impl App {
         if !self.race_loading_step(r, step) {
             return;
         }
-        let (lw, lh) = self.hud_logical();
+        let (lw, lh) = self.hud_logical_on(r);
         let sprites = self.fe.race_loading.as_ref().map(|l| l.sprites(lw as f32, lh as f32)).unwrap_or_default();
         let scene = Scene { sprites, clear_color: [0.0, 0.0, 0.0, 1.0], ..Scene::default() };
         if let Err(e) = r.render(&scene, &self.camera) {
