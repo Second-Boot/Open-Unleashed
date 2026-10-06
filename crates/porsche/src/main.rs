@@ -23,6 +23,7 @@
 mod accessors;
 mod app;
 mod career_ui;
+mod diag;
 mod hud;
 mod hud_cfg;
 mod intro_run;
@@ -61,12 +62,15 @@ use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
-fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+fn main() {
+    diag::init();
+    if let Err(e) = run() {
+        diag::fatal(&e);
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let paths = GamePaths::locate()?;
     tracing::info!(root = %paths.root.display(), "located original game data");
     let args: Vec<String> = std::env::args().skip(1).collect();

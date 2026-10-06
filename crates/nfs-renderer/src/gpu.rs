@@ -320,7 +320,15 @@ impl Core {
             apply_limit_buckets: false,
         }))
         .context("no suitable GPU adapter")?;
+        // diagnostics (port-own, `porsche.log`): every adapter the instance sees, the chosen one with
+        // its features / limits, so a failure on another machine can be read from the log
+        for a in pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all())) {
+            let i = a.get_info();
+            tracing::info!(name = %i.name, backend = ?i.backend, device_type = ?i.device_type, driver = %i.driver, driver_info = %i.driver_info, vendor = format_args!("{:#06x}", i.vendor), device = format_args!("{:#06x}", i.device), "gpu adapter available");
+        }
         tracing::info!(adapter = ?adapter.get_info().name, backend = ?adapter.get_info().backend, "gpu adapter");
+        tracing::info!(info = ?adapter.get_info(), features = ?adapter.features(), "chosen adapter");
+        tracing::info!(limits = ?adapter.limits(), downlevel = ?adapter.get_downlevel_capabilities(), "chosen adapter limits");
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("nfs-renderer"),
             required_features: wgpu::Features::empty(),
