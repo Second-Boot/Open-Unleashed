@@ -192,7 +192,6 @@ pub struct MusicPlayer {
     /// `game.spl[0]` — the music trim (52 shipped, 80 compiled in).
     trim: u32,
     current: Option<Music>,
-    rng: u32,
     /// `MusicGlobals+0x10`: 0 at `MusicInit` (0x4ADFAE), 1 after the end-of-stream advance opens
     /// the next song (0x4ADE0A), 0 again whenever a swap starts one (state 1, 0x4ADB6E) — what
     /// `I_MUSIC` 0x4AD790 tests to decide between off and a new song
@@ -219,6 +218,13 @@ pub(crate) fn state2_step(starting: Option<u8>, running: bool) -> (Option<u8>, O
     }
 }
 
+/// `|x|` of a `0x538040() + GetTickCount()` sum as 0x4AE4D0 takes it (`cdq ; xor eax, edx ; sub
+/// eax, edx`, then a signed `idiv`). The sum 0x80000000 stays negative through the original's
+/// `abs` (a negative remainder); the port takes its magnitude, as [`MusicPlayer::toggle`] does.
+fn abs_draw(x: u32) -> usize {
+    (x as i32).unsigned_abs() as usize
+}
+
 /// The ramp's length in milliseconds, the literal 5 pushed at 0x4ADC5A / 0x4ADC6A (a ramp of
 /// `5 / 10`, at least one service tick: `0x565DFF…0x565E03`).
 pub(crate) const START_RAMP_MS: i32 = 5;
@@ -243,16 +249,10 @@ impl MusicPlayer {
             level: settings.music_level,
             trim: nfs_formats::spl::GameSpl::load(sounds_dir).music(),
             current: None,
-            rng: 0x2545_F491,
             advanced: false,
             pending: None,
             starting: None,
         })
-    }
-
-    fn rand(&mut self) -> usize {
-        self.rng = self.rng.wrapping_mul(1_103_515_245).wrapping_add(12345);
-        (self.rng >> 8) as usize
     }
 
     /// The stream indices in the playlist, in order (`PLAYLIST` in `fe.txt`).
@@ -293,16 +293,30 @@ impl MusicPlayer {
         if n.starts_with("win") || n.starts_with("lose") || n.starts_with("vic") { self.level as u32 } else { (self.trim * self.level as u32) >> 7 }
     }
 
-    /// `MusicPlay(NULL, 0)` — the race-start pick: any entry of the saved playlist other than the
-    /// current one.
-    pub fn start_race(&mut self, out: &AudioOutput) {
+    /// `MusicPlay(NULL, 0)` — the race-start pick (`AudioLoadTrack` 0x4A88A0 after its
+    /// `MusicSetPlaylist`): any entry of the saved playlist other than the current one.
+    ///
+    /// `draw` is the pick's `0x538040() + GetTickCount()` (0x4AE739…0x4AE746) — the front end's
+    /// generator, shared with every other 0x538040 caller, plus the clock; it is called only
+    /// when the pick needs it (a list of more than one, the volume `+0` not 0).
+    pub fn start_race(&mut self, out: &AudioOutput, draw: &mut dyn FnMut() -> u32) {
+        if let Some(pos) = self.race_start_pick(draw) {
+            self.request(out, pos);
+        }
+    }
+
+    /// The pick of [`Self::start_race`] without the play: the saved list becomes the playlist
+    /// (`MusicSetPlaylist`), then 0x4AE4D0 with no pattern — nothing with the volume `+0` at 0
+    /// (0x4AE614 `cmp [edx], ebp ; je 0x4AE8A6`) or an empty list (0x4AE61C), position 0 for one
+    /// song without a draw (0x4AE709), else `(|draw| % (n − 1) + cur + 1) % n` (0x4AE736…0x4AE763).
+    fn race_start_pick(&mut self, draw: &mut dyn FnMut() -> u32) -> Option<usize> {
         self.playlist = self.saved.clone();
         let n = self.playlist.len();
-        if n == 0 {
-            return;
+        if (self.trim * self.level as u32) >> 7 == 0 || n == 0 {
+            return None;
         }
-        let pos = Self::next_pos(n, self.cur(), self.rand());
-        self.request(out, pos);
+        let r = if n > 1 { abs_draw(draw()) } else { 0 };
+        Some(Self::next_pos(n, self.cur(), r))
     }
 
     /// **`MusicPlay(NULL, 0)`** 0x4AE4D0 alone, over the list as it stands — what the race pause's
@@ -311,14 +325,16 @@ impl MusicPlayer {
     /// any entry but the current one. The list is the race's (with a jingle `MusicPlay(…, 1)`
     /// appended), a `STARTREPLAY` playback's the front end's last pattern, and a command-line
     /// playback's none (`MusicInit`'s, a playback skipping `MusicSetPlaylist`, 0x4A8A4A).
-    /// Returns whether a song was started.
-    pub fn play_next(&mut self, out: &AudioOutput) -> bool {
+    /// Returns whether a song was started. `draw` is `0x538040() + GetTickCount()`, called
+    /// only for a list of more than one (as [`Self::start_race`]).
+    pub fn play_next(&mut self, out: &AudioOutput, draw: &mut dyn FnMut() -> u32) -> bool {
         let n = self.playlist.len();
         if n == 0 || (self.trim * self.level as u32) >> 7 == 0 {
             tracing::info!(listed = n, "MusicPlay(NULL, 0): no playlist or no volume, nothing plays");
             return false;
         }
-        let pos = Self::next_pos(n, self.cur(), self.rand());
+        let r = if n > 1 { abs_draw(draw()) } else { 0 };
+        let pos = Self::next_pos(n, self.cur(), r);
         self.request(out, pos);
         true
     }
@@ -360,32 +376,38 @@ impl MusicPlayer {
     /// `MusicPlay(pattern, mode)`: rebuild the playlist from a name pattern. Mode 1 appends the pick to
     /// the saved list (the race-end jingles), mode 2 replaces the list with it (the congratulations
     /// screen), mode 0 plays a random match (the front end).
-    pub fn play_pattern(&mut self, out: &AudioOutput, pattern: &str, mode: u8) {
+    ///
+    /// `draw` is `0x538040() + GetTickCount()` (mode 1 0x4AE65A, mode 2 0x4AE6CA, mode 0
+    /// 0x4AE716), taken as a signed int's magnitude (`cdq ; xor ; sub`) and divided by the
+    /// matches' count: modes 1 and 2 always draw, mode 0 only for more than one match.
+    pub fn play_pattern(&mut self, out: &AudioOutput, pattern: &str, mode: u8, draw: &mut dyn FnMut() -> u32) {
         let mut list: Vec<usize> = (0..self.names.len()).filter(|i| pattern_match(&self.names[*i], pattern)).collect();
         if list.is_empty() && pattern.len() < 0x3D {
             let alt = format!("*-{pattern}");
             list = (0..self.names.len()).filter(|i| pattern_match(&self.names[*i], &alt)).collect();
         }
         list.truncate(128);
-        if self.level == 0 || list.is_empty() {
+        // 0x4AE614 / 0x4AE61C: nothing with the volume `MusicGlobals+0` (`game.spl[0] · level >> 7`)
+        // at 0 or no match — before any draw
+        if (self.trim * self.level as u32) >> 7 == 0 || list.is_empty() {
             return;
         }
         let n = list.len();
         match mode {
             1 => {
-                let pick = list[self.rand() % n];
+                let pick = list[abs_draw(draw()) % n];
                 self.playlist = self.saved.clone();
                 self.playlist.push(pick);
                 self.pos = self.playlist.len() - 1;
             }
             2 => {
-                let pick = list[self.rand() % n];
+                let pick = list[abs_draw(draw()) % n];
                 self.playlist = vec![pick];
                 self.pos = 0;
             }
             _ => {
                 self.playlist = list;
-                self.pos = if n == 1 { 0 } else { self.rand() % n };
+                self.pos = if n == 1 { 0 } else { abs_draw(draw()) % n };
             }
         }
         let pos = self.pos;
@@ -399,7 +421,10 @@ impl MusicPlayer {
 
     /// End-of-stream advance (0x4ADD6D): sequential, or "any other entry" when shuffling. After
     /// an `I_MUSIC` press, the off or the swap it asked for once the fade has run out.
-    pub fn update(&mut self, out: &AudioOutput) {
+    ///
+    /// `draw` is the shuffled advance's `0x538040() + GetTickCount()` (0x4ADDA0…0x4ADDA7), taken
+    /// only when a song has ended, the list holds more than one and the shuffle is on.
+    pub fn update(&mut self, out: &AudioOutput, draw: &mut dyn FnMut() -> u32) {
         // state 2 (0x4ADBB9…): the open stream waits for the mixer, then ramps to its level
         if self.starting.is_some() {
             let running = self.current.as_ref().is_some_and(|m| m.src.queued_frames() > 0 && out.is_playing(m.voice));
@@ -438,16 +463,26 @@ impl MusicPlayer {
             self.current = None;
             return;
         }
-        self.pos = if n == 1 {
-            0
-        } else if self.shuffle || self.front_end {
-            (self.rand() % (n - 1) + self.pos + 1) % n
-        } else {
-            (self.pos + 1) % n
-        };
+        let shuffle = self.shuffle || self.front_end;
+        let r = if n > 1 && shuffle { draw() } else { 0 };
+        self.pos = Self::advance_pos(n, self.pos, shuffle, r);
         self.play_current(out);
         // the advance opens the next song itself (0x4AD8B0, state 2) and sets `+0x10` (0x4ADE0A)
         self.advanced = true;
+    }
+
+    /// **`MusicUpdate`'s state 0** once the stream has ended (`+0x8C == 0` with a song chosen,
+    /// 0x4ADD6D…): one song → position 0; the shuffle flag `+0x24` (0x4ADD95) clear → `(cur + 1) % n`;
+    /// set → `(|draw| % (n − 1) + 1 + cur) % n` (`cdq ; xor ; sub` then two `idiv`s), never the
+    /// same song twice running.
+    fn advance_pos(n: usize, cur: usize, shuffle: bool, draw: u32) -> usize {
+        if n == 1 {
+            0
+        } else if shuffle {
+            ((draw as i32).unsigned_abs() as usize % (n - 1) + 1 + cur) % n
+        } else {
+            (cur + 1) % n
+        }
     }
 
     /// **`I_MUSIC` (F9), 0x4AD790** — nothing without a playlist (`+8`) or with the music volume
@@ -605,7 +640,7 @@ impl Music {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             }
-            feeder.finished.store(true, std::sync::atomic::Ordering::Relaxed);
+            feeder.finished.store(true, std::sync::atomic::Ordering::Release);
         });
         Ok(Self { voice, title, src, _thread: thread })
     }
@@ -617,7 +652,7 @@ mod tests {
 
     /// A bare `MusicPlayer` with no on-disk `zzzymus.viv` (bypassing `MusicPlayer::new`'s file
     /// read) — `names` only needs to be long enough for `playlist`'s and `saved`'s indices.
-    fn bare(playlist: Vec<usize>, saved: Vec<usize>) -> MusicPlayer {
+    pub(super) fn bare(playlist: Vec<usize>, saved: Vec<usize>) -> MusicPlayer {
         MusicPlayer {
             dir: PathBuf::new(),
             names: vec!["a".into(), "b".into()],
@@ -630,7 +665,6 @@ mod tests {
             level: 127,
             trim: 52,
             current: None,
-            rng: 1,
             advanced: false,
             pending: None,
             starting: None,
@@ -683,6 +717,18 @@ mod tests {
     }
 
     #[test]
+    fn the_end_of_a_song_advances_sequentially_or_to_any_other() {
+        // 0x4ADD6D…: one song → 0; shuffle clear → the next, wrapping
+        assert_eq!(MusicPlayer::advance_pos(1, 0, true, 7), 0);
+        assert_eq!(MusicPlayer::advance_pos(11, 3, false, 7), 4);
+        assert_eq!(MusicPlayer::advance_pos(11, 10, false, 7), 0);
+        // shuffle set: `(|draw| % (n − 1) + 1 + cur) % n`, never the current one
+        assert_eq!(MusicPlayer::advance_pos(11, 3, true, 7), (7 % 10 + 1 + 3) % 11);
+        assert_eq!(MusicPlayer::advance_pos(11, 3, true, (-25i32) as u32), (25 % 10 + 1 + 3) % 11);
+        assert!((0..200u32).all(|d| MusicPlayer::advance_pos(5, 2, true, d) != 2));
+    }
+
+    #[test]
     fn playsong_with_no_current_song_does_not_reset_the_playlist() {
         // 0x5120D0's `None` arm (0x4BEB40 found no current entry, returning 0) calls
         // `MusicPlay(NULL, 0)` — 0x4AE4D0 with the candidate pool exhausted (`[edx+8] == 0`,
@@ -694,14 +740,14 @@ mod tests {
         // called here before this fix.
         let Ok(out) = AudioOutput::new() else { return }; // no audio device on this host
         let mut exhausted = bare(vec![], vec![0, 1]);
-        assert!(!exhausted.play_next(&out), "no candidates left: MusicPlay(NULL, 0) plays nothing");
+        assert!(!exhausted.play_next(&out, &mut || 0), "no candidates left: MusicPlay(NULL, 0) plays nothing");
         assert!(exhausted.playlist.is_empty(), "play_next never refills from `saved`");
 
         // Contrast: `start_race` (the wrong call the port's `PLAYSONG` used to make for this arm)
         // rebuilds the list from `saved` and would have picked from it — the divergence this test
         // guards against regressing.
         let mut same_state = bare(vec![], vec![0, 1]);
-        same_state.start_race(&out);
+        same_state.start_race(&out, &mut || 0);
         assert_eq!(same_state.playlist, vec![0, 1], "start_race resets the list from `saved` — not PLAYSONG's rule");
     }
 
@@ -757,7 +803,7 @@ mod tests {
 
     #[test]
     fn jingles_are_louder_than_the_race_playlist() {
-        let p = MusicPlayer { dir: PathBuf::new(), names: Vec::new(), playlist: Vec::new(), saved: Vec::new(), cur_set: false, pos: 0, shuffle: false, front_end: false, level: 127, trim: 52, current: None, rng: 1, advanced: false, pending: None, starting: None };
+        let p = MusicPlayer { dir: PathBuf::new(), names: Vec::new(), playlist: Vec::new(), saved: Vec::new(), cur_set: false, pos: 0, shuffle: false, front_end: false, level: 127, trim: 52, current: None, advanced: false, pending: None, starting: None };
         // the shipped game.spl[0] = 52: 52 · 127 >> 7 = 51 of 127 for a race track, the raw 127 for a jingle
         assert!((p.volume_for("game13-Activator-Morphadron") - 51.0 / 127.0).abs() < 1e-6);
         assert_eq!(p.volume_for("win04-Victory-Cypher"), 1.0);
@@ -767,7 +813,8 @@ mod tests {
 
 #[cfg(test)]
 mod toggle_tests {
-    use super::{MusicPlayer, Settings};
+    use super::tests::bare;
+    use super::{AudioOutput, MusicPlayer, Settings};
 
     #[test]
     fn f10_keeps_the_levels_and_gives_them_back() {
@@ -796,6 +843,55 @@ mod toggle_tests {
         assert_eq!(MusicPlayer::toggle_step(false, 1, 7), Some(0));
         // the sum is taken as a signed int and its magnitude divided: −7 → 7 % 5
         assert_eq!(MusicPlayer::toggle_step(false, 5, (-7i32) as u32), Some(2));
+    }
+
+    /// AUDIO-RNG: the race-start pick draws `0x538040() + GetTickCount()` (0x4AE739…0x4AE746). The
+    /// generator's state after the session's reseed is the same for the same seconds, the clock's
+    /// milliseconds are not — so two launches can open the race on different songs, while the
+    /// same draw (a pinned clock) always gives the same one. No draw at all for one song or no
+    /// volume.
+    #[test]
+    fn the_race_start_pick_varies_with_the_clock_and_is_fixed_for_a_fixed_one() {
+        let saved: Vec<usize> = (0..12).collect();
+        // the generator's draw stands for 0x538040's (the same for two launches in one second)
+        let draw0 = 0x1234_5678u32;
+        let pick = |clock: u32| {
+            let mut m = bare(Vec::new(), saved.clone());
+            m.names = (0..12).map(|i| format!("game{i}")).collect();
+            m.race_start_pick(&mut || draw0.wrapping_add(clock))
+        };
+        assert_eq!(pick(1_000), pick(1_000));
+        let picks: std::collections::BTreeSet<_> = (0..64u32).map(|c| pick(1_000 + 37 * c)).collect();
+        assert!(picks.len() > 1, "the clock changes the first song: {picks:?}");
+        // from no song chosen (−1): `|r| % 11 + 0`
+        assert_eq!(pick(0), Some((0x1234_5678usize % 11 + 1 - 1) % 12));
+        // one song: position 0, no draw; volume 0: nothing, no draw
+        let mut m = bare(Vec::new(), vec![1]);
+        assert_eq!(m.race_start_pick(&mut || unreachable!("one song draws nothing")), Some(0));
+        let mut m = bare(Vec::new(), vec![0, 1]);
+        m.level = 0;
+        assert_eq!(m.race_start_pick(&mut || unreachable!("no volume draws nothing")), None);
+    }
+
+    /// The pattern modes draw `|0x538040() + GetTickCount()| % matches` (0x4AE65A / 0x4AE6CA /
+    /// 0x4AE716): mode 0 only for more than one match, modes 1 and 2 always.
+    #[test]
+    fn the_pattern_picks_take_the_draw_as_a_signed_magnitude() {
+        let out = AudioOutput::offline();
+        let mut m = bare(Vec::new(), vec![0]);
+        m.names = vec!["game1".into(), "menu1".into(), "menu2".into(), "menu3".into(), "win1".into()];
+        let mut calls = 0;
+        m.play_pattern(&out, "menu*", 0, &mut || {
+            calls += 1;
+            (-5i32) as u32
+        });
+        assert_eq!((calls, m.playlist.clone(), m.pos), (1, vec![1, 2, 3], 5 % 3));
+        let mut calls = 0;
+        m.play_pattern(&out, "win*", 1, &mut || {
+            calls += 1;
+            9
+        });
+        assert_eq!((calls, m.playlist.last().copied()), (1, Some(4)));
     }
 }
 
@@ -827,5 +923,63 @@ mod real_data {
         let total_ms: u64 = names.iter().zip(&lens).filter(|(n, _)| pattern_match(n, "game*")).map(|(_, &ms)| ms as u64).sum();
         let secs = total_ms / 1000;
         assert_eq!((secs / 60, secs % 60), (35, 46), "total {total_ms} ms, pass6_options_audio.jpg shows 35:46");
+    }
+
+    /// AUDIO-RACEMUSIC end to end on the real `zzzymus.viv`: a list of two songs (`vic01`, 17.2 s,
+    /// then `win04`, 30.0 s) on the offline mixer, shuffle off; the game's update runs every 10 ms
+    /// of mix. When the first song has been played the next starts (0x4ADD6D → 0x4AD8B0) and is
+    /// heard within a few service ticks.
+    #[test]
+    fn the_next_song_starts_when_one_ends() {
+        let Some(root) = game_root() else {
+            eprintln!("skipping: original game data not found");
+            return;
+        };
+        let out = AudioOutput::offline();
+        let mut settings = Settings::load(&root);
+        settings.playlist = vec![14, 27];
+        let mut m = MusicPlayer::new(&root.join("GameData/Music"), &root.join("GameData/Sounds"), &settings).unwrap();
+        m.set_saved(vec![14, 27]);
+        // the race-start pick from −1: `r % 1 + 1 − 1` → position 0 whatever `r`
+        m.start_race(&out, &mut || 1);
+        assert_eq!(m.now_playing(), Some("vic01-Congrats-CaptainGinger"));
+        let first = m.current.as_ref().unwrap().voice;
+        let tick = |out: &AudioOutput| {
+            // four calls are one 10 ms render of the offline mixer
+            for _ in 0..4 {
+                out.fade(crate::VoiceId(u32::MAX), 0, 0);
+            }
+        };
+        let (mut ticks, mut ended, mut heard) = (0u32, None, None);
+        while ticks < 60 * 100 {
+            // the feeder runs on its own thread: let it keep up with the offline mix
+            if let Some(c) = m.current.as_ref()
+                && c.src.queued_frames() < 4096
+                && !c.src.finished.load(std::sync::atomic::Ordering::Acquire)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            tick(&out);
+            ticks += 1;
+            m.update(&out, &mut || panic!("no draw with the shuffle off"));
+            if ended.is_none() && !out.is_playing(first) {
+                ended = Some(ticks);
+            }
+            if ended.is_some()
+                && let Some(c) = m.current.as_ref()
+                && c.voice != first
+                && out.stream_volume(c.voice).is_some_and(|v| v > 0.0)
+            {
+                heard = Some(ticks);
+                break;
+            }
+        }
+        let (ended, heard) = (ended.expect("the first song never ended"), heard.expect("no next song"));
+        eprintln!("first song over after {} ms of mix; the next heard {} ms later", ended * 10, (heard - ended) * 10);
+        assert_eq!(m.now_playing(), Some("win04-Victory-Cypher"));
+        // vic01 is 550351 frames at 32 kHz = 17.20 s
+        assert!((1715..=1730).contains(&ended), "ended at tick {ended}");
+        assert!(heard - ended <= 5, "{} ticks of silence between the songs", heard - ended);
     }
 }

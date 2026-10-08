@@ -53,7 +53,15 @@ impl App {
             if self.snd.audio.is_none() {
                 self.snd.audio = nfs_audio::AudioOutput::new().map_err(|e| tracing::warn!(error = %e, "audio disabled")).ok();
             }
-            self.intro = Some(intro_run::IntroRun::new(window, renderer, &self.paths));
+            // the sound is open and configured for `AUDIOQUALITY` before the movies: main 0x4B6A50
+            // calls 0x4A6840 (→ 0x4A66B0 at 0x4A68A2, the voice budget, mixing rate and driver
+            // sleep) at 0x4B6B09, the movies 0x4DD600 only at 0x4B6C42. *(Until 2026-10-09 the
+            // movies played on the library's defaults and the front end's first sound configured
+            // it — AUDIO-START.)*
+            if let Some(a) = &self.snd.audio {
+                a.set_audio_quality(self.snd.audio_settings.audio_quality);
+            }
+            self.intro =Some(intro_run::IntroRun::new(window, renderer, &self.paths));
             return;
         }
         if let Some(m) = self.fe.menu.as_mut() {

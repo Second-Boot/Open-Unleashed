@@ -625,7 +625,7 @@ impl App {
     /// The tail of 0x510210's re-roll once 0x4DC140 returns: `MusicPlay("Menu*", 0)` (0x510246…0x510251)
     /// and the stamp `[+0x290] = TIMER_getTicks()` (0x510254…0x510259) — read after the movie.
     pub(crate) fn finish_idle_movie(&mut self) {
-        self.fe_music(|m, a| m.play_pattern(a, "Menu*", 0));
+        self.fe_music(|m, a, draw| m.play_pattern(a, "Menu*", 0, draw));
         self.fe.main_music_stamp = self.fe_timer_ticks();
     }
 

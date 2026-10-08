@@ -122,7 +122,16 @@ impl App {
                     m.set_front_end(false);
                     m.stop_fade(a, 1500);
                     if !playing {
-                        m.start_race(a);
+                        // the pick's `0x538040() + GetTickCount()` (0x4AE739…0x4AE746): the shared
+                        // generator `fe_rng`, which the session's load reseeded from `time(0)`
+                        // (0x428C2D), and the clock (`tick_count_ms`, APPROXIMATION). APPROXIMATION
+                        // (order): the original's pick (the pass, `AudioLoadTrack` 0x4A88A0) draws
+                        // before the pass remakes the sky (0x4690A0 → 0x45DBD0, the jitter
+                        // 0x45F3C0); the port's one sky was drawn at the load (`Sky::upload`), so
+                        // here the pick comes after the jitter's draws — same count, swapped order
+                        // on a clock-seeded state
+                        let rng = &mut self.fe_rng;
+                        m.start_race(a, &mut || rng.next_u32().wrapping_add(crate::app::audio::tick_count_ms()));
                     }
                 }
             }

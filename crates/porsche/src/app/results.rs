@@ -56,7 +56,8 @@ impl App {
         let roll = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos() as usize);
         let text = ids.get(roll % ids.len().max(1)).copied();
         if let (Some(a), Some(m)) = (&self.snd.audio, self.snd.music.as_mut()) {
-            m.play_pattern(a, if pass { "win*" } else { "lose*" }, 1);
+            let rng = &mut self.fe_rng;
+            m.play_pattern(a, if pass { "win*" } else { "lose*" }, 1, &mut || rng.next_u32().wrapping_add(crate::app::audio::tick_count_ms()));
         }
         self.mission_result = Some((pass, text));
     }
@@ -519,7 +520,8 @@ impl App {
             && let (Some(a), Some(m)) = (&self.snd.audio, self.snd.music.as_mut())
         {
             tracing::info!(place, "HCongrats' jingle (0x41D1EF)");
-            m.play_pattern(a, if place == 1 { "win*" } else { "lose*" }, 1);
+            let rng = &mut self.fe_rng;
+            m.play_pattern(a, if place == 1 { "win*" } else { "lose*" }, 1, &mut || rng.next_u32().wrapping_add(crate::app::audio::tick_count_ms()));
         }
     }
 }

@@ -940,20 +940,31 @@ pub fn ring_frames(mix_rate: u32) -> u32 {
 /// ([`Shared::render`]); then it `Sleep`s [`pump_sleep_ms`]. So a write is the frames the cursor
 /// moved in one pass, in multiples of 16 (at 22050 Hz and 20 ms: 432 or 448, 441 on average),
 /// cut in two at the ring's end. APPROXIMATION: the cursor is taken to move exactly the sleep's
-/// frames a pass (`n · sleep · rate / 1000` after `n` passes) — the thread's own work, the
-/// scheduler and the first pass's lead fill are not modelled.
+/// frames a pass (the sum of every pass's `sleep · rate / 1000`, `n · sleep · rate / 1000` after
+/// `n` passes of one setting) — the thread's own work, the scheduler and the first pass's lead
+/// fill are not modelled.
+///
+/// The cursor moves with time, so a pass after the sleep (or the rate) changed writes one pass of
+/// the new setting, not the whole run again at it. *(Until 2026-10-09 the end was `passes ·` the
+/// current sleep: the library's 10 ms during the start-up movies, then `AUDIOQUALITY` 1's 20 ms
+/// from the front end's first sound — one pass wrote as many frames as had been played so far, the
+/// whole intro again, mixed at once before anything the front end started: AUDIO-START, seconds of
+/// silence in the menu after the movies.)*
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Pump {
     pub passes: u64,
     /// the frames written so far (the write end, unwrapped)
     pub end: u64,
+    /// `Σ sleep · rate` over the passes so far: the cursor, in thousandths of a frame
+    pub moved: u64,
 }
 
 impl Pump {
     /// The next pass's parts: up to the ring's end, then the rest from its start.
     pub fn next_write(&mut self, mix_rate: u32, sleep_ms: u32) -> [u32; 2] {
         self.passes += 1;
-        let end = (self.passes * sleep_ms as u64 * mix_rate as u64 / 1000) & !15;
+        self.moved += sleep_ms as u64 * mix_rate as u64;
+        let end = (self.moved / 1000) & !15;
         let w = end.saturating_sub(self.end) as u32;
         let ring = ring_frames(mix_rate).max(16);
         let pos = (self.end % ring as u64) as u32;
@@ -1100,6 +1111,18 @@ impl Shared {
                 if f.done() {
                     sv.fade = None;
                 }
+            }
+            // **a stream whose song has been played is gone**: the stream's position callback
+            // 0x566E40 adds the frames played to the item's `+0x14` and, once it reaches the
+            // item's length `+0x18` (0x566E7C…0x566E84), takes the item off (0x566D80 at 0x566E8A),
+            // so the stream object's item count `+0x16` (0x567550 adds one per queued song) drops
+            // to 0 — the running flag 0x566A40 hands `MusicUpdate` (`+0x8C`), whose state 0 then
+            // advances the playlist (0x4ADD6D). Here: the feeder has decoded the last block and
+            // the mix has taken every queued frame. *(Until 2026-10-09 a drained stream stayed in
+            // the mix for ever, so the music player never saw it end and the race went on in
+            // silence after the first song — AUDIO-RACEMUSIC.)*
+            if sv.src.finished.load(Ordering::Acquire) && sv.src.queue.len() < sv.src.channels.max(1) as usize && !stopped.contains(id) {
+                stopped.push(*id);
             }
         }
         self.streams.retain(|(i, _)| !stopped.contains(i));
@@ -2085,6 +2108,14 @@ impl AudioOutput {
         Err(last.expect("an attempt was made").into())
     }
 
+    /// TEST GLUE: the offline mixer of a muted run (no device, nothing written), for the tests of
+    /// the modules that drive it.
+    #[cfg(test)]
+    pub(crate) fn offline() -> Self {
+        let (tx, _) = Tx::new(44100, true);
+        Self { _stream: None, tx, rate: 44100 }
+    }
+
     /// The output stream whose callback is `core`'s: what the game thread queued since the last
     /// run, then the mix — nothing here takes a lock or allocates.
     fn open(device: &cpal::Device, config: &cpal::StreamConfig, channels: usize, mut core: Core) -> Result<cpal::Stream, cpal::Error> {
@@ -2753,6 +2784,51 @@ mod rate_tests {
                     [next, sign * next]
                 })
                 .collect()
+        }
+    }
+
+    /// The device frames (44.1 kHz callbacks of 512) from a sound started right after the
+    /// driver's sleep changed from the library's 10 ms to `AUDIOQUALITY` 1's 20 ms, `intro_s`
+    /// seconds of output after the device opened, until the sound is heard.
+    fn frames_until_heard_after_sleep_change(intro_s: f64) -> usize {
+        let mut s = Shared::default();
+        let mut bridge = Bridge::default();
+        let step = 22050.0 / 44100.0;
+        let callback = |s: &mut Shared, bridge: &mut Bridge| -> bool {
+            let mut heard = false;
+            for k in 0..512 {
+                let lr = bridge.next(step, 512 - k, |_, pending| s.pump_to(22050, pending));
+                heard |= lr[0] != 0.0;
+            }
+            heard
+        };
+        for _ in 0..(intro_s * 44100.0 / 512.0) as usize {
+            callback(&mut s, &mut bridge);
+        }
+        // the front end's first `fe_music`: 0x4A66B0's configuration for AUDIOQUALITY 1 (20 ms)
+        s.sleep_ms = Some(20);
+        // one callback with it (the music stream opens silent, state 2), then a sound starts
+        callback(&mut s, &mut bridge);
+        let clip = std::sync::Arc::new(super::Clip { rate: 22050, channels: 1, samples: vec![1000; 22050], loop_range: Some((0, 22050)), gain: 1.0, bend_cents: 0, fx_send: 0, priority: 0, pan: 64, pan_scale: 1, records: Vec::new(), layers: Vec::new(), tables: Vec::new() });
+        s.voices.push((super::VoiceId(0), super::Voice::new(clip, resample::PITCH_UNIT, 1.0, true, 0)));
+        let mut n = 0;
+        while !callback(&mut s, &mut bridge) {
+            n += 512;
+            assert!(n < 44100 * 120, "never heard");
+        }
+        n
+    }
+
+    #[test]
+    fn a_driver_sleep_change_queues_no_backlog() {
+        // AUDIO-START (2026-10-09): the intro opened the output with the library's 10 ms
+        // pass, the front end's first `set_audio_quality` made it 20 ms, and a pass wrote
+        // `passes · 20 ms` less what was written — the whole intro once more, mixed at once and
+        // played before anything newer
+        for intro in [3.0, 10.0, 30.0] {
+            let n = frames_until_heard_after_sleep_change(intro);
+            eprintln!("intro {intro} s: first sound after {n} device frames ({} ms)", n * 1000 / 44100);
+            assert!(n <= 2 * 512, "intro {intro} s: {n} frames of backlog");
         }
     }
 

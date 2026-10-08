@@ -106,7 +106,7 @@ impl App {
         // the playlist becomes that one pick (`engine-audio.md` §8.3). Once per opening.
         if !self.fe.era_music {
             self.fe.era_music = true;
-            self.fe_music(|m, a| m.play_pattern(a, "vic*", 2));
+            self.fe_music(|m, a, draw| m.play_pattern(a, "vic*", 2, draw));
         }
         let loaded;
         let fresh;

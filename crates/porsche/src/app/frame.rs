@@ -44,7 +44,12 @@ impl App {
         if self.vehicle.is_none()
             && let (Some(a), Some(m)) = (&self.snd.audio, self.snd.music.as_mut())
         {
-            m.update(a);
+            // the shuffled advance's `0x538040() + GetTickCount()` (0x4ADDA0…0x4ADDA7): the shared
+            // generator `fe_rng` and the wall clock's milliseconds — APPROXIMATION for the time
+            // since Windows started (as `I_MUSIC`'s pick)
+            let rng = &mut self.fe_rng;
+            let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u32);
+            m.update(a, &mut || rng.next_u32().wrapping_add(ms));
         }
         // the end-of-era show's sting, once, 128 ticks in (0x4FFA7C): `0x4A6270(k)` queues speech
         // id 4 + k — `Era-ClassictoGolden`, `Era-GoldentoModern`, `Era-CEvoModecomplet`

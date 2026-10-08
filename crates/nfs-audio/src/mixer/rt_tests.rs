@@ -396,3 +396,28 @@ fn the_mix_does_not_depend_on_the_callback_size() {
     assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "256 vs 512");
     assert!(a.iter().zip(&c).all(|(x, y)| x.to_bits() == y.to_bits()), "odd sizes vs 512");
 }
+
+/// AUDIO-RACEMUSIC: a stream whose song has been played leaves the mix (0x566E40 → 0x566D80, the
+/// item count `+0x16` to 0), so `MusicUpdate`'s running test (`+0x8C`, 0x566A40) sees it end; a
+/// stream the feeder is still decoding stays, even with its queue run dry.
+#[test]
+fn a_played_stream_leaves_the_mix() {
+    let (tx, core) = Tx::new(44100, false);
+    let mut core = core.unwrap();
+    let out = AudioOutput { _stream: None, tx, rate: 44100 };
+    let (done, live) = (StreamSource::new(22050, 2), StreamSource::new(22050, 2));
+    done.push(&[100; 2000]);
+    live.push(&[100; 2000]);
+    done.finished.store(true, std::sync::atomic::Ordering::Release);
+    let (a, b) = (out.play_stream(done.clone(), 1.0), out.play_stream(live.clone(), 1.0));
+    let mut buf = vec![0.0f32; 1024];
+    for _ in 0..10 {
+        core.drain();
+        core.fill(&mut buf, 2, 44100.0);
+        core.publish();
+    }
+    assert_eq!(done.queued_frames(), 0);
+    assert_eq!(live.queued_frames(), 0);
+    assert!(!out.is_playing(a), "the played song is still in the mix");
+    assert!(out.is_playing(b), "a stream still being fed left the mix");
+}

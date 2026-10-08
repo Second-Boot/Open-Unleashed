@@ -95,12 +95,12 @@ impl App {
                 // *(Until this port pass, `None` called `start_race`, which resets the list to the
                 // saved one — recorded 2026-09-27 as a divergence, now matched.)*
                 let name = table.iter().find(|(i, _)| *i as i32 == self.fe.cd_current).map(|(_, n)| n.clone());
-                self.fe_music(|m, a| {
+                self.fe_music(|m, a, draw| {
                     m.stop(a);
                     match &name {
-                        Some(n) => m.play_pattern(a, n, 0),
+                        Some(n) => m.play_pattern(a, n, 0, draw),
                         None => {
-                            m.play_next(a);
+                            m.play_next(a, draw);
                         }
                     }
                 });
@@ -108,7 +108,7 @@ impl App {
             }
             "STOPSONG" => {
                 // 0x5120F0: `MusicStop(0)`
-                self.fe_music(|m, a| m.stop(a));
+                self.fe_music(|m, a, _| m.stop(a));
                 return true;
             }
             "SKIPFWD" | "SKIPBK" => {
@@ -154,9 +154,9 @@ impl App {
         // `[[0x65B928]+0xE0]`, the bottom layer's list
         let cd_screen = self.fe_list_now() == "ID_OPTIONSSCREEN";
         if cd_screen {
-            self.fe_music(|m, a| {
+            self.fe_music(|m, a, draw| {
                 m.stop(a);
-                m.play_pattern(a, &name, 0);
+                m.play_pattern(a, &name, 0, draw);
             });
         }
         self.bind_lists();
@@ -218,7 +218,7 @@ impl App {
             self.fe_list_gone(&old);
             match list.as_str() {
                 "ID_OPTIONSSCREEN" => {
-                    self.fe_music(|m, a| m.stop_fade(a, 1500));
+                    self.fe_music(|m, a, _| m.stop_fade(a, 1500));
                     // 0x51175D: `0x4BEAC0(-1)` — `CDPlayer.Current` `[0x5D7938]` back to −1
                     self.fe.cd_current = -1;
                 }
@@ -236,18 +236,18 @@ impl App {
         if pattern != self.fe.music_current {
             let play = pattern != "NONE";
             let p = pattern.clone();
-            self.fe_music(|m, a| {
+            self.fe_music(|m, a, draw| {
                 m.set_front_end(true);
                 m.stop_fade(a, 1500);
                 if play {
-                    m.play_pattern(a, &p, 0);
+                    m.play_pattern(a, &p, 0, draw);
                 }
             });
             tracing::info!(pattern, "front end: music (0x4D1BD0)");
             self.fe.music_current = pattern.clone();
         }
         if pattern == "NONE" {
-            self.fe_music(|m, a| m.stop_fade(a, 150));
+            self.fe_music(|m, a, _| m.stop_fade(a, 150));
         }
         swapped
     }
@@ -278,7 +278,7 @@ impl App {
             // 0x510235: MusicStop(200); 0x510244: 0x4DC140 — which plays `inPC-av.mad` (0x4DD4A0, the
             // movie the start-up shows second) and waits until no button is down, a modal wait the
             // window's event loop takes over (`start_idle_movie`, `finish_idle_movie`)
-            self.fe_music(|m, a| m.stop_fade(a, 200));
+            self.fe_music(|m, a, _| m.stop_fade(a, 200));
             let scripted = NO_FOCUS.load(std::sync::atomic::Ordering::Relaxed) && !PLAY_INTRO.load(std::sync::atomic::Ordering::Relaxed);
             if scripted || self.screenshot.is_some() || self.window.is_none() {
                 // a scripted run plays no movies (as at the start-up)
@@ -290,8 +290,9 @@ impl App {
     }
 
     /// The front end's music player, made on first use (the port has no menu music of its own yet)
-    /// — nothing in a screenshot run.
-    pub(crate) fn fe_music(&mut self, f: impl FnOnce(&mut nfs_audio::music::MusicPlayer, &nfs_audio::AudioOutput)) {
+    /// — nothing in a screenshot run. `f` gets the picks' draw, `0x538040() + GetTickCount()`
+    /// (0x4AE4D0): the shared generator `fe_rng` and [`tick_count_ms`].
+    pub(crate) fn fe_music(&mut self, f: impl FnOnce(&mut nfs_audio::music::MusicPlayer, &nfs_audio::AudioOutput, &mut dyn FnMut() -> u32)) {
         if self.screenshot.is_some() {
             return;
         }
@@ -308,8 +309,9 @@ impl App {
                 .map_err(|e| tracing::warn!(error = %e, "music unavailable"))
                 .ok();
         }
+        let rng = &mut self.fe_rng;
         if let (Some(a), Some(m)) = (self.snd.audio.as_ref(), self.snd.music.as_mut()) {
-            f(m, a);
+            f(m, a, &mut || rng.next_u32().wrapping_add(tick_count_ms()));
         }
     }
 
@@ -404,7 +406,8 @@ impl App {
                         // its jingle for an automatic replay, none for a command-line one.
                         // *(Until 2026-09-27 the port kept a playback and a finished race silent
                         // here, and reset the list to the saved one as the race start does.)*
-                        m.play_next(a);
+                        let rng = &mut self.fe_rng;
+                        m.play_next(a, &mut || rng.next_u32().wrapping_add(tick_count_ms()));
                     }
                 }
             }
@@ -543,4 +546,13 @@ pub(crate) fn crowding_factor(distances: impl IntoIterator<Item = f32>) -> u8 {
         }
     }
     x.clamp(0.0, 128.0) as u8
+}
+
+/// The music picks' clock term: `GetTickCount()` (0x4AE4D0, 0x4ADDA0) / `timeGetTime()` (0x4AD790),
+/// the milliseconds since Windows started. APPROXIMATION: the port has no such clock and takes the
+/// wall clock's milliseconds since the epoch, truncated to 32 bits — like the original's, a value
+/// that differs from launch to launch, which is all the picks use it for (the sum with
+/// 0x538040's draw, `|sum| % n`).
+pub(crate) fn tick_count_ms() -> u32 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u32)
 }

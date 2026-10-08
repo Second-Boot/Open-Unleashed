@@ -106,7 +106,7 @@ impl App {
 
     pub(crate) fn fe_loading_frame(&mut self, step: u32) {
         // 0x4DDA00: `MusicStop(1)` (0x4DDA14) — a fade of one step, then the update stops it
-        self.fe_music(|m, a| m.stop_fade(a, 1));
+        self.fe_music(|m, a, _| m.stop_fade(a, 1));
         let sprites = self.fe_loading_sprites(step);
         let scene = Scene { sprites, clear_color: [0.0, 0.0, 0.0, 1.0], ..Scene::default() };
         if let Some(r) = self.renderer.as_mut()
