@@ -183,7 +183,15 @@ impl App {
                 let v = clamp_index(*d, (hi - lo + 1) as u32) as i32 + lo;
                 let a = &mut self.snd.audio_settings;
                 match name {
-                    "Audio.MusicLevel" => a.music_level = v as u8,
+                    "Audio.MusicLevel" => {
+                        a.music_level = v as u8;
+                        // `LoadAccessors` 0x4B7FD0 → the accessor's Load 0x4BC480 → `SetSelection`
+                        // 0x4BC240, which stores the value and calls the commit callback `+0x10`
+                        // (0x4BC2A5…0x4BC2B4) — for `Audio.MusicLevel` 0x4E47B0 (the ctor's
+                        // seventh argument at 0x4E4928 → 0x4BC1F0 → 0x4B7B30's `+0x10`):
+                        // `MusicSetVolume(MusicLevelToVolume(v))`
+                        self.music_level_changed();
+                    }
                     "Audio.SfxLevel" => a.sfx_level = v as u8,
                     "Audio.EngineLevel" => a.engine_level = v as u8,
                     "Audio.SpeechLevel" => a.speech_level = v as u8,

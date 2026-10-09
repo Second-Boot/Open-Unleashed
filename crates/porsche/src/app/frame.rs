@@ -186,7 +186,7 @@ impl App {
         }
         // and the movies on it, which need the renderer to put each frame in its texture
         if let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) {
-            l.advance_movies(r, dt_ms, self.snd.audio.as_ref(), self.snd.audio_settings.music_level);
+            l.advance_movies(r, dt_ms, self.snd.audio.as_ref(), self.snd.registry_music_level);
         }
         // the front end's own pointer (`controls.md` §4.152), and where the turntable stands,
         // which is what a hovered `NFS5.3DCAR` picks its cursor by (§4.153)

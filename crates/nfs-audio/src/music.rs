@@ -104,6 +104,16 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// **The front end's level accessors as their constructors leave them**: 0x4E4910
+    /// (the Audio data area's slot 0, run by 0x4E5D00 at every front-end entry, 0x4D36D7) builds
+    /// the five `Audio.*Level` `FEIntAccessor`s with `0x4BA310(name, 0x37…0x3B, 0x7F, 0, 0x7F, 0,
+    /// cb)` (0x4E4928…0x4E4A5A) — the third argument is the value 0x4BA362's `SetSelection`
+    /// stores — and no code reads the registry words `[0x657CA0…0x657CB0]` (`fe.txt`'s
+    /// `MUSICLEVEL` …) into them; only a profile's `LoadAccessors` changes them.
+    pub fn front_end_defaults(&mut self) {
+        (self.music_level, self.sfx_level, self.engine_level, self.speech_level, self.ambient_level) = (0x7F, 0x7F, 0x7F, 0x7F, 0x7F);
+    }
+
     /// **`I_SFX` (F10), 0x4AB4E0** — the four effect levels, off and back. On (`[0x656840]` set,
     /// as every race start leaves it, 0x4A8841): the live SFX / engine / speech / ambient levels
     /// `[0x5D1744…0x5D1750]` are kept in their registry variables `[0x657CA4…0x657CB0]` and set to
@@ -175,7 +185,15 @@ pub struct MusicPlayer {
     dir: PathBuf,
     /// stream names in `zzzymus.viv` directory order
     pub names: Vec<String>,
-    playlist: Vec<usize>,
+    /// **`MusicGlobals+0xE8`**, the byte array of stream indices, and **`+8`** (`listed`), how
+    /// many of them are the list. Entries past `listed` stay as they were written:
+    /// `MusicPlay` mode 1 puts the jingle at index `oldN` and sets `+8 = oldN` (0x4AE6A3 /
+    /// 0x4AE6B0) — the jingle plays at a position **outside** the list — and mode 2 puts its pick
+    /// at index 0 and sets `+8 = 0` (0x4AE6F2 / 0x4AE6FE). Every list reader (the picks of
+    /// 0x4AE4D0, the advance 0x4ADD85, `I_MUSIC` 0x4AD7A0 / 0x4AD86D) takes `listed`; only the
+    /// opens (0x4AE7E7, 0x4ADCDE, 0x4AD8C2) index the array by the position, unchecked.
+    slots: Vec<usize>,
+    listed: usize,
     /// `MusicGlobals+0xC` (`pos`) is `>= 0`: a song is chosen. `MusicStop` (0x4AE3C0) sets it to
     /// −1 and does nothing at all while it is −1; the next `MusicPlay`'s "any entry but the
     /// current one" then counts from −1 (0x4AE7xx `(r % (n − 1) + 1 + [+0xC]) % n`)
@@ -184,17 +202,25 @@ pub struct MusicPlayer {
     saved: Vec<usize>,
     pos: usize,
     shuffle: bool,
-    /// `[0x65B928] != 0` — the front end is running. `MusicPlay` and the end-of-stream advance
-    /// take the shuffle flag as `[0x65B928] ? 1 : RANDOMPLAYLIST` (§8.3), so in the front end the
-    /// list always shuffles. 0x4D3420 sets the pointer at 0x4D3564 and clears it at 0x4D559A.
+    /// `[0x65B928] != 0` — the front end is running. `MusicPlay` latches the shuffle flag as
+    /// `[0x65B928] ? 1 : RANDOMPLAYLIST` (§8.3, `shuffle_on`), so in the front end the list
+    /// always shuffles. 0x4D3420 sets the pointer at 0x4D3564 and clears it at 0x4D559A.
     front_end: bool,
     level: u8,
     /// `game.spl[0]` — the music trim (52 shipped, 80 compiled in).
     trim: u32,
     current: Option<Music>,
-    /// `MusicGlobals+0x10`: 0 at `MusicInit` (0x4ADFAE), 1 after the end-of-stream advance opens
-    /// the next song (0x4ADE0A), 0 again whenever a swap starts one (state 1, 0x4ADB6E) — what
-    /// `I_MUSIC` 0x4AD790 tests to decide between off and a new song
+    /// `MusicGlobals+0x10`, the one flag `I_MUSIC` 0x4AD790 reads (0x4AD830, its only reader in
+    /// the image) to choose between off and a new song. Its writers, all of them:
+    /// 0 at `MusicInit` (0x4ADFAE); **1 at the tail of every `MusicPlay`** that gets past the
+    /// volume and empty-list tests (0x4AE86D…0x4AE872, whichever of the three starts it took);
+    /// 1 when the end-of-stream advance opens the next song (0x4ADE0A); `I_MUSIC` itself 0 for
+    /// the off (0x4AD835) and 1 for a new song (0x4AD853); 0 on state 2's failure exit (0x4ADB6E,
+    /// the stream `+0x70 < 0` or `+0x6C == 0` — which also turns the music off). No swap, stop or
+    /// open clears it. So with music playing F9 turns it off, the next press starts a new song,
+    /// the next turns it off again — F9 alternates. *(Until that change the port cleared it on
+    /// every start, misreading 0x4ADB6E as the swap's, so F9 skipped songs and never stopped
+    /// one that `MusicPlay` had started.)*
     advanced: bool,
     /// `MusicGlobals+0x14` after an `I_MUSIC` press: state −1 (off, `None`) or 1 (a swap to
     /// that position) — the update waits for the stream's fade to reach 0 (0x4ADC88…0x4ADC9E,
@@ -206,6 +232,23 @@ pub struct MusicPlayer {
     /// `+0x16`), then ramps to this byte level in **5 ms** (0x4ADC6F `0x566AE0(+0x70, 5, level)`)
     /// and returns to state 0. `Some(level)` = in state 2 with that target.
     starting: Option<u8>,
+    /// **`MusicGlobals+0x20`**, the nominal length in ms of the fade a `MusicPlay` / `I_MUSIC` /
+    /// `MusicStop` started — what `MusicSetVolume` rescales (0x4AE8EE…0x4AE94F). Its writers on
+    /// the globals, all of them: **500** with `MusicPlay`'s fade (0x4AE798),
+    /// **1000** with `I_MUSIC`'s 500 ms fade (0x4AD818 — twice the fade itself), **`ms`** with
+    /// `MusicStop(ms)`'s from state 0 (0x4AE439); **0** at `MusicInit` (0x4ADF9C), `MusicStop(0)`
+    /// (0x4AE3F8), the swap's open in state 1 (0x4ADCCD) and `MusicPlay`'s direct open
+    /// (0x4AE7BE). The end-of-stream advance (0x4AD8B0) and the update's end of state −1
+    /// (0x4ADC7D) leave it. (0x4ADAE7 / 0x4ADB5B, the starved-stream exits of `MusicUpdate`,
+    /// have no port analogue.)
+    fade_ms: i32,
+    /// **`MusicGlobals+0x24`**, the shuffle flag: latched by every `MusicPlay` past its volume
+    /// and empty-list tests as `[0x65B928] ? 1 : RANDOMPLAYLIST` (0x4AE625…0x4AE63D) and read by
+    /// the end-of-stream advance only (0x4ADD95) — so the advance shuffles as the front end and
+    /// `RANDOMPLAYLIST` stood when the song's `MusicPlay` ran, not as they stand at its end.
+    /// `MusicInit`'s reset 0x4ADF50 does not write it; every way to a song
+    /// passes the latch first, so its first value is never read.
+    shuffle_on: bool,
 }
 
 /// One `MusicUpdate` call in state 2 (0x4ADBB9…0x4ADC87): until the stream runs (`+0x8C == 0`,
@@ -241,7 +284,8 @@ impl MusicPlayer {
             // `MusicInit` 0x4AE100 (once, from main's 0x4A6840 at 0x4B6B09) zeroes the list's
             // length `+8` (0x4ADFA5): nothing is listed until the race start's `MusicSetPlaylist`
             // or a front-end pattern fills it
-            playlist: Vec::new(),
+            slots: Vec::new(),
+            listed: 0,
             cur_set: false,
             pos: 0,
             shuffle: settings.shuffle,
@@ -252,12 +296,43 @@ impl MusicPlayer {
             advanced: false,
             pending: None,
             starting: None,
+            fade_ms: 0,
+            shuffle_on: false,
         })
     }
 
-    /// The stream indices in the playlist, in order (`PLAYLIST` in `fe.txt`).
+    /// The stream indices in the playlist, in order: `+0xE8[0..+8]` — a mode-1 jingle (at index
+    /// `+8`) and a mode-2 pick (with `+8 = 0`) are not in it.
     pub fn playlist(&self) -> &[usize] {
-        &self.playlist
+        &self.slots[..self.listed]
+    }
+
+    /// Write `list` into `+0xE8` from index 0 and make it the list (`+8`); the entries past it
+    /// stay as they were.
+    fn set_list(&mut self, list: &[usize]) {
+        if self.slots.len() < list.len() {
+            self.slots.resize(list.len(), 0);
+        }
+        self.slots[..list.len()].copy_from_slice(list);
+        self.listed = list.len();
+    }
+
+    /// `+0xE8[i] = v`, growing the port's array as needed.
+    fn set_slot(&mut self, i: usize, v: usize) {
+        if self.slots.len() <= i {
+            self.slots.resize(i + 1, 0);
+        }
+        self.slots[i] = v;
+    }
+
+    /// `MusicGlobals+0` (0x4AE614's test): `game.spl[0] · MUSICLEVEL >> 7`.
+    fn volume(&self) -> u32 {
+        (self.trim * self.level as u32) >> 7
+    }
+
+    /// 0x4AE625…0x4AE63D, `MusicPlay` past its two tests: `+0x24 = [0x65B928] ? 1 : [0x657A5C]`.
+    fn latch_shuffle(&mut self) {
+        self.shuffle_on = self.front_end || self.shuffle;
     }
 
     /// The saved playlist the race starts from, as the CD player edited it.
@@ -310,11 +385,13 @@ impl MusicPlayer {
     /// (0x4AE614 `cmp [edx], ebp ; je 0x4AE8A6`) or an empty list (0x4AE61C), position 0 for one
     /// song without a draw (0x4AE709), else `(|draw| % (n − 1) + cur + 1) % n` (0x4AE736…0x4AE763).
     fn race_start_pick(&mut self, draw: &mut dyn FnMut() -> u32) -> Option<usize> {
-        self.playlist = self.saved.clone();
-        let n = self.playlist.len();
-        if (self.trim * self.level as u32) >> 7 == 0 || n == 0 {
+        let saved = self.saved.clone();
+        self.set_list(&saved);
+        let n = self.listed;
+        if self.volume() == 0 || n == 0 {
             return None;
         }
+        self.latch_shuffle();
         let r = if n > 1 { abs_draw(draw()) } else { 0 };
         Some(Self::next_pos(n, self.cur(), r))
     }
@@ -322,17 +399,20 @@ impl MusicPlayer {
     /// **`MusicPlay(NULL, 0)`** 0x4AE4D0 alone, over the list as it stands — what the race pause's
     /// resume 0x4AB200 calls (0x4AB222), with no `MusicSetPlaylist` before it and no replay test:
     /// nothing with the volume `+0` at 0 or an empty list, else position 0 of a one-song list or
-    /// any entry but the current one. The list is the race's (with a jingle `MusicPlay(…, 1)`
-    /// appended), a `STARTREPLAY` playback's the front end's last pattern, and a command-line
-    /// playback's none (`MusicInit`'s, a playback skipping `MusicSetPlaylist`, 0x4A8A4A).
+    /// any entry but the current one. The list is the race's (a jingle `MusicPlay(…, 1)` sits
+    /// past its end and is not counted: after one the pick counts from the jingle's position
+    /// `oldN`, `(|r| % (oldN − 1) + oldN + 1) % oldN`, never entry 0), a
+    /// `STARTREPLAY` playback's the front end's last pattern, and a command-line playback's none
+    /// (`MusicInit`'s, a playback skipping `MusicSetPlaylist`, 0x4A8A4A).
     /// Returns whether a song was started. `draw` is `0x538040() + GetTickCount()`, called
     /// only for a list of more than one (as [`Self::start_race`]).
     pub fn play_next(&mut self, out: &AudioOutput, draw: &mut dyn FnMut() -> u32) -> bool {
-        let n = self.playlist.len();
-        if n == 0 || (self.trim * self.level as u32) >> 7 == 0 {
+        let n = self.listed;
+        if n == 0 || self.volume() == 0 {
             tracing::info!(listed = n, "MusicPlay(NULL, 0): no playlist or no volume, nothing plays");
             return false;
         }
+        self.latch_shuffle();
         let r = if n > 1 { abs_draw(draw()) } else { 0 };
         let pos = Self::next_pos(n, self.cur(), r);
         self.request(out, pos);
@@ -356,62 +436,197 @@ impl MusicPlayer {
     /// (state 2's start-up, which the port has no separate state for); while a stop or a swap is
     /// already running (`+0x14` −1 or 1) only the choice is replaced, the fade running on.
     /// *(Until batch A6 every `MusicPlay` cut the song and started the next at once.)*
+    ///
+    /// Every way through the tail ends at 0x4AE86D…0x4AE872: `+0x10 = 1`, so the
+    /// next F9 turns the music off.
+    ///
+    /// The state test is `+0x14 == 0` (0x4AE765): state 2 (the stream opened silent and waiting
+    /// to run — `starting`) is a state ≠ 0 like −1 and 1, so the call only makes it a swap (state
+    /// 1, the pick) with no fade, and the update opens the pick once the silent stream answers
+    /// level 0 (0x4ADC88). *(Until that change the port faded and kept `starting`, whose
+    /// 5 ms ramp then brought the stream up and the swap waited on it until the song ended.)*
+    /// The direct open clears `+0x20` (0x4AE7BE), the fade sets it to 500 (0x4AE798).
     fn request(&mut self, out: &AudioOutput, pos: usize) {
-        if self.pending.is_none() && !self.cur_set {
+        let idle = self.pending.is_none() && self.starting.is_none();
+        if idle && !self.cur_set {
             self.pos = pos;
             self.cur_set = true;
+            self.fade_ms = 0;
             self.play_current(out);
-            return;
+        } else {
+            if idle {
+                if let Some(m) = &self.current {
+                    out.fade(m.voice, 500, 0);
+                }
+                self.fade_ms = 500;
+            }
+            self.starting = None;
+            self.pos = pos;
+            self.cur_set = true;
+            self.pending = Some(Some(pos));
         }
-        if self.pending.is_none()
-            && let Some(m) = &self.current
-        {
-            out.fade(m.voice, 500, 0);
-        }
-        self.pos = pos;
-        self.cur_set = true;
-        self.pending = Some(Some(pos));
+        // 0x4AE872
+        self.advanced = true;
     }
 
-    /// `MusicPlay(pattern, mode)`: rebuild the playlist from a name pattern. Mode 1 appends the pick to
-    /// the saved list (the race-end jingles), mode 2 replaces the list with it (the congratulations
-    /// screen), mode 0 plays a random match (the front end).
+    /// **`MusicPlay(pattern, mode)`** 0x4AE4D0 with a pattern: rebuild the list from a name
+    /// pattern. Mode 1 adds the pick after the list as it stood (the race-end jingles), mode 2
+    /// keeps only the pick (the congratulations screen), mode 0 plays a random match (the front
+    /// end, the CD player).
+    ///
+    /// The sequence, to the instruction:
+    /// 1. 0x4AE4EA…0x4AE50E: the list as it stands (`+0xE8[0..+8]`, `oldN = +8`) copied aside.
+    /// 2. 0x4AE51F…0x4AE57A: `+8 = 0`, then every stream whose name matches appended while
+    ///    `+8 < 0x80`; none and `strlen(pattern) < 0x3D` → the same with `"*-%s"`
+    ///    (0x4AE585…0x4AE612). **The list is replaced before any test**: with the
+    ///    volume at 0, or no match at all, the call returns (0x4AE614 → 0x4AE8A6, 0x4AE61C →
+    ///    0x4AE898) with the matches — possibly none — as the list, mode 1 / 2's restore not
+    ///    made; a later `MusicSetVolume` raise from 0 (0x4AE978's `MusicPlay(NULL, 0)`), F9 or the
+    ///    pause's resume then picks from them. *(Until that change the port tested first and left
+    ///    the old list.)*
+    /// 3. Mode 1 (0x4AE651…0x4AE6BB): `pick = list[|draw| % n]`; the copy back into
+    ///    `+0xE8[0..oldN]`, `+0xE8[oldN] = pick`, **`+8 = oldN`**, position `oldN` — the jingle
+    ///    plays outside the list. Mode 2 (0x4AE6C5…0x4AE707): `+0xE8[0] = pick`, **`+8 = 0`**,
+    ///    position 0 — when it ends nothing follows (the advance opens nothing for `+8 == 0`,
+    ///    0x4ADDF2), F9 and `MusicPlay(NULL, 0)` do nothing. Mode 0: 0 for one match, else
+    ///    `|draw| % n` (0x4AE709…0x4AE734). *(Until that change the port counted the jingle in
+    ///    the list — after it the race list began again at entry 0 — appended it to the saved
+    ///    list rather than the current one, and replayed the `vic*` pick for ever.)*
+    /// 4. The tail, [`Self::request`].
     ///
     /// `draw` is `0x538040() + GetTickCount()` (mode 1 0x4AE65A, mode 2 0x4AE6CA, mode 0
     /// 0x4AE716), taken as a signed int's magnitude (`cdq ; xor ; sub`) and divided by the
     /// matches' count: modes 1 and 2 always draw, mode 0 only for more than one match.
     pub fn play_pattern(&mut self, out: &AudioOutput, pattern: &str, mode: u8, draw: &mut dyn FnMut() -> u32) {
-        let mut list: Vec<usize> = (0..self.names.len()).filter(|i| pattern_match(&self.names[*i], pattern)).collect();
-        if list.is_empty() && pattern.len() < 0x3D {
-            let alt = format!("*-{pattern}");
-            list = (0..self.names.len()).filter(|i| pattern_match(&self.names[*i], &alt)).collect();
+        let old: Vec<usize> = self.playlist().to_vec();
+        let old_n = old.len();
+        self.rebuild(pattern);
+        if self.listed == 0 && pattern.len() < 0x3D {
+            self.rebuild(&format!("*-{pattern}"));
         }
-        list.truncate(128);
-        // 0x4AE614 / 0x4AE61C: nothing with the volume `MusicGlobals+0` (`game.spl[0] · level >> 7`)
-        // at 0 or no match — before any draw
-        if (self.trim * self.level as u32) >> 7 == 0 || list.is_empty() {
+        // 0x4AE614 / 0x4AE61C: nothing more with the volume `MusicGlobals+0` at 0 or no match —
+        // before any draw, the list already replaced
+        if self.volume() == 0 || self.listed == 0 {
             return;
         }
-        let n = list.len();
-        match mode {
+        self.latch_shuffle();
+        let n = self.listed;
+        let pos = match mode {
             1 => {
-                let pick = list[abs_draw(draw()) % n];
-                self.playlist = self.saved.clone();
-                self.playlist.push(pick);
-                self.pos = self.playlist.len() - 1;
+                let pick = self.slots[abs_draw(draw()) % n];
+                self.set_list(&old);
+                self.set_slot(old_n, pick);
+                self.listed = old_n;
+                old_n
             }
             2 => {
-                let pick = list[abs_draw(draw()) % n];
-                self.playlist = vec![pick];
-                self.pos = 0;
+                let pick = self.slots[abs_draw(draw()) % n];
+                self.set_slot(0, pick);
+                self.listed = 0;
+                0
             }
             _ => {
-                self.playlist = list;
-                self.pos = if n == 1 { 0 } else { abs_draw(draw()) % n };
+                if n == 1 {
+                    0
+                } else {
+                    abs_draw(draw()) % n
+                }
+            }
+        };
+        self.request(out, pos);
+    }
+
+    /// 0x4AE51F…0x4AE57A (and 0x4AE5B3…0x4AE612 for the retry): `+8 = 0`, then each stream in
+    /// directory order whose name `PatternMatch`es (0x4A5F90) appended while `+8 < 0x80`.
+    fn rebuild(&mut self, pattern: &str) {
+        self.listed = 0;
+        for i in 0..self.names.len() {
+            if self.listed >= 0x80 {
+                break;
+            }
+            if pattern_match(&self.names[i], pattern) {
+                let k = self.listed;
+                self.set_slot(k, i);
+                self.listed += 1;
             }
         }
-        let pos = self.pos;
-        self.request(out, pos);
+    }
+
+    /// **`MusicSetVolume(v)`** 0x4AE8C0, `v = MusicLevelToVolume(level)` (0x4A82F0,
+    /// `game.spl[0] · level >> 7`) — what the `Audio.MusicLevel` accessor's commit callback
+    /// 0x4E47B0 calls with the accessor's value whenever `SetSelection` 0x4BC240 stores one (a
+    /// slider step; a profile's `LoadAccessors` 0x4B7FD0 → Load 0x4BC480). The
+    /// port keeps the raw level (the jingles' `[0x5D1740]`) and works `+0` out of it.
+    /// * `v` equal to `+0`: nothing (0x4AE8D7).
+    /// * `v == 0`: `+0 = 0`, `MusicStop(0)` (0x4AE8E1…0x4AE8E4).
+    /// * **a fade running** (`+0x20 != 0`, 0x4AE8F5) with the stream's level `cur` (0x567850) and
+    ///   `+0` both above 0: `t = +0x20 · cur / +0` (0x4AE91E…0x4AE922, `idiv`, toward zero) and,
+    ///   for `t != 0`, the stream's level set to `t · v / +0x20` (0x4AE92A…0x4AE935, 0x567810)
+    ///   and the fade begun again to 0 over `t` ms (0x4AE947, 0x566AE0) — [`Self::rescale`].
+    /// `+0x20` stays as it was.
+    /// * otherwise, unless the player is in state 2 (0x4AE958), `0x567810(+0x70, v)`: the level
+    ///   at once ([`AudioOutput::stream_level`]) — also over a swap or a stop waiting in state 1 /
+    ///   −1, whose stream the update then waits for while it answers a level (0x4ADC94).
+    /// * then `+0 = v` and, **when `+0` was 0, `MusicPlay(NULL, 0)`** (0x4AE96E…0x4AE97C) — a pick
+    ///   from the list as it stands, which a pattern call made at volume 0 has replaced.
+    /// 
+    ///
+    /// State 2 (the stream opening silent) reads `+0` when it ramps (0x4ADC4F), so the port's
+    /// ramp target follows. *(Until that change the level was a one-tick ramp and a running
+    /// fade was left alone.)*
+    pub fn set_level(&mut self, out: &AudioOutput, level: u8, draw: &mut dyn FnMut() -> u32) {
+        let old = self.volume() as i32;
+        let raw_changed = level != self.level;
+        self.level = level;
+        let v = self.volume() as i32;
+        if raw_changed
+            && self.starting.is_some()
+            && let Some(name) = self.current_name()
+        {
+            self.starting = Some(self.level_byte_for(&name) as u8);
+        }
+        if v == old {
+            return;
+        }
+        if v == 0 {
+            self.stop(out);
+            return;
+        }
+        if let Some(m) = &self.current {
+            // 0x567850: the voice's level byte; a stream out of the mix answers its `+0xE4`, the
+            // 0 its last fade or the advance (0x4ADDE4) left there
+            let cur = out.stream_volume(m.voice).map_or(0, |x| (x * 127.0).round() as i32);
+            match Self::rescale(self.fade_ms, cur, old, v) {
+                Some((lvl, t)) => {
+                    out.stream_level(m.voice, lvl);
+                    out.fade(m.voice, t, 0);
+                }
+                None if self.starting.is_none() => out.stream_level(m.voice, v),
+                None => {}
+            }
+        }
+        if old == 0 {
+            self.play_next(out, draw);
+        }
+    }
+
+    /// 0x4AE8EE…0x4AE94F: with a fade of nominal `ms` (`+0x20`) running, the stream at `cur`
+    /// and the old `+0` `old` both above 0, `t = ms · cur / old` and, for `t != 0`, the level
+    /// `t · v / ms` and the new fade's length `t` (`imul` / `cdq` / `idiv`, toward zero).
+    fn rescale(ms: i32, cur: i32, old: i32, v: i32) -> Option<(i32, i32)> {
+        if ms == 0 || cur <= 0 || old <= 0 {
+            return None;
+        }
+        let t = ms.wrapping_mul(cur) / old;
+        if t == 0 {
+            return None;
+        }
+        Some((t.wrapping_mul(v) / ms, t))
+    }
+
+    /// The name of the stream at the current position (`+0xE8[+0xC]`).
+    fn current_name(&self) -> Option<String> {
+        self.slots.get(self.pos).and_then(|&i| self.names.get(i)).cloned()
     }
 
     /// `game.spl[0]` again, after the race audio init swapped the block (`nfs_formats::spl::select_mix`).
@@ -445,6 +660,8 @@ impl MusicPlayer {
             self.pending = None;
             self.end_stream(out);
             if let Some(pos) = next {
+                // state 1's open: `+0x20 = 0` (0x4ADCCD); state −1 leaves it (0x4ADC7D)
+                self.fade_ms = 0;
                 self.pos = pos;
                 self.cur_set = true;
                 self.play_current(out);
@@ -458,12 +675,15 @@ impl MusicPlayer {
         if !done {
             return;
         }
-        let n = self.playlist.len();
+        // 0x4ADD85 / 0x4ADDF2: the list's length `+8`; with none (after a `vic*` mode 2, or a
+        // mode-1 jingle over an empty list) the stream is set to 0 and nothing opens
+        let n = self.listed;
         if n == 0 {
             self.current = None;
             return;
         }
-        let shuffle = self.shuffle || self.front_end;
+        // `+0x24` as the song's `MusicPlay` latched it (0x4ADD95), not the flags as they stand
+        let shuffle = self.shuffle_on;
         let r = if n > 1 && shuffle { draw() } else { 0 };
         self.pos = Self::advance_pos(n, self.pos, shuffle, r);
         self.play_current(out);
@@ -486,11 +706,13 @@ impl MusicPlayer {
     }
 
     /// **`I_MUSIC` (F9), 0x4AD790** — nothing without a playlist (`+8`) or with the music volume
-    /// `+0` at 0. After a song that began by the end-of-stream advance (`+0x10` set) it turns the
-    /// music **off**: state −1, position −1. Otherwise it asks for **another song**: `+0x10` set,
-    /// state 1 (a swap), the position 0 for a one-song list or `|0x538040() + timeGetTime()| % n`
-    /// (0x4AD87E…0x4AD89C) — and the swap clears `+0x10` again when it starts the song
-    /// (0x4ADB6E), so the next press picks again. Either way a song that is playing (state 0,
+    /// `+0` at 0. With `+0x10` set — after any `MusicPlay` (0x4AE872), an end-of-stream advance
+    /// (0x4ADE0A) or a press that started a song — it turns the music **off**: `+0x10 = 0`, state
+    /// −1, position −1 (0x4AD835…0x4AD84B). With it clear (after an off, or before any song) it
+    /// asks for **another song**: `+0x10 = 1`, state 1 (a swap), the position 0 for a one-song
+    /// list or `|0x538040() + timeGetTime()| % n` (0x4AD853…0x4AD89C). Nothing on the way clears
+    /// the flag again, so presses alternate off / new song (0x4ADB6E, read before
+    /// as the swap's clear, is state 2's failure exit). Either way a song that is playing (state 0,
     /// position > −1) is first faded out over 500 ms (`0x566AE0(+0x70, 0x1F4, 0)`, 0x4AD800…
     /// 0x4AD80A, `+0x20 = 1000`) and the update carries the change out once it is silent.
     /// *(Until 2026-09-26 the song stopped at once.)*
@@ -498,17 +720,21 @@ impl MusicPlayer {
     /// `draw` is the pick's `0x538040() + timeGetTime()`, called only on the way to a new song
     /// of a longer list.
     pub fn toggle(&mut self, out: &AudioOutput, draw: &mut dyn FnMut() -> u32) {
-        if self.playlist.is_empty() || (self.trim * self.level as u32) >> 7 == 0 {
+        if self.listed == 0 || self.volume() == 0 {
             return;
         }
-        if self.pending.is_none()
-            && let Some(m) = &self.current
-        {
-            out.fade(m.voice, 500, 0);
+        // 0x4AD7F5…0x4AD818: state 0 with a song chosen — the fade and `+0x20 = 1000`; in any
+        // other state (state 2 included) the press only replaces it below
+        if self.pending.is_none() && self.starting.is_none() && self.cur_set {
+            if let Some(m) = &self.current {
+                out.fade(m.voice, 500, 0);
+            }
+            self.fade_ms = 1000;
         }
+        self.starting = None;
         // the draw is taken only on the way to a new song of a longer list (0x4AD87E)
-        let draw = if !self.advanced && self.playlist.len() > 1 { draw() } else { 0 };
-        let next = Self::toggle_step(self.advanced, self.playlist.len(), draw);
+        let draw = if !self.advanced && self.listed > 1 { draw() } else { 0 };
+        let next = Self::toggle_step(self.advanced, self.listed, draw);
         // 0x4AD835 / 0x4AD853: `+0x10` cleared for the off, set for the swap
         self.advanced = next.is_some();
         // the press writes the state and the position together (−1 / −1 for the off, 1 / the
@@ -547,6 +773,8 @@ impl MusicPlayer {
         self.pending = None;
         self.starting = None;
         self.cur_set = false;
+        // 0x4AE3F8
+        self.fade_ms = 0;
         self.end_stream(out);
     }
 
@@ -567,10 +795,13 @@ impl MusicPlayer {
         if !self.cur_set {
             return;
         }
-        if self.pending.is_none()
-            && let Some(m) = &self.current
-        {
-            out.fade(m.voice, ms as i32, 0);
+        // state 0 only (0x4AE41C): the fade and `+0x20 = ms` (0x4AE439); in state 1 / 2 / −1
+        // only the state and the position change
+        if self.pending.is_none() && self.starting.is_none() {
+            if let Some(m) = &self.current {
+                out.fade(m.voice, ms as i32, 0);
+            }
+            self.fade_ms = ms as i32;
         }
         self.starting = None;
         self.pending = Some(None);
@@ -585,11 +816,11 @@ impl MusicPlayer {
     }
 
     fn play_current(&mut self, out: &AudioOutput) {
-        // a swap (state 1) clears `+0x10` (0x4ADB6E); the advance sets it back after this
-        self.advanced = false;
+        // no open touches `+0x10` (the swap's 0x4ADCCD…0x4ADD63, 0x4AE7BE…0x4AE86A, 0x4AD8B0)
         // a new start replaces whatever an `I_MUSIC` press left waiting
         self.pending = None;
-        let Some(&idx) = self.playlist.get(self.pos) else { return };
+        // `+0xE8[+0xC]`, past `+8` for a mode-1 jingle (0x4AE7E7 / 0x4ADCDE / 0x4AD8C2)
+        let Some(&idx) = self.slots.get(self.pos) else { return };
         let Some(name) = self.names.get(idx).cloned() else { return };
         let vol = self.volume_for(&name);
         let target = self.level_byte_for(&name) as u8;
@@ -656,7 +887,8 @@ mod tests {
         MusicPlayer {
             dir: PathBuf::new(),
             names: vec!["a".into(), "b".into()],
-            playlist,
+            listed: playlist.len(),
+            slots: playlist,
             saved,
             cur_set: false,
             pos: 0,
@@ -668,6 +900,8 @@ mod tests {
             advanced: false,
             pending: None,
             starting: None,
+            fade_ms: 0,
+            shuffle_on: false,
         }
     }
 
@@ -741,14 +975,14 @@ mod tests {
         let Ok(out) = AudioOutput::new() else { return }; // no audio device on this host
         let mut exhausted = bare(vec![], vec![0, 1]);
         assert!(!exhausted.play_next(&out, &mut || 0), "no candidates left: MusicPlay(NULL, 0) plays nothing");
-        assert!(exhausted.playlist.is_empty(), "play_next never refills from `saved`");
+        assert!(exhausted.playlist().is_empty(), "play_next never refills from `saved`");
 
         // Contrast: `start_race` (the wrong call the port's `PLAYSONG` used to make for this arm)
         // rebuilds the list from `saved` and would have picked from it — the divergence this test
         // guards against regressing.
         let mut same_state = bare(vec![], vec![0, 1]);
         same_state.start_race(&out, &mut || 0);
-        assert_eq!(same_state.playlist, vec![0, 1], "start_race resets the list from `saved` — not PLAYSONG's rule");
+        assert_eq!(same_state.playlist(), [0, 1], "start_race resets the list from `saved` — not PLAYSONG's rule");
     }
 
     #[test]
@@ -794,6 +1028,14 @@ mod tests {
     }
 
     #[test]
+    fn the_front_end_levels_start_at_the_constructors_value() {
+        // 0x4BA310(…, 0x7F, 0, 0x7F, 0, cb): whatever `fe.txt` said
+        let mut s = Settings { music_level: 10, sfx_level: 20, engine_level: 30, speech_level: 40, ambient_level: 0, ..Settings::default() };
+        s.front_end_defaults();
+        assert_eq!([s.music_level, s.sfx_level, s.engine_level, s.speech_level, s.ambient_level], [0x7F; 5]);
+    }
+
+    #[test]
     fn settings_default_to_the_shipped_playlist() {
         let s = Settings::default();
         assert_eq!(s.playlist, (0..11).collect::<Vec<_>>());
@@ -803,7 +1045,7 @@ mod tests {
 
     #[test]
     fn jingles_are_louder_than_the_race_playlist() {
-        let p = MusicPlayer { dir: PathBuf::new(), names: Vec::new(), playlist: Vec::new(), saved: Vec::new(), cur_set: false, pos: 0, shuffle: false, front_end: false, level: 127, trim: 52, current: None, advanced: false, pending: None, starting: None };
+        let p = MusicPlayer { dir: PathBuf::new(), names: Vec::new(), slots: Vec::new(), listed: 0, saved: Vec::new(), cur_set: false, pos: 0, shuffle: false, front_end: false, level: 127, trim: 52, current: None, advanced: false, pending: None, starting: None, fade_ms: 0, shuffle_on: false };
         // the shipped game.spl[0] = 52: 52 · 127 >> 7 = 51 of 127 for a race track, the raw 127 for a jingle
         assert!((p.volume_for("game13-Activator-Morphadron") - 51.0 / 127.0).abs() < 1e-6);
         assert_eq!(p.volume_for("win04-Victory-Cypher"), 1.0);
@@ -814,7 +1056,7 @@ mod tests {
 #[cfg(test)]
 mod toggle_tests {
     use super::tests::bare;
-    use super::{AudioOutput, MusicPlayer, Settings};
+    use super::{AudioOutput, Music, MusicPlayer, Settings, StreamSource, VoiceId};
 
     #[test]
     fn f10_keeps_the_levels_and_gives_them_back() {
@@ -885,13 +1127,309 @@ mod toggle_tests {
             calls += 1;
             (-5i32) as u32
         });
-        assert_eq!((calls, m.playlist.clone(), m.pos), (1, vec![1, 2, 3], 5 % 3));
+        assert_eq!((calls, m.playlist().to_vec(), m.pos), (1, vec![1, 2, 3], 5 % 3));
         let mut calls = 0;
         m.play_pattern(&out, "win*", 1, &mut || {
             calls += 1;
             9
         });
-        assert_eq!((calls, m.playlist.last().copied()), (1, Some(4)));
+        // the jingle at index `oldN` = 3, outside the list `+8 = 3` (0x4AE6A3 / 0x4AE6B0)
+        assert_eq!((calls, m.slots[3], m.playlist().to_vec(), m.pos), (1, 4, vec![1, 2, 3], 3));
+    }
+
+    /// Eleven `game*` songs (0..=10) and four of each jingle group after them.
+    fn race_player() -> MusicPlayer {
+        let mut m = bare(Vec::new(), (0..11).collect());
+        m.names = (0..11).map(|i| format!("game{i:02}")).chain((1..=4).map(|i| format!("win0{i}"))).chain((1..=4).map(|i| format!("lose0{i}"))).chain(["vic01".to_string()]).collect();
+        m
+    }
+
+    /// mode 1 (0x4AE651…0x4AE6BB): the race-end jingle is written at index `oldN`
+    /// of the **current** list, which keeps `+8 = oldN`; the end-of-stream advance and the
+    /// resume's `MusicPlay(NULL, 0)` then count from position `oldN` over `oldN` entries.
+    #[test]
+    fn a_jingle_plays_past_the_list_and_what_follows_counts_from_it() {
+        let out = AudioOutput::offline();
+        let mut m = race_player();
+        m.start_race(&out, &mut || 3);
+        assert_eq!((m.playlist().len(), m.pos), (11, 3 % 10));
+        m.play_pattern(&out, "win*", 1, &mut || 6);
+        // `win03` = stream 13, at index 11; the list is still the 11 race songs
+        assert_eq!((m.playlist().to_vec(), m.slots[11], m.pos), ((0..11).collect::<Vec<_>>(), 13, 11));
+        assert_eq!(m.current_name(), Some("win03".to_string()));
+        // the advance after the jingle (0x4ADD6D…): sequential `(11 + 1) % 11` = entry 1 (the
+        // port counted the jingle and went to entry 0); shuffled `(|r| % 10 + 1 + 11) % 11`, never 0
+        assert_eq!(MusicPlayer::advance_pos(m.playlist().len(), m.pos, false, 0), 1);
+        assert!((0..100u32).all(|r| (1..11).contains(&MusicPlayer::advance_pos(11, 11, true, r))));
+        // a second jingle replaces the first at the same index, the list unchanged
+        m.play_pattern(&out, "lose*", 1, &mut || 1);
+        assert_eq!((m.playlist().len(), m.slots[11], m.pos), (11, 16, 11));
+    }
+
+    /// the race pause's resume (0x4AB222, `MusicPlay(NULL, 0)`) after a jingle
+    /// picks `(|r| % (oldN − 1) + oldN + 1) % oldN` — one of entries 1..oldN−1.
+    #[test]
+    fn the_resume_after_a_jingle_picks_from_the_race_list_counting_from_the_jingle() {
+        let out = AudioOutput::offline();
+        let mut m = race_player();
+        m.start_race(&out, &mut || 0);
+        m.play_pattern(&out, "lose*", 1, &mut || 0);
+        assert_eq!(m.pos, 11);
+        m.stop(&out);
+        // the stop forgets the position (`+0xC = −1`): the resume counts from −1
+        assert!(m.play_next(&out, &mut || 4));
+        assert_eq!(m.pos, 4 % 10);
+        // without the stop, from the jingle's position
+        let mut m = race_player();
+        m.start_race(&out, &mut || 0);
+        m.play_pattern(&out, "lose*", 1, &mut || 0);
+        assert!(m.play_next(&out, &mut || 4));
+        assert_eq!(m.pos, (4 % 10 + 11 + 1) % 11);
+        assert!((0..50u32).all(|r| (1..11).contains(&MusicPlayer::next_pos(11, 11, r as usize))));
+    }
+
+    /// mode 2 (0x4AE6C5…0x4AE707): the congratulations screen's `vic*` pick is
+    /// written at index 0 with `+8 = 0` — it plays, and then nothing: the advance opens nothing,
+    /// F9 and `MusicPlay(NULL, 0)` return at once.
+    #[test]
+    fn the_congratulations_pick_leaves_no_list() {
+        let out = AudioOutput::offline();
+        let mut m = race_player();
+        m.start_race(&out, &mut || 0);
+        m.play_pattern(&out, "vic*", 2, &mut || 0);
+        assert_eq!((m.playlist().len(), m.slots[0], m.pos), (0, 19, 0));
+        assert_eq!(m.current_name(), Some("vic01".to_string()));
+        assert!(!m.play_next(&out, &mut || unreachable!("no list, no draw")));
+        let pending = m.pending;
+        m.toggle(&out, &mut || unreachable!("no list, no draw"));
+        assert_eq!(m.pending, pending, "F9 does nothing with `+8 == 0`");
+    }
+
+    /// a race-start song begun with nothing chosen leaves `+0x10 = 1` (0x4AE872),
+    /// so F9 turns the music off; the next press starts a new song (and sets it, 0x4AD853), the
+    /// next turns it off — also after the swap has opened that song (no open clears it).
+    #[test]
+    fn f9_after_a_song_started_without_a_pick_turns_the_music_off() {
+        let out = AudioOutput::offline();
+        let mut m = race_player();
+        assert!(!m.advanced, "MusicInit's 0 (0x4ADFAE)");
+        m.start_race(&out, &mut || 0);
+        assert!(m.advanced && m.cur_set && m.pending.is_none());
+        m.toggle(&out, &mut || unreachable!("the off draws nothing"));
+        assert_eq!((m.pending, m.cur_set, m.advanced), (Some(None), false, false));
+        m.update(&out, &mut || 0);
+        assert!(m.pending.is_none() && m.current.is_none());
+        m.toggle(&out, &mut || 7);
+        assert_eq!((m.pending, m.advanced), (Some(Some(7 % 11)), true));
+        // the swap opens it (state 1 → 2) and leaves the flag set
+        m.update(&out, &mut || 0);
+        assert!(m.pending.is_none() && m.advanced);
+        m.toggle(&out, &mut || unreachable!("the off draws nothing"));
+        assert_eq!(m.pending, Some(None));
+        // a `MusicPlay` swap over a playing song (the front end's pattern) sets it as well
+        let mut m = race_player();
+        m.start_race(&out, &mut || 0);
+        m.advanced = false;
+        m.play_pattern(&out, "game*", 0, &mut || 2);
+        assert_eq!((m.pending, m.advanced), (Some(Some(2)), true));
+        m.update(&out, &mut || 0);
+        assert!(m.advanced, "the swap's open does not clear `+0x10`");
+    }
+
+    /// the pattern list is rebuilt before the volume test (0x4AE51F…0x4AE614): at
+    /// volume 0 the call replaces the list and returns without a draw — mode 1's restore not
+    /// made — and `MusicSetVolume`'s raise from 0 (0x4AE978) then plays `MusicPlay(NULL, 0)`
+    /// from that list.
+    #[test]
+    fn a_pattern_at_volume_zero_replaces_the_list_and_the_raise_plays_from_it() {
+        let out = AudioOutput::offline();
+        let mut m = race_player();
+        m.start_race(&out, &mut || 0);
+        m.set_level(&out, 0, &mut || unreachable!("the stop draws nothing"));
+        assert!(!m.cur_set, "MusicSetVolume(0): MusicStop(0) (0x4AE8E4)");
+        m.play_pattern(&out, "win*", 1, &mut || unreachable!("no volume, no draw"));
+        assert_eq!(m.playlist(), [11, 12, 13, 14], "the matches, not the race list with the jingle");
+        assert!(!m.cur_set && m.pending.is_none(), "no tail");
+        m.advanced = false;
+        m.set_level(&out, 127, &mut || 2);
+        // from −1: `(|r| % 3 + 0) % 4` = 2 → `win03`
+        assert_eq!((m.cur_set, m.pos, m.advanced), (true, 2, true));
+        assert_eq!(m.current_name(), Some("win03".to_string()));
+        // an unchanged `+0` does nothing; a pattern with no match at all empties the list
+        m.set_level(&out, 127, &mut || unreachable!());
+        m.play_pattern(&out, "nothing", 0, &mut || unreachable!("no match, no draw"));
+        assert!(m.playlist().is_empty());
+    }
+
+    /// A stream of no data playing as the current song at `level` (a byte), for the tests of
+    /// the player's state without `zzzymus.viv`. `finished` marks its source as played out.
+    fn with_stream(m: &mut MusicPlayer, out: &AudioOutput, level: i32, finished: bool) -> VoiceId {
+        let src = StreamSource::new(22050, 1);
+        src.finished.store(finished, std::sync::atomic::Ordering::Release);
+        let voice = out.play_stream(src.clone(), level as f32 / 127.0);
+        m.current = Some(Music { voice, title: "game00".into(), src, _thread: std::thread::spawn(|| {}) });
+        voice
+    }
+
+    /// One 10 ms render of the offline mixer (four calls each).
+    fn tick(out: &AudioOutput) {
+        for _ in 0..4 {
+            out.fade(VoiceId(u32::MAX), 0, 0);
+        }
+    }
+
+    fn byte(out: &AudioOutput, v: VoiceId) -> i32 {
+        out.stream_volume(v).map_or(-1, |x| (x * 127.0).round() as i32)
+    }
+
+    /// 0x4AE8EE…0x4AE94F: `t = +0x20 · cur / +0`, the level `t · v / +0x20`,
+    /// the fade again over `t` ms; no rescale without a fade, a level or a `+0`, or for `t == 0`.
+    #[test]
+    fn the_running_fade_is_rescaled_to_the_new_volume() {
+        // F9's fade (`+0x20` 1000) from `+0` 51 at level 41, the slider to 64 (`+0` 26)
+        assert_eq!(MusicPlayer::rescale(1000, 41, 51, 26), Some((1000 * 41 / 51 * 26 / 1000, 1000 * 41 / 51)));
+        assert_eq!(MusicPlayer::rescale(1000, 41, 51, 26), Some((20, 803)));
+        // `MusicStop(1500)` half-way, the volume doubled: the level doubles, the time is what was left
+        assert_eq!(MusicPlayer::rescale(1500, 20, 40, 80), Some((40, 750)));
+        assert_eq!(MusicPlayer::rescale(0, 41, 51, 26), None, "no fade: the level at once");
+        assert_eq!(MusicPlayer::rescale(500, 0, 51, 26), None, "the fade at 0");
+        assert_eq!(MusicPlayer::rescale(500, 41, 0, 26), None, "`+0` 0");
+        assert_eq!(MusicPlayer::rescale(1, 1, 51, 26), None, "`t` 0 (0x4AE928)");
+    }
+
+    /// on the offline mixer: a slider change during F9's fade sets the stream's
+    /// level at once to `t · v / +0x20` and the fade runs on from there over `t` ms; without a
+    /// fade the level is the new `+0` at once (0x567810), not a ramp.
+    #[test]
+    fn a_volume_change_during_a_fade_restarts_it_from_the_new_level() {
+        let out = AudioOutput::offline();
+        let mut m = race_player();
+        m.start_race(&out, &mut || 0);
+        // the song at `+0` = 52 · 127 >> 7 = 51, state 0
+        let v = with_stream(&mut m, &out, 51, false);
+        assert_eq!(m.fade_ms, 0, "the direct open (0x4AE7BE)");
+        // no fade: the level at once (0x4AE951…0x4AE960)
+        m.set_level(&out, 100, &mut || unreachable!());
+        assert_eq!(byte(&out, v), (52 * 100) >> 7);
+        m.set_level(&out, 127, &mut || unreachable!());
+        assert_eq!(byte(&out, v), 51);
+        // F9 off: 500 ms fade, `+0x20 = 1000` (0x4AD818)
+        m.toggle(&out, &mut || unreachable!("the off draws nothing"));
+        assert_eq!((m.fade_ms, m.pending), (1000, Some(None)));
+        for _ in 0..10 {
+            tick(&out);
+        }
+        let cur = byte(&out, v);
+        assert!((38..=42).contains(&cur), "ten ticks of the 50-tick fade: {cur}");
+        m.set_level(&out, 64, &mut || unreachable!());
+        let (lvl, t) = MusicPlayer::rescale(1000, cur, 51, (52 * 64) >> 7).unwrap();
+        assert!(byte(&out, v) == lvl || byte(&out, v) == lvl - 1, "{} vs {lvl}", byte(&out, v));
+        assert_eq!(m.fade_ms, 1000, "`+0x20` stays");
+        // the fade now ends `t` ms later (one step a 10 ms tick, the goal on the last)
+        let mut ticks = 0;
+        while byte(&out, v) > 0 && ticks < 1000 {
+            tick(&out);
+            ticks += 1;
+        }
+        // (the byte is 0 a step before the goal: `t / 10 / lvl` ticks early at most) — the fade
+        // left alone would have been silent after ~40 more
+        let n = t / 10;
+        assert!((n - n / lvl - 2..=n + 1).contains(&ticks), "faded out after {ticks} ticks, t = {t} ms");
+    }
+
+    /// `+0x20`'s writers — 500 with `MusicPlay`'s fade, `ms` with `MusicStop(ms)`
+    /// from state 0, 0 at the swap's open and at `MusicStop(0)`; a state-1 stop leaves it.
+    #[test]
+    fn the_fade_length_follows_its_writers() {
+        let out = AudioOutput::offline();
+        let mut m = race_player();
+        m.start_race(&out, &mut || 0);
+        with_stream(&mut m, &out, 0, false);
+        m.play_pattern(&out, "game*", 0, &mut || 4);
+        assert_eq!((m.fade_ms, m.pending), (500, Some(Some(4))), "0x4AE798");
+        // state 1: MusicStop(1500) does not touch it (0x4AE41F → 0x4AE44E)
+        m.stop_fade(&out, 1500);
+        assert_eq!((m.fade_ms, m.pending), (500, Some(None)));
+        m.update(&out, &mut || 0);
+        assert_eq!(m.fade_ms, 500, "state −1's end leaves it (0x4ADC7D)");
+        // a new start with nothing chosen: the direct open clears it
+        m.play_pattern(&out, "game*", 0, &mut || 1);
+        assert_eq!(m.fade_ms, 0, "0x4AE7BE");
+        with_stream(&mut m, &out, 51, false);
+        m.starting = None;
+        m.stop_fade(&out, 1500);
+        assert_eq!(m.fade_ms, 1500, "0x4AE439");
+        m.request(&out, 2);
+        assert_eq!(m.fade_ms, 1500, "a pick over the stop only replaces the choice");
+        m.current = None;
+        m.update(&out, &mut || 0);
+        assert_eq!(m.fade_ms, 0, "the swap's open (0x4ADCCD)");
+        m.fade_ms = 7;
+        m.stop(&out);
+        assert_eq!(m.fade_ms, 0, "MusicStop(0) (0x4AE3F8)");
+    }
+
+    /// `MusicPlay` and `I_MUSIC` in state 2 (0x4AE765 /
+    /// 0x4AD7F5 test `+0x14 == 0`) make a swap / an off without a fade, and the update opens
+    /// the pick as soon as the silent stream answers level 0 (0x4ADC88).
+    #[test]
+    fn a_pick_while_a_song_is_starting_swaps_without_a_fade() {
+        let out = AudioOutput::offline();
+        let mut m = race_player();
+        m.start_race(&out, &mut || 0);
+        let v = with_stream(&mut m, &out, 0, false);
+        m.starting = Some(51);
+        m.play_pattern(&out, "game*", 0, &mut || 5);
+        assert_eq!((m.starting, m.pending, m.fade_ms), (None, Some(Some(5)), 0));
+        m.update(&out, &mut || 0);
+        assert!(m.pending.is_none(), "the silent stream does not hold the swap");
+        assert!(!out.is_playing(v), "the old stream is stopped");
+        // F9 in state 2: the off with no fade and no `+0x20`
+        let mut m = race_player();
+        m.start_race(&out, &mut || 0);
+        with_stream(&mut m, &out, 0, false);
+        m.starting = Some(51);
+        m.toggle(&out, &mut || unreachable!());
+        assert_eq!((m.starting, m.pending, m.fade_ms), (None, Some(None), 0));
+    }
+
+    /// the end-of-stream advance (0x4ADD95) reads `+0x24` as `MusicPlay`
+    /// latched it (0x4AE625…0x4AE63D), not the front-end flag or `RANDOMPLAYLIST` at the end.
+    #[test]
+    fn the_advance_shuffles_as_the_songs_musicplay_latched_it() {
+        let out = AudioOutput::offline();
+        // latched off (the race, no `randomplaylist`), the front end's flag set before the end
+        let mut m = race_player();
+        m.start_race(&out, &mut || 0);
+        assert!(!m.shuffle_on);
+        let v = with_stream(&mut m, &out, 51, true);
+        m.set_front_end(true);
+        m.set_shuffle(true);
+        tick(&out);
+        assert!(!out.is_playing(v), "the played-out stream has left the mix");
+        let pos = m.pos;
+        m.update(&out, &mut || panic!("a sequential advance draws nothing"));
+        assert_eq!(m.pos, (pos + 1) % 11);
+        // latched on (the front end), the flags cleared before the end: shuffled
+        let mut m = race_player();
+        m.set_front_end(true);
+        m.start_race(&out, &mut || 0);
+        assert!(m.shuffle_on);
+        m.set_front_end(false);
+        with_stream(&mut m, &out, 51, true);
+        tick(&out);
+        let (pos, mut drew) = (m.pos, false);
+        m.update(&out, &mut || {
+            drew = true;
+            4
+        });
+        assert!(drew);
+        assert_eq!(m.pos, (4 % 10 + 1 + pos) % 11);
+        // a call that returns before the latch (volume 0, 0x4AE614) leaves it
+        m.set_shuffle(false);
+        m.level = 0;
+        m.play_pattern(&out, "game*", 0, &mut || unreachable!());
+        assert!(m.shuffle_on);
     }
 }
 

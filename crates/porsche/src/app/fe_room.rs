@@ -705,10 +705,23 @@ impl App {
         self.camera.position = Vec3::ZERO;
         self.camera.target = Vec3::Z;
         self.camera.up = Vec3::Y;
-        // `V.A.` is the half-angle: with the full angle the two `carcompare` cars land far outside
-        // the rectangles their widgets carry, and with twice it they land inside them
-        // (`RE/notes/frontend-3d.md` §2, HIGH).
-        self.camera.fov_y_radians = (room.view_angle * 2.0).to_radians();
+        // `V.A.` (`+0x290`) is the FE view's **horizontal** half-angle: 0x4E84A0 →
+        // 0x4D6240 stores it in the view `[0x65B928]+0xFC`'s `+0x130`, which 0x466F30 doubles into
+        // 0x5391B0 (`m00 = cot h`, `m11 = cot h · A`); that view is built full-screen (0x4D3728:
+        // viewport 0…1 × 0…1), so `A` is the mode's `W / H` under `nfs5.dll` (0x466FE7 / 0x466FF4)
+        // and the vertical tangent `tan h / r` — `camera::fov_y_window`. Measured on the server's
+        // dealership frame (static background, 1024 × 768): the exit sign and the ceiling lights
+        // sit 1.33× farther from the centre than the port's old "vertical 2 × V.A." drew them.
+        // The dll's cell replaces the literal 37.5 the dealer, factory and garage constructors
+        // store (0x4E8B7F, 0x4E9900, 0x4E9BAA → dll 0x10003C30 / 0x10003C50 / 0x10003C70); the
+        // victory's 32 and the track's 25 are not patched. `ID_NONE` sets none (its base 0x4E76C0
+        // keeps the view's current angle, 0x4E7762) and the port's stand-in is the garage's.
+        let h = if room.view_angle == nfs_game::camera::DEFAULT_HALF_ANGLE {
+            nfs_game::camera::mode_half_angle()
+        } else {
+            room.view_angle
+        };
+        self.camera.fov_y_radians = nfs_game::camera::fov_y_window(h);
         self.camera.near = 0.05;
         self.camera.far = 500.0;
         if views.is_empty() {

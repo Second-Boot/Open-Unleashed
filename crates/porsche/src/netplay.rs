@@ -1375,6 +1375,24 @@ impl NetPlay {
         v
     }
 
+    /// Whether a player id is on the room's list (the host's copy).
+    fn in_room(&self, id: i32) -> bool {
+        self.room.players.iter().any(|p| p.id == id)
+    }
+
+    /// 0x48BDA0's tail (0x48BEB7…0x48BEC8): a player out of the room, `room+0xAC` − 1, then 0x490B70 — the room's description
+    /// (0x48BAA0) to every player record left on the manager's list `mgr+0x164` with the new count. The `0xB1` before it has
+    /// already taken the player off our own list, so the count is the room's after the leave. Only for a player that was in the
+    /// room: 0x492770 calls 0x48BDA0 only when the record has a room (`+0xA4 != 0`); a peer still in `hello_wait` has no record.
+    fn describe_room_to_all(&mut self) {
+        if !self.is_host() {
+            return;
+        }
+        let count = self.room.players.len() as u32;
+        let (rname, dbytes, dwords) = (self.net.name, self.net.desc_bytes, self.net.desc_words);
+        self.dispatch(vec![(To::All, room::description(ROOM_ID, &rname, dbytes, dwords, count))]);
+    }
+
     /// 0x48BB50 — the room admits a player (the old body of the `PeerJoined` arm).
     fn admit_peer(&mut self, slot: u32, _log: &mut Vec<String>) {
         // 0x48BB50: the room tells the newcomer who is there, and everyone of it
@@ -1401,7 +1419,10 @@ impl NetPlay {
         let mut adm = self.room.admit(id, &name);
         let c6 = if adm.last().map(|m| m.1.first()) == Some(Some(&0xC6)) { adm.pop() } else { None };
         out.extend(adm);
-        out.push(to_new(room::description(ROOM_ID, &rname, dbytes, dwords, count + 1)));
+        // 0x48BCE3…0x48BCEE: `room+0xAC` + 1, then 0x490B70 sends the description (0x48BAA0) to every player record of the manager's
+        // list `mgr+0x164` — every connected player, not the newcomer alone (live: the original host's runB / run3,
+        // an earlier joiner gets the newcomer's `0xB0` and then `0xB4` with the new count)
+        out.push((To::All, room::description(ROOM_ID, &rname, dbytes, dwords, count + 1)));
         out.extend(c6);
         self.dispatch(out);
         // 0x491AB4 / 0x491C25: the handler's last store, `+0xBA = 1`, after the `0xC6`
@@ -1480,7 +1501,11 @@ impl NetPlay {
                     self.server.leave(slot as usize + 1);
                     log.push(format!("slot {slot} left"));
                     // 0x48BE05: the room tells everyone left that the player has gone
+                    let was_in = self.in_room(slot as i32 + 1);
                     self.dispatch(vec![(To::All, room::player_out(slot as i32 + 1))]);
+                    if was_in {
+                        self.describe_room_to_all();
+                    }
                 }
                 Event::Quit { from } => log.push(format!("{from} quit")),
                 Event::Found { from, describe } => {
@@ -2433,7 +2458,11 @@ impl NetPlay {
         self.net.remove_peer(slot);
         self.slots.clear(player as usize);
         self.in_race &= !(1u8 << player);
+        let was_in = self.in_room(player);
         self.dispatch(vec![(To::All, room::player_out(player))]);
+        if was_in {
+            self.describe_room_to_all();
+        }
         true
     }
 
@@ -3418,5 +3447,73 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(first.as_deref().and_then(|m| m.get(..2)), Some(&[0xFE, 1][..]), "the first data frame of B is the link message 0xFE 1");
+    }
+
+    /// the room's description `0xB4` after a change of the room's count goes to **every** player (0x490B70 walks the
+    /// manager's list `mgr+0x164`, 0x48BAA0 for each), not to the newcomer alone: an earlier joiner hears the newcomer's `0xB0` and
+    /// then `0xB4` with the count + 1 (the original host's capture runB: `b0 000002`, `b4 … count 3` to the first joiner), and after a
+    /// player leaves the room (0x48BDA0: `0xB1`, count − 1, 0x490B70) the `0xB4` with the count − 1. Loopback, two bare `Net` clients.
+    #[test]
+    fn the_rooms_description_goes_to_every_player_after_each_change_of_the_count() {
+        use nfs_net::session::Event;
+        let mut host = NetPlay::start("host:0", "HOSTY").unwrap();
+        let to = SocketAddr::from(([127, 0, 0, 1], host.net.local_addr().unwrap().port()));
+        let client = |who: &str| {
+            let sock = CommSocket::bind_on(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+            let mut n = with_probe(Net::client(sock, key(), name16(who)));
+            n.join(to, &join_identity(who)).unwrap();
+            n
+        };
+        let hello = |n: &mut Net| n.send_game(&[0xFF, 0x00, b'P', 0]).unwrap();
+        let data = |n: &mut Net| -> Vec<Vec<u8>> {
+            n.poll().into_iter().filter_map(|e| if let Event::Data { bytes, .. } = e { Some(bytes) } else { None }).collect()
+        };
+        let count = |m: &[u8]| (m.first() == Some(&0xB4) && m.len() == 0x50).then(|| u32::from_le_bytes([m[0x4C], m[0x4D], m[0x4E], m[0x4F]]));
+        // A joins and is admitted (its admission ends with `0xC6 (0xE)`)
+        let mut a = client("AAAA");
+        let (mut a_hello, mut got_a) = (false, Vec::new());
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until && !got_a.iter().any(|m: &Vec<u8>| m.first() == Some(&0xC6)) {
+            host.poll(0);
+            if !a_hello && a.poll().iter().any(|e| matches!(e, Event::Joined { .. })) {
+                hello(&mut a);
+                a_hello = true;
+            }
+            got_a.extend(data(&mut a));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let a_counts: Vec<u32> = got_a.iter().filter_map(|m| count(m)).collect();
+        assert_eq!(a_counts, vec![1, 2], "A's own admission: the count before it, then after it");
+        // B joins: A hears B's `0xB0` and then the `0xB4` with three players
+        let mut b = client("BBBB");
+        let (mut b_hello, mut got_b, mut more_a) = (false, Vec::new(), Vec::new());
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until && !(got_b.iter().any(|m: &Vec<u8>| m.first() == Some(&0xC6)) && more_a.iter().any(|m: &Vec<u8>| count(m) == Some(3))) {
+            host.poll(0);
+            if !b_hello && b.poll().iter().any(|e| matches!(e, Event::Joined { .. })) {
+                hello(&mut b);
+                b_hello = true;
+            }
+            got_b.extend(data(&mut b));
+            more_a.extend(data(&mut a));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let b_counts: Vec<u32> = got_b.iter().filter_map(|m| count(m)).collect();
+        assert_eq!(b_counts, vec![2, 3], "B's admission: the newcomer hears both");
+        let b0 = more_a.iter().position(|m| m.first() == Some(&0xB0) && m.get(1..4) == Some(&[0, 0, 2][..]));
+        let b4 = more_a.iter().position(|m| count(m) == Some(3));
+        assert!(matches!((b0, b4), (Some(x), Some(y)) if x < y), "A: B's 0xB0, then 0xB4 count 3; got {more_a:?}");
+        // B leaves: A hears `0xB1 (2)` and then the `0xB4` with two players
+        b.leave().unwrap();
+        let mut after = Vec::new();
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until && !after.iter().any(|m: &Vec<u8>| count(m) == Some(2)) {
+            host.poll(0);
+            after.extend(data(&mut a));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let b1 = after.iter().position(|m| m.first() == Some(&0xB1) && m.get(1..4) == Some(&[0, 0, 2][..]));
+        let b4 = after.iter().position(|m| count(m) == Some(2));
+        assert!(matches!((b1, b4), (Some(x), Some(y)) if x < y), "A: 0xB1 (2), then 0xB4 count 2; got {after:?}");
     }
 }

@@ -150,12 +150,15 @@ pub fn player_in(id: i32, name: &[u8]) -> Vec<u8> {
     encode(kind::JOIN, Some(id), None, Some(name))
 }
 
-/// `0xB4` — the room's description, 0x50 bytes (0x48BAA0 builds it from `room+0x74`, 0x48BD10 / 0x48BD80 send it; **captured**
-/// twice per newcomer, REFERENCE-2026-10-02-SRVX): the head's value, then the 0x4C-byte record the games list is made of —
-/// 0x14 zeros, the 0x34 bytes at `room+0x74` (the name field `Game~3.5` padded to 32, the four descriptor bytes, the two descriptor
-/// words **little-endian** (raw memory, not the `'d'`'s network order), 8 zeros, **8** = the room's player limit), and last
-/// `+0x48` = the number of players in the room. `value` is the newcomer's id in both captured sends (APPROXIMATION: the capture only
-/// ever has id 1; a 24-bit value at 0x48BAA0 was not traced).
+/// `0xB4` — the room's description, 0x50 bytes (**captured** twice per newcomer, REFERENCE-2026-10-02-SRVX): the head's value, then
+/// the 0x4C-byte record the games list is made of — 0x14 zeros, the 0x34 bytes at `room+0x74` (the name field `Game~3.5` padded to 32,
+/// the four descriptor bytes, the two descriptor words **little-endian** (raw memory, not the `'d'`'s network order), 8 zeros, **8** =
+/// the room's player limit), and last `+0x48` = the number of players in the room (`room+0xAC`). `value` is `room+0x70`, the room's
+/// session number (0x490AF0, the first room 1). Two senders: **0x48BD10 / 0x48BD80** in the admission 0x48BB50 (to the
+/// newcomer alone, the count before it) and **0x48BAA0**, which **0x490B70** calls for every player record of the manager's list
+/// `mgr+0x164` — every connected player, the host's own included — after each change of `room+0xAC`: the admission (0x48BCEE, count
+/// + 1), a player out of the room 0x48BDA0 (0x48BEC8, count − 1; the disconnect 0x492770 takes the record off `+0x164` first) and
+/// the room's creation (0x491467 / 0x491A81).
 pub fn description(value: i32, name: &[u8; 32], bytes: [u8; 4], words: [u16; 2], count: u32) -> Vec<u8> {
     let mut m = vec![kind::DESCRIPTION];
     m.extend_from_slice(&[(value >> 16) as u8, (value >> 8) as u8, value as u8]);

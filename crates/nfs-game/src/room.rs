@@ -2,7 +2,7 @@
 //!
 //! A `.lay` screen's `room=` names one of six room classes, each of which loads a model from
 //! `FEData/Models` and turns the player's car on a turntable in front of the camera. The rig — where
-//! the room sits, how fast the car turns, the camera's vertical angle and the whole lighting set —
+//! the room sits, how fast the car turns, the camera's half-angle and the whole lighting set —
 //! is a table of numbers in each class's constructor, and the class's own tuning overlay
 //! (0x4E7950) names every one of them, so the meanings below are the game's own labels.
 
@@ -19,7 +19,7 @@ pub struct Room {
     pub rot: [f32; 3],
     /// `Spin` — seconds per turn of the turntable; 0 stands still
     pub spin: f32,
-    /// `V.A.` — the camera's vertical angle in degrees
+    /// `V.A.` — the FE view's **horizontal** half-angle in degrees (0x4E84A0 → 0x4D6240 → view `+0x130` → 0x5391B0)
     pub view_angle: f32,
     /// `AR` `AG` `AB`, 0…255
     pub ambient: [f32; 3],

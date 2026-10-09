@@ -1655,6 +1655,7 @@ enum Cmd {
     Stop(VoiceId),
     Env { p20: i32, p80: i32 },
     Fade { id: VoiceId, ms: i32, target: i32 },
+    StreamLevel { id: VoiceId, level: i32 },
     Stream { id: VoiceId, src: Arc<StreamSource>, volume: f32 },
 }
 
@@ -1887,6 +1888,11 @@ impl Core {
             Cmd::Fade { id, ms, target } => {
                 if let Some((_, sv)) = g.streams.iter_mut().find(|(i, _)| *i == id) {
                     sv.fade = Some(Fade::new(sv.volume, ms, target));
+                }
+            }
+            Cmd::StreamLevel { id, level } => {
+                if let Some((_, sv)) = g.streams.iter_mut().find(|(i, _)| *i == id) {
+                    sv.set_level(level);
                 }
             }
             Cmd::Stream { id, src, volume } => {
@@ -2422,6 +2428,13 @@ impl AudioOutput {
         self.tx.send(Cmd::Fade { id, ms, target });
     }
 
+    /// **0x567810(stream, level)**: the byte `stream+0xE4 = level` and `Voice_setVolume`
+    /// 0x566340 on the stream's voice — the level at once, a running fade cancelled
+    /// ([`StreamVoice::set_level`]).
+    pub fn stream_level(&self, id: VoiceId, level: i32) {
+        self.tx.send(Cmd::StreamLevel { id, level });
+    }
+
     /// A stream's volume now (0x567850 answers the voice's current level, 0x591320), `None` when
     /// it is not playing.
     pub fn stream_volume(&self, id: VoiceId) -> Option<f32> {
@@ -2455,6 +2468,22 @@ pub(crate) struct StreamVoice {
     /// the first three frames are in `window`
     pub(crate) primed: bool,
     pub(crate) fade: Option<Fade>,
+}
+
+impl StreamVoice {
+    /// **0x567810(stream, level)** → `Voice_setVolume` 0x566340 → **0x5662B0** on the stream's
+    /// voice: the int `<< 16` into `voice+0x2C` and the ramp step `+0x24` zeroed — the level is
+    /// there at once and a running fade (0x566AE0) is over — unless `+0x2C` already holds that
+    /// value (0x5662FE `je`), when nothing is written and a running fade goes on. `+0x2C` is the
+    /// fade's word while one runs, else the stream's byte level.
+    pub(crate) fn set_level(&mut self, level: i32) {
+        let vol16 = self.fade.map_or_else(|| volume_16(self.volume), |f| f.vol16);
+        let v = level.wrapping_shl(16);
+        if vol16 != v {
+            self.volume = level.clamp(0, 127) as f32 / 127.0;
+            self.fade = None;
+        }
+    }
 }
 
 /// **0x566AE0(stream, ms, target)**: the byte `stream+0xE4 = target` and **0x565DD0**(`stream+8`,
@@ -2906,6 +2935,23 @@ mod rate_tests {
         s.voices.push((super::VoiceId(0), super::Voice::new(clip, resample::PITCH_UNIT, 1.0, true, 0)));
         s.render(5000, 22050);
         assert_eq!(s.voices.len(), 1);
+    }
+
+    #[test]
+    fn a_stream_level_is_set_at_once_and_ends_a_running_fade() {
+        // 0x567810 → 0x5662B0: `+0x2C = level << 16`, the ramp step 0 — the level at once
+        let src = super::StreamSource::new(22050, 1);
+        let mut sv = super::StreamVoice { src, volume: 1.0, frac: 0, window: [[0.0; 4]; 2], primed: false, fade: Some(super::Fade::new(1.0, 500, 0)) };
+        sv.set_level(40);
+        assert_eq!((sv.volume, sv.fade), (40.0 / 127.0, None));
+        // the same word (0x5662FE `je`): nothing written, a fade running from there goes on
+        sv.fade = Some(super::Fade::new(sv.volume, 500, 0));
+        sv.set_level(40);
+        assert!(sv.fade.is_some());
+        // once the fade has stepped the word is no longer `40 << 16`: the call ends it
+        sv.fade.as_mut().unwrap().tick();
+        sv.set_level(40);
+        assert_eq!((sv.volume, sv.fade), (40.0 / 127.0, None));
     }
 
     #[test]

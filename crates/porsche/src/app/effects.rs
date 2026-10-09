@@ -546,20 +546,33 @@ impl App {
         if level >= 3 {
             return Double;
         }
-        let replaying = matches!(
-            self.replay.stream.as_ref().map(|r| r.mode),
-            Some(nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted)
-        );
-        if replaying {
-            let half = match self.track_cameras.as_ref() {
-                Some(t) if matches!(self.camera_view(), 0x0C | 0x14) => t.tv.half_angle,
-                _ => nfs_game::camera::DEFAULT_HALF_ANGLE,
-            };
-            if half < 37.5 { Double } else { PerItem }
+        if self.replay_zoom().is_some() {
+            // `nfs5.dll` rewrites the compare's `[0x5B3C9C]` (0x44ECB2) to its cell
+            if self.replay_zoom() == Some(true) { Double } else { PerItem }
         } else {
             let speed = self.vehicle.as_ref().map(|v| v.speed_est).unwrap_or(0.0);
             if speed >= 15.0 { Single } else { PerItem }
         }
+    }
+
+    /// The two replay gates on the main slot's half-angle `[0x627ED8]` (slot 0's `+0x58`):
+    /// `None` unless `REPLAY [0x657424] ≥ 2` (a playing or exhausted replay), else whether the
+    /// half-angle is under `[0x5B3C9C]` — the literal 37.5 the dll rewrites to its cell at both
+    /// compares, 0x44ECB2 (`FakeSort`, 0x44EC80) and 0x44F1B1 (the view distance, 0x44F1A0).
+    /// Only the trackside / spline zoom (0x462B80, `TvSlot::half_angle`) moves `+0x58` off the
+    /// cell; every other view keeps SetSlotView's.
+    pub(crate) fn replay_zoom(&self) -> Option<bool> {
+        let replaying = matches!(
+            self.replay.stream.as_ref().map(|r| r.mode),
+            Some(nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted)
+        );
+        replaying.then(|| {
+            let half = match self.track_cameras.as_ref() {
+                Some(t) if matches!(self.camera_view(), 0x0C | 0x14) => t.tv.half_angle,
+                _ => nfs_game::camera::mode_half_angle(),
+            };
+            half < nfs_game::camera::mode_half_angle()
+        })
     }
 
     /// The `car+0x330` of the car whose effect set is `k` (`nfs_game::car_effects`): 0 the player,

@@ -108,8 +108,12 @@ impl ApplicationHandler for App {
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            // PORT-DEVIATION D17 (FOCUS-INPUT): key / modifier releases that happen while another window has the
-            // focus never reach this one (macOS Cmd+Shift+5), so a focus change forgets every held key
+            // Focus lost = the original's WM_ACTIVATE deactivation (0x53B050, registered for message 6 at 0x53AD66):
+            // LOWORD(wParam) == 0 or HIWORD != 0 -> ShowCursor(1) (0x53B113) and memset(0x5DE028, 0, 0x80)
+            // (0x53B119..0x53B125) = the key-down table forgets every key. Focus regained: the original
+            // clears nothing (0x53B07F..0x53B0CC only re-hooks the Windows key); the port clears again there
+            // because macOS (Cmd+Shift+5 overlay) can hand back a synthetic press for a key whose release was
+            // swallowed — PORT-DEVIATION D17 (remainder, FOCUS-INPUT).
             WindowEvent::Focused(_) => self.input.release_all(),
             WindowEvent::KeyboardInput { event, .. } => {
                 self.input.key_event(&event);
@@ -476,6 +480,8 @@ impl ApplicationHandler for App {
                 if let Some(r) = self.renderer.as_mut() {
                     r.resize(size.width, size.height);
                 }
+                // a new mode: the dll's SetMode cells (`camera::set_mode`)
+                nfs_game::camera::set_mode(size.width, size.height);
             }
             // The pointer, mapped back through `place`: the design area keeps 4:3 and is centred
             // in a wider window, so the inverse is `(u - x0) / fw * 640` across and `v * 480` down.

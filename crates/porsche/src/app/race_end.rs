@@ -224,7 +224,9 @@ impl App {
         self.replay_session_end();
         // 0x501340 + `LoadInfo` (0x4D3B52), before this race's own filing — same rule as
         // `file_track_record`'s own reload, applied to the career
+        self.fe.menu_template = Some(menu);
         self.reload_career_at_fe_entry();
+        let menu = self.fe.menu_template.take().expect("put back above");
         self.settle_mission();
         if self.career.as_ref().is_some_and(|c| c.pending.is_some()) {
             let (order, times) = self.finishing_order();
@@ -352,7 +354,9 @@ impl App {
         let zones = self.result_damage();
         // 0x501340 + `LoadInfo` (0x4D3B52): every return to the front end reloads the profile,
         // aborted or a replay alike, before the abort arm of 0x4EDD00 runs
+        self.fe.menu_template = Some(menu);
         self.reload_career_at_fe_entry();
+        let menu = self.fe.menu_template.take().expect("put back above");
         if let Some(c) = self.career.as_mut().filter(|_| !playback) {
             // an aborted tournament race still runs the race end 0x4EDD00: the damage goes back
             // on the car, the market ticks, the current event is reset and nothing is filed
@@ -631,15 +635,40 @@ impl App {
     /// no career (a non-career session) or the profile file does not parse yet (first-ever entry,
     /// before any of the three save sites has run) — `fe_profile_loadable`'s own check below
     /// still decides whether the screen stack can be rebuilt at all.
+    ///
+    /// **`LoadInfo`'s accessor pass and modules as well:** 0x4DE9B0 walks the whole
+    /// `.sav` — the `accessor` module through `LoadAccessors` 0x4B7FD0 (each saved accessor's Load,
+    /// 0x4BC480 and the like → `SetSelection` 0x4BC240 and its commit callback) and the side
+    /// modules — on this entry as on a profile choice, so every option goes back to the value the
+    /// last save wrote: [`Self::apply_saved_profile`], with the menu (the race-screen counts, the
+    /// knockout table) in `fe.menu` while it runs. What differs from the live state is what changed
+    /// after the launch's save 0x4D52EA: the launch fill 0x4ED5D0 (0x4D546B, after the save) draws a
+    /// quick race's opponents into `OpponentCar.Car` and `[0x6907D8]` — the reload puts the saved
+    /// ones back — and a profile no launch saved (one only chosen) loses nothing, its file being
+    /// what the chooser loaded. *(Until that change only the career was re-read.)*
     pub(crate) fn reload_career_at_fe_entry(&mut self) {
+        let mut loaded = false;
         if let Some(c) = self.career.as_mut() {
             let p = c.profile.clone();
             let money_before = c.career.money;
             if c.switch_profile(&p) {
+                loaded = true;
                 tracing::debug!(profile = %p.name, money = c.career.money, money_before, state = %c.summary(), "front end: profile reloaded from disk (0x501340 + 0x4D3B52)");
             } else {
                 tracing::debug!("front end: profile reload at FE entry found nothing on disk yet (0x4D3B52) — keeping the live career");
             }
+        }
+        if loaded {
+            // the race keeps the menu aside (`menu_template`); the accessor pass reads it in place
+            let parked = self.fe.menu.is_none() && self.fe.menu_template.is_some();
+            if parked {
+                self.fe.menu = self.fe.menu_template.take();
+            }
+            self.apply_saved_profile();
+            if parked {
+                self.fe.menu_template = self.fe.menu.take();
+            }
+            tracing::info!(music = self.snd.audio_settings.music_level, sfx = self.snd.audio_settings.sfx_level, "front end: the profile's accessors re-applied (0x4D3B52 → 0x4B7FD0)");
         }
     }
 

@@ -107,7 +107,8 @@ pub struct TvSlot {
 
 impl Default for TvSlot {
     fn default() -> Self {
-        let h = crate::camera::DEFAULT_HALF_ANGLE;
+        // 37.5 in the exe; `nfs5.dll` turns 0x46584F's `mov eax, imm` into a load of its cell
+        let h = crate::camera::mode_half_angle();
         // SetSlotView 0x465790: +0x34 0, +0x38 = +0x78 = +0x58 = 37.5, +0x44 1.0, +0x48 0.02,
         // +0x3C 0, +0x30 3.0, +0x5C 0.5 (0x465854…0x465896)
         Self {
@@ -197,7 +198,22 @@ impl TvSlot {
                 return;
             }
             let a = self.a38;
-            let dp = d * a * 0.026_666_667;
+            // `d·A·[0x5B3F70]` (1/37.5, not patched by `nfs5.dll`), then 0x462BF4…0x462C4A picks by
+            // `A` against `[0x5B3C9C]` — which the dll rewrites to its cell (0x462BFC / 0x462C26,
+            // `camera::mode_half_angle`): above it `d + |d − d·A/37.5|` (0x462C07…0x462C1A), below
+            // it `d − |…|` (0x462C31…0x462C4A), equal `d` (0x462C4A pops the product). At 4:3 and
+            // taller (cell 37.5) all three are `d·A/37.5` up to rounding; a wider mode's cell
+            // (> 37.5) turns an `A` between 37.5 and the cell into `2d − d·A/37.5` and `A` = cell
+            // into `d`.
+            let hd = crate::camera::mode_half_angle();
+            let prod = d * a * 0.026_666_667;
+            let dp = if a > hd {
+                d + (d - prod).abs()
+            } else if a < hd {
+                d - (d - prod).abs()
+            } else {
+                d
+            };
             let e = (dp - d0).abs() * self.t44;
             // equal distances load the slot index's bits (`[esp+8]`, 0x462C93) — 0 for slot 0
             let v = if d0 < dp { dp - e } else if d0 > dp { dp + e } else { 0.0 };
@@ -221,7 +237,8 @@ impl TvSlot {
             self.half_angle = self.a38;
             self.near = crate::camera::zoom_near(self.half_angle);
         } else {
-            self.half_angle = crate::camera::DEFAULT_HALF_ANGLE;
+            // the hook at 0x462B80 (dll 0x10003BF0) pushes the dll's cell where the exe pushed 37.5
+            self.half_angle = crate::camera::mode_half_angle();
             self.near = crate::camera::DEFAULT_NEAR;
         }
     }
@@ -293,7 +310,10 @@ impl TrackCameras {
             has_position: p.first().copied().unwrap_or(1.0) != 0.0,
             half_angle: match (p.get(6), p.get(7)) {
                 (Some(&flag), Some(&a)) if flag != 0.0 => a,
-                _ => crate::camera::DEFAULT_HALF_ANGLE,
+                // the element's constructor 0x469230 seeds `+0x9C` with 37.5 at 0x4692E2, which
+                // `nfs5.dll` hooks to its cell (dll 0x10003C10) — only an element whose
+                // line leaves it unread keeps it, and only a set `+0x98` uses it (0x413A2A / 0x413AC2)
+                _ => crate::camera::mode_half_angle(),
             },
             lift: e.params.first().and_then(|l| l.get(1)).copied().unwrap_or(0.0),
             fixed_view: match (e.params.first().and_then(|l| l.get(2)), e.orientation) {

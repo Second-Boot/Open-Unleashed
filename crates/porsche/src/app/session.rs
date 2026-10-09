@@ -146,6 +146,9 @@ impl App {
                     Err(e) => tracing::error!(error = %e, name, "layout unavailable"),
                 }
             }
+            // the dll's SetMode cells for the first window (`camera::set_mode`)
+            let (w, h) = renderer.size();
+            nfs_game::camera::set_mode(w, h);
             self.renderer = Some(renderer);
             self.window = Some(window);
             self.last_frame = Instant::now();
@@ -389,7 +392,7 @@ impl App {
                     // through the screen's transition
                     let frames: Option<usize> = nfs_game::config::cfg().nfs_fe_frames.var().ok().and_then(|v| v.parse().ok());
                     for i in 0..frames.unwrap_or(120) {
-                        l.advance_movies(r, 16, self.snd.audio.as_ref(), self.snd.audio_settings.music_level);
+                        l.advance_movies(r, 16, self.snd.audio.as_ref(), self.snd.registry_music_level);
                         ran += 1;
                         // every layer's screen, as 0x4D2570 does (0x4D25EB)
                         for (_, u) in self.fe.layout_under.iter_mut() {

@@ -44,8 +44,13 @@ pub fn fov_y(half_angle_deg: f32) -> f32 {
 
 /// `[0x657D5C]` — the front end's "wide screen" (`Graphics.WideScreen`). The main view's viewport is
 /// then `y` 0.15…0.85 of the screen (0x468E96…0x468EA4 / 0x468E30 → 0x466EB0) and the half-angle ×1.2
-/// (`[0x5B2480]`, 0x4653E9) unless the slot's view is 1. The projection's aspect is the viewport's,
-/// so the band shows `2·atan(tan h · 0.75 / 0.7)` of the full window's height.
+/// (`[0x5B2480]`, 0x4653E9) unless the slot's view is 1. The projection's aspect is the viewport's
+/// (0x466F30: `A = dx·640 / (dy·480)`, `dy` 0.7), and 0x5391B0 multiplies `m11` by it, so the band's
+/// own vertical tangent is `tan h · 0.75 · 0.7` over its 0.7 of the screen — the full window's
+/// `tan h · 0.75` cut to the band, the horizontal field unchanged (the viewport 0x538DA0
+/// maps NDC onto the band itself; its `+0x200` / `+0x204` scales are 1 for a viewport inside the
+/// screen, 0x538FBF…0x538FFE). *(Until 2026-10-09 this said the band shows
+/// `2·atan(tan h · 0.75 / 0.7)` of the window's height and the port drew a field 1/0.7 too wide.)*
 pub const WIDESCREEN_BAND: f32 = 0.7;
 pub const WIDESCREEN_ZOOM: f32 = 1.2;
 
@@ -54,12 +59,78 @@ pub fn half_angle(base: f32, widescreen: bool, view: u16) -> f32 {
     if widescreen && view != 1 { base * WIDESCREEN_ZOOM } else { base }
 }
 
-/// The full-window vertical field of view that puts the wide-screen band's projection on the
-/// band: the viewport is `WIDESCREEN_BAND` of the height, so the whole window spans `1/0.7` of it.
-pub fn fov_y_window(half_angle_deg: f32, widescreen: bool) -> f32 {
-    let band = if widescreen { WIDESCREEN_BAND } else { 1.0 };
+/// The full-window vertical field of view of the main view. The port draws the scene over the
+/// whole window and the wide-screen bars over it: the band viewport's projection (aspect
+/// `r / 0.7`) is the full window's cut to the band, so the band needs no term here
+/// ([`WIDESCREEN_BAND`]) — only the ×1.2 of [`half_angle`].
+/// The aspect is the current mode's ([`set_mode`]): the shipped game's `nfs5.dll` replaces the
+/// 640 / 480 of 0x466F30's aspect (0x466FE7 / 0x466FF4) by its virtual screen, whose ratio is the
+/// mode's `W / H` on both sides of 4:3 ([`fov_y_window_at`]).
+pub fn fov_y_window(half_angle_deg: f32) -> f32 {
+    fov_y_window_at(half_angle_deg, mode_aspect())
+}
+
+/// [`fov_y_window`] for a mode of aspect `r = W / H`. 0x5391B0 takes `m00 = cot h`,
+/// `m11 = cot h · A` (0x5391C1…0x5391F7) with 0x466F30's `A = dx·640 / (dy·480)` (0x466FD7…
+/// 0x466FF8), whose 640 / 480 `nfs5.dll` rewrites to its virtual width / height (0x466FE7 /
+/// 0x466FF4, dll 0x10003840: `virtW / virtH = r` above and below 4:3). So the vertical half-angle's
+/// tangent is `tan h / r` — `tan h · 0.75` at 4:3, written `· 0.75 · (4/3) / r` so that a 4:3 mode
+/// (640 × 480, 800 × 600, 1024 × 768 in `f32`) keeps the exact factor 1.
+pub fn fov_y_window_at(half_angle_deg: f32, aspect: f32) -> f32 {
+    let k = (4.0f32 / 3.0) / aspect;
     // det-allow: camera shake offset, drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
-    2.0 * (half_angle_deg.to_radians().tan() * 0.75 / band).atan()
+    2.0 * (half_angle_deg.to_radians().tan() * 0.75 * k).atan()
+}
+
+/// **`nfs5.dll` 0x10003840**, run on every SetMode with the mode `W × H` (`[0x1000611C]` /
+/// `[0x10006120]`): the camera half-angle cell `[0x10006080]` that replaces the literal 37.5 at
+/// every patched site (SetSlotView 0x46584F, the race init 0x46414B, the cycle key 0x465AE8, the
+/// TV zoom 0x462B80 / 0x462BFC / 0x462C26 / 0x462CAB / 0x462CC4 / 0x462DD7 / 0x462DF0, the
+/// `FakeSort` / view-distance gates 0x44ECB2 / 0x44F1B1, the view 0x4692E2 and the FE rooms
+/// 0x4E8B7F / 0x4E9900 / 0x4E9BAA; `RE/notes/nfs5-dll.md` §3.5). `r = W / H` (`fild` / `fdiv`,
+/// 0x1000384C…0x10003868); 4/3 is the double 1.3333333730697632 at 0x10005600, and `fcomi` / `jb`
+/// (0x10003872) takes the wide branch only when `4/3 < r`:
+/// * `r ≤ 4/3`: `[0x5B3C9C]` = 37.5 (0x10003896) — the **horizontal** half-angle stays, so a
+///   window taller than 4:3 sees more above and below;
+/// * `r > 4/3`: `atan2(3·r, 4 / tan(37.5 · π/180)) / (π/180)` (`_CItan` 0x100038D8, `_CIatan2`
+///   0x100038E9; 3.0 / 4.0 / π/180 the doubles at 0x10005608 / 0x10005610 / 0x100055F8) — the
+///   half-angle that keeps the 4:3 vertical field.
+pub fn dll_half_angle(w: f32, h: f32) -> f32 {
+    let r = w as f64 / h as f64;
+    if 1.333_333_373_069_763_2 < r {
+        let rad = 0.017_453_292_f64;
+        // det-allow: the dll's mode set, drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
+        ((3.0 * r).atan2(4.0 / (DEFAULT_HALF_ANGLE as f64 * rad).tan()) / rad) as f32
+    } else {
+        DEFAULT_HALF_ANGLE
+    }
+}
+
+/// `[0x10006080]` (37.5 until the first mode set)
+static MODE_HALF_ANGLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x4216_0000);
+/// the mode's `W / H` (4/3 in `f32` until the first mode set)
+static MODE_ASPECT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3FAA_AAAB);
+
+/// The SetMode hook's cells for a window of `w × h`: the dll keeps them as globals written once per
+/// mode set; the port's resizable window sets them on every size. 0 × 0 (minimised) is ignored.
+pub fn set_mode(w: u32, h: u32) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    MODE_HALF_ANGLE.store(dll_half_angle(w as f32, h as f32).to_bits(), Relaxed);
+    MODE_ASPECT.store((w as f32 / h as f32).to_bits(), Relaxed);
+}
+
+/// The dll's `[0x10006080]` for the current mode — the default slot half-angle every patched 37.5
+/// reads ([`dll_half_angle`]).
+pub fn mode_half_angle() -> f32 {
+    f32::from_bits(MODE_HALF_ANGLE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The current mode's `W / H` ([`set_mode`]).
+pub fn mode_aspect() -> f32 {
+    f32::from_bits(MODE_ASPECT.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// A scene view's own half-angle `+0x130` as its constructor 0x4672F0 sets it (0x4673D5, `0x42340000`).
@@ -94,9 +165,15 @@ pub fn near_plane(slot_near: f32, view: u16) -> f32 {
 /// The near plane 0x462B80 writes to `+0x5C` with a new half-angle `a` (degrees): below 37.5
 /// (`[0x5B3C9C]`), `max((37.5 − a) / a, [0x5B23F4] 0.2)`, else `[0x5B23F0]` 0.5 — the dolly branch
 /// 0x462CA5…0x462CE3 and the stepping one 0x462DC7…0x462E09 alike. A narrow zoom pushes the near
-/// plane out: 9.0 at 3.75°.
+/// plane out: 9.0 at 3.75°. `nfs5.dll` rewrites the compare and the minuend `[0x5B3C9C]` (0x462CAB /
+/// 0x462CC4, 0x462DD7 / 0x462DF0) to its cell `[0x10006080]` ([`mode_half_angle`]).
 pub fn zoom_near(a: f32) -> f32 {
-    if a < DEFAULT_HALF_ANGLE { ((DEFAULT_HALF_ANGLE - a) / a).max(0.2) } else { DEFAULT_NEAR }
+    zoom_near_at(a, mode_half_angle())
+}
+
+/// [`zoom_near`] against a given default half-angle `hd` (the dll's cell).
+pub fn zoom_near_at(a: f32, hd: f32) -> f32 {
+    if a < hd { ((hd - a) / a).max(0.2) } else { DEFAULT_NEAR }
 }
 
 /// **CircleCam 0x462980** (view 0x0A), the slot's two words: the angle count `+0xC6` and the
@@ -634,10 +711,35 @@ mod tests {
     fn near_planes() {
         assert_eq!(near_plane(DEFAULT_NEAR, 2), 0.5);
         assert!((near_plane(DEFAULT_NEAR, 1) - 0.15).abs() < 1e-6, "the driver view");
-        assert_eq!(zoom_near(37.5), 0.5);
-        assert_eq!(zoom_near(40.0), 0.5);
-        assert!((zoom_near(3.75) - 9.0).abs() < 1e-5);
-        assert_eq!(zoom_near(35.0), 0.2, "(37.5 − 35) / 35 is under the 0.2 floor");
+        assert_eq!(zoom_near_at(37.5, 37.5), 0.5);
+        assert_eq!(zoom_near_at(40.0, 37.5), 0.5);
+        assert!((zoom_near_at(3.75, 37.5) - 9.0).abs() < 1e-5);
+        assert_eq!(zoom_near_at(35.0, 37.5), 0.2, "(37.5 − 35) / 35 is under the 0.2 floor");
+        // a wide mode's cell: 40° is now under it
+        assert_eq!(zoom_near_at(40.0, 46.0), 0.2);
+        assert!((zoom_near_at(20.0, 46.0) - 1.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_dll_half_angle_by_aspect() {
+        // 4:3 and taller keep the literal: the horizontal half-angle stays
+        assert_eq!(dll_half_angle(640.0, 480.0), 37.5);
+        assert_eq!(dll_half_angle(1024.0, 768.0), 37.5);
+        assert_eq!(dll_half_angle(1280.0, 1024.0), 37.5);
+        // wider: the vertical field stays — tan(hd) / r = tan(37.5°) · 0.75
+        for (w, h) in [(1280.0f32, 800.0f32), (1920.0, 1080.0)] {
+            let hd = dll_half_angle(w, h);
+            assert!(hd > 37.5);
+            assert!((fov_y_window_at(hd, w / h) - fov_y(37.5)).abs() < 1e-6, "{w}x{h}: {hd}");
+        }
+        // 5:4: the vertical field grows past 4:3's
+        let v = fov_y_window_at(dll_half_angle(1280.0, 1024.0), 1.25);
+        assert!((v - 2.0 * (37.5f32.to_radians().tan() / 1.25).atan()).abs() < 1e-6);
+        assert!(v > fov_y(37.5));
+        // a 4:3 mode gives exactly the number the port had before
+        assert_eq!(fov_y_window_at(37.5, 640.0 / 480.0), 2.0 * (37.5f32.to_radians().tan() * 0.75).atan());
+        // the wide-screen band is the full view cut to 0.7 of the height — no band term
+        assert_eq!(fov_y_window_at(45.0, 1024.0 / 768.0), fov_y(45.0));
     }
 
     #[test]

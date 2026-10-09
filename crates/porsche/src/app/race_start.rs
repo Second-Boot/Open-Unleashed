@@ -742,6 +742,8 @@ impl App {
         event_loop: &ActiveEventLoop,
     ) {
         self.enter_race_mode();
+        // the launch dump 0x4B4DA0 (0x4B5179): `[0x657CA0]` = the `Audio.MusicLevel` accessor
+        self.snd.registry_music_level = self.snd.audio_settings.music_level;
         // `Replay_startRace` 0x413EA0 + `0x414EB0`: rewind the stream and seed the shared RNG from
         // the race's seed, which is what makes a replay re-simulate the same race (replay.md §11).
         let playing = self

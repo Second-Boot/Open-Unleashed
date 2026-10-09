@@ -291,7 +291,7 @@ fn run() -> Result<()> {
         let parts_table = nfs_formats::career::parse_parts(&std::fs::read(paths.fe_data().join("Data").join("nfs5.prt")).unwrap_or_default()).unwrap_or_default();
         let family = catalog.iter().find(|c| c.sim.eq_ignore_ascii_case(&sim_name)).map(|c| c.sim_family.clone()).unwrap_or_default();
         // the stock parts (0x4EE9A0) and the constructor's neutral sliders (0x4EED2D) through 0x49CB50;
-        // `.TRANSMISSION` is the gearbox option (`Car.Transmission`), automatic unless it says otherwise
+        // `.TRANSMISSION` is the gearbox option (`cli_automatic` above: `Car.Transmission` index >= 1 = automatic)
         let before = (specs.top_speed, specs.final_drive, specs.grip, specs.transfer_div, specs.roll_gain, specs.front_weight);
         // a recording's car-info record of slot 0 (`Replay_begin` 0x413CF0's restore): its parts, their wear and
         // its sliders, parts first (0x49CB50 / 0x49D290); a file with none races the fresh catalogue car
@@ -304,8 +304,8 @@ fn run() -> Result<()> {
                 .enumerate()
                 .map(|(i, p)| nfs_physics::specs::InstalledPart::new(p.kind, p.zone_mask.map(|b| b != 0), p.condition, c.part_damage.get(i).copied().unwrap_or(p.state as f32)))
                 .collect();
-            // `.TRANSMISSION` of the recorded block (`carinfo+0xC`); a file from before the field: automatic, the
-            // session's option (APPROXIMATION)
+            // `.TRANSMISSION` of the recorded block (`carinfo+0xC`); a file from before the field: the session's
+            // option, `cli_automatic` (APPROXIMATION)
             let automatic = replay_setup.as_ref().and_then(|r| r.transmission).unwrap_or(cli_automatic);
             specs.apply_setup(&c.setup.unwrap_or(nfs_game::career::CAR_SETUP_DEFAULT), automatic);
         } else {
@@ -646,6 +646,20 @@ fn run() -> Result<()> {
     };
 
     let mut audio_settings = nfs_audio::music::Settings::load(&paths.root);
+    // **The front end's five level accessors start at their constructors' 0x7F, not at `fe.txt`'s
+    // `MUSICLEVEL` … `AMBIENTLEVEL`**: 0x4E4910, the Audio data area's slot 0 that
+    // 0x4E5D00 runs at every front-end entry (0x4D36D7), builds `Audio.MusicLevel` / `SfxLevel` /
+    // `EngineLevel` / `SpeechLevel` / `AmbientLevel` with `0x4BA310(name, 0x37…0x3B, 0x7F, 0, 0x7F,
+    // 0, cb)` (0x4E4928…0x4E4A5A); the third argument is the value 0x4BA362's `SetSelection` stores.
+    // Nothing reads the registry words `[0x657CA0…0x657CB0]` into them (their readers are the race
+    // audio's 0x4A8A80 / 0x4AB150 / 0x4AB200 / 0x4AB270 / 0x4AB360, the launch dump's 0x4B4DA0 that
+    // *writes* them from the accessors, and the movie's 0x4E27BA) — only a profile's
+    // `LoadAccessors` changes them. A race without the front end keeps the registry's.
+    // `[0x657CA0]` as the registry load left it, before the accessors take their own
+    let registry_music_level = audio_settings.music_level;
+    if use_menu {
+        audio_settings.front_end_defaults();
+    }
     // `FEStrings.loc` / `hud.loc` in the current language (0x4E04F0, 0x41E170)
     let fe_strings = nfs_game::layout::load_strings(&paths);
     // `Replay_begin` 0x413CF0 copies the whole saved block back over `0x6573E8` (0x413DCF) and
@@ -1167,6 +1181,7 @@ fn run() -> Result<()> {
         snd: AudioState {
             audio: None,
             sfx_saved: None,
+            registry_music_level,
             engine_sound: None,
             sfx: None,
             ai_engines: None,

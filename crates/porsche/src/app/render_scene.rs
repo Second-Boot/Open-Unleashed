@@ -1038,7 +1038,11 @@ impl App {
         // "The track draw's culling"), not a clip plane. *(Until 2026-09-26 the port clipped at the
         // draw distance, cutting the mid-ground's 600 / 700 m short.)*
         self.camera.near = nfs_game::camera::near_plane(slot_near, view);
-        self.draw_distance = keys.far_distance(cam_slice, self.detail);
+        // 0x44F1A0 (from the frame's 0x468A63): the factor is 1.0 instead of the option's table entry
+        // while a replay plays with the main slot zoomed in (`replay_zoom`: `[0x627ED8]` under the
+        // dll's cell, 0x44F1A9…0x44F1BC)
+        let factor = if self.replay_zoom() == Some(true) { 1.0 } else { self.detail };
+        self.draw_distance = keys.far_distance(cam_slice, factor);
         self.camera.far = if self.vehicle.is_some() { nfs_renderer::VIEW_FAR } else { 20000.0 };
         self.sun_view_diagnostic();
         self.main_sky_items(cam_slice);
@@ -2296,8 +2300,14 @@ impl App {
         }
         self.slot_view = Some(view);
         let ws = self.widescreen();
-        let fov_of = |h: f32| nfs_game::camera::fov_y_window(nfs_game::camera::half_angle(h, ws, view), ws);
-        self.camera.fov_y_radians = fov_of(nfs_game::camera::DEFAULT_HALF_ANGLE);
+        // the dll's SetMode cells (`camera::set_mode`) for the window as it is now — the
+        // default half-angle `[0x10006080]` SetSlotView stores (0x46584F) and the aspect 0x466F30 takes
+        if let Some(r) = self.renderer.as_ref() {
+            let (w, h) = r.size();
+            nfs_game::camera::set_mode(w, h);
+        }
+        let fov_of = |h: f32| nfs_game::camera::fov_y_window(nfs_game::camera::half_angle(h, ws, view));
+        self.camera.fov_y_radians = fov_of(nfs_game::camera::mode_half_angle());
         // the slot's near plane `+0x5C` (`camera::near_plane`, applied with the far plane below):
         // SetSlotView's 0.5 unless 0x462B80 (TVCam, SplineCam) has zoomed
         let mut slot_near = nfs_game::camera::DEFAULT_NEAR;
@@ -2821,7 +2831,7 @@ impl App {
                                         .partial_cmp(&b.distance_squared(self.car_pos))
                                         .unwrap()
                                 })
-                                .map(|p| (p, nfs_game::camera::DEFAULT_HALF_ANGLE, None, false, nfs_game::camera::DEFAULT_NEAR))
+                                .map(|p| (p, nfs_game::camera::mode_half_angle(), None, false, nfs_game::camera::DEFAULT_NEAR))
                         })
                     });
                 match cam {

@@ -315,6 +315,19 @@ impl App {
         }
     }
 
+    /// The `Audio.MusicLevel` accessor's setter **0x4E47B0**: `MusicSetVolume(MusicLevelToVolume(v))`
+    /// (0x4E47D3 / 0x4E47D9) with the value just set — `MusicPlayer::set_level` (0x4AE8C0). The
+    /// accessor's `SetSelection` 0x4BC240 calls it for every value stored: the two slider writes
+    /// and a profile's load (`apply_saved_profile`, 0x4B7FD0 → 0x4BC480 → 0x4BC240). A player not
+    /// made yet takes the level from the settings when it is.
+    pub(crate) fn music_level_changed(&mut self) {
+        let level = self.snd.audio_settings.music_level;
+        let rng = &mut self.fe_rng;
+        if let (Some(a), Some(m)) = (self.snd.audio.as_ref(), self.snd.music.as_mut()) {
+            m.set_level(a, level, &mut || rng.next_u32().wrapping_add(tick_count_ms()));
+        }
+    }
+
     /// Silence the race audio (engine layers, squeal / horn loops) when leaving to the menu.
     pub(crate) fn stop_race_audio(&mut self) {
         // the effect levels come back with the race: the front end reads the registry variables
@@ -458,6 +471,15 @@ pub(crate) struct AudioState {
     /// `I_SFX` (F10) has the four effect levels off: `[0x656840]` clear, holding the levels the
     /// registry variables `[0x657CA4…0x657CB0]` keep (`Settings::toggle_effects`)
     pub(crate) sfx_saved: Option<[u8; 4]>,
+    /// **`[0x657CA0]`, the registry's `MUSICLEVEL` word** — not the `Audio.MusicLevel` accessor
+    /// (`audio_settings.music_level`): what the front end's movies play their sound track at
+    /// (0x4E27BA…0x4E27CE, the raw byte into 0x567810, `mad.md`). `fe.txt`'s value at start-up
+    /// (the registry load), then the accessor's at every race launch — the launch dump 0x4B4DA0
+    /// writes it from the accessors (0x4B5179) — and the race keeps it there (the pause 0x4AB150,
+    /// the resume 0x4AB24C and the resets 0x4AB2FE / 0x4AB465 copy it between `[0x657CA0]` and the
+    /// live `[0x5D1740]`, both the launch value). A slider move or a profile load in the front end
+    /// does not reach it until the next launch.
+    pub(crate) registry_music_level: u8,
     pub(crate) engine_sound: Option<nfs_audio::engine::EngineSound>,
     pub(crate) sfx: Option<nfs_audio::sfx::CollisionSfx>,
     pub(crate) ai_engines: Option<nfs_audio::ai_engine::AiEngines>,

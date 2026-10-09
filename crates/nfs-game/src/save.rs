@@ -1201,6 +1201,19 @@ mod tests {
         assert_eq!(back.spares, c.spares[..2]);
     }
 
+    /// every front-end entry after the first re-applies the profile's accessor block
+    /// (0x4D3B52 → `LoadInfo` 0x4DE9B0 → `LoadAccessors` 0x4B7FD0); the levels the launch's save
+    /// (0x4D52EA) wrote are what that pass hands back, each one under its own accessor.
+    #[test]
+    fn the_levels_the_launch_saves_are_what_the_front_end_entry_applies() {
+        let tables = CareerTables { raw: Default::default(), tracks: vec![], tournaments: vec![], parts: vec![], personalities: vec![], missions: vec![], strings: Default::default(), catalog: vec![], package_count: 0 };
+        let mut side = SaveSide::default();
+        (side.settings.music, side.settings.sfx, side.settings.engine, side.settings.speech, side.settings.ambient) = (64, 30, 100, 5, 0);
+        let s = career_to_sav_with(&Career::default(), &tables, &Profile::new("Hans", 3), &side);
+        let back = side_from_sav(&SaveFile::parse(&s.write()).unwrap()).settings;
+        assert_eq!((back.music, back.sfx, back.engine, back.speech, back.ambient), (64, 30, 100, 5, 0));
+    }
+
     /// A rebound control survives the `.sav`: six dwords under its `Controller.*` name, read back
     /// by name (0x51D060 / 0x51D080).
     #[test]

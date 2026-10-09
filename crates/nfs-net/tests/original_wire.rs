@@ -262,3 +262,35 @@ fn the_hosts_replayed_option_and_row_records_are_the_originals_bytes() {
     assert_eq!(m[2], unhex("bc0000002502000000000000ccfff3ff"));
     assert_eq!(m[3], unhex("bc000000550200000000000001000000"));
 }
+
+/// the original host's capture with an original and a port joining (runB, `runB_snap.pcap` t = 113.356): the
+/// original joiner (id 2) sends its 4024-byte picture (`pic16.fsh`, type 0) as 18 messages — `0xBF` with the whole size, then `0xC0`
+/// with the offset, 0xE8 bytes each, the last 80 (0x48CCC0). The headers below are the captured ones in wire order; the host relays
+/// them to the other joiner unchanged (the same 18 messages host → port, byte for byte). The file's own bytes are the player's
+/// picture and are not copied here: a synthetic body of the same size stands in (the chunker never looks at it).
+const FILE_HEADS: [&str; 18] = [
+    "bf020000b80f0000", "c0020000e8000000", "c0020000d0010000", "c0020000b8020000", "c0020000a0030000", "c002000088040000",
+    "c002000070050000", "c002000058060000", "c002000040070000", "c002000028080000", "c002000010090000", "c0020000f8090000",
+    "c0020000e00a0000", "c0020000c80b0000", "c0020000b00c0000", "c0020000980d0000", "c0020000800e0000", "c0020000680f0000",
+];
+
+#[test]
+fn a_players_file_goes_out_in_the_originals_chunks() {
+    use nfs_net::room::{self, Room, PICTURE};
+    let file: Vec<u8> = (0..4024u32).map(|i| (i * 13 + 5) as u8).collect();
+    let mut r = Room::new(2);
+    r.hear(&room::player_in(2, b"DRIVER"));
+    r.post(PICTURE, &file);
+    assert!(r.tick(1000).is_empty(), "the first tick only sets the clock");
+    let sent = r.tick(2000);
+    assert_eq!(sent.len(), FILE_HEADS.len());
+    let mut at = 0;
+    for (m, head) in sent.iter().zip(FILE_HEADS) {
+        assert_eq!(&m[..8], &unhex(head)[..], "chunk at {at}");
+        let n = m.len() - 8;
+        assert_eq!(n, if at + 0xE8 <= file.len() { 0xE8 } else { 80 });
+        assert_eq!(&m[8..], &file[at..at + n]);
+        at += n;
+    }
+    assert_eq!(at, file.len());
+}

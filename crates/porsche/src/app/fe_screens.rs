@@ -28,6 +28,9 @@ impl App {
                 "Audio.AmbientLevel" => a.ambient_level = v,
                 _ => {}
             }
+            if base == "Audio.MusicLevel" {
+                self.music_level_changed();
+            }
             return;
         }
         if let Some(key) = RANGE_ACCESSORS.iter().find(|(n, ..)| *n == base).map(|(_, k, ..)| *k) {
@@ -358,6 +361,9 @@ impl App {
                     "Audio.SpeechLevel" => a.speech_level = lvl(a.speech_level),
                     "Audio.AmbientLevel" => a.ambient_level = lvl(a.ambient_level),
                     _ => {}
+                }
+                if base == "Audio.MusicLevel" {
+                    self.music_level_changed();
                 }
             }
         }
