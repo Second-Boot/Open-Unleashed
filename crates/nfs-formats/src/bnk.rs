@@ -76,7 +76,9 @@ fn saturate(v: f64) -> i16 {
 pub fn decode_ea_xa_frame(frame: &[u8; EA_XA_FRAME_BYTES], state: &mut EaXaState, out: &mut Vec<i16>) {
     let predictor = (frame[0] >> 4) as usize;
     let shift = frame[0] & 0x0F;
-    let (k0, k1) = (EA_XA_K0[predictor], EA_XA_K1[predictor]);
+    // predictors 4…15 index past the 4-entry tables (the exe would read whatever follows them): a
+    // corrupt frame, decoded without prediction rather than by a panic
+    let (k0, k1) = (EA_XA_K0.get(predictor).copied().unwrap_or(0.0), EA_XA_K1.get(predictor).copied().unwrap_or(0.0));
     for &byte in &frame[1..] {
         for nib in [byte >> 4, byte & 0x0F] {
             let s = ea_xa_table(shift, nib) as f64 + k0 * state.s1 + k1 * state.s2;
@@ -460,6 +462,42 @@ fn be_value(bytes: &[u8], off: usize, code: u8) -> Result<u32, FormatError> {
     Ok(bytes.iter().fold(0u32, |acc, &b| (acc << 8) | b as u32))
 }
 
+/// The codes of a `PT` header's TLV walk (`PtHeader::parse_at`); the fields they fill document the
+/// evidence. Codes below [`PARAM_LIMIT`] are the patch parameters, [`RECORD_CODE_LIMIT`] of them
+/// the per-record ones.
+mod pt_code {
+    /// ends the header
+    pub const END: u8 = 0xFF;
+    /// no value, skipped
+    pub const SKIP: u8 = 0xFC;
+    /// no value; sets `saw_fd`
+    pub const SAW_FD: u8 = 0xFD;
+    /// no value; starts the next record
+    pub const NEXT_RECORD: u8 = 0xFE;
+    /// a size byte of this value means a 32-bit big-endian size follows
+    pub const EXTENDED_SIZE: u8 = 0xFF;
+    pub const PARAM_LIMIT: u8 = 0x80;
+    pub const RECORD_CODE_LIMIT: u8 = 0x26;
+    /// the per-record codes whose value is a self-relative pointer
+    pub const SELF_RELATIVE: [u8; 5] = [0x12, 0x17, 0x19, 0x1D, 0x20];
+    pub const SPLIT: u8 = 0x80;
+    pub const TYPE_HINT: u8 = 0x81;
+    pub const CHANNELS: u8 = 0x82;
+    pub const CODEC_CLASS: u8 = 0x83;
+    pub const SAMPLE_RATE: u8 = 0x84;
+    pub const SAMPLE_COUNT: u8 = 0x85;
+    pub const LOOP_START: u8 = 0x86;
+    pub const LOOP_END: u8 = 0x87;
+    /// the per-channel data offsets: 0x88 and 0x89
+    pub const DATA_OFFSET_0: u8 = 0x88;
+    pub const DATA_OFFSET_1: u8 = 0x89;
+    pub const UNKNOWN_8A: u8 = 0x8A;
+    pub const UNKNOWN_8B: u8 = 0x8B;
+    pub const FLAGS_8C: u8 = 0x8C;
+    pub const CODEC_BYTE: u8 = 0xA0;
+    pub const FLAGS_A1: u8 = 0xA1;
+}
+
 impl PtHeader {
     /// Parse a `PT` header starting at `data[off]`.
     pub fn parse(data: &[u8], off: usize) -> Result<Self, FormatError> {
@@ -498,13 +536,13 @@ impl PtHeader {
             let code = *data.get(p).ok_or(FormatError::Truncated { what: "PT code", offset: p, needed: 1 })?;
             p += 1;
             match code {
-                0xFF => break,
-                0xFC => continue,
-                0xFD => {
+                pt_code::END => break,
+                pt_code::SKIP => continue,
+                pt_code::SAW_FD => {
                     h.saw_fd = true;
                     continue;
                 }
-                0xFE => {
+                pt_code::NEXT_RECORD => {
                     h.saw_fe = true;
                     if one_record {
                         more = true;
@@ -518,7 +556,7 @@ impl PtHeader {
             }
             let mut size = *data.get(p).ok_or(FormatError::Truncated { what: "PT size", offset: p, needed: 1 })? as usize;
             p += 1;
-            if size == 0xFF {
+            if size == pt_code::EXTENDED_SIZE as usize {
                 size = crate::u32_be(data, p, "PT extended size")? as usize;
                 p += 4;
             }
@@ -527,9 +565,9 @@ impl PtHeader {
             p += size;
             let v = || be_value(bytes, val_off, code);
             match code {
-                c if c < 0x80 => {
+                c if c < pt_code::PARAM_LIMIT => {
                     let value = v()?;
-                    if c < 0x26 {
+                    if c < pt_code::RECORD_CODE_LIMIT {
                         let signed = match size {
                             1 if value > 0x7F => value as i32 - 0x100,
                             2 if value > 0x7FFF => value as i32 - 0x1_0000,
@@ -537,15 +575,15 @@ impl PtHeader {
                             _ => value as i32,
                         };
                         h.records.last_mut().expect("one record at least").push((c, signed));
-                        if matches!(c, 0x12 | 0x17 | 0x19 | 0x1D | 0x20) {
+                        if pt_code::SELF_RELATIVE.contains(&c) {
                             ptrs.last_mut().expect("one record at least").push((c, val_off as i64 + signed as i64));
                         }
                     }
                     h.patch_params.push((c, value));
                 }
-                0x80 => h.split = Some(v()?),
-                0x81 => h.type_hint = Some(v()?),
-                0x82 => {
+                pt_code::SPLIT => h.split = Some(v()?),
+                pt_code::TYPE_HINT => h.type_hint = Some(v()?),
+                pt_code::CHANNELS => {
                     let ch = v()?;
                     if ch == 0 || ch > 2 {
                         return Err(FormatError::UnexpectedValue {
@@ -557,16 +595,16 @@ impl PtHeader {
                     }
                     h.channels = ch as u16;
                 }
-                0x83 => h.codec_class = Some(v()?),
-                0x84 => h.sample_rate = v()?,
-                0x85 => h.sample_count = Some(v()?),
-                0x86 => h.loop_start = Some(v()?),
-                0x87 => h.loop_end = Some(v()?),
-                0x88 | 0x89 => h.data_offset[(code - 0x88) as usize] = Some(v()?),
-                0x8A | 0x8B => h.unknown_8a[(code - 0x8A) as usize] = Some(v()?),
-                0x8C => h.flags_8c = Some(v()?),
-                0xA1 => h.flags_a1 = Some(v()?),
-                0xA0 => h.codec_byte = Some(v()?),
+                pt_code::CODEC_CLASS => h.codec_class = Some(v()?),
+                pt_code::SAMPLE_RATE => h.sample_rate = v()?,
+                pt_code::SAMPLE_COUNT => h.sample_count = Some(v()?),
+                pt_code::LOOP_START => h.loop_start = Some(v()?),
+                pt_code::LOOP_END => h.loop_end = Some(v()?),
+                pt_code::DATA_OFFSET_0 | pt_code::DATA_OFFSET_1 => h.data_offset[(code - pt_code::DATA_OFFSET_0) as usize] = Some(v()?),
+                pt_code::UNKNOWN_8A | pt_code::UNKNOWN_8B => h.unknown_8a[(code - pt_code::UNKNOWN_8A) as usize] = Some(v()?),
+                pt_code::FLAGS_8C => h.flags_8c = Some(v()?),
+                pt_code::FLAGS_A1 => h.flags_a1 = Some(v()?),
+                pt_code::CODEC_BYTE => h.codec_byte = Some(v()?),
                 _ => h.unknown.push((code, bytes.to_vec())),
             }
         }
@@ -650,7 +688,8 @@ impl PtHeader {
             if off > data.len() {
                 return Err(FormatError::InvalidOffset { what: "PT sample data", offset: off, len: data.len() });
             }
-            let mut plane = Vec::with_capacity(count);
+            // `count` is the header's claim; no codec yields more than two samples a stream byte
+            let mut plane = Vec::with_capacity(count.min(data.len().saturating_mul(2)));
             match codec {
                 Codec::EaXa => {
                     padded_tail = padded_tail.max(decode_ea_xa(data, off, count, &mut EaXaState::default(), &mut plane, "EA-XA sample data")?);
@@ -749,7 +788,7 @@ impl Bnk {
         if version != 4 {
             return Err(FormatError::UnsupportedVersion { what: "BNKl", found: version as u32, supported: "4" });
         }
-        let unknown_05 = data[5];
+        let unknown_05 = *data.get(5).ok_or(FormatError::Truncated { what: "BNKl +5", offset: 5, needed: 1 })?;
         let count = u16_le(data, 6, "BNKl slot count")? as usize;
         let dir_size = u32_le(data, 8, "BNKl dir size")?;
         let data_size = u32_le(data, 12, "BNKl data size")?;
@@ -804,6 +843,18 @@ impl Bnk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pt_codes_keep_their_literal_values() {
+        use pt_code::*;
+        assert_eq!([END, SKIP, SAW_FD, NEXT_RECORD, EXTENDED_SIZE], [0xFF, 0xFC, 0xFD, 0xFE, 0xFF]);
+        assert_eq!([PARAM_LIMIT, RECORD_CODE_LIMIT], [0x80, 0x26]);
+        assert_eq!(SELF_RELATIVE, [0x12, 0x17, 0x19, 0x1D, 0x20]);
+        assert_eq!(
+            [SPLIT, TYPE_HINT, CHANNELS, CODEC_CLASS, SAMPLE_RATE, SAMPLE_COUNT, LOOP_START, LOOP_END, DATA_OFFSET_0, DATA_OFFSET_1, UNKNOWN_8A, UNKNOWN_8B, FLAGS_8C, CODEC_BYTE, FLAGS_A1],
+            [0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0xA0, 0xA1]
+        );
+    }
 
     fn hex(s: &str) -> Vec<u8> {
         s.split_whitespace().map(|b| u8::from_str_radix(b, 16).unwrap()).collect()

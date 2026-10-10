@@ -61,7 +61,7 @@ impl App {
         // blank only because nothing had been bought, damaged or listed — a parity loop reading
         // that number chases widgets that are already ported. `NFS_SWEEP_STATE=0` restores the
         // bare-career count for anyone who wants to see it.
-        if nfs_game::config::cfg().nfs_sweep_state.var().as_deref() != Ok("0")
+        if nfs_game::config::cfg().nfs_sweep_state.as_str() != Some("0")
             && let Some(c) = self.career.as_mut()
         {
             let parts: Vec<(i16, f32)> = {
@@ -127,7 +127,7 @@ impl App {
             // the same probe fills the browser with one session, so the four `Comms.*` lists and
             // the watches beside them can be measured too. The record is what a `'d'` answer
             // carries (`nfs_net::comm::Describe`), filled as a two-player game would fill it.
-            if nfs_game::config::cfg().nfs_sweep_state.var().as_deref() != Ok("0")
+            if nfs_game::config::cfg().nfs_sweep_state.as_str() != Some("0")
                 && let Some(lobby) = self.net.lobby.as_mut()
                 && lobby.found.is_empty()
             {
@@ -172,7 +172,7 @@ impl App {
             // and `NFS_SWEEP_DUMP=*` every screen's. The blank count cannot see a widget that draws
             // the **wrong** thing — `UsedCar.Car` answered every modifier with the car's name for a
             // long time and counted as drawn — so this is the other half of the measurement.
-            if nfs_game::config::cfg().nfs_sweep_dump.var().as_deref().is_ok_and(|v| v == "*" || v == name.as_str())
+            if nfs_game::config::cfg().nfs_sweep_dump.as_str().is_some_and(|v| v == "*" || v == name.as_str())
                 && let Some(l) = self.fe.layout_preview.as_ref()
             {
                 for e in &l.layout.elements {
@@ -195,21 +195,21 @@ impl App {
                 }
             }
             // Every part expression whose evaluation reached the cycle guard (`guard_hits`; // there is no unanswerable name any more) — none over the 98 shipped layouts.
-            if nfs_game::config::cfg().nfs_expr_sweep.var().is_ok()
+            if nfs_game::config::cfg().nfs_expr_sweep.as_str().is_some()
                 && let Some(l) = self.fe.layout_preview.as_ref()
             {
                 for (class, part, key, expr) in l.expr_failures() {
                     *expr_fail.entry((class, part, key, expr)).or_insert(0usize) += 1;
                 }
             }
-            if nfs_game::config::cfg().nfs_box_sweep.var().is_ok()
+            if nfs_game::config::cfg().nfs_box_sweep.as_str().is_some()
                 && let Some(l) = self.fe.layout_preview.as_ref()
             {
                 for (class, b, u) in l.box_disagreements() {
                     println!("  box {name:<20} {class:<28} size.value=({:.0}x{:.0}) parts=({:.0}x{:.0})", b.0, b.1, u.0, u.1);
                 }
             }
-            if nfs_game::config::cfg().nfs_hit_sweep.var().is_ok()
+            if nfs_game::config::cfg().nfs_hit_sweep.as_str().is_some()
                 && let Some(l) = self.fe.layout_preview.as_mut()
             {
                 for line in l.hit_sweep() {
@@ -364,7 +364,7 @@ impl App {
         // A list of gaps that names things already done is the same failure as the blank count
         // reading an empty career, and it hid a real one underneath: `state_hidden_or_disabled`
         // was reading only the `.lay` attribute, so a widget hidden at run time stayed pressable.
-        if nfs_game::config::cfg().nfs_sweep_states.var().is_ok() {
+        if nfs_game::config::cfg().nfs_sweep_states.as_str().is_some() {
             const KNOWN: [&str; 9] =
                 ["normal", "hover", "focused", "focusedhover", "selected", "selectedhover", "highlighty", "hidden", "disabled"];
             let mut miss: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = Default::default();
@@ -397,7 +397,7 @@ impl App {
                 println!("  {class:<32} {}", states.iter().cloned().collect::<Vec<_>>().join(", "));
             }
         }
-        if nfs_game::config::cfg().nfs_sweep_where.var().is_ok() {
+        if nfs_game::config::cfg().nfs_sweep_where.as_str().is_some() {
             println!("blank widgets by screen:");
             let mut ks: Vec<&String> = where_of.keys().collect();
             ks.sort();
@@ -490,7 +490,7 @@ impl App {
     /// what this port has on a machine with no pad. `NFS_FE_PAD=1` stands one in, all eight axes
     /// present and each a tenth of the way along, so `deadzone.lay` can be looked at without one.
     pub(crate) fn fe_pads(&self) -> Vec<nfs_game::layout::FePad> {
-        if nfs_game::config::cfg().nfs_fe_pad.var().is_ok() {
+        if nfs_game::config::cfg().nfs_fe_pad.as_str().is_some() {
             return vec![nfs_game::layout::FePad { analogue: true, axes: 0xFF, values: [32767; 8] }];
         }
         // `NFS_FE_DZ=<min>,<max>` puts the sixteen values somewhere other than the factory's
@@ -505,7 +505,7 @@ impl App {
     /// `NFS_FE_DZ=<min>,<max>` — the sixteen dead-zone values for a still, in the accessors' own
     /// 0…0x80. Without it they are the factory's 0 and 0x80 (0x51E546, 0x51E550).
     pub(crate) fn fe_deadzone() -> Option<[[i32; 2]; 8]> {
-        let v = nfs_game::config::cfg().nfs_fe_dz.var().ok()?;
+        let v = nfs_game::config::cfg().nfs_fe_dz.as_str()?;
         let (a, b) = v.split_once(',')?;
         let (a, b) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
         Some([[a, b]; 8])
@@ -561,22 +561,21 @@ pub(crate) static PLAY_INTRO: std::sync::atomic::AtomicBool = std::sync::atomic:
 /// (default 1280x800, the goldens' size) and `NFS_SHOT_SCALE=<s>` (default 1, the HiDPI factor the
 /// HUD's logical resolution is taken with, see [`App::hud_geometry`]).
 pub(crate) fn shot_geometry() -> (u32, u32, f32) {
-    let (w, h) = nfs_game::config::cfg().nfs_shot_size.var()
-        .ok()
+    let (w, h) = nfs_game::config::cfg().nfs_shot_size.as_str()
         .and_then(|v| {
             let (a, b) = v.split_once('x')?;
             Some((a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?))
         })
         .filter(|&(w, h)| w > 0 && h > 0)
         .unwrap_or((1280, 800));
-    let s = nfs_game::config::cfg().nfs_shot_scale.var().ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|s| *s >= 1.0).unwrap_or(1.0);
+    let s = nfs_game::config::cfg().nfs_shot_scale.as_str().and_then(|v| v.trim().parse::<f32>().ok()).filter(|s| *s >= 1.0).unwrap_or(1.0);
     (w, h, s)
 }
 
 /// diagnostic: `NFS_CONE_LIMIT=n` gives the mission a cone **limit** of `n` (rule kind 0, which no
 /// shipped mission uses) — so `CONEPENALTY` is −1 and `HTime`'s sum can go below 0
 pub(crate) fn cone_limit_diagnostic(mut ms: career_ui::MissionStart) -> career_ui::MissionStart {
-    if let Some(n) = nfs_game::config::cfg().nfs_cone_limit.var().ok().and_then(|v| v.trim().parse::<u16>().ok()) {
+    if let Some(n) = nfs_game::config::cfg().nfs_cone_limit.as_str().and_then(|v| v.trim().parse::<u16>().ok()) {
         ms.mission.cone_rule = Some(nfs_formats::career::ConeRule::Limit(n));
     }
     ms
@@ -599,8 +598,8 @@ pub(crate) fn race_finish_diagnostic() -> Option<u64> {
 fn race_place_spec() -> (Option<usize>, Option<u64>) {
     static SPEC: std::sync::OnceLock<(Option<usize>, Option<u64>)> = std::sync::OnceLock::new();
     *SPEC.get_or_init(|| {
-        let Ok(v) = nfs_game::config::cfg().nfs_race_place.var() else { return (None, None) };
-        let (p, t) = v.split_once(':').map_or((v.as_str(), None), |(p, t)| (p, Some(t)));
+        let Some(v) = nfs_game::config::cfg().nfs_race_place.as_str() else { return (None, None) };
+        let (p, t) = v.split_once(':').map_or((v, None), |(p, t)| (p, Some(t)));
         let place = p.trim().parse::<usize>().ok().filter(|p| *p >= 1);
         (place, place.and(t.and_then(|t| t.trim().parse::<u64>().ok())))
     })
@@ -648,7 +647,7 @@ impl App {
     /// not its replay — written as `<prefix>.t<tick>.png`, so a session's later race can be
     /// compared still by still with a first race in a fresh process.
     pub(crate) fn shot_at_tick(&mut self) {
-        let Ok(spec) = std::env::var("NFS_SHOT_TICKS") else { return };
+        let Some(spec) = nfs_game::config::cfg().nfs_shot_ticks.as_str() else { return };
         let Some((path, ticks)) = spec.rsplit_once('@') else { return };
         let replaying = self.replay.stream.as_ref().is_some_and(|r| matches!(r.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted));
         if self.session_races > 1 || replaying || !ticks.split(',').any(|t| t.trim().parse::<u64>().ok() == Some(self.tick)) {
@@ -659,7 +658,7 @@ impl App {
         // still. A scripted run draws no frames between its shots, so the wing's 2000 ms easer (one step per drawn frame,
         // `CarModel::update_animation`, gate 22.222 m/s) never runs; this writes the end of its travel directly. Unset = the
         // original's path; the simulation is not touched.
-        if std::env::var_os("NFS_TEST_SPOILER").is_some()
+        if nfs_game::config::cfg().nfs_test_spoiler.is_set()
             && let (Some(c), Some(r)) = (self.car_model.as_mut(), self.renderer.as_mut())
         {
             c.set_anim(r, 2, c.anim_length(2) as f32);

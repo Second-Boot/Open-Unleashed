@@ -82,7 +82,7 @@ impl App {
                 if let Err(e) = renderer.render(&scene, &self.camera) {
                     tracing::error!(error = %e, "start-up loading screen render failed");
                 }
-                if nfs_game::config::cfg().nfs_fe_loadscrn.var().is_ok() {
+                if nfs_game::config::cfg().nfs_fe_loadscrn.as_str().is_some() {
                     self.fe.startup_still = Some(l);
                 }
             }
@@ -218,7 +218,7 @@ impl App {
             // back from a race of that type (`fe_after_race`) on start-up, so a still shows the
             // screen 0x4D3420 would open and the log the stack under it
             if self.fe.layout_preview.is_some()
-                && let Some(spec) = nfs_game::config::cfg().nfs_fe_after_race.var().ok()
+                && let Some(spec) = nfs_game::config::cfg().nfs_fe_after_race.as_str()
                 && let Some(t) = spec.split(':').next().and_then(|t| t.trim().parse::<u8>().ok())
             {
                 self.fe.race_game_type = Some(t);
@@ -226,8 +226,8 @@ impl App {
             }
             // diagnostic: `NFS_FE_CALLBACK=<name>` presses the first control whose `callback` is
             // `name` on start-up, as ENTER on it would (`layout_key`)
-            if let Some(cb) = nfs_game::config::cfg().nfs_fe_callback.var().ok()
-                && let Some(i) = self.fe.layout_preview.as_ref().and_then(|l| l.controls().iter().position(|c| c.callback.as_deref() == Some(cb.as_str())))
+            if let Some(cb) = nfs_game::config::cfg().nfs_fe_callback.as_str()
+                && let Some(i) = self.fe.layout_preview.as_ref().and_then(|l| l.controls().iter().position(|c| c.callback.as_deref() == Some(cb)))
             {
                 self.fe.layout_sel = i;
                 self.layout_key(MenuKey::Enter, event_loop);
@@ -241,7 +241,7 @@ impl App {
             // presses the current screen's control with that callback, `type:<accessor>=<text>`
             // types into that input box
             if self.fe.layout_preview.is_some()
-                && let Ok(spec) = nfs_game::config::cfg().nfs_fe_keys.var()
+                && let Some(spec) = nfs_game::config::cfg().nfs_fe_keys.as_str()
             {
                 for k in spec.split(',').map(str::trim) {
                     self.fe_scripted_key(k, event_loop);
@@ -250,7 +250,7 @@ impl App {
             // diagnostic: `NFS_FE_STEP=<accessor>:<delta>[,…]` steps accessors on start-up as a
             // combo slider's arrows do (`set_accessor`), e.g. `Tournament.Tournament:1`
             if self.fe.layout_preview.is_some()
-                && let Ok(spec) = nfs_game::config::cfg().nfs_fe_step.var()
+                && let Some(spec) = nfs_game::config::cfg().nfs_fe_step.as_str()
             {
                 for (name, d) in spec.split(',').filter_map(|s| s.rsplit_once(':')) {
                     if let Ok(d) = d.trim().parse::<i32>() {
@@ -267,10 +267,10 @@ impl App {
             // start-up — with `--autotest N` the race runs headless and the log shows where the
             // front end comes back to (`fe_after_race`)
             if self.fe.layout_preview.is_some()
-                && let Some(t) = nfs_game::config::cfg().nfs_fe_playgame.var().ok().and_then(|v| v.trim().parse::<u8>().ok())
+                && let Some(t) = nfs_game::config::cfg().nfs_fe_playgame.as_str().and_then(|v| v.trim().parse::<u8>().ok())
             {
                 self.fe.game_type = t;
-                let started = if t == 4 && self.career.is_some() {
+                let started = if t == game_type::TOURNAMENT && self.career.is_some() {
                     self.start_tournament_from_layout(event_loop)
                 } else {
                     self.fe_start_game(event_loop);
@@ -304,7 +304,7 @@ impl App {
             // `--sprite-selftest`: draw three quads through the real sprite path — a grey ground,
             // a black square and a white square — and print what came back. The smallest case that
             // can show the fault in `RE/AUDIT.md` F2, using the pipeline the front end uses.
-            if nfs_game::config::cfg().nfs_sprite_selftest.var().is_ok() {
+            if nfs_game::config::cfg().nfs_sprite_selftest.as_str().is_some() {
                 let white = self.fe.layout_preview.as_ref().map(|l| l.white_texture());
                 let atlas = self.fe.layout_preview.as_ref().and_then(|l| l.a_font_texture());
                 if let (Some(tex), Some(r)) = (white, self.renderer.as_mut()) {
@@ -372,7 +372,7 @@ impl App {
             }
             // (tooling: `NFS_SHOT_IN_RACE=1` leaves the still for the race that follows, so a
             // network joiner — which the host's `0xB3` starts — can be photographed in its race)
-            if nfs_game::config::cfg().nfs_shot_in_race.var_os().is_none()
+            if !nfs_game::config::cfg().nfs_shot_in_race.is_set()
                 && let Some(path) = self.screenshot.take()
             {
                 // a screen fades in over half a second (`RE/notes/controls.md` §6), so a shot taken
@@ -390,7 +390,7 @@ impl App {
                     let least = if l.has_movies() { 32 } else { 0 };
                     // diagnostic: `NFS_FE_FRAMES=<n>` stops after n frames, for a still part way
                     // through the screen's transition
-                    let frames: Option<usize> = nfs_game::config::cfg().nfs_fe_frames.var().ok().and_then(|v| v.parse().ok());
+                    let frames: Option<usize> = nfs_game::config::cfg().nfs_fe_frames.as_str().and_then(|v| v.parse().ok());
                     for i in 0..frames.unwrap_or(120) {
                         l.advance_movies(r, 16, self.snd.audio.as_ref(), self.snd.registry_music_level);
                         ran += 1;
@@ -414,7 +414,7 @@ impl App {
                     // panel A loaded — Options' "controllers" panel embeds `Controllers.lay` with its
                     // own strip — is reached through its real parent), and so on; the single form
                     // `A:60` is a chain of one. A step whose widget is not found ends the chain.
-                    if let Ok(chain) = nfs_game::config::cfg().nfs_fe_tab.var() {
+                    if let Some(chain) = nfs_game::config::cfg().nfs_fe_tab.as_str() {
                         for step in chain.split(',') {
                             let Some((spec, n)) = step.split_once(':').map(|(a, b)| (a, b.parse::<usize>().unwrap_or(0))) else {
                                 break;
@@ -455,7 +455,7 @@ impl App {
                 // 0x5082F0, `Layout::picture_drag_to`), without a live mouse. Added for user
                 // report 2026-09-30 (b); there is no `wheel:` token, because the original drops
                 // the wheel entirely (`RE/notes/controls.md` §4.40, NOT A BUG — nothing to script).
-                if let Ok(v) = nfs_game::config::cfg().nfs_fe_clicks.var() {
+                if let Some(v) = nfs_game::config::cfg().nfs_fe_clicks.as_str() {
                     for p in v.split(';') {
                         if let Some(rest) = p.strip_prefix("drag:")
                             && let Some((p1, p2)) = rest.split_once('>')
@@ -498,7 +498,7 @@ impl App {
                 }
                 // and a room that is still changing — the last screen's going out, then this one's
                 // coming in (`fe_room_tick`) — is let settle too, the screen's clock running with it
-                let settle = nfs_game::config::cfg().nfs_fe_frames.var().is_err() && nfs_game::config::cfg().nfs_fe_tab.var().is_err();
+                let settle = nfs_game::config::cfg().nfs_fe_frames.as_str().is_none() && nfs_game::config::cfg().nfs_fe_tab.as_str().is_none();
                 for _ in 0..240 {
                     if !settle || self.fe.room_obj.is_none_or(|(_, t)| matches!(t, nfs_game::layout::Transition::Idle)) {
                         break;
@@ -528,7 +528,7 @@ impl App {
                 // `NFS_FE_DIALOG` raises its dialog in the dialog step, which a still otherwise
                 // never reaches
                 // (and a dialog a scripted network run raised: `comm_tick`'s notices)
-                if nfs_game::config::cfg().nfs_fe_dialog.var().is_ok() || self.fe.dialog.is_some() {
+                if nfs_game::config::cfg().nfs_fe_dialog.as_str().is_some() || self.fe.dialog.is_some() {
                     self.fe_dialog_step();
                 }
                 // **TEST GLUE** `NFS_FE_SEQ`: consecutive frames instead of the one still (`fe_seq.rs`)
@@ -540,7 +540,7 @@ impl App {
                 let mut scene = self.scene.clone();
                 // `NFS_FE_KEEP=<n>` renders only the first n sprites of the front end's own list —
                 // the bisect for `RE/AUDIT.md` F2
-                if let Ok(n) = nfs_game::config::cfg().nfs_fe_keep.var().map(|v| v.parse::<usize>().unwrap_or(usize::MAX)) {
+                if let Some(n) = nfs_game::config::cfg().nfs_fe_keep.as_str().map(|v| v.parse::<usize>().unwrap_or(usize::MAX)) {
                     println!("fe sprites: {}, keeping {}", scene.sprites.len(), n.min(scene.sprites.len()));
                     scene.sprites.truncate(n);
                 }

@@ -8,7 +8,8 @@
 //! which makes the jingles noticeably louder (0x4ADBF9).
 
 use crate::mixer::{AudioOutput, StreamSource, VoiceId};
-use nfs_formats::{bigf::Bigf, schl::SchlStream};
+use nfs_formats::{bigf::BigfEntry, schl::SchlStream};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 pub struct Music {
@@ -18,9 +19,63 @@ pub struct Music {
     _thread: std::thread::JoinHandle<()>,
 }
 
+/// The music archive's file name inside the `Music` directory.
+const MUSIC_VIV: &str = "zzzymus.viv";
+
+/// How long the feeder sleeps while the queue holds more than two seconds.
+const FEED_WAIT_MS: u64 = 100;
+
+/// A song that is dropped is not wanted any more: its feeder thread stops (until
+/// then a thread whose voice had been stopped slept in its throttle loop for good, holding the
+/// song's bytes and the 2 MB queue).
+impl Drop for Music {
+    fn drop(&mut self) {
+        self.src.cancel();
+    }
+}
+
+/// The directory of a BIGF archive read from its head only, not the whole file
+/// (the music archive is tens of MB and was read whole by every title list, length list and
+/// song start). Same table as [`nfs_formats::bigf::Bigf::parse`] walks (`+8` count, `+12` header
+/// size, then `{u32 BE offset, u32 BE size, NUL-terminated name}`), the entries checked against
+/// the file's length.
+fn viv_directory(file: &mut std::fs::File) -> anyhow::Result<Vec<BigfEntry>> {
+    let len = file.metadata()?.len();
+    let mut head = [0u8; 16];
+    file.read_exact(&mut head)?;
+    anyhow::ensure!(&head[0..4] == b"BIGF", "not a BIGF archive");
+    let be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    let (count, header_size) = (be(&head[8..12]) as usize, be(&head[12..16]) as u64);
+    // the table ends where the first file's data begins (`header_size`); never read past the file
+    let mut table = vec![0u8; header_size.saturating_sub(16).min(len.saturating_sub(16)) as usize];
+    file.read_exact(&mut table)?;
+    let mut entries = Vec::with_capacity(count);
+    let mut pos = 0usize;
+    for _ in 0..count {
+        let fields = table.get(pos..pos + 8).ok_or_else(|| anyhow::anyhow!("BIGF entry truncated"))?;
+        let (offset, size) = (be(&fields[0..4]), be(&fields[4..8]));
+        pos += 8;
+        let start = pos;
+        while *table.get(pos).ok_or_else(|| anyhow::anyhow!("BIGF entry name truncated"))? != 0 {
+            pos += 1;
+        }
+        let name = table[start..pos].iter().map(|&b| b as char).collect();
+        pos += 1;
+        anyhow::ensure!(offset as u64 + size as u64 <= len, "BIGF entry data past the end of the file");
+        entries.push(BigfEntry { name, offset, size });
+    }
+    Ok(entries)
+}
+
+/// The entry directory of `<music_dir>/zzzymus.viv` and the file, still open.
+fn open_viv(music_dir: &Path) -> anyhow::Result<(std::fs::File, Vec<BigfEntry>)> {
+    let mut file = std::fs::File::open(music_dir.join(MUSIC_VIV))?;
+    let entries = viv_directory(&mut file)?;
+    Ok((file, entries))
+}
+
 pub fn song_titles(music_dir: &Path) -> anyhow::Result<Vec<String>> {
-    let data = std::fs::read(music_dir.join("zzzymus.viv"))?;
-    Ok(Bigf::parse(&data)?.entries.iter().map(|e| e.name.clone()).collect())
+    Ok(open_viv(music_dir)?.1.into_iter().map(|e| e.name).collect())
 }
 
 /// Each song's length in milliseconds, which is what the original keeps at `track + 0x20` and what
@@ -42,9 +97,7 @@ pub fn song_titles(music_dir: &Path) -> anyhow::Result<Vec<String>> {
 /// past this point — its identity as "the resolved entry's byte size" rests on the exact numeric
 /// match above, not a read to the instruction of where that size is fetched.
 pub fn song_lengths_ms(music_dir: &Path) -> anyhow::Result<Vec<u32>> {
-    let data = std::fs::read(music_dir.join("zzzymus.viv"))?;
-    let viv = Bigf::parse(&data)?;
-    Ok(viv.entries.iter().map(|e| ((e.size as u64 * 10) / 348) as u32).collect())
+    Ok(open_viv(music_dir)?.1.iter().map(|e| ((e.size as u64 * 10) / 348) as u32).collect())
 }
 
 /// `game13-Activator-Morphadron` → (`Activator`, `Morphadron`) — `0x4AD950` splits on `-`.
@@ -843,10 +896,12 @@ impl MusicPlayer {
 
 impl Music {
     pub fn play(out: &AudioOutput, music_dir: &Path, index: usize, volume: f32) -> anyhow::Result<Self> {
-        let data = std::fs::read(music_dir.join("zzzymus.viv"))?;
-        let viv = Bigf::parse(&data)?;
-        let entry = viv.entries.get(index).ok_or_else(|| anyhow::anyhow!("song index {index} out of range"))?.clone();
-        let bytes = viv.data(&data, &entry).to_vec();
+        let (mut file, entries) = open_viv(music_dir)?;
+        let entry = entries.get(index).ok_or_else(|| anyhow::anyhow!("song index {index} out of range"))?.clone();
+        // only this song's bytes, not the whole archive
+        let mut bytes = vec![0u8; entry.size as usize];
+        file.seek(SeekFrom::Start(entry.offset as u64))?;
+        file.read_exact(&mut bytes)?;
         let stream = SchlStream::parse(&bytes)?;
         let (rate, channels) = (stream.header.sample_rate, stream.header.channels);
         let src = StreamSource::new(rate, channels);
@@ -858,7 +913,13 @@ impl Music {
                 Ok(s) => s,
                 Err(_) => return,
             };
+            // nobody plays this stream any more: its `Music` was dropped (cancelled), or the mixer
+            // let go of the voice and `Music` is gone too (only this handle is left)
+            let abandoned = |f: &std::sync::Arc<StreamSource>| f.is_cancelled() || std::sync::Arc::strong_count(f) == 1;
             for block in stream.blocks(&bytes) {
+                if abandoned(&feeder) {
+                    return;
+                }
                 let Ok(block) = block else { break };
                 let nfs_formats::schl::Block::Data(block) = block else { continue };
                 let mut pcm = Vec::new();
@@ -868,7 +929,10 @@ impl Music {
                 feeder.push(&pcm);
                 // keep ~2 s buffered ahead
                 while feeder.queued_frames() > rate as usize * 2 {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if abandoned(&feeder) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(FEED_WAIT_MS));
                 }
             }
             feeder.finished.store(true, std::sync::atomic::Ordering::Release);
@@ -1433,6 +1497,129 @@ mod toggle_tests {
     }
 }
 
+/// the archive head reader and the feeder thread's life, on a synthetic archive
+/// (one EA-XA mono song of silent blocks at 100 Hz, so the feeder reaches its throttle at once).
+#[cfg(test)]
+mod feeder {
+    use super::*;
+    use std::sync::Arc;
+
+    /// `zzzymus.viv` with the entries `(name, bytes)`.
+    fn viv(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let header = 16 + entries.iter().map(|(n, _)| 8 + n.len() + 1).sum::<usize>();
+        let total = header + entries.iter().map(|(_, d)| d.len()).sum::<usize>();
+        let mut out = b"BIGF".to_vec();
+        out.extend((total as u32).to_be_bytes());
+        out.extend((entries.len() as u32).to_be_bytes());
+        out.extend((header as u32).to_be_bytes());
+        let mut at = header;
+        for (n, d) in entries {
+            out.extend((at as u32).to_be_bytes());
+            out.extend((d.len() as u32).to_be_bytes());
+            out.extend(n.bytes());
+            out.push(0);
+            at += d.len();
+        }
+        for (_, d) in entries {
+            out.extend(d);
+        }
+        out
+    }
+
+    /// A mono EA-XA stream of `blocks` blocks of 28 silent samples at `rate` Hz.
+    fn song(rate: u16, blocks: u32) -> Vec<u8> {
+        let mut head = b"PT".to_vec();
+        head.extend([0, 0, 0x82, 1, 1, 0x84, 2]);
+        head.extend(rate.to_be_bytes());
+        head.extend([0x85, 4]);
+        head.extend((blocks * 28).to_be_bytes());
+        head.push(0xFF);
+        let mut out = b"SCHl".to_vec();
+        out.extend((8 + head.len() as u32).to_le_bytes());
+        out.extend(head);
+        for _ in 0..blocks {
+            out.extend(b"SCDl");
+            out.extend((8u32 + 4 + 4 + 4 + 15).to_le_bytes());
+            out.extend(28u32.to_le_bytes());
+            out.extend(0u32.to_le_bytes());
+            out.extend([0u8; 4 + 15]);
+        }
+        out.extend(b"SCEl");
+        out.extend(8u32.to_le_bytes());
+        out
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nfs-music-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn wait_for(what: &str, mut ok: impl FnMut() -> bool) {
+        let t = std::time::Instant::now();
+        while !ok() {
+            assert!(t.elapsed() < std::time::Duration::from_secs(5), "timed out: {what}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn the_directory_comes_from_the_head_alone() {
+        let dir = scratch("dir");
+        let a = song(100, 3);
+        let b = vec![7u8; 1000];
+        std::fs::write(dir.join(MUSIC_VIV), viv(&[("game00-A-B", a.clone()), ("win1", b.clone())])).unwrap();
+        assert_eq!(song_titles(&dir).unwrap(), ["game00-A-B", "win1"]);
+        assert_eq!(song_lengths_ms(&dir).unwrap(), [((a.len() as u64 * 10) / 348) as u32, ((b.len() as u64 * 10) / 348) as u32]);
+        // the same table the format crate's parser reads
+        let data = std::fs::read(dir.join(MUSIC_VIV)).unwrap();
+        let full = nfs_formats::bigf::Bigf::parse(&data).unwrap();
+        let (_, head) = open_viv(&dir).unwrap();
+        assert_eq!(head, full.entries);
+        // a cut file refuses, a wrong magic refuses
+        std::fs::write(dir.join(MUSIC_VIV), &data[..data.len() - 10]).unwrap();
+        assert!(song_titles(&dir).is_err());
+        std::fs::write(dir.join(MUSIC_VIV), b"BIGX0000000000000000").unwrap();
+        assert!(song_titles(&dir).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A song that was started and stopped leaves no thread behind: after the player lets go of
+    /// it the feeder (parked in its throttle loop) ends and its source is freed.
+    #[test]
+    fn a_stopped_song_frees_its_feeder() {
+        let dir = scratch("feed");
+        std::fs::write(dir.join(MUSIC_VIV), viv(&[("game00-A-B", song(100, 40))])).unwrap();
+        let out = AudioOutput::offline();
+        for _ in 0..20 {
+            let m = Music::play(&out, &dir, 0, 0.0).unwrap();
+            let weak = Arc::downgrade(&m.src);
+            wait_for("the feeder fills its queue", || m.src.queued_frames() > 200);
+            out.stop(m.voice);
+            drop(m);
+            // (the stopped voice waits in the mixer's return ring until the next call frees it)
+            wait_for("the feeder lets the source go", || {
+                out.set_pan(crate::mixer::VoiceId(u32::MAX), 0);
+                weak.upgrade().is_none()
+            });
+        }
+        assert!(Music::play(&out, &dir, 1, 0.0).is_err(), "a song index past the archive");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A song nobody drops still plays out: the feeder finishes and sets `finished`.
+    #[test]
+    fn a_song_that_plays_on_is_fed_to_its_end() {
+        let dir = scratch("end");
+        std::fs::write(dir.join(MUSIC_VIV), viv(&[("game00-A-B", song(100, 4))])).unwrap();
+        let out = AudioOutput::offline();
+        let m = Music::play(&out, &dir, 0, 0.0).unwrap();
+        wait_for("the feeder reaches the end", || m.src.finished.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(m.src.queued_frames(), 4 * 28);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
 #[cfg(test)]
 mod real_data {
     use super::*;
@@ -1461,6 +1648,26 @@ mod real_data {
         let total_ms: u64 = names.iter().zip(&lens).filter(|(n, _)| pattern_match(n, "game*")).map(|(_, &ms)| ms as u64).sum();
         let secs = total_ms / 1000;
         assert_eq!((secs / 60, secs % 60), (35, 46), "total {total_ms} ms, pass6_options_audio.jpg shows 35:46");
+    }
+
+    /// the head-only directory is the format crate's own table, and a song read by
+    /// its range is the bytes of the whole-file read.
+    #[test]
+    fn the_head_directory_equals_the_whole_file_parse() {
+        let Some(root) = game_root() else {
+            eprintln!("skipping: original game data not found");
+            return;
+        };
+        let dir = root.join("GameData/Music");
+        let data = std::fs::read(dir.join(MUSIC_VIV)).unwrap();
+        let full = nfs_formats::bigf::Bigf::parse(&data).unwrap();
+        let (mut file, head) = open_viv(&dir).unwrap();
+        assert_eq!(head, full.entries);
+        let e = &head[head.len() - 1];
+        let mut bytes = vec![0u8; e.size as usize];
+        file.seek(SeekFrom::Start(e.offset as u64)).unwrap();
+        file.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, full.data(&data, e));
     }
 
     /// AUDIO-RACEMUSIC end to end on the real `zzzymus.viv`: a list of two songs (`vic01`, 17.2 s,

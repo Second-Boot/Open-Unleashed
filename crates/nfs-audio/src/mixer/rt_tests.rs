@@ -51,7 +51,7 @@ fn counted<R>(f: impl FnOnce() -> R) -> (R, usize) {
 }
 
 fn clips() -> [Arc<Clip>; 4] {
-    let plain = Clip { rate: 22050, channels: 1, samples: Vec::new(), loop_range: None, gain: 1.0, bend_cents: 0, fx_send: 0, priority: 0, pan: 64, pan_scale: 1, records: Vec::new(), layers: Vec::new(), tables: Vec::new() };
+    let plain = Clip { samples: Vec::new(), ..Default::default() };
     let wave = |n: usize, k: i16| (0..n).map(|i| ((i as i16 % 97) - 48) * k).collect::<Vec<i16>>();
     // a loop that sends to the reverb, a short one-shot, a stereo one-shot
     let looped = Arc::new(Clip { samples: wave(5000, 120), loop_range: Some((100, 4000)), fx_send: 100, priority: 10, ..plain.clone() });
@@ -354,6 +354,56 @@ fn a_status_call_sees_the_calls_the_callback_has_not_yet_applied() {
     assert_eq!(out.progress(id), None);
 }
 
+/// a voice the mixer was the last owner of (its clip, a stream's queue) is not freed
+/// by the callback: it goes back through the return ring and is freed by the game thread's next
+/// call.
+#[test]
+fn the_callback_does_not_free_the_last_owner_of_a_clip() {
+    let (tx, core) = Tx::new(44100, false);
+    let mut core = core.unwrap();
+    let out = AudioOutput { _stream: None, tx, rate: 44100 };
+    let mut buf = vec![0.0f32; 1024];
+    let mut run = |core: &mut Core| {
+        counted(|| {
+            core.drain();
+            core.fill(&mut buf, 2, 44100.0);
+            core.publish();
+        })
+        .1
+    };
+    out.set_audio_quality(2);
+    run(&mut core); // the quality change itself (a one-time cost on the callback, as before)
+    assert_eq!(run(&mut core), 0);
+    // a one-shot the mixer owns alone, stopped by the game
+    let clip = Arc::new(Clip { samples: vec![100; 60_000], ..(*clips()[1]).clone() });
+    let weak = Arc::downgrade(&clip);
+    let id = out.play_word(clip, 1.0, 4096, 0x40, 0x4000, true);
+    assert_eq!(run(&mut core), 0);
+    out.stop(id);
+    assert_eq!(run(&mut core), 0, "stopping freed the clip on the callback");
+    assert!(weak.upgrade().is_some(), "held by the return ring until the game thread's next call");
+    out.set_pan(VoiceId(777), 0); // any call: it empties the return ring
+    assert!(weak.upgrade().is_none(), "freed on the game thread");
+    // a one-shot that ends by itself
+    let clip = Arc::new(Clip { samples: vec![100; 600], loop_range: None, ..(*clips()[1]).clone() });
+    let weak = Arc::downgrade(&clip);
+    out.play_word(clip, 1.0, 4096, 0x40, 0x4000, false);
+    for _ in 0..40 {
+        assert_eq!(run(&mut core), 0);
+    }
+    out.set_pan(VoiceId(777), 0);
+    assert!(weak.upgrade().is_none(), "a finished voice's clip is freed on the game thread");
+    // a stream whose only owner is the mixer
+    let stream = StreamSource::new(22050, 2);
+    let weak = Arc::downgrade(&stream);
+    let id = out.play_stream(stream, 1.0);
+    assert_eq!(run(&mut core), 0);
+    out.stop(id);
+    assert_eq!(run(&mut core), 0, "stopping freed the stream's queue on the callback");
+    out.set_pan(VoiceId(777), 0);
+    assert!(weak.upgrade().is_none());
+}
+
 #[test]
 fn the_counter_sees_an_allocation() {
     let (v, n) = counted(|| vec![1u8; 100]);
@@ -421,3 +471,70 @@ fn a_played_stream_leaves_the_mix() {
     assert!(!out.is_playing(a), "the played song is still in the mix");
     assert!(out.is_playing(b), "a stream still being fed left the mix");
 }
+
+/// FNV-1a 64 over the bit patterns of a rendered mix.
+fn fnv(h: &mut u64, buf: &[f32]) {
+    for x in buf {
+        for b in x.to_bits().to_le_bytes() {
+            *h = (*h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+}
+
+/// Characterisation: the script's whole mix, pinned as a hash of every sample
+/// bit, once per mix quality (the interpolator, the budget, the rate and the reverb follow it) and
+/// once with the script's own quality changes. Any refactor of the mix path must keep these.
+fn scripted_mix_hash(quality: Option<u8>, steps: usize) -> u64 {
+    let (tx, core) = Tx::new(44100, false);
+    let mut core = core.unwrap();
+    let mut out = AudioOutput { _stream: None, tx, rate: 44100 };
+    let clips = clips();
+    let stream = StreamSource::new(22050, 2);
+    stream.push(&(0..90000).map(|i| ((i % 200) as i16 - 100) * 60).collect::<Vec<_>>());
+    let (mut live, mut h) = (Vec::new(), 0xcbf2_9ce4_8422_2325u64);
+    let mut buf = vec![0.0f32; 882];
+    for i in 0..steps {
+        step(&mut out, i, &mut live, &clips, &stream);
+        if let (0, Some(q)) = (i, quality) {
+            out.set_audio_quality(q);
+        }
+        core.drain();
+        core.fill(&mut buf, 2, 44100.0);
+        fnv(&mut h, &buf);
+    }
+    h
+}
+
+/// Timing (`cargo test -p nfs-audio -- --ignored --nocapture mix_block_timing`):
+/// 24 looping voices at the cubic interpolator, five seconds of mix at 44100 Hz; prints the time.
+#[test]
+#[ignore]
+fn mix_block_timing() {
+    let (tx, core) = Tx::new(44100, false);
+    let mut core = core.unwrap();
+    let out = AudioOutput { _stream: None, tx, rate: 44100 };
+    out.set_audio_quality(3);
+    let wave: Vec<i16> = (0..8000).map(|i| ((i % 97) as i16 - 48) * 100).collect();
+    let looped = Arc::new(Clip { samples: wave, loop_range: Some((100, 7000)), priority: 10, ..Default::default() });
+    for i in 0..24 {
+        out.play_word_sel(looped.clone(), 0.5, 4096 + i * 40, 0x40, 0x2000, true, 0x7F);
+    }
+    let mut buf = vec![0.0f32; 882];
+    let t = std::time::Instant::now();
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for _ in 0..250 {
+        core.drain();
+        core.fill(&mut buf, 2, 44100.0);
+        fnv(&mut h, &buf);
+    }
+    eprintln!("mix_block_timing: {:?} (hash {h:016x})", t.elapsed());
+}
+
+#[test]
+fn the_scripted_mix_is_pinned() {
+    let got = [scripted_mix_hash(None, 300), scripted_mix_hash(Some(0), 55), scripted_mix_hash(Some(1), 55), scripted_mix_hash(Some(2), 55), scripted_mix_hash(Some(3), 55)];
+    eprintln!("PINNED {got:016x?}");
+    assert_eq!(got, PINNED_MIX, "the scripted mix changed");
+}
+
+const PINNED_MIX: [u64; 5] = [0x6f0e6096346de3a1, 0x915bc3675c20c65c, 0x34e61de18c1ba39e, 0x61c4478b8b8eecc1, 0x453179fc96264360];

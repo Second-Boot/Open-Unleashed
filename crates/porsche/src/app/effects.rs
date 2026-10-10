@@ -33,7 +33,7 @@ impl App {
             // Then the cars' sets (0x43F6E0 at 0x468B6F, after 0x455260): the same draw, `d²`
             // the car's from its last drive
             let mut sprites = p.sprites();
-            if main && nfs_game::config::cfg().nfs_skid_stats.var_os().is_some() {
+            if main && nfs_game::config::cfg().nfs_skid_stats.is_set() {
                 tracing::info!(drawn = sprites.len(), undrawn = p.undrawn_sprites(), "track particle sprites");
             }
             let mut streaks = Vec::new();
@@ -138,10 +138,10 @@ impl App {
         let view = nfs_game::weather::View::new(self.camera.position, fwd, self.camera.up);
         let tick = self.tick as u32;
         let (Some(w), Some(p)) = (self.weather.as_mut(), self.track_particles.as_mut()) else { return };
-        if nfs_game::config::cfg().nfs_weather_view.var().is_ok() {
+        if nfs_game::config::cfg().nfs_weather_view.as_str().is_some() {
             // `NFS_WEATHER_STEPS=<n>` (diagnostic) runs n one-tick frames instead of 40; a
             // `NFS_WEATHER_VIEW` that is not a slice number leaves the camera where it is
-            let steps = nfs_game::config::cfg().nfs_weather_steps.var().ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(40);
+            let steps = nfs_game::config::cfg().nfs_weather_steps.as_str().and_then(|v| v.parse::<u32>().ok()).unwrap_or(40);
             for j in 0..steps {
                 w.frame(tick.wrapping_add(j), snow, rain, view, false, p.rng_mut(), &mut self.fe_rng);
             }
@@ -201,7 +201,7 @@ impl App {
     fn windscreen_quad(&self) -> Option<[Vec3; 4]> {
         let recs = self.car.crp.window_points(&self.car.crp_data).ok()?;
         let style = nfs_assets::car::CarStyle::from_tpg(&self.car.tpg, self.car.style_index + 1);
-        let scale = if self.cheat_bits & (1 << 1) != 0 { 0.4 } else { 1.0 };
+        let scale = if self.cheat_bits & CHEAT_TINY != 0 { 0.4 } else { 1.0 };
         let pts: Vec<Vec3> = recs
             .iter()
             .filter(|r| style.article_enabled(r.style_slot as u8, r.style_value as u8))
@@ -513,7 +513,7 @@ impl App {
 
     /// `SPECIALFX` `[0x657D6C]` as 0x44ED10 switches on it (0x44EDEA): 0…3, anything else 3.
     pub(crate) fn special_fx_level(&self) -> usize {
-        match self.choice_index("Graphics.SpecialFX").map(|(i, _)| i) {
+        match self.choice_index(choice::GRAPHICS_SPECIAL_FX).map(|(i, _)| i) {
             Some(i) if i < 3 => i,
             _ => 3,
         }

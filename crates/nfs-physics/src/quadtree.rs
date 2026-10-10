@@ -245,20 +245,92 @@ impl Node {
     /// `0x4848B0`: a childless node is a leaf — append it and return. Otherwise, in query order,
     /// descend a child only when the segment's box could reach that half (a coordinate exactly at
     /// the node's centre goes to the high half only — the low test is a strict `<`).
-    fn query(&self, bounds: Bounds, seg_min: (f32, f32), seg_max: (f32, f32), out: &mut Vec<Vec<usize>>) {
+    ///
+    /// The recursive form, kept as the reference [`SegmentIter`] is tested against
+    /// (`quadtree/order_guard.rs`).
+    #[cfg(test)]
+    fn query_reference(&self, bounds: Bounds, seg_min: (f32, f32), seg_max: (f32, f32), out: &mut Vec<Vec<usize>>) {
         match self {
             Node::Leaf { entries } => out.push(entries.clone()),
             Node::Split { children } => {
                 let (cx, cz) = bounds.centre();
                 for quadrant in QUERY_ORDER {
-                    let low_x = matches!(quadrant, Quadrant::LowXLowZ | Quadrant::LowXHighZ);
-                    let low_z = matches!(quadrant, Quadrant::LowXLowZ | Quadrant::HighXLowZ);
-                    let x_reaches = if low_x { seg_min.0 < cx } else { seg_max.0 >= cx };
-                    let z_reaches = if low_z { seg_min.1 < cz } else { seg_max.1 >= cz };
-                    if x_reaches && z_reaches {
-                        children[quadrant.slot()].query(bounds.child(quadrant), seg_min, seg_max, out);
+                    if quadrant_reached(quadrant, cx, cz, seg_min, seg_max) {
+                        children[quadrant.slot()].query_reference(bounds.child(quadrant), seg_min, seg_max, out);
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Does the segment's box reach `quadrant` of a node centred at `(cx, cz)`? The low half is a strict
+/// `<` on the segment's minimum, the high half `>=` on its maximum (`0x4848B0`'s `fcomp` /
+/// `test ah,1` pairs).
+#[inline]
+fn quadrant_reached(quadrant: Quadrant, cx: f32, cz: f32, seg_min: (f32, f32), seg_max: (f32, f32)) -> bool {
+    let low_x = matches!(quadrant, Quadrant::LowXLowZ | Quadrant::LowXHighZ);
+    let low_z = matches!(quadrant, Quadrant::LowXLowZ | Quadrant::HighXLowZ);
+    let x_reaches = if low_x { seg_min.0 < cx } else { seg_max.0 >= cx };
+    let z_reaches = if low_z { seg_min.1 < cz } else { seg_max.1 >= cz };
+    x_reaches && z_reaches
+}
+
+/// One split node on [`SegmentIter`]'s path: its children, its box and the next [`QUERY_ORDER`]
+/// position to try.
+#[derive(Clone, Copy)]
+struct Frame<'a> {
+    children: &'a [Node; 4],
+    bounds: Bounds,
+    next: usize,
+}
+
+/// `0x4848B0` as a lazy walk: the entries of every leaf under the segment's box, leaf by leaf in
+/// [`QUERY_ORDER`], each leaf's entries in insertion order — the same sequence the recursive
+/// `Node::query_reference` collects, with no allocation (a split node exists only below
+/// [`LEVEL_CAP`], so the path is at most that many frames).
+pub struct SegmentIter<'a> {
+    stack: [Option<Frame<'a>>; LEVEL_CAP as usize + 1],
+    depth: usize,
+    leaf: std::slice::Iter<'a, usize>,
+    seg_min: (f32, f32),
+    seg_max: (f32, f32),
+}
+
+impl<'a> SegmentIter<'a> {
+    fn enter(&mut self, node: &'a Node, bounds: Bounds) {
+        match node {
+            Node::Leaf { entries } => self.leaf = entries.iter(),
+            Node::Split { children } => {
+                self.stack[self.depth] = Some(Frame { children, bounds, next: 0 });
+                self.depth += 1;
+            }
+        }
+    }
+}
+
+impl Iterator for SegmentIter<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        loop {
+            if let Some(&i) = self.leaf.next() {
+                return Some(i);
+            }
+            if self.depth == 0 {
+                return None;
+            }
+            let frame = self.stack[self.depth - 1].as_mut().expect("a frame below depth");
+            if frame.next == QUERY_ORDER.len() {
+                self.depth -= 1;
+                continue;
+            }
+            let quadrant = QUERY_ORDER[frame.next];
+            frame.next += 1;
+            let (children, bounds) = (frame.children, frame.bounds);
+            let (cx, cz) = bounds.centre();
+            if quadrant_reached(quadrant, cx, cz, self.seg_min, self.seg_max) {
+                self.enter(&children[quadrant.slot()], bounds.child(quadrant));
             }
         }
     }
@@ -287,13 +359,31 @@ impl QuadTree {
     /// within a leaf, entries keep the tree's own insertion order (`0x483DF0` re-inserts in order,
     /// `0x484AE0` only ever appends).
     pub fn query_segment(&self, p0: (f32, f32), p1: (f32, f32)) -> Vec<usize> {
+        self.segment_iter(p0, p1).collect()
+    }
+
+    /// [`Self::query_segment`] without the allocations: the same sequence, walked lazily.
+    pub fn segment_iter(&self, p0: (f32, f32), p1: (f32, f32)) -> SegmentIter<'_> {
+        let seg_min = (p0.0.min(p1.0), p0.1.min(p1.1));
+        let seg_max = (p0.0.max(p1.0), p0.1.max(p1.1));
+        let mut it = SegmentIter { stack: [None; LEVEL_CAP as usize + 1], depth: 0, leaf: [].iter(), seg_min, seg_max };
+        it.enter(&self.root, Bounds::root());
+        it
+    }
+
+    /// The recursive query, collected leaf by leaf (the reference for [`Self::segment_iter`]).
+    #[cfg(test)]
+    fn query_segment_reference(&self, p0: (f32, f32), p1: (f32, f32)) -> Vec<usize> {
         let seg_min = (p0.0.min(p1.0), p0.1.min(p1.1));
         let seg_max = (p0.0.max(p1.0), p0.1.max(p1.1));
         let mut leaves = Vec::new();
-        self.root.query(Bounds::root(), seg_min, seg_max, &mut leaves);
+        self.root.query_reference(Bounds::root(), seg_min, seg_max, &mut leaves);
         leaves.into_iter().flatten().collect()
     }
 }
+
+#[cfg(test)]
+mod order_guard;
 
 #[cfg(test)]
 mod tests {

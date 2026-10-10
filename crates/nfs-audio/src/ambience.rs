@@ -22,7 +22,7 @@
 //! doppler that goes with them) — the port has no animated objects yet. Static elements are never
 //! doppler-shifted in the original either, so the rest plays at exactly 1.0.
 
-use crate::mixer::{pan_angle, AudioOutput, Clip, VoiceId};
+use crate::mixer::{byte_gain, pan_angle, AudioOutput, Clip, ClipCache, VoiceId, BEND_ROOT, LEVEL_MAX};
 use nfs_formats::{bigf::Bigf, bnk::Bnk, scn::{ElementKind, Scene}};
 use std::collections::HashMap;
 use std::path::Path;
@@ -264,7 +264,7 @@ pub struct Ambience {
     /// PatchID → bank bytes in `track.viv`
     index: HashMap<u16, (usize, usize)>,
     viv: Vec<u8>,
-    clips: HashMap<u16, Option<Arc<Clip>>>,
+    clips: ClipCache<u16>,
     pool: [Slot; VOICES],
     rng: u32,
     /// `[0x5D1750]` AmbientLevel 0..127
@@ -353,7 +353,7 @@ impl Ambience {
             base += s.elements.len();
         }
         tracing::info!(elements = elements.len(), banks = index.len(), ambient_level, "ambience loaded");
-        Ok(Self { filter: None, elements, animated: Vec::new(), index, viv, clips: HashMap::new(), pool: [Slot::default(); VOICES], rng: 0x1234_5678, ambient_level, game_trim, thunder: Thunder::default() })
+        Ok(Self { filter: None, elements, animated: Vec::new(), index, viv, clips: ClipCache::new(true), pool: [Slot::default(); VOICES], rng: 0x1234_5678, ambient_level, game_trim, thunder: Thunder::default() })
     }
 
     fn rand(&mut self) -> i32 {
@@ -365,20 +365,19 @@ impl Ambience {
     /// 2026-09-26 the port forced a whole-sample loop on Type 1, which it took for "continuous";
     /// `Voice_play` 0x4A9C10 plays the patch as it is.)*
     fn clip(&mut self, patch: u16) -> Option<Arc<Clip>> {
-        if let Some(c) = self.clips.get(&patch) {
-            return c.clone();
-        }
-        let clip = self.index.get(&patch).and_then(|&(o, l)| {
-            let bytes = self.viv.get(o..o + l)?;
-            let bank = Bnk::parse(bytes).ok()?;
-            let p = (0..bank.slot_count().max(1)).find_map(|s| bank.decode_slot(bytes, s).ok())?;
-            Some(Arc::new(Clip::from_pcm(p)))
-        });
-        if clip.is_none() {
-            tracing::debug!(patch, "ambience bank missing or unreadable");
-        }
-        self.clips.insert(patch, clip.clone());
-        clip
+        let (index, viv) = (&self.index, &self.viv);
+        self.clips.get_or_load(patch, || {
+            let clip = index.get(&patch).and_then(|&(o, l)| {
+                let bytes = viv.get(o..o + l)?;
+                let bank = Bnk::parse(bytes).ok()?;
+                let p = (0..bank.slot_count().max(1)).find_map(|s| bank.decode_slot(bytes, s).ok())?;
+                Some(Arc::new(Clip::from_pcm(p)))
+            });
+            if clip.is_none() {
+                tracing::debug!(patch, "ambience bank missing or unreadable");
+            }
+            clip
+        })
     }
 
     /// `0x4AC0E0(1)` from a type-4 trigger (0x470D5F…0x470DB3): the `[0x628168]` element
@@ -407,7 +406,7 @@ impl Ambience {
 
     /// Mixer volume `(AmbientLevel · game.spl[3] · level · 85) >> 21`, which saturates at 83 of 127.
     fn voice_volume(&self, level: i32) -> f32 {
-        ((self.ambient_level as i32 * self.game_trim as i32 * level * 85) >> 21).clamp(0, 127) as f32 / 127.0
+        byte_gain(((self.ambient_level as i32 * self.game_trim as i32 * level * 85) >> 21).clamp(0, LEVEL_MAX))
     }
 
     fn list_ref(&self, list: List) -> &[Element] {
@@ -622,7 +621,7 @@ impl Ambience {
         let pitch = doppler_pitch_word(rel, e.velocity);
         match self.pool[slot].voice {
             Some(v) if out.is_playing(v) => {
-                out.set_word(v, vol, pitch, 0x40);
+                out.set_word(v, vol, pitch, BEND_ROOT);
                 out.set_pan(v, pan);
                 // 0x4AEED6 is `Voice_play` on voice `slot + 0x39` (bank kind 5)
                 out.voice_play_filter(v, self.filter);
@@ -631,7 +630,7 @@ impl Ambience {
                 if let Some(c) = self.clip(e.patch as u16) {
                     let looping = c.loop_range.is_some();
                     tracing::debug!(patch = e.patch, label = e.label, d = d as i32, level, looping, pitch, "ambience voice");
-                    self.pool[slot].voice = Some(out.play_word(c, vol, pitch, 0x40, pan, looping));
+                    self.pool[slot].voice = Some(out.play_word(c, vol, pitch, BEND_ROOT, pan, looping));
                 } else {
                     self.release(out, list, i);
                 }
@@ -690,11 +689,11 @@ impl Ambience {
                 let _ = self.clip(patch as u16);
             }
             ThunderStep::Play { patch, pan } => {
-                let vol = self.voice_volume(0x7F);
+                let vol = self.voice_volume(LEVEL_MAX);
                 match self.clip(patch as u16) {
                     Some(c) => {
                         let looping = c.loop_range.is_some();
-                        let id = out.play_word(c, vol, crate::resample::PITCH_UNIT, 0x40, pan as u16, looping);
+                        let id = out.play_word(c, vol, crate::resample::PITCH_UNIT, BEND_ROOT, pan as u16, looping);
                         tracing::info!(patch, pan, vol, playing = out.is_playing(id), "thunder");
                     }
                     None => tracing::info!(patch, "thunder: patch missing from track.viv"),
@@ -893,7 +892,7 @@ mod tests {
             animated: Vec::new(),
             index: HashMap::new(),
             viv: Vec::new(),
-            clips: HashMap::new(),
+            clips: ClipCache::new(true),
             pool: [Slot::default(); VOICES],
             rng: 1,
             ambient_level: 127,

@@ -10,6 +10,10 @@ use std::sync::Mutex;
 
 pub const MUL: u32 = 123_456_789;
 
+/// `2^-16` — the `[0, 1)` scale of a 16-bit draw (`[0x5B253C]`, `RE/notes/traffic.md` §4826,
+/// `race-logic.md`): [`rand01`] and the AI's skill draw ([`crate::ai`]) multiply a `rand16` by it.
+pub const RAND16_TO_UNIT: f32 = 1.525_878_9e-5;
+
 static STATE: Mutex<u32> = Mutex::new(0x3ADE_68B1);
 
 /// `Rand_seed(seed)` — `seed mod 500` warm-up steps from 0x3ADE68B1.
@@ -37,7 +41,7 @@ pub fn rand16() -> u32 {
 
 /// `rand16 · 1/65536` — the `[0, 1)` the branch choice compares its thresholds against.
 pub fn rand01() -> f32 {
-    rand16() as f32 * 1.525_878_9e-5
+    rand16() as f32 * RAND16_TO_UNIT
 }
 
 /// `(rand16 · n) >> 16` — the original's "random below n".

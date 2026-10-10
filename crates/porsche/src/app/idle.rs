@@ -51,7 +51,7 @@ impl App {
     /// the sleep is part of that frame's time.
     // PORT-DEVIATION D4 (RE/notes/PORT-DEVIATIONS.md): NFS_FPS_CAP, opt-in and off by default; the original has no frame cap.
     pub(crate) fn pace_frame(&self) {
-        let Some(cap) = nfs_game::config::cfg().nfs_fps_cap.var().ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|c| *c >= 1.0) else { return };
+        let Some(cap) = nfs_game::config::cfg().nfs_fps_cap.as_str().and_then(|v| v.trim().parse::<f64>().ok()).filter(|c| *c >= 1.0) else { return };
         let want = Duration::from_secs_f64(1.0 / cap);
         let spent = self.last_frame.elapsed();
         if spent < want {
@@ -73,14 +73,14 @@ impl App {
         let eligible = self.vehicle.is_none()
             && self.race.is_none()
             && self.fe.menu.is_some()
-            && (self.shot_target.is_none() || nfs_game::config::cfg().nfs_fe_idle_verify.var_os().is_some())
+            && (self.shot_target.is_none() || nfs_game::config::cfg().nfs_fe_idle_verify.is_set())
             && self.scene.items.is_empty()
             && self.fe.room.is_empty()
             && self.fe.cars.is_empty()
             && self.fe.loading_still.is_none()
             && self.fe.startup_still.is_none()
             && self.fe.race_loading_still.is_none()
-            && nfs_game::config::cfg().nfs_fe_redraw_always.var_os().is_none()
+            && !nfs_game::config::cfg().nfs_fe_redraw_always.is_set()
             && self.fe.layout_preview.as_ref().is_some_and(|l| !l.has_live_textures())
             && self.fe.layout_under.iter().all(|(_, u)| !u.has_live_textures())
             && self.fe.layout_bottom.as_ref().is_none_or(|b| !b.has_live_textures());

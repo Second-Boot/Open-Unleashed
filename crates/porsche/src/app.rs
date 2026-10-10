@@ -147,7 +147,7 @@ pub(crate) struct App {
     /// diagnostic: `NFS_HUD_KEYS=tick:key,…` (key `F5` `F6` `F7` `F8` `2` `pause` or
     /// `pauserestart`) — the HUD toggle keys pressed on those game ticks (`hud_key`), for a
     /// `--screenshot` of their effect
-    pub(crate) hud_key_script: Vec<(u64, ScriptedHudKey)>,
+    pub(crate) hud_key_script: std::collections::VecDeque<(u64, ScriptedHudKey)>,
     /// **TEST GLUE**: the races of a scripted session (`NFS_AUTOTEST_RACES`) begun after the first
     pub(crate) scripted_race_no: u32,
     /// **TEST GLUE**: the pause `hud_key_script`'s hold ends in the pause menu's quit (`NFS_HUD_KEYS`'s
@@ -1290,6 +1290,46 @@ mod after_race_tests {
 
 /// Original game tick: 1/64 s (see module docs).
 pub(crate) const GAME_TICK: Duration = Duration::from_nanos(15_625_000);
+
+/// The original game tick rate, 64 Hz (`GAME_TICK`'s reciprocal) as the `f64` / `f32` the tick
+/// to seconds conversions divide by (`time_s = ticks / 64`, `tick * 1000 / 64` ms, `secs * 64` ticks).
+pub(crate) const TICKS_PER_SEC_F64: f64 = 64.0;
+/// [`TICKS_PER_SEC_F64`] for the `f32` arithmetic.
+pub(crate) const TICKS_PER_SEC_F32: f32 = 64.0;
+
+/// `Game.GameType` (`FEGAME_TYPE [0x6573E8]`, `[0x690AAC]` at the launch, `[0x690AD4]` after the
+/// race): `RE/notes/modes.md` section 0 / `0x4ED5D0`. The values the launch paths compare and store.
+pub(crate) mod game_type {
+    pub(crate) const QUICK_KNOCKOUT: u8 = 1;
+    pub(crate) const KNOCKOUT: u8 = 2;
+    /// network race
+    pub(crate) const NETWORK: u8 = 3;
+    pub(crate) const TOURNAMENT: u8 = 4;
+    pub(crate) const TOURNAMENT_TEST_DRIVE: u8 = 5;
+    pub(crate) const DEALER_TEST_DRIVE: u8 = 6;
+    pub(crate) const USED_TEST_DRIVE: u8 = 7;
+    /// factory-driver mission
+    pub(crate) const MISSION: u8 = 9;
+    /// era finale
+    pub(crate) const FINALE: u8 = 10;
+    pub(crate) const FINALE_TEST_DRIVE: u8 = 11;
+}
+
+/// The name-box cheat bits of `[0x65B940]` (`nfs_game::cheats::TABLE` ids, read through 0x4D8790):
+/// `App::cheat_bits & CHEAT_x != 0`.
+pub(crate) const CHEAT_RALLY: u32 = 1;
+/// id 1, "Gulliver"
+pub(crate) const CHEAT_TINY: u32 = 1 << 1;
+/// id 2 (the launch word's glass flag, `netlobby`)
+pub(crate) const CHEAT_GLASS: u32 = 1 << 2;
+/// id 3, "evenstvn": every car a 993 coupe
+pub(crate) const CHEAT_993: u32 = 1 << 3;
+/// id 5, "Fuzzyfuz": cops in a quick race
+pub(crate) const CHEAT_COPS: u32 = 1 << 5;
+/// id 7, "Smash Up"
+pub(crate) const CHEAT_DERBY: u32 = 1 << 7;
+/// id 8, "fetherw8"
+pub(crate) const CHEAT_HEAVY: u32 = 1 << 8;
 
 /// Knockout series (`RE/notes/modes.md` §5, CONFIRMED): `n` races, the last-placed car drops out
 /// after each race, the grid is the previous finishing order, the player finishing last ends the

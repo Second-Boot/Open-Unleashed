@@ -61,9 +61,27 @@ pub const PING_TICKS: u32 = 450;
 
 /// Does 0x588A80 have a case for this tag, or does it fall through to 0x5891E2?
 pub fn is_handled(t: u8) -> bool {
-    use tag::*;
-    matches!(t, STAR | USER | ALIVE | NO_SUCH | BYE_K | BYE_B | A | DESCRIBE | QUERY | JOIN | REPLY | Q | R | W)
+    HANDLED.contains(&t)
 }
+
+/// The characters 0x588A80 has a case for: fourteen characters, thirteen handlers (`'K'` and `'b'`
+/// share 0x589152, `'?'` and `'p'` share 0x588D5C).
+pub const HANDLED: [u8; 14] = [
+    tag::STAR,
+    tag::USER,
+    tag::ALIVE,
+    tag::NO_SUCH,
+    tag::BYE_K,
+    tag::BYE_B,
+    tag::A,
+    tag::DESCRIBE,
+    tag::QUERY,
+    tag::JOIN,
+    tag::REPLY,
+    tag::Q,
+    tag::R,
+    tag::W,
+];
 
 /// `0x56E290(p, n)` — `n` bytes at `p`, most significant first.
 pub fn read_be(bytes: &[u8], at: usize, n: usize) -> Option<u32> {

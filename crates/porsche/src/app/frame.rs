@@ -13,7 +13,7 @@ impl App {
         // 120 Hz vsync-bound machine it adds frame-time jitter and gains nothing, `RE/notes/PERF.md` PH)
         if let Some(r) = self.renderer.as_mut()
             && !r.render_thread()
-            && nfs_game::config::cfg().nfs_render_thread.var().is_ok_and(|v| v.trim() != "0")
+            && nfs_game::config::cfg().nfs_render_thread.as_str().is_some_and(|v| v.trim() != "0")
         {
             r.enable_render_thread();
         }
@@ -243,7 +243,7 @@ impl App {
         // the front end's idle redraw (`idle.rs`): the frame the window already shows is not
         // rendered or presented again
         let idle = self.fe_frame_unchanged();
-        if nfs_game::config::cfg().nfs_fe_idle_verify.var_os().is_some() {
+        if nfs_game::config::cfg().nfs_fe_idle_verify.is_set() {
             self.fe_idle_verify(idle);
         }
         if !idle

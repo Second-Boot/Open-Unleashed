@@ -5,7 +5,7 @@
 //! `df` colours are one RGBA u32 per triangle corner (byte order LOW confidence, treated as
 //! little-endian A,B,G,R → we read bytes as R,G,B,A which matches white 0xFFFFFFFF either way).
 
-use nfs_formats::crp::{ArticleGeometry, Primitive};
+use nfs_formats::crp::{prim_type, ArticleGeometry, Primitive};
 use nfs_physics::collision::PatchKind;
 use nfs_renderer::{MeshData, Vertex};
 use std::collections::BTreeMap;
@@ -78,7 +78,7 @@ pub fn article_parts(art: &ArticleGeometry, lod: u8, skipped: &mut usize) -> Vec
         // §4); `TrackGeometry::collision_grid` pairs this mesh's triangles back into quads two at
         // a time (`nfs_physics::collision::TriangleGrid::patches`), so one `patch_kind` per
         // primitive is enough — every quad in a quad-list record shares it.
-        let patch_kind = if p.prim_type == 4 { PatchKind::Quad } else { PatchKind::Triangle };
+        let patch_kind = if p.prim_type == prim_type::QUADS { PatchKind::Quad } else { PatchKind::Triangle };
         out.push(MaterialMesh { material: p.material, mesh, flags: p.flags, key_hi: p.key_hi, centre: [p.sphere[0], p.sphere[1], p.sphere[2]], patch_kind, prim_index: i });
     }
     out
@@ -94,11 +94,11 @@ fn primitive_corners(p: &Primitive, skipped: &mut usize) -> Option<Vec<usize>> {
         // (the `df` window) says — that window is what tells the engine how long the primitive is
         let seq = if p.colors.is_empty() { p.positions.len() } else { p.colors.len().min(p.positions.len()) };
         let corners: Vec<usize> = match (p.prim_type, p.vertex_indices.is_empty()) {
-            (3, false) => (0..p.vertex_indices.len()).collect(),
-            (3, true) if seq % 3 == 0 => (0..seq).collect(),
-            (1, false) => strip_corners(p.vertex_indices.len(), |k| p.vertex_indices[k] as usize),
-            (1, true) => strip_corners(seq, |k| k),
-            (4, true) if seq % 4 == 0 => {
+            (prim_type::LIST, false) => (0..p.vertex_indices.len()).collect(),
+            (prim_type::LIST, true) if seq % 3 == 0 => (0..seq).collect(),
+            (prim_type::STRIP, false) => strip_corners(p.vertex_indices.len(), |k| p.vertex_indices[k] as usize),
+            (prim_type::STRIP, true) => strip_corners(seq, |k| k),
+            (prim_type::QUADS, true) if seq % 4 == 0 => {
                 let mut v = Vec::new();
                 for q in 0..seq / 4 {
                     let b = q * 4;

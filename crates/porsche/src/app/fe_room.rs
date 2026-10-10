@@ -183,7 +183,7 @@ impl App {
         // `Graphics.CarChrome` (0x44F020 → `[0x6197F8]`, `lighting.md` §5.3). The front end's
         // `R3DCar` slot 15 leaves `+0x190` clear (0x43AD8E), so the pass is not gated off, and binds
         // no sky map (0x43AD64…0x43AD87) — the items carry none.
-        let chrome = self.choice_index("Graphics.CarChrome").is_some_and(|(i, _)| i >= 1);
+        let chrome = self.choice_index(choice::GRAPHICS_CAR_CHROME).is_some_and(|(i, _)| i >= 1);
         let env_stale = self.fe.cars_env.is_none_or(|e| e.chrome_passes != chrome);
         if env_stale && let Some(r) = self.renderer.as_mut() {
             let specular = match self.fe.cars_env {
@@ -417,7 +417,7 @@ impl App {
         // `NFS_FE_PARTS=1,3` clicks those zones of every 3D car at tick 0, once, so a still taken
         // with `NFS_FE_CLOCK` shows them open — the way `NFS_FE_DZ` stands in for a dragged bar
         if !self.fe.parts_forced
-            && let Ok(v) = nfs_game::config::cfg().nfs_fe_parts.var()
+            && let Some(v) = nfs_game::config::cfg().nfs_fe_parts.as_str()
         {
             self.fe.parts_forced = true;
             let widgets: Vec<usize> = self.fe.layout_preview.as_ref().map(|l| l.car_3d().iter().map(|w| w.index).collect()).unwrap_or_default();
@@ -433,7 +433,7 @@ impl App {
         }
         // the widget's tick first looks at `Car.Roof` (0x4C05E7…0x4C063F) — and the roof zone is
         // there only when the car's roof animation has a length (0x438190 at 0x4C0D10)
-        let roof_down = self.choice_index("Car.Roof").is_some_and(|(i, _)| i == 1);
+        let roof_down = self.choice_index(choice::CAR_ROOF).is_some_and(|(i, _)| i == 1);
         let widgets: Vec<usize> = self.fe.layout_preview.as_ref().map(|l| l.car_3d().iter().map(|w| w.index).collect()).unwrap_or_default();
         for w in widgets {
             let has_roof = self.fe_car_slot_of(w).is_some_and(|k| self.fe.cars[k].4.anim_length(1) > 0);
@@ -461,7 +461,7 @@ impl App {
         // a car, 0 otherwise (0x4C0662…0x4C068B, through 0x4D1A00 into `car+0x4E4 + 4z`)
         let damages: Vec<(usize, [f32; 10])> = l.car_3d().iter().map(|w| (w.index, if w.damage { self.fe_car_damage(w.accessor.as_deref()) } else { [0.0; 10] })).collect();
         // `CARDETAIL` `[0x6197C4]` gates the crush 0x43E390 in the front end too
-        let detail = self.choice_index("Graphics.CarDetail").map_or(0, |(i, _)| i as u8);
+        let detail = self.choice_index(choice::GRAPHICS_CAR_DETAIL).map_or(0, |(i, _)| i as u8);
         for (w, d) in damages {
             if let Some(k) = self.fe_car_slot_of(w)
                 && let Some(r) = self.renderer.as_mut()
@@ -858,19 +858,19 @@ impl App {
     /// *(Until 2026-09-26 these took `Track1.Track`, an approximation — no track room shows during
     /// them, so nothing on screen changes.)*
     fn fe_room_track(&mut self) -> Option<(nfs_formats::career::TrackInfo, bool, bool)> {
-        if matches!(self.fe.game_type, 4 | 5)
+        if matches!(self.fe.game_type, game_type::TOURNAMENT | game_type::TOURNAMENT_TEST_DRIVE)
             && let Some(c) = self.career.as_ref()
         {
             let t = c.current()?;
             let ev = t.events.get(c.career.remaining_event(t, self.fe.remaining_sel)?)?;
             return Some((c.tables.track(ev.track_id)?.clone(), ev.backwards, ev.direction_flag != 0));
         }
-        if matches!(self.fe.game_type, 9 | 10 | 11)
+        if matches!(self.fe.game_type, game_type::MISSION | game_type::FINALE | game_type::FINALE_TEST_DRIVE)
             && let Some(c) = self.career.as_ref()
         {
             // a track id no record carries falls to the first record (0x4FC555 / 0x4FC66C)
             let by_id = |id: i16| c.tables.track(id).or_else(|| c.tables.tracks.first()).cloned();
-            if self.fe.game_type == 9 {
+            if self.fe.game_type == game_type::MISSION {
                 let m = c.career.current_mission(&c.tables).or((!c.tables.missions.is_empty()).then_some(0)).and_then(|i| c.tables.missions.get(i))?;
                 return Some((by_id(m.track_id)?, m.backwards, false));
             }
@@ -885,14 +885,14 @@ impl App {
             // (0x4FC20E…0x4FC3C3); none running: `Knockout.Track`'s linked row (slot 0x78, then
             // 0x4FA690, 0x4FC3CD…0x4FC411) and nothing else — `rev` / `mir` keep the zeros
             // 0x4FC0E3 / 0x4FC0E6 wrote, so the wall shows the selected row forward and unmirrored
-            2 => match self.knockout.as_ref().filter(|k| k.state.active) {
+            game_type::KNOCKOUT => match self.knockout.as_ref().filter(|k| k.state.active) {
                 Some(k) => {
                     let r = m.ko_row(k.state.race_index.max(0) as usize);
                     (m.tracks.get(r.track_idx)?.clone(), r.backwards, r.mirror)
                 }
                 None => (m.ko_track(m.ko_sel).to_string(), false, false),
             },
-            1 => (m.looped_track().to_string(), m.backwards, m.mirror),
+            game_type::QUICK_KNOCKOUT => (m.looped_track().to_string(), m.backwards, m.mirror),
             // 0 and 3 (0x4FC108 / 0x4FC148): `Track1.Track` with `Track1.Direction`
             0 | 3 => (m.track().to_string(), m.backwards, m.mirror),
             // the test drives 6…8 (0x4FC691): `Track1.Track` alone — forward, unmirrored
@@ -1086,7 +1086,7 @@ impl App {
                 // the port's own key-hint line, a diagnostic the original has no counterpart
                 // to: drawn only under `NFS_FE_HINTS` (decided 2026-09-27 — until
                 // then it was always on, and the credits roll drew over it in the oval)
-                if let Some(f) = self.fe.menu.as_ref().and_then(|m| m.font.as_ref()).filter(|_| nfs_game::config::cfg().nfs_fe_hints.var_os().is_some()) {
+                if let Some(f) = self.fe.menu.as_ref().and_then(|m| m.font.as_ref()).filter(|_| nfs_game::config::cfg().nfs_fe_hints.is_set()) {
                     let name = self.fe.layout_name.clone().unwrap_or_default();
                     let hint = if l.can_play() {
                         "UP/DOWN SELECT   LEFT/RIGHT CHANGE   ENTER RACE   B BACK   ESC EXIT"
@@ -1132,7 +1132,7 @@ impl App {
     fn fe_career_tabs(&self, aspect: f32) -> Vec<Sprite> {
         // slot 0xAC of `[[0x65B928]+0xE0]` (0x4D8461) — the callback list, the bottom layer's
         let (Some(l), Some(b)) = (self.fe_base_layout(), self.fe.layout_bottom.as_ref()) else { return Vec::new() };
-        if self.fe.game_type != 4 || slot_ac(&callback_list_of(l)) {
+        if self.fe.game_type != game_type::TOURNAMENT || slot_ac(&callback_list_of(l)) {
             return Vec::new();
         }
         let era = self.career.as_ref().map(|c| match c.career.era {

@@ -19,7 +19,7 @@
 //! port halved both voices of a pair — no source.)* The tunnel reverb of §4.7 lives in
 //! `reverb.rs`. The road, wind and turbo layers of §4.4–§4.6 live in `sfx.rs`.
 
-use crate::mixer::{AudioOutput, Clip, VoiceId};
+use crate::mixer::{byte_gain, AudioOutput, Clip, VoiceId, BEND_ROOT, LEVEL_MAX};
 use nfs_formats::{bigf::Bigf, bnk::Bnk, crdl::Crdl, spl::Spl};
 use std::path::Path;
 use std::sync::Arc;
@@ -278,7 +278,7 @@ pub fn rpm_level(rpm: f32, redline: f32, automatic: bool, airborne_count: u16) -
 /// or `4 · 2048/(d+1)` on view 0x0C.
 /// The `· 4` is inside the `>> 16` (0x4AAC31), so it is `floor(4 · 2048/(d+1))` (`crate::fix_atten`).
 pub fn horn_volume(view: u16, distance: f32) -> i32 {
-    if view == 0x0C { crate::fix_atten(0x800_0000, 0x1_0000, 2, distance) } else { crate::fix_atten(0x800_0000, 0x2_0000, 0, distance) }
+    if view == 0x0C { crate::ATTEN_VIEW_0C.at(distance) } else { crate::ATTEN_ENGINE.at(distance) }
 }
 
 impl EngineSound {
@@ -328,7 +328,7 @@ impl EngineSound {
                         tracing::warn!(set, slot = d.slot, "engine layer sample missing");
                     }
                     // the layer loops for as long as it is audible
-                    c.map(|c| Arc::new(Clip { loop_range: c.loop_range.or(Some((0, (c.samples.len() / c.channels.max(1) as usize) as u32))), ..(*c).clone() }))
+                    c.map(|c| Arc::new(Clip::from_arc(c).with_whole_loop()))
                 }
                 None => None,
             })
@@ -336,7 +336,8 @@ impl EngineSound {
 
         let spl = nfs_formats::ci_file::find_file(sounds_dir, &format!("{sim}.spl")).and_then(|p| std::fs::read(p).ok()).and_then(|d| Spl::parse(&d).ok()).unwrap_or_default();
         // `game.spl[6]` = the engine trim of the global settings block (16 shipped)
-        let game_trim = nfs_formats::spl::GameSpl::load(sounds_dir).engine();
+        let game_spl = nfs_formats::spl::GameSpl::load(sounds_dir);
+        let game_trim = game_spl.engine();
         let start_clips = [decode(6), decode(7), decode(8)];
         let stop_clips = [decode(9), decode(10), decode(11)];
         let n = layers.iter().filter(|l| l.is_some()).count();
@@ -359,17 +360,14 @@ impl EngineSound {
             start_voice: None,
             stop_voice: None,
             started: false,
-            shift_click: decode(2).map(|c| Arc::new(Clip { loop_range: None, ..(*c).clone() })),
+            shift_click: decode(2).map(|c| Arc::new(Clip::from_arc(c).one_shot())),
             // `Horn_start` restarts the voice whenever it has finished, so a sample without a loop
             // (3 and 4) repeats; the port loops it whole
             horn_clips: [3, 4, 5].map(|n| {
-                decode(n).map(|c| {
-                    let frames = (c.samples.len() / c.channels.max(1) as usize) as u32;
-                    Arc::new(Clip { loop_range: c.loop_range.or(Some((0, frames))), ..(*c).clone() })
-                })
+                decode(n).map(|c| Arc::new(Clip::from_arc(c).with_whole_loop()))
             }),
             horn_voice: None,
-            horn_trim: nfs_formats::spl::GameSpl::load(sounds_dir).horn(),
+            horn_trim: game_spl.horn(),
         })
     }
 
@@ -412,8 +410,8 @@ impl EngineSound {
     /// volume for any slider above 0. The port had a fixed 0.6 until 2026-09-24.
     pub fn play_shift(&self, out: &AudioOutput, sfx_level: u8) {
         if let Some(c) = &self.shift_click {
-            let vol = (sfx_level as i32 * 0x7F).min(0x7F);
-            out.play_word(c.clone(), vol as f32 / 127.0, crate::resample::PITCH_UNIT, 0x40, 0, false);
+            let vol = (sfx_level as i32 * LEVEL_MAX).min(LEVEL_MAX);
+            out.play_word(c.clone(), byte_gain(vol), crate::resample::PITCH_UNIT, BEND_ROOT, 0, false);
         }
     }
 
@@ -439,12 +437,12 @@ impl EngineSound {
         if !on || self.horn_voice.is_some() {
             return;
         }
-        let vol = horn_volume(view, distance).min(0x7F);
+        let vol = horn_volume(view, distance).min(LEVEL_MAX);
         let mixed = ((sfx_level as i32 * self.horn_trim as i32 * vol * 85) >> 21).clamp(0, 127);
         // bend byte 0x40: no bend
-        let amp = mixed as f32 / 127.0;
+        let amp = byte_gain(mixed);
         if let Some(c) = &self.horn_clips[slot - 3] {
-            self.horn_voice = Some((out.play_word(c.clone(), amp, crate::resample::PITCH_UNIT, 0x40, pan, true), slot));
+            self.horn_voice = Some((out.play_word(c.clone(), amp, crate::resample::PITCH_UNIT, BEND_ROOT, pan, true), slot));
         }
     }
 
@@ -466,9 +464,9 @@ impl EngineSound {
         // `fixdiv(20000, d + 15) << 1`, of the fractional distance (`crate::fix_atten`). The port
         // had only the first, of whole metres, until 2026-09-26.
         let atten = if inp.view_0c_replay {
-            crate::fix_atten(0x4E20_0000, 0xF_0000, 1, inp.distance)
+            crate::ATTEN_ENGINE_REPLAY_0C.at(inp.distance)
         } else {
-            crate::fix_atten(0x800_0000, 0x2_0000, 0, inp.distance)
+            crate::ATTEN_ENGINE.at(inp.distance)
         };
         let rpm_lvl = rpm_level(inp.rpm, inp.redline, inp.automatic, inp.airborne_count);
         let a = atten.max(atten * (rpm_lvl.clamp(0, 150) + 40) / 128);
@@ -519,7 +517,7 @@ impl EngineSound {
         let load_word: i32 = if !inp.running {
             -1
         } else if inp.rev_cut {
-            0x7F
+            LEVEL_MAX
         } else {
             l >> 1
         };
@@ -554,7 +552,7 @@ impl EngineSound {
 
         tracing::trace!(rpm = inp.rpm, bin, load, blend, rec_volume, pitch_word, mode = inp.mode, audible = self.level.iter().filter(|l| **l > 0).count(), "engine record");
         for i in 0..32 {
-            let Some(d) = self.layers[i].clone() else { continue };
+            let Some(d) = self.layers[i].as_ref() else { continue };
             // mode 0 plays the cockpit half, every other mode the exterior half
             let audible_half = (inp.mode > 0) == (i < 16);
             let level = if !audible_half || bin < d.start || bin >= d.end {
@@ -580,14 +578,14 @@ impl EngineSound {
             // a voice the budget took (or refused) keeps its id until the level falls to 0
             // ([`layer_step`]); the updates on it do nothing, as 0x589D20 fails the old handle
             for (k, slot, wanted, pan_x, lvl_x) in [(0, &mut self.voices[i], lvl > 0, pan_a, lvl_a), (1, &mut self.voices_b[i], lvl > 0 && stereo_pair, pan_b, lvl)] {
-                let vol = lvl_x as f32 / 127.0;
+                let vol = byte_gain(lvl_x);
                 match (layer_step(wanted, *slot), *slot) {
                     (LayerStep::Stop, Some(v)) => {
                         out.stop(v);
                         *slot = None;
                     }
                     (LayerStep::Update, Some(v)) => {
-                        out.set_word(v, vol, pitch_word, 0x40);
+                        out.set_word(v, vol, pitch_word, BEND_ROOT);
                         out.set_pan(v, pan_x);
                         if k == 0 {
                             self.kept[i] = (pan_x, lvl_x);
@@ -595,7 +593,7 @@ impl EngineSound {
                     }
                     (LayerStep::Start, _) => {
                         if let Some(c) = &self.clips[i] {
-                            *slot = Some(out.play_word(c.clone(), vol, pitch_word, 0x40, pan_x, true));
+                            *slot = Some(out.play_word(c.clone(), vol, pitch_word, BEND_ROOT, pan_x, true));
                             // 0x4AC57E / 0x4AC581: the start keeps its level and pan
                             if k == 0 {
                                 self.kept[i] = (pan_x, lvl_x);
@@ -634,7 +632,7 @@ impl EngineSound {
             match self.start_voice {
                 None => {
                     match &self.start_clips[class] {
-                        Some(c) => self.start_voice = Some(out.play_word(c.clone(), level, crate::resample::PITCH_UNIT, 0x40, pan, false)),
+                        Some(c) => self.start_voice = Some(out.play_word(c.clone(), level, crate::resample::PITCH_UNIT, BEND_ROOT, pan, false)),
                         // a start that fails leaves an error handle, whose status (0x566380) ends
                         // it on the next update at 0x200 — the same as `started` now
                         None => self.started = true,
@@ -642,7 +640,7 @@ impl EngineSound {
                     start_duck(true, false, None)
                 }
                 Some(v) if out.is_playing(v) => {
-                    out.set_word(v, level, crate::resample::PITCH_UNIT, 0x40);
+                    out.set_word(v, level, crate::resample::PITCH_UNIT, BEND_ROOT);
                     out.set_pan(v, pan);
                     start_duck(true, false, Some(Some(out.progress(v).unwrap_or(1.0))))
                 }
@@ -660,13 +658,13 @@ impl EngineSound {
             if self.started {
                 match self.stop_voice {
                     None => match &self.stop_clips[class] {
-                        Some(c) => self.stop_voice = Some(out.play_word(c.clone(), level, crate::resample::PITCH_UNIT, 0x40, pan, false)),
+                        Some(c) => self.stop_voice = Some(out.play_word(c.clone(), level, crate::resample::PITCH_UNIT, BEND_ROOT, pan, false)),
                         // the failed start's error handle ends it on the next update; every update
                         // answers 0 either way
                         None => self.started = false,
                     },
                     Some(v) if out.is_playing(v) => {
-                        out.set_word(v, level, crate::resample::PITCH_UNIT, 0x40);
+                        out.set_word(v, level, crate::resample::PITCH_UNIT, BEND_ROOT);
                         out.set_pan(v, pan);
                     }
                     Some(_) => {

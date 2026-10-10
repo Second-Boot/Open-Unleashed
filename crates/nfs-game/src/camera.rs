@@ -96,9 +96,11 @@ pub fn fov_y_window_at(half_angle_deg: f32, aspect: f32) -> f32 {
 ///   0x100038E9; 3.0 / 4.0 / π/180 the doubles at 0x10005608 / 0x10005610 / 0x100055F8) — the
 ///   half-angle that keeps the 4:3 vertical field.
 pub fn dll_half_angle(w: f32, h: f32) -> f32 {
+    /// The dll's π/180 double (0x100055F8), as the port has always spelled it.
+    const DLL_DEG_TO_RAD: f64 = 0.017_453_292_f64;
     let r = w as f64 / h as f64;
     if 1.333_333_373_069_763_2 < r {
-        let rad = 0.017_453_292_f64;
+        let rad = DLL_DEG_TO_RAD;
         // det-allow: the dll's mode set, drawing only (PORT-DEVIATIONS D1: drawing sites keep std)
         ((3.0 * r).atan2(4.0 / (DEFAULT_HALF_ANGLE as f64 * rad).tan()) / rad) as f32
     } else {

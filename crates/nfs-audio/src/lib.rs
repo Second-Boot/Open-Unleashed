@@ -20,8 +20,9 @@ pub mod reverb;
 pub mod sfx;
 pub mod slots;
 pub mod speech;
+pub mod voice_loop;
 
-pub use mixer::{AudioOutput, StopHandle, VoiceId};
+pub use mixer::{AudioOutput, PlayArgs, StopHandle, VoiceId};
 
 /// The distance attenuations every audio pass builds the same way: the listener distance in 16.16
 /// (`ftol(|p − 0x655E50| · 65536)`, 0x5A0F98 truncating), `fixdiv(num, d16 + add)` 0x4A6160 — a
@@ -36,9 +37,37 @@ pub fn fix_atten(num: i32, add: i32, shl: u32, distance: f32) -> i32 {
     ((q << shl) >> 16) as i32
 }
 
+/// The `(num, add, shl)` of one [`fix_atten`] call, named by what it attenuates.
+#[derive(Clone, Copy)]
+pub struct Atten {
+    pub num: i32,
+    pub add: i32,
+    pub shl: u32,
+}
+
+impl Atten {
+    /// [`fix_atten`] at `distance`.
+    pub fn at(self, distance: f32) -> i32 {
+        fix_atten(self.num, self.add, self.shl, distance)
+    }
+}
+
+/// `2048 / (d + 2)` (`fixdiv(0x8000000, d + 2)`): the player engine (0x4AA072), the AI engine
+/// (0x4AA973) and the horn (0x4AAC10).
+pub const ATTEN_ENGINE: Atten = Atten { num: 0x800_0000, add: 0x2_0000, shl: 0 };
+/// View 0x0C: four times `2048 / (d + 1)`, the `· 4` inside the shift (the horn 0x4AAC31, the
+/// one-shots 0x4A93C0).
+pub const ATTEN_VIEW_0C: Atten = Atten { num: 0x800_0000, add: 0x1_0000, shl: 2 };
+/// `512 / (d + 2)`: the collision one-shots (0x4A93D0…0x4A9420).
+pub const ATTEN_ONE_SHOT: Atten = Atten { num: 0x200_0000, add: 0x2_0000, shl: 0 };
+/// The AI engine on the spline camera: `4096 / (d + 1)`.
+pub const ATTEN_AI_SPLINE: Atten = Atten { num: 0x1000_0000, add: 0x1_0000, shl: 0 };
+/// The player engine on view 0x0C in a replay's playback: `fixdiv(20000, d + 15) << 1`.
+pub const ATTEN_ENGINE_REPLAY_0C: Atten = Atten { num: 0x4E20_0000, add: 0xF_0000, shl: 1 };
+
 #[cfg(test)]
 mod tests {
-    use super::fix_atten;
+    use super::{fix_atten, ATTEN_ENGINE, ATTEN_ONE_SHOT, ATTEN_VIEW_0C};
 
     #[test]
     fn the_attenuation_takes_the_fractional_distance() {
@@ -50,5 +79,9 @@ mod tests {
         assert_eq!(fix_atten(0x800_0000, 0x1_0000, 2, 70.3), 114);
         // 512/(d+2) for the collision one-shots
         assert_eq!(fix_atten(0x200_0000, 0x2_0000, 0, 3.0), 102);
+        // the named triples are those calls
+        assert_eq!(ATTEN_ENGINE.at(10.7), 161);
+        assert_eq!(ATTEN_VIEW_0C.at(70.3), 114);
+        assert_eq!(ATTEN_ONE_SHOT.at(3.0), 102);
     }
 }

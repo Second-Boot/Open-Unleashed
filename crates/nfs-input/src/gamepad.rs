@@ -53,6 +53,8 @@ pub struct Gamepads {
     x_band: (i32, i32),
     rumbler: crate::ff::Rumbler,
     rumble_test: Option<RumbleTest>,
+    /// the pads' records of the frame, reused (`poll` runs every frame)
+    records_buf: Vec<crate::bindings::PadRecord>,
 }
 
 /// `Analog`'s reader **0x411B80**: raw axis `v` (0…65535) against the descriptor's `lo`/`hi`
@@ -174,7 +176,7 @@ impl Gamepads {
         };
         // `XAxis.Min` / `.Max` default to 0 and 0x80 (0x51E546, 0x51E550) — no dead zone, and
         // full lock at the stick's end
-        Self { gilrs, axes: PadAxes::default(), x_band: (0, 0x80), rumbler: Default::default(), rumble_test: None }
+        Self { gilrs, axes: PadAxes::default(), x_band: (0, 0x80), rumbler: Default::default(), rumble_test: None, records_buf: Vec::new() }
     }
 
     /// The steering band, `XAxis.Min` and `XAxis.Max` of the accessors' own 0…0x80. The original
@@ -274,7 +276,10 @@ impl Gamepads {
         if touched || input.pad.is_some() {
             input.pad = Some(self.axes);
         }
-        input.set_pads(self.records());
+        let mut records = std::mem::take(&mut self.records_buf);
+        self.records_into(&mut records);
+        input.set_pads(&records);
+        self.records_buf = records;
     }
 }
 
@@ -360,74 +365,77 @@ impl Gamepads {
     /// number is this port's own — APPROXIMATION. The capture and the reader use the same order,
     /// so what is bound is what is read.
     pub fn records(&self) -> Vec<crate::bindings::PadRecord> {
-        let Some(g) = self.gilrs.as_ref() else { return Vec::new() };
-        let sets = self.axis_sets();
-        g.gamepads()
-            .zip(sets)
-            .map(|((_, gp), set)| {
-                let mut r = crate::bindings::PadRecord { mask: set.mask, axes: set.values, ..Default::default() };
-                for (n, b) in BUTTON_ORDER.iter().enumerate() {
-                    r.buttons[n] = gp.is_pressed(*b);
-                    // `[info+0xC]`, the buttons 0x51F140 asks about: the ones the pad's mapping
-                    // has, in this port's numbering
-                    if gp.button_code(*b).is_some() {
-                        r.button_mask |= 1 << n;
-                    }
-                }
-                let (u, d, l, rt) = (
-                    gp.is_pressed(Button::DPadUp),
-                    gp.is_pressed(Button::DPadDown),
-                    gp.is_pressed(Button::DPadLeft),
-                    gp.is_pressed(Button::DPadRight),
-                );
-                // DirectInput's hat: hundredths of a degree clockwise from north, −1 centred
-                r.pov[0] = match (u, rt, d, l) {
-                    (true, false, false, false) => 0,
-                    (true, true, false, false) => 4500,
-                    (false, true, false, false) => 9000,
-                    (false, true, true, false) => 13500,
-                    (false, false, true, false) => 18000,
-                    (false, false, true, true) => 22500,
-                    (false, false, false, true) => 27000,
-                    (true, false, false, true) => 31500,
-                    _ => -1,
-                };
-                r
-            })
-            .collect()
+        let mut out = Vec::new();
+        self.records_into(&mut out);
+        out
     }
 
+    /// [`records`](Self::records) into `out`, which is cleared first (the per-frame path reuses one
+    /// buffer).
+    pub fn records_into(&self, out: &mut Vec<crate::bindings::PadRecord>) {
+        out.clear();
+        let Some(g) = self.gilrs.as_ref() else { return };
+        out.extend(g.gamepads().map(|(_, gp)| {
+            let set = axis_set_of(&gp);
+            let mut r = crate::bindings::PadRecord { mask: set.mask, axes: set.values, ..Default::default() };
+            for (n, b) in BUTTON_ORDER.iter().enumerate() {
+                r.buttons[n] = gp.is_pressed(*b);
+                // `[info+0xC]`, the buttons 0x51F140 asks about: the ones the pad's mapping
+                // has, in this port's numbering
+                if gp.button_code(*b).is_some() {
+                    r.button_mask |= 1 << n;
+                }
+            }
+            r.pov[0] = hat_of(
+                gp.is_pressed(Button::DPadUp),
+                gp.is_pressed(Button::DPadRight),
+                gp.is_pressed(Button::DPadDown),
+                gp.is_pressed(Button::DPadLeft),
+            );
+            r
+        }));
+    }
+
+    /// The connected pads' axis sets, in connection order — what `NFS5.DEADZONE` draws from.
     pub fn axis_sets(&self) -> Vec<PadAxisSet> {
         let Some(g) = self.gilrs.as_ref() else { return Vec::new() };
-        // `DIJOYSTATE`'s eight axes against the HID usages `gilrs` names them by
-        const ORDER: [Axis; 6] =
-            [Axis::LeftStickX, Axis::LeftStickY, Axis::LeftZ, Axis::RightStickX, Axis::RightStickY, Axis::RightZ];
-        g.gamepads()
-            .map(|(_, gp)| {
-                let mut set = PadAxisSet::default();
-                for (n, a) in ORDER.iter().enumerate() {
-                    if let Some(d) = gp.axis_data(*a) {
-                        set.mask |= 1 << n;
-                        // `[rec+4+4n]` is the **device's** own reading, not the accessor's: the
-                        // image sets no `DIPROP_RANGE` (0x56FD70's only `SetProperty` is
-                        // `DIPROP_BUFFERSIZE`), so an absolute axis keeps DirectInput's default
-                        // 0…65535 with the centre at 32767, which is the range `NFS5.DEADZONE`'s
-                        // marker divides by 65536 (0x51B819). `gilrs` reads -1…1.
-                        //
-                        // A stick's Y runs **down**, as DirectInput's `lY` / `lRy` do: `gilrs`
-                        // turns the platform's downward Y round to point up (its
-                        // `IS_Y_AXIS_REVERSED`), and this turns it back. The image depends on
-                        // it — `DEFAULTCONTROLS` puts `Accel` on Y **−1** and `Brake` on Y **+1**
-                        // (0x51D60A…0x51D6EB), which is stick forward to accelerate only with
-                        // a Y that grows downward.
-                        let v = if n == 1 || n == 4 { -d.value() } else { d.value() };
-                        set.values[n] = (((v + 1.0) * 0.5 * 65535.0) as i32).clamp(0, 0xFFFF);
-                    }
-                }
-                set
-            })
-            .collect()
+        g.gamepads().map(|(_, gp)| axis_set_of(&gp)).collect()
     }
+}
+
+/// One pad's axes as `DIJOYSTATE`'s eight, against the HID usages `gilrs` names them by.
+fn axis_set_of(gp: &gilrs::Gamepad<'_>) -> PadAxisSet {
+    const ORDER: [Axis; 6] = [Axis::LeftStickX, Axis::LeftStickY, Axis::LeftZ, Axis::RightStickX, Axis::RightStickY, Axis::RightZ];
+    let mut set = PadAxisSet::default();
+    for (n, a) in ORDER.iter().enumerate() {
+        if let Some(d) = gp.axis_data(*a) {
+            set.mask |= 1 << n;
+            // `[rec+4+4n]` is the **device's** own reading, not the accessor's: the
+            // image sets no `DIPROP_RANGE` (0x56FD70's only `SetProperty` is
+            // `DIPROP_BUFFERSIZE`), so an absolute axis keeps DirectInput's default
+            // 0…65535 with the centre at 32767, which is the range `NFS5.DEADZONE`'s
+            // marker divides by 65536 (0x51B819). `gilrs` reads -1…1.
+            //
+            // A stick's Y runs **down**, as DirectInput's `lY` / `lRy` do: `gilrs`
+            // turns the platform's downward Y round to point up (its
+            // `IS_Y_AXIS_REVERSED`), and this turns it back. The image depends on
+            // it — `DEFAULTCONTROLS` puts `Accel` on Y **−1** and `Brake` on Y **+1**
+            // (0x51D60A…0x51D6EB), which is stick forward to accelerate only with
+            // a Y that grows downward.
+            let v = if n == 1 || n == 4 { -d.value() } else { d.value() };
+            set.values[n] = (((v + 1.0) * 0.5 * 65535.0) as i32).clamp(0, 0xFFFF);
+        }
+    }
+    set
+}
+
+/// DirectInput's hat for the d-pad buttons (up, right, down, left): hundredths of a degree
+/// clockwise from north, −1 centred (and for the combinations no hat reports). Indexed by the
+/// four buttons as bits `up | right << 1 | down << 2 | left << 3`.
+const HAT: [i32; 16] = [-1, 0, 9000, 4500, 18000, -1, 13500, -1, 27000, 31500, -1, -1, 22500, -1, -1, -1];
+
+fn hat_of(up: bool, right: bool, down: bool, left: bool) -> i32 {
+    HAT[up as usize | (right as usize) << 1 | (down as usize) << 2 | (left as usize) << 3]
 }
 
 #[cfg(test)]
@@ -437,6 +445,25 @@ mod tests {
     /// 0x411B80 over the factory band (0 / 0x80): centred reads nothing, either end reads full
     /// lock, and the two halves are the original's slightly different spans (0x80…0xFF right,
     /// 0x80…0x00 left).
+    #[test]
+    fn the_hat_table_is_the_original_match() {
+        for bits in 0..16usize {
+            let (u, rt, d, l) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
+            let old = match (u, rt, d, l) {
+                (true, false, false, false) => 0,
+                (true, true, false, false) => 4500,
+                (false, true, false, false) => 9000,
+                (false, true, true, false) => 13500,
+                (false, false, true, false) => 18000,
+                (false, false, true, true) => 22500,
+                (false, false, false, true) => 27000,
+                (true, false, false, true) => 31500,
+                _ => -1,
+            };
+            assert_eq!(hat_of(u, rt, d, l), old, "buttons {bits:04b}");
+        }
+    }
+
     #[test]
     fn the_stick_reads_through_0x411b80() {
         assert_eq!(axis_band(0, 0x80, 1), (0x80, 0xFF));

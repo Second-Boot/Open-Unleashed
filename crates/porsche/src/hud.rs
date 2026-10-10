@@ -501,7 +501,7 @@ pub(crate) fn step_slide((mut st, mut stamp): (u8, u64), clock: u64, before_star
     }
     // diagnostic: `NFS_TRAYS_IN=1` puts the trays in place at once — `--screenshot` renders too
     // few frames to watch a slide finish
-    if st == 1 && nfs_game::config::cfg().nfs_trays_in.var().is_ok() {
+    if st == 1 && nfs_game::config::cfg().nfs_trays_in.as_str().is_some() {
         stamp = clock.saturating_sub(11);
     }
     if clock.saturating_sub(stamp) >= 11 {
@@ -634,7 +634,7 @@ impl App {
     pub(crate) fn hud_stored_sync(&self, w: u32, h: u32) {
         self.hud_cfg_ensure();
         // the layout the draw picks (`SCREEN_LAYOUTS`, `Display.ScreenLayout`)
-        let layout = self.choice_index("Display.ScreenLayout").map_or(0, |(i, _)| i.min(3));
+        let layout = self.choice_index(choice::DISPLAY_SCREEN_LAYOUT).map_or(0, |(i, _)| i.min(3));
         let cache = self.hud_cfg.borrow();
         let stored = cache.cfg.as_ref().and_then(|c| c.find(layout, w, h).map(|i| c.stored_positions(i)));
         Hud::set_stored(layout, stored);

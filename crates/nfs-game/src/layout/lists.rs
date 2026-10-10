@@ -105,7 +105,7 @@ impl LayoutScreen {
     /// list box** (0x4C53B1 asks 0x4C7DD0, 0x4C53BA asks the constructor's `[this+0x1DD]`), and
     /// **0** otherwise — so a combo that is not focused draws no list at all.
     pub fn set_open_combo(&mut self, index: Option<usize>) {
-        if crate::config::cfg().nfs_fe_open.var().is_ok() {
+        if crate::config::cfg().nfs_fe_open.as_str().is_some() {
             return;
         }
         let open = index.filter(|i| *i < self.layout.elements.len());

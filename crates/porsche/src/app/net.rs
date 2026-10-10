@@ -208,7 +208,7 @@ impl App {
                     o.vehicle.traction_control = false;
                 }
             }
-            if let Ok(path) = nfs_game::config::cfg().nfs_net_dump.var()
+            if let Some(path) = nfs_game::config::cfg().nfs_net_dump.as_str()
                 && let Ok(f) = std::fs::File::create(&path)
             {
                 self.net_dump = Some(std::io::BufWriter::new(f));
@@ -591,7 +591,7 @@ impl App {
     /// port (a replay is a file), so the `Some` arm runs only under the test glue `NFS_FOLLOW_VIEWED`.
     pub(crate) fn followed_seat(&self) -> Option<usize> {
         let viewed = Self::viewed_seat_of(self.replay_net.as_ref(), self.replay_view)?;
-        let live = self.net.session.as_ref().is_some_and(|n| n.link_up() && n.finish_sent()) || nfs_game::config::cfg().nfs_follow_viewed.var_os().is_some();
+        let live = self.net.session.as_ref().is_some_and(|n| n.link_up() && n.finish_sent()) || nfs_game::config::cfg().nfs_follow_viewed.is_set();
         live.then_some(viewed)
     }
 
@@ -780,14 +780,14 @@ impl App {
             nocollision: positional && collision == 0,
             derby: false,
             // 0x4ED5D0: `0x4D8790(0)` → `RALLY` 0x19, `0x4D8790(8)` → `HEAVY` 0x1A, each `1` and only when set
-            rally: self.cheat_bits & 1 != 0,
-            heavy: self.cheat_bits & (1 << 8) != 0,
+            rally: self.cheat_bits & CHEAT_RALLY != 0,
+            heavy: self.cheat_bits & CHEAT_HEAVY != 0,
             own_car: Vec::new(),
         };
         // the "Smash Up" cheat (cheat bit 7): 0x4ED7D9…0x4ED841 sets `DERBY`, the skid pad, damage on,
         // `NOCOLLISION` off and `LINEAR_TRACK` 0 after the mode's own options — so the stream the host's
         // launch sends says so (`derby_track`, `network.md` §11.18)
-        if self.cheat_bits & (1 << 7) != 0 {
+        if self.cheat_bits & CHEAT_DERBY != 0 {
             s.derby = true;
             s.track = "skidpad".to_string();
             s.linear = false;
@@ -1555,7 +1555,7 @@ pub(crate) fn remote_dump(tick: u64, seat: usize, v: &Vehicle, n: &netplay::NetP
     use std::io::Write;
     static OUT: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
     let out = OUT.get_or_init(|| {
-        let path = nfs_game::config::cfg().nfs_remote_dump.var_os()?;
+        let path = nfs_game::config::cfg().nfs_remote_dump.as_os_str()?;
         let mut f = std::io::BufWriter::new(std::fs::File::create(path).ok()?);
         let _ = writeln!(f, "tick,seat,x,y,z,speed_est,block_tick,lag,lag_avg,stale");
         Some(std::sync::Mutex::new(f))

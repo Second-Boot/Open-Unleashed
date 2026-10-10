@@ -193,8 +193,8 @@ impl App {
     /// lobby after the return can be watched and drawn while the room's session lives on.
     pub(crate) fn fe_sequence_in(&mut self, var: &str, event_loop: &ActiveEventLoop) -> bool {
         let Ok(dir) = std::env::var(var) else { return false };
-        let frames: usize = std::env::var("NFS_FE_SEQ_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
-        let script = std::env::var("NFS_FE_SEQ_SCRIPT").unwrap_or_default();
+        let frames: usize = nfs_game::config::cfg().nfs_fe_seq_frames.as_str().and_then(|v| v.parse().ok()).unwrap_or(60);
+        let script = nfs_game::config::cfg().nfs_fe_seq_script.as_str().unwrap_or_default();
         let events: Vec<(usize, String)> = script
             .split('|')
             .filter_map(|e| e.split_once('@'))

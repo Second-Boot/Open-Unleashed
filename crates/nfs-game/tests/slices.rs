@@ -61,7 +61,7 @@ fn vehicle_wall_response_synthetic() {
     v.velocity = Vec3::new(64.0, 0.0, 0.0); // 2 m per tick
     // road (a drivable patch at y = 0) up to the wall line: the centre is on it, the +x corners
     // are not (0x495020 tests a corner off the road with the segment centre → corner)
-    let hit = v.collide_walls(&walls, &tree, &|p| (p.x <= 2.0).then_some(0.0), 0.0, 0.0, 0.0);
+    let hit = v.collide_walls(&walls, &tree, &|p| (p.x <= 2.0).then_some(0.0));
     eprintln!("hit={hit} pos={:?} vel={:?}", v.position, v.velocity);
     assert!(hit);
     assert!(v.velocity.x < 0.0 && v.velocity.x > -10.0, "restitution 0.1 expected, got {:?}", v.velocity);

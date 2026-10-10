@@ -1,8 +1,56 @@
 //! Car asset bundle: model CRP, day/night texture packs, texture-page layout, simulation data.
 
-use crate::{fmt_err, read, texture::{decode_pack, TextureImage}, AssetError, GamePaths};
+use crate::{fmt_err, read, read_pack, texture::{decode_pack, TextureImage}, AssetError, GamePaths};
 use nfs_formats::{crp::Crp, fsh::Fsh, ini::Ini, refpack, sim::CarSim};
 use std::path::{Path, PathBuf};
+
+/// The values of a `.tpg` `[tpageN.details] bpp` key — the surface format 0x535950 makes the page in
+/// (`TexturePage::bpp`); 1555 is the default (0x613 at 0x442F5F).
+pub mod page_bpp {
+    pub const ARGB8888: i64 = 32;
+    pub const ARGB1555: i64 = 1555;
+    pub const ARGB4444: i64 = 4444;
+    pub const RGB565: i64 = 565;
+}
+
+/// The files `[file<n>.details] global=K` names (K is 1-based), all in `CarModel/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalPack {
+    Shadow = 1,
+    IntGlass,
+    Suit,
+    Head,
+    Cabrio,
+}
+
+impl GlobalPack {
+    fn from_key(g: i64) -> Option<Self> {
+        Some(match g {
+            1 => Self::Shadow,
+            2 => Self::IntGlass,
+            3 => Self::Suit,
+            4 => Self::Head,
+            5 => Self::Cabrio,
+            _ => return None,
+        })
+    }
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::Shadow => "Shadow.fsh",
+            Self::IntGlass => "INTGLASS.FSH",
+            Self::Suit => "Suit.fsh",
+            Self::Head => "Head.fsh",
+            Self::Cabrio => "Cabrio.fsh",
+        }
+    }
+
+    /// The two packs with alpha content (the wheel shadows', the interior glass): their pages keep
+    /// the alpha and are blended.
+    fn keeps_alpha(self) -> bool {
+        matches!(self, Self::Shadow | Self::IntGlass)
+    }
+}
 
 /// One assembled texture page (`.tpg` `[tpageN.details]`), RGBA8.
 #[derive(Debug, Clone)]
@@ -426,11 +474,11 @@ impl CarAssets {
             GamePaths::find_file(&dir, &n).ok_or_else(|| AssetError::MissingFile { dir: dir.clone(), name: n })
         };
         let crp_path = file(".crp")?;
-        let crp_data = refpack::maybe_decompress(&read(&crp_path)?).map_err(fmt_err(&crp_path))?.into_owned();
+        let crp_data = read_pack(&crp_path)?;
         let crp = Crp::parse(&crp_data).map_err(fmt_err(&crp_path))?;
         let pack = |suffix: &str| -> Result<Vec<TextureImage>, AssetError> {
             let p = file(suffix)?;
-            let d = refpack::maybe_decompress(&read(&p)?).map_err(fmt_err(&p))?.into_owned();
+            let d = read_pack(&p)?;
             decode_pack(&p, &d)
         };
         let tpg_path = file(".tpg")?;
@@ -502,14 +550,16 @@ impl CarAssets {
                 let w = d.and_then(|d| d.get_i64("width")).unwrap_or(256) as u32;
                 let h = d.and_then(|d| d.get_i64("height")).unwrap_or(256) as u32;
                 let is_window = d.and_then(|d| d.get_i64("window")).unwrap_or(0) == 1;
-                let bpp = d.and_then(|d| d.get_i64("bpp")).unwrap_or(1555);
+                let bpp = d.and_then(|d| d.get_i64("bpp")).unwrap_or(page_bpp::ARGB1555);
                 TexturePage { width: w, height: h, rgba: vec![0; (w * h * 4) as usize], is_window, is_alpha: false, bpp }
             })
             .collect();
         let embedded = self.crp.embedded_texture_files(&self.crp_data).map_err(fmt_err(&crp_path))?;
-        let sf_indices: Vec<u16> = self.crp.material_entries.iter().filter(|e| e.is_part(b"sf")).map(|e| e.part_index()).collect();
-        const GLOBALS: [&str; 5] = ["Shadow.fsh", "INTGLASS.FSH", "Suit.fsh", "Head.fsh", "Cabrio.fsh"];
-        let mut owned_globals: Vec<Vec<u8>> = Vec::new();
+        let sf_indices: Vec<u16> = self.crp.material_entries.iter().filter(|e| e.is_part(nfs_formats::crp::tags::SF)).map(|e| e.part_index()).collect();
+        // each global file is found, read and unpacked once, by the first page that names it
+        // (`Some(None)`: looked for, not there)
+        let car_dir = paths.car_model_dir();
+        let mut globals: [Option<Option<Vec<u8>>>; 5] = Default::default();
         // 0x442EC5…0x442F09: each page's file — the last `[file<n>.details]` naming it as its
         // `tpage` (one byte per page, the file's 0-based number)
         let mut page_file: Vec<Option<usize>> = vec![None; numpages];
@@ -527,7 +577,8 @@ impl CarAssets {
         // of the two offsets is 0). *(Until 2026-09-25 the port blitted a `mirror = 1` file's
         // entries into the page its own page's `mirrortpage` named, and nothing else there.)*
         for page_no in 1..=numpages {
-            let src = self.tpg.section(&format!("tpage{page_no}.details")).and_then(|d| d.get_i64("sourcetpage")).unwrap_or(page_no as i64);
+            let page_details = self.tpg.section(&format!("tpage{page_no}.details"));
+            let src = page_details.and_then(|d| d.get_i64("sourcetpage")).unwrap_or(page_no as i64);
             if src != page_no as i64 && src >= 1 && src as usize <= numpages {
                 page_file[page_no - 1] = page_file[src as usize - 1];
             }
@@ -536,18 +587,24 @@ impl CarAssets {
             let Some(det) = self.tpg.section(&format!("file{file_no}.details")) else { continue };
             // 0x443F97…0x443FD2: `mirror` (default 0) and its two offsets
             let mirror = det.get_i64("mirror").unwrap_or(0) != 0;
+            let page_fmt = page_details.and_then(|d| d.get_i64("bpp")).unwrap_or(page_bpp::ARGB1555);
+            let file_tint = det.get_i64("tint").unwrap_or(1) != 0;
             let (moffx, moffy) = (det.get_i64("mirroroffsetx").unwrap_or(0), det.get_i64("mirroroffsety").unwrap_or(0));
             // source SHPI bytes
             let data: &[u8] = if let Some(g) = det.get_i64("global") {
-                if g == 1 || g == 2 {
+                let Some(pack) = GlobalPack::from_key(g) else { continue };
+                if pack.keeps_alpha() {
                     pages[page_no - 1].is_alpha = true;
                 }
-                let name = GLOBALS.get((g as usize).wrapping_sub(1)).copied();
-                let Some(name) = name else { continue };
-                let Some(p) = GamePaths::find_file(&paths.car_model_dir(), name) else { continue };
-                let d = refpack::maybe_decompress(&read(&p)?).map_err(fmt_err(&p))?.into_owned();
-                owned_globals.push(d);
-                owned_globals.last().unwrap()
+                let slot = &mut globals[pack as usize - 1];
+                if slot.is_none() {
+                    *slot = Some(match GamePaths::find_file(&car_dir, pack.file_name()) {
+                        Some(p) => Some(read_pack(&p)?),
+                        None => None,
+                    });
+                }
+                let Some(Some(d)) = &*slot else { continue };
+                d
             } else {
                 // embedded: sf#k with k = file_no - 1 (or by position when indices are sequential)
                 match sf_indices.iter().position(|&i| i as usize + 1 == file_no) {
@@ -601,12 +658,13 @@ impl CarAssets {
                 // So it is the 32-bit rule on an opaque texel, which is what `blit` does with the
                 // decoded image (alpha 255) — CONFIRMED, `car-model.md` §5.4. *(Until 2026-09-25
                 // this was an approximation, the second stage unread.)*
-                let page_bpp = self.tpg.section(&format!("tpage{page_no}.details")).and_then(|d| d.get_i64("bpp")).unwrap_or(1555);
-                let file_tint = det.get_i64("tint").unwrap_or(1) != 0;
-                let bl = self.tpg.section(&format!("file{file_no}.{}", ename.to_lowercase())).and_then(|s| s.get_i64("tint")).map_or(file_tint, |t| t != 0);
+                // the entry's own section by its lower-cased name, looked up once for the tint
+                // flag here and the page text below
+                let lower_sec = self.tpg.section(&format!("file{file_no}.{}", ename.to_lowercase()));
+                let bl = lower_sec.and_then(|s| s.get_i64("tint")).map_or(file_tint, |t| t != 0);
                 let path = match fmt {
                     nfs_formats::fsh::PixelFormat::Indexed8 if bl => BlitPath::Palette,
-                    nfs_formats::fsh::PixelFormat::Argb8888 if bl && (page_bpp == 32 || page_bpp == 1555) => BlitPath::Texel,
+                    nfs_formats::fsh::PixelFormat::Argb8888 if bl && (page_fmt == page_bpp::ARGB8888 || page_fmt == page_bpp::ARGB1555) => BlitPath::Texel,
                     _ => BlitPath::Blitter,
                 };
                 // the palette path reads its palette as 0x444130 does — the block 0x537FB0 finds,
@@ -626,12 +684,12 @@ impl CarAssets {
                 // paths, the 32-on-32 copy 0x4447BA among them, add them) and 0x4440CC draws the
                 // text again — on the same surface, `ebx`, at the same place: 0x444880 takes
                 // (page, entry, file, name) and no offsets.
-                let text_page = self.page_text.as_ref().zip(self.tpg.section(&format!("file{file_no}.{}", ename.to_lowercase())));
+                let text_page = self.page_text.as_ref().zip(lower_sec);
                 let (sx, sy) = (sign12(b.misc[2]), sign12(b.misc[3]));
                 let rect = (sx, sy, b.width as i64, b.height as i64);
                 let copies: &[(i64, i64)] = if mirror { &[(0, 0), (moffx, moffy)] } else { &[(0, 0)] };
                 for &(ox, oy) in copies {
-                    let soft = path == BlitPath::Blitter && !(page_bpp == 32 && fmt == nfs_formats::fsh::PixelFormat::Argb8888);
+                    let soft = path == BlitPath::Blitter && !(page_fmt == page_bpp::ARGB8888 && fmt == nfs_formats::fsh::PixelFormat::Argb8888);
                     let (ox, oy) = if soft { (0, 0) } else { (ox, oy) };
                     let page = &mut pages[page_no - 1];
                     blit(page, &src, w, h, x + ox, y + oy, path, &tints);
@@ -1039,9 +1097,9 @@ fn expand(v: u8, bits: u32) -> u8 {
 /// five bits and the alpha bit "the source dword is not 0", 32 kept.
 pub fn blitter_texel(bpp: i64, t: [u8; 4]) -> [u8; 4] {
     match bpp {
-        4444 => t.map(|c| expand(c, 4)),
-        565 => [expand(t[0], 5), expand(t[1], 6), expand(t[2], 5), 255],
-        1555 => [expand(t[0], 5), expand(t[1], 5), expand(t[2], 5), if t != [0; 4] { 255 } else { 0 }],
+        page_bpp::ARGB4444 => t.map(|c| expand(c, 4)),
+        page_bpp::RGB565 => [expand(t[0], 5), expand(t[1], 6), expand(t[2], 5), 255],
+        page_bpp::ARGB1555 => [expand(t[0], 5), expand(t[1], 5), expand(t[2], 5), if t != [0; 4] { 255 } else { 0 }],
         _ => t,
     }
 }
@@ -1081,10 +1139,10 @@ fn blit(page: &mut TexturePage, src: &[u8], w: u32, h: u32, x: i64, y: i64, path
             // page kept all eight bits of every channel and a 565 / 1555 one all eight of colour,
             // and the 1555 alpha bit was `alpha > 0` on every path.)*
             match page.bpp {
-                4444 => d.copy_from_slice(&t.map(|c| expand(c, 4))),
-                565 if path == BlitPath::Palette => {}
-                565 => d.copy_from_slice(&[expand(t[0], 5), expand(t[1], 6), expand(t[2], 5), 255]),
-                1555 => {
+                page_bpp::ARGB4444 => d.copy_from_slice(&t.map(|c| expand(c, 4))),
+                page_bpp::RGB565 if path == BlitPath::Palette => {}
+                page_bpp::RGB565 => d.copy_from_slice(&[expand(t[0], 5), expand(t[1], 6), expand(t[2], 5), 255]),
+                page_bpp::ARGB1555 => {
                     let bit = if path == BlitPath::Blitter { t != [0; 4] } else { t[3] > 0 };
                     d.copy_from_slice(&[expand(t[0], 5), expand(t[1], 5), expand(t[2], 5), if bit { 255 } else { 0 }]);
                 }
@@ -1118,7 +1176,7 @@ pub struct DamagePatch {
 pub fn damage_patches(paths: &GamePaths, model: &str, light: bool) -> Result<Vec<DamagePatch>, AssetError> {
     let suffix = if light { "L" } else { "D" };
     let Some(p) = GamePaths::find_file(&paths.car_model_dir(), &format!("{model}{suffix}.fsh")) else { return Ok(Vec::new()) };
-    let data = refpack::maybe_decompress(&read(&p)?).map_err(fmt_err(&p))?.into_owned();
+    let data = read_pack(&p)?;
     let fsh = Fsh::parse(&data).map_err(fmt_err(&p))?;
     let mut out = Vec::new();
     for (i, e) in fsh.entries.iter().enumerate() {
@@ -1220,9 +1278,9 @@ pub fn blend_patch(page: &mut TexturePage, patch: &DamagePatch, damage: f32) {
             let lut = |c: u8| ((c as u32 * level) >> 8) as u32;
             let px = lut(src[s + 3]) << 24 | lut(src[s]) << 16 | lut(src[s + 1]) << 8 | lut(src[s + 2]);
             match page.bpp {
-                1555 => blend_1555(&mut page.rgba[d..d + 4], px),
-                565 => blend_565(&mut page.rgba[d..d + 4], px),
-                32 => blend_32(&mut page.rgba[d..d + 4], px),
+                page_bpp::ARGB1555 => blend_1555(&mut page.rgba[d..d + 4], px),
+                page_bpp::RGB565 => blend_565(&mut page.rgba[d..d + 4], px),
+                page_bpp::ARGB8888 => blend_32(&mut page.rgba[d..d + 4], px),
                 _ => {
                     // APPROXIMATION (4444 page, see above)
                     let a = src[s + 3] as f32 / 255.0 * (level as f32 / 255.0);
@@ -1236,6 +1294,22 @@ pub fn blend_patch(page: &mut TexturePage, patch: &DamagePatch, damage: f32) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tpg_constant_tests {
+    use super::*;
+
+    /// The named `.tpg` values are the literals the page builder used to carry.
+    #[test]
+    fn page_formats_and_global_packs_keep_their_values() {
+        assert_eq!([page_bpp::ARGB8888, page_bpp::ARGB1555, page_bpp::ARGB4444, page_bpp::RGB565], [32, 1555, 4444, 565]);
+        for (key, file, alpha) in [(1, "Shadow.fsh", true), (2, "INTGLASS.FSH", true), (3, "Suit.fsh", false), (4, "Head.fsh", false), (5, "Cabrio.fsh", false)] {
+            let pack = GlobalPack::from_key(key).unwrap();
+            assert_eq!((pack as i64, pack.file_name(), pack.keeps_alpha()), (key, file, alpha));
+        }
+        assert!([i64::MIN, -1, 0, 6, 7, i64::MAX].into_iter().all(|k| GlobalPack::from_key(k).is_none()));
     }
 }
 

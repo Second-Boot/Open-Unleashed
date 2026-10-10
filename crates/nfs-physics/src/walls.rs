@@ -60,13 +60,24 @@ impl Entry for Wall {
 /// of 0x10, so the game's seventh ("unknown") table entry is unreachable and rock is the fallback.
 pub fn wall_class(word: u32) -> u8 {
     match word {
-        0x10 => 0,
-        0x20 => 1,
-        0x30 => 2,
-        0x40 => 3,
-        0x50 => 4,
-        _ => 5,
+        0x10 => class::METAL,
+        0x20 => class::WOOD,
+        0x30 => class::SNOW,
+        0x40 => class::ICE,
+        0x50 => class::EARTH,
+        _ => class::ROCK,
     }
+}
+
+/// The wall material classes [`wall_class`] returns (and `Wall::class`, `Vehicle::last_wall_class`
+/// carry to the sound code as a number).
+pub mod class {
+    pub const METAL: u8 = 0;
+    pub const WOOD: u8 = 1;
+    pub const SNOW: u8 = 2;
+    pub const ICE: u8 = 3;
+    pub const EARTH: u8 = 4;
+    pub const ROCK: u8 = 5;
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +119,7 @@ impl WallSet {
         let nx = (((max.x - min.x) / cell).ceil() as usize).max(1);
         let nz = (((max.y - min.y) / cell).ceil() as usize).max(1);
         let mut cells = vec![Vec::new(); nx * nz];
-        let idx = |p: Vec2| ((((p.x - min.x) / cell).floor().max(0.0) as usize).min(nx - 1), (((p.y - min.y) / cell).floor().max(0.0) as usize).min(nz - 1));
+        let idx = |p: Vec2| crate::collision::grid_cell(min.x, min.y, cell, nx, nz, p.x, p.y);
         for (i, w) in walls.iter().enumerate() {
             let (x0, z0) = idx(w.a.min(w.b));
             let (x1, z1) = idx(w.a.max(w.b));
@@ -141,7 +152,7 @@ impl WallSet {
             return None;
         }
         let q = Vec2::new(p.x, p.z);
-        let idx = |v: Vec2| ((((v.x - self.min.x) / self.cell).floor().max(0.0) as usize).min(self.nx - 1), (((v.y - self.min.y) / self.cell).floor().max(0.0) as usize).min(self.nz - 1));
+        let idx = |v: Vec2| crate::collision::grid_cell(self.min.x, self.min.y, self.cell, self.nx, self.nz, v.x, v.y);
         let (x0, z0) = idx(q - Vec2::splat(radius));
         let (x1, z1) = idx(q + Vec2::splat(radius));
         let mut best: Option<(Vec2, f32)> = None;

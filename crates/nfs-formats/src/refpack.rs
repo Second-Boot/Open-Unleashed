@@ -21,9 +21,23 @@
 
 use crate::FormatError;
 
+/// The most output one stream byte can produce (a 4-byte command copies up to 1028 bytes): the
+/// header's size is only trusted for the up-front allocation up to this bound.
+const MAX_EXPANSION: usize = 260;
+
+/// The second header byte.
+pub const MARKER: u8 = 0xFB;
+/// Header flag: the sizes are four bytes instead of three.
+pub const FLAG_LONG_SIZES: u8 = 0x80;
+/// Header flag: a compressed-size field precedes the uncompressed size.
+pub const FLAG_HAS_COMPRESSED_SIZE: u8 = 0x01;
+/// The flag bits that must read `0x10` for [`is_refpack`] (bit 7, the size width, and bit 0 are free).
+const FLAGS_MASK: u8 = 0x3E;
+const FLAGS_VALUE: u8 = 0x10;
+
 /// Returns `true` if `data` starts with a RefPack header.
 pub fn is_refpack(data: &[u8]) -> bool {
-    data.len() >= 2 && data[1] == 0xFB && (data[0] & 0x3E) == 0x10
+    data.len() >= 2 && data[1] == MARKER && (data[0] & FLAGS_MASK) == FLAGS_VALUE
 }
 
 /// Header information without decoding the stream.
@@ -37,16 +51,16 @@ pub struct RefPackHeader {
 }
 
 pub fn read_header(data: &[u8]) -> Result<RefPackHeader, FormatError> {
-    if data.len() < 2 || data[1] != 0xFB {
+    if data.len() < 2 || data[1] != MARKER {
         return Err(FormatError::UnknownMagic {
             what: "RefPack",
             offset: 0,
-            expected: vec![0x10, 0xFB],
+            expected: vec![FLAGS_VALUE, MARKER],
             found: data.iter().take(2).copied().collect(),
         });
     }
     let flags = data[0];
-    let n = if flags & 0x80 != 0 { 4 } else { 3 };
+    let n = if flags & FLAG_LONG_SIZES != 0 { 4 } else { 3 };
     let mut pos = 2;
     let read_size = |pos: usize| -> Result<u32, FormatError> {
         let b = data
@@ -54,7 +68,7 @@ pub fn read_header(data: &[u8]) -> Result<RefPackHeader, FormatError> {
             .ok_or(FormatError::Truncated { what: "RefPack header", offset: pos, needed: n })?;
         Ok(b.iter().fold(0u32, |acc, &x| (acc << 8) | x as u32))
     };
-    let compressed_size = if flags & 0x01 != 0 {
+    let compressed_size = if flags & FLAG_HAS_COMPRESSED_SIZE != 0 {
         let s = read_size(pos)?;
         pos += n;
         Some(s)
@@ -69,7 +83,7 @@ pub fn read_header(data: &[u8]) -> Result<RefPackHeader, FormatError> {
 /// Decompress a complete RefPack stream. Fails if the output size does not match the header.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, FormatError> {
     let hdr = read_header(data)?;
-    let mut out: Vec<u8> = Vec::with_capacity(hdr.uncompressed_size as usize);
+    let mut out: Vec<u8> = Vec::with_capacity((hdr.uncompressed_size as usize).min(data.len().saturating_mul(MAX_EXPANSION)));
     let mut pos = hdr.payload_offset;
 
     let byte = |p: usize| -> Result<u8, FormatError> {
@@ -127,10 +141,15 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, FormatError> {
                 return Err(FormatError::RefPack { offset: pos, reason: "back-reference before start of output" });
             }
             let start = out.len() - copy_off;
-            // Overlapping copy semantics: byte-by-byte.
-            for i in 0..copy_len {
-                let b = out[start + i];
-                out.push(b);
+            if copy_off >= copy_len {
+                // the source run ends before the destination begins: one block copy
+                out.extend_from_within(start..start + copy_len);
+            } else {
+                // Overlapping copy semantics: byte-by-byte.
+                for i in 0..copy_len {
+                    let b = out[start + i];
+                    out.push(b);
+                }
             }
         }
     }
@@ -154,9 +173,24 @@ pub fn maybe_decompress(data: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>, Forma
     }
 }
 
+/// [`maybe_decompress`] for an owned buffer: the same `Vec` back (no copy) when it is not RefPack.
+pub fn decompress_vec(data: Vec<u8>) -> Result<Vec<u8>, FormatError> {
+    if is_refpack(&data) {
+        decompress(&data)
+    } else {
+        Ok(data)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_constants_keep_their_literal_values() {
+        assert_eq!([MARKER, FLAG_LONG_SIZES, FLAG_HAS_COMPRESSED_SIZE, FLAGS_MASK, FLAGS_VALUE], [0xFB, 0x80, 0x01, 0x3E, 0x10]);
+        assert!(is_refpack(&[0x10, 0xFB]) && is_refpack(&[0x91, 0xFB]) && !is_refpack(&[0x20, 0xFB]) && !is_refpack(&[0x10, 0xFA]));
+    }
 
     #[test]
     fn literal_only_stream() {
@@ -171,6 +205,28 @@ mod tests {
         // b0 = literals 2 | len (3-3)=0<<2 | off hi 0 => 0x02 ; b1 = off-1 = 1
         let s = [0x10, 0xFB, 0, 0, 5, 0x02, 0x01, b'a', b'b', 0xFC];
         assert_eq!(decompress(&s).unwrap(), b"ababa");
+    }
+
+    #[test]
+    fn overlapping_run_repeats_the_last_byte() {
+        // "ab" then a copy of length 3 from offset 1: each byte copied is the one just written.
+        let s = [0x10, 0xFB, 0, 0, 5, 0x02, 0x00, b'a', b'b', 0xFC];
+        assert_eq!(decompress(&s).unwrap(), b"abbbb");
+    }
+
+    #[test]
+    fn non_overlapping_copy_is_a_block_copy() {
+        // 4 literals "abcd" (0xE0), then copy length 3 from offset 4 (cmd 0x00, b1 = off - 1).
+        let s = [0x10, 0xFB, 0, 0, 7, 0xE0, b'a', b'b', b'c', b'd', 0x00, 0x03, 0xFC];
+        assert_eq!(decompress(&s).unwrap(), b"abcdabc");
+    }
+
+    #[test]
+    fn decompress_vec_is_maybe_decompress_without_the_copy() {
+        let packed = vec![0x10, 0xFB, 0, 0, 5, 0xE0, b'a', b'b', b'c', b'd', 0xFD, b'e'];
+        assert_eq!(decompress_vec(packed.clone()).unwrap(), maybe_decompress(&packed).unwrap().into_owned());
+        let plain = b"SHPI plain bytes".to_vec();
+        assert_eq!(decompress_vec(plain.clone()).unwrap(), plain);
     }
 
     #[test]

@@ -1050,11 +1050,10 @@ impl LayoutScreen {
         // …and only for the screen being opened: `bottombar` is a page too, and the front end draws
         // it *after* the screen, so giving it a background put a second copy of that background
         // over everything. That artefact cost four passes of `RE/AUDIT.md` F2.
-        let forced = crate::config::cfg().nfs_fe_bg.var()
-            .ok()
+        let forced = crate::config::cfg().nfs_fe_bg.as_str()
             .filter(|_| !name.eq_ignore_ascii_case("bottombar"))
             .filter(|_| screen.layout.screen().and_then(|s| s.get("screen")).is_none_or(str::is_empty));
-        if let Some(bg) = forced.as_deref().or_else(|| screen.layout.screen().and_then(|s| s.get("screen")).and_then(background_layout)) {
+        if let Some(bg) = forced.or_else(|| screen.layout.screen().and_then(|s| s.get("screen")).and_then(background_layout)) {
             match Self::load_one(r, paths, bg, controls, fe_strings) {
                 Ok(mut b) => {
                     // a background screen never draws the pointer — the screen in front of it does
@@ -1521,7 +1520,7 @@ impl LayoutScreen {
         let screen = Self { layout, background: None, shapes, fonts, white, cursor_ms: 0, cursor_shape_at: std::cell::Cell::new((usize::MAX, 0)), cursor_btn_at: std::cell::Cell::new((false, 0)), cursor_btn: false, car_spin: 0.0, car_parts: HashMap::new(), car_roof: Default::default(), covered: false, combo_hover: std::cell::Cell::new(None), overlay_mask: std::cell::Cell::new(None), unrendered, logos: HashMap::new(), checks: HashMap::new(), knobs: HashMap::new(), closed: std::collections::HashSet::new(), groups: HashMap::new(), bars: HashMap::new(), lists: HashMap::new(), swatches: HashMap::new(), car_views: HashMap::new(), track_maps: HashMap::new(), movies: HashMap::new(), ko_strip: HashMap::new(), badges: HashMap::new(),
             // `NFS_FE_CLOCK` preloads the screen clock in milliseconds, so a still can be taken
             // part way through an animation the front end would otherwise only show in motion
-            clock_ms: crate::config::cfg().nfs_fe_clock.var().ok().and_then(|v| v.parse().ok()).unwrap_or(0), glint, colb, arcs, parts_glyphs,
+            clock_ms: crate::config::cfg().nfs_fe_clock.as_str().and_then(|v| v.parse().ok()).unwrap_or(0), glint, colb, arcs, parts_glyphs,
             movie_overlays: Default::default(),
             credits_roll: Default::default(),
             wrap_watch: Default::default(),
@@ -1529,7 +1528,7 @@ impl LayoutScreen {
             pending_tab: None,
             inherited: std::cell::Cell::new((false, 0)),
             glints: Default::default(),
-            preload_ticks: crate::config::cfg().nfs_fe_clock.var().ok().and_then(|v| v.parse::<u64>().ok()).map_or(0, |ms| (ms * 128 / 1000) as i64),
+            preload_ticks: crate::config::cfg().nfs_fe_clock.as_str().and_then(|v| v.parse::<u64>().ok()).map_or(0, |ms| (ms * 128 / 1000) as i64),
             watch_text: Default::default(), eval_memo: Default::default(), guard_hits: Default::default(),
             last_drawn_state: Default::default(),
             end_of_era: None,
@@ -1539,7 +1538,7 @@ impl LayoutScreen {
             driver_picture: crate::save::DEFAULT_PICTURE as i32,
             // `NFS_FE_CURSOR=x,y` parks the pointer for a still, the way `NFS_FE_CLOCK` parks the
             // clock — a screenshot has no pointer of its own
-            cursor: crate::config::cfg().nfs_fe_cursor.var().ok().and_then(|v| {
+            cursor: crate::config::cfg().nfs_fe_cursor.as_str().and_then(|v| {
                 let (a, b) = v.split_once(',')?;
                 Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
             }),
@@ -1547,12 +1546,12 @@ impl LayoutScreen {
             wide_hit: false,
             pointer: None,
             // `NFS_FE_PRESS=1` holds the button down for a still, the pair of `NFS_FE_CURSOR`
-            pressed: crate::config::cfg().nfs_fe_press.var().ok().is_some_and(|v| v != "0"),
+            pressed: crate::config::cfg().nfs_fe_press.as_str().is_some_and(|v| v != "0"),
             capture: None,
             // `NFS_FE_OPEN=<index>` drops a combo's list open for a still
-            open_combo: crate::config::cfg().nfs_fe_open.var().ok().and_then(|v| v.parse().ok()),
+            open_combo: crate::config::cfg().nfs_fe_open.as_str().and_then(|v| v.parse().ok()),
             // `NFS_FE_PICKER=1` with `NFS_FE_OPEN` raises the latch for a still of the editor
-            picker_latch: crate::config::cfg().nfs_fe_picker.var().is_ok_and(|v| v != "0"),
+            picker_latch: crate::config::cfg().nfs_fe_picker.as_str().is_some_and(|v| v != "0"),
             picker: Picker::default(),
             pads: Vec::new(),
             pad_sel: 0,
@@ -1714,7 +1713,7 @@ impl LayoutScreen {
         let hit = self.eval_memo.borrow().pair.get(&(i, depth)).and_then(|m| m.get(v)).copied();
         if let Some(r) = hit {
             // **TEST GLUE** `NFS_EVAL_VERIFY=1`: every hit is re-evaluated and must agree
-            if crate::config::cfg().nfs_eval_verify.var_os().is_some() {
+            if crate::config::cfg().nfs_eval_verify.is_set() {
                 assert_eq!(r, nfs_formats::ctr::eval_pair(v, &|n| self.reference(e, n, depth)), "eval memo stale: {v:?} on element {i} (depth {depth})");
             }
             return r;
@@ -1731,7 +1730,7 @@ impl LayoutScreen {
         };
         let hit = self.eval_memo.borrow().one.get(&(i, depth)).and_then(|m| m.get(v)).copied();
         if let Some(r) = hit {
-            if crate::config::cfg().nfs_eval_verify.var_os().is_some() {
+            if crate::config::cfg().nfs_eval_verify.is_set() {
                 assert_eq!(r, nfs_formats::ctr::eval(v, &|n| self.reference(e, n, depth)), "eval memo stale: {v:?} on element {i} (depth {depth})");
             }
             return r;
@@ -3061,7 +3060,7 @@ impl LayoutScreen {
     /// `NFS_FE_CURSOR`, and then the screen clock is the rest — so `NFS_FE_CLOCK=1500` with a
     /// parked pointer shows the tooltip half way through its fade.
     fn hover_ms(&self) -> u32 {
-        if crate::config::cfg().nfs_fe_cursor.var().is_ok() { self.clock_ms } else { self.hover_ms }
+        if crate::config::cfg().nfs_fe_cursor.as_str().is_some() { self.clock_ms } else { self.hover_ms }
     }
 
     /// The class of the widget at the flattened index, following a group the same way the hit
@@ -3500,7 +3499,7 @@ impl LayoutScreen {
 
     pub fn set_cursor(&mut self, at: Option<(f32, f32)>) {
         // a still parked its own pointer with `NFS_FE_CURSOR`; the live one must not clobber it
-        if crate::config::cfg().nfs_fe_cursor.var().is_ok() {
+        if crate::config::cfg().nfs_fe_cursor.as_str().is_some() {
             return;
         }
         self.pointer = None;
@@ -3512,7 +3511,7 @@ impl LayoutScreen {
     /// events never reach the windows, whose hover `[+0x110]` / `[+0x114]` stay put (0x5289D9),
     /// while the cursor draw reads the device (0x4D32DB).
     pub fn set_pointer(&mut self, at: Option<(f32, f32)>) {
-        if crate::config::cfg().nfs_fe_cursor.var().is_ok() {
+        if crate::config::cfg().nfs_fe_cursor.as_str().is_some() {
             return;
         }
         self.pointer = Some(at);
@@ -3671,7 +3670,7 @@ impl LayoutScreen {
     /// type **4** when the button goes down and **8** when it comes up (0x529806), and
     /// `Control::handleEvent` 0x525F80 sends them to **slot 5** and **slot 9**.
     pub fn set_pressed(&mut self, down: bool) {
-        if crate::config::cfg().nfs_fe_press.var().is_ok() {
+        if crate::config::cfg().nfs_fe_press.as_str().is_some() {
             return;
         }
         self.pressed = down;
@@ -4050,7 +4049,7 @@ impl LayoutScreen {
             match e.class.as_str() {
                 c if c.starts_with("REAL.BLACK") => self.draw_screen_fill(d, &mut out),
                 // `NFS_NO_GOURAUD=1` skips them — the probe for which sprites bury the text
-                "NFS5.GOURAUDBOX" if crate::config::cfg().nfs_no_gouraud.var().is_ok() => {}
+                "NFS5.GOURAUDBOX" if crate::config::cfg().nfs_no_gouraud.as_str().is_some() => {}
                 "NFS5.GOURAUDBOX" => self.draw_gouraud_box(d, &mut out),
                 "NFS5.GouraudIndicatorBar" => self.draw_gouraud_indicator_bar(d, &mut out),
                 "NFS5.GlintyRectangle" => self.draw_glinty_rectangle(d, &mut out),
@@ -4112,7 +4111,7 @@ impl LayoutScreen {
             // `NFS_WIDGET_DUMP=1` prints, per widget, how many sprites it produced, their extent
             // and the transition alpha they carry — the diagnostic that found the faint-text bug
             // recorded in `RE/AUDIT.md`
-            if crate::config::cfg().nfs_widget_dump.var().is_ok() {
+            if crate::config::cfg().nfs_widget_dump.as_str().is_some() {
                 let n = out.len() - first;
                 let b = out[first..].iter().fold((9.0f32, 9.0f32, -9.0f32, -9.0f32), |a, s| (a.0.min(s.pos[0]), a.1.min(s.pos[1]), a.2.max(s.pos[0]), a.3.max(s.pos[1])));
                 let f0: Vec<(String, [f32; 4])> = { let mut v: Vec<(String, [f32; 4])> = out[first..].iter().map(|s| (format!("{:?}", s.texture), s.color)).collect(); v.dedup(); v.truncate(3); v };
@@ -4154,7 +4153,7 @@ impl LayoutScreen {
         out.append(&mut overlay);
         // last of all, over the tooltip and the drop-down alike
         self.cursor_sprite(&mut out, aspect, hovered);
-        if crate::config::cfg().nfs_layer_dump.var().is_ok() {
+        if crate::config::cfg().nfs_layer_dump.as_str().is_some() {
             println!("layer: background {} sprites, own {} sprites", bg_end, out.len() - bg_end);
         }
         out

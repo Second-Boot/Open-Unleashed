@@ -689,7 +689,7 @@ impl App {
                     "TRACKPLAY" => len(list.first().copied().unwrap_or(0)),
                     // the elapsed time, which is 0 with nothing playing; `CDPlayer.View` would
                     // make it the remainder instead
-                    _ if self.choice_index("CDPlayer.View").is_some_and(|(i, _)| i != 0) => len(list.first().copied().unwrap_or(0)),
+                    _ if self.choice_index(choice::CDPLAYER_VIEW).is_some_and(|(i, _)| i != 0) => len(list.first().copied().unwrap_or(0)),
                     _ => 0,
                 };
                 let secs = ms / 1000;

@@ -105,7 +105,7 @@ impl App {
             tracing::info!(
                 mission = ms.mission.code,
                 pass,
-                time_s = t as f32 / 64.0,
+                time_s = t as f32 / TICKS_PER_SEC_F32,
                 cones,
                 message = c.message,
                 "mission recorded"
@@ -217,7 +217,7 @@ impl App {
     pub(crate) fn result_pages(&self) -> Vec<ResultPage> {
         // `DERBY` (the Smash Up cheat): the queue is `HCongrats` alone — 0x426DB7 jumps to 0x427345 with
         // nothing else queued: no summary, no records, no tournament chain (`hud.md`, the DERBY readers 0x4266A0 / 0x426D07 / 0x426DB7)
-        if self.cheat_bits & (1 << 7) != 0 {
+        if self.cheat_bits & CHEAT_DERBY != 0 {
             return Vec::new();
         }
         if self.mission.is_some() {
@@ -242,7 +242,7 @@ impl App {
         }
         // game type 3 skips the records page (0x4272F7 `cmp [0x6573E8], ebp; je 0x427345`, `ebp = 3` from
         // 0x426CCF): the queue goes on to the summary's timeout and nothing else
-        if self.hud_records.is_some() && self.block_game_type() != Some(3) {
+        if self.hud_records.is_some() && self.block_game_type() != Some(game_type::NETWORK) {
             pages.push(ResultPage::Records);
         }
         pages
@@ -458,7 +458,7 @@ impl App {
         let (place, total, best) = (me.place, me.time as u32, me.best_lap as u32);
         // 0x426D07: under `DERBY` `HCongrats` takes the place `car+0xB50 == 3 ? 8 : 1` of `[0x65741C]`'s car —
         // knocked out, or the winner — and not the ranking's
-        let place = if self.cheat_bits & (1 << 7) != 0 { if self.player_eliminated { 8 } else { 1 } } else { place };
+        let place = if self.cheat_bits & CHEAT_DERBY != 0 { if self.player_eliminated { 8 } else { 1 } } else { place };
         if place == 0 && self.mission.is_none() {
             return;
         }
@@ -493,10 +493,10 @@ impl App {
             let count = n_cars as u32;
             match fegame_type {
                 // 0x41D1B6: place 1 → kKnockoutWon 0x4A62E0, else kKnockoutEliminated 0x4A6350
-                1 => sp.say_id(if place == 1 { phrase::knockout_won(&mut draw) } else { phrase::knockout_eliminated(&mut draw) }),
+                game_type::QUICK_KNOCKOUT => sp.say_id(if place == 1 { phrase::knockout_won(&mut draw) } else { phrase::knockout_eliminated(&mut draw) }),
                 // 0x41D18E: place 1 of two → won; place < count → kKnockoutQualify 0x4A6320; else
                 // eliminated (`jge`)
-                2 => sp.say_id(if place == 1 && count == 2 {
+                game_type::KNOCKOUT => sp.say_id(if place == 1 && count == 2 {
                     phrase::knockout_won(&mut draw)
                 } else if place < count {
                     phrase::KNOCKOUT_QUALIFY

@@ -184,4 +184,34 @@ mod tests {
         assert_eq!(r.pop_frame(1), Some([3.0, 3.0]));
         assert!(r.is_empty());
     }
+
+    /// the feeder pushes in uneven chunks while the callback pops stereo
+    /// frames; every sample arrives once, in order, across the wrap of a small ring.
+    #[test]
+    fn the_sample_ring_hands_samples_across_threads() {
+        const N: usize = 200_000;
+        let r = std::sync::Arc::new(SampleRing::new(64));
+        let feeder = {
+            let r = r.clone();
+            std::thread::spawn(move || {
+                let data: Vec<i16> = (0..N).map(|i| (i % 30011) as i16).collect();
+                let (mut at, mut chunk) = (0, 1);
+                while at < N {
+                    let end = (at + chunk).min(N);
+                    at += r.push(&data[at..end]);
+                    chunk = chunk % 37 + 1;
+                }
+            })
+        };
+        let mut next = 0usize;
+        while next < N {
+            if let Some([l, rr]) = r.pop_frame(2) {
+                assert_eq!(l, (next % 30011) as i16 as f32);
+                assert_eq!(rr, ((next + 1) % 30011) as i16 as f32);
+                next += 2;
+            }
+        }
+        feeder.join().unwrap();
+        assert!(r.is_empty());
+    }
 }

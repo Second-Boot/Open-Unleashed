@@ -164,7 +164,7 @@ impl App {
                 let t = self
                     .fe.menu
                     .as_ref()
-                    .map(|m| if self.fe.game_type == 1 { m.looped_track() } else { m.track() }.to_string())
+                    .map(|m| if self.fe.game_type == game_type::QUICK_KNOCKOUT { m.looped_track() } else { m.track() }.to_string())
                     .unwrap_or_else(|| self.track.name.clone());
                 let rows = self
                     .records
@@ -799,7 +799,7 @@ impl App {
         let Some(l) = self.fe.layout_preview.as_ref() else { return };
         let Some((index, _)) = l.widgets_named(&["ID_LAPSSELECTOR"]).into_iter().next() else { return };
         let Some(m) = self.fe.menu.as_ref() else { return };
-        let idx = if self.fe.game_type == 2 { m.ko_sel } else { 0 };
+        let idx = if self.fe.game_type == game_type::KNOCKOUT { m.ko_sel } else { 0 };
         let track = m.ko_track(idx).to_string();
         let circuit = self.records.track(&track).is_some_and(|t| t.circuit);
         let Some(l) = self.fe.layout_preview.as_mut() else { return };

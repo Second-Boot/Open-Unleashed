@@ -60,7 +60,7 @@ impl LocFile {
             return Err(FormatError::UnknownMagic { what, offset: block, expected: LANGUAGE.to_vec(), found: d.get(block..block + 4).unwrap_or_default().to_vec() });
         }
         let count = u32_at(d, block + 0xC).unwrap_or(0) as usize;
-        let mut entries = Vec::with_capacity(count);
+        let mut entries = Vec::with_capacity(crate::cap_hint(count, d.len(), 4));
         for i in 0..count {
             let off = u32_at(d, block + 0x10 + i * 4).unwrap_or(0) as usize + block;
             let end = d[off.min(d.len())..].iter().position(|&b| b == 0).map(|n| off + n).unwrap_or(d.len());

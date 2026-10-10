@@ -724,12 +724,12 @@ fn is_flat(name: &str) -> bool {
 /// 1 medium, 2 high) whatever the option says — the shipped option is 0, where no track has a
 /// block, so the layers are otherwise never seen.
 pub fn forced_level() -> Option<usize> {
-    crate::config::cfg().nfs_sky_level.var().ok()?.parse().ok()
+    crate::config::cfg().nfs_sky_level.as_str()?.parse().ok()
 }
 
 /// `NFS_LIGHTNING=1`: a port diagnostic that drives the lightning's field value to 1 (mode 2).
 pub fn forced_lightning() -> bool {
-    crate::config::cfg().nfs_lightning.var_os().is_some()
+    crate::config::cfg().nfs_lightning.is_set()
 }
 
 /// The 16 × 16 layer grid of 0x460EC0(15, …) / 0x460F40 in metres around the eye, with the base UVs of 0x45EC40 (`j/a`, `i/b`) and the colour stream `colours` (vertex

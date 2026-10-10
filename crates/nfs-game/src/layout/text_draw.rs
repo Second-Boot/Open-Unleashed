@@ -203,14 +203,14 @@ impl LayoutScreen {
         let top = y.round();
         // `NFS_TEXT_PROBE=1` draws the same glyphs in white — the A/B that characterised the
         // faint-text fault in `RE/AUDIT.md` F2.
-        let probe = crate::config::cfg().nfs_text_probe.var().is_ok();
+        let probe = crate::config::cfg().nfs_text_probe.as_str().is_some();
         let color = if probe { [1.0, 1.0, 1.0, 1.0] } else { color };
-        let solid = crate::config::cfg().nfs_text_solid.var().is_ok();
+        let solid = crate::config::cfg().nfs_text_solid.as_str().is_some();
         for g in &glyphs {
             let (pos, size) = self.place(aspect, left + g.x, top + g.y, g.w, g.h);
             // `NFS_TEXT_FULLUV=1` opens the glyph's UV window to the whole sheet — with
             // `NFS_TEXT_BIG` it shows the sheet, without it nothing (`AUDIT.md` F2)
-            let full = crate::config::cfg().nfs_text_fulluv.var().is_ok();
+            let full = crate::config::cfg().nfs_text_fulluv.as_str().is_some();
             let (uv0, uv1) = if full {
                 ([0.0, 0.0], [1.0, 1.0])
             } else if solid {
@@ -223,14 +223,14 @@ impl LayoutScreen {
             // window to one texel, so a glyph quad becomes a plain filled rectangle — the probe
             // that showed the quads composite at about 8 % whatever they sample (`AUDIT.md` F2).
             // `NFS_TEXT_BIG=1` draws the quads four times the size
-            let size = if crate::config::cfg().nfs_text_big.var().is_ok() { [size[0] * 4.0, size[1] * 4.0] } else { size };
+            let size = if crate::config::cfg().nfs_text_big.as_str().is_some() { [size[0] * 4.0, size[1] * 4.0] } else { size };
             let tex = if solid { self.white } else { f.texture() };
             out.push(Sprite { texture: tex, pos, size, uv_min: uv0, uv_max: uv1, color, rotation: 0.0, pivot: [0.0, 0.0], tri: None, corner_colors: None, depth: None });
             // `NFS_TEXT_AB=1` repeats each glyph one line lower **in red**, same texture, same UV
             // window, same size — so one image carries the widget's text twice and the only
             // difference between the two is `color.rgb`. The red copy draws and the black original
             // does not (`AUDIT.md` F2).
-            if crate::config::cfg().nfs_text_ab.var().is_ok() {
+            if crate::config::cfg().nfs_text_ab.as_str().is_some() {
                 out.push(Sprite { texture: f.texture(), pos: [pos[0], pos[1] + size[1] * 1.2], size, uv_min: uv0, uv_max: uv1, color: [1.0, 0.0, 0.0, 1.0], rotation: 0.0, pivot: [0.0, 0.0], tri: None, corner_colors: None, depth: None });
             }
         }

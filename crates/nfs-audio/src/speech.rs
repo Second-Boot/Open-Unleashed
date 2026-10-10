@@ -2,7 +2,7 @@
 //! demand; requests go through a FIFO like `Speech_enqueue` 0x4B05A0 (no cool-down, phrases play back
 //! to back, more than 32 pending requests are dropped).
 
-use crate::mixer::{AudioOutput, Clip, VoiceId};
+use crate::mixer::{byte_gain, AudioOutput, Clip, VoiceId, BEND_ROOT};
 use nfs_formats::{bigf::Bigf, bnk::Bnk};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -159,7 +159,7 @@ impl Speech {
             let bank = Bnk::parse(bytes).ok()?;
             let slot = bank.slots.iter().position(|s| s.is_some())?;
             let pcm = bank.decode_slot(bytes, slot).ok()?;
-            Some(Arc::new(Clip { loop_range: None, ..Clip::from_pcm(pcm) }))
+            Some(Arc::new(Clip::from_pcm(pcm).one_shot()))
         });
         if decoded.is_none() {
             tracing::warn!(name, "speech bank missing");
@@ -178,7 +178,7 @@ impl Speech {
     /// ≥ 4 and 4 for ids 0…3 — the countdown (0x4B052A…0x4B055A; helpers 0x4A8300 / 0x4A8320) — at
     /// bend byte 0x40. At the top of the slider with the shipped trims that is 83 of 127.
     pub fn volume(level: u8, trim: u32) -> f32 {
-        (((level as u32 * trim * 85) >> 14).min(127)) as f32 / 127.0
+        byte_gain((((level as u32 * trim * 85) >> 14).min(127)) as i32)
     }
 
     /// Enqueue a phrase (bank name, e.g. `Lap-Final.bnk`). The port had fixed volumes 0.8 / 0.9 at
@@ -269,7 +269,7 @@ impl Speech {
             // (0x4AF900(0, 0)) the port has no counterpart for, so the phrase is tagged `table` to
             // reach the same voice through the one silencing walk the port has
             // (`AudioOutput::silence_voices`, `RE/notes/sfx.md` "Audit 2026-09-27, audio port 11").
-            *cur = Some(out.play_word(c, volume, crate::resample::PITCH_UNIT, 0x40, 0, false));
+            *cur = Some(out.play_word(c, volume, crate::resample::PITCH_UNIT, BEND_ROOT, 0, false));
         }
     }
 }

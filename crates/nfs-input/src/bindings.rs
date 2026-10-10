@@ -10,18 +10,32 @@
 //! `fe.txt` writes a key binding as `key,SC_<NAME>`; the names are the 82-entry table at
 //! **0x5D6588** (`{char* name, u32 scancode}`), which is DirectInput's own scancode set.
 
+/// The modifier keys' scancodes, the ones 0x411C20 folds into a key read ([`Modifiers`]).
+pub const SC_CTRL: u8 = 0x1D;
+pub const SC_LSHIFT: u8 = 0x2A;
+pub const SC_RSHIFT: u8 = 0x36;
+pub const SC_ALT: u8 = 0x38;
+
+/// A hat's step, hundredths of a degree per compass point (45 degrees): 0x411AC0 reads the bound
+/// direction `pov` as `pov · 4500`, 0x51F3B0 stores a captured hat as `value / 4500`.
+pub const POV_STEP: i32 = 4500;
+/// 0x51F3B0's window: an axis counts as moved once it is this far (of 65535) from its snapshot.
+pub const CAPTURE_THRESHOLD: i32 = 5000;
+/// 0x51F3B0 numbers a captured hat `0x20 + n`.
+pub const HAT_INDEX_BASE: u32 = 0x20;
+
 /// The `SC_*` table at 0x5D6588, in its own order.
 pub const SC_NAMES: [(&str, u8); 82] = [
     ("SC_ESC", 0x01), ("SC_1", 0x02), ("SC_2", 0x03), ("SC_3", 0x04), ("SC_4", 0x05), ("SC_5", 0x06),
     ("SC_6", 0x07), ("SC_7", 0x08), ("SC_8", 0x09), ("SC_9", 0x0A), ("SC_0", 0x0B), ("SC_MINUS", 0x0C),
     ("SC_EQUAL", 0x0D), ("SC_BS", 0x0E), ("SC_TAB", 0x0F), ("SC_Q", 0x10), ("SC_W", 0x11), ("SC_E", 0x12),
     ("SC_R", 0x13), ("SC_T", 0x14), ("SC_Y", 0x15), ("SC_U", 0x16), ("SC_I", 0x17), ("SC_O", 0x18),
-    ("SC_P", 0x19), ("SC_LBRACKET", 0x1A), ("SC_RBRACKET", 0x1B), ("SC_ENTER", 0x1C), ("SC_CTRL", 0x1D),
+    ("SC_P", 0x19), ("SC_LBRACKET", 0x1A), ("SC_RBRACKET", 0x1B), ("SC_ENTER", 0x1C), ("SC_CTRL", SC_CTRL),
     ("SC_A", 0x1E), ("SC_S", 0x1F), ("SC_D", 0x20), ("SC_F", 0x21), ("SC_G", 0x22), ("SC_H", 0x23),
     ("SC_J", 0x24), ("SC_K", 0x25), ("SC_L", 0x26), ("SC_COLON", 0x27), ("SC_QUOTE", 0x28),
-    ("SC_BQUOTE", 0x29), ("SC_LSHIFT", 0x2A), ("SC_Z", 0x2C), ("SC_X", 0x2D), ("SC_C", 0x2E),
+    ("SC_BQUOTE", 0x29), ("SC_LSHIFT", SC_LSHIFT), ("SC_Z", 0x2C), ("SC_X", 0x2D), ("SC_C", 0x2E),
     ("SC_V", 0x2F), ("SC_B", 0x30), ("SC_N", 0x31), ("SC_M", 0x32), ("SC_COMMA", 0x33),
-    ("SC_PERIOD", 0x34), ("SC_QUESTION", 0x35), ("SC_RSHIFT", 0x36), ("SC_PRTSRC", 0x37), ("SC_ALT", 0x38),
+    ("SC_PERIOD", 0x34), ("SC_QUESTION", 0x35), ("SC_RSHIFT", SC_RSHIFT), ("SC_PRTSRC", 0x37), ("SC_ALT", SC_ALT),
     ("SC_SPACE", 0x39), ("SC_CAPLOCK", 0x3A), ("SC_F1", 0x3B), ("SC_F2", 0x3C), ("SC_F3", 0x3D),
     ("SC_F4", 0x3E), ("SC_F5", 0x3F), ("SC_F6", 0x40), ("SC_F7", 0x41), ("SC_F8", 0x42), ("SC_F9", 0x43),
     ("SC_F10", 0x44), ("SC_NUMLOCK", 0x45), ("SC_SCROLLLOCK", 0x46), ("SC_HOME", 0x47), ("SC_UP", 0x48),
@@ -74,6 +88,49 @@ pub mod id {
     pub const I_HUDTRANSPARENCY: u16 = 0x20D;
 }
 
+/// A binding's kind, `[binding+0x14]` (0x51D010 / 0x51CB7C): which reader looks at it. A value
+/// nothing in the image writes is kept as [`BindingKind::Other`], so a profile loads and saves
+/// back as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingKind {
+    /// 0, a cleared row
+    None,
+    /// 1, an `Analog` axis (0x411B80)
+    Axis,
+    /// 2, a `Button` (0x411A50)
+    Button,
+    /// 3, a `Key` (0x411C20)
+    Key,
+    /// 5, a `Pov` hat (0x411AC0)
+    Hat,
+    /// any other value (4 is "none" in the image's notes)
+    Other(u32),
+}
+
+impl BindingKind {
+    pub const fn from_u32(v: u32) -> Self {
+        match v {
+            0 => Self::None,
+            1 => Self::Axis,
+            2 => Self::Button,
+            3 => Self::Key,
+            5 => Self::Hat,
+            other => Self::Other(other),
+        }
+    }
+
+    pub const fn as_u32(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Axis => 1,
+            Self::Button => 2,
+            Self::Key => 3,
+            Self::Hat => 5,
+            Self::Other(v) => v,
+        }
+    }
+}
+
 /// One binding's six fields, `[binding+0x14…+0x28]`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Binding {
@@ -91,6 +148,11 @@ pub struct Binding {
 }
 
 impl Binding {
+    /// [`kind`](Self::kind) as the enum (the stored `u32` is what the profile keeps).
+    pub const fn kind_class(&self) -> BindingKind {
+        BindingKind::from_u32(self.kind)
+    }
+
     /// The six dwords `FEControllerInputAccessor` saves from `this+0x14` (0x51D060) and loads
     /// back (0x51D080), in their order.
     pub fn to_fields(&self) -> [u32; 6] {
@@ -145,7 +207,7 @@ pub fn parse(value: &str) -> Option<Binding> {
         return None;
     }
     let sc = scancode_by_name(parts.next()?)?;
-    Some(Binding { kind: 3, device: 0, index: sc as u32, dir: 0, pov: 0, key: display_code(sc) })
+    Some(Binding { kind: BindingKind::Key.as_u32(), device: 0, index: sc as u32, dir: 0, pov: 0, key: display_code(sc) })
 }
 
 /// The modifier state 0x411C20 folds into a key read: Shift (0x2A or 0x36, `[0x5DE052]` /
@@ -161,7 +223,7 @@ pub struct Modifiers {
 /// Alt is held, since the reader XORs their bits into a binding that carries none and answers 0
 /// on any bit left set (0x411C5F).
 pub fn key_read(b: &Binding, down: impl Fn(u8) -> bool, m: Modifiers) -> u8 {
-    if b.kind != 3 || m.shift || m.ctrl || m.alt {
+    if b.kind_class() != BindingKind::Key || m.shift || m.ctrl || m.alt {
         return 0;
     }
     if down((b.index & 0xFF) as u8) { 255 } else { 0 }
@@ -205,22 +267,22 @@ pub fn capture(base: &[PadRecord], cur: &[PadRecord]) -> Option<Binding> {
         let mut out: Option<Binding> = None;
         for n in 0..32 {
             if b.buttons[n] != c.buttons[n] {
-                out = Some(Binding { kind: 2, device: d as u32, index: n as u32, dir: 0, pov: 0, key: 0 });
+                out = Some(Binding { kind: BindingKind::Button.as_u32(), device: d as u32, index: n as u32, dir: 0, pov: 0, key: 0 });
             }
         }
         for n in 0..4 {
             if b.pov[n] != c.pov[n] {
-                out = Some(Binding { kind: 5, device: d as u32, index: 0x20 + n as u32, dir: 0, pov: (c.pov[n] / 4500) as u32, key: 0 });
+                out = Some(Binding { kind: BindingKind::Hat.as_u32(), device: d as u32, index: HAT_INDEX_BASE + n as u32, dir: 0, pov: (c.pov[n] / POV_STEP) as u32, key: 0 });
             }
         }
-        let moved = |n: usize| c.axes[n] >= b.axes[n] + 5000 || c.axes[n] <= b.axes[n] - 5000;
+        let moved = |n: usize| c.axes[n] >= b.axes[n] + CAPTURE_THRESHOLD || c.axes[n] <= b.axes[n] - CAPTURE_THRESHOLD;
         for n in 0..8 {
             if c.mask & (1 << n) == 0 || !moved(n) {
                 continue;
             }
             let from = if n < 6 { n } else { 5 };
-            let dir = if c.axes[from] < b.axes[from] + 5000 { -1 } else { 1 };
-            out = Some(Binding { kind: 1, device: d as u32, index: n as u32, dir, pov: 0, key: 0 });
+            let dir = if c.axes[from] < b.axes[from] + CAPTURE_THRESHOLD { -1 } else { 1 };
+            out = Some(Binding { kind: BindingKind::Axis.as_u32(), device: d as u32, index: n as u32, dir, pov: 0, key: 0 });
         }
         if out.is_some() {
             return out;
@@ -247,8 +309,8 @@ pub fn pov_read(b: &Binding, pads: &[PadRecord]) -> u8 {
         return 0;
     }
     let d = b.pov as i32;
-    let mut hi = ((d + 1) & 7) * 4500;
-    let mut lo = ((d - 1) & 7) * 4500;
+    let mut hi = ((d + 1) & 7) * POV_STEP;
+    let mut lo = ((d - 1) & 7) * POV_STEP;
     if lo > hi {
         if v <= hi {
             lo = -hi;
@@ -282,42 +344,7 @@ pub struct Bindings {
 
 impl Bindings {
     pub fn from_registry<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Self {
-        let names = [
-            ("C1_LEFT", id::C1_LEFT),
-            ("C1_RIGHT", id::C1_RIGHT),
-            ("C1_GAS", id::C1_GAS),
-            ("C1_BRAKE", id::C1_BRAKE),
-            ("C1_HANDBRAKE", id::C1_HANDBRAKE),
-            ("C1_HORN", id::C1_HORN),
-            ("C1_SHIFTUP", id::C1_SHIFTUP),
-            ("C1_SHIFTDOWN", id::C1_SHIFTDOWN),
-            ("C1_ABORT", id::C1_ABORT),
-            ("C1_RESET", id::C1_RESET),
-            ("C1_AIDRIVE", id::C1_AIDRIVE),
-            ("C1_SIGNALLEFT", id::C1_SIGNALLEFT),
-            ("C1_SIGNALRIGHT", id::C1_SIGNALRIGHT),
-            ("C1_SIREN", id::C1_SIREN),
-            ("C1_LIGHTSON", id::C1_LIGHTSON),
-            ("I_PAUSE", id::I_PAUSE),
-            ("I_ROTCAMCCLOCK", id::I_ROTCAMCCLOCK),
-            ("I_ROTCAMSTOP", id::I_ROTCAMSTOP),
-            ("I_ROTCAMCLOCK", id::I_ROTCAMCLOCK),
-            ("I_TOGGLEPAUSEMENU", id::I_TOGGLEPAUSEMENU),
-            ("I_SFX", id::I_SFX),
-            ("I_MUSIC", id::I_MUSIC),
-            ("I_LOOKBEHIND", id::I_LOOKBEHIND),
-            ("I_LOOKLEFT", id::I_LOOKLEFT),
-            ("I_LOOKRIGHT", id::I_LOOKRIGHT),
-            ("I_LOOKFORWARD", id::I_LOOKFORWARD),
-            ("I_CYCLECAMERA", id::I_CYCLECAMERA),
-            ("I_TOGGLEHUD", id::I_TOGGLEHUD),
-            ("I_CYCLEHUD", id::I_CYCLEHUD),
-            ("I_TOGGLEREARVIEW", id::I_TOGGLEREARVIEW),
-            ("I_TOGGLEMAP", id::I_TOGGLEMAP),
-            ("I_CYCLEMAP", id::I_CYCLEMAP),
-            ("I_HUDTRANSPARENCY", id::I_HUDTRANSPARENCY),
-        ];
-        let by_id = names.iter().filter_map(|&(n, i)| Some((i, parse(get(n)?)?))).collect();
+        let by_id = crate::ACTIONS.iter().filter_map(|d| Some((d.id, parse(get(d.fe_name)?)?))).collect();
         Self { by_id, rows: Vec::new() }
     }
     pub fn get(&self, id: u16) -> Option<&Binding> {
@@ -343,7 +370,7 @@ impl Bindings {
         let rows = &self.rows;
         for (i, b) in self.by_id.iter_mut() {
             if (rows.is_empty() || rows.contains(i)) && same(b, new) {
-                b.kind = 0;
+                b.kind = BindingKind::None.as_u32();
             }
         }
     }
@@ -356,9 +383,9 @@ pub fn same(a: &Binding, b: &Binding) -> bool {
     if a.kind != b.kind || a.device != b.device {
         return false;
     }
-    match a.kind {
-        3 => a.key == b.key && a.index == b.index,
-        5 => a.index == b.index && a.dir == b.dir && a.pov == b.pov,
+    match a.kind_class() {
+        BindingKind::Key => a.key == b.key && a.index == b.index,
+        BindingKind::Hat => a.index == b.index && a.dir == b.dir && a.pov == b.pov,
         _ => a.index == b.index && a.dir == b.dir,
     }
 }
@@ -480,8 +507,8 @@ pub fn default_bindings(device: u32, caps: DeviceCaps, lang: u32) -> [Binding; 1
     let mut done = [false; 19];
     if caps.analogue {
         for &(row, kind, index, dir) in &PAD_DEFAULTS {
-            let has = match kind {
-                1 => caps.axes & (1 << index) != 0,
+            let has = match BindingKind::from_u32(kind) {
+                BindingKind::Axis => caps.axes & (1 << index) != 0,
                 _ => caps.buttons & (1 << index) != 0,
             };
             if has {
@@ -493,7 +520,7 @@ pub fn default_bindings(device: u32, caps: DeviceCaps, lang: u32) -> [Binding; 1
     for row in 0..19 {
         if !done[row] {
             let (key, sc) = default_key(row, lang);
-            out[row] = Binding { kind: 3, device: 0, index: sc as u32, dir: 0, pov: 0, key };
+            out[row] = Binding { kind: BindingKind::Key.as_u32(), device: 0, index: sc as u32, dir: 0, pov: 0, key };
         }
     }
     out
@@ -516,6 +543,9 @@ impl Bindings {
         }
     }
 }
+
+const _: () = assert!(SC_CTRL == 0x1D && SC_LSHIFT == 0x2A && SC_RSHIFT == 0x36 && SC_ALT == 0x38);
+const _: () = assert!(POV_STEP == 4500 && CAPTURE_THRESHOLD == 5000 && HAT_INDEX_BASE == 0x20);
 
 #[cfg(test)]
 mod tests {
@@ -554,6 +584,61 @@ mod tests {
             p.pov[0] = v;
             assert_eq!(pov_read(&north, &[p]), want, "hat at {v}");
         }
+    }
+
+    /// Profile compatibility: the six dwords a profile stores come back
+    /// unchanged, whatever the kind (0…7, and values nothing writes).
+    #[test]
+    fn a_binding_round_trips_its_six_fields() {
+        for kind in (0..=7).chain([0x1234_5678, u32::MAX]) {
+            let b = Binding { kind, device: 3, index: 0x23, dir: -1, pov: 6, key: 0x4800 };
+            assert_eq!(Binding::from_fields(b.to_fields()), b, "kind {kind}");
+            assert_eq!(b.to_fields(), [kind, 3, 0x23, u32::MAX, 6, 0x4800]);
+        }
+        let f = [5, 1, 0x20, 0, 3, 0];
+        assert_eq!(Binding::from_fields(f).to_fields(), f);
+    }
+
+    /// the kind enum is the stored `u32` and back for every value (4 and the unknown ones
+    /// included), and a binding with such a kind survives a save round trip with its kind intact.
+    #[test]
+    fn a_binding_kind_keeps_unknown_values() {
+        for v in (0..=9).chain([0x1234_5678, u32::MAX]) {
+            assert_eq!(BindingKind::from_u32(v).as_u32(), v);
+        }
+        assert_eq!(BindingKind::from_u32(4), BindingKind::Other(4));
+        assert_eq!(
+            [0, 1, 2, 3, 5].map(BindingKind::from_u32),
+            [BindingKind::None, BindingKind::Axis, BindingKind::Button, BindingKind::Key, BindingKind::Hat]
+        );
+        for kind in 0..=7 {
+            let b = Binding { kind, device: 1, index: 2, dir: 1, pov: 3, key: 4 };
+            let back = Binding::from_fields(b.to_fields());
+            assert_eq!((back.kind, back.kind_class().as_u32()), (kind, kind));
+            // a kind the readers do not know reads nothing and is not "same" as a key
+            if matches!(kind, 0 | 4 | 6 | 7) {
+                assert_eq!(key_read(&b, |_| true, Modifiers::default()), 0);
+                assert_eq!(button_read(&Binding { kind: 4, ..b }, &[PadRecord::default()]), 0);
+            }
+        }
+    }
+
+    /// 0x411AC0 about north and 0x51F3B0's snapshot are covered above; `capture` with no change
+    /// and with the second device moving.
+    #[test]
+    fn capture_takes_the_first_device_that_moved() {
+        let base = PadRecord { mask: 0xFF, ..Default::default() };
+        assert_eq!(capture(&[base, base], &[base, base]), None);
+        let mut cur = base;
+        cur.buttons[9] = true;
+        let got = capture(&[base, base], &[base, cur]).unwrap();
+        assert_eq!((got.kind, got.device, got.index), (2, 1, 9));
+        // a slider takes its direction from axis 5 (0x51F67A)
+        let mut c2 = base;
+        c2.axes[6] = base.axes[6] + 5000;
+        c2.axes[5] = base.axes[5] - 6000;
+        let got = capture(&[base], &[c2]).unwrap();
+        assert_eq!((got.kind, got.index, got.dir), (1, 6, -1));
     }
 
     /// Rebinding a key another row holds takes it from that row (0x51DCC0), and binding a row to

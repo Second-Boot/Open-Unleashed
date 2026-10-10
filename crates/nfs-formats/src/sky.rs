@@ -15,6 +15,10 @@
 
 use crate::FormatError;
 
+/// The 2π the sun's turn is multiplied by — the executable's own f64 literal, **not** `TAU`
+/// (`sun_position`).
+const TWO_PI_F64: f64 = 6.28318452835083;
+
 /// The `type` keyword. 0x45FD57 onwards compares it against thirteen strings and turns it into a
 /// **bitmask** — `config` 0x01, `basic` 0x02, `multinormal` 0x04, `multiadditive` 0x08,
 /// `multiattenuate` 0x10, `multimodulate` 0x20, `freecloud` 0x40, `additive` 0x100, the `…water`
@@ -546,7 +550,7 @@ impl SkyBin {
     pub fn sun_position(&self) -> [f32; 3] {
         let [a, b] = self.sun_offset;
         let r = &self.rings[0];
-        let t = (r.angle_turns as f64 * 6.28318452835083) as f32;
+        let t = (r.angle_turns as f64 * TWO_PI_F64) as f32;
         let (c, s) = (t.cos(), t.sin());
         let g = self.scalar_ce4;
         [(c * a + s * b) * g, (r.height - r.small * (a * a + b * b)) * g, (c * b - s * a) * g]
@@ -562,6 +566,22 @@ impl SkyBin {
 
     pub const COLOURS_AT: usize = 0xCE8;
     pub const RECORD: usize = 60;
+    /// Offsets of the scalar fields and the two ring records inside the `.bin` (the field docs of
+    /// [`SkyBin`] carry the addresses that read them).
+    pub const RING_TURN_AT: usize = 0x04;
+    pub const COLOUR_ROTATION_AT: usize = 0x08;
+    pub const TILE_COLS_AT: usize = 0x0C;
+    pub const TILE_ROWS_AT: usize = 0x10;
+    pub const HEIGHT_PAIR_AT: usize = 0x14;
+    /// 16 segments of `{tile, mirror}` bytes
+    pub const SEGMENTS_AT: usize = 0x1C;
+    pub const RING_0_AT: usize = 0x3C;
+    pub const RING_1_AT: usize = 0xB3C;
+    pub const SUN_OFFSET_AT: usize = 0xCDC;
+    pub const SCALAR_CE4_AT: usize = 0xCE4;
+    pub const SUN_READBACK_AT: usize = 0xDD8;
+    /// the colour records are stored as 0…254 and read back divided by this
+    const COLOUR_SCALE: f32 = 254.0;
     /// `+0xDDC`, `+0x1A5C`, `+0x655C` — three per-slice keyframe tracks, each at most 400 entries and
     /// ended by the first entry whose slice is negative (uninitialised memory is `0xCB` filler,
     /// which reads as one). The upgrade path 0x459700 writes the same bound and the `−1` terminator.
@@ -574,7 +594,7 @@ impl SkyBin {
         let u32_at = |o: usize| -> Result<u32, FormatError> {
             data.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).ok_or(FormatError::Truncated { what: "sky .bin", offset: o, needed: 4 })
         };
-        let f_at = |o: usize| -> f32 { data.get(o..o + 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0.0) / 254.0 };
+        let f_at = |o: usize| -> f32 { data.get(o..o + 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0.0) / Self::COLOUR_SCALE };
         let version = u32_at(0)?;
         let f_raw = |o: usize| -> f32 { data.get(o..o + 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0.0) };
         let mut colours = Vec::new();
@@ -595,7 +615,7 @@ impl SkyBin {
         let i_at = |o: usize| -> i32 { data.get(o..o + 4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(-1) };
         let mut segments = [SkySegment::default(); 16];
         for (i, s) in segments.iter_mut().enumerate() {
-            *s = SkySegment { tile: data.get(0x1C + i * 2).copied().unwrap_or(0), mirror: data.get(0x1D + i * 2).copied().unwrap_or(0) };
+            *s = SkySegment { tile: data.get(Self::SEGMENTS_AT + i * 2).copied().unwrap_or(0), mirror: data.get(Self::SEGMENTS_AT + 1 + i * 2).copied().unwrap_or(0) };
         }
         let ring = |o: usize| SkyRing { angle_turns: f_raw(o), radius: f_raw(o + 4), small: f_raw(o + 8), height: f_raw(o + 12) };
         // each track ends at the first negative slice, and never runs past 400 entries
@@ -630,16 +650,16 @@ impl SkyBin {
         Ok(Self {
             version,
             colours,
-            ring_turn: f_raw(4),
-            colour_rotation: i_at(8),
-            tile_cols: i_at(0xC),
-            tile_rows: i_at(0x10),
-            height_pair: [f_raw(0x14), f_raw(0x18)],
+            ring_turn: f_raw(Self::RING_TURN_AT),
+            colour_rotation: i_at(Self::COLOUR_ROTATION_AT),
+            tile_cols: i_at(Self::TILE_COLS_AT),
+            tile_rows: i_at(Self::TILE_ROWS_AT),
+            height_pair: [f_raw(Self::HEIGHT_PAIR_AT), f_raw(Self::HEIGHT_PAIR_AT + 4)],
             segments,
-            rings: [ring(0x3C), ring(0xB3C)],
-            scalar_ce4: f_raw(0xCE4),
-            sun_offset: [f_raw(0xCDC), f_raw(0xCE0)],
-            sun_readback: i_at(0xDD8) != 0,
+            rings: [ring(Self::RING_0_AT), ring(Self::RING_1_AT)],
+            scalar_ce4: f_raw(Self::SCALAR_CE4_AT),
+            sun_offset: [f_raw(Self::SUN_OFFSET_AT), f_raw(Self::SUN_OFFSET_AT + 4)],
+            sun_readback: i_at(Self::SUN_READBACK_AT) != 0,
             track_a,
             track_b,
             track_c,
@@ -896,6 +916,17 @@ fn sample<T: Copy>(keys: &[(i32, T)], slice: i32, lap: i32, get: impl Fn(&T) -> 
 #[cfg(test)]
 mod bin_tests {
     use super::*;
+
+    /// The named offsets and the 2π literal are the numbers `parse` / `sun_position` carried.
+    #[test]
+    fn named_offsets_keep_their_literal_values() {
+        assert_eq!(
+            [SkyBin::RING_TURN_AT, SkyBin::COLOUR_ROTATION_AT, SkyBin::TILE_COLS_AT, SkyBin::TILE_ROWS_AT, SkyBin::HEIGHT_PAIR_AT, SkyBin::SEGMENTS_AT, SkyBin::RING_0_AT, SkyBin::RING_1_AT, SkyBin::SUN_OFFSET_AT, SkyBin::SCALAR_CE4_AT, SkyBin::SUN_READBACK_AT],
+            [4, 8, 0xC, 0x10, 0x14, 0x1C, 0x3C, 0xB3C, 0xCDC, 0xCE4, 0xDD8]
+        );
+        assert_eq!(SkyBin::COLOUR_SCALE, 254.0);
+        assert_eq!(TWO_PI_F64.to_bits(), 6.28318452835083f64.to_bits());
+    }
 
     #[test]
     fn a_gradient_record_takes_track_bs_colour() {

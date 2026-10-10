@@ -384,7 +384,7 @@ impl CareerUi {
         // every mission done: none — unless `NFS_MISSION` names one (`mission_request`)
         let idx = match self.career.current_mission(&self.tables) {
             Some(i) => i,
-            None if std::env::var("NFS_MISSION").is_ok() => 0,
+            None if nfs_game::config::cfg().nfs_mission.as_str().is_some() => 0,
             None => return None,
         };
         self.mission_request(idx)
@@ -394,8 +394,8 @@ impl CareerUi {
     /// 0x4ECF00 over the record 0x51AE80 returns), marked pending. `NFS_MISSION=<idx>` overrides the
     /// mission (smoke runs).
     pub fn mission_request(&mut self, idx: usize) -> Option<StartRequest> {
-        let idx = std::env::var("NFS_MISSION")
-            .ok()
+        let idx = nfs_game::config::cfg().nfs_mission
+            .as_str()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|i| *i < self.tables.missions.len())
             .unwrap_or(idx);
@@ -523,7 +523,7 @@ impl CareerUi {
         let promotion = self.career.record_mission(&self.tables, idx, passed);
         // 0x51AEF0's other three stores (0x51AF2B…0x51AF3E): time, average damage, smackables
         self.career.set_mission_stats(&self.tables, idx, Career::mission_stats_of(time_ticks, zones, cones));
-        let secs = time_ticks as f32 / 64.0;
+        let secs = time_ticks as f32 / crate::TICKS_PER_SEC_F32;
         let mut msg = format!(
             "{}: {}  ({}:{:05.2}, {} CONES)  ",
             if passed { "PASSED" } else { "FAILED" },

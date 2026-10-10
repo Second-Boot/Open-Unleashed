@@ -18,6 +18,14 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+/// A send whose failure the port has always ignored (UDP: the reliable layer resends, the peer re-asks, the next
+/// ping comes; how the original treats a failed `sendto` is not read): the error is only written to the debug log.
+fn tolerate<T>(r: io::Result<T>, what: &str, to: SocketAddr) {
+    if let Err(e) = r {
+        tracing::debug!(%to, error = %e, "nfs-net: {what} send failed (ignored)");
+    }
+}
+
 /// `add ebx, 0x64` at 0x588D8 and 0x587DBD — one player record is 100 bytes.
 pub const PLAYER_STRIDE: usize = 0x64;
 /// `lea ebx, [edi + 0x88]` (0x5888A9) — where the records start inside the session.
@@ -156,8 +164,8 @@ pub struct Net {
     pub relay: bool,
     /// The data layer's connection object per peer (`conn` of 0x5951A0: its own sequence
     /// `+0x5A`, ack `+0x5E`, sent list, timers — [`crate::reliable`], `network.md` §11.18), keyed by
-    /// address. Made when the first game frame goes to or comes from a peer.
-    pub conns: std::collections::HashMap<SocketAddr, crate::reliable::Conn>,
+    /// address (an ordered map: the per-tick pump then sends the peers' frames in the same order every run). Made when the first game frame goes to or comes from a peer.
+    pub conns: std::collections::BTreeMap<SocketAddr, crate::reliable::Conn>,
     /// The origin of the 128 Hz tick clock the connections' timers run on (glue: the original's
     /// `[0x6B7C7C]` is the multimedia timer's counter).
     epoch: std::time::Instant,
@@ -201,7 +209,7 @@ impl Net {
             slot: None,
             relay: true,
             identity_gate: None,
-            conns: std::collections::HashMap::new(),
+            conns: std::collections::BTreeMap::new(),
             outbox: crate::outbox::Outbox::new(),
             // det-allow: transport timeouts, not simulation state
             epoch: std::time::Instant::now(),
@@ -232,7 +240,7 @@ impl Net {
             slot: None,
             relay: false,
             identity_gate: None,
-            conns: std::collections::HashMap::new(),
+            conns: std::collections::BTreeMap::new(),
             outbox: crate::outbox::Outbox::new(),
             // det-allow: transport timeouts, not simulation state
             epoch: std::time::Instant::now(),
@@ -248,7 +256,7 @@ impl Net {
     /// `'q'` once per peer, before the first frame to it, which is what both captured sessions show.
     fn send_frame(&mut self, to: SocketAddr, frame: &[u8]) -> io::Result<usize> {
         if self.q_sent.insert(to) {
-            let _ = self.sock.send_to(to, crate::data::CONNECT_TAG, &[]);
+            tolerate(self.sock.send_to(to, crate::data::CONNECT_TAG, &[]), "connect", to);
         }
         self.sock.send_to(to, crate::data::TAG, frame)
     }
@@ -374,9 +382,9 @@ impl Net {
         use crate::msg::kind;
         match body.first() {
             None => false,
-            Some(&kind::CAR_STATE) | Some(&0xC4) => false,
+            Some(&kind::CAR_STATE) | Some(&kind::HEARTBEAT) => false,
             // below 0xB0: a frame from the room (reliable), a sample from a player (not)
-            Some(&t) if t < 0xB0 => self.role == Role::Host,
+            Some(&t) if t < crate::msg::FIRST => self.role == Role::Host,
             Some(_) => true,
         }
     }
@@ -396,19 +404,30 @@ impl Net {
         }
         let now = self.ticks();
         for &to in addrs {
-            if reliable && self.host_register(to, bytes) {
-                continue;
-            }
-            if reliable {
-                // the original's room sends reliably only through a peer record's queue
-                // (0x48B340 → 0x48A3D0); an address without a record has no sender, nothing goes
-                continue;
-            }
-            let conn = self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now));
-            let f = conn.send_unreliable(bytes, now);
-            self.send_frame(to, &f)?;
+            self.deliver(to, bytes, reliable, now)?;
         }
         Ok(())
+    }
+
+    /// One message to one peer, by its [`Net::is_reliable`] class: a reliable one goes through the
+    /// host's peer-record queue ([`Net::host_register`]); an unreliable one is framed by the peer's
+    /// connection and sent at once. `now` is the caller's tick, so one call to [`Net::send_game_to`]
+    /// (or one relayed message) stamps every peer alike.
+    fn deliver(&mut self, to: SocketAddr, body: &[u8], reliable: bool, now: i64) -> io::Result<()> {
+        if reliable {
+            // the original's room sends reliably only through a peer record's queue
+            // (0x48B340 → 0x48A3D0); an address without a record has no sender, nothing goes
+            self.host_register(to, body);
+            return Ok(());
+        }
+        let f = self.conn(to, now).send_unreliable(body, now);
+        self.send_frame(to, &f)?;
+        Ok(())
+    }
+
+    /// The data layer's connection to `to`, made on first use (stamped `now`).
+    fn conn(&mut self, to: SocketAddr, now: i64) -> &mut crate::reliable::Conn {
+        self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now))
     }
 
     /// The host's room sender for one peer — the room's send slot 0 (0x48B340) into the peer record's queue,
@@ -432,10 +451,9 @@ impl Net {
     /// answer 0).
     fn peer_send(&mut self, to: SocketAddr, body: &[u8]) -> bool {
         let now = self.ticks();
-        let conn = self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now));
-        match conn.send(body, now) {
+        match self.conn(to, now).send(body, now) {
             Some(f) => {
-                let _ = self.send_frame(to, &f);
+                tolerate(self.send_frame(to, &f), "frame", to);
                 true
             }
             None => false,
@@ -474,10 +492,9 @@ impl Net {
     fn link_send(&mut self, body: &[u8]) -> bool {
         let (Some(to), Some(_)) = (self.host, self.slot) else { return false };
         let now = self.ticks();
-        let conn = self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now));
-        match conn.send(body, now) {
+        match self.conn(to, now).send(body, now) {
             Some(f) => {
-                let _ = self.send_frame(to, &f);
+                tolerate(self.send_frame(to, &f), "frame", to);
                 true
             }
             None => false,
@@ -537,7 +554,7 @@ impl Net {
             }
         }
         for (to, f) in out {
-            let _ = self.send_frame(to, &f);
+            tolerate(self.send_frame(to, &f), "frame", to);
         }
     }
 
@@ -578,12 +595,12 @@ impl Net {
         match t {
             tag::W if self.role == Role::Host => {
                 if p.len() >= 32 && p[..32] == self.key[..] {
-                    let _ = self.describe(from, 0);
+                    tolerate(self.describe(from, 0), "describe", from);
                 }
             }
             tag::R if self.role == Role::Host => {
                 if let Some(id) = comm::read_be(p, 0, 4) {
-                    let _ = self.describe(from, id);
+                    tolerate(self.describe(from, id), "describe", from);
                 }
             }
             tag::DESCRIBE => {
@@ -598,7 +615,7 @@ impl Net {
                     let rec = self.slot_record(head.index);
 
                     let (t, body) = comm::answer_query(head, rec.as_ref());
-                    let _ = self.sock.send_to(from, t, &body);
+                    tolerate(self.sock.send_to(from, t, &body), "query answer", from);
                 }
             }
             tag::REPLY | tag::NO_SUCH => {
@@ -620,7 +637,7 @@ impl Net {
                     if let JoinStatus::Joined(slot) = reply.status {
                         out.push(Event::PeerJoined { slot, from });
                     }
-                    let _ = self.sock.send_to(from, tag::A, &reply.encode());
+                    tolerate(self.sock.send_to(from, tag::A, &reply.encode()), "join reply", from);
                 }
             }
             tag::A if self.role == Role::Client => {
@@ -664,8 +681,7 @@ impl Net {
                     self.ping = comm::PING_TICKS;
                 }
                 let now = self.ticks();
-                let conn = self.conns.entry(from).or_insert_with(|| crate::reliable::Conn::new(now));
-                for body in conn.receive(p, now) {
+                for body in self.conn(from, now).receive(p, now) {
                     // the room's relay (0x48C0F0 / 0x48C170): what the host does not act on itself
                     // goes on to the others, as a fresh frame on each link
                     // (`0xBC` is the room's own relay with the lobby-group gate, 0x48C050: the caller's)
@@ -673,18 +689,10 @@ impl Net {
                         let reliable = self.is_reliable(&body);
                         // 0x48C0F0 skips the sender for `0xBF` … `0xC2` and **not for `0xBD`**: the barrier's bit comes back to the joiner that
                         // sent it (captured, REFERENCE-2026-10-02-SRVX: the original host answers a joiner's `0xBD 1` with `0xBD 1`)
-                        let echo = body.first() == Some(&0xBD);
+                        let echo = body.first() == Some(&crate::msg::kind::BARRIER);
                         let others: Vec<SocketAddr> = self.everyone().into_iter().filter(|&a| echo || a != from).collect();
                         for to in others {
-                            if reliable && self.host_register(to, &body) {
-                                continue;
-                            }
-                            if reliable {
-                                continue; // no peer record, no reliable sender
-                            }
-                            let c = self.conns.entry(to).or_insert_with(|| crate::reliable::Conn::new(now));
-                            let f = c.send_unreliable(&body, now);
-                            let _ = self.send_frame(to, &f);
+                            tolerate(self.deliver(to, &body, reliable, now), "relay", to);
                         }
                     }
                     out.push(Event::Data { from, slot, bytes: body });
@@ -697,7 +705,7 @@ impl Net {
                 } else if self.host == Some(from) {
                     // 0x5890C3: a client answers the ping with another '*' and rearms 0xAC
                     self.ping = comm::PING_TICKS;
-                    let _ = self.sock.send_to(from, tag::STAR, &[]);
+                    tolerate(self.sock.send_to(from, tag::STAR, &[]), "ping answer", from);
                 }
             }
             tag::BYE_K | tag::BYE_B => {
@@ -721,7 +729,7 @@ impl Net {
                 if self.relay {
                     for to in self.everyone() {
                         if to != from {
-                            let _ = self.sock.send_to(to, tag::USER, p);
+                            tolerate(self.sock.send_to(to, tag::USER, p), "user relay", to);
                         }
                     }
                 }
@@ -889,7 +897,7 @@ impl Net {
             p.countdown -= 1;
             if ping_round {
                 let to = p.sock;
-                let _ = self.sock.send_to(to, tag::STAR, &[]);
+                tolerate(self.sock.send_to(to, tag::STAR, &[]), "ping", to);
             }
         }
         out
@@ -909,6 +917,10 @@ impl Net {
     }
 }
 
+/// The CONMAN's hello (0x55CED0 / 0x560420): a message byte outside `0xB0 … 0xC6` that the host's
+/// link layer answers itself.
+const CONMAN_HELLO: u8 = 0xFF;
+
 /// Whether the room acts on a player's message itself, where the others' messages it only passes on
 /// (0x49120C's jump table, `network.md` §11.18): the chat request 0x48D9B0 is rewritten before anyone
 /// else sees it (0x491324); the ping request `0xC3` (0x48D9F0) is answered to its sender alone
@@ -918,10 +930,10 @@ impl Net {
 fn msg_for_the_host(body: &[u8]) -> bool {
     match body.first() {
         // `0xFF` is the CONMAN's hello (0x55CED0 / 0x560420): the host's link layer answers it, nobody else gets it
-        Some(&crate::msg::kind::CHAT | &crate::msg::kind::PING | &0xFF) => true,
+        Some(&crate::msg::kind::CHAT | &crate::msg::kind::PING | &CONMAN_HELLO) => true,
         // the input exchange's messages to the room: a player's three input bytes (any type below
         // `0xB0`, 0x49120C -> 0x48A2C0), its `0xB3` request, `0xC5` (start) and `0xB7` (report)
-        Some(&t) => t < 0xB0 || matches!(t, crate::msg::kind::START | 0xB7 | 0xC5),
+        Some(&t) => t < crate::msg::FIRST || matches!(t, crate::msg::kind::START | crate::msg::kind::RACE_TIME | crate::msg::kind::GO),
         None => false,
     }
 }

@@ -22,10 +22,10 @@ pub struct CarModel {
     pub body: Vec<(MeshId, MaterialId, Mat4)>,
     /// Each material's `R3DLightLayer` parameters (`RE/notes/lighting.md` §6) — every shipped car
     /// material has them.
-    material_light: HashMap<MaterialId, nfs_formats::crp::LayerLight>,
+    material_light: MaterialMap<nfs_formats::crp::LayerLight>,
     /// The materials whose render method takes the shadow projector (layer class 0x8102,
     /// `R3DShadowMapTextureLayer`).
-    shadowed: std::collections::HashSet<MaterialId>,
+    shadowed: MaterialSet,
     /// The meshes each **model animation** morphs (`Base+77`, index 1…7), with every frame's
     /// positions: 1 the convertible's roof, 2 the `SpoilerW` wing, 3 the wipers, 4 / 5 / 6 the
     /// driver's right arm, left arm and body, 7 the aerial (`anims` example over every car).
@@ -176,6 +176,48 @@ pub struct CarLight {
 
 /// Model animations are numbered 1…7 in the shipped cars; slot 0 is unused.
 const ANIMS: usize = 8;
+
+/// A multiplicative hash for the per-item material lookups ([`CarModel::draw_items_block`],
+/// [`CarModel::apply_projector`]): a `MaterialId` is a small `u32`, and SipHash on it for every item of
+/// every car every frame was the cost. Lookups only — nothing iterates these tables, so the order
+/// a hasher gives is never seen.
+#[derive(Default, Clone, Copy)]
+struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.0 = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type IdBuild = std::hash::BuildHasherDefault<IdHasher>;
+type MaterialMap<V> = HashMap<MaterialId, V, IdBuild>;
+type MaterialSet = std::collections::HashSet<MaterialId, IdBuild>;
+
+/// The two work buffers of one [`CarModel::draw_items_into`]: a pass's items with their
+/// `body_order` keys, and the `(key, index)` pairs sorted to put them in the original's order.
+#[derive(Default)]
+pub struct DrawScratch {
+    items: Vec<(u32, DrawItem)>,
+    order: Vec<(u32, u32)>,
+}
+
+thread_local! {
+    /// [`CarModel::draw_items`]' buffers: the draw runs on one thread and does not nest.
+    static DRAW_SCRATCH: std::cell::RefCell<DrawScratch> = std::cell::RefCell::new(DrawScratch::default());
+}
+
+/// The steering wheel's travel, `±4.5 / 23` of a turn (`.z = ch1.y + ch2.y` within it,
+/// 0x43858F…0x4385FB; the frame index is `23·ch5.z + 4.5`, 0x438C4F…0x438C6B).
+const STEERING_WHEEL_LIMIT: f32 = 4.5 / 23.0;
 
 /// One of slot 9's eight keyframe players, `R3DCar+0x484 + 0x1C·n` (0x438B66…0x438C3D) — player
 /// `n` drives animation `n`: `{count, table, start, duration, frame, next, frac}`.
@@ -689,8 +731,8 @@ impl CarModel {
         let page_textures: Vec<nfs_renderer::TextureId> = page_tex.iter().map(|p| p.0).collect();
         let materials = car.crp.materials(&car.crp_data)?;
         let mut mat_ids: HashMap<u16, MaterialId> = HashMap::new();
-        let mut material_light: HashMap<MaterialId, nfs_formats::crp::LayerLight> = HashMap::new();
-        let mut shadowed: std::collections::HashSet<MaterialId> = std::collections::HashSet::new();
+        let mut material_light: MaterialMap<nfs_formats::crp::LayerLight> = MaterialMap::default();
+        let mut shadowed = MaterialSet::default();
         let mut material_for = |r: &mut Renderer, id: u16| {
             if let Some(m) = mat_ids.get(&id) {
                 return *m;
@@ -1212,7 +1254,7 @@ impl CarModel {
                 tex_remap.insert(old_tex, new_tex);
             }
             let mut mat_remap: HashMap<MaterialId, MaterialId> = HashMap::new();
-            let mut remap = |mid: &mut MaterialId, material_light: &mut HashMap<MaterialId, nfs_formats::crp::LayerLight>, shadowed: &mut std::collections::HashSet<MaterialId>| {
+            let mut remap = |mid: &mut MaterialId, material_light: &mut MaterialMap<nfs_formats::crp::LayerLight>, shadowed: &mut MaterialSet| {
                 if let Some(&nid) = mat_remap.get(mid) {
                     *mid = nid;
                     return;
@@ -1390,7 +1432,7 @@ impl CarModel {
         }
         // the steering frame: 23·ch5.z + 4.5 (0x438C4F…0x438C6B), 0…9 as a table index
         // (0x438CC8…0x438D7E: under 0 → 0, over 9 → 9, else fistp(f − 0.5))
-        let f = d.wheel_turns.clamp(-4.5 / 23.0, 4.5 / 23.0) * 23.0 + 4.5;
+        let f = d.wheel_turns.clamp(-STEERING_WHEEL_LIMIT, STEERING_WHEEL_LIMIT) * 23.0 + 4.5;
         let index = |f: f32| -> usize {
             if f < 0.0 {
                 0
@@ -1566,7 +1608,7 @@ impl CarModel {
         yz[11][1] = t0 + t1 * rpm * 0.001;
         yz[12][1] = s0 + s1 * speed * 0.144;
         // 5 `.z`: the steering wheel, `ch1.y + ch2.y` within ±4.5/23 (0x43858F…0x4385FB)
-        yz[5][1] = (steer[0] + steer[1]).clamp(-4.5 / 23.0, 4.5 / 23.0);
+        yz[5][1] = (steer[0] + steer[1]).clamp(-STEERING_WHEEL_LIMIT, STEERING_WHEEL_LIMIT);
         // 18…21: channels 1…4 with `.x` = 0 — the tread and the shadow turn but do not spin
         // (0x438669…0x438726)
         for k in 0..4 {
@@ -1686,6 +1728,15 @@ impl CarModel {
     /// the passes one after the other as 0x444E00 makes them — the driver, then the body, then the
     /// wheels.
     pub fn draw_items(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2], travel: [f32; 4], passes: &[CarPass]) -> Vec<DrawItem> {
+        let mut out = Vec::with_capacity(self.body.len() / 4 + 4 * 8);
+        DRAW_SCRATCH.with(|s| self.draw_items_into(&mut out, &mut s.borrow_mut(), car_to_world, wheel_spin, steer, travel, passes));
+        out
+    }
+
+    /// [`Self::draw_items`] appending to `out` with the caller's scratch buffers, so a frame's cars
+    /// allocate nothing per car beyond `out` itself.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_items_into(&self, out: &mut Vec<DrawItem>, scratch: &mut DrawScratch, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2], travel: [f32; 4], passes: &[CarPass]) {
         // 0x4433D2 / 0x4433BC: `(−m·s, s, −s)` — `MODEL_TO_BODY` scaled, its x turned back in a
         // mirrored race; and the steer channels negated there (0x438471)
         let car_to_world = car_to_world * Mat4::from_scale(Vec3::new(if self.mirror { -self.scale } else { self.scale }, self.scale, self.scale));
@@ -1694,13 +1745,11 @@ impl CarModel {
         // part's matrix after its `tr` and before its rotation — the only float of it written is
         // `.y` (0x43E6E1…0x43E6F1), so a lift along the model's (and the body's) up
         let lift = |m: i8| usize::try_from(m).ok().and_then(|m| travel.get(m).copied()).map_or(Mat4::IDENTITY, |y| Mat4::from_translation(Vec3::new(0.0, y, 0.0)));
-        let mut out = Vec::with_capacity(self.body.len() / 4 + 4 * 8);
         // (the same products every part makes, taken once: `(car_to_world · MODEL_TO_BODY) · m` is how
         // the expression below associates, and the inverse is of a constant)
         let to_body = car_to_world * MODEL_TO_BODY;
         let body_to_model = MODEL_TO_BODY.inverse();
-        let mut items: Vec<(u32, DrawItem)> = Vec::with_capacity(self.body.len() / 4 + 4 * 8);
-        let mut order: Vec<(u32, u32)> = Vec::with_capacity(items.capacity());
+        let DrawScratch { items, order } = scratch;
         for pass in passes {
             items.clear();
             for (i, (mesh, material, local)) in self.body.iter().enumerate() {
@@ -1720,7 +1769,7 @@ impl CarModel {
                     // 5, the steering wheel: `.z = ch1.y + ch2.y` within ±4.5/23 (0x43858F…0x4385FB).
                     // Off the caller's `steer` for the same reason as 18…21 — the traffic and the cops
                     // share one model per car type and would otherwise hold the wheel straight.
-                    5 => *local * Mat4::from_rotation_z((steer[0] + steer[1]).clamp(-4.5 / 23.0, 4.5 / 23.0) * std::f32::consts::TAU),
+                    5 => *local * Mat4::from_rotation_z((steer[0] + steer[1]).clamp(-STEERING_WHEEL_LIMIT, STEERING_WHEEL_LIMIT) * std::f32::consts::TAU),
                     n => *local * self.channel_matrix(n),
                 };
                 items.push((self.body_order.get(i).copied().unwrap_or(u32::MAX), DrawItem::new(*mesh, *material, to_body * m)));
@@ -1771,7 +1820,6 @@ impl CarModel {
             order.sort_unstable();
             out.extend(order.iter().map(|&(_, i)| items[i as usize].1));
         }
-        out
     }
 
     /// The class count the LOD pick scales by (0x43A0DC…0x43A117): the 1-based number of the first

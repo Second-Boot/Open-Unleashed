@@ -411,7 +411,7 @@ impl App {
             // lists at 0x505447, 0x505441 and 0x50543B. §4.105.
             "Tournament.Tournament" => {
                 let c = self.career.as_ref()?;
-                let list = c.event_type_list(self.choice_index("Tournament.EventType").map_or(0, |(i, _)| i));
+                let list = c.event_type_list(self.choice_index(choice::TOURNAMENT_EVENT_TYPE).map_or(0, |(i, _)| i));
                 let cur = c.current().and_then(|t| list.iter().position(|x| x.id == t.id));
                 let rows = list
                     .iter()
@@ -571,7 +571,7 @@ impl App {
         };
         // diagnostic: `NFS_CHOICE=Graphics.CarChrome=2,Display.RearView=1` overrides a choice for
         // a `--screenshot` run, where no front end sets it
-        if let Ok(over) = nfs_game::config::cfg().nfs_choice.var()
+        if let Some(over) = nfs_game::config::cfg().nfs_choice.as_str()
             && let Some(v) = over.split(',').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == name).and_then(|(_, v)| v.trim().parse::<usize>().ok())
         {
             return Some((v.min(options.len() - 1), options));
@@ -714,11 +714,16 @@ impl App {
     /// directory, else the shipped `FEData/Data/nfs5-1.hud` / `nfs5-2.hud` (the `XXhud?XX.hud` of
     /// 0x41F7A0).
     pub(crate) fn hud_cfg_ensure(&self) {
-        let who = self.career.as_ref().map(|c| (c.save_dir.clone(), c.profile.name.clone()));
         let mut cache = self.hud_cfg.borrow_mut();
-        if cache.loaded && cache.who == who {
+        // (compared in place: this runs on every Display-option lookup, ~20 a frame in a race, and
+        // used to clone the save dir and the profile name just to find nothing changed)
+        let same = |who: &Option<(std::path::PathBuf, String)>| {
+            who.as_ref().map(|(d, n)| (d.as_path(), n.as_str())) == self.career.as_ref().map(|c| (c.save_dir.as_path(), c.profile.name.as_str()))
+        };
+        if cache.loaded && same(&cache.who) {
             return;
         }
+        let who = self.career.as_ref().map(|c| (c.save_dir.clone(), c.profile.name.clone()));
         let shipped = self.paths.fe_data().join("Data");
         let loaded = hud_cfg::load(who.as_ref().map(|(d, n)| (d.as_path(), n.as_str())), &shipped);
         cache.who = who;
@@ -978,6 +983,37 @@ pub(crate) const POSITIONAL_OPTIONS: [u32; 2] = [281, 282];
 /// (0x4E561B then calls the setter, slot 11, with **1** — `Menu::difficulty`.)
 pub(crate) const DIFFICULTY_OPTIONS: [u32; 3] = [450, 451, 452];
 
+/// The accessor names the port's own code asks [`App::choice_index`] for (each is a
+/// [`CHOICE_ACCESSORS`] row; the `choice_consts_are_accessors` test pins that).
+pub(crate) mod choice {
+    pub(crate) const CDPLAYER_OPTIONS: &str = "CDPlayer.Options";
+    pub(crate) const CDPLAYER_VIEW: &str = "CDPlayer.View";
+    pub(crate) const CAR_ROOF: &str = "Car.Roof";
+    pub(crate) const CAR_TRANSMISSION: &str = "Car.Transmission";
+    pub(crate) const DISPLAY_DAMAGE: &str = "Display.Damage";
+    pub(crate) const DISPLAY_DISP_COLS: &str = "Display.DispCols";
+    pub(crate) const DISPLAY_GEAR: &str = "Display.Gear";
+    pub(crate) const DISPLAY_MAP: &str = "Display.Map";
+    pub(crate) const DISPLAY_MAP_SCALE: &str = "Display.MapScale";
+    pub(crate) const DISPLAY_OPP_LIST: &str = "Display.OppList";
+    pub(crate) const DISPLAY_REAR_VIEW: &str = "Display.RearView";
+    pub(crate) const DISPLAY_SCREEN_LAYOUT: &str = "Display.ScreenLayout";
+    pub(crate) const DISPLAY_SPEED_UNITS: &str = "Display.SpeedUnits";
+    pub(crate) const DISPLAY_SPEEDOMETER: &str = "Display.Speedometer";
+    pub(crate) const DISPLAY_SPLIT_TIMES: &str = "Display.SplitTimes";
+    pub(crate) const DISPLAY_TACH: &str = "Display.Tach";
+    pub(crate) const DISPLAY_TRANSLUCENCY: &str = "Display.Translucency";
+    pub(crate) const GRAPHICS_CAR_CHROME: &str = "Graphics.CarChrome";
+    pub(crate) const GRAPHICS_CAR_DETAIL: &str = "Graphics.CarDetail";
+    pub(crate) const GRAPHICS_HEADLIGHTS: &str = "Graphics.Headlights";
+    pub(crate) const GRAPHICS_LENS_FLARE: &str = "Graphics.LensFlare";
+    pub(crate) const GRAPHICS_SKY_RENDERING: &str = "Graphics.SkyRendering";
+    pub(crate) const GRAPHICS_SPECIAL_FX: &str = "Graphics.SpecialFX";
+    pub(crate) const GRAPHICS_VIEW_DISTANCE: &str = "Graphics.ViewDistance";
+    pub(crate) const GRAPHICS_WIDE_SCREEN: &str = "Graphics.WideScreen";
+    pub(crate) const TOURNAMENT_EVENT_TYPE: &str = "Tournament.EventType";
+}
+
 pub(crate) const CHOICE_ACCESSORS: &[(&str, &str, &[u32])] = &[
     ("Audio.Mode", "audio3d", &[1500, 1501]),
     ("Audio.Quality", "audioquality", &[1504, 1503, 1502, 1500]),
@@ -1090,3 +1126,22 @@ pub(crate) const DIRECTION_OPTIONS: [u32; 4] = [410, 411, 412, 413];
 /// (0x4FC1BC, 0x4FC320). So the lap count a front-end race can ask for is **1…8**, not any larger
 /// number; the list accessor's own stepper (0x4BC240) clamps at the ends. CONFIRMED.
 pub(crate) const LAPS_MAX: u32 = 8;
+
+#[cfg(test)]
+mod choice_name_tests {
+    use super::*;
+
+    /// every named accessor is a row of the table (a typo in a name would make `choice_index` answer `None`)
+    #[test]
+    fn choice_consts_are_accessors() {
+        let src = include_str!("fe_choices.rs");
+        let block = src.split("pub(crate) mod choice {").nth(1).unwrap().split("\n}\n").next().unwrap();
+        let mut n = 0;
+        for line in block.lines().filter(|l| l.contains("&str = ")) {
+            let name = line.split('"').nth(1).unwrap();
+            assert!(CHOICE_ACCESSORS.iter().any(|(a, _, _)| *a == name), "{name} is not a CHOICE_ACCESSORS row");
+            n += 1;
+        }
+        assert_eq!(n, 26);
+    }
+}

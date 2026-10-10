@@ -179,6 +179,59 @@ pub struct LaneScratch {
     pub soft: [f32; 3],
 }
 
+/// The lists one car's lane pass (section 12 / 23) reads, in the order the original registers its
+/// cars (0x40F189): the cars the caller passes first (the human, the opponents, the cops or the
+/// traffic), then this set's own active cars **less the one being scored**. `places` are the
+/// `car+0x528` race-order places of the previous even tick, `positions` the world positions for
+/// `0x40E860`'s fine step. One per set, refilled for every car ([`Self::fill`]) so the pass
+/// allocates nothing: `TrafficSet::ai_on` and `Police::lane_pass` used to build the three vectors
+/// by hand each.
+#[derive(Debug, Clone, Default)]
+pub struct LanePassCtx {
+    pub cars: Vec<LaneCar>,
+    pub places: Vec<usize>,
+    pub positions: Vec<glam::Vec3>,
+    /// the index buffer of [`LaneScratch::find_blockers_buffered`]
+    pub sorted: Vec<usize>,
+    /// the caller supplied a place for every entry of the others: the walk then reads the real
+    /// race-order array instead of sorting the cars itself
+    pub placed: bool,
+}
+
+impl LanePassCtx {
+    /// Rebuild the lists for one car: `others` (with `other_places` and `other_positions`, which may
+    /// be shorter or longer than `others`: the places are taken whole, a missing position is NaN),
+    /// then `own`, one `(lane car, place, position)` per own car other than the scored one.
+    pub fn fill(&mut self, others: &[LaneCar], other_places: &[usize], other_positions: &[glam::Vec3], own: impl Iterator<Item = (LaneCar, usize, glam::Vec3)>) {
+        self.cars.clear();
+        self.cars.extend_from_slice(others);
+        self.places.clear();
+        self.places.extend_from_slice(other_places);
+        self.positions.clear();
+        // an `others` entry the caller gave no position for falls back to the slice gap (NaN is never
+        // within +-12 m of anything the fine step would accept, so [`Self::fine_ok`] filters it out)
+        self.positions.extend((0..others.len()).map(|k| other_positions.get(k).copied().unwrap_or(glam::Vec3::NAN)));
+        for (car, place, position) in own {
+            self.cars.push(car);
+            self.places.push(place);
+            self.positions.push(position);
+        }
+        self.placed = other_places.len() == others.len();
+    }
+
+    /// Every position is known, so the fine step may run.
+    pub fn fine_ok(&self) -> bool {
+        self.positions.iter().all(|p| p.is_finite())
+    }
+
+    /// [`LaneScratch::find_blockers_buffered`] on these lists for the car at `position` with
+    /// race-order place `place`.
+    pub fn find_blockers(&mut self, sc: &mut LaneScratch, table: &SliceTable, me: &LaneSelf, position: glam::Vec3, place: usize) {
+        let fine_ok = self.fine_ok();
+        sc.find_blockers_buffered(&mut self.sorted, table, me, &self.cars, &PERSONALITIES[0], fine_ok.then_some((position, self.positions.as_slice())), self.placed.then_some((place, self.places.as_slice())));
+    }
+}
+
 /// The car doing the scoring.
 #[derive(Debug, Clone, Copy)]
 pub struct LaneSelf {
@@ -232,6 +285,13 @@ impl LaneScratch {
     /// `0x5E8B88[(car+0xEB0·i + n + car+0x528) mod n]` reads. Without them the walk falls back to
     /// a fresh sort on the slices of this tick (the APPROXIMATION described above).
     pub fn find_blockers_placed(&mut self, table: &SliceTable, me: &LaneSelf, cars: &[LaneCar], pers: &Personality, positions: Option<(glam::Vec3, &[glam::Vec3])>, places: Option<(usize, &[usize])>) {
+        self.find_blockers_buffered(&mut Vec::new(), table, me, cars, pers, positions, places)
+    }
+
+    /// [`Self::find_blockers_placed`] with the walk's index buffer supplied by the caller
+    /// ([`LanePassCtx`]), so a pass allocates nothing; the buffer's contents on entry are ignored.
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_blockers_buffered(&mut self, sorted: &mut Vec<usize>, table: &SliceTable, me: &LaneSelf, cars: &[LaneCar], pers: &Personality, positions: Option<(glam::Vec3, &[glam::Vec3])>, places: Option<(usize, &[usize])>) {
         self.hard = [me.target_speed; 3];
         self.soft = [me.target_speed; 3];
         self.blocker = [None; 3];
@@ -265,7 +325,8 @@ impl LaneScratch {
         };
         let key = |slice: usize, p: Option<glam::Vec3>| (table.route_pos.get(slice).copied().unwrap_or(0), p.map_or(f32::NEG_INFINITY, |p| along(slice, p)));
         let pos_of = |i: usize| positions.and_then(|(_, ps)| ps.get(i).copied());
-        let mut sorted: Vec<usize> = (0..cars.len()).collect();
+        sorted.clear();
+        sorted.extend(0..cars.len());
         let own = match places.filter(|(_, p)| p.len() == cars.len()) {
             // the array itself: the others by their `car+0x528`, and this car's own place among them
             Some((mine, p)) => {
@@ -646,36 +707,17 @@ impl LaneScratch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::race::{Section, SLICE_SPACING};
+    use crate::test_support::Road;
     use glam::Vec3;
 
     fn ring(n: usize, lanes_a: u32, lanes_b: u32) -> SliceTable {
-        let r = n as f32 * SLICE_SPACING / std::f32::consts::TAU;
-        let slices = (0..n)
-            .map(|i| {
-                let a = i as f32 / n as f32 * std::f32::consts::TAU;
-                let forward = Vec3::new(-a.sin(), 0.0, a.cos());
-                let mut mask = 0;
-                for l in (6 - lanes_a as i32)..=(lanes_b as i32 + 7) {
-                    mask |= lane_bit(l);
-                }
-                Slice {
-                    centre: Vec3::new(a.cos() * r, 0.0, a.sin() * r),
-                    up: Vec3::Y,
-                    forward,
-                    lateral: Vec3::Y.cross(forward),
-                    lane_mask: mask,
-                    lanes_a,
-                    lanes_b,
-                    // a real road has a shoulder beyond the marked lanes
-                    width_a: lanes_a as f32 * 4.0 + 3.0,
-                    width_b: lanes_b as f32 * 4.0 + 3.0,
-                    lane_width_a: 4.0,
-                    lane_width_b: 4.0,
-                }
-            })
-            .collect();
-        SliceTable::build(slices, vec![Section { first: 0, last: n - 1, f0: 0.0, f1: 1.0 }])
+        let mut lane_mask = 0;
+        for l in (6 - lanes_a as i32)..=(lanes_b as i32 + 7) {
+            lane_mask |= lane_bit(l);
+        }
+        // a real road has a shoulder beyond the marked lanes
+        let road = Road { lane_mask, lanes_a, lanes_b, width_a: lanes_a as f32 * 4.0 + 3.0, width_b: lanes_b as f32 * 4.0 + 3.0, lane_width_a: 4.0, lane_width_b: 4.0 };
+        crate::test_support::ring_of(n, road)
     }
 
     fn me(lane: i32, lateral: f32) -> LaneSelf {
@@ -918,5 +960,47 @@ mod tests {
         let mut s2 = LaneScratch::default();
         s2.score_own_side(&m, true, true);
         assert_eq!(s2.score, [0.0; 3]);
+    }
+
+    /// The pass context keeps the registration order (the others first, then the own cars less the
+    /// one scored), the places whole, a NaN where the caller gave no position, and drives the same
+    /// walk as the hand-built lists did.
+    #[test]
+    fn the_pass_context_lists_the_others_then_the_own_cars() {
+        let t = ring(400, 2, 2);
+        let mk = |slice: usize, lateral: f32| LaneCar { slice, lane: 8, lane_mask: lane_bit(8), speed: 4.0, speed_est: 4.0, half_len: 2.1, lateral, half_span: 0.9, is_human: false, is_racer: false };
+        let others = [mk(12, 6.0), mk(14, 6.0)];
+        let own = [(mk(20, 6.0), 7usize, Vec3::new(1.0, 0.0, 0.0)), (mk(22, 6.0), 8, Vec3::new(2.0, 0.0, 0.0))];
+        let mut ctx = LanePassCtx::default();
+        // places for both others, a position for the first only
+        ctx.fill(&others, &[3, 4], &[Vec3::new(9.0, 0.0, 0.0)], own.iter().copied());
+        assert_eq!(ctx.cars.iter().map(|c| c.slice).collect::<Vec<_>>(), [12, 14, 20, 22]);
+        assert_eq!(ctx.places, [3, 4, 7, 8]);
+        assert!(ctx.placed);
+        assert_eq!(ctx.positions[0], Vec3::new(9.0, 0.0, 0.0));
+        assert!(ctx.positions[1].is_nan() && ctx.positions[1].x.is_nan());
+        assert_eq!(ctx.positions[2], Vec3::new(1.0, 0.0, 0.0));
+        assert!(!ctx.fine_ok(), "a missing position switches the fine step off");
+        // shorter places: the walk sorts the cars itself; the places are still taken whole
+        ctx.fill(&others, &[3], &[], own.iter().copied());
+        assert_eq!((ctx.placed, ctx.places.clone()), (false, vec![3, 7, 8]));
+        // a refill drops the previous car's lists
+        ctx.fill(&[], &[], &[], std::iter::empty());
+        assert!(ctx.cars.is_empty() && ctx.places.is_empty() && ctx.positions.is_empty() && ctx.fine_ok());
+
+        // the walk through the context is the walk through the explicit lists
+        let m = me(8, 6.0);
+        let positions: Vec<Vec3> = (0..4).map(|k| t.slices[12 + 2 * k].centre).collect();
+        let mut ctx = LanePassCtx::default();
+        ctx.fill(&others, &[2, 3], &positions[..2], own.iter().map(|&(c, p, _)| (c, p, t.slices[c.slice].centre)));
+        let cars: Vec<LaneCar> = others.iter().copied().chain(own.iter().map(|o| o.0)).collect();
+        let places = [2usize, 3, 7, 8];
+        let ps: Vec<Vec3> = positions[..2].iter().copied().chain(own.iter().map(|o| t.slices[o.0.slice].centre)).collect();
+        let mut want = LaneScratch::default();
+        want.find_blockers_placed(&t, &m, &cars, &PERSONALITIES[0], Some((t.slices[10].centre, &ps)), Some((5, &places)));
+        let mut got = LaneScratch::default();
+        ctx.find_blockers(&mut got, &t, &m, t.slices[10].centre, 5);
+        assert_eq!(got, want);
+        assert!(got.blocker[1].is_some(), "the fixture has a blocker ahead");
     }
 }

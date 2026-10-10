@@ -157,7 +157,7 @@ pub fn player_in(id: i32, name: &[u8]) -> Vec<u8> {
 /// session number (0x490AF0, the first room 1). Two senders: **0x48BD10 / 0x48BD80** in the admission 0x48BB50 (to the
 /// newcomer alone, the count before it) and **0x48BAA0**, which **0x490B70** calls for every player record of the manager's list
 /// `mgr+0x164` — every connected player, the host's own included — after each change of `room+0xAC`: the admission (0x48BCEE, count
-/// + 1), a player out of the room 0x48BDA0 (0x48BEC8, count − 1; the disconnect 0x492770 takes the record off `+0x164` first) and
+/// plus 1), a player out of the room 0x48BDA0 (0x48BEC8, count − 1; the disconnect 0x492770 takes the record off `+0x164` first) and
 /// the room's creation (0x491467 / 0x491A81).
 pub fn description(value: i32, name: &[u8; 32], bytes: [u8; 4], words: [u16; 2], count: u32) -> Vec<u8> {
     let mut m = vec![kind::DESCRIPTION];

@@ -17,6 +17,9 @@
 
 use crate::{u32_be, FormatError};
 
+/// The file magic.
+pub const MAGIC: &[u8; 4] = b"BIGF";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BigfEntry {
     pub name: String,
@@ -31,20 +34,26 @@ pub struct Bigf {
     pub entries: Vec<BigfEntry>,
 }
 
+/// `entry`'s byte range, with the end computed in `usize` (two `u32`s can overflow their own width).
+fn entry_bytes<'a>(data: &'a [u8], entry: &BigfEntry) -> Option<&'a [u8]> {
+    let start = entry.offset as usize;
+    data.get(start..start.checked_add(entry.size as usize)?)
+}
+
 impl Bigf {
     pub fn parse(data: &[u8]) -> Result<Self, FormatError> {
-        if data.get(0..4) != Some(b"BIGF") {
+        if data.get(0..4) != Some(MAGIC) {
             return Err(FormatError::UnknownMagic {
                 what: "BIGF",
                 offset: 0,
-                expected: b"BIGF".to_vec(),
+                expected: MAGIC.to_vec(),
                 found: data.iter().take(4).copied().collect(),
             });
         }
         let declared_size = u32_be(data, 4, "BIGF size")?;
         let count = u32_be(data, 8, "BIGF count")?;
         let header_size = u32_be(data, 12, "BIGF header size")?;
-        let mut entries = Vec::with_capacity(count as usize);
+        let mut entries = Vec::with_capacity(crate::cap_hint(count as usize, data.len(), 9));
         let mut pos = 16usize;
         for _ in 0..count {
             let offset = u32_be(data, pos, "BIGF entry offset")?;
@@ -65,14 +74,15 @@ impl Bigf {
         Ok(Self { declared_size, header_size, entries })
     }
 
+    /// The named entry's bytes (`None` for an unknown name, or when `data` is shorter than the
+    /// entry says).
     pub fn get<'a>(&self, data: &'a [u8], name: &str) -> Option<&'a [u8]> {
-        self.entries
-            .iter()
-            .find(|e| e.name.eq_ignore_ascii_case(name))
-            .map(|e| &data[e.offset as usize..(e.offset + e.size) as usize])
+        self.entries.iter().find(|e| e.name.eq_ignore_ascii_case(name)).and_then(|e| entry_bytes(data, e))
     }
 
+    /// The entry's bytes out of the archive `data` this was parsed from. An empty slice when `data`
+    /// is shorter than the entry says (it cannot be, for the buffer [`Bigf::parse`] checked).
     pub fn data<'a>(&self, data: &'a [u8], entry: &BigfEntry) -> &'a [u8] {
-        &data[entry.offset as usize..(entry.offset + entry.size) as usize]
+        entry_bytes(data, entry).unwrap_or_default()
     }
 }

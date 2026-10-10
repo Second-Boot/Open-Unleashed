@@ -5,6 +5,17 @@ use nfs_formats::sim::CarSim;
 
 pub const GRAVITY: f32 = 9.8;
 
+/// `part+0x26`, the part type the part-damage getters select on (`physics.md` §10).
+pub mod part_kind {
+    pub const ENGINE: u16 = 1;
+    pub const BRAKES: u16 = 2;
+    pub const GEARBOX: u16 = 3;
+    /// The three suspension types the getter 0x493BC0 sums (its names are not told apart).
+    pub const SUSPENSION: [u16; 3] = [4, 5, 8];
+    pub const AERO: u16 = 6;
+    pub const TYRES: u16 = 9;
+}
+
 /// One entry of the car's installed-part list `car+0x768` (twenty pointers to 0x168-byte part
 /// records, `loaders.md` §1) as the part-damage getters read it (`physics.md` §10, CONFIRMED —
 /// 0x4938A0, 0x493980, 0x493A10, 0x493AA0, 0x493B30, 0x493BC0 read to the instruction 2026-09-26):
@@ -56,7 +67,14 @@ pub fn fallback_parts() -> Vec<InstalledPart> {
     let corners = [true, false, true, false, true, false, true, false, false, false];
     let rear = [false, false, false, false, true, true, true, false, false, false];
     let aero = [true, true, true, false, true, true, true, false, false, false];
-    [(1, rear), (2, corners), (3, rear), (4, corners), (6, aero), (9, corners)]
+    [
+        (part_kind::ENGINE, rear),
+        (part_kind::BRAKES, corners),
+        (part_kind::GEARBOX, rear),
+        (part_kind::SUSPENSION[0], corners),
+        (part_kind::AERO, aero),
+        (part_kind::TYRES, corners),
+    ]
         .into_iter()
         .map(|(kind, mask)| InstalledPart { kind, mask, scale: 1.5, state: 0.0, carried: 0.0 })
         .collect()

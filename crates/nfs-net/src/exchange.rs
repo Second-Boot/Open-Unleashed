@@ -41,6 +41,17 @@ pub const CMD_RESET: u8 = 5;
 /// The server's frame clock: one frame every `1000 / 16` ms — the room tick's `now << 4` against a
 /// counter that steps by `0x3E8` (0x48B7CD, 0x48B8C4).
 pub const FRAMES_PER_SECOND: u32 = 16;
+/// The unit every one of the exchange's clocks steps by — `0x3E8` (the room's beat and frame clocks,
+/// 0x48B7CD / 0x48B8C4, and the 128 Hz timer's model, 0x4A45D0): a millisecond count shifted left
+/// by 0, 4 or 5.
+pub const CLOCK_STEP: i32 = 1000;
+/// A frame's block is three bytes per player ([`Block`]).
+pub const BLOCK_BYTES: usize = 3;
+/// A sample's low three bits are the buttons; the command code rides bits 3…7 (`>> 3`).
+const BUTTONS_MASK: u8 = 7;
+/// `next ^ head` is a multiple of 128 when a player's next frame has fallen a whole ring behind
+/// (0x48B86D).
+const RING_MASK: u32 = RING as u32 - 1;
 
 // ---------------------------------------------------------------------------------------------
 // the ring — 0x415E00 / 0x415E80 / 0x415EF0
@@ -196,7 +207,7 @@ impl Sender {
         }
         if self.count != 0 {
             // 0x48ED73: the store arm
-            self.avg = [s[1], s[2], s[3], s[0] & 7];
+            self.avg = [s[1], s[2], s[3], s[0] & BUTTONS_MASK];
             self.count = 0;
             self.taken = self.taken.wrapping_add(1);
             return None;
@@ -206,7 +217,7 @@ impl Sender {
         self.avg[0] = ((sum - (sum >> 31)) >> 1) as u8;
         self.avg[1] = ((u32::from(self.avg[1]) + u32::from(s[2])) >> 1) as u8;
         self.avg[2] = ((u32::from(self.avg[2]) + u32::from(s[3])) >> 1) as u8;
-        self.avg[3] |= s[0] & 7;
+        self.avg[3] |= s[0] & BUTTONS_MASK;
         let mut b = [self.avg[3], 0, 0];
         if let Some(c) = self.commands.pop_front() {
             b[0] |= c << 3;
@@ -238,7 +249,7 @@ impl Sender {
 /// ```
 pub fn decode(b: Block, second: bool) -> Sample {
     [
-        if second { b[0] & 7 } else { b[0] & 0xFB },
+        if second { b[0] & BUTTONS_MASK } else { b[0] & 0xFB },
         (((b[1] as i8) >> 1) as u8) & 0xFE,
         ((b[1] & 3) << 5).wrapping_add((b[2] >> 3) & 0x1C),
         (b[2] & 0x1F) << 2,
@@ -323,7 +334,7 @@ impl Timer {
             iterations = 2;
             self.cool = 4;
         }
-        self.model = self.model.wrapping_add(iterations * 1000);
+        self.model = self.model.wrapping_add(iterations * CLOCK_STEP);
         let mut samples = 0;
         for _ in 0..iterations {
             self.c128 = self.c128.wrapping_add(1);
@@ -456,7 +467,7 @@ impl Client {
         }
         let s = &mut self.sender;
         for k in 0..SEATS {
-            let cl = pkt[3 * k] & 4 == 4;
+            let cl = pkt[BLOCK_BYTES * k] & 4 == 4;
             let al = s.bits[k];
             if k == me {
                 if cl == al && !s.armed {
@@ -475,7 +486,7 @@ impl Client {
         for second in [false, true] {
             for k in 0..SEATS {
                 let Some(p) = car(k).filter(|p| *p < SEATS) else { continue };
-                let b = [pkt[3 * k], pkt[3 * k + 1], pkt[3 * k + 2]];
+                let b = [pkt[BLOCK_BYTES * k], pkt[BLOCK_BYTES * k + 1], pkt[BLOCK_BYTES * k + 2]];
                 if !self.ring.push(p, decode(b, second)) && !self.failed {
                     self.failed = true;
                     self.stopped = true;
@@ -613,7 +624,7 @@ impl Server {
     /// filled, and the player's bit into `+0xCC1`.
     pub fn input(&mut self, slot: usize, block: Block) {
         let f = &mut self.frames[(self.head as usize) & (RING - 1)];
-        f[3 * slot..3 * slot + 3].copy_from_slice(&block);
+        f[BLOCK_BYTES * slot..BLOCK_BYTES * slot + BLOCK_BYTES].copy_from_slice(&block);
         self.got |= 1 << slot;
     }
 
@@ -658,7 +669,7 @@ impl Server {
         if ms.wrapping_sub(self.next_beat) > 0 {
             loop {
                 out.push(Out::Beat { now });
-                self.next_beat = self.next_beat.wrapping_add(1000);
+                self.next_beat = self.next_beat.wrapping_add(CLOCK_STEP);
                 if ms.wrapping_sub(self.next_beat) <= 0 {
                     break;
                 }
@@ -685,15 +696,15 @@ impl Server {
                     continue;
                 }
                 let f = &mut self.frames[nxt];
-                f[3 * k] &= 7;
+                f[BLOCK_BYTES * k] &= BUTTONS_MASK;
                 if self.not_ready & (1 << k) != 0 {
-                    f[3 * k..3 * k + 3].copy_from_slice(&ABSENT);
-                } else if (self.next[k] ^ self.head) & 0x7F == 0 {
+                    f[BLOCK_BYTES * k..BLOCK_BYTES * k + BLOCK_BYTES].copy_from_slice(&ABSENT);
+                } else if (self.next[k] ^ self.head) & RING_MASK == 0 {
                     out.push(Out::Drop { slot: k });
                     dropped.push(k);
                 }
             }
-            self.clock16 = self.clock16.wrapping_add(1000);
+            self.clock16 = self.clock16.wrapping_add(CLOCK_STEP);
         }
         // 0x48B8E0…0x48B99C
         let t32 = ms.wrapping_shl(5);
@@ -710,7 +721,7 @@ impl Server {
                     self.next[k] = self.next[k].wrapping_add(1);
                 }
             }
-            self.clock32 = self.clock32.wrapping_add(1000);
+            self.clock32 = self.clock32.wrapping_add(CLOCK_STEP);
         }
         out
     }
@@ -718,7 +729,7 @@ impl Server {
     /// The block of the frame at `index` for `slot` (a test's and a log's view).
     pub fn block(&self, index: u32, slot: usize) -> Block {
         let f = &self.frames[(index as usize) & (RING - 1)];
-        [f[3 * slot], f[3 * slot + 1], f[3 * slot + 2]]
+        [f[BLOCK_BYTES * slot], f[BLOCK_BYTES * slot + 1], f[BLOCK_BYTES * slot + 2]]
     }
 }
 
@@ -729,28 +740,28 @@ impl Server {
 /// `0xC4`, the heartbeat: `0x48C870` builds `[0xC4, 0, 0, 0]` and the word — the host's clock — at
 /// `+4` (0x48B71E…0x48B73A).
 pub fn beat(now: u32) -> Vec<u8> {
-    crate::room::encode(0xC4, Some(0), Some(now), None)
+    crate::room::encode(crate::msg::kind::HEARTBEAT, Some(0), Some(now), None)
 }
 
 /// `0xC5` from a player to the host (0x48D3A0): the type byte alone (`value` and `word` omitted).
 pub fn go_request() -> Vec<u8> {
-    crate::room::encode(0xC5, None, None, None)
+    crate::room::encode(crate::msg::kind::GO, None, None, None)
 }
 
 /// `0xC5` from the host to everybody (0x48BFDC…0x48BFEA): `(0, now)` — the exchange starts.
 pub fn go(now: u32) -> Vec<u8> {
-    crate::room::encode(0xC5, Some(0), Some(now), None)
+    crate::room::encode(crate::msg::kind::GO, Some(0), Some(now), None)
 }
 
 /// `0xB3` from a player to the host (0x48D370): the request that puts it in the race.
 pub fn ready_request() -> Vec<u8> {
-    crate::room::encode(0xB3, None, None, None)
+    crate::room::encode(crate::msg::kind::START, None, None, None)
 }
 
 /// `0xB7 (id, word)` — a player's report (0x48C220 to everyone, 0x48DA60 from the player); the word
 /// `−2` is "left the race".
 pub fn report(id: i32, word: i32) -> Vec<u8> {
-    crate::room::encode(0xB7, Some(id), Some(word as u32), None)
+    crate::room::encode(crate::msg::kind::RACE_TIME, Some(id), Some(word as u32), None)
 }
 
 #[cfg(test)]
@@ -869,7 +880,7 @@ mod tests {
     fn frame_of(blocks: &[(usize, Block)]) -> [u8; FRAME] {
         let mut f = [0u8; FRAME];
         for (k, b) in blocks {
-            f[3 * k..3 * k + 3].copy_from_slice(b);
+            f[BLOCK_BYTES * k..BLOCK_BYTES * k + BLOCK_BYTES].copy_from_slice(b);
         }
         f
     }

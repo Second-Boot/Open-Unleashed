@@ -10,7 +10,8 @@
 //!   `min(127·slipSum, 127)` (rear × 0.5), pitch 1.0. CONFIRMED.
 //! * Gear-shift click: engine bank slot 2 (`engine::EngineSound::play_shift`).
 
-use crate::mixer::{AudioOutput, Clip, VoiceId};
+use crate::mixer::{byte_gain, AudioOutput, Clip, ClipCache, VoiceId, BEND_ROOT, LEVEL_MAX};
+use crate::voice_loop::{LoopCall, LoopVoice};
 use nfs_formats::bnk::Bnk;
 use std::collections::HashMap;
 use std::path::Path;
@@ -60,6 +61,18 @@ pub fn squeal_slot(tyre_class: usize, m: Material) -> usize {
         Earth => 0x2C,
     }
 }
+
+/// `SND_coll` slots of the loops: the road roll's base (`0x11 + nibble`, §4.5) and the wind.
+const SLOT_ROAD_BASE: usize = 0x11;
+const SLOT_WIND: usize = 0x1F;
+/// The turbo / blower (voice 0, §4.6).
+const SLOT_TURBO: usize = 0x0F;
+/// The first collision-group slot: from here 0x4A9A56 scales a one-shot by the tunnel and takes
+/// the aux byte.
+const FIRST_COLLISION_SLOT: usize = 0x30;
+/// 0x4A9A56…0x4A9A90's `0x96 − reverb` and its divisor `150`.
+const TUNNEL_REVERB_SPAN: i32 = 0x96;
+const _: () = assert!(SLOT_ROAD_BASE == 0x11 && SLOT_WIND == 0x1F && FIRST_COLLISION_SLOT == GROUP_CAR_CAR && TUNNEL_REVERB_SPAN == 150);
 
 /// One-shot slot group bases (§3).
 pub const GROUP_CAR_CAR: usize = 0x30;
@@ -295,8 +308,8 @@ impl WindWalk {
     pub fn step(&mut self, draw: &mut impl FnMut() -> u32) {
         self.level = self.level.wrapping_add(self.level_step);
         self.pitch = self.pitch.wrapping_add(self.pitch_step);
-        if self.level > 0x7F {
-            self.level = 0x7F;
+        if self.level > LEVEL_MAX {
+            self.level = LEVEL_MAX;
             self.level_step = -1 - (draw() & 7) as i32;
         }
         if self.level < 0x28 {
@@ -320,22 +333,22 @@ pub struct CollisionSfx {
     pub filter: Option<i32>,
     bank: Bnk,
     data: Vec<u8>,
-    clips: HashMap<usize, Arc<Clip>>,
+    clips: ClipCache<usize>,
     /// last random pick per group base (no-repeat rule 0x4A9380)
     last_pick: HashMap<usize, u8>,
     rng: u32,
     /// per-frame level gate `0x656860` (level >> 4)
     gate: i32,
-    front: Option<(VoiceId, usize)>,
-    rear: Option<(VoiceId, usize)>,
+    front: Option<LoopVoice>,
+    rear: Option<LoopVoice>,
     /// road / tyre roll loop (voice 0x18, §4.4) and the slot it is playing
-    road: Option<(VoiceId, usize)>,
+    road: Option<LoopVoice>,
     /// wind loop (voice 0x1A, slot 0x1F, §4.5)
-    wind: Option<VoiceId>,
+    wind: Option<LoopVoice>,
     /// the wind's two random walks ([`WindWalk`])
     wind_walk: WindWalk,
     /// turbo / blower loop (voice 0, slot 0x0F, §4.6)
-    turbo: Option<VoiceId>,
+    turbo: Option<LoopVoice>,
     /// the police sirens by audio slot (`0x6562E8[slot]`, started by 0x4AAE90)
     sirens: HashMap<usize, VoiceId>,
     /// `game.spl[5]` `[0x5D14C4]` — the siren's mix level
@@ -357,7 +370,7 @@ pub struct CollisionSfx {
     one_shot_pan: u16,
     /// the slot cars' loop voices `slot + 0x22` by audio slot: the voice, the `SND_coll` slot it
     /// plays (`[0x656184 + 8·voice]`) and the bend byte latched when it started (`0x5D17E8[voice]`)
-    ai_loops: HashMap<usize, (VoiceId, usize, i32)>,
+    ai_loops: HashMap<usize, LoopVoice>,
 }
 
 /// 0x4A98E0 / 0x4A9C10's mixer volume `(categoryLevel · game.spl[k] · vol · 85) >> 21` — `imul`s,
@@ -436,7 +449,7 @@ pub fn turbo_terms(boost: f32, throttle: u8, rpm: f32, redline: f32, lvl: i32, p
     let fg = f0 * (x / den);
     let pitch = ((dbs * 2.5 / r + 0.5) * pitch_base as f64) as f32;
     let vol = ((lvl as f64 * fg) as f32).round_ties_even() as i32;
-    let vol = vol.min(0x7F).max(0);
+    let vol = vol.min(LEVEL_MAX).max(0);
     (vol, pitch.round_ties_even() as i32)
 }
 
@@ -454,7 +467,7 @@ const SIREN_START_BEND: u8 = 0x20;
 pub fn siren_bend(pitch_base: i32) -> u8 {
     let x = pitch_base.wrapping_shl(6);
     let q = (x + ((x >> 31) & 0xFFFF)) >> 16;
-    q.clamp(0, 0x7F) as u8
+    q.clamp(0, LEVEL_MAX) as u8
 }
 
 /// The siren sample 0x4AAE90 picks: slot 9 for a car with `0x52C & 0x40` (no cop has it in this
@@ -548,7 +561,7 @@ pub fn road_volume(a: i32, v: i32, half: bool) -> i32 {
 /// The `· 4` is applied before the floor (0x4A93F1 `shl eax, 2` ahead of the `>> 16`,
 /// `crate::fix_atten`); the port took `4 · floor(2048/(d+1))` until 2026-09-26.
 fn atten_for(d: f32, view_0c: bool) -> i32 {
-    if view_0c { crate::fix_atten(0x800_0000, 0x1_0000, 2, d) } else { crate::fix_atten(0x200_0000, 0x2_0000, 0, d) }
+    if view_0c { crate::ATTEN_VIEW_0C.at(d) } else { crate::ATTEN_ONE_SHOT.at(d) }
 }
 
 impl CollisionSfx {
@@ -557,11 +570,13 @@ impl CollisionSfx {
         let data = std::fs::read(&path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         let bank = Bnk::parse(&data)?;
         tracing::info!(slots = bank.slot_count(), "collision bank loaded");
+        // `game.spl` read once for both
+        let spl = nfs_formats::spl::GameSpl::load(sounds_dir);
         Ok(Self {
             filter: None,
             bank,
             data,
-            clips: HashMap::new(),
+            clips: ClipCache::new(false),
             last_pick: HashMap::new(),
             rng: 0x2545_F491,
             gate: 0,
@@ -573,8 +588,8 @@ impl CollisionSfx {
             wind_walk: WindWalk::default(),
             turbo: None,
             sirens: HashMap::new(),
-            siren_trim: nfs_formats::spl::GameSpl::load(sounds_dir).loops_6564d0(),
-            spl: nfs_formats::spl::GameSpl::load(sounds_dir),
+            siren_trim: spl.loops_6564d0(),
+            spl,
             sfx_level: 127,
             engine_level: 127,
             reverb: 8,
@@ -586,13 +601,8 @@ impl CollisionSfx {
     }
 
     fn clip(&mut self, slot: usize) -> Option<Arc<Clip>> {
-        if let Some(c) = self.clips.get(&slot) {
-            return Some(c.clone());
-        }
-        let pcm = self.bank.decode_slot(&self.data, slot).ok()?;
-        let clip = Arc::new(Clip::from_pcm(pcm));
-        self.clips.insert(slot, clip.clone());
-        Some(clip)
+        let (bank, data) = (&self.bank, &self.data);
+        self.clips.get_or_load(slot, || Some(Arc::new(Clip::from_pcm(bank.decode_slot(data, slot).ok()?))))
     }
 
     fn rand(&mut self) -> u32 {
@@ -665,7 +675,7 @@ impl CollisionSfx {
 
     /// The default category, `SfxLevel · game.spl[9]` — everything in this bank but the slots below.
     fn sfx_volume(&self, vol: i32) -> f32 {
-        category(self.sfx_level, self.spl.sfx(), vol) as f32 / 127.0
+        byte_gain(category(self.sfx_level, self.spl.sfx(), vol))
     }
 
     /// A one-shot's volume byte (0x4A98E0): the default category (0x4A9A49…0x4A9A59, stored as
@@ -675,8 +685,8 @@ impl CollisionSfx {
     /// 100) is a third as loud as outside (8).
     fn one_shot_volume(&self, slot: usize, vol: i32) -> f32 {
         let b = category(self.sfx_level, self.spl.sfx(), vol) as i8 as i32;
-        let b = if slot >= 0x30 { ((0x96 - self.reverb) * b / 150) as i8 as i32 } else { b };
-        b as f32 / 127.0
+        let b = if slot >= FIRST_COLLISION_SLOT { ((TUNNEL_REVERB_SPAN - self.reverb) * b / TUNNEL_REVERB_SPAN) as i8 as i32 } else { b };
+        byte_gain(b)
     }
 
     /// Call once per audio update: the one-shot gate decays by one.
@@ -706,10 +716,10 @@ impl CollisionSfx {
         self.gate = (level as i32) >> 4;
         let vol = self.atten.clamp(0, 127);
         if let Some(clip) = self.clip(slot) {
-            let id = out.play_word_sel_untabled(clip, self.one_shot_volume(slot, vol), crate::resample::PITCH_UNIT, 0x40, self.one_shot_pan, false, level as i32 as u8);
+            let id = out.play_word_sel_untabled(clip, self.one_shot_volume(slot, vol), crate::resample::PITCH_UNIT, BEND_ROOT, self.one_shot_pan, false, level as i32 as u8);
             // the aux byte is taken only for slots from 0x30 (0x4A9A56 `jl`), which every
             // collision group is
-            if slot >= 0x30 {
+            if slot >= FIRST_COLLISION_SLOT {
                 out.set_fx_aux(id, level as i32 as u8);
             }
         }
@@ -822,7 +832,7 @@ impl CollisionSfx {
     /// `Voice_play` call, so not in the pause's table (`AudioOutput::silence_voices`).
     pub fn trigger_chime(&mut self, out: &AudioOutput) {
         if let Some(clip) = self.clip(2) {
-            out.play_word_untabled(clip, self.sfx_volume(0x7F), crate::resample::PITCH_UNIT, 0x40, 0, false);
+            out.play_word_untabled(clip, self.sfx_volume(LEVEL_MAX), crate::resample::PITCH_UNIT, BEND_ROOT, 0, false);
         }
     }
 
@@ -830,7 +840,7 @@ impl CollisionSfx {
     /// direct `Bank_playOneShot` path as [`trigger_chime`](Self::trigger_chime), not in the table.
     pub fn wrong_way_cue(&mut self, out: &AudioOutput) {
         if let Some(clip) = self.clip(1) {
-            out.play_word_untabled(clip, self.sfx_volume(0x28), crate::resample::PITCH_UNIT, 0x40, 0, false);
+            out.play_word_untabled(clip, self.sfx_volume(0x28), crate::resample::PITCH_UNIT, BEND_ROOT, 0, false);
         }
     }
 
@@ -860,7 +870,7 @@ impl CollisionSfx {
             Some(&id) => {
                 let v = siren_volume(distance);
                 let vol = category(ambient_level, self.siren_trim, v);
-                out.set_word(id, vol as f32 / 127.0, SIREN_WORD, siren_bend(pitch_base));
+                out.set_word(id, byte_gain(vol), SIREN_WORD, siren_bend(pitch_base));
                 out.set_pan(id, pan);
             }
             None => {
@@ -881,7 +891,7 @@ impl CollisionSfx {
     /// `Bank_playOneShot` path as [`trigger_chime`](Self::trigger_chime): not in the pause's table.
     pub fn pylon_hit(&mut self, out: &AudioOutput) {
         if let Some(clip) = self.clip(0) {
-            out.play_word_untabled(clip, self.sfx_volume(0x7F), crate::resample::PITCH_UNIT, 0x40, 0, false);
+            out.play_word_untabled(clip, self.sfx_volume(LEVEL_MAX), crate::resample::PITCH_UNIT, BEND_ROOT, 0, false);
         }
     }
 
@@ -947,35 +957,19 @@ impl CollisionSfx {
         let bend = ((v16 * 127 / 10) >> 16).min(127) as i32;
         let level = ((v16 * 127) >> 16).min(127) as i32;
         let vol = ((self.atten * level) >> 7).clamp(0, 127);
-        let voice = if which == 0 { &mut self.front } else { &mut self.rear };
+        let mut voice = if which == 0 { self.front } else { self.rear };
         if v <= 0.0 {
             // 0x4A956F / 0x4A97EF: 0x565DD0(h, 5, −1), the five-tick release (`mixer::Ramp`)
-            if let Some((id, _)) = voice.take() {
-                out.release(id);
-            }
-            return;
+            LoopVoice::release(&mut voice, out);
+        } else {
+            let amp = byte_gain(category(master.0, master.1, vol));
+            // the loops take the car's own pan (0x4A7C61 → 0x4A983A)
+            // 0x4A9840…0x4A9854: `Voice_play(voice, slot, bend, 0x10000, vol, pan, 0x7F)` — the word
+            // 0x1000, the bend byte on the voice
+            let call = LoopCall { slot, amp, word: WORD_UNIT, bend: bend as u8, pan: self.pan, filter: self.filter };
+            LoopVoice::drive(&mut voice, out, call, false, || self.clip(slot));
         }
-        let amp = category(master.0, master.1, vol) as f32 / 127.0;
-        // the loops take the car's own pan (0x4A7C61 → 0x4A983A)
-        let pan = self.pan;
-        // 0x4A9840…0x4A9854: `Voice_play(voice, slot, bend, 0x10000, vol, pan, 0x7F)` — the word
-        // 0x1000, the bend byte on the voice
-        match *voice {
-            Some((id, s)) if s == slot => {
-                out.set_word(id, amp, WORD_UNIT, bend as u8);
-                out.set_pan(id, pan);
-                out.voice_play_filter(id, self.filter);
-            }
-            other => {
-                // `Voice_play` with another sample on the voice: the old one's 25-tick release
-                // (0x4A9DA4) before the start
-                if let Some((id, _)) = other {
-                    out.release_replaced(id);
-                }
-                let voice_slot = self.clip(slot).map(|clip| (out.play_word(clip, amp, WORD_UNIT, bend as u8, pan, true), slot));
-                if which == 0 { self.front = voice_slot } else { self.rear = voice_slot }
-            }
-        }
+        if which == 0 { self.front = voice } else { self.rear = voice }
     }
 
 
@@ -1003,36 +997,23 @@ impl CollisionSfx {
     #[allow(clippy::too_many_arguments)]
     pub fn road_roll(&mut self, out: &AudioOutput, speed: f32, nibble: usize, a: i32, half: bool, pitch_base: i32, pan: u16) {
         let master = (self.sfx_level, self.spl.road_roll());
-        let slot = 0x11 + nibble.min(11);
+        let slot = SLOT_ROAD_BASE + nibble.min(11);
         let v = road_v(speed, nibble);
         let level = (v / 2 + 64).clamp(0, 127);
         let vol = road_volume(a, v, half);
+        let mut voice = self.road;
         if vol == 0 {
             // 0x4AA454: 0x565DD0(h, 5, −1)
-            if let Some((id, _)) = self.road.take() {
-                out.release(id);
-            }
-            return;
+            LoopVoice::release(&mut voice, out);
+        } else {
+            // `level` is the bend byte: the roll rises in pitch with speed
+            let amp = byte_gain(category(master.0, master.1, vol));
+            let word = (pitch_base >> 4) as u16;
+            // another surface's sample on voice 0x18: `Voice_play`'s 25-tick release (0x4A9DA4)
+            let call = LoopCall { slot, amp, word, bend: level as u8, pan, filter: self.filter };
+            LoopVoice::drive(&mut voice, out, call, false, || self.clip(slot));
         }
-        // `level` is the bend byte: the roll rises in pitch with speed
-        let amp = category(master.0, master.1, vol) as f32 / 127.0;
-        let word = (pitch_base >> 4) as u16;
-        match self.road {
-            Some((id, s)) if s == slot => {
-                out.set_word(id, amp, word, level as u8);
-                out.set_pan(id, pan);
-                out.voice_play_filter(id, self.filter);
-            }
-            _ => {
-                // another surface's sample on voice 0x18: `Voice_play`'s 25-tick release (0x4A9DA4)
-                if let Some((id, _)) = self.road.take() {
-                    out.release_replaced(id);
-                }
-                if let Some(c) = self.clip(slot) {
-                    self.road = Some((out.play_word(c, amp, word, level as u8, pan, true), slot));
-                }
-            }
-        }
+        self.road = voice;
     }
 
     /// §4.5 wind — voice 0x1A, `SND_coll` slot 0x1F. `active` is 0x4AA050's `[ebp+0x13]` (see
@@ -1061,32 +1042,23 @@ impl CollisionSfx {
     pub fn wind(&mut self, out: &AudioOutput, active: bool, speed_est: f32, road_speed: f32, nibble: usize, draw: &mut impl FnMut() -> u32) {
         let master = (self.sfx_level, self.spl.sfx());
         let s = (speed_est.abs() * 5.0) as i32;
+        let mut voice = self.wind;
         if !active || s == 0 {
             // 0x4AA5FF: 0x565DD0(h, 5, −1)
-            if let Some(id) = self.wind.take() {
-                out.release(id);
-            }
-            return;
+            LoopVoice::release(&mut voice, out);
+        } else {
+            // [0x5D1838] 0x28..0x7F, [0x5D183C] 0xFA24..0x105DC
+            self.wind_walk.step(draw);
+            let vol = ((s * self.wind_walk.level) >> 7).min(127);
+            let level = (road_v(road_speed, nibble) / 2 + 64).clamp(0, 127);
+            // `level` is the bend byte on top of the random-walk pitch
+            let amp = byte_gain(category(master.0, master.1, vol));
+            let word = (self.wind_walk.pitch >> 4) as u16;
+            // one sample on the voice, so the slot never differs; the pan angle is 0
+            let call = LoopCall { slot: SLOT_WIND, amp, word, bend: level as u8, pan: 0, filter: self.filter };
+            LoopVoice::drive(&mut voice, out, call, false, || self.clip(SLOT_WIND));
         }
-        // [0x5D1838] 0x28..0x7F, [0x5D183C] 0xFA24..0x105DC
-        self.wind_walk.step(draw);
-        let vol = ((s * self.wind_walk.level) >> 7).min(127);
-        let level = (road_v(road_speed, nibble) / 2 + 64).clamp(0, 127);
-        // `level` is the bend byte on top of the random-walk pitch
-        let amp = category(master.0, master.1, vol) as f32 / 127.0;
-        let word = (self.wind_walk.pitch >> 4) as u16;
-        match self.wind {
-            Some(id) => {
-                out.set_word(id, amp, word, level as u8);
-                out.set_pan(id, 0);
-                out.voice_play_filter(id, self.filter);
-            }
-            None => {
-                if let Some(c) = self.clip(0x1F) {
-                    self.wind = Some(out.play_word(c, amp, word, level as u8, 0, true));
-                }
-            }
-        }
+        self.wind = voice;
     }
 
     /// §4.6 turbo / blower — voice 0, `SND_coll` slot 0x0F. `boost` is the turbo state `car+0x54C`,
@@ -1111,30 +1083,21 @@ impl CollisionSfx {
     #[allow(clippy::too_many_arguments)]
     pub fn turbo(&mut self, out: &AudioOutput, boost: f32, throttle: u8, rpm: f32, redline: f32, base: i32, gain: i32, pitch_base: i32, pan: u16) {
         let master = (self.engine_level, self.spl.turbo());
+        let mut voice = self.turbo;
         if boost <= 0.1 || redline <= 0.0 {
             // 0x4AA869: 0x565DD0(h, 5, −1)
-            if let Some(id) = self.turbo.take() {
-                out.release(id);
-            }
-            return;
+            LoopVoice::release(&mut voice, out);
+        } else {
+            // 0x4AA70F…0x4AA72E: `min(auxVolume(mode) · gain >> 7, 0x7F)`
+            let lvl = (base.wrapping_mul(gain) >> 7).min(127);
+            let (vol, pitch) = turbo_terms(boost, throttle, rpm, redline, lvl, pitch_base);
+            let word = (pitch >> 4) as u16;
+            let amp = byte_gain(category(master.0, master.1, vol));
+            // one sample on the voice, so the slot never differs
+            let call = LoopCall { slot: SLOT_TURBO, amp, word, bend: BEND_ROOT, pan, filter: self.filter };
+            LoopVoice::drive(&mut voice, out, call, false, || self.clip(SLOT_TURBO));
         }
-        // 0x4AA70F…0x4AA72E: `min(auxVolume(mode) · gain >> 7, 0x7F)`
-        let lvl = (base.wrapping_mul(gain) >> 7).min(127);
-        let (vol, pitch) = turbo_terms(boost, throttle, rpm, redline, lvl, pitch_base);
-        let word = (pitch >> 4) as u16;
-        let amp = category(master.0, master.1, vol) as f32 / 127.0;
-        match self.turbo {
-            Some(id) => {
-                out.set_word(id, amp, word, 0x40);
-                out.set_pan(id, pan);
-                out.voice_play_filter(id, self.filter);
-            }
-            None => {
-                if let Some(c) = self.clip(0x0F) {
-                    self.turbo = Some(out.play_word(c, amp, word, 0x40, pan, true));
-                }
-            }
-        }
+        self.turbo = voice;
     }
 
     /// **The AI cars' queue drain, 0x4A73DE…0x4A7458 inside `Audio_updateAiCar` 0x4A7080** — read
@@ -1189,55 +1152,44 @@ impl CollisionSfx {
             return;
         }
         let amp = self.sfx_volume(self.atten.clamp(0, 127));
-        let pan = self.pan;
-        match self.ai_loops.get(&audio_slot).copied() {
-            Some((id, s, bend)) if s == sample => {
-                out.set_word(id, amp, WORD_UNIT, bend as u8);
-                out.set_pan(id, pan);
-                out.voice_play_filter(id, self.filter);
+        // 0x4A9663…0x4A9687: `min(mag·127/10 >> 16, 127)` from the 16.16 magnitude, latched when
+        // the voice starts (an update keeps the one it started with)
+        let v16 = (v * 65536.0) as i64;
+        let bend = ((v16 * 127 / 10) >> 16).min(127) as i32;
+        let mut voice = self.ai_loops.get(&audio_slot).copied();
+        let call = LoopCall { slot: sample, amp, word: WORD_UNIT, bend: bend as u8, pan: self.pan, filter: self.filter };
+        LoopVoice::drive(&mut voice, out, call, true, || {
+            let clip = self.clip(sample);
+            if clip.is_some() {
+                tracing::debug!(audio_slot, sample, bend, amp, "ai loop start (voice slot + 0x22)");
             }
-            other => {
-                // another sample on voice `slot + 0x22`: `Voice_play`'s 25-tick release (0x4A9DA4)
-                if let Some((id, ..)) = other {
-                    out.release_replaced(id);
-                    self.ai_loops.remove(&audio_slot);
-                }
-                // 0x4A9663…0x4A9687: `min(mag·127/10 >> 16, 127)` from the 16.16 magnitude
-                let v16 = (v * 65536.0) as i64;
-                let bend = ((v16 * 127 / 10) >> 16).min(127) as i32;
-                if let Some(clip) = self.clip(sample) {
-                    tracing::debug!(audio_slot, sample, bend, amp, "ai loop start (voice slot + 0x22)");
-                    self.ai_loops.insert(audio_slot, (out.play_word(clip, amp, WORD_UNIT, bend as u8, pan, true), sample, bend));
-                }
-            }
-        }
+            clip
+        });
+        match voice {
+            Some(v) => self.ai_loops.insert(audio_slot, v),
+            None => self.ai_loops.remove(&audio_slot),
+        };
     }
 
     /// 0x4A9890 on voice `slot + 0x22`: a slot car's loop released — by a stop entry, or by
     /// 0x4A7DC0 when the slot loses its car (0x4A7FF8 / 0x4A80BD).
     pub fn stop_ai_loop(&mut self, out: &AudioOutput, audio_slot: usize) {
-        if let Some((id, ..)) = self.ai_loops.remove(&audio_slot) {
+        if let Some(v) = self.ai_loops.remove(&audio_slot) {
             tracing::debug!(audio_slot, "ai loop release (voice slot + 0x22)");
             // 0x4A98B4 / 0x4A9521: 0x565DD0(h, 5, −1)
-            out.release(id);
+            LoopVoice::release(&mut Some(v), out);
         }
     }
 
     pub fn stop_loops(&mut self, out: &AudioOutput) {
-        for v in [self.front.take(), self.rear.take()].into_iter().flatten() {
-            out.stop(v.0);
-        }
-        for id in [self.wind.take(), self.turbo.take()].into_iter().flatten() {
-            out.stop(id);
-        }
-        if let Some((id, _)) = self.road.take() {
-            out.stop(id);
+        for voice in [&mut self.front, &mut self.rear, &mut self.wind, &mut self.turbo, &mut self.road] {
+            LoopVoice::stop(voice, out);
         }
         for (_, id) in self.sirens.drain() {
             out.stop(id);
         }
-        for (_, (id, ..)) in self.ai_loops.drain() {
-            out.stop(id);
+        for (_, v) in self.ai_loops.drain() {
+            LoopVoice::stop(&mut Some(v), out);
         }
     }
 }

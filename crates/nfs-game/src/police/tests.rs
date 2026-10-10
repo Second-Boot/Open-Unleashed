@@ -1,30 +1,11 @@
 use super::*;
-use crate::race::{Section, Slice, SLICE_SPACING};
+use crate::race::Slice;
+use crate::test_support::Road;
 use glam::Vec3;
 use nfs_formats::cop::CopRecord;
 
 fn ring(n: usize) -> SliceTable {
-    let r = n as f32 * SLICE_SPACING / std::f32::consts::TAU;
-    let slices = (0..n)
-        .map(|i| {
-            let a = i as f32 / n as f32 * std::f32::consts::TAU;
-            let forward = Vec3::new(-a.sin(), 0.0, a.cos());
-            Slice {
-                centre: Vec3::new(a.cos() * r, 0.0, a.sin() * r),
-                up: Vec3::Y,
-                forward,
-                lateral: Vec3::Y.cross(forward),
-                lane_mask: 0,
-                lanes_a: 2,
-                lanes_b: 2,
-                width_a: 11.0,
-                width_b: 11.0,
-                lane_width_a: 4.0,
-                lane_width_b: 4.0,
-            }
-        })
-        .collect();
-    SliceTable::build(slices, vec![Section { first: 0, last: n - 1, f0: 0.0, f1: 1.0 }])
+    crate::test_support::ring_of(n, Road::two_lanes(11.0))
 }
 
 fn mgr(slices: &[i32], moving: bool) -> CopManager {
@@ -1224,4 +1205,119 @@ fn the_probability_matches_the_shipped_files() {
     // every other shipped track has 16 or fewer, so the roll always succeeds
     let c = mgr(&[100, 300, 500, 800, 1100], true);
     assert!(c.spawn_probability(false, 0) >= 1.0);
+}
+
+/// Refactor guard (2026-10-10, T1 a): traffic and cops share one ring for 600 ticks, each fed the
+/// other's lane cars, so every lane pass of both runs with the others' list, the places and the
+/// fine positions. Pins the draws of both generators (the set's own `Lcg` and the cops' closure) and
+/// the end poses — a rewrite of the per-car lane-pass context (cars / places / positions, their
+/// order, the skipped self) that changes one draw or one tie shows up here without game data.
+fn shared_ring_digest(with_places: bool) -> (u32, u32, u64) {
+    use crate::traffic::{CopView, Reference, TrafficSet};
+    let t = ring(200);
+    let mut set = TrafficSet::new(&crate::test_support::traffic_models(7), &t, 1.0, false, 12345);
+    set.slot_base = 3;
+    let file = CopFile { records: [10, 30, 150].iter().map(|&s| CopRecord::Point { kind: 1, slice: s, moving: true }).collect() };
+    let mut p = Police::new(file, (0..3).map(|_| cop(0.6, 1)).collect(), 0, false);
+    for i in 0..3 {
+        p.deploy(&t, i, i, 900);
+    }
+    chase_now(&mut p, 0);
+    let mut cop_rng = crate::traffic::Lcg::new(77);
+    for tick in 961u64..2161 {
+        let s = (tick as usize / 40) % 200;
+        let r = Reference { position: t.slices[s].centre, slice: s, laps: 0, speed: 20.0, dir: 1.0, honking: false };
+        let tgt = ChaseTarget { position: r.position, slice: s, lateral: 0.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
+        if tick % 2 == 0 {
+            // the lists each side is handed: the other set's cars, registration order
+            let cop_lane: Vec<LaneCar> = p.cars.iter().filter(|c| c.active).map(|c| c.as_lane_car(&t)).collect();
+            let traffic_lane: Vec<LaneCar> = set.cars.iter().filter(|c| c.active).map(|c| c.as_lane_car(&t)).collect();
+            if with_places {
+                set.other_positions = p.cars.iter().filter(|c| c.active).map(|c| c.position).collect();
+                set.other_places = (0..cop_lane.len()).map(|k| (10 - k) * 3 + (tick as usize / 2) % 3).collect();
+                p.other_positions = set.cars.iter().filter(|c| c.active).map(|c| c.position).collect();
+                p.other_places = (0..traffic_lane.len()).map(|k| (10 - k) * 2 + (tick as usize / 2) % 2).collect();
+            }
+            set.cops = p.cars.iter().map(|c| CopView { slice: c.slice, speed: c.speed, in_world: c.active, has_target: c.chasing }).collect();
+            p.ai(&t, tick, &tgt, &traffic_lane, &[], &mut || cop_rng.rand16(), None);
+            set.ai(&t, tick, r, &cop_lane);
+        }
+        set.drive(&t, tick, r, None, &[]);
+        p.drive(&t, tick, None);
+        set.integrate(&t, 1.0 / 64.0);
+        p.integrate(&t, 1.0 / 64.0);
+    }
+    // the pose checksum: the f32 bits of every car's position and lateral, FNV-1a
+    let mut h = 0xCBF2_9CE4_8422_2325u64;
+    let mut eat = |x: u32| {
+        h ^= x as u64;
+        h = h.wrapping_mul(0x100_0000_01B3);
+    };
+    for c in &set.cars {
+        eat(c.active as u32);
+        eat(c.slice as u32);
+        for v in [c.position.x, c.position.y, c.position.z, c.lateral, c.speed, c.target_speed, c.lateral_target] {
+            eat(v.to_bits());
+        }
+    }
+    for c in &p.cars {
+        eat(c.active as u32);
+        eat(c.slice as u32);
+        for v in [c.position.x, c.position.y, c.position.z, c.lateral, c.speed, c.target_speed, c.lateral_target] {
+            eat(v.to_bits());
+        }
+    }
+    (set.rng.0, cop_rng.0, h)
+}
+
+#[test]
+fn traffic_and_cops_on_a_shared_ring_keep_their_draws_and_poses() {
+    let a = shared_ring_digest(false);
+    let b = shared_ring_digest(true);
+    assert_eq!(shared_ring_digest(false), a, "deterministic");
+    assert_eq!(a, (24509, 10773, 3543943248959768697));
+    assert_eq!(b, a, "the places and positions of the others change no draw here");
+}
+
+/// Timing of the shared-ring scenario (`cargo test -p nfs-game --lib -- --ignored --nocapture ring_timing`):
+/// the per-AI-pass allocations of the traffic and the cops show up here. Not an assertion.
+#[test]
+#[ignore]
+fn ring_timing() {
+    let t0 = std::time::Instant::now();
+    for _ in 0..20 {
+        shared_ring_digest(true);
+    }
+    eprintln!("ring_timing: {:?} for 20 x 1200 ticks", t0.elapsed());
+}
+
+/// Refactor guard (P4): `leading_racer` is the last of a stable ascending sort on the order key, so
+/// the later of equal keys wins. Compared with that definition (the old implementation, kept here as
+/// the reference) over every assignment of four key values — equal keys and a NaN among them — to up to
+/// six racers, and every starting order of the array.
+#[test]
+fn the_leading_racer_is_the_last_of_the_stable_sort() {
+    fn reference(order: &[usize], racers: &[RacerRef]) -> Option<usize> {
+        let mut order = order.to_vec();
+        stable_order(&mut order, racers, RacerRef::order_key);
+        order.last().copied()
+    }
+    let keys = [0.0f32, 1.0, 2.5, f32::NAN];
+    let mut checked = 0;
+    for n in 0..=5usize {
+        for code in 0..keys.len().pow(n as u32) {
+            let racers: Vec<RacerRef> = (0..n).map(|k| RacerRef { progress: keys[(code / keys.len().pow(k as u32)) % keys.len()], ..Default::default() }).collect();
+            // the identity order, its reverse and a rotation
+            let orders: Vec<Vec<usize>> = vec![(0..n).collect(), (0..n).rev().collect(), (0..n).map(|k| (k + 1) % n.max(1)).collect(), Vec::new()];
+            for order in orders {
+                let mut p = Police::new(CopFile { records: vec![] }, vec![], 0, false);
+                p.racers = racers.clone();
+                p.race_order = order.clone();
+                let want = reference(&order, &racers);
+                assert_eq!(p.leading_racer(), want, "keys {:?} order {order:?}", racers.iter().map(|r| r.progress).collect::<Vec<_>>());
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 5000);
 }

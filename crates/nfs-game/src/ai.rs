@@ -279,7 +279,7 @@ impl AiDriver {
     /// `mean + range·U(−1, 1)` exactly as 0x40BC70…0x40BCB3 builds it:
     /// `(mean − range) + rand16 · 2·range · 2⁻¹⁶`, one draw from the game's single stream.
     fn skill_draw(mean: f32, range: f32) -> f32 {
-        (mean - range) + crate::rng::rand16() as f32 * (range + range) * 1.525_878_9e-5
+        (mean - range) + crate::rng::rand16() as f32 * (range + range) * crate::rng::RAND16_TO_UNIT
     }
 
     /// The personal speed factor `car+0xEA0` (0x40BC61…0x40BF1D, audit 2026-09-26). `c3` is the
@@ -504,7 +504,7 @@ impl AiDriver {
         target *= 0.25;
         // avoidance (§10.2, CONFIRMED): racing cars stand off `t` metres from the centre of a car
         // beside or shortly ahead; the car two ahead is processed first, the car directly ahead last
-        let no_avoid = crate::config::cfg().nfs_ai_noavoid.var_os().is_some();
+        let no_avoid = crate::config::cfg().nfs_ai_noavoid.is_set();
         for &(opos, _oslice, ovlong, ohalf, _human) in ahead.iter().take(if no_avoid { 0 } else { 2 }).rev() {
             let dir = (target - v.position).normalize_or_zero();
             let d1 = opos - v.position;
@@ -541,7 +541,7 @@ impl AiDriver {
             let sl = &table.slices[ts];
             self.dbg_offset = (target - sl.centre).dot(sl.lateral);
         }
-        let steer = if crate::config::cfg().nfs_ai_flip.var_os().is_some() { -steer } else { steer };
+        let steer = if crate::config::cfg().nfs_ai_flip.is_set() { -steer } else { steer };
         // the stuck counter `car+0xEA4` (0x40C934): one tick per control tick under 2 m/s once the
         // race has started, cleared otherwise — and cleared for a racing car (`car+0x52C & 1`,
         // every opponent) that has finished or is out, `car+0xB50 >= 2` (0x40C922…0x40C932).
@@ -637,7 +637,7 @@ impl AiDriver {
     }
 
     pub fn wants_reset(&mut self) -> bool {
-        if crate::config::cfg().nfs_no_aireset.var_os().is_some() {
+        if crate::config::cfg().nfs_no_aireset.is_set() {
             self.stuck_ticks = 0;
             self.wrong_way = false;
             return false;
@@ -813,27 +813,14 @@ mod curve_factor_tests {
 #[cfg(test)]
 mod pull_over_tests {
     use super::pull_over_target;
-    use crate::race::{Section, Slice, SliceTable, SLICE_SPACING};
+    use crate::race::SliceTable;
+    use crate::test_support::Road;
     use glam::Vec3;
 
     /// A straight road along +z, side A narrow (1 lane of 2 m) and side B wide (2 lanes of 4 m).
     fn straight() -> SliceTable {
-        let slices = (0..64)
-            .map(|i| Slice {
-                centre: Vec3::new(0.0, 0.0, i as f32 * SLICE_SPACING),
-                up: Vec3::Y,
-                forward: Vec3::Z,
-                lateral: Vec3::X,
-                lane_mask: 0,
-                lanes_a: 1,
-                lanes_b: 2,
-                width_a: 6.0,
-                width_b: 11.0,
-                lane_width_a: 2.0,
-                lane_width_b: 4.0,
-            })
-            .collect();
-        SliceTable::build(slices, vec![Section { first: 0, last: 63, f0: 0.0, f1: 1.0 }])
+        let road = Road { lane_mask: 0, lanes_a: 1, lanes_b: 2, width_a: 6.0, width_b: 11.0, lane_width_a: 2.0, lane_width_b: 4.0 };
+        crate::test_support::straight_of(64, road)
     }
 
     /// On a straight the cross product is 0, so the car goes to side A — and side A's 2 m is

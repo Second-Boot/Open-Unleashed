@@ -59,6 +59,40 @@
 
 use crate::{u16_le, u32_le, FormatError};
 
+/// The file magic.
+pub const MAGIC: &[u8; 4] = b"SHPI";
+
+/// `FshBlock::code` values (see the module doc for the evidence behind each).
+pub mod block_code {
+    // image formats (before the compressed bit is applied)
+    /// 8-bit indexed, palette in a following block
+    pub const INDEXED8: u8 = 0x7B;
+    /// 32 bits per pixel
+    pub const ARGB8888: u8 = 0x7D;
+    pub const RGB565: u8 = 0x78;
+    pub const ARGB1555: u8 = 0x7E;
+    pub const ARGB4444: u8 = 0x6D;
+    /// 24 bits per pixel
+    pub const BGR888: u8 = 0x7F;
+    // attachments
+    /// 32-bit palette
+    pub const PALETTE_ARGB8888: u8 = 0x2A;
+    /// 16-bit RGB565 palette
+    pub const PALETTE_RGB565: u8 = 0x29;
+    /// 16-bit ARGB1555 palette
+    pub const PALETTE_ARGB1555: u8 = 0x2D;
+    /// text comment
+    pub const TEXT: u8 = 0x6F;
+    /// hot-spot table
+    pub const HOT_SPOTS: u8 = 0x7C;
+    /// bit 7 of an image code: the pixel data is a RefPack stream
+    pub const COMPRESSED_BIT: u8 = 0x80;
+    /// the code without [`COMPRESSED_BIT`]
+    pub const FORMAT_MASK: u8 = 0x7F;
+    /// the one code with bit 7 set that is not a compressed block
+    pub const NOT_COMPRESSED: u8 = 0xFF;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
     /// 8 bits per pixel, palette in a following `0x2A` block. Code `0x7B`.
@@ -78,12 +112,12 @@ pub enum PixelFormat {
 impl PixelFormat {
     pub fn from_code(code: u8) -> Option<Self> {
         Some(match code {
-            0x7B => Self::Indexed8,
-            0x7D => Self::Argb8888,
-            0x78 => Self::Rgb565,
-            0x7E => Self::Argb1555,
-            0x6D => Self::Argb4444,
-            0x7F => Self::Bgr888,
+            block_code::INDEXED8 => Self::Indexed8,
+            block_code::ARGB8888 => Self::Argb8888,
+            block_code::RGB565 => Self::Rgb565,
+            block_code::ARGB1555 => Self::Argb1555,
+            block_code::ARGB4444 => Self::Argb4444,
+            block_code::BGR888 => Self::Bgr888,
             _ => return None,
         })
     }
@@ -100,11 +134,11 @@ impl PixelFormat {
 impl FshBlock {
     /// Image format code with the "compressed" bit removed.
     pub fn format_code(&self) -> u8 {
-        self.code & 0x7F
+        self.code & block_code::FORMAT_MASK
     }
     /// True when the pixel payload is a RefPack stream (bit 7 of the code).
     pub fn is_compressed(&self) -> bool {
-        self.code & 0x80 != 0 && self.code != 0xFF
+        self.code & block_code::COMPRESSED_BIT != 0 && self.code != block_code::NOT_COMPRESSED
     }
     /// Number of mip levels in the file, the base included: `misc[3] >> 12` counts the levels
     /// **after** the base (0x44D710), so 0 ⇒ base only.
@@ -136,6 +170,9 @@ pub struct Fsh {
     pub declared_size: u32,
     pub directory_id: [u8; 4],
     pub entries: Vec<FshEntry>,
+    /// Every entry's offset, ascending (duplicates kept): [`Fsh::image_block_len`] finds "the next
+    /// entry after this one" by binary search instead of scanning the directory per call.
+    sorted_offsets: Vec<u32>,
 }
 
 /// A decoded image, always expanded to RGBA8 (row-major, top-left origin).
@@ -149,18 +186,21 @@ pub struct DecodedImage {
 
 impl Fsh {
     pub fn parse(data: &[u8]) -> Result<Self, FormatError> {
-        if data.get(0..4) != Some(b"SHPI") {
+        if data.get(0..4) != Some(MAGIC) {
             return Err(FormatError::UnknownMagic {
                 what: "SHPI",
                 offset: 0,
-                expected: b"SHPI".to_vec(),
+                expected: MAGIC.to_vec(),
                 found: data.iter().take(4).copied().collect(),
             });
         }
         let declared_size = u32_le(data, 4, "SHPI size")?;
         let count = u32_le(data, 8, "SHPI count")? as usize;
-        let directory_id: [u8; 4] = data[12..16].try_into().unwrap();
-        let mut entries = Vec::with_capacity(count);
+        let directory_id: [u8; 4] = data
+            .get(12..16)
+            .and_then(|b| b.try_into().ok())
+            .ok_or(FormatError::Truncated { what: "SHPI directory id", offset: 12, needed: 4 })?;
+        let mut entries = Vec::with_capacity(crate::cap_hint(count, data.len(), 8));
         for i in 0..count {
             let p = 16 + i * 8;
             let name_b = data.get(p..p + 4).ok_or(FormatError::Truncated { what: "SHPI directory", offset: p, needed: 8 })?;
@@ -172,7 +212,9 @@ impl Fsh {
             let blocks = parse_blocks(data, offset as usize)?;
             entries.push(FshEntry { name, offset, blocks });
         }
-        Ok(Self { declared_size, directory_id, entries })
+        let mut sorted_offsets: Vec<u32> = entries.iter().map(|e| e.offset).collect();
+        sorted_offsets.sort_unstable();
+        Ok(Self { declared_size, directory_id, entries, sorted_offsets })
     }
 
     /// Byte length of the image block for `entry`, using the next entry's offset (or file end)
@@ -183,13 +225,9 @@ impl Fsh {
         if first.size != 0 {
             return first.size as usize;
         }
-        let next = self
-            .entries
-            .iter()
-            .map(|o| o.offset as usize)
-            .filter(|&o| o > e.offset as usize)
-            .min()
-            .unwrap_or(data_len);
+        // the smallest entry offset above this one's, else the end of the file
+        let above = self.sorted_offsets.partition_point(|&o| o <= e.offset);
+        let next = self.sorted_offsets.get(above).map_or(data_len, |&o| o as usize);
         next - e.offset as usize
     }
 
@@ -210,7 +248,7 @@ impl Fsh {
     /// length back out of the already-parsed [`FshBlock::width`] rather than reparsing anything.
     pub fn entry_caption(&self, data: &[u8], idx: usize) -> Option<String> {
         let e = self.entries.get(idx)?;
-        let b = e.blocks.iter().find(|b| b.code == 0x6F)?;
+        let b = e.blocks.iter().find(|b| b.code == block_code::TEXT)?;
         let len = b.width as usize;
         let start = b.offset + 8;
         let raw = data.get(start..start + len)?;
@@ -226,8 +264,27 @@ impl Fsh {
 
     /// Decode mip `level` (0 = base) of entry `idx` to RGBA8.
     pub fn decode_mip(&self, data: &[u8], idx: usize, level: u32) -> Result<DecodedImage, FormatError> {
-        let e = &self.entries[idx];
-        let img = &e.blocks[0];
+        self.decode_level(data, idx, level, &mut None)
+    }
+
+    /// Decode mip levels `0..levels` of entry `idx` to RGBA8. The same images as `levels` calls of
+    /// [`Self::decode_mip`] (and the same first error), but a RefPack-compressed chain is
+    /// decompressed once instead of once per level.
+    pub fn decode_levels(&self, data: &[u8], idx: usize, levels: u32) -> Result<Vec<DecodedImage>, FormatError> {
+        let mut payload = None;
+        (0..levels).map(|level| self.decode_level(data, idx, level, &mut payload)).collect()
+    }
+
+    /// `decode_mip` with the entry's raw payload (inline or decompressed) kept in `payload`
+    /// between calls: filled by the first level that gets that far.
+    fn decode_level<'a>(&self, data: &'a [u8], idx: usize, level: u32, payload: &mut Option<std::borrow::Cow<'a, [u8]>>) -> Result<DecodedImage, FormatError> {
+        let e = self.entries.get(idx).ok_or(FormatError::UnexpectedValue {
+            what: "SHPI entry index",
+            offset: 0,
+            expected: format!("< {}", self.entries.len()),
+            found: idx.to_string(),
+        })?;
+        let img = e.blocks.first().ok_or(FormatError::Truncated { what: "SHPI entry blocks", offset: e.offset as usize, needed: 16 })?;
         let fmt = PixelFormat::from_code(img.format_code()).ok_or(FormatError::UnknownRecordType {
             what: "SHPI pixel format",
             offset: img.offset,
@@ -245,17 +302,20 @@ impl Fsh {
         let (bw, bh) = (img.width as usize, img.height as usize);
         // Raw payload: either inline or a RefPack stream covering the whole mip chain.
         let px_off = img.offset + 16;
-        let block_len = self.image_block_len(data.len(), idx);
-        let payload: std::borrow::Cow<[u8]> = if img.is_compressed() {
-            let comp = data.get(px_off..img.offset + block_len).ok_or(FormatError::Truncated {
-                what: "SHPI compressed pixel data",
-                offset: px_off,
-                needed: block_len,
-            })?;
-            std::borrow::Cow::Owned(crate::refpack::decompress(comp)?)
-        } else {
-            std::borrow::Cow::Borrowed(&data[px_off..])
-        };
+        if payload.is_none() {
+            *payload = Some(if img.is_compressed() {
+                let block_len = self.image_block_len(data.len(), idx);
+                let comp = data.get(px_off..img.offset + block_len).ok_or(FormatError::Truncated {
+                    what: "SHPI compressed pixel data",
+                    offset: px_off,
+                    needed: block_len,
+                })?;
+                std::borrow::Cow::Owned(crate::refpack::decompress(comp)?)
+            } else {
+                std::borrow::Cow::Borrowed(data.get(px_off..).ok_or(FormatError::Truncated { what: "SHPI pixel data", offset: px_off, needed: 1 })?)
+            });
+        }
+        let payload: &[u8] = payload.as_deref().unwrap_or_default();
         // Skip preceding mip levels.
         let mut start = 0usize;
         let (mut w, mut h) = (bw, bh);
@@ -273,7 +333,7 @@ impl Fsh {
         let mut rgba = vec![0u8; npix * 4];
         match fmt {
             PixelFormat::Indexed8 => {
-                let pal = e.blocks.iter().find(|b| matches!(b.code, 0x2A | 0x29 | 0x2D)).ok_or(FormatError::UnexpectedValue {
+                let pal = e.blocks.iter().find(|b| matches!(b.code, block_code::PALETTE_ARGB8888 | block_code::PALETTE_RGB565 | block_code::PALETTE_ARGB1555)).ok_or(FormatError::UnexpectedValue {
                     what: "SHPI indexed image",
                     offset: img.offset,
                     expected: "a 0x2A/0x29/0x2D palette block".into(),
@@ -281,20 +341,28 @@ impl Fsh {
                 })?;
                 let ncol = pal.width as usize * pal.height.max(1) as usize;
                 let pal_off = pal.offset + 16;
-                let entry_size = if pal.code == 0x2A { 4 } else { 2 };
+                let entry_size = if pal.code == block_code::PALETTE_ARGB8888 { 4 } else { 2 };
                 let pal_bytes = data.get(pal_off..pal_off + ncol * entry_size).ok_or(FormatError::Truncated {
                     what: "SHPI palette",
                     offset: pal_off,
                     needed: ncol * entry_size,
                 })?;
+                if ncol == 0 && !px.is_empty() {
+                    return Err(FormatError::UnexpectedValue {
+                        what: "SHPI indexed image",
+                        offset: pal.offset,
+                        expected: "a palette with at least one colour".into(),
+                        found: "0 colours".into(),
+                    });
+                }
                 let lookup = |ix: u8| -> [u8; 4] {
                     let c = &pal_bytes[(ix as usize).min(ncol - 1) * entry_size..][..entry_size];
                     match pal.code {
                         // Stored as B,G,R,A (little-endian ARGB). CONFIRMED visually on car textures.
-                        0x2A => [c[2], c[1], c[0], c[3]],
+                        block_code::PALETTE_ARGB8888 => [c[2], c[1], c[0], c[3]],
                         // CONFIRMED (0x570820, see the module doc above): RGB565, transparent
                         // (0,0,0,0) when the raw u16 is the fixed colour-key 0x0000.
-                        0x29 => {
+                        block_code::PALETTE_RGB565 => {
                             let raw = u16::from_le_bytes([c[0], c[1]]);
                             if raw == PALETTE_565_COLORKEY { [0, 0, 0, 0] } else { rgb565(raw) }
                         }
@@ -304,40 +372,49 @@ impl Fsh {
                         _ => argb1555(u16::from_le_bytes([c[0], c[1]])),
                     }
                 };
-                for (i, &ix) in px.iter().enumerate() {
-                    rgba[i * 4..i * 4 + 4].copy_from_slice(&lookup(ix));
+                if px.len() > 256 {
+                    // more texels than palette slots: convert each slot once
+                    let mut lut = [[0u8; 4]; 256];
+                    for (ix, slot) in lut.iter_mut().enumerate() {
+                        *slot = lookup(ix as u8);
+                    }
+                    for (&ix, out) in px.iter().zip(rgba.chunks_exact_mut(4)) {
+                        out.copy_from_slice(&lut[ix as usize]);
+                    }
+                } else {
+                    for (&ix, out) in px.iter().zip(rgba.chunks_exact_mut(4)) {
+                        out.copy_from_slice(&lookup(ix));
+                    }
                 }
             }
             PixelFormat::Argb8888 => {
-                for i in 0..npix {
-                    let c = &px[i * 4..i * 4 + 4];
-                    rgba[i * 4..i * 4 + 4].copy_from_slice(&[c[2], c[1], c[0], c[3]]);
+                for (c, out) in px.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
+                    out.copy_from_slice(&[c[2], c[1], c[0], c[3]]);
                 }
             }
             PixelFormat::Bgr888 => {
-                for i in 0..npix {
-                    let c = &px[i * 3..i * 3 + 3];
-                    rgba[i * 4..i * 4 + 4].copy_from_slice(&[c[2], c[1], c[0], 255]);
+                for (c, out) in px.chunks_exact(3).zip(rgba.chunks_exact_mut(4)) {
+                    out.copy_from_slice(&[c[2], c[1], c[0], 255]);
                 }
             }
             PixelFormat::Rgb565 => {
-                for i in 0..npix {
-                    rgba[i * 4..i * 4 + 4].copy_from_slice(&rgb565(u16::from_le_bytes([px[i * 2], px[i * 2 + 1]])));
+                for (c, out) in px.chunks_exact(2).zip(rgba.chunks_exact_mut(4)) {
+                    out.copy_from_slice(&rgb565(u16::from_le_bytes([c[0], c[1]])));
                 }
             }
             PixelFormat::Argb1555 => {
-                for i in 0..npix {
-                    rgba[i * 4..i * 4 + 4].copy_from_slice(&argb1555(u16::from_le_bytes([px[i * 2], px[i * 2 + 1]])));
+                for (c, out) in px.chunks_exact(2).zip(rgba.chunks_exact_mut(4)) {
+                    out.copy_from_slice(&argb1555(u16::from_le_bytes([c[0], c[1]])));
                 }
             }
             PixelFormat::Argb4444 => {
-                for i in 0..npix {
-                    let v = u16::from_le_bytes([px[i * 2], px[i * 2 + 1]]);
+                for (c, out) in px.chunks_exact(2).zip(rgba.chunks_exact_mut(4)) {
+                    let v = u16::from_le_bytes([c[0], c[1]]);
                     let a = ((v >> 12) & 0xF) as u8;
                     let r = ((v >> 8) & 0xF) as u8;
                     let g = ((v >> 4) & 0xF) as u8;
                     let b = (v & 0xF) as u8;
-                    rgba[i * 4..i * 4 + 4].copy_from_slice(&[r * 17, g * 17, b * 17, a * 17]);
+                    out.copy_from_slice(&[r * 17, g * 17, b * 17, a * 17]);
                 }
             }
         }
@@ -364,6 +441,10 @@ fn argb1555(v: u16) -> [u8; 4] {
     [r << 3 | r >> 2, g << 3 | g >> 2, b << 3 | b >> 2, a]
 }
 
+/// The longest block chain an entry may have (image, palette, text, … — the shipped ones have at
+/// most three).
+const MAX_BLOCKS: usize = 16;
+
 fn parse_blocks(data: &[u8], mut off: usize) -> Result<Vec<FshBlock>, FormatError> {
     let mut blocks = Vec::new();
     loop {
@@ -379,8 +460,18 @@ fn parse_blocks(data: &[u8], mut off: usize) -> Result<Vec<FshBlock>, FormatErro
             u16_le(data, off + 14, "SHPI misc")?,
         ];
         blocks.push(FshBlock { offset: off, code, size, width, height, misc });
-        if size == 0 || blocks.len() > 16 {
+        if size == 0 {
             break;
+        }
+        // no shipped entry chains more than a handful of blocks; a longer chain is a broken file,
+        // not something to cut off silently
+        if blocks.len() > MAX_BLOCKS {
+            return Err(FormatError::UnexpectedValue {
+                what: "SHPI block chain",
+                offset: off,
+                expected: format!("at most {MAX_BLOCKS} blocks"),
+                found: "a longer chain".into(),
+            });
         }
         off += size as usize;
     }
@@ -424,6 +515,22 @@ mod tests {
         d.extend_from_slice(&0x0000u16.to_le_bytes());
         d.extend_from_slice(&0x63f0u16.to_le_bytes());
         d
+    }
+
+    #[test]
+    fn block_codes_keep_their_literal_values() {
+        use block_code::*;
+        assert_eq!(MAGIC, b"SHPI");
+        assert_eq!([INDEXED8, ARGB8888, RGB565, ARGB1555, ARGB4444, BGR888], [0x7B, 0x7D, 0x78, 0x7E, 0x6D, 0x7F]);
+        assert_eq!([PALETTE_ARGB8888, PALETTE_RGB565, PALETTE_ARGB1555, TEXT, HOT_SPOTS], [0x2A, 0x29, 0x2D, 0x6F, 0x7C]);
+        assert_eq!([COMPRESSED_BIT, FORMAT_MASK, NOT_COMPRESSED], [0x80, 0x7F, 0xFF]);
+        // every format code round-trips through PixelFormat, with and without the compressed bit
+        for c in [INDEXED8, ARGB8888, RGB565, ARGB1555, ARGB4444, BGR888] {
+            assert!(PixelFormat::from_code(c).is_some());
+            let b = FshBlock { offset: 0, code: c | COMPRESSED_BIT, size: 0, width: 0, height: 0, misc: [0; 4] };
+            assert_eq!(b.format_code(), c);
+            assert_eq!(b.is_compressed(), c | COMPRESSED_BIT != NOT_COMPRESSED);
+        }
     }
 
     #[test]

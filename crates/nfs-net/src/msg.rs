@@ -56,6 +56,11 @@ pub mod kind {
     /// 0x48F8D2 (player) / the room's 0x49185B → 0x48BFB0 — the room's "go", answering the first
     /// `0xC5` request of a race (`crate::room::go`).
     pub const GO: u8 = 0xC5;
+    /// The room's heartbeat (`crate::exchange::beat`, 0x48B71E…0x48B75E; read at 0x48F92A): the host's
+    /// clock, once a second, sent unreliably.
+    pub const HEARTBEAT: u8 = 0xC4;
+    /// The lobby barrier (`crate::room`; 0x48C0F0 relays it to every player, **the sender included**).
+    pub const BARRIER: u8 = 0xBD;
     /// 0x48F527 (player) / 0x491661 (host) — the lobby's ping exchange (`crate::room::Ping`).
     pub const PING: u8 = 0xC3;
     /// 0x48F34F — eject / shut down (`push 0xC6` at 0x491748, under "Ejected by host").

@@ -72,7 +72,7 @@ pub fn parse_track_table(data: &[u8]) -> Result<Vec<TrackInfo>, FormatError> {
         let mut recs = Vec::with_capacity(n_records);
         for i in 0..n_records {
             let b = 0x1B0 + i * 0x4C;
-            recs.push(TrackRecord { driver: fixed_str(r, b, 20, what)?, car: fixed_str(r, b + 0x14, 52, what)?, time: u32_le(r, b + 0x48, what)? });
+            recs.push(TrackRecord { driver: fixed_str(r, b, 20, what)?, car: fixed_str(r, b + SLOT_CAR_AT, 52, what)?, time: u32_le(r, b + SLOT_TIME_AT, what)? });
         }
         let mut traffic_cars = [0u16; 7];
         for (i, t) in traffic_cars.iter_mut().enumerate() {
@@ -682,6 +682,10 @@ pub const NO_RECORD_TIME: u32 = 359_999;
 pub const RECORD_SLOTS: usize = 8;
 const SLOT_STRIDE: usize = 0x4C;
 const SLOTS_AT: usize = 0x1B0;
+/// Inside a record-holder slot: the driver name starts at 0, the car name here (`strncpy(slot+0x14, …)`).
+const SLOT_CAR_AT: usize = 0x14;
+/// … and the time (a `u32`) here; the two names live in the 0x48 bytes before it.
+const SLOT_TIME_AT: usize = 0x48;
 
 impl TrackRecordFile {
     /// Wrap a `nfs5.trk` image and apply the 0x4FAE20 empty-slot fixup.
@@ -717,11 +721,11 @@ impl TrackRecordFile {
         for t in 0..self.count() {
             for k in 0..RECORD_SLOTS {
                 let e = self.slot(t, k);
-                if u32::from_le_bytes([self.raw[e + 0x48], self.raw[e + 0x49], self.raw[e + 0x4A], self.raw[e + 0x4B]]) == 0 {
+                if u32::from_le_bytes([self.raw[e + SLOT_TIME_AT], self.raw[e + SLOT_TIME_AT + 1], self.raw[e + SLOT_TIME_AT + 2], self.raw[e + SLOT_TIME_AT + 3]]) == 0 {
                     // `strcpy(e, "n/a")` (0x4FAF41…0x4FAF67): four bytes, the rest of the
                     // 20-byte name left as it was
                     self.raw[e..e + 4].copy_from_slice(b"n/a\0");
-                    self.raw[e + 0x48..e + 0x4C].copy_from_slice(&NO_RECORD_TIME.to_le_bytes());
+                    self.raw[e + SLOT_TIME_AT..e + SLOT_TIME_AT + 4].copy_from_slice(&NO_RECORD_TIME.to_le_bytes());
                 }
             }
         }
@@ -733,8 +737,8 @@ impl TrackRecordFile {
                 let e = self.slot(track, k);
                 TrackRecord {
                     driver: fixed_str(&self.raw, e, 20, "nfs5.trk").unwrap_or_default(),
-                    car: fixed_str(&self.raw, e + 0x14, 52, "nfs5.trk").unwrap_or_default(),
-                    time: u32::from_le_bytes([self.raw[e + 0x48], self.raw[e + 0x49], self.raw[e + 0x4A], self.raw[e + 0x4B]]),
+                    car: fixed_str(&self.raw, e + SLOT_CAR_AT, 52, "nfs5.trk").unwrap_or_default(),
+                    time: u32::from_le_bytes([self.raw[e + SLOT_TIME_AT], self.raw[e + SLOT_TIME_AT + 1], self.raw[e + SLOT_TIME_AT + 2], self.raw[e + SLOT_TIME_AT + 3]]),
                 }
             })
             .collect()
@@ -774,7 +778,7 @@ impl TrackRecordFile {
         let k = times.iter().position(|e| (time as i32) < (*e as i32))?;
         // `strcpy(raw[dst..], bytes)` kept inside the row's 0x48 bytes of text
         fn strcpy(raw: &mut [u8], row: usize, at: usize, bytes: &[u8]) {
-            let end = row + 0x48;
+            let end = row + SLOT_TIME_AT;
             for (i, b) in bytes.iter().copied().chain(std::iter::once(0)).enumerate() {
                 if at + i >= end {
                     break;
@@ -785,21 +789,21 @@ impl TrackRecordFile {
         let cstr = |raw: &[u8], at: usize, end: usize| -> Vec<u8> { raw[at..end].iter().copied().take_while(|b| *b != 0).collect() };
         for j in (k + 1..RECORD_SLOTS).rev() {
             let (dst, src) = (self.slot(t, j), self.slot(t, j - 1));
-            let tm = self.raw[src + 0x48..src + 0x4C].to_vec();
-            self.raw[dst + 0x48..dst + 0x4C].copy_from_slice(&tm);
-            let d = cstr(&self.raw, src, src + 0x48);
+            let tm = self.raw[src + SLOT_TIME_AT..src + SLOT_TIME_AT + 4].to_vec();
+            self.raw[dst + SLOT_TIME_AT..dst + SLOT_TIME_AT + 4].copy_from_slice(&tm);
+            let d = cstr(&self.raw, src, src + SLOT_TIME_AT);
             strcpy(&mut self.raw, dst, dst, &d);
-            let c = cstr(&self.raw, src + 0x14, src + 0x48);
-            strcpy(&mut self.raw, dst, dst + 0x14, &c);
+            let c = cstr(&self.raw, src + SLOT_CAR_AT, src + SLOT_TIME_AT);
+            strcpy(&mut self.raw, dst, dst + SLOT_CAR_AT, &c);
         }
         let e = self.slot(t, k);
-        self.raw[e + 0x48..e + 0x4C].copy_from_slice(&time.to_le_bytes());
+        self.raw[e + SLOT_TIME_AT..e + SLOT_TIME_AT + 4].copy_from_slice(&time.to_le_bytes());
         let d: Vec<u8> = driver.chars().map(|c| c as u32 as u8).collect();
         strcpy(&mut self.raw, e, e, &d);
         // strncpy(slot+0x14, car, 0x11): up to 17 bytes, zero-padded to 17 when shorter
         let c: Vec<u8> = car.chars().map(|c| c as u32 as u8).take(0x11).collect();
         for i in 0..0x11 {
-            self.raw[e + 0x14 + i] = c.get(i).copied().unwrap_or(0);
+            self.raw[e + SLOT_CAR_AT + i] = c.get(i).copied().unwrap_or(0);
         }
         self.raw[e + 0x25] = 0;
         Some(k)
@@ -808,6 +812,11 @@ impl TrackRecordFile {
 
 #[cfg(test)]
 mod track_record_tests {
+    #[test]
+    fn slot_offsets_keep_their_literal_values() {
+        assert_eq!([super::SLOT_CAR_AT, super::SLOT_TIME_AT], [0x14, 0x48]);
+    }
+
     use super::*;
 
     /// 0x4FAE20's fixup is a `strcpy` of `"n/a"`: four bytes, the rest of the name untouched.

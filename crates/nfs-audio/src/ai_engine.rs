@@ -10,7 +10,7 @@
 //! `tbl[0x40 − blend]` and `tbl[0x40 + blend]`.
 
 use crate::engine::WEIGHT_CURVE;
-use crate::mixer::{AudioOutput, Clip, VoiceId};
+use crate::mixer::{byte_gain, AudioOutput, Clip, VoiceId, BEND_ROOT, LEVEL_MAX};
 use nfs_formats::{bigf::Bigf, bnk::Bnk};
 use std::collections::HashMap;
 use std::path::Path;
@@ -95,7 +95,7 @@ pub fn ai_road_volume(atten: i32, speed16: i32, crowding: u8) -> i32 {
 /// `Voice_play`'s clamp of its volume argument to 0…0x7F (0x4A9C34…0x4A9C4D: `setl ; dec ; and`
 /// then `cmp 0x7F ; jle`).
 fn vol_arg(v: i32) -> i32 {
-    v.clamp(0, 0x7F)
+    v.clamp(0, LEVEL_MAX)
 }
 
 /// The three Audio options' levels the mix categories take (`[0x5D1744]` SfxLevel, `[0x5D1748]`
@@ -279,7 +279,7 @@ pub struct AiEngines {
 
 /// 0x4A9C10's mixer volume, `(categoryLevel · game.spl[k] · vol · 85) >> 21`, as a gain.
 fn mix(category: u8, trim: u32, vol: i32) -> f32 {
-    ((category as i32 * trim as i32 * vol * 85) >> 21).clamp(0, 127) as f32 / 127.0
+    byte_gain(((category as i32 * trim as i32 * vol * 85) >> 21).clamp(0, LEVEL_MAX))
 }
 
 impl AiEngines {
@@ -307,8 +307,7 @@ impl AiEngines {
             let bytes = viv.get(&self.viv, name)?;
             let bank = Bnk::parse(bytes).ok()?;
             let p = bank.decode_slot(bytes, 0).ok()?;
-            let frames = (p.samples.len() / p.channels.max(1) as usize) as u32;
-            Some(Arc::new(Clip { loop_range: p.loop_range.or(Some((0, frames))), ..Clip::from_pcm(p) }))
+            Some(Arc::new(Clip::from_pcm(p).with_whole_loop()))
         };
         let pair = (load(&format!("{key}lden.bnk")), load(&format!("{key}ldex.bnk")));
         if pair.0.is_none() && pair.1.is_none() {
@@ -349,7 +348,7 @@ impl AiEngines {
             self.cars.resize_with(index + 1, CarVoices::default);
         }
         // of the fractional distance (`crate::fix_atten`); the port took whole metres until 2026-09-26
-        let atten = if spline_cam { crate::fix_atten(0x1000_0000, 0x1_0000, 0, distance) } else { crate::fix_atten(0x800_0000, 0x2_0000, 0, distance) };
+        let atten = if spline_cam { crate::ATTEN_AI_SPLINE.at(distance) } else { crate::ATTEN_ENGINE.at(distance) };
         if atten == 0 {
             // 0x4AA9C0…0x4AAAA4 releases the engine voices `v`, `v + 4`, `v + 8` only, each
             // 0x565DD0(h, 5, −1) (0x4AA9E4, 0x4AAA2D, 0x4AAA86) — the five-tick ramp of
@@ -376,11 +375,11 @@ impl AiEngines {
             let voice = if slot == 0 { &mut self.cars[index].near } else { &mut self.cars[index].far };
             match (*voice, clip) {
                 (Some(id), _) => {
-                    out.set_word(id, amp, word, 0x40);
+                    out.set_word(id, amp, word, BEND_ROOT);
                     out.set_pan(id, pan);
                     out.voice_play_filter(id, self.filter);
                 }
-                (None, Some(c)) => *voice = Some(out.play_word(c, amp, word, 0x40, pan, true)),
+                (None, Some(c)) => *voice = Some(out.play_word(c, amp, word, BEND_ROOT, pan, true)),
                 (None, None) => {}
             }
         }

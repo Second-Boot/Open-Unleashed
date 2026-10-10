@@ -342,3 +342,19 @@ fn steering_turns_the_car() {
     // depends on the model frame (RE/notes/car-model.md: +X = car's left) — the input layer maps it.
     assert!(turn > 0.0, "positive steer should turn toward +x (cross.y = {turn})");
 }
+
+/// The RALLY nibble rule, against the two inline forms it replaced.
+#[test]
+fn the_rally_nibble_helper_equals_the_inline_forms() {
+    for rally in [false, true] {
+        for n in 0..16usize {
+            let old_body = if rally && (n == 1 || n == 10) { 2 } else { n };
+            let new_body = if super::rally_reads_as_two(n, rally) { 2 } else { n };
+            assert_eq!(old_body, new_body);
+            let word = 0x1234_5670u32 | n as u32;
+            let old_wheel = if rally && (n == 1 || n == 10) { 2 } else { word & 0xFFFF };
+            let new_wheel = if super::rally_reads_as_two(n, rally) { 2 } else { word & 0xFFFF };
+            assert_eq!(old_wheel, new_wheel);
+        }
+    }
+}

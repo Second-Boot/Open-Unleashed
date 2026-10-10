@@ -210,7 +210,7 @@ pub fn sign_point_cloud(vertices: &[Vec3], axis_lengths: Vec3) -> Vec<Vec3> {
 /// `max(|dx|, |dz|) + 0.25 · min(|dx|, |dz|)` — the octagonal distance 0x4A0F80 measures.
 fn oct_distance(a: Vec3, b: Vec3) -> f32 {
     let (dx, dz) = ((a.x - b.x).abs(), (a.z - b.z).abs());
-    dx.max(dz) + 0.25 * dx.min(dz)
+    crate::vehicle::norm_est(dx, dz)
 }
 
 /// One smackable: its car record and the fields of it the four handlers use.

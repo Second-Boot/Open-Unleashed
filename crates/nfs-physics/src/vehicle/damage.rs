@@ -1,6 +1,15 @@
 //! `Vehicle` methods split out of the parent module (a move, no logic changed).
 
 use super::*;
+use crate::specs::part_kind;
+
+/// The ring of damage zones `car+0x4E4[10]`: 0…7 round the body, 8 the roof ([`Vehicle::damage_by_normal`]),
+/// 9 the last of the ten the figures sum. The engine figure starts from zone 1 (0x4938AE).
+pub const ZONE_ENGINE: usize = 1;
+/// The roof zone (0x494E54…0x494E84).
+pub const ZONE_ROOF: usize = 8;
+/// The zones 0…8 the body figure sums (0x493C94 `mov ecx, 9`).
+pub const BODY_ZONES: usize = 9;
 
 impl Vehicle {
     /// The part-damage getters' loop (`0x4938A0` family, CONFIRMED — read to the instruction
@@ -36,34 +45,34 @@ impl Vehicle {
     /// 0x4938E2), so it is `(zone1 + Σ part terms) / (1 + n)` and always divides (0x493946). The
     /// misfire, the drive force and HTextDamage's "drivetrain" row read it.
     pub fn engine_wear(&self, specs: &crate::specs::CarSpecs) -> f32 {
-        let (sum, n) = self.part_sum(specs, &[1]);
-        (self.damage[1] + sum) / (1 + n) as f32
+        let (sum, n) = self.part_sum(specs, &[part_kind::ENGINE]);
+        (self.damage[ZONE_ENGINE] + sum) / (1 + n) as f32
     }
 
     /// `0x493A10`, the brakes figure: the type-2 part terms summed, no outer division.
     pub fn brakes_wear(&self, specs: &crate::specs::CarSpecs) -> f32 {
-        self.part_sum(specs, &[2]).0
+        self.part_sum(specs, &[part_kind::BRAKES]).0
     }
 
     /// `0x493AA0`, the gearbox figure: the type-3 part terms summed, no outer division.
     pub fn gearbox_wear(&self, specs: &crate::specs::CarSpecs) -> f32 {
-        self.part_sum(specs, &[3]).0
+        self.part_sum(specs, &[part_kind::GEARBOX]).0
     }
 
     /// `0x493B30`, the aero figure: the type-6 part terms summed, no outer division.
     pub fn aero_wear(&self, specs: &crate::specs::CarSpecs) -> f32 {
-        self.part_sum(specs, &[6]).0
+        self.part_sum(specs, &[part_kind::AERO]).0
     }
 
     /// `0x493980`, the tyre figure: the type-9 part terms summed, no outer division.
     pub fn tyres_wear(&self, specs: &crate::specs::CarSpecs) -> f32 {
-        self.part_sum(specs, &[9]).0
+        self.part_sum(specs, &[part_kind::TYRES]).0
     }
 
     /// `0x493BC0`, the suspension figure: the part terms of types 4, 5 and 8 summed, then divided by
     /// their count when it is above 1 (0x493C78…0x493C7E).
     pub fn suspension_wear(&self, specs: &crate::specs::CarSpecs) -> f32 {
-        let (w, n) = self.part_sum(specs, &[4, 5, 8]);
+        let (w, n) = self.part_sum(specs, &part_kind::SUSPENSION);
         if n > 1 { w / n as f32 } else { w }
     }
 
@@ -75,7 +84,7 @@ impl Vehicle {
     /// `0x493C90`, the body figure: zones 0…8 summed and scaled by `[0x5B49B0]` = 1/12 — nine zones
     /// over twelve, as the binary has it (0x493C94 `mov ecx, 9`).
     pub fn body_damage(&self) -> f32 {
-        self.damage[..9].iter().sum::<f32>() * (1.0f32 / 12.0)
+        self.damage[..BODY_ZONES].iter().sum::<f32>() * (1.0f32 / 12.0)
     }
 
     /// `0x493CC0`, the mean body damage in per cent: the ten zones summed and scaled by
@@ -115,8 +124,8 @@ impl Vehicle {
         let m = self.orientation;
         let (x, y, z) = (n_world.dot(m.row(0)), n_world.dot(m.row(1)), n_world.dot(m.row(2)));
         if y < -0.5 && !self.smackable {
-            self.damage_zone(effect, 8);
-            self.crash_response(effect, 8, flag, mass);
+            self.damage_zone(effect, ZONE_ROOF);
+            self.crash_response(effect, ZONE_ROOF, flag, mass);
         }
         let zone = if x.abs() < 0.1 && z < -0.1 {
             1
@@ -202,7 +211,7 @@ impl Vehicle {
             } else {
                 a * 0.333_333_34
             };
-            self.reset_countdown = 0xC0;
+            self.reset_countdown = RESET_COUNTDOWN;
             // 0x49488C…0x49489A: `car+0x42C = 1` (`ebx`) unless `car+0x52C & 0x80`
             if !self.smackable {
                 self.knocked_over = true;

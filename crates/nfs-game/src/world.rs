@@ -319,6 +319,12 @@ fn part_list(flags: u16) -> Option<ViewList> {
 /// `nfs_renderer::FakeSortMode::PerItem`'s per-item fold.
 const FAKESORT_NEAR_KEY: u32 = 10_000;
 
+/// What a draw item with no recorded part (`TrackWorld::parts` shorter than the item list) is
+/// queued by: the flag word 2 (the near list, [`part_list`]) with the usual key word 0x8000
+/// (`pr+6`, the high half of the list-`+4` key: "0x8000 on most parts", 0x450F37…0x450F44) at the
+/// origin.
+const DEFAULT_PART: (u16, u16, Vec3) = (2, 0x8000, Vec3::ZERO);
+
 /// One `Vis ` segment as 0x487330 keeps it: `raised = a.y ≠ 0`, the start and the delta in xz,
 /// `len²` and `1/len²`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2327,7 +2333,7 @@ impl TrackWorld {
                             let Some(k) = a.lods.iter().position(|(n, _)| *n == lod) else { continue };
                             let parts = a.parts.get(k).map(|p| p.as_slice()).unwrap_or(&[]);
                             for (i, item) in a.lods[k].1.iter().enumerate() {
-                                let (flags, key_hi, centre) = parts.get(i).copied().unwrap_or((2, 0x8000, Vec3::ZERO));
+                                let (flags, key_hi, centre) = parts.get(i).copied().unwrap_or(DEFAULT_PART);
                                 // `FakeSortMode::PerItem`'s fold (0x449AB2, `[0x61975C] < 0x2710`
                                 // unsigned): the drawer writes the queued entry's own `+0xC` — this same
                                 // view-list key — to the global just before each draw (0x450CE2, `edx =
@@ -2949,6 +2955,53 @@ fn rotated_local_box_aabb(lo: Vec3, hi: Vec3, tr: Mat4) -> (Vec3, Vec3) {
         .fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(p), b.max(p)))
 }
 
+/// The collision object of one article placed by `tr` — the part [`track_props`] and
+/// [`scene_props`] share once each has chosen its article, its `animdefs.txt` definition (`def`) and
+/// its placement: `None` when the article has no geometry at its lowest LOD or its `collideType` is
+/// neither `kCylinder` nor `kBox` (the callers then skip it, as before). `article` is the `.crp`
+/// index the prop carries.
+fn build_prop(tags: &[(u32, Option<[u32; 2]>)], g: &nfs_formats::crp::ArticleGeometry, b: &nfs_formats::crp::Base, def: &nfs_formats::animdefs::AnimDef, tr: Mat4, article: usize) -> Option<nfs_physics::props::Prop> {
+    use nfs_physics::props::{Breakable, Prop, PropShape, box_footprint};
+    let lod = g.primitives.iter().map(|p| p.lod).min()?;
+    let mut skipped = 0;
+    let local: Vec<Vec3> = article_meshes(g, lod, &mut skipped)
+        .iter()
+        .flat_map(|m| m.mesh.vertices.iter().map(|v| Vec3::from(v.position)))
+        .collect();
+    if local.is_empty() {
+        return None;
+    }
+    // The AABB's own source is `Base.bbox_min`/`Base.bbox_max` (getBBox, 0x477F40, reading
+    // Base+0x14/+0x20 — `rotated_local_box_aabb`'s doc above), not the lowest-LOD vertex fold
+    // this pass replaces; `local` still feeds `box_footprint` below, a separate field.
+    let (mn, mx) = rotated_local_box_aabb(Vec3::from(b.bbox_min), Vec3::from(b.bbox_max), tr);
+    // 0x476380 finds each piece's `QuatGroup` among the instances by tag (0x478640 / 0x478670)
+    // and gives up at one whose `Anim` part is missing or has both words 0 (0x476501…0x47651F)
+    let breakable = (!def.pieces.is_empty()).then(|| Breakable {
+        bands: def.bands.clone(),
+        band_pieces: def.band_pieces.clone(),
+        resolved: def
+            .pieces
+            .iter()
+            .map(|(_, p)| first_by_tag(tags, group_tag(&p.quat_group)).and_then(|k| tags[k].1).is_some_and(|w| w != [0, 0]))
+            .collect(),
+        started: std::cell::Cell::new(None),
+        article,
+    });
+    let shape = match def.collide_type.as_str() {
+        "kCylinder" => PropShape::Cylinder { radius: 0.25 },
+        "kBox" => {
+            let corners = box_footprint(&local).map(|c| tr.transform_point3(c));
+            let c = (mn + mx) * 0.5;
+            let radius = Vec3::new(mx.x - c.x, 0.0, mx.z - c.z).length() * 1.05;
+            PropShape::Box { corners, radius }
+        }
+        _ => return None,
+    };
+    let class = if matches!(shape, PropShape::Cylinder { .. }) { def.radius as i32 as u32 } else { 0 };
+    Some(Prop { shape, aabb_min: mn, aabb_max: mx, class, breakable, drive_through: def.drive_through, article })
+}
+
 /// The track loader's collision objects (0x4750B0 at 0x475152…0x475302): every article of the
 /// track's `.crp` whose `Base` byte 0 lacks 0x40 (0x47515A) and whose tag is set, through
 /// `AnimDefs::lookup` (0x47ED90 — an unknown tag gets the file's first definition, `ENDW`):
@@ -2981,7 +3034,6 @@ fn rotated_local_box_aabb(lo: Vec3, hi: Vec3, tr: Mat4) -> (Vec3, Vec3) {
 /// bit-identical to the old vertex-derived value (`crp-geometry.md` §2.2's own CONFIRMED equality
 /// of `bbox_min`/`bbox_max` to the LOD0 `vt` extent already predicted this).
 pub fn track_props(track: &TrackAssets) -> Vec<nfs_physics::props::Prop> {
-    use nfs_physics::props::{Breakable, Prop, PropShape, box_footprint};
     let mut out = Vec::new();
     let Ok(arts) = track.crp.articles(&track.crp_data) else { return out };
     let tags = article_tags(track, &arts);
@@ -2998,45 +3050,8 @@ pub fn track_props(track: &TrackAssets) -> Vec<nfs_physics::props::Prop> {
             continue;
         }
         let Some(def) = track.animdefs.lookup(b.tag_u32()) else { continue };
-        let Some(lod) = g.primitives.iter().map(|p| p.lod).min() else { continue };
         let tr = g.transform.as_ref().map(Mat4::from_cols_array).unwrap_or(Mat4::IDENTITY);
-        let mut skipped = 0;
-        let local: Vec<Vec3> = article_meshes(&g, lod, &mut skipped)
-            .iter()
-            .flat_map(|m| m.mesh.vertices.iter().map(|v| Vec3::from(v.position)))
-            .collect();
-        if local.is_empty() {
-            continue;
-        }
-        // The AABB's own source is `Base.bbox_min`/`Base.bbox_max` (getBBox, 0x477F40, reading
-        // Base+0x14/+0x20 — `rotated_local_box_aabb`'s doc above), not the lowest-LOD vertex fold
-        // this pass replaces; `local` still feeds `box_footprint` below, a separate field.
-        let (mn, mx) = rotated_local_box_aabb(Vec3::from(b.bbox_min), Vec3::from(b.bbox_max), tr);
-        // 0x476380 finds each piece's `QuatGroup` among the instances by tag (0x478640 / 0x478670)
-        // and gives up at one whose `Anim` part is missing or has both words 0 (0x476501…0x47651F)
-        let breakable = (!def.pieces.is_empty()).then(|| Breakable {
-            bands: def.bands.clone(),
-            band_pieces: def.band_pieces.clone(),
-            resolved: def
-                .pieces
-                .iter()
-                .map(|(_, p)| first_by_tag(&tags, group_tag(&p.quat_group)).and_then(|k| tags[k].1).is_some_and(|w| w != [0, 0]))
-                .collect(),
-            started: std::cell::Cell::new(None),
-            article: index,
-        });
-        let shape = match def.collide_type.as_str() {
-            "kCylinder" => PropShape::Cylinder { radius: 0.25 },
-            "kBox" => {
-                let corners = box_footprint(&local).map(|c| tr.transform_point3(c));
-                let c = (mn + mx) * 0.5;
-                let radius = Vec3::new(mx.x - c.x, 0.0, mx.z - c.z).length() * 1.05;
-                PropShape::Box { corners, radius }
-            }
-            _ => continue,
-        };
-        let class = if matches!(shape, PropShape::Cylinder { .. }) { def.radius as i32 as u32 } else { 0 };
-        out.push(Prop { shape, aabb_min: mn, aabb_max: mx, class, breakable, drive_through: def.drive_through, article: index });
+        out.extend(build_prop(&tags, &g, b, def, tr, index));
     }
     out
 }
@@ -3106,7 +3121,6 @@ pub fn track_props(track: &TrackAssets) -> Vec<nfs_physics::props::Prop> {
 /// silently drops an unmatched element the way the pre-2026-09-28 code did.
 /// The 64-slot cap is applied (`.take(64)`) though also unreachable (5 is the largest count found).
 pub fn scene_props(track: &TrackAssets, geometry: &nfs_assets::track::TrackGeometry) -> Vec<nfs_physics::props::Prop> {
-    use nfs_physics::props::{Breakable, Prop, PropShape, box_footprint};
     let mut out = Vec::new();
     let Ok(arts) = track.crp.articles(&track.crp_data) else { return out };
     let tags = article_tags(track, &arts);
@@ -3122,42 +3136,10 @@ pub fn scene_props(track: &TrackAssets, geometry: &nfs_assets::track::TrackGeome
         // fallback substitutes the whole `{tag, Article*}` pair (0x482EA0's own copy), so collision
         // behaviour follows the template that was actually spawned.
         let Some(def) = track.animdefs.lookup(art.tag) else { continue };
-        let Some(lod) = g.primitives.iter().map(|p| p.lod).min() else { continue };
         // the element's own placement, never the library article's `tr` ("The scene bundle's
         // items": `0x482BF1` stores the template record as identity/zero).
         let tr = inst.transform * Mat4::from_scale(inst.scale);
-        let mut skipped = 0;
-        let local: Vec<Vec3> = article_meshes(&g, lod, &mut skipped)
-            .iter()
-            .flat_map(|m| m.mesh.vertices.iter().map(|v| Vec3::from(v.position)))
-            .collect();
-        if local.is_empty() {
-            continue;
-        }
-        let (mn, mx) = rotated_local_box_aabb(Vec3::from(b.bbox_min), Vec3::from(b.bbox_max), tr);
-        let breakable = (!def.pieces.is_empty()).then(|| Breakable {
-            bands: def.bands.clone(),
-            band_pieces: def.band_pieces.clone(),
-            resolved: def
-                .pieces
-                .iter()
-                .map(|(_, p)| first_by_tag(&tags, group_tag(&p.quat_group)).and_then(|k| tags[k].1).is_some_and(|w| w != [0, 0]))
-                .collect(),
-            started: std::cell::Cell::new(None),
-            article: art.index,
-        });
-        let shape = match def.collide_type.as_str() {
-            "kCylinder" => PropShape::Cylinder { radius: 0.25 },
-            "kBox" => {
-                let corners = box_footprint(&local).map(|c| tr.transform_point3(c));
-                let c = (mn + mx) * 0.5;
-                let radius = Vec3::new(mx.x - c.x, 0.0, mx.z - c.z).length() * 1.05;
-                PropShape::Box { corners, radius }
-            }
-            _ => continue,
-        };
-        let class = if matches!(shape, PropShape::Cylinder { .. }) { def.radius as i32 as u32 } else { 0 };
-        out.push(Prop { shape, aabb_min: mn, aabb_max: mx, class, breakable, drive_through: def.drive_through, article: art.index });
+        out.extend(build_prop(&tags, &g, b, def, tr, art.index));
     }
     out
 }

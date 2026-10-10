@@ -193,7 +193,7 @@ impl App {
     /// `OwnedCars.Car`'s list — **0x501AD0**'s `[0x691DFC]` (`Career::owned_list`): the garage,
     /// less the cars from a later model year than the chronicle's when `Game.GameType` is 4.
     pub(crate) fn owned_list(&self) -> Vec<usize> {
-        self.career.as_ref().map(|c| c.career.owned_list(&c.tables, self.fe.game_type == 4)).unwrap_or_default()
+        self.career.as_ref().map(|c| c.career.owned_list(&c.tables, self.fe.game_type == game_type::TOURNAMENT)).unwrap_or_default()
     }
 
     /// Keep the garage selection on a car `OwnedCars.Car` lists. 0x4F5980 (slot 0x90) reads
@@ -404,12 +404,12 @@ pub(crate) fn selectable_index(rows: &[ListRow], row: usize) -> i32 {
 /// itself* (era/class/year, exchange, not `Vec::sort_by_key(year)`) and to `reset_track_rows`
 /// resetting `car_idx` on every `SETTYPE*` both still stand, unchanged.
 fn dealer_flag_admitted(flag: u16, game_type: u8) -> bool {
-    if game_type == 4 {
+    if game_type == game_type::TOURNAMENT {
         flag != 2
     } else {
         match flag {
             0 | 2 => true,
-            1 => game_type == 3, // Multiplayer, or the un-ported CHEATALLCARS cheat — see above
+            1 => game_type == game_type::NETWORK, // Multiplayer, or the un-ported CHEATALLCARS cheat — see above
             _ => false,
         }
     }

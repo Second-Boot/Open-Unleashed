@@ -151,7 +151,7 @@ impl App {
     pub(crate) fn launch_race_type(&self) -> u8 {
         if self.quick_knockout {
             3
-        } else if self.knockout_round || self.race_fegame_type() == 4 {
+        } else if self.knockout_round || self.race_fegame_type() == game_type::TOURNAMENT {
             2
         } else if self.skill.is_some() {
             4
@@ -171,9 +171,9 @@ impl App {
     /// Knockout".)*
     pub(crate) fn summary_title(fegame_type: u8) -> u32 {
         match fegame_type {
-            1 => 18175,
-            2 => 18169,
-            _ => 18129,
+            game_type::QUICK_KNOCKOUT => hud_str::TITLE_QUICK_KNOCKOUT,
+            game_type::KNOCKOUT => hud_str::TITLE_KNOCKOUT,
+            _ => hud_str::TITLE_SINGLE_RACE,
         }
     }
 
@@ -185,7 +185,7 @@ impl App {
         // diagnostic: `NFS_KO_PLACE=<p>` files the player at place `p` (1-based) of the order —
         // a scripted series (`NFS_FE_KO_SERIES`) cannot drive past anyone, so this is how a still
         // reaches the rounds after the first and `knockoutraceinfo`
-        if let Some(p) = nfs_game::config::cfg().nfs_ko_place.var().ok().and_then(|v| v.trim().parse::<usize>().ok())
+        if let Some(p) = nfs_game::config::cfg().nfs_ko_place.as_str().and_then(|v| v.trim().parse::<usize>().ok())
             && let Some(at) = order.iter().position(|d| *d == 0)
         {
             let d = order.remove(at);
@@ -527,7 +527,7 @@ impl App {
         let flags = self.career.as_ref().map(|c| c.race_flags).unwrap_or_default();
         // 0x4EDD00 on a type-4 race, run or aborted, ends in 0x503A50 and 0x503AD0: the next event
         // `[0x691E7C]` is the first undone one again — `Tournament.RemainingTracks`' first row
-        if game_type == 4 {
+        if game_type == game_type::TOURNAMENT {
             self.fe.remaining_sel = 0;
         }
         let (promotion, missions_done) = self
@@ -608,8 +608,8 @@ impl App {
             let kept = if ev_type < c.event_type_rows().len() { ev_type } else { 0 };
             self.choices.insert(EV.to_string(), kept);
         }
-        if matches!(self.fe.game_type, 5 | 10 | 11) {
-            self.fe.game_type = 4;
+        if matches!(self.fe.game_type, game_type::TOURNAMENT_TEST_DRIVE | game_type::FINALE | game_type::FINALE_TEST_DRIVE) {
+            self.fe.game_type = game_type::TOURNAMENT;
         }
         self.fe.remaining_sel = 0;
     }
@@ -774,7 +774,7 @@ impl App {
         // a network race (`FEGAME_TYPE 3`): 0x417010 never runs (0x417128 tests the game type, not the link — a
         // race whose session was torn down is still no single-player race); the pages come from the room's times
         let playback = self.replay.stream.as_ref().is_some_and(|s| matches!(s.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted));
-        if self.block_game_type() == Some(3) {
+        if self.block_game_type() == Some(game_type::NETWORK) {
             // (a playback of a network race: 0x417010 does not run either, the stream's end leaves)
             if !playback {
                 self.net_results_check();

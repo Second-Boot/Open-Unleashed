@@ -216,6 +216,29 @@ fn patch_centre_y(t: &Triangle) -> f32 {
     (t.a.y + t.b.y + t.c.y) * (1.0 / 3.0)
 }
 
+/// The triangle's plane normal `(b − a) × (c − a)` when the point's plan lies inside the triangle's
+/// ([`Triangle::contains_xz`], edges included) and the plane is not vertical (`|n.y| < 1e-9` is
+/// skipped). The first half of every plan query: [`TriangleGrid::find_patch`],
+/// [`TriangleGrid::find_patch_height`] and [`TriangleGrid::patches_where`].
+#[inline]
+fn plan_normal(t: &Triangle, p: Vec3) -> Option<Vec3> {
+    if !t.contains_xz(p) {
+        return None;
+    }
+    let n = (t.b - t.a).cross(t.c - t.a);
+    if n.y.abs() < 1e-9 {
+        return None;
+    }
+    Some(n)
+}
+
+/// The plane's height at the point: `h = a.y − ((p.x − a.x)·n.x + (p.z − a.z)·n.z) / n.y`
+/// (0x4952A0…0x4952B6, 0x48A060).
+#[inline]
+fn plane_height(t: &Triangle, n: Vec3, p: Vec3) -> f32 {
+    t.a.y - (n.x * (p.x - t.a.x) + n.z * (p.z - t.a.z)) / n.y
+}
+
 /// One original patch — a quadtree leaf entry (`RE/RENDERING.md` "What the tree holds") —
 /// reconstructed from a [`TriangleGrid`]'s own triangles by [`TriangleGrid::patches`]. See that
 /// method for the centroid formula and the extent gap.
@@ -263,6 +286,14 @@ pub struct Hit {
     pub surface: u32,
     /// The triangle's vertex colours interpolated at the hit, 0..1 per channel.
     pub color: [f32; 4],
+}
+
+/// The cell of the point `(x, z)` in an `nx × nz` grid of square cells of side `cell` whose corner
+/// is `(min_x, min_z)`: floored, clamped to the grid on both sides (shared by the triangle grid and
+/// the wall set).
+#[inline]
+pub(crate) fn grid_cell(min_x: f32, min_z: f32, cell: f32, nx: usize, nz: usize, x: f32, z: f32) -> (usize, usize) {
+    ((((x - min_x) / cell).floor().max(0.0) as usize).min(nx - 1), (((z - min_z) / cell).floor().max(0.0) as usize).min(nz - 1))
 }
 
 /// Static triangle grid over the XZ plane.
@@ -391,9 +422,7 @@ impl TriangleGrid {
     }
 
     fn cell_of(min: Vec3, cs: f32, nx: usize, nz: usize, p: Vec3) -> (usize, usize) {
-        let x = (((p.x - min.x) / cs).floor().max(0.0) as usize).min(nx - 1);
-        let z = (((p.z - min.z) / cs).floor().max(0.0) as usize).min(nz - 1);
-        (x, z)
+        grid_cell(min.x, min.z, cs, nx, nz, p.x, p.z)
     }
 
     pub fn triangle_count(&self) -> usize {
@@ -462,14 +491,7 @@ impl TriangleGrid {
             if t.surface & 0xF == 0 {
                 continue;
             }
-            let side = |a: Vec3, b: Vec3| (b.x - a.x) * (p.z - a.z) - (b.z - a.z) * (p.x - a.x);
-            let (d0, d1, d2) = (side(t.a, t.b), side(t.b, t.c), side(t.c, t.a));
-            let inside = (d0 >= 0.0 && d1 >= 0.0 && d2 >= 0.0) || (d0 <= 0.0 && d1 <= 0.0 && d2 <= 0.0);
-            if !inside {
-                continue;
-            }
-            let n = (t.b - t.a).cross(t.c - t.a);
-            if n.y.abs() < 1e-9 {
+            if plan_normal(t, p).is_none() {
                 continue;
             }
             let d = (patch_centre_y(t) - p.y).abs();
@@ -499,17 +521,8 @@ impl TriangleGrid {
             if t.surface & 0xF == 0 {
                 continue;
             }
-            let side = |a: Vec3, b: Vec3| (b.x - a.x) * (p.z - a.z) - (b.z - a.z) * (p.x - a.x);
-            let (d0, d1, d2) = (side(t.a, t.b), side(t.b, t.c), side(t.c, t.a));
-            let inside = (d0 >= 0.0 && d1 >= 0.0 && d2 >= 0.0) || (d0 <= 0.0 && d1 <= 0.0 && d2 <= 0.0);
-            if !inside {
-                continue;
-            }
-            let n = (t.b - t.a).cross(t.c - t.a);
-            if n.y.abs() < 1e-9 {
-                continue;
-            }
-            let h = t.a.y - (n.x * (p.x - t.a.x) + n.z * (p.z - t.a.z)) / n.y;
+            let Some(n) = plan_normal(t, p) else { continue };
+            let h = plane_height(t, n, p);
             let d = (patch_centre_y(t) - p.y).abs();
             if best.map(|(bd, _, _)| d < bd).unwrap_or(true) {
                 best = Some((d, t.surface, h));
@@ -529,7 +542,7 @@ impl TriangleGrid {
 
     /// [`Self::patches_at`] with another test on the flags word — 0x473420, the ceiling list, keeps
     /// the words with bit 15 set and **no** surface nibble (0x4734D6…0x4734E5).
-    pub fn patches_where(&self, p: Vec3, keep: impl Fn(u32) -> bool + 'static) -> impl Iterator<Item = (&Triangle, f32)> + '_ {
+    pub fn patches_where<'a>(&'a self, p: Vec3, keep: impl Fn(u32) -> bool + 'a) -> impl Iterator<Item = (&'a Triangle, f32)> + 'a {
         let cell = if self.tris.is_empty() {
             &[][..]
         } else {
@@ -541,17 +554,8 @@ impl TriangleGrid {
             if !keep(t.surface) {
                 return None;
             }
-            let side = |a: Vec3, b: Vec3| (b.x - a.x) * (p.z - a.z) - (b.z - a.z) * (p.x - a.x);
-            let (d0, d1, d2) = (side(t.a, t.b), side(t.b, t.c), side(t.c, t.a));
-            let inside = (d0 >= 0.0 && d1 >= 0.0 && d2 >= 0.0) || (d0 <= 0.0 && d1 <= 0.0 && d2 <= 0.0);
-            if !inside {
-                return None;
-            }
-            let n = (t.b - t.a).cross(t.c - t.a);
-            if n.y.abs() < 1e-9 {
-                return None;
-            }
-            Some((t, t.a.y - (n.x * (p.x - t.a.x) + n.z * (p.z - t.a.z)) / n.y))
+            let n = plan_normal(t, p)?;
+            Some((t, plane_height(t, n, p)))
         })
     }
 
@@ -602,6 +606,9 @@ fn ray_triangle(o: Vec3, d: Vec3, t: &Triangle) -> Option<(f32, Vec3, f32, f32)>
     }
     Some((dist, n, u, v))
 }
+
+#[cfg(test)]
+mod plan_guard;
 
 #[cfg(test)]
 mod tests {

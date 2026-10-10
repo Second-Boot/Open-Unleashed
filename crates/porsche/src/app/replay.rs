@@ -168,7 +168,7 @@ impl App {
         let race_class = setup.sim.to_lowercase().starts_with("gt") || setup.sim.starts_with("935");
         self.specs = CarSpecs::from_sim(&car.1, race_class);
         // `.TINYCAR` (cheat bit 1) at the `.sim` load, 0x49C9B2
-        if self.cheat_bits & (1 << 1) != 0 {
+        if self.cheat_bits & CHEAT_TINY != 0 {
             self.specs.apply_tinycar();
         }
         // 0x49CB50 folds the car's stock parts (0x4EE9A0) and the neutral sliders (0x4EED2D) — the
@@ -294,7 +294,7 @@ impl App {
         // session's own bit comes back when the playback is left) and a positional network race's car-car pass
         if let Some(d) = setup.derby {
             let live = *self.cheat_bits_live.get_or_insert(self.cheat_bits);
-            self.cheat_bits = if d { live | (1 << 7) } else { live & !(1 << 7) };
+            self.cheat_bits = if d { live | CHEAT_DERBY } else { live & !CHEAT_DERBY };
             self.net_derby = d && setup.net.is_some();
         }
         if let Some(nc) = setup.nocollision {
@@ -422,7 +422,7 @@ impl App {
                 // the gates `[0x657E34]` (aborted — such a race is left, never replayed here),
                 // `[0x60C9B4]` (not in this port) and `DERBY` (0x4266A0: `[0x657400] == 0`) — the Smash Up
                 // cheat closes the dialogs and queues nothing
-                if self.cheat_bits & (1 << 7) == 0
+                if self.cheat_bits & CHEAT_DERBY == 0
                     && let Some(r) = self.results.as_mut()
                 {
                     // `0x426C90(1)`: the queue from its start, no `HCongrats`

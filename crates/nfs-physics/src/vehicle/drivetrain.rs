@@ -17,7 +17,7 @@ impl Vehicle {
         // (0x40C051…0x40C0AB, no alive test): past tick 0x1C0 it is put straight into 1st —
         // `car+0xD82` and `+0xD7E` both 2 — with a shift timer of `4 + (rand·8 >> 16)`, one draw;
         // a human car's automatic is 0x49DD20's (in [`Self::process_input`], after the request)
-        if self.ai_driven && self.gear <= 1 && self.game_tick > 0x1C0 {
+        if self.ai_driven && self.gear <= 1 && self.game_tick > TICK_RACE_START {
             self.shift_timer = 4 + match self.shift_roll.take() {
                 Some(r) => (r * 8) >> 16,
                 None => self.rand_below(8),
@@ -104,7 +104,7 @@ impl Vehicle {
         // 0x49DD20 for a manual human car (0x49DEDC / 0x49DEE1), after the start tick (0x49DDAE):
         // the request is taken as it stands — the previous gear kept, the downshift flag set when
         // going down into a forward gear, the shift timer loaded with `specs[0x54]`
-        if !self.ai_driven && self.game_tick > 0x1C0 {
+        if !self.ai_driven && self.game_tick > TICK_RACE_START {
             if self.automatic {
                 self.automatic_request();
             }
@@ -155,7 +155,7 @@ impl Vehicle {
     /// the latch `car+0xD98`, which a request that differs from the gear clears.
     /// `car+0x540` / `+0x544` are not carried.
     fn automatic_request(&mut self) {
-        if self.game_tick < 0x1C4 {
+        if self.game_tick < TICK_AUTOMATIC {
             self.requested_gear = 2;
             return;
         }
@@ -305,7 +305,7 @@ impl Vehicle {
             self.rpm = specs.redline + 50.0;
             self.ignition_cut = if gear > 1 && rear_contact {
                 self.rand_below(2) + 3 * gear as u32
-            } else if self.ai_driven && self.game_tick < 0x1A0 {
+            } else if self.ai_driven && self.game_tick < TICK_AI_MISFIRE {
                 self.rand_below(20) + 10
             } else {
                 self.rand_below(2) + 2
@@ -329,7 +329,8 @@ impl Vehicle {
         // block below, so on those paths it kept the previous tick's value.
         self.rear_spin = false;
         // `misfire = engineDamage/300 > rand01` (§4.3), drawn at the top of the routine (0x49E4BD)
-        let misfire = self.engine_wear(specs) / 300.0 > self.misfire_roll;
+        let engine_wear = self.engine_wear(specs);
+        let misfire = engine_wear / 300.0 > self.misfire_roll;
         // **The no-drive path, 0x49EF36…0x49F075**, entered in neutral, mid-shift or with the rear
         // off the ground (0x49E84F / 0x49E85D / 0x49E869):
         //
@@ -382,7 +383,8 @@ impl Vehicle {
         let rpm_wheel = specs.ratio_rpm_per_mps[ratio_gear] * vz;
         let rpm_c = self.rpm.clamp(0.0, specs.redline);
         let t = specs.torque_at(rpm_c);
-        let mut a_drive = t * specs.accel_per_torque[gear] * (1.0 - self.engine_wear(specs) / 300.0) * (1.0 - 0.005 * self.gearbox_wear(specs));
+        let gearbox_wear = self.gearbox_wear(specs);
+        let mut a_drive = t * specs.accel_per_torque[gear] * (1.0 - engine_wear / 300.0) * (1.0 - 0.005 * gearbox_wear);
         // `diff = target − |wheel rpm|` (0x49E9A7…0x49E9AD, `fsub st(1)`), zeroed when it is under
         // 125 (`[0x5B4A58]`, 0x49E9CA `test ah,1; je` skips at `>=`) **and the target is below
         // `redline − 300`** (0x49E9D7: `fld redline−300; fcomp target; test ah,0x41; jne` skips the
@@ -478,7 +480,7 @@ impl Vehicle {
             } else {
                 let k4 = if self.ignition_cut > 0 { 4.0 } else { 1.0 };
                 let neg = -(a_drive * k4 * specs.engine_brake);
-                a_drive = (self.gearbox_wear(specs) * 0.02 + 1.0).min(5.0) * neg;
+                a_drive = (gearbox_wear * 0.02 + 1.0).min(5.0) * neg;
             }
             let cap = specs.mps_per_rpm[gear] * 81920.0;
             let step = if gear == 0 { (-slip).max(cap) } else { (-slip).min(cap) };
@@ -590,7 +592,7 @@ impl Vehicle {
         self.wheels[2].limit -= left;
         self.wheels[1].limit += right;
         self.wheels[3].limit += right;
-        self.gravity_scale = 1.16;
+        self.gravity_scale = GRAVITY_SCALE;
         let vz = self.v_local.z;
         if vz > 5.0 {
             let aero = 1.0 - 0.005 * self.aero_wear(specs);
@@ -603,7 +605,7 @@ impl Vehicle {
             // 0x4A1C35 `fld [car+0x3A0]; fcomp 0.939; test ah,0x41; jne 0x4A1C62` skips the add
             // when `cosTilt <= 0.939`, so the rear downforce presses an **upright** car down.
             // *(Corrected 2026-09-26: `physics.md` §5.1 and the port had `< 0.939`.)*
-            if self.cos_tilt > 0.939 {
+            if self.cos_tilt > UPRIGHT_COS_TILT {
                 self.gravity_scale += 8.0 * dr;
             }
         }

@@ -78,7 +78,7 @@ impl App {
             // the accessor's own index `[this+0x18]` (0x4BC460), which is the row the graphics
             // screen shows — *(until 2026-09-26 the port wrote the index of its own draw-distance
             // factor `detail`, which no screen sets)*
-            view_distance: self.choice_index("Graphics.ViewDistance").map_or(0, |(i, _)| i as u8),
+            view_distance: self.choice_index(choice::GRAPHICS_VIEW_DISTANCE).map_or(0, |(i, _)| i as u8),
             laps: self.fe.menu.as_ref().map(|m| m.laps).unwrap_or(self.num_laps),
             opponents: self
                 .fe.menu
@@ -316,8 +316,8 @@ impl App {
         let m = self.fe.menu.as_ref()?;
         Some(
             match self.fe.game_type {
-                1 => m.looped_track(),
-                2 => m.ko_track(m.ko_sel),
+                game_type::QUICK_KNOCKOUT => m.looped_track(),
+                game_type::KNOCKOUT => m.ko_track(m.ko_sel),
                 _ => m.track(),
             }
             .to_string(),

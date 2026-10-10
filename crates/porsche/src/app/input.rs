@@ -275,7 +275,7 @@ impl App {
                             car.sim.to_lowercase().starts_with("gt") || car.sim.starts_with("935");
                         self.specs = CarSpecs::from_sim(&sim, race_class);
                         // `.TINYCAR` (cheat bit 1) at the `.sim` load, 0x49C9B2
-                        if self.cheat_bits & (1 << 1) != 0 {
+                        if self.cheat_bits & CHEAT_TINY != 0 {
                             self.specs.apply_tinycar();
                         }
                         // a freshly built catalogue car: its stock parts (0x4EE9A0) and the constructor's
@@ -349,7 +349,7 @@ impl App {
                 self.road.traffic_ids = None;
                 self.road.damage_on = m.damage;
                 // the single race (game type 0) with the Fuzzyfuz code is the cops race (0x4EB4FD)
-                self.road.cops_race = m.mode == 0 && self.cheat_bits & (1 << 5) != 0;
+                self.road.cops_race = m.mode == 0 && self.cheat_bits & CHEAT_COPS != 0;
                 self.road.cops_enabled = m.cops || self.road.cops_race;
                 self.road.cop_count = 4;
                 self.owned_paint = None;
@@ -389,7 +389,7 @@ impl App {
                             car.sim.to_lowercase().starts_with("gt") || car.sim.starts_with("935");
                         self.specs = CarSpecs::from_sim(&sim, race_class);
                         // `.TINYCAR` (cheat bit 1) at the `.sim` load, 0x49C9B2
-                        if self.cheat_bits & (1 << 1) != 0 {
+                        if self.cheat_bits & CHEAT_TINY != 0 {
                             self.specs.apply_tinycar();
                         }
                         // a freshly built catalogue car: its stock parts (0x4EE9A0) and the constructor's
@@ -596,8 +596,8 @@ impl App {
                     Some("SETTYPEQUICKKNOCKOUT") => Some(1),
                     Some("SETTYPEKNOCKOUT") => Some(2),
                     Some("SETTYPEMULTIPLAYER") => Some(3),
-                    Some("SETTYPECAREERMODE") => Some(4),
-                    Some("SETTYPEFACTORYDRIVER") => Some(9),
+                    Some("SETTYPECAREERMODE") => Some(game_type::TOURNAMENT),
+                    Some("SETTYPEFACTORYDRIVER") => Some(game_type::MISSION),
                     _ => None,
                 } {
                     self.fe.game_type = t;
@@ -667,7 +667,7 @@ impl App {
                     self.fe.comms_game_mode = mode;
                     if mode == 0 {
                         // (`update_check_tick`; set by fields: `l` borrows the screen)
-                        let ticks = nfs_game::config::cfg().nfs_update_check_ticks.var().ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(netlobby::UPDATE_THREAD_TICKS);
+                        let ticks = nfs_game::config::cfg().nfs_update_check_ticks.as_str().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(netlobby::UPDATE_THREAD_TICKS);
                         if self.fe.update_check.is_none() {
                             self.fe.update_check = Some((ticks, true));
                         }

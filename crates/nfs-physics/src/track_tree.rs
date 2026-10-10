@@ -101,7 +101,7 @@ impl TrackTree {
     /// insertion-order — the same order a leaf's own entries were inserted in, since `0x483DF0`'s
     /// split re-inserts a leaf's list front to back and `0x484AE0` only ever appends.
     pub fn query_segment(&self, p0: (f32, f32), p1: (f32, f32)) -> impl Iterator<Item = TreeItem> + '_ {
-        self.tree.query_segment(p0, p1).into_iter().map(move |i| self.order[i])
+        self.tree.segment_iter(p0, p1).map(move |i| self.order[i])
     }
 }
 

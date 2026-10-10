@@ -52,6 +52,12 @@ pub(crate) fn u32_le(data: &[u8], off: usize, what: &'static str) -> Result<u32,
         .ok_or(FormatError::Truncated { offset: off, needed: 4, what })
 }
 
+/// A `Vec::with_capacity` argument for `n` records a header announces: the announcement is
+/// untrusted, and `data_len / min_record_bytes` is the most the file can actually hold.
+pub(crate) fn cap_hint(n: usize, data_len: usize, min_record_bytes: usize) -> usize {
+    n.min(data_len / min_record_bytes.max(1))
+}
+
 /// A little-endian `u32` at `o` of a record the caller has already length-checked (panics past the end).
 pub(crate) fn dword(r: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([r[o], r[o + 1], r[o + 2], r[o + 3]])

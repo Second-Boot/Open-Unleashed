@@ -182,7 +182,7 @@ impl App {
         // first undone event (0x504E79…0x504EB4) — `Tournament.RemainingTracks` back on row 0.
         // A club list (EventType 1…3) is the career's club mode here (`CareerUi::club`).
         if base == "Tournament.Tournament" {
-            let ev_type = self.choice_index("Tournament.EventType").map_or(0, |(i, _)| i);
+            let ev_type = self.choice_index(choice::TOURNAMENT_EVENT_TYPE).map_or(0, |(i, _)| i);
             if let Some(c) = self.career.as_mut() {
                 let list: Vec<i16> = c.event_type_list(ev_type).iter().map(|t| t.id).collect();
                 if !list.is_empty() {

@@ -477,8 +477,13 @@ pub const YEAR_TABLE: [u16; 17] = [1950, 1956, 1960, 1965, 1969, 1970, 1973, 197
 /// families present in `nfs5.prt` (`356`, `356A`, `356B`, `550A`, `911`, `911 (930)`, `911 (964)`,
 /// `911 (993)`, `911 (996)`, `914`, `935`, `944`, `Boxster`, `GT1`).
 pub fn part_family(car: &CarCatalogEntry) -> Option<&'static str> {
-    let f = car.family.as_str();
-    let y = car.year;
+    part_family_of(car.family.as_str(), car.year)
+}
+
+/// [`part_family`] on the two fields it reads. The arms are ORDER-SENSITIVE (the generic `911` +
+/// year arms come before `911 Turbo`, so a Turbo of 1989 or later is a `911 (964)` and never a
+/// `911 (930)`), pinned by `part_family_ladder_is_order_sensitive`.
+fn part_family_of(f: &str, y: u16) -> Option<&'static str> {
     Some(match () {
         _ if f.starts_with("356 B") => "356B",
         _ if f.starts_with("356 A") => "356A",
@@ -901,7 +906,7 @@ impl Career {
     /// migration ([`crate::save::migrate_legacy_json`]) and never written again — the career is
     /// the profile's `.sav`, as in the original.
     pub fn legacy_json_path() -> PathBuf {
-        if std::env::var_os("NFS5_SAVE_DIR").is_some() {
+        if crate::config::cfg().nfs5_save_dir.is_set() {
             return crate::save::save_dir().join("career.json");
         }
         nfs_assets::platform::data_dir().join("career.json")
@@ -3346,5 +3351,49 @@ mod tests {
         assert_eq!(c.part_damage(0, &part), if m(1.0) > 0.0 { 100.0 } else { 90.0 });
         c.record_damage(&tables, 0, [0.0; 10]);
         assert_eq!(c.part_damage(0, &part), if m(1.0) > 0.0 { 0.0 } else { 90.0 }, "below 0 the front end holds it at 0");
+    }
+
+    /// Refactor guard (M4): the 14 `nfs5.prt` families over the years, including the order quirks
+    /// of the ladder — a `911 Turbo` from 1989 on is a 964, a Turbo of 1975..=1988 a 930, an
+    /// earlier or later plain 911 by the year bands, `911 GT1` before the `911` arms.
+    #[test]
+    fn part_family_ladder_is_order_sensitive() {
+        let cases: &[(&str, u16, Option<&str>)] = &[
+            ("356", 1950, Some("356")),
+            ("356 A", 1955, Some("356A")),
+            ("356 B", 1960, Some("356B")),
+            ("356 Carrera", 1962, Some("356")),
+            ("550 Spyder", 1954, Some("550A")),
+            ("914", 1970, Some("914")),
+            ("914/6", 1971, Some("914")),
+            ("935", 1978, Some("935")),
+            ("944", 1985, Some("944")),
+            ("944 Turbo", 1987, Some("944")),
+            ("Boxster", 1997, Some("Boxster")),
+            ("Boxster S", 2000, Some("Boxster")),
+            ("911 GT1", 1998, Some("GT1")),
+            ("911 GT1", 1990, Some("GT1")),
+            ("911", 1964, Some("911")),
+            ("911", 1988, Some("911")),
+            ("911", 1989, Some("911 (964)")),
+            ("911", 1993, Some("911 (964)")),
+            ("911", 1994, Some("911 (993)")),
+            ("911", 1998, Some("911 (993)")),
+            ("911", 1999, Some("911 (996)")),
+            ("911", 2003, Some("911 (996)")),
+            ("911 Turbo", 1974, Some("911")),
+            ("911 Turbo", 1975, Some("911 (930)")),
+            ("911 Turbo", 1988, Some("911 (930)")),
+            ("911 Turbo", 1989, Some("911 (964)")),
+            ("911 Turbo", 1995, Some("911 (993)")),
+            ("911 Turbo", 2000, Some("911 (996)")),
+            ("911 Carrera RS", 1973, Some("911")),
+            ("Cayenne", 2003, None),
+            ("", 1990, None),
+            ("GT2", 1996, None),
+        ];
+        for &(family, year, want) in cases {
+            assert_eq!(part_family_of(family, year), want, "{family} {year}");
+        }
     }
 }

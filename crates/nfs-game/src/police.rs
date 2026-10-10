@@ -382,7 +382,7 @@ mod tests;
 // ---------------------------------------------------------------------------------------------
 
 use crate::aidrive::{self, AiCarState};
-use crate::lanes::{lane_of, lane_span, LaneCar, LaneScratch, LaneSelf, PERSONALITIES};
+use crate::lanes::{lane_of, lane_span, LaneCar, LanePassCtx, LaneScratch, LaneSelf};
 use glam::{Mat3, Vec3};
 use nfs_physics::collision::TriangleGrid;
 use nfs_physics::specs::CarSpecs;
@@ -571,7 +571,7 @@ pub const NUDGE_TICKS: u64 = 0x20;
 /// update, 62 at 4 Hz (round to nearest even) — and the LCG step `r` (the shared `rand16`),
 /// passing when `(r · 1000) >> 16 < thr`: 0.25 per second of AI updates.
 pub fn nudge_roll(ai_ticks: i32, r16: u32) -> bool {
-    let thr = (ai_ticks as f32 * 0.25 * 0.03125 * 1000.0).round_ties_even() as i32;
+    let thr = (ai_ticks as f32 * 0.25 * crate::traffic::AI_DT * 1000.0).round_ties_even() as i32;
     (((r16 * 1000) >> 16) as i32) < thr
 }
 /// `0x5CBEA0[level]+0x0C` — how long the close-in (ram) mode lasts, in ticks: 0x4046C3 hands it to
@@ -1151,11 +1151,13 @@ pub struct Police {
     /// `edi = nP + nOpp` at 0x4ED103 / 0x4ED1ED, `traffic.md` §17.5d). It is the phase of the AI
     /// pass's gate ([`crate::traffic::ai_pass_due`], `car+0` = `slot | 0x100`); the caller sets it.
     pub slot_base: usize,
+    /// the lane pass's lists, refilled for every cop ([`Police::lane_pass`]; no per-cop allocation)
+    lane_ctx: LanePassCtx,
 }
 
 impl Police {
     pub fn new(file: CopFile, cars: Vec<CopCar>, skill: u8, one_way: bool) -> Self {
-        Self { manager: CopManager::new(file), cars, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: CopPhysics::default(), violation: Violation::None, route_dir: 1.0, skill, one_way, wanted: false, weather: false, racers: Vec::new(), other_places: Vec::new(), other_positions: Vec::new(), race_order: Vec::new(), spawn_order: Vec::new(), budget: duty_budget(1, false), slot_base: 0, roster: [None; 7] }
+        Self { manager: CopManager::new(file), cars, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: CopPhysics::default(), violation: Violation::None, route_dir: 1.0, skill, one_way, wanted: false, weather: false, racers: Vec::new(), other_places: Vec::new(), other_positions: Vec::new(), race_order: Vec::new(), spawn_order: Vec::new(), budget: duty_budget(1, false), slot_base: 0, roster: [None; 7], lane_ctx: LanePassCtx::default() }
     }
 
     /// This tick's racers, and `0x417710` (called at 0x4179BF at the end of the per-tick car pass):
@@ -1186,9 +1188,20 @@ impl Police {
     /// keys go to whichever of them the stable sort has left later — the registration order at the
     /// start (the later-registered racer), then whatever order the last change of lead left.
     fn leading_racer(&self) -> Option<usize> {
-        let mut order = self.race_order.clone();
-        stable_order(&mut order, &self.racers, RacerRef::order_key);
-        order.last().copied()
+        // the last of the stable ascending sort = the maximum, the later of equal keys winning; one
+        // pass over the array in its current order (`stable_order` resets a wrong-sized one to the
+        // registration order), the earlier racer kept only when its key is strictly greater
+        let n = self.racers.len();
+        let kept = self.race_order.len() == n;
+        let mut best: Option<usize> = None;
+        for k in 0..n {
+            let r = if kept { self.race_order[k] } else { k };
+            best = match best {
+                Some(b) if self.racers[b].order_key() > self.racers[r].order_key() => Some(b),
+                _ => Some(r),
+            };
+        }
+        best
     }
 
     /// `AIHigh_Perp+0x78 != 0` for racer `p`. **Only the human's can ever be set.** An opponent's
@@ -2267,17 +2280,13 @@ impl Police {
     /// behaviours call, and which is also what counts `chase+0x90`.
     fn lane_pass(&mut self, table: &SliceTable, i: usize, target: &ChaseTarget, others: &[LaneCar], chase: bool, ai_ticks: i32) {
         let sl = table.slices[self.cars[i].slice.min(table.slices.len() - 1)];
-        let mut cars: Vec<LaneCar> = others.to_vec();
-        cars.extend(self.cars.iter().enumerate().filter(|(j, o)| *j != i && o.active).map(|(_, o)| o.as_lane_car(table)));
-        // `car+0x528` of each entry of `cars`, when the caller gave the others' (the race gives
-        // them; the unit tests do not and the walk sorts the cars itself)
-        let places: Vec<usize> = self
-            .other_places
-            .iter()
-            .copied()
-            .chain(self.cars.iter().enumerate().filter(|(j, o)| *j != i && o.active).map(|(_, o)| o.place))
-            .collect();
-        let placed = self.other_places.len() == others.len();
+        // the lists of the pass (`car+0x528` of each entry when the caller gave the others': the race
+        // gives them, the unit tests do not and the walk sorts the cars itself; and the world
+        // positions for 0x40E860's fine step, `traffic.md` section 34.6 *(until then `police.rs`
+        // called `find_blockers_placed` with `None`, i.e. every lane-blocker gap was the coarse
+        // 6 m-per-slice one)*) — the same builder as `TrafficSet::ai_on`'s
+        let mut ctx = std::mem::take(&mut self.lane_ctx);
+        ctx.fill(others, &self.other_places, &self.other_positions, self.cars.iter().enumerate().filter(|(j, o)| *j != i && o.active).map(|(_, o)| (o.as_lane_car(table), o.place, o.position)));
         let c = &self.cars[i];
         let me = LaneSelf {
             slice: c.slice,
@@ -2294,19 +2303,7 @@ impl Police {
         };
         let mut sc = LaneScratch::default();
         let mut scan = c.scan;
-        // world positions in the order of `cars` for 0x40E860's fine step (`traffic.md` §34.6): an
-        // `others` entry the caller gave no position for falls back to the slice gap (NaN is never
-        // within ±12 m of anything the fine step would accept, so it is filtered out below), same as
-        // `TrafficSet::ai`'s `positions`. *(Until now `police.rs` called `find_blockers_placed` with
-        // `None`, i.e. every lane-blocker gap was the coarse 6 m-per-slice one, §34.6's gap left for
-        // this module.)*
-        let positions: Vec<Vec3> = (0..others.len())
-            .map(|k| self.other_positions.get(k).copied().unwrap_or(Vec3::NAN))
-            .chain(self.cars.iter().enumerate().filter(|(j, o)| *j != i && o.active).map(|(_, o)| o.position))
-            .collect();
-        let fine_ok = positions.iter().all(|p| p.is_finite());
-        let me_pos = c.position;
-        sc.find_blockers_placed(table, &me, &cars, &PERSONALITIES[0], fine_ok.then_some((me_pos, positions.as_slice())), placed.then_some((c.place, places.as_slice())));
+        ctx.find_blockers(&mut sc, table, &me, c.position, c.place);
         sc.score_own_side(&me, self.one_way, true);
         // §27.10 `0x40DA00`: +15 to whichever side the target is on (`0x401380` × 3), but only when
         // the lane corridor between the two cars is broken at the target's slice and whole at the
@@ -2330,16 +2327,16 @@ impl Police {
             }
         }
         sc.score_blockers(&me);
-        sc.score_abreast(table, &me, &cars);
+        sc.score_abreast(table, &me, &ctx.cars);
         sc.score_lane_exists(table, &me, &mut scan, ai_ticks);
         sc.score_narrowing(table, &me);
-        sc.score_shoulders(table, &me, &cars);
+        sc.score_shoulders(table, &me, &ctx.cars);
         let (slot, lane) = sc.pick(&me);
         // 0x402A5A…0x402A7D: a positive `car+0x107C` first tries the held offset `car+0x1078`
         // (`0x402790`), which bypasses the squeeze-past and the lane centre when it wins
         let (held, bias) = (self.cars[i].lane_override, self.cars[i].lane_bias);
-        let lateral_target = if bias > 0.0 && sc.override_holds(table, &me, held, bias) { held } else { sc.lateral_target(table, &me, lane, slot, &cars) };
-        let capped = sc.capped_target(&me, lane, lateral_target, 0.0, &cars);
+        let lateral_target = if bias > 0.0 && sc.override_holds(table, &me, held, bias) { held } else { sc.lateral_target(table, &me, lane, slot, &ctx.cars) };
+        let capped = sc.capped_target(&me, lane, lateral_target, 0.0, &ctx.cars);
         let c = &mut self.cars[i];
         c.scan = scan;
         c.stuck_ticks = stuck;
@@ -2348,6 +2345,7 @@ impl Police {
         // target under an aim point.)*
         c.lateral_target = lateral_target;
         c.target_speed = capped;
+        self.lane_ctx = ctx;
     }
 
     /// The 64 Hz half — the two shared Sc64 integrators every car record runs (`car+0xE24` /

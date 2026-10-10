@@ -29,6 +29,76 @@
 
 use crate::{f32_le, u16_le, u32_le, FormatError};
 
+/// The tags of the table entries (see the layout above): four characters for the level entries,
+/// two for the parts; the file stores them reversed and the parser reads them back in order.
+pub mod tags {
+    // level entries
+    pub const TRAK: &[u8; 4] = b"Trak";
+    pub const CAR: &[u8; 4] = b"Car ";
+    pub const ARTI: &[u8; 4] = b"Arti";
+    pub const RMTH: &[u8; 4] = b"RMth";
+    pub const ANQT: &[u8; 4] = b"Anqt";
+    pub const BASE: &[u8; 4] = b"Base";
+    pub const NAME: &[u8; 4] = b"Name";
+    pub const BNDP: &[u8; 4] = b"BndP";
+    pub const WNDO: &[u8; 4] = b"Wndo";
+    // parts: materials
+    pub const MT: &[u8; 2] = b"mt";
+    pub const SN: &[u8; 2] = b"sn";
+    pub const SF: &[u8; 2] = b"sf";
+    // parts: articles
+    pub const TR: &[u8; 2] = b"tr";
+    pub const PR: &[u8; 2] = b"pr";
+    pub const DZ: &[u8; 2] = b"dz";
+    /// the `pr` record's four vertex streams
+    pub const VT: &[u8; 2] = b"vt";
+    pub const NM: &[u8; 2] = b"nm";
+    pub const UV: &[u8; 2] = b"uv";
+    pub const DF: &[u8; 2] = b"df";
+    /// a `pr` record's index-array tag, as read back after the reversal (`uI` in the file)
+    pub const IU: &[u8; 2] = b"Iu";
+}
+
+/// `StreamDesc::kind`: which of a primitive's four vertex streams a descriptor windows.
+pub mod stream_kind {
+    pub const VT: u16 = 0;
+    pub const NM: u16 = 1;
+    pub const UV: u16 = 2;
+    pub const DF: u16 = 3;
+}
+
+/// `StreamDesc::slot` of a descriptor that names no stream.
+pub const NO_SLOT: u32 = 0xFFFF_FFFF;
+
+/// `PrimitiveRecord::prim_type` / `Primitive::prim_type`: how the corner list reads.
+pub mod prim_type {
+    /// triangle strip
+    pub const STRIP: u16 = 1;
+    /// triangle list
+    pub const LIST: u16 = 3;
+    /// quad list ("sequential quads", `RE/notes/crp-geometry.md` §4)
+    pub const QUADS: u16 = 4;
+}
+
+/// `RenderOp::class` codes of the render layers the port reads (the layer factory 0x449B70, jump
+/// table 0x449F70; `RE/notes/lighting.md` §4, §5). `LayerState` is the factory 0x53F980's class 8.
+pub mod layer_class {
+    /// `LayerState` — the `Rs` render-state block
+    pub const STATE: u32 = 8;
+    /// `RCustomLayers::LayerUVAnimate`
+    pub const UV_ANIMATE: u32 = 0x8001;
+    /// `Headlights::LayerVertexLight`
+    pub const VERTEX_LIGHT: u32 = 0x8002;
+    /// `Headlights::LayerVertexLight_Opaque`
+    pub const VERTEX_LIGHT_OPAQUE: u32 = 0x8003;
+    /// `Headlights::LayerUVLight` (allocator 0x449C6D, constructor 0x453C60)
+    pub const UV_LIGHT: u32 = 0x8004;
+    /// `RCustomLayers::LayerAmbient`
+    pub const AMBIENT: u32 = 0x8007;
+    /// `Headlights::LayerVertexLight_Ambient`
+    pub const VERTEX_LIGHT_AMBIENT: u32 = 0x8011;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrpKind {
     Track,
@@ -164,7 +234,7 @@ fn parse_entry(data: &[u8], idx: usize) -> Result<CrpEntry, FormatError> {
     } else {
         CrpEntry::Part { entry_index: idx as u32, index: u16_le(e, 0, "CRP part index")?, tag: [e[3], e[2]], a, b, c }
     };
-    if !ent.is_level(b"Arti") {
+    if !ent.is_level(tags::ARTI) {
         let end = ent.data_offset() + ent.data_len();
         if end > data.len() {
             return Err(FormatError::InvalidOffset { what: "CRP entry data", offset: end, len: data.len() });
@@ -178,8 +248,8 @@ impl Crp {
         let magic = data.get(0..4).ok_or(FormatError::Truncated { what: "CRP header", offset: 0, needed: 16 })?;
         let m = [magic[3], magic[2], magic[1], magic[0]];
         let kind = match &m {
-            b"Trak" => CrpKind::Track,
-            b"Car " => CrpKind::Car,
+            tags::TRAK => CrpKind::Track,
+            tags::CAR => CrpKind::Car,
             other if is_ascii_tag(other) => CrpKind::Other(*other),
             _ => {
                 return Err(FormatError::UnknownMagic { what: "CRP", offset: 0, expected: b"karT / raC ".to_vec(), found: magic.to_vec() })
@@ -208,7 +278,7 @@ impl Crp {
         let first_run = level
             .iter()
             .filter_map(|e| match e {
-                CrpEntry::Level { entry_index, tag, c, .. } if tag == b"Arti" => Some(*entry_index as usize + *c as usize),
+                CrpEntry::Level { entry_index, tag, c, .. } if tag == tags::ARTI => Some(*entry_index as usize + *c as usize),
                 _ => None,
             })
             .min()
@@ -217,7 +287,7 @@ impl Crp {
         for i in idx..first_run {
             let e = parse_entry(data, i)?;
             match &e {
-                CrpEntry::Part { tag, .. } if matches!(tag, b"mt" | b"sn" | b"sf") => material_entries.push(e),
+                CrpEntry::Part { tag, .. } if matches!(tag, tags::MT | tags::SN | tags::SF) => material_entries.push(e),
                 other => {
                     return Err(FormatError::UnexpectedValue {
                         what: "CRP material table",
@@ -228,7 +298,7 @@ impl Crp {
                 }
             }
         }
-        let n_arti = level.iter().filter(|e| e.is_level(b"Arti")).count() as u32;
+        let n_arti = level.iter().filter(|e| e.is_level(tags::ARTI)).count() as u32;
         if header_a >> 5 != n_arti {
             return Err(FormatError::UnexpectedValue {
                 what: "CRP header article count",
@@ -254,14 +324,14 @@ impl Crp {
     /// the union of the records its style selects. The points are in the model frame with `y = 0` at
     /// the wheel contact plane; the original then shifts them by `−carInfo[0x3AC]`.
     pub fn bound_points(&self, data: &[u8]) -> Result<Vec<BoundPoints>, FormatError> {
-        self.point_records(data, b"BndP")
+        self.point_records(data, tags::BNDP)
     }
 
     /// `Wndo` — the windscreen quad, same record shape as `BndP` and the same style filter
     /// (loader 0x442200). The original draws its first four points with the `INTGLASS` texture in
     /// the cockpit view (0x43A490).
     pub fn window_points(&self, data: &[u8]) -> Result<Vec<BoundPoints>, FormatError> {
-        self.point_records(data, b"Wndo")
+        self.point_records(data, tags::WNDO)
     }
 
     fn point_records(&self, data: &[u8], tag: &[u8; 4]) -> Result<Vec<BoundPoints>, FormatError> {
@@ -294,10 +364,10 @@ impl Crp {
         let mut out = Vec::new();
         for (i, e) in self.level.iter().enumerate() {
             if let CrpEntry::Level { entry_index, tag, b, c, .. } = e
-                && tag == b"Arti"
+                && tag == tags::ARTI
             {
                 let start = *entry_index as usize + *c as usize;
-                let mut parts = Vec::with_capacity(*b as usize);
+                let mut parts = Vec::with_capacity(crate::cap_hint(*b as usize, data.len(), 16));
                 for j in 0..*b as usize {
                     parts.push(parse_entry(data, start + j)?);
                 }
@@ -317,18 +387,18 @@ impl Crp {
     /// Every `RMth` level record ([`RenderMethod`]), in file order.
     pub fn render_methods(&self, data: &[u8]) -> Result<Vec<RenderMethod>, FormatError> {
         self.check(data)?;
-        self.level.iter().filter(|e| e.is_level(b"RMth")).map(|e| RenderMethod::parse(self.entry_data(data, e)?, e.data_offset())).collect()
+        self.level.iter().filter(|e| e.is_level(tags::RMTH)).map(|e| RenderMethod::parse(self.entry_data(data, e)?, e.data_offset())).collect()
     }
 
     /// Materials in table order (`pr.material` indexes this list).
     pub fn materials(&self, data: &[u8]) -> Result<Vec<Material>, FormatError> {
         self.check(data)?;
-        self.material_entries.iter().filter(|e| e.is_part(b"mt")).map(|e| Material::parse(self.entry_data(data, e)?, e.data_offset())).collect()
+        self.material_entries.iter().filter(|e| e.is_part(tags::MT)).map(|e| Material::parse(self.entry_data(data, e)?, e.data_offset())).collect()
     }
 
     /// Name of the external SHPI texture file (`sn` entry), tracks only.
     pub fn texture_file_name(&self, data: &[u8]) -> Result<Option<String>, FormatError> {
-        match self.material_entries.iter().find(|e| e.is_part(b"sn")) {
+        match self.material_entries.iter().find(|e| e.is_part(tags::SN)) {
             Some(e) => Ok(Some(self.entry_string(data, e)?)),
             None => Ok(None),
         }
@@ -336,7 +406,7 @@ impl Crp {
 
     /// Embedded SHPI blobs (`sf` entries), cars only.
     pub fn embedded_texture_files<'a>(&self, data: &'a [u8]) -> Result<Vec<&'a [u8]>, FormatError> {
-        self.material_entries.iter().filter(|e| e.is_part(b"sf")).map(|e| self.entry_data(data, e)).collect()
+        self.material_entries.iter().filter(|e| e.is_part(tags::SF)).map(|e| self.entry_data(data, e)).collect()
     }
 
     /// Which `W*Bundle` claims (and, for every variant here, **consumes**) this article when
@@ -357,12 +427,12 @@ impl Crp {
     ///   `+0x18`/`+0x1c` pair when clear, its auxiliary `+0x34` table when set); **both** branches
     ///   fall through to the same zeroing write, `0x478598`'s `mov dword ptr [eax], 0` at
     ///   `0x47859e`. So this predicate alone decides consumption; equivalent to
-    ///   `art.find(b"tr", 0).is_some()`.
+    ///   `art.find(tags::TR, 0).is_some()`.
     /// - **`WAnimBundle::Load`** (`0x4777F0`): of what `WInstanceBundle` left behind (so, in
     ///   practice, never an article with `'tr'#0`), claims one with an `'Anqt'` level part:
     ///   `call 0x59F7C0` at `0x47781b`, compared against the article's own part-run end sentinel
     ///   (`Entry_base` `0x59F870`) at `0x47783e`/`0x477840`. Equivalent to
-    ///   `art.level(b"Anqt").is_some()`. Consumes.
+    ///   `art.level(tags::ANQT).is_some()`. Consumes.
     /// - **`WMidGroundBundle::Load`** (`0x47CCE0`): of what's left (no `'tr'#0`, no `'Anqt'`),
     ///   claims an article whose `Base` record's flags dword (`Base::flags`, `Base+0`) has bit
     ///   `0x2000` or `0x4000` set — `test ch, 0x60` at `0x47cd67` (count) / `0x47ce37` (fill),
@@ -387,13 +457,13 @@ impl Crp {
     /// with what's read so far; `is_scene_member`'s gate governs its separate `+0x34` auxiliary
     /// transform table only. `WLineBundle` remains out of scope (not article-sourced, zero items).
     pub fn bundle_of(&self, data: &[u8], art: &Article) -> Result<BundleKind, FormatError> {
-        if art.find(b"tr", 0).is_some() {
+        if art.find(tags::TR, 0).is_some() {
             return Ok(BundleKind::Instance);
         }
-        if art.level(b"Anqt").is_some() {
+        if art.level(tags::ANQT).is_some() {
             return Ok(BundleKind::Anim);
         }
-        let midground = match art.level(b"Base") {
+        let midground = match art.level(tags::BASE) {
             Some(e) => Base::parse(self.entry_data(data, e)?, e.data_offset())?.flags & 0x6000 != 0,
             None => false,
         };
@@ -406,10 +476,10 @@ impl Crp {
     /// [`Crp::bundle_of`]'s partition — see that method's doc comment for the gap this predicate
     /// does and does not cover.
     pub fn is_scene_member(&self, data: &[u8], art: &Article) -> Result<bool, FormatError> {
-        if art.find(b"tr", 0).is_none() {
+        if art.find(tags::TR, 0).is_none() {
             return Ok(false);
         }
-        Ok(match art.level(b"Base") {
+        Ok(match art.level(tags::BASE) {
             Some(e) => Base::parse(self.entry_data(data, e)?, e.data_offset())?.flags & 0x8000 != 0,
             None => false,
         })
@@ -423,7 +493,7 @@ impl Crp {
         // is the `Anqt` record's own second word (`[part + 8]`, 0x4779E0…0x4779F4) and its data the
         // record's offset — an `Anqt` article without an `Anim` part plays like any other
         // (every shipped one has both, and the same count: `animscale` example)
-        let anqt = art.level(b"Anqt")?;
+        let anqt = art.level(tags::ANQT)?;
         let count = anqt.b() as usize;
         let (qo, ql) = (anqt.data_offset(), anqt.data_len());
         if count == 0 || ql < count * 52 || qo + ql > data.len() {
@@ -465,7 +535,7 @@ impl Crp {
 
     /// The article's `dz#lod` part (0x59F2A0: `"dz"` + the LOD), if it has one.
     pub fn damage_zones(&self, data: &[u8], art: &Article, lod: u8) -> Result<Option<DamageZones>, FormatError> {
-        match art.find(b"dz", u16::from(lod)) {
+        match art.find(tags::DZ, u16::from(lod)) {
             Some(e) => Ok(Some(DamageZones::parse(self.entry_data(data, e)?)?)),
             None => Ok(None),
         }
@@ -473,16 +543,16 @@ impl Crp {
 
     fn article_geometry_with(&self, data: &[u8], art: &Article, frame: u16, damage: bool) -> Result<ArticleGeometry, FormatError> {
         self.check(data)?;
-        let name = match art.level(b"Name") {
+        let name = match art.level(tags::NAME) {
             Some(e) => self.entry_string(data, e)?,
             None => String::new(),
         };
-        let base = match art.level(b"Base") {
+        let base = match art.level(tags::BASE) {
             Some(e) => Some(Base::parse(self.entry_data(data, e)?, e.data_offset())?),
             None => None,
         };
         let mut transforms = Vec::new();
-        for e in art.parts.iter().filter(|p| p.is_part(b"tr")) {
+        for e in art.parts.iter().filter(|p| p.is_part(tags::TR)) {
             let b = self.entry_data(data, e)?;
             if b.len() >= 64 {
                 let mut m = [0f32; 16];
@@ -494,23 +564,23 @@ impl Crp {
         }
         let transform = transforms.first().map(|t| t.1);
         let mut primitives = Vec::new();
-        for pr in art.parts.iter().filter(|p| p.is_part(b"pr")) {
+        for pr in art.parts.iter().filter(|p| p.is_part(tags::PR)) {
             let lod = pr.lod();
             let bytes = self.entry_data(data, pr)?;
             let rec = PrimitiveRecord::parse(bytes, pr.data_offset())?;
             let stream_bytes = |kind: u16| -> Result<Option<&[u8]>, FormatError> {
-                let Some(sd) = rec.streams.iter().find(|s| s.kind == kind && s.slot != 0xFFFF_FFFF) else { return Ok(None) };
+                let Some(sd) = rec.streams.iter().find(|s| s.kind == kind && s.slot != NO_SLOT) else { return Ok(None) };
                 let tag: &[u8; 2] = match kind {
-                    0 => b"vt",
-                    1 => b"nm",
-                    2 => b"uv",
-                    3 => b"df",
+                    stream_kind::VT => tags::VT,
+                    stream_kind::NM => tags::NM,
+                    stream_kind::UV => tags::UV,
+                    stream_kind::DF => tags::DF,
                     _ => return Ok(None),
                 };
-                let idx = if tag == b"pr" { 0 } else { sd.lod };
-                let idx = if kind == 0 && frame > 0 { frame * 0x10 + idx } else { idx };
-                let idx = if kind == 0 && damage { 0x8000 | idx } else { idx };
-                let part = art.find(tag, idx).or_else(|| if (frame > 0 || damage) && kind == 0 { None } else { art.parts.iter().find(|p| p.is_part(tag) && p.lod() == lod) }).ok_or(FormatError::UnexpectedValue {
+                let idx = if tag == tags::PR { 0 } else { sd.lod };
+                let idx = if kind == stream_kind::VT && frame > 0 { frame * 0x10 + idx } else { idx };
+                let idx = if kind == stream_kind::VT && damage { 0x8000 | idx } else { idx };
+                let part = art.find(tag, idx).or_else(|| if (frame > 0 || damage) && kind == stream_kind::VT { None } else { art.parts.iter().find(|p| p.is_part(tag) && p.lod() == lod) }).ok_or(FormatError::UnexpectedValue {
                     what: "CRP primitive stream",
                     offset: pr.data_offset(),
                     expected: format!("a '{}' part for lod {lod}", String::from_utf8_lossy(tag)),
@@ -521,11 +591,11 @@ impl Crp {
                 let e = s + sd.byte_len as usize;
                 Ok(Some(pb.get(s..e).ok_or(FormatError::InvalidOffset { what: "CRP stream window", offset: part.data_offset() + e, len: part.data_offset() + pb.len() })?))
             };
-            let vt = stream_bytes(0)?;
-            let vt_first = rec.streams.iter().find(|s| s.kind == 0 && s.slot != 0xFFFF_FFFF).map_or(0, |s| s.byte_offset / 16);
-            let nm = stream_bytes(1)?;
-            let uv = stream_bytes(2)?;
-            let df = stream_bytes(3)?;
+            let vt = stream_bytes(stream_kind::VT)?;
+            let vt_first = rec.streams.iter().find(|s| s.kind == stream_kind::VT && s.slot != NO_SLOT).map_or(0, |s| s.byte_offset / 16);
+            let nm = stream_bytes(stream_kind::NM)?;
+            let uv = stream_bytes(stream_kind::UV)?;
+            let df = stream_bytes(stream_kind::DF)?;
             let read_vec = |b: Option<&[u8]>, stride: usize, n: usize| -> Vec<[f32; 3]> {
                 let Some(b) = b else { return Vec::new() };
                 b.chunks_exact(stride)
@@ -772,29 +842,63 @@ pub fn env_variant(reflection: f32) -> usize {
     }
 }
 
+/// Byte offsets inside a material (`mt`) record, as the doc comments of [`Material`]'s fields give
+/// them (the fixed part is 76 bytes; a car's record is longer and carries the extension table).
+mod mt_off {
+    pub const MIN_LEN: usize = 76;
+    pub const FLAGS: usize = 0;
+    pub const CLASS: usize = 4;
+    pub const OP_MASK: usize = 0x0C;
+    /// the 16-byte NUL-padded render-method name
+    pub const METHOD: usize = 16;
+    pub const METHOD_LEN: usize = 16;
+    pub const UNKNOWN_20: usize = 32;
+    /// the texture FourCC (a car's: the 0-based page index)
+    pub const TEXTURE: usize = 40;
+    pub const LOD_BIAS: usize = 0x40;
+    pub const ADDRESS_U: usize = 0x44;
+    pub const ADDRESS_V: usize = 0x48;
+    /// a car's extension-table entry for the `Rs` block: data offset (0) and size (0x18) at these, the data
+    /// at [`RS_DATA`]
+    pub const RS_ID: usize = 168;
+    pub const RS_SIZE: usize = 172;
+    pub const RS_DATA: usize = 260;
+    /// the extension-table entry for `R3DLightLayer`'s block: data offset (0x28) and size (0xC) at these,
+    /// the three dwords at [`LIGHT_DATA`]
+    pub const LIGHT_ID: usize = 248;
+    pub const LIGHT_SIZE: usize = 252;
+    pub const LIGHT_DATA: usize = 300;
+    /// the reflection strength, first of the four equal parameters
+    pub const REFLECTION: usize = 284;
+    /// a record holds the light block and the `Rs` block from this length on
+    pub const EXT_LEN: usize = 312;
+    pub const REFLECTION_END: usize = 288;
+}
+
 impl Material {
     pub fn parse(b: &[u8], off: usize) -> Result<Self, FormatError> {
-        if b.len() < 76 {
-            return Err(FormatError::Truncated { what: "CRP material", offset: off, needed: 76 - b.len() });
+        use mt_off as o;
+        if b.len() < o::MIN_LEN {
+            return Err(FormatError::Truncated { what: "CRP material", offset: off, needed: o::MIN_LEN - b.len() });
         }
-        let name_end = b[16..32].iter().position(|&c| c == 0).unwrap_or(16);
+        let name_end = b[o::METHOD..o::METHOD + o::METHOD_LEN].iter().position(|&c| c == 0).unwrap_or(o::METHOD_LEN);
         Ok(Self {
-            flags: u32_le(b, 0, "mt flags")?,
-            class: u32_le(b, 4, "mt class")?,
-            op_mask: u32_le(b, 0x0C, "mt op mask")?,
-            render_method: b[16..16 + name_end].iter().map(|&c| c as char).collect(),
-            texture: [b[40], b[41], b[42], b[43]],
-            unknown_20: u32_le(b, 32, "mt +32")?,
-            light: (b.len() >= 312 && u32_le(b, 248, "mt +248")? == 0x28 && u32_le(b, 252, "mt +252")? == 0xC).then(|| LayerLight {
-                p0: f32::from_bits(u32::from_le_bytes([b[300], b[301], b[302], b[303]])),
-                p1: f32::from_bits(u32::from_le_bytes([b[304], b[305], b[306], b[307]])),
-                slot: u32::from_le_bytes([b[308], b[309], b[310], b[311]]),
+            flags: u32_le(b, o::FLAGS, "mt flags")?,
+            class: u32_le(b, o::CLASS, "mt class")?,
+            op_mask: u32_le(b, o::OP_MASK, "mt op mask")?,
+            render_method: b[o::METHOD..o::METHOD + name_end].iter().map(|&c| c as char).collect(),
+            texture: [b[o::TEXTURE], b[o::TEXTURE + 1], b[o::TEXTURE + 2], b[o::TEXTURE + 3]],
+            unknown_20: u32_le(b, o::UNKNOWN_20, "mt +32")?,
+            light: (b.len() >= o::EXT_LEN && u32_le(b, o::LIGHT_ID, "mt +248")? == 0x28 && u32_le(b, o::LIGHT_SIZE, "mt +252")? == 0xC).then(|| LayerLight {
+                p0: f32::from_bits(u32::from_le_bytes([b[o::LIGHT_DATA], b[o::LIGHT_DATA + 1], b[o::LIGHT_DATA + 2], b[o::LIGHT_DATA + 3]])),
+                p1: f32::from_bits(u32::from_le_bytes([b[o::LIGHT_DATA + 4], b[o::LIGHT_DATA + 5], b[o::LIGHT_DATA + 6], b[o::LIGHT_DATA + 7]])),
+                slot: u32::from_le_bytes([b[o::LIGHT_DATA + 8], b[o::LIGHT_DATA + 9], b[o::LIGHT_DATA + 10], b[o::LIGHT_DATA + 11]]),
             }),
-            lod_bias: f32::from_bits(u32_le(b, 0x40, "mt lod bias")?),
-            address: [u32_le(b, 0x44, "mt address u")?, u32_le(b, 0x48, "mt address v")?],
-            reflection: if b.len() >= 288 { f32::from_bits(u32::from_le_bytes([b[284], b[285], b[286], b[287]])) } else { 0.0 },
-            rs: (b.len() >= 312 && u32_le(b, 168, "mt +168")? == 0 && u32_le(b, 172, "mt +172")? == 0x18).then(|| {
-                std::array::from_fn(|k| i32::from_le_bytes([b[260 + 4 * k], b[261 + 4 * k], b[262 + 4 * k], b[263 + 4 * k]]))
+            lod_bias: f32::from_bits(u32_le(b, o::LOD_BIAS, "mt lod bias")?),
+            address: [u32_le(b, o::ADDRESS_U, "mt address u")?, u32_le(b, o::ADDRESS_V, "mt address v")?],
+            reflection: if b.len() >= o::REFLECTION_END { f32::from_bits(u32::from_le_bytes([b[o::REFLECTION], b[o::REFLECTION + 1], b[o::REFLECTION + 2], b[o::REFLECTION + 3]])) } else { 0.0 },
+            rs: (b.len() >= o::EXT_LEN && u32_le(b, o::RS_ID, "mt +168")? == 0 && u32_le(b, o::RS_SIZE, "mt +172")? == 0x18).then(|| {
+                std::array::from_fn(|k| i32::from_le_bytes([b[o::RS_DATA + 4 * k], b[o::RS_DATA + 1 + 4 * k], b[o::RS_DATA + 2 + 4 * k], b[o::RS_DATA + 3 + 4 * k]]))
             }),
             blocks: Self::parse_blocks(b),
         })
@@ -911,10 +1015,13 @@ impl RenderMethod {
         if key >= 0x10000 {
             return Some(key);
         }
-        let mut keys: Vec<u32> = self.ops.iter().map(|o| o.key).collect();
-        keys.sort_unstable();
-        keys.dedup();
-        keys.get(key as usize).copied()
+        // the `key`-th smallest distinct op key, found by stepping up the table without building
+        // (and sorting) it
+        let mut at: Option<u32> = None;
+        for _ in 0..=key {
+            at = Some(self.ops.iter().map(|o| o.key).filter(|&k| at.is_none_or(|p| k > p)).min()?);
+        }
+        at
     }
 }
 
@@ -949,15 +1056,23 @@ pub struct PrimitiveRecord {
     pub index_count: u32,
 }
 
+/// Byte offsets inside a `pr` record: the 48-byte header, then the stream descriptors (16 bytes
+/// each), then the index-array descriptors (8 bytes each).
+mod pr_off {
+    pub const HEADER_LEN: usize = 48;
+    pub const N_STREAMS: usize = 40;
+    pub const N_INDEX_ARRAYS: usize = 44;
+}
+
 impl PrimitiveRecord {
     pub fn parse(b: &[u8], off: usize) -> Result<Self, FormatError> {
-        if b.len() < 48 {
-            return Err(FormatError::Truncated { what: "CRP pr", offset: off, needed: 48 - b.len() });
+        if b.len() < pr_off::HEADER_LEN {
+            return Err(FormatError::Truncated { what: "CRP pr", offset: off, needed: pr_off::HEADER_LEN - b.len() });
         }
-        let n_streams = u32_le(b, 40, "pr n_streams")? as usize;
-        let n_ia = u32_le(b, 44, "pr n_index_arrays")? as usize;
-        let mut streams = Vec::with_capacity(n_streams);
-        let mut p = 48;
+        let n_streams = u32_le(b, pr_off::N_STREAMS, "pr n_streams")? as usize;
+        let n_ia = u32_le(b, pr_off::N_INDEX_ARRAYS, "pr n_index_arrays")? as usize;
+        let mut streams = Vec::with_capacity(crate::cap_hint(n_streams, b.len(), 16));
+        let mut p = pr_off::HEADER_LEN;
         for _ in 0..n_streams {
             streams.push(StreamDesc {
                 slot: u32_le(b, p, "pr stream slot")?,
@@ -969,7 +1084,7 @@ impl PrimitiveRecord {
             });
             p += 16;
         }
-        let mut index_arrays = Vec::with_capacity(n_ia);
+        let mut index_arrays = Vec::with_capacity(crate::cap_hint(n_ia, b.len(), 8));
         for _ in 0..n_ia {
             let t = b.get(p + 2..p + 4).ok_or(FormatError::Truncated { what: "pr index array", offset: off + p, needed: 8 })?;
             index_arrays.push(([t[1], t[0]], u32_le(b, p + 4, "pr index array offset")?));
@@ -979,7 +1094,7 @@ impl PrimitiveRecord {
         // long). Some primitives carry **only** `vI`, and then the whole remaining index area is that
         // one array, with the uv and colour streams running per corner instead of being indexed.
         // the tags are stored reversed in the file, so the uv array reads back as `Iu`
-        let index_count = match index_arrays.iter().find(|(t, _)| t == b"Iu") {
+        let index_count = match index_arrays.iter().find(|(t, _)| t == tags::IU) {
             Some((_, o)) => *o,
             None if index_arrays.len() == 1 => (b.len() - p) as u32,
             None => 0,
@@ -1048,7 +1163,7 @@ impl DamageZones {
         let u = |o: usize| u32_le(b, o, "CRP dz");
         let n = u(0)? as usize;
         let list = 4 + 12 * n;
-        let mut zones = Vec::with_capacity(n);
+        let mut zones = Vec::with_capacity(crate::cap_hint(n, b.len(), 12));
         for k in 0..n {
             let r = 4 + 12 * k;
             let (zone, count, first) = (u(r)?, u(r + 4)? as usize, u(r + 8)? as usize);
@@ -1081,6 +1196,50 @@ impl Crp {
     /// Article count declared in the header (`+4 >> 5`).
     pub fn article_count(&self) -> u32 {
         self.header_a >> 5
+    }
+}
+
+#[cfg(test)]
+mod constant_tests {
+    use super::*;
+
+    /// The named tags, stream kinds, primitive types and layer classes are the literals the parser
+    /// carried before they were named.
+    #[test]
+    fn named_constants_keep_their_literal_values() {
+        let level: [(&[u8; 4], &[u8; 4]); 9] = [
+            (tags::TRAK, b"Trak"),
+            (tags::CAR, b"Car "),
+            (tags::ARTI, b"Arti"),
+            (tags::RMTH, b"RMth"),
+            (tags::ANQT, b"Anqt"),
+            (tags::BASE, b"Base"),
+            (tags::NAME, b"Name"),
+            (tags::BNDP, b"BndP"),
+            (tags::WNDO, b"Wndo"),
+        ];
+        assert!(level.iter().all(|(a, b)| a == b));
+        let part: [(&[u8; 2], &[u8; 2]); 11] = [
+            (tags::MT, b"mt"),
+            (tags::SN, b"sn"),
+            (tags::SF, b"sf"),
+            (tags::TR, b"tr"),
+            (tags::PR, b"pr"),
+            (tags::DZ, b"dz"),
+            (tags::VT, b"vt"),
+            (tags::NM, b"nm"),
+            (tags::UV, b"uv"),
+            (tags::DF, b"df"),
+            (tags::IU, b"Iu"),
+        ];
+        assert!(part.iter().all(|(a, b)| a == b));
+        assert_eq!([stream_kind::VT, stream_kind::NM, stream_kind::UV, stream_kind::DF], [0, 1, 2, 3]);
+        assert_eq!(NO_SLOT, 0xFFFF_FFFF);
+        assert_eq!([prim_type::STRIP, prim_type::LIST, prim_type::QUADS], [1, 3, 4]);
+        assert_eq!(
+            [layer_class::STATE, layer_class::UV_ANIMATE, layer_class::VERTEX_LIGHT, layer_class::VERTEX_LIGHT_OPAQUE, layer_class::UV_LIGHT, layer_class::AMBIENT, layer_class::VERTEX_LIGHT_AMBIENT],
+            [8, 0x8001, 0x8002, 0x8003, 0x8004, 0x8007, 0x8011]
+        );
     }
 }
 

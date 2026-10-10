@@ -802,16 +802,7 @@ mod tests {
 
     /// Synthetic circular lap of `n` slices, radius r, 6 m apart.
     fn ring(n: usize) -> SliceTable {
-        let r = n as f32 * SLICE_SPACING / std::f32::consts::TAU;
-        let slices = (0..n)
-            .map(|i| {
-                let a = i as f32 / n as f32 * std::f32::consts::TAU;
-                let centre = Vec3::new(a.cos() * r, 0.0, a.sin() * r);
-                let forward = Vec3::new(-a.sin(), 0.0, a.cos());
-                Slice { centre, up: Vec3::Y, forward, lateral: Vec3::Y.cross(forward), lane_mask: 0, lanes_a: 1, lanes_b: 1, width_a: 5.0, width_b: 5.0, lane_width_a: 5.0, lane_width_b: 5.0 }
-            })
-            .collect();
-        SliceTable::build(slices, vec![Section { first: 0, last: n - 1, f0: 0.0, f1: 1.0 }])
+        crate::test_support::ring_of(n, crate::test_support::Road::one_lane(5.0))
     }
 
     /// `Grid_slot` 0x410580: `STARTINGPOS = grid_pos + 1`, 3 slices a car, the pole furthest
@@ -1033,16 +1024,7 @@ mod finish_tests {
     #[test]
     fn progress_freezes_after_the_finish() {
         let n = 100;
-        let r = n as f32 * SLICE_SPACING / std::f32::consts::TAU;
-        let slices: Vec<Slice> = (0..n)
-            .map(|i| {
-                let a = i as f32 / n as f32 * std::f32::consts::TAU;
-                let centre = Vec3::new(a.cos() * r, 0.0, a.sin() * r);
-                let forward = Vec3::new(-a.sin(), 0.0, a.cos());
-                Slice { centre, up: Vec3::Y, forward, lateral: Vec3::Y.cross(forward), lane_mask: 0, lanes_a: 1, lanes_b: 1, width_a: 5.0, width_b: 5.0, lane_width_a: 5.0, lane_width_b: 5.0 }
-            })
-            .collect();
-        let t = SliceTable::build(slices, vec![Section { first: 0, last: n - 1, f0: 0.0, f1: 1.0 }]);
+        let t = crate::test_support::ring_of(n, crate::test_support::Road::one_lane(5.0));
         let mut p = RaceProgress::new(0, &t);
         for step in 1..=250usize {
             let s = step % n;
@@ -1059,16 +1041,7 @@ mod finish_tests {
     #[test]
     fn wrong_way_counter_follows_its_gates() {
         let n = 100;
-        let r = n as f32 * SLICE_SPACING / std::f32::consts::TAU;
-        let slices: Vec<Slice> = (0..n)
-            .map(|i| {
-                let a = i as f32 / n as f32 * std::f32::consts::TAU;
-                let centre = Vec3::new(a.cos() * r, 0.0, a.sin() * r);
-                let forward = Vec3::new(-a.sin(), 0.0, a.cos());
-                Slice { centre, up: Vec3::Y, forward, lateral: Vec3::Y.cross(forward), lane_mask: 0, lanes_a: 1, lanes_b: 1, width_a: 5.0, width_b: 5.0, lane_width_a: 5.0, lane_width_b: 5.0 }
-            })
-            .collect();
-        let t = SliceTable::build(slices, vec![Section { first: 0, last: n - 1, f0: 0.0, f1: 1.0 }]);
+        let t = crate::test_support::ring_of(n, crate::test_support::Road::one_lane(5.0));
         let mut p = RaceProgress::new(10, &t);
         let back = |p: &mut RaceProgress, tick: u64| p.update(&t, t.slices[10].centre, -t.slices[10].forward, tick, 3);
         for tick in 1..=4 {

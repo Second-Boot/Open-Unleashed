@@ -180,7 +180,7 @@ impl Vehicle {
     /// points, which is what the first four `BndP` points are on a real car (port fallback).
     pub(crate) fn body_height_on(&mut self, n: Vec3, q: Vec3) {
         let mt = self.orientation.transpose();
-        let upright = self.cos_tilt > 0.939 && !self.smackable;
+        let upright = self.cos_tilt > UPRIGHT_COS_TILT && !self.smackable;
         let fallback = self.probe_points();
         let pts: &[Vec3] = if self.body_points.is_empty() { &fallback } else { &self.body_points };
         let pts = if upright { &pts[..pts.len().min(4)] } else { pts };
@@ -278,7 +278,7 @@ impl Vehicle {
         let vy = self.velocity.y;
         let closing = dh - vy;
         let surf = surf & 15;
-        if (self.cos_tilt < 0.939 || self.smackable) && self.body_height < 0.001 {
+        if (self.cos_tilt < UPRIGHT_COS_TILT || self.smackable) && self.body_height < 0.001 {
             let k = if self.cos_tilt > 0.707 && !self.smackable { 0.1 } else { SURFACE_BOUNCE[surf][0] };
             // `GroundImpulse` leaves the event word `car+0x438 = 0x30000 | car+0x464` (0x4960D6…
             // 0x496104) and `BodyGroundCollide` the magnitude `car+0x430 = 4·|vel·n|` (0x496844)
@@ -446,7 +446,7 @@ impl Vehicle {
             // `RALLY` turning nibbles 1 and 10 into 2)
             self.wheels[i].tracker.update_zone(grid, probe);
             let nibble = (self.wheels[i].tracker.word & 0xF) as usize;
-            let zone = if self.rally && (nibble == 1 || nibble == 10) { 2 } else { self.wheels[i].tracker.word & 0xFFFF };
+            let zone = if rally_reads_as_two(nibble, self.rally) { 2 } else { self.wheels[i].tracker.word & 0xFFFF };
             self.wheels[i].zone = zone;
             self.wheels[i].surface = (zone & 0xF) as usize;
             // 0x494480: no surface nibble ⇒ 1; the patch plane more than 4 m from the body's

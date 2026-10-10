@@ -38,6 +38,8 @@ pub mod skill;
 pub mod smackables;
 pub mod sky;
 pub mod start;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod text;
 pub mod track_list;
 pub mod track_particles;

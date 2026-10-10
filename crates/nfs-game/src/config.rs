@@ -4,10 +4,10 @@
 //! them were read with `std::env::var` **every frame / every tick** — each read a `getenv` (a
 //! linear scan of the environment under a lock) and, for `var`, a `String` allocation. This
 //! module snapshots every such variable the in-game code reads, **once, on first use**, into one
-//! [`Config`] object; a call site asks `cfg().<name>.var()` / `.var_os()` and gets exactly what
-//! `std::env::var("<NAME>")` / `std::env::var_os("<NAME>")` would have answered at start-up
-//! (`Result<String, VarError>` / `Option<OsString>`, so `is_ok` vs `var_os().is_some()` vs a
-//! parse-with-default stays each switch's own — the call sites keep their original expression).
+//! [`Config`] object; a call site asks `cfg().<name>.as_str()` / `.is_set()` / `.as_os_str()` and gets exactly what
+//! `std::env::var("<NAME>").ok()` / `var_os("<NAME>").is_some()` / `var_os("<NAME>")` would have
+//! answered at start-up, borrowed (no clone per call; `as_str().is_some()` vs `is_set()` differ
+//! only for a non-Unicode value, so each switch keeps the test its call site always used).
 //!
 //! Semantics: the environment is **not re-read** later. The only writer in the program is
 //! `main` (`NFS_FE_CURSOR` / `NFS_FE_CLOCK` for the scripted runs), which runs before anything
@@ -17,7 +17,6 @@
 //! Every switch below is a TEST GLUE / diagnostic hook of the port, not a game rule; their
 //! meaning is documented at the call sites.
 
-use std::env::VarError;
 use std::ffi::OsString;
 use std::sync::OnceLock;
 
@@ -30,17 +29,20 @@ impl Switch {
         Switch(std::env::var_os(name))
     }
 
-    /// What `std::env::var(name)` answered at the snapshot.
-    pub fn var(&self) -> Result<String, VarError> {
-        match &self.0 {
-            None => Err(VarError::NotPresent),
-            Some(v) => v.clone().into_string().map_err(VarError::NotUnicode),
-        }
+    /// What `std::env::var(name)` answered at the snapshot, without the clone: `Some` only when
+    /// the variable is set **and** valid Unicode (`var(..).is_ok()` / `.ok()` of the old API).
+    pub fn as_str(&self) -> Option<&str> {
+        self.0.as_deref().and_then(std::ffi::OsStr::to_str)
     }
 
-    /// What `std::env::var_os(name)` answered at the snapshot.
-    pub fn var_os(&self) -> Option<OsString> {
-        self.0.clone()
+    /// What `std::env::var_os(name).is_some()` answered at the snapshot (set, Unicode or not).
+    pub fn is_set(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// What `std::env::var_os(name)` answered at the snapshot, borrowed.
+    pub fn as_os_str(&self) -> Option<&std::ffi::OsStr> {
+        self.0.as_deref()
     }
 }
 
@@ -62,6 +64,8 @@ macro_rules! switches {
 }
 
 switches! {
+    // the save-data directory override (`save::save_dir`, `Career::legacy_json_path`, `diag`)
+    nfs5_save_dir = "NFS5_SAVE_DIR",
     nfs_ai_flip = "NFS_AI_FLIP",
     nfs_ai_noavoid = "NFS_AI_NOAVOID",
     nfs_ai_trace = "NFS_AI_TRACE",
@@ -100,7 +104,14 @@ switches! {
     nfs_eval_verify = "NFS_EVAL_VERIFY",
     nfs_map_verify = "NFS_MAP_VERIFY",
     nfs_fe_redraw_always = "NFS_FE_REDRAW_ALWAYS",
+    nfs_detail = "NFS_DETAIL",
+    nfs_fe_seq_frames = "NFS_FE_SEQ_FRAMES",
+    nfs_fe_seq_script = "NFS_FE_SEQ_SCRIPT",
     nfs_fps_cap = "NFS_FPS_CAP",
+    nfs_mission = "NFS_MISSION",
+    nfs_shot_ticks = "NFS_SHOT_TICKS",
+    nfs_test_spoiler = "NFS_TEST_SPOILER",
+    nfs_traffic_view = "NFS_TRAFFIC_VIEW",
     nfs_render_thread = "NFS_RENDER_THREAD",
     nfs_fe_idle_verify = "NFS_FE_IDLE_VERIFY",
     nfs_fe_keys = "NFS_FE_KEYS",
@@ -121,6 +132,7 @@ switches! {
     nfs_fx_frames = "NFS_FX_FRAMES",
     nfs_hit_sweep = "NFS_HIT_SWEEP",
     nfs_hud_boxes = "NFS_HUD_BOXES",
+    nfs_hud_keys = "NFS_HUD_KEYS",
     nfs_ko_place = "NFS_KO_PLACE",
     nfs_layer_dump = "NFS_LAYER_DUMP",
     nfs_lens_warmup = "NFS_LENS_WARMUP",
@@ -188,4 +200,34 @@ pub fn cfg() -> &'static Config {
 /// Pin the snapshot now (idempotent) — `main` calls it once its own `set_var`s are done.
 pub fn init() {
     let _ = cfg();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn switch_accessors_match_the_std_env_answers() {
+        let unset = Switch(None);
+        assert!(!unset.is_set());
+        assert_eq!(unset.as_str(), None);
+        assert_eq!(unset.as_os_str(), None);
+
+        // set to the empty string and to "0": both are "set" (presence-only switches stay on)
+        for v in ["", "0", "1", "a=b,c"] {
+            let s = Switch(Some(OsString::from(v)));
+            assert!(s.is_set(), "{v:?}");
+            assert_eq!(s.as_str(), Some(v));
+            assert_eq!(s.as_os_str(), Some(std::ffi::OsStr::new(v)));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_value_is_set_but_has_no_str() {
+        use std::os::unix::ffi::OsStringExt;
+        let s = Switch(Some(OsString::from_vec(vec![0x66, 0xFF, 0x6F])));
+        assert!(s.is_set(), "var_os().is_some()");
+        assert_eq!(s.as_str(), None, "var().is_ok() was false for it");
+    }
 }

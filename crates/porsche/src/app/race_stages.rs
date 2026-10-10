@@ -116,7 +116,7 @@ impl App {
                 // the shuffle flag of a race is `RANDOMPLAYLIST` `[0x657A5C]` (0x4AE639),
                 // which the launch's accessor dump sets from `CDPlayer.Options`' selection (id 0x43;
                 // rows 1856 "continuous" = 0, 1855 "random order" = 1), not the file's value
-                let shuffle = self.choice_index("CDPlayer.Options").is_some_and(|(i, _)| i != 0);
+                let shuffle = self.choice_index(choice::CDPLAYER_OPTIONS).is_some_and(|(i, _)| i != 0);
                 if let Some(m) = self.snd.music.as_mut() {
                     m.set_shuffle(shuffle);
                     m.set_front_end(false);
@@ -415,7 +415,7 @@ impl App {
                     let entry = &entry_993;
                     // `.TINYCAR` 0x24F is per car: a remote player's car is tiny when *its* record says so (its own
                     // machine's Gulliver code, sent only when set), every other car by this machine's own bit
-                    let car_tiny = seat_rec.map_or(self.cheat_bits & (1 << 1) != 0, |r| r.num(nfs_net::launchcar::id::TINYCAR).is_some_and(|v| v != 0));
+                    let car_tiny = seat_rec.map_or(self.cheat_bits & CHEAT_TINY != 0, |r| r.num(nfs_net::launchcar::id::TINYCAR).is_some_and(|v| v != 0));
                     let (Ok(assets), Ok(sim)) = (
                         CarAssets::load(&self.paths, &entry.model).map(|c| {
                             let mut c = c.with_style(entry.variant).with_cabrio(entry.cabrio).with_style_overlay(swaps);
@@ -912,14 +912,14 @@ impl App {
                                         continue;
                                     };
                                     let mut model = model;
-                                    if self.cheat_bits & (1 << 1) != 0 {
+                                    if self.cheat_bits & CHEAT_TINY != 0 {
                                         model.scale = 0.4;
                                     }
                                     self.road.police_models.push(model);
                                     // 0x445090: a cop (`car+0x52C` 0x22 / 0x62, bit 0x10 clear at
                                     // 0x4450D2) takes `[this+0xB0][4]`, LOD 5, as a racer does;
                                     // `× 0.4` for `.TINYCAR` (0x445140)
-                                    let (points, half) = nfs_game::world::car_body(&assets, self.cheat_bits & (1 << 1) != 0);
+                                    let (points, half) = nfs_game::world::car_body(&assets, self.cheat_bits & CHEAT_TINY != 0);
                                     boxes.push(half);
                                     // the body points, the first four being `Susp_update`'s
                                     // wheel probes (0x499AD4, `CopCar::probes`)
@@ -962,10 +962,10 @@ impl App {
                                 cop.set_body(p.clone(), half);
                             }
                             cop.body.automatic = cop_automatic; // its own `carinfo+0xC` (0x4ED174 / 0x4ED25E pass 0)
-                            cop.body.tiny = self.cheat_bits & (1 << 1) != 0;
+                            cop.body.tiny = self.cheat_bits & CHEAT_TINY != 0;
                             // `DERBY` `[0x657400]`, which only the Smash Up code sets (cheat bit 7): `Damage` takes ×1.5, not ×0.5 (0x49452F)
-                            cop.body.derby = self.cheat_bits & (1 << 7) != 0;
-                            cop.body.rally = self.cheat_bits & 1 != 0;
+                            cop.body.derby = self.cheat_bits & CHEAT_DERBY != 0;
+                            cop.body.rally = self.cheat_bits & CHEAT_RALLY != 0;
                             cars.push(cop);
                         }
                         if !cars.is_empty() {
@@ -1101,8 +1101,8 @@ impl App {
         // `ADJUSTABLEVIEWDISTANCE` `[0x657D70]` = `Graphics.ViewDistance`'s selection, and 0x44F1A0
         // scales the `.key` draw distance by `{0.5, 0.67, 0.83, 1.0}[0x657D70]` (0x5CE90C). The
         // port took 1.0 (`NFS_DETAIL` stays the diagnostic override).
-        if std::env::var("NFS_DETAIL").is_err()
-            && let Some((i, _)) = self.choice_index("Graphics.ViewDistance")
+        if nfs_game::config::cfg().nfs_detail.as_str().is_none()
+            && let Some((i, _)) = self.choice_index(choice::GRAPHICS_VIEW_DISTANCE)
         {
             self.detail = [0.5f32, 0.67, 0.83, 1.0][i.min(3)];
         }

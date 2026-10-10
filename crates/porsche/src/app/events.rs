@@ -309,7 +309,7 @@ impl ApplicationHandler for App {
                 // question or resumed — an approximation of a key the original does not have.)*
                 // Once the pages have closed it opens the menu, whose quit leaves
                 let dialog_up = self.paused || (self.results.is_some() && self.result_pages().get(self.results_page as usize).is_some());
-                if self.vehicle.is_some() && self.fe.race_game_type == Some(3) {
+                if self.vehicle.is_some() && self.fe.race_game_type == Some(game_type::NETWORK) {
                     // a network race (`[0x6573E8] == 3`): 0x415110's own rules, not the single-player pause
                     if self.input.take_pressed(Action::Pause) {
                         self.net_pause_action(event_loop);
@@ -618,7 +618,7 @@ impl ApplicationHandler for App {
                 // gamepad: d-pad / left stick moves, South (A / cross) selects — PORT-DEVIATION D10
                 // (PORT-DEVIATIONS.md) [the FE reads no pad, event pump 0x529700]
                 self.gamepads.poll(&mut self.input);
-                if nfs_game::config::cfg().nfs_ff_test.var_os().is_some() {
+                if nfs_game::config::cfg().nfs_ff_test.is_set() {
                     self.gamepads.rumble_test_tick();
                 }
                 let stick = self.input.pad.map(|p| p.steer).unwrap_or(0.0);
@@ -694,7 +694,7 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested if event_loop.exiting() => {}
             WindowEvent::RedrawRequested => {
                 self.gamepads.poll(&mut self.input);
-                if nfs_game::config::cfg().nfs_ff_test.var_os().is_some() {
+                if nfs_game::config::cfg().nfs_ff_test.is_set() {
                     self.gamepads.rumble_test_tick();
                 }
                 self.pace_frame();
@@ -716,7 +716,7 @@ impl ApplicationHandler for App {
                 if !self.paused {
                     self.pause_offset += self.pause_ticks;
                 }
-                self.pause_ticks = if self.paused { self.pause_ticks + self.frame_dt as f64 * 64.0 } else { 0.0 };
+                self.pause_ticks = if self.paused { self.pause_ticks + self.frame_dt as f64 * TICKS_PER_SEC_F64 } else { 0.0 };
                 // **The race pause 0x4AB150** (0x4151C8, 0x41554B, 0x415A2C: the pause menu; 0x415830:
                 // the replay's freeze), skipped with `[0x657C94]`: the speech phrase's voices and the
                 // voice table to volume 0 (0x4AF900(0, 0), 0x4AB16A…0x4AB18A) — they run on silent —
@@ -803,7 +803,7 @@ impl ApplicationHandler for App {
                 // diagnostic: `NFS_REPLAY_TYPE`, as the scripted-run loop does
                 if !bar_save_was_up
                     && self.replay_save.up
-                    && let Ok(name) = nfs_game::config::cfg().nfs_replay_type.var()
+                    && let Some(name) = nfs_game::config::cfg().nfs_replay_type.as_str()
                 {
                     for c in name.chars() {
                         self.replay_save.type_char(c);

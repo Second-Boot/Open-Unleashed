@@ -25,6 +25,7 @@ mod app;
 mod career_ui;
 mod diag;
 mod hud;
+mod hud_str;
 mod hud_cfg;
 mod intro_run;
 mod netlobby;
@@ -251,7 +252,7 @@ fn run() -> Result<()> {
     // the option says in Factory Driver mission 0x1D (the player's 0x4EEDA0 call alone, 0x4EB9C6…0x4EEF8D). A
     // recording's own word is read below. GB: the folds took `true` whatever the option said.
     let cli_automatic = {
-        let over = nfs_game::config::cfg().nfs_choice.var().ok().and_then(|o| {
+        let over = nfs_game::config::cfg().nfs_choice.as_str().and_then(|o| {
             o.split(',').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == "Car.Transmission").and_then(|(_, v)| v.trim().parse::<usize>().ok())
         });
         let option = over.unwrap_or_else(|| nfs_formats::fetxt::Registry::load(&paths.root).u32("car[0].transmission", 0) as usize);
@@ -838,7 +839,7 @@ fn run() -> Result<()> {
         hud_keys: HudKeys::new(1, false, true),
         replay_bar: nfs_game::replay::BarState::new(),
         bar_press: None,
-        hud_key_script: std::env::var("NFS_HUD_KEYS_1").or_else(|_| std::env::var("NFS_HUD_KEYS")).map(|s| parse_hud_keys(&s)).unwrap_or_default(),
+        hud_key_script: std::env::var("NFS_HUD_KEYS_1").or_else(|_| std::env::var("NFS_HUD_KEYS")).map(|s| parse_hud_keys(&s).into()).unwrap_or_default(),
         scripted_race_no: 0,
         race_order: Default::default(),
         audio_paused: false,
@@ -935,8 +936,8 @@ fn run() -> Result<()> {
             let bits: u32 = std::env::var("NFS_CHEAT_BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
             // a recording's `DERBY` word (0x1B, the block `Replay_begin` restores)
             match replay_setup.as_ref().and_then(|r| r.derby) {
-                Some(true) => bits | (1 << 7),
-                Some(false) => bits & !(1 << 7),
+                Some(true) => bits | CHEAT_DERBY,
+                Some(false) => bits & !CHEAT_DERBY,
                 None => bits,
             }
         },

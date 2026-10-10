@@ -107,13 +107,13 @@ impl CommSocket {
     pub fn recv(&mut self) -> io::Result<Option<(SocketAddr, Datagram)>> {
         loop {
             match self.sock.recv_from(&mut self.buf) {
-                Ok((n, from)) => match {
+                Ok((n, from)) => {
                     self.dump_line('R', from, &self.buf[..n]);
-                    Datagram::decode(&self.buf[..n])
-                } {
-                    Ok(d) => return Ok(Some((from, d))),
-                    Err(_) => continue, // empty or oversized: not ours
-                },
+                    match Datagram::decode(&self.buf[..n]) {
+                        Ok(d) => return Ok(Some((from, d))),
+                        Err(_) => continue, // empty or oversized: not ours
+                    }
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 // an ICMP port-unreachable comes back as an error on the *next* call on some

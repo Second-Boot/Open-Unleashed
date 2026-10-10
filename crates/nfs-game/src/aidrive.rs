@@ -383,25 +383,11 @@ mod tests {
         assert_eq!(brake_light(1, Some(false), 2), 0);
         assert_eq!(brake_light(5, None, 2), 5);
     }
-    use crate::race::{Section, Slice, SLICE_SPACING};
+    use crate::race::SLICE_SPACING;
+    use crate::test_support::Road;
 
     fn straight(n: usize) -> SliceTable {
-        let slices = (0..n)
-            .map(|i| Slice {
-                centre: Vec3::new(0.0, 0.0, i as f32 * SLICE_SPACING),
-                up: Vec3::Y,
-                forward: Vec3::Z,
-                lateral: Vec3::X,
-                lane_mask: 0,
-                lanes_a: 2,
-                lanes_b: 2,
-                width_a: 11.0,
-                width_b: 11.0,
-                lane_width_a: 4.0,
-                lane_width_b: 4.0,
-            })
-            .collect();
-        SliceTable::build(slices, vec![Section { first: 0, last: n - 1, f0: 0.0, f1: 1.0 }])
+        crate::test_support::straight_of(n, Road::two_lanes(11.0))
     }
 
     fn car() -> AiCarState {

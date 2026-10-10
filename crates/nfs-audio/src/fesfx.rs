@@ -14,16 +14,15 @@
 //! scrollbar arrow), 9 (an input box taking a key, the hover of a HUD box), 0x0D and 0x30…0x35 (the
 //! front-end car's parts).
 
-use crate::mixer::{AudioOutput, Clip};
+use crate::mixer::{byte_gain, AudioOutput, Clip, ClipCache, BEND_ROOT};
 use nfs_formats::bnk::Bnk;
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 pub struct FeSfx {
     bank: Bnk,
     data: Vec<u8>,
-    clips: HashMap<usize, Arc<Clip>>,
+    clips: ClipCache<usize>,
     /// `game.spl[2]` (`GameSpl::fe_sfx`)
     trim: u32,
 }
@@ -44,17 +43,12 @@ impl FeSfx {
         let bank = Bnk::parse(&data)?;
         tracing::info!(slots = bank.slot_count(), name, "front-end sound bank loaded");
         let trim = nfs_formats::spl::GameSpl::load(sounds_dir).fe_sfx();
-        Ok(Self { bank, data, clips: HashMap::new(), trim })
+        Ok(Self { bank, data, clips: ClipCache::new(false), trim })
     }
 
     fn clip(&mut self, slot: usize) -> Option<Arc<Clip>> {
-        if let Some(c) = self.clips.get(&slot) {
-            return Some(c.clone());
-        }
-        let pcm = self.bank.decode_slot(&self.data, slot).ok()?;
-        let clip = Arc::new(Clip::from_pcm(pcm));
-        self.clips.insert(slot, clip.clone());
-        Some(clip)
+        let (bank, data) = (&self.bank, &self.data);
+        self.clips.get_or_load(slot, || Some(Arc::new(Clip::from_pcm(bank.decode_slot(data, slot).ok()?))))
     }
 
     /// 0x4AADB0(`slot`): nothing at sound detail 3; otherwise the slot once, centred, at
@@ -66,7 +60,7 @@ impl FeSfx {
         }
         let v = level(self.trim, sfx_level);
         if let Some(c) = self.clip(slot) {
-            out.play_word_untabled(c, v as f32 / 127.0, crate::resample::PITCH_UNIT, 0x40, 0, false);
+            out.play_word_untabled(c, byte_gain(v as i32), crate::resample::PITCH_UNIT, BEND_ROOT, 0, false);
         }
     }
 }

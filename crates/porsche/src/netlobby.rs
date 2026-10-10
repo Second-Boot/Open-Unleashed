@@ -54,7 +54,7 @@ impl App {
         let (_, car_name, colour) = self.net_own_car()?;
         let bytes = |s: &str| -> Vec<u8> { s.chars().map(|c| if (c as u32) < 256 { c as u8 } else { b'?' }).collect() };
         // 0x4EEEB5 / 0x4EEEC6: the `evenstvn` code (cheat bit 3) replaces the spec names
-        let cheat = self.cheat_bits & (1 << 3) != 0;
+        let cheat = self.cheat_bits & CHEAT_993 != 0;
         // the paint the race puts on it (`start_race`): the custom colour, else the set whose exterior it is
         let rgb = entry.paint_sets.get(m.paint_idx % entry.paint_sets.len().max(1)).map(|p| p.colours[0]).unwrap_or([0xD4, 0x10, 0x10]);
         let paint = Self::menu_custom_paint(m, entry).unwrap_or_else(|| Paint::matching(entry, rgb));
@@ -88,8 +88,8 @@ impl App {
             setup,
             dash: entry.dash.map(f32::to_bits),
             parts,
-            tiny: self.cheat_bits & (1 << 1) != 0,
-            glass: self.cheat_bits & (1 << 2) != 0,
+            tiny: self.cheat_bits & CHEAT_TINY != 0,
+            glass: self.cheat_bits & CHEAT_GLASS != 0,
             abs_accessor: if entry.abs { index("Car.ABS") } else { 0 },
             traction_accessor: if entry.traction { index("Car.Traction") } else { 0 },
             // 0x4F1E40 forces `Car.Roof` to 0 on a car without the convertible flag

@@ -29,15 +29,18 @@ impl Vehicle {
     /// *(Until 2026-09-26 the port swept each corner from `corner − vel/32` to the corner, which
     /// misses a corner that a yawing car swings across the line, and a car turned so that the
     /// sweep ran along the wall; the original has no per-corner sweep at all.)*
-    pub fn collide_walls(&mut self, walls: &crate::walls::WallSet, tree: &crate::track_tree::TrackTree, patch_height: &dyn Fn(Vec3) -> Option<f32>, _unused: f32, _b: f32, _f: f32) -> bool {
+    pub fn collide_walls(&mut self, walls: &crate::walls::WallSet, tree: &crate::track_tree::TrackTree, patch_height: &dyn Fn(Vec3) -> Option<f32>) -> bool {
         let m = self.orientation;
         let (hw, hh, hl) = (self.half_extents.x, self.half_extents.y, self.half_extents.z);
         let (bx, by, bz) = (m.row(0), m.row(1), m.row(2));
-        let mut corners = Vec::with_capacity(8);
+        // z outer, x inner, the lower corner then the upper one — the order the hits are taken in
+        let mut corners = [Vec3::ZERO; 8];
+        let mut k = 0;
         for sz in [-1.0, 1.0] {
             for sx in [-1.0, 1.0] {
-                corners.push(self.position - by * hh + bz * (sz * hl) + bx * (sx * hw));
-                corners.push(self.position + by * hh + bz * (sz * hl * 0.5) + bx * (sx * hw));
+                corners[k] = self.position - by * hh + bz * (sz * hl) + bx * (sx * hw);
+                corners[k + 1] = self.position + by * hh + bz * (sz * hl * 0.5) + bx * (sx * hw);
+                k += 2;
             }
         }
         // `vel/32` once, before any impulse (0x49507D); the corners too (0x4950F7…0x495254)

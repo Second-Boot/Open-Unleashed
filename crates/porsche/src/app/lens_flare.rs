@@ -141,7 +141,7 @@ impl App {
     /// A race's lens-flare object (0x4601F0 → 0x460780): the state at its constructor values,
     /// `LENSFLARE` as the launch's accessor dump left it (module doc) and `flarepos.dat`.
     pub(crate) fn lens_reset(&mut self) {
-        let enabled = self.choice_index("Graphics.LensFlare").is_some_and(|(i, _)| i != 0);
+        let enabled = self.choice_index(choice::GRAPHICS_LENS_FLARE).is_some_and(|(i, _)| i != 0);
         let mut positions = DEFAULT_POSITIONS;
         if let Ok(d) = std::fs::read(self.paths.render_dir().join("flarepos.dat")) {
             positions = [0.0; 14];

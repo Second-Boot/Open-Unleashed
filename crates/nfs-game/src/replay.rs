@@ -2253,6 +2253,65 @@ mod tests {
         assert_eq!(at(0xCA4 + 0x114), 50 * 65536);
     }
 
+    /// Refactor guard: a truncated or foreign file must never panic the readers — the user can
+    /// drop any file in — and the full ones still read back whole. Every prefix of a fully populated port
+    /// file and of an original `.rpl` (up to a few bytes past the fixed snapshot) is parsed.
+    #[test]
+    fn no_prefix_of_a_replay_file_panics_a_reader() {
+        let car = |id: u16, skill: bool| CarRecord {
+            car_id: id,
+            paint: [1, 2, 3],
+            name: format!("car{id}"),
+            grid: Some(2),
+            decal: 5,
+            personality: i16::from(skill),
+            difficulty: 1.0,
+            skill: skill.then_some([[0.5, 0.1], [0.6, 0.2], [0.7, 0.3], [0.8, 0.4]]),
+            parts: Some(vec![11, 12, 13]),
+            part_damage: vec![1.0, 2.0, 3.0],
+            damage: [1.0; 10],
+            setup: Some([0.5; 17]),
+        };
+        let setup = ReplaySetup {
+            track: "monaco1".into(),
+            car: "356".into(),
+            sim: "356a".into(),
+            car_id: 107,
+            paint: [1, 2, 3],
+            laps: 2,
+            opponents: 2,
+            driver_name: "ANNA".into(),
+            player: Some(car(107, false)),
+            opponent_cars: Some(vec![car(30, true), car(31, false)]),
+            scene: Some(3),
+            derby: Some(true),
+            nocollision: Some(false),
+            transmission: Some(false),
+            opponent_transmission: Some(true),
+            mission: Some([3011, 0, 0, 3012, 3013, 0, 90, -1, -1, 5, 2, 0]),
+            race_type: Some(3),
+            fegame_type: Some(9),
+            camera: Some(vec![1, 0, 2, 7]),
+            ..Default::default()
+        };
+        let f = ReplayFile { setup: setup.clone(), final_tick: 77, stream: (0..300).map(|i| (i % 251 + 1) as u8).collect() };
+        let d = f.write();
+        assert_eq!(ReplayFile::parse(&d), Some(f), "the whole file reads back");
+        for n in 0..d.len() {
+            let _ = ReplayFile::parse(&d[..n]);
+        }
+        let rpl = original_rpl(&setup, 77, &[1, 2, 3], Ramp::default(), 7);
+        assert!(parse_original_rpl(&rpl).is_some(), "the whole file reads back");
+        for n in (0..SNAPSHOT_LEN + 8).chain([rpl.len() - 1]) {
+            let got = parse_original_rpl(&rpl[..n]);
+            assert_eq!(got.is_some(), n >= SNAPSHOT_LEN + 4, "length {n}: only the length is validated");
+        }
+        // garbage of every size around the fixed header
+        for n in [0, 1, 7, 11, 15, 16, 17, 40, 1000] {
+            assert_eq!(ReplayFile::parse(&vec![0xA5; n]), None);
+        }
+    }
+
     #[test]
     fn the_original_rpl_has_the_documented_shape() {
         // §6.1: 0x3E24 of setup, the final tick, 0x19000 of stream — 118 312 bytes, always

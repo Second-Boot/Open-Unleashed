@@ -94,41 +94,76 @@ pub enum Action {
     CycleMap,
 }
 
-const ALL_ACTIONS: [Action; 33] = [
-    Action::CameraNext,
-    Action::RearView,
-    Action::SteerLeft,
-    Action::SteerRight,
-    Action::Throttle,
-    Action::Brake,
-    Action::Handbrake,
-    Action::Horn,
-    Action::ShiftUp,
-    Action::ShiftDown,
-    Action::Reset,
-    Action::Pause,
-    Action::Abort,
-    Action::AiDrive,
-    Action::SignalLeft,
-    Action::SignalRight,
-    Action::Hazards,
-    Action::Lights,
-    Action::LookLeft,
-    Action::LookRight,
-    Action::LookForward,
-    Action::TogglePauseMenu,
-    Action::RotCamCounter,
-    Action::RotCamStop,
-    Action::RotCamClock,
-    Action::ToggleHud,
-    Action::ToggleRearView,
-    Action::ToggleMap,
-    Action::HudTransparency,
-    Action::Music,
-    Action::Sfx,
-    Action::CycleHud,
-    Action::CycleMap,
-];
+/// What the port keeps per action, one row each, **in the order of [`Action`]'s variants** (so
+/// `ACTIONS[a as usize]` is `a`'s row — a test checks it): the registry name and option id its
+/// binding reads through (`bindings::id`), the key it reads when it has no binding at all
+/// ([`default_binding`]) and, for the nineteen rows the controller-setup screens show, the
+/// original's own code for that key ([`key_code_for`]).
+struct ActionDef {
+    action: Action,
+    /// `fe.txt`'s name of the binding
+    fe_name: &'static str,
+    /// the option id (`[0x5E9130 + id·4]`)
+    id: u16,
+    default_key: KeyCode,
+    key_code: Option<u32>,
+}
+
+const fn def(action: Action, fe_name: &'static str, id: u16, default_key: KeyCode, key_code: Option<u32>) -> ActionDef {
+    ActionDef { action, fe_name, id, default_key, key_code }
+}
+
+const ACTIONS: [ActionDef; 33] = {
+    use bindings::id::*;
+    [
+        def(Action::SteerLeft, "C1_LEFT", C1_LEFT, KeyCode::ArrowLeft, Some(0x4B00)),
+        def(Action::SteerRight, "C1_RIGHT", C1_RIGHT, KeyCode::ArrowRight, Some(0x4D00)),
+        def(Action::Throttle, "C1_GAS", C1_GAS, KeyCode::ArrowUp, Some(0x4800)),
+        def(Action::Brake, "C1_BRAKE", C1_BRAKE, KeyCode::ArrowDown, Some(0x5000)),
+        def(Action::Handbrake, "C1_HANDBRAKE", C1_HANDBRAKE, KeyCode::Space, Some(0x20)),
+        def(Action::ShiftUp, "C1_SHIFTUP", C1_SHIFTUP, KeyCode::KeyA, Some(b'a' as u32)),
+        def(Action::ShiftDown, "C1_SHIFTDOWN", C1_SHIFTDOWN, KeyCode::KeyZ, Some(b'z' as u32)),
+        def(Action::CameraNext, "I_CYCLECAMERA", I_CYCLECAMERA, KeyCode::KeyC, Some(b'c' as u32)),
+        def(Action::RearView, "I_LOOKBEHIND", I_LOOKBEHIND, KeyCode::KeyB, Some(b'b' as u32)),
+        def(Action::Pause, "I_PAUSE", I_PAUSE, KeyCode::KeyP, Some(b'p' as u32)),
+        def(Action::Reset, "C1_RESET", C1_RESET, KeyCode::KeyR, Some(b'r' as u32)),
+        def(Action::Horn, "C1_HORN", C1_HORN, KeyCode::KeyH, Some(b'h' as u32)),
+        def(Action::Abort, "C1_ABORT", C1_ABORT, KeyCode::KeyQ, None),
+        def(Action::AiDrive, "C1_AIDRIVE", C1_AIDRIVE, KeyCode::KeyD, None),
+        def(Action::SignalLeft, "C1_SIGNALLEFT", C1_SIGNALLEFT, KeyCode::KeyW, Some(b'w' as u32)),
+        def(Action::SignalRight, "C1_SIGNALRIGHT", C1_SIGNALRIGHT, KeyCode::KeyE, Some(b'e' as u32)),
+        def(Action::Hazards, "C1_SIREN", C1_SIREN, KeyCode::KeyT, Some(b't' as u32)),
+        def(Action::Lights, "C1_LIGHTSON", C1_LIGHTSON, KeyCode::KeyL, Some(b'l' as u32)),
+        def(Action::LookLeft, "I_LOOKLEFT", I_LOOKLEFT, KeyCode::KeyY, Some(b'y' as u32)),
+        def(Action::LookRight, "I_LOOKRIGHT", I_LOOKRIGHT, KeyCode::KeyI, Some(b'i' as u32)),
+        def(Action::LookForward, "I_LOOKFORWARD", I_LOOKFORWARD, KeyCode::KeyU, Some(b'u' as u32)),
+        def(Action::TogglePauseMenu, "I_TOGGLEPAUSEMENU", I_TOGGLEPAUSEMENU, KeyCode::F1, None),
+        def(Action::RotCamCounter, "I_ROTCAMCCLOCK", I_ROTCAMCCLOCK, KeyCode::F4, None),
+        def(Action::RotCamStop, "I_ROTCAMSTOP", I_ROTCAMSTOP, KeyCode::F3, None),
+        def(Action::RotCamClock, "I_ROTCAMCLOCK", I_ROTCAMCLOCK, KeyCode::F2, None),
+        def(Action::ToggleHud, "I_TOGGLEHUD", I_TOGGLEHUD, KeyCode::F5, None),
+        def(Action::ToggleRearView, "I_TOGGLEREARVIEW", I_TOGGLEREARVIEW, KeyCode::F6, None),
+        def(Action::ToggleMap, "I_TOGGLEMAP", I_TOGGLEMAP, KeyCode::F7, None),
+        def(Action::HudTransparency, "I_HUDTRANSPARENCY", I_HUDTRANSPARENCY, KeyCode::F8, None),
+        def(Action::Music, "I_MUSIC", I_MUSIC, KeyCode::F9, None),
+        def(Action::Sfx, "I_SFX", I_SFX, KeyCode::F10, None),
+        def(Action::CycleHud, "I_CYCLEHUD", I_CYCLEHUD, KeyCode::Digit1, None),
+        def(Action::CycleMap, "I_CYCLEMAP", I_CYCLEMAP, KeyCode::Digit2, None),
+    ]
+};
+
+const _: () = assert!(ACTIONS.len() <= 64, "InputState keeps held / pressed in one u64 each");
+
+/// Every action, in the order of [`ACTIONS`].
+const ALL_ACTIONS: [Action; 33] = {
+    let mut out = [Action::SteerLeft; 33];
+    let mut i = 0;
+    while i < out.len() {
+        out[i] = ACTIONS[i].action;
+        i += 1;
+    }
+    out
+};
 
 /// The original's default key of each action, used only for an action with no binding at all
 /// ([`bindings`]; with the shipped `fe.txt` and 0x51D1D0's rows every action has one). The keys
@@ -141,42 +176,7 @@ const ALL_ACTIONS: [Action; 33] = [
 /// the key-down table. *(Corrected 2026-09-26: this map also had Escape for pause and the
 /// port's own free-camera keys W / S / Q / E / PageUp / PageDown / Shift, which nothing read.)*
 pub fn default_binding(key: KeyCode) -> Option<Action> {
-    Some(match key {
-        KeyCode::ArrowLeft => Action::SteerLeft,
-        KeyCode::ArrowRight => Action::SteerRight,
-        KeyCode::ArrowUp => Action::Throttle,
-        KeyCode::ArrowDown => Action::Brake,
-        KeyCode::Space => Action::Handbrake,
-        KeyCode::KeyA => Action::ShiftUp,
-        KeyCode::KeyZ => Action::ShiftDown,
-        KeyCode::KeyC => Action::CameraNext,
-        KeyCode::KeyR => Action::Reset,
-        KeyCode::KeyB => Action::RearView,
-        KeyCode::KeyH => Action::Horn,
-        KeyCode::KeyP => Action::Pause,
-        KeyCode::KeyL => Action::Lights,
-        KeyCode::KeyW => Action::SignalLeft,
-        KeyCode::KeyE => Action::SignalRight,
-        KeyCode::KeyT => Action::Hazards,
-        KeyCode::KeyY => Action::LookLeft,
-        KeyCode::KeyI => Action::LookRight,
-        KeyCode::KeyU => Action::LookForward,
-        KeyCode::KeyQ => Action::Abort,
-        KeyCode::KeyD => Action::AiDrive,
-        KeyCode::F1 => Action::TogglePauseMenu,
-        KeyCode::F2 => Action::RotCamClock,
-        KeyCode::F3 => Action::RotCamStop,
-        KeyCode::F4 => Action::RotCamCounter,
-        KeyCode::F5 => Action::ToggleHud,
-        KeyCode::F6 => Action::ToggleRearView,
-        KeyCode::F7 => Action::ToggleMap,
-        KeyCode::F8 => Action::HudTransparency,
-        KeyCode::F9 => Action::Music,
-        KeyCode::F10 => Action::Sfx,
-        KeyCode::Digit1 => Action::CycleHud,
-        KeyCode::Digit2 => Action::CycleMap,
-        _ => return None,
-    })
+    ACTIONS.iter().find(|d| d.default_key == key).map(|d| d.action)
 }
 
 /// The key bound to an action in the original's own key codes, the ones its key formatter
@@ -186,29 +186,7 @@ pub fn default_binding(key: KeyCode) -> Option<Action> {
 /// in the codes 0x51D1D0 binds them with (lower-case letters, which 0x51C050 prints as the
 /// capitals, 0x51C1EE); other actions return `None`.
 pub fn key_code_for(action: Action) -> Option<u32> {
-    let c = |ch: u8| ch as u32;
-    Some(match action {
-        Action::SteerLeft => 0x4B00,
-        Action::SteerRight => 0x4D00,
-        Action::Throttle => 0x4800,
-        Action::Brake => 0x5000,
-        Action::Handbrake => 0x20,
-        Action::ShiftUp => c(b'a'),
-        Action::ShiftDown => c(b'z'),
-        Action::CameraNext => c(b'c'),
-        Action::Reset => c(b'r'),
-        Action::RearView => c(b'b'),
-        Action::Horn => c(b'h'),
-        Action::Pause => c(b'p'),
-        Action::Lights => c(b'l'),
-        Action::SignalLeft => c(b'w'),
-        Action::SignalRight => c(b'e'),
-        Action::Hazards => c(b't'),
-        Action::LookLeft => c(b'y'),
-        Action::LookRight => c(b'i'),
-        Action::LookForward => c(b'u'),
-        _ => return None,
-    })
+    ACTIONS[action as usize].key_code
 }
 
 /// The DirectInput scancode of a physical key — the set `fe.txt`'s `SC_*` names and the key-down
@@ -220,12 +198,12 @@ pub fn scancode(k: KeyCode) -> Option<u8> {
         Digit6 => 0x07, Digit7 => 0x08, Digit8 => 0x09, Digit9 => 0x0A, Digit0 => 0x0B, Minus => 0x0C,
         Equal => 0x0D, Backspace => 0x0E, Tab => 0x0F, KeyQ => 0x10, KeyW => 0x11, KeyE => 0x12,
         KeyR => 0x13, KeyT => 0x14, KeyY => 0x15, KeyU => 0x16, KeyI => 0x17, KeyO => 0x18, KeyP => 0x19,
-        BracketLeft => 0x1A, BracketRight => 0x1B, Enter => 0x1C, ControlLeft | ControlRight => 0x1D,
+        BracketLeft => 0x1A, BracketRight => 0x1B, Enter => 0x1C, ControlLeft | ControlRight => bindings::SC_CTRL,
         KeyA => 0x1E, KeyS => 0x1F, KeyD => 0x20, KeyF => 0x21, KeyG => 0x22, KeyH => 0x23, KeyJ => 0x24,
-        KeyK => 0x25, KeyL => 0x26, Semicolon => 0x27, Quote => 0x28, Backquote => 0x29, ShiftLeft => 0x2A,
+        KeyK => 0x25, KeyL => 0x26, Semicolon => 0x27, Quote => 0x28, Backquote => 0x29, ShiftLeft => bindings::SC_LSHIFT,
         KeyZ => 0x2C, KeyX => 0x2D, KeyC => 0x2E, KeyV => 0x2F, KeyB => 0x30, KeyN => 0x31, KeyM => 0x32,
-        Comma => 0x33, Period => 0x34, Slash => 0x35, ShiftRight => 0x36, PrintScreen => 0x37,
-        AltLeft | AltRight => 0x38, Space => 0x39, CapsLock => 0x3A, F1 => 0x3B, F2 => 0x3C, F3 => 0x3D,
+        Comma => 0x33, Period => 0x34, Slash => 0x35, ShiftRight => bindings::SC_RSHIFT, PrintScreen => 0x37,
+        AltLeft | AltRight => bindings::SC_ALT, Space => 0x39, CapsLock => 0x3A, F1 => 0x3B, F2 => 0x3C, F3 => 0x3D,
         F4 => 0x3E, F5 => 0x3F, F6 => 0x40, F7 => 0x41, F8 => 0x42, F9 => 0x43, F10 => 0x44,
         NumLock => 0x45, ScrollLock => 0x46, Home => 0x47, ArrowUp => 0x48, PageUp => 0x49,
         NumpadSubtract => 0x4A, ArrowLeft => 0x4B, Numpad5 => 0x4C, ArrowRight => 0x4D, NumpadAdd => 0x4E,
@@ -236,49 +214,20 @@ pub fn scancode(k: KeyCode) -> Option<u8> {
 
 /// The binding id each action reads through (`bindings::id`).
 pub fn binding_id(a: Action) -> Option<u16> {
-    use bindings::id::*;
-    Some(match a {
-        Action::SteerLeft => C1_LEFT,
-        Action::SteerRight => C1_RIGHT,
-        Action::Throttle => C1_GAS,
-        Action::Brake => C1_BRAKE,
-        Action::Handbrake => C1_HANDBRAKE,
-        Action::Horn => C1_HORN,
-        Action::ShiftUp => C1_SHIFTUP,
-        Action::ShiftDown => C1_SHIFTDOWN,
-        Action::Abort => C1_ABORT,
-        Action::Reset => C1_RESET,
-        Action::AiDrive => C1_AIDRIVE,
-        Action::SignalLeft => C1_SIGNALLEFT,
-        Action::SignalRight => C1_SIGNALRIGHT,
-        Action::Hazards => C1_SIREN,
-        Action::Lights => C1_LIGHTSON,
-        Action::Pause => I_PAUSE,
-        Action::RotCamCounter => I_ROTCAMCCLOCK,
-        Action::RotCamStop => I_ROTCAMSTOP,
-        Action::RotCamClock => I_ROTCAMCLOCK,
-        Action::TogglePauseMenu => I_TOGGLEPAUSEMENU,
-        Action::Sfx => I_SFX,
-        Action::Music => I_MUSIC,
-        Action::RearView => I_LOOKBEHIND,
-        Action::LookLeft => I_LOOKLEFT,
-        Action::LookRight => I_LOOKRIGHT,
-        Action::LookForward => I_LOOKFORWARD,
-        Action::CameraNext => I_CYCLECAMERA,
-        Action::ToggleHud => I_TOGGLEHUD,
-        Action::CycleHud => I_CYCLEHUD,
-        Action::ToggleRearView => I_TOGGLEREARVIEW,
-        Action::ToggleMap => I_TOGGLEMAP,
-        Action::CycleMap => I_CYCLEMAP,
-        Action::HudTransparency => I_HUDTRANSPARENCY,
-    })
+    Some(ACTIONS[a as usize].id)
+}
+
+/// The action whose binding has option id `id`.
+fn action_of_id(id: u16) -> Option<Action> {
+    ACTIONS.iter().find(|d| d.id == id).map(|d| d.action)
 }
 
 /// Current logical input state, updated from window events and sampled once per tick.
 #[derive(Debug, Default, Clone)]
 pub struct InputState {
-    held: HashSet<Action>,
-    pressed: HashSet<Action>,
+    /// the actions held / pressed since the last tick, one bit each by `Action as u8`
+    held: u64,
+    pressed: u64,
     /// `fe.txt`'s `C1_*` key bindings; an action with one reads through it, the rest through
     /// [`default_binding`]
     pub bindings: bindings::Bindings,
@@ -293,28 +242,43 @@ pub struct InputState {
     pub pad: Option<gamepad::PadAxes>,
 }
 
+/// An action's bit in [`InputState`]'s held / pressed masks.
+const fn bit(a: Action) -> u64 {
+    1 << (a as u8)
+}
+
 impl InputState {
+    /// The action goes down: held, and pressed when it was not held already.
+    fn hold(&mut self, a: Action) {
+        if self.held & bit(a) == 0 {
+            self.held |= bit(a);
+            self.pressed |= bit(a);
+        }
+    }
+
+    fn unhold(&mut self, a: Action) {
+        self.held &= !bit(a);
+    }
+
     pub fn key_event(&mut self, ev: &KeyEvent) {
         let PhysicalKey::Code(code) = ev.physical_key else { return };
+        self.key_changed(code, ev.state);
+    }
+    /// A physical key going down or up (`key_event` minus the winit event, which tests cannot build).
+    fn key_changed(&mut self, code: KeyCode, state: ElementState) {
         if let Some(sc) = scancode(code) {
-            match ev.state {
+            match state {
                 ElementState::Pressed => self.keys_down.insert(sc),
                 ElementState::Released => self.keys_down.remove(&sc),
             };
             // an action bound in `fe.txt` is pressed by its binding's key and no other
-            let bound = self.bindings.by_id.iter().filter(|(_, b)| b.kind == 3 && b.index == sc as u32).map(|(&i, _)| i).collect::<Vec<_>>();
+            let bound = self.bindings.by_id.iter().filter(|(_, b)| b.kind_class() == bindings::BindingKind::Key && b.index == sc as u32).map(|(&i, _)| i).collect::<Vec<_>>();
             for i in bound {
-                if let Some(a) = ALL_ACTIONS.iter().copied().find(|&a| binding_id(a) == Some(i)) {
-                    match ev.state {
-                        ElementState::Pressed if self.read(a) > 0x40 => {
-                            if self.held.insert(a) {
-                                self.pressed.insert(a);
-                            }
-                        }
+                if let Some(a) = action_of_id(i) {
+                    match state {
+                        ElementState::Pressed if self.read(a) > 0x40 => self.hold(a),
                         ElementState::Pressed => {}
-                        ElementState::Released => {
-                            self.held.remove(&a);
-                        }
+                        ElementState::Released => self.unhold(a),
                     }
                 }
             }
@@ -323,24 +287,16 @@ impl InputState {
         if binding_id(action).is_some_and(|i| self.bindings.get(i).is_some()) {
             return;
         }
-        match ev.state {
-            ElementState::Pressed => {
-                if self.held.insert(action) {
-                    self.pressed.insert(action);
-                }
-            }
-            ElementState::Released => {
-                self.held.remove(&action);
-            }
+        match state {
+            ElementState::Pressed => self.hold(action),
+            ElementState::Released => self.unhold(action),
         }
     }
     pub fn press(&mut self, action: Action) {
-        if self.held.insert(action) {
-            self.pressed.insert(action);
-        }
+        self.hold(action);
     }
     pub fn release(&mut self, action: Action) {
-        self.held.remove(&action);
+        self.unhold(action);
     }
     pub fn mouse_motion(&mut self, dx: f64, dy: f64) {
         self.mouse_delta.0 += dx as f32;
@@ -352,19 +308,20 @@ impl InputState {
         if self.pad_bound(a) && self.read(a) > 0x40 {
             return true;
         }
-        let gated = binding_id(a).is_some_and(|i| self.bindings.get(i).is_some_and(|b| b.kind == 3)) && self.modifier_down();
-        self.held.contains(&a) && !gated
+        let gated = binding_id(a).is_some_and(|i| self.bindings.get(i).is_some_and(|b| b.kind_class() == bindings::BindingKind::Key)) && self.modifier_down();
+        self.held & bit(a) != 0 && !gated
     }
     /// New pad readings: an action bound to a pad control is pressed on the tick its read goes
     /// above 0x40 (the packer's threshold, 0x412FE4), which is what `take_pressed` hands out.
-    pub fn set_pads(&mut self, pads: Vec<bindings::PadRecord>) {
-        let before: Vec<Action> = ALL_ACTIONS.iter().copied().filter(|&a| self.pad_bound(a) && self.read(a) > 0x40).collect();
-        self.pads = pads;
-        for a in ALL_ACTIONS {
-            if self.pad_bound(a) && self.read(a) > 0x40 && !before.contains(&a) {
-                self.pressed.insert(a);
-            }
-        }
+    pub fn set_pads(&mut self, pads: &[bindings::PadRecord]) {
+        let before = self.pad_pressed_mask();
+        self.pads.clear();
+        self.pads.extend_from_slice(pads);
+        self.pressed |= self.pad_pressed_mask() & !before;
+    }
+    /// The actions bound to a pad control whose read is above the packer's 0x40 threshold now.
+    fn pad_pressed_mask(&self) -> u64 {
+        ALL_ACTIONS.iter().filter(|&&a| self.pad_bound(a) && self.read(a) > 0x40).fold(0, |m, &a| m | bit(a))
     }
     /// **0x51D1D0** for pad `pad` of [`pads`](Self::pads), committed over the bindings
     /// ([`bindings::Bindings::set_defaults`]). No pad, or one that is not there, is the device
@@ -382,44 +339,46 @@ impl InputState {
         self.keys_down.len()
     }
     fn modifier_down(&self) -> bool {
-        [0x2A, 0x36, 0x1D, 0x38].iter().any(|s| self.keys_down.contains(s))
+        [bindings::SC_LSHIFT, bindings::SC_RSHIFT, bindings::SC_CTRL, bindings::SC_ALT].iter().any(|s| self.keys_down.contains(s))
     }
     /// An action's 0…255 read through its binding by the kind's reader (the records at
     /// `0x5CC5C8 + 12·kind`): `Analog` 0x411B80, `Button` 0x411A50, `Key` 0x411C20, `Pov`
     /// 0x411AC0. 0 for an action with no binding, or a binding of kind 0.
     pub fn read(&self, a: Action) -> u8 {
         let Some(b) = binding_id(a).and_then(|i| self.bindings.get(i)) else { return 0 };
-        match b.kind {
-            1 => bindings::axis_read(b, &self.pads, &self.axis_bands),
-            2 => bindings::button_read(b, &self.pads),
-            3 => {
+        match b.kind_class() {
+            bindings::BindingKind::Axis => bindings::axis_read(b, &self.pads, &self.axis_bands),
+            bindings::BindingKind::Button => bindings::button_read(b, &self.pads),
+            bindings::BindingKind::Key => {
                 let down = |s: u8| self.keys_down.contains(&s);
                 let m = bindings::Modifiers {
-                    shift: down(0x2A) || down(0x36),
-                    ctrl: down(0x1D),
-                    alt: down(0x38),
+                    shift: down(bindings::SC_LSHIFT) || down(bindings::SC_RSHIFT),
+                    ctrl: down(bindings::SC_CTRL),
+                    alt: down(bindings::SC_ALT),
                 };
                 bindings::key_read(b, down, m)
             }
-            5 => bindings::pov_read(b, &self.pads),
+            bindings::BindingKind::Hat => bindings::pov_read(b, &self.pads),
             _ => 0,
         }
     }
     /// Whether an action is bound to a pad control (kinds 1, 2, 5), which the packer then reads
     /// through its reader rather than through a held key.
     pub fn pad_bound(&self, a: Action) -> bool {
-        binding_id(a).and_then(|i| self.bindings.get(i)).is_some_and(|b| matches!(b.kind, 1 | 2 | 5))
+        binding_id(a).and_then(|i| self.bindings.get(i)).is_some_and(|b| matches!(b.kind_class(), bindings::BindingKind::Axis | bindings::BindingKind::Button | bindings::BindingKind::Hat))
     }
     /// `.RAMPS` / `.RAMPG` / `.RAMPB` — 0x51CC00 writes `kind != 1` for the `C1_RIGHT`, `C1_GAS`
     /// and `C1_BRAKE` bindings into option ids 0x222 / 0x223 / 0x224 (0x51CF54…0x51CFFC): every
     /// control but an axis is ramped. Without a binding the port's keyboard is digital.
     pub fn ramps(&self) -> (bool, bool, bool) {
-        let digital = |a: Action| binding_id(a).and_then(|i| self.bindings.get(i)).is_none_or(|b| b.kind != 1);
+        let digital = |a: Action| binding_id(a).and_then(|i| self.bindings.get(i)).is_none_or(|b| b.kind_class() != bindings::BindingKind::Axis);
         (digital(Action::SteerRight), digital(Action::Throttle), digital(Action::Brake))
     }
     /// Edge-triggered: true once per key press.
     pub fn take_pressed(&mut self, a: Action) -> bool {
-        self.pressed.remove(&a)
+        let was = self.pressed & bit(a) != 0;
+        self.pressed &= !bit(a);
+        was
     }
     /// −1..1 steering: gamepad axis if present, else digital keys (no ramp yet — see module docs).
     pub fn steer(&self) -> f32 {
@@ -456,14 +415,14 @@ impl InputState {
     /// pending press. PORT-DEVIATION D17 (PORT-DEVIATIONS.md): the release events of keys / modifiers
     /// held at that moment never arrive (macOS: Cmd+Shift+5 leaves Cmd / Shift "down").
     pub fn release_all(&mut self) {
-        self.held.clear();
-        self.pressed.clear();
+        self.held = 0;
+        self.pressed = 0;
         self.keys_down.clear();
         self.mouse_delta = (0.0, 0.0);
     }
     /// Call at the end of each tick.
     pub fn end_tick(&mut self) {
-        self.pressed.clear();
+        self.pressed = 0;
         self.mouse_delta = (0.0, 0.0);
     }
 }
@@ -487,6 +446,144 @@ mod tests {
         assert!(st.keys_down.is_empty());
         assert_eq!(st.mouse_delta, (0.0, 0.0));
     }
+
+    fn keyed(lines: &'static [(&'static str, &'static str)]) -> InputState {
+        InputState { bindings: bindings::Bindings::from_registry(|k| lines.iter().find(|(n, _)| *n == k).map(|(_, v)| *v)), ..Default::default() }
+    }
+
+    /// an action with no binding reads its default key: pressed once on the
+    /// down edge, held until the up, the edge is cleared by `end_tick`.
+    #[test]
+    fn a_default_key_presses_once_and_holds() {
+        let mut st = InputState::default();
+        st.key_changed(KeyCode::KeyW, ElementState::Pressed);
+        assert!(st.held(Action::SignalLeft));
+        assert!(st.take_pressed(Action::SignalLeft));
+        assert!(!st.take_pressed(Action::SignalLeft), "one edge per press");
+        st.key_changed(KeyCode::KeyW, ElementState::Pressed); // auto-repeat: no second edge
+        assert!(!st.take_pressed(Action::SignalLeft));
+        st.key_changed(KeyCode::KeyW, ElementState::Released);
+        assert!(!st.held(Action::SignalLeft));
+        st.key_changed(KeyCode::KeyW, ElementState::Pressed);
+        st.end_tick();
+        assert!(!st.take_pressed(Action::SignalLeft), "end_tick drops the edge");
+        assert!(st.held(Action::SignalLeft));
+        st.key_changed(KeyCode::Escape, ElementState::Pressed);
+        assert_eq!(st.keys_down_count(), 2, "Escape has a scancode but no action");
+    }
+
+    /// A bound action is pressed by its binding's key and no other: `C1_LEFT = key,SC_H` moves
+    /// the steering to H and leaves the arrow (its default) and `Horn`'s own H dead.
+    #[test]
+    fn a_bound_action_follows_its_binding() {
+        let mut st = keyed(&[("C1_LEFT", "key,SC_H"), ("C1_HORN", "key,SC_X")]);
+        st.key_changed(KeyCode::ArrowLeft, ElementState::Pressed);
+        assert!(!st.held(Action::SteerLeft), "the default key is dead once the action is bound");
+        st.key_changed(KeyCode::KeyH, ElementState::Pressed);
+        assert!(st.held(Action::SteerLeft) && st.take_pressed(Action::SteerLeft));
+        assert!(!st.held(Action::Horn), "Horn is bound to X, not H");
+        assert_eq!(st.read(Action::SteerLeft), 255);
+        st.key_changed(KeyCode::KeyH, ElementState::Released);
+        assert!(!st.held(Action::SteerLeft));
+        assert_eq!(st.read(Action::SteerLeft), 0);
+    }
+
+    /// 0x411C5F: Shift, Ctrl or Alt down zeroes a bound key's read and gates its held state; what
+    /// is held through `press` is gated only for a key binding.
+    #[test]
+    fn a_modifier_gates_a_bound_key() {
+        let mut st = keyed(&[("C1_GAS", "key,SC_UP")]);
+        st.key_changed(KeyCode::ArrowUp, ElementState::Pressed);
+        assert!(st.held(Action::Throttle));
+        for m in [KeyCode::ShiftLeft, KeyCode::ShiftRight, KeyCode::ControlLeft, KeyCode::AltRight] {
+            st.key_changed(m, ElementState::Pressed);
+            assert!(!st.held(Action::Throttle), "{m:?}");
+            assert_eq!(st.read(Action::Throttle), 0);
+            st.key_changed(m, ElementState::Released);
+            assert!(st.held(Action::Throttle), "{m:?} released");
+        }
+        // a modifier pressed first: the key goes down under it and is not pressed at all
+        let mut st = keyed(&[("C1_GAS", "key,SC_UP")]);
+        st.key_changed(KeyCode::ShiftLeft, ElementState::Pressed);
+        st.key_changed(KeyCode::ArrowUp, ElementState::Pressed);
+        assert!(!st.take_pressed(Action::Throttle) && !st.held(Action::Throttle));
+        // an unbound action's default key is not gated
+        let mut st = InputState::default();
+        st.key_changed(KeyCode::ShiftLeft, ElementState::Pressed);
+        st.key_changed(KeyCode::ArrowUp, ElementState::Pressed);
+        assert!(st.held(Action::Throttle));
+    }
+
+    /// 0x412FE4: an action bound to a pad control is pressed on the tick its read goes above 0x40,
+    /// held while it stays there; the digital/analogue split of the ramps follows the kind.
+    #[test]
+    fn a_pad_control_presses_on_the_edge() {
+        let mut st = InputState::default();
+        st.bindings.by_id.insert(bindings::id::C1_HANDBRAKE, bindings::Binding { kind: 2, device: 0, index: 4, dir: 0, pov: 0, key: 0 });
+        st.bindings.by_id.insert(bindings::id::C1_GAS, bindings::Binding { kind: 1, device: 0, index: 1, dir: 1, pov: 0, key: 0 });
+        assert!(st.pad_bound(Action::Handbrake) && st.pad_bound(Action::Throttle) && !st.pad_bound(Action::Brake));
+        assert_eq!(st.ramps(), (true, false, true), "an axis is not ramped, the rest are");
+        let mut rec = bindings::PadRecord::default();
+        st.set_pads(&[rec]);
+        assert!(!st.held(Action::Handbrake) && !st.take_pressed(Action::Handbrake));
+        rec.buttons[4] = true;
+        st.set_pads(&[rec]);
+        assert!(st.held(Action::Handbrake) && st.take_pressed(Action::Handbrake));
+        st.set_pads(&[rec]); // still down: no new edge
+        assert!(st.held(Action::Handbrake) && !st.take_pressed(Action::Handbrake));
+        rec.buttons[4] = false;
+        st.set_pads(&[rec]);
+        assert!(!st.held(Action::Handbrake));
+        // `press` / `release` work for any action, key or not
+        st.press(Action::Horn);
+        assert!(st.held(Action::Horn) && st.take_pressed(Action::Horn));
+        st.release(Action::Horn);
+        assert!(!st.held(Action::Horn));
+    }
+
+    /// The table's row `i` is the action whose discriminant is `i`, and every row is the action's own.
+    #[test]
+    fn the_action_table_is_indexed_by_the_variant() {
+        for (i, d) in ACTIONS.iter().enumerate() {
+            assert_eq!(d.action as usize, i, "{:?}", d.action);
+            assert_eq!(binding_id(d.action), Some(d.id));
+            assert_eq!(action_of_id(d.id), Some(d.action));
+            assert_eq!(default_binding(d.default_key), Some(d.action));
+            assert!(d.fe_name.starts_with("C1_") || d.fe_name.starts_with("I_"), "{}", d.fe_name);
+        }
+        let names: std::collections::HashSet<_> = ACTIONS.iter().map(|d| d.fe_name).collect();
+        assert_eq!(names.len(), 33, "names are unique");
+        // the declaration order is the table's, so the last variant is the last row
+        assert_eq!(Action::CycleMap as usize, ACTIONS.len() - 1);
+    }
+
+    /// the per-action tables as one text, pinned by hash (ids, default keys,
+    /// display codes, `ALL_ACTIONS` order, scancodes) — the guard for folding them into one table.
+    #[test]
+    fn the_action_tables_are_pinned() {
+        let mut s = String::new();
+        let mut actions = ALL_ACTIONS;
+        actions.sort_by_key(|a| format!("{a:?}"));
+        for a in actions.iter() {
+            let key = KEY_PROBE.iter().find(|k| default_binding(**k) == Some(*a));
+            s += &format!("{a:?}:{:?}:{:?}:{:?}\n", binding_id(*a), key_code_for(*a), key.map(|k| scancode(*k)));
+        }
+        let ids: std::collections::HashSet<_> = ALL_ACTIONS.iter().map(|a| binding_id(*a)).collect();
+        assert_eq!(ids.len(), 33, "ids are unique");
+        let h = s.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+        eprintln!("TABLES {h:016x}\n{s}");
+        assert_eq!(h, PINNED_TABLES);
+    }
+    const PINNED_TABLES: u64 = 0x9e95fc809b4b2db8;
+    const KEY_PROBE: [KeyCode; 41] = [
+        KeyCode::ArrowLeft, KeyCode::ArrowRight, KeyCode::ArrowUp, KeyCode::ArrowDown, KeyCode::Space,
+        KeyCode::KeyA, KeyCode::KeyZ, KeyCode::KeyC, KeyCode::KeyR, KeyCode::KeyB, KeyCode::KeyH,
+        KeyCode::KeyP, KeyCode::KeyL, KeyCode::KeyW, KeyCode::KeyE, KeyCode::KeyT, KeyCode::KeyY,
+        KeyCode::KeyI, KeyCode::KeyU, KeyCode::KeyQ, KeyCode::KeyD, KeyCode::F1, KeyCode::F2,
+        KeyCode::F3, KeyCode::F4, KeyCode::F5, KeyCode::F6, KeyCode::F7, KeyCode::F8, KeyCode::F9,
+        KeyCode::F10, KeyCode::Digit1, KeyCode::Digit2, KeyCode::Escape, KeyCode::KeyX, KeyCode::F11,
+        KeyCode::F12, KeyCode::NumpadAdd, KeyCode::Tab, KeyCode::Digit3, KeyCode::KeyS,
+    ];
 
     /// The shipped `fe.txt`'s binding lines (lines 397…436) and 0x51D1D0's keyboard rows give
     /// every action a key, and it is the one [`default_binding`] names.

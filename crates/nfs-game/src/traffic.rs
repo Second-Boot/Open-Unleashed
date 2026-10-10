@@ -68,7 +68,7 @@
 
 use crate::aidrive::{self, AiCarState};
 use crate::scripts::{ScriptRunner, Trigger};
-use crate::lanes::{lane_of, lane_span, LaneCar, LaneScratch, LaneSelf, PERSONALITIES};
+use crate::lanes::{lane_of, lane_span, LaneCar, LanePassCtx, LaneScratch, LaneSelf, PERSONALITIES};
 use crate::race::SliceTable;
 use glam::{Mat3, Vec3};
 
@@ -82,6 +82,14 @@ pub const DESPAWN_DISTANCE: f32 = 400.0;
 pub const SPAWN_GAP: (u32, u32) = (60, 6);
 /// AI timestep — `[0x5CC750]`, the 32 Hz rate traffic runs at inside ~160 m (§14.3).
 pub const AI_DT: f32 = 1.0 / 32.0;
+/// The drive's timestep on the half-rate rows of `0x414B10` (every other 32 Hz tick, past 160 m
+/// from a racer, [`drive_due`]) — twice [`AI_DT`].
+pub const AI_DT_HALF_RATE: f32 = 1.0 / 16.0;
+/// §21.7's lying-on-its-side test: a car whose up row has a `y` under this, and has never been
+/// hit, is only damped ([`LYING_DAMP`]) and does not steer.
+const LYING_UP_Y: f32 = 0.3;
+/// §21.7's damping factor: `vel *= k` (and the same for a car whose target speed is zero).
+const LYING_DAMP: f32 = 0.94;
 
 /// `Lod_shouldUpdate` 0x414B10 as the drive `0x408360` calls it (0x408373…0x40839E) —
 /// `0x414B10(1, 1, car+0x78, car+0, &[0x5E6D00], &[0x5E6D78], &[0x5E6D7C], car+0x10B8)`, read to
@@ -100,7 +108,7 @@ pub fn drive_due(distance: f32, force: bool, tick: u64, slot: usize) -> Option<(
         return Some((AI_DT, 1));
     }
     let lod = if force { 0 } else { (distance as i32 / 16).min(19) };
-    let (mask, dt, n_ticks) = if lod < 10 { (0u64, AI_DT, 1) } else { (1, 1.0 / 16.0, 2) };
+    let (mask, dt, n_ticks) = if lod < 10 { (0u64, AI_DT, 1) } else { (1, AI_DT_HALF_RATE, 2) };
     ((((slot | 0x100) as u64 + tick / 2) & mask) == mask).then_some((dt, n_ticks))
 }
 /// Purgatory delay table `0x5CC4A0`, indexed by the number of registered traffic cars (§9.1).
@@ -661,6 +669,8 @@ pub struct TrafficSet {
     /// the humans of the caller's `others` list, in the same order (empty: the [`Reference`] is the one
     /// human) — 0x401580's triggers read `0x40E9E0(human)` and `human+0xD86` of **each** human it walks
     pub human_views: Vec<HumanView>,
+    /// the lane pass's lists, refilled for every car of [`Self::ai_on`] (no per-car allocation)
+    lane_ctx: LanePassCtx,
 }
 
 /// The spawn gate `0x40E060`'s track windows (0x40E0AD…0x40E134): `TRACK_NAME [0x657444]`'s first
@@ -702,7 +712,7 @@ impl TrafficSet {
                 c
             })
             .collect();
-        Self { cars, opponents: 0, cops_race: false, weather: false, scripts: nfs_formats::scripts::Scripts::default(), rng, one_way, race_dir, linear, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: TrafficPhysics::default(), slot_base: 0, no_spawn: &[], time_mode: false, bodies: Vec::new(), specs: None, car_specs: Vec::new(), cops: Vec::new(), chase_targets: Vec::new(), other_positions: Vec::new(), other_places: Vec::new(), overtake_order: Vec::new(), swap_partner: Vec::new(), swap_tick: Vec::new(), overtake_base: 0, human_views: Vec::new() }
+        Self { cars, opponents: 0, cops_race: false, weather: false, scripts: nfs_formats::scripts::Scripts::default(), rng, one_way, race_dir, linear, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: TrafficPhysics::default(), slot_base: 0, no_spawn: &[], time_mode: false, bodies: Vec::new(), specs: None, car_specs: Vec::new(), cops: Vec::new(), chase_targets: Vec::new(), other_positions: Vec::new(), other_places: Vec::new(), overtake_order: Vec::new(), swap_partner: Vec::new(), swap_tick: Vec::new(), overtake_base: 0, human_views: Vec::new(), lane_ctx: LanePassCtx::default() }
     }
 
     /// The cars' bodies: `RigidBody_init` 0x49B510 for each traffic car, with `default.sim`'s
@@ -746,6 +756,10 @@ impl TrafficSet {
     /// and the alive flag `car+0xDB0`.
     pub fn sync_in(&mut self, i: usize) {
         let (Some(c), Some(b)) = (self.cars.get(i), self.bodies.get_mut(i)) else { return };
+        Self::sync_in_one(c, b);
+    }
+
+    fn sync_in_one(c: &TrafficCar, b: &mut nfs_physics::vehicle::Vehicle) {
         b.position = c.position;
         b.orientation = c.orientation;
         b.velocity = c.velocity;
@@ -763,6 +777,10 @@ impl TrafficSet {
     /// and `car+0x464` (the body tracker's patch nibble — 0 off the surface).
     pub fn sync_out(&mut self, i: usize) {
         let (Some(c), Some(b)) = (self.cars.get_mut(i), self.bodies.get(i)) else { return };
+        Self::sync_out_one(c, b);
+    }
+
+    fn sync_out_one(c: &mut TrafficCar, b: &nfs_physics::vehicle::Vehicle) {
         c.position = b.position;
         c.orientation = b.orientation;
         c.velocity = b.velocity;
@@ -783,21 +801,23 @@ impl TrafficSet {
     /// phase). With no bodies (the unit tests) nothing runs; [`Self::integrate_on`] then holds the
     /// slice's height.
     pub fn ground(&mut self, grid: &nfs_physics::collision::TriangleGrid, tick: u64) {
-        let Some(default_specs) = self.specs.clone() else { return };
-        for i in 0..self.cars.len().min(self.bodies.len()) {
-            let specs = self.car_specs.get(i).unwrap_or(&default_specs).clone();
-            if !self.cars[i].active {
+        // split borrows: the specs are read in place, nothing is cloned per tick
+        let Self { cars, bodies, specs, car_specs, slot_base, .. } = self;
+        let Some(default_specs) = specs.as_ref() else { return };
+        for i in 0..cars.len().min(bodies.len()) {
+            if !cars[i].active {
                 continue;
             }
-            self.sync_in(i);
-            let slot = self.slot_base + i;
-            let b = &mut self.bodies[i];
+            let specs = car_specs.get(i).unwrap_or(default_specs);
+            let b = &mut bodies[i];
+            Self::sync_in_one(&cars[i], b);
+            let slot = *slot_base + i;
             b.tracker.track(grid, b.position);
-            if let Some((rate_hz, n_ticks)) = nfs_physics::vehicle::ground_due(self.cars[i].racer_distance, false, tick, slot) {
-                b.ai_ground_step(grid, &specs, rate_hz, n_ticks, false);
+            if let Some((rate_hz, n_ticks)) = nfs_physics::vehicle::ground_due(cars[i].racer_distance, false, tick, slot) {
+                b.ai_ground_step(grid, specs, rate_hz, n_ticks, false);
                 tracing::trace!(car = i, tick, patch = b.tracker.word & 0xF, cos_tilt = b.cos_tilt, air = b.airborne_count, h424 = b.body_height, y = b.position.y, "traffic ground");
             }
-            self.sync_out(i);
+            Self::sync_out_one(&mut cars[i], b);
         }
     }
 
@@ -896,18 +916,11 @@ impl TrafficSet {
             // are all zero, so there is no in-lane swerve to add.
             // in registration order (0x40F189): the caller's human, opponents and cops, then this
             // set's cars — the order `find_blockers`' race-order walk keeps for a tie
-            let mut cars: Vec<LaneCar> = others.to_vec();
-            cars.extend(self.cars.iter().enumerate().filter(|(j, o)| *j != i && o.active).map(|(_, o)| o.as_lane_car(table)));
-            // `car+0x528` of each entry of `cars` — the race-order places of the previous even tick
-            // (0x401FA2 walks `0x5E8B88[]` from the car's own); without the others' (the unit tests)
-            // the walk sorts the cars itself
-            let places: Vec<usize> = self
-                .other_places
-                .iter()
-                .copied()
-                .chain(self.cars.iter().enumerate().filter(|(j, o)| *j != i && o.active).map(|(_, o)| o.place))
-                .collect();
-            let placed = self.other_places.len() == others.len();
+            // `car+0x528` of each entry (the race-order places of the previous even tick, 0x401FA2
+            // walks `0x5E8B88[]` from the car's own) and the positions for 0x40E860's fine step go
+            // with them; without the others' places (the unit tests) the walk sorts the cars itself
+            let mut ctx = std::mem::take(&mut self.lane_ctx);
+            ctx.fill(others, &self.other_places, &self.other_positions, self.cars.iter().enumerate().filter(|(j, o)| *j != i && o.active).map(|(_, o)| (o.as_lane_car(table), o.place, o.position)));
             let sl = table.slices[self.cars[i].slice];
             let c = &self.cars[i];
             let me = LaneSelf {
@@ -966,7 +979,7 @@ impl TrafficSet {
                     if tick.saturating_sub(hit_tick) < 15 {
                         requests.push((0, Trigger::Collision));
                     }
-                    for (hi, h) in cars.iter().enumerate().filter(|(_, h)| h.is_human) {
+                    for (hi, h) in ctx.cars.iter().enumerate().filter(|(_, h)| h.is_human) {
                         // `0x40E9E0(human)` and the horn of *this* human (the reference alone when the caller
                         // gave no views: a single-player race has one human)
                         let (h_laps, h_slice, h_honk) = match self.human_views.get(hi) {
@@ -1033,25 +1046,18 @@ impl TrafficSet {
             let mut sc = LaneScratch::default();
             let one_way = self.one_way;
             let mut scan = my_scan;
-            // world positions in the order of `cars` for 0x40E860's fine step; an `others` entry the
-            // caller gave no position for falls back to the slice gap (NaN is never within ±12 m of
-            // anything the fine step would accept, so it is filtered out below)
-            let positions: Vec<Vec3> = (0..others.len())
-                .map(|k| self.other_positions.get(k).copied().unwrap_or(Vec3::NAN))
-                .chain(self.cars.iter().enumerate().filter(|(j, o)| *j != i && o.active).map(|(_, o)| o.position))
-                .collect();
-            let fine_ok = positions.iter().all(|p| p.is_finite());
-            sc.find_blockers_placed(table, &me, &cars, &PERSONALITIES[0], fine_ok.then_some((self.cars[i].position, positions.as_slice())), placed.then_some((self.cars[i].place, places.as_slice())));
+            ctx.find_blockers(&mut sc, table, &me, self.cars[i].position, self.cars[i].place);
             sc.score_own_side(&me, one_way, true);
             // §12.3's script reactions push the same lane scores the scorers do
             {
+                let fine_ok = ctx.fine_ok();
                 let r = &self.cars[i].script;
                 // SWERVE (0x40146E…0x4014E7): the weave runs while the target is **more** than 12 m
                 // away — `fcomp [0x5B240C]; test ah, 0x41; jne skip` at 0x40149B…0x4014A6 skips
                 // `|d| <= 12` (the port had `< 12`, after the note). No shipped script uses SWERVE
                 // (`traffic.md` §30.x), so this is dead data either way.
                 if let Some(t) = r.query(nfs_formats::scripts::mask::SWERVE)
-                    && let Some(o) = cars.get(t.max(0) as usize)
+                    && let Some(o) = ctx.cars.get(t.max(0) as usize)
                     && crate::lanes::gap_between(table, o.slice, me.slice).abs() > 12.0
                 {
                     // a deterministic 1 Hz weave off the script's own timer, not a random draw:
@@ -1063,13 +1069,13 @@ impl TrafficSet {
                     }
                 }
                 if let Some(t) = r.query(nfs_formats::scripts::mask::SWIPE)
-                    && let Some(o) = cars.get(t.max(0) as usize)
+                    && let Some(o) = ctx.cars.get(t.max(0) as usize)
                     // `0x40E860(car, o)` (0x401503: `push edi` the target, `push esi` the car) is
                     // positive when **this car** is ahead — `gap_fine(car, o)`, the slice gap and
                     // inside ±12 m the offset on this car's slice forward; the port had the
                     // arguments the other way round, i.e. the sign flipped. Then `· car+0xEB0 < 4`
                     // (0x40150A…0x401522, `test ah, 1`). Dead data for traffic: row 0 has no SWIPE.
-                    && crate::lanes::gap_fine(table, me.slice, o.slice, fine_ok.then(|| positions.get(t.max(0) as usize).map(|p| (self.cars[i].position, *p))).flatten()) * me.dir < 4.0
+                    && crate::lanes::gap_fine(table, me.slice, o.slice, fine_ok.then(|| ctx.positions.get(t.max(0) as usize).map(|p| (self.cars[i].position, *p))).flatten()) * me.dir < 4.0
                 {
                     match o.lane.cmp(&me.lane) {
                         std::cmp::Ordering::Greater => sc.score[2] += 5.0,
@@ -1079,23 +1085,24 @@ impl TrafficSet {
                 }
             }
             sc.score_blockers(&me);
-            sc.score_abreast(table, &me, &cars);
+            sc.score_abreast(table, &me, &ctx.cars);
             sc.score_lane_exists(table, &me, &mut scan, ai_ticks);
             sc.score_narrowing(table, &me);
-            sc.score_shoulders(table, &me, &cars);
+            sc.score_shoulders(table, &me, &ctx.cars);
             let (slot, lane) = sc.pick(&me);
             if lane != me.lane {
                 tracing::debug!(car = i, from = me.lane, to = lane, scores = ?sc.score, "traffic lane change");
             }
-            let lateral_target = sc.lateral_target(table, &me, lane, slot, &cars);
+            let lateral_target = sc.lateral_target(table, &me, lane, slot, &ctx.cars);
             if (lateral_target - sc.lane_centre(table, &me, lane)).abs() > 0.01 {
                 tracing::debug!(car = i, lane, lateral_target, centre = sc.lane_centre(table, &me, lane), "traffic squeezes past");
             }
-            let capped = sc.capped_target(&me, lane, lateral_target, self.cars[i].lateral_rate, &cars);
+            let capped = sc.capped_target(&me, lane, lateral_target, self.cars[i].lateral_rate, &ctx.cars);
             let c = &mut self.cars[i];
             c.scan = scan;
             c.lateral_target = lateral_target;
             c.target_speed = capped;
+            self.lane_ctx = ctx;
         }
     }
 
@@ -1133,15 +1140,18 @@ impl TrafficSet {
         }
     }
 
-    /// The chase targets this pass: [`Self::chase_targets`], or the human alone.
-    fn targets(&self, reference: Reference) -> Vec<ChaseTarget> {
-        if self.chase_targets.is_empty() { vec![reference.into()] } else { self.chase_targets.clone() }
+    /// The chase targets this pass: [`Self::chase_targets`], or the human alone. Borrowed — nothing
+    /// is copied unless the list is empty (the human alone).
+    fn targets_of(chase_targets: &[ChaseTarget], reference: Reference) -> std::borrow::Cow<'_, [ChaseTarget]> {
+        if chase_targets.is_empty() { std::borrow::Cow::Owned(vec![reference.into()]) } else { std::borrow::Cow::Borrowed(chase_targets) }
     }
 
     /// Car `i`'s reference `car+0xED4` as a chase target.
     fn reference_of(&self, i: usize, reference: Reference) -> ChaseTarget {
-        let t = self.targets(reference);
-        t[self.cars[i].reference.min(t.len() - 1)]
+        match self.chase_targets.len() {
+            0 => reference.into(),
+            n => self.chase_targets[self.cars[i].reference.min(n - 1)],
+        }
     }
 
     /// The chase targets in `0x5E8B88[]`'s order — by the place each holds in the array the previous
@@ -1302,10 +1312,10 @@ impl TrafficSet {
             // `ω.y *= 0.98` — and does not steer. The damaged-out and player exits cannot fire for
             // traffic (§21.7).
             let up_y = c.orientation.row(1).y;
-            let damp = if c.collisions == 0 && up_y < 0.3 {
-                Some(0.94)
+            let damp = if c.collisions == 0 && up_y < LYING_UP_Y {
+                Some(LYING_DAMP)
             } else if c.target_speed == 0.0 {
-                Some(0.94)
+                Some(LYING_DAMP)
             } else {
                 None
             };
@@ -1437,22 +1447,22 @@ impl TrafficSet {
         let (fwd, _, up) = axes(&sl, dir);
         let rest = self.cars[i].rest_height();
         self.cars[i].slice = s;
-        match (grid, self.car_specs.get(i).cloned().or_else(|| self.specs.clone())) {
+        match (grid, self.car_specs.get(i).or(self.specs.as_ref())) {
             (Some(g), Some(specs)) if i < self.bodies.len() => {
                 // 0x49E220 (re-arms `car+0xDB0`, the drivetrain and the AI's forces), then
                 // `Car_placeAtSlice` 0x49B090 with the zero offset and `car+0xEAC`
                 self.cars[i].accel_local = Vec3::ZERO;
                 self.cars[i].accel_world = Vec3::ZERO;
                 self.cars[i].alive = true;
-                self.sync_in(i);
+                Self::sync_in_one(&self.cars[i], &mut self.bodies[i]);
                 let b = &mut self.bodies[i];
                 b.reset_countdown = 0;
                 b.rearm_after_reset();
                 for w in &mut b.wheels {
                     *w = nfs_physics::vehicle::Wheel::default();
                 }
-                b.place_at_slice(g, &specs, sl.centre, sl.forward.normalize_or_zero(), Vec3::ZERO, false, dir < 0.0);
-                self.sync_out(i);
+                b.place_at_slice(g, specs, sl.centre, sl.forward.normalize_or_zero(), Vec3::ZERO, false, dir < 0.0);
+                Self::sync_out_one(&mut self.cars[i], &self.bodies[i]);
             }
             _ => {
                 let c = &mut self.cars[i];
@@ -1586,7 +1596,8 @@ impl TrafficSet {
         if oct_distance(pos, self.reference_of(i, reference).position) <= DESPAWN_DISTANCE {
             return false;
         }
-        match self.targets(reference).iter().position(|t| oct_distance(pos, t.position) <= DESPAWN_DISTANCE) {
+        let found = Self::targets_of(&self.chase_targets, reference).iter().position(|t| oct_distance(pos, t.position) <= DESPAWN_DISTANCE);
+        match found {
             Some(k) => {
                 self.cars[i].reference = k;
                 false
@@ -1629,7 +1640,7 @@ impl TrafficSet {
         // The purgatory's exit 0x40DFB0 ran first (0x406146 → `[vtable+4]`): `car+0xED4` = the chase
         // target that leads the race order — `0x5E8B88` walked down from the top, the first with
         // `car+0x52C & 0x100` (0x40E00F…0x40E048). The spawn's step 1 overwrites it at once.
-        let targets = self.targets(reference);
+        let targets = Self::targets_of(&self.chase_targets, reference);
         let order = Self::race_order(&targets);
         // 0x407290 step 1 (0x407293…0x4072D4): `car+0xED4 = 0x5E8B10[(rand16 · [0x5E8AB8]) >> 16]`, a
         // random chase target (the human alone unless `COPS`)
@@ -1697,20 +1708,20 @@ impl TrafficSet {
         c.speed = target * dir; // `car+0xEC0 = car+0xEB8` — a traffic car spawns already at speed
         c.accel_local = Vec3::ZERO;
         c.accel_world = Vec3::ZERO;
-        match (grid, self.car_specs.get(i).cloned().or_else(|| self.specs.clone())) {
+        match (grid, self.car_specs.get(i).or(self.specs.as_ref())) {
             (Some(g), Some(specs)) if i < self.bodies.len() => {
                 // 0x407690 (§9.6): `Car_placeAtSlice` 0x49B090 (car, slice, {car+0xEB4, 1.0, 0},
                 // car+0xEB0) — the slice-local offset in the frame the tracker's patch normal
                 // gives, then the body dropped by `BodyHeight` onto that patch
                 // (`Vehicle::place_at_slice`); the velocity `|car+0xEC0| · car.forward` after it
-                self.sync_in(i);
+                Self::sync_in_one(&self.cars[i], &mut self.bodies[i]);
                 let b = &mut self.bodies[i];
                 b.rearm_after_reset();
                 for w in &mut b.wheels {
                     *w = nfs_physics::vehicle::Wheel::default();
                 }
-                b.place_at_slice(g, &specs, sl.centre, sl.forward.normalize_or_zero(), Vec3::new(lateral, 1.0, 0.0), false, dir < 0.0);
-                self.sync_out(i);
+                b.place_at_slice(g, specs, sl.centre, sl.forward.normalize_or_zero(), Vec3::new(lateral, 1.0, 0.0), false, dir < 0.0);
+                Self::sync_out_one(&mut self.cars[i], &self.bodies[i]);
                 let c = &mut self.cars[i];
                 c.velocity = c.orientation.row(2) * target;
             }
@@ -1769,35 +1780,14 @@ fn heading(fwd: Vec3, up: Vec3) -> Mat3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::race::{Section, Slice, SLICE_SPACING};
+    use crate::test_support::Road;
 
     fn ring(n: usize) -> SliceTable {
-        let r = n as f32 * SLICE_SPACING / std::f32::consts::TAU;
-        let slices = (0..n)
-            .map(|i| {
-                let a = i as f32 / n as f32 * std::f32::consts::TAU;
-                let centre = Vec3::new(a.cos() * r, 0.0, a.sin() * r);
-                let forward = Vec3::new(-a.sin(), 0.0, a.cos());
-                Slice {
-                    centre,
-                    up: Vec3::Y,
-                    forward,
-                    lateral: Vec3::Y.cross(forward),
-                    lane_mask: 0,
-                    lanes_a: 2,
-                    lanes_b: 2,
-                    width_a: 8.0,
-                    width_b: 8.0,
-                    lane_width_a: 4.0,
-                    lane_width_b: 4.0,
-                }
-            })
-            .collect();
-        SliceTable::build(slices, vec![Section { first: 0, last: n - 1, f0: 0.0, f1: 1.0 }])
+        crate::test_support::ring_of(n, Road::two_lanes(8.0))
     }
 
     fn models(n: usize) -> Vec<TrafficSpec> {
-        (0..n).map(|i| TrafficSpec { model: i, bus: false, half_extents: Vec3::new(0.85, 0.6, 2.1) }).collect()
+        crate::test_support::traffic_models(n)
     }
 
     #[test]

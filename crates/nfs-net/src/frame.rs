@@ -101,10 +101,8 @@ impl Frame {
             return Err(FrameError::LengthMismatch { want, have: b.len().saturating_sub(HEADER) });
         }
         let got = u16::from_be_bytes([b[4], b[5]]);
-        let mut zeroed = b.to_vec();
-        zeroed[4] = 0;
-        zeroed[5] = 0;
-        let want_crc = crc16(&zeroed);
+        // the checksum is taken with its own two bytes zeroed — streamed over the three pieces, no copy
+        let want_crc = [&b[..4], &[0, 0][..], &b[HEADER..]].into_iter().fold(CRC_INIT, crc16_update);
         if got != want_crc {
             return Err(FrameError::BadCrc { got, want: want_crc });
         }
@@ -122,7 +120,11 @@ pub const CRC_INIT: u16 = 0xFBEA;
 const POLY: u16 = 0xA001;
 
 pub fn crc16(bytes: &[u8]) -> u16 {
-    let mut crc = CRC_INIT;
+    crc16_update(CRC_INIT, bytes)
+}
+
+/// Continue a running checksum over more bytes (`crc16(a ++ b) == crc16_update(crc16(a), b)`).
+fn crc16_update(mut crc: u16, bytes: &[u8]) -> u16 {
     for b in bytes {
         let idx = ((crc ^ *b as u16) & 0xFF) as usize;
         crc = (crc >> 8) ^ table()[idx];
@@ -148,6 +150,38 @@ fn table() -> &'static [u16; 256] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decode's streamed checksum against the copy-and-zero form it replaced, on frames with
+    /// random contents and on corrupted ones.
+    #[test]
+    fn the_streamed_checksum_equals_the_copy_and_zero_form() {
+        let mut x = 0x1234_5678u32;
+        let mut next = || {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (x >> 16) as u8
+        };
+        for n in 0..=MAX_PAYLOAD.min(40) {
+            let payload: Vec<u8> = (0..n).map(|_| next()).collect();
+            let f = Frame { sequence: Sequence::Reliable(next() & SEQ_MASK), ack: next() & SEQ_MASK, payload };
+            let mut bytes = f.encode().unwrap();
+            assert_eq!(Frame::decode(&bytes).unwrap(), f);
+            let mut zeroed = bytes.clone();
+            zeroed[4] = 0;
+            zeroed[5] = 0;
+            assert_eq!(u16::from_be_bytes([bytes[4], bytes[5]]), crc16(&zeroed));
+            // corrupt one byte at a time: the old and the new form reject the same ones
+            for k in 0..bytes.len() {
+                bytes[k] ^= 0x5A;
+                let mut z = bytes.clone();
+                z[4] = 0;
+                z[5] = 0;
+                let old_ok = bytes[0] == MARKER && bytes[1] as usize == n && u16::from_be_bytes([bytes[4], bytes[5]]) == crc16(&z);
+                assert_eq!(Frame::decode(&bytes).is_ok(), old_ok, "n {n} byte {k}");
+                bytes[k] ^= 0x5A;
+            }
+        }
+    }
+
 
     #[test]
     fn the_table_matches_the_originals() {

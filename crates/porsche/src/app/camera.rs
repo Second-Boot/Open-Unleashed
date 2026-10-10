@@ -13,7 +13,7 @@ impl App {
     /// draw on. The port registers before the frame's cars draw; the original's queue runs the hook
     /// with the track's other queued parts, at most a frame apart (the queue's flush order is not read).
     pub(crate) fn projector_planes(&self, pos: Vec3) -> Option<([f32; 4], [f32; 4])> {
-        if self.choice_index("Graphics.CarChrome").is_none_or(|(i, _)| i < 2) {
+        if self.choice_index(choice::GRAPHICS_CAR_CHROME).is_none_or(|(i, _)| i < 2) {
             return None;
         }
         self.world.as_ref().and_then(|w| w.projector_for(pos)).map(|q| (q.u, q.v))
@@ -35,13 +35,13 @@ impl App {
     /// The view the camera is on, by the original's ids (`nfs_game::camera`).
     /// `Graphics.WideScreen` on (`[0x657D5C]`, `camera::WIDESCREEN_BAND`).
     pub(crate) fn widescreen(&self) -> bool {
-        self.choice_index("Graphics.WideScreen").is_some_and(|(i, _)| i == 1)
+        self.choice_index(choice::GRAPHICS_WIDE_SCREEN).is_some_and(|(i, _)| i == 1)
     }
 
     pub(crate) fn camera_view(&self) -> u16 {
         // diagnostic: `NFS_VIEW=<id>` (decimal: 10 CircleCam, 11 SplineCam, 20 DirectorsCam …) holds
         // the slot on that view, for screenshots of views outside the car's cycle
-        if let Some(v) = nfs_game::config::cfg().nfs_view.var().ok().and_then(|v| v.parse::<u16>().ok()) {
+        if let Some(v) = nfs_game::config::cfg().nfs_view.as_str().and_then(|v| v.parse::<u16>().ok()) {
             return v;
         }
         if let Some(v) = self.replay_view() {
@@ -88,14 +88,14 @@ impl App {
     /// `SKYRENDERING` `[0x657D9C]` (the `Graphics.SkyRendering` choice, or `NFS_SKY_LEVEL`): where
     /// 0x459950 starts its search for the colour record and 0x45FB80's block level.
     pub(crate) fn sky_level(&self) -> usize {
-        nfs_game::sky::forced_level().unwrap_or_else(|| self.choice_index("Graphics.SkyRendering").map_or(0, |(i, _)| i))
+        nfs_game::sky::forced_level().unwrap_or_else(|| self.choice_index(choice::GRAPHICS_SKY_RENDERING).map_or(0, |(i, _)| i))
     }
 
     /// A car's `R3DSkyMapTextureLayer` (`RE/notes/lighting.md` §3.2): the maps of its own slice's
     /// section, only while `[0x6197CB]` is set — `Graphics.CarChrome` = High (0x43A730; below it
     /// 0x43A780 binds none and the pass draws nothing). `origin` is the car's `car+0x330`.
     pub(crate) fn sky_map_for(&self, origin: Vec3, slice: usize) -> Option<nfs_renderer::SkyMap> {
-        if self.choice_index("Graphics.CarChrome").is_none_or(|(i, _)| i < 2) {
+        if self.choice_index(choice::GRAPHICS_CAR_CHROME).is_none_or(|(i, _)| i < 2) {
             return None;
         }
         let record = self.slices.as_ref()?.slices.get(slice)?;
@@ -139,7 +139,7 @@ impl App {
     /// one runs out (0x462F58 with `+0x0C` cleared at 0x463244), as the original's slot would if
     /// nothing moved it off 0x0E.
     pub(crate) fn camera_anim_step(&mut self, tick: u64, car_pos: Vec3, car_rot: Quat) -> Option<(Vec3, glam::Mat3)> {
-        let held = nfs_game::config::cfg().nfs_view.var().ok().and_then(|v| v.parse::<u16>().ok()) == Some(0x0E);
+        let held = nfs_game::config::cfg().nfs_view.as_str().and_then(|v| v.parse::<u16>().ok()) == Some(0x0E);
         if held && self.anim_cam == AnimCamSlot::Off {
             self.anim_cam = AnimCamSlot::Start;
         }
@@ -180,7 +180,7 @@ impl App {
     }
 
     pub(crate) fn camera_slot_reset(&mut self) {
-        let forced = nfs_game::config::cfg().nfs_camera.var().ok().and_then(|v| v.parse::<u8>().ok());
+        let forced = nfs_game::config::cfg().nfs_camera.as_str().and_then(|v| v.parse::<u8>().ok());
         self.camera_mode = forced.unwrap_or(0);
         self.anim_cam = if forced.is_some() { AnimCamSlot::Off } else { AnimCamSlot::Start };
         self.chase_offset = None;

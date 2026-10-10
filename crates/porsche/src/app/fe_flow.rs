@@ -217,7 +217,7 @@ impl App {
         // a still — the way `NFS_FE_PARTS` opens the car's parts
         if self.fe.dialog.is_none()
             && !self.fe.dialog_forced
-            && let Some(id) = nfs_game::config::cfg().nfs_fe_dialog.var().ok().and_then(|v| v.parse::<u32>().ok())
+            && let Some(id) = nfs_game::config::cfg().nfs_fe_dialog.as_str().and_then(|v| v.parse::<u32>().ok())
         {
             self.fe.dialog_forced = true;
             let text = self.fe.strings.get(id).unwrap_or_default().to_string();
@@ -228,7 +228,7 @@ impl App {
         // `NFS_FE_DIALOG=input:<FEStrings id>:<typed>` — the input dialog with that text typed
         if self.fe.dialog.is_none()
             && !self.fe.dialog_forced
-            && let Some(spec) = nfs_game::config::cfg().nfs_fe_dialog.var().ok().and_then(|v| v.strip_prefix("input:").map(str::to_string))
+            && let Some(spec) = nfs_game::config::cfg().nfs_fe_dialog.as_str().and_then(|v| v.strip_prefix("input:").map(str::to_string))
         {
             self.fe.dialog_forced = true;
             let (id, typed) = spec.split_once(':').unwrap_or((&spec, ""));
@@ -327,7 +327,7 @@ impl App {
                 _ => true,
             },
         };
-        let account = self.fe.game_type == 4 && !slot_ac(&list);
+        let account = self.fe.game_type == game_type::TOURNAMENT && !slot_ac(&list);
         let layered = self.fe.nav.bottom_covered();
         let Some(b) = self.fe.layout_bottom.as_mut() else { return };
         // 0x4D1E70 after the open: the bar is covered while more than one layer is open
@@ -411,7 +411,7 @@ impl App {
         let Some(c) = self.career.as_ref() else { return false };
         let car = match self.fe.game_type {
             0..=3 => self.fe.menu.as_ref().filter(|m| m.car_garage).map(|_| c.car_sel.min(c.career.garage.len().saturating_sub(1))),
-            4 => (!c.career.garage.is_empty()).then(|| c.car_sel.min(c.career.garage.len() - 1)),
+            game_type::TOURNAMENT => (!c.career.garage.is_empty()).then(|| c.car_sel.min(c.career.garage.len() - 1)),
             _ => None,
         };
         let Some(car) = car else { return false };
@@ -613,7 +613,7 @@ impl App {
         {
             return a;
         }
-        self.choice_index("Car.Transmission").is_none_or(|(i, _)| i == 1)
+        self.choice_index(choice::CAR_TRANSMISSION).is_none_or(|(i, _)| i == 1)
     }
 
     /// `TIMER_getTicks()` (0x53C2E0), the 128 Hz clock `TIMER_init` (0x565030, called from main

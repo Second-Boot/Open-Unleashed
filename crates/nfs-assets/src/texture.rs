@@ -84,19 +84,11 @@ fn decode_pack_levels(path: &Path, data: &[u8], pick: impl Fn(u32, u32) -> u32 +
     let decode_entry = |i: usize| -> Result<TextureImage, AssetError> {
         let e = &fsh.entries[i];
         let levels = pick(e.blocks[0].mip_levels(), e.blocks[0].width as u32).max(1);
-        let mut mips = Vec::with_capacity(levels as usize);
-        let mut width = 0;
-        let mut height = 0;
-        let mut has_alpha = false;
-        for level in 0..levels {
-            let img = fsh.decode_mip(data, i, level).map_err(fmt_err(path))?;
-            if level == 0 {
-                width = img.width;
-                height = img.height;
-                has_alpha = img.rgba.chunks_exact(4).any(|p| p[3] < 255);
-            }
-            mips.push(img.rgba);
-        }
+        // the whole chain at once: a compressed block is decompressed once, not once per level
+        let imgs = fsh.decode_levels(data, i, levels).map_err(fmt_err(path))?;
+        let (width, height) = (imgs[0].width, imgs[0].height);
+        let has_alpha = imgs[0].rgba.chunks_exact(4).any(|p| p[3] < 255);
+        let mips: Vec<Vec<u8>> = imgs.into_iter().map(|img| img.rgba).collect();
         let b = &e.blocks[0];
         Ok(TextureImage {
             name: e.name.clone(),
@@ -109,9 +101,9 @@ fn decode_pack_levels(path: &Path, data: &[u8], pick: impl Fn(u32, u32) -> u32 +
             x: (b.misc[2] & 0xFFF) as u32,
             y: (b.misc[3] & 0xFFF) as u32,
             place: [b.misc[0] as i16 as i32, b.misc[1] as i16 as i32],
-            text: e.blocks.iter().find(|b| b.code == 0x6F).and_then(|b| {
+            text: e.blocks.iter().find(|b| b.code == nfs_formats::fsh::block_code::TEXT).and_then(|b| {
                 let start = b.offset + 8;
-                let end = data[start..].iter().position(|c| *c == 0).map(|n| start + n)?;
+                let end = data.get(start..)?.iter().position(|c| *c == 0).map(|n| start + n)?;
                 std::str::from_utf8(&data[start..end]).ok().map(str::to_string)
             }),
         })
@@ -131,7 +123,7 @@ fn decode_pack_levels(path: &Path, data: &[u8], pick: impl Fn(u32, u32) -> u32 +
             .collect();
         let mut out = Vec::with_capacity(n);
         for h in handles {
-            out.extend(h.join().expect("texture decode worker")?);
+            out.extend(h.join().map_err(|_| AssetError::Worker { path: path.to_path_buf() })??);
         }
         Ok(out)
     })

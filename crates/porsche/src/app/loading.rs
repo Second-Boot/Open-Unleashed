@@ -81,9 +81,9 @@ impl App {
         // other machine's `0x256` records and its picture arrive meanwhile — redrawn with step −1
         // (0x4A4A70 with −1 draws the rows again and leaves the bar as it was)
         if step == 9
-            && let Ok(path) = nfs_game::config::cfg().nfs_loading_shot.var()
+            && let Some(path) = nfs_game::config::cfg().nfs_loading_shot.as_str()
         {
-            let wait = nfs_game::config::cfg().nfs_loading_wait.var().ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(3000);
+            let wait = nfs_game::config::cfg().nfs_loading_wait.as_str().and_then(|v| v.parse::<u64>().ok()).unwrap_or(3000);
             let until = Instant::now() + Duration::from_millis(wait);
             while Instant::now() < until {
                 if let Some(n) = self.net.session.as_mut() {

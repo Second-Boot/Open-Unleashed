@@ -15,6 +15,7 @@
 //! not written yet.
 
 use crate::error::FormatError;
+use crate::{u16_le, u32_le};
 
 // -------------------------------------------------------------------------------------------
 // container
@@ -154,18 +155,19 @@ pub struct PeImage<'a> {
 impl<'a> PeImage<'a> {
     pub fn parse(data: &'a [u8]) -> Result<Self, FormatError> {
         let what = "nfs5.exe";
-        let u16at = |o: usize| -> u16 { u16::from_le_bytes([data[o], data[o + 1]]) };
-        let u32at = |o: usize| -> u32 { u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) };
+        // every offset below comes out of the file: read through the checked readers
+        let u16at = |o: usize| u16_le(data, o, what);
+        let u32at = |o: usize| u32_le(data, o, what);
         if data.len() < 0x40 || &data[..2] != b"MZ" {
             return Err(FormatError::UnknownMagic { what, offset: 0, expected: b"MZ".to_vec(), found: data[..data.len().min(2)].to_vec() });
         }
-        let pe = u32at(0x3C) as usize;
-        if data.len() < pe + 0x18 || &data[pe..pe + 4] != b"PE\0\0" {
-            return Err(FormatError::UnknownMagic { what, offset: pe, expected: b"PE\0\0".to_vec(), found: data[pe..(pe + 4).min(data.len())].to_vec() });
+        let pe = u32at(0x3C)? as usize;
+        if data.len() < pe.saturating_add(0x18) || &data[pe..pe + 4] != b"PE\0\0" {
+            return Err(FormatError::UnknownMagic { what, offset: pe, expected: b"PE\0\0".to_vec(), found: data.get(pe..).unwrap_or_default().iter().take(4).copied().collect() });
         }
-        let base = u32at(pe + 0x34);
-        let n = u16at(pe + 6) as usize;
-        let opt = u16at(pe + 0x14) as usize;
+        let base = u32at(pe + 0x34)?;
+        let n = u16at(pe + 6)? as usize;
+        let opt = u16at(pe + 0x14)? as usize;
         let first = pe + 0x18 + opt;
         let mut sections = Vec::with_capacity(n);
         for i in 0..n {
@@ -173,7 +175,7 @@ impl<'a> PeImage<'a> {
             if s + 40 > data.len() {
                 return Err(FormatError::Truncated { what, offset: s, needed: 40 });
             }
-            sections.push((base + u32at(s + 12), u32at(s + 8), u32at(s + 20)));
+            sections.push((base.wrapping_add(u32at(s + 12)?), u32at(s + 8)?, u32at(s + 20)?));
         }
         Ok(Self { data, sections })
     }
@@ -182,8 +184,8 @@ impl<'a> PeImage<'a> {
     pub fn at(&self, va: u32, n: usize) -> Option<&'a [u8]> {
         let (v, size, off) = *self.sections.iter().find(|(v, size, _)| va >= *v && va - *v < *size)?;
         let _ = size;
-        let start = (off + (va - v)) as usize;
-        self.data.get(start..start + n)
+        let start = (off as usize).checked_add((va - v) as usize)?;
+        self.data.get(start..start.checked_add(n)?)
     }
 
     fn i32s(&self, va: u32, n: usize) -> Option<Vec<i32>> {
@@ -305,7 +307,7 @@ impl MadTables {
             if n <= 0 {
                 return;
             }
-            let end = (base + n as usize).min(t.len());
+            let end = base.saturating_add(n as usize).min(t.len());
             if base < end {
                 t[base..end].fill(e);
             }
@@ -314,21 +316,21 @@ impl MadTables {
         // array A → the 9-bit primary, or the second-level table for the long codes
         for r in &a {
             if r.index & 0xFC00 != 0 {
-                fill(&mut flat, tbl::PRIMARY + (r.index >> 7) as usize, 9 - r.bits, pack(r.code, r.bits));
+                fill(&mut flat, tbl::PRIMARY.saturating_add((r.index >> 7) as usize), 9i32.wrapping_sub(r.bits), pack(r.code, r.bits));
             } else {
                 // `add esi, -6` at 0x56CBD7: the reader reaches this table after consuming the
                 // six-bit prefix, so what the entry stores is what is left
-                fill(&mut flat, tbl::ESCAPE_B + (r.index >> 2) as usize, 0xE - r.bits, pack(r.code, r.bits - 6));
+                fill(&mut flat, tbl::ESCAPE_B.saturating_add((r.index >> 2) as usize), 0xEi32.wrapping_sub(r.bits), pack(r.code, r.bits.wrapping_sub(6)));
             }
         }
         // array B → the two escape tables; the record's length counts the prefix, which the entry
         // does not (0x56CC2E subtracts 9, 0x56CC62 subtracts 6)
         for r in &b {
-            let total = r.bits + 8;
+            let total = r.bits.wrapping_add(8);
             if r.index & 0x8000 != 0 {
-                fill(&mut flat, tbl::ESCAPE_B + (r.index >> 10) as usize, 0xE - total, pack(r.code, total - 6));
+                fill(&mut flat, tbl::ESCAPE_B.saturating_add((r.index >> 10) as usize), 0xEi32.wrapping_sub(total), pack(r.code, total.wrapping_sub(6)));
             } else {
-                fill(&mut flat, tbl::ESCAPE_A + (r.index >> 7) as usize, 0x11 - total, pack(r.code, total - 9));
+                fill(&mut flat, tbl::ESCAPE_A.saturating_add((r.index >> 7) as usize), 0x11i32.wrapping_sub(total), pack(r.code, total.wrapping_sub(9)));
             }
         }
 
@@ -566,8 +568,7 @@ pub fn idct(block: &[i32; 64], out: &mut [i32; 64]) {
         idct_pass(&block[r * 8..r * 8 + 8], &mut mid, r, 9, true);
     }
     for r in 0..8 {
-        let row: Vec<i32> = (0..8).map(|k| mid[r * 9 + k]).collect();
-        idct_pass(&row, out, r * 8, 1, false);
+        idct_pass(&mid[r * 9..r * 9 + 8], out, r * 8, 1, false);
     }
 }
 

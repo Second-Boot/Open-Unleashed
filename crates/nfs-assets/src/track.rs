@@ -2,9 +2,9 @@
 //! converted to meshes (mesh conversion lands once the CRP geometry layout is established —
 //! see `RE/notes/crp-geometry.md`).
 
-use crate::{fmt_err, read, texture::{decode_pack, decode_pack_mipped, TextureImage}, AssetError, GamePaths};
+use crate::{fmt_err, read, read_pack, texture::{decode_pack, decode_pack_mipped, TextureImage}, AssetError, GamePaths};
 use crate::mesh::{article_parts, MaterialMesh};
-use nfs_formats::{crp::{Crp, Material}, edg::EdgeFile, ini::Ini, refpack, scn::Scene};
+use nfs_formats::{crp::{layer_class, tags, Crp, Material}, edg::EdgeFile, ini::Ini, scn::Scene};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -54,19 +54,27 @@ pub struct PropInstance {
 /// places that set the game's night flag `word[0x628A28]` (0x449BF8 / 0x449C25 / 0x449C62).
 /// So a track is a **night** track exactly when its render methods use one of them.
 /// CONFIRMED (`RE/notes/lighting.md` §4).
-pub const HEADLIGHT_LAYERS: [u32; 3] = [0x8002, 0x8003, 0x8011];
+pub const HEADLIGHT_LAYERS: [u32; 3] = [layer_class::VERTEX_LIGHT, layer_class::VERTEX_LIGHT_OPAQUE, layer_class::VERTEX_LIGHT_AMBIENT];
+
+/// The raw bytes of every `RMth` record of the file whose data lies inside `data`.
+fn rmth_records<'a>(crp: &'a Crp, data: &'a [u8]) -> impl Iterator<Item = &'a [u8]> + 'a {
+    crp.level.iter().filter(|e| e.is_level(tags::RMTH)).filter_map(move |e| data.get(e.data_offset()..e.data_offset() + e.data_len()))
+}
+
+/// The render methods whose `RMth` record holds (past its 16-byte name) a dword `class` accepts,
+/// by the method's name.
+fn methods_with_class(crp: &Crp, data: &[u8], class: impl Fn(u32) -> bool) -> std::collections::HashSet<String> {
+    rmth_records(crp, data)
+        .filter(|bytes| bytes.len() > 16 && bytes[16..].chunks_exact(4).any(|w| class(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))))
+        .map(|bytes| bytes[..16].iter().take_while(|b| **b != 0).map(|b| *b as char).collect())
+        .collect()
+}
 
 /// The render methods that build `Headlights::LayerVertexLight` (0x8002) or `…_Opaque` (0x8003) —
 /// both slot 0 **0x453110**, which adds the headlight projection to each vertex's colour
 /// (`RE/notes/lighting.md` §5). By the method's name, the key an `mt` names it by.
 pub fn vertex_light_methods(crp: &Crp, data: &[u8]) -> std::collections::HashSet<String> {
-    crp.level
-        .iter()
-        .filter(|e| e.is_level(b"RMth"))
-        .filter_map(|e| data.get(e.data_offset()..e.data_offset() + e.data_len()))
-        .filter(|bytes| bytes.len() > 16 && bytes[16..].chunks_exact(4).any(|w| matches!(u32::from_le_bytes([w[0], w[1], w[2], w[3]]), 0x8002 | 0x8003)))
-        .map(|bytes| bytes[..16].iter().take_while(|b| **b != 0).map(|b| *b as char).collect())
-        .collect()
+    methods_with_class(crp, data, |w| matches!(w, layer_class::VERTEX_LIGHT | layer_class::VERTEX_LIGHT_OPAQUE))
 }
 
 /// The flat vertex colour of every material whose method builds, for its `op_mask`, an `Am` op —
@@ -81,13 +89,18 @@ pub fn vertex_light_methods(crp: &Crp, data: &[u8]) -> std::collections::HashSet
 /// `RE/notes/lighting.md` §5.4).
 pub fn ambient_colours(crp: &Crp, data: &[u8]) -> std::collections::HashMap<u16, u32> {
     let (Ok(methods), Ok(materials)) = (crp.render_methods(data), crp.materials(data)) else { return Default::default() };
+    // the first method of each name, as `methods.iter().find(..)` would pick it
+    let mut by_name = std::collections::HashMap::with_capacity(methods.len());
+    for (k, r) in methods.iter().enumerate() {
+        by_name.entry(r.name.as_str()).or_insert(k);
+    }
     materials
         .iter()
         .enumerate()
         .filter_map(|(i, m)| {
-            let method = methods.iter().find(|r| r.name == m.render_method)?;
+            let method = &methods[*by_name.get(m.render_method.as_str())?];
             // pass masks are only ever set on later passes; the `Am` op sits in pass 1 (mask 0)
-            let op = method.built_ops(0, m.op_mask).find(|o| matches!(o.class, 0x8007 | 0x8011))?;
+            let op = method.built_ops(0, m.op_mask).find(|o| matches!(o.class, layer_class::AMBIENT | layer_class::VERTEX_LIGHT_AMBIENT))?;
             let b = method.block(op.key)?;
             Some((i as u16, u32::from_le_bytes(b.get(..4)?.try_into().ok()?)))
         })
@@ -119,7 +132,7 @@ pub struct UvAnimate {
 /// own override block, the same `[mat+0x10]`-first rule [`render_states`] documents).
 pub fn uv_animate(methods: &[nfs_formats::crp::RenderMethod], m: &Material) -> Option<UvAnimate> {
     let method = methods.iter().find(|r| r.name == m.render_method)?;
-    let op = method.built_ops(0, m.op_mask).find(|o| o.class == 0x8001)?;
+    let op = method.built_ops(0, m.op_mask).find(|o| o.class == layer_class::UV_ANIMATE)?;
     let own = m.blocks.iter().find(|(k, _)| method.resolve(*k) == Some(op.key)).map(|(_, b)| b.as_slice());
     let b = own.or_else(|| method.block(op.key))?;
     if b.len() < 8 {
@@ -141,7 +154,7 @@ pub fn uv_animate(methods: &[nfs_formats::crp::RenderMethod], m: &Material) -> O
 /// of 108 `FakeSort` materials and one `Opaque` (monaco3), which override their methods'.
 pub fn render_states(methods: &[nfs_formats::crp::RenderMethod], m: &Material) -> Option<[i32; 6]> {
     let method = methods.iter().find(|r| r.name == m.render_method)?;
-    let op = method.built_ops(0, m.op_mask).find(|o| o.class == 8)?;
+    let op = method.built_ops(0, m.op_mask).find(|o| o.class == layer_class::STATE)?;
     let own = m.blocks.iter().find(|(k, _)| method.resolve(*k) == Some(op.key)).map(|(_, b)| b.as_slice());
     let b = own.or_else(|| method.block(op.key))?;
     (b.len() >= 24).then(|| std::array::from_fn(|k| i32::from_le_bytes([b[4 * k], b[4 * k + 1], b[4 * k + 2], b[4 * k + 3]])))
@@ -152,13 +165,7 @@ pub fn render_states(methods: &[nfs_formats::crp::RenderMethod], m: &Material) -
 /// the vtable 0x5B3DAC). Two of them sit in every night track's `Opaque` method and none in a day
 /// track's, so the decal is live in shipped content (`RE/notes/lighting.md` §5.2).
 pub fn uv_light_methods(crp: &Crp, data: &[u8]) -> std::collections::HashSet<String> {
-    crp.level
-        .iter()
-        .filter(|e| e.is_level(b"RMth"))
-        .filter_map(|e| data.get(e.data_offset()..e.data_offset() + e.data_len()))
-        .filter(|bytes| bytes.len() > 16 && bytes[16..].chunks_exact(4).any(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]) == 0x8004))
-        .map(|bytes| bytes[..16].iter().take_while(|b| **b != 0).map(|b| *b as char).collect())
-        .collect()
+    methods_with_class(crp, data, |w| w == layer_class::UV_LIGHT)
 }
 
 /// `GameData/Render/night.psh`'s one entry, `nght` — 128 × 128 bytes the headlight projector
@@ -179,15 +186,7 @@ pub fn night_map(paths: &crate::GamePaths) -> Option<Vec<u8>> {
 
 /// Does this CRP's `RMth` table build a headlight layer?
 pub fn uses_headlight_layers(crp: &Crp, data: &[u8]) -> bool {
-    crp.level
-        .iter()
-        .filter(|e| e.is_level(b"RMth"))
-        .filter_map(|e| data.get(e.data_offset()..e.data_offset() + e.data_len()))
-        .any(|bytes| {
-            bytes
-                .chunks_exact(4)
-                .any(|w| HEADLIGHT_LAYERS.contains(&u32::from_le_bytes([w[0], w[1], w[2], w[3]])))
-        })
+    rmth_records(crp, data).any(|bytes| bytes.chunks_exact(4).any(|w| HEADLIGHT_LAYERS.contains(&u32::from_le_bytes([w[0], w[1], w[2], w[3]]))))
 }
 
 impl TrackGeometry {
@@ -272,6 +271,44 @@ pub fn geom_scale(e: &nfs_formats::scn::SceneElement) -> glam::Vec3 {
     glam::Vec3::new(f(sx), f(sy), f(sz))
 }
 
+/// The thread's result; a worker that panicked panics here too, as the sequential load would have.
+fn join_scoped<T>(h: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    h.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// `GamePaths::find_file` for one directory looked up many times: the exact spelling is tried first
+/// (a stat), and on a miss the directory is listed **once**, not once per lookup, and the names kept
+/// by lower-cased ASCII. The first entry in listing order wins, as in `find_file`.
+struct DirLookup {
+    dir: PathBuf,
+    listing: std::sync::OnceLock<std::collections::HashMap<String, PathBuf>>,
+}
+
+impl DirLookup {
+    fn new(dir: &std::path::Path) -> Self {
+        Self { dir: dir.to_path_buf(), listing: std::sync::OnceLock::new() }
+    }
+
+    fn find(&self, name: &str) -> Option<PathBuf> {
+        let direct = self.dir.join(name);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        let listing = self.listing.get_or_init(|| {
+            let mut map = std::collections::HashMap::new();
+            if let Ok(rd) = std::fs::read_dir(&self.dir) {
+                for p in rd.flatten().map(|e| e.path()) {
+                    if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
+                        map.entry(n.to_ascii_lowercase()).or_insert(p);
+                    }
+                }
+            }
+            map
+        });
+        listing.get(&name.to_ascii_lowercase()).cloned()
+    }
+}
+
 #[derive(Debug)]
 pub struct TrackAssets {
     pub name: String,
@@ -279,6 +316,8 @@ pub struct TrackAssets {
     /// Decompressed `.crp` bytes (parts are resolved lazily against this buffer).
     pub crp_data: Vec<u8>,
     pub crp: Crp,
+    /// The `.crp` file as found on disk (for error messages).
+    crp_path: PathBuf,
     /// The track's `.fsh` and `.env` pixels (RGBA8, with their mip chains). Only the GPU upload reads
     /// them: [`Self::release_textures`] drops them once it is done (some 25-35 MB of a track) and
     /// [`Self::ensure_textures`] reads them again for the next upload (a restart, a replay pass).
@@ -324,71 +363,98 @@ impl TrackAssets {
 
     pub fn load(paths: &GamePaths, name: &str) -> Result<Self, AssetError> {
         let dir = paths.track_dir();
+        let lookup = DirLookup::new(&dir);
         let file = |suffix: &str| -> Result<PathBuf, AssetError> {
             let n = format!("{name}{suffix}");
-            GamePaths::find_file(&dir, &n).ok_or_else(|| AssetError::MissingFile { dir: dir.clone(), name: n })
-        };
-        let crp_path = file(".crp")?;
-        let crp_data = refpack::maybe_decompress(&read(&crp_path)?).map_err(fmt_err(&crp_path))?.into_owned();
-        let crp = Crp::parse(&crp_data).map_err(fmt_err(&crp_path))?;
-
-        let (textures, env_textures) = Self::decode_textures(&dir, name)?;
-
-        let map_path = file(".map")?;
-        let map = Ini::parse(&String::from_utf8_lossy(&read(&map_path)?));
-        // one `animdefs.txt` for every track, beside the track files
-        let animdefs = GamePaths::find_file(&dir, "animdefs.txt")
-            .and_then(|p| std::fs::read(p).ok())
-            .map(|b| nfs_formats::animdefs::AnimDefs::parse(&b.iter().map(|&c| nfs_formats::locale::cp1252(c)).collect::<String>()))
-            .unwrap_or_default();
-
-        let scene = |suffix: &str| -> Result<Option<Scene>, AssetError> {
-            match file(suffix) {
-                Ok(p) => Ok(Some(Scene::parse(&String::from_utf8_lossy(&read(&p)?)).map_err(fmt_err(&p))?)),
-                Err(_) => Ok(None),
-            }
-        };
-        let keys = |suffix: &str| -> nfs_formats::key::DrawKeys {
-            file(suffix)
-                .ok()
-                .and_then(|p| std::fs::read(p).ok())
-                .and_then(|d| nfs_formats::key::DrawKeys::parse(&d).ok())
-                .unwrap_or_default()
-        };
-        let edges = match file(".edg") {
-            Ok(p) => Some(EdgeFile::parse(&read(&p)?).map_err(fmt_err(&p))?),
-            Err(_) => None,
+            lookup.find(&n).ok_or_else(|| AssetError::MissingFile { dir: dir.clone(), name: n })
         };
         let sky_dir = dir.join("Sky");
-        let (sky_textures, sky_params) = match (GamePaths::find_file(&sky_dir, &format!("{name}.fsh")), GamePaths::find_file(&sky_dir, &format!("{name}.txt"))) {
-            (Some(fsh), txt) => {
-                let d = refpack::maybe_decompress(&read(&fsh)?).map_err(fmt_err(&fsh))?.into_owned();
-                let params = match txt {
-                    Some(t) => String::from_utf8_lossy(&read(&t)?).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty() && !l.starts_with('#')).collect(),
-                    None => Vec::new(),
-                };
-                (decode_pack(&fsh, &d)?, params)
-            }
-            _ => (Vec::new(), Vec::new()),
-        };
-        let sky_bin = GamePaths::find_file(&sky_dir, &format!("{name}.bin"))
-            .or_else(|| GamePaths::find_file(&sky_dir, "default.bin"))
-            .and_then(|p| read(&p).ok())
-            .and_then(|d| nfs_formats::sky::SkyBin::parse(&d).ok());
+        let sky_lookup = DirLookup::new(&sky_dir);
+
+        // PORT-DEVIATION D7 (RE/notes/PORT-DEVIATIONS.md): the .crp read + unpack + parse, the track's
+        // .fsh / .env decode and the sky pack's decode run on their own threads while this one reads
+        // the small files; every result is kept and the errors are raised afterwards in the order the
+        // sequential load met them, so the same file fails first and nothing is ordered by completion.
+        // The original loads sequentially (load steps 0x4A4A70).
+        let (crp_res, tex_res, sky_res, map_res, edges_res, scene_forward, scene_backward, scene_cameras, animdefs, draw_keys, sky_bin) = std::thread::scope(|s| {
+            let crp_h = s.spawn(|| -> Result<(PathBuf, Vec<u8>, Crp), AssetError> {
+                let crp_path = file(".crp")?;
+                let crp_data = read_pack(&crp_path)?;
+                let crp = Crp::parse(&crp_data).map_err(fmt_err(&crp_path))?;
+                Ok((crp_path, crp_data, crp))
+            });
+            let tex_h = s.spawn(|| Self::decode_textures(&lookup, &dir, name));
+            let sky_h = s.spawn(|| -> Result<(Vec<TextureImage>, Vec<String>), AssetError> {
+                let (fsh, txt) = (sky_lookup.find(&format!("{name}.fsh")), sky_lookup.find(&format!("{name}.txt")));
+                Ok(match (fsh, txt) {
+                    (Some(fsh), txt) => {
+                        let d = read_pack(&fsh)?;
+                        let params = match txt {
+                            Some(t) => String::from_utf8_lossy(&read(&t)?).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty() && !l.starts_with('#')).collect(),
+                            None => Vec::new(),
+                        };
+                        (decode_pack(&fsh, &d)?, params)
+                    }
+                    _ => (Vec::new(), Vec::new()),
+                })
+            });
+
+            let map_res = file(".map").and_then(|map_path| Ok(Ini::parse(&String::from_utf8_lossy(&read(&map_path)?))));
+            // one `animdefs.txt` for every track, beside the track files
+            let animdefs = lookup
+                .find("animdefs.txt")
+                .and_then(|p| std::fs::read(p).ok())
+                .map(|b| nfs_formats::animdefs::AnimDefs::parse(&b.iter().map(|&c| nfs_formats::locale::cp1252(c)).collect::<String>()))
+                .unwrap_or_default();
+            let scene = |suffix: &str| -> Result<Option<Scene>, AssetError> {
+                match file(suffix) {
+                    Ok(p) => Ok(Some(Scene::parse(&String::from_utf8_lossy(&read(&p)?)).map_err(fmt_err(&p))?)),
+                    Err(_) => Ok(None),
+                }
+            };
+            let keys = |suffix: &str| -> nfs_formats::key::DrawKeys {
+                file(suffix)
+                    .ok()
+                    .and_then(|p| std::fs::read(p).ok())
+                    .and_then(|d| nfs_formats::key::DrawKeys::parse(&d).ok())
+                    .unwrap_or_default()
+            };
+            let edges_res = match file(".edg") {
+                Ok(p) => read(&p).and_then(|d| EdgeFile::parse(&d).map(Some).map_err(fmt_err(&p))),
+                Err(_) => Ok(None),
+            };
+            let sky_bin = sky_lookup
+                .find(&format!("{name}.bin"))
+                .or_else(|| sky_lookup.find("default.bin"))
+                .and_then(|p| read(&p).ok())
+                .and_then(|d| nfs_formats::sky::SkyBin::parse(&d).ok());
+            let scene_forward = scene("_fstart.scn");
+            let scene_backward = scene("_bstart.scn");
+            let draw_keys = (keys("_forward.key"), keys("_backwards.key"));
+            let scene_cameras = scene("_cameras.scn");
+            (join_scoped(crp_h), join_scoped(tex_h), join_scoped(sky_h), map_res, edges_res, scene_forward, scene_backward, scene_cameras, animdefs, draw_keys, sky_bin)
+        });
+
+        let (crp_path, crp_data, crp) = crp_res?;
+        let (textures, env_textures) = tex_res?;
+        let map = map_res?;
+        let edges = edges_res?;
+        let (sky_textures, sky_params) = sky_res?;
         Ok(Self {
             name: name.to_string(),
             dir: dir.clone(),
+            crp_path,
             crp_data,
             crp,
             textures,
             env_textures,
             textures_released: false,
             map,
-            start_forward: scene("_fstart.scn")?,
-            start_backward: scene("_bstart.scn")?,
-            draw_keys_forward: keys("_forward.key"),
-            draw_keys_backward: keys("_backwards.key"),
-            cameras: scene("_cameras.scn")?,
+            start_forward: scene_forward?,
+            start_backward: scene_backward?,
+            draw_keys_forward: draw_keys.0,
+            draw_keys_backward: draw_keys.1,
+            cameras: scene_cameras?,
             extra_scenes: Vec::new(),
             reverse: false,
             animdefs,
@@ -401,16 +467,16 @@ impl TrackAssets {
 
     /// The track's `.fsh` (pack key 0, the one with a mip chain: 0x4877BD, `texture::decode_pack_mipped`)
     /// and `.env` pixels.
-    fn decode_textures(dir: &std::path::Path, name: &str) -> Result<(Vec<TextureImage>, Vec<TextureImage>), AssetError> {
+    fn decode_textures(lookup: &DirLookup, dir: &std::path::Path, name: &str) -> Result<(Vec<TextureImage>, Vec<TextureImage>), AssetError> {
         let file = |suffix: &str| -> Result<PathBuf, AssetError> {
             let n = format!("{name}{suffix}");
-            GamePaths::find_file(dir, &n).ok_or_else(|| AssetError::MissingFile { dir: dir.to_path_buf(), name: n })
+            lookup.find(&n).ok_or_else(|| AssetError::MissingFile { dir: dir.to_path_buf(), name: n })
         };
         let fsh_path = file(".fsh")?;
-        let fsh_data = refpack::maybe_decompress(&read(&fsh_path)?).map_err(fmt_err(&fsh_path))?.into_owned();
+        let fsh_data = read_pack(&fsh_path)?;
         let textures = decode_pack_mipped(&fsh_path, &fsh_data)?;
         let env_path = file(".env")?;
-        let env_data = refpack::maybe_decompress(&read(&env_path)?).map_err(fmt_err(&env_path))?.into_owned();
+        let env_data = read_pack(&env_path)?;
         let env_textures = decode_pack(&env_path, &env_data)?;
         Ok((textures, env_textures))
     }
@@ -426,7 +492,7 @@ impl TrackAssets {
     /// Read the texture pixels again if [`Self::release_textures`] dropped them, for the next upload.
     pub fn ensure_textures(&mut self) -> Result<(), AssetError> {
         if self.textures_released {
-            let (textures, env_textures) = Self::decode_textures(&self.dir, &self.name)?;
+            let (textures, env_textures) = Self::decode_textures(&DirLookup::new(&self.dir), &self.dir, &self.name)?;
             self.textures = textures;
             self.env_textures = env_textures;
             self.textures_released = false;
@@ -443,21 +509,21 @@ impl TrackAssets {
 
     /// Materials of the track CRP in `pr.material` order.
     pub fn materials(&self) -> Result<Vec<Material>, AssetError> {
-        self.crp.materials(&self.crp_data).map_err(fmt_err(&self.dir.join(format!("{}.crp", self.name))))
+        self.crp.materials(&self.crp_data).map_err(fmt_err(&self.crp_path))
     }
 
     /// Static track geometry at the lowest LOD of every article, grouped per article and material.
     /// Articles carrying a `tr` matrix are library objects instanced by `.scn` files (mapping not yet
     /// known) and are returned separately in `TrackGeometry::library`.
     pub fn build_geometry(&self) -> Result<TrackGeometry, AssetError> {
-        let crp_path = self.dir.join(format!("{}.crp", self.name));
-        let arts = self.crp.articles(&self.crp_data).map_err(fmt_err(&crp_path))?;
+        let crp_path = &self.crp_path;
+        let arts = self.crp.articles(&self.crp_data).map_err(fmt_err(crp_path))?;
         let mut world = Vec::new();
         let mut library = Vec::new();
         let mut skipped = 0usize;
         let flat = ambient_colours(&self.crp, &self.crp_data);
         for (index, a) in arts.iter().enumerate() {
-            let g = self.crp.article_geometry(&self.crp_data, a).map_err(fmt_err(&crp_path))?;
+            let g = self.crp.article_geometry(&self.crp_data, a).map_err(fmt_err(crp_path))?;
             let mut lod_numbers: Vec<u8> = g.primitives.iter().map(|p| p.lod).collect();
             lod_numbers.sort_unstable();
             lod_numbers.dedup();
@@ -547,6 +613,28 @@ impl TrackAssets {
 }
 
 #[cfg(test)]
+mod dir_lookup_tests {
+    use super::*;
+
+    /// The cached listing answers like `GamePaths::find_file`: the exact spelling, else the entry
+    /// that differs only in ASCII case, else nothing.
+    #[test]
+    fn matches_find_file() {
+        let dir = std::env::temp_dir().join(format!("nfs-dirlookup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Alps_AUDIO.scn"), b"x").unwrap();
+        std::fs::write(dir.join("alps.crp"), b"x").unwrap();
+        let lookup = DirLookup::new(&dir);
+        for name in ["alps.crp", "ALPS.CRP", "alps_audio.scn", "Alps_Audio.SCN", "alps.fsh", "alps_missing.key"] {
+            assert_eq!(lookup.find(name), GamePaths::find_file(&dir, name), "{name}");
+        }
+        assert!(lookup.find("alps_audio.scn").is_some());
+        assert!(lookup.find("alps.fsh").is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod headlight_tests {
     use super::*;
 
@@ -564,6 +652,31 @@ mod headlight_tests {
         assert!(lit.contains("Normal") && lit.contains("Opaque"), "{lit:?}");
         let day = TrackAssets::load(&paths, "alps").unwrap();
         assert!(vertex_light_methods(&day.crp, &day.crp_data).is_empty());
+    }
+
+    /// The shared `RMth` scan answers exactly what the three separate scans (kept here as the
+    /// reference) did, on every shipped track.
+    #[test]
+    fn rmth_scans_match_the_separate_reference_scans() {
+        let Ok(paths) = crate::GamePaths::locate() else { return };
+        let words = |bytes: &[u8]| -> Vec<u32> { bytes.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect() };
+        let reference = |t: &TrackAssets, pred: &dyn Fn(u32) -> bool| -> std::collections::HashSet<String> {
+            t.crp
+                .level
+                .iter()
+                .filter(|e| e.is_level(b"RMth"))
+                .filter_map(|e| t.crp_data.get(e.data_offset()..e.data_offset() + e.data_len()))
+                .filter(|bytes| bytes.len() > 16 && words(&bytes[16..]).into_iter().any(pred))
+                .map(|bytes| bytes[..16].iter().take_while(|b| **b != 0).map(|b| *b as char).collect())
+                .collect()
+        };
+        for name in ["alps", "monaco1", "canyon", "industrial", "coastal"] {
+            let Ok(t) = TrackAssets::load(&paths, name) else { continue };
+            assert_eq!(vertex_light_methods(&t.crp, &t.crp_data), reference(&t, &|w| matches!(w, 0x8002 | 0x8003)), "{name}");
+            assert_eq!(uv_light_methods(&t.crp, &t.crp_data), reference(&t, &|w| w == 0x8004), "{name}");
+            let any_headlight = t.crp.level.iter().filter(|e| e.is_level(b"RMth")).filter_map(|e| t.crp_data.get(e.data_offset()..e.data_offset() + e.data_len())).any(|b| words(b).into_iter().any(|w| HEADLIGHT_LAYERS.contains(&w)));
+            assert_eq!(t.is_night(), any_headlight, "{name}");
+        }
     }
 
     /// Exactly the materials with op-mask bit 0x10 build an `Am` op — `…_Ambient` 0x8011 by

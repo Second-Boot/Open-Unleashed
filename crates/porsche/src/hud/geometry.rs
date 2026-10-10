@@ -276,7 +276,7 @@ impl Hud {
         }));
         if self.map_drawn.borrow().as_ref() == Some(&now) {
             // **TEST GLUE** `NFS_MAP_VERIFY=1`: the skipped redraw must equal what the texture holds
-            if nfs_game::config::cfg().nfs_map_verify.var_os().is_some() {
+            if nfs_game::config::cfg().nfs_map_verify.is_set() {
                 assert!(self.map_check.borrow().as_deref() == Some(self.map_image(&now).as_slice()), "map redraw skipped but its picture changed");
             }
             *self.map_scratch.borrow_mut() = now;
@@ -286,7 +286,7 @@ impl Hud {
         // new allocation per redraw
         let mut td = self.map_tex.borrow_mut().take().unwrap_or_else(|| TextureData::single(MAP_PX, MAP_PX, Vec::new()));
         self.map_image_into(&now, &mut td.mips[0]);
-        if nfs_game::config::cfg().nfs_map_verify.var_os().is_some() {
+        if nfs_game::config::cfg().nfs_map_verify.is_set() {
             *self.map_check.borrow_mut() = Some(td.mips[0].clone());
         }
         r.update_texture(tex, &td);
@@ -749,7 +749,7 @@ impl Hud {
         // **TEST GLUE** (not in the original): `NFS_HUD_BOXES=1` prints each anchored element's
         // pixel box (logical pixels) — the measurement of `hud.md` §2.2's rule at a resolution
         static BOXES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *BOXES.get_or_init(|| nfs_game::config::cfg().nfs_hud_boxes.var_os().is_some()) {
+        if *BOXES.get_or_init(|| nfs_game::config::cfg().nfs_hud_boxes.is_set()) {
             eprintln!("HUDBOX design=({x},{y},{w},{h}) screen={sw}x{sh} box=({xi},{yi},{wi},{hi})");
         }
         let (right, bottom) = (xi >= sw / 2, yi >= sh / 2);

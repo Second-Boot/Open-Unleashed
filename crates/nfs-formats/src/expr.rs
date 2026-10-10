@@ -161,8 +161,8 @@ fn prec(c: u8) -> i32 {
 /// the brackets and separators.
 fn unary(c: u8) -> i32 {
     match c {
-        0x93..=0xA3 | 0xA5 => 15,
-        0x8C..=0x92 | b'*' | b'+' | b'-' | b'<' | b'>' | b'~' | b'!' => 14,
+        op::ABS..=op::INTSIN | op::SQRT => 15,
+        op::NEG..=op::SHIFT_RIGHT_1 | b'*' | b'+' | b'-' | b'<' | b'>' | b'~' | b'!' => 14,
         b')' | b']' => 2,
         0 | b'(' | b'[' | b',' | b';' => 1,
         _ => 0,
@@ -181,17 +181,70 @@ const FUNCTIONS: [&str; 19] = [
 /// `_CONTROL` 0x20, `_BLANK` 0x40, `_HEX` 0x80, `_ALPHA` 0x100; nothing above 0x7F.
 fn ctype(c: i32) -> i32 {
     match c as u8 {
-        b'\t'..=b'\r' => 0x28,
-        0..=0x1F | 0x7F => 0x20,
-        b' ' => 0x48,
-        b'0'..=b'9' => 0x84,
-        b'A'..=b'F' => 0x181,
-        b'G'..=b'Z' => 0x101,
-        b'a'..=b'f' => 0x182,
-        b'g'..=b'z' => 0x102,
-        0x21..=0x7E => 0x10,
+        b'\t'..=b'\r' => ct::SPACE | ct::CONTROL,
+        0..=0x1F | 0x7F => ct::CONTROL,
+        b' ' => ct::SPACE | ct::BLANK,
+        b'0'..=b'9' => ct::DIGIT | ct::HEX,
+        b'A'..=b'F' => ct::UPPER | ct::HEX | ct::ALPHA,
+        b'G'..=b'Z' => ct::UPPER | ct::ALPHA,
+        b'a'..=b'f' => ct::LOWER | ct::HEX | ct::ALPHA,
+        b'g'..=b'z' => ct::LOWER | ct::ALPHA,
+        0x21..=0x7E => ct::PUNCT,
         _ => 0,
     }
+}
+
+/// The `_pctype` bits (see [`ctype`]).
+mod ct {
+    pub const UPPER: i32 = 0x001;
+    pub const LOWER: i32 = 0x002;
+    pub const DIGIT: i32 = 0x004;
+    pub const SPACE: i32 = 0x008;
+    pub const PUNCT: i32 = 0x010;
+    pub const CONTROL: i32 = 0x020;
+    pub const BLANK: i32 = 0x040;
+    pub const HEX: i32 = 0x080;
+    pub const ALPHA: i32 = 0x100;
+    /// what each `is*` function tests (the masks the table at 0x530890 uses)
+    pub const IS_ALPHA: i32 = UPPER | LOWER | ALPHA;
+    pub const IS_ALNUM: i32 = UPPER | LOWER | DIGIT | ALPHA;
+    pub const IS_PRINT: i32 = UPPER | LOWER | DIGIT | PUNCT | BLANK | ALPHA;
+    pub const IS_GRAPH: i32 = UPPER | LOWER | DIGIT | PUNCT | ALPHA;
+}
+
+/// The operator codes of the unary operators and functions (the table at 0x530890). Functions
+/// start at [`op::ABS`]: name *k* of `FUNCTIONS` is `ABS + k`.
+mod op {
+    pub const NEG: u8 = 0x8C;
+    pub const BIT_NOT: u8 = 0x8D;
+    pub const LOGICAL_NOT: u8 = 0x8E;
+    /// `<x`: the high word
+    pub const HIGH_WORD: u8 = 0x8F;
+    /// `>x`: the low word
+    pub const LOW_WORD: u8 = 0x90;
+    /// `<<x`
+    pub const SHIFT_LEFT_1: u8 = 0x91;
+    /// `>>x`
+    pub const SHIFT_RIGHT_1: u8 = 0x92;
+    pub const ABS: u8 = 0x93;
+    pub const ISALPHA: u8 = 0x94;
+    pub const ISUPPER: u8 = 0x95;
+    pub const ISLOWER: u8 = 0x96;
+    pub const ISDIGIT: u8 = 0x97;
+    pub const ISXDIGIT: u8 = 0x98;
+    pub const ISALNUM: u8 = 0x99;
+    pub const ISSPACE: u8 = 0x9A;
+    pub const ISPUNCT: u8 = 0x9B;
+    pub const ISCNTRL: u8 = 0x9C;
+    pub const ISPRINT: u8 = 0x9D;
+    pub const ISGRAPH: u8 = 0x9E;
+    pub const ISASCII: u8 = 0x9F;
+    pub const TOLOWER: u8 = 0xA0;
+    pub const TOUPPER: u8 = 0xA1;
+    pub const TOASCII: u8 = 0xA2;
+    pub const INTSIN: u8 = 0xA3;
+    pub const INTCOS: u8 = 0xA4;
+    pub const SQRT: u8 = 0xA5;
 }
 
 /// `_ftol` 0x5A0F98: `fistp` of a 64-bit integer under a truncating control word, returning the
@@ -271,19 +324,19 @@ impl Evaluator {
                 i += 1;
                 let op = match c {
                     b'+' => continue 'operand,
-                    b'-' => 0x8C,
-                    b'~' => 0x8D,
-                    b'!' => 0x8E,
+                    b'-' => op::NEG,
+                    b'~' => op::BIT_NOT,
+                    b'!' => op::LOGICAL_NOT,
                     b'<' if at(i + 1) == b'<' => {
                         i += 1;
-                        0x91
+                        op::SHIFT_LEFT_1
                     }
-                    b'<' => 0x8F,
+                    b'<' => op::HIGH_WORD,
                     b'>' if at(i + 1) == b'>' => {
                         i += 1;
-                        0x92
+                        op::SHIFT_RIGHT_1
                     }
-                    _ => 0x90,
+                    _ => op::LOW_WORD,
                 };
                 self.ops.push((op, unary(op)));
                 continue;
@@ -319,7 +372,7 @@ impl Evaluator {
             let mut implied = 0u8;
             if at(i) == b'(' {
                 if let Some(k) = FUNCTIONS.iter().position(|f| f.as_bytes() == tok.as_slice()) {
-                    let op = 0x93 + k as u8;
+                    let op = op::ABS + k as u8;
                     self.ops.push((op, unary(op)));
                     continue;
                 }
@@ -444,34 +497,34 @@ impl Evaluator {
     fn unary_op(op: u8, v: i32) -> i32 {
         let byte = |f: &dyn Fn(i32) -> i32| if v as u32 & 0xFFFF_FF00 != 0 { 0 } else { f(v) };
         match op {
-            0x8C => v.wrapping_neg(),                 // 0x5305BC
-            0x8D => !v,                               // 0x5305CD
-            0x8E => (v == 0) as i32,                  // 0x5305DE
-            0x8F => (v >> 16) & 0xFFFF,               // 0x53060D `<x`: the high word
-            0x90 => v & 0xFFFF,                       // 0x530625 `>x`: the low word
-            0x91 => v.wrapping_shl(1),                // 0x5305F3
-            0x92 => v >> 1,                           // 0x530600
-            0x93 => v.wrapping_neg().max(v) & 0x7FFF_FFFF, // abs, 0x5300D4: `neg` then `and 0x7FFFFFFF`
-            0x94 => byte(&|c| ctype(c) & 0x103),      // isalpha
-            0x95 => byte(&|c| ctype(c) & 0x001),      // isupper
-            0x96 => byte(&|c| ctype(c) & 0x002),      // islower
-            0x97 => byte(&|c| ctype(c) & 0x004),      // isdigit
-            0x98 => byte(&|c| ctype(c) & 0x080),      // isxdigit
-            0x99 => byte(&|c| ctype(c) & 0x107),      // isalnum
-            0x9A => byte(&|c| ctype(c) & 0x008),      // isspace
-            0x9B => byte(&|c| ctype(c) & 0x010),      // ispunct
-            0x9C => byte(&|c| ctype(c) & 0x020),      // iscntrl
-            0x9D => byte(&|c| ctype(c) & 0x157),      // isprint
-            0x9E => byte(&|c| ctype(c) & 0x117),      // isgraph
-            0x9F => byte(&|c| (c < 0x80) as i32),     // isascii, 0x5304E2
-            0xA0 => if v as u32 & 0xFFFF_FF00 != 0 { v } else { (v as u8).to_ascii_lowercase() as i32 }, // 0x53050A
-            0xA1 => if v as u32 & 0xFFFF_FF00 != 0 { v } else { (v as u8).to_ascii_uppercase() as i32 }, // 0x53052F
-            0xA2 => v & 0x7F,                         // toascii, 0x530554
+            op::NEG => v.wrapping_neg(),                 // 0x5305BC
+            op::BIT_NOT => !v,                               // 0x5305CD
+            op::LOGICAL_NOT => (v == 0) as i32,                  // 0x5305DE
+            op::HIGH_WORD => (v >> 16) & 0xFFFF,               // 0x53060D `<x`: the high word
+            op::LOW_WORD => v & 0xFFFF,                       // 0x530625 `>x`: the low word
+            op::SHIFT_LEFT_1 => v.wrapping_shl(1),                // 0x5305F3
+            op::SHIFT_RIGHT_1 => v >> 1,                           // 0x530600
+            op::ABS => v.wrapping_neg().max(v) & 0x7FFF_FFFF, // abs, 0x5300D4: `neg` then `and 0x7FFFFFFF`
+            op::ISALPHA => byte(&|c| ctype(c) & ct::IS_ALPHA),      // isalpha
+            op::ISUPPER => byte(&|c| ctype(c) & ct::UPPER),      // isupper
+            op::ISLOWER => byte(&|c| ctype(c) & ct::LOWER),      // islower
+            op::ISDIGIT => byte(&|c| ctype(c) & ct::DIGIT),      // isdigit
+            op::ISXDIGIT => byte(&|c| ctype(c) & ct::HEX),      // isxdigit
+            op::ISALNUM => byte(&|c| ctype(c) & ct::IS_ALNUM),      // isalnum
+            op::ISSPACE => byte(&|c| ctype(c) & ct::SPACE),      // isspace
+            op::ISPUNCT => byte(&|c| ctype(c) & ct::PUNCT),      // ispunct
+            op::ISCNTRL => byte(&|c| ctype(c) & ct::CONTROL),      // iscntrl
+            op::ISPRINT => byte(&|c| ctype(c) & ct::IS_PRINT),      // isprint
+            op::ISGRAPH => byte(&|c| ctype(c) & ct::IS_GRAPH),      // isgraph
+            op::ISASCII => byte(&|c| (c < 0x80) as i32),     // isascii, 0x5304E2
+            op::TOLOWER => if v as u32 & 0xFFFF_FF00 != 0 { v } else { (v as u8).to_ascii_lowercase() as i32 }, // 0x53050A
+            op::TOUPPER => if v as u32 & 0xFFFF_FF00 != 0 { v } else { (v as u8).to_ascii_uppercase() as i32 }, // 0x53052F
+            op::TOASCII => v & 0x7F,                         // toascii, 0x530554
             // intsin / intcos: `fild`, × 2π/1024 ([0x5BB2A8]), `fsin`/`fcos`, × 65536 ([0x5B4B38]),
             // `_ftol` (0x530562 / 0x530584)
-            0xA3 => ftol((v as f64 * 0.006_135_922_572_265_625).sin() * 65536.0),
-            0xA4 => ftol((v as f64 * 0.006_135_922_572_265_625).cos() * 65536.0),
-            0xA5 => ftol((v as f64).sqrt()),          // 0x5305A6
+            op::INTSIN => ftol((v as f64 * 0.006_135_922_572_265_625).sin() * 65536.0),
+            op::INTCOS => ftol((v as f64 * 0.006_135_922_572_265_625).cos() * 65536.0),
+            op::SQRT => ftol((v as f64).sqrt()),          // 0x5305A6
             _ => v,
         }
     }
@@ -800,6 +853,40 @@ fn parse_quoted(t: &[u8]) -> (Vec<u8>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The named `_pctype` bits and operator codes are the literals the evaluator carried, and
+    /// `ctype` answers the old literal table for every byte.
+    #[test]
+    fn named_ctype_bits_and_operator_codes_keep_their_literal_values() {
+        assert_eq!([ct::UPPER, ct::LOWER, ct::DIGIT, ct::SPACE, ct::PUNCT, ct::CONTROL, ct::BLANK, ct::HEX, ct::ALPHA], [1, 2, 4, 8, 0x10, 0x20, 0x40, 0x80, 0x100]);
+        assert_eq!([ct::IS_ALPHA, ct::IS_ALNUM, ct::IS_PRINT, ct::IS_GRAPH], [0x103, 0x107, 0x157, 0x117]);
+        assert_eq!(
+            [op::NEG, op::BIT_NOT, op::LOGICAL_NOT, op::HIGH_WORD, op::LOW_WORD, op::SHIFT_LEFT_1, op::SHIFT_RIGHT_1, op::ABS, op::ISALPHA, op::ISUPPER, op::ISLOWER, op::ISDIGIT],
+            [0x8C, 0x8D, 0x8E, 0x8F, 0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97]
+        );
+        assert_eq!(
+            [op::ISXDIGIT, op::ISALNUM, op::ISSPACE, op::ISPUNCT, op::ISCNTRL, op::ISPRINT, op::ISGRAPH, op::ISASCII, op::TOLOWER, op::TOUPPER, op::TOASCII, op::INTSIN, op::INTCOS, op::SQRT],
+            [0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5]
+        );
+        // the function table: name k is ABS + k
+        assert_eq!(op::ABS as usize + FUNCTIONS.len() - 1, op::SQRT as usize);
+        // the table as it was written with literals
+        let old = |c: i32| -> i32 {
+            match c as u8 {
+                b'\t'..=b'\r' => 0x28,
+                0..=0x1F | 0x7F => 0x20,
+                b' ' => 0x48,
+                b'0'..=b'9' => 0x84,
+                b'A'..=b'F' => 0x181,
+                b'G'..=b'Z' => 0x101,
+                b'a'..=b'f' => 0x182,
+                b'g'..=b'z' => 0x102,
+                0x21..=0x7E => 0x10,
+                _ => 0,
+            }
+        };
+        assert!((0..=255).all(|c| ctype(c) == old(c)));
+    }
 
     fn none(_: &str) -> Macro {
         Macro::Undefined
