@@ -12,7 +12,7 @@
 //! `car+0x364` has the car's axes in its rows (`physics.md` §2: +0x364 x-axis, +0x370 up,
 //! +0x37C forward) and `car+0x330` is the body's origin — half the model box (`car+0x3AC`,
 //! 0x445090) above the contact plane; the body is drawn `M[1]·car+0x3AC` below it (0x43A410).
-//! *(Corrected 2026-09-25: this said `car+0x330` is where the body is drawn, 5 cm above the road.)*
+//! (history: `game-history.md` §15.1)
 //! So the offsets below are metres in the car's body frame — +x right, +y up, +z forward —
 //! measured from that origin.
 
@@ -49,8 +49,7 @@ pub fn fov_y(half_angle_deg: f32) -> f32 {
 /// own vertical tangent is `tan h · 0.75 · 0.7` over its 0.7 of the screen — the full window's
 /// `tan h · 0.75` cut to the band, the horizontal field unchanged (the viewport 0x538DA0
 /// maps NDC onto the band itself; its `+0x200` / `+0x204` scales are 1 for a viewport inside the
-/// screen, 0x538FBF…0x538FFE). *(Until 2026-10-09 this said the band shows
-/// `2·atan(tan h · 0.75 / 0.7)` of the window's height and the port drew a field 1/0.7 too wide.)*
+/// screen, 0x538FBF…0x538FFE). (history: `game-history.md` §15.2)
 pub const WIDESCREEN_BAND: f32 = 0.7;
 pub const WIDESCREEN_ZOOM: f32 = 1.2;
 
@@ -313,8 +312,7 @@ pub const VIEW_DRIVER: usize = 1;
 /// Whether the camera's own car runs its particle effects' drive in this view — **it does not**
 /// in the bumper and driver views (0x4383FD: when `carInfo+0x520` is the car the camera follows and
 /// the view id is 0 or 1, `[car+0x704] → 0x43EF80(1)` is skipped; `nfs_game::car_effects`).
-/// CONFIRMED. *(Corrected 2026-09-26/27: this was read as "the car is not drawn"; 0x43EF80 is the
-/// cars' `carpart.dat` effects, not the body — `car-model.md` §13, `particles.md` §11.)* The gate
+/// CONFIRMED. (history: `game-history.md` §15.3) The gate
 /// is slot 7's only: the odd tick's walk 0x443640 drives the same car through slot 8 (0x438420)
 /// with no view test, so the own car's effects still run at 32 Hz in these views.
 pub fn draws_own_car(view: u16) -> bool {
@@ -491,6 +489,7 @@ pub fn look_step(cur: i16, target: i16) -> (i16, bool) {
 /// but nothing reads), no drift, state 1 and the start `+0x08` = `gGameTick` at the pick.
 pub mod anim_cam {
     use glam::{Mat3, Vec3};
+    use nfs_formats::bytes;
     use nfs_formats::crp::{AnimFrame, AnimTrack};
 
     /// 0x471AEC: the player's seconds per key, `0x3D124925`.
@@ -501,7 +500,7 @@ pub mod anim_cam {
     /// The five `CmAn` animations of a track, in table order (0x471850 walks the level entries from
     /// the first `CmAn`, 0x59F700, `ebx += 0x10`). An entry too short for its count is skipped.
     pub fn load(crp: &nfs_formats::crp::Crp, data: &[u8]) -> Vec<AnimTrack> {
-        let f = |b: &[u8], o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let f = |b: &[u8], o: usize| bytes::read_f32(b, o);
         crp.level
             .iter()
             .filter(|e| e.is_level(b"CmAn"))
@@ -510,7 +509,7 @@ pub mod anim_cam {
                 if b.len() < 0x2C {
                     return None;
                 }
-                let n = u32::from_le_bytes([b[0x28], b[0x29], b[0x2A], b[0x2B]]) as usize;
+                let n = bytes::read_u32(b, 0x28) as usize;
                 if n < 2 || b.len() < 0x2C + n * 0x34 {
                     return None;
                 }

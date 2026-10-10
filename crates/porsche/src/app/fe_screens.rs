@@ -131,13 +131,6 @@ impl App {
             self.choices.insert(Self::choice_slot(base, key).to_string(), next);
             return;
         }
-        // the network screens' own sliders and lists
-        if base == "Comms.Positional"
-            && let Some(n) = self.net.session.as_mut()
-        {
-            n.positional = !n.positional;
-            return;
-        }
         // `CDPlayer.Title` is a combo on the song table (`audioreal.lay`): slot 21 wraps over the
         // table and lands in the setter 0x4BEDC0 (`cd_set_title`) — a click on its caption did nothing
         // before (2026-09-30)
@@ -149,99 +142,12 @@ impl App {
             }
             return;
         }
-        if base == "Comms.PlayerList"
-            && let Some(n) = self.net.session.as_mut()
-        {
-            n.step_player(delta);
+        // the network screens' own sliders and lists
+        if self.step_comms_accessor(base, delta) {
             return;
         }
-        if let Some(l) = self.net.lobby.as_mut() {
-            match base {
-                "Comms.Positional" => {
-                    l.positional = !l.positional;
-                    return;
-                }
-                "Comms.IPList" => {
-                    let n = l.history.len().max(1);
-                    let row = ((l.ip_sel as i32 + delta).rem_euclid(n as i32)) as usize;
-                    self.pick_ip_row(row);
-                    return;
-                }
-                "Comms.ServerList" | "Comms.GamesList" | "Comms.LobbyPlayerList" | "Comms.PlayerList" => {
-                    let n = l.found.len().max(1);
-                    l.sel = ((l.sel as i32 + delta).rem_euclid(n as i32)) as usize;
-                    return;
-                }
-                _ => {}
-            }
-        }
-        // `Tournament.Tournament`'s combo (`tournament.lay`): the list accessor's step wraps both
-        // ways (vtable 0x5B88F0 slots 20 / 21 = 0x4BC660 / 0x4BC690) and lands in its setter
-        // **0x504D00(k)**, which makes the k-th record of the list `Tournament.EventType` picks
-        // (0x5053C0) the selected tournament `[0x691E6C]` (0x504DCC) and puts `[0x691E7C]` on its
-        // first undone event (0x504E79…0x504EB4) — `Tournament.RemainingTracks` back on row 0.
-        // A club list (EventType 1…3) is the career's club mode here (`CareerUi::club`).
-        if base == "Tournament.Tournament" {
-            let ev_type = self.choice_index(choice::TOURNAMENT_EVENT_TYPE).map_or(0, |(i, _)| i);
-            if let Some(c) = self.career.as_mut() {
-                let list: Vec<i16> = c.event_type_list(ev_type).iter().map(|t| t.id).collect();
-                if !list.is_empty() {
-                    let cur = c.current().and_then(|t| list.iter().position(|id| *id == t.id)).unwrap_or(0);
-                    let id = list[(cur as i32 + delta).rem_euclid(list.len() as i32) as usize];
-                    c.club = (1..=3).contains(&c.event_type_kind(ev_type));
-                    if let Some(i) = c.tournaments().iter().position(|t| t.id == id) {
-                        c.t_idx = i;
-                    }
-                    self.fe.remaining_sel = 0;
-                }
-            }
-            return;
-        }
-        // `Tournament.RemainingTracks` keeps its own row, wrapping (0x4FA575 folds an index at or
-        // past the count back to 0)
-        if base == "Tournament.RemainingTracks" {
-            let n = self.career.as_ref().and_then(|c| {
-                let t = c.current()?;
-                let done = c.career.tournaments.get(&t.id).map_or(0, |s| s.events.len());
-                Some(t.events.len().saturating_sub(done))
-            });
-            if let Some(n) = n.filter(|n| *n > 0) {
-                self.fe.remaining_sel = ((self.fe.remaining_sel.min(n - 1) as i32 + delta).rem_euclid(n as i32)) as usize;
-            }
-            return;
-        }
-        // the dealership's car in a career: it wraps both ways (0x4BC660 / 0x4BC690) and a new car
-        // puts the colour rows back to 0 (0x4F30A4…); its two colour lists went through
-        // `colour_step` above
-        if base == "DealerCar.Car"
-            && let Some(v) = self.dealer_cars()
-        {
-            let count = v.len();
-            let n_cars = count.max(1) as i32;
-            let d = &mut self.fe.dealer;
-            let step = |v: usize, n: i32| ((v.min(n as usize - 1) as i32 + delta).rem_euclid(n)) as usize;
-            // 0x4BC660 / 0x4BC690 wrap, then slot 11 (0x4F3060)
-            let row = step(d.car, n_cars);
-            d.slot11(row as i64, count);
-            return;
-        }
-        // `OwnedCars.Car` is the garage (`FEOwnedCarAccessor`, §4.144): its index is the garage
-        // selection every other owned-car accessor, the logo and the 3D car read. *(Until
-        // 2026-09-25 it stepped the quick race's catalogue index, so the garage's and the paint
-        // shop's car combos moved nothing on screen.)* Outside a career it keeps that meaning.
-        // stepped over 0x501AD0's list (`owned_list`), not the whole garage
-        if base == "OwnedCars.Car"
-            && self.career.is_some()
-        {
-            let list = self.owned_list();
-            if let Some(c) = self.career.as_mut() {
-                if !list.is_empty() {
-                    let n = list.len() as i32;
-                    let k = list.iter().position(|i| *i == c.car_sel).unwrap_or(0) as i32;
-                    c.car_sel = list[(k + delta).rem_euclid(n) as usize];
-                }
-                c.part_sel = 0;
-            }
+        // the career lists: the tournament, its remaining events, the dealer car and the garage car
+        if self.step_career_list_accessor(base, delta) {
             return;
         }
         // a string list (0x4B8990): the combo adds its step to the index and the setter 0x4BC240
@@ -270,9 +176,123 @@ impl App {
             self.step_merged_car(delta);
             return;
         }
-        // computed off `self.paths` (disjoint from `self.fe`, borrowed mutably below) for the
-        // `zMergedList.Car`/`OwnedCars.Car`/`DealerCar.Car`/`GenericCar.Car`/`CARSETTINGS.CAR` arm
-        let default_colour = default_paint_colour(&nfs_formats::fedata::parse_car_catalog(&std::fs::read(self.paths.fe_data().join("Data").join("nfs5.car")).unwrap_or_default()).unwrap_or_default());
+        self.step_menu_accessor(base, delta);
+    }
+
+    /// [`Self::set_accessor`]'s network arms: `true` when one of them took the step.
+    fn step_comms_accessor(&mut self, base: &str, delta: i32) -> bool {
+        if base == "Comms.Positional"
+            && let Some(n) = self.net.session.as_mut()
+        {
+            n.positional = !n.positional;
+            return true;
+        }
+        if base == "Comms.PlayerList"
+            && let Some(n) = self.net.session.as_mut()
+        {
+            n.step_player(delta);
+            return true;
+        }
+        if let Some(l) = self.net.lobby.as_mut() {
+            match base {
+                "Comms.Positional" => {
+                    l.positional = !l.positional;
+                    return true;
+                }
+                "Comms.IPList" => {
+                    let n = l.history.len().max(1);
+                    let row = ((l.ip_sel as i32 + delta).rem_euclid(n as i32)) as usize;
+                    self.pick_ip_row(row);
+                    return true;
+                }
+                "Comms.ServerList" | "Comms.GamesList" | "Comms.LobbyPlayerList" | "Comms.PlayerList" => {
+                    let n = l.found.len().max(1);
+                    l.sel = ((l.sel as i32 + delta).rem_euclid(n as i32)) as usize;
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// [`Self::set_accessor`]'s career-list arms: `true` when one of them took the step.
+    fn step_career_list_accessor(&mut self, base: &str, delta: i32) -> bool {
+        // `Tournament.Tournament`'s combo (`tournament.lay`): the list accessor's step wraps both
+        // ways (vtable 0x5B88F0 slots 20 / 21 = 0x4BC660 / 0x4BC690) and lands in its setter
+        // **0x504D00(k)**, which makes the k-th record of the list `Tournament.EventType` picks
+        // (0x5053C0) the selected tournament `[0x691E6C]` (0x504DCC) and puts `[0x691E7C]` on its
+        // first undone event (0x504E79…0x504EB4) — `Tournament.RemainingTracks` back on row 0.
+        // A club list (EventType 1…3) is the career's club mode here (`CareerUi::club`).
+        if base == "Tournament.Tournament" {
+            let ev_type = self.choice_index(choice::TOURNAMENT_EVENT_TYPE).map_or(0, |(i, _)| i);
+            if let Some(c) = self.career.as_mut() {
+                let list: Vec<i16> = c.event_type_list(ev_type).iter().map(|t| t.id).collect();
+                if !list.is_empty() {
+                    let cur = c.current().and_then(|t| list.iter().position(|id| *id == t.id)).unwrap_or(0);
+                    let id = list[(cur as i32 + delta).rem_euclid(list.len() as i32) as usize];
+                    c.club = (1..=3).contains(&c.event_type_kind(ev_type));
+                    if let Some(i) = c.tournaments().iter().position(|t| t.id == id) {
+                        c.t_idx = i;
+                    }
+                    self.fe.remaining_sel = 0;
+                }
+            }
+            return true;
+        }
+        // `Tournament.RemainingTracks` keeps its own row, wrapping (0x4FA575 folds an index at or
+        // past the count back to 0)
+        if base == "Tournament.RemainingTracks" {
+            let n = self.career.as_ref().and_then(|c| {
+                let t = c.current()?;
+                let done = c.career.tournaments.get(&t.id).map_or(0, |s| s.events.len());
+                Some(t.events.len().saturating_sub(done))
+            });
+            if let Some(n) = n.filter(|n| *n > 0) {
+                self.fe.remaining_sel = ((self.fe.remaining_sel.min(n - 1) as i32 + delta).rem_euclid(n as i32)) as usize;
+            }
+            return true;
+        }
+        // the dealership's car in a career: it wraps both ways (0x4BC660 / 0x4BC690) and a new car
+        // puts the colour rows back to 0 (0x4F30A4…); its two colour lists went through
+        // `colour_step` above
+        if base == "DealerCar.Car"
+            && let Some(v) = self.dealer_cars()
+        {
+            let count = v.len();
+            let n_cars = count.max(1) as i32;
+            let d = &mut self.fe.dealer;
+            let step = |v: usize, n: i32| ((v.min(n as usize - 1) as i32 + delta).rem_euclid(n)) as usize;
+            // 0x4BC660 / 0x4BC690 wrap, then slot 11 (0x4F3060)
+            let row = step(d.car, n_cars);
+            d.slot11(row as i64, count);
+            return true;
+        }
+        // `OwnedCars.Car` is the garage (`FEOwnedCarAccessor`, §4.144): its index is the garage
+        // selection every other owned-car accessor, the logo and the 3D car read. *(Until
+        // 2026-09-25 it stepped the quick race's catalogue index, so the garage's and the paint
+        // shop's car combos moved nothing on screen.)* Outside a career it keeps that meaning.
+        // stepped over 0x501AD0's list (`owned_list`), not the whole garage
+        if base == "OwnedCars.Car"
+            && self.career.is_some()
+        {
+            let list = self.owned_list();
+            if let Some(c) = self.career.as_mut() {
+                if !list.is_empty() {
+                    let n = list.len() as i32;
+                    let k = list.iter().position(|i| *i == c.car_sel).unwrap_or(0) as i32;
+                    c.car_sel = list[(k + delta).rem_euclid(n) as usize];
+                }
+                c.part_sel = 0;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// [`Self::set_accessor`]'s last arms: the accessors the race-set-up menu (`fe.menu`) holds,
+    /// and the audio levels.
+    fn step_menu_accessor(&mut self, base: &str, delta: i32) {
         let Some(m) = self.fe.menu.as_mut() else { return };
         let step = |i: usize, n: usize| ((i as i32 + delta).rem_euclid(n.max(1) as i32)) as usize;
         match base {
@@ -331,6 +351,10 @@ impl App {
             // the garage / dealership / settings accessors: not observed, the by-value row is
             // kept (residual)
             "OwnedCars.Car" | "DealerCar.Car" | "CARSETTINGS.CAR" => {
+                // read off `self.paths` (disjoint from `self.fe`, which `m` borrows) — here, for
+                // this arm alone: it used to read and parse `nfs5.car` on every step of any
+                // accessor of this function
+                let default_colour = default_paint_colour(&nfs_formats::fedata::parse_car_catalog(&std::fs::read(self.paths.fe_data().join("Data").join("nfs5.car")).unwrap_or_default()).unwrap_or_default());
                 m.car_idx = step(m.car_idx, m.cars.len());
                 m.paint_idx = m.cars.get(m.car_idx).map(|c| default_paint_row(default_colour, &c.paint_sets)).unwrap_or(0);
                 m.paint_custom = None;

@@ -24,8 +24,6 @@ impl App {
             Some((b, m)) => (b.trim(), m.trim_end_matches(')')),
             None => (name, ""),
         };
-        let menu = self.fe.menu.as_ref();
-        let career = self.career.as_ref();
         // **`CARSETTINGS.CAR` is a forwarder, not an accessor.** `FECarSettingsCarAccessor`'s vtable
         // 0x5B4CE0 has 37 slots and **every one of them** is a thunk: 0x4B8820…0x4B88D0 each call
         // 0x4B88F0 for a delegate and `jmp`/`call` the same slot on it. 0x4B88F0 switches on
@@ -39,8 +37,31 @@ impl App {
         // in a career. `Game.GameType` here is what the port can tell: a pending career event is the
         // Evolution race, a factory-driver mission is 9, and everything else is the single-race 0.
         let base = if base == "CARSETTINGS.CAR" { self.car_settings_delegate() } else { base };
+        // one function per accessor family, by the part of the name before the dot. The arms keep
+        // their first-match order inside each family, and a name no family arm takes falls
+        // through to `other_accessor` — the settings tables, the car-setup and repair rows and the
+        // list accessors' own caption. No name a family arm takes is one an `other_accessor` arm
+        // takes ahead of it (the settings tables hold no `Tournament`/`Comms`/car/`CDPlayer` name
+        // those arms answer), so the order is the single match it was split from.
+        match base.split_once('.').map_or(base, |(family, _)| family) {
+            "Tournament" => self.tournament_accessor(base, modifier),
+            "Factory" => self.factory_accessor(base, modifier),
+            "Comms" => self.comms_accessor(base, modifier),
+            "Track1" | "LoopedTrack" | "Knockout" | "Record" | "Track" => self.track_accessor(base, modifier),
+            "Parts" => self.parts_accessor(base, modifier),
+            "OwnedCars" | "OwnedCar" | "DealerCar" | "GenericCar" | "GenericCar2" | "UsedCar" | "zMergedList"
+            | "OpponentCar" | "PrizeCars" | "CARSETTINGS" => self.car_accessor(base, modifier),
+            "Game" => self.game_accessor(base, modifier),
+            "Controller" => self.controller_accessor(name, base, modifier),
+            "CDPlayer" => self.cd_player_accessor(base, modifier),
+            _ => self.other_accessor(base, modifier),
+        }
+    }
+
+    /// `Tournament.*`: the tournament screen, the money line and the end-of-era lines.
+    fn tournament_accessor(&self, base: &str, modifier: &str) -> Option<String> {
+        let career = self.career.as_ref();
         Some(match base {
-            "Showcase.Text" => self.showcase_text(modifier.parse::<usize>().ok()?)?,
             // the tournament screen. Each field is one the `nfs5.trn` record already carries, and
             // `(LOCATION)` is what 0x506992 makes it: the accessor looks up
             // `Tournament.RemainingTracks`, calls its vtable +0x70 for an id and hands that to the
@@ -144,6 +165,13 @@ impl App {
                 let id = if modifier == "ENDERAHEADER" { t.title_string_id } else { t.description_string_id };
                 self.fe.strings.get(id)?.to_string()
             }
+            _ => return self.other_accessor(base, modifier),
+        })
+    }
+
+    /// `Factory.*`: the factory-drive mission and the team profiles.
+    fn factory_accessor(&self, base: &str, modifier: &str) -> Option<String> {
+        Some(match base {
             // the factory-drive mission the career is on (`missionbrief.lay`, `missionmap.lay`).
             // `NARRNAME` is `FEStrings[(i16)[mission+0x1E] + 0x9C4]` — 0x519DCA reads the field and
             // 0x519DCE adds 2500 — `MISSONDESC` is `FEStrings[[mission+0]]`, the id 0x519D67 loads
@@ -178,37 +206,14 @@ impl App {
                 };
                 self.fe.strings.get(base + 4 * self.fe.factory_profile as u32)?.to_string()
             }
-            // a range setting the port has no other state for — the force-feedback volumes and
-            // the gamma — shows its number
-            // A range setting asked for as a per cent. `FEAccessor::text("PERCENT")` is
-            // 0x4BC558…0x4BC5F0: with a list of one entry or none it answers a flat **100**
-            // (0x4BC5D8), otherwise `index · 100 / (count − 1)` (0x4BC5A5…0x4BC5C1) **clamped at
-            // 100** (0x4BC5C7), printed with a bare `"%d"` — no per-cent sign. An int range's
-            // index is the value less its minimum and its count is `max − min + 1` (0x4BA329,
-            // 0x4BA34A), so this works out to `(v − min) · 100 / (max − min)`.
-            //
-            // The sign on screen is the layout's, not the accessor's: `audioreal.lay` carries five
-            // `text=%` labels beside its five `(PERCENT)` watches and `advgraphics.lay` one beside
-            // its one, so appending a `%` here printed it twice.
-            _ if modifier == "PERCENT" && RANGE_ACCESSORS.iter().any(|(n, ..)| *n == base) => {
-                let (v, lo, hi) = self.range_value(base)?;
-                if hi <= lo {
-                    "100".to_string()
-                } else {
-                    ((v - lo) * 100 / (hi - lo)).min(100).to_string()
-                }
-            }
-            "FF.TotalVolume" | "FF.RoadVolume" | "FF.EngineVolume" | "FF.CollisionVolume"
-            | "FF.RoadGripVolume" | "Graphics.GammaCorrection" => self.range_value(base)?.0.to_string(),
-            // a multiple-choice setting: the text is the `FEStrings` entry its chosen index names
-            _ if CHOICE_ACCESSORS.iter().any(|(n, _, _)| *n == base) => {
-                let (i, options) = self.choice_index(base)?;
-                self.fe.strings.get(options[i])?.to_string()
-            }
-            // the car-compare screen's five numbers — `CarCompare.Data(<n>CarCompareCar<m>)`, the
-            // same source name its bars read (`fn compare_rating`)
-            // 0x50E94C prints it with **`"%02d"`** — a rating under ten reads `05`, not `5`
-            "CarCompare.Data" => format!("{:02}", self.compare_rating(modifier)?),
+            _ => return self.other_accessor(base, modifier),
+        })
+    }
+
+    /// `Comms.*`: the network screens.
+    fn comms_accessor(&self, base: &str, modifier: &str) -> Option<String> {
+        let menu = self.fe.menu.as_ref();
+        Some(match base {
             // the network screens (`netplay::Lobby`): the names come out of the layouts themselves
             "Comms.IP" => self.net.lobby.as_ref()?.ip.clone(),
             // **`FECommInfoAccessor`'s modified text 0x50BDD0** (vtable 0x5B9604 slot 5; its plain
@@ -294,32 +299,15 @@ impl App {
             "Comms.PhoneNumber" => String::new(),
             // chat is carried by a message the port has not traced, so the box stays empty
             "Comms.ChatInput" => String::new(),
-            "Chronicle.Year" => self.chronicle_year().to_string(),
-            // the combo's own closed caption is its current row's text — `choice_rows`'
-            // real-mode list ([`App::resolution_list`]), not a hardcoded fake row (COVERAGE
-            // §14.6.3)
-            "Graphics.Resolutions" => {
-                let modes = self.resolution_list();
-                let sel = self.fe.resolution_sel.min(modes.len().saturating_sub(1));
-                modes.get(sel).map_or_else(String::new, |(w, h, d)| format!("{w} x {h} x {d}"))
-            }
-            "Controller.AllControllers" | "Controller.AllPads" => {
-                let pads_only = name == "Controller.AllPads";
-                let v: Vec<String> =
-                    self.gamepads.devices().into_iter().filter(|(_, is_pad)| !pads_only || *is_pad).map(|(n, _)| n).collect();
-                let sel = if pads_only { self.fe.pads_sel } else { self.fe.controllers_sel };
-                v.get(sel.min(v.len().saturating_sub(1))).map(|n| n.to_string()).unwrap_or_default()
-            }
-            "Game.Damage" => {
-                let id = BOOL_OPTIONS[usize::from(menu?.damage)];
-                self.fe.strings.get(id).unwrap_or_default().to_string()
-            }
-            "Game.NumOpponents" => menu?.opponents.to_string(),
-            "Game.NumKOOpponents" => menu?.ko_opponents.to_string(),
-            "Game.Difficutly" => {
-                // the current row's text: `FEStrings[0x5D9F08[i]]` (`DIFFICULTY_OPTIONS`)
-                self.fe.strings.get(DIFFICULTY_OPTIONS[(menu?.difficulty as usize).min(2)])?.to_string()
-            }
+            _ => return self.other_accessor(base, modifier),
+        })
+    }
+
+    /// The track accessors — `Track1.*`, `LoopedTrack.Track`, `Knockout.*`, `Record.Track`,
+    /// `Track.Track` — and the knockout table.
+    fn track_accessor(&self, base: &str, modifier: &str) -> Option<String> {
+        let menu = self.fe.menu.as_ref();
+        Some(match base {
             "Track1.Track" | "LoopedTrack.Track" | "Knockout.Track" | "Record.Track"
             | "Track.Track" => {
                 // each accessor's own selection in its own list: `LoopedTrack.Track` over
@@ -351,96 +339,6 @@ impl App {
                     // it (`App::track_full_name`; until 2026-09-26 both were upper-cased)
                     _ => self.track_full_name(&t),
                 }
-            }
-            // the car-setup screen: the 17 floats the original keeps on the car and reads back
-            // nowhere (`RE/notes/layouts.md`), so the port shows them and changes nothing
-            b if nfs_game::career::CAR_SETUP_NAMES.contains(&b) => {
-                let c = career?;
-                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                let k = nfs_game::career::CAR_SETUP_NAMES
-                    .iter()
-                    .position(|n| *n == b)?;
-                let v = c.career.garage.get(idx)?.setup[k];
-                // shown through the accessor's own index and format, not as the raw float —
-                // `career::car_setup_text` has the chain (0x4B9C10 → 0x4BC240 → 0x4B9AB0)
-                nfs_game::career::car_setup_text(k, v)
-            }
-            // the repair screen: what each category costs on the selected car (`RepairCost`
-            // 0x518880 per installed part, summed by the QUICKFIX screen 0x50F110)
-            b if b.starts_with("QUICKFIX.") => {
-                let c = career?;
-                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                let kinds = quickfix_kinds(&b["QUICKFIX.".len()..])?;
-                with_thousands(c.career.repair_cost(&c.tables, idx, kinds))
-            }
-            // The two baskets' totals. `parts.lay` §19 watches `Parts.ShoppingList(TOTAL)` and
-            // `advancedrepair.lay` §24 `Parts.RepairShoppingList(TOTAL)`, and both accessors
-            // answer the same way: 0x516480 and 0x517500 compare the modifier against the literal
-            // **`TOTAL`** (0x5DCE04) and, on a match, print `this->slot6(modifier)` with
-            // **`"%d"`** (0x5CD1B0) — a bare number, no currency sign and no thousands commas.
-            // Slot 6 is the sum over the basket: 0x516500 for the shop (resale in, aged price
-            // out, so a basket of buys prints **negative**) and 0x517580 for the repair screen
-            // (each entry's replace cost 0x518900 or fix cost 0x518880 by its `[+4]` byte). An
-            // **empty** basket prints **`0`**, not nothing. Any other modifier answers null, which
-            // is `CANTFINDSTRING` in the original (§4.10) and nothing here.
-            //
-            // *(Corrected 2026-09-25: the repair total was taken from the `QUICKFIX.*` ticks —
-            // `repair.lay`'s sum 0x50F110 — which `advancedrepair.lay` has nothing to do with; and
-            // 0x518900 is the replace cost, 0x518880 the fix cost, not a price.)* §4.160.
-            "Parts.ShoppingList" if modifier == "TOTAL" => {
-                let c = career?;
-                format!("{}", c.career.shop_total(&c.tables, &self.fe.shop.basket))
-            }
-            "Parts.RepairShoppingList" if modifier == "TOTAL" => {
-                let c = career?;
-                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                format!("{}", c.career.repair_total(&c.tables, idx, &self.fe.shop.repair))
-            }
-            // A `Parts.*` accessor with **no** modifier: `FEAccessorWatch::tick` asks vtable +0x10
-            // (§4.10), which is the base's 0x4BC4E0 — `this->slot12([this+0x18])`, the text of the
-            // accessor's **current row**, and that index is 0 out of the constructor and nothing
-            // in this port moves it.
-            //
-            // For `Parts.AllParts` row 0 is the first section header (0x5152E0's `row == 0` arm),
-            // whose text is `FEStrings` 2550, "PARTS AVAILABLE FOR %s", with the car (0x5157A1).
-            // For `Parts.InstallList` slot 12 is 0x516B50: `"%s %s"` of the row's part name and
-            // its type name, so row 0 is the first row of the list 0x5166E0 builds — the car's
-            // parts but the body and the spares that fit it, in 0x49C350's order
-            // (`Career::install_list`). *(Until 2026-09-25 this was the first installed part.)*
-            "Parts.AllParts" if modifier.is_empty() => {
-                let c = self.career.as_ref()?;
-                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                let car = c.tables.car(c.career.garage.get(idx)?.car_id)?;
-                self.fe.strings.get(2550)?.replacen("%s", &car.display_name.to_string(), 1)
-            }
-            "Parts.InstallList" if modifier.is_empty() => {
-                let c = self.career.as_ref()?;
-                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                let p = match c.career.install_list(&c.tables, idx).first()? {
-                    nfs_game::shop::InstallRow::Fitted(id) => c.tables.parts.iter().find(|p| p.id == *id)?,
-                    nfs_game::shop::InstallRow::Spare(i) => c.career.spare_part(&c.tables, *i)?.0,
-                };
-                format!("{} {}", self.fe.strings.get(p.name_string_id).unwrap_or(""), p.kind_name)
-            }
-            // A `Parts.*` accessor **with** a modifier goes to vtable +0x14, and these two classes
-            // override it with a function that never looks at the modifier at all: 0x515D60 and
-            // 0x516BA0 both take the accessor's current row and answer
-            // `FEStrings[part->nameStringId + 0x1F4]` — the part's **description**, 500 ids above
-            // its name. So `Parts.InstallList(DESC)` is the description of the first installed
-            // part, and `DESC` could have been any word.
-            //
-            // `Parts.AllParts(DESC)` is not portable: its current row is **0**, a section header
-            // (§4.x), and 0x5152E0's header arms leave the fourth and fifth out-parameters
-            // untouched (0x5152EE, 0x515346), so 0x515DCA reads an uninitialised stack slot. The
-            // original's answer there is undefined; this port draws nothing.
-            "Parts.InstallList" => {
-                let c = self.career.as_ref()?;
-                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
-                let p = match c.career.install_list(&c.tables, idx).first()? {
-                    nfs_game::shop::InstallRow::Fitted(id) => c.tables.parts.iter().find(|p| p.id == *id)?,
-                    nfs_game::shop::InstallRow::Spare(i) => c.career.spare_part(&c.tables, *i)?.0,
-                };
-                self.fe.strings.get(p.name_string_id + 500)?.to_string()
             }
             // one cell of `locationsetup.lay`'s table. The modifier is `<row>TRACK<FIELD>`:
             // 0x4BA838 takes the leading digit as the row (the same shape the car-compare bars
@@ -523,6 +421,93 @@ impl App {
                 };
                 self.fe.strings.get(DIRECTION_OPTIONS[usize::from(b)])?.to_string()
             }
+            _ => return self.other_accessor(base, modifier),
+        })
+    }
+
+    /// `Parts.*`: the parts shop and the repair basket.
+    fn parts_accessor(&self, base: &str, modifier: &str) -> Option<String> {
+        let career = self.career.as_ref();
+        Some(match base {
+            // The two baskets' totals. `parts.lay` §19 watches `Parts.ShoppingList(TOTAL)` and
+            // `advancedrepair.lay` §24 `Parts.RepairShoppingList(TOTAL)`, and both accessors
+            // answer the same way: 0x516480 and 0x517500 compare the modifier against the literal
+            // **`TOTAL`** (0x5DCE04) and, on a match, print `this->slot6(modifier)` with
+            // **`"%d"`** (0x5CD1B0) — a bare number, no currency sign and no thousands commas.
+            // Slot 6 is the sum over the basket: 0x516500 for the shop (resale in, aged price
+            // out, so a basket of buys prints **negative**) and 0x517580 for the repair screen
+            // (each entry's replace cost 0x518900 or fix cost 0x518880 by its `[+4]` byte). An
+            // **empty** basket prints **`0`**, not nothing. Any other modifier answers null, which
+            // is `CANTFINDSTRING` in the original (§4.10) and nothing here.
+            //
+            // *(Corrected 2026-09-25: the repair total was taken from the `QUICKFIX.*` ticks —
+            // `repair.lay`'s sum 0x50F110 — which `advancedrepair.lay` has nothing to do with; and
+            // 0x518900 is the replace cost, 0x518880 the fix cost, not a price.)* §4.160.
+            "Parts.ShoppingList" if modifier == "TOTAL" => {
+                let c = career?;
+                format!("{}", c.career.shop_total(&c.tables, &self.fe.shop.basket))
+            }
+            "Parts.RepairShoppingList" if modifier == "TOTAL" => {
+                let c = career?;
+                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
+                format!("{}", c.career.repair_total(&c.tables, idx, &self.fe.shop.repair))
+            }
+            // A `Parts.*` accessor with **no** modifier: `FEAccessorWatch::tick` asks vtable +0x10
+            // (§4.10), which is the base's 0x4BC4E0 — `this->slot12([this+0x18])`, the text of the
+            // accessor's **current row**, and that index is 0 out of the constructor and nothing
+            // in this port moves it.
+            //
+            // For `Parts.AllParts` row 0 is the first section header (0x5152E0's `row == 0` arm),
+            // whose text is `FEStrings` 2550, "PARTS AVAILABLE FOR %s", with the car (0x5157A1).
+            // For `Parts.InstallList` slot 12 is 0x516B50: `"%s %s"` of the row's part name and
+            // its type name, so row 0 is the first row of the list 0x5166E0 builds — the car's
+            // parts but the body and the spares that fit it, in 0x49C350's order
+            // (`Career::install_list`). *(Until 2026-09-25 this was the first installed part.)*
+            "Parts.AllParts" if modifier.is_empty() => {
+                let c = self.career.as_ref()?;
+                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
+                let car = c.tables.car(c.career.garage.get(idx)?.car_id)?;
+                self.fe.strings.get(2550)?.replacen("%s", &car.display_name.to_string(), 1)
+            }
+            "Parts.InstallList" if modifier.is_empty() => {
+                let c = self.career.as_ref()?;
+                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
+                let p = match c.career.install_list(&c.tables, idx).first()? {
+                    nfs_game::shop::InstallRow::Fitted(id) => c.tables.parts.iter().find(|p| p.id == *id)?,
+                    nfs_game::shop::InstallRow::Spare(i) => c.career.spare_part(&c.tables, *i)?.0,
+                };
+                format!("{} {}", self.fe.strings.get(p.name_string_id).unwrap_or(""), p.kind_name)
+            }
+            // A `Parts.*` accessor **with** a modifier goes to vtable +0x14, and these two classes
+            // override it with a function that never looks at the modifier at all: 0x515D60 and
+            // 0x516BA0 both take the accessor's current row and answer
+            // `FEStrings[part->nameStringId + 0x1F4]` — the part's **description**, 500 ids above
+            // its name. So `Parts.InstallList(DESC)` is the description of the first installed
+            // part, and `DESC` could have been any word.
+            //
+            // `Parts.AllParts(DESC)` is not portable: its current row is **0**, a section header
+            // (§4.x), and 0x5152E0's header arms leave the fourth and fifth out-parameters
+            // untouched (0x5152EE, 0x515346), so 0x515DCA reads an uninitialised stack slot. The
+            // original's answer there is undefined; this port draws nothing.
+            "Parts.InstallList" => {
+                let c = self.career.as_ref()?;
+                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
+                let p = match c.career.install_list(&c.tables, idx).first()? {
+                    nfs_game::shop::InstallRow::Fitted(id) => c.tables.parts.iter().find(|p| p.id == *id)?,
+                    nfs_game::shop::InstallRow::Spare(i) => c.career.spare_part(&c.tables, *i)?.0,
+                };
+                self.fe.strings.get(p.name_string_id + 500)?.to_string()
+            }
+            _ => return self.other_accessor(base, modifier),
+        })
+    }
+
+    /// The car accessors — the garage, dealer, catalogue, used-car, merged, opponent and prize
+    /// lists, and the colour rows.
+    fn car_accessor(&self, base: &str, modifier: &str) -> Option<String> {
+        let menu = self.fe.menu.as_ref();
+        let career = self.career.as_ref();
+        Some(match base {
             // **`UsedCar.Car` on an empty lot is not an empty answer.** `FEOwnedCarAccessor`'s
             // modified text, slot 5 **0x4F6150**, takes the current car only when the index is inside the list
             // (0x4F6177 `cmp; jae`) and otherwise keeps a null car in `ebp`. Its first arm is
@@ -636,11 +621,43 @@ impl App {
                 Some(m) => m.cars2.get(m.car2_idx)?.display_name.to_string(),
                 None => return None,
             },
+            _ => return self.other_accessor(base, modifier),
+        })
+    }
+
+    /// `Game.*`: the race options.
+    fn game_accessor(&self, base: &str, modifier: &str) -> Option<String> {
+        let menu = self.fe.menu.as_ref();
+        Some(match base {
+            "Game.Damage" => {
+                let id = BOOL_OPTIONS[usize::from(menu?.damage)];
+                self.fe.strings.get(id).unwrap_or_default().to_string()
+            }
+            "Game.NumOpponents" => menu?.opponents.to_string(),
+            "Game.NumKOOpponents" => menu?.ko_opponents.to_string(),
+            "Game.Difficutly" => {
+                // the current row's text: `FEStrings[0x5D9F08[i]]` (`DIFFICULTY_OPTIONS`)
+                self.fe.strings.get(DIFFICULTY_OPTIONS[(menu?.difficulty as usize).min(2)])?.to_string()
+            }
             // an integer accessor, not a caption: 0x4E55B0 registers it with 0x4BA310 (range 0…0xC,
             // vtable 0x5B502C), whose text (slot 4 0x4BC4E0 → slot 12 0x4BA440) is
             // `sprintf("%d", min + index)` (0x5CD1B0, 0x4BA461) — "0" for a quick race. No layout
             // draws it. *(Until 2026-09-27: the port's own "QUICK RACE".)*
             "Game.GameType" => self.fe.game_type.to_string(),
+            _ => return self.other_accessor(base, modifier),
+        })
+    }
+
+    /// `Controller.*`: the device lists and the key-binding rows.
+    fn controller_accessor(&self, name: &str, base: &str, modifier: &str) -> Option<String> {
+        Some(match base {
+            "Controller.AllControllers" | "Controller.AllPads" => {
+                let pads_only = name == "Controller.AllPads";
+                let v: Vec<String> =
+                    self.gamepads.devices().into_iter().filter(|(_, is_pad)| !pads_only || *is_pad).map(|(n, _)| n).collect();
+                let sel = if pads_only { self.fe.pads_sel } else { self.fe.controllers_sel };
+                v.get(sel.min(v.len().saturating_sub(1))).map(|n| n.to_string()).unwrap_or_default()
+            }
             // the key-binding rows of `GameCtrl.lay` / `fluffctrl.lay`: `"keyboard %s"` over
             // 0x51C050's name for the row's key (`nfs_game::keyname`), and nothing for a binding of
             // kind 0 — what a row shows after 0x51DCC0 took its control for another (0x51C997).
@@ -661,8 +678,13 @@ impl App {
                     _ => text,
                 }
             }
-            // the options screens: the levels the port actually mixes with (`fe.txt`, 0..127)
-            // the CD player's now-playing line, and the sound-quality setting (`AUDIOQUALITY`)
+            _ => return self.other_accessor(base, modifier),
+        })
+    }
+
+    /// `CDPlayer.*`: the CD player's status, timing and title lines.
+    fn cd_player_accessor(&self, base: &str, modifier: &str) -> Option<String> {
+        Some(match base {
             // `FECDPlayerAccessor`'s `STATUS` is one of two strings: `FEStrings[0x2857]`
             // "playing..." while something is playing and `[0x2858]` "stopped." otherwise
             // (0x4BF0BA, 0x4BF0CE). The front end plays nothing, so it is the second.
@@ -704,15 +726,82 @@ impl App {
                 let (_, n) = table.get(self.fe.cd_title.min(table.len().checked_sub(1)?))?;
                 nfs_audio::music::split_title(n).0.to_string()
             }
-            "Audio.Quality" => self.snd.audio_settings.audio_quality.to_string(),
-            // the draw-distance setting, as the original's index into `0x5CE90C` = {0.5, .67, .83, 1}
-            "Graphics.ViewDistance" => {
-                let idx = [0.5f32, 0.67, 0.83, 1.0]
-                    .iter()
-                    .position(|v| (v - self.detail).abs() < 0.01)
-                    .unwrap_or(3);
-                idx.to_string()
+            _ => return self.other_accessor(base, modifier),
+        })
+    }
+
+    /// Every accessor outside the families above: the range and choice settings, the car-setup and
+    /// repair rows, a few singles, and a list accessor's own caption.
+    fn other_accessor(&self, base: &str, modifier: &str) -> Option<String> {
+        let career = self.career.as_ref();
+        Some(match base {
+            "Showcase.Text" => self.showcase_text(modifier.parse::<usize>().ok()?)?,
+            // a range setting the port has no other state for — the force-feedback volumes and
+            // the gamma — shows its number
+            // A range setting asked for as a per cent. `FEAccessor::text("PERCENT")` is
+            // 0x4BC558…0x4BC5F0: with a list of one entry or none it answers a flat **100**
+            // (0x4BC5D8), otherwise `index · 100 / (count − 1)` (0x4BC5A5…0x4BC5C1) **clamped at
+            // 100** (0x4BC5C7), printed with a bare `"%d"` — no per-cent sign. An int range's
+            // index is the value less its minimum and its count is `max − min + 1` (0x4BA329,
+            // 0x4BA34A), so this works out to `(v − min) · 100 / (max − min)`.
+            //
+            // The sign on screen is the layout's, not the accessor's: `audioreal.lay` carries five
+            // `text=%` labels beside its five `(PERCENT)` watches and `advgraphics.lay` one beside
+            // its one, so appending a `%` here printed it twice.
+            _ if modifier == "PERCENT" && RANGE_ACCESSORS.iter().any(|(n, ..)| *n == base) => {
+                let (v, lo, hi) = self.range_value(base)?;
+                if hi <= lo {
+                    "100".to_string()
+                } else {
+                    ((v - lo) * 100 / (hi - lo)).min(100).to_string()
+                }
             }
+            "FF.TotalVolume" | "FF.RoadVolume" | "FF.EngineVolume" | "FF.CollisionVolume"
+            | "FF.RoadGripVolume" | "Graphics.GammaCorrection" => self.range_value(base)?.0.to_string(),
+            // a multiple-choice setting: the text is the `FEStrings` entry its chosen index names
+            _ if CHOICE_ACCESSORS.iter().any(|(n, _, _)| *n == base) => {
+                let (i, options) = self.choice_index(base)?;
+                self.fe.strings.get(options[i])?.to_string()
+            }
+            // the car-compare screen's five numbers — `CarCompare.Data(<n>CarCompareCar<m>)`, the
+            // same source name its bars read (`fn compare_rating`)
+            // 0x50E94C prints it with **`"%02d"`** — a rating under ten reads `05`, not `5`
+            "CarCompare.Data" => format!("{:02}", self.compare_rating(modifier)?),
+            "Chronicle.Year" => self.chronicle_year().to_string(),
+            // the combo's own closed caption is its current row's text — `choice_rows`'
+            // real-mode list ([`App::resolution_list`]), not a hardcoded fake row (COVERAGE
+            // §14.6.3)
+            "Graphics.Resolutions" => {
+                let modes = self.resolution_list();
+                let sel = self.fe.resolution_sel.min(modes.len().saturating_sub(1));
+                modes.get(sel).map_or_else(String::new, |(w, h, d)| format!("{w} x {h} x {d}"))
+            }
+            // the car-setup screen: the 17 floats the original keeps on the car and reads back
+            // nowhere (`RE/notes/layouts.md`), so the port shows them and changes nothing
+            b if nfs_game::career::CAR_SETUP_NAMES.contains(&b) => {
+                let c = career?;
+                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
+                let k = nfs_game::career::CAR_SETUP_NAMES
+                    .iter()
+                    .position(|n| *n == b)?;
+                let v = c.career.garage.get(idx)?.setup[k];
+                // shown through the accessor's own index and format, not as the raw float —
+                // `career::car_setup_text` has the chain (0x4B9C10 → 0x4BC240 → 0x4B9AB0)
+                nfs_game::career::car_setup_text(k, v)
+            }
+            // the repair screen: what each category costs on the selected car (`RepairCost`
+            // 0x518880 per installed part, summed by the QUICKFIX screen 0x50F110)
+            b if b.starts_with("QUICKFIX.") => {
+                let c = career?;
+                let idx = c.car_sel.min(c.career.garage.len().saturating_sub(1));
+                let kinds = quickfix_kinds(&b["QUICKFIX.".len()..])?;
+                with_thousands(c.career.repair_cost(&c.tables, idx, kinds))
+            }
+            // `Audio.Quality` and `Graphics.ViewDistance` are rows of `CHOICE_ACCESSORS`, so the
+            // choice arm above answers them (the option's `FEStrings` row). The arms of their own
+            // that stood here — the quality as a bare number, the view distance as its index into
+            // `0x5CE90C` = {0.5, .67, .83, 1} — came after it and were never reached.
+            // the options screens: the levels the port actually mixes with (`fe.txt`, 0..127)
             "Audio.MusicLevel" => self.snd.audio_settings.music_level.to_string(),
             "Audio.SfxLevel" => self.snd.audio_settings.sfx_level.to_string(),
             "Audio.EngineLevel" => self.snd.audio_settings.engine_level.to_string(),

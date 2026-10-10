@@ -1,9 +1,12 @@
-//! The race-set-up menu (`Menu`) the `--fe`-less start and the front end's game-setup screens share.
+//! The race-set-up state (`Menu`, `fe.menu`) the front end's game-setup screens and the
+//! developer text menu (`debug_menu.rs`) share.
 
 use crate::*;
 
-/// Minimal frontend (M7 first cut): choose track and car, Enter starts the race.
-/// The original's `.lay`-driven screens are not reproduced yet; this uses the catalogue tables.
+/// The front end's race set-up: the catalogue lists the layout screens' accessors index (`tracks`,
+/// `looped`, `cars`, `cars2`, the knockout table) and the selections and options on them, which a
+/// launch reads (`race_setup.rs`). Its name is the M7 text menu's, which still draws and edits it
+/// behind `--debug-menu` (`debug_menu.rs`, with `row`, `mode` and `knockout_line`).
 pub(crate) struct Menu {
     /// 0 = quick race, 1 = evolution (career)
     pub(crate) mode: u8,
@@ -112,6 +115,44 @@ pub(crate) struct Menu {
 }
 
 impl Menu {
+    /// The text menu's copy of itself, kept aside while its race runs (`fe.menu_template`, handed
+    /// back by `leave_race`): every field cloned, the font **moved** out of this one.
+    pub(crate) fn race_template(&mut self) -> Menu {
+        let m = self;
+        Menu {
+            mode: m.mode,
+            tracks: m.tracks.clone(),
+            looped: m.looped.clone(),
+            tracks_year: m.tracks_year,
+            cars: m.cars.clone(),
+            cars2: m.cars2.clone(),
+            track_idx: m.track_idx,
+            car_idx: m.car_idx,
+            car_garage: m.car_garage,
+            merged_at_zero: m.merged_at_zero,
+            car2_idx: m.car2_idx,
+            ko: m.ko.clone(),
+            ko_sel: m.ko_sel,
+            opponents: m.opponents,
+            ko_opponents: m.ko_opponents,
+            damage: m.damage,
+            difficulty: m.difficulty,
+            opp_car: m.opp_car,
+            paint_idx: m.paint_idx,
+            paint_custom: m.paint_custom,
+            laps: m.laps,
+            traffic: m.traffic,
+            cops: m.cops,
+            backwards: m.backwards,
+            mirror: m.mirror,
+            circuits: m.circuits.clone(),
+            looped_idx: m.looped_idx,
+            knockout_line: m.knockout_line.clone(),
+            row: m.row,
+            font: m.font.take(),
+        }
+    }
+
     /// **The selected track, with the original's own out-of-range rule.** `FETrackAccessor`'s row
     /// getters all guard the index the same way — 0x4FA5A0, 0x4FA5E0 and 0x4FA620 each take the
     /// list's length as `(end − begin)/4` and, when the index is **not below** it, use **0**
@@ -270,193 +311,6 @@ impl Menu {
             k.set_direction(direction as usize);
             self.set_ko_row(i, k);
         }
-    }
-
-    pub(crate) fn rows(&self) -> u8 {
-        match self.mode {
-            0 | 4 | 5 => 10,
-            3 => 2,
-            _ => 4,
-        }
-    }
-
-    pub(crate) fn sprites(&self, career: Option<&CareerUi>) -> Vec<Sprite> {
-        let Some(f) = &self.font else {
-            return Vec::new();
-        };
-        let mut out = f.sprites(
-            "PORSCHE UNLEASHED  -  NATIVE",
-            [0.05, 0.08],
-            0.05,
-            [1.0, 1.0, 1.0, 1.0],
-        );
-        let sel = |r: u8| {
-            if self.row == r {
-                [1.0, 0.75, 0.1, 1.0]
-            } else {
-                [0.85, 0.85, 0.85, 1.0]
-            }
-        };
-        out.extend(f.sprites(
-            &format!(
-                "MODE    < {} >",
-                [
-                    "QUICK RACE",
-                    "EVOLUTION",
-                    "TOURNAMENT",
-                    "FACTORY DRIVER",
-                    "QUICK KNOCKOUT",
-                    "KNOCKOUT"
-                ][self.mode.min(5) as usize]
-            ),
-            [0.08, 0.15],
-            0.04,
-            sel(0),
-        ));
-        if (1..=3).contains(&self.mode) {
-            match career {
-                // career rows share the cursor: menu row 1 = tournament, row 2 = car
-                Some(c) => out.extend(c.sprites(f, (self.row > 0).then(|| self.row - 1))),
-                None => out.extend(f.sprites(
-                    "CAREER TABLES UNAVAILABLE",
-                    [0.08, 0.30],
-                    0.045,
-                    [0.85, 0.85, 0.85, 1.0],
-                )),
-            }
-            out.extend(f.sprites(
-                "UP/DOWN SELECT ROW   LEFT/RIGHT CHANGE   ENTER BUY / RACE   ESC QUIT",
-                [0.08, 0.85],
-                0.028,
-                [0.6, 0.6, 0.6, 1.0],
-            ));
-            return out;
-        }
-        if self.mode == 5 {
-            out.extend(f.sprites(&self.knockout_line, [0.08, 0.30], 0.045, sel(1)));
-        } else {
-            out.extend(f.sprites(
-                &format!("TRACK   < {} >", self.track().to_string()),
-                [0.08, 0.30],
-                0.045,
-                sel(1),
-            ));
-        }
-        let Some(c) = self.car() else { return Vec::new() };
-        out.extend(f.sprites(
-            &format!("CAR     < {} >", c.display_name.to_string()),
-            [0.08, 0.40],
-            0.045,
-            sel(2),
-        ));
-        let paint = c
-            .paint_sets
-            .get(self.paint_idx % c.paint_sets.len().max(1))
-            .map(|p| p.colours[0])
-            .unwrap_or([0xD4, 0x10, 0x10]);
-        out.extend(f.sprites(
-            &format!(
-                "PAINT   < {} / {} >",
-                self.paint_idx % c.paint_sets.len().max(1) + 1,
-                c.paint_sets.len()
-            ),
-            [0.08, 0.48],
-            0.045,
-            sel(3),
-        ));
-        out.extend(f.sprites(
-            "####",
-            [0.42, 0.48],
-            0.045,
-            [
-                paint[0] as f32 / 255.0,
-                paint[1] as f32 / 255.0,
-                paint[2] as f32 / 255.0,
-                1.0,
-            ],
-        ));
-        out.extend(f.sprites(
-            &format!("OPPONENTS  < {} >", if self.mode >= 4 { self.ko_opponents } else { self.opponents }),
-            [0.08, 0.545],
-            0.045,
-            sel(4),
-        ));
-        // `OpponentCar.Car`: FE strings 640..644, default "same car" (`modes.md` §1.1a)
-        out.extend(f.sprites(
-            &format!(
-                "THEY DRIVE < {} >",
-                nfs_game::opponents::OpponentChoice::from_index(self.opp_car as u32).label()
-            ),
-            [0.08, 0.602],
-            0.04,
-            sel(9),
-        ));
-        if self.mode == 4 {
-            out.extend(f.sprites(
-                &format!("LAPS    {}  (ONE CAR OUT PER LAP)", self.ko_opponents.max(1)),
-                [0.08, 0.66],
-                0.045,
-                sel(5),
-            ));
-        } else if self.mode == 5 {
-            out.extend(f.sprites(
-                &format!(
-                    "RACES   {}   LAPS < {} >   (LAST CAR OUT EACH RACE)",
-                    self.ko_opponents.max(1),
-                    self.laps
-                ),
-                [0.08, 0.66],
-                0.04,
-                sel(5),
-            ));
-        } else {
-            out.extend(f.sprites(
-                &format!("LAPS    < {} >", self.laps),
-                [0.08, 0.66],
-                0.045,
-                sel(5),
-            ));
-        }
-        // Track1.Direction ids 0x19A..0x19D: forward / backward / forward mirrored / backward mirrored
-        let dir = match (self.backwards, self.mirror) {
-            (false, false) => "FORWARD",
-            (true, false) => "BACKWARD",
-            (false, true) => "FORWARD MIRRORED",
-            (true, true) => "BACKWARD MIRRORED",
-        };
-        out.extend(f.sprites(
-            &format!("DIRECTION  < {dir} >"),
-            [0.08, 0.74],
-            0.045,
-            sel(6),
-        ));
-        // FE strings 403/402/401/400; the count is `_ftol(index · 2.5)` = 0/2/5/7 (`traffic.md` §1)
-        let density = ["NONE", "LIGHT", "MEDIUM", "HEAVY"][self.traffic.min(3) as usize];
-        out.extend(f.sprites(
-            &format!(
-                "TRAFFIC    < {density} >   ({} CARS)",
-                TRAFFIC_COUNT[self.traffic.min(3) as usize]
-            ),
-            [0.08, 0.80],
-            0.04,
-            sel(7),
-        ));
-        out.extend(f.sprites(
-            &format!(
-                "POLICE     < {} >",
-                if self.cops { "ON  (4 CARS)" } else { "OFF" }
-            ),
-            [0.08, 0.845],
-            0.04,
-            sel(8),
-        ));
-        out.extend(f.sprites(
-            "UP/DOWN SELECT ROW   LEFT/RIGHT CHANGE   ENTER START   ESC QUIT",
-            [0.08, 0.91],
-            0.026,
-            [0.6, 0.6, 0.6, 1.0],
-        ));
-        out
     }
 }
 

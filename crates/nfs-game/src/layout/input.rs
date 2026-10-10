@@ -283,9 +283,7 @@ impl LayoutScreen {
     /// start a drag instead — `combo_scroll_grab` / `combo_scroll_track` / `set_combo_scroll_pos`,
     /// called from `App::fe_left_button` the way `list_drag` already does for the list box's own
     /// scrollbar. `index` is the combo's flattened index (`combo_scroll_at`'s own), routed into an
-    /// embedded screen the same way every other combo method is — *(until this fix, a plain
-    /// `self.open_combo` here meant a nested panel's combo scrollbar never stepped at all; user
-    /// report's knob-drag gap was one symptom of the same missing routing)*.
+    /// embedded screen the same way every other combo method is — (history: `game-history.md` §32.1).
     pub fn combo_scroll_press(&mut self, index: usize, region: u32) -> bool {
         if let Some((k, j)) = self.route(index) {
             return self.groups.get_mut(&k).is_some_and(|g| g.combo_scroll_press(j, region));

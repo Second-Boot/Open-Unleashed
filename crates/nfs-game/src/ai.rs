@@ -14,10 +14,27 @@
 //! sorted this tick rather than at the end of the previous even tick (ties in registration order).
 
 use crate::race::{RaceProgress, SliceTable};
+use crate::track_id::{FamilyKey, TrackId};
 use glam::Vec3;
 use nfs_formats::ais::{AiCarData, RacingLine};
 use nfs_physics::specs::{CarSpecs, GRIP_DRY, GRIP_WET};
-use nfs_physics::vehicle::{Controls, Vehicle};
+use nfs_physics::vehicle::{Controls, RaceState, Vehicle};
+
+/// One car of the race-order array `0x5E8B88[]` directly ahead of an opponent, as the avoidance
+/// of 0x40BFE0 reads it ([`AiDriver::controls`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AheadCar {
+    /// The car's position (`o+0x330`, read live for an opponent).
+    pub position: Vec3,
+    /// Its slice.
+    pub slice: usize,
+    /// Its longitudinal speed (`o+0xD60`, read live for an opponent).
+    pub v_long: f32,
+    /// Its half width (`car+0x3A8`, the model box's).
+    pub half_width: f32,
+    /// Whether it is the human's car.
+    pub human: bool,
+}
 
 pub struct AiDriver {
     pub data: AiCarData,
@@ -75,6 +92,8 @@ pub struct AiDriver {
     /// `sim` tail 20 before the per-track steering factor is applied
     k_steer_base: f32,
     pub track: String,
+    /// [`track`](Self::track) parsed once by [`set_track`](Self::set_track)
+    track_id: Option<TrackId>,
     pub backwards: bool,
     /// Debug: slices ahead of the last steering target and its lateral offset from the centreline.
     pub dbg_n: i32,
@@ -100,11 +119,15 @@ pub struct AiDriver {
 /// | `monaco2` | `928` | 0.925 |
 /// | `monaco3` **backwards only** | `930T` `965T` | 1.10 |
 pub fn steer_factor(track: &str, family: &str, backwards: bool) -> f32 {
-    let is = |a: &str| family.eq_ignore_ascii_case(a);
-    let race = is("935") || is("GT1") || is("GT2") || is("GT3");
-    let track = track.to_ascii_lowercase();
-    match track.as_str() {
-        "autobahn" => {
+    steer_factor_for(TrackId::from_name(track), FamilyKey::from_name(family), backwards)
+}
+
+/// [`steer_factor`] for a track / family parsed once.
+fn steer_factor_for(track: Option<TrackId>, family: FamilyKey, backwards: bool) -> f32 {
+    use FamilyKey::*;
+    let race = family.is_race();
+    match track {
+        Some(TrackId::Autobahn) => {
             if race {
                 0.85
             } else {
@@ -112,35 +135,35 @@ pub fn steer_factor(track: &str, family: &str, backwards: bool) -> f32 {
             }
         }
         // monaco1 only has a table when it is driven backwards, and then it is the autobahn's
-        "monaco1" if backwards => {
+        Some(TrackId::Monaco1) if backwards => {
             if race {
                 0.85
             } else {
                 1.0
             }
         }
-        "castle" => {
+        Some(TrackId::Castle) => {
             if race {
                 0.80
-            } else if is("993T") || is("996T") {
+            } else if matches!(family, F993T | F996T) {
                 0.85
-            } else if is("993") || is("996") || is("boxster") {
+            } else if matches!(family, F993 | F996 | Boxster) {
                 0.90
             } else {
                 1.0
             }
         }
-        "monaco2" => {
+        Some(TrackId::Monaco2) => {
             if race {
                 0.85
-            } else if is("928") {
+            } else if family == F928 {
                 0.925
             } else {
                 1.0
             }
         }
-        "monaco3" if backwards => {
-            if is("930T") || is("965T") {
+        Some(TrackId::Monaco3) if backwards => {
+            if matches!(family, F930T | F965T) {
                 1.10
             } else {
                 1.0
@@ -156,16 +179,20 @@ pub fn steer_factor(track: &str, family: &str, backwards: bool) -> f32 {
 ///
 /// The two `alps` rows are the original's: 935 and GT2 drop to tier 1 **on that track only**
 /// (0x4A2C1F and 0x4A2C4B each guard their family's tier-1 exit with a second `strcmp`).
+#[cfg(test)]
 fn class_tier(family: &str, track: &str) -> u32 {
-    let f = family.to_ascii_uppercase();
-    let alps = track.eq_ignore_ascii_case("alps");
-    match f.as_str() {
-        "356" | "356A" | "356B" => 1,
-        "935" if alps => 1,
-        "GT2" if alps => 1,
-        "550A" | "928" | "930T" | "964" => 2,
-        "914" | "944" | "959" | "965T" => 3,
-        "993" | "993T" | "996" | "996T" | "GT2" | "GT3" | "BOXSTER" => 4,
+    class_tier_for(FamilyKey::from_name(family), TrackId::from_name(track) == Some(TrackId::Alps))
+}
+
+fn class_tier_for(family: FamilyKey, alps: bool) -> u32 {
+    use FamilyKey::*;
+    match family {
+        F356 | F356A | F356B => 1,
+        F935 if alps => 1,
+        Gt2 if alps => 1,
+        F550A | F928 | F930T | F964 => 2,
+        F914 | F944 | F959 | F965T => 3,
+        F993 | F993T | F996 | F996T | Gt2 | Gt3 | Boxster => 4,
         _ => 5,
     }
 }
@@ -182,49 +209,89 @@ fn class_tier(family: &str, track: &str) -> u32 {
 ///
 /// An unknown track returns **1.0** (0x4A45C5 hands back the argument slot 0x4A2E0E seeded with
 /// 1.0), which is also what the port did for every track before this was read.
+const CURVE_ROWS: [[f32; 5]; 14] = [
+    [1.175, 1.22, 1.275, 1.325, 1.5], // monaco1
+    [1.175, 1.2, 1.275, 1.325, 1.6],  // monaco2
+    [1.2, 1.225, 1.275, 1.325, 1.6],  // monaco3
+    [1.2, 1.2, 1.275, 1.325, 1.375],  // monaco4
+    [1.2, 1.2, 1.275, 1.325, 1.5],    // monaco5
+    [1.0, 1.15, 1.2, 1.2, 1.3],       // alps
+    [1.0, 1.1, 1.1, 1.2, 1.3],        // autobahn
+    [1.1, 1.1, 1.15, 1.15, 1.2],      // canyon
+    [1.0, 1.0, 1.05, 1.1, 1.1],       // castle
+    [1.1, 1.1, 1.2, 1.2, 1.3],        // coastal
+    [1.0, 1.0, 1.05, 1.1, 1.2],       // farmland
+    [1.2, 1.2, 1.25, 1.3, 1.4],       // foothills
+    [1.0, 1.0, 1.05, 1.15, 1.25],     // forest
+    [1.0, 1.0, 1.0, 1.0, 1.1],        // industrial
+];
+
+#[cfg(test)]
 fn curve_factor(track: &str, family: &str) -> f32 {
-    let tier = class_tier(family, track) as usize;
-    // tiers 1…5
-    let row: [f32; 5] = match track.to_ascii_lowercase().as_str() {
-        "monaco1" => [1.175, 1.22, 1.275, 1.325, 1.5],
-        "monaco2" => [1.175, 1.2, 1.275, 1.325, 1.6],
-        "monaco3" => [1.2, 1.225, 1.275, 1.325, 1.6],
-        "monaco4" => [1.2, 1.2, 1.275, 1.325, 1.375],
-        "monaco5" => [1.2, 1.2, 1.275, 1.325, 1.5],
-        "alps" => [1.0, 1.15, 1.2, 1.2, 1.3],
-        "autobahn" => [1.0, 1.1, 1.1, 1.2, 1.3],
-        "canyon" => [1.1, 1.1, 1.15, 1.15, 1.2],
-        "castle" => [1.0, 1.0, 1.05, 1.1, 1.1],
-        "coastal" => [1.1, 1.1, 1.2, 1.2, 1.3],
-        "farmland" => [1.0, 1.0, 1.05, 1.1, 1.2],
-        "foothills" => [1.2, 1.2, 1.25, 1.3, 1.4],
-        "forest" => [1.0, 1.0, 1.05, 1.15, 1.25],
-        "industrial" => [1.0, 1.0, 1.0, 1.0, 1.1],
-        _ => [1.0; 5],
-    };
+    curve_factor_for(TrackId::from_name(track), FamilyKey::from_name(family))
+}
+
+fn curve_factor_for(track: Option<TrackId>, family: FamilyKey) -> f32 {
+    let tier = class_tier_for(family, track == Some(TrackId::Alps)) as usize;
+    // tiers 1…5; a name that is not a track keeps the seeded 1.0
+    let row = track.map_or([1.0; 5], |t| CURVE_ROWS[t.index()]);
     row[tier - 1]
 }
 
 /// `monaco3` is the one track whose factor depends on the direction — its two ladders are at
 /// 0x4A311A (backwards) and 0x4A3258 (forwards).
+#[cfg(test)]
 fn curve_factor_dir(track: &str, family: &str, backwards: bool) -> f32 {
-    if backwards && track.eq_ignore_ascii_case("monaco3") {
-        let tier = class_tier(family, track) as usize;
+    curve_factor_dir_for(TrackId::from_name(track), FamilyKey::from_name(family), backwards)
+}
+
+fn curve_factor_dir_for(track: Option<TrackId>, family: FamilyKey, backwards: bool) -> f32 {
+    if backwards && track == Some(TrackId::Monaco3) {
+        // (the old call passed `track` here too: this track is not alps)
+        let tier = class_tier_for(family, false) as usize;
         return [1.15, 1.15, 1.2, 1.325, 1.6][tier - 1];
     }
-    curve_factor(track, family)
+    curve_factor_for(track, family)
 }
 
 impl AiDriver {
-    pub fn new(data: AiCarData, specs: &CarSpecs, sim_tail: &[f32; 22]) -> Self {
-        Self { data, bend_speed_base: [0.0; 40], grip_ratio: 1.0, k_lookahead: sim_tail[19], k_steer: sim_tail[20], k_steer_base: sim_tail[20], k_angle: sim_tail[21], stuck_ticks: 0, wrong_way: false, reset_why: None, target_speed: 0.0, skill_mean: [1.0; 4], skill_range: [0.0; 4], band: 0, skill: 0, catchup: None, last_node: None, link: None, preferred_segment: None, speed_factor: 1.0, shift_roll: None, pull_over: 0.0, wet: false, wf_div: 12.0, track: String::new(), backwards: false, dbg_n: 0, dbg_offset: 0.0, dbg_dot: 0.0, dbg_facing: 0.0 }
-            .tap(|d| {
-                // The curve factor is per track *and* per car class, so it cannot be applied here
-                // — `set_track` does it, over a pristine copy of the curve so that re-entering a
-                // track does not compound it.
-                d.bend_speed_base = d.data.bend_speed;
-                let _ = specs;
-            })
+    pub fn new(data: AiCarData, sim_tail: &[f32; 22]) -> Self {
+        Self {
+            // The curve factor is per track *and* per car class, so it cannot be applied here
+            // — `set_track` does it, over a pristine copy of the curve so that re-entering a
+            // track does not compound it.
+            bend_speed_base: data.bend_speed,
+            data,
+            grip_ratio: 1.0,
+            k_lookahead: sim_tail[19],
+            k_steer: sim_tail[20],
+            k_steer_base: sim_tail[20],
+            k_angle: sim_tail[21],
+            stuck_ticks: 0,
+            wrong_way: false,
+            reset_why: None,
+            target_speed: 0.0,
+            skill_mean: [1.0; 4],
+            skill_range: [0.0; 4],
+            band: 0,
+            skill: 0,
+            catchup: None,
+            last_node: None,
+            link: None,
+            preferred_segment: None,
+            speed_factor: 1.0,
+            shift_roll: None,
+            pull_over: 0.0,
+            wet: false,
+            wf_div: 12.0,
+            track: String::new(),
+            track_id: None,
+            backwards: false,
+            dbg_n: 0,
+            dbg_offset: 0.0,
+            dbg_dot: 0.0,
+            dbg_facing: 0.0,
+        }
     }
 
     /// Per-track road-width normaliser and speed zones (0x4A2DC0).
@@ -234,11 +301,13 @@ impl AiDriver {
         self.backwards = backwards;
         // `carSpecs[0x140] *= 0x4A2950(family)` (0x49CB16) — the steering factor is per track and
         // per car family, and 1.0 unless the table names the pair
-        self.k_steer = self.k_steer_base * steer_factor(track, family, backwards);
+        let (track_id, family_key) = (TrackId::from_name(track), FamilyKey::from_name(family));
+        self.track_id = track_id;
+        self.k_steer = self.k_steer_base * steer_factor_for(track_id, family_key, backwards);
         // …and `0x4A2DC0`'s return value scales the whole bend-speed curve (0x49CAF5)
         // — after the loader's rescale about the curve's floor: `mn = min(200, min f[24..64))`,
         // `f[i] = (f[i] − mn)·ratio + mn` (0x49CAD7), then the factor
-        let f = curve_factor_dir(track, family, backwards);
+        let f = curve_factor_dir_for(track_id, family_key, backwards);
         let mn = self.bend_speed_base.iter().fold(200.0f32, |m, &v| m.min(v));
         for (v, base) in self.data.bend_speed.iter_mut().zip(self.bend_speed_base.iter()) {
             *v = ((base - mn) * self.grip_ratio + mn) * f;
@@ -247,9 +316,7 @@ impl AiDriver {
 
     /// Speed estimate `car+0x35C = max(|vx|,|vz|) + 0.25·min(|vx|,|vz|)` used by the AI — of the
     /// **world** velocity `car+0x33C/+0x344` (0x49BEA9…0x49BF02), which is
-    /// [`Vehicle::horizontal_speed`]. *(Until the audit of 2026-09-26 this took the body-frame
-    /// components, which differ whenever the car is not heading along a world axis: the estimate
-    /// is not rotation-invariant.)*
+    /// [`Vehicle::horizontal_speed`]. (history: `game-history.md` §3.1)
     fn speed_est(v: &Vehicle) -> f32 {
         v.horizontal_speed()
     }
@@ -297,9 +364,7 @@ impl AiDriver {
     /// ```
     ///
     /// All three draws are the global stream `[0x5D1028]` (`crate::rng`), the one the branch
-    /// choice and `Car_simulate` pull from. *(Until this audit the port drew them from a per-car
-    /// LCG of its own — `0x19660/0x3C6EF35F` seeded by a slot hash, neither in the image — only on a
-    /// band change, and took the band value when `r <= SKILL[band]`: the opposite arm.)* With the
+    /// choice and `Car_simulate` pull from. (history: `game-history.md` §3.2) With the
     /// quick race's `SKILL* = 1.0` and ranges 0 every arm yields 1.0, so only the stream moves.
     fn update_speed_factor(&mut self, c3: f32) {
         let base = Self::skill_draw(self.skill_mean[3], self.skill_range[3]);
@@ -408,7 +473,7 @@ impl AiDriver {
             }
         }
         // per-track zone multiplier on the bend angle (0x4A2DC0 zones, ai.md §2.3)
-        let zone = crate::zones::zone_mult(&self.track, self.backwards, s0);
+        let zone = crate::zones::zone_mult_of(self.track_id, self.backwards, s0);
         let ang = ((max_l + max_r) * self.k_angle * zone).min(115.0);
         // the curve index is `fistp(ang · [0x5B2680])` (0x40BAA8…0x40BAB4), [0x5B2680] = 0.33333334
         // — rounded to nearest, not truncated: an angle of 13.6° reads f[24 + 5], not f[24 + 4]
@@ -454,9 +519,8 @@ impl AiDriver {
         vt
     }
 
-    /// Steering / throttle / brake 0x40BFE0. `ahead` = up to two cars directly ahead in race order:
-    /// (position, slice, v_long, half width, is_human).
-    pub fn controls(&mut self, table: &SliceTable, line: Option<&RacingLine>, race: &RaceProgress, v: &Vehicle, specs: &CarSpecs, tick: u64, ahead: &[(Vec3, usize, f32, f32, bool)], half_width: f32) -> Controls {
+    /// Steering / throttle / brake 0x40BFE0. `ahead` = up to two cars directly ahead in race order.
+    pub fn controls(&mut self, table: &SliceTable, line: Option<&RacingLine>, race: &RaceProgress, v: &Vehicle, specs: &CarSpecs, tick: u64, ahead: &[AheadCar], half_width: f32) -> Controls {
         let vt = self.target_speed(table, race, v, specs);
         self.target_speed = vt;
         let g = v.gear.max(2).min(specs.gear_slots - 1);
@@ -505,7 +569,7 @@ impl AiDriver {
         // avoidance (§10.2, CONFIRMED): racing cars stand off `t` metres from the centre of a car
         // beside or shortly ahead; the car two ahead is processed first, the car directly ahead last
         let no_avoid = crate::config::cfg().nfs_ai_noavoid.is_set();
-        for &(opos, _oslice, ovlong, ohalf, _human) in ahead.iter().take(if no_avoid { 0 } else { 2 }).rev() {
+        for &AheadCar { position: opos, v_long: ovlong, half_width: ohalf, .. } in ahead.iter().take(if no_avoid { 0 } else { 2 }).rev() {
             let dir = (target - v.position).normalize_or_zero();
             let d1 = opos - v.position;
             let along = d1.dot(dir);
@@ -520,16 +584,16 @@ impl AiDriver {
         // the finish states `car+0xB50` (0x40C5EE…0x40C850), after the avoidance and before the
         // steering byte: 2 (finished) holds the brake; 3 (knocked out) pulls over
         match v.race_state {
-            2 => {
+            RaceState::Finished => {
                 throttle = 0;
                 brake = 0xFF;
             }
-            3 => {
+            RaceState::Out => {
                 target = self.pull_over_target(table, s0, v);
                 throttle = 0;
                 brake = 0x28;
             }
-            _ => {}
+            RaceState::Racing => {}
         }
         let dir = (target - v.position).normalize_or_zero();
         let right = v.orientation.row(0);
@@ -546,7 +610,7 @@ impl AiDriver {
         // race has started, cleared otherwise — and cleared for a racing car (`car+0x52C & 1`,
         // every opponent) that has finished or is out, `car+0xB50 >= 2` (0x40C922…0x40C932).
         // Only the **alive** arm below reads it.
-        if v.v_long() < 2.0 && v.race_started && v.race_state < 2 {
+        if v.v_long() < 2.0 && v.race_started && v.race_state == RaceState::Racing {
             self.stuck_ticks += 1;
         } else {
             self.stuck_ticks = 0;
@@ -644,8 +708,7 @@ impl AiDriver {
         }
         if self.wrong_way {
             // `car+0xD8B = 0` at the next pass (0x40C946…0x40C952); the counter is not touched
-            // here — only the stuck arm clears it (0x40C9F1). *(The port used to clear it on the
-            // facing and dead-car arms too.)*
+            // here — only the stuck arm clears it (0x40C9F1). (history: `game-history.md` §3.3)
             self.wrong_way = false;
             true
         } else {
@@ -678,14 +741,6 @@ fn pull_over_target(table: &SliceTable, s0: usize, link: Option<usize>, bw: bool
     let lat_o = if bw { -sl.lateral } else { sl.lateral };
     sl.centre + lat_o.normalize_or_zero() * *offset
 }
-
-trait Tap: Sized {
-    fn tap(mut self, f: impl FnOnce(&mut Self)) -> Self {
-        f(&mut self);
-        self
-    }
-}
-impl<T> Tap for T {}
 
 #[cfg(test)]
 mod steer_factor_tests {
@@ -861,5 +916,50 @@ mod pull_over_tests {
         // the original's lateral is +x, so the point is 10 m to −x of the slice 10 ahead
         let s = t.add_graph(s0, 10, None);
         assert!((p - (t.slices[s].centre - Vec3::new(10.0, 0.0, 0.0))).length() < 1e-4, "{p}");
+    }
+}
+
+/// Refactor guard (written before the `TrackId` / `FamilyKey` refactor): the whole
+/// cross product track x family x direction through the public string APIs, hashed on the f32
+/// bits. Includes mixed case, an unknown track / family and the empty string.
+#[cfg(test)]
+mod track_family_table_pin {
+    use super::{curve_factor_dir, steer_factor};
+    use crate::zones::{width_divisor, zone_mult, zones_for};
+
+    pub const TRACKS: &[&str] = &[
+        "monaco1", "monaco2", "monaco3", "monaco4", "monaco5", "alps", "autobahn", "canyon", "castle", "coastal", "farmland", "foothills", "forest", "industrial",
+        "ALPS", "Castle", "MoNaCo3", "skidpad", "", "castle2", "forestx", "monaco6", "alp",
+    ];
+    pub const FAMILIES: &[&str] = &[
+        "356", "356A", "356B", "935", "GT1", "GT2", "GT3", "550A", "928", "930T", "964", "914", "944", "959", "965T", "993", "993T", "996", "996T", "boxster", "BOXSTER", "Boxster",
+        "gt2", "930t", "911", "", "xyz", "3560",
+    ];
+
+    pub fn fnv(h: &mut u64, bytes: &[u8]) {
+        for b in bytes {
+            *h = (*h ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    #[test]
+    fn the_track_family_tables_are_pinned() {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for t in TRACKS {
+            for f in FAMILIES {
+                for back in [false, true] {
+                    fnv(&mut h, &steer_factor(t, f, back).to_bits().to_le_bytes());
+                    fnv(&mut h, &curve_factor_dir(t, f, back).to_bits().to_le_bytes());
+                }
+            }
+            fnv(&mut h, &width_divisor(t).to_bits().to_le_bytes());
+            for back in [false, true] {
+                fnv(&mut h, &(zones_for(t, back).len() as u32).to_le_bytes());
+                for s in 0..3000usize {
+                    fnv(&mut h, &zone_mult(t, back, s).to_bits().to_le_bytes());
+                }
+            }
+        }
+        assert_eq!(h, 13469399165449465643, "pinned hash of the track / family tables");
     }
 }

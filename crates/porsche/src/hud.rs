@@ -12,17 +12,17 @@ mod race;
 /// (Boxster/996 records `−φ − 90°`, HYPOTHESIS on the projection sign), texts in `UniversC12b`.
 /// Not reproduced: translucent trays, slide-in, track map, mirror.
 /// The in-race trays' strings, each fetched from `FEStrings` by the element that draws it.
-pub(crate) struct HudText {
+pub(crate) struct HudText<'a> {
     /// `HSpeed` 0x42E570: the value and FE 11 "km/h" / FE 20 "mph"
     pub(crate) speed: String,
-    pub(crate) speed_label: String,
+    pub(crate) speed_label: &'a str,
     /// `HGear` 0x421CB0: FE 18145 "R" / 18146 "N" / "1"…"7", under FE 10 "gear"
-    pub(crate) gear: String,
-    pub(crate) gear_label: String,
+    pub(crate) gear: &'a str,
+    pub(crate) gear_label: &'a str,
     /// `HTime` 0x4317B0: FE 18 "time"
-    pub(crate) time_label: String,
+    pub(crate) time_label: &'a str,
     /// `HWrongWay` 0x436FD7: FE 18159 "WRONG WAY"
-    pub(crate) wrong_way: String,
+    pub(crate) wrong_way: &'a str,
     /// `SPEEDOMETER` / `HUDTACHOMETER` (0 off, 1 digital, 2 analog) and `GEAR` (0 off, 1 on): the
     /// analog dials draw only on 2 (0x41E940 / 0x41E960), `HSpeed` only on 1 (0x41E920), `HGear`
     /// only on 1 (0x41E900); `fe.txt` ships 2, 2, 1. The digital tachometer (`HTachDigital`, 1 —
@@ -31,7 +31,7 @@ pub(crate) struct HudText {
     pub(crate) tachometer: usize,
     pub(crate) gear_on: bool,
     /// `HTachDigital` 0x42F740: FE 18144 "rpm"
-    pub(crate) rpm_label: String,
+    pub(crate) rpm_label: &'a str,
     /// `HTach`'s needle scale `[+0xA9D0] = (R − 750) / R`, `R = car+0xEE0 = ftol(carSpecs+0x94)` the
     /// redline (0x406EF0 / 0x42F50F…0x42F52C)
     pub(crate) tach_scale: f32,

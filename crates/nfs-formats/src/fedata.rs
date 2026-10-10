@@ -215,10 +215,7 @@ pub fn parse_car_catalog(data: &[u8]) -> Result<Vec<CarCatalogEntry>, FormatErro
             }
             let package = crate::u32_le(r, o, "nfs5.car paint package")?;
             let c = |k: usize| [r[o + 4 + k * 4 + 1], r[o + 4 + k * 4 + 2], r[o + 4 + k * 4 + 3]];
-            let packed = |k: usize| {
-                let b = &r[o + 4 + k * 4..o + 8 + k * 4];
-                u32::from_be_bytes([b[0], b[1], b[2], b[3]])
-            };
+            let packed = |k: usize| crate::bytes::read_u32_be(r, o + 4 + k * 4);
             paint_sets.push(PaintSet { package, colours: [c(0), c(1), c(2)], packed: [packed(0), packed(1), packed(2)] });
         }
         let n_int = u16_le(r, 0x528, "nfs5.car interior count")? as usize;
@@ -328,4 +325,33 @@ mod dial_tests {
         assert_eq!(s.screen_cw_deg(-5), s.screen_cw_deg(0));
         assert_eq!(s.screen_cw_deg(999), s.screen_cw_deg(299));
     }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    /// Characterisation guard: two records of a deterministic byte pattern with sane counts, the
+    /// whole parse output hashed (covers the paint sets' big-endian packed colours).
+    #[test]
+    fn catalog_parse_output_is_pinned() {
+        let mut d = vec![0u8; CAR_RECORD_SIZE * 2];
+        for (i, b) in d.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(197) ^ (i >> 5)) as u8;
+        }
+        for r in 0..2 {
+            let base = r * CAR_RECORD_SIZE;
+            d[base + 0x3E6..base + 0x3E8].copy_from_slice(&(5u16 + r as u16 * 30).to_le_bytes());
+            d[base + 0x528..base + 0x52A].copy_from_slice(&(7u16 + r as u16).to_le_bytes());
+            d[base + 0x3BC..base + 0x3BE].copy_from_slice(&3u16.to_le_bytes());
+            d[base + 0x32E..base + 0x330].copy_from_slice(&4u16.to_le_bytes());
+        }
+        let cars = parse_car_catalog(&d).unwrap();
+        assert_eq!(cars.len(), 2);
+        let h = format!("{cars:?}").bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+        assert_eq!(h, PIN);
+        assert!(matches!(parse_car_catalog(&d[..CAR_RECORD_SIZE + 3]), Err(FormatError::SizeMismatch { what: "nfs5.car", declared: CAR_RECORD_SIZE, actual: 3 })));
+    }
+
+    const PIN: u64 = 1724816995285911392;
 }

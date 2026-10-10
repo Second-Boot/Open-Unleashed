@@ -1,6 +1,7 @@
 //! The stages of `start_race`, split out as plain moves (no change of order or content): the race audio load, the grid and the cars, and the sprite / particle pools. The `race_loading_frame` steps stay in `start_race`, between them.
 
 use crate::*;
+use nfs_game::world::CarUpload;
 
 impl App {
     /// Stage "audio" — steps 6 → 7 of the load: the output, the engine, the ambience, the banks, the speech and the race music.
@@ -447,12 +448,14 @@ impl App {
                         &self.paths,
                         1,
                         paint,
-                        car_env,
-                        self.track.is_night(),
-                        // `.CABRIODOWN` 0x24B: 0 for every car but a player's (0x4EEF0C), whose own
-                        // machine sent `Car.Roof` through 0x4F1E40's predicate
-                        Some(seat_rec.and_then(|r| r.num(nfs_net::launchcar::id::CABRIODOWN)).unwrap_or(0)),
-                        self.skidpad_rule(),
+                        CarUpload {
+                            env: car_env,
+                            night: self.track.is_night(),
+                            // `.CABRIODOWN` 0x24B: 0 for every car but a player's (0x4EEF0C), whose own
+                            // machine sent `Car.Roof` through 0x4F1E40's predicate
+                            race_roof: Some(seat_rec.and_then(|r| r.num(nfs_net::launchcar::id::CABRIODOWN)).unwrap_or(0)),
+                            skidpad: self.skidpad_rule(),
+                        },
                     ) else {
                         continue;
                     };
@@ -558,7 +561,7 @@ impl App {
                     self.road.opponent_models.push(model);
                     let controller = match CarAssets::load_ais(&self.paths, &entry.model) {
                         Ok(ais) => {
-                            let mut d = nfs_game::ai::AiDriver::new(ais, &specs, &sim.unknown_tail);
+                            let mut d = nfs_game::ai::AiDriver::new(ais, &sim.unknown_tail);
                             d.grip_ratio = grip_ratio;
                             // the family key `nfs5.car` +0x115 the steering table is keyed on
                             d.set_track(&self.track.name, self.backwards, &entry.sim_family);
@@ -720,10 +723,7 @@ impl App {
                                     &self.paths,
                                     1,
                                     paint,
-                                    car_env,
-                                    self.track.is_night(),
-                                    Some(0),
-                                    self.skidpad_rule(),
+                                    CarUpload { env: car_env, night: self.track.is_night(), race_roof: Some(0), skidpad: self.skidpad_rule() },
                                 ) {
                                     Ok(m) => m,
                                     Err(e) => {
@@ -904,10 +904,7 @@ impl App {
                                         &self.paths,
                                         1,
                                         paint,
-                                        car_env,
-                                        self.track.is_night(),
-                                        Some(0),
-                                        self.skidpad_rule(),
+                                        CarUpload { env: car_env, night: self.track.is_night(), race_roof: Some(0), skidpad: self.skidpad_rule() },
                                     ) else {
                                         continue;
                                     };

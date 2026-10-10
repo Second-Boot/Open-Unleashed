@@ -54,7 +54,8 @@ impl Vehicle {
         if self.engine_alive != 0 {
             self.engine_alive += 1;
         }
-        let dead = self.engine_alive == 0 || (!self.ai_driven && self.race_state >= 2);
+        // (`>= 2` over the three states 0 / 2 / 3 = not racing)
+        let dead = self.engine_alive == 0 || (!self.ai_driven && self.race_state != RaceState::Racing);
         (self.throttle_byte, self.brake_byte) = if dead || self.engine_alive < 0x40 {
             (0, 0xFF)
         } else if !self.race_started {
@@ -159,7 +160,7 @@ impl Vehicle {
             self.requested_gear = 2;
             return;
         }
-        if self.requested_gear != self.gear || self.race_state != 0 {
+        if self.requested_gear != self.gear || self.race_state != RaceState::Racing {
             self.reverse_latch = false;
             return;
         }
@@ -419,7 +420,17 @@ impl Vehicle {
         // nearly always. A fourth disjunct, `DB8 == 1 && ignitionCut == 0` (0x49EA76), is dead:
         // 0x49E849 cleared `DB8` at the top of this very call and nothing in the image writes 1.
         let clutch = (slip > 250.0 && self.shift_timer == 0 && gear != 1) || (gear > 1 && vz < -0.1) || (gear == 0 && vz > 0.1);
-        self.engine_arm = if clutch { 1 } else if diff < 0.0 { 2 } else if diff == 0.0 { 3 } else if misfire { 4 } else { 5 };
+        self.engine_arm = if clutch {
+            EngineArm::Clutch
+        } else if diff < 0.0 {
+            EngineArm::Overrun
+        } else if diff == 0.0 {
+            EngineArm::AtTarget
+        } else if misfire {
+            EngineArm::Misfire
+        } else {
+            EngineArm::Driving
+        };
         if clutch {
             // `allow`, 0x49EA91…0x49EB44: the most the revs may fall this tick. The loads are the
             // wheels' grip limits `+0xAC` (the wheel block is at `car+0x7B8`, so wheel 0's is

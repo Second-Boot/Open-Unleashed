@@ -146,7 +146,7 @@ impl LayoutScreen {
                     self.text(out, aspect, f, t, px, ry + 2.0, rect_w, 1, tint(text_c));
                     let bevel_y = if matches!(row, ListRow::GroupHeading(_)) { ry + 1.0 } else { ry };
                     let bevel_h = if matches!(row, ListRow::GroupHeading(_)) { 12.0 } else { PART_HEADER_H };
-                    self.bevel_heading(out, aspect, px, bevel_y, rect_w, bevel_h, 2.0);
+                    self.bevel_heading(out, aspect, FeRect::new(px, bevel_y, rect_w, bevel_h), 2.0);
                 }
                 ListRow::Columns(_) | ListRow::Racer(..) => {}
             }
@@ -209,7 +209,8 @@ impl LayoutScreen {
     /// luminance**, because 0x4D8900 is an HLS→RGB (§4.66) — 0.5 each out of the factory
     /// (0x4C38B9). The port moves them from the pointer exactly as the class's three mouse slots
     /// do, so the editor is live.
-    pub(super) fn color_picker(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32, tint: impl Fn([u8; 4]) -> [f32; 4]) {
+    pub(super) fn color_picker(&self, out: &mut Vec<Sprite>, aspect: f32, rect: FeRect, tint: impl Fn([u8; 4]) -> [f32; 4]) {
+        let FeRect { x, y, w, h } = rect;
         let (l, t, r, b) = (x, y, x + w, y + h);
         let rects = picker_rects(l, t, r, b);
         let region = self.cursor.map(|(cx, cy)| picker_region(&rects, cx, cy)).unwrap_or(5);
@@ -281,9 +282,9 @@ impl LayoutScreen {
             // pressed takes the bevel (0x4C4414, 0x4C4603) and anything else the inset
             // highlight (0x4C446B, 0x4C465A) — the same two-arm tail every button here has
             if on {
-                self.bevel(out, aspect, ex0, ey0, ex1 - ex0, ey1 - ey0, 3.0);
+                self.bevel(out, aspect, FeRect::new(ex0, ey0, ex1 - ex0, ey1 - ey0), 3.0);
             } else {
-                self.glass(out, aspect, ex0, ey0, ex1 - ex0, ey1 - ey0, &tint);
+                self.glass(out, aspect, FeRect::new(ex0, ey0, ex1 - ex0, ey1 - ey0), &tint);
             }
             outline(out, ex0, ey0, ex1 - ex0, ey1 - ey0, black);
         }
@@ -310,8 +311,7 @@ impl LayoutScreen {
     /// `[this+0x1DE]` is set, which is `NFS5.ColorBox` alone (§4.44): the widget asks its accessor
     /// for the index it calls custom (`0x4B94B0`: `row == accessor->[+0x24]()`, the colour count —
     /// a function-pointer member, not a vtable slot) and opens the editor when the row just chosen
-    /// **is** that one, the `custom...` row of the list (§4.171). *(Until 2026-09-27 the port
-    /// opened the editor on the click that opens the list — an approximation retired here.)*
+    /// **is** that one, the `custom...` row of the list (§4.171). (history: `game-history.md` §25.1)
     /// **`data.allowcustom` decides whether there is a custom colour to open at all.** The bind
     /// 0x4C3BF0 hands it to the colour accessor at `[this+0x220]` through 0x4B9590, which is one
     /// instruction — `[accessor+0x30] = flag` — and the accessor's own count reads that byte

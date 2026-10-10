@@ -3,6 +3,7 @@
 //! 6.0 m apart along the road; `SimT` gives the slice count per section (main lap first).
 
 use glam::{Mat3, Vec3};
+use nfs_formats::bytes::{read_f32, read_u32};
 use nfs_formats::crp::{Crp, CrpEntry};
 use nfs_formats::scn::{ElementKind, Scene};
 
@@ -75,8 +76,8 @@ impl SliceTable {
         if bytes.len() < n * 80 {
             return Err(format!("SimD: {} bytes for {n} slices", bytes.len()));
         }
-        let f = |o: usize| f32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
-        let u = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+        let f = |o: usize| read_f32(bytes, o);
+        let u = |o: usize| read_u32(bytes, o);
         let v3 = |o: usize| Vec3::new(f(o), f(o + 4), f(o + 8));
         let mut slices = Vec::with_capacity(n);
         for i in 0..n {
@@ -98,7 +99,7 @@ impl SliceTable {
         let counts: Vec<usize> = match crp.level.iter().find(|e| e.is_level(b"SimT")) {
             Some(e) => {
                 let d = crp.entry_data(data, e).map_err(|x| x.to_string())?;
-                d.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize).collect()
+                d.chunks_exact(4).map(|c| read_u32(c, 0) as usize).collect()
             }
             None => vec![n],
         };
@@ -1134,7 +1135,7 @@ pub struct RacerResult {
 /// is, and only ∞ / NaN / an overflow (≥ 2³¹) give the integer indefinite 0x80000000. The time
 /// formatter 0x4356E0 prints the absolute value (with a sign only when its flag is set, which
 /// none of the race-result printers sets — [`nfs_game::records::format_time_dword`]).
-/// *(Until 2026-09-30 the port folded a negative or indefinite result into 0, "no time".)*
+/// (history: `game-history.md` §6.1)
 fn fistp_time(v: f32) -> i32 {
     let r = v.round_ties_even();
     if r.is_finite() && (-2_147_483_648.0..2_147_483_648.0).contains(&r) { r as i32 } else { i32::MIN }
@@ -1151,9 +1152,7 @@ fn fistp_time(v: f32) -> i32 {
 /// ```
 ///
 /// The stack juggling at 0x416BE5…0x416BF7 is what makes a car that has hardly moved come out at
-/// `NUM_LAPS · 250000` ticks, not at a scaled-up ratio. *(Until 2026-09-26 the port had
-/// `ratio *= 250000` and then `elapsed / ratio`, measured `elapsed` to the current tick rather than
-/// to `+0xB14`, took the finish fraction as 1.0 and truncated.)*
+/// `NUM_LAPS · 250000` ticks, not at a scaled-up ratio. (history: `game-history.md` §6.2)
 pub fn projected_ratio(progress: f32, start: f32, finish: f32, tick: u64, num_laps: u32) -> i32 {
     let mut num = progress as f64 - start as f64;
     if num <= 0.001f32 as f64 {

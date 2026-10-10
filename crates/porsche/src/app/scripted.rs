@@ -642,6 +642,460 @@ pub(crate) enum ScriptedHudKey {
 }
 
 impl App {
+    /// **TEST GLUE, the start of a tick's car work**: the diagnostic placements `NFS_SMACK_DRIVE`,
+    /// `NFS_PHANTOM_DRIVE`, `NFS_CONE_DRIVE`, `NFS_NET_RAM` and `NFS_NET_RAM_PROP`, which set a car
+    /// down short of a prop, a point, a cone or a traffic car. Moved out of [`Self::simulate`] verbatim:
+    /// it runs between the same two statements (after the exchange registration, before the 32 Hz
+    /// block's `v.race_started = …`), and `simulate` borrows the car and the world only after it.
+    pub(crate) fn apply_tick_glue(&mut self, exchange_in: Option<&ExchangeIn>) {
+        let Some(v) = self.vehicle.as_mut() else { return };
+        let Some(w) = self.world.as_ref() else { return };
+        // diagnostic: `NFS_SMACK_DRIVE=k` sets the player's car down 6 m short of the track's k-th
+        // smackable (`TrackWorld::track_smackable`, `[WTrack+0x34]` order less the mission's) on
+        // game tick 600, heading at it at 12 m/s — to see a hit, its player's start and its burst
+        // (`RUST_LOG=nfs_game=debug`); with `NFS_SMACK_VIEW=k` the camera watches the prop
+        if self.tick == 600
+            && let Some(k) = nfs_game::config::cfg().nfs_smack_drive.as_str().and_then(|v| v.parse::<usize>().ok())
+            && let Some((article, pos, _)) = w.track_smackable(k)
+        {
+            let to = Vec3::new(pos.x - v.position.x, 0.0, pos.z - v.position.z).normalize_or(Vec3::Z);
+            v.place_at_trigger(&w.collision, &self.specs, pos - to * 6.0 + Vec3::Y * 0.5, to);
+            v.velocity = to * 12.0;
+            tracing::info!(target: "porsche::app::simulate", k, article, ?pos, "NFS_SMACK_DRIVE: the car set at the smackable");
+        }
+        // diagnostic: `NFS_PHANTOM_DRIVE=x,y,z,hx,hz[@t]` sets the player's car down 8 m short of the
+        // world point (x, y, z), heading (hx, hz) at 12 m/s on game tick `t` (default 600) — to drive
+        // into a place whose collision geometry is in question (the `--record` csv shows a stop)
+        if let Some((p, t)) = nfs_game::config::cfg().nfs_phantom_drive.as_str().and_then(|s| {
+            let (list, t) = match s.split_once('@') {
+                Some((l, t)) => (l, t.trim().parse::<u64>().ok()?),
+                None => (s, 600),
+            };
+            let n: Vec<f32> = list.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            (n.len() == 5).then_some((n, t))
+        }) && self.tick == t
+        {
+            let to = Vec3::new(p[3], 0.0, p[4]).normalize_or(Vec3::Z);
+            let at = Vec3::new(p[0], p[1], p[2]);
+            v.place_at_trigger(&w.collision, &self.specs, at - to * 8.0 + Vec3::Y * 0.5, to);
+            v.velocity = to * 12.0;
+            tracing::info!(target: "porsche::app::simulate", ?at, ?to, "NFS_PHANTOM_DRIVE: the car set short of the point");
+        }
+        // diagnostic: `NFS_CONE_DRIVE=k` does the same with the mission scene's k-th cone, to see
+        // the HUD's cone count move (the scripted run then draws a frame every other tick);
+        // `k@t` on game tick `t` instead of 600
+        let cone_drive = nfs_game::config::cfg().nfs_cone_drive.as_str().and_then(|v| match v.split_once('@') {
+            Some((k, t)) => Some((k.trim().parse::<usize>().ok()?, t.trim().parse::<u64>().ok()?)),
+            None => Some((v.trim().parse::<usize>().ok()?, 600)),
+        });
+        if let Some((k, at)) = cone_drive
+            && self.tick == at
+            && let Some(pos) = self.skill.as_ref().and_then(|sk| sk.cones.get(k)).map(|c| c.position)
+        {
+            let to = Vec3::new(pos.x - v.position.x, 0.0, pos.z - v.position.z).normalize_or(Vec3::Z);
+            v.place_at_trigger(&w.collision, &self.specs, pos - to * 6.0 + Vec3::Y * 0.5, to);
+            v.velocity = to * 12.0;
+            tracing::info!(target: "porsche::app::simulate", k, ?pos, "NFS_CONE_DRIVE: the car set at the cone");
+        }
+        // **Test glue** (`NFS_NET_RAM=<race index>@<tick>[,…]`, set on every machine, an even tick): in an
+        // input-exchange race that human car is set down 6 m behind the traffic car nearest to it, on that
+        // car's heading, closing at 15 m/s over its speed — a contact with the traffic car the two-instance
+        // runs would not otherwise reach (`network.md` §11.20). Every machine does it to the same car on
+        // the same tick from the same (shared) traffic state, so the runs' dumps stay comparable.
+        if self.tick % 2 == 0
+            && let Some(x) = exchange_in.as_ref()
+            && let Some(list) = nfs_game::config::cfg().nfs_net_ram.as_str()
+            && let Some(t) = self.road.traffic.as_ref()
+        {
+            for (idx, at) in list.split(',').filter_map(|e| e.split_once('@').and_then(|(i, t)| Some((i.trim().parse::<u32>().ok()?, t.trim().parse::<u64>().ok()?)))) {
+                if at != self.tick {
+                    continue;
+                }
+                let (from, seat) = if idx == x.local_index {
+                    (v.position, None)
+                } else if let Some(e) = x.seats.iter().find(|e| e.1 == idx) {
+                    (self.road.opponents.get(e.0).map_or(v.position, |o| o.vehicle.position), Some(e.0))
+                } else {
+                    continue;
+                };
+                let Some(c) = t.cars.iter().filter(|c| c.active).min_by(|a, b| a.position.distance(from).total_cmp(&b.position.distance(from))) else { continue };
+                let dir = Vec3::new(c.velocity.x, 0.0, c.velocity.z).try_normalize().unwrap_or_else(|| Vec3::new(c.orientation.z_axis.x, 0.0, c.orientation.z_axis.z).normalize_or(Vec3::Z));
+                let at_pos = c.position - dir * 6.0 + Vec3::Y * 0.5;
+                let speed = c.velocity.length() + 15.0;
+                match seat {
+                    None => {
+                        v.place_at_trigger(&w.collision, &self.specs, at_pos, dir);
+                        v.velocity = dir * speed;
+                    }
+                    Some(k) => {
+                        if let Some(o) = self.road.opponents.get_mut(k) {
+                            o.vehicle.place_at_trigger(&w.collision, &o.specs, at_pos, dir);
+                            o.vehicle.velocity = dir * speed;
+                        }
+                    }
+                }
+                tracing::info!(target: "netplay", race_index = idx, tick = self.tick, traffic_at = ?c.position, "NFS_NET_RAM: the human car set behind the traffic car");
+            }
+        }
+        // **Test glue** (`NFS_NET_RAM_PROP=<race index>@<tick>:<k>[,…]`, every machine, an even tick): the same
+        // for the track's k-th smackable — that human car set down 6 m short of it, heading at it at 12 m/s
+        // (`NFS_SMACK_DRIVE`'s placement, for any car of an exchange race), so that two cars can reach one
+        // prop on one tick and the smackables' walk order (0x4A17F0, race-index order) shows
+        if self.tick % 2 == 0
+            && let Some(x) = exchange_in.as_ref()
+            && let Some(list) = nfs_game::config::cfg().nfs_net_ram_prop.as_str()
+        {
+            for (idx, at, k) in list.split(',').filter_map(|e| {
+                let (i, rest) = e.split_once('@')?;
+                let (t, k) = rest.split_once(':')?;
+                Some((i.trim().parse::<u32>().ok()?, t.trim().parse::<u64>().ok()?, k.trim().parse::<usize>().ok()?))
+            }) {
+                let Some((article, pos, _)) = w.track_smackable(k) else { continue };
+                if at != self.tick {
+                    continue;
+                }
+                let seat = if idx == x.local_index { None } else if let Some(e) = x.seats.iter().find(|e| e.1 == idx) { Some(e.0) } else { continue };
+                let from = seat.and_then(|k| self.road.opponents.get(k)).map_or(v.position, |o| o.vehicle.position);
+                let to = Vec3::new(pos.x - from.x, 0.0, pos.z - from.z).normalize_or(Vec3::Z);
+                match seat {
+                    None => {
+                        v.place_at_trigger(&w.collision, &self.specs, pos - to * 6.0 + Vec3::Y * 0.5, to);
+                        v.velocity = to * 12.0;
+                    }
+                    Some(k) => {
+                        if let Some(o) = self.road.opponents.get_mut(k) {
+                            o.vehicle.place_at_trigger(&w.collision, &o.specs, pos - to * 6.0 + Vec3::Y * 0.5, to);
+                            o.vehicle.velocity = to * 12.0;
+                        }
+                    }
+                }
+                tracing::info!(target: "netplay", race_index = idx, tick = self.tick, article, ?pos, "NFS_NET_RAM_PROP: the human car set at the smackable");
+            }
+        }
+    }
+
+    /// **The scripted run** (`--autotest <secs>`, the diagnostic runs and the fixtures' races): the race run in a loop of
+    /// one-tick iterations instead of the window's frames, with the `NFS_*` test glue the windowed frame does not have
+    /// (the held scripted pause, the network leave, the pace, the drawn frames of `NFS_SMACK_DRIVE`, the stops, the
+    /// traces), then the race's end as the interactive path files it. Moved out of `start_race` unchanged; the end of
+    /// each iteration is [`Self::race_frame_epilogue`], the windowed frame's own. `true` when `start_race` must return
+    /// (the run ended the program, left for the front end or started another race), `false` to go on to the screenshot.
+    pub(crate) fn run_scripted_race(&mut self, secs: f32, event_loop: &ActiveEventLoop) -> bool {
+        let ticks = (secs * TICKS_PER_SEC_F32) as u32;
+        // diagnostic: with `NFS_SMACK_DRIVE` the scripted run draws a frame every other tick,
+        // so the draw's side of a struck smackable (its player's sample, its record's `+8`,
+        // the burst) runs as in a windowed race
+        // — and with `NFS_FX_FRAMES`, so the cars' effects (driven by each drawn frame,
+        // `nfs_game::car_effects`) run as in a windowed race
+        let smack_frames = nfs_game::config::cfg().nfs_smack_drive.is_set() || nfs_game::config::cfg().nfs_cone_drive.is_set() || nfs_game::config::cfg().nfs_fx_frames.is_set();
+        let mut pause_hold = 0;
+        // **TEST GLUE** (not in the original): `NFS_NET_PACE=1` holds a scripted network race to
+        // the game's own 64 Hz, so the two machines' tick counters stay comparable — the link
+        // classification (0x490140) measures a packet's age against the game tick, and an unpaced
+        // headless run lets one machine's tick run far ahead of the other's
+        let exchange_run = self.net.session.as_ref().is_some_and(|n| n.exchanging());
+        let pace = (nfs_game::config::cfg().nfs_net_pace.is_set() && self.net.session.is_some() && !exchange_run).then(Instant::now);
+        for t in 0..ticks {
+            self.net_race_notice();
+            // an input-exchange race runs a tick when the frames and the host's clock allow it
+            if exchange_run && !self.net_exchange_wait() {
+                tracing::warn!(target: "porsche::app::race_start", tick = self.tick, "the input exchange stopped: the scripted run ends");
+                break;
+            }
+            if let Some(t0) = pace
+                && let Some(wait) = (t0 + Duration::from_micros(u64::from(t) * 15_625)).checked_duration_since(Instant::now())
+            {
+                std::thread::sleep(wait);
+            }
+            // diagnostic `NFS_HUD_KEYS=tick:pause` in a network race: the press has asked to leave
+            if std::mem::take(&mut self.scripted_net_leave) {
+                if !self.leave_race_as(false) {
+                    tracing::info!(target: "porsche::app::race_start", "network race left by a scripted pause press: no front end to return to");
+                } else if self.fe_sequence_in("NFS_NET_LEAVE_SEQ", event_loop) {
+                    // **TEST GLUE** `NFS_NET_LEAVE_SEQ=<dir>`: the lobby after the return stays up
+                    // and is drawn (`NFS_FE_SEQ_SCRIPT` tokens, e.g. `wait:` to tick the room);
+                    // the sequence ends the run
+                    return true;
+                }
+                event_loop.exit();
+                return true;
+            }
+            // diagnostic `NFS_HUD_KEYS=tick:pause`: the headless run holds the pause for 64 of
+            // its iterations (no tick runs), the audio paused and resumed as a frame would
+            if self.scripted_pause {
+                self.sync_audio_pause();
+                pause_hold += 1;
+                if pause_hold >= 64 {
+                    pause_hold = 0;
+                    // `NFS_HUD_KEYS=tick:pauserestart` — the pause menu's restart
+                    // (command 3, 0x415721) instead of its continue, for the restart's
+                    // audio-pick count (`replay.md` §18.12): this recurses into a fresh
+                    // `start_race` (`self.autotest` is already taken, so it runs the
+                    // ordinary — not the scripted — set-up), so the outer loop's own
+                    // `ticks`/`t` no longer describe a live race. The extra `sync_audio_pause`
+                    // right after stands for the windowed loop's next `RedrawRequested` —
+                    // the frame where the divergence's stray resume pick used to fire once
+                    // `restart_race` had already made its own race-start pick — then the
+                    // scripted run ends (scripted runs never stay open, as the ordinary
+                    // race-end path does at its own `event_loop.exit()`).
+                    if self.end_scripted_pause(event_loop) {
+                        self.sync_audio_pause();
+                        event_loop.exit();
+                        return true;
+                    }
+                    // **TEST GLUE** `NFS_HUD_KEYS=tick:pausequit` — the pause menu's quit (its question
+                    // answered yes): the race left for the front end (`leave_race`), then, in a
+                    // scripted session (`NFS_AUTOTEST_RACES`), `PLAYGAME` again for the next race
+                    if std::mem::take(&mut self.scripted_quit) {
+                        let game_type = self.fe.race_game_type.unwrap_or(self.fe.game_type);
+                        if self.leave_race() && self.session_races > 1 {
+                            self.session_races -= 1;
+                            self.session_replayed = false;
+                            tracing::info!(target: "porsche::app::race_start", left = self.session_races, "session: quit from the pause menu, next race");
+                            // the script's own keys are let go, as `session_step` does
+                            self.input.release(Action::Throttle);
+                            self.input.release(Action::SteerRight);
+                            self.rearm_hud_keys();
+                            self.autotest = Some(secs);
+                            self.session_next_from_fe(game_type, event_loop);
+                            return true;
+                        }
+                        event_loop.exit();
+                        return true;
+                    }
+                    self.sync_audio_pause();
+                }
+                continue;
+            }
+            if smack_frames && t % 2 == 1 {
+                // the windowed frame's billboard key first, as `RedrawRequested` takes it
+                self.billboard_key_frame();
+                self.rebuild_scene();
+                self.shot_at_tick();
+            }
+            let phase = t as f32 / ticks as f32;
+            if t % 2 == 0 {
+                self.input.press(Action::Throttle);
+                // **TEST GLUE** (not in the original): `NFS_NO_STEER=1` keeps the scripted run's
+                // last third straight, for a still of the wheel and the hands at rest
+                if !self.follow_road && phase > 0.66 && !nfs_game::config::cfg().nfs_no_steer.is_set() {
+                    self.input.press(Action::SteerRight);
+                }
+            }
+            self.simulate();
+            self.start_auto_replay_if_due(event_loop);
+            // diagnostic: `NFS_REPLAY_STOP_EXHAUSTED=1` stops a scripted playback on the first
+            // tick its stream has run out (`[0x5E99F4] == 3`), before the frame's end test, so
+            // `--screenshot` shows the frame the original draws last before it leaves
+            if nfs_game::config::cfg().nfs_replay_stop_exhausted.is_set()
+                && self.replay.stream.as_ref().is_some_and(|r| r.mode == nfs_game::replay::Mode::Exhausted)
+            {
+                tracing::info!(target: "porsche::app::race_start", tick = self.tick, "diagnostic: the scripted run stops at the stream's end");
+                break;
+            }
+            // diagnostic: `NFS_RESULTS_STOP=<n>[:<ticks>]` stops a scripted run `ticks` (96)
+            // after the n-th result page of the queue (0-based) was first drawn, its slide-in
+            // over, so `--screenshot` shows it (with `NFS_FX_FRAMES`, which draws the frames
+            // that open and time the pages)
+            if let Some((n, wait)) = nfs_game::config::cfg().nfs_results_stop.as_str().and_then(|v| {
+                let (n, w) = v.split_once(':').map_or((v, "96"), |(n, w)| (n, w));
+                Some((n.trim().parse::<u8>().ok()?, w.trim().parse::<u64>().unwrap_or(96)))
+            }) && self.results.is_some()
+                && self.results_page == n
+                && self.page_seen == Some(n)
+                && self.page_open_tick.is_some_and(|t0| self.tick >= t0 + wait)
+            {
+                tracing::info!(target: "porsche::app::race_start", tick = self.tick, page = ?self.result_pages().get(n as usize), "diagnostic: the scripted run stops on the result page");
+                break;
+            }
+            // a scripted run's iteration is a frame of one tick
+            if self.race_frame_epilogue(event_loop) {
+                return true;
+            }
+            // NFS_AI_TRACE=<opponent index>: per-quarter-second trace of one AI car (target vs speed, pedals, slip)
+            if t % 16 == 0
+                && let Some(idx) = nfs_game::config::cfg().nfs_ai_trace.as_str()
+                    .and_then(|v| v.parse::<usize>().ok())
+                && let Some(o) = self.road.opponents.get(idx)
+            {
+                let target = match &o.controller {
+                    Controller::Ai(a) => a.target_speed * 3.6,
+                    _ => -1.0,
+                };
+                let (n_ahead, t_off, t_dot) = match &o.controller {
+                    Controller::Ai(a) => (a.dbg_n, a.dbg_offset, a.dbg_dot),
+                    _ => (0, 0.0, 0.0),
+                };
+                let car_off = self
+                    .slices
+                    .as_ref()
+                    .map(|t| {
+                        let sl = &t.slices[o.progress.slice];
+                        (o.vehicle.position - sl.centre).dot(sl.lateral)
+                    })
+                    .unwrap_or(0.0);
+                let lat = o.vehicle.v_local.x;
+                tracing::info!(target: "porsche::app::race_start", t = t as f32 / TICKS_PER_SEC_F32, slice = o.progress.slice, speed = (o.vehicle.speed() * 3.6) as i32, target = target as i32, thr = (o.vehicle.throttle * 100.0) as i32, brk = (o.vehicle.brake * 100.0) as i32, steer = o.vehicle.steer, n_ahead, t_off = (t_off * 10.0).round() / 10.0, t_dot = (t_dot * 100.0).round() / 100.0, car_off = (car_off * 10.0).round() / 10.0, v_lat = lat, slip = ?o.vehicle.wheels.iter().map(|w| (w.slip * 10.0) as i32).collect::<Vec<_>>(), locked = ?o.vehicle.wheels.iter().map(|w| w.locked as u8).collect::<Vec<_>>(), walls = o.wall_hits, "ai trace");
+            }
+            if t % 64 == 0
+                && let Some(v) = &self.vehicle
+            {
+                tracing::info!(target: "porsche::app::race_start", t = t / 64, speed_kmh = v.speed() * 3.6, gear = v.gear, rpm = v.rpm, slice = self.race.as_ref().map(|r| r.slice), walls = self.wall_hits, resets = self.resets, damage = ?v.damage.map(|d| d as i32), opp = ?self.road.opponents.iter().map(|o| (o.progress.slice, (o.vehicle.speed() * 3.6) as i32, match &o.controller { Controller::Ai(a) => (a.target_speed * 3.6) as i32, _ => -1 }, o.vehicle.gear, o.wall_hits, o.resets, o.vehicle.wheels[0].steer as i32, (o.vehicle.throttle * 100.0) as i32, (o.vehicle.brake * 100.0) as i32, o.vehicle.position.x as i32, o.vehicle.position.z as i32)).collect::<Vec<_>>(), wrong_way = self.race.as_ref().map(|r| r.wrong_way_ticks > 0), police = ?self.road.police.as_ref().map(|p| p.cars.iter().filter(|c| c.active).map(|c| (c.slice, (c.speed * 3.6) as i32, (c.position - v.position).length() as i32, c.mode)).collect::<Vec<_>>()), violation = ?self.road.police.as_ref().map(|p| p.violation), traffic = ?self.road.traffic.as_ref().map(|tr| tr.cars.iter().filter(|c| c.active).map(|c| (c.slice, c.dir as i32, (c.speed * 3.6) as i32, (c.lateral * 10.0) as i32, (c.position - v.position).length() as i32, (c.position.y - v.position.y) as i32)).collect::<Vec<_>>()), pos = ?v.position, "autotest");
+            }
+        }
+        if self.session_step(event_loop, secs) {
+            return true;
+        }
+        // 0x4EDF00's record arm runs on every race end, career or not, type 10 (the finale)
+        // included ([`App::file_track_record`]) — `end_finished_race` calls it first for the
+        // interactive path; this scripted fallthrough (the last race of an `--autotest`
+        // session, or a single one) skipped it entirely until now, so a scripted finale (or
+        // any other scripted race that runs off the end of its ticks here) filed the career
+        // event but never the track record. *(Until 2026-09-27 this diagnostic path called
+        // neither `file_track_record` nor `end_finished_race`.)*
+        self.file_track_record();
+        self.rebuild_scene();
+        self.update_damage_decals();
+        // 0x501340 + `LoadInfo` (0x4D3B52), same as the interactive `end_finished_race` path
+        self.reload_career_at_fe_entry();
+        self.settle_mission();
+        if self.career.as_ref().is_some_and(|c| c.pending.is_some()) {
+            let (order, times) = self.finishing_order();
+            let clean = self.clean_racers();
+            let zones = self.result_damage();
+            if let Some(c) = self.career.as_mut() {
+                if let Some(z) = zones {
+                    c.park(z);
+                }
+                c.finish(&order, &times, &clean);
+                tracing::info!(target: "porsche::app::race_start", order = ?order, message = c.message, money = c.career.money, "career event recorded");
+            }
+        }
+        // a race the layout front end started (`NFS_FE_PLAYGAME`) goes back to it as the last
+        // results page does, so the log names the screen 0x4D3420 opens
+        if self.fe.race_game_type.is_some()
+            && let Some(mut menu) = self.fe.menu_template.take()
+        {
+            self.knockout_race_end(&mut menu);
+            self.career_opponents = None;
+            self.player_grid_override = None;
+            self.stop_race_audio();
+            self.fe.menu = Some(menu);
+            self.fe_after_race(false);
+            // diagnostic: `NFS_FE_KO_SERIES=1` keeps pressing `PLAYGAME` while the knockout
+            // series runs, each round another `--autotest` race of the same length, so a
+            // scripted run drives a whole series and the log carries every 0x4DE060
+            if nfs_game::config::cfg().nfs_fe_ko_series.is_set() && self.knockout.as_ref().is_some_and(|k| k.state.active) {
+                self.autotest = Some(secs);
+                self.fe.game_type = game_type::KNOCKOUT;
+                self.start_from_layout(event_loop);
+                return true;
+            }
+        }
+        if self.screenshot.is_none() {
+            // The original saves the replay from the race de-init chain after *every* race,
+            // finished or not (replay.md §6.2) — so a scripted run saves on its way out too.
+            self.save_replay();
+            // scripted runs never stay open
+            event_loop.exit();
+        }
+        false
+    }
+
+    /// **The still of `--screenshot`** (a scripted run's last step): the mirror's texture, the renderer's per-frame
+    /// state the scripted loop never sets, the lens-flare warm-up, the offscreen render to `path` and the
+    /// `NFS_SHOT_SEQ` / `NFS_MIRROR_DUMP` extras; then the program ends. Moved out of `start_race` unchanged.
+    pub(crate) fn take_screenshot(&mut self, path: String, event_loop: &ActiveEventLoop) {
+        // a scripted run seldom redraws, so the mirror may not have a texture yet: render it,
+        // and rebuild the scene once more so the HUD carries it
+        if self.rear_mirror.is_some() {
+            let first = self.mirror_tex.is_none();
+            self.render_mirror();
+            if first {
+                self.rebuild_scene();
+            }
+        }
+        // The scripted loop never calls `draw_frame`, which is otherwise the only place that
+        // sets `set_trilinear` / `set_fakesort_mode` (both `SPECIALFX`-driven) each frame —
+        // so a `--screenshot` run kept the renderer's construction-time defaults whatever
+        // `Graphics.SpecialFX` said. Set them here too, or `NFS_CHOICE=Graphics.
+        // SpecialFX=…` cannot show either one in a still.
+        let fx_level = self.race.is_some().then(|| self.special_fx_level());
+        let fakesort_mode = self.fakesort_mode(fx_level);
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_trilinear(fx_level.is_some_and(|l| l >= 3));
+            r.set_fakesort_mode(fakesort_mode);
+        }
+        // **TEST GLUE** (not in the original): `NFS_LENS_WARMUP=<n>` — the sun's lens flare runs over
+        // frames and wall-clock (its stored block is taken on the first frame the sun is on
+        // screen, its test every 200 ms, and the read-backs come back a frame later), and a
+        // scripted run draws no frame; so the still is preceded by n frames drawn 210 ms apart
+        // (`render_to_image`, discarded), the scene rebuilt for each as a frame does
+        if let Some(n) = nfs_game::config::cfg().nfs_lens_warmup.as_str().and_then(|v| v.parse::<u32>().ok()) {
+            for _ in 0..n {
+                self.rebuild_scene();
+                let _ = self.renderer.as_mut().unwrap().render_to_image(&self.scene, &self.camera, shot_geometry().0, shot_geometry().1);
+                std::thread::sleep(Duration::from_millis(210));
+            }
+            self.rebuild_scene();
+        }
+        self.sync_gamma();
+        let rgba = self
+            .renderer
+            .as_mut()
+            .unwrap()
+            .render_to_image(&self.scene, &self.camera, shot_geometry().0, shot_geometry().1)
+            .expect("offscreen render");
+        image::save_buffer(&path, &rgba, shot_geometry().0, shot_geometry().1, image::ColorType::Rgba8)
+            .expect("write png");
+        tracing::info!(target: "porsche::app::race_start", path, "screenshot written");
+        // **TEST GLUE** (not in the original): `NFS_SHOT_SEQ=<n>` also writes the frames a windowed
+        // run draws between this tick and the next — `<shot>.seq<k>.png` at the interpolation
+        // fraction k / n (the mirror rebuilt with each, as a frame does), k = 0…n − 1
+        if let Some(n) = nfs_game::config::cfg().nfs_shot_seq.as_str().and_then(|v| v.parse::<u32>().ok()) {
+            for k in 0..n {
+                self.test_alpha = Some(k as f32 / n as f32);
+                self.rebuild_scene();
+                self.render_mirror();
+                let rgba = self.renderer.as_mut().unwrap().render_to_image(&self.scene, &self.camera, shot_geometry().0, shot_geometry().1).expect("offscreen render");
+                let sp = format!("{}.seq{k}.png", path.trim_end_matches(".png"));
+                image::save_buffer(&sp, &rgba, shot_geometry().0, shot_geometry().1, image::ColorType::Rgba8).expect("write png");
+                if nfs_game::config::cfg().nfs_mirror_dump.as_str().is_some()
+                    && let (Some(tex), Some(r)) = (self.mirror_tex, self.renderer.as_mut())
+                    && let Ok((w, h, px)) = r.read_texture(tex)
+                {
+                    image::save_buffer(format!("{}.mirror.png", sp.trim_end_matches(".png")), &px, w, h, image::ColorType::Rgba8).expect("write mirror png");
+                }
+            }
+            self.test_alpha = None;
+        }
+        // diagnostic: `NFS_MIRROR_DUMP=1` writes the mirror's own texture next to the screenshot
+        if nfs_game::config::cfg().nfs_mirror_dump.as_str().is_some()
+            && let (Some(tex), Some(r)) = (self.mirror_tex, self.renderer.as_mut())
+            && let Ok((w, h, px)) = r.read_texture(tex)
+        {
+            let mp = format!("{}.mirror.png", path.trim_end_matches(".png"));
+            image::save_buffer(&mp, &px, w, h, image::ColorType::Rgba8).expect("write mirror png");
+            tracing::info!(target: "porsche::app::race_start", path = mp, w, h, "mirror texture written");
+        }
+        event_loop.exit();
+    }
+
+    /// **TEST GLUE** `NFS_HUD_KEYS=tick:pause` / `pauserestart` / `pausequit`, the end of the held pause: the pause is
+    /// let go as the pause menu's continue would, or — `pauserestart` — as its restart (command 3, 0x415721) does:
+    /// the race made again ([`Self::restart_race`]). `true` when it restarted, which leaves the caller's own race
+    /// behind. The windowed frame lets go after 64 pause ticks of its clock, a scripted run's loop after 64
+    /// iterations.
+    pub(crate) fn end_scripted_pause(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        self.scripted_pause = false;
+        self.paused = false;
+        if std::mem::take(&mut self.scripted_restart) {
+            self.restart_race(event_loop);
+            return true;
+        }
+        false
+    }
+
     /// **TEST GLUE** `NFS_SHOT_TICKS=<prefix>@t1,t2,…` (with `NFS_FX_FRAMES`, whose drawn frames it
     /// takes): the frame drawn at each of those game ticks of the **last** race of a scripted run —
     /// not its replay — written as `<prefix>.t<tick>.png`, so a session's later race can be

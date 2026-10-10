@@ -140,12 +140,30 @@ pub fn ai_gear(speed_est: f32, reversing: bool, mps_per_rpm: &[f32], gear_slots:
     g
 }
 
-/// The CRAZY_HORN patterns `(len, reload, repeats)` 0x4013D0 hands `HonkPattern` by
-/// `(gGameTick >> 3) & 3` (0x40142A…0x40145F, jump table 0x401568).
-pub const CRAZY_HORN_PATTERNS: [(i32, i32, i32); 4] = [(4, 0x10, 8), (2, 0x20, 0xC), (7, 0x28, 0x10), (1, 0x20, 0)];
+/// The three arguments `HonkPattern(car, len, reload, repeats)` 0x4A6DE0 takes besides the car (see
+/// [`HonkTimer::pattern`]): how long a honk lasts, the pause between two (negated into the timer's
+/// reload) and how many there are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HonkPattern {
+    /// the timer's first value and its length (`+0x24`)
+    pub len: i32,
+    /// the pause between two honks, stored negated (`+0x28 = −reload`)
+    pub reload: i32,
+    /// how many honks (`+0x2C`)
+    pub repeats: i32,
+}
+
+/// The CRAZY_HORN patterns 0x4013D0 hands `HonkPattern` by `(gGameTick >> 3) & 3`
+/// (0x40142A…0x40145F, jump table 0x401568).
+pub const CRAZY_HORN_PATTERNS: [HonkPattern; 4] = [
+    HonkPattern { len: 4, reload: 0x10, repeats: 8 },
+    HonkPattern { len: 2, reload: 0x20, repeats: 0xC },
+    HonkPattern { len: 7, reload: 0x28, repeats: 0x10 },
+    HonkPattern { len: 1, reload: 0x20, repeats: 0 },
+];
 
 /// The oncoming traffic car's random honk, `HonkPattern(car, 2, 0x20, 8)` (0x401230…0x401237).
-pub const ONCOMING_HONK_PATTERN: (i32, i32, i32) = (2, 0x20, 8);
+pub const ONCOMING_HONK_PATTERN: HonkPattern = HonkPattern { len: 2, reload: 0x20, repeats: 8 };
 
 /// What one honk-timer step asks of the horn voice `slot + 0x27`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,12 +220,12 @@ impl HonkTimer {
 
     /// `HonkPattern(car, len, reload, repeats)` 0x4A6DE0: taken only while the timer is 0 —
     /// `timer = len = len`, `+0x28 = −reload`, `+0x2C = repeats` (0x4A6E03…0x4A6E14).
-    pub fn pattern(&mut self, len: i32, reload: i32, repeats: i32) {
+    pub fn pattern(&mut self, p: HonkPattern) {
         if self.timer == 0 {
-            self.timer = len;
-            self.len = len;
-            self.reload = -reload;
-            self.repeats = repeats;
+            self.timer = p.len;
+            self.len = p.len;
+            self.reload = -p.reload;
+            self.repeats = p.repeats;
         }
     }
 
@@ -495,14 +513,14 @@ mod tests {
         // (4, 0x10, 8) with nothing cutting it: 3 updates on, the stop, 15 updates of pause, the
         // reload update, and again — 8 times
         let mut t = HonkTimer::default();
-        t.pattern(4, 0x10, 8);
+        t.pattern(HonkPattern { len: 4, reload: 0x10, repeats: 8 });
         assert_eq!((t.timer, t.len, t.reload, t.repeats), (4, 4, -0x10, 8));
         let cycle = format!("PPPs{}", ".".repeat(0x10));
         assert_eq!(run(&mut t, cycle.len() * 8), cycle.repeat(8));
         assert_eq!(t.timer, 0, "the eighth stop does not reload");
         // a pattern is taken only while the timer is 0
         t.honk(true);
-        t.pattern(7, 0x28, 0x10);
+        t.pattern(HonkPattern { len: 7, reload: 0x28, repeats: 0x10 });
         assert_eq!((t.timer, t.len), (1, 0));
     }
 
@@ -530,8 +548,7 @@ mod tests {
             if t.horn {
                 t.honk(false);
             }
-            let (l, r, n) = ONCOMING_HONK_PATTERN;
-            t.pattern(l, r, n);
+            t.pattern(ONCOMING_HONK_PATTERN);
             out.push(match t.step() {
                 HonkStep::Play => 'P',
                 HonkStep::Stop => 's',
@@ -545,8 +562,7 @@ mod tests {
     #[test]
     fn the_fourth_crazy_horn_pattern_is_silent_and_never_ends() {
         let mut t = HonkTimer::default();
-        let (l, r, n) = CRAZY_HORN_PATTERNS[3];
-        t.pattern(l, r, n);
+        t.pattern(CRAZY_HORN_PATTERNS[3]);
         let s = run(&mut t, 200);
         assert!(!s.contains('P'), "{s}");
         assert_ne!(t.timer, 0, "the timer stays busy, so no other pattern is taken");

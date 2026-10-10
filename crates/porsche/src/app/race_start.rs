@@ -101,36 +101,23 @@ impl App {
         };
         let dealer = (game_type == game_type::DEALER_TEST_DRIVE && self.dealer_cars().is_some()).then_some(self.fe.dealer);
         let paint_set = owned.as_ref().map_or(dealer.map_or(m.paint_idx, |d| d.paint), |o| o.paint_set as usize);
-        self.paint = car.paint_sets.get(paint_set % car.paint_sets.len().max(1)).map(|p| p.colours[0]).unwrap_or([0xD4, 0x10, 0x10]);
-        self.owned_decal = owned.as_ref().map(|o| o.trim.decal);
-        self.owned_paint = match (owned.as_ref(), dealer) {
-            (Some(o), _) if !car.paint_sets.is_empty() => Some(Self::paint_of(&car, o)),
-            (None, Some(d)) if !car.paint_sets.is_empty() => Some(Paint::owned(&car, d.paint, d.interior, 0, 0, 0)),
-            (None, None) => Self::menu_custom_paint(m, &car),
-            _ => None,
+        let mut look = PlayerLook {
+            paint: car.paint_sets.get(paint_set % car.paint_sets.len().max(1)).map(|p| p.colours[0]).unwrap_or([0xD4, 0x10, 0x10]),
+            owned_paint: match (owned.as_ref(), dealer) {
+                (Some(o), _) if !car.paint_sets.is_empty() => Some(Self::paint_of(&car, o)),
+                (None, Some(d)) if !car.paint_sets.is_empty() => Some(Paint::owned(&car, d.paint, d.interior, 0, 0, 0)),
+                (None, None) => Self::menu_custom_paint(m, &car),
+                _ => None,
+            },
+            owned_decal: owned.as_ref().map(|o| o.trim.decal),
         };
         // a colour that is not a row (`OwnedCar::custom`) is the paint the race compares against
-        if let Some(p) = self.owned_paint {
-            self.paint = p.exterior;
+        if let Some(p) = look.owned_paint {
+            look.paint = p.exterior;
         }
-        self.num_opponents = 0;
-        self.num_laps = 1;
-        self.backwards = false;
-        self.mirror = false;
-        self.road.traffic_count = 5;
-        self.road.traffic_ids = None;
-        if let Some((_, laps, rev, mir, traffic, ids)) = event {
-            self.num_laps = laps;
-            self.backwards = rev;
-            self.mirror = mir;
-            self.road.traffic_count = traffic;
-            self.road.traffic_ids = ids;
-        }
-        self.road.cops_enabled = false;
-        self.road.cop_count = 4;
-        self.road.cops_race = false;
-        self.career_opponents = None;
-        self.quick_knockout = false;
+        let event = event.map(|(_, laps, rev, mir, traffic, ids)| (laps, rev, mir, traffic, ids));
+        let rs = RaceSetup::test_drive(event, look, self.race_setup());
+        self.apply_race_setup(rs);
         // the player's `nfs5.car` record is the car 0x4EB710 took for this type — what the dash
         // calibration and the replay's car read (`player_car_id`); until 2026-10-01 a test drive
         // kept the last race's record here (EV1 audit)
@@ -221,30 +208,13 @@ impl App {
     /// its parts' style overlay, the `.sim` with the parts, their wear and the setup. `false` when
     /// the assets do not load; the event is no longer pending then. The callers start the race.
     pub(crate) fn load_career_race(&mut self, req: career_ui::StartRequest) -> bool {
-        self.num_opponents = req.opponents.len() as u32;
-        self.num_laps = req.laps;
-        self.owned_paint = None;
-        self.owned_decal = None;
-        self.paint = req.paint;
-        self.career_opponents = Some(req.opponents.clone());
-        self.road.traffic_count = req.traffic;
-        self.road.traffic_ids = req.traffic_ids.clone();
-        self.player_grid_override = req.player_grid;
-        // **Career police.** 0x4ED0A5 gives cops only to game type 9 — a factory-driver
-        // mission — and only when its record's `+0x26` is set, and then two of them
-        // (0x4ED0BC…0x4ED0E7); a tournament has none. This path used to leave
-        // `cops_enabled` at whatever the last menu race had.
-        let mission_cops = req.mission.as_ref().is_some_and(|m| m.mission.police);
-        self.road.cops_enabled = mission_cops;
-        self.road.cop_count = 2;
-        self.race_skill = req.skill;
-        self.backwards = req.backwards;
-        self.mirror = req.mirror;
+        // the event's options, career police among them (`RaceSetup::career`; this path used to leave
+        // `cops_enabled` at whatever the last menu race had)
+        let rs = RaceSetup::career(&req, self.race_setup());
+        self.apply_race_setup(rs);
         // the dials' calibration is the player's own `nfs5.car` record (a quick race's choice
         // used to linger here)
         self.player_car_id = Some(req.car.id);
-        self.quick_knockout = false;
-        self.road.cops_race = false;
         let car = self.cheat_993(req.car.clone());
         self.mission = req.mission.clone().map(cone_limit_diagnostic);
         self.skill = None;
@@ -351,14 +321,7 @@ impl App {
             return false;
         }
         self.launch_skill_damage(game_type::FINALE, skill, false);
-        self.fe.menu_template = self.fe.menu.take();
-        self.fe.race_game_type = Some(game_type::FINALE);
-        self.fe.layout_preview = None;
-        self.fe.layout_name = None;
-        let (Some(renderer), Some(window)) = (self.renderer.take(), self.window.take()) else { return false };
-        self.tick = 0;
-        self.start_race(renderer, window, event_loop);
-        true
+        self.fe_hand_over(game_type::FINALE, event_loop)
     }
 
     pub(crate) fn start_tournament_from_layout(&mut self, event_loop: &ActiveEventLoop) -> bool {
@@ -384,14 +347,7 @@ impl App {
             self.owned_paint = Some(Self::paint_of(e, o));
             self.owned_decal = Some(o.trim.decal);
         }
-        self.fe.menu_template = self.fe.menu.take();
-        self.fe.race_game_type = Some(game_type::TOURNAMENT);
-        self.fe.layout_preview = None;
-        self.fe.layout_name = None;
-        let (Some(renderer), Some(window)) = (self.renderer.take(), self.window.take()) else { return false };
-        self.tick = 0;
-        self.start_race(renderer, window, event_loop);
-        true
+        self.fe_hand_over(game_type::TOURNAMENT, event_loop)
     }
 
     /// **`PLAYGAME` for `Game.GameType` 9** (`factorydriver.lay`, `factdone.lay`, both
@@ -416,8 +372,16 @@ impl App {
             return false;
         }
         self.launch_skill_damage(game_type::MISSION, skill, opponents);
+        self.fe_hand_over(game_type::MISSION, event_loop)
+    }
+
+    /// **The front end hands over to the race it has just set up** — the career launches and a
+    /// replay's: the menu kept aside for the way back (`leave_race`, `fe_after_race`), the race's
+    /// `FEGAME_TYPE` (`race_game_type`), the layout screen dropped, then [`App::start_race`] on the
+    /// window. `false` (nothing started) when the window is not here to take.
+    pub(crate) fn fe_hand_over(&mut self, race_game_type: u8, event_loop: &ActiveEventLoop) -> bool {
         self.fe.menu_template = self.fe.menu.take();
-        self.fe.race_game_type = Some(game_type::MISSION);
+        self.fe.race_game_type = Some(race_game_type);
         self.fe.layout_preview = None;
         self.fe.layout_name = None;
         let (Some(renderer), Some(window)) = (self.renderer.take(), self.window.take()) else { return false };
@@ -544,35 +508,36 @@ impl App {
             }
             _ => {
                 let m = self.fe.menu.as_ref().expect("menu");
-                self.player_grid_override = None;
-                self.career_opponents = None;
-                self.backwards = m.backwards;
-                self.mirror = m.mirror;
-                self.road.traffic_count = TRAFFIC_COUNT[m.traffic.min(3) as usize];
-                self.road.traffic_ids = None;
-                self.road.damage_on = m.damage;
-                self.road.cop_count = 4;
-                if game_type == game_type::QUICK_KNOCKOUT {
+                let (t, rs) = if game_type == game_type::QUICK_KNOCKOUT {
                     // 1: `LoopedTrack.Track`, `RACE_TYPE` 3, `NUM_LAPS` = `NUMOPPONENTRACECARS` =
                     // `Game.NumKOOpponents` (0x4ECDF0 / 0x4ECF00, §4); no cops
                     let t = m.looped_track().to_string();
-                    self.num_opponents = m.ko_opponents;
-                    self.num_laps = m.ko_opponents.max(1);
-                    self.road.cops_race = false;
-                    self.road.cops_enabled = false;
-                    self.quick_knockout = true;
-                    t
+                    let rs = RaceSetup {
+                        opponents: m.ko_opponents,
+                        laps: m.ko_opponents.max(1),
+                        cops_race: false,
+                        cops_enabled: false,
+                        quick_knockout: true,
+                        ..RaceSetup::menu(m, self.race_setup())
+                    };
+                    (t, rs)
                 } else {
                     let t = m.track().to_string();
-                    self.num_opponents = m.opponents;
-                    self.num_laps = fe_laps(&m.circuits, &t, m.laps);
                     // the single race, game type 0: the Fuzzyfuz code (bit 5) makes it the cops
                     // race — `RACE_TYPE` 1 (0x4EB4FD) and four cop cars (0x4ED0BC…0x4ED282)
-                    self.road.cops_race = self.cheat_bits & CHEAT_COPS != 0;
-                    self.road.cops_enabled = m.cops || self.road.cops_race;
-                    self.quick_knockout = false;
-                    t
-                }
+                    let cops_race = self.cheat_bits & CHEAT_COPS != 0;
+                    let rs = RaceSetup {
+                        opponents: m.opponents,
+                        laps: fe_laps(&m.circuits, &t, m.laps),
+                        cops_race,
+                        cops_enabled: m.cops || cops_race,
+                        quick_knockout: false,
+                        ..RaceSetup::menu(m, self.race_setup())
+                    };
+                    (t, rs)
+                };
+                self.apply_race_setup(rs);
+                t
             }
         };
         let track_name = self.net_race_apply(track_name);
@@ -581,16 +546,8 @@ impl App {
         // carries the running series (and a tournament's running event, 0x503940)
         self.launch_save();
         let Some(m) = self.fe.menu.as_ref() else { return };
-        self.owned_paint = None;
-        self.owned_decal = None;
-        self.paint = car
-            .paint_sets
-            .get(m.paint_idx % car.paint_sets.len().max(1))
-            .map(|p| p.colours[0])
-            .unwrap_or([0xD4, 0x10, 0x10]);
-        if let Some(p) = Self::menu_custom_paint(m, &car) {
-            (self.paint, self.owned_paint) = (p.exterior, Some(p));
-        }
+        let look = PlayerLook::from_menu(m, &car);
+        self.apply_player_look(look);
         // (`quick_knockout` is the arm's own above — 1 true, 0 and 2 false —, and `derby_track`'s
         // Smash Up code sets it at the track load below; a `false` here, as it stood until
         // 2026-10-01, turned the Quick Knockout's lap cut off in every layout launch of type 1:
@@ -1040,13 +997,15 @@ impl App {
             &self.paths,
             1,
             player_paint,
-            car_env,
-            self.track.is_night(),
-            // `.CABRIODOWN` 0x24B: the player's car (kind 1) keeps `Car.Roof`, which 0x4F1E40
-            // forces to 0 on a car without the convertible flag; every other car is sent 0
-            // (0x4EEF0C…0x4EEF1A)
-            Some(if self.car.cabrio { self.choice_index(choice::CAR_ROOF).map_or(0, |(i, _)| i as u32) } else { 0 }),
-            self.skidpad_rule(),
+            nfs_game::world::CarUpload {
+                env: car_env,
+                night: self.track.is_night(),
+                // `.CABRIODOWN` 0x24B: the player's car (kind 1) keeps `Car.Roof`, which 0x4F1E40
+                // forces to 0 on a car without the convertible flag; every other car is sent 0
+                // (0x4EEF0C…0x4EEF1A)
+                race_roof: Some(if self.car.cabrio { self.choice_index(choice::CAR_ROOF).map_or(0, |(i, _)| i as u32) } else { 0 }),
+                skidpad: self.skidpad_rule(),
+            },
         )
         .expect("car");
         let sky_level = nfs_game::sky::forced_level().unwrap_or_else(|| self.choice_index(choice::GRAPHICS_SKY_RENDERING).map_or(0, |(i, _)| i));
@@ -1355,244 +1314,10 @@ impl App {
         self.net_exchange_begin();
         self.last_frame = Instant::now();
         self.fps_timer = Instant::now();
-        if let Some(secs) = self.autotest.take() {
-            let ticks = (secs * TICKS_PER_SEC_F32) as u32;
-            // diagnostic: with `NFS_SMACK_DRIVE` the scripted run draws a frame every other tick,
-            // so the draw's side of a struck smackable (its player's sample, its record's `+8`,
-            // the burst) runs as in a windowed race
-            // — and with `NFS_FX_FRAMES`, so the cars' effects (driven by each drawn frame,
-            // `nfs_game::car_effects`) run as in a windowed race
-            let smack_frames = nfs_game::config::cfg().nfs_smack_drive.is_set() || nfs_game::config::cfg().nfs_cone_drive.is_set() || nfs_game::config::cfg().nfs_fx_frames.is_set();
-            let mut pause_hold = 0;
-            // **TEST GLUE** (not in the original): `NFS_NET_PACE=1` holds a scripted network race to
-            // the game's own 64 Hz, so the two machines' tick counters stay comparable — the link
-            // classification (0x490140) measures a packet's age against the game tick, and an unpaced
-            // headless run lets one machine's tick run far ahead of the other's
-            let exchange_run = self.net.session.as_ref().is_some_and(|n| n.exchanging());
-            let pace = (nfs_game::config::cfg().nfs_net_pace.is_set() && self.net.session.is_some() && !exchange_run).then(Instant::now);
-            for t in 0..ticks {
-                self.net_race_notice();
-                // an input-exchange race runs a tick when the frames and the host's clock allow it
-                if exchange_run && !self.net_exchange_wait() {
-                    tracing::warn!(tick = self.tick, "the input exchange stopped: the scripted run ends");
-                    break;
-                }
-                if let Some(t0) = pace
-                    && let Some(wait) = (t0 + Duration::from_micros(u64::from(t) * 15_625)).checked_duration_since(Instant::now())
-                {
-                    std::thread::sleep(wait);
-                }
-                // diagnostic `NFS_HUD_KEYS=tick:pause` in a network race: the press has asked to leave
-                if std::mem::take(&mut self.scripted_net_leave) {
-                    if !self.leave_race_as(false) {
-                        tracing::info!("network race left by a scripted pause press: no front end to return to");
-                    } else if self.fe_sequence_in("NFS_NET_LEAVE_SEQ", event_loop) {
-                        // **TEST GLUE** `NFS_NET_LEAVE_SEQ=<dir>`: the lobby after the return stays up
-                        // and is drawn (`NFS_FE_SEQ_SCRIPT` tokens, e.g. `wait:` to tick the room);
-                        // the sequence ends the run
-                        return;
-                    }
-                    event_loop.exit();
-                    return;
-                }
-                // diagnostic `NFS_HUD_KEYS=tick:pause`: the headless run holds the pause for 64 of
-                // its iterations (no tick runs), the audio paused and resumed as a frame would
-                if self.scripted_pause {
-                    self.sync_audio_pause();
-                    pause_hold += 1;
-                    if pause_hold >= 64 {
-                        pause_hold = 0;
-                        self.scripted_pause = false;
-                        self.paused = false;
-                        if std::mem::take(&mut self.scripted_restart) {
-                            // `NFS_HUD_KEYS=tick:pauserestart` — the pause menu's restart
-                            // (command 3, 0x415721) instead of its continue, for the restart's
-                            // audio-pick count (`replay.md` §18.12): this recurses into a fresh
-                            // `start_race` (`self.autotest` is already taken, so it runs the
-                            // ordinary — not the scripted — set-up), so the outer loop's own
-                            // `ticks`/`t` no longer describe a live race. The extra `sync_audio_pause`
-                            // right after stands for the windowed loop's next `RedrawRequested` —
-                            // the frame where the divergence's stray resume pick used to fire once
-                            // `restart_race` had already made its own race-start pick — then the
-                            // scripted run ends (scripted runs never stay open, as the ordinary
-                            // race-end path does at its own `event_loop.exit()`).
-                            self.restart_race(event_loop);
-                            self.sync_audio_pause();
-                            event_loop.exit();
-                            return;
-                        }
-                        // **TEST GLUE** `NFS_HUD_KEYS=tick:pausequit` — the pause menu's quit (its question
-                        // answered yes): the race left for the front end (`leave_race`), then, in a
-                        // scripted session (`NFS_AUTOTEST_RACES`), `PLAYGAME` again for the next race
-                        if std::mem::take(&mut self.scripted_quit) {
-                            let game_type = self.fe.race_game_type.unwrap_or(self.fe.game_type);
-                            if self.leave_race() && self.session_races > 1 {
-                                self.session_races -= 1;
-                                self.session_replayed = false;
-                                tracing::info!(left = self.session_races, "session: quit from the pause menu, next race");
-                                // the script's own keys are let go, as `session_step` does
-                                self.input.release(Action::Throttle);
-                                self.input.release(Action::SteerRight);
-                                self.rearm_hud_keys();
-                                self.autotest = Some(secs);
-                                self.session_next_from_fe(game_type, event_loop);
-                                return;
-                            }
-                            event_loop.exit();
-                            return;
-                        }
-                        self.sync_audio_pause();
-                    }
-                    continue;
-                }
-                if smack_frames && t % 2 == 1 {
-                    // the windowed frame's billboard key first, as `RedrawRequested` takes it
-                    self.billboard_key_frame();
-                    self.rebuild_scene();
-                    self.shot_at_tick();
-                }
-                let phase = t as f32 / ticks as f32;
-                if t % 2 == 0 {
-                    self.input.press(Action::Throttle);
-                    // **TEST GLUE** (not in the original): `NFS_NO_STEER=1` keeps the scripted run's
-                    // last third straight, for a still of the wheel and the hands at rest
-                    if !self.follow_road && phase > 0.66 && !nfs_game::config::cfg().nfs_no_steer.is_set() {
-                        self.input.press(Action::SteerRight);
-                    }
-                }
-                self.simulate();
-                if self.auto_replay_due {
-                    self.start_auto_replay(event_loop);
-                }
-                // diagnostic: `NFS_REPLAY_STOP_EXHAUSTED=1` stops a scripted playback on the first
-                // tick its stream has run out (`[0x5E99F4] == 3`), before the frame's end test, so
-                // `--screenshot` shows the frame the original draws last before it leaves
-                if nfs_game::config::cfg().nfs_replay_stop_exhausted.is_set()
-                    && self.replay.stream.as_ref().is_some_and(|r| r.mode == nfs_game::replay::Mode::Exhausted)
-                {
-                    tracing::info!(tick = self.tick, "diagnostic: the scripted run stops at the stream's end");
-                    break;
-                }
-                // diagnostic: `NFS_RESULTS_STOP=<n>[:<ticks>]` stops a scripted run `ticks` (96)
-                // after the n-th result page of the queue (0-based) was first drawn, its slide-in
-                // over, so `--screenshot` shows it (with `NFS_FX_FRAMES`, which draws the frames
-                // that open and time the pages)
-                if let Some((n, wait)) = nfs_game::config::cfg().nfs_results_stop.as_str().and_then(|v| {
-                    let (n, w) = v.split_once(':').map_or((v, "96"), |(n, w)| (n, w));
-                    Some((n.trim().parse::<u8>().ok()?, w.trim().parse::<u64>().unwrap_or(96)))
-                }) && self.results.is_some()
-                    && self.results_page == n
-                    && self.page_seen == Some(n)
-                    && self.page_open_tick.is_some_and(|t0| self.tick >= t0 + wait)
-                {
-                    tracing::info!(tick = self.tick, page = ?self.result_pages().get(n as usize), "diagnostic: the scripted run stops on the result page");
-                    break;
-                }
-                // a scripted run's iteration is a frame of one tick
-                if self.replay_exit_check(event_loop) {
-                    return;
-                }
-                let bar_save_was_up = self.replay_save.up;
-                self.run_bar_script();
-                self.replay_bar_frame(event_loop);
-                // diagnostic: `NFS_REPLAY_TYPE` typed into `HReplaySave`'s name once the bar's
-                // scripted press (or a real one) has just opened it (0x430E10, `replay_save_click`
-                // reads it from the field the same way)
-                if !bar_save_was_up
-                    && self.replay_save.up
-                    && let Some(name) = nfs_game::config::cfg().nfs_replay_type.as_str()
-                {
-                    for c in name.chars() {
-                        self.replay_save.type_char(c);
-                    }
-                }
-                // NFS_AI_TRACE=<opponent index>: per-quarter-second trace of one AI car (target vs speed, pedals, slip)
-                if t % 16 == 0
-                    && let Some(idx) = nfs_game::config::cfg().nfs_ai_trace.as_str()
-                        .and_then(|v| v.parse::<usize>().ok())
-                    && let Some(o) = self.road.opponents.get(idx)
-                {
-                    let target = match &o.controller {
-                        Controller::Ai(a) => a.target_speed * 3.6,
-                        _ => -1.0,
-                    };
-                    let (n_ahead, t_off, t_dot) = match &o.controller {
-                        Controller::Ai(a) => (a.dbg_n, a.dbg_offset, a.dbg_dot),
-                        _ => (0, 0.0, 0.0),
-                    };
-                    let car_off = self
-                        .slices
-                        .as_ref()
-                        .map(|t| {
-                            let sl = &t.slices[o.progress.slice];
-                            (o.vehicle.position - sl.centre).dot(sl.lateral)
-                        })
-                        .unwrap_or(0.0);
-                    let lat = o.vehicle.v_local.x;
-                    tracing::info!(t = t as f32 / TICKS_PER_SEC_F32, slice = o.progress.slice, speed = (o.vehicle.speed() * 3.6) as i32, target = target as i32, thr = (o.vehicle.throttle * 100.0) as i32, brk = (o.vehicle.brake * 100.0) as i32, steer = o.vehicle.steer, n_ahead, t_off = (t_off * 10.0).round() / 10.0, t_dot = (t_dot * 100.0).round() / 100.0, car_off = (car_off * 10.0).round() / 10.0, v_lat = lat, slip = ?o.vehicle.wheels.iter().map(|w| (w.slip * 10.0) as i32).collect::<Vec<_>>(), locked = ?o.vehicle.wheels.iter().map(|w| w.locked as u8).collect::<Vec<_>>(), walls = o.wall_hits, "ai trace");
-                }
-                if t % 64 == 0
-                    && let Some(v) = &self.vehicle
-                {
-                    tracing::info!(t = t / 64, speed_kmh = v.speed() * 3.6, gear = v.gear, rpm = v.rpm, slice = self.race.as_ref().map(|r| r.slice), walls = self.wall_hits, resets = self.resets, damage = ?v.damage.map(|d| d as i32), opp = ?self.road.opponents.iter().map(|o| (o.progress.slice, (o.vehicle.speed() * 3.6) as i32, match &o.controller { Controller::Ai(a) => (a.target_speed * 3.6) as i32, _ => -1 }, o.vehicle.gear, o.wall_hits, o.resets, o.vehicle.wheels[0].steer as i32, (o.vehicle.throttle * 100.0) as i32, (o.vehicle.brake * 100.0) as i32, o.vehicle.position.x as i32, o.vehicle.position.z as i32)).collect::<Vec<_>>(), wrong_way = self.race.as_ref().map(|r| r.wrong_way_ticks > 0), police = ?self.road.police.as_ref().map(|p| p.cars.iter().filter(|c| c.active).map(|c| (c.slice, (c.speed * 3.6) as i32, (c.position - v.position).length() as i32, c.mode)).collect::<Vec<_>>()), violation = ?self.road.police.as_ref().map(|p| p.violation), traffic = ?self.road.traffic.as_ref().map(|tr| tr.cars.iter().filter(|c| c.active).map(|c| (c.slice, c.dir as i32, (c.speed * 3.6) as i32, (c.lateral * 10.0) as i32, (c.position - v.position).length() as i32, (c.position.y - v.position.y) as i32)).collect::<Vec<_>>()), pos = ?v.position, "autotest");
-                }
-            }
-            if self.session_step(event_loop, secs) {
-                return;
-            }
-            // 0x4EDF00's record arm runs on every race end, career or not, type 10 (the finale)
-            // included ([`App::file_track_record`]) — `end_finished_race` calls it first for the
-            // interactive path; this scripted fallthrough (the last race of an `--autotest`
-            // session, or a single one) skipped it entirely until now, so a scripted finale (or
-            // any other scripted race that runs off the end of its ticks here) filed the career
-            // event but never the track record. *(Until 2026-09-27 this diagnostic path called
-            // neither `file_track_record` nor `end_finished_race`.)*
-            self.file_track_record();
-            self.rebuild_scene();
-            self.update_damage_decals();
-            // 0x501340 + `LoadInfo` (0x4D3B52), same as the interactive `end_finished_race` path
-            self.reload_career_at_fe_entry();
-            self.settle_mission();
-            if self.career.as_ref().is_some_and(|c| c.pending.is_some()) {
-                let (order, times) = self.finishing_order();
-                let clean = self.clean_racers();
-                let zones = self.result_damage();
-                if let Some(c) = self.career.as_mut() {
-                    if let Some(z) = zones {
-                        c.park(z);
-                    }
-                    c.finish(&order, &times, &clean);
-                    tracing::info!(order = ?order, message = c.message, money = c.career.money, "career event recorded");
-                }
-            }
-            // a race the layout front end started (`NFS_FE_PLAYGAME`) goes back to it as the last
-            // results page does, so the log names the screen 0x4D3420 opens
-            if self.fe.race_game_type.is_some()
-                && let Some(mut menu) = self.fe.menu_template.take()
-            {
-                self.knockout_race_end(&mut menu);
-                self.career_opponents = None;
-                self.player_grid_override = None;
-                self.stop_race_audio();
-                self.fe.menu = Some(menu);
-                self.fe_after_race(false);
-                // diagnostic: `NFS_FE_KO_SERIES=1` keeps pressing `PLAYGAME` while the knockout
-                // series runs, each round another `--autotest` race of the same length, so a
-                // scripted run drives a whole series and the log carries every 0x4DE060
-                if nfs_game::config::cfg().nfs_fe_ko_series.is_set() && self.knockout.as_ref().is_some_and(|k| k.state.active) {
-                    self.autotest = Some(secs);
-                    self.fe.game_type = game_type::KNOCKOUT;
-                    self.start_from_layout(event_loop);
-                    return;
-                }
-            }
-            if self.screenshot.is_none() {
-                // The original saves the replay from the race de-init chain after *every* race,
-                // finished or not (replay.md §6.2) — so a scripted run saves on its way out too.
-                self.save_replay();
-                // scripted runs never stay open
-                event_loop.exit();
-            }
+        if let Some(secs) = self.autotest.take()
+            && self.run_scripted_race(secs, event_loop)
+        {
+            return;
         }
         // with `NFS_RESULTS_STOP` the still waits for the scripted run to reach its page: the
         // automatic replay's pass (started inside that run) does not take it at its first frame
@@ -1600,79 +1325,7 @@ impl App {
         if !results_stop_pass
             && let Some(path) = self.screenshot.take()
         {
-            // a scripted run seldom redraws, so the mirror may not have a texture yet: render it,
-            // and rebuild the scene once more so the HUD carries it
-            if self.rear_mirror.is_some() {
-                let first = self.mirror_tex.is_none();
-                self.render_mirror();
-                if first {
-                    self.rebuild_scene();
-                }
-            }
-            // The scripted loop never calls `draw_frame`, which is otherwise the only place that
-            // sets `set_trilinear` / `set_fakesort_mode` (both `SPECIALFX`-driven) each frame —
-            // so a `--screenshot` run kept the renderer's construction-time defaults whatever
-            // `Graphics.SpecialFX` said. Set them here too, or `NFS_CHOICE=Graphics.
-            // SpecialFX=…` cannot show either one in a still.
-            let fx_level = self.race.is_some().then(|| self.special_fx_level());
-            let fakesort_mode = self.fakesort_mode(fx_level);
-            if let Some(r) = self.renderer.as_mut() {
-                r.set_trilinear(fx_level.is_some_and(|l| l >= 3));
-                r.set_fakesort_mode(fakesort_mode);
-            }
-            // **TEST GLUE** (not in the original): `NFS_LENS_WARMUP=<n>` — the sun's lens flare runs over
-            // frames and wall-clock (its stored block is taken on the first frame the sun is on
-            // screen, its test every 200 ms, and the read-backs come back a frame later), and a
-            // scripted run draws no frame; so the still is preceded by n frames drawn 210 ms apart
-            // (`render_to_image`, discarded), the scene rebuilt for each as a frame does
-            if let Some(n) = nfs_game::config::cfg().nfs_lens_warmup.as_str().and_then(|v| v.parse::<u32>().ok()) {
-                for _ in 0..n {
-                    self.rebuild_scene();
-                    let _ = self.renderer.as_mut().unwrap().render_to_image(&self.scene, &self.camera, shot_geometry().0, shot_geometry().1);
-                    std::thread::sleep(Duration::from_millis(210));
-                }
-                self.rebuild_scene();
-            }
-            self.sync_gamma();
-            let rgba = self
-                .renderer
-                .as_mut()
-                .unwrap()
-                .render_to_image(&self.scene, &self.camera, shot_geometry().0, shot_geometry().1)
-                .expect("offscreen render");
-            image::save_buffer(&path, &rgba, shot_geometry().0, shot_geometry().1, image::ColorType::Rgba8)
-                .expect("write png");
-            tracing::info!(path, "screenshot written");
-            // **TEST GLUE** (not in the original): `NFS_SHOT_SEQ=<n>` also writes the frames a windowed
-            // run draws between this tick and the next — `<shot>.seq<k>.png` at the interpolation
-            // fraction k / n (the mirror rebuilt with each, as a frame does), k = 0…n − 1
-            if let Some(n) = nfs_game::config::cfg().nfs_shot_seq.as_str().and_then(|v| v.parse::<u32>().ok()) {
-                for k in 0..n {
-                    self.test_alpha = Some(k as f32 / n as f32);
-                    self.rebuild_scene();
-                    self.render_mirror();
-                    let rgba = self.renderer.as_mut().unwrap().render_to_image(&self.scene, &self.camera, shot_geometry().0, shot_geometry().1).expect("offscreen render");
-                    let sp = format!("{}.seq{k}.png", path.trim_end_matches(".png"));
-                    image::save_buffer(&sp, &rgba, shot_geometry().0, shot_geometry().1, image::ColorType::Rgba8).expect("write png");
-                    if nfs_game::config::cfg().nfs_mirror_dump.as_str().is_some()
-                        && let (Some(tex), Some(r)) = (self.mirror_tex, self.renderer.as_mut())
-                        && let Ok((w, h, px)) = r.read_texture(tex)
-                    {
-                        image::save_buffer(format!("{}.mirror.png", sp.trim_end_matches(".png")), &px, w, h, image::ColorType::Rgba8).expect("write mirror png");
-                    }
-                }
-                self.test_alpha = None;
-            }
-            // diagnostic: `NFS_MIRROR_DUMP=1` writes the mirror's own texture next to the screenshot
-            if nfs_game::config::cfg().nfs_mirror_dump.as_str().is_some()
-                && let (Some(tex), Some(r)) = (self.mirror_tex, self.renderer.as_mut())
-                && let Ok((w, h, px)) = r.read_texture(tex)
-            {
-                let mp = format!("{}.mirror.png", path.trim_end_matches(".png"));
-                image::save_buffer(&mp, &px, w, h, image::ColorType::Rgba8).expect("write mirror png");
-                tracing::info!(path = mp, w, h, "mirror texture written");
-            }
-            event_loop.exit();
+            self.take_screenshot(path, event_loop);
         }
     }
 

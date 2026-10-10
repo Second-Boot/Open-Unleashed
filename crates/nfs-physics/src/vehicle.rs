@@ -42,6 +42,66 @@ pub use netcar::Block as NetBlock;
 use tuning::*;
 use x87::{fistp, sign_clamp, tyre_demand_clamp};
 
+/// [`Vehicle::race_state`], `car+0xB50` (the finish state). Every store is one of these three
+/// (the app's per-tick writes, simulate.rs / net.rs); nothing reads it from a file or the wire.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RaceState {
+    /// 0: racing.
+    #[default]
+    Racing = 0,
+    /// 2: finished.
+    Finished = 2,
+    /// 3: out.
+    Out = 3,
+}
+
+/// [`Vehicle::contact_kind`], `car+0x438 & 0xEFFF0000` — the kind of the tick's last contact
+/// writer; the word goes to the force feedback as is ([`ContactKind::word`]).
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ContactKind {
+    /// 0: nothing wrote it this tick (0x40FB0D clears it).
+    #[default]
+    None = 0,
+    /// `0x30000`, the body on the ground (0x496104).
+    Ground = 0x30000,
+    /// `0x40000`, a wall (0x49411E…).
+    Wall = 0x40000,
+    /// `0x50000`, a prop or a car (0x498A44, 0x498DB6, 0x496CB5…).
+    PropOrCar = 0x50000,
+    /// `0x60000`, a bush (0x498F00).
+    Bush = 0x60000,
+}
+
+impl ContactKind {
+    /// The word `car+0x438 & 0xEFFF0000` as the original stores it.
+    #[inline]
+    pub fn word(self) -> u32 {
+        self as u32
+    }
+}
+
+/// [`Vehicle::engine_arm`] (diagnostic only): which arm of `engine_update`'s rev/clutch
+/// selection ran last.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EngineArm {
+    /// 0: no engine step yet.
+    #[default]
+    None = 0,
+    /// 1: the clutch arm.
+    Clutch = 1,
+    /// 2: the over-run (engine braking) arm.
+    Overrun = 2,
+    /// 3: `diff == 0`.
+    AtTarget = 3,
+    /// 4: a misfire under the target.
+    Misfire = 4,
+    /// 5: the driving arm under the target.
+    Driving = 5,
+}
+
 /// A front wheel's angle in 1/256 turn from its steering value: `max_steer · steer / 17`.
 /// `set_wheel_steer` scales the lock to 17 (`y · 17 / max_steer`), so this undoes it. One function
 /// for the tyre and the renderer.
@@ -157,7 +217,7 @@ pub struct Vehicle {
     /// Diagnostic only: which arm of `engine_update`'s rev/clutch selection ran last — 1 the
     /// clutch arm, 2 the over-run (engine braking) arm, 3 `diff == 0`, 4 a misfire under the
     /// target, 5 the driving arm under the target.
-    pub engine_arm: u8,
+    pub engine_arm: EngineArm,
     /// `DraftFactor` 0x49D9B0's result, which scales the drag. 1.0 = clean air; the caller sets it
     /// from the other racers each tick with [`draft_factor`].
     pub draft: f32,
@@ -194,7 +254,7 @@ pub struct Vehicle {
     /// otherwise.
     pub game_tick: u64,
     /// `car+0xB50`, the finish state: 0 racing, 2 finished, 3 out.
-    pub race_state: u8,
+    pub race_state: RaceState,
     /// `RALLY` `[0x6573F8]`, the race option the Dakar code sets (cheat bit 0) — global, so every
     /// car in the race has it: surfaces 1 and 10 read as 2 (0x499B90, 0x49AFE1), the steering
     /// ramps 18 a tick (0x49DFC0), the front grip limits ×1.1 (0x4A1ADD), the drive
@@ -407,7 +467,7 @@ pub struct Vehicle {
     /// `car+0x438 & 0xEFFF0000`, the kind of the last writer: `0x30000` the body on the ground
     /// (0x496104), `0x40000` a wall (0x49411E…), `0x50000` a prop or a car (0x498A44, 0x498DB6,
     /// 0x496CB5…), `0x60000` a bush (0x498F00). 0 when nothing wrote it this tick.
-    pub contact_kind: u32,
+    pub contact_kind: ContactKind,
     /// `car+0x440…+0x448`, the **last contact point** in world space — read 2026-09-26, CONFIRMED.
     /// The byte scan of `+0x440` / `+0x444` / `+0x448` finds seven writers, all in the collision
     /// code: the wall pass 0x495506 (the car's own **corner** that crossed the edge, the point it
@@ -458,7 +518,7 @@ impl Vehicle {
             ground_normal: Vec3::Y,
             cos_tilt: 1.0,
             engine_kill: 0,
-            engine_arm: 0,
+            engine_arm: EngineArm::None,
             draft: 1.0,
             boost: 0.0,
             misfire_roll: 1.0,
@@ -476,7 +536,7 @@ impl Vehicle {
             reverse_latch: false,
             // a car no race clock drives (the scenarios) behaves as one made on the start tick
             game_tick: 0x1C1,
-            race_state: 0,
+            race_state: RaceState::Racing,
             rally: false,
             tcs: false,
             tiny: false,
@@ -547,7 +607,7 @@ impl Vehicle {
             last_contact: Vec3::ZERO,
             last_wall_effect: 0.0,
             contact_mag: 0.0,
-            contact_kind: 0,
+            contact_kind: ContactKind::None,
             tracker: PatchTracker::new(Vec3::new(position.x, position.y - wheel_radius, position.z)),
             net_car: false,
             rng: 0x3ADE_68B1,
@@ -660,7 +720,7 @@ impl Vehicle {
     /// `physics.md` §4.1c; `car+0xD89`, the other request, is only ever cleared.)
     pub fn reset_request(&mut self, requested: bool, game_tick: u64) -> bool {
         let go = requested
-            && self.race_state == 0
+            && self.race_state == RaceState::Racing
             && game_tick > TICK_RESET_ALLOWED
             && self.reset_hold == 0
             && self.horizontal_speed() < RESET_SPEED_LIMIT;
@@ -943,58 +1003,86 @@ impl Vehicle {
         self.ground_contact(grid, specs);
     }
 
-    /// `Car_physicsStep` 0x49F160, which `Car_simulate` calls on an upright car.
+    /// `Car_physicsStep` 0x49F160, which `Car_simulate` calls on an upright car. The named steps
+    /// below run in the binary's order; how each was corrected over time is in
+    /// `RE/notes/physics-history.md` §1.
     fn physics_step(&mut self, specs: &CarSpecs) {
         let m = self.frame;
         // 0x628F9C = !(w0.air && w1.air && bodyHeight > 0.05), likewise for the rear axle
         let front_contact = !(self.wheels[0].airborne && self.wheels[1].airborne && self.body_height > 0.05);
         let rear_contact = !(self.wheels[2].airborne && self.wheels[3].airborne && self.body_height > 0.05);
-        self.v_local = m * self.velocity;
-        self.w_local = m * self.angular_velocity;
-        let vl = self.v_local;
-        // **Signed, not `|vz|`.** 0x49F25C loads `car+0xD60` with no `fabs` and 0x49F262 compares
-        // it with `[0x5B2400]` = 5.0; 0x49F270's `test ah,0x41; jne` zeroes the ratio when
-        // `vz <= 5`. So driving **backwards** the slip tangent is always 0 in the original, where
-        // the port's `abs()` kept computing a ratio. It gates the kick-down and scales the
-        // longitudinal demand, so the difference shows up in reverse. Corrected 2026-09-21.
-        self.slip_tangent = if vl.z > 5.0 { vl.x / vl.z } else { 0.0 };
-        // contact-patch slip velocities (×−16) with the yaw/roll term
-        let yaw = specs.yaw_lever * self.angular_velocity.y * 32.0 * -0.5;
+        let vl = self.body_frame_velocity(m);
         // `car+0x35C`, the estimate `Car_ground` makes of the **world** velocity's `x` / `z`
         // (0x49BEA9…0x49BF02) — the roll factor (0x49F2EA), the steering rack (0x49F5EA) and the
         // tail's gates (0x49FB98, 0x49FBE5, 0x49FCF7) all load it; the step never rewrites it,
         // so the tail sees the value from before this tick's integration. Confirmed by disassembly
         // 2026-09-27: 0x49F2EA is `fld dword ptr [esi+0x35c]`, a bare memory load, no recompute.
-        // *(Corrected 2026-09-26: the port took the estimate of the physics-frame `car+0xD58` /
-        // `+0xD60`, which is not rotation-invariant — up to 1/0.884 of it at 45° of heading.)*
-        // *(Corrected 2026-09-27: the port then worked it out here from the current velocity —
-        // [`Self::horizontal_speed`] recomputed on `self.velocity`, which `car_ground_body`
-        // (`Car_ground`) already advanced (gravity, the bounce/landing impulses, the ceiling rule)
-        // between when it stored [`Self::speed_est`] and now. [`Self::speed_est`] is [`car_ground_body`]'s
-        // stored `car+0x35C` from the previous tick's `Car_ground` — the same value the ordering
-        // `physics_step` (this tick) then `ground_contact` (this tick, i.e. next tick's `Car_ground`
-        // pass relative to this step) reproduces — and is what the tail below must read.)*
+        // [`Self::speed_est`] is [`car_ground_body`]'s stored `car+0x35C` from the previous tick's
+        // `Car_ground` (history: `physics-history.md` §1.2).
         let speed = self.speed_est;
-        // The two arms are the other way round: 0x49F2F0 compares the speed with `[0x5B241C]` =
-        // 10.0 and 0x49F301's `je` goes to the **`+70 … ×0.0125`** arm when `speed >= 10`, while
-        // the fall-through at 0x49F303 is `+30 … ×0.025` for `speed < 10`. (Both give `1.0·yaw`
-        // at exactly 10, so the curve is continuous either way and only the branch order tells
-        // them apart.) `physics.md` §4 had it inverted and the port followed.
+        self.contact_patch_slip(specs, vl, speed);
+        let gravity_l = m * Vec3::new(0.0, -GRAVITY, 0.0);
+        // 0x49F3D4: `Car_processInput` 0x49DD20 runs here, after `car+0xD58…+0xD6C`, `car+0xDC0`,
+        // the contact-patch slip velocities and `[0x628FA0…A8]` — so its gearbox (the automatic's
+        // request, the pick out of neutral, `AutoShift`) reads this tick's body-frame velocity and
+        // slip tangent (history: `physics-history.md` §1.4).
+        self.process_input(specs);
+        self.steering_and_damage_pull(specs, front_contact, gravity_l, speed, vl);
+        let a_drive = self.engine_update(specs, rear_contact);
+        if !front_contact && !rear_contact {
+            self.accel_local = Vec3::ZERO;
+            for w in &mut self.wheels {
+                w.slip = 0.0;
+                w.lateral = 0.0;
+                w.longitudinal = 0.0;
+            }
+        } else {
+            self.wheel_demands(specs, vl, a_drive);
+            self.axle_tyres(specs, front_contact, rear_contact);
+            let torque_y = self.tyre_force_sums(specs);
+            self.stability_assist(vl);
+            self.integrate_forces(m, torque_y);
+            self.tail_damping(specs, speed, gravity_l, vl);
+        }
+    }
+
+    /// `Car_physicsStep` 0x49F160 up to 0x49F270: the body-frame velocities `car+0xD58` /
+    /// `+0xD64` and the slip tangent `car+0xDC0`. Returns `car+0xD58…+0xD60`.
+    fn body_frame_velocity(&mut self, m: Mat3) -> Vec3 {
+        self.v_local = m * self.velocity;
+        self.w_local = m * self.angular_velocity;
+        let vl = self.v_local;
+        // **Signed, not `|vz|`.** 0x49F25C loads `car+0xD60` with no `fabs` and 0x49F262 compares
+        // it with `[0x5B2400]` = 5.0; 0x49F270's `test ah,0x41; jne` zeroes the ratio when
+        // `vz <= 5`. So driving **backwards** the slip tangent is always 0 in the original
+        // (history: `physics-history.md` §1.1).
+        self.slip_tangent = if vl.z > 5.0 { vl.x / vl.z } else { 0.0 };
+        vl
+    }
+
+    /// `Car_physicsStep` 0x49F2EA…, before `Car_processInput` at 0x49F3D4: the contact-patch slip
+    /// velocities (×−16) with the yaw/roll term; `speed` is `car+0x35C` ([`Self::speed_est`]).
+    fn contact_patch_slip(&mut self, specs: &CarSpecs, vl: Vec3, speed: f32) {
+        // contact-patch slip velocities (×−16) with the yaw/roll term
+        let yaw = specs.yaw_lever * self.angular_velocity.y * 32.0 * -0.5;
+        // 0x49F2F0 compares the speed with `[0x5B241C]` = 10.0 and 0x49F301's `je` goes to the
+        // **`+70 … ×0.0125`** arm when `speed >= 10`, while the fall-through at 0x49F303 is
+        // `+30 … ×0.025` for `speed < 10`. (Both give `1.0·yaw` at exactly 10, so the curve is
+        // continuous either way and only the branch order tells them apart; history:
+        // `physics-history.md` §1.3.)
         let roll = if speed < 10.0 { (speed + 30.0) * yaw * 0.025 } else { (speed + 70.0) * yaw * 0.0125 };
         for (i, w) in self.wheels.iter_mut().enumerate() {
             let lat = -16.0 * vl.x + if i < 2 { roll } else { -roll };
             w.slip_vel = [lat, -16.0 * vl.y, -16.0 * vl.z];
         }
-        let gravity_l = m * Vec3::new(0.0, -GRAVITY, 0.0);
-        // 0x49F3D4: `Car_processInput` 0x49DD20 runs here, after `car+0xD58…+0xD6C`, `car+0xDC0`,
-        // the contact-patch slip velocities and `[0x628FA0…A8]` — so its gearbox (the automatic's
-        // request, the pick out of neutral, `AutoShift`) reads this tick's body-frame velocity and
-        // slip tangent. *(Corrected 2026-09-26: the port ran it first, on the previous tick's.)*
-        self.process_input(specs);
+    }
+
+    /// `Car_physicsStep` 0x49F3EE…0x49F5EA: the steering angle law — the gravity offset, the
+    /// damage pull and its noise, the force-feedback words — into [`Self::set_wheel_steer`].
+    fn steering_and_damage_pull(&mut self, specs: &CarSpecs, front_contact: bool, gravity_l: Vec3, speed: f32, vl: Vec3) {
         // steering angle law. Both float→int steps here are **bare `fistp`** — 0x49F3EE for the
         // gravity offset and 0x49F4C9 for the damage pull — so they round to nearest (ties to
-        // even), not truncate. `physics.md` writes them as `int()` and the port used `as i32`.
-        // Corrected 2026-09-21; see `RE/CONVENTIONS.md`.
+        // even), not truncate; see `RE/CONVENTIONS.md` (history: `physics-history.md` §1.5).
         let g_off = fistp(gravity_l.x * 8.0).clamp(-64, 64);
         // damage pull, read to the instruction 2026-09-26 (0x49F412…0x49F4C3): `zone2·¼ − zone0·¼`,
         // and when the game tick `[0x606AC4]` is a multiple of 4 (`and 0x80000003`, 0x49F437) a
@@ -1003,11 +1091,7 @@ impl Vehicle {
         // by `car+0x35C · 1/15` **below** 15 m/s (`[0x5B243C]`, `[0x5B49EC]`; `test ah,1; je` skips
         // it at 15 and above; confirmed by disassembly 2026-09-27: 0x49F498 and 0x49F4AE are both
         // `fld dword ptr [esi+0x35c]`, the same stored estimate `speed` above, not a fresh
-        // recompute). *(Corrected: the port counted its own ticks, drew from an LCG of its
-        // own, scaled by speed/15 above 15 instead of below, and took 1/100 of it — none of which
-        // is in the binary; `physics.md` §4 had the speed arm inverted.)* *(Corrected 2026-09-27:
-        // the port also recomputed this speed from the velocity instead of reading `speed`,
-        // i.e. [`Self::speed_est`] — see the note at the top of this function.)*
+        // recompute). History: `physics-history.md` §1.6.
         let mut pull = self.damage[2] * 0.25 - self.damage[0] * 0.25;
         let mut noise_term = 0.0f32; // `[ebp+8]`, left 0 on a tick that is not a multiple of 4 (0x49F430)
         if self.game_tick.is_multiple_of(4) {
@@ -1025,154 +1109,158 @@ impl Vehicle {
         // previous `Tyre` left them (this runs before it). Output only.
         self.ff_words = crate::force_feedback::ff_words(front_contact, self.wheels[0].slip + self.wheels[1].slip, specs.grip, noise_term, pull, g_off, speed);
         self.set_wheel_steer(specs, (self.steer + fistp(pull) + g_off).clamp(-127, 127) as f32, speed, vl.z);
-        let a_drive = self.engine_update(specs, rear_contact);
-        if !front_contact && !rear_contact {
-            self.accel_local = Vec3::ZERO;
-            for w in &mut self.wheels {
-                w.slip = 0.0;
-                w.lateral = 0.0;
-                w.longitudinal = 0.0;
-            }
-        } else {
-            let mut a_brake = specs.brake_decel * self.brake * (1.0 - 0.005 * self.brakes_wear(specs));
-            a_brake = a_brake.min(vl.z.abs() * 32.0);
-            let sign = -vl.z.signum();
-            let a_brake = a_brake * if vl.z == 0.0 { 0.0 } else { sign };
-            let a_bf = a_brake * specs.front_brake;
-            self.load_transfer(specs);
-            let f = specs.front_drive;
-            let (l0, l1, l2, l3) = (self.wheels[0].limit, self.wheels[1].limit, self.wheels[2].limit, self.wheels[3].limit);
-            // The drive split, read to the instruction 2026-09-26 (0x49F7E4…0x49F894): a plain
-            // `fdiv` by `L0 + L1` (`wheel+0xAC` at 0x864 / 0x928) and `L2 + L3` (0x9EC / 0xAB0),
-            // no floor — `a·specs[0x5C]·L0`, `L1·specs[0x5C]·a`, `(1 − specs[0x5C])·L2·a`,
-            // `(1 − specs[0x5C])·L3·a` in that operand order. Since `LoadTransfer` no longer floors
-            // the limits (b9141f7) a sum can be negative, and the original divides by it.
-            // *(Corrected: the port took `max(sum, 1e-6)`, which turned a negative sum into a
-            // divisor of 1e-6.)* An exactly zero sum gives the axle no drive share here, where the
-            // original's x87 divide makes ±inf / NaN of it — **unreachable** (settled 2026-09-30,
-            // batch A6): a sum is `2·μ·share·g_eff/2 ± dz` with `μ ≥ 0.5` in both grip tables
-            // (0x5D0D50 / 0x5D0E4C), `share` the front weight 0.44…0.485 of all 86 shipped
-            // `.sim`s (or its complement), `grip ≥ 1.1`, so zero needs `g_eff = up.y·grip·g` to be
-            // exactly 0 (a car on its side to the last bit) or an exact cancellation with `dz`; a
-            // zero or negative-sum tick was not seen in 84 s of races (the three goldens and a 60 s
-            // alps race) either.
-            let share = |x: f32, s: f32| if s == 0.0 { 0.0 } else { x / s };
-            let (fs, rs) = (l0 + l1, l2 + l3);
-            self.wheels[0].demand = share(a_drive * f * l0, fs) + 0.5 * a_bf;
-            self.wheels[1].demand = share(l1 * f * a_drive, fs) + 0.5 * a_bf;
-            self.wheels[2].demand = share((1.0 - f) * l2 * a_drive, rs) + 0.5 * (a_brake - a_bf);
-            self.wheels[3].demand = share((1.0 - f) * l3 * a_drive, rs) + 0.5 * (a_brake - a_bf);
-            for w in &mut self.wheels {
-                w.lateral = 0.0;
-                w.longitudinal = 0.0;
-            }
-            // 0x493980, the tyre figure: the zones and the part list do not change inside the step, so
-            // the four tyres share one evaluation
-            let tyre_damage = if front_contact || rear_contact { self.tyres_wear(specs) } else { 0.0 };
-            if front_contact {
-                self.tyre(0, specs, tyre_damage);
-                self.tyre(1, specs, tyre_damage);
-            }
-            if rear_contact {
-                self.tyre(2, specs, tyre_damage);
-                self.tyre(3, specs, tyre_damage);
-            }
-            let w = &self.wheels;
-            let fx: f32 = w.iter().map(|w| w.lateral).sum();
-            let fz: f32 = w.iter().map(|w| w.longitudinal).sum();
-            self.accel_local = Vec3::new(fx, 0.0, fz * specs.inv_grip);
-            // yaw torque, 0x49F9A0…0x49F9E3 re-read 2026-09-26: `A − B` with
-            // `A = ((w1.lat + w0.lat) − (w2.lat + w3.lat)) · specs[0x1B8]` and
-            // `B = ((w2.long + w0.long) − w1.long − w3.long) · specs[0x1B8]` (the wheels' `+0x90` /
-            // `+0x98` at 0x848 / 0x850, 0x90C / 0x914, 0x9D0 / 0x9D8, 0xA94 / 0xA9C) — the sum is
-            // exact; MEDIUM only on the sign conventions the tyre model gives `+0x90` / `+0x98`
-            let torque_y = ((w[1].lateral + w[0].lateral) - (w[2].lateral + w[3].lateral)) * specs.inv_yaw_lever
-                - ((w[2].longitudinal + w[0].longitudinal) - w[1].longitudinal - w[3].longitudinal) * specs.inv_yaw_lever;
-            // **Stability assist 0x49F0C0, corrected 2026-09-21.** Two gates, both of which the
-            // port had wrong.
-            //
-            // The lateral term: 0x49F11F compares `|car+0xD58|` with 1.0 and 0x49F12A's
-            // `test ah,0x41; je` jumps **straight to the add** when `|x| > 1`; only the
-            // `|x| <= 1` path falls through to the second test, `[car+0x374] < 0.833`
-            // (0x49F132 / 0x49F13D). So the condition is `|vL.x| > 1 || M[1].y < 0.833`, and the
-            // port asked for `< 1`.
-            //
-            // The longitudinal term is not unconditional either: 0x49F0E3 is
-            // `cmp byte [ecx+0xD80], 0x40; jae 0x49F104`, so `−4.9 · M[2].y` is added only while
-            // the **brake byte is under 64** of 255.
-            //
-            // Re-read 2026-09-26 (0x49F0C0…0x49F157, called at 0x49F9EC): the assist adds **into
-            // `car+0xD4C` / `+0xD54` themselves** (`fadd [ecx+0xD54]; fstp [ecx+0xD54]`,
-            // 0x49F0F8 / 0x49F14B), so the world acceleration (0x49F9F6…), the filters `+0xE08` /
-            // `+0xE04` (0x49FAFE…0x49FB34) and next tick's `LoadTransfer` and `Susp_update` all see
-            // the sum; the tilts it reads are the **body** rows `car+0x368` / `+0x380` (the
-            // orientation's `M[0].y` / `M[2].y`), not the physics frame `car+0x490`; and the byte
-            // is `car+0xD80` as 0x49DD20 leaves it — 0xFF before the start, so a car on a sloped
-            // grid is not pushed downhill. *(Corrected: the port added it to a copy, from the
-            // physics frame, with the controller's brake byte.)* Not carried: the gate at
-            // 0x49F0C4…0x49F0E1 — skipped for a traffic body (`car+0x52C & 0x10`, which never
-            // runs `Car_simulate`) and in a network race (`[0x6573E8] == 3` with `[0x657408]`).
-            if vl.x.abs() > 1.0 || self.orientation.row(1).y < SLOPE_UP_Y {
-                self.accel_local.x += SLOPE_PUSH_X * self.orientation.row(0).y;
-            }
-            if self.brake_byte < 0x40 {
-                self.accel_local.z += SLOPE_PUSH_Z * self.orientation.row(2).y;
-            }
-            let local = self.accel_local;
-            let acc = m.transpose() * local;
-            self.accel_world = acc;
-            let angacc = m.transpose() * Vec3::new(0.0, torque_y, 0.0);
-            self.velocity += acc * DT32;
-            self.angular_velocity.x += angacc.x * DT32;
-            self.angular_velocity.z += angacc.z * DT32;
-            // the yaw step is 1/48 of the angular acceleration, 1/32 for `.TINYCAR` (0x49FAD4)
-            self.angular_velocity.y += angacc.y * if self.tiny { 1.0 / 32.0 } else { 1.0 / 48.0 };
-            self.lateral_filtered = 0.25 * self.accel_local.x + 0.75 * self.lateral_filtered;
-            self.long_filtered = 0.9 * self.long_filtered + 0.1 * self.accel_local.z;
-            // 0x49FB3A: under `RALLY` the velocity loses `0.002 · min(|car+0xDC0|, 5)` of itself
-            // each step (0x532360 over `car+0x33C`, `[0x5B2400]` 5, `[0x5B4A30]` 0.002)
-            if self.rally {
-                self.velocity *= 1.0 - 0.002 * self.slip_tangent.abs().min(5.0);
-            }
-            // **Coast yaw damping / handbrake — both conditions were inverted, 2026-09-21.**
-            // 0x49FBE5 loads the speed and compares it with `[0x5B2408]` = 30.0; 0x49FBF3's
-            // `test ah,1; je` **bails** when `speed >= 30`, so the damping is a *low*-speed
-            // effect. 0x49FBFE then loads `specs[0xF4]` against `[0x5B2464]` = 2.5 and
-            // 0x49FC0C's `test ah,0x41; jne` bails when it is `<= 2.5`, so it needs a grip
-            // multiplier **above** 2.5. The port asked for `> 30` and `<= 2.5`, which is the
-            // opposite pair on both counts.
-            //
-            // The handbrake arm is the same shape: 0x49FCFD compares the speed with 1.0 and
-            // 0x49FD05's `je` bails when `speed >= 1`, so `vel *= 0.5` is the stop-it-dead
-            // behaviour at a standstill, not a braking force at speed.
-            //
-            // The tail read to the instruction 2026-09-26 (0x49FB8F…0x49FD21), each arm a `ret`:
-            // * 0x49FB8F: the body's surface word `car+0x464 == 3` and `car+0x35C > 44.64`
-            //   (`[0x5B4A70]`; `test ah,0x41; jne` skips at `<=`) → the world velocity `car+0x33C`
-            //   ×0.995 (`0x3F7EB852`, 0x532360) and return — none of the arms below.
-            // * gear `car+0xD82 > 1` (signed `jle`, 0x49FBCC): the coast damping above; any failed
-            //   test goes to 0x49FC51, whose `cmp cl,1; jne` sends a forward gear to the handbrake.
-            // * gear `== 1`, neutral (0x49FC54…0x49FCE3): when `|[0x628FA8]| < 0.5` (gravity along
-            //   the frame's `z`, `test ah,1; je` bails at `>=`), `f = 0.998` (`0x3F7F7CEE`) if
-            //   `|car+0xD60| >= 20` and `|car+0xD94| <= 32` (`jle`), else `f = 0.99`
-            //   (`0x3F7D70A4`); the velocity `car+0x33C` **and** the angular velocity `car+0x388`
-            //   (`[ebp−0x10]`, 0x49FA8B) ×f, whole vectors, and return. Otherwise the handbrake.
-            // * 0x49FCED, the handbrake: byte `car+0xD85` and `car+0x35C < 1` → velocity ×0.5.
-            // *(Corrected 2026-09-26: the surface-3 and neutral arms were missing, and a car in
-            // neutral fell through to the handbrake.)*
-            if self.surface_nibble() == 3 && speed > SURFACE3_DAMP_SPEED {
-                self.velocity *= 0.995;
-            } else if self.gear > 1 && self.throttle < 0.25 && speed < 30.0 && specs.grip > 2.5 {
-                let k = 1.0 - 0.05 * self.angular_velocity.y.abs();
-                self.velocity.x *= k;
-                self.velocity.z *= k;
-            } else if self.gear == 1 && gravity_l.z.abs() < 0.5 {
-                let f = if vl.z.abs() >= 20.0 && self.steer.abs() <= 32 { 0.998 } else { 0.99 };
-                self.velocity *= f;
-                self.angular_velocity *= f;
-            } else if self.handbrake && speed < 1.0 {
-                self.velocity *= 0.5;
-            }
+    }
+
+    /// `Car_physicsStep` with ground contact: the brake force, `LoadTransfer` and each wheel's
+    /// demand from the drive split (0x49F7E4…0x49F894); clears the tyre forces.
+    fn wheel_demands(&mut self, specs: &CarSpecs, vl: Vec3, a_drive: f32) {
+        let mut a_brake = specs.brake_decel * self.brake * (1.0 - 0.005 * self.brakes_wear(specs));
+        a_brake = a_brake.min(vl.z.abs() * 32.0);
+        let sign = -vl.z.signum();
+        let a_brake = a_brake * if vl.z == 0.0 { 0.0 } else { sign };
+        let a_bf = a_brake * specs.front_brake;
+        self.load_transfer(specs);
+        let f = specs.front_drive;
+        let (l0, l1, l2, l3) = (self.wheels[0].limit, self.wheels[1].limit, self.wheels[2].limit, self.wheels[3].limit);
+        // The drive split, read to the instruction 2026-09-26 (0x49F7E4…0x49F894): a plain
+        // `fdiv` by `L0 + L1` (`wheel+0xAC` at 0x864 / 0x928) and `L2 + L3` (0x9EC / 0xAB0),
+        // no floor — `a·specs[0x5C]·L0`, `L1·specs[0x5C]·a`, `(1 − specs[0x5C])·L2·a`,
+        // `(1 − specs[0x5C])·L3·a` in that operand order. Since `LoadTransfer` no longer floors
+        // the limits (b9141f7) a sum can be negative, and the original divides by it (history:
+        // `physics-history.md` §1.7). An exactly zero sum gives the axle no drive share here, where the
+        // original's x87 divide makes ±inf / NaN of it — **unreachable** (settled 2026-09-30,
+        // batch A6): a sum is `2·μ·share·g_eff/2 ± dz` with `μ ≥ 0.5` in both grip tables
+        // (0x5D0D50 / 0x5D0E4C), `share` the front weight 0.44…0.485 of all 86 shipped
+        // `.sim`s (or its complement), `grip ≥ 1.1`, so zero needs `g_eff = up.y·grip·g` to be
+        // exactly 0 (a car on its side to the last bit) or an exact cancellation with `dz`; a
+        // zero or negative-sum tick was not seen in 84 s of races (the three goldens and a 60 s
+        // alps race) either.
+        let share = |x: f32, s: f32| if s == 0.0 { 0.0 } else { x / s };
+        let (fs, rs) = (l0 + l1, l2 + l3);
+        self.wheels[0].demand = share(a_drive * f * l0, fs) + 0.5 * a_bf;
+        self.wheels[1].demand = share(l1 * f * a_drive, fs) + 0.5 * a_bf;
+        self.wheels[2].demand = share((1.0 - f) * l2 * a_drive, rs) + 0.5 * (a_brake - a_bf);
+        self.wheels[3].demand = share((1.0 - f) * l3 * a_drive, rs) + 0.5 * (a_brake - a_bf);
+        for w in &mut self.wheels {
+            w.lateral = 0.0;
+            w.longitudinal = 0.0;
+        }
+    }
+
+    /// `Car_physicsStep`: `Tyre` on each axle in contact.
+    fn axle_tyres(&mut self, specs: &CarSpecs, front_contact: bool, rear_contact: bool) {
+        // 0x493980, the tyre figure: the zones and the part list do not change inside the step, so
+        // the four tyres share one evaluation
+        let tyre_damage = if front_contact || rear_contact { self.tyres_wear(specs) } else { 0.0 };
+        if front_contact {
+            self.tyre(0, specs, tyre_damage);
+            self.tyre(1, specs, tyre_damage);
+        }
+        if rear_contact {
+            self.tyre(2, specs, tyre_damage);
+            self.tyre(3, specs, tyre_damage);
+        }
+    }
+
+    /// `Car_physicsStep` …0x49F9E3: the body-frame acceleration `car+0xD4C…+0xD54` from the tyre
+    /// forces, and the yaw torque it returns.
+    fn tyre_force_sums(&mut self, specs: &CarSpecs) -> f32 {
+        let w = &self.wheels;
+        let fx: f32 = w.iter().map(|w| w.lateral).sum();
+        let fz: f32 = w.iter().map(|w| w.longitudinal).sum();
+        self.accel_local = Vec3::new(fx, 0.0, fz * specs.inv_grip);
+        // yaw torque, 0x49F9A0…0x49F9E3 re-read 2026-09-26: `A − B` with
+        // `A = ((w1.lat + w0.lat) − (w2.lat + w3.lat)) · specs[0x1B8]` and
+        // `B = ((w2.long + w0.long) − w1.long − w3.long) · specs[0x1B8]` (the wheels' `+0x90` /
+        // `+0x98` at 0x848 / 0x850, 0x90C / 0x914, 0x9D0 / 0x9D8, 0xA94 / 0xA9C) — the sum is
+        // exact; MEDIUM only on the sign conventions the tyre model gives `+0x90` / `+0x98`
+        ((w[1].lateral + w[0].lateral) - (w[2].lateral + w[3].lateral)) * specs.inv_yaw_lever
+            - ((w[2].longitudinal + w[0].longitudinal) - w[1].longitudinal - w[3].longitudinal) * specs.inv_yaw_lever
+    }
+
+    /// Stability assist 0x49F0C0 (called at 0x49F9EC), history in `physics-history.md` §1.8.
+    ///
+    /// The lateral term: 0x49F11F compares `|car+0xD58|` with 1.0 and 0x49F12A's
+    /// `test ah,0x41; je` jumps **straight to the add** when `|x| > 1`; only the
+    /// `|x| <= 1` path falls through to the second test, `[car+0x374] < 0.833`
+    /// (0x49F132 / 0x49F13D). So the condition is `|vL.x| > 1 || M[1].y < 0.833`.
+    ///
+    /// The longitudinal term is not unconditional either: 0x49F0E3 is
+    /// `cmp byte [ecx+0xD80], 0x40; jae 0x49F104`, so `−4.9 · M[2].y` is added only while
+    /// the **brake byte is under 64** of 255.
+    ///
+    /// Re-read 2026-09-26 (0x49F0C0…0x49F157): the assist adds **into `car+0xD4C` / `+0xD54`
+    /// themselves** (`fadd [ecx+0xD54]; fstp [ecx+0xD54]`, 0x49F0F8 / 0x49F14B), so the world
+    /// acceleration (0x49F9F6…), the filters `+0xE08` / `+0xE04` (0x49FAFE…0x49FB34) and next
+    /// tick's `LoadTransfer` and `Susp_update` all see the sum; the tilts it reads are the
+    /// **body** rows `car+0x368` / `+0x380` (the orientation's `M[0].y` / `M[2].y`), not the
+    /// physics frame `car+0x490`; and the byte is `car+0xD80` as 0x49DD20 leaves it — 0xFF
+    /// before the start, so a car on a sloped grid is not pushed downhill. Not carried: the gate
+    /// at 0x49F0C4…0x49F0E1 — skipped for a traffic body (`car+0x52C & 0x10`, which never runs
+    /// `Car_simulate`) and in a network race (`[0x6573E8] == 3` with `[0x657408]`).
+    fn stability_assist(&mut self, vl: Vec3) {
+        if vl.x.abs() > 1.0 || self.orientation.row(1).y < SLOPE_UP_Y {
+            self.accel_local.x += SLOPE_PUSH_X * self.orientation.row(0).y;
+        }
+        if self.brake_byte < 0x40 {
+            self.accel_local.z += SLOPE_PUSH_Z * self.orientation.row(2).y;
+        }
+    }
+
+    /// `Car_physicsStep` 0x49F9F6…0x49FB8F: the world acceleration `car+0xD40`, the 32 Hz velocity
+    /// / angular-velocity step, the filters `+0xE08` / `+0xE04` and the `RALLY` drag.
+    fn integrate_forces(&mut self, m: Mat3, torque_y: f32) {
+        let local = self.accel_local;
+        let acc = m.transpose() * local;
+        self.accel_world = acc;
+        let angacc = m.transpose() * Vec3::new(0.0, torque_y, 0.0);
+        self.velocity += acc * DT32;
+        self.angular_velocity.x += angacc.x * DT32;
+        self.angular_velocity.z += angacc.z * DT32;
+        // the yaw step is 1/48 of the angular acceleration, 1/32 for `.TINYCAR` (0x49FAD4)
+        self.angular_velocity.y += angacc.y * if self.tiny { 1.0 / 32.0 } else { 1.0 / 48.0 };
+        self.lateral_filtered = 0.25 * self.accel_local.x + 0.75 * self.lateral_filtered;
+        self.long_filtered = 0.9 * self.long_filtered + 0.1 * self.accel_local.z;
+        // 0x49FB3A: under `RALLY` the velocity loses `0.002 · min(|car+0xDC0|, 5)` of itself
+        // each step (0x532360 over `car+0x33C`, `[0x5B2400]` 5, `[0x5B4A30]` 0.002)
+        if self.rally {
+            self.velocity *= 1.0 - 0.002 * self.slip_tangent.abs().min(5.0);
+        }
+    }
+
+    /// The tail of `Car_physicsStep`, 0x49FB8F…0x49FD21: four mutually exclusive velocity
+    /// scalings, each arm a `ret` (history: `physics-history.md` §1.9).
+    ///
+    /// * 0x49FB8F: the body's surface word `car+0x464 == 3` and `car+0x35C > 44.64`
+    ///   (`[0x5B4A70]`; `test ah,0x41; jne` skips at `<=`) → the world velocity `car+0x33C`
+    ///   ×0.995 (`0x3F7EB852`, 0x532360) and return — none of the arms below.
+    /// * gear `car+0xD82 > 1` (signed `jle`, 0x49FBCC): the coast yaw damping. 0x49FBE5 loads
+    ///   the speed and compares it with `[0x5B2408]` = 30.0; 0x49FBF3's `test ah,1; je`
+    ///   **bails** when `speed >= 30`, so the damping is a *low*-speed effect. 0x49FBFE then
+    ///   loads `specs[0xF4]` against `[0x5B2464]` = 2.5 and 0x49FC0C's `test ah,0x41; jne`
+    ///   bails when it is `<= 2.5`, so it needs a grip multiplier **above** 2.5. Any failed
+    ///   test goes to 0x49FC51, whose `cmp cl,1; jne` sends a forward gear to the handbrake.
+    /// * gear `== 1`, neutral (0x49FC54…0x49FCE3): when `|[0x628FA8]| < 0.5` (gravity along
+    ///   the frame's `z`, `test ah,1; je` bails at `>=`), `f = 0.998` (`0x3F7F7CEE`) if
+    ///   `|car+0xD60| >= 20` and `|car+0xD94| <= 32` (`jle`), else `f = 0.99`
+    ///   (`0x3F7D70A4`); the velocity `car+0x33C` **and** the angular velocity `car+0x388`
+    ///   (`[ebp−0x10]`, 0x49FA8B) ×f, whole vectors, and return. Otherwise the handbrake.
+    /// * 0x49FCED, the handbrake: byte `car+0xD85` and `car+0x35C < 1` → velocity ×0.5;
+    ///   0x49FCFD compares the speed with 1.0 and 0x49FD05's `je` bails when `speed >= 1`, so
+    ///   it is the stop-it-dead behaviour at a standstill, not a braking force at speed.
+    fn tail_damping(&mut self, specs: &CarSpecs, speed: f32, gravity_l: Vec3, vl: Vec3) {
+        if self.surface_nibble() == 3 && speed > SURFACE3_DAMP_SPEED {
+            self.velocity *= 0.995;
+        } else if self.gear > 1 && self.throttle < 0.25 && speed < 30.0 && specs.grip > 2.5 {
+            let k = 1.0 - 0.05 * self.angular_velocity.y.abs();
+            self.velocity.x *= k;
+            self.velocity.z *= k;
+        } else if self.gear == 1 && gravity_l.z.abs() < 0.5 {
+            let f = if vl.z.abs() >= 20.0 && self.steer.abs() <= 32 { 0.998 } else { 0.99 };
+            self.velocity *= f;
+            self.angular_velocity *= f;
+        } else if self.handbrake && speed < 1.0 {
+            self.velocity *= 0.5;
         }
     }
 
@@ -1231,7 +1319,7 @@ impl Vehicle {
 
     /// 0x40F740's end of tick for the contact word: the magnitude and the kind, cleared
     /// (`car+0x430 = car+0x434 = car+0x438 = 0`, 0x40FAFB…0x40FB0D).
-    pub fn take_contact(&mut self) -> (f32, u32) {
+    pub fn take_contact(&mut self) -> (f32, ContactKind) {
         (std::mem::take(&mut self.contact_mag), std::mem::take(&mut self.contact_kind))
     }
 

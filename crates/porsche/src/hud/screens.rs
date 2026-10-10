@@ -60,7 +60,7 @@ impl Hud {
         let row_text = |y: f32| y + ((20.0 - EXT_SMALL) / 2.0).trunc();
         let mut cx = left;
         for (i, h) in head.iter().enumerate() {
-            self.text(out, aspect, h, cx + 4.0, row_text(top), th, black);
+            self.text(out, aspect, h, (cx + 4.0, row_text(top)), th, black);
             cx += widths.get(i).copied().unwrap_or(0.0);
         }
         for (k, row) in rows.iter().take(n as usize).enumerate() {
@@ -80,7 +80,7 @@ impl Hud {
                     out.push(self.quad(aspect, sx + 17.0, sy, 1.0, 6.0, black));
                     tx += 22.0;
                 }
-                self.text(out, aspect, t, tx, row_text(ry), th, black);
+                self.text(out, aspect, t, (tx, row_text(ry)), th, black);
                 cx += widths.get(i).copied().unwrap_or(0.0);
             }
         }
@@ -272,9 +272,9 @@ impl Hud {
         let nh = FONT_SMALL;
         let nw = self.text_width(name, nh);
         let nx = if nw < 54.0 { (x + 20.0 + (54.0 - nw) * 0.5).trunc() } else { x + 20.0 + 2.0 };
-        self.text(out, aspect, name, nx, py + 66.0, nh, [0.0, 0.0, 0.0, 0xCC as f32 / 255.0]);
+        self.text(out, aspect, name, (nx, py + 66.0), nh, [0.0, 0.0, 0.0, 0xCC as f32 / 255.0]);
         let (bx, by) = Self::mission_button();
-        self.button_sprites(out, aspect, bx, by, race_again, button.0, button.1);
+        self.button_sprites(out, aspect, (bx, by), race_again, button.0, button.1);
         // the result text (`+0x12C`, 0x428AEB…0x428B06): `unviers9b` in 0xFF000000, one visual moved
         // line by line from `(W/2 − w/4, H/2 − h/4)` (`+0x130`/`+0x134`, 0x428B15…0x428B67), each line
         // `measured height · [0x5B2CC0] 1.5` below the last (0x4291FC…0x429210), and **typed out**: the
@@ -288,7 +288,7 @@ impl Hud {
         for l in lines {
             let n = l.chars().count();
             let shown: String = l.chars().take(left.min(n)).collect();
-            self.text(out, aspect, &shown, lx, ly, th, [0.0, 0.0, 0.0, 1.0]);
+            self.text(out, aspect, &shown, (lx, ly), th, [0.0, 0.0, 0.0, 1.0]);
             ly += EXT_SMALL * 1.5;
             if left <= n {
                 break;
@@ -357,15 +357,15 @@ impl Hud {
         let white = [1.0, 1.0, 1.0, 1.0];
         let th = FONT_MAIN;
         let strip = |top: f32| (top + (22.0 - EXT_MAIN) * 0.5).trunc();
-        self.text(out, aspect, bb.left, x + 10.0, strip(y), th, white);
+        self.text(out, aspect, bb.left, (x + 10.0, strip(y)), th, white);
         let rw = self.text_width(bb.right, th);
-        self.text(out, aspect, bb.right, x + w - 10.0 - rw, strip(y), th, white);
+        self.text(out, aspect, bb.right, (x + w - 10.0 - rw, strip(y)), th, white);
         if let Some((esc, space)) = bb.hints {
             let by = strip(y + h - 44.0);
-            self.text(out, aspect, esc, x + 10.0, by, th, white);
+            self.text(out, aspect, esc, (x + 10.0, by), th, white);
             if let Some(sp) = space {
                 let sw = self.text_width(sp, th);
-                self.text(out, aspect, sp, x + w - 10.0 - sw, by, th, white);
+                self.text(out, aspect, sp, (x + w - 10.0 - sw, by), th, white);
             }
         }
         true
@@ -435,8 +435,7 @@ impl Hud {
 
     /// `hovered` is `+0x100`; `pressed` is the pointer's button held (`[p+0x10]` of 0x5372A0(6),
     /// 0x41B386), which with `hovered` gives the sunken bevel (0x41B4B2…0x41B4D9).
-    #[allow(clippy::too_many_arguments)]
-    fn button_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, label: &str, selected: bool, pressed: bool) {
+    fn button_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, (x, y): (f32, f32), label: &str, selected: bool, pressed: bool) {
         let (bw, bh) = HUD_BUTTON;
         let argb = |c: u32| [((c >> 16) & 0xFF) as f32 / 255.0, ((c >> 8) & 0xFF) as f32 / 255.0, (c & 0xFF) as f32 / 255.0, (c >> 24) as f32 / 255.0];
         let (fill, text) = if selected { (0xFFFA_B400, 0xFF00_0000) } else { (0xFFBC_0000, 0xFFFF_FFFF) };
@@ -468,18 +467,18 @@ impl Hud {
         out.push(ramp(dark_h, x + bw, y + 5.0, 5.0, bh, false));
         out.push(ramp(dark_v, x + 5.0, y + bh, bw, 5.0, true));
         let tw = self.text_width(label, FONT_MAIN);
-        self.text(out, aspect, label, x + (bw - tw) / 2.0, (y + (bh - EXT_MAIN) / 2.0).trunc(), FONT_MAIN, argb(text));
+        self.text(out, aspect, label, (x + (bw - tw) / 2.0, (y + (bh - EXT_MAIN) / 2.0).trunc()), FONT_MAIN, argb(text));
     }
 
     /// `HPauseMenu` (0x42A440): the billboard titled FE 18128 with three buttons — 18108 continue,
     /// 18109 race again, 18110 quit — at `x = W/2 − 71` and `y = ftol(H/2 − 1.5·step) + k·step`
     /// with `step = 19 · 1.6` (0x42A482…0x42A587, each `ftol`'d from the previous one).
-    pub fn pause_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, bb: &Billboard, labels: &[String; 3], sel: usize, pressed: bool) {
+    pub fn pause_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, bb: &Billboard, labels: &[&str; 3], sel: usize, pressed: bool) {
         if !self.billboard(out, aspect, bb) {
             return;
         }
         for (k, (l, (bx, by))) in labels.iter().zip(Self::pause_buttons()).enumerate() {
-            self.button_sprites(out, aspect, bx, by, l, k == sel, pressed);
+            self.button_sprites(out, aspect, (bx, by), l, k == sel, pressed);
         }
     }
 
@@ -526,18 +525,18 @@ impl Hud {
         }
         let [field, b0, b1, label_y] = Self::replay_save_rows();
         let x = HUD_REF_W / 2.0 - HUD_BUTTON.0 / 2.0;
-        self.button_sprites(out, aspect, x, field, name, true, true);
+        self.button_sprites(out, aspect, (x, field), name, true, true);
         if caret && self.font.is_some() {
             // 0x41B270: the text's own x (an integer) plus its measured width, `ftol`'d, then +1
             let tw = self.text_width(name, FONT_MAIN);
             let tx = (x + (HUD_BUTTON.0 - tw) / 2.0).trunc();
             let ty = (field + (HUD_BUTTON.1 - EXT_MAIN) / 2.0).trunc();
-            self.text(out, aspect, "I", (tx + tw).trunc() + 1.0, ty, FONT_MAIN, [0x80 as f32 / 255.0, 0x80 as f32 / 255.0, 0x80 as f32 / 255.0, 1.0]);
+            self.text(out, aspect, "I", ((tx + tw).trunc() + 1.0, ty), FONT_MAIN, [0x80 as f32 / 255.0, 0x80 as f32 / 255.0, 0x80 as f32 / 255.0, 1.0]);
         }
         for (k, (l, by)) in buttons.iter().zip([b0, b1]).enumerate() {
-            self.button_sprites(out, aspect, x, by, l, hover == Some(k), pressed);
+            self.button_sprites(out, aspect, (x, by), l, hover == Some(k), pressed);
         }
-        self.text(out, aspect, label, x, label_y, FONT_MAIN, [0.0, 0.0, 0.0, 0xC0 as f32 / 255.0]);
+        self.text(out, aspect, label, (x, label_y), FONT_MAIN, [0.0, 0.0, 0.0, 0xC0 as f32 / 255.0]);
     }
 
     /// `HReplaySave`'s rows: the field, the two buttons and the label (0x42E0C2…0x42E206), each
@@ -591,11 +590,11 @@ impl Hud {
         let x = HUD_REF_W / 2.0 - bw / 2.0;
         let mut y = (HUD_REF_H / 2.0 - step * 4.0 * 0.5).trunc();
         for l in lines {
-            self.text(out, aspect, l, x, y, FONT_MAIN, [0.0, 0.0, 0.0, 0xC0 as f32 / 255.0]);
+            self.text(out, aspect, l, (x, y), FONT_MAIN, [0.0, 0.0, 0.0, 0xC0 as f32 / 255.0]);
             y = (y + step).trunc();
         }
         for (k, (b, (bx, by))) in buttons.iter().zip(Self::yes_no_buttons()).enumerate() {
-            self.button_sprites(out, aspect, bx, by, b, k == sel, pressed);
+            self.button_sprites(out, aspect, (bx, by), b, k == sel, pressed);
         }
     }
 
@@ -616,7 +615,7 @@ impl Hud {
         let tw = self.text_width(text, th);
         let tx = (x + (w / 2.0).trunc() - tw * 0.5).trunc();
         let ty = (y + (h / 2.0).trunc() - EXT_MAIN * 0.5).trunc();
-        self.text(out, aspect, text, tx, ty, th, [0.0, 0.0, 0.0, 1.0]);
+        self.text(out, aspect, text, (tx, ty), th, [0.0, 0.0, 0.0, 1.0]);
     }
 
     /// The tournament standings (`HTournamentStandings` 0x431860, rows 0x431D33…0x431E46): ordinal,
@@ -729,10 +728,10 @@ impl Hud {
         let lx = (x + 10.0).trunc();
         for (r, (label, amount)) in lines.iter().enumerate() {
             let ry = row_y(r);
-            self.text(out, aspect, label, lx, ry, FONT_SMALL, white);
+            self.text(out, aspect, label, (lx, ry), FONT_SMALL, white);
             let s = format!("{amount} ");
             let sw = self.text_width(&s, FONT_SMALL);
-            self.text(out, aspect, &s, (lx + 180.0 - sw).trunc(), ry, FONT_SMALL, white);
+            self.text(out, aspect, &s, ((lx + 180.0 - sw).trunc(), ry), FONT_SMALL, white);
         }
     }
 

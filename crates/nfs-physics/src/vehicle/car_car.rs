@@ -319,8 +319,8 @@ fn pair_impulse(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, pt: 
         // `car+0x430` is assigned (0x496B42…0x496C3E), the word's kind is 5
         a.contact_mag = eff_a;
         b.contact_mag = eff_b;
-        a.contact_kind = 0x50000;
-        b.contact_kind = 0x50000;
+        a.contact_kind = ContactKind::PropOrCar;
+        b.contact_kind = ContactKind::PropOrCar;
         // The damage normal is not the contact normal (read 2026-09-26): the local 0x496F38 hands
         // 0x494DF0 is `A.pos − B.pos` (0x496CC3…0x496CF5), normalised in place (0x5328D0 at
         // 0x496D4D) — or `(0, 1, 0)` when the contact normal is exactly zero (0x496CF9…0x496D39),

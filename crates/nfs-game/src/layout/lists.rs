@@ -36,8 +36,7 @@ impl LayoutScreen {
     /// **names** (0x4C2530, 0x4C259A: 0x4BBB60 finds a player's row, slot 12 its text); `[+0x150]`
     /// is a range accessor of the box's own, `"%s.SliderBar"` (0x4C2BEF, 0x4BA310), which the
     /// scrollbar moves. The rows the draw 0x4C2F50 walks are the vector `[0x65B6A8]` of chat
-    /// lines (0x4C2FD1), filled by 0x4C24F0 as lines arrive. *(Corrected 2026-09-25: §4.131 read
-    /// the rows as the accessor's, and the box showed the player list.)*
+    /// lines (0x4C2FD1), filled by 0x4C24F0 as lines arrive. (history: `game-history.md` §24.1)
     pub fn chat_boxes(&self) -> Vec<usize> {
         self.layout.elements.iter().enumerate().filter(|(_, e)| e.class == "NFS5.CHATDISPLAYBOX").map(|(i, _)| i).collect()
     }

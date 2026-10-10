@@ -233,7 +233,7 @@ impl App {
             let (sx, sy) = (ex / 640.0, ey / 480.0);
             let dir = fwd + right * ((sx * 2.0 - 1.0) * tan_x) + up * ((1.0 - sy * 2.0) * tan_y);
             let centre = cam.position + dir * ahead;
-            self.flare_quads(&mut items, &cam, aspect, SUN_VIEW_MAIN, def, (ex, ey), centre, ahead, scale, &self.lens_sprites, true);
+            self.flare_quads(&mut items, &cam, aspect, SUN_VIEW_MAIN, FlareQuad { def, at: (ex, ey), centre, ahead, scale, sprites: &self.lens_sprites, overlay: true });
         }
         self.scene.items.extend(items);
     }

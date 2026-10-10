@@ -124,7 +124,7 @@ impl Vehicle {
         // corner hit; the word (0x49411E…0x4941DE) is written by a hit only
         self.contact_mag = self.contact_mag.max(max_effect);
         if hit {
-            self.contact_kind = 0x40000;
+            self.contact_kind = ContactKind::Wall;
         }
         hit
     }
@@ -161,7 +161,7 @@ impl Vehicle {
                     self.impact = self.impact.max(15.0);
                     // 0x498F43: `car+0x430 = 15`, the word `0x50000 | car+0x44C`
                     self.contact_mag = 15.0;
-                    self.contact_kind = 0x50000;
+                    self.contact_kind = ContactKind::PropOrCar;
                     // 0x498F33: `car+0x440 = car+0x330`
                     self.last_contact = self.position;
                     hit = Some((15.0, PropEvent::Prop(0)));
@@ -174,7 +174,7 @@ impl Vehicle {
                         self.impact = self.impact.max(15.0);
                         // 0x498EF6: `car+0x430 = 15`, the word `0x6000F`
                         self.contact_mag = 15.0;
-                        self.contact_kind = 0x60000;
+                        self.contact_kind = ContactKind::Bush;
                         // 0x498EF0: `car+0x440 = car+0x330`
                         self.last_contact = self.position;
                         hit = Some((15.0, PropEvent::Bush));
@@ -193,7 +193,7 @@ impl Vehicle {
                 hit = Some((self.impact, PropEvent::Prop(p.class)));
                 // 0x4984B8 / 0x498575 (the box), 0x498A44 / 0x498DB6 (the word's `0x50000 | class`)
                 self.contact_mag = self.impact;
-                self.contact_kind = 0x50000;
+                self.contact_kind = ContactKind::PropOrCar;
             }
             self.impact = self.impact.max(before);
         }

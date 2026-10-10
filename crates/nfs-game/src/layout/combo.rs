@@ -20,6 +20,7 @@ impl LayoutScreen {
     /// * then the rows, from the shared loop at 0x4C66E8, the first being the scrollbar's own
     ///   position `[this+0x1BC]->slot10()`. Their colours are §4.42's three, and `ComboBox.ctr`
     ///   defines none of them — so the text is black, which is what the amber panel wants.
+    ///
     /// The combo drop-down's own scrollbar — **not** the list box's `NFS5.VerticalSlider`.
     /// `FeComboBox` builds it at 0x4C516A through **0x4DADB0**, a class of its own (vtable
     /// 0x5B6A64) whose six arrows come out of `WeeIcons.fsh` by tag, and **0x4DAF10** lays it out
@@ -52,7 +53,7 @@ impl LayoutScreen {
         const W: f32 = 16.0;
         const ARROW_H: f32 = COMBO_ARROW_H;
         out.push(self.quad(aspect, x, y, W, h, tint([0xFE, 0xDD, 0x81, 0x80])));
-        self.bevel(out, aspect, x, y, W, h, 3.0);
+        self.bevel(out, aspect, FeRect::new(x, y, W, h), 3.0);
         if let Some(a) = self.combo_arrows {
             // `[this+0xEC]` picks the frame: the resting `ARup`/`A2up`, the hovered `ARov`/`A2ov`
             // or the held `ARin`/`A2in` — 0x4DB820 and 0x4DB86B choose between them by comparing
@@ -82,7 +83,7 @@ impl LayoutScreen {
         }
         // and §4.98's outline **over** the body, the way 0x5215C0 lays its four quads after the
         // one 0x4D96B0, at the thickness 7 that 0x4DB622 passes
-        self.bevel_knob(out, aspect, x + 1.0, ky, 14.0, knob_h, 7.0);
+        self.bevel_knob(out, aspect, FeRect::new(x + 1.0, ky, 14.0, knob_h), 7.0);
         // Then two three-pixel slivers, one above the knob and one below, through the **clipped**
         // gouraud rect 0x4D94A0 that §4.29's glint sweep also uses — clipped to the trough:
         //
@@ -175,9 +176,7 @@ impl LayoutScreen {
     /// A drop-down open inside an embedded screen (a tab panel) is held by that screen alone —
     /// `set_open_combo` keeps only indices of this screen's own elements in `open_combo` — so with
     /// none open here, ask each embedded screen at the panel's own offset, the same routing
-    /// `combo_row_at` uses (2026-09-29's nested-panel fix). *(Until this fix a nested panel's
-    /// combo's scrollbar never hit-tested at all — its arrows and knob were unreachable, on top of
-    /// this file's own knob-drag gap.)*
+    /// `combo_row_at` uses (2026-09-29's nested-panel fix). (history: `game-history.md` §23.1)
     pub fn combo_scroll_at(&self, px: f32, py: f32) -> Option<(usize, u32)> {
         if let Some(i) = self.open_combo {
             let (x, y, h, rows, first) = self.combo_scroll_geom(i)?;
@@ -283,9 +282,7 @@ impl LayoutScreen {
         // `graphicsettings.lay`'s six combos) is held by that screen alone: `set_open_combo`
         // keeps only indices of this screen's own elements in `open_combo`. So with none open
         // here, ask each embedded screen at the panel's own offset and hand its answer back in
-        // the flattened index space. *(Until 2026-09-29 this returned at once, so a row of a
-        // nested drop-down never committed — the release fell through to whatever widget lay
-        // under the list, typically the next combo, which it opened instead. User report.)*
+        // the flattened index space. (history: `game-history.md` §23.2)
         let Some(i) = self.open_combo else {
             let mut keys: Vec<usize> = self.groups.keys().copied().collect();
             keys.sort_unstable();

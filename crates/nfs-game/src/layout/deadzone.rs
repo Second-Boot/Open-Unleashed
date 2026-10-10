@@ -5,7 +5,8 @@ use super::*;
 impl LayoutScreen {
     /// The shared bar painter **0x521CB0**: the span `lo … hi` of the box, as one cell per per
     /// cent, coloured by `at`. `NFS5.GouraudIndicatorBar` and `NFS5.DEADZONE` both draw through it.
-    pub(super) fn gouraud_bar(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32, lo: f32, hi: f32, at: &dyn Fn(f32) -> [f32; 4], shadow: Option<bool>) {
+    pub(super) fn gouraud_bar(&self, out: &mut Vec<Sprite>, aspect: f32, rect: FeRect, lo: f32, hi: f32, at: &dyn Fn(f32) -> [f32; 4], shadow: Option<bool>) {
+        let FeRect { x, y, w, h } = rect;
         if hi <= lo {
             return;
         }
@@ -33,7 +34,7 @@ impl LayoutScreen {
         // §4.79.
         if let Some(mirrored) = shadow {
             let (a, b) = if mirrored { (-4.0, 4.0) } else { (3.0, 4.0) };
-            self.drop_shadow(out, aspect, x + lo * cell, y, (hi - lo) * cell, h.max(1.0), a, b);
+            self.drop_shadow(out, aspect, FeRect::new(x + lo * cell, y, (hi - lo) * cell, h.max(1.0)), a, b);
         }
     }
 
@@ -145,7 +146,6 @@ impl LayoutScreen {
             }
             let (x, y) = self.position_of(e);
             let (w, h) = self.box_of(e, 0);
-            let (x, y, w, h) = (x as f32, y as f32, w as f32, h as f32);
             if !(px >= x && px <= x + w && py >= y && py <= y + h) || w <= 0.0 {
                 continue;
             }
@@ -154,9 +154,7 @@ impl LayoutScreen {
         }
         // a bar inside an open panel (`advgraphics.lay`'s gamma under `graphics.lay`'s strip,
         // `audioreal.lay`'s levels, `forcefeedback.lay`'s five): the same test in the panel's own
-        // frame, its answer in the flattened index space, as `combo_row_at` does. *(Until
-        // 2026-10-02 only the screen's own elements were tested, so none of the eleven bars —
-        // every one sits in a panel — took the pointer. User report.)*
+        // frame, its answer in the flattened index space, as `combo_row_at` does. (history: `game-history.md` §27.1)
         let mut keys: Vec<usize> = self.groups.keys().copied().collect();
         keys.sort_unstable();
         let mut base = self.layout.elements.len();
@@ -325,8 +323,8 @@ impl LayoutScreen {
         const PALE: [u8; 4] = [0xFF, 0xD7, 0x6C, 0xFF];
         const ORANGE: [u8; 4] = [0xFD, 0xB3, 0x06, 0xFF];
         let hw = half as f32;
-        self.gouraud_bar(out, aspect, x + 1.0, y, hw, h, 100.0 - hi, 100.0 - lo, &ramp(ORANGE, PALE, RED), Some(true));
-        self.gouraud_bar(out, aspect, x + hw - 1.0, y, hw, h, lo, hi, &ramp(RED, PALE, ORANGE), Some(false));
+        self.gouraud_bar(out, aspect, FeRect::new(x + 1.0, y, hw, h), 100.0 - hi, 100.0 - lo, &ramp(ORANGE, PALE, RED), Some(true));
+        self.gouraud_bar(out, aspect, FeRect::new(x + hw - 1.0, y, hw, h), lo, hi, &ramp(RED, PALE, ORANGE), Some(false));
 
         // The five bars over the gradient — 0x51B7FA…0x51BAE1. Each is a `0x4D9280` fill with an
         // outline primitive over it, and all five share the box's own height.
@@ -352,7 +350,7 @@ impl LayoutScreen {
         let mx = x + deadzone_marker(w as i32, pad.values[n]);
         out.push(self.quad(aspect, mx, y, 10.0, h, tint([0xFF, 0xBB, 0x00, 0xFF])));
         // and 0x521810's inset highlight over it (0x51B875)
-        self.glass(out, aspect, mx, y, 10.0, h, &tint);
+        self.glass(out, aspect, FeRect::new(mx, y, 10.0, h), &tint);
         for (region, centre) in deadzone_handles(w as i32, dz) {
             let hot = self.dz_hover.is_some_and(|(_, r)| r == region);
             let col = if hot { [0xFF, 0xBB, 0x00, 0xFF] } else { [0xBC, 0x00, 0x00, 0xFF] };
@@ -361,9 +359,9 @@ impl LayoutScreen {
             // the held handle takes 0x521050's sunken bevel and every other one 0x521250's
             // raised outline — §4.77 reads the second out band by band
             if self.dz_grab.is_some_and(|(_, r)| r == region) {
-                self.bevel(out, aspect, hx, y, 5.0, h, 3.0);
+                self.bevel(out, aspect, FeRect::new(hx, y, 5.0, h), 3.0);
             } else {
-                self.bevel_glow(out, aspect, hx, y, 5.0, h, 3.0);
+                self.bevel_glow(out, aspect, FeRect::new(hx, y, 5.0, h), 3.0);
             }
         }
     }

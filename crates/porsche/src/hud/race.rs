@@ -76,7 +76,7 @@ impl Hud {
     /// playback starts, 0x413ECB / 0x426A89). The cells answer the pointer in
     /// `App::replay_bar_apply_press`, once per frame (`App::replay_bar_frame`).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn replay_bar(&self, out: &mut Vec<Sprite>, aspect: f32, frozen: bool, network: bool, bar: &nfs_game::replay::BarState, pct: i32, cursor: Option<(f32, f32)>, tips: &[String; 7]) {
+    pub(crate) fn replay_bar(&self, out: &mut Vec<Sprite>, aspect: f32, frozen: bool, network: bool, bar: &nfs_game::replay::BarState, pct: i32, cursor: Option<(f32, f32)>, tips: &[&str; 7]) {
         use nfs_game::replay::{bar_cell_at, cell_glyph_origin, BAR, BAR_CELL, BAR_FRAME, BAR_PLAY};
         let (cells, frame) = Hud::bar_geometry();
         let (fw, fh) = BAR_FRAME;
@@ -142,7 +142,7 @@ impl Hud {
             let (x, y) = (cell.0, frame.1 - 16.0);
             let w = (self.text_width(tip, FONT_SMALL) + 8.0).trunc();
             out.push(self.quad(aspect, x, y, w, 14.0, [1.0, 1.0, 1.0, 0x40 as f32 / 255.0]));
-            self.text(out, aspect, tip, x + 4.0, ((14.0 - EXT_SMALL) * 0.5 + y).trunc(), FONT_SMALL, [0.0, 0.0, 0.0, 1.0]);
+            self.text(out, aspect, tip, (x + 4.0, ((14.0 - EXT_SMALL) * 0.5 + y).trunc()), FONT_SMALL, [0.0, 0.0, 0.0, 1.0]);
         }
     }
 
@@ -201,11 +201,11 @@ impl Hud {
         out.push(self.image(aspect, tex, mx, my, m, m));
         if let Some((label, current, total)) = &lap {
             let y = my + m - 2.0 - EXT_MAIN;
-            self.text(out, aspect, label, 5.0 * m / HUD_REF_W, y, FONT_MAIN, HUD_GREY);
+            self.text(out, aspect, label, (5.0 * m / HUD_REF_W, y), FONT_MAIN, HUD_GREY);
             let tw = self.text_width(total, FONT_MAIN);
-            self.text(out, aspect, total, m - 5.0 - tw, y, FONT_MAIN, HUD_GREY);
+            self.text(out, aspect, total, (m - 5.0 - tw, y), FONT_MAIN, HUD_GREY);
             let cw = self.text_width(current, FONT_MAIN);
-            self.text(out, aspect, current, m - 5.0 - tw - cw, y, FONT_MAIN, self.display());
+            self.text(out, aspect, current, (m - 5.0 - tw - cw, y), FONT_MAIN, self.display());
         }
         // each blip is the car's footprint (0x433174…0x43331A → 0x423C00): a quad along its matrix,
         // `2·half width × 2·half length` times `k`, in the map's own projection
@@ -354,8 +354,8 @@ impl Hud {
         self.tray_rule(out, aspect, x, y, w, (h / 2.0).trunc());
         let th = FONT_MAIN;
         let vw = self.text_width(value, th);
-        self.text(out, aspect, value, x + w - 5.0 - vw, y + 2.0, th, color);
-        self.text(out, aspect, label, x + 5.0, y + h - 2.0 - EXT_MAIN, th, HUD_GREY);
+        self.text(out, aspect, value, (x + w - 5.0 - vw, y + 2.0), th, color);
+        self.text(out, aspect, label, (x + 5.0, y + h - 2.0 - EXT_MAIN), th, HUD_GREY);
     }
 
     /// `HWrongWay` (layout 0x437360, draw 0x436FCB…0x437345): FE 18159 with its top-left at
@@ -368,7 +368,7 @@ impl Hud {
         let (cx, cy, h) = (HUD_REF_W / 2.0, HUD_REF_H / 2.0, EXT_MAIN);
         let w = self.text_width(s, FONT_MAIN);
         let x = (cx - w / 2.0).trunc();
-        self.text(out, aspect, s, x, cy, FONT_MAIN, HUD_ORANGE);
+        self.text(out, aspect, s, (x, cy), FONT_MAIN, HUD_ORANGE);
         let (l, r) = ((cx - w / 2.0 - 5.0).trunc(), (cx + w / 2.0 + 5.0).trunc());
         let (t, b) = (cy - 5.0, (cy + h + 5.0).trunc());
         for (px, py, dx, dy) in [(l, t, 1.0, 1.0), (l, b, 1.0, -1.0), (r, t, -1.0, 1.0), (r, b, -1.0, -1.0)] {
@@ -434,9 +434,9 @@ impl Hud {
         // the labels over the gauge at `y + 2 + 2·27 + 4`, the gauge 6 px lower plus a label height
         let label_y = ty + 2.0 + 54.0 + 4.0;
         let lh = FONT_ITALIC;
-        self.text(out, aspect, labels[0], tx + 5.0, label_y, lh, self.display());
+        self.text(out, aspect, labels[0], (tx + 5.0, label_y), lh, self.display());
         let w100 = self.text_width(labels[1], lh);
-        self.text(out, aspect, labels[1], tx + tw - 6.0 - w100, label_y, lh, self.display());
+        self.text(out, aspect, labels[1], (tx + tw - 6.0 - w100, label_y), lh, self.display());
         let gy = label_y + 4.0 + EXT_ITALIC;
         let mid = tx + (tw / 2.0).trunc();
         out.push(quad(self.damage_gauge.0, tx + 5.0, gy, mid - tx - 5.0, 6.0, false, [1.0; 4]));
@@ -448,7 +448,7 @@ impl Hud {
             s.uv_max = [0.75, 0.5];
         }
         let colour = self.damage_title(over_limit);
-        self.text(out, aspect, labels[2], tx + 5.0, ty + th - 2.0 - EXT_MAIN, FONT_MAIN, colour);
+        self.text(out, aspect, labels[2], (tx + 5.0, ty + th - 2.0 - EXT_MAIN), FONT_MAIN, colour);
     }
 
     /// `HTextDamage` (ctor 0x42F900, positions 0x430870, draw 0x430150) — `DAMAGEDISPLAY` 2 "bar graph"
@@ -494,11 +494,11 @@ impl Hud {
         let span = w - 2.0 * 5.0;
         for (i, &v) in values.iter().enumerate() {
             let ry = y + row_h * i as f32;
-            self.text(out, aspect, labels[i], x + 5.0, ry, lh, HUD_GREY);
+            self.text(out, aspect, labels[i], (x + 5.0, ry), lh, HUD_GREY);
             if percentages {
                 let s = format!("{v}%");
                 let sw = self.text_width(&s, FONT_ITALIC);
-                self.text(out, aspect, &s, x + w - 5.0 - sw, ry, FONT_ITALIC, self.display());
+                self.text(out, aspect, &s, (x + w - 5.0 - sw, ry), FONT_ITALIC, self.display());
             } else {
                 let by = ry + 4.0 + EXT_SMALL;
                 let end = x + 5.0 + (v * span as i32 / 100) as f32;
@@ -510,7 +510,7 @@ impl Hud {
             }
         }
         let colour = self.damage_title(over_limit);
-        self.text(out, aspect, labels[4], x + 5.0, y + h - 2.0 - EXT_MAIN, th, colour);
+        self.text(out, aspect, labels[4], (x + 5.0, y + h - 2.0 - EXT_MAIN), th, colour);
     }
 
     /// `HPosition` (ctor 0x42A790, layout 0x42B650, draw 0x42B000): the opponent list. A tray
@@ -559,17 +559,17 @@ impl Hud {
             while !name.is_empty() && self.text_width(&name, FONT_SMALL) > 55.0 {
                 name.pop();
             }
-            self.text(out, aspect, &name, x + 18.0, ry, FONT_SMALL, HUD_GREY);
+            self.text(out, aspect, &name, (x + 18.0, ry), FONT_SMALL, HUD_GREY);
             let link = links.get(k).and_then(|l| l.as_ref());
             if let Some(LinkBadge { dnf: Some(dnf), .. }) = link {
                 // game type 3, state 3 or 1 (0x42B279…0x42B2D0): FE 18191 in the display colour and
                 // `UniversC12b` (`+0x118`, ctor 0x42AC05…0x42AC48: alignment 0), moved to the gap
                 // visual's own position (0x42B29D…0x42B2AA) — the anchor `x + w − 13` the gap
                 // draws right-aligned to, so this one runs **left** from it
-                self.text(out, aspect, dnf, x + w - 13.0, ry, FONT_MAIN, self.display());
+                self.text(out, aspect, dnf, (x + w - 13.0, ry), FONT_MAIN, self.display());
             } else {
                 let vw = self.text_width(value, FONT_ITALIC);
-                self.text(out, aspect, value, (x + w - 13.0 - vw).trunc(), ry, FONT_ITALIC, self.display());
+                self.text(out, aspect, value, ((x + w - 13.0 - vw).trunc(), ry), FONT_ITALIC, self.display());
             }
             // the link badge (0x42B4D1…0x42B536, game type 3 only): the 5 × 5 `pingmeter` dot tinted
             // 0x5B2D90[0x490140(race index)] on all four corners (0x423D70), at the gap visual's
@@ -585,7 +585,7 @@ impl Hud {
         // `unviers9b`, all three left-aligned on one top; the port had put the count 3 px lower and
         // right-aligned both values on their own widths
         let fy = y + h - (2.0 + EXT_MAIN).trunc();
-        self.text(out, aspect, label, x + 5.0, fy, FONT_MAIN, HUD_GREY);
+        self.text(out, aspect, label, (x + 5.0, fy), FONT_MAIN, HUD_GREY);
         // `DERBY [0x657400]` (the Smash Up code) stops after the label: 0x42B5A4…0x42B5AB jumps
         // past the place and the count to the return 0x42B63E
         if derby {
@@ -593,8 +593,8 @@ impl Hud {
         }
         let slash = self.text_width("4/", FONT_MAIN);
         let px = ((x + w - 5.0 - slash).trunc() - self.text_width("4", FONT_SMALL)).trunc() - 3.0;
-        self.text(out, aspect, &format!("{place}/"), px, fy, FONT_MAIN, self.display());
-        self.text(out, aspect, &rows.len().to_string(), (px + slash).trunc(), fy, FONT_SMALL, HUD_GREY);
+        self.text(out, aspect, &format!("{place}/"), (px, fy), FONT_MAIN, self.display());
+        self.text(out, aspect, &rows.len().to_string(), ((px + slash).trunc(), fy), FONT_SMALL, HUD_GREY);
     }
 
     /// `HLeader` (ctor 0x4284D0, draw 0x4286F0) — the network race's leader. A tray 59 × 85 at
@@ -608,7 +608,7 @@ impl Hud {
         let (w, h) = (59.0, 85.0);
         self.tray(out, aspect, x, y, w, h);
         out.push(self.image(aspect, tex, x + 2.0, y + 2.0, 54.0, 64.0));
-        self.text(out, aspect, label, x + 5.0, (y + h - 2.0 - EXT_MAIN).trunc(), FONT_MAIN, HUD_GREY);
+        self.text(out, aspect, label, (x + 5.0, (y + h - 2.0 - EXT_MAIN).trunc()), FONT_MAIN, HUD_GREY);
     }
 
     /// A dial: the 128 px face centred on `centre` (design pixels) with its needle on top.
@@ -616,8 +616,7 @@ impl Hud {
         &self,
         out: &mut Vec<Sprite>,
         aspect: f32,
-        face: TextureId,
-        needle: (TextureId, f32, f32, f32),
+        (face, needle): (TextureId, (TextureId, f32, f32, f32)),
         centre: [f32; 2],
         spec: &nfs_formats::fedata::DialSpec,
         value: i32,
@@ -698,8 +697,7 @@ impl Hud {
             self.dial_sprites(
                 &mut out,
                 aspect,
-                self.dial,
-                self.needle,
+                (self.dial, self.needle),
                 [sx + 64.0, sy + 64.0],
                 &self.kmh,
                 speed_kmh as i32,
@@ -714,8 +712,7 @@ impl Hud {
             self.dial_sprites(
                 &mut out,
                 aspect,
-                td,
-                tn,
+                (td, tn),
                 [tx + 64.0, ty + 64.0],
                 &self.tach_spec,
                 // `HTach` 0x42F660: `ftol(car+0xDB4 · [+0xA9D0] + 750.0) / 10` (0x42F678…0x42F6A2,
@@ -732,13 +729,13 @@ impl Hud {
             if text.speedometer == 1 {
                 let (x, y) = layout.speed;
                 let n0 = out.len();
-                self.combo_sprites(&mut out, aspect, (x, y, 73.0, 35.0), &text.speed, &text.speed_label, self.display());
+                self.combo_sprites(&mut out, aspect, (x, y, 73.0, 35.0), &text.speed, text.speed_label, self.display());
                 Self::slide(&mut out, n0, aspect, (x, y, 73.0, 35.0), slide);
             }
             if text.gear_on {
                 let (x, y) = layout.gear;
                 let n0 = out.len();
-                self.combo_sprites(&mut out, aspect, (x, y, 85.0, 35.0), &text.gear, &text.gear_label, self.display());
+                self.combo_sprites(&mut out, aspect, (x, y, 85.0, 35.0), text.gear, text.gear_label, self.display());
                 Self::slide_passes(&mut out, n0, aspect, (x, y, 85.0, 35.0), slide, 2);
             }
             // `HTachDigital` (0x42F740, `HUDTACHOMETER == 1`): `ftol(car+0xDB4)` zero-padded to four
@@ -748,7 +745,7 @@ impl Hud {
                 let r = rpm as i32;
                 let value = if r < 1 { "0000".to_string() } else { format!("{r:04}") };
                 let n0 = out.len();
-                self.combo_sprites(&mut out, aspect, (x, y, 73.0, 35.0), &value, &text.rpm_label, self.display());
+                self.combo_sprites(&mut out, aspect, (x, y, 73.0, 35.0), &value, text.rpm_label, self.display());
                 Self::slide(&mut out, n0, aspect, (x, y, 73.0, 35.0), slide);
             }
             if race.is_some() {
@@ -774,12 +771,12 @@ impl Hud {
                     let shown = (base as i64 + time_penalty).unsigned_abs();                    let colour = if time_alert { [1.0, 0.0, 0.0, 0xCC as f32 / 255.0] } else { self.display() };
                     let (x, y) = layout.time;
                     let n0 = out.len();
-                    self.combo_sprites(&mut out, aspect, (x, y, 73.0, 35.0), &format_ticks(shown), &text.time_label, colour);
+                    self.combo_sprites(&mut out, aspect, (x, y, 73.0, 35.0), &format_ticks(shown), text.time_label, colour);
                     Self::slide(&mut out, n0, aspect, (x, y, 73.0, 35.0), time_slide);
                 }
                 // `HWrongWay` 0x436F70 (the blink state is the caller's, see `wrong_way_blink`)
                 if wrong_way {
-                    self.wrong_way_sprites(&mut out, aspect, &text.wrong_way);
+                    self.wrong_way_sprites(&mut out, aspect, text.wrong_way);
                 }
             }
         }

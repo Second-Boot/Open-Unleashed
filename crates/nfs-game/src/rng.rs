@@ -5,8 +5,13 @@
 //! 8..23 of the full 32-bit product. It is **one shared stream** — the AI's branch choice, the traffic
 //! spawner and everything else pull from the same state, which is why reproducing a race means seeding
 //! it once and then not touching it out of order.
+//!
+//! The state is one process-wide word ([`AtomicU32`], the original's global): every thread draws from
+//! the same stream, as with the `Mutex` it replaced, but a panic can no longer poison it. Tests that
+//! seed it run in parallel threads and share it; a test that needs a fixed sequence reads it right
+//! after its own `seed`.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 pub const MUL: u32 = 123_456_789;
 
@@ -14,7 +19,7 @@ pub const MUL: u32 = 123_456_789;
 /// `race-logic.md`): [`rand01`] and the AI's skill draw ([`crate::ai`]) multiply a `rand16` by it.
 pub const RAND16_TO_UNIT: f32 = 1.525_878_9e-5;
 
-static STATE: Mutex<u32> = Mutex::new(0x3ADE_68B1);
+static STATE: AtomicU32 = AtomicU32::new(0x3ADE_68B1);
 
 /// `Rand_seed(seed)` — `seed mod 500` warm-up steps from 0x3ADE68B1.
 pub fn seed(seed: u32) {
@@ -22,21 +27,24 @@ pub fn seed(seed: u32) {
     for _ in 0..(seed % 500) {
         s = s.wrapping_mul(MUL) & 0xFFFF;
     }
-    *STATE.lock().unwrap() = s;
+    STATE.store(s, Relaxed);
 }
 
 /// The stream's current state (the LCG word) — **test glue**: a dump's view of where the shared
 /// stream stands; reading it draws nothing.
 pub fn state() -> u32 {
-    *STATE.lock().unwrap()
+    STATE.load(Relaxed)
 }
 
 /// One 16-bit draw.
 pub fn rand16() -> u32 {
-    let mut g = STATE.lock().unwrap();
-    let prod = g.wrapping_mul(MUL);
-    *g = prod & 0xFFFF;
-    (prod >> 8) & 0xFFFF
+    // one read-modify-write, so concurrent draws still each take a distinct step as under the lock
+    // (a compare-exchange loop rather than `fetch_update`, which newer toolchains deprecate)
+    let mut g = STATE.load(Relaxed);
+    while let Err(now) = STATE.compare_exchange_weak(g, g.wrapping_mul(MUL) & 0xFFFF, Relaxed, Relaxed) {
+        g = now;
+    }
+    (g.wrapping_mul(MUL) >> 8) & 0xFFFF
 }
 
 /// `rand16 · 1/65536` — the `[0, 1)` the branch choice compares its thresholds against.

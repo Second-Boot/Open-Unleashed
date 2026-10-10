@@ -35,8 +35,8 @@ pub struct Checkpoint {
     /// Element index of the arrow marker to show when this trigger fires.
     pub link: Option<usize>,
     pub chime: bool,
-    /// `+0xBC`, the required direction of travel: 0x4704E0 wants `dot(+0xBC, normalize(car+0x33C))
-    /// > 0.5` unless all three components are exactly 0 (0x470575…0x470662) — the `+0xE4` flag
+    /// `+0xBC`, the required direction of travel: 0x4704E0 wants
+    /// `dot(+0xBC, normalize(car+0x33C)) > 0.5` unless all three components are exactly 0 (0x470575…0x470662) — the `+0xE4` flag
     /// beside it is never read
     pub velocity_dir: Vec3,
     /// `+0xC8` as stored, whatever the `+0xE8` flag — what 0x46F0F0 hands the start placement
@@ -79,8 +79,7 @@ pub struct Cone {
 /// moved on, not the cones: two cones flagged between two frames cost one penalty.
 /// 0x426B20…0x426B3B zeroes all three when the race (re)starts.
 ///
-/// *(Until 2026-09-26 the port counted on the skill tick, without the gates, only the mission
-/// scene's cones, and used the count itself for the HUD's added time and the summary.)*
+/// (history: `game-history.md` §19.1)
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct HudCones {
     /// `[0x60CA04]`, the last count
@@ -203,8 +202,7 @@ impl SkillTest {
     /// The start trigger's pose for 0x410430: its position (vtable `+0x38`) and `+0xC8` as
     /// stored (0x46F0F0, no flag test, not normalised — the placement re-orthonormalises the
     /// frame, 0x4A4810). Every shipped start trigger carries a unit `+0xC8` with its `+0xE8` flag
-    /// set. *(Until 2026-09-25 this fell back to the line's normal when the flag was clear — no
-    /// original counterpart, and never taken with the shipped scenes.)*
+    /// set. (history: `game-history.md` §19.2)
     pub fn start_pose(&self) -> Option<(Vec3, Vec3)> {
         let s = self.checkpoints.iter().find(|c| c.kind == 2)?;
         Some((s.position, s.heading_c8))
@@ -230,9 +228,7 @@ impl SkillTest {
     /// height of endpoint `+0xA4`, inclusive (0x4707B2…0x470810), the second has no height test.
     /// Any other shape never fires. Not carried: the `carinfo+0x518` (`.TINYCAR`) re-basing of the
     /// four points (0x470757…0x4707AF), which reads an unwritten local.
-    /// *(Until 2026-09-26 the port took the side segments FL→RL / FR→RR, tested both against the
-    /// trigger's position height, also counted the centre's path over the tick as a crossing,
-    /// and never ran the three gates.)*
+    /// (history: `game-history.md` §19.3)
     fn hit(c: &Checkpoint, car: &TriggerCar) -> bool {
         let fired = match c.shape {
             0 => (car.position - c.position).length() < c.radius,
@@ -329,9 +325,7 @@ impl SkillTest {
 /// ```
 ///
 /// A minimum rank therefore skips the damage and cone-limit tests: `jle 0x429569` (0x4294BE)
-/// lands past both, and the failing `jmp 0x429564` only clears the flag. *(Until 2026-09-26 the
-/// port ran the damage test for every mission and the cone limit after a rank test too; a time
-/// of 0 was compared like any other.)*
+/// lands past both, and the failing `jmp 0x429564` only clears the flag. (history: `game-history.md` §19.4)
 pub fn evaluate_mission(mission: &Mission, position: usize, time: i64, cones: u64, zones: &[f32; 10]) -> (bool, i64) {
     if let Some(rank) = mission.min_rank {
         return (position <= rank as usize, time);

@@ -329,7 +329,7 @@ impl TrackParticles {
     /// (0x4542C2), then, the third argument being 1, its `prime` updates at once (0x4543A7…) — so
     /// they already fade by the value against the draw distance `draw` — and only **after** them
     /// flag 2 clears `+0x2C` (0x4543DF…0x4543E4): a once-only system primes emitting.
-    /// *(Until 2026-09-26 the port primed at the full rate, and a flag-2 system not emitting.)*
+    /// (history: `game-history.md` §13.1)
     ///
     /// **Where the prime births (0x455030, read 2026-09-30).** Both creators prime at the part's
     /// point as the part stores it, [`Emitter::local`]: the static one hands the constructor the
@@ -381,13 +381,7 @@ impl TrackParticles {
     /// last argument 1, which swaps the sample for the identity (0x476A24…0x476A3E, `[0x5BC660]`)
     /// before the product with the instance's matrix (0x539CD0 / 0x559230) — so the point
     /// 0x53A330 makes of the part's (0x450B0D…0x450B14) is the part through the placement, every
-    /// drawn frame the same. *(Corrected 2026-09-30: the system 0x450980 makes is the movable
-    /// one, vtable 0x5B3E24, whose slot 4 is 0x4550B0 — it copies that point, 16 bytes, to the
-    /// system's `+0x58` — not the static one's `ret 4` 0x50BBE0. The outcome is the same place:
-    /// [`Emitter::position`], which is `tr` × the part's point — MEDIUM that the anim-world
-    /// record's instance matrix `world+0x40 + 56·id` is the article's `tr`, as the port's own
-    /// draw of the article at rest takes it. What does differ is the prime, [`Self::make`], and
-    /// the directions, which stay the part's own: [`Emitter::dir_a`].)*
+    /// drawn frame the same. (history: `game-history.md` §13.2)
     /// `draw` is the scaled draw distance `[0x6197CC]` the constructor's prime updates fade by.
     pub fn draw(&mut self, draw: f32, drawn: impl Fn(&Emitter) -> Option<(f32, bool)>) {
         for k in 0..self.systems.len() {
@@ -676,7 +670,7 @@ mod tests {
         let e = Emitter { article: 0, part: 0, position: Vec3::ZERO, local: Vec3::ZERO, dir_a: Vec3::X, dir_b: Vec3::Y, tag: 1 };
         let mut d = def();
         (d.flags, d.prime, d.volume) = (2, 50, 0.5);
-        let mut p = TrackParticles::new(vec![d.clone()], &[e.clone()], 0, 256);
+        let mut p = TrackParticles::new(vec![d.clone()], std::slice::from_ref(&e), 0, 256);
         p.draw(1000.0, |_| Some((0.0, false)));
         let near = p.sprites().len();
         assert!(near > 0, "a once-only system primes emitting");

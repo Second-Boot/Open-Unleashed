@@ -28,16 +28,13 @@
 //! install); the port carries each byte as the char [`crate::locale::cp1252`] makes of it, and
 //! [`crate::locale::to_cp1252`] gives the same byte back to the glyph lookup.
 
+use crate::bytes::{get_u16, get_u32, read_u16};
 use crate::FormatError;
 
 /// The four-byte tags, in the order a file carries them.
 pub const HEADER: &[u8; 4] = b"LOCH";
 pub const INDEX: &[u8; 4] = b"LOCI";
 pub const LANGUAGE: &[u8; 4] = b"LOCL";
-
-fn u32_at(d: &[u8], o: usize) -> Option<u32> {
-    d.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-}
 
 /// One car's strings in one language.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -53,16 +50,16 @@ impl LocFile {
         if d.get(0..4) != Some(HEADER) {
             return Err(FormatError::UnknownMagic { what, offset: 0, expected: HEADER.to_vec(), found: d.get(0..4).unwrap_or_default().to_vec() });
         }
-        let langs = u32_at(d, 0xC).unwrap_or(0) as usize;
+        let langs = get_u32(d, 0xC).unwrap_or(0) as usize;
         let pick = if lang < langs { lang } else { 0 };
-        let block = u32_at(d, 0x10 + pick * 4).ok_or(FormatError::Truncated { what, offset: 0x10 + pick * 4, needed: 4 })? as usize;
+        let block = get_u32(d, 0x10 + pick * 4).ok_or(FormatError::Truncated { what, offset: 0x10 + pick * 4, needed: 4 })? as usize;
         if d.get(block..block + 4) != Some(LANGUAGE) {
             return Err(FormatError::UnknownMagic { what, offset: block, expected: LANGUAGE.to_vec(), found: d.get(block..block + 4).unwrap_or_default().to_vec() });
         }
-        let count = u32_at(d, block + 0xC).unwrap_or(0) as usize;
+        let count = get_u32(d, block + 0xC).unwrap_or(0) as usize;
         let mut entries = Vec::with_capacity(crate::cap_hint(count, d.len(), 4));
         for i in 0..count {
-            let off = u32_at(d, block + 0x10 + i * 4).unwrap_or(0) as usize + block;
+            let off = get_u32(d, block + 0x10 + i * 4).unwrap_or(0) as usize + block;
             let end = d[off.min(d.len())..].iter().position(|&b| b == 0).map(|n| off + n).unwrap_or(d.len());
             entries.push(d.get(off..end).unwrap_or_default().iter().map(|&b| crate::locale::cp1252(b)).collect());
         }
@@ -105,13 +102,13 @@ impl LocTable {
             return Err(FormatError::Truncated { what: "loc", offset: 0, needed: 0x10 });
         }
         // before 0x536D80 runs the slot is what the file holds (0 in every shipped one)
-        let language = u16::from_le_bytes([data[0xE], data[0xF]]);
+        let language = read_u16(&data, 0xE);
         Ok(Self { data, language })
     }
 
     /// `+0xC` as a u16: the number of language offsets the header lists (7 in every shipped file).
     pub fn language_count(&self) -> u16 {
-        u16::from_le_bytes([self.data[0xC], self.data[0xD]])
+        read_u16(&self.data, 0xC)
     }
 
     /// 0x536D80(file, 0, lang): the language every later [`LocTable::get`] reads.
@@ -125,22 +122,21 @@ impl LocTable {
 
     /// The absolute offset of language `lang`'s block as the header gives it.
     pub fn block_offset(&self, lang: u16) -> Option<u32> {
-        u32_at(&self.data, 0x10 + 4 * lang as usize)
+        get_u32(&self.data, 0x10 + 4 * lang as usize)
     }
 
     fn index_base(&self) -> Option<usize> {
-        u32_at(&self.data, 4).map(|o| o as usize)
+        get_u32(&self.data, 4).map(|o| o as usize)
     }
 
     /// The `LOCI` pairs in file order: `(id, index)`.
     pub fn index(&self) -> Vec<(u16, u16)> {
         let Some(base) = self.index_base() else { return Vec::new() };
-        let n = u32_at(&self.data, base + 8).unwrap_or(0) as usize;
+        let n = get_u32(&self.data, base + 8).unwrap_or(0) as usize;
         (0..n)
             .map_while(|i| {
                 let o = base + 0x10 + 4 * i;
-                let b = self.data.get(o..o + 4)?;
-                Some((u16::from_le_bytes([b[0], b[1]]), u16::from_le_bytes([b[2], b[3]])))
+                Some((get_u16(&self.data, o)?, get_u16(&self.data, o + 2)?))
             })
             .collect()
     }
@@ -159,11 +155,10 @@ impl LocTable {
         let Some(base) = self.index_base() else { return -1 };
         // the key is the argument's low word (0x536E3F reads a u16 through the key pointer)
         let key = (id & 0xFFFF) as i32;
-        let count = i64::from(u32_at(&self.data, base + 8).unwrap_or(0));
+        let count = i64::from(get_u32(&self.data, base + 8).unwrap_or(0));
         let pair = |i: i64| -> Option<(i32, i32)> {
             let o = base + 0x10 + 4 * usize::try_from(i).ok()?;
-            let b = self.data.get(o..o + 4)?;
-            Some((i32::from(u16::from_le_bytes([b[0], b[1]])), i32::from(u16::from_le_bytes([b[2], b[3]]))))
+            Some((i32::from(get_u16(&self.data, o)?), i32::from(get_u16(&self.data, o + 2)?)))
         };
         let (mut lo, mut hi, mut num) = (0i64, count - 1, count);
         while lo <= hi {
@@ -196,14 +191,14 @@ impl LocTable {
     /// 0x536DA0(file, id): the string's bytes (without the NUL) in the current language; `None`
     /// is the NULL the game gets back — an id the index lacks, an index outside the block's count.
     pub fn get(&self, id: u32) -> Option<&[u8]> {
-        let flags = u32_at(&self.data, 8)?;
+        let flags = get_u32(&self.data, 8)?;
         let index = if flags & 1 != 0 { self.search(id) } else { id as i32 };
-        let block = u32_at(&self.data, 0x10 + 4 * self.language as usize)? as usize;
-        let count = u32_at(&self.data, block + 0xC)? as i32;
+        let block = get_u32(&self.data, 0x10 + 4 * self.language as usize)? as usize;
+        let count = get_u32(&self.data, block + 0xC)? as i32;
         if index < 0 || index >= count {
             return None;
         }
-        let off = (u32_at(&self.data, block + 0x10 + 4 * index as usize)? as usize).checked_add(block)?;
+        let off = (get_u32(&self.data, block + 0x10 + 4 * index as usize)? as usize).checked_add(block)?;
         let tail = self.data.get(off..)?;
         let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
         Some(&tail[..end])

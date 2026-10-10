@@ -160,7 +160,7 @@ fn under_target_steps_up_toward_the_wheels() {
     v.velocity = Vec3::new(0.0, 0.0, 20.0);
     v.rpm = 0.0;
     v.step32(&full, &specs, &grid);
-    assert_eq!(v.engine_arm, 5, "under its target");
+    assert_eq!(v.engine_arm, EngineArm::Driving, "under its target");
     assert!(v.rpm >= 199.0 && v.rpm <= 201.0, "one rung up, not a snap to the wheels: {}", v.rpm);
 }
 
@@ -208,7 +208,7 @@ fn over_run_brakes_and_steps_the_revs_by_the_cap() {
     v.rpm = 0.0;
     let before = v.velocity.z;
     v.step32(&idle, &specs, &grid);
-    assert_eq!(v.engine_arm, 2, "over-run");
+    assert_eq!(v.engine_arm, EngineArm::Overrun, "over-run");
     let cap = specs.mps_per_rpm[3] * 81920.0;
     assert!((v.rpm - cap).abs() < 1.0, "revs {} step by the cap {cap}", v.rpm);
     assert!(v.velocity.z < before, "engine braking slows the car");
@@ -231,7 +231,7 @@ fn launch_profile() {
             }
             v.step64(&specs);
             if t % 32 == 0 {
-                println!("grade {grade:.2} t={:.1}s  {:5.1} km/h  rpm {:6.0} gear {} contact {} arm {}", t as f32 / 64.0, v.speed() * 3.6, v.rpm, v.gear, v.wheels.iter().filter(|w| w.contact).count(), v.engine_arm);
+                println!("grade {grade:.2} t={:.1}s  {:5.1} km/h  rpm {:6.0} gear {} contact {} arm {}", t as f32 / 64.0, v.speed() * 3.6, v.rpm, v.gear, v.wheels.iter().filter(|w| w.contact).count(), v.engine_arm as u8);
             }
         }
     }
@@ -357,4 +357,22 @@ fn the_rally_nibble_helper_equals_the_inline_forms() {
             assert_eq!(old_wheel, new_wheel);
         }
     }
+}
+
+/// The enum field types keep the original's stored values (`car+0xB50`, `car+0x438`, the
+/// diagnostic engine arm).
+#[test]
+fn state_enums_keep_the_original_values() {
+    assert_eq!([RaceState::Racing as u8, RaceState::Finished as u8, RaceState::Out as u8], [0, 2, 3]);
+    assert_eq!(
+        [ContactKind::None, ContactKind::Ground, ContactKind::Wall, ContactKind::PropOrCar, ContactKind::Bush].map(ContactKind::word),
+        [0, 0x30000, 0x40000, 0x50000, 0x60000]
+    );
+    assert_eq!(
+        [EngineArm::None, EngineArm::Clutch, EngineArm::Overrun, EngineArm::AtTarget, EngineArm::Misfire, EngineArm::Driving].map(|a| a as u8),
+        [0, 1, 2, 3, 4, 5]
+    );
+    let specs = specs_993();
+    let v = Vehicle::new(Vec3::ZERO, Mat3::IDENTITY, &specs, 0.7, 0.3);
+    assert_eq!((v.race_state, v.contact_kind, v.engine_arm), (RaceState::Racing, ContactKind::None, EngineArm::None));
 }

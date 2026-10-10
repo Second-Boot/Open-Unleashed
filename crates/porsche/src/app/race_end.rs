@@ -93,20 +93,9 @@ impl App {
             o.grid = Some((k.start_pos[car] - 1).max(0) as u32);
             opponents.push(o);
         }
-        self.player_grid_override = Some((k.start_pos[0] - 1).max(0) as u32);
-        self.num_opponents = opponents.len() as u32;
         tracing::info!(track, race = k.race_index + 1, of = k.opponents, grid = ?k.start_pos, drivers = ?opponents.iter().map(|o| (o.name.as_str(), o.car.display_name.as_str())).collect::<Vec<_>>(), "knockout round (0x4DE150)");
-        self.career_opponents = Some(opponents);
-        self.road.traffic_count = TRAFFIC_COUNT[row.traffic.min(3) as usize];
-        self.road.traffic_ids = None;
-        self.road.damage_on = damage;
-        self.road.cops_enabled = false;
-        self.road.cops_race = false;
-        self.road.cop_count = 4;
-        self.quick_knockout = false;
-        self.num_laps = laps;
-        self.backwards = row.backwards;
-        self.mirror = row.mirror;
+        let rs = RaceSetup::knockout_round(&row, laps, damage, opponents, (k.start_pos[0] - 1).max(0) as u32, self.race_setup());
+        self.apply_race_setup(rs);
         self.knockout_round = true;
         Some(track)
     }

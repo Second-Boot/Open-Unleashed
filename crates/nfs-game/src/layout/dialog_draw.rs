@@ -6,7 +6,7 @@
 //! whole and the alpha of what it pushed is then scaled by `fade / 255`, the same thing to within
 //! a rounding of the original's per-colour blend.
 
-use super::{argb, tint, LayoutScreen, DIALOG_BUTTON_FONT, DIALOG_TEXT_FONT};
+use super::{argb, tint, FeRect, LayoutScreen, DIALOG_BUTTON_FONT, DIALOG_TEXT_FONT};
 use crate::dialog::Dialog;
 use nfs_formats::locale::Strings;
 use nfs_renderer::Sprite;
@@ -48,10 +48,10 @@ impl LayoutScreen {
             }
             // then the bevel when hovered and held (0x514FA6), else the drop shadow and the glass
             if b.hovered && pressed {
-                self.bevel(&mut out, aspect, bx, by, bw, bh, 3.0);
+                self.bevel(&mut out, aspect, FeRect::new(bx, by, bw, bh), 3.0);
             } else {
-                self.drop_shadow(&mut out, aspect, bx, by, bw, bh, 4.0, 4.0);
-                self.glass(&mut out, aspect, bx, by, bw, bh, &tint);
+                self.drop_shadow(&mut out, aspect, FeRect::new(bx, by, bw, bh), 4.0, 4.0);
+                self.glass(&mut out, aspect, FeRect::new(bx, by, bw, bh), &tint);
             }
         }
         // the input dialog's field, its draw 0x514AF0: the typed text in the buttons' font, black,
@@ -87,7 +87,7 @@ impl LayoutScreen {
             self.gouraud(&mut out, aspect, p, c.map(argb));
         }
         // 0x512F04: the drop shadow under the whole frame
-        self.drop_shadow(&mut out, aspect, x - 5.0, y - 5.0, w + 10.0, h + 10.0, 4.0, 4.0);
+        self.drop_shadow(&mut out, aspect, FeRect::new(x - 5.0, y - 5.0, w + 10.0, h + 10.0), 4.0, 4.0);
         let fade = d.fade as f32 / 255.0;
         for s in &mut out {
             s.color[3] *= fade;

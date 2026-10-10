@@ -15,6 +15,7 @@
 //! not written yet.
 
 use crate::error::FormatError;
+use crate::bytes::{get_u16, read_i16, read_i32, read_u32};
 use crate::{u16_le, u32_le};
 
 // -------------------------------------------------------------------------------------------
@@ -47,7 +48,7 @@ pub fn chunks(d: &[u8]) -> impl Iterator<Item = Chunk<'_>> {
     let mut at = 0usize;
     std::iter::from_fn(move || {
         let h = d.get(at..at + 8)?;
-        let size = u32::from_le_bytes([h[4], h[5], h[6], h[7]]) as usize;
+        let size = read_u32(h, 4) as usize;
         if size < 8 || at + size > d.len() {
             return None;
         }
@@ -107,10 +108,10 @@ impl MadHeader {
         }
         Ok(Self {
             magic,
-            size: u32::from_le_bytes([d[4], d[5], d[6], d[7]]),
-            period: u32::from_le_bytes([d[0xC], d[0xD], d[0xE], d[0xF]]),
-            width: i16::from_le_bytes([d[0x10], d[0x11]]),
-            height: i16::from_le_bytes([d[0x12], d[0x13]]),
+            size: read_u32(d, 4),
+            period: read_u32(d, 0xC),
+            width: read_i16(d, 0x10),
+            height: read_i16(d, 0x12),
             quant: d[0x15] as i8,
         })
     }
@@ -190,7 +191,7 @@ impl<'a> PeImage<'a> {
 
     fn i32s(&self, va: u32, n: usize) -> Option<Vec<i32>> {
         let d = self.at(va, n * 4)?;
-        Some(d.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+        Some(d.chunks_exact(4).map(|c| read_i32(c, 0)).collect())
     }
 }
 
@@ -372,7 +373,7 @@ impl MadTables {
         if &d[..8] != Self::MAGIC {
             return Err(FormatError::UnknownMagic { what, offset: 0, expected: Self::MAGIC.to_vec(), found: d[..8].to_vec() });
         }
-        let mut words = d[8..].chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        let mut words = d[8..].chunks_exact(4).map(|c| read_u32(c, 0));
         let flat: Vec<u32> = words.by_ref().take(tbl::LEN).collect();
         let mut quant = [0i32; 64];
         let mut prescale = [0i32; 64];
@@ -412,7 +413,8 @@ pub struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     pub fn new(d: &'a [u8]) -> Self {
-        let le16 = |o: usize| -> u32 { d.get(o..o + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]) as u32) };
+        // past the end the reader zero-fills (format behaviour, keep)
+        let le16 = |o: usize| -> u32 { get_u16(d, o).map_or(0, u32::from) };
         Self { d, pos: 4, w: (le16(0) << 16) | le16(2), avail: 0x20 }
     }
 
@@ -421,7 +423,7 @@ impl<'a> BitReader<'a> {
         self.w = self.w.wrapping_shl(n as u32);
         self.avail -= n;
         if self.avail < 16 {
-            let next = self.d.get(self.pos..self.pos + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]) as u32);
+            let next = get_u16(self.d, self.pos).map_or(0, u32::from);
             self.pos += 2;
             self.w |= next.wrapping_shl((16 - self.avail) as u32);
             self.avail += 16;

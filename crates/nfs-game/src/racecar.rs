@@ -40,7 +40,7 @@ pub struct RaceCar {
 }
 
 impl RaceCar {
-    pub fn controls_for(&mut self, player: &Controls, table: &SliceTable, line: Option<&nfs_formats::ais::RacingLine>, tick: u64, ahead: &[(Vec3, usize, f32, f32, bool)]) -> Controls {
+    pub fn controls_for(&mut self, player: &Controls, table: &SliceTable, line: Option<&nfs_formats::ais::RacingLine>, tick: u64, ahead: &[crate::ai::AheadCar]) -> Controls {
         match &mut self.controller {
             Controller::Player => *player,
             // finish state 2 (`ai.md` §3.2): throttle 0, full brake
@@ -49,9 +49,8 @@ impl RaceCar {
             // A finished (or knocked-out) opponent still runs the whole of 0x40B650 and 0x40BFE0 —
             // the draws, the aim point, the avoidance and the steering — and 0x40C5EE only replaces
             // the pedals (and, knocked out, the aim point) by `car+0xB50`, which the caller keeps in
-            // `Vehicle::race_state` (`AiDriver::controls`). *(Until the audit of 2026-09-26 the port
-            // returned before the AI ran, so a finished car rolled on with the wheel straight and
-            // consumed none of the stream, and a knocked-out one was parked.)* The own half width
+            // `Vehicle::race_state` (`AiDriver::controls`). (history: `game-history.md` §8.1)
+            // The own half width
             // is `car+0x3A8` (0x40C577), the model box of 0x445090 — not the 0.9 the port passed.
             Controller::Ai(ai) => ai.controls(table, line, &self.progress, &self.vehicle, &self.specs, tick, ahead, self.vehicle.half_extents.x),
         }

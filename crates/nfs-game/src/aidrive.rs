@@ -151,7 +151,7 @@ pub struct DriveCommand {
 /// brake arm adds `4 · [0x5E6D78]` saturating at 0xFF (0x409B0E…), the throttle arm takes
 /// `[0x5E6D78]` off down to 0 (0x409ABD…); `[0x5E6D78]` is the **32 Hz** ticks the drive step
 /// covers — `0x5CC71C[k]` from the drive's gate 0x414B10 (row 1: 1 within 160 m of a racer, 2
-/// beyond; `traffic.md` §14.3). *(Corrected 2026-09-25: this said 64 Hz ticks.)*
+/// beyond; `traffic.md` §14.3). (history: `game-history.md` §5.1)
 /// 0x439360 lights the brake lamps while the byte is non-zero (0x43938C…0x43939B).
 pub fn brake_light(counter: u8, braking: Option<bool>, ticks: u8) -> u8 {
     match braking {

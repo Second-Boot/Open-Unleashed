@@ -13,7 +13,8 @@
 //! `multimodulate`, `multimodulatewater`, `multinormal`, `multinormalwater` (strings at 0x45Fxxx).
 //! A `basic` block carries **one** layer per weather region, a `multi*` block **three**.
 
-use crate::FormatError;
+use crate::bytes::{get_f32, get_i32};
+use crate::{u32_le, FormatError};
 
 /// The 2π the sun's turn is multiplied by — the executable's own f64 literal, **not** `TAU`
 /// (`sun_position`).
@@ -591,12 +592,12 @@ impl SkyBin {
     pub const MAX_KEYS: usize = 0x190;
 
     pub fn parse(data: &[u8]) -> Result<Self, FormatError> {
-        let u32_at = |o: usize| -> Result<u32, FormatError> {
-            data.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).ok_or(FormatError::Truncated { what: "sky .bin", offset: o, needed: 4 })
-        };
-        let f_at = |o: usize| -> f32 { data.get(o..o + 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0.0) / Self::COLOUR_SCALE };
+        // past the end: the dword reads fail, the float reads fall back to 0.0 and the int reads
+        // to -1 (format behaviour, keep)
+        let u32_at = |o: usize| u32_le(data, o, "sky .bin");
+        let f_at = |o: usize| -> f32 { get_f32(data, o).unwrap_or(0.0) / Self::COLOUR_SCALE };
         let version = u32_at(0)?;
-        let f_raw = |o: usize| -> f32 { data.get(o..o + 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0.0) };
+        let f_raw = |o: usize| -> f32 { get_f32(data, o).unwrap_or(0.0) };
         let mut colours = Vec::new();
         for i in 0..4 {
             let o = Self::COLOURS_AT + Self::RECORD * i;
@@ -612,7 +613,7 @@ impl SkyBin {
                 raw: [[raw(o + 8), raw(o + 20)], [raw(o + 36), raw(o + 48)]],
             }));
         }
-        let i_at = |o: usize| -> i32 { data.get(o..o + 4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(-1) };
+        let i_at = |o: usize| -> i32 { get_i32(data, o).unwrap_or(-1) };
         let mut segments = [SkySegment::default(); 16];
         for (i, s) in segments.iter_mut().enumerate() {
             *s = SkySegment { tile: data.get(Self::SEGMENTS_AT + i * 2).copied().unwrap_or(0), mirror: data.get(Self::SEGMENTS_AT + 1 + i * 2).copied().unwrap_or(0) };

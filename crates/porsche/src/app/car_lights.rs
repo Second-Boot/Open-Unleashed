@@ -199,7 +199,7 @@ impl App {
                 if wb > 0.1 {
                     let len2 = ax1.length_squared();
                     let size = f32::from_bits(((len2.to_bits() as i32 >> 1) + 0x1FC0_0000) as u32);
-                    out.push(Self::lamp_reflection(world, ground, size, l.colour[0], wb * b, self.camera.position, right, eye_ground, k));
+                    out.push(Self::lamp_reflection(world, ground, size, l.colour[0], wb * b, ReflectionEye { eye: self.camera.position, right, eye_ground, k }));
                 }
             }
             // the beam, whatever the glare's `b` (0x43DA7C…0x43DAAA)
@@ -235,8 +235,8 @@ impl App {
     /// `ftol(p · 64) & 0xFF`, the colour's low 24 bits (0x451F59…0x451F9B); UVs (0, 0) (1, 0) (1, 1)
     /// (0, 1); the depth bias `fistp(cam[+0xC] · −25000 / |c − eye|²)` (`[0x5B3D6C]`,
     /// 0x451FC7…0x451FFB) on `[0x61BCB4]`, blend pair 1 (additive), the alpha test off around it.
-    #[allow(clippy::too_many_arguments)]
-    fn lamp_reflection(c: Vec3, ground: f32, size: f32, colour: u32, p: f32, eye: Vec3, right: Vec3, eye_ground: f32, k: f32) -> LampDraw {
+    fn lamp_reflection(c: Vec3, ground: f32, size: f32, colour: u32, p: f32, view: ReflectionEye) -> LampDraw {
+        let ReflectionEye { eye, right, eye_ground, k } = view;
         let d = c - eye;
         let e = -d.y;
         let (h, e) = if e < 0.0 { (d.y, 0.0) } else { (ground - eye_ground, e) };
@@ -473,6 +473,16 @@ pub(crate) enum LampDraw {
     Glare(nfs_renderer::DrawItem),
     Reflection([nfs_renderer::Vertex; 4], i32),
     Beam([nfs_renderer::Vertex; 18]),
+}
+
+/// The camera's side of 0x451D60 (`App::lamp_reflection`): the eye, its row `+0xE8` (`right`), the
+/// eye's road height `[0x61BCBC]` (`eye_ground`) and the depth-bias factor `cam[+0xC]` (`k`).
+#[derive(Clone, Copy)]
+struct ReflectionEye {
+    eye: Vec3,
+    right: Vec3,
+    eye_ground: f32,
+    k: f32,
 }
 
 /// One view pass's inputs for `App::dyn_items`: the frame's interpolation and the player's pose,

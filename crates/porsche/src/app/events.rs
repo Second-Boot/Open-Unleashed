@@ -706,11 +706,7 @@ impl ApplicationHandler for App {
                 // diagnostic `NFS_HUD_KEYS=tick:pause`: the pause menu's continue after 64 pause ticks
                 // (or, `tick:pauserestart`, its restart instead — `replay.md` §18.12)
                 if self.scripted_pause && self.pause_ticks >= 64.0 {
-                    self.scripted_pause = false;
-                    self.paused = false;
-                    if std::mem::take(&mut self.scripted_restart) {
-                        self.restart_race(event_loop);
-                    }
+                    self.end_scripted_pause(event_loop);
                 }
                 let halted = self.paused || self.replay.frozen;
                 if !self.paused {
@@ -783,8 +779,7 @@ impl ApplicationHandler for App {
                         self.simulate();
                         // race over ends `RaceFrame` (0x415D17) and the session loop restarts
                         // the race as its replay
-                        if self.auto_replay_due {
-                            self.start_auto_replay(event_loop);
+                        if self.start_auto_replay_if_due(event_loop) {
                             break;
                         }
                     }
@@ -793,21 +788,8 @@ impl ApplicationHandler for App {
                     // the render's interpolation runs on the time since the last tick
                     self.accumulator = now.saturating_duration_since(self.exchange_tick_at).min(GAME_TICK);
                 }
-                // 0x415CB3: the played-back stream's end, after the catch-up loop
-                if self.replay_exit_check(event_loop) {
+                if self.race_frame_epilogue(event_loop) {
                     return;
-                }
-                let bar_save_was_up = self.replay_save.up;
-                self.run_bar_script();
-                self.replay_bar_frame(event_loop);
-                // diagnostic: `NFS_REPLAY_TYPE`, as the scripted-run loop does
-                if !bar_save_was_up
-                    && self.replay_save.up
-                    && let Some(name) = nfs_game::config::cfg().nfs_replay_type.as_str()
-                {
-                    for c in name.chars() {
-                        self.replay_save.type_char(c);
-                    }
                 }
                 self.draw_frame();
             }

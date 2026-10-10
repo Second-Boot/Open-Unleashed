@@ -2,6 +2,22 @@
 
 use super::*;
 
+/// A widget box in front-end pixels — the `(x, y, w, h)` the painters below take, as the
+/// original passes them (four floats on the stack).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FeRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl FeRect {
+    pub(super) const fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
+        Self { x, y, w, h }
+    }
+}
+
 impl LayoutScreen {
     /// The front end's drop shadow, **0x520F00** — the widget's box offset by `(a, b)` and painted
     /// black, as the L of what the offset uncovers. `NFS5.GOTOBUTTON`'s draw calls it with
@@ -21,7 +37,8 @@ impl LayoutScreen {
     /// | upper-right wedge (0x521036) | `(x+w, y+b)` 0C | `(x+w+a, y+b)` 0C | `(x+w, y+2b)` CC | `(x+w, y+2b)` CC |
     ///
     /// Behind the same global gate 0x4E35E0 as the bevel (0x520F03).
-    pub(super) fn drop_shadow(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32, a: f32, b: f32) {
+    pub(super) fn drop_shadow(&self, out: &mut Vec<Sprite>, aspect: f32, rect: FeRect, a: f32, b: f32) {
+        let FeRect { x, y, w, h } = rect;
         let (near, far, edge) = (tint([0, 0, 0, 0xcc]), tint([0, 0, 0, 0x19]), tint([0, 0, 0, 0x0c]));
         let (r, bot) = (x + w, y + h);
         self.gouraud(out, aspect, [[r, y + b], [r + a, y + b], [r, bot], [r + a, bot + b]], [near, far, near, far]);
@@ -43,7 +60,8 @@ impl LayoutScreen {
     /// | right (0x521C9C) | `(x+w, y)` FF | `(x+w+t, y−t)` 80 | `(x+w, y+h)` FF | `(x+w+t, y+h+t)` 80 |
     ///
     /// Unlike 0x521050 and 0x520F00 it asks no global gate. CONFIRMED (symbolic walk of the stack).
-    pub(super) fn picture_frame(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32, t: f32) {
+    pub(super) fn picture_frame(&self, out: &mut Vec<Sprite>, aspect: f32, rect: FeRect, t: f32) {
+        let FeRect { x, y, w, h } = rect;
         let (inner, outer) = (tint([0xff, 0xff, 0xff, 0xff]), tint([0xff, 0xff, 0xff, 0x80]));
         let (r, b) = (x + w, y + h);
         self.gouraud(out, aspect, [[x - t, y - t], [r + t, y - t], [x, y], [r, y]], [outer, outer, inner, inner]);
@@ -95,7 +113,8 @@ impl LayoutScreen {
     ///
     /// Each half is one gouraud rectangle ([`Self::gouraud`]); the port stepped them in one-pixel
     /// strips until 2026-09-24.
-    pub(super) fn glass(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32, tint: &dyn Fn([u8; 4]) -> [f32; 4]) {
+    pub(super) fn glass(&self, out: &mut Vec<Sprite>, aspect: f32, rect: FeRect, tint: &dyn Fn([u8; 4]) -> [f32; 4]) {
+        let FeRect { x, y, w, h } = rect;
         let half = (h - 2.0) * 0.5;
         if half < 1.0 || w < 3.0 {
             return;
@@ -132,7 +151,8 @@ impl LayoutScreen {
     /// left corner and dim at the right, which is the one thing neither bevel's other bands do.
     ///
     /// Each band is one gouraud quad ([`Self::bevel_bands`]).
-    pub(super) fn bevel_up(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32, t: f32) {
+    pub(super) fn bevel_up(&self, out: &mut Vec<Sprite>, aspect: f32, rect: FeRect, t: f32) {
+        let FeRect { x, y, w, h } = rect;
         let (lit_out, lit_in) = (tint([0xff, 0xff, 0xff, 0xcc]), tint([0xff, 0xff, 0xff, 0x33]));
         let (dark_out, dark_in) = (tint([0, 0, 0, 0xcc]), tint([0, 0, 0, 0x33]));
         let (r, b) = (x + w, y + h - 1.0);
@@ -164,7 +184,8 @@ impl LayoutScreen {
     ///
     /// — a white glow under the top edge and inside the right one, a dark one inside the left edge
     /// and above the bottom. CONFIRMED (symbolic walk of the stack, 2026-09-27).
-    pub(super) fn bevel_heading(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32, t: f32) {
+    pub(super) fn bevel_heading(&self, out: &mut Vec<Sprite>, aspect: f32, rect: FeRect, t: f32) {
+        let FeRect { x, y, w, h } = rect;
         let c = |v: u32| tint([(v >> 16) as u8, (v >> 8) as u8, v as u8, (v >> 24) as u8]);
         let (r, b) = (x + w, y + h);
         let (w19, we5, wcc) = (c(0x19FF_FFFF), c(0xE5FF_FFFF), c(0xCCFF_FFFF));
@@ -215,7 +236,8 @@ impl LayoutScreen {
     /// Light on the top and left, dark on the right and bottom — raised, like §4.77's two — on
     /// the box's own edge with no `-1` anywhere, and **every** band fading along its length.
     /// §4.98.
-    pub(super) fn bevel_knob(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32, t: f32) {
+    pub(super) fn bevel_knob(&self, out: &mut Vec<Sprite>, aspect: f32, rect: FeRect, t: f32) {
+        let FeRect { x, y, w, h } = rect;
         let c = |v: [u8; 4]| tint(v);
         let (r, b) = (x + w, y + h);
         let clear_w = c([0xff, 0xff, 0xff, 0]);
@@ -249,7 +271,8 @@ impl LayoutScreen {
     ///
     /// White on the top and left, black on the right and bottom — raised, like 0x521970 — but on
     /// the widget's own edge rather than a pixel inside it, and with no `-1` anywhere.
-    pub(super) fn bevel_glow(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32, t: f32) {
+    pub(super) fn bevel_glow(&self, out: &mut Vec<Sprite>, aspect: f32, rect: FeRect, t: f32) {
+        let FeRect { x, y, w, h } = rect;
         let c = |v: [u8; 4]| tint(v);
         let (r, b) = (x + w, y + h);
         let bands = [
@@ -261,7 +284,8 @@ impl LayoutScreen {
         self.bevel_bands(out, aspect, &bands, t);
     }
 
-    pub(super) fn bevel(&self, out: &mut Vec<Sprite>, aspect: f32, x: f32, y: f32, w: f32, h: f32, t: f32) {
+    pub(super) fn bevel(&self, out: &mut Vec<Sprite>, aspect: f32, rect: FeRect, t: f32) {
+        let FeRect { x, y, w, h } = rect;
         let (dark_out, dark_in) = (tint([0, 0, 0, 0xcc]), tint([0, 0, 0, 0x19]));
         let (lit_out, lit_in) = (tint([0xff, 0xff, 0xff, 0xcc]), tint([0xff, 0xff, 0xff, 0x33]));
         let (r, b) = (x + w, y + h);

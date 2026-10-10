@@ -137,8 +137,7 @@ impl LayoutScreen {
                 // 0x4FFB66 / 0x4FFB8D / 0x4FFBB7), so they are drawn and write depth where their
                 // art's alpha passes the test; 0x4DAAC0 (0x4FF791); the movie through the player's
                 // slot 1 (0x4FF84F) lands only on them; 0x4DAB00 (0x4FF852), and the four lines after
-                // it (0x4FFBF0) are outside. *(Until 2026-09-27 the pieces were not painted and the
-                // movie was its whole 416 × 348 rectangle, an approximation.)*
+                // it (0x4FFBF0) are outside. (history: `game-history.md` §26.1)
                 Draw::Oval { entry: k, x, y, flip } => {
                     let m = *mask.get_or_insert_with(super::fe_depth::mask_begin);
                     if let Some(a) = entry(eoe::OVAL, k) {

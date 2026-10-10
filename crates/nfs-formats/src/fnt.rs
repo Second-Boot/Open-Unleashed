@@ -19,6 +19,7 @@
 //!        high nibble first, row-major (width × height / 2 bytes)
 //! ```
 
+use crate::bytes::read_u16;
 use crate::{u16_le, u32_le, FormatError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,7 +69,7 @@ impl Font {
         for i in 0..count {
             let o = table + i * 11;
             let r = data.get(o..o + 11).ok_or(FormatError::Truncated { what: "FNTF glyph", offset: o, needed: 11 })?;
-            glyphs.push(Glyph { ch: u16::from_le_bytes([r[0], r[1]]), width: r[2], height: r[3], x: u16::from_le_bytes([r[4], r[5]]), y: u16::from_le_bytes([r[6], r[7]]), advance: r[8] as i8, offset_x: r[9] as i8, offset_y: r[10] as i8 });
+            glyphs.push(Glyph { ch: read_u16(r, 0), width: r[2], height: r[3], x: read_u16(r, 4), y: read_u16(r, 6), advance: r[8] as i8, offset_x: r[9] as i8, offset_y: r[10] as i8 });
         }
         let code = *data.get(atlas_off).ok_or(FormatError::Truncated { what: "FNTF atlas", offset: atlas_off, needed: 16 })?;
         if code != 0x7A {
@@ -185,4 +186,44 @@ mod tests {
         assert!(f.lookup('\u{2018}').is_none()); // 0x91: no other case
         assert!(f.lookup('\u{4E00}').is_none());
     }
+
+    /// Characterisation guard for the table / header reads: a synthetic two-glyph font file, the
+    /// parse output hashed, and the failure texts of a short table and a short atlas.
+    #[test]
+    fn parse_output_is_pinned() {
+        let mut d = vec![0u8; 0x36 + 16 + 8];
+        d[0..4].copy_from_slice(b"FNTF");
+        d[10..12].copy_from_slice(&2u16.to_le_bytes());
+        d[12..16].copy_from_slice(&0x0005_0004u32.to_le_bytes());
+        d[16] = 0xFE;
+        d[17] = 3;
+        d[0x12] = 0xFF;
+        d[0x13] = 2;
+        d[20..24].copy_from_slice(&0x20u32.to_le_bytes());
+        d[28..32].copy_from_slice(&0x36u32.to_le_bytes());
+        let g = |ch: u16, w: u8, h: u8, x: u16, y: u16, a: i8, ox: i8, oy: i8| {
+            let mut r = Vec::new();
+            r.extend(ch.to_le_bytes());
+            r.extend([w, h]);
+            r.extend(x.to_le_bytes());
+            r.extend(y.to_le_bytes());
+            r.extend([a as u8, ox as u8, oy as u8]);
+            r
+        };
+        d[0x20..0x2B].copy_from_slice(&g(0x41, 7, 9, 0x102, 0x304, -1, 2, -3));
+        d[0x2B..0x36].copy_from_slice(&g(0x92, 200, 130, 0xFFFE, 1, 127, -128, 5));
+        d[0x36] = 0x7A;
+        d[0x3A..0x3C].copy_from_slice(&4u16.to_le_bytes());
+        d[0x3C..0x3E].copy_from_slice(&4u16.to_le_bytes());
+        for b in &mut d[0x36 + 16..] {
+            *b = 0xA5;
+        }
+        let f = Font::parse(&d).unwrap();
+        let h = format!("{f:?}").bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+        assert_eq!(h, PIN);
+        assert!(matches!(Font::parse(&d[..0x30]), Err(FormatError::Truncated { what: "FNTF glyph", offset: 0x2B, needed: 11 })));
+        assert!(matches!(Font::parse(&d[..0x36 + 16 + 7]), Err(FormatError::Truncated { what: "FNTF atlas pixels", offset: 0x46, needed: 8 })));
+    }
+
+    const PIN: u64 = 382026314622361756;
 }

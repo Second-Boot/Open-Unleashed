@@ -29,7 +29,7 @@ impl RegFile {
     /// (`REGEDIT4`).
     pub fn parse(bytes: &[u8]) -> RegFile {
         let text = if bytes.starts_with(&[0xFF, 0xFE]) {
-            let units: Vec<u16> = bytes[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            let units: Vec<u16> = bytes[2..].chunks_exact(2).map(|c| crate::bytes::read_u16(c, 0)).collect();
             String::from_utf16_lossy(&units)
         } else {
             bytes.iter().map(|&b| b as char).collect()
@@ -114,5 +114,16 @@ mod tests {
         // case-sensitive strcmp: nfs5.ini's lower-case spelling would not match
         assert_eq!(language_index(Some(&sz("german"))), 0);
         assert_eq!(language_index(Some(&sz("Russian"))), 0);
+    }
+
+    /// Guard for the UTF-16 decode: a surrogate pair, and an odd trailing byte that is dropped.
+    #[test]
+    fn utf16_decode_edges() {
+        let mut b = utf16("[K]\r\n\"a\"=\"\u{1F600}x\"\r\n");
+        b.push(0x41);
+        let f = RegFile::parse(&b);
+        assert_eq!(f.value("k", "A"), Some(&RegValue::Sz("\u{1F600}x".into())));
+        let lossy = RegFile::parse(&[0xFF, 0xFE, 0x00, 0xD8, 0x5B, 0x00, 0x4B, 0x00, 0x5D, 0x00, 0x0A, 0x00, 0x22, 0x00, 0x61, 0x00, 0x22, 0x00, 0x3D, 0x00, 0x22, 0x00, 0x62, 0x00, 0x22, 0x00]);
+        assert_eq!(lossy.value("K", "a"), None); // the lone surrogate becomes U+FFFD before '[': not a key line
     }
 }

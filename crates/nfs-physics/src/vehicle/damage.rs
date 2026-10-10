@@ -264,7 +264,7 @@ impl Vehicle {
     /// `car+0xB50 != 0` — finished or out — jumps past the zones (0x494521…0x494529) to the crash
     /// response, like the switch. *(Audit 2026-09-26: the port had no `+0xB50` gate here.)*
     pub fn damage_zone(&mut self, amount: f32, zone: usize) {
-        if !self.damage_enabled || self.race_state != 0 || zone > 9 {
+        if !self.damage_enabled || self.race_state != RaceState::Racing || zone > 9 {
             return;
         }
         let a = (amount * if self.derby { 1.5 } else { 0.5 }).min(100.0);

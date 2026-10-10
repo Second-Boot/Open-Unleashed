@@ -28,6 +28,7 @@
 //!   and reports the count in [`PcmSample::padded_tail`]; a shortfall of a whole frame or more is
 //!   an error.
 
+use crate::bytes::read_i16;
 use crate::{u16_le, u32_le, FormatError};
 
 /// Shift table entry, `0x59B8D0`: `(signext4(nib) << 12) >> shift` (arithmetic shift).
@@ -696,7 +697,7 @@ impl PtHeader {
                 }
                 Codec::Pcm16 => {
                     let bytes = data.get(off..off + count * 2).ok_or(FormatError::Truncated { what: "PCM16 sample data", offset: off, needed: count * 2 })?;
-                    plane.extend(bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
+                    plane.extend(bytes.chunks_exact(2).map(|b| read_i16(b, 0)));
                 }
                 Codec::Pcm8 => {
                     let bytes = data.get(off..off + count).ok_or(FormatError::Truncated { what: "PCM8 sample data", offset: off, needed: count })?;

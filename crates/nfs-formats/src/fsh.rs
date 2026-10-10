@@ -57,6 +57,7 @@
 //! +16  pixel data; further blocks (e.g. palette, code 0x2A) follow at +size
 //! ```
 
+use crate::bytes::{get_array, read_u16};
 use crate::{u16_le, u32_le, FormatError};
 
 /// The file magic.
@@ -196,9 +197,7 @@ impl Fsh {
         }
         let declared_size = u32_le(data, 4, "SHPI size")?;
         let count = u32_le(data, 8, "SHPI count")? as usize;
-        let directory_id: [u8; 4] = data
-            .get(12..16)
-            .and_then(|b| b.try_into().ok())
+        let directory_id: [u8; 4] = get_array(data, 12)
             .ok_or(FormatError::Truncated { what: "SHPI directory id", offset: 12, needed: 4 })?;
         let mut entries = Vec::with_capacity(crate::cap_hint(count, data.len(), 8));
         for i in 0..count {
@@ -363,13 +362,13 @@ impl Fsh {
                         // CONFIRMED (0x570820, see the module doc above): RGB565, transparent
                         // (0,0,0,0) when the raw u16 is the fixed colour-key 0x0000.
                         block_code::PALETTE_RGB565 => {
-                            let raw = u16::from_le_bytes([c[0], c[1]]);
+                            let raw = read_u16(c, 0);
                             if raw == PALETTE_565_COLORKEY { [0, 0, 0, 0] } else { rgb565(raw) }
                         }
                         // CONFIRMED (0x570780): ARGB1555; its own colour-key check against the
                         // same fixed 0x0000 changes nothing here since alpha's own bit (15) is
                         // already clear on 0x0000.
-                        _ => argb1555(u16::from_le_bytes([c[0], c[1]])),
+                        _ => argb1555(read_u16(c, 0)),
                     }
                 };
                 if px.len() > 256 {
@@ -399,17 +398,17 @@ impl Fsh {
             }
             PixelFormat::Rgb565 => {
                 for (c, out) in px.chunks_exact(2).zip(rgba.chunks_exact_mut(4)) {
-                    out.copy_from_slice(&rgb565(u16::from_le_bytes([c[0], c[1]])));
+                    out.copy_from_slice(&rgb565(read_u16(c, 0)));
                 }
             }
             PixelFormat::Argb1555 => {
                 for (c, out) in px.chunks_exact(2).zip(rgba.chunks_exact_mut(4)) {
-                    out.copy_from_slice(&argb1555(u16::from_le_bytes([c[0], c[1]])));
+                    out.copy_from_slice(&argb1555(read_u16(c, 0)));
                 }
             }
             PixelFormat::Argb4444 => {
                 for (c, out) in px.chunks_exact(2).zip(rgba.chunks_exact_mut(4)) {
-                    let v = u16::from_le_bytes([c[0], c[1]]);
+                    let v = read_u16(c, 0);
                     let a = ((v >> 12) & 0xF) as u8;
                     let r = ((v >> 8) & 0xF) as u8;
                     let g = ((v >> 4) & 0xF) as u8;

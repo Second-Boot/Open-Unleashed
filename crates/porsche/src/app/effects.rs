@@ -313,7 +313,7 @@ impl App {
         // *(until 2026-09-30 it read the quad's 2 m, ≤ 2 % of the fog mix)*.
         let ahead = if cam.near < 1.0 { 1.0 } else { cam.near * 2.0 };
         let centre = cam.position + pt.rel * (ahead / pt.depth);
-        self.flare_quads(&mut out, cam, aspect, view, def, (pt.px, pt.py), centre, ahead, 1.0, &self.sun_sprites, false);
+        self.flare_quads(&mut out, cam, aspect, view, FlareQuad { def, at: (pt.px, pt.py), centre, ahead, scale: 1.0, sprites: &self.sun_sprites, overlay: false });
         out
     }
 
@@ -385,21 +385,8 @@ impl App {
     /// elements `matches / 16`. `overlay` draws the quad after the finished frame under no depth
     /// test ([`nfs_renderer::DrawItem::overlay`], the lens flare — drawn by 0x45D1A0 after the
     /// world, 0x45D25C) instead of in the sky pass.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn flare_quads(
-        &self,
-        out: &mut Vec<nfs_renderer::DrawItem>,
-        cam: &Camera,
-        aspect: f32,
-        view: [f32; 4],
-        def: &nfs_formats::flare::FlareDef,
-        (px, py): (f32, f32),
-        centre: Vec3,
-        ahead: f32,
-        scale: f32,
-        sprites: &std::collections::HashMap<String, (nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
-        overlay: bool,
-    ) {
+    pub(crate) fn flare_quads(&self, out: &mut Vec<nfs_renderer::DrawItem>, cam: &Camera, aspect: f32, view: [f32; 4], quad: FlareQuad<'_>) {
+        let FlareQuad { def, at: (px, py), centre, ahead, scale, sprites, overlay } = quad;
         if scale < 0.05 {
             return;
         }
@@ -628,6 +615,20 @@ pub(crate) struct SunPoint {
     pub py: f32,
     pub rel: Vec3,
     pub depth: f32,
+}
+
+/// One `flare.dat` record's screen quad for [`App::flare_quads`] (0x451710): the record, its point
+/// `at` in the view's 640 × 480 frame, that point laid `ahead` metres from the eye (`centre`), the
+/// call's third argument `scale`, the layers' sprites, and `overlay` (drawn after the finished frame).
+#[derive(Clone, Copy)]
+pub(crate) struct FlareQuad<'a> {
+    pub def: &'a nfs_formats::flare::FlareDef,
+    pub at: (f32, f32),
+    pub centre: Vec3,
+    pub ahead: f32,
+    pub scale: f32,
+    pub sprites: &'a std::collections::HashMap<String, (nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
+    pub overlay: bool,
 }
 
 pub(crate) const SUN_FLARE: u32 = 0x7375_6E61;

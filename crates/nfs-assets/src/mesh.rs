@@ -87,32 +87,30 @@ pub fn article_parts(art: &ArticleGeometry, lod: u8, skipped: &mut usize) -> Vec
 /// The corners of a primitive's expanded triangle list (see [`article_meshes`]); `None`, counted
 /// in `skipped`, for a shape the builder does not take.
 fn primitive_corners(p: &Primitive, skipped: &mut usize) -> Option<Vec<usize>> {
-    {
-        // corners of the expanded triangle list, each as a position in the primitive's own index
-        // arrays (which is also what indexes the per-corner colours)
-        // a primitive without index arrays runs one corner per vertex, as many as the colour stream
-        // (the `df` window) says — that window is what tells the engine how long the primitive is
-        let seq = if p.colors.is_empty() { p.positions.len() } else { p.colors.len().min(p.positions.len()) };
-        let corners: Vec<usize> = match (p.prim_type, p.vertex_indices.is_empty()) {
-            (prim_type::LIST, false) => (0..p.vertex_indices.len()).collect(),
-            (prim_type::LIST, true) if seq % 3 == 0 => (0..seq).collect(),
-            (prim_type::STRIP, false) => strip_corners(p.vertex_indices.len(), |k| p.vertex_indices[k] as usize),
-            (prim_type::STRIP, true) => strip_corners(seq, |k| k),
-            (prim_type::QUADS, true) if seq % 4 == 0 => {
-                let mut v = Vec::new();
-                for q in 0..seq / 4 {
-                    let b = q * 4;
-                    v.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
-                }
-                v
+    // corners of the expanded triangle list, each as a position in the primitive's own index
+    // arrays (which is also what indexes the per-corner colours)
+    // a primitive without index arrays runs one corner per vertex, as many as the colour stream
+    // (the `df` window) says — that window is what tells the engine how long the primitive is
+    let seq = if p.colors.is_empty() { p.positions.len() } else { p.colors.len().min(p.positions.len()) };
+    let corners: Vec<usize> = match (p.prim_type, p.vertex_indices.is_empty()) {
+        (prim_type::LIST, false) => (0..p.vertex_indices.len()).collect(),
+        (prim_type::LIST, true) if seq % 3 == 0 => (0..seq).collect(),
+        (prim_type::STRIP, false) => strip_corners(p.vertex_indices.len(), |k| p.vertex_indices[k] as usize),
+        (prim_type::STRIP, true) => strip_corners(seq, |k| k),
+        (prim_type::QUADS, true) if seq % 4 == 0 => {
+            let mut v = Vec::new();
+            for q in 0..seq / 4 {
+                let b = q * 4;
+                v.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
             }
-            _ => {
-                *skipped += 1;
-                return None;
-            }
-        };
-        Some(corners)
-    }
+            v
+        }
+        _ => {
+            *skipped += 1;
+            return None;
+        }
+    };
+    Some(corners)
 }
 
 /// Expand a triangle strip into triangle-list corner positions, keeping the file's winding and

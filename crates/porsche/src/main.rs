@@ -23,6 +23,7 @@
 mod accessors;
 mod app;
 mod career_ui;
+mod cli;
 mod diag;
 mod hud;
 mod hud_str;
@@ -74,41 +75,13 @@ fn main() {
 fn run() -> Result<()> {
     let paths = GamePaths::locate()?;
     tracing::info!(root = %paths.root.display(), "located original game data");
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    // positional arguments = tokens that are neither flags nor flag values
-    let flags_with_value = [
-        "--screenshot",
-        "--autotest",
-        "--opponents",
-        "--record",
-        "--laps",
-        "--career",
-        "--layout",
-        "--replay",
-        "--net",
-        "--net-name",
-        "--net-browse",
-    ];
-    // flags without a value: --follow, --mission
-    let mut positional = Vec::new();
-    let mut skip = false;
-    for a in &args {
-        if skip {
-            skip = false;
-            continue;
-        }
-        if a.starts_with("--") {
-            skip = flags_with_value.contains(&a.as_str());
-            continue;
-        }
-        positional.push(a.clone());
-    }
+    let cli = cli::Cli::from_env();
+    let positional = &cli.positional;
     // `--replay <file>`: play back a recording the port saved (`RE/notes/replay.md` §14.5 — the
     // original's 118 312-byte .rpl is the registry dump of §16, which `--rpl` writes)
-    let replay_file = args
-        .iter()
-        .position(|a| a == "--replay")
-        .and_then(|i| args.get(i + 1))
+    let replay_file = cli
+        .replay
+        .as_ref()
         .and_then(|p| {
             let d = std::fs::read(p)
                 .map_err(|e| tracing::error!(error = %e, path = p, "replay unreadable"))
@@ -119,14 +92,11 @@ fn run() -> Result<()> {
                     None
                 })
         });
-    let career_id: Option<i16> = args
-        .iter()
-        .position(|a| a == "--career")
-        .and_then(|i| args.get(i + 1)?.parse().ok());
-    let mission_flag = args.iter().any(|a| a == "--mission");
+    let career_id = cli.career;
+    let mission_flag = cli.mission;
     // (`NFS_FE_PLAYGAME` keeps the front end for a scripted run: the race starts from it)
     let use_menu = positional.is_empty()
-        && (!args.iter().any(|a| a == "--autotest") || std::env::var_os("NFS_FE_PLAYGAME").is_some() || std::env::var_os("NFS_FE_KEYS").is_some())
+        && (!cli.autotest_flag || std::env::var_os("NFS_FE_PLAYGAME").is_some() || std::env::var_os("NFS_FE_KEYS").is_some())
         && career_id.is_none()
         && !mission_flag
         && replay_file.is_none();
@@ -342,8 +312,7 @@ fn run() -> Result<()> {
     // must not take the keyboard focus away from whatever the user is doing: on macOS the process
     // stays an accessory (no Dock icon, never activated on launch) and its window is shown without
     // being made key. The window still appears, so the GPU path is the real one.
-    let scripted = ["--autotest", "--screenshot", "--layout-sweep", "--record"].iter().any(|f| args.iter().any(|a| a == f))
-        || std::env::var_os("NFS_NO_FOCUS").is_some();
+    let scripted = cli.scripted || std::env::var_os("NFS_NO_FOCUS").is_some();
     NO_FOCUS.store(scripted, std::sync::atomic::Ordering::Relaxed);
     // diagnostic: `NFS_PLAY_INTRO=1` keeps the start-up movies for a scripted run (see `PLAY_INTRO`)
     PLAY_INTRO.store(std::env::var_os("NFS_PLAY_INTRO").is_some(), std::sync::atomic::Ordering::Relaxed);
@@ -376,15 +345,9 @@ fn run() -> Result<()> {
     event_loop.set_control_flow(ControlFlow::Poll);
     // `--fe` boots into the original front end instead of the text menu, on the quick-race screen
     // or on the layout named after it (`--fe carcompare`)
-    let fe_start = args.iter().find(|a| a.starts_with("--fe")).map(|a| match a.split_once('=') {
-        Some((_, name)) if !name.is_empty() => name.to_string(),
-        _ => "QuickRace".to_string(),
-    });
-    let screenshot = args
-        .iter()
-        .position(|a| a == "--screenshot")
-        .and_then(|i| args.get(i + 1).cloned());
-    let layout_sweep = args.iter().any(|a| a == "--layout-sweep");
+    let fe_start = cli.fe.clone();
+    let screenshot = cli.screenshot.clone();
+    let layout_sweep = cli.layout_sweep;
     // The sweep measures **gaps**, and a widget that is correctly blank because an animation has
     // not started yet is not one. `data.animating` keeps a wordwrap widget empty for its first
     // 0x97 = 151 ticks (§4.87), so a sweep taken at clock 0 counts five of them; preloading the
@@ -401,8 +364,8 @@ fn run() -> Result<()> {
     // NOINTROMOVIES) and enters the front end on `"gamesetup"` (0x4B6C52, `FE_ENTRY`), with the
     // profile prompt of the first entry. The port's text menu is a developer tool and opens only
     // with `--debug-menu`; a `--layout <name>` start keeps its own screen.
-    let debug_menu = args.iter().any(|a| a == "--debug-menu");
-    let fe_start = if use_menu && fe_start.is_none() && !debug_menu && !args.iter().any(|a| a == "--layout") {
+    let debug_menu = cli.debug_menu;
+    let fe_start = if use_menu && fe_start.is_none() && !debug_menu && !cli.layout_flag {
         Some(app::FE_ENTRY.to_string())
     } else {
         fe_start
@@ -419,46 +382,34 @@ fn run() -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<u8>().ok())
         .unwrap_or(0);
-    let autotest = args
-        .iter()
-        .position(|a| a == "--autotest")
-        .and_then(|i| args.get(i + 1)?.parse().ok());
-    let follow_road = args.iter().any(|a| a == "--follow");
+    let autotest = cli.autotest;
+    let follow_road = cli.follow;
     // `--net` without `--opponents` still needs one seat for the other player
-    let num_opponents_default = u32::from(args.iter().any(|a| a == "--net"));
+    let num_opponents_default = u32::from(cli.net_flag);
     let num_opponents: u32 = replay_setup
         .as_ref()
         .map(|r| r.opponents)
         .or_else(|| career_request.as_ref().map(|r| r.opponents.len() as u32))
-        .or_else(|| {
-            args.iter()
-                .position(|a| a == "--opponents")
-                .and_then(|i| args.get(i + 1)?.parse().ok())
-        })
+        .or(cli.opponents)
         .unwrap_or(num_opponents_default);
     let num_laps: u32 = replay_setup
         .as_ref()
         .map(|r| r.laps)
         .or_else(|| career_request.as_ref().map(|r| r.laps))
-        .or_else(|| {
-            args.iter()
-                .position(|a| a == "--laps")
-                .and_then(|i| args.get(i + 1)?.parse().ok())
-        })
+        .or(cli.laps)
         .unwrap_or(2)
         .max(1);
     // Quick Knockout: laps = opponents (modes.md §4)
-    let num_laps = if args.iter().any(|a| a == "--quick-knockout") {
+    let num_laps = if cli.quick_knockout {
         num_opponents.max(1)
     } else {
         num_laps
     };
     // `RAND_SEED`: `fe.txt`'s `rand_seed` (see `start_race`)
     let fe_rand_seed = nfs_formats::fetxt::Registry::load(&paths.root).u32("rand_seed", 0);
-    let record = args
-        .iter()
-        .position(|a| a == "--record")
-        .and_then(|i| args.get(i + 1))
+    let record = cli
+        .record
+        .as_ref()
         .and_then(|p| {
             let mut w = std::io::BufWriter::new(std::fs::File::create(p).ok()?);
             use std::io::Write;
@@ -472,7 +423,7 @@ fn run() -> Result<()> {
     let backwards = match &replay_setup {
         Some(r) => r.backwards,
         None => {
-            args.iter().any(|a| a == "--backwards")
+            cli.backwards
                 || career_request
                     .as_ref()
                     .map(|r| r.backwards)
@@ -604,11 +555,7 @@ fn run() -> Result<()> {
 
     // `--net-browse N`: probe for N seconds and print the sessions that answer, then exit. The
     // same `'w'` / `'d'` exchange the network screens run, without a window.
-    if let Some(secs) = args
-        .iter()
-        .position(|a| a == "--net-browse")
-        .and_then(|i| args.get(i + 1)?.parse::<f32>().ok())
-    {
+    if let Some(secs) = cli.net_browse {
         let mut lobby = netplay::Lobby::open("browser")?;
         let until = std::time::Instant::now() + Duration::from_secs_f32(secs);
         while std::time::Instant::now() < until {
@@ -624,16 +571,11 @@ fn run() -> Result<()> {
     }
 
     // `--net host[:PORT]` / `--net join:HOST[:PORT]`: two copies of the port in one race.
-    let net = match args
-        .iter()
-        .position(|a| a == "--net")
-        .and_then(|i| args.get(i + 1))
-    {
+    let net = match &cli.net {
         Some(spec) => {
-            let who = args
-                .iter()
-                .position(|a| a == "--net-name")
-                .and_then(|i| args.get(i + 1).cloned())
+            let who = cli
+                .net_name
+                .clone()
                 .unwrap_or_else(|| {
                     if spec.starts_with("host") {
                         "host".into()
@@ -692,529 +634,91 @@ fn run() -> Result<()> {
         let o = ui.career.garage.get(ui.pending.as_ref()?.garage_idx?)?;
         (!r.car.paint_sets.is_empty()).then(|| (App::paint_of(&r.car, o), o.trim.decal))
     });
-    let mut app = App {
-        fe: FrontEnd {
-            era_music: false,
-            bar_grab: None,
-            chronicle_group: CHRONICLE_GROUP,
-            chronicle_col: None,
-            chronicle_sel: 0,
-            chronicle_year_idx: None,
-            chronicle_slider_drag: None,
-            picker_prev: None,
-            generic_colour_row: None,
-            usedcars_showparts: false,
-            usedcar_sel: 0,
-            dealer: DealerSel::default(),
-            compare_dealer: false,
-            remaining_sel: 0,
-            parts_sel: None,
-            setting_repeat: None,
-            mouse_down: false,
-            repair_ticks: Default::default(),
-            binding_base: None,
-            controllers_sel: 0,
-            pads_sel: 0,
-            resolution_sel: 0,
-            owned_seen: None,
-            resolution_race: None,
-            parts_forced: false,
-            last_hover: None,
-            dialog: None,
-            dialog_forced: false,
-            dialog_answer: None,
-            dialog_input: None,
-            replay_sel: 0,
-            user_sel: None,
-            driver_picture: std::env::var("NFS_FE_DRIVER_PICTURE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(nfs_game::save::DEFAULT_PICTURE as i32),
-            cd_available: None,
-            cd_selected: None,
-            cd_title: 0,
-            cd_current: -1,
-            after_replay: false,
-            test_drive: None,
-            game_type: 0,
-            // **Diagnostic glue**: `--fe=local` skips the `SETMODELAN` button that leads to that
-            // screen (0x510E00 writes `Comms.GameMode` 1), and the games list's row draw
-            // (0x4BA030) is laid out by that mode, so the direct entry starts in it
-            comms_game_mode: u32::from(fe_start.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("local"))),
-            update_check: None,
-            camera_current: 0,
-            camera_list: [0, 1, 2, 3],
-            camera_pic_click: Default::default(),
-            race_game_type: None,
-            xxdefxx: None,
-            track_tables,
-            cursor: None,
-            // both of `Parts.AllParts`'s sections start closed (0x515190, 0x515193)
-            parts_open: [false, false],
-            shop: parts_shop::PartsShop::default(),
-            factory_profile: 0,
-            menu,
-            menu_template: None,
-            room: Vec::new(),
-            cars: Vec::new(),
-            cars_key: Vec::new(),
-            cars_env: None,
-            // `NFS_FE_CLOCK` preloads this the same way it preloads `LayoutScreen::clock_ms`
-            // (layout.rs), so the turntable (`room.spin_turns`, `frontend-3d.md` §3) can be
-            // pinned for a still — the room's clock was previously never seeded from it at all
-            ms: std::env::var("NFS_FE_CLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
-            dealer_row: None,
-            dealer_prev: None,
-            room_car_half: None,
-            garage_shadow_prev: None,
-            garage_shadow_tex: None,
-            victory_movie: None,
-            track_room: None,
-            room_obj: None,
-            track_art: None,
-            trk_table: None,
-            track_turn_back: false,
-            layout_preview: None,
-            layout_bottom: None,
-            music_current: String::new(),
-            list_current: String::new(),
-            main_music_stamp: 0,
-            timer_origin: std::time::Instant::now(),
-            loading: None,
-            loading_still: std::env::var("NFS_FE_LOADING").ok().and_then(|v| v.trim().parse().ok()),
-            race_loading: None,
-            race_loading_still: std::env::var("NFS_RACE_LOADING").ok().and_then(|v| v.trim().parse().ok()),
-            startup_still: None,
-            strings: fe_strings,
-            layout_name: args
-                .iter()
-                .position(|a| a == "--layout")
-                .and_then(|i| args.get(i + 1).cloned())
-                .or(fe_start),
-            layout_sel: 0,
-            layout_nav_used: false,
-            layout_open_combo: None,
-            list_drag: None,
-            combo_drag: None,
-            list_repeat: None,
-            combo_arrow_repeat: None,
-            nav: nfs_game::layout::nav::Nav::new(),
-            layout_under: Vec::new(),
-        },
-        layout_sweep,
-        registry: nfs_formats::fetxt::Registry::load(&paths.root),
-        language: paths.language(),
-        choices: std::collections::HashMap::new(),
-        hud_cfg: std::cell::RefCell::new(HudCfgCache::default()),
-        paths,
-        net: Network { session: net, leaving: Vec::new(), lobby: None, start_due: false, join_notified: false, lobby_sent: false, lobby_car: None, lobby_setsel: false, race: None, connect_pending: false, connect_opened: false },
-        career,
-        career_opponents: career_request.map(|r| r.opponents),
-        cheat_bits_live: None,
-        // diagnostic: `NFS_OPPCAR=0..4` picks `OpponentCar.Car` without going through the menu
-        opp_choice: std::env::var("NFS_OPPCAR")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0),
-        player_car_id: None,
-        pad_stick_latched: false,
-        skill,
-        smackables: Default::default(),
-        mission: mission_start,
-        prev_car_pos: Vec3::ZERO,
-        world_actions: Vec::new(),
-        render_prev: None,
-        local_pose: (Vec3::ZERO, Quat::IDENTITY),
-        local_prev: None,
-        frame_dt: 1.0 / 60.0,
-        fe_ms_carry: 0.0,
-        pause_ticks: 0.0,
-        pause_offset: 0.0,
-        hud_clock_base: 0.0,
-        hud_scale: std::cell::Cell::new(1.0),
-        tray_slide: (0, 0),
-        time_trays: (0, 0),
-        map_slide: (0, 0),
-        mirror_slide: (0, 0),
-        hud_keys: HudKeys::new(1, false, true),
-        replay_bar: nfs_game::replay::BarState::new(),
-        bar_press: None,
-        hud_key_script: std::env::var("NFS_HUD_KEYS_1").or_else(|_| std::env::var("NFS_HUD_KEYS")).map(|s| parse_hud_keys(&s).into()).unwrap_or_default(),
-        scripted_race_no: 0,
-        race_order: Default::default(),
-        audio_paused: false,
-        scripted_pause: false,
-        scripted_restart: false,
-        scripted_net_leave: false,
-        scripted_quit: false,
-        results_billboard: None,
-        billboard_key: 0,
-        paused: false,
-        knockout: None,
-        opp_cars: Vec::new(),
-        knockout_round: false,
-        player_grid_override: None,
-        net_fe_txt: Default::default(),
-        net_nocollision: false,
-        net_seat_grids: Vec::new(),
-        net_seat_cars: Vec::new(),
-        net_own_words: Vec::new(),
-        exchange_in: None,
-        replay_net: None,
-        replay_view: 0,
-        net_derby: false,
-        net_flags: None,
-        net_traffic: Vec::new(),
-        crt_rand: nfs_game::movie_overlay::CRand::new(1),
+    // **The command line's race options** (`RaceSetup`): a `--replay` takes the recorded block's
+    // (`Replay_begin` 0x413CF0's restore), a `--career` event its own, else the flags, the
+    // `NFS_*` switches and the registry. The menus write their own at their launch.
+    let launch = RaceSetup {
+        opponents: num_opponents,
+        laps: num_laps,
         backwards,
         mirror: replay_setup
             .as_ref()
             .map(|r| r.mirror)
-            .unwrap_or_else(|| args.iter().any(|a| a == "--mirror")),
+            .unwrap_or(cli.mirror),
+        // the registry's `traffic_density`, or `NFS_TRAFFIC=0..3` for the menu-less --autotest start
+        traffic_count: TRAFFIC_COUNT[replay_setup
+            .as_ref()
+            .map(|r| r.traffic as usize)
+            .unwrap_or_else(|| {
+                std::env::var("NFS_TRAFFIC")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(fe.traffic_density as usize)
+            })
+            .min(3)],
+        traffic_ids: None,
+        cops_enabled: replay_setup.as_ref().map(|r| r.cops).unwrap_or_else(|| {
+            std::env::var("NFS_COPS").map(|v| v != "0").unwrap_or(fe.cops)
+        }),
+        // the recording's `RACE_TYPE` 1 (the cops race) / `FEGAME_TYPE` 9 (a mission's two cops)
+        cops_race: replay_setup.as_ref().is_some_and(|r| r.race_type == Some(1)),
+        cop_count: if replay_setup.as_ref().is_some_and(|r| r.fegame_type == Some(9)) { 2 } else { 4 },
+        damage: replay_setup.as_ref().is_none_or(|r| r.damage),
+        skill: race_skill,
         // a recording's `RACE_TYPE` 3 (`Replay_begin` 0x413CF0's restore); no such word: the command line's
         quick_knockout: match replay_setup.as_ref().and_then(|r| r.race_type) {
             Some(t) => t == 3,
-            None => args.iter().any(|a| a == "--quick-knockout"),
+            None => cli.quick_knockout,
         },
-        player_eliminated: false,
-        net_time_sent: false,
-        net_pad_buttons: 0,
+        career_opponents: career_request.map(|r| r.opponents),
+        player_grid: None,
+        look: PlayerLook { paint, owned_paint: cli_owned.map(|(p, _)| p), owned_decal: cli_owned.map(|(_, d)| d) },
+    };
+    let mut app = App::new(AppInit {
+        paths,
+        cli: &cli,
+        fe_start,
+        track_tables,
+        menu,
+        fe_strings,
+        layout_sweep,
+        net,
+        career,
+        launch,
+        mission_start,
+        skill,
         records,
-        replay: Playback {
-            stream: Some(match &replay_file {
-                Some(f) => nfs_game::replay::Replay::playing(f.stream.clone(), f.final_tick),
-                None => nfs_game::replay::Replay::new(),
-            }),
-            speed: nfs_game::replay::Speed::Normal,
-            race_over: false,
-            setup: replay_setup
-                .clone()
-                .unwrap_or(nfs_game::replay::ReplaySetup {
-                    track: track_name.to_string(),
-                    car: car_name.to_string(),
-                    sim: sim_name.clone(),
-                    car_id: catalog
-                        .iter()
-                        .find(|c| c.sim.eq_ignore_ascii_case(&sim_name))
-                        .map(|c| c.id)
-                        .unwrap_or(0),
-                    paint,
-                    laps: num_laps,
-                    opponents: num_opponents,
-                    traffic: std::env::var("NFS_TRAFFIC")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(fe.traffic_density as u32),
-                    cops: std::env::var("NFS_COPS")
-                        .map(|v| v != "0")
-                        .unwrap_or(fe.cops),
-                    // `Game.Damage`'s accessor starts on (0x4E55DD's initial 1); `fe.txt` has no key
-                    damage: true,
-                    backwards,
-                    mirror: args.iter().any(|a| a == "--mirror"),
-                    seed: 0,
-                    skill: fe.skill,
-                    // overwritten by `start_race`'s own rebuild before this is read for a fresh
-                    // (non-replay) race; this placeholder only shows if that never runs
-                    driver_name: String::new(),
-                    net: None,
-                    race_type: None,
-                    fegame_type: None,
-                    camera: None,
-                    ..Default::default()
-                }),
-            path: nfs_game::save::save_dir().join("replay.prpl"),
-            saved: false,
-            loop_count: 0,
-            camera: 0,
-            frozen: false,
-        },
-        // the original seeds the race RNG from the registry's RAND_SEED (replay.md §11); a replay
-        // carries the seed so playback re-simulates the same traffic, police and AI
-        // (**test glue**: `NFS_CHEAT_BITS` sets the cheat bits a name-box code would, for the scripted runs)
-        cheat_bits: {
-            let bits: u32 = std::env::var("NFS_CHEAT_BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-            // a recording's `DERBY` word (0x1B, the block `Replay_begin` restores)
-            match replay_setup.as_ref().and_then(|r| r.derby) {
-                Some(true) => bits | CHEAT_DERBY,
-                Some(false) => bits & !CHEAT_DERBY,
-                None => bits,
-            }
-        },
-        traffic_seed: match (
-            &replay_setup,
-            std::env::var("NFS_TRAFFIC_SEED")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-        ) {
-            (Some(r), _) => r.seed,
-            (None, Some(s)) => s,
-            // `fe.txt`'s `rand_seed`, as `start_race` reads it for every live race
-            (None, None) => fe_rand_seed,
-        },
-        scripted: autotest.is_some(),
-        stuck_ticks: 0,
-        detail: std::env::var("NFS_DETAIL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1.0),
+        replay_file,
+        replay_setup,
+        track_name,
+        car_name,
+        sim_name,
+        catalog,
+        paint,
+        num_laps,
+        num_opponents,
+        fe,
+        backwards,
+        fe_rand_seed,
+        autotest,
         records_path,
-        car_id: catalog
-            .iter()
-            .find(|c| c.sim.eq_ignore_ascii_case(&sim_name))
-            .map(|c| c.id)
-            .unwrap_or(0),
-        player_name: nfs_game::save::read_player_lst(&nfs_game::save::save_dir())
-            .and_then(|s| nfs_game::save::Profile::from_stem(&s))
-            .map(|p| p.name)
-            .unwrap_or_else(|| "DRIVER".to_string()),
-        hud_records: None,
-        records_spoken: false,
-        results_page: 0,
-        page_seen: None,
-        page_frames: 0,
-        page_open_tick: None,
-        page_closing: None,
-        pause_sel: 0,
-        pause_confirm: None,
-        hud_hover: None,
-        replay_save: ReplaySave::default(),
-        bar_script: std::env::var("NFS_REPLAY_PRESS")
-            .ok()
-            .map(|v| {
-                v.split(',')
-                    .filter_map(|e| {
-                        let (t, c) = e.split_once(':')?;
-                        Some((t.trim().parse().ok()?, c.trim().parse().ok()?))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        hover_script: std::env::var("NFS_REPLAY_HOVER")
-            .ok()
-            .map(|v| {
-                v.split(',')
-                    .filter_map(|e| {
-                        let (t, c) = e.split_once(':')?;
-                        let c = c.trim();
-                        Some((t.trim().parse().ok()?, if c == "off" { None } else { Some(c.parse().ok()?) }))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        results: None,
-        auto_replay_due: false,
-        results_page_tick: 0,
-        mission_result: None,
-        cone_flash: 0,
-        hud_cones: Default::default(),
-        start_damage: [0; 8],
         track,
         car,
-        shot_target: (screenshot.is_some() || std::env::var_os("NFS_RACE_LOADING").is_some() || std::env::var_os("NFS_LOADING_SHOT").is_some()).then(shot_geometry),
         screenshot,
-        autotest,
-        fe_rng: nfs_game::opponents::FeRng::new(0),
-        race_pass: false,
-        session_races: std::env::var("NFS_AUTOTEST_RACES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1),
-        session_replayed: false,
-        intro: None,
-        intro_done: None,
-        idle_movie_due: false,
-        idle_movie_running: false,
-        window: None,
-        renderer: None,
-        world: None,
-        car_model: None,
-        car_lod: Default::default(),
-        driver_cam: None,
-        // `NFS_CAMERA=0..3` picks the starting view (chase / bonnet / trackside / cockpit) —
-        // the port's own switch, for screenshots and tests
-        sky: None,
-        scene: Scene::default(),
-        camera: Camera::default(),
-        input: InputState::default(),
-        gamepads: Gamepads::new(),
-        ff: None,
-        ff_levels: nfs_physics::force_feedback::FfLevels { total: 50, road: 50, engine: 50, collision: 50, grip: 50 },
-        car_pos: Vec3::ZERO,
-        car_rot: Quat::IDENTITY,
         specs,
-        vehicle: None,
         camera_mode,
-        weather_kept: None,
-        anim_cam: AnimCamSlot::Off,
-        anim_cam_counter: 0,
-        cam_anims: Vec::new(),
         camera_cycle,
-        skid: nfs_game::skidmarks::SkidMarks::new(),
-        skid_pool: Vec::new(),
-        particle_draw: None,
-        shadow_draw: None,
-        shadow_meshes: Default::default(),
-        glare_draw: None,
-        glare_star: [None, None],
-        lamp_pools: LampPools::default(),
-        flare_defs: Vec::new(),
-        flare_sprites: std::collections::HashMap::new(),
-        sun_sprites: std::collections::HashMap::new(),
-        lens_sprites: std::collections::HashMap::new(),
-        lens: Default::default(),
-        track_particles: None,
-        walk_calls: 0,
-        track_particle_defs: Vec::new(),
-        track_particle_sprites: std::collections::HashMap::new(),
-        car_effects: None,
-        car_effect_defs: Vec::new(),
-        weather: None,
-        weather_draws: [None, None],
-        splat_draw: None,
-        streak_draw: None,
-        article_draws: Vec::new(),
-        draw_distance: 700.0,
-        track_item_range: (0, 0),
-        effect_item_range: (0, 0),
-        blended_dyn_items: Vec::new(),
-        scratch: Default::default(),
-        order_cache: Default::default(),
-        order_key: Default::default(),
-        view_far: 700.0,
-        pool_used: PoolUse::default(),
-        dyn_pose: None,
-        test_alpha: None,
-        sky_item_range: (0, 0),
-        particles_left_ref_one: false,
-        track_cameras: None,
-        slices: None,
-        race: None,
-        road: RoadCars {
-            opponents: Vec::new(),
-            opponent_models: Vec::new(),
-            opp_prev: Vec::new(),
-            opp_steer_prev: Vec::new(),
-            player_steer_prev: None,
-            traffic: None,
-            traffic_models: Vec::new(),
-            opponent_sets: Vec::new(),
-            traffic_sets: Vec::new(),
-            opponent_paints: Vec::new(),
-            opponent_families: Vec::new(),
-            traffic_paints: Vec::new(),
-            police: None,
-            police_models: Vec::new(),
-            police_sets: Vec::new(),
-            police_specs: Vec::new(),
-            police_prev: Vec::new(),
-            // the recording's `RACE_TYPE` 1 (the cops race) / `FEGAME_TYPE` 9 (a mission's two cops)
-            cops_race: replay_setup.as_ref().is_some_and(|r| r.race_type == Some(1)),
-            cop_count: if replay_setup.as_ref().is_some_and(|r| r.fegame_type == Some(9)) { 2 } else { 4 },
-            cops_enabled: replay_setup.as_ref().map(|r| r.cops).unwrap_or_else(|| {
-                std::env::var("NFS_COPS").map(|v| v != "0").unwrap_or(fe.cops)
-            }),
-            traffic_prev: Vec::new(),
-            traffic_specs: None,
-            traffic_spin: Vec::new(),
-            opponent_lods: Vec::new(),
-            police_lods: Vec::new(),
-            traffic_lods: Vec::new(),
-            // the registry's `traffic_density`, or `NFS_TRAFFIC=0..3` for the menu-less --autotest start
-            traffic_ids: None,
-            traffic_colours: Vec::new(),
-            damage_on: replay_setup.as_ref().is_none_or(|r| r.damage),
-            traffic_count: TRAFFIC_COUNT[replay_setup
-                .as_ref()
-                .map(|r| r.traffic as usize)
-                .unwrap_or_else(|| {
-                    std::env::var("NFS_TRAFFIC")
-                        .ok()
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .unwrap_or(fe.traffic_density as usize)
-                })
-                .min(3)],
-        },
-        racing_line: None,
-        num_opponents,
-        player_grid: 0,
-        hud_metres: Vec::new(),
-        rear_mirror: None,
-        mirror_tex: None,
-        wrong_way_blink: (0, 0, true),
         record,
-        net_dump: None,
-        exchange_tick_at: Instant::now(),
-        net_notice: None,
-        net_notice_space: false,
-        net_lag_box: false,
-        num_laps,
-        derby_hud_laps: None,
         follow_road,
-        car_half_width: 0.9,
-        chase_offset: None,
-        chase_settle: 0,
-        slot_view: None,
-        slot_key_enters: 0,
-        fe0: !use_menu && career_id.is_none() && !mission_flag && replay_file.is_none(),
-        slot_seen: (0, 0),
-        look_yaw: None,
-        look_held: [false; 3],
-        lamp_bits: 0,
-        hud_hidden: false,
-        orbit: Orbit::default(),
-        head_ramp: HeadRamp::default(),
-        camera_tick: 0,
-        cam_hist: Default::default(),
-        colour_idx: Default::default(),
-        flip_side: None,
-        slot_eye: None,
-        replay_wander: Default::default(),
-        circle: (nfs_game::camera::CircleCam::default(), 0xFFFF, 0),
-        cam_slice: None,
-        wall_hits: 0,
-        resets: 0,
-        hud: None,
-        dials: catalog
-            .iter()
-            .find(|c| c.sim.eq_ignore_ascii_case(&sim_name))
-            .map(|c| (c.dial_kmh, c.dial_mph, c.dial_tach)),
-        paint,
-        owned_paint: cli_owned.map(|(p, _)| p),
-        owned_decal: cli_owned.map(|(_, d)| d),
-        snd: AudioState {
-            audio: None,
-            sfx_saved: None,
-            registry_music_level,
-            engine_sound: None,
-            sfx: None,
-            ai_engines: None,
-            slots: Default::default(),
-            crowding: 128,
-            ambience: None,
-            audio_triggers: Vec::new(),
-            reverb: nfs_audio::reverb::Reverb::default(),
-            music: None,
-            music_names,
-            music_lengths,
-            audio_settings,
-            speech: None,
-            countdown_said: 0,
-            sound_set,
-            last_gear: 1,
-            crash_played: false,
-            ai_sfx: std::collections::HashMap::new(),
-            player_loops: Default::default(),
-            fe_sfx: None,
-        },
-        sim_name: sim_name.clone(),
-        race_skill,
-        last_frame: Instant::now(),
-        presented: None,
-        idle_check: None,
-        accumulator: Duration::ZERO,
-        tick: 0,
-        cop_blips: Vec::new(),
-        frames: 0,
-        fps_timer: Instant::now(),
-    };
+        use_menu,
+        career_id,
+        mission_flag,
+        registry_music_level,
+        music_names,
+        music_lengths,
+        audio_settings,
+        sound_set,
+    });
     // the player's key bindings are `fe.txt`'s `C1_*` lines (`nfs_input::bindings`)
     app.input.bindings = nfs_input::bindings::Bindings::from_registry(|k| app.registry.get(k));
     // …then the `Controller.*` accessors' factory values: once it has built them, 0x51E89B

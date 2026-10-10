@@ -27,6 +27,7 @@
 //!      LOD: kind = 0x03 | lod<<3 ; vt/uv/df.index = lod ; pr.index = lod<<12 | n
 //! ```
 
+use crate::bytes::{get_u32, read_f32, read_i32, read_u32};
 use crate::{f32_le, u16_le, u32_le, FormatError};
 
 /// The tags of the table entries (see the layout above): four characters for the level entries,
@@ -341,8 +342,8 @@ impl Crp {
             if b.len() < 8 {
                 continue;
             }
-            let u32_at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
-            let f_at = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+            let u32_at = |o: usize| read_u32(b, o);
+            let f_at = |o: usize| read_f32(b, o);
             let n = (b.len() - 8) / 16;
             out.push(BoundPoints {
                 style_slot: u32_at(0),
@@ -499,7 +500,7 @@ impl Crp {
         if count == 0 || ql < count * 52 || qo + ql > data.len() {
             return None;
         }
-        let f = |o: usize| f32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+        let f = |o: usize| read_f32(data, o);
         let frames = (0..count)
             .map(|i| {
                 let b = qo + i * 52;
@@ -577,7 +578,7 @@ impl Crp {
                     stream_kind::DF => tags::DF,
                     _ => return Ok(None),
                 };
-                let idx = if tag == tags::PR { 0 } else { sd.lod };
+                let idx = sd.lod;
                 let idx = if kind == stream_kind::VT && frame > 0 { frame * 0x10 + idx } else { idx };
                 let idx = if kind == stream_kind::VT && damage { 0x8000 | idx } else { idx };
                 let part = art.find(tag, idx).or_else(|| if (frame > 0 || damage) && kind == stream_kind::VT { None } else { art.parts.iter().find(|p| p.is_part(tag) && p.lod() == lod) }).ok_or(FormatError::UnexpectedValue {
@@ -602,7 +603,7 @@ impl Crp {
                     .map(|c| {
                         let mut v = [0f32; 3];
                         for (i, x) in v.iter_mut().enumerate().take(n) {
-                            *x = f32::from_le_bytes([c[i * 4], c[i * 4 + 1], c[i * 4 + 2], c[i * 4 + 3]]);
+                            *x = read_f32(c, i * 4);
                         }
                         v
                     })
@@ -611,7 +612,7 @@ impl Crp {
             let positions = read_vec(vt, 16, 3);
             let normals = read_vec(nm, 16, 3);
             let uvs: Vec<[f32; 2]> = read_vec(uv, 8, 2).into_iter().map(|v| [v[0], v[1]]).collect();
-            let colors: Vec<u32> = df.map(|b| b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()).unwrap_or_default();
+            let colors: Vec<u32> = df.map(|b| b.chunks_exact(4).map(|c| read_u32(c, 0)).collect()).unwrap_or_default();
             let n = rec.index_count as usize;
             // Any primitive kind may carry indices: `vI`+`uI` (both indexed), `vI` alone (uv and
             // colour run per corner) or neither (everything sequential).
@@ -890,15 +891,15 @@ impl Material {
             texture: [b[o::TEXTURE], b[o::TEXTURE + 1], b[o::TEXTURE + 2], b[o::TEXTURE + 3]],
             unknown_20: u32_le(b, o::UNKNOWN_20, "mt +32")?,
             light: (b.len() >= o::EXT_LEN && u32_le(b, o::LIGHT_ID, "mt +248")? == 0x28 && u32_le(b, o::LIGHT_SIZE, "mt +252")? == 0xC).then(|| LayerLight {
-                p0: f32::from_bits(u32::from_le_bytes([b[o::LIGHT_DATA], b[o::LIGHT_DATA + 1], b[o::LIGHT_DATA + 2], b[o::LIGHT_DATA + 3]])),
-                p1: f32::from_bits(u32::from_le_bytes([b[o::LIGHT_DATA + 4], b[o::LIGHT_DATA + 5], b[o::LIGHT_DATA + 6], b[o::LIGHT_DATA + 7]])),
-                slot: u32::from_le_bytes([b[o::LIGHT_DATA + 8], b[o::LIGHT_DATA + 9], b[o::LIGHT_DATA + 10], b[o::LIGHT_DATA + 11]]),
+                p0: read_f32(b, o::LIGHT_DATA),
+                p1: read_f32(b, o::LIGHT_DATA + 4),
+                slot: read_u32(b, o::LIGHT_DATA + 8),
             }),
             lod_bias: f32::from_bits(u32_le(b, o::LOD_BIAS, "mt lod bias")?),
             address: [u32_le(b, o::ADDRESS_U, "mt address u")?, u32_le(b, o::ADDRESS_V, "mt address v")?],
-            reflection: if b.len() >= o::REFLECTION_END { f32::from_bits(u32::from_le_bytes([b[o::REFLECTION], b[o::REFLECTION + 1], b[o::REFLECTION + 2], b[o::REFLECTION + 3]])) } else { 0.0 },
+            reflection: if b.len() >= o::REFLECTION_END { read_f32(b, o::REFLECTION) } else { 0.0 },
             rs: (b.len() >= o::EXT_LEN && u32_le(b, o::RS_ID, "mt +168")? == 0 && u32_le(b, o::RS_SIZE, "mt +172")? == 0x18).then(|| {
-                std::array::from_fn(|k| i32::from_le_bytes([b[o::RS_DATA + 4 * k], b[o::RS_DATA + 1 + 4 * k], b[o::RS_DATA + 2 + 4 * k], b[o::RS_DATA + 3 + 4 * k]]))
+                std::array::from_fn(|k| read_i32(b, o::RS_DATA + 4 * k))
             }),
             blocks: Self::parse_blocks(b),
         })
@@ -908,7 +909,7 @@ impl Material {
     /// them (`(n + 2) << 4` past the texture entries, plus the record's offset). A record whose data
     /// lies outside the `mt` is skipped.
     fn parse_blocks(b: &[u8]) -> Vec<(u32, Vec<u8>)> {
-        let d = |o: usize| b.get(o..o + 4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+        let d = |o: usize| get_u32(b, o);
         let Some(counts) = d(8) else { return Vec::new() };
         let (textures, n) = ((counts & 0xFFFF) as usize, (counts >> 16) as usize);
         let table = 0x20 + 0x2C * textures;
@@ -1271,7 +1272,7 @@ mod render_method_tests {
         assert_eq!(m.passes[1], RenderPass { first: 3, count: 1, mask: 8 });
         assert_eq!(m.ops[1], RenderOp { key: 0x416D_0001, class: 0x8011, param: 1, mask: 0x10 });
         assert_eq!(m.block(0x416D_0001), Some(&[0xFF, 0xFF, 0xFF, 0xFF][..]));
-        let rs: Vec<i32> = m.block(0x5273_0003).unwrap().chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let rs: Vec<i32> = m.block(0x5273_0003).unwrap().chunks_exact(4).map(|c| read_i32(c, 0)).collect();
         assert_eq!(rs, [0, 2, -1, 1, 0, -1]);
         assert!(m.block(0x5273_0001).is_none());
     }

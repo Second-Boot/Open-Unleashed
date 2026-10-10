@@ -101,7 +101,7 @@ impl App {
         // the record's `+0xC98` ten zones, which 0x4EE12A…0x4EE14E sum for `+0xEC`
         let zones = self.result_damage().unwrap_or([0.0; 10]);
         if let Some(c) = self.career.as_mut() {
-            c.finish_mission(ms.index, pass, t, cones, &zones, text, &driver);
+            c.finish_mission(ms.index, career_ui::MissionOutcome { passed: pass, time_ticks: t, cones, zones: &zones }, text, &driver);
             tracing::info!(
                 mission = ms.mission.code,
                 pass,

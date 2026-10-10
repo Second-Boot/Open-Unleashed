@@ -21,6 +21,7 @@
 //! same stream, under its own extension (`.prpl`) and its own magic, so neither game can mistake
 //! one for the other.
 
+use nfs_formats::bytes::{self, Cursor};
 use nfs_physics::vehicle::Controls;
 
 /// `0x5ED848`, `u8[0x19000]`.
@@ -303,8 +304,7 @@ impl Replay {
     /// that stops recording. The guard does not look at the mode: **every** refused flush writes
     /// `[0x5E99F4] = 1` and `[0x606A80] = [0x606AC4]` (0x414076…0x414086), so while the stream is
     /// full the final tick keeps following the block flushes, and the save (0x413FD0, which only
-    /// takes the clock in mode 0) stores the tick of the last refused block. *(Until the audit of
-    /// 2026-09-26 the port froze it at the first refusal.)*
+    /// takes the clock in mode 0) stores the tick of the last refused block. (history: `game-history.md` §20.1)
     fn flush(&mut self, tick: u64) {
         if self.write + HEAD_ROOM >= STREAM_LEN {
             self.mode = Mode::Full;
@@ -423,7 +423,7 @@ pub fn apply_camera(id: u8, has_camera_nodes: bool) -> u8 {
 /// entry is **0x0B `SplineCam`** the name `TRACK_NAME [0x657444]` is compared with `"skidpad"`
 /// (`_stricmp` 0x5AE3C0 at 0x4149A3): **equal** steps the index once more (0x4149B3…0x4149C4),
 /// **different** keeps 0x0B (`jne 0x414AB7`). So 0x0B is skipped *on* skidpad and offered on every
-/// other track. *(Until the audit of 2026-09-26 this was the other way round, from `replay.md` §8.)*
+/// other track. (history: `game-history.md` §20.2)
 pub fn next_camera(index: usize, is_skidpad: bool) -> usize {
     let n = CAMERA_IDS.len();
     let mut i = (index + 1) % n;
@@ -436,8 +436,7 @@ pub fn next_camera(index: usize, is_skidpad: bool) -> usize {
 /// The end of a playback, 0x415CB3…0x415CE2 in `RaceFrame`: once the stream has run out
 /// (`[0x5E99F4] == 3`) the race is over as soon as `gGameTick [0x606AC4] > 0x40`
 /// (`cmp …, 0x40 ; jle` skips) — `[0x606A8C] = 1`, `REPLAY = 3`. The 64 is an absolute tick of the
-/// race, not a grace period after the stream ends. *(Until the audit of 2026-09-26 the port kept
-/// the race running for 64 ticks after the exhaustion, from `replay.md` §5.2's "one second after".)*
+/// race, not a grace period after the stream ends. (history: `game-history.md` §20.3)
 pub const END_MIN_TICK: u64 = 0x40;
 
 /// Whether a playback in `mode` at game tick `tick` is over (0x415CB3).
@@ -653,53 +652,49 @@ impl CarRecord {
         }
     }
 
-    fn parse(d: &[u8], p: &mut usize) -> Option<Self> {
-        let take = |p: &mut usize, n: usize| -> Option<&[u8]> {
-            let s = d.get(*p..*p + n)?;
-            *p += n;
-            Some(s)
-        };
-        let f32r = |p: &mut usize| -> Option<f32> { Some(f32::from_le_bytes(take(p, 4)?.try_into().ok()?)) };
-        let car_id = u16::from_le_bytes(take(p, 2)?.try_into().ok()?);
-        let paint = [take(p, 1)?[0], take(p, 1)?[0], take(p, 1)?[0]];
-        let n = u32::from_le_bytes(take(p, 4)?.try_into().ok()?) as usize;
-        let name = String::from_utf8_lossy(take(p, n)?).to_string();
-        let grid = if take(p, 1)?[0] != 0 { Some(u32::from_le_bytes(take(p, 4)?.try_into().ok()?)) } else { None };
-        let decal = i32::from_le_bytes(take(p, 4)?.try_into().ok()?);
-        let personality = i16::from_le_bytes(take(p, 2)?.try_into().ok()?);
-        let difficulty = f32r(p)?;
-        let skill = if take(p, 1)?[0] != 0 {
+    /// The inverse of [`CarRecord::write`]; `None` when the file ends inside the record.
+    fn parse(c: &mut Cursor) -> Option<Self> {
+        let flag = |c: &mut Cursor| -> Option<bool> { Some(c.u8().ok()? != 0) };
+        let car_id = c.u16().ok()?;
+        let paint = c.array::<3>().ok()?;
+        let n = c.u32().ok()? as usize;
+        let name = String::from_utf8_lossy(c.take(n).ok()?).to_string();
+        let grid = if flag(c)? { Some(c.u32().ok()?) } else { None };
+        let decal = c.i32().ok()?;
+        let personality = c.i16().ok()?;
+        let difficulty = c.f32().ok()?;
+        let skill = if flag(c)? {
             let mut s = [[0f32; 2]; 4];
             for pair in s.iter_mut() {
-                *pair = [f32r(p)?, f32r(p)?];
+                *pair = [c.f32().ok()?, c.f32().ok()?];
             }
             Some(s)
         } else {
             None
         };
-        let parts = if take(p, 1)?[0] != 0 {
-            let n = u32::from_le_bytes(take(p, 4)?.try_into().ok()?) as usize;
+        let parts = if flag(c)? {
+            let n = c.u32().ok()? as usize;
             let mut v = Vec::new();
             for _ in 0..n.min(64) {
-                v.push(i16::from_le_bytes(take(p, 2)?.try_into().ok()?));
+                v.push(c.i16().ok()?);
             }
             Some(v)
         } else {
             None
         };
-        let n = u32::from_le_bytes(take(p, 4)?.try_into().ok()?) as usize;
+        let n = c.u32().ok()? as usize;
         let mut part_damage = Vec::new();
         for _ in 0..n.min(64) {
-            part_damage.push(f32r(p)?);
+            part_damage.push(c.f32().ok()?);
         }
         let mut damage = [0f32; 10];
         for v in damage.iter_mut() {
-            *v = f32r(p)?;
+            *v = c.f32().ok()?;
         }
-        let setup = if take(p, 1)?[0] != 0 {
+        let setup = if flag(c)? {
             let mut s = [0f32; 17];
             for v in s.iter_mut() {
-                *v = f32r(p)?;
+                *v = c.f32().ok()?;
             }
             Some(s)
         } else {
@@ -813,89 +808,66 @@ impl NetSetup {
         }
     }
 
-    fn parse(d: &[u8], p: &mut usize) -> Option<Self> {
-        let u32r = |p: &mut usize| -> Option<u32> {
-            let v = u32::from_le_bytes(d.get(*p..*p + 4)?.try_into().ok()?);
-            *p += 4;
-            Some(v)
+    /// The inverse of [`NetSetup::write`]; `None` when the file ends inside it. `own_words` and `fe_txt` are
+    /// read only when bytes are left (a file from before them ends after `camera0`).
+    fn parse(c: &mut Cursor) -> Option<Self> {
+        let u32r = |c: &mut Cursor| c.u32().ok();
+        let opt = |c: &mut Cursor| -> Option<Option<u32>> { if c.u8().ok()? == 0 { Some(None) } else { Some(Some(c.u32().ok()?)) } };
+        let text = |c: &mut Cursor| -> Option<Vec<u8>> {
+            let n = c.u32().ok()? as usize;
+            Some(c.take(n).ok()?.to_vec())
         };
-        let opt = |p: &mut usize| -> Option<Option<u32>> {
-            let f = *d.get(*p)?;
-            *p += 1;
-            if f == 0 {
-                return Some(None);
-            }
-            let v = u32::from_le_bytes(d.get(*p..*p + 4)?.try_into().ok()?);
-            *p += 4;
-            Some(Some(v))
-        };
-        let text = |p: &mut usize| -> Option<Vec<u8>> {
-            let n = u32::from_le_bytes(d.get(*p..*p + 4)?.try_into().ok()?) as usize;
-            *p += 4;
-            let t = d.get(*p..*p + n)?.to_vec();
-            *p += n;
-            Some(t)
-        };
-        let local_index = u32r(p)?;
-        let grid = opt(p)?;
-        let n = u32r(p)? as usize;
-        let mut seats = Vec::new();
-        for _ in 0..n {
-            let race_index = u32r(p)?;
-            let name = String::from_utf8_lossy(&text(p)?).to_string();
-            let grid = opt(p)?;
-            let m = u32r(p)? as usize;
+        // `(option id, words)` records: a count, then per record its id, a word count and the words
+        let words = |c: &mut Cursor| -> Option<Vec<(u32, Vec<u32>)>> {
+            let m = u32r(c)? as usize;
             let mut words = Vec::new();
             for _ in 0..m {
-                let id = u32r(p)?;
-                let k = u32r(p)? as usize;
+                let id = u32r(c)?;
+                let k = u32r(c)? as usize;
                 let mut w = Vec::new();
                 for _ in 0..k {
-                    w.push(u32r(p)?);
+                    w.push(u32r(c)?);
                 }
                 words.push((id, w));
             }
+            Some(words)
+        };
+        let local_index = u32r(c)?;
+        let grid = opt(c)?;
+        let n = u32r(c)? as usize;
+        let mut seats = Vec::new();
+        for _ in 0..n {
+            let race_index = u32r(c)?;
+            let name = String::from_utf8_lossy(&text(c)?).to_string();
+            let grid = opt(c)?;
+            let words = words(c)?;
             seats.push(NetSeat { race_index, name, grid, words });
         }
-        let t = u32r(p)? as usize;
+        let t = u32r(c)? as usize;
         let mut traffic = Vec::new();
         for _ in 0..t {
-            let model = String::from_utf8_lossy(&text(p)?).to_string();
-            let name = text(p)?;
-            let colour = u32r(p)?;
+            let model = String::from_utf8_lossy(&text(c)?).to_string();
+            let name = text(c)?;
+            let colour = u32r(c)?;
             traffic.push(NetTraffic { model, name, colour });
         }
-        let camera0 = if *d.get(*p)? == 0 {
-            *p += 1;
+        let camera0 = if c.u8().ok()? == 0 {
             None
         } else {
-            *p += 1;
-            let n = u32r(p)? as usize;
-            let mut c = Vec::new();
+            let n = u32r(c)? as usize;
+            let mut v = Vec::new();
             for _ in 0..n {
-                c.push(u32r(p)?);
+                v.push(u32r(c)?);
             }
-            Some(c)
+            Some(v)
         };
-        let mut own_words = Vec::new();
-        if *p < d.len() {
-            let m = u32r(p)? as usize;
-            for _ in 0..m {
-                let id = u32r(p)?;
-                let k = u32r(p)? as usize;
-                let mut w = Vec::new();
-                for _ in 0..k {
-                    w.push(u32r(p)?);
-                }
-                own_words.push((id, w));
-            }
-        }
+        let own_words = if c.remaining() > 0 { words(c)? } else { Vec::new() };
         let mut fe_txt = Vec::new();
-        if *p < d.len() {
-            let m = u32r(p)? as usize;
+        if c.remaining() > 0 {
+            let m = u32r(c)? as usize;
             for _ in 0..m {
-                let k = String::from_utf8_lossy(&text(p)?).to_string();
-                fe_txt.push((k, u32r(p)?));
+                let k = String::from_utf8_lossy(&text(c)?).to_string();
+                fe_txt.push((k, u32r(c)?));
             }
         }
         Some(Self { local_index, grid, seats, traffic, camera0, own_words, fe_txt })
@@ -1010,106 +982,85 @@ impl ReplayFile {
         o
     }
 
+    /// The inverse of [`ReplayFile::write`]. `None` for a foreign file (magic / version) or one that ends
+    /// inside a required field; the two trailing sections are optional (a file from before them ends there) and
+    /// so are a few single bytes inside them (each reads as absent: the fallbacks are the caller's).
     pub fn parse(d: &[u8]) -> Option<Self> {
-        if d.len() < 16 || &d[..8] != FILE_MAGIC || u32::from_le_bytes(d[8..12].try_into().ok()?) != FILE_VERSION {
+        if d.len() < 16 || &d[..8] != FILE_MAGIC || bytes::read_u32(d, 8) != FILE_VERSION {
             return None;
         }
-        let mut p = 12usize;
-        let u32at = |p: &mut usize| -> Option<u32> {
-            let v = u32::from_le_bytes(d.get(*p..*p + 4)?.try_into().ok()?);
-            *p += 4;
-            Some(v)
+        let mut c = Cursor::at(d, 12, "replay");
+        let c = &mut c;
+        let text = |c: &mut Cursor| -> Option<String> {
+            let n = c.u32().ok()? as usize;
+            Some(String::from_utf8_lossy(c.take(n).ok()?).to_string())
         };
-        let text = |p: &mut usize| -> Option<String> {
-            let n = u32::from_le_bytes(d.get(*p..*p + 4)?.try_into().ok()?) as usize;
-            *p += 4;
-            let s = String::from_utf8_lossy(d.get(*p..*p + n)?).to_string();
-            *p += n;
-            Some(s)
-        };
-        let (track, car, sim, driver_name) = (text(&mut p)?, text(&mut p)?, text(&mut p)?, text(&mut p)?);
-        let paint = [*d.get(p)?, *d.get(p + 1)?, *d.get(p + 2)?];
-        let skill = *d.get(p + 3)?;
-        let car_id = u16::from_le_bytes(d.get(p + 4..p + 6)?.try_into().ok()?);
-        p += 6;
-        let laps = u32at(&mut p)?;
-        let opponents = u32at(&mut p)?;
-        let traffic = u32at(&mut p)?;
-        let (cops, backwards, mirror) = (*d.get(p)? != 0, *d.get(p + 1)? != 0, *d.get(p + 2)? != 0);
-        let damage = *d.get(p + 3)? == 0;
-        p += 4;
-        let seed = u32at(&mut p)?;
-        let final_tick = u64::from_le_bytes(d.get(p..p + 8)?.try_into().ok()?);
-        p += 8;
-        let len = u32at(&mut p)? as usize;
-        let stream = d.get(p..p + len)?.to_vec();
-        p += len;
-        let net = if *d.get(p)? == 0 {
-            p += 1;
-            None
-        } else {
-            p += 1;
-            Some(NetSetup::parse(d, &mut p)?)
-        };
-        // the launch block's trailing section; a file written before it ends here (the fallbacks are the caller's)
+        let flag = |c: &mut Cursor| -> Option<bool> { Some(c.u8().ok()? != 0) };
+        let (track, car, sim, driver_name) = (text(c)?, text(c)?, text(c)?, text(c)?);
+        let [r, g, b, skill] = c.array::<4>().ok()?;
+        let paint = [r, g, b];
+        let car_id = c.u16().ok()?;
+        let laps = c.u32().ok()?;
+        let opponents = c.u32().ok()?;
+        let traffic = c.u32().ok()?;
+        let [cops, backwards, mirror, no_damage] = c.array::<4>().ok()?;
+        let (cops, backwards, mirror, damage) = (cops != 0, backwards != 0, mirror != 0, no_damage == 0);
+        let seed = c.u32().ok()?;
+        let final_tick = u64::from_le_bytes(c.array::<8>().ok()?);
+        let len = c.u32().ok()? as usize;
+        let stream = c.take(len).ok()?.to_vec();
+        let net = if flag(c)? { Some(NetSetup::parse(c)?) } else { None };
+        // a missing optional byte leaves the cursor where it is, and every later byte is missing too
+        let some = |b: u8| (b != 0xFF).then_some(b);
+        let tri = |b: u8| (b != 0xFF).then_some(b != 0);
+        // the launch block's trailing section (tag 1); a file written before it ends here
         let (mut race_type, mut fegame_type, mut camera) = (None, None, None);
-        if d.get(p) == Some(&1) {
-            let some = |b: u8| (b != 0xFF).then_some(b);
-            race_type = d.get(p + 1).copied().and_then(some);
-            fegame_type = d.get(p + 2).copied().and_then(some);
-            let n = *d.get(p + 3)? as usize;
+        if bytes::get_u8(d, c.pos()) == Some(1) {
+            c.skip(1).ok()?;
+            race_type = c.u8().ok().and_then(some);
+            fegame_type = c.u8().ok().and_then(some);
+            // the camera list: its length + 1 (0 = none)
+            let n = c.u8().ok()? as usize;
             if n > 0 {
                 let mut list = Vec::new();
-                for k in 0..n - 1 {
-                    let at = p + 4 + k * 4;
-                    list.push(u32::from_le_bytes(d.get(at..at + 4)?.try_into().ok()?));
+                for _ in 0..n - 1 {
+                    list.push(c.u32().ok()?);
                 }
                 camera = Some(list);
             }
-            p += 4 + n.saturating_sub(1) * 4;
         }
+        // the car records' section (tag 2)
         let (mut player, mut opponent_cars, mut scene, mut derby, mut nocollision, mut transmission) = (None, None, None, None, None, None);
         let mut opponent_transmission = None;
         let mut mission = None;
-        if d.get(p) == Some(&2) {
-            p += 1;
-            if *d.get(p)? != 0 {
-                p += 1;
-                player = Some(CarRecord::parse(d, &mut p)?);
-            } else {
-                p += 1;
+        if bytes::get_u8(d, c.pos()) == Some(2) {
+            c.skip(1).ok()?;
+            if flag(c)? {
+                player = Some(CarRecord::parse(c)?);
             }
-            if *d.get(p)? != 0 {
-                let n = u32::from_le_bytes(d.get(p + 1..p + 5)?.try_into().ok()?) as usize;
-                p += 5;
+            if flag(c)? {
+                let n = c.u32().ok()? as usize;
                 let mut list = Vec::new();
                 for _ in 0..n.min(16) {
-                    list.push(CarRecord::parse(d, &mut p)?);
+                    list.push(CarRecord::parse(c)?);
                 }
                 opponent_cars = Some(list);
-            } else {
-                p += 1;
             }
-            if *d.get(p)? != 0 {
-                scene = Some(i16::from_le_bytes(d.get(p + 1..p + 3)?.try_into().ok()?));
-                p += 3;
-            } else {
-                p += 1;
+            if flag(c)? {
+                scene = Some(c.i16().ok()?);
             }
-            let tri = |b: u8| (b != 0xFF).then_some(b != 0);
-            derby = tri(*d.get(p)?);
-            nocollision = tri(*d.get(p + 1)?);
-            transmission = d.get(p + 2).and_then(|b| tri(*b));
-            if d.get(p + 3) == Some(&1) {
+            derby = tri(c.u8().ok()?);
+            nocollision = tri(c.u8().ok()?);
+            transmission = c.u8().ok().and_then(tri);
+            if c.u8().ok() == Some(1) {
                 let mut w = [0i32; 12];
-                for (k, v) in w.iter_mut().enumerate() {
-                    *v = i32::from_le_bytes(d.get(p + 4 + k * 4..p + 8 + k * 4)?.try_into().ok()?);
+                for v in w.iter_mut() {
+                    *v = c.i32().ok()?;
                 }
                 mission = Some(w);
             }
             // the byte after the mission's words (a file from before GB ends there: `None`)
-            let after = if d.get(p + 3) == Some(&1) { p + 52 } else { p + 4 };
-            opponent_transmission = d.get(after).and_then(|b| tri(*b));
+            opponent_transmission = c.u8().ok().and_then(tri);
         }
         Some(Self { setup: ReplaySetup { track, car, sim, car_id, paint, laps, opponents, traffic, cops, damage, backwards, mirror, seed, skill, driver_name, net, race_type, fegame_type, camera, player, opponent_cars, scene, derby, nocollision, transmission, opponent_transmission, mission }, final_tick, stream })
     }
@@ -1123,6 +1074,15 @@ impl ReplayFile {
 pub const SNAPSHOT_LEN: usize = 0x3E24;
 /// `0x3E24 + 4 + 0x19000` — every `.rpl` the original writes is exactly this long.
 pub const RPL_LEN: usize = SNAPSHOT_LEN + 4 + STREAM_LEN;
+
+// What lets [`parse_original_rpl`] index a file of `SNAPSHOT_LEN + 4` bytes unchecked: the nine car-info
+// records end at the snapshot's end, every car field lies inside a record, and so do the mission's words.
+const _: () = {
+    assert!(snapshot::CARS + 9 * snapshot::CAR_STRIDE == SNAPSHOT_LEN);
+    assert!(snapshot::CAR_FIELDS[snapshot::CAR_FIELDS.len() - 1].0 + 4 <= snapshot::CAR_STRIDE);
+    assert!(snapshot::CAR_DRIVERNAME + snapshot::CAR_DRIVERNAME_LEN <= snapshot::CAR_STRIDE);
+    assert!(MISSION_WORDS[MISSION_WORDS.len() - 1] + 4 <= snapshot::CARS);
+};
 /// Offsets of the snapshot fields the port can fill, from `replay.md` §16.1 (CONFIRMED).
 pub mod snapshot {
     pub const FEGAME_TYPE: usize = 0x0000;
@@ -1313,8 +1273,8 @@ fn put_car_record(out: &mut [u8], slot: usize, c: &CarRecord, n_cars: u32) {
 fn get_car_record(data: &[u8], slot: usize) -> Option<CarRecord> {
     use snapshot as f;
     let base = f::CARS + slot * f::CAR_STRIDE;
-    let u32at = |at: usize| u32::from_le_bytes(data[base + at..base + at + 4].try_into().unwrap());
-    let f32at = |at: usize| f32::from_bits(u32at(at));
+    let u32at = |at: usize| bytes::read_u32(data, base + at);
+    let f32at = |at: usize| bytes::read_f32(data, base + at);
     let car_id = u32at(f::CAR_TYPE) as u16;
     if car_id == 0 {
         return None;
@@ -1500,7 +1460,8 @@ pub fn parse_original_rpl(data: &[u8]) -> Option<(ReplaySetup, u64, Vec<u8>)> {
     if data.len() < SNAPSHOT_LEN + 4 {
         return None;
     }
-    let u32at = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+    // every read below lies inside the snapshot and the final tick after it (the asserts at `SNAPSHOT_LEN`)
+    let u32at = |at: usize| bytes::read_u32(data, at);
     let end = data[f::TRACK_NAME..f::FE_PLAYER_FILENAME].iter().position(|b| *b == 0).unwrap_or(0);
     let track: String = data[f::TRACK_NAME..f::TRACK_NAME + end].iter().map(|&b| b as char).collect();
     // `.DRIVERNAME` (+0x17C, §16.2), restored by `Replay_begin`'s bulk `memcpy` on playback —
@@ -1547,7 +1508,6 @@ pub fn parse_original_rpl(data: &[u8]) -> Option<(ReplaySetup, u64, Vec<u8>)> {
         transmission: get_car_record(data, 0).filter(|c| c.parts.is_some()).map(|_| u32at(f::CARS + f::CAR_TRANSMISSION) == 1),
         // slot 1's word, when the file has an opponent's record
         opponent_transmission: get_car_record(data, 1).filter(|c| c.parts.is_some()).map(|_| u32at(f::CARS + f::CAR_STRIDE + f::CAR_TRANSMISSION) == 1),
-        ..Default::default()
     };
     let final_tick = u32at(SNAPSHOT_LEN) as u64;
     let stream = data[SNAPSHOT_LEN + 4..].to_vec();
@@ -1712,9 +1672,7 @@ pub fn bar_cell_at(cells: &[(f32, f32); 7], x: i32, y: i32) -> Option<usize> {
 
 /// A press on `cell` (0x42D880 with event 2): the answer, given the bar's own state and `network`
 /// (`+0x198`). The `rest` cell puts the speed step `+0x174` back to 5 (0x42D984) and the speed
-/// cell steps it (0x42DBCF), both on the bar ([`BarState`]). See [`BarEvent`]. *(Until
-/// 2026-09-27 the speed cell stepped from the playback's speed `[0x606864]` — `Speed::next`,
-/// removed — which differs from `+0x174` after a playback start, 0x413ECF.)*
+/// cell steps it (0x42DBCF), both on the bar ([`BarState`]). See [`BarEvent`]. (history: `game-history.md` §20.4)
 pub fn bar_event(cell: usize, bar: &mut BarState, network: bool) -> Option<BarEvent> {
     match (cell, network) {
         (0, _) => Some(BarEvent::Camera),

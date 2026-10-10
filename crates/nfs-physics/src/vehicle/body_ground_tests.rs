@@ -103,7 +103,7 @@ fn derby_damage_is_one_and_a_half() {
 fn a_finished_car_takes_no_zone_damage() {
     let specs = tests::specs_993();
     let mut v = Vehicle::new(Vec3::ZERO, Mat3::IDENTITY, &specs, 0.8, 0.3);
-    v.race_state = 2;
+    v.race_state = RaceState::Finished;
     v.damage_by_normal(60.0, Vec3::new(0.0, 0.0, -1.0), 0, 1.0);
     assert_eq!(v.damage, [0.0; 10]);
 }
@@ -179,7 +179,7 @@ fn reset_request_gates_and_hold() {
         assert!(!v.reset_request(true, 0x400));
     }
     assert!(v.reset_request(true, 0x400), "the hold has run out");
-    v.race_state = 2;
+    v.race_state = RaceState::Finished;
     v.reset_hold = 0;
     assert!(!v.reset_request(true, 0x400), "finished");
 }

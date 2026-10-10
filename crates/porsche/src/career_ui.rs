@@ -98,6 +98,16 @@ impl MissionStart {
     }
 }
 
+/// How a mission run ended, for [`CareerUi::finish_mission`]: the verdict, the time in game ticks,
+/// the cones hit and the record's ten damage zones (`+0xC98`).
+#[derive(Debug, Clone, Copy)]
+pub struct MissionOutcome<'a> {
+    pub passed: bool,
+    pub time_ticks: u64,
+    pub cones: usize,
+    pub zones: &'a [f32; 10],
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingEvent {
     pub tournament: i16,
@@ -516,7 +526,8 @@ impl CareerUi {
     /// Mission over: `passed` from `SkillTest::evaluate` / the race position.
     /// `text` is the result line the race's `HMissionSummary` chose (0x4293F0), and `driver` the
     /// name its `%s` takes.
-    pub fn finish_mission(&mut self, idx: usize, passed: bool, time_ticks: u64, cones: usize, zones: &[f32; 10], text: Option<u32>, driver: &str) {
+    pub fn finish_mission(&mut self, idx: usize, outcome: MissionOutcome<'_>, text: Option<u32>, driver: &str) {
+        let MissionOutcome { passed, time_ticks, cones, zones } = outcome;
         self.pending = None;
         let m = self.tables.missions[idx].clone();
         let pick = text;

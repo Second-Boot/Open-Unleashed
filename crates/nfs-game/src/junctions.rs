@@ -15,6 +15,7 @@
 //! "section 0"; that is what gives every node a lap fraction and the track its lap length.
 
 use glam::Vec3;
+use nfs_formats::bytes;
 
 /// `[0x5B47B8]` — the squared radius, in metres², that both passes use.
 pub const JOIN_RADIUS_SQ: f32 = 256.0;
@@ -294,11 +295,11 @@ impl Junctions {
             return false;
         }
         for rec in data.chunks_exact(36) {
-            let idx = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as usize;
+            let idx = bytes::read_u32(rec, 0) as usize;
             let Some(node) = self.nodes.get(idx) else { continue };
             for (k, l) in node.links.iter().enumerate().take(MAX_LINKS) {
                 let o = 4 + k * 4;
-                let w = f32::from_le_bytes([rec[o], rec[o + 1], rec[o + 2], rec[o + 3]]);
+                let w = bytes::read_f32(rec, o);
                 self.segments[l.segment].weight[l.end] = w;
             }
         }

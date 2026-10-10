@@ -159,7 +159,7 @@ fn main() {
         let n_pts = line.points.len();
 
         for (item_idx, (centre, radius)) in items.iter().enumerate() {
-            let node_circles: Vec<((f32, f32), f32)> = registered[item_idx].iter().map(|&(_, cx, cz, r)| ((cx, cz), r)).collect();
+            let node_circles: Vec<((f32, f32), f32)> = registered[item_idx].iter().map(|n| ((n.cx, n.cz), n.r)).collect();
 
             // Sample eye positions along the real racing line (every 3rd point keeps this fast).
             for (pi, p) in line.points.iter().enumerate().step_by(3) {

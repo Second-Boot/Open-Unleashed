@@ -205,3 +205,142 @@ fn a_sliding_widget_travels_exactly_one_screen_and_fades_by_p_255_over_512() {
         assert_eq!(1.0 - fade(p) as f32 / 255.0, 1.0 - (p * 255 / TRANS_FULL) as f32 / 255.0);
     }
 }
+
+/// The draw dispatch of `sprites_reporting_bg` as it was when it matched `e.class` as a string:
+/// one label per arm, in the arm order. `WidgetClass` must reproduce it.
+fn old_draw_arm(class: &str) -> &'static str {
+    match class {
+        c if c.starts_with("REAL.BLACK") => "screen_fill",
+        "NFS5.GOURAUDBOX" => "gouraud_box",
+        "NFS5.GouraudIndicatorBar" => "gouraud_indicator_bar",
+        "NFS5.GlintyRectangle" => "glinty_rectangle",
+        "NFS5.PANEL" => "panel",
+        "NFS5.3DCAR" => "3d_car",
+        "NFS5.DEADZONE" => "deadzone",
+        "NFS5.INPUTBOX" | "NFS5.CHATINPUTBOX" | "NFS5.CHATDISPLAYBOX" | "NFS5.CHARVECTACCESSORINPUTBOX" | "NFS5.CONTROLLERSETUP" => "text_boxes",
+        "NFS5.ListBox" => "list_box",
+        "NFS5.RADIOGROUP" => "radio_group",
+        "NFS5.TrackSmall2dSpline" => "track_small_spline",
+        "NFS5.PRIZERACEMAP" | "NFS5.FACTORYMAP" => "race_or_factory_map",
+        "NFS5.PLAYERPICTURE" | "NFS5.MINIPLAYERPICTURE" | "NFS5.BADGE" | "NFS5.MINIBADGE" | "NFS5.FACTORYPIC" | "NFS5.HUD" => "pack_pictures",
+        "NFS5.MOVIEBOX" | "NFS5.MOVIECIRCLE" => "movie",
+        "NFS5.ACCOUNTTHING" => "account_thing",
+        "NFS5.ANIMSHOWCASEPICTURE" => "anim_showcase_picture",
+        "NFS5.ChroniclePictureIcon" | "NFS5.ShowcasePicture" | "NFS5.ChroniclePicture" => "chronicle_or_showcase_picture",
+        "NFS5.CarLogo" => "car_logo",
+        "NFS5.KNOCKOUTTRACKLIST" => "knockout_track_list",
+        "NFS5.ChronicleMainBoxControl" => "chronicle_main_box",
+        "NFS5.AnimatingPicture" => "animating_picture",
+        "NFS5.HEADER" | "NFS5.SUBHEADER" | "REAL.LABEL" | "NFS5.PICTURE" | "NFS5.NonLocalizedLabel" | "NFS5.ExtraCircle" | "NFS5.OutlineRectangle" | "NFS5.Rectangle" | "NFS5.BEVELEDOPTIONBOX" | "NFS5.GLINTYLINE" => "template_classes",
+        "NFS5.CheckBox" => "check_box",
+        "NFS5.CarSettingSlider" | "NFS5.CHRONICLESLIDER" => "car_setting_slider",
+        "NFS5.ComboBoxSlider" | "NFS5.ColorBox" => "combo",
+        "NFS5.GOTOBUTTON" => "goto_button",
+        "NFS5.BOTTOMBARBUTTON" | "NFS5.GRAPHICTABBUTTON" => "bar_or_graphic_tab",
+        "NFS5.TABBUTTON" | "NFS5.CAMERASELECT" | "NFS5.CAMERAPICTURE" => "tab_or_camera",
+        _ => "default",
+    }
+}
+
+/// The literals the dispatch names, and near misses (case, prefix).
+const DISPATCH_PROBES: &[&str] = &[
+    "REAL.BLACK_640x480", "REAL.BLACK", "REAL.BLACKX", "REAL.black_640x480", "REAL.LABEL", "REAL.label", "NFS5.GOURAUDBOX", "NFS5.GouraudBox",
+    "NFS5.GouraudIndicatorBar", "NFS5.GlintyRectangle", "NFS5.PANEL", "nfs5.panel", "NFS5.3DCAR", "NFS5.3dcar", "NFS5.DEADZONE", "NFS5.INPUTBOX",
+    "NFS5.CHATINPUTBOX", "NFS5.CHATDISPLAYBOX", "NFS5.CHARVECTACCESSORINPUTBOX", "NFS5.CONTROLLERSETUP", "NFS5.ListBox", "NFS5.LISTBOX",
+    "NFS5.RADIOGROUP", "NFS5.TrackSmall2dSpline", "NFS5.PRIZERACEMAP", "NFS5.FACTORYMAP", "NFS5.PLAYERPICTURE", "NFS5.MINIPLAYERPICTURE",
+    "NFS5.BADGE", "NFS5.MINIBADGE", "NFS5.FACTORYPIC", "NFS5.HUD", "NFS5.MOVIEBOX", "NFS5.MOVIECIRCLE", "NFS5.ACCOUNTTHING",
+    "NFS5.ANIMSHOWCASEPICTURE", "NFS5.ChroniclePictureIcon", "NFS5.ShowcasePicture", "NFS5.ChroniclePicture", "NFS5.CarLogo",
+    "NFS5.KNOCKOUTTRACKLIST", "NFS5.ChronicleMainBoxControl", "NFS5.AnimatingPicture", "NFS5.HEADER", "NFS5.SUBHEADER", "NFS5.PICTURE",
+    "NFS5.NonLocalizedLabel", "NFS5.ExtraCircle", "NFS5.OutlineRectangle", "NFS5.Rectangle", "NFS5.BEVELEDOPTIONBOX", "NFS5.GLINTYLINE",
+    "NFS5.CheckBox", "NFS5.CarSettingSlider", "NFS5.CHRONICLESLIDER", "NFS5.ComboBoxSlider", "NFS5.ColorBox", "NFS5.GOTOBUTTON",
+    "NFS5.BOTTOMBARBUTTON", "NFS5.GRAPHICTABBUTTON", "NFS5.TABBUTTON", "NFS5.CAMERASELECT", "NFS5.CAMERAPICTURE", "NFS5.CARSETTINGBUTTON",
+    "NFS5.VerticalSlider", "", "NFS5.", "something.else",
+];
+
+/// Every class of every shipped layout (empty when the game is not installed).
+fn shipped_classes() -> std::collections::BTreeSet<String> {
+    let mut set = std::collections::BTreeSet::new();
+    if let Ok(paths) = GamePaths::locate()
+        && let Ok(dir) = std::fs::read_dir(paths.fe_data().join("Layouts"))
+    {
+        for f in dir.flatten() {
+            if f.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("lay"))
+                && let Ok(bytes) = std::fs::read(f.path())
+            {
+                for e in Layout::parse(&String::from_utf8_lossy(&bytes)).elements {
+                    set.insert(e.class);
+                }
+            }
+        }
+    }
+    set
+}
+
+/// T1(d), the guard written before the refactor: the table class -> draw arm of the string
+/// `match`, hashed (FNV-1a 64) over the probe literals, and the shipped classes all land in an
+/// arm that exists.
+#[test]
+fn the_string_dispatch_table_is_pinned() {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for c in DISPATCH_PROBES {
+        for b in format!("{c}={}\n", old_draw_arm(c)).bytes() {
+            h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    assert_eq!(h, 14941361031669849365, "pinned hash of the old dispatch table");
+    for c in shipped_classes() {
+        assert!(!old_draw_arm(&c).is_empty());
+    }
+}
+
+/// The draw arm the new `sprites_reporting_bg` takes for a [`WidgetClass`] — its `match`, with
+/// the arm labels of `old_draw_arm`.
+fn new_draw_arm(c: WidgetClass) -> &'static str {
+    use WidgetClass::*;
+    match c {
+        ScreenFill => "screen_fill",
+        GouraudBox => "gouraud_box",
+        GouraudIndicatorBar => "gouraud_indicator_bar",
+        GlintyRectangle => "glinty_rectangle",
+        Panel => "panel",
+        Car3d => "3d_car",
+        DeadZone => "deadzone",
+        InputBox | ChatInputBox | ChatDisplayBox | CharVectAccessorInputBox | ControllerSetup => "text_boxes",
+        ListBox => "list_box",
+        RadioGroup => "radio_group",
+        TrackSmall2dSpline => "track_small_spline",
+        PrizeRaceMap | FactoryMap => "race_or_factory_map",
+        PlayerPicture | MiniPlayerPicture | Badge | MiniBadge | FactoryPic | Hud => "pack_pictures",
+        MovieBox | MovieCircle => "movie",
+        AccountThing => "account_thing",
+        AnimShowcasePicture => "anim_showcase_picture",
+        ChroniclePictureIcon | ShowcasePicture | ChroniclePicture => "chronicle_or_showcase_picture",
+        CarLogo => "car_logo",
+        KnockoutTrackList => "knockout_track_list",
+        ChronicleMainBoxControl => "chronicle_main_box",
+        AnimatingPicture => "animating_picture",
+        Header | SubHeader | RealLabel | Picture | NonLocalizedLabel | ExtraCircle | OutlineRectangle | Rectangle | BeveledOptionBox | GlintyLine => "template_classes",
+        CheckBox => "check_box",
+        CarSettingSlider | ChronicleSlider => "car_setting_slider",
+        ComboBoxSlider | ColorBox => "combo",
+        GotoButton => "goto_button",
+        BottomBarButton | GraphicTabButton => "bar_or_graphic_tab",
+        TabButton | CameraSelect | CameraPicture => "tab_or_camera",
+        CarSettingButton | Other => "default",
+    }
+}
+
+/// T1(d): for every probe literal and every class of the shipped layouts, the parsed enum lands
+/// in the arm the old string `match` took, and the click / press facts agree with the old lists.
+#[test]
+fn the_widget_class_enum_dispatches_like_the_string_match() {
+    let mut all: std::collections::BTreeSet<String> = DISPATCH_PROBES.iter().map(|s| s.to_string()).collect();
+    all.extend(shipped_classes());
+    for c in &all {
+        assert_eq!(new_draw_arm(WidgetClass::from_class(c)), old_draw_arm(c), "class {c:?}");
+        let old_click = matches!(c.as_str(), "NFS5.INPUTBOX" | "NFS5.CHATINPUTBOX" | "NFS5.CHARVECTACCESSORINPUTBOX");
+        assert_eq!(WidgetClass::from_class(c).takes_click(), old_click, "takes_click {c:?}");
+        let old_press = ["NFS5.CARSETTINGBUTTON", "NFS5.DEADZONE", "NFS5.GouraudIndicatorBar"].contains(&c.as_str());
+        assert_eq!(WidgetClass::from_class(c).takes_focus_on_press(), old_press, "press {c:?}");
+    }
+}

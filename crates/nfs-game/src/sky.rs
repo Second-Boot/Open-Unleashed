@@ -29,8 +29,7 @@
 //! The jitter draws from the front end's generator 0x538040 (`opponents::FeRng`, through 0x5561D0
 //! at 0x45EEA1 / 0x45F3D3) — the game's **one** state, which the caller hands in: the race's, seeded
 //! from `time(0)` by the HUD's init and shared with the weather and the announcer (`App::fe_rng` in
-//! `porsche`). *(Until 2026-09-26 it drew from an LCG of the port's own, then from a state of its
-//! own starting at the image's `.data` values.)* Not ported: `basic`'s `noise` alpha maps
+//! `porsche`). (history: `game-history.md` §11.1) Not ported: `basic`'s `noise` alpha maps
 //! (0x45E680, folded into the colours' alpha by 0x45E27D…; no shipped block names one).
 //!
 //! **Lightning** (2026-09-27, [`Lightning`], [`Flash`]): track B's field 6 strikes a cell of the
@@ -784,10 +783,7 @@ const RING_RADIUS: f32 = 400.0;
 /// **not rotated**. On the tracks whose `+0x08` is 5 (Canyon, Forest, Industrial, Monaco1…5,
 /// foothills) the draw's window reaches those quads whenever it wraps past segment 15 (the draw
 /// 0x45A1A0, [`ring_window`]), and their top-right corner takes the colour five places back.
-/// *(Until 2026-09-27 the port drew the sixteen once, with the first set; until 2026-09-26 it put
-/// point `k` at `(cos, sin)` of `k/16` without the start turn — the ring mirrored and turned — on a
-/// circle of the grid's side, 500…1500 m, rescaled with its heights: every ring sat 1.25…3.75 times
-/// flatter.)*
+/// (history: `game-history.md` §11.2)
 fn horizon_ring_quad(bin: &nfs_formats::sky::SkyBin, q: usize, y0: f32, y1: f32, colour: impl Fn(usize, usize) -> [f32; 4]) -> MeshData {
     let mut m = MeshData::default();
     let k = q % 16;
@@ -842,8 +838,7 @@ impl Sky {
             let region_b = &b.regions[1];
             // with no usable `.bin` no layer is drawn: the loader falls back to `default.bin`
             // (0x459680 / 0x4596A1, as `TrackAssets` does), so only a broken install gets here, and
-            // what the original then does was not read. *(Until 2026-09-25 the port drew an
-            // invented dome scrolled by an untraced wind rule.)*
+            // what the original then does was not read. (history: `game-history.md` §11.3)
             let bin = track.sky_bin.as_ref().filter(|b| b.rings[0].radius > 0.0);
             // A stage `k` draws the grid with **cloud `k` as its texture** and **sky map `k` as its
             // vertex colours** (MultiSky 0x45BB56…0x45BB82, BasicSky 0x45B20A…0x45B236 → 0x468630):
@@ -851,8 +846,7 @@ impl Sky {
             // `LayerColours` the 0x45DD90 object's `+0x14` over the region-A / region-B sky maps.
             // MultiSky has as many stages as its three cloud names have entries other than `none`
             // (`+0x80`, 0x45B97B / 0x45B9AD) and takes them in order from 0; BasicSky one, with region
-            // A's cloud only (0x45B1AB). *(Corrected 2026-09-25: the port drew the sky map as the
-            // texture and never read the clouds.)*
+            // A's cloud only (0x45B1AB). (history: `game-history.md` §11.4)
             let (clouds, pair): (Vec<Option<String>>, u8) = match b.kind {
                 // the factory's blend argument (0x45D997 / 0x45D9C7 / 0x45DA13 / 0x45DA6C: 0, 1, 2, 3)
                 // is the stage state block's `+8` (0x537A50 at 0x45B827), Thrash 0x38
@@ -900,8 +894,7 @@ impl Sky {
                 let scale = [layer.scale[0].max(0.01), layer.scale[1].max(0.01)];
                 let ring = &bin.rings[0];
                 // every stage shares the one grid (`[this+0x30]`, bound once per block at 0x45BED5),
-                // so no stage sits nearer than another. *(Until 2026-09-25 each higher layer was drawn
-                // 2 % closer, the port's own.)*
+                // so no stage sits nearer than another. (history: `game-history.md` §11.5)
                 let mesh = layer_grid(ring, bin.scalar_ce4, scale[0], scale[1], &colours.a);
                 // 0x45F1B0: both regions' numbers for this stage; the wind flag when either
                 // region's speed is over 0.25, the parallax when either move ratio is over 1
@@ -1068,8 +1061,7 @@ impl Sky {
     /// the view's planes to 0.15 / 700 (0x45D501…0x45D51D → 0x467120), so the grid and the ring are
     /// drawn unscaled around the eye and whatever lies beyond 700 m of view depth is clipped — the
     /// grid's far corners on `alps`, `Canyon`, `Castle`, `Farmland` and `foothills` (whose side ×
-    /// `+0xCE4` puts them past it). *(Until 2026-09-26 the port scaled the whole sky to 0.9 of the
-    /// draw distance, its own rule: the same picture, but nothing ever clipped.)* The port keeps the
+    /// `+0xCE4` puts them past it). (history: `game-history.md` §11.6) The port keeps the
     /// view's own near plane (0.5, the driver view's 0.15) — no sky point comes within 10 m.
     ///
     /// Unlit: the layers and the horizon ring are drawn through the primitive helper 0x468240 /

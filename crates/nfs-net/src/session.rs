@@ -588,155 +588,193 @@ impl Net {
         Some(i)
     }
 
+    /// One datagram, dispatched on its tag with the role guards (0x5891E2 drops anything else).
+    /// The arm order matters: the empty `tag::ALIVE` keep-alive is tested before the data frame.
     fn handle(&mut self, from: SocketAddr, t: u8, p: &[u8], out: &mut Vec<Event>) {
-        // every reply handler checks the request number first and drops the datagram when it does
-        // not match the one outstanding (0x588B7C, 0x588DAB, 0x588FD5)
-        let replies_to_us = |p: &[u8]| comm::read_be(p, 0, 4) == Some(self.pending);
         match t {
-            tag::W if self.role == Role::Host => {
-                if p.len() >= 32 && p[..32] == self.key[..] {
-                    tolerate(self.describe(from, 0), "describe", from);
-                }
-            }
-            tag::R if self.role == Role::Host => {
-                if let Some(id) = comm::read_be(p, 0, 4) {
-                    tolerate(self.describe(from, id), "describe", from);
-                }
-            }
-            tag::DESCRIBE => {
-                // a `'w'` carries no request, so its `'d'` echoes 0 (0x588AF0)
-                if (d_ok(p, self.pending)) && let Ok(d) = Describe::decode(p) {
-                    self.alive = comm::ALIVE_TICKS;
-                    out.push(Event::Found { from, describe: Box::new(d) });
-                }
-            }
-            tag::QUERY if self.role == Role::Host => {
-                if let Ok(head) = comm::Header::decode(p) {
-                    let rec = self.slot_record(head.index);
-
-                    let (t, body) = comm::answer_query(head, rec.as_ref());
-                    tolerate(self.sock.send_to(from, t, &body), "query answer", from);
-                }
-            }
-            tag::REPLY | tag::NO_SUCH => {
-                if replies_to_us(p) {
-                    self.alive = comm::ALIVE_TICKS;
-                    if t == tag::REPLY && p.len() >= comm::REPLY_SIZE {
-                        // the original hands payload+0x1C and index+1 to the connection's callback
-                        out.push(Event::Data {
-                            from,
-                            slot: comm::read_be(p, 0x18, 4).map(|i| i.wrapping_add(1)),
-                            bytes: p[comm::Header::SIZE..].to_vec(),
-                        });
-                    }
-                }
-            }
-            tag::JOIN if self.role == Role::Host => {
-                if let Ok(j) = Join::decode(p) {
-                    let reply = self.admit(&j, from);
-                    if let JoinStatus::Joined(slot) = reply.status {
-                        out.push(Event::PeerJoined { slot, from });
-                    }
-                    tolerate(self.sock.send_to(from, tag::A, &reply.encode()), "join reply", from);
-                }
-            }
-            tag::A if self.role == Role::Client => {
-                if let Ok(a) = JoinReply::decode(p)
-                    && a.request == self.pending
-                    {
-                        self.join_req = None;
-                        self.ping = comm::PING_TICKS;
-                        self.alive = comm::ALIVE_TICKS;
-                        match a.status {
-                            JoinStatus::Joined(slot) => {
-                                self.slot = Some(slot);
-                                self.host = Some(from);
-                                // the transport's "connected" event (4, 0x48FBB0) enables the queue's pump
-                                self.outbox.enable();
-                                out.push(Event::Joined { slot });
-                            }
-                            other => out.push(Event::Refused { status: other }),
-                        }
-                    }
-            }
+            tag::W if self.role == Role::Host => self.on_w(from, p),
+            tag::R if self.role == Role::Host => self.on_r(from, p),
+            tag::DESCRIBE => self.on_describe(from, p, out),
+            tag::QUERY if self.role == Role::Host => self.on_query(from, p),
+            tag::REPLY | tag::NO_SUCH => self.on_reply(from, t, p, out),
+            tag::JOIN if self.role == Role::Host => self.on_join(from, p, out),
+            tag::A if self.role == Role::Client => self.on_join_reply(from, p, out),
             // 0x5890ED's keep-alive carries nothing; 0x582700's data frame carries a frame.
-            tag::ALIVE if p.is_empty() => {
-                if self.role == Role::Host {
-                    self.refresh_advertised(from);
-                    self.refresh(from);
-                } else if self.host == Some(from) {
-                    self.alive = comm::ALIVE_TICKS;
-                }
-            }
-            tag::ALIVE => {
-                let slot = if self.role == Role::Host { self.refresh(from) } else { None };
-                // (live, the original hosting): the original host's `'*'` ping rounds stop ~3 s after admission (two originals' capture:
-                // `'*'` at 0.78 / 1.56 / 2.34 / 3.12 s and none after), what keeps the link alive afterwards is its data layer's frames.
-                // read the original's own test (network.md 7.21): **there is none** — `conn+0xAC` is decremented by 0x587D10 and read
-                // only by 0x588220 (the connect's "already connected" compare) and 0x58908A (the `'*'` rearm); events 9 / 10 of 0x48F0C4 come
-                // only from the CONMAN's command 7 (0x55CB75), which the two disconnect members (`[link+0x84]` = 0x55B480, `[conman+0x270]` =
-                // 0x55CDE0) queue, and nothing in the image calls either member. So the original never declares a silent host lost; this is a
-                // **PORT-ONLY GUARD** (PORT-DEVIATIONS.md), not an approximation of a test: any datagram from the host counts as life.
-                if self.role == Role::Client && self.host == Some(from) {
-                    self.ping = comm::PING_TICKS;
-                }
-                let now = self.ticks();
-                for body in self.conn(from, now).receive(p, now) {
-                    // the room's relay (0x48C0F0 / 0x48C170): what the host does not act on itself
-                    // goes on to the others, as a fresh frame on each link
-                    // (`0xBC` is the room's own relay with the lobby-group gate, 0x48C050: the caller's)
-                    if self.relay && !msg_for_the_host(&body) && body.first() != Some(&crate::msg::kind::OPTIONS) {
-                        let reliable = self.is_reliable(&body);
-                        // 0x48C0F0 skips the sender for `0xBF` … `0xC2` and **not for `0xBD`**: the barrier's bit comes back to the joiner that
-                        // sent it (captured, REFERENCE-2026-10-02-SRVX: the original host answers a joiner's `0xBD 1` with `0xBD 1`)
-                        let echo = body.first() == Some(&crate::msg::kind::BARRIER);
-                        let others: Vec<SocketAddr> = self.everyone().into_iter().filter(|&a| echo || a != from).collect();
-                        for to in others {
-                            tolerate(self.deliver(to, &body, reliable, now), "relay", to);
-                        }
-                    }
-                    out.push(Event::Data { from, slot, bytes: body });
-                }
-            }
-            tag::STAR => {
-                if self.role == Role::Host {
-                    self.refresh_advertised(from);
-                    self.refresh(from);
-                } else if self.host == Some(from) {
-                    // 0x5890C3: a client answers the ping with another '*' and rearms 0xAC
-                    self.ping = comm::PING_TICKS;
-                    tolerate(self.sock.send_to(from, tag::STAR, &[]), "ping answer", from);
-                }
-            }
-            tag::BYE_K | tag::BYE_B => {
-                if self.role == Role::Host {
-                    if let Some(i) = self.slot_of(from) {
-                        self.drop_slot(i, out);
-                    }
-                } else if self.host == Some(from) {
-                    self.host = None;
-                    self.slot = None;
-                    // the link is gone: the queue is freed with it (0x48AED0)
-                    self.outbox.clear();
-                }
-            }
+            tag::ALIVE if p.is_empty() => self.on_keep_alive(from),
+            tag::ALIVE => self.on_data_frame(from, p, out),
+            tag::STAR => self.on_star(from),
+            tag::BYE_K | tag::BYE_B => self.on_bye(from, out),
             // 0x589029: `if (conn+0x14 != NULL && conn+0x14(...) == 0) send '!'`. The game's session has no such
             // callback — captured: the host never answered the data layer's connect `'q'` (0x582711) with a
             // `'!'`, and a `'q'` takes nothing away (the room's players leave by `'K'`/`'b'` or the countdown)
             tag::Q => {}
-            tag::USER => {
-                let slot = if self.role == Role::Host { self.refresh(from) } else { None };
-                if self.relay {
-                    for to in self.everyone() {
-                        if to != from {
-                            tolerate(self.sock.send_to(to, tag::USER, p), "user relay", to);
-                        }
-                    }
-                }
-                out.push(Event::Data { from, slot, bytes: p.to_vec() });
-            }
+            tag::USER => self.on_user(from, p, out),
             _ => {} // 0x5891E2: anything else is dropped
         }
+    }
+
+    /// `'w'` to the host: a describe request carrying the session key.
+    fn on_w(&mut self, from: SocketAddr, p: &[u8]) {
+        if p.len() >= 32 && p[..32] == self.key[..] {
+            tolerate(self.describe(from, 0), "describe", from);
+        }
+    }
+
+    /// `'r'` to the host: a describe request carrying a request number.
+    fn on_r(&mut self, from: SocketAddr, p: &[u8]) {
+        if let Some(id) = comm::read_be(p, 0, 4) {
+            tolerate(self.describe(from, id), "describe", from);
+        }
+    }
+
+    /// `'d'`: a session's describe answer.
+    fn on_describe(&mut self, from: SocketAddr, p: &[u8], out: &mut Vec<Event>) {
+        // a `'w'` carries no request, so its `'d'` echoes 0 (0x588AF0)
+        if (d_ok(p, self.pending)) && let Ok(d) = Describe::decode(p) {
+            self.alive = comm::ALIVE_TICKS;
+            out.push(Event::Found { from, describe: Box::new(d) });
+        }
+    }
+
+    /// `'g'` to the host: answered with the slot's record (`'p'`) or `'?'`.
+    fn on_query(&mut self, from: SocketAddr, p: &[u8]) {
+        if let Ok(head) = comm::Header::decode(p) {
+            let rec = self.slot_record(head.index);
+            let (t, body) = comm::answer_query(head, rec.as_ref());
+            tolerate(self.sock.send_to(from, t, &body), "query answer", from);
+        }
+    }
+
+    /// `'p'` / `'?'`: a query's answer, the record or "no such".
+    fn on_reply(&mut self, from: SocketAddr, t: u8, p: &[u8], out: &mut Vec<Event>) {
+        // every reply handler checks the request number first and drops the datagram when it does
+        // not match the one outstanding (0x588B7C, 0x588DAB, 0x588FD5)
+        let replies_to_us = |p: &[u8]| comm::read_be(p, 0, 4) == Some(self.pending);
+        if replies_to_us(p) {
+            self.alive = comm::ALIVE_TICKS;
+            if t == tag::REPLY && p.len() >= comm::REPLY_SIZE {
+                // the original hands payload+0x1C and index+1 to the connection's callback
+                out.push(Event::Data {
+                    from,
+                    slot: comm::read_be(p, 0x18, 4).map(|i| i.wrapping_add(1)),
+                    bytes: p[comm::Header::SIZE..].to_vec(),
+                });
+            }
+        }
+    }
+
+    /// `'j'` to the host: admit the joiner and answer with `'a'`.
+    fn on_join(&mut self, from: SocketAddr, p: &[u8], out: &mut Vec<Event>) {
+        if let Ok(j) = Join::decode(p) {
+            let reply = self.admit(&j, from);
+            if let JoinStatus::Joined(slot) = reply.status {
+                out.push(Event::PeerJoined { slot, from });
+            }
+            tolerate(self.sock.send_to(from, tag::A, &reply.encode()), "join reply", from);
+        }
+    }
+
+    /// `'a'` to a client: the host's answer to our join.
+    fn on_join_reply(&mut self, from: SocketAddr, p: &[u8], out: &mut Vec<Event>) {
+        if let Ok(a) = JoinReply::decode(p)
+            && a.request == self.pending
+        {
+            self.join_req = None;
+            self.ping = comm::PING_TICKS;
+            self.alive = comm::ALIVE_TICKS;
+            match a.status {
+                JoinStatus::Joined(slot) => {
+                    self.slot = Some(slot);
+                    self.host = Some(from);
+                    // the transport's "connected" event (4, 0x48FBB0) enables the queue's pump
+                    self.outbox.enable();
+                    out.push(Event::Joined { slot });
+                }
+                other => out.push(Event::Refused { status: other }),
+            }
+        }
+    }
+
+    /// `'='` empty: 0x5890ED's keep-alive.
+    fn on_keep_alive(&mut self, from: SocketAddr) {
+        if self.role == Role::Host {
+            self.refresh_advertised(from);
+            self.refresh(from);
+        } else if self.host == Some(from) {
+            self.alive = comm::ALIVE_TICKS;
+        }
+    }
+
+    /// `'='` with a payload, 0x582700's data frame: the reliable layer's bodies, relayed by the host (0x48C0F0 /
+    /// 0x48C170) and handed up.
+    fn on_data_frame(&mut self, from: SocketAddr, p: &[u8], out: &mut Vec<Event>) {
+        let slot = if self.role == Role::Host { self.refresh(from) } else { None };
+        // (live, the original hosting; `RE/notes/network.md` §7.20): the original host's `'*'`
+        // ping rounds stop ~3 s after admission, what keeps the link alive afterwards is its data
+        // layer's frames. (§7.21 (c)): the original has no liveness test
+        // (`conn+0xAC` is decremented by 0x587D10 and read only by 0x588220 and 0x58908A; events
+        // 9 / 10 of 0x48F0C4 come only from the CONMAN's command 7, 0x55CB75, which nothing queues),
+        // so this rearm is a **PORT-ONLY GUARD** (PORT-DEVIATIONS.md), not an approximation of a
+        // test: any datagram from the host counts as life.
+        if self.role == Role::Client && self.host == Some(from) {
+            self.ping = comm::PING_TICKS;
+        }
+        let now = self.ticks();
+        for body in self.conn(from, now).receive(p, now) {
+            // the room's relay (0x48C0F0 / 0x48C170): what the host does not act on itself
+            // goes on to the others, as a fresh frame on each link
+            // (`0xBC` is the room's own relay with the lobby-group gate, 0x48C050: the caller's)
+            if self.relay && !msg_for_the_host(&body) && body.first() != Some(&crate::msg::kind::OPTIONS) {
+                let reliable = self.is_reliable(&body);
+                // 0x48C0F0 skips the sender for `0xBF` … `0xC2` and **not for `0xBD`**: the barrier's bit comes back to the joiner that
+                // sent it (captured, REFERENCE-2026-10-02-SRVX: the original host answers a joiner's `0xBD 1` with `0xBD 1`)
+                let echo = body.first() == Some(&crate::msg::kind::BARRIER);
+                let others: Vec<SocketAddr> = self.everyone().into_iter().filter(|&a| echo || a != from).collect();
+                for to in others {
+                    tolerate(self.deliver(to, &body, reliable, now), "relay", to);
+                }
+            }
+            out.push(Event::Data { from, slot, bytes: body });
+        }
+    }
+
+    /// `'*'`, the ping.
+    fn on_star(&mut self, from: SocketAddr) {
+        if self.role == Role::Host {
+            self.refresh_advertised(from);
+            self.refresh(from);
+        } else if self.host == Some(from) {
+            // 0x5890C3: a client answers the ping with another '*' and rearms 0xAC
+            self.ping = comm::PING_TICKS;
+            tolerate(self.sock.send_to(from, tag::STAR, &[]), "ping answer", from);
+        }
+    }
+
+    /// `'K'` / `'b'`: a peer leaves (host side) or the host goes (client side).
+    fn on_bye(&mut self, from: SocketAddr, out: &mut Vec<Event>) {
+        if self.role == Role::Host {
+            if let Some(i) = self.slot_of(from) {
+                self.drop_slot(i, out);
+            }
+        } else if self.host == Some(from) {
+            self.host = None;
+            self.slot = None;
+            // the link is gone: the queue is freed with it (0x48AED0)
+            self.outbox.clear();
+        }
+    }
+
+    /// `'<'`, the game's own datagram: relayed by the host to everyone else and handed up.
+    fn on_user(&mut self, from: SocketAddr, p: &[u8], out: &mut Vec<Event>) {
+        let slot = if self.role == Role::Host { self.refresh(from) } else { None };
+        if self.relay {
+            for to in self.everyone() {
+                if to != from {
+                    tolerate(self.sock.send_to(to, tag::USER, p), "user relay", to);
+                }
+            }
+        }
+        out.push(Event::Data { from, slot, bytes: p.to_vec() });
     }
 
     /// The 0x5C bytes a `'p'` carries: the session's own head for `-1`, else the player's record.

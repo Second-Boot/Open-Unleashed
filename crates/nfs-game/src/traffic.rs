@@ -60,11 +60,7 @@
 //! drive (0x4086E6) resets in place the same way, `0x40F540(car, 1, 0)` — the port used to send that
 //! car back to purgatory.
 //!
-//! *(Until 2026-09-26 the traffic was kinematic — never rolled, its up followed the ground normal,
-//! and a reset stood it on the slice plane for the next ground snap to seat. With
-//! [`TrafficSet::bodies`] the car-car impulse's spin, `Susp_update`'s pitch / roll and 0x49B090's
-//! placement — two `Susp_update`s with the `BodyHeight` drop between — are the body's own,
-//! `nfs_physics::vehicle::Vehicle::place_at_slice`.)*
+//! (history: `game-history.md` §2.1)
 
 use crate::aidrive::{self, AiCarState};
 use crate::scripts::{ScriptRunner, Trigger};
@@ -566,11 +562,8 @@ impl Default for TrafficPhysics {
 
 /// Where the body's origin sits above the surface under it while a traffic car rests on the
 /// ground: the model's lowest `BndP` points, at `y = −0.001` on every traffic and police model
-/// (−0.002 on `eas4`, `eas10`; `nfs-game/examples/bndp.rs`), laid on the plane. The port used 1 m,
-/// a leftover of the slice height, and every traffic and police car floated a metre up.
-/// *(Corrected 2026-09-25:)* this said a traffic car is `car+0x52C & 0x80` and so takes `Susp_AI`
-/// 0x4998C0, whose `BodyGroundCollide` 0x496610 is what lays those points on the plane. `0x80` is
-/// the smackables' flag; the traffic's is 0x10 (`ai.md` §6), so a traffic car goes through
+/// (−0.002 on `eas4`, `eas10`; `nfs-game/examples/bndp.rs`), laid on the plane (history:
+/// `game-history.md` §2.2). `0x80` is the smackables' flag; the traffic's is 0x10 (`ai.md` §6), so a traffic car goes through
 /// `Susp_update` 0x499A70 like any other (`suspension-collision.md` §4.2). That path rests the car
 /// at the same height: upright, `BodyHeight` 0x49A900 puts `+0x424` at `½(mean + min)` of the four
 /// lowest body points — the `BndP` wheel quad, sorted first by 0x49ABC0 (`car-model.md` §12) — and
@@ -698,9 +691,7 @@ impl TrafficSet {
     /// `models` = one entry per traffic car the race was set up with.
     pub fn new(models: &[TrafficSpec], table: &SliceTable, race_dir: f32, linear: bool, seed: u32) -> Self {
         // `[0x5E7544]` (0x40E670): the original's slice 1 lanesA, the same flag in either direction.
-        // *(Until 2026-09-25 this read `lanes_a` off the reversed table — the original's lanesB in a
-        // backwards race — the bug `police::one_way_road` fixed for the cops, bd6aa8d. No shipped
-        // track has `lanesA == 0` on slice 1, so nothing observable changes with that data.)*
+        // (history: `game-history.md` §2.3)
         let one_way = crate::police::one_way_road(table);
         let mut rng = Lcg::new(seed);
         let delay = RESPAWN_TABLE[models.len().min(RESPAWN_TABLE.len() - 1)];
@@ -740,7 +731,7 @@ impl TrafficSet {
                 v.body_lift = 0.0;
                 // `RigidBody_init` 0x49B510: `car+0x84 = 1.0`. Only the racers' `LoadTransfer`
                 // 0x4A1900 (inside `Car_simulate`, which a traffic car never runs — `traffic.md`
-                // §21.5) puts 1.16 there. *(Until 2026-09-26 the bodies kept `Vehicle::new`'s 1.16.)*
+                // §21.5) puts 1.16 there. (history: `game-history.md` §2.4)
                 v.gravity_scale = 1.0;
                 v.set_car_body(points.get(c.model).cloned().unwrap_or_default(), c.half_extents);
                 v.position = c.position;
@@ -866,45 +857,7 @@ impl TrafficSet {
     pub fn ai_on(&mut self, table: &SliceTable, tick: u64, reference: Reference, others: &[LaneCar], grid: Option<&nfs_physics::collision::TriangleGrid>) {
         for i in 0..self.cars.len() {
             let Some(ai_ticks) = ai_pass_due(self.cars[i].racer_distance, false, tick, self.slot_base + i) else { continue };
-            // `AIHigh_Traffic::update` 0x406020. Every arm ends in `0x40B4D0` on the state object
-            // the arm leaves in place, which steps the scripts (a car in the world only) and runs
-            // that state's update **in the same call** — so a new state runs at once.
-            if !self.cars[i].active {
-                // state 1 (0x40610E): the spawn gate `0x40E060` first — the delay `car+0xEE8` must
-                // have run out, and if five cars are already out it re-arms the delay to 1 and says
-                // no; on canyon / industrial it also says no, without re-arming, while the
-                // reference car — `car+0xED4`, which the purgatory ctor 0x40DE10 set to racer 0,
-                // the player — is in one of the track's windows — then, if it passes, a new
-                // `AIState_Normal`, `Traffic_spawn` 0x407820, and 0x40B4D0 runs the new state's
-                // update (0x406167…0x40616D) — the lane pass below. The arm also asks
-                // `AIHigh+0x1C == 0` (0x40611E, and 0x4061D0 / 0x4063F4 in state 2): always true —
-                // the only store to it is `AIHigh_Traffic`'s ctor's 0 (0x4064A8; every `[reg+0x1C]`
-                // store in 0x401000…0x420000 and every `0x5E6774` read was checked).
-                let mut spawned = false;
-                if self.cars[i].respawn_ticks <= 0 {
-                    if self.active_count() >= MAX_ACTIVE {
-                        self.cars[i].respawn_ticks = 1; // 0x40E135
-                    } else if self.no_spawn.iter().any(|&(a, b)| (a..=b).contains(&reference.slice)) {
-                        tracing::debug!(car = i, slice = reference.slice, "traffic spawn gate: tunnel window");
-                    } else {
-                        self.spawn(i, table, reference, grid);
-                        spawned = true;
-                    }
-                }
-                if !spawned {
-                    // 0x406460 → 0x40B4D0 → the purgatory update 0x40E140
-                    self.purgatory_countdown(i, tick, ai_ticks);
-                    continue;
-                }
-            } else if self.should_retire(i, table, reference) {
-                // state 2 (0x40617A): `0x407030` says retire → a new purgatory (0x40DE10, which
-                // arms the delay) and 0x40B4D0 runs its update at once (0x4061C3): the countdown
-                // takes its first step in the same call
-                self.retire(i);
-                self.purgatory_countdown(i, tick, ai_ticks);
-                continue;
-            } else if self.police_reaction(i, table, reference, ai_ticks) {
-                // states 2 / 3 with a cop near: `AIState_Idle`'s update ran instead of the lane pass
+            if !self.ai_state(i, table, tick, ai_ticks, reference, grid) {
                 continue;
             }
             // §14.4 longitudinal: step toward the target speed, never overshooting
@@ -937,95 +890,24 @@ impl TrafficSet {
                 // a traffic car the metres from the lap's start to its slice, not the distance it drove
                 travelled: metres(table, c.progress),
             };
-            let (my_scan, hit_tick) = (c.scan, c.hit_by_human_tick);
+            let my_scan = c.scan;
             // `0x40B4D0` (0x40B4D0…0x40B509): the script runner steps **first** — `0x40AB80(car+0xE3C,
             // [0x5E6654])` while `car+0x7F`, not a human, and `word car+0x41A == 0` (always: the only
             // store to it is `RigidBody_init`'s 0, 0x49B714) — and only then does it call the state's
             // update (`call [edx]`, 0x40B509), whose 0x401580 raises this call's requests. The port
             // stepped after the requests, starting a script one AI update early (audit 2026-09-26).
-            {
-                let scripts = std::mem::take(&mut self.scripts);
-                let before = self.cars[i].script.running();
-                self.cars[i].script.step(&scripts, ai_ticks);
-                if let Some(id) = self.cars[i].script.running()
-                    && before != Some(id)
-                {
-                    tracing::debug!(car = i, id, "traffic script starts");
-                }
-                self.scripts = scripts;
-            }
+            self.step_script(i, ai_ticks);
             // 0x401060's head (0x40106C…0x401116): `s = addSlices(car+8, 2·car+0x520, −1)`; a traffic
             // car (`52C & 0x10`) re-rolls only when `s` is even, with probability `(rand16 ·
             // pers[+0x1C]) >> 16 == 1`, and then draws `car+0xEC8 = pers[0xC + 4·(rand >> 8 & 3)]` —
             // all zero in row 0, but the draws are taken. `car+0x520` is the racer slot. (The port's
             // `add_slices` runs along the race route; ±2·slot slices keep the parity either way.)
-            {
-                let s = self.add_slices(table, self.cars[i].slice, 2 * (self.slot_base + i) as i32);
-                if s.is_multiple_of(2) && self.rng.below(PERSONALITIES[0].reroll) == 1 {
-                    let _offset = PERSONALITIES[0].lane_offsets[(self.rng.rand16() & 3) as usize];
-                }
-            }
+            self.personality_reroll(i, table);
             // §12.9: ask for a script when the human does something worth reacting to, then step the
             // runner. `0x401580` returns at once while `0x40E9E0(car) < 800` ([0x5B2414], 0x4015A8):
             // a traffic car on the first 800 m of the lap (its `+0xAF8` being the bare fraction), and
             // on the call that places it, whose `+0xAF8` is still the purgatory's 0.
-            {
-                let travelled = me.travelled;
-                // `0x40E9E0(human)`: the player's `+0xAF8` counts its laps
-                let (my_lane, my_dir, my_speed, my_slice) = (me.lane, me.dir, me.speed, me.slice);
-                let time_mode = self.time_mode;
-                let mut requests: Vec<(i32, Trigger)> = Vec::new();
-                if travelled >= 800.0 {
-                    if tick.saturating_sub(hit_tick) < 15 {
-                        requests.push((0, Trigger::Collision));
-                    }
-                    for (hi, h) in ctx.cars.iter().enumerate().filter(|(_, h)| h.is_human) {
-                        // `0x40E9E0(human)` and the horn of *this* human (the reference alone when the caller
-                        // gave no views: a single-player race has one human)
-                        let (h_laps, h_slice, h_honk) = match self.human_views.get(hi) {
-                            Some(v) => (v.laps, h.slice, v.honking),
-                            None => (reference.laps, reference.slice, reference.honking),
-                        };
-                        let human_m = metres(table, h_laps as f32 + table.frac(h_slice));
-                        let d = crate::lanes::gap_between(table, h.slice, my_slice).abs();
-                        // a much slower human close ahead
-                        if my_dir * h.speed + 40.0 < my_dir * my_speed && d < 12.0 {
-                            requests.push((hi as i32, Trigger::OpponentWhizzedBy));
-                        }
-                        // in the same lane and close: 2 when `0x40E9E0(car) < 0x40E9E0(human)`, else 3
-                        // (0x401676…0x40169F) — metres along the lap, not the gap along the road
-                        if d < 12.0 && h.lane == my_lane {
-                            requests.push((hi as i32, if travelled < human_m { Trigger::HumanBlocksOpponent } else { Trigger::OpponentBlocksHuman }));
-                        }
-                        // 4 / 5 (0x4016B7…0x40170B): `human+0x550 == car` and `gGameTick −
-                        // car+0x554 < 15` — **not** a collision: 0x417710's second sort (0x417783…
-                        // 0x4177F9) writes both fields on every swap, so this is "the human's last
-                        // swap in the `+0xAF8` order was with this car, and this car swapped within
-                        // 15 ticks" — an overtake ([`Self::overtakes`]). The port used the collision
-                        // tick until the audit of 2026-09-26. 4 when `0x40E9E0(human) <
-                        // 0x40E9E0(car)`, else 5 (0x4016D2…0x4016FB)
-                        let me_flat = self.overtake_base + i;
-                        let swapped = self.swap_partner.get(hi).copied().flatten() == Some(me_flat)
-                            && self.swap_tick.get(me_flat).copied().flatten().is_some_and(|t| tick.saturating_sub(t) < 15);
-                        if swapped {
-                            requests.push((hi as i32, if human_m < travelled { Trigger::OpponentPassesHuman } else { Trigger::HumanPassesOpponent }));
-                        }
-                        // trigger 6, `human honk` (0x401713…0x40174E): the slice distance under
-                        // 30 m (`[0x5B2408]`), the human's horn byte `human+0xD86` set, and the
-                        // `TIME` option `[0x657A30]` clear. The port has one human, the reference.
-                        if d < 30.0 && h_honk && !time_mode {
-                            requests.push((hi as i32, Trigger::HumanHonks));
-                        }
-                    }
-                }
-                // the requests go in after this call's step (above): a trigger raised now starts
-                // its script on the car's next AI update
-                let c = &mut self.cars[i];
-                for (target, trigger) in requests {
-                    tracing::debug!(car = i, target, ?trigger, "traffic script trigger");
-                    c.script.request(target, trigger, tick as i64);
-                }
-            }
+            self.script_requests(i, table, tick, reference, &me, &ctx);
 
             // 0x401171…0x40123C, after the triggers: a traffic car travelling against the race
             // (`car+0xEB0 != (REVERSE ? −1 : 1)`), with cars in the race, draws `(rand16·1000) >> 16`
@@ -1035,75 +917,219 @@ impl TrafficSet {
             // 0x401246), so it always passes; `[0x657404]` (split screen) is never 1 here. The call
             // finds the car's audio slot and programs its honk timer (0x4A6DE0) — here the tick is
             // recorded (`honk_tick`) and the odd tick's audio update programs the timer from it.
-            // *(Until 2026-09-26 the draw was only logged.)*
-            if self.cars[i].dir != 1.0 {
-                let r = self.rng.below(1000);
-                if r < 5 && self.cars[i].speed.abs() > 0.2 {
-                    tracing::debug!(car = i, "traffic honks: HonkPattern(car, 2, 0x20, 8)");
-                    self.cars[i].honk_tick = Some(tick);
-                }
-            }
-            let mut sc = LaneScratch::default();
-            let one_way = self.one_way;
-            let mut scan = my_scan;
-            ctx.find_blockers(&mut sc, table, &me, self.cars[i].position, self.cars[i].place);
-            sc.score_own_side(&me, one_way, true);
-            // §12.3's script reactions push the same lane scores the scorers do
-            {
-                let fine_ok = ctx.fine_ok();
-                let r = &self.cars[i].script;
-                // SWERVE (0x40146E…0x4014E7): the weave runs while the target is **more** than 12 m
-                // away — `fcomp [0x5B240C]; test ah, 0x41; jne skip` at 0x40149B…0x4014A6 skips
-                // `|d| <= 12` (the port had `< 12`, after the note). No shipped script uses SWERVE
-                // (`traffic.md` §30.x), so this is dead data either way.
-                if let Some(t) = r.query(nfs_formats::scripts::mask::SWERVE)
-                    && let Some(o) = ctx.cars.get(t.max(0) as usize)
-                    && crate::lanes::gap_between(table, o.slice, me.slice).abs() > 12.0
-                {
-                    // a deterministic 1 Hz weave off the script's own timer, not a random draw:
-                    // `0x40AC80(script)`, `cdq; and edx, 0x1F; add; sar 5` = the signed `/ 32`
-                    if (r.timer() / 32) & 1 == 1 {
-                        sc.score[0] += 30.0;
-                    } else {
-                        sc.score[2] += 30.0;
-                    }
-                }
-                if let Some(t) = r.query(nfs_formats::scripts::mask::SWIPE)
-                    && let Some(o) = ctx.cars.get(t.max(0) as usize)
-                    // `0x40E860(car, o)` (0x401503: `push edi` the target, `push esi` the car) is
-                    // positive when **this car** is ahead — `gap_fine(car, o)`, the slice gap and
-                    // inside ±12 m the offset on this car's slice forward; the port had the
-                    // arguments the other way round, i.e. the sign flipped. Then `· car+0xEB0 < 4`
-                    // (0x40150A…0x401522, `test ah, 1`). Dead data for traffic: row 0 has no SWIPE.
-                    && crate::lanes::gap_fine(table, me.slice, o.slice, fine_ok.then(|| ctx.positions.get(t.max(0) as usize).map(|p| (self.cars[i].position, *p))).flatten()) * me.dir < 4.0
-                {
-                    match o.lane.cmp(&me.lane) {
-                        std::cmp::Ordering::Greater => sc.score[2] += 5.0,
-                        std::cmp::Ordering::Less => sc.score[0] += 5.0,
-                        std::cmp::Ordering::Equal => {}
-                    }
-                }
-            }
-            sc.score_blockers(&me);
-            sc.score_abreast(table, &me, &ctx.cars);
-            sc.score_lane_exists(table, &me, &mut scan, ai_ticks);
-            sc.score_narrowing(table, &me);
-            sc.score_shoulders(table, &me, &ctx.cars);
-            let (slot, lane) = sc.pick(&me);
-            if lane != me.lane {
-                tracing::debug!(car = i, from = me.lane, to = lane, scores = ?sc.score, "traffic lane change");
-            }
-            let lateral_target = sc.lateral_target(table, &me, lane, slot, &ctx.cars);
-            if (lateral_target - sc.lane_centre(table, &me, lane)).abs() > 0.01 {
-                tracing::debug!(car = i, lane, lateral_target, centre = sc.lane_centre(table, &me, lane), "traffic squeezes past");
-            }
-            let capped = sc.capped_target(&me, lane, lateral_target, self.cars[i].lateral_rate, &ctx.cars);
-            let c = &mut self.cars[i];
-            c.scan = scan;
-            c.lateral_target = lateral_target;
-            c.target_speed = capped;
+            // (history: `game-history.md` §2.5)
+            self.wrong_way_honk(i, tick);
+            self.lane_pass(i, table, &me, &mut ctx, my_scan, ai_ticks);
             self.lane_ctx = ctx;
         }
+    }
+
+    /// `AIHigh_Traffic::update` 0x406020's state arms ahead of `AIState_Normal`'s update: the
+    /// purgatory and the spawn (state 1), the retire test (state 2) and the police reaction
+    /// (states 2 / 3). `true` when the car runs the Normal update — the lane pass — this call.
+    fn ai_state(&mut self, i: usize, table: &SliceTable, tick: u64, ai_ticks: i32, reference: Reference, grid: Option<&nfs_physics::collision::TriangleGrid>) -> bool {
+        // `AIHigh_Traffic::update` 0x406020. Every arm ends in `0x40B4D0` on the state object
+        // the arm leaves in place, which steps the scripts (a car in the world only) and runs
+        // that state's update **in the same call** — so a new state runs at once.
+        if !self.cars[i].active {
+            // state 1 (0x40610E): the spawn gate `0x40E060` first — the delay `car+0xEE8` must
+            // have run out, and if five cars are already out it re-arms the delay to 1 and says
+            // no; on canyon / industrial it also says no, without re-arming, while the
+            // reference car — `car+0xED4`, which the purgatory ctor 0x40DE10 set to racer 0,
+            // the player — is in one of the track's windows — then, if it passes, a new
+            // `AIState_Normal`, `Traffic_spawn` 0x407820, and 0x40B4D0 runs the new state's
+            // update (0x406167…0x40616D) — the lane pass below. The arm also asks
+            // `AIHigh+0x1C == 0` (0x40611E, and 0x4061D0 / 0x4063F4 in state 2): always true —
+            // the only store to it is `AIHigh_Traffic`'s ctor's 0 (0x4064A8; every `[reg+0x1C]`
+            // store in 0x401000…0x420000 and every `0x5E6774` read was checked).
+            let mut spawned = false;
+            if self.cars[i].respawn_ticks <= 0 {
+                if self.active_count() >= MAX_ACTIVE {
+                    self.cars[i].respawn_ticks = 1; // 0x40E135
+                } else if self.no_spawn.iter().any(|&(a, b)| (a..=b).contains(&reference.slice)) {
+                    tracing::debug!(car = i, slice = reference.slice, "traffic spawn gate: tunnel window");
+                } else {
+                    self.spawn(i, table, reference, grid);
+                    spawned = true;
+                }
+            }
+            if !spawned {
+                // 0x406460 → 0x40B4D0 → the purgatory update 0x40E140
+                self.purgatory_countdown(i, tick, ai_ticks);
+                return false;
+            }
+        } else if self.should_retire(i, table, reference) {
+            // state 2 (0x40617A): `0x407030` says retire → a new purgatory (0x40DE10, which
+            // arms the delay) and 0x40B4D0 runs its update at once (0x4061C3): the countdown
+            // takes its first step in the same call
+            self.retire(i);
+            self.purgatory_countdown(i, tick, ai_ticks);
+            return false;
+        } else if self.police_reaction(i, table, reference, ai_ticks) {
+            // states 2 / 3 with a cop near: `AIState_Idle`'s update ran instead of the lane pass
+            return false;
+        }
+        true
+    }
+
+    /// `0x40B4D0`'s script step for car `i` (see [`Self::ai_on`]).
+    fn step_script(&mut self, i: usize, ai_ticks: i32) {
+        let scripts = std::mem::take(&mut self.scripts);
+        let before = self.cars[i].script.running();
+        self.cars[i].script.step(&scripts, ai_ticks);
+        if let Some(id) = self.cars[i].script.running()
+            && before != Some(id)
+        {
+            tracing::debug!(car = i, id, "traffic script starts");
+        }
+        self.scripts = scripts;
+    }
+
+    /// 0x401060's personality re-roll for car `i` (see [`Self::ai_on`]): the draws are taken, the
+    /// offset (row 0) is zero.
+    fn personality_reroll(&mut self, i: usize, table: &SliceTable) {
+        let s = self.add_slices(table, self.cars[i].slice, 2 * (self.slot_base + i) as i32);
+        if s.is_multiple_of(2) && self.rng.below(PERSONALITIES[0].reroll) == 1 {
+            let _offset = PERSONALITIES[0].lane_offsets[(self.rng.rand16() & 3) as usize];
+        }
+    }
+
+    /// 0x401580's script requests for car `i` (§12.9, see [`Self::ai_on`]), raised after this
+    /// call's step.
+    fn script_requests(&mut self, i: usize, table: &SliceTable, tick: u64, reference: Reference, me: &LaneSelf, ctx: &LanePassCtx) {
+        // the human-hit tick as the caller left it (nothing in this pass writes it)
+        let hit_tick = self.cars[i].hit_by_human_tick;
+        let travelled = me.travelled;
+        // `0x40E9E0(human)`: the player's `+0xAF8` counts its laps
+        let (my_lane, my_dir, my_speed, my_slice) = (me.lane, me.dir, me.speed, me.slice);
+        let time_mode = self.time_mode;
+        let mut requests: Vec<(i32, Trigger)> = Vec::new();
+        if travelled >= 800.0 {
+            if tick.saturating_sub(hit_tick) < 15 {
+                requests.push((0, Trigger::Collision));
+            }
+            for (hi, h) in ctx.cars.iter().enumerate().filter(|(_, h)| h.is_human) {
+                // `0x40E9E0(human)` and the horn of *this* human (the reference alone when the caller
+                // gave no views: a single-player race has one human)
+                let (h_laps, h_slice, h_honk) = match self.human_views.get(hi) {
+                    Some(v) => (v.laps, h.slice, v.honking),
+                    None => (reference.laps, reference.slice, reference.honking),
+                };
+                let human_m = metres(table, h_laps as f32 + table.frac(h_slice));
+                let d = crate::lanes::gap_between(table, h.slice, my_slice).abs();
+                // a much slower human close ahead
+                if my_dir * h.speed + 40.0 < my_dir * my_speed && d < 12.0 {
+                    requests.push((hi as i32, Trigger::OpponentWhizzedBy));
+                }
+                // in the same lane and close: 2 when `0x40E9E0(car) < 0x40E9E0(human)`, else 3
+                // (0x401676…0x40169F) — metres along the lap, not the gap along the road
+                if d < 12.0 && h.lane == my_lane {
+                    requests.push((hi as i32, if travelled < human_m { Trigger::HumanBlocksOpponent } else { Trigger::OpponentBlocksHuman }));
+                }
+                // 4 / 5 (0x4016B7…0x40170B): `human+0x550 == car` and `gGameTick −
+                // car+0x554 < 15` — **not** a collision: 0x417710's second sort (0x417783…
+                // 0x4177F9) writes both fields on every swap, so this is "the human's last
+                // swap in the `+0xAF8` order was with this car, and this car swapped within
+                // 15 ticks" — an overtake ([`Self::overtakes`]). The port used the collision
+                // tick until the audit of 2026-09-26. 4 when `0x40E9E0(human) <
+                // 0x40E9E0(car)`, else 5 (0x4016D2…0x4016FB)
+                let me_flat = self.overtake_base + i;
+                let swapped = self.swap_partner.get(hi).copied().flatten() == Some(me_flat)
+                    && self.swap_tick.get(me_flat).copied().flatten().is_some_and(|t| tick.saturating_sub(t) < 15);
+                if swapped {
+                    requests.push((hi as i32, if human_m < travelled { Trigger::OpponentPassesHuman } else { Trigger::HumanPassesOpponent }));
+                }
+                // trigger 6, `human honk` (0x401713…0x40174E): the slice distance under
+                // 30 m (`[0x5B2408]`), the human's horn byte `human+0xD86` set, and the
+                // `TIME` option `[0x657A30]` clear. The port has one human, the reference.
+                if d < 30.0 && h_honk && !time_mode {
+                    requests.push((hi as i32, Trigger::HumanHonks));
+                }
+            }
+        }
+        // the requests go in after this call's step (above): a trigger raised now starts
+        // its script on the car's next AI update
+        let c = &mut self.cars[i];
+        for (target, trigger) in requests {
+            tracing::debug!(car = i, target, ?trigger, "traffic script trigger");
+            c.script.request(target, trigger, tick as i64);
+        }
+    }
+
+    /// 0x401171…0x40123C: a traffic car against the race direction draws its honk (see
+    /// [`Self::ai_on`]).
+    fn wrong_way_honk(&mut self, i: usize, tick: u64) {
+        if self.cars[i].dir != 1.0 {
+            let r = self.rng.below(1000);
+            if r < 5 && self.cars[i].speed.abs() > 0.2 {
+                tracing::debug!(car = i, "traffic honks: HonkPattern(car, 2, 0x20, 8)");
+                self.cars[i].honk_tick = Some(tick);
+            }
+        }
+    }
+
+    /// §12 / §23's lane pass for car `i`: the blockers, the scorers (with §12.3's script reactions),
+    /// the pick, the lateral target and the speed cap, written to the car.
+    fn lane_pass(&mut self, i: usize, table: &SliceTable, me: &LaneSelf, ctx: &mut LanePassCtx, my_scan: i32, ai_ticks: i32) {
+        let mut sc = LaneScratch::default();
+        let one_way = self.one_way;
+        let mut scan = my_scan;
+        ctx.find_blockers(&mut sc, table, me, self.cars[i].position, self.cars[i].place);
+        sc.score_own_side(me, one_way, true);
+        // §12.3's script reactions push the same lane scores the scorers do
+        {
+            let fine_ok = ctx.fine_ok();
+            let r = &self.cars[i].script;
+            // SWERVE (0x40146E…0x4014E7): the weave runs while the target is **more** than 12 m
+            // away — `fcomp [0x5B240C]; test ah, 0x41; jne skip` at 0x40149B…0x4014A6 skips
+            // `|d| <= 12` (the port had `< 12`, after the note). No shipped script uses SWERVE
+            // (`traffic.md` §30.x), so this is dead data either way.
+            if let Some(t) = r.query(nfs_formats::scripts::mask::SWERVE)
+                && let Some(o) = ctx.cars.get(t.max(0) as usize)
+                && crate::lanes::gap_between(table, o.slice, me.slice).abs() > 12.0
+            {
+                // a deterministic 1 Hz weave off the script's own timer, not a random draw:
+                // `0x40AC80(script)`, `cdq; and edx, 0x1F; add; sar 5` = the signed `/ 32`
+                if (r.timer() / 32) & 1 == 1 {
+                    sc.score[0] += 30.0;
+                } else {
+                    sc.score[2] += 30.0;
+                }
+            }
+            if let Some(t) = r.query(nfs_formats::scripts::mask::SWIPE)
+                && let Some(o) = ctx.cars.get(t.max(0) as usize)
+                // `0x40E860(car, o)` (0x401503: `push edi` the target, `push esi` the car) is
+                // positive when **this car** is ahead — `gap_fine(car, o)`, the slice gap and
+                // inside ±12 m the offset on this car's slice forward; the port had the
+                // arguments the other way round, i.e. the sign flipped. Then `· car+0xEB0 < 4`
+                // (0x40150A…0x401522, `test ah, 1`). Dead data for traffic: row 0 has no SWIPE.
+                && crate::lanes::gap_fine(table, me.slice, o.slice, fine_ok.then(|| ctx.positions.get(t.max(0) as usize).map(|p| (self.cars[i].position, *p))).flatten()) * me.dir < 4.0
+            {
+                match o.lane.cmp(&me.lane) {
+                    std::cmp::Ordering::Greater => sc.score[2] += 5.0,
+                    std::cmp::Ordering::Less => sc.score[0] += 5.0,
+                    std::cmp::Ordering::Equal => {}
+                }
+            }
+        }
+        sc.score_blockers(me);
+        sc.score_abreast(table, me, &ctx.cars);
+        sc.score_lane_exists(table, me, &mut scan, ai_ticks);
+        sc.score_narrowing(table, me);
+        sc.score_shoulders(table, me, &ctx.cars);
+        let (slot, lane) = sc.pick(me);
+        if lane != me.lane {
+            tracing::debug!(car = i, from = me.lane, to = lane, scores = ?sc.score, "traffic lane change");
+        }
+        let lateral_target = sc.lateral_target(table, me, lane, slot, &ctx.cars);
+        if (lateral_target - sc.lane_centre(table, me, lane)).abs() > 0.01 {
+            tracing::debug!(car = i, lane, lateral_target, centre = sc.lane_centre(table, me, lane), "traffic squeezes past");
+        }
+        let capped = sc.capped_target(me, lane, lateral_target, self.cars[i].lateral_rate, &ctx.cars);
+        let c = &mut self.cars[i];
+        c.scan = scan;
+        c.lateral_target = lateral_target;
+        c.target_speed = capped;
     }
 
     /// `0x417710`'s second sort (0x417783…0x4177F9), at the end of `0x417800` on an even tick — after

@@ -8,7 +8,7 @@
 //! which makes the jingles noticeably louder (0x4ADBF9).
 
 use crate::mixer::{AudioOutput, StreamSource, VoiceId};
-use nfs_formats::{bigf::BigfEntry, schl::SchlStream};
+use nfs_formats::{bigf::BigfEntry, bytes::read_u32_be, schl::SchlStream};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -44,8 +44,7 @@ fn viv_directory(file: &mut std::fs::File) -> anyhow::Result<Vec<BigfEntry>> {
     let mut head = [0u8; 16];
     file.read_exact(&mut head)?;
     anyhow::ensure!(&head[0..4] == b"BIGF", "not a BIGF archive");
-    let be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-    let (count, header_size) = (be(&head[8..12]) as usize, be(&head[12..16]) as u64);
+    let (count, header_size) = (read_u32_be(&head, 8) as usize, read_u32_be(&head, 12) as u64);
     // the table ends where the first file's data begins (`header_size`); never read past the file
     let mut table = vec![0u8; header_size.saturating_sub(16).min(len.saturating_sub(16)) as usize];
     file.read_exact(&mut table)?;
@@ -53,7 +52,7 @@ fn viv_directory(file: &mut std::fs::File) -> anyhow::Result<Vec<BigfEntry>> {
     let mut pos = 0usize;
     for _ in 0..count {
         let fields = table.get(pos..pos + 8).ok_or_else(|| anyhow::anyhow!("BIGF entry truncated"))?;
-        let (offset, size) = (be(&fields[0..4]), be(&fields[4..8]));
+        let (offset, size) = (read_u32_be(fields, 0), read_u32_be(fields, 4));
         pos += 8;
         let start = pos;
         while *table.get(pos).ok_or_else(|| anyhow::anyhow!("BIGF entry name truncated"))? != 0 {

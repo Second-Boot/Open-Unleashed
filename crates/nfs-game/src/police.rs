@@ -24,8 +24,7 @@ pub const SPAWN_LEAD_SLICES: i32 = 31;
 /// **signed** `cmp …, 0xA00 ; jle`), so a record handed out at tick `t` is free again from `t + 2561`.
 /// `CopManager::load` 0x40E3B0 fills `lastUse[]` with `0xFFFFF600` = −2560 (0x40E3C7 / 0x40E3D1), so
 /// at the start of a race the test is `gGameTick + 2560 <= 2560`, which holds **only at tick 0**:
-/// every spawn point is usable from the first tick after it. *(Until 2026-09-25 this said the points
-/// were blocked for the first 40 s; the port also tested `< 2560`, one tick short of the original.)*
+/// every spawn point is usable from the first tick after it. (history: `game-history.md` §1.1)
 pub const SPAWN_COOLDOWN: i64 = 0xA00;
 /// A spawn point is vetoed when a human is within this track distance of it (`0x407CC0`).
 pub const HUMAN_VETO: f32 = 172.0;
@@ -65,9 +64,7 @@ impl Violation {
 /// reorders or mirrors its slice table for a backwards race (`REVERSE [0x657430]` is a sign the
 /// readers apply), so it is the same flag either way; the port's backwards table
 /// (`SliceTable::reversed`) swaps each slice's A / B lane counts in place, so there the original's
-/// lanesA is `lanes_b` — as `race::grid_slot` already reads it. *(Until 2026-09-25 `main.rs` read
-/// `lanes_a` off the reversed table for the police, i.e. the original's lanesB in a backwards race.
-/// No shipped track has `lanesA == 0` on slice 1, so nothing observable changes with that data.)*
+/// lanesA is `lanes_b` — as `race::grid_slot` already reads it. (history: `game-history.md` §1.2)
 pub fn one_way_road(table: &SliceTable) -> bool {
     table.slices.get(1).map(|s| if table.backwards { s.lanes_b } else { s.lanes_a } == 0).unwrap_or(false)
 }
@@ -416,8 +413,7 @@ pub const BOOST_SUPPRESS_BEHIND: f32 = 20.0;
 /// `chase+0x8C` — a blackout lasts 15 s.
 pub const BLACKOUT_TICKS: u64 = 0x3C0;
 /// `chase+0x90 > 160` — five seconds unable to reach the target's lane: `0x40DA00` adds
-/// `[0x5E6654]`, the 32 Hz ticks each (8 Hz) update covers. *(Until 2026-09-25 this said two and
-/// a half, the port counting 2 on every 32 Hz tick.)*
+/// `[0x5E6654]`, the 32 Hz ticks each (8 Hz) update covers. (history: `game-history.md` §1.3)
 pub const STUCK_LIMIT: i32 = 160;
 /// `0x40E330(state, 10.0)` (0x405048 pushes `0x41200000`) — state 9 has arrived inside 10 m.
 pub const GOTO_SLICE_ARRIVED: f32 = 10.0;
@@ -499,8 +495,7 @@ pub const COP_LEVEL: [usize; 2] = [2, 0];
 /// on `|[car+0xED4]+0xEC0|` (the 22.22 store at 0x40B04A is overwritten, as in traffic's copy); then —
 /// the `flags & 0x10` block being traffic's only — straight to the floor `max(v, 8.8889)`
 /// (`[0x5B2430]`, 0x40B157…0x40B178) and `× (int)car+0xEB0`. No `car+0xEEC` / `− 13.4` / 8.9 terms,
-/// which `traffic::target_speed` has. *(Until 2026-09-26 the port used the traffic function, whose
-/// 8.9 floor lifted the 8.8889 rung.)*
+/// which `traffic::target_speed` has. (history: `game-history.md` §1.4)
 pub fn unlit_target_speed(dir: f32, race_dir: f32, reference_speed: f32) -> f32 {
     let mut v: f32 = 16.5;
     if dir != race_dir {
@@ -578,11 +573,10 @@ pub fn nudge_roll(ai_ticks: i32, r16: u32) -> bool {
 /// `0x40CD50(chase, 1, ticks)`.
 pub const CLOSE_IN_TICKS: [u64; 3] = [0x200, 0x300, 0x480];
 /// `0x5CBEA0[level]+0x10` — the boost budget `chase+0x7C`, in 32 Hz ticks of boost (`0x40CD70`
-/// charges `[0x5E6654]` per update that had it on): 16 / 16 / 32 s. *(Until 2026-09-25 this said
-/// 8 / 8 / 16 s, counting 64 Hz ticks.)* State 2 loads it
+/// charges `[0x5E6654]` per update that had it on): 16 / 16 / 32 s. (history: `game-history.md` §1.5)
+/// State 2 loads it
 /// at 0x404392 (`[edx*4 + 0x5CBEB0]`, `edx = 5·level`) and passes it as the Chase ctor's fourth
-/// argument, which 0x40CB96 stores at `+0x7C`. *(Corrected 2026-09-25: the port used the `+0x0C`
-/// column, the ram duration, 0x480 against 0x400.)*
+/// argument, which 0x40CB96 stores at `+0x7C`. (history: `game-history.md` §1.6)
 pub const BOOST_BUDGET: [i32; 3] = [0x200, 0x200, 0x400];
 
 /// `0x40D150`'s speed factor by |gap| (§27.8): the cop eases off as it closes.
@@ -1296,12 +1290,10 @@ impl Police {
     /// is stored as **`car+0x108C`** — the multiplier both drive controllers put on the brake force
     /// and the in-control one on its lateral gains when it exceeds 1 (0x409B46, 0x409E95, 0x40A105)
     /// — and `car+0x84`, the body's **gravity scale** `Car_ground` reads, becomes `m > 1 ? m : 1.0`
-    /// (0x40AFBF / 0x40AFC9). Both keep their value while the lights are off. *(Until 2026-09-26 the
-    /// port drove the controllers on `car+0x1098` and kept the racers' 1.16 gravity scale on a cop.)*
+    /// (0x40AFBF / 0x40AFC9). Both keep their value while the lights are off. (history: `game-history.md` §1.7)
     ///
     /// The unlit arm is §17.6's ladder, whose oncoming branch reads `|[car+0xED4]+0xEC0|` (0x40B01A)
-    /// — the **reference car's** speed, not the target's. *(Until 2026-09-26 the port passed the
-    /// chase target's.)*
+    /// — the **reference car's** speed, not the target's. (history: `game-history.md` §1.8)
     fn base_target_speed(&mut self, i: usize, target: &ChaseTarget) -> f32 {
         let reference_speed = self.cars[i].reference.and_then(|r| self.racers.get(r)).map(|r| r.speed).unwrap_or(target.speed);
         let route_dir = self.route_dir;
@@ -1340,8 +1332,7 @@ impl Police {
 
     /// `0x40CD70`'s tail (0x40CE36…0x40CE72): if the last update left the boost on (`car+0x1098 !=
     /// 1.0`) the budget `chase+0x7C` is charged `[0x5E6654]` — the 32 Hz ticks this update covers —
-    /// and `car+0x1098` / `+0x109C` go back to 1.0 before `0x40CE80` decides again. *(Until
-    /// 2026-09-25 the port charged 2 on the tick it lit the boost, every 32 Hz tick.)*
+    /// and `car+0x1098` / `+0x109C` go back to 1.0 before `0x40CE80` decides again. (history: `game-history.md` §1.9)
     fn spend_boost(&mut self, i: usize, ai_ticks: i32) {
         let c = &mut self.cars[i];
         if c.boost_engine != 1.0 {
@@ -1369,15 +1360,12 @@ impl Police {
     /// the next one's `0x403120`. Each idle cop asks on its own; a query that moves a cursor and
     /// finds nothing leaves the next one nothing to sweep unless something changed in between.
     /// `humans` are the humans' slices (the 172 m veto), `rand16` the shared LCG.
-    /// *(Until 2026-09-25 the port ran every idle cop's search before any cop's update and stopped
-    /// at the first empty query.)*
+    /// (history: `game-history.md` §1.10)
     ///
     /// This is the AI half only — `AIHigh_Cop::update` 0x403E40 and the `AIState` it runs write the
     /// targets `car+0xEAC` / `car+0xEB4` / `car+0xEB8` and nothing that moves the car. The drive
     /// 0x408360 is each cop's `car+0xE1C` on the Sc32 list at priority 0x1E (`traffic.md` §17.5e),
-    /// which runs after the whole AI pass: [`Police::drive`]. *(Until 2026-09-25 (later) the port
-    /// drove each cop right after its decision, so a later cop's lane pass saw an earlier cop's new
-    /// velocity.)*
+    /// which runs after the whole AI pass: [`Police::drive`]. (history: `game-history.md` §1.11)
     ///
     /// **The gate.** `AIHigh_Cop` keeps the base ctor's `+0x10 = 0` (0x406790; only
     /// `AIHigh_Opponent`'s ctor sets it, 0x40593D), so 0x406720 runs a cop's update only when
@@ -1388,9 +1376,7 @@ impl Police {
     /// update steps moves by the `[0x5E6654]` it returns — 4 or 8 32 Hz ticks, 1 in the first 15
     /// game ticks: the boost budget `chase+0x7C` (0x40CE46), the formation timer `chase+0x78`
     /// (0x40D2A3), the stuck timer `chase+0x90` (0x40DAED) and the lane-existence scan
-    /// `car+0x101C` (§23.4). *(Until 2026-09-25 every cop updated on every 32 Hz tick and each of
-    /// these stepped by 2, so the stuck limit of 160 — 5 s — was reached in 2.5 s and the 16 s /
-    /// 32 s boost budgets lasted 8 s / 16 s.)*
+    /// `car+0x101C` (§23.4). (history: `game-history.md` §1.12)
     ///
     /// `grid` is the track's collision grid, for state 1's placement (`Car_placeAtSlice` 0x49B090).
     pub fn ai(&mut self, table: &SliceTable, tick: u64, target: &ChaseTarget, others: &[LaneCar], humans: &[usize], rand16: &mut dyn FnMut() -> u32, grid: Option<&TriangleGrid>) {
@@ -1430,8 +1416,7 @@ impl Police {
     /// (`[0x5E6D78]` = 2, `dt` = 1/16, mask 1) beyond, phased by the slot `slot_base + i`
     /// ([`crate::traffic::drive_due`]). In between the cop keeps the velocity it has. `[0x5E6D78]`
     /// is what `car+0x1080` (0x40A5E7) and the brake light (0x409AC8 / 0x409B65, 0x40A0BC /
-    /// 0x40A124) step by. *(Until 2026-09-25 every cop drove on every 32 Hz tick with `dt` 1/32 and
-    /// both counters stepping by 2 — twice the original's rate near a racer.)*
+    /// 0x40A124) step by. (history: `game-history.md` §1.13)
     ///
     /// `world` is what 0x408750's net at the end of the tick needs to re-place the car
     /// ([`CopWorld`]); without it (the unit tests' entries) the net is not run.
@@ -1458,8 +1443,7 @@ impl Police {
     /// on their wheel trackers, the compression, the roughness, the pitch / roll rates into
     /// `car+0x388` (which the 64 Hz step [`Police::integrate`] then turns the body by), `car+0x418`,
     /// `BodyHeight`, the gravity while `car+0x428 > 0.005`, the tilted arm's `BodyGroundCollide`,
-    /// the hard landing and the resting drop. *(Until 2026-09-26 the port stood the cop on the
-    /// contact plane at every 64 Hz step with no pitch / roll rates, no roughness and no landing.)*
+    /// the hard landing and the resting drop. (history: `game-history.md` §1.14)
     ///
     /// MEDIUM: `car+0xD7F` (the throttle `Susp_update`'s roll term reads, 0x49A673) has no writer
     /// in the cop's drive chain (0x408000…0x40B000 store it nowhere; 0x49E220 zeroes it), so it is
@@ -1570,8 +1554,7 @@ impl Police {
     fn run(&mut self, table: &SliceTable, tick: u64, target: &ChaseTarget, others: &[LaneCar], mut spawn: Option<(&[usize], &mut dyn FnMut() -> u32)>, due: &dyn Fn(usize) -> Option<i32>, grid: Option<&TriangleGrid>) {
         // `AIHigh+0x60`, the rank, is each cop's place in the perp's roster (`0x403C00`, run by the
         // cop itself when it claims the perp and on each of its state-4 ticks — [`Police::roster_bubble`]),
-        // not a sort of all the chasers. *(Until 2026-09-26 the port re-sorted every chasing cop by
-        // its gap to the target at the head of every pass, without the 12 m hysteresis.)*
+        // not a sort of all the chasers. (history: `game-history.md` §1.15)
         for i in 0..self.cars.len() {
             // 0x406745…0x406770: the AI pass's gate, and `[0x5E6654]` for this update
             let Some(ai_ticks) = due(i) else { continue };
@@ -1622,103 +1605,17 @@ impl Police {
             }
             let mut built_parked = false;
             if self.cars[i].chasing {
-                // state 4's head (0x40444C…0x404455) sets `car+0xECC & 2`, the lights, before its
-                // give-up tests
-                self.cars[i].lights = true;
-                // The arm in the binary's order (0x4044FC…0x404719), before its `0x405220`: the stuck
-                // test (acted on below, after the give-up test — the GotoSlice is only driven if
-                // the cop is still out), then on the live chase the roster, the ram latch and the
-                // nudge. The nudge's LCG step comes even on a stuck tick (0x4046E1 runs on the
-                // freed chase), and before any drop or give-up. *(Until 2026-09-26 the port ran
-                // them after the drop and give-up tests.)*
-                let stuck = self.cars[i].stuck_ticks > STUCK_LIMIT;
-                // 0x404600…0x404666: the roster answers this cop's rank; a changed rank re-aims the chase
-                // at the new formation slot through `0x40CCA0` — but only outside the ram mode, so a
-                // cop that is ramming keeps its slot (and `AIHigh+0x60` still takes the new rank).
-                let lvl = self.cars[i].level.min(2);
-                // (On a stuck tick the roster step still runs — it is the perp's object, 0x40460D —
-                // while the re-aim, the latch and the nudge would write the freed chase.)
-                let r = self.roster_bubble(table, i);
-                if r != self.cars[i].rank {
-                    self.cars[i].rank = r;
-                    if !stuck && !self.cars[i].ram {
-                        self.retarget(table, i, target, FORMATION[lvl][r.min(5)], tick, ai_ticks);
-                    }
-                }
-                // §27.4, 0x40466B…0x4046CE, read to the instruction 2026-09-26: the chase latches the ram
-                // mode for 8 / 12 / 18 s (`0x40CD50`, only while it is not already on) when the cop has
-                // held its formation slot for **more** than `0x5CBEA0[lvl]+0x00` = 10 / 8 / 4 ticks of
-                // `[0x5E6654]` (`chase+0x78`, `jle` skips), sits within `+0x04` = 10 / 14 / 18 m of the
-                // tracked target laterally (`|chase+0x6C|`) and within `+0x08` = 13 / 15 / 18 m of it
-                // along the road (`|chase+0x68|`), both strict. The arm reads what the last `0x40CD70` /
-                // CLOSE-QUARTERS left. *(Until 2026-09-26 the port tested the longitudinal gap alone, so
-                // any cop passing within 13–18 m of the target latched a ram.)*
-                let hold = self.cars[i].slot_ticks > CLOSE_IN_SLOT_TICKS[lvl] && self.cars[i].chase_lat_err.abs() < CLOSE_IN_LATERAL[lvl];
-                if !stuck && !self.cars[i].ram && hold && self.cars[i].chase_gap.abs() < CLOSE_IN_GAP[lvl] {
-                    tracing::debug!(cop = i, tick, "police ram: close-in mode latched (0x4046CE)");
-                    self.cars[i].ram = true;
-                    self.cars[i].ram_until = tick + CLOSE_IN_TICKS[lvl];
-                }
-                // 0x4046D3…0x404719: the nudge. `0x403850(cop, 0.25, target)` rolls the shared LCG on
-                // every state-4 tick and then asks whether the cop is alongside and just ahead; if so
-                // and the ram mode is off, `0x40CCA0` re-aims the chase at the offset `{0, 0, 0}` —
-                // right on the target, and latched until the next rank change — and `0x40CD50(chase, 1,
-                // 0x20)` rams for half a second. (Without the LCG — the unit tests' `update` — no roll.)
-                if let Some((_, rand16)) = spawn.as_mut() {
-                    let r = rand16();
-                    if !stuck && nudge_roll(ai_ticks, r) && self.alongside(table, i, target) && !self.cars[i].ram {
-                        self.retarget(table, i, target, [0.0; 3], tick, ai_ticks);
-                        self.cars[i].ram = true;
-                        self.cars[i].ram_until = tick + NUDGE_TICKS;
-                        tracing::debug!(cop = i, tick, "police nudge: dead-on ram for 0x20 ticks (0x404714)");
-                    }
-                }
-
-                // State 4 runs `0x405220` itself (0x40471F). With no wanted perp left both of its
-                // passes come up empty (pass 1's `lim` is 0 for a clean perp, pass 2 asks for
-                // `perp+0x78 != 0`), and since the cop still holds a target it releases the slot
-                // (0x403BA0) and clears `+0x58` (0x4053E9…0x405424). 0x404795 then sees the target
-                // gone and takes 0x4047D9, which builds an
-                // `AIState_Normal`, deletes the chase (its dtor 0x40CC10 resets the aim point and
-                // the boost) and sets **state 2** — no `car+0xEAC` write, the lights left on this
-                // tick. The give-up test (0x404840) still runs, and then 0x405092 runs the Normal's
-                // update, i.e. the patrol drive. 0x40479F sends a **finished** target
-                // (`tgt+0xB50 >= 2`) down the same exit; with one human it is the drop that fires
-                // first, since the perp's own tick (0x4059C0, before any cop's) has already
-                // cleared `+0x78` — see [`perp_update`].
-                // A different perp would re-rank and re-aim the chase (0x404728…0x40477F, 0x40CCA0);
-                // only the human can be wanted, so the same one is kept (`best == old`, 0x40536F).
-                let got = self.acquire(table, i, target);
-                if got.is_some() {
-                    self.cars[i].target = got;
-                }
-                if got.is_none() || target.finished {
-                    self.drop_chase(i);
-                    tracing::debug!(cop = i, "police target dropped; back to state 2");
-                }
+                self.chase_head(table, i, target, tick, ai_ticks, &mut spawn);
             } else {
-                // State 2's head (0x4042DA) / state 3's (0x404D75) clear the lights; then
-                // `0x405220` (0x4042F8 / 0x404D86) looks for a perp. With one human its second pass
-                // (0x4052FA…) takes the wanted perp whatever the slot count says, so every patrol
-                // car gets it; the chase is built (0x4043A8 / 0x404E4B, state 4) and its update runs
-                // this very tick (0x405092 / 0x404E70) with the lights still off. The orders
-                // (`AIHigh+0x20`) that could also move state 3 are never set in this build (§17.5b).
-                self.cars[i].lights = false;
-                if let Some(p) = self.acquire(table, i, target) {
-                    // 0x4053AC / 0x4053C3: `+0x58` and the claim on the perp; 0x404316 the rank
-                    self.cars[i].target = Some(p);
-                    self.cars[i].rank = self.roster_claim(table, i);
-                    built_parked = self.cars[i].parked;
-                    self.build_chase(table, i, target, tick, ai_ticks);
-                }
+                built_parked = self.patrol_head(table, i, target, tick, ai_ticks);
             }
             // §17.5 give-up: too far (`0x4071E0` — in state 4 at 0x40484D, in state 2 at 0x4043D6
             // also right after it built a chase, in state 3 at 0x404E80 only when it built none).
             // A finished perp is **not** a give-up: the cop dropped to state 2 above and patrols
-            // until this test sends it to purgatory. *(Until 2026-09-25 the port retired it.)*
+            // until this test sends it to purgatory. (history: `game-history.md` §1.18)
             // `0x4071E0(car)` measures to `car+0xED4`, the reference car — the racer that led when
             // the cop was placed — not to the target: octdist over X/Z (`+0x330` / `+0x338`, the
-            // 0.25 at `[0x5B2468]`) `> 216.0`. *(Until 2026-09-25 the port measured to the target.)*
+            // 0.25 at `[0x5B2468]`) `> 216.0`. (history: `game-history.md` §1.19)
             let (ref_pos, _) = self.reference_of(i, target);
             if crate::traffic::oct_distance(self.cars[i].position, ref_pos) > GIVE_UP_DISTANCE && !built_parked {
                 self.retire(i);
@@ -1762,34 +1659,7 @@ impl Police {
             self.chase_geometry(table, i, target, tick, ai_ticks);
             let gap = self.cars[i].chase_gap;
             let lateral_err = self.cars[i].chase_lat_err;
-            // `chase+0x64` = sign of the cop's `car+0xEC0` and `chase+0x60` = sign of the tracked
-            // target speed `chase+0x40` (0x40CD81…0x40CDBB), `>= 0` giving +1 for both
-            let sign_speed = if self.cars[i].speed >= 0.0 { 1.0 } else { -1.0 };
-            let sign_tgt = if self.cars[i].tracker.speed >= 0.0 { 1.0 } else { -1.0 };
-
-            // §27.6 dispatch: `dv` and `slow` read the target's own `car+0xEC0` (0x40CF9A, 0x40CFF4),
-            // not the tracked one
-            let dv = self.cars[i].speed - target.speed;
-            let adv = dv.abs();
-            let near = gap.abs() * 0.025;
-            let slow = target.speed.abs() < 6.667;
-            let mode = if near > adv && gap.abs() > 140.0 {
-                ChaseMode::CatchUp
-            } else if sign_tgt * sign_speed == 1.0 && !slow {
-                // 0x40D09B…0x40D0B3: `chase+0x60 · chase+0x64 == 1` — the cop and the target travel
-                // the same way. *(Until 2026-09-26 the port multiplied the cop's direction by the
-                // sign of the lateral error `chase+0x6C`, so a cop to the left of a target going
-                // its way never took CLOSE-QUARTERS.)*
-                ChaseMode::CloseQuarters
-            } else if sign_speed * gap >= 0.0 && !slow {
-                ChaseMode::CatchUp
-            } else {
-                // 0x40D0D6…0x40D10D: `fcomp 26.67 ; test ah, 0x41 ; je push 0` — the flag is 0 when
-                // `adv` is **above** 26.67, and the same idiom on `|chase+0x68|` against 80 (`[0x5B26D4]`),
-                // so the ram is for a cop that is close and not closing fast. *(Until 2026-09-26 the
-                // port — and `traffic.md` §17.5 / §27.6 — had both comparisons the other way round.)*
-                ChaseMode::Pursue { hard: adv <= 26.67 && gap.abs() <= 80.0 }
-            };
+            let mode = self.chase_mode(i, target, gap);
             self.cars[i].mode = Some(mode);
             // CATCH-UP (0x40D049 / 0x40D055) and PURSUE (0x40D6FE / 0x40D70A) point the car at the
             // target — `chase+0x68 > 0` → −1, else +1, behind `gGameTick > chase+0x44`, which only
@@ -1803,8 +1673,7 @@ impl Police {
             let human_gap = track_distance(table, self.cars[i].slice, target.slice);
             self.apply_boost(i, tick, human_gap, true);
             // CLOSE-QUARTERS in the ram mode runs `0x40CE80(this, 0)` again (0x40D19F) — the boost
-            // without the human suppression — before its `0x40AF70` (0x40D507). *(Until 2026-09-26
-            // the port suppressed it near the human in the ram mode too.)*
+            // without the human suppression — before its `0x40AF70` (0x40D507). (history: `game-history.md` §1.22)
             if matches!(mode, ChaseMode::CloseQuarters) && self.cars[i].ram {
                 self.apply_boost(i, tick, human_gap, false);
             }
@@ -1816,72 +1685,7 @@ impl Police {
                 // §27.8, the formation controller in full: compare the sector the cop is in with
                 // the one its formation slot wants, pick a speed to close the difference and bias
                 // the lateral aim toward the slot.
-                ChaseMode::CloseQuarters => {
-                    let lvl = self.cars[i].level.min(2);
-                    let dir = self.cars[i].dir;
-                    let (hw, hl) = (target.half_width, target.half_length);
-                    let ram = self.cars[i].ram;
-                    let offset = self.cars[i].formation;
-                    // `chase+0x58` / `+0x5C`: the sectors of the latched offset. In the ram mode the
-                    // slot is "dead on" and the boost is not suppressed (0x40D194).
-                    let (want_lon, want_lat) = if ram { (0, 0) } else { (self.cars[i].want_lon, self.cars[i].want_lat) };
-                    let lat = sector(dir * lateral_err, -hw, hw);
-                    let g = dir * gap;
-                    let p = sector(g, 2.0 - hl, hl + 2.0);
-                    let lon = sector(g, -(hl + 2.0), hl + 2.0);
-                    self.cars[i].slot_ticks = if lat == want_lat && p == want_lon { self.cars[i].slot_ticks + ai_ticks } else { 0 };
-                    let (mut ok, mut m, mut sub) = (true, 0, 0);
-                    if want_lon * lon == -1 {
-                        m = if want_lat != 0 { want_lat } else { -1 };
-                    } else if want_lat * lat == -1 && lon == 0 {
-                        sub = -1;
-                        ok = false;
-                    } else if want_lat == 0 && lon == 0 && !ram {
-                        ok = false;
-                    } else if want_lon == 1 && lon == 1 && lat == 0 && gap < 20.0 {
-                        sub = -2;
-                    }
-                    // the target speed the slot implies, from the tracked `|chase+0x40|`
-                    let mut want = self.cars[i].tracker.speed.abs();
-                    if p < want_lon {
-                        want *= 1.4; // behind the slot: chase
-                    } else if p > want_lon || sub == -1 {
-                        want *= close_quarters_factor(gap); // ahead of it: ease off
-                    } else if gap <= 20.0 {
-                        // 0x40D3BC: the **signed** `chase+0x68` against 20 (`test ah, 0x41 ; jne`), so a
-                        // cop more than 20 m behind its slot keeps the target's speed here too.
-                        // *(Until 2026-09-26 the port tested `|chase+0x68|` and eased such a cop off
-                        // by the distance table.)* The branch at 0x40D3CC (`> 20` and `< 10`) is dead.
-                        if sub == -2 {
-                            want *= CLOSE_QUARTERS_SLOW[lvl];
-                        }
-                    } else {
-                        want *= close_quarters_factor(gap);
-                    }
-                    // `cop+0xEB8 = dir · max(5, min(S, |cop+0xEB8|))`
-                    speed = dir * want.min(speed.abs()).max(5.0);
-                    if ok {
-                        // `chase+0x38`, the tracked target lateral
-                        let base = self.cars[i].tracker.lateral;
-                        let (y, bias) = if ram {
-                            (base, 30.0)
-                        } else {
-                            // `+ dir·(half width + 6)` when the cop has to swing out, else the
-                            // slot's own lateral offset; then clamped onto the road
-                            let y = base + if m != 0 { dir * (hw + 6.0) } else { dir * offset[0] };
-                            // 0x40D5CF…0x40D638: clamped to `[−rec+0x48·rec+0x38, rec+0x4C·rec+0x3C]`
-                            // of the cop's slice — lane width × lane count on each side, not the road
-                            // half-widths `rec+0x40` / `+0x44` the port used until 2026-09-26
-                            let sl = &table.slices[self.cars[i].slice.min(table.slices.len() - 1)];
-                            (y.max(-(sl.lane_width_a * sl.lanes_a as f32)).min(sl.lane_width_b * sl.lanes_b as f32), 15.0)
-                        };
-                        // 0x40D642 / 0x40D64B: `car+0x1078 = y`, `car+0x107C = 15 / 30` — the lane
-                        // pass that follows honours it through `0x402790`. *(Until 2026-09-26 the
-                        // port wrote `y` into the lane target, which its lane pass then overwrote.)*
-                        self.cars[i].lane_override = y;
-                        self.cars[i].lane_bias = bias;
-                    }
-                }
+                ChaseMode::CloseQuarters => speed = self.close_quarters(table, i, target, gap, lateral_err, ai_ticks, speed),
                 // §27.9: the distance ladder is a cap on the 100 m/s base, and `hard` rams
                 ChaseMode::Pursue { hard } => {
                     let d = crate::traffic::oct_distance(self.cars[i].position, target.position);
@@ -1902,9 +1706,7 @@ impl Police {
             // §27.7's U-turn needs nothing here: asking for the opposite direction makes the
             // throttle windows fail (`car+0xEAC == car+0xEB0` at 0x409AAF / 0x40A09B, which
             // `aidrive` carries), so the cop brakes to a stop, 0x408360 flips it and it drives
-            // back. `car+0xEB8` itself keeps what `0x40AF70` and the behaviour gave it. *(Until
-            // 2026-09-25 the port also zeroed the target speed here, which the original does not;
-            // the lane pass saw the zero.)*
+            // back. `car+0xEB8` itself keeps what `0x40AF70` and the behaviour gave it. (history: `game-history.md` §1.25)
             self.cars[i].target_speed = speed;
 
             // §12/§23 lane pass, with §27.10's `0x40DA00` in front of the scorers: every behaviour
@@ -1913,13 +1715,213 @@ impl Police {
         }
     }
 
+    /// State 4's head (0x40444C…0x404719, then its `0x405220`, 0x40471F): the lights, the roster
+    /// step and re-aim, the ram latch (§27.4), the nudge's LCG roll and the acquire / drop.
+    fn chase_head(&mut self, table: &SliceTable, i: usize, target: &ChaseTarget, tick: u64, ai_ticks: i32, spawn: &mut Option<(&[usize], &mut dyn FnMut() -> u32)>) {
+        // state 4's head (0x40444C…0x404455) sets `car+0xECC & 2`, the lights, before its
+        // give-up tests
+        self.cars[i].lights = true;
+        // The arm in the binary's order (0x4044FC…0x404719), before its `0x405220`: the stuck
+        // test (acted on below, after the give-up test — the GotoSlice is only driven if
+        // the cop is still out), then on the live chase the roster, the ram latch and the
+        // nudge. The nudge's LCG step comes even on a stuck tick (0x4046E1 runs on the
+        // freed chase), and before any drop or give-up. (history: `game-history.md` §1.16)
+        let stuck = self.cars[i].stuck_ticks > STUCK_LIMIT;
+        // 0x404600…0x404666: the roster answers this cop's rank; a changed rank re-aims the chase
+        // at the new formation slot through `0x40CCA0` — but only outside the ram mode, so a
+        // cop that is ramming keeps its slot (and `AIHigh+0x60` still takes the new rank).
+        let lvl = self.cars[i].level.min(2);
+        // (On a stuck tick the roster step still runs — it is the perp's object, 0x40460D —
+        // while the re-aim, the latch and the nudge would write the freed chase.)
+        let r = self.roster_bubble(table, i);
+        if r != self.cars[i].rank {
+            self.cars[i].rank = r;
+            if !stuck && !self.cars[i].ram {
+                self.retarget(table, i, target, FORMATION[lvl][r.min(5)], tick, ai_ticks);
+            }
+        }
+        // §27.4, 0x40466B…0x4046CE, read to the instruction 2026-09-26: the chase latches the ram
+        // mode for 8 / 12 / 18 s (`0x40CD50`, only while it is not already on) when the cop has
+        // held its formation slot for **more** than `0x5CBEA0[lvl]+0x00` = 10 / 8 / 4 ticks of
+        // `[0x5E6654]` (`chase+0x78`, `jle` skips), sits within `+0x04` = 10 / 14 / 18 m of the
+        // tracked target laterally (`|chase+0x6C|`) and within `+0x08` = 13 / 15 / 18 m of it
+        // along the road (`|chase+0x68|`), both strict. The arm reads what the last `0x40CD70` /
+        // CLOSE-QUARTERS left. (history: `game-history.md` §1.17)
+        let hold = self.cars[i].slot_ticks > CLOSE_IN_SLOT_TICKS[lvl] && self.cars[i].chase_lat_err.abs() < CLOSE_IN_LATERAL[lvl];
+        if !stuck && !self.cars[i].ram && hold && self.cars[i].chase_gap.abs() < CLOSE_IN_GAP[lvl] {
+            tracing::debug!(cop = i, tick, "police ram: close-in mode latched (0x4046CE)");
+            self.cars[i].ram = true;
+            self.cars[i].ram_until = tick + CLOSE_IN_TICKS[lvl];
+        }
+        // 0x4046D3…0x404719: the nudge. `0x403850(cop, 0.25, target)` rolls the shared LCG on
+        // every state-4 tick and then asks whether the cop is alongside and just ahead; if so
+        // and the ram mode is off, `0x40CCA0` re-aims the chase at the offset `{0, 0, 0}` —
+        // right on the target, and latched until the next rank change — and `0x40CD50(chase, 1,
+        // 0x20)` rams for half a second. (Without the LCG — the unit tests' `update` — no roll.)
+        if let Some((_, rand16)) = spawn.as_mut() {
+            let r = rand16();
+            if !stuck && nudge_roll(ai_ticks, r) && self.alongside(table, i, target) && !self.cars[i].ram {
+                self.retarget(table, i, target, [0.0; 3], tick, ai_ticks);
+                self.cars[i].ram = true;
+                self.cars[i].ram_until = tick + NUDGE_TICKS;
+                tracing::debug!(cop = i, tick, "police nudge: dead-on ram for 0x20 ticks (0x404714)");
+            }
+        }
+
+        // State 4 runs `0x405220` itself (0x40471F). With no wanted perp left both of its
+        // passes come up empty (pass 1's `lim` is 0 for a clean perp, pass 2 asks for
+        // `perp+0x78 != 0`), and since the cop still holds a target it releases the slot
+        // (0x403BA0) and clears `+0x58` (0x4053E9…0x405424). 0x404795 then sees the target
+        // gone and takes 0x4047D9, which builds an
+        // `AIState_Normal`, deletes the chase (its dtor 0x40CC10 resets the aim point and
+        // the boost) and sets **state 2** — no `car+0xEAC` write, the lights left on this
+        // tick. The give-up test (0x404840) still runs, and then 0x405092 runs the Normal's
+        // update, i.e. the patrol drive. 0x40479F sends a **finished** target
+        // (`tgt+0xB50 >= 2`) down the same exit; with one human it is the drop that fires
+        // first, since the perp's own tick (0x4059C0, before any cop's) has already
+        // cleared `+0x78` — see [`perp_update`].
+        // A different perp would re-rank and re-aim the chase (0x404728…0x40477F, 0x40CCA0);
+        // only the human can be wanted, so the same one is kept (`best == old`, 0x40536F).
+        let got = self.acquire(table, i, target);
+        if got.is_some() {
+            self.cars[i].target = got;
+        }
+        if got.is_none() || target.finished {
+            self.drop_chase(i);
+            tracing::debug!(cop = i, "police target dropped; back to state 2");
+        }
+    }
+
+    /// State 2's / 3's head (0x4042DA / 0x404D75): the lights off and `0x405220`'s acquire, which
+    /// builds the chase. Returns whether the chase was built on a parked cop (the give-up test
+    /// skips such a cop this tick).
+    fn patrol_head(&mut self, table: &SliceTable, i: usize, target: &ChaseTarget, tick: u64, ai_ticks: i32) -> bool {
+        let mut built_parked = false;
+        // State 2's head (0x4042DA) / state 3's (0x404D75) clear the lights; then
+        // `0x405220` (0x4042F8 / 0x404D86) looks for a perp. With one human its second pass
+        // (0x4052FA…) takes the wanted perp whatever the slot count says, so every patrol
+        // car gets it; the chase is built (0x4043A8 / 0x404E4B, state 4) and its update runs
+        // this very tick (0x405092 / 0x404E70) with the lights still off. The orders
+        // (`AIHigh+0x20`) that could also move state 3 are never set in this build (§17.5b).
+        self.cars[i].lights = false;
+        if let Some(p) = self.acquire(table, i, target) {
+            // 0x4053AC / 0x4053C3: `+0x58` and the claim on the perp; 0x404316 the rank
+            self.cars[i].target = Some(p);
+            self.cars[i].rank = self.roster_claim(table, i);
+            built_parked = self.cars[i].parked;
+            self.build_chase(table, i, target, tick, ai_ticks);
+        }
+        built_parked
+    }
+
+    /// `AIState_Chase::update` 0x40CF70's dispatch (§27.6) on the gap `chase+0x68` that
+    /// [`Police::chase_geometry`] left.
+    fn chase_mode(&self, i: usize, target: &ChaseTarget, gap: f32) -> ChaseMode {
+        // `chase+0x64` = sign of the cop's `car+0xEC0` and `chase+0x60` = sign of the tracked
+        // target speed `chase+0x40` (0x40CD81…0x40CDBB), `>= 0` giving +1 for both
+        let sign_speed = if self.cars[i].speed >= 0.0 { 1.0 } else { -1.0 };
+        let sign_tgt = if self.cars[i].tracker.speed >= 0.0 { 1.0 } else { -1.0 };
+
+        // §27.6 dispatch: `dv` and `slow` read the target's own `car+0xEC0` (0x40CF9A, 0x40CFF4),
+        // not the tracked one
+        let dv = self.cars[i].speed - target.speed;
+        let adv = dv.abs();
+        let near = gap.abs() * 0.025;
+        let slow = target.speed.abs() < 6.667;
+        if near > adv && gap.abs() > 140.0 {
+            ChaseMode::CatchUp
+        } else if sign_tgt * sign_speed == 1.0 && !slow {
+            // 0x40D09B…0x40D0B3: `chase+0x60 · chase+0x64 == 1` — the cop and the target travel
+            // the same way. (history: `game-history.md` §1.20)
+            ChaseMode::CloseQuarters
+        } else if sign_speed * gap >= 0.0 && !slow {
+            ChaseMode::CatchUp
+        } else {
+            // 0x40D0D6…0x40D10D: `fcomp 26.67 ; test ah, 0x41 ; je push 0` — the flag is 0 when
+            // `adv` is **above** 26.67, and the same idiom on `|chase+0x68|` against 80 (`[0x5B26D4]`),
+            // so the ram is for a cop that is close and not closing fast. (history: `game-history.md` §1.21)
+            ChaseMode::Pursue { hard: adv <= 26.67 && gap.abs() <= 80.0 }
+        }
+    }
+
+    /// §27.8's formation controller (CLOSE-QUARTERS): the sector the cop is in against the one its
+    /// slot wants, the speed that closes the difference (returned, from `speed`) and the lateral
+    /// aim toward the slot.
+    #[allow(clippy::too_many_arguments)]
+    fn close_quarters(&mut self, table: &SliceTable, i: usize, target: &ChaseTarget, gap: f32, lateral_err: f32, ai_ticks: i32, mut speed: f32) -> f32 {
+        let lvl = self.cars[i].level.min(2);
+        let dir = self.cars[i].dir;
+        let (hw, hl) = (target.half_width, target.half_length);
+        let ram = self.cars[i].ram;
+        let offset = self.cars[i].formation;
+        // `chase+0x58` / `+0x5C`: the sectors of the latched offset. In the ram mode the
+        // slot is "dead on" and the boost is not suppressed (0x40D194).
+        let (want_lon, want_lat) = if ram { (0, 0) } else { (self.cars[i].want_lon, self.cars[i].want_lat) };
+        let lat = sector(dir * lateral_err, -hw, hw);
+        let g = dir * gap;
+        let p = sector(g, 2.0 - hl, hl + 2.0);
+        let lon = sector(g, -(hl + 2.0), hl + 2.0);
+        self.cars[i].slot_ticks = if lat == want_lat && p == want_lon { self.cars[i].slot_ticks + ai_ticks } else { 0 };
+        let (mut ok, mut m, mut sub) = (true, 0, 0);
+        if want_lon * lon == -1 {
+            m = if want_lat != 0 { want_lat } else { -1 };
+        } else if want_lat * lat == -1 && lon == 0 {
+            sub = -1;
+            ok = false;
+        } else if want_lat == 0 && lon == 0 && !ram {
+            ok = false;
+        } else if want_lon == 1 && lon == 1 && lat == 0 && gap < 20.0 {
+            sub = -2;
+        }
+        // the target speed the slot implies, from the tracked `|chase+0x40|`
+        let mut want = self.cars[i].tracker.speed.abs();
+        if p < want_lon {
+            want *= 1.4; // behind the slot: chase
+        } else if p > want_lon || sub == -1 {
+            want *= close_quarters_factor(gap); // ahead of it: ease off
+        } else if gap <= 20.0 {
+            // 0x40D3BC: the **signed** `chase+0x68` against 20 (`test ah, 0x41 ; jne`), so a
+            // cop more than 20 m behind its slot keeps the target's speed here too.
+            // (history: `game-history.md` §1.23)
+            // The branch at 0x40D3CC (`> 20` and `< 10`) is dead.
+            if sub == -2 {
+                want *= CLOSE_QUARTERS_SLOW[lvl];
+            }
+        } else {
+            want *= close_quarters_factor(gap);
+        }
+        // `cop+0xEB8 = dir · max(5, min(S, |cop+0xEB8|))`
+        speed = dir * want.min(speed.abs()).max(5.0);
+        if ok {
+            // `chase+0x38`, the tracked target lateral
+            let base = self.cars[i].tracker.lateral;
+            let (y, bias) = if ram {
+                (base, 30.0)
+            } else {
+                // `+ dir·(half width + 6)` when the cop has to swing out, else the
+                // slot's own lateral offset; then clamped onto the road
+                let y = base + if m != 0 { dir * (hw + 6.0) } else { dir * offset[0] };
+                // 0x40D5CF…0x40D638: clamped to `[−rec+0x48·rec+0x38, rec+0x4C·rec+0x3C]`
+                // of the cop's slice — lane width × lane count on each side, not the road
+                // half-widths `rec+0x40` / `+0x44` the port used until 2026-09-26
+                let sl = &table.slices[self.cars[i].slice.min(table.slices.len() - 1)];
+                (y.max(-(sl.lane_width_a * sl.lanes_a as f32)).min(sl.lane_width_b * sl.lanes_b as f32), 15.0)
+            };
+            // 0x40D642 / 0x40D64B: `car+0x1078 = y`, `car+0x107C = 15 / 30` — the lane
+            // pass that follows honours it through `0x402790`. (history: `game-history.md` §1.24)
+            self.cars[i].lane_override = y;
+            self.cars[i].lane_bias = bias;
+        }
+        speed
+    }
+
     /// The lane scorers plus `0x40DA00`'s bias toward the target's lane.
     /// One tick of a patrolling cop: the traffic speed ladder, the same lane pass and the same drive
     /// model, with no chase behaviour at all (§17.4 states 2/3).
     ///
     /// `AIState_Normal::update` 0x40B5A0 writes no `car+0xEAC`: the requested direction is whatever
     /// the last writer left — the placement 0x407890 (the car's own direction) after a deploy, the
-    /// GotoSlice after state 9. *(Until 2026-09-25 this reset it to `car+0xEB0` every tick.)*
+    /// GotoSlice after state 9. (history: `game-history.md` §1.26)
     fn patrol(&mut self, table: &SliceTable, i: usize, target: &ChaseTarget, others: &[LaneCar], ai_ticks: i32) {
         if self.cars[i].parked {
             // `AIState_Stop::update` 0x40CAB0, mode 1 (0x404295 → `+0x0C = 1`): `car+0xEB8 = 0`,
@@ -1987,7 +1989,7 @@ impl Police {
         // car+0xEAC` while `car+0xEC4 < 8.889`, `[0x5B2430]`) and only then runs the drive chain
         // (0x40A900, 0x4082E0, …) — so a U-turn asked for by this tick's state (0x406720 runs
         // before the Sc32 scheduler, `timing.md` §7) is granted in time for this tick's throttle
-        // gate. *(Until 2026-09-25 the port granted it after integrating, one tick late.)*
+        // gate. (history: `game-history.md` §1.27)
         {
             let c = &mut self.cars[i];
             if c.speed_estimate() < 8.889 {
@@ -2000,13 +2002,12 @@ impl Police {
         // zeroing the AI's force / torque `car+0xD34…`, `+0xD4C…`, `+0xD70…` and damping:
         // * 0x4084C3 — knocked over, `car+0x42C == 1` (`Damage` 0x49489A on an impact past 80,
         //   [`Vehicle::knocked_over`]; only a reset clears it): `vel ×= 0.98` (0x408505) and
-        //   `ω.y ×= 0.98` (0x408512). *(Not taken before 2026-09-26: the port's cops took no
-        //   `Damage`.)*
+        //   `ω.y ×= 0.98` (0x408512). (history: `game-history.md` §1.28)
         // * 0x40854C — `car+0x418 == 0` and the up axis `car+0x374` below 0.3 (`[0x5B25F0]`), on
         //   its side or its roof, and 0x4085EC — the target speed `car+0xEB8` exactly 0: `vel ×=
         //   0.94` (`[0x5B25F4]`, 0x40863C, 0x532360) and `ω.y ×= 0.98`. The damaged-out exit
         //   (`car+0x540`, 0.99) has no writer for a cop and the finished-racer exit needs
-        //   `car+0x52C & 1`. *(Until 2026-09-25 the cops drove through all of them.)*
+        //   `car+0x52C & 1`. (history: `game-history.md` §1.29)
         {
             let c = &mut self.cars[i];
             let damp = if c.body.knocked_over {
@@ -2034,13 +2035,12 @@ impl Police {
             // `0x40A470(car, 1)` (0x40842C) copies the lane target `car+0xEB4` into the one the aim
             // point follows, `car+0x1074`, on every drive; 0x408E30 clamps `car+0xEB8` and zeroes
             // `car+0x1074` while reversing — not `car+0xEB4`, so the lane pass's target is back on
-            // the next drive. *(Until 2026-09-25 the port wrote the zero into `car+0xEB4`.)*
+            // the next drive. (history: `game-history.md` §1.30)
             let (speed, mut target) = aidrive::reverse_trim(&mut c.gear, tick, c.lateral, c.lateral_target, lat_vel, c.target_speed);
             c.target_speed = speed;
             // 0x408665…0x40868A: `(int)car+0xEB0 · car+0xEC0 < 0` — the car moving against its own
             // direction, as in a U-turn — with the gear not reversed: `car+0x1074 = 0`, so it aims
-            // at the centre line. *(Not in the port before 2026-09-25: a cop turning round after a
-            // deploy kept aiming at its old lane on the far side, ran wide off the road.)*
+            // at the centre line. (history: `game-history.md` §1.31)
             if c.dir * c.speed < 0.0 && c.gear.sense >= 0.0 {
                 target = 0.0;
             }
@@ -2049,8 +2049,7 @@ impl Police {
                 aidrive::toggle_gear(&mut c.gear, tick, c.speed, aidrive::GEAR_PERIOD);
             }
             // `0x408F20` → `0x4090C0` (0x4086A9, after the trim and the U-turn zero): with an
-            // explicit aim point `car+0x1074 = car+0x1070` (0x40954E…0x409557). *(Until 2026-09-26
-            // the port drove PURSUE's ram on the lane pass's target.)*
+            // explicit aim point `car+0x1074 = car+0x1070` (0x40954E…0x409557). (history: `game-history.md` §1.32)
             if c.aim_point != Vec3::ZERO {
                 target = c.aim_lateral;
             }
@@ -2108,7 +2107,7 @@ impl Police {
         // (`fcomp; test ah,0x41; je`) — or the lateral offset `car+0xED0` below
         // `−[slice+0x40] − 35` or above `[slice+0x40] + 35` (`[0x5B25F8]`; the slice's own
         // half-width field, `width_a` in the track's frame) → `0x40F540(car, 1, 0)`
-        // ([`Police::reset_at`]). *(Not run for a cop before 2026-09-26.)*
+        // ([`Police::reset_at`]). (history: `game-history.md` §1.33)
         let w_half = if table.backwards { sl.width_b } else { sl.width_a };
         let insane = c.velocity.z > SANITY_SPEED || c.velocity.x > SANITY_SPEED || c.speed_estimate() > SANITY_SPEED;
         let off_road = c.lateral < -(w_half + SANITY_OFF_ROAD) || c.lateral > w_half + SANITY_OFF_ROAD;
@@ -2119,9 +2118,7 @@ impl Police {
     }
 
     /// `AIHigh_Perp+0x78`: whether the perp is wanted. A patrol car picks that up in its own next
-    /// tick (`update`, state 2/3's `0x405220`). *(Until 2026-09-25 this promoted every patrol car
-    /// on the spot; the chase is now built where the original builds it, which also covers a cop
-    /// state 1 has only just placed — it waits for its first state-2/3 tick.)*
+    /// tick (`update`, state 2/3's `0x405220`). (history: `game-history.md` §1.34)
     pub fn set_wanted(&mut self, wanted: bool) {
         self.wanted = wanted;
     }
@@ -2282,9 +2279,8 @@ impl Police {
         let sl = table.slices[self.cars[i].slice.min(table.slices.len() - 1)];
         // the lists of the pass (`car+0x528` of each entry when the caller gave the others': the race
         // gives them, the unit tests do not and the walk sorts the cars itself; and the world
-        // positions for 0x40E860's fine step, `traffic.md` section 34.6 *(until then `police.rs`
-        // called `find_blockers_placed` with `None`, i.e. every lane-blocker gap was the coarse
-        // 6 m-per-slice one)*) — the same builder as `TrafficSet::ai_on`'s
+        // positions for 0x40E860's fine step, `traffic.md` section 34.6; history: `game-history.md`
+        // §1.35) — the same builder as `TrafficSet::ai_on`'s
         let mut ctx = std::mem::take(&mut self.lane_ctx);
         ctx.fill(others, &self.other_places, &self.other_positions, self.cars.iter().enumerate().filter(|(j, o)| *j != i && o.active).map(|(_, o)| (o.as_lane_car(table), o.place, o.position)));
         let c = &self.cars[i];
@@ -2341,8 +2337,7 @@ impl Police {
         c.scan = scan;
         c.stuck_ticks = stuck;
         // `car+0xEB4` is written whatever the aim point; the drive's `0x4090C0` takes `car+0x1070`
-        // instead when there is an explicit one. *(Until 2026-09-26 the port kept the old lane
-        // target under an aim point.)*
+        // instead when there is an explicit one. (history: `game-history.md` §1.36)
         c.lateral_target = lateral_target;
         c.target_speed = capped;
         self.lane_ctx = ctx;
@@ -2411,7 +2406,7 @@ impl Police {
     /// its lights off (0x403F4A), and runs that state's update this tick — never state 4. `chasing`
     /// says whether the perp is wanted (`AIHigh_Perp+0x78`, as `set_wanted`); a wanted perp is
     /// acquired on the cop's next tick, whose chase update runs unlit, and the tick after that lights
-    /// it (§17.5b). *(Until 2026-09-25 `chasing = true` put the cop straight into a lit chase.)*
+    /// it (§17.5b). (history: `game-history.md` §1.37)
     ///
     /// `grid` is the track's collision grid for `Car_placeAtSlice` 0x49B090; without one (the unit
     /// tests) the placement is taken against the slice's own plane (port fallback).
@@ -2436,10 +2431,7 @@ impl Police {
         // (`car+0x52C & 8` clear), so the offset is slice-local: the placement point is `centre +
         // lateral·L + 1.0·N` in the frame the **tracker's patch normal** gives (0x49B22F…), the
         // trackers seated on the slice centre, and the body is then dropped by `BodyHeight`'s
-        // `car+0x424` against that patch (0x49B493…0x49B4C7, `Vehicle::place_at_slice`). *(Until
-        // 2026-09-26 the port placed the cop on the slice's own plane and settled it on the
-        // patch at the next 64 Hz step: on a crowned or banked road it was drawn about a metre
-        // above the road for the deploy tick.)*
+        // `car+0x424` against that patch (0x49B493…0x49B4C7, `Vehicle::place_at_slice`). (history: `game-history.md` §1.38)
         match grid {
             Some(g) => {
                 c.body.rearm_after_reset();

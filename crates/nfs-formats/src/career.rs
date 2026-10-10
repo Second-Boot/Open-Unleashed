@@ -5,11 +5,8 @@
 //! exactly as the original loaders compute it. Fields whose meaning was not established keep
 //! `unknown_*` names with their file offset.
 
-use crate::{f32_le, fixed_str, u16_le, u32_le, FormatError};
-
-fn i16_le(data: &[u8], off: usize, what: &'static str) -> Result<i16, FormatError> {
-    Ok(u16_le(data, off, what)? as i16)
-}
+use crate::bytes::{read_u16, read_u32};
+use crate::{f32_le, fixed_str, i16_le, u16_le, u32_le, FormatError};
 
 fn records<'a>(data: &'a [u8], size: usize, what: &'static str) -> Result<impl Iterator<Item = &'a [u8]>, FormatError> {
     if !data.len().is_multiple_of(size) {
@@ -705,7 +702,7 @@ impl TrackRecordFile {
     /// `nfs5.trk` id of record `i` (`*(u16*)trk`, the key 0x4FAFC0 searches by).
     pub fn id_at(&self, i: usize) -> u16 {
         let b = i * TRACK_RECORD_SIZE;
-        u16::from_le_bytes([self.raw[b], self.raw[b + 1]])
+        read_u16(&self.raw, b)
     }
 
     pub fn index_of(&self, id: u16) -> Option<usize> {
@@ -721,7 +718,7 @@ impl TrackRecordFile {
         for t in 0..self.count() {
             for k in 0..RECORD_SLOTS {
                 let e = self.slot(t, k);
-                if u32::from_le_bytes([self.raw[e + SLOT_TIME_AT], self.raw[e + SLOT_TIME_AT + 1], self.raw[e + SLOT_TIME_AT + 2], self.raw[e + SLOT_TIME_AT + 3]]) == 0 {
+                if read_u32(&self.raw, e + SLOT_TIME_AT) == 0 {
                     // `strcpy(e, "n/a")` (0x4FAF41…0x4FAF67): four bytes, the rest of the
                     // 20-byte name left as it was
                     self.raw[e..e + 4].copy_from_slice(b"n/a\0");
@@ -738,7 +735,7 @@ impl TrackRecordFile {
                 TrackRecord {
                     driver: fixed_str(&self.raw, e, 20, "nfs5.trk").unwrap_or_default(),
                     car: fixed_str(&self.raw, e + SLOT_CAR_AT, 52, "nfs5.trk").unwrap_or_default(),
-                    time: u32::from_le_bytes([self.raw[e + SLOT_TIME_AT], self.raw[e + SLOT_TIME_AT + 1], self.raw[e + SLOT_TIME_AT + 2], self.raw[e + SLOT_TIME_AT + 3]]),
+                    time: read_u32(&self.raw, e + SLOT_TIME_AT),
                 }
             })
             .collect()

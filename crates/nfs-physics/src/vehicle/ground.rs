@@ -285,7 +285,7 @@ impl Vehicle {
             if let Some(effect) = self.body_ground_collide_mass(mass, n, q, k) {
                 self.ground_sound = Some((effect, self.surface_nibble()));
                 self.contact_mag = effect;
-                self.contact_kind = 0x30000;
+                self.contact_kind = ContactKind::Ground;
             }
             // 0x49C005…0x49C01B: left upside down by the contact, the car is dead
             if self.cos_tilt < 0.0 {
@@ -302,7 +302,7 @@ impl Vehicle {
             }
             // 0x49C095…0x49C0E6: rolled over with damage on (`[0x657A2C]`), roof under 40, still
             // racing — the roll-over event, and the roof damage is set to 40
-            if self.damage_enabled && self.cos_tilt < -0.86 && self.damage[8] < 40.0 && self.race_state == 0 {
+            if self.damage_enabled && self.cos_tilt < -0.86 && self.damage[8] < 40.0 && self.race_state == RaceState::Racing {
                 self.rollover_sound = true;
                 self.damage[8] = 40.0;
             }
@@ -425,121 +425,152 @@ impl Vehicle {
     /// `Susp_update` 0x499A70 (car, &normalOut) → the ground height `(Σc/4).y`
     /// (`RE/notes/suspension-collision.md` §3): the four wheel probes, the compression, the
     /// suspension vectors, the ground normal ([`Self::ground_normal`]), the pitch / roll rates,
-    /// `car+0x418` and `BodyHeight` 0x49A900 into `car+0x424` / `+0x428`.
+    /// `car+0x418` and `BodyHeight` 0x49A900 into `car+0x424` / `+0x428`. The named steps run in
+    /// the binary's order; correction history in `RE/notes/physics-history.md` §2.
     pub(super) fn susp_update(&mut self, grid: &TriangleGrid, specs: &CarSpecs, police: bool) -> f32 {
         let m = self.orientation; // rows = body axes in world space
         let mt = m.transpose();
         let up = m.row(1);
         let s_sign = if self.cos_tilt > 0.0 { 1.0 } else { -1.0 };
+        let body = SuspFrame { m, mt, up, s_sign };
         let mut contacts = [Vec3::ZERO; 4];
         let mut susp_y = [0f32; 4];
         let mut n_air = 0;
         let mut heights = [0f32; 4];
         let probes = self.probe_points();
-        for i in 0..4 {
-            // the world collision point `car+0x1DC + 12i` (0x49AE30: `pos + Σ p_k·M[k]`) of body
-            // point i, which 0x49ABC0 left as wheel i's ground reference (0x499AD4…0x499B13)
-            let world_pt = self.position + mt * probes[i];
-            let probe = world_pt + Vec3::new(0.0, specs.probe_offset * up.y, 0.0);
-            // the wheel's tracker (0x499B64 `updateZone(probe, 1)`); its zone word — 0 with no
-            // patch — is the wheel's surface `wheel+0x8C` on **both** branches (0x499B86…0x499BA7,
-            // `RALLY` turning nibbles 1 and 10 into 2)
-            self.wheels[i].tracker.update_zone(grid, probe);
-            let nibble = (self.wheels[i].tracker.word & 0xF) as usize;
-            let zone = if rally_reads_as_two(nibble, self.rally) { 2 } else { self.wheels[i].tracker.word & 0xFFFF };
-            self.wheels[i].zone = zone;
-            self.wheels[i].surface = (zone & 0xF) as usize;
-            // 0x494480: no surface nibble ⇒ 1; the patch plane more than 4 m from the body's
-            // `car+0x334` ⇒ 2 (0x4944CB…0x4944F0, `[0x5B2404]`); else 0, the patch branch
-            let patch_h = if nibble == 0 {
-                None
-            } else {
-                self.wheels[i].tracker.patch_height(probe.x, probe.z).filter(|h| (h - self.position.y).abs() <= 4.0)
-            };
-            let h_i = match patch_h {
-                Some(h) => {
-                    // road roughness (0x499730), added on the patch branch only; its speed is
-                    // `car+0x35C` ([`Self::speed_est`]) — *corrected 2026-09-26*: the port took
-                    // the estimate of the physics-frame `car+0xD58` / `+0xD60`
-                    let mut h = h + self.roughness(i);
-                    // the front wheels' wobble from suspension damage (0x499C8B…0x499CC1):
-                    // `SuspDamage(car)·sin(6.28318·(0.5·i + wheel+0x88))·(1/1500)` — 0x493BC0,
-                    // `[0x5B23F0]` 0.5, `[0x5B4A08]` 6.28318, the double `[0x5B4A00]` 1/1500
-                    if i < 2 {
-                        // the original's constant is 6.28318, not TAU
-                        #[allow(clippy::approx_constant)]
-                        let arg = (0.5 * i as f32 + self.wheels[i].rotation) * 6.283_18;
-                        // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable sin, not std; original inline x87 `fsin` at 0x499CB3.
-                        h += self.suspension_wear(specs) * nfs_math::portable::sinf(arg) * (1.0 / 1500.0);
-                    }
-                    h
-                }
-                // no usable patch: the kept plane `car+0x3E8` / `car+0x400` (0x499BC4…0x499C2E),
-                // with no roughness — the branch jumps straight to the sum at 0x499CC9
-                None => self.tracker.plane_height(probe.x, probe.z),
-            };
-            // the plane's normal the branch used, `wheel+0x4C` (0x499D0F…0x499D12): the tracker's
-            // on the patch branch, `car+0x3E8` or `(0, 1, 0)` on the fallback
-            let n_i = if patch_h.is_some() { self.wheels[i].tracker.normal } else { self.tracker.fallback_normal() };
-            let (vel, acc, row0) = (self.velocity, self.accel_world, m.row(0));
-            let w = &mut self.wheels[i];
-            heights[i] = h_i;
-            contacts[i] = Vec3::new(probe.x, h_i, probe.z);
-            w.world_pos = Vec3::new(probe.x, h_i + self.ride_height, probe.z);
-            // compression (feeds the wheel render height only), and the wheel's stiffness: 1.0,
-            // or **1.25** when the compression is past twice its cap (0x499DD6…0x499DE7 front,
-            // 0x499E14…0x499E25 rear; `stiff[4]` at `[esp+0x9C]`, 1.0 each at 0x499A81)
-            // `c = (contact − probe)·M[1]`, and −0.1 when `M[1].y < 0.3` (0x499D78…0x499D90,
-            // `[0x5B25F0]` / `[0x5B2444]`)
-            let c = if up.y < 0.3 { -0.1 } else { (h_i - probe.y) * up.y };
-            let mut stiff = 1.0;
-            // 0x499D15: before game tick 2 (`[0x606AC4] < 2`) the block is skipped — the
-            // compression `wheel+0x68` and the render angle `wheel+0x70` are zeroed (0x499EE4…
-            // 0x499EE9) and the stiffness stays 1.0 — and so for a network car (`[0x657408]` and
-            // `car+0xDAC`, 0x499D22…0x499D34: `net_car`, a remote car in a positional race).
-            if self.game_tick < 2 || self.net_car {
-                w.compression = 0.0;
-            } else if c > 0.0 {
-                let cmax = if i < 2 { 0.9 } else { 0.75 } * (specs.bump_travel - specs.probe_offset);
-                if c > 2.0 * cmax {
-                    stiff = 1.25;
-                }
-                w.compression = c.min(cmax);
-            } else {
-                let c = c.max(-(if w.airborne { 1.65 } else { 1.6 }) * specs.bump_travel);
-                w.compression = 0.5 * (c + w.compression);
-            }
-            w.height_d = h_i - probe.y;
-            let d_i = w.height_d.max(-0.30625);
-            let v_y = s_sign * d_i * up.y;
-            if d_i < -0.2041667 {
-                w.airborne = true;
+        for (i, &body_pt) in probes.iter().enumerate() {
+            let s = self.wheel_probe(i, body_pt, &body, grid, specs);
+            heights[i] = s.height;
+            contacts[i] = s.contact;
+            susp_y[i] = s.susp_y;
+            if s.hangs {
                 n_air += 1;
-                // `.TINYCAR` keeps the whole of it (0x49A01B skips the ×0.8)
-                susp_y[i] = stiff * if self.tiny { v_y } else { v_y * 0.8 };
-            } else {
-                // **The lateral term** (0x49A050…0x49A1A7): with the velocity's `|x|` and `|z|`
-                // both over 0.01 (`[0x5B27A8]`, `test ah,0x41; jne` skips at ≤), `u = normalize(−vx,
-                // 0, −vz)`, `u' = (n_i × u) × n_i` (0x532880 twice — the ground-plane direction
-                // against the motion), `k = 0.0666667·|vel·M[0]|` (`[0x5B49EC]`) when the wheel
-                // hung last tick (`wheel+0x84` is read before 0x49A1AC clears it) or
-                // `0.0625·|car+0xD40·M[0]|` (`[0x5B26A4]`) — positive either way, the `fchs` at
-                // 0x49A11F / 0x49A163 takes the absolute value — and `(k·u')·M[1]` is added to
-                // `susp.y` **after** the stiffness (0x49A1DA `fadd st(1)`). Anything else leaves the
-                // 0.0 pushed at 0x499F60.
-                let mut lat = 0.0;
-                if vel.x.abs() > 0.01 && vel.z.abs() > 0.01 {
-                    let u = Vec3::new(-vel.x, 0.0, -vel.z).normalize();
-                    let u2 = n_i.cross(u).cross(n_i);
-                    let k = if w.airborne { 0.066_666_67 * vel.dot(row0).abs() } else { 0.0625 * acc.dot(row0).abs() };
-                    lat = (u2 * k).dot(up);
-                }
-                w.airborne = false;
-                susp_y[i] = stiff * v_y + lat;
             }
-            w.contact = !w.airborne;
         }
         let h = (heights[0] + heights[1] + heights[2] + heights[3]) * 0.25;
+        let n = self.susp_ground_normal(&contacts, &mut n_air);
+        self.susp_pitch_roll(specs, police, &body, &susp_y, n_air);
+        // body height above the contact plane: `BodyHeight` 0x49A900 on Susp_update's normal and
+        // `Σc/4` (0x49A8CF…0x49A8DD), over the body points (`Self::body_height_on`)
+        let centre = (contacts[0] + contacts[1] + contacts[2] + contacts[3]) * 0.25;
+        self.body_height_on(n, centre);
+        self.height_marker = if self.body_height > 0.05 { self.body_height } else { 0.0 };
+        h
+    }
+
+    /// One pass of `Susp_update`'s wheel loop (0x499AD4…0x49A1AC) for wheel `i` at body point
+    /// `body_pt`: the probe, the surface, the ground height, the compression and the suspension
+    /// vector's `y`.
+    fn wheel_probe(&mut self, i: usize, body_pt: Vec3, body: &SuspFrame, grid: &TriangleGrid, specs: &CarSpecs) -> WheelSample {
+        let SuspFrame { m, mt, up, s_sign } = *body;
+        // the world collision point `car+0x1DC + 12i` (0x49AE30: `pos + Σ p_k·M[k]`) of body
+        // point i, which 0x49ABC0 left as wheel i's ground reference (0x499AD4…0x499B13)
+        let world_pt = self.position + mt * body_pt;
+        let probe = world_pt + Vec3::new(0.0, specs.probe_offset * up.y, 0.0);
+        // the wheel's tracker (0x499B64 `updateZone(probe, 1)`); its zone word — 0 with no
+        // patch — is the wheel's surface `wheel+0x8C` on **both** branches (0x499B86…0x499BA7,
+        // `RALLY` turning nibbles 1 and 10 into 2)
+        self.wheels[i].tracker.update_zone(grid, probe);
+        let nibble = (self.wheels[i].tracker.word & 0xF) as usize;
+        let zone = if rally_reads_as_two(nibble, self.rally) { 2 } else { self.wheels[i].tracker.word & 0xFFFF };
+        self.wheels[i].zone = zone;
+        self.wheels[i].surface = (zone & 0xF) as usize;
+        // 0x494480: no surface nibble ⇒ 1; the patch plane more than 4 m from the body's
+        // `car+0x334` ⇒ 2 (0x4944CB…0x4944F0, `[0x5B2404]`); else 0, the patch branch
+        let patch_h = if nibble == 0 {
+            None
+        } else {
+            self.wheels[i].tracker.patch_height(probe.x, probe.z).filter(|h| (h - self.position.y).abs() <= 4.0)
+        };
+        let h_i = match patch_h {
+            Some(h) => {
+                // road roughness (0x499730), added on the patch branch only; its speed is
+                // `car+0x35C` ([`Self::speed_est`]) — history: `physics-history.md` §2.1
+                let mut h = h + self.roughness(i);
+                // the front wheels' wobble from suspension damage (0x499C8B…0x499CC1):
+                // `SuspDamage(car)·sin(6.28318·(0.5·i + wheel+0x88))·(1/1500)` — 0x493BC0,
+                // `[0x5B23F0]` 0.5, `[0x5B4A08]` 6.28318, the double `[0x5B4A00]` 1/1500
+                if i < 2 {
+                    // the original's constant is 6.28318, not TAU
+                    #[allow(clippy::approx_constant)]
+                    let arg = (0.5 * i as f32 + self.wheels[i].rotation) * 6.283_18;
+                    // PORT-DEVIATION D1 (RE/notes/PORT-DEVIATIONS.md): portable sin, not std; original inline x87 `fsin` at 0x499CB3.
+                    h += self.suspension_wear(specs) * nfs_math::portable::sinf(arg) * (1.0 / 1500.0);
+                }
+                h
+            }
+            // no usable patch: the kept plane `car+0x3E8` / `car+0x400` (0x499BC4…0x499C2E),
+            // with no roughness — the branch jumps straight to the sum at 0x499CC9
+            None => self.tracker.plane_height(probe.x, probe.z),
+        };
+        // the plane's normal the branch used, `wheel+0x4C` (0x499D0F…0x499D12): the tracker's
+        // on the patch branch, `car+0x3E8` or `(0, 1, 0)` on the fallback
+        let n_i = if patch_h.is_some() { self.wheels[i].tracker.normal } else { self.tracker.fallback_normal() };
+        let (vel, acc, row0) = (self.velocity, self.accel_world, m.row(0));
+        let w = &mut self.wheels[i];
+        let contact = Vec3::new(probe.x, h_i, probe.z);
+        w.world_pos = Vec3::new(probe.x, h_i + self.ride_height, probe.z);
+        // compression (feeds the wheel render height only), and the wheel's stiffness: 1.0,
+        // or **1.25** when the compression is past twice its cap (0x499DD6…0x499DE7 front,
+        // 0x499E14…0x499E25 rear; `stiff[4]` at `[esp+0x9C]`, 1.0 each at 0x499A81)
+        // `c = (contact − probe)·M[1]`, and −0.1 when `M[1].y < 0.3` (0x499D78…0x499D90,
+        // `[0x5B25F0]` / `[0x5B2444]`)
+        let c = if up.y < 0.3 { -0.1 } else { (h_i - probe.y) * up.y };
+        let mut stiff = 1.0;
+        // 0x499D15: before game tick 2 (`[0x606AC4] < 2`) the block is skipped — the
+        // compression `wheel+0x68` and the render angle `wheel+0x70` are zeroed (0x499EE4…
+        // 0x499EE9) and the stiffness stays 1.0 — and so for a network car (`[0x657408]` and
+        // `car+0xDAC`, 0x499D22…0x499D34: `net_car`, a remote car in a positional race).
+        if self.game_tick < 2 || self.net_car {
+            w.compression = 0.0;
+        } else if c > 0.0 {
+            let cmax = if i < 2 { 0.9 } else { 0.75 } * (specs.bump_travel - specs.probe_offset);
+            if c > 2.0 * cmax {
+                stiff = 1.25;
+            }
+            w.compression = c.min(cmax);
+        } else {
+            let c = c.max(-(if w.airborne { 1.65 } else { 1.6 }) * specs.bump_travel);
+            w.compression = 0.5 * (c + w.compression);
+        }
+        w.height_d = h_i - probe.y;
+        let d_i = w.height_d.max(-0.30625);
+        let v_y = s_sign * d_i * up.y;
+        let susp_y;
+        let hangs;
+        if d_i < -0.2041667 {
+            w.airborne = true;
+            hangs = true;
+            // `.TINYCAR` keeps the whole of it (0x49A01B skips the ×0.8)
+            susp_y = stiff * if self.tiny { v_y } else { v_y * 0.8 };
+        } else {
+            // **The lateral term** (0x49A050…0x49A1A7): with the velocity's `|x|` and `|z|`
+            // both over 0.01 (`[0x5B27A8]`, `test ah,0x41; jne` skips at ≤), `u = normalize(−vx,
+            // 0, −vz)`, `u' = (n_i × u) × n_i` (0x532880 twice — the ground-plane direction
+            // against the motion), `k = 0.0666667·|vel·M[0]|` (`[0x5B49EC]`) when the wheel
+            // hung last tick (`wheel+0x84` is read before 0x49A1AC clears it) or
+            // `0.0625·|car+0xD40·M[0]|` (`[0x5B26A4]`) — positive either way, the `fchs` at
+            // 0x49A11F / 0x49A163 takes the absolute value — and `(k·u')·M[1]` is added to
+            // `susp.y` **after** the stiffness (0x49A1DA `fadd st(1)`). Anything else leaves the
+            // 0.0 pushed at 0x499F60.
+            let mut lat = 0.0;
+            if vel.x.abs() > 0.01 && vel.z.abs() > 0.01 {
+                let u = Vec3::new(-vel.x, 0.0, -vel.z).normalize();
+                let u2 = n_i.cross(u).cross(n_i);
+                let k = if w.airborne { 0.066_666_67 * vel.dot(row0).abs() } else { 0.0625 * acc.dot(row0).abs() };
+                lat = (u2 * k).dot(up);
+            }
+            w.airborne = false;
+            hangs = false;
+            susp_y = stiff * v_y + lat;
+        }
+        w.contact = !w.airborne;
+        WheelSample { height: h_i, contact, susp_y, hangs }
+    }
+
+    /// `Susp_update` 0x49A36C…0x49A3CF and 0x49A8AA…0x49A8C0: the ground normal from the four contact points into
+    /// [`Self::ground_normal`], `nAir = 4` for a steep one, and `car+0x418`.
+    fn susp_ground_normal(&mut self, contacts: &[Vec3; 4], n_air: &mut i32) -> Vec3 {
         // ground normal from the contact points
         let f = ((contacts[0] + contacts[1]) - (contacts[2] + contacts[3])) * 0.5;
         let r = ((contacts[1] + contacts[3]) - (contacts[0] + contacts[2])) * 0.5;
@@ -547,7 +578,7 @@ impl Vehicle {
         // 0x49A36C…0x49A3CF: `*normalOut` gets `N`, negated when `N.y < 0`, but the `N.y < 0.5`
         // test that sets `nAir = 4` reads the stack copy **before** the negation (`[esp+0x30]`),
         // so a normal that pointed down (a car on its roof) always counts as all four wheels
-        // hanging. *(Corrected 2026-09-26: the port tested the negated normal.)*
+        // hanging (history: `physics-history.md` §2.2).
         let steep = n.y < 0.5;
         if n.y < 0.0 {
             n = -n;
@@ -555,11 +586,18 @@ impl Vehicle {
         if n.length_squared() < 0.5 {
             n = Vec3::Y;
         } else if steep {
-            n_air = 4;
+            *n_air = 4;
         }
         self.ground_normal = n;
         // 0x49A8AA…0x49A8C0: `word car+0x418 = nAir > 1` (after `nAir = 4` for a steep normal)
-        self.airborne_count = u16::from(n_air > 1);
+        self.airborne_count = u16::from(*n_air > 1);
+        n
+    }
+
+    /// `Susp_update` …0x49A8A4: the pitch / roll rate kinematics from the suspension
+    /// vectors' `y`, the dive / roll filters `car+0xDC4` / `+0xDC8`, and the two-wheel shift.
+    fn susp_pitch_roll(&mut self, specs: &CarSpecs, police: bool, body: &SuspFrame, susp_y: &[f32; 4], n_air: i32) {
+        let SuspFrame { m, mt, .. } = *body;
         // pitch / roll rate kinematics
         if self.cos_tilt < 0.707 {
             self.dive *= 0.5;
@@ -574,7 +612,7 @@ impl Vehicle {
             // A cop (`car+0x52C & 0x20`, 0x49A4CD) clamps `aL` to ±10 (`[0x5B241C]`, `[0x5B49E8]`)
             // and takes 0.125 either way (0x49A4D6…0x49A51A); `.TINYCAR` the gain unfiltered;
             // anyone else 0.125 accelerating, 0.175 braking (0x49A540…0x49A57F), plus 0.8 of the
-            // old value (0x49A585). *(Corrected 2026-09-26: the port had no police arm.)*
+            // old value (0x49A585). History: `physics-history.md` §2.3.
             // a network car (`car+0xDAC`, 0x49A4AB…0x49A4C8) holds `car+0xDC4` at 0 and skips the filter
             self.dive = if self.net_car {
                 0.0
@@ -597,9 +635,8 @@ impl Vehicle {
             };
             // the roll target is scaled by `1 − car+0xD7F · [0x5B49E0]` (1/1275, `0x3A4D9A67`): the
             // throttle **byte** as 0x49DD20 left it (0x49A671 `mov al, [esi+0xD7F]` / `fild`),
-            // 0…254, so full throttle leaves 0.8 of it (0x49A671…0x49A693). *(Corrected
-            // 2026-09-26: the port took the pedal float `[0x628FB0]` · 254, which is 254 at a
-            // byte of 252 and follows the automatic's reverse swap of the floats.)*
+            // 0…254, so full throttle leaves 0.8 of it (0x49A671…0x49A693). History:
+            // `physics-history.md` §2.4.
             let thr = self.throttle_byte as f32 * f32::from_bits(0x3A4D_9A67);
             let rr = sign_clamp(r_in + (1.0 - thr) * self.roll_lp, specs.roll_clamp);
             // `fld specs[0x114]; fmul [car+0xD64]; fmul [0x5B49DC]` (0.925), then `+ p`, in that
@@ -627,12 +664,6 @@ impl Vehicle {
                 self.position += mt * v * (1.0 / 32.0);
             }
         }
-        // body height above the contact plane: `BodyHeight` 0x49A900 on Susp_update's normal and
-        // `Σc/4` (0x49A8CF…0x49A8DD), over the body points (`Self::body_height_on`)
-        let centre = (contacts[0] + contacts[1] + contacts[2] + contacts[3]) * 0.25;
-        self.body_height_on(n, centre);
-        self.height_marker = if self.body_height > 0.05 { self.body_height } else { 0.0 };
-        h
     }
 
     /// `Car_ground` 0x49BD40 after its `Susp_update` call, `h` that call's height, `rate_hz` /
@@ -680,4 +711,23 @@ impl Vehicle {
         self.frame = Mat3::from_cols(x, n, z).transpose();
         self.car_ground_body(dh, tn, tq, surf, specs.mass, Some((specs.probe_offset, specs.bump_travel)), grid, n_ticks, racer);
     }
+}
+
+/// `Susp_update`'s body frame for one call: the orientation `M` (rows = body axes in world
+/// space), its transpose, `M[1]` and the sign of `cosTilt`.
+#[derive(Clone, Copy)]
+struct SuspFrame {
+    m: Mat3,
+    mt: Mat3,
+    up: Vec3,
+    s_sign: f32,
+}
+
+/// What one wheel's pass of `Susp_update` hands back: its ground height, its contact point, its
+/// suspension vector's `y`, and whether it hangs (counted into `nAir`).
+struct WheelSample {
+    height: f32,
+    contact: Vec3,
+    susp_y: f32,
+    hangs: bool,
 }

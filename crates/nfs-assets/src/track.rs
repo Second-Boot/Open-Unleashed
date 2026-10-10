@@ -4,6 +4,7 @@
 
 use crate::{fmt_err, read, read_pack, texture::{decode_pack, decode_pack_mipped, TextureImage}, AssetError, GamePaths};
 use crate::mesh::{article_parts, MaterialMesh};
+use nfs_formats::bytes::{get_u32, read_i32, read_u32};
 use nfs_formats::{crp::{layer_class, tags, Crp, Material}, edg::EdgeFile, ini::Ini, scn::Scene};
 use std::path::PathBuf;
 
@@ -65,7 +66,7 @@ fn rmth_records<'a>(crp: &'a Crp, data: &'a [u8]) -> impl Iterator<Item = &'a [u
 /// by the method's name.
 fn methods_with_class(crp: &Crp, data: &[u8], class: impl Fn(u32) -> bool) -> std::collections::HashSet<String> {
     rmth_records(crp, data)
-        .filter(|bytes| bytes.len() > 16 && bytes[16..].chunks_exact(4).any(|w| class(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))))
+        .filter(|bytes| bytes.len() > 16 && bytes[16..].chunks_exact(4).any(|w| class(read_u32(w, 0))))
         .map(|bytes| bytes[..16].iter().take_while(|b| **b != 0).map(|b| *b as char).collect())
         .collect()
 }
@@ -102,7 +103,7 @@ pub fn ambient_colours(crp: &Crp, data: &[u8]) -> std::collections::HashMap<u16,
             // pass masks are only ever set on later passes; the `Am` op sits in pass 1 (mask 0)
             let op = method.built_ops(0, m.op_mask).find(|o| matches!(o.class, layer_class::AMBIENT | layer_class::VERTEX_LIGHT_AMBIENT))?;
             let b = method.block(op.key)?;
-            Some((i as u16, u32::from_le_bytes(b.get(..4)?.try_into().ok()?)))
+            Some((i as u16, get_u32(b, 0)?))
         })
         .collect()
 }
@@ -138,7 +139,7 @@ pub fn uv_animate(methods: &[nfs_formats::crp::RenderMethod], m: &Material) -> O
     if b.len() < 8 {
         return None;
     }
-    Some(UvAnimate { mode: u32::from_le_bytes(b[0..4].try_into().ok()?), rate: i32::from_le_bytes(b[4..8].try_into().ok()?) })
+    Some(UvAnimate { mode: read_u32(b, 0), rate: read_i32(b, 4) })
 }
 
 /// The `Rs` block a material's first pass applies — Thrash states **6, 0x0A, 0x38, 2, 0x18** and a
@@ -157,7 +158,7 @@ pub fn render_states(methods: &[nfs_formats::crp::RenderMethod], m: &Material) -
     let op = method.built_ops(0, m.op_mask).find(|o| o.class == layer_class::STATE)?;
     let own = m.blocks.iter().find(|(k, _)| method.resolve(*k) == Some(op.key)).map(|(_, b)| b.as_slice());
     let b = own.or_else(|| method.block(op.key))?;
-    (b.len() >= 24).then(|| std::array::from_fn(|k| i32::from_le_bytes([b[4 * k], b[4 * k + 1], b[4 * k + 2], b[4 * k + 3]])))
+    (b.len() >= 24).then(|| std::array::from_fn(|k| read_i32(b, 4 * k)))
 }
 
 /// The render methods that build `Headlights::LayerUVLight` — the serialised class code **0x8004**
@@ -175,18 +176,18 @@ pub fn night_map(paths: &crate::GamePaths) -> Option<Vec<u8>> {
     if d.get(0..4)? != b"SHPP" {
         return None;
     }
-    let count = u32::from_le_bytes(d.get(8..12)?.try_into().ok()?) as usize;
+    let count = get_u32(&d, 8)? as usize;
     (0..count).find_map(|i| {
         let e = 16 + 8 * i;
         (d.get(e..e + 4)? == b"nght").then_some(())?;
-        let off = u32::from_le_bytes(d.get(e + 4..e + 8)?.try_into().ok()?) as usize;
+        let off = get_u32(&d, e + 4)? as usize;
         d.get(off + 0x10..off + 0x10 + 128 * 128).map(<[u8]>::to_vec)
     })
 }
 
 /// Does this CRP's `RMth` table build a headlight layer?
 pub fn uses_headlight_layers(crp: &Crp, data: &[u8]) -> bool {
-    rmth_records(crp, data).any(|bytes| bytes.chunks_exact(4).any(|w| HEADLIGHT_LAYERS.contains(&u32::from_le_bytes([w[0], w[1], w[2], w[3]]))))
+    rmth_records(crp, data).any(|bytes| bytes.chunks_exact(4).any(|w| HEADLIGHT_LAYERS.contains(&read_u32(w, 0))))
 }
 
 impl TrackGeometry {
@@ -659,7 +660,7 @@ mod headlight_tests {
     #[test]
     fn rmth_scans_match_the_separate_reference_scans() {
         let Ok(paths) = crate::GamePaths::locate() else { return };
-        let words = |bytes: &[u8]| -> Vec<u32> { bytes.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect() };
+        let words = |bytes: &[u8]| -> Vec<u32> { bytes.chunks_exact(4).map(|w| read_u32(w, 0)).collect() };
         let reference = |t: &TrackAssets, pred: &dyn Fn(u32) -> bool| -> std::collections::HashSet<String> {
             t.crp
                 .level

@@ -158,8 +158,8 @@ impl Grid {
             .spread(start, &hull)
             .into_iter()
             .map(|n| {
-                let (ncx, ncz, nr) = tree.circle(n);
-                (n.id, ncx, ncz, nr)
+                let (cx, cz, r) = tree.circle(n);
+                crate::world::RegisteredNode { id: n.id, cx, cz, r }
             })
             .collect();
         out.push(Cell { node: node.id, cx, cy: 0.0, cz, r, nodes });

@@ -40,8 +40,7 @@ pub fn scrollbar_region(x: f32, y: f32, h: f32, rows: usize, first: usize, px: f
 /// with `[+0xF4]` the knob's resting top, `y + 13` (0x4DAF30 / 0x4DB016). The divisor is the
 /// **count**, not `count − 1` — this is not `NFS5.VerticalSlider`'s placement (0x4D0BBE, §4.46),
 /// so the knob never quite reaches the down arrow. The drag, 0x4DB9B0, is its exact inverse
-/// (`App::fe_apply_combo_drag`). *(Until 2026-09-30 the port placed this knob with the list box's
-/// `count − 1` in floats.)*
+/// (`App::fe_apply_combo_drag`). (history: `game-history.md` §31.1)
 pub fn combo_knob(y: f32, h: f32, count: usize, first: usize) -> (f32, f32, i32) {
     const ARROW_H: i32 = COMBO_ARROW_H as i32;
     let (h, count) = (h as i32, count as i32);

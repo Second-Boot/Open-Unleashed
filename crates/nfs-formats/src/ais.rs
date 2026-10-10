@@ -53,7 +53,41 @@ impl RacingLine {
         if !body.len().is_multiple_of(8) {
             return Err(FormatError::SizeMismatch { what: ".lsp points", declared: 8, actual: body.len() % 8 });
         }
-        let points = body.chunks_exact(8).map(|c| [f32::from_le_bytes([c[0], c[1], c[2], c[3]]), f32::from_le_bytes([c[4], c[5], c[6], c[7]])]).collect();
+        let points = body.chunks_exact(8).map(|c| [crate::bytes::read_f32(c, 0), crate::bytes::read_f32(c, 4)]).collect();
         Ok(Self { header, points })
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fnv(s: &str) -> u64 {
+        s.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
+    }
+
+    /// Characterisation guard for the byte readers: a synthetic 304-byte record and a racing line,
+    /// the whole parse output pinned by a hash, plus the failure texts.
+    #[test]
+    fn parse_output_is_pinned() {
+        let mut d = vec![0u8; AIS_SIZE];
+        d[..7].copy_from_slice(b"porsche");
+        for i in 0..68 {
+            d[32 + i * 4..36 + i * 4].copy_from_slice(&(i as f32 * 1.25 - 3.0).to_le_bytes());
+        }
+        assert_eq!(fnv(&format!("{:?}", AiCarData::parse(&d).unwrap())), PIN_AIS);
+        assert!(matches!(AiCarData::parse(&d[..300]), Err(FormatError::Truncated { what: ".ais", offset: 300, needed: 4 })));
+
+        let mut l = 1u32.to_le_bytes().to_vec();
+        for i in 0..5 {
+            l.extend((i as f32 * 0.5).to_le_bytes());
+            l.extend((-(i as f32) * 7.25).to_le_bytes());
+        }
+        assert_eq!(fnv(&format!("{:?}", RacingLine::parse(&l).unwrap())), PIN_LSP);
+        assert!(matches!(RacingLine::parse(&l[..3]), Err(FormatError::Truncated { what: ".lsp header", offset: 0, needed: 4 })));
+        assert!(matches!(RacingLine::parse(&l[..8]), Err(FormatError::SizeMismatch { what: ".lsp points", declared: 8, actual: 4 })));
+    }
+
+    const PIN_AIS: u64 = 16739403588534398335;
+    const PIN_LSP: u64 = 1050907368300943273;
 }

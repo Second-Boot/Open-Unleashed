@@ -15,6 +15,7 @@
 //! here: [`AccessorBlock`] parses and writes it, and a *subset* is legal because the original looks
 //! every name up in its own registry and anything absent keeps its default (§9.6).
 
+use crate::bytes::{get_u16, get_u32, Cursor};
 use crate::FormatError;
 
 const WHAT: &str = "sav";
@@ -53,7 +54,7 @@ pub struct KnockoutState {
 
 impl KnockoutState {
     pub fn parse(b: &[u8]) -> Self {
-        let u32at = |o: usize| b.get(o..o + 4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]])).unwrap_or(0);
+        let u32at = |o: usize| get_u32(b, o).unwrap_or(0);
         let i32at = |o: usize| u32at(o) as i32;
         let mut s = Self { active: b.first().copied().unwrap_or(0) != 0, race_index: i32at(4), opponents: i32at(8), ..Default::default() };
         for (i, a) in s.alive.iter_mut().enumerate() {
@@ -90,47 +91,9 @@ impl KnockoutState {
     }
 }
 
-fn err(offset: usize, needed: usize) -> FormatError {
-    FormatError::Truncated { what: "sav", offset, needed }
-}
-
-struct Reader<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], FormatError> {
-        let b = self.data.get(self.pos..self.pos + n).ok_or_else(|| err(self.pos, n))?;
-        self.pos += n;
-        Ok(b)
-    }
-    fn u32(&mut self) -> Result<u32, FormatError> {
-        let b = self.take(4)?;
-        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-    }
-    fn i32(&mut self) -> Result<i32, FormatError> {
-        Ok(self.u32()? as i32)
-    }
-    fn f32(&mut self) -> Result<f32, FormatError> {
-        Ok(f32::from_bits(self.u32()?))
-    }
-    fn u16(&mut self) -> Result<u16, FormatError> {
-        let b = self.take(2)?;
-        Ok(u16::from_le_bytes([b[0], b[1]]))
-    }
-    fn u8(&mut self) -> Result<u8, FormatError> {
-        Ok(self.take(1)?[0])
-    }
-    /// A NUL-terminated string, as every name and both player names are stored.
-    fn cstr(&mut self) -> Result<String, FormatError> {
-        let rest = &self.data[self.pos.min(self.data.len())..];
-        let end = rest.iter().position(|&b| b == 0).ok_or_else(|| err(self.pos, 1))?;
-        let s: String = rest[..end].iter().map(|&b| b as char).collect();
-        self.pos += end + 1;
-        Ok(s)
-    }
-}
+/// The sequential reader every block parser here uses: the shared [`Cursor`], whose errors are
+/// `Truncated { what: "sav", offset: pos, needed }` exactly as this module's own reader reported.
+type Reader<'a> = Cursor<'a>;
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -193,7 +156,7 @@ impl SavedCar {
 
     /// Read a dword of the FE car image (`car+0x68C` … `car+0x6A4`, `career.md` §10).
     pub fn field_u32(&self, off: usize) -> u32 {
-        self.image.get(off..off + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0)
+        get_u32(&self.image, off).unwrap_or(0)
     }
     pub fn set_field_u32(&mut self, off: usize, v: u32) {
         if self.image.len() < off + 4 {
@@ -212,7 +175,7 @@ impl SavedCar {
     }
     /// `nfs5.car` record id, the record's first word at `car+0x04` (0x4EEBDA).
     pub fn car_id(&self) -> u16 {
-        self.image.get(4..6).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(0)
+        get_u16(&self.image, 4).unwrap_or(0)
     }
 }
 
@@ -358,9 +321,9 @@ pub struct SaveFile {
 
 impl SaveFile {
     pub fn parse(data: &[u8]) -> Result<Self, FormatError> {
-        let mut r = Reader { data, pos: 0 };
+        let mut r = Reader::new(data, "sav");
         let mut out = Self::default();
-        while r.pos < data.len() {
+        while r.pos() < data.len() {
             let name = r.cstr()?;
             out.order.push(name.clone());
             match name.as_str() {
@@ -399,7 +362,7 @@ impl SaveFile {
                 _ => {
                     return Err(FormatError::UnexpectedValue {
                         what: "sav",
-                        offset: r.pos,
+                        offset: r.pos(),
                         expected: format!("one of {MODULE_ORDER:?} or \"accessor\""),
                         found: name,
                     });
@@ -834,12 +797,12 @@ pub struct AccessorBlock {
 
 impl AccessorBlock {
     pub fn parse(data: &[u8]) -> Result<Self, FormatError> {
-        let mut r = Reader { data, pos: 0 };
+        let mut r = Reader::new(data, "sav");
         let mut entries = Vec::new();
-        while r.pos < data.len() {
+        while r.pos() < data.len() {
             let name = r.cstr()?;
             let Some(kind) = accessor_kind(&name) else {
-                return Err(FormatError::UnexpectedValue { what: "sav accessors", offset: r.pos, expected: "a registered accessor name".into(), found: name });
+                return Err(FormatError::UnexpectedValue { what: "sav accessors", offset: r.pos(), expected: "a registered accessor name".into(), found: name });
             };
             let value = match kind {
                 AccessorKind::Dword => AccessorValue::Dword(r.u32()?),

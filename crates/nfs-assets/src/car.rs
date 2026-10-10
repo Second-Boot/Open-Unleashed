@@ -1,6 +1,7 @@
 //! Car asset bundle: model CRP, day/night texture packs, texture-page layout, simulation data.
 
 use crate::{fmt_err, read, read_pack, texture::{decode_pack, TextureImage}, AssetError, GamePaths};
+use nfs_formats::bytes::get_u32;
 use nfs_formats::{crp::Crp, fsh::Fsh, ini::Ini, refpack, sim::CarSim};
 use std::path::{Path, PathBuf};
 
@@ -1027,7 +1028,7 @@ fn palette_path_texels(palette: &[[u8; 4]; 255], indices: &[u8], tints: &[[u8; 3
 fn clut_block(data: &[u8], entry: usize) -> Option<usize> {
     let mut at = entry;
     loop {
-        let d = u32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?);
+        let d = get_u32(data, at)?;
         if matches!(d & 0xFF, 0x22 | 0x24 | 0x23 | 0x29 | 0x2A | 0x2C | 0x2D | 0x2E) {
             return Some(at);
         }
@@ -1275,7 +1276,7 @@ pub fn blend_patch(page: &mut TexturePage, patch: &DamagePatch, damage: f32) {
                 continue;
             }
             // 0x53FEF0: the source dword (`A R G B`, the 0x2A palette's order) scaled byte by byte
-            let lut = |c: u8| ((c as u32 * level) >> 8) as u32;
+            let lut = |c: u8| (c as u32 * level) >> 8;
             let px = lut(src[s + 3]) << 24 | lut(src[s]) << 16 | lut(src[s + 1]) << 8 | lut(src[s + 2]);
             match page.bpp {
                 page_bpp::ARGB1555 => blend_1555(&mut page.rgba[d..d + 4], px),
@@ -1367,7 +1368,7 @@ mod damage_blend_tests {
     fn blend_32_formula() {
         let mut d = [100u8, 200, 50, 7];
         blend_32(&mut d, 0x00_00_00_00);
-        assert_eq!(d, [(100 * 255 >> 8) as u8, (200 * 255 >> 8) as u8, (50 * 255 >> 8) as u8, 0xFF]);
+        assert_eq!(d, [((100 * 255) >> 8) as u8, ((200 * 255) >> 8) as u8, ((50 * 255) >> 8) as u8, 0xFF]);
     }
 }
 

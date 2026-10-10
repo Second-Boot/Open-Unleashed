@@ -13,9 +13,7 @@
 //! The consumers read the array during the tick pair that follows, i.e. the order the previous
 //! even tick's progress values gave: the racing AI's "two entries after my own" (0x40C2CC), the
 //! lane pass's walk outward from `car+0x528` (0x401FA2…0x401FD3), the purgatory dtor's lead pick
-//! (0x40E00F). *(Until 2026-09-26 the port's consumers each sorted a fresh list on the values of
-//! the current tick, with ties in registration order — approximation, `ai.md` §11, `traffic.md`
-//! §34.11.)*
+//! (0x40E00F). (history: `game-history.md` §7.1)
 //!
 //! The second array `0x5E8BAC[]` (the same sort on `car+0xAF8` alone, with the swap records
 //! `+0x550` / `+0x554`) is [`crate::traffic::TrafficSet::overtakes`].

@@ -1,6 +1,7 @@
 //! Network play on the application side: the lobby callbacks, the lock-step exchange, the race-start sync and the net state types.
 
 use crate::*;
+use nfs_physics::vehicle::RaceState;
 
 impl App {
     /// **`HInfo`'s tick 0x427C70** for a network race (`[0x6573E8] == 3`; the HUD tick 0x425950 calls it at
@@ -180,11 +181,11 @@ impl App {
             o.vehicle.tiny = o.tiny;
             o.vehicle.derby = flags.1;
             o.vehicle.race_state = if o.eliminated {
-                3
+                RaceState::Out
             } else if o.progress.finished {
-                2
+                RaceState::Finished
             } else {
-                0
+                RaceState::Racing
             };
             o.vehicle.draft = nfs_physics::vehicle::draft_factor(o.vehicle.position, o.vehicle.forward(), o.vehicle.v_long(), &others);
             o.vehicle.misfire_roll = nfs_game::rng::rand01();
@@ -949,29 +950,16 @@ impl App {
             self.derby_hud_laps = None;
             return track;
         };
-        self.backwards = r.backwards;
-        self.mirror = r.mirror;
-        self.num_laps = r.laps.max(1);
         // a Smash Up has no laps: the knockout arm ends every path of 0x416310 before the lap code
         // (0x4164C0), so no car ever counts one (`car+0xB20` stays 0) and none ends the race. The
-        // port's lap tracking is kept from ending it by a count no race reaches (99), and the
-        // HUD's lap counter — which the original still draws, `1/NUM_LAPS`, 0x432F92 with
+        // port's lap tracking is kept from ending it by a count no race reaches (99, `RaceSetup::net`),
+        // and the HUD's lap counter — which the original still draws, `1/NUM_LAPS`, 0x432F92 with
         // `[0x657494]` clear — reads the launch's real count from `derby_hud_laps`.
         self.derby_hud_laps = r.derby.then_some(r.laps.max(1));
-        if r.derby {
-            self.num_laps = 99;
-        }
-        self.road.damage_on = r.damage;
-        self.race_skill = r.skill;
-        // 0x4ECF00: no cops, `nOpp` 0 in a network game; the humans are the room's players
-        // (0x4B5079's `NUMPLAYERRACECARS = ebx`), one of which is this machine
-        self.road.cops_race = false;
-        self.road.cops_enabled = false;
-        self.road.traffic_count = r.traffic_cars;
-        self.road.traffic_ids = None;
         self.road.traffic_colours.clear();
         // **the traffic cars' records** (0x4B4B80 wrote the host's `.FILENAME` / `.COLOUR` per
         // slot): the model each is, by file name, and the colour where it is not the model's own
+        let mut traffic_ids = None;
         if !r.traffic.is_empty() {
             let catalog = self.fe_car_catalog();
             let (mut ids, mut colours) = (Vec::new(), Vec::new());
@@ -988,14 +976,20 @@ impl App {
             let own: Vec<String> = self.net_traffic_cars(r.track.as_deref().unwrap_or(&track), r.traffic.len() as u32, &mut || 0).into_iter().map(|c| c.model).collect();
             tracing::info!(target: "netplay", traffic = ?r.traffic.iter().map(|c| (c.model.as_str(), format!("{:08X}", c.colour))).collect::<Vec<_>>(), own_table_says = ?own, "network race: the traffic cars of the host's records");
             if !ids.is_empty() {
-                self.road.traffic_ids = Some(ids);
+                traffic_ids = Some(ids);
                 self.road.traffic_colours = colours;
             }
         }
         if r.opponents != 0 {
             tracing::warn!(target: "netplay", opponents = r.opponents, "the stream carries NUMOPPONENTRACECARS != 0: the original numbers opponent slots after the players (0x4B5081); this port has no AI opponent in a network race");
         }
-        self.num_opponents = r.players.saturating_sub(1);
+        // the host's direction, laps, damage, skill and traffic; 0x4ECF00: no cops, `nOpp` 0 in a
+        // network game; the humans are the room's players (0x4B5079's `NUMPLAYERRACECARS = ebx`),
+        // one of which is this machine; the drawn `.STARTINGPOS` is `Grid_slot`'s `g` as it stands
+        // (the values are 0…n−1, so the 0 sits one row ahead of the pole `g = 1`, the original's own
+        // arithmetic); `grid_pos` is `g − 1` (`u32::MAX` for 0, which `grid_slot` reads back as `g = 0`)
+        let rs = RaceSetup::net(&NetRaceOptions::from(&r), traffic_ids, self.race_setup());
+        self.apply_race_setup(rs);
         // the camera reads `car[0].camera` (`[0x658294]`, slot 0 — 0x465A60 is called with 0 by
         // 0x415AF2, 0x462F30 / 0x465790 with the camera slot): in a network race the table is by
         // **race index**, so that is the list of whoever holds index 0 — the host, in list order —
@@ -1004,10 +998,6 @@ impl App {
         if let Some(list) = r.camera0.as_ref().filter(|l| !l.is_empty()) {
             self.camera_cycle = list.iter().map(|&v| v as u16).collect();
         }
-        // the drawn `.STARTINGPOS` is `Grid_slot`'s `g` as it stands (the values are 0…n−1, so the
-        // 0 sits one row ahead of the pole `g = 1`, the original's own arithmetic); `grid_pos` is
-        // `g − 1` (`u32::MAX` for 0, which `grid_slot` reads back as `g = 0`)
-        self.player_grid_override = r.grid;
         self.net_seat_grids = r.seat_grids.clone();
         self.net_seat_cars = r.seat_cars.clone();
         self.net_own_words = r.own_words.clone();

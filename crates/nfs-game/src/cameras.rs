@@ -454,9 +454,7 @@ impl CameraTrigger {
     /// rest), each skipped when its vector is exactly zero, and the speed window
     /// `car+0x35C + 0.1 > +0x90 && +0x94 + 0.1 > car+0x35C` (0x47066B…0x47069D).
     ///
-    /// *(Until 2026-09-26 the port tested the car centre's path over the tick against the trigger
-    /// position's height and ran no gate: every shipped camera trigger carries a `+0xBC`, so a car
-    /// driving the wrong way — a backwards race on the forward cameras — switched them too.)*
+    /// (history: `game-history.md` §16.1)
     pub fn test(&self, car: &crate::skill::TriggerCar) -> bool {
         let fired = match self.shape {
             0 => (car.position - self.position).length() < self.radius,
@@ -587,7 +585,7 @@ mod tests {
     fn the_link_is_an_element_index() {
         // alps_cameras.scn: c1, its trigger (link 0), c2, its trigger (link 2) — 0x46D980 indexes
         // the element list, so link 2 is c2, the second camera, not the third
-        let two = SAMPLE.replace("Replay Camera Trigger\n", "Replay Camera Trigger\n")
+        let two = SAMPLE.to_string()
             + &SAMPLE.replace("c1\n", "c2\n").replace("-1 -1 -1 -1 0 -1", "-1 -1 -1 -1 2 -1").replace("1 1 12 0 2", "1 1 11 0 2");
         let c = TrackCameras::from_scene(&Scene::parse(&two).unwrap());
         assert_eq!(c.triggers[1].link, 2);

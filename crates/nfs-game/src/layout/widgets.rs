@@ -95,7 +95,7 @@ impl LayoutScreen {
         // 41 of the 42 shipped bars carry `hasshadow=1` and the template's own value
         // is 1, so all but the one with an empty value throw a shadow (§4.79)
         let shade = (self.attr_num(e, "hasshadow").unwrap_or(0.0) != 0.0).then_some(going_left);
-        self.gouraud_bar(out, aspect, x, y, w, h, lo, hi, &at, shade);
+        self.gouraud_bar(out, aspect, FeRect::new(x, y, w, h), lo, hi, &at, shade);
     }
 }
 
@@ -217,7 +217,7 @@ impl LayoutScreen {
     }
 
     pub(super) fn draw_combo(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>, overlay: &mut Vec<Sprite>) {
-        let WidgetDraw { i, e, x, y, w, h, aspect, strings, selected, hovered, accessor, .. } = d;
+        let WidgetDraw { i, e, x, y, w, h, aspect, selected, hovered, .. } = d;
         self.glinty_box(out, aspect, e, i, x, y, selected, hovered, tint);
         // The combo's own bevel, 0x4C69DF — the last call site of 0x521050 whose
         // arguments were not all read (§4.58, §4.68). Its gate is four tests at
@@ -229,13 +229,11 @@ impl LayoutScreen {
         // (0x4C69BE) and `h` the two rects' heights together (0x4C6998, 0x4C69A5),
         // which is `data.height` plus the selection box's height — the rows' height slot 1 sets
         // every tick (0x4C57D5 → 0x4E2C20), **0 while the combo holds no focus** (0x4C53C4) and
-        // the clamped rows' height while its list is open (`drop_down_rect`). *(Corrected
-        // 2026-09-27: this added `data.selectionboxmaxheight` always, on §4.44's "nothing sets
-        // the height". The gate's first test, 0x4C6947, is the list-box byte, not "open".)*
+        // the clamped rows' height while its list is open (`drop_down_rect`). (history: `game-history.md` §22.1)
         // Thickness **3**.
         if self.pressed_on(i, hovered) {
             let open_h = if self.open_combo == Some(i) { self.drop_down_rect(e, i, x, y).map_or(0.0, |r| r.3) } else { 0.0 };
-            self.bevel(out, aspect, x, y + h, w, h + open_h, 3.0);
+            self.bevel(out, aspect, FeRect::new(x, y + h, w, h + open_h), 3.0);
         }
         let state = self.state_for(e, i, selected, hovered);
         if self.open_combo == Some(i) {
@@ -243,7 +241,7 @@ impl LayoutScreen {
             // editor replaces it once the custom row has raised the latch (0x4C3D0C:
             // focus and `[0x65B710]`) — §4.66, §4.86
             if self.open_picker() == Some(i) {
-                self.color_picker(overlay, aspect, x, y, w, h, tint);
+                self.color_picker(overlay, aspect, FeRect::new(x, y, w, h), tint);
             } else {
                 self.drop_down(overlay, aspect, e, i, x, y, tint);
             }
@@ -256,8 +254,7 @@ impl LayoutScreen {
         // `data.nolabel != 4` path, over the same `backrect` box. Three of the 86
         // sliders carry 2 and all three are `nolabel=2`, so all three reach it. §4.78.
         // **Under the text**: 0x4C5EC9 comes before the stems (0x4C5F50…), the caption
-        // (0x4C6054) and the value (0x4C6237). *(Until 2026-09-27 the port drew it after
-        // both, which blanked the CD player's three combos on `audioreal.lay`.)*
+        // (0x4C6054) and the value (0x4C6237). (history: `game-history.md` §22.2)
         if self.attr_num(e, "dropshadow") == Some(2.0) {
             let (l, r) = (tint([0xe0, 0x0c, 0x0c, 0xff]), tint([0x82, 0, 0, 0xff]));
             let (x0, y0, x1, y1) = (x + 1.0, y + 1.0, x + w - 1.0, y + h - 1.0);
@@ -277,22 +274,13 @@ impl LayoutScreen {
         // on `dropshadow == 2` both fall into it). **It is not on the `nolabel == 4`
         // path**: 0x4C5A29 `jne 0x4C5E74` sends every other value to the background and
         // the stems, and the `nolabel == 4` arm ends at 0x4C5E6F `jmp 0x4C64FB`, past
-        // them. *(Until 2026-09-27 the port drew the pair on the eleven `nolabel=4`
-        // sliders too.)*
+        // them. (history: `game-history.md` §22.3)
         //
         // A third one-pixel bar follows, 0x4C5FB7…0x4C5FF6: black again, `backrect.height`
         // tall (0x4E2BA0), at `backrect.left + [+0x1F0]` — the end of the caption strip
         // (`combo_strip`), which a release on a closed combo treats as a step, not an open
         // (0x4C6BB8, `App` side).
-        if self.attr_num(e, "nolabel") != Some(4.0) {
-            let stem = tint([0, 0, 0, 0xff]);
-            let bh = self.attr_num(e, "height").unwrap_or(0.0) as f32;
-            let bw = self.attr_num(e, "width").unwrap_or(0.0) as f32;
-            let at = |k: &str| self.attr_num(e, k).unwrap_or(0.0) as f32 + bh;
-            out.push(self.quad(aspect, x, y, 1.0, at("stemleftheight"), stem));
-            out.push(self.quad(aspect, x + bw, y, 1.0, at("stemrightheight"), stem));
-            out.push(self.quad(aspect, x + self.combo_strip(e), y, 1.0, bh, stem));
-        }
+        self.combo_stems(d, out);
         // The arrow is **not** drawn from a state's part list: the family's slot 1 / 15 / 27
         // (0x4C5460 / 0x4C6A60 / 0x4C5810) never reach 0x4C8260; the bind looks `arrowbutton`
         // up by name (0x4C535D → `[+0x19C]`) and the draw paints that part's entry itself,
@@ -337,6 +325,76 @@ impl LayoutScreen {
         // real formula on the `nolabel != 4` path (the scroll-drag nudge is not modelled — no
         // shipped still has a combo mid-drag).
         let arrow_at = out.len();
+        self.combo_arrow(d, out);
+        self.combo_caption(d, out);
+        // And the value, which the class draws itself — `FeComboBox`'s own draw has
+        // two text calls, and they settle both:
+        //
+        // * **0x4C6054** puts the caption at `(x + 5, y + 2)` with align **0** in the
+        //   font at `[this+0x190]` — the template's `labelleft`, same place;
+        // * **0x4C6237** puts the value with align **2** anchored at
+        //   `x + width(this) - 12` (0x4C6220, over 0x4E2B90's width) at the widget's
+        //   own `y`, in the second font `[this+0x194]`.
+        //
+        // The template's `label` part says `data.width-10-label.size.width-3,2`, which
+        // is the same right edge one pixel further in and two rows down; the code is
+        // what runs, so the port follows the code. That retires the approximation this
+        // arm used to carry.
+        //
+        // **A colour box shows no value text.** Past the caption, 0x4C60FA tests the class's
+        // `[this+0x1DE]` (set for `NFS5.ColorBox` alone, §4.44) and draws, in place of the
+        // value, a **20 × 10 swatch** of the accessor's current colour — slot 29 0x4C4BF0 →
+        // `FEColourAccessor` 0x4B94C0, `[+0x2C]` — at `(x + width − 40, y + 4)`, `width` the
+        // `backrect`'s (0x4E2B90 on `[+0x17C]`, the same the value's `x + width − 12` uses),
+        // filled `0x4D87F0(colour, fade)` through 0x4D9280 (0x4C6154) and outlined black
+        // `0x4D87E0(fade)` through 0x4D9200 (0x4C618B); then 0x4C6193 jumps past the value
+        // draw to the arrow (0x4C623F). `nolabel == 1` is tested first (0x4C6062) and keeps
+        // the left-aligned value — no shipped colour box has it (all eleven carry 0). §4.171.4.
+        if self.combo_value(d, state, out, arrow_at) {
+            return;
+        }
+        // and last of all, over everything it has just drawn — the label included —
+        // the inset highlight 0x521810 (0x4C5E6A in the closed arm, 0x4C636D in the
+        // other), over the **`backrect`** part: `0x4E2B90([this+0x17C])` is
+        // `[[part+4]+0x38]`, its width, and `0x4E2BA0` `[+0x3C]`, its height, and
+        // `ComboBox.ctr` fixes that part at `pos=0,0` size `data.width,data.height`
+        // `HIDDEN|READONLY`, so it is the widget's own box. The same (x, y) pair
+        // feeds the box's own one-pixel outline at 0x4C5C31.
+        //
+        // Both arms skip it when the widget is pressed (0x4C5DC5/0x4C5DCE and
+        // 0x4C62CB/0x4C62D4, which is where §4.58's bevel goes instead) and send
+        // `data.dropshadow == 2` to 0x521970 instead — `[this+0x209]`, which the bind
+        // sets at 0x4C5064 out of the same three-way split the buttons use
+        // (0x4C505A…0x4C5088). Three of the 86 sliders carry 2; `ListBox.ctr` has no
+        // `dropshadow` at all and `ColorBox.ctr`'s is 1, so both leave the byte 0 and
+        // take this. §4.76.
+        if !self.pressed_on(i, hovered) {
+            if self.attr_num(e, "dropshadow") == Some(2.0) {
+                self.bevel_up(out, aspect, FeRect::new(x, y, w, h), 3.0);
+            } else {
+                self.glass(out, aspect, FeRect::new(x, y, w, h), &tint);
+            }
+        }
+    }
+
+    /// The combo's stems (0x4C5F18…0x4C5FF6, see [`Self::draw_combo`]): left, right and the
+    /// caption strip's end, off the `nolabel == 4` path.
+    fn combo_stems(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
+        let WidgetDraw { e, x, y, aspect, .. } = d;
+        if self.attr_num(e, "nolabel") != Some(4.0) {
+            let stem = tint([0, 0, 0, 0xff]);
+            let bh = self.attr_num(e, "height").unwrap_or(0.0) as f32;
+            let bw = self.attr_num(e, "width").unwrap_or(0.0) as f32;
+            let at = |k: &str| self.attr_num(e, k).unwrap_or(0.0) as f32 + bh;
+            out.push(self.quad(aspect, x, y, 1.0, at("stemleftheight"), stem));
+            out.push(self.quad(aspect, x + bw, y, 1.0, at("stemrightheight"), stem));
+            out.push(self.quad(aspect, x + self.combo_strip(e), y, 1.0, bh, stem));
+        }
+    }
+
+    /// The combo's `arrowbutton` entry (0x4C6260…0x4C629E, see [`Self::draw_combo`]).
+    fn combo_arrow(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
+        let WidgetDraw { e, x, y, w, h, aspect, .. } = d;
         for (px, py, file, index, flip) in self.shape_parts_in(e, &["arrowbutton".to_string()], None) {
             let Some(&(tex, aw, ah)) = self.shapes.get(&(file, index)) else { continue };
             // the template's own `x` is `data.width − arrowbutton.size.width − 4`; 0x4C629E's
@@ -348,7 +406,12 @@ impl LayoutScreen {
             let (v0, v1) = if flip & 2 != 0 { (1.0, 0.0) } else { (0.0, 1.0) };
             out.push(Sprite { texture: tex, pos, size, uv_min: [u0, v0], uv_max: [u1, v1], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None });
         }
-        // the caption, where the template puts it
+    }
+
+    /// The combo's caption, where the template's `labelleft` puts it, in the font
+    /// `data.usesmallfont` picks.
+    fn combo_caption(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
+        let WidgetDraw { e, x, y, aspect, strings, .. } = d;
         if let Some(c) = self.controls.get(&e.class)
             && let Some(p) = c.part("labelleft")
             && let Some(t) = e.string_id().filter(|n| *n != 0).and_then(|n| strings.get(n)).filter(|t| !t.is_empty())
@@ -377,29 +440,13 @@ impl LayoutScreen {
                 self.text(out, aspect, f, t, x + px as f32, y + py as f32, 0.0, 0, tint(col));
             }
         }
-        // And the value, which the class draws itself — `FeComboBox`'s own draw has
-        // two text calls, and they settle both:
-        //
-        // * **0x4C6054** puts the caption at `(x + 5, y + 2)` with align **0** in the
-        //   font at `[this+0x190]` — the template's `labelleft`, same place;
-        // * **0x4C6237** puts the value with align **2** anchored at
-        //   `x + width(this) - 12` (0x4C6220, over 0x4E2B90's width) at the widget's
-        //   own `y`, in the second font `[this+0x194]`.
-        //
-        // The template's `label` part says `data.width-10-label.size.width-3,2`, which
-        // is the same right edge one pixel further in and two rows down; the code is
-        // what runs, so the port follows the code. That retires the approximation this
-        // arm used to carry.
-        //
-        // **A colour box shows no value text.** Past the caption, 0x4C60FA tests the class's
-        // `[this+0x1DE]` (set for `NFS5.ColorBox` alone, §4.44) and draws, in place of the
-        // value, a **20 × 10 swatch** of the accessor's current colour — slot 29 0x4C4BF0 →
-        // `FEColourAccessor` 0x4B94C0, `[+0x2C]` — at `(x + width − 40, y + 4)`, `width` the
-        // `backrect`'s (0x4E2B90 on `[+0x17C]`, the same the value's `x + width − 12` uses),
-        // filled `0x4D87F0(colour, fade)` through 0x4D9280 (0x4C6154) and outlined black
-        // `0x4D87E0(fade)` through 0x4D9200 (0x4C618B); then 0x4C6193 jumps past the value
-        // draw to the arrow (0x4C623F). `nolabel == 1` is tested first (0x4C6062) and keeps
-        // the left-aligned value — no shipped colour box has it (all eleven carry 0). §4.171.4.
+    }
+
+    /// The combo's value (or a colour box's swatch, see [`Self::draw_combo`]). Returns `true`
+    /// where the original's draw ends there (no value font, the `nolabel == 1` and `== 4` arms),
+    /// so the inset highlight is not drawn.
+    fn combo_value(&self, d: WidgetDraw<'_>, state: &str, out: &mut Vec<Sprite>, arrow_at: usize) -> bool {
+        let WidgetDraw { i, e, x, y, w, aspect, strings, selected, hovered, accessor, .. } = d;
         if e.class == "NFS5.ColorBox" && self.attr_num(e, "nolabel") != Some(1.0) {
             if let Some(c) = self.swatches.get(&i) {
                 let (sx, sy, sw, sh) = (x + w - 40.0, y + 4.0, 20.0, 10.0);
@@ -420,7 +467,7 @@ impl LayoutScreen {
                 .or_else(|| self.attr_num(e, "usesmallfont").is_some_and(|v| v != 0.0).then(|| SMALL_FONT.to_string()))
                 .and_then(|f| self.fonts.get(&f))
                 .or_else(|| self.font_for(e));
-            let Some(f) = f else { return };
+            let Some(f) = f else { return true };
             // **`nolabel == 4`** is a second box, and eleven of the shipped sliders
             // ask for it — all on `advgraphics.lay`, `graphicsettings.lay` and
             // `audioreal.lay`, the same eleven that carry a non-zero
@@ -466,7 +513,7 @@ impl LayoutScreen {
                 // no live case to miss until the ordinary arm's own gap (below) was found.
                 let shown = if state == "disabled" { strings.get(299).unwrap_or_default() } else { v.as_str() };
                 self.text(out, aspect, cf, shown, x + 5.0, y + 2.0, 0.0, 0, colour);
-                return;
+                return true;
             }
             if self.attr_num(e, "nolabel") == Some(4.0) && gscw >= 1.0 {
                 let bw = self.attr_num(e, "width").unwrap_or(0.0) as f32;
@@ -513,7 +560,7 @@ impl LayoutScreen {
                 // above, so the mask's draws go in under it
                 let masked: Vec<Sprite> = out.drain(stencil..).collect();
                 out.splice(arrow_at..arrow_at, masked);
-                return;
+                return true;
             }
             // **`nolabel == 2` draws no value at all**: past the caption, 0x4C6198
             // `cmp eax, 2` / `je 0x4C623F` jumps over the value's 0x4DA350 straight to
@@ -521,8 +568,7 @@ impl LayoutScreen {
             // `.Options`, `.Title`), `GameCtrl.lay`'s `Controller.AllControllers`,
             // `deadzone.lay`'s `Controller.AllPads`, `PeerToPeerIP.lay`'s `Comms.IPList` and
             // `modem.lay`'s `Comms.PhoneList`; a closed one reads as its caption alone.
-            // *(Until 2026-09-27 the port right-aligned the value against the arrow, and
-            // "осталось времени трека" / "играть последовательно" ran out of the box.)*
+            // (history: `game-history.md` §22.4)
             // **The ordinary (`nolabel != 1/2/4`) value draw is disabled-gated too**, just
             // past the `nolabel == 2` skip: 0x4C61A1 `call 0x4C7E40` (isDisabled) runs before
             // 0x4C61B6 reads the cached value string — disabled takes 0x4C61F1 instead,
@@ -530,35 +576,13 @@ impl LayoutScreen {
             // 0x4DA350 call at 0x4C6237. The `nolabel == 4` arm already had this (§4.125);
             // `ID_LAPSSELECTOR`'s own `круги` row (`nolabel=0`) is the first to exercise the
             // ordinary one, disabled by `App::bind_laps_selector` on a point-to-point track.
-            // *(Until 2026-09-29 this drew the raw value on a disabled row too, since nothing
-            // had ever set `disabled_flags` on an ordinary combo box before.)*
+            // (history: `game-history.md` §22.5)
             if self.attr_num(e, "nolabel") != Some(2.0) {
                 let shown = if state == "disabled" { strings.get(299).unwrap_or_default() } else { v.as_str() };
                 self.text(out, aspect, f, shown, x + w - 12.0, y, 0.0, 2, colour);
             }
         }
-        // and last of all, over everything it has just drawn — the label included —
-        // the inset highlight 0x521810 (0x4C5E6A in the closed arm, 0x4C636D in the
-        // other), over the **`backrect`** part: `0x4E2B90([this+0x17C])` is
-        // `[[part+4]+0x38]`, its width, and `0x4E2BA0` `[+0x3C]`, its height, and
-        // `ComboBox.ctr` fixes that part at `pos=0,0` size `data.width,data.height`
-        // `HIDDEN|READONLY`, so it is the widget's own box. The same (x, y) pair
-        // feeds the box's own one-pixel outline at 0x4C5C31.
-        //
-        // Both arms skip it when the widget is pressed (0x4C5DC5/0x4C5DCE and
-        // 0x4C62CB/0x4C62D4, which is where §4.58's bevel goes instead) and send
-        // `data.dropshadow == 2` to 0x521970 instead — `[this+0x209]`, which the bind
-        // sets at 0x4C5064 out of the same three-way split the buttons use
-        // (0x4C505A…0x4C5088). Three of the 86 sliders carry 2; `ListBox.ctr` has no
-        // `dropshadow` at all and `ColorBox.ctr`'s is 1, so both leave the byte 0 and
-        // take this. §4.76.
-        if !self.pressed_on(i, hovered) {
-            if self.attr_num(e, "dropshadow") == Some(2.0) {
-                self.bevel_up(out, aspect, x, y, w, h, 3.0);
-            } else {
-                self.glass(out, aspect, x, y, w, h, &tint);
-            }
-        }
+        false
     }
 
     // A `NFS5.GOTOBUTTON` is a **dark-red pill with white text**, not red text on
@@ -615,21 +639,21 @@ impl LayoutScreen {
         }
         self.template_widget(out, aspect, e, state, x, y, strings);
         if self.pressed_on(i, hovered) {
-            self.bevel(out, aspect, x, y, w, h, 3.0);
+            self.bevel(out, aspect, FeRect::new(x, y, w, h), 3.0);
         } else if self.attr_num(e, "dropshadow") == Some(2.0) {
             // the six `dropshadow == 2` buttons take 0x521970 instead (0x4C9291) —
             // §4.77's raised bevel, thickness 3
-            self.bevel_up(out, aspect, x, y, w, h, 3.0);
+            self.bevel_up(out, aspect, FeRect::new(x, y, w, h), 3.0);
         } else {
             // and the second half of the tail (0x4C923F…0x4C92D9): a button that is
             // **not** pressed takes the inset highlight 0x521810 over its own box —
             // unless `[this+0x14D]`, `data.dropshadow == 2`, which sends it to
             // 0x521970 instead (0x4C9291). Six of the 153 go that way; the other 147
             // get this. §4.75.
-            self.glass(out, aspect, x, y, w, h, &tint);
+            self.glass(out, aspect, FeRect::new(x, y, w, h), &tint);
         }
         if self.attr_num(e, "dropshadow") == Some(1.0) {
-            self.drop_shadow(out, aspect, x, y, w, h, 4.0, 4.0);
+            self.drop_shadow(out, aspect, FeRect::new(x, y, w, h), 4.0, 4.0);
         }
         // **and the last of 0x4C90C0's tail.** A button that is **hovered**
         // (0x4C92DE → 0x4C7C90, `[this+0x10C] & 4` — bit 2 of the state mask, §4.109,
@@ -786,7 +810,7 @@ impl LayoutScreen {
             && self.attr_num(e, "dropshadow").is_some_and(|v| v != 0.0)
             && !self.pressed_on(i, hovered)
         {
-            self.drop_shadow(out, aspect, x, y, w, h, 4.0, 4.0);
+            self.drop_shadow(out, aspect, FeRect::new(x, y, w, h), 4.0, 4.0);
         }
         // All three end the same way: pressed takes §4.21's bevel, anything else
         // takes the inset highlight 0x521810 over the same box — 0x4D04A8 for a tab
@@ -797,23 +821,23 @@ impl LayoutScreen {
         match e.class.as_str() {
             "NFS5.TABBUTTON" if self.attr_num(e, "dropshadow").is_some_and(|v| v != 0.0) => {
                 if down {
-                    self.bevel(out, aspect, x, y, w, h, 3.0);
+                    self.bevel(out, aspect, FeRect::new(x, y, w, h), 3.0);
                 } else {
-                    self.glass(out, aspect, x, y, w, h, &tint);
+                    self.glass(out, aspect, FeRect::new(x, y, w, h), &tint);
                 }
             }
             "NFS5.CAMERASELECT" => {
                 if down {
-                    self.bevel(out, aspect, x, y, w, h, 3.0);
+                    self.bevel(out, aspect, FeRect::new(x, y, w, h), 3.0);
                 } else {
-                    self.glass(out, aspect, x, y, w, h, &tint);
+                    self.glass(out, aspect, FeRect::new(x, y, w, h), &tint);
                 }
             }
             "NFS5.CAMERAPICTURE" => {
                 if down {
-                    self.bevel(out, aspect, x, y, 15.0, 13.0, 3.0);
+                    self.bevel(out, aspect, FeRect::new(x, y, 15.0, 13.0), 3.0);
                 } else {
-                    self.glass(out, aspect, x, y, 15.0, 13.0, &tint);
+                    self.glass(out, aspect, FeRect::new(x, y, 15.0, 13.0), &tint);
                 }
             }
             _ => {}
@@ -996,9 +1020,9 @@ impl LayoutScreen {
         // the other half of a tail §4.23 read only the first half of. §4.78.
         if e.class == "NFS5.ChroniclePictureIcon" {
             if self.pressed_on(i, hovered) {
-                self.bevel(out, aspect, x, y, aw, ah, 3.0);
+                self.bevel(out, aspect, FeRect::new(x, y, aw, ah), 3.0);
             } else {
-                self.drop_shadow(out, aspect, x, y, aw, ah, 4.0, 4.0);
+                self.drop_shadow(out, aspect, FeRect::new(x, y, aw, ah), 4.0, 4.0);
             }
         }
     }
@@ -1074,8 +1098,8 @@ impl LayoutScreen {
     // `0x80`) separate the rows and mark **four** columns, at `x + 0x0B`, `x + 0x71`,
     // `x + 0xA4` and `x + 0xCC` (0x4FA35B, 0x4FA39F, 0x4FA3D5, 0x4FA424), each the filled
     // height tall; last, the filled strip is outlined in full-fade black, 0x4D9200 of
-    // `0x4D87E0(fade)` over `(x, y, w, n·h/7)` (0x4FA43A…0x4FA45A). *(Until 2026-09-27 the
-    // port drew the first two columns and no outline.)* A `Knockout.TrackNumber` at or past
+    // `0x4D87E0(fade)` over `(x, y, w, n·h/7)` (0x4FA43A…0x4FA45A). (history: `game-history.md` §22.6)
+    // A `Knockout.TrackNumber` at or past
     // `n` is put back on row 0 by the draw itself (0x4FA27B…0x4FA28C) — the binding does it.
     pub(super) fn draw_knockout_track_list(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
         let WidgetDraw { i, x, y, w, h, talpha, aspect, .. } = d;
@@ -1346,7 +1370,7 @@ impl LayoutScreen {
         // (0x4C8670) in its fade colour. So it is its amber fill and black frame with
         // a sunken bevel inside them, not the fill alone.
         if e.class == "NFS5.BEVELEDOPTIONBOX" {
-            self.bevel(out, aspect, x, y, w, h, 3.0);
+            self.bevel(out, aspect, FeRect::new(x, y, w, h), 3.0);
         }
         // Erased, not undrawn, in two cases the original agrees with:
         //
@@ -2099,7 +2123,7 @@ impl LayoutScreen {
             // else takes anything. Focus is a runtime flag now (§4.109), so the
             // first half of that test is drawn as well.
             if state == "focused" || self.pressed_on(i, hovered) {
-                self.bevel(out, aspect, x, y, w, h, 3.0);
+                self.bevel(out, aspect, FeRect::new(x, y, w, h), 3.0);
             }
         } else if matches!(e.class.as_str(), "NFS5.INPUTBOX" | "NFS5.CHARVECTACCESSORINPUTBOX") {
             // and 0x4CC950's own tail is a three-way. A box that is **pressed** —
@@ -2109,12 +2133,12 @@ impl LayoutScreen {
             // unless `data.noshadow` (0x4CCA57) and then, **always**, the inset
             // highlight 0x521810 at 0x4CCAE3.
             if self.pressed_on(i, hovered) {
-                self.bevel(out, aspect, x, y, w, h, 3.0);
+                self.bevel(out, aspect, FeRect::new(x, y, w, h), 3.0);
             } else {
                 if self.attr_num(e, "noshadow").unwrap_or(0.0) == 0.0 {
-                    self.drop_shadow(out, aspect, x, y, w, h, 4.0, 4.0);
+                    self.drop_shadow(out, aspect, FeRect::new(x, y, w, h), 4.0, 4.0);
                 }
-                self.glass(out, aspect, x, y, w, h, &tint);
+                self.glass(out, aspect, FeRect::new(x, y, w, h), &tint);
             }
         }
         // `NFS5.CONTROLLERSETUP`'s own draw, **0x51C670**, ends like the buttons':
@@ -2133,17 +2157,15 @@ impl LayoutScreen {
             self.controller_setup_row(out, aspect, e, state, x, y, w, talpha, strings, accessor);
             let lit = (state == "focused" || self.pressed_on(i, hovered)) && state != "disabled";
             if lit {
-                self.bevel(out, aspect, x, y, w, h, 3.0);
+                self.bevel(out, aspect, FeRect::new(x, y, w, h), 3.0);
             } else {
-                self.glass(out, aspect, x, y, w, h, &tint);
+                self.glass(out, aspect, FeRect::new(x, y, w, h), &tint);
             }
             // and 0x51C670 returns there: no caret, which is the input boxes' (0x4CC9D7)
             return;
         }
         // `NFS5.CHATDISPLAYBOX`'s draw 0x4C2F50 is the chat's rows and its scrollbar, above, and
-        // nothing else — its `data.accessor` (`Comms.PlayerList`) only names players. *(Until
-        // 2026-09-25 it fell through to the input boxes' value and printed that list's first row
-        // — "empty" — in the chat once the list had rows.)*
+        // nothing else — its `data.accessor` (`Comms.PlayerList`) only names players. (history: `game-history.md` §22.7)
         if e.class == "NFS5.CHATDISPLAYBOX" {
             return;
         }
@@ -2322,75 +2344,14 @@ impl LayoutScreen {
         // `ret 0xC` — `trough.x = x` unmodified, `trough.y = y`, no width argument at all
         // (0x10 is a constant).
         //
-        // **`x = parent.+0x38 + self0.+0x38 + rect.x`, `y = self0.+0x3c + rect.y`** —
-        // refreshRows' tail (0x4C5796…0x4C57C9), unwound arg-by-arg 2026-09-27: `self0 =
-        // *[esi+0x178]` (the selection-box rect object), `parent = *(self0+4)`, and `rect`
-        // is the one stack argument both single-thiscall-arg getters (0x4E2B50, then
-        // 0x4E2B30, `y` before `x`, each `ret 4`) take — **0x4C8670's own return**.
-        //
-        // **0x4C8670 read to its `ret 4`, 2026-09-27, and settled 2026-09-28** (the
-        // "unread virtual call plus two string-keyed helpers" this marker used to carry):
-        // `[this+0x34]` is the widget's **own** box, `{left, top, right, bottom}` — a
-        // virtual call, no name lookup. `0x5A134B` is **not** a named lookup either — its
-        // signature `(ptr, vfDelta, srcType, targetType, isRef)`, its SEH prologue and its
-        // type-descriptor-flag dispatch to 0x5A14CD/0x5A1527/0x5A1620 are the compiler's own
-        // `__RTDynamicCast`, the exact same helper `layouts.md`'s Tabs entry already names
-        // (`[[this+0xD0]+0xD0]` cast to `FERadioGroup`) — so this call is
-        // `dynamic_cast<T*>([this+0xD0])`, and `[this+0xD0]` is the widget's own
-        // **parent/owner** pointer (`controls.md` lines 406/407/430, the same field).
-        // **`T` settled 2026-09-28** by dumping the call's own pushed immediates
-        // (0x4c868f/0x4c8697) and reading them as `TypeDescriptor`s (`vfptr`/`spare`/mangled
-        // `name`, straight out of `.data`, exactly like the already-committed `FERadioGroup`
-        // one at 0x5D9030) rather than the "lazy-bound cache cell / bootstrap thunk" this
-        // marker guessed: `0x5D75E8` (`TargetType`) is `".?AVControl@FERT@@"` = **`T =
-        // FERT::Control`**, `0x5D75C8` (`SrcType`) is `".?AVTarget@FERT@@"` = `FERT::Target`
-        // (`owner`'s own static type) — `Control@FERT` is this codebase's already-documented
-        // "FERT part/control root" (`RE/drafts/round2/fe-widgets.md` §1.2, vtable 0x5BAFD4),
-        // the common base of every widget and every screen, so the cast asks "is my owner a
-        // widget/window" (true for an ordinary widget's screen or panel). `0x525310` is
-        // **not** a lookup either: read to its own `ret 4`, `*(this+0xE0)`'s own `+0x38`/
-        // `+0x3c` (a pointer indirection, `mov ecx,[ecx+0xE0]` then `[ecx+0x38]`/`[ecx+0x3c]`)
-        // — the **same** position pair `self0`/`parent` are read through above, called here on
-        // **`owner`**, not the widget itself: `point = owner`'s own on-screen position. So
-        // `0x4C8670` hands back the widget's own box **translated** by its owner's position:
-        // `rect.x = box.left + point.x`, `rect.y = box.top + point.y` (0x4C86BF…0x4C86E2,
-        // both edges of each axis shifted the same amount).
-        //
-        // **`point`, and hence the whole formula, needs no separate port code**: of the
-        // shipped `.lay` files that reach here, a scrollbar's widget is either on a plain
-        // top-level screen (`point` = (0, 0), the screen's own rest position) or inside a
-        // `NFS5.PANEL` sub-layout (`audioreal`/`cdplayer` under `Audio.lay`,
-        // `deadzone`/`gamectrl` under `Controllers.lay`, `display`/`graphicsettings`/
-        // `advgraphics` under `Options.lay`/`graphics.lay`) — and for those, `owner` is the
-        // sub-layout's own screen, whose position `0x4CECE0` sets to the panel's own
-        // placement (`controls.md` §4.1) — i.e. `point` is the panel's placement. `layout.rs`'s
-        // `embedded()` (the panel draw) already applies exactly that translation, once, to a
-        // sub-layout's whole finished sprite list rather than once per `0x4C8670` call, so this
-        // port's `px, py` (from `x, y` — already the widget's fully-resolved on-screen position,
-        // panel offset included where it applies) **is** `rect` above for every shipped case.
-        // `X = parent.x + self0.x + rect.x` settles to what `px, py` already compute — "the
-        // strip's left edge" is the formula's own answer, not an untraced inference. The knob's
-        // index is the port's own scroll position now (§4.45), which is what
-        // `[this+0x1BC]->slot10()` is in the original.
+        // `x = parent.+0x38 + self0.+0x38 + rect.x`, `y = self0.+0x3c + rect.y` (refreshRows' tail
+        // 0x4C5796…0x4C57C9), `rect` 0x4C8670's answer: the widget's own box `[this+0x34]`
+        // translated by its owner's position (`dynamic_cast<FERT::Control*>([this+0xD0])`,
+        // 0x525310) — for every shipped case the port's `px, py` (a panel's offset is applied by
+        // `embedded()`). The knob's index is the port's own scroll position (§4.45). The full
+        // trace (settled 2026-09-28): `RE/notes/game-history.md` §33.4.
         if scrolls {
-            let sx = px + panel_w;
-            let art = |n: usize| self.shapes.get(&("weeicons.fsh".to_string(), n)).copied();
-            let (up, down) = (art(13), art(14));
-            let track_w = down.map(|(_, w, _)| w).or(up.map(|(_, w, _)| w)).unwrap_or(LIST_SCROLLBAR_W);
-            out.push(self.quad(aspect, sx, py, track_w, panel_h, tint([0xff, 0xbb, 0x00, 0xff])));
-            if let Some((tex, aw, ah)) = up {
-                let (pos, size) = self.place(aspect, sx, py + 7.0, aw, ah);
-                out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None });
-            }
-            if let Some((tex, aw, ah)) = down {
-                let (pos, size) = self.place(aspect, sx, py + panel_h - ah, aw, ah);
-                out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None });
-            }
-            // the knob's own travel, straight out of `list_scrollbar` so that where
-            // it is drawn and where a drag puts it are the same arithmetic
-            let knob_w = up.map(|(_, w, _)| w).unwrap_or(track_w);
-            let ky = self.list_scrollbar(i).map(|b| b.knob.1).unwrap_or(py);
-            out.push(self.quad(aspect, sx, ky, knob_w, LIST_KNOB_H, tint([0xff, 0xff, 0xff, 0x80])));
+            self.list_scrollbar_sprites(out, aspect, i, px + panel_w, py, panel_h);
         }
         // `textcolor` is black and the two highlights amber and dark red, all three
         // straight out of `ListBox.ctr`; a highlighted row's own text turns white
@@ -2409,36 +2370,14 @@ impl LayoutScreen {
         //
         // The original measures from the widget's own box (0x4C8670); the port
         // measures from the selection box, one pixel below it.
-        let hover_row = self.cursor.and_then(|(cx, cy)| {
-            if !(cx >= px && cx < px + panel_w && cy >= py && cy < py + panel_h) {
-                // off the list. 0x4C6F00 clears the row *unless* the pointer has
-                // landed on this list's own scrollbar, so keep the last one then.
-                return match (self.combo_scroll, self.combo_hover.get()) {
-                    (Some((c, _, _)), Some((h, n))) if c == i && h == i => Some(n),
-                    _ => {
-                        self.combo_hover.set(None);
-                        None
-                    }
-                };
-            }
-            let mut acc = py;
-            let first = self.scroll.get(&i).copied().unwrap_or(0);
-            let n = rows.iter().skip(first).position(|r| {
-                acc += r.height();
-                cy < acc
-            }).map(|n| n + first);
-            self.combo_hover.set(n.map(|n| (i, n)));
-            n
-        });
+        let hover_row = self.list_hover_row(i, rows, px, py, panel_w, panel_h);
         // The row loop starts at the scrollbar's own position — 0x4C66E8 takes
         // `[this+0x1BC]->slot10()` for its first row (§4.45)
         let first = self.scroll.get(&i).copied().unwrap_or(0).min(rows.len().saturating_sub(1));
         // **The loop does not stop at the edge.** Its test is at its *foot*, 0x4C6915:
         // a row is drawn, its height added, and only then is the running total compared
         // with `[this+0x1C4]` — so the row that crosses the bottom edge is drawn. The port
-        // used to stop one row early. *(Corrected 2026-09-27: this said the row "overhangs"
-        // and that 0x4DAA10 / 0x4DAAC0 were "a z step, not a scissor" — they are the depth
-        // mask above, which cuts that row at the fill's bottom edge.)*
+        // used to stop one row early. (history: `game-history.md` §22.8)
         let mut acc = 0.0f32;
         let mut ry = py;
         // `Parts.AllParts` overrides the row draw (0x515620, slot 15 of vtable
@@ -2479,7 +2418,7 @@ impl LayoutScreen {
                         if bar.is_none() {
                             out.push(self.quad(aspect, px, ry, panel_w, 13.0, tint([0xBC, 0, 0, 0xFF])));
                         }
-                        self.glass(out, aspect, px, ry, panel_w, 13.0, &tint);
+                        self.glass(out, aspect, FeRect::new(px, ry, panel_w, 13.0), &tint);
                     }
                     self.text(out, aspect, f, t, px + 3.0, ry + 2.0, 0.0, 0, fg);
                 }
@@ -2491,7 +2430,7 @@ impl LayoutScreen {
                         out.push(self.quad(aspect, px, ry, panel_w, row.height(), tint(c)));
                     } else if parts_glass && headers >= 2 {
                         out.push(self.quad(aspect, px, ry, panel_w, 13.0, tint([0xBC, 0, 0, 0xFF])));
-                        self.glass(out, aspect, px, ry, panel_w, 13.0, &tint);
+                        self.glass(out, aspect, FeRect::new(px, ry, panel_w, 13.0), &tint);
                     }
                     for cell in cells {
                         // a cell with no anchor of its own sits at the panel's left edge
@@ -2545,7 +2484,7 @@ impl LayoutScreen {
                     headers += 1;
                     if parts_glass {
                         out.push(self.quad(aspect, px, ry, panel_w, PART_HEADER_H, tint([0xBC, 0, 0, 0xFF])));
-                        self.glass(out, aspect, px, ry, panel_w, PART_HEADER_H, &tint);
+                        self.glass(out, aspect, FeRect::new(px, ry, panel_w, PART_HEADER_H), &tint);
                         let mut tx = px;
                         let pair = if bar.is_some() { 2 } else { 0 };
                         if let Some(idx) = self.parts_glyphs.map(|g| g[pair + if *open { 1 } else { 0 }])
@@ -2562,7 +2501,7 @@ impl LayoutScreen {
                         out.push(self.quad(aspect, px, ry + PART_HEADER_H, panel_w, 1.0, black));
                         self.text(out, aspect, f, t, px, ry + 2.0, panel_w, 1, tint(text_c));
                         // and over it 0x521400's bevel, `(x, y, w, 13.0, fade, 2)` (0x518E7F…)
-                        self.bevel_heading(out, aspect, px, ry, panel_w, PART_HEADER_H, 2.0);
+                        self.bevel_heading(out, aspect, FeRect::new(px, ry, panel_w, PART_HEADER_H), 2.0);
                     }
                 }
                 // the garage list's grouping heading (§4.144): the same two rules 13
@@ -2584,7 +2523,7 @@ impl LayoutScreen {
                     self.text(out, aspect, f, t, px, ry + 2.0, panel_w, 1, tint(text_c));
                     // and 0x521400's bevel one pixel down, `(x, y + 1, w, 12.0, fade, 2)`
                     // (0x4F5DF1…0x4F5E0C)
-                    self.bevel_heading(out, aspect, px, ry + 1.0, panel_w, 12.0, 2.0);
+                    self.bevel_heading(out, aspect, FeRect::new(px, ry + 1.0, panel_w, 12.0), 2.0);
                 }
             }
             if let Some(cx) = price_x {
@@ -2593,6 +2532,55 @@ impl LayoutScreen {
             ry += row.height();
         }
         super::fe_depth::apply(&mut out[inside_from..], inside);
+    }
+
+    /// The list box's `NFS5.VerticalSlider` (see [`Self::draw_list_box`]): the track, the two
+    /// `weeicons.fsh` arrows (entries 13 / 14) and the knob, at the strip `sx` the panel gave up.
+    fn list_scrollbar_sprites(&self, out: &mut Vec<Sprite>, aspect: f32, i: usize, sx: f32, py: f32, panel_h: f32) {
+        let art = |n: usize| self.shapes.get(&("weeicons.fsh".to_string(), n)).copied();
+        let (up, down) = (art(13), art(14));
+        let track_w = down.map(|(_, w, _)| w).or(up.map(|(_, w, _)| w)).unwrap_or(LIST_SCROLLBAR_W);
+        out.push(self.quad(aspect, sx, py, track_w, panel_h, tint([0xff, 0xbb, 0x00, 0xff])));
+        if let Some((tex, aw, ah)) = up {
+            let (pos, size) = self.place(aspect, sx, py + 7.0, aw, ah);
+            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None });
+        }
+        if let Some((tex, aw, ah)) = down {
+            let (pos, size) = self.place(aspect, sx, py + panel_h - ah, aw, ah);
+            out.push(Sprite { texture: tex, pos, size, uv_min: [0.0, 0.0], uv_max: [1.0, 1.0], color: [1.0, 1.0, 1.0, 1.0], rotation: 0.0, pivot: [0.5, 0.5], tri: None, corner_colors: None, depth: None });
+        }
+        // the knob's own travel, straight out of `list_scrollbar` so that where
+        // it is drawn and where a drag puts it are the same arithmetic
+        let knob_w = up.map(|(_, w, _)| w).unwrap_or(track_w);
+        let ky = self.list_scrollbar(i).map(|b| b.knob.1).unwrap_or(py);
+        out.push(self.quad(aspect, sx, ky, knob_w, LIST_KNOB_H, tint([0xff, 0xff, 0xff, 0x80])));
+    }
+
+    /// The hovered row of list `i` (`FeListBox`'s slot 8, 0x4C6F60; see [`Self::draw_list_box`]):
+    /// the first row whose running bottom is past the pointer, the last one kept while the pointer
+    /// is on the list's own scrollbar.
+    fn list_hover_row(&self, i: usize, rows: &[ListRow], px: f32, py: f32, panel_w: f32, panel_h: f32) -> Option<usize> {
+        self.cursor.and_then(|(cx, cy)| {
+            if !(cx >= px && cx < px + panel_w && cy >= py && cy < py + panel_h) {
+                // off the list. 0x4C6F00 clears the row *unless* the pointer has
+                // landed on this list's own scrollbar, so keep the last one then.
+                return match (self.combo_scroll, self.combo_hover.get()) {
+                    (Some((c, _, _)), Some((h, n))) if c == i && h == i => Some(n),
+                    _ => {
+                        self.combo_hover.set(None);
+                        None
+                    }
+                };
+            }
+            let mut acc = py;
+            let first = self.scroll.get(&i).copied().unwrap_or(0);
+            let n = rows.iter().skip(first).position(|r| {
+                acc += r.height();
+                cy < acc
+            }).map(|n| n + first);
+            self.combo_hover.set(n.map(|n| (i, n)));
+            n
+        })
     }
 }
 
@@ -2696,12 +2684,12 @@ impl LayoutScreen {
             let (bw, bh) = self.box_hit(e);
             let chosen = self.attr_num(e, "ournumber").unwrap_or(0.0) as i32 == self.driver_picture;
             if chosen {
-                self.picture_frame(out, aspect, x, y, bw, bh, 5.0);
+                self.picture_frame(out, aspect, FeRect::new(x, y, bw, bh), 5.0);
             }
             if self.pressed_on(i, hovered) {
-                self.bevel(out, aspect, x, y, bw, bh, 3.0);
+                self.bevel(out, aspect, FeRect::new(x, y, bw, bh), 3.0);
             } else if !chosen {
-                self.drop_shadow(out, aspect, x, y, bw, bh, 4.0, 4.0);
+                self.drop_shadow(out, aspect, FeRect::new(x, y, bw, bh), 4.0, 4.0);
             }
         }
         if code_placed(&e.class) {

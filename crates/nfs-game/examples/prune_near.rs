@@ -159,7 +159,7 @@ fn main() {
                 if !old.is_empty() && old.iter().all(|&(cx, cz, r)| node_wholly_pruned(&view, cx, cz, r)) {
                     old_drops += 1;
                 }
-                if ns.iter().all(|&(_, cx, cz, r)| node_wholly_pruned(&view, cx, cz, r)) {
+                if ns.iter().all(|n| node_wholly_pruned(&view, n.cx, n.cz, n.r)) {
                     drops += 1;
                     any = true;
                     if example.is_empty() {

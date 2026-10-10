@@ -64,6 +64,31 @@ impl App {
         true
     }
 
+    /// **The end of a race frame**, one for the windowed frame (`RedrawRequested`) and for a scripted run's iteration
+    /// (`run_scripted_race`), so the two cannot drift apart: the played-back stream's end ([`Self::replay_exit_check`]),
+    /// the replay bar's scripted press and its frame, and the diagnostic `NFS_REPLAY_TYPE`, typed into `HReplaySave`'s
+    /// name once the bar's scripted press (or a real one) has just opened it (0x430E10, `replay_save_click` reads it from
+    /// the field the same way). `true` when the program is ending: the caller returns.
+    pub(crate) fn race_frame_epilogue(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        // 0x415CB3: the played-back stream's end, after the catch-up loop
+        if self.replay_exit_check(event_loop) {
+            return true;
+        }
+        let bar_save_was_up = self.replay_save.up;
+        self.run_bar_script();
+        self.replay_bar_frame(event_loop);
+        // diagnostic: `NFS_REPLAY_TYPE`
+        if !bar_save_was_up
+            && self.replay_save.up
+            && let Some(name) = nfs_game::config::cfg().nfs_replay_type.as_str()
+        {
+            for c in name.chars() {
+                self.replay_save.type_char(c);
+            }
+        }
+        false
+    }
+
     /// Write the port's replay file (`replay.md` §6.2 saves `replay.rpl` after every race; §14.5
     /// explains why this is the port's own format and not the original's 118 312-byte dump).
     /// `Replay_saveDefault` 0x413FD0 has no condition at all: an empty recording and a playback
@@ -245,33 +270,17 @@ impl App {
             None => car.0,
         };
         self.sim_name = setup.sim.clone();
-        self.num_opponents = setup.opponents;
-        self.num_laps = setup.laps.max(1);
-        self.backwards = setup.backwards;
-        self.mirror = setup.mirror;
-        self.owned_paint = None;
-        self.owned_decal = None;
-        self.paint = setup.paint;
-        self.road.traffic_count = TRAFFIC_COUNT[(setup.traffic as usize).min(3)];
-        self.road.traffic_ids = None;
-        self.road.cops_enabled = setup.cops;
-        self.road.damage_on = setup.damage;
-        // `SKILL` travels in the block as well (0x413DCF)
-        self.race_skill = setup.skill;
+        // the recorded block's race options (`RaceSetup::replay`); `RACE_TYPE` / `FEGAME_TYPE`'s three
+        // are `apply_replay_launch_block`'s above, the grid `apply_replay_net`'s below
+        let rs = RaceSetup::replay(&setup, self.race_setup());
+        self.apply_race_setup(rs);
         self.traffic_seed = setup.seed;
-        self.career_opponents = None;
         self.replay.stream = Some(nfs_game::replay::Replay::playing(f.stream, f.final_tick));
         self.replay.setup = setup;
         self.apply_replay_net();
         // the menu comes back when the playback ends (`leave_race`)
-        self.fe.menu_template = self.fe.menu.take();
         self.fe.after_replay = true;
-        self.fe.race_game_type = Some(self.fe.game_type);
-        self.fe.layout_preview = None;
-        self.fe.layout_name = None;
-        let (Some(renderer), Some(window)) = (self.renderer.take(), self.window.take()) else { return };
-        self.tick = 0;
-        self.start_race(renderer, window, event_loop);
+        self.fe_hand_over(self.fe.game_type, event_loop);
     }
 
     /// The launch-block words of a recording a playback takes from it (`Replay_begin` 0x413CF0's bulk
@@ -578,6 +587,17 @@ impl App {
             return;
         }
         self.replay_again(event_loop, true);
+    }
+
+    /// Race over ends `RaceFrame` (0x415D17) and the session loop restarts the race as its replay: after a tick,
+    /// the automatic replay when [`App::simulate`] asked for it. The windowed frame stops its catch-up loop
+    /// on `true`, a scripted run's iteration goes on to its own checks.
+    pub(crate) fn start_auto_replay_if_due(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        if !self.auto_replay_due {
+            return false;
+        }
+        self.start_auto_replay(event_loop);
+        true
     }
 
     /// The session loop's "play it (again)" arm (0x4B6EF4…0x4B6F18): `REPLAY = 2`, `[0x5E99F4] = 2`,

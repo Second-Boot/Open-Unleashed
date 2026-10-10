@@ -28,6 +28,7 @@
 //! renamed; nothing writes it any more.
 
 use crate::career::{Career, CareerTables, EventResult, OwnedCar, TournamentState};
+use nfs_formats::bytes;
 use nfs_formats::career::{Era, MISSION_RECORD_SIZE, PART_RECORD_SIZE, TOURNAMENT_RECORD_SIZE};
 use nfs_formats::fedata::CAR_RECORD_SIZE;
 use nfs_formats::sav::{AccessorBlock, AccessorValue, KnockoutState, PlayerInfo, SaveFile, SavedCar, SavedPart, TournamentModule, UsedCarMarket, FE_CAR_IMAGE};
@@ -79,7 +80,7 @@ impl Profile {
 /// the enumerator 0x59E270 builds `"%s%s"` of the root and the `"%s*.sav"` pattern, and 0x59FEB0
 /// puts each `FindFirstFileA` / `FindNextFileA` result's `cFileName` (the find data's `+0x2C`,
 /// `[esp+0x58]` there) into the set 0x59FFE0 walks — name and `.sav` together, no directory. So
-/// a stem of 96 characters is already left out. *(Until 2026-09-26 the port tested the stem.)*
+/// a stem of 96 characters is already left out. (history: `game-history.md` §18.1)
 pub fn list_profiles(dir: &Path) -> Vec<Profile> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else { return out };
@@ -206,9 +207,8 @@ fn car_image(tables: &CareerTables, c: &OwnedCar, players: bool) -> SavedCar {
     // big-endian as the getters read them — the package index and the race number. A bought
     // car's rows are what the dealership had (0x501CF0: the interior chosen there, paint set 0's
     // stripes, package 0x508E70's 0).
-    // *(Until 2026-09-25 the port wrote the paint set's first dword as the package — 0 or 205
-    // over `nfs5.car`, not a package — the chosen set's stripes, no interior and decal 0.)*
-    let be = |o: usize| image.get(car::RECORD + o..car::RECORD + o + 4).map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    // (history: `game-history.md` §18.2)
+    let be = |o: usize| bytes::get_u32_be(&image, car::RECORD + o).unwrap_or(0);
     let t = c.trim;
     let (s1, s2, int) = (be(0x3F0 + 16 * t.stripe1 as usize), be(0x3F4 + 16 * t.stripe2 as usize), be(0x530 + 16 * t.interior as usize));
     let mut car = SavedCar::new(image);
@@ -259,8 +259,7 @@ fn car_image(tables: &CareerTables, c: &OwnedCar, players: bool) -> SavedCar {
                     .parts
                     .iter()
                     .position(|p| p.id == *id)
-                    .and_then(|i| tables.raw.prt.get(i * PART_RECORD_SIZE + 0x164..i * PART_RECORD_SIZE + 0x168))
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .and_then(|i| bytes::get_f32(&tables.raw.prt, i * PART_RECORD_SIZE + 0x164))
                     .unwrap_or(0.0)
             });
             SavedPart { id: *id as i32, state }
@@ -276,8 +275,8 @@ fn owned_from_image(tables: &CareerTables, car: &SavedCar) -> OwnedCar {
     let rec = car.image.get(car::RECORD..car::RECORD + CAR_RECORD_SIZE).unwrap_or(&[]);
     let mut custom = [None; 4];
     let mut row = |slot: usize, base: usize, count_at: usize, v: u32| -> u8 {
-        let n = rec.get(count_at..count_at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]) as usize).min(40);
-        let at = (0..n).position(|i| rec.get(base + 16 * i..base + 16 * i + 4).is_some_and(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) == v));
+        let n = bytes::get_u16(rec, count_at).map_or(0, usize::from).min(40);
+        let at = (0..n).position(|i| bytes::get_u32_be(rec, base + 16 * i) == Some(v));
         if at.is_none() && v != 0 {
             custom[slot] = Some(v);
         }
@@ -356,11 +355,13 @@ fn put_u32(buf: &mut [u8], at: usize, v: u32) {
 fn put_i16(buf: &mut [u8], at: usize, v: i16) {
     buf[at..at + 2].copy_from_slice(&v.to_le_bytes());
 }
+/// A little-endian `u32` at `at`, 0 past the end of `buf` (a short table reads as zeros).
 fn get_u32(buf: &[u8], at: usize) -> u32 {
-    buf.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0)
+    bytes::get_u32(buf, at).unwrap_or(0)
 }
+/// A little-endian `i16` at `at`, 0 past the end of `buf`.
 fn get_i16(buf: &[u8], at: usize) -> i16 {
-    buf.get(at..at + 2).map(|b| i16::from_le_bytes([b[0], b[1]])).unwrap_or(0)
+    bytes::get_i16(buf, at).unwrap_or(0)
 }
 
 /// The `nfs5.trn` image with the port's tournament state patched into the runtime fields.
@@ -569,8 +570,8 @@ pub fn opponent_car_image(tables: &CareerTables, o: &OpponentCarSave) -> SavedCa
     {
         image[car::RECORD..car::RECORD + CAR_RECORD_SIZE].copy_from_slice(rec);
     }
-    let rec = |o: usize| image.get(car::RECORD + o..car::RECORD + o + 4).map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
-    let count = |o: usize| image.get(car::RECORD + o..car::RECORD + o + 2).map_or(0, |b| i16::from_le_bytes([b[0], b[1]]));
+    let rec = |o: usize| bytes::get_u32_be(&image, car::RECORD + o).unwrap_or(0);
+    let count = |o: usize| bytes::get_i16(&image, car::RECORD + o).unwrap_or(0);
     let none = 0xFFFF_0000u32;
     let (mut ext, mut s1, mut s2, mut int) = (none, none, none, none);
     if count(0x3E6) > 0 {
@@ -608,8 +609,8 @@ pub fn opponent_car_image(tables: &CareerTables, o: &OpponentCarSave) -> SavedCa
 pub fn opponent_car_of(car: &SavedCar) -> OpponentCarSave {
     let rec = car.image.get(car::RECORD..car::RECORD + CAR_RECORD_SIZE).unwrap_or(&[]);
     let row = |base: usize, count_at: usize, v: u32| -> usize {
-        let n = rec.get(count_at..count_at + 2).map_or(0, |b| i16::from_le_bytes([b[0], b[1]]).max(0) as usize).min(40);
-        (0..n).position(|i| rec.get(base + 16 * i..base + 16 * i + 4).is_some_and(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) == v)).unwrap_or(0)
+        let n = bytes::get_i16(rec, count_at).map_or(0, |c| c.max(0) as usize).min(40);
+        (0..n).position(|i| bytes::get_u32_be(rec, base + 16 * i) == Some(v)).unwrap_or(0)
     };
     OpponentCarSave {
         car_id: car.car_id(),
@@ -648,8 +649,7 @@ pub struct SaveSide {
     /// `OwnedCars.Car`'s selection (`FEOwnedCarAccessor`, §6.1): its Save 0x4F5B30 writes the
     /// count (`(end − begin) / 4` of the vector `[this+0x2C]()`) and then the index `vtbl[+0x28]()`;
     /// its Load 0x4F5B70 hands the count to `setCount` (slot 24, 0x4BC310) and the index to
-    /// 0x4F0A30 → `SetSelection` 0x4BC240, clamped into the garage. *(Until 2026-09-30 the port
-    /// wrote 0 and read nothing back — a reload always stood on the first car.)*
+    /// 0x4F0A30 → `SetSelection` 0x4BC240, clamped into the garage. (history: `game-history.md` §18.3)
     pub owned_car_selection: u32,
 }
 
@@ -828,9 +828,7 @@ pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, 
         // `Game.GameType` is left out: it holds whatever mode the front end was in when the
         // original saved (0 quick race, 1 quick knockout, 2 knockout, 4 Evolution, 9 factory
         // driver — `controls.md` §SETTYPE*; 0x4D52EA saves after any race), which the career
-        // does not know. *(Until 2026-09-26 the port wrote `evolution_complete` as 0/1 here — the
-        // club flag `[0x691E54]`, already in the `Tournament` module — so a finished Evolution put
-        // the original into quick knockout on load.)*
+        // does not know. (history: `game-history.md` §18.4)
         ("OwnedCars.Car".into(), AccessorValue::OwnedCarSel { cars: c.garage.len() as u32, selection: side.owned_car_selection }),
         ("UserList.NameInput".into(), AccessorValue::Text(profile.name.clone())),
         ("Tournament.Data".into(), AccessorValue::Empty),
@@ -844,8 +842,7 @@ pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, 
         ("Audio.AmbientLevel".into(), AccessorValue::Dword(settings.ambient as u32)),
         ("Audio.Quality".into(), AccessorValue::Dword(settings.audio_quality as u32)),
         ("Graphics.ViewDistance".into(), AccessorValue::Dword(settings.view_distance as u32)),
-        // each the accessor's index, not the port's count *(until 2026-09-26 the port wrote the
-        // lap and knockout-opponent counts themselves, one more than the original reads)*
+        // each the accessor's index, not the port's count (history: `game-history.md` §18.5)
         ("Track1.Laps".into(), AccessorValue::Dword(laps_to_index(settings.laps))),
         ("Game.NumOpponents".into(), AccessorValue::Dword(settings.opponents)),
         ("Track1.Traffic".into(), AccessorValue::Dword(settings.traffic)),
@@ -980,7 +977,7 @@ pub fn career_from_sav(s: &SaveFile, tables: &CareerTables) -> Career {
         c.spares = recs
             .iter()
             .filter(|r| r.len() >= PART_RECORD_SIZE)
-            .map(|r| crate::shop::SparePart { id: get_i16(r, 0), state: f32::from_le_bytes([r[0x164], r[0x165], r[0x166], r[0x167]]) })
+            .map(|r| crate::shop::SparePart { id: get_i16(r, 0), state: bytes::read_f32(r, 0x164) })
             .collect();
     }
     // 0x51A760 copies the whole table back over `[0x69C8E8]`: the results `+0xE8` and the

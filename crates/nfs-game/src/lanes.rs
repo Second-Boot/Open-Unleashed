@@ -102,8 +102,8 @@ pub fn gap_between(table: &SliceTable, a_slice: usize, b_slice: usize) -> f32 {
 /// `+0x28`, `+0x3C4` ← `+0x10`, `+0x3D0` ← `+0x1C` of `slices[car+8]`, read 2026-09-26); only
 /// `Car_placeAtSlice` orthogonalises it, and the 0x49AF70 it ends with refreshes it again. So the
 /// dot is with the raw `x` / `z` of the slice's forward, **not** renormalised in x–z (0x40E8E9…
-/// 0x40E913: `f.x·dx + f.z·dz`). *(Until 2026-09-26 the port normalised it in x–z, an
-/// approximation that read `+0x3D0` as orthogonalised.)* Positions `None`: the coarse gap alone.
+/// 0x40E913: `f.x·dx + f.z·dz`). (history: `game-history.md` §4.1)
+/// Positions `None`: the coarse gap alone.
 pub fn gap_fine(table: &SliceTable, a_slice: usize, b_slice: usize, pos: Option<(glam::Vec3, glam::Vec3)>) -> f32 {
     let d = gap_between(table, a_slice, b_slice);
     match pos {

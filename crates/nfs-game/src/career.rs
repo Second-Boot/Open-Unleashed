@@ -270,8 +270,8 @@ impl OwnedCar {
 
     /// The four colours as `FECar+0x674…+0x680` hold them — exterior, interior, stripe 1,
     /// stripe 2 — each an accessor dword (`b0<<24 | b1<<16 | b2<<8 | b3`): [`OwnedCar::custom`]
-    /// where one was chosen, else the list row's, `rec+0x3EC` / `+0x530` / `+0x3F0` / `+0x3F4
-    /// + 16·row` (`savegame.md` §4.7a). An interior carries alpha 0xFF, as all 443 shipped entries
+    /// where one was chosen, else the list row's, `rec+0x3EC` / `+0x530` / `+0x3F0` /
+    /// `+0x3F4 + 16·row` (`savegame.md` §4.7a). An interior carries alpha 0xFF, as all 443 shipped entries
     /// do (the catalogue keeps its interiors as RGB). 0 for a row the record lacks.
     pub fn colour_words(&self, e: &CarCatalogEntry) -> [u32; 4] {
         let set = |row: u8, k: usize| e.paint_sets.get(row as usize).map_or(0, |p| p.packed[k]);
@@ -337,6 +337,7 @@ impl OwnedCar {
     ///   slot empty: for each `+0x75C` entry in turn, unmatched → a fresh copy is **pushed onto the
     ///   end** of `+0x758` (0x4F8B59…0x4F8C48), in the stock list's own order; matched → nothing.
     ///   No sort follows either push.
+    ///
     /// So "appended at the end, in stock order, no re-sort" is not the port's own choice — it is
     /// the original's rule for this operation, read off the one case it actually runs. (The
     /// exchange-sort at `+0x758`'s **construction** and at **load**, `owned_from_image`'s own
@@ -630,10 +631,8 @@ fn default_setup() -> [f32; 17] {
 /// zeroed record has type `+0x26` = 0, which none of the getters' kinds 1…10 matches — so a car
 /// with no parts (a traffic car: 16 of the 109 `nfs5.car` records — Eden 1…5 and EAS1…11 — carry no
 /// stock list; an owned car always keeps its body part, which the install list does not offer to
-/// remove, 0x516751) contributes nothing to the wear sums. *(Until 2026-09-30 the empty list took
-/// `nfs_physics::specs::fallback_parts`, six invented parts.)* *(Until 2026-09-26
-/// this was `zone_masks_for` — one mask per group, the family's first part of the type, whether
-/// installed or not — and `part_wear_for`, one summed scale and offset per group.)*
+/// remove, 0x516751) contributes nothing to the wear sums. (history: `game-history.md` §17.1)
+/// (history: `game-history.md` §17.2)
 pub fn installed_parts(parts: &[&Part], owned: Option<&OwnedCar>) -> Vec<nfs_physics::specs::InstalledPart> {
     parts
         .iter()
@@ -762,15 +761,7 @@ pub struct TournamentState {
     /// `Tournament.Tournament(TIMESCOMPLETED)` prints (0x506929).
     #[serde(default)]
     pub completions: u32,
-    // *(Until 2026-10-01 the port also kept `final_rank`, `prize` and `failed_attempts` here. None
-    // is a field of the original: the filing 0x503AD0 takes the rank from 0x503660 (0x503B9A) only
-    // to choose between completion and reset (`cmp eax, 3` at 0x503BA2 → 0x503CB3), the prize goes
-    // straight into the money (0x4EE06E), and the event records are zeroed — done byte, points,
-    // times, bonus, prize — by 0x503E40 on both era arms (0x503CB8) and inline on the club arm
-    // (0x503D74…0x503DD8) — so after the last event nothing in
-    // `nfs5.trn` or anywhere else holds the rank, the prize or a count of failed attempts; what
-    // stays is `+0xD3C` ([`Self::completions`]). They were lost at every front-end entry's reload
-    // (0x4D3B52); an older port JSON's three keys are ignored.)*
+    // (history: `game-history.md` §17.3)
 }
 
 /// What one of `repair.lay`'s ten `QUICKFIX` boxes repairs — the fix function 0x50F110 calls for
@@ -796,12 +787,7 @@ pub struct Career {
     pub money: i64,
     pub garage: Vec<OwnedCar>,
     pub tournaments: BTreeMap<i16, TournamentState>,
-    // *(Until 2026-09-27 the port also kept `finale` — a pending finale — and `eras_completed`
-    // — the eras whose finale was won. Neither is a field of the original: the finale is keyed
-    // on 0x504800 alone (the launch, 0x4ED66F / 0x4FC5BF, and the award 0x4EE17D through
-    // `PrizeCars.Car` 0x502550), its offer is the front end's screen stack
-    // (`[E, VictoryRoom] endofera`, 0x4D4809…0x4D484F), and a won finale leaves nothing but
-    // the prize car in the garage (0x502270). An older port JSON's two keys are ignored.)*
+    // (history: `game-history.md` §17.4)
     /// Evolution finished (Modern era completed, `0x691E54`).
     #[serde(default)]
     pub evolution_complete: bool,
@@ -812,10 +798,7 @@ pub struct Career {
     /// 3191 / 3342 / 3495 in the shipped table) overwritten with −1 by **0x51AF80**, which
     /// `ACCEPTPRIZECAR` 0x51A6D0 calls on the record the last mission race filed (`[0x69C8F0]`,
     /// [`Self::last_mission`]). The `Missions` module saves and loads the whole table
-    /// (0x51A870 / 0x51A760), so the mark rides in the `.sav`. *(Until 2026-10-01 the port kept a
-    /// list of accepted stages, `promotions_accepted`, which no `.sav` field held: every front-end
-    /// entry's reload (0x4D3B52) dropped it and the next mission race offered the stage's prize car
-    /// again.)*
+    /// (0x51A870 / 0x51A760), so the mark rides in the `.sav`. (history: `game-history.md` §17.5)
     #[serde(default)]
     pub prize_taken: Vec<bool>,
     /// Per `nfs5.fac` record: the last attempt's `+0xEA` time (race time `car+0xCD8`, 64 Hz ticks
@@ -974,8 +957,7 @@ impl Career {
     /// `[0x691E50]` (`era`) has already moved on. `None` when no era is complete: the original
     /// then answers the stack word its `push ecx` left (0x504800, `[esp+0x10]` at 0x50484A) —
     /// not an era id in practice, so 0x504990 falls to its first record ([`CareerTables::finale_record`]).
-    /// *(Until 2026-09-27 the port's notes read this as "the first era with an unfinished
-    /// tournament" — the current era — and its finale screens named the next era's finale.)*
+    /// (history: `game-history.md` §17.6)
     pub fn completed_era(&self, tables: &CareerTables) -> Option<Era> {
         let done = |e: Era| tables.tournaments.iter().filter(|t| t.kind == TournamentKind::Era(e) && !t.is_hidden()).all(|t| self.state(t.id).completed);
         [Era::Modern, Era::Golden, Era::Classic].into_iter().find(|e| done(*e))
@@ -1028,8 +1010,7 @@ impl Career {
     /// ```
     ///
     /// `year` is the chronicle year 0x5032C0. The cheat flag `[0x691A04]` (set only by the
-    /// handler 0x50DD70 → 0x4F4440) is not ported. *(Corrected 2026-09-26: the port widened the
-    /// last year to `max(first, last)`, which no shipped record needs but the original does not do.)*
+    /// handler 0x50DD70 → 0x4F4440) is not ported. (history: `game-history.md` §17.7)
     pub fn dealer_lists(&self, c: &CarCatalogEntry) -> bool {
         let y = self.year as i16;
         c.year as i16 <= y && y <= c.year_end as i16 && !matches!(c.dealer_flag_204, 2 | 3) && c.kind == 0
@@ -1100,8 +1081,7 @@ impl Career {
     /// car's **stock** parts (0x4EE9A0 — `controls.md` §4.169.6, which corrects "spares" here),
     /// each at its own `+0x164`; the installed list holds copies of them too, so an undamaged
     /// stock part in its slot cancels out, a damaged one lowers the value and an upgrade adds its
-    /// resale over the stock part's. *(Until 2026-09-25 the port kept the stock parts out of both
-    /// sums.)*
+    /// resale over the stock part's. (history: `game-history.md` §17.8)
     pub fn value_of(&self, tables: &CareerTables, owned: &OwnedCar) -> Option<i64> {
         let car = tables.car(owned.car_id)?;
         let installed: i64 = owned
@@ -1156,8 +1136,7 @@ impl Career {
             // `car+0x6A0` is 0, a car the game put there, and deletes it; with none (the list all
             // listings) nothing goes. This port keeps the listings in the garage under an asking
             // price, so they are counted there, and the market keeps the list's order, so its
-            // first car is the first such entry. *(Corrected 2026-09-26: the listings were not
-            // counted.)*
+            // first car is the first such entry. (history: `game-history.md` §17.9)
             let listed = self.garage.iter().filter(|c| c.asking_price.is_some()).count();
             if self.market.len() + listed >= USED_CAR_MARKET_MAX && !self.market.is_empty() {
                 self.market.remove(0);
@@ -1311,9 +1290,8 @@ impl Career {
     /// `+0x164` (`.PARTDAMAGE`) and `Z0` the zones the car was launched with (`.DAMAGEZONES`, the
     /// car's own `owned.damage` for a type the launch carries, 0x4EF41B…0x4EF45E). So a part gains
     /// `scale·(mean(Z1) − mean(Z0))` — this race's dents — and racing a dented car again without a
-    /// scratch leaves it as it was. *(Until 2026-09-27 the port added `scale·mean(Z1)` whole and
-    /// set no body part: every race counted the carried zones again. The type gate and the clamp
-    /// at 100 were added 2026-09-26.)* The automatic replay's second fold (0x416D31 again, from
+    /// scratch leaves it as it was. (history: `game-history.md` §17.10)
+    /// The automatic replay's second fold (0x416D31 again, from
     /// the playback's `Race_finalize(2)`) starts from the same `carried` and `Z0` — `Car_raceInit`
     /// reloads them at every pass — so `zones` is simply the last record's `+0xC98`.
     ///
@@ -1323,7 +1301,7 @@ impl Career {
     /// fold's own `mov [ebx+0x4E0]` (0x493DAE, types 1…10 only; `.text` scanned for `+0xC48`,
     /// `+0x4E0`, `+0xAD4` and `+0x174`, 2026-09-27). So such a part comes back at 0 (the `else 0`
     /// arm). No shipped part has such a type (`nfs5.prt`: types 1…10 only), so this is for the
-    /// rule's sake. *(Until 2026-09-27 the port left such a part as it was.)* 0x4EDD40's inner
+    /// rule's sake. (history: `game-history.md` §17.11) 0x4EDD40's inner
     /// loop runs over the installed-part **count** of record slots (`mov edi, edx`, 0x4EDDBC), not
     /// twenty; the race car's slots are filled in the installed order (0x49C5F1), so every
     /// installed part finds its own.
@@ -1411,9 +1389,7 @@ impl Career {
     /// So each part pays at the damage it has **then** — a part a box before already fixed pays
     /// nothing — and the body zones are cleared only by COSMETIC and OVERALL, all ten of them.
     /// COSMETIC fixes the one `"Body"` part although its cost (0x4EFF20) counts every category-10
-    /// part, rims and roof too. Returns what was spent. *(Corrected 2026-09-26: the port charged
-    /// the box's pre-computed cost, fixed every category-10 part for COSMETIC and cleared the
-    /// zones under the mask of every part it fixed, whatever the box.)*
+    /// part, rims and roof too. Returns what was spent. (history: `game-history.md` §17.12)
     ///
     /// Gap: a car with no `"Body"` part would hand 0x5189F0 a null part (0x4F07E7 `xor esi,
     /// esi`), which reads `[0+0x46]`; every shipped car has one, and the port skips it.
@@ -1481,7 +1457,7 @@ impl Career {
     /// `0x502190(car)`: accept the standing offer — the money is paid and the car leaves the garage.
     /// The payment is 0x5012E0's inline twin (0x5021DE…0x502226): the **amount** `car+0x694` is
     /// held to ±999 999 999 and then added to `[0x691D90]`; the sum is not clamped.
-    /// *(Corrected 2026-09-26: the port clamped the new balance.)*
+    /// (history: `game-history.md` §17.13)
     pub fn accept_offer(&mut self, tables: &CareerTables, idx: usize) -> Result<i64, CareerError> {
         let car = self.garage.get(idx).ok_or(CareerError::UnknownCar { id: 0 })?;
         let offer = car.offer.ok_or(CareerError::NoOffer)? as i64;
@@ -1587,9 +1563,7 @@ impl Career {
     /// ```
     ///
     /// `0x49C350` is the parts' order: category `+0x26`, then price `+0x5C`, then id `+0`, each
-    /// ascending and signed ([`part_less`]). *(Corrected 2026-09-25: the port matched the car's
-    /// family name against `part+0x04`, took the newest year of each part name, kept categories
-    /// 1…8 only and sorted by category, type name and price — none of which is the original's.)*
+    /// ascending and signed ([`part_less`]). (history: `game-history.md` §17.14)
     pub fn parts_for<'a>(&self, tables: &'a CareerTables, car: &CarCatalogEntry) -> Vec<&'a Part> {
         let mut v: Vec<&Part> = Vec::new();
         for id in &car.compatible_parts {
@@ -1627,7 +1601,7 @@ impl Career {
     /// (`career_ui`), which the original splits in two: the shop's buy 0x5183C0
     /// ([`Career::buy_spare`], the aged price into the inventory) and `INSTALLPART` 0x518510
     /// ([`Career::install_spare`]), which moves the part it replaces — a stock part included —
-    /// into the inventory. *(Until 2026-09-25 the replaced part was dropped.)*
+    /// into the inventory. (history: `game-history.md` §17.15)
     pub fn buy_part(&mut self, tables: &CareerTables, idx: usize, part_id: i16) -> Result<(), CareerError> {
         let part = tables.parts.iter().find(|p| p.id == part_id).ok_or(CareerError::UnknownPart { id: part_id })?;
         let car = self.garage.get(idx).and_then(|c| tables.car(c.car_id)).ok_or(CareerError::UnknownCar { id: 0 })?;
@@ -1726,8 +1700,8 @@ impl Career {
         // check 0x4D59F3…0x4D5B3F tests the car restriction (0x504A70 → 813), the part-way
         // tournaments (0x504B60 → 858) and the fee (0x503430 → 857), and nothing else — the
         // filing cleared its events (0x503E40), so the fee is due again, and a second completion
-        // counts `+0xD3C` (`TIMESCOMPLETED`) without the year step (`== 1`, 0x503BBC). *(Until
-        // 2026-09-27 the port refused a completed tournament.)* The hidden finales are not
+        // counts `+0xD3C` (`TIMESCOMPLETED`) without the year step (`== 1`, 0x503BBC). (history: `game-history.md` §17.16)
+        // The hidden finales are not
         // listed (0x504D00), so never selected.
         let era_ok = t.is_club() || t.era() == self.era;
         if self.availability(tables, t) == Availability::Locked || !era_ok {
@@ -1948,9 +1922,7 @@ impl Career {
     /// Finale race over: **0x4EE17D** — game type 10 and the player's place 1 → `PrizeCars.Car`'s
     /// car, `0x4F4360(0x5048D0(0x504800()))`, appended by 0x502270 (price 0, first paint set);
     /// nothing else is filed, won or lost — no money, no km / win (the type-4 arm 0x4EDFE6), no
-    /// tournament state, no era flag. Returns (won, prize car id). *(Until 2026-09-27 the award
-    /// read a port-only pending finale, which a profile load dropped, and a win also filed a
-    /// port-only `eras_completed`.)*
+    /// tournament state, no era flag. Returns (won, prize car id). (history: `game-history.md` §17.17)
     pub fn record_finale(&mut self, tables: &CareerTables, order: &[usize]) -> Option<(bool, u16)> {
         let prize = self.finale_tournament(tables)?.prize_car;
         let won = order.first() == Some(&0);
@@ -2011,9 +1983,7 @@ impl Career {
     /// finished, or every record passed) yes unless R's `+0xC` is −1 (0x51AFCD / 0x51AFFA), the mark
     /// 0x51AF80 leaves once R's prize was taken. So the offer belongs to the race that finished the
     /// stage and to no later one; the record answers with its own promotion text `+0xC` and prize
-    /// car `+0x10` (0x51B050). *(Until 2026-10-01 the port offered every finished stage whose
-    /// prize it had not seen accepted, from a list a profile reload dropped, so the next mission
-    /// race after any reload offered the first stage's car again.)*
+    /// car `+0x10` (0x51B050). (history: `game-history.md` §17.18)
     pub fn promotion_due<'a>(&self, tables: &'a CareerTables) -> Option<&'a Mission> {
         let r = self.last_mission?;
         let rec = tables.missions.get(r)?;
@@ -2215,7 +2185,7 @@ pub fn part_repair_cost(p: &Part, year: u16, state: f32) -> i64 {
 /// formula (`price·sum/100 − (100 − c)·aged/100 + price`), the complementary share — 20 % for an
 /// undamaged part, rising with damage. `0x518900` is a different function — the advanced repair
 /// screen's **replace** cost, `aged − this` (0x5171C5, 0x5175F8; [`crate::shop::part_replace_cost`]).
-/// *(Corrected 2026-09-25: it was said to belong to the parts shop.)*
+/// (history: `game-history.md` §17.19)
 pub(crate) fn part_resale(p: &Part, year: u16, state: f32) -> i64 {
     part_resale_from(part_aged_price(p, year), state)
 }
@@ -2262,8 +2232,7 @@ fn part_resale_from(aged: i64, state: f32) -> i64 {
 /// the port's `owned.parts` holds those copies too since 2026-09-25 ([`OwnedCar::fit_stock`]).
 /// The value is what `0x4F8E50` and `0x4F7E90` truncate into their damage bands.
 /// The result is the x87 value (53-bit, MSVC's precision control) that the callers hand straight
-/// to `_ftol` — an `f64` here, never rounded to `f32` on the way. *(Until 2026-09-26 it was stored
-/// as `f32`, an approximation that could round a total just under an integer up to it.)*
+/// to `_ftol` — an `f64` here, never rounded to `f32` on the way. (history: `game-history.md` §17.20)
 pub fn car_damage_pct(tables: &CareerTables, owned: &OwnedCar) -> f64 {
     let parts: Vec<(u16, f32)> = owned
         .parts

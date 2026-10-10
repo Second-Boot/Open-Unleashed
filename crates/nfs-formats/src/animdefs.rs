@@ -254,8 +254,8 @@ impl AnimDefs {
             if line.is_empty() {
                 continue;
             }
-            if line.starts_with("SECTION:") {
-                let kind = line["SECTION:".len()..].trim().to_ascii_uppercase();
+            if let Some(kind) = line.strip_prefix("SECTION:") {
+                let kind = kind.trim().to_ascii_uppercase();
                 pending = match kind.as_str() {
                     "ANIM" => Some("anim"),
                     "PIECE" => Some("piece"),

@@ -2,6 +2,7 @@
 
 use glam::{Mat4, Vec3};
 use nfs_assets::{car::CarAssets, mesh::article_meshes, track::TrackAssets};
+use nfs_formats::bytes;
 use nfs_renderer::{DrawItem, LayerLight, MaterialDesc, MaterialId, MeshData, MeshId, Renderer, TextureData, Vertex};
 use std::collections::HashMap;
 
@@ -82,8 +83,8 @@ pub struct TrackWorld {
     /// Props playing their own looping animation: an `.scn`-instanced library piece whose
     /// `animdefs.txt` definition loops it (`RE/notes/crp-geometry.md` §7 — the shipped file loops
     /// exactly two, the two dockers; every other `PIECE` animation there is played on impact, the
-    /// breakables below). *(Until 2026-09-30 this also held autobahn's `"Locomotive"`; every
-    /// `WAnimBundle` article now moves through [`Self::anim_articles`].)* (The smackables are car records whose player only follows the
+    /// breakables below). (history: `game-history.md` §9.1)
+    /// (The smackables are car records whose player only follows the
     /// body, 0x471180 — none of their definitions has pieces.)
     animated: Vec<AnimatedProp>,
     /// The Locomotive's own path, for the game's audio update to sample every tick
@@ -122,8 +123,7 @@ pub struct TrackWorld {
     article_seq: Vec<u32>,
     /// The track's own geometry, one entry per placed article (the breakables' apart), each LOD's
     /// draw items uploaded — what the walk's draw picks from per frame ([`Self::visible_items`]).
-    /// *(Until 2026-09-26 every article's lowest LOD was merged per material into a few hundred
-    /// meshes and clipped by the far plane alone.)*
+    /// (history: `game-history.md` §9.2)
     pub track_lods: Vec<TrackArticleGpu>,
     /// The `Vis ` segments the walk's occlusion test 0x488B50 uses.
     pub occluders: Vec<Occluder>,
@@ -264,6 +264,27 @@ struct UvPlan {
     targets: Vec<(UvTarget, u32, i32)>,
     applied: Option<u32>,
 }
+
+/// The instance items [`TrackWorld::upload`] builds in its phases (breakables, smackables, the
+/// scene's elements): the draw items, the walk's instance entries and each item's `(entry, LOD)`.
+#[derive(Default)]
+struct ItemLists {
+    items: Vec<DrawItem>,
+    instance_culls: Vec<InstanceCull>,
+    item_cull: Vec<Option<(usize, u8)>>,
+}
+
+/// What [`TrackWorld::upload_scene_items`] returns besides the items themselves.
+struct SceneItems {
+    animated: Vec<AnimatedProp>,
+    smackables: Vec<SmackableSpawn>,
+    instance_flares: Vec<(usize, TrackFlare)>,
+    /// the `WSceneBundle`'s items for the fitted tree's population: (article, world matrix)
+    scene_items: Vec<(usize, Mat4)>,
+}
+
+/// One uploaded LOD of a library article: its LOD number and its meshes with their materials.
+type LodMeshes = (u8, Vec<(MeshId, MaterialId)>);
 
 /// The buffers [`TrackWorld::track_draw_lists_into`] fills, kept between frames.
 #[derive(Default)]
@@ -514,7 +535,7 @@ impl<'a> CellWalk<'a> {
     /// [`Self::visit`] with the gate that dropped the cell.
     pub fn gate(&self, cx: f32, cy: f32, cz: f32, r: f32, nodes: &[RegisteredNode]) -> Result<u32, CellDrop> {
         let v = &self.v;
-        if NODE_PRUNE && nodes.iter().all(|&(_, ncx, ncz, nr)| node_wholly_pruned(v, ncx, ncz, nr)) {
+        if NODE_PRUNE && nodes.iter().all(|n| node_wholly_pruned(v, n.cx, n.cz, n.r)) {
             return Err(CellDrop::Nodes);
         }
         let centre = Vec3::new(cx, cy, cz);
@@ -578,7 +599,7 @@ impl TrackWorld {
         let articles = self.cull_articles.iter().zip(self.article_nodes.iter()).zip(self.article_seq.iter()).map(|((a, nodes), &seq)| {
             let a = a.as_ref()?;
             // the first registered node the node pass does not drop (nodes are in tree order)
-            let first = if NODE_PRUNE && !nodes.is_empty() { Some(nodes.iter().find(|&&(_, ncx, ncz, nr)| !node_wholly_pruned(v, ncx, ncz, nr))?.0) } else { nodes.first().map(|n| n.0) };
+            let first = if NODE_PRUNE && !nodes.is_empty() { Some(nodes.iter().find(|n| !node_wholly_pruned(v, n.cx, n.cz, n.r))?.id) } else { nodes.first().map(|n| n.id) };
             let mut d = walk_item(v, &near, a.drawer, a.centre, a.radius, &a.lods)?;
             d.order = (first.unwrap_or(0), seq);
             Some(d)
@@ -587,7 +608,7 @@ impl TrackWorld {
             let (c, r) = self.instance_sphere(ic)?;
             // the node pass drops an item whose registered node is wholly outside the wedge or the
             // far circle, as for an article (0x47F400); the list order is the registration's
-            let (id, ncx, ncz, nr) = reg.node;
+            let RegisteredNode { id, cx: ncx, cz: ncz, r: nr } = reg.node;
             if NODE_PRUNE && node_wholly_pruned(v, ncx, ncz, nr) {
                 return None;
             }
@@ -627,7 +648,7 @@ impl TrackWorld {
                         next_scene - 1
                     }
                 };
-                InstanceReg { node: (n.id, cx, cz, nr), seq, centre }
+                InstanceReg { node: RegisteredNode { id: n.id, cx, cz, r: nr }, seq, centre }
             })
             .collect();
         self.instance_regs = regs;
@@ -645,9 +666,9 @@ impl TrackWorld {
             }
             self.instance_regs[k].centre = centre;
             let n = self.fitted.node_for_sphere(centre.x, centre.y, centre.z, r);
-            if n.id != self.instance_regs[k].node.0 {
+            if n.id != self.instance_regs[k].node.id {
                 let (cx, cz, nr) = self.fitted.circle(n);
-                self.instance_regs[k].node = (n.id, cx, cz, nr);
+                self.instance_regs[k].node = RegisteredNode { id: n.id, cx, cz, r: nr };
                 self.instance_regs[k].seq = self.next_seq;
                 self.next_seq += 1;
             }
@@ -693,10 +714,8 @@ impl TrackWorld {
     /// drawn frame for the rest of the race** — `+8` is kept while the lead's state is 1 or 2
     /// (0x476810) and cleared only by the race start's reset 0x476170 (`suspension-collision.md`
     /// §9 "The track's smackables"). Every shipped kind-3 part on a `tr` article sits on a `BBOX` /
-    /// `HYDR` / `PSTV` / `TRSH` prop (`nfs-game/examples/ef3anim.rs`). *(Corrected 2026-09-26:
-    /// the earlier reading ran it on the start frame alone, "once per hit" — 0x4761FC, taken for
-    /// the clear, is in the race-start reset; and until that day kind 3 ran on every drawn frame of
-    /// such an article, as kind 2 does, whether struck or not.)* A track smackable's article is
+    /// `HYDR` / `PSTV` / `TRSH` prop (`nfs-game/examples/ef3anim.rs`). (history: `game-history.md` §9.3)
+    /// A track smackable's article is
     /// drawn apart, so the walk's answer is its instance entry's (its sphere through the body's
     /// pose, 0x4786A0). The value is the walk's — *(settled 2026-09-27: 0x450980 does read the
     /// view's `+0xC` twice (its first argument, `[[esp+0x6C]+0xC]`, at 0x4509DC and again at
@@ -841,7 +860,7 @@ pub fn track_occluders(track: &TrackAssets) -> Vec<Occluder> {
     let Some(e) = track.crp.level.iter().find(|e| e.is_level(b"Vis ")) else { return Vec::new() };
     let nfs_formats::crp::CrpEntry::Level { b: count, .. } = e else { return Vec::new() };
     let Ok(d) = track.crp.entry_data(&track.crp_data, e) else { return Vec::new() };
-    let f = |o: usize| f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+    let f = |o: usize| bytes::read_f32(d, o);
     (0..*count as usize)
         .take_while(|i| (i + 1) * 24 <= d.len())
         .map(|i| {
@@ -989,14 +1008,14 @@ pub fn tree_population_with_scene(track: &TrackAssets, articles: &[Option<CullAr
             max[k] = max[k].max(hi[k]);
         }
         let Some(base) = a.level(b"Base").and_then(|e| track.crp.entry_data(&track.crp_data, e).ok()) else { return };
-        let u32_at = |o: usize| base.get(o..o + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+        let u32_at = |o: usize| bytes::get_u32(base, o).map_or(0, |v| v as usize);
         let o = 0x64 + 12 * u32_at(8);
-        let Some(lod) = base.get(o + 8..o + 10).map(|w| u16::from_le_bytes([w[0], w[1]])) else { return };
+        let Some(lod) = bytes::get_u16(base, o + 8) else { return };
         // a record with LOD `0xFFFF` takes the article's first `vt` (0x47B819…0x47B81E)
         let vt = if lod == 0xFFFF { a.parts.iter().find(|p| p.is_part(b"vt")) } else { a.find(b"vt", lod) };
         let Some(vt) = vt else { return };
         let Ok(d) = track.crp.entry_data(&track.crp_data, vt) else { return };
-        let f = |o: usize| f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+        let f = |o: usize| bytes::read_f32(d, o);
         points.extend((0..d.len() / 16).map(|i| (f(16 * i), f(16 * i + 8))));
     };
     for (a, c) in arts.iter().zip(articles) {
@@ -1035,7 +1054,13 @@ pub fn parked_scene_slots(geom_elements: usize) -> Vec<nfs_assets::track::PropIn
 }
 
 /// A node an article is registered into: its allocation number and its circle `(cx, cz, r)`.
-pub type RegisteredNode = (u32, f32, f32, f32);
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RegisteredNode {
+    pub id: u32,
+    pub cx: f32,
+    pub cz: f32,
+    pub r: f32,
+}
 
 /// The registration of every [`cull_articles`] entry (0x487D72's loop over the bundles in the
 /// order Instance, Anim, MidGround, Static — `.crp` order inside each — into 0x489370 → 0x489530),
@@ -1061,7 +1086,7 @@ pub type RegisteredNode = (u32, f32, f32, f32);
 pub fn build_article_nodes(tree: &crate::fitted_tree::FittedTree, articles: &[Option<CullArticle>]) -> (Vec<Vec<RegisteredNode>>, Vec<u32>) {
     let reg = |n: &crate::fitted_tree::Node| {
         let (cx, cz, r) = tree.circle(n);
-        (n.id, cx, cz, r)
+        RegisteredNode { id: n.id, cx, cz, r }
     };
     let mut nodes = vec![Vec::new(); articles.len()];
     let mut seq = vec![u32::MAX; articles.len()];
@@ -1167,7 +1192,7 @@ fn article_base(track: &TrackAssets, a: &nfs_formats::crp::Article) -> Option<(V
     let lods = (0..base.lod_count as usize)
         .map_while(|i| {
             let o = 100 + 12 * i;
-            let w = |k: usize| u16::from_le_bytes([bytes[o + k], bytes[o + k + 1]]);
+            let w = |k: usize| nfs_formats::bytes::read_u16(bytes, o + k);
             (o + 12 <= bytes.len()).then(|| CullLod { distance: w(10), effects: bytes[o + 1] != 0, first: w(4), last: w(6), lod: w(8) as u8 })
         })
         .collect();
@@ -1233,12 +1258,12 @@ pub fn track_projectors(track: &TrackAssets) -> Vec<Projector> {
         let tr = g.transform.as_ref().map(Mat4::from_cols_array).unwrap_or(Mat4::IDENTITY);
         for p in a.parts.iter().filter(|p| p.is_part(b"ef")) {
             let Ok(d) = track.crp.entry_data(&track.crp_data, p) else { continue };
-            if d.len() < 0x48 || u32::from_le_bytes([d[0], d[1], d[2], d[3]]) != 4 {
+            if d.len() < 0x48 || bytes::read_u32(d, 0) != 4 {
                 continue;
             }
             let f = |i: usize| {
                 let o = 8 + 4 * i;
-                f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+                bytes::read_f32(d, o)
             };
             out.push(Projector {
                 article,
@@ -1285,10 +1310,10 @@ pub fn track_emitters(track: &TrackAssets) -> Vec<crate::track_particles::Emitte
         let tr = g.transform.as_ref().map(Mat4::from_cols_array).unwrap_or(Mat4::IDENTITY);
         for p in a.parts.iter().filter(|p| p.is_part(b"ef")) {
             let Ok(d) = track.crp.entry_data(&track.crp_data, p) else { continue };
-            if d.len() < 0x34 || u32::from_le_bytes([d[0], d[1], d[2], d[3]]) != 3 {
+            if d.len() < 0x34 || bytes::read_u32(d, 0) != 3 {
                 continue;
             }
-            let f = |o: usize| f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+            let f = |o: usize| bytes::read_f32(d, o);
             // the point through `tr` is where the running system emits (0x450980 → slot 4
             // 0x4550B0 with the placement's point, 0x450B0D…0x450B22); the prime's point and the
             // two directions are the part's own — 0x455030 copies the part's 48 bytes and
@@ -1302,7 +1327,7 @@ pub fn track_emitters(track: &TrackAssets) -> Vec<crate::track_particles::Emitte
                 local,
                 dir_a: Vec3::new(f(0x18), f(0x1C), f(0x20)),
                 dir_b: Vec3::new(f(0x24), f(0x28), f(0x2C)),
-                tag: u32::from_le_bytes([d[0x30], d[0x31], d[0x32], d[0x33]]),
+                tag: bytes::read_u32(d, 0x30),
             });
         }
     }
@@ -1330,11 +1355,11 @@ fn article_flares(track: &TrackAssets, article: usize, a: &nfs_formats::crp::Art
     let mut out = Vec::new();
     for p in a.parts.iter().filter(|p| p.is_part(b"ef")) {
         let Ok(d) = track.crp.entry_data(&track.crp_data, p) else { continue };
-        if d.len() < 0x2C || u32::from_le_bytes([d[0], d[1], d[2], d[3]]) != 2 {
+        if d.len() < 0x2C || bytes::read_u32(d, 0) != 2 {
             continue;
         }
-        let f = |o: usize| f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
-        let w = |o: usize| u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+        let f = |o: usize| bytes::read_f32(d, o);
+        let w = |o: usize| bytes::read_u32(d, o);
         out.push(TrackFlare {
             article,
             part: p.part_index(),
@@ -1576,13 +1601,7 @@ impl TrackWorld {
     pub fn upload(r: &mut Renderer, track: &TrackAssets) -> anyhow::Result<Self> {
         let geometry = track.build_geometry()?;
         let materials = track.materials()?;
-        let mut tex_ids = HashMap::new();
-        // every track texture in one go: the pixels are written from worker threads, the ids are
-        // the same consecutive ones, in file order
-        let items: Vec<(u32, u32, &[Vec<u8>])> = track.textures.iter().map(|t| (t.width, t.height, t.mips.as_slice())).collect();
-        for (tex, id) in track.textures.iter().zip(r.upload_textures(&items)) {
-            tex_ids.insert(tex.name.clone(), (id, tex.has_alpha));
-        }
+        let tex_ids = Self::upload_track_textures(r, track);
         let methods = track.crp.render_methods(&track.crp_data).unwrap_or_default();
         let mut mat_ids: HashMap<u16, MaterialId> = HashMap::new();
         let mut material_for = |r: &mut Renderer, id: u16| {
@@ -1620,9 +1639,7 @@ impl TrackWorld {
         // The track's own geometry: the walk 0x47F890 draws each article on its own through its
         // drawer with the LOD the distance picks (`RE/RENDERING.md` "The track draw's culling"), so
         // every placed article keeps its own meshes per LOD and per material, at its own transform.
-        // *(Until 2026-09-26 the lowest LODs were merged per material — a few hundred meshes clipped
-        // by the far plane alone; the original's mid-ground reaches 600 / 700 m past the draw
-        // distance and the near articles switch LOD.)*
+        // (history: `game-history.md` §9.4)
         // `WSceneBundle`'s own tree contribution (`scene_props`'s doc: `0x46D1D0` over `[0x628168]`)
         // is appended after the crp-article props so every index a `Breakable`/`SmackableSpawn`
         // stored before this point (keyed by `.crp` article, not by position in `props`) stays
@@ -1670,9 +1687,143 @@ impl TrackWorld {
             .filter(|a| a.animation.is_some() && track.animdefs.sound_by_fourcc(a.tag).is_some())
             .map(|a| a.index)
             .collect();
+        let mut track_lods = Self::upload_track_lods(r, &geometry, &|k| breakable_articles.contains(&k) || smackable_articles.contains(&k), &mut material_for);
+        let mut lists = ItemLists::default();
+        let broken = Self::breakables(r, track, &geometry, &props, &mut lists, &mut material_for);
+        let (moved, smack_anims) = Self::upload_track_smackables(r, track, &geometry, &track_smackables, &mut lists, &mut material_for);
+        // The `sound_articles` object above ("Locomotive"/`tag=TRAN`) only feeds the ambient
+        // sound here ([`AnimatedSound`]); its picture is drawn like every other `WAnimBundle` article
+        // (`track_lods`, [`TrackWorld::animate_articles`]). A `WAnimBundle` article with no
+        // `animdefs.txt` piece plays at 0.1 s a frame, always looping (`WAnimBundle::Load` 0x4777F0,
+        // 0x4779DF…0x4779F7: `0x471490(…, flags=[0x5B45A4] = 1, 0.1f, …)`), started at track load
+        // (0x477A0E) and sampled on the race clock from phase 0. CONFIRMED; the full trace:
+        // `RE/notes/game-history.md` §33.3.
+        let animated_sound = Self::animated_sound(track, &geometry, &sound_articles);
+        let lib_gpu = Self::upload_library(r, &geometry, &mut material_for);
+        let arts = track.crp.articles(&track.crp_data).unwrap_or_default();
+        let mut item_element = vec![None; lists.items.len()];
+        let SceneItems { animated, smackables, instance_flares, scene_items } = Self::upload_scene_items(track, &geometry, &lib_gpu, &arts, &mut lists, &mut item_element);
+        let ItemLists { mut items, instance_culls, item_cull } = lists;
+        let (env_by_id, env_map) = Self::upload_env_textures(r, track);
+        let flags: Vec<u32> = materials.iter().map(|m| m.flags).collect();
+        let collision = geometry.collision_grid(20.0, &|mat| flags.get(mat as usize).copied().unwrap_or(0));
+        // (history: `game-history.md` §9.6)
+        let walls = nfs_physics::walls::WallSet::build(track.edges.iter().flat_map(|e| e.segments.iter().map(|s| s.loaded())), 30.0);
+        // `WTrack+0x24`, wired: `insertAll(C)` (patches + `kCylinder`/`kBox` props, bundle by
+        // bundle, `RE/RENDERING.md` "Bundle order, read 2026-09-28") then `insertAll(A)` (every
+        // `.edg` wall in file order, `WallSet::build`'s own input order above).
+        let patches = collision.patches();
+        let mut tree_order = track_tree_order(&track.crp, &track.crp_data, &arts, &geometry.world, &patches, &props, &scene_indices);
+        tree_order.extend((0..walls.walls().len()).map(nfs_physics::track_tree::TreeItem::Wall));
+        let tree = nfs_physics::track_tree::TrackTree::build(&patches, &props, walls.walls(), &tree_order);
+        let start = track
+            .start_forward
+            .as_ref()
+            .and_then(|s| s.of_kind(&nfs_formats::scn::ElementKind::Trigger).next())
+            .map(|e| Vec3::from(e.position))
+            .unwrap_or(Vec3::ZERO);
+        let ambient = track
+            .map
+            .section("header")
+            .and_then(|h| h.get_f32_list("ambient"))
+            .filter(|a| a.len() == 4)
+            .map(|a| ((a[1] + a[2] + a[3]) / 3.0).clamp(0.2, 0.9))
+            .unwrap_or(0.35);
+        tracing::info!(items = items.len(), triangles = collision.triangle_count(), walls = walls.len(), "track uploaded");
+        if !animated.is_empty() {
+            tracing::info!(props = animated.len(), "animated props");
+        }
+        let map_light = MapLight::from_map(&track.map);
+        let sun_direction = track.sky_bin.as_ref().map(|b| -Vec3::from(b.sun_position()).normalize_or_zero()).filter(|d| *d != Vec3::ZERO).unwrap_or(Vec3::NEG_Y);
+        let map_sections = MapSection::all(&track.map);
+        Self::mark_lit_items(track, &materials, &mat_ids, &mut items, &mut track_lods);
+        // materials whose render method builds `RCustomLayers::LayerUVAnimate` (0x8001) — water
+        // and flags/banners (`RE/drafts/round1/render-core.md` §4.4)
+        let uv_animate: HashMap<MaterialId, nfs_assets::track::UvAnimate> = mat_ids
+            .iter()
+            .filter_map(|(id, mid)| materials.get(*id as usize).and_then(|m| nfs_assets::track::uv_animate(&methods, m)).map(|a| (*mid, a)))
+            .collect();
+        tracing::info!(props = props.len(), breakable = props.iter().filter(|p| p.breakable.is_some()).count(), "track props");
+        let projectors = track_projectors(track);
+        let projector_texture = projectors.first().and_then(|p| tex_ids.get(&p.texture)).map(|t| t.0);
+        let projector_registered = vec![false; projectors.len()];
+        let cull_articles = cull_articles(track);
+        let population = tree_population_with_scene(track, &cull_articles, &scene_items);
+        let fitted = std::sync::Arc::new(crate::fitted_tree::FittedTree::new(population.min, population.max, &population.points));
+        let (article_nodes, article_seq) = build_article_nodes(&fitted, &cull_articles);
+        let next_seq = article_seq.iter().filter(|&&q| q != u32::MAX).count() as u32;
+        let anim_articles = Self::anim_articles(track, &cull_articles, &mut track_lods);
+        let occluders = track_occluders(track);
+        tracing::info!(articles = cull_articles.iter().flatten().count(), drawn = track_lods.len(), lods = track_lods.iter().map(|a| a.lods.len()).sum::<usize>(), occluders = occluders.len(), instances = instance_culls.len(), "track culling");
+        let mut world = Self {
+            items,
+            item_element,
+            hidden: std::collections::HashSet::new(),
+            env_map,
+            collision,
+            fitted,
+            props,
+            patches,
+            walls,
+            tree,
+            start,
+            ambient,
+            map_light,
+            sun_direction,
+            map_sections,
+            env_by_id,
+            smackables: smackables.into_iter().chain(track_smackables).take(MAX_SMACKABLES).collect(),
+            moved,
+            smack_anims,
+            animated,
+            animated_sound,
+            broken,
+            flares: track_flares(track),
+            emitters: track_emitters(track),
+            projectors,
+            projector_texture,
+            projector_registered,
+            cull_articles,
+            article_nodes,
+            article_seq,
+            track_lods,
+            occluders,
+            instance_culls,
+            instance_regs: Vec::new(),
+            instance_flares,
+            item_cull,
+            uv_animate,
+            uv_plan: UvPlan::default(),
+            anim_articles,
+            next_seq,
+        };
+        world.register_instances();
+        Ok(world)
+    }
+
+    /// Every track texture in one go: the pixels are written from worker threads, the ids are the
+    /// same consecutive ones, in file order. Keyed by name: `(id, has_alpha)`.
+    fn upload_track_textures(r: &mut Renderer, track: &TrackAssets) -> HashMap<String, (nfs_renderer::TextureId, bool)> {
+        let mut tex_ids = HashMap::new();
+        let items: Vec<(u32, u32, &[Vec<u8>])> = track.textures.iter().map(|t| (t.width, t.height, t.mips.as_slice())).collect();
+        for (tex, id) in track.textures.iter().zip(r.upload_textures(&items)) {
+            tex_ids.insert(tex.name.clone(), (id, tex.has_alpha));
+        }
+        tex_ids
+    }
+
+    /// Every placed world article's meshes per LOD at its own transform (the walk 0x47F890 draws
+    /// each through its drawer), but those `skip` names (the breakables', the smackables'), with
+    /// each part's flag word, key word and world sphere centre.
+    fn upload_track_lods(
+        r: &mut Renderer,
+        geometry: &nfs_assets::track::TrackGeometry,
+        skip: &dyn Fn(usize) -> bool,
+        material_for: &mut dyn FnMut(&mut Renderer, u16) -> MaterialId,
+    ) -> Vec<TrackArticleGpu> {
         let mut track_lods: Vec<TrackArticleGpu> = Vec::new();
         for art in &geometry.world {
-            if breakable_articles.contains(&art.index) || smackable_articles.contains(&art.index) {
+            if skip(art.index) {
                 continue;
             }
             let lods = art
@@ -1685,80 +1836,102 @@ impl TrackWorld {
             let parts = art.lods.iter().map(|(_, meshes)| meshes.iter().map(|mm| (mm.flags, mm.key_hi, art.transform.transform_point3(Vec3::from(mm.centre)))).collect()).collect();
             track_lods.push(TrackArticleGpu { article: art.index, lods, parts });
         }
-        let mut items = Vec::new();
-        let mut instance_culls: Vec<InstanceCull> = Vec::new();
-        let mut item_cull: Vec<Option<(usize, u8)>> = Vec::new();
-        let broken = Self::breakables(r, track, &geometry, &props, &mut items, &mut instance_culls, &mut item_cull, &mut material_for);
-        // each track smackable's article: an instance item of its own (the walk answers it through
-        // 0x4786A0 with the body's pose, 0x450010 picks the LOD from its own records), every LOD
-        // uploaded, drawn at `pose · home⁻¹ · tr` ([`Self::place_smackable`])
+        track_lods
+    }
+
+    /// Each track smackable's article: an instance item of its own (the walk answers it through
+    /// 0x4786A0 with the body's pose, 0x450010 picks the LOD from its own records), every LOD
+    /// uploaded, drawn at `pose · home⁻¹ · tr` ([`Self::place_smackable`]).
+    #[allow(clippy::type_complexity)]
+    fn upload_track_smackables(
+        r: &mut Renderer,
+        track: &TrackAssets,
+        geometry: &nfs_assets::track::TrackGeometry,
+        track_smackables: &[SmackableSpawn],
+        lists: &mut ItemLists,
+        material_for: &mut dyn FnMut(&mut Renderer, u16) -> MaterialId,
+    ) -> (HashMap<SmackableOwner, (Mat4, Vec<(usize, Mat4)>)>, Vec<SmackAnim>) {
+        let ItemLists { items, instance_culls, item_cull } = lists;
         let mut moved: HashMap<SmackableOwner, (Mat4, Vec<(usize, Mat4)>)> = HashMap::new();
         let mut smack_anims: Vec<SmackAnim> = Vec::new();
-        {
-            let arts = track.crp.articles(&track.crp_data).unwrap_or_default();
-            for sp in &track_smackables {
-                let SmackableOwner::Article(k) = sp.owner else { continue };
-                let Some(own) = geometry.world.iter().find(|a| a.index == k) else { continue };
-                let slot = arts.get(k).and_then(|a| article_base(track, a)).map(|(centre, radius, lods)| {
-                    instance_culls.push(InstanceCull { centre, radius, lods, first_item: items.len(), broken: None, article: Some(k) });
-                    instance_culls.len() - 1
-                });
-                let first = items.len();
-                let drawn = if slot.is_some() { &own.lods[..] } else { &own.lods[..own.lods.len().min(1)] };
-                for (lod, meshes) in drawn {
-                    for mm in meshes {
-                        items.push(DrawItem::new(r.upload_mesh(&mm.mesh), material_for(r, mm.material), own.transform));
-                        item_cull.push(slot.map(|s| (s, *lod)));
+        let arts = track.crp.articles(&track.crp_data).unwrap_or_default();
+        for sp in track_smackables {
+            let SmackableOwner::Article(k) = sp.owner else { continue };
+            let Some(own) = geometry.world.iter().find(|a| a.index == k) else { continue };
+            let slot = arts.get(k).and_then(|a| article_base(track, a)).map(|(centre, radius, lods)| {
+                instance_culls.push(InstanceCull { centre, radius, lods, first_item: items.len(), broken: None, article: Some(k) });
+                instance_culls.len() - 1
+            });
+            let first = items.len();
+            let drawn = if slot.is_some() { &own.lods[..] } else { &own.lods[..own.lods.len().min(1)] };
+            for (lod, meshes) in drawn {
+                for mm in meshes {
+                    items.push(DrawItem::new(r.upload_mesh(&mm.mesh), material_for(r, mm.material), own.transform));
+                    item_cull.push(slot.map(|s| (s, *lod)));
+                }
+            }
+            moved.insert(sp.owner, (sp.pose().inverse(), (first..items.len()).map(|i| (i, own.transform)).collect()));
+            smack_anims.push(SmackAnim { article: k, slot, home: sp.position, position: sp.position, state: 0, armed: false });
+        }
+        (moved, smack_anims)
+    }
+
+    /// The headlight flags of every item: `headlit` where the material's render method builds
+    /// `Headlights::LayerVertexLight`, `uv_lit` where it builds `Headlights::LayerUVLight`.
+    fn mark_lit_items(
+        track: &TrackAssets,
+        materials: &[nfs_formats::crp::Material],
+        mat_ids: &HashMap<u16, MaterialId>,
+        items: &mut [DrawItem],
+        track_lods: &mut [TrackArticleGpu],
+    ) {
+        // the items whose render method builds `Headlights::LayerVertexLight` (0x8002 / 0x8003)
+        let lit_methods = nfs_assets::track::vertex_light_methods(&track.crp, &track.crp_data);
+        let lit: std::collections::HashSet<MaterialId> = mat_ids
+            .iter()
+            .filter(|(id, _)| materials.get(**id as usize).is_some_and(|m| lit_methods.contains(&m.render_method)))
+            .map(|(_, mid)| *mid)
+            .collect();
+        // the items whose render method builds `Headlights::LayerUVLight` (0x8004) — the `HEAD`
+        // decal of `lighting.md` §5.2, two layers in every night track's `Opaque` method
+        let uv_methods = nfs_assets::track::uv_light_methods(&track.crp, &track.crp_data);
+        let uv: std::collections::HashSet<MaterialId> = mat_ids
+            .iter()
+            .filter(|(id, _)| materials.get(**id as usize).is_some_and(|m| uv_methods.contains(&m.render_method)))
+            .map(|(_, mid)| *mid)
+            .collect();
+        for it in items.iter_mut().chain(track_lods.iter_mut().flat_map(|a| a.lods.iter_mut().flat_map(|(_, v)| v.iter_mut()))) {
+            it.headlit = lit.contains(&it.material);
+            it.uv_lit = uv.contains(&it.material);
+        }
+    }
+
+    /// Every `WAnimBundle` article moves with its own player: its draw items start at
+    /// frame 0's matrix, the same the registration used.
+    fn anim_articles(track: &TrackAssets, cull_articles: &[Option<CullArticle>], track_lods: &mut [TrackArticleGpu]) -> Vec<AnimArticle> {
+        let mut anim_articles: Vec<AnimArticle> = Vec::new();
+        let arts = track.crp.articles(&track.crp_data).unwrap_or_default();
+        for (i, c) in cull_articles.iter().enumerate() {
+            let Some(c) = c.as_ref().filter(|c| c.drawer == ArticleDrawer::Anim) else { continue };
+            let Some(track_anim) = arts.get(i).and_then(|a| track.crp.article_animation(&track.crp_data, a)) else { continue };
+            let Some((centre, radius, _)) = arts.get(i).and_then(|a| article_base(track, a)) else { continue };
+            let matrix = anim_matrix(&track_anim, 0.0, WANIM_BUNDLE_DEFAULT_SECONDS_PER_FRAME, WANIM_BUNDLE_DEFAULT_LOOPING);
+            let gpu = track_lods.iter().position(|g| g.article == i);
+            if let Some(g) = gpu.and_then(|g| track_lods.get_mut(g)) {
+                for (_, its) in g.lods.iter_mut() {
+                    for it in its.iter_mut() {
+                        it.transform = matrix;
                     }
                 }
-                moved.insert(sp.owner, (sp.pose().inverse(), (first..items.len()).map(|i| (i, own.transform)).collect()));
-                smack_anims.push(SmackAnim { article: k, slot, home: sp.position, position: sp.position, state: 0, armed: false });
             }
+            anim_articles.push(AnimArticle { article: i, track: track_anim, centre, radius, gpu, matrix, registered: c.centre });
         }
-        // The `sound_articles` object above ("Locomotive"/`tag=TRAN`) only feeds the ambient
-        // sound here ([`AnimatedSound`]); since 2026-09-30 (`COVERAGE` §14.79) its picture
-        // is drawn like every other `WAnimBundle` article — through `track_lods` and the walk, its
-        // matrix the player's ([`TrackWorld::animate_articles`]; the track's frames are already
-        // world-space — `frame 0`/`frame 250` land on the same point, a closed loop — and the
-        // article's vertices are in its own frame). The rate and loop notes that follow are the
-        // rule of all of them:
-        // CONFIRMED (2026-10-01, `COVERAGE-2026-09-26.md` §14.42 — settles the
-        // `572752fc`'s open approximation): the *default* `secondsPerFrame`/loop rule a
-        // `WAnimBundle` article gets when it has no `animdefs.txt SECTION:ANIM` piece of its own.
-        // `WAnimBundle::Load` 0x4777F0, at 0x4779DF..0x4779F7, constructs one player per claimed
-        // article with `0x471490(this, frames, AnqtPtr, vertexFlag=0, flags=[0x5B45A4], 0.1f,
-        // heading=0)` — `frames`/`AnqtPtr` from the article's own `Anqt` *part* record's `b`
-        // (element count) and (flag-adjusted) `rel_offset` fields (`crp-geometry.md` §2, not a
-        // separate `Anim` part — `WAnimBundle::Load` never searches for one), the literal float
-        // `0x3DCCCCCD` (**0.1 s/frame, 10 fps** — not `0.1/playbackrate`: there is no piece to read
-        // a `playbackrate` from) and the *global constant* read from `[0x5B45A4]` — read directly
-        // off the shipped `.exe`'s `.rdata`, **= 1** — as the flags word `AnimPlayer::sample`
-        // 0x470E90 tests bit 0 of for its loop flag: **always looping**, unconditionally, not a
-        // per-article choice (unlike the two dockers below, whose loop bit and rate come from a
-        // real `animdefs.txt SECTION:PIECE`'s `properties=LOOP` / `playbackrate`).
-        // *(An earlier pass, `COVERAGE-2026-09-26.md` §14.40, read `0x471490` as the ctor of the
-        // already-`CONFIRMED`-inert `SmackAnim` pose cache (`crp-geometry.md` §7.0b) and left the
-        // rate/loop an approximation on that basis. That was a misidentification, corrected this
-        // pass: `0x471490` sets `[this] = 0x5B460C` — the *player* vtable `suspension-collision.md`
-        // already names for the breakable-piece players (`RENDERING.md` "the player vtable
-        // 0x5B460C's slot 8 is 0x471150 `fld 0.0`" — matches slot 8 of `0x5B460C` exactly), the
-        // same class `AnimPlayer::sample` 0x470E90/0x470F70 already fully specifies
-        // (`crp-geometry.md` §7) — not `SmackAnim`'s distinct vtable `0x5B45E4`.)*
-        // The player is *started* once, immediately after construction, by `WAnimBundle::Load`
-        // itself calling the player's slot 5 (`0x4716E0`, `start()`: `state=1`,
-        // `start_tick=gGameTick`) at 0x477A0E — at **track load** (`main`'s per-session
-        // `0x468FB0`, `replay.md` §10.1), which runs once and *before* every race "pass"'s own
-        // `0x414EB0` zeroes `gGameTick` (`[0x606AC4]`). Since the player's per-draw sample
-        // (`WAnimBundle`'s own slot 5, `getInstanceTransform` 0x4777B0 → the player's slot 1
-        // 0x4715A0 → `AnimPlayer::sample` 0x470E90) clamps `ticks = max(0, gGameTick −
-        // start_tick)` to ≥0, every race begins with `ticks = 0` regardless of `start_tick`'s
-        // stale value — **phase 0 at every race start** — exactly what the port's own `self.tick =
-        // 0` at race start (`porsche/src/main.rs`) already gives `animate(self.tick as f32 /
-        // 64.0)`/`eval_pair(self.tick)` below. `0x4777B0` is called once per **draw** of the
-        // article (no separate per-tick "advance" step exists for it), so its value only changes
-        // once every simulation tick (`[0x628938]+8` = the 64 Hz `globalStep`, `1/64`) — driven by
-        // the **global race clock**, not a draw-count or a wall clock.
-        let mut animated: Vec<AnimatedProp> = Vec::new();
+        anim_articles
+    }
+
+    /// The ambient sound of the one `WAnimBundle` article whose tag carries a `SoundDef` (see
+    /// [`Self::upload`]'s `sound_articles`), at the bundle's default rate and loop.
+    fn animated_sound(track: &TrackAssets, geometry: &nfs_assets::track::TrackGeometry, sound_articles: &std::collections::HashSet<usize>) -> Option<AnimatedSound> {
         let mut animated_sound: Option<AnimatedSound> = None;
         for art in geometry.world.iter().filter(|a| sound_articles.contains(&a.index)) {
             let Some(def) = track.animdefs.sound_by_fourcc(art.tag) else { continue };
@@ -1774,9 +1947,14 @@ impl TrackWorld {
                 });
             }
         }
+        animated_sound
+    }
+
+    /// The library articles' meshes, every LOD, uploaded once per tag.
+    fn upload_library(r: &mut Renderer, geometry: &nfs_assets::track::TrackGeometry, material_for: &mut dyn FnMut(&mut Renderer, u16) -> MaterialId) -> HashMap<u32, Vec<LodMeshes>> {
         // every LOD of each library article, by tag (the first article with it, as 0x478640 finds
         // the template); every shipped one has a single LOD
-        let mut lib_gpu: HashMap<u32, Vec<(u8, Vec<(MeshId, MaterialId)>)>> = HashMap::new();
+        let mut lib_gpu: HashMap<u32, Vec<LodMeshes>> = HashMap::new();
         for art in &geometry.library {
             if lib_gpu.contains_key(&art.tag) {
                 continue;
@@ -1784,8 +1962,22 @@ impl TrackWorld {
             let lods = art.lods.iter().map(|(lod, meshes)| (*lod, meshes.iter().map(|mm| (r.upload_mesh(&mm.mesh), material_for(r, mm.material))).collect())).collect();
             lib_gpu.insert(art.tag, lods);
         }
-        let arts = track.crp.articles(&track.crp_data).unwrap_or_default();
-        let mut item_element = vec![None; items.len()];
+        lib_gpu
+    }
+
+    /// The `WSceneBundle`'s items (0x482EA0): each scene element (and the parked `DFLT` slots) drawn
+    /// as its library article at the element's matrix, appended to `lists` with `item_element`
+    /// kept parallel to `lists.items`.
+    fn upload_scene_items(
+        track: &TrackAssets,
+        geometry: &nfs_assets::track::TrackGeometry,
+        lib_gpu: &HashMap<u32, Vec<LodMeshes>>,
+        arts: &[nfs_formats::crp::Article],
+        lists: &mut ItemLists,
+        item_element: &mut Vec<Option<usize>>,
+    ) -> SceneItems {
+        let ItemLists { items, instance_culls, item_cull } = lists;
+        let mut animated: Vec<AnimatedProp> = Vec::new();
         let mut missing_tags = std::collections::HashSet::new();
         let mut smackables: Vec<SmackableSpawn> = Vec::new();
         let mut instance_flares: Vec<(usize, TrackFlare)> = Vec::new();
@@ -1819,8 +2011,7 @@ impl TrackWorld {
                 // library article's own `tr`: the template's record is the identity (0x482BF1), and
                 // the draw 0x450380 pushes this matrix (0x450465…0x450477) and draws the article's
                 // `vt` as they are, with no `tr` lookup on the way (`RE/RENDERING.md` "The instance
-                // and scene items"). *(Until 2026-09-26 the port applied the `tr` too — the cones
-                // at 0.585 of their size.)*
+                // and scene items"). (history: `game-history.md` §9.5)
                 let world_tr = inst.transform * Mat4::from_scale(inst.scale);
                 if let Some(a) = art {
                     scene_items.push((a.index, world_tr));
@@ -1881,6 +2072,12 @@ impl TrackWorld {
         if !missing_tags.is_empty() {
             tracing::warn!(tags = ?missing_tags.iter().map(|t| String::from_utf8_lossy(&t.to_le_bytes()).into_owned()).collect::<Vec<_>>(), "mission props without a library article");
         }
+        SceneItems { animated, smackables, instance_flares, scene_items }
+    }
+
+    /// Every `.env` texture uploaded, keyed by its SHPI name as the `.map` sections spell it, and
+    /// the sky map (`SKY`, else the first).
+    fn upload_env_textures(r: &mut Renderer, track: &TrackAssets) -> (HashMap<u32, nfs_renderer::TextureId>, Option<nfs_renderer::TextureId>) {
         // every `.env` entry, keyed by its SHPI name as the `.map` sections spell it
         let mut env_by_id = HashMap::new();
         let env_items: Vec<(u32, u32, &[Vec<u8>])> = track.env_textures.iter().map(|t| (t.width, t.height, t.mips.as_slice())).collect();
@@ -1904,144 +2101,7 @@ impl TrackWorld {
                 }
                 env_by_id.get(&u32::from_le_bytes(name)).copied()
             });
-        let flags: Vec<u32> = materials.iter().map(|m| m.flags).collect();
-        let collision = geometry.collision_grid(20.0, &|mat| flags.get(mat as usize).copied().unwrap_or(0));
-        // *(Until 2026-09-28 a skill test's `ENDW` barriers also joined this wall set as
-        // synthesized footprint-edge segments — a pre-2026-09-28 port addition, not `.edg` data,
-        // invented before `WSceneBundle`'s own tree contribution ([`scene_props`]) was read. That
-        // duplicated the barrier: one course-closing box per `ENDW` element in the wall set *and*
-        // one `kBox` [`nfs_physics::props::Prop`] in the tree for the same element. Removed —
-        // `scene_props`'s tree entry is now the barrier's only collision object, matching the
-        // original's one-object-per-spawned-element rule (`0x4750B0`'s per-article dispatch).)*
-        let walls = nfs_physics::walls::WallSet::build(track.edges.iter().flat_map(|e| e.segments.iter().map(|s| s.loaded())), 30.0);
-        // `WTrack+0x24`, wired: `insertAll(C)` (patches + `kCylinder`/`kBox` props, bundle by
-        // bundle, `RE/RENDERING.md` "Bundle order, read 2026-09-28") then `insertAll(A)` (every
-        // `.edg` wall in file order, `WallSet::build`'s own input order above).
-        let patches = collision.patches();
-        let mut tree_order = track_tree_order(&track.crp, &track.crp_data, &arts, &geometry.world, &patches, &props, &scene_indices);
-        tree_order.extend((0..walls.walls().len()).map(nfs_physics::track_tree::TreeItem::Wall));
-        let tree = nfs_physics::track_tree::TrackTree::build(&patches, &props, walls.walls(), &tree_order);
-        let start = track
-            .start_forward
-            .as_ref()
-            .and_then(|s| s.of_kind(&nfs_formats::scn::ElementKind::Trigger).next())
-            .map(|e| Vec3::from(e.position))
-            .unwrap_or(Vec3::ZERO);
-        let ambient = track
-            .map
-            .section("header")
-            .and_then(|h| h.get_f32_list("ambient"))
-            .filter(|a| a.len() == 4)
-            .map(|a| ((a[1] + a[2] + a[3]) / 3.0).clamp(0.2, 0.9))
-            .unwrap_or(0.35);
-        tracing::info!(items = items.len(), triangles = collision.triangle_count(), walls = walls.len(), "track uploaded");
-        if !animated.is_empty() {
-            tracing::info!(props = animated.len(), "animated props");
-        }
-        let map_light = MapLight::from_map(&track.map);
-        let sun_direction = track.sky_bin.as_ref().map(|b| -Vec3::from(b.sun_position()).normalize_or_zero()).filter(|d| *d != Vec3::ZERO).unwrap_or(Vec3::NEG_Y);
-        let map_sections = MapSection::all(&track.map);
-        // the items whose render method builds `Headlights::LayerVertexLight` (0x8002 / 0x8003)
-        let lit_methods = nfs_assets::track::vertex_light_methods(&track.crp, &track.crp_data);
-        let lit: std::collections::HashSet<MaterialId> = mat_ids
-            .iter()
-            .filter(|(id, _)| materials.get(**id as usize).is_some_and(|m| lit_methods.contains(&m.render_method)))
-            .map(|(_, mid)| *mid)
-            .collect();
-        // the items whose render method builds `Headlights::LayerUVLight` (0x8004) — the `HEAD`
-        // decal of `lighting.md` §5.2, two layers in every night track's `Opaque` method
-        let uv_methods = nfs_assets::track::uv_light_methods(&track.crp, &track.crp_data);
-        let uv: std::collections::HashSet<MaterialId> = mat_ids
-            .iter()
-            .filter(|(id, _)| materials.get(**id as usize).is_some_and(|m| uv_methods.contains(&m.render_method)))
-            .map(|(_, mid)| *mid)
-            .collect();
-        for it in items.iter_mut().chain(track_lods.iter_mut().flat_map(|a| a.lods.iter_mut().flat_map(|(_, v)| v.iter_mut()))) {
-            it.headlit = lit.contains(&it.material);
-            it.uv_lit = uv.contains(&it.material);
-        }
-        // materials whose render method builds `RCustomLayers::LayerUVAnimate` (0x8001) — water
-        // and flags/banners (`RE/drafts/round1/render-core.md` §4.4)
-        let uv_animate: HashMap<MaterialId, nfs_assets::track::UvAnimate> = mat_ids
-            .iter()
-            .filter_map(|(id, mid)| materials.get(*id as usize).and_then(|m| nfs_assets::track::uv_animate(&methods, m)).map(|a| (*mid, a)))
-            .collect();
-        tracing::info!(props = props.len(), breakable = props.iter().filter(|p| p.breakable.is_some()).count(), "track props");
-        let projectors = track_projectors(track);
-        let projector_texture = projectors.first().and_then(|p| tex_ids.get(&p.texture)).map(|t| t.0);
-        let projector_registered = vec![false; projectors.len()];
-        let cull_articles = cull_articles(track);
-        let population = tree_population_with_scene(track, &cull_articles, &scene_items);
-        let fitted = std::sync::Arc::new(crate::fitted_tree::FittedTree::new(population.min, population.max, &population.points));
-        let (article_nodes, article_seq) = build_article_nodes(&fitted, &cull_articles);
-        let next_seq = article_seq.iter().filter(|&&q| q != u32::MAX).count() as u32;
-        // every `WAnimBundle` article moves with its own player: its draw items start at
-        // frame 0's matrix, the same the registration above used
-        let mut anim_articles: Vec<AnimArticle> = Vec::new();
-        {
-            let arts = track.crp.articles(&track.crp_data).unwrap_or_default();
-            for (i, c) in cull_articles.iter().enumerate() {
-                let Some(c) = c.as_ref().filter(|c| c.drawer == ArticleDrawer::Anim) else { continue };
-                let Some(track_anim) = arts.get(i).and_then(|a| track.crp.article_animation(&track.crp_data, a)) else { continue };
-                let Some((centre, radius, _)) = arts.get(i).and_then(|a| article_base(track, a)) else { continue };
-                let matrix = anim_matrix(&track_anim, 0.0, WANIM_BUNDLE_DEFAULT_SECONDS_PER_FRAME, WANIM_BUNDLE_DEFAULT_LOOPING);
-                let gpu = track_lods.iter().position(|g| g.article == i);
-                if let Some(g) = gpu.and_then(|g| track_lods.get_mut(g)) {
-                    for (_, its) in g.lods.iter_mut() {
-                        for it in its.iter_mut() {
-                            it.transform = matrix;
-                        }
-                    }
-                }
-                anim_articles.push(AnimArticle { article: i, track: track_anim, centre, radius, gpu, matrix, registered: c.centre });
-            }
-        }
-        let occluders = track_occluders(track);
-        tracing::info!(articles = cull_articles.iter().flatten().count(), drawn = track_lods.len(), lods = track_lods.iter().map(|a| a.lods.len()).sum::<usize>(), occluders = occluders.len(), instances = instance_culls.len(), "track culling");
-        let mut world = Self {
-            items,
-            item_element,
-            hidden: std::collections::HashSet::new(),
-            env_map,
-            collision,
-            fitted,
-            props,
-            patches,
-            walls,
-            tree,
-            start,
-            ambient,
-            map_light,
-            sun_direction,
-            map_sections,
-            env_by_id,
-            smackables: smackables.into_iter().chain(track_smackables).take(MAX_SMACKABLES).collect(),
-            moved,
-            smack_anims,
-            animated,
-            animated_sound,
-            broken,
-            flares: track_flares(track),
-            emitters: track_emitters(track),
-            projectors,
-            projector_texture,
-            projector_registered,
-            cull_articles,
-            article_nodes,
-            article_seq,
-            track_lods,
-            occluders,
-            instance_culls,
-            instance_regs: Vec::new(),
-            instance_flares,
-            item_cull,
-            uv_animate,
-            uv_plan: UvPlan::default(),
-            anim_articles,
-            next_seq,
-        };
-        world.register_instances();
-        Ok(world)
+        (env_by_id, env_map)
     }
 
     /// Diagnostic: the current sphere the walk answers for the `WAnimBundle` article named
@@ -2130,9 +2190,9 @@ impl TrackWorld {
             if centre != self.anim_articles[k].registered {
                 self.anim_articles[k].registered = centre;
                 let node = self.fitted.node_for_sphere(centre.x, centre.y, centre.z, radius);
-                if self.article_nodes.get(article).and_then(|n| n.first()).map(|n| n.0) != Some(node.id) {
+                if self.article_nodes.get(article).and_then(|n| n.first()).map(|n| n.id) != Some(node.id) {
                     let (cx, cz, r) = self.fitted.circle(node);
-                    self.article_nodes[article] = vec![(node.id, cx, cz, r)];
+                    self.article_nodes[article] = vec![RegisteredNode { id: node.id, cx, cz, r }];
                     self.article_seq[article] = self.next_seq;
                     self.next_seq += 1;
                 }
@@ -2212,32 +2272,16 @@ impl TrackWorld {
     /// stream into the vertex colour untouched (0x540E1D) — or an `Am` op has written its flat
     /// colour there (§5.4) — for stage 0 to `MODULATE` with the texture (`thrash.md` §5).
     ///
-    /// **The order** is the view's lists' (`RE/RENDERING.md` "The view's lists", read 2026-09-26):
-    /// the static / mid-ground drawer 0x450DE0 queues each `pr` part of the chosen LOD on its own
-    /// (0x450EDB…0x450FCF) keyed by `round(d²)`, `d` from the eye (`[[0x628130]+0x10]+0x34`) to the
-    /// part's sphere centre (`pr+8`, 0x450EF8…0x450F25) — a flag-2 part in the list `+4`, drawn
-    /// first and **nearest first**, a flag-1 or flag-4 part in `+0xC`, drawn after and **farthest
-    /// first** ([`part_list`]); the instance drawer queues its whole item in `+0xC` with the walk's
-    /// `round(v)` (0x44FFC0 → 0x466A90), and 0x450010 draws its parts together there. Equal keys keep
-    /// the order they were queued in (each tree insert goes right on equal, 0x466933 / 0x466AD3;
-    /// `0x466A90`'s walk compares the `fistp`-rounded `u32` key **unsigned**, `jbe`/`ja` at
-    /// 0x466ad3/0x466aed — never signed, though every shipped key is non-negative regardless).
-    /// So the flag-2 parts — every `Opaque` one, but also 7 000 blended `Normal` / `NormMatState` /
-    /// `FullAmbient` / `FakeSort` ones — are drawn front to back before anything of `+0xC`: they come
-    /// first here and are marked `early` (the renderer's opaque stage, in this order); the `+0xC`
-    /// ones follow, farthest first, in the blended stage — merged now with the cars' and the skid
-    /// marks' own `+0xC` entries by [`App::rebuild_scene`] ([`Self::track_draw_lists`]).
-    /// Equal keys keep the node pass's queueing order ([`ArticleDraw::order`]): the walk lists the
-    /// visible tree nodes in pre-order (0x47F400) and an item is queued at its first ref
-    /// (0x47F939…0x47F942, once per frame), refs sitting in a node's list in registration order. An
-    /// item with no `Base` (port fallback) goes last. The refs of the dynamic bundles (instances, anims,
-    /// `.scn` items) are re-registered when their sphere moves (0x489530's compare against the item's stored
-    /// centre, 0x4895B4…0x4895E5, then 0x47BC20's node; a different node takes the ref at the end of its list,
-    /// 0x489850 / 0x47C640) — [`Self::reregister_articles`] does that every eighth walk, and the `.scn`
-    /// instances and the breakables are queued at their own place among the articles
-    /// ([`ArticleDraw::order`], `QueueUnit`), not after all of them (CLOSED 2026-10-02, WP-R).
+    /// **The order** is the view's lists' (`RE/RENDERING.md` "The view's lists"): 0x450DE0 queues
+    /// each `pr` part keyed by `round(d²)` (0x450EDB…0x450FCF) — flag 2 in list `+4`, nearest first
+    /// and marked `early`; flag 1 / 4 in `+0xC`, farthest first ([`part_list`]); the instance
+    /// drawer's whole item in `+0xC` (0x44FFC0 → 0x466A90). Equal keys keep the queueing order
+    /// ([`ArticleDraw::order`], 0x466933 / 0x466AD3, unsigned compare); an item with no `Base` (port
+    /// fallback) goes last. The full trace (the walk's
+    /// pre-order 0x47F400, the re-registration of moved refs 0x489530):
+    /// `RE/notes/game-history.md` §33.2.
     pub fn visible_items(&self, draws: &[Option<ArticleDraw>], eye: Vec3) -> Vec<DrawItem> {
-        let (mut near, mut far, rest) = self.track_draw_lists(draws, eye);
+        let TrackLists { mut near, mut far, rest, .. } = self.track_draw_lists(draws, eye);
         near.sort_by_key(|(k, _)| *k);
         far.sort_by_key(|(k, _)| std::cmp::Reverse(*k));
         near.into_iter()
@@ -2258,10 +2302,10 @@ impl TrackWorld {
     /// in the original but drew in separate blocks here until now. `near` (list `+4`, unsorted) and
     /// `rest` (the port's no-`Base` fallback) are returned too, for [`Self::visible_items`]'s own
     /// use and for the mirror's independent walk ([`App::render_mirror`]).
-    pub fn track_draw_lists(&self, draws: &[Option<ArticleDraw>], eye: Vec3) -> (Vec<(u32, DrawItem)>, Vec<(u32, DrawItem)>, Vec<DrawItem>) {
+    pub fn track_draw_lists(&self, draws: &[Option<ArticleDraw>], eye: Vec3) -> TrackLists {
         let mut lists = TrackLists::default();
         self.track_draw_lists_into(draws, eye, &mut lists);
-        (lists.near, lists.far, lists.rest)
+        lists
     }
 
     /// [`Self::track_draw_lists`] into reusable buffers (cleared first): the per-frame callers keep one
@@ -2348,7 +2392,8 @@ impl TrackWorld {
                                             // draw after every 0x8000 part. Read live 2026-10-03 (gdb at
                                             // 0x450F4C / 0x46668D, autobahn: the flush walks the keys
                                             // ascending, the 0x8001 / 0x8002 parts after the rest; `thrash.md` §6e)
-                                            let k = ((key_hi as u32) << 16).wrapping_add(key(centre));                                            near.push((k, DrawItem { fakesort_near: k < FAKESORT_NEAR_KEY, ..*item }));
+                                            let k = ((key_hi as u32) << 16).wrapping_add(key(centre));
+                                            near.push((k, DrawItem { fakesort_near: k < FAKESORT_NEAR_KEY, ..*item }));
                                         }
                                         Some(ViewList::Far) => {
                                             let k = key(centre);
@@ -2409,11 +2454,10 @@ impl TrackWorld {
         track: &TrackAssets,
         geometry: &nfs_assets::track::TrackGeometry,
         props: &[nfs_physics::props::Prop],
-        items: &mut Vec<DrawItem>,
-        culls: &mut Vec<InstanceCull>,
-        item_cull: &mut Vec<Option<(usize, u8)>>,
+        lists: &mut ItemLists,
         material_for: &mut dyn FnMut(&mut Renderer, u16) -> MaterialId,
     ) -> Vec<BrokenProp> {
+        let ItemLists { items, instance_culls: culls, item_cull } = lists;
         let Ok(arts) = track.crp.articles(&track.crp_data) else { return Vec::new() };
         let tags = article_tags(track, &arts);
         let by_index: HashMap<usize, &nfs_assets::track::ArticleMeshes> = geometry.world.iter().chain(geometry.library.iter()).map(|a| (a.index, a)).collect();
@@ -2582,7 +2626,7 @@ impl TrackWorld {
 /// the instance's frame. The article's own `tr` is **not** applied: 0x476ED0 reads only the
 /// article's `Base` and `vt` (0x476F35, 0x476FAB), and 0x483360 takes the pose from the scene
 /// record's matrix (0x4774F8…0x477515), which has no `tr` in it (0x482BF1 / 0x482EA0) — CONFIRMED.
-/// *(Until 2026-09-26 the port folded the `tr` into the points.)* MEDIUM: the GEOM scale is folded
+/// (history: `game-history.md` §9.7) MEDIUM: the GEOM scale is folded
 /// into the points and the instance's rotation and position kept as the body's pose — 0x476A80
 /// splits the record matrix into the unscaled pose and the axis lengths `rec+0x58`, and where the
 /// latter is used again was not read; and the vertices are the port's article meshes (the original
@@ -3056,70 +3100,15 @@ pub fn track_props(track: &TrackAssets) -> Vec<nfs_physics::props::Prop> {
     out
 }
 
-/// `WSceneBundle`'s own tree contribution — corrects `RE/RENDERING.md`'s former "no parsed source
-/// for *which* library articles a track's scene places" (`ac7b3e6c`): this port
-/// *does* have that source, `nfs_formats::scn` + [`TrackGeometry::instances`] (read this session,
-/// disassembler addresses below).
-///
-/// **The read.** `0x46D1D0` (called once, at `0x487abd`, right after `WSceneBundle::Load`'s own
-/// call `0x487a87` and before any other bundle's ctor/`Load`/`insertAll(C)` — unchanged from
-/// "`WSceneBundle`'s own timing, settled") walks `[0x628168]` — the combined element vector
-/// `Scene_parseFile` 0x46C220 fills, `RE/notes/race-logic.md` §3.1: the track's *generic* `.scn`
-/// files (never any `GEOM_ELEMENT`s — swept all 78 shipped `.scn` files, zero exceptions) **then**
-/// the one loaded start/skill-test file's elements — dynamic-casts each to `CGeomElem` (RTTI
-/// `0x5CFA48`, the cast helper `0x5A134B` at `0x46D212`; `0x46D9C0` counts the same way and is
-/// what decides `WSceneBundle::Load`'s own live-slot count, `min(that count, 64)`, `0x482c81`…
-/// `0x482c97`), and for each survivor calls `0x483260` → **0x482EA0**(this=bundle, fourcc, pos,
-/// 3×3): `0x478640`(this, fourcc) searches the bundle's own template-record array (one per
-/// `'tr'∧library` article, `0x482970`'s gate) for a record whose stored tag equals the element's
-/// own fourcc (`CGeomElem+0x7C`, `0x46AF50`) — **on no match it falls back to template index 0**
-/// (`0x482ebe`…`0x482ec0`: `jge` keeps a `>= 0` index, else `xor eax,eax`), never a skip and never
-/// a parked `DFLT` slot — then, only once the live cursor is still `< 0x40` (`0x482ec2`, the 64
-/// cap; past it the spawn is silently dropped, no slot written, no cursor increment), copies the
-/// matched template's `{tag, Article*}` pair and overwrites the record with the **element's own**
-/// position and 3×3 (scaled by its per-cent values, `0x46B020`) — never the article's own `tr`
-/// (`0x482BF1`: the template's stored record is the identity/zero, matching "The scene bundle's
-/// items"). `0x46D9C0()`'s own count is exactly this same dynamic-cast tally, so on every shipped
-/// track `N` (the live-slot table's size) equals `M` (the number of elements that pass the cast)
-/// exactly whenever there is at least one template (always true — all 70 shared library articles
-/// carry `'tr'∧library`) — **zero parked `DFLT` fillers survive spawning on any shipped race**,
-/// correcting the former "plus `N−M` `DFLT` filler entries" framing (that framing was the honest
-/// worst case before this session's read of `0x482c73`'s own `N`-formula; it is not what the
-/// numbers give once `0x46D9C0()` is read).
-///
-/// Once spawned, the *same* `0x4750B0` walk every other bundle goes through (`RE/RENDERING.md`
-/// "Bundle order, read 2026-09-28") decides the tree contribution by the matched **template
-/// article's** `animdefs.txt` `collideType` — `kCylinder`/`kBox` build one [`Prop`], anything else
-/// (every shipped scene tag surveyed: `FNSH`/`ARW1`-`ARW4` = `collideType=0`, `CONE` =
-/// `kSmackable`) contributes nothing, same as a non-`kCylinder`/`kBox` article anywhere else in
-/// the tree. A `kBox`/`kCylinder` scene prop's placement is the **element's** transform
-/// (`inst.transform * Mat4::from_scale(inst.scale)`, [`crate::world::TrackGeometry::instances`]'s
-/// own field, matching "The scene bundle's items"' `0x4828A0` → `0x539CD0` draw matrix), never the
-/// library article's own `tr` — [`rotated_local_box_aabb`]/[`box_footprint`] take it in place of
-/// `g.transform`.
-///
-/// **Real data (surveyed, all `*_fstart.scn`/`*_bstart.scn`, every shipped track): 2–5
-/// `GEOM_ELEMENT`s per file, tags `FNSH`/`CONE`/`ARW1`-`ARW4` only** (`ENDW`, the one shared
-/// article with `collideType=kBox`, appears only in a skill test's `_ST<N>.scn`, which
-/// [`TrackAssets::build_geometry`] loads instead of the start file, never alongside it) — **none**
-/// of `FNSH`/`CONE`/`ARW1`-`4` is `kCylinder`/`kBox`, so this returns an **empty** `Vec` for every
-/// shipped, non-skill-test race: a measured fact
-/// (`scene_props_are_empty_on_a_shipped_race`, below), not an assumption that lets the tree wiring
-/// skip calling this. The former "the port parses no source" claim is corrected, not merely
-/// softened: the source is [`TrackGeometry::instances`] plus [`AnimDefs::lookup`], already wired
-/// for drawing; only the *tree*-facing use (this function, and its caller's insertion order) was
-/// missing.
-///
-/// **The fourcc-miss fallback, implemented 2026-09-28** (was a documented, unreachable-on-real-
-/// data divergence): a fourcc absent from the bundle's template records takes template index 0
-/// (`0x482ebe`…`0x482ec0`, above) — the first `'tr'∧library` article in `.crp` order, i.e.
-/// `geometry.library.first()` ([`TrackGeometry::build_geometry`]'s own `library.push` order
-/// matches `0x482970`'s gate order). On every shipped track that first article is `DFLT`
-/// (`animdefs.txt`: `collideType=kCylinder`), so the fallback is itself collidable — not a
-/// no-op. Still unreachable on shipped data (every scene tag on every shipped track's start file
-/// or skill test names one of the 70 shared articles), but no longer skipped: `art` below never
-/// silently drops an unmatched element the way the pre-2026-09-28 code did.
-/// The 64-slot cap is applied (`.take(64)`) though also unreachable (5 is the largest count found).
+/// `WSceneBundle`'s own tree contribution: the scene's `GEOM_ELEMENT`s spawned by `0x46D1D0`
+/// (called once at `0x487abd`) → `0x483260` → **0x482EA0** (template by fourcc, `0x478640`; a
+/// fourcc miss takes template index 0, `0x482ebe`…`0x482ec0`; at most 64 live slots, `0x482ec2`),
+/// placed by the **element's** transform, never the article's `tr` (`0x482BF1`); the `0x4750B0`
+/// walk then builds one [`Prop`] for a `kCylinder` / `kBox` template article and nothing for any
+/// other `collideType`. Empty on every shipped non-skill-test race
+/// (`scene_props_are_empty_on_a_shipped_race`); `ENDW` (`kBox`) appears only in a skill test's
+/// `_ST<N>.scn`. The full trace (the cast count `0x46D9C0`, the `DFLT` fallback, the survey of the
+/// shipped `.scn` files): `RE/notes/game-history.md` §33.
 pub fn scene_props(track: &TrackAssets, geometry: &nfs_assets::track::TrackGeometry) -> Vec<nfs_physics::props::Prop> {
     let mut out = Vec::new();
     let Ok(arts) = track.crp.articles(&track.crp_data) else { return out };
@@ -3235,7 +3224,7 @@ fn article_tags(track: &TrackAssets, arts: &[nfs_formats::crp::Article]) -> Vec<
         .map(|art| {
             let tag = track.crp.article_geometry(&track.crp_data, art).ok().and_then(|g| g.base.map(|b| b.tag_u32())).unwrap_or(0);
             let anim = art.level(b"Anim").and_then(|e| track.crp.entry_data(&track.crp_data, e).ok()).filter(|d| d.len() >= 8).map(|d| {
-                [u32::from_le_bytes([d[0], d[1], d[2], d[3]]), u32::from_le_bytes([d[4], d[5], d[6], d[7]])]
+                [bytes::read_u32(d, 0), bytes::read_u32(d, 4)]
             });
             (tag, anim)
         })

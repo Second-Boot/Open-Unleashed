@@ -24,21 +24,89 @@ impl App {
         let (dt_ms, carry) = fe_step_ms(self.frame_dt, self.fe_ms_carry);
         self.fe_ms_carry = carry;
         self.fe.ms += dt_ms as u64;
-        // the garage screen's tick re-decides its buttons every frame (0x50F970), and the player
-        // screens' tick theirs (0x510210)
-        self.bind_garage();
-        // carsetup's own tick, 0x4F1AC0, re-decides the gear-ratio panel every frame too
-        self.bind_carsetup_gearratio();
-        // the same 0x50CC30 helper decides `ID_LAPSSELECTOR`'s disabled state every frame too
-        self.bind_laps_selector();
-        self.bind_player_buttons();
-        // and the bottom bar's tick (0x4D8250) with its refresh (0x4D81C0) — the button states
-        self.bind_bottom_bar();
-        self.fe_career_first_tick();
+        self.fe_frame_tick(dt_ms);
+        self.rebuild_scene();
+        self.update_damage_decals();
+        // the mip filter's promotion `[0x69DD1D]`: the race's 0x44ED10 sets it at `SPECIALFX` 3
+        // only (0x44EDD1 clears, 0x44EF04 sets), the front end's 0x44F020 clears it (0x44F080)
+        let fx_level = self.race.is_some().then(|| self.special_fx_level());
+        let trilinear = fx_level.is_some_and(|l| l >= 3);
+        let fakesort_mode = self.fakesort_mode(fx_level);
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_trilinear(trilinear);
+            r.set_fakesort_mode(fakesort_mode);
+        }
+        self.render_mirror();
+        // the front end's idle redraw (`idle.rs`): the frame the window already shows is not
+        // rendered or presented again
+        let idle = self.fe_frame_unchanged();
+        if nfs_game::config::cfg().nfs_fe_idle_verify.is_set() {
+            self.fe_idle_verify(idle);
+        }
+        if !idle
+            && let Some(r) = self.renderer.as_mut()
+            && let Err(e) = r.render(&self.scene, &self.camera)
+        {
+            tracing::error!(error = %e, "render failed");
+        }
+        self.mirror_sky_update();
+        self.mirror_weather_step();
+        self.frames += 1;
+        if self.fps_timer.elapsed() >= Duration::from_secs(1) {
+            tracing::info!(fps = self.frames, tick = self.tick, "frame stats");
+            self.frames = 0;
+            self.fps_timer = Instant::now();
+        }
+        if idle {
+            self.idle_wait();
+        }
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// **The front end's part of a frame**, in the order the frame has always run it: the screens'
+    /// own ticks, the front end's music and speech, the career's dialogs, the controls screens, the
+    /// widgets' clocks and pointer, then the network screens. It runs during a race too: the
+    /// layout screens are gone then, but the bottom bar, the layers under it, the comm state
+    /// machine and the update check are not (`fe_frame_net`).
+    fn fe_frame_tick(&mut self, dt_ms: u32) {
+        self.fe_screen_ticks();
+        self.fe_frame_audio();
+        self.fe_career_dialog();
+        self.fe_offer_check();
+        self.fe_frame_controls();
+        self.fe_frame_widgets(dt_ms);
+        self.fe_frame_net();
+    }
+
+    /// The screens' own per-frame ticks: the button states each screen re-decides every frame.
+    fn fe_screen_ticks(&mut self) {
+        // the six screen ticks below each return first thing when no layout screen is on show (a
+        // race, the text menu), and none of them opens one — so without a screen they are not
+        // called at all
+        if self.fe.layout_preview.is_some() {
+            // the garage screen's tick re-decides its buttons every frame (0x50F970), and the player
+            // screens' tick theirs (0x510210)
+            self.bind_garage();
+            // carsetup's own tick, 0x4F1AC0, re-decides the gear-ratio panel every frame too
+            self.bind_carsetup_gearratio();
+            // the same 0x50CC30 helper decides `ID_LAPSSELECTOR`'s disabled state every frame too
+            self.bind_laps_selector();
+            self.bind_player_buttons();
+            // and the bottom bar's tick (0x4D8250) with its refresh (0x4D81C0) — the button states
+            self.bind_bottom_bar();
+            self.fe_career_first_tick();
+        }
         // the dialog's tick (0x512980 and the kind's own), and the covering the manager keeps
         // while it is up (0x4D2000 on the raise, 0x4D1E70 on the dismiss)
         self.fe_dialog_step();
         self.fe_main_screen_music_tick();
+    }
+
+    /// The front end's music and speech: the CD player's advance, the end-of-era sting, the
+    /// speech queue — none of it in a race.
+    fn fe_frame_audio(&mut self) {
         // the front end's music, when the CD player started some: the end-of-stream advance
         // (0x4ADD6D) the race's audio update runs
         if self.vehicle.is_none()
@@ -73,8 +141,11 @@ impl App {
             sp.set_level(self.snd.audio_settings.speech_level);
             sp.update(a, false);
         }
-        self.fe_career_dialog();
-        self.fe_offer_check();
+    }
+
+    /// The controls screens: the steering band the dead-zone screen sets, and a binding row
+    /// waiting for a control.
+    fn fe_frame_controls(&mut self) {
         // the steering band is the front end's own `XAxis.Min` / `XAxis.Max`, not a constant of
         // this port's (`nfs-input/src/gamepad.rs`)
         if let Some(l) = self.fe.layout_preview.as_ref() {
@@ -102,11 +173,20 @@ impl App {
             }
             None => self.fe.binding_base = None,
         }
-        let pads = self.fe_pads();
+    }
+
+    /// The widgets' clocks and pointer: the room object, every layer's transition, the bottom
+    /// bar, the held arrows, the movies and the cursor.
+    fn fe_frame_widgets(&mut self, dt_ms: u32) {
+        // the pads and the HUD preview are handed to the screen on show only, so without one (a
+        // race, the text menu) they are not built — two lists and eight option lookups a frame.
+        // Nothing between here and the hand-over opens a screen (the room object and the layers'
+        // transitions do not), so "a screen now" is "a screen there".
+        let for_screen = self.fe.layout_preview.is_some().then(|| self.fe_pads());
         // `Camera.Current` — the slot `NFS5.CAMERASELECT` highlights (§4.89)
         let cam_cur = self.fe.camera_current;
         let cam_list = self.fe.camera_list;
-        let hud_preview = self.hud_preview_pieces();
+        let for_screen = for_screen.map(|pads| (pads, self.hud_preview_pieces()));
         self.fe_room_tick(dt_ms);
         // 0x4D2570 advances **every** layer's screen (+0x80, 0x4D25EB, bottom first), not only
         // the top one: a covered screen still finishes its fade — and the bar and the layers
@@ -124,10 +204,12 @@ impl App {
             } else {
                 l.set_cursor(self.fe.cursor);
             }
-            l.set_pads(pads, self.fe.pads_sel);
-            l.set_camera_current(cam_cur);
-            l.set_camera_list(cam_list);
-            l.set_hud_preview(hud_preview.0, hud_preview.1, hud_preview.2);
+            if let Some((pads, hud_preview)) = for_screen {
+                l.set_pads(pads, self.fe.pads_sel);
+                l.set_camera_current(cam_cur);
+                l.set_camera_list(cam_list);
+                l.set_hud_preview(hud_preview.0, hud_preview.1, hud_preview.2);
+            }
         }
         // the bottom bar is a screen of its own (0x4D39D3) and its four buttons hover and animate
         // like any other (§4.53), so it needs the clock and the pointer too. Its transition moves
@@ -143,6 +225,22 @@ impl App {
                 b.set_cursor(self.fe.cursor);
             }
         }
+        self.fe_held_repeats(dt_ms);
+        // and the movies on it, which need the renderer to put each frame in its texture
+        if let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) {
+            l.advance_movies(r, dt_ms, self.snd.audio.as_ref(), self.snd.registry_music_level);
+        }
+        // the front end's own pointer (`controls.md` §4.152), and where the turntable stands,
+        // which is what a hovered `NFS5.3DCAR` picks its cursor by (§4.153)
+        let spin = self.fe_room_of().map(|r| r.spin_turns(self.fe.ms)).unwrap_or(0.0);
+        if let Some(l) = self.fe.layout_preview.as_mut() {
+            l.advance_cursor(dt_ms, self.fe.mouse_down);
+            l.set_car_spin(spin);
+        }
+    }
+
+    /// The held scrollbar, combo and car-setting arrows, each on its 150 ms repeat.
+    fn fe_held_repeats(&mut self, dt_ms: u32) {
         // A held scrollbar arrow repeats. 0x4D0A97: the press starts `0x529220(this, 0x96, 1)` —
         // a **150 ms** repeating timer, the same one `NFS5.CARSETTINGBUTTON` uses (§4.40) — and
         // slot 10 (0x4D0B40) steps the position each time it fires.
@@ -184,17 +282,11 @@ impl App {
                 self.bind_after_accessor();
             }
         }
-        // and the movies on it, which need the renderer to put each frame in its texture
-        if let (Some(l), Some(r)) = (self.fe.layout_preview.as_mut(), self.renderer.as_mut()) {
-            l.advance_movies(r, dt_ms, self.snd.audio.as_ref(), self.snd.registry_music_level);
-        }
-        // the front end's own pointer (`controls.md` §4.152), and where the turntable stands,
-        // which is what a hovered `NFS5.3DCAR` picks its cursor by (§4.153)
-        let spin = self.fe_room_of().map(|r| r.spin_turns(self.fe.ms)).unwrap_or(0.0);
-        if let Some(l) = self.fe.layout_preview.as_mut() {
-            l.advance_cursor(dt_ms, self.fe.mouse_down);
-            l.set_car_spin(spin);
-        }
+    }
+
+    /// The network screens' part of the frame: the session's lobby drain, the comm state machine,
+    /// the update check and the browse screens.
+    fn fe_frame_net(&mut self) {
         // a session open on the front end's lobby screens is drained here, the race's
         // `net_step` being idle — the room's players and chat arrive this way
         if self.vehicle.is_none() && self.net.session.as_mut().is_some_and(|n| n.poll_lobby()) {
@@ -227,44 +319,6 @@ impl App {
                 self.bind_lists();
             self.bind_checks();
             }
-        }
-        self.rebuild_scene();
-        self.update_damage_decals();
-        // the mip filter's promotion `[0x69DD1D]`: the race's 0x44ED10 sets it at `SPECIALFX` 3
-        // only (0x44EDD1 clears, 0x44EF04 sets), the front end's 0x44F020 clears it (0x44F080)
-        let fx_level = self.race.is_some().then(|| self.special_fx_level());
-        let trilinear = fx_level.is_some_and(|l| l >= 3);
-        let fakesort_mode = self.fakesort_mode(fx_level);
-        if let Some(r) = self.renderer.as_mut() {
-            r.set_trilinear(trilinear);
-            r.set_fakesort_mode(fakesort_mode);
-        }
-        self.render_mirror();
-        // the front end's idle redraw (`idle.rs`): the frame the window already shows is not
-        // rendered or presented again
-        let idle = self.fe_frame_unchanged();
-        if nfs_game::config::cfg().nfs_fe_idle_verify.is_set() {
-            self.fe_idle_verify(idle);
-        }
-        if !idle
-            && let Some(r) = self.renderer.as_mut()
-            && let Err(e) = r.render(&self.scene, &self.camera)
-        {
-            tracing::error!(error = %e, "render failed");
-        }
-        self.mirror_sky_update();
-        self.mirror_weather_step();
-        self.frames += 1;
-        if self.fps_timer.elapsed() >= Duration::from_secs(1) {
-            tracing::info!(fps = self.frames, tick = self.tick, "frame stats");
-            self.frames = 0;
-            self.fps_timer = Instant::now();
-        }
-        if idle {
-            self.idle_wait();
-        }
-        if let Some(w) = &self.window {
-            w.request_redraw();
         }
     }
 }

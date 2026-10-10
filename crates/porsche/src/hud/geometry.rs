@@ -609,14 +609,14 @@ impl Hud {
     }
 
     /// One line of text at a design-space position, `h` pixels tall, laid out glyph by glyph in the
-    /// same space so the spacing is the original's whatever the window's shape.
+    /// same space so the spacing is the original's whatever the window's shape. `(x, y)` is that
+    /// design-space position.
     pub(crate) fn text(
         &self,
         out: &mut Vec<Sprite>,
         aspect: f32,
         s: &str,
-        x: f32,
-        y: f32,
+        (x, y): (f32, f32),
         h: f32,
         color: [f32; 4],
     ) {

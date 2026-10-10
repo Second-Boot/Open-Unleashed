@@ -245,7 +245,7 @@ impl App {
                             let (lo, hi) = nfs_game::world::car_model_box(&a, 5);
                             self.fe.room_car_half = Some((hi - lo) * 0.5);
                         }
-                        CarModel::upload_with_env(r, &a, &self.paths, 1, paint, car_env, false, None, None)
+                        CarModel::upload_with_env(r, &a, &self.paths, 1, paint, nfs_game::world::CarUpload { env: car_env, ..Default::default() })
                     });
                 match loaded {
                     Ok(m) => self.fe.cars.push((slot, model, variant, paint.exterior, m)),

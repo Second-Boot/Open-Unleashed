@@ -35,9 +35,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::text::BitmapFont;
+use class::WidgetClass;
 
 mod bar_oval;
 mod bevel;
+use bevel::FeRect;
+mod class;
 mod career_tabs;
 mod chronicle;
 mod combo;
@@ -87,7 +90,7 @@ use movie::movie_advance_frames;
 /// registry exports (`GamePaths::language`, `game_info/regs/*.reg`), with the original's default.
 /// The same index is what the original copies into the `LANGUAGE` option (id 0x32, `[0x657C84]`,
 /// 0x4E0750 → 0x4D53A9 / 0x4ED6CB) that the loading screen's `loadtext.fsh` reads.
-/// *(Until 2026-09-27 the port took `fe.txt`'s `language` instead — an approximation.)*
+/// (history: `game-history.md` §21.1)
 ///
 /// **Fallback (the port's, not the original's):** without `FEStrings.loc` the port reads that
 /// language's column of `FEStrings.csv` (English first; the original has no CSV reader and would
@@ -123,7 +126,6 @@ pub fn load_strings(paths: &GamePaths) -> Strings {
 
 /// Read `FEData/Controls/*.ctr` — the widget class templates that hold every attribute's default
 /// and the pieces each class is made of (`RE/notes/controls.md`).
-
 pub fn load_controls(paths: &GamePaths) -> ControlLibrary {
     let dir = paths.fe_data().join("Controls");
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -312,15 +314,26 @@ struct TrackMapArt {
     name: String,
 }
 
+/// The timeline's icon entries by (column, row): (resting, hot).
+type ChronicleIcons = std::collections::BTreeMap<(usize, usize), (usize, usize)>;
+
+/// One widget's memoised `pair` evaluations, by expression.
+type PairMemo = HashMap<String, Option<(i32, i32)>>;
+
 /// [`LayoutScreen::eval_memo`]'s two tables.
 #[derive(Default)]
 struct EvalMemo {
-    pair: HashMap<(usize, u32), HashMap<String, Option<(i32, i32)>>>,
+    pair: HashMap<(usize, u32), PairMemo>,
     one: HashMap<(usize, u32), HashMap<String, i32>>,
 }
 
 pub struct LayoutScreen {
     pub layout: Layout,
+    /// [`WidgetClass`] of each `layout.elements[i]`, parsed once at load (parallel to it)
+    classes: Vec<WidgetClass>,
+    /// whether `layout.elements[i]`'s template has a `[state.hover]` ([`can_hover_at`](Self::can_hover_at),
+    /// parallel to `layout.elements`; the control library is fixed after load)
+    hoverable: Vec<bool>,
     /// The background screen this one is laid over (`screen=` → [`background_layout`]).
     background: Option<Box<LayoutScreen>>,
     /// `("Extras.fsh", 3)` → texture and the entry's own pixel size
@@ -573,7 +586,7 @@ pub struct LayoutScreen {
     chronicle_columns: Vec<(u32, usize)>,
     /// The timeline's icon pack, and the entry each (column, row) cell shows in its two states —
     /// `0x507340(year, row, variant, hot)`'s two slots (§4.118, §4.123).
-    chronicle_icons: (String, std::collections::BTreeMap<(usize, usize), (usize, usize)>),
+    chronicle_icons: (String, ChronicleIcons),
     /// One caption per timeline column — the `фото`-row (kind 0) entry's own `0x6F` text
     /// attachment (`nfs_formats::fsh::Fsh::entry_caption`), always the **resting** frame's
     /// (0x507340's fourth argument, `hot`, is a hardcoded `0` at the caption's own call site,
@@ -1037,6 +1050,15 @@ fn source_of(e: &nfs_formats::lay::Element) -> String {
     e.string_id().map(|id| format!("stringID={id}")).unwrap_or_else(|| "(none)".to_string())
 }
 
+/// The `weeicons.fsh` entries a screen looks up by tag ([`LayoutScreen::wanted_icons`]).
+struct TaggedIcons {
+    glint: Option<usize>,
+    combo_arrows: Option<[usize; 6]>,
+    colb: Option<usize>,
+    parts_glyphs: Option<[usize; 4]>,
+    arcs: Option<[usize; 8]>,
+}
+
 impl LayoutScreen {
     /// Load `FEData/Layouts/<name>.lay`, the background screen it names, and every `.fsh` entry
     /// they reference.
@@ -1221,8 +1243,89 @@ impl LayoutScreen {
 
         let white = r.upload_texture(&TextureData::single(1, 1, vec![255, 255, 255, 255]));
         let art = paths.fe_data().join("Art");
-        let mut shapes: HashMap<(String, usize), (TextureId, f32, f32)> = HashMap::new();
-        let mut packs: HashMap<String, Vec<nfs_assets::texture::TextureImage>> = HashMap::new();
+        let mut wanted = Self::wanted_art(&layout, &controls);
+        let TaggedIcons { glint, combo_arrows, colb, parts_glyphs, arcs } = Self::wanted_icons(&layout, &controls, &art, &mut wanted);
+        let shapes = Self::upload_shapes(r, &art, wanted);
+
+        let fonts = Self::upload_fonts(r, &art, &layout, &controls);
+
+        let unrendered = Self::count_unrendered(&layout);
+        tracing::info!(name, elements = layout.elements.len(), art = shapes.len(), fonts = fonts.len(), skipped = unrendered.len(), "layout loaded");
+        let classes: Vec<WidgetClass> = layout.elements.iter().map(|e| WidgetClass::from_class(&e.class)).collect();
+        let hoverable: Vec<bool> = layout.elements.iter().map(|e| controls.get(&e.class).is_some_and(|c| c.has_state("hover"))).collect();
+        let screen = Self { layout, background: None, shapes, fonts, white, cursor_ms: 0, cursor_shape_at: std::cell::Cell::new((usize::MAX, 0)), cursor_btn_at: std::cell::Cell::new((false, 0)), cursor_btn: false, car_spin: 0.0, car_parts: HashMap::new(), car_roof: Default::default(), covered: false, combo_hover: std::cell::Cell::new(None), overlay_mask: std::cell::Cell::new(None), unrendered, logos: HashMap::new(), checks: HashMap::new(), knobs: HashMap::new(), closed: std::collections::HashSet::new(), groups: HashMap::new(), bars: HashMap::new(), lists: HashMap::new(), swatches: HashMap::new(), car_views: HashMap::new(), track_maps: HashMap::new(), movies: HashMap::new(), ko_strip: HashMap::new(), badges: HashMap::new(),
+            // `NFS_FE_CLOCK` preloads the screen clock in milliseconds, so a still can be taken
+            // part way through an animation the front end would otherwise only show in motion
+            clock_ms: crate::config::cfg().nfs_fe_clock.as_str().and_then(|v| v.parse().ok()).unwrap_or(0), glint, colb, arcs, parts_glyphs,
+            movie_overlays: Default::default(),
+            credits_roll: Default::default(),
+            wrap_watch: Default::default(),
+            typing: Default::default(),
+            pending_tab: None,
+            inherited: std::cell::Cell::new((false, 0)),
+            glints: Default::default(),
+            preload_ticks: crate::config::cfg().nfs_fe_clock.as_str().and_then(|v| v.parse::<u64>().ok()).map_or(0, |ms| (ms * 128 / 1000) as i64),
+            watch_text: Default::default(), eval_memo: Default::default(), guard_hits: Default::default(),
+            last_drawn_state: Default::default(),
+            end_of_era: None,
+            career_tabs: None,
+            bar_oval: None,
+            cheat_bits: 0,
+            driver_picture: crate::save::DEFAULT_PICTURE as i32,
+            // `NFS_FE_CURSOR=x,y` parks the pointer for a still, the way `NFS_FE_CLOCK` parks the
+            // clock — a screenshot has no pointer of its own
+            cursor: crate::config::cfg().nfs_fe_cursor.as_str().and_then(|v| {
+                let (a, b) = v.split_once(',')?;
+                Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+            }),
+            denied: false,
+            wide_hit: false,
+            pointer: None,
+            // `NFS_FE_PRESS=1` holds the button down for a still, the pair of `NFS_FE_CURSOR`
+            pressed: crate::config::cfg().nfs_fe_press.as_str().is_some_and(|v| v != "0"),
+            capture: None,
+            // `NFS_FE_OPEN=<index>` drops a combo's list open for a still
+            open_combo: crate::config::cfg().nfs_fe_open.as_str().and_then(|v| v.parse().ok()),
+            // `NFS_FE_PICKER=1` with `NFS_FE_OPEN` raises the latch for a still of the editor
+            picker_latch: crate::config::cfg().nfs_fe_picker.as_str().is_some_and(|v| v != "0"),
+            picker: Picker::default(),
+            pads: Vec::new(),
+            pad_sel: 0,
+            deadzone: Vec::new(),
+            dz_grab: None,
+            dz_hover: None,
+            camera_current: 0,
+            camera_list: [0, 1, 2, 3],
+            hud_preview: (Vec::new(), 1.0, 1.0),
+            combo_scroll: None,
+            focused: Default::default(),
+            edits: HashMap::new(),
+            selected_flags: Default::default(),
+            unselected: Default::default(),
+            hidden_flags: Default::default(),
+            disabled_flags: Default::default(),
+            picture_pan: Default::default(),
+            picture_drag: None,
+            chronicle_columns: Vec::new(),
+            chronicle_icons: (String::new(), Default::default()),
+            chronicle_captions: Vec::new(),
+            combo_arrows,
+            knob_at: None,
+            scroll: HashMap::new(),
+            hover_ms: 0,
+            hover_of: None,
+            classes,
+            hoverable,
+            controls, fe_strings, transition: Transition::Idle, overlay: false };
+        screen.activate_glints();
+        Ok(screen)
+    }
+
+    /// The art a screen's widgets draw: each widget's own `shapePathName` / `shapeIndex` (and the
+    /// runs of `NFS5.AnimatingPicture` / `NFS5.BOTTOMBARBUTTON`, both of `NFS5.CheckBox`'s entries)
+    /// and every `SHAPE` part its class template draws — the second is where
+    /// `NFS5.CARSETTINGBUTTON` and its like keep all of their art. In the order they are uploaded.
+    fn wanted_art(layout: &Layout, controls: &ControlLibrary) -> Vec<(String, usize)> {
         // the widget's own `shapePathName`/`shapeIndex`, and every `SHAPE` part its class template
         // draws — the second is where `NFS5.CARSETTINGBUTTON` and its like keep all of their art
         let mut wanted: Vec<(String, usize)> = Vec::new();
@@ -1320,13 +1423,20 @@ impl LayoutScreen {
                 wanted.push((file.to_string(), index));
             }
         }
+        wanted
+    }
+
+    /// The `weeicons.fsh` entries the code looks up by tag (the glint, the combo's arrows, the
+    /// colour box's `COLB`, the parts list's collapse icons, the controller setup's arcs), the list
+    /// box's scrollbar, the movie circle's flashes and the pointer, appended to `wanted`.
+    fn wanted_icons(layout: &Layout, controls: &ControlLibrary, art: &std::path::Path, wanted: &mut Vec<(String, usize)>) -> TaggedIcons {
         // A `NFS5.HEADER` sweeps a glint across the screen (§4.25). Its activate builds
         // `"%sweeicons.fsh"` from the art directory and looks the entry up **by its tag**,
         // `"GLNT"` (0x4CADC0), so the port does the same rather than carry the index.
         // The bottom bar's buttons (0x4C95E4…0x4C95FE) and the word-wrap text object (0x5230E1…
         // 0x523105, the typewriter's leading letter) look up the same entry.
         let glint = layout.elements.iter().any(|e| matches!(e.class.as_str(), "NFS5.HEADER" | "NFS5.CarLogo" | "NFS5.BOTTOMBARBUTTON") || e.class.to_ascii_lowercase().contains("wordwrap")).then(|| {
-            let p = GamePaths::find_file(&art, "weeicons.fsh")?;
+            let p = GamePaths::find_file(art, "weeicons.fsh")?;
             let d = std::fs::read(p).ok()?;
             let pack = nfs_formats::fsh::Fsh::parse(&d).ok()?;
             let n = pack.entries.iter().position(|e| e.name.trim_end_matches('\0').eq_ignore_ascii_case("GLNT"))?;
@@ -1343,7 +1453,7 @@ impl LayoutScreen {
             .iter()
             .any(|e| matches!(e.class.as_str(), "NFS5.ComboBoxSlider" | "NFS5.ColorBox"))
             .then(|| {
-                let p = GamePaths::find_file(&art, "weeicons.fsh")?;
+                let p = GamePaths::find_file(art, "weeicons.fsh")?;
                 let d = std::fs::read(p).ok()?;
                 let pack = nfs_formats::fsh::Fsh::parse(&d).ok()?;
                 let at = |tag: &str| pack.entries.iter().position(|e| e.name.trim_end_matches('\0').eq_ignore_ascii_case(tag));
@@ -1358,7 +1468,7 @@ impl LayoutScreen {
         // that its factory looks up at 0x4C390C — the same by-tag lookup as the glint's
         // (`RE/notes/controls.md` §4.47, §4.48)
         let colb = layout.elements.iter().any(|e| e.class == "NFS5.ColorBox").then(|| {
-            let p = GamePaths::find_file(&art, "weeicons.fsh")?;
+            let p = GamePaths::find_file(art, "weeicons.fsh")?;
             let d = std::fs::read(p).ok()?;
             let pack = nfs_formats::fsh::Fsh::parse(&d).ok()?;
             let n = pack.entries.iter().position(|e| e.name.trim_end_matches('\0').eq_ignore_ascii_case("COLB"))?;
@@ -1369,7 +1479,7 @@ impl LayoutScreen {
         // a `+`/`−` collapse icon from the same `weeicons.fsh` the ctor **0x515160** caches by
         // index (`pls1`=3, `min4`=0xB, `pls2`=4, `pls3`=5 — see the field doc above)
         let parts_glyphs = layout.elements.iter().any(|e| e.get("accessor").is_some_and(|a| a.starts_with("Parts.AllParts"))).then(|| {
-            let p = GamePaths::find_file(&art, "weeicons.fsh")?;
+            let p = GamePaths::find_file(art, "weeicons.fsh")?;
             let d = std::fs::read(p).ok()?;
             let pack = nfs_formats::fsh::Fsh::parse(&d).ok()?;
             let at = |tag: &str| pack.entries.iter().position(|e| e.name.trim_end_matches('\0').eq_ignore_ascii_case(tag));
@@ -1380,7 +1490,7 @@ impl LayoutScreen {
             Some(four)
         }).flatten();
         let arcs = layout.elements.iter().any(|e| e.class == "NFS5.CONTROLLERSETUP").then(|| {
-            let p = GamePaths::find_file(&art, "weeicons.fsh")?;
+            let p = GamePaths::find_file(art, "weeicons.fsh")?;
             let d = std::fs::read(p).ok()?;
             let pack = nfs_formats::fsh::Fsh::parse(&d).ok()?;
             let mut arcs = [0; 8];
@@ -1417,6 +1527,13 @@ impl LayoutScreen {
         for i in 0..34 {
             wanted.push((POINTER.to_string(), i));
         }
+        TaggedIcons { glint, combo_arrows, colb, parts_glyphs, arcs }
+    }
+
+    /// Each wanted art entry uploaded once, in order: `(texture, width, height)` by `(file, index)`.
+    fn upload_shapes(r: &mut Renderer, art: &std::path::Path, wanted: Vec<(String, usize)>) -> HashMap<(String, usize), (TextureId, f32, f32)> {
+        let mut shapes: HashMap<(String, usize), (TextureId, f32, f32)> = HashMap::new();
+        let mut packs: HashMap<String, Vec<nfs_assets::texture::TextureImage>> = HashMap::new();
         for (file, index) in wanted {
             let file = file.as_str();
             let key = (file.to_string(), index);
@@ -1424,7 +1541,7 @@ impl LayoutScreen {
                 continue;
             }
             let entry = packs.entry(file.to_string()).or_insert_with(|| {
-                GamePaths::find_file(&art, file)
+                GamePaths::find_file(art, file)
                     .and_then(|p| std::fs::read(&p).ok().map(|d| (p, d)))
                     .and_then(|(p, d)| decode_pack(&p, &d).ok())
                     .unwrap_or_default()
@@ -1437,9 +1554,12 @@ impl LayoutScreen {
             let id = r.upload_texture(&TextureData::single(img.width, img.height, level0.clone()));
             shapes.insert(key, (id, img.width as f32, img.height as f32));
         }
+        shapes
+    }
 
-        // every `fontPathName` the file names, every one its widgets' class templates name, plus
-        // the FE default
+    /// Every `fontPathName` the file names, every one its widgets' class templates name, plus the FE
+    /// default, the dialogs' two and the ones some classes build themselves — uploaded by name.
+    fn upload_fonts(r: &mut Renderer, art: &std::path::Path, layout: &Layout, controls: &ControlLibrary) -> HashMap<String, BitmapFont> {
         let mut fonts: HashMap<String, BitmapFont> = HashMap::new();
         // the FE default, and the dialogs' two fonts: a dialog can come up over any screen
         let mut want: Vec<String> = vec![DEFAULT_FONT.to_string(), DIALOG_TEXT_FONT.to_string(), DIALOG_BUTTON_FONT.to_string()];
@@ -1496,7 +1616,7 @@ impl LayoutScreen {
         want.sort();
         want.dedup();
         for name in want {
-            let Some(path) = GamePaths::find_file(&art, &name) else {
+            let Some(path) = GamePaths::find_file(art, &name) else {
                 tracing::debug!(name, "layout font missing");
                 continue;
             };
@@ -1508,6 +1628,11 @@ impl LayoutScreen {
             }
         }
 
+        fonts
+    }
+
+    /// The code-placed classes this port does not draw, counted (for the log).
+    fn count_unrendered(layout: &Layout) -> Vec<(String, usize)> {
         let mut counts: HashMap<String, usize> = HashMap::new();
         for e in &layout.elements {
             if code_placed(&e.class) {
@@ -1516,71 +1641,7 @@ impl LayoutScreen {
         }
         let mut unrendered: Vec<(String, usize)> = counts.into_iter().collect();
         unrendered.sort();
-        tracing::info!(name, elements = layout.elements.len(), art = shapes.len(), fonts = fonts.len(), skipped = unrendered.len(), "layout loaded");
-        let screen = Self { layout, background: None, shapes, fonts, white, cursor_ms: 0, cursor_shape_at: std::cell::Cell::new((usize::MAX, 0)), cursor_btn_at: std::cell::Cell::new((false, 0)), cursor_btn: false, car_spin: 0.0, car_parts: HashMap::new(), car_roof: Default::default(), covered: false, combo_hover: std::cell::Cell::new(None), overlay_mask: std::cell::Cell::new(None), unrendered, logos: HashMap::new(), checks: HashMap::new(), knobs: HashMap::new(), closed: std::collections::HashSet::new(), groups: HashMap::new(), bars: HashMap::new(), lists: HashMap::new(), swatches: HashMap::new(), car_views: HashMap::new(), track_maps: HashMap::new(), movies: HashMap::new(), ko_strip: HashMap::new(), badges: HashMap::new(),
-            // `NFS_FE_CLOCK` preloads the screen clock in milliseconds, so a still can be taken
-            // part way through an animation the front end would otherwise only show in motion
-            clock_ms: crate::config::cfg().nfs_fe_clock.as_str().and_then(|v| v.parse().ok()).unwrap_or(0), glint, colb, arcs, parts_glyphs,
-            movie_overlays: Default::default(),
-            credits_roll: Default::default(),
-            wrap_watch: Default::default(),
-            typing: Default::default(),
-            pending_tab: None,
-            inherited: std::cell::Cell::new((false, 0)),
-            glints: Default::default(),
-            preload_ticks: crate::config::cfg().nfs_fe_clock.as_str().and_then(|v| v.parse::<u64>().ok()).map_or(0, |ms| (ms * 128 / 1000) as i64),
-            watch_text: Default::default(), eval_memo: Default::default(), guard_hits: Default::default(),
-            last_drawn_state: Default::default(),
-            end_of_era: None,
-            career_tabs: None,
-            bar_oval: None,
-            cheat_bits: 0,
-            driver_picture: crate::save::DEFAULT_PICTURE as i32,
-            // `NFS_FE_CURSOR=x,y` parks the pointer for a still, the way `NFS_FE_CLOCK` parks the
-            // clock — a screenshot has no pointer of its own
-            cursor: crate::config::cfg().nfs_fe_cursor.as_str().and_then(|v| {
-                let (a, b) = v.split_once(',')?;
-                Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
-            }),
-            denied: false,
-            wide_hit: false,
-            pointer: None,
-            // `NFS_FE_PRESS=1` holds the button down for a still, the pair of `NFS_FE_CURSOR`
-            pressed: crate::config::cfg().nfs_fe_press.as_str().is_some_and(|v| v != "0"),
-            capture: None,
-            // `NFS_FE_OPEN=<index>` drops a combo's list open for a still
-            open_combo: crate::config::cfg().nfs_fe_open.as_str().and_then(|v| v.parse().ok()),
-            // `NFS_FE_PICKER=1` with `NFS_FE_OPEN` raises the latch for a still of the editor
-            picker_latch: crate::config::cfg().nfs_fe_picker.as_str().is_some_and(|v| v != "0"),
-            picker: Picker::default(),
-            pads: Vec::new(),
-            pad_sel: 0,
-            deadzone: Vec::new(),
-            dz_grab: None,
-            dz_hover: None,
-            camera_current: 0,
-            camera_list: [0, 1, 2, 3],
-            hud_preview: (Vec::new(), 1.0, 1.0),
-            combo_scroll: None,
-            focused: Default::default(),
-            edits: HashMap::new(),
-            selected_flags: Default::default(),
-            unselected: Default::default(),
-            hidden_flags: Default::default(),
-            disabled_flags: Default::default(),
-            picture_pan: Default::default(),
-            picture_drag: None,
-            chronicle_columns: Vec::new(),
-            chronicle_icons: (String::new(), Default::default()),
-            chronicle_captions: Vec::new(),
-            combo_arrows,
-            knob_at: None,
-            scroll: HashMap::new(),
-            hover_ms: 0,
-            hover_of: None,
-            controls, fe_strings, transition: Transition::Idle, overlay: false };
-        screen.activate_glints();
-        Ok(screen)
+        unrendered
     }
 
     /// The activates that draw from `rand` — `NFS5.HEADER` (0x4CAE0D), `NFS5.CarLogo`
@@ -2795,9 +2856,7 @@ impl LayoutScreen {
     /// diagonal — the two triangles would overlap and not tile the quad at all (checked against
     /// coordinates). Only a split that shares **v0–v2** (a fan, or any index pattern built on that
     /// diagonal) tiles the quad correctly for this vertex order — the **BR–TL** diagonal, not the
-    /// BL–TR one this port drew before. *(Until this pass the port kept the caller's own BR, BL,
-    /// TR, TL order and read it as a strip, splitting BL–TR — wrong on two counts now traced: the
-    /// node does not keep that order, and that order read as a strip is not even a valid tiling.)*
+    /// BL–TR one this port drew before. (history: `game-history.md` §21.2)
     /// This port used to step the quad into a grid of flat cells (up to 8 × 8), since its sprites had
     /// one colour a quad; the renderer's per-corner triangles make that unnecessary.
     fn gouraud(&self, out: &mut Vec<Sprite>, aspect: f32, p: [[f32; 2]; 4], c: [[f32; 4]; 4]) {
@@ -3343,7 +3402,7 @@ impl LayoutScreen {
     }
 
     /// `focused` is reached here by holding the button down over a widget whose class takes focus
-    /// on the press (§4.40, `can_press`) — for `NFS5.CARSETTINGBUTTON` that is `picseldown` at
+    /// on the press (§4.40, `can_press_at`) — for `NFS5.CARSETTINGBUTTON` that is `picseldown` at
     /// `data.seldownindex`, the pressed art. `focusedhover` needs `[+0x110] & 0x80`, which no
     /// shipped template of those three sets, so the cascade falls to `focused`.
     fn state_for<'a>(&self, e: &'a nfs_formats::lay::Element, i: usize, selected: Option<usize>, hovered: Option<usize>) -> &'a str {
@@ -3383,7 +3442,7 @@ impl LayoutScreen {
         //
         // and `CameraSelect.ctr`'s `[state.highlighty]` swaps `bg` for `hbg`. The four shipped
         // widgets are `cameras.lay`'s, carrying `accessornum` 0…3 and `text` 1…4. §4.89.
-        if e.class == "NFS5.CAMERASELECT"
+        if self.classes[i] == WidgetClass::CameraSelect
             && self.attr_num(e, "accessornum").unwrap_or(-1.0) == self.camera_current as f64
             && self.controls.get(&e.class).is_some_and(|c| c.has_state("highlighty"))
         {
@@ -3396,13 +3455,13 @@ impl LayoutScreen {
         // the base ctor 0x4C7480 clears and the base bind 0x4C7530 never sets), the state is
         // `highlighty` (0x4BF8AE, `0x4C7970` at 0x4BF8B5); otherwise the ordinary one (0x4BF8BE
         // `0x4C7B70`, 0x4BF8C9 `0x4C7A00`)
-        if e.class == "NFS5.CAMERAPICTURE"
+        if self.classes[i] == WidgetClass::CameraPicture
             && self.camera_list.iter().any(|&v| f64::from(v) == self.attr_num(e, "picturenum").unwrap_or(-1.0))
             && self.controls.get(&e.class).is_some_and(|c| c.has_state("highlighty"))
         {
             return "highlighty";
         }
-        if hot && self.pressed && self.can_press(&e.class) {
+        if hot && self.pressed && self.can_press_at(i) {
             if self.controls.get(&e.class).is_some_and(|c| c.has_state("focusedhover")) {
                 return "focusedhover";
             }
@@ -3416,7 +3475,7 @@ impl LayoutScreen {
             }
             return "selected";
         }
-        if hot && self.can_hover(&e.class) {
+        if hot && self.can_hover_at(i) {
             return "hover";
         }
         match e.get("state").unwrap_or("normal") {
@@ -3436,8 +3495,8 @@ impl LayoutScreen {
     /// the `selected` flag (0x4C7D00), the panel's load (+0x6C, 0x4CEA90) and show (0x4CEC60) —
     /// once the old button is no longer selected and the panel's screen is neither going out
     /// (0x4E0E00 ≠ 3) nor closed (0x4E0E10) — `tick_panels`. So the old panel goes out and only
-    /// then does the new one come in. *(Until 2026-09-26 the switch was made at once, an
-    /// approximation.)* A button's `panel` names a `NFS5.PANEL` of the screen that holds the strip
+    /// then does the new one come in. (history: `game-history.md` §21.3)
+    /// A button's `panel` names a `NFS5.PANEL` of the screen that holds the strip
     /// (0x4D01F0 looks it up three windows up).
     pub fn tab_click(&mut self, r: &mut Renderer, paths: &GamePaths, index: usize) -> bool {
         let Some((k, j)) = self.route(index) else { return false };
@@ -3660,8 +3719,8 @@ impl LayoutScreen {
     /// exactly "the `.ctr` has a `[state.hover]`". Checked against the classes whose draws gate
     /// something on hover: all seven have one, and `BevelOptionBox.ctr`, whose bevel is *not*
     /// gated, has none.
-    fn can_hover(&self, class: &str) -> bool {
-        self.controls.get(class).is_some_and(|c| c.has_state("hover"))
+    fn can_hover_at(&self, i: usize) -> bool {
+        self.hoverable[i]
     }
 
     /// Hold the left button down, or let it up.
@@ -3678,7 +3737,7 @@ impl LayoutScreen {
         // `Window::handleEvent`'s button arm then hands it every button event wherever the pointer
         // is (0x528AD5). The classes that take focus on the press are §4.40's three.
         self.capture = if down {
-            self.hovered().filter(|i| self.layout.elements.get(*i).is_some_and(|e| self.can_press(&e.class)))
+            self.hovered().filter(|i| self.layout.elements.get(*i).is_some_and(|_| self.can_press_at(*i)))
         } else {
             None
         };
@@ -3694,13 +3753,11 @@ impl LayoutScreen {
     /// (`NFS5.CAMERAPICTURE` 0x4BF9BF, `NFS5.3DCAR` 0x4C1002, `NFS5.CONTROLLERSETUP` 0x51C5F0)
     /// take it in **slot 9**, on the release, and keep it — that is a selection, not a press, and
     /// the port does not raise it.
-    const PRESS_FOCUS: [&'static str; 3] = ["NFS5.CARSETTINGBUTTON", "NFS5.DEADZONE", "NFS5.GouraudIndicatorBar"];
-
     /// Whether this widget shows a held-down state: its class must set focus on the press, and
     /// `setFocused` only sets the bit when `[this+0x110] & 0x40`, the mask bit the template's own
     /// `[state.focused]` puts there.
-    fn can_press(&self, class: &str) -> bool {
-        Self::PRESS_FOCUS.contains(&class) && self.controls.get(class).is_some_and(|c| c.has_state("focused"))
+    fn can_press_at(&self, i: usize) -> bool {
+        self.classes[i].takes_focus_on_press() && self.controls.get(&self.layout.elements[i].class).is_some_and(|c| c.has_state("focused"))
     }
 
     /// The widget the pointer is over — the **first** section whose box contains it and whose
@@ -3790,7 +3847,10 @@ impl LayoutScreen {
         let (cx, cy) = self.cursor?;
         // the bases the flattened index space gives each embedded screen, by the element the
         // panel sits at, so a sub-layout is tested exactly where the draw reaches it
-        let bases: std::collections::HashMap<usize, usize> = {
+        // (most screens embed nothing: then there is nothing to build, P7)
+        let bases: std::collections::HashMap<usize, usize> = if self.groups.is_empty() {
+            std::collections::HashMap::new()
+        } else {
             let mut keys: Vec<usize> = self.groups.keys().copied().collect();
             keys.sort_unstable();
             let mut base = self.layout.elements.len();
@@ -3825,14 +3885,14 @@ impl LayoutScreen {
             // such click is observed on the running original (RE/notes/controls.md 2026-10-02).
             //
             // The window's hit test (0x528C00) asks every child's containsPoint (0x525A90) and
-            // knows nothing of a hover state; `can_hover` stands in for "a widget that reacts to
+            // knows nothing of a hover state; `can_hover_at` stands in for "a widget that reacts to
             // the pointer" and is right for the buttons. The three text-entry classes react to a
             // click without ever having a `[state.hover]` (their `.ctr` states are `normal,
             // hidden, focused[, disabled]`): the release goes to their slot 9 (0x4CCB70,
             // 0x4C2220) which takes the focus. Without them here a click on `Comms.IP` (or the
             // chat line) never reached the box and nothing could be typed into it.
-            let takes_click = matches!(e.class.as_str(), "NFS5.INPUTBOX" | "NFS5.CHATINPUTBOX" | "NFS5.CHARVECTACCESSORINPUTBOX");
-            if !(self.wide_hit || self.can_hover(&e.class) || takes_click) || self.state_draws_nothing(e) {
+            let takes_click = self.classes[i].takes_click();
+            if !(self.wide_hit || self.can_hover_at(i) || takes_click) || self.state_draws_nothing(e) {
                 continue;
             }
             // **A hidden widget contributes no box** (`[this+0x10C] & 0x20`, the bit 0x50D910's helper
@@ -4030,8 +4090,7 @@ impl LayoutScreen {
         // `_First` (0x528785…0x528799). So the **last** section is painted first and **section 1
         // is on top**. Section **0** is not a child at all: 0x5285D3 reads it once for the screen
         // descriptor, and it is the screen's own fill, painted before everything.
-        let order: Vec<usize> = std::iter::once(0).chain((1..self.layout.elements.len()).rev()).collect();
-        for i in order {
+        for i in std::iter::once(0).chain((1..self.layout.elements.len()).rev()) {
             let e = &self.layout.elements[i];
             let ((tdx, tdy), talpha) = self.transition_of(e);
             let (x, y) = self.position_of(e);
@@ -4046,47 +4105,47 @@ impl LayoutScreen {
             let mut closed = false;
             // what every per-class draw in `layout/widgets.rs` reads
             let d = WidgetDraw { i, e, x, y, w, h, talpha, aspect, strings, selected, hovered, accessor };
-            match e.class.as_str() {
-                c if c.starts_with("REAL.BLACK") => self.draw_screen_fill(d, &mut out),
+            match self.classes[i] {
+                WidgetClass::ScreenFill => self.draw_screen_fill(d, &mut out),
                 // `NFS_NO_GOURAUD=1` skips them — the probe for which sprites bury the text
-                "NFS5.GOURAUDBOX" if crate::config::cfg().nfs_no_gouraud.as_str().is_some() => {}
-                "NFS5.GOURAUDBOX" => self.draw_gouraud_box(d, &mut out),
-                "NFS5.GouraudIndicatorBar" => self.draw_gouraud_indicator_bar(d, &mut out),
-                "NFS5.GlintyRectangle" => self.draw_glinty_rectangle(d, &mut out),
-                "NFS5.PANEL" => {
+                WidgetClass::GouraudBox if crate::config::cfg().nfs_no_gouraud.as_str().is_some() => {}
+                WidgetClass::GouraudBox => self.draw_gouraud_box(d, &mut out),
+                WidgetClass::GouraudIndicatorBar => self.draw_gouraud_indicator_bar(d, &mut out),
+                WidgetClass::GlintyRectangle => self.draw_glinty_rectangle(d, &mut out),
+                WidgetClass::Panel => {
                     closed = self.draw_panel(d, &mut out, blank);
                 }
-                "NFS5.3DCAR" => self.draw_3d_car(d, &mut out),
-                "NFS5.DEADZONE" => {
+                WidgetClass::Car3d => self.draw_3d_car(d, &mut out),
+                WidgetClass::DeadZone => {
                     closed = self.draw_deadzone(d, &mut out);
                 }
-                "NFS5.INPUTBOX" | "NFS5.CHATINPUTBOX" | "NFS5.CHATDISPLAYBOX"
-                | "NFS5.CHARVECTACCESSORINPUTBOX" | "NFS5.CONTROLLERSETUP" => self.draw_text_boxes(d, &mut out),
-                "NFS5.ListBox" => self.draw_list_box(d, &mut out),
-                "NFS5.RADIOGROUP" => self.draw_radio_group(d, &mut out, blank),
-                "NFS5.TrackSmall2dSpline" => self.draw_track_small_spline(d, &mut out),
-                "NFS5.PRIZERACEMAP" | "NFS5.FACTORYMAP" => self.draw_race_or_factory_map(d, &mut out),
-                "NFS5.PLAYERPICTURE" | "NFS5.MINIPLAYERPICTURE" | "NFS5.BADGE" | "NFS5.MINIBADGE" | "NFS5.FACTORYPIC" | "NFS5.HUD" => self.draw_pack_pictures(d, &mut out),
-                "NFS5.MOVIEBOX" | "NFS5.MOVIECIRCLE" => self.draw_movie(d, &mut out),
-                "NFS5.ACCOUNTTHING" => self.draw_account_thing(d, &mut out),
-                "NFS5.ANIMSHOWCASEPICTURE" => self.draw_anim_showcase_picture(d, &mut out),
-                "NFS5.ChroniclePictureIcon" | "NFS5.ShowcasePicture" | "NFS5.ChroniclePicture" => self.draw_chronicle_or_showcase_picture(d, &mut out),
-                "NFS5.CarLogo" => self.draw_car_logo(d, &mut out),
-                "NFS5.KNOCKOUTTRACKLIST" => self.draw_knockout_track_list(d, &mut out),
-                "NFS5.ChronicleMainBoxControl" => self.draw_chronicle_main_box(d, &mut out),
-                "NFS5.AnimatingPicture" => self.draw_animating_picture(d, &mut out),
-                "NFS5.HEADER" | "NFS5.SUBHEADER"
-                | "REAL.LABEL" | "NFS5.PICTURE" | "NFS5.NonLocalizedLabel" | "NFS5.ExtraCircle"
-                | "NFS5.OutlineRectangle" | "NFS5.Rectangle" | "NFS5.BEVELEDOPTIONBOX" | "NFS5.GLINTYLINE" => {
+                WidgetClass::InputBox | WidgetClass::ChatInputBox | WidgetClass::ChatDisplayBox
+                | WidgetClass::CharVectAccessorInputBox | WidgetClass::ControllerSetup => self.draw_text_boxes(d, &mut out),
+                WidgetClass::ListBox => self.draw_list_box(d, &mut out),
+                WidgetClass::RadioGroup => self.draw_radio_group(d, &mut out, blank),
+                WidgetClass::TrackSmall2dSpline => self.draw_track_small_spline(d, &mut out),
+                WidgetClass::PrizeRaceMap | WidgetClass::FactoryMap => self.draw_race_or_factory_map(d, &mut out),
+                WidgetClass::PlayerPicture | WidgetClass::MiniPlayerPicture | WidgetClass::Badge | WidgetClass::MiniBadge | WidgetClass::FactoryPic | WidgetClass::Hud => self.draw_pack_pictures(d, &mut out),
+                WidgetClass::MovieBox | WidgetClass::MovieCircle => self.draw_movie(d, &mut out),
+                WidgetClass::AccountThing => self.draw_account_thing(d, &mut out),
+                WidgetClass::AnimShowcasePicture => self.draw_anim_showcase_picture(d, &mut out),
+                WidgetClass::ChroniclePictureIcon | WidgetClass::ShowcasePicture | WidgetClass::ChroniclePicture => self.draw_chronicle_or_showcase_picture(d, &mut out),
+                WidgetClass::CarLogo => self.draw_car_logo(d, &mut out),
+                WidgetClass::KnockoutTrackList => self.draw_knockout_track_list(d, &mut out),
+                WidgetClass::ChronicleMainBoxControl => self.draw_chronicle_main_box(d, &mut out),
+                WidgetClass::AnimatingPicture => self.draw_animating_picture(d, &mut out),
+                WidgetClass::Header | WidgetClass::SubHeader
+                | WidgetClass::RealLabel | WidgetClass::Picture | WidgetClass::NonLocalizedLabel | WidgetClass::ExtraCircle
+                | WidgetClass::OutlineRectangle | WidgetClass::Rectangle | WidgetClass::BeveledOptionBox | WidgetClass::GlintyLine => {
                     closed = self.draw_template_classes(d, &mut out);
                 }
-                "NFS5.CheckBox" => self.draw_check_box(d, &mut out),
+                WidgetClass::CheckBox => self.draw_check_box(d, &mut out),
                 // `NFS5.CHRONICLESLIDER` is the same helper (0x4D0B90, `[helper+0x130] == 0`)
-                "NFS5.CarSettingSlider" | "NFS5.CHRONICLESLIDER" => self.draw_car_setting_slider(d, &mut out),
-                "NFS5.ComboBoxSlider" | "NFS5.ColorBox" => self.draw_combo(d, &mut out, &mut overlay),
-                "NFS5.GOTOBUTTON" => self.draw_goto_button(d, &mut out),
-                "NFS5.BOTTOMBARBUTTON" | "NFS5.GRAPHICTABBUTTON" => self.draw_bar_or_graphic_tab(d, &mut out),
-                "NFS5.TABBUTTON" | "NFS5.CAMERASELECT" | "NFS5.CAMERAPICTURE" => self.draw_tab_or_camera(d, &mut out),
+                WidgetClass::CarSettingSlider | WidgetClass::ChronicleSlider => self.draw_car_setting_slider(d, &mut out),
+                WidgetClass::ComboBoxSlider | WidgetClass::ColorBox => self.draw_combo(d, &mut out, &mut overlay),
+                WidgetClass::GotoButton => self.draw_goto_button(d, &mut out),
+                WidgetClass::BottomBarButton | WidgetClass::GraphicTabButton => self.draw_bar_or_graphic_tab(d, &mut out),
+                WidgetClass::TabButton | WidgetClass::CameraSelect | WidgetClass::CameraPicture => self.draw_tab_or_camera(d, &mut out),
                 _ => {
                     closed = self.draw_default(d, &mut out);
                 }
@@ -4132,7 +4191,7 @@ impl LayoutScreen {
             // something the original does; a sweep that counts 2D sprites therefore has nothing
             // to see here, the same way `deadzone.lay`'s axis bars have nothing to show without
             // a pad. Reported on its own line rather than as a blank.
-            if out.len() == first && i > 0 && !closed && e.class != "NFS5.3DCAR" {
+            if out.len() == first && i > 0 && !closed && self.classes[i] != WidgetClass::Car3d {
                 blank.push((e.class.clone(), source_of(e)));
             }
         }

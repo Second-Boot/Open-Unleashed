@@ -6,9 +6,7 @@
 //! `skill-tests.md` §5.3 / §5.4). The bodies are `nfs_physics::smackable`; this module keeps them
 //! for the race and runs their handlers in the priority list's order.
 //!
-//! *(Until 2026-09-26 only a skill test had them, `SkillTest::step_props`; a race's hydrants and
-//! signs were drawn but took no hit — the port's 0x498DE0 has no object for them, rightly: the
-//! loader 0x4750B0 builds none for `collideType` 3.)*
+//! (history: `game-history.md` §14.1)
 
 use crate::world::{SmackableOwner, TrackWorld};
 use glam::{Mat3, Mat4, Quat, Vec3};

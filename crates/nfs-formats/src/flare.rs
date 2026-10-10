@@ -24,14 +24,14 @@ pub struct FlareDef {
     pub off: i32,
 }
 
-use crate::dword;
+use crate::bytes::{read_f32, read_i32, read_u32};
 
 /// Every whole record of the file, in file order.
 pub fn parse(data: &[u8]) -> Vec<FlareDef> {
     data.chunks_exact(RECORD)
         .map(|r| {
             let tex = |o: usize| {
-                let v = dword(r, o);
+                let v = read_u32(r, o);
                 // 0x452132: the stored dword "llun" read little-endian is 0x6E756C6C
                 if v == 0x6E75_6C6C {
                     return None;
@@ -40,14 +40,14 @@ pub fn parse(data: &[u8]) -> Vec<FlareDef> {
                 Some(b.iter().map(|&c| c as char).collect::<String>())
             };
             FlareDef {
-                id: dword(r, 0),
+                id: read_u32(r, 0),
                 textures: [tex(4), tex(8)],
-                colours: [dword(r, 0x1C), dword(r, 0x20)],
-                sizes: [f32::from_bits(dword(r, 0x34)), f32::from_bits(dword(r, 0x38))],
-                flags: dword(r, 0x4C),
-                phase: dword(r, 0x50) as i32,
-                on: dword(r, 0x54) as i32,
-                off: dword(r, 0x58) as i32,
+                colours: [read_u32(r, 0x1C), read_u32(r, 0x20)],
+                sizes: [read_f32(r, 0x34), read_f32(r, 0x38)],
+                flags: read_u32(r, 0x4C),
+                phase: read_i32(r, 0x50),
+                on: read_i32(r, 0x54),
+                off: read_i32(r, 0x58),
             }
         })
         .collect()
@@ -92,4 +92,23 @@ mod tests {
         assert_eq!((d.colours[0], d.sizes[0], d.flags), (0xB5FF_FFFF, 8.7, 4));
         assert!(d.lit(0, 0) && d.lit(0, 21) && !d.lit(0, 22) && !d.lit(0, 70) && d.lit(0, 71));
     }
+
+    /// Characterisation guard: three records of a deterministic byte pattern (negative phase /
+    /// on / off, a `"null"` layer, a trailing partial record ignored), the whole output hashed.
+    #[test]
+    fn parse_output_is_pinned() {
+        let mut d = vec![0u8; RECORD * 3 + 5];
+        for (i, b) in d.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(131) ^ (i >> 3)) as u8;
+        }
+        d[RECORD + 8..RECORD + 12].copy_from_slice(b"llun");
+        d[RECORD + 0x50..RECORD + 0x54].copy_from_slice(&(-7i32).to_le_bytes());
+        d[RECORD + 0x58..RECORD + 0x5C].copy_from_slice(&(-1i32).to_le_bytes());
+        let defs = parse(&d);
+        assert_eq!(defs.len(), 3);
+        let h = format!("{defs:?}").bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+        assert_eq!(h, PIN);
+    }
+
+    const PIN: u64 = 1909061371421202550;
 }

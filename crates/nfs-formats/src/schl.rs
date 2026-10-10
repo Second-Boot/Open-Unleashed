@@ -17,6 +17,7 @@
 //! block, so blocks decode independently (which is what makes seeking trivial).
 
 use crate::bnk::{decode_ea_xa, interleave, Codec, EaXaState, PcmSample, PtHeader};
+use crate::bytes::{read_i16, read_u32};
 use crate::{u32_le, FormatError};
 
 /// One `SCDl` block: `channels[c]` starts at that channel's two seed samples.
@@ -37,8 +38,8 @@ impl<'a> DataBlock<'a> {
             if chan.len() < 4 {
                 return Err(FormatError::Truncated { what: "SCDl channel seed", offset: self.offset, needed: 4 });
             }
-            let s1 = i16::from_le_bytes([chan[0], chan[1]]);
-            let s2 = i16::from_le_bytes([chan[2], chan[3]]);
+            let s1 = read_i16(chan, 0);
+            let s2 = read_i16(chan, 2);
             let mut plane = Vec::with_capacity(n);
             let padded = decode_ea_xa(chan, 4, n, &mut EaXaState::seeded(s1, s2), &mut plane, "SCDl EA-XA frames")?;
             if padded != 0 {
@@ -127,7 +128,7 @@ pub fn parse_block(data: &[u8], pos: usize, channels: usize) -> Result<(Block<'_
         }
         b"SCEl" => Block::End,
         other => {
-            return Err(FormatError::UnknownRecordType { what: "SCxl block", offset: pos, code: u32::from_le_bytes([other[0], other[1], other[2], other[3]]) });
+            return Err(FormatError::UnknownRecordType { what: "SCxl block", offset: pos, code: read_u32(other, 0) });
         }
     };
     Ok((block, pos + size))

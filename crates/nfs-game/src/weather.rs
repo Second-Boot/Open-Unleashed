@@ -25,9 +25,7 @@
 //! order (the prime, then per frame snow, rain, splat). The constructor's draws (0x456F5F, at the
 //! track load 0x469092) come from the state the track load's 0x44F240 left, which that reseed
 //! replaces and the prime's reset draws again: they leave no trace, and are made from a state of
-//! their own here. *(Until 2026-09-26 the emitters drew from a stand-in, the race's 16-bit LCG
-//! form, and the splat from a state of its own; then all three from one state of the layer's own
-//! starting at the image's `.data` values.)*
+//! their own here. (history: `game-history.md` §12.1)
 
 use glam::{Mat3, Vec3};
 
@@ -430,9 +428,9 @@ impl Emitter {
     }
 
     /// 0x4565F0: world down in camera space `a`, `b = cross((0, 0, −1), a)`, `P = (b.x·w, b.y·w,
-    /// b.z)`, `Q = (a.x·l, a.y·l, a.z)` — z not scaled, as read — and per pair of particles `c, c + P
-    /// + Q, c + Q` / `c, c + P, c + P + Q`, with the UVs 0x456790 set: `(0,0) (1,1) (0,1)` / `(0,0)
-    /// (1,0) (1,1)`.
+    /// b.z)`, `Q = (a.x·l, a.y·l, a.z)` — z not scaled, as read — and per pair of particles
+    /// `c, c + P + Q, c + Q` / `c, c + P, c + P + Q`, with the UVs 0x456790 set: `(0,0) (1,1) (0,1)` /
+    /// `(0,0) (1,0) (1,1)`.
     fn build(&mut self, view: View) {
         self.verts.clear();
         if self.count < 1 {
