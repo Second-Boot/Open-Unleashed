@@ -115,8 +115,8 @@ struct Shared {
     /// the callback's reusable buffers (PERF F5: nothing in the device callback allocates)
     scratch: Scratch,
     /// voices and streams taken out of the mix, waiting for [`Core::publish`] to hand them to the
-    /// game thread to be freed there
-    /// 
+    /// game thread to be freed there (a clip's samples or a stream's queue are
+    /// freed by whoever drops the last `Arc`, and that must not be the callback)
     dead: Vec<Gc>,
 }
 

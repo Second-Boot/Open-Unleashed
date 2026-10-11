@@ -425,7 +425,7 @@ impl Ambience {
 
     /// The animated-object emitters' per-frame position/velocity refresh (§7.4: `p1 =
     /// obj.EvalPos(tick)`, `p2 = obj.EvalPos(tick + 0x20)`, `vel = 2·(p1 − p2)` — read directly off
-    /// `0x4AEF30`'s disassembly 2026-09-30, which **corrects** an earlier note's
+    /// `0x4AEF30`'s disassembly (2026-09-30), which **corrects** an earlier note's
     /// `(p2 − p1)·64/dt`: the actual subtraction order is `p1 − p2`, doubled (`64/0x20 == 2`), not
     /// `p2 − p1`). The record's own position field gets **`p2`** (the *later* sample, not `p1`) —
     /// `0x477a2e`'s copy writes `[esp+0x1c..0x24]` (still holding `p2` at that point) into the

@@ -10,7 +10,7 @@ impl App {
             Some(wr) => wr,
             None => {
                 let attrs = Window::default_attributes()
-                    .with_title("Porsche Unleashed (native)")
+                    .with_title(crate::brand::TITLE)
                     .with_inner_size({
                         // **TEST GLUE**: `NFS_SHOT_SIZE` also shapes the window (its aspect is the still's)
                         let (w, h, _) = shot_geometry();

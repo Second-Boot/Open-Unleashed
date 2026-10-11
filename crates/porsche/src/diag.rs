@@ -99,7 +99,7 @@ pub fn init() {
         #[cfg(all(windows, not(debug_assertions)))]
         {
             let where_ = shown.as_ref().map_or_else(|| "(журнал не записан)".to_string(), |p| p.display().to_string());
-            message_box(&format!("Porsche Unleashed: ошибка запуска — подробности в {where_}\n\n{info}"));
+            message_box(&format!("{}: ошибка запуска — подробности в {where_}\n\n{info}", crate::brand::TITLE));
         }
     }));
 }
@@ -110,7 +110,7 @@ pub fn fatal(err: &anyhow::Error) {
     #[cfg(all(windows, not(debug_assertions)))]
     {
         let where_ = LOG.get().cloned().flatten().unwrap_or_else(|| nfs_assets::platform::data_dir().join("porsche.log"));
-        message_box(&format!("Porsche Unleashed: ошибка запуска — подробности в {}\n\n{err:#}", where_.display()));
+        message_box(&format!("{}: ошибка запуска — подробности в {}\n\n{err:#}", crate::brand::TITLE, where_.display()));
     }
 }
 
@@ -121,7 +121,7 @@ fn message_box(text: &str) {
         fn MessageBoxW(hwnd: *mut core::ffi::c_void, text: *const u16, caption: *const u16, ty: u32) -> i32;
     }
     let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
-    let (t, c) = (wide(text), wide("Porsche Unleashed"));
+    let (t, c) = (wide(text), wide(crate::brand::TITLE));
     // MB_OK | MB_ICONERROR
     unsafe { MessageBoxW(core::ptr::null_mut(), t.as_ptr(), c.as_ptr(), 0x10) };
 }

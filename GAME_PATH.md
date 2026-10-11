@@ -21,13 +21,11 @@ copy individual files elsewhere first.
 Runtime code and tools resolve the game root in this order:
 
 1. `NFS5_GAME_PATH` environment variable, if set.
-2. `<binary dir>/../Resources/game` — the data a self-contained app bundle carries
-   (`packaging/make_app.sh --with-data`; for personal use only, the assets are EA's).
-3. `~/Games/NFS-Porsche-Unleashed/game_info/data`.
-4. `~/Games/NFS-Porsche-Unleashed` (if it directly contains `GameData/`).
+2. `game/` beside the executable (the Windows / Linux archives).
+3. `<binary dir>/../Resources/game` — the data a self-contained app bundle carries
+   (`packaging/make_app.sh --with-data`: a private build for your own machines, never to be shared — the assets are EA's).
+4. on macOS, `game/` beside the `.app`.
+5. `~/Games/NFS-Porsche-Unleashed/game_info/data`.
+6. `~/Games/NFS-Porsche-Unleashed` (if it directly contains `GameData/`).
 
 See `crates/nfs-assets/src/paths.rs`.
-
-## What is there
-
-See `RE/BINARY.md` for the executable triage and `RE/FORMATS.md` for the data file inventory.

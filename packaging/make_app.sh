@@ -1,12 +1,13 @@
 #!/bin/sh
-# Build PorscheUnleashed.app (Apple Silicon, or arm64+x86_64 with --universal) from the release binary.
+# Build <APP_ID>.app (Apple Silicon, or arm64+x86_64 with --universal) from the release binary
+# (the name: packaging/brand.sh).
 #
-#   make_app.sh              the code only; the original game data stays external (GAME_PATH.md):
-#                            set NFS5_GAME_PATH or keep the default location
+#   make_app.sh              the code only (the public build); the player's own game data stays external:
+#                            game/ beside the .app, NFS5_GAME_PATH or the default location (GAME_PATH.md)
 #   make_app.sh --universal  also build x86_64 and ship one arm64+x86_64 (lipo) binary, so the app
 #                            runs on Intel Macs too (needs `rustup target add x86_64-apple-darwin`);
 #                            combines with --with-data in any order
-#   make_app.sh --with-data  a self-contained PorscheUnleashed-Full.app that also carries the data
+#   make_app.sh --with-data  a self-contained <APP_ID>-WithData.app that also carries the data
 #                            the port reads (GameData, FEData, fe.txt) in
 #                            Contents/Resources/game, plus madtables.bin — the movie decoder's tables
 #                            extracted from nfs5.exe (the executable itself is NOT bundled). The assets are EA's: for your own machines only,
@@ -16,6 +17,7 @@
 # only read (copied), never modified.
 set -e
 cd "$(dirname "$0")/.."
+. packaging/brand.sh
 WITH_DATA=0
 UNIVERSAL=0
 for a in "$@"; do
@@ -29,14 +31,14 @@ cargo build --release -p porsche
 if [ "$UNIVERSAL" = 1 ]; then
   cargo build --release -p porsche --target x86_64-apple-darwin
 fi
-if [ "$WITH_DATA" = 1 ]; then APP=target/PorscheUnleashed-Full.app; else APP=target/PorscheUnleashed.app; fi
+if [ "$WITH_DATA" = 1 ]; then APP=target/$APP_ID-WithData.app; else APP=target/$APP_ID.app; fi
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 if [ "$UNIVERSAL" = 1 ]; then
   lipo -create target/release/porsche target/x86_64-apple-darwin/release/porsche \
-    -output "$APP/Contents/MacOS/PorscheUnleashed"
+    -output "$APP/Contents/MacOS/$APP_ID"
 else
-  cp target/release/porsche "$APP/Contents/MacOS/PorscheUnleashed"
+  cp target/release/porsche "$APP/Contents/MacOS/$APP_ID"
 fi
 if [ "$WITH_DATA" = 1 ]; then
   SRC="${NFS5_GAME_PATH:-$HOME/Games/NFS-Porsche-Unleashed/game_info/data}"
@@ -57,12 +59,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>CFBundleName</key><string>Porsche Unleashed</string>
-  <key>CFBundleDisplayName</key><string>Porsche Unleashed</string>
-  <key>CFBundleIdentifier</key><string>dev.porsche-re.PorscheUnleashed</string>
+  <key>CFBundleName</key><string>$APP_TITLE</string>
+  <key>CFBundleDisplayName</key><string>$APP_TITLE</string>
+  <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   <key>CFBundleVersion</key><string>0.1.0</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
-  <key>CFBundleExecutable</key><string>PorscheUnleashed</string>
+  <key>CFBundleExecutable</key><string>$APP_ID</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
@@ -77,7 +79,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
        this game does no service discovery, just plain UDP broadcast and unicast.
        (No multicast entitlement either: com.apple.developer.networking.multicast is for multicast
        groups, and the game broadcasts.) -->
-  <key>NSLocalNetworkUsageDescription</key><string>Porsche Unleashed looks for and joins network races on your local network (UDP port 1106).</string>
+  <key>NSLocalNetworkUsageDescription</key><string>$APP_TITLE looks for and joins network races on your local network (UDP port 1106).</string>
 </dict></plist>
 PLIST
 # Seal the bundle with an ad-hoc signature (PLATFORM GLUE): Apple Silicon runs only signed code, and
@@ -85,4 +87,4 @@ PLIST
 # per signed app identity, so an unsealed bundle whose Info.plist changed asks again every build.
 codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "codesign failed - the app may not start on Apple Silicon" >&2
 echo "built $APP"
-file "$APP/Contents/MacOS/PorscheUnleashed"
+file "$APP/Contents/MacOS/$APP_ID"

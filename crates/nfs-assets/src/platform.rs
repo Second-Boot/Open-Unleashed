@@ -41,12 +41,16 @@ pub fn data_dir() -> PathBuf {
 
 /// The places the game data may live, in search order (the first that holds `GameData` and
 /// `FEData` wins): `game/` beside the executable (Windows / Linux packages), the macOS bundle's
-/// `../Resources/game`, then the developer's `~/Games/NFS-Porsche-Unleashed[/game_info/data]`.
+/// `../Resources/game`, `game/` beside the `.app` (macOS packages without the data), then
+/// `~/Games/NFS-Porsche-Unleashed[/game_info/data]`.
 pub fn game_data_candidates() -> Vec<PathBuf> {
     let mut v = Vec::new();
     if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
         v.push(dir.join("game"));
         v.push(dir.join("../Resources/game"));
+        if cfg!(target_os = "macos") {
+            v.push(dir.join("../../../game"));
+        }
     }
     if let Some(home) = home_dir() {
         v.push(home.join("Games/NFS-Porsche-Unleashed/game_info/data"));

@@ -8,7 +8,7 @@ pub struct GamePaths {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("original game installation not found; set NFS5_GAME_PATH (see GAME_PATH.md). Tried: {tried:?}")]
+#[error("original game data not found: copy the GameData and FEData folders of your own installed copy into `game/` beside the executable, or set NFS5_GAME_PATH to the folder that holds them (see README). Tried: {tried:?}")]
 pub struct GameNotFound {
     pub tried: Vec<PathBuf>,
 }

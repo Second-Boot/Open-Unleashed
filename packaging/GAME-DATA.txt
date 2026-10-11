@@ -1,0 +1,12 @@
+@TITLE@ needs the data of your own copy of Need for Speed: Porsche Unleashed (PC, 2000).
+None of the original game's files are included.
+
+Copy the folders GameData and FEData from the installed game (the folder that holds nfs5.exe)
+into this folder, so that it contains:
+
+    game/GameData/...
+    game/FEData/...
+
+Optionally also copy nfs5.exe (the intro movies' decoder reads its tables from it; it is never run)
+and fe.txt. Instead of copying, you can set the environment variable NFS5_GAME_PATH to the
+installed game's folder.

@@ -37,7 +37,7 @@
 //! quadrant per `0x47C2C0`) is wholly pruned (`wholly_pruned`, `0x47F310`'s far-circle-and-wedge
 //! rule) by the *same* eye/forward/`h`/`far`?
 //!
-//! **2026-09-30:** the registration is the original's, now in
+//! **2026-09-30 (triage batch A1):** the registration is the original's, now in
 //! `nfs_game::fitted_tree` / `nfs_game::world::build_article_nodes` — the tree is built from the
 //! placed articles' first-LOD `vt` vertices over the box-corner root (`tree_population`), the
 //! static and mid-ground articles are spread by their hull through 0x5A0790's polygon-rectangle

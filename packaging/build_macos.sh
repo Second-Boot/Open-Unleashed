@@ -1,20 +1,30 @@
 #!/bin/sh
-# macOS universal (arm64 + x86_64) build -> target/dist/PorscheUnleashed-macos-universal-<commit>.zip
-# Contents: PorscheUnleashed-Full.app (the game data inside, see make_app.sh --with-data), README.txt.
+# macOS universal (arm64 + x86_64) build -> target/dist/<APP_ID>-macos-universal-<commit>[-with-data].zip
+# Contents: <APP_ID>.app, game/ (where the player's data goes), README.txt, LICENSE.txt, THIRD-PARTY-LICENSES.txt.
+#   --with-data   <APP_ID>-WithData.app with the game data inside instead (make_app.sh --with-data): private use only
 set -e
 cd "$(dirname "$0")/.."
+. packaging/common.sh
+parse_pack_args "$@"
 ROOT=$(pwd)
 COMMIT=$(git rev-parse --short=8 HEAD)
 DIST=$ROOT/target/dist
-STAGE=$DIST/stage-mac/PorscheUnleashed
+STAGE=$DIST/stage-mac/$APP_ID
 mkdir -p "$DIST"
-sh packaging/make_app.sh --with-data --universal
 rm -rf "$DIST/stage-mac"
 mkdir -p "$STAGE"
-ditto --norsrc --noextattr target/PorscheUnleashed-Full.app "$STAGE/PorscheUnleashed-Full.app"
-cp packaging/README-macos.txt "$STAGE/README.txt"
-OUT=$DIST/PorscheUnleashed-macos-universal-$COMMIT.zip
+if [ "$WITH_DATA" = 1 ]; then
+  sh packaging/make_app.sh --with-data --universal
+  ditto --norsrc --noextattr "target/$APP_ID-WithData.app" "$STAGE/$APP_ID-WithData.app"
+else
+  sh packaging/make_app.sh --universal
+  ditto --norsrc --noextattr "target/$APP_ID.app" "$STAGE/$APP_ID.app"
+  stage_game_dir "$STAGE/game"
+fi
+brand_readme packaging/README-macos.txt > "$STAGE/README.txt"
+stage_legal "$STAGE" aarch64-apple-darwin
+OUT=$DIST/$APP_ID-macos-universal-$COMMIT$SUFFIX.zip
 rm -f "$OUT"
-(cd "$DIST/stage-mac" && ditto -c -k --norsrc --noextattr --keepParent PorscheUnleashed "$OUT")
+(cd "$DIST/stage-mac" && ditto -c -k --norsrc --noextattr --keepParent "$APP_ID" "$OUT")
 rm -rf "$DIST/stage-mac"
 ls -lh "$OUT"
