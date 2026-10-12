@@ -3,7 +3,7 @@
 # (the name: packaging/brand.sh).
 #
 #   make_app.sh              the code only (the public build); the player's own game data stays external:
-#                            game/ beside the .app, NFS5_GAME_PATH or the default location (GAME_PATH.md)
+#                            game/ beside the .app, NFS5_GAME_PATH or the default location (docs/en/game-data.md)
 #   make_app.sh --universal  also build x86_64 and ship one arm64+x86_64 (lipo) binary, so the app
 #                            runs on Intel Macs too (needs `rustup target add x86_64-apple-darwin`);
 #                            combines with --with-data in any order
@@ -27,18 +27,18 @@ for a in "$@"; do
     *) echo "unknown option $a" >&2; exit 2 ;;
   esac
 done
-cargo build --release -p porsche
+cargo build --release -p open-unleashed
 if [ "$UNIVERSAL" = 1 ]; then
-  cargo build --release -p porsche --target x86_64-apple-darwin
+  cargo build --release -p open-unleashed --target x86_64-apple-darwin
 fi
 if [ "$WITH_DATA" = 1 ]; then APP=target/$APP_ID-WithData.app; else APP=target/$APP_ID.app; fi
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 if [ "$UNIVERSAL" = 1 ]; then
-  lipo -create target/release/porsche target/x86_64-apple-darwin/release/porsche \
+  lipo -create target/release/open-unleashed target/x86_64-apple-darwin/release/porsche \
     -output "$APP/Contents/MacOS/$APP_ID"
 else
-  cp target/release/porsche "$APP/Contents/MacOS/$APP_ID"
+  cp target/release/open-unleashed "$APP/Contents/MacOS/$APP_ID"
 fi
 if [ "$WITH_DATA" = 1 ]; then
   SRC="${NFS5_GAME_PATH:-$HOME/Games/NFS-Porsche-Unleashed/game_info/data}"
@@ -71,7 +71,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSArchitecturePriority</key><array><string>arm64</string></array>
   <!-- Network play (PLATFORM GLUE, not in the original): from macOS 15 (and 14 for apps started from
        the Finder) any UDP to or from a local-network address - the game's broadcast that finds a
-       host on the LAN (port 1106), the join and the race traffic - is held back until the user has
+       host on the LAN (UDP 9442), the join and the race traffic - is held back until the user has
        allowed "Local Network" for the app; the text below is what the system shows in that prompt.
        Without this key the prompt has no purpose string and the permission ends up denied, which
        shows as sends failing with EHOSTUNREACH ("No route to host") and an empty games list.
@@ -79,7 +79,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
        this game does no service discovery, just plain UDP broadcast and unicast.
        (No multicast entitlement either: com.apple.developer.networking.multicast is for multicast
        groups, and the game broadcasts.) -->
-  <key>NSLocalNetworkUsageDescription</key><string>$APP_TITLE looks for and joins network races on your local network (UDP port 1106).</string>
+  <key>NSLocalNetworkUsageDescription</key><string>$APP_TITLE looks for and joins network races on your local network (UDP port 9442).</string>
 </dict></plist>
 PLIST
 # Seal the bundle with an ad-hoc signature (PLATFORM GLUE): Apple Silicon runs only signed code, and

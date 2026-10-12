@@ -1,4 +1,4 @@
-//! Locate the (read-only) original game installation. See `GAME_PATH.md`.
+//! Locate the (read-only) original game installation. See `docs/en/game-data.md`.
 
 use std::path::{Path, PathBuf};
 

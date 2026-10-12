@@ -14,7 +14,7 @@ use nfs_net::state::{CarState, TICK_MASK};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant};
 
-/// The application GUID at 0x5B4980, zero-padded — see `porsche::netplay` and §7.16.
+/// The application GUID at 0x5B4980, zero-padded — see `open_unleashed::netplay` and §7.16.
 const KEY: [u8; 32] = [
     0x81, 0x6B, 0xD4, 0x5C, 0xE4, 0xEC, 0xD3, 0x11, 0x9B, 0x6A, 0x00, 0x90, 0x27, 0x24, 0xAB, 0x1E,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,

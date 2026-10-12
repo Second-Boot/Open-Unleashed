@@ -29,7 +29,7 @@
 //! The jitter draws from the front end's generator 0x538040 (`opponents::FeRng`, through 0x5561D0
 //! at 0x45EEA1 / 0x45F3D3) — the game's **one** state, which the caller hands in: the race's, seeded
 //! from `time(0)` by the HUD's init and shared with the weather and the announcer (`App::fe_rng` in
-//! `porsche`). (history: `game-history.md` §11.1) Not ported: `basic`'s `noise` alpha maps
+//! `open-unleashed`). (history: `game-history.md` §11.1) Not ported: `basic`'s `noise` alpha maps
 //! (0x45E680, folded into the colours' alpha by 0x45E27D…; no shipped block names one).
 //!
 //! **Lightning** (2026-09-27, [`Lightning`], [`Flash`]): track B's field 6 strikes a cell of the

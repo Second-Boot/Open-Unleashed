@@ -1,5 +1,5 @@
 # The project's user-facing name, sourced by the packaging scripts (the game's window title is
-# crates/porsche/src/brand.rs). A working name: change both together. It names no trademark of the
+# crates/open-unleashed/src/brand.rs). A working name: change both together. It names no trademark of the
 # original game's owners; the READMEs say which game it runs.
 APP_ID=OpenUnleashed
 APP_TITLE=OpenUnleashed

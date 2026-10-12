@@ -21,7 +21,7 @@
 //! The draws from 0x5561D0 / 0x538040 — the emitters' flutter timers and gusts, the drops' points
 //! and alphas — come from the front end's generator itself (`opponents::FeRng`), the game's **one**
 //! state, which the caller hands in: the race's, seeded from `time(0)` by the HUD's init and shared
-//! with the sky's jitter and the announcer (`App::fe_rng` in `porsche`), drawn in the original's call
+//! with the sky's jitter and the announcer (`App::fe_rng` in `open-unleashed`), drawn in the original's call
 //! order (the prime, then per frame snow, rain, splat). The constructor's draws (0x456F5F, at the
 //! track load 0x469092) come from the state the track load's 0x44F240 left, which that reseed
 //! replaces and the prime's reset draws again: they leave no trace, and are made from a state of

@@ -150,6 +150,8 @@ switches! {
     nfs_no_gouraud = "NFS_NO_GOURAUD",
     nfs_no_shadow = "NFS_NO_SHADOW",
     nfs_no_steer = "NFS_NO_STEER",
+    nfs_autopilot = "NFS_AUTOPILOT",
+    nfs_demo = "NFS_DEMO",
     nfs_offroad_log = "NFS_OFFROAD_LOG",
     nfs_phantom_drive = "NFS_PHANTOM_DRIVE",
     nfs_projector_view = "NFS_PROJECTOR_VIEW",

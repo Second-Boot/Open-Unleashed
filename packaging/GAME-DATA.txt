@@ -10,3 +10,18 @@ into this folder, so that it contains:
 Optionally also copy nfs5.exe (the intro movies' decoder reads its tables from it; it is never run)
 and fe.txt. Instead of copying, you can set the environment variable NFS5_GAME_PATH to the
 installed game's folder.
+
+--------------------------------------------------------------------------------
+
+Для @TITLE@ нужны данные вашей копии Need for Speed: Porsche Unleashed (PC, 2000).
+Файлов оригинальной игры в комплекте нет.
+
+Скопируйте папки GameData и FEData из установленной игры (из папки, где лежит nfs5.exe)
+в эту папку, чтобы получилось:
+
+    game/GameData/...
+    game/FEData/...
+
+По желанию скопируйте и nfs5.exe (из него берутся таблицы для вступительных роликов; сам он
+не запускается) и fe.txt. Вместо копирования можно указать в переменной окружения
+NFS5_GAME_PATH папку установленной игры.

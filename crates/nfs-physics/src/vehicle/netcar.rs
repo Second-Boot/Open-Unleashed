@@ -2,7 +2,7 @@
 //! `0x4A0A40` (the apply, from `Car_integrateOrient` 0x49B8E0 at 64 Hz), `0x4A04A0` (snap or blend),
 //! `0x4A02A0` (the snap's tail) and `0x4A03D0` (the store's own snap). Read to the instruction.
 //!
-//! The lag book the store 0x4A0DF0 keeps (`+0x5C…+0x70`) is the network layer's — `porsche::netplay`;
+//! The lag book the store 0x4A0DF0 keeps (`+0x5C…+0x70`) is the network layer's — `open_unleashed::netplay`;
 //! this file is what those routines do to the car.
 
 use glam::{Mat3, Vec3};

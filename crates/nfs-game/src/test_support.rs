@@ -52,8 +52,11 @@ pub(crate) fn ring_of(n: usize, road: Road) -> SliceTable {
     let slices = (0..n)
         .map(|i| {
             let a = i as f32 / n as f32 * std::f32::consts::TAU;
-            let centre = Vec3::new(a.cos() * r, 0.0, a.sin() * r);
-            let forward = Vec3::new(-a.sin(), 0.0, a.cos());
+            // portable maths (PORT-DEVIATION D1): the ring's bits are the same on every OS / CPU, so the tests that pin
+            // a checksum of what drives on it hold on Linux / Windows x86_64 as on macOS arm64
+            let (sin, cos) = nfs_math::portable::sin_cosf(a);
+            let centre = Vec3::new(cos * r, 0.0, sin * r);
+            let forward = Vec3::new(-sin, 0.0, cos);
             slice(centre, forward, Vec3::Y.cross(forward), road)
         })
         .collect();

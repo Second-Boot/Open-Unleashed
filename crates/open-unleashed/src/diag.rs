@@ -2,9 +2,9 @@
 //!
 //! A release build on Windows is a GUI-subsystem program (`windows_subsystem = "windows"`), so a
 //! panic or an error return has no console to land on and the window just closes. Every release
-//! run therefore writes `porsche.log` (tracing at INFO, still echoed to stderr) into the port's
+//! run therefore writes `open-unleashed.log` (tracing at INFO, still echoed to stderr) into the port's
 //! data directory (`nfs_assets::platform::data_dir`, `%APPDATA%\PorscheUnleashed` on Windows),
-//! keeping the previous run as `porsche.prev.log`; a panic writes its message and backtrace to the
+//! keeping the previous run as `open-unleashed.prev.log`; a panic writes its message and backtrace to the
 //! log and, on a Windows release build, shows a native message box naming the log. Debug builds
 //! (development, the golden runs) log to stderr only, unless `NFS_LOG_FILE=1`. PORT-DEVIATION: the
 //! game's behaviour is untouched.
@@ -28,8 +28,8 @@ fn log_path() -> Option<PathBuf> {
         .and_then(|d| PathBuf::from(d).parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(nfs_assets::platform::data_dir);
     std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join("porsche.log");
-    let _ = std::fs::rename(&path, dir.join("porsche.prev.log"));
+    let path = dir.join("open-unleashed.log");
+    let _ = std::fs::rename(&path, dir.join("open-unleashed.prev.log"));
     Some(path)
 }
 
@@ -109,7 +109,7 @@ pub fn fatal(err: &anyhow::Error) {
     tracing::error!("fatal: {err:#}");
     #[cfg(all(windows, not(debug_assertions)))]
     {
-        let where_ = LOG.get().cloned().flatten().unwrap_or_else(|| nfs_assets::platform::data_dir().join("porsche.log"));
+        let where_ = LOG.get().cloned().flatten().unwrap_or_else(|| nfs_assets::platform::data_dir().join("open-unleashed.log"));
         message_box(&format!("{}: ошибка запуска — подробности в {}\n\n{err:#}", crate::brand::TITLE, where_.display()));
     }
 }

@@ -1,11 +1,11 @@
 [package]
-name = "porsche"
+name = "open-unleashed"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "porsche"
+name = "open-unleashed"
 path = "src/main.rs"
 
 [dependencies]

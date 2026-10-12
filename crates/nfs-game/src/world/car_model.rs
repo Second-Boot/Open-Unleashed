@@ -556,7 +556,7 @@ pub fn car_body_points(car: &CarAssets) -> Vec<Vec3> {
 /// through its `tr#lod` matrix when it has one (0x59F220 `'tr' | lod`, 0x53A330 `v·M`).
 ///
 /// CONFIRMED for the code path; the port's reading of the `vt` part is the one its mesh loader
-/// uses. A racer's box is LOD 5 ([`car_body`]); traffic's LOD 1 (`crates/porsche`'s traffic set-up,
+/// uses. A racer's box is LOD 5 ([`car_body`]); traffic's LOD 1 (`crates/open-unleashed`'s traffic set-up,
 /// `nfs_game::traffic::TrafficCar::draw_origin`).
 pub fn car_model_box(car: &CarAssets, lod: u16) -> (Vec3, Vec3) {
     let (mut lo, mut hi) = (Vec3::ZERO, Vec3::ZERO);

@@ -1702,6 +1702,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "open-unleashed"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "glam",
+ "image",
+ "nfs-assets",
+ "nfs-audio",
+ "nfs-formats",
+ "nfs-game",
+ "nfs-input",
+ "nfs-math",
+ "nfs-net",
+ "nfs-physics",
+ "nfs-renderer",
+ "pollster",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
 name = "orbclient"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1828,30 +1852,6 @@ name = "pollster"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc6355899e1c9462875b6757c79f3caa011a1fdae12bbb1a2e72dd1f234f8336"
-
-[[package]]
-name = "porsche"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "glam",
- "image",
- "nfs-assets",
- "nfs-audio",
- "nfs-formats",
- "nfs-game",
- "nfs-input",
- "nfs-math",
- "nfs-net",
- "nfs-physics",
- "nfs-renderer",
- "pollster",
- "serde_json",
- "tracing",
- "tracing-subscriber",
- "wgpu",
- "winit",
-]
 
 [[package]]
 name = "portable-atomic"

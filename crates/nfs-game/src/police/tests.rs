@@ -1275,7 +1275,7 @@ fn traffic_and_cops_on_a_shared_ring_keep_their_draws_and_poses() {
     let a = shared_ring_digest(false);
     let b = shared_ring_digest(true);
     assert_eq!(shared_ring_digest(false), a, "deterministic");
-    assert_eq!(a, (24509, 10773, 3543943248959768697));
+    assert_eq!(a, (24509, 10773, 5548681200507787554)); // the same on every platform since the test ring uses portable maths
     assert_eq!(b, a, "the places and positions of the others change no draw here");
 }
 

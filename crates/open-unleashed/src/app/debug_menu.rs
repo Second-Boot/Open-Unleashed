@@ -319,7 +319,7 @@ impl Menu {
             return Vec::new();
         };
         let mut out = f.sprites(
-            "PORSCHE UNLEASHED  -  NATIVE",
+            &crate::brand::TITLE.to_uppercase(),
             [0.05, 0.08],
             0.05,
             [1.0, 1.0, 1.0, 1.0],

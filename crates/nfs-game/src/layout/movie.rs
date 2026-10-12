@@ -83,7 +83,7 @@ impl MoviePlayer {
     /// (0x56CA20, then 0x56CA00) — the port's own `open` is never mid-tick, so the two collapse
     /// into `advance`'s own first call rather than here, which also fixes the case this port adds
     /// that the original never has: the sound device can finish initialising strictly later than
-    /// a screen's widgets are bound (`self.snd.audio`'s own lazy open in `porsche`). `audio_out`
+    /// a screen's widgets are bound (`self.snd.audio`'s own lazy open in `open-unleashed`). `audio_out`
     /// is `None` exactly when `[0x657C94]` (no sound device) forces the original's own `[+0x75]`
     /// off (`self.snd.audio.is_none()` in the port) — checked again every `advance`.
     pub(super) fn open(r: &mut Renderer, paths: &GamePaths, dir: &str, file: &str, audio: bool) -> Option<Self> {

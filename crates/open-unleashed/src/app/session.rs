@@ -18,6 +18,9 @@ impl App {
                     })
                     // a scripted run's window is never made the key window (see `main`)...
                     .with_active(!scripted)
+                    // **PLATFORM GLUE** (not in the original): `NFS_DEMO=1` keeps the window above the others without taking the
+                    // focus, so a demo recording of it is never covered (macOS does not draw a covered window)
+                    .with_window_level(if nfs_game::config::cfg().nfs_demo.is_set() { winit::window::WindowLevel::AlwaysOnTop } else { winit::window::WindowLevel::Normal })
                     // ...and, tooling only (not a game rule): never shown on screen at all. The
                     // window still exists and keeps its real 1280x800 inner size (the goldens
                     // depend on that resolution), so `Renderer::new` still creates a real Metal

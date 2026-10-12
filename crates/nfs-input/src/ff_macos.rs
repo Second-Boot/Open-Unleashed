@@ -5,7 +5,7 @@
 //! (`is_ff_supported` is `false`, `set_ff_state` is empty), so without this a pad gets nothing.
 //!
 //! The original game had DirectInput force feedback only; nothing here is the original's. The
-//! mapping of its effects onto a pad's two motors is the caller's (`porsche::app::force_feedback`,
+//! mapping of its effects onto a pad's two motors is the caller's (`open_unleashed::app::force_feedback`,
 //! **APPROXIMATION A2**: road → the Strong motor at a constant level, engine → the Weak motor,
 //! jolt → a Strong pulse, the spring dropped) — this module is the same approximation on another
 //! platform, it only provides the mechanism.

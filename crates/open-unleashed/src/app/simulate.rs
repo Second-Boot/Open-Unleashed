@@ -26,6 +26,11 @@ impl App {
         if mirror {
             steer = -steer;
         }
+        // **TEST GLUE** (not in the original): `NFS_AUTOPILOT=1` with `--follow` drives a windowed race too — the
+        // throttle held, the steering below — so a live race (HUD and all) can be filmed without a driver
+        if follow_road && nfs_game::config::cfg().nfs_autopilot.is_set() {
+            input.press(Action::Throttle);
+        }
         if follow_road && let (Some(t), Some(r)) = (slices, race) {
             // pure pursuit on the slice ahead (autotest only; not the original AI)
             let ahead = t.add(r.slice, 4);

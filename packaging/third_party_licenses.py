@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write THIRD-PARTY-LICENSES.txt for the game binary: every crate the `porsche` package links
+"""Write THIRD-PARTY-LICENSES.txt for the game binary: every crate the `open-unleashed` package links
 (normal dependencies, transitively, for one target), with its SPDX expression and the licence files
 its source ships. Build-time-only crates (build scripts, proc macros) are not in the binary and are
 left out.
@@ -31,7 +31,7 @@ def main():
     pkgs = {p["id"]: p for p in meta["packages"]}
     nodes = {n["id"]: n for n in meta["resolve"]["nodes"]}
     members = set(meta["workspace_members"])
-    root = next(i for i in members if pkgs[i]["name"] == "porsche")
+    root = next(i for i in members if pkgs[i]["name"] == "open-unleashed")
     seen, stack = set(), [root]
     while stack:
         i = stack.pop()

@@ -54,6 +54,16 @@ impl App {
         self.frames += 1;
         if self.fps_timer.elapsed() >= Duration::from_secs(1) {
             tracing::info!(fps = self.frames, tick = self.tick, "frame stats");
+            // **PLATFORM GLUE** (not in the original): `NFS_DEMO=1` shows the frame rate, the GPU / graphics API and the
+            // platform in the window title, for demo recordings (and keeps the window on top, `session.rs`)
+            if nfs_game::config::cfg().nfs_demo.is_set()
+                && let Some(w) = &self.window
+            {
+                let gpu = nfs_renderer::ADAPTER_LABEL.get().map_or("", String::as_str);
+                let os = match std::env::consts::OS { "macos" => "macOS", "windows" => "Windows", "linux" => "Linux", o => o };
+                let arch = match std::env::consts::ARCH { "aarch64" => "arm64", a => a };
+                w.set_title(&format!("{} — {} fps · {gpu} · {os} {arch}", crate::brand::TITLE, self.frames));
+            }
             self.frames = 0;
             self.fps_timer = Instant::now();
         }

@@ -10,7 +10,7 @@
 //! platforms only. This backend's time base is a 50 ms tick (`Ticks`), so no periodic waveform of the
 //! original's 6…35 Hz can be shaped, and a DirectInput constant force, spring or condition has no
 //! counterpart at all. The mapping onto this is therefore an **APPROXIMATION** and lives with the
-//! caller (`porsche::app::force_feedback`), which labels each choice; this module only provides the
+//! caller (`open_unleashed::app::force_feedback`), which labels each choice; this module only provides the
 //! mechanism: two sustained motor effects whose level is changed through `Effect::set_gain`, and
 //! one-shot pulses.
 

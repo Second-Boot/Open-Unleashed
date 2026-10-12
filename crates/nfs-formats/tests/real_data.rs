@@ -1,5 +1,5 @@
 //! Regression tests against the original game data. Skipped (with a message) when the
-//! installation is not present; see GAME_PATH.md.
+//! installation is not present; see docs/en/game-data.md.
 use nfs_formats::{
     bigf::Bigf,
     crp::Crp,

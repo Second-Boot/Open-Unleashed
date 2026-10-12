@@ -622,7 +622,7 @@ pub struct TrafficSet {
     /// day, the night word of the track spec record (`traffic.md` §33.3): the `human honk`
     /// trigger 6 is only raised while it is 0 (0x40172E). Its only other readers pick and build
     /// that spec record (0x469041, 0x475A82), whose file `Tr00.bin` is not shipped, so the honk
-    /// gate is its one effect on a race. `fe.txt`'s `time` (shipped 0), set by `porsche`.
+    /// gate is its one effect on a race. `fe.txt`'s `time` (shipped 0), set by `open-unleashed`.
     pub time_mode: bool,
     /// One `RigidBody` per car — the car record `Car_ground` 0x49BD40 (`car+0xE20`), the
     /// placement 0x49B090 and the collision pass 0x498FF0 run on; empty until

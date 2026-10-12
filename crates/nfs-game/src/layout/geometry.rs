@@ -77,7 +77,7 @@ pub fn combo_drag_pos(py: f32, grab_y: f32, grab_at: usize, count: usize, travel
 /// scrollbar arrow shares one shape: `NFS5.VerticalSlider`'s own bar (0x4D0A97/0x4D0B40),
 /// `NFS5.CARSETTINGBUTTON` (0x4C1F40/0x4C1F80) and the open combo's own `FeListScrollBar`
 /// (`0x4DB040`/`0x4DB1D0`, §4.101) all arm the identical repeating timer on press and step once
-/// per firing — `porsche::App`'s `list_repeat` / `setting_repeat` / `combo_arrow_repeat` bank the
+/// per firing — `open_unleashed::App`'s `list_repeat` / `setting_repeat` / `combo_arrow_repeat` bank the
 /// frame's `dt_ms` against the time already carried and take out whole 150 ms periods, exactly
 /// the way the timer's own callback would fire once per elapsed period rather than at most once
 /// per game tick. Returns `(steps, new accumulator)`.

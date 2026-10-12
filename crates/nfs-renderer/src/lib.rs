@@ -3,6 +3,10 @@
 //! Nothing here knows about CRP/SHPI files; `nfs-assets` converts original data into
 //! [`MeshData`] / [`TextureData`] and this crate uploads and draws them.
 
+
+/// The chosen GPU and graphics API (`"Apple M1 Pro · Metal"`), set once at start-up — for diagnostics and the demo title.
+pub static ADAPTER_LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 mod camera;
 mod front;
 mod gpu;

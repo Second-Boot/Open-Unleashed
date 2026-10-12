@@ -10,7 +10,7 @@ members = [
     "crates/nfs-input",
     "crates/nfs-net",
     "crates/nfs-game",
-    "crates/porsche",
+    "crates/open-unleashed",
     "tools/asset-inspector",
     "tools/asset-extractor",
     "tools/track-viewer",

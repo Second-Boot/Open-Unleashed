@@ -661,7 +661,7 @@ impl App {
             let to = Vec3::new(pos.x - v.position.x, 0.0, pos.z - v.position.z).normalize_or(Vec3::Z);
             v.place_at_trigger(&w.collision, &self.specs, pos - to * 6.0 + Vec3::Y * 0.5, to);
             v.velocity = to * 12.0;
-            tracing::info!(target: "porsche::app::simulate", k, article, ?pos, "NFS_SMACK_DRIVE: the car set at the smackable");
+            tracing::info!(target: "open_unleashed::app::simulate", k, article, ?pos, "NFS_SMACK_DRIVE: the car set at the smackable");
         }
         // diagnostic: `NFS_PHANTOM_DRIVE=x,y,z,hx,hz[@t]` sets the player's car down 8 m short of the
         // world point (x, y, z), heading (hx, hz) at 12 m/s on game tick `t` (default 600) — to drive
@@ -679,7 +679,7 @@ impl App {
             let at = Vec3::new(p[0], p[1], p[2]);
             v.place_at_trigger(&w.collision, &self.specs, at - to * 8.0 + Vec3::Y * 0.5, to);
             v.velocity = to * 12.0;
-            tracing::info!(target: "porsche::app::simulate", ?at, ?to, "NFS_PHANTOM_DRIVE: the car set short of the point");
+            tracing::info!(target: "open_unleashed::app::simulate", ?at, ?to, "NFS_PHANTOM_DRIVE: the car set short of the point");
         }
         // diagnostic: `NFS_CONE_DRIVE=k` does the same with the mission scene's k-th cone, to see
         // the HUD's cone count move (the scripted run then draws a frame every other tick);
@@ -695,7 +695,7 @@ impl App {
             let to = Vec3::new(pos.x - v.position.x, 0.0, pos.z - v.position.z).normalize_or(Vec3::Z);
             v.place_at_trigger(&w.collision, &self.specs, pos - to * 6.0 + Vec3::Y * 0.5, to);
             v.velocity = to * 12.0;
-            tracing::info!(target: "porsche::app::simulate", k, ?pos, "NFS_CONE_DRIVE: the car set at the cone");
+            tracing::info!(target: "open_unleashed::app::simulate", k, ?pos, "NFS_CONE_DRIVE: the car set at the cone");
         }
         // **Test glue** (`NFS_NET_RAM=<race index>@<tick>[,…]`, set on every machine, an even tick): in an
         // input-exchange race that human car is set down 6 m behind the traffic car nearest to it, on that
@@ -799,7 +799,7 @@ impl App {
             self.net_race_notice();
             // an input-exchange race runs a tick when the frames and the host's clock allow it
             if exchange_run && !self.net_exchange_wait() {
-                tracing::warn!(target: "porsche::app::race_start", tick = self.tick, "the input exchange stopped: the scripted run ends");
+                tracing::warn!(target: "open_unleashed::app::race_start", tick = self.tick, "the input exchange stopped: the scripted run ends");
                 break;
             }
             if let Some(t0) = pace
@@ -810,7 +810,7 @@ impl App {
             // diagnostic `NFS_HUD_KEYS=tick:pause` in a network race: the press has asked to leave
             if std::mem::take(&mut self.scripted_net_leave) {
                 if !self.leave_race_as(false) {
-                    tracing::info!(target: "porsche::app::race_start", "network race left by a scripted pause press: no front end to return to");
+                    tracing::info!(target: "open_unleashed::app::race_start", "network race left by a scripted pause press: no front end to return to");
                 } else if self.fe_sequence_in("NFS_NET_LEAVE_SEQ", event_loop) {
                     // **TEST GLUE** `NFS_NET_LEAVE_SEQ=<dir>`: the lobby after the return stays up
                     // and is drawn (`NFS_FE_SEQ_SCRIPT` tokens, e.g. `wait:` to tick the room);
@@ -851,7 +851,7 @@ impl App {
                         if self.leave_race() && self.session_races > 1 {
                             self.session_races -= 1;
                             self.session_replayed = false;
-                            tracing::info!(target: "porsche::app::race_start", left = self.session_races, "session: quit from the pause menu, next race");
+                            tracing::info!(target: "open_unleashed::app::race_start", left = self.session_races, "session: quit from the pause menu, next race");
                             // the script's own keys are let go, as `session_step` does
                             self.input.release(Action::Throttle);
                             self.input.release(Action::SteerRight);
@@ -890,7 +890,7 @@ impl App {
             if nfs_game::config::cfg().nfs_replay_stop_exhausted.is_set()
                 && self.replay.stream.as_ref().is_some_and(|r| r.mode == nfs_game::replay::Mode::Exhausted)
             {
-                tracing::info!(target: "porsche::app::race_start", tick = self.tick, "diagnostic: the scripted run stops at the stream's end");
+                tracing::info!(target: "open_unleashed::app::race_start", tick = self.tick, "diagnostic: the scripted run stops at the stream's end");
                 break;
             }
             // diagnostic: `NFS_RESULTS_STOP=<n>[:<ticks>]` stops a scripted run `ticks` (96)
@@ -905,7 +905,7 @@ impl App {
                 && self.page_seen == Some(n)
                 && self.page_open_tick.is_some_and(|t0| self.tick >= t0 + wait)
             {
-                tracing::info!(target: "porsche::app::race_start", tick = self.tick, page = ?self.result_pages().get(n as usize), "diagnostic: the scripted run stops on the result page");
+                tracing::info!(target: "open_unleashed::app::race_start", tick = self.tick, page = ?self.result_pages().get(n as usize), "diagnostic: the scripted run stops on the result page");
                 break;
             }
             // a scripted run's iteration is a frame of one tick
@@ -935,12 +935,12 @@ impl App {
                     })
                     .unwrap_or(0.0);
                 let lat = o.vehicle.v_local.x;
-                tracing::info!(target: "porsche::app::race_start", t = t as f32 / TICKS_PER_SEC_F32, slice = o.progress.slice, speed = (o.vehicle.speed() * 3.6) as i32, target = target as i32, thr = (o.vehicle.throttle * 100.0) as i32, brk = (o.vehicle.brake * 100.0) as i32, steer = o.vehicle.steer, n_ahead, t_off = (t_off * 10.0).round() / 10.0, t_dot = (t_dot * 100.0).round() / 100.0, car_off = (car_off * 10.0).round() / 10.0, v_lat = lat, slip = ?o.vehicle.wheels.iter().map(|w| (w.slip * 10.0) as i32).collect::<Vec<_>>(), locked = ?o.vehicle.wheels.iter().map(|w| w.locked as u8).collect::<Vec<_>>(), walls = o.wall_hits, "ai trace");
+                tracing::info!(target: "open_unleashed::app::race_start", t = t as f32 / TICKS_PER_SEC_F32, slice = o.progress.slice, speed = (o.vehicle.speed() * 3.6) as i32, target = target as i32, thr = (o.vehicle.throttle * 100.0) as i32, brk = (o.vehicle.brake * 100.0) as i32, steer = o.vehicle.steer, n_ahead, t_off = (t_off * 10.0).round() / 10.0, t_dot = (t_dot * 100.0).round() / 100.0, car_off = (car_off * 10.0).round() / 10.0, v_lat = lat, slip = ?o.vehicle.wheels.iter().map(|w| (w.slip * 10.0) as i32).collect::<Vec<_>>(), locked = ?o.vehicle.wheels.iter().map(|w| w.locked as u8).collect::<Vec<_>>(), walls = o.wall_hits, "ai trace");
             }
             if t % 64 == 0
                 && let Some(v) = &self.vehicle
             {
-                tracing::info!(target: "porsche::app::race_start", t = t / 64, speed_kmh = v.speed() * 3.6, gear = v.gear, rpm = v.rpm, slice = self.race.as_ref().map(|r| r.slice), walls = self.wall_hits, resets = self.resets, damage = ?v.damage.map(|d| d as i32), opp = ?self.road.opponents.iter().map(|o| (o.progress.slice, (o.vehicle.speed() * 3.6) as i32, match &o.controller { Controller::Ai(a) => (a.target_speed * 3.6) as i32, _ => -1 }, o.vehicle.gear, o.wall_hits, o.resets, o.vehicle.wheels[0].steer as i32, (o.vehicle.throttle * 100.0) as i32, (o.vehicle.brake * 100.0) as i32, o.vehicle.position.x as i32, o.vehicle.position.z as i32)).collect::<Vec<_>>(), wrong_way = self.race.as_ref().map(|r| r.wrong_way_ticks > 0), police = ?self.road.police.as_ref().map(|p| p.cars.iter().filter(|c| c.active).map(|c| (c.slice, (c.speed * 3.6) as i32, (c.position - v.position).length() as i32, c.mode)).collect::<Vec<_>>()), violation = ?self.road.police.as_ref().map(|p| p.violation), traffic = ?self.road.traffic.as_ref().map(|tr| tr.cars.iter().filter(|c| c.active).map(|c| (c.slice, c.dir as i32, (c.speed * 3.6) as i32, (c.lateral * 10.0) as i32, (c.position - v.position).length() as i32, (c.position.y - v.position.y) as i32)).collect::<Vec<_>>()), pos = ?v.position, "autotest");
+                tracing::info!(target: "open_unleashed::app::race_start", t = t / 64, speed_kmh = v.speed() * 3.6, gear = v.gear, rpm = v.rpm, slice = self.race.as_ref().map(|r| r.slice), walls = self.wall_hits, resets = self.resets, damage = ?v.damage.map(|d| d as i32), opp = ?self.road.opponents.iter().map(|o| (o.progress.slice, (o.vehicle.speed() * 3.6) as i32, match &o.controller { Controller::Ai(a) => (a.target_speed * 3.6) as i32, _ => -1 }, o.vehicle.gear, o.wall_hits, o.resets, o.vehicle.wheels[0].steer as i32, (o.vehicle.throttle * 100.0) as i32, (o.vehicle.brake * 100.0) as i32, o.vehicle.position.x as i32, o.vehicle.position.z as i32)).collect::<Vec<_>>(), wrong_way = self.race.as_ref().map(|r| r.wrong_way_ticks > 0), police = ?self.road.police.as_ref().map(|p| p.cars.iter().filter(|c| c.active).map(|c| (c.slice, (c.speed * 3.6) as i32, (c.position - v.position).length() as i32, c.mode)).collect::<Vec<_>>()), violation = ?self.road.police.as_ref().map(|p| p.violation), traffic = ?self.road.traffic.as_ref().map(|tr| tr.cars.iter().filter(|c| c.active).map(|c| (c.slice, c.dir as i32, (c.speed * 3.6) as i32, (c.lateral * 10.0) as i32, (c.position - v.position).length() as i32, (c.position.y - v.position.y) as i32)).collect::<Vec<_>>()), pos = ?v.position, "autotest");
             }
         }
         if self.session_step(event_loop, secs) {
@@ -968,7 +968,7 @@ impl App {
                     c.park(z);
                 }
                 c.finish(&order, &times, &clean);
-                tracing::info!(target: "porsche::app::race_start", order = ?order, message = c.message, money = c.career.money, "career event recorded");
+                tracing::info!(target: "open_unleashed::app::race_start", order = ?order, message = c.message, money = c.career.money, "career event recorded");
             }
         }
         // a race the layout front end started (`NFS_FE_PLAYGAME`) goes back to it as the last
@@ -1048,7 +1048,7 @@ impl App {
             .expect("offscreen render");
         image::save_buffer(&path, &rgba, shot_geometry().0, shot_geometry().1, image::ColorType::Rgba8)
             .expect("write png");
-        tracing::info!(target: "porsche::app::race_start", path, "screenshot written");
+        tracing::info!(target: "open_unleashed::app::race_start", path, "screenshot written");
         // **TEST GLUE** (not in the original): `NFS_SHOT_SEQ=<n>` also writes the frames a windowed
         // run draws between this tick and the next — `<shot>.seq<k>.png` at the interpolation
         // fraction k / n (the mirror rebuilt with each, as a frame does), k = 0…n − 1
@@ -1076,7 +1076,7 @@ impl App {
         {
             let mp = format!("{}.mirror.png", path.trim_end_matches(".png"));
             image::save_buffer(&mp, &px, w, h, image::ColorType::Rgba8).expect("write mirror png");
-            tracing::info!(target: "porsche::app::race_start", path = mp, w, h, "mirror texture written");
+            tracing::info!(target: "open_unleashed::app::race_start", path = mp, w, h, "mirror texture written");
         }
         event_loop.exit();
     }
