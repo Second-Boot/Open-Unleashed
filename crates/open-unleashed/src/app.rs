@@ -571,6 +571,9 @@ pub(crate) struct App {
     pub(crate) derby_hud_laps: Option<u32>,
     /// autotest: steer toward the centreline (pure pursuit) instead of scripted input
     pub(crate) follow_road: bool,
+    /// **TEST GLUE** (not in the original): `NFS_AUTOPILOT=ai` with `--follow` — the opponents' driver
+    /// ([`nfs_game::ai::AiDriver`], from the player's car's own `.ais`) drives the player's car, for recordings
+    pub(crate) player_ai: Option<Box<nfs_game::ai::AiDriver>>,
     pub(crate) car_half_width: f32,
     /// The chase camera's slot state (0x461E80): the eye's offset from the car `+0x08`, the view it
     /// was built for, and the `+0xC1` settle count SetSlotView starts at 0x32 (0x465848).

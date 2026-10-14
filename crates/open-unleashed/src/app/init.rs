@@ -532,6 +532,7 @@ impl App {
             num_laps: launch.laps,
             derby_hud_laps: None,
             follow_road,
+            player_ai: None,
             car_half_width: 0.9,
             chase_offset: None,
             chase_settle: 0,

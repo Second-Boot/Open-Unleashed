@@ -1,0 +1,3 @@
+// The Windows executable's icon (PLATFORM GLUE, packaging): the first ICON resource is what Explorer and the
+// taskbar show. Rendered by packaging/brand/render_icons.py.
+1 ICON "../../../packaging/brand/icon.ico"

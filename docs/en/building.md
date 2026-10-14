@@ -61,7 +61,7 @@ and `THIRD-PARTY-LICENSES.txt` — never any file of the original game.
 | `NFS_TRAFFIC=0..3`, `NFS_TRAFFIC_SEED=<n>` | traffic density (none / light / medium / heavy), repeatable spawns |
 | `NFS_NO_CARCOL=1` | no car-to-car collisions |
 | `NFS_DEMO=1` | frame rate, GPU, graphics API and system in the window title; the window stays on top (for recordings) |
-| `NFS_AUTOPILOT=1` with `--follow` | a windowed race drives itself (for recordings) |
+| `NFS_AUTOPILOT=1` with `--follow` | a windowed race drives itself (for recordings); `NFS_AUTOPILOT=ai` — the opponents' AI drives the player's car |
 | `NFS_AI_TRACE=<idx>` | a quarter-second trace of one AI car in the log |
 
 ## Code layout

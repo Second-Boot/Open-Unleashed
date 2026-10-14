@@ -1,6 +1,13 @@
-# OpenUnleashed
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="packaging/brand/mark-dark.svg">
+    <img src="packaging/brand/mark-light.svg" alt="OpenUnleashed" width="180">
+  </picture>
+</p>
 
-[English](README.md) | **Русский**
+<h1 align="center">OpenUnleashed</h1>
+
+<p align="center"><a href="README.md">English</a> | <b>Русский</b></p>
 
 Неофициальная открытая реализация движка **Need for Speed: Porsche Unleashed** (PC, 2000). Работает нативно на
 macOS (Apple Silicon и Intel), Windows и Linux — без Wine, эмуляторов и оригинального exe — и играется как

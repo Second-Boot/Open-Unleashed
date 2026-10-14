@@ -35,11 +35,13 @@ if [ "$WITH_DATA" = 1 ]; then APP=target/$APP_ID-WithData.app; else APP=target/$
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 if [ "$UNIVERSAL" = 1 ]; then
-  lipo -create target/release/open-unleashed target/x86_64-apple-darwin/release/porsche \
+  lipo -create target/release/open-unleashed target/x86_64-apple-darwin/release/open-unleashed \
     -output "$APP/Contents/MacOS/$APP_ID"
 else
   cp target/release/open-unleashed "$APP/Contents/MacOS/$APP_ID"
 fi
+# the Finder / Dock icon (packaging/brand/render_icons.py)
+cp packaging/brand/icon.icns "$APP/Contents/Resources/AppIcon.icns"
 if [ "$WITH_DATA" = 1 ]; then
   SRC="${NFS5_GAME_PATH:-$HOME/Games/NFS-Porsche-Unleashed/game_info/data}"
   [ -d "$SRC/GameData" ] && [ -d "$SRC/FEData" ] || { echo "game data not found at $SRC (set NFS5_GAME_PATH)" >&2; exit 1; }
@@ -65,6 +67,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>0.1.0</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundleExecutable</key><string>$APP_ID</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>

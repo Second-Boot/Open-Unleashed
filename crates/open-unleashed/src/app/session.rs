@@ -11,6 +11,7 @@ impl App {
             None => {
                 let attrs = Window::default_attributes()
                     .with_title(crate::brand::TITLE)
+                    .with_window_icon(crate::brand::window_icon())
                     .with_inner_size({
                         // **TEST GLUE**: `NFS_SHOT_SIZE` also shapes the window (its aspect is the still's)
                         let (w, h, _) = shot_geometry();

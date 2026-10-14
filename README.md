@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="packaging/brand/mark-dark.svg">
+    <img src="packaging/brand/mark-light.svg" alt="OpenUnleashed" width="180">
+  </picture>
+</p>
+
 <h1 align="center">OpenUnleashed</h1>
 
 <p align="center"><b>English</b> | <a href="README.ru.md">Русский</a></p>

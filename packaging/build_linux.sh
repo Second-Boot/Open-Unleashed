@@ -1,6 +1,6 @@
 #!/bin/sh
 # Linux x86_64 build in Docker (works from an arm64 Mac) -> target/dist/<APP_ID>-linux-x86_64-<commit>[-with-data].tar.gz
-# Contents: <APP_ID>, run.sh, README.txt, LICENSE.txt, THIRD-PARTY-LICENSES.txt,
+# Contents: <APP_ID>, run.sh, <APP_ID>.png (icon), README.txt, LICENSE.txt, THIRD-PARTY-LICENSES.txt,
 # game/ (empty: where the player's data goes; with --with-data the game data itself, see stage_data.sh: private use only).
 # Cargo registry/target live in the docker volumes nfs5-cargo-reg / nfs5-linux-target (fast rebuilds).
 # PACK_NATIVE=1 builds without the container (CI on a Linux runner).
@@ -32,6 +32,8 @@ chmod +x "$STAGE/$APP_ID"
 if [ "$WITH_DATA" = 1 ]; then cp -R "$DIST/stage/game" "$STAGE/game"; else stage_game_dir "$STAGE/game"; fi
 sed "s/@APP@/$APP_ID/g" packaging/run.sh > "$STAGE/run.sh"
 chmod +x "$STAGE/run.sh"
+# the icon, for a launcher entry the player makes (packaging/brand/render_icons.py)
+cp packaging/brand/icon-256.png "$STAGE/$APP_ID.png"
 brand_readme packaging/README-linux.txt > "$STAGE/README.txt"
 stage_legal "$STAGE" x86_64-unknown-linux-gnu
 OUT=$DIST/$APP_ID-linux-x86_64-$COMMIT$SUFFIX.tar.gz

@@ -577,8 +577,24 @@ impl App {
         self.replay_tick();
     }
 
+    /// **TEST GLUE** `NFS_AUTOPILOT=ai`: an opponent's driver for the player's car — its `.ais`, its `.sim` tail and
+    /// the steering family of its `nfs5.car` record, as `race_stages` builds one for an opponent (default skill)
+    fn make_player_ai(&self) -> Option<Box<nfs_game::ai::AiDriver>> {
+        let ais = CarAssets::load_ais(&self.paths, &self.car.model).ok()?;
+        let sim = CarAssets::load_sim(&self.paths, if self.sim_name.is_empty() { "default" } else { &self.sim_name }).ok()?;
+        let id = self.player_car_id.unwrap_or(self.car_id);
+        let family = self.fe_car_catalog().into_iter().find(|e| e.id == id).map(|e| e.sim_family).unwrap_or_default();
+        let mut d = nfs_game::ai::AiDriver::new(ais, &sim.unknown_tail);
+        d.set_track(&self.track.name, self.backwards, &family);
+        tracing::info!(model = self.car.model, family, "NFS_AUTOPILOT=ai: the opponents' driver drives the player's car");
+        Some(Box::new(d))
+    }
+
     /// **The 32 Hz block's controller latch** (see [`Self::simulate`]): the car's flags for the tick, the countdown speech, the controller sample the car reads (this machine's own, the exchange's, the replay's), and the lamp bytes. Moved out of `simulate` unchanged; the sample goes to `st.controls`.
     fn tick_controls(&mut self, ctx: &TickCtx, st: &mut TickState) {
+        if self.player_ai.is_none() && self.follow_road && nfs_game::config::cfg().nfs_autopilot.as_str() == Some("ai") {
+            self.player_ai = self.make_player_ai();
+        }
         let Some(v) = self.vehicle.as_mut() else { return };
         let (rally_on, derby_on) = (ctx.rally_on, ctx.derby_on);
         let (exchange_in, exch_order, net_seats) = (&ctx.exchange_in, &ctx.exch_order, &ctx.net_seats);
@@ -619,9 +635,18 @@ impl App {
         // helper below) — or, in an input-exchange race, what the frame driver latched for this car
         // from the room's frame (0x415EF0 → 0x413870 → 0x4992CF), which is the same sample sixteen
         // times a second, averaged in pairs and quantised, `network.md` §11.17
-        let controls = match exchange_in.as_ref() {
-            Some(x) => x.local,
-            None => Self::controller_sample(&mut self.input, self.mirror, self.follow_road, self.slices.as_ref(), self.race.as_ref(), v, false),
+        let controls = match (exchange_in.as_ref(), self.player_ai.as_mut(), self.slices.as_ref(), self.race.as_ref()) {
+            (Some(x), ..) => x.local,
+            // **TEST GLUE** `NFS_AUTOPILOT=ai`: the opponents' driver steers the player's car (see `player_ai`), with
+            // the assists an AI car runs with (`ai_driven`, traction control) and its gear-shift draw
+            (None, Some(d), Some(t), Some(r)) => {
+                let c = d.controls(t, self.racing_line.as_ref(), r, v, &self.specs, self.tick, &[], v.half_extents.x);
+                v.ai_driven = true;
+                v.traction_control = true;
+                v.shift_roll = d.shift_roll.take();
+                c
+            }
+            (None, ..) => Self::controller_sample(&mut self.input, self.mirror, self.follow_road, self.slices.as_ref(), self.race.as_ref(), v, false),
         };
         // **TEST GLUE** (not in the original): `NFS_SKID_SCRIPT=<from_s>:<for_s>:<steer −1…1>` holds the
         // handbrake with full throttle and that steering from `from_s` for `for_s` seconds of the
