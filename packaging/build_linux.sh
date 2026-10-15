@@ -1,5 +1,5 @@
 #!/bin/sh
-# Linux x86_64 build in Docker (works from an arm64 Mac) -> target/dist/<APP_ID>-linux-x86_64-<commit>[-with-data].tar.gz
+# Linux x86_64 build in Docker (works from an arm64 Mac) -> target/dist/<APP_ID>-linux-x86_64-<version>[-with-data].tar.gz
 # Contents: <APP_ID>, run.sh, <APP_ID>.png (icon), README.txt, LICENSE.txt, THIRD-PARTY-LICENSES.txt,
 # game/ (empty: where the player's data goes; with --with-data the game data itself, see stage_data.sh: private use only).
 # Cargo registry/target live in the docker volumes nfs5-cargo-reg / nfs5-linux-target (fast rebuilds).
@@ -9,7 +9,8 @@ cd "$(dirname "$0")/.."
 . packaging/common.sh
 parse_pack_args "$@"
 ROOT=$(pwd)
-COMMIT=$(git rev-parse --short=8 HEAD)
+# <version>: PACK_VERSION (a release sets it to the tag, e.g. v0.1.0), else the commit
+COMMIT=${PACK_VERSION:-$(git rev-parse --short=8 HEAD)}
 DIST=$ROOT/target/dist
 STAGE=$DIST/stage-linux/$APP_ID
 mkdir -p "$DIST"

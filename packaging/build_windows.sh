@@ -1,5 +1,5 @@
 #!/bin/sh
-# Windows x64 cross-build (cargo-xwin, msvc target, in Docker) -> target/dist/<APP_ID>-windows-x64-<commit>[-with-data].zip
+# Windows x64 cross-build (cargo-xwin, msvc target, in Docker) -> target/dist/<APP_ID>-windows-x64-<version>[-with-data].zip
 # Contents: <APP_ID>.exe, README.txt, LICENSE.txt, THIRD-PARTY-LICENSES.txt,
 # game/ (empty: where the player's data goes; with --with-data the game data itself, see stage_data.sh: private use only).
 # The MSVC CRT / SDK files xwin downloads are cached in the volume nfs5-xwin. PACK_NATIVE=1 builds without the container (CI).
@@ -8,7 +8,8 @@ cd "$(dirname "$0")/.."
 . packaging/common.sh
 parse_pack_args "$@"
 ROOT=$(pwd)
-COMMIT=$(git rev-parse --short=8 HEAD)
+# <version>: PACK_VERSION (a release sets it to the tag, e.g. v0.1.0), else the commit
+COMMIT=${PACK_VERSION:-$(git rev-parse --short=8 HEAD)}
 DIST=$ROOT/target/dist
 STAGE=$DIST/stage-win/$APP_ID
 mkdir -p "$DIST"

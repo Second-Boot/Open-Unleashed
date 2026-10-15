@@ -27,6 +27,10 @@ for a in "$@"; do
     *) echo "unknown option $a" >&2; exit 2 ;;
   esac
 done
+# PLATFORM GLUE: a Mac builds outside a container, so the compiler would embed this user's home in the binary (the
+# paths of the dependencies' sources in ~/.cargo and of the standard library in ~/.rustup, in panic messages and debug
+# info): map the home directory to a neutral prefix (the Linux / Windows builds run in containers: /usr/local/cargo)
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$HOME=/build"
 cargo build --release -p open-unleashed
 if [ "$UNIVERSAL" = 1 ]; then
   cargo build --release -p open-unleashed --target x86_64-apple-darwin

@@ -1,5 +1,5 @@
 #!/bin/sh
-# macOS universal (arm64 + x86_64) build -> target/dist/<APP_ID>-macos-universal-<commit>[-with-data].zip
+# macOS universal (arm64 + x86_64) build -> target/dist/<APP_ID>-macos-universal-<version>[-with-data].zip
 # Contents: <APP_ID>.app, game/ (where the player's data goes), README.txt, LICENSE.txt, THIRD-PARTY-LICENSES.txt.
 #   --with-data   <APP_ID>-WithData.app with the game data inside instead (make_app.sh --with-data): private use only
 set -e
@@ -7,7 +7,8 @@ cd "$(dirname "$0")/.."
 . packaging/common.sh
 parse_pack_args "$@"
 ROOT=$(pwd)
-COMMIT=$(git rev-parse --short=8 HEAD)
+# <version>: PACK_VERSION (a release sets it to the tag, e.g. v0.1.0), else the commit
+COMMIT=${PACK_VERSION:-$(git rev-parse --short=8 HEAD)}
 DIST=$ROOT/target/dist
 STAGE=$DIST/stage-mac/$APP_ID
 mkdir -p "$DIST"
