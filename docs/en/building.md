@@ -63,6 +63,7 @@ and `THIRD-PARTY-LICENSES.txt` — never any file of the original game.
 | `NFS_DEMO=1` | frame rate, GPU, graphics API and system in the window title; the window stays on top (for recordings) |
 | `NFS_AUTOPILOT=1` with `--follow` | a windowed race drives itself (for recordings); `NFS_AUTOPILOT=ai` — the opponents' AI drives the player's car |
 | `NFS_AI_TRACE=<idx>` | a quarter-second trace of one AI car in the log |
+| `WGPU_BACKEND=vulkan`/`gl`/`dx12`/`metal` | the graphics API (by default Vulkan / Metal / Direct3D 12, OpenGL only without them) |
 
 ## Code layout
 

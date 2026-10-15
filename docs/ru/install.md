@@ -9,8 +9,8 @@
 - Одна из систем:
   - **macOS** 13 или новее, Apple Silicon или Intel (одно универсальное приложение);
   - **Windows** 10 или новее, 64-бит, драйвер видеокарты с DirectX 12 или Vulkan;
-  - **Linux** x86_64 с glibc 2.36 или новее (Debian 12, Ubuntu 23.04 и новее), драйвер Vulkan или OpenGL,
-    X11 или Wayland.
+  - **Linux** x86_64 с glibc 2.36 или новее (Debian 12, Ubuntu 23.04 и новее), драйвер Vulkan (а без него —
+    OpenGL 3.3), X11 или Wayland.
 
 ## Шаги
 
@@ -25,7 +25,8 @@
    - **Linux:** `./run.sh` (или `./OpenUnleashed` из папки архива).
 
 Для Linux нужны пакеты (названия для Debian / Ubuntu): `libasound2` или `libasound2t64` (звук), `libudev1`
-(геймпады), `libvulkan1` и драйвер Vulkan (`mesa-vulkan-drivers` или драйвер производителя), либо драйвер OpenGL.
+(геймпады), `libvulkan1` и драйвер Vulkan (`mesa-vulkan-drivers` или драйвер производителя); без Vulkan игра
+переходит на OpenGL 3.3 через EGL (`libegl1` и `libgl1-mesa-dri` или драйвер производителя).
 
 ## Сетевая игра
 

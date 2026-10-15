@@ -9,8 +9,8 @@
 - One of:
   - **macOS** 13 or newer, Apple Silicon or Intel (one universal app);
   - **Windows** 10 or newer, 64-bit, a GPU driver with DirectX 12 or Vulkan;
-  - **Linux** x86_64 with glibc 2.36 or newer (Debian 12, Ubuntu 23.04 and later), a Vulkan or OpenGL driver,
-    X11 or Wayland.
+  - **Linux** x86_64 with glibc 2.36 or newer (Debian 12, Ubuntu 23.04 and later), a Vulkan driver (or, without
+    one, OpenGL 3.3), X11 or Wayland.
 
 ## Steps
 
@@ -25,7 +25,8 @@
    - **Linux:** `./run.sh` (or `./OpenUnleashed` from the archive's folder).
 
 On Linux the runtime needs (Debian / Ubuntu package names) `libasound2` or `libasound2t64` (sound), `libudev1`
-(gamepads), `libvulkan1` and a Vulkan driver (`mesa-vulkan-drivers` or your vendor's), or an OpenGL driver.
+(gamepads), `libvulkan1` and a Vulkan driver (`mesa-vulkan-drivers` or your vendor's); without Vulkan the game
+falls back to OpenGL 3.3 through EGL (`libegl1` and `libgl1-mesa-dri` or your vendor's driver).
 
 ## Network games
 

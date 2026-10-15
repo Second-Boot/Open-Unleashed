@@ -308,18 +308,36 @@ pub const VIEW_FAR: f32 = 700.0;
 impl Core {
     pub fn new(window: Arc<Window>) -> Result<Self> {
         let size = window.inner_size();
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::METAL | wgpu::Backends::PRIMARY,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-        let surface = instance.create_surface(window.clone()).context("create surface")?;
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        }))
-        .context("no suitable GPU adapter")?;
+        // PLATFORM GLUE: the graphics API. Vulkan / Metal / Direct3D 12 first; OpenGL (EGL / WGL) only when none of
+        // them gives an adapter for this window (a machine without a Vulkan driver). `WGPU_BACKEND` (wgpu's own
+        // variable, e.g. `gl` or `vulkan`) picks the API instead, for testing the fallback.
+        let open = |backends: wgpu::Backends| -> Result<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter)> {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends,
+                // EGL needs the display before any surface exists
+                ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(window.clone()))
+            });
+            // with no driver of these APIs installed at all, already the surface fails
+            let surface = instance.create_surface(window.clone()).context("create surface")?;
+            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            }))
+            .context("no suitable GPU adapter")?;
+            Ok((instance, surface, adapter))
+        };
+        let (instance, surface, adapter) = match wgpu::Backends::from_env() {
+            Some(chosen) => open(chosen)?,
+            None => match open(wgpu::Backends::METAL | wgpu::Backends::PRIMARY) {
+                Ok(found) => found,
+                Err(e) => {
+                    tracing::warn!(error = format!("{e:#}"), "no Vulkan / Metal / Direct3D 12 for the window: trying OpenGL");
+                    open(wgpu::Backends::GL)?
+                }
+            },
+        };
         // diagnostics (port-own, `open-unleashed.log`): every adapter the instance sees, the chosen one with
         // its features / limits, so a failure on another machine can be read from the log
         for a in pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all())) {
