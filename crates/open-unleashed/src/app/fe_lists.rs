@@ -369,8 +369,8 @@ pub(crate) fn selectable_index(rows: &[ListRow], row: usize) -> i32 {
     rows[..=snapped].iter().filter(|r| !is_heading(r)).count() as i32 - 1
 }
 
-/// **`GenericCar.Car`'s own dealer-availability admit rule — the `[0x6919EC]` `+0x204` question
-/// left open, resolved by a fresh disassembly of 0x4F4087…0x4F41B7 (`0x4F3E40`'s per-record kind-0
+/// **`GenericCar.Car`'s own dealer-availability admit rule — the `[0x6919EC]` `+0x204` question left
+/// open earlier, resolved by a fresh disassembly of 0x4F4087…0x4F41B7 (`0x4F3E40`'s per-record kind-0
 /// arm) and cross-checked against the shipped `nfs5.car` data and a live original capture.**
 ///
 /// The arm taken is `Game.GameType == 4` (career/Evolution, `edi`/`[esp+0x18]` compared against the

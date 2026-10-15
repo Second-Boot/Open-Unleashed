@@ -1000,8 +1000,8 @@ impl LayoutScreen {
         let Some(&(tex, aw, ah)) = self.shapes.get(key) else { return };
         let (dw, dh) = (if w > 0.0 { w } else { aw }, if h > 0.0 { h } else { ah });
         let (pos, size) = self.place(aspect, x, y, dw, dh);
-        // `NFS5.ShowcasePicture`'s own draw, **0x508DB0** (
-        // re-read in full this pass): reads the widget's tint (0x528C90, opaque white on both
+        // `NFS5.ShowcasePicture`'s own draw, **0x508DB0** (re-read in
+        // full): reads the widget's tint (0x528C90, opaque white on both
         // screens) and folds in the transition's fade via `0x4C8840` (the alpha-multiply idiom
         // at 0x508E08…0x508E2C, `a = base_a * fade / 255`) when not in the software-render
         // fallback (`![0x657E58]`, the branch the port always takes). This is exactly the same

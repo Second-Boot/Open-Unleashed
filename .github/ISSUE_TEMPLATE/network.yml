@@ -1,0 +1,41 @@
+name: Network game / Сетевая игра
+description: A problem with finding, joining or racing in a network game. / Проблема с поиском, подключением или гонкой по сети.
+labels: ["network"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Network races use UDP port 9442. / Сетевые гонки идут через UDP-порт 9442.
+        **Never attach files of the original game.** / **Не прикладывайте файлы оригинальной игры.**
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened / Что произошло
+    validations:
+      required: true
+  - type: dropdown
+    id: peers
+    attributes:
+      label: Players / Игроки
+      options:
+        - OpenUnleashed with OpenUnleashed
+        - OpenUnleashed with the original game / с оригинальной игрой
+    validations:
+      required: true
+  - type: input
+    id: network
+    attributes:
+      label: Network / Сеть
+      description: LAN, VPN or internet; who hosts. / Локальная сеть, VPN или интернет; кто создаёт игру.
+  - type: input
+    id: version
+    attributes:
+      label: Version and systems / Версия и системы
+      description: Archive or commit, and each player's OS. / Архив или коммит и ОС каждого игрока.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: open-unleashed.log (host and client / хост и клиент)
+      render: text

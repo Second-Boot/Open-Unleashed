@@ -4,7 +4,7 @@
 
 ## Requirements
 
-- Rust 1.85 or newer (`rustup`);
+- Rust 1.95 or newer (`rustup`);
 - the game data as described in [game data](game-data.md);
 - Linux: the development packages `libasound2-dev libudev-dev libx11-dev libxkbcommon-dev libwayland-dev
   libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libvulkan-dev pkg-config`.

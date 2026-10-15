@@ -4,7 +4,7 @@
 
 ## Что нужно
 
-- Rust 1.85 или новее (`rustup`);
+- Rust 1.95 или новее (`rustup`);
 - данные игры, как описано в разделе [данные игры](game-data.md);
 - Linux: пакеты для разработки `libasound2-dev libudev-dev libx11-dev libxkbcommon-dev libwayland-dev
   libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libvulkan-dev pkg-config`.

@@ -94,7 +94,7 @@ impl App {
         // layers — only `carcompare` and `usedcardamage` have such widgets and nothing is ever
         // pushed over either, so covered views of that kind are not carried: APPROXIMATION, no
         // shipped case.)
-        // (formerly approximation, MEDIUM — CLOSED 329adc1a, confirmed on the Wine original: the covered garage car shows behind the oval) was not read: that a covered screen's tick 0x80 reaches its
+        // (formerly approximation, MEDIUM — closed by 329adc1a, confirmed on the Wine original: the covered garage car shows behind the oval) was not read: that a covered screen's tick 0x80 reaches its
         // widgets' tick 0x4C0520 with no cover test, and that `FEEmpty3DRoom`'s slot 41 stores the car.
         // A dx7 capture of `settings` over `garage` decides it (a faint car behind the oval or none).
         if !widgets.iter().any(|w| w.position().is_none())

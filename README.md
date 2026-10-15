@@ -42,6 +42,10 @@ Details and troubleshooting: [installation](docs/en/install.md).
 GNU General Public License v3.0 or later ([LICENSE](LICENSE)). Third-party components keep their own licences;
 the release archives list them in `THIRD-PARTY-LICENSES.txt`.
 
+## Contributing
+
+Bug reports and pull requests: [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Acknowledgements
 
 The community patch 1.0.6 by Verok, whose run-time fixes to the original executable this engine reproduces where

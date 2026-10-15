@@ -363,8 +363,8 @@ impl App {
                     self.fe.track_turn_back = delta < 0;
                     self.set_accessor(acc, delta);
                     // was a hand-picked `bind_lists`+`bind_car_logos` pair; every other
-                    // `set_accessor` site runs the full `bind_after_accessor()` (the
-                    // audit of the `NFS5.CARSETTINGBUTTON` gap)
+                    // `set_accessor` site runs the full `bind_after_accessor()` (the audit of the
+                    // `NFS5.CARSETTINGBUTTON` gap)
                     self.bind_after_accessor();
                     return;
                 }

@@ -1,0 +1,42 @@
+name: Bug report / Ошибка
+description: Something does not work or works differently from the original game. / Что-то не работает или работает не как в оригинале.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never attach files of the original game** (GameData, FEData, nfs5.exe, extracted textures or sounds). Screenshots and short videos are fine.
+        **Не прикладывайте файлы оригинальной игры** (GameData, FEData, nfs5.exe, извлечённые текстуры или звуки). Скриншоты и короткие видео — можно.
+        English or Russian. / Можно по-русски.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened / Что произошло
+      description: What you did, what you expected, what happened instead. / Что делали, чего ожидали, что произошло.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce / Как воспроизвести
+      description: Track, car, game mode, settings. / Трасса, машина, режим, настройки.
+  - type: input
+    id: version
+    attributes:
+      label: Version / Версия
+      description: Archive name or commit. / Имя архива или коммит.
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System / Система
+      description: OS and version, CPU, GPU and driver. / ОС и версия, процессор, видеокарта и драйвер.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: open-unleashed.log
+      description: From the saves folder (see docs/en/install.md). / Из папки сохранений (см. docs/ru/install.md).
+      render: text
