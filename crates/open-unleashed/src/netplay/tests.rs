@@ -725,3 +725,17 @@ fn the_rooms_description_goes_to_every_player_after_each_change_of_the_count() {
     let b4 = after.iter().position(|m| count(m) == Some(2));
     assert!(matches!((b1, b4), (Some(x), Some(y)) if x < y), "A: 0xB1 (2), then 0xB4 count 2; got {after:?}");
 }
+
+/// D19: the version 0x48DBE0 keeps — the file, else the registry's `Client Version`, else `"0.0"` — and the port's
+/// `"3.5"` only when there is no registry export at all (a player's `game/` folder).
+#[test]
+fn the_version_falls_back_to_the_shipped_one_only_without_a_registry() {
+    use nfs_formats::regfile::{RegFile, GAME_KEY};
+    let reg = RegFile::parse(format!("Windows Registry Editor Version 5.00\r\n\r\n[{GAME_KEY}]\r\n\"Client Version\"=\"0.0\"\r\n").as_bytes());
+    assert!(!reg.is_empty());
+    assert_eq!(super::version_from(Some("3.5".into()), Some(&reg)), "3.5");
+    assert_eq!(super::version_from(Some("3.5".into()), None), "3.5");
+    assert_eq!(super::version_from(None, Some(&reg)), "0.0");
+    assert_eq!(super::version_from(None, Some(&RegFile::default())), "3.5");
+    assert_eq!(super::version_from(None, None), "3.5");
+}

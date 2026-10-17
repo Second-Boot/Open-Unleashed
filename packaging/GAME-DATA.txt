@@ -7,8 +7,9 @@ into this folder, so that it contains:
     game/GameData/...
     game/FEData/...
 
-Optionally also copy nfs5.exe (the intro movies' decoder reads its tables from it; it is never run)
-and fe.txt. Instead of copying, you can set the environment variable NFS5_GAME_PATH to the
+Also copy version.txt if you want network games: it holds the game's version ("3.5"), which every
+player of a race must share. Optionally also copy nfs5.exe (the intro movies' decoder reads its
+tables from it; it is never run) and fe.txt. Instead of copying, you can set the environment variable NFS5_GAME_PATH to the
 installed game's folder.
 
 --------------------------------------------------------------------------------
@@ -22,6 +23,7 @@ installed game's folder.
     game/GameData/...
     game/FEData/...
 
-По желанию скопируйте и nfs5.exe (из него берутся таблицы для вступительных роликов; сам он
-не запускается) и fe.txt. Вместо копирования можно указать в переменной окружения
+Для сетевой игры скопируйте и version.txt: в нём версия игры («3.5»), которая у всех участников
+гонки должна совпадать. По желанию скопируйте и nfs5.exe (из него берутся таблицы для
+вступительных роликов; сам он не запускается) и fe.txt. Вместо копирования можно указать в переменной окружения
 NFS5_GAME_PATH папку установленной игры.

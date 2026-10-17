@@ -57,6 +57,11 @@ impl RegFile {
     }
 
     /// `name` under `key`, the last one any merged file set.
+    /// No key at all: no export was found (the port has no registry of its own).
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
     pub fn value(&self, key: &str, name: &str) -> Option<&RegValue> {
         self.keys
             .iter()

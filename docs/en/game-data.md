@@ -13,6 +13,7 @@ From the installed game — the folder that holds `nfs5.exe`:
 |---|---|---|
 | `GameData/` | yes | tracks, cars, physics, sounds |
 | `FEData/` | yes | menus, fonts, texts, movies |
+| `version.txt` | for network games | the game's version (`3.5`), which the network session announces and a host checks; without it the engine announces `0.0` and no other player can join |
 | `nfs5.exe` | no | the intro movies' decoder reads its tables from it (it is never run); without it the intro is skipped |
 | `fe.txt` | no | the original's settings file; without it the defaults are used |
 

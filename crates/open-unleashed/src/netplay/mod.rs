@@ -57,6 +57,12 @@ pub use remote::*;
 /// (this install's `reg.reg`: `"0.0"`). Until this date the port answered `"3.5"`, the literal
 /// 0x48A700 compares a peer's version with, which is not what the constructor keeps, and trimmed
 /// the file's text.
+///
+/// **PORT-DEVIATION D19** (`RE/notes/PORT-DEVIATIONS.md`): with neither the file nor a registry export
+/// — a player's `game/` folder, which the install instructions fill with `GameData` and `FEData` only —
+/// the port announces [`SHIPPED_VERSION`], what every installed copy's `version.txt` holds, instead of the
+/// table's `"0.0"`. The original cannot be in that state (its installer writes both); `"0.0"` would make a
+/// host refuse every other player. The file, when present, still wins, as it does there.
 pub fn game_version() -> String {
     let paths = nfs_assets::paths::GamePaths::locate().ok();
     let file = paths
@@ -64,14 +70,30 @@ pub fn game_version() -> String {
         .and_then(|p| std::fs::read(p.root.join("version.txt")).ok())
         .map(|b| b.into_iter().take(5).take_while(|&c| c != 0).map(|c| c as char).collect::<String>())
         .filter(|v| !v.is_empty());
-    file.unwrap_or_else(|| {
-        let reg = paths.map(|p| p.registry());
-        match reg.as_ref().and_then(|r| r.value(nfs_formats::regfile::GAME_KEY, "Client Version")) {
-            Some(nfs_formats::regfile::RegValue::Sz(v)) => v.chars().take(4).collect(),
-            _ => "0.0".to_string(),
-        }
-    })
+    let reg = paths.map(|p| p.registry());
+    version_from(file, reg.as_ref())
 }
+
+/// 0x48DBE0's choice, from what was read: the file's text, else the registry's `Client Version` (4 chars), else
+/// `"0.0"` — or, with no registry export at all, [`SHIPPED_VERSION`] (D19).
+pub fn version_from(file: Option<String>, reg: Option<&nfs_formats::regfile::RegFile>) -> String {
+    if let Some(v) = file {
+        return v;
+    }
+    match reg.and_then(|r| r.value(nfs_formats::regfile::GAME_KEY, "Client Version")) {
+        Some(nfs_formats::regfile::RegValue::Sz(v)) => v.chars().take(4).collect(),
+        Some(_) => "0.0".to_string(),
+        None if reg.is_some_and(|r| !r.is_empty()) => "0.0".to_string(),
+        None => {
+            tracing::info!(version = SHIPPED_VERSION, "no version.txt beside the game data and no registry export: the shipped version");
+            SHIPPED_VERSION.to_string()
+        }
+    }
+}
+
+/// The version every installed copy of the game carries in its `version.txt` (the literal 0x48A700 compares a
+/// peer's version with, 0x5D06FC), announced when a player's data folder has no such file (D19).
+pub const SHIPPED_VERSION: &str = "3.5";
 
 /// The address record a host's `'d'` carries at `+0x04` — its machine's own address as 0x583899
 /// builds `MYIPADDRESS` (`gethostname` → `gethostbyname` → the first `AF_INET` address), with the

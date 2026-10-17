@@ -13,5 +13,7 @@ cp -R "$SRC/GameData" "$SRC/FEData" "$DST/"
 find "$DST" -type f \( -iname 'vssver.scc' -o -iname '*.xls' -o -iname '*.h' -o -iname '*.dtx' -o -iname '*.eng' -o -iname '*.pfn' \) -delete
 cargo run -q --release -p nfs-formats --example extract_mad_tables -- "$SRC/nfs5.exe" "$DST/madtables.bin"
 [ -f "$SRC/fe.txt" ] && cp "$SRC/fe.txt" "$DST/"
+# the game's version ("3.5"): the network session name carries it, and a host refuses any other
+[ -f "$SRC/version.txt" ] && cp "$SRC/version.txt" "$DST/"
 chmod -R u+w "$DST"
 du -sh "$DST"

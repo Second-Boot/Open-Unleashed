@@ -16,7 +16,8 @@
 
 1. Download the archive for your system from the releases and unpack it.
 2. Copy the folders **`GameData`** and **`FEData`** from the installed game (the folder that holds `nfs5.exe`) into
-   the **`game`** folder of the unpacked archive. Optionally also copy `nfs5.exe` (the intro movies read their
+   the **`game`** folder of the unpacked archive. For network games also copy `version.txt` (the game's version,
+   `3.5`: every player of a race must have the same). Optionally also copy `nfs5.exe` (the intro movies read their
    tables from it; it is never run) and `fe.txt`. Other places the engine looks: [game data](game-data.md).
 3. Start the game:
    - **macOS:** `OpenUnleashed.app`. The app is not notarised: the first time, right-click it → **Open**, or run
