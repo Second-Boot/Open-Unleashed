@@ -108,3 +108,33 @@ fn a_rear_end_shunt_damages_the_chasers_nose_and_the_leaders_tail() {
     assert!(a.damage[1] > 0.0 && a.damage[5] == 0.0, "A: {:?}", a.damage);
     assert!(b.damage[5] > 0.0 && b.damage[1] == 0.0, "B: {:?}", b.damage);
 }
+
+/// The 48 degree sign hit on the original (`REFERENCE-2026-10-17-SIGN.md`, run 3, game tick 50058, the
+/// logged records a 64 Hz step on): the sign (A, half extents of the SIGN record, rows as set up) and
+/// the 993 (B, the model box, rows of the setup, 13.5 m/s along them). Fed to the port's pair test
+/// the first overlap is the car's nose face centre inside the sign (B's +z face, 0x497006…0x497103)
+/// and the contact the separation's last pass leaves is a sign corner in the car's box with the
+/// car's nose axis as the normal — what the original's first contact was (the car's nose face).
+/// The sign's lower corners lie 6 mm under the car box's floor at this state, so a few cm of
+/// height change which of the corner tests fires first: the reason the scripted ram can differ.
+#[test]
+fn the_logged_48_degree_sign_hit_takes_the_cars_nose_face() {
+    let rows = |r: [[f32; 3]; 3]| Mat3::from_cols(Vec3::from(r[0]), Vec3::from(r[1]), Vec3::from(r[2])).transpose();
+    let specs = super::tests::specs_993();
+    let mut sign = Vehicle::new(Vec3::new(167.2005, 34.948_345, -295.109_34), Mat3::IDENTITY, &specs, 0.8, 0.3);
+    sign.orientation = rows([[-0.356_618_1, 0.0, 0.934_250_1], [0.0, 1.0, 0.0], [-0.934_250_1, 0.0, -0.356_618_1]]);
+    sign.half_extents = Vec3::new(0.757_210_85, 1.587_997_3, 0.162_077_01);
+    let vel = Vec3::new(11.956_026, 0.923_828, -6.209_604);
+    let mut car = Vehicle::new(Vec3::new(165.065_98, 33.875_755, -293.993_2) + vel / 64.0, Mat3::IDENTITY, &specs, 0.8, 0.3);
+    car.orientation = rows([[-0.461_564_9, -0.009_576_35, -0.887_055_1], [-0.065_387_62, 0.997_589_2, 0.023_253_75], [0.884_693_7, 0.068_735_53, -0.461_078_17]]);
+    car.half_extents = Vec3::new(0.909_964_86, 0.631_321_5, 2.103_711);
+    car.velocity = vel;
+    let nose = car.orientation.row(2);
+    // the first test that fires: B's +z face centre
+    let (p0, n0) = box_contact(&sign, &car).expect("overlap");
+    assert!((n0 - nose).length() < 1e-5, "first normal {n0:?}");
+    assert!((p0 - (car.position + nose * car.half_extents.z)).length() < 1e-4, "{p0:?}");
+    // after the separation passes (the sign is the light one) the contact is a corner with the same axis
+    let (_, n) = separate(&mut sign, 0.625, &mut car, 9.0).expect("overlap");
+    assert!((n - nose).length() < 1e-5, "last normal {n:?}");
+}

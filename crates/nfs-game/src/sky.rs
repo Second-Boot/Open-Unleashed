@@ -816,7 +816,7 @@ impl Sky {
             r.upload_texture_mips(t.width, t.height, &t.mips)
         }
         let mut parts = Vec::new();
-        let sky_mat = |r: &mut Renderer, texture, blend, blend_pair| r.create_material(MaterialDesc { texture, alpha_blend: blend, cull_back: false, depth_test: false, env_texture: None, env_mix: 0.0, env_variant: 0, sky_map: false, blend_pair, clamp: [false; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false });
+        let sky_mat = |r: &mut Renderer, texture, blend, blend_pair, clamp: bool| r.create_material(MaterialDesc { texture, alpha_blend: blend, cull_back: false, depth_test: false, env_texture: None, env_mix: 0.0, env_variant: 0, sky_map: false, blend_pair, clamp: [clamp; 2], lod_bias: 0.0, device_states: false, view_cull: false, depth_bias: 0, false_sort: false });
 
         let file = nfs_formats::sky::SkyFile::parse(&track.sky_params.join("\n")).ok();
         // the blocks of the `SKYRENDERING` level (0x45D8F0 → 0x45FB80, `SkyFile::for_level`) — none
@@ -890,7 +890,7 @@ impl Sky {
                     let Some(t) = find(cloud) else { continue };
                     (Some(tex(r, t)), !(colours.is_opaque() && alpha_free(t.code)))
                 };
-                let m = sky_mat(r, texture, blend, pair);
+                let m = sky_mat(r, texture, blend, pair, false);
                 let scale = [layer.scale[0].max(0.01), layer.scale[1].max(0.01)];
                 let ring = &bin.rings[0];
                 // every stage shares the one grid (`[this+0x30]`, bound once per block at 0x45BED5),
@@ -918,7 +918,12 @@ impl Sky {
         // `foothills` carry a `hor0`, and `Canyon` a `hor1` / `hor2`; the port had always taken `horz`.
         if let Some(hz) = find(&format!("hor{level}")).or_else(|| find("horz")) {
             let id = tex(r, hz);
-            let m = sky_mat(r, Some(id), true, 0);
+            // the layers' primitive helper takes its last argument 0 (0x45BB5C) and the ring's 1
+            // (0x459C93 → 0x4685E0): 0x468440 turns that flag into the state block's `ADDRESSU` /
+            // `ADDRESSV` (0x4684F1…0x4684FF → 0x537A70, `+0x14` / `+0x18`) — 0 → `WRAP`, 1 → `CLAMP`.
+            // The ring's tiles are cells of one image, so a wrap blends their u = 0 / 1 edges
+            // (the seam on the sea).
+            let m = sky_mat(r, Some(id), true, 0, true);
             match track.sky_bin.as_ref().filter(|b| b.tile_cols > 0) {
                 // the ring the track's own `.bin` describes
                 Some(bin) => {

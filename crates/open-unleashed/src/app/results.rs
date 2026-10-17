@@ -63,22 +63,12 @@ impl App {
     }
 
     /// The mission's result line as `HMissionSummary` prints it: the text id `sprintf`ed with the
-    /// driver's name (`car+0x558 → +0x17C`, 0x429608…0x42962B) and broken at spaces into lines
-    /// shorter than 50 characters (0x42965A…).
+    /// driver's name (`car+0x558 -> +0x17C`, 0x429608..0x42962B) and broken into lines by
+    /// [`break_mission_text`] (0x42965A..0x4297F1).
     pub(crate) fn mission_text_lines(&self) -> Vec<String> {
         let Some((_, Some(id))) = self.mission_result else { return Vec::new() };
         let text = self.fe.strings.hud(id).unwrap_or_default().replacen("%s", &self.player_name, 1);
-        let mut lines: Vec<String> = Vec::new();
-        for w in text.split(' ').filter(|w| !w.is_empty()) {
-            match lines.last_mut() {
-                Some(l) if l.len() + 1 + w.len() < 50 => {
-                    l.push(' ');
-                    l.push_str(w);
-                }
-                _ => lines.push(w.to_string()),
-            }
-        }
-        lines
+        break_mission_text(&text)
     }
 
     pub(crate) fn settle_mission(&mut self) {
@@ -548,6 +538,72 @@ pub(crate) fn with_thousands(n: i64) -> String {
         out.insert(0, '-');
     }
     out
+}
+
+/// `HMissionSummary`'s line break (0x42965A..0x4297F1, the constructor's text loop), read to the
+/// instruction. The text is a single-byte string (the hud.loc code page), so a "character" is one
+/// byte, here one `char`: the port holds the text as UTF-8, and counting its bytes made every
+/// Cyrillic line about half as long as the original's.
+///
+/// With `esi` the line's start, `edx` the scan index and `last` the last space seen: at each index
+/// a space is followed by the rest of its run (0x429664..0x42966E: `edx` moves to the first
+/// non-space, `last = edx - 1`); then, when `edx - esi < 50` (0x42967F `cmp ecx, 0x32`) and
+/// `edx < len - 1` (0x429687), the scan goes on one character (0x4297EA); otherwise the line is
+/// cut: `edx == len - 1` makes `last = edx` (0x4296A1), the line is `s[esi..=last]` (0x4296B8,
+/// `last - esi + 1` bytes) and the next starts at `last + 1` (0x4296C4), the scan carrying on from
+/// `edx + 1`. So a line is a plain greedy fill that never passes 50 characters (the trailing space
+/// counted) and breaks only at a space run; its spaces are kept.
+pub(crate) fn break_mission_text(text: &str) -> Vec<String> {
+    let s: Vec<char> = text.chars().collect();
+    let len = s.len() as i64;
+    let at = |i: i64| -> char { usize::try_from(i).ok().and_then(|i| s.get(i)).copied().unwrap_or('\0') };
+    let mut lines = Vec::new();
+    let (mut esi, mut edx, mut last) = (0i64, 0i64, 0i64);
+    while edx < len {
+        if at(edx) == ' ' {
+            loop {
+                edx += 1;
+                if at(edx) != ' ' {
+                    break;
+                }
+            }
+            last = edx - 1;
+        }
+        if edx - esi < 50 && edx < len - 1 {
+            edx += 1;
+            continue;
+        }
+        if edx == len - 1 {
+            last = edx;
+        }
+        // a word longer than the line leaves `last` behind the start (the original would copy a
+        // negative count): break the line where the scan is
+        if last < esi {
+            last = (edx - 1).max(esi);
+        }
+        lines.push((esi..=last).map(at).collect());
+        esi = last + 1;
+        edx += 1;
+    }
+    lines
+}
+
+#[cfg(test)]
+mod mission_text_tests {
+    use super::break_mission_text;
+
+    #[test]
+    fn lines_are_a_greedy_fill_of_fifty_characters() {
+        let t = "Эй, Игрок, добро пожаловать в команду. Я - Рольф, начальник отдела гонщиков-испытателей. Удачи!";
+        let l = break_mission_text(t);
+        assert_eq!(l.concat(), t);
+        assert_eq!(l.len(), 2, "{l:?}");
+        assert!(l.iter().all(|x| x.chars().count() <= 50), "{l:?}");
+        let w = format!("{} {}", "a".repeat(48), "bcd");
+        assert_eq!(break_mission_text(&w), [format!("{} ", "a".repeat(48)), "bcd".to_string()]);
+        assert_eq!(break_mission_text("short"), ["short"]);
+        assert!(break_mission_text("").is_empty());
+    }
 }
 
 #[cfg(test)]

@@ -239,13 +239,17 @@ impl App {
                     })
                     .map_err(anyhow::Error::from)
                     .and_then(|a| {
-                        // the room car's half box, 0x445090's `car+0x3A8…+0x3B0` (a front-end
-                        // car is a racer's kind: LOD 5), for the garage's shadow projector
+                        // the car's half box, 0x445090's `car+0x3A8…+0x3B0` (a front-end car is a
+                        // racer's kind: LOD 5), for the garage's shadow projector and every other
+                        // front-end car's blob shadow (0x43B471)
+                        let (lo, hi) = nfs_game::world::car_model_box(&a, 5);
                         if slot == usize::MAX {
-                            let (lo, hi) = nfs_game::world::car_model_box(&a, 5);
                             self.fe.room_car_half = Some((hi - lo) * 0.5);
                         }
-                        CarModel::upload_with_env(r, &a, &self.paths, 1, paint, nfs_game::world::CarUpload { env: car_env, ..Default::default() })
+                        CarModel::upload_with_env(r, &a, &self.paths, 1, paint, nfs_game::world::CarUpload { env: car_env, ..Default::default() }).map(|mut m| {
+                            m.box_half = (hi - lo) * 0.5;
+                            m
+                        })
                     });
                 match loaded {
                     Ok(m) => self.fe.cars.push((slot, model, variant, paint.exterior, m)),
@@ -291,13 +295,31 @@ impl App {
                 self.garage_car().map(|(_, o)| o.trim.decal)
             }
             Some("UsedCar.Car") => self.used_car().map(|o| o.trim.decal),
+            // `FEFactoryDriverCarAccessor` slot 34 (0x519B50) reads `FECar+0x688`, the DecalNum
+            // 0x51AA60 → 0x4EE3B0 → 0x4EEBA0 stored from the mission's `+0xBE`
+            Some("FactoryDriver.Car") => self.mission_fe_livery().map(|(_, d)| d),
             _ => None,
         }
         .filter(|n| *n >= 0)
     }
 
+    /// The livery of the factory-drive screen's FE car (`[0x69C8C8]`, 0x51AA60): the current
+    /// mission's `+0xA0 / +0xB0 / +0xBC / +0xBE` block, whatever the last race left in `self.paint`.
+    fn mission_fe_livery(&self) -> Option<(Paint, i8)> {
+        let c = self.career.as_ref()?;
+        let m = c.tables.missions.get(c.career.current_mission(&c.tables)?)?;
+        Some(crate::career_ui::CareerUi::mission_livery_of(m))
+    }
+
     fn fe_car_paint(&self, accessor: Option<&str>, car: &nfs_formats::fedata::CarCatalogEntry) -> Paint {
         let base = accessor.map(|a| a.split_once('(').map_or(a, |(b, _)| b));
+        // `FEFactoryDriverCarAccessor` slots 29…33 (0x519B00…0x519B40): `FECar+0x674…0x684` read
+        // straight, the mission's own colours (controls.md §4.149)
+        if base == Some("FactoryDriver.Car")
+            && let Some((p, _)) = self.mission_fe_livery()
+        {
+            return p;
+        }
         if base == Some("OwnedCars.Car")
             && let Some((_, o)) = self.garage_car()
             && !car.paint_sets.is_empty()
@@ -538,9 +560,28 @@ impl App {
         let room_light = nfs_game::world::LightBlock::room(room.ambient, room.sun, sun_dir, light_fade, false);
         let mut car_light = nfs_game::world::LightBlock::room(room.ambient, room.sun, sun_dir, light_fade, true);
         car_light.direction = nfs_game::world::MODEL_TO_BODY.transform_vector3(car_light.direction);
+        // the cars' blob shadow (0x43B820's front-end quad, `fe_blob_shadow`), built once
+        if self.fe.blob_shadow.is_none()
+            && let Some(r) = self.renderer.as_mut()
+            && let Some(path) = nfs_assets::GamePaths::find_file(&self.paths.render_dir(), "common.fsh")
+            && let Ok(data) = std::fs::read(&path)
+            && let Ok(images) = nfs_assets::texture::decode_pack(&path, &data)
+            && let Some(img) = images.iter().find(|t| t.name.trim() == "SHAD")
+        {
+            let tex = r.upload_texture_mips(img.width, img.height, &img.mips);
+            let mut quad = nfs_renderer::MeshData::default();
+            // the corner order of 0x43B471…0x43B5A3 with the uvs of 0x5CD5F0
+            for (x, z, u, v) in [(-1.0f32, -1.0f32, 0.0f32, 0.0f32), (1.0, -1.0, 1.0, 0.0), (1.0, 1.0, 1.0, 1.0), (-1.0, 1.0, 0.0, 1.0)] {
+                quad.vertices.push(nfs_renderer::Vertex { position: [x, 0.0, z], normal: [0.0, 1.0, 0.0], uv: [u, v], color: [1.0; 4] });
+            }
+            quad.indices = vec![0, 1, 2, 0, 2, 3];
+            let mesh = r.upload_mesh(&quad);
+            let material = r.create_material(nfs_renderer::MaterialDesc { alpha_blend: true, cull_back: false, depth_test: true, ..nfs_renderer::MaterialDesc::textured(tex) });
+            self.fe.blob_shadow = Some((mesh, material));
+        }
         // **The dealership** is its own draw, `FEDealership3DRoom` slot 15 0x4E8C70 after its tick
         // 0x4E93B0 (`nfs_game::room::DealerRow`): a row of sections, one per car, which the camera
-        // slides along as the car changes, drawn twice over on a machine that is not a low-end card
+        // slides along as the car changes, with its reflection drawn first on a machine that is not a low-end card
         let dealer = match room.id {
             "ID_DEALER" => self.fe_dealer_items(&spin, zoom, &room_light, &car_light),
             "ID_TRACK" => self.fe_track_items(&room_light),
@@ -644,7 +685,7 @@ impl App {
             for (_, model) in &self.fe.room {
                 let mut its = model.draw_items_block(room_m, [0.0; 4], [0.0; 2], [0.0; 4], &nfs_game::world::FRONT_END_PASSES, &room_light);
                 model.apply_projector(&mut its, shadow.map(|s| s.1));
-                items.extend(its);
+                items.extend(in_submission_order(its));
             }
         }
         let widgets = self
@@ -656,6 +697,9 @@ impl App {
         // drawn into an offscreen view instead, so it lands in that widget's place in the screen's
         // drawing order rather than behind all of it
         let mut views: Vec<(usize, Vec<nfs_renderer::DrawItem>)> = Vec::new();
+        // the garage's draw clears the room car's blob-shadow flag (0x4E9D15) and projects `FESH`
+        // instead; every other front-end car keeps the flag its constructor set (0x4D138A)
+        let blob = self.fe.blob_shadow.filter(|_| !nfs_game::config::cfg().nfs_no_shadow.is_set());
         for (slot, _, _, _, car) in &self.fe.cars {
             let widget = widgets.iter().find(|w| w.index == *slot);
             match widget.and_then(|w| w.position().map(|p| (p, w.alpha))) {
@@ -686,10 +730,13 @@ impl App {
                             .transform_vector3(Vec3::new(0.0, f32::from_bits(0xbf34_fdf4), f32::from_bits(0x3f34_fdf4))),
                         material: [1.0; 3],
                     };
-                    views.push((*slot, car.draw_items_block(m, [0.0; 4], [0.0; 2], [0.0; 4], &nfs_game::world::FRONT_END_PASSES, &own_light)));
+                    views.push((*slot, fe_car_draw(car, m, &nfs_game::world::FRONT_END_PASSES, &own_light, blob, false)));
                 }
                 None if dealer_drawn => {}
-                None => items.extend(car.draw_items_block(turn(spin), [0.0; 4], [0.0; 2], [0.0; 4], &nfs_game::world::FRONT_END_PASSES, &car_light)),
+                None => {
+                    let blob = blob.filter(|_| room.id != "ID_GARAGE");
+                    items.extend(fe_car_draw(car, turn(spin), &nfs_game::world::FRONT_END_PASSES, &car_light, blob, false));
+                }
             }
         }
         if let Some(d) = dealer {
@@ -722,8 +769,8 @@ impl App {
             room.view_angle
         };
         self.camera.fov_y_radians = nfs_game::camera::fov_y_window(h);
-        self.camera.near = 0.05;
-        self.camera.far = 500.0;
+        self.camera.near = FE_NEAR;
+        self.camera.far = FE_FAR;
         if views.is_empty() {
             return;
         }
@@ -781,9 +828,12 @@ impl App {
     /// * **The early pass** (0x4E90A7…0x4E9231), skipped only on a low-end card (0x4E35C0) — never
     ///   in this port: each section with `[R3DCar+0x2C8] = 1`, the car and the car being left with
     ///   3, through 0x4D15F0, whose `+0x471 = 1` makes the car draw 0x444E00 take a single call of
-    ///   LOD `[+0x2C8] + 1` with mask **0x30** (0x444F2B). It lands under the ordinary pass at the
-    ///   same places, so only what the ordinary pass does not cover shows — the section's additive
-    ///   light casts, which both LODs carry, add up twice.
+    ///   LOD `[+0x2C8] + 1` with mask **0x30** (0x444F2B) — and sends the model draw 0x4432B0 to
+    ///   slot 3 **0x443490** (0x4432DD…0x4432F9, `[car+0xC+0x465]` = `+0x471`), which mirrors the
+    ///   model through its own floor (`reflected`). This pass is the showroom's **reflection**: the
+    ///   low LODs upside down under the turntable and the floor, whose 4444 pages the ordinary pass
+    ///   then lays over it. *(Until 2026-10-18 the port drew it unmirrored in place, so a door,
+    ///   bonnet or boot lid opened by the ordinary pass left LOD 4's closed body showing under it.)*
     /// * **The ordinary pass** (0x4E9236…0x4E93A1): the sections, the car at the row's `(X, Y, Z)`,
     ///   and while sliding the car being left at `(X + d·XOff, Y, Z + d·YOff)` with the current
     ///   car's door channels 6 and 7 copied onto it (0x4E930D…0x4E9380).
@@ -824,19 +874,30 @@ impl App {
         let early_car = [CarPass { lod: 4, mask: 0x30, flag: false }];
         let mut items = Vec::new();
         let car = self.fe.cars.iter().find(|c| c.0 == usize::MAX).map(|c| &c.4);
-        for (passes_room, passes_car) in [(&early_room[..], &early_car[..]), (&FRONT_END_PASSES[..], &FRONT_END_PASSES[..])] {
+        let blob = self.fe.blob_shadow.filter(|_| !nfs_game::config::cfg().nfs_no_shadow.is_set());
+        // the first pass is the **reflection**: 0x4D15F0 queues with `+0x471 = 1`, which sends the
+        // draw 0x4432B0 to slot 3 0x443490 (0x4432DD…0x4432F9) — every model mirrored through its
+        // own floor (`reflected`), under the turntable and the floor the second pass lays over
+        // it (their pages are 4444, `dealer2a.tpg`). The car's slot 2 draws its blob shadow
+        // first in both passes (0x437AE2), unmirrored.
+        for (reflect, passes_room, passes_car) in [(true, &early_room[..], &early_car[..]), (false, &FRONT_END_PASSES[..], &FRONT_END_PASSES[..])] {
             for (k, p) in &sections {
                 let m = &self.fe.room[*k].1;
-                items.extend(m.draw_items_block(place(*p, 0.5), [0.0; 4], [0.0; 2], [0.0; 4], passes_room, room_light));
+                let at = place(*p, 0.5);
+                let its = m.draw_items_block(if reflect { reflected(at) } else { at }, [0.0; 4], [0.0; 2], [0.0; 4], passes_room, room_light);
+                items.extend(in_submission_order(its).into_iter().map(|mut it| {
+                    it.mirrored = reflect;
+                    it
+                }));
             }
             if let Some(car) = car {
-                items.extend(car.draw_items_block(place(layout.pos, spin), [0.0; 4], [0.0; 2], [0.0; 4], passes_car, car_light));
+                items.extend(fe_car_draw(car, place(layout.pos, spin), passes_car, car_light, blob, reflect));
                 if let (Some(at), Some(prev)) = (prev_at, self.fe.dealer_prev.as_mut()) {
                     if passes_car == &FRONT_END_PASSES[..] {
                         prev.set_channel_vec(6, car.channel_vec(6));
                         prev.set_channel_vec(7, car.channel_vec(7));
                     }
-                    items.extend(prev.draw_items_block(place(at, spin), [0.0; 4], [0.0; 2], [0.0; 4], passes_car, car_light));
+                    items.extend(fe_car_draw(prev, place(at, spin), passes_car, car_light, blob, reflect));
                 }
             }
         }
@@ -1156,4 +1217,88 @@ impl App {
             _ => [0.0; 10],
         }
     }
+}
+
+/// The front end's view planes as the port draws them (`fe_room_items`' camera); the blob shadow's
+/// depth bias reads them as `cam[+0xC]`.
+const FE_NEAR: f32 = 0.05;
+const FE_FAR: f32 = 500.0;
+
+/// Every item of a front-end 3D view in the order the original flushes them: the front end queues
+/// each room model and car on the view's `+0xC` list and draws it farthest first (0x466660), and
+/// the dealership flushes every draw at once (0x467290 after each 0x4D15E0 / 0x4D15F0). A room's
+/// list key is its box centre `car+0x330` — the room's place raised by half its box (0x4D1700,
+/// `+0x334 = y + car+0x3AC`), several metres up — against the car's, half a car's height up at
+/// the same place (0x4430A0 → 0x4436C0, `round(d²)` from the eye at 0x4431F8), so with every
+/// shipped rig (`y` −1.1 / −1.2 under the eye) the room is drawn before its car. The port's
+/// stages would draw the room's blended materials after every opaque part instead; `early`
+/// keeps the submission order, which is what lets the car's blob shadow lie on the floor under
+/// the car (it has no depth writes, so a floor drawn after it would cover it).
+fn in_submission_order(mut items: Vec<nfs_renderer::DrawItem>) -> Vec<nfs_renderer::DrawItem> {
+    for it in &mut items {
+        it.early = true;
+    }
+    items
+}
+
+/// The model matrix `R3DCar` slot 3 **0x443490** builds for the front end's reflection pass
+/// (`car+0x471` set, 0x4432E5 → `call [edx+0xC]`): after the model flip `S(−1, 1, −1)`
+/// (0x443506) and the car's rotation `car+0x364` (0x443534, no translation: 0x5BB2B0) it pushes
+/// **`S(1, −1, 1)`** (0x443564) and only then the translation `car+0x330 − up·car+0x3AC`
+/// (0x4435A0) — the model mirrored through the horizontal plane at its own origin, the floor it
+/// stands on. `place` is the port's ordinary `T · R` for the same car.
+fn reflected(place: Mat4) -> Mat4 {
+    let t = Mat4::from_translation(place.w_axis.truncate());
+    t * Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0)) * t.inverse() * place
+}
+
+/// One front-end car through `R3DCar` slot 2 **0x437AB0**: the blob shadow 0x43B820 first (when
+/// the car has one — `[R3DCar+0x700]`, set for every front-end car by 0x4D138A and cleared only by
+/// the garage's draw, 0x4E9D15), then the model 0x4432B0 — reflected (slot 3, 0x443490) when the
+/// draw was queued with `+0x471` (0x4D15F0, the dealership's first pass).
+#[allow(clippy::too_many_arguments)]
+fn fe_car_draw(
+    car: &CarModel,
+    place: Mat4,
+    passes: &[nfs_game::world::CarPass],
+    light: &nfs_game::world::LightBlock,
+    blob: Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
+    reflect: bool,
+) -> Vec<nfs_renderer::DrawItem> {
+    let mut out: Vec<nfs_renderer::DrawItem> = blob.and_then(|b| fe_blob_shadow(b, place, car.box_half)).into_iter().collect();
+    let m = if reflect { reflected(place) } else { place };
+    out.extend(car.draw_items_block(m, [0.0; 4], [0.0; 2], [0.0; 4], passes, light).into_iter().map(|mut it| {
+        it.mirrored = reflect;
+        it
+    }));
+    in_submission_order(out)
+}
+
+/// **0x43B820 in the front end** (`[0x65B928]` set): slot 22 0x43B220's front-end branch
+/// (0x43B471…0x43B5A3) lays the corners `(∓ex, −ey, ∓ez)` — `car+0x3A8 / +0x3AC / +0x3B0`, the
+/// order −−, +−, ++, −+ — through the car's basis `car+0x364` and its origin `car+0x330` (0x532A80)
+/// into the table 0x611570, `w` 1; whatever the distance, one quad (0x43B92B → 0x43B94C, 0x43B984
+/// → 0x43BB00) over those four with the uvs 0x5CD5F0 `(0,0) (1,0) (1,1) (0,1)`, white vertices
+/// (`[ebp−0x2C…−0x20]` = −1), `Render/common.fsh`'s `SHAD` (0x44D320 on `[0x613E04]`, 0x43B967),
+/// through the primitive helper 0x59F070 (blended, no light of its own — `TRACK_LIGHT`, as the
+/// race's), depth writes off around it (0x43B8D7 / 0x43BB27) and the depth bias
+/// `fistp(−20000 · cam[+0xC] / d²)` (0x43B89E…0x43B8BD, `d²` from the eye to `car+0x330`). The
+/// origin is the place raised by `ey` (0x4D1700), so the corners lie on the model's ground:
+/// `place · (±ex, 0, ±ez)`. The quad is the unit one `(±1, 0, ±1)` scaled by the box.
+fn fe_blob_shadow(blob: (nfs_renderer::MeshId, nfs_renderer::MaterialId), place: Mat4, half: Vec3) -> Option<nfs_renderer::DrawItem> {
+    if half == Vec3::ZERO {
+        return None;
+    }
+    // the front end's eye is the origin (`fe_room_items` puts the camera there)
+    let origin = place.transform_point3(Vec3::new(0.0, half.y, 0.0));
+    let d2 = origin.length_squared().max(1e-6);
+    let k = FE_FAR * FE_NEAR / (FE_FAR - FE_NEAR);
+    // `fld [cam+0xC]; fmul −20000; fdiv d²` on the x87 stack, `fstp` to a float, `fistp`
+    let bias = ((-20000.0 * k as f64 / d2 as f64) as f32).round_ties_even() as i32;
+    Some(nfs_renderer::DrawItem {
+        layer_light: Some(nfs_game::world::TRACK_LIGHT),
+        early: true,
+        depth_bias: bias,
+        ..nfs_renderer::DrawItem::new(blob.0, blob.1, place * Mat4::from_scale(Vec3::new(half.x, 1.0, half.z)))
+    })
 }

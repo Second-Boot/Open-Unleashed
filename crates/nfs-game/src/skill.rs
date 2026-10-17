@@ -208,6 +208,18 @@ impl SkillTest {
         Some((s.position, s.heading_c8))
     }
 
+    /// The state a race start gives the test: the scene's triggers are read afresh at every race
+    /// (`WTrack::load` 0x4876E0 → `Scene_loadSkillTest` 0x46D330) and the start (0x410890) sets the
+    /// car's next checkpoint id `car+0xB58` to 1, its state `car+0xB50` / time `car+0xB24` are the
+    /// new car's. A restart (pause menu command 3, 0x415721) goes through that start again.
+    pub fn reset(&mut self) {
+        self.next_sequence = 1;
+        self.finished = false;
+        self.dnf = false;
+        self.time_ticks = None;
+        self.shown_arrow = None;
+    }
+
     /// Arrow to show at the start (link of the start trigger).
     pub fn initial_arrow(&self) -> Option<usize> {
         self.checkpoints.iter().find(|c| c.kind == 2).and_then(|c| c.link)
@@ -399,6 +411,21 @@ mod tests {
     fn car(pos: Vec3) -> TriggerCar {
         let w = |x: f32, z: f32| pos + Vec3::new(x, 0.0, z);
         TriggerCar { position: pos, wheels: [w(-0.8, -1.2), w(0.8, -1.2), w(-0.8, 1.2), w(0.8, 1.2)], forward: Vec3::NEG_Z, velocity: Vec3::new(0.0, 0.0, -10.0), speed: 10.0 }
+    }
+
+    /// FD-RESTART: a restarted race counts the gates again — the state is the fresh test's.
+    #[test]
+    fn a_restart_counts_the_gates_again() {
+        let scene = Scene::parse(SCENE).unwrap();
+        let fresh = SkillTest::from_scene(&scene, "canyon");
+        let mut st = fresh.clone();
+        st.tick(600, &car(Vec3::new(0.0, 0.0, -11.0)), false);
+        st.tick(700, &car(Vec3::new(0.0, 0.0, -31.0)), false);
+        assert!(st.finished);
+        st.reset();
+        assert_eq!(st, fresh);
+        let e = st.tick(600, &car(Vec3::new(0.0, 0.0, -11.0)), false);
+        assert_eq!(e, vec![SkillEvent::Checkpoint { sequence: 1, chime: true }]);
     }
 
     #[test]

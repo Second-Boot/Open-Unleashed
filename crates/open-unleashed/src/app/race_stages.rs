@@ -257,6 +257,12 @@ impl App {
                     Option<u32>,
                     i32,
                 )>> = rec_resolved.as_ref().map(|l| l.iter().map(|(e, r)| (e.clone(), r.paint, r.name.clone(), r.skill.map(|k| (r.difficulty, k)), r.grid, r.decal)).collect());
+                // the colours beside the exterior, per slot: a playback's recorded ones, a drawn opponent's
+                // (`CareerOpponent::livery`, 0x4F4FA0 / 0x4EC1A0), else `None` = rebuilt from the exterior
+                let mut plan_liv: Vec<Option<Paint>> = match &rec_resolved {
+                    Some(l) => l.iter().map(|(_, r)| r.livery.map(|v| Paint { exterior: r.paint, stripe1: v.stripe1, stripe2: v.stripe2, interior: v.interior, package: v.package })).collect(),
+                    None => self.career_opponents.as_ref().map(|l| l.iter().map(|o| o.livery).collect()).unwrap_or_default(),
+                };
                 let rec_parts: Option<Vec<Vec<nfs_formats::career::Part>>> = rec_resolved.as_ref().map(|l| {
                     l.iter().map(|(_, r)| r.parts.as_ref().map(|ids| ids.iter().filter_map(|id| parts_table.iter().find(|p| p.id == *id).cloned()).collect()).unwrap_or_default()).collect()
                 });
@@ -309,6 +315,7 @@ impl App {
                             c.side.personalities = Some(drawn.iter().map(|p| *p as u16).collect());
                         }
                         plan_pers = list.iter().map(|o| o.personality).collect();
+                        plan_liv = list.iter().map(|o| o.livery).collect();
                         list.into_iter()
                             .map(|o| (o.car, o.paint, o.name, (o.personality != 0).then_some((o.difficulty, o.skill)), None, o.decal))
                             .collect()
@@ -363,6 +370,10 @@ impl App {
                         let colour = rec.num(cid::COLOUR).map_or(p.1, rgb);
                         p.0 = e.clone();
                         p.1 = colour;
+                        // another car now: the drawn livery no longer fits it
+                        if let Some(l) = plan_liv.get_mut(k) {
+                            *l = None;
+                        }
                         p.2 = text(cid::LICENSE).filter(|l| !l.is_empty()).or_else(|| room_names.get(k).cloned()).unwrap_or_default();
                         if let Some(g) = self.net_seat_grids.get(k).copied().flatten() {
                             p.4 = Some(g);
@@ -390,6 +401,7 @@ impl App {
                                 grid: *grid,
                                 decal: *decal,
                                 personality: plan_pers.get(g).copied().unwrap_or(0),
+                                livery: plan_liv.get(g).copied().flatten().map(|l| nfs_game::replay::Livery { stripe1: l.stripe1, stripe2: l.stripe2, interior: l.interior, package: l.package }),
                                 difficulty: skill.map_or(0.0, |k| k.0),
                                 skill: skill.map(|k| k.1),
                                 parts: self.career_opponents.as_ref().and_then(|l| l.get(g)).map(|o| o.parts.iter().map(|p| p.id).collect()),
@@ -427,7 +439,7 @@ impl App {
                     ) else {
                         continue;
                     };
-                    let mut paint = Paint::matching(entry, *paint);
+                    let mut paint = plan_liv.get(slot).copied().flatten().unwrap_or_else(|| Paint::matching(entry, *paint));
                     // `.COLORCONFIG` (exterior, stripe 1, stripe 2, interior) and `.STRIPEPACKAGE`
                     if let Some(rec) = seat_rec
                         && let Some(cc) = rec.array(nfs_net::launchcar::id::COLORCONFIG).filter(|a| a.len() == 4)

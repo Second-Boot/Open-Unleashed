@@ -109,3 +109,26 @@ fn traffic_quad_is_lowered_by_the_lod1_half_height() {
     assert!(half.y > 0.5, "{half:?}");
     assert!(pts[..4].iter().all(|p| (p.y + half.y).abs() < 0.01), "{:?}", &pts[..4]);
 }
+
+/// CAR-GAP: the car–car box `car+0x3A8…+0x3B0` is no bigger than the car that is drawn. 0x445090
+/// keeps only `0.5·(max − min)` of LOD 5's box (0x532330 / 0x532360, the centre is dropped) and
+/// 0x496FD0 centres it on `car+0x330`, which the draw puts `car+0x3AC` above the model's ground
+/// (0x43A410): on every face the box lies within a few centimetres of the drawn (LOD 1) model's own
+/// extent — the mirrors and LOD 1's slightly wider sills even poke out. What is left between two
+/// cars at the first contact is the model's rounded plan corners inside the box's square ones
+/// (`car-model.md` §12, CAR-GAP: 0.2…0.3 m along a diagonal), the original's shape.
+#[test]
+fn a_racers_box_is_the_drawn_models_extent() {
+    for model in ["993", "356_1", "550", "930", "959", "996", "Boxster", "GT1"] {
+        let Ok(paths) = GamePaths::locate() else { return };
+        let Ok(car) = CarAssets::load(&paths, model) else { return };
+        let car = car.with_style(0);
+        let (_, half) = nfs_game::world::car_body(&car, false);
+        let (lo, hi) = nfs_game::world::car_model_box(&car, 1);
+        // the box centred on the body origin, in the model's frame: x and z about 0, y over [0, 2h]
+        let faces = [(half.x, hi.x), (half.x, -lo.x), (half.z, hi.z), (half.z, -lo.z), (2.0 * half.y, hi.y - lo.y)];
+        for (i, (b, m)) in faces.into_iter().enumerate() {
+            assert!(b - m < 0.06, "{model}: box face {i} at {b:.3} stands {:.3} m outside the drawn model ({m:.3})", b - m);
+        }
+    }
+}

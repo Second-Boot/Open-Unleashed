@@ -546,7 +546,19 @@ impl App {
         // carries the running series (and a tournament's running event, 0x503940)
         self.launch_save();
         let Some(m) = self.fe.menu.as_ref() else { return };
-        let look = PlayerLook::from_menu(m, &car);
+        let mut look = PlayerLook::from_menu(m, &car);
+        // **A garage car brings its own colours and number** — 0x4EB710 hands 0x4EEDA0 the owned `FECar`
+        // itself for `zMergedList.Car`'s garage half (0x4F4DF0 true → slot 0x8C, 0x4EB87A…0x4EB8A9), and
+        // 0x4EEDA0 reads `.COLORCONFIG` / `.STRIPEPACKAGE` / `.RACENUMBER` from `FECar+0x674…0x688`
+        // (0x4EEFBA, 0x4EF0FA…0x4EF13C), not from the colour combo a catalogue car's fresh `FECar` takes
+        if m.car_garage
+            && let Some((e, o)) = self.garage_car().filter(|(e, _)| !e.paint_sets.is_empty())
+        {
+            let p = Self::paint_of(&e, &o);
+            look.paint = p.exterior;
+            look.owned_paint = Some(p);
+            look.owned_decal = Some(o.trim.decal);
+        }
         self.apply_player_look(look);
         // (`quick_knockout` is the arm's own above — 1 true, 0 and 2 false —, and `derby_track`'s
         // Smash Up code sets it at the track load below; a `false` here, as it stood until
@@ -1058,6 +1070,10 @@ impl App {
         // 0x414E63: step 8 in the race init 0x414DB0, before `Cars_create` 0x411130 (0x414E68) makes the cars
         self.race_loading_frame(&mut renderer, 8);
         let (table, rot, grid_place) = self.race_stage_grid(&mut renderer, &mut world, car_env, &mut driver_rand, factory_driver);
+        // **`srand(time(0))`** (0x418100, `H321Go`'s constructor, built with the HUD after the cars):
+        // the shared state the front end draws from after this race — the next opponents' rolls
+        // (0x4F4FA0), the market, the glints
+        nfs_game::layout::glints::crt_srand(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_secs() as u32));
         if let Some(h) =
             world
                 .collision
@@ -1071,7 +1087,10 @@ impl App {
         // (the same pick as the grid stage's, which holds it across its own `self` writes)
         let start_scene = if self.backwards { self.track.start_backward.as_ref().or(self.track.start_forward.as_ref()) } else { self.track.start_forward.as_ref() };
         let mut skill_start: Option<(Vec3, Vec3)> = None;
-        if let Some(sk) = &self.skill {
+        if let Some(sk) = self.skill.as_mut() {
+            // a restarted race (`restart_race`) finds the last attempt's progress: the original
+            // reads the scene afresh and starts at checkpoint id 1 (0x4876E0 / 0x410890)
+            sk.reset();
             // skill test: start pose from the type-2 trigger (0x410430), first arrow shown
             if let Some((pos, fwd)) = sk.start_pose() {
                 skill_start = Some((pos, fwd));
@@ -1182,6 +1201,11 @@ impl App {
         // `Car_init` 0x410C74: the lamp byte `car+0xD87` starts at 3 (the headlights) on a night
         // track, else 0; the headlights' ramp starts clear (`HeadRamp`)
         self.lamp_bits = if self.track.is_night() { 3 } else { 0 };
+        // **TEST GLUE** `NFS_LAMPS=toggle`: start with the lamp byte XORed by the lights key's toggle
+        // (`lamp_command` code 13, `car+0xD87 ^= 3`, 0x49941D) — stills of a daytime race with the lamps on
+        if std::env::var("NFS_LAMPS").is_ok_and(|v| v == "toggle") {
+            self.lamp_bits = lamp_command(self.lamp_bits, 13);
+        }
         self.head_ramp = HeadRamp::default();
         self.hud_hidden = false;
         tracing::info!(pos = ?self.car_pos, "car placed");

@@ -37,6 +37,17 @@ pub fn crt_srand(seed: u32) {
     HOLDRAND.with(|h| h.set(seed));
 }
 
+/// Hands the shared state to a caller that draws through a [`crate::rng::CRand`] (0x4F4FA0's
+/// opponent rolls, 0x4E3160's driver draw) and keeps what it left: one stream, as in the original.
+pub fn with_crt<R>(f: impl FnOnce(&mut crate::rng::CRand) -> R) -> R {
+    HOLDRAND.with(|h| {
+        let mut c = crate::rng::CRand::new(h.get());
+        let r = f(&mut c);
+        h.set(c.state());
+        r
+    })
+}
+
 /// The header's and the car logo's sweep (0x4CB024…0x4CB0F6, 0x4C1CE0…0x4C1DAF).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sweep {
@@ -267,6 +278,14 @@ mod tests {
         crt_srand(1);
         // MSVC's first three from the default seed
         assert_eq!([crt_rand(), crt_rand(), crt_rand()], [41, 18467, 6334]);
+    }
+
+    #[test]
+    fn a_crand_borrowed_through_with_crt_continues_and_leaves_the_shared_state() {
+        crt_srand(1);
+        let first = with_crt(|c| [c.next(), c.next()]);
+        assert_eq!(first, [41, 18467]);
+        assert_eq!(crt_rand(), 6334, "the next draw continues where the borrowed stream stopped");
     }
 
     #[test]

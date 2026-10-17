@@ -176,6 +176,7 @@ impl App {
                 room_car_half: None,
                 garage_shadow_prev: None,
                 garage_shadow_tex: None,
+                blob_shadow: None,
                 victory_movie: None,
                 track_room: None,
                 room_obj: None,

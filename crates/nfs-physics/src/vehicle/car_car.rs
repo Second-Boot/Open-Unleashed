@@ -127,7 +127,7 @@ const SEPARATION_PASSES: usize = 0x20;
 /// `v / (32 · |vA − vB|)` (0x497E4B…0x497FC0); otherwise the two move apart along the line of
 /// centres, A by `mB / (mA + mB) / 32`, B by `mA / (mA + mB) / 32` (0x497FC5…0x498079). The
 /// contact is the last overlapping pass's; none when the first pass finds the boxes clear.
-fn separate(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32) -> Option<(Vec3, Vec3)> {
+pub(crate) fn separate(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32) -> Option<(Vec3, Vec3)> {
     let mut contact = None;
     let (mut push_a, mut push_b) = (Vec3::ZERO, Vec3::ZERO);
     for _ in 0..SEPARATION_PASSES {
@@ -300,10 +300,13 @@ fn pair_impulse(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, pt: 
         let (t_a, t_b) = (turn(a, mass_a, eff_a), turn(b, mass_b, eff_b));
         let w_a = w_a + r_a.cross(imp) * (t_a * inv6_a);
         let w_b = w_b - r_b.cross(imp) * (t_b * inv6_b);
-        // back to turns/s; `Damage`'s crash response (0x496F8E / 0x496FB9) runs on those, and
-        // the clamp waits for the whole pair (`collide_cars_with`).
-        a.angular_velocity = w_a / TAU;
-        b.angular_velocity = w_b / TAU;
+        // `Damage`'s crash response (0x496F8E / 0x496FB9) runs **inside** the solver, so on the
+        // rad/s spin (the original's own `Damage` entry reads 2π times the turns/s that the tick
+        // ends with — a live sign hit: (2.50, 1.43, 5.06) at the call, (0.40, 0.23, 0.81) after —
+        // `RE/notes/REFERENCE-2026-10-17-SIGN.md`); it is converted back to turns/s as 0x498FF0
+        // does when the pair returns, and the clamp waits for the whole pair (`collide_cars_with`).
+        a.angular_velocity = w_a;
+        b.angular_velocity = w_b;
         // 0x496F1E / 0x496F25: `word car+0x418` steps for both bodies
         a.airborne_count = a.airborne_count.wrapping_add(1);
         b.airborne_count = b.airborne_count.wrapping_add(1);
@@ -330,6 +333,36 @@ fn pair_impulse(a: &mut Vehicle, mass_a: f32, b: &mut Vehicle, mass_b: f32, pt: 
         let dn = if ni == Vec3::ZERO { Vec3::Y } else { (a.position - b.position).normalize() };
         a.damage_by_normal(eff_a, dn, 2, mass_a);
         b.damage_by_normal(eff_b, -dn, 2, mass_b);
+        a.angular_velocity /= TAU;
+        b.angular_velocity /= TAU;
         Some((eff_a, eff_b))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The first impulse of a live hit on the original (alps SIGN 0 hit by car 993 at 13.9 m/s, the
+    /// solver's entry at tick 6254, `REFERENCE-2026-10-17-SIGN.md`): the numerator at 0x4969DF read
+    /// 13.8968 = `(vB − vA)·n` plus the spin terms (−0.0066), the quotient `j` = 11.3507, and the
+    /// sign's velocity at the `Damage` call 11.35 along `n` — the denominator 1.2243 is this
+    /// function's `den` to four digits. (An earlier note's "closing speed 11.8" was `j` times a
+    /// guessed denominator, not a measurement.)
+    #[test]
+    fn the_impulse_of_a_live_sign_hit_is_the_originals() {
+        let (ma, mb) = (0.625f32, 10.3125);
+        let mut sign = Vehicle::bare(Vec3::new(-158.848, 3.5715, 193.4924), Mat3::IDENTITY, 0.0, 80.0, 0.0, 0.0);
+        sign.smackable = true;
+        let mut car = Vehicle::bare(Vec3::new(-157.82, 2.2570, 196.0780), Mat3::IDENTITY, 2.5, 1300.0, 0.8, 0.3);
+        car.velocity = Vec3::new(-5.1303, -0.85415, -12.8956);
+        car.angular_velocity = Vec3::new(-0.035889, 0.0000917, 0.0061115) / TAU;
+        let pt = Vec3::new(-158.23468, 1.9708, 194.00198);
+        let ni = Vec3::new(-0.369168, -0.0465407, -0.928197);
+        pair_impulse(&mut sign, ma, &mut car, mb, pt, ni).unwrap();
+        // the sign's velocity change along n is j (·0.5·invM·1.25 = 1.0 here), plus the crash
+        // response's lift (y only, `n.y` = −0.047 of it)
+        let dj = sign.velocity.dot(ni);
+        assert!((dj - 11.3507).abs() < 0.4, "{dj}");
     }
 }

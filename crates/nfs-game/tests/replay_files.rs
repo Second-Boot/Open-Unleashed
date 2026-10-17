@@ -3,7 +3,9 @@
 //! The fixtures in `tests/data/` were written by master 059e30ae: the three `.prpl` / `.rpl` pairs by
 //! autotest races (`porsche <track> 993 --autotest 8 --opponents 3`, the save dir a copy of
 //! `fe_save_pristine`), `8DRIVER.sav` the profile of that save dir. The digests below are what the
-//! master readers made of them; a reader change must keep every one.
+//! master readers made of them; a reader change must keep every one. Re-pinned 2026-10-17 for
+//! `CarRecord::livery` (file version 4): the `Debug` digests now print `livery: None`, and a written
+//! file is version 4; the `.rpl` bytes the port writes are unchanged.
 use nfs_game::replay::{self, CarRecord, NetSeat, NetSetup, NetTraffic, ReplayFile, ReplaySetup};
 
 /// FNV-1a 64 — a stable digest with no dependency.
@@ -31,9 +33,9 @@ fn prefix_digest(d: &[u8]) -> u64 {
 const TRACKS: [&str; 3] = ["alps", "coastal", "monaco1"];
 
 /// `(parse, every prefix)` digests of the master-written `.prpl`s.
-const PRPL: [(u64, u64); 3] = [(0x8000_bcc6_0098_e11d, 0xecda_19ea_6d7e_103f), (0x4115_f424_a0c4_d7b5, 0xbe69_8ab1_9bab_70b7), (0xd079_1b3e_68de_f957, 0x64f4_86ec_d2e7_15b0)];
+const PRPL: [(u64, u64); 3] = [(0x43ea_bfd6_2d29_d175, 0xe8e8_307e_d5d0_a7c2), (0x236e_1679_da5d_7a9f, 0xb47f_b2d2_a69c_695e), (0x1715_9e98_b827_5349, 0x7d4d_19a4_d42a_a5e4)];
 /// `parse_original_rpl` digest of the master-written `.rpl`s, and of the prefixes around the snapshot.
-const RPL: [(u64, u64); 3] = [(0x2bad_1122_ee80_d895, 0xab3a_b630_60d8_21d2), (0x42a8_0de9_7c60_32e3, 0x1be7_a3d3_1b23_49dd), (0x42e6_6698_7107_5dad, 0x2079_bb1a_bcfa_17d5)];
+const RPL: [(u64, u64); 3] = [(0xd18d_cda9_909d_b7f9, 0x6ebb_e837_b2c4_86b0), (0x7c95_afea_5e84_8805, 0x922f_4163_1c6f_62e7), (0x85d3_c26a_6625_afe3, 0x8521_87d5_04d8_ab1d)];
 
 #[test]
 fn master_written_port_replays_parse_and_reserialise_to_the_same_bytes() {
@@ -41,7 +43,12 @@ fn master_written_port_replays_parse_and_reserialise_to_the_same_bytes() {
     for t in TRACKS {
         let d = data(&format!("replays/{t}.prpl"));
         let f = ReplayFile::parse(&d).unwrap_or_else(|| panic!("{t}.prpl parses"));
-        assert_eq!(f.write(), d, "{t}.prpl re-serialises byte for byte");
+        // the fixtures are version 3 (no livery byte): they read with every livery absent, and the
+        // version-4 file written from them reads back to the same thing
+        assert_eq!(u32::from_le_bytes(d[8..12].try_into().unwrap()), 3);
+        let cars = f.setup.player.iter().chain(f.setup.opponent_cars.iter().flatten());
+        assert!(cars.into_iter().all(|c| c.livery.is_none()), "{t}.prpl: a version-3 record has no livery");
+        assert_eq!(ReplayFile::parse(&f.write()).as_ref(), Some(&f), "{t}.prpl round-trips through version 4");
         let got = (digest(&f), prefix_digest(&d));
         println!("prpl {t}: {got:#x?}");
         all.push(got);
@@ -80,6 +87,7 @@ fn net_file() -> ReplayFile {
         part_damage: vec![1.0, 2.0, 3.0],
         damage: [1.0; 10],
         setup: Some([0.5; 17]),
+        livery: None,
     };
     let net = NetSetup {
         local_index: 1,
@@ -126,7 +134,7 @@ fn net_file() -> ReplayFile {
 /// A network race's file with every optional section (`NetSetup` with seats / traffic / camera0 /
 /// own words / fe.txt, the launch block, the car records, the mission): the bytes master wrote and
 /// what the reader makes of every prefix.
-const NET: (u64, u64, u64, u64) = (0x9ce6_5b05_95cc_1440, 0x411d_26ab_eafd_1e76, 0x936e_708d_316a_5f17, 0x4581_ef48_cd1d_32d3);
+const NET: (u64, u64, u64, u64) = (0x4892_63f3_7273_cb45, 0x00cf_7cc0_4e1b_17b8, 0x936e_708d_316a_5f17, 0x4581_ef48_cd1d_32d3);
 
 #[test]
 fn a_network_replay_reads_back_as_master_wrote_it() {

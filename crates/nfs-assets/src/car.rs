@@ -101,6 +101,21 @@ impl Paint {
         Self { exterior: p.colours[0], stripe1: first.colours[1], stripe2: first.colours[2], interior: entry.interior_colours.first().copied().unwrap_or(p.colours[0]), package: 0 }
     }
 
+    /// The livery a drawn opponent or market car carries into `FECar::init` 0x4EEBA0 (`0x4F4FA0`,
+    /// `car-model.md` §5.4): ExtColour, S1Colour and S2Colour are the words `rec+0x3EC`, `+0x3F0` and
+    /// `+0x3F4` of the **one drawn paint set** (0x4F5017…0x4F50F0; a record with no sets leaves all
+    /// three `0xFFFF0000`), IntColour the drawn interior row `rec+0x530+16·i` (`0xFFFFFFFF` while the
+    /// record lists none) and `package` the drawn `PackageNum`. Unlike [`Paint::from_catalogue`] the
+    /// stripes follow the drawn set, not set 0.
+    pub fn drawn(entry: &nfs_formats::fedata::CarCatalogEntry, set: usize, interior: usize, package: u32) -> Self {
+        let (exterior, stripe1, stripe2) = match entry.paint_sets.get(set) {
+            Some(p) => (p.colours[0], p.colours[1], p.colours[2]),
+            None => ([0xFF, 0, 0], [0xFF, 0, 0], [0xFF, 0, 0]),
+        };
+        let interior = entry.interior_colours.get(interior).copied().unwrap_or([0xFF; 3]);
+        Self { exterior, stripe1, stripe2, interior, package }
+    }
+
     /// A garage car: paint set `set`'s exterior, interior row `interior`, stripe 1 from paint set
     /// `stripe1`'s colour 1 and stripe 2 from `stripe2`'s colour 2 — the rows the paint shop's
     /// `OwnedCar.*Colour` lists offer (`savegame.md` §4.7a) — and `package` (`OwnedCar.PackageNum`).

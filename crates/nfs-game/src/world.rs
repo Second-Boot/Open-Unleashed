@@ -2645,11 +2645,14 @@ pub fn smackable_spawn(track: &TrackAssets, art: &nfs_assets::track::ArticleMesh
     let local = Mat4::from_scale(inst.scale);
     let verts: Vec<Vec3> = art.meshes.iter().flat_map(|mm| mm.mesh.vertices.iter().map(|v| local.transform_point3(Vec3::from(v.position)))).collect();
     let (_, rot, pos) = inst.transform.to_scale_rotation_translation();
+    // 0x483360: the record's points are centred and its position moves by the centre
+    let mut points = nfs_physics::smackable::point_cloud(&verts);
+    let position = nfs_physics::smackable::centre_record(&mut points, pos);
     Some(SmackableSpawn {
         owner: SmackableOwner::Element(inst.element),
-        position: pos,
+        position,
         orientation: glam::Mat3::from_quat(rot).transpose(),
-        points: nfs_physics::smackable::point_cloud(&verts),
+        points,
         mass: def.mass,
         audio_type: def.audio_type_index().unwrap_or(0),
     })
@@ -2669,11 +2672,13 @@ pub fn track_smackable_spawn(track: &TrackAssets, art: &nfs_assets::track::Artic
     let rows = [tr.x_axis.truncate(), tr.y_axis.truncate(), tr.z_axis.truncate()];
     let lengths = Vec3::new(rows[0].length(), rows[1].length(), rows[2].length());
     let verts: Vec<Vec3> = art.meshes.iter().flat_map(|mm| mm.mesh.vertices.iter().map(|v| Vec3::from(v.position))).collect();
-    let points = if def.tag.eq_ignore_ascii_case("SIGN") { nfs_physics::smackable::sign_point_cloud(&verts, lengths) } else { nfs_physics::smackable::point_cloud(&verts) };
+    let mut points = if def.tag.eq_ignore_ascii_case("SIGN") { nfs_physics::smackable::sign_point_cloud(&verts, lengths) } else { nfs_physics::smackable::point_cloud(&verts) };
+    // 0x483360: the record's points are centred and its position moves by the centre
+    let position = nfs_physics::smackable::centre_record(&mut points, tr.w_axis.truncate());
     let unit = |v: Vec3| v.normalize_or_zero();
     Some(SmackableSpawn {
         owner: SmackableOwner::Article(art.index),
-        position: tr.w_axis.truncate(),
+        position,
         orientation: glam::Mat3::from_cols(unit(rows[0]), unit(rows[1]), unit(rows[2])).transpose(),
         points,
         mass: def.mass,
@@ -3091,6 +3096,17 @@ pub fn track_props(track: &TrackAssets) -> Vec<nfs_physics::props::Prop> {
         // (`[bundle+0xC] = 0`, so `0x488090` never calls `0x4750B0` for it, 0x48838B) — no
         // collision object either
         if matches!(track.crp.bundle_of(&track.crp_data, a), Ok(nfs_formats::crp::BundleKind::Anim | nfs_formats::crp::BundleKind::MidGround)) {
+            continue;
+        }
+        // A scene-library article (`'tr'` ∧ `Base.flags & 0x8000`, e.g. `EndWall`, `ExplodingBox`,
+        // `Crabcrate_Rigid03`) is a *template* the `.scn` GEOM elements spawn from, not an object of
+        // the track: `WInstanceBundle::Load` 0x4781A0 parks it in its auxiliary `+0x34` table, never
+        // in the `+0x18`/`+0x1C` pair `0x4750B0` walks (`track_tree_order`, "Library articles are
+        // excluded"). Its collision object exists only where a scene element places it
+        // ([`scene_props`]). Without this gate `Car_propPass`' "every prop is tried" loop collided
+        // with the template at its own `tr` — `EndWall`'s 12 m box at the world origin was an
+        // invisible wall across the `0M01` skidpad course (`RE/notes/skill-tests.md` §14, FD-WALL).
+        if track.crp.is_scene_member(&track.crp_data, a).unwrap_or(false) {
             continue;
         }
         let Some(def) = track.animdefs.lookup(b.tag_u32()) else { continue };

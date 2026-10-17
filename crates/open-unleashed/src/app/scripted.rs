@@ -663,6 +663,31 @@ impl App {
             v.velocity = to * 12.0;
             tracing::info!(target: "open_unleashed::app::simulate", k, article, ?pos, "NFS_SMACK_DRIVE: the car set at the smackable");
         }
+        // **TEST GLUE** `NFS_SMACK_RAM=k@t:deg`: on game tick `t` the player's car is sent along its own
+        // heading at 12 m/s and the track's k-th smackable is set down 6 m ahead of it, on the car's
+        // ground, its face turned `deg` degrees off head-on — the same scenario the reference run
+        // sets up on the original by memory writes (`RE/notes/REFERENCE-2026-10-17-SIGN.md`)
+        if let Some((k, t, deg)) = nfs_game::config::cfg().nfs_smack_ram.as_str().and_then(|s| {
+            let (k, rest) = s.split_once('@')?;
+            let (t, deg) = rest.split_once(':')?;
+            Some((k.trim().parse::<usize>().ok()?, t.trim().parse::<u64>().ok()?, deg.trim().parse::<f32>().ok()?))
+        }) && self.tick == t
+            && let Some(p) = self.smackables.props.get_mut(k)
+        {
+            let fwd = v.orientation.row(2);
+            let h = Vec3::new(fwd.x, 0.0, fwd.z).normalize_or(Vec3::Z);
+            let ang = |a: Vec3| a.z.atan2(a.x);
+            let rows = [p.body.orientation.row(0), p.body.orientation.row(1), p.body.orientation.row(2)];
+            let d = ang(-h) + deg.to_radians() - ang(rows[2]);
+            let (s, c) = d.sin_cos();
+            let rot = |a: Vec3| Vec3::new(a.x * c - a.z * s, a.y, a.x * s + a.z * c);
+            let o = glam::Mat3::from_cols(rot(rows[0]), rot(rows[1]), rot(rows[2])).transpose();
+            let low = p.body.body_points.iter().map(|q| q.y).fold(f32::MAX, f32::min);
+            let at = Vec3::new(v.position.x + h.x * 6.0, v.ground_h - low + 0.088866, v.position.z + h.z * 6.0);
+            p.relocate(&w.collision, at, o);
+            v.velocity = Vec3::new(h.x * 12.0, v.velocity.y, h.z * 12.0);
+            tracing::info!(target: "open_unleashed::app::simulate", k, ?at, ?h, "NFS_SMACK_RAM: the smackable set ahead of the car");
+        }
         // diagnostic: `NFS_PHANTOM_DRIVE=x,y,z,hx,hz[@t]` sets the player's car down 8 m short of the
         // world point (x, y, z), heading (hx, hz) at 12 m/s on game tick `t` (default 600) — to drive
         // into a place whose collision geometry is in question (the `--record` csv shows a stop)

@@ -37,6 +37,12 @@ pub struct CareerOpponent {
     /// same day): its decal *is* drawn, the same two-roll shape as the market's own
     /// (`nfs_game::career::used_car_trim`), not left at −1.
     pub decal: i32,
+    /// The livery `FECar::init` 0x4EEBA0 was handed — S1 / S2 / IntColour / PackageNum beside the
+    /// exterior — when the constructor draws them (`nfs_assets::car::Paint::drawn`, `car-model.md`
+    /// §5.4): a quick-race / knockout opponent (0x4F4FA0), a mission opponent (0x4EC1A0) and a
+    /// tournament / finale opponent (0x4EBDA0, from the record's own fields).
+    /// `None` = the race rebuilds the paint from the exterior colour (`Paint::matching`).
+    pub livery: Option<nfs_assets::car::Paint>,
 }
 
 /// Everything the app needs to start a career event.
@@ -69,6 +75,10 @@ pub struct StartRequest {
     pub traffic_ids: Option<Vec<u16>>,
     /// The player's 0-based grid slot (`STARTINGPOS − 1`), when the event sets one.
     pub player_grid: Option<u32>,
+    /// The player's `FECar::init` livery and race number when the launch builds a fresh car with its
+    /// own — a Factory Driver mission (0x51AA50: ExtColour / IntColour = bswap(`+0xA0` / `+0xB0`),
+    /// S1 = S2 = `+0xBC`, DecalNum = `+0xBE`); `None` = the catalogue's paint-set match.
+    pub player_livery: Option<(nfs_assets::car::Paint, i8)>,
 }
 
 /// `[0x5DB438]` / `[0x5DB448]` — traffic level → number of cars for career events (`traffic.md` §1).
@@ -400,6 +410,18 @@ impl CareerUi {
         self.mission_request(idx)
     }
 
+    /// The livery `FECar::init` 0x4EEBA0 stores for mission `m`'s car (0x51AA50, see `mission_request`):
+    /// the paint and the decal number (`+0xBE`, signed). Both the race car and the factory-drive
+    /// screen's one FE car (`[0x69C8C8]`, built by 0x51AA60 → 0x4EE3B0 from the same block;
+    /// `FactoryDriver.Car`'s slots 29…34 read it back from `FECar+0x674…0x688`) wear it.
+    pub fn mission_livery_of(m: &nfs_formats::career::Mission) -> (nfs_assets::car::Paint, i8) {
+        let rgb = |c: [u8; 4]| [c[1], c[2], c[3]];
+        let stripe = rgb((m.colour_index_bc as i32 as u32).to_be_bytes());
+        let paint = rgb(m.colours[0]);
+        let livery = nfs_assets::car::Paint { exterior: paint, stripe1: stripe, stripe2: stripe, interior: rgb(m.colours[4]), package: 0 };
+        (livery, m.colour_index_be as i8)
+    }
+
     /// Mission `idx`'s race as the type-9 launch builds it (0x4EB470 / 0x4ECDF0 / 0x4EC040 /
     /// 0x4ECF00 over the record 0x51AE80 returns), marked pending. `NFS_MISSION=<idx>` overrides the
     /// mission (smoke runs).
@@ -419,15 +441,12 @@ impl CareerUi {
             self.message = format!("UNKNOWN TRACK {}", m.track_id);
             return None;
         };
-        let c = m.colours[0];
-        let paint = if c[..3] == [0, 0, 0] {
-            car.paint_sets
-                .first()
-                .map(|p| p.colours[0])
-                .unwrap_or([0xD4, 0x10, 0x10])
-        } else {
-            [c[0], c[1], c[2]]
-        };
+        // 0x51AA50 (0x51AAB9…0x51AB62) hands the car constructor 0x4EE3B0 → FECar::init 0x4EEBA0 the
+        // record's dwords byte-swapped (`b0<<24|b1<<16|b2<<8|b3`, i.e. 0xAARRGGBB with the file's byte 0
+        // the alpha): ExtColour = `+0xA0`, IntColour = `+0xB0`, S1 = S2 = the sign-extended i16
+        // `+0xBC`, PackageNum literal 0, DecalNum = the sign-extended i16 `+0xBE`; 0x4EEBA0 stores
+        // them at FECar+0x674…0x688 untouched (no "default" test: `ff000000` is a black paint).
+        let (livery, decal) = Self::mission_livery_of(&m);
         let parts: Vec<Part> = m
             .parts
             .iter()
@@ -473,7 +492,7 @@ impl CareerUi {
         Some(StartRequest {
             track_file: track.file.clone(),
             car,
-            paint,
+            paint: livery.exterior,
             laps: m.laps.max(1) as u32,
             backwards: m.backwards,
             mirror: false,
@@ -487,6 +506,7 @@ impl CareerUi {
             traffic: CAREER_TRAFFIC[(m.traffic_level.max(0) as usize).min(3)],
             traffic_ids: None,
             player_grid: None,
+            player_livery: Some((livery, decal)),
             skill: m.skill.clamp(0, 2) as u8,
         })
     }
@@ -510,9 +530,11 @@ impl CareerUi {
             .unwrap_or([[1.0, 0.0]; 4]);
         let (paint_set, trim) = nfs_game::career::used_car_trim(car.paint_sets.len(), car.interior_colours.len(), self.tables.package_count, rand, crt);
         let paint = car.paint_sets.get(paint_set as usize).map(|p| p.colours[0]).unwrap_or([0x20, 0x40, 0xC0]);
+        let livery = Some(nfs_assets::car::Paint::drawn(&car, paint_set as usize, trim.interior as usize, trim.package as u32));
         Some(CareerOpponent {
             car,
             paint,
+            livery,
             name: self.tables.driver_name(per),
             difficulty: 1.0,
             skill,
@@ -1299,16 +1321,25 @@ impl CareerUi {
                     .find(|p| p.id == o.driver)
                     .map(|p| p.skill)
                     .unwrap_or([[1.0, 0.0]; 4]);
-                let c = o.colours[0];
-                // opponent colour record is RGBA (bytes r g b a); an all-zero entry means "catalogue default"
-                let paint = if c[..3] == [0, 0, 0] {
+                // 0x4EBDA0 (0x4EBE50…0x4EBEC1) hands FECar::init the record's dwords byte-swapped
+                // (`b0<<24|b1<<16|b2<<8|b3`), i.e. 0xAARRGGBB with the file's byte 0 the alpha
+                // (the catalogue's colour dwords have the same shape, `parse_car_catalog` reads
+                // bytes 1..3): ExtColour = `+0x34`, IntColour = `+0x44`; S1 = S2 = the sign-extended
+                // i16 at `+0x50` as a dword; PackageNum literal 0 (`car-model.md` §5.3 / §5.4).
+                let rgb = |d: u32| [(d >> 16) as u8, (d >> 8) as u8, d as u8];
+                let word = |c: [u8; 4]| u32::from_be_bytes(c);
+                let ext = rgb(word(o.colours[0]));
+                let stripe = rgb(o.unknown_50 as i32 as u32);
+                // an all-zero entry means "catalogue default" (the shipped table has none)
+                let paint = if ext == [0, 0, 0] {
                     car.paint_sets
                         .first()
                         .map(|p| p.colours[0])
                         .unwrap_or([0x20, 0x40, 0xC0])
                 } else {
-                    [c[0], c[1], c[2]]
+                    ext
                 };
+                let livery = Some(nfs_assets::car::Paint { exterior: paint, stripe1: stripe, stripe2: stripe, interior: rgb(word(o.colours[4])), package: 0 });
                 Some(CareerOpponent {
                     car,
                     paint,
@@ -1321,6 +1352,8 @@ impl CareerUi {
                     // `.RACENUMBER` is the table's own field, not a draw (`car-model.md` §5.3,
                     // `nfs_formats::career::TournamentOpponent::decal`, `0x4EBDA0` read 2026-09-27)
                     decal: o.decal as i32,
+                    // 0x4EBDA0 builds the colours from the table's own fields, not a draw
+                    livery,
                 })
             })
             .collect();
@@ -1379,6 +1412,7 @@ impl CareerUi {
                 None => CAREER_TRAFFIC[(t.traffic_level as usize).min(3)],
             },
             player_grid: ranks.map(|r| r[0] - 1),
+            player_livery: None,
             traffic_ids: t
                 .custom_traffic
                 .as_ref()

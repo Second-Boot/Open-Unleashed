@@ -171,6 +171,7 @@ switches! {
     nfs_sky_level = "NFS_SKY_LEVEL",
     nfs_slow_log = "NFS_SLOW_LOG",
     nfs_smack_drive = "NFS_SMACK_DRIVE",
+    nfs_smack_ram = "NFS_SMACK_RAM",
     nfs_smack_view = "NFS_SMACK_VIEW",
     nfs_sprite_selftest = "NFS_SPRITE_SELFTEST",
     nfs_sun_view = "NFS_SUN_VIEW",

@@ -53,10 +53,13 @@ impl App {
         let (opp_choice, n) = (m.opp_car as u32, m.ko_opponents as i32);
         let catalog = self.fe_car_catalog();
         let selected = catalog.iter().position(|c| c.id == car_id).unwrap_or(0);
-        let mut crand = nfs_game::opponents::CRand::default();
-        let picks = Self::draw_opp_cars(&self.paths, opp_choice, &catalog, selected, &mut crand);
+        // on the C runtime's shared state (0x5A17C9), as the quick race's draw
+        let (picks, drawn) = nfs_game::layout::glints::with_crt(|crand| {
+            let picks = Self::draw_opp_cars(&self.paths, opp_choice, &catalog, selected, crand);
+            let drawn = Self::draw_drivers(&self.paths, self.race_skill, n.max(0) as usize, crand);
+            (picks, drawn)
+        });
         self.opp_cars = Self::opp_car_saves(&catalog, &picks);
-        let drawn = Self::draw_drivers(&self.paths, self.race_skill, n.max(0) as usize, &mut crand);
         let mut state = self.knockout_block();
         nfs_game::career::knockout_start(&mut state, n, &drawn);
         if let Some(c) = self.career.as_mut() {

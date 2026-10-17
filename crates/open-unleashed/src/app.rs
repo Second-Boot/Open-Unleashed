@@ -747,6 +747,10 @@ pub(crate) struct FrontEnd {
     pub(crate) garage_shadow_prev: Option<Mat4>,
     /// `Render/common.fsh`'s `FESH`, the garage's shadow map (0x4E9E4B), uploaded on first use
     pub(crate) garage_shadow_tex: Option<nfs_renderer::TextureId>,
+    /// The front-end cars' blob shadow (`R3DCar` slot 2 0x437AB0 → 0x43B820, front-end branch):
+    /// the quad `(±1, 0, ±1)` with 0x5CD5F0's uvs and a material over `Render/common.fsh`'s
+    /// `SHAD` (0x43B95A), built on first use — `App::fe_blob_shadow`
+    pub(crate) blob_shadow: Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)>,
     /// `FEVictory3DRoom`'s movie `[+0x2F0]` (`nfs_game::room::VictoryMovie`) and the front-end
     /// millisecond of its last render, while the room is `ID_VICTORY`
     pub(crate) victory_movie: Option<(nfs_game::room::VictoryMovie, u64)>,

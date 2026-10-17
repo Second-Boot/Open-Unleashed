@@ -94,6 +94,29 @@ pub fn class_for_audio(audio_type: u32) -> u32 {
     T.get(audio_type as usize).copied().unwrap_or(0x13)
 }
 
+/// `0x483360`'s centring of a smackable's record (called by 0x4772F0 after 0x476B30 / 0x476ED0,
+/// 0x477515): the bounding box of the points is taken per axis (min / max seeded `±1e8`,
+/// `0x4833F9…0x483419`), its centre `c = (min + max) / 2` (`[0x5B23F0]` = 0.5, 0x4834BD…0x4834DF)
+/// becomes the body's origin — every point loses `c` (`rec+0..8 = −c`, added to each point at
+/// 0x48352B…0x48356F) and the record's position `rec+0x28` is the item's position **plus `c`**
+/// (0x483503…0x483520: `item − (−c)`, `c` added as it is, not rotated by the item's matrix).
+/// So a sign (points 0 … 3.2 m up from its foot) stands on a body whose origin is its middle,
+/// 1.59 m up, and a cone (tip 0.74, base 0) on one 0.37 m up; the body then rotates about that
+/// centre, which is what the original's live records hold (the server's alps `SIGN` 0: position
+/// = the `tr` position + (0.04, 1.588, 0.01), points y ∈ ±1.588). Returns the record's position;
+/// `points` are centred in place.
+pub fn centre_record(points: &mut [Vec3], position: Vec3) -> Vec3 {
+    if points.is_empty() {
+        return position;
+    }
+    let (lo, hi) = points.iter().fold((Vec3::splat(1e8), Vec3::splat(-1e8)), |(a, b), p| (a.min(*p), b.max(*p)));
+    let c = (lo + hi) * 0.5;
+    for p in points.iter_mut() {
+        *p -= c;
+    }
+    position + c
+}
+
 /// `0x476ED0` — a smackable's collision points from its article's vertices (article frame):
 /// the vertices are split at the middle of the box's height (`y > mid` above, the rest below,
 /// 0x4770FC…0x477156), each half is reduced to its **convex hull in x–z** (0x5A0480), the upper
@@ -261,6 +284,21 @@ impl Smackable {
         s.body.tracker.refresh_plane();
         s.ground_h = s.susp_ai(grid);
         s
+    }
+
+    /// **TEST GLUE** (`NFS_SMACK_RAM`): sets the awake body down at `position` with `orientation`
+    /// (rows = the body axes), at rest, its tracker and ground read afresh — the in-game memory
+    /// writes of the reference run on the original (`REFERENCE-2026-10-17-SIGN.md`).
+    pub fn relocate(&mut self, grid: &TriangleGrid, position: Vec3, orientation: Mat3) {
+        self.body.position = position;
+        self.body.orientation = orientation;
+        self.body.velocity = Vec3::ZERO;
+        self.body.angular_velocity = Vec3::ZERO;
+        self.body.tracker = crate::collision::PatchTracker::new(position);
+        self.body.tracker.update_zone(grid, position);
+        self.body.tracker.refresh_plane();
+        self.ground_h = self.susp_ai(grid);
+        self.asleep = false;
     }
 
     /// The collision mass `car+0x354` in the original's units.
@@ -612,6 +650,55 @@ mod tests {
         let (long, short) = (run(4.4), run(0.9));
         assert!(long > 1.0, "the long body climbs: {long}");
         assert!(short < 0.1, "the short one settles: {short}");
+    }
+
+    /// 0x483360 centres a record on its points' bounding box: a sign's 3.2 m of points sit
+    /// ±1.6 m about the body origin, which is the item's position plus the centre (the server's
+    /// alps `SIGN` 0: position = the `tr` position + (0.04, 1.588, 0.01), points y ∈ ±1.588).
+    #[test]
+    fn a_record_is_centred_on_its_points() {
+        let mut pts = vec![Vec3::new(-0.72, 1.69, 0.15), Vec3::new(-0.02, 0.0, 0.17), Vec3::new(0.79, 3.18, -0.15)];
+        let at = centre_record(&mut pts, Vec3::new(88.5, 15.85, -5212.87));
+        assert!((at - Vec3::new(88.535, 17.44, -5212.86)).abs().max_element() < 1e-3, "{at:?}");
+        let (lo, hi) = pts.iter().fold((Vec3::splat(1e8), Vec3::splat(-1e8)), |(a, b), p| (a.min(*p), b.max(*p)));
+        assert!((lo + hi).abs().max_element() < 1e-5, "centred: {lo:?} {hi:?}");
+        assert!(centre_record(&mut [], Vec3::ONE) == Vec3::ONE);
+    }
+
+    /// A 13 m/s car into an 80 kg sign (collision mass 0.625) at its middle: the impact is over 80,
+    /// so `Damage`'s heavy arm runs **inside** the solver, on the spin in rad/s (the original's own
+    /// call sees (2.5, 1.4, 5.1) where the tick ends with 2π times less — a live hit,
+    /// `RE/notes/REFERENCE-2026-10-17-SIGN.md`). The sign leaves with the car's speed and a spin
+    /// under a turn a second; run on turns/s the same hit drew the random ±10 turns/s spin
+    /// (past 5 turns/s after the clamp) and made a 6-turn tumble.
+    #[test]
+    fn a_car_hits_a_sign_in_the_solvers_units() {
+        let grid = flat();
+        let mut pts = vec![];
+        for z in [-0.16f32, 0.16] {
+            for (x, y) in [(-0.76, 1.7), (0.76, 1.7), (0.76, 3.2), (-0.76, 3.2), (0.0, 0.0)] {
+                pts.push(Vec3::new(x, y, z));
+            }
+        }
+        let at = centre_record(&mut pts, Vec3::new(0.0, 0.1, 0.0));
+        let mut s = Smackable::new(at, Mat3::IDENTITY, pts, 80.0, 1, &grid);
+        s.asleep = false;
+        let mut car = Vehicle::bare(Vec3::new(0.0, 1.4, -2.5), Mat3::IDENTITY, 2.5, 1300.0, 0.8, 0.3);
+        car.half_extents = Vec3::new(0.9, 0.5, 2.2);
+        car.velocity = Vec3::new(0.0, 0.0, 13.0);
+        let mut others = [(&mut car, 1300.0f32 / 128.0)];
+        let mut hit = false;
+        for _ in 0..3 {
+            if !s.collide(&mut others, &mut |_| {}).is_empty() {
+                hit = true;
+                break;
+            }
+            others[0].0.position += others[0].0.velocity / 32.0;
+        }
+        assert!(hit, "the car reaches the sign");
+        let w = s.body.angular_velocity.abs().max_element();
+        assert!(w < 1.0, "{w} turns/s: {:?}", s.body.angular_velocity);
+        assert!(s.body.velocity.z > 13.0 && s.body.velocity.y > 3.0, "{:?}", s.body.velocity);
     }
 
     #[test]

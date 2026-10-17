@@ -193,7 +193,9 @@ pub struct DrawItem {
     /// scene — a car's blob shadow (slots 22 / 23, 0x43B820, ahead of the car's own parts): it is
     /// drawn in the opaque stage, in submission order, still blended and without depth writes, so
     /// the parts drawn after it paint over it whatever its depth bias pulled it to. The port's
-    /// stage split (sky, opaque, blended) is its own; the original draws in queue order.
+    /// stage split (sky, opaque, blended) is its own; the original draws in queue order. The
+    /// front end's 3-D views set it on every item (rooms, shadows, cars), so they draw in the
+    /// order they are submitted.
     pub early: bool,
     /// The draw's own Thrash state 0x18 — a state object's `+0x10` (0x537A60) set per draw, as the
     /// lamp glare's `fistp(b · −20000 · cam[+0xC] / d²)` (0x43D419…0x43D45C) — added to the
@@ -238,11 +240,16 @@ pub struct DrawItem {
     /// after reading the finished frame's pixels at the sun (`RE/notes/lighting.md` §7). The
     /// item's material must have no depth test.
     pub overlay: bool,
+    /// Drawn through a reflecting transform (a negative determinant): the winding flips, so the
+    /// item culls as a draw in a mirrored world does ([`Scene::mirror`]). `R3DCar` slot 3
+    /// **0x443490**, the front end's reflection draw (`car+0x471`, 0x4432E5), puts **0x467F90**
+    /// (`3 − cull` on the view) around itself for the same reason (0x4434A2 / 0x4435F0).
+    pub mirrored: bool,
 }
 
 impl DrawItem {
     pub fn new(mesh: MeshId, material: MaterialId, transform: Mat4) -> Self {
-        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, alpha_ref: 10, sky: None, main_view_only: false, sky_pass: false, fog_w: 0.0, fakesort_near: false, overlay: false }
+        Self { mesh, material, transform, light: [1.0; 3], alpha: 1.0, uv_offset: [0.0; 2], layer_light: None, headlit: false, uv_lit: false, shadow: None, early: false, depth_bias: 0, alpha_test: false, alpha_ref: 10, sky: None, main_view_only: false, sky_pass: false, fog_w: 0.0, fakesort_near: false, overlay: false, mirrored: false }
     }
 }
 

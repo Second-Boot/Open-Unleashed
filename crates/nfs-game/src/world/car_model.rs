@@ -97,6 +97,10 @@ pub struct CarModel {
     pub wheels: Vec<CarWheelModel>,
     pub bbox_min: Vec3,
     pub bbox_max: Vec3,
+    /// `car+0x3A8 / +0x3AC / +0x3B0`: half the box 0x445090 takes from the LOD-5 object
+    /// ([`car_model_box`]), which the front end's blob shadow spans (0x43B471…0x43B5A3). Zero
+    /// until a caller that has the assets sets it (the front end's loader, `fe_room_models`).
+    pub box_half: Vec3,
     pub wheel_radius: f32,
     pub half_track: f32,
     /// The car's lamps: every glare article's `ef` record and its mirrored copy
@@ -1272,6 +1276,7 @@ impl CarModel {
             wheels,
             bbox_min: min,
             bbox_max: max,
+            box_half: Vec3::ZERO,
             wheel_radius,
             half_track,
             lights,

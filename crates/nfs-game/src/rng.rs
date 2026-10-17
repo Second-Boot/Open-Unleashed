@@ -87,6 +87,10 @@ impl CRand {
         self.0 = crt_step(self.0);
         crt_out(self.0)
     }
+    /// The state word (what `srand` would set to continue from here).
+    pub fn state(&self) -> u32 {
+        self.0
+    }
 }
 
 #[cfg(test)]

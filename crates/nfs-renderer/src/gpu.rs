@@ -1556,7 +1556,7 @@ impl Core {
             let mat = &self.materials[item.material.0 as usize];
             // mirrored world: the winding flips, so a material whose cull is the view's culls
             // the other one (0x468C45); any other draws both faces rather than the wrong one
-            let cull = match (mat.cull_back, scene.mirror, mat.view_cull) {
+            let cull = match (mat.cull_back, scene.mirror != item.mirrored, mat.view_cull) {
                 (false, _, _) | (true, true, false) => 1,
                 (true, false, _) => 0,
                 (true, true, true) => 2,

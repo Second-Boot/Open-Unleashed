@@ -453,8 +453,10 @@ pub const FILE_MAGIC: &[u8; 8] = b"NFS5PRPL";
 /// 2 carries `ReplaySetup::driver_name` (§16.2 / §18.11's gap) — a clean break: the format is the
 /// port's own working file, not a distributed one, and a version-1 file fails [`ReplayFile::parse`]
 /// rather than silently reading in an unset name. 3 adds the network race's own section
-/// ([`NetSetup`], `replay.md` §18.15) after the stream.
-pub const FILE_VERSION: u32 = 3;
+/// ([`NetSetup`], `replay.md` §18.15) after the stream. 4 adds [`CarRecord::livery`]; version 3 files still load.
+pub const FILE_VERSION: u32 = 4;
+/// The oldest file [`ReplayFile::parse`] still reads (3: no livery in the car records).
+const OLDEST_VERSION: u32 = 3;
 
 /// Everything the port needs to set the race up again, plus the stream. The original stores the
 /// whole `0x6573E8` registry region instead (§6.1); these are the same knobs the port's race setup
@@ -596,6 +598,19 @@ pub struct CarRecord {
     pub damage: [f32; 10],
     /// the seventeen sliders (`.FRONTDOWNFORCE` ... `.FINALRATIO`); `None` = the constructor's neutral ones
     pub setup: Option<[f32; 17]>,
+    /// the colours `FECar::init` got beside the exterior (`.COLOUR`) — S1 / S2 / IntColour / PackageNum of a
+    /// drawn opponent (0x4F4FA0, `car-model.md` §5.4); `None` = rebuilt from the exterior colour. Version 4 of the
+    /// file; a version-3 record reads as `None`.
+    pub livery: Option<Livery>,
+}
+
+/// The stripe colours, interior colour and stripe package of a car's `FECar::init` call (`CarRecord::livery`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Livery {
+    pub stripe1: [u8; 3],
+    pub stripe2: [u8; 3],
+    pub interior: [u8; 3],
+    pub package: u32,
 }
 
 impl CarRecord {
@@ -650,10 +665,21 @@ impl CarRecord {
             }
             None => o.push(0),
         }
+        match &self.livery {
+            Some(l) => {
+                o.push(1);
+                o.extend_from_slice(&l.stripe1);
+                o.extend_from_slice(&l.stripe2);
+                o.extend_from_slice(&l.interior);
+                o.extend_from_slice(&l.package.to_le_bytes());
+            }
+            None => o.push(0),
+        }
     }
 
-    /// The inverse of [`CarRecord::write`]; `None` when the file ends inside the record.
-    fn parse(c: &mut Cursor) -> Option<Self> {
+    /// The inverse of [`CarRecord::write`]; `None` when the file ends inside the record. `version` is the
+    /// file's: the livery byte exists from version 4.
+    fn parse(c: &mut Cursor, version: u32) -> Option<Self> {
         let flag = |c: &mut Cursor| -> Option<bool> { Some(c.u8().ok()? != 0) };
         let car_id = c.u16().ok()?;
         let paint = c.array::<3>().ok()?;
@@ -700,7 +726,12 @@ impl CarRecord {
         } else {
             None
         };
-        Some(Self { car_id, paint, name, grid, decal, personality, difficulty, skill, parts, part_damage, damage, setup })
+        let livery = if version >= 4 && flag(c)? {
+            Some(Livery { stripe1: c.array::<3>().ok()?, stripe2: c.array::<3>().ok()?, interior: c.array::<3>().ok()?, package: c.u32().ok()? })
+        } else {
+            None
+        };
+        Some(Self { car_id, paint, name, grid, decal, personality, difficulty, skill, parts, part_damage, damage, setup, livery })
     }
 }
 
@@ -986,9 +1017,10 @@ impl ReplayFile {
     /// inside a required field; the two trailing sections are optional (a file from before them ends there) and
     /// so are a few single bytes inside them (each reads as absent: the fallbacks are the caller's).
     pub fn parse(d: &[u8]) -> Option<Self> {
-        if d.len() < 16 || &d[..8] != FILE_MAGIC || bytes::read_u32(d, 8) != FILE_VERSION {
+        if d.len() < 16 || &d[..8] != FILE_MAGIC || !(OLDEST_VERSION..=FILE_VERSION).contains(&bytes::read_u32(d, 8)) {
             return None;
         }
+        let version = bytes::read_u32(d, 8);
         let mut c = Cursor::at(d, 12, "replay");
         let c = &mut c;
         let text = |c: &mut Cursor| -> Option<String> {
@@ -1036,13 +1068,13 @@ impl ReplayFile {
         if bytes::get_u8(d, c.pos()) == Some(2) {
             c.skip(1).ok()?;
             if flag(c)? {
-                player = Some(CarRecord::parse(c)?);
+                player = Some(CarRecord::parse(c, version)?);
             }
             if flag(c)? {
                 let n = c.u32().ok()? as usize;
                 let mut list = Vec::new();
                 for _ in 0..n.min(16) {
-                    list.push(CarRecord::parse(c)?);
+                    list.push(CarRecord::parse(c, version)?);
                 }
                 opponent_cars = Some(list);
             }
@@ -1302,6 +1334,7 @@ fn get_car_record(data: &[u8], slot: usize) -> Option<CarRecord> {
         part_damage,
         damage: std::array::from_fn(|k| f32at(0xC8 + 4 * k)),
         setup,
+        livery: None,
     })
 }
 
@@ -2229,6 +2262,7 @@ mod tests {
             part_damage: vec![1.0, 2.0, 3.0],
             damage: [1.0; 10],
             setup: Some([0.5; 17]),
+            livery: skill.then_some(Livery { stripe1: [4, 5, 6], stripe2: [7, 8, 9], interior: [10, 11, 12], package: 3 }),
         };
         let setup = ReplaySetup {
             track: "monaco1".into(),

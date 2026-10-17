@@ -36,9 +36,14 @@ impl App {
         selected: usize,
         n: usize,
     ) -> (Vec<CareerOpponent>, Vec<nfs_game::opponents::OpponentPick>, Vec<i16>) {
-        let mut crand = nfs_game::opponents::CRand::default();
-        let picks = Self::draw_opp_cars(paths, opp_choice, catalog, selected, &mut crand);
-        let drivers = Self::draw_drivers(paths, difficulty, n, &mut crand);
+        // the rolls take the C runtime's one shared state (0x5A17C9), which the front end's glints
+        // have been moving since start-up and the last race load re-seeded (0x418100) — a fresh
+        // seed-1 stream here gave all seven cars decal −1 every time (`car-model.md` §5.3)
+        let (picks, drivers) = nfs_game::layout::glints::with_crt(|crand| {
+            let picks = Self::draw_opp_cars(paths, opp_choice, catalog, selected, crand);
+            let drivers = Self::draw_drivers(paths, difficulty, n, crand);
+            (picks, drivers)
+        });
         let per_table = Self::per_table(paths);
         let opponents = picks
             .iter()
@@ -76,6 +81,7 @@ impl App {
     ) -> CareerOpponent {
         let entry = catalog.get(p.car).cloned().unwrap_or_else(|| catalog[0].clone());
         let paint = entry.paint_sets.get(p.paint_set).map(|s| s.colours[0]).unwrap_or([0x20, 0x40, 0xC0]);
+        let livery = Some(nfs_assets::car::Paint::drawn(&entry, p.paint_set, p.interior, p.package));
         let driver = driver.and_then(|id| per_table.iter().find(|r| r.id == id));
         let name = driver.and_then(|r| strings.get(r.name_string_id)).map(|n| n.to_string()).unwrap_or_else(|| entry.display_name.clone());
         CareerOpponent {
@@ -88,6 +94,9 @@ impl App {
             personality: driver.map_or(0, |r| r.id),
             parts: Vec::new(),
             decal: p.decal,
+            // 0x4F4FA0 hands FECar::init the drawn paint set's three colours, the drawn interior and
+            // package (call at 0x4F51B6, `car-model.md` §5.4)
+            livery,
         }
     }
 

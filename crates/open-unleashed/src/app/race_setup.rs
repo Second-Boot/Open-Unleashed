@@ -143,7 +143,11 @@ impl RaceSetup {
             quick_knockout: false,
             career_opponents: Some(req.opponents.clone()),
             player_grid: req.player_grid,
-            look: PlayerLook::plain(req.paint),
+            look: match req.player_livery {
+                // the mission's own FECar livery and race number (0x51AA50, `career_ui::StartRequest::player_livery`)
+                Some((p, decal)) => PlayerLook { paint: p.exterior, owned_paint: Some(p), owned_decal: Some(decal) },
+                None => PlayerLook::plain(req.paint),
+            },
         }
     }
 
@@ -379,7 +383,7 @@ mod parity {
     }
 
     fn opponent(name: &str) -> CareerOpponent {
-        CareerOpponent { car: car(7, &[]), paint: [1, 2, 3], name: name.into(), difficulty: 0.5, skill: [[0.0; 2]; 4], grid: None, personality: -1, parts: Vec::new(), decal: -1 }
+        CareerOpponent { car: car(7, &[]), paint: [1, 2, 3], name: name.into(), difficulty: 0.5, skill: [[0.0; 2]; 4], grid: None, personality: -1, parts: Vec::new(), decal: -1, livery: None }
     }
 
     /// a state no builder produces as a whole: every field set to something a launch must overwrite or keep
@@ -508,6 +512,7 @@ mod parity {
             traffic: 4,
             traffic_ids: Some(vec![21]),
             player_grid: Some(6),
+            player_livery: None,
         };
         let new = RaceSetup::career(&req, kept().setup());
         // `load_career_race` before
