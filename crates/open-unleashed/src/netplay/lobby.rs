@@ -23,11 +23,14 @@ pub struct Lobby {
     net: Net,
     /// the sessions a `'w'` probe turned up, newest first
     pub found: Vec<(SocketAddr, nfs_net::comm::Describe)>,
-    /// When each `found` entry last answered a probe. **APPROXIMATION** (port's choice): the
-    /// original's server list is redrawn from the live peer list (0x4B9780 walks it under the
-    /// NfsNet lock and skips a peer whose ping 0x48C6E0 is negative), so a host that goes away
-    /// leaves it; a `'d'` carries no ping, so the port drops an entry that has not answered for
-    /// [`SESSION_TTL`].
+    /// When each `found` entry last answered a probe. **PORT-DEVIATION D36** (the ping's transport): the
+    /// original lists a peer only while its last ping 0x48C6E0 is not negative (the draws 0x4B9780 and
+    /// 0x4BA030 skip a negative one; a new record starts at −1, 0x48C37B). 0x48C6E0 re-pings a peer
+    /// once `5 · [0x5DEB48]` ticks (5 s; `[0x5DEB48]` = 128 per second, clock 0x53C2E0) have passed
+    /// since the last ping started, through the CONMAN ping thread 0x55D800 — ICMP echoes, each with a
+    /// 2500 ms timeout (0x55D916), the first failure ends the run and the callback 0x48C660 stores −1.
+    /// The port has no ICMP: the `'d'` answer stands for the echo reply, and an entry that has not
+    /// answered for [`SESSION_TTL`] is the peer whose next echo failed.
     pub(super) seen: HashMap<SocketAddr, Instant>,
     /// The round trip of each listed session's last `'d'`, in milliseconds — what the server
     /// list's ping column shows (`ID_PINGPOS`, 0x4B9780 draws 0x48C6E0's value, at most 9999).
@@ -79,8 +82,10 @@ fn merge_key(d: &nfs_net::comm::Describe) -> Option<nfs_net::wire::Addr> {
     d.from.ipv4().filter(|ip| *ip != [0; 4]).map(|_| d.from)
 }
 
-/// How long a listed session may stay silent before it leaves the list — see [`Lobby::seen`].
-pub(super) const SESSION_TTL: Duration = Duration::from_secs(4);
+/// How long a listed session may stay silent before it leaves the list — see [`Lobby::seen`]:
+/// the re-ping period `5 · [0x5DEB48]` ticks = 5 s (0x48C71E…0x48C730) plus the failing echo's
+/// 2500 ms timeout (0x55D916): 7.5 s.
+pub(super) const SESSION_TTL: Duration = Duration::from_millis(7500);
 
 /// `Comms.IPList`, the accessor's contents: the address strings (newest first) and the selected
 /// row. It lives in the profile's option block (`FECharVectAccessor`, ctor 0x50B8BE, Save 0x4B8D70 /

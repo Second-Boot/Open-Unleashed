@@ -684,6 +684,27 @@ impl App {
         Some((v.min(options.len() - 1), options))
     }
 
+    /// A Display option as the **global** an HUD element reads directly, not through the cfg2 record's
+    /// getter (`RE/notes/hud.md` §3.6): `SPLITTIMES [0x657DD8]` (HMultiTime 0x42A279, whose gate 0x41E850
+    /// reads the record), `SPEEDUNITS [0x657DC0]` (0x42E593, 0x42E741, 0x42E857), `DAMAGEDISPLAY [0x657DC8]`
+    /// (0x430355), `OPPONENTLIST [0x657DD4]` (0x42B393), `TRANSLUCENCY [0x657DE4]` (0x425298, 0x4267A0). A
+    /// front-end race fills the globals from the accessors (the same values as the record, 0x4ED653); a
+    /// `fe = 0` launch ([`App::fe0`]) has them from `fe.txt` / the command line by name — `splittimes=2`
+    /// in the shipped file where the record's Config 1 says 1 — and 0 for a key the file lacks.
+    pub(crate) fn choice_global(&self, name: &str) -> Option<(usize, &'static [u32])> {
+        let base = self.choice_index(name)?;
+        let overridden = nfs_game::config::cfg()
+            .nfs_choice
+            .as_str()
+            .is_some_and(|o| o.split(',').filter_map(|kv| kv.split_once('=')).any(|(k, _)| k == name));
+        if !self.fe0 || overridden {
+            return Some(base);
+        }
+        let (_, key, options) = CHOICE_ACCESSORS.iter().find(|(n, _, _)| *n == name)?;
+        let v = self.registry.u32(key, 0) as usize;
+        Some((v.min(options.len() - 1), options))
+    }
+
     /// The slot of a Display option in a `nfs5-2.hud` record's option run (cfg2 `+0x30…+0x64`,
     /// `hud.md` §2: SPEEDOMETER, SPEEDUNITS, HUDTACHOMETER, DAMAGEDISPLAY, MAP, MAPSCALE,
     /// OPPONENTLIST, SPLITTIMES, DISPLAYCOLORS, DRIVERSNAPSHOT, TRANSLUCENCY, REARVIEWMIRRROR,

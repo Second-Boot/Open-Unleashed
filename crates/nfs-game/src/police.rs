@@ -834,7 +834,7 @@ pub struct CopCar {
 impl CopCar {
     /// A cop car with its own `.sim` (`specs`, §17.1 — the mass is the sim's) and the half box
     /// 0x445090 takes. The body starts with the box's bottom corners at the wheel-quad height as
-    /// its probes (APPROXIMATION, for callers without a model — the unit tests); the race gives it
+    /// its probes (TEST GLUE, for callers without a model — the unit tests); the race gives it
     /// the model's `BndP` points through [`Self::set_body`].
     pub fn new(model: usize, half_extents: Vec3, specs: &CarSpecs, level: usize) -> Self {
         let mass = specs.mass;

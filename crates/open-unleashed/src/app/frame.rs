@@ -123,7 +123,7 @@ impl App {
             && let (Some(a), Some(m)) = (&self.snd.audio, self.snd.music.as_mut())
         {
             // the shuffled advance's `0x538040() + GetTickCount()` (0x4ADDA0…0x4ADDA7): the shared
-            // generator `fe_rng` and the wall clock's milliseconds — APPROXIMATION for the time
+            // generator `fe_rng` and the wall clock's milliseconds — PORT-DEVIATION D20 for the time
             // since Windows started (as `I_MUSIC`'s pick)
             let rng = &mut self.fe_rng;
             let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u32);

@@ -277,7 +277,7 @@ fn run() -> Result<()> {
                 .map(|(i, p)| nfs_physics::specs::InstalledPart::new(p.kind, p.zone_mask.map(|b| b != 0), p.condition, c.part_damage.get(i).copied().unwrap_or(p.state as f32)))
                 .collect();
             // `.TRANSMISSION` of the recorded block (`carinfo+0xC`); a file from before the field: the session's
-            // option, `cli_automatic` (APPROXIMATION)
+            // option, `cli_automatic` (PORT-DEVIATION D22)
             let automatic = replay_setup.as_ref().and_then(|r| r.transmission).unwrap_or(cli_automatic);
             specs.apply_setup(&c.setup.unwrap_or(nfs_game::career::CAR_SETUP_DEFAULT), automatic);
         } else {

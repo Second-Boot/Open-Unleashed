@@ -286,7 +286,7 @@ impl CarEffects {
     /// **0x43F6E0**, in the render frame after the track's systems (0x468B64 → 0x455260, then
     /// 0x468B6F): every set of the draw set, its eleven systems' draw (slot 1, 0x454430) in slot
     /// order. `car_position` answers a car's `car+0x330`, which a relative system's draw adds.
-    /// APPROXIMATION: the draw set is a `std::set` of the sets' addresses, so the cars' order is
+    /// PORT-DEVIATION D33: the draw set is a `std::set` of the sets' addresses, so the cars' order is
     /// their heap order; here it is the car index. **Observed on the original (2026-10-01 SV, Wine
     /// heap, gdb at 0x43F392 / 0x43F6F0):** in a 4-car race the four sets were inserted in car-draw
     /// order at 0x28c2880, 0x28c0b18, 0x28bedb0, 0x28ba3e8 (falling addresses) and the walk visited

@@ -168,8 +168,8 @@ pub struct EngineSound {
     /// the object comes from 0x531CA0 (`0x4ACC64`: name 0x5D1B94, 0x758 bytes, flags 0), which
     /// clears nothing — it links a free block and writes its 16-byte header (0x5320B0; a guard
     /// or name only under flags 0x200 / 0x100) — and the init loop 0x4ACCB5…0x4ACCE1 writes the
-    /// record's handle (`+0x45C`, −1) but not these two. APPROXIMATION of that undefined start:
-    /// (0, 0), the plain arm of [`layer_pan_level`] (no silent pass on the first rise).
+    /// record's handle (`+0x45C`, −1) but not these two. The undefined start behaves as (0, 0) on the original (closed by SRV-C, measured
+    /// below), the plain arm of [`layer_pan_level`] (no silent pass on the first rise).
     /// **Observed on the original (2026-10-01 SV, Wine heap, gdb at 0x4ACC6E, coastal / alps, one
     /// fresh start each):** the block is NOT zero — the 32 layers' `+0x454` / `+0x458` words held heap
     /// leftovers (pointers and small integers, e.g. `0x00cb3900` / `0x028aae68`), none with a low word

@@ -18,12 +18,14 @@ impl App {
     /// **0x4DDA00(`step`)** — one whole loading-screen frame, drawn and presented at once, as
     /// 0x4D3420 does between the stages of its load (`controls.md` §4.165.3). It first stops the
     /// music (`MusicStop(1)`, 0x4DDA16). The port's own front-end load has no stages in 0x4D3420's
-    /// order, so only the first (0) and last (9) frames are drawn — APPROXIMATION: steps 1…8,
+    /// order, so only the first (0) and last (9) frames are drawn — PORT-DEVIATION D31: steps 1…8,
     /// which grow the bar 13.78 pixels each, are not. As in the original the screen stays up
     /// only while the load runs; nothing holds it longer.
     /// What 0x4A4A70 reads: `Game.GameType` (the launch's), the career era `0x5032D0`, the
-    /// track, `MIRROR` / `REVERSE`, a network session (APPROXIMATION of the four session tests,
-    /// as §4.163's) and `LANGUAGE`.
+    /// track, `MIRROR` / `REVERSE`, a network session and `LANGUAGE`. The session tests are the same
+    /// fields as 0x4D4072's (read at 0x4A4AD4…0x4A4B00 for the progress send and at 0x4A4F5F…0x4A4F9B for
+    /// the `MLoading.fsh` draw: `[0x628C70]`, `+8`, `+0xBF == 0`, `+0xBE`, `+0xDC ≥ 0`), which is
+    /// `NetPlay::established`.
     fn race_loading_inputs(&self) -> nfs_game::layout::loading::RaceLoadingInputs {
         use nfs_formats::career::Era;
         nfs_game::layout::loading::RaceLoadingInputs {
@@ -36,7 +38,7 @@ impl App {
             track: self.track.name.clone(),
             mirror: self.mirror,
             reverse: self.backwards,
-            network: self.net.session.is_some(),
+            network: self.net.session.as_ref().is_some_and(|n| n.established()),
             language: u32::from(self.language),
             rows: Vec::new(),
         }
@@ -63,7 +65,7 @@ impl App {
     /// 1 and 2 after the picture post (0x427A60), 3 after `TrackWorld::upload` (0x469065, the track
     /// data), 4 and 5 after the sky (the end of 0x468FB0), 6 after the camera data (0x471B70, moved up
     /// for the order), 7 after the collision sounds (0x4A8CD0), 8 before and 9 after the cars
-    /// (0x414E63, 0x414E74), 10 after the barrier (0x4B68CB). APPROXIMATION: the *work* between two
+    /// (0x414E63, 0x414E74), 10 after the barrier (0x4B68CB). PORT-DEVIATION D31: the *work* between two
     /// steps is the port's, not 0x4B67B0's — the bar moves when the port's equivalent finishes.
     pub(crate) fn race_loading_frame(&mut self, r: &mut Renderer, step: i32) {
         tracing::debug!(target: "loading", step, "0x4A4A70");

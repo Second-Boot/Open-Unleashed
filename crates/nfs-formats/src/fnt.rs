@@ -113,8 +113,8 @@ impl Font {
     /// * still nothing → `None`: the character is **skipped** — no quad and the pen does not move
     ///   (0x53DBE9 / 0x53DBFD jump back to the reader).
     ///
-    /// `None` too for a char no Windows-1252 byte stands for (APPROXIMATION of "cannot happen":
-    /// the original's strings are bytes).
+    /// `None` too for a char no Windows-1252 byte stands for (the original's strings are bytes, so
+    /// such a char cannot arise there (settled, class D: the caller's skip, 0x53DBFD, is the `None` arm).
     pub fn lookup(&self, ch: char) -> Option<&Glyph> {
         let b = crate::locale::to_cp1252(ch)?;
         self.glyph_code(b as u16).or_else(|| match case_swap(b) {

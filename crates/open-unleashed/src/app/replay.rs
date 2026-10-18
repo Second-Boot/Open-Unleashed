@@ -206,7 +206,7 @@ impl App {
         if let Some(e) = &entry {
             let table = self.fe_parts_table();
             // `.TRANSMISSION` is the recording's (`carinfo+0xC` of the restored block, `player_automatic`); a file
-            // from before the field takes the session's option (APPROXIMATION, logged below)
+            // from before the field takes the session's option (PORT-DEVIATION D22, logged below)
             let automatic = setup.transmission.unwrap_or_else(|| {
                 tracing::info!("replay: no .TRANSMISSION in the setup, the session's Car.Transmission option is used (APPROXIMATION)");
                 self.player_automatic()
@@ -290,7 +290,7 @@ impl App {
     /// [`App::block_game_type`] (and a mission's two cops, 0x4ED0A5...0x4ED0E7); `.CAMERA` 0x148 is
     /// slot 0's list (+0xCA4 +0x208), the four views the race's camera cycles. A field the file does
     /// not carry (a `.prpl` from before them) falls back and says so: single race (not a lap knockout),
-    /// the front end's current `Game.GameType`, the last launch's camera list (APPROXIMATION).
+    /// the front end's current `Game.GameType`, the last launch's camera list (PORT-DEVIATION D22).
     pub(crate) fn apply_replay_launch_block(&mut self, setup: &nfs_game::replay::ReplaySetup) {
         self.quick_knockout = setup.race_type == Some(3);
         self.road.cops_race = setup.race_type == Some(1);

@@ -343,6 +343,14 @@ impl NetPlay {
         self.net.role == Role::Host
     }
 
+    /// **0x48CAA0**, read to its end (0x48CB20…0x48CB43): with the connection up (`+8`, `+0xBF == 0`,
+    /// `+0xBE`, `+0xDC ≥ 0`, [`NetPlay::established`]) and the list `net+0x260` not empty, `true` when
+    /// the first player's id (`[list head].+0x40`) is ours (`+0xDC`). The host's own player is the
+    /// first the room holds (its `0xB0` is the first any member hears), so this is "we are the host".
+    pub fn first_player_is_us(&self) -> bool {
+        self.room.me >= 0 && self.room.players.first().is_some_and(|p| p.id == self.room.me)
+    }
+
     /// The opponent seats the network owns. Called once the race has built its opponents.
     pub fn reserve(&mut self, seats: Vec<usize>) {
         self.seats = seats;

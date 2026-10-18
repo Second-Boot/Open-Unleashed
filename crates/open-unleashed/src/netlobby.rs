@@ -12,7 +12,7 @@ use nfs_net::slots;
 
 /// The `Comms.PlayerList` row's tags: 0x5D7524, 0x5D7518, 0x5D7508.
 const NAMEPOS: &str = "ID_NAMEPOS";
-/// APPROXIMATION (instant): how many ticks the update thread 0x4A5750 is still seen running (state 2) after
+/// Settled (class D): how many ticks the update thread 0x4A5750 is still seen running (state 2) after
 /// `SETMODENET`; the original's duration is the DLL's connect to `trans.ea.com:80`, which the port never makes.
 pub(crate) const UPDATE_THREAD_TICKS: u32 = 1;
 const CARPOS: &str = "ID_CARPOS";
@@ -572,7 +572,7 @@ impl App {
     ///
     /// The thread's answer on this install (`.castanet\properties.txt` + `index.mrb`, no `undo.mrb` /
     /// `holding.mrb`) is **state 0** whatever the transmitter does (§11.21 item 6); the port never contacts
-    /// `trans.ea.com`. **APPROXIMATION (instant):** the thread's duration — in the original the DLL's connect to
+    /// `trans.ea.com`. **Settled, class D:** the thread's duration — in the original the DLL's connect to
     /// `trans.ea.com:80` (a black hole, OS-dependent: seconds) — is here the case of a machine whose connect is
     /// refused at once: the thread is done before the second tick after the click (`UPDATE_THREAD_TICKS` = 1 tick
     /// still seen as running: the thread starts in the click's frame, and its file checks and the refused connect
@@ -585,7 +585,7 @@ impl App {
     /// (`.castanet\properties.txt` + `index.mrb`, no `undo.mrb` / `holding.mrb`) is **state 0** whatever the
     /// transmitter does (§11.21 item 6); the port never contacts `trans.ea.com`.
     ///
-    /// **APPROXIMATION (instant):** the thread's duration — in the original the DLL's connect to `trans.ea.com:80`
+    /// **Settled, class D:** the thread's duration — in the original the DLL's connect to `trans.ea.com:80`
     /// (a black hole, OS-dependent: seconds) — is here the case of a machine whose connect is refused at once: the
     /// thread is still running at the click frame's own tick and done at the next ([`UPDATE_THREAD_TICKS`] = 1).
     /// `NFS_UPDATE_CHECK_TICKS=<n>` (test glue) runs it `n` ticks instead.

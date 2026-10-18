@@ -110,7 +110,7 @@ impl App {
     /// `FEGAME_TYPE [0x6573E8]` of the race running (option 0x30, written by 0x4EB470 from the
     /// launch's `Game.GameType`): the layout front end's type when it started the race; for the
     /// text menu and the command line, 1 for a Quick Knockout (`RACE_TYPE` 3), 2 for a knockout
-    /// round, 9 for a mission, else 0 — APPROXIMATION for those port-only launches: a text-menu career event (the
+    /// round, 9 for a mission, else 0 — PORT-DEVIATION D23 for those port-only launches: a text-menu career event (the
     /// original's 4) answers 0, which picks the same summary title.
     pub(crate) fn race_fegame_type(&self) -> u8 {
         self.block_game_type().unwrap_or(if self.quick_knockout {
@@ -130,7 +130,7 @@ impl App {
     /// `Game.GameType` (`race_game_type`); a **playback**'s is the recording's: `Replay_begin`
     /// 0x413CF0 copies the whole recorded block over `0x6573E8` (0x413DC0...), the front end's own
     /// `Game.GameType` `[0x690AAC]` untouched. A setup that carries none (a file from before the
-    /// field) answers the current one (APPROXIMATION, `replay.md` 2026-10-01).
+    /// field) answers the current one (PORT-DEVIATION D22, `replay.md` 2026-10-01).
     pub(crate) fn block_game_type(&self) -> Option<u8> {
         let playback = self.replay.stream.as_ref().is_some_and(|s| matches!(s.mode, nfs_game::replay::Mode::Playing | nfs_game::replay::Mode::Exhausted));
         self.replay.setup.fegame_type.filter(|_| playback).or(self.fe.race_game_type)
@@ -465,9 +465,10 @@ impl App {
     /// layout front end started has a stack to rebuild (`race_game_type`); one from the text
     /// menu goes back to it. `aborted` is `[0x657E34]`, a race left from the pause menu.
     ///
-    /// Inputs as this port has them: the network test (0x4D4072…0x4D40A6, the session object
-    /// `[0x628C70]` linked, not ejected and holding a player id) is "a session is open", and host
-    /// (0x48CAA0: our id is the first player's) is `NetPlay::is_host` — APPROXIMATION of both.
+    /// Inputs: the network test (0x4D4072…0x4D40A6: the session object `[0x628C70]` linked, `+8`,
+    /// `+0xBF == 0`, `+0xBE`, `+0xDC ≥ 0`) is `NetPlay::established`, and host (0x48CAA0, read to its
+    /// `ret` at 0x48CB46: our id `+0xDC` equals the first player's `+0x40` in the list `net+0x260`) is
+    /// `NetPlay::first_player_is_us`.
     /// `TOURNAMENTLASTRACE` / `TOURNAMENTENDOFERA` (options 0xB9 / 0xBA) are what the event's
     /// launch set and the era-changed byte (0x505800) what filing it left
     /// (`CareerUi::race_flags`). The mission pair is the career's (0x51AF90 `promotion_due`,
@@ -531,7 +532,7 @@ impl App {
             aborted,
             game_type,
             knockout_active: self.knockout.as_ref().is_some_and(|k| k.state.active),
-            net: self.net.session.as_ref().map(|n| (self.fe.comms_game_mode, n.is_host())),
+            net: self.net.session.as_ref().filter(|n| n.established()).map(|n| (self.fe.comms_game_mode, n.first_player_is_us())),
             last_race: flags.last_race,
             end_of_era: flags.end_of_era,
             era_changed: flags.era_changed,

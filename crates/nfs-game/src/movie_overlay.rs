@@ -3,7 +3,7 @@
 //! "NEED FOR SPEED" runs over the widget's box, built once by 0x4CDC80 and run every draw off the
 //! millisecond clock and the C runtime's `rand`.
 //!
-//! APPROXIMATION: the original seeds `rand` from the time (`srand(time)` at 0x418100) and shares it
+//! PORT-DEVIATION D21: the original seeds `rand` from the time (`srand(time)` at 0x418100) and shares it
 //! with the whole program, so no two runs agree; this one has a generator of its own with a fixed
 //! seed, which makes a still reproducible.
 
@@ -166,7 +166,7 @@ pub struct MovieOverlay {
     pub at: i64,
 }
 
-/// The step the port runs the overlay at. APPROXIMATION: the original runs it once a drawn frame
+/// The step the port runs the overlay at. PORT-DEVIATION D21: the original runs it once a drawn frame
 /// off the real clock; a fixed 16 ms step keeps a still reproducible.
 pub const STEP_MS: i64 = 16;
 

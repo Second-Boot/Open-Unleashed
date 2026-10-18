@@ -8,7 +8,7 @@
 //! levels as the per-effect gains and the total, the jolt's direction / duration / magnitude and its
 //! re-arm window, the pause stop (0x412030…).
 //!
-//! What is **APPROXIMATION** (each labelled where it is made):
+//! The port's choices are **PORT-DEVIATION D24** (each labelled where it is made):
 //! * **A1, the device.** The original arms force feedback only when the player has a
 //!   force-feedback-capable DirectInput device bound in the control config (0x4116D0, 0x411D20) and
 //!   picks the *last* such device of 32. The port arms it when gilrs reports a connected pad that

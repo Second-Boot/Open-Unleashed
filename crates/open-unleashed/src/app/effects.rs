@@ -475,7 +475,9 @@ impl App {
             // game's screen z `far/(far − near) · (1 − near / Z)` (0x540CE0, `thrash.md` §6d.3, the
             // view's own planes), carried as `DrawItem::depth_bias`: some 7.6 m of view depth toward
             // the eye (`cam[+0xC] / d²` is that z's slope). Where it passes the near plane the shader
-            // holds the screen z at 0 (its APPROXIMATION: the device's handling of `sz < 0` is not read).
+            // holds the screen z at 0 (its APPROXIMATION, `shader.wgsl`: dx7z passes `sz < 0` to the device
+            // unclipped and unclamped — 0x60006B41…, flush 0x60006F20, quad path 0x60007650, draw 0x60006A50 with
+            // flags 0 — and the Direct3D runtime's own handling is not in a readable binary).
             let z_near = self.camera.near;
             let far = self.view_far;
             let bias = (-250000.0 * (far * z_near / (far - z_near)) / d2.max(1e-6)).round();

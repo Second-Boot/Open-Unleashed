@@ -704,15 +704,17 @@ impl App {
             let widget = widgets.iter().find(|w| w.index == *slot);
             match widget.and_then(|w| w.position().map(|p| (p, w.alpha))) {
                 Some((p, alpha)) => {
-                    // the table at 0x4BFF28 is kept exactly as it is in the binary, and its `x` is
-                    // **mirrored here**: `carcompare.lay` gives the widget at `pos=175` (the left
-                    // half of the 640-wide screen) `positiontype=1`, which the table places at
-                    // `x = +2.4`, and the one at `pos=350` `positiontype=2` at `x = -2.4`. So in
-                    // the original's front-end camera space +x is toward screen *left*, and this
-                    // port's camera has +x to the right. CONFIRMED by the two widgets' own boxes.
+                    // the table at 0x4BFF1F…0x4BFF75 as the binary has it (`Car3dWidget::position`):
+                    // 0x4D1700's first argument, the last one pushed, is the x (`[car+0x330]`), +x
+                    // is to the screen's right as in the port's camera, and type 1 (`carcompare`'s
+                    // left half, `pos=175`) stands at x = −2.4 while type 3 (`usedcardamage`'s
+                    // box on the right, `pos=288`) stands at +2.4. *(Until 2026-10-18 the table had
+                    // types 1 and 2 swapped and the port negated x to compensate, which put type 3
+                    // on the left, under the damage panel; type 3's widget `ID_Used3DCar` is hidden by 0x4F71E2…0x4F726D
+                    // and 0x4F7384 in every state, so nothing shipped draws it.)*
                     let m = Mat4::from_rotation_translation(
                         Quat::from_rotation_y(spin * std::f32::consts::TAU),
-                        Vec3::new(-p[0], p[1], p[2]),
+                        Vec3::new(p[0], p[1], p[2]),
                     );
                     // **The widget lights its own car**, not the room: `FECar3DControl` slot 25
                     // **0x4C0A90**, which the frame calls on every widget of every layer's screen
@@ -1297,6 +1299,10 @@ fn fe_blob_shadow(blob: (nfs_renderer::MeshId, nfs_renderer::MaterialId), place:
     let bias = ((-20000.0 * k as f64 / d2 as f64) as f32).round_ties_even() as i32;
     Some(nfs_renderer::DrawItem {
         layer_light: Some(nfs_game::world::TRACK_LIGHT),
+        // the flush 0x466660's `GREATER 10` (Thrash 0x24 ← 10 at 0x466703 / 0x46666D), which 0x43B820
+        // does not change: the front end flushes through the same function (0x467290 → 0x466660)
+        alpha_test: true,
+        alpha_ref: 10,
         early: true,
         depth_bias: bias,
         ..nfs_renderer::DrawItem::new(blob.0, blob.1, place * Mat4::from_scale(Vec3::new(half.x, 1.0, half.z)))

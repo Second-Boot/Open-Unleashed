@@ -899,7 +899,7 @@ impl LayoutScreen {
         // 0x4BDD5E; `[+0x1CC]` = 2) — each spelling **the widget's `label` string**, which the bind
         // copies to `[+0x164]` (0x4C8B60 `"label"`, 0x4E7310, 0x4BDCC4…0x4BDCEA), in
         // `0x4D87F0(0xA0FFFFFF, fade)` (0x4BE0B6): so the caption drifts across the pictures, cut
-        // to their opaque texels. Not drawn by the port before. APPROXIMATIONS as the circle's
+        // to their opaque texels. Not drawn by the port before. PORT-DEVIATION D21, as the circle's
         // runs: a generator of their own (seed 1) and 16 ms steps.
         let text = e.string_id().filter(|n| *n != 0).and_then(|n| strings.get(n)).unwrap_or_default().to_string();
         if !text.is_empty() {

@@ -98,12 +98,15 @@ pub struct Peer {
     pub adv_until: Instant,
 }
 
-/// How long a slot's bit stays in the mask a `'d'` advertises (`session+0x50`), with nothing refreshing it. **APPROXIMATION
-/// of the period only**: the count is 450 spends of 0x587CE0 (0x5E1A04 -> 0x587D82), which the original ran live on its
-/// `nfs5-third` host as 3.52 s (admission 0x589486 -> clearing 0x587D92, gdb, runs of 3.52 / 3.54 / 3.54 s; the callback
-/// was entered 900 times, two registrations per round); the timer that calls it (0x580DC0's registry, driven from
-/// 0x53C0F0) was not read, so the cadence is the measured one.
-pub const ADVERTISED_BIT_LIFE: Duration = Duration::from_millis(3530);
+/// How long a slot's bit stays in the mask a `'d'` advertises (`session+0x50`), with nothing refreshing it: the count
+/// 450 (`[0x5E1A04]`, stored at 0x5894A0) is spent once per call of 0x587CE0 (0x587D82) and the bit goes when the
+/// count was already 0 (0x587D8B…0x587D92), the 451st call. The callback 0x587CC0 → 0x580DC0 (a walk over the
+/// registry 0x6B4AC0) is registered in the table 0x69E5B4 by 0x53BFE0 (0x587C1F) and run by the thread 0x53C0F0
+/// (the loop 0x53C123…0x53C134) each time it wakes; the event it waits on (0x55FB90, INFINITE) is set by the
+/// `timeSetEvent` callback 0x564EB0 (0x564F6F → 0x53C270 `SetEvent`), which advances a 16.16 clock by
+/// `[0x6A5BF8] = 0x3E80000 / [0x5DEB48]` (0x565098…0x5650A6) per call = 1000 / 128 = 7.8125 ms. So
+/// 451 · 7.8125 ms = 3.5234 s (the original measured live: 3.52 / 3.54 / 3.54 s, `network.md` §7.23).
+pub const ADVERTISED_BIT_LIFE: Duration = Duration::from_nanos(451 * 7_812_500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -133,7 +136,8 @@ pub struct Net {
     /// The request number an outstanding `'j'` keeps while it is repeated (0x588130 sends one buffer
     /// again and again until the reply or the deadline).
     join_req: Option<u32>,
-    /// the peers the data layer has already sent its connect `'q'` to ([`Net::send_frame`])
+    /// the peers whose link has turned from `link+0x4C < 0` ("opened", 0x5824F0) to `1` (0x5826DF): a frame
+    /// from them was accepted ([`Net::send_frame`] sends its connect `'q'` before every frame to the others)
     q_sent: std::collections::HashSet<SocketAddr>,
     /// `session+0x84`.
     pub limit: u32,
@@ -249,13 +253,18 @@ impl Net {
         }
     }
 
-    /// **0x582700**: the data layer's send. When the link is not connected yet (`link+0x4C < 0`) an empty
-    /// `'q'` goes first, then the frame under `'='` (0x582711 / 0x58273D). Captured: one `'q'` per side, 1 ms
-    /// before the first `'='` (the ack-only frame), none after (`REFERENCE-2026-10-02-SRVE.md` §2).
-    /// **APPROXIMATION:** where the original's `link+0x4C` turns non-negative was not traced; this sends the
-    /// `'q'` once per peer, before the first frame to it, which is what both captured sessions show.
+    /// **0x582700**: the data layer's send. While the link is not connected yet (`link+0x4C < 0`) an empty
+    /// `'q'` goes before **every** frame, then the frame under `'='` (0x582711 / 0x58273D). The writers of
+    /// `+0x4C` (all read): the open 0x582470 sets `-1` (0x5824F0; `0` when the provider has no endpoint,
+    /// 0x58250E), the close 0x582520 and the init 0x582750 set `0` (0x5825BE, 0x58275F), and the receive
+    /// poll 0x582660 sets `1` (0x5826DF) when the upper layer's handler (`[[link+0x50]+8]` slot `+0x40`,
+    /// called at 0x5826BD) returns nonzero for a datagram — `0` stays `0`. So the `'q'` repeats until the
+    /// first frame from that peer has been accepted. Captured: one `'q'` per side, 1 ms before the first
+    /// `'='` (the ack-only frame), none after (`REFERENCE-2026-10-02-SRVE.md` §2): the peer's first frame
+    /// came back before the next send. **APPROXIMATION (residual):** the handler's return value was not
+    /// read; a `'='` with a body from the peer ([`Net::on_data_frame`]) stands for "accepted".
     fn send_frame(&mut self, to: SocketAddr, frame: &[u8]) -> io::Result<usize> {
-        if self.q_sent.insert(to) {
+        if !self.q_sent.contains(&to) {
             tolerate(self.sock.send_to(to, crate::data::CONNECT_TAG, &[]), "connect", to);
         }
         self.sock.send_to(to, crate::data::TAG, frame)
@@ -708,6 +717,8 @@ impl Net {
     /// `'='` with a payload, 0x582700's data frame: the reliable layer's bodies, relayed by the host (0x48C0F0 /
     /// 0x48C170) and handed up.
     fn on_data_frame(&mut self, from: SocketAddr, p: &[u8], out: &mut Vec<Event>) {
+        // `link+0x4C` turns 1 (0x5826DF): no more connect `'q'` to this peer
+        self.q_sent.insert(from);
         let slot = if self.role == Role::Host { self.refresh(from) } else { None };
         // (live, the original hosting; `RE/notes/network.md` §7.20): the original host's `'*'`
         // ping rounds stop ~3 s after admission, what keeps the link alive afterwards is its data

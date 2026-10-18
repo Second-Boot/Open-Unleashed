@@ -1165,7 +1165,7 @@ impl App {
             }
             _ => {
                 // ENTER on the server list (`serverlist.lay`): the original connects to the lobby
-                // service (§1), which is not reproduced. **APPROXIMATION** (direction: what the
+                // service (§1), which is not reproduced. **PORT-DEVIATION D34** (direction: what the
                 // list is *for*): the port's server list shows the LAN sessions, so ENTER joins
                 // the row under the cursor, as `JOIN` does on the games screen.
                 let joined = self.net.lobby.as_ref().and_then(|l| l.join_target().map(|a| l.connect(a)));

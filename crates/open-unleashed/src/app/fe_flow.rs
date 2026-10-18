@@ -557,7 +557,13 @@ impl App {
     /// whose room then sends `0xB1` for us) and dropping it closes the socket; the lobby's
     /// browsing socket is reopened by the screen the back shows (`fe_bind_screen`), which is the
     /// kind-0 object 0x48E1A0(0, 0, 0) makes. The host's room going is the joiners' `0xC6 (0xC)`.
-    /// APPROXIMATION: our own `0xB1` to the host is the host's to send.
+    /// A leaving **joiner** sends no `0xB1`: 0x48E9C0's send (0x48EA16, through 0x48C870 with the room's
+    /// builder `[+0xC]`, which delivers to the links of its list `[builder+4]`) sits behind `+0xC2`, which
+    /// only the host's create writes 1 (0x48E143; the other stores are the zeroes 0x48E0E8, 0x48E302,
+    /// 0x48E49E, 0x48E678, 0x48EB06, 0x48FD8C), so there `0xB1` is the host's own id before its room closes.
+    /// For a joiner the host learns by `'K'` (0x589152: the slot's bit and countdown go) and the room's
+    /// disconnect 0x492770 (walks the peers whose `[peer] == 0`, 0x490836…0x490845) sends the others the
+    /// `0xB1` through 0x48BDA0 (0x48BE05) — which is what the port's host room does.
     pub(crate) fn fe_session_leave(&mut self) {
         if let Some(mut n) = self.net.session.take() {
             tracing::info!("front end: session left (0x48E6F0 / 0x48E9C0)");

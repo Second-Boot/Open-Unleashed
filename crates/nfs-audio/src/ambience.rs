@@ -430,8 +430,8 @@ impl Ambience {
     /// `p2 − p1`). The record's own position field gets **`p2`** (the *later* sample, not `p1`) —
     /// `0x477a2e`'s copy writes `[esp+0x1c..0x24]` (still holding `p2` at that point) into the
     /// record, matching `0x4AEF30`'s own field order. The caller supplies both samples (typically
-    /// `nfs_formats::crp::AnimTrack::sample` on the object's own path — see that call site's own
-    /// `APPROXIMATION` note for the frame-rate/loop caveat) so this method stays free of any
+    /// `nfs_formats::crp::AnimTrack::sample` on the object's own path — the loop wrap is the caller's
+    /// (`eval_pair` in nfs-game/src/world.rs passes `self.looping`)) so this method stays free of any
     /// track/animation-format dependency.
     pub fn sync_animated(&mut self, index: usize, p1: [f32; 3], p2: [f32; 3]) {
         if let Some(e) = self.animated.get_mut(index) {
@@ -670,7 +670,7 @@ impl Ambience {
     /// kind-5 arm: the level `([0x5D1750] AmbientLevel · [0x5D14BC] game.spl[3] · 0x7F · 85) >> 21`
     /// (0x4A9969…0x4A9A30, the ambience's own [`Self::voice_volume`]), the pan byte of the angle
     /// ([`crate::mixer::pan_byte`], 0x4A9B4B…0x4A9B84), no bend, the patch as the bank has it.
-    /// (Was an APPROXIMATION, settled below:) the original plays only if the streamed patch has loaded during the
+    /// (Settled on the original, below:) the original plays only if the streamed patch has loaded during the
     /// countdown (0x4A8570 answers −1 until then, and 0x4A9BC7 then plays nothing); the port's
     /// banks are in memory, so it always plays. **Observed on the original (2026-10-01 SV, Wine, industrial
     /// with `skyrendering = 2`, gdb at 0x4A8340 / 0x4A98E0 / 0x4A9BC7, two separate races):** a strike's

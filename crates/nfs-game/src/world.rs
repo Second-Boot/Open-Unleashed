@@ -993,7 +993,7 @@ pub fn tree_population(track: &TrackAssets, articles: &[Option<CullArticle>]) ->
 /// (0x487ABD) *before* 0x47B660 runs (0x487CD8), so its items — the `.scn` GEOM elements, each a
 /// library article at the record's matrix (`(crp article, world matrix)`) — are in the tree's
 /// box and vertex population like any bundle's. *(§14.76 read the count as 0 there: 0x482970
-/// zeroes `[+0x18]` at 0x482987 and sets it at 0x482C76 / 0x482C97.)* APPROXIMATION: a scene
+/// zeroes `[+0x18]` at 0x482987 and sets it at 0x482C76 / 0x482C97.)* Settled (closed cd8003d8; the port's `parked_scene_slots` does this): a scene
 /// with no element keeps 64 slots live, parked as `DFLT` at y 9999 in the original (`[+0x44]`,
 /// 0x482C76): the caller ([`TrackWorld::upload`]) passes them in `scene` — the five Monaco tracks
 /// and the skidpad have no start scene, so that is every race there.
@@ -2207,7 +2207,7 @@ impl TrackWorld {
     /// (water) scrolls V by `t − ⌊t⌋`, `t = ticks · rate · 1e-4`; mode 2 (flags/banners) wobbles U
     /// by `sin(th · τ) · 0.06`, `th = ticks · rate · 2e-4` turns. Neither mode's bit 0x200 interlock
     /// (`+0x117E4`, "someone already owns the UVs") applies here — nothing else in the port writes
-    /// a track item's UVs. APPROXIMATION: the original phase-offsets mode 2 by the layer's own UV
+    /// a track item's UVs. PORT-DEVIATION D33: the original phase-offsets mode 2 by the layer's own UV
     /// source pointer's low 12 bits (0x448E12) so identical articles do not wobble in step; the
     /// port has no such pointer and uses phase 0 for every one — every flag on one material wobbles
     /// in lockstep.

@@ -263,7 +263,7 @@ impl LaneScratch {
     /// takes the real array: [`Self::find_blockers_placed`] with every car's `car+0x528` from
     /// [`crate::race_order::RaceOrder`], sorted at the end of the previous even tick with the
     /// original's stable bubble sort. Without places (this entry point, the unit tests) it sorts the
-    /// cars itself on the slices they have now — APPROXIMATIONS there: a racer that is unlapping or
+    /// cars itself on the slices they have now — TEST GLUE (not race code: the race always supplies the places through `LanePassCtx`): a racer that is unlapping or
     /// has finished (`+0xB20` ahead of the lap, `traffic.md` §17.5c) is keyed on its slice all the
     /// same, and ties keep the registration order where the original keeps the previous sort's.
     pub fn find_blockers(&mut self, table: &SliceTable, me: &LaneSelf, cars: &[LaneCar], pers: &Personality) {
@@ -283,7 +283,7 @@ impl LaneScratch {
     /// car+0x528, one per entry of cars)` — the places [`crate::race_order::RaceOrder`] gave every
     /// car at the end of the previous even tick (0x417800 → 0x417710), which is what 0x401FA2's
     /// `0x5E8B88[(car+0xEB0·i + n + car+0x528) mod n]` reads. Without them the walk falls back to
-    /// a fresh sort on the slices of this tick (the APPROXIMATION described above).
+    /// a fresh sort on the slices of this tick (the TEST GLUE fallback described above).
     pub fn find_blockers_placed(&mut self, table: &SliceTable, me: &LaneSelf, cars: &[LaneCar], pers: &Personality, positions: Option<(glam::Vec3, &[glam::Vec3])>, places: Option<(usize, &[usize])>) {
         self.find_blockers_buffered(&mut Vec::new(), table, me, cars, pers, positions, places)
     }
@@ -843,7 +843,7 @@ mod tests {
     /// is the `None`-`places` fallback only — used before the first even-tick resort (or the unit
     /// tests), never once `places` is supplied. So a pass inside a slice does not swap the walk
     /// order when the real array is given, matching the original; `traffic.md` §34.11's remaining
-    /// APPROXIMATION note is for that fallback alone.
+    /// TEST GLUE note is for that fallback alone.
     #[test]
     fn with_places_the_within_slice_order_is_the_race_orders_history_not_the_current_position() {
         let t = ring(400, 2, 2);

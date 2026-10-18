@@ -148,6 +148,10 @@ pub struct DialSpec {
 }
 
 impl DialSpec {
+    /// The option block's cleared state: what the dial options hold when no front end copied a car's
+    /// record into them (a `fe = 0` launch, 0x4EB710 never runs). Style 0, no units, no sweep.
+    pub const CLEARED: DialSpec = DialSpec { style: 0, total_units: 0, needle_style: 0, start_deg: 0, deg_per_unit_x1000: 0, needle_pivot: 0 };
+
     pub fn parse(r: &[u8], off: usize) -> Result<Self, FormatError> {
         let v = |i: usize| u16_le(r, off + i * 2, "nfs5.car dial").map(|x| x as i16);
         Ok(Self { style: v(0)?, total_units: v(1)?, needle_style: v(2)?, start_deg: v(3)?, deg_per_unit_x1000: v(4)?, needle_pivot: v(5)? })

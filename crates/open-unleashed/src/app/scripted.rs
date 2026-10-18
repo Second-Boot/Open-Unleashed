@@ -1142,6 +1142,17 @@ impl App {
         {
             c.set_anim(r, 2, c.anim_length(2) as f32);
         }
+        // **TEST GLUE**: a scripted run draws no frames, and the mirror's texture is made by the frame's
+        // pass (`render_mirror`, before the main view) — without it the still carried the empty tray. The
+        // first still makes the texture and rebuilds the scene so the HUD holds it; later ones refresh it
+        // in place ([`Self::take_screenshot`] does the same).
+        if self.rear_mirror.is_some() {
+            let first = self.mirror_tex.is_none();
+            self.render_mirror();
+            if first {
+                self.rebuild_scene();
+            }
+        }
         let (w, h, _) = shot_geometry();
         if let Some(r) = self.renderer.as_mut()
             && let Ok(rgba) = r.render_to_image(&self.scene, &self.camera, w, h)

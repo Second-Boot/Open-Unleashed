@@ -631,7 +631,7 @@ impl App {
     /// the sprites are fractions of the target, so they land at `× scale` physical pixels. At scale 1
     /// that is the original to the pixel. A font is the native bitmap font drawn `scale` times
     /// as large (its glyph quads are simply scaled; for an integer scale that is a nearest-neighbour
-    /// enlargement if the renderer samples nearest, otherwise the sampler's filter — APPROXIMATION
+    /// enlargement if the renderer samples nearest, otherwise the sampler's filter — PORT-DEVIATION D30
     /// for fractional scales, which the original has no analogue for).
     pub(crate) fn hud_geometry(&self) -> (u32, u32, f32) {
         if let Some(t) = self.shot_target {

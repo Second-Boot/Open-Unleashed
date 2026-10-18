@@ -442,9 +442,19 @@ impl App {
         // table — no read anywhere in it of the car's light block or of any `.map` / ambient
         // global, so its colour and alpha are the material's own constant, not the car's light nor
         // the `.map` ambient (`nfs_game::world::TRACK_LIGHT`, for the same "no light of its own").
+        // The strength is the `SHAD` texel's own alpha (at most 136 / 255, black texels) times
+        // the vertex colour, which is white in both paths of 0x43B820 (`[ebp−0x2C…−0x20]` = −1,
+        // 0x43B842…0x43B84E; the race's quad grid reads the same four words, 0x43B972 → `+0xB8`),
+        // so `alpha` stays 1: the 0.9 this carried was the first shadow's stand-in (the HUD
+        // commit's `shadow_item`), read from nowhere. The blend is the default pair 0
+        // (`SRCALPHA` / `INVSRCALPHA`, state object `{1, 2, 0, 0, 0, −1}` of 0x5379F0 — it names
+        // no pair of its own). The alpha test is the flush's `GREATER 10` (Thrash 0x24 ← 10 at
+        // 0x466703 before the list `+0xC` the cars' slot 2 0x437AB0 is drawn from; 0x43B820 sets
+        // no state of its own): a texel (× the white vertex) of alpha ≤ 10 is dropped.
         items.push(nfs_renderer::DrawItem {
             layer_light: Some(nfs_game::world::TRACK_LIGHT),
-            alpha: 0.9,
+            alpha_test: true,
+            alpha_ref: 10,
             early: true,
             depth_bias,
             ..nfs_renderer::DrawItem::new(mesh, material, Mat4::IDENTITY)

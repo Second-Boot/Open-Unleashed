@@ -944,6 +944,8 @@ impl App {
                 // legitimately show here for this track under the shipped default; the capture
                 // most likely reflects a different `SplitTimes` choice or stale session state in
                 // that one wine run, not a difference in this port's zero/sentinel handling.
+                // the label reads the global `SPLITTIMES [0x657DD8]` (0x42A279), the gate above the record
+                let split_times = self.choice_global(choice::DISPLAY_SPLIT_TIMES).map_or(split_times, |(i, _)| i);
                 match split_times {
                     2 => Some((23, laps.iter().copied().min().unwrap_or(0))),
                     3 => Some((24, laps.last().copied().unwrap_or(0))),

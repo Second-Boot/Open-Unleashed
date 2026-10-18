@@ -117,7 +117,7 @@ impl Pump {
 }
 
 /// From the mix rate to the output device's: the port mixes at [`mix_rate`] and interpolates
-/// linearly between two mixed frames per device frame. APPROXIMATION of that one step: the
+/// linearly between two mixed frames per device frame. PORT-DEVIATION D27 (device rate): the
 /// original hands the mix-rate buffer to DirectSound, and the conversion to the card's rate (if
 /// any) is the card's or the system mixer's, not the game's.
 #[derive(Default)]

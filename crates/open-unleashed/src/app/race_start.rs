@@ -1031,7 +1031,6 @@ impl App {
             });
             self.fe_rng = nfs_game::opponents::FeRng::new(t);
         }
-        self.sky = Sky::upload(&mut renderer, &self.track, sky_level, &mut self.fe_rng);
         // 0x4B6827 / 0x4B682E: steps 4 and 5 straight after the whole track load 0x468FB0 (the sky and
         // the weather were its last parts), the track picture drawn at 5
         self.race_loading_frame(&mut renderer, 4);
@@ -1065,6 +1064,10 @@ impl App {
         self.cam_anims = nfs_game::camera::anim_cam::load(&self.track.crp, &self.track.crp_data);
         self.race_loading_frame(&mut renderer, 6);
         self.race_stage_audio(playing, &mut world);
+        // the sky after the pick: the pass draws the pick (`AudioLoadTrack` 0x4A88A0, 0x4A8A6D) before
+        // its sky remake (0x414EB0 → 0x4690A0 → 0x45DBD0, 0x414F21), race_stages.rs; the sky's
+        // jitter draws from the same generator (0x5561D0 → 0x538040)
+        self.sky = Sky::upload(&mut renderer, &self.track, sky_level, &mut self.fe_rng);
         // 0x4B6855: step 7 after `SND_coll` 0x4A8CD0 (the collision sounds, `CollisionSfx` above)
         self.race_loading_frame(&mut renderer, 7);
         // 0x414E63: step 8 in the race init 0x414DB0, before `Cars_create` 0x411130 (0x414E68) makes the cars

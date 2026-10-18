@@ -350,7 +350,7 @@ impl LayoutScreen {
     /// `[this+0x144]` accessor's `SetSelection` (slot 0x2C) when it is **below** the count
     /// `[this+0x140]` answers (slot 0x6C, `jge` at 0x4FA4BD); otherwise nothing, and the slot
     /// answers 0. There is no lower bound and no x test. `None` for any other widget, or a row
-    /// at or past the count. The pointer is in design pixels, taken whole (APPROXIMATION: the
+    /// at or past the count. The pointer is in design pixels, taken whole (PORT-DEVIATION D32: the
     /// original's are the event's integer pixels).
     pub fn ko_row_at(&self, index: usize, x: f32, y: f32) -> Option<usize> {
         if let Some((k, j)) = self.route(index) {

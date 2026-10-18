@@ -640,18 +640,25 @@ impl Hud {
         let (tex, nw, nh, pivot) = needle;
         let piv_y = 1.0 - pivot / nh;
         let (pos, size) = Self::place(aspect, centre[0] - nw * 0.5, centre[1] - nh * piv_y, nw, nh);
-        out.push(Sprite {
-            texture: tex,
-            pos,
-            size,
-            uv_min: [0.0, 0.0],
-            uv_max: [1.0, 1.0],
-            color: [1.0; 4],
-            rotation: Self::needle_turns(spec, value),
-            pivot: [0.5, piv_y],
-            tri: None, corner_colors: None,
-            depth: None,
-        });
+        // A dial with no units (`total` 0: the options of a `fe = 0` launch, `DialSpec::CLEARED`) has an
+        // empty vertex table: `setValue` 0x421650 clamps the value to `total − 1` = −1 and reads the
+        // entry before the table, the object's own pointer fields (`this + 0xD0…`) taken as floats ≈ 0,
+        // so the needle quad collapses on the centre and nothing of it shows (the original's stills:
+        // faces and hub, no needle, `hud.md` §3.5). Inference from the stills and the read, not run.
+        if spec.total_units > 0 {
+            out.push(Sprite {
+                texture: tex,
+                pos,
+                size,
+                uv_min: [0.0, 0.0],
+                uv_max: [1.0, 1.0],
+                color: [1.0; 4],
+                rotation: Self::needle_turns(spec, value),
+                pivot: [0.5, piv_y],
+                tri: None, corner_colors: None,
+                depth: None,
+            });
+        }
         if let Some(hub) = self.hub {
             out.push(self.image(aspect, hub, centre[0] - 10.0, centre[1] - 10.0, 20.0, 20.0));
         }

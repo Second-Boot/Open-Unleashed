@@ -494,8 +494,9 @@ pub struct LayoutScreen {
     /// set by [`claim_pointer`](Self::claim_pointer) while a sibling panel holds the window's hit
     /// (EV3): this screen then sees no pointer, though it keeps the one it was handed
     denied: bool,
-    /// diagnostic (`hit_sweep`): the scan counts every class, as 0x528C00 does
-    wide_hit: bool,
+    /// diagnostic (`hit_sweep`): the scan keeps only the classes the port used to count (the
+    /// hoverable and text-entry ones), the stand-in that `hovered_scan_owner` no longer applies
+    narrow_hit: bool,
     /// The pointer the **cursor sprite** is drawn at, when it is not `cursor`. The cursor draw
     /// 0x4E1C90 takes the device's position straight from 0x5372A0(6) (0x4D32D9…0x4D32EF), not
     /// from an event, so the pointer moves while the input dispatch 0x4D2850 is dropping the
@@ -868,12 +869,13 @@ pub struct Car3dWidget {
 }
 
 impl Car3dWidget {
-    /// Where `positiontype` puts the car, camera-relative (0x4BFF28…0x4BFF75). `positiontype` 0
+    /// Where `positiontype` puts the car, camera-relative (0x4BFF1F…0x4BFF75: 0x4D1700's x is the last
+    /// argument pushed — type 1 pushes 0xC019999A, types 2 and 3 0x4019999A). `positiontype` 0
     /// has none of its own.
     pub fn position(&self) -> Option<[f32; 3]> {
         match self.position_type {
-            1 => Some([2.4, 0.2, 8.1]),
-            2 => Some([-2.4, 0.2, 8.1]),
+            1 => Some([-2.4, 0.2, 8.1]),
+            2 => Some([2.4, 0.2, 8.1]),
             3 => Some([2.4, -1.2, 6.2]),
             _ => None,
         }
@@ -1279,7 +1281,7 @@ impl LayoutScreen {
                 Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
             }),
             denied: false,
-            wide_hit: false,
+            narrow_hit: false,
             pointer: None,
             // `NFS_FE_PRESS=1` holds the button down for a still, the pair of `NFS_FE_CURSOR`
             pressed: crate::config::cfg().nfs_fe_press.as_str().is_some_and(|v| v != "0"),
@@ -3623,7 +3625,7 @@ impl LayoutScreen {
         // first (`[this+0x120]`, §4.57).
         //
         // **The leave (type 6) to the former hit IS forwarded** (N04, read 2026-10-02, replaces
-        // the APPROXIMATION that said it was not): 0x5289B0's move arm sends type 6 to the old
+        // the earlier reading that said it was not): 0x5289B0's move arm sends type 6 to the old
         // `[window+0x110]` through its slot 3 (0x528A16…0x528A2D); for a panel that is
         // `FEPanel::handleEvent` **0x4CEB30** — types 5 and 6 (0x4CEB51…0x4CEB59) take the
         // sub-window's stored pointer `[sub+0x114]` (0x529030), hit-test it (0x528C00, the first
@@ -3646,14 +3648,15 @@ impl LayoutScreen {
         }
     }
 
-    /// Diagnostic for over a grid of design-space points, where the first-hit widget
-    /// changes when the scan counts **every** class (0x4CEE70 / 0x528C00 do), as `class -> class`
+    /// Diagnostic for over a grid of design-space points, where the first-hit
+    /// widget changes between the old hoverable-only stand-in (`narrow_hit`) and the scan as the
+    /// original runs it (every class by its own slot 19, 0x528C00 / 0x4CEE70), as `class -> class`
     /// pairs with a count and one sample point.
     pub fn hit_sweep(&mut self) -> Vec<String> {
-        fn set_wide(s: &mut LayoutScreen, w: bool) {
-            s.wide_hit = w;
+        fn set_narrow(s: &mut LayoutScreen, n: bool) {
+            s.narrow_hit = n;
             for g in s.groups.values_mut() {
-                set_wide(g, w);
+                set_narrow(g, n);
             }
         }
         fn class_at(s: &LayoutScreen, i: usize) -> String {
@@ -3678,11 +3681,10 @@ impl LayoutScreen {
             let mut x = 0;
             while x <= 640 {
                 self.place_cursor(Some((x as f32, y as f32)));
-                set_wide(self, false);
+                set_narrow(self, true);
                 let a = self.hovered_scan_owner().map(|(i, _)| i);
-                set_wide(self, true);
+                set_narrow(self, false);
                 let b = self.hovered_scan_owner().map(|(i, _)| i);
-                set_wide(self, false);
                 if a != b {
                     let ca = a.map_or("-".to_string(), |i| class_at(self, i));
                     let cb = b.map_or("-".to_string(), |i| class_at(self, i));
@@ -3872,27 +3874,49 @@ impl LayoutScreen {
                 }
                 continue;
             }
-            // **APPROXIMATION (measured 2026-10-02, not widened).** 0x528C00 and a panel's
-            // 0x4CEE70 test the box of **every** child, whatever its class (all of them share
-            // 0x525A90 on the box 0x4C86F0 = computeBox 0x5253C0, the parts' union). The filter below
-            // is narrower. `--layout-sweep` with `NFS_HIT_SWEEP=1` (`hit_sweep`, `wide_hit`) counts, on
-            // a 2-px grid, where the first hit would change if it counted every class: on many
-            // shipped screens (the `Options` panels over the tab wedges, `advancedrepair`'s four
-            // `GlintyRectangle` frames over its `ListBox`, `QuickRace` / `FactoryVictory`'s
-            // `ExtraCircle` over the `3DCAR`, …) — and a few of those cannot be the shipped
-            // behaviour taken literally (a frame eating every click on the list it frames), so the
-            // box of a decoration is not known to be what the original's is. Left narrow until one
-            // such click is observed on the running original (RE/notes/controls.md 2026-10-02).
+            // A panel or radio group with no embedded layout built (a tab's panel that is not up, or a
+            // file that did not load) answers its slot 19 with false: 0x4CEE70 tests the children of
+            // `[this+0x14C]`, and that is null (RE/notes/controls.md). Its own box is never
+            // tested, so it takes no pointer here.
+            if matches!(e.class.as_str(), "NFS5.PANEL" | "NFS5.RADIOGROUP") {
+                continue;
+            }
+            // The window's hit test 0x528C00 asks every child's **slot 19** (`containsPoint`), and
+            // the first child that answers true takes the hit. Read 2026-10-18 from the vtables in
+            // nfs5.exe (slot 19 = vtable + 0x4C): `Control::containsPoint` 0x525A90 — the box from
+            // slot 13 (0x4C8670 = computeBox 0x5253C0), inclusive on both edges — for
+            // `NFS5.GlintyRectangle` (0x5BADA4), `NFS5.ListBox` (0x5B611C), `NFS5.3DCAR` (0x5B5878),
+            // `NFS5.BEVELEDOPTIONBOX` (0x5BAD34), `NFS5.GLINTYLINE` (0x5BAE14), and every other
+            // registered shipped vtable (the 41 of RE/notes/controls.md §4.19 and the rest of the
+            // layouts' classes: `pictures`, `badges`, `movie`, `text-entry`, ... — all 0x525A90).
+            // The classes that override it: `NFS5.GRAPHICTABBUTTON` 0x4CABA0 (the slanted test,
+            // `tab_slant`, applied below) and `NFS5.PANEL` / `NFS5.RADIOGROUP` 0x4CEE70 (any child
+            // of the embedded layout, the groups above).
+            // A class with no code of its own (`NFS5.ExtraCircle` and the other template-only ids)
+            // is built by the factory fallback 0x4C73C0, which stores vtable `FEControl` 0x5B5CA0
+            // (0x4C745A) — its slot 19 is 0x525A90 as well (0x5B5CEC).
+            // So no class is filtered by its kind: the box decides, as in 0x525A90. The box itself is
+            // `Control::getBox` 0x4C86F0 (slot 13), which returns four zeros when `[this+0x125]` is set
+            // — `data.nosize` — or when the widget is hidden (`[this+0x10C] & 0x20`); 0x525A90 fails an
+            // empty box (`left == right`, 0x525AAF). The templates of PICTURE, ExtraCircle, REAL.LABEL,
+            // Rectangle, OutlineRectangle, GlintyRectangle, MovieBox, OvalThing, the factory pictures,
+            // HudDControl and AccessorWatch set `nosize.value=1`, so those never take the pointer
+            // (RE/notes/REFERENCE-2026-10-18-srv-hit.md: measured on the original, GameSetup, GameCtrl,
+            // Options). `nosize` is the widget's own `.lay` key, else the template default.
             //
-            // The window's hit test (0x528C00) asks every child's containsPoint (0x525A90) and
-            // knows nothing of a hover state; `can_hover_at` stands in for "a widget that reacts to
-            // the pointer" and is right for the buttons. The three text-entry classes react to a
-            // click without ever having a `[state.hover]` (their `.ctr` states are `normal,
-            // hidden, focused[, disabled]`): the release goes to their slot 9 (0x4CCB70,
-            // 0x4C2220) which takes the focus. Without them here a click on `Comms.IP` (or the
-            // chat line) never reached the box and nothing could be typed into it.
+            // **APPROXIMATION (kept, 2026-10-18).** `state_draws_nothing` still skips a widget whose
+            // current state draws no part at all. For an autosizing widget that is what the original's
+            // box gives (the union of the drawn parts is empty, so 0x525A90 fails); for a widget with
+            // a fixed `size.value` (`autosize = 0`, the seven classes of §4.62) the original's box is
+            // still the size, and this skip would drop it. No shipped layout was checked for such a
+            // widget under the pointer, so the skip stays until that is read. `nosize` does not cover
+            // it: the draw-nothing state is a different thing from `data.nosize`.
+            //
+            // `narrow_hit` (diagnostic only, `hit_sweep`) keeps the old stand-in: a hoverable class
+            // or one of the three text-entry classes (their click goes to slot 9, 0x4CCB70 / 0x4C2220).
             let takes_click = self.classes[i].takes_click();
-            if !(self.wide_hit || self.can_hover_at(i) || takes_click) || self.state_draws_nothing(e) {
+            let nosize = self.attr_num(e, "nosize").is_some_and(|v| v != 0.0);
+            if (self.narrow_hit && !(self.can_hover_at(i) || takes_click)) || nosize || self.state_draws_nothing(e) {
                 continue;
             }
             // **A hidden widget contributes no box** (`[this+0x10C] & 0x20`, the bit 0x50D910's helper

@@ -571,7 +571,8 @@ pub(crate) fn crowding_factor(distances: impl IntoIterator<Item = f32>) -> u8 {
 }
 
 /// The music picks' clock term: `GetTickCount()` (0x4AE4D0, 0x4ADDA0) / `timeGetTime()` (0x4AD790),
-/// the milliseconds since Windows started. APPROXIMATION: the port has no such clock and takes the
+/// the milliseconds since Windows started. Class D (settled, unobservable; the host clock is PORT-DEVIATION D20):
+/// the port has no such clock and takes the
 /// wall clock's milliseconds since the epoch, truncated to 32 bits — like the original's, a value
 /// that differs from launch to launch, which is all the picks use it for (the sum with
 /// 0x538040's draw, `|sum| % n`).

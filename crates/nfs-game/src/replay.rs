@@ -498,7 +498,7 @@ pub struct ReplaySetup {
     /// restore hands the recording's back, so a playback of a Quick Knockout (3) runs the lap
     /// knockout, of the cops race (1) the cops race, and so on (0 normal, 1 cops, 2 series,
     /// 3 lap knockout, 4 skill test: `modes.md` section 1, 0x4EB470). `None` for a file written before
-    /// the field existed: the playback then runs as a single race (APPROXIMATION, logged).
+    /// the field existed: the playback then runs as a single race (PORT-DEVIATION D22, logged).
     pub race_type: Option<u8>,
     /// `FEGAME_TYPE` (`[0x6573E8]`, id 0x30 at +0x00): the launch's `Game.GameType`, also the
     /// recording's after the same restore (0x4EB4DE...0x4EB4E2 writes it). `None` as above: the
@@ -510,10 +510,10 @@ pub struct ReplaySetup {
     /// The player's car-info record (slot 0): the installed parts, their wear, the seventeen sliders and the
     /// damage the car starts with (`.PARTINDEX` 0x14B, `.PARTDAMAGE` 0x14C, the sliders, `.DAMAGEZONES` 0x14D) -
     /// what the launch's 0x4EEDA0 wrote and 0x49C4C0 / 0x49CB50 / 0x49D290 build the car from. `None` for a file
-    /// that carries none: the playback's car is then a fresh catalogue car (APPROXIMATION, logged).
+    /// that carries none: the playback's car is then a fresh catalogue car (PORT-DEVIATION D22, logged).
     pub player: Option<CarRecord>,
     /// The opponents' car-info records (slots 1...8, the plan the race built them from: the draw or the career's
-    /// own list). `None` = the file carries none: the playback draws them again (APPROXIMATION, logged).
+    /// own list). `None` = the file carries none: the playback draws them again (PORT-DEVIATION D22, logged).
     pub opponent_cars: Option<Vec<CarRecord>>,
     /// `SCENENUMBER` (id 0x1C): the `_ST<N>` skill-test scene, 0 = none. `None` = the file carries none.
     pub scene: Option<i16>,
@@ -524,7 +524,7 @@ pub struct ReplaySetup {
     /// `.TRANSMISSION` (id 0x221, `carinfo+0xC`, +0xC of every car slot): the gearbox word the launch wrote
     /// (`Car.Transmission`'s index, 1 = automatic; 0 for the Factory Driver mission 0x1D's own car) — the word
     /// 0x49D290's manual ×1.05 and the shift logic read, from the block `Replay_begin` restores, **not** the
-    /// session's option. `None` = the file carries none: the playback takes the option (APPROXIMATION, logged).
+    /// session's option. `None` = the file carries none: the playback takes the option (PORT-DEVIATION D22, logged).
     pub transmission: Option<bool>,
     /// `.TRANSMISSION` of the opponents' slots (+0xC of slot 1…): the option, while the player's own word is 0 in
     /// Factory Driver mission 0x1D (only the player's 0x4EEDA0 call passes that flag, 0x4EBA4D). `None` = the file

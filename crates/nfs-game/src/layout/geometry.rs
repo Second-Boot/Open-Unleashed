@@ -62,7 +62,7 @@ pub fn combo_knob(y: f32, h: f32, count: usize, first: usize) -> (f32, f32, i32)
 /// ```
 ///
 /// The event's y is an integer, so both ends are taken to the design pixel first — the port's
-/// cursor is sub-pixel (APPROXIMATION of the original's integer mouse position). `None` when the
+/// cursor is sub-pixel (PORT-DEVIATION D32: the original's integer mouse position). `None` when the
 /// travel is zero (the original would divide by zero there; it cannot arise, since the knob is at
 /// most `h − 26` tall only when the bar has no travel and then nothing scrolls).
 pub fn combo_drag_pos(py: f32, grab_y: f32, grab_at: usize, count: usize, travel: i32) -> Option<i32> {

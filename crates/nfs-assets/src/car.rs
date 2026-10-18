@@ -1025,7 +1025,8 @@ const PALETTE_ENTRY_255: [u8; 4] = [0, 0, 0, 0];
 /// (`examples/pagesrc.rs`: the drivers' `Suit.fsh` / `Head.fsh` entries, the `f901` `flag` / `eng`,
 /// the `eas8` `hood`), whose writer 0x444329 keeps bit 15 = `alpha > 0`. The candidates of the
 /// first copy with the alpha byte zero — all but the two `.tpg` pointers — leave the texel
-/// transparent there, so the port takes a zero dword (APPROXIMATION; the colour bits differ by
+/// transparent there, so the port takes a zero dword (settled: the alpha byte of that texel is always 0 on the original, closed by SRV-B in
+/// REFERENCE-2026-10-02-SRVB.md; the colour bits differ by
 /// candidate and only reach the screen through the filter).
 fn palette_path_texels(palette: &[[u8; 4]; 255], indices: &[u8], tints: &[[u8; 3]; 18]) -> Vec<u8> {
     let pal: Vec<[u8; 4]> = palette.iter().map(|&c| tint_texel(c, tints)).collect();
@@ -1099,7 +1100,7 @@ fn tint_texel(s: [u8; 4], tints: &[[u8; 3]; 18]) -> [u8; 4] {
 /// A channel cut to its high `bits` and brought back to eight bits by repeating them — what the
 /// sampler reads out of the D3D 4444 / 1555 / 565 texture dx7z makes of the page (its format
 /// classifier 0x60003710 knows 1555, 565, 4444, 888 and 8888). For 4 bits this is `x·17`, exactly
-/// `x/15`; for 5 and 6 bits the byte nearest `x/31`, `x/63` up to rounding (APPROXIMATION: the
+/// `x/15`; for 5 and 6 bits the byte nearest `x/31`, `x/63` up to rounding (PORT-DEVIATION D29: the
 /// hardware's expansion is in no code).
 fn expand(v: u8, bits: u32) -> u8 {
     let x = (v >> (8 - bits)) as u32;
@@ -1298,7 +1299,8 @@ pub fn blend_patch(page: &mut TexturePage, patch: &DamagePatch, damage: f32) {
                 page_bpp::RGB565 => blend_565(&mut page.rgba[d..d + 4], px),
                 page_bpp::ARGB8888 => blend_32(&mut page.rgba[d..d + 4], px),
                 _ => {
-                    // APPROXIMATION (4444 page, see above)
+                    // Settled unreachable (STATUS, class D): no shipped page is 4444; the original would write
+                    // 565 words into one, so this arm is not run for shipped data.
                     let a = src[s + 3] as f32 / 255.0 * (level as f32 / 255.0);
                     if a <= 0.0 {
                         continue;

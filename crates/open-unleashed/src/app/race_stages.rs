@@ -125,12 +125,13 @@ impl App {
                     if !playing {
                         // the pick's `0x538040() + GetTickCount()` (0x4AE739…0x4AE746): the shared
                         // generator `fe_rng`, which the session's load reseeded from `time(0)`
-                        // (0x428C2D), and the clock (`tick_count_ms`, APPROXIMATION). APPROXIMATION
-                        // (order): the original's pick (the pass, `AudioLoadTrack` 0x4A88A0) draws
-                        // before the pass remakes the sky (0x4690A0 → 0x45DBD0, the jitter
-                        // 0x45F3C0); the port's one sky was drawn at the load (`Sky::upload`), so
-                        // here the pick comes after the jitter's draws — same count, swapped order
-                        // on a clock-seeded state
+                        // (0x428C2D), and the clock (`tick_count_ms`, PORT-DEVIATION D20). Order: the pass
+                        // draws the pick (`AudioLoadTrack` 0x4A88A0 → 0x4AE4D0, 0x4A8A6D; the draws
+                        // at 0x4AE65A…0x4AE739) before it remakes the sky (0x414EB0 → 0x4690A0 at
+                        // 0x414F21 → 0x45DBD0 → the jitter 0x45F3C0, 0x45EADF). The port's sky
+                        // (`Sky::upload`, race_start.rs) is made right after this pick. Not modelled:
+                        // the sky pass 0 of the track load (0x468FB0 → 0x45DBD0(track, 0) at 0x4B6820,
+                        // before 0x414DB0 and the HUD's reseed); its draws are not read (APPROXIMATION)
                         let rng = &mut self.fe_rng;
                         m.start_race(a, &mut || rng.next_u32().wrapping_add(crate::app::audio::tick_count_ms()));
                     }

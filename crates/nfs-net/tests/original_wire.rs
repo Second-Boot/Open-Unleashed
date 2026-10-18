@@ -35,7 +35,7 @@ fn the_joiners_j_is_the_originals_byte_for_byte() {
         let mut ours = Datagram::encode(b'j', &j.encode()).unwrap();
         assert_eq!(ours.len(), 137, "tag + 0x88 (0x588107: push 0x88)");
         // +0x84 (datagram +0x85): four stack leftovers in the original, `e0 0a 37 00` in both sessions;
-        // the port sends zeros there (APPROXIMATION, nothing reads them)
+        // the port sends zeros there (settled, class D: nothing reads them)
         assert_eq!(&ours[133..], &[0, 0, 0, 0]);
         assert_eq!(&g[133..], &[0xe0, 0x0a, 0x37, 0x00]);
         ours[133..].copy_from_slice(&g[133..]);
@@ -185,8 +185,21 @@ fn the_data_layer_opens_a_link_with_one_empty_q_and_a_q_takes_nothing_away() {
     assert_eq!(&buf[..n], b"q", "an empty 'q' first (0x582711)");
     let n = c.recv(&mut buf).unwrap();
     assert_eq!(buf[0], b'=', "then the frame, {n} bytes");
+    // `link+0x4C` stays below 0 until a frame from the peer is accepted (0x5826DF): the second send is
+    // preceded by a `'q'` again (0x582700 tests the state on every send)
     let n = c.recv(&mut buf).unwrap();
-    assert_eq!(buf[0], b'=', "and no second 'q': {n} bytes");
+    assert_eq!(&buf[..n], b"q", "another empty 'q' while the peer has not spoken");
+    let n = c.recv(&mut buf).unwrap();
+    assert_eq!(buf[0], b'=', "then the frame, {n} bytes");
+    // the peer's first frame (the captured ack-only `3d 0000 fffd 00 00`) turns the link on: no more `'q'`
+    c.send_to(&unhex("3d0000fffd0000"), at).unwrap();
+    for _ in 0..10 {
+        h.poll();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.send_game_to(&[me], &[0xBE, 7, 8, 9]).unwrap();
+    let n = c.recv(&mut buf).unwrap();
+    assert_eq!(buf[0], b'=', "no 'q' once the peer has sent a frame: {n} bytes");
     // the peer's own `'q'` is not answered with `'!'` and does not free its slot
     c.send_to(b"q", at).unwrap();
     for _ in 0..10 {

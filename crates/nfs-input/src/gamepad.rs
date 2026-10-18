@@ -362,7 +362,7 @@ impl Gamepads {
     /// [`axis_sets`](Self::axis_sets) orders them, the d-pad as the first hat and the buttons in
     /// [`BUTTON_ORDER`]. DirectInput numbers a pad's buttons in the device's own HID order, which
     /// `gilrs` does not expose; this port's numbering is `BUTTON_ORDER`, so a button binding's
-    /// number is this port's own — APPROXIMATION. The capture and the reader use the same order,
+    /// number is this port's own — PORT-DEVIATION D25. The capture and the reader use the same order,
     /// so what is bound is what is read.
     pub fn records(&self) -> Vec<crate::bindings::PadRecord> {
         let mut out = Vec::new();

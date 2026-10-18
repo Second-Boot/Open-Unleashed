@@ -166,9 +166,17 @@ impl Grid {
     }
 
     /// 0x47BAD0 then 0x47A300: the index of the cell record for a position. A position outside the
-    /// tree's box answers a null node (key 0), which finds the first record. When no record's key
-    /// reaches the node's (a node past the last cell in allocation order) the original indexes
-    /// past its table; the last cell stands in (APPROXIMATION).
+    /// tree's box answers a null node (key 0), which finds the first record.
+    ///
+    /// Every node 0x47BAD0 returns has its own record, so the `lower_bound` is an exact match and
+    /// never reaches the end pointer. 0x47BAD0 returns a node only when it is a leaf (0x479810
+    /// records each node with no children), when it is at the chosen level (0x479810 records each
+    /// node with `level >= chosen`), or when its child slot is empty, which only an internal node
+    /// with fewer than four children has: 0x47BE30 creates all four children of a split node at
+    /// once (0x47BF69 tests the node's own list), so no internal node has an empty slot. The
+    /// original's out-of-table read past the end pointer (0x47A300's `esi` at 0x47A34B) is therefore
+    /// not reachable from a position; the clamp below is only a bounds guard for Rust indexing and never
+    /// changes a reachable answer.
     fn cell_of(&self, p: Vec3) -> u32 {
         let key = self.tree.descend(p.x, p.y, p.z, self.chosen_level).map_or(0, |n| n.id);
         let i = self.cells.partition_point(|c| c.node < key);

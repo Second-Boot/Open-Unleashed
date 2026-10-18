@@ -64,7 +64,7 @@ pub fn to_cp1252(ch: char) -> Option<u8> {
 /// targets a Cyrillic key arrives as its 1251 byte. The port stores strings as the byte decoded
 /// through [`cp1252`], so a Latin/Windows-1252 char maps to itself and a Cyrillic letter to
 /// `cp1252(its Windows-1251 byte)`, which the byte-keyed font then draws as that letter.
-/// APPROXIMATION: the original's mapping is whatever ANSI code page the Windows install has; this
+/// PORT-DEVIATION D26: the original's mapping is whatever ANSI code page the Windows install has; this
 /// assumes the Russian one (1251) for Cyrillic keys — on another code page the original would
 /// accept fewer letters (it errs toward accepting Cyrillic the original would take only on a
 /// Russian system).

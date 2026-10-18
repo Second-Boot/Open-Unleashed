@@ -218,10 +218,15 @@ fn vs_main(in: VsIn, @builtin(instance_index) inst: u32) -> VsOut {
     // place on screen and its `w`, and the depth buffer compares exactly `sz + bias`. A vertex the
     // original clips (outside near…far, tested on the unbiased Z by 0x5B0660) is left to the
     // clipper here as well.
-    // APPROXIMATION: the original hands the device `sz + bias` unclamped; what Direct3D does with
-    // a screen z outside [0, 1] is not read — here it is held at the near / far plane, so the
-    // vertex is neither clipped nor wrapped (a negative bias at the near end leaves it in front of
-    // everything, as the earlier pull did).
+    // APPROXIMATION (device behaviour only): dx7z hands the device `sz + bias` unclamped and
+    // unclipped — its vertex copy (0x60006B41…, 0x60007008…0x60007056) only `fadd`s the stored bias,
+    // the whole flush 0x60006F20 / quad path 0x60007650 holds no float compare, and the one draw
+    // 0x60006A50 is `DrawIndexedPrimitive` (vtable +0x68) with the flags word [0x60031A60] never
+    // written (0, so no DONOTCLIP) on FVF 452 = pre-transformed. What the Direct3D runtime / card
+    // then does with a screen z outside [0, 1] (clip at the plane, or clamp) is not in any binary
+    // that can be read (`RE/notes/thrash.md` §6d.3, "Near-plane vertices"): here it is held at the
+    // near / far plane, so the vertex is neither clipped nor wrapped (a negative bias at the near end
+    // leaves it in front of everything, as the earlier pull did).
     let dz = object.lit_dir.w;
     if dz != 0.0 && out.clip.w > 0.0 && out.clip.z >= 0.0 && out.clip.z <= out.clip.w {
         out.clip.z = clamp(out.clip.z + dz * out.clip.w, 0.0, out.clip.w);

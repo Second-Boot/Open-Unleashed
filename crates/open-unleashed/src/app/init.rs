@@ -558,10 +558,19 @@ impl App {
             wall_hits: 0,
             resets: 0,
             hud: None,
-            dials: catalog
-                .iter()
-                .find(|c| c.sim.eq_ignore_ascii_case(&sim_name))
-                .map(|c| (c.dial_kmh, c.dial_mph, c.dial_tach)),
+            // **A launch with no front end (`fe = 0`) never runs 0x4EB710** (called from 0x4ECF00, the front
+            // end's launch): the ten dial options (`SPEEDOSTYLEKMH` … `SPEEDOTOTALUNITS`, 0x657DF4…0x657E1C)
+            // keep their cleared values, so HSpeedometer 0x42E710 / HTach 0x42F3A0 build style 0 faces
+            // (`speedK` 0 = 200 km/h, `tach` 0 = 60) with no units to sweep (`RE/notes/hud.md` §3.5). A
+            // front-end race copies the car's own `nfs5.car` records (0x4EBA8E…) instead.
+            dials: if !use_menu && career_id.is_none() && !mission_flag && replay_file.is_none() {
+                Some((nfs_formats::fedata::DialSpec::CLEARED, nfs_formats::fedata::DialSpec::CLEARED, nfs_formats::fedata::DialSpec::CLEARED))
+            } else {
+                catalog
+                    .iter()
+                    .find(|c| c.sim.eq_ignore_ascii_case(&sim_name))
+                    .map(|c| (c.dial_kmh, c.dial_mph, c.dial_tach))
+            },
             paint: launch.look.paint,
             owned_paint: launch.look.owned_paint,
             owned_decal: launch.look.owned_decal,

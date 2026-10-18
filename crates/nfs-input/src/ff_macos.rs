@@ -6,8 +6,8 @@
 //!
 //! The original game had DirectInput force feedback only; nothing here is the original's. The
 //! mapping of its effects onto a pad's two motors is the caller's (`open_unleashed::app::force_feedback`,
-//! **APPROXIMATION A2**: road → the Strong motor at a constant level, engine → the Weak motor,
-//! jolt → a Strong pulse, the spring dropped) — this module is the same approximation on another
+//! **PORT-DEVIATION D24, A2**: road → the Strong motor at a constant level, engine → the Weak motor,
+//! jolt → a Strong pulse, the spring dropped) — this module is the same deviation on another
 //! platform, it only provides the mechanism.
 //!
 //! Mechanism, per motor ("channel"):

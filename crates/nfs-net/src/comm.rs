@@ -177,8 +177,8 @@ pub fn answer_query(head: Header, record: Option<&[u8; RECORD_SIZE]>) -> (u8, Ve
 /// The session description a `'d'` carries (§7.6 reads it, §7.10 builds it).
 ///
 /// 0x5892A0 sends **0xAC** bytes but only writes the fields below; the gaps carry whatever was on
-/// its stack, so this port sends zeroes there — an **APPROXIMATION** of those bytes, and the only
-/// one in this module. The handler 0x588B45 never reads them.
+/// its stack, so this port sends zeroes there — settled (closed by SRV-C,
+/// `RE/notes/REFERENCE-2026-10-02-SRVC.md` §4): the handler 0x588B45 never reads them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Describe {
     /// `+0x00` — the request number the `'r'` carried, or **0** when a `'w'` provoked it.
@@ -393,8 +393,14 @@ impl Join {
 
     /// The `'j'` an original joiner sends (0x588030 + 0x588130), field by field. `to` is the host's
     /// address as typed, `own` the joiner's own socket record, `identity` the `name~version~game` text.
-    /// **APPROXIMATION:** the four bytes at `+0x84` are stack leftovers in the original (`e0 0a 37 00` in
-    /// both captured sessions); a host never reads them (0x589440 copies 0x5C bytes), so they are zero.
+    /// The four bytes at `+0x84` are stack leftovers in the original (`e0 0a 37 00` in both captured
+    /// sessions) and **nothing reads them**, so they are zero: the `'j'` handler 0x588E11…0x588F7B hands
+    /// 0x589440 `payload + 0x28` (`add ebx, 0x28; push ebx`, 0x588EA0), which copies exactly 0x17 dwords =
+    /// 0x5C bytes (`rep movsd`, 0x58948C…0x589497), i.e. up to `payload + 0x84` exclusive; the handler has
+    /// no other load of the payload past that record (checked over its whole extent). The one other
+    /// consumer is the optional session callback `[session+0x4C]` (0x588EBF…0x588ECC, which gets the
+    /// pointer `payload + 0x28`); whether it is set on a game's session was not traced, the stub 0x508E70
+    /// that the create passes returns 0 and cannot be it.
     pub fn original(request: u32, to: Addr, own: Addr, identity: &[u8]) -> Self {
         let mut rec = vec![0u8; record::SIZE + 4];
         rec[..20].copy_from_slice(&own.0);

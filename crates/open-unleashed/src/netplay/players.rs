@@ -199,7 +199,7 @@ impl NetPlay {
     ///
     /// The comm layer's own events give **4** (0x48F0C4, 0x48FBB6): a connect that runs out
     /// ([`JOIN_TIMEOUT`], conman event 5) and a host that goes silent after we were in (events 9 / 10).
-    /// **APPROXIMATION** of the two joins' refusals, which the original never had in this form (its
+    /// **PORT-DEVIATION D35** of the two joins' refusals, which the original never had in this form (its
     /// version / game / full checks are the room's `0xC6` after a link that is up): a refused `'a'`
     /// maps to 11 (`Full`, −2), 10 (`Refused`, −3: the identity gate of `nfs_net::session`) and — with
     /// no original writer on a LAN, state 8 is the lobby service's `0xC6` value — 8 (`NameTaken`, −1,

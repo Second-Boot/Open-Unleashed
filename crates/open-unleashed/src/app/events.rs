@@ -372,7 +372,7 @@ impl ApplicationHandler for App {
                     && let (Some(a), Some(m)) = (&self.snd.audio, self.snd.music.as_mut())
                 {
                     // the pick is `0x538040() + timeGetTime()` (0x4AD87E…0x4AD88B); the port's
-                    // clock is the wall clock's milliseconds — APPROXIMATION for the time since
+                    // clock is the wall clock's milliseconds — PORT-DEVIATION D20 for the time since
                     // Windows started
                     let rng = &mut self.fe_rng;
                     let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u32);
