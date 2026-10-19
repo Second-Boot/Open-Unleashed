@@ -56,6 +56,10 @@ struct ObjectUniform {
     sky_u: [f32; 4],
     sky_v: [f32; 4],
     sky_on: [f32; 4],
+    /// `view_proj · model` multiplied out in `f64` and rounded once (PORT-DEVIATION D37): the clip
+    /// position of a vertex, so that a car 4 km from the world origin does not lose its sub-millimetre
+    /// depth order to `f32` world coordinates
+    mvp: [[f32; 4]; 4],
 }
 
 /// A mesh's vertices and indices: a byte range of a vertex buffer and of an index buffer. A static
@@ -1691,6 +1695,7 @@ impl Core {
             // built on the CPU and copied in once: wgpu 30's mapped views are write-only
             // (`WriteOnly`), not a `&mut [u8]` to cast in place
             let mut objects: Vec<ObjectUniform> = vec![bytemuck::Zeroable::zeroed(); n];
+            let vp64 = glam::DMat4::from_cols_array(&vp.to_cols_array().map(f64::from));
             for (o, item) in objects.iter_mut().zip(scene.items.iter().take(n)) {
                 let mat = self.materials.get(item.material.0 as usize);
                 let env_mix = mat.map_or(0.0, |m| m.env_mix);
@@ -1715,6 +1720,7 @@ impl Core {
                 let pull = mat.map_or(0.0, |m| depth_bias_offset(m.depth_bias.saturating_add(item.depth_bias)) * (a_port / a_game));
                 *o = ObjectUniform {
                     model: item.transform.to_cols_array_2d(),
+                    mvp: (vp64 * glam::DMat4::from_cols_array(&item.transform.to_cols_array().map(f64::from))).as_mat4().to_cols_array_2d(),
                     // .x is the environment-map mix, .zw a uv offset (the sky layers scroll with it)
                     // .y flags an item the headlight projector lights
                     env_mix: [env_mix, item.headlit as u32 as f32, item.uv_offset[0], item.uv_offset[1]],

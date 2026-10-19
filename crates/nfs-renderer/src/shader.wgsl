@@ -134,6 +134,8 @@ struct Object {
     sky_u: vec4<f32>,
     sky_v: vec4<f32>,
     sky_on: vec4<f32>,
+    // `view_proj · model`, multiplied out in f64 by the host (PORT-DEVIATION D37)
+    mvp: mat4x4<f32>,
 };
 // every object of the pass sits in one read-only storage buffer, bound once per pass; a draw names
 // its object by `first_instance` (`instance_index`), which the vertex stage hands to the fragment
@@ -208,7 +210,7 @@ fn vs_main(in: VsIn, @builtin(instance_index) inst: u32) -> VsOut {
     var out: VsOut;
     out.obj = inst;
     let world = object.model * vec4<f32>(in.position, 1.0);
-    out.clip = globals.view_proj * world;
+    out.clip = object.mvp * vec4<f32>(in.position, 1.0);
     // Thrash state 0x18, the depth bias (`lit_dir.w`, an offset of the screen z): with the DX7
     // driver the game keeps it itself (0x540500 / 0x5404A0 store `b · 2^-15` at `ctx+0x1180C` once
     // 0x5492DC has seen "DX7" in `THRASH_about`) and adds it to the screen z of its own

@@ -183,7 +183,15 @@ fn run() -> Result<()> {
     // replay's bit-exact comparison (`replay.md` §18.15)
     let car = match replay_setup.as_ref().filter(|r| r.car_id != 0).and_then(|r| catalog.iter().find(|e| e.id == r.car_id)) {
         Some(e) => car.with_style(e.variant).with_cabrio(e.cabrio),
-        None => car,
+        // TEST GLUE: a scripted `--mission` run takes the mission car's catalogue record the same way
+        // (`load_career_race`: body style, roof, the parts' style overlay)
+        None => match career_request.as_ref() {
+            Some(r) => car
+                .with_style(r.car.variant)
+                .with_cabrio(r.car.cabrio)
+                .with_style_overlay(r.parts.iter().flat_map(|p| p.geometry_swaps.iter().copied()).collect()),
+            None => car,
+        },
     };
     let sim_name = replay_setup
         .as_ref()
