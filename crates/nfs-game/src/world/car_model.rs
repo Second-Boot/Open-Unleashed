@@ -1669,18 +1669,19 @@ impl CarModel {
     ///
     /// `steer` is each front wheel's `+0xB4` over 216 (turns, negated in a mirrored race); `rpm`
     /// is `car+0xDB4`, `speed` `car+0xEC4`; `dt_ms` advances the clock 0x53C2E0 stands for.
-    pub fn update_race_channels(&mut self, dt_ms: u32, steer: [f32; 2], spin: [f32; 4], rpm: f32, speed: f32) {
+    pub fn update_race_channels(&mut self, dt_ms: u32, steer: [f32; 2], spin: [f32; 4], roll: [f32; 4], rpm: f32, speed: f32) {
         self.clock_ms += dt_ms as u64;
         // `TIMER_getTicks` (0x53C2E0 → `[0x6B7C7C]`) counts at 128 Hz (`timing.md`)
         let clock = (self.clock_ms * 128 / 1000) as u32;
         let yz = &mut self.channel_yz;
         // 1, 2 `.y` = the fronts' steer; 1…4 `.x` = −the wheel's turn (`+0x88`); `.z` is the
-        // wheel's `+0x70`, which this port's suspension does not produce (left at 0)
+        // wheel's `+0x70` (`Wheel::render_angle`, 0x4384F3…0x43852F), in turns
         for (k, s) in steer.iter().enumerate() {
             yz[1 + k][0] = *s;
         }
         for k in 0..4 {
             self.channel_turns[1 + k] = -spin[k];
+            yz[1 + k][1] = roll[k];
         }
         // 11 `.z`: `.TACH0RPM + .TACH1000RPM · rpm · 0.001` (0x43853C…0x438561); 12 `.z`:
         // `.SPEEDO0KM + .SPEEDO100KM · car+0xEC4 · 0.144` (0x43856C…0x438593)
@@ -1799,7 +1800,10 @@ impl CarModel {
 
     /// Draw items for a car at `car_to_world` (body frame → world). `wheel_spin` in turns,
     /// `steer` in turns for the front wheels, positive to the right — take it from
-    /// `Vehicle::wheel_steer_turns`, not from the raw `Wheel::steer`. `travel` is the car's four
+    /// `Vehicle::wheel_steer_turns`, not from the raw `Wheel::steer`. `roll` is each wheel's
+    /// `+0x70` (`Wheel::render_angle`), which slot 9 copies into channels 1…4's and 18…21's `.z`
+    /// **as turns** (0x4384F3…0x43852F, 0x438669…0x438726) — a few degrees of tilt with the
+    /// suspension's travel. `travel` is the car's four
     /// translation channels' `.y` ([`CarLodState::travel`]) and `passes` the car draw's calls
     /// ([`race_passes`], [`in_car_passes`], [`FRONT_END_PASSES`]).
     ///
@@ -1807,16 +1811,16 @@ impl CarModel {
     /// mask ([`PartInfo::in_pass`]) in `Base+70` order (0x43C1B0's sort of that LOD's list), and
     /// the passes one after the other as 0x444E00 makes them — the driver, then the body, then the
     /// wheels.
-    pub fn draw_items(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2], travel: [f32; 4], passes: &[CarPass]) -> Vec<DrawItem> {
+    pub fn draw_items(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2], roll: [f32; 4], travel: [f32; 4], passes: &[CarPass]) -> Vec<DrawItem> {
         let mut out = Vec::with_capacity(self.body.len() / 4 + 4 * 8);
-        DRAW_SCRATCH.with(|s| self.draw_items_into(&mut out, &mut s.borrow_mut(), car_to_world, wheel_spin, steer, travel, passes));
+        DRAW_SCRATCH.with(|s| self.draw_items_into(&mut out, &mut s.borrow_mut(), car_to_world, wheel_spin, steer, roll, travel, passes));
         out
     }
 
     /// [`Self::draw_items`] appending to `out` with the caller's scratch buffers, so a frame's cars
     /// allocate nothing per car beyond `out` itself.
     #[allow(clippy::too_many_arguments)]
-    pub fn draw_items_into(&self, out: &mut Vec<DrawItem>, scratch: &mut DrawScratch, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2], travel: [f32; 4], passes: &[CarPass]) {
+    pub fn draw_items_into(&self, out: &mut Vec<DrawItem>, scratch: &mut DrawScratch, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2], roll: [f32; 4], travel: [f32; 4], passes: &[CarPass]) {
         // 0x4433D2 / 0x4433BC: `(−m·s, s, −s)` — `MODEL_TO_BODY` scaled, its x turned back in a
         // mirrored race; and the steer channels negated there (0x438471)
         let car_to_world = car_to_world * Mat4::from_scale(Vec3::new(if self.mirror { -self.scale } else { self.scale }, self.scale, self.scale));
@@ -1844,8 +1848,8 @@ impl CarModel {
                     // and the parts that turn with the steer but do not spin. Taking them from the
                     // caller's `steer` instead of this model's own channels is what lets the traffic
                     // and the cops have them: those share one upload per car type.
-                    n @ 18..=21 if n <= 19 => *local * Mat4::from_rotation_y(steer[(n - 18) as usize] * std::f32::consts::TAU),
-                    20..=21 => *local,
+                    // `.z` of 18…21 is the wheel's `+0x70` too (0x438669…0x438726 copy all three, `.x` then cleared)
+                    n @ 18..=21 => *local * Mat4::from_rotation_y(if n <= 19 { steer[(n - 18) as usize] } else { 0.0 } * std::f32::consts::TAU) * Mat4::from_rotation_z(roll[(n - 18) as usize] * std::f32::consts::TAU),
                     // 5, the steering wheel: `.z = ch1.y + ch2.y` within ±4.5/23 (0x43858F…0x4385FB).
                     // Off the caller's `steer` for the same reason as 18…21 — the traffic and the cops
                     // share one model per car type and would otherwise hold the wheel straight.
@@ -1880,11 +1884,16 @@ impl CarModel {
                 // `.y` is the wheel's own `+0xB4` over 216 (channels 1 and 2, 0x438461…0x4384EB); a
                 // turn about y is the same in both frames
                 let st = if w.is_front { Mat4::from_rotation_y(steer[if w.is_left { 0 } else { 1 }] * std::f32::consts::TAU) } else { Mat4::IDENTITY };
+                // `.z`, the wheel's `+0x70` in turns (0x4384F3…0x43852F; 18…21 copy it, 0x438669…0x438726):
+                // `Rx·Ry·Rz` is the channel's composition (0x43CA26 / 0x43CA38) in the engine's row
+                // convention — x first, z last — so in the column products used here the roll is the
+                // outermost, after the steer: the camber about the model's z
+                let rz = Mat4::from_rotation_z(roll[idx] * std::f32::consts::TAU);
                 for (mesh, material, local) in &w.parts {
                     // local has translation = pivot (every wheel `tr` is a pure translation); rotate
                     // about the pivot in model space, the lift before it: `tr · T · R`
                     let pivot = local.w_axis.truncate();
-                    let m = lift(w.info.move_channel) * Mat4::from_translation(pivot) * MODEL_TO_BODY * st * spin * body_to_model * Mat4::from_translation(-pivot) * *local;
+                    let m = lift(w.info.move_channel) * Mat4::from_translation(pivot) * MODEL_TO_BODY * rz * st * spin * body_to_model * Mat4::from_translation(-pivot) * *local;
                     items.push((w.order, DrawItem::new(*mesh, *material, to_body * m)));
                 }
             }
@@ -2148,8 +2157,8 @@ impl CarModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn draw_items_block(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2], travel: [f32; 4], passes: &[CarPass], block: &LightBlock) -> Vec<DrawItem> {
-        let mut out = self.draw_items(car_to_world, wheel_spin, steer, travel, passes);
+    pub fn draw_items_block(&self, car_to_world: Mat4, wheel_spin: [f32; 4], steer: [f32; 2], roll: [f32; 4], travel: [f32; 4], passes: &[CarPass], block: &LightBlock) -> Vec<DrawItem> {
+        let mut out = self.draw_items(car_to_world, wheel_spin, steer, roll, travel, passes);
         for it in &mut out {
             it.layer_light = self.material_light.get(&it.material).and_then(|l| block.layer_light(*l));
         }

@@ -42,12 +42,12 @@ fn place_at_slice_drops_the_body_onto_the_road() {
     let mut v = Vehicle::bare(Vec3::new(0.0, 3.0, 0.0), Mat3::IDENTITY, 2.3, 1300.0, 0.8, 0.3);
     v.set_car_body(pts, Vec3::new(0.91, 0.631, 2.1));
     v.game_tick = 0;
-    v.place_at_slice(&grid, &specs, Vec3::new(5.0, 0.0, 5.0), Vec3::Z, Vec3::new(1.5, 0.5, 0.0), true, false);
+    v.place_at_slice(&grid, &specs, Vec3::new(5.0, 0.0, 5.0), Vec3::Z, [Vec3::X, Vec3::Y, Vec3::Z], Vec3::new(1.5, 0.5, 0.0), true, false);
     assert!((v.position - Vec3::new(6.5, 0.631, 5.0)).length() < 1e-4, "{:?}", v.position);
     assert!((v.draw_origin().y).abs() < 1e-4);
     assert_eq!(v.body_height, 0.0);
     v.game_tick = 0x1C1;
-    v.place_at_slice(&grid, &specs, Vec3::new(5.0, 0.0, 5.0), Vec3::Z, Vec3::new(-2.0, 0.0, 7.0), true, true);
+    v.place_at_slice(&grid, &specs, Vec3::new(5.0, 0.0, 5.0), Vec3::Z, [Vec3::X, Vec3::Y, Vec3::Z], Vec3::new(-2.0, 0.0, 7.0), true, true);
     assert!((v.position - Vec3::new(-2.0, 0.631, 7.0)).length() < 1e-4, "{:?}", v.position);
     assert!((v.orientation.row(2) - Vec3::NEG_Z).length() < 1e-5, "flipped: forward negated");
 }
@@ -241,4 +241,57 @@ fn a_hard_landing_clamps_the_spin_per_component() {
     assert_eq!(v.angular_velocity, Vec3::new(0.7, -0.7, 0.75));
     assert!((v.position.y + 0.05).abs() < 1e-6);
     assert!((v.velocity.y - 0.4 * 0.7 * 8.0).abs() < 1e-5, "{:?}", v.velocity);
+}
+
+/// 0x49B40C…0x49B41E: when 0x49AF70 finds the final position on another patch than the slice
+/// centre's, its refresh copies the slice record's own vectors into `car+0x3B8…`, and 0x417260 /
+/// 0x417310 copy them into the orientation and the physics frame — the raw, non-orthonormal slice
+/// frame (alps grid slice 44, logged live in `REFERENCE-2026-10-22-PA-TRACE.md`), lateral and
+/// forward negated under `flip`. On the centre's own patch nothing refreshes and the frame built at
+/// 0x49B22F stays. (The flat grid's two triangles meet on `x = z`.)
+#[test]
+fn a_placed_car_takes_the_raw_slice_frame() {
+    let grid = flat();
+    let specs = super::tests::specs_993();
+    let lat = Vec3::new(-0.924_635, 0.0, 0.380_855);
+    let up = Vec3::new(0.012_049, 0.999_434, 0.031_408);
+    let fwd = Vec3::new(-0.357_964, 0.033_64, -0.933_129);
+    let rows = |v: &Vehicle| (v.orientation.row(0), v.orientation.row(1), v.orientation.row(2));
+    let mut v = Vehicle::bare(Vec3::new(0.0, 3.0, 0.0), Mat3::IDENTITY, 2.3, 1300.0, 0.8, 0.3);
+    // centre on (x > z), the corner pushed 1.5 m along the built lateral across `x = z`
+    v.place_at_slice(&grid, &specs, Vec3::new(5.0, 0.0, 4.9), fwd, [lat, up, fwd], Vec3::new(1.5, 0.5, 0.0), false, false);
+    assert_eq!(rows(&v), (lat, up, fwd));
+    assert_eq!(v.frame, v.orientation);
+    // flipped, from the other side of the line
+    let mut v = Vehicle::bare(Vec3::new(0.0, 3.0, 0.0), Mat3::IDENTITY, 2.3, 1300.0, 0.8, 0.3);
+    v.place_at_slice(&grid, &specs, Vec3::new(4.9, 0.0, 5.0), fwd, [lat, up, fwd], Vec3::new(-1.5, 0.5, 0.0), false, true);
+    assert_eq!(rows(&v), (-lat, up, -fwd));
+    // the same patch: the built frame (up = the patch normal, orthonormal)
+    let mut v = Vehicle::bare(Vec3::new(0.0, 3.0, 0.0), Mat3::IDENTITY, 2.3, 1300.0, 0.8, 0.3);
+    v.place_at_slice(&grid, &specs, Vec3::new(20.0, 0.0, 0.0), fwd, [lat, up, fwd], Vec3::new(1.5, 0.5, 0.0), false, false);
+    assert_eq!(v.orientation.row(1), Vec3::Y);
+    assert!((v.orientation.row(0).dot(v.orientation.row(2))).abs() < 1e-6);
+}
+
+/// 0x49BA01…0x49BA1D: the byte countdown `car+0x80` (0 on a placed racer) runs 0x4A4810 on the
+/// 256th 64 Hz rotation step and every 32nd after it — the original's first one on the alps grid
+/// was at game tick 255, measured live.
+#[test]
+fn the_orientation_is_reorthonormalised_on_its_own_countdown() {
+    let skew = Mat3::from_cols(Vec3::new(-0.924_635, 0.0, 0.380_855), Vec3::new(0.012_049, 0.999_434, 0.031_408), Vec3::new(-0.357_964, 0.033_64, -0.933_129)).transpose();
+    let mut v = Vehicle::bare(Vec3::ZERO, skew, 2.3, 1300.0, 0.8, 0.3);
+    for _ in 0..255 {
+        v.integrate64();
+    }
+    assert_eq!(v.orientation, skew, "untouched for 255 steps");
+    v.integrate64();
+    assert_ne!(v.orientation, skew, "the 256th step re-orthonormalises");
+    assert_eq!(v.orientation, renormalise_matrix(skew));
+    let once = v.orientation;
+    for _ in 0..31 {
+        v.integrate64();
+    }
+    assert_eq!(v.orientation, once);
+    v.integrate64();
+    assert_eq!(v.orientation, renormalise_matrix(once), "then every 32nd");
 }

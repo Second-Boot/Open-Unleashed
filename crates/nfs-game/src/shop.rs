@@ -194,6 +194,23 @@ impl Career {
         }
     }
 
+    /// The basket after a part went back into the inventory at position `pos` — the replaced part
+    /// `install_spare` pushes (0x5185B4…) or the one `uninstall_part` pushes (0x518771…0x51878A,
+    /// the same record pointer: `mov ecx, [edi]; mov [ebp], ecx`). An entry that named that record
+    /// while it sat on a car ([`ShopItem::Moved`]) finds it in the inventory again (0x5182D7), so it
+    /// is a sale of `pos` once more. The record is matched by its part and damage, the identity a
+    /// [`ShopItem::Moved`] keeps.
+    pub fn shop_spare_returned(basket: &mut [ShopItem], pos: usize, back: SparePart) {
+        for item in basket.iter_mut() {
+            if let ShopItem::Moved(id, bits) = *item
+                && id == back.id
+                && bits == back.state.to_bits()
+            {
+                *item = ShopItem::Sell(pos);
+            }
+        }
+    }
+
     /// **0x518740(part, car)** — `UNINSTALLPART` (0x4F1C40): if the part is on the car
     /// (`car+0x758`), push it onto the inventory and erase it from the car (0x51876F…0x518869).
     pub fn uninstall_part(&mut self, tables: &CareerTables, car: usize, part: i16) {
@@ -559,6 +576,29 @@ mod tests {
         c.shop_purchase(&t, &mut b).unwrap();
         // the two spares still in the inventory (ids 5 and 3) were sold, the moved one was not
         assert!(!c.spares.iter().any(|s| s.id == 5 || s.id == 3), "{:?}", c.spares);
+    }
+
+    /// 0x518740 pushes the record pointer it took off the car back into the inventory, so a basket
+    /// entry that followed the part onto the car (0x5155FC) names an inventory record again and the
+    /// purchase finds it (0x5182D7).
+    #[test]
+    fn an_uninstalled_part_is_found_again_by_its_basket_entry() {
+        let (t, mut c) = shop();
+        c.garage[0].parts = vec![2, 1];
+        c.spares = vec![SparePart { id: 5, state: 0.0 }, SparePart { id: 3, state: 3.0 }];
+        let mut b = Vec::new();
+        c.shop_add(&t, &mut b, ShopItem::Sell(1));
+        let moved = c.spares[1];
+        assert!(c.install_spare(&t, 0, 1));
+        Career::shop_spare_installed(&mut b, 1, moved);
+        assert!(matches!(b[0], ShopItem::Moved(3, _)));
+        let before = c.spares.len();
+        c.uninstall_part(&t, 0, 3);
+        assert_eq!(c.spares.len(), before + 1);
+        Career::shop_spare_returned(&mut b, before, *c.spares.last().unwrap());
+        assert_eq!(b[0], ShopItem::Sell(before));
+        c.shop_purchase(&t, &mut b).unwrap();
+        assert!(!c.spares.iter().any(|s| s.id == 3), "{:?}", c.spares);
     }
 
     /// 0x518510 / 0x518740: installing swaps the same category and type name into the inventory,

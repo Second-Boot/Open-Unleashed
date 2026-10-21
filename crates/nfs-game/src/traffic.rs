@@ -1487,7 +1487,7 @@ impl TrafficSet {
                 for w in &mut b.wheels {
                     *w = nfs_physics::vehicle::Wheel::default();
                 }
-                b.place_at_slice(g, specs, sl.centre, sl.forward.normalize_or_zero(), Vec3::ZERO, false, dir < 0.0);
+                b.place_at_slice(g, specs, sl.centre, sl.forward.normalize_or_zero(), [sl.lateral, sl.up, sl.forward], Vec3::ZERO, false, dir < 0.0);
                 Self::sync_out_one(&mut self.cars[i], &self.bodies[i]);
             }
             _ => {
@@ -1746,7 +1746,7 @@ impl TrafficSet {
                 for w in &mut b.wheels {
                     *w = nfs_physics::vehicle::Wheel::default();
                 }
-                b.place_at_slice(g, specs, sl.centre, sl.forward.normalize_or_zero(), Vec3::new(lateral, 1.0, 0.0), false, dir < 0.0);
+                b.place_at_slice(g, specs, sl.centre, sl.forward.normalize_or_zero(), [sl.lateral, sl.up, sl.forward], Vec3::new(lateral, 1.0, 0.0), false, dir < 0.0);
                 Self::sync_out_one(&mut self.cars[i], &self.bodies[i]);
                 let c = &mut self.cars[i];
                 c.velocity = c.orientation.row(2) * target;
@@ -1874,7 +1874,7 @@ mod tests {
         c.angular_velocity = Vec3::ZERO;
         set.sync_in(0);
         let specs = crate::police::test_specs();
-        set.bodies[0].place_at_slice(&grid, &specs, Vec3::new(5.0, h(5.0), 0.0), Vec3::Z, Vec3::new(0.0, 1.0, 0.0), false, false);
+        set.bodies[0].place_at_slice(&grid, &specs, Vec3::new(5.0, h(5.0), 0.0), Vec3::Z, [Vec3::X, Vec3::Y, Vec3::Z], Vec3::new(0.0, 1.0, 0.0), false, false);
         set.sync_out(0);
         // `Car_ground` at 32 Hz and the integrators at 64 Hz, until the body has settled
         for tick in 0..256u64 {

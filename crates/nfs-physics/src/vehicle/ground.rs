@@ -523,6 +523,7 @@ impl Vehicle {
         // `car+0xDAC`, 0x499D22…0x499D34: `net_car`, a remote car in a positional race).
         if self.game_tick < 2 || self.net_car {
             w.compression = 0.0;
+            w.render_angle = 0.0;
         } else if c > 0.0 {
             let cmax = if i < 2 { 0.9 } else { 0.75 } * (specs.bump_travel - specs.probe_offset);
             if c > 2.0 * cmax {
@@ -532,6 +533,16 @@ impl Vehicle {
         } else {
             let c = c.max(-(if w.airborne { 1.65 } else { 1.6 }) * specs.bump_travel);
             w.compression = 0.5 * (c + w.compression);
+        }
+        // `wheel+0x70` (0x499E91...0x499EDA): `asin(0.1·specs[0x120])`, plus `0.1·compression` only
+        // when this tick's `c` was above 0, negated for wheels 1 and 3 (`ebp` 0x0 / 0x18 positive)
+        if !(self.game_tick < 2 || self.net_car) {
+            let mut arg = specs.probe_offset * 0.1;
+            if c > 0.0 {
+                arg += w.compression * 0.1;
+            }
+            let a = nfs_math::portable::asin(arg as f64) as f32;
+            w.render_angle = if i == 0 || i == 2 { a } else { -a };
         }
         w.height_d = h_i - probe.y;
         let d_i = w.height_d.max(-0.30625);

@@ -376,6 +376,38 @@ impl SliceTable {
     /// raw slice — `(N − 1 − p) / N` (the earlier reading) sat one slice, 6 m, from the original's and
     /// put the lap line between the wrong pair of slices (`race-logic.md` §1.5a).
     pub fn frac(&self, slice: usize) -> f32 {
+        let Some(raw) = self.section_frac(slice) else { return self.frac_by_route(slice) };
+        if self.backwards {
+            // 0x4162E4…0x416302: `1 − f`, and on a circuit exactly 1.0 becomes 0.0
+            let f = 1.0 - raw;
+            if !self.linear && f == 1.0 {
+                return 0.0;
+            }
+            return f;
+        }
+        raw
+    }
+
+    /// 0x481B70 + 0x416290 / 0x416A30 on the **raw** slice (the original never reverses its table):
+    /// the segment holding the slice (the first of the split list with `first ≤ slice ≤ last`,
+    /// 0x481B8B…0x481BA0), its entry node's `lapFraction` `f0` and its exit node's `f1` (`≤ 0.01`
+    /// becomes 1.0, `[0x5B27A8]`), `len = last − first + 1`; then
+    /// `(slice − first) / len · (f1 − f0) + f0` (0x4162C8…0x4162DE, each step rounded to f32 as the
+    /// 24-bit x87 does). `None` for a slice in no segment or a segment end no node holds.
+    fn section_frac(&self, slice: usize) -> Option<f32> {
+        let seg = self.junctions.segments.iter().find(|s| (s.first..=s.last).contains(&slice))?;
+        let f0 = self.junctions.nodes.get(seg.entry_node?)?.lap_fraction;
+        let mut f1 = self.junctions.nodes.get(seg.exit_node?)?.lap_fraction;
+        if f1 <= 0.01 {
+            f1 = 1.0;
+        }
+        let len = (seg.last + 1 - seg.first) as f32;
+        Some(((slice - seg.first) as f32 / len) * (f1 - f0) + f0)
+    }
+
+    /// APPROXIMATION (a slice no segment or node covers — tables built by hand in tests): the route
+    /// position over the lap length.
+    fn frac_by_route(&self, slice: usize) -> f32 {
         let p = self.route_pos.get(slice).copied().unwrap_or(0);
         if self.backwards {
             let raw = (self.lap_len as u32).saturating_sub(1).saturating_sub(p);

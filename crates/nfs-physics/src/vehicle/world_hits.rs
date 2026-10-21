@@ -129,8 +129,12 @@ impl Vehicle {
         hit
     }
 
-    /// `Car_propPass` 0x498DE0: the props whose AABB meets the car's position ± 5 m (0x473870 with
-    /// 0x486510 — the tree query's 3 m leaf search is not reproduced, every prop is tried), each
+    /// `Car_propPass` 0x498DE0: the candidates of 0x473870 — the leaves of the track tree whose box
+    /// meets the car's position ± 3 m (0x484630 with `0x40400000`), each leaf's object entries
+    /// (type byte 0, the `+0` of its 8-byte entries) in insertion order whose AABB meets
+    /// position ± 5 (0x486510, x and z), appended once **per leaf entry** with no de-duplication
+    /// (0x4738E0…0x473945): a prop listed in two leaves is tried twice, in leaf order
+    /// ([`crate::track_tree::TrackTree::prop_candidates`]) — each
     /// through 0x498280 — `|d·x| ≤ r + hx` and `|d·fwd| ≤ r + hz` for `d` the x-z offset to its
     /// centre — and then its slot 8 (0x487290) on the car's velocity `car+0x33C`: **2** (solid, and
     /// every prop without pieces) takes the cylinder's push 0x498AA0 or the box's 0x498690; **1**,
@@ -142,12 +146,20 @@ impl Vehicle {
     /// setup 0x4A12D7…0x4A136D writes, so a racing car's is 0 (MEDIUM: its allocation's zero). The
     /// `car+0x43C` hold that would skip the pass (0x498DE9) never runs: every writer in the image
     /// stores 0 (`suspension-collision.md` §4.2 item 10; corrected 2026-09-25 from "not carried").
-    pub fn collide_props(&mut self, props: &[crate::props::Prop], tick: u32) -> Option<(f32, PropEvent)> {
+    pub fn collide_props(&mut self, props: &[crate::props::Prop], tree: &crate::track_tree::TrackTree, tick: u32) -> Option<(f32, PropEvent)> {
+        let candidates: Vec<usize> = tree.prop_candidates(self.position, props).collect();
+        self.collide_prop_list(candidates.into_iter().map(|i| &props[i]), tick)
+    }
+
+    /// TEST GLUE: every prop of the slice in order, as the port did before the tree query.
+    pub fn collide_props_all(&mut self, props: &[crate::props::Prop], tick: u32) -> Option<(f32, PropEvent)> {
+        let pos = self.position;
+        self.collide_prop_list(props.iter().filter(|p| p.near(pos, 5.0)), tick)
+    }
+
+    fn collide_prop_list<'a>(&mut self, list: impl Iterator<Item = &'a crate::props::Prop>, tick: u32) -> Option<(f32, PropEvent)> {
         let mut hit = None;
-        for p in props {
-            if !p.near(self.position, 5.0) {
-                continue;
-            }
+        for p in list {
             let c = p.centre();
             let d = Vec3::new(c.x - self.position.x, 0.0, c.z - self.position.z);
             let (bx, bz) = (self.orientation.row(0), self.orientation.row(2));
@@ -289,26 +301,31 @@ impl Vehicle {
         true
     }
 
-    /// `WallSpin` 0x493F10 (car, j, n), read to the instruction 2026-09-26: `car+0x434 = 0`; nothing
-    /// when `j ≥ 15` (`[0x5B243C]`) **and** `car+0xD60` (the body-frame forward speed) `≥ 20`
-    /// (`[0x5B2470]`, 0x493F14…0x493F41); else the world yaw rate `car+0x38C` = `0.25 ·
-    /// min(|j|, |n · frame_x|)` (`[0x5B2468]`; `frame_x` the physics frame's row `car+0x490`,
-    /// 0x493F5D…0x493FAD) with the sign from `j` and `nz = n · frame_z` (`car+0x4A8`,
-    /// 0x493F4C…0x493F59): `j < 0` → `nz < 0 ? −spin : +spin` (0x493FD0…0x493FDD); `j ≥ 0` →
-    /// `(nz > 0 ? −spin : +spin) · 0.5` (0x493FDF…0x493FEC, `[0x5B23F0]`). *(Until 2026-09-26 the
-    /// port turned by the sign of `n · right` and of the forward speed, without the halving —
-    /// the "sign table MEDIUM".)* The rate is set outright, in turns/s like `car+0x38C`.
+    /// `WallSpin` 0x493F10 (car, j, n): `car+0x434 = 0`; nothing when `j ≥ 15` (`[0x5B243C]`)
+    /// **and** `car+0xD60` (the body-frame forward speed) `≥ 20` (`[0x5B2470]`, 0x493F14…0x493F41);
+    /// else the world yaw rate `car+0x38C` is **set** (turns/s) from the two dots of `n` with the
+    /// physics frame `car+0x490`: `nz = n · row 2` (`car+0x4A8`, 0x493F54) and `nx = n · row 0`
+    /// (0x493F65). The routine reuses its argument slots — `nz` goes into the `car` slot
+    /// (0x493F59), `nx` into the `n` slot (0x493F70) and `|nx|` into the `j` slot (0x493F81) — so
+    /// what follows reads only those: `spin = 0.25 · min(|nz|, |nx|)` (0x493F85…0x493FAD,
+    /// `[0x5B2468]`), and with `nz < 0`: `nx < 0 ? −spin : +spin` (0x493FD0…0x493FDD, no halving);
+    /// with `nz ≥ 0`: `(nx > 0 ? −spin : +spin) · 0.5` (0x493FDF…0x493FEC, `[0x5B23F0]`). `j` is
+    /// read by the gate alone.
+    /// *(Corrected 2026-10-22 by the live trace: the port took `min(|j|, |nx|)` and the signs from `j` and
+    /// `nz` — the slot reuse misread. Measured live: an alps wall hit at 30 m/s with `j` 5.18,
+    /// `n = (0.984, 0, −0.178)`, `nz` −0.176, `nx` −0.984 left `car+0x38C` = −0.04389 in the
+    /// original, the port's old rule gave +0.123; this rule gives −0.04389.)*
     fn wall_spin(&mut self, j: f32, n: Vec3) {
         if j >= 15.0 && self.v_local.z >= 20.0 {
             return;
         }
-        let nx = n.dot(self.frame.row(0));
         let nz = n.dot(self.frame.row(2));
-        let spin = 0.25 * j.abs().min(nx.abs());
-        self.angular_velocity.y = if j < 0.0 {
-            if nz < 0.0 { -spin } else { spin }
+        let nx = n.dot(self.frame.row(0));
+        let spin = 0.25 * nz.abs().min(nx.abs());
+        self.angular_velocity.y = if nz < 0.0 {
+            if nx < 0.0 { -spin } else { spin }
         } else {
-            (if nz > 0.0 { -spin } else { spin }) * 0.5
+            (if nx > 0.0 { -spin } else { spin }) * 0.5
         };
     }
 
@@ -359,5 +376,48 @@ impl Vehicle {
             self.damage_zone(impact, zone);
             self.crash_response(impact, zone, 1, self.collision_mass);
         }
+    }
+}
+
+#[cfg(test)]
+mod wall_spin_tests {
+    use super::*;
+
+    /// `WallSpin` 0x493F10 on the state logged live at its entry (alps, game tick 858 of the
+    /// traced launch, `REFERENCE-2026-10-22-PA-TRACE.md`: `j` 5.1848, `n` (0.98412, 0, −0.17750), the physics frame `car+0x490`,
+    /// `car+0xD60` 29.438): the original left `car+0x38C` = −0.04389, i.e. `0.25·min(|nz|, |nx|)`
+    /// with `nz` −0.1756 and `nx` −0.9845, not halved (`nz < 0`), negative (`nx < 0`).
+    #[test]
+    fn the_wall_spin_of_a_logged_hit_is_the_originals() {
+        let frame = Mat3::from_cols(Vec3::new(-0.93767, 0.00234, 0.34751), Vec3::new(0.00030, 0.99998, -0.00592), Vec3::new(-0.34752, -0.00544, -0.93766)).transpose();
+        let mut v = Vehicle::bare(Vec3::ZERO, frame, 2.35, 1320.0, 0.8, 0.3);
+        v.frame = frame;
+        v.v_local = Vec3::new(0.0, 0.0, 29.438_06);
+        v.angular_velocity = Vec3::new(0.00278, -0.00008, -0.00307);
+        v.wall_spin(5.1848, Vec3::new(0.98412, 0.0, -0.17750));
+        assert!((v.angular_velocity.y - -0.04389).abs() < 2e-5, "{}", v.angular_velocity.y);
+        assert_eq!(v.angular_velocity.x, 0.00278, "only the yaw rate is set");
+    }
+
+    /// The gate (0x493F14…0x493F41): a hard hit (`j >= 15`) at speed (`car+0xD60 >= 20`) leaves the
+    /// spin alone; the other quadrants of the sign rule (0x493FD0…0x493FEC).
+    #[test]
+    fn the_wall_spin_gate_and_signs() {
+        let mut v = Vehicle::bare(Vec3::ZERO, Mat3::IDENTITY, 2.35, 1320.0, 0.8, 0.3);
+        v.frame = Mat3::IDENTITY;
+        v.v_local = Vec3::new(0.0, 0.0, 25.0);
+        v.angular_velocity.y = 0.7;
+        v.wall_spin(20.0, Vec3::new(0.6, 0.0, -0.8));
+        assert_eq!(v.angular_velocity.y, 0.7);
+        v.v_local.z = 10.0;
+        // nz < 0, nx > 0: +spin, 0.25·min(0.8, 0.6)
+        v.wall_spin(20.0, Vec3::new(0.6, 0.0, -0.8));
+        assert!((v.angular_velocity.y - 0.15).abs() < 1e-6);
+        // nz >= 0, nx > 0: −spin halved
+        v.wall_spin(3.0, Vec3::new(0.6, 0.0, 0.8));
+        assert!((v.angular_velocity.y - -0.075).abs() < 1e-6);
+        // nz >= 0, nx < 0: +spin halved
+        v.wall_spin(3.0, Vec3::new(-0.6, 0.0, 0.8));
+        assert!((v.angular_velocity.y - 0.075).abs() < 1e-6);
     }
 }

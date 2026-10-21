@@ -1469,6 +1469,22 @@ impl CareerUi {
         }
     }
 
+    /// `0x4F7DB0(year)`: the used-car market's tick, after a career race (finished or aborted,
+    /// 0x4EDD2C) and after SELLCAR's listing (0x50FC9F). It reseeds the front end's shared
+    /// generator 0x538040 from `time(0)` (0x4F7DB5 → 0x5A17EB, 0x4F7DBB → 0x538110) — never
+    /// from the race result: 0x538110 has only these callers (0x428C2D, 0x44F25B / 0x44F2E0,
+    /// 0x4E3182, 0x4F7DBB) — and then draws the offers (0x4F7E90), re-prices (0x4F7E63) and tops the
+    /// market up (0x4F80C0) from that one stream, leaving it advanced for the sky / audio draws
+    /// that follow. The appearance rolls use the CRT `rand()`, which it does not reseed.
+    pub fn market_tick(&mut self, fe_rng: &mut nfs_game::opponents::FeRng) {
+        *fe_rng = nfs_game::opponents::FeRng::from_clock();
+        let mut rand = || fe_rng.next_u32();
+        let mut crt_draw = || nfs_game::layout::glints::crt_rand() as u32;
+        self.career.generate_offers(&self.tables, &mut rand);
+        self.career.reprice_market(&self.tables);
+        self.career.refresh_market(&self.tables, &mut rand, &mut crt_draw);
+    }
+
     /// A race left from the pause menu (`[0x657E34]` set). The front end still runs the race end
     /// 0x4EDD00 on its way back (0x4D3EEC, before it tests the flag at 0x4D3EF1), and for a
     /// tournament race (`[0x690AD4] == 4`) that is more than filing nothing: 0x4EDD40 (0x4EDD0E)
@@ -1478,7 +1494,7 @@ impl CareerUi {
     /// ticks the used-car market with the year (0x4EDD1D…0x4EDD2C). *(Until the audit of
     /// 2026-09-26 the port dropped the damage and skipped the market.)* Returns whether the race
     /// was a tournament race.
-    pub fn abort(&mut self, zones: Option<[f32; 10]>) -> bool {
+    pub fn abort(&mut self, zones: Option<[f32; 10]>, fe_rng: &mut nfs_game::opponents::FeRng) -> bool {
         let Some(p) = self.pending.take() else { return false };
         if p.finale {
             // an aborted type 10 goes back to `E` alone (0x4D3FF8): the offer is gone
@@ -1490,13 +1506,7 @@ impl CareerUi {
         if let (Some(i), Some(z)) = (p.garage_idx, zones) {
             self.career.record_damage(&self.tables, i, z);
         }
-        // 0x4F7DB0 seeds the front end's generator from the clock (0x5A17EB → 0x538110)
-        let mut fe_rng = nfs_game::opponents::FeRng::from_clock();
-        let mut rand = move || fe_rng.next_u32();
-        let mut crt_draw = || nfs_game::layout::glints::crt_rand() as u32;
-        self.career.generate_offers(&self.tables, &mut rand);
-        self.career.reprice_market(&self.tables);
-        self.career.refresh_market(&self.tables, &mut rand, &mut crt_draw);
+        self.market_tick(fe_rng);
         // 0x503AD0 clears the era-changed byte `[0x691E81]` (0x503B01) and files nothing
         self.race_flags.era_changed = false;
         // 0x503A50 at 0x4EDF1A: the running pair back to −1
@@ -1504,7 +1514,7 @@ impl CareerUi {
         true
     }
 
-    pub fn finish(&mut self, order: &[usize], times: &[i32; 8], clean: &[bool; 8]) {
+    pub fn finish(&mut self, order: &[usize], times: &[i32; 8], clean: &[bool; 8], fe_rng: &mut nfs_game::opponents::FeRng) {
         let Some(p) = self.pending.take() else { return };
         if p.mission.is_some() {
             // missions are settled through `finish_mission`
@@ -1537,23 +1547,8 @@ impl CareerUi {
             .record_event(&self.tables, &t, p.event, order, times, clean, p.garage_idx);
         // 0x503A50 at 0x4EE076, once the result is filed through the pair: −1 again
         (self.side.tournament.current_event, self.side.tournament.current_tournament) = (-1, -1);
-        // used-car offers are refreshed after every career race (0x4F7DB0)
-        let mut seed = (o.result.position as u32).wrapping_mul(2_654_435_761)
-            ^ (times[0] as u32).wrapping_mul(40_503)
-            ^ 0x9E37_79B9;
-        let mut rand = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 17;
-            seed ^= seed << 5;
-            seed >> 8
-        };
-        let mut crt_draw = || nfs_game::layout::glints::crt_rand() as u32;
-        self.career.generate_offers(&self.tables, &mut rand);
-        // 0x4F7DB0 then re-prices every market car at its current value (0x4F7E63) and calls
-        // 0x4F80C0 to top the market up — so the used-car lot fills after the first career race,
-        // not when the career is created
-        self.career.reprice_market(&self.tables);
-        self.career.refresh_market(&self.tables, &mut rand, &mut crt_draw);
+        // used-car offers are refreshed after every career race (0x4EDD2C → 0x4F7DB0)
+        self.market_tick(fe_rng);
         let mut msg = format!("RESULT: P{}  PRIZE ${}", o.result.position, o.result.prize);
         if o.result.bonus > 0 {
             msg += &format!("  BONUS ${}", o.result.bonus);
@@ -2154,7 +2149,7 @@ mod tests {
         );
         assert_eq!(req.laps, 1, "point-to-point stage");
         assert!(ui.pending.is_some());
-        ui.finish(&[0, 1, 2, 3, 4, 5, 6, 7], &[6400; 8], &[true; 8]);
+        ui.finish(&[0, 1, 2, 3, 4, 5, 6, 7], &[6400; 8], &[true; 8], &mut nfs_game::opponents::FeRng::new(1));
         assert!(ui.pending.is_none());
         let st = ui.career.state(1);
         assert_eq!(st.events.len(), 1);

@@ -396,6 +396,18 @@ impl LayoutScreen {
         !c.state_parts(state).iter().filter_map(|n| c.part(n)).any(|p| p.kind() != nfs_formats::ctr::PartKind::Data)
     }
 
+    /// Whether the widget's `state` is `hidden` and its class supports that state: the widget then
+    /// has bit `0x20` in `[+0x10C]` (0x4C7820…0x4C78B2 matches the attribute against the nine names,
+    /// and sets the bit only when `[+0x110]` has the state's own bit, 0x4C7881), and
+    /// `Control::getBox` 0x4C86F0 (`test byte [ecx+0x10C], 0x20`) answers four zeros — whatever the
+    /// class's `size.value` or `autosize`. This, and not [`Self::state_draws_nothing`], is the
+    /// original's reason for a hit-test skip; for an autosizing widget the empty union of the drawn
+    /// parts (`parts_union`) gives the same zero box by itself.
+    pub(super) fn state_is_hidden(&self, e: &nfs_formats::lay::Element) -> bool {
+        let Some(c) = self.controls.get(&e.class) else { return false };
+        e.get("state").is_some_and(|s| s == "hidden" && c.has_state(s))
+    }
+
     /// An embedded layout's sprites, moved into the widget's own place. The offset is applied in
     /// the same normalised space [`place`](Self::place) maps into, so it carries the letterbox
     /// factor with it.

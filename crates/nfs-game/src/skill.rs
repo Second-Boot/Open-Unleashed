@@ -277,13 +277,17 @@ impl SkillTest {
     /// be auto-reset (`car+0xDB0 == 0 && car+0x1100 < 4`).
     pub fn tick(&mut self, tick: u64, car: &TriggerCar, about_to_reset: bool) -> Vec<SkillEvent> {
         let mut ev = Vec::new();
-        if self.finished || self.dnf {
-            return ev;
-        }
-        if about_to_reset && !self.skidpad {
+        // 0x416170 tests the crash-DNF (0x416176…0x4161AF) BEFORE the state gate `+0xB50 >= 2`
+        // (0x4161B9): a car wrecked after the finish line (state 2) goes to state 3 and
+        // `+0xB24 = 99999` too, and the mission then fails (read 2026-10-22, PA-G1). Repeating
+        // it in state 3 rewrites the same values, so only the first tick is acted on.
+        if about_to_reset && !self.skidpad && !self.dnf {
             self.dnf = true;
             self.time_ticks = Some(99_999);
             ev.push(SkillEvent::Dnf);
+            return ev;
+        }
+        if self.finished || self.dnf {
             return ev;
         }
         let Some(c) = self.next().cloned() else { return ev };
@@ -445,6 +449,19 @@ mod tests {
         let e = st.tick(700, &car(Vec3::new(0.0, 0.0, -31.0)), false);
         assert_eq!(e, vec![SkillEvent::Finish { time_ticks: 700 - 448 }]);
         assert!(st.finished);
+    }
+
+    /// PA-G1: 0x416170 tests the crash-DNF before the state gate, so a wreck after the finish fails.
+    #[test]
+    fn a_wreck_after_the_finish_is_a_dnf() {
+        let scene = Scene::parse(SCENE).unwrap();
+        let mut st = SkillTest::from_scene(&scene, "canyon");
+        st.tick(600, &car(Vec3::new(0.0, 0.0, -11.0)), false);
+        st.tick(700, &car(Vec3::new(0.0, 0.0, -31.0)), false);
+        assert_eq!(st.time_ticks, Some(252));
+        assert_eq!(st.tick(710, &car(Vec3::new(0.0, 0.0, -35.0)), true), vec![SkillEvent::Dnf]);
+        assert!(st.dnf && st.time_ticks == Some(99_999));
+        assert!(st.tick(712, &car(Vec3::new(0.0, 0.0, -35.0)), true).is_empty());
     }
 
     #[test]

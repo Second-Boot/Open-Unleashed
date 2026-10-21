@@ -22,6 +22,7 @@ pub mod error;
 pub mod expr;
 pub mod fedata;
 pub mod fetxt;
+mod fetxt_table;
 pub mod flare;
 pub mod particle_dat;
 pub mod fnt;

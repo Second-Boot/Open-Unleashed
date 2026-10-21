@@ -992,7 +992,7 @@ impl App {
                 if let Some(z) = zones {
                     c.park(z);
                 }
-                c.finish(&order, &times, &clean);
+                c.finish(&order, &times, &clean, &mut self.fe_rng);
                 tracing::info!(target: "open_unleashed::app::race_start", order = ?order, message = c.message, money = c.career.money, "career event recorded");
             }
         }

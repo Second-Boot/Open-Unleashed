@@ -45,8 +45,11 @@ impl App {
     /// `[0x65780C…]` or `[0x657818…]` — chosen by `rand() % count` (0x429588…0x4295ED, after
     /// `srand(time(0))` in the constructor, 0x428C25); and the `win*` / `lose*` music cue
     /// (0x4AE4D0). The clock stands in for the CRT `rand()`.
+    /// The verdict is taken when the summary page is built, at race over (0x417010, 320 ticks after the
+    /// finish; `self.results` set) and not at the player's finish: a wreck in between still counts
+    /// (PA-G1; 0x4293F0 reads `car+0xCD8` when the page is built).
     pub(crate) fn fix_mission_result(&mut self) {
-        if self.mission_result.is_some() || !self.race.as_ref().is_some_and(|r| r.finished) {
+        if self.mission_result.is_some() || self.results.is_none() {
             return;
         }
         let Some((pass, _, _)) = self.mission_outcome() else { return };
@@ -347,6 +350,18 @@ impl App {
         }
     }
 
+    /// The pump's answer 3, the pause menu's "race again" (`HPauseMenu` 0x42A6A0 answers 3), in
+    /// 0x425EF0's switch case 2 (0x426011): with `[0x6573E8]` (the game type) 4, 10 or 2
+    /// (0x426016…0x42602B) it jumps to 0x426165 (`ebx = 0`, no command): the dialog is not popped
+    /// and nothing restarts — Knockout, Tournament and the era finale cannot be restarted from
+    /// the pause menu (PA-G8). Any other type restarts (0x415721).
+    pub(crate) fn pause_restart_allowed(&self) -> bool {
+        !matches!(
+            self.fe.race_game_type,
+            Some(game_type::KNOCKOUT | game_type::TOURNAMENT | game_type::FINALE)
+        )
+    }
+
     /// A left-button release over an in-race dialog's button. The HUD takes the window's
     /// `WM_LBUTTONUP` as event **1** and `WM_LBUTTONDOWN` as 2 (0x434EB5…0x434EEC → 0x435200 /
     /// 0x435180, while `[0x5CD1E4]`, set for the race, 0x427C50); the pump 0x425EF0 hands it to the top
@@ -364,8 +379,11 @@ impl App {
                 match k {
                     0 => self.paused = false,
                     1 => {
-                        self.paused = false;
-                        self.restart_race(event_loop);
+                        // 0x426011…0x42602B: no restart in game types 2, 4, 10 — the menu stays up
+                        if self.pause_restart_allowed() {
+                            self.paused = false;
+                            self.restart_race(event_loop);
+                        }
                     }
                     _ => self.pause_confirm = Some(1),
                 }

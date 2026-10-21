@@ -261,8 +261,12 @@ impl Net {
     /// called at 0x5826BD) returns nonzero for a datagram — `0` stays `0`. So the `'q'` repeats until the
     /// first frame from that peer has been accepted. Captured: one `'q'` per side, 1 ms before the first
     /// `'='` (the ack-only frame), none after (`REFERENCE-2026-10-02-SRVE.md` §2): the peer's first frame
-    /// came back before the next send. **APPROXIMATION (residual):** the handler's return value was not
-    /// read; a `'='` with a body from the peer ([`Net::on_data_frame`]) stands for "accepted".
+    /// came back before the next send. **Handler read (PA-S3):** `link+0x50` is
+    /// the conman's `+8` object (0x55B739 / 0x55C8DC call 0x582750 with it), `[+8]` is the table 0x5E1CF0 and its
+    /// slot `+0x40` = **0x5889D0**. It runs the tag dispatcher 0x588A80 on the datagram, then returns
+    /// `tag == '='` (0x588A68 `cmp bl, 0x3d; sete al`) whatever the body (and stores `tag != '!'` through its
+    /// last argument, 0x588A5D). A datagram is therefore "accepted" exactly when its tag is `'='`, an empty one
+    /// included (the empty-body arm of `dispatch` and [`Net::on_data_frame`]).
     fn send_frame(&mut self, to: SocketAddr, frame: &[u8]) -> io::Result<usize> {
         if !self.q_sent.contains(&to) {
             tolerate(self.sock.send_to(to, crate::data::CONNECT_TAG, &[]), "connect", to);
@@ -609,7 +613,11 @@ impl Net {
             tag::JOIN if self.role == Role::Host => self.on_join(from, p, out),
             tag::A if self.role == Role::Client => self.on_join_reply(from, p, out),
             // 0x5890ED's keep-alive carries nothing; 0x582700's data frame carries a frame.
-            tag::ALIVE if p.is_empty() => self.on_keep_alive(from),
+            tag::ALIVE if p.is_empty() => {
+                // 0x5889D0 returns `tag == '='` whatever the body: an empty `'='` is accepted too
+                self.q_sent.insert(from);
+                self.on_keep_alive(from)
+            }
             tag::ALIVE => self.on_data_frame(from, p, out),
             tag::STAR => self.on_star(from),
             tag::BYE_K | tag::BYE_B => self.on_bye(from, out),

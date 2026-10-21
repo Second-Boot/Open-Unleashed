@@ -683,7 +683,7 @@ impl App {
                 r.set_projector_texture(Some(tex));
             }
             for (_, model) in &self.fe.room {
-                let mut its = model.draw_items_block(room_m, [0.0; 4], [0.0; 2], [0.0; 4], &nfs_game::world::FRONT_END_PASSES, &room_light);
+                let mut its = model.draw_items_block(room_m, [0.0; 4], [0.0; 2], [0.0; 4], [0.0; 4], &nfs_game::world::FRONT_END_PASSES, &room_light);
                 model.apply_projector(&mut its, shadow.map(|s| s.1));
                 items.extend(in_submission_order(its));
             }
@@ -886,7 +886,7 @@ impl App {
             for (k, p) in &sections {
                 let m = &self.fe.room[*k].1;
                 let at = place(*p, 0.5);
-                let its = m.draw_items_block(if reflect { reflected(at) } else { at }, [0.0; 4], [0.0; 2], [0.0; 4], passes_room, room_light);
+                let its = m.draw_items_block(if reflect { reflected(at) } else { at }, [0.0; 4], [0.0; 2], [0.0; 4], [0.0; 4], passes_room, room_light);
                 items.extend(in_submission_order(its).into_iter().map(|mut it| {
                     it.mirrored = reflect;
                     it
@@ -1056,9 +1056,9 @@ impl App {
         }
         use std::f32::consts::TAU;
         let place = |y: f32| Mat4::from_translation(Vec3::new(-pos[0], pos[1], pos[2])) * Mat4::from_rotation_x(xrot * TAU) * Mat4::from_rotation_y(-y * TAU);
-        let mut items = self.fe.room[0].1.draw_items_block(place(yrot), [0.0; 4], [0.0; 2], [0.0; 4], &FRONT_END_PASSES, room_light);
+        let mut items = self.fe.room[0].1.draw_items_block(place(yrot), [0.0; 4], [0.0; 2], [0.0; 4], [0.0; 4], &FRONT_END_PASSES, room_light);
         for k in 0..4 {
-            items.extend(self.fe.room[1].1.draw_items_block(place(yrot + k as f32 * 0.25), [0.0; 4], [0.0; 2], [0.0; 4], &FRONT_END_PASSES, room_light));
+            items.extend(self.fe.room[1].1.draw_items_block(place(yrot + k as f32 * 0.25), [0.0; 4], [0.0; 2], [0.0; 4], [0.0; 4], &FRONT_END_PASSES, room_light));
         }
         Some(items)
     }
@@ -1269,7 +1269,7 @@ fn fe_car_draw(
 ) -> Vec<nfs_renderer::DrawItem> {
     let mut out: Vec<nfs_renderer::DrawItem> = blob.and_then(|b| fe_blob_shadow(b, place, car.box_half)).into_iter().collect();
     let m = if reflect { reflected(place) } else { place };
-    out.extend(car.draw_items_block(m, [0.0; 4], [0.0; 2], [0.0; 4], passes, light).into_iter().map(|mut it| {
+    out.extend(car.draw_items_block(m, [0.0; 4], [0.0; 2], [0.0; 4], [0.0; 4], passes, light).into_iter().map(|mut it| {
         it.mirrored = reflect;
         it
     }));

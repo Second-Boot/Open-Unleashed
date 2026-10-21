@@ -297,12 +297,13 @@ pub fn view_by_name(name: &str) -> Option<u16> {
 }
 
 /// The cameras a car cycles through, from the registry's `car[<n>].camera` list — the shipped
-/// `fe.txt` gives the player `BumperCam2, BumperCam, TailCam0, HeliCam2`. Unknown names are
-/// dropped; an empty or missing list falls back to that same four.
+/// `fe.txt` gives the player `BumperCam2, BumperCam, TailCam0, HeliCam2`. The registry has already
+/// turned the names into the view ids (the symbolic table of 0x4B5250, `nfs_formats::fetxt::eval`: an
+/// unknown name is 0); ids that are no view are dropped; an empty or missing list falls back to that
+/// same four.
 pub fn cycle_from_registry(r: &nfs_formats::fetxt::Registry, car: usize) -> Vec<u16> {
     let key = format!("car[{car}].camera");
-    let names = r.get(&key).unwrap_or_default();
-    let v: Vec<u16> = names.split(',').filter_map(view_by_name).collect();
+    let v: Vec<u16> = r.list_i32(&key).into_iter().filter_map(|id| u16::try_from(id).ok()).filter(|id| VIEW_NAMES.iter().any(|(_, v)| v == id)).collect();
     if v.is_empty() { vec![0x01, 0x00, 0x02, 0x07] } else { v }
 }
 
@@ -644,6 +645,18 @@ mod tests {
         assert_eq!(view_by_name("TVCam"), Some(0x0C));
         assert_eq!(view_by_name("DirectorsCam"), Some(0x14));
         assert_eq!(view_by_name("nope"), None);
+        // ... which are the symbols of the option evaluator (0x5D63A0)
+        for (n, v) in VIEW_NAMES {
+            assert_eq!(nfs_formats::fetxt::symbol(n), Some(v as i32), "{n}");
+        }
+    }
+
+    #[test]
+    fn the_registry_turns_camera_names_into_view_ids() {
+        let r = nfs_formats::fetxt::Registry::parse("car[0].camera = BumperCam2, BumperCam, TailCam0, HeliCam2\ncar[1 to 2].camera = TVCam\n");
+        assert_eq!(cycle_from_registry(&r, 0), [0x01, 0x00, 0x02, 0x07]);
+        assert_eq!(cycle_from_registry(&r, 2), [0x0C]);
+        assert_eq!(cycle_from_registry(&r, 5), [0x01, 0x00, 0x02, 0x07], "none given: the default four");
     }
 
     #[test]

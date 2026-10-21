@@ -41,6 +41,7 @@ mod input;
 mod frame;
 mod events;
 mod scripted;
+mod pa_trace;
 mod fe_seq;
 mod idle;
 mod quickfix;
@@ -926,6 +927,9 @@ pub(crate) struct FrontEnd {
     pub(crate) resolution_sel: usize,
     /// `OwnedCars.Car`'s list as [`App::fe_owned_select`] last saw it
     pub(crate) owned_seen: Option<Vec<usize>>,
+    /// The list vector's buffer as 0x501AD0 leaves it: refilled in place, the slots past the new
+    /// count keep what an earlier list put there (see [`App::fe_owned_select`]).
+    pub(crate) owned_slots: Vec<usize>,
     /// the mode the pick was made for once one was made, and the front end's window size to give back
     /// after the race (see [`App::apply_resolution`])
     pub(crate) resolution_race: Option<((u32, u32), Option<winit::dpi::PhysicalSize<u32>>)>,

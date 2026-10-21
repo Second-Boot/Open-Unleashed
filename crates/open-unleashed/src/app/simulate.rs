@@ -94,7 +94,11 @@ impl App {
     }
 
     pub(crate) fn simulate(&mut self) {
-        self.tick += 1;
+        // TEST GLUE: `NFS_PA_TRACE`, the state the last tick left (`pa_trace.rs`)
+        self.pa_trace_tick();
+        if !super::pa_trace::experiment_tick0(self.tick) {
+            self.tick += 1;
+        }
         let (rally_on, heavy_on, derby_on) = self.launch_flags();
         // diagnostic: `NFS_HUD_KEYS` — a scripted HUD toggle press on its tick
         while let Some(&(t, a)) = self.hud_key_script.front()
@@ -384,9 +388,9 @@ impl App {
                 n.apply(oi, &mut o.vehicle, &o.specs, &w.collision, centre, self.tick);
                 remote_dump(self.tick, oi, &o.vehicle, n);
             }
-            if self.tick % 32 == 0 {
-                o.vehicle.renormalise();
-            }
+            // the re-orthonormalisation is the car's own countdown `car+0x80` in its 64 Hz step
+            // (0x49BA01…0x49BA1D, `Vehicle::integrate64`) — *(corrected 2026-10-22 by the live trace: the
+            // port ran it on every 32nd game tick from tick 0)*
         }
         // the skid marks, per wheel (0x4A2880 from the 64 Hz position step 0x49B84F, which
         // skips only the smackables, `car+0x52C & 0x80` — the traffic and the cops run it too,
@@ -446,9 +450,7 @@ impl App {
             }
         }
         self.smackables.integrate(self.tick);
-        if self.tick % 32 == 0 {
-            v.renormalise();
-        }
+        // (the player's re-orthonormalisation: its own `car+0x80` countdown in `integrate64`)
         self.car_pos = v.draw_origin();
         self.car_rot = Quat::from_mat3(&v.orientation.transpose()).normalize();
         // a network replay's viewed car (`[0x606858]`): the camera follows that human's car, not the recorded
@@ -695,6 +697,8 @@ impl App {
             ),
             None => controls,
         };
+        // TEST GLUE: `NFS_PA_INPUT`, the scripted packet of the trace against the original (`pa_trace.rs`)
+        let controls = super::pa_trace::input(self.tick, controls);
         // `Car_applyInput` switches on the packet's code for the lamps (0x49933E, jump table
         // 0x499480) — the recorded code too, so a replay blinks as the race did
         self.lamp_bits = lamp_command(self.lamp_bits, controls.command);
@@ -1462,7 +1466,12 @@ impl App {
         v.draft =
             nfs_physics::vehicle::draft_factor(v.position, v.forward(), v.v_long(), &racers);
         // the misfire draw comes from the shared LCG, like every other draw in the game
-        v.misfire_roll = nfs_game::rng::rand01();
+        // TEST GLUE experiment `NFS_PA_SHARED_RNG` (`pa_trace.rs`): the car draws it itself, in place
+        if nfs_game::config::cfg().nfs_pa_shared_rng.is_set() {
+            v.shared_rng = true;
+        } else {
+            v.misfire_roll = nfs_game::rng::rand01();
+        }
         // `LoadTransfer`'s wet test, 0x4A191D…0x4A194D: `[0x606AE0]` and nothing overhead
         v.wet_track = self.track.name.eq_ignore_ascii_case("autobahn") && w.overhead_flags(v.position) == 0;
         // 0x4123E0, the force-feedback driver: Sc32 priority 10, before the car's step (priority
@@ -1763,7 +1772,7 @@ impl App {
             }
             let mut walls = |c: &mut nfs_physics::vehicle::Vehicle| {
                 c.collide_walls(&w.walls, &w.tree, &patch_height);
-                c.collide_props(&w.props, tick);
+                c.collide_props(&w.props, &w.tree, tick);
             };
             let hits = self.smackables.step(w, self.slices.as_ref(), self.tick, n_cars, racers, &mut cars, &mut walls);
             let mut touched_cops = Vec::new();
@@ -1816,7 +1825,7 @@ impl App {
         // 0x4980D0's rounds collide each car's walls again between them (0x495020)
         let mut racer_walls = |c: &mut nfs_physics::vehicle::Vehicle| {
             c.collide_walls(&w.walls, &w.tree, &patch_height);
-            c.collide_props(&w.props, tick);
+            c.collide_props(&w.props, &w.tree, tick);
         };
         let mut ground_event = *ground_event_out;
         // traffic vs everyone (`traffic.md` §21.5): the broad phase walks every car pair, so a
@@ -1842,7 +1851,7 @@ impl App {
                 if b.collide_walls(&w.walls, &w.tree, &patch_height) {
                     ai_hits.push((AudioCar::Traffic(i), wall_sfx(b)));
                 }
-                if let Some((impact, event)) = b.collide_props(&w.props, tick) {
+                if let Some((impact, event)) = b.collide_props(&w.props, &w.tree, tick) {
                     ai_hits.push((AudioCar::Traffic(i), prop_sfx(impact, event)));
                 }
                 // the human cars meet it in registration order (an exchange race: by race index, the
@@ -1955,7 +1964,7 @@ impl App {
         // 0x4980D0's rounds collide each car's walls again between them (0x495020)
         let mut racer_walls = |c: &mut nfs_physics::vehicle::Vehicle| {
             c.collide_walls(&w.walls, &w.tree, &patch_height);
-            c.collide_props(&w.props, tick);
+            c.collide_props(&w.props, &w.tree, tick);
         };
         let mut ground_event = *ground_event_out;
         // The cops' passes, in `0x5E8B34` order — after the humans and the opponents, before
@@ -1984,7 +1993,7 @@ impl App {
                 if c.body.collide_walls(&w.walls, &w.tree, &patch_height) {
                     ai_hits.push((AudioCar::Police(i), wall_sfx(&c.body)));
                 }
-                if let Some((impact, event)) = c.body.collide_props(&w.props, tick) {
+                if let Some((impact, event)) = c.body.collide_props(&w.props, &w.tree, tick) {
                     ai_hits.push((AudioCar::Police(i), prop_sfx(impact, event)));
                 }
                 if !no_carcol {
@@ -2036,7 +2045,7 @@ impl App {
         let tick = self.tick as u32;
         let mut racer_walls = |c: &mut nfs_physics::vehicle::Vehicle| {
             c.collide_walls(&w.walls, &w.tree, &patch_height);
-            c.collide_props(&w.props, tick);
+            c.collide_props(&w.props, &w.tree, tick);
         };
         // **Input exchange: the cars in race-index order.** Every machine runs the same pass over the
         // same cars — each car's walls and props, then its pairs with the cars already done, the
@@ -2070,7 +2079,7 @@ impl App {
                             self.snd.player_loops.push_impact(wall_sfx(v));
                             v.impact = 0.0;
                         }
-                        let prop_hit = v.collide_props(&w.props, self.tick as u32);
+                        let prop_hit = v.collide_props(&w.props, &w.tree, self.tick as u32);
                         if prop_hit.is_some() {
                             ground_event = None;
                         }
@@ -2085,7 +2094,7 @@ impl App {
                             o.wall_hits += 1;
                             ai_hits.push((AudioCar::Opponent(oi), wall_sfx(&o.vehicle)));
                         }
-                        if let Some((impact, event)) = o.vehicle.collide_props(&w.props, tick) {
+                        if let Some((impact, event)) = o.vehicle.collide_props(&w.props, &w.tree, tick) {
                             ai_hits.push((AudioCar::Opponent(oi), prop_sfx(impact, event)));
                         }
                     }
@@ -2133,7 +2142,7 @@ impl App {
                 self.snd.player_loops.push_impact(wall_sfx(v));
                 v.impact = 0.0;
             }
-            let prop_hit = v.collide_props(&w.props, self.tick as u32);
+            let prop_hit = v.collide_props(&w.props, &w.tree, self.tick as u32);
             if prop_hit.is_some() {
                 ground_event = None;
             }
@@ -2155,7 +2164,7 @@ impl App {
                     o.wall_hits += 1;
                     ai_hits.push((AudioCar::Opponent(oi), wall_sfx(&o.vehicle)));
                 }
-                if let Some((impact, event)) = o.vehicle.collide_props(&w.props, tick) {
+                if let Some((impact, event)) = o.vehicle.collide_props(&w.props, &w.tree, tick) {
                     ai_hits.push((AudioCar::Opponent(oi), prop_sfx(impact, event)));
                 }
                 if no_carcol {
@@ -2374,7 +2383,7 @@ impl App {
             // 0x40F6DE: the human's offset is zero — `Car_placeAtSlice` 0x49B090 puts the
             // origin on the slice centre and drops the body onto the road (`place_at_slice`),
             // dir `car+0xEAC` (+1 along this port's lap)
-            v.place_at_slice(&w.collision, &self.specs, sl.centre, sl.forward, Vec3::ZERO, false, false);
+            v.place_at_slice(&w.collision, &self.specs, sl.centre, sl.forward, [sl.lateral, sl.up, sl.forward], Vec3::ZERO, false, false);
             v.velocity = Vec3::ZERO;
             // 0x40F400: the spin and `+0x418` the placement's `Susp_update` left
             v.angular_velocity = Vec3::ZERO;
@@ -2493,7 +2502,7 @@ impl App {
                         .map_or(Vec3::ZERO, |p| Vec3::new(p[0], sl.centre.y, p[1]));
                     if exchange_seat.is_some() || net_human {
                         // a human's reset (0x40F6DE: offset zero, `car+0x52C & 8` clear), the player's own block
-                        o.vehicle.place_at_slice(&w.collision, &o.specs, sl.centre, sl.forward, Vec3::ZERO, false, false);
+                        o.vehicle.place_at_slice(&w.collision, &o.specs, sl.centre, sl.forward, [sl.lateral, sl.up, sl.forward], Vec3::ZERO, false, false);
                         o.vehicle.velocity = Vec3::ZERO;
                         o.vehicle.angular_velocity = Vec3::ZERO;
                         o.vehicle.airborne_count = 0;
@@ -2503,7 +2512,7 @@ impl App {
                         o.vehicle.reset_countdown = 0;
                     } else {
                     o.vehicle.reset_to(o.vehicle.position, o.vehicle.orientation);
-                    o.vehicle.place_at_slice(&w.collision, &o.specs, sl.centre, sl.forward, line, true, false);
+                    o.vehicle.place_at_slice(&w.collision, &o.specs, sl.centre, sl.forward, [sl.lateral, sl.up, sl.forward], line, true, false);
                     // 0x40F711…0x40F724: the velocity, then 0x40F400 the spin and `+0x418`
                     o.vehicle.velocity = Vec3::ZERO;
                     o.vehicle.angular_velocity = Vec3::ZERO;

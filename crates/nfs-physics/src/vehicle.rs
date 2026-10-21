@@ -179,6 +179,14 @@ pub struct Wheel {
     pub height_d: f32,
     pub airborne: bool,
     pub compression: f32,
+    /// `wheel+0x70`, the render angle in radians that slot 9 copies into channels 1...4's `.z`
+    /// (0x4384F3...0x43852F) and 18...21's (0x438669...0x438726): `+-asin(0.1·specs[0x120] +
+    /// (c > 0 ? 0.1·compression : 0))`, positive for wheels 0 and 2, negative for 1 and 3
+    /// (0x499E91...0x499EDA); 0 before game tick 2 and for a network car (0x499EE4).
+    /// `0x5A2A10` is the CRT **asin** (`fpatan` of `x / sqrt((1+x)(1-x))`, its error name
+    /// `"asin"`), not `acos` as the notes said until 2026-10-22, so the value is a few
+    /// hundredths, not 1.57.
+    pub render_angle: f32,
     /// `Roughness` 0x499730 state: previous / target offset and the distance phase
     /// (`wheel+0x74 / +0x78 / +0x7C`).
     pub rough_prev: f32,
@@ -498,6 +506,16 @@ pub struct Vehicle {
     pub net_car: bool,
     /// LCG state (the original's `0x5D1028 × 0x5D102C`) for road roughness and the engine's noise.
     rng: u32,
+    /// `car+0x80`, the byte countdown of the orientation's re-orthonormalisation: 0x49B8E0's tail
+    /// (0x49BA01…0x49BA1D) decrements it every 64 Hz rotation step and runs 0x4A4810 when it
+    /// reaches 0, then reloads 0x20. A grid-placed racer starts at 0 (the first re-orthonormalisation
+    /// on its 256th step — measured live, `REFERENCE-2026-10-22-PA-TRACE.md`); 0x410521 (the
+    /// skill-test start) and the network snaps 0x4A0306 / 0x4A0662 load 0x20.
+    pub(crate) orient_countdown: u8,
+    /// **TEST GLUE, experiment** (`NFS_PA_SHARED_RNG`, `REFERENCE-2026-10-22-PA-TRACE.md`): the car's
+    /// draws (roughness 0x499856, the damage pull 0x49F473, `AutoShift` 0x49DAF3, the misfire
+    /// 0x49E496 at its own place) taken from the shared stream, as the original takes them.
+    pub shared_rng: bool,
 }
 
 impl Vehicle {
@@ -611,6 +629,8 @@ impl Vehicle {
             tracker: PatchTracker::new(Vec3::new(position.x, position.y - wheel_radius, position.z)),
             net_car: false,
             rng: 0x3ADE_68B1,
+            orient_countdown: 0,
+            shared_rng: false,
         }
     }
 
@@ -679,6 +699,10 @@ impl Vehicle {
     /// keeps **one** stream for the whole game; this crate sits below `nfs-game`, so it carries its
     /// own state with the same arithmetic.
     fn rand16(&mut self) -> u32 {
+        // TEST GLUE experiment (`NFS_PA_SHARED_RNG`): draw from the shared stream
+        if self.shared_rng {
+            return crate::lcg::rand16();
+        }
         let prod = self.rng.wrapping_mul(123_456_789);
         self.rng = prod & 0xFFFF;
         (prod >> 8) & 0xFFFF
@@ -1315,6 +1339,16 @@ impl Vehicle {
             }
         }
         self.orientation = orientation_step(self.orientation, self.angular_velocity * DT64);
+        // 0x49BA01…0x49BA1D: `--car+0x80`, and at 0 `0x4A4810(car+0x364)` and `car+0x80 = 0x20`.
+        // Every car record runs it; the props keep the port's own every-32nd-game-tick
+        // re-orthonormalisation (`nfs_game::smackables::integrate`), so they are left out here.
+        if !self.smackable {
+            self.orient_countdown = self.orient_countdown.wrapping_sub(1);
+            if self.orient_countdown == 0 {
+                self.renormalise();
+                self.orient_countdown = 0x20;
+            }
+        }
     }
 
     /// 0x40F740's end of tick for the contact word: the magnitude and the kind, cleared
@@ -1367,7 +1401,10 @@ impl Vehicle {
     ///    (0x532A00 transposes the frame, three dots 0x532910; 0x49B3B7…0x49B3F2), or `L` in the
     ///    opponent case (0x49B397). The orientation and the physics frame `car+0x490` are that
     ///    frame, lateral and forward negated when `flip` (0x417260 / 0x417310).
-    /// 4. 0x49AF70 (the car tracker at the new position), then — the car alive (`car+0x7F`) —
+    /// 4. 0x49AF70 (the car tracker at the new position) — whose 0x499520, when the zone changed,
+    ///    overwrites the frame block `car+0x3B8…` with the slice record's raw vectors — and
+    ///    0x49B417 / 0x49B41E copy that block into the orientation and the physics frame (below);
+    ///    then — the car alive (`car+0x7F`) —
     ///    **`Susp_update` twice with the body dropped in between**: `car+0x41C = h`,
     ///    `car+0x334 −= car+0x424` (`BodyHeight`'s height of the lowest body points above the
     ///    contact plane), `car+0x424 = 0`, `car+0x41C = h` again (0x49B493…0x49B4C7); last every
@@ -1403,7 +1440,7 @@ impl Vehicle {
     /// which only bites a caller that resolves slice index 0 — this API takes `Vec3`s, not an
     /// index, so a caller would have to special-case it; no current caller ever targets slice 0.)*
     #[allow(clippy::too_many_arguments)]
-    pub fn place_at_slice(&mut self, grid: &TriangleGrid, specs: &CarSpecs, centre: Vec3, slice_fwd: Vec3, offset: Vec3, opponent: bool, flip: bool) {
+    pub fn place_at_slice(&mut self, grid: &TriangleGrid, specs: &CarSpecs, centre: Vec3, slice_fwd: Vec3, slice_raw: [Vec3; 3], offset: Vec3, opponent: bool, flip: bool) {
         let absolute = opponent && self.game_tick > TICK_RACE_START && offset != Vec3::ZERO;
         // `car+0x35C = 0` (0x49B403)
         self.speed_est = 0.0;
@@ -1416,7 +1453,21 @@ impl Vehicle {
         let s = if flip { -1.0 } else { 1.0 };
         self.orientation = Mat3::from_cols(lat * s, n, fwd * s).transpose();
         self.frame = self.orientation;
-        self.tracker.track(grid, self.position);
+        // 0x49B40C → 0x49AF70: when the zone changed (it does on a fresh `setSlice`), 0x499520 also
+        // copies the slice record's own vectors into the frame block `car+0x3B8…` (0x4996A3…0x49971E:
+        // lateral `+0x28`, up `+0x10`, forward `+0x1C`, as they stand — not orthonormal); and
+        // 0x49B417 / 0x49B41E (0x417260 / 0x417310) copy that block into the orientation `car+0x364`
+        // and the physics frame `car+0x490`, lateral and forward negated under `flip`. So a placed car
+        // starts in the raw slice frame, and its first re-orthonormalisation (`car+0x80`) turns it
+        // (0.45° of heading on the alps grid, measured live). *(Corrected 2026-10-22 by the live trace: the
+        // port kept the frame built at 0x49B22F.)* The vectors are the slice the caller placed on;
+        // 0x49AF70's 0x474440 re-finds the tracker's slice at the final position, which differs only
+        // when the offset crosses a slice boundary — APPROXIMATION, not traced.
+        if self.tracker.track(grid, self.position) {
+            let [rl, ru, rf] = slice_raw;
+            self.orientation = Mat3::from_cols(rl * s, ru, rf * s).transpose();
+            self.frame = self.orientation;
+        }
         self.ground_h = self.susp_update(grid, specs, false);
         self.position.y -= self.body_height;
         self.body_height = 0.0;
@@ -1444,7 +1495,7 @@ impl Vehicle {
     ///    (or lifted) onto the pad by `BodyHeight`, as 0x49B090 does but without its second
     ///    `Susp_update`; last each wheel's `+0x68`, `+0x84`, `+0x70` are zeroed (0x41056C…0x41057A).
     ///
-    /// Not carried: `car+0x80 = 0x20` (0x410521, no reader known to the port), 0x49AB60's seeds
+    /// `car+0x80 = 0x20` (0x410521) loads the re-orthonormalisation countdown. Not carried: 0x49AB60's seeds
     /// (overwritten by the first `Susp_update` here as in `place_at_slice`), the wheel trackers'
     /// reset (the port's re-find their patch each `Susp_update`).
     pub fn place_at_trigger(&mut self, grid: &TriangleGrid, specs: &CarSpecs, position: Vec3, heading: Vec3) {
@@ -1457,6 +1508,8 @@ impl Vehicle {
         self.orientation = Mat3::from_cols(right, up, fwd).transpose();
         self.renormalise();
         self.frame = self.orientation;
+        // 0x410521
+        self.orient_countdown = 0x20;
         self.ground_h = self.susp_update(grid, specs, false);
         self.position.y -= self.body_height;
         self.body_height = 0.0;

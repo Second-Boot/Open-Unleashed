@@ -72,17 +72,7 @@ impl App {
                     let ask: u32 = typed.parse().unwrap_or(0);
                     let sel = c.car_sel.min(c.career.garage.len().saturating_sub(1));
                     if c.career.list_for_sale(sel, ask).is_ok() {
-                        // 0x4F7DB0 seeds the CRT generator from the clock (0x4F7DB5)
-                        let mut seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u32).unwrap_or(1) | 1;
-                        let mut rand = move || {
-                            seed ^= seed << 13;
-                            seed ^= seed >> 17;
-                            seed ^= seed << 5;
-                            seed >> 8
-                        };
-                        c.career.generate_offers(&c.tables, &mut rand);
-                        c.career.reprice_market(&c.tables);
-                        c.career.refresh_market(&c.tables, &mut rand, &mut || nfs_game::layout::glints::crt_rand() as u32);
+                        c.market_tick(&mut self.fe_rng);
                     }
                 }
                 self.bind_lists();

@@ -14,7 +14,7 @@ fn a_pole_pushes_in_the_xz_plane() {
         drive_through: false,
         article: 0,
     };
-    assert!(v.collide_props(&[pole], 0).is_some());
+    assert!(v.collide_props_all(&[pole], 0).is_some());
     assert!(v.velocity.y.abs() <= 1.1, "no vertical push: {:?}", v.velocity);
     assert_eq!(v.position.y, -4.0);
     assert!(v.velocity.x < 1.0, "pushed away from the pole: {:?}", v.velocity);
@@ -244,6 +244,10 @@ fn flat_grid() -> TriangleGrid {
 }
 
 pub(super) fn specs_993() -> CarSpecs {
+    CarSpecs::from_sim(&sim_993(), false)
+}
+
+fn sim_993() -> nfs_formats::sim::CarSim {
     // 993 Carrera 3.6 values from GameData/Simulation/CarData/993coupe36.sim (RE/PHYSICS.md)
     let mut sim = nfs_formats::sim::CarSim {
         name: "993".into(),
@@ -269,7 +273,23 @@ pub(super) fn specs_993() -> CarSpecs {
         unknown_tail: [0.0; 22],
     };
     sim.unknown_tail = [46.0, 1.9, 30.0, 16.5, 0.0, 9.5, 60.0, 1.0, 1.1, 77.5, 75.0, 1.0, 0.0, 110.0, 3.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
-    CarSpecs::from_sim(&sim, false)
+    sim
+}
+
+/// 0x49CC26…0x49CC46 and 0x49C84A against the live `carSpecs` block of an `fe = 0` race's
+/// `default.sim` (255/40 R17, 175 mph; `REFERENCE-2026-10-22-PA-TRACE.md`): circumference
+/// 1.99742925 (0x3FFFABC3) from the image's 0.02 / 25.4 / 0.0031416 at double precision, and
+/// top speed 78.125 from ×0.44642857.
+#[test]
+fn the_tyre_circumference_and_top_speed_are_the_live_blocks() {
+    let mut sim = sim_993();
+    sim.tyre_width_mm = 255.0;
+    sim.tyre_aspect = 40.0;
+    sim.rim_inches = 17.0;
+    sim.top_speed_mph = 175.0;
+    let s = CarSpecs::from_sim(&sim, false);
+    assert_eq!(s.circumference.to_bits(), 0x3FFF_ABC3, "{}", s.circumference);
+    assert_eq!(s.top_speed, 78.125);
 }
 
 fn run(v: &mut Vehicle, specs: &CarSpecs, grid: &TriangleGrid, c: Controls, seconds: f32) {
@@ -279,9 +299,6 @@ fn run(v: &mut Vehicle, specs: &CarSpecs, grid: &TriangleGrid, c: Controls, seco
             v.step32(&c, specs, grid);
         }
         v.step64(specs);
-        if t % 32 == 0 {
-            v.renormalise();
-        }
     }
 }
 

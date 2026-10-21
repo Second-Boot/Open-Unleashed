@@ -196,27 +196,41 @@ impl App {
         self.career.as_ref().map(|c| c.career.owned_list(&c.tables, self.fe.game_type == game_type::TOURNAMENT)).unwrap_or_default()
     }
 
-    /// Keep the garage selection on a car `OwnedCars.Car` lists. 0x4F5980 (slot 0x90) reads
-    /// `list[index]`, `list[0]` when the index is at or past the count (0x4F59B1 `jb`), null on
-    /// an empty list — the accessor's **own** index into the list (slot 0x28) is the selection
-    /// every owned-car reader shares, so when 0x501AD0 rebuilds the list (the chronicle year or the
-    /// game type changed) the index stays and names whatever now sits there. The port keeps a
-    /// garage index (`car_sel`) and the list it was last read against (`fe.owned_seen`): on a
-    /// changed list the old position of `car_sel` is looked up there and read from the new list
-    /// (a position past its end → the first car, as 0x4F59B1). A selection the list does not hold
-    /// and no earlier list placed goes to the first car.
+    /// Keep the garage selection where `OwnedCars.Car`'s accessor keeps it. 0x4F5980 (slot 0x90)
+    /// reads `begin[index]` of the list `[0x691DFC]` with the accessor's **own** index (slot 0x28):
+    /// the index stays when 0x501AD0 rebuilds the list (the chronicle year or the game type
+    /// changed) and names whatever now sits there. Read to the instruction 2026-10-22: the
+    /// "`list[0]` past the end" arm (0x4F59B3…0x4F59BA) only computes `list[0] + 4` (0x529FD0 is
+    /// `lea eax, [ecx+4]`) and drops it — execution falls into 0x4F59BF and reads `begin[index]`
+    /// anyway. 0x501AD0 empties the vector by moving its end back (0x501B0E) and refills it in
+    /// place, so a position at or past the new count holds the **stale pointer** the buffer had
+    /// there: the car an earlier list put in that slot. The port keeps a garage index (`car_sel`),
+    /// the list it last saw (`fe.owned_seen`) and a shadow of the buffer (`fe.owned_slots`):
+    /// the old position of `car_sel` is looked up and read from the shadow after the refill.
+    /// APPROXIMATION: the buffer's capacity is taken as the longest list seen (the original
+    /// reallocates when the new count outgrows it, and a slot past the new count then holds
+    /// uninitialised memory); a selection no list or slot placed goes to the first car.
     pub(crate) fn fe_owned_select(&mut self) {
         let list = self.owned_list();
         let seen = self.fe.owned_seen.replace(list.clone());
+        let before = std::mem::take(&mut self.fe.owned_slots);
+        let mut slots = before.clone();
+        if list.len() > slots.len() {
+            slots = list.clone();
+        } else {
+            slots[..list.len()].copy_from_slice(&list);
+        }
+        self.fe.owned_slots = slots;
+        let slots = &self.fe.owned_slots;
         let Some(c) = self.career.as_mut() else { return };
         let Some(first) = list.first().copied() else { return };
         if let Some(prev) = seen.filter(|p| *p != list)
-            && let Some(at) = prev.iter().position(|i| *i == c.car_sel)
+            && let Some(at) = prev.iter().position(|i| *i == c.car_sel).or_else(|| before.iter().position(|i| *i == c.car_sel))
         {
-            c.car_sel = list.get(at).copied().unwrap_or(first);
+            c.car_sel = list.get(at).or_else(|| slots.get(at)).copied().unwrap_or(first);
             return;
         }
-        if !list.contains(&c.car_sel) {
+        if !list.contains(&c.car_sel) && !slots[list.len()..].contains(&c.car_sel) {
             c.car_sel = first;
         }
     }

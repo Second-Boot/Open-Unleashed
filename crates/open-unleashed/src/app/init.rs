@@ -125,6 +125,7 @@ impl App {
                 pads_sel: 0,
                 resolution_sel: 0,
                 owned_seen: None,
+                owned_slots: Vec::new(),
                 resolution_race: None,
                 parts_forced: false,
                 last_hover: None,

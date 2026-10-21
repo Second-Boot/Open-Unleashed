@@ -411,8 +411,11 @@ impl ApplicationHandler for App {
                             (Some(_), _) => self.pause_confirm = None,
                             (None, 0) => self.paused = false,
                             (None, 1) => {
-                                self.paused = false;
-                                self.restart_race(event_loop);
+                                // 0x426011…0x42602B: no restart in game types 2, 4, 10 — the menu stays up
+                                if self.pause_restart_allowed() {
+                                    self.paused = false;
+                                    self.restart_race(event_loop);
+                                }
                             }
                             _ => self.pause_confirm = Some(1),
                         },

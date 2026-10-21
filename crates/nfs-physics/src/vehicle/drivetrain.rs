@@ -283,6 +283,9 @@ impl Vehicle {
     /// `Engine_update` 0x49E440 → drive − drag, read to the instruction 2026-09-26
     /// (`physics.md` §4.5).
     pub(super) fn engine_update(&mut self, specs: &CarSpecs, rear_contact: bool) -> f32 {
+        // (TEST GLUE experiment `shared_rng`: the misfire draw at its own place, 0x49E496, ahead
+        // of the rev limiter's 0x49E5xx)
+        let roll = if self.shared_rng { self.rand16() as f32 * 1.525_878_9e-5 } else { self.misfire_roll };
         let vz = self.v_local.z;
         let a_drag = specs.drag * vz * vz * vz * self.draft;
         let gear = self.gear;
@@ -331,7 +334,7 @@ impl Vehicle {
         self.rear_spin = false;
         // `misfire = engineDamage/300 > rand01` (§4.3), drawn at the top of the routine (0x49E4BD)
         let engine_wear = self.engine_wear(specs);
-        let misfire = engine_wear / 300.0 > self.misfire_roll;
+        let misfire = engine_wear / 300.0 > roll;
         // **The no-drive path, 0x49EF36…0x49F075**, entered in neutral, mid-shift or with the rear
         // off the ground (0x49E84F / 0x49E85D / 0x49E869):
         //

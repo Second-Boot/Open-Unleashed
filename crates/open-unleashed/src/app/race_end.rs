@@ -232,7 +232,7 @@ impl App {
                 if let Some(z) = zones {
                     c.park(z);
                 }
-                c.finish(&order, &times, &clean);
+                c.finish(&order, &times, &clean, &mut self.fe_rng);
             }
         }
         self.skill = None;
@@ -353,7 +353,7 @@ impl App {
             // an aborted tournament race still runs the race end 0x4EDD00: the damage goes back
             // on the car, the market ticks, the current event is reset and nothing is filed
             // (`CareerUi::abort`); any other race just drops its pending entry
-            if !c.abort(zones) {
+            if !c.abort(zones, &mut self.fe_rng) {
                 c.pending = None;
             }
         }

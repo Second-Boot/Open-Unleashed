@@ -133,7 +133,7 @@ pub struct CarSpecs {
     pub gear_ratio: [f32; 8],
     /// `ratio'[slot] = final * ratio * 60 / circumference` = rpm per m/s; slot 0 = reverse (negative), 1 = neutral (0)
     pub ratio_rpm_per_mps: [f32; 8],
-    /// top speed m/s (+0x90 ×0.44643)
+    /// top speed m/s (+0x90 ×0.44642857, `[0x5B4A28]`)
     pub top_speed: f32,
     pub redline: f32,
     /// engine-braking factor (+0x98 ×0.01, 0x49C880): `Engine_update`'s over-run arm returns
@@ -207,8 +207,17 @@ impl CarSpecs {
     pub fn from_sim(sim: &CarSim, race_class: bool) -> Self {
         let t = &sim.unknown_tail; // +0xF0 ..
         let mass = sim.mass_kg;
-        let circumference = std::f32::consts::PI / 1000.0 * (2.0 * sim.tyre_width_mm * sim.tyre_aspect / 100.0 + sim.rim_inches * 25.4);
-        let top_speed = sim.top_speed_mph * 0.44643;
+        // 0x49CC26…0x49CC46: `((+0x88 · [0x5B3714] 0.02) · +0x84 + +0x8C · [0x5B4A40] 25.4) ·
+        // [0x5B4A3C] 0.0031416` — the image's own constants (not π/1000), on the x87 at double
+        // precision (the race's control word 0x27F, measured live) and stored once as f32
+        // *(corrected 2026-10-22 by the live trace: the port used π/1000 and f32 steps; the live block of the
+        // 996 Carrera holds 1.99742925, the port had 1.9974246)*
+        let circumference = (((sim.tyre_aspect as f64 * f32::from_bits(0x3CA3_D70A) as f64) * sim.tyre_width_mm as f64
+            + sim.rim_inches as f64 * f32::from_bits(0x41CB_3333) as f64)
+            * f32::from_bits(0x3B4D_E34D) as f64) as f32;
+        // 0x49C84A: `+0x90 *= [0x5B4A28]` = 0.44642857 (0x3EE49249), not 0.44643 *(corrected
+        // 2026-10-22 by the live trace: live 78.125 for 175 mph, the port had 78.12525)*
+        let top_speed = sim.top_speed_mph * f32::from_bits(0x3EE4_9249);
         let efficiency = sim.unknown_58_pct * 0.01;
         let gear_slots = (sim.gear_count + 2) as usize;
         let mut ratio = [0f32; 8];

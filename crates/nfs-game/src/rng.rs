@@ -11,15 +11,15 @@
 //! seed it run in parallel threads and share it; a test that needs a fixed sequence reads it right
 //! after its own `seed`.
 
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::Ordering::Relaxed;
 
-pub const MUL: u32 = 123_456_789;
+pub const MUL: u32 = nfs_physics::lcg::MUL;
 
 /// `2^-16` — the `[0, 1)` scale of a 16-bit draw (`[0x5B253C]`, `RE/notes/traffic.md` §4826,
 /// `race-logic.md`): [`rand01`] and the AI's skill draw ([`crate::ai`]) multiply a `rand16` by it.
 pub const RAND16_TO_UNIT: f32 = 1.525_878_9e-5;
 
-static STATE: AtomicU32 = AtomicU32::new(0x3ADE_68B1);
+use nfs_physics::lcg::STATE;
 
 /// `Rand_seed(seed)` — `seed mod 500` warm-up steps from 0x3ADE68B1.
 pub fn seed(seed: u32) {
@@ -38,13 +38,7 @@ pub fn state() -> u32 {
 
 /// One 16-bit draw.
 pub fn rand16() -> u32 {
-    // one read-modify-write, so concurrent draws still each take a distinct step as under the lock
-    // (a compare-exchange loop rather than `fetch_update`, which newer toolchains deprecate)
-    let mut g = STATE.load(Relaxed);
-    while let Err(now) = STATE.compare_exchange_weak(g, g.wrapping_mul(MUL) & 0xFFFF, Relaxed, Relaxed) {
-        g = now;
-    }
-    (g.wrapping_mul(MUL) >> 8) & 0xFFFF
+    nfs_physics::lcg::rand16()
 }
 
 /// `rand16 · 1/65536` — the `[0, 1)` the branch choice compares its thresholds against.

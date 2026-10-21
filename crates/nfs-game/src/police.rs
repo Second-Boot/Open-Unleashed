@@ -1533,7 +1533,7 @@ impl Police {
         let sl = &table.slices[s];
         c.slice = s;
         c.sync_body_in();
-        c.body.place_at_slice(grid, &c.specs, sl.centre, sl.forward.normalize_or_zero(), Vec3::ZERO, false, c.requested_dir < 0.0);
+        c.body.place_at_slice(grid, &c.specs, sl.centre, sl.forward.normalize_or_zero(), [sl.lateral, sl.up, sl.forward], Vec3::ZERO, false, c.requested_dir < 0.0);
         c.sync_body_out();
         // vel = 0 and 0x40F400
         c.velocity = Vec3::ZERO;
@@ -2436,7 +2436,7 @@ impl Police {
             Some(g) => {
                 c.body.rearm_after_reset();
                 c.sync_body_in();
-                c.body.place_at_slice(g, &c.specs, sl.centre, sl.forward.normalize_or_zero(), Vec3::new(lateral, 1.0, 0.0), false, dir < 0.0);
+                c.body.place_at_slice(g, &c.specs, sl.centre, sl.forward.normalize_or_zero(), [sl.lateral, sl.up, sl.forward], Vec3::new(lateral, 1.0, 0.0), false, dir < 0.0);
                 c.sync_body_out();
                 c.lateral = (c.position - sl.centre).dot(sl.lateral.normalize_or_zero());
                 c.lateral_target = c.lateral;

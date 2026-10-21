@@ -162,6 +162,8 @@ impl Vehicle {
             };
             self.orientation = from_rows(out);
             self.renormalise();
+            // 0x4A0662: the re-orthonormalisation countdown `car+0x80` reloaded
+            self.orient_countdown = 0x20;
         } else {
             // the snap: `car+0x388 / +0x38C / +0x390 = (0, ω, 0)`, velocity, matrix, position, then 0x4A02A0
             self.angular_velocity = Vec3::new(0.0, w, 0.0);
@@ -184,6 +186,8 @@ impl Vehicle {
         let r2 = r0.cross(up);
         self.orientation = from_rows([r0.to_array(), up.to_array(), r2.to_array()]);
         self.renormalise();
+        // 0x4A0306: the re-orthonormalisation countdown `car+0x80` reloaded
+        self.orient_countdown = 0x20;
         let (ax, az) = (self.velocity.x.abs(), self.velocity.z.abs());
         self.speed_est = if ax <= az { ax * 0.25 + az } else { az * 0.25 + ax };
         self.net_reseat(grid, specs);

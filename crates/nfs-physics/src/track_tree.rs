@@ -29,6 +29,7 @@ use crate::collision::Patch;
 use crate::props::Prop;
 use crate::quadtree::{Entry, QuadTree};
 use crate::walls::Wall;
+use glam::Vec3;
 
 /// One tree slot: which of the port's own lists it is, and its index there. `Copy` — this is a
 /// plain tag, not a borrow, so a query's result list can be collected and reused freely.
@@ -90,6 +91,22 @@ impl TrackTree {
         TrackTree { tree, order: order.to_vec() }
     }
 
+    /// `0x473870` over `0x484630` (3.0) and `0x486510` (`PA-G6`): the props of every leaf under
+    /// `pos ± 3` (x-z), leaf by leaf and in insertion order inside a leaf, whose AABB meets
+    /// `pos ± 5` — one result per leaf entry, so a prop in two leaves comes twice (0x4738E0…
+    /// 0x473945 appends with no de-duplication). `0x484630`'s descent is the segment query's
+    /// (same `+0xC`, `+4`, `+0x10`, `+8` order and strict-low / closed-high tests) with the box
+    /// `pos ± r`.
+    pub fn prop_candidates<'a>(&'a self, pos: Vec3, props: &'a [Prop]) -> impl Iterator<Item = usize> + 'a {
+        const CELL_R: f32 = 3.0; // 0x4738A2's `push 0x40400000`
+        self.tree
+            .segment_iter((pos.x - CELL_R, pos.z - CELL_R), (pos.x + CELL_R, pos.z + CELL_R))
+            .filter_map(move |i| match self.order[i] {
+                TreeItem::Prop(k) if props[k].near(pos, 5.0) => Some(k),
+                _ => None,
+            })
+    }
+
     /// An empty tree (no patches, props or walls) — a track with none of the three, or a test
     /// fixture that does not need the real thing.
     pub fn empty() -> Self {
@@ -147,6 +164,30 @@ mod tests {
         assert!(got.contains(&TreeItem::Patch(1)));
         assert!(got.contains(&TreeItem::Prop(0)));
         assert!(got.contains(&TreeItem::Wall(0)));
+    }
+
+    fn boxed(article: usize, lo: Vec3, hi: Vec3) -> Prop {
+        Prop { aabb_min: lo, aabb_max: hi, ..prop(article, Vec3::ZERO) }
+    }
+
+    /// `0x473870` (PA-G6): only the leaves under `pos ± 3` are searched, so a prop whose AABB meets
+    /// `pos ± 5` but sits in a farther leaf is not a candidate; a prop listed in several leaves
+    /// (its extent straddles a split) comes once per leaf entry.
+    #[test]
+    fn prop_candidates_are_the_three_metre_leaves_with_duplicates() {
+        let mut props: Vec<Prop> = (0..49).map(|i| prop(i, Vec3::new(1.0, 0.0, 1.0))).collect();
+        let big = props.len();
+        props.push(boxed(big, Vec3::new(-10.0, 0.0, -10.0), Vec3::new(10.0, 0.0, 10.0)));
+        let far = props.len();
+        props.push(boxed(far, Vec3::new(4.4, 0.0, 0.9), Vec3::new(4.6, 0.0, 1.1)));
+        let order: Vec<TreeItem> = (0..props.len()).map(TreeItem::Prop).collect();
+        let tree = TrackTree::build(&[], &props, &[], &order);
+        let got: Vec<usize> = tree.prop_candidates(Vec3::new(0.5, 0.0, 1.0), &props).collect();
+        assert!(got.iter().filter(|&&k| k == big).count() >= 2, "the straddling prop is listed in several leaves: {got:?}");
+        assert!(!got.contains(&far), "the AABB meets pos ± 5 but its leaf is outside pos ± 3");
+        assert!(props[far].near(Vec3::new(0.5, 0.0, 1.0), 5.0));
+        // the leaf order is the tree's own: the same list twice
+        assert_eq!(got, tree.prop_candidates(Vec3::new(0.5, 0.0, 1.0), &props).collect::<Vec<_>>());
     }
 
     /// An empty tree answers no entries and does not panic.

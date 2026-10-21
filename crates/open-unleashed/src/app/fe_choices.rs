@@ -713,7 +713,7 @@ impl App {
         [
             "speedometer",
             "speedunits",
-            "tachometer",
+            "hudtachometer",
             "damagedisplay",
             "map",
             "mapscale",
@@ -1086,7 +1086,7 @@ pub(crate) const CHOICE_ACCESSORS: &[(&str, &str, &[u32])] = &[
     ("Display.SpeedUnits", "speedunits", &[1803, 1804]),
     ("Display.Speedometer", "speedometer", &[1500, 1801, 1802]),
     ("Display.SplitTimes", "splittimes", &[1500, 1816, 1817, 1819]),
-    ("Display.Tach", "tachometer", &[1500, 1801, 1802]),
+    ("Display.Tach", "hudtachometer", &[1500, 1801, 1802]),
     ("Display.Translucency", "translucency", &[1501, 1500]),
     ("Graphics.CarChrome", "carchrome", &[1502, 1503, 1504]),
     // the RUN-TIME list, not the file's: `nfs5.dll` (the Verok patch's runtime patcher) rewrites the push operand

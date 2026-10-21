@@ -1507,7 +1507,8 @@ impl Career {
     /// Nothing is skipped for already holding an offer: an immediate offer is re-drawn after every
     /// race, and a failed roll leaves the old one in place. `0x4F7DB0` then deletes every market
     /// car so bought (0x4F7DE0…0x4F7E3F) before re-pricing the rest. The original draws from the
-    /// CRT `rand()` it has just seeded from the clock (0x5A17EB, 0x538110); `rand` stands in.
+    /// front end's generator 0x538040 it has just seeded from the clock (0x5A17EB, 0x538110);
+    /// `CareerUi::market_tick` hands that stream in.
     pub fn generate_offers(&mut self, tables: &CareerTables, rand: &mut impl FnMut() -> u32) {
         let year = self.year;
         let decide = |this: &Self, car: &OwnedCar, rand: &mut dyn FnMut() -> u32| -> Option<Offer> {

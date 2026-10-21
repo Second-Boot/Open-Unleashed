@@ -135,7 +135,7 @@ fn canyon_st12_endw_barrier_stops_the_car_once() {
     let mut hits = 0u32;
     let mut max_forward = f32::MIN;
     for i in 0..128u64 {
-        if car.collide_props(std::slice::from_ref(barrier), 2 * i as u32).is_some() {
+        if car.collide_props_all(std::slice::from_ref(barrier), 2 * i as u32).is_some() {
             hits += 1;
         }
         car.integrate64();

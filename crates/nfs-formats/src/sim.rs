@@ -3,7 +3,7 @@
 //! Status: layout derived from side-by-side comparison against published Porsche specifications
 //! and CONFIRMED by the loader `CarSim_load` at 0x49C6C0 (`RE/notes/loaders.md`), which copies the
 //! 328 bytes into a 452-byte runtime block and converts units in place:
-//! `+0x90` mph → m/s (×0.44643); `+0x58,+0x5C,+0x98,+0xF0,+0xF8,+0x108,+0x114,+0x118` percent → fraction
+//! `+0x90` mph → m/s (×0.44642857, `[0x5B4A28]`); `+0x58,+0x5C,+0x98,+0xF0,+0xF8,+0x108,+0x114,+0x118` percent → fraction
 //! (×0.01); `+0x44` and `+0x10C,+0x110,+0x120,+0x124,+0x128,+0x12C` mm → m (×0.001); `+0x50` gear count
 //! += 2 (adds R and N slots). Derived runtime fields: `1/redline`, tyre circumference =
 //! π/1000·(2·width·aspect/100 + rim·25.4) m. This struct keeps the **file** units.

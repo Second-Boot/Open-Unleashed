@@ -558,7 +558,7 @@ impl App {
                     // first tick, so the offset is slice-local (0x49B0FB)
                     vehicle.game_tick = self.tick;
                     let s = &t.slices[sl];
-                    vehicle.place_at_slice(&world.collision, &specs, s.centre, s.forward, grid_offset(s, p), true, false);
+                    vehicle.place_at_slice(&world.collision, &specs, s.centre, s.forward, [s.lateral, s.up, s.forward], grid_offset(s, p), true, false);
                     let mut model = model;
                     if car_tiny {
                         model.scale = 0.4;

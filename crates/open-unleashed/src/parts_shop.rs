@@ -407,11 +407,18 @@ impl PartsShop {
                 let car = car?;
                 if let Some(InstallRow::Spare(i)) = self.install_pick(c, strings) {
                     let moved = c.career.spares.get(i).copied();
+                    let before = c.career.spares.len();
                     if c.career.install_spare(&c.tables, car, i)
                         && let Some(moved) = moved
                     {
                         // the basket holds pointers: the spare's entries keep their record (0x518510)
                         nfs_game::career::Career::shop_spare_installed(&mut self.basket, i, moved);
+                        // …and the part it replaced is back in the inventory, where its entries find it
+                        if c.career.spares.len() == before
+                            && let Some(back) = c.career.spares.last().copied()
+                        {
+                            nfs_game::career::Career::shop_spare_returned(&mut self.basket, before - 1, back);
+                        }
                     }
                 }
                 self.install_sel = None;
@@ -420,7 +427,14 @@ impl PartsShop {
             "UNINSTALLPART" => {
                 let car = car?;
                 if let Some(InstallRow::Fitted(id)) = self.install_pick(c, strings) {
+                    let before = c.career.spares.len();
                     c.career.uninstall_part(&c.tables, car, id);
+                    if c.career.spares.len() > before
+                        && let Some(back) = c.career.spares.last().copied()
+                    {
+                        // 0x518771: the same record pointer goes back into the inventory
+                        nfs_game::career::Career::shop_spare_returned(&mut self.basket, before, back);
+                    }
                 }
                 self.install_sel = None;
             }

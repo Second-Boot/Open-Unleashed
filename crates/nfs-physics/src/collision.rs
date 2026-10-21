@@ -160,15 +160,17 @@ impl PatchTracker {
     }
 
     /// 0x499520, `Car_refreshGroundPlane`.
-    pub fn refresh_plane(&mut self) {
+    /// Answers whether it got past the no-patch return (see [`Self::track`]).
+    pub fn refresh_plane(&mut self) -> bool {
         let centre = self.patch.map(|(a, b, c, _)| (a * 2.0 + b + c) * 0.25).unwrap_or(Vec3::ZERO);
         if centre == Vec3::ZERO {
-            return;
+            return false;
         }
         self.plane_point = centre;
         if self.changed {
             self.plane_normal = self.normal;
         }
+        true
     }
 
     /// `Car_placeAtSlice` 0x49B090's tracker part (0x49B14E…0x49B1F9, 0x49B2D2…0x49B30D):
@@ -184,12 +186,15 @@ impl PatchTracker {
         }
     }
 
-    /// 0x49AF70's part of it: `updateZone(pos, 1)` and, when the zone changed, 0x499520.
-    pub fn track(&mut self, grid: &TriangleGrid, pos: Vec3) {
+    /// 0x49AF70's part of it: `updateZone(pos, 1)` and, when the zone changed, 0x499520. Answers
+    /// whether 0x499520 ran past its no-patch return (0x4995F8), i.e. also rewrote the slice
+    /// vectors `car+0x3B8…` (0x4996A3…0x49971E) — which `Car_placeAtSlice` copies into the orientation.
+    pub fn track(&mut self, grid: &TriangleGrid, pos: Vec3) -> bool {
         self.update_zone(grid, pos);
         if self.changed {
-            self.refresh_plane();
+            return self.refresh_plane();
         }
+        false
     }
 
     /// `p.y − ((x − q.x)·n.x + (z − q.z)·n.z)/n.y` on the kept plane, `Susp_update`'s fallback

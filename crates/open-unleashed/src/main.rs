@@ -77,6 +77,8 @@ fn run() -> Result<()> {
     let paths = GamePaths::locate()?;
     tracing::info!(root = %paths.root.display(), "located original game data");
     let cli = cli::Cli::from_env();
+    // the strings every `Registry::load` reads after `fe.txt` (0x4B6698); PLATFORM GLUE: the port's own `--flags` stay out
+    nfs_formats::fetxt::set_command_line(cli.options.clone());
     let positional = &cli.positional;
     // `--replay <file>`: play back a recording the port saved (`RE/notes/replay.md` §14.5 — the
     // original's 118 312-byte .rpl is the registry dump of §16, which `--rpl` writes)
@@ -292,7 +294,25 @@ fn run() -> Result<()> {
             if replay_setup.is_some() {
                 tracing::info!("replay: no car record in the setup, the car is a fresh catalogue car (APPROXIMATION)");
             }
-            nfs_game::career::fold_fresh_car(&mut specs, stock_ids, &parts_table, &family, cli_automatic);
+            if std::env::var_os("NFS_PA_FE0").is_some() {
+                // TEST GLUE `NFS_PA_FE0` (the trace against the original, `app/pa_trace.rs`): the car an
+                // `fe = 0` race of the original builds — no parts (no `FECar`), the seventeen sliders
+                // straight from `fe.txt`'s `car[0].*` keys (16.16 fixed), as the dump of its live
+                // `carSpecs` block shows (grip 1.9 × (35/30·2 + 8)·0.1)
+                let reg = nfs_formats::fetxt::Registry::load(&paths.root);
+                let keys = [
+                    "frontdownforce", "reardownforce", "brakebias", "rideheight", "suspensiontravel", "steeringtoe", "shockrate",
+                    "fronttirepressure", "reartirepressure", "REVERSERATIO", "FIRSTRATIO", "SECONDRATIO", "THIRDRATIO",
+                    "FOURTHRATIO", "FIFTHRATIO", "SIXTHRATIO", "FINALRATIO",
+                ];
+                let mut setup = nfs_game::career::CAR_SETUP_DEFAULT;
+                for (k, name) in keys.iter().enumerate() {
+                    setup[k] = reg.u32(&format!("car[0].{name}"), (setup[k] * 65536.0) as u32) as i32 as f32 / 65536.0;
+                }
+                specs.apply_setup(&setup, cli_automatic);
+            } else {
+                nfs_game::career::fold_fresh_car(&mut specs, stock_ids, &parts_table, &family, cli_automatic);
+            }
         }
         tracing::info!(
             stock = ?stock_ids, top_speed_before = before.0, top_speed = specs.top_speed, final_drive_before = before.1, final_drive = specs.final_drive,
@@ -672,7 +692,12 @@ fn run() -> Result<()> {
         // the recording's `RACE_TYPE` 1 (the cops race) / `FEGAME_TYPE` 9 (a mission's two cops)
         cops_race: replay_setup.as_ref().is_some_and(|r| r.race_type == Some(1)),
         cop_count: if replay_setup.as_ref().is_some_and(|r| r.fegame_type == Some(9)) { 2 } else { 4 },
-        damage: replay_setup.as_ref().is_none_or(|r| r.damage),
+        // (TEST GLUE `NFS_PA_FE0`: an `fe = 0` race reads `fe.txt`'s `damage` key into `DAMAGE` [0x657A2C])
+        damage: match replay_setup.as_ref() {
+            Some(r) => r.damage,
+            None if std::env::var_os("NFS_PA_FE0").is_some() => nfs_formats::fetxt::Registry::load(&paths.root).u32("damage", 1) != 0,
+            None => true,
+        },
         skill: race_skill,
         // a recording's `RACE_TYPE` 3 (`Replay_begin` 0x413CF0's restore); no such word: the command line's
         quick_knockout: match replay_setup.as_ref().and_then(|r| r.race_type) {

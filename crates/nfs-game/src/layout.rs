@@ -3904,19 +3904,21 @@ impl LayoutScreen {
             // (RE/notes/REFERENCE-2026-10-18-srv-hit.md: measured on the original, GameSetup, GameCtrl,
             // Options). `nosize` is the widget's own `.lay` key, else the template default.
             //
-            // **APPROXIMATION (kept, 2026-10-18).** `state_draws_nothing` still skips a widget whose
-            // current state draws no part at all. For an autosizing widget that is what the original's
-            // box gives (the union of the drawn parts is empty, so 0x525A90 fails); for a widget with
-            // a fixed `size.value` (`autosize = 0`, the seven classes of §4.62) the original's box is
-            // still the size, and this skip would drop it. No shipped layout was checked for such a
-            // widget under the pointer, so the skip stays until that is read. `nosize` does not cover
-            // it: the draw-nothing state is a different thing from `data.nosize`.
+            // **Settled 2026-10-22 (was an APPROXIMATION).** A widget whose state draws no part at all
+            // needs no skip of its own: an autosizing one has the empty union as its box (0x5253C0),
+            // which 0x525A90 fails, and a fixed-size one (`autosize = 0`) keeps its `size.value` in
+            // the original — the only state that zeroes the box regardless of size is `hidden`
+            // (`[+0x10C] & 0x20`, 0x4C86F0 / 0x4C7820…0x4C78B2, `state_is_hidden`). Swept over the 98
+            // shipped layouts: exactly three widgets have a draw-nothing state (`carsetup` §77,
+            // `carsetupdesc` §11, `usedcars` §19), all `NFS5.PANEL` with `state=hidden` — skipped
+            // above as panels, and hidden here — so no fixed-size widget with a draw-nothing state
+            // other than `hidden` exists to be affected.
             //
             // `narrow_hit` (diagnostic only, `hit_sweep`) keeps the old stand-in: a hoverable class
             // or one of the three text-entry classes (their click goes to slot 9, 0x4CCB70 / 0x4C2220).
             let takes_click = self.classes[i].takes_click();
             let nosize = self.attr_num(e, "nosize").is_some_and(|v| v != 0.0);
-            if (self.narrow_hit && !(self.can_hover_at(i) || takes_click)) || nosize || self.state_draws_nothing(e) {
+            if (self.narrow_hit && !(self.can_hover_at(i) || takes_click)) || nosize || self.state_is_hidden(e) {
                 continue;
             }
             // **A hidden widget contributes no box** (`[this+0x10C] & 0x20`, the bit 0x50D910's helper

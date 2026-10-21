@@ -4,7 +4,8 @@
 //! arguments before this struct existed, kept as it was — a flag's value is the token after the
 //! flag's **first** occurrence (whatever that token is), a value that does not parse counts as
 //! absent, a flag given without its value is still "present" for the presence tests, and a
-//! positional argument is any token that is neither a flag nor the value of a flag that takes one.
+//! positional argument is any token that is neither a flag nor the value of a flag that takes one
+//! (nor an original-style option: `name=value`, `@file`, `car[0].abs=1`, see [`Cli::options`]).
 //!
 //! ```text
 //! porsche [track] [car] [sim] [--fe[=layout]] [--layout NAME] [--layout-sweep] [--debug-menu]
@@ -36,6 +37,9 @@ const SCRIPTED_FLAGS: [&str; 4] = ["--autotest", "--screenshot", "--layout-sweep
 pub(crate) struct Cli {
     /// `[track] [car] [sim]`: the tokens that are neither flags nor flag values
     pub positional: Vec<String>,
+    /// The original's own command-line options: `name=value`, `car[0].abs=1`, `@file` -- the tokens
+    /// 0x4B60D0 scans after `fe.txt` (`nfs_formats::fetxt`); never positional
+    pub options: Vec<String>,
     /// `--replay <file>`: play back a recording the port saved
     pub replay: Option<String>,
     /// `--career <id>`: start the next event of tournament `<id>` from the saved career
@@ -95,6 +99,7 @@ impl Cli {
         let has = |flag: &str| args.iter().any(|a| a == flag);
         let value = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1));
         let mut positional = Vec::new();
+        let mut options = Vec::new();
         let mut skip = false;
         for a in args {
             if skip {
@@ -105,10 +110,16 @@ impl Cli {
                 skip = FLAGS_WITH_VALUE.contains(&a.as_str());
                 continue;
             }
+            // 0x4B60D0 reacts to '=', '[' and '@' in a token: those are registry options, not a track or a car
+            if a.contains('=') || a.contains('[') || a.starts_with('@') {
+                options.push(a.clone());
+                continue;
+            }
             positional.push(a.clone());
         }
         Self {
             positional,
+            options,
             replay: value("--replay").cloned(),
             career: value("--career").and_then(|v| v.parse().ok()),
             mission: has("--mission"),
@@ -165,6 +176,13 @@ mod tests {
         assert_eq!(c.laps, None, "a value that does not parse is absent");
         assert!(c.follow && c.mission);
         assert!(c.net_flag && c.net.is_none(), "present without its value");
+    }
+
+    #[test]
+    fn the_originals_options_are_not_positionals() {
+        let c = cli("alps skill=2 993 car[0to1].abs=1 @extra --autotest 8");
+        assert_eq!(c.positional, ["alps", "993"]);
+        assert_eq!(c.options, ["skill=2", "car[0to1].abs=1", "@extra"]);
     }
 
     #[test]

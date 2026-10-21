@@ -1195,7 +1195,7 @@ impl App {
         {
             vehicle.game_tick = self.tick;
             let s = &t.slices[slice];
-            vehicle.place_at_slice(&world.collision, &self.specs, s.centre, s.forward, grid_offset(s, pos), false, false);
+            vehicle.place_at_slice(&world.collision, &self.specs, s.centre, s.forward, [s.lateral, s.up, s.forward], grid_offset(s, pos), false, false);
             self.car_pos = vehicle.draw_origin();
             self.prev_car_pos = self.car_pos;
         }

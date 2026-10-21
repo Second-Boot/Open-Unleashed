@@ -94,6 +94,7 @@ impl App {
                     16,
                     [ws[0] / 216.0 * k, ws[1] / 216.0 * k],
                     [v.wheels[0].rotation, v.wheels[1].rotation, v.wheels[2].rotation, v.wheels[3].rotation],
+                    [v.wheels[0].render_angle, v.wheels[1].render_angle, v.wheels[2].render_angle, v.wheels[3].render_angle],
                     v.rpm,
                     v.speed(),
                 );
@@ -104,6 +105,7 @@ impl App {
                     16,
                     [ws[0] / 216.0 * k, ws[1] / 216.0 * k],
                     [v.wheels[0].rotation, v.wheels[1].rotation, v.wheels[2].rotation, v.wheels[3].rotation],
+                    [v.wheels[0].render_angle, v.wheels[1].render_angle, v.wheels[2].render_angle, v.wheels[3].render_angle],
                     v.rpm,
                     v.speed(),
                 );
@@ -194,6 +196,8 @@ impl App {
         self.road.police_lods.resize(counts.1, Default::default());
         self.road.opponent_lods.resize(counts.2, Default::default());
         let compression = |v: &nfs_physics::vehicle::Vehicle| -> [f32; 4] { std::array::from_fn(|k| v.wheels[k].compression) };
+        // each wheel's `+0x70`, channels 1...4's and 18...21's `.z` (0x4384F3...0x43852F)
+        let roll_of = |v: &nfs_physics::vehicle::Vehicle| -> [f32; 4] { std::array::from_fn(|k| v.wheels[k].render_angle) };
         // the cars' effect drive 0x43EF80(1), which the car's draw 0x4430A0 runs last (slot 7
         // 0x4383C0 at 0x443239) — so for every car drawn: the eye `0x627EA4`, the sky's field 5 at
         // the camera's slice (0x45DD80 → 0x45D000, the rain's value, `weather_strengths`) and
@@ -248,7 +252,7 @@ impl App {
                     fx.drive(1 + counts.2 + counts.1 + i, &nfs_game::car_effects::CarInput::from_vehicle(b), fx_eye, fx_wet, true);
                 }
                 let travel = state.travel;
-                car_items.extend(self.car_body_items(model, block.as_ref(), (m, [spin; 4], [0.0; 2], travel), &passes, p, Some((p + (c.position - c.draw_origin()), c.slice))));
+                car_items.extend(self.car_body_items(model, block.as_ref(), (m, [spin; 4], [0.0; 2], tr.bodies.get(i).map_or([0.0; 4], roll_of), travel), &passes, p, Some((p + (c.position - c.draw_origin()), c.slice))));
                 // the brake lamps follow the AI's own counter `car+0xD80` (0x439360, `aidrive::brake_light`);
                 // the reverse lamp its gear byte `car+0xD82`, 0 once the race is on while the AI
                 // backs up at 2 m/s or more (0x408495…0x4084A1 → 0x408130), refreshed every
@@ -299,7 +303,7 @@ impl App {
                     fx.drive(1 + counts.2 + i, &nfs_game::car_effects::CarInput::from_vehicle(&c.body), fx_eye, fx_wet, true);
                 }
                 let travel = state.travel;
-                car_items.extend(self.car_body_items(model, block.as_ref(), (m, [spin; 4], [0.0; 2], travel), &passes, p, Some((p + (c.position - c.draw_origin()), c.slice))));
+                car_items.extend(self.car_body_items(model, block.as_ref(), (m, [spin; 4], [0.0; 2], roll_of(&c.body), travel), &passes, p, Some((p + (c.position - c.draw_origin()), c.slice))));
                 // the lamps as the traffic's (above): the AI's brake counter and gear byte, the
                 // reflection on the body's `car+0x41C`
                 let reverse = self.tick >= RACE_START_TICK && c.gear.sense < 0.0 && c.speed_estimate() >= 2.0;
@@ -360,7 +364,7 @@ impl App {
                 fx.drive(1 + i, &nfs_game::car_effects::CarInput::from_vehicle(&o.vehicle), fx_eye, fx_wet, true);
             }
             let travel = state.travel;
-            car_items.extend(self.car_body_items(model, block.as_ref(), (m, spin, steer, travel), &passes, p, Some((p + (o.vehicle.position - o.vehicle.draw_origin()), o.progress.slice))));
+            car_items.extend(self.car_body_items(model, block.as_ref(), (m, spin, steer, roll_of(&o.vehicle), travel), &passes, p, Some((p + (o.vehicle.position - o.vehicle.draw_origin()), o.progress.slice))));
             let out = o.vehicle.race_state == RaceState::Out;
             // the car's own lamp byte (`car+0xD87`, the night flag at `Car_init`): the indicators too
             let bits = o.lamp_bits;
@@ -425,6 +429,7 @@ impl App {
         {
             let travel = self.car_lod.travel;
             let m = Mat4::from_rotation_translation(local_rot, local_draw);
+            let v_roll = self.vehicle.as_ref().map_or([0.0; 4], |v| std::array::from_fn(|k| v.wheels[k].render_angle));
             let (spin, steer) = match &self.vehicle {
                 Some(v) => (
                     [
@@ -446,7 +451,7 @@ impl App {
             // the car's light block — the ground under it times the `.map` colours, and the sun of
             // the track's sky (`RE/notes/lighting.md` §6)
             let block = self.world.as_ref().map(|w| w.car_light(local_pos));
-            car_items.extend(self.car_body_items(c, block.as_ref(), (m, spin, steer, travel), &passes, local_pos, self.race.as_ref().map(|r| (local_pos, r.slice))));
+            car_items.extend(self.car_body_items(c, block.as_ref(), (m, spin, steer, v_roll, travel), &passes, local_pos, self.race.as_ref().map(|r| (local_pos, r.slice))));
             // the effect drive, but not for the camera's own car in the bumper and driver views
             // (0x4383D8…0x43840C: `carInfo+0x520 == 0x465D80(0)` and the view id 0 or 1)
             if nfs_game::camera::draws_own_car(gate_view)
@@ -596,10 +601,10 @@ impl App {
     /// A car model's body draw (0x444E00) with its light block, then the headlight projector at
     /// `projector_at` and, with `sky = Some((origin, slice))`, the sky map (`CarModel::apply_projector`,
     /// `CarModel::apply_sky`).
-    fn car_body_items(&self, model: &CarModel, block: Option<&nfs_game::world::LightBlock>, (m, spin, steer, travel): (Mat4, [f32; 4], [f32; 2], [f32; 4]), passes: &[nfs_game::world::CarPass], projector_at: Vec3, sky: Option<(Vec3, usize)>) -> Vec<nfs_renderer::DrawItem> {
+    fn car_body_items(&self, model: &CarModel, block: Option<&nfs_game::world::LightBlock>, (m, spin, steer, roll, travel): (Mat4, [f32; 4], [f32; 2], [f32; 4], [f32; 4]), passes: &[nfs_game::world::CarPass], projector_at: Vec3, sky: Option<(Vec3, usize)>) -> Vec<nfs_renderer::DrawItem> {
         let mut items = match block {
-            Some(b) => model.draw_items_block(m, spin, steer, travel, passes, b),
-            None => model.draw_items(m, spin, steer, travel, passes),
+            Some(b) => model.draw_items_block(m, spin, steer, roll, travel, passes, b),
+            None => model.draw_items(m, spin, steer, roll, travel, passes),
         };
         model.apply_projector(&mut items, self.projector_planes(projector_at));
         if let Some((origin, slice)) = sky {
