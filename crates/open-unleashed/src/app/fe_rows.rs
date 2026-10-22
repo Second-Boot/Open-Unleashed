@@ -705,7 +705,10 @@ impl App {
         if self.fe.layout_name.as_deref() != Some("garage") {
             return;
         }
-        let career = self.career.is_some() && self.mission.is_none();
+        // 0x50FA1A reads `Game.GameType == 4` (the Evolution), not "a career is loaded": a garage
+        // reached from the single-player menu in quick-race mode (type 0) greys the used / new car
+        // buttons, parts, repair and sell (the original's sheet)
+        let career = self.career.is_some() && self.fe.game_type == game_type::TOURNAMENT;
         let owned = self.career.as_ref().and_then(|c| c.career.garage.get(c.car_sel));
         let car = owned.is_some();
         let listed = owned.is_some_and(|c| c.asking_price.is_some());

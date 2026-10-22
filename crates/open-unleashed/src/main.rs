@@ -299,16 +299,7 @@ fn run() -> Result<()> {
                 // `fe = 0` race of the original builds — no parts (no `FECar`), the seventeen sliders
                 // straight from `fe.txt`'s `car[0].*` keys (16.16 fixed), as the dump of its live
                 // `carSpecs` block shows (grip 1.9 × (35/30·2 + 8)·0.1)
-                let reg = nfs_formats::fetxt::Registry::load(&paths.root);
-                let keys = [
-                    "frontdownforce", "reardownforce", "brakebias", "rideheight", "suspensiontravel", "steeringtoe", "shockrate",
-                    "fronttirepressure", "reartirepressure", "REVERSERATIO", "FIRSTRATIO", "SECONDRATIO", "THIRDRATIO",
-                    "FOURTHRATIO", "FIFTHRATIO", "SIXTHRATIO", "FINALRATIO",
-                ];
-                let mut setup = nfs_game::career::CAR_SETUP_DEFAULT;
-                for (k, name) in keys.iter().enumerate() {
-                    setup[k] = reg.u32(&format!("car[0].{name}"), (setup[k] * 65536.0) as u32) as i32 as f32 / 65536.0;
-                }
+                let setup = app::pa_trace_fe0_setup(&paths.root, 0);
                 specs.apply_setup(&setup, cli_automatic);
             } else {
                 nfs_game::career::fold_fresh_car(&mut specs, stock_ids, &parts_table, &family, cli_automatic);
@@ -629,6 +620,9 @@ fn run() -> Result<()> {
     // `LoadAccessors` changes them. A race without the front end keeps the registry's.
     // `[0x657CA0]` as the registry load left it, before the accessors take their own
     let registry_music_level = audio_settings.music_level;
+    // `[0x657C98]`, `fe.txt`'s `AUDIOQUALITY`, as the registry load left it: the first sound open
+    // 0x4A6840 (main 0x4B6B09) configures the library for it, before the accessors exist
+    let registry_audio_quality = audio_settings.audio_quality;
     if use_menu {
         audio_settings.front_end_defaults();
     }
@@ -748,6 +742,7 @@ fn run() -> Result<()> {
         career_id,
         mission_flag,
         registry_music_level,
+        registry_audio_quality,
         music_names,
         music_lengths,
         audio_settings,
@@ -775,8 +770,9 @@ fn run() -> Result<()> {
     }
     // a network race's replay file: its humans, their cars and the traffic (`replay.md` §18.15)
     app.apply_replay_net();
-    // every `<Axis>.Min` / `.Max` starts at 0 / 0x80 (0x51E546, 0x51E550)
-    app.input.axis_bands = [[0, 0x80]; 8];
+    // every `<Axis>.Min` / `.Max` starts at 0 / 0x80 (0x51E546, 0x51E550), the `.Max` clamped to the
+    // range's last index 127 by `SetSelection` 0x4BC240
+    app.input.axis_bands = [[0, 127]; 8];
     event_loop.run_app(&mut app)?;
     Ok(())
 }

@@ -68,6 +68,80 @@ impl App {
         s
     }
 
+    /// Which lamp slots a **front-end car** lights: the lamp function 0x439360 sends the front end
+    /// (`[0x65B928]` set, 0x43936E `jne 0x439800`) to its own arm, which lights slots 0 and 1 at
+    /// `[0x5B359C]` 0.8, 2 and 3 and 0xA and 0xB at `[0x5B35A4]` 0.6, 8 at `[0x5B35A0]` 0 and 9 at
+    /// 1.0 (0x439800…0x4398BF), leaving 4…7, 0xC and 0xD as the constructor's unlit (0x4416B1), and
+    /// then breaks the lamps of a zone over 30 as the race arm does (0x4398C6…0x4399E6). The
+    /// zones are the car's own (`car+0x4E4 + 4k`), here the garage car's.
+    pub(crate) fn fe_lamp_slots(damage: &[f32; 10]) -> [(bool, f32); 14] {
+        let mut s = [(false, 1.0f32); 14];
+        for (k, v) in [(0, 0.8f32), (1, 0.8), (2, 0.6), (3, 0.6), (0xA, 0.6), (0xB, 0.6), (8, 0.0), (9, 1.0)] {
+            s[k] = (true, v);
+        }
+        for (zone, slots) in [(0usize, &[0usize, 4][..]), (2, &[1, 5]), (4, &[3, 7, 0xB]), (6, &[2, 6, 0xA]), (5, &[8]), (8, &[0xC, 0xD])] {
+            if damage[zone] > 30.0 {
+                for &k in slots {
+                    s[k].0 = false;
+                }
+            }
+        }
+        s
+    }
+
+    /// The effect pass 0x43D800 of one front-end model standing at `place` (its glares: the
+    /// first sprite `CARG` and the star `SPIK` per lit lamp, 0x43CDD0), appended to `items`.
+    /// A **room** model has every lamp lit at 1.0 — the model constructor's loop over all twenty
+    /// slots when its kind is 2 (0x4D1397…0x4D13AA, the rooms' `0x4D1160(2, …)` calls) — which is
+    /// what makes the dealership's two ceiling spots white discs; a car has [`Self::fe_lamp_slots`].
+    /// The camera must already be the front end's (origin, looking +z).
+    pub(crate) fn fe_lamp_items(&self, model: &CarModel, place: Mat4, slots: [(bool, f32); 14], items: &mut Vec<nfs_renderer::DrawItem>) {
+        let (_, rot, pos) = place.to_scale_rotation_translation();
+        let mut draws = Vec::new();
+        self.lamp_draws_in(model, pos, rot, 0.0, slots, true, &mut draws);
+        for d in draws {
+            if let LampDraw::Glare(mut item) = d {
+                item.early = true;
+                items.push(item);
+            }
+        }
+    }
+
+    /// `CARG`, `SPIK` and `GLNT` of `Render/common.fsh` for the glares (blend pair 1, additive,
+    /// 0x43CF5B), when no race has loaded them yet — the front end draws the same effect pass.
+    pub(crate) fn fe_load_lamp_sprites(&mut self) {
+        if self.glare_draw.is_some() {
+            return;
+        }
+        let Some(renderer) = self.renderer.as_mut() else { return };
+        let Some(path) = nfs_assets::GamePaths::find_file(&self.paths.render_dir(), "common.fsh") else { return };
+        let Ok(data) = std::fs::read(&path) else { return };
+        let Ok(images) = nfs_assets::texture::decode_pack(&path, &data) else { return };
+        let mut quad = nfs_renderer::MeshData::default();
+        for (x, y, u, v) in [(-0.5f32, -0.5f32, 0.0f32, 1.0f32), (0.5, -0.5, 1.0, 1.0), (0.5, 0.5, 1.0, 0.0), (-0.5, 0.5, 0.0, 0.0)] {
+            quad.vertices.push(nfs_renderer::Vertex { position: [x, y, 0.0], normal: [0.0, 1.0, 0.0], uv: [u, v], color: [1.0; 4] });
+        }
+        quad.indices = vec![0, 1, 2, 0, 2, 3];
+        let mut sprite = |name: &str| -> Option<(nfs_renderer::MeshId, nfs_renderer::MaterialId)> {
+            let img = images
+                .iter()
+                .find(|t| t.name.trim() == name)
+                .or_else(|| images.iter().find(|t| t.name.trim().eq_ignore_ascii_case(name)))?;
+            let tex = renderer.upload_texture_mips(img.width, img.height, &img.mips);
+            let mesh = renderer.upload_mesh(&quad);
+            let material = renderer.create_material(nfs_renderer::MaterialDesc {
+                alpha_blend: true,
+                cull_back: false,
+                depth_test: true,
+                blend_pair: 1,
+                ..nfs_renderer::MaterialDesc::textured(tex)
+            });
+            Some((mesh, material))
+        };
+        self.glare_draw = sprite("CARG");
+        self.glare_star = [sprite("SPIK"), sprite("GLNT")];
+    }
+
     /// The car's effect pass `R3DCarLOD` slot 3, **0x43D800** (vtable 0x5B36AC), which the car draw
     /// 0x4432B0 runs right after the body's LODs (slot 14 at 0x44344B, then `[car+0xA4]`'s slot 3
     /// at 0x443464) — so a car's glares and beams follow its own body and precede the next car's,
@@ -111,6 +185,14 @@ impl App {
     /// layers are coords, colours, uv, texture, state and the draw (0x59F0A3…0x59F186), so
     /// `Headlights::LayerVertexLight_Ambient` is not on this path.
     pub(crate) fn lamp_draws(&self, model: &CarModel, pos: Vec3, rot: Quat, ground: f32, slots: [(bool, f32); 14], out: &mut Vec<LampDraw>) {
+        self.lamp_draws_in(model, pos, rot, ground, slots, false, out);
+    }
+
+    /// [`Self::lamp_draws`] for a race (`front_end` false) or for the front end's 3D views, where
+    /// `[0x65B928]` is set: no road reflection (0x43D47D's gate), no night beam (`[0x628A28]` is
+    /// the race's weather word, 0x43DA88), and the view's planes are the front end's.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lamp_draws_in(&self, model: &CarModel, pos: Vec3, rot: Quat, ground: f32, slots: [(bool, f32); 14], front_end: bool, out: &mut Vec<LampDraw>) {
         out.clear();
         let Some((mesh, material)) = self.glare_draw else {
             return;
@@ -121,14 +203,13 @@ impl App {
         // (its right, 0x451DF9) and `[0x61BCBC]`, the road under the eye (`eye_road_height`)
         let lap = self.slices.as_ref().map_or(0, |t| t.slices.len() as i32);
         let wet = match (self.track.sky_bin.as_ref(), self.cam_slice) {
-            (Some(b), Some(s)) => b.sample_track_b(5, s as i32, lap),
+            (Some(b), Some(s)) if !front_end => b.sample_track_b(5, s as i32, lap),
             _ => 0.0,
         };
         let right = view.cross(self.camera.up).normalize_or_zero();
         let eye_ground = self.eye_road_height();
         // `cam[+0xC]` = `far · near / (far − near)` of the view's planes (0x467247…0x467261)
-        let far = self.view_far;
-        let z_near = self.camera.near;
+        let (far, z_near) = if front_end { (super::fe_room::FE_FAR, super::fe_room::FE_NEAR) } else { (self.view_far, self.camera.near) };
         let k = far * z_near / (far - z_near);
         const T: [(f32, f32); 9] = [(0.3, 0.0), (0.212, 0.212), (0.0, 0.3), (-0.212, 0.212), (-0.3, 0.0), (-0.212, -0.212), (0.0, -0.3), (0.212, -0.212), (0.3, 0.0)];
         for l in &model.lights {
@@ -203,7 +284,7 @@ impl App {
                 }
             }
             // the beam, whatever the glare's `b` (0x43DA7C…0x43DAAA)
-            if l.night && self.track.is_night() {
+            if l.night && !front_end && self.track.is_night() {
                 let (a1, a2) = (rot * ax1, rot * ax2);
                 let dir = rot * bf.transform_vector3(Vec3::Z);
                 let rgb = [((l.colour[0] >> 16) & 0xFF) as f32 / 255.0, ((l.colour[0] >> 8) & 0xFF) as f32 / 255.0, (l.colour[0] & 0xFF) as f32 / 255.0];

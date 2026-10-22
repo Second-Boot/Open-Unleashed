@@ -226,9 +226,9 @@ impl LanePassCtx {
 
     /// [`LaneScratch::find_blockers_buffered`] on these lists for the car at `position` with
     /// race-order place `place`.
-    pub fn find_blockers(&mut self, sc: &mut LaneScratch, table: &SliceTable, me: &LaneSelf, position: glam::Vec3, place: usize) {
+    pub fn find_blockers(&mut self, sc: &mut LaneScratch, table: &SliceTable, me: &LaneSelf, position: glam::Vec3, place: usize, pers: &Personality) {
         let fine_ok = self.fine_ok();
-        sc.find_blockers_buffered(&mut self.sorted, table, me, &self.cars, &PERSONALITIES[0], fine_ok.then_some((position, self.positions.as_slice())), self.placed.then_some((place, self.places.as_slice())));
+        sc.find_blockers_buffered(&mut self.sorted, table, me, &self.cars, pers, fine_ok.then_some((position, self.positions.as_slice())), self.placed.then_some((place, self.places.as_slice())));
     }
 }
 
@@ -999,7 +999,7 @@ mod tests {
         let mut want = LaneScratch::default();
         want.find_blockers_placed(&t, &m, &cars, &PERSONALITIES[0], Some((t.slices[10].centre, &ps)), Some((5, &places)));
         let mut got = LaneScratch::default();
-        ctx.find_blockers(&mut got, &t, &m, t.slices[10].centre, 5);
+        ctx.find_blockers(&mut got, &t, &m, t.slices[10].centre, 5, &PERSONALITIES[0]);
         assert_eq!(got, want);
         assert!(got.blocker[1].is_some(), "the fixture has a blocker ahead");
     }

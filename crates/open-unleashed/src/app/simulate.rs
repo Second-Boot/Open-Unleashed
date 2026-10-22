@@ -93,13 +93,39 @@ impl App {
         self.net_flags.unwrap_or((self.cheat_bits & CHEAT_RALLY != 0, self.cheat_bits & CHEAT_HEAVY != 0, self.cheat_bits & CHEAT_DERBY != 0))
     }
 
+    /// **`GameTick` 0x414FF0**: one 64 Hz game tick, run under the tick counter `gGameTick`
+    /// (`[0x606AC4]`, [`App::tick`]) and counted **at its end** — `inc [0x606AC4]` at 0x415101 is the
+    /// routine's last instruction. So the first tick of a race runs with the counter at 0 (zeroed by
+    /// the race init 0x414EB0, 0x414EDF), an even tick with its 32 Hz block; everything inside the tick
+    /// reads the value it runs under, and between two ticks (the draw, the HUD, the frame driver) the
+    /// counter is the number of ticks done. *(Until 2026-10-22 the port counted first, so its first
+    /// tick ran as tick 1 and tick 0 never ran: every car's alive count `+0xDB0` was one 32 Hz step
+    /// behind the original's — measured, `REFERENCE-2026-10-22-PA-TRACE.md`.)*
     pub(crate) fn simulate(&mut self) {
         // TEST GLUE: `NFS_PA_TRACE`, the state the last tick left (`pa_trace.rs`)
         self.pa_trace_tick();
-        if !super::pa_trace::experiment_tick0(self.tick) {
-            self.tick += 1;
-        }
+        self.game_tick();
+        // 0x415101
+        self.tick += 1;
+    }
+
+    /// The body of [`Self::simulate`]: the tick under `self.tick`, before the count.
+    fn game_tick(&mut self) {
+        // `COMM_MODE [0x657404]`: 4 for a network race (`Race_setTypeSkillDamage` 0x4EB470, game type 3; the replay of
+        // one restores it from the snapshot, `replay.md` §18.15), 0 otherwise — `Car_processInput` divides the pedal
+        // bytes by 240 instead of 252 above 0 (0x49E0CA, `nfs_physics::comm`)
+        nfs_physics::comm::set(if self.fe.race_game_type == Some(game_type::NETWORK) || self.replay_net.is_some() { 4 } else { 0 });
+        // the stability assist's gate 0x49F0D1…0x49F0E1: game type 3 with `COMMSPOSITIONAL` (a positional race; the
+        // input-exchange race and a replay of one carry 0, `nfs_physics::comm::positional_network`)
+        let positional = self.fe.race_game_type == Some(game_type::NETWORK) && self.net.session.as_ref().is_some_and(|n| n.positional);
+        nfs_physics::comm::set_positional_network(positional);
         let (rally_on, heavy_on, derby_on) = self.launch_flags();
+        // 0x415060…0x41508E, the race-start SFX fade: in the `[0x606AC0] == 0` part of the tick (0x414FFC),
+        // which runs up to and including the tick that sets the flag (tick 448, 0x415056); the fade
+        // itself only acts on tick 0 and ticks 17…80. Audio only: the simulation never reads the level.
+        if self.tick <= RACE_START_TICK {
+            self.snd.audio_settings.race_start_fade(self.tick, &mut self.snd.sfx_registry);
+        }
         // diagnostic: `NFS_HUD_KEYS` — a scripted HUD toggle press on its tick
         while let Some(&(t, a)) = self.hud_key_script.front()
             && t <= self.tick
@@ -301,6 +327,7 @@ impl App {
             self.tick_ai_police(&ctx);
             self.tick_ai_traffic(&ctx, &mut st);
             self.tick_player_step(&ctx, &st);
+            self.tick_opponent_grounds(&mut st);
             let mut ground_event = None;
             self.tick_step_sounds(&mut ground_event);
             self.tick_trackside_and_skill(&ctx);
@@ -449,7 +476,7 @@ impl App {
                 }
             }
         }
-        self.smackables.integrate(self.tick);
+        self.smackables.integrate();
         // (the player's re-orthonormalisation: its own `car+0x80` countdown in `integrate64`)
         self.car_pos = v.draw_origin();
         self.car_rot = Quat::from_mat3(&v.orientation.transpose()).normalize();
@@ -476,7 +503,8 @@ impl App {
             };
             let (slice, wrong_way) = self.race.as_ref().map_or((0, false), |r| (r.slice, r.wrong_way_ticks > 0));
             self.cam_hist.push_back(CamTick {
-                tick: self.tick,
+                // (tagged with the count after this tick, as the frame's camera pass counts the ticks done)
+                tick: self.tick + 1,
                 pos: self.car_pos + self.car_rot * Vec3::Y * lift,
                 rot: self.car_rot,
                 v_local: v.v_local,
@@ -517,7 +545,7 @@ impl App {
             (None, None) => None,
         };
         // (test glue: every car's whole `Vehicle` after the first tick, to diff two machines' or a replay's)
-        if self.tick == 1
+        if self.tick == 0
             && self.net_dump.is_some()
             && let Some((local, seat_index)) = dump_index.as_ref()
             && let Some(path) = nfs_game::config::cfg().nfs_net_dump.as_str()
@@ -582,10 +610,11 @@ impl App {
     /// **TEST GLUE** `NFS_AUTOPILOT=ai`: an opponent's driver for the player's car — its `.ais`, its `.sim` tail and
     /// the steering family of its `nfs5.car` record, as `race_stages` builds one for an opponent (default skill)
     fn make_player_ai(&self) -> Option<Box<nfs_game::ai::AiDriver>> {
-        let ais = CarAssets::load_ais(&self.paths, &self.car.model).ok()?;
         let sim = CarAssets::load_sim(&self.paths, if self.sim_name.is_empty() { "default" } else { &self.sim_name }).ok()?;
         let id = self.player_car_id.unwrap_or(self.car_id);
         let family = self.fe_car_catalog().into_iter().find(|e| e.id == id).map(|e| e.sim_family).unwrap_or_default();
+        // 0x49CA30: keyed on the car-info `.AISPECNAME`, the catalogue family
+        let ais = CarAssets::load_ais(&self.paths, &family).ok()?;
         let mut d = nfs_game::ai::AiDriver::new(ais, &sim.unknown_tail);
         d.set_track(&self.track.name, self.backwards, &family);
         tracing::info!(model = self.car.model, family, "NFS_AUTOPILOT=ai: the opponents' driver drives the player's car");
@@ -738,6 +767,8 @@ impl App {
         let mut ko_laps: Vec<(usize, u32)> = Vec::new();
         // the remote cars of a positional race whose `Car_simulate` runs this tick on the wire's controls
         let mut remote_steps: Vec<(usize, u32, Controls)> = Vec::new();
+        // (opponent, its slice before this tick's re-find by 0x49AF70) for the Sc32 `Car_ground` and the progress after the player's step
+        let mut opp_grounds: Vec<(usize, usize)> = Vec::new();
         if let Some(t) = &self.slices {
             // race order for the avoidance rule: `0x5E8B88`, sorted ascending by
             // `car+0xAF8 − car+0xB20` (0x417710) — the progress **into the lap**, laps timed
@@ -884,6 +915,34 @@ impl App {
                         _ => None,
                     };
                 }
+                // **`AIHigh_Opponent::update` 0x4058A0's first call**: the object is new at every race start
+                // (0x414EB0 deletes them, 0x4066D0, and 0x406710 → 0x406520 builds them after
+                // `Cars_resetAll`), its state id `+0xC` 0 (base ctor 0x406790), and that call only builds
+                // `AIState_Racing` and sets the id 0xB (0x4058C6…0x4058F7) — it returns without the state's
+                // update. So on the race's first AI pass (tick 0) an opponent neither decides nor runs
+                // `Car_simulate`; its `Car_ground` on the Sc32 list still runs (measured: the AI car's first
+                // step is at tick 2, its alive count one step behind the human's, `REFERENCE-2026-10-22-PA-TRACE.md`)
+                if !net_seats.contains(&oi) && self.tick == 0 {
+                    opp_grounds.push((oi, o.progress.slice));
+                    continue;
+                }
+                // **0x49AF70 at the head of `AIState_Racing::update`** (0x40CA27, before 0x40B650 /
+                // 0x40BFE0): the tracker re-finds `car+8` (0x474440, with the preferred section the last
+                // branch choice left) and the body's patch / surface `car+0x464` at the position the odd
+                // tick left — the slice and the surface the decisions read. The opponent's own Sc32 slot
+                // `+0xE0C` is 0x408360, which returns at once (`traffic.md` §17.5e), so this is its only
+                // tracker pass. *(The port had re-found the slice after the ground contact, one odd
+                // tick's travel earlier: the s4 trace's AI car turned in two ticks late at 520,
+                // `REFERENCE-2026-10-22-PA-TRAFFIC.md`.)*
+                let ai_prev_slice = o.progress.slice;
+                if !net_seats.contains(&oi) {
+                    let pref = match &o.controller {
+                        Controller::Ai(d) => d.preferred_segment,
+                        _ => None,
+                    };
+                    o.progress.track_only(t, o.vehicle.position, pref);
+                    o.vehicle.track32(&w.collision);
+                }
                 if let Controller::Ai(d) = &mut o.controller {
                     d.set_catchup(self.race_skill, player_progress, player_pace);
                     // 0x40BAF0…0x40BB13: `[0x606AE0]` (autobahn) and nothing overhead
@@ -930,7 +989,6 @@ impl App {
                 if let Controller::Ai(d) = &mut o.controller {
                     o.vehicle.shift_roll = d.shift_roll.take();
                 }
-                o.vehicle.misfire_roll = nfs_game::rng::rand01();
                 o.vehicle.draft = nfs_physics::vehicle::draft_factor(
                     o.vehicle.position,
                     o.vehicle.forward(),
@@ -949,7 +1007,17 @@ impl App {
                 let off_before = o.off_surface;
                 // `LoadTransfer`'s wet test, 0x4A191D…0x4A194D: `[0x606AE0]` and nothing overhead
                 o.vehicle.wet_track = self.track.name.eq_ignore_ascii_case("autobahn") && w.overhead_flags(o.vehicle.position) == 0;
-                o.vehicle.step32(&c, &o.specs, &w.collision);
+                if net_seats.contains(&oi) {
+                    // a stale remote car on the AI arm is a human car: its `Car_simulate` and
+                    // `Car_ground` are both Sc32 entries
+                    o.vehicle.step32(&c, &o.specs, &w.collision);
+                } else {
+                    // the AI pass's `Car_simulate` (0x40CA6F); `Car_ground` follows on the Sc32 list
+                    o.vehicle.simulate32(&c, &o.specs);
+                    live[oi] = (o.vehicle.position, o.vehicle.v_long());
+                    opp_grounds.push((oi, ai_prev_slice));
+                    continue;
+                }
                 live[oi] = (o.vehicle.position, o.vehicle.v_long());
                 o.off_surface = w.collision.find_patch(o.vehicle.position) & 0xF == 0;
                 if o.off_surface != off_before && nfs_game::config::cfg().nfs_offroad_log.is_set() {
@@ -989,6 +1057,40 @@ impl App {
         }
         st.ko_laps = ko_laps;
         st.remote_steps = remote_steps;
+        st.opp_grounds = opp_grounds;
+    }
+
+    /// **The AI opponents' `Car_ground`** 0x49BD40 (Sc32 `+0xE20`, priority 0x1E): after every human
+    /// car's `+0xE1C` / `+0xE20` (the list holds them in slot order, the humans first, `traffic.md`
+    /// §17.5e) and before the cops' and the traffic's; then what the port reads off the grounded
+    /// car — the surface flag and the tracked progress with its lap.
+    fn tick_opponent_grounds(&mut self, st: &mut TickState) {
+        let (Some(w), Some(t)) = (self.world.as_ref(), self.slices.as_ref()) else { return };
+        for &(oi, prev_slice) in &st.opp_grounds {
+            let Some(o) = self.road.opponents.get_mut(oi) else { continue };
+            o.vehicle.ground32(&w.collision, &o.specs);
+            let off_before = o.off_surface;
+            o.off_surface = w.collision.find_patch(o.vehicle.position) & 0xF == 0;
+            if o.off_surface != off_before && nfs_game::config::cfg().nfs_offroad_log.is_set() {
+                tracing::info!(
+                    t = self.tick,
+                    opponent = oi,
+                    off = o.off_surface,
+                    pos = ?o.vehicle.position,
+                    kmh = o.vehicle.speed() * 3.6,
+                    wall = ?w.walls.nearest(o.vehicle.position, 8.0).map(|(n, d)| (n.x, n.y, d)),
+                    "offroad watch"
+                );
+            }
+            // the per-car progress 0x4169B0 on the slice 0x49AF70 found at the head of the AI pass
+            let o_lap_done = o.progress.account(t, prev_slice, o.vehicle.forward(), self.tick, self.num_laps);
+            if o_lap_done {
+                tracing::info!(opponent = oi, lap = o.progress.laps, tick = self.tick, finished = o.progress.finished, "opponent lap");
+            }
+            if o_lap_done && !o.eliminated && o.progress.laps <= self.num_laps {
+                st.ko_laps.push((oi, o.progress.laps));
+            }
+        }
     }
 
     /// **The AI pass for the police** (see [`Self::simulate`]): the human's perp update and the cops' decisions in index order (`traffic.md` §17.3, §25, §27). Moved out of `simulate` unchanged.
@@ -1008,7 +1110,12 @@ impl App {
             // speed, and `car+0x1020` is the lane `0x40EBB0` puts the car in — both are what
             // 0x403990 reads. The table is already reversed for a backwards race, so the sign
             // and the lane side flip together, as they do in the original (cb1ad65).
-            let vl = v.velocity.dot(sl0.forward.normalize_or_zero());
+            let vl_live = v.velocity.dot(sl0.forward.normalize_or_zero());
+            // the stored `car+0xEC0` / `car+0xED0` (see [`HumanEd`]); the live ones before the first even tick
+            let (vl, lat_stored) = match self.road.human_ed.values {
+                Some((lat, spd)) => (spd, Some(lat)),
+                None => (vl_live, None),
+            };
             let lane = lane_of(sl0, (v.position - sl0.centre).dot(sl0.lateral.normalize_or_zero()));
             // `[0x5E7544]`: slice 1's lanesA in the track's own frame (0x40E670), which the
             // reversed table of a backwards race keeps in `lanes_b`
@@ -1086,7 +1193,8 @@ impl App {
             // ones' searches between the others' updates (0x406720, `Police::tick`).
             {
                 let sl = &t.slices[slice];
-                let lat = (v.position - sl.centre).dot(sl.lateral.normalize_or_zero());
+                let lat_live = (v.position - sl.centre).dot(sl.lateral.normalize_or_zero());
+                let lat = lat_stored.unwrap_or(lat_live);
                 let target = nfs_game::police::ChaseTarget {
                     position: v.position,
                     slice,
@@ -1149,7 +1257,19 @@ impl App {
                 // Sc32 priority 6, the trackers 0x49AF70 → 0x417190: each cop's `car+0x78`,
                 // its distance to the nearest racer, which the next AI pass's gate reads
                 let racers: Vec<Vec3> = std::iter::once(v.position).chain(self.road.opponents.iter().map(|o| o.vehicle.position)).collect();
+                pol.track_slices(t, Some(&w.collision));
                 pol.track_racers(&racers);
+                // `0x417800` for the human, after the Sc32 list of an even tick: its tracker (shadow) at this position,
+                // the frame block of the last zone change, then `car+0xED0` / `car+0xEC0` against it
+                if self.tick % 2 == 0 {
+                    let h = &mut self.road.human_ed;
+                    let cur = t.find_slice(v.position, slice);
+                    let sl = &t.slices[cur];
+                    if h.tracker.track(&w.collision, v.position) || h.frame == [Vec3::ZERO; 3] {
+                        h.frame = [sl.lateral, sl.up, sl.forward];
+                    }
+                    h.values = Some(((v.position - sl.centre).dot(h.frame[0]), v.velocity.dot(h.frame[2])));
+                }
             }
         }
     }
@@ -1334,7 +1454,7 @@ impl App {
                 .chain(self.road.opponents.iter().map(|o| o.vehicle.position))
                 .chain(self.road.police.iter().flat_map(|p| p.cars.iter().filter(|c| c.active).map(|c| c.position)))
                 .collect();
-            tr.human_views = hum.iter().map(|h| nfs_game::traffic::HumanView { laps: h.laps, honking: h.horn }).collect();
+            tr.human_views = hum.iter().map(|h| nfs_game::traffic::HumanView { laps: h.laps, honking: h.horn, position: h.position }).collect();
             if !hum.is_empty() {
                 tr.other_positions = hum.iter().map(|h| h.position).collect();
             }
@@ -1411,7 +1531,15 @@ impl App {
                     .map(|(r, h)| nfs_game::traffic::ChaseTarget { position: h.position, slice: h.slice, speed: h.vl, dir: h.dir, place: hum_place(r) })
                     .collect();
             }
+            // `[0x5E6674]` is one global: the cops' passes (earlier in the registration order) leave
+            // their cap for the traffic's honk gate (0x4011A7), and the traffic's for the next tick's cops
+            if let Some(p) = self.road.police.as_ref() {
+                tr.lane_cap = p.lane_cap;
+            }
             tr.ai_on(t, self.tick, reference, &others, self.world.as_ref().map(|w| &w.collision));
+            if let Some(p) = self.road.police.as_mut() {
+                p.lane_cap = tr.lane_cap;
+            }
             traffic_reference = Some(reference);
             // Sc32 priority 6, the trackers 0x49AF70 → 0x417190: each traffic car's `car+0x78`,
             // its distance to the nearest racer (the human, then the opponents, `0x5E8E2C[]`),
@@ -1421,6 +1549,7 @@ impl App {
             } else {
                 hum.iter().map(|h| h.position).collect()
             };
+            tr.track_slices(t, self.world.as_ref().map(|w| &w.collision));
             tr.track_racers(&racers);
         }
         st.traffic_reference = traffic_reference;
@@ -1442,6 +1571,23 @@ impl App {
         // (`DraftFactor` reads them live, the misfire draw is the shared stream's next), and
         // every machine gets the same numbers. The seats with a lower index first…
         let autobahn = self.track.name.eq_ignore_ascii_case("autobahn");
+        // **Sc32 priority 6, `+0xE0C` = 0x49AF70** for every human car, ahead of any priority-0x1E
+        // step: `Tracker::update` 0x474440 re-finds `car+8` at the position the odd tick left, and
+        // the progress 0x4169B0 (Sc64, after the Sc32 list) reads that slice (`RaceProgress::retrack`;
+        // the body half, the patch tracker, is `Vehicle::track32` at the head of `step32`). *(The port
+        // had re-found the slice after the step, at the even tick's position: the s4 trace's human,
+        // reversing past its start, was sent back one 32 Hz step late, `REFERENCE-2026-10-22-PA-TRAFFIC.md`.)*
+        if let Some(t) = self.slices.as_ref() {
+            if let Some(r) = self.race.as_mut() {
+                r.retrack(t, v.position, None);
+            }
+            if let Some(x) = exchange_in.as_ref() {
+                for e in &x.seats {
+                    let o = &mut self.road.opponents[e.0];
+                    o.progress.retrack(t, o.vehicle.position, None);
+                }
+            }
+        }
         if let Some(x) = exchange_in.as_ref() {
             let mut lower: Vec<(usize, u32, Controls)> = x.seats.iter().filter(|e| e.1 < x.local_index).copied().collect();
             lower.sort_by_key(|e| e.1);
@@ -1465,13 +1611,7 @@ impl App {
         let racers: Vec<Vec3> = self.road.opponents.iter().map(|o| o.vehicle.position).collect();
         v.draft =
             nfs_physics::vehicle::draft_factor(v.position, v.forward(), v.v_long(), &racers);
-        // the misfire draw comes from the shared LCG, like every other draw in the game
-        // TEST GLUE experiment `NFS_PA_SHARED_RNG` (`pa_trace.rs`): the car draws it itself, in place
-        if nfs_game::config::cfg().nfs_pa_shared_rng.is_set() {
-            v.shared_rng = true;
-        } else {
-            v.misfire_roll = nfs_game::rng::rand01();
-        }
+        // (the misfire draw is the car's own, in place in `Engine_update`, 0x49E496)
         // `LoadTransfer`'s wet test, 0x4A191D…0x4A194D: `[0x606AE0]` and nothing overhead
         v.wet_track = self.track.name.eq_ignore_ascii_case("autobahn") && w.overhead_flags(v.position) == 0;
         // 0x4123E0, the force-feedback driver: Sc32 priority 10, before the car's step (priority
@@ -2312,6 +2452,39 @@ impl App {
         }
     }
 
+    /// `0x40F540` for the human car: the free slice from `r.slice` (or, for mode 3 — `behind`, a
+    /// point-to-point car below its start bound — from the start slice `car+0xAFC`), then
+    /// `Car_placeAtSlice` and the reset's clears.
+    #[allow(clippy::too_many_arguments)]
+    fn place_player_on_reset(v: &mut Vehicle, specs: &CarSpecs, w: &TrackWorld, t: &SliceTable, r: &nfs_game::race::RaceProgress, road: &RoadCars, smackables: &nfs_game::smackables::RaceSmackables, behind: bool) {
+        let occupied: Vec<usize> = road
+            .opponents
+            .iter()
+            .filter(|o| !o.eliminated)
+            .map(|o| o.progress.slice)
+            .chain(reset_blockers(road.police.as_ref(), road.traffic.as_ref(), smackables))
+            .collect();
+        let from = if behind { r.start_slice } else { r.slice };
+        let slice = free_reset_slice(t, &w.collision, from, &occupied);
+        let sl = &t.slices[slice];
+        // 0x40F694 → 0x49E220 before the placement: the drivetrain, the controller bytes and the
+        // wheels' suspension / roughness state are cleared, so the placement's two `Susp_update`s
+        // start from them (the s4 trace's body height after the reset)
+        v.reset_drive();
+        // 0x40F6DE: the human's offset is zero — `Car_placeAtSlice` 0x49B090 puts the
+        // origin on the slice centre and drops the body onto the road (`place_at_slice`),
+        // dir `car+0xEAC` (+1 along this port's lap)
+        v.place_at_slice(&w.collision, specs, sl.centre, sl.forward, [sl.lateral, sl.up, sl.forward], Vec3::ZERO, false, false);
+        // 0x40F727…: `car+0x33C…+0x344` = 0, then 0x40F400: the spin and `+0x418` the placement's
+        // `Susp_update` left
+        v.velocity = Vec3::ZERO;
+        v.angular_velocity = Vec3::ZERO;
+        v.airborne_count = 0;
+        // 0x40F59D: every reset clears the countdown
+        v.reset_countdown = 0;
+        tracing::info!(slice, "car reset to track");
+    }
+
     /// **The player's post-impact pass** (see [`Self::simulate`]): the crash countdown, the reset request (the key, the exchange's command 5, the scripted bot's stand-in) and the reset onto the slice. Moved out of `simulate` unchanged; the request goes to `st.asked` for the remote cars of a positional race.
     fn tick_player_reset(&mut self, ctx: &TickCtx, st: &mut TickState) {
         let Some(v) = self.vehicle.as_mut() else { return };
@@ -2338,7 +2511,8 @@ impl App {
         // headless runs stand in for a human pressing reset: a scripted bot that is stuck below
         // 2 m/s for 5 s resets itself (the original's AI rule `car+0xD8B = 5`, ai.md §3.2) so a
         // wedged car cannot block a regression run. Interactive play uses the key only.
-        if self.scripted {
+        // (not under the trace glue's scripted controller `NFS_PA_INPUT`, which stands for the pad)
+        if self.scripted && nfs_game::config::cfg().nfs_pa_input.as_str().is_none() {
             self.stuck_ticks = if v.speed() < 2.0 && v.race_started {
                 self.stuck_ticks + 1
             } else {
@@ -2368,32 +2542,8 @@ impl App {
             && !exempt
             && let (Some(t), Some(r)) = (&self.slices, &self.race)
         {
+            Self::place_player_on_reset(v, &self.specs, w, t, r, &self.road, &self.smackables, behind);
             self.resets += 1;
-            let occupied: Vec<usize> = self
-                .road
-                .opponents
-                .iter()
-                .filter(|o| !o.eliminated)
-                .map(|o| o.progress.slice)
-                .chain(reset_blockers(self.road.police.as_ref(), self.road.traffic.as_ref(), &self.smackables))
-                .collect();
-            let from = if behind { r.start_slice } else { r.slice };
-            let slice = free_reset_slice(t, &w.collision, from, &occupied);
-            let sl = &t.slices[slice];
-            // 0x40F6DE: the human's offset is zero — `Car_placeAtSlice` 0x49B090 puts the
-            // origin on the slice centre and drops the body onto the road (`place_at_slice`),
-            // dir `car+0xEAC` (+1 along this port's lap)
-            v.place_at_slice(&w.collision, &self.specs, sl.centre, sl.forward, [sl.lateral, sl.up, sl.forward], Vec3::ZERO, false, false);
-            v.velocity = Vec3::ZERO;
-            // 0x40F400: the spin and `+0x418` the placement's `Susp_update` left
-            v.angular_velocity = Vec3::ZERO;
-            v.airborne_count = 0;
-            v.rpm = 0.0;
-            v.gear = 2;
-            v.rearm_after_reset();
-            // 0x40F59D: every reset clears the countdown
-            v.reset_countdown = 0;
-            tracing::info!(slice, "car reset to track");
         }
         if let (Some(t), Some(r)) = (&self.slices, &self.race) {
             let off_surface = w.collision.find_patch(v.position) & 0xF == 0;
@@ -2781,7 +2931,7 @@ impl App {
         if let (Some(x), Some(t)) = (exchange_in.as_ref(), &self.slices) {
             for e in &x.seats {
                 let o = &mut self.road.opponents[e.0];
-                o.progress.update_tracked(t, o.vehicle.position, o.vehicle.forward(), self.tick, self.num_laps, None);
+                o.progress.update(t, o.vehicle.position, o.vehicle.forward(), self.tick, self.num_laps);
             }
         }
         if let (Some(t), Some(r)) = (&self.slices, self.race.as_mut()) {
@@ -2813,6 +2963,19 @@ impl App {
             } else {
                 r.update(t, v.position, v.forward(), self.tick, self.num_laps)
             };
+            // **0x4174A2…0x4174B8: `Lap_check` calls 0x40F540(car, 3, 0) itself**, inside the progress
+            // pass (Sc64 0x4169B0 → 0x416310 → 0x417440), so a point-to-point car below its start bound
+            // is placed in the tick that finds it there, after the Sc32 list — not by the next even
+            // tick's post-impact pass, as the port had it (the s4 trace: the reversing human placed at
+            // 764, the port at 766). 0x40F540 itself refuses a skill test on the skidpad.
+            let exempt = self.skill.is_some() && self.track.name.eq_ignore_ascii_case("skidpad");
+            if std::mem::take(&mut r.behind_start)
+                && !exempt
+                && let Some(w) = self.world.as_ref()
+            {
+                Self::place_player_on_reset(v, &self.specs, w, t, r, &self.road, &self.smackables, true);
+                self.resets += 1;
+            }
             // the "wrong way" cue at 64, 96 and 128 steps (0x4A7734…0x4A7744)
             if r.wrong_way_steps != steps_before
                 && nfs_game::race::wrong_way_cue(r.wrong_way_steps)
@@ -3721,6 +3884,9 @@ struct TickState {
     ko_laps: Vec<(usize, u32)>,
     /// the remote cars of a positional race whose `Car_simulate` runs this tick on the wire's controls
     remote_steps: Vec<(usize, u32, Controls)>,
+    /// the AI opponents whose `Car_ground` (Sc32 `+0xE20`) is still to run this tick, in slot order
+    /// (`tick_opponent_grounds`, after the humans' steps)
+    opp_grounds: Vec<(usize, usize)>,
     /// the player's pose as the traffic's AI pass took it, which the traffic's drive reads too (`tick_ai_traffic`)
     traffic_reference: Option<Reference>,
     /// the player asked for a reset (the key, the exchange's command 5 or the scripted bot), which a remote
@@ -3731,6 +3897,22 @@ struct TickState {
 /// Everyone else on the road, split out of [`App`] on 2026-09-21: the opponents, the traffic and
 /// the police, each with its models, bodies, previous poses and per-car sound set and paint.
 /// The fields kept their names, so `self.x` became `self.road.x`.
+/// The human's lateral `car+0xED0` and speed `car+0xEC0` as the original keeps them: `0x417800` (after the Sc32 list of an
+/// even tick, before the Sc64 integrators) measures them against the human's frame block `car+0x3B8…` (the slice vectors of
+/// the last patch-zone change, 0x499520) and the AI pass of the next even tick reads that value — two ticks stale. This
+/// keeps the frame with a shadow tracker run at the same position the human's own tracker 0x49AF70 sees.
+pub(crate) struct HumanEd {
+    pub(crate) tracker: nfs_physics::collision::PatchTracker,
+    pub(crate) frame: [Vec3; 3],
+    pub(crate) values: Option<(f32, f32)>,
+}
+
+impl Default for HumanEd {
+    fn default() -> Self {
+        Self { tracker: nfs_physics::collision::PatchTracker::new(Vec3::ZERO), frame: [Vec3::ZERO; 3], values: None }
+    }
+}
+
 pub(crate) struct RoadCars {
     /// opponents (parked until the AI rules are implemented) with their own models
     pub(crate) opponents: Vec<RaceCar>,
@@ -3765,6 +3947,8 @@ pub(crate) struct RoadCars {
     pub(crate) police_sets: Vec<String>,
     pub(crate) police_specs: Vec<CarSpecs>,
     pub(crate) police_prev: Vec<(Vec3, Quat)>,
+    /// The human's `car+0xED0` / `car+0xEC0` as `0x417800` last left them (the cops' AI reads these, not the live pose)
+    pub(crate) human_ed: HumanEd,
     /// whether the race was set up with police at all (`COPS`)
     pub(crate) cops_enabled: bool,
     /// how many cop cars go on the road when `cops_enabled`: **4** for the cops race

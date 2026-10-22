@@ -690,6 +690,15 @@ pub struct CopCar {
     /// State 1 placed the cop this tick and already ran the new state's update (0x404243); the
     /// state 2/3 head and its `0x405220` only run from the next tick on.
     pub placed: bool,
+    /// `AIHigh_Cop` state 0 (0x403E79) not yet run: the first AI pass builds the purgatory (0x40DE10) —
+    /// parks the car and draws the delay (0x40DEAE) — and sets state 1
+    pub purgatory_pending: bool,
+    /// The tracker's frame block `car+0x3B8…0x3D8` (lateral, up, forward — a slice record's `+0x28`, `+0x10`, `+0x1C`):
+    /// 0x499520 copies the slice's vectors in whenever the cop's patch zone changes ([`Police::track_slices`]) and the
+    /// placement does; `0x417800` measures `car+0xED0` / `car+0xEC0` against it (as the traffic's, `TrafficCar::frame`)
+    pub frame: [Vec3; 3],
+    /// `car+0x80`, the countdown of 0x49B8E0's re-orthonormalisation (0x49BA01…0x49BA1D), as the traffic's
+    pub orient_countdown: u8,
     pub slice: usize,
     /// `car+0xAF8` — for a cop, as for a traffic car, the **bare lap fraction** of its slice:
     /// 0x4169B0 (`car+0xE18`, Sc64 priority 0x19, even ticks) writes `frac(car+8)` for a car
@@ -861,6 +870,9 @@ impl CopCar {
             chasing: false,
             parked: false,
             placed: false,
+            purgatory_pending: true,
+            frame: [Vec3::ZERO; 3],
+            orient_countdown: 0,
             slice: 0,
             progress: 0.0,
             dir: 1.0,
@@ -1033,16 +1045,20 @@ pub struct ChaseTracker {
 }
 
 impl ChaseTracker {
-    /// `0x403620(this, cop, target, k)` → `0x403650(target)`: the raw values of this instant. One
-    /// quirk carried as read: 0x4036B0…0x4036BF store `+0x34 = cop+0xED0 − target+0xED0`, the
+    /// `0x403620(this, cop, target, k)` → `0x403650(target)`: the raw values of this instant. Three
+    /// quirks carried as read (the gap and `rel` below, and): 0x4036B0…0x4036BF store `+0x34 = cop+0xED0 − target+0xED0`, the
     /// **opposite** sign of what the step filters toward (`target − cop`), so a slow tracker starts
     /// with its lateral difference mirrored.
     pub fn new(table: &SliceTable, k: f32, cop: &CopCar, tgt: &ChaseTarget) -> Self {
         Self {
             k,
-            gap: track_distance(table, tgt.slice, cop.slice),
+            // the reset 0x403650 calls `0x40E6E0(cop, target)` (0x403660: it pushes the target, then the cop) and
+            // `0x532330(1, cop+0x330, target+0x330, &rel)` — cop minus target — where the step 0x4036F0 calls
+            // `0x40E6E0(target, cop)` and filters toward target minus cop: like `lat_diff`, the gap and `rel` start
+            // mirrored (live, alps tick 994, k = 0.05: gap 180 → 162 → 144.9 toward −180; rel.z −173 → −138.8)
+            gap: track_distance(table, cop.slice, tgt.slice),
             slice: tgt.slice,
-            rel: tgt.position - cop.position,
+            rel: cop.position - tgt.position,
             point: tgt.position,
             lat_diff: cop.lateral - tgt.lateral,
             lateral: tgt.lateral,
@@ -1091,7 +1107,9 @@ pub struct CopPhysics {
 
 impl Default for CopPhysics {
     fn default() -> Self {
-        Self { brake_force: 9.0, max_lat_acc: 9.8, max_yaw_acc: 2.6 }
+        // (`brake_force` = `[0x5B263C]` = 11, times the row's braking factor: 0x40A9B0 stores `[0x5B263C] · pers[+0x20]` at
+        // `car+0x1014→+0x80` for an opponent or a cop, 0x40A9CF…0x40A9EC; live, a row-2 cop: 11.0)
+        Self { brake_force: 11.0, max_lat_acc: 9.8, max_yaw_acc: 2.6 }
     }
 }
 
@@ -1147,11 +1165,74 @@ pub struct Police {
     pub slot_base: usize,
     /// the lane pass's lists, refilled for every cop ([`Police::lane_pass`]; no per-cop allocation)
     lane_ctx: LanePassCtx,
+    /// `[0x5E6674]`, the global every lane pass shares (see `TrafficSet::lane_cap`): the cop's
+    /// 0x401F20 writes the current lane's hard cap there, and the next traffic car's honk gate
+    /// (0x4011A7) reads what the cop left; the caller hands it across ([`TrafficSet::lane_cap`]).
+    pub lane_cap: f32,
+    /// `[0x5E8E24]`, the traffic cars' count — the index into the purgatory delay table (0x40DE85…0x40DEA0)
+    pub traffic_count: usize,
+    /// The racer slots' `.PERSONALITY` words, as [`crate::traffic::TrafficSet::slot_personalities`]: a cop's
+    /// `prsonal.bin` row is `slot[its registration index] % 5` (0x4080A4, `car+0xE38`)
+    pub slot_personalities: Vec<i32>,
+    /// The shared word the lane pass's personality re-roll (0x4010E7, 0x401109) draws from
+    pub rng: crate::traffic::SharedRng,
+    /// `LINEAR_TRACK`, for the race-init placement's `addSlices`
+    pub linear: bool,
+    /// What the race-init placement ([`Self::place_at_race_init`]) needs and the grid stage knows: the
+    /// start slice, the racers `[0x5E8AE8]`, the grid rule and each cop slot's `.STARTINGPOS`
+    pub grid_init: Option<(usize, u32, crate::race::GridRule, Vec<i32>)>,
 }
 
 impl Police {
     pub fn new(file: CopFile, cars: Vec<CopCar>, skill: u8, one_way: bool) -> Self {
-        Self { manager: CopManager::new(file), cars, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: CopPhysics::default(), violation: Violation::None, route_dir: 1.0, skill, one_way, wanted: false, weather: false, racers: Vec::new(), other_places: Vec::new(), other_positions: Vec::new(), race_order: Vec::new(), spawn_order: Vec::new(), budget: duty_budget(1, false), slot_base: 0, roster: [None; 7], lane_ctx: LanePassCtx::default() }
+        Self { manager: CopManager::new(file), cars, cfg: nfs_formats::trafcfg::TrafficConfig::default(), phys: CopPhysics::default(), violation: Violation::None, route_dir: 1.0, skill, one_way, wanted: false, weather: false, racers: Vec::new(), other_places: Vec::new(), other_positions: Vec::new(), race_order: Vec::new(), spawn_order: Vec::new(), budget: duty_budget(1, false), slot_base: 0, roster: [None; 7], lane_ctx: LanePassCtx::default(), lane_cap: 0.0, traffic_count: 0, slot_personalities: Vec::new(), rng: crate::traffic::SharedRng::Shared, linear: false, grid_init: None }
+    }
+
+    /// `Cars_resetAll` 0x4110A0 for the cop slots (registered right after the racers): `Car_reset` 0x410730 ->
+    /// `Grid_slot` 0x410580 -> `Car_placeAtSlice` 0x49B090 on the cop's own body, exactly as
+    /// [`crate::traffic::TrafficSet::place_at_race_init`] does for traffic (live, alps: slots 1 / 2,
+    /// `.STARTINGPOS` 1 / 2, `addSlices(43, 1)` = slice 44, 8 `Roughness` draws each). The pose is thrown
+    /// away by the first AI pass (the purgatory park); only the draws and the wheels' state survive.
+    pub fn place_at_race_init(&mut self, table: &SliceTable, grid: &TriangleGrid, tick: u64) {
+        let Some((start, n, rule, startingpos)) = self.grid_init.clone() else { return };
+        let linear = self.linear;
+        for i in 0..self.cars.len() {
+            let g = startingpos.get(i).copied().unwrap_or(0);
+            let (slice, off) = crate::race::grid_slot_by(table, start, (g - 1) as u32, n, &rule, |s, d| crate::traffic::add_slices_on(table, linear, s, d));
+            let sl = table.slices[slice];
+            let c = &mut self.cars[i];
+            c.sync_body_in();
+            let held = std::mem::replace(&mut c.body.game_tick, tick);
+            c.body.place_at_slice(grid, &c.specs, sl.centre, sl.forward.normalize_or_zero(), [sl.lateral, sl.up, sl.forward], off, false, false);
+            c.body.game_tick = held;
+            c.sync_body_out();
+        }
+    }
+
+    /// The `prsonal.bin` row of cop `i`: `slot[slot_base + i].PERSONALITY % 5` (0x4080A4, as the traffic's).
+    fn personality_row(&self, i: usize) -> usize {
+        usize::try_from(self.slot_personalities.get(self.slot_base + i).copied().unwrap_or(0) % 5).unwrap_or(0)
+    }
+
+    /// `AIHigh_Cop` state 0 (0x403E79): the purgatory ctor 0x40DE10 - `Car_placeAtSlice(car, 0, {0, 10 * slot, 0}, 1)`
+    /// with `car+0x7F` still 0 (no draws, as the traffic's), then the delay `1 + rand_below(0x5CC4A0[[0x5E8E24]])`
+    /// (0x40DEAE) - and state 1. The delay is never read for a cop (`AIState_Purgatory::update` 0x40E140
+    /// leaves `car+0xEE8` alone for `car+0x52C & 0x20`), only its draw matters.
+    fn purgatory_init(&mut self, table: &SliceTable, i: usize, rand16: &mut dyn FnMut() -> u32, grid: Option<&TriangleGrid>) {
+        self.cars[i].purgatory_pending = false;
+        if let Some(g) = grid
+            && table.slices.len() >= 2
+        {
+            let (s0, s1) = (table.slices[0], table.slices[1]);
+            let slot = (self.slot_base + i) as f32;
+            let c = &mut self.cars[i];
+            c.sync_body_in();
+            c.body.place_at_slice_from(g, &c.specs, s1.centre, s0.centre, s1.forward.normalize_or_zero(), [s1.lateral, s1.up, s1.forward], Vec3::new(0.0, slot * 10.0, 0.0), false, false, false);
+            c.sync_body_out();
+        }
+        // (the table's entry only scales the draw: `1 + (rand16 * table[n]) >> 16`)
+        let _ = crate::traffic::RESPAWN_TABLE[self.traffic_count.min(crate::traffic::RESPAWN_TABLE.len() - 1)];
+        rand16();
     }
 
     /// This tick's racers, and `0x417710` (called at 0x4179BF at the end of the per-tick car pass):
@@ -1391,6 +1472,24 @@ impl Police {
         self.drive(table, tick, None);
     }
 
+    /// The slice half of each cop's tracker 0x49AF70 (`car+0xE0C`, Sc32 priority 6, after the AI pass and before the
+    /// drives), exactly as [`crate::traffic::TrafficSet::track_slices`]: `Tracker::update` re-finds `car+8` at the
+    /// position the odd tick left, for a cop in the world; a patch-zone change (0x474060) makes 0x499520 copy the
+    /// slice's vectors into [`CopCar::frame`]. Without a grid (the unit tests) the frame follows the slice.
+    pub fn track_slices(&mut self, table: &SliceTable, grid: Option<&TriangleGrid>) {
+        for c in self.cars.iter_mut().filter(|c| c.active) {
+            c.slice = table.find_slice(c.position, c.slice);
+            let sl = &table.slices[c.slice];
+            let changed = match grid {
+                Some(g) => c.body.tracker.track(g, c.position),
+                None => true,
+            };
+            if changed || c.frame == [Vec3::ZERO; 3] {
+                c.frame = [sl.lateral, sl.up, sl.forward];
+            }
+        }
+    }
+
     /// `0x417190`, run by each cop's tracker 0x49AF70 at Sc32 priority 6 (after the AI pass):
     /// `car+0x78` = the octagonal x–z distance to the nearest racer (`0x5E8E2C[]`, from 1000,
     /// `[0x5B2468]` = 0.25), for the cops in the world — the same rule as
@@ -1535,6 +1634,8 @@ impl Police {
         c.sync_body_in();
         c.body.place_at_slice(grid, &c.specs, sl.centre, sl.forward.normalize_or_zero(), [sl.lateral, sl.up, sl.forward], Vec3::ZERO, false, c.requested_dir < 0.0);
         c.sync_body_out();
+        c.frame = [sl.lateral, sl.up, sl.forward];
+        c.body.point_rows = None;
         // vel = 0 and 0x40F400
         c.velocity = Vec3::ZERO;
         c.angular_velocity = Vec3::ZERO;
@@ -1558,11 +1659,20 @@ impl Police {
         for i in 0..self.cars.len() {
             // 0x406745…0x406770: the AI pass's gate, and `[0x5E6654]` for this update
             let Some(ai_ticks) = due(i) else { continue };
+            if self.cars[i].purgatory_pending
+                && let Some((_, rand16)) = spawn.as_mut()
+            {
+                self.purgatory_init(table, i, &mut **rand16, grid);
+                continue;
+            }
             if !self.cars[i].active {
                 // state 1: search, and on a record place the car (0x407890, [`Police::deploy_as`])
                 // and run the new state's update at once (0x404243) — the `placed` arm below
                 let Some((humans, rand16)) = spawn.as_mut() else { continue };
                 let Some(rec) = self.find_spawn_point(table, tick, humans, &mut **rand16) else { continue };
+                // 0x40419B…0x4041BB: the record-kind-1 arm steps the shared word once and discards it
+                // before the placement (live, alps tick 986: the draw between 0x4055E2 and the placement's eight)
+                rand16();
                 let wanted = self.wanted;
                 if !self.deploy_as(table, i, rec, tick, wanted, grid) {
                     continue;
@@ -1997,7 +2107,7 @@ impl Police {
             }
         }
         let sl = table.slices[self.cars[i].slice.min(table.slices.len() - 1)];
-        let st_road = (sl.width_a, sl.width_b);
+        let st_road = aidrive::lane_extent(&sl);
         // The exits of 0x4084C3…0x408646, taken before the drive chain (`traffic.md` §21.7), each
         // zeroing the AI's force / torque `car+0xD34…`, `+0xD4C…`, `+0xD70…` and damping:
         // * 0x4084C3 — knocked over, `car+0x42C == 1` (`Damage` 0x49489A on an impact past 80,
@@ -2055,7 +2165,8 @@ impl Police {
             }
             target
         };
-        let mut st = self.cars[i].as_ai_state(self.phys.max_lat_acc, self.phys.max_yaw_acc);
+        // `car+0x1084 = carSpecs[0xF4] · 9.8` (0x406EF0, for every AI car; live: 15.878614 = 1.620267 · 9.8)
+        let mut st = self.cars[i].as_ai_state(self.cars[i].specs.grip * 9.8, self.phys.max_yaw_acc);
         st.lateral_target = lane_target;
         let aim = aidrive::aim_direction(table, &self.cfg, &st);
         let err = aidrive::heading_error(&st, aim);
@@ -2078,13 +2189,28 @@ impl Police {
         // multiplied by it when it exceeds 1 in both controllers (0x409B46 / 0x40A105), and the
         // in-control lateral pair too (0x409E95…0x409EB2)
         let rate_mul = self.cars[i].rate_mul;
-        let brake = self.phys.brake_force * if rate_mul > 1.0 { rate_mul } else { 1.0 };
-        let cmd = if aidrive::out_of_control(&st, &self.cfg.out_of_control, err, st_road, bend) {
+        let brake = self.phys.brake_force * crate::lanes::PERSONALITIES[self.personality_row(i)].braking * if rate_mul > 1.0 { rate_mul } else { 1.0 };
+        let mut cmd = if aidrive::out_of_control(&st, &self.cfg.out_of_control, err, st_road, bend) {
             aidrive::out_of_control_command(&st, &self.cfg.out_of_control, err, accel, brake)
         } else {
             let grip = 1.0 + 0.0015 * aidrive::body_forward_speed(&st);
             aidrive::in_control_command(&st, &self.cfg.in_control, err, aim, grip, rate_mul, accel, brake)
         };
+        // `0x40A1D0` calls the stability assist 0x49F0C0 before it turns the force into the world acceleration, for every
+        // car but a traffic one (`car+0x52C & 0x10`, 0x49F0C4) — a cop included: with the brake byte `car+0xD80` (the
+        // controller's, just updated) under 0x40, `−4.9 · M[2].y` goes into the forward force (0x49F0E3…0x49F0FE); with
+        // `|vL.x| > 1` or `M[1].y < 0.833`, `−19.6 · M[0].y` into the lateral one (0x49F104…0x49F151). Live, alps tick
+        // 986: a braking cop's world acceleration 11.102 = 11 + 4.9 · 0.0214
+        {
+            let c = &self.cars[i];
+            let rows = c.orientation;
+            if aidrive::brake_light(c.brake_light, cmd.braking, n_ticks as u8) < 0x40 {
+                cmd.forward += -4.9 * rows.row(2).y;
+            }
+            if st.velocity.dot(rows.row(0)).abs() > 1.0 || rows.row(1).y < 0.833 {
+                cmd.lateral += -19.6 * rows.row(0).y;
+            }
+        }
         {
             let c = &self.cars[i];
             tracing::trace!(cop = i, tick, slice = c.slice, dir = c.dir, lat = c.lateral, lat_t = st.lateral_target, speed = c.speed, tgt = c.target_speed, up_y = c.orientation.row(1).y, pos = ?c.position, err, sense = c.gear.sense, "cop drive");
@@ -2281,6 +2407,13 @@ impl Police {
         // gives them, the unit tests do not and the walk sorts the cars itself; and the world
         // positions for 0x40E860's fine step, `traffic.md` section 34.6; history: `game-history.md`
         // §1.35) — the same builder as `TrafficSet::ai_on`'s
+        // 0x401060's head (0x401081…0x401116): a car with none of `car+0x52C & 4 / 8 / 0x10` — a cop, 0x22 —
+        // takes the re-roll draw on every pass, `(rand16 · pers[+0x1C]) >> 16 == 1` (0x4010E7), and then the
+        // lane offset's draw (0x401109); the offset itself is read again only by an opponent's lane pass
+        let row = self.personality_row(i);
+        if self.rng.below(crate::lanes::PERSONALITIES[row].reroll) == 1 {
+            let _ = self.rng.rand16();
+        }
         let mut ctx = std::mem::take(&mut self.lane_ctx);
         ctx.fill(others, &self.other_places, &self.other_positions, self.cars.iter().enumerate().filter(|(j, o)| *j != i && o.active).map(|(_, o)| (o.as_lane_car(table), o.place, o.position)));
         let c = &self.cars[i];
@@ -2299,8 +2432,13 @@ impl Police {
         };
         let mut sc = LaneScratch::default();
         let mut scan = c.scan;
-        ctx.find_blockers(&mut sc, table, &me, c.position, c.place);
-        sc.score_own_side(&me, self.one_way, true);
+        ctx.find_blockers(&mut sc, table, &me, c.position, c.place, &crate::lanes::PERSONALITIES[row]);
+        // 0x401F5B / 0x40212B leave the current lane's hard cap in `[0x5E6674]` (same routine as the traffic's)
+        self.lane_cap = sc.hard[1];
+        // 0x401A00 returns at once for a car with `car+0xECC & 2` (0x401A58: the lights on — a chasing cop) — live,
+        // alps: the cop's own-side scores are (−4, 0, −114) unlit and (0, 0, −114) from tick 1002 on, which lets
+        // the held offset of 0x402790 win at 1090
+        sc.score_own_side(&me, self.one_way, !self.cars[i].lights);
         // §27.10 `0x40DA00`: +15 to whichever side the target is on (`0x401380` × 3), but only when
         // the lane corridor between the two cars is broken at the target's slice and whole at the
         // cop's; the stuck timer counts while it is broken at both. `chase+0x68` is the longitudinal
@@ -2375,6 +2513,18 @@ impl Police {
             }
         }
         for c in self.cars.iter_mut().filter(|c| c.active) {
+            // `0x417800` (after the Sc32 list of an even tick, ahead of the Sc64 integrators): `car+0xED0` = the
+            // frame's lateral · (position − the current slice's centre), `car+0xEC0` = the velocity · the frame's
+            // forward (0x4178A0, 0x4178BE…0x4178E6) — the frame block of the last zone change, raw, and only on
+            // even ticks, as the traffic's (`TrafficSet::integrate_tick`; live, alps tick 994: the cop's `ED0` the
+            // AI pass reads is the one of tick 992)
+            if let Some(t) = tick
+                && t % 2 == 0
+                && c.frame != [Vec3::ZERO; 3]
+            {
+                c.lateral = (c.position - table.slices[c.slice].centre).dot(c.frame[0]);
+                c.speed = c.velocity.dot(c.frame[2]);
+            }
             c.position += c.velocity * dt;
             // 0x49B7A0 moves the four contacts `wheel+0x40` by the same `vel/64` as the body
             // (0x49B7F5…0x49B84C; every car but a smackable) — what the skid marks read after it
@@ -2384,12 +2534,27 @@ impl Police {
                 }
             }
             c.orientation = nfs_physics::vehicle::orientation_step(c.orientation, c.angular_velocity * dt);
-            c.slice = table.find_slice(c.position, c.slice);
-            let sl = &table.slices[c.slice];
-            let lat_axis = sl.lateral.normalize_or_zero();
-            c.lateral = (c.position - sl.centre).dot(lat_axis);
-            c.speed = c.velocity.dot(sl.forward.normalize_or_zero());
+            if grounded && tick.is_some() {
+                // 0x49B9FC refreshes the stored points with these rows, ahead of 0x4A4810; 0x49BA01…0x49BA1D:
+                // `--car+0x80`, at 0 `0x4A4810(car+0x364)` and `car+0x80 = 0x20`
+                c.body.point_rows = None;
+                c.orient_countdown = c.orient_countdown.wrapping_sub(1);
+                if c.orient_countdown == 0 {
+                    c.body.point_rows = Some(c.orientation);
+                    c.orientation = nfs_physics::vehicle::renormalise_matrix(c.orientation);
+                    c.orient_countdown = 0x20;
+                }
+            }
+            // `car+8` is re-found by the tracker 0x49AF70 only ([`Self::track_slices`]); without a game tick (the
+            // unit tests' stand-alone stepping) it follows every step
+            if tick.is_none() {
+                c.slice = table.find_slice(c.position, c.slice);
+                let sl = &table.slices[c.slice];
+                c.lateral = (c.position - sl.centre).dot(sl.lateral.normalize_or_zero());
+                c.speed = c.velocity.dot(sl.forward.normalize_or_zero());
+            }
             if !grounded {
+                let sl = &table.slices[c.slice];
                 c.position.y = sl.centre.y + c.rest_height();
                 c.velocity.y = 0.0;
             }
@@ -2435,9 +2600,13 @@ impl Police {
         match grid {
             Some(g) => {
                 c.body.rearm_after_reset();
+                for w in &mut c.body.wheels {
+                    *w = nfs_physics::vehicle::Wheel::default();
+                }
                 c.sync_body_in();
                 c.body.place_at_slice(g, &c.specs, sl.centre, sl.forward.normalize_or_zero(), [sl.lateral, sl.up, sl.forward], Vec3::new(lateral, 1.0, 0.0), false, dir < 0.0);
                 c.sync_body_out();
+                c.frame = [sl.lateral, sl.up, sl.forward];
                 c.lateral = (c.position - sl.centre).dot(sl.lateral.normalize_or_zero());
                 c.lateral_target = c.lateral;
             }

@@ -131,7 +131,10 @@ impl IntroRun {
             self.blank -= 1;
         } else if let Some(m) = self.movie.as_mut() {
             let Movie { data, video, dec, player, voice, started, .. } = m;
-            let mut decode = |c: usize| dec.decode_frame(&data[video[c].clone()]).rgba;
+            let mut decode = |c: usize| {
+                let r = video[c].clone();
+                dec.decode_frame(nfs_formats::mad::with_run_on(data, r.start, r.len())).rgba
+            };
             if !*started {
                 *started = true;
                 player.preload(&mut decode);

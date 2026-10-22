@@ -525,6 +525,17 @@ impl App {
                 "ASKINGPRICE" => String::new(),
                 _ => self.fe.strings.get(612)?.to_string(),
             },
+            // **`OwnedCars.Car` on an empty garage** — the same class, the same slots:
+            // slot 12 0x4F5C30 answers `FEStrings[[this+0x28]]` with the ctor's second argument
+            // **0x32** (0x4F1EC0) = 50 "no cars owned"; slot 5 0x4F6150 answers `""` for
+            // `ASKINGPRICE` (0x4F61C6) and `FEStrings[612]` "n/a" for every other modifier
+            // (0x4F6200), `PURCHASEPRICE` and `CURRENTVALUE` among them. (The original's garage
+            // sheet of a profile without a car: caption `нет своих машин`, price rows `н/д`.)
+            "OwnedCars.Car" if career.is_some_and(|c| c.career.garage.is_empty()) => match modifier {
+                "" | "SHORT" => self.fe.strings.get(50)?.to_string(),
+                "ASKINGPRICE" => String::new(),
+                _ => self.fe.strings.get(612)?.to_string(),
+            },
             // `"%s %s"` of the car's era and its class, as `FEStrings[era − 10]` and
             // `FEStrings[class + 13]` (0x4F0AAE…0x4F0AD4): 521 − 10 is "Classic" and 501 + 13 is
             // "3", so a `'50 356` reads "Classic 3".

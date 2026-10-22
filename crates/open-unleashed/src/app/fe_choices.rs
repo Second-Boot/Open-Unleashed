@@ -576,6 +576,11 @@ impl App {
         {
             return Some((v.min(options.len() - 1), options));
         }
+        // `Audio.Quality` is the one the sound runs by: the accessor's index is `AUDIOQUALITY`
+        // (0x4E4820 passes it to 0x4A6A00), so the screen and the mixer share one value
+        if name == "Audio.Quality" {
+            return Some(((self.snd.audio_settings.audio_quality as usize).min(options.len() - 1), options));
+        }
         // `OwnedCar.PackageNum` shows the garage car's `FECar+0x684` (slot 33, 0x4F6F50)
         if name == "OwnedCar.PackageNum"
             && let Some((_, o)) = self.garage_car()
@@ -674,6 +679,10 @@ impl App {
                 let hw_default = match name {
                     _ if self.fe0 => 0,
                     "Graphics.LensFlare" => 1,
+                    // 0x50BB4C…0x50BB59: the connection screen's constructor builds it on the list
+                    // 0x5B95F4 (1500 "off", 1501 "on") and sets row **1** (slot 11 with 1) — the
+                    // server's fresh profiles carry 1; the port's 0 came from 0x4BC1F0's initial 0
+                    "Comms.Collision" => 1,
                     "Graphics.SkyRendering" | "Graphics.CarChrome" | "Graphics.CarDetail" => 2,
                     _ if *key == "gear" => 1,
                     _ => 0,

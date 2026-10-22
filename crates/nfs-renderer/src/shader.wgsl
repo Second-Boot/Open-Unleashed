@@ -302,7 +302,7 @@ fn fogged(in: VsOut, c: vec4<f32>) -> vec4<f32> {
 @fragment
 fn fs_opaque(in: VsOut) -> @location(0) vec4<f32> {
     object = objects[in.obj];
-    let c = shade(in);
+    let c = shade(in, false);
     if object.shadow_on.w > 0.0 && c.a * 255.0 < object.shadow_on.w {
         discard;
     }
@@ -312,14 +312,44 @@ fn fs_opaque(in: VsOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     object = objects[in.obj];
-    let c = shade(in);
+    let c = shade(in, false);
     if object.shadow_on.w > 0.0 && c.a * 255.0 < object.shadow_on.w {
         discard;
     }
     return fogged(in, c);
 }
 
-fn shade(in: VsOut) -> vec4<f32> {
+// A blended material with the specular / sky-map / projector passes (`CarWindow`, the alpha pages of
+// `CarExtEnv`): the original draws the base pass first and each of the others after it, every one
+// blended `SRCALPHA` / `INVSRCALPHA` over what is already in the target (`RE/notes/lighting.md`
+// §3.1: the pass blends by the overlay texel's own alpha, whatever the base pass's alpha was). The
+// result of the sequence over the target `d` is `d · Π(1 − aᵢ) + Σ cᵢ · aᵢ · Π(1 − aⱼ, j after i)`,
+// which this entry writes as one premultiplied colour and the coverage `1 − Π(1 − aᵢ)` for the
+// pipeline's `ONE` / `INVSRCALPHA` — not as the overlays mixed into the base colour, which weighs
+// them by the base's alpha. The base pass's alpha test drops only the base layer; an overlay's own
+// `GREATER 10` drops that overlay.
+@fragment
+fn fs_layers(in: VsOut) -> @location(0) vec4<f32> {
+    object = objects[in.obj];
+    let c = shade(in, true);
+    var fog = globals.fog;
+    if object.sky_on.y > 0.5 {
+        fog = globals.sky_fog;
+    }
+    if fog.w <= 0.0 {
+        return c;
+    }
+    var d = max(-(globals.view * vec4<f32>(in.world, 1.0)).z, 0.0);
+    if object.sky_on.z > 0.0 {
+        d = object.sky_on.z;
+    }
+    // the fog is per layer (`f · cᵢ + (1 − f) · fog`), so on the premultiplied sum
+    // `f · C + (1 − f) · fog · A`
+    let f = exp(-fog.w * d);
+    return vec4<f32>(c.rgb * f + fog.rgb * (1.0 - f) * c.a, c.a);
+}
+
+fn shade(in: VsOut, layered: bool) -> vec4<f32> {
     // the material's mip LOD bias, Thrash state 8 (`RE/notes/thrash.md` §7), in `shadow_on.z`
     let tex = textureSampleBias(t_diffuse, s_diffuse, in.uv, object.shadow_on.z);
     let n = normalize(in.normal);
@@ -371,7 +401,22 @@ fn shade(in: VsOut) -> vec4<f32> {
         }
     }
     var lit = base.rgb * light;
-    lit = mix(lit, env_over.rgb * light, env_over.a);
+    // `layered`: `lit` is the premultiplied sum of the layers so far, `cov` its coverage
+    let base_a = base.a * object.light.a;
+    var cov = 1.0;
+    if layered {
+        cov = base_a;
+        if object.shadow_on.w > 0.0 && base_a * 255.0 < object.shadow_on.w {
+            cov = 0.0;
+        }
+        lit = lit * cov;
+    }
+    if layered {
+        lit = lit * (1.0 - env_over.a) + env_over.rgb * light * env_over.a;
+        cov = cov * (1.0 - env_over.a) + env_over.a;
+    } else {
+        lit = mix(lit, env_over.rgb * light, env_over.a);
+    }
     // `R3DSkyMapTextureLayer`, pass 2 (option mask 2 on `CarExtEnv` / `CarExtEnvNS`, mask 0 on
     // `CarWindow`): the same three-op pass as the specular one — the `Rs` block `{1, 2, 0, 1, 0,
     // −1}` (`rmthpasses`: key 0x52730006), the layer and the draw — so the section map × the light
@@ -380,7 +425,12 @@ fn shade(in: VsOut) -> vec4<f32> {
     if object.sky_on.x > 0.5 {
         let sky = textureSampleLevel(t_sky, s_proj, in.sky_uv, 0.0);
         if sky.a * 255.0 > 10.0 {
-            lit = mix(lit, sky.rgb * light, sky.a);
+            if layered {
+                lit = lit * (1.0 - sky.a) + sky.rgb * light * sky.a;
+                cov = cov * (1.0 - sky.a) + sky.a;
+            } else {
+                lit = mix(lit, sky.rgb * light, sky.a);
+            }
         }
     }
     // `R3DShadowMapTextureLayer` (0x446130), pass 3 with the same `Rs` block: the projector's
@@ -396,8 +446,16 @@ fn shade(in: VsOut) -> vec4<f32> {
         // `sh80`'s material asks for a LOD bias of −1 (`mt+0x40`, `RE/notes/thrash.md` §7)
         let sh = textureSampleBias(t_proj, s_proj, uv, -1.0);
         if sh.a * 255.0 > 10.0 {
-            lit = mix(lit, sh.rgb * light, sh.a);
+            if layered {
+                lit = lit * (1.0 - sh.a) + sh.rgb * light * sh.a;
+                cov = cov * (1.0 - sh.a) + sh.a;
+            } else {
+                lit = mix(lit, sh.rgb * light, sh.a);
+            }
         }
     }
-    return vec4<f32>(lit, base.a * object.light.a);
+    if layered {
+        return vec4<f32>(lit, cov);
+    }
+    return vec4<f32>(lit, base_a);
 }

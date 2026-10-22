@@ -1,6 +1,7 @@
 //! Opponent driver reconstructed from `AIState_Racing` (`RE/notes/ai.md` §3, CONFIRMED unless noted):
 //! target speed from the summed heading deviation over a speed-dependent lookahead (`.ais` tables),
-//! throttle/brake from the rpm error, steering toward the mean of four racing-line points ahead.
+//! throttle from `ratio·vTarget` and the brake from the rpm error (0x40C02F…0x40C10A), steering toward the mean
+//! of four racing-line points ahead.
 //!
 //! The junction branch choice of `race-logic.md` §10.4 is in: once per junction the lookahead reaches,
 //! the car draws from the original's single global stream and picks a link, which every road preview
@@ -529,11 +530,21 @@ impl AiDriver {
         // after the pedal law and before the steering. `Vehicle::process_input` applies it.
         self.shift_roll = (v.gear <= 1 && tick > 0x1C0).then(crate::rng::rand16);
         let ratio = specs.ratio_rpm_per_mps[g];
-        let err = ratio * (vt - v.v_long());
-        let mut throttle = ((err / specs.redline) * 256.0).clamp(0.0, 254.0) as u8;
+        // **The pedal law, 0x40C008…0x40C10A** (x87, 53-bit): `fld r; fmul [car+0xEB8]` (r·vt),
+        // `fld r; fmul [car+0xD60]` (r·v), `fsubr st(0), st(1)` (`D8 E9`: st0 = r·vt − r·v), and
+        // `fstp [ebp+8]` **stores the error and pops it** — so the `fdiv [specs+0x94]` / `fmul 256` /
+        // `_ftol` that follow work on what is left, **r·vt**: the throttle byte is
+        // `min(trunc(r·vt / redline · 256), 254)`, the car's speed does not enter it. The error (as
+        // the f32 it was stored as) only feeds the brake: below 0, `brake = min(trunc(|2·err| /
+        // redline · 256), 254)` and a non-zero brake zeroes the throttle (0x40C0B2…0x40C103).
+        // *(The port had taken the throttle from the error, `r·(vt − v)/redline`: the s4 trace's AI
+        // car held 254 in 4th at 846 where the port's gave 222, `REFERENCE-2026-10-22-PA-TRAFFIC.md`.)*
+        let (r64, vt64, redline64) = (ratio as f64, vt as f64, specs.redline as f64);
+        let err = (r64 * vt64 - r64 * v.v_long() as f64) as f32;
+        let mut throttle = ((r64 * vt64 / redline64 * 256.0).trunc().clamp(-2147483648.0, 254.0) as i32) as u8;
         let mut brake = 0u8;
         if err < 0.0 {
-            brake = ((2.0 * err.abs() / specs.redline) * 256.0).clamp(0.0, 254.0) as u8;
+            brake = ((2.0 * (err as f64).abs() / redline64 * 256.0).trunc().min(254.0) as i32) as u8;
             if brake > 0 {
                 throttle = 0;
             }

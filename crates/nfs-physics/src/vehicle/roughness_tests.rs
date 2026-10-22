@@ -81,7 +81,6 @@ fn a_damaged_engine_misfires() {
     let specs = tests::specs_993();
     let mut v = Vehicle::new(Vec3::ZERO, Mat3::IDENTITY, &specs, 0.8, 0.3);
     // an undamaged engine never misfires, whatever the draw
-    v.misfire_roll = 0.0;
     assert_eq!(v.engine_wear(&specs), 0.0);
     // a wrecked one misfires whatever the draw: (300 + 1.5·300) / 2 over 300
     v.damage = [300.0; 10];

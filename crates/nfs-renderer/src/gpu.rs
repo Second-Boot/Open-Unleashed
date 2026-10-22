@@ -499,7 +499,7 @@ impl Core {
             let c = wgpu::BlendComponent { src_factor: src, dst_factor: dst, operation: wgpu::BlendOperation::Add };
             wgpu::BlendState { color: c, alpha: c }
         };
-        let make_pipeline = |blend: bool, pair: u8, cull: Option<wgpu::Face>, depth: bool, zwrite: bool| {
+        let make_pipeline = |blend: bool, pair: u8, cull: Option<wgpu::Face>, depth: bool, zwrite: bool, layers: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("mesh pipeline"),
                 layout: Some(&pipeline_layout),
@@ -515,11 +515,25 @@ impl Core {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some(if blend { "fs_main" } else { "fs_opaque" }),
+                    entry_point: Some(if layers {
+                        "fs_layers"
+                    } else if blend {
+                        "fs_main"
+                    } else {
+                        "fs_opaque"
+                    }),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format,
-                        blend: Some(if blend { pair_state(pair) } else { wgpu::BlendState::REPLACE }),
+                        blend: Some(if layers {
+                            // `fs_layers` writes the premultiplied sum of the passes and their coverage
+                            let c = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add };
+                            wgpu::BlendState { color: c, alpha: c }
+                        } else if blend {
+                            pair_state(pair)
+                        } else {
+                            wgpu::BlendState::REPLACE
+                        }),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
@@ -552,13 +566,14 @@ impl Core {
         };
         // six a group — the cull (back, none, front) × depth (on, off), `2·cull + !depth` — and the
         // groups: 0 blend off, 1 the plain alpha pair, 2…4 the other pairs, 5…8 every pair again
-        // with depth writes on (`device_states`)
+        // with depth writes on (`device_states`), 9 / 10 the layered passes of a blended material
+        // (`fs_layers`, plain pair) without and with depth writes
         const CULLS: [Option<wgpu::Face>; 3] = [Some(wgpu::Face::Back), None, Some(wgpu::Face::Front)];
-        // (the 54 pipelines compile independently: built on worker threads, kept in the same order)
-        let mut specs = Vec::with_capacity(54);
-        for (blend, pair, zwrite) in [(false, 0, false), (true, 0, false), (true, 1, false), (true, 2, false), (true, 3, false), (true, 0, true), (true, 1, true), (true, 2, true), (true, 3, true)] {
+        // (the 66 pipelines compile independently: built on worker threads, kept in the same order)
+        let mut specs = Vec::with_capacity(66);
+        for (blend, pair, zwrite, layers) in [(false, 0, false, false), (true, 0, false, false), (true, 1, false, false), (true, 2, false, false), (true, 3, false, false), (true, 0, true, false), (true, 1, true, false), (true, 2, true, false), (true, 3, true, false), (true, 0, false, true), (true, 0, true, true)] {
             for i in 0..6 {
-                specs.push((blend, pair, CULLS[i / 2], i % 2 == 0, zwrite));
+                specs.push((blend, pair, CULLS[i / 2], i % 2 == 0, zwrite, layers));
             }
         }
         let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8);
@@ -566,7 +581,7 @@ impl Core {
             let make_pipeline = &make_pipeline;
             let handles: Vec<_> = specs
                 .chunks(specs.len().div_ceil(workers))
-                .map(|c| sc.spawn(move || c.iter().map(|&(blend, pair, cull, depth, zwrite)| make_pipeline(blend, pair, cull, depth, zwrite)).collect::<Vec<_>>()))
+                .map(|c| sc.spawn(move || c.iter().map(|&(blend, pair, cull, depth, zwrite, layers)| make_pipeline(blend, pair, cull, depth, zwrite, layers)).collect::<Vec<_>>()))
                 .collect();
             handles.into_iter().flat_map(|h| h.join().expect("pipeline worker")).collect()
         });
@@ -1569,7 +1584,12 @@ impl Core {
             // the blend group without depth writes, and with them (`device_states`)
             let plain = if mat.alpha_blend && mat.blend_pair > 0 { 1 + mat.blend_pair as usize } else { mat.alpha_blend as usize };
             let group = if mat.alpha_blend && mat.device_states { 5 + mat.blend_pair as usize } else { plain };
-            let sky = sky_tex_of(&self.materials, self.no_reflections, item).unwrap_or(white).0;
+            let sky_texture = sky_tex_of(&self.materials, self.no_reflections, item);
+            let sky = sky_texture.unwrap_or(white).0;
+            // a blended material with the specular, sky-map or projector pass draws them over its
+            // own blend, not mixed into its colour (`fs_layers`); the plain alpha pair only
+            let layered = mat.alpha_blend && mat.blend_pair == 0 && (sky_texture.is_some() || item.shadow.is_some() || (mat.env_mix > 0.0 && !self.no_reflections));
+            let (plain, group) = if layered { (9, if mat.device_states { 10 } else { 9 }) } else { (plain, group) };
             // `LayerFalseSort1` / `2`: at `SPECIALFX` 3, always, and at 2 by the runtime
             // pick (`FakeSortMode`, `RE/notes/thrash.md` §6d.4), the same draw first with
             // depth writes off, then on (0x449ADB / 0x449B2A). Otherwise (below 2, or 2's

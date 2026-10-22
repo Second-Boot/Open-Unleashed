@@ -485,7 +485,7 @@ impl Shared {
                 for (ch, o) in frame.iter_mut().enumerate() {
                     let w = sv.window[ch];
                     let x = resample::interpolate(interp, sv.frac, 0, |k| w[(k + 1) as usize]);
-                    *o = resample::mix_into(*o, x, sv.volume);
+                    *o = resample::mix_into(*o, x, sv.volume * sv.gains[ch]);
                 }
                 let f = sv.frac + step;
                 sv.frac = f & 0xFFFF;
@@ -858,7 +858,7 @@ mod rate_tests {
     fn a_stream_level_is_set_at_once_and_ends_a_running_fade() {
         // 0x567810 → 0x5662B0: `+0x2C = level << 16`, the ramp step 0 — the level at once
         let src = super::StreamSource::new(22050, 1);
-        let mut sv = super::StreamVoice { src, volume: 1.0, frac: 0, window: [[0.0; 4]; 2], primed: false, fade: Some(super::Fade::new(1.0, 500, 0)) };
+        let mut sv = super::StreamVoice { src, volume: 1.0, gains: [1.0, 1.0], frac: 0, window: [[0.0; 4]; 2], primed: false, fade: Some(super::Fade::new(1.0, 500, 0)) };
         sv.set_level(40);
         assert_eq!((sv.volume, sv.fade), (40.0 / 127.0, None));
         // the same word (0x5662FE `je`): nothing written, a fade running from there goes on
@@ -875,7 +875,7 @@ mod rate_tests {
     fn a_stream_fade_steps_once_a_tick() {
         let src = super::StreamSource::new(22050, 1);
         let mut s = Shared::default();
-        s.streams.push((super::VoiceId(0), super::StreamVoice { src, volume: 1.0, frac: 0, window: [[0.0; 4]; 2], primed: false, fade: Some(super::Fade::new(1.0, 30, 0)) }));
+        s.streams.push((super::VoiceId(0), super::StreamVoice { src, volume: 1.0, gains: [1.0, 1.0], frac: 0, window: [[0.0; 4]; 2], primed: false, fade: Some(super::Fade::new(1.0, 30, 0)) }));
         // the first render runs the service before its first frame: one of the three steps,
         // 127 << 16 less 2774357 — level 84
         s.render(1, 22050);

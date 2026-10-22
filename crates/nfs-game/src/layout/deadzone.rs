@@ -86,7 +86,10 @@ impl LayoutScreen {
         if self.deadzone.len() <= pad {
             self.deadzone.resize(pad + 1, DEADZONE_DEFAULT);
         }
-        self.deadzone[pad][n] = deadzone_clamp(region, v, self.deadzone[pad][n]);
+        // the arm's own clamp is 0…0x80 (0x51BDC9); the accessor then stores it through
+        // `SetSelection` 0x4BC240, which keeps it within the range's 0x80 rows: 0…127
+        let c = deadzone_clamp(region, v, self.deadzone[pad][n]);
+        self.deadzone[pad][n] = [c[0].min(127), c[1].min(127)];
     }
 
     /// The bar the pointer pressed on, and which handle — `FEDeadZone`'s slot 5, **0x51BB60**: it

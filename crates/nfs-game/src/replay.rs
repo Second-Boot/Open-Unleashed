@@ -470,6 +470,10 @@ pub struct ReplaySetup {
     /// The `nfs5.car` record id, which is what the original's snapshot carries (`.TYPE` of the car
     /// slot, §16.2); the port resolves the model and sim from it when it reads an original `.rpl`.
     pub car_id: u16,
+    /// An original `.rpl`'s slot-0 `.FILENAME` (+0x228) and `.SPECNAME` (+0x268): the model and sim names
+    /// the original's own loader takes (a race launched by `fe = 0` carries `.TYPE` 0xB, no catalogue id).
+    /// Only the fallback when `car_id` names no catalogue car.
+    pub file_car: Option<(String, String)>,
     /// Body colour.
     pub paint: [u8; 3],
     pub laps: u32,
@@ -1094,7 +1098,7 @@ impl ReplayFile {
             // the byte after the mission's words (a file from before GB ends there: `None`)
             opponent_transmission = c.u8().ok().and_then(tri);
         }
-        Some(Self { setup: ReplaySetup { track, car, sim, car_id, paint, laps, opponents, traffic, cops, damage, backwards, mirror, seed, skill, driver_name, net, race_type, fegame_type, camera, player, opponent_cars, scene, derby, nocollision, transmission, opponent_transmission, mission }, final_tick, stream })
+        Some(Self { setup: ReplaySetup { track, car, sim, car_id, paint, laps, opponents, traffic, cops, damage, backwards, mirror, seed, skill, driver_name, net, race_type, fegame_type, camera, player, opponent_cars, scene, derby, nocollision, transmission, opponent_transmission, mission, ..Default::default() }, final_tick, stream })
     }
 }
 
@@ -1267,6 +1271,12 @@ fn put_car_record(out: &mut [u8], slot: usize, c: &CarRecord, n_cars: u32) {
     let base = f::CARS + slot * f::CAR_STRIDE;
     let put = |o: &mut [u8], at: usize, v: u32| o[base + at..base + at + 4].copy_from_slice(&v.to_le_bytes());
     put(out, f::CAR_TYPE, c.car_id as u32);
+    // `.CLASS` +0x8 is the racer's kind (`fe.txt`: `car[0].class=human`, `car[1..7].class=ai`; 1 and 2 in a live `fe = 0`
+    // file): `Race_setCars` 0x4ECF00 builds no racer for a slot of class 0, and the original's playback of a file
+    // without it died on its empty racer list (0x42448D reads `0x5E8E2C[0]`)
+    put(out, f::CAR_CLASS, if slot == 0 { 1 } else { 2 });
+    // `.SUSPENSIONSTIFFNESS` 0x233 (+0x130): 1.0 in both slots of a live `fe = 0` file
+    put(out, 0x130, 65536);
     put(out, f::CAR_COLOUR, (c.paint[0] as u32) << 16 | (c.paint[1] as u32) << 8 | c.paint[2] as u32);
     let dn = c.name.as_bytes();
     let n = dn.len().min(f::CAR_DRIVERNAME_LEN - 1);
@@ -1292,12 +1302,29 @@ fn put_car_record(out: &mut [u8], slot: usize, c: &CarRecord, n_cars: u32) {
     for (k, d) in c.damage.iter().enumerate() {
         put(out, 0xC8 + 4 * k, d.to_bits());
     }
-    if let Some(setup) = &c.setup {
-        for (id, v) in SETUP_IDS.iter().zip(setup) {
-            if let Some((off, _)) = f::car_field(*id) {
-                put(out, off, (*v * 65536.0) as i32 as u32);
-            }
+    // a record with no sliders is the `FECar` constructor's (0x4EED2D: 50 / 50 / 50, three zeroes, 1.0, 30 / 30 psi and
+    // eight zeroes); the original reads the file's words as they stand, and a zero tyre pressure or shock rate gave a
+    // racer whose position went NaN on the first tick
+    let setup = c.setup.unwrap_or(NEUTRAL_SETUP);
+    for (id, v) in SETUP_IDS.iter().zip(setup) {
+        if let Some((off, _)) = f::car_field(*id) {
+            put(out, off, (v * 65536.0) as i32 as u32);
         }
+    }
+}
+
+/// The `FECar` constructor's slider block (0x4EED2D), in [`SETUP_IDS`] order.
+const NEUTRAL_SETUP: [f32; 17] = [50.0, 50.0, 50.0, 0.0, 0.0, 0.0, 1.0, 30.0, 30.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+/// `.FILENAME` 0x13D (+0x228) and `.SPECNAME` 0x13E (+0x268) of slot `slot`: the model directory and the sim the
+/// original's loader builds the racer from (a record without them left the racer a model-less default).
+fn put_car_names(out: &mut [u8], slot: usize, names: Option<(String, String)>) {
+    use snapshot as f;
+    let Some((model, sim)) = names.filter(|(m, s)| !m.is_empty() && !s.is_empty()) else { return };
+    let base = f::CARS + slot * f::CAR_STRIDE;
+    for (at, text) in [(0x228usize, &model), (0x268, &sim)] {
+        let n = text.len().min(0x3F);
+        out[base + at..base + at + n].copy_from_slice(&text.as_bytes()[..n]);
     }
 }
 
@@ -1370,6 +1397,12 @@ fn put_car_words(out: &mut [u8], slot: usize, words: &[(u32, Vec<u32>)]) {
 /// `num_cars` is `NUMCARS` as `Race_setCars` 0x4ECF00 sets it: cops + players + opponents +
 /// traffic, the traffic already cut to fit nine (0x4ED382…0x4ED399) — the caller knows the counts.
 pub fn original_rpl(setup: &ReplaySetup, final_tick: u64, stream: &[u8], ramp: Ramp, num_cars: u32) -> Vec<u8> {
+    original_rpl_named(setup, final_tick, stream, ramp, num_cars, &|_| None)
+}
+
+/// [`original_rpl`] with the catalogue's `(model, sim)` of a car id, for the `.FILENAME` / `.SPECNAME` the original's
+/// loader builds each racer from (`names` of the player's `car_id` is not asked: the setup carries it).
+pub fn original_rpl_named(setup: &ReplaySetup, final_tick: u64, stream: &[u8], ramp: Ramp, num_cars: u32, names: &dyn Fn(u16) -> Option<(String, String)>) -> Vec<u8> {
     use snapshot as f;
     let mut out = vec![0u8; RPL_LEN];
     let put = |o: &mut Vec<u8>, at: usize, v: u32| o[at..at + 4].copy_from_slice(&v.to_le_bytes());
@@ -1428,9 +1461,11 @@ pub fn original_rpl(setup: &ReplaySetup, final_tick: u64, stream: &[u8], ramp: R
         }
         if let Some(c) = &setup.player {
             put_car_record(&mut out, 0, c, num_cars);
+            put_car_names(&mut out, 0, Some((setup.car.clone(), setup.sim.clone())));
         }
         for (k, c) in setup.opponent_cars.iter().flatten().enumerate() {
             put_car_record(&mut out, k + 1, c, num_cars);
+            put_car_names(&mut out, k + 1, names(c.car_id));
         }
     }
     if let Some(net) = &setup.net {
@@ -1507,6 +1542,13 @@ pub fn parse_original_rpl(data: &[u8]) -> Option<(ReplaySetup, u64, Vec<u8>)> {
         car: String::new(),
         sim: String::new(),
         car_id: u32at(f::CARS + f::CAR_TYPE) as u16,
+        file_car: {
+            let name = |at: usize| {
+                let b = &data[f::CARS + at..f::CARS + at + 0x40];
+                b[..b.iter().position(|x| *x == 0).unwrap_or(0x40)].iter().map(|&c| c as char).collect::<String>()
+            };
+            Some((name(0x228), name(0x268))).filter(|(m, _)| !m.is_empty())
+        },
         paint: [0, 0, 0],
         laps: u32at(f::NUM_LAPS),
         opponents: u32at(f::NUMOPPONENTRACECARS),
@@ -2458,5 +2500,34 @@ mod tests {
         assert_eq!(&f[slot(2) + 0x228..slot(2) + 0x22C], b"sbus");
         // nothing lands in the slots past the traffic
         assert!(f[slot(3)..slot(9)].iter().all(|b| *b == 0));
+    }
+
+    /// A port-written `.rpl` the original can play (PA-SRV, played live in the original): every racer slot has a `.CLASS`
+    /// (1 human, 2 AI), the `FECar` constructor's sliders when the record has none, and the model / sim names the loader
+    /// takes. Without them the original's racer list was empty (0x42448D) or a racer's position went NaN on tick 4.
+    #[test]
+    fn a_port_written_rpl_has_the_words_the_originals_loader_needs() {
+        let car = |id: u16, setup: Option<[f32; 17]>| CarRecord { car_id: id, paint: [1, 2, 3], name: "X".into(), grid: None, decal: -1, personality: 0, difficulty: 1.0, skill: None, parts: None, part_damage: vec![], damage: [0.0; 10], setup, livery: None };
+        let setup = ReplaySetup {
+            track: "alps".into(),
+            car: "993".into(),
+            sim: "993cabrio36".into(),
+            car_id: 153,
+            opponents: 1,
+            player: Some(car(153, Some([50.0, 50.0, 50.0, 0.0, 0.0, 0.0, 1.0, 35.0, 35.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))),
+            opponent_cars: Some(vec![car(30, None)]),
+            ..Default::default()
+        };
+        let f = original_rpl_named(&setup, 9, &[1], Ramp::default(), 2, &|id| (id == 30).then(|| ("911".to_string(), "911sim".to_string())));
+        let word = |slot: usize, at: usize| u32::from_le_bytes(f[snapshot::CARS + slot * snapshot::CAR_STRIDE + at..][..4].try_into().unwrap());
+        assert_eq!((word(0, 8), word(1, 8)), (1, 2));
+        // the player's own sliders stand; the opponent's are the constructor's (50 / 50 / 50, shock 1.0, 30 psi)
+        assert_eq!((word(0, 0x13C), word(1, 0x13C)), (35 << 16, 30 << 16));
+        assert_eq!((word(1, 0x114), word(1, 0x11C), word(1, 0x134), word(1, 0x130)), (50 << 16, 50 << 16, 1 << 16, 1 << 16));
+        let text = |slot: usize, at: usize| -> Vec<u8> { f[snapshot::CARS + slot * snapshot::CAR_STRIDE + at..][..16].iter().copied().take_while(|b| *b != 0).collect() };
+        assert_eq!((text(0, 0x228), text(0, 0x268)), (b"993".to_vec(), b"993cabrio36".to_vec()));
+        assert_eq!((text(1, 0x228), text(1, 0x268)), (b"911".to_vec(), b"911sim".to_vec()));
+        // an original `.rpl` names the car for the loader when its `.TYPE` is no catalogue id
+        assert_eq!(parse_original_rpl(&f).unwrap().0.file_car, Some(("993".to_string(), "993cabrio36".to_string())));
     }
 }

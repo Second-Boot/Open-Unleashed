@@ -11,6 +11,7 @@ impl App {
         match class {
             // 0x51AE00 answers −1 while mission 0 is unpassed; 0x4CF3ED / 0x4CF61D stop the draw
             "NFS5.BADGE" | "NFS5.MINIBADGE" if self.badge_stage().is_none() => Some("licence badge, no mission passed (0x51AE00 = -1, 0x4CF3ED / 0x4CF61D)"),
+            "NFS5.MINIPLAYERPICTURE" if self.badge_stage().is_none() => Some("mini portrait, no mission passed (0x51AE00 = -1, 0x4CFCA3 -> 0x4CFD4D)"),
             // the bind 0x5087CF stops at `number >= [0x699D00]`, the media list's count
             "NFS5.ChroniclePictureIcon" if *icons > 0 => {
                 *icons -= 1;

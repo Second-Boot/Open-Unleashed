@@ -64,7 +64,7 @@ impl Vehicle {
             (c.throttle, c.brake)
         };
         // The pedal floats `[0x628FB0]` / `[0x628FAC]` are `min(byte / 252, 1)` of those bytes
-        // **after** the overrides (0x49E0E3…0x49E147; 240 under `[0x657404] > 0`, not carried).
+        // **after** the overrides (0x49E0E3…0x49E147; 240 under `[0x657404] > 0`, see `crate::comm`).
         // So the hold after a car's (re)birth is `car+0xDB0 < 0x40` — 63 ticks for a new or a
         // dead-and-reset car (`DB0 = 1`), 4 for a live one reset (`0x3C`, 0x49E31E…) — and before
         // the start only the brake is held: the throttle revs the engine on the grid.
@@ -72,8 +72,13 @@ impl Vehicle {
         // birth counter `ticks_alive` was under 0x40 or the race had not started, so a reset car
         // was never held and a car on the grid could not rev. This 2 s birth hold is also the
         // "dead zone" `physics.md` §4.1b-bis measured with `launch_profile`.)*
-        let mut thr = (self.throttle_byte as f32 / 252.0).min(1.0);
-        let mut brk = (self.brake_byte as f32 / 252.0).min(1.0);
+        // the divisor is 240 under `COMM_MODE [0x657404] > 0` (0x49E0CA…0x49E0DB: `mov [esp+0x10], 252.0`, replaced
+        // by 240.0 when the global is positive) — every network race: a pedal byte of 240 or more is a full pedal
+        // there, and a full 0x7E packet (252) saturates; the live exchange race against the original
+        // (`REFERENCE-2026-10-22-PA-356.md`) had the 356s on byte 248 = 0.984 here, 1.0 there
+        let div = crate::comm::pedal_divisor();
+        let mut thr = (self.throttle_byte as f32 / div).min(1.0);
+        let mut brk = (self.brake_byte as f32 / div).min(1.0);
         if dead {
             self.downshift_blip = false;
             self.shift_timer = 0;
@@ -283,9 +288,10 @@ impl Vehicle {
     /// `Engine_update` 0x49E440 → drive − drag, read to the instruction 2026-09-26
     /// (`physics.md` §4.5).
     pub(super) fn engine_update(&mut self, specs: &CarSpecs, rear_contact: bool) -> f32 {
-        // (TEST GLUE experiment `shared_rng`: the misfire draw at its own place, 0x49E496, ahead
-        // of the rev limiter's 0x49E5xx)
-        let roll = if self.shared_rng { self.rand16() as f32 * 1.525_878_9e-5 } else { self.misfire_roll };
+        // the misfire draw `rand16 · [0x5B253C]` at its own place, 0x49E496 — after the damage pull
+        // (0x49F473) and ahead of the rev limiter's (0x49E58B…) and `AutoShift`'s (0x49DAF3) — from
+        // the shared word, measured live (`REFERENCE-2026-10-22-PA-TRACE.md`)
+        let roll = self.rand16() as f32 * 1.525_878_9e-5;
         let vz = self.v_local.z;
         let a_drag = specs.drag * vz * vz * vz * self.draft;
         let gear = self.gear;
@@ -401,8 +407,8 @@ impl Vehicle {
         }
         let slip = self.rpm - rpm_wheel.abs();
         // (`misfire`, above: a damaged engine stumbles, which stops the clutch model pulling the revs
-        // down and kills the drive when it is over its target. The draw comes from the shared LCG,
-        // so the caller fills `misfire_roll` each tick.)
+        // down and kills the drive when it is over its target. The draw comes from the shared LCG
+        // in place, 0x49E496.)
         // **The clutch-slip block of `Engine_update` 0x49E440, read to the instruction on
         // 2026-09-21** (`physics.md` §4.1a). The note this used to follow had three comparisons the
         // wrong way round, and the port had simplified the rest; together they left the rear axle

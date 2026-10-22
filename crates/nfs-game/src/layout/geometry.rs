@@ -132,8 +132,10 @@ pub fn deadzone_clamp(region: u32, v: i32, dz: [i32; 2]) -> [i32; 2] {
 }
 
 /// The sixteen dead-zone accessors out of the factory: every `.Min` 0 and every `.Max` 0x80
-/// (0x51E546, 0x51E550).
-pub const DEADZONE_DEFAULT: [[i32; 2]; 8] = [[0, 0x80]; 8];
+/// (0x51E546, 0x51E550) **as `SetSelection` 0x4BC240 keeps it** — clamped to the range's last
+/// index, 127 (the range 0…0x80 has 0x80 rows, 0x51BE3D; every fresh profile the original wrote
+/// has 127 in the selection and in all sixteen values).
+pub const DEADZONE_DEFAULT: [[i32; 2]; 8] = [[0, 127]; 8];
 
 /// `NFS5.ColorBox`'s custom colour editor, as state — `RE/notes/controls.md` §4.47, §4.48, §4.66.
 ///

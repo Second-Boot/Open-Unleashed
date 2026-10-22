@@ -44,6 +44,11 @@ impl StreamSource {
     pub fn queued_frames(&self) -> usize {
         self.queue.len() / self.channels.max(1) as usize
     }
+    /// TEST GLUE: play everything queued at once.
+    #[cfg(test)]
+    pub(crate) fn drain(&self) {
+        while self.queue.pop_frame(self.channels.max(1) as usize).is_some() {}
+    }
 }
 
 impl AudioOutput {
@@ -75,10 +80,24 @@ impl AudioOutput {
     /// handle. Its channels take voices of the budget at [`STREAM_PRIORITY`] (0x5612A0), so it is
     /// never stolen; a refused start (the budget full of unstealable voices) returns a dead handle.
     pub fn play_stream(&self, src: Arc<StreamSource>, volume: f32) -> VoiceId {
+        self.start_stream(src, volume, [1.0, 1.0])
+    }
+
+    /// [`Self::play_stream`] of a **mono** source at the request's pan byte `+7` through the
+    /// library's stereo law (`pan_gains`): 0x5612A0 stores the byte in `voice+0x1F` and its
+    /// angle `(p − 0x40) << 8` in `voice+0x14` (0x561414…0x561424, 0x5614B7). Only the voice chat
+    /// asks for one (0x493496: byte 0). APPROXIMATION: the stream voice's patch pan `voice+0x3E`
+    /// (0x561451, from the stream format's parse 0x58A4B0, not read) is taken as the centre 0x40,
+    /// which leaves the byte as it is ([`voice_pan`]).
+    pub fn play_stream_panned(&self, src: Arc<StreamSource>, volume: f32, pan: u8) -> VoiceId {
+        self.start_stream(src, volume, pan::pan_gains(pan))
+    }
+
+    fn start_stream(&self, src: Arc<StreamSource>, volume: f32, gains: [f32; 2]) -> VoiceId {
         let mut st = self.tx.state.lock().unwrap();
         let id = VoiceId(st.next_id);
         st.next_id += 1;
-        self.tx.push(&mut st, Cmd::Stream { id, src, volume }, Some(Pend::Stream(id, volume)));
+        self.tx.push(&mut st, Cmd::Stream { id, src, volume, gains }, Some(Pend::Stream(id, volume)));
         id
     }
 }
@@ -86,6 +105,8 @@ impl AudioOutput {
 pub(crate) struct StreamVoice {
     pub(crate) src: Arc<StreamSource>,
     pub(crate) volume: f32,
+    /// per output channel: 1 for every stream but a panned mono one ([`AudioOutput::play_stream_panned`])
+    pub(crate) gains: [f32; 2],
     /// the resampler's 16-bit fraction ([`resample::Cursor`])
     pub(crate) frac: u32,
     /// per channel `s[P−1], s[P], s[P+1], s[P+2]` around the stream's position, 16-bit scale

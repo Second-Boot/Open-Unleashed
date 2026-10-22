@@ -44,7 +44,10 @@ pub(crate) fn specs() -> CarSpecs {
 
 /// A cop car of half height `hy` (the box 0x445090 halves) at chase level `level`.
 fn cop(hy: f32, level: usize) -> CopCar {
-    CopCar::new(0, Vec3::new(0.9, hy, 2.1), &specs(), level)
+    let mut c = CopCar::new(0, Vec3::new(0.9, hy, 2.1), &specs(), level);
+    // (state 0's purgatory — `Police::purgatory_init` — has its own test)
+    c.purgatory_pending = false;
+    c
 }
 
 /// A flat drivable square, surface 1, `s` metres to a side.
@@ -533,13 +536,13 @@ fn the_chase_tracker_lags_by_the_skill_gain() {
     c.lateral = 1.0;
     let tgt = ChaseTarget { position: t.slices[40].centre, slice: 40, lateral: 3.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
     let mut tr = ChaseTracker::new(&t, TRACKER_GAIN[0], &c, &tgt);
-    assert_eq!((tr.gap, tr.slice, tr.lateral, tr.speed), (60.0, 40, 3.0, 20.0));
+    assert_eq!((tr.gap, tr.slice, tr.lateral, tr.speed), (-60.0, 40, 3.0, 20.0), "0x403660: the reset's gap is 0x40E6E0(cop, target), the step's (target, cop)");
     assert_eq!(tr.lat_diff, -2.0, "0x4036B0: cop − target, the step's sign reversed");
     let faster = ChaseTarget { speed: 40.0, ..tgt };
     tr.step(&t, &c, &faster);
     assert!((tr.speed - 21.0).abs() < 1e-4, "0.05 of the way: {}", tr.speed);
     assert!((tr.lat_diff - (-2.0 + 0.05 * 4.0)).abs() < 1e-5);
-    assert_eq!(tr.slice, 40, "round(60 / 6) = 10 slices ahead of the cop");
+    assert_eq!(tr.slice, 21, "the mirrored reset gap −60 steps to −54: round(−54 / 6) = −9 slices from the cop");
     let mut exact = ChaseTracker { k: TRACKER_GAIN[2], ..tr };
     exact.step(&t, &c, &faster);
     assert_eq!((exact.speed, exact.lateral), (40.0, 3.0));
@@ -1015,6 +1018,25 @@ fn a_cop_never_acquires_an_opponent() {
     assert_eq!(p.claims(0), 0, "the empty-handed 0x405220 releases");
 }
 
+/// `AIHigh_Cop` state 0 (0x403E79): the first AI pass that reaches a cop builds its purgatory (0x40DE10) and draws the delay
+/// once (0x40DEAE); the cop stays out of the world and its state-1 search starts with the next pass.
+#[test]
+fn state_zero_draws_the_purgatory_delay_once() {
+    let t = ring(400);
+    let file = CopFile { records: vec![CopRecord::Point { kind: 1, slice: 43, moving: true }] };
+    let mut cars = vec![cop(0.6, 2), cop(0.6, 2)];
+    cars.iter_mut().for_each(|c| c.purgatory_pending = true);
+    let mut p = Police::new(file, cars, 0, false);
+    let tgt = ChaseTarget { position: t.slices[10].centre, slice: 10, lateral: 0.0, lane: 7, speed: 20.0, half_width: 0.9, half_length: 2.2, finished: false };
+    let mut draws = 0;
+    p.set_racers(vec![RacerRef { position: t.slices[10].centre, slice: 10, progress: 0.025, laps_timed: 0, speed: 20.0 }]);
+    p.tick(&t, 0, &tgt, &[], &[10], &mut || { draws += 1; 0 });
+    assert_eq!(draws, 2, "one delay draw per cop, in index order");
+    assert!(p.cars.iter().all(|c| !c.purgatory_pending && !c.active));
+    p.tick(&t, 1, &tgt, &[], &[10], &mut || { draws += 1; 0 });
+    assert!(draws >= 2, "no second delay");
+}
+
 /// §17.5d: `0x405440` walks the racers from the top of `0x5E8BAC` and an opponent is a clean
 /// perp — so a patrol comes out 31 slices ahead of **it**, one per 500 m, whatever the human does.
 #[test]
@@ -1038,7 +1060,7 @@ fn a_patrol_spawns_ahead_of_an_opponent() {
     assert!(p.cars[0].active && p.cars[0].slice == 233, "cop 0 at the opponent's record");
     assert!(p.cars[1].active && p.cars[1].slice == 43, "cop 1 at the human's: the opponent has a cop inside 500 m now, the human's cursor has not moved yet");
     assert!(!p.cars[2].active);
-    assert_eq!(draws, 2, "one LCG step per usable record");
+    assert_eq!(draws, 4, "two LCG steps per usable record: the search's and the placement arm's discarded one (0x40419B)");
     // nobody is wanted, so nobody claims — and the opponent is never acquired
     let tgt = tgt(13);
     p.update(&t, 5004, &tgt, &[]);
@@ -1216,6 +1238,8 @@ fn shared_ring_digest(with_places: bool) -> (u32, u32, u64) {
     use crate::traffic::{CopView, Reference, TrafficSet};
     let t = ring(200);
     let mut set = TrafficSet::new(&crate::test_support::traffic_models(7), &t, 1.0, false, 12345);
+    // (the set's own stream, TEST GLUE: the race's is the process-wide word other tests draw from)
+    set.rng = crate::traffic::SharedRng::Own(crate::traffic::Lcg::new(12345));
     set.slot_base = 3;
     let file = CopFile { records: [10, 30, 150].iter().map(|&s| CopRecord::Point { kind: 1, slice: s, moving: true }).collect() };
     let mut p = Police::new(file, (0..3).map(|_| cop(0.6, 1)).collect(), 0, false);
@@ -1267,7 +1291,7 @@ fn shared_ring_digest(with_places: bool) -> (u32, u32, u64) {
             eat(v.to_bits());
         }
     }
-    (set.rng.0, cop_rng.0, h)
+    (set.rng.word(), cop_rng.0, h)
 }
 
 #[test]
@@ -1275,8 +1299,23 @@ fn traffic_and_cops_on_a_shared_ring_keep_their_draws_and_poses() {
     let a = shared_ring_digest(false);
     let b = shared_ring_digest(true);
     assert_eq!(shared_ring_digest(false), a, "deterministic");
-    assert_eq!(a, (24509, 10773, 5548681200507787554)); // the same on every platform since the test ring uses portable maths
-    assert_eq!(b, a, "the places and positions of the others change no draw here");
+    // the same on every platform since the test ring uses portable maths. Re-baselined 2026-10-22
+    // (PA-TRAFFIC): the purgatory's delay is drawn by each car's first update (0x40DE10 at 0x40DEAE),
+    // not when the set is built, and the oncoming honk draw waits for a human within 360 m (0x407C20)
+    // Re-baselined again 2026-10-22 (PA-TRAFFIC3): the traffic drive's aim point is 0x4090C0's
+    // (sixths, the narrow-road shrink and the lane-extent retry), its brake `12 · pers[+0x20]`, its
+    // lateral clamp `specs[0xF4] · 9.8`, the oncoming honk waits for `[0x5E6674] > −3`, the purgatory
+    // parks the car, and 0x40A1D0 damps the world `ω.y` by the pre-step `car+0xD60`
+    // Re-baselined again 2026-10-22 (PA-COPS): the cops' lane pass takes the personality re-roll draw
+    // (0x4010E7) and the placement arm its discarded step (0x40419B), the chase tracker's reset is mirrored
+    // (0x403660), the brake force is `11 · pers[+0x20]` and the lateral limit `specs[0xF4] · 9.8`, the cops'
+    // slice / `car+0xED0` / `car+0xEC0` follow the tracker and 0x417800, the stability assist 0x49F0C0 reaches the cop's force, a lit cop skips 0x401A00
+    assert_eq!(a, (23541, 12645, 4455510520046766344));
+    // with the real places and positions the cops' fine gaps (0x40E860) and the traffic's blocker
+    // caps differ from the slice-gap fallback, and since PA-TRAFFIC3 the trajectories they feed no
+    // longer happen to meet the same draws: the variant is pinned on its own
+    assert_eq!(shared_ring_digest(true), b, "deterministic");
+    assert_eq!(b, (23541, 12645, 7698492423931635218));
 }
 
 /// Timing of the shared-ring scenario (`cargo test -p nfs-game --lib -- --ignored --nocapture ring_timing`):

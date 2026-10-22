@@ -718,18 +718,19 @@ impl CarAssets {
         Ok(pages)
     }
 
-    /// Load `GameData/Simulation/AICarData/<family>.ais`; tries the model name (e.g. `993`, `356_1` → `356`)
-    /// then `default.ais` (the exe keys the file by the car-info family string — HYPOTHESIS on the mapping).
-    pub fn load_ais(paths: &GamePaths, model: &str) -> Result<nfs_formats::ais::AiCarData, AssetError> {
+    /// **The `.ais` loader 0x49CA30**: `GameData/Simulation/AICarData/<family>.ais`, the name being the car-info
+    /// record's `.AISPECNAME` (`carinfo+0x2A8`, 0x49CA45…0x49CA52 `"%s%s.ais"`) — an FE car's catalogue family
+    /// (`nfs5.car` +0x115, e.g. `993T` for the 993 Turbo), `fe.txt`'s `car[i].aispecname` in an `fe = 0` race —
+    /// and `default.ais` when that file does not open (0x49CA70…0x49CA7D `"%sdefault.ais"`). *(Until 2026-10-22
+    /// the port keyed it on the model name, so a 993 Turbo drove on `993.ais` and a 930 on `default.ais`.)*
+    pub fn load_ais(paths: &GamePaths, family: &str) -> Result<nfs_formats::ais::AiCarData, AssetError> {
         let dir = paths.game_data().join("Simulation").join("AICarData");
-        let base: String = model.chars().take_while(|c| *c != '_').collect();
-        let candidates = [format!("{model}.ais"), format!("{base}.ais"), format!("{}.ais", base.to_lowercase()), "default.ais".into()];
-        for n in &candidates {
-            if let Some(p) = GamePaths::find_file(&dir, n) {
+        for n in [format!("{family}.ais"), "default.ais".into()] {
+            if let Some(p) = GamePaths::find_file(&dir, &n) {
                 return nfs_formats::ais::AiCarData::parse(&read(&p)?).map_err(fmt_err(&p));
             }
         }
-        Err(AssetError::MissingFile { dir, name: format!("{model}.ais") })
+        Err(AssetError::MissingFile { dir, name: format!("{family}.ais") })
     }
 
     /// Load `GameData/Simulation/CarData/<variant>.sim`.

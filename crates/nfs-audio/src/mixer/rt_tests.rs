@@ -124,12 +124,28 @@ impl Api for AudioOutput {
 struct Direct {
     core: Core,
     cfg_next_id: u32,
+    cfg_quality: Option<u8>,
 }
 
 impl Api for Direct {
     fn quality(&mut self, q: u8) {
         let (budget, rate, interp, sleep) = (voice_budget(q), mix_rate(q), Interp::for_quality(q), pump_sleep_ms(q));
+        if self.cfg_quality == Some(q) {
+            return;
+        }
+        let reopen = self.cfg_quality.is_some();
+        self.cfg_quality = Some(q);
         let g = &mut self.core.shared;
+        if reopen {
+            g.voices.clear();
+            g.streams.clear();
+            g.tail = None;
+        }
+        if reopen || g.mix_rate.is_none() {
+            (g.clock, g.pump, g.service_tick) = (ServiceClock::default(), Pump::default(), 0);
+            g.bridge.pending.clear();
+            g.bridge.t = 0.0;
+        }
         g.sleep_ms = Some(sleep);
         g.interp = interp;
         g.budget = Some(budget);
@@ -194,7 +210,7 @@ impl Api for Direct {
         let id = VoiceId(self.cfg_next_id);
         self.cfg_next_id += 1;
         if self.core.shared.allocate(src.channels.max(1) as usize, STREAM_PRIORITY, None) {
-            self.core.shared.streams.push((id, StreamVoice { src: src.clone(), volume: vol, frac: 0, window: [[0.0; 4]; 2], primed: false, fade: None }));
+            self.core.shared.streams.push((id, StreamVoice { src: src.clone(), volume: vol, gains: [1.0, 1.0], frac: 0, window: [[0.0; 4]; 2], primed: false, fade: None }));
         }
         id
     }
@@ -221,6 +237,11 @@ fn step(a: &mut dyn Api, i: usize, live: &mut Vec<VoiceId>, clips: &[Arc<Clip>; 
     }
     if i == 120 {
         a.quality(0);
+    }
+    if i == 121 {
+        // the reopen at 120 stopped every voice and the stream: the song again, still `live[0]`
+        let id = a.stream(stream, 0.6);
+        live.insert(0, id);
     }
     if i == 130 {
         a.fade(live[0], 500, 0);
@@ -310,7 +331,7 @@ fn the_queue_mixes_what_the_direct_calls_mix() {
     let mut out = AudioOutput { _stream: None, tx, rate: 44100 };
     // the old mixer made its reverb on the first send; the new one has a fresh one from the start
     let (_, rcore) = Tx::new(44100, false);
-    let mut direct = Direct { core: rcore.unwrap(), cfg_next_id: 0 };
+    let mut direct = Direct { core: rcore.unwrap(), cfg_next_id: 0, cfg_quality: None };
     direct.core.shared.tail = None;
     let clips = clips();
     let wave = (0..60000).map(|i| ((i % 200) as i16 - 100) * 60).collect::<Vec<_>>();
@@ -537,4 +558,71 @@ fn the_scripted_mix_is_pinned() {
     assert_eq!(got, PINNED_MIX, "the scripted mix changed");
 }
 
-const PINNED_MIX: [u64; 5] = [0x6f0e6096346de3a1, 0x915bc3675c20c65c, 0x34e61de18c1ba39e, 0x61c4478b8b8eecc1, 0x453179fc96264360];
+// re-pinned for REG-AUDIO2: a changed quality reopens the sound (every voice and stream stopped,
+// the service clock from 0) — the script's own changes at 60 / 120 and the forced quality 0 / 1 / 3
+// over its step-0 quality 2; the quality-2 run (no change) kept its hash
+const PINNED_MIX: [u64; 5] = [0x08bae4bd5d4507d1, 0x056dc4acbe1708f5, 0x202055c77ce4cd0d, 0x61c4478b8b8eecc1, 0x0dcfa221d76b08d5];
+
+/// REG-AUDIO2: a reported session — the output opened at `AUDIOQUALITY` 0 (32000 Hz, a fresh
+/// profile's default) with the front end's song and loops playing, then the profile's 1 (22050
+/// Hz) seconds later. The mix must keep its service ticks: a fade, a release and a stream's end
+/// run at the new rate as at the first one. *(Before the fix the 32000 → 22050 switch under the
+/// running clock made the next tick ~268 million frames: the race start's `MusicStop(1500)` fade
+/// never reached 0 and a released loop never left the mix.)*
+#[test]
+fn a_quality_change_reopens_the_sound_and_the_service_keeps_ticking() {
+    let (tx, core) = Tx::new(48000, false);
+    let mut core = core.unwrap();
+    let out = AudioOutput { _stream: None, tx, rate: 48000 };
+    let mut buf = vec![0.0f32; 256 * 2];
+    // one device callback of 256 frames at 48 kHz, as the macOS output asks
+    let mut run = |core: &mut Core, secs: f64| {
+        for _ in 0..(secs * 48000.0 / 256.0).ceil() as usize {
+            core.drain();
+            core.fill(&mut buf, 2, 48000.0);
+            core.publish();
+        }
+    };
+    let song = |frames: usize| {
+        let s = StreamSource::new(22050, 2);
+        s.push(&(0..frames * 2).map(|i| ((i % 200) as i16 - 100) * 60).collect::<Vec<_>>());
+        s
+    };
+    assert!(!out.set_audio_quality(0), "the first configuration is the open, not a reopen");
+    assert!(!out.set_audio_quality(0), "the same setting again does nothing");
+    let looped = clips()[0].clone();
+    let fe_song = out.play_stream(song(22050 * 30), 0.4);
+    let fe_loop = out.play_word(looped.clone(), 0.5, 4096, 0x40, 0x2000, true);
+    run(&mut core, 11.0);
+    assert!(out.is_playing(fe_song) && out.is_playing(fe_loop));
+    // the profile's quality: 0x4A6A00 closes and reopens — nothing that played survives
+    assert!(out.set_audio_quality(1), "a changed setting reopens the sound");
+    run(&mut core, 0.05);
+    assert!(!out.is_playing(fe_song) && !out.is_playing(fe_loop), "the reopen stops every voice and stream");
+    // after the reopen: a song faded out over 1500 ms reaches level 0 (the race start's
+    // `MusicStop(1500)` the next pick waits on)
+    let s = out.play_stream(song(22050 * 30), 0.4);
+    run(&mut core, 1.0);
+    out.fade(s, 1500, 0);
+    run(&mut core, 1.7);
+    assert_eq!(out.stream_volume(s), Some(0.0), "the 1500 ms fade ran out");
+    // a released loop leaves the mix after its five-tick ramp
+    let v = out.play_word(looped, 0.5, 4096, 0x40, 0x2000, true);
+    run(&mut core, 0.2);
+    out.release(v);
+    run(&mut core, 0.2);
+    assert!(!out.is_playing(v), "the release ran out");
+    // a song that has been played leaves the mix (what `MusicUpdate`'s advance waits for)
+    let src = song(22050 / 2);
+    src.finished.store(true, Ordering::Release);
+    let e = out.play_stream(src, 0.4);
+    run(&mut core, 1.0);
+    assert!(!out.is_playing(e), "the played-out song ended");
+    // and the other way, 22050 → 32000
+    assert!(out.set_audio_quality(0));
+    let v = out.play_word(clips()[0].clone(), 0.5, 4096, 0x40, 0x2000, true);
+    run(&mut core, 0.2);
+    out.release(v);
+    run(&mut core, 0.2);
+    assert!(!out.is_playing(v), "the release ran out at 32000 Hz");
+}

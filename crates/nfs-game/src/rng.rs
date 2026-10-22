@@ -37,16 +37,19 @@ pub fn state() -> u32 {
 }
 
 /// One 16-bit draw.
+#[track_caller]
 pub fn rand16() -> u32 {
     nfs_physics::lcg::rand16()
 }
 
 /// `rand16 · 1/65536` — the `[0, 1)` the branch choice compares its thresholds against.
+#[track_caller]
 pub fn rand01() -> f32 {
     rand16() as f32 * RAND16_TO_UNIT
 }
 
 /// `(rand16 · n) >> 16` — the original's "random below n".
+#[track_caller]
 pub fn below(n: u32) -> u32 {
     (rand16() * n) >> 16
 }

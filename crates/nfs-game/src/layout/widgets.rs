@@ -246,7 +246,14 @@ impl LayoutScreen {
                 self.drop_down(overlay, aspect, e, i, x, y, tint);
             }
         }
+        // **A disabled combo is dim**: 0x4C5992 `call 0x4C7E40` and, when true, the
+        // bar's colour is 0x4D87F0(0x30FF0000, fade) (0x4C599C) in place of the red / amber, and
+        // the two text colours take alpha 0x30 (0x4C59D0 `neg al / sbb / and al, 0x31 / add 0xFF`
+        // = 0x30 disabled, 0xFF otherwise, into 0x4D87E0 / 0x4D87D0, 0x4C59E0 / 0x4C5A09). The
+        // template's `[state.disabled]` lists the same parts as `normal`, so this is all code.
+        let dim = state == "disabled";
         for (px, py, pw, ph, col) in self.state_rects(e, state) {
+            let col = if dim { [0xff, 0, 0, 0x30] } else { col };
             out.push(self.quad(aspect, x + px, y + py, pw.max(1.0), ph.max(1.0), tint(col)));
         }
         // `data.dropshadow == 2` replaces the `backrect`'s plain fill with §4.22's red
@@ -411,12 +418,16 @@ impl LayoutScreen {
     /// The combo's caption, where the template's `labelleft` puts it, in the font
     /// `data.usesmallfont` picks.
     fn combo_caption(&self, d: WidgetDraw<'_>, out: &mut Vec<Sprite>) {
-        let WidgetDraw { e, x, y, aspect, strings, .. } = d;
+        let WidgetDraw { i, e, x, y, aspect, strings, selected, hovered, .. } = d;
+        let dim = self.state_for(e, i, selected, hovered) == "disabled";
         if let Some(c) = self.controls.get(&e.class)
             && let Some(p) = c.part("labelleft")
             && let Some(t) = e.string_id().filter(|n| *n != 0).and_then(|n| strings.get(n)).filter(|t| !t.is_empty())
-            && let Some(col) = self.part_colour(e, p, "foreColor").filter(|c| c[3] != 0)
+            && let Some(mut col) = self.part_colour(e, p, "foreColor").filter(|c| c[3] != 0)
         {
+            if dim {
+                col[3] = 0x30; // 0x4C59D0: a disabled combo's text alpha, see `draw_combo`
+            }
             let (px, py) = self
                 .part_attr(e, p, "pos")
                 .and_then(|v| self.ev_pair(e, v, 0))
@@ -491,6 +502,8 @@ impl LayoutScreen {
             // disabled flag; it is drawn now. §4.125.
             let gscw = self.attr_num(e, "GraphicsSpecialCaseWidth").unwrap_or(0.0) as f32;
             let colour = if selected == Some(i) { [1.0, 0.85, 0.2, 1.0] } else { [1.0, 1.0, 1.0, 1.0] };
+            // a disabled combo's text is alpha 0x30 (0x4C59D0, see `draw_combo`)
+            let colour = if state == "disabled" { [colour[0], colour[1], colour[2], 0x30 as f32 / 255.0] } else { colour };
             // **`nolabel == 1`** — all fourteen of them on `display.lay`, and all
             // fourteen with `stringID=0`, so they have no caption of their own — puts
             // the **value** where the caption would go instead: 0x4C6080 takes the

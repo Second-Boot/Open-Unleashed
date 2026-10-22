@@ -128,7 +128,10 @@ impl App {
         let num_cars = cops + 1 + self.num_opponents + traffic;
         // a network race's (`NetSetup` in the setup): the humans and the host's traffic cars kept
         let num_cars = if let Some(n) = file.setup.net.as_ref() { 1 + n.seats.len() as u32 + n.traffic.len() as u32 } else { num_cars };
-        let rpl = nfs_game::replay::original_rpl(&file.setup, file.final_tick, &file.stream, r.ramp, num_cars);
+        // the catalogue's model / sim of an opponent's `.TYPE` for its `.FILENAME` / `.SPECNAME`
+        let catalogue = std::fs::read(self.paths.fe_data().join("Data").join("nfs5.car")).ok().and_then(|d| nfs_formats::fedata::parse_car_catalog(&d).ok()).unwrap_or_default();
+        let names = |id: u16| catalogue.iter().find(|c| c.id == id).map(|c| (c.model.clone(), c.sim.clone()));
+        let rpl = nfs_game::replay::original_rpl_named(&file.setup, file.final_tick, &file.stream, r.ramp, num_cars, &names);
         if let Err(e) = std::fs::write(path.with_extension("rpl"), rpl) {
             tracing::debug!(error = %e, "writing the original-format .rpl failed");
         }
@@ -717,5 +720,13 @@ pub(crate) fn resolve_replay_car(paths: &GamePaths, rs: &mut nfs_game::replay::R
         rs.car = e.model.clone();
         rs.sim = e.sim.clone();
         rs.paint = e.paint_sets.first().map(|p| p.colours[0]).unwrap_or([0xD4, 0x10, 0x10]);
+    } else if rs.car.is_empty()
+        && let Some((model, sim)) = rs.file_car.clone()
+    {
+        // no catalogue car (an `fe = 0` race's `.TYPE` is 0xB): the original loads `GameData/CarModel/<.FILENAME>`
+        // and the `.SPECNAME` sim itself (`default` there); the colour index stays the first paint
+        rs.car = model;
+        rs.sim = if sim.is_empty() { "default".into() } else { sim };
+        rs.paint = [0xD4, 0x10, 0x10];
     }
 }

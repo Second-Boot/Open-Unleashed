@@ -13,9 +13,7 @@ impl App {
         }
         // the voice budget of the sound's open 0x4A66B0 for the current `AUDIOQUALITY` — re-given on
         // every use, as 0x4A6A00 reopens the sound when the setting changed
-        if let Some(a) = &self.snd.audio {
-            a.set_audio_quality(self.snd.audio_settings.audio_quality);
-        }
+        self.apply_audio_quality();
         // the race audio init 0x4A8660 loads `replay.spl` over the mix block for a playback and
         // `game.spl` otherwise (0x4A86A1); the players the port keeps across races took the old
         // block's trims, so they are rebuilt (the engine and the ambience are, every race)
@@ -141,7 +139,7 @@ impl App {
     }
 
     /// Stage "cars" — steps 8 → 9: the grid pose, the player's seat, the opponents, the police and the traffic; hands back the slice table, the start frame and the player's grid slot.
-    pub(super) fn race_stage_grid(&mut self, renderer: &mut Renderer, world: &mut TrackWorld, car_env: nfs_game::world::CarEnv, driver_rand: &mut nfs_game::movie_overlay::CRand, factory_driver: bool) -> (Option<SliceTable>, glam::Mat3, Option<(usize, Vec3)>) {
+    pub(super) fn race_stage_grid(&mut self, renderer: &mut Renderer, world: &mut TrackWorld, car_env: nfs_game::world::CarEnv, driver_rand: &mut nfs_game::movie_overlay::CRand, factory_driver: bool) -> (Option<SliceTable>, glam::Mat3, Option<(usize, Vec3)>, Vec<(usize, usize, Vec3)>) {
         // start pose from the slice-based grid rule (pole position, single racer)
         // `<track>.jnc` carries the branch weights the AI's junction choice reads (`race-logic.md` §10)
         let table = SliceTable::from_crp(&self.track.crp, &self.track.crp_data).ok().map(|mut t| {
@@ -202,6 +200,9 @@ impl App {
         let grid_rule = nfs_game::race::GridRule { linear: self.linear_track(), derby_cars: self.net_derby.then(|| n_cars + self.road.traffic_count) };
         // the player's `Grid_slot` slice and pose, for `Car_placeAtSlice` below
         let mut grid_place: Option<(usize, Vec3)> = None;
+        // the opponents' `Grid_slot` slices and poses (opponent index, slice, pose), placed after the
+        // human's (`start_race`): `Cars_resetAll` 0x4110A0 resets the racers in registration order
+        let mut opp_places: Vec<(usize, usize, Vec3)> = Vec::new();
         let rot = match &table {
             Some(t) => {
                 let (pos, rot, slice) = grid_pose(t, start_scene, self.player_grid, n_cars, &grid_rule);
@@ -268,6 +269,14 @@ impl App {
                     l.iter().map(|(_, r)| r.parts.as_ref().map(|ids| ids.iter().filter_map(|id| parts_table.iter().find(|p| p.id == *id).cloned()).collect()).unwrap_or_default()).collect()
                 });
                 let mut plan_pers: Vec<i16> = self.career_opponents.as_ref().map(|l| l.iter().map(|o| o.personality).collect()).unwrap_or_default();
+                // TEST GLUE `NFS_PA_FE0` (`pa_trace.rs`): an `fe = 0` race's opponents, `fe.txt`'s `car[k].*`
+                let fe0 = std::env::var_os("NFS_PA_FE0").is_some() && rec_plan.is_none() && self.career_opponents.is_none();
+                if fe0 {
+                    let list = super::pa_trace::fe0_opponents(&self.paths.root, &catalog, self.num_opponents as usize);
+                    plan_pers = list.iter().map(|o| o.personality).collect();
+                    plan_liv = list.iter().map(|o| o.livery).collect();
+                    self.career_opponents = Some(list);
+                }
                 let plan: Vec<(
                     nfs_formats::fedata::CarCatalogEntry,
                     [u8; 3],
@@ -511,10 +520,14 @@ impl App {
                     // record's, else the gearbox option (0x4EEDA0 writes it for every kind whose
                     // `param_7` is 0 — the opponents' callers 0x4EBCBF / 0x4EBF06 / 0x4EC3FF and 0x4DE213 pass 0)
                     let mut seat_setup = None;
+                    // (TEST GLUE `NFS_PA_FE0`: `fe.txt`'s `car[k].transmission`, absent = 0, manual)
                     let automatic = seat_rec
                         .and_then(|rec| rec.num(nfs_net::launchcar::id::TRANSMISSION))
-                        .map_or_else(|| self.option_automatic(), |v| v == 1);
-                    let setup = seat_rec.and_then(|rec| rec.setup());
+                        .map(|v| v == 1)
+                        .or_else(|| fe0.then(|| super::pa_trace::fe0_automatic(&self.paths.root, slot + 1)))
+                        .unwrap_or_else(|| self.option_automatic());
+                    // (TEST GLUE `NFS_PA_FE0`: the sliders of `fe.txt`'s `car[k].*`)
+                    let setup = seat_rec.and_then(|rec| rec.setup()).or_else(|| fe0.then(|| super::pa_trace::fe0_setup(&self.paths.root, slot + 1)));
                     if let Some(setup) = setup {
                         seat_setup = Some(setup);
                     }
@@ -553,12 +566,10 @@ impl App {
                     let (pts, half) = nfs_game::world::car_body(&assets, car_tiny);
                     vehicle.set_car_body(pts, half);
                     // `Car_raceInit` 0x410730: `Grid_slot` 0x410580's slice and offset into
-                    // `Car_placeAtSlice` 0x49B090 (0x41095C), dir +1 — the port's reversed table
-                    // already turns the slices round. An opponent (`car+0x52C & 8`) on the race's
-                    // first tick, so the offset is slice-local (0x49B0FB)
-                    vehicle.game_tick = self.tick;
-                    let s = &t.slices[sl];
-                    vehicle.place_at_slice(&world.collision, &specs, s.centre, s.forward, [s.lateral, s.up, s.forward], grid_offset(s, p), true, false);
+                    // `Car_placeAtSlice` 0x49B090 (0x41095C) — run in `start_race`, after the human's:
+                    // `Cars_resetAll` 0x4110A0 resets the racers in registration order, and the
+                    // placement's two `Susp_update`s draw their roughness from the shared word
+                    opp_places.push((self.road.opponents.len(), sl, p));
                     let mut model = model;
                     if car_tiny {
                         model.scale = 0.4;
@@ -572,7 +583,8 @@ impl App {
                         .unwrap_or(entry.dash);
                     model.set_dash(dash[0], dash[1], dash[2], dash[3]);
                     self.road.opponent_models.push(model);
-                    let controller = match CarAssets::load_ais(&self.paths, &entry.model) {
+                    // 0x49CA30: the `.ais` of the car-info record's `.AISPECNAME`, the catalogue family
+                    let controller = match CarAssets::load_ais(&self.paths, &entry.sim_family) {
                         Ok(ais) => {
                             let mut d = nfs_game::ai::AiDriver::new(ais, &sim.unknown_tail);
                             d.grip_ratio = grip_ratio;
@@ -773,7 +785,13 @@ impl App {
                         if let Some(sim) = &traffic_sim {
                             // (`.TINYCAR` is on every car but traffic — `CarSpecs::apply_tinycar`)
                             let mut cs = CarSpecs::from_sim(sim, false);
-                            nfs_game::career::fold_fresh_car(&mut cs, &entry.stock_parts, &traffic_parts_table, &entry.sim_family, traffic_automatic);
+                            // (TEST GLUE `NFS_PA_FE0`: an `fe = 0` race's traffic slot is a racer slot whose
+                            // record holds `fe.txt`'s `car[k].*` sliders — live, slot 2's `specs[0xF4]` came out
+                            // 1.963333 = 1.9 · (35/30 · 2 + 8) · 0.1, its 35 psi tyres; `k` = 1 + the opponents
+                            // + this car's index, the slot `TrafficSet::slot_base` gives it)
+                            let fe0_slot = 1 + self.num_opponents as usize + traffic_car_specs.len();
+                            let setup = if fe0 { super::pa_trace::fe0_setup(&self.paths.root, fe0_slot) } else { nfs_game::career::CAR_SETUP_DEFAULT };
+                            nfs_game::career::fold_fresh_car_with(&mut cs, &entry.stock_parts, &traffic_parts_table, &entry.sim_family, &setup, traffic_automatic);
                             traffic_car_specs.push(cs);
                         }
                     }
@@ -802,6 +820,13 @@ impl App {
                             b.automatic = traffic_automatic; // its own `carinfo+0xC` (0x4ED460 / 0x4ED56E pass 0)
                         }
                         set.cops_race = self.road.cops_race;
+                        // the racer slots' `.PERSONALITY` (0x65808C + 0x580·i + 0x14C): slot 0 the human, then
+                        // the opponents' — a traffic car's registration index lies past them, where the
+                        // original reads what the array last held (`TrafficSet::slot_personalities`)
+                        set.slot_personalities = std::iter::once(0).chain(plan_pers.iter().map(|&p| i32::from(p))).collect();
+                        if fe0 {
+                            set.slot_personalities = super::pa_trace::fe0_slot_personalities(&self.paths.root);
+                        }
                         // `TRACK_NAME` for the spawn gate's canyon / industrial windows (0x40E0AD)
                         set.set_track(&self.track.name);
                         // `[0x5E8BF8]` for the §5.2 rule 3 early-race boost
@@ -829,6 +854,12 @@ impl App {
                                 Err(e) => tracing::warn!(error = %e, "scripts.bin unreadable"),
                             }
                         }
+                        // `Cars_resetAll`'s placement of the traffic slots (`Grid_slot` 0x410580): the start slice
+                        // the human's grid uses, the racers `[0x5E8AE8]`, each slot's `.STARTINGPOS` — what a
+                        // slot 0x4ECF00 never wrote holds: 0 (a fresh process; an `fe = 0` race reads `fe.txt`)
+                        let first_slot = 1 + self.num_opponents as usize + cops as usize;
+                        let startingpos: Vec<i32> = (0..plan.len()).map(|k| if fe0 { super::pa_trace::fe0_startingpos(&self.paths.root, first_slot + k) } else { 0 }).collect();
+                        set.grid_init = Some((nfs_game::race::start_slice(t, start_scene, grid_rule.linear), n_cars, grid_rule, startingpos));
                         self.road.traffic = Some(set);
                         for sp in &plan {
                             tracing::debug!(model = sp.model, bus = sp.bus, half = ?sp.half_extents, mass = sp.mass(), "traffic body");
@@ -848,6 +879,14 @@ impl App {
                 self.road.police_sets.clear();
                 self.road.police_specs.clear();
                 self.road.police_prev.clear();
+                self.road.human_ed = Default::default();
+                // TEST GLUE `NFS_PA_FE0` (`pa_trace.rs`): an `fe = 0` race's cops are the racer slots whose
+                // `car[k].class` is `cop`; the `cops` key sets `COPS` [0x657414]
+                let fe0_cops: Vec<(usize, String)> = if fe0 { super::pa_trace::fe0_cops(&self.paths.root) } else { Vec::new() };
+                if fe0 {
+                    self.road.cops_enabled = !fe0_cops.is_empty() && nfs_formats::fetxt::Registry::load(&self.paths.root).u32("cops", 0) != 0;
+                    self.road.cop_count = fe0_cops.len() as u32;
+                }
                 if self.road.cops_enabled {
                     let trk = std::fs::read(self.paths.fe_data().join("Data").join("nfs5.trk"))
                         .ok()
@@ -880,7 +919,12 @@ impl App {
                         let mut boxes: Vec<Vec3> = Vec::new();
                         let mut probe_sets: Vec<Vec<Vec3>> = Vec::new();
                         for k in 0..self.road.cop_count as usize {
-                            let id = ids[k % ids.len()];
+                            let mut id = ids[k % ids.len()];
+                            if let Some((_, model)) = fe0_cops.get(k)
+                                && let Some(c) = catalog.iter().find(|c| c.model.eq_ignore_ascii_case(model))
+                            {
+                                id = c.id;
+                            }
                             // a cop's `.DRIVER`: 0x4ED0BC / 0x4ED1A5 launch each cop car through
                             // 0x4EEDA0 (kind 8, 0x4ED174 / 0x4ED25E), so every cop record draws
                             // its own `rand() & 7` (0x4EEDAC), cop 0 first, right after the
@@ -952,7 +996,12 @@ impl App {
                                 .ok()
                                 .map(|s| {
                                     let mut cs = CarSpecs::from_sim(&s, false);
-                                    nfs_game::career::fold_fresh_car(&mut cs, &entry.stock_parts, &cop_parts_table, &entry.sim_family, cop_automatic);
+                                    // (TEST GLUE `NFS_PA_FE0`: the cop's racer slot holds `fe.txt`'s `car[k].*` sliders)
+                                    let setup = match fe0_cops.get(k) {
+                                        Some(&(slot, _)) => super::pa_trace::fe0_setup(&self.paths.root, slot),
+                                        None => nfs_game::career::CAR_SETUP_DEFAULT,
+                                    };
+                                    nfs_game::career::fold_fresh_car_with(&mut cs, &entry.stock_parts, &cop_parts_table, &entry.sim_family, &setup, cop_automatic);
                                     cs
                                 })
                                 .unwrap_or_else(|| self.specs.clone());
@@ -996,6 +1045,19 @@ impl App {
                                 1 + self.num_opponents as usize,
                                 false,
                             );
+                            // `Cars_resetAll`'s placement of the cop slots (right after the racers): see
+                            // `Police::place_at_race_init`; `.STARTINGPOS` of a cop slot = `fe.txt`'s key in an `fe = 0` race
+                            // (TEST GLUE), else what 0x4ECF00 left (0)
+                            let startingpos: Vec<i32> = (0..pol.cars.len()).map(|k| if fe0 { fe0_cops.get(k).map_or(0, |&(slot, _)| super::pa_trace::fe0_startingpos(&self.paths.root, slot)) } else { 0 }).collect();
+                            pol.grid_init = Some((nfs_game::race::start_slice(t, start_scene, grid_rule.linear), n_cars, grid_rule, startingpos));
+                            pol.linear = grid_rule.linear;
+                            pol.slot_base = 1 + self.num_opponents as usize;
+                            pol.slot_personalities = if fe0 {
+                                super::pa_trace::fe0_slot_personalities(&self.paths.root)
+                            } else {
+                                std::iter::once(0).chain(plan_pers.iter().map(|&p| i32::from(p))).collect()
+                            };
+                            pol.traffic_count = self.road.traffic.as_ref().map_or(0, |s| s.cars.len());
                             self.road.police = Some(pol);
                         }
                     }
@@ -1013,7 +1075,7 @@ impl App {
                 glam::Mat3::IDENTITY
             }
         };
-        (table, rot, grid_place)
+        (table, rot, grid_place, opp_places)
     }
 
     /// Stage "pools" — after step 9: the sprite, beam, skid, flare, particle and weather draws out of `common.fsh` / `particle.fsh`.

@@ -59,7 +59,7 @@ pub(crate) const HEADER: &str = "tick,car,px,py,pz,vx,vy,vz,wx,wy,wz,fx,fy,fz,ux
 lat0,lon0,slip0,cmp0,lim0,lat1,lon1,slip1,cmp1,lim1,lat2,lon2,slip2,cmp2,lim2,lat3,lon3,slip3,cmp3,lim3,alive,shtm,rng,\
 su0,sv0,dm0,su1,sv1,dm1,su2,sv2,dm2,su3,sv3,dm3,z0,z1,z2,z3,z4,z5,z6,z7,z8,z9";
 
-fn row(out: &mut impl Write, tick: u64, car: usize, v: &Vehicle) {
+fn row(out: &mut impl Write, tick: i64, car: usize, v: &Vehicle) {
     let (p, vel, w, f, u) = (v.position, v.velocity, v.angular_velocity, v.orientation.row(2), v.orientation.row(1));
     let _ = write!(
         out,
@@ -106,6 +106,9 @@ impl App {
         let Some(w) = writer() else { return };
         let Ok(mut f) = w.lock() else { return };
         let Some(v) = self.vehicle.as_ref() else { return };
+        if std::env::var_os("NFS_PA_RNGLOG").is_some() {
+            eprintln!("ROW {}", self.tick as i64 - 1);
+        }
         if self.tick == 0
             && let Some(p) = nfs_game::config::cfg().nfs_pa_trace.as_str()
         {
@@ -119,27 +122,122 @@ impl App {
             }
             let _ = std::fs::write(format!("{p}.specs"), d);
         }
-        row(&mut *f, self.tick, 0, v);
+        // (numbered as the gdb script numbers the original's: `[0x606AC4] − 1`, the tick that left it)
+        let t = self.tick as i64 - 1;
+        row(&mut *f, t, 0, v);
         for (k, o) in self.road.opponents.iter().enumerate() {
-            row(&mut *f, self.tick, k + 1, &o.vehicle);
+            row(&mut *f, t, k + 1, &o.vehicle);
+        }
+        // the cops, registered after the racers (`traffic.md` §8), in the traffic rows' layout below
+        if let Some(pol) = &self.road.police {
+            let base = 1 + self.road.opponents.len();
+            for (j, c) in pol.cars.iter().enumerate() {
+                let (p, v, w, fw, u) = (c.position, c.velocity, c.angular_velocity, c.orientation.row(2), c.orientation.row(1));
+                let _ = write!(
+                    &mut *f,
+                    "{t},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},0,0,0,0,0,0,{:.6},{},{},{:.6}",
+                    base + j, p.x, p.y, p.z, v.x, v.y, v.z, w.x, w.y, w.z, fw.x, fw.y, fw.z, u.x, u.y, u.z, c.speed, c.slice, c.active as u8, c.target_speed
+                );
+                let _ = write!(&mut *f, "{}", ",0".repeat(17));
+                let _ = write!(&mut *f, ",0,0,{}", nfs_game::rng::state());
+                let _ = writeln!(&mut *f, "{}", ",0".repeat(22));
+            }
+        }
+        // the traffic cars, registered after the racers and the cops (`traffic.md` §8): position,
+        // velocity, `car+0x388` (ω), the orientation rows, `car+0xEC0` in the speed column and `car+0x08` / `+0x7F` /
+        // `+0xEB8` in the wheel columns' place; the shared word
+        if let Some(tr) = &self.road.traffic {
+            let base = 1 + self.road.opponents.len() + self.road.police.as_ref().map_or(0, |p| p.cars.len());
+            for (j, c) in tr.cars.iter().enumerate() {
+                let (p, v, w, fw, u) = (c.position, c.velocity, c.angular_velocity, c.orientation.row(2), c.orientation.row(1));
+                let _ = write!(
+                    &mut *f,
+                    "{t},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},0,0,0,0,0,0,{:.6},{},{},{:.6}",
+                    base + j, p.x, p.y, p.z, v.x, v.y, v.z, w.x, w.y, w.z, fw.x, fw.y, fw.z, u.x, u.y, u.z, c.speed, c.slice, c.active as u8, c.target_speed
+                );
+                let _ = write!(&mut *f, "{}", ",0".repeat(17));
+                let _ = write!(&mut *f, ",0,0,{}", nfs_game::rng::state());
+                let _ = writeln!(&mut *f, "{}", ",0".repeat(22));
+            }
         }
         let _ = f.flush();
     }
 }
 
-/// **TEST GLUE, experiment only** — `NFS_PA_TICK0=1`: the first call of [`App::simulate`] processes
-/// tick 0 (the original's first `GameTick` runs with `[0x606AC4] = 0` and increments at its end,
-/// 0x415101; the port increments first, so its first processed tick is 1). `NFS_PA_RNG_SKIP=<n>`:
-/// `n` draws of the shared stream before that first tick (the original's stream stands 8 draws past
-/// the seed at tick 0, measured). Answers whether to skip this call's increment.
-pub(crate) fn experiment_tick0(tick: u64) -> bool {
-    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if tick != 0 || DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        return false;
+/// The seventeen car-setup sliders of `fe.txt`'s `car[k].*` keys (16.16 fixed), in the order of
+/// [`nfs_game::career::CAR_SETUP_DEFAULT`], each key missing keeping its neutral value.
+pub(crate) fn fe0_setup(root: &std::path::Path, k: usize) -> [f32; 17] {
+    let reg = nfs_formats::fetxt::Registry::load(root);
+    let keys = [
+        "frontdownforce", "reardownforce", "brakebias", "rideheight", "suspensiontravel", "steeringtoe", "shockrate",
+        "fronttirepressure", "reartirepressure", "REVERSERATIO", "FIRSTRATIO", "SECONDRATIO", "THIRDRATIO",
+        "FOURTHRATIO", "FIFTHRATIO", "SIXTHRATIO", "FINALRATIO",
+    ];
+    let mut setup = nfs_game::career::CAR_SETUP_DEFAULT;
+    for (i, name) in keys.iter().enumerate() {
+        setup[i] = reg.u32(&format!("car[{k}].{name}"), (setup[i] * 65536.0) as u32) as i32 as f32 / 65536.0;
     }
-    let skip: u32 = std::env::var("NFS_PA_RNG_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    for _ in 0..skip {
-        nfs_game::rng::rand16();
-    }
-    std::env::var_os("NFS_PA_TICK0").is_some()
+    setup
+}
+
+/// **TEST GLUE** `NFS_PA_FE0` with opponents: the cars an `fe = 0` race of the original builds for
+/// slots `1..=n` from `fe.txt`'s `car[k].*` (`ai.md` §7: `.FILENAME`, `.SPECNAME` → the `.sim`,
+/// `.AISPECNAME` → the `.ais` and the family, `.PERSONALITY`, the `.SKILL*` words and ranges as
+/// floats' bits) — no parts, no `FECar` (so no stock fit); the model's first catalogue record gives
+/// only the body, paint and sound. The pairs go in the key order slow / medium / fast / default.
+pub(crate) fn fe0_opponents(root: &std::path::Path, catalog: &[nfs_formats::fedata::CarCatalogEntry], n: usize) -> Vec<CareerOpponent> {
+    let reg = nfs_formats::fetxt::Registry::load(root);
+    let text = |k: usize, key: &str, def: &str| reg.get(&format!("car[{k}].{key}")).map_or(def.to_string(), |s| s.trim().to_string());
+    let float = |k: usize, key: &str, def: f32| f32::from_bits(reg.u32(&format!("car[{k}].{key}"), def.to_bits()));
+    (1..=n)
+        .filter_map(|k| {
+            let model = text(k, "filename", "993");
+            let mut car = catalog.iter().find(|c| c.model.eq_ignore_ascii_case(&model))?.clone();
+            car.sim = text(k, "specname", "default");
+            car.sim_family = text(k, "aispecname", "default");
+            car.stock_parts = Vec::new();
+            let pair = |s: &str| [float(k, &format!("skill{s}"), 1.0), float(k, &format!("skillrange{s}"), 0.0)];
+            Some(CareerOpponent {
+                paint: car.paint_sets.first().map_or([0x20, 0x40, 0xC0], |s| s.colours[0]),
+                name: text(k, "drivername", &car.display_name),
+                difficulty: 1.0,
+                skill: [pair("slow"), pair("medium"), pair("fast"), pair("default")],
+                grid: None,
+                personality: reg.u32(&format!("car[{k}].personality"), k as u32) as i16,
+                parts: Vec::new(),
+                decal: -1,
+                livery: None,
+                car,
+            })
+        })
+        .collect()
+}
+
+/// **TEST GLUE** `NFS_PA_FE0`: the racer slot array's `.PERSONALITY` words (`0x65808C + 0x580·k + 0x14C`,
+/// nine slots) as an `fe = 0` race reads them from `fe.txt`'s `car[k].personality`, a missing key = 0 (`.bss`).
+/// A traffic car's row is `slot[its registration index] % 5` (`TrafficSet::slot_personalities`).
+pub(crate) fn fe0_slot_personalities(root: &std::path::Path) -> Vec<i32> {
+    let reg = nfs_formats::fetxt::Registry::load(root);
+    (0..9).map(|k| reg.u32(&format!("car[{k}].personality"), 0) as i32).collect()
+}
+
+/// **TEST GLUE** `NFS_PA_FE0`: the racer slot array's `.STARTINGPOS` word (`0x658200 + 0x580·k`) as an
+/// `fe = 0` race reads it from `fe.txt`'s `car[k].startingpos`, a missing key = 0 (`.bss`).
+pub(crate) fn fe0_startingpos(root: &std::path::Path, k: usize) -> i32 {
+    nfs_formats::fetxt::Registry::load(root).u32(&format!("car[{k}].startingpos"), 0) as i32
+}
+
+/// `fe.txt`'s `car[k].transmission` as `carinfo+0xC`: 1 automatic, anything else (or no key) manual.
+pub(crate) fn fe0_automatic(root: &std::path::Path, k: usize) -> bool {
+    nfs_formats::fetxt::Registry::load(root).u32(&format!("car[{k}].transmission"), 0) == 1
+}
+
+/// **TEST GLUE** `NFS_PA_FE0`: the racer slots `1..=8` whose `car[k].class` is `cop` (symbol 8, `Cop`), in slot order,
+/// with their `car[k].filename` (the model name).
+pub(crate) fn fe0_cops(root: &std::path::Path) -> Vec<(usize, String)> {
+    let reg = nfs_formats::fetxt::Registry::load(root);
+    (1..=8)
+        .filter(|&k| reg.u32(&format!("car[{k}].class"), 0) == 8)
+        .map(|k| (k, reg.get(&format!("car[{k}].filename")).map_or(String::new(), |s| s.trim().to_string())))
+        .collect()
 }

@@ -378,6 +378,13 @@ impl App {
         if let Some(live) = self.cheat_bits_live.take() {
             self.cheat_bits = live;
         }
+        // a race left from the pause menu (its quit, command 4 after 0x426182) is not resumed: the
+        // resume 0x4AB200 has two callers, the menu's continue 0x415701 and the replay bar's
+        // unfreeze 0x41583E. The port's `audio_paused` edge is cleared with the race, as
+        // `restart_race` does, so the next race's first frame runs no resume — no extra
+        // `MusicPlay(NULL, 0)` over its own race-start pick. *(Until REG-AUDIO2 the windowed
+        // quit — `paused = false`, then here — left it set.)*
+        self.audio_paused = false;
         self.stop_race_audio();
         self.fe.menu = Some(menu);
         self.sim_shutdown();

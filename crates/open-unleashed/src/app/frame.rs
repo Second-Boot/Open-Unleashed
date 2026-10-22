@@ -303,6 +303,10 @@ impl App {
             self.bind_lists();
         }
         self.net_lobby_step();
+        // the session's voice chat (0x493350), on the front end and in the race alike
+        if let Some(n) = self.net.session.as_mut() {
+            n.voice_tick(self.snd.audio.as_ref());
+        }
         if self.vehicle.is_none() && self.race.is_none() {
             self.net_sync_options();
         }

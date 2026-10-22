@@ -104,7 +104,7 @@ impl MoviePlayer {
         let &(off, len) = chunks.first()?;
         let header = nfs_formats::mad::MadHeader::parse(&data[off..off + len]).ok()?;
         let mut decoder = nfs_formats::mad::MadDecoder::new(tables, &header);
-        let f = decoder.decode_frame(&data[off..off + len]);
+        let f = decoder.decode_frame(nfs_formats::mad::with_run_on(&data, off, len));
         if f.width == 0 || f.height == 0 {
             return None;
         }
@@ -187,7 +187,7 @@ impl MoviePlayer {
             }
             let (off, len) = self.chunks[self.next];
             self.next += 1;
-            let _ = self.decoder.decode_chunk(&self.data[off..off + len]);
+            let _ = self.decoder.decode_chunk(nfs_formats::mad::with_run_on(&self.data, off, len));
             drawn = true;
         }
         if self.catchup && (looped || self.voice.is_none()) {

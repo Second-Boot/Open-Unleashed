@@ -1033,6 +1033,12 @@ impl CarModel {
             // method and page: every shipped car block is `{1, 2, 0, …}`, the plain pair.
             let (blend, blend_pair) = match m.and_then(|m| m.rs) {
                 Some(rs) if car.front_end_room => (rs[1] == 2, rs[2].clamp(0, 3) as u8),
+                // The shipped car's own block says 0x0A = 2 on every material (`thrash.md` §6d.4): the
+                // draw is alpha-blended over the pixel by the texel's alpha, so the 1555 pages'
+                // edge texels (the door handle's and the badges' sprites, whose neighbours are alpha 0
+                // with coloured bits) fade out under the bilinear filter instead of leaving a light
+                // outline (PA-DETAIL). `device_states` already drops alpha ≤ 10.
+                Some(rs) => (blend || rs[1] == 2, 0),
                 _ => (blend, 0),
             };
             // Thrash 0x18 from the same block, `rs[4]` (`LayerState` 0x53F780 → 0x540660 hands the

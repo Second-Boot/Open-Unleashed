@@ -289,6 +289,35 @@ impl App {
         }
     }
 
+    /// The current `AUDIOQUALITY` to the sound, as every user of it gives it (0x4A66B0's
+    /// configuration). A changed setting reopens the sound (**0x4A6A00**,
+    /// [`nfs_audio::AudioOutput::set_audio_quality`]): every voice and the music's stream are gone,
+    /// and its tail is made here — `fesfx` reloaded for the new setting (0x4A8B80, 0x4A6B17) and the
+    /// music's new stream with `MusicPlay(NULL, 0)` (0x4AE010 / 0x4AE4D0(0, 0), 0x4A6B12…0x4A6B1E;
+    /// [`nfs_audio::music::MusicPlayer::reopen`]). The original reopens from the `Audio.Quality`
+    /// commit 0x4E4820 (0x4E48B4), which a profile's `LoadAccessors` runs too; the port calls this
+    /// at the commit (the options row, the profile load) and gives the setting at the sound's next
+    /// use otherwise.
+    pub(crate) fn apply_audio_quality(&mut self) {
+        let Some(a) = &self.snd.audio else { return };
+        // the first open 0x4A6840 reads the registry's `[0x657C98]` (main 0x4B6B09); the front end's
+        // accessor takes over by the commit 0x4E4820 (the `Audio.Quality` constructor's
+        // `SetSelection`, 0x4E4BDC), a reopen when the two differ
+        if !self.snd.sound_opened {
+            self.snd.sound_opened = true;
+            a.set_audio_quality(self.snd.registry_audio_quality);
+        }
+        if !a.set_audio_quality(self.snd.audio_settings.audio_quality) {
+            return;
+        }
+        self.snd.fe_sfx = None;
+        let rng = &mut self.fe_rng;
+        if let Some(m) = self.snd.music.as_mut() {
+            let asked = m.reopen(a, &mut || rng.next_u32().wrapping_add(tick_count_ms()));
+            tracing::info!(quality = self.snd.audio_settings.audio_quality, asked, "sound reopened (0x4A6A00): MusicPlay(NULL, 0)");
+        }
+    }
+
     /// The front end's music player, made on first use (the port has no menu music of its own yet)
     /// — nothing in a screenshot run. `f` gets the picks' draw, `0x538040() + GetTickCount()`
     /// (0x4AE4D0): the shared generator `fe_rng` and [`tick_count_ms`].
@@ -301,9 +330,7 @@ impl App {
         }
         // the voice budget of the sound's open 0x4A66B0 for the current `AUDIOQUALITY` — re-given on
         // every use, as 0x4A6A00 reopens the sound when the setting changed
-        if let Some(a) = &self.snd.audio {
-            a.set_audio_quality(self.snd.audio_settings.audio_quality);
-        }
+        self.apply_audio_quality();
         if self.snd.music.is_none() {
             self.snd.music = nfs_audio::music::MusicPlayer::new(&self.paths.game_data().join("Music"), &self.paths.game_data().join("Sounds"), &self.snd.audio_settings)
                 .map_err(|e| tracing::warn!(error = %e, "music unavailable"))
@@ -439,9 +466,7 @@ impl App {
         }
         // the voice budget of the sound's open 0x4A66B0 for the current `AUDIOQUALITY` — re-given on
         // every use, as 0x4A6A00 reopens the sound when the setting changed
-        if let Some(a) = &self.snd.audio {
-            a.set_audio_quality(self.snd.audio_settings.audio_quality);
-        }
+        self.apply_audio_quality();
         let q = self.snd.audio_settings.audio_quality;
         if self.snd.fe_sfx.is_none() {
             self.snd.fe_sfx = nfs_audio::fesfx::FeSfx::load(&self.paths.game_data().join("Sounds"), q)
@@ -471,6 +496,11 @@ pub(crate) struct AudioState {
     /// `I_SFX` (F10) has the four effect levels off: `[0x656840]` clear, holding the levels the
     /// registry variables `[0x657CA4…0x657CB0]` keep (`Settings::toggle_effects`)
     pub(crate) sfx_saved: Option<[u8; 4]>,
+    /// **`[0x657CA4]`, the registry's SFXLEVEL word the race-start fade keeps** (0x415064):
+    /// tick 0 of a race writes it from the live `SfxLevel`, the fade's ticks 17…80 read it back
+    /// (`nfs_audio::music::Settings::race_start_fade`). Only the fade reads it in the port: the
+    /// `I_SFX` toggle keeps its own copy in `sfx_saved` (an F10 press during the fade is not modelled).
+    pub(crate) sfx_registry: u8,
     /// **`[0x657CA0]`, the registry's `MUSICLEVEL` word** — not the `Audio.MusicLevel` accessor
     /// (`audio_settings.music_level`): what the front end's movies play their sound track at
     /// (0x4E27BA…0x4E27CE, the raw byte into 0x567810, `mad.md`). `fe.txt`'s value at start-up
@@ -480,6 +510,13 @@ pub(crate) struct AudioState {
     /// live `[0x5D1740]`, both the launch value). A slider move or a profile load in the front end
     /// does not reach it until the next launch.
     pub(crate) registry_music_level: u8,
+    /// **`[0x657C98]`, the registry's `AUDIOQUALITY` word as `fe.txt` / the command line left it**
+    /// (0 when neither names it: the word is zero-initialised data). The sound's first open,
+    /// 0x4A6840 (main 0x4B6B09), configures the library for it — the front end's accessor
+    /// (`audio_settings.audio_quality`) does not exist yet.
+    pub(crate) registry_audio_quality: u8,
+    /// the first open 0x4A6840 has been made ([`App::apply_audio_quality`])
+    pub(crate) sound_opened: bool,
     pub(crate) engine_sound: Option<nfs_audio::engine::EngineSound>,
     pub(crate) sfx: Option<nfs_audio::sfx::CollisionSfx>,
     pub(crate) ai_engines: Option<nfs_audio::ai_engine::AiEngines>,

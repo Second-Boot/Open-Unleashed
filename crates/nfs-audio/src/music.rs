@@ -164,6 +164,11 @@ impl Settings {
     /// `MUSICLEVEL` …) into them; only a profile's `LoadAccessors` changes them.
     pub fn front_end_defaults(&mut self) {
         (self.music_level, self.sfx_level, self.engine_level, self.speech_level, self.ambient_level) = (0x7F, 0x7F, 0x7F, 0x7F, 0x7F);
+        // `Audio.Quality` (0x4E4B5B…0x4E4BDC): the accessor is made with `Audio.Mode`'s 0 and
+        // then set to the probe 0x44E580's answer — 0 when the clock is 450 MHz or more and the
+        // RAM 64 MB or more (`[0x619799]` clear), which is every machine the port runs on
+        // (`nfs5-dll.md` §3.2: the dll feeds the probes MHz). The original's fresh profiles carry 0.
+        self.audio_quality = 0;
     }
 
     /// **`I_SFX` (F10), 0x4AB4E0** — the four effect levels, off and back. On (`[0x656840]` set,
@@ -211,6 +216,24 @@ impl Settings {
         }
     }
 
+    /// **The race-start SFX fade, `GameTick` 0x414FF0 0x415060…0x41508E**, run on every tick before
+    /// the race is flagged started (`[0x606AC0] == 0`; the body reads `[0x606AC4]` = `tick`). Only the
+    /// SFX level moves: at tick 0 the registry word `[0x657CA4]` takes the live `SfxLevel [0x5D1744]`
+    /// (0x415064…0x41506F) and the live level goes to 0 (0x41506A); on ticks 17…80
+    /// (0x415077…0x41507F: `tick > 16`, `tick <= 80`) the live level is `((tick − 16) · [0x657CA4]) >> 6`
+    /// (0x415081…0x41508E, `imul` then `sar 6`). Tick 80 gives back the registry value exactly.
+    /// `sfx_registry` is the port's `[0x657CA4]`; the other ticks change nothing.
+    pub fn race_start_fade(&mut self, tick: u64, sfx_registry: &mut u8) {
+        match tick {
+            0 => {
+                *sfx_registry = self.sfx_level;
+                self.sfx_level = 0;
+            }
+            17..=80 => self.sfx_level = (((tick as i32 - 16) * i32::from(*sfx_registry)) >> 6) as u8,
+            _ => {}
+        }
+    }
+
     /// Read `fe.txt` from the game root through the shared registry reader.
     pub fn load(game_root: &Path) -> Self {
         let r = nfs_formats::fetxt::Registry::load(game_root);
@@ -228,7 +251,9 @@ impl Settings {
         s.engine_level = r.u8("enginelevel", 127);
         s.speech_level = r.u8("speechlevel", 127);
         s.ambient_level = r.u8("ambientlevel", 127);
-        s.audio_quality = r.u8("audioquality", 1);
+        // `[0x657C98]` is zero-initialised data (past the image's raw section), so a `fe.txt`
+        // without `AUDIOQUALITY` leaves 0 (0x4A6840 opens at it)
+        s.audio_quality = r.u8("audioquality", 0);
         s
     }
 }
@@ -860,6 +885,19 @@ impl MusicPlayer {
         self.cur_set = false;
     }
 
+    /// **The sound reopen's music side** (0x4A6A00 on a changed `AUDIOQUALITY`, after
+    /// [`AudioOutput::set_audio_quality`] answered `true`): 0x4AE2B0 destroys the stream (0x567690,
+    /// `+0x70 = −1`) and stops the update timer, leaving the state `+0x14` and the position `+0xC`
+    /// as they are; 0x4AE010 makes a new, silent stream object and restarts the timer; then
+    /// `MusicPlay(NULL, 0)` (0x4AE4D0(0, 0), 0x4A6B1E) picks over the list as it stands — with a
+    /// song chosen it waits as a swap for the new stream's level 0, which is there at once.
+    /// Returns whether a song was asked for. `draw` as [`Self::play_next`].
+    pub fn reopen(&mut self, out: &AudioOutput, draw: &mut dyn FnMut() -> u32) -> bool {
+        // the mixer already dropped the stream; this lets the feeder go
+        self.end_stream(out);
+        self.play_next(out, draw)
+    }
+
     /// 0x567740 alone: the stream stops.
     fn end_stream(&mut self, out: &AudioOutput) {
         if let Some(m) = self.current.take() {
@@ -1046,6 +1084,36 @@ mod tests {
         let mut same_state = bare(vec![], vec![0, 1]);
         same_state.start_race(&out, &mut || 0);
         assert_eq!(same_state.playlist(), [0, 1], "start_race resets the list from `saved` — not PLAYSONG's rule");
+    }
+
+    #[test]
+    fn the_race_start_fade_ramps_sfx_from_zero_to_the_registry_value() {
+        let mut s = Settings { sfx_level: 100, ..Settings::default() };
+        let mut reg = 0u8;
+        // tick 0: the live level is saved in the registry word and silenced (0x41506A, 0x41506F)
+        s.race_start_fade(0, &mut reg);
+        assert_eq!((s.sfx_level, reg), (0, 100));
+        // ticks 1..=16 and past 80: nothing (0x41507A, 0x41507F)
+        for t in (1..=16).chain(81..=447) {
+            s.sfx_level = 7;
+            s.race_start_fade(t, &mut reg);
+            assert_eq!(s.sfx_level, 7, "tick {t}");
+        }
+        // ticks 17..=80: (tick − 16) · 100 >> 6
+        s.race_start_fade(17, &mut reg);
+        assert_eq!(s.sfx_level, 1, "1 · 100 >> 6");
+        s.race_start_fade(48, &mut reg);
+        assert_eq!(s.sfx_level, 50, "32 · 100 >> 6");
+        s.race_start_fade(80, &mut reg);
+        assert_eq!(s.sfx_level, 100, "tick 80 gives back the registry value");
+        // a registry word that is not a multiple of 64 is shifted down, not rounded (`sar 6`)
+        let mut odd = Settings { sfx_level: 127, ..Settings::default() };
+        let mut reg = 0u8;
+        odd.race_start_fade(0, &mut reg);
+        odd.race_start_fade(17, &mut reg);
+        assert_eq!(odd.sfx_level, 1, "1 · 127 >> 6");
+        odd.race_start_fade(19, &mut reg);
+        assert_eq!(odd.sfx_level, 5, "3 · 127 >> 6");
     }
 
     #[test]

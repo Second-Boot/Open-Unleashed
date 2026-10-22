@@ -57,6 +57,7 @@ impl App {
             tournament: nfs_game::save::TournamentFe::default(),
             opponent_cars: None,
             owned_car_selection: 0,
+            name_input: String::new(),
         }
     }
 
@@ -92,7 +93,7 @@ impl App {
                 .fe.layout_preview
                 .as_ref()
                 .map(|l| l.deadzone_values().map(|p| [p[0] as u32, p[1] as u32]))
-                .unwrap_or([[0, 0x80]; 8]),
+                .unwrap_or([[0, 127]; 8]),
             controls: self.saved_control_fields(),
             options: self.saved_option_indices(),
             // the peer-to-peer screen's list, in the profile's option block (`Comms.IPList`, 0x4B8D70)
@@ -204,7 +205,11 @@ impl App {
             // the four the race screens keep in the menu, each only when the file carries it
             let st = &side.settings;
             match name {
-                "Audio.Quality" => self.snd.audio_settings.audio_quality = st.audio_quality,
+                "Audio.Quality" => {
+                    self.snd.audio_settings.audio_quality = st.audio_quality;
+                    // `SetSelection` 0x4BC240 calls the commit 0x4E4820 → 0x4A6A00 (0x4E48B4)
+                    self.apply_audio_quality();
+                }
                 "Track1.Laps" | "Game.NumOpponents" | "Track1.Traffic" | "Game.NumKOOpponents" => {
                     if let Some(m) = self.fe.menu.as_mut() {
                         match name {

@@ -89,6 +89,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
        (No multicast entitlement either: com.apple.developer.networking.multicast is for multicast
        groups, and the game broadcasts.) -->
   <key>NSLocalNetworkUsageDescription</key><string>$APP_TITLE looks for and joins network races on your local network (UDP port 9442).</string>
+  <!-- The network voice chat (PLATFORM GLUE for the original's DirectSoundCapture, which needed no
+       permission): in a network session the game opens the default input device. Without this key
+       macOS ends the app the moment it touches the microphone; with it the user is asked once, and
+       a refusal only leaves the voice chat without capture. -->
+  <key>NSMicrophoneUsageDescription</key><string>$APP_TITLE sends your voice to the other players during network races, as the original game did.</string>
 </dict></plist>
 PLIST
 # Seal the bundle with an ad-hoc signature (PLATFORM GLUE): Apple Silicon runs only signed code, and

@@ -128,6 +128,14 @@ impl App {
             if base == "Display.ScreenLayout" {
                 self.hud_cfg_layout_changed();
             }
+            // `Audio.Quality`'s `SetSelection` calls the commit 0x4E4820, which reopens the sound
+            // (0x4E48B4 → 0x4A6A00) before the screen is drawn again; the accessor's value is the
+            // port's `audio_settings.audio_quality` ([`App::choice_index`])
+            if base == "Audio.Quality" {
+                self.snd.audio_settings.audio_quality = next as u8;
+                self.apply_audio_quality();
+                return;
+            }
             self.choices.insert(Self::choice_slot(base, key).to_string(), next);
             return;
         }

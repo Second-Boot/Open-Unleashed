@@ -19,7 +19,7 @@ fn main() {
         for (i, m) in mats.iter().enumerate() {
             let page = m.page_index() + 1;
             let bpp = car.tpg.section(&format!("tpage{page}.details")).and_then(|d| d.get_i64("bpp")).unwrap_or(1555);
-            println!("  mt{i:<2} {:<10} page {page} bpp {bpp:<4} rs {:?} blocks {:?} addr {:?}", m.render_method, m.rs, m.blocks.iter().map(|b| b.0).collect::<Vec<_>>(), m.address);
+            println!("  mt{i:<2} {:<10} page {page} bpp {bpp:<4} rs {:?} blocks {:?} addr {:?} light {:?}", m.render_method, m.rs, m.blocks.iter().map(|b| b.0).collect::<Vec<_>>(), m.address, m.light);
         }
         for a in car.crp.articles(&car.crp_data).unwrap() {
             let Ok(g) = car.crp.article_geometry(&car.crp_data, &a) else { continue };

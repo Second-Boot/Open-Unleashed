@@ -258,7 +258,18 @@ impl App {
     /// 4…7). 3496 is `IDS_JUNIORTESTDRIVER` and 3485 `IDS_FEMALEJUNIORTESTDRIVER`. CONFIRMED.
     pub(crate) fn bind_player_pictures(&mut self) {
         let Some(l) = self.fe.layout_preview.as_ref() else { return };
-        let pictures: Vec<usize> = ["NFS5.PLAYERPICTURE", "NFS5.MINIPLAYERPICTURE"].iter().flat_map(|c| l.numbered_widgets(c)).map(|(i, _)| i).collect();
+        // **`NFS5.MINIPLAYERPICTURE` draws only with a licence stage** (PA-SRV2): its draw 0x4CFC90
+        // asks 0x51AE00 first and leaves at 0x4CFD4D on −1 (0x4CFCA3…0x4CFCAA), the way the badges
+        // do (0x4CF3ED, 0x4CF61D) — `NFS5.PLAYERPICTURE` 0x4CFC00 has no such test. The running
+        // original's Factory Driver screen (`factorydriver.lay`, the mini picture at 566,22) shows
+        // nothing there for a profile that has passed no mission; the port drew the portrait.
+        let has_stage = self.badge_stage().is_some();
+        let pictures: Vec<usize> = ["NFS5.PLAYERPICTURE", "NFS5.MINIPLAYERPICTURE"]
+            .iter()
+            .filter(|c| has_stage || **c != "NFS5.MINIPLAYERPICTURE")
+            .flat_map(|c| l.numbered_widgets(c))
+            .map(|(i, _)| i)
+            .collect();
         let badges: Vec<usize> = ["NFS5.BADGE", "NFS5.MINIBADGE"].iter().flat_map(|c| l.numbered_widgets(c)).map(|(i, _)| i).collect();
         if pictures.is_empty()
             && badges.is_empty()

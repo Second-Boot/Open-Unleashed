@@ -118,6 +118,7 @@ impl NetPlay {
             aborted: false,
             sent_time: false,
             tick_override: None,
+            voice: Default::default(),
         };
         // the host's own player is the room's first, id 0: in the original the host's game
         // joins the room object like any other (0x48BB50 hands out the lowest clear bit of
@@ -174,6 +175,11 @@ impl NetPlay {
 
     /// One room message for our own player (0x48F0A0's cases).
     pub(super) fn hear(&mut self, m: &[u8]) {
+        // 0x48F76C (`0xC1` / `0xC2`): the voice object's receiver 0x493270, when there is one
+        if let Some(p) = nfs_net::voice::packets(m) {
+            self.voice.receive(&p);
+            return;
+        }
         // 0x48F784 (`0xBD`): `[net+0xE6] ^= 1 << value` (a word: bits 8…15 are `+0xE7`)
         if m.first() == Some(&0xBD) {
             if let Ok(h) = nfs_net::msg::Message::parse(m) {
@@ -380,6 +386,30 @@ impl NetPlay {
         // room description, no state (`network.md` §11.9). What makes every machine know
         // every car is the launch's per-slot resend with race indices (`send_launch`,
         // §11.12) — the port used to hand the host's table to a newcomer here.
+    }
+
+    /// **0x493320 → 0x493350**, the voice object's run (the original's is a callback of the sound
+    /// library's service, 0x5610E0; the port runs it once a frame): capture, encode, a `0xC1` every
+    /// five packets — to the room's players, which a host reaches on its links and a player through
+    /// the host's relay (0x48C0F0) — and the playback of what arrived.
+    pub fn voice_tick(&mut self, audio: Option<&nfs_audio::AudioOutput>) {
+        let established = self.established();
+        for batch in self.voice.tick(established, audio) {
+            let m = nfs_net::voice::message(&batch);
+            // a host's room reaches only the players it has (as `dispatch`'s `To::All`)
+            let sent = if self.is_host() && !self.hello_wait.is_empty() {
+                let to: Vec<_> = (0..self.net.peers.len() as u32)
+                    .filter(|s| !self.hello_wait.contains(s))
+                    .filter_map(|s| self.net.peer_addr(s))
+                    .collect();
+                self.net.send_game_to(&to, &m)
+            } else {
+                self.net.send_game(&m)
+            };
+            if let Err(e) = sent {
+                tracing::debug!(error = %e, "voice message not sent");
+            }
+        }
     }
 
     /// Drain the socket. Returns the events worth logging; the car states are kept internally.

@@ -119,14 +119,11 @@ impl RaceSmackables {
         hits
     }
 
-    /// The props' 64 Hz integrators (0x49B7A0 / 0x49B8E0), after the cars' — and every 32 ticks
-    /// the re-orthonormalisation the port gives every body (0x4A4810).
-    pub fn integrate(&mut self, tick: u64) {
+    /// The props' 64 Hz integrators (0x49B7A0 / 0x49B8E0), after the cars' — awake props only. The
+    /// re-orthonormalisation is the prop's own `car+0x80` countdown inside 0x49B8E0 (`integrate64`).
+    pub fn integrate(&mut self) {
         for p in self.props.iter_mut() {
             p.integrate();
-            if tick.is_multiple_of(32) {
-                p.body.renormalise();
-            }
         }
     }
 

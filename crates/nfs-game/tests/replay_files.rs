@@ -5,7 +5,8 @@
 //! `fe_save_pristine`), `8DRIVER.sav` the profile of that save dir. The digests below are what the
 //! master readers made of them; a reader change must keep every one. Re-pinned 2026-10-17 for
 //! `CarRecord::livery` (file version 4): the `Debug` digests now print `livery: None`, and a written
-//! file is version 4; the `.rpl` bytes the port writes are unchanged.
+//! file is version 4; the `.rpl` bytes the port writes are unchanged. Re-pinned 2026-10-22 for `ReplaySetup::file_car` (the `Debug`
+//! digests print it; a master-written file has no `.FILENAME`, so it reads `None`); the network file's written bytes are unchanged.
 use nfs_game::replay::{self, CarRecord, NetSeat, NetSetup, NetTraffic, ReplayFile, ReplaySetup};
 
 /// FNV-1a 64 — a stable digest with no dependency.
@@ -33,9 +34,9 @@ fn prefix_digest(d: &[u8]) -> u64 {
 const TRACKS: [&str; 3] = ["alps", "coastal", "monaco1"];
 
 /// `(parse, every prefix)` digests of the master-written `.prpl`s.
-const PRPL: [(u64, u64); 3] = [(0x43ea_bfd6_2d29_d175, 0xe8e8_307e_d5d0_a7c2), (0x236e_1679_da5d_7a9f, 0xb47f_b2d2_a69c_695e), (0x1715_9e98_b827_5349, 0x7d4d_19a4_d42a_a5e4)];
+const PRPL: [(u64, u64); 3] = [(0x8914_82d9_9760_a1aa, 0xeb60_35b3_d9ad_0f86), (0x07d1_977d_54f0_3df8, 0x05fe_84e4_ef34_ffc8), (0x2591_5e72_9593_c24e, 0x5bca_57b2_fe03_a70e)];
 /// `parse_original_rpl` digest of the master-written `.rpl`s, and of the prefixes around the snapshot.
-const RPL: [(u64, u64); 3] = [(0xd18d_cda9_909d_b7f9, 0x6ebb_e837_b2c4_86b0), (0x7c95_afea_5e84_8805, 0x922f_4163_1c6f_62e7), (0x85d3_c26a_6625_afe3, 0x8521_87d5_04d8_ab1d)];
+const RPL: [(u64, u64); 3] = [(0x895b_d294_98c9_8ea8, 0x1466_ce0e_6c95_25be), (0xf3a9_7176_bc43_1f70, 0x2606_5773_5ec8_4055), (0x3237_eaf3_a37e_44f6, 0x3ae3_6e2f_c94b_d6f5)];
 
 #[test]
 fn master_written_port_replays_parse_and_reserialise_to_the_same_bytes() {
@@ -134,7 +135,7 @@ fn net_file() -> ReplayFile {
 /// A network race's file with every optional section (`NetSetup` with seats / traffic / camera0 /
 /// own words / fe.txt, the launch block, the car records, the mission): the bytes master wrote and
 /// what the reader makes of every prefix.
-const NET: (u64, u64, u64, u64) = (0x4892_63f3_7273_cb45, 0x00cf_7cc0_4e1b_17b8, 0x936e_708d_316a_5f17, 0x4581_ef48_cd1d_32d3);
+const NET: (u64, u64, u64, u64) = (0x4892_63f3_7273_cb45, 0xa854_6b3d_4f80_5950, 0x936e_708d_316a_5f17, 0xc43c_1f90_eed7_838e);
 
 #[test]
 fn a_network_replay_reads_back_as_master_wrote_it() {
@@ -148,8 +149,13 @@ fn a_network_replay_reads_back_as_master_wrote_it() {
 }
 
 /// `8DRIVER.sav` through the port's career conversion and back: the `Career` / side it reads and the
-/// bytes it writes again.
-const SAV: (u64, u64, u64) = (0x9901_2848_0975_68d3, 0x9025_c01c_3df6_113e, 0xc970_db8b_8990_791d);
+/// bytes it writes again. *(The written digest moved with PA-SRV2: `Chronicle.Year` is written as the
+/// index 0, no longer the career's 1950; the career and side digests did not move. Moved again with
+/// the side carries `UserList.NameInput`'s text, and the dead-zone `.Max` a file does not
+/// carry starts at 127 (the clamp of 0x80, 0x4BC240) with the selection written; the career digest did not move. Moved again
+/// with PA-STOCK: a `.sav` kept its part lists as written, the stock list no longer rebuilt on load; and back with REG-PHYS:
+/// a car with no stock list gets its stock parts on load again (PORT-DEVIATION D40), the digests of before PA-STOCK.)*
+const SAV: (u64, u64, u64) = (0x9901_2848_0975_68d3, 0x70f4_87fc_897c_cec6, 0x9a6f_8e22_d590_8bb4);
 
 #[test]
 fn a_master_written_save_converts_as_before() {

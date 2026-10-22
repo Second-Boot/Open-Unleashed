@@ -21,6 +21,7 @@ pub mod sfx;
 pub mod slots;
 pub mod speech;
 pub mod voice_loop;
+pub mod voicechat;
 
 pub use mixer::{AudioOutput, PlayArgs, StopHandle, VoiceId};
 

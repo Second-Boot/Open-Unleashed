@@ -818,6 +818,7 @@ impl App {
                 // the catalogue record the race's car is (`start_from_layout`'s `player_car_id`), which a
                 // replay resolves the model's body style and roof from; the start-up default otherwise
                 car_id: self.player_car_id.unwrap_or(self.car_id),
+                file_car: None,
                 paint: self.paint,
                 laps: self.num_laps,
                 opponents: self.num_opponents,
@@ -1072,7 +1073,7 @@ impl App {
         self.race_loading_frame(&mut renderer, 7);
         // 0x414E63: step 8 in the race init 0x414DB0, before `Cars_create` 0x411130 (0x414E68) makes the cars
         self.race_loading_frame(&mut renderer, 8);
-        let (table, rot, grid_place) = self.race_stage_grid(&mut renderer, &mut world, car_env, &mut driver_rand, factory_driver);
+        let (table, rot, grid_place, opp_places) = self.race_stage_grid(&mut renderer, &mut world, car_env, &mut driver_rand, factory_driver);
         // **`srand(time(0))`** (0x418100, `H321Go`'s constructor, built with the HUD after the cars):
         // the shared state the front end draws from after this race — the next opponents' rolls
         // (0x4F4FA0), the market, the glints
@@ -1198,6 +1199,41 @@ impl App {
             vehicle.place_at_slice(&world.collision, &self.specs, s.centre, s.forward, [s.lateral, s.up, s.forward], grid_offset(s, pos), false, false);
             self.car_pos = vehicle.draw_origin();
             self.prev_car_pos = self.car_pos;
+        }
+        // …then the opponents' (`Cars_resetAll` 0x4110A0: `Car_reset(racer[i], i)` in registration
+        // order, the human first): `Car_placeAtSlice` 0x49B090 with dir +1 — the port's reversed
+        // table already turns the slices round. An opponent (`car+0x52C & 8`) on the race's first
+        // tick, so the offset is slice-local (0x49B0FB). Each placement's two `Susp_update`s draw
+        // from the shared word (measured: the stream stands 8 draws past `Rand_seed` at the first
+        // `GameTick` of a one-car race, `REFERENCE-2026-10-22-PA-TRACE.md`), so the order counts.
+        if let Some(t) = &self.slices {
+            for &(k, sl, p) in &opp_places {
+                if let Some(o) = self.road.opponents.get_mut(k) {
+                    let s = &t.slices[sl];
+                    o.vehicle.game_tick = self.tick;
+                    o.vehicle.place_at_slice(&world.collision, &o.specs, s.centre, s.forward, [s.lateral, s.up, s.forward], grid_offset(s, p), true, false);
+                }
+            }
+        }
+        // …and the traffic cars', registered after the racers (`traffic.md` §8): `Cars_resetAll` resets
+        // them too (`Car_reset` 0x410730 → `Grid_slot` 0x410580 → `Car_placeAtSlice` 0x49B090, read live
+        // on alps: slot 1 `STARTINGPOS` 1 / slot 2 `STARTINGPOS` 2, `[0x5E8AE8]` = 1 racer, both on
+        // `addSlices(43, 1)` = slice 44, sides `g & 1`), so each placement's two `Susp_update`s draw their
+        // `Roughness` 0x499730 from the shared word wherever the wheels stand on a surface that draws
+        // (on a road patch all 8). `TrafficSet::place_at_race_init` runs the real placement on each
+        // car's own body at its slot's `Grid_slot` slice. The pose is thrown away by the first AI pass
+        // (the purgatory park 0x40DE10) and the respawn (0x49E220). `.STARTINGPOS` of a traffic slot is
+        // what 0x4ECF00 never wrote (it fills the players' and opponents' slots only): 0 in a fresh
+        // process, `fe.txt`'s key in an `fe = 0` race (TEST GLUE). APPROXIMATION: a stale value an
+        // earlier race of the same process left in the slot array is not carried.
+        // (the cops first: registered before the traffic, `traffic.md` §8)
+        if let (Some(pol), Some(t)) = (self.road.police.as_mut(), &self.slices) {
+            pol.place_at_race_init(t, &world.collision, self.tick);
+        }
+        if let (Some(tr), Some(t)) = (self.road.traffic.as_mut(), &self.slices)
+            && let Some((start, n, rule, startingpos)) = tr.grid_init.clone()
+        {
+            tr.place_at_race_init(t, &world.collision, start, n, &rule, &startingpos, self.tick);
         }
         self.vehicle = Some(vehicle);
         self.ff_arm();

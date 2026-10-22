@@ -428,11 +428,24 @@ impl Vehicle {
     /// `car+0x418` and `BodyHeight` 0x49A900 into `car+0x424` / `+0x428`. The named steps run in
     /// the binary's order; correction history in `RE/notes/physics-history.md` §2.
     pub(super) fn susp_update(&mut self, grid: &TriangleGrid, specs: &CarSpecs, police: bool) -> f32 {
+        self.susp_update_from(grid, specs, police, self.position)
+    }
+
+    /// [`Self::susp_update`] with the world collision points `car+0x1DC + 12i` taken from `origin`
+    /// instead of the body's position. `Susp_update` 0x499A70 reads the stored points (0x499AD4…0x499B13),
+    /// which 0x49AE30 fills from `car+0x330` and only the caller refreshes — so `Car_placeAtSlice`'s
+    /// second call (0x49B4C2), after the body was dropped by `BodyHeight` (0x49B4AA…0x49B4BC), still
+    /// probes from the position the first one used (live: a traffic car placed 1.08 m below the road,
+    /// `REFERENCE-2026-10-22-PA-TRAFFIC2.md`; the second pass leaves every wheel's `+0x58` as the first
+    /// wrote it and shifts nothing).
+    pub(super) fn susp_update_from(&mut self, grid: &TriangleGrid, specs: &CarSpecs, police: bool, origin: Vec3) -> f32 {
         let m = self.orientation; // rows = body axes in world space
         let mt = m.transpose();
         let up = m.row(1);
         let s_sign = if self.cos_tilt > 0.0 { 1.0 } else { -1.0 };
-        let body = SuspFrame { m, mt, up, s_sign };
+        // (the stored points are refreshed by this call's tail, 0x49A8CA: the old rows are used once)
+        let point_rows = self.point_rows.take();
+        let body = SuspFrame { m, mt, up, s_sign, origin, point_mt: point_rows.map_or(mt, |r| r.transpose()) };
         let mut contacts = [Vec3::ZERO; 4];
         let mut susp_y = [0f32; 4];
         let mut n_air = 0;
@@ -462,10 +475,10 @@ impl Vehicle {
     /// `body_pt`: the probe, the surface, the ground height, the compression and the suspension
     /// vector's `y`.
     fn wheel_probe(&mut self, i: usize, body_pt: Vec3, body: &SuspFrame, grid: &TriangleGrid, specs: &CarSpecs) -> WheelSample {
-        let SuspFrame { m, mt, up, s_sign } = *body;
+        let SuspFrame { m, mt: _, up, s_sign, origin, point_mt: _ } = *body;
         // the world collision point `car+0x1DC + 12i` (0x49AE30: `pos + Σ p_k·M[k]`) of body
         // point i, which 0x49ABC0 left as wheel i's ground reference (0x499AD4…0x499B13)
-        let world_pt = self.position + mt * body_pt;
+        let world_pt = origin + body.point_mt * body_pt;
         let probe = world_pt + Vec3::new(0.0, specs.probe_offset * up.y, 0.0);
         // the wheel's tracker (0x499B64 `updateZone(probe, 1)`); its zone word — 0 with no
         // patch — is the wheel's surface `wheel+0x8C` on **both** branches (0x499B86…0x499BA7,
@@ -732,6 +745,10 @@ struct SuspFrame {
     mt: Mat3,
     up: Vec3,
     s_sign: f32,
+    /// where the world collision points were taken from (see [`Vehicle::susp_update_from`])
+    origin: Vec3,
+    /// the transposed rows the stored points were built with ([`Vehicle::point_rows`]; `mt` normally)
+    point_mt: Mat3,
 }
 
 /// What one wheel's pass of `Susp_update` hands back: its ground height, its contact point, its

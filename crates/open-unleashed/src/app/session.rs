@@ -62,9 +62,7 @@ impl App {
             // sleep) at 0x4B6B09, the movies 0x4DD600 only at 0x4B6C42. *(Until 2026-10-09 the
             // movies played on the library's defaults and the front end's first sound configured
             // it — AUDIO-START.)*
-            if let Some(a) = &self.snd.audio {
-                a.set_audio_quality(self.snd.audio_settings.audio_quality);
-            }
+            self.apply_audio_quality();
             self.intro =Some(intro_run::IntroRun::new(window, renderer, &self.paths));
             return;
         }

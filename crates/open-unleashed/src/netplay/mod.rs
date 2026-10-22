@@ -291,6 +291,8 @@ pub struct NetPlay {
     sent_time: bool,
     /// **Test glue**: a fixed `GetTickCount()` for the unit tests.
     tick_override: Option<u32>,
+    /// `net+0x14`: the voice chat (0x4931C0 on the create / join paths, `network.md` §11.40).
+    pub voice: nfs_audio::voicechat::VoiceChat,
 }
 
 /// **0x490140**'s answer: how a racer's connection looks. `HPosition`'s row badge takes its colour

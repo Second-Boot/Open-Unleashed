@@ -8,7 +8,9 @@ use super::*;
 /// lock between two callbacks, so it counted from the next one's first block — and the library's
 /// generator ([`Shared::rand`]) is still drawn by the start, on the callback's side, in call order.
 pub(super) enum Cmd {
-    Quality { budget: usize, rate: u32, interp: Interp, sleep: u32, reverb: Option<Box<ReverbTail>> },
+    /// `reopen`: the setting changed from an earlier one — the library closed and opened again
+    /// ([`AudioOutput::set_audio_quality`])
+    Quality { budget: usize, rate: u32, interp: Interp, sleep: u32, reverb: Option<Box<ReverbTail>>, reopen: bool },
     FxAux { id: VoiceId, aux: u8 },
     Silence,
     Pan { id: VoiceId, pan: u16 },
@@ -20,7 +22,7 @@ pub(super) enum Cmd {
     Env { p20: i32, p80: i32 },
     Fade { id: VoiceId, ms: i32, target: i32 },
     StreamLevel { id: VoiceId, level: i32 },
-    Stream { id: VoiceId, src: Arc<StreamSource>, volume: f32 },
+    Stream { id: VoiceId, src: Arc<StreamSource>, volume: f32, gains: [f32; 2] },
 }
 
 /// A command queued and not yet seen applied (its sequence number is above the snapshot's
@@ -111,6 +113,8 @@ pub(super) struct TxState {
     pub(super) seq: u64,
     /// the mix rate the queued commands leave the mixer at ([`Shared::mix_rate`]'s mirror)
     pub(super) cfg_rate: Option<u32>,
+    /// the `AUDIOQUALITY` the sound was last opened for ([`AudioOutput::set_audio_quality`])
+    pub(super) cfg_quality: Option<u8>,
     pub(super) pending: Vec<(u64, Pend)>,
 }
 
@@ -153,7 +157,36 @@ impl Core {
     pub(super) fn apply(&mut self, cmd: Cmd) {
         let g = &mut self.shared;
         match cmd {
-            Cmd::Quality { budget, rate, interp, sleep, reverb } => {
+            Cmd::Quality { budget, rate, interp, sleep, reverb, reopen } => {
+                if reopen {
+                    // **0x4A6A00's close** (a changed `AUDIOQUALITY`): every voice stopped
+                    // (0x5659F0(−1), 0x4A6A6B), the music's stream destroyed (0x4AE2B0 →
+                    // 0x567690), the library closed (0x565890) — nothing that played survives
+                    let n = (g.voices.len(), g.streams.len());
+                    g.remove_voices(|_| true);
+                    g.remove_streams(|_| true);
+                    tracing::info!(voices = n.0, streams = n.1, "sound reopened for a new AUDIOQUALITY (0x4A6A00): every voice and stream stopped");
+                }
+                if reopen || g.mix_rate.is_none() {
+                    // **the open's counters** — the DirectSound driver's open zeroes the service
+                    // clock `[0x6AD7AC]` / `[0x6AD7B0]` / `[0x6AD7A8]` (0x58EEA5…0x58EEB1) and makes
+                    // a new mixing buffer (0x58EDBC…), the library's open the service tick
+                    // `[0x6B49A8]` (0x5657D1). The original changes the mix rate only through that
+                    // open, so 0x58FBC0's `rate · tick / 100 − counted` never sees a rate below
+                    // the one its count was made at. *(Until REG-AUDIO2 the port switched the
+                    // rate under a running clock: from 32000 to 22050 the difference went
+                    // negative and its `& 0x0FFFFFF0` made the next tick ~268 million frames —
+                    // no service tick for hours, so no fade, release, envelope or stream end
+                    // ran: the race music never started, songs never advanced and released
+                    // loops played on in the menu.)*
+                    g.clock = ServiceClock::default();
+                    g.pump = Pump::default();
+                    g.service_tick = 0;
+                    // the frames mixed at the old rate on their way to the device (port glue),
+                    // emptied in place: the callback allocates nothing
+                    g.bridge.pending.clear();
+                    g.bridge.t = 0.0;
+                }
                 g.sleep_ms = Some(sleep);
                 if g.interp != interp {
                     g.interp = interp;
@@ -163,7 +196,7 @@ impl Core {
                     g.budget = Some(budget);
                     tracing::info!(budget, "voice budget");
                 }
-                if g.mix_rate != Some(rate) {
+                if g.mix_rate != Some(rate) || (reopen && reverb.is_some()) {
                     g.mix_rate = Some(rate);
                     // the reverb's delay lines are sized in frames of the mix rate
                     if let Some(old) = std::mem::replace(&mut g.tail, reverb) {
@@ -225,9 +258,9 @@ impl Core {
                     sv.set_level(level);
                 }
             }
-            Cmd::Stream { id, src, volume } => {
+            Cmd::Stream { id, src, volume, gains } => {
                 if g.allocate(src.channels.max(1) as usize, STREAM_PRIORITY, None) {
-                    g.streams.push((id, StreamVoice { src, volume, frac: 0, window: [[0.0; 4]; 2], primed: false, fade: None }));
+                    g.streams.push((id, StreamVoice { src, volume, gains, frac: 0, window: [[0.0; 4]; 2], primed: false, fade: None }));
                 }
             }
         }
@@ -285,7 +318,7 @@ impl Tx {
         let mut shared = Shared::default();
         shared.reserve_rt();
         let core = Core { shared, rx, gc: gc_tx, applied: 0, snap: snap.clone(), lat: lat.clone(), device_rate };
-        let state = Mutex::new(TxState { prod, gc, next_id: 0, seq: 0, cfg_rate: None, pending: Vec::with_capacity(256) });
+        let state = Mutex::new(TxState { prod, gc, next_id: 0, seq: 0, cfg_rate: None, cfg_quality: None, pending: Vec::with_capacity(256) });
         let mut tx = Tx { state, snap, lat, bus: [AtomicI8::new(0), AtomicI8::new(0)], offline: None };
         if offline {
             tx.offline = Some(Mutex::new(Offline { core, n: 0 }));

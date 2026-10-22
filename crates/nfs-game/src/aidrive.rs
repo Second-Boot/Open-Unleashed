@@ -57,18 +57,89 @@ pub struct AiCarState {
     pub max_lat_acc: f32,
 }
 
-/// `0x4090C0` — where the car is aiming, in world space.
+/// `0x4090C0` — where the car is aiming, in world space (`car+0x102C`), read to the instruction
+/// 2026-10-22 (`traffic.md` §27.2c):
+///
+/// * an explicit aim point `car+0x1064…` wins outright (0x4090DB…0x409127);
+/// * otherwise `n = fistp(f32((|car+0xEC0| · 0.7 + 3) · ⅙))` slices (0x409148…0x40916A,
+///   `[0x5B2618]`, `[0x5B2600]`, `[0x5B2420]`), raised to `min_lookahead / 6` when it is below it
+///   (0x40916D…0x409199 — **sixths**, the integer `imul 0x2AAAAAAB`, not thirds) and cut to
+///   `max_lookahead / 6` (0x40919B…0x4091B3);
+/// * on a narrow road ahead — `lanesA·laneWidthA + lanesB·laneWidthB < 18` (`[0x5B2614]`) of the
+///   slice `n` along (0x4091F8…0x40922A) — a bend `|0x40EDD0(car, step)|` past 0.95 cuts `n` to
+///   `n · 0xCA3D >> 16`, and then the first of past 0.9 / 0.8 / 0.75 to `· 0xD70A / 0xE666 / 0xF333 >> 16`
+///   (0x409230…0x409313);
+/// * the loop (0x409329…0x4094F5, at most five passes): the point is the slice `n` along's node
+///   `+0x04` plus its lateral `+0x28` (unnormalised) times `car+0x1074`; its offset across the car's
+///   **own** slice (`dot(+0x28, point − node)`) past that slice's lane extent on the side away from
+///   `car+0xED0` retries unless the lanes 8 m and 4 m from `car+0xED0` on that side both exist
+///   (`0x40EB20` / `0x40EA00`); every pass then sets `n = max(n · 0xCCCC >> 16, 4)`.
+///
+/// The port's earlier version clamped to thirds (4…10 slices), so a traffic car at 15 m/s aimed 24 m
+/// ahead instead of 12 (live, `REFERENCE-2026-10-22-PA-TRAFFIC3.md`).
 pub fn aim_direction(table: &SliceTable, cfg: &TrafficConfig, car: &AiCarState) -> Vec3 {
     if car.aim_point != Vec3::ZERO {
         return car.aim_point - car.position;
     }
-    // n = round((0.7·|speed| + 3) / 6) slices, clamped by the config's lookahead thirds
-    let n = ((cfg.look_ahead_factor * car.speed.abs() + 3.0) / 6.0).round() as i32;
-    let n = n.clamp(cfg.min_lookahead / 3, cfg.max_lookahead / 3).max(1);
-    let s = table.add(car.slice, n * (car.dir * car.sense) as i32);
-    let sl = &table.slices[s];
-    let point = sl.centre + sl.lateral.normalize_or_zero() * car.lateral_target;
+    let v = car.speed.abs();
+    // the product is stored as a float (0x409161) and then rounded to nearest by `fistp`
+    let x = ((f64::from(v) * f64::from(0.7f32) + 3.0) * f64::from(1.0f32 / 6.0)) as f32;
+    let mut n = fistp(x);
+    let (min6, max6) = (cfg.min_lookahead / 6, cfg.max_lookahead / 6);
+    if n >= 0 && n < min6 {
+        n = min6;
+    }
+    if n > max6 {
+        n = max6;
+    }
+    let sense = (car.dir as i32) * (car.sense as i32);
+    let shrink = |n: i32, k: i64| ((i64::from(n) * k) / 65536) as i32;
+    let ahead = &table.slices[table.add(car.slice, sense * n)];
+    let road = f64::from(ahead.lane_width_b) * f64::from(ahead.lanes_b) + f64::from(ahead.lane_width_a) * f64::from(ahead.lanes_a);
+    if road < 18.0 {
+        let bend = road_bend_steps(table, car.slice, sense * n).abs();
+        if bend > 0.95 {
+            n = shrink(n, 0xCA3D);
+        }
+        if bend > 0.9 {
+            n = shrink(n, 0xD70A);
+        } else if bend > 0.8 {
+            n = shrink(n, 0xE666);
+        } else if bend > 0.75 {
+            n = shrink(n, 0xF333);
+        }
+    }
+    let own = &table.slices[car.slice];
+    let mut point;
+    let mut pass = 0;
+    loop {
+        let sl = &table.slices[table.add(car.slice, sense * n)];
+        point = sl.centre + sl.lateral * car.lateral_target;
+        let d = point - own.centre;
+        let off = f64::from(own.lateral.x) * f64::from(d.x) + f64::from(own.lateral.y) * f64::from(d.y) + f64::from(own.lateral.z) * f64::from(d.z);
+        let ed0 = f64::from(car.lateral);
+        let edge_b = f64::from(own.lane_width_b) * f64::from(own.lanes_b);
+        let edge_a = f64::from(own.lane_width_a) * f64::from(own.lanes_a);
+        let ok = if (off > edge_b && off > ed0) || (off < -edge_a && off < ed0) {
+            let side = if ed0 <= off { 1.0 } else { -1.0 };
+            crate::lanes::lane_exists(own, crate::lanes::lane_of(own, car.lateral + side * 8.0))
+                && crate::lanes::lane_exists(own, crate::lanes::lane_of(own, car.lateral + side * 4.0))
+        } else {
+            true
+        };
+        pass += 1;
+        n = shrink(n, 0xCCCC).max(4);
+        if pass > 4 || ok {
+            break;
+        }
+    }
     point - car.position
+}
+
+/// `fistp` under the x87's default rounding: to nearest, ties to even.
+fn fistp(v: f32) -> i32 {
+    let r = v.round();
+    if (v - v.trunc()).abs() == 0.5 && (r as i32) % 2 != 0 { r as i32 - v.signum() as i32 } else { r as i32 }
 }
 
 /// `0x408F20` — the heading error in **turns**, in −0.5..0.5. Positive means the car points to the
@@ -112,6 +183,14 @@ pub fn out_of_control(car: &AiCarState, ooc: &AiPhysics, heading_err: f32, road:
         || (body_lateral_speed(car).abs() > 0.4 * car.speed_est && car.speed.abs() >= 15.0)
 }
 
+/// The road edges [`out_of_control`] tests `car+0xED0` against: `laneWidthA · lanesA` and
+/// `laneWidthB · lanesB` of the car's slice (`+0x48 · +0x38`, `+0x4C · +0x3C`, `fimul`;
+/// 0x40966D…0x409699) — not the slice's `+0x40` / `+0x44` widths, which the port passed until
+/// 2026-10-22.
+pub fn lane_extent(sl: &crate::race::Slice) -> (f32, f32) {
+    (sl.lane_width_a * sl.lanes_a as f32, sl.lane_width_b * sl.lanes_b as f32)
+}
+
 /// **How sharply the road turns in the next eight slices** — `0x40EDD0(car, car+0xEB0 · 8)`, the
 /// measure [`out_of_control`]'s sixth clause tests against `[0x5B24E8]` = 0.8.
 ///
@@ -121,7 +200,13 @@ pub fn out_of_control(car: &AiCarState, ooc: &AiPhysics, heading_err: f32, road:
 /// road and ±1 at a right-angle turn, so `> 0.8` is a bend of about 53° over the 48 m the eight
 /// slices span. The slice arithmetic is `addSlices` with `link = −1` (0x40EDEA).
 pub fn road_bend(table: &SliceTable, slice: usize, dir: f32) -> f32 {
-    let ahead = table.add_graph(slice, if dir < 0.0 { -8 } else { 8 }, None);
+    road_bend_steps(table, slice, if dir < 0.0 { -8 } else { 8 })
+}
+
+/// `0x40EDD0(car, steps)` for any step count: the car's slice's lateral `+0x28` against the forward
+/// `+0x1C` of the slice `steps` along (`addSlices` with `link = −1`), in x and z.
+pub fn road_bend_steps(table: &SliceTable, slice: usize, steps: i32) -> f32 {
+    let ahead = table.add_graph(slice, steps, None);
     let (a, b) = (&table.slices[slice.min(table.slices.len() - 1)], &table.slices[ahead.min(table.slices.len() - 1)]);
     a.lateral.x * b.forward.x + a.lateral.z * b.forward.z
 }
@@ -352,23 +437,28 @@ pub fn in_control_command(car: &AiCarState, cfg: &AiPhysics, heading_err: f32, a
 }
 
 /// `0x40A1D0` — rotate the body-frame command into world space and integrate it. `dt` is the AI dt.
+///
+/// `v += dt · Mᵀ·car+0xD4C` (+ `car+0xD70` in the `car+0x3B8` basis, zero from both controllers;
+/// 0x40A201…0x40A349) and `ω += dt · Mᵀ·car+0xD34` (0x40A2AD…0x40A3C0); then the walking-pace yaw
+/// damping on the **world** `ω.y` `car+0x38C`, keyed on `car+0xD60` — the body-frame forward speed
+/// 0x408F20 stored before the controllers ran, not the integrated one: `|D60| < 1` (`[0x5B24A8]`)
+/// zeroes it (0x40A3EE; 0x532970 then renormalises the forward row, a unit vector already), otherwise
+/// it is scaled by `min(0.15 · |D60|, 1)` (`[0x5B2638]`, 0x40A437…0x40A459). The port damped the
+/// component along the body's up axis by the post-step speed until 2026-10-22.
 pub fn integrate(car: &mut AiCarState, cmd: &DriveCommand, dt: f32) {
     let right = car.orientation.row(0);
     let fwd = car.orientation.row(2);
     let up = car.orientation.row(1);
+    // `car+0xD60`, written by 0x408F20 from the velocity the controllers saw
+    let d60 = body_forward_speed(car);
     car.velocity += (right * cmd.lateral + fwd * cmd.forward) * dt;
     car.angular_velocity += up * (cmd.yaw * dt);
-    // `0x40A1D0` damps or zeroes the yaw rate at walking pace
-    let v = body_forward_speed(car);
-    if v.abs() < 1.0 {
-        car.angular_velocity -= up * car.angular_velocity.dot(up);
+    if d60.abs() < 1.0 {
+        car.angular_velocity.y = 0.0;
     } else {
-        let k = (0.15 * v.abs()).min(1.0);
-        let yaw = car.angular_velocity.dot(up);
-        car.angular_velocity += up * (yaw * k - yaw);
+        car.angular_velocity.y *= (0.15 * d60.abs()).min(1.0);
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,10 +507,17 @@ mod tests {
         let cfg = TrafficConfig::default();
         let mut c = car();
         c.position = t.slices[10].centre;
-        // at 16 m/s the lookahead is round((0.7·16 + 3)/6) = 2 slices, inside the 4..10 clamp -> 4
+        // at 16 m/s the lookahead is fistp((0.7·16 + 3)/6) = 2 slices, inside the 2..5 clamp
+        // (`min_lookahead / 6` … `max_lookahead / 6`, 0x40916D…0x4091B3)
         let aim = aim_direction(&t, &cfg, &c);
         assert!(aim.z > 0.0 && aim.x.abs() < 1e-3, "{aim:?}");
-        assert!((aim.length() - 4.0 * SLICE_SPACING).abs() < 1e-3, "four slices ahead: {}", aim.length());
+        assert!((aim.length() - 2.0 * SLICE_SPACING).abs() < 1e-3, "two slices ahead: {}", aim.length());
+        // at 30 m/s: fistp(4.0) = 4; at 60 m/s 7.5 → 8, cut to 5
+        c.speed = 30.0;
+        assert!((aim_direction(&t, &cfg, &c).length() - 4.0 * SLICE_SPACING).abs() < 1e-3);
+        c.speed = 60.0;
+        assert!((aim_direction(&t, &cfg, &c).length() - 5.0 * SLICE_SPACING).abs() < 1e-3);
+        c.speed = 16.0;
         // a lane target moves it sideways
         c.lateral_target = 3.0;
         assert!((aim_direction(&t, &cfg, &c).x - 3.0).abs() < 1e-3);

@@ -9,6 +9,7 @@ fn main() {
 
     let save = SaveFile::parse(&data).expect("SaveFile::parse");
     println!("module order on disk: {:?}", save.order);
+    println!("write() reproduces the file byte for byte: {}", save.write() == data);
     println!();
 
     // Offset table: build incremental subsets in MODULE_ORDER and measure each module's contribution.

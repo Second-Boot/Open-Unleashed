@@ -544,9 +544,22 @@ pub struct RaceProgress {
     /// `car+8 != car+0xB18` block of 0x416310), the tick it finished (0x416721) or was knocked
     /// out (0x416649…0x4166FD). The ranking table breaks a progress tie on it ([`ranking`]).
     pub tick: u64,
+    /// The slice before this tick's tracker pass when that pass ran ahead of the progress
+    /// ([`Self::retrack`]): the human's 0x49AF70 is its Sc32 `+0xE0C` entry at priority 6, before its
+    /// step, and the progress 0x4169B0 (Sc64) only reads `car+8` — `update` then accounts on it
+    /// without re-finding the slice.
+    pub retracked_from: Option<usize>,
 }
 
 impl RaceProgress {
+    /// The tracker half of 0x49AF70 ahead of the car's step (`Tracker::update` 0x474440 at the
+    /// position the odd tick left); the next [`Self::update`] / [`Self::track_only`] uses this slice.
+    pub fn retrack(&mut self, table: &SliceTable, pos: Vec3, preferred: Option<usize>) {
+        let prev = self.slice;
+        self.slice = table.track_slice(pos, self.slice, preferred);
+        self.retracked_from.get_or_insert(prev);
+    }
+
     pub fn new(start_slice: usize, table: &SliceTable) -> Self {
         let p = table.frac(start_slice);
         Self { slice: start_slice, progress: p, prev_progress: p, start_progress: p, start_slice, ..Default::default() }
@@ -565,6 +578,9 @@ impl RaceProgress {
     /// Update at 32 Hz (even ticks): tracker, `Lap_check` 0x417440, `Race_updateProgress` 0x416310,
     /// wrong-way 0x4A7660. Returns true when a lap was completed this call.
     pub fn update(&mut self, table: &SliceTable, pos: Vec3, forward: Vec3, tick: u64, num_laps: u32) -> bool {
+        if let Some(prev) = self.retracked_from.take() {
+            return self.account(table, prev, forward, tick, num_laps);
+        }
         self.update_tracked(table, pos, forward, tick, num_laps, None)
     }
 
@@ -574,6 +590,9 @@ impl RaceProgress {
     /// caller 0x4179A4 is for cars without `car+0x52C` bit 0) nor `car+0xB14` move — only the
     /// tracker's slice does. The finish and its tick are 0x416170's (the caller's).
     pub fn track_only(&mut self, table: &SliceTable, pos: Vec3, preferred: Option<usize>) {
+        if self.retracked_from.take().is_some() {
+            return;
+        }
         self.slice = table.track_slice(pos, self.slice, preferred);
     }
 
@@ -582,6 +601,15 @@ impl RaceProgress {
     pub fn update_tracked(&mut self, table: &SliceTable, pos: Vec3, forward: Vec3, tick: u64, num_laps: u32, preferred: Option<usize>) -> bool {
         let prev_slice = self.slice;
         self.slice = table.track_slice(pos, self.slice, preferred);
+        self.account(table, prev_slice, forward, tick, num_laps)
+    }
+
+    /// The progress half of [`Self::update_tracked`] on the slice the tracker already holds: an AI
+    /// opponent's slice is re-found by 0x49AF70 at the head of its `AIState_Racing::update`
+    /// (0x40CA27, before the decisions 0x40B650 / 0x40BFE0), at the position the odd tick left, and
+    /// the per-car progress 0x4169B0 (Sc64) reads that `car+8` without tracking it again
+    /// (`REFERENCE-2026-10-22-PA-TRAFFIC.md`). `prev_slice` is the slice before that re-find.
+    pub fn account(&mut self, table: &SliceTable, prev_slice: usize, forward: Vec3, tick: u64, num_laps: u32) -> bool {
         // finished / eliminated cars leave the progress accounting (0x4169B0: `state >= 2 ⇒ return`),
         // so their lap list and rank freeze at the finish
         if self.finished {
@@ -782,7 +810,14 @@ pub fn start_slice(table: &SliceTable, start_scene: Option<&Scene>, linear: bool
 /// the `max(1)` on its lane count only keeps the port from dividing by zero where the original
 /// would (`fidiv`, 0x4106C3).
 pub fn grid_slot(table: &SliceTable, start: usize, grid_pos: u32, n: u32, rule: &GridRule) -> (usize, Vec3) {
-    let start = if table.backwards && !rule.linear { table.add(0, start as i32) } else { start };
+    grid_slot_by(table, start, grid_pos, n, rule, |from, steps| table.add(from, steps))
+}
+
+/// [`grid_slot`] with the slice step `addSlices` 0x4817D0 supplied by the caller (the junction graph's
+/// walk, which returns the slice it was given where a node has no link in the direction — the
+/// traffic set's `add_slices`).
+pub fn grid_slot_by(table: &SliceTable, start: usize, grid_pos: u32, n: u32, rule: &GridRule, add: impl Fn(usize, i32) -> usize) -> (usize, Vec3) {
+    let start = if table.backwards && !rule.linear { add(0, start as i32) } else { start };
     let g = grid_pos as i32 + 1;
     let n = n as i32;
     let k = match rule.derby_cars {
@@ -790,7 +825,7 @@ pub fn grid_slot(table: &SliceTable, start: usize, grid_pos: u32, n: u32, rule: 
         None if n > 2 => 3 * (n - g) + 1,
         None => 1,
     };
-    let slice = table.add(start, k);
+    let slice = add(start, k);
     let side = g & 1 == 1;
     let s = &table.slices[slice];
     let s1 = &table.slices[1.min(table.slices.len() - 1)];

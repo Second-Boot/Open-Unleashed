@@ -149,13 +149,19 @@ pub fn room(id: &str) -> Option<&'static Room> {
 
 impl Room {
     /// The turntable angle in turns at `ms` milliseconds: one whole turn every `spin` seconds
-    /// (`YRot = now / (ticksPerSecond · Spin)`, 0x4EA0AE, and the model spin setter multiplies by
-    /// −360 to make degrees).
+    /// (`YRot = now / (ticksPerSecond · Spin)`, 0x4EA0AE). *Sign (PA-SRV2):* this port's world
+    /// mirrors the original's x (`place` negates the rows' x), which reverses the sense of a turn
+    /// about y, so the original's `+now / (128 · Spin)` — the model spin setter turns it by −360
+    /// degrees in its own frame — is the **positive** turn here. Measured against the running
+    /// original (its `TIMER_getTicks` return at 0x4EA0B3 held at 640, `NFS_FE_CLOCK=5000`): the
+    /// dealership, garage and Factory Driver cars stand at the same angle only with this sign
+    /// (the former `−ms / (1000 · spin)` had the car 120 degrees away and the turntable running
+    /// the other way round).
     pub fn spin_turns(&self, ms: u64) -> f32 {
         if self.spin <= 0.0 {
             return 0.0;
         }
-        -(ms as f32) / (1000.0 * self.spin)
+        (ms as f32) / (1000.0 * self.spin)
     }
 
     /// Where the room (and its car) sits `zoom` of the way into a door: `(X·f, Y·f − zoom·0.8,
@@ -634,7 +640,7 @@ impl VictoryMovie {
         let &(off, len) = chunks.first()?;
         let header = nfs_formats::mad::MadHeader::parse(&data[off..off + len]).ok()?;
         let mut decoder = nfs_formats::mad::MadDecoder::new(tables, &header);
-        let f = decoder.decode_frame(&data[off..off + len]);
+        let f = decoder.decode_frame(nfs_formats::mad::with_run_on(&data, off, len));
         if f.width == 0 || f.height == 0 {
             return None;
         }
@@ -667,7 +673,7 @@ impl VictoryMovie {
             self.clock_ms = 0.0;
         }
         let (off, len) = self.chunks[self.at];
-        let _ = self.decoder.decode_chunk(&self.data[off..off + len]);
+        let _ = self.decoder.decode_chunk(nfs_formats::mad::with_run_on(&self.data, off, len));
         true
     }
 
@@ -816,8 +822,8 @@ mod tests {
     fn the_turntable_takes_spin_seconds_per_turn() {
         let g = room("ID_GARAGE").unwrap();
         assert_eq!(g.spin, 30.0);
-        assert!((g.spin_turns(30_000) + 1.0).abs() < 1e-6, "one turn in thirty seconds");
-        assert!((g.spin_turns(15_000) + 0.5).abs() < 1e-6);
+        assert!((g.spin_turns(30_000) - 1.0).abs() < 1e-6, "one turn in thirty seconds");
+        assert!((g.spin_turns(15_000) - 0.5).abs() < 1e-6);
         // the track wall turns faster
         assert_eq!(room("ID_TRACK").unwrap().spin, 20.0);
     }

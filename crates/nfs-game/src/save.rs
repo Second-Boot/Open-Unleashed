@@ -326,8 +326,17 @@ fn owned_from_image(tables: &CareerTables, car: &SavedCar) -> OwnedCar {
                 }
         }
     }
-    // a `.sav` the port wrote before 2026-09-25 has no stock list (`n1 = 0`) and only the bought
-    // parts installed — port-only, see `OwnedCar::adopt_implicit_stock`
+    // PORT-DEVIATION D40 (RE/notes/PORT-DEVIATIONS.md): a car whose stock list `+0x75C` is empty is
+    // given its stock parts (`OwnedCar::adopt_implicit_stock`, which leaves a car with a stock list
+    // alone). 0x4EE6A0 loads both lists as written, but the original never writes such a car: its
+    // only writers of `+0x75C` are the constructors (0x4EE404 / 0x4EE63C), 0x4EE9A0 (the record's
+    // stock, run unconditionally by `FECar::init` 0x4EEBA0 at 0x4EED28) and this loader (0x4EE7F2);
+    // nothing erases from it. So an empty list for a record with stock parts is a `.sav` the port
+    // wrote before 2026-09-25 (only the bought parts installed), or such a file re-saved by the
+    // original (the server profile's `'50 356`, removed 0 / installed 1). Kept as written, that car
+    // races with no stock parts in `car+0x768` (0x4EEDA0 `.PARTINDEX` → 0x49C4C0), so the part-damage
+    // getters 0x493980 / 0x493BC0 / 0x493A10 read 0 however damaged it is: no tyre-grip loss, no
+    // suspension pull (REG-PHYS). *(PA-STOCK had dropped the rebuild here, 53c25b82.)*
     owned.adopt_implicit_stock(tables);
     owned.damage_pct = crate::career::car_damage_pct(tables, &owned);
     owned
@@ -651,6 +660,12 @@ pub struct SaveSide {
     /// its Load 0x4F5B70 hands the count to `setCount` (slot 24, 0x4BC310) and the index to
     /// 0x4F0A30 → `SetSelection` 0x4BC240, clamped into the garage. (history: `game-history.md` §18.3)
     pub owned_car_selection: u32,
+    /// `UserList.NameInput`'s text as the profile was loaded (`FEStringAccessor`, a plain C string,
+    /// §6.1) and saved again: the accessor is the profile chooser's name box and nothing writes the
+    /// profile's own name into it on a save. The original's fresh profiles (`XXDefXX`, a created
+    /// `0TEST`) carry `""` however the name was typed (the server's files); a profile
+    /// whose file carried a name keeps it.
+    pub name_input: String,
 }
 
 /// The four dwords of the `Tournament` module (§4.3) that belong to the front end, not to the
@@ -758,20 +773,25 @@ impl Default for SavedSettings {
     fn default() -> Self {
         // `Game.NumOpponents` and `Game.NumKOOpponents` are both registered with a default of
         // **4** (0x4E5539, 0x4E556C), and every dead-zone accessor with 0 for a `.Min` and 0x80
-        // for a `.Max` (0x51E546, 0x51E550)
+        // for a `.Max` (0x51E546, 0x51E550) — which `SetSelection` 0x4BC240 clamps to the range's
+        // last index, 127 (the range 0…0x80 holds 0x80 rows, 0x51BE3D; the server's fresh profiles
+        // carry 127 in the selection and in all sixteen values)
         Self {
             music: 127,
             sfx: 127,
             engine: 127,
             speech: 127,
             ambient: 127,
-            audio_quality: 1,
+            // `Audio.Quality` starts at 0x44E580's probe (0x4E4BD3 → slot 11): 0 for a clock of
+            // 450 MHz or more with 64 MB of RAM or more, i.e. every machine the port runs on
+            // (the server's fresh `XXDefXX` / `0TEST` carry 0)
+            audio_quality: 0,
             view_distance: 3,
             laps: 2,
             opponents: 4,
             traffic: 0,
             ko_opponents: 4,
-            deadzone: [[0, 0x80]; 8],
+            deadzone: [[0, 127]; 8],
             controls: [None; CONTROL_ROWS],
             options: Vec::new(),
             ip_list: None,
@@ -824,13 +844,15 @@ pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, 
     };
     // The accessors the port has real values for, each in the shape its class implies (§6.1/§6.2a).
     let mut entries = vec![
-        ("Chronicle.Year".into(), AccessorValue::Dword(c.year as u32)),
+        // the chronicle range's index (0x508A24, `controls.md` §4.121), not the career's year: 0 is what
+        // the original's fresh profiles carry; the chronicle screen sets it itself on entry (0x506E98)
+        ("Chronicle.Year".into(), AccessorValue::Dword(0)),
         // `Game.GameType` is left out: it holds whatever mode the front end was in when the
         // original saved (0 quick race, 1 quick knockout, 2 knockout, 4 Evolution, 9 factory
         // driver — `controls.md` §SETTYPE*; 0x4D52EA saves after any race), which the career
         // does not know. (history: `game-history.md` §18.4)
         ("OwnedCars.Car".into(), AccessorValue::OwnedCarSel { cars: c.garage.len() as u32, selection: side.owned_car_selection }),
-        ("UserList.NameInput".into(), AccessorValue::Text(profile.name.clone())),
+        ("UserList.NameInput".into(), AccessorValue::Text(side.name_input.clone())),
         ("Tournament.Data".into(), AccessorValue::Empty),
         ("Factory.Data".into(), AccessorValue::Empty),
         // the settings screens: every one of these is an `FEIntAccessor` or an
@@ -854,9 +876,10 @@ pub fn career_to_sav_with(c: &Career, tables: &CareerTables, profile: &Profile, 
     // is what an untouched pad has.
     for (n, axis) in DEADZONE_AXES.iter().enumerate() {
         for (k, suffix) in ["Min", "Max"].iter().enumerate() {
-            let mut values = [if k == 0 { 0 } else { 0x80 }; 16];
+            let mut values = [if k == 0 { 0 } else { 127 }; 16];
             values[0] = settings.deadzone[n][k];
-            entries.push((format!("{axis}.{suffix}"), AccessorValue::DeadZone { selection: 0, values }));
+            // the selection is the current pad's value (slot 2 0x51BE70 swaps it in, 0x51BF20 sets it)
+            entries.push((format!("{axis}.{suffix}"), AccessorValue::DeadZone { selection: values[0], values }));
         }
     }
     for (name, fields) in settings.controls.iter().flatten() {
@@ -965,13 +988,12 @@ pub fn career_from_sav(s: &SaveFile, tables: &CareerTables) -> Career {
         c.evolution_complete = t.club_mode != 0;
         c.tournaments = tournaments_from_table(tables, &t.table);
     }
-    if let Some(a) = &s.accessors {
-        for (name, value) in &a.entries {
-            if let ("Chronicle.Year", AccessorValue::Dword(y)) = (name.as_str(), value) {
-                c.year = *y as u16;
-            }
-        }
-    }
+    // *(Until PA-SRV2 the career's year was overwritten here from `Chronicle.Year`.* That accessor is not
+    // the calendar: it is the chronicle screen's own range 1948…cursor and what it saves is the
+    // **index** into it — `0` in every fresh profile the original made (`XXDefXX`, `0TEST`), `48` in
+    // an `8DRIVER.sav` whose owner browsed the chronicle to 1996 — so an original-written profile
+    // loaded as the year 48, and a car's current price came out 11 000 where the original's own
+    // garage said 11 123. The year is the `Tournament` module's, above (0x5029F0).*)
     // 0x517810 reads the records back by value; the id and the damage are all the port keeps
     if let Some(recs) = &s.parts_market {
         c.spares = recs
@@ -1117,6 +1139,7 @@ pub fn side_from_sav(s: &SaveFile) -> SaveSide {
         tournament: s.tournament.as_ref().map_or_else(TournamentFe::default, |t| TournamentFe { selected: t.selected, next_event: t.remaining_tracks, current_event: t.current_event, current_tournament: t.current_tournament }),
         opponent_cars: None,
         owned_car_selection: 0,
+        name_input: String::new(),
     };
     let mut opponent_cars = None;
     let st = &mut side.settings;
@@ -1147,6 +1170,7 @@ pub fn side_from_sav(s: &SaveFile) -> SaveSide {
             // 0x4F5B70: the index as saved; the clamp into the garage is the caller's (0x4BC240
             // against the live count, `vtbl[+0x24]`)
             (n, AccessorValue::OwnedCarSel { selection, .. }) if n == "OwnedCars.Car" => side.owned_car_selection = *selection,
+            (n, AccessorValue::Text(t)) if n == "UserList.NameInput" => side.name_input = t.clone(),
             (_, AccessorValue::DeadZone { values, .. }) => {
                 if let Some((axis, k)) = name.split_once('.').and_then(|(a, m)| Some((DEADZONE_AXES.iter().position(|x| *x == a)?, ["Min", "Max"].iter().position(|x| *x == m)?))) {
                     st.deadzone[axis][k] = values[0];
@@ -1196,6 +1220,25 @@ mod tests {
         let s = SaveFile { parts_market: Some(recs), ..SaveFile::default() };
         let back = career_from_sav(&SaveFile::parse(&s.write()).unwrap(), &tables);
         assert_eq!(back.spares, c.spares[..2]);
+    }
+
+    /// PA-SRV2: `Chronicle.Year` is the chronicle screen's range index (0 in the original's fresh
+    /// profiles, 48 in an `8DRIVER.sav` browsed to 1996), never the career's calendar year — the
+    /// year is the `Tournament` module's, so a profile the original wrote keeps 1950.
+    #[test]
+    fn the_chronicle_index_is_not_the_career_year() {
+        let tables = CareerTables { raw: Default::default(), tracks: vec![], tournaments: vec![], parts: vec![], personalities: vec![], missions: vec![], strings: Default::default(), catalog: vec![], package_count: 0 };
+        let mut c = Career::default();
+        c.year = 1953;
+        let mut s = career_to_sav(&c, &tables, &Profile::new("Hans", 3));
+        let a = s.accessors.as_mut().unwrap();
+        assert!(a.entries.iter().any(|(n, v)| n == "Chronicle.Year" && *v == AccessorValue::Dword(0)), "written as the index a fresh profile carries");
+        for (n, v) in a.entries.iter_mut() {
+            if n == "Chronicle.Year" {
+                *v = AccessorValue::Dword(48);
+            }
+        }
+        assert_eq!(career_from_sav(&SaveFile::parse(&s.write()).unwrap(), &tables).year, 1953);
     }
 
     /// every front-end entry after the first re-applies the profile's accessor block

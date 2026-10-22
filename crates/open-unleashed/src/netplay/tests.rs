@@ -739,3 +739,38 @@ fn the_version_falls_back_to_the_shipped_one_only_without_a_registry() {
     assert_eq!(super::version_from(None, Some(&RegFile::default())), "3.5");
     assert_eq!(super::version_from(None, None), "3.5");
 }
+
+/// **The voice chat's `0xC1` over the loopback** (`network.md` §11.40): a player's message reaches
+/// the host's voice object and, through the room's relay 0x48C0F0, the other player's — not the
+/// sender's own (the relay skips the sender for `0xBF` … `0xC2`).
+#[test]
+fn a_voice_message_reaches_the_host_and_the_other_player_but_not_its_sender() {
+    let mut host = NetPlay::start("host:0", "HOSTY").unwrap();
+    host.net.identity_gate = None;
+    let port = host.net.local_addr().unwrap().port();
+    let mut a = NetPlay::start(&format!("join:127.0.0.1:{port}"), "ALPHA").unwrap();
+    let mut b = NetPlay::start(&format!("join:127.0.0.1:{port}"), "BRAVO").unwrap();
+    let until = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < until && !(a.established() && b.established() && host.room_len() == 3 && a.room_len() == 3 && b.room_len() == 3) {
+        host.poll_lobby();
+        a.poll_lobby();
+        b.poll_lobby();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(a.established() && b.established() && host.room_len() == 3, "both players are in the room");
+    let mut ps = [[0u8; nfs_net::voice::PACKET]; nfs_net::voice::PACKETS];
+    for (i, p) in ps.iter_mut().enumerate() {
+        p[0] = i as u8 + 1;
+    }
+    a.net.send_game(&nfs_net::voice::message(&ps)).unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < until && !(host.voice.queued() == 5 && b.voice.queued() == 5) {
+        host.poll_lobby();
+        a.poll_lobby();
+        b.poll_lobby();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(host.voice.queued(), 5);
+    assert_eq!(b.voice.queued(), 5);
+    assert_eq!(a.voice.queued(), 0);
+}

@@ -59,7 +59,7 @@ fn career_round_trips_through_the_original_format() {
     assert!(!k.active && k.opponents == 0);
     // the accessor block carries the values the port has, in the original's map order
     let acc = parsed.accessors.as_ref().expect("accessor block");
-    assert!(acc.entries.iter().any(|(n, v)| n == "Chronicle.Year" && *v == nfs_formats::sav::AccessorValue::Dword(1969)));
+    assert!(acc.entries.iter().any(|(n, v)| n == "Chronicle.Year" && *v == nfs_formats::sav::AccessorValue::Dword(0)), "the chronicle screen's index (PA-SRV2, 0 as a fresh profile), not the year");
     assert!(acc.entries.iter().any(|(n, _)| n == "OwnedCars.Car"));
     assert!(!acc.entries.iter().any(|(n, _)| n == "Game.GameType"), "the mode is not the career's to write");
     // …the settings screens' values, each a plain dword (§6.1)
@@ -121,8 +121,9 @@ fn career_round_trips_through_the_original_format() {
     let mut seen = parsed.clone();
     seen.player.as_mut().unwrap().seen_evolution_intro = 1;
     assert!(career_from_sav(&seen, &t).seen_evolution_intro, "[0x691DD5] comes back (0x501859)");
-    // a `.sav` the port wrote before the stock list: no `+0x75C` parts and only what was bought
-    // installed — the stock list comes back from the record and fills the empty slots
+    // a `.sav` the port wrote before the stock list (no `+0x75C` parts, only what was bought
+    // installed — a state the original never writes, PORT-DEVIATION D40): the stock list comes back
+    // from the record and fills the empty slots (REG-PHYS)
     let mut old = parsed.clone();
     let oc = &mut old.player.as_mut().unwrap().cars[0];
     oc.removed.clear();
@@ -169,7 +170,7 @@ fn the_embedded_tables_are_the_shipped_images() {
 
 /// The sixteen `FEControllerDeadZoneAccessor`s ride in the accessor block as `u32 selection` plus
 /// `u32[16]` — one value per pad — and the port writes the pad it edits into slot 0, leaving the
-/// rest at the factory's own 0 / 0x80. `RE/notes/savegame.md` §6.1, `controls.md` §4.17.
+/// rest at the factory's own 0 / 0x80 (127 once 0x4BC240 has clamped it). `RE/notes/savegame.md` §6.1, `controls.md` §4.17.
 #[test]
 fn the_dead_zone_accessors_ride_in_the_save() {
     let Some(tables) = tables() else {
@@ -181,7 +182,8 @@ fn the_dead_zone_accessors_ride_in_the_save() {
     let mut settings = nfs_game::save::SavedSettings::default();
     // both opponent counts start at 4 (0x4E5539, 0x4E556C), not at 7
     assert_eq!((settings.opponents, settings.ko_opponents), (4, 4));
-    assert_eq!(settings.deadzone, [[0, 0x80]; 8]);
+    // 0x80 as `SetSelection` 0x4BC240 keeps it: the range 0…0x80 has 0x80 rows, so 127
+    assert_eq!(settings.deadzone, [[0, 127]; 8]);
     settings.deadzone[2] = [40, 100];
 
     let sav = nfs_game::save::career_to_sav_with(&career, &tables, &profile, &nfs_game::save::SaveSide { settings, ..Default::default() });
@@ -195,9 +197,10 @@ fn the_dead_zone_accessors_ride_in_the_save() {
             let nfs_formats::sav::AccessorValue::DeadZone { selection, values } = v else {
                 panic!("{axis}.{suffix} is not a dead-zone value");
             };
-            assert_eq!(selection, 0);
+            // the selection is the current pad's value
+            assert_eq!(selection, values[0]);
             // pads 1..15 keep the factory's own default for that end
-            assert!(values[1..].iter().all(|x| *x == if k == 0 { 0 } else { 0x80 }), "{axis}.{suffix}");
+            assert!(values[1..].iter().all(|x| *x == if k == 0 { 0 } else { 127 }), "{axis}.{suffix}");
         }
     }
     // and the one the test moved came through on pad 0
@@ -579,6 +582,7 @@ fn the_front_end_modules_and_options_come_back() {
         tournament: nfs_game::save::TournamentFe { selected: 4, next_event: 2, current_event: 1, current_tournament: 4 },
         opponent_cars: None,
         owned_car_selection: 1,
+        name_input: String::new(),
     };
     // `OpponentCar.Car`'s seven (0x4F56C0 / 0x4F56F0): a record with paint sets and interiors
     let with_paint = t.catalog.iter().find(|c| c.paint_sets.len() > 2 && c.interior_colours.len() > 1).expect("a painted car");
@@ -846,4 +850,50 @@ fn the_legacy_json_is_folded_into_the_sav_once() {
     assert_eq!(migrate_legacy_json(&json, &dir, &r, &t), Migration::Unreadable);
     assert!(!json.exists());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PORT-DEVIATION D40: a car with an empty stock list `+0x75C` — which the original never writes
+/// (its writers are the constructors 0x4EE404 / 0x4EE63C, 0x4EE9A0 and the loader 0x4EE7F2) — gets
+/// its stock parts on load, and a car with a stock list keeps both lists as written (0x4EE6A0). The
+/// race goldens' `8DRIVER.sav` (a port seed from before 2026-09-25: removed 0 / installed 1) races
+/// with its stock parts again, so its part-damage getters read the damage (REG-PHYS).
+#[test]
+fn a_sav_car_without_a_stock_list_gets_its_stock_parts() {
+    let Some(t) = tables() else {
+        eprintln!("skipping: no game data");
+        return;
+    };
+    let car_id = t.catalog.iter().find(|c| t.car(c.id).is_some_and(|r| r.stock_parts.len() >= 2)).unwrap().id;
+    let stock = t.car(car_id).unwrap().stock_parts.clone();
+    let first = stock[0];
+    let mut c = Career::default();
+    let mut owned = OwnedCar::new(car_id, 0, 0);
+    owned.parts = vec![first];
+    owned.part_state = vec![(first, 0.0)];
+    c.garage.push(owned);
+    // a car with a stock list keeps its lists as written, a stock slot left empty included
+    let mut kept = OwnedCar::new(car_id, 0, 0);
+    kept.fit_stock(&t);
+    kept.parts.retain(|id| *id != stock[1]);
+    kept.part_state.retain(|(id, _)| *id != stock[1]);
+    c.garage.push(kept.clone());
+    let sav = career_to_sav(&c, &t, &Profile::new("T", 0));
+    let garage = career_from_sav(&SaveFile::parse(&sav.write()).unwrap(), &t).garage;
+    let back = garage.iter().find(|o| o.parts.contains(&stock[1])).unwrap();
+    assert_eq!(back.stock.iter().map(|(id, _)| *id).collect::<Vec<_>>(), stock, "the stock list comes back from the record");
+    assert_eq!(back.parts.len(), stock.len(), "every open stock slot filled");
+    let again = garage.iter().find(|o| !o.parts.contains(&stock[1])).unwrap();
+    assert_eq!(again.stock.len(), stock.len());
+    assert_eq!(again.parts.len(), stock.len() - 1, "a car with its stock list is not refilled");
+
+    // the race goldens' seed, when the fixtures exist
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let path = std::path::Path::new(&home).join("RustroverProjects/nfs5-fixtures/fe_save_pristine/8DRIVER.sav");
+    let Ok(data) = std::fs::read(&path) else { return };
+    let s = SaveFile::parse(&data).unwrap();
+    let raw = &s.player.as_ref().unwrap().cars[0];
+    assert!(raw.removed.is_empty() && raw.installed.len() == 1, "the file: removed 0 / installed 1");
+    let car = &career_from_sav(&s, &t).garage[0];
+    let want = t.car(car.car_id).unwrap().stock_parts.len();
+    assert!(car.stock.len() == want && car.parts.len() >= want, "the stock parts are back: {:?}", car.parts);
 }

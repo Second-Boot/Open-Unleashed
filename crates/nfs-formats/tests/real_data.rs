@@ -810,6 +810,40 @@ fn mad_frames_consume_their_payload() {
     assert!(files >= 10, "expected the twelve shipped movies, found {files}");
 }
 
+/// A frame whose bitstream stops before its last macroblock reads the macroblock out of the bytes that follow the chunk in
+/// the file, as the original's buffer-wide bit reader does (`RE/notes/mad.md` §10). The digests are FNV-1a 64 of the
+/// surfaces dumped from the running original (gdb at 0x4DD0EC, the frame's macroblock loop over): ch6 chunks 122 / 148 /
+/// 999 and ch4 chunk 386 — each ends 14 to 16 bytes short; decoded without the run-on, 128 to 256 of their ~14 000
+/// dwords differ.
+#[test]
+fn a_short_mad_frame_reads_its_last_macroblock_from_the_next_chunk() {
+    let root = need_game!();
+    let Ok(exe) = std::fs::read(root.join("nfs5.exe")) else {
+        eprintln!("skipping: nfs5.exe not found");
+        return;
+    };
+    let fnv = |s: &[u32]| s.iter().flat_map(|d| d.to_le_bytes()).fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+    for (name, n, digest) in [("ch6", 122usize, 0x5e7b_9bc3_800b_6e85u64), ("ch6", 148, 0x2da3_068a_9dc3_1b56), ("ch6", 999, 0x6156_c73a_2fd6_db02), ("ch4", 386, 0x4114_5de2_84e5_c7d0)] {
+        let Ok(d) = std::fs::read(root.join("FEData").join("Movies").join(format!("{name}.mad"))) else { continue };
+        let chunks: Vec<(usize, usize)> = {
+            let mut at = 0;
+            nfs_formats::mad::chunks(&d)
+                .filter_map(|c| {
+                    let r = c.is_video().then_some((at, c.data.len()));
+                    at += c.data.len();
+                    r
+                })
+                .collect()
+        };
+        let h = nfs_formats::mad::MadHeader::parse(&d[chunks[0].0..chunks[0].0 + chunks[0].1]).unwrap();
+        let mut dec = nfs_formats::mad::MadDecoder::new(nfs_formats::mad::MadTables::from_exe(&exe).unwrap(), &h);
+        for &(off, len) in &chunks[..=n] {
+            dec.decode_chunk(nfs_formats::mad::with_run_on(&d, off, len)).unwrap();
+        }
+        assert_eq!(fnv(dec.surface()), digest, "{name} chunk {n}");
+    }
+}
+
 /// Track B's field 5 (`+0x18`, 0x45D000 → 0x45A560 / 0x45A8E0): 0 on every shipped track but
 /// Autobahn, whose keys run 1.0 at slice 0…171, 0 from 172, 0.495 from 180.
 #[test]

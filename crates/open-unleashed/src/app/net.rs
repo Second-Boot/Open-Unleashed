@@ -188,7 +188,6 @@ impl App {
                 RaceState::Racing
             };
             o.vehicle.draft = nfs_physics::vehicle::draft_factor(o.vehicle.position, o.vehicle.forward(), o.vehicle.v_long(), &others);
-            o.vehicle.misfire_roll = nfs_game::rng::rand01();
             o.vehicle.wet_track = wet(o.vehicle.position);
             o.vehicle.step32(&c, &o.specs, grid);
         }
@@ -266,7 +265,11 @@ impl App {
                 n.exchange_sample(s);
             }
         }
-        let next = self.tick + 1;
+        // the tick about to run is `self.tick` itself (`[0x606AA0]`, the ticks done, which 0x414EB0 zeroes
+        // with `[0x606AC4]`): 0x415B96…0x415BC4 runs it while it is at most `[0x606A9C]` = allowed − 1, and
+        // latches ring entry `t / 2` for it (0x415BD4…0x415BDC). *(Until the port ran tick 0, 2026-10-22, the
+        // tick about to run was `self.tick + 1`.)*
+        let next = self.tick;
         self.net.session.as_ref().is_some_and(|n| next < n.exchange_ticks_allowed())
     }
 
@@ -665,7 +668,10 @@ impl App {
     /// the mirroring [`App::controller_sample`] applied on the way in).
     fn exchange_sample_bytes(&mut self) -> Option<nfs_net::exchange::Sample> {
         let v = self.vehicle.as_ref()?;
-        let mut c = Self::controller_sample(&mut self.input, self.mirror, self.follow_road, self.slices.as_ref(), self.race.as_ref(), v, true);
+        let c = Self::controller_sample(&mut self.input, self.mirror, self.follow_road, self.slices.as_ref(), self.race.as_ref(), v, true);
+        // TEST GLUE `NFS_PA_INPUT`: the scripted pad is what the exchange sends too (not the original's)
+        let c = super::pa_trace::input(self.tick, c);
+        let mut c = c;
         if self.mirror {
             c.steer = -c.steer;
         }
@@ -760,8 +766,8 @@ impl App {
         let m = self.fe.menu.as_ref()?;
         let t = self.fe.track_tables.tracks.iter().find(|r| r.file.eq_ignore_ascii_case(m.track()))?;
         let positional = self.net.session.as_ref().is_some_and(|n| n.positional);
-        // `Comms.Collision`'s row 0 is "off" (FEStrings 1500)
-        let collision = self.choices.get("Comms.Collision").copied().unwrap_or(0);
+        // `Comms.Collision`'s row 0 is "off" (FEStrings 1500), row 1 "on" (1501), the start row
+        let collision = self.choice_index("Comms.Collision").map_or(1, |(i, _)| i);
         let players = self.net.session.as_ref().map_or(1, |n| n.room_len().max(1)) as u32;
         let mut s = nfs_net::options::LaunchSettings {
             players,

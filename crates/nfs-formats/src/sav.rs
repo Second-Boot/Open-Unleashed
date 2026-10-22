@@ -726,8 +726,16 @@ pub const ACCESSORS: [(&str, AccessorKind); 223] = [
 /// through 0x4BA310) and `sprintf("%s.Sliderbar", widget)` (0x4C50B0, an `FEPositionableAccessor`
 /// through 0x4BC1F0). Both go through the base constructor's map insert, so a save the original
 /// makes while such a widget exists carries them — each a plain dword (0x4BC460).
+///
+/// **A second widget of the same name gets a number** (PA-SRV2): the base constructor 0x4B7B30 looks
+/// its name up in the registry `[0x65B3A8]` (0x4B7C0F…0x4B7C3D) and, while one is there and that
+/// entry's own flag `+0x1C` is set (the byte the slider constructor 0x4BC1F0 stores at 0x4BC21F),
+/// appends `sprintf("%d", n)` with `n` from 2 up (0x4B7C04 starts it at 2; 0x4B7C93 the `"%d"`
+/// at 0x5CD1B0; 0x4B7CD9 `inc`) and looks again. A save made after the front end built eight
+/// `ID_COMBOBOX` sliders carries `ID_COMBOBOX.Sliderbar`, `…Sliderbar2` … `…Sliderbar8`.
 pub fn accessor_kind(name: &str) -> Option<AccessorKind> {
-    if name.ends_with(".SliderBar") || name.ends_with(".Sliderbar") {
+    let stem = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    if stem.ends_with(".SliderBar") || stem.ends_with(".Sliderbar") {
         return Some(AccessorKind::Dword);
     }
     let key = name.split_once('(').map(|(b, _)| b.trim()).unwrap_or(name);
@@ -974,6 +982,11 @@ mod tests {
         // the per-widget slider accessors (0x4C2BEF / 0x4C50B0) carry one dword
         assert_eq!(accessor_kind("NFS5.MUSICSLIDER.SliderBar"), Some(AccessorKind::Dword));
         assert_eq!(accessor_kind("NFS5.GAMMA.Sliderbar"), Some(AccessorKind::Dword));
+        // a later widget of the same name: the registry appends 2, 3, ... (0x4B7C04)
+        assert_eq!(accessor_kind("ID_COMBOBOX.Sliderbar2"), Some(AccessorKind::Dword));
+        assert_eq!(accessor_kind("ID_COMBOBOX.Sliderbar8"), Some(AccessorKind::Dword));
+        assert_eq!(accessor_kind("ID_COMBOBOX.SliderBar12"), Some(AccessorKind::Dword));
+        assert_eq!(accessor_kind("Camera.1"), accessor_kind("Camera.1"));
     }
 
     #[test]

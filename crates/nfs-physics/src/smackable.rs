@@ -652,6 +652,31 @@ mod tests {
         assert!(short < 0.1, "the short one settles: {short}");
     }
 
+    /// 0x49BA01…0x49BA1D on a prop (PA-NETRULES, 2026-10-22): its `car+0x80` countdown runs only in its
+    /// awake 64 Hz steps (0x49B8E0's `car+0x7D` gate), starts at 0, so the first re-orthonormalisation is
+    /// the 256th awake step and then every 32nd; an asleep prop never counts.
+    #[test]
+    fn a_prop_renormalises_on_its_own_countdown_while_awake() {
+        let grid = flat();
+        let mut s = Smackable::new(Vec3::new(0.0, 0.01, 0.0), Mat3::IDENTITY, crate_points(0.9), 10.0, 7, &grid);
+        assert!(s.asleep);
+        s.integrate();
+        assert_eq!(s.body.orient_countdown, 0, "asleep: no step, no count");
+        s.asleep = false;
+        for _ in 0..255 {
+            s.integrate();
+        }
+        assert_eq!(s.body.orient_countdown, 1);
+        s.integrate();
+        assert_eq!(s.body.orient_countdown, 0x20, "the 256th awake step renormalises and reloads 0x20");
+        for _ in 0..31 {
+            s.integrate();
+        }
+        assert_eq!(s.body.orient_countdown, 1);
+        s.integrate();
+        assert_eq!(s.body.orient_countdown, 0x20, "then every 32nd awake step");
+    }
+
     /// 0x483360 centres a record on its points' bounding box: a sign's 3.2 m of points sit
     /// ±1.6 m about the body origin, which is the item's position plus the centre (the server's
     /// alps `SIGN` 0: position = the `tr` position + (0.04, 1.588, 0.01), points y ∈ ±1.588).

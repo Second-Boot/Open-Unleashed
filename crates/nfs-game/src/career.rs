@@ -677,10 +677,16 @@ pub fn layout_race_parts(parts: &[&Part]) -> Vec<nfs_physics::specs::InstalledPa
 /// The order is 0x49CB50's: parts, then sliders. [`CarSpecs::parts`] gets the stock list at its
 /// carried state (the table's own).
 pub fn fold_fresh_car(specs: &mut nfs_physics::specs::CarSpecs, stock_ids: &[i16], table: &[Part], family: &str, automatic: bool) {
+    fold_fresh_car_with(specs, stock_ids, table, family, &CAR_SETUP_DEFAULT, automatic);
+}
+
+/// [`fold_fresh_car`] with the slot's own seventeen sliders instead of the neutral ones (0x49CB50
+/// reads them from the slot's record whatever it holds).
+pub fn fold_fresh_car_with(specs: &mut nfs_physics::specs::CarSpecs, stock_ids: &[i16], table: &[Part], family: &str, setup: &[f32; 17], automatic: bool) {
     let stock: Vec<&Part> = stock_ids.iter().filter_map(|id| table.iter().find(|p| p.id == *id)).collect();
     specs.apply_parts(&stock, family);
     specs.parts = nfs_physics::specs::stock_parts(stock_ids, table);
-    specs.apply_setup(&CAR_SETUP_DEFAULT, automatic);
+    specs.apply_setup(setup, automatic);
 }
 
 /// [`installed_parts`] for an owned car: its parts looked up in the table.

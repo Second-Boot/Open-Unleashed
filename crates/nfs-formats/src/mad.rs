@@ -43,6 +43,20 @@ impl<'a> Chunk<'a> {
     }
 }
 
+/// How many bytes after a video chunk the decoder is given ([`with_run_on`]); a frame's last macroblock may read about
+/// 16 past its payload (RE/notes/mad.md §10), and a few more are cheap.
+pub const RUN_ON: usize = 64;
+
+/// The video chunk at `file[off..off + len]` **and the bytes that follow it in the file**. The original reads a whole movie
+/// into one buffer (0x59E440) and its bit reader (0x56D040) has no end: a frame whose bitstream stops before its last
+/// macroblock (11 of 3357 shipped frames, `MADm` of ch3 / ch4 / ch6) decodes that macroblock out of the **next chunk's
+/// bytes**, not out of zeros. Measured against surfaces dumped from the running original (0x4DD0EC, ch6 chunks 122 and 148):
+/// every dword equal with the run-on, 192 differing without it. Hand this to [`MadDecoder::decode_chunk`] /
+/// [`MadDecoder::decode_frame`] instead of the bare chunk.
+pub fn with_run_on(file: &[u8], off: usize, len: usize) -> &[u8] {
+    &file[off..(off + len + RUN_ON).min(file.len())]
+}
+
 /// Walk a `.mad` file's chunks.
 pub fn chunks(d: &[u8]) -> impl Iterator<Item = Chunk<'_>> {
     let mut at = 0usize;
@@ -413,7 +427,8 @@ pub struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     pub fn new(d: &'a [u8]) -> Self {
-        // past the end the reader zero-fills (format behaviour, keep)
+        // past the end of the slice the reader zero-fills: the end of the file (the original's buffer ends there too);
+        // a frame's own end is not the slice's, see `with_run_on`
         let le16 = |o: usize| -> u32 { get_u16(d, o).map_or(0, u32::from) };
         Self { d, pos: 4, w: (le16(0) << 16) | le16(2), avail: 0x20 }
     }
@@ -751,6 +766,11 @@ impl MadDecoder {
     pub fn decode_frame(&mut self, chunk: &[u8]) -> Frame {
         let _ = self.decode_chunk(chunk);
         Frame { width: self.width, height: self.height, rgba: self.rgba() }
+    }
+
+    /// The surface the last decode produced as the packed `y0 y1 u v` dwords the original's `[0x65B9D4 + idx·8]` holds.
+    pub fn surface(&self) -> &[u32] {
+        &self.surfaces[self.cur ^ 1]
     }
 
     /// The surface the last decode produced, as RGBA8.

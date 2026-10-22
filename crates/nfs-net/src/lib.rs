@@ -23,6 +23,7 @@ pub mod slots;
 pub mod socket;
 pub mod state;
 pub mod tcp;
+pub mod voice;
 pub mod wire;
 
 /// The UDP port of the IP transport — `0x24E2` = 9442, the word after the application GUID at

@@ -19,8 +19,8 @@
 //!   separation, box test and impulses, not approximations.
 //! * Drafting (`DraftFactor` 0x49D9B0, CONFIRMED): the caller fills `draft` from the other racers
 //!   and it scales the drag.
-//! * Induction boost (`0x49E6C4`) and misfire (§4.3) are modelled; the caller fills `misfire_roll`
-//!   from the shared LCG.
+//! * Induction boost (`0x49E6C4`) and misfire (§4.3) are modelled; the misfire draw, like every
+//!   other draw of the car, comes from the one shared LCG word `[0x5D1028]` (`crate::lcg`).
 //! * The part-damage getters (`physics.md` §10) walk `specs.parts`, the installed-part list
 //!   `car+0x768`, each part over its own zone mask; the career fills it from the car's parts.
 
@@ -231,9 +231,6 @@ pub struct Vehicle {
     pub draft: f32,
     /// `car+0x54C` — the induction boost state 0..1 (0x49E6C4), which the turbo sound reads.
     pub boost: f32,
-    /// The `[0, 1)` draw the misfire test compares the engine damage against (§4.3). The original
-    /// takes it from the shared LCG every engine step; the caller fills it from the same stream.
-    pub misfire_roll: f32,
     /// The `rand16` the AI's start-gear shift timer takes (0x40C06F…0x40C09E, `4 + (r·8 >> 16)`),
     /// drawn by the AI's pedal routine from the shared stream before `Car_simulate` runs; the
     /// caller fills it for the tick it is due, and the car's own stream stands in when it does not.
@@ -504,18 +501,18 @@ pub struct Vehicle {
     /// (`[0x657408]` and `+0xDAC`, 0x499D22…0x499D34) and `WheelRotation` 0x4A2790 turns the wheels by
     /// `car+0x35C / circumference` whatever the drive (0x4A2799). `vehicle/netcar.rs`.
     pub net_car: bool,
-    /// LCG state (the original's `0x5D1028 × 0x5D102C`) for road roughness and the engine's noise.
-    rng: u32,
     /// `car+0x80`, the byte countdown of the orientation's re-orthonormalisation: 0x49B8E0's tail
     /// (0x49BA01…0x49BA1D) decrements it every 64 Hz rotation step and runs 0x4A4810 when it
     /// reaches 0, then reloads 0x20. A grid-placed racer starts at 0 (the first re-orthonormalisation
     /// on its 256th step — measured live, `REFERENCE-2026-10-22-PA-TRACE.md`); 0x410521 (the
     /// skill-test start) and the network snaps 0x4A0306 / 0x4A0662 load 0x20.
     pub(crate) orient_countdown: u8,
-    /// **TEST GLUE, experiment** (`NFS_PA_SHARED_RNG`, `REFERENCE-2026-10-22-PA-TRACE.md`): the car's
-    /// draws (roughness 0x499856, the damage pull 0x49F473, `AutoShift` 0x49DAF3, the misfire
-    /// 0x49E496 at its own place) taken from the shared stream, as the original takes them.
-    pub shared_rng: bool,
+    /// The rows 0x49AE30 used for the world collision points `car+0x1DC + 12i` when it last ran
+    /// (0x49B8E0's tail, 0x49B9FC — *before* 0x4A4810 orthonormalises the matrix on the 256th step).
+    /// `Susp_update` reads those stored points (0x499AD4…0x499B13), so on the `Car_ground` that
+    /// follows a re-orthonormalisation the probes sit where the raw rows put them. `None`: the rows
+    /// are the current ones (every other step, and the racers, whose steps refresh them anyway).
+    pub point_rows: Option<Mat3>,
 }
 
 impl Vehicle {
@@ -539,7 +536,6 @@ impl Vehicle {
             engine_arm: EngineArm::None,
             draft: 1.0,
             boost: 0.0,
-            misfire_roll: 1.0,
             shift_roll: None,
             height_marker: 0.0,
             v_local: Vec3::ZERO,
@@ -628,9 +624,8 @@ impl Vehicle {
             contact_kind: ContactKind::None,
             tracker: PatchTracker::new(Vec3::new(position.x, position.y - wheel_radius, position.z)),
             net_car: false,
-            rng: 0x3ADE_68B1,
             orient_countdown: 0,
-            shared_rng: false,
+            point_rows: None,
         }
     }
 
@@ -694,21 +689,20 @@ impl Vehicle {
         }
     }
 
-    /// The original's 16-bit LCG, drawn inline at every call site: `prod = state · 123456789`,
-    /// `state = prod & 0xFFFF`, `rand16 = (prod >> 8) & 0xFFFF` (`traffic.md` §14.7). The original
-    /// keeps **one** stream for the whole game; this crate sits below `nfs-game`, so it carries its
-    /// own state with the same arithmetic.
+    /// A draw of the original's **one shared** 16-bit LCG, `[0x5D1028]` (`crate::lcg`, `traffic.md`
+    /// §14.7), drawn inline at every call site. Every draw of the car comes from it, in the order
+    /// the original takes them — per 32 Hz step of a racer the damage pull 0x49F44B…0x49F473 (game
+    /// tick ≡ 0 mod 4), the misfire 0x49E496, the rev limiter's cut (0x49E58B…, when it fires),
+    /// `AutoShift` 0x49DAF3, the four wheels' `Roughness` 0x499856 — and the placement's two
+    /// `Susp_update`s draw their roughness from it too (measured live by a watchpoint on the word,
+    /// `REFERENCE-2026-10-22-PA-TRACE.md`). *(Until 2026-10-22 the car carried a stream of its own.)*
+    #[track_caller]
     fn rand16(&mut self) -> u32 {
-        // TEST GLUE experiment (`NFS_PA_SHARED_RNG`): draw from the shared stream
-        if self.shared_rng {
-            return crate::lcg::rand16();
-        }
-        let prod = self.rng.wrapping_mul(123_456_789);
-        self.rng = prod & 0xFFFF;
-        (prod >> 8) & 0xFFFF
+        crate::lcg::rand16()
     }
 
     /// `(rand16 · n) >> 16` — the original's "random below n".
+    #[track_caller]
     fn rand_below(&mut self, n: u32) -> u32 {
         (self.rand16() * n) >> 16
     }
@@ -987,11 +981,34 @@ impl Vehicle {
         }
     }
 
-    /// 32 Hz step: input, forces, velocity integration, ground contact (`Car_simulate`).
+    /// 32 Hz step of a human car: the tracker, `Car_simulate` and `Car_ground` — its Sc32 entries
+    /// `+0xE0C`, `+0xE1C`, `+0xE20` (`traffic.md` §17.5e).
     pub fn step32(&mut self, controls: &Controls, specs: &CarSpecs, grid: &TriangleGrid) {
-        // 0x49AF70 (`+0xE0C`, priority 6, ahead of `Car_simulate` / `Car_ground` at 0x1E): the car
-        // tracker at the position and, on a new patch, the plane 0x499520 keeps
+        self.track32(grid);
+        self.simulate32(controls, specs);
+        self.ground_contact(grid, specs);
+    }
+
+    /// `Car_ground` 0x49BD40 alone (the Sc32 entry `car+0xE20`, priority 0x1E): an AI opponent's runs
+    /// on the list, after every human's `Car_simulate` / `Car_ground`, while its `Car_simulate` runs
+    /// inside the AI pass (`AIState_Racing::update` 0x40CA20 → 0x40CA6F, [`Self::simulate32`]).
+    pub fn ground32(&mut self, grid: &TriangleGrid, specs: &CarSpecs) {
+        self.ground_contact(grid, specs);
+    }
+
+    /// The body half of the tracker 0x49AF70: the car's patch tracker at the position and, on a new
+    /// patch, the plane 0x499520 keeps (and so `car+0x464`, the surface the AI's target speed reads).
+    /// A human car runs it from the Sc32 list (`+0xE0C`, priority 6, ahead of `Car_simulate` /
+    /// `Car_ground` at 0x1E, [`Self::step32`]); an AI opponent at the head of its
+    /// `AIState_Racing::update` 0x40CA20 (0x40CA27), **before** the decisions 0x40B650 / 0x40BFE0.
+    pub fn track32(&mut self, grid: &TriangleGrid) {
         self.tracker.track(grid, self.position);
+    }
+
+    /// `Car_simulate` 0x49FD30 — input, forces, velocity integration — without the tracker
+    /// ([`Self::track32`]) and the ground contact: an AI opponent's, from its `AIState_Racing::update`
+    /// 0x40CA20 (0x40CA6F); its `Car_ground` is [`Self::ground32`].
+    pub fn simulate32(&mut self, controls: &Controls, specs: &CarSpecs) {
         self.ticks_alive += 1;
         self.latch_input(controls, specs);
         // `Car_simulate` 0x49FD30, read to the instruction 2026-09-26: `car+0x3A0` (the ground
@@ -1024,7 +1041,6 @@ impl Vehicle {
         } else {
             self.physics_step(specs);
         }
-        self.ground_contact(grid, specs);
     }
 
     /// `Car_physicsStep` 0x49F160, which `Car_simulate` calls on an upright car. The named steps
@@ -1221,8 +1237,14 @@ impl Vehicle {
     /// physics frame `car+0x490`; and the byte is `car+0xD80` as 0x49DD20 leaves it — 0xFF
     /// before the start, so a car on a sloped grid is not pushed downhill. Not carried: the gate
     /// at 0x49F0C4…0x49F0E1 — skipped for a traffic body (`car+0x52C & 0x10`, which never runs
-    /// `Car_simulate`) and in a network race (`[0x6573E8] == 3` with `[0x657408]`).
+    /// `Car_simulate`: the port's traffic bodies never call [`Self::physics_step`]) and in a positional
+    /// network race (`[0x6573E8] == 3` with `[0x657408]` set): [`nfs_physics::comm::positional_network`],
+    /// set by the application each tick. Read 2026-10-22 (PA-NETRULES): 0x49F0C4 `test byte [ecx+0x52C],0x10;
+    /// jne 0x49F157`, 0x49F0D1 `cmp [0x6573E8],3; jne 0x49F0E3`, 0x49F0DA `mov eax,[0x657408]; test; jne 0x49F157`.
     fn stability_assist(&mut self, vl: Vec3) {
+        if crate::comm::positional_network() {
+            return;
+        }
         if vl.x.abs() > 1.0 || self.orientation.row(1).y < SLOPE_UP_Y {
             self.accel_local.x += SLOPE_PUSH_X * self.orientation.row(0).y;
         }
@@ -1340,14 +1362,14 @@ impl Vehicle {
         }
         self.orientation = orientation_step(self.orientation, self.angular_velocity * DT64);
         // 0x49BA01…0x49BA1D: `--car+0x80`, and at 0 `0x4A4810(car+0x364)` and `car+0x80 = 0x20`.
-        // Every car record runs it; the props keep the port's own every-32nd-game-tick
-        // re-orthonormalisation (`nfs_game::smackables::integrate`), so they are left out here.
-        if !self.smackable {
-            self.orient_countdown = self.orient_countdown.wrapping_sub(1);
-            if self.orient_countdown == 0 {
-                self.renormalise();
-                self.orient_countdown = 0x20;
-            }
+        // Every record runs it, a smackable too (PA-NETRULES, 2026-10-22): its 64 Hz step is this one only
+        // while awake (`Smackable::integrate`, `car+0x7D`), and its `car+0x80` starts at 0 (no placement
+        // writes 0x20: `Car_reset`'s smackable branch 0x4107A1 skips 0x410430), so its first renormalisation
+        // is the 256th awake step and then every 32nd.
+        self.orient_countdown = self.orient_countdown.wrapping_sub(1);
+        if self.orient_countdown == 0 {
+            self.renormalise();
+            self.orient_countdown = 0x20;
         }
     }
 
@@ -1355,6 +1377,71 @@ impl Vehicle {
     /// (`car+0x430 = car+0x434 = car+0x438 = 0`, 0x40FAFB…0x40FB0D).
     pub fn take_contact(&mut self) -> (f32, ContactKind) {
         (std::mem::take(&mut self.contact_mag), std::mem::take(&mut self.contact_kind))
+    }
+
+    /// **0x49E220**, the drivetrain / controller / wheel clear 0x40F540 runs **before**
+    /// `Car_placeAtSlice` (0x40F694), as far as the port carries the fields (read 2026-10-22):
+    ///
+    /// * the requested and current gear `+0xD7E` / `+0xD82` = 2 for an automatic (`[car+0x558]+0xC
+    ///   == 1`), else 1 (neutral); `+0xD81` = 1; the reverse latch `+0xD98`, the controller bytes
+    ///   `+0xD7C` / `+0xD7D`, the effective pedals `+0xD7F` / `+0xD80`, the steering target / value
+    ///   `+0xD90` / `+0xD94`, the blip `+0xD83`, the shift timer `+0xD84`, the handbrake `+0xD85` = 0;
+    /// * per wheel (0x49E2B5…): the wheel tracker `wheel+4` = a copy of the car's (0x473190), the
+    ///   block `+0x34…+0x88` zeroed but the normal's `y` `+0x50` = 1.0 (so `d` `+0x64`, the
+    ///   compression `+0x68`, the render angle `+0x70`, the roughness state `+0x74…+0x7C`, airborne
+    ///   `+0x84`, the rotation `+0x88`), the zone `+0x8C` = 1, the slip `+0xB8` and the steer angle
+    ///   `+0xB4` = 0;
+    /// * the accelerations `+0xD34…+0xD54`, the body-frame velocities `+0xD58…+0xD6C`, the filtered
+    ///   accelerations `+0xE04` / `+0xE08`, the rpm `+0xDB4`, the slip tangent `+0xDC0`, the boost
+    ///   `+0x54C`, the wheelspin state `+0xDB8`, the dive / roll states `+0xDC4` / `+0xDC8` = 0, and
+    ///   `+0xDB0` re-armed ([`Self::rearm_after_reset`]).
+    ///
+    /// Not carried here: `+0xD88`, `+0xD89`, `+0xD8B`, `+0xD8C` (requests the port keeps elsewhere),
+    /// `+0xDBC`, `+0xD2C`, `+0x540`, `+0x103C…`, the probe / contact / normal vectors (the port
+    /// derives them in `Susp_update`), and the AI's branch latch `+0xE94` / `+0xC` (the caller's).
+    pub fn reset_drive(&mut self) {
+        self.gear = if self.automatic { 2 } else { 1 };
+        self.requested_gear = self.gear;
+        self.prev_gear = 1;
+        self.reverse_latch = false;
+        self.throttle_raw = 0;
+        self.brake_raw = 0;
+        self.throttle_byte = 0;
+        self.brake_byte = 0;
+        self.steer_target = 0;
+        self.steer = 0;
+        self.downshift_blip = false;
+        self.shift_timer = 0;
+        self.handbrake = false;
+        let tracker = self.tracker;
+        for w in &mut self.wheels {
+            w.tracker = tracker;
+            w.height_d = 0.0;
+            w.compression = 0.0;
+            w.render_angle = 0.0;
+            w.rough_prev = 0.0;
+            w.rough_target = 0.0;
+            w.rough_phase = 0.0;
+            w.airborne = false;
+            w.rotation = 0.0;
+            w.zone = 1;
+            w.surface = 1;
+            w.slip = 0.0;
+            w.steer = 0.0;
+        }
+        self.accel_world = Vec3::ZERO;
+        self.accel_local = Vec3::ZERO;
+        self.v_local = Vec3::ZERO;
+        self.w_local = Vec3::ZERO;
+        self.long_filtered = 0.0;
+        self.lateral_filtered = 0.0;
+        self.rpm = 0.0;
+        self.slip_tangent = 0.0;
+        self.boost = 0.0;
+        self.rear_spin = false;
+        self.dive = 0.0;
+        self.roll_lp = 0.0;
+        self.rearm_after_reset();
     }
 
     /// Reset onto the track at a slice pose (the game's "reset car" 0x40F540 mode 3 — placement only,
@@ -1441,10 +1528,24 @@ impl Vehicle {
     /// index, so a caller would have to special-case it; no current caller ever targets slice 0.)*
     #[allow(clippy::too_many_arguments)]
     pub fn place_at_slice(&mut self, grid: &TriangleGrid, specs: &CarSpecs, centre: Vec3, slice_fwd: Vec3, slice_raw: [Vec3; 3], offset: Vec3, opponent: bool, flip: bool) {
+        self.place_at_slice_from(grid, specs, centre, centre, slice_fwd, slice_raw, offset, opponent, flip, true);
+    }
+
+    /// [`Self::place_at_slice`] with the two nodes apart and the in-world flag: 0x49B090 seats the
+    /// tracker (`L`, 0x49B0D7) on the **clamped** slice `max(1, slice)` but adds the offset to the
+    /// node of the slice **as passed** (0x49B2xx — live: the purgatory park `0x49B090(car, 0, …)`
+    /// lands on slice 0's node, `REFERENCE-2026-10-22-PA-TRAFFIC3.md`), and runs the two
+    /// `Susp_update`s and the `BodyHeight` drop only while `car+0x7F` is set — a car parked from
+    /// purgatory at the race's first AI pass (`car+0x7F` still 0) is neither dropped nor draws
+    /// (`in_world`). Every other caller passes the same node twice and `true`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn place_at_slice_from(&mut self, grid: &TriangleGrid, specs: &CarSpecs, seat: Vec3, centre: Vec3, slice_fwd: Vec3, slice_raw: [Vec3; 3], offset: Vec3, opponent: bool, flip: bool, in_world: bool) {
         let absolute = opponent && self.game_tick > TICK_RACE_START && offset != Vec3::ZERO;
+        // the placement refreshes the stored world points itself (0x49B431, 0x49B483)
+        self.point_rows = None;
         // `car+0x35C = 0` (0x49B403)
         self.speed_est = 0.0;
-        let l = if absolute { offset } else { centre };
+        let l = if absolute { offset } else { seat };
         self.tracker.seat(grid, l);
         let n = self.tracker.normal;
         let lat = n.cross(slice_fwd).normalize_or_zero();
@@ -1468,10 +1569,15 @@ impl Vehicle {
             self.orientation = Mat3::from_cols(rl * s, ru, rf * s).transpose();
             self.frame = self.orientation;
         }
+        if !in_world {
+            return;
+        }
+        let probe_origin = self.position;
         self.ground_h = self.susp_update(grid, specs, false);
         self.position.y -= self.body_height;
         self.body_height = 0.0;
-        self.ground_h = self.susp_update(grid, specs, false);
+        // the second pass reads the collision points the first one used (0x49B4C2 follows no 0x49AE30)
+        self.ground_h = self.susp_update_from(grid, specs, false, probe_origin);
         for w in &mut self.wheels {
             w.compression = 0.0;
             w.airborne = false;

@@ -1176,6 +1176,7 @@ version = "0.1.4"
 dependencies = [
  "anyhow",
  "cpal",
+ "libm",
  "nfs-assets",
  "nfs-formats",
  "tracing",

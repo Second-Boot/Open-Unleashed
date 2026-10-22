@@ -8,6 +8,7 @@ license.workspace = true
 nfs-formats.workspace = true
 cpal.workspace = true
 tracing.workspace = true
+libm.workspace = true
 anyhow.workspace = true
 
 [dev-dependencies]

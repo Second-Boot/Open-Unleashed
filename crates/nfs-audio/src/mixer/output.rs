@@ -167,20 +167,36 @@ impl AudioOutput {
     }
 
     /// What 0x4A66B0 configures for `AUDIOQUALITY` when the sound opens (both start-ups 0x4A6840 /
-    /// 0x4A6A00; the latter reopens on a quality change): the software voice count
-    /// ([`voice_budget`]) and the mix rate ([`mix_rate`]). Voices already playing are left alone;
-    /// later starts obey the new count, and the mix goes on at the new rate.
-    pub fn set_audio_quality(&self, audio_quality: u8) {
+    /// 0x4A6A00): the software voice count ([`voice_budget`]), the mix rate ([`mix_rate`]), the
+    /// interpolator and the driver's sleep. The callers give it on every use; the same setting
+    /// again does nothing (0x4A6A1C…0x4A6A2E: `[0x655D38]` unchanged → return).
+    ///
+    /// **A changed setting reopens the sound**, as 0x4A6A00 does (its one caller, the
+    /// `Audio.Quality` / `Audio.Mode` commit 0x4E4820, 0x4E48B4): every voice stopped
+    /// (0x5659F0(−1)), the music's stream destroyed (0x4AE2B0), the library closed (0x565890) and
+    /// opened again at the new setting (0x4A66B0), its service clock from 0 (0x58EEA5…0x58EEB1).
+    /// Returns `true` then: the caller makes what the reopen's tail makes — the music's stream and
+    /// timer (0x4AE010), `fesfx` reloaded (0x4A8B80), `MusicPlay(NULL, 0)` (0x4AE4D0(0, 0),
+    /// 0x4A6B1E). The first call configures the opened output (0x4A6840's open) and answers `false`.
+    /// *(Until REG-AUDIO2 a change was applied under the running mix, the voices left playing.)*
+    pub fn set_audio_quality(&self, audio_quality: u8) -> bool {
         let budget = voice_budget(audio_quality);
         let rate = mix_rate(audio_quality);
         let interp = Interp::for_quality(audio_quality);
         let sleep = pump_sleep_ms(audio_quality);
         let mut st = self.tx.state.lock().unwrap();
-        // a new mix rate drops the reverb (its delay lines are sized in frames of the mix rate)
-        // and the next send makes a fresh one — made here, off the callback, and handed over
-        let reverb = (st.cfg_rate != Some(rate)).then(|| Box::new(ReverbTail::new(rate)));
+        if st.cfg_quality == Some(audio_quality) {
+            return false;
+        }
+        let reopen = st.cfg_quality.is_some();
+        st.cfg_quality = Some(audio_quality);
+        // a new mix rate (or a reopen) drops the reverb (its delay lines are sized in frames of
+        // the mix rate) and the next send makes a fresh one — made here, off the callback, and
+        // handed over
+        let reverb = (reopen || st.cfg_rate != Some(rate)).then(|| Box::new(ReverbTail::new(rate)));
         st.cfg_rate = Some(rate);
-        self.tx.push(&mut st, Cmd::Quality { budget, rate, interp, sleep, reverb }, None);
+        self.tx.push(&mut st, Cmd::Quality { budget, rate, interp, sleep, reverb, reopen }, None);
+        reopen
     }
 
     /// The aux byte of `Voice_play` for a collision one-shot: `voice+0x45 = 0x7F − aux`
