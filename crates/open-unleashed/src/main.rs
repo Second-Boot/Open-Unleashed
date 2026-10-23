@@ -192,7 +192,12 @@ fn run() -> Result<()> {
                 .with_style(r.car.variant)
                 .with_cabrio(r.car.cabrio)
                 .with_style_overlay(r.parts.iter().flat_map(|p| p.geometry_swaps.iter().copied()).collect()),
-            None => car,
+            // TEST GLUE: `NFS_CAR_ID=<catalogue id>` gives a `<track> <car>` run that record's body
+            // style and roof (e.g. 126, the Carrera RS 2.7 = the 901's style 7), for stills
+            None => match std::env::var("NFS_CAR_ID").ok().and_then(|v| v.parse::<u16>().ok()).and_then(|id| catalog.iter().find(|e| e.id == id)) {
+                Some(e) => car.with_style(e.variant).with_cabrio(e.cabrio),
+                None => car,
+            },
         },
     };
     let sim_name = replay_setup

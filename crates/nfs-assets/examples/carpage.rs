@@ -1,6 +1,7 @@
 //! Diagnostic: build a car's texture pages for the front end and for a race (`CarStyle::front_end`)
 //! and write one page of each as PNG — `carpage <model> <page, 1-based> <outdir> [licence [number]]`
-//! (with a licence the page builder's text is drawn too, `car-model.md` §5.3).
+//! (with a licence the page builder's text is drawn too, `car-model.md` §5.3); `STYLE=<n>` builds body style `n`
+//! (default 1; the Carrera RS 2.7 is the `901`'s style 7).
 use nfs_assets::{car::CarAssets, car::CarStyle, GamePaths};
 
 fn main() {
@@ -12,7 +13,7 @@ fn main() {
     }
     let n: usize = a[1].parse().unwrap();
     for fe in [true, false] {
-        let mut style = CarStyle::from_tpg(&car.tpg, 1);
+        let mut style = CarStyle::from_tpg(&car.tpg, std::env::var("STYLE").ok().and_then(|s| s.parse().ok()).unwrap_or(1));
         style.front_end = fe;
         let pages = car.build_pages(&paths, [200, 0, 0], &style).unwrap();
         let p = &pages[n - 1];
